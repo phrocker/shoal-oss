@@ -1,0 +1,32 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: shoal-platform-config
+  labels:
+    app.kubernetes.io/name: shoal
+    app.kubernetes.io/part-of: shoal-platform
+data:
+  # shoal-embed serve supports only --data and --port today.
+  # TODO(shoal): add a listen-address flag; cmd/shoal-embed currently binds 127.0.0.1.
+  SHOAL_EMBED_DATA_DIR: /var/lib/shoal
+  SHOAL_EMBED_GRPC_PORT: "9876"
+
+  # Desired shared object-store configuration for the write tier/read fleet.
+  # TODO(shoal): cmd/shoal-embed has no storage backend/bucket/prefix flags yet,
+  # even though engine.Options supports a Backend. These values are documented
+  # here for operators and future wiring, but are not passed to shoal-embed.
+  SHOAL_OBJECT_STORAGE_BACKEND: gs
+  SHOAL_OBJECT_BUCKET: example-shoal-rfiles
+  SHOAL_OBJECT_PREFIX: shards/shard-0000
+
+  # cmd/shoal distributed read-fleet flags.
+  SHOAL_THRIFT_LISTEN: :9800
+  SHOAL_ZK: zk-0.zk:2181,zk-1.zk:2181,zk-2.zk:2181
+  SHOAL_INSTANCE: accumulo
+  SHOAL_ACCUMULO_VERSION: 4.0.0-SNAPSHOT
+  SHOAL_METADATA_USER: root
+  SHOAL_STORAGE_SCHEME: gs
+  SHOAL_CACHE_BYTES: "268435456"
+  SHOAL_LOG_LEVEL: info
+  SHOAL_PREWARM_TABLES: auto
+  SHOAL_PREWARM_PARALLELISM: "8"

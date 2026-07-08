@@ -1,0 +1,19 @@
+/bin/
+/tools/
+
+# Go workspace sum (regenerated locally)
+/go.work.sum
+
+shoal-embed.exe
+shoal-embed.exe~
+
+# Go test binaries + profiling artifacts (from `go test -c` / -cpuprofile etc.)
+*.test
+*.test.exe
+*.prof
+*.pprof
+*.out
+# Stray profile output files written by ad-hoc benchmark runs
+cpu
+cpw
+mp

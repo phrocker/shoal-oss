@@ -1,0 +1,47 @@
+image:
+  repository: ghcr.io/example/shoal
+  tag: dev
+  pullPolicy: IfNotPresent
+
+objectStorage:
+  # Used by cmd/shoal -storage. cmd/shoal-embed does not expose backend/bucket/prefix flags yet.
+  backend: gs
+  bucket: example-shoal-rfiles
+  prefix: shards/shard-0000
+  credentialsSecretName: shoal-object-storage-credentials
+  createSecret: true
+  gcsKeyJson: '{"type":"service_account","project_id":"REPLACE_ME"}'
+
+writeTier:
+  replicas: 1
+  dataDir: /var/lib/shoal
+  grpcPort: 9876
+  storageSize: 50Gi
+  resources:
+    requests:
+      cpu: 500m
+      memory: 512Mi
+    limits:
+      cpu: "2"
+      memory: 2Gi
+
+readFleet:
+  replicas: 3
+  listen: :9800
+  servicePort: 9800
+  zk: zk-0.zk:2181,zk-1.zk:2181,zk-2.zk:2181
+  instance: accumulo
+  accumuloVersion: 4.0.0-SNAPSHOT
+  metadataUser: root
+  accumuloPassword: REPLACE_ME
+  cacheBytes: "268435456"
+  logLevel: info
+  prewarmTables: auto
+  prewarmParallelism: "8"
+  resources:
+    requests:
+      cpu: 500m
+      memory: 512Mi
+    limits:
+      cpu: "2"
+      memory: 2Gi
