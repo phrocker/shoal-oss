@@ -99,6 +99,13 @@ const (
 	// than a timestamp ceiling. Option "asOfTimestamp" (int64; <=0 disables).
 	// Belongs at the bottom of a scan stack, beneath deleting/versioning.
 	IterAsOf = "asOf"
+	// IterDocumentIndex is the DataWave-style document retrieval pushdown
+	// iterator: it resolves field=value terms against the in-shard field index
+	// (fi) and reconstructs each matching document's event cells. Options:
+	// shardCount, shard.<i>, termCount, term.<i>.field, term.<i>.value, boolOp.
+	// Must be hosted above a re-seekable whole-table source (see
+	// DocumentIndexIterator).
+	IterDocumentIndex = "documentIndex"
 )
 
 // BuildStack composes an iterator stack on top of leaf, in order: specs[0]
@@ -155,6 +162,8 @@ func newIterator(name string) (SortedKeyValueIterator, error) {
 		return NewVisibilityStampIterator(), nil
 	case IterAsOf:
 		return NewAsOfIterator(), nil
+	case IterDocumentIndex:
+		return NewDocumentIndexIterator(), nil
 	default:
 		return nil, fmt.Errorf("unknown iterator %q", name)
 	}
