@@ -102,7 +102,7 @@ func VerifyTablet(spec compaction.Spec, output []byte, entriesWritten int64) (*V
 	}
 	rep.SelfConsistent = rep.Mismatch == nil
 
-	shReport, err := shadow.Compare(toShadowSpec(spec), nil)
+	shReport, err := shadow.ValidateOutput(output)
 	if err != nil {
 		return rep, fmt.Errorf("offlinecompact: shadow verify: %w", err)
 	}
@@ -174,22 +174,22 @@ func openRFile(image []byte) (*rfile.Reader, error) {
 
 func renderCell(k *wire.Key, v []byte) string {
 	return fmt.Sprintf("(%s:%s:%s@%d del=%t val=%s)",
-		metadata.PrintableBytes(k.Row),
-		metadata.PrintableBytes(k.ColumnFamily),
-		metadata.PrintableBytes(k.ColumnQualifier),
-		k.Timestamp, k.Deleted, metadata.PrintableBytes(v))
+		truncBytes(k.Row),
+		truncBytes(k.ColumnFamily),
+		truncBytes(k.ColumnQualifier),
+		k.Timestamp, k.Deleted, truncBytes(v))
 }
 
-func toShadowSpec(spec compaction.Spec) shadow.CompareSpec {
-	inputs := make([]shadow.InputBlob, len(spec.Inputs))
-	for i, in := range spec.Inputs {
-		inputs[i] = shadow.InputBlob{Name: in.Name, Bytes: in.Bytes}
+// maxRenderBytes bounds how many bytes of any single cell field are
+// rendered into a mismatch reason, so a divergence on a multi-megabyte
+// value cannot explode log size or dump full (possibly sensitive) cell
+// payloads. The comparison itself is still byte-exact; only the message
+// is truncated.
+const maxRenderBytes = 64
+
+func truncBytes(b []byte) string {
+	if len(b) <= maxRenderBytes {
+		return metadata.PrintableBytes(b)
 	}
-	return shadow.CompareSpec{
-		Inputs:              inputs,
-		Stack:               spec.Stack,
-		Scope:               spec.Scope,
-		FullMajorCompaction: spec.FullMajorCompaction,
-		Codec:               spec.Codec,
-	}
+	return fmt.Sprintf("%s…(+%d bytes)", metadata.PrintableBytes(b[:maxRenderBytes]), len(b)-maxRenderBytes)
 }

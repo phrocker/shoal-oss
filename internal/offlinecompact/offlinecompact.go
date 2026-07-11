@@ -172,9 +172,23 @@ func Run(ctx context.Context, tableID string, deps Deps, opts Options) (*Plan, e
 		return nil, fmt.Errorf("offlinecompact: enumerate tablets of %s: %w", tableID, err)
 	}
 
+	// Resolve the majc iterator stack once per run: Resolve is scoped to
+	// (tableID, scope) and identical for every tablet, so resolving per
+	// tablet would add repeated ZK/config reads on large tables. Fail
+	// early if any class is unported — never silently drop an iterator,
+	// which would corrupt compaction semantics (closing that gap is the
+	// iterator-forge track, docs/iterator-forge-design.md).
+	resolved, err := deps.Stacks.Resolve(ctx, tableID, iterrt.ScopeMajc)
+	if err != nil {
+		return nil, fmt.Errorf("offlinecompact: resolve majc stack for %s: %w", tableID, err)
+	}
+	if len(resolved.Skipped) > 0 {
+		return nil, unportedError(tableID, resolved.Skipped)
+	}
+
 	plan := &Plan{TableID: tableID}
 	for _, tablet := range tablets {
-		res, skipped, err := compactTablet(ctx, tableID, tablet, deps, opts, newName, logger)
+		res, skipped, err := compactTablet(ctx, tableID, tablet, resolved.Stack, deps, opts, newName, logger)
 		if err != nil {
 			return nil, err
 		}
@@ -193,25 +207,15 @@ func Run(ctx context.Context, tableID string, deps Deps, opts Options) (*Plan, e
 }
 
 // compactTablet resolves + applies the majc stack for one tablet. The
-// bool return is true when the tablet was skipped as a no-op.
-func compactTablet(ctx context.Context, tableID string, tablet metadata.TabletInfo, deps Deps, opts Options, newName func() string, logger *slog.Logger) (*TabletResult, bool, error) {
-	resolved, err := deps.Stacks.Resolve(ctx, tableID, iterrt.ScopeMajc)
-	if err != nil {
-		return nil, false, fmt.Errorf("offlinecompact: resolve majc stack for %s: %w", tableID, err)
-	}
-	// Never silently drop an iterator — that would corrupt compaction
-	// semantics. An unported (Skipped) class aborts the run; closing that
-	// gap is the iterator-forge track (docs/iterator-forge-design.md).
-	if len(resolved.Skipped) > 0 {
-		return nil, false, unportedError(tableID, resolved.Skipped)
-	}
-
-	if !shouldCompact(tablet.Files, resolved.Stack) {
+// compactTablet applies the (already-resolved) majc stack to one tablet.
+// The bool return is true when the tablet was skipped as a no-op.
+func compactTablet(ctx context.Context, tableID string, tablet metadata.TabletInfo, stack []iterrt.IterSpec, deps Deps, opts Options, newName func() string, logger *slog.Logger) (*TabletResult, bool, error) {
+	if !shouldCompact(tablet.Files, stack) {
 		logger.Debug("skipping tablet (nothing to compact)",
 			slog.String("table", tableID),
 			slog.String("end_row", metadata.PrintableBytes(tablet.EndRow)),
 			slog.Int("files", len(tablet.Files)),
-			slog.Int("iterators", len(resolved.Stack)),
+			slog.Int("iterators", len(stack)),
 		)
 		return nil, true, nil
 	}
@@ -226,15 +230,18 @@ func compactTablet(ctx context.Context, tableID string, tablet metadata.TabletIn
 		inputs = append(inputs, compaction.Input{Name: f.Path, Bytes: b})
 	}
 
-	result, err := compaction.Compact(compaction.Spec{
+	// One spec drives both the compaction and (if enabled) the
+	// verification's independent re-derivation, so they can never drift.
+	spec := compaction.Spec{
 		Inputs:              inputs,
-		Stack:               resolved.Stack,
+		Stack:               stack,
 		Scope:               iterrt.ScopeMajc,
 		FullMajorCompaction: true,
 		Codec:               opts.Codec,
 		BlockSize:           opts.BlockSize,
 		AdjacencyEdgeCF:     opts.AdjacencyEdgeCF,
-	})
+	}
+	result, err := compaction.Compact(spec)
 	if err != nil {
 		return nil, false, fmt.Errorf("offlinecompact: compact tablet %s of %s: %w",
 			metadata.PrintableBytes(tablet.EndRow), tableID, err)
@@ -251,15 +258,6 @@ func compactTablet(ctx context.Context, tableID string, tablet metadata.TabletIn
 
 	var vreport *VerifyReport
 	if opts.Verify {
-		spec := compaction.Spec{
-			Inputs:              inputs,
-			Stack:               resolved.Stack,
-			Scope:               iterrt.ScopeMajc,
-			FullMajorCompaction: true,
-			Codec:               opts.Codec,
-			BlockSize:           opts.BlockSize,
-			AdjacencyEdgeCF:     opts.AdjacencyEdgeCF,
-		}
 		vreport, err = VerifyTablet(spec, result.Output, result.EntriesWritten)
 		if err != nil {
 			return nil, false, fmt.Errorf("offlinecompact: verify tablet %s of %s: %w",
@@ -287,7 +285,7 @@ func compactTablet(ctx context.Context, tableID string, tablet metadata.TabletIn
 
 	return &TabletResult{
 		Tablet:         tablet,
-		Stack:          resolved.Stack,
+		Stack:          stack,
 		Inputs:         tablet.Files,
 		OutputPath:     outPath,
 		OutputSize:     int64(len(result.Output)),

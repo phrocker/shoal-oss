@@ -176,16 +176,24 @@ func run() int {
 
 	// Fence-verified commit (plan-emit by default; direct writes only
 	// when --dry-run=false and --commit-mode=direct with a committer).
-	commitPlan, err := offlinecompact.Commit(ctx, plan, fence, minted, commitMode, *dryRun, nil)
-	if err != nil {
-		return fail(logger, "commit: %v", err)
-	}
+	commitPlan, commitErr := offlinecompact.Commit(ctx, plan, fence, minted, commitMode, *dryRun, nil)
 
-	// Always emit the commit plan artifact so the operator can inspect
-	// (dry-run) or replay (Mode P) the exact metadata delta.
-	planPath, err := writeCommitPlan(*outDir, tableID, commitPlan)
-	if err != nil {
-		return fail(logger, "write commit plan: %v", err)
+	// Always emit the commit plan artifact when one was produced — even
+	// on a commit error (e.g. ErrDirectCommitUnavailable, or a mid-run
+	// Mode D failure) — so the operator can inspect or resume from it.
+	var planPath string
+	if commitPlan != nil {
+		planPath, err = writeCommitPlan(*outDir, tableID, commitPlan)
+		if err != nil {
+			return fail(logger, "write commit plan: %v", err)
+		}
+	}
+	if commitErr != nil {
+		if planPath != "" {
+			logger.Error("commit plan written despite commit failure",
+				slog.String("commit_plan", planPath))
+		}
+		return fail(logger, "commit: %v", commitErr)
 	}
 
 	switch {

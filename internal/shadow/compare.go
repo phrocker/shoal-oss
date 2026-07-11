@@ -31,8 +31,8 @@ import (
 	"github.com/phrocker/shoal/internal/compaction"
 	"github.com/phrocker/shoal/internal/rfile"
 	"github.com/phrocker/shoal/internal/rfile/bcfile"
-	"github.com/phrocker/shoal/internal/rfile/wire"
 	"github.com/phrocker/shoal/internal/rfile/bcfile/block"
+	"github.com/phrocker/shoal/internal/rfile/wire"
 )
 
 // Compare runs the parity oracle. Streaming-hash design:
@@ -128,6 +128,39 @@ func Compare(spec CompareSpec, javaOutput []byte) (*Report, error) {
 		// it was deliberately not run.
 		report.T3 = T3Result{}
 	}
+
+	return report, nil
+}
+
+// ValidateOutput runs the shoal-only verification tiers over an
+// already-produced output RFile WITHOUT recompacting. Offline-compaction
+// verification must validate the exact bytes written to storage, not a
+// fresh recompaction — so it cannot use Compare (which regenerates its own
+// output and would ignore the caller's writer/codec/block choices).
+//
+// Populates:
+//   - T4 (always): per-file summary — cell count, per-CF histogram,
+//     first/last key, size — over the provided bytes (ShoalSummary,
+//     ShoalCells).
+//   - T1 (env-gated on SHOAL_JAVA_RFILE_VALIDATE): the Java RFile reader
+//     run against the provided bytes, proving Java can consume shoal's
+//     actual output (T1, T1Ms).
+//
+// T2/T3 are left un-attempted: there is no Java reference output to
+// cross-diff against for a fresh offline compaction.
+func ValidateOutput(output []byte) (*Report, error) {
+	report := &Report{}
+
+	_, summary, err := hashRFile(output)
+	if err != nil {
+		return nil, fmt.Errorf("summarize output: %w", err)
+	}
+	report.ShoalSummary = summary
+	report.ShoalCells = summary.TotalCells
+
+	t1 := runJavaValidator(output)
+	report.T1 = t1
+	report.T1Ms = t1.elapsedMs
 
 	return report, nil
 }

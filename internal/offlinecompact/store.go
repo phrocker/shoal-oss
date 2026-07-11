@@ -20,6 +20,7 @@ package offlinecompact
 import (
 	"context"
 	"fmt"
+	"io"
 
 	"github.com/phrocker/shoal/internal/storage"
 )
@@ -66,7 +67,7 @@ func (s *BackendStore) Write(ctx context.Context, path string, data []byte) erro
 	if err != nil {
 		return fmt.Errorf("offlinecompact: create %s: %w", path, err)
 	}
-	if _, err := w.Write(data); err != nil {
+	if err := writeAll(w, data); err != nil {
 		w.Close()
 		return fmt.Errorf("offlinecompact: write %s: %w", path, err)
 	}
@@ -78,6 +79,28 @@ func (s *BackendStore) Write(ctx context.Context, path string, data []byte) erro
 	}
 	if err := w.Close(); err != nil {
 		return fmt.Errorf("offlinecompact: close %s: %w", path, err)
+	}
+	return nil
+}
+
+// writeAll writes every byte of data, tolerating a Writer that returns
+// short counts. A zero-progress write with no error is treated as a
+// failure rather than looping forever, so a misbehaving backend can never
+// silently leave a truncated RFile that verification (which uses the
+// in-memory image) would still pass and oc-commit would later reference.
+func writeAll(w io.Writer, data []byte) error {
+	for len(data) > 0 {
+		n, err := w.Write(data)
+		if n < 0 || n > len(data) {
+			return fmt.Errorf("writer returned invalid count %d (remaining %d)", n, len(data))
+		}
+		data = data[n:]
+		if err != nil {
+			return err
+		}
+		if n == 0 && len(data) > 0 {
+			return fmt.Errorf("writer made no progress with %d bytes remaining", len(data))
+		}
 	}
 	return nil
 }
