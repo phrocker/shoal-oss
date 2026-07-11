@@ -1,0 +1,278 @@
+<!--
+
+    Licensed to the Apache Software Foundation (ASF) under one
+    or more contributor license agreements.  See the NOTICE file
+    distributed with this work for additional information
+    regarding copyright ownership.  The ASF licenses this file
+    to you under the Apache License, Version 2.0 (the
+    "License"); you may not use this file except in compliance
+    with the License.  You may obtain a copy of the License at
+
+      https://www.apache.org/licenses/LICENSE-2.0
+
+    Unless required by applicable law or agreed to in writing,
+    software distributed under the License is distributed on an
+    "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+    KIND, either express or implied.  See the License for the
+    specific language governing permissions and limitations
+    under the License.
+
+-->
+# Offline compaction of Accumulo-hosted tablets — design
+
+Status: **draft / design**. Implementation tracked by todos `oc-*`.
+
+## 1. Goal
+
+Let shoal perform a **major compaction of a tablet whose table is
+offline**, end to end, from a standalone Go binary — no tserver, no
+manager, no compaction coordinator in the loop — and commit the result
+back into `accumulo.metadata` safely.
+
+This is the offline counterpart to the online `shoal-compactor`
+(`cmd/shoal-compactor`), which today connects to the coordinator but
+**stops at the metadata-commit boundary** because a non-manager process
+has no write authority over `accumulo.metadata` / `accumulo.root` while
+a tablet is live.
+
+## 2. Why offline is the safe path
+
+The online commit problem is a **concurrency + authority** problem: while
+a tablet is hosted, its tserver is the single writer of that tablet's
+file set, and only the manager (via Ample + the metadata-constraint
+iterators) may mutate `file:` refs. Bypassing that risks the exact
+"authority bleeding" wedge called out in the `shoal-compactor` file
+header.
+
+Taking the table **OFFLINE removes the concurrent writer entirely**:
+
+- No tserver hosts any tablet of an offline table, so nothing else is
+  reading or rewriting the tablet's RFiles or its metadata row.
+- The tablet's `file:` column set is quiescent — it cannot change under
+  us between the moment we read it and the moment we commit.
+- Accumulo's own bulk-import / clone / export tooling relies on the same
+  offline invariant, so we are reusing a well-understood safety envelope
+  rather than inventing one.
+
+That single invariant — **table is OFFLINE for the whole operation** —
+is what makes a non-manager metadata commit defensible. Everything in
+this design exists to *establish, fence, and preserve* that invariant.
+
+## 3. Safety model
+
+### 3.1 The OFFLINE fence
+
+The table state lives in ZooKeeper (`/accumulo/<iid>/tables/<id>/state`,
+value `OFFLINE` / `ONLINE`). The orchestrator:
+
+1. **Pre-check**: read table state; abort unless it is exactly `OFFLINE`.
+2. **Watch/latch**: register a ZK watch on the state znode. If the state
+   leaves `OFFLINE` at any point during the run, the operation aborts
+   before commit (fail-closed).
+3. **Re-check at commit**: immediately before the metadata mutation,
+   re-read the state znode *and* confirm the watch never fired. Commit
+   only if both agree the table has been continuously OFFLINE.
+
+This is a compare-and-swap in spirit: we treat "table continuously
+OFFLINE from pre-check through commit" as the CAS guard. If anyone
+onlines the table mid-run, we throw the work away rather than commit
+against a possibly-hosted tablet.
+
+> We deliberately do **not** try to compact online tables by racing the
+> tserver. If the operator wants online compaction, that is the separate
+> coordinator-driven path and requires the Java-side `CompactionCommit`
+> RPC (out of scope here).
+
+### 3.2 Full-major semantics
+
+Offline compaction is always a **full major compaction**: all of a
+tablet's input RFiles are merged into exactly one output RFile, and the
+output is the tablet's sole remaining file. This is the only mode where
+`DeletingIterator` may legally drop tombstones (see `compaction.Spec.
+FullMajorCompaction` and `iterrt` `DeletingIterator` Init contract), and
+it keeps the metadata mutation trivial: replace the entire `file:` set
+with one entry.
+
+Partial/selection compactions (merge a subset) are a later extension;
+they complicate delete propagation and are not needed for the primary
+use case (shrink a tablet's file count / apply a stack offline).
+
+### 3.3 GC-safe input dereference
+
+We never delete input RFiles from the volume directly. The commit
+removes the input `file:` refs from the tablet's metadata row; Accumulo's
+garbage collector reclaims the now-unreferenced files on its normal
+cycle. This matches how the manager's own commit path behaves and avoids
+a shoal-side file-deletion authority claim.
+
+### 3.4 Dry-run by default
+
+The CLI defaults to **dry-run**: it performs the full read + compaction +
+verification and prints the exact metadata mutation it *would* apply
+(input refs to delete, output ref to insert), then exits without
+touching metadata. A real commit requires an explicit `--commit` (or
+`--dry-run=false`) flag *and* the OFFLINE fence.
+
+### 3.5 Rollback
+
+The output RFile is written under a fresh, unique name (`A<uuid>.rf`
+convention) *before* the metadata mutation. The metadata mutation is the
+single linearization point:
+
+- If we crash **before** the mutation: the orphan output file is
+  unreferenced and GC reclaims it. Inputs are untouched. No-op.
+- If we crash **during/after** the mutation: the mutation is a single
+  conditional batch (see §4.3). It either landed atomically or it did
+  not; on restart the orchestrator re-reads the tablet's file set and
+  is idempotent (if it already sees the single output file, it treats
+  the tablet as done).
+
+## 4. Architecture
+
+Reuses existing, already-tested components; the new code is orchestration
++ commit + verification glue.
+
+```
+metadata.Walker ──► enumerate tablets + file: sets (per table/range)
+        │
+        ▼
+shadow/itercfg  ──► resolve table.iterator.majc.* stack  ─┐
+        │                                                  │ (must have
+internal/storage ─► fetch each input RFile's bytes         │  full shoal
+        │                                                  │  coverage —
+        ▼                                                  │  else abort:
+internal/compaction.Compact(Spec{Inputs, Stack, Majc,      │  see §6)
+        FullMajorCompaction:true}) ─► output RFile bytes ◄─┘
+        │
+        ▼
+internal/storage ─► write A<uuid>.rf + fsync
+        │
+        ▼
+internal/offlinecompact/commit ─► OFFLINE fence re-check + metadata CAS
+        │
+        ▼
+internal/offlinecompact/verify ─► self-consistency + shadow oracle
+```
+
+### 4.1 `internal/offlinecompact` (new package)
+
+Pure-ish orchestrator. Given `(tableID, optional row range, options)`:
+
+1. Fence pre-check (§3.1).
+2. `Walker` enumerate target tablets.
+3. For each tablet: resolve majc stack (itercfg), fetch inputs
+   (storage), `compaction.Compact`, write output.
+4. Verify (§5).
+5. Fence re-check, then commit (§4.3) unless dry-run.
+
+Kept free of I/O primitives it does not own — it composes `metadata`,
+`storage`, `itercfg`, `compaction`, and `zk` rather than reimplementing
+them.
+
+### 4.2 Output file naming
+
+Match Accumulo's convention so the file is indistinguishable from a
+Java-produced one: full major compaction outputs are named `A<base>.rf`
+in the tablet's directory (`<volume>/tables/<id>/<tabletDir>/`). We
+generate `<base>` from a UUID to avoid collisions.
+
+### 4.3 The metadata commit — decision required
+
+Two candidate mechanisms; **the CLI supports both, defaulting to the
+conservative one until we have soak time on direct mode.**
+
+**Mode P (plan, conservative, default):** emit a machine-readable commit
+plan (per tablet: extent, input refs to delete, output ref + size +
+entry count to insert). An operator applies it with Accumulo's own
+tooling (a small `accumulo shell` script or a supplied Java applier that
+uses Ample). Write authority never leaves Accumulo. Slower UX, zero new
+trust claim.
+
+**Mode D (direct, faster, opt-in):** shoal writes the `accumulo.metadata`
+mutation itself as a **conditional mutation** — the batch is guarded by
+a condition on the tablet's current file set (the exact input refs we
+read), so if metadata changed underneath us the conditional write is
+rejected server-side. Combined with the OFFLINE fence this is safe, but
+it *is* a shoal-side metadata write, so it stays opt-in behind
+`--commit-mode=direct` and starts life gated in docs as "advanced".
+
+> Recommendation: ship Mode P first (unblocks the workflow with zero
+> authority risk), land Mode D behind the flag once `oc-e2e` has soak
+> coverage. This is the one open decision for `oc-commit`.
+
+## 5. Verification (`oc-verify`)
+
+There is no Java "expected output" for a fresh offline compaction (Java
+never ran it), so we cannot use the shadow oracle's T2/T3 cross-diff
+directly. Instead we layer three independent checks:
+
+1. **Self-consistency (primary gate):** independently re-scan the *input*
+   RFiles through the *same* iterator stack in a second pipeline and
+   assert the emitted cell sequence is byte-identical to the output
+   RFile's cell sequence. This catches writer bugs, block-boundary
+   corruption, and stack non-determinism.
+2. **Shadow oracle, shoal-only mode:** run `shadow.Compare` with
+   `JavaCellsSourced=false` to get T1 (self-read: the output RFile is
+   re-openable and fully scannable) + T4 (per-file summary sanity:
+   cell count, CF histogram, first/last key).
+3. **Optional Java cross-read:** if `SHOAL_JAVA_RFILE_VALIDATE` is
+   configured, run the real Java RFile reader over shoal's output to
+   prove Java can consume it (the T1 tier's external validator). This is
+   the strongest single assurance that the offline output is a
+   first-class Accumulo RFile.
+
+Verification runs in dry-run too, so operators can gain confidence before
+ever committing.
+
+## 6. Iterator-coverage precondition (link to Workstream B)
+
+Offline compaction can only run a tablet whose entire majc stack is
+covered by shoal iterators. `itercfg.ResolvedStack.Skipped` lists any
+`table.iterator.majc.*` class with no shoal port. If `Skipped` is
+non-empty the orchestrator **aborts that tablet** (never silently drops
+an iterator — that would corrupt semantics).
+
+Closing that gap is exactly what the **iterator forge** (Workstream B,
+`if-*`, see `iterator-forge-design.md`) does: it ports the missing Java
+iterators to Go and widens `itercfg.ClassAllowlist`. The two workstreams
+are complementary — A is usable today for allowlisted stacks; B expands
+the set of tables A can service.
+
+## 7. CLI surface (`cmd/shoal-offline-compact`)
+
+```
+shoal-offline-compact \
+  --zk <quorum> --instance <name> \
+  --table <name|id> [--range <startRow>:<endRow>] \
+  [--dry-run=true]              # default: plan+verify, no commit
+  [--commit-mode=plan|direct]  # default: plan
+  [--verify=true]              # default: run §5 checks
+  [--out <dir>]                # where to write the commit plan (Mode P)
+```
+
+Exit non-zero if: table not OFFLINE, any target tablet has a Skipped
+iterator, verification fails, or the fence trips.
+
+## 8. Testing (`oc-e2e`)
+
+Against a Mini/real Accumulo instance:
+
+1. Ingest known data, flush + compact a few times to create multiple
+   RFiles per tablet.
+2. Offline the table.
+3. Run `shoal-offline-compact --dry-run=false` (Mode P applied via the
+   test's Ample applier; Mode D exercised directly).
+4. Online the table.
+5. Full scan; assert every original cell is present and correct, and the
+   tablet now has a single `file:` entry.
+6. Negative tests: table left ONLINE ⇒ abort; a table with an unported
+   iterator ⇒ abort with the Skipped class named.
+
+## 9. Open decisions
+
+- **D-1 (commit mechanism):** ship Mode P default + Mode D opt-in as
+  above, or go direct-only? Current lean: **P default, D opt-in.**
+- **D-2 (range compaction):** full-table only for v1, or allow
+  `--range` sub-tablet selection from the start? Current lean: allow
+  `--range` at tablet granularity (whole tablets intersecting the
+  range), never sub-tablet.
