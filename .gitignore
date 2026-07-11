@@ -17,3 +17,7 @@ shoal-embed.exe~
 cpu
 cpw
 mp
+
+# build artifacts
+*.exe
+shoal-offline-compact.exe
