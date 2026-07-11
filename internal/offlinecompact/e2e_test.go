@@ -147,7 +147,13 @@ func scanTablet(t *testing.T, m *memStore, meta *modelMeta, endRow []byte) []kv 
 		if cells[i].row != cells[j].row {
 			return cells[i].row < cells[j].row
 		}
-		return cells[i].ts > cells[j].ts // Accumulo: newer ts sorts first
+		if cells[i].ts != cells[j].ts {
+			return cells[i].ts > cells[j].ts // Accumulo: newer ts sorts first
+		}
+		if cells[i].cf != cells[j].cf {
+			return cells[i].cf < cells[j].cf
+		}
+		return cells[i].cq < cells[j].cq
 	})
 	return cells
 }
@@ -194,6 +200,9 @@ func twoTabletFixture(t *testing.T, m *memStore) []metadata.TabletInfo {
 func fixedNames(names ...string) func() string {
 	i := 0
 	return func() string {
+		if i >= len(names) {
+			panic(fmt.Sprintf("fixedNames exhausted: Run requested more than the %d output name(s) the test provided; add names to match the fixture", len(names)))
+		}
 		n := names[i]
 		i++
 		return n
