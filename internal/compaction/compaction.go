@@ -152,7 +152,7 @@ func Compact(spec Spec) (*Result, error) {
 		}
 		written++
 		if err := top.Next(); err != nil {
-			return nil, fmt.Errorf("compaction: advance after cell %d: %w", written, err)
+			return nil, fmt.Errorf("compaction: advance after cell %d: %w", written-1, err)
 		}
 	}
 	if err := w.Close(); err != nil {

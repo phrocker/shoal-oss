@@ -180,6 +180,16 @@ func Commit(ctx context.Context, p *Plan, fence StateFence, minted FenceToken, m
 	}
 	cp.Mode = mode.String()
 
+	// Validate the mode BEFORE the dry-run gate so an invalid CommitMode
+	// fails closed in every path — otherwise a dry run would happily emit
+	// a plan stamped with a bogus mode and no error.
+	switch mode {
+	case ModePlan, ModeDirect:
+		// recognized
+	default:
+		return cp, fmt.Errorf("unknown commit mode %v", mode)
+	}
+
 	if dryRun {
 		return cp, nil
 	}
