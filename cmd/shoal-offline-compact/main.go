@@ -68,7 +68,7 @@ func run() int {
 	table := flag.String("table", "", "table name or id to compact (REQUIRED)")
 	rangeSpec := flag.String("range", "", "restrict to tablets in startRow:endRow (inclusive; either side may be empty for unbounded)")
 	dryRun := flag.Bool("dry-run", true, "plan + verify only; pass --dry-run=false to actually commit (the ONLY commit gate)")
-	commitModeStr := flag.String("commit-mode", "plan", "plan|direct — how to commit; only consulted when --dry-run=false")
+	commitModeStr := flag.String("commit-mode", "plan", "plan|direct — how to commit; always validated, but only acted on when --dry-run=false")
 	doVerify := flag.Bool("verify", true, "run the §5 verification on every compacted tablet")
 	outDir := flag.String("out", ".", "directory to write the commit plan into (Mode P)")
 	storageScheme := flag.String("storage", "gs", "RFile storage backend: gs, s3, azure, local, memory")
