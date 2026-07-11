@@ -78,12 +78,18 @@ This is the forge's input queue.
 
 ### 3.2 Acquire
 
-Obtain the iterator's **Java source** (preferred) or **bytecode**:
+Obtain the iterator's **Java source** (the common, preferred case) or
+fall back to **bytecode**:
 
-- Source path: operator points the forge at the jar's source or a
-  source tree. Best transpile quality.
-- Bytecode path: decompile the class from the deployed jar (the class is
-  already on the cluster classpath). Lower fidelity but always available.
+- **Source path (expected for most iterators):** the operator points the
+  forge at the iterator's source (the jar's `-sources` artifact or a
+  source tree). Custom iterators are typically first-party code the
+  operator owns, so source is available in the majority of real cases,
+  and it yields by far the best transpile quality (comments, option
+  descriptors, and control flow all survive).
+- **Bytecode path (fallback):** when only the deployed jar is available,
+  decompile the class from the cluster classpath. Lower fidelity but
+  always available.
 
 Capture, alongside the code: the fully-qualified class name + hash, the
 `IteratorSetting` option keys it reads (scraped from `init()` / option
@@ -104,7 +110,13 @@ GoldenTrace {
   javaClass, classHash
   scope, options
   inputRFileRefs (hashes)
-  outputCells []Cell   // the ground truth
+  // The ground truth: the iterator's full output as canonical
+  // key/value BYTES in Accumulo sort order — each entry is the
+  // serialized (row, cf, cq, vis, timestamp, deleteFlag) key plus the
+  // raw value bytes, exactly as an RFile would encode them. Stored as
+  // opaque bytes, NOT as any in-memory Cell struct, so the trace is
+  // serializable and the parity gate compares byte-for-byte.
+  outputEntries [](keyBytes, valueBytes)
 }
 ```
 
@@ -158,10 +170,18 @@ The acceptance test. For every golden trace:
 
 1. Build a shoal leaf from the trace's input RFiles.
 2. Stack the generated iterator with the trace's options/scope.
-3. Drain it and diff against `outputCells` using the **shadow** oracle's
-   T2 (cell-sequence, first-divergence) and T3 (random point-lookup)
-   comparators — the same byte-exact machinery already trusted for
-   compaction parity.
+3. Drain it and diff its emitted key/value byte stream against the
+   trace's `outputEntries` using the **shadow** oracle's **T2**
+   comparator — a streaming digest over the canonical cell sequence that
+   proves position-for-position equality (see `internal/shadow/
+   compare.go`). This is the same byte-exact machinery already trusted
+   for compaction parity.
+
+> Note: the shadow oracle's T3 (random point-lookup sampling) is
+> **vestigial** under the current streaming-hash design — `compare.go`
+> always leaves `T3.Attempted=false`, because equal T2 digests already
+> prove the cell sequences are identical. The parity gate therefore
+> keys off **T2 only**; it does not rely on T3.
 
 Pass = byte-exact across the **entire** corpus. On pass, auto-generate a
 committed table-driven `_test.go` from the golden traces so the
@@ -171,8 +191,9 @@ LLM and of any live cluster).
 ### 3.7 Repair loop (`if-repair`)
 
 On compile failure or parity divergence, re-invoke the transpiler with
-the previous candidate + the **exact** failure signal (compiler error,
-or the first-divergence cell diff from T2 / the divergent probe from T3).
+the previous candidate + the **exact** failure signal: the compiler
+error, and/or the **T2 first-divergence diff** (the first position where
+the generated iterator's key/value bytes differ from the golden trace).
 Bounded to N rounds (default 3). If still failing, the class is reported
 as **needs-human-port** with the captured diffs attached — the forge
 degrades to a very good assistant rather than shipping something wrong.
@@ -194,7 +215,7 @@ On a green corpus:
 | Concern | Reuse | New |
 |---|---|---|
 | Iterator contract | `iterrt.SortedKeyValueIterator` | — |
-| Byte-exact diff | `shadow` T2/T3 comparators | — |
+| Byte-exact diff | `shadow` T2 comparator | — |
 | Config discovery | `shadow/itercfg` | worklist aggregation |
 | Class→alias map | `itercfg.ClassAllowlist` | promotion writer |
 | Run Java iterator | — | `shoal-iterforge-java` sidecar |
