@@ -65,18 +65,31 @@ this design exists to *establish, fence, and preserve* that invariant.
 The table state lives in ZooKeeper (`/accumulo/<iid>/tables/<id>/state`,
 value `OFFLINE` / `ONLINE`). The orchestrator:
 
-1. **Pre-check**: read table state; abort unless it is exactly `OFFLINE`.
-2. **Watch/latch**: register a ZK watch on the state znode. If the state
-   leaves `OFFLINE` at any point during the run, the operation aborts
-   before commit (fail-closed).
+1. **Fenced read**: read the state znode **and set the watch in the same
+   ZK call** (`getData(path, watch=true)`), capturing both the value and
+   the znode `Stat` (specifically `stat.version` and the read's `zxid`).
+   Abort unless the value is exactly `OFFLINE`. Registering the watch in
+   the same call as the read closes the classic watch race — a state
+   flip between a separate read and a later watch registration cannot
+   slip through, because there is no gap between them.
+2. **Session-expiry is a fence failure**: if the ZK session expires (or
+   disconnects long enough to lose the watch) at any point during the
+   run, the operation aborts before commit (fail-closed). A lost session
+   means we can no longer prove continuity, so we treat it as a
+   definite fence trip rather than assuming OFFLINE held.
 3. **Re-check at commit**: immediately before the metadata mutation,
-   re-read the state znode *and* confirm the watch never fired. Commit
-   only if both agree the table has been continuously OFFLINE.
+   re-read the state znode and require **both** (a) value still exactly
+   `OFFLINE`, and (b) `stat.version` **unchanged** from the fenced read
+   in step 1. The version check is the real guard — ZK watches are
+   one-shot and "the watch never fired" alone does not prove the absence
+   of an intermediate ONLINE→OFFLINE round-trip; an unchanged
+   `stat.version` does (any state write bumps the version).
 
-This is a compare-and-swap in spirit: we treat "table continuously
-OFFLINE from pre-check through commit" as the CAS guard. If anyone
-onlines the table mid-run, we throw the work away rather than commit
-against a possibly-hosted tablet.
+This is a compare-and-swap in spirit: the CAS guard is the tuple
+(value==`OFFLINE`, `stat.version` unchanged, session never lost) from the
+fenced read through commit. If anyone onlines the table mid-run — even
+transiently and back — the version advances and we throw the work away
+rather than commit against a possibly-hosted tablet.
 
 > We deliberately do **not** try to compact online tables by racing the
 > tserver. If the operator wants online compaction, that is the separate
@@ -110,8 +123,10 @@ a shoal-side file-deletion authority claim.
 The CLI defaults to **dry-run**: it performs the full read + compaction +
 verification and prints the exact metadata mutation it *would* apply
 (input refs to delete, output ref to insert), then exits without
-touching metadata. A real commit requires an explicit `--commit` (or
-`--dry-run=false`) flag *and* the OFFLINE fence.
+touching metadata. A real commit requires passing `--dry-run=false`
+*and* a passing OFFLINE fence. (`--dry-run` is the single source of
+truth for the commit gate; see §7 for the flag list — there is no
+separate `--commit` flag.)
 
 ### 3.5 Rollback
 
@@ -244,8 +259,11 @@ the set of tables A can service.
 shoal-offline-compact \
   --zk <quorum> --instance <name> \
   --table <name|id> [--range <startRow>:<endRow>] \
-  [--dry-run=true]              # default: plan+verify, no commit
-  [--commit-mode=plan|direct]  # default: plan
+  [--dry-run=true]              # default true: plan+verify, no commit.
+                               #   Pass --dry-run=false to actually commit
+                               #   (this is the ONLY commit gate flag).
+  [--commit-mode=plan|direct]  # default: plan. Only consulted when
+                               #   --dry-run=false.
   [--verify=true]              # default: run §5 checks
   [--out <dir>]                # where to write the commit plan (Mode P)
 ```
