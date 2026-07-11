@@ -20,7 +20,10 @@
 -->
 # Offline compaction of Accumulo-hosted tablets — design
 
-Status: **draft / design**. Implementation tracked by todos `oc-*`.
+Status: **implemented**. Orchestrator, OFFLINE fence + guarded commit,
+verification, and the `shoal-offline-compact` CLI have all landed (todos
+`oc-*`). Operators should start with the runbook:
+[`offline-compaction.md`](./offline-compaction.md).
 
 ## 1. Goal
 
@@ -273,6 +276,22 @@ iterator, verification fails, or the fence trips.
 
 ## 8. Testing (`oc-e2e`)
 
+Two layers:
+
+**Hermetic pipeline test (implemented, runs every build).**
+`internal/offlinecompact/e2e_test.go` wires the real
+Run → verify → Commit → apply → "online + full scan" cycle against an
+in-process model of the pieces a cluster provides (RFile store, tablet
+enumerator, majc-stack resolver, an `accumulo.metadata` model with a
+conditional applier, and the **real** fence continuity predicates
+`requireOffline` + `verifyContinuity` driven off a mutable table-state).
+It covers: Mode D full cycle, the Mode P plan JSON hand-off to an
+out-of-band applier, the ONLINE-round-trip version-guard trip at commit,
+ONLINE-at-fence refusal, and an unported-iterator abort. This is the gate
+that a full-scan of the committed output equals the original data
+(post-versioning) and each tablet collapses to a single `file:` entry.
+
+**Cluster-backed test (follow-up, out of the unit suite).**
 Against a Mini/real Accumulo instance:
 
 1. Ingest known data, flush + compact a few times to create multiple
@@ -286,11 +305,14 @@ Against a Mini/real Accumulo instance:
 6. Negative tests: table left ONLINE ⇒ abort; a table with an unported
    iterator ⇒ abort with the Skipped class named.
 
-## 9. Open decisions
+## 9. Decisions
 
-- **D-1 (commit mechanism):** ship Mode P default + Mode D opt-in as
-  above, or go direct-only? Current lean: **P default, D opt-in.**
-- **D-2 (range compaction):** full-table only for v1, or allow
-  `--range` sub-tablet selection from the start? Current lean: allow
-  `--range` at tablet granularity (whole tablets intersecting the
-  range), never sub-tablet.
+- **D-1 (commit mechanism):** **DECIDED — Mode P default + Mode D
+  opt-in.** shoal ships the conservative plan-emit path as the default
+  and keeps metadata-write authority inside Accumulo; the direct
+  `MetadataCommitter` seam is opt-in (`--commit-mode=direct`) and errors
+  clearly until a committer is wired. We do not go direct-only.
+- **D-2 (range compaction):** **DECIDED — range compaction is
+  supported.** `--range` selects whole tablets that intersect the given
+  row range (tablet granularity, never sub-tablet); an empty `--range`
+  compacts the whole table. See `SelectTablets`.
