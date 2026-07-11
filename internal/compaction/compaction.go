@@ -43,6 +43,7 @@ import (
 	"github.com/phrocker/shoal/internal/rfile"
 	"github.com/phrocker/shoal/internal/rfile/bcfile"
 	"github.com/phrocker/shoal/internal/rfile/bcfile/block"
+	"github.com/phrocker/shoal/internal/rfile/wire"
 )
 
 // Input is one RFile feeding a compaction. Bytes is the whole RFile
@@ -123,60 +124,11 @@ type Result struct {
 // MergingIterator emits them sorted and the stack above it is
 // order-preserving (versioning/visibility only drop cells, never reorder).
 func Compact(spec Spec) (*Result, error) {
-	leaves := make([]iterrt.SortedKeyValueIterator, 0, len(spec.Inputs))
-	closers := make([]io.Closer, 0, len(spec.Inputs))
-	defer func() {
-		for _, c := range closers {
-			_ = c.Close()
-		}
-	}()
-
-	env := iterrt.IteratorEnvironment{
-		Scope:               spec.Scope,
-		FullMajorCompaction: spec.FullMajorCompaction,
-	}
-
-	for _, in := range spec.Inputs {
-		src, rdr, err := openInputSource(in, env)
-		if err != nil {
-			return nil, err
-		}
-		closers = append(closers, rdr)
-		leaves = append(leaves, src)
-	}
-
-	merge := iterrt.NewMergingIterator(leaves...)
-	if err := merge.Init(nil, nil, env); err != nil {
-		return nil, fmt.Errorf("compaction: merge init: %w", err)
-	}
-
-	// Wrap source in DeletingIterator BEFORE applying user iterators —
-	// matches Java's FileCompactor.compactLocalityGroup, which builds
-	// the stack as: source → DeletingIterator → user iterators. Without
-	// this, any tombstone in the input passes through to user iterators
-	// (e.g. LatentEdgeDiscoveryIterator) as a live cell. Symptom on
-	// graph_vidx: latentEdge buffers vertices whose Java-side equivalent
-	// was already skipped, yielding a ~14% delta in emitted link cells
-	// on tablets where vertices have been deleted.
-	//
-	// The propagateDeletes flag is computed from env.Scope +
-	// FullMajorCompaction (see DeletingIterator's Init contract):
-	// dropping tombstones is safe only when the output is the tablet's
-	// sole file (FullMajorCompaction at ScopeMajc). Everything else
-	// preserves them so a later compaction can apply suppression
-	// against RFiles this stack didn't see.
-	delIter := iterrt.NewDeletingIterator()
-	if err := delIter.Init(merge, nil, env); err != nil {
-		return nil, fmt.Errorf("compaction: deleting iter init: %w", err)
-	}
-
-	top, err := iterrt.BuildStack(delIter, spec.Stack, env)
+	top, closer, err := buildSource(spec)
 	if err != nil {
-		return nil, fmt.Errorf("compaction: build stack: %w", err)
+		return nil, err
 	}
-	if err := top.Seek(iterrt.InfiniteRange(), nil, false); err != nil {
-		return nil, fmt.Errorf("compaction: seek: %w", err)
-	}
+	defer closer.Close()
 
 	codec := spec.Codec
 	if codec == "" {
@@ -209,6 +161,106 @@ func Compact(spec Spec) (*Result, error) {
 
 	return &Result{Output: buf.Bytes(), EntriesWritten: written}, nil
 }
+
+// StreamCells drains the compaction source for spec — the merged,
+// delete-aware, fully-iterated cell stream that Compact would feed to the
+// writer — invoking emit for each (key, value) in non-decreasing key
+// order. It performs no RFile writing, so it is the "second pipeline"
+// oc-verify uses to independently re-derive the expected output cells
+// from the inputs and compare them against the written RFile.
+//
+// The key/value passed to emit are owned by the underlying iterators and
+// are only valid until the next call; copy anything that must outlive it.
+func StreamCells(spec Spec, emit func(k *wire.Key, v []byte) error) error {
+	top, closer, err := buildSource(spec)
+	if err != nil {
+		return err
+	}
+	defer closer.Close()
+
+	for top.HasTop() {
+		if err := emit(top.GetTopKey(), top.GetTopValue()); err != nil {
+			return err
+		}
+		if err := top.Next(); err != nil {
+			return fmt.Errorf("compaction: advance: %w", err)
+		}
+	}
+	return nil
+}
+
+// buildSource opens spec.Inputs, merges them, wraps the merge in the
+// delete-aware source, and stacks spec.Stack on top. The returned
+// iterator is seeked to the full range and ready to drain. The returned
+// io.Closer releases every input RFile reader; the caller must Close it.
+func buildSource(spec Spec) (iterrt.SortedKeyValueIterator, io.Closer, error) {
+	leaves := make([]iterrt.SortedKeyValueIterator, 0, len(spec.Inputs))
+	closers := make([]io.Closer, 0, len(spec.Inputs))
+	closeAll := func() {
+		for _, c := range closers {
+			_ = c.Close()
+		}
+	}
+
+	env := iterrt.IteratorEnvironment{
+		Scope:               spec.Scope,
+		FullMajorCompaction: spec.FullMajorCompaction,
+	}
+
+	for _, in := range spec.Inputs {
+		src, rdr, err := openInputSource(in, env)
+		if err != nil {
+			closeAll()
+			return nil, nil, err
+		}
+		closers = append(closers, rdr)
+		leaves = append(leaves, src)
+	}
+
+	merge := iterrt.NewMergingIterator(leaves...)
+	if err := merge.Init(nil, nil, env); err != nil {
+		closeAll()
+		return nil, nil, fmt.Errorf("compaction: merge init: %w", err)
+	}
+
+	// Wrap source in DeletingIterator BEFORE applying user iterators —
+	// matches Java's FileCompactor.compactLocalityGroup, which builds
+	// the stack as: source → DeletingIterator → user iterators. Without
+	// this, any tombstone in the input passes through to user iterators
+	// (e.g. LatentEdgeDiscoveryIterator) as a live cell. Symptom on
+	// graph_vidx: latentEdge buffers vertices whose Java-side equivalent
+	// was already skipped, yielding a ~14% delta in emitted link cells
+	// on tablets where vertices have been deleted.
+	//
+	// The propagateDeletes flag is computed from env.Scope +
+	// FullMajorCompaction (see DeletingIterator's Init contract):
+	// dropping tombstones is safe only when the output is the tablet's
+	// sole file (FullMajorCompaction at ScopeMajc). Everything else
+	// preserves them so a later compaction can apply suppression
+	// against RFiles this stack didn't see.
+	delIter := iterrt.NewDeletingIterator()
+	if err := delIter.Init(merge, nil, env); err != nil {
+		closeAll()
+		return nil, nil, fmt.Errorf("compaction: deleting iter init: %w", err)
+	}
+
+	top, err := iterrt.BuildStack(delIter, spec.Stack, env)
+	if err != nil {
+		closeAll()
+		return nil, nil, fmt.Errorf("compaction: build stack: %w", err)
+	}
+	if err := top.Seek(iterrt.InfiniteRange(), nil, false); err != nil {
+		closeAll()
+		return nil, nil, fmt.Errorf("compaction: seek: %w", err)
+	}
+
+	return top, closerFunc(closeAll), nil
+}
+
+// closerFunc adapts a func() to io.Closer.
+type closerFunc func()
+
+func (f closerFunc) Close() error { f(); return nil }
 
 // openInputSource opens one Input as an iterrt leaf. The returned closer
 // is the rfile.Reader; the caller closes it once the compaction drains.

@@ -101,6 +101,10 @@ type Options struct {
 	// "A0f3c1a2b4d6.rf"). nil uses a UUID-based default. Injectable so
 	// tests are deterministic.
 	NewFileName func() string
+	// Verify, when true, runs the §5 verification on every compacted
+	// tablet (self-consistency + shadow shoal-only tiers) and aborts the
+	// run if any tablet's output fails to verify.
+	Verify bool
 	// Logger for per-tablet progress. nil uses slog.Default().
 	Logger *slog.Logger
 }
@@ -121,6 +125,9 @@ type TabletResult struct {
 	OutputSize int64
 	// EntriesWritten is the cell count in the output.
 	EntriesWritten int64
+	// Verify is the §5 verification report for this tablet's output.
+	// Populated only when Options.Verify is set; nil otherwise.
+	Verify *VerifyReport
 }
 
 // Plan is the full result of an orchestration pass over one table. It is
@@ -242,6 +249,33 @@ func compactTablet(ctx context.Context, tableID string, tablet metadata.TabletIn
 		return nil, false, fmt.Errorf("offlinecompact: write output %s: %w", outPath, err)
 	}
 
+	var vreport *VerifyReport
+	if opts.Verify {
+		spec := compaction.Spec{
+			Inputs:              inputs,
+			Stack:               resolved.Stack,
+			Scope:               iterrt.ScopeMajc,
+			FullMajorCompaction: true,
+			Codec:               opts.Codec,
+			BlockSize:           opts.BlockSize,
+			AdjacencyEdgeCF:     opts.AdjacencyEdgeCF,
+		}
+		vreport, err = VerifyTablet(spec, result.Output, result.EntriesWritten)
+		if err != nil {
+			return nil, false, fmt.Errorf("offlinecompact: verify tablet %s of %s: %w",
+				metadata.PrintableBytes(tablet.EndRow), tableID, err)
+		}
+		if !vreport.OK() {
+			return nil, false, fmt.Errorf("offlinecompact: verification failed for tablet %s of %s: %s",
+				metadata.PrintableBytes(tablet.EndRow), tableID, verifyFailureReason(vreport))
+		}
+		logger.Debug("tablet verified",
+			slog.String("table", tableID),
+			slog.String("end_row", metadata.PrintableBytes(tablet.EndRow)),
+			slog.Int64("cells_compared", vreport.CellsCompared),
+		)
+	}
+
 	logger.Info("tablet compacted",
 		slog.String("table", tableID),
 		slog.String("end_row", metadata.PrintableBytes(tablet.EndRow)),
@@ -258,7 +292,26 @@ func compactTablet(ctx context.Context, tableID string, tablet metadata.TabletIn
 		OutputPath:     outPath,
 		OutputSize:     int64(len(result.Output)),
 		EntriesWritten: result.EntriesWritten,
+		Verify:         vreport,
 	}, false, nil
+}
+
+// verifyFailureReason renders the most actionable reason a VerifyReport
+// failed its gate, for the abort error.
+func verifyFailureReason(r *VerifyReport) string {
+	if r == nil {
+		return "nil report"
+	}
+	if r.Mismatch != nil {
+		return "self-consistency: " + r.Mismatch.String()
+	}
+	if !r.SelfConsistent {
+		return "self-consistency failed"
+	}
+	if r.Shadow != nil && r.Shadow.T1.Attempted && !r.Shadow.T1.Passed {
+		return "java cross-read (T1) rejected output: " + r.Shadow.T1.Error
+	}
+	return "unknown"
 }
 
 // shouldCompact decides whether a tablet is worth compacting. A tablet
