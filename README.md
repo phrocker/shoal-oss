@@ -54,6 +54,7 @@ V1 + IVF-PQ iterator port shipped. Embedded standalone engine shipped.
 | File / locator / block caches | shipped |
 | Startup pre-warm (`-prewarm-tables=auto`) | shipped — distributed-serving mode |
 | Client-side hedge coordinator | shipped — `scanRow*` + `scanBatch*` overloads |
+| Offline compaction (`shoal-offline-compact`, `internal/offlinecompact`) | shipped — OFFLINE-fenced full major compaction off-cluster ([design](docs/offline-compaction-design.md) · [runbook](docs/offline-compaction.md)) |
 
 ## Embedded engine (standalone, no ZooKeeper)
 
@@ -181,6 +182,7 @@ cmd/
   shoal/                distributed serving daemon — metadata + Thrift listener
   shoal-bootstrap/      diagnostic CLI: walks ZK → root → metadata → tablets
   shoal-compactor/      standalone compaction worker
+  shoal-offline-compact/  offline (OFFLINE-fenced) full major compaction of a table's tablets, off-cluster
   shoal-compactor-shadow/  shadow-compaction harness
   shoal-probe/          one-shot RFile probe (version + LG summary + walk count)
   shoal-rfile-pull/     gs://… → local copy
@@ -202,6 +204,8 @@ internal/
   zk/                   ZooKeeper client + root-tablet locator (Accumulo interop)
   cred/                 Hadoop-Writable PasswordToken encoding
   metadata/             metadata-table walker — tablet→file map bootstrap
+  offlinecompact/       offline-compaction orchestrator: OFFLINE fence + guarded
+                        commit (plan/direct) + byte-exact verify (see docs/offline-compaction-design.md)
   cclient/              cooked Go types (KeyExtent, Range, Authorizations, …)
   scanclient/           Thrift client wrapper (TSocket → framed → AccumuloProtocol → MUX)
   cache/                LRU caches: tablet locator, decompressed blocks, RFile bytes
@@ -235,6 +239,21 @@ Currently recognized:
 Anything else in `ssiList` errors out server-side rather than silently
 producing wrong answers — for Accumulo interop, callers can fall back to a
 tserver in that case.
+
+## Offline compaction
+
+`shoal-offline-compact` runs a full major compaction of an **OFFLINE**
+Accumulo table's tablets from a standalone process — no tserver, manager,
+or compaction coordinator in the loop. It reads each tablet's input
+RFiles, applies the resolved `table.iterator.majc.*` stack, writes one
+compacted output RFile per tablet, verifies it byte-for-byte, and hands
+off the metadata delta under an OFFLINE continuity fence. The default
+commit mode emits a machine-readable plan for an Ample-based applier
+(keeping metadata-write authority in Accumulo); a direct-write mode is
+opt-in.
+
+- [Design & safety model](docs/offline-compaction-design.md)
+- [Operator runbook](docs/offline-compaction.md)
 
 ## Operational notes
 
