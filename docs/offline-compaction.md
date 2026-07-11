@@ -158,9 +158,12 @@ guarded on the current file set. shoal ships **no** default committer (it
 is a read fleet), so Mode D errors with
 `direct commit mode requires a MetadataCommitter` until one is wired.
 
-In both modes the commit-plan JSON is written to `-out` whenever a plan is
-produced — including when Mode D fails with `ErrDirectCommitUnavailable`
-or trips mid-run — so you can always inspect or resume from it.
+The commit-plan JSON is written to `-out` whenever `Commit` returns a
+plan — including when Mode D fails with `ErrDirectCommitUnavailable` (the
+plan is still produced) — so you can inspect or resume from it. A
+pre-commit **fence trip** is different: it fails *before* a plan is built,
+returns no plan, and writes no artifact — because nothing was safe to
+commit (see §10).
 
 ---
 

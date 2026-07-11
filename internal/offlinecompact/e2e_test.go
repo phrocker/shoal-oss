@@ -144,16 +144,17 @@ func scanTablet(t *testing.T, m *memStore, meta *modelMeta, endRow []byte) []kv 
 		cells = append(cells, drainRFile(t, m.data[path])...)
 	}
 	sort.SliceStable(cells, func(i, j int) bool {
+		// Accumulo key order: row, cf, cq, then timestamp DESCENDING.
 		if cells[i].row != cells[j].row {
 			return cells[i].row < cells[j].row
-		}
-		if cells[i].ts != cells[j].ts {
-			return cells[i].ts > cells[j].ts // Accumulo: newer ts sorts first
 		}
 		if cells[i].cf != cells[j].cf {
 			return cells[i].cf < cells[j].cf
 		}
-		return cells[i].cq < cells[j].cq
+		if cells[i].cq != cells[j].cq {
+			return cells[i].cq < cells[j].cq
+		}
+		return cells[i].ts > cells[j].ts
 	})
 	return cells
 }
