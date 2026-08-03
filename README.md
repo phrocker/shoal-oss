@@ -17,7 +17,8 @@ Two ways to run it:
   self-contained storage engine with its own write-ahead log, memtable,
   compaction, and split policy. No external coordinator: open a data
   directory, create tables, write and scan. Durable RFiles land on the
-  local filesystem or any pluggable backend (in-memory, GCS, S3), so the
+  local filesystem or any pluggable backend (in-memory, GCS, S3, Azure Blob,
+  HDFS), so the
   same engine scales from a single machine to cloud-durable storage. Use it
   via the CLI or the `ShoalEmbed` gRPC service.
 - **Distributed serving** (`cmd/shoal`) — a shoal pod opens RFiles directly
@@ -39,7 +40,7 @@ V1 + IVF-PQ iterator port shipped. Embedded standalone engine shipped.
 | **Embedded engine** (`shoal-embed`, `internal/engine`) — no ZooKeeper | shipped — WAL + memtable + compaction + split policy |
 | Embedded CLI (`init` / `write` / `scan` / `compact` / `status` / `serve`) | shipped |
 | `ShoalEmbed` gRPC service (`proto/embed.proto`) | shipped |
-| Pluggable durable backend (local FS / in-memory / GCS / S3) | shipped — local scale to cloud-durable |
+| Pluggable durable backend (local FS / in-memory / GCS / S3 / Azure Blob / HDFS) | shipped — local scale to cloud-durable |
 | Graph pushdown: `EdgeExpandIterator` (one-hop neighborhood) | shipped |
 | Graph pushdown: `LatentEdgeDiscoveryIterator` | shipped |
 | Keyword pushdown: `TermIndexIterator` | shipped |
@@ -103,6 +104,14 @@ GCS, or S3 backend keeps each tablet's WAL local while flushing immutable
 RFiles elsewhere — a locally-resident, cloud-durable store with the same
 engine and iterators in both cases. WAL durability is tunable
 (`SyncFull` / `SyncNormal` + group-commit interval).
+
+**HDFS.** Select the `hdfs` backend and use `hdfs:/path` or
+`hdfs://namenode:port/path` object paths. The native Go client loads
+`core-site.xml` and `hdfs-site.xml` from `HADOOP_CONF_DIR` or
+`HADOOP_HOME`. Set `SHOAL_HDFS_NAMENODE=host:port` when commands discover
+qualified HDFS paths indirectly (for example, through Accumulo metadata);
+otherwise authority-less paths use the Hadoop default cluster. Simple
+authentication uses `HADOOP_USER_NAME` when set.
 
 **Complex graph & vector operations, pushed down.** Rather than streaming
 whole row ranges to the client, the engine runs server-side iterators next

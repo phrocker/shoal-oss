@@ -49,6 +49,7 @@ import (
 	"github.com/phrocker/shoal/internal/storage"
 	"github.com/phrocker/shoal/internal/storage/azure"
 	"github.com/phrocker/shoal/internal/storage/gcs"
+	"github.com/phrocker/shoal/internal/storage/hdfs"
 	"github.com/phrocker/shoal/internal/storage/local"
 	"github.com/phrocker/shoal/internal/storage/memory"
 	"github.com/phrocker/shoal/internal/storage/s3"
@@ -71,7 +72,7 @@ func run() int {
 	commitModeStr := flag.String("commit-mode", "plan", "plan|direct — how to commit; always validated, but only acted on when --dry-run=false")
 	doVerify := flag.Bool("verify", true, "run the §5 verification on every compacted tablet")
 	outDir := flag.String("out", ".", "directory to write the commit plan into (Mode P)")
-	storageScheme := flag.String("storage", "gs", "RFile storage backend: gs, s3, azure, local, memory")
+	storageScheme := flag.String("storage", "gs", "RFile storage backend: gs, s3, azure, hdfs, local, memory")
 	user := flag.String("user", "root", "principal for metadata reads")
 	password := flag.String("password", "", "password (prefer SHOAL_PASSWORD env); also used as the ZK instance secret")
 	accVersion := flag.String("accumulo-version", "4.0.0-SNAPSHOT", "server major.minor must match")
@@ -301,12 +302,18 @@ func openBackend(ctx context.Context, scheme string) (storage.Backend, func(), e
 			return nil, nil, err
 		}
 		return be, func() { _ = be.Close() }, nil
+	case "hdfs":
+		be, err := hdfs.New(os.Getenv("SHOAL_HDFS_NAMENODE"))
+		if err != nil {
+			return nil, nil, err
+		}
+		return be, func() { _ = be.Close() }, nil
 	case "local":
 		return local.New(), noop, nil
 	case "memory":
 		return memory.New(), noop, nil
 	default:
-		return nil, nil, fmt.Errorf("unknown scheme (expected gs, s3, azure, local, or memory)")
+		return nil, nil, fmt.Errorf("unknown scheme (expected gs, s3, azure, hdfs, local, or memory)")
 	}
 }
 

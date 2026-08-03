@@ -22,7 +22,7 @@ func cmdSync(args []string) {
 	fs := flag.NewFlagSet("sync", flag.ExitOnError)
 	dataDir := fs.String("data", defaultDataDir(), "source engine data directory")
 	tableName := fs.String("table", "", "table name (required)")
-	dstBackendName := fs.String("dst-backend", "local", "destination backend: local | memory | gcs | s3 | azure")
+	dstBackendName := fs.String("dst-backend", "local", "destination backend: local | memory | gcs | s3 | azure | hdfs")
 	dstRoot := fs.String("dst-root", "", "destination object/engine root (required)")
 	statePath := fs.String("state", "", "sync state file (default: <data>/.sync/<table>.json)")
 	interval := fs.Duration("interval", 30*time.Second, "interval between sync ticks (ignored with --once)")
@@ -77,7 +77,7 @@ func cmdSync(args []string) {
 	tick := func() error {
 		tctx, cancel := context.WithTimeout(ctx, *tickTimeout)
 		defer cancel()
-		dst, cleanup, err := openStorageBackend(tctx, *dstBackendName)
+		dst, cleanup, err := openStorageBackend(tctx, *dstBackendName, *dstRoot)
 		if err != nil {
 			return err
 		}

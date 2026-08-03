@@ -7,12 +7,14 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/phrocker/shoal/internal/engine"
 	"github.com/phrocker/shoal/internal/storage"
 	"github.com/phrocker/shoal/internal/storage/azure"
 	"github.com/phrocker/shoal/internal/storage/gcs"
+	"github.com/phrocker/shoal/internal/storage/hdfs"
 	"github.com/phrocker/shoal/internal/storage/local"
 	"github.com/phrocker/shoal/internal/storage/memory"
 	"github.com/phrocker/shoal/internal/storage/s3"
@@ -22,7 +24,7 @@ func cmdExport(args []string) {
 	fs := flag.NewFlagSet("export", flag.ExitOnError)
 	dataDir := fs.String("data", defaultDataDir(), "source engine data directory")
 	tableName := fs.String("table", "", "table name (required)")
-	dstBackendName := fs.String("dst-backend", "local", "destination backend: local | memory | gcs | s3 | azure")
+	dstBackendName := fs.String("dst-backend", "local", "destination backend: local | memory | gcs | s3 | azure | hdfs")
 	dstRoot := fs.String("dst-root", "", "destination engine/object root (required)")
 	manifestPath := fs.String("manifest", "", "manifest path on destination backend (default: <dst-root>/manifest.json)")
 	cfSchema := fs.String("cf-schema", "", "free-form column-family schema stamp")
@@ -39,7 +41,7 @@ func cmdExport(args []string) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 	defer cancel()
-	dst, cleanup, err := openStorageBackend(ctx, *dstBackendName)
+	dst, cleanup, err := openStorageBackend(ctx, *dstBackendName, *dstRoot)
 	if err != nil {
 		die("export: %v", err)
 	}
@@ -77,7 +79,7 @@ func cmdExport(args []string) {
 func cmdImport(args []string) {
 	fs := flag.NewFlagSet("import", flag.ExitOnError)
 	dataDir := fs.String("data", defaultDataDir(), "destination engine data directory")
-	backendName := fs.String("backend", "local", "destination backend containing manifest/RFiles: local | memory | gcs | s3 | azure")
+	backendName := fs.String("backend", "local", "destination backend containing manifest/RFiles: local | memory | gcs | s3 | azure | hdfs")
 	manifestPath := fs.String("manifest", "", "manifest path on backend (required)")
 	timeout := fs.Duration("timeout", 10*time.Minute, "overall import timeout")
 	fs.Parse(args)
@@ -87,7 +89,7 @@ func cmdImport(args []string) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 	defer cancel()
-	be, cleanup, err := openStorageBackend(ctx, *backendName)
+	be, cleanup, err := openStorageBackend(ctx, *backendName, *manifestPath)
 	if err != nil {
 		die("import: %v", err)
 	}
@@ -111,7 +113,7 @@ func cmdImport(args []string) {
 	fmt.Printf("imported table %q with %d RFile(s)\n", manifest.SourceTable, len(manifest.RFiles))
 }
 
-func openStorageBackend(ctx context.Context, name string) (storage.Backend, func(), error) {
+func openStorageBackend(ctx context.Context, name, pathHint string) (storage.Backend, func(), error) {
 	switch name {
 	case "local":
 		return local.New(), func() {}, nil
@@ -131,6 +133,20 @@ func openStorageBackend(ctx context.Context, name string) (storage.Backend, func
 		return be, func() { _ = be.Close() }, nil
 	case "azure", "azblob", "az":
 		be, err := azure.New(ctx)
+		if err != nil {
+			return nil, nil, err
+		}
+		return be, func() { _ = be.Close() }, nil
+	case "hdfs":
+		address := os.Getenv("SHOAL_HDFS_NAMENODE")
+		if address == "" && strings.HasPrefix(pathHint, "hdfs:") {
+			var err error
+			address, err = hdfs.AddressFromPath(pathHint)
+			if err != nil {
+				return nil, nil, err
+			}
+		}
+		be, err := hdfs.New(address)
 		if err != nil {
 			return nil, nil, err
 		}

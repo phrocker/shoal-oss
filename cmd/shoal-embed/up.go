@@ -53,7 +53,7 @@ func cmdUp(args []string) {
 	splits := fs.String("splits", "evt:,ent:,idx:", "comma-separated split points for the default table")
 	noDefaultTable := fs.Bool("no-default-table", false, "skip auto-provisioning the default table")
 	syncDstRoot := fs.String("sync-dst-root", "", "enable event-driven RFile shipping to this destination root (empty disables sync)")
-	syncBackend := fs.String("sync-dst-backend", "local", "sync destination backend: local | memory | gcs | s3 | azure")
+	syncBackend := fs.String("sync-dst-backend", "local", "sync destination backend: local | memory | gcs | s3 | azure | hdfs")
 	syncInterval := fs.Duration("sync-interval", 60*time.Second, "safety-net poll between event-driven syncs")
 	syncDebounce := fs.Duration("sync-debounce", 750*time.Millisecond, "coalesce a burst of flush/compact events before shipping")
 	syncState := fs.String("sync-state", "", "sync watermark state file (default: <data>/.sync/<table>.json)")

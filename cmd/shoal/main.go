@@ -38,6 +38,7 @@ import (
 	"github.com/phrocker/shoal/internal/storage/azure"
 	"github.com/phrocker/shoal/internal/storage/diskcache"
 	"github.com/phrocker/shoal/internal/storage/gcs"
+	"github.com/phrocker/shoal/internal/storage/hdfs"
 	"github.com/phrocker/shoal/internal/storage/local"
 	"github.com/phrocker/shoal/internal/storage/s3"
 	"github.com/phrocker/shoal/internal/thrift/gen/tabletscan"
@@ -55,7 +56,7 @@ func main() {
 	user := flag.String("user", "root", "principal for metadata scans (NOT for served scan requests — those carry their own creds)")
 	password := flag.String("password", "", "password (NOT recommended; prefer SHOAL_PASSWORD env)")
 	zkTimeout := flag.Duration("zk-timeout", 30*time.Second, "ZK session timeout")
-	storageScheme := flag.String("storage", "gs", "RFile storage scheme: gs (GCS, default), s3 (AWS S3), azure (Azure Blob), or local")
+	storageScheme := flag.String("storage", "gs", "RFile storage scheme: gs (GCS, default), s3 (AWS S3), azure (Azure Blob), hdfs, or local")
 	cacheBytes := flag.Int64("cache-bytes", 256<<20, "block cache capacity in bytes; 0 disables")
 	diskCacheDir := flag.String("disk-cache-dir", "", "local directory for the read-through disk cache in front of the remote store; empty disables it")
 	diskCacheBytes := flag.Int64("disk-cache-bytes", 20<<30, "disk cache capacity in bytes; only used when -disk-cache-dir is set")
@@ -136,10 +137,17 @@ func main() {
 		if err != nil {
 			die("shoal: azure.New: %v", err)
 		}
+	case "hdfs":
+		hdfsBackend, hdfsErr := hdfs.New(os.Getenv("SHOAL_HDFS_NAMENODE"))
+		if hdfsErr != nil {
+			die("shoal: hdfs.New: %v", hdfsErr)
+		}
+		defer hdfsBackend.Close()
+		bk = hdfsBackend
 	case "local":
 		bk = local.New()
 	default:
-		die("shoal: unknown -storage %q (expected gs, s3, azure, or local)", *storageScheme)
+		die("shoal: unknown -storage %q (expected gs, s3, azure, hdfs, or local)", *storageScheme)
 	}
 
 	// 3b. Optional read-through local-FS disk cache in front of the
