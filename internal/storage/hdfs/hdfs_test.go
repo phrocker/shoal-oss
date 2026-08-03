@@ -205,7 +205,7 @@ func TestBackendRejectsOpaqueHDFSPath(t *testing.T) {
 	}
 }
 
-func TestBackendListUsesRequestedAuthority(t *testing.T) {
+func TestBackendRejectsQualifiedPathWithoutConfiguredNamenode(t *testing.T) {
 	client := newFakeClient()
 	client.files["/tables/1.rf"] = []byte("rfile")
 	backend, err := New("", WithClient(client))
@@ -213,12 +213,40 @@ func TestBackendListUsesRequestedAuthority(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got, err := backend.List(context.Background(), "hdfs://configured-nn:8020/tables")
-	if err != nil {
-		t.Fatal(err)
+	if _, err := backend.List(context.Background(), "hdfs://configured-nn:8020/tables"); err == nil {
+		t.Fatal("List accepted a qualified path without a configured namenode")
 	}
-	if len(got) != 1 || got[0] != "hdfs://configured-nn:8020/tables/1.rf" {
-		t.Fatalf("List returned %v", got)
+}
+
+func TestAddressFromPath(t *testing.T) {
+	valid := []struct {
+		path string
+		want string
+	}{
+		{path: "hdfs://nn:8020/tables/1.rf", want: "nn:8020"},
+		{path: "hdfs:/tables/1.rf", want: ""},
+		{path: "hdfs:///tables/1.rf", want: ""},
+	}
+	for _, test := range valid {
+		got, err := AddressFromPath(test.path)
+		if err != nil {
+			t.Fatalf("AddressFromPath(%q): %v", test.path, err)
+		}
+		if got != test.want {
+			t.Fatalf("AddressFromPath(%q) = %q, want %q", test.path, got, test.want)
+		}
+	}
+
+	invalid := []string{
+		"https://nn:8020/tables/1.rf",
+		"hdfs:tables/1.rf",
+		"hdfs://nn:8020/tables/1.rf?version=1",
+		"hdfs://nn:8020/tables/1.rf#fragment",
+	}
+	for _, objectPath := range invalid {
+		if _, err := AddressFromPath(objectPath); err == nil {
+			t.Fatalf("AddressFromPath(%q) succeeded, want error", objectPath)
+		}
 	}
 }
 

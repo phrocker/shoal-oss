@@ -56,7 +56,7 @@ func runEventSync(ctx context.Context, eng *engine.Engine, logger *slog.Logger, 
 	tick := func(reason string) {
 		tctx, cancelTick := context.WithTimeout(ctx, cfg.TickTimeout)
 		defer cancelTick()
-		dst, cleanup, err := openStorageBackend(tctx, cfg.BackendName)
+		dst, cleanup, err := openStorageBackend(tctx, cfg.BackendName, cfg.Opts.DestinationRoot)
 		if err != nil {
 			logger.Error("event-sync backend open failed", "err", err)
 			return

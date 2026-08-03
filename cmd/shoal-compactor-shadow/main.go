@@ -77,13 +77,14 @@ import (
 	"github.com/phrocker/shoal/internal/shadow"
 	"github.com/phrocker/shoal/internal/storage"
 	"github.com/phrocker/shoal/internal/storage/gcs"
+	"github.com/phrocker/shoal/internal/storage/hdfs"
 	"github.com/phrocker/shoal/internal/storage/local"
 )
 
 func main() {
 	// Phase 1 (single-shot) flags.
-	inputs := flag.String("inputs", "", "comma-separated list of input RFile paths (gs:// or local)")
-	javaOutput := flag.String("java-output", "", "java-produced RFile to diff against (optional; gs:// or local). Empty = shoal-only sanity (T2/T3 skipped).")
+	inputs := flag.String("inputs", "", "comma-separated list of input RFile paths (gs://, hdfs://, or local)")
+	javaOutput := flag.String("java-output", "", "java-produced RFile to diff against (optional; gs://, hdfs://, or local). Empty = shoal-only sanity (T2/T3 skipped).")
 	iterSpec := flag.String("iterators", "",
 		"semicolon-separated iterator stack, each item is 'name[:opt=val,opt=val]'. Built bottom-up.\n"+
 			"e.g. 'versioning:maxVersions=10;deleting' applies versioning then deleting.")
@@ -325,6 +326,21 @@ func backendFor(ctx context.Context, path string) (storage.Backend, string, func
 		}
 		return be, path, func() { _ = be.Close() }, nil
 	}
+	if strings.HasPrefix(path, "hdfs:") {
+		address := os.Getenv("SHOAL_HDFS_NAMENODE")
+		if address == "" {
+			var err error
+			address, err = hdfs.AddressFromPath(path)
+			if err != nil {
+				return nil, "", nil, err
+			}
+		}
+		be, err := hdfs.New(address)
+		if err != nil {
+			return nil, "", nil, fmt.Errorf("hdfs.New: %w", err)
+		}
+		return be, path, func() { _ = be.Close() }, nil
+	}
 	return local.New(), path, nil, nil
 }
 
@@ -370,10 +386,10 @@ func writeShoalOutput(ctx context.Context, spec shadow.CompareSpec, dstPath stri
 
 func emitReport(ctx context.Context, report *shadow.Report, dstPath string, inputs []string, javaOutput string) error {
 	type wireReport struct {
-		Inputs     []string        `json:"inputs"`
-		JavaOutput string          `json:"java_output,omitempty"`
-		Report     *shadow.Report  `json:"report"`
-		Time       string          `json:"time"`
+		Inputs     []string       `json:"inputs"`
+		JavaOutput string         `json:"java_output,omitempty"`
+		Report     *shadow.Report `json:"report"`
+		Time       string         `json:"time"`
 	}
 	wr := wireReport{
 		Inputs:     inputs,

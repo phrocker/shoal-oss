@@ -14,6 +14,7 @@ import (
 	"sync"
 
 	hdfsclient "github.com/colinmarc/hdfs/v2"
+	"github.com/colinmarc/hdfs/v2/hadoopconf"
 	"github.com/google/uuid"
 
 	"github.com/phrocker/shoal/internal/storage"
@@ -85,6 +86,17 @@ func New(address string, opts ...Option) (*Backend, error) {
 			if len(options.Addresses) == 0 && clientAddress != "" {
 				options.Addresses = []string{clientAddress}
 			}
+			client, err = hdfsclient.NewClient(options)
+		} else if user := os.Getenv("HADOOP_USER_NAME"); user != "" {
+			conf, loadErr := hadoopconf.LoadFromEnvironment()
+			if loadErr != nil {
+				return nil, fmt.Errorf("hdfs: load Hadoop configuration: %w", loadErr)
+			}
+			options := hdfsclient.ClientOptionsFromConf(conf)
+			if clientAddress != "" {
+				options.Addresses = strings.Split(clientAddress, ",")
+			}
+			options.User = user
 			client, err = hdfsclient.NewClient(options)
 		} else {
 			client, err = hdfsclient.New(clientAddress)
@@ -201,6 +213,9 @@ func (b *Backend) resolve(objectPath string) (resolved, qualifier string, err er
 	if u.Opaque != "" {
 		return "", "", fmt.Errorf("hdfs: opaque path %q is not supported", objectPath)
 	}
+	if u.Host != "" && b.authority == "" {
+		return "", "", fmt.Errorf("hdfs: qualified path authority %q requires a configured namenode", u.Host)
+	}
 	if u.Host != "" && b.authority != "" && !strings.EqualFold(u.Host, b.authority) {
 		return "", "", fmt.Errorf("hdfs: path authority %q does not match backend authority %q", u.Host, b.authority)
 	}
@@ -217,6 +232,26 @@ func (b *Backend) resolve(objectPath string) (resolved, qualifier string, err er
 		resolved = "/"
 	}
 	return resolved, qualifier, nil
+}
+
+// AddressFromPath returns the namenode authority from a qualified HDFS path.
+// Authority-less HDFS paths return an empty address so Hadoop configuration can
+// select the cluster.
+func AddressFromPath(objectPath string) (string, error) {
+	u, err := url.Parse(objectPath)
+	if err != nil {
+		return "", fmt.Errorf("hdfs: parse path %q: %w", objectPath, err)
+	}
+	if u.Scheme != "hdfs" {
+		return "", fmt.Errorf("hdfs: path %q does not use the hdfs scheme", objectPath)
+	}
+	if u.Opaque != "" {
+		return "", fmt.Errorf("hdfs: opaque path %q is not supported", objectPath)
+	}
+	if u.RawQuery != "" || u.Fragment != "" {
+		return "", fmt.Errorf("hdfs: path %q must not contain a query or fragment", objectPath)
+	}
+	return u.Host, nil
 }
 
 func parseAddress(address string) (authority, clientAddress string, err error) {
