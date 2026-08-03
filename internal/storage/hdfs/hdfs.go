@@ -198,6 +198,9 @@ func (b *Backend) resolve(objectPath string) (resolved, qualifier string, err er
 	if u.Scheme != "hdfs" {
 		return "", "", fmt.Errorf("hdfs: unsupported path scheme %q", u.Scheme)
 	}
+	if u.Opaque != "" {
+		return "", "", fmt.Errorf("hdfs: opaque path %q is not supported", objectPath)
+	}
 	if u.Host != "" && b.authority != "" && !strings.EqualFold(u.Host, b.authority) {
 		return "", "", fmt.Errorf("hdfs: path authority %q does not match backend authority %q", u.Host, b.authority)
 	}

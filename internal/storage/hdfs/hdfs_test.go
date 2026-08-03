@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"os"
 	"path"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -106,6 +107,8 @@ func TestBackendListPreservesPathForm(t *testing.T) {
 		"hdfs://nn:8020/tables/1.rf",
 		"hdfs://nn:8020/tables/2.rf",
 	}
+	slices.Sort(got)
+	slices.Sort(want)
 	if len(got) != len(want) {
 		t.Fatalf("List returned %v, want %v", got, want)
 	}
@@ -159,6 +162,16 @@ func TestBackendAcceptsAuthoritylessHDFSPaths(t *testing.T) {
 			t.Fatalf("Open(%q): %v", objectPath, err)
 		}
 		_ = f.Close()
+	}
+}
+
+func TestBackendRejectsOpaqueHDFSPath(t *testing.T) {
+	backend, err := New("nn:8020", WithClient(newFakeClient()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := backend.Open(context.Background(), "hdfs:tables/1.rf"); err == nil {
+		t.Fatal("Open accepted an opaque HDFS URI")
 	}
 }
 
