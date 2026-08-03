@@ -83,7 +83,9 @@ jobs:
             -DTHRIFT_COMPILER_XML=OFF \
             -DTHRIFT_COMPILER_XSD=OFF
           cmake --build thrift-build --target thrift-compiler --parallel 2
-          echo "THRIFT=$PWD/thrift-build/bin/thrift" >> "$GITHUB_ENV"
+          THRIFT_PATH="$(find "$PWD/thrift-build" -type f -name thrift -perm -111 -print -quit)"
+          test -n "$THRIFT_PATH"
+          echo "THRIFT=$THRIFT_PATH" >> "$GITHUB_ENV"
 
       - name: Verify generated Thrift bindings
         run: make thrift-verify
