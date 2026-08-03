@@ -137,7 +137,7 @@ func (b *Backend) Create(_ context.Context, objectPath string) (storage.Writer, 
 	tempPath := resolved + ".shoal-tmp-" + uuid.NewString()
 	writer, err := b.client.Create(tempPath)
 	if err != nil {
-		return nil, fmt.Errorf("hdfs: create %s: %w", objectPath, err)
+		return nil, fmt.Errorf("hdfs: create temporary file %s: %w", tempPath, err)
 	}
 	return &replaceWriter{
 		client: b.client,
@@ -304,11 +304,22 @@ func (w *replaceWriter) Close() error {
 	}
 
 	if err := w.client.Rename(w.temp, w.target); err != nil {
+		publishErr := fmt.Errorf("hdfs: publish %s: %w", w.target, err)
 		if hadOld {
-			_ = w.client.Rename(backup, w.target)
+			if restoreErr := w.client.Rename(backup, w.target); restoreErr != nil {
+				publishErr = errors.Join(
+					publishErr,
+					fmt.Errorf("hdfs: restore existing file %s from %s: %w", w.target, backup, restoreErr),
+				)
+			}
 		}
-		_ = w.client.Remove(w.temp)
-		return fmt.Errorf("hdfs: publish %s: %w", w.target, err)
+		if cleanupErr := w.client.Remove(w.temp); cleanupErr != nil && !isNotFound(cleanupErr) {
+			publishErr = errors.Join(
+				publishErr,
+				fmt.Errorf("hdfs: remove temporary file %s: %w", w.temp, cleanupErr),
+			)
+		}
+		return publishErr
 	}
 	if hadOld {
 		if err := w.client.Remove(backup); err != nil && !isNotFound(err) {

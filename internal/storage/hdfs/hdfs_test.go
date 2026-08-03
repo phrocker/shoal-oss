@@ -8,6 +8,7 @@ import (
 	"os"
 	"path"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -35,6 +36,35 @@ func TestBackendOpenQualifiedPath(t *testing.T) {
 	}
 	if string(got) != "rfile" {
 		t.Fatalf("got %q, want rfile", got)
+	}
+}
+
+func TestBackendCreateReportsPublishAndRestoreFailures(t *testing.T) {
+	client := newFakeClient()
+	client.files["/tables/1.rf"] = []byte("old")
+	client.failPublish = true
+	client.failRestore = true
+	backend, err := New("nn:8020", WithClient(client))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	w, err := backend.Create(context.Background(), "/tables/1.rf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write([]byte("new")); err != nil {
+		t.Fatal(err)
+	}
+	err = w.Close()
+	if err == nil {
+		t.Fatal("Close succeeded, want publish and restore failures")
+	}
+	if !strings.Contains(err.Error(), "publish /tables/1.rf") {
+		t.Fatalf("Close error %q does not include publish failure", err)
+	}
+	if !strings.Contains(err.Error(), "restore existing file /tables/1.rf") {
+		t.Fatalf("Close error %q does not include restore failure", err)
 	}
 }
 
@@ -219,6 +249,8 @@ type fakeClient struct {
 	dirs            map[string]bool
 	mkdir           string
 	failWriterClose bool
+	failPublish     bool
+	failRestore     bool
 }
 
 func newFakeClient() *fakeClient {
@@ -280,6 +312,12 @@ func (c *fakeClient) Remove(name string) error {
 }
 
 func (c *fakeClient) Rename(oldpath, newpath string) error {
+	if c.failPublish && strings.Contains(oldpath, ".shoal-tmp-") {
+		return &os.PathError{Op: "rename", Path: oldpath, Err: errors.New("injected publish failure")}
+	}
+	if c.failRestore && strings.Contains(oldpath, ".shoal-backup-") {
+		return &os.PathError{Op: "rename", Path: oldpath, Err: errors.New("injected restore failure")}
+	}
 	data, ok := c.files[oldpath]
 	if !ok {
 		return &os.PathError{Op: "rename", Path: oldpath, Err: fs.ErrNotExist}
