@@ -248,6 +248,9 @@ func AddressFromPath(objectPath string) (string, error) {
 	if u.Opaque != "" {
 		return "", fmt.Errorf("hdfs: opaque path %q is not supported", objectPath)
 	}
+	if u.RawQuery != "" || u.Fragment != "" {
+		return "", fmt.Errorf("hdfs: path %q must not contain a query or fragment", objectPath)
+	}
 	return u.Host, nil
 }
 

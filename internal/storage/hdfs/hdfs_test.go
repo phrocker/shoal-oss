@@ -219,7 +219,7 @@ func TestBackendRejectsQualifiedPathWithoutConfiguredNamenode(t *testing.T) {
 }
 
 func TestAddressFromPath(t *testing.T) {
-	tests := []struct {
+	valid := []struct {
 		path string
 		want string
 	}{
@@ -227,13 +227,25 @@ func TestAddressFromPath(t *testing.T) {
 		{path: "hdfs:/tables/1.rf", want: ""},
 		{path: "hdfs:///tables/1.rf", want: ""},
 	}
-	for _, test := range tests {
+	for _, test := range valid {
 		got, err := AddressFromPath(test.path)
 		if err != nil {
 			t.Fatalf("AddressFromPath(%q): %v", test.path, err)
 		}
 		if got != test.want {
 			t.Fatalf("AddressFromPath(%q) = %q, want %q", test.path, got, test.want)
+		}
+	}
+
+	invalid := []string{
+		"https://nn:8020/tables/1.rf",
+		"hdfs:tables/1.rf",
+		"hdfs://nn:8020/tables/1.rf?version=1",
+		"hdfs://nn:8020/tables/1.rf#fragment",
+	}
+	for _, objectPath := range invalid {
+		if _, err := AddressFromPath(objectPath); err == nil {
+			t.Fatalf("AddressFromPath(%q) succeeded, want error", objectPath)
 		}
 	}
 }
