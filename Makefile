@@ -75,6 +75,10 @@ thrift-gen: thrift-check
 
 .PHONY: thrift-verify
 thrift-verify: thrift-check
+	@test -d "$(THRIFT_OUT)" || { \
+	  echo "generated Thrift bindings not found at $(THRIFT_OUT); run make thrift-gen"; \
+	  exit 1; \
+	}
 	@tmp=$$(mktemp -d); \
 	  trap 'rm -rf "$$tmp"' EXIT; \
 	  cp -R $(THRIFT_OUT) "$$tmp/gen"; \
