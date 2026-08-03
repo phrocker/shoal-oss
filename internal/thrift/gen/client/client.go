@@ -5877,6 +5877,8 @@ func (p *ClientServicePingArgs) Write(ctx context.Context, oprot thrift.TProtoco
 }
 
 func (p *ClientServicePingArgs) writeField2(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Credentials == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "credentials", thrift.STRUCT, 2); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 2:credentials: ", p), err) }
   if err := p.Credentials.Write(ctx, oprot); err != nil {
@@ -6114,6 +6116,8 @@ func (p *ClientServiceGetDiskUsageArgs) Write(ctx context.Context, oprot thrift.
 }
 
 func (p *ClientServiceGetDiskUsageArgs) writeField1(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Credentials == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "credentials", thrift.STRUCT, 1); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 1:credentials: ", p), err) }
   if err := p.Credentials.Write(ctx, oprot); err != nil {
@@ -6481,6 +6485,8 @@ func (p *ClientServiceListLocalUsersArgs) Write(ctx context.Context, oprot thrif
 }
 
 func (p *ClientServiceListLocalUsersArgs) writeField2(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Tinfo == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "tinfo", thrift.STRUCT, 2); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 2:tinfo: ", p), err) }
   if err := p.Tinfo.Write(ctx, oprot); err != nil {
@@ -6492,6 +6498,8 @@ func (p *ClientServiceListLocalUsersArgs) writeField2(ctx context.Context, oprot
 }
 
 func (p *ClientServiceListLocalUsersArgs) writeField3(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Credentials == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "credentials", thrift.STRUCT, 3); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 3:credentials: ", p), err) }
   if err := p.Credentials.Write(ctx, oprot); err != nil {
@@ -6870,6 +6878,8 @@ func (p *ClientServiceCreateLocalUserArgs) writeField3(ctx context.Context, opro
 }
 
 func (p *ClientServiceCreateLocalUserArgs) writeField5(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Tinfo == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "tinfo", thrift.STRUCT, 5); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 5:tinfo: ", p), err) }
   if err := p.Tinfo.Write(ctx, oprot); err != nil {
@@ -6881,6 +6891,8 @@ func (p *ClientServiceCreateLocalUserArgs) writeField5(ctx context.Context, opro
 }
 
 func (p *ClientServiceCreateLocalUserArgs) writeField6(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Credentials == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "credentials", thrift.STRUCT, 6); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 6:credentials: ", p), err) }
   if err := p.Credentials.Write(ctx, oprot); err != nil {
@@ -7148,6 +7160,8 @@ func (p *ClientServiceDropLocalUserArgs) writeField2(ctx context.Context, oprot 
 }
 
 func (p *ClientServiceDropLocalUserArgs) writeField3(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Tinfo == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "tinfo", thrift.STRUCT, 3); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 3:tinfo: ", p), err) }
   if err := p.Tinfo.Write(ctx, oprot); err != nil {
@@ -7159,6 +7173,8 @@ func (p *ClientServiceDropLocalUserArgs) writeField3(ctx context.Context, oprot 
 }
 
 func (p *ClientServiceDropLocalUserArgs) writeField4(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Credentials == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "credentials", thrift.STRUCT, 4); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 4:credentials: ", p), err) }
   if err := p.Credentials.Write(ctx, oprot); err != nil {
@@ -7462,6 +7478,8 @@ func (p *ClientServiceChangeLocalUserPasswordArgs) writeField3(ctx context.Conte
 }
 
 func (p *ClientServiceChangeLocalUserPasswordArgs) writeField4(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Tinfo == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "tinfo", thrift.STRUCT, 4); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 4:tinfo: ", p), err) }
   if err := p.Tinfo.Write(ctx, oprot); err != nil {
@@ -7473,6 +7491,8 @@ func (p *ClientServiceChangeLocalUserPasswordArgs) writeField4(ctx context.Conte
 }
 
 func (p *ClientServiceChangeLocalUserPasswordArgs) writeField5(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Credentials == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "credentials", thrift.STRUCT, 5); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 5:credentials: ", p), err) }
   if err := p.Credentials.Write(ctx, oprot); err != nil {
@@ -7703,6 +7723,8 @@ func (p *ClientServiceAuthenticateArgs) Write(ctx context.Context, oprot thrift.
 }
 
 func (p *ClientServiceAuthenticateArgs) writeField1(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Tinfo == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "tinfo", thrift.STRUCT, 1); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 1:tinfo: ", p), err) }
   if err := p.Tinfo.Write(ctx, oprot); err != nil {
@@ -7714,6 +7736,8 @@ func (p *ClientServiceAuthenticateArgs) writeField1(ctx context.Context, oprot t
 }
 
 func (p *ClientServiceAuthenticateArgs) writeField2(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Credentials == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "credentials", thrift.STRUCT, 2); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 2:credentials: ", p), err) }
   if err := p.Credentials.Write(ctx, oprot); err != nil {
@@ -8021,6 +8045,8 @@ func (p *ClientServiceAuthenticateUserArgs) Write(ctx context.Context, oprot thr
 }
 
 func (p *ClientServiceAuthenticateUserArgs) writeField1(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Tinfo == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "tinfo", thrift.STRUCT, 1); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 1:tinfo: ", p), err) }
   if err := p.Tinfo.Write(ctx, oprot); err != nil {
@@ -8032,6 +8058,8 @@ func (p *ClientServiceAuthenticateUserArgs) writeField1(ctx context.Context, opr
 }
 
 func (p *ClientServiceAuthenticateUserArgs) writeField2(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Credentials == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "credentials", thrift.STRUCT, 2); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 2:credentials: ", p), err) }
   if err := p.Credentials.Write(ctx, oprot); err != nil {
@@ -8043,6 +8071,8 @@ func (p *ClientServiceAuthenticateUserArgs) writeField2(ctx context.Context, opr
 }
 
 func (p *ClientServiceAuthenticateUserArgs) writeField3(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.ToAuth == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "toAuth", thrift.STRUCT, 3); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 3:toAuth: ", p), err) }
   if err := p.ToAuth.Write(ctx, oprot); err != nil {
@@ -8412,6 +8442,8 @@ func (p *ClientServiceChangeAuthorizationsArgs) writeField3(ctx context.Context,
 }
 
 func (p *ClientServiceChangeAuthorizationsArgs) writeField4(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Tinfo == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "tinfo", thrift.STRUCT, 4); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 4:tinfo: ", p), err) }
   if err := p.Tinfo.Write(ctx, oprot); err != nil {
@@ -8423,6 +8455,8 @@ func (p *ClientServiceChangeAuthorizationsArgs) writeField4(ctx context.Context,
 }
 
 func (p *ClientServiceChangeAuthorizationsArgs) writeField5(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Credentials == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "credentials", thrift.STRUCT, 5); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 5:credentials: ", p), err) }
   if err := p.Credentials.Write(ctx, oprot); err != nil {
@@ -8690,6 +8724,8 @@ func (p *ClientServiceGetUserAuthorizationsArgs) writeField2(ctx context.Context
 }
 
 func (p *ClientServiceGetUserAuthorizationsArgs) writeField3(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Tinfo == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "tinfo", thrift.STRUCT, 3); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 3:tinfo: ", p), err) }
   if err := p.Tinfo.Write(ctx, oprot); err != nil {
@@ -8701,6 +8737,8 @@ func (p *ClientServiceGetUserAuthorizationsArgs) writeField3(ctx context.Context
 }
 
 func (p *ClientServiceGetUserAuthorizationsArgs) writeField4(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Credentials == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "credentials", thrift.STRUCT, 4); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 4:credentials: ", p), err) }
   if err := p.Credentials.Write(ctx, oprot); err != nil {
@@ -9069,6 +9107,8 @@ func (p *ClientServiceHasSystemPermissionArgs) writeField3(ctx context.Context, 
 }
 
 func (p *ClientServiceHasSystemPermissionArgs) writeField4(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Tinfo == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "tinfo", thrift.STRUCT, 4); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 4:tinfo: ", p), err) }
   if err := p.Tinfo.Write(ctx, oprot); err != nil {
@@ -9080,6 +9120,8 @@ func (p *ClientServiceHasSystemPermissionArgs) writeField4(ctx context.Context, 
 }
 
 func (p *ClientServiceHasSystemPermissionArgs) writeField5(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Credentials == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "credentials", thrift.STRUCT, 5); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 5:credentials: ", p), err) }
   if err := p.Credentials.Write(ctx, oprot); err != nil {
@@ -9465,6 +9507,8 @@ func (p *ClientServiceHasTablePermissionArgs) writeField4(ctx context.Context, o
 }
 
 func (p *ClientServiceHasTablePermissionArgs) writeField5(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Tinfo == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "tinfo", thrift.STRUCT, 5); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 5:tinfo: ", p), err) }
   if err := p.Tinfo.Write(ctx, oprot); err != nil {
@@ -9476,6 +9520,8 @@ func (p *ClientServiceHasTablePermissionArgs) writeField5(ctx context.Context, o
 }
 
 func (p *ClientServiceHasTablePermissionArgs) writeField6(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Credentials == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "credentials", thrift.STRUCT, 6); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 6:credentials: ", p), err) }
   if err := p.Credentials.Write(ctx, oprot); err != nil {
@@ -9875,6 +9921,8 @@ func (p *ClientServiceHasNamespacePermissionArgs) Write(ctx context.Context, opr
 }
 
 func (p *ClientServiceHasNamespacePermissionArgs) writeField1(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Tinfo == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "tinfo", thrift.STRUCT, 1); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 1:tinfo: ", p), err) }
   if err := p.Tinfo.Write(ctx, oprot); err != nil {
@@ -9886,6 +9934,8 @@ func (p *ClientServiceHasNamespacePermissionArgs) writeField1(ctx context.Contex
 }
 
 func (p *ClientServiceHasNamespacePermissionArgs) writeField2(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Credentials == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "credentials", thrift.STRUCT, 2); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 2:credentials: ", p), err) }
   if err := p.Credentials.Write(ctx, oprot); err != nil {
@@ -10310,6 +10360,8 @@ func (p *ClientServiceGrantSystemPermissionArgs) writeField3(ctx context.Context
 }
 
 func (p *ClientServiceGrantSystemPermissionArgs) writeField4(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Tinfo == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "tinfo", thrift.STRUCT, 4); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 4:tinfo: ", p), err) }
   if err := p.Tinfo.Write(ctx, oprot); err != nil {
@@ -10321,6 +10373,8 @@ func (p *ClientServiceGrantSystemPermissionArgs) writeField4(ctx context.Context
 }
 
 func (p *ClientServiceGrantSystemPermissionArgs) writeField5(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Credentials == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "credentials", thrift.STRUCT, 5); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 5:credentials: ", p), err) }
   if err := p.Credentials.Write(ctx, oprot); err != nil {
@@ -10625,6 +10679,8 @@ func (p *ClientServiceRevokeSystemPermissionArgs) writeField3(ctx context.Contex
 }
 
 func (p *ClientServiceRevokeSystemPermissionArgs) writeField4(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Tinfo == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "tinfo", thrift.STRUCT, 4); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 4:tinfo: ", p), err) }
   if err := p.Tinfo.Write(ctx, oprot); err != nil {
@@ -10636,6 +10692,8 @@ func (p *ClientServiceRevokeSystemPermissionArgs) writeField4(ctx context.Contex
 }
 
 func (p *ClientServiceRevokeSystemPermissionArgs) writeField5(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Credentials == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "credentials", thrift.STRUCT, 5); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 5:credentials: ", p), err) }
   if err := p.Credentials.Write(ctx, oprot); err != nil {
@@ -10976,6 +11034,8 @@ func (p *ClientServiceGrantTablePermissionArgs) writeField4(ctx context.Context,
 }
 
 func (p *ClientServiceGrantTablePermissionArgs) writeField5(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Tinfo == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "tinfo", thrift.STRUCT, 5); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 5:tinfo: ", p), err) }
   if err := p.Tinfo.Write(ctx, oprot); err != nil {
@@ -10987,6 +11047,8 @@ func (p *ClientServiceGrantTablePermissionArgs) writeField5(ctx context.Context,
 }
 
 func (p *ClientServiceGrantTablePermissionArgs) writeField6(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Credentials == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "credentials", thrift.STRUCT, 6); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 6:credentials: ", p), err) }
   if err := p.Credentials.Write(ctx, oprot); err != nil {
@@ -11372,6 +11434,8 @@ func (p *ClientServiceRevokeTablePermissionArgs) writeField4(ctx context.Context
 }
 
 func (p *ClientServiceRevokeTablePermissionArgs) writeField5(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Tinfo == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "tinfo", thrift.STRUCT, 5); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 5:tinfo: ", p), err) }
   if err := p.Tinfo.Write(ctx, oprot); err != nil {
@@ -11383,6 +11447,8 @@ func (p *ClientServiceRevokeTablePermissionArgs) writeField5(ctx context.Context
 }
 
 func (p *ClientServiceRevokeTablePermissionArgs) writeField6(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Credentials == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "credentials", thrift.STRUCT, 6); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 6:credentials: ", p), err) }
   if err := p.Credentials.Write(ctx, oprot); err != nil {
@@ -11737,6 +11803,8 @@ func (p *ClientServiceGrantNamespacePermissionArgs) Write(ctx context.Context, o
 }
 
 func (p *ClientServiceGrantNamespacePermissionArgs) writeField1(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Tinfo == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "tinfo", thrift.STRUCT, 1); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 1:tinfo: ", p), err) }
   if err := p.Tinfo.Write(ctx, oprot); err != nil {
@@ -11748,6 +11816,8 @@ func (p *ClientServiceGrantNamespacePermissionArgs) writeField1(ctx context.Cont
 }
 
 func (p *ClientServiceGrantNamespacePermissionArgs) writeField2(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Credentials == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "credentials", thrift.STRUCT, 2); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 2:credentials: ", p), err) }
   if err := p.Credentials.Write(ctx, oprot); err != nil {
@@ -12132,6 +12202,8 @@ func (p *ClientServiceRevokeNamespacePermissionArgs) Write(ctx context.Context, 
 }
 
 func (p *ClientServiceRevokeNamespacePermissionArgs) writeField1(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Tinfo == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "tinfo", thrift.STRUCT, 1); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 1:tinfo: ", p), err) }
   if err := p.Tinfo.Write(ctx, oprot); err != nil {
@@ -12143,6 +12215,8 @@ func (p *ClientServiceRevokeNamespacePermissionArgs) writeField1(ctx context.Con
 }
 
 func (p *ClientServiceRevokeNamespacePermissionArgs) writeField2(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Credentials == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "credentials", thrift.STRUCT, 2); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 2:credentials: ", p), err) }
   if err := p.Credentials.Write(ctx, oprot); err != nil {
@@ -12485,6 +12559,8 @@ func (p *ClientServiceGetConfigurationArgs) writeField1(ctx context.Context, opr
 }
 
 func (p *ClientServiceGetConfigurationArgs) writeField2(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Tinfo == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "tinfo", thrift.STRUCT, 2); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 2:tinfo: ", p), err) }
   if err := p.Tinfo.Write(ctx, oprot); err != nil {
@@ -12496,6 +12572,8 @@ func (p *ClientServiceGetConfigurationArgs) writeField2(ctx context.Context, opr
 }
 
 func (p *ClientServiceGetConfigurationArgs) writeField3(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Credentials == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "credentials", thrift.STRUCT, 3); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 3:credentials: ", p), err) }
   if err := p.Credentials.Write(ctx, oprot); err != nil {
@@ -12798,6 +12876,8 @@ func (p *ClientServiceGetSystemPropertiesArgs) Write(ctx context.Context, oprot 
 }
 
 func (p *ClientServiceGetSystemPropertiesArgs) writeField1(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Tinfo == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "tinfo", thrift.STRUCT, 1); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 1:tinfo: ", p), err) }
   if err := p.Tinfo.Write(ctx, oprot); err != nil {
@@ -12809,6 +12889,8 @@ func (p *ClientServiceGetSystemPropertiesArgs) writeField1(ctx context.Context, 
 }
 
 func (p *ClientServiceGetSystemPropertiesArgs) writeField2(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Credentials == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "credentials", thrift.STRUCT, 2); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 2:credentials: ", p), err) }
   if err := p.Credentials.Write(ctx, oprot); err != nil {
@@ -13111,6 +13193,8 @@ func (p *ClientServiceGetVersionedSystemPropertiesArgs) Write(ctx context.Contex
 }
 
 func (p *ClientServiceGetVersionedSystemPropertiesArgs) writeField1(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Tinfo == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "tinfo", thrift.STRUCT, 1); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 1:tinfo: ", p), err) }
   if err := p.Tinfo.Write(ctx, oprot); err != nil {
@@ -13122,6 +13206,8 @@ func (p *ClientServiceGetVersionedSystemPropertiesArgs) writeField1(ctx context.
 }
 
 func (p *ClientServiceGetVersionedSystemPropertiesArgs) writeField2(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Credentials == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "credentials", thrift.STRUCT, 2); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 2:credentials: ", p), err) }
   if err := p.Credentials.Write(ctx, oprot); err != nil {
@@ -13423,6 +13509,8 @@ func (p *ClientServiceGetVersionedResourceGroupPropertiesArgs) Write(ctx context
 }
 
 func (p *ClientServiceGetVersionedResourceGroupPropertiesArgs) writeField1(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Tinfo == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "tinfo", thrift.STRUCT, 1); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 1:tinfo: ", p), err) }
   if err := p.Tinfo.Write(ctx, oprot); err != nil {
@@ -13434,6 +13522,8 @@ func (p *ClientServiceGetVersionedResourceGroupPropertiesArgs) writeField1(ctx c
 }
 
 func (p *ClientServiceGetVersionedResourceGroupPropertiesArgs) writeField2(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Credentials == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "credentials", thrift.STRUCT, 2); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 2:credentials: ", p), err) }
   if err := p.Credentials.Write(ctx, oprot); err != nil {
@@ -13790,6 +13880,8 @@ func (p *ClientServiceGetTableConfigurationArgs) Write(ctx context.Context, opro
 }
 
 func (p *ClientServiceGetTableConfigurationArgs) writeField1(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Tinfo == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "tinfo", thrift.STRUCT, 1); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 1:tinfo: ", p), err) }
   if err := p.Tinfo.Write(ctx, oprot); err != nil {
@@ -13811,6 +13903,8 @@ func (p *ClientServiceGetTableConfigurationArgs) writeField2(ctx context.Context
 }
 
 func (p *ClientServiceGetTableConfigurationArgs) writeField3(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Credentials == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "credentials", thrift.STRUCT, 3); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 3:credentials: ", p), err) }
   if err := p.Credentials.Write(ctx, oprot); err != nil {
@@ -14184,6 +14278,8 @@ func (p *ClientServiceGetTablePropertiesArgs) Write(ctx context.Context, oprot t
 }
 
 func (p *ClientServiceGetTablePropertiesArgs) writeField1(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Tinfo == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "tinfo", thrift.STRUCT, 1); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 1:tinfo: ", p), err) }
   if err := p.Tinfo.Write(ctx, oprot); err != nil {
@@ -14205,6 +14301,8 @@ func (p *ClientServiceGetTablePropertiesArgs) writeField2(ctx context.Context, o
 }
 
 func (p *ClientServiceGetTablePropertiesArgs) writeField3(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Credentials == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "credentials", thrift.STRUCT, 3); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 3:credentials: ", p), err) }
   if err := p.Credentials.Write(ctx, oprot); err != nil {
@@ -14578,6 +14676,8 @@ func (p *ClientServiceGetVersionedTablePropertiesArgs) Write(ctx context.Context
 }
 
 func (p *ClientServiceGetVersionedTablePropertiesArgs) writeField1(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Tinfo == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "tinfo", thrift.STRUCT, 1); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 1:tinfo: ", p), err) }
   if err := p.Tinfo.Write(ctx, oprot); err != nil {
@@ -14599,6 +14699,8 @@ func (p *ClientServiceGetVersionedTablePropertiesArgs) writeField2(ctx context.C
 }
 
 func (p *ClientServiceGetVersionedTablePropertiesArgs) writeField3(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Credentials == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "credentials", thrift.STRUCT, 3); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 3:credentials: ", p), err) }
   if err := p.Credentials.Write(ctx, oprot); err != nil {
@@ -14945,6 +15047,8 @@ func (p *ClientServiceGetNamespaceConfigurationArgs) Write(ctx context.Context, 
 }
 
 func (p *ClientServiceGetNamespaceConfigurationArgs) writeField1(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Tinfo == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "tinfo", thrift.STRUCT, 1); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 1:tinfo: ", p), err) }
   if err := p.Tinfo.Write(ctx, oprot); err != nil {
@@ -14956,6 +15060,8 @@ func (p *ClientServiceGetNamespaceConfigurationArgs) writeField1(ctx context.Con
 }
 
 func (p *ClientServiceGetNamespaceConfigurationArgs) writeField2(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Credentials == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "credentials", thrift.STRUCT, 2); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 2:credentials: ", p), err) }
   if err := p.Credentials.Write(ctx, oprot); err != nil {
@@ -15339,6 +15445,8 @@ func (p *ClientServiceGetNamespacePropertiesArgs) Write(ctx context.Context, opr
 }
 
 func (p *ClientServiceGetNamespacePropertiesArgs) writeField1(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Tinfo == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "tinfo", thrift.STRUCT, 1); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 1:tinfo: ", p), err) }
   if err := p.Tinfo.Write(ctx, oprot); err != nil {
@@ -15350,6 +15458,8 @@ func (p *ClientServiceGetNamespacePropertiesArgs) writeField1(ctx context.Contex
 }
 
 func (p *ClientServiceGetNamespacePropertiesArgs) writeField2(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Credentials == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "credentials", thrift.STRUCT, 2); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 2:credentials: ", p), err) }
   if err := p.Credentials.Write(ctx, oprot); err != nil {
@@ -15733,6 +15843,8 @@ func (p *ClientServiceGetVersionedNamespacePropertiesArgs) Write(ctx context.Con
 }
 
 func (p *ClientServiceGetVersionedNamespacePropertiesArgs) writeField1(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Tinfo == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "tinfo", thrift.STRUCT, 1); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 1:tinfo: ", p), err) }
   if err := p.Tinfo.Write(ctx, oprot); err != nil {
@@ -15744,6 +15856,8 @@ func (p *ClientServiceGetVersionedNamespacePropertiesArgs) writeField1(ctx conte
 }
 
 func (p *ClientServiceGetVersionedNamespacePropertiesArgs) writeField2(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Credentials == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "credentials", thrift.STRUCT, 2); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 2:credentials: ", p), err) }
   if err := p.Credentials.Write(ctx, oprot); err != nil {
@@ -16126,6 +16240,8 @@ func (p *ClientServiceCheckClassArgs) Write(ctx context.Context, oprot thrift.TP
 }
 
 func (p *ClientServiceCheckClassArgs) writeField1(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Tinfo == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "tinfo", thrift.STRUCT, 1); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 1:tinfo: ", p), err) }
   if err := p.Tinfo.Write(ctx, oprot); err != nil {
@@ -16157,6 +16273,8 @@ func (p *ClientServiceCheckClassArgs) writeField3(ctx context.Context, oprot thr
 }
 
 func (p *ClientServiceCheckClassArgs) writeField4(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Credentials == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "credentials", thrift.STRUCT, 4); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 4:credentials: ", p), err) }
   if err := p.Credentials.Write(ctx, oprot); err != nil {
@@ -16465,6 +16583,8 @@ func (p *ClientServiceCheckTableClassArgs) Write(ctx context.Context, oprot thri
 }
 
 func (p *ClientServiceCheckTableClassArgs) writeField1(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Tinfo == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "tinfo", thrift.STRUCT, 1); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 1:tinfo: ", p), err) }
   if err := p.Tinfo.Write(ctx, oprot); err != nil {
@@ -16506,6 +16626,8 @@ func (p *ClientServiceCheckTableClassArgs) writeField4(ctx context.Context, opro
 }
 
 func (p *ClientServiceCheckTableClassArgs) writeField5(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Credentials == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "credentials", thrift.STRUCT, 5); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 5:credentials: ", p), err) }
   if err := p.Credentials.Write(ctx, oprot); err != nil {
@@ -16904,6 +17026,8 @@ func (p *ClientServiceCheckNamespaceClassArgs) Write(ctx context.Context, oprot 
 }
 
 func (p *ClientServiceCheckNamespaceClassArgs) writeField1(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Tinfo == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "tinfo", thrift.STRUCT, 1); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 1:tinfo: ", p), err) }
   if err := p.Tinfo.Write(ctx, oprot); err != nil {
@@ -16915,6 +17039,8 @@ func (p *ClientServiceCheckNamespaceClassArgs) writeField1(ctx context.Context, 
 }
 
 func (p *ClientServiceCheckNamespaceClassArgs) writeField2(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Credentials == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "credentials", thrift.STRUCT, 2); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 2:credentials: ", p), err) }
   if err := p.Credentials.Write(ctx, oprot); err != nil {

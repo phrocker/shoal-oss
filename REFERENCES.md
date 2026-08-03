@@ -72,6 +72,8 @@ cribs land.
   cache for user tables
 
 ### Thrift IDL
+- Vendored snapshot: `internal/thrift/idl` (Accumulo source revision
+  `1a716b2c1bb5762ead4b46d2bc4f53e13873b314`)
 - `core/src/main/thrift/tabletscan.thrift:77-95` — `startScan` signature
 - `core/src/main/thrift/data.thrift` — `TKeyExtent`, `TRange`, `TKey`,
   `TKeyValue`, `TColumn`, `IterInfo`

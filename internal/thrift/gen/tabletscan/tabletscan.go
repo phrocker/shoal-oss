@@ -221,6 +221,8 @@ func (p *TooManyFilesException) Write(ctx context.Context, oprot thrift.TProtoco
 }
 
 func (p *TooManyFilesException) writeField1(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Extent == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "extent", thrift.STRUCT, 1); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 1:extent: ", p), err) }
   if err := p.Extent.Write(ctx, oprot); err != nil {
@@ -339,6 +341,8 @@ func (p *TSampleNotPresentException) Write(ctx context.Context, oprot thrift.TPr
 }
 
 func (p *TSampleNotPresentException) writeField1(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Extent == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "extent", thrift.STRUCT, 1); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 1:extent: ", p), err) }
   if err := p.Extent.Write(ctx, oprot); err != nil {
@@ -1188,6 +1192,8 @@ func (p *ActiveScan) writeField8(ctx context.Context, oprot thrift.TProtocol) (e
 }
 
 func (p *ActiveScan) writeField9(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Extent == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "extent", thrift.STRUCT, 9); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 9:extent: ", p), err) }
   if err := p.Extent.Write(ctx, oprot); err != nil {
@@ -2971,6 +2977,8 @@ func (p *TabletScanClientServiceStartScanArgs) Write(ctx context.Context, oprot 
 }
 
 func (p *TabletScanClientServiceStartScanArgs) writeField1(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Credentials == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "credentials", thrift.STRUCT, 1); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 1:credentials: ", p), err) }
   if err := p.Credentials.Write(ctx, oprot); err != nil {
@@ -2982,6 +2990,8 @@ func (p *TabletScanClientServiceStartScanArgs) writeField1(ctx context.Context, 
 }
 
 func (p *TabletScanClientServiceStartScanArgs) writeField2(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Extent == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "extent", thrift.STRUCT, 2); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 2:extent: ", p), err) }
   if err := p.Extent.Write(ctx, oprot); err != nil {
@@ -2993,6 +3003,8 @@ func (p *TabletScanClientServiceStartScanArgs) writeField2(ctx context.Context, 
 }
 
 func (p *TabletScanClientServiceStartScanArgs) writeField3(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Range == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "range", thrift.STRUCT, 3); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 3:range: ", p), err) }
   if err := p.Range.Write(ctx, oprot); err != nil {
@@ -3120,6 +3132,8 @@ func (p *TabletScanClientServiceStartScanArgs) writeField10(ctx context.Context,
 }
 
 func (p *TabletScanClientServiceStartScanArgs) writeField11(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Tinfo == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "tinfo", thrift.STRUCT, 11); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 11:tinfo: ", p), err) }
   if err := p.Tinfo.Write(ctx, oprot); err != nil {
@@ -3141,6 +3155,8 @@ func (p *TabletScanClientServiceStartScanArgs) writeField12(ctx context.Context,
 }
 
 func (p *TabletScanClientServiceStartScanArgs) writeField13(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.SamplerConfig == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "samplerConfig", thrift.STRUCT, 13); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 13:samplerConfig: ", p), err) }
   if err := p.SamplerConfig.Write(ctx, oprot); err != nil {
@@ -3677,6 +3693,8 @@ func (p *TabletScanClientServiceContinueScanArgs) writeField1(ctx context.Contex
 }
 
 func (p *TabletScanClientServiceContinueScanArgs) writeField2(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Tinfo == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "tinfo", thrift.STRUCT, 2); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 2:tinfo: ", p), err) }
   if err := p.Tinfo.Write(ctx, oprot); err != nil {
@@ -4147,6 +4165,8 @@ func (p *TabletScanClientServiceCloseScanArgs) writeField1(ctx context.Context, 
 }
 
 func (p *TabletScanClientServiceCloseScanArgs) writeField2(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Tinfo == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "tinfo", thrift.STRUCT, 2); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 2:tinfo: ", p), err) }
   if err := p.Tinfo.Write(ctx, oprot); err != nil {
@@ -4687,6 +4707,8 @@ func (p *TabletScanClientServiceStartMultiScanArgs) Write(ctx context.Context, o
 }
 
 func (p *TabletScanClientServiceStartMultiScanArgs) writeField1(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Credentials == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "credentials", thrift.STRUCT, 1); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 1:credentials: ", p), err) }
   if err := p.Credentials.Write(ctx, oprot); err != nil {
@@ -4824,6 +4846,8 @@ func (p *TabletScanClientServiceStartMultiScanArgs) writeField7(ctx context.Cont
 }
 
 func (p *TabletScanClientServiceStartMultiScanArgs) writeField8(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Tinfo == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "tinfo", thrift.STRUCT, 8); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 8:tinfo: ", p), err) }
   if err := p.Tinfo.Write(ctx, oprot); err != nil {
@@ -4835,6 +4859,8 @@ func (p *TabletScanClientServiceStartMultiScanArgs) writeField8(ctx context.Cont
 }
 
 func (p *TabletScanClientServiceStartMultiScanArgs) writeField9(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.SamplerConfig == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "samplerConfig", thrift.STRUCT, 9); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 9:samplerConfig: ", p), err) }
   if err := p.SamplerConfig.Write(ctx, oprot); err != nil {
@@ -5281,6 +5307,8 @@ func (p *TabletScanClientServiceContinueMultiScanArgs) writeField1(ctx context.C
 }
 
 func (p *TabletScanClientServiceContinueMultiScanArgs) writeField2(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Tinfo == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "tinfo", thrift.STRUCT, 2); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 2:tinfo: ", p), err) }
   if err := p.Tinfo.Write(ctx, oprot); err != nil {
@@ -5661,6 +5689,8 @@ func (p *TabletScanClientServiceCloseMultiScanArgs) writeField1(ctx context.Cont
 }
 
 func (p *TabletScanClientServiceCloseMultiScanArgs) writeField2(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Tinfo == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "tinfo", thrift.STRUCT, 2); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 2:tinfo: ", p), err) }
   if err := p.Tinfo.Write(ctx, oprot); err != nil {
@@ -5891,6 +5921,8 @@ func (p *TabletScanClientServiceGetActiveScansArgs) Write(ctx context.Context, o
 }
 
 func (p *TabletScanClientServiceGetActiveScansArgs) writeField1(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Credentials == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "credentials", thrift.STRUCT, 1); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 1:credentials: ", p), err) }
   if err := p.Credentials.Write(ctx, oprot); err != nil {
@@ -5902,6 +5934,8 @@ func (p *TabletScanClientServiceGetActiveScansArgs) writeField1(ctx context.Cont
 }
 
 func (p *TabletScanClientServiceGetActiveScansArgs) writeField2(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Tinfo == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "tinfo", thrift.STRUCT, 2); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 2:tinfo: ", p), err) }
   if err := p.Tinfo.Write(ctx, oprot); err != nil {

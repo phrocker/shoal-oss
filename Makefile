@@ -19,40 +19,75 @@
 
 SHELL := /bin/bash
 
-# Pinned to the exact Apache Thrift compiler version Accumulo's pom uses
-# (version.thrift = 0.17.0). DO NOT use the system thrift — versions may drift.
-THRIFT       ?= thrift
-THRIFT_IDL   ?= $(ACCUMULO_SRC)/core/src/main/thrift
-THRIFT_OUT   := internal/thrift/gen
+THRIFT_VERSION        := 0.17.0
+THRIFT                ?= thrift
+THRIFT_IDL            := internal/thrift/idl
+THRIFT_OUT            := internal/thrift/gen
+THRIFT_PACKAGE_PREFIX := github.com/phrocker/shoal/internal/thrift/gen/
 
-# Subset of Accumulo's Thrift IDL shoal needs (read path only).
+# Generate the two top-level services shoal uses. The compiler's recursive
+# mode follows their vendored includes and emits the shared data packages.
 THRIFT_FILES := \
 	$(THRIFT_IDL)/tabletscan.thrift \
-	$(THRIFT_IDL)/data.thrift \
-	$(THRIFT_IDL)/security.thrift \
-	$(THRIFT_IDL)/client.thrift
+	$(THRIFT_IDL)/compaction-coordinator.thrift
 
 .PHONY: all
 all: build
 
 .PHONY: thrift-check
 thrift-check:
-	@test -x $(THRIFT) || { echo "thrift compiler not found at $(THRIFT)"; exit 1; }
-	@v=$$($(THRIFT) --version | awk '{print $$3}'); \
-	  test "$$v" = "0.17.0" || { echo "expected thrift 0.17.0, got $$v"; exit 1; }
+	@command -v "$(THRIFT)" >/dev/null 2>&1 || { \
+	  echo "thrift compiler not found: $(THRIFT)"; \
+	  echo "install Apache Thrift $(THRIFT_VERSION) or set THRIFT=/path/to/thrift"; \
+	  exit 1; \
+	}
+	@v=$$("$(THRIFT)" --version | awk '{print $$3}'); \
+	  test "$$v" = "$(THRIFT_VERSION)" || { \
+	    echo "expected thrift $(THRIFT_VERSION), got $$v"; \
+	    exit 1; \
+	  }
 
 .PHONY: thrift-gen
 thrift-gen: thrift-check
 	rm -rf $(THRIFT_OUT)
 	mkdir -p $(THRIFT_OUT)
 	for f in $(THRIFT_FILES); do \
-	  $(THRIFT) -r --gen go:package_prefix=github.com/accumulo/shoal/internal/thrift/gen/ \
+	  "$(THRIFT)" -r -I $(THRIFT_IDL) \
+	    --gen go:package_prefix=$(THRIFT_PACKAGE_PREFIX) \
 	    -out $(THRIFT_OUT) $$f || exit 1; \
 	done
 	# Drop standalone -remote debug CLIs; they target a newer apache/thrift
 	# Go runtime API and we don't use them.
 	find $(THRIFT_OUT) -type d -name '*-remote' -exec rm -rf {} +
+	# Thrift derives the Go package from the hyphenated IDL basename, which is
+	# not a valid Go identifier. Accumulo's Java generator does not need a Go
+	# namespace, so normalize this one package after generation.
+	if test -d $(THRIFT_OUT)/compaction-coordinator; then \
+	  sed -i 's/^package compaction-coordinator$$/package compactioncoordinator/' \
+	    $(THRIFT_OUT)/compaction-coordinator/*.go; \
+	  for f in $(THRIFT_OUT)/compaction-coordinator/*; do \
+	    b=$$(basename "$$f" | sed 's/compaction-coordinator/compactioncoordinator/g'); \
+	    mv "$$f" "$(THRIFT_OUT)/compaction-coordinator/$$b"; \
+	  done; \
+	  mv $(THRIFT_OUT)/compaction-coordinator $(THRIFT_OUT)/compactioncoordinator; \
+	fi
 	$(MAKE) patch-thrift-nil-binary
+
+.PHONY: thrift-verify
+thrift-verify: thrift-check
+	@test -d "$(THRIFT_OUT)" || { \
+	  echo "generated Thrift bindings not found at $(THRIFT_OUT); run make thrift-gen"; \
+	  exit 1; \
+	}
+	@tmp=$$(mktemp -d); \
+	  trap 'rm -rf "$$tmp"' EXIT; \
+	  cp -R $(THRIFT_OUT) "$$tmp/gen"; \
+	  $(MAKE) --no-print-directory thrift-gen; \
+	  if ! diff -ru --strip-trailing-cr "$$tmp/gen" $(THRIFT_OUT); then \
+	    echo "generated Thrift bindings are stale; run make thrift-gen"; \
+	    exit 1; \
+	  fi; \
+	  echo "generated Thrift bindings match the vendored IDLs"
 
 # Patch generated writeFieldN functions that write a struct-pointer field
 # unconditionally. Java treats absent struct fields as "no value"; the Go
@@ -79,8 +114,8 @@ _patch-binary-fields:
 	  echo "_patch-binary-fields: already applied"; \
 	else \
 	  awk 'BEGIN { p=0 } \
-	       /^func \(p \*TKeyExtent\) writeField2\b/ { p=1; print; next } \
-	       /^func \(p \*TKeyExtent\) writeField3\b/ { p=2; print; next } \
+	       /^func \(p \*TKeyExtent\) writeField2\(/ { p=1; print; next } \
+	       /^func \(p \*TKeyExtent\) writeField3\(/ { p=2; print; next } \
 	       p==1 && /WriteFieldBegin\(ctx, "endRow"/     { print "  // PATCH (shoal): skip endRow when nil so wire matches Java\047s \"infinite endRow\" semantics."; print "  if p.EndRow == nil { return nil }"; p=0 } \
 	       p==2 && /WriteFieldBegin\(ctx, "prevEndRow"/ { print "  // PATCH (shoal): null prevEndRow = \"infinite prev\" (start of table)."; print "  if p.PrevEndRow == nil { return nil }"; p=0 } \
 	       { print }' $$f > $$f.tmp && mv $$f.tmp $$f; \

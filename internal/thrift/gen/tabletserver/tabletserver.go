@@ -285,6 +285,8 @@ func (p *NotServingTabletException) Write(ctx context.Context, oprot thrift.TPro
 }
 
 func (p *NotServingTabletException) writeField1(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Extent == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "extent", thrift.STRUCT, 1); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 1:extent: ", p), err) }
   if err := p.Extent.Write(ctx, oprot); err != nil {
@@ -945,6 +947,8 @@ func (p *TabletStats) Write(ctx context.Context, oprot thrift.TProtocol) error {
 }
 
 func (p *TabletStats) writeField1(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Extent == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "extent", thrift.STRUCT, 1); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 1:extent: ", p), err) }
   if err := p.Extent.Write(ctx, oprot); err != nil {
@@ -956,6 +960,8 @@ func (p *TabletStats) writeField1(ctx context.Context, oprot thrift.TProtocol) (
 }
 
 func (p *TabletStats) writeField3(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Minors == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "minors", thrift.STRUCT, 3); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 3:minors: ", p), err) }
   if err := p.Minors.Write(ctx, oprot); err != nil {
@@ -1447,6 +1453,8 @@ func (p *ActiveCompaction) Write(ctx context.Context, oprot thrift.TProtocol) er
 }
 
 func (p *ActiveCompaction) writeField1(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Extent == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "extent", thrift.STRUCT, 1); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 1:extent: ", p), err) }
   if err := p.Extent.Write(ctx, oprot); err != nil {
@@ -2572,6 +2580,8 @@ func (p *TExternalCompactionJob) writeField1(ctx context.Context, oprot thrift.T
 }
 
 func (p *TExternalCompactionJob) writeField2(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Extent == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "extent", thrift.STRUCT, 2); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 2:extent: ", p), err) }
   if err := p.Extent.Write(ctx, oprot); err != nil {
@@ -2602,6 +2612,8 @@ func (p *TExternalCompactionJob) writeField3(ctx context.Context, oprot thrift.T
 }
 
 func (p *TExternalCompactionJob) writeField4(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.IteratorSettings == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "iteratorSettings", thrift.STRUCT, 4); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 4:iteratorSettings: ", p), err) }
   if err := p.IteratorSettings.Write(ctx, oprot); err != nil {
@@ -2643,6 +2655,8 @@ func (p *TExternalCompactionJob) writeField7(ctx context.Context, oprot thrift.T
 }
 
 func (p *TExternalCompactionJob) writeField8(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.FateId == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "fateId", thrift.STRUCT, 8); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 8:fateId: ", p), err) }
   if err := p.FateId.Write(ctx, oprot); err != nil {
@@ -4946,6 +4960,8 @@ func (p *TabletServerClientServiceFlushArgs) Write(ctx context.Context, oprot th
 }
 
 func (p *TabletServerClientServiceFlushArgs) writeField1(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Credentials == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "credentials", thrift.STRUCT, 1); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 1:credentials: ", p), err) }
   if err := p.Credentials.Write(ctx, oprot); err != nil {
@@ -4977,6 +4993,8 @@ func (p *TabletServerClientServiceFlushArgs) writeField3(ctx context.Context, op
 }
 
 func (p *TabletServerClientServiceFlushArgs) writeField4(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Tinfo == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "tinfo", thrift.STRUCT, 4); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 4:tinfo: ", p), err) }
   if err := p.Tinfo.Write(ctx, oprot); err != nil {
@@ -5128,6 +5146,8 @@ func (p *TabletServerClientServiceGetTabletServerStatusArgs) Write(ctx context.C
 }
 
 func (p *TabletServerClientServiceGetTabletServerStatusArgs) writeField1(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Credentials == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "credentials", thrift.STRUCT, 1); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 1:credentials: ", p), err) }
   if err := p.Credentials.Write(ctx, oprot); err != nil {
@@ -5139,6 +5159,8 @@ func (p *TabletServerClientServiceGetTabletServerStatusArgs) writeField1(ctx con
 }
 
 func (p *TabletServerClientServiceGetTabletServerStatusArgs) writeField3(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Tinfo == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "tinfo", thrift.STRUCT, 3); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 3:tinfo: ", p), err) }
   if err := p.Tinfo.Write(ctx, oprot); err != nil {
@@ -5440,6 +5462,8 @@ func (p *TabletServerClientServiceGetTabletStatsArgs) Write(ctx context.Context,
 }
 
 func (p *TabletServerClientServiceGetTabletStatsArgs) writeField1(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Credentials == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "credentials", thrift.STRUCT, 1); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 1:credentials: ", p), err) }
   if err := p.Credentials.Write(ctx, oprot); err != nil {
@@ -5461,6 +5485,8 @@ func (p *TabletServerClientServiceGetTabletStatsArgs) writeField2(ctx context.Co
 }
 
 func (p *TabletServerClientServiceGetTabletStatsArgs) writeField3(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Tinfo == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "tinfo", thrift.STRUCT, 3); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 3:tinfo: ", p), err) }
   if err := p.Tinfo.Write(ctx, oprot); err != nil {
@@ -5754,6 +5780,8 @@ func (p *TabletServerClientServiceGetHistoricalStatsArgs) Write(ctx context.Cont
 }
 
 func (p *TabletServerClientServiceGetHistoricalStatsArgs) writeField1(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Credentials == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "credentials", thrift.STRUCT, 1); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 1:credentials: ", p), err) }
   if err := p.Credentials.Write(ctx, oprot); err != nil {
@@ -5765,6 +5793,8 @@ func (p *TabletServerClientServiceGetHistoricalStatsArgs) writeField1(ctx contex
 }
 
 func (p *TabletServerClientServiceGetHistoricalStatsArgs) writeField2(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Tinfo == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "tinfo", thrift.STRUCT, 2); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 2:tinfo: ", p), err) }
   if err := p.Tinfo.Write(ctx, oprot); err != nil {
@@ -6066,6 +6096,8 @@ func (p *TabletServerClientServiceHaltArgs) Write(ctx context.Context, oprot thr
 }
 
 func (p *TabletServerClientServiceHaltArgs) writeField1(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Credentials == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "credentials", thrift.STRUCT, 1); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 1:credentials: ", p), err) }
   if err := p.Credentials.Write(ctx, oprot); err != nil {
@@ -6087,6 +6119,8 @@ func (p *TabletServerClientServiceHaltArgs) writeField2(ctx context.Context, opr
 }
 
 func (p *TabletServerClientServiceHaltArgs) writeField3(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Tinfo == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "tinfo", thrift.STRUCT, 3); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 3:tinfo: ", p), err) }
   if err := p.Tinfo.Write(ctx, oprot); err != nil {
@@ -6343,6 +6377,8 @@ func (p *TabletServerClientServiceFastHaltArgs) Write(ctx context.Context, oprot
 }
 
 func (p *TabletServerClientServiceFastHaltArgs) writeField1(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Credentials == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "credentials", thrift.STRUCT, 1); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 1:credentials: ", p), err) }
   if err := p.Credentials.Write(ctx, oprot); err != nil {
@@ -6364,6 +6400,8 @@ func (p *TabletServerClientServiceFastHaltArgs) writeField2(ctx context.Context,
 }
 
 func (p *TabletServerClientServiceFastHaltArgs) writeField3(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Tinfo == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "tinfo", thrift.STRUCT, 3); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 3:tinfo: ", p), err) }
   if err := p.Tinfo.Write(ctx, oprot); err != nil {
@@ -6494,6 +6532,8 @@ func (p *TabletServerClientServiceGetActiveCompactionsArgs) Write(ctx context.Co
 }
 
 func (p *TabletServerClientServiceGetActiveCompactionsArgs) writeField1(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Credentials == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "credentials", thrift.STRUCT, 1); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 1:credentials: ", p), err) }
   if err := p.Credentials.Write(ctx, oprot); err != nil {
@@ -6505,6 +6545,8 @@ func (p *TabletServerClientServiceGetActiveCompactionsArgs) writeField1(ctx cont
 }
 
 func (p *TabletServerClientServiceGetActiveCompactionsArgs) writeField2(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Tinfo == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "tinfo", thrift.STRUCT, 2); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 2:tinfo: ", p), err) }
   if err := p.Tinfo.Write(ctx, oprot); err != nil {
@@ -6837,6 +6879,8 @@ func (p *TabletServerClientServiceRemoveLogsArgs) Write(ctx context.Context, opr
 }
 
 func (p *TabletServerClientServiceRemoveLogsArgs) writeField1(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Tinfo == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "tinfo", thrift.STRUCT, 1); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 1:tinfo: ", p), err) }
   if err := p.Tinfo.Write(ctx, oprot); err != nil {
@@ -6848,6 +6892,8 @@ func (p *TabletServerClientServiceRemoveLogsArgs) writeField1(ctx context.Contex
 }
 
 func (p *TabletServerClientServiceRemoveLogsArgs) writeField2(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Credentials == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "credentials", thrift.STRUCT, 2); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 2:credentials: ", p), err) }
   if err := p.Credentials.Write(ctx, oprot); err != nil {
@@ -6996,6 +7042,8 @@ func (p *TabletServerClientServiceGetActiveLogsArgs) Write(ctx context.Context, 
 }
 
 func (p *TabletServerClientServiceGetActiveLogsArgs) writeField1(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Tinfo == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "tinfo", thrift.STRUCT, 1); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 1:tinfo: ", p), err) }
   if err := p.Tinfo.Write(ctx, oprot); err != nil {
@@ -7007,6 +7055,8 @@ func (p *TabletServerClientServiceGetActiveLogsArgs) writeField1(ctx context.Con
 }
 
 func (p *TabletServerClientServiceGetActiveLogsArgs) writeField2(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Credentials == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "credentials", thrift.STRUCT, 2); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 2:credentials: ", p), err) }
   if err := p.Credentials.Write(ctx, oprot); err != nil {
@@ -7288,6 +7338,8 @@ func (p *TabletServerClientServiceStartGetSummariesArgs) Write(ctx context.Conte
 }
 
 func (p *TabletServerClientServiceStartGetSummariesArgs) writeField1(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Tinfo == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "tinfo", thrift.STRUCT, 1); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 1:tinfo: ", p), err) }
   if err := p.Tinfo.Write(ctx, oprot); err != nil {
@@ -7299,6 +7351,8 @@ func (p *TabletServerClientServiceStartGetSummariesArgs) writeField1(ctx context
 }
 
 func (p *TabletServerClientServiceStartGetSummariesArgs) writeField2(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Credentials == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "credentials", thrift.STRUCT, 2); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 2:credentials: ", p), err) }
   if err := p.Credentials.Write(ctx, oprot); err != nil {
@@ -7310,6 +7364,8 @@ func (p *TabletServerClientServiceStartGetSummariesArgs) writeField2(ctx context
 }
 
 func (p *TabletServerClientServiceStartGetSummariesArgs) writeField3(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Request == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "request", thrift.STRUCT, 3); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 3:request: ", p), err) }
   if err := p.Request.Write(ctx, oprot); err != nil {
@@ -7714,6 +7770,8 @@ func (p *TabletServerClientServiceStartGetSummariesForPartitionArgs) Write(ctx c
 }
 
 func (p *TabletServerClientServiceStartGetSummariesForPartitionArgs) writeField1(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Tinfo == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "tinfo", thrift.STRUCT, 1); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 1:tinfo: ", p), err) }
   if err := p.Tinfo.Write(ctx, oprot); err != nil {
@@ -7725,6 +7783,8 @@ func (p *TabletServerClientServiceStartGetSummariesForPartitionArgs) writeField1
 }
 
 func (p *TabletServerClientServiceStartGetSummariesForPartitionArgs) writeField2(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Credentials == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "credentials", thrift.STRUCT, 2); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 2:credentials: ", p), err) }
   if err := p.Credentials.Write(ctx, oprot); err != nil {
@@ -7736,6 +7796,8 @@ func (p *TabletServerClientServiceStartGetSummariesForPartitionArgs) writeField2
 }
 
 func (p *TabletServerClientServiceStartGetSummariesForPartitionArgs) writeField3(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Request == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "request", thrift.STRUCT, 3); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 3:request: ", p), err) }
   if err := p.Request.Write(ctx, oprot); err != nil {
@@ -8118,6 +8180,8 @@ func (p *TabletServerClientServiceStartGetSummariesFromFilesArgs) Write(ctx cont
 }
 
 func (p *TabletServerClientServiceStartGetSummariesFromFilesArgs) writeField1(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Tinfo == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "tinfo", thrift.STRUCT, 1); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 1:tinfo: ", p), err) }
   if err := p.Tinfo.Write(ctx, oprot); err != nil {
@@ -8129,6 +8193,8 @@ func (p *TabletServerClientServiceStartGetSummariesFromFilesArgs) writeField1(ct
 }
 
 func (p *TabletServerClientServiceStartGetSummariesFromFilesArgs) writeField2(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Credentials == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "credentials", thrift.STRUCT, 2); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 2:credentials: ", p), err) }
   if err := p.Credentials.Write(ctx, oprot); err != nil {
@@ -8140,6 +8206,8 @@ func (p *TabletServerClientServiceStartGetSummariesFromFilesArgs) writeField2(ct
 }
 
 func (p *TabletServerClientServiceStartGetSummariesFromFilesArgs) writeField3(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Request == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "request", thrift.STRUCT, 3); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 3:request: ", p), err) }
   if err := p.Request.Write(ctx, oprot); err != nil {
@@ -8438,6 +8506,8 @@ func (p *TabletServerClientServiceContiuneGetSummariesArgs) Write(ctx context.Co
 }
 
 func (p *TabletServerClientServiceContiuneGetSummariesArgs) writeField1(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Tinfo == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "tinfo", thrift.STRUCT, 1); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 1:tinfo: ", p), err) }
   if err := p.Tinfo.Write(ctx, oprot); err != nil {
@@ -8760,6 +8830,8 @@ func (p *TabletServerClientServiceRefreshTabletsArgs) Write(ctx context.Context,
 }
 
 func (p *TabletServerClientServiceRefreshTabletsArgs) writeField1(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Tinfo == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "tinfo", thrift.STRUCT, 1); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 1:tinfo: ", p), err) }
   if err := p.Tinfo.Write(ctx, oprot); err != nil {
@@ -8771,6 +8843,8 @@ func (p *TabletServerClientServiceRefreshTabletsArgs) writeField1(ctx context.Co
 }
 
 func (p *TabletServerClientServiceRefreshTabletsArgs) writeField2(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Credentials == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "credentials", thrift.STRUCT, 2); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 2:credentials: ", p), err) }
   if err := p.Credentials.Write(ctx, oprot); err != nil {
@@ -9075,6 +9149,8 @@ func (p *TabletServerClientServiceAllocateTimestampsArgs) Write(ctx context.Cont
 }
 
 func (p *TabletServerClientServiceAllocateTimestampsArgs) writeField1(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Tinfo == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "tinfo", thrift.STRUCT, 1); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 1:tinfo: ", p), err) }
   if err := p.Tinfo.Write(ctx, oprot); err != nil {
@@ -9086,6 +9162,8 @@ func (p *TabletServerClientServiceAllocateTimestampsArgs) writeField1(ctx contex
 }
 
 func (p *TabletServerClientServiceAllocateTimestampsArgs) writeField2(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Credentials == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "credentials", thrift.STRUCT, 2); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 2:credentials: ", p), err) }
   if err := p.Credentials.Write(ctx, oprot); err != nil {

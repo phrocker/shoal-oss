@@ -598,6 +598,8 @@ func (p *TExternalCompaction) writeField3(ctx context.Context, oprot thrift.TPro
 }
 
 func (p *TExternalCompaction) writeField4(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Job == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "job", thrift.STRUCT, 4); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 4:job: ", p), err) }
   if err := p.Job.Write(ctx, oprot); err != nil {
@@ -997,6 +999,8 @@ func (p *TNextCompactionJob) Write(ctx context.Context, oprot thrift.TProtocol) 
 }
 
 func (p *TNextCompactionJob) writeField1(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Job == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "job", thrift.STRUCT, 1); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 1:job: ", p), err) }
   if err := p.Job.Write(ctx, oprot); err != nil {
@@ -2486,6 +2490,8 @@ func (p *CompactionCoordinatorServiceCompactionCompletedArgs) Write(ctx context.
 }
 
 func (p *CompactionCoordinatorServiceCompactionCompletedArgs) writeField1(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Tinfo == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "tinfo", thrift.STRUCT, 1); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 1:tinfo: ", p), err) }
   if err := p.Tinfo.Write(ctx, oprot); err != nil {
@@ -2497,6 +2503,8 @@ func (p *CompactionCoordinatorServiceCompactionCompletedArgs) writeField1(ctx co
 }
 
 func (p *CompactionCoordinatorServiceCompactionCompletedArgs) writeField2(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Credentials == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "credentials", thrift.STRUCT, 2); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 2:credentials: ", p), err) }
   if err := p.Credentials.Write(ctx, oprot); err != nil {
@@ -2518,6 +2526,8 @@ func (p *CompactionCoordinatorServiceCompactionCompletedArgs) writeField3(ctx co
 }
 
 func (p *CompactionCoordinatorServiceCompactionCompletedArgs) writeField4(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Extent == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "extent", thrift.STRUCT, 4); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 4:extent: ", p), err) }
   if err := p.Extent.Write(ctx, oprot); err != nil {
@@ -2529,6 +2539,8 @@ func (p *CompactionCoordinatorServiceCompactionCompletedArgs) writeField4(ctx co
 }
 
 func (p *CompactionCoordinatorServiceCompactionCompletedArgs) writeField5(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Stats == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "stats", thrift.STRUCT, 5); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 5:stats: ", p), err) }
   if err := p.Stats.Write(ctx, oprot); err != nil {
@@ -2882,6 +2894,8 @@ func (p *CompactionCoordinatorServiceGetCompactionJobArgs) Write(ctx context.Con
 }
 
 func (p *CompactionCoordinatorServiceGetCompactionJobArgs) writeField1(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Tinfo == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "tinfo", thrift.STRUCT, 1); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 1:tinfo: ", p), err) }
   if err := p.Tinfo.Write(ctx, oprot); err != nil {
@@ -2893,6 +2907,8 @@ func (p *CompactionCoordinatorServiceGetCompactionJobArgs) writeField1(ctx conte
 }
 
 func (p *CompactionCoordinatorServiceGetCompactionJobArgs) writeField2(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Credentials == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "credentials", thrift.STRUCT, 2); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 2:credentials: ", p), err) }
   if err := p.Credentials.Write(ctx, oprot); err != nil {
@@ -3327,6 +3343,8 @@ func (p *CompactionCoordinatorServiceUpdateCompactionStatusArgs) Write(ctx conte
 }
 
 func (p *CompactionCoordinatorServiceUpdateCompactionStatusArgs) writeField1(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Tinfo == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "tinfo", thrift.STRUCT, 1); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 1:tinfo: ", p), err) }
   if err := p.Tinfo.Write(ctx, oprot); err != nil {
@@ -3338,6 +3356,8 @@ func (p *CompactionCoordinatorServiceUpdateCompactionStatusArgs) writeField1(ctx
 }
 
 func (p *CompactionCoordinatorServiceUpdateCompactionStatusArgs) writeField2(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Credentials == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "credentials", thrift.STRUCT, 2); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 2:credentials: ", p), err) }
   if err := p.Credentials.Write(ctx, oprot); err != nil {
@@ -3359,6 +3379,8 @@ func (p *CompactionCoordinatorServiceUpdateCompactionStatusArgs) writeField3(ctx
 }
 
 func (p *CompactionCoordinatorServiceUpdateCompactionStatusArgs) writeField4(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Status == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "status", thrift.STRUCT, 4); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 4:status: ", p), err) }
   if err := p.Status.Write(ctx, oprot); err != nil {
@@ -3755,6 +3777,8 @@ func (p *CompactionCoordinatorServiceCompactionFailedArgs) Write(ctx context.Con
 }
 
 func (p *CompactionCoordinatorServiceCompactionFailedArgs) writeField1(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Tinfo == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "tinfo", thrift.STRUCT, 1); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 1:tinfo: ", p), err) }
   if err := p.Tinfo.Write(ctx, oprot); err != nil {
@@ -3766,6 +3790,8 @@ func (p *CompactionCoordinatorServiceCompactionFailedArgs) writeField1(ctx conte
 }
 
 func (p *CompactionCoordinatorServiceCompactionFailedArgs) writeField2(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Credentials == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "credentials", thrift.STRUCT, 2); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 2:credentials: ", p), err) }
   if err := p.Credentials.Write(ctx, oprot); err != nil {
@@ -3787,6 +3813,8 @@ func (p *CompactionCoordinatorServiceCompactionFailedArgs) writeField3(ctx conte
 }
 
 func (p *CompactionCoordinatorServiceCompactionFailedArgs) writeField4(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Extent == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "extent", thrift.STRUCT, 4); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 4:extent: ", p), err) }
   if err := p.Extent.Write(ctx, oprot); err != nil {
@@ -4082,6 +4110,8 @@ func (p *CompactionCoordinatorServiceGetRunningCompactionsArgs) Write(ctx contex
 }
 
 func (p *CompactionCoordinatorServiceGetRunningCompactionsArgs) writeField1(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Tinfo == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "tinfo", thrift.STRUCT, 1); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 1:tinfo: ", p), err) }
   if err := p.Tinfo.Write(ctx, oprot); err != nil {
@@ -4093,6 +4123,8 @@ func (p *CompactionCoordinatorServiceGetRunningCompactionsArgs) writeField1(ctx 
 }
 
 func (p *CompactionCoordinatorServiceGetRunningCompactionsArgs) writeField2(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Credentials == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "credentials", thrift.STRUCT, 2); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 2:credentials: ", p), err) }
   if err := p.Credentials.Write(ctx, oprot); err != nil {
@@ -4413,6 +4445,8 @@ func (p *CompactionCoordinatorServiceGetLongRunningCompactionsArgs) Write(ctx co
 }
 
 func (p *CompactionCoordinatorServiceGetLongRunningCompactionsArgs) writeField1(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Tinfo == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "tinfo", thrift.STRUCT, 1); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 1:tinfo: ", p), err) }
   if err := p.Tinfo.Write(ctx, oprot); err != nil {
@@ -4424,6 +4458,8 @@ func (p *CompactionCoordinatorServiceGetLongRunningCompactionsArgs) writeField1(
 }
 
 func (p *CompactionCoordinatorServiceGetLongRunningCompactionsArgs) writeField2(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Credentials == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "credentials", thrift.STRUCT, 2); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 2:credentials: ", p), err) }
   if err := p.Credentials.Write(ctx, oprot); err != nil {
@@ -4770,6 +4806,8 @@ func (p *CompactionCoordinatorServiceGetCompletedCompactionsArgs) Write(ctx cont
 }
 
 func (p *CompactionCoordinatorServiceGetCompletedCompactionsArgs) writeField1(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Tinfo == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "tinfo", thrift.STRUCT, 1); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 1:tinfo: ", p), err) }
   if err := p.Tinfo.Write(ctx, oprot); err != nil {
@@ -4781,6 +4819,8 @@ func (p *CompactionCoordinatorServiceGetCompletedCompactionsArgs) writeField1(ct
 }
 
 func (p *CompactionCoordinatorServiceGetCompletedCompactionsArgs) writeField2(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Credentials == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "credentials", thrift.STRUCT, 2); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 2:credentials: ", p), err) }
   if err := p.Credentials.Write(ctx, oprot); err != nil {
@@ -5127,6 +5167,8 @@ func (p *CompactionCoordinatorServiceCancelArgs) Write(ctx context.Context, opro
 }
 
 func (p *CompactionCoordinatorServiceCancelArgs) writeField1(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Tinfo == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "tinfo", thrift.STRUCT, 1); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 1:tinfo: ", p), err) }
   if err := p.Tinfo.Write(ctx, oprot); err != nil {
@@ -5138,6 +5180,8 @@ func (p *CompactionCoordinatorServiceCancelArgs) writeField1(ctx context.Context
 }
 
 func (p *CompactionCoordinatorServiceCancelArgs) writeField2(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Credentials == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "credentials", thrift.STRUCT, 2); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 2:credentials: ", p), err) }
   if err := p.Credentials.Write(ctx, oprot); err != nil {
@@ -5449,6 +5493,8 @@ func (p *CompactionCoordinatorServiceRecordCompletionArgs) Write(ctx context.Con
 }
 
 func (p *CompactionCoordinatorServiceRecordCompletionArgs) writeField1(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Tinfo == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "tinfo", thrift.STRUCT, 1); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 1:tinfo: ", p), err) }
   if err := p.Tinfo.Write(ctx, oprot); err != nil {
@@ -5460,6 +5506,8 @@ func (p *CompactionCoordinatorServiceRecordCompletionArgs) writeField1(ctx conte
 }
 
 func (p *CompactionCoordinatorServiceRecordCompletionArgs) writeField2(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Credentials == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "credentials", thrift.STRUCT, 2); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 2:credentials: ", p), err) }
   if err := p.Credentials.Write(ctx, oprot); err != nil {
@@ -6165,6 +6213,8 @@ func (p *CompactorServiceGetRunningCompactionArgs) Write(ctx context.Context, op
 }
 
 func (p *CompactorServiceGetRunningCompactionArgs) writeField1(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Tinfo == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "tinfo", thrift.STRUCT, 1); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 1:tinfo: ", p), err) }
   if err := p.Tinfo.Write(ctx, oprot); err != nil {
@@ -6176,6 +6226,8 @@ func (p *CompactorServiceGetRunningCompactionArgs) writeField1(ctx context.Conte
 }
 
 func (p *CompactorServiceGetRunningCompactionArgs) writeField2(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Credentials == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "credentials", thrift.STRUCT, 2); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 2:credentials: ", p), err) }
   if err := p.Credentials.Write(ctx, oprot); err != nil {
@@ -6451,6 +6503,8 @@ func (p *CompactorServiceGetRunningCompactionIdArgs) Write(ctx context.Context, 
 }
 
 func (p *CompactorServiceGetRunningCompactionIdArgs) writeField1(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Tinfo == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "tinfo", thrift.STRUCT, 1); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 1:tinfo: ", p), err) }
   if err := p.Tinfo.Write(ctx, oprot); err != nil {
@@ -6462,6 +6516,8 @@ func (p *CompactorServiceGetRunningCompactionIdArgs) writeField1(ctx context.Con
 }
 
 func (p *CompactorServiceGetRunningCompactionIdArgs) writeField2(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Credentials == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "credentials", thrift.STRUCT, 2); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 2:credentials: ", p), err) }
   if err := p.Credentials.Write(ctx, oprot); err != nil {
@@ -6737,6 +6793,8 @@ func (p *CompactorServiceGetActiveCompactionsArgs) Write(ctx context.Context, op
 }
 
 func (p *CompactorServiceGetActiveCompactionsArgs) writeField1(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Credentials == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "credentials", thrift.STRUCT, 1); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 1:credentials: ", p), err) }
   if err := p.Credentials.Write(ctx, oprot); err != nil {
@@ -6748,6 +6806,8 @@ func (p *CompactorServiceGetActiveCompactionsArgs) writeField1(ctx context.Conte
 }
 
 func (p *CompactorServiceGetActiveCompactionsArgs) writeField2(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Tinfo == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "tinfo", thrift.STRUCT, 2); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 2:tinfo: ", p), err) }
   if err := p.Tinfo.Write(ctx, oprot); err != nil {
@@ -7067,6 +7127,8 @@ func (p *CompactorServiceCancelArgs) Write(ctx context.Context, oprot thrift.TPr
 }
 
 func (p *CompactorServiceCancelArgs) writeField1(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Tinfo == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "tinfo", thrift.STRUCT, 1); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 1:tinfo: ", p), err) }
   if err := p.Tinfo.Write(ctx, oprot); err != nil {
@@ -7078,6 +7140,8 @@ func (p *CompactorServiceCancelArgs) writeField1(ctx context.Context, oprot thri
 }
 
 func (p *CompactorServiceCancelArgs) writeField2(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Credentials == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "credentials", thrift.STRUCT, 2); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 2:credentials: ", p), err) }
   if err := p.Credentials.Write(ctx, oprot); err != nil {

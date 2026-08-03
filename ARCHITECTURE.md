@@ -57,8 +57,10 @@ lambda-iterator path.
 
 ## Wire protocol
 
-Apache Thrift, IDL pinned to **0.17.0** (matches Accumulo's
-`version.thrift`). The compiler version is enforced by `make thrift-check`.
+Apache Thrift, generated with compiler **0.17.0** from the vendored Accumulo 4
+IDL snapshot in `internal/thrift/idl`. The source and compiler revisions are
+documented there, `make thrift-check` enforces the compiler version, and
+`make thrift-verify` checks the internal generated bindings for drift.
 
 Transport: `TFramedTransport`. Protocol: `TCompactProtocol` wrapped in a
 custom `AccumuloProtocol` that prepends/validates a header on every
