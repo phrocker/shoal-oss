@@ -1,0 +1,81 @@
+package accumulo
+
+import (
+	"errors"
+	"sync"
+
+	"github.com/phrocker/shoal/internal/transportpool"
+)
+
+// Connector is the root handle for Accumulo client operations.
+//
+// A Connector does not own the Instance passed to NewConnector. Callers may
+// share an Instance across connectors and must close it separately.
+type Connector struct {
+	mu          sync.RWMutex
+	instance    InstanceInfo
+	credentials Credentials
+	options     normalizedConnectorOptions
+	pool        *transportpool.Pool
+	closed      bool
+}
+
+// NewConnector validates and captures the instance and credentials used by
+// future scanner, writer, and administration APIs.
+func NewConnector(instance Instance, credentials Credentials, opts ConnectorOptions) (*Connector, error) {
+	if instance == nil {
+		return nil, errors.New("accumulo: instance is required")
+	}
+	info := instance.Info()
+	if info.Name == "" || info.ID == "" {
+		return nil, errors.New("accumulo: instance identity is incomplete")
+	}
+	if err := credentials.validate(); err != nil {
+		return nil, err
+	}
+	normalized, err := normalizeConnectorOptions(opts)
+	if err != nil {
+		return nil, err
+	}
+	pool, err := transportpool.New(normalized.poolConfig)
+	if err != nil {
+		return nil, err
+	}
+	return &Connector{
+		instance:    info,
+		credentials: credentials.clone(),
+		options:     normalized,
+		pool:        pool,
+	}, nil
+}
+
+// Instance returns the immutable identity captured by the connector.
+func (c *Connector) Instance() InstanceInfo {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.instance
+}
+
+// Principal returns the authenticated principal name.
+func (c *Connector) Principal() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.credentials.Principal()
+}
+
+// Close releases connector-owned transports. It is safe to call repeatedly.
+func (c *Connector) Close() error {
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return nil
+	}
+	c.closed = true
+	pool := c.pool
+	for i := range c.credentials.token {
+		c.credentials.token[i] = 0
+	}
+	c.credentials.token = nil
+	c.mu.Unlock()
+	return pool.Close()
+}
