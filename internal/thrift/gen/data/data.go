@@ -971,6 +971,8 @@ func (p *TKeyExtent) writeField1(ctx context.Context, oprot thrift.TProtocol) (e
 }
 
 func (p *TKeyExtent) writeField2(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): skip endRow when nil so wire matches Java's "infinite endRow" semantics.
+  if p.EndRow == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "endRow", thrift.STRING, 2); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 2:endRow: ", p), err) }
   if err := oprot.WriteBinary(ctx, p.EndRow); err != nil {
@@ -981,6 +983,8 @@ func (p *TKeyExtent) writeField2(ctx context.Context, oprot thrift.TProtocol) (e
 }
 
 func (p *TKeyExtent) writeField3(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null prevEndRow = "infinite prev" (start of table).
+  if p.PrevEndRow == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "prevEndRow", thrift.STRING, 3); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 3:prevEndRow: ", p), err) }
   if err := oprot.WriteBinary(ctx, p.PrevEndRow); err != nil {
@@ -1116,6 +1120,8 @@ func (p *TKeyValue) Write(ctx context.Context, oprot thrift.TProtocol) error {
 }
 
 func (p *TKeyValue) writeField1(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Key == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "key", thrift.STRUCT, 1); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 1:key: ", p), err) }
   if err := p.Key.Write(ctx, oprot); err != nil {
@@ -1533,6 +1539,8 @@ func (p *TRange) Write(ctx context.Context, oprot thrift.TProtocol) error {
 }
 
 func (p *TRange) writeField1(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Start == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "start", thrift.STRUCT, 1); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 1:start: ", p), err) }
   if err := p.Start.Write(ctx, oprot); err != nil {
@@ -1544,6 +1552,8 @@ func (p *TRange) writeField1(ctx context.Context, oprot thrift.TProtocol) (err e
 }
 
 func (p *TRange) writeField2(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Stop == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "stop", thrift.STRUCT, 2); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 2:stop: ", p), err) }
   if err := p.Stop.Write(ctx, oprot); err != nil {
@@ -1976,6 +1986,8 @@ func (p *MultiScanResult_) writeField3(ctx context.Context, oprot thrift.TProtoc
 }
 
 func (p *MultiScanResult_) writeField4(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.PartScan == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "partScan", thrift.STRUCT, 4); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 4:partScan: ", p), err) }
   if err := p.PartScan.Write(ctx, oprot); err != nil {
@@ -1987,6 +1999,8 @@ func (p *MultiScanResult_) writeField4(ctx context.Context, oprot thrift.TProtoc
 }
 
 func (p *MultiScanResult_) writeField5(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.PartNextKey == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "partNextKey", thrift.STRUCT, 5); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 5:partNextKey: ", p), err) }
   if err := p.PartNextKey.Write(ctx, oprot); err != nil {
@@ -2174,6 +2188,8 @@ func (p *InitialScan) writeField1(ctx context.Context, oprot thrift.TProtocol) (
 }
 
 func (p *InitialScan) writeField2(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Result_ == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "result", thrift.STRUCT, 2); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 2:result: ", p), err) }
   if err := p.Result_.Write(ctx, oprot); err != nil {
@@ -2320,6 +2336,8 @@ func (p *InitialMultiScan) writeField1(ctx context.Context, oprot thrift.TProtoc
 }
 
 func (p *InitialMultiScan) writeField2(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Result_ == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "result", thrift.STRUCT, 2); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 2:result: ", p), err) }
   if err := p.Result_.Write(ctx, oprot); err != nil {
@@ -3624,6 +3642,8 @@ func (p *TConditionalMutation) writeField1(ctx context.Context, oprot thrift.TPr
 }
 
 func (p *TConditionalMutation) writeField2(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Mutation == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "mutation", thrift.STRUCT, 2); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 2:mutation: ", p), err) }
   if err := p.Mutation.Write(ctx, oprot); err != nil {
@@ -4274,6 +4294,8 @@ func (p *TSummary) writeField1(ctx context.Context, oprot thrift.TProtocol) (err
 }
 
 func (p *TSummary) writeField2(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Config == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "config", thrift.STRUCT, 2); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 2:config: ", p), err) }
   if err := p.Config.Write(ctx, oprot); err != nil {
@@ -4930,6 +4952,8 @@ func (p *TSummaryRequest) writeField1(ctx context.Context, oprot thrift.TProtoco
 }
 
 func (p *TSummaryRequest) writeField2(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Bounds == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "bounds", thrift.STRUCT, 2); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 2:bounds: ", p), err) }
   if err := p.Bounds.Write(ctx, oprot); err != nil {

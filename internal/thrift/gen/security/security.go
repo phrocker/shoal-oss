@@ -907,6 +907,8 @@ func (p *TDelegationToken) writeField1(ctx context.Context, oprot thrift.TProtoc
 }
 
 func (p *TDelegationToken) writeField2(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): null struct-pointer field = absent on wire.
+  if p.Identifier == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "identifier", thrift.STRUCT, 2); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 2:identifier: ", p), err) }
   if err := p.Identifier.Write(ctx, oprot); err != nil {

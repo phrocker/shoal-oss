@@ -161,13 +161,21 @@ make build       # go build ./... (builds shoal-embed and all binaries)
 make test        # full test suite (race-clean)
 
 # only the distributed-serving mode needs generated Thrift bindings:
-make thrift-gen  # generate Go bindings from Accumulo-compatible .thrift IDL
+make thrift-gen     # regenerate internal Go bindings from the vendored IDLs
+make thrift-verify  # regenerate and fail if the checked-in bindings drift
 ```
 
 The embedded engine builds with a plain `go build ./...` and has no Thrift
-dependency. Generating bindings (serving mode) requires the Apache Thrift
-compiler **exactly 0.17.0** (matches Accumulo's `version.thrift` in its root
-`pom.xml`). Go 1.25+ (transitively from `cloud.google.com/go/storage`).
+dependency. The required Accumulo 4 IDLs are vendored under
+`internal/thrift/idl`; regeneration does not require an Accumulo checkout or
+`ACCUMULO_SRC`. They are pinned to Accumulo 4 source revision
+`1a716b2c1bb5762ead4b46d2bc4f53e13873b314`, whose root POM pins the
+compiler to **Apache Thrift exactly 0.17.0**. Install that compiler, verify
+`thrift --version`, or set
+`THRIFT=/path/to/thrift-0.17.0` when invoking make. Windows users can use the
+ASF binary whose SHA-256 is
+`e2406226921e8d2822ec20a199060342398084f130e85fbe1dba0cb1f060e592`.
+Go 1.25+ (transitively from `cloud.google.com/go/storage`).
 
 Docker image (multi-stage, distroless static):
 ```bash
@@ -220,7 +228,9 @@ internal/
   visfilter/            CV expression parser + Authorizations + alloc-free evaluator
   ivfpq/                IvfPqDistanceIterator Go port (V1)
   scanserver/           Thrift TabletScanClientService implementation
-  thrift/gen/           generated Thrift bindings (gitignored, run thrift-gen)
+  thrift/
+    idl/                pinned Apache Accumulo 4 IDLs + provenance
+    gen/                checked-in internal Go bindings (run thrift-gen)
 ```
 
 ## Custom iterators
