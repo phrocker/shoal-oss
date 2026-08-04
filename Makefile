@@ -155,6 +155,18 @@ build:
 test:
 	go test ./...
 
+.PHONY: test-hdfs
+test-hdfs:
+	@set -e; \
+		cleanup() { status=$$?; if [ $$status -ne 0 ]; then docker compose -f test/hdfs/docker-compose.yml logs --no-color || true; fi; docker compose -f test/hdfs/docker-compose.yml down -v || true; exit $$status; }; \
+		trap cleanup EXIT; \
+		docker compose -f test/hdfs/docker-compose.yml up -d; \
+		bash test/hdfs/wait.sh; \
+		HADOOP_CONF_DIR=$(CURDIR)/test/hdfs/client-conf \
+		HADOOP_USER_NAME=shoal \
+		SHOAL_HDFS_INTEGRATION=1 \
+		go test -tags=integration -count=1 -v ./internal/storage/hdfs
+
 .PHONY: vet
 vet:
 	go vet ./...

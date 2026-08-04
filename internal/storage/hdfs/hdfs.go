@@ -12,6 +12,7 @@ import (
 	"path"
 	"strings"
 	"sync"
+	"time"
 
 	hdfsclient "github.com/colinmarc/hdfs/v2"
 	"github.com/colinmarc/hdfs/v2/hadoopconf"
@@ -323,7 +324,7 @@ func (w *replaceWriter) Close() error {
 		return errors.New("hdfs: writer already closed")
 	}
 	w.closed = true
-	if err := w.writer.Close(); err != nil {
+	if err := closeAfterReplication(w.writer); err != nil {
 		_ = w.client.Remove(w.temp)
 		return fmt.Errorf("hdfs: close temporary file %s: %w", w.temp, err)
 	}
@@ -362,6 +363,28 @@ func (w *replaceWriter) Close() error {
 		}
 	}
 	return nil
+}
+
+func closeAfterReplication(writer storage.Writer) error {
+	const (
+		initialDelay = 100 * time.Millisecond
+		maxDelay     = time.Second
+		timeout      = 10 * time.Second
+	)
+
+	deadline := time.Now().Add(timeout)
+	delay := initialDelay
+	for {
+		err := writer.Close()
+		if !errors.Is(err, hdfsclient.ErrReplicating) {
+			return err
+		}
+		if time.Now().Add(delay).After(deadline) {
+			return err
+		}
+		time.Sleep(delay)
+		delay = min(delay*2, maxDelay)
+	}
 }
 
 type clientAdapter struct {

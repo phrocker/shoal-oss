@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	hdfsclient "github.com/colinmarc/hdfs/v2"
 	"github.com/phrocker/shoal/internal/storage"
 )
 
@@ -116,6 +117,33 @@ func TestBackendCreateFailurePreservesExistingFile(t *testing.T) {
 	}
 	if got := string(client.files["/tables/1.rf"]); got != "old" {
 		t.Fatalf("existing contents = %q, want old", got)
+	}
+}
+
+func TestBackendCreateRetriesReplicationInProgress(t *testing.T) {
+	client := newFakeClient()
+	client.replicatingCloseFailures = 2
+	backend, err := New("nn:8020", WithClient(client))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	w, err := backend.Create(context.Background(), "/tables/1.rf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write([]byte("new")); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if client.writerCloseCalls != 3 {
+		t.Fatalf("writer Close calls = %d, want 3", client.writerCloseCalls)
+	}
+	if got := string(client.files["/tables/1.rf"]); got != "new" {
+		t.Fatalf("created contents = %q, want new", got)
 	}
 }
 
@@ -273,12 +301,14 @@ func TestFileSerializesConcurrentReadAt(t *testing.T) {
 }
 
 type fakeClient struct {
-	files           map[string][]byte
-	dirs            map[string]bool
-	mkdir           string
-	failWriterClose bool
-	failPublish     bool
-	failRestore     bool
+	files                    map[string][]byte
+	dirs                     map[string]bool
+	mkdir                    string
+	failWriterClose          bool
+	failPublish              bool
+	failRestore              bool
+	replicatingCloseFailures int
+	writerCloseCalls         int
 }
 
 func newFakeClient() *fakeClient {
@@ -302,7 +332,7 @@ func (c *fakeClient) Open(name string) (Reader, error) {
 func (c *fakeClient) Create(name string) (storage.Writer, error) {
 	return &fakeWriter{close: func(data []byte) {
 		c.files[name] = append([]byte(nil), data...)
-	}, failClose: c.failWriterClose}, nil
+	}, client: c, failClose: c.failWriterClose}, nil
 }
 
 func (c *fakeClient) MkdirAll(dirname string, _ os.FileMode) error {
@@ -371,10 +401,16 @@ func (r *fakeReader) Stat() os.FileInfo { return r.info }
 type fakeWriter struct {
 	bytes.Buffer
 	close     func([]byte)
+	client    *fakeClient
 	failClose bool
 }
 
 func (w *fakeWriter) Close() error {
+	w.client.writerCloseCalls++
+	if w.client.replicatingCloseFailures > 0 {
+		w.client.replicatingCloseFailures--
+		return &os.PathError{Op: "create", Path: "temporary", Err: hdfsclient.ErrReplicating}
+	}
 	if w.failClose {
 		return errors.New("injected close failure")
 	}
