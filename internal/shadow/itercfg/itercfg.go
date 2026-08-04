@@ -75,7 +75,6 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/binary"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -88,14 +87,8 @@ import (
 	"time"
 
 	"github.com/phrocker/shoal/internal/iterrt"
-	"github.com/phrocker/shoal/internal/zk"
+	"github.com/phrocker/shoal/internal/tablenames"
 )
-
-// defaultNamespace is the unqualified-name fallback. Accumulo's
-// Namespace.DEFAULT.name() is the empty string and DEFAULT id is
-// "+default" — names without a "." (e.g. "graph_vidx") resolve under
-// this namespace.
-const defaultNamespaceName = ""
 
 // ClassAllowlist maps fully-qualified Java iterator class names to the
 // iterrt registered identifier shoal will instantiate in their place.
@@ -174,15 +167,11 @@ func (r *ResolvedStack) HasShoalCoverage() bool {
 // config change is picked up by the poller. Set 0 to disable caching
 // (every Resolve hits ZK).
 type Resolver struct {
-	locator *zk.Locator
+	locator tablenames.Locator
 	ttl     time.Duration
 	logger  *slog.Logger
 
-	// Name → tableID cache. Populated lazily; refresh by clearing on
-	// resolver shutdown or external signal. Names rarely change so we
-	// don't TTL this.
-	nameMu sync.RWMutex
-	nameID map[string]string
+	names *tablenames.Resolver
 
 	cacheMu sync.Mutex
 	cache   map[stackKey]*ResolvedStack
@@ -195,7 +184,7 @@ type stackKey struct {
 
 // NewResolver builds a Resolver bound to locator. ttl=0 disables the
 // per-stack cache. logger=nil uses slog.Default().
-func NewResolver(locator *zk.Locator, ttl time.Duration, logger *slog.Logger) *Resolver {
+func NewResolver(locator tablenames.Locator, ttl time.Duration, logger *slog.Logger) *Resolver {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -203,7 +192,7 @@ func NewResolver(locator *zk.Locator, ttl time.Duration, logger *slog.Logger) *R
 		locator: locator,
 		ttl:     ttl,
 		logger:  logger,
-		nameID:  map[string]string{},
+		names:   tablenames.NewResolver(locator),
 		cache:   map[stackKey]*ResolvedStack{},
 	}
 }
@@ -217,104 +206,13 @@ func NewResolver(locator *zk.Locator, ttl time.Duration, logger *slog.Logger) *R
 // tables added after construction won't be visible until
 // InvalidateNames clears the cache.
 func (r *Resolver) ResolveTableID(ctx context.Context, tableName string) (string, error) {
-	r.nameMu.RLock()
-	if id, ok := r.nameID[tableName]; ok {
-		r.nameMu.RUnlock()
-		return id, nil
-	}
-	r.nameMu.RUnlock()
-
-	nsName, rawName := splitQualifiedName(tableName)
-
-	nsID, err := r.resolveNamespaceID(ctx, nsName)
-	if err != nil {
-		return "", err
-	}
-
-	// Load the namespace's table map: /accumulo/<id>/namespaces/<ns-id>/tables
-	// Data is a JSON object {"<table-id>": "<table-name>", ...}.
-	tablesPath := path.Join(r.locator.InstancePath(), "namespaces", nsID, "tables")
-	data, err := r.locator.GetRaw(ctx, tablesPath)
-	if err != nil {
-		return "", fmt.Errorf("get %s: %w", tablesPath, err)
-	}
-	idToName, err := decodeMappingJSON(data)
-	if err != nil {
-		return "", fmt.Errorf("decode %s: %w", tablesPath, err)
-	}
-
-	r.nameMu.Lock()
-	defer r.nameMu.Unlock()
-	// Refresh the cache from the loaded map. The key in the cache is
-	// the operator-facing form (qualified or not, depending on what
-	// was asked) so subsequent lookups hit the same key.
-	for id, n := range idToName {
-		if nsName == defaultNamespaceName {
-			r.nameID[n] = id
-		} else {
-			r.nameID[nsName+"."+n] = id
-		}
-	}
-	if id, ok := r.nameID[tableName]; ok {
-		return id, nil
-	}
-	if id, ok := idToName[rawName]; ok {
-		// Last-ditch: matched the unqualified half even if the call
-		// used the qualified form (or vice versa). Cover the edge.
-		return id, nil
-	}
-	return "", fmt.Errorf("table %q not found in namespace %q (%s)", tableName, nsName, tablesPath)
-}
-
-// resolveNamespaceID looks up a namespace by name in /accumulo/<id>/namespaces
-// (JSON {ns-id: ns-name}). The default namespace's name is the empty
-// string; its id is "+default".
-func (r *Resolver) resolveNamespaceID(ctx context.Context, nsName string) (string, error) {
-	nsRoot := path.Join(r.locator.InstancePath(), "namespaces")
-	data, err := r.locator.GetRaw(ctx, nsRoot)
-	if err != nil {
-		return "", fmt.Errorf("get %s: %w", nsRoot, err)
-	}
-	idToName, err := decodeMappingJSON(data)
-	if err != nil {
-		return "", fmt.Errorf("decode %s: %w", nsRoot, err)
-	}
-	for id, n := range idToName {
-		if n == nsName {
-			return id, nil
-		}
-	}
-	return "", fmt.Errorf("namespace %q not found at %s", nsName, nsRoot)
-}
-
-// splitQualifiedName mirrors TableNameUtil.qualify: a single dot
-// separates namespace + table; absence = default namespace.
-func splitQualifiedName(tableName string) (ns, raw string) {
-	if i := strings.IndexByte(tableName, '.'); i >= 0 {
-		return tableName[:i], tableName[i+1:]
-	}
-	return defaultNamespaceName, tableName
-}
-
-// decodeMappingJSON parses NamespaceMapping.serializeMap output: a flat
-// JSON object {string: string}.
-func decodeMappingJSON(data []byte) (map[string]string, error) {
-	m := map[string]string{}
-	if len(data) == 0 {
-		return m, nil
-	}
-	if err := json.Unmarshal(data, &m); err != nil {
-		return nil, err
-	}
-	return m, nil
+	return r.names.ResolveID(ctx, tableName)
 }
 
 // InvalidateNames clears the name→id cache so the next ResolveTableID
 // re-scans ZK. Used by the poller after detecting a CreateTable / rename.
 func (r *Resolver) InvalidateNames() {
-	r.nameMu.Lock()
-	r.nameID = map[string]string{}
-	r.nameMu.Unlock()
+	r.names.Invalidate()
 }
 
 // Resolve loads the iterator stack for tableID at scope, parses

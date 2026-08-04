@@ -5,6 +5,8 @@ import (
 	"errors"
 	"testing"
 	"time"
+
+	"github.com/phrocker/shoal/internal/zk"
 )
 
 func TestNewStaticInstance(t *testing.T) {
@@ -117,6 +119,13 @@ type fakeLocator struct {
 
 func (l *fakeLocator) InstanceID() string { return l.id }
 func (l *fakeLocator) Close()             { l.closes++ }
+func (l *fakeLocator) RootTabletLocation(context.Context) (*zk.Location, error) {
+	return nil, nil
+}
+func (l *fakeLocator) InstancePath() string { return "/accumulo/" + l.id }
+func (l *fakeLocator) GetRaw(context.Context, string) ([]byte, error) {
+	return nil, nil
+}
 
 type channelLocator struct {
 	id     string
@@ -125,3 +134,10 @@ type channelLocator struct {
 
 func (l *channelLocator) InstanceID() string { return l.id }
 func (l *channelLocator) Close()             { close(l.closed) }
+func (l *channelLocator) RootTabletLocation(context.Context) (*zk.Location, error) {
+	return nil, nil
+}
+func (l *channelLocator) InstancePath() string { return "/accumulo/" + l.id }
+func (l *channelLocator) GetRaw(context.Context, string) ([]byte, error) {
+	return nil, nil
+}

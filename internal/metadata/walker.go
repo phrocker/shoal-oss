@@ -19,10 +19,17 @@ import (
 // tablet→file maps for every user table. V0: pull-based, no caching.
 // Caching + exception-driven invalidation lands in internal/cache.
 type Walker struct {
-	locator    *zk.Locator
+	locator    Locator
 	creds      *security.TCredentials
 	accVersion string
+	lifecycle  scanclient.Lifecycle
 	logger     *slog.Logger
+}
+
+// Locator is the ZooKeeper bootstrap subset needed by Walker.
+type Locator interface {
+	InstanceID() string
+	RootTabletLocation(context.Context) (*zk.Location, error)
 }
 
 // NewWalker constructs a Walker. The supplied creds are used for every
@@ -35,6 +42,22 @@ func NewWalker(locator *zk.Locator, creds *security.TCredentials, accVersion str
 		creds:      creds,
 		accVersion: accVersion,
 		logger:     slog.Default(),
+	}
+}
+
+// NewWalkerWithLifecycle constructs a Walker that sends metadata scans
+// through an existing connector-owned scan lifecycle.
+func NewWalkerWithLifecycle(locator Locator, lifecycle scanclient.Lifecycle) *Walker {
+	if locator == nil {
+		panic("metadata.NewWalkerWithLifecycle: nil Locator")
+	}
+	if lifecycle == nil {
+		panic("metadata.NewWalkerWithLifecycle: nil Lifecycle")
+	}
+	return &Walker{
+		locator:   locator,
+		lifecycle: lifecycle,
+		logger:    slog.Default(),
 	}
 }
 
@@ -130,23 +153,13 @@ func (w *Walker) RawRootScan(ctx context.Context) (host string, kvs []*data.TKey
 	}
 	extent := rootTabletExtent()
 
-	cli, err := scanclient.Dial(loc.HostPort, w.locator.InstanceID(), w.accVersion)
-	if err != nil {
-		return loc.HostPort, nil, false, fmt.Errorf("dial %s: %w", loc.HostPort, err)
-	}
-	defer cli.Close()
-
 	w.logger.LogAttrs(ctx, slog.LevelInfo, "raw scan",
 		slog.String("phase", "root"),
 		slog.String("host", loc.HostPort),
 		extentAttr(extent),
 	)
 	start := time.Now()
-	scan, err := cli.SimpleScan(ctx, scanclient.SimpleScanRequest{
-		Credentials: w.creds,
-		Extent:      extent,
-		Range:       fullRange(),
-	})
+	scan, err := w.simpleScan(ctx, loc.HostPort, extent)
 	dur := time.Since(start)
 	if err != nil {
 		var cleanupErr *scanclient.CleanupError
@@ -180,22 +193,12 @@ func (w *Walker) RawRootScan(ctx context.Context) (host string, kvs []*data.TKey
 }
 
 func (w *Walker) scanTablet(ctx context.Context, hostPort string, extent *data.TKeyExtent) ([]TabletInfo, error) {
-	cli, err := scanclient.Dial(hostPort, w.locator.InstanceID(), w.accVersion)
-	if err != nil {
-		return nil, fmt.Errorf("dial %s: %w", hostPort, err)
-	}
-	defer cli.Close()
-
 	w.logger.LogAttrs(ctx, slog.LevelInfo, "scan tablet",
 		slog.String("host", hostPort),
 		extentAttr(extent),
 	)
 	start := time.Now()
-	scan, err := cli.SimpleScan(ctx, scanclient.SimpleScanRequest{
-		Credentials: w.creds,
-		Extent:      extent,
-		Range:       fullRange(),
-	})
+	scan, err := w.simpleScan(ctx, hostPort, extent)
 	dur := time.Since(start)
 	if err != nil {
 		var cleanupErr *scanclient.CleanupError
@@ -215,10 +218,8 @@ func (w *Walker) scanTablet(ctx context.Context, hostPort string, extent *data.T
 			slog.String("err", cleanupErr.Error()),
 		)
 	}
-	// V0 single-shot — first batch only. If `scan.Result_.More` is true we
-	// drop the rest. For metadata scans this is typically fine (root tablet
-	// has small N; metadata tablets bound by Accumulo's split policy). If
-	// it bites, we add continueScan/closeScan in #9.5.
+	// V0 single-shot — first batch only. If Result_.More is true, the
+	// remaining metadata rows are not materialized yet.
 	if scan == nil || scan.Result_ == nil {
 		return nil, fmt.Errorf("scan %s: nil InitialScan result", hostPort)
 	}
@@ -230,6 +231,26 @@ func (w *Walker) scanTablet(ctx context.Context, hostPort string, extent *data.T
 		slog.Duration("dur", dur),
 	)
 	return AggregateRows(scan.Result_.Results)
+}
+
+func (w *Walker) simpleScan(ctx context.Context, hostPort string, extent *data.TKeyExtent) (*data.InitialScan, error) {
+	if w.lifecycle != nil {
+		return scanclient.SimpleScanLifecycle(ctx, w.lifecycle, hostPort, scanclient.SimpleScanRequest{
+			Extent: extent,
+			Range:  fullRange(),
+		})
+	}
+	cli, err := scanclient.Dial(hostPort, w.locator.InstanceID(), w.accVersion)
+	if err != nil {
+		return nil, fmt.Errorf("dial %s: %w", hostPort, err)
+	}
+	defer cli.Close()
+
+	return cli.SimpleScan(ctx, scanclient.SimpleScanRequest{
+		Credentials: w.creds,
+		Extent:      extent,
+		Range:       fullRange(),
+	})
 }
 
 // rootTabletExtent returns the TKeyExtent identifying the root tablet:

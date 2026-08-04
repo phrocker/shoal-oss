@@ -28,6 +28,40 @@ type Adapter interface {
 	Close() error
 }
 
+// SimpleScanLifecycle starts a metadata-style scan through lifecycle and
+// closes its server-side session after the initial batch.
+func SimpleScanLifecycle(
+	ctx context.Context,
+	lifecycle Lifecycle,
+	address string,
+	req SimpleScanRequest,
+) (*data.InitialScan, error) {
+	if lifecycle == nil {
+		return nil, errors.New("scanclient: nil lifecycle")
+	}
+	batchSize := req.BatchSize
+	if batchSize == 0 {
+		batchSize = defaultBatchSize
+	}
+	scan, err := lifecycle.Start(ctx, address, StartRequest{
+		Credentials:        req.Credentials,
+		Extent:             req.Extent,
+		Range:              req.Range,
+		BatchSize:          batchSize,
+		Authorizations:     req.Authorizations,
+		ReadaheadThreshold: int64(defaultBatchSize),
+	})
+	if err != nil {
+		return nil, err
+	}
+	if scan != nil && scan.ScanID != 0 {
+		if closeErr := lifecycle.CloseScan(ctx, address, scan.ScanID); closeErr != nil {
+			return scan, &CleanupError{ScanID: scan.ScanID, Err: closeErr}
+		}
+	}
+	return scan, nil
+}
+
 // Pooled is the connector-facing tablet-scan RPC adapter.
 type Pooled struct {
 	pool            *transportpool.Pool

@@ -1,5 +1,3 @@
-//go:build !embed
-
 package cache
 
 import (
@@ -247,8 +245,8 @@ func TestLocate_EmptyTableNotCached(t *testing.T) {
 	c := New(src)
 
 	_, err := c.Locate(context.Background(), "2k", []byte("a"))
-	if !errors.Is(err, ErrNoTabletCovers) {
-		t.Errorf("err = %v, want ErrNoTabletCovers", err)
+	if !errors.Is(err, ErrTableNotFound) {
+		t.Errorf("err = %v, want ErrTableNotFound", err)
 	}
 
 	// Now table is "born" — populate it on the source. Cache should
