@@ -239,11 +239,24 @@ func validateStartRequest(req StartRequest) error {
 }
 
 func dialTransport(ctx context.Context, addr string, timeout time.Duration) (thrift.TTransport, error) {
+	dialer := &net.Dialer{Timeout: timeout}
+	return dialTransportWith(ctx, addr, dialer.DialContext)
+}
+
+func dialTransportWith(
+	ctx context.Context,
+	addr string,
+	dial func(context.Context, string, string) (net.Conn, error),
+) (thrift.TTransport, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	conn, err := (&net.Dialer{Timeout: timeout}).DialContext(ctx, "tcp", addr)
+	conn, err := dial(ctx, "tcp", addr)
 	if err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		_ = conn.Close()
 		return nil, err
 	}
 	conf := &thrift.TConfiguration{}

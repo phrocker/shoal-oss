@@ -3,6 +3,8 @@ package scanclient
 import (
 	"context"
 	"errors"
+	"io"
+	"net"
 	"strings"
 	"testing"
 
@@ -68,6 +70,32 @@ func TestDial_RejectsUnreachableAddr(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "open transport") {
 		t.Errorf("error = %v, want substring %q", err, "open transport")
+	}
+}
+
+func TestDialTransportClosesConnectionCanceledAfterDial(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	clientConn, serverConn := net.Pipe()
+	t.Cleanup(func() { _ = serverConn.Close() })
+
+	transport, err := dialTransportWith(
+		ctx,
+		"tablet-1:9997",
+		func(context.Context, string, string) (net.Conn, error) {
+			cancel()
+			return clientConn, nil
+		},
+	)
+	if transport != nil {
+		t.Fatalf("transport = %T, want nil", transport)
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want context.Canceled", err)
+	}
+
+	buf := make([]byte, 1)
+	if _, err := serverConn.Read(buf); !errors.Is(err, io.EOF) {
+		t.Fatalf("peer read error = %v, want io.EOF after client close", err)
 	}
 }
 

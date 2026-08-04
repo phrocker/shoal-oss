@@ -76,7 +76,7 @@ func main() {
 
 	c, err := scanclient.DialContext(ctx, *addr, instanceID, *accVersion, *dialTimeout)
 	if err != nil {
-		fail("scanclient.Dial: %v", err)
+		fail("scanclient.DialContext: %v", err)
 	}
 	defer c.Close()
 
