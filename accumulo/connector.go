@@ -4,7 +4,9 @@ import (
 	"errors"
 	"sync"
 
+	"github.com/phrocker/shoal/internal/metadata"
 	"github.com/phrocker/shoal/internal/scanclient"
+	"github.com/phrocker/shoal/internal/tablenames"
 	"github.com/phrocker/shoal/internal/transportpool"
 )
 
@@ -19,6 +21,7 @@ type Connector struct {
 	options     normalizedConnectorOptions
 	pool        *transportpool.Pool
 	scan        scanclient.Adapter
+	discovery   *connectorDiscovery
 	closed      bool
 }
 
@@ -65,13 +68,21 @@ func NewConnector(instance Instance, credentials Credentials, opts ConnectorOpti
 		_ = pool.Close()
 		return nil, err
 	}
-	return &Connector{
+	connector := &Connector{
 		instance:    info,
 		credentials: credentials.clone(),
 		options:     normalized,
 		pool:        pool,
 		scan:        scan,
-	}, nil
+	}
+	if source, ok := instance.(discoveryInstance); ok {
+		locator := source.discoveryLocator()
+		if locator != nil {
+			walker := metadata.NewWalkerWithLifecycle(locator, scan)
+			connector.discovery = newConnectorDiscovery(walker, tablenames.NewResolver(locator))
+		}
+	}
+	return connector, nil
 }
 
 // Instance returns the immutable identity captured by the connector.
@@ -97,10 +108,14 @@ func (c *Connector) Close() error {
 	}
 	c.closed = true
 	pool := c.pool
+	discovery := c.discovery
 	for i := range c.credentials.token {
 		c.credentials.token[i] = 0
 	}
 	c.credentials.token = nil
 	c.mu.Unlock()
+	if discovery != nil {
+		discovery.close()
+	}
 	return errors.Join(c.scan.Close(), pool.Close())
 }

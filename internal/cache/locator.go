@@ -1,5 +1,3 @@
-//go:build !embed
-
 // LocatorCache: per-table tablet-location cache with exception-driven
 // invalidation. Mirrors the sharkbite LocatorCache.h pattern: sharkbite
 // uses a per-table sorted map keyed by EndRow and invalidates individual
@@ -39,6 +37,10 @@ type TableLocator interface {
 // table — not a stale cache, so the cache layer surfaces it as-is.
 var ErrNoTabletCovers = errors.New("no tablet covers row")
 
+// ErrTableNotFound is returned when the metadata source has no tablets for
+// the requested table ID.
+var ErrTableNotFound = errors.New("table not found")
+
 // LocatorCache caches metadata.TabletInfo per (tableID, row).
 // Concurrency: safe for many concurrent readers (RWMutex); a single
 // writer holds the lock during populate.
@@ -75,7 +77,7 @@ func (c *LocatorCache) Locate(ctx context.Context, tableID string, row []byte) (
 	if t, ok := c.lookup(tableID, row); ok {
 		return t, nil
 	}
-	if err := c.refresh(ctx, tableID); err != nil {
+	if _, err := c.refresh(ctx, tableID); err != nil {
 		return metadata.TabletInfo{}, fmt.Errorf("populate cache for table %s: %w", tableID, err)
 	}
 	if t, ok := c.lookup(tableID, row); ok {
@@ -136,10 +138,13 @@ func (c *LocatorCache) LocateTable(ctx context.Context, tableID string) ([]metad
 	if tabs := c.Snapshot(tableID); tabs != nil {
 		return tabs, nil
 	}
-	if err := c.refresh(ctx, tableID); err != nil {
+	tablets, err := c.refresh(ctx, tableID)
+	if err != nil {
 		return nil, err
 	}
-	return c.Snapshot(tableID), nil
+	out := make([]metadata.TabletInfo, len(tablets))
+	copy(out, tablets)
+	return out, nil
 }
 
 // Snapshot returns a defensive copy of the cached tablets for tableID,
@@ -171,17 +176,15 @@ func (c *LocatorCache) lookup(tableID string, row []byte) (metadata.TabletInfo, 
 	return tabs[idx], true
 }
 
-func (c *LocatorCache) refresh(ctx context.Context, tableID string) error {
+func (c *LocatorCache) refresh(ctx context.Context, tableID string) (tabletList, error) {
 	tablets, err := c.src.LocateTable(ctx, tableID)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if len(tablets) == 0 {
-		// Distinct from "row uncovered" — the table itself doesn't exist.
-		// Cache nothing; caller's Locate retry will fall through to
-		// ErrNoTabletCovers. (We don't cache emptiness — a freshly-
-		// created table will look identical and we'd never repopulate.)
-		return nil
+		// Do not cache absence: a newly-created table must become visible on
+		// the next lookup without an explicit invalidation.
+		return nil, fmt.Errorf("%w: table=%s", ErrTableNotFound, tableID)
 	}
 	out := make(tabletList, len(tablets))
 	copy(out, tablets)
@@ -191,7 +194,7 @@ func (c *LocatorCache) refresh(ctx context.Context, tableID string) error {
 	c.mu.Lock()
 	c.byTable[tableID] = out
 	c.mu.Unlock()
-	return nil
+	return out, nil
 }
 
 // endRowLess orders EndRows ascending with nil ("default tablet" /+inf)

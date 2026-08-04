@@ -26,8 +26,19 @@ type Instance interface {
 }
 
 type locator interface {
-	InstanceID() string
+	discoveryLocator
 	Close()
+}
+
+type discoveryLocator interface {
+	InstanceID() string
+	RootTabletLocation(context.Context) (*zk.Location, error)
+	InstancePath() string
+	GetRaw(context.Context, string) ([]byte, error)
+}
+
+type discoveryInstance interface {
+	discoveryLocator() discoveryLocator
 }
 
 type zkLocator struct {
@@ -124,6 +135,9 @@ func newZooKeeperInstance(
 }
 
 func (i *zkLocator) Info() InstanceInfo { return i.info }
+func (i *zkLocator) discoveryLocator() discoveryLocator {
+	return i.locator
+}
 
 func (i *zkLocator) Close() error {
 	i.once.Do(i.locator.Close)

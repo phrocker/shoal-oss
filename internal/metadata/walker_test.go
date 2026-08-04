@@ -2,7 +2,12 @@ package metadata
 
 import (
 	"bytes"
+	"context"
 	"testing"
+
+	"github.com/phrocker/shoal/internal/scanclient"
+	"github.com/phrocker/shoal/internal/thrift/gen/data"
+	"github.com/phrocker/shoal/internal/zk"
 )
 
 func TestRootTabletExtent(t *testing.T) {
@@ -54,5 +59,55 @@ func TestFullRange(t *testing.T) {
 	}
 	if r.Start != nil || r.Stop != nil {
 		t.Errorf("expected nil Start/Stop, got %+v / %+v", r.Start, r.Stop)
+	}
+}
+
+type fakeWalkerLocator struct{}
+
+func (fakeWalkerLocator) InstanceID() string { return "uuid-1" }
+func (fakeWalkerLocator) RootTabletLocation(context.Context) (*zk.Location, error) {
+	return &zk.Location{HostPort: "root:9997", Session: "abc"}, nil
+}
+
+type fakeWalkerLifecycle struct {
+	address string
+	starts  int
+	closes  int
+}
+
+func (f *fakeWalkerLifecycle) Start(
+	_ context.Context,
+	address string,
+	req scanclient.StartRequest,
+) (*data.InitialScan, error) {
+	f.address = address
+	f.starts++
+	if string(req.Extent.Table) != RootTableID {
+		return nil, context.Canceled
+	}
+	return &data.InitialScan{ScanID: 7, Result_: &data.ScanResult_{}}, nil
+}
+
+func (*fakeWalkerLifecycle) Continue(context.Context, string, data.ScanID, int64) (*data.ScanResult_, error) {
+	return nil, nil
+}
+
+func (f *fakeWalkerLifecycle) CloseScan(context.Context, string, data.ScanID) error {
+	f.closes++
+	return nil
+}
+
+func TestWalkerUsesInjectedLocatorAndLifecycle(t *testing.T) {
+	lifecycle := &fakeWalkerLifecycle{}
+	walker := NewWalkerWithLifecycle(fakeWalkerLocator{}, lifecycle)
+	tablets, err := walker.ScanRootTablet(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tablets) != 0 {
+		t.Fatalf("tablets = %v, want empty", tablets)
+	}
+	if lifecycle.address != "root:9997" || lifecycle.starts != 1 || lifecycle.closes != 1 {
+		t.Fatalf("lifecycle address=%q starts=%d closes=%d", lifecycle.address, lifecycle.starts, lifecycle.closes)
 	}
 }
