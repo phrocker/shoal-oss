@@ -2,6 +2,7 @@ package scanclient
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -17,6 +18,7 @@ func TestDial_RejectsEmptyArgs(t *testing.T) {
 		{"no instance", "host:9997", "", "4.0.0", "empty instanceID"},
 		{"no version", "host:9997", "uuid", "", "empty accumuloVersion"},
 	}
+
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			_, err := Dial(c.addr, c.instance, c.version)
@@ -27,6 +29,34 @@ func TestDial_RejectsEmptyArgs(t *testing.T) {
 				t.Errorf("error = %v, want substring %q", err, c.want)
 			}
 		})
+	}
+}
+
+func TestSimpleScanReturnsResultAndCloseFailure(t *testing.T) {
+	closeErr := errors.New("close failed")
+	want := &data.InitialScan{ScanID: 23}
+	c := &Client{rpc: &fakeScanRPC{
+		startResult: want,
+		closeErr:    closeErr,
+	}}
+
+	got, err := c.SimpleScan(context.Background(), SimpleScanRequest{
+		Credentials: &security.TCredentials{},
+		Extent:      &data.TKeyExtent{},
+		Range:       &data.TRange{},
+	})
+	if got != want {
+		t.Fatalf("result = %p, want %p", got, want)
+	}
+	if !errors.Is(err, closeErr) {
+		t.Fatalf("error = %v, want close failure", err)
+	}
+	var cleanupErr *CleanupError
+	if !errors.As(err, &cleanupErr) {
+		t.Fatalf("error type = %T, want *CleanupError", err)
+	}
+	if cleanupErr.ScanID != want.ScanID {
+		t.Fatalf("cleanup scan ID = %d, want %d", cleanupErr.ScanID, want.ScanID)
 	}
 }
 

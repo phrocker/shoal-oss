@@ -74,8 +74,7 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), *scanTimeout)
 	defer cancel()
 
-	_ = dialTimeout // accepted for future signature; current Dial is not deadline-aware
-	c, err := scanclient.Dial(*addr, instanceID, *accVersion)
+	c, err := scanclient.DialContext(ctx, *addr, instanceID, *accVersion, *dialTimeout)
 	if err != nil {
 		fail("scanclient.Dial: %v", err)
 	}
@@ -101,8 +100,13 @@ func main() {
 	}
 
 	t0 := time.Now()
-	resp, err := c.Raw().StartScan(ctx, nil, creds, extent, rangeArg, nil, 1024,
-		nil, nil, auths, false, false, 0, nil, 0, "", nil, 0)
+	resp, err := c.Start(ctx, scanclient.StartRequest{
+		Credentials:    creds,
+		Extent:         extent,
+		Range:          rangeArg,
+		BatchSize:      1024,
+		Authorizations: auths,
+	})
 	dur := time.Since(t0)
 	if err != nil {
 		fail("StartScan: %v", err)
