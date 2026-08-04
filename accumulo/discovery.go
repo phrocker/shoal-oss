@@ -75,7 +75,7 @@ func (c *Connector) TableByName(ctx context.Context, name string) (Table, error)
 	id, err := discovery.names.ResolveID(ctx, name)
 	if err != nil {
 		if errors.Is(err, tablenames.ErrTableNotFound) {
-			return Table{}, fmt.Errorf("%w: %w", ErrTableNotFound, err)
+			return Table{}, fmt.Errorf("%w: table name %q", ErrTableNotFound, name)
 		}
 		return Table{}, fmt.Errorf("accumulo: resolve table name %q: %w", name, err)
 	}
@@ -100,7 +100,7 @@ func (c *Connector) TableByID(ctx context.Context, id string) (Table, error) {
 	name, err := discovery.names.ResolveName(ctx, id)
 	if err != nil {
 		if errors.Is(err, tablenames.ErrTableNotFound) {
-			return Table{}, fmt.Errorf("%w: %w", ErrTableNotFound, err)
+			return Table{}, fmt.Errorf("%w: table ID %q", ErrTableNotFound, id)
 		}
 		return Table{}, fmt.Errorf("accumulo: resolve table ID %q: %w", id, err)
 	}

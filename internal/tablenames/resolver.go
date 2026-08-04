@@ -29,6 +29,9 @@ type Resolver struct {
 	mu       sync.RWMutex
 	nameToID map[string]string
 	idToName map[string]string
+
+	namespaceNames   map[string]string
+	loadedNamespaces map[string]struct{}
 }
 
 // NewResolver creates a table-name resolver backed by locator.
@@ -37,9 +40,11 @@ func NewResolver(locator Locator) *Resolver {
 		panic("tablenames.NewResolver: nil Locator")
 	}
 	return &Resolver{
-		locator:  locator,
-		nameToID: map[string]string{},
-		idToName: map[string]string{},
+		locator:          locator,
+		nameToID:         map[string]string{},
+		idToName:         map[string]string{},
+		namespaceNames:   nil,
+		loadedNamespaces: map[string]struct{}{},
 	}
 }
 
@@ -119,6 +124,8 @@ func (r *Resolver) Invalidate() {
 	r.mu.Lock()
 	r.nameToID = map[string]string{}
 	r.idToName = map[string]string{}
+	r.namespaceNames = nil
+	r.loadedNamespaces = map[string]struct{}{}
 	r.mu.Unlock()
 }
 
@@ -136,6 +143,14 @@ func (r *Resolver) resolveNamespaceID(ctx context.Context, namespaceName string)
 }
 
 func (r *Resolver) loadNamespaces(ctx context.Context) (map[string]string, error) {
+	r.mu.RLock()
+	if r.namespaceNames != nil {
+		namespaces := cloneMapping(r.namespaceNames)
+		r.mu.RUnlock()
+		return namespaces, nil
+	}
+	r.mu.RUnlock()
+
 	namespacesPath := path.Join(r.locator.InstancePath(), "namespaces")
 	data, err := r.locator.GetRaw(ctx, namespacesPath)
 	if err != nil {
@@ -145,10 +160,23 @@ func (r *Resolver) loadNamespaces(ctx context.Context) (map[string]string, error
 	if err != nil {
 		return nil, fmt.Errorf("decode %s: %w", namespacesPath, err)
 	}
-	return namespaces, nil
+	r.mu.Lock()
+	if r.namespaceNames == nil {
+		r.namespaceNames = namespaces
+	}
+	cached := cloneMapping(r.namespaceNames)
+	r.mu.Unlock()
+	return cached, nil
 }
 
 func (r *Resolver) loadNamespace(ctx context.Context, namespaceID, namespaceName string) error {
+	r.mu.RLock()
+	_, loaded := r.loadedNamespaces[namespaceID]
+	r.mu.RUnlock()
+	if loaded {
+		return nil
+	}
+
 	tablesPath := path.Join(r.locator.InstancePath(), "namespaces", namespaceID, "tables")
 	data, err := r.locator.GetRaw(ctx, tablesPath)
 	if err != nil {
@@ -168,8 +196,17 @@ func (r *Resolver) loadNamespace(ctx context.Context, namespaceID, namespaceName
 		r.nameToID[name] = id
 		r.idToName[id] = name
 	}
+	r.loadedNamespaces[namespaceID] = struct{}{}
 	r.mu.Unlock()
 	return nil
+}
+
+func cloneMapping(mapping map[string]string) map[string]string {
+	cloned := make(map[string]string, len(mapping))
+	for key, value := range mapping {
+		cloned[key] = value
+	}
+	return cloned
 }
 
 func splitQualifiedName(tableName string) (namespace, raw string) {

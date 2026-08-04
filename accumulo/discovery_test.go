@@ -3,11 +3,13 @@ package accumulo
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/phrocker/shoal/internal/metadata"
+	"github.com/phrocker/shoal/internal/tablenames"
 	"github.com/phrocker/shoal/internal/zk"
 )
 
@@ -41,7 +43,7 @@ func (f *fakeTableNames) ResolveID(ctx context.Context, name string) (string, er
 	}
 	id, ok := f.byName[name]
 	if !ok {
-		return "", errors.New("missing fake table")
+		return "", fmt.Errorf("%w: missing fake table", tablenames.ErrTableNotFound)
 	}
 	return id, nil
 }
@@ -52,7 +54,7 @@ func (f *fakeTableNames) ResolveName(ctx context.Context, id string) (string, er
 	}
 	name, ok := f.byID[id]
 	if !ok {
-		return "", errors.New("missing fake table")
+		return "", fmt.Errorf("%w: missing fake table", tablenames.ErrTableNotFound)
 	}
 	return name, nil
 }
@@ -214,6 +216,16 @@ func TestDiscoveryErrorsAndCancellation(t *testing.T) {
 	}
 	if _, err := withDiscovery.LocateTablet(context.Background(), Table{ID: "missing"}, []byte("a")); !errors.Is(err, ErrTableNotFound) {
 		t.Fatalf("missing table error = %v", err)
+	}
+	if _, err := withDiscovery.TableByName(context.Background(), "missing"); err == nil ||
+		!errors.Is(err, ErrTableNotFound) || err.Error() != `accumulo: table not found: table name "missing"` {
+		t.Fatalf("missing table name error = %v", err)
+	}
+	withDiscovery.discovery.tablets.InvalidateAll()
+	noLocation.tablets["missing"] = []metadata.TabletInfo{{TableID: "missing"}}
+	if _, err := withDiscovery.TableByID(context.Background(), "missing"); err == nil ||
+		!errors.Is(err, ErrTableNotFound) || err.Error() != `accumulo: table not found: table ID "missing"` {
+		t.Fatalf("missing table ID error = %v", err)
 	}
 
 	gapped := testConnectorWithDiscovery(t, &fakeTabletWalker{tablets: map[string][]metadata.TabletInfo{

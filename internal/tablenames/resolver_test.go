@@ -48,8 +48,19 @@ func TestResolverNamesAndNamespaces(t *testing.T) {
 	if err != nil || name != "analytics.events" {
 		t.Fatalf("ResolveName(2) = %q, %v", name, err)
 	}
+	if _, err := resolver.ResolveName(context.Background(), "missing"); !errors.Is(err, ErrTableNotFound) {
+		t.Fatalf("ResolveName(missing) error = %v, want ErrTableNotFound", err)
+	}
 
+	namespaces := "/accumulo/uuid-1/namespaces"
 	defaultTables := "/accumulo/uuid-1/namespaces/+default/tables"
+	analyticsTables := "/accumulo/uuid-1/namespaces/ns1/tables"
+	if got := locator.reads[namespaces]; got != 1 {
+		t.Fatalf("namespace map reads = %d, want 1", got)
+	}
+	if got := locator.reads[analyticsTables]; got != 1 {
+		t.Fatalf("analytics table map reads = %d, want 1", got)
+	}
 	resolver.ResolveID(context.Background(), "events")
 	if got := locator.reads[defaultTables]; got != 1 {
 		t.Fatalf("default table map reads = %d, want 1 cache hit", got)
@@ -58,6 +69,9 @@ func TestResolverNamesAndNamespaces(t *testing.T) {
 	resolver.ResolveID(context.Background(), "events")
 	if got := locator.reads[defaultTables]; got != 2 {
 		t.Fatalf("default table map reads = %d, want 2 after invalidation", got)
+	}
+	if got := locator.reads[namespaces]; got != 2 {
+		t.Fatalf("namespace map reads = %d, want 2 after invalidation", got)
 	}
 }
 
