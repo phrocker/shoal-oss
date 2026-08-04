@@ -2,6 +2,9 @@ package scanclient
 
 import (
 	"context"
+	"errors"
+	"io"
+	"net"
 	"strings"
 	"testing"
 
@@ -17,6 +20,7 @@ func TestDial_RejectsEmptyArgs(t *testing.T) {
 		{"no instance", "host:9997", "", "4.0.0", "empty instanceID"},
 		{"no version", "host:9997", "uuid", "", "empty accumuloVersion"},
 	}
+
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			_, err := Dial(c.addr, c.instance, c.version)
@@ -30,6 +34,34 @@ func TestDial_RejectsEmptyArgs(t *testing.T) {
 	}
 }
 
+func TestSimpleScanReturnsResultAndCloseFailure(t *testing.T) {
+	closeErr := errors.New("close failed")
+	want := &data.InitialScan{ScanID: 23}
+	c := &Client{rpc: &fakeScanRPC{
+		startResult: want,
+		closeErr:    closeErr,
+	}}
+
+	got, err := c.SimpleScan(context.Background(), SimpleScanRequest{
+		Credentials: &security.TCredentials{},
+		Extent:      &data.TKeyExtent{},
+		Range:       &data.TRange{},
+	})
+	if got != want {
+		t.Fatalf("result = %p, want %p", got, want)
+	}
+	if !errors.Is(err, closeErr) {
+		t.Fatalf("error = %v, want close failure", err)
+	}
+	var cleanupErr *CleanupError
+	if !errors.As(err, &cleanupErr) {
+		t.Fatalf("error type = %T, want *CleanupError", err)
+	}
+	if cleanupErr.ScanID != want.ScanID {
+		t.Fatalf("cleanup scan ID = %d, want %d", cleanupErr.ScanID, want.ScanID)
+	}
+}
+
 func TestDial_RejectsUnreachableAddr(t *testing.T) {
 	// 127.0.0.1:1 — reserved low port that should be unreachable.
 	_, err := Dial("127.0.0.1:1", "uuid", "4.0.0")
@@ -38,6 +70,32 @@ func TestDial_RejectsUnreachableAddr(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "open transport") {
 		t.Errorf("error = %v, want substring %q", err, "open transport")
+	}
+}
+
+func TestDialTransportClosesConnectionCanceledAfterDial(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	clientConn, serverConn := net.Pipe()
+	t.Cleanup(func() { _ = serverConn.Close() })
+
+	transport, err := dialTransportWith(
+		ctx,
+		"tablet-1:9997",
+		func(context.Context, string, string) (net.Conn, error) {
+			cancel()
+			return clientConn, nil
+		},
+	)
+	if transport != nil {
+		t.Fatalf("transport = %T, want nil", transport)
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want context.Canceled", err)
+	}
+
+	buf := make([]byte, 1)
+	if _, err := serverConn.Read(buf); !errors.Is(err, io.EOF) {
+		t.Fatalf("peer read error = %v, want io.EOF after client close", err)
 	}
 }
 

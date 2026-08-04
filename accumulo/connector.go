@@ -4,6 +4,7 @@ import (
 	"errors"
 	"sync"
 
+	"github.com/phrocker/shoal/internal/scanclient"
 	"github.com/phrocker/shoal/internal/transportpool"
 )
 
@@ -17,6 +18,7 @@ type Connector struct {
 	credentials Credentials
 	options     normalizedConnectorOptions
 	pool        *transportpool.Pool
+	scan        scanclient.Adapter
 	closed      bool
 }
 
@@ -41,11 +43,34 @@ func NewConnector(instance Instance, credentials Credentials, opts ConnectorOpti
 	if err != nil {
 		return nil, err
 	}
+	thriftCredentials, err := credentials.thrift(info.ID)
+	if err != nil {
+		_ = pool.Close()
+		return nil, err
+	}
+	defer func() {
+		for i := range thriftCredentials.Token {
+			thriftCredentials.Token[i] = 0
+		}
+		thriftCredentials.Token = nil
+	}()
+	scan, err := scanclient.NewPooled(
+		pool,
+		info.ID,
+		normalized.accumuloVersion,
+		thriftCredentials,
+		normalized.dialTimeout,
+	)
+	if err != nil {
+		_ = pool.Close()
+		return nil, err
+	}
 	return &Connector{
 		instance:    info,
 		credentials: credentials.clone(),
 		options:     normalized,
 		pool:        pool,
+		scan:        scan,
 	}, nil
 }
 
@@ -77,5 +102,5 @@ func (c *Connector) Close() error {
 	}
 	c.credentials.token = nil
 	c.mu.Unlock()
-	return pool.Close()
+	return errors.Join(c.scan.Close(), pool.Close())
 }

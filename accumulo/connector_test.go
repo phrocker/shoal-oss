@@ -25,6 +25,9 @@ func TestNewConnectorLifecycle(t *testing.T) {
 	if connector.Principal() != "root" {
 		t.Fatalf("Principal() = %q", connector.Principal())
 	}
+	if connector.scan == nil {
+		t.Fatal("connector scan adapter is nil")
+	}
 	if err := connector.Close(); err != nil {
 		t.Fatal(err)
 	}

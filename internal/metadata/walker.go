@@ -3,6 +3,7 @@ package metadata
 import (
 	"context"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -148,13 +149,22 @@ func (w *Walker) RawRootScan(ctx context.Context) (host string, kvs []*data.TKey
 	})
 	dur := time.Since(start)
 	if err != nil {
-		w.logger.LogAttrs(ctx, slog.LevelError, "raw scan failed",
+		var cleanupErr *scanclient.CleanupError
+		if scan == nil || !errors.As(err, &cleanupErr) {
+			w.logger.LogAttrs(ctx, slog.LevelError, "raw scan failed",
+				slog.String("host", loc.HostPort),
+				extentAttr(extent),
+				slog.Duration("dur", dur),
+				slog.String("err", err.Error()),
+			)
+			return loc.HostPort, nil, false, fmt.Errorf("scan %s: %w", loc.HostPort, err)
+		}
+		w.logger.LogAttrs(ctx, slog.LevelWarn, "raw scan cleanup failed",
 			slog.String("host", loc.HostPort),
 			extentAttr(extent),
-			slog.Duration("dur", dur),
-			slog.String("err", err.Error()),
+			slog.Int64("scan_id", int64(cleanupErr.ScanID)),
+			slog.String("err", cleanupErr.Error()),
 		)
-		return loc.HostPort, nil, false, fmt.Errorf("scan %s: %w", loc.HostPort, err)
 	}
 	if scan == nil || scan.Result_ == nil {
 		return loc.HostPort, nil, false, fmt.Errorf("scan %s: nil InitialScan result", loc.HostPort)
@@ -188,13 +198,22 @@ func (w *Walker) scanTablet(ctx context.Context, hostPort string, extent *data.T
 	})
 	dur := time.Since(start)
 	if err != nil {
-		w.logger.LogAttrs(ctx, slog.LevelError, "scan tablet failed",
+		var cleanupErr *scanclient.CleanupError
+		if scan == nil || !errors.As(err, &cleanupErr) {
+			w.logger.LogAttrs(ctx, slog.LevelError, "scan tablet failed",
+				slog.String("host", hostPort),
+				extentAttr(extent),
+				slog.Duration("dur", dur),
+				slog.String("err", err.Error()),
+			)
+			return nil, fmt.Errorf("scan %s: %w", hostPort, err)
+		}
+		w.logger.LogAttrs(ctx, slog.LevelWarn, "scan tablet cleanup failed",
 			slog.String("host", hostPort),
 			extentAttr(extent),
-			slog.Duration("dur", dur),
-			slog.String("err", err.Error()),
+			slog.Int64("scan_id", int64(cleanupErr.ScanID)),
+			slog.String("err", cleanupErr.Error()),
 		)
-		return nil, fmt.Errorf("scan %s: %w", hostPort, err)
 	}
 	// V0 single-shot — first batch only. If `scan.Result_.More` is true we
 	// drop the rest. For metadata scans this is typically fine (root tablet
