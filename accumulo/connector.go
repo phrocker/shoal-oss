@@ -4,6 +4,7 @@ import (
 	"errors"
 	"sync"
 
+	"github.com/phrocker/shoal/internal/ingestclient"
 	"github.com/phrocker/shoal/internal/metadata"
 	"github.com/phrocker/shoal/internal/scanclient"
 	"github.com/phrocker/shoal/internal/tablenames"
@@ -21,6 +22,7 @@ type Connector struct {
 	options     normalizedConnectorOptions
 	pool        *transportpool.Pool
 	scan        scanclient.Adapter
+	ingest      ingestclient.Adapter
 	discovery   *connectorDiscovery
 	closed      bool
 }
@@ -68,12 +70,25 @@ func NewConnector(instance Instance, credentials Credentials, opts ConnectorOpti
 		_ = pool.Close()
 		return nil, err
 	}
+	ingest, err := ingestclient.NewPooled(
+		pool,
+		info.ID,
+		normalized.accumuloVersion,
+		thriftCredentials,
+		normalized.dialTimeout,
+	)
+	if err != nil {
+		_ = scan.Close()
+		_ = pool.Close()
+		return nil, err
+	}
 	connector := &Connector{
 		instance:    info,
 		credentials: credentials.clone(),
 		options:     normalized,
 		pool:        pool,
 		scan:        scan,
+		ingest:      ingest,
 	}
 	if source, ok := instance.(discoveryInstance); ok {
 		locator := source.discoveryLocator()
@@ -117,5 +132,5 @@ func (c *Connector) Close() error {
 	if discovery != nil {
 		discovery.close()
 	}
-	return errors.Join(c.scan.Close(), pool.Close())
+	return errors.Join(c.scan.Close(), c.ingest.Close(), pool.Close())
 }

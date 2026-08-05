@@ -71,12 +71,28 @@ cribs land.
 - `core/.../client/clientImpl/ClientTabletCacheImpl.java` — multi-level
   cache for user tables
 
+### Mutation and ingest reference (write path)
+- `core/.../data/Mutation.java`
+  - `VALUE_SIZE_COPY_CUTOFF = 1 << 15`
+  - column updates use Hadoop `writeVLong` lengths, an explicit
+    `hasTimestamp` byte, a delete byte, and negative indexes into
+    `TMutation.values` for large values
+- `core/.../clientImpl/TabletServerBatchWriter.java`
+  - one tablet-server client carries `startUpdate` → one-way
+    `applyUpdates` batches → `closeUpdate`
+  - `UpdateErrors.failedExtents` values are committed-mutation counts used
+    for partial retry; full binning/retry policy remains a later client slice
+- `core/.../rpc/clients/ThriftClientTypes.java`
+  - `TabletIngestClientService` multiplex service name is `ingest`
+
 ### Thrift IDL
 - Vendored snapshot: `internal/thrift/idl` (Accumulo source revision
   `1a716b2c1bb5762ead4b46d2bc4f53e13873b314`)
 - `core/src/main/thrift/tabletscan.thrift:77-95` — `startScan` signature
+- `core/src/main/thrift/tabletingest.thrift` — `startUpdate`,
+  `applyUpdates`, `closeUpdate`, and `cancelUpdate`
 - `core/src/main/thrift/data.thrift` — `TKeyExtent`, `TRange`, `TKey`,
-  `TKeyValue`, `TColumn`, `IterInfo`
+  `TKeyValue`, `TColumn`, `IterInfo`, `TMutation`, and `UpdateErrors`
 - `core/src/main/thrift/security.thrift` — `TCredentials`
 - `core/src/main/thrift/client.thrift` — `TInfo`
 

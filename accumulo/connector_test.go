@@ -28,6 +28,9 @@ func TestNewConnectorLifecycle(t *testing.T) {
 	if connector.scan == nil {
 		t.Fatal("connector scan adapter is nil")
 	}
+	if connector.ingest == nil {
+		t.Fatal("connector ingest adapter is nil")
+	}
 	if err := connector.Close(); err != nil {
 		t.Fatal(err)
 	}

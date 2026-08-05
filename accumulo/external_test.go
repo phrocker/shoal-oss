@@ -96,3 +96,19 @@ func TestPublicScannerAPICompiles(t *testing.T) {
 	var _ func(*accumulo.BatchScanner, context.Context, []*accumulo.Range) ([]accumulo.KeyValue, error) = (*accumulo.BatchScanner).Scan
 	_ = accumulo.ErrRangeSpansTablets
 }
+
+func TestPublicMutationAPICompiles(t *testing.T) {
+	mutation, err := accumulo.NewMutation([]byte("row"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	mutation.PutLatest([]byte("cf"), []byte("cq"), nil, []byte("value"))
+	mutation.Put([]byte("cf"), []byte("cq"), []byte("private"), 123, []byte("value"))
+	mutation.DeleteLatest([]byte("cf"), []byte("cq"), nil)
+	mutation.Delete([]byte("cf"), []byte("cq"), nil, 456)
+
+	_ = mutation.Row()
+	_ = mutation.Size()
+	_ = accumulo.MutationLatestTimestamp
+	var _ *accumulo.Mutation = mutation
+}
