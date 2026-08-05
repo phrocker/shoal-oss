@@ -122,7 +122,7 @@ func (s *Scanner) executeBatchScan(
 		parallelism = len(segments)
 	}
 
-	jobs := make(chan int, len(segments))
+	jobs := make(chan int)
 	var workers sync.WaitGroup
 	workers.Add(parallelism)
 	for range parallelism {
