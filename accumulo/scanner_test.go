@@ -661,6 +661,37 @@ func TestBatchScannerGroupsMultiScansByServer(t *testing.T) {
 	}
 }
 
+func TestMultiScanExtentIdentityPreservesNilBoundaries(t *testing.T) {
+	scanRange, _ := NewRangeRow([]byte("a"))
+	tablets := []Tablet{
+		{
+			Extent: TabletExtent{TableID: "1", EndRow: []byte{}},
+			Server: &TabletServer{HostPort: "shared:9997"},
+		},
+		{
+			Extent: TabletExtent{TableID: "1", PrevRow: []byte{}, EndRow: []byte{}},
+			Server: &TabletServer{HostPort: "shared:9997"},
+		},
+		{
+			Extent: TabletExtent{TableID: "1"},
+			Server: &TabletServer{HostPort: "shared:9997"},
+		},
+	}
+	segments := make([]batchScanSegment, len(tablets))
+	for index, tablet := range tablets {
+		segments[index] = batchScanSegment{tablet: tablet, scanRange: scanRange}
+	}
+	groups := groupBatchSegments(segments)
+	if len(groups) != 1 || len(groups[0].batch) != 3 {
+		t.Fatalf("groups=%d extents=%d, want 1/3", len(groups), len(groups[0].batch))
+	}
+	nilBoundary := tabletExtentToThrift(tablets[0])
+	emptyBoundary := tabletExtentToThrift(tablets[1])
+	if thriftExtentEqual(nilBoundary, emptyBoundary) {
+		t.Fatal("nil and empty previous-row boundaries must remain distinct")
+	}
+}
+
 func TestBatchScannerContinuesMultiScanAndFallsBackFailures(t *testing.T) {
 	tablets := discoveryTablets()
 	for index := range tablets {

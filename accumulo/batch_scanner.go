@@ -36,9 +36,11 @@ type batchMultiScanGroup struct {
 }
 
 type tabletExtentMapKey struct {
-	tableID string
-	prevRow string
-	endRow  string
+	tableID    string
+	prevRow    string
+	prevRowSet bool
+	endRow     string
+	endRowSet  bool
 }
 
 // NewBatchScanner constructs a multi-tablet scanner for table.
@@ -377,8 +379,12 @@ func matchFailedSegments(
 func thriftExtentEqual(left, right *data.TKeyExtent) bool {
 	return left != nil && right != nil &&
 		bytes.Equal(left.Table, right.Table) &&
-		bytes.Equal(left.EndRow, right.EndRow) &&
-		bytes.Equal(left.PrevEndRow, right.PrevEndRow)
+		optionalBytesEqual(left.EndRow, right.EndRow) &&
+		optionalBytesEqual(left.PrevEndRow, right.PrevEndRow)
+}
+
+func optionalBytesEqual(left, right []byte) bool {
+	return (left == nil) == (right == nil) && bytes.Equal(left, right)
 }
 
 func thriftRangeEqual(left, right *data.TRange) bool {
@@ -405,9 +411,11 @@ func thriftKeyEqual(left, right *data.TKey) bool {
 
 func tabletExtentKey(tablet Tablet) tabletExtentMapKey {
 	return tabletExtentMapKey{
-		tableID: tablet.Extent.TableID,
-		prevRow: string(tablet.Extent.PrevRow),
-		endRow:  string(tablet.Extent.EndRow),
+		tableID:    tablet.Extent.TableID,
+		prevRow:    string(tablet.Extent.PrevRow),
+		prevRowSet: tablet.Extent.PrevRow != nil,
+		endRow:     string(tablet.Extent.EndRow),
+		endRowSet:  tablet.Extent.EndRow != nil,
 	}
 }
 
