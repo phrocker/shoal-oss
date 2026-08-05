@@ -59,11 +59,50 @@ func (c Column) Family() []byte { return cloneRow(c.family) }
 // qualifier means every qualifier in the family.
 func (c Column) Qualifier() []byte { return cloneRow(c.qualifier) }
 
+// IteratorSetting configures one server-side iterator for a scan.
+type IteratorSetting struct {
+	name      string
+	className string
+	priority  int32
+	options   map[string]string
+}
+
+// NewIteratorSetting constructs a server-side scan iterator setting.
+func NewIteratorSetting(
+	name, className string,
+	priority int32,
+	options map[string]string,
+) (IteratorSetting, error) {
+	setting := IteratorSetting{
+		name:      name,
+		className: className,
+		priority:  priority,
+		options:   cloneStringMap(options),
+	}
+	if err := validateIteratorSetting(setting); err != nil {
+		return IteratorSetting{}, err
+	}
+	return setting, nil
+}
+
+// Name returns the iterator's scan-local name.
+func (s IteratorSetting) Name() string { return s.name }
+
+// ClassName returns the iterator implementation class.
+func (s IteratorSetting) ClassName() string { return s.className }
+
+// Priority returns the positive iterator execution priority.
+func (s IteratorSetting) Priority() int32 { return s.priority }
+
+// Options returns a defensive copy of the iterator options.
+func (s IteratorSetting) Options() map[string]string { return cloneStringMap(s.options) }
+
 // ScannerOptions configures a Scanner.
 type ScannerOptions struct {
 	BatchSize      int32
 	Authorizations [][]byte
 	Columns        []Column
+	Iterators      []IteratorSetting
 	// Parallelism bounds concurrent tablet scans performed by BatchScanner.
 	// Zero uses one worker. Scanner ignores this field.
 	Parallelism int
@@ -109,6 +148,11 @@ func (c *Connector) NewScanner(table Table, options ScannerOptions) (*Scanner, e
 	}
 	options.Authorizations = cloneByteSlices(options.Authorizations)
 	options.Columns = cloneColumns(options.Columns)
+	iterators, err := cloneIteratorSettings(options.Iterators)
+	if err != nil {
+		return nil, err
+	}
+	options.Iterators = iterators
 	return &Scanner{
 		connector: c,
 		table: Table{
@@ -215,11 +259,14 @@ func (s *Scanner) scanTablet(ctx context.Context, tablet Tablet, scanRange *Rang
 	if batchSize == 0 {
 		batchSize = defaultScannerBatchSize
 	}
+	iterators, iteratorOptions := iteratorsToThrift(s.options.Iterators)
 	initial, err := s.connector.scan.Start(ctx, tablet.Server.HostPort, scanclient.StartRequest{
 		Extent:             tabletExtentToThrift(tablet),
 		Range:              scanRange.toThrift(),
 		Columns:            columnsToThrift(s.options.Columns),
 		BatchSize:          batchSize,
+		Iterators:          iterators,
+		IteratorOptions:    iteratorOptions,
 		Authorizations:     cloneByteSlices(s.options.Authorizations),
 		ReadaheadThreshold: int64(batchSize),
 	})
@@ -342,4 +389,81 @@ func columnsToThrift(columns []Column) []*data.TColumn {
 		}
 	}
 	return wire
+}
+
+func validateIteratorSetting(setting IteratorSetting) error {
+	switch {
+	case setting.name == "":
+		return errors.New("accumulo: iterator name is empty")
+	case setting.className == "":
+		return errors.New("accumulo: iterator class name is empty")
+	case setting.priority <= 0:
+		return errors.New("accumulo: iterator priority must be positive")
+	default:
+		return nil
+	}
+}
+
+func cloneIteratorSettings(settings []IteratorSetting) ([]IteratorSetting, error) {
+	if settings == nil {
+		return nil, nil
+	}
+	cloned := make([]IteratorSetting, len(settings))
+	names := make(map[string]struct{}, len(settings))
+	priorities := make(map[int32]struct{}, len(settings))
+	for i, setting := range settings {
+		if err := validateIteratorSetting(setting); err != nil {
+			return nil, err
+		}
+		if _, exists := names[setting.name]; exists {
+			return nil, fmt.Errorf("accumulo: duplicate iterator name %q", setting.name)
+		}
+		if _, exists := priorities[setting.priority]; exists {
+			return nil, fmt.Errorf("accumulo: duplicate iterator priority %d", setting.priority)
+		}
+		names[setting.name] = struct{}{}
+		priorities[setting.priority] = struct{}{}
+		cloned[i] = IteratorSetting{
+			name:      setting.name,
+			className: setting.className,
+			priority:  setting.priority,
+			options:   cloneStringMap(setting.options),
+		}
+	}
+	return cloned, nil
+}
+
+func iteratorsToThrift(
+	settings []IteratorSetting,
+) ([]*data.IterInfo, map[string]map[string]string) {
+	if len(settings) == 0 {
+		return nil, nil
+	}
+	iterators := make([]*data.IterInfo, len(settings))
+	var options map[string]map[string]string
+	for i, setting := range settings {
+		iterators[i] = &data.IterInfo{
+			Priority:  setting.priority,
+			ClassName: setting.className,
+			IterName:  setting.name,
+		}
+		if len(setting.options) != 0 {
+			if options == nil {
+				options = make(map[string]map[string]string)
+			}
+			options[setting.name] = cloneStringMap(setting.options)
+		}
+	}
+	return iterators, options
+}
+
+func cloneStringMap(values map[string]string) map[string]string {
+	if values == nil {
+		return nil
+	}
+	cloned := make(map[string]string, len(values))
+	for key, value := range values {
+		cloned[key] = value
+	}
+	return cloned
 }

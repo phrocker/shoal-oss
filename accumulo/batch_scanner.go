@@ -253,10 +253,13 @@ func (s *Scanner) scanMultiGroup(
 	multi scanclient.MultiLifecycle,
 	group batchMultiScanGroup,
 ) ([]KeyValue, error) {
+	iterators, iteratorOptions := iteratorsToThrift(s.options.Iterators)
 	initial, err := multi.StartMulti(ctx, group.address, scanclient.MultiStartRequest{
-		Batch:          group.batch,
-		Columns:        columnsToThrift(s.options.Columns),
-		Authorizations: cloneByteSlices(s.options.Authorizations),
+		Batch:           group.batch,
+		Columns:         columnsToThrift(s.options.Columns),
+		Iterators:       iterators,
+		IteratorOptions: iteratorOptions,
+		Authorizations:  cloneByteSlices(s.options.Authorizations),
 	})
 	if initial == nil && err != nil {
 		return nil, err
