@@ -43,6 +43,10 @@ func TestTableAdministrationListingAndExistence(t *testing.T) {
 	if err != nil || exists {
 		t.Fatalf("TableExists(missing) = %v, %v", exists, err)
 	}
+	exists, err = connector.TableExists(context.Background(), "")
+	if exists || !errors.Is(err, ErrTableNotFound) {
+		t.Fatalf("TableExists(empty) = %v, %v, want false/ErrTableNotFound", exists, err)
+	}
 	if err := connector.InvalidateDiscovery(); err != nil {
 		t.Fatal(err)
 	}

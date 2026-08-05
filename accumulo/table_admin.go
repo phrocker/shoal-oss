@@ -39,6 +39,9 @@ func (c *Connector) TableExists(ctx context.Context, name string) (bool, error) 
 	if err := ctx.Err(); err != nil {
 		return false, err
 	}
+	if name == "" {
+		return false, fmt.Errorf("%w: empty table name", ErrTableNotFound)
+	}
 	discovery, err := c.discoveryState()
 	if err != nil {
 		return false, err
