@@ -96,13 +96,22 @@ func (s *Scanner) Scan(ctx context.Context, scanRange *Range) ([]KeyValue, error
 		return nil, err
 	}
 	routingRow := scanRange.routingRow()
+	tablet, err := s.locateTablet(ctx, table, routingRow)
+	if err != nil {
+		return nil, err
+	}
+	return s.scanLocated(ctx, table, routingRow, tablet, scanRange)
+}
 
+func (s *Scanner) scanLocated(
+	ctx context.Context,
+	table Table,
+	routingRow []byte,
+	tablet Tablet,
+	scanRange *Range,
+) ([]KeyValue, error) {
 	var priorCleanup error
 	for attempt := 0; attempt < 2; attempt++ {
-		tablet, locateErr := s.locateTablet(ctx, table, routingRow)
-		if locateErr != nil {
-			return nil, errors.Join(priorCleanup, locateErr)
-		}
 		if !scanRange.fitsTablet(tablet) {
 			return nil, fmt.Errorf(
 				"%w: table=%s start=%q end=%q tabletEnd=%q",
@@ -125,6 +134,10 @@ func (s *Scanner) Scan(ctx context.Context, scanRange *Range) ([]KeyValue, error
 		}
 		if cleanupErr != nil {
 			priorCleanup = errors.Join(priorCleanup, cleanupErr)
+		}
+		tablet, scanErr = s.locateTablet(ctx, table, routingRow)
+		if scanErr != nil {
+			return nil, errors.Join(priorCleanup, scanErr)
 		}
 	}
 	return nil, priorCleanup

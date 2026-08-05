@@ -53,11 +53,14 @@ func (s *BatchScanner) Scan(ctx context.Context, ranges []*Range) ([]KeyValue, e
 			if err != nil {
 				return values, errors.Join(cleanupErr, err)
 			}
-			segment, done, err := clipRangeToTablet(remaining, tablet)
-			if err != nil {
-				return values, errors.Join(cleanupErr, err)
-			}
-			segmentValues, scanErr := scanner.Scan(ctx, segment)
+			segment, done := clipRangeToTablet(remaining, tablet)
+			segmentValues, scanErr := scanner.scanLocated(
+				ctx,
+				table,
+				remaining.routingRow(),
+				tablet,
+				segment,
+			)
 			values = append(values, segmentValues...)
 			if scanErr != nil {
 				if !onlyCleanupErrors(scanErr) {
@@ -79,23 +82,16 @@ func (s *BatchScanner) Scan(ctx context.Context, ranges []*Range) ([]KeyValue, e
 	return values, cleanupErr
 }
 
-func clipRangeToTablet(scanRange *Range, tablet Tablet) (*Range, bool, error) {
+func clipRangeToTablet(scanRange *Range, tablet Tablet) (*Range, bool) {
 	if scanRange.fitsTablet(tablet) {
-		return cloneRange(scanRange), true, nil
+		return cloneRange(scanRange), true
 	}
-	if tablet.Extent.EndRow == nil {
-		return nil, false, errors.New("accumulo: unbounded tablet did not contain scan range")
-	}
-	segment, err := NewRange(
-		scanRange.startRow,
-		scanRange.startInclusive,
-		tablet.Extent.EndRow,
-		true,
-	)
-	if err != nil {
-		return nil, false, err
-	}
-	return segment, false, nil
+	return &Range{
+		startRow:       cloneRow(scanRange.startRow),
+		endRow:         cloneRow(tablet.Extent.EndRow),
+		startInclusive: scanRange.startInclusive,
+		endInclusive:   true,
+	}, false
 }
 
 func cloneRange(scanRange *Range) *Range {
