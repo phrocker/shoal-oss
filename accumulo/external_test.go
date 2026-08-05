@@ -65,10 +65,15 @@ func TestPublicScannerAPICompiles(t *testing.T) {
 	_ = scanRange.EndInclusive()
 	_, _ = accumulo.NewRangeRow([]byte("row"))
 	_ = accumulo.InfiniteRange()
+	familyColumn := accumulo.NewColumnFamily([]byte("content"))
+	exactColumn := accumulo.NewColumn([]byte("meta"), []byte("type"))
+	_ = familyColumn.Family()
+	_ = familyColumn.Qualifier()
 
 	_, err = connector.NewScanner(accumulo.Table{Name: "events"}, accumulo.ScannerOptions{
 		BatchSize:      128,
 		Authorizations: [][]byte{[]byte("public")},
+		Columns:        []accumulo.Column{familyColumn, exactColumn},
 		Parallelism:    4,
 		UseMultiScan:   true,
 	})
