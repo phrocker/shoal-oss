@@ -91,7 +91,7 @@ func (s IteratorSetting) Name() string { return s.name }
 // ClassName returns the iterator implementation class.
 func (s IteratorSetting) ClassName() string { return s.className }
 
-// Priority returns the non-negative iterator execution priority.
+// Priority returns the positive iterator execution priority.
 func (s IteratorSetting) Priority() int32 { return s.priority }
 
 // Options returns a defensive copy of the iterator options.
@@ -397,8 +397,8 @@ func validateIteratorSetting(setting IteratorSetting) error {
 		return errors.New("accumulo: iterator name is empty")
 	case setting.className == "":
 		return errors.New("accumulo: iterator class name is empty")
-	case setting.priority < 0:
-		return errors.New("accumulo: iterator priority must not be negative")
+	case setting.priority <= 0:
+		return errors.New("accumulo: iterator priority must be positive")
 	default:
 		return nil
 	}

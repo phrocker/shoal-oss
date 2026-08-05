@@ -882,8 +882,8 @@ func TestBatchScannerValidatesRanges(t *testing.T) {
 	if _, err := NewIteratorSetting("example", "", 10, nil); err == nil {
 		t.Fatal("empty iterator class should fail")
 	}
-	if _, err := NewIteratorSetting("example", "example.Iterator", -1, nil); err == nil {
-		t.Fatal("negative iterator priority should fail")
+	if _, err := NewIteratorSetting("example", "example.Iterator", 0, nil); err == nil {
+		t.Fatal("zero iterator priority should fail")
 	}
 	first, _ := NewIteratorSetting("first", "example.First", 10, nil)
 	second, _ := NewIteratorSetting("second", "example.Second", 10, nil)
