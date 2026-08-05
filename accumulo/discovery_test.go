@@ -59,6 +59,17 @@ func (f *fakeTableNames) ResolveName(ctx context.Context, id string) (string, er
 	return name, nil
 }
 
+func (f *fakeTableNames) List(ctx context.Context) (map[string]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	tables := make(map[string]string, len(f.byName))
+	for name, id := range f.byName {
+		tables[name] = id
+	}
+	return tables, nil
+}
+
 func (f *fakeTableNames) Invalidate() { f.invalidates++ }
 
 func testConnectorWithDiscovery(t *testing.T, walker *fakeTabletWalker, names *fakeTableNames) *Connector {

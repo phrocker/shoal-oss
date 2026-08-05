@@ -119,6 +119,26 @@ func (r *Resolver) ResolveName(ctx context.Context, tableID string) (string, err
 	return "", fmt.Errorf("%w: table id %q", ErrTableNotFound, tableID)
 }
 
+// List returns every qualified table name mapped to its table ID.
+func (r *Resolver) List(ctx context.Context) (map[string]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	namespaces, err := r.loadNamespaces(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for namespaceID, namespaceName := range namespaces {
+		if err := r.loadNamespace(ctx, namespaceID, namespaceName); err != nil {
+			return nil, err
+		}
+	}
+	r.mu.RLock()
+	tables := cloneMapping(r.nameToID)
+	r.mu.RUnlock()
+	return tables, nil
+}
+
 // Invalidate clears all cached mappings.
 func (r *Resolver) Invalidate() {
 	r.mu.Lock()
