@@ -125,3 +125,27 @@ func TestSimpleScan_RejectsNilFields(t *testing.T) {
 		})
 	}
 }
+
+func TestStartMulti_RejectsNilFields(t *testing.T) {
+	c := &Client{}
+
+	cases := []struct {
+		name string
+		req  MultiStartRequest
+		want string
+	}{
+		{"nil credentials", MultiStartRequest{Batch: data.ScanBatch{}}, "nil Credentials"},
+		{"nil batch", MultiStartRequest{Credentials: &security.TCredentials{}}, "nil Batch"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := c.StartMulti(context.Background(), tc.req)
+			if err == nil {
+				t.Fatal("expected validation error, got nil")
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("error = %v, want substring %q", err, tc.want)
+			}
+		})
+	}
+}
