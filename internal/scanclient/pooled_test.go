@@ -85,6 +85,53 @@ func TestPooledReusesTransportAcrossLifecycle(t *testing.T) {
 	}
 }
 
+func TestPooledReusesTransportAcrossMultiLifecycle(t *testing.T) {
+	pooled, pool := newTestPooled(t, transportpool.Config{MaxIdlePerEndpoint: 1})
+	defer pool.Close()
+
+	var dials atomic.Int32
+	rpc := &fakeScanRPC{
+		multiStartResult:    &data.InitialMultiScan{ScanID: 51},
+		multiContinueResult: &data.MultiScanResult_{More: true},
+	}
+	pooled.dial = func(context.Context, transportpool.Key) (io.Closer, error) {
+		dials.Add(1)
+		return &fakePooledTransport{rpc: rpc}, nil
+	}
+	pooled.newClient = clientFromFakeTransport
+
+	initial, err := pooled.StartMulti(context.Background(), "tablet-1:9997", validMultiStartRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if initial.ScanID != 51 {
+		t.Fatalf("scan ID = %d, want 51", initial.ScanID)
+	}
+	batch, err := pooled.ContinueMulti(context.Background(), "tablet-1:9997", initial.ScanID, 17)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if batch == nil || !batch.More {
+		t.Fatalf("continue result = %+v, want More", batch)
+	}
+	if err := pooled.CloseMultiScan(context.Background(), "tablet-1:9997", initial.ScanID); err != nil {
+		t.Fatal(err)
+	}
+	if dials.Load() != 1 {
+		t.Fatalf("dials = %d, want 1", dials.Load())
+	}
+	if rpc.multiStartCalls.Load() != 1 ||
+		rpc.multiContinueCalls.Load() != 1 ||
+		rpc.multiCloseCalls.Load() != 1 {
+		t.Fatalf(
+			"multi calls start/continue/close = %d/%d/%d, want 1/1/1",
+			rpc.multiStartCalls.Load(),
+			rpc.multiContinueCalls.Load(),
+			rpc.multiCloseCalls.Load(),
+		)
+	}
+}
+
 func TestPooledInvalidatesWireFailures(t *testing.T) {
 	tests := []struct {
 		name string
@@ -162,6 +209,15 @@ func TestPooledChecksCancellationBeforeRPCs(t *testing.T) {
 	}
 	if err := pooled.CloseScan(ctx, "tablet-1:9997", 1); !errors.Is(err, context.Canceled) {
 		t.Fatalf("CloseScan error = %v, want context.Canceled", err)
+	}
+	if _, err := pooled.StartMulti(ctx, "tablet-1:9997", validMultiStartRequest()); !errors.Is(err, context.Canceled) {
+		t.Fatalf("StartMulti error = %v, want context.Canceled", err)
+	}
+	if _, err := pooled.ContinueMulti(ctx, "tablet-1:9997", 1, 0); !errors.Is(err, context.Canceled) {
+		t.Fatalf("ContinueMulti error = %v, want context.Canceled", err)
+	}
+	if err := pooled.CloseMultiScan(ctx, "tablet-1:9997", 1); !errors.Is(err, context.Canceled) {
+		t.Fatalf("CloseMultiScan error = %v, want context.Canceled", err)
 	}
 	if dials.Load() != 0 {
 		t.Fatalf("dials = %d, want 0", dials.Load())
@@ -298,10 +354,20 @@ func validStartRequest() StartRequest {
 	}
 }
 
+func validMultiStartRequest() MultiStartRequest {
+	return MultiStartRequest{
+		Batch: data.ScanBatch{
+			&data.TKeyExtent{}: []*data.TRange{{}},
+		},
+	}
+}
+
 func successfulRPC() *fakeScanRPC {
 	return &fakeScanRPC{
-		startResult:    &data.InitialScan{ScanID: 1},
-		continueResult: &data.ScanResult_{},
+		startResult:         &data.InitialScan{ScanID: 1},
+		continueResult:      &data.ScanResult_{},
+		multiStartResult:    &data.InitialMultiScan{ScanID: 2},
+		multiContinueResult: &data.MultiScanResult_{},
 	}
 }
 
@@ -321,19 +387,35 @@ func clientFromFakeTransport(transport io.Closer) (scanRPC, error) {
 }
 
 type fakeScanRPC struct {
-	startResult    *data.InitialScan
-	startErr       error
-	continueResult *data.ScanResult_
-	continueErr    error
-	closeErr       error
-	startCalls     atomic.Int32
-	continueCalls  atomic.Int32
-	closeCalls     atomic.Int32
+	startResult         *data.InitialScan
+	startErr            error
+	multiStartResult    *data.InitialMultiScan
+	multiStartErr       error
+	continueResult      *data.ScanResult_
+	continueErr         error
+	multiContinueResult *data.MultiScanResult_
+	multiContinueErr    error
+	closeErr            error
+	multiCloseErr       error
+	startCalls          atomic.Int32
+	multiStartCalls     atomic.Int32
+	continueCalls       atomic.Int32
+	multiContinueCalls  atomic.Int32
+	closeCalls          atomic.Int32
+	multiCloseCalls     atomic.Int32
 }
 
 func (c *fakeScanRPC) Start(context.Context, StartRequest) (*data.InitialScan, error) {
 	c.startCalls.Add(1)
 	return c.startResult, c.startErr
+}
+
+func (c *fakeScanRPC) StartMulti(
+	context.Context,
+	MultiStartRequest,
+) (*data.InitialMultiScan, error) {
+	c.multiStartCalls.Add(1)
+	return c.multiStartResult, c.multiStartErr
 }
 
 func (c *fakeScanRPC) Continue(
@@ -345,11 +427,30 @@ func (c *fakeScanRPC) Continue(
 	return c.continueResult, c.continueErr
 }
 
+func (c *fakeScanRPC) ContinueMulti(
+	context.Context,
+	data.ScanID,
+	int64,
+) (*data.MultiScanResult_, error) {
+	c.multiContinueCalls.Add(1)
+	return c.multiContinueResult, c.multiContinueErr
+}
+
 func (c *fakeScanRPC) Close(context.Context, data.ScanID) error {
 	c.closeCalls.Add(1)
 	return c.closeErr
 }
 
+func (c *fakeScanRPC) CloseMulti(context.Context, data.ScanID) error {
+	c.multiCloseCalls.Add(1)
+	return c.multiCloseErr
+}
+
 func (c *fakeScanRPC) totalCalls() int32 {
-	return c.startCalls.Load() + c.continueCalls.Load() + c.closeCalls.Load()
+	return c.startCalls.Load() +
+		c.multiStartCalls.Load() +
+		c.continueCalls.Load() +
+		c.multiContinueCalls.Load() +
+		c.closeCalls.Load() +
+		c.multiCloseCalls.Load()
 }

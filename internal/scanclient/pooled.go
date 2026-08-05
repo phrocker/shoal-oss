@@ -22,10 +22,23 @@ type Lifecycle interface {
 	CloseScan(context.Context, string, data.ScanID) error
 }
 
+// MultiLifecycle is the grouped tablet-scan RPC boundary.
+type MultiLifecycle interface {
+	StartMulti(context.Context, string, MultiStartRequest) (*data.InitialMultiScan, error)
+	ContinueMulti(context.Context, string, data.ScanID, int64) (*data.MultiScanResult_, error)
+	CloseMultiScan(context.Context, string, data.ScanID) error
+}
+
 // Adapter is a Lifecycle that can forget connector-owned credentials.
 type Adapter interface {
 	Lifecycle
 	Close() error
+}
+
+// MultiAdapter supports both single and grouped scan lifecycles.
+type MultiAdapter interface {
+	Adapter
+	MultiLifecycle
 }
 
 // SimpleScanLifecycle starts a metadata-style scan through lifecycle and
@@ -77,7 +90,7 @@ type Pooled struct {
 	newClient func(io.Closer) (scanRPC, error)
 }
 
-var _ Adapter = (*Pooled)(nil)
+var _ MultiAdapter = (*Pooled)(nil)
 
 // NewPooled constructs a pooled tablet-scan adapter.
 func NewPooled(
@@ -130,6 +143,25 @@ func (p *Pooled) Start(
 	})
 }
 
+// StartMulti acquires an exclusive scan-service transport and starts a grouped scan.
+func (p *Pooled) StartMulti(
+	ctx context.Context,
+	address string,
+	req MultiStartRequest,
+) (*data.InitialMultiScan, error) {
+	credentials, err := p.credentialsForRPC()
+	if err != nil {
+		return nil, err
+	}
+	req.Credentials = credentials
+	if err := validateMultiStartRequest(req); err != nil {
+		return nil, err
+	}
+	return withLease(p, ctx, address, func(client scanRPC) (*data.InitialMultiScan, error) {
+		return client.StartMulti(ctx, req)
+	})
+}
+
 // Continue acquires an exclusive scan-service transport and continues scanID.
 func (p *Pooled) Continue(
 	ctx context.Context,
@@ -142,6 +174,18 @@ func (p *Pooled) Continue(
 	})
 }
 
+// ContinueMulti acquires an exclusive scan-service transport and continues scanID.
+func (p *Pooled) ContinueMulti(
+	ctx context.Context,
+	address string,
+	scanID data.ScanID,
+	busyTimeout int64,
+) (*data.MultiScanResult_, error) {
+	return withLease(p, ctx, address, func(client scanRPC) (*data.MultiScanResult_, error) {
+		return client.ContinueMulti(ctx, scanID, busyTimeout)
+	})
+}
+
 // CloseScan acquires an exclusive scan-service transport and closes scanID.
 func (p *Pooled) CloseScan(
 	ctx context.Context,
@@ -150,6 +194,18 @@ func (p *Pooled) CloseScan(
 ) error {
 	_, err := withLease(p, ctx, address, func(client scanRPC) (struct{}, error) {
 		return struct{}{}, client.Close(ctx, scanID)
+	})
+	return err
+}
+
+// CloseMultiScan acquires an exclusive scan-service transport and closes scanID.
+func (p *Pooled) CloseMultiScan(
+	ctx context.Context,
+	address string,
+	scanID data.ScanID,
+) error {
+	_, err := withLease(p, ctx, address, func(client scanRPC) (struct{}, error) {
+		return struct{}{}, client.CloseMulti(ctx, scanID)
 	})
 	return err
 }

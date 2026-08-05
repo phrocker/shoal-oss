@@ -99,6 +99,22 @@ type StartRequest struct {
 	BusyTimeout        int64
 }
 
+// MultiStartRequest is the internal input for a startMultiScan RPC.
+type MultiStartRequest struct {
+	Credentials        *security.TCredentials
+	Batch              data.ScanBatch
+	Columns            []*data.TColumn
+	Iterators          []*data.IterInfo
+	IteratorOptions    map[string]map[string]string
+	Authorizations     [][]byte
+	WaitForWrites      bool
+	SamplerConfig      *tabletscan.TSamplerConfiguration
+	BatchTimeout       int64
+	ClassLoaderContext string
+	ExecutionHints     map[string]string
+	BusyTimeout        int64
+}
+
 // Start begins a tablet scan.
 func (c *Client) Start(ctx context.Context, req StartRequest) (*data.InitialScan, error) {
 	if err := validateStartRequest(req); err != nil {
@@ -108,6 +124,17 @@ func (c *Client) Start(ctx context.Context, req StartRequest) (*data.InitialScan
 		return nil, err
 	}
 	return c.rpc.Start(ctx, req)
+}
+
+// StartMulti begins a grouped tablet scan.
+func (c *Client) StartMulti(ctx context.Context, req MultiStartRequest) (*data.InitialMultiScan, error) {
+	if err := validateMultiStartRequest(req); err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return c.rpc.StartMulti(ctx, req)
 }
 
 // Continue fetches the next batch for scanID.
@@ -122,12 +149,32 @@ func (c *Client) Continue(
 	return c.rpc.Continue(ctx, scanID, busyTimeout)
 }
 
+// ContinueMulti fetches the next grouped batch for scanID.
+func (c *Client) ContinueMulti(
+	ctx context.Context,
+	scanID data.ScanID,
+	busyTimeout int64,
+) (*data.MultiScanResult_, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return c.rpc.ContinueMulti(ctx, scanID, busyTimeout)
+}
+
 // CloseScan releases the server-side scan session.
 func (c *Client) CloseScan(ctx context.Context, scanID data.ScanID) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 	return c.rpc.Close(ctx, scanID)
+}
+
+// CloseMultiScan releases a server-side grouped scan session.
+func (c *Client) CloseMultiScan(ctx context.Context, scanID data.ScanID) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return c.rpc.CloseMulti(ctx, scanID)
 }
 
 // SimpleScanRequest is the minimal set of fields a metadata-style scan needs.
@@ -182,8 +229,11 @@ func (c *Client) SimpleScan(ctx context.Context, req SimpleScanRequest) (*data.I
 
 type scanRPC interface {
 	Start(context.Context, StartRequest) (*data.InitialScan, error)
+	StartMulti(context.Context, MultiStartRequest) (*data.InitialMultiScan, error)
 	Continue(context.Context, data.ScanID, int64) (*data.ScanResult_, error)
+	ContinueMulti(context.Context, data.ScanID, int64) (*data.MultiScanResult_, error)
 	Close(context.Context, data.ScanID) error
+	CloseMulti(context.Context, data.ScanID) error
 }
 
 type thriftScanRPC struct {
@@ -213,6 +263,28 @@ func (c thriftScanRPC) Start(ctx context.Context, req StartRequest) (*data.Initi
 	)
 }
 
+func (c thriftScanRPC) StartMulti(
+	ctx context.Context,
+	req MultiStartRequest,
+) (*data.InitialMultiScan, error) {
+	return c.raw.StartMultiScan(
+		ctx,
+		clientpkg.NewTInfo(),
+		req.Credentials,
+		req.Batch,
+		req.Columns,
+		req.Iterators,
+		req.IteratorOptions,
+		req.Authorizations,
+		req.WaitForWrites,
+		req.SamplerConfig,
+		req.BatchTimeout,
+		req.ClassLoaderContext,
+		req.ExecutionHints,
+		req.BusyTimeout,
+	)
+}
+
 func (c thriftScanRPC) Continue(
 	ctx context.Context,
 	scanID data.ScanID,
@@ -221,8 +293,20 @@ func (c thriftScanRPC) Continue(
 	return c.raw.ContinueScan(ctx, clientpkg.NewTInfo(), scanID, busyTimeout)
 }
 
+func (c thriftScanRPC) ContinueMulti(
+	ctx context.Context,
+	scanID data.ScanID,
+	busyTimeout int64,
+) (*data.MultiScanResult_, error) {
+	return c.raw.ContinueMultiScan(ctx, clientpkg.NewTInfo(), scanID, busyTimeout)
+}
+
 func (c thriftScanRPC) Close(ctx context.Context, scanID data.ScanID) error {
 	return c.raw.CloseScan(ctx, clientpkg.NewTInfo(), scanID)
+}
+
+func (c thriftScanRPC) CloseMulti(ctx context.Context, scanID data.ScanID) error {
+	return c.raw.CloseMultiScan(ctx, clientpkg.NewTInfo(), scanID)
 }
 
 func validateStartRequest(req StartRequest) error {
@@ -233,6 +317,17 @@ func validateStartRequest(req StartRequest) error {
 		return errors.New("scanclient: nil Extent")
 	case req.Range == nil:
 		return errors.New("scanclient: nil Range")
+	default:
+		return nil
+	}
+}
+
+func validateMultiStartRequest(req MultiStartRequest) error {
+	switch {
+	case req.Credentials == nil:
+		return errors.New("scanclient: nil Credentials")
+	case req.Batch == nil:
+		return errors.New("scanclient: nil Batch")
 	default:
 		return nil
 	}
