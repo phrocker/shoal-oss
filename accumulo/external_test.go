@@ -73,11 +73,17 @@ func TestPublicScannerAPICompiles(t *testing.T) {
 	if !errors.Is(err, accumulo.ErrDiscoveryUnavailable) {
 		t.Fatalf("error = %v, want ErrDiscoveryUnavailable", err)
 	}
+	_, err = connector.NewBatchScanner(accumulo.Table{Name: "events"}, accumulo.ScannerOptions{})
+	if !errors.Is(err, accumulo.ErrDiscoveryUnavailable) {
+		t.Fatalf("error = %v, want ErrDiscoveryUnavailable", err)
+	}
 
 	var _ accumulo.Key
 	var _ accumulo.KeyValue
 	var _ *accumulo.Scanner
+	var _ *accumulo.BatchScanner
 	var _ *accumulo.CleanupError
 	var _ func(*accumulo.Scanner, context.Context, *accumulo.Range) ([]accumulo.KeyValue, error) = (*accumulo.Scanner).Scan
+	var _ func(*accumulo.BatchScanner, context.Context, []*accumulo.Range) ([]accumulo.KeyValue, error) = (*accumulo.BatchScanner).Scan
 	_ = accumulo.ErrRangeSpansTablets
 }
