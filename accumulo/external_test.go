@@ -70,6 +70,7 @@ func TestPublicScannerAPICompiles(t *testing.T) {
 		BatchSize:      128,
 		Authorizations: [][]byte{[]byte("public")},
 		Parallelism:    4,
+		UseMultiScan:   true,
 	})
 	if !errors.Is(err, accumulo.ErrDiscoveryUnavailable) {
 		t.Fatalf("error = %v, want ErrDiscoveryUnavailable", err)

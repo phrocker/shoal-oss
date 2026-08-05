@@ -25,6 +25,12 @@ type fakeScannerAdapter struct {
 	closeErr     error
 	closeErrors  []error
 
+	multiStartResults []*data.InitialMultiScan
+	multiStartErrors  []error
+	multiContinues    []*data.MultiScanResult_
+	multiContinueErr  error
+	multiCloseErr     error
+
 	addresses     []string
 	startRequests []scanclient.StartRequest
 	startCalls    int
@@ -37,6 +43,13 @@ type fakeScannerAdapter struct {
 	startRelease  <-chan struct{}
 	activeStarts  int
 	maxStarts     int
+
+	multiAddresses     []string
+	multiRequests      []scanclient.MultiStartRequest
+	multiStartCalls    int
+	multiContinueCalls int
+	multiCloseCalls    int
+	multiStartFunc     func(string, scanclient.MultiStartRequest) (*data.InitialMultiScan, error)
 }
 
 func (f *fakeScannerAdapter) Start(
@@ -119,6 +132,61 @@ func (f *fakeScannerAdapter) CloseScan(ctx context.Context, _ string, _ data.Sca
 		return f.closeErrors[index]
 	}
 	return f.closeErr
+}
+
+func (f *fakeScannerAdapter) StartMulti(
+	_ context.Context,
+	address string,
+	req scanclient.MultiStartRequest,
+) (*data.InitialMultiScan, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.multiAddresses = append(f.multiAddresses, address)
+	f.multiRequests = append(f.multiRequests, req)
+	index := f.multiStartCalls
+	f.multiStartCalls++
+	if f.multiStartFunc != nil {
+		return f.multiStartFunc(address, req)
+	}
+	var result *data.InitialMultiScan
+	if index < len(f.multiStartResults) {
+		result = f.multiStartResults[index]
+	}
+	var err error
+	if index < len(f.multiStartErrors) {
+		err = f.multiStartErrors[index]
+	}
+	return result, err
+}
+
+func (f *fakeScannerAdapter) ContinueMulti(
+	_ context.Context,
+	_ string,
+	_ data.ScanID,
+	_ int64,
+) (*data.MultiScanResult_, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	index := f.multiContinueCalls
+	f.multiContinueCalls++
+	if f.multiContinueErr != nil {
+		return nil, f.multiContinueErr
+	}
+	if index >= len(f.multiContinues) {
+		return &data.MultiScanResult_{}, nil
+	}
+	return f.multiContinues[index], nil
+}
+
+func (f *fakeScannerAdapter) CloseMultiScan(
+	_ context.Context,
+	_ string,
+	_ data.ScanID,
+) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.multiCloseCalls++
+	return f.multiCloseErr
 }
 
 func (f *fakeScannerAdapter) Close() error { return nil }
@@ -531,6 +599,180 @@ func TestBatchScannerBoundsParallelismAndPreservesOrder(t *testing.T) {
 	adapter.mu.Unlock()
 	if maxStarts != 2 {
 		t.Fatalf("maximum concurrent starts = %d, want 2", maxStarts)
+	}
+}
+
+func TestBatchScannerGroupsMultiScansByServer(t *testing.T) {
+	tablets := discoveryTablets()
+	tablets[0].Location.HostPort = "shared:9997"
+	tablets[1].Location.HostPort = "shared:9997"
+	tablets[2].Location.HostPort = "other:9997"
+	walker := &fakeTabletWalker{tablets: map[string][]metadata.TabletInfo{"1": tablets}}
+	connector := testConnectorWithDiscovery(t, walker, &fakeTableNames{
+		byName: map[string]string{"events": "1"},
+		byID:   map[string]string{"1": "events"},
+	})
+	adapter := &fakeScannerAdapter{
+		multiStartResults: []*data.InitialMultiScan{
+			{
+				ScanID: 40,
+				Result_: &data.MultiScanResult_{
+					Results: []*data.TKeyValue{testEntry("a", "one"), testEntry("m", "two")},
+				},
+			},
+			{
+				ScanID: 41,
+				Result_: &data.MultiScanResult_{
+					Results: []*data.TKeyValue{testEntry("z", "three")},
+				},
+			},
+		},
+	}
+	connector.scan = adapter
+	scanner, err := connector.NewBatchScanner(Table{ID: "1", Name: "events"}, ScannerOptions{
+		UseMultiScan: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	scanRange, _ := NewRange([]byte("a"), true, []byte("z"), true)
+	values, err := scanner.Scan(context.Background(), []*Range{scanRange})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(values) != 3 || adapter.multiStartCalls != 2 || adapter.startCalls != 0 {
+		t.Fatalf(
+			"values=%+v multiStartCalls=%d startCalls=%d",
+			values,
+			adapter.multiStartCalls,
+			adapter.startCalls,
+		)
+	}
+	if got := adapter.multiAddresses; len(got) != 2 ||
+		got[0] != "shared:9997" || got[1] != "other:9997" {
+		t.Fatalf("multi addresses = %v", got)
+	}
+	if len(adapter.multiRequests[0].Batch) != 2 || len(adapter.multiRequests[1].Batch) != 1 {
+		t.Fatalf(
+			"batch extent counts = %d/%d, want 2/1",
+			len(adapter.multiRequests[0].Batch),
+			len(adapter.multiRequests[1].Batch),
+		)
+	}
+}
+
+func TestBatchScannerContinuesMultiScanAndFallsBackFailures(t *testing.T) {
+	tablets := discoveryTablets()
+	for index := range tablets {
+		tablets[index].Location.HostPort = "shared:9997"
+	}
+	walker := &fakeTabletWalker{tablets: map[string][]metadata.TabletInfo{"1": tablets}}
+	connector := testConnectorWithDiscovery(t, walker, &fakeTableNames{
+		byName: map[string]string{"events": "1"},
+		byID:   map[string]string{"1": "events"},
+	})
+	adapter := &fakeScannerAdapter{
+		startResults: []*data.InitialScan{{
+			ScanID:  43,
+			Result_: &data.ScanResult_{Results: []*data.TKeyValue{testEntry("m", "fallback")}},
+		}},
+		multiContinues: []*data.MultiScanResult_{{
+			Results: []*data.TKeyValue{testEntry("z", "continued")},
+		}},
+	}
+	adapter.multiStartFunc = func(
+		_ string,
+		req scanclient.MultiStartRequest,
+	) (*data.InitialMultiScan, error) {
+		var failedExtent *data.TKeyExtent
+		var failedRange *data.TRange
+		for extent, ranges := range req.Batch {
+			if bytes.Equal(extent.EndRow, []byte("p")) {
+				failedExtent = extent
+				failedRange = ranges[0]
+				break
+			}
+		}
+		if failedExtent == nil || failedRange == nil {
+			return nil, errors.New("test did not find middle tablet failure")
+		}
+		walker.mu.Lock()
+		walker.tablets["1"][1].Location = &metadata.Location{HostPort: "moved:9997"}
+		walker.mu.Unlock()
+		return &data.InitialMultiScan{
+			ScanID: 42,
+			Result_: &data.MultiScanResult_{
+				Results:  []*data.TKeyValue{testEntry("a", "initial")},
+				Failures: data.ScanBatch{failedExtent: []*data.TRange{failedRange}},
+				More:     true,
+			},
+		}, nil
+	}
+	connector.scan = adapter
+	scanner, err := connector.NewBatchScanner(Table{ID: "1", Name: "events"}, ScannerOptions{
+		UseMultiScan: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	scanRange, _ := NewRange([]byte("a"), true, []byte("z"), true)
+	values, err := scanner.Scan(context.Background(), []*Range{scanRange})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(values) != 3 ||
+		adapter.multiStartCalls != 1 ||
+		adapter.multiContinueCalls != 1 ||
+		adapter.multiCloseCalls != 1 ||
+		adapter.startCalls != 1 {
+		t.Fatalf(
+			"values=%+v multi=%d/%d/%d fallback starts=%d",
+			values,
+			adapter.multiStartCalls,
+			adapter.multiContinueCalls,
+			adapter.multiCloseCalls,
+			adapter.startCalls,
+		)
+	}
+	if got := adapter.addresses[0]; got != "moved:9997" {
+		t.Fatalf("fallback address = %q, want moved:9997", got)
+	}
+	if got := string(adapter.startRequests[0].Extent.EndRow); got != "p" {
+		t.Fatalf("fallback extent end = %q, want p", got)
+	}
+}
+
+func TestBatchScannerReturnsMultiScanCleanupErrorWithResults(t *testing.T) {
+	walker := &fakeTabletWalker{tablets: map[string][]metadata.TabletInfo{"1": discoveryTablets()}}
+	connector := testConnectorWithDiscovery(t, walker, &fakeTableNames{
+		byName: map[string]string{"events": "1"},
+		byID:   map[string]string{"1": "events"},
+	})
+	closeErr := errors.New("close multi-scan")
+	adapter := &fakeScannerAdapter{
+		multiStartResults: []*data.InitialMultiScan{{
+			ScanID: 44,
+			Result_: &data.MultiScanResult_{
+				Results: []*data.TKeyValue{testEntry("a", "one")},
+			},
+		}},
+		multiCloseErr: closeErr,
+	}
+	connector.scan = adapter
+	scanner, err := connector.NewBatchScanner(Table{ID: "1", Name: "events"}, ScannerOptions{
+		UseMultiScan: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	scanRange, _ := NewRangeRow([]byte("a"))
+	values, err := scanner.Scan(context.Background(), []*Range{scanRange})
+	var cleanupErr *CleanupError
+	if len(values) != 1 ||
+		!errors.Is(err, closeErr) ||
+		!errors.As(err, &cleanupErr) ||
+		cleanupErr.ScanID != 44 {
+		t.Fatalf("values=%+v error=%v", values, err)
 	}
 }
 

@@ -40,6 +40,9 @@ type ScannerOptions struct {
 	// Parallelism bounds concurrent tablet scans performed by BatchScanner.
 	// Zero uses one worker. Scanner ignores this field.
 	Parallelism int
+	// UseMultiScan groups tablet ranges by server into Accumulo multi-scan
+	// RPCs. Multi-scan result order is server-defined.
+	UseMultiScan bool
 }
 
 // CleanupError reports that scan results are usable but the server-side scan
@@ -185,11 +188,7 @@ func (s *Scanner) scanTablet(ctx context.Context, tablet Tablet, scanRange *Rang
 		batchSize = defaultScannerBatchSize
 	}
 	initial, err := s.connector.scan.Start(ctx, tablet.Server.HostPort, scanclient.StartRequest{
-		Extent: &data.TKeyExtent{
-			Table:      []byte(tablet.Extent.TableID),
-			EndRow:     cloneRow(tablet.Extent.EndRow),
-			PrevEndRow: cloneRow(tablet.Extent.PrevRow),
-		},
+		Extent:             tabletExtentToThrift(tablet),
 		Range:              scanRange.toThrift(),
 		BatchSize:          batchSize,
 		Authorizations:     cloneByteSlices(s.options.Authorizations),
@@ -242,7 +241,11 @@ func appendScanResult(values []KeyValue, result *data.ScanResult_) ([]KeyValue, 
 	if result == nil {
 		return values, nil
 	}
-	for _, entry := range result.Results {
+	return appendKeyValues(values, result.Results)
+}
+
+func appendKeyValues(values []KeyValue, entries []*data.TKeyValue) ([]KeyValue, error) {
+	for _, entry := range entries {
 		if entry == nil || entry.Key == nil {
 			return values, errors.New("accumulo: scan result contains a nil key")
 		}
@@ -258,6 +261,14 @@ func appendScanResult(values []KeyValue, result *data.ScanResult_) ([]KeyValue, 
 		})
 	}
 	return values, nil
+}
+
+func tabletExtentToThrift(tablet Tablet) *data.TKeyExtent {
+	return &data.TKeyExtent{
+		Table:      []byte(tablet.Extent.TableID),
+		EndRow:     cloneRow(tablet.Extent.EndRow),
+		PrevEndRow: cloneRow(tablet.Extent.PrevRow),
+	}
 }
 
 func isStaleScanError(err error) bool {
