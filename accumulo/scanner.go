@@ -33,10 +33,37 @@ type KeyValue struct {
 	Value []byte
 }
 
+// Column selects a column family, optionally restricted to one qualifier.
+type Column struct {
+	family    []byte
+	qualifier []byte
+}
+
+// NewColumnFamily selects every qualifier in family.
+func NewColumnFamily(family []byte) Column {
+	return Column{family: cloneRow(family)}
+}
+
+// NewColumn selects one family and qualifier pair.
+func NewColumn(family, qualifier []byte) Column {
+	return Column{
+		family:    cloneRow(family),
+		qualifier: cloneRow(qualifier),
+	}
+}
+
+// Family returns a defensive copy of the selected column family.
+func (c Column) Family() []byte { return cloneRow(c.family) }
+
+// Qualifier returns a defensive copy of the selected qualifier. A nil
+// qualifier means every qualifier in the family.
+func (c Column) Qualifier() []byte { return cloneRow(c.qualifier) }
+
 // ScannerOptions configures a Scanner.
 type ScannerOptions struct {
 	BatchSize      int32
 	Authorizations [][]byte
+	Columns        []Column
 	// Parallelism bounds concurrent tablet scans performed by BatchScanner.
 	// Zero uses one worker. Scanner ignores this field.
 	Parallelism int
@@ -81,6 +108,7 @@ func (c *Connector) NewScanner(table Table, options ScannerOptions) (*Scanner, e
 		return nil, err
 	}
 	options.Authorizations = cloneByteSlices(options.Authorizations)
+	options.Columns = cloneColumns(options.Columns)
 	return &Scanner{
 		connector: c,
 		table: Table{
@@ -190,6 +218,7 @@ func (s *Scanner) scanTablet(ctx context.Context, tablet Tablet, scanRange *Rang
 	initial, err := s.connector.scan.Start(ctx, tablet.Server.HostPort, scanclient.StartRequest{
 		Extent:             tabletExtentToThrift(tablet),
 		Range:              scanRange.toThrift(),
+		Columns:            columnsToThrift(s.options.Columns),
 		BatchSize:          batchSize,
 		Authorizations:     cloneByteSlices(s.options.Authorizations),
 		ReadaheadThreshold: int64(batchSize),
@@ -288,4 +317,29 @@ func cloneByteSlices(values [][]byte) [][]byte {
 		cloned[i] = cloneRow(values[i])
 	}
 	return cloned
+}
+
+func cloneColumns(columns []Column) []Column {
+	if columns == nil {
+		return nil
+	}
+	cloned := make([]Column, len(columns))
+	for i, column := range columns {
+		cloned[i] = NewColumn(column.family, column.qualifier)
+	}
+	return cloned
+}
+
+func columnsToThrift(columns []Column) []*data.TColumn {
+	if len(columns) == 0 {
+		return nil
+	}
+	wire := make([]*data.TColumn, len(columns))
+	for i, column := range columns {
+		wire[i] = &data.TColumn{
+			ColumnFamily:    cloneRow(column.family),
+			ColumnQualifier: cloneRow(column.qualifier),
+		}
+	}
+	return wire
 }

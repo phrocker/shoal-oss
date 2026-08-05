@@ -236,13 +236,24 @@ func TestScannerContinuationAndCleanup(t *testing.T) {
 		}},
 	}
 	connector.scan = adapter
+	family := []byte("content")
+	qualifier := []byte("body")
+	columns := []Column{
+		NewColumnFamily(family),
+		NewColumn(family, qualifier),
+	}
 	scanner, err := connector.NewScanner(Table{Name: "events"}, ScannerOptions{
 		BatchSize:      2,
 		Authorizations: [][]byte{[]byte("public")},
+		Columns:        columns,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
+	family[0] = 'X'
+	qualifier[0] = 'X'
+	columns[0].family[0] = 'X'
+	columns[1].qualifier[0] = 'X'
 	scanRange, _ := NewRange([]byte("a"), true, []byte("k"), true)
 	values, err := scanner.Scan(context.Background(), scanRange)
 	if err != nil {
@@ -258,6 +269,7 @@ func TestScannerContinuationAndCleanup(t *testing.T) {
 	if req.BatchSize != 2 || len(req.Authorizations) != 1 || string(req.Extent.Table) != "1" {
 		t.Fatalf("start request = %+v", req)
 	}
+	assertColumns(t, req.Columns, "content", "body")
 	values[0].Key.Row[0] = 'z'
 	if string(adapter.startResults[0].Result_.Results[0].Key.Row) != "a" {
 		t.Fatal("public key mutation leaked into wire result")
@@ -742,6 +754,10 @@ func TestBatchScannerContinuesMultiScanAndFallsBackFailures(t *testing.T) {
 	connector.scan = adapter
 	scanner, err := connector.NewBatchScanner(Table{ID: "1", Name: "events"}, ScannerOptions{
 		UseMultiScan: true,
+		Columns: []Column{
+			NewColumnFamily([]byte("content")),
+			NewColumn([]byte("meta"), []byte("type")),
+		},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -771,6 +787,8 @@ func TestBatchScannerContinuesMultiScanAndFallsBackFailures(t *testing.T) {
 	if got := string(adapter.startRequests[0].Extent.EndRow); got != "p" {
 		t.Fatalf("fallback extent end = %q, want p", got)
 	}
+	assertColumns(t, adapter.multiRequests[0].Columns, "meta", "type")
+	assertColumns(t, adapter.startRequests[0].Columns, "meta", "type")
 }
 
 func TestBatchScannerReturnsMultiScanCleanupErrorWithResults(t *testing.T) {
@@ -852,5 +870,16 @@ func testEntry(row, value string) *data.TKeyValue {
 			Timestamp:    17,
 		},
 		Value: []byte(value),
+	}
+}
+
+func assertColumns(t *testing.T, columns []*data.TColumn, exactFamily, exactQualifier string) {
+	t.Helper()
+	if len(columns) != 2 ||
+		string(columns[0].ColumnFamily) != "content" ||
+		columns[0].ColumnQualifier != nil ||
+		string(columns[1].ColumnFamily) != exactFamily ||
+		string(columns[1].ColumnQualifier) != exactQualifier {
+		t.Fatalf("columns = %+v", columns)
 	}
 }

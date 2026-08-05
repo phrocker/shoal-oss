@@ -255,6 +255,7 @@ func (s *Scanner) scanMultiGroup(
 ) ([]KeyValue, error) {
 	initial, err := multi.StartMulti(ctx, group.address, scanclient.MultiStartRequest{
 		Batch:          group.batch,
+		Columns:        columnsToThrift(s.options.Columns),
 		Authorizations: cloneByteSlices(s.options.Authorizations),
 	})
 	if initial == nil && err != nil {
