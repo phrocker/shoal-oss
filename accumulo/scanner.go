@@ -125,11 +125,12 @@ func (s *Scanner) Scan(ctx context.Context, scanRange *Range) ([]KeyValue, error
 			return values, errors.Join(priorCleanup, scanErr)
 		}
 		var cleanupErr *CleanupError
-		if errors.As(scanErr, &cleanupErr) {
-			priorCleanup = errors.Join(priorCleanup, cleanupErr)
-		}
+		errors.As(scanErr, &cleanupErr)
 		if invalidateErr := s.connector.InvalidateTablet(table, routingRow); invalidateErr != nil {
 			return values, errors.Join(priorCleanup, scanErr, invalidateErr)
+		}
+		if cleanupErr != nil {
+			priorCleanup = errors.Join(priorCleanup, cleanupErr)
 		}
 	}
 	return nil, priorCleanup

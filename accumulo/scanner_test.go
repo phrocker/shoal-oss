@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 
@@ -196,6 +197,39 @@ func TestScannerRetriesNotServingAssignmentOnce(t *testing.T) {
 	}
 	if got := adapter.addresses; len(got) != 2 || got[0] != "old:9997" || got[1] != "new:9997" {
 		t.Fatalf("addresses = %v", got)
+	}
+}
+
+func TestScannerDoesNotDuplicateCleanupErrorWhenInvalidationFails(t *testing.T) {
+	walker := &fakeTabletWalker{tablets: map[string][]metadata.TabletInfo{"1": discoveryTablets()}}
+	connector := testConnectorWithDiscovery(t, walker, &fakeTableNames{
+		byName: map[string]string{"events": "1"},
+		byID:   map[string]string{"1": "events"},
+	})
+	closeErr := errors.New("close failed")
+	adapter := &fakeScannerAdapter{
+		startResults: []*data.InitialScan{{
+			ScanID:  12,
+			Result_: &data.ScanResult_{Results: []*data.TKeyValue{testEntry("a", "ok")}},
+		}},
+		startErrors: []error{tabletserver.NewNotServingTabletException()},
+		closeErr:    closeErr,
+	}
+	adapter.onFirstStart = func() {
+		connector.discovery = nil
+	}
+	connector.scan = adapter
+	scanner, err := connector.NewScanner(Table{ID: "1", Name: "events"}, ScannerOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	scanRange, _ := NewRangeRow([]byte("a"))
+	values, err := scanner.Scan(context.Background(), scanRange)
+	if len(values) != 1 || !errors.Is(err, closeErr) || !errors.Is(err, ErrDiscoveryUnavailable) {
+		t.Fatalf("values=%+v error=%v", values, err)
+	}
+	if got := strings.Count(err.Error(), closeErr.Error()); got != 1 {
+		t.Fatalf("cleanup error occurrences = %d, want 1: %v", got, err)
 	}
 }
 
