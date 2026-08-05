@@ -242,10 +242,22 @@ func TestScannerContinuationAndCleanup(t *testing.T) {
 		NewColumnFamily(family),
 		NewColumn(family, qualifier),
 	}
+	iteratorOptions := map[string]string{"maxVersions": "3"}
+	iterator, err := NewIteratorSetting(
+		"versioning",
+		"org.apache.accumulo.core.iterators.user.VersioningIterator",
+		20,
+		iteratorOptions,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	iterators := []IteratorSetting{iterator}
 	scanner, err := connector.NewScanner(Table{Name: "events"}, ScannerOptions{
 		BatchSize:      2,
 		Authorizations: [][]byte{[]byte("public")},
 		Columns:        columns,
+		Iterators:      iterators,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -254,6 +266,8 @@ func TestScannerContinuationAndCleanup(t *testing.T) {
 	qualifier[0] = 'X'
 	columns[0].family[0] = 'X'
 	columns[1].qualifier[0] = 'X'
+	iteratorOptions["maxVersions"] = "99"
+	iterators[0].options["maxVersions"] = "100"
 	scanRange, _ := NewRange([]byte("a"), true, []byte("k"), true)
 	values, err := scanner.Scan(context.Background(), scanRange)
 	if err != nil {
@@ -270,6 +284,7 @@ func TestScannerContinuationAndCleanup(t *testing.T) {
 		t.Fatalf("start request = %+v", req)
 	}
 	assertColumns(t, req.Columns, "content", "body")
+	assertIterators(t, req.Iterators, req.IteratorOptions)
 	values[0].Key.Row[0] = 'z'
 	if string(adapter.startResults[0].Result_.Results[0].Key.Row) != "a" {
 		t.Fatal("public key mutation leaked into wire result")
@@ -752,12 +767,22 @@ func TestBatchScannerContinuesMultiScanAndFallsBackFailures(t *testing.T) {
 		}, nil
 	}
 	connector.scan = adapter
+	iterator, err := NewIteratorSetting(
+		"ageoff",
+		"org.apache.accumulo.core.iterators.user.AgeOffFilter",
+		30,
+		map[string]string{"ttl": "60000"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
 	scanner, err := connector.NewBatchScanner(Table{ID: "1", Name: "events"}, ScannerOptions{
 		UseMultiScan: true,
 		Columns: []Column{
 			NewColumnFamily([]byte("content")),
 			NewColumn([]byte("meta"), []byte("type")),
 		},
+		Iterators: []IteratorSetting{iterator},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -789,6 +814,8 @@ func TestBatchScannerContinuesMultiScanAndFallsBackFailures(t *testing.T) {
 	}
 	assertColumns(t, adapter.multiRequests[0].Columns, "meta", "type")
 	assertColumns(t, adapter.startRequests[0].Columns, "meta", "type")
+	assertIterators(t, adapter.multiRequests[0].Iterators, adapter.multiRequests[0].IteratorOptions)
+	assertIterators(t, adapter.startRequests[0].Iterators, adapter.startRequests[0].IteratorOptions)
 }
 
 func TestBatchScannerReturnsMultiScanCleanupErrorWithResults(t *testing.T) {
@@ -849,6 +876,30 @@ func TestBatchScannerValidatesRanges(t *testing.T) {
 	); err == nil {
 		t.Fatal("negative parallelism should fail")
 	}
+	if _, err := NewIteratorSetting("", "example.Iterator", 10, nil); err == nil {
+		t.Fatal("empty iterator name should fail")
+	}
+	if _, err := NewIteratorSetting("example", "", 10, nil); err == nil {
+		t.Fatal("empty iterator class should fail")
+	}
+	if _, err := NewIteratorSetting("example", "example.Iterator", -1, nil); err == nil {
+		t.Fatal("negative iterator priority should fail")
+	}
+	first, _ := NewIteratorSetting("first", "example.First", 10, nil)
+	second, _ := NewIteratorSetting("second", "example.Second", 10, nil)
+	if _, err := connector.NewScanner(
+		Table{ID: "1", Name: "events"},
+		ScannerOptions{Iterators: []IteratorSetting{first, second}},
+	); err == nil {
+		t.Fatal("duplicate iterator priority should fail")
+	}
+	second, _ = NewIteratorSetting("first", "example.Second", 20, nil)
+	if _, err := connector.NewScanner(
+		Table{ID: "1", Name: "events"},
+		ScannerOptions{Iterators: []IteratorSetting{first, second}},
+	); err == nil {
+		t.Fatal("duplicate iterator name should fail")
+	}
 }
 
 func assertWireRange(t *testing.T, scanRange *data.TRange, start []byte, startInclusive bool, stop []byte) {
@@ -881,5 +932,33 @@ func assertColumns(t *testing.T, columns []*data.TColumn, exactFamily, exactQual
 		string(columns[1].ColumnFamily) != exactFamily ||
 		string(columns[1].ColumnQualifier) != exactQualifier {
 		t.Fatalf("columns = %+v", columns)
+	}
+}
+
+func assertIterators(
+	t *testing.T,
+	iterators []*data.IterInfo,
+	options map[string]map[string]string,
+) {
+	t.Helper()
+	if len(iterators) != 1 {
+		t.Fatalf("iterators = %+v", iterators)
+	}
+	iterator := iterators[0]
+	switch iterator.IterName {
+	case "versioning":
+		if iterator.Priority != 20 ||
+			iterator.ClassName != "org.apache.accumulo.core.iterators.user.VersioningIterator" ||
+			options["versioning"]["maxVersions"] != "3" {
+			t.Fatalf("iterator/options = %+v/%+v", iterator, options)
+		}
+	case "ageoff":
+		if iterator.Priority != 30 ||
+			iterator.ClassName != "org.apache.accumulo.core.iterators.user.AgeOffFilter" ||
+			options["ageoff"]["ttl"] != "60000" {
+			t.Fatalf("iterator/options = %+v/%+v", iterator, options)
+		}
+	default:
+		t.Fatalf("iterator/options = %+v/%+v", iterator, options)
 	}
 }

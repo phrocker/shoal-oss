@@ -71,11 +71,25 @@ func TestPublicScannerAPICompiles(t *testing.T) {
 	exactColumn := accumulo.NewColumn([]byte("meta"), []byte("type"))
 	_ = familyColumn.Family()
 	_ = familyColumn.Qualifier()
+	iterator, err := accumulo.NewIteratorSetting(
+		"versioning",
+		"org.apache.accumulo.core.iterators.user.VersioningIterator",
+		20,
+		map[string]string{"maxVersions": "3"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = iterator.Name()
+	_ = iterator.ClassName()
+	_ = iterator.Priority()
+	_ = iterator.Options()
 
 	_, err = connector.NewScanner(accumulo.Table{Name: "events"}, accumulo.ScannerOptions{
 		BatchSize:      128,
 		Authorizations: [][]byte{[]byte("public")},
 		Columns:        []accumulo.Column{familyColumn, exactColumn},
+		Iterators:      []accumulo.IteratorSetting{iterator},
 		Parallelism:    4,
 		UseMultiScan:   true,
 	})
