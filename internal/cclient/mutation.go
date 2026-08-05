@@ -1,22 +1,22 @@
 package cclient
 
 import (
+	"bytes"
 	"errors"
+	"fmt"
+	"math"
 
 	"github.com/phrocker/shoal/internal/rfile/wire"
+	"github.com/phrocker/shoal/internal/thrift/gen/data"
 )
 
-// MutationLatestTimestamp is the sentinel value Accumulo uses for "use the
-// server-side current time" — matches Java's `Long.MAX_VALUE` and
-// sharkbite's `9223372036854775807L` (Mutation.h:54).
+const mutationValueCopyCutoff = 1 << 15
+
+// MutationLatestTimestamp is the Go model's sentinel for omitting a timestamp
+// from the serialized mutation so the tablet server assigns one.
 const MutationLatestTimestamp int64 = 9223372036854775807
 
-// MutationEntry is one Put or Delete in a mutation. Serialization to the
-// Accumulo on-wire mutation format (see TMutation.Data in
-// internal/thrift/gen/data) is intentionally NOT implemented here — that
-// belongs in a follow-on once the read fleet has a write path.
-//
-// Reference: sharkbite include/data/constructs/Mutation.h:38-86.
+// MutationEntry is one Put or Delete in a mutation.
 type MutationEntry struct {
 	ColFamily     []byte
 	ColQualifier  []byte
@@ -26,18 +26,13 @@ type MutationEntry struct {
 	Deleted       bool
 }
 
-// Mutation is a row + ordered list of column entries. Mirrors the
-// sharkbite class shape (Mutation.h:41-86). The `Data []byte` payload that
-// `TMutation.Data` carries on the wire is computed by `Serialize()` —
-// currently a TODO.
+// Mutation is a row plus an ordered list of column updates.
 type Mutation struct {
 	row     []byte
 	entries []MutationEntry
 }
 
-// NewMutation allocates a Mutation for the given row. row must be
-// non-empty (Mutation.h:47 — sharkbite takes a const std::string& row but
-// Accumulo rejects empty rows server-side).
+// NewMutation allocates a Mutation for the given non-empty row.
 func NewMutation(row []byte) (*Mutation, error) {
 	if len(row) == 0 {
 		return nil, errors.New("cclient: Mutation row must be non-empty")
@@ -53,17 +48,14 @@ func (m *Mutation) Row() []byte { return m.row }
 // Entries returns the ordered list of column entries.
 func (m *Mutation) Entries() []MutationEntry { return m.entries }
 
-// Put appends a Put entry. cv may be nil (default visibility). Pass
-// MutationLatestTimestamp for "let the server stamp it".
-//
-// Reference: Mutation.h:57-70 (the put overloads).
+// Put appends a Put entry. Inputs are defensively copied.
 func (m *Mutation) Put(cf, cq, cv []byte, timestamp int64, value []byte) {
 	m.entries = append(m.entries, MutationEntry{
-		ColFamily:     cf,
-		ColQualifier:  cq,
-		ColVisibility: cv,
+		ColFamily:     cloneBytes(cf),
+		ColQualifier:  cloneBytes(cq),
+		ColVisibility: cloneBytes(cv),
 		Timestamp:     timestamp,
-		Value:         value,
+		Value:         cloneBytes(value),
 		Deleted:       false,
 	})
 }
@@ -73,13 +65,12 @@ func (m *Mutation) PutLatest(cf, cq, cv, value []byte) {
 	m.Put(cf, cq, cv, MutationLatestTimestamp, value)
 }
 
-// Delete appends a Delete entry. A delete is a tombstone — value is
-// always empty for deletes (Mutation.h:49-55).
+// Delete appends a tombstone entry. Inputs are defensively copied.
 func (m *Mutation) Delete(cf, cq, cv []byte, timestamp int64) {
 	m.entries = append(m.entries, MutationEntry{
-		ColFamily:     cf,
-		ColQualifier:  cq,
-		ColVisibility: cv,
+		ColFamily:     cloneBytes(cf),
+		ColQualifier:  cloneBytes(cq),
+		ColVisibility: cloneBytes(cv),
 		Timestamp:     timestamp,
 		Value:         nil,
 		Deleted:       true,
@@ -137,14 +128,101 @@ func (m *Mutation) Cells() []Cell {
 	return cells
 }
 
-// Serialize encodes the mutation into the Accumulo on-wire format and
-// returns the bytes ready to populate TMutation.Data. NOT YET IMPLEMENTED
-// — the read fleet has no write path in V0. Tracking this as a TODO so
-// the type surface is stable when the writer arrives.
-//
-// The format is documented in:
-//   - sharkbite src/data/constructs/Mutation.cpp (the byte layout)
-//   - Java org.apache.accumulo.core.data.Mutation#serialize
+// Serialize encodes the column-update stream stored in TMutation.Data.
 func (m *Mutation) Serialize() ([]byte, error) {
-	return nil, errors.New("cclient: Mutation.Serialize not yet implemented (write path is post-V0)")
+	serialized, err := m.serialize()
+	if err != nil {
+		return nil, err
+	}
+	return serialized.data, nil
+}
+
+// ToThrift converts the mutation to the internal Accumulo 4 wire type.
+func (m *Mutation) ToThrift() (*data.TMutation, error) {
+	serialized, err := m.serialize()
+	if err != nil {
+		return nil, err
+	}
+	return &data.TMutation{
+		Row:     cloneBytes(m.row),
+		Data:    serialized.data,
+		Values:  serialized.values,
+		Entries: int32(len(m.entries)),
+	}, nil
+}
+
+type serializedMutation struct {
+	data   []byte
+	values [][]byte
+}
+
+func (m *Mutation) serialize() (serializedMutation, error) {
+	if m == nil {
+		return serializedMutation{}, errors.New("cclient: nil Mutation")
+	}
+	if len(m.row) == 0 {
+		return serializedMutation{}, errors.New("cclient: Mutation row must be non-empty")
+	}
+	if len(m.entries) > math.MaxInt32 {
+		return serializedMutation{}, errors.New("cclient: Mutation has too many entries")
+	}
+
+	var encoded bytes.Buffer
+	var values [][]byte
+	for index := range m.entries {
+		entry := &m.entries[index]
+		if err := writeMutationBytes(&encoded, entry.ColFamily); err != nil {
+			return serializedMutation{}, fmt.Errorf("cclient: encode column family: %w", err)
+		}
+		if err := writeMutationBytes(&encoded, entry.ColQualifier); err != nil {
+			return serializedMutation{}, fmt.Errorf("cclient: encode column qualifier: %w", err)
+		}
+		if err := writeMutationBytes(&encoded, entry.ColVisibility); err != nil {
+			return serializedMutation{}, fmt.Errorf("cclient: encode column visibility: %w", err)
+		}
+
+		hasTimestamp := entry.Timestamp != MutationLatestTimestamp
+		if err := encoded.WriteByte(boolByte(hasTimestamp)); err != nil {
+			return serializedMutation{}, err
+		}
+		if hasTimestamp {
+			if _, err := wire.WriteVLong(&encoded, entry.Timestamp); err != nil {
+				return serializedMutation{}, fmt.Errorf("cclient: encode timestamp: %w", err)
+			}
+		}
+		if err := encoded.WriteByte(boolByte(entry.Deleted)); err != nil {
+			return serializedMutation{}, err
+		}
+
+		if len(entry.Value) < mutationValueCopyCutoff {
+			if err := writeMutationBytes(&encoded, entry.Value); err != nil {
+				return serializedMutation{}, fmt.Errorf("cclient: encode value: %w", err)
+			}
+			continue
+		}
+		values = append(values, cloneBytes(entry.Value))
+		if _, err := wire.WriteVLong(&encoded, -int64(len(values))); err != nil {
+			return serializedMutation{}, fmt.Errorf("cclient: encode large value reference: %w", err)
+		}
+	}
+	return serializedMutation{data: encoded.Bytes(), values: values}, nil
+}
+
+func writeMutationBytes(buffer *bytes.Buffer, value []byte) error {
+	if _, err := wire.WriteVLong(buffer, int64(len(value))); err != nil {
+		return err
+	}
+	_, err := buffer.Write(value)
+	return err
+}
+
+func boolByte(value bool) byte {
+	if value {
+		return 1
+	}
+	return 0
+}
+
+func cloneBytes(value []byte) []byte {
+	return append([]byte(nil), value...)
 }

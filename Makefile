@@ -25,10 +25,11 @@ THRIFT_IDL            := internal/thrift/idl
 THRIFT_OUT            := internal/thrift/gen
 THRIFT_PACKAGE_PREFIX := github.com/phrocker/shoal/internal/thrift/gen/
 
-# Generate the two top-level services shoal uses. The compiler's recursive
+# Generate the top-level services shoal uses. The compiler's recursive
 # mode follows their vendored includes and emits the shared data packages.
 THRIFT_FILES := \
 	$(THRIFT_IDL)/tabletscan.thrift \
+	$(THRIFT_IDL)/tabletingest.thrift \
 	$(THRIFT_IDL)/compaction-coordinator.thrift
 
 .PHONY: all

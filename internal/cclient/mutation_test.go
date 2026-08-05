@@ -56,16 +56,74 @@ func TestMutation_PutAndDelete(t *testing.T) {
 }
 
 func TestMutation_LatestTimestampIsLongMax(t *testing.T) {
-	// Mutation.h:54 — sharkbite's `9223372036854775807L`. Java uses Long.MAX_VALUE.
 	if MutationLatestTimestamp != 9223372036854775807 {
 		t.Errorf("MutationLatestTimestamp = %d, want 9223372036854775807", MutationLatestTimestamp)
 	}
 }
 
-func TestMutation_SerializeNotImplemented(t *testing.T) {
+func TestMutation_SerializeAccumulo4Encoding(t *testing.T) {
 	m, _ := NewMutation([]byte("row"))
 	m.PutLatest([]byte("cf"), []byte("cq"), nil, []byte("v"))
-	if _, err := m.Serialize(); err == nil {
-		t.Error("Serialize should error until write path lands")
+	m.Put([]byte("f"), []byte("q"), []byte("A"), 128, []byte("value"))
+	m.DeleteLatest([]byte("d"), []byte("x"), nil)
+
+	got, err := m.Serialize()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []byte{
+		0x02, 'c', 'f', 0x02, 'c', 'q', 0x00, 0x00, 0x00, 0x01, 'v',
+		0x01, 'f', 0x01, 'q', 0x01, 'A', 0x01, 0x8f, 0x80, 0x00, 0x05, 'v', 'a', 'l', 'u', 'e',
+		0x01, 'd', 0x01, 'x', 0x00, 0x00, 0x01, 0x00,
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("Serialize() = %x, want %x", got, want)
+	}
+}
+
+func TestMutation_ToThriftSeparatesLargeValues(t *testing.T) {
+	m, _ := NewMutation([]byte("row"))
+	large := bytes.Repeat([]byte{0xab}, mutationValueCopyCutoff)
+	m.PutLatest([]byte("cf"), []byte("cq"), nil, large)
+
+	wireMutation, err := m.ToThrift()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(wireMutation.Row, []byte("row")) {
+		t.Fatalf("Row = %q", wireMutation.Row)
+	}
+	if wireMutation.Entries != 1 {
+		t.Fatalf("Entries = %d, want 1", wireMutation.Entries)
+	}
+	wantData := []byte{0x02, 'c', 'f', 0x02, 'c', 'q', 0x00, 0x00, 0x00, 0xff}
+	if !bytes.Equal(wireMutation.Data, wantData) {
+		t.Fatalf("Data = %x, want %x", wireMutation.Data, wantData)
+	}
+	if len(wireMutation.Values) != 1 || !bytes.Equal(wireMutation.Values[0], large) {
+		t.Fatalf("Values did not contain the large value")
+	}
+
+	large[0] = 0
+	if wireMutation.Values[0][0] != 0xab {
+		t.Fatal("large value was not defensively copied")
+	}
+}
+
+func TestMutation_PutDefensivelyCopiesInputs(t *testing.T) {
+	cf := []byte("cf")
+	cq := []byte("cq")
+	cv := []byte("cv")
+	value := []byte("value")
+	m, _ := NewMutation([]byte("row"))
+	m.PutLatest(cf, cq, cv, value)
+
+	cf[0], cq[0], cv[0], value[0] = 'x', 'x', 'x', 'x'
+	entry := m.Entries()[0]
+	if string(entry.ColFamily) != "cf" ||
+		string(entry.ColQualifier) != "cq" ||
+		string(entry.ColVisibility) != "cv" ||
+		string(entry.Value) != "value" {
+		t.Fatalf("entry changed through caller-owned input: %+v", entry)
 	}
 }
