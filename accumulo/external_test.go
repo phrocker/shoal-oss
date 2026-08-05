@@ -69,6 +69,7 @@ func TestPublicScannerAPICompiles(t *testing.T) {
 	_, err = connector.NewScanner(accumulo.Table{Name: "events"}, accumulo.ScannerOptions{
 		BatchSize:      128,
 		Authorizations: [][]byte{[]byte("public")},
+		Parallelism:    4,
 	})
 	if !errors.Is(err, accumulo.ErrDiscoveryUnavailable) {
 		t.Fatalf("error = %v, want ErrDiscoveryUnavailable", err)

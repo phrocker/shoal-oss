@@ -37,6 +37,9 @@ type KeyValue struct {
 type ScannerOptions struct {
 	BatchSize      int32
 	Authorizations [][]byte
+	// Parallelism bounds concurrent tablet scans performed by BatchScanner.
+	// Zero uses one worker. Scanner ignores this field.
+	Parallelism int
 }
 
 // CleanupError reports that scan results are usable but the server-side scan
@@ -67,6 +70,9 @@ func (c *Connector) NewScanner(table Table, options ScannerOptions) (*Scanner, e
 	}
 	if options.BatchSize < 0 {
 		return nil, errors.New("accumulo: scanner batch size must not be negative")
+	}
+	if options.Parallelism < 0 {
+		return nil, errors.New("accumulo: scanner parallelism must not be negative")
 	}
 	if _, err := c.discoveryState(); err != nil {
 		return nil, err

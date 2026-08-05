@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/phrocker/shoal/internal/metadata"
 	"github.com/phrocker/shoal/internal/scanclient"
@@ -31,6 +32,11 @@ type fakeScannerAdapter struct {
 	closeCalls    int
 	onFirstStart  func()
 	closeContext  error
+	startFunc     func(string, scanclient.StartRequest) (*data.InitialScan, error)
+	startEntered  chan<- struct{}
+	startRelease  <-chan struct{}
+	activeStarts  int
+	maxStarts     int
 }
 
 func (f *fakeScannerAdapter) Start(
@@ -39,14 +45,14 @@ func (f *fakeScannerAdapter) Start(
 	req scanclient.StartRequest,
 ) (*data.InitialScan, error) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.addresses = append(f.addresses, address)
 	f.startRequests = append(f.startRequests, req)
 	index := f.startCalls
 	f.startCalls++
-	if index == 0 && f.onFirstStart != nil {
-		f.onFirstStart()
-	}
+	onFirstStart := f.onFirstStart
+	startFunc := f.startFunc
+	startEntered := f.startEntered
+	startRelease := f.startRelease
 	var result *data.InitialScan
 	if index < len(f.startResults) {
 		result = f.startResults[index]
@@ -54,6 +60,29 @@ func (f *fakeScannerAdapter) Start(
 	var err error
 	if index < len(f.startErrors) {
 		err = f.startErrors[index]
+	}
+	f.activeStarts++
+	if f.activeStarts > f.maxStarts {
+		f.maxStarts = f.activeStarts
+	}
+	f.mu.Unlock()
+	defer func() {
+		f.mu.Lock()
+		f.activeStarts--
+		f.mu.Unlock()
+	}()
+
+	if index == 0 && onFirstStart != nil {
+		onFirstStart()
+	}
+	if startEntered != nil {
+		startEntered <- struct{}{}
+	}
+	if startRelease != nil {
+		<-startRelease
+	}
+	if startFunc != nil {
+		return startFunc(address, req)
 	}
 	return result, err
 }
@@ -432,6 +461,79 @@ func TestBatchScannerSupportsUnboundedAndMultipleRanges(t *testing.T) {
 	}
 }
 
+func TestBatchScannerBoundsParallelismAndPreservesOrder(t *testing.T) {
+	walker := &fakeTabletWalker{tablets: map[string][]metadata.TabletInfo{"1": discoveryTablets()}}
+	connector := testConnectorWithDiscovery(t, walker, &fakeTableNames{
+		byName: map[string]string{"events": "1"},
+		byID:   map[string]string{"1": "events"},
+	})
+	entered := make(chan struct{}, 3)
+	release := make(chan struct{})
+	adapter := &fakeScannerAdapter{
+		startEntered: entered,
+		startRelease: release,
+		startFunc: func(address string, _ scanclient.StartRequest) (*data.InitialScan, error) {
+			rows := map[string]string{
+				"ts1:9997": "a",
+				"ts2:9997": "m",
+				"ts3:9997": "z",
+			}
+			return &data.InitialScan{
+				ScanID:  31,
+				Result_: &data.ScanResult_{Results: []*data.TKeyValue{testEntry(rows[address], address)}},
+			}, nil
+		},
+	}
+	connector.scan = adapter
+	scanner, err := connector.NewBatchScanner(Table{ID: "1", Name: "events"}, ScannerOptions{
+		Parallelism: 2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	scanRange, _ := NewRange([]byte("a"), true, []byte("z"), true)
+	type scanResult struct {
+		values []KeyValue
+		err    error
+	}
+	done := make(chan scanResult, 1)
+	go func() {
+		values, err := scanner.Scan(context.Background(), []*Range{scanRange})
+		done <- scanResult{values: values, err: err}
+	}()
+
+	for range 2 {
+		select {
+		case <-entered:
+		case <-time.After(time.Second):
+			t.Fatal("two tablet scans did not start concurrently")
+		}
+	}
+	close(release)
+
+	var result scanResult
+	select {
+	case result = <-done:
+	case <-time.After(time.Second):
+		t.Fatal("batch scan did not complete")
+	}
+	if result.err != nil {
+		t.Fatal(result.err)
+	}
+	if len(result.values) != 3 ||
+		string(result.values[0].Key.Row) != "a" ||
+		string(result.values[1].Key.Row) != "m" ||
+		string(result.values[2].Key.Row) != "z" {
+		t.Fatalf("values = %+v", result.values)
+	}
+	adapter.mu.Lock()
+	maxStarts := adapter.maxStarts
+	adapter.mu.Unlock()
+	if maxStarts != 2 {
+		t.Fatalf("maximum concurrent starts = %d, want 2", maxStarts)
+	}
+}
+
 func TestBatchScannerValidatesRanges(t *testing.T) {
 	walker := &fakeTabletWalker{tablets: map[string][]metadata.TabletInfo{"1": discoveryTablets()}}
 	connector := testConnectorWithDiscovery(t, walker, &fakeTableNames{
@@ -449,6 +551,12 @@ func TestBatchScannerValidatesRanges(t *testing.T) {
 	oneRow, _ := NewRangeRow([]byte("a"))
 	if _, err := scanner.Scan(context.Background(), []*Range{oneRow, nil}); err == nil {
 		t.Fatal("nil range should fail")
+	}
+	if _, err := connector.NewBatchScanner(
+		Table{ID: "1", Name: "events"},
+		ScannerOptions{Parallelism: -1},
+	); err == nil {
+		t.Fatal("negative parallelism should fail")
 	}
 }
 
