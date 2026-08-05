@@ -40,6 +40,7 @@ type Tablet struct {
 type tableNameResolver interface {
 	ResolveID(context.Context, string) (string, error)
 	ResolveName(context.Context, string) (string, error)
+	List(context.Context) (map[string]string, error)
 	Invalidate()
 }
 

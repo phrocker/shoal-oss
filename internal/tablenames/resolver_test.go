@@ -48,6 +48,21 @@ func TestResolverNamesAndNamespaces(t *testing.T) {
 	if err != nil || name != "analytics.events" {
 		t.Fatalf("ResolveName(2) = %q, %v", name, err)
 	}
+	tables, err := resolver.List(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tables) != 2 || tables["events"] != "1" || tables["analytics.events"] != "2" {
+		t.Fatalf("List() = %#v", tables)
+	}
+	tables["events"] = "mutated"
+	again, err := resolver.List(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again["events"] != "1" {
+		t.Fatalf("List() returned mutable cache state: %#v", again)
+	}
 	if _, err := resolver.ResolveName(context.Background(), "missing"); !errors.Is(err, ErrTableNotFound) {
 		t.Fatalf("ResolveName(missing) error = %v, want ErrTableNotFound", err)
 	}
@@ -73,6 +88,18 @@ func TestResolverNamesAndNamespaces(t *testing.T) {
 	if got := locator.reads[namespaces]; got != 2 {
 		t.Fatalf("namespace map reads = %d, want 2 after invalidation", got)
 	}
+
+	locator.mu.Lock()
+	locator.data[defaultTables] = []byte(`{"1":"events","3":"metrics"}`)
+	locator.mu.Unlock()
+	resolver.Invalidate()
+	tables, err = resolver.List(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tables["metrics"] != "3" {
+		t.Fatalf("List() after invalidation = %#v, want metrics table", tables)
+	}
 }
 
 func TestResolverErrorsAndCancellation(t *testing.T) {
@@ -91,5 +118,8 @@ func TestResolverErrorsAndCancellation(t *testing.T) {
 	cancel()
 	if _, err := resolver.ResolveName(ctx, "1"); !errors.Is(err, context.Canceled) {
 		t.Fatalf("ResolveName error = %v, want context.Canceled", err)
+	}
+	if _, err := resolver.List(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("List error = %v, want context.Canceled", err)
 	}
 }
