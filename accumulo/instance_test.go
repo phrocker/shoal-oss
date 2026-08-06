@@ -126,6 +126,7 @@ func (l *fakeLocator) InstancePath() string { return "/accumulo/" + l.id }
 func (l *fakeLocator) GetRaw(context.Context, string) ([]byte, error) {
 	return nil, nil
 }
+func (l *fakeLocator) Children(context.Context, string) ([]string, error) { return nil, nil }
 
 type channelLocator struct {
 	id     string
@@ -141,3 +142,4 @@ func (l *channelLocator) InstancePath() string { return "/accumulo/" + l.id }
 func (l *channelLocator) GetRaw(context.Context, string) ([]byte, error) {
 	return nil, nil
 }
+func (l *channelLocator) Children(context.Context, string) ([]string, error) { return nil, nil }

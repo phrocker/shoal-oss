@@ -1,0 +1,328 @@
+package managerclient
+
+import (
+	"context"
+	"errors"
+	"io"
+	"sync"
+	"sync/atomic"
+	"testing"
+
+	"github.com/apache/thrift/lib/go/thrift"
+
+	clientgen "github.com/phrocker/shoal/internal/thrift/gen/client"
+	"github.com/phrocker/shoal/internal/thrift/gen/security"
+	"github.com/phrocker/shoal/internal/transportpool"
+)
+
+func TestPooledExecuteLifecycleAndReuse(t *testing.T) {
+	pooled, pool := newTestPooled(t)
+	defer pool.Close()
+
+	var dials atomic.Int32
+	rpc := &fakeFateRPC{id: fateID{Type: 1, UUID: "abc"}}
+	pooled.dial = func(_ context.Context, key transportpool.Key) (io.Closer, error) {
+		dials.Add(1)
+		want := transportpool.Key{
+			Address:         "manager:9997",
+			Service:         "fate",
+			InstanceID:      "uuid-1",
+			ProtocolVersion: "4.0.0-SNAPSHOT",
+		}
+		if key != want {
+			t.Fatalf("key = %+v, want %+v", key, want)
+		}
+		return &fakeTransport{rpc: rpc}, nil
+	}
+	pooled.newClient = clientFromFakeTransport
+
+	for range 2 {
+		if err := pooled.Execute(context.Background(), "manager:9997", createRequest("events")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if dials.Load() != 1 {
+		t.Fatalf("dials = %d, want 1", dials.Load())
+	}
+	if rpc.begin.Load() != 2 || rpc.execute.Load() != 2 || rpc.waitCalls.Load() != 2 || rpc.finish.Load() != 2 {
+		t.Fatalf("calls begin/execute/wait/finish = %d/%d/%d/%d",
+			rpc.begin.Load(), rpc.execute.Load(), rpc.waitCalls.Load(), rpc.finish.Load())
+	}
+	if got := string(rpc.request.Arguments[0]); got != "events" {
+		t.Fatalf("table argument = %q", got)
+	}
+	if rpc.instance != FateUser {
+		t.Fatalf("FATE instance = %v, want user", rpc.instance)
+	}
+}
+
+func TestPooledFinishesAfterOperationFailure(t *testing.T) {
+	pooled, pool := newTestPooled(t)
+	defer pool.Close()
+
+	rpc := &fakeFateRPC{
+		id: fateID{Type: 1, UUID: "abc"},
+		executeErr: &clientgen.ThriftTableOperationException{
+			Type:      clientgen.TableOperationExceptionType_EXISTS,
+			TableName: "events",
+		},
+	}
+	pooled.dial = func(context.Context, transportpool.Key) (io.Closer, error) {
+		return &fakeTransport{rpc: rpc}, nil
+	}
+	pooled.newClient = clientFromFakeTransport
+
+	err := pooled.Execute(context.Background(), "manager:9997", createRequest("events"))
+	var managerErr *Error
+	if !errors.As(err, &managerErr) || managerErr.Kind != ErrorTableExists {
+		t.Fatalf("error = %#v, want ErrorTableExists", err)
+	}
+	if rpc.finish.Load() != 1 {
+		t.Fatalf("finish calls = %d, want 1", rpc.finish.Load())
+	}
+}
+
+func TestPooledFinishesWithCancelledContext(t *testing.T) {
+	pooled, pool := newTestPooled(t)
+	defer pool.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	rpc := &fakeFateRPC{id: fateID{Type: 1, UUID: "abc"}, wait: func() error {
+		cancel()
+		return context.Canceled
+	}}
+	pooled.dial = func(context.Context, transportpool.Key) (io.Closer, error) {
+		return &fakeTransport{rpc: rpc}, nil
+	}
+	pooled.newClient = clientFromFakeTransport
+
+	if err := pooled.Execute(ctx, "manager:9997", createRequest("events")); !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want context.Canceled", err)
+	}
+	if rpc.finish.Load() != 1 || rpc.finishContextErr != nil {
+		t.Fatalf("finish calls/context = %d/%v", rpc.finish.Load(), rpc.finishContextErr)
+	}
+}
+
+func TestPooledInvalidatesWireFailureAndCloseRace(t *testing.T) {
+	pooled, pool := newTestPooled(t)
+	defer pool.Close()
+
+	var dials atomic.Int32
+	var first *fakeTransport
+	pooled.dial = func(context.Context, transportpool.Key) (io.Closer, error) {
+		n := dials.Add(1)
+		rpc := &fakeFateRPC{id: fateID{Type: 1, UUID: "abc"}}
+		if n == 1 {
+			rpc.beginErr = thrift.NewTTransportExceptionFromError(errors.New("reset"))
+		}
+		transport := &fakeTransport{rpc: rpc}
+		if n == 1 {
+			first = transport
+		}
+		return transport, nil
+	}
+	pooled.newClient = clientFromFakeTransport
+
+	if err := pooled.Execute(context.Background(), "manager:9997", createRequest("events")); err == nil {
+		t.Fatal("expected wire error")
+	}
+	if first.closes.Load() != 1 {
+		t.Fatalf("invalidated closes = %d, want 1", first.closes.Load())
+	}
+	if err := pooled.Execute(context.Background(), "manager:9997", createRequest("events")); err != nil {
+		t.Fatal(err)
+	}
+
+	var wg sync.WaitGroup
+	for range 20 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = pooled.Close()
+		}()
+	}
+	wg.Wait()
+	if err := pooled.Execute(context.Background(), "manager:9997", createRequest("events")); err == nil {
+		t.Fatal("expected closed error")
+	}
+}
+
+func TestPooledConcurrentOperationsUseExclusiveTransports(t *testing.T) {
+	pooled, pool := newTestPooled(t)
+	defer pool.Close()
+
+	var active atomic.Int32
+	var maxActive atomic.Int32
+	release := make(chan struct{})
+	var started sync.WaitGroup
+	started.Add(8)
+	pooled.dial = func(context.Context, transportpool.Key) (io.Closer, error) {
+		return &fakeTransport{rpc: &fakeFateRPC{
+			id: fateID{Type: 1, UUID: "abc"},
+			beginHook: func() {
+				now := active.Add(1)
+				for {
+					max := maxActive.Load()
+					if now <= max || maxActive.CompareAndSwap(max, now) {
+						break
+					}
+				}
+				started.Done()
+				<-release
+			},
+			finishHook: func() {
+				active.Add(-1)
+			},
+		}}, nil
+	}
+	pooled.newClient = clientFromFakeTransport
+
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := pooled.Execute(context.Background(), "manager:9997", createRequest("events")); err != nil {
+				t.Errorf("Execute: %v", err)
+			}
+		}()
+	}
+	started.Wait()
+	close(release)
+	wg.Wait()
+	if maxActive.Load() < 2 {
+		t.Fatalf("max concurrent transports = %d, want at least 2", maxActive.Load())
+	}
+}
+
+func TestMapRPCError(t *testing.T) {
+	tests := []struct {
+		err  error
+		kind ErrorKind
+	}{
+		{&clientgen.ThriftTableOperationException{
+			Type: clientgen.TableOperationExceptionType_EXISTS,
+		}, ErrorTableExists},
+		{&clientgen.ThriftTableOperationException{
+			Type: clientgen.TableOperationExceptionType_NOTFOUND,
+		}, ErrorTableNotFound},
+		{&clientgen.ThriftTableOperationException{
+			Type: clientgen.TableOperationExceptionType_NAMESPACE_NOTFOUND,
+		}, ErrorNamespaceNotFound},
+		{&clientgen.ThriftTableOperationException{
+			Type: clientgen.TableOperationExceptionType_INVALID_NAME,
+		}, ErrorInvalidName},
+		{&clientgen.ThriftSecurityException{
+			Code: clientgen.SecurityErrorCode_PERMISSION_DENIED,
+		}, ErrorSecurity},
+		{&clientgen.ThriftSecurityException{
+			Code: clientgen.SecurityErrorCode_TABLE_DOESNT_EXIST,
+		}, ErrorTableNotFound},
+		{&clientgen.ThriftSecurityException{
+			Code: clientgen.SecurityErrorCode_NAMESPACE_DOESNT_EXIST,
+		}, ErrorNamespaceNotFound},
+		{&clientgen.ThriftNotActiveServiceException{}, ErrorNotActive},
+	}
+	for _, tt := range tests {
+		var got *Error
+		if err := mapRPCError(tt.err); !errors.As(err, &got) || got.Kind != tt.kind {
+			t.Fatalf("mapRPCError(%T) = %#v, want kind %d", tt.err, err, tt.kind)
+		}
+	}
+}
+
+func newTestPooled(t *testing.T) (*Pooled, *transportpool.Pool) {
+	t.Helper()
+	pool, err := transportpool.New(transportpool.Config{MaxIdlePerEndpoint: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pooled, err := NewPooled(pool, "uuid-1", "4.0.0-SNAPSHOT", &security.TCredentials{
+		Principal:      "root",
+		TokenClassName: "PasswordToken",
+		Token:          []byte("secret"),
+		InstanceId:     "uuid-1",
+	}, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return pooled, pool
+}
+
+func createRequest(name string) Request {
+	return Request{
+		Operation: TableCreate,
+		Instance:  FateUser,
+		Arguments: [][]byte{[]byte(name), []byte("MILLIS"), []byte("ONLINE"), []byte("HOSTED"), []byte("0")},
+		Options:   map[string]string{},
+	}
+}
+
+type fakeTransport struct {
+	rpc    fateRPC
+	closes atomic.Int32
+}
+
+func (t *fakeTransport) Close() error {
+	t.closes.Add(1)
+	return nil
+}
+
+func clientFromFakeTransport(transport io.Closer) (fateRPC, error) {
+	return transport.(*fakeTransport).rpc, nil
+}
+
+type fakeFateRPC struct {
+	id         fateID
+	beginErr   error
+	executeErr error
+	wait       func() error
+	finishErr  error
+	request    Request
+	instance   FateInstance
+	beginHook  func()
+	finishHook func()
+
+	begin            atomic.Int32
+	execute          atomic.Int32
+	waitCalls        atomic.Int32
+	finish           atomic.Int32
+	finishContextErr error
+}
+
+func (r *fakeFateRPC) Begin(
+	_ context.Context,
+	_ *security.TCredentials,
+	instance FateInstance,
+) (fateID, error) {
+	r.begin.Add(1)
+	r.instance = instance
+	if r.beginHook != nil {
+		r.beginHook()
+	}
+	return r.id, r.beginErr
+}
+
+func (r *fakeFateRPC) Execute(_ context.Context, _ *security.TCredentials, _ fateID, req Request) error {
+	r.execute.Add(1)
+	r.request = req
+	return r.executeErr
+}
+
+func (r *fakeFateRPC) Wait(context.Context, *security.TCredentials, fateID) (string, error) {
+	r.waitCalls.Add(1)
+	if r.wait != nil {
+		return "", r.wait()
+	}
+	return "", nil
+}
+
+func (r *fakeFateRPC) Finish(ctx context.Context, _ *security.TCredentials, _ fateID) error {
+	r.finish.Add(1)
+	r.finishContextErr = ctx.Err()
+	if r.finishHook != nil {
+		r.finishHook()
+	}
+	return r.finishErr
+}
