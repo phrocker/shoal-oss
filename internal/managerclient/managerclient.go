@@ -19,9 +19,11 @@ import (
 )
 
 const (
-	fateServiceName    = "fate"
-	managerServiceName = "mgr"
-	fateFinishTimeout  = 5 * time.Second
+	fateServiceName      = "fate"
+	managerServiceName   = "mgr"
+	fateFinishTimeout    = 5 * time.Second
+	waitForFlushMaxLoops = int64(1<<63 - 1)
+	noWaitFlushMaxLoops  = int64(1)
 )
 
 type Operation int
@@ -86,6 +88,7 @@ func (e *Error) Error() string {
 
 type Adapter interface {
 	Execute(context.Context, string, Request) error
+	FlushTable(context.Context, string, string, bool) error
 	SetTableProperty(context.Context, string, string, string, string) error
 	RemoveTableProperty(context.Context, string, string, string) error
 	Close() error
@@ -104,6 +107,8 @@ type fateRPC interface {
 }
 
 type managerRPC interface {
+	InitiateFlush(context.Context, *security.TCredentials, string) (int64, error)
+	WaitForFlush(context.Context, *security.TCredentials, string, int64, int64) error
 	SetTableProperty(context.Context, *security.TCredentials, string, string, string) error
 	RemoveTableProperty(context.Context, *security.TCredentials, string, string) error
 }
@@ -213,6 +218,34 @@ func (p *Pooled) SetTableProperty(
 	return mapRPCError(err)
 }
 
+func (p *Pooled) FlushTable(
+	ctx context.Context,
+	address, tableID string,
+	wait bool,
+) error {
+	if tableID == "" {
+		return errors.New("managerclient: empty table ID")
+	}
+	credentials, err := p.credentialsForRPC()
+	if err != nil {
+		return err
+	}
+	flushID, err := withManagerClient(p, ctx, address, func(rpc managerRPC) (int64, error) {
+		return rpc.InitiateFlush(ctx, credentials, tableID)
+	})
+	if err != nil {
+		return mapRPCError(err)
+	}
+	maxLoops := noWaitFlushMaxLoops
+	if wait {
+		maxLoops = waitForFlushMaxLoops
+	}
+	_, err = withManagerClient(p, ctx, address, func(rpc managerRPC) (struct{}, error) {
+		return struct{}{}, rpc.WaitForFlush(ctx, credentials, tableID, flushID, maxLoops)
+	})
+	return mapRPCError(err)
+}
+
 func (p *Pooled) RemoveTableProperty(
 	ctx context.Context,
 	address, tableName, property string,
@@ -277,7 +310,7 @@ func withServiceClient[T any, C any](
 	}
 	result, rpcErr := call(client)
 	var cleanupErr error
-	if isWireFailure(rpcErr) {
+	if shouldInvalidateTransport(rpcErr) {
 		cleanupErr = lease.Invalidate()
 	} else {
 		cleanupErr = lease.Close()
@@ -387,6 +420,33 @@ func (r thriftManagerRPC) SetTableProperty(
 		tableName,
 		property,
 		value,
+	)
+}
+
+func (r thriftManagerRPC) InitiateFlush(
+	ctx context.Context,
+	credentials *security.TCredentials,
+	tableID string,
+) (int64, error) {
+	return r.raw.InitiateFlush(ctx, &clientgen.TInfo{}, credentials, tableID)
+}
+
+func (r thriftManagerRPC) WaitForFlush(
+	ctx context.Context,
+	credentials *security.TCredentials,
+	tableID string,
+	flushID, maxLoops int64,
+) error {
+	// Accumulo uses absent row fields for an unbounded full-table flush.
+	return r.raw.WaitForFlush(
+		ctx,
+		&clientgen.TInfo{},
+		credentials,
+		tableID,
+		nil,
+		nil,
+		flushID,
+		maxLoops,
 	)
 }
 
@@ -592,9 +652,12 @@ func cloneOptions(options map[string]string) map[string]string {
 	return cloned
 }
 
-func isWireFailure(err error) bool {
+func shouldInvalidateTransport(err error) bool {
 	if err == nil {
 		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return true
 	}
 	var transportErr thrift.TTransportException
 	if errors.As(err, &transportErr) {

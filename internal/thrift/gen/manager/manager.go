@@ -11038,6 +11038,8 @@ func (p *ManagerClientServiceWaitForFlushArgs) writeField3(ctx context.Context, 
 }
 
 func (p *ManagerClientServiceWaitForFlushArgs) writeField4(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): nil startRow = unbounded flush start.
+  if p.StartRow == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "startRow", thrift.STRING, 4); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 4:startRow: ", p), err) }
   if err := oprot.WriteBinary(ctx, p.StartRow); err != nil {
@@ -11048,6 +11050,8 @@ func (p *ManagerClientServiceWaitForFlushArgs) writeField4(ctx context.Context, 
 }
 
 func (p *ManagerClientServiceWaitForFlushArgs) writeField5(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): nil endRow = unbounded flush end.
+  if p.EndRow == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "endRow", thrift.STRING, 5); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 5:endRow: ", p), err) }
   if err := oprot.WriteBinary(ctx, p.EndRow); err != nil {
