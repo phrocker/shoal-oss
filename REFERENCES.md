@@ -81,7 +81,10 @@ cribs land.
   - one tablet-server client carries `startUpdate` → one-way
     `applyUpdates` batches → `closeUpdate`
   - `UpdateErrors.failedExtents` values are committed-mutation counts used
-    for partial retry; full binning/retry policy remains a later client slice
+    to invalidate the failed tablet and retry only
+    `mutations[committed:]`
+  - shoal follows that explicit-prefix retry, but does not replay ambiguous
+    `applyUpdates` or `closeUpdate` transport failures
 - `core/.../rpc/clients/ThriftClientTypes.java`
   - `TabletIngestClientService` multiplex service name is `ingest`
 

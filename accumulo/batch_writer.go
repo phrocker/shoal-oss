@@ -15,6 +15,8 @@ import (
 const (
 	defaultBatchWriterMaxMemoryBytes int64 = 50 << 20
 	defaultBatchWriterMaxBatchBytes  int64 = 128 << 10
+	defaultBatchWriterMaxRetries           = 3
+	defaultBatchWriterRetryBackoff         = 100 * time.Millisecond
 	batchWriterCleanupTimeout              = 5 * time.Second
 )
 
@@ -25,6 +27,10 @@ var (
 	// ErrBatchWriterFailed indicates that a submission may have partially
 	// committed. The writer cannot safely retry or accept more mutations.
 	ErrBatchWriterFailed = errors.New("accumulo: batch writer failed")
+
+	// ErrBatchWriterRetryExhausted indicates that the bounded retries for a
+	// provably safe failure were exhausted.
+	ErrBatchWriterRetryExhausted = errors.New("accumulo: batch writer retry limit exhausted")
 )
 
 // Durability selects the tablet server's write-ahead-log behavior.
@@ -47,12 +53,21 @@ type BatchWriterOptions struct {
 	// MaxBatchBytes bounds each applyUpdates mutation batch. Zero uses 128 KiB.
 	MaxBatchBytes int64
 
+	// MaxRetries bounds additional attempts after the initial submission.
+	// Zero uses three retries.
+	MaxRetries int
+
+	// RetryBackoff is the fixed delay between safe retries. Zero uses 100 ms.
+	RetryBackoff time.Duration
+
 	Durability Durability
 }
 
 type normalizedBatchWriterOptions struct {
 	maxMemoryBytes int64
 	maxBatchBytes  int64
+	maxRetries     int
+	retryBackoff   time.Duration
 	durability     ingestclient.Durability
 }
 
@@ -132,6 +147,29 @@ type serverPlan struct {
 	address string
 	extents []extentPlan
 	indexes map[tabletExtentMapKey]int
+}
+
+type batchWriterRoutingError struct {
+	row []byte
+	err error
+}
+
+func (e *batchWriterRoutingError) Error() string { return e.err.Error() }
+func (e *batchWriterRoutingError) Unwrap() error { return e.err }
+
+type serverSendResult struct {
+	retry            []bufferedMutation
+	invalidateRows   [][]byte
+	evidence         error
+	beforeAcceptance bool
+	submitted        bool
+}
+
+type mutationUpdateResult struct {
+	retry          []bufferedMutation
+	invalidateRows [][]byte
+	rejection      *MutationRejectionError
+	terminal       bool
 }
 
 // BatchWriter buffers mutations for one table and submits them through
@@ -248,7 +286,11 @@ func (w *BatchWriter) Add(ctx context.Context, mutation *Mutation) error {
 }
 
 // Flush commits every mutation accepted before Flush acquired the writer.
-// A submission failure is sticky because Accumulo may have committed a prefix.
+// Tablet routing, session-start, and explicit uncommitted-suffix failures are
+// retried within the configured bound. Ambiguous apply or close failures are
+// sticky because Accumulo may have committed an unknown prefix. A retry limit
+// error without ErrBatchWriterFailed leaves the original buffer available for
+// a later Flush.
 func (w *BatchWriter) Flush(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -308,35 +350,99 @@ func (w *BatchWriter) flushLocked(ctx context.Context) error {
 	if len(w.pending) == 0 {
 		return nil
 	}
-	table, plans, err := w.plan(ctx)
+	table, err := w.resolveTable(ctx)
 	if err != nil {
 		return err
 	}
 	w.table = table
-	for index := range plans {
-		if err := w.sendServer(ctx, plans[index]); err != nil {
-			w.failure = errors.Join(ErrBatchWriterFailed, err)
+	remaining := w.pending
+	submitted := false
+
+	for attempt := 0; ; attempt++ {
+		plans, err := w.plan(ctx, table, remaining)
+		if err != nil {
+			if !isRetryableWriterRoutingError(err) {
+				return w.finishSubmissionFailure(submitted, err)
+			}
+			if invalidateErr := w.invalidateRoutingError(table, err); invalidateErr != nil {
+				return w.finishSubmissionFailure(
+					submitted,
+					errors.Join(err, invalidateErr),
+				)
+			}
+			if attempt >= w.options.maxRetries {
+				return w.finishRetryExhausted(submitted, err)
+			}
+			if waitErr := waitForWriterRetry(ctx, w.options.retryBackoff); waitErr != nil {
+				return w.finishSubmissionFailure(submitted, errors.Join(err, waitErr))
+			}
+			continue
+		}
+
+		var retry []bufferedMutation
+		var invalidateRows [][]byte
+		var retryEvidence error
+		for index := range plans {
+			result, sendErr := w.sendServer(ctx, plans[index])
+			submitted = submitted || result.submitted
+			if sendErr != nil {
+				return w.finishSubmissionFailure(
+					submitted,
+					errors.Join(retryEvidence, sendErr),
+				)
+			}
+			if len(result.retry) == 0 {
+				continue
+			}
+			retry = append(retry, result.retry...)
+			invalidateRows = append(invalidateRows, result.invalidateRows...)
+			retryEvidence = errors.Join(retryEvidence, result.evidence)
+			if result.beforeAcceptance {
+				for _, unsent := range plans[index+1:] {
+					retry = append(retry, serverPlanMutations(unsent)...)
+				}
+				break
+			}
+		}
+
+		if len(retry) == 0 {
 			w.pending = nil
 			w.pendingBytes = 0
-			return w.failure
+			return nil
 		}
+		if invalidateErr := w.invalidateRetryRows(table, invalidateRows); invalidateErr != nil {
+			return w.finishSubmissionFailure(
+				submitted,
+				errors.Join(retryEvidence, invalidateErr),
+			)
+		}
+		if attempt >= w.options.maxRetries {
+			return w.finishRetryExhausted(submitted, retryEvidence)
+		}
+		if waitErr := waitForWriterRetry(ctx, w.options.retryBackoff); waitErr != nil {
+			return w.finishSubmissionFailure(
+				submitted,
+				errors.Join(retryEvidence, waitErr),
+			)
+		}
+		remaining = retry
 	}
-	w.pending = nil
-	w.pendingBytes = 0
-	return nil
 }
 
-func (w *BatchWriter) plan(ctx context.Context) (Table, []serverPlan, error) {
-	table, err := w.resolveTable(ctx)
-	if err != nil {
-		return Table{}, nil, err
-	}
+func (w *BatchWriter) plan(
+	ctx context.Context,
+	table Table,
+	mutations []bufferedMutation,
+) ([]serverPlan, error) {
 	var plans []serverPlan
 	serverIndexes := make(map[string]int)
-	for _, mutation := range w.pending {
+	for _, mutation := range mutations {
 		tablet, err := w.connector.LocateTablet(ctx, table, mutation.row)
 		if err != nil {
-			return Table{}, nil, err
+			return nil, &batchWriterRoutingError{
+				row: cloneRow(mutation.row),
+				err: err,
+			}
 		}
 		address := tablet.Server.HostPort
 		serverIndex, ok := serverIndexes[address]
@@ -363,7 +469,7 @@ func (w *BatchWriter) plan(ctx context.Context) (Table, []serverPlan, error) {
 			mutation,
 		)
 	}
-	return table, plans, nil
+	return plans, nil
 }
 
 func (w *BatchWriter) resolveTable(ctx context.Context) (Table, error) {
@@ -377,15 +483,25 @@ func (w *BatchWriter) resolveTable(ctx context.Context) (Table, error) {
 	}
 }
 
-func (w *BatchWriter) sendServer(ctx context.Context, plan serverPlan) error {
+func (w *BatchWriter) sendServer(
+	ctx context.Context,
+	plan serverPlan,
+) (serverSendResult, error) {
 	session, err := w.startSession(ctx, plan.address, w.options.durability)
 	if err != nil {
-		return fmt.Errorf("accumulo: start update session on %s: %w", plan.address, err)
+		return serverSendResult{
+			retry:            serverPlanMutations(plan),
+			invalidateRows:   serverPlanRows(plan),
+			evidence:         fmt.Errorf("accumulo: start update session on %s: %w", plan.address, err),
+			beforeAcceptance: true,
+		}, nil
 	}
+	result := serverSendResult{}
 	for _, extent := range plan.extents {
 		for _, mutations := range mutationBatches(extent.mutations, w.options.maxBatchBytes) {
+			result.submitted = true
 			if err := session.Apply(ctx, extent.extent, mutations); err != nil {
-				return errors.Join(
+				return result, errors.Join(
 					fmt.Errorf("accumulo: apply mutations on %s: %w", plan.address, err),
 					cancelWriterSession(ctx, plan.address, session),
 				)
@@ -394,19 +510,93 @@ func (w *BatchWriter) sendServer(ctx context.Context, plan serverPlan) error {
 	}
 	updateErrors, err := session.Close(ctx)
 	if err != nil {
-		return errors.Join(
+		return result, errors.Join(
 			fmt.Errorf("accumulo: close update session on %s: %w", plan.address, err),
 			cancelWriterSession(ctx, plan.address, session),
 		)
 	}
-	rejection, err := mutationRejection(plan, updateErrors)
+	updateResult, err := decodeMutationUpdateErrors(plan, updateErrors)
 	if err != nil {
+		return result, err
+	}
+	if updateResult.terminal {
+		return result, updateResult.rejection
+	}
+	result.retry = updateResult.retry
+	result.invalidateRows = updateResult.invalidateRows
+	result.evidence = updateResult.rejection
+	return result, nil
+}
+
+func (w *BatchWriter) finishSubmissionFailure(submitted bool, err error) error {
+	if !submitted {
 		return err
 	}
-	if rejection != nil {
-		return rejection
+	w.failure = errors.Join(ErrBatchWriterFailed, err)
+	w.pending = nil
+	w.pendingBytes = 0
+	return w.failure
+}
+
+func (w *BatchWriter) finishRetryExhausted(submitted bool, evidence error) error {
+	err := errors.Join(ErrBatchWriterRetryExhausted, evidence)
+	return w.finishSubmissionFailure(submitted, err)
+}
+
+func (w *BatchWriter) invalidateRoutingError(table Table, err error) error {
+	var routing *batchWriterRoutingError
+	if !errors.As(err, &routing) {
+		return err
 	}
-	return nil
+	if errors.Is(err, ErrNoTabletCoversRow) {
+		return w.connector.InvalidateTable(table)
+	}
+	return w.connector.InvalidateTablet(table, routing.row)
+}
+
+func (w *BatchWriter) invalidateRetryRows(table Table, rows [][]byte) error {
+	var invalidateErr error
+	for _, row := range rows {
+		invalidateErr = errors.Join(
+			invalidateErr,
+			w.connector.InvalidateTablet(table, row),
+		)
+	}
+	return invalidateErr
+}
+
+func isRetryableWriterRoutingError(err error) bool {
+	return errors.Is(err, ErrTabletNotLocated) ||
+		errors.Is(err, ErrNoTabletCoversRow)
+}
+
+func waitForWriterRetry(ctx context.Context, backoff time.Duration) error {
+	timer := time.NewTimer(backoff)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func serverPlanMutations(plan serverPlan) []bufferedMutation {
+	var mutations []bufferedMutation
+	for _, extent := range plan.extents {
+		mutations = append(mutations, extent.mutations...)
+	}
+	return mutations
+}
+
+func serverPlanRows(plan serverPlan) [][]byte {
+	rows := make([][]byte, 0, len(plan.extents))
+	for _, extent := range plan.extents {
+		if len(extent.mutations) != 0 {
+			rows = append(rows, extent.mutations[0].row)
+		}
+	}
+	return rows
 }
 
 func cancelWriterSession(
@@ -454,38 +644,66 @@ func mutationBatches(
 	return batches
 }
 
-func mutationRejection(
+func decodeMutationUpdateErrors(
 	plan serverPlan,
 	updateErrors *data.UpdateErrors,
-) (*MutationRejectionError, error) {
+) (mutationUpdateResult, error) {
 	if updateErrors == nil {
-		return nil, nil
+		return mutationUpdateResult{}, nil
 	}
 	rejection := &MutationRejectionError{Server: plan.address}
-	submitted := make(map[tabletExtentMapKey]int)
-	for _, extent := range plan.extents {
-		submitted[thriftTabletExtentKey(extent.extent)] = len(extent.mutations)
+	submitted := make(map[tabletExtentMapKey]int, len(plan.extents))
+	for index, extent := range plan.extents {
+		submitted[thriftTabletExtentKey(extent.extent)] = index
 	}
+	failed := make(map[tabletExtentMapKey]int64, len(updateErrors.FailedExtents))
 	for extent, committed := range updateErrors.FailedExtents {
 		if extent == nil {
-			return nil, errors.New("accumulo: closeUpdate returned a nil failed extent")
+			return mutationUpdateResult{}, errors.New(
+				"accumulo: closeUpdate returned a nil failed extent",
+			)
 		}
-		count, ok := submitted[thriftTabletExtentKey(extent)]
+		key := thriftTabletExtentKey(extent)
+		extentIndex, ok := submitted[key]
 		if !ok {
-			return nil, errors.New("accumulo: closeUpdate returned an unknown failed extent")
+			return mutationUpdateResult{}, errors.New(
+				"accumulo: closeUpdate returned an unknown failed extent",
+			)
 		}
+		count := len(plan.extents[extentIndex].mutations)
 		if committed < 0 || committed > int64(count) {
-			return nil, fmt.Errorf(
+			return mutationUpdateResult{}, fmt.Errorf(
 				"accumulo: closeUpdate returned invalid committed count %d for %d mutations",
 				committed,
 				count,
 			)
 		}
+		if _, duplicate := failed[key]; duplicate {
+			return mutationUpdateResult{}, errors.New(
+				"accumulo: closeUpdate returned a duplicate failed extent",
+			)
+		}
+		failed[key] = committed
+	}
+
+	result := mutationUpdateResult{}
+	for _, extent := range plan.extents {
+		committed, ok := failed[thriftTabletExtentKey(extent.extent)]
+		if !ok {
+			continue
+		}
+		count := len(extent.mutations)
 		rejection.FailedExtents = append(rejection.FailedExtents, FailedExtent{
-			Extent:    publicTabletExtent(extent),
+			Extent:    publicTabletExtent(extent.extent),
 			Submitted: count,
 			Committed: committed,
 		})
+		if committed == int64(count) {
+			continue
+		}
+		suffix := extent.mutations[int(committed):]
+		result.retry = append(result.retry, suffix...)
+		result.invalidateRows = append(result.invalidateRows, suffix[0].row)
 	}
 	for _, violation := range updateErrors.ViolationSummaries {
 		if violation == nil {
@@ -503,7 +721,9 @@ func mutationRejection(
 	}
 	for extent, code := range updateErrors.AuthorizationFailures {
 		if extent == nil {
-			return nil, errors.New("accumulo: closeUpdate returned a nil authorization extent")
+			return mutationUpdateResult{}, errors.New(
+				"accumulo: closeUpdate returned a nil authorization extent",
+			)
 		}
 		rejection.AuthorizationFailures = append(
 			rejection.AuthorizationFailures,
@@ -525,12 +745,12 @@ func mutationRejection(
 			rejection.AuthorizationFailures[j].Extent,
 		)
 	})
-	if len(rejection.FailedExtents) == 0 &&
-		len(rejection.ConstraintViolations) == 0 &&
-		len(rejection.AuthorizationFailures) == 0 {
-		return nil, nil
+	result.terminal = len(rejection.ConstraintViolations) != 0 ||
+		len(rejection.AuthorizationFailures) != 0
+	if result.terminal || len(result.retry) != 0 {
+		result.rejection = rejection
 	}
-	return rejection, nil
+	return result, nil
 }
 
 func normalizeBatchWriterOptions(
@@ -552,6 +772,22 @@ func normalizeBatchWriterOptions(
 	if options.MaxBatchBytes == 0 {
 		options.MaxBatchBytes = defaultBatchWriterMaxBatchBytes
 	}
+	if options.MaxRetries < 0 {
+		return normalizedBatchWriterOptions{}, errors.New(
+			"accumulo: batch writer MaxRetries must not be negative",
+		)
+	}
+	if options.MaxRetries == 0 {
+		options.MaxRetries = defaultBatchWriterMaxRetries
+	}
+	if options.RetryBackoff < 0 {
+		return normalizedBatchWriterOptions{}, errors.New(
+			"accumulo: batch writer RetryBackoff must not be negative",
+		)
+	}
+	if options.RetryBackoff == 0 {
+		options.RetryBackoff = defaultBatchWriterRetryBackoff
+	}
 	if options.Durability > DurabilityNone {
 		return normalizedBatchWriterOptions{}, errors.New(
 			"accumulo: batch writer durability is invalid",
@@ -560,6 +796,8 @@ func normalizeBatchWriterOptions(
 	return normalizedBatchWriterOptions{
 		maxMemoryBytes: options.MaxMemoryBytes,
 		maxBatchBytes:  options.MaxBatchBytes,
+		maxRetries:     options.MaxRetries,
+		retryBackoff:   options.RetryBackoff,
 		durability:     ingestclient.Durability(options.Durability),
 	}, nil
 }

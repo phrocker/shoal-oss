@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/phrocker/shoal/accumulo"
 )
@@ -139,6 +140,8 @@ func TestPublicBatchWriterAPICompiles(t *testing.T) {
 	_, err = connector.NewBatchWriter(accumulo.Table{Name: "events"}, accumulo.BatchWriterOptions{
 		MaxMemoryBytes: 1 << 20,
 		MaxBatchBytes:  1 << 17,
+		MaxRetries:     3,
+		RetryBackoff:   100 * time.Millisecond,
 		Durability:     accumulo.DurabilitySync,
 	})
 	if !errors.Is(err, accumulo.ErrDiscoveryUnavailable) {
@@ -157,4 +160,5 @@ func TestPublicBatchWriterAPICompiles(t *testing.T) {
 	_ = accumulo.DurabilityNone
 	_ = accumulo.ErrBatchWriterClosed
 	_ = accumulo.ErrBatchWriterFailed
+	_ = accumulo.ErrBatchWriterRetryExhausted
 }
