@@ -4,6 +4,7 @@ import (
 	"errors"
 
 	"github.com/phrocker/shoal/internal/cclient"
+	"github.com/phrocker/shoal/internal/thrift/gen/data"
 )
 
 // MutationLatestTimestamp requests a tablet-server-assigned timestamp.
@@ -65,4 +66,11 @@ func (m *Mutation) Delete(
 // DeleteLatest adds a tombstone whose timestamp will be assigned by the tablet server.
 func (m *Mutation) DeleteLatest(columnFamily, columnQualifier, columnVisibility []byte) {
 	m.mutation.DeleteLatest(columnFamily, columnQualifier, columnVisibility)
+}
+
+func (m *Mutation) toThrift() (*data.TMutation, error) {
+	if m == nil || m.mutation == nil {
+		return nil, errors.New("accumulo: mutation is nil")
+	}
+	return m.mutation.ToThrift()
 }

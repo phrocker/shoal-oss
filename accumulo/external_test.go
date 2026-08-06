@@ -126,3 +126,35 @@ func TestPublicMutationAPICompiles(t *testing.T) {
 	_ = accumulo.MutationLatestTimestamp
 	var _ *accumulo.Mutation = mutation
 }
+
+func TestPublicBatchWriterAPICompiles(t *testing.T) {
+	instance, _ := accumulo.NewStaticInstance("accumulo", "uuid-1")
+	credentials, _ := accumulo.PasswordCredentials("root", []byte("secret"))
+	connector, err := accumulo.NewConnector(instance, credentials, accumulo.ConnectorOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connector.Close()
+
+	_, err = connector.NewBatchWriter(accumulo.Table{Name: "events"}, accumulo.BatchWriterOptions{
+		MaxMemoryBytes: 1 << 20,
+		MaxBatchBytes:  1 << 17,
+		Durability:     accumulo.DurabilitySync,
+	})
+	if !errors.Is(err, accumulo.ErrDiscoveryUnavailable) {
+		t.Fatalf("error = %v, want ErrDiscoveryUnavailable", err)
+	}
+
+	var _ *accumulo.BatchWriter
+	var _ *accumulo.MutationRejectionError
+	var _ *accumulo.BatchWriterCleanupError
+	var _ accumulo.FailedExtent
+	var _ accumulo.ConstraintViolation
+	var _ accumulo.AuthorizationFailure
+	_ = accumulo.DurabilityDefault
+	_ = accumulo.DurabilityFlush
+	_ = accumulo.DurabilityLog
+	_ = accumulo.DurabilityNone
+	_ = accumulo.ErrBatchWriterClosed
+	_ = accumulo.ErrBatchWriterFailed
+}
