@@ -58,6 +58,11 @@ func TestTablePropertyMutationsMapErrors(t *testing.T) {
 	connector.manager = manager
 	connector.managerAddr = fakeManagerAddress{address: "manager:9997"}
 
+	rpcErr := errors.New("rpc failed")
+	unknownManagerErr := &managerclient.Error{
+		Kind:        managerclient.ErrorUnknown,
+		Description: "configuration update failed",
+	}
 	tests := []struct {
 		err  error
 		want error
@@ -86,6 +91,16 @@ func TestTablePropertyMutationsMapErrors(t *testing.T) {
 			&managerclient.Error{Kind: managerclient.ErrorNotActive},
 			ErrManagerUnavailable,
 			ErrManagerUnavailable.Error(),
+		},
+		{
+			rpcErr,
+			rpcErr,
+			`accumulo: table property "table.invalid" on table "events": rpc failed`,
+		},
+		{
+			unknownManagerErr,
+			unknownManagerErr,
+			`accumulo: table property "table.invalid" on table "events": managerclient: configuration update failed`,
 		},
 	}
 	for _, tt := range tests {

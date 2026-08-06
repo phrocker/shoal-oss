@@ -76,8 +76,31 @@ func (c *Connector) executeTablePropertyMutation(
 
 func mapManagerPropertyError(tableName, property string, err error) error {
 	var managerErr *managerclient.Error
-	if !errors.As(err, &managerErr) || managerErr.Kind != managerclient.ErrorInvalidProperty {
-		return mapManagerError(tableName, err)
+	if !errors.As(err, &managerErr) {
+		return fmt.Errorf(
+			"accumulo: table property %q on table %q: %w",
+			property,
+			tableName,
+			err,
+		)
+	}
+	if managerErr.Kind != managerclient.ErrorInvalidProperty {
+		switch managerErr.Kind {
+		case managerclient.ErrorTableExists,
+			managerclient.ErrorTableNotFound,
+			managerclient.ErrorNamespaceNotFound,
+			managerclient.ErrorInvalidName,
+			managerclient.ErrorSecurity,
+			managerclient.ErrorNotActive:
+			return mapManagerError(tableName, managerErr)
+		default:
+			return fmt.Errorf(
+				"accumulo: table property %q on table %q: %w",
+				property,
+				tableName,
+				managerErr,
+			)
+		}
 	}
 	errorProperty := managerErr.Property
 	if errorProperty == "" {
