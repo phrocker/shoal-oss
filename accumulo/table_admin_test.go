@@ -108,6 +108,9 @@ type fakeManagerAdapter struct {
 	requests         []managerclient.Request
 	flushRequests    []fakeFlushRequest
 	propertyRequests []fakePropertyRequest
+	configuration    map[string]string
+	configurationFn  func(context.Context, string, string) (map[string]string, error)
+	configurationRPC []string
 	err              error
 	closed           int
 }
@@ -145,6 +148,23 @@ func (m *fakeManagerAdapter) FlushTable(
 		wait:    wait,
 	})
 	return m.err
+}
+
+func (m *fakeManagerAdapter) GetTableConfiguration(
+	ctx context.Context,
+	address, tableName string,
+) (map[string]string, error) {
+	m.mu.Lock()
+	m.address = address
+	m.configurationRPC = append(m.configurationRPC, address)
+	fn := m.configurationFn
+	configuration := m.configuration
+	err := m.err
+	m.mu.Unlock()
+	if fn != nil {
+		return fn(ctx, address, tableName)
+	}
+	return configuration, err
 }
 
 func (m *fakeManagerAdapter) SetTableProperty(

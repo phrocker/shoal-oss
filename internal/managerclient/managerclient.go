@@ -21,6 +21,7 @@ import (
 const (
 	fateServiceName      = "fate"
 	managerServiceName   = "mgr"
+	clientServiceName    = "client"
 	fateFinishTimeout    = 5 * time.Second
 	waitForFlushMaxLoops = int64(1<<63 - 1)
 	noWaitFlushMaxLoops  = int64(1)
@@ -89,6 +90,7 @@ func (e *Error) Error() string {
 type Adapter interface {
 	Execute(context.Context, string, Request) error
 	FlushTable(context.Context, string, string, bool) error
+	GetTableConfiguration(context.Context, string, string) (map[string]string, error)
 	SetTableProperty(context.Context, string, string, string, string) error
 	RemoveTableProperty(context.Context, string, string, string) error
 	Close() error
@@ -113,6 +115,14 @@ type managerRPC interface {
 	RemoveTableProperty(context.Context, *security.TCredentials, string, string) error
 }
 
+type clientRPC interface {
+	GetTableConfiguration(
+		context.Context,
+		*security.TCredentials,
+		string,
+	) (map[string]string, error)
+}
+
 type Pooled struct {
 	pool            *transportpool.Pool
 	instanceID      string
@@ -127,6 +137,7 @@ type Pooled struct {
 	dial             transportpool.DialFunc
 	newClient        func(io.Closer) (fateRPC, error)
 	newManagerClient func(io.Closer) (managerRPC, error)
+	newServiceClient func(io.Closer) (clientRPC, error)
 }
 
 var _ Adapter = (*Pooled)(nil)
@@ -160,6 +171,7 @@ func NewPooled(
 	p.dial = p.dialThrift
 	p.newClient = p.newThriftRPC
 	p.newManagerClient = p.newThriftManagerRPC
+	p.newServiceClient = p.newThriftClientRPC
 	return p, nil
 }
 
@@ -246,6 +258,26 @@ func (p *Pooled) FlushTable(
 	return mapRPCError(err)
 }
 
+func (p *Pooled) GetTableConfiguration(
+	ctx context.Context,
+	address, tableName string,
+) (map[string]string, error) {
+	if tableName == "" {
+		return nil, errors.New("managerclient: empty table name")
+	}
+	credentials, err := p.credentialsForRPC()
+	if err != nil {
+		return nil, err
+	}
+	properties, err := withClientService(p, ctx, address, func(rpc clientRPC) (map[string]string, error) {
+		return rpc.GetTableConfiguration(ctx, credentials, tableName)
+	})
+	if err != nil {
+		return nil, mapRPCError(err)
+	}
+	return cloneOptions(properties), nil
+}
+
 func (p *Pooled) RemoveTableProperty(
 	ctx context.Context,
 	address, tableName, property string,
@@ -279,6 +311,15 @@ func withManagerClient[T any](
 	call func(managerRPC) (T, error),
 ) (result T, err error) {
 	return withServiceClient(p, ctx, address, managerServiceName, p.newManagerClient, call)
+}
+
+func withClientService[T any](
+	p *Pooled,
+	ctx context.Context,
+	address string,
+	call func(clientRPC) (T, error),
+) (result T, err error) {
+	return withServiceClient(p, ctx, address, clientServiceName, p.newServiceClient, call)
 }
 
 func withServiceClient[T any, C any](
@@ -380,6 +421,17 @@ func (p *Pooled) newThriftManagerRPC(transport io.Closer) (managerRPC, error) {
 	return thriftManagerRPC{raw: raw}, nil
 }
 
+func (p *Pooled) newThriftClientRPC(transport io.Closer) (clientRPC, error) {
+	thriftTransport, ok := transport.(thrift.TTransport)
+	if !ok {
+		return nil, fmt.Errorf("managerclient: pooled transport %T is not a thrift transport", transport)
+	}
+	proto := protocol.NewClientFactory(p.instanceID, p.accumuloVersion).GetProtocol(thriftTransport)
+	muxed := thrift.NewTMultiplexedProtocol(proto, clientServiceName)
+	raw := clientgen.NewClientServiceClient(thrift.NewTStandardClient(muxed, muxed))
+	return thriftClientRPC{raw: raw}, nil
+}
+
 type thriftFateRPC struct {
 	raw *manager.FateServiceClient
 }
@@ -406,6 +458,23 @@ func (r thriftFateRPC) Begin(
 
 type thriftManagerRPC struct {
 	raw *manager.ManagerClientServiceClient
+}
+
+type thriftClientRPC struct {
+	raw *clientgen.ClientServiceClient
+}
+
+func (r thriftClientRPC) GetTableConfiguration(
+	ctx context.Context,
+	credentials *security.TCredentials,
+	tableName string,
+) (map[string]string, error) {
+	return r.raw.GetTableConfiguration(
+		ctx,
+		clientgen.NewTInfo(),
+		credentials,
+		tableName,
+	)
 }
 
 func (r thriftManagerRPC) SetTableProperty(
@@ -679,4 +748,25 @@ func shouldInvalidateTransport(err error) bool {
 	default:
 		return true
 	}
+}
+
+// IsRetryableEndpointError reports whether an RPC failed before receiving a
+// valid application response and can be retried against another advertised
+// ClientService endpoint.
+func IsRetryableEndpointError(err error) bool {
+	if err == nil ||
+		errors.Is(err, context.Canceled) ||
+		errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	var managerErr *Error
+	if errors.As(err, &managerErr) {
+		return false
+	}
+	var transportErr thrift.TTransportException
+	if errors.As(err, &transportErr) {
+		return true
+	}
+	var networkErr net.Error
+	return errors.As(err, &networkErr)
 }

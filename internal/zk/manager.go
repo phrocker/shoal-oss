@@ -19,7 +19,10 @@ const (
 	zLockPrefix  = "zlock#"
 )
 
-var ErrManagerUnavailable = errors.New("zk: manager unavailable")
+var (
+	ErrManagerUnavailable       = errors.New("zk: manager unavailable")
+	ErrClientServiceUnavailable = errors.New("zk: client service unavailable")
+)
 
 type serviceLockData struct {
 	Descriptors []serviceDescriptor `json:"descriptors"`
@@ -74,6 +77,92 @@ func ManagerAddress(ctx context.Context, locator interface {
 		return descriptor.Address, nil
 	}
 	return "", ErrManagerUnavailable
+}
+
+// ClientServiceAddresses returns the live Accumulo 4 ClientService endpoints
+// advertised by tablet servers, scan servers, and compactors.
+func ClientServiceAddresses(ctx context.Context, locator interface {
+	InstancePath() string
+	GetRaw(context.Context, string) ([]byte, error)
+	Children(context.Context, string) ([]string, error)
+}) ([]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if locator == nil {
+		return nil, errors.New("zk: nil locator")
+	}
+	addresses := make(map[string]struct{})
+	for _, serverRoot := range []string{"/tservers", "/sservers", "/compactors"} {
+		root := path.Join(locator.InstancePath(), serverRoot)
+		groups, err := locator.Children(ctx, root)
+		if errors.Is(err, gozk.ErrNoNode) {
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("list client service resource groups %s: %w", root, err)
+		}
+		sort.Strings(groups)
+		for _, group := range groups {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			groupPath := path.Join(root, group)
+			servers, err := locator.Children(ctx, groupPath)
+			if errors.Is(err, gozk.ErrNoNode) {
+				continue
+			}
+			if err != nil {
+				return nil, fmt.Errorf("list client service servers %s: %w", groupPath, err)
+			}
+			sort.Strings(servers)
+			for _, server := range servers {
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
+				lockPath := path.Join(groupPath, server)
+				children, err := locator.Children(ctx, lockPath)
+				if errors.Is(err, gozk.ErrNoNode) {
+					continue
+				}
+				if err != nil {
+					return nil, fmt.Errorf("list client service locks %s: %w", lockPath, err)
+				}
+				lockNode := firstLockNode(children)
+				if lockNode == "" {
+					continue
+				}
+				data, err := locator.GetRaw(ctx, path.Join(lockPath, lockNode))
+				if errors.Is(err, gozk.ErrNoNode) {
+					continue
+				}
+				if err != nil {
+					return nil, fmt.Errorf("get client service lock %s: %w", lockPath, err)
+				}
+				var lock serviceLockData
+				if err := json.Unmarshal(data, &lock); err != nil {
+					return nil, fmt.Errorf("decode client service lock %s: %w", lockPath, err)
+				}
+				for _, descriptor := range lock.Descriptors {
+					if descriptor.Service != "CLIENT" ||
+						descriptor.Address == "" ||
+						descriptor.Address == "0.0.0.0:0" {
+						continue
+					}
+					addresses[descriptor.Address] = struct{}{}
+				}
+			}
+		}
+	}
+	if len(addresses) == 0 {
+		return nil, ErrClientServiceUnavailable
+	}
+	result := make([]string, 0, len(addresses))
+	for address := range addresses {
+		result = append(result, address)
+	}
+	sort.Strings(result)
+	return result, nil
 }
 
 func firstLockNode(children []string) string {
