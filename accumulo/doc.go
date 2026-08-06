@@ -3,6 +3,6 @@
 //
 // The current implementation targets the Accumulo 4 protocol and discovery
 // layout. The connector supports table discovery, listing, existence checks,
-// scanners, and mutation construction; batch writer and mutating administration
-// APIs build on these stable boundaries.
+// scanners, mutation construction, and bounded batch writing; mutating
+// administration APIs build on these stable boundaries.
 package accumulo

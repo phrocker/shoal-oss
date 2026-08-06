@@ -72,7 +72,13 @@ func (f *fakeTableNames) List(ctx context.Context) (map[string]string, error) {
 
 func (f *fakeTableNames) Invalidate() { f.invalidates++ }
 
-func testConnectorWithDiscovery(t *testing.T, walker *fakeTabletWalker, names *fakeTableNames) *Connector {
+func testConnectorWithDiscovery(
+	t *testing.T,
+	walker interface {
+		LocateTable(context.Context, string) ([]metadata.TabletInfo, error)
+	},
+	names *fakeTableNames,
+) *Connector {
 	t.Helper()
 	instance, err := NewStaticInstance("accumulo", "uuid-1")
 	if err != nil {
