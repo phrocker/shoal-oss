@@ -93,7 +93,7 @@ func ClientServiceAddresses(ctx context.Context, locator interface {
 		return nil, errors.New("zk: nil locator")
 	}
 	addresses := make(map[string]struct{})
-	for _, serverRoot := range []string{"/tservers", "/sservers", "/compactors"} {
+	for _, serverRoot := range []string{"tservers", "sservers", "compactors"} {
 		root := path.Join(locator.InstancePath(), serverRoot)
 		groups, err := locator.Children(ctx, root)
 		if errors.Is(err, gozk.ErrNoNode) {
@@ -120,28 +120,29 @@ func ClientServiceAddresses(ctx context.Context, locator interface {
 				if err := ctx.Err(); err != nil {
 					return nil, err
 				}
-				lockPath := path.Join(groupPath, server)
-				children, err := locator.Children(ctx, lockPath)
+				serverPath := path.Join(groupPath, server)
+				children, err := locator.Children(ctx, serverPath)
 				if errors.Is(err, gozk.ErrNoNode) {
 					continue
 				}
 				if err != nil {
-					return nil, fmt.Errorf("list client service locks %s: %w", lockPath, err)
+					return nil, fmt.Errorf("list client service locks %s: %w", serverPath, err)
 				}
 				lockNode := firstLockNode(children)
 				if lockNode == "" {
 					continue
 				}
-				data, err := locator.GetRaw(ctx, path.Join(lockPath, lockNode))
+				lockNodePath := path.Join(serverPath, lockNode)
+				data, err := locator.GetRaw(ctx, lockNodePath)
 				if errors.Is(err, gozk.ErrNoNode) {
 					continue
 				}
 				if err != nil {
-					return nil, fmt.Errorf("get client service lock %s: %w", lockPath, err)
+					return nil, fmt.Errorf("get client service lock %s: %w", lockNodePath, err)
 				}
 				var lock serviceLockData
 				if err := json.Unmarshal(data, &lock); err != nil {
-					return nil, fmt.Errorf("decode client service lock %s: %w", lockPath, err)
+					return nil, fmt.Errorf("decode client service lock %s: %w", lockNodePath, err)
 				}
 				for _, descriptor := range lock.Descriptors {
 					if descriptor.Service != "CLIENT" ||

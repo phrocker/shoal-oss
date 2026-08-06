@@ -728,6 +728,7 @@ func shouldInvalidateTransport(err error) bool {
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return true
 	}
+	// TTransportException is an interface; errors.As takes its address.
 	var transportErr thrift.TTransportException
 	if errors.As(err, &transportErr) {
 		return true
