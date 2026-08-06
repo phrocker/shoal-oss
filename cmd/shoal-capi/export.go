@@ -1,0 +1,365 @@
+package main
+
+/*
+#cgo CFLAGS: -I${SRCDIR}/../../capi/include
+#include <stdlib.h>
+#include "bridge.h"
+*/
+import "C"
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+	"unsafe"
+
+	"github.com/phrocker/shoal/accumulo"
+)
+
+const defaultBootstrapTimeout = 30 * time.Second
+
+type connectorConfig struct {
+	bootstrap        int32
+	instanceName     string
+	instanceID       string
+	zookeeperServers []string
+	principal        string
+	password         []byte
+	accumuloVersion  string
+	zkSessionTimeout time.Duration
+	bootstrapTimeout time.Duration
+	instanceSecret   string
+	dialTimeout      time.Duration
+}
+
+//export shoal_abi_version
+func shoal_abi_version() C.uint32_t {
+	return C.uint32_t(C.SHOAL_ABI_VERSION)
+}
+
+//export shoal_connector_config_init
+func shoal_connector_config_init(config *C.shoal_connector_config) {
+	C.shoal_bridge_connector_config_init(config)
+}
+
+//export shoal_connector_create
+func shoal_connector_create(
+	config *C.shoal_connector_config,
+	outConnector **C.shoal_connector,
+	outError **C.shoal_error,
+) (status C.shoal_status) {
+	clearError(outError)
+	if outConnector != nil {
+		*outConnector = nil
+	}
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			status = fail(outError, C.SHOAL_STATUS_INTERNAL, fmt.Errorf("shoal: internal panic: %v", recovered))
+		}
+	}()
+	if outConnector == nil {
+		return fail(outError, C.SHOAL_STATUS_INVALID_ARGUMENT, errors.New("shoal: out_connector is required"))
+	}
+
+	parsed, err := parseConnectorConfig(config)
+	if err != nil {
+		if errors.Is(err, accumulo.ErrUnsupportedVersion) {
+			return fail(outError, C.SHOAL_STATUS_UNSUPPORTED, err)
+		}
+		return fail(outError, C.SHOAL_STATUS_INVALID_ARGUMENT, err)
+	}
+	defer zeroBytes(parsed.password)
+	owned, code, err := openConnector(parsed)
+	if err != nil {
+		return fail(outError, code, err)
+	}
+
+	id, ok := connectors.add(owned)
+	if !ok {
+		_ = owned.close()
+		return fail(outError, C.SHOAL_STATUS_INTERNAL, errors.New("shoal: connector handle space exhausted"))
+	}
+	handle := C.shoal_bridge_connector_alloc(C.uint64_t(id))
+	if handle == nil {
+		removed, _ := connectors.remove(id)
+		_ = removed.close()
+		return fail(outError, C.SHOAL_STATUS_OUT_OF_MEMORY, errors.New("shoal: allocate connector handle"))
+	}
+	*outConnector = handle
+	return C.SHOAL_STATUS_OK
+}
+
+//export shoal_connector_close
+func shoal_connector_close(
+	handle *C.shoal_connector,
+	outError **C.shoal_error,
+) (status C.shoal_status) {
+	clearError(outError)
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			status = fail(outError, C.SHOAL_STATUS_INTERNAL, fmt.Errorf("shoal: internal panic: %v", recovered))
+		}
+	}()
+	owned, err := lookupConnector(handle)
+	if err != nil {
+		return fail(outError, C.SHOAL_STATUS_INVALID_HANDLE, err)
+	}
+	if err := owned.close(); err != nil {
+		return fail(outError, C.SHOAL_STATUS_INTERNAL, fmt.Errorf("shoal: close connector: %w", err))
+	}
+	return C.SHOAL_STATUS_OK
+}
+
+//export shoal_connector_free
+func shoal_connector_free(handle **C.shoal_connector) {
+	defer func() {
+		_ = recover()
+	}()
+	if handle == nil || *handle == nil {
+		return
+	}
+	value := *handle
+	*handle = nil
+	id := uint64(C.shoal_bridge_connector_id(value))
+	if owned, ok := connectors.remove(id); ok {
+		_ = owned.close()
+	}
+	C.shoal_bridge_connector_free(value)
+}
+
+//export shoal_error_code
+func shoal_error_code(err *C.shoal_error) C.shoal_status {
+	return C.shoal_bridge_error_code(err)
+}
+
+//export shoal_error_message
+func shoal_error_message(err *C.shoal_error) *C.char {
+	return C.shoal_bridge_error_message(err)
+}
+
+//export shoal_error_free
+func shoal_error_free(err **C.shoal_error) {
+	if err == nil || *err == nil {
+		return
+	}
+	C.shoal_bridge_error_free(*err)
+	*err = nil
+}
+
+func parseConnectorConfig(config *C.shoal_connector_config) (connectorConfig, error) {
+	if config == nil {
+		return connectorConfig{}, errors.New("shoal: connector config is required")
+	}
+	requiredSize := uint64(C.shoal_bridge_connector_config_v1_size())
+	if uint64(config.struct_size) < requiredSize {
+		return connectorConfig{}, fmt.Errorf(
+			"shoal: config struct_size is %d, need at least %d",
+			uint64(config.struct_size),
+			requiredSize,
+		)
+	}
+	instanceName, err := requiredString(config.instance_name, "instance_name")
+	if err != nil {
+		return connectorConfig{}, err
+	}
+	principal, err := requiredString(config.principal, "principal")
+	if err != nil {
+		return connectorConfig{}, err
+	}
+	password, err := copyBytes(config.password, config.password_length, "password")
+	if err != nil {
+		return connectorConfig{}, err
+	}
+	parsed := connectorConfig{
+		bootstrap:       int32(config.bootstrap),
+		instanceName:    instanceName,
+		principal:       principal,
+		password:        password,
+		instanceSecret:  optionalString(config.instance_secret),
+		accumuloVersion: optionalString(config.accumulo_version),
+	}
+	if parsed.accumuloVersion != "" && !strings.HasPrefix(parsed.accumuloVersion, "4.") {
+		zeroBytes(parsed.password)
+		return connectorConfig{}, fmt.Errorf(
+			"%w: only Accumulo 4.x is supported, got %q",
+			accumulo.ErrUnsupportedVersion,
+			parsed.accumuloVersion,
+		)
+	}
+	parsed.dialTimeout, err = durationMilliseconds(config.dial_timeout_ms, "dial_timeout_ms", 0)
+	if err != nil {
+		zeroBytes(parsed.password)
+		return connectorConfig{}, err
+	}
+
+	switch config.bootstrap {
+	case C.SHOAL_BOOTSTRAP_STATIC:
+		parsed.instanceID, err = requiredString(config.instance_id, "instance_id")
+	case C.SHOAL_BOOTSTRAP_ZOOKEEPER:
+		parsed.zookeeperServers, err = parseServers(config.zookeeper_servers)
+		if err == nil {
+			parsed.zkSessionTimeout, err = durationMilliseconds(
+				config.zookeeper_session_timeout_ms,
+				"zookeeper_session_timeout_ms",
+				0,
+			)
+		}
+		if err == nil {
+			parsed.bootstrapTimeout, err = durationMilliseconds(
+				config.bootstrap_timeout_ms,
+				"bootstrap_timeout_ms",
+				defaultBootstrapTimeout,
+			)
+		}
+	default:
+		err = fmt.Errorf("shoal: unsupported bootstrap mode %d", int32(config.bootstrap))
+	}
+	if err != nil {
+		zeroBytes(parsed.password)
+		return connectorConfig{}, err
+	}
+	return parsed, nil
+}
+
+func openConnector(config connectorConfig) (*ownedConnector, C.shoal_status, error) {
+	credentials, err := accumulo.PasswordCredentials(config.principal, config.password)
+	if err != nil {
+		return nil, C.SHOAL_STATUS_INVALID_ARGUMENT, err
+	}
+
+	var instance accumulo.Instance
+	switch config.bootstrap {
+	case int32(C.SHOAL_BOOTSTRAP_STATIC):
+		instance, err = accumulo.NewStaticInstance(config.instanceName, config.instanceID)
+	case int32(C.SHOAL_BOOTSTRAP_ZOOKEEPER):
+		ctx, cancel := context.WithTimeout(context.Background(), config.bootstrapTimeout)
+		defer cancel()
+		instance, err = accumulo.NewZooKeeperInstance(ctx, accumulo.ZooKeeperConfig{
+			Servers:        config.zookeeperServers,
+			InstanceName:   config.instanceName,
+			SessionTimeout: config.zkSessionTimeout,
+			InstanceSecret: config.instanceSecret,
+		})
+	}
+	if err != nil {
+		return nil, C.SHOAL_STATUS_BOOTSTRAP_FAILED, err
+	}
+
+	connector, err := accumulo.NewConnector(instance, credentials, accumulo.ConnectorOptions{
+		AccumuloVersion: config.accumuloVersion,
+		DialTimeout:     config.dialTimeout,
+	})
+	if err != nil {
+		_ = instance.Close()
+		if errors.Is(err, accumulo.ErrUnsupportedVersion) {
+			return nil, C.SHOAL_STATUS_UNSUPPORTED, err
+		}
+		return nil, C.SHOAL_STATUS_INTERNAL, err
+	}
+	return &ownedConnector{connector: connector, instance: instance}, C.SHOAL_STATUS_OK, nil
+}
+
+func lookupConnector(handle *C.shoal_connector) (*ownedConnector, error) {
+	if handle == nil {
+		return nil, errors.New("shoal: connector handle is NULL")
+	}
+	id := uint64(C.shoal_bridge_connector_id(handle))
+	if id == 0 {
+		return nil, errors.New("shoal: connector handle is invalid")
+	}
+	connector, ok := connectors.get(id)
+	if !ok {
+		return nil, errors.New("shoal: connector handle is unknown or freed")
+	}
+	return connector, nil
+}
+
+func requiredString(value *C.char, name string) (string, error) {
+	if value == nil {
+		return "", fmt.Errorf("shoal: %s is required", name)
+	}
+	converted := C.GoString(value)
+	if converted == "" {
+		return "", fmt.Errorf("shoal: %s is required", name)
+	}
+	return converted, nil
+}
+
+func optionalString(value *C.char) string {
+	if value == nil {
+		return ""
+	}
+	return C.GoString(value)
+}
+
+func parseServers(value *C.char) ([]string, error) {
+	raw, err := requiredString(value, "zookeeper_servers")
+	if err != nil {
+		return nil, err
+	}
+	parts := strings.Split(raw, ",")
+	servers := make([]string, 0, len(parts))
+	for _, part := range parts {
+		server := strings.TrimSpace(part)
+		if server == "" {
+			return nil, errors.New("shoal: zookeeper_servers contains an empty server")
+		}
+		servers = append(servers, server)
+	}
+	return servers, nil
+}
+
+func copyBytes(value *C.uint8_t, length C.size_t, name string) ([]byte, error) {
+	if length == 0 {
+		return nil, nil
+	}
+	if value == nil {
+		return nil, fmt.Errorf("shoal: %s is NULL with non-zero length", name)
+	}
+	maxInt := uint64(^uint(0) >> 1)
+	if uint64(length) > maxInt {
+		return nil, fmt.Errorf("shoal: %s is too large", name)
+	}
+	source := unsafe.Slice((*byte)(unsafe.Pointer(value)), int(length))
+	return append([]byte(nil), source...), nil
+}
+
+func durationMilliseconds(value C.int64_t, name string, defaultValue time.Duration) (time.Duration, error) {
+	milliseconds := int64(value)
+	if milliseconds < 0 {
+		return 0, fmt.Errorf("shoal: %s must not be negative", name)
+	}
+	if milliseconds == 0 {
+		return defaultValue, nil
+	}
+	if milliseconds > int64(^uint64(0)>>1)/int64(time.Millisecond) {
+		return 0, fmt.Errorf("shoal: %s is too large", name)
+	}
+	return time.Duration(milliseconds) * time.Millisecond, nil
+}
+
+func clearError(outError **C.shoal_error) {
+	if outError != nil {
+		*outError = nil
+	}
+}
+
+func fail(outError **C.shoal_error, code C.shoal_status, err error) C.shoal_status {
+	if outError != nil {
+		message := err.Error()
+		cMessage := C.CString(message)
+		if cMessage != nil {
+			*outError = C.shoal_bridge_error_alloc(code, cMessage, C.size_t(len(message)))
+			C.free(unsafe.Pointer(cMessage))
+		}
+	}
+	return code
+}
+
+func zeroBytes(value []byte) {
+	for index := range value {
+		value[index] = 0
+	}
+}

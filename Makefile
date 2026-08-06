@@ -25,6 +25,18 @@ THRIFT_IDL            := internal/thrift/idl
 THRIFT_OUT            := internal/thrift/gen
 THRIFT_PACKAGE_PREFIX := github.com/phrocker/shoal/internal/thrift/gen/
 
+GOOS := $(shell go env GOOS)
+ifeq ($(GOOS),windows)
+CAPI_LIBRARY := shoal.dll
+CAPI_INTERMEDIATE := shoal-cgo.dll
+else ifeq ($(GOOS),darwin)
+CAPI_LIBRARY := libshoal.dylib
+CAPI_INTERMEDIATE := shoal-cgo.dylib
+else
+CAPI_LIBRARY := libshoal.so
+CAPI_INTERMEDIATE := shoal-cgo.so
+endif
+
 # Generate the top-level services shoal uses. The compiler's recursive
 # mode follows their vendored includes and emits the shared data packages.
 THRIFT_FILES := \
@@ -151,6 +163,14 @@ _patch-struct-fields:
 .PHONY: build
 build:
 	go build ./...
+
+.PHONY: capi
+capi:
+	mkdir -p bin/capi
+	go build -buildmode=c-shared -o bin/capi/$(CAPI_INTERMEDIATE) ./cmd/shoal-capi
+	mv bin/capi/$(CAPI_INTERMEDIATE) bin/capi/$(CAPI_LIBRARY)
+	rm -f bin/capi/shoal-cgo.h
+	cp capi/include/shoal.h capi/include/shoal_types.h bin/capi/
 
 .PHONY: test
 test:
