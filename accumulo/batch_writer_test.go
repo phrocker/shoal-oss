@@ -510,7 +510,7 @@ func TestBatchWriterAmbiguousAutomaticFlushErrorIsSticky(t *testing.T) {
 
 func TestBatchWriterAutomaticFlushLifecycleDoesNotLeak(t *testing.T) {
 	const writerCount = 32
-	for index := range writerCount {
+	for index := 0; index < writerCount; index++ {
 		ingest := &fakeBatchWriterIngest{}
 		writer := newBatchWriterTestWriter(t, discoveryTablets(), BatchWriterOptions{
 			MaxLatency: time.Hour,

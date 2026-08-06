@@ -451,6 +451,8 @@ func (w *BatchWriter) automaticFlushLoop(ctx context.Context) {
 		if timer == nil {
 			timer = time.NewTimer(delay)
 		} else {
+			// go.mod requires Go 1.25; channel timers have guaranteed that
+			// Reset cannot expose a stale pre-reset tick since Go 1.23.
 			timer.Reset(delay)
 		}
 		timerC = timer.C
