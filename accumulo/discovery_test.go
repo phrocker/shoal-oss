@@ -266,6 +266,7 @@ func (l *lifecycleLocator) InstancePath() string { return "/accumulo/uuid-1" }
 func (l *lifecycleLocator) GetRaw(context.Context, string) ([]byte, error) {
 	return nil, nil
 }
+func (l *lifecycleLocator) Children(context.Context, string) ([]string, error) { return nil, nil }
 
 type lifecycleInstance struct {
 	locator *lifecycleLocator

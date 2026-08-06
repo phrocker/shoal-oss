@@ -14,6 +14,23 @@ var (
 	// ErrTableNotFound indicates that no table matches the requested name or ID.
 	ErrTableNotFound = errors.New("accumulo: table not found")
 
+	// ErrTableExists indicates that a requested table name is already in use.
+	ErrTableExists = errors.New("accumulo: table exists")
+
+	// ErrInvalidTableName indicates that Accumulo rejected a table name.
+	ErrInvalidTableName = errors.New("accumulo: invalid table name")
+
+	// ErrNamespaceNotFound indicates that a table's target namespace does not exist.
+	ErrNamespaceNotFound = errors.New("accumulo: namespace not found")
+
+	// ErrPermissionDenied indicates that the authenticated principal is not
+	// authorized for the requested operation.
+	ErrPermissionDenied = errors.New("accumulo: permission denied")
+
+	// ErrManagerUnavailable indicates that no active Accumulo Manager address
+	// is currently advertised in ZooKeeper.
+	ErrManagerUnavailable = errors.New("accumulo: manager unavailable")
+
 	// ErrNoTabletCoversRow indicates malformed or stale metadata with no extent
 	// covering the requested row.
 	ErrNoTabletCoversRow = errors.New("accumulo: no tablet covers row")

@@ -3,7 +3,11 @@ package accumulo
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
+
+	"github.com/phrocker/shoal/internal/managerclient"
+	"github.com/phrocker/shoal/internal/metadata"
 )
 
 func TestTableAdministrationListingAndExistence(t *testing.T) {
@@ -86,5 +90,180 @@ func TestTableAdministrationLifecycleAndCancellation(t *testing.T) {
 	}
 	if _, err := connector.TableExists(context.Background(), "events"); !errors.Is(err, ErrConnectorClosed) {
 		t.Fatalf("TableExists closed error = %v, want ErrConnectorClosed", err)
+	}
+}
+
+type fakeManagerAddress struct {
+	address string
+	err     error
+}
+
+func (r fakeManagerAddress) Address(context.Context) (string, error) {
+	return r.address, r.err
+}
+
+type fakeManagerAdapter struct {
+	mu       sync.Mutex
+	address  string
+	requests []managerclient.Request
+	err      error
+	closed   int
+}
+
+func (m *fakeManagerAdapter) Execute(_ context.Context, address string, req managerclient.Request) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.address = address
+	m.requests = append(m.requests, req)
+	return m.err
+}
+
+func (m *fakeManagerAdapter) Close() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.closed++
+	return nil
+}
+
+func TestTableMutationsUseAccumulo4FATEArguments(t *testing.T) {
+	names := &fakeTableNames{byName: map[string]string{"events": "1"}, byID: map[string]string{"1": "events"}}
+	connector := testConnectorWithDiscovery(t, &fakeTabletWalker{}, names)
+	manager := &fakeManagerAdapter{}
+	connector.manager = manager
+	connector.managerAddr = fakeManagerAddress{address: "manager:9997"}
+
+	if err := connector.CreateTable(context.Background(), "analytics.events"); err != nil {
+		t.Fatal(err)
+	}
+	if err := connector.CreateTable(context.Background(), "accumulo.audit"); err != nil {
+		t.Fatal(err)
+	}
+	if err := connector.DeleteTable(context.Background(), "events"); err != nil {
+		t.Fatal(err)
+	}
+	if err := connector.RenameTable(context.Background(), "events", "renamed"); err != nil {
+		t.Fatal(err)
+	}
+
+	manager.mu.Lock()
+	defer manager.mu.Unlock()
+	if manager.address != "manager:9997" || len(manager.requests) != 4 {
+		t.Fatalf("manager address/requests = %q/%d", manager.address, len(manager.requests))
+	}
+	create := manager.requests[0]
+	if create.Operation != managerclient.TableCreate {
+		t.Fatalf("create operation = %v", create.Operation)
+	}
+	if create.Instance != managerclient.FateUser {
+		t.Fatalf("create FATE instance = %v, want user", create.Instance)
+	}
+	if manager.requests[1].Operation != managerclient.TableCreate ||
+		manager.requests[1].Instance != managerclient.FateMeta {
+		t.Fatalf("system table FATE instance = %v, want meta", manager.requests[1].Instance)
+	}
+	wantCreate := []string{"analytics.events", "MILLIS", "ONLINE", "HOSTED", "0"}
+	for i, want := range wantCreate {
+		if got := string(create.Arguments[i]); got != want {
+			t.Fatalf("create argument %d = %q, want %q", i, got, want)
+		}
+	}
+	if manager.requests[2].Operation != managerclient.TableDelete ||
+		string(manager.requests[2].Arguments[0]) != "events" {
+		t.Fatalf("delete request = %#v", manager.requests[2])
+	}
+	if manager.requests[3].Operation != managerclient.TableRename ||
+		string(manager.requests[3].Arguments[0]) != "events" ||
+		string(manager.requests[3].Arguments[1]) != "renamed" {
+		t.Fatalf("rename request = %#v", manager.requests[3])
+	}
+	if names.invalidates != 4 {
+		t.Fatalf("name invalidations = %d, want 4", names.invalidates)
+	}
+}
+
+func TestTableMutationsMapErrorsAndLifecycle(t *testing.T) {
+	walker := &fakeTabletWalker{tablets: map[string][]metadata.TabletInfo{"1": discoveryTablets()}}
+	names := &fakeTableNames{}
+	connector := testConnectorWithDiscovery(t, walker, names)
+	manager := &fakeManagerAdapter{}
+	connector.manager = manager
+	connector.managerAddr = fakeManagerAddress{address: "manager:9997"}
+
+	if _, err := connector.Tablets(context.Background(), Table{ID: "1"}); err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		kind managerclient.ErrorKind
+		want error
+	}{
+		{managerclient.ErrorTableExists, ErrTableExists},
+		{managerclient.ErrorTableNotFound, ErrTableNotFound},
+		{managerclient.ErrorNamespaceNotFound, ErrNamespaceNotFound},
+		{managerclient.ErrorInvalidName, ErrInvalidTableName},
+		{managerclient.ErrorSecurity, ErrPermissionDenied},
+		{managerclient.ErrorNotActive, ErrManagerUnavailable},
+	}
+	for _, tt := range tests {
+		manager.err = &managerclient.Error{Kind: tt.kind}
+		if err := connector.CreateTable(context.Background(), "events"); !errors.Is(err, tt.want) {
+			t.Fatalf("kind %d error = %v, want %v", tt.kind, err, tt.want)
+		}
+	}
+
+	if _, err := connector.Tablets(context.Background(), Table{ID: "1"}); err != nil {
+		t.Fatal(err)
+	}
+	if walker.calls != 2 {
+		t.Fatalf("tablet discovery calls = %d, want 2 after failed mutation invalidation", walker.calls)
+	}
+	if names.invalidates != len(tests) {
+		t.Fatalf("name invalidations = %d, want %d", names.invalidates, len(tests))
+	}
+
+	if err := connector.CreateTable(context.Background(), ""); !errors.Is(err, ErrInvalidTableName) {
+		t.Fatalf("empty create error = %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := connector.CreateTable(ctx, "events"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled create error = %v", err)
+	}
+
+	static, _ := NewStaticInstance("accumulo", "uuid-1")
+	credentials, _ := PasswordCredentials("root", []byte("secret"))
+	noDiscovery, err := NewConnector(static, credentials, ConnectorOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := noDiscovery.CreateTable(context.Background(), "events"); !errors.Is(err, ErrDiscoveryUnavailable) {
+		t.Fatalf("static create error = %v", err)
+	}
+	if err := noDiscovery.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := noDiscovery.CreateTable(context.Background(), "events"); !errors.Is(err, ErrConnectorClosed) {
+		t.Fatalf("closed create error = %v", err)
+	}
+}
+
+func TestMapManagerErrorUsesServerTableName(t *testing.T) {
+	tests := []struct {
+		kind      managerclient.ErrorKind
+		tableName string
+		want      error
+		text      string
+	}{
+		{managerclient.ErrorTableExists, "renamed", ErrTableExists, `accumulo: table exists: "renamed"`},
+		{managerclient.ErrorInvalidName, "bad name", ErrInvalidTableName, `accumulo: invalid table name: "bad name"`},
+		{managerclient.ErrorNamespaceNotFound, "analytics.events", ErrNamespaceNotFound, `accumulo: namespace not found: "analytics.events"`},
+	}
+	for _, tt := range tests {
+		err := mapManagerError("events", &managerclient.Error{
+			Kind:      tt.kind,
+			TableName: tt.tableName,
+		})
+		if !errors.Is(err, tt.want) || err.Error() != tt.text {
+			t.Fatalf("kind %d error = %v, want %q", tt.kind, err, tt.text)
+		}
 	}
 }

@@ -35,6 +35,7 @@ type discoveryLocator interface {
 	RootTabletLocation(context.Context) (*zk.Location, error)
 	InstancePath() string
 	GetRaw(context.Context, string) ([]byte, error)
+	Children(context.Context, string) ([]string, error)
 }
 
 type discoveryInstance interface {
