@@ -82,11 +82,17 @@ cribs land.
     `applyUpdates` batches → `closeUpdate`
   - independent tablet servers are submitted through a bounded send pool;
     each server is queued to only one send task at a time
+  - maximum-latency processing runs on a scheduled task synchronized with
+    add/flush/close, and close shuts down the scheduler
   - `UpdateErrors.failedExtents` values are committed-mutation counts used
     to invalidate the failed tablet and retry only
     `mutations[committed:]`
   - shoal follows that explicit-prefix retry, but does not replay ambiguous
     `applyUpdates` or `closeUpdate` transport failures
+- `core/.../client/BatchWriterConfig.java`
+  - zero maximum latency means no latency bound
+  - shoal also treats zero as disabled, rather than adopting Accumulo's
+    configured 120-second default
 - `core/.../rpc/clients/ThriftClientTypes.java`
   - `TabletIngestClientService` multiplex service name is `ingest`
 
@@ -138,6 +144,9 @@ pattern reference, not a code dependency.
 - `include/writer/impl/WriterHeuristic.h:60-217` — fixed writer worker count
   and bounded submission queue (shoal uses per-flush workers that are always
   joined instead of persistent threads)
+- `include/writer/Sink.h:89-115` and
+  `src/writer/impl/SinkImpl.cpp:70-177` — sharkbite flushes on queue thresholds,
+  explicit flush, and close; it has no latency-based writer scheduler
 - `src/interconnect/accumulo/AccumuloServerOne.cpp:181-247` — single-shot
   `startScan` invocation shape
 - `include/data/constructs/client/zookeeper/zookeepers.h:35-41` — ZK path
@@ -154,3 +163,11 @@ pattern reference, not a code dependency.
 - **No `DataFileValue` decoding.** Sharkbite ignores the `file:` value
   bytes. We need to parse `size,numEntries[,time]` for accurate split
   decisions and stats. (Optional in V0; required by V1.)
+
+## Go runtime
+
+- `time.Timer.Stop` and `time.Timer.Reset` documentation for Go 1.23+
+  - channel-based timers do not deliver stale values after Stop or Reset
+  - `go.mod` requires Go 1.25, so this guarantee is part of the supported
+    runtime baseline
+  - shoal reuses one channel-based timer and joins its owning goroutine
