@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"sync"
 	"time"
 
 	"github.com/phrocker/shoal/internal/ingestclient"
@@ -13,11 +14,12 @@ import (
 )
 
 const (
-	defaultBatchWriterMaxMemoryBytes int64 = 50 << 20
-	defaultBatchWriterMaxBatchBytes  int64 = 128 << 10
-	defaultBatchWriterMaxRetries           = 3
-	defaultBatchWriterRetryBackoff         = 100 * time.Millisecond
-	batchWriterCleanupTimeout              = 5 * time.Second
+	defaultBatchWriterMaxMemoryBytes  int64 = 50 << 20
+	defaultBatchWriterMaxBatchBytes   int64 = 128 << 10
+	defaultBatchWriterMaxWriteThreads       = 3
+	defaultBatchWriterMaxRetries            = 3
+	defaultBatchWriterRetryBackoff          = 100 * time.Millisecond
+	batchWriterCleanupTimeout               = 5 * time.Second
 )
 
 var (
@@ -53,6 +55,10 @@ type BatchWriterOptions struct {
 	// MaxBatchBytes bounds each applyUpdates mutation batch. Zero uses 128 KiB.
 	MaxBatchBytes int64
 
+	// MaxWriteThreads bounds concurrent tablet-server submissions. Each
+	// tablet server is handled by only one worker per attempt. Zero uses three.
+	MaxWriteThreads int
+
 	// MaxRetries bounds additional attempts after the initial submission.
 	// Zero uses three retries.
 	MaxRetries int
@@ -64,11 +70,12 @@ type BatchWriterOptions struct {
 }
 
 type normalizedBatchWriterOptions struct {
-	maxMemoryBytes int64
-	maxBatchBytes  int64
-	maxRetries     int
-	retryBackoff   time.Duration
-	durability     ingestclient.Durability
+	maxMemoryBytes  int64
+	maxBatchBytes   int64
+	maxWriteThreads int
+	maxRetries      int
+	retryBackoff    time.Duration
+	durability      ingestclient.Durability
 }
 
 // FailedExtent reports an Accumulo 4 failed extent and the committed prefix
@@ -158,11 +165,15 @@ func (e *batchWriterRoutingError) Error() string { return e.err.Error() }
 func (e *batchWriterRoutingError) Unwrap() error { return e.err }
 
 type serverSendResult struct {
-	retry            []bufferedMutation
-	invalidateRows   [][]byte
-	evidence         error
-	beforeAcceptance bool
-	submitted        bool
+	retry          []bufferedMutation
+	invalidateRows [][]byte
+	evidence       error
+	submitted      bool
+}
+
+type serverSendOutcome struct {
+	result serverSendResult
+	err    error
 }
 
 type mutationUpdateResult struct {
@@ -174,7 +185,9 @@ type mutationUpdateResult struct {
 
 // BatchWriter buffers mutations for one table and submits them through
 // Accumulo 4 update sessions. Operations are serialized; concurrent callers
-// waiting for the writer honor their contexts.
+// waiting for the writer honor their contexts. Independent tablet servers are
+// submitted concurrently up to MaxWriteThreads, while each server plan remains
+// ordered and single-threaded.
 type BatchWriter struct {
 	connector *Connector
 	table     Table
@@ -382,14 +395,14 @@ func (w *BatchWriter) flushLocked(ctx context.Context) error {
 		var retry []bufferedMutation
 		var invalidateRows [][]byte
 		var retryEvidence error
-		for index := range plans {
-			result, sendErr := w.sendServer(ctx, plans[index])
+		sendFailed := false
+		for _, outcome := range w.sendServerPlans(ctx, plans) {
+			result := outcome.result
 			submitted = submitted || result.submitted
-			if sendErr != nil {
-				return w.finishSubmissionFailure(
-					submitted,
-					errors.Join(retryEvidence, sendErr),
-				)
+			if outcome.err != nil {
+				sendFailed = true
+				retryEvidence = errors.Join(retryEvidence, outcome.err)
+				continue
 			}
 			if len(result.retry) == 0 {
 				continue
@@ -397,12 +410,9 @@ func (w *BatchWriter) flushLocked(ctx context.Context) error {
 			retry = append(retry, result.retry...)
 			invalidateRows = append(invalidateRows, result.invalidateRows...)
 			retryEvidence = errors.Join(retryEvidence, result.evidence)
-			if result.beforeAcceptance {
-				for _, unsent := range plans[index+1:] {
-					retry = append(retry, serverPlanMutations(unsent)...)
-				}
-				break
-			}
+		}
+		if sendFailed {
+			return w.finishSubmissionFailure(submitted, retryEvidence)
 		}
 
 		if len(retry) == 0 {
@@ -427,6 +437,42 @@ func (w *BatchWriter) flushLocked(ctx context.Context) error {
 		}
 		remaining = retry
 	}
+}
+
+func (w *BatchWriter) sendServerPlans(
+	ctx context.Context,
+	plans []serverPlan,
+) []serverSendOutcome {
+	outcomes := make([]serverSendOutcome, len(plans))
+	if len(plans) == 0 {
+		return outcomes
+	}
+	workerCount := min(w.options.maxWriteThreads, len(plans))
+	if workerCount == 1 {
+		for index := range plans {
+			outcomes[index].result, outcomes[index].err = w.sendServer(ctx, plans[index])
+		}
+		return outcomes
+	}
+
+	jobs := make(chan int)
+	var workers sync.WaitGroup
+	workers.Add(workerCount)
+	for range workerCount {
+		go func() {
+			defer workers.Done()
+			for index := range jobs {
+				outcomes[index].result, outcomes[index].err =
+					w.sendServer(ctx, plans[index])
+			}
+		}()
+	}
+	for index := range plans {
+		jobs <- index
+	}
+	close(jobs)
+	workers.Wait()
+	return outcomes
 }
 
 func (w *BatchWriter) plan(
@@ -490,10 +536,9 @@ func (w *BatchWriter) sendServer(
 	session, err := w.startSession(ctx, plan.address, w.options.durability)
 	if err != nil {
 		return serverSendResult{
-			retry:            serverPlanMutations(plan),
-			invalidateRows:   serverPlanRows(plan),
-			evidence:         fmt.Errorf("accumulo: start update session on %s: %w", plan.address, err),
-			beforeAcceptance: true,
+			retry:          serverPlanMutations(plan),
+			invalidateRows: serverPlanRows(plan),
+			evidence:       fmt.Errorf("accumulo: start update session on %s: %w", plan.address, err),
 		}, nil
 	}
 	result := serverSendResult{}
@@ -786,6 +831,14 @@ func normalizeBatchWriterOptions(
 	if options.MaxBatchBytes == 0 {
 		options.MaxBatchBytes = defaultBatchWriterMaxBatchBytes
 	}
+	if options.MaxWriteThreads < 0 {
+		return normalizedBatchWriterOptions{}, errors.New(
+			"accumulo: batch writer MaxWriteThreads must not be negative",
+		)
+	}
+	if options.MaxWriteThreads == 0 {
+		options.MaxWriteThreads = defaultBatchWriterMaxWriteThreads
+	}
 	if options.MaxRetries < 0 {
 		return normalizedBatchWriterOptions{}, errors.New(
 			"accumulo: batch writer MaxRetries must not be negative",
@@ -808,11 +861,12 @@ func normalizeBatchWriterOptions(
 		)
 	}
 	return normalizedBatchWriterOptions{
-		maxMemoryBytes: options.MaxMemoryBytes,
-		maxBatchBytes:  options.MaxBatchBytes,
-		maxRetries:     options.MaxRetries,
-		retryBackoff:   options.RetryBackoff,
-		durability:     ingestclient.Durability(options.Durability),
+		maxMemoryBytes:  options.MaxMemoryBytes,
+		maxBatchBytes:   options.MaxBatchBytes,
+		maxWriteThreads: options.MaxWriteThreads,
+		maxRetries:      options.MaxRetries,
+		retryBackoff:    options.RetryBackoff,
+		durability:      ingestclient.Durability(options.Durability),
 	}, nil
 }
 
