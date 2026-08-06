@@ -138,11 +138,12 @@ func TestPublicBatchWriterAPICompiles(t *testing.T) {
 	defer connector.Close()
 
 	_, err = connector.NewBatchWriter(accumulo.Table{Name: "events"}, accumulo.BatchWriterOptions{
-		MaxMemoryBytes: 1 << 20,
-		MaxBatchBytes:  1 << 17,
-		MaxRetries:     3,
-		RetryBackoff:   100 * time.Millisecond,
-		Durability:     accumulo.DurabilitySync,
+		MaxMemoryBytes:  1 << 20,
+		MaxBatchBytes:   1 << 17,
+		MaxWriteThreads: 3,
+		MaxRetries:      3,
+		RetryBackoff:    100 * time.Millisecond,
+		Durability:      accumulo.DurabilitySync,
 	})
 	if !errors.Is(err, accumulo.ErrDiscoveryUnavailable) {
 		t.Fatalf("error = %v, want ErrDiscoveryUnavailable", err)

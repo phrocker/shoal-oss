@@ -80,6 +80,8 @@ cribs land.
 - `core/.../clientImpl/TabletServerBatchWriter.java`
   - one tablet-server client carries `startUpdate` → one-way
     `applyUpdates` batches → `closeUpdate`
+  - independent tablet servers are submitted through a bounded send pool;
+    each server is queued to only one send task at a time
   - `UpdateErrors.failedExtents` values are committed-mutation counts used
     to invalidate the failed tablet and retry only
     `mutations[committed:]`
@@ -133,6 +135,9 @@ pattern reference, not a code dependency.
   pattern (we reuse this; no TTL)
 - `include/interconnect/transport/CachedTransport.h:44-91` — transport-level
   error → cache eviction
+- `include/writer/impl/WriterHeuristic.h:60-217` — fixed writer worker count
+  and bounded submission queue (shoal uses per-flush workers that are always
+  joined instead of persistent threads)
 - `src/interconnect/accumulo/AccumuloServerOne.cpp:181-247` — single-shot
   `startScan` invocation shape
 - `include/data/constructs/client/zookeeper/zookeepers.h:35-41` — ZK path
