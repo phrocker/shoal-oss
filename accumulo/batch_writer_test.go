@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -493,6 +494,76 @@ func TestBatchWriterSurfacesAccumuloUpdateErrors(t *testing.T) {
 	}
 	if rejection.AuthorizationFailures[0].Code != "PERMISSION_DENIED" {
 		t.Fatalf("authorization code = %q", rejection.AuthorizationFailures[0].Code)
+	}
+}
+
+func TestMalformedUpdateErrorsIncludeTabletServer(t *testing.T) {
+	const server = "ts-malformed:9997"
+	extent := func(endRow string) *data.TKeyExtent {
+		return &data.TKeyExtent{
+			Table:  []byte("1"),
+			EndRow: []byte(endRow),
+		}
+	}
+	plan := serverPlan{
+		address: server,
+		extents: []extentPlan{
+			{
+				extent:    extent("k"),
+				mutations: []bufferedMutation{{row: []byte("a")}},
+			},
+		},
+	}
+	cases := []struct {
+		name   string
+		errors *data.UpdateErrors
+	}{
+		{
+			name: "nil failed extent",
+			errors: &data.UpdateErrors{
+				FailedExtents: map[*data.TKeyExtent]int64{nil: 0},
+			},
+		},
+		{
+			name: "unknown failed extent",
+			errors: &data.UpdateErrors{
+				FailedExtents: map[*data.TKeyExtent]int64{extent("z"): 0},
+			},
+		},
+		{
+			name: "invalid committed count",
+			errors: &data.UpdateErrors{
+				FailedExtents: map[*data.TKeyExtent]int64{extent("k"): 2},
+			},
+		},
+		{
+			name: "duplicate failed extent",
+			errors: &data.UpdateErrors{
+				FailedExtents: map[*data.TKeyExtent]int64{
+					extent("k"): 0,
+					extent("k"): 0,
+				},
+			},
+		},
+		{
+			name: "nil authorization extent",
+			errors: &data.UpdateErrors{
+				AuthorizationFailures: map[*data.TKeyExtent]clientpkg.SecurityErrorCode{
+					nil: clientpkg.SecurityErrorCode_PERMISSION_DENIED,
+				},
+			},
+		},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			_, err := decodeMutationUpdateErrors(plan, testCase.errors)
+			if err == nil {
+				t.Fatal("expected malformed update error")
+			}
+			if !strings.Contains(err.Error(), server) {
+				t.Fatalf("error = %q, want tablet server %q", err, server)
+			}
+		})
 	}
 }
 

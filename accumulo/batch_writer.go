@@ -659,28 +659,32 @@ func decodeMutationUpdateErrors(
 	failed := make(map[tabletExtentMapKey]int64, len(updateErrors.FailedExtents))
 	for extent, committed := range updateErrors.FailedExtents {
 		if extent == nil {
-			return mutationUpdateResult{}, errors.New(
-				"accumulo: closeUpdate returned a nil failed extent",
+			return mutationUpdateResult{}, malformedUpdateError(
+				plan.address,
+				"a nil failed extent",
 			)
 		}
 		key := thriftTabletExtentKey(extent)
 		extentIndex, ok := submitted[key]
 		if !ok {
-			return mutationUpdateResult{}, errors.New(
-				"accumulo: closeUpdate returned an unknown failed extent",
+			return mutationUpdateResult{}, malformedUpdateError(
+				plan.address,
+				"an unknown failed extent",
 			)
 		}
 		count := len(plan.extents[extentIndex].mutations)
 		if committed < 0 || committed > int64(count) {
-			return mutationUpdateResult{}, fmt.Errorf(
-				"accumulo: closeUpdate returned invalid committed count %d for %d mutations",
+			return mutationUpdateResult{}, malformedUpdateError(
+				plan.address,
+				"invalid committed count %d for %d mutations",
 				committed,
 				count,
 			)
 		}
 		if _, duplicate := failed[key]; duplicate {
-			return mutationUpdateResult{}, errors.New(
-				"accumulo: closeUpdate returned a duplicate failed extent",
+			return mutationUpdateResult{}, malformedUpdateError(
+				plan.address,
+				"a duplicate failed extent",
 			)
 		}
 		failed[key] = committed
@@ -721,8 +725,9 @@ func decodeMutationUpdateErrors(
 	}
 	for extent, code := range updateErrors.AuthorizationFailures {
 		if extent == nil {
-			return mutationUpdateResult{}, errors.New(
-				"accumulo: closeUpdate returned a nil authorization extent",
+			return mutationUpdateResult{}, malformedUpdateError(
+				plan.address,
+				"a nil authorization extent",
 			)
 		}
 		rejection.AuthorizationFailures = append(
@@ -751,6 +756,15 @@ func decodeMutationUpdateErrors(
 		result.rejection = rejection
 	}
 	return result, nil
+}
+
+func malformedUpdateError(server, format string, args ...any) error {
+	detail := fmt.Sprintf(format, args...)
+	return fmt.Errorf(
+		"accumulo: malformed closeUpdate response from tablet server %s: %s",
+		server,
+		detail,
+	)
 }
 
 func normalizeBatchWriterOptions(
