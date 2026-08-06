@@ -79,7 +79,7 @@ func ManagerAddress(ctx context.Context, locator interface {
 func firstLockNode(children []string) string {
 	type candidate struct {
 		name     string
-		sequence int
+		sequence int64
 	}
 	valid := make([]candidate, 0, len(children))
 	for _, child := range children {
@@ -93,7 +93,8 @@ func firstLockNode(children []string) string {
 		if _, err := uuid.Parse(parts[0]); err != nil {
 			continue
 		}
-		sequence, err := strconv.Atoi(parts[1])
+		// Accumulo ServiceLock.validateAndSort uses Integer.parseInt.
+		sequence, err := strconv.ParseInt(parts[1], 10, 32)
 		if err != nil {
 			continue
 		}

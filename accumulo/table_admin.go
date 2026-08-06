@@ -173,17 +173,21 @@ func mapManagerError(name string, err error) error {
 	if !errors.As(err, &managerErr) {
 		return fmt.Errorf("accumulo: table operation %q: %w", name, err)
 	}
+	errorName := managerErr.TableName
+	if errorName == "" {
+		errorName = name
+	}
 	switch managerErr.Kind {
 	case managerclient.ErrorTableExists:
-		return fmt.Errorf("%w: %q", ErrTableExists, name)
+		return fmt.Errorf("%w: %q", ErrTableExists, errorName)
 	case managerclient.ErrorTableNotFound:
-		return fmt.Errorf("%w: %q", ErrTableNotFound, name)
+		return fmt.Errorf("%w: %q", ErrTableNotFound, errorName)
 	case managerclient.ErrorNamespaceNotFound:
-		return fmt.Errorf("%w: table %q", ErrNamespaceNotFound, name)
+		return fmt.Errorf("%w: %q", ErrNamespaceNotFound, errorName)
 	case managerclient.ErrorInvalidName:
-		return fmt.Errorf("%w: %q", ErrInvalidTableName, name)
+		return fmt.Errorf("%w: %q", ErrInvalidTableName, errorName)
 	case managerclient.ErrorSecurity:
-		return fmt.Errorf("%w: table %q", ErrPermissionDenied, name)
+		return fmt.Errorf("%w: table %q", ErrPermissionDenied, errorName)
 	case managerclient.ErrorNotActive:
 		return ErrManagerUnavailable
 	default:

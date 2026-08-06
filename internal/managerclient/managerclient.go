@@ -18,7 +18,10 @@ import (
 	"github.com/phrocker/shoal/internal/transportpool"
 )
 
-const fateServiceName = "fate"
+const (
+	fateServiceName   = "fate"
+	fateFinishTimeout = 5 * time.Second
+)
 
 type Operation int
 
@@ -99,6 +102,7 @@ type Pooled struct {
 	instanceID      string
 	accumuloVersion string
 	dialTimeout     time.Duration
+	finishTimeout   time.Duration
 
 	mu          sync.RWMutex
 	credentials *security.TCredentials
@@ -133,6 +137,7 @@ func NewPooled(
 		instanceID:      instanceID,
 		accumuloVersion: accumuloVersion,
 		dialTimeout:     dialTimeout,
+		finishTimeout:   fateFinishTimeout,
 		credentials:     cloneCredentials(credentials),
 	}
 	p.dial = p.dialThrift
@@ -153,7 +158,8 @@ func (p *Pooled) Execute(ctx context.Context, address string, req Request) (err 
 	})
 	if id.UUID != "" {
 		defer func() {
-			finishCtx := context.WithoutCancel(ctx)
+			finishCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), p.finishTimeout)
+			defer cancel()
 			_, finishErr := withClient(p, finishCtx, address, func(rpc fateRPC) (struct{}, error) {
 				return struct{}{}, rpc.Finish(finishCtx, credentials, id)
 			})
@@ -418,7 +424,7 @@ func mapRPCError(err error) error {
 		} else if securityErr.Code == clientgen.SecurityErrorCode_NAMESPACE_DOESNT_EXIST {
 			kind = ErrorNamespaceNotFound
 		}
-		return &Error{Kind: kind, Description: securityErr.User, Code: securityErr.Code.String()}
+		return &Error{Kind: kind, Code: securityErr.Code.String()}
 	}
 	var inactiveErr *clientgen.ThriftNotActiveServiceException
 	if errors.As(err, &inactiveErr) {

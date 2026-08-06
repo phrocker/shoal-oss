@@ -209,6 +209,7 @@ func TestTableMutationsMapErrorsAndLifecycle(t *testing.T) {
 			t.Fatalf("kind %d error = %v, want %v", tt.kind, err, tt.want)
 		}
 	}
+
 	if _, err := connector.Tablets(context.Background(), Table{ID: "1"}); err != nil {
 		t.Fatal(err)
 	}
@@ -242,5 +243,27 @@ func TestTableMutationsMapErrorsAndLifecycle(t *testing.T) {
 	}
 	if err := noDiscovery.CreateTable(context.Background(), "events"); !errors.Is(err, ErrConnectorClosed) {
 		t.Fatalf("closed create error = %v", err)
+	}
+}
+
+func TestMapManagerErrorUsesServerTableName(t *testing.T) {
+	tests := []struct {
+		kind      managerclient.ErrorKind
+		tableName string
+		want      error
+		text      string
+	}{
+		{managerclient.ErrorTableExists, "renamed", ErrTableExists, `accumulo: table exists: "renamed"`},
+		{managerclient.ErrorInvalidName, "bad name", ErrInvalidTableName, `accumulo: invalid table name: "bad name"`},
+		{managerclient.ErrorNamespaceNotFound, "analytics.events", ErrNamespaceNotFound, `accumulo: namespace not found: "analytics.events"`},
+	}
+	for _, tt := range tests {
+		err := mapManagerError("events", &managerclient.Error{
+			Kind:      tt.kind,
+			TableName: tt.tableName,
+		})
+		if !errors.Is(err, tt.want) || err.Error() != tt.text {
+			t.Fatalf("kind %d error = %v, want %q", tt.kind, err, tt.text)
+		}
 	}
 }

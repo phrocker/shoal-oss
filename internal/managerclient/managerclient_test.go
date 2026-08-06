@@ -7,6 +7,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/apache/thrift/lib/go/thrift"
 
@@ -101,6 +102,33 @@ func TestPooledFinishesWithCancelledContext(t *testing.T) {
 	}
 	if rpc.finish.Load() != 1 || rpc.finishContextErr != nil {
 		t.Fatalf("finish calls/context = %d/%v", rpc.finish.Load(), rpc.finishContextErr)
+	}
+}
+
+func TestPooledBoundsFinishCleanup(t *testing.T) {
+	pooled, pool := newTestPooled(t)
+	defer pool.Close()
+	pooled.finishTimeout = 20 * time.Millisecond
+
+	rpc := &fakeFateRPC{
+		id: fateID{Type: 1, UUID: "abc"},
+		finishFunc: func(ctx context.Context) error {
+			<-ctx.Done()
+			return ctx.Err()
+		},
+	}
+	pooled.dial = func(context.Context, transportpool.Key) (io.Closer, error) {
+		return &fakeTransport{rpc: rpc}, nil
+	}
+	pooled.newClient = clientFromFakeTransport
+
+	started := time.Now()
+	err := pooled.Execute(context.Background(), "manager:9997", createRequest("events"))
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("error = %v, want context deadline exceeded", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("bounded finish took %v", elapsed)
 	}
 }
 
@@ -230,6 +258,13 @@ func TestMapRPCError(t *testing.T) {
 			t.Fatalf("mapRPCError(%T) = %#v, want kind %d", tt.err, err, tt.kind)
 		}
 	}
+	securityErr := mapRPCError(&clientgen.ThriftSecurityException{
+		User: "root",
+		Code: clientgen.SecurityErrorCode_PERMISSION_DENIED,
+	})
+	if got := securityErr.Error(); got != "managerclient: PERMISSION_DENIED" {
+		t.Fatalf("security error = %q, want code without principal", got)
+	}
 }
 
 func newTestPooled(t *testing.T) (*Pooled, *transportpool.Pool) {
@@ -279,6 +314,7 @@ type fakeFateRPC struct {
 	executeErr error
 	wait       func() error
 	finishErr  error
+	finishFunc func(context.Context) error
 	request    Request
 	instance   FateInstance
 	beginHook  func()
@@ -323,6 +359,9 @@ func (r *fakeFateRPC) Finish(ctx context.Context, _ *security.TCredentials, _ fa
 	r.finishContextErr = ctx.Err()
 	if r.finishHook != nil {
 		r.finishHook()
+	}
+	if r.finishFunc != nil {
+		return r.finishFunc(ctx)
 	}
 	return r.finishErr
 }

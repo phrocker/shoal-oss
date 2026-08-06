@@ -72,3 +72,15 @@ func TestManagerAddressUnavailableAndCancellation(t *testing.T) {
 		t.Fatalf("canceled error = %v", err)
 	}
 }
+
+func TestFirstLockNodeUsesAccumuloSequenceRange(t *testing.T) {
+	const uuid = "407b5e9b-9d92-4aaa-bff0-d9ba9be206a6"
+	maxSequence := "zlock#" + uuid + "#2147483647"
+	if got := firstLockNode([]string{maxSequence}); got != maxSequence {
+		t.Fatalf("max Accumulo sequence = %q, want %q", got, maxSequence)
+	}
+	overflow := "zlock#" + uuid + "#2147483648"
+	if got := firstLockNode([]string{overflow}); got != "" {
+		t.Fatalf("overflow sequence = %q, want invalid", got)
+	}
+}
