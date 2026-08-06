@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -257,16 +258,16 @@ func TestBatchWriterConcurrentAdds(t *testing.T) {
 	errs := make(chan error, mutationCount)
 	var callers sync.WaitGroup
 	callers.Add(mutationCount)
-	for index := range mutationCount {
-		go func() {
+	for index := 0; index < mutationCount; index++ {
+		go func(index int) {
 			defer callers.Done()
-			mutation, err := NewMutation([]byte{byte('a' + index%10)})
+			mutation, err := NewMutation([]byte(fmt.Sprintf("row-%02d", index)))
 			if err == nil {
 				mutation.PutLatest([]byte("cf"), []byte("cq"), nil, []byte{byte(index)})
 				err = writer.Add(context.Background(), mutation)
 			}
 			errs <- err
-		}()
+		}(index)
 	}
 	callers.Wait()
 	close(errs)
@@ -281,13 +282,20 @@ func TestBatchWriterConcurrentAdds(t *testing.T) {
 	ingest.mu.Lock()
 	defer ingest.mu.Unlock()
 	submitted := 0
+	rows := make(map[string]struct{}, mutationCount)
 	for _, session := range ingest.sessions {
 		for _, apply := range session.applies {
 			submitted += len(apply.mutations)
+			for _, mutation := range apply.mutations {
+				rows[string(mutation.Row)] = struct{}{}
+			}
 		}
 	}
 	if submitted != mutationCount {
 		t.Fatalf("submitted = %d, want %d", submitted, mutationCount)
+	}
+	if len(rows) != mutationCount {
+		t.Fatalf("unique rows = %d, want %d", len(rows), mutationCount)
 	}
 }
 
@@ -387,7 +395,7 @@ func TestBatchWriterSurfacesAccumuloUpdateErrors(t *testing.T) {
 	session := &fakeBatchWriterSession{
 		closeResult: &data.UpdateErrors{
 			FailedExtents: map[*data.TKeyExtent]int64{
-				{Table: []byte("1"), EndRow: []byte("k")}: 1,
+				&data.TKeyExtent{Table: []byte("1"), EndRow: []byte("k")}: 1,
 			},
 			ViolationSummaries: []*data.TConstraintViolationSummary{
 				{
@@ -398,7 +406,10 @@ func TestBatchWriterSurfacesAccumuloUpdateErrors(t *testing.T) {
 				},
 			},
 			AuthorizationFailures: map[*data.TKeyExtent]clientpkg.SecurityErrorCode{
-				{Table: []byte("1"), EndRow: []byte("k")}: clientpkg.SecurityErrorCode_PERMISSION_DENIED,
+				&data.TKeyExtent{
+					Table:  []byte("1"),
+					EndRow: []byte("k"),
+				}: clientpkg.SecurityErrorCode_PERMISSION_DENIED,
 			},
 		},
 	}
