@@ -140,6 +140,7 @@ func TestPublicBatchWriterAPICompiles(t *testing.T) {
 	_, err = connector.NewBatchWriter(accumulo.Table{Name: "events"}, accumulo.BatchWriterOptions{
 		MaxMemoryBytes:  1 << 20,
 		MaxBatchBytes:   1 << 17,
+		MaxLatency:      time.Second,
 		MaxWriteThreads: 3,
 		MaxRetries:      3,
 		RetryBackoff:    100 * time.Millisecond,
@@ -161,5 +162,6 @@ func TestPublicBatchWriterAPICompiles(t *testing.T) {
 	_ = accumulo.DurabilityNone
 	_ = accumulo.ErrBatchWriterClosed
 	_ = accumulo.ErrBatchWriterFailed
+	_ = accumulo.ErrBatchWriterAutoFlush
 	_ = accumulo.ErrBatchWriterRetryExhausted
 }

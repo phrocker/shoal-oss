@@ -270,7 +270,265 @@ func TestBatchWriterMemoryBoundFlushesSynchronously(t *testing.T) {
 	}
 }
 
+func TestBatchWriterAutomaticFlushesAtDeadline(t *testing.T) {
+	session := &fakeBatchWriterSession{closeEntered: make(chan struct{}, 1)}
+	writer := newBatchWriterTestWriterWithLocator(
+		t,
+		&fakeTabletWalker{tablets: map[string][]metadata.TabletInfo{
+			"1": discoveryTablets(),
+		}},
+		BatchWriterOptions{MaxLatency: 10 * time.Millisecond},
+	)
+	writer.startSession = func(
+		_ context.Context,
+		_ string,
+		_ ingestclient.Durability,
+	) (batchWriterSession, error) {
+		return session, nil
+	}
+	addBatchWriterMutation(t, writer, "a")
+	waitForBatchWriterSignal(t, session.closeEntered)
+	if err := writer.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := appliedMutationRows(session), []string{"a"}; !equalStrings(got, want) {
+		t.Fatalf("automatic flush rows = %v, want %v", got, want)
+	}
+	waitForBatchWriterSignal(t, writer.autoFlushDone)
+}
+
+func TestBatchWriterAutomaticFlushLeavesIdleWriterEmpty(t *testing.T) {
+	started := make(chan struct{}, 1)
+	writer := newBatchWriterTestWriterWithLocator(
+		t,
+		&fakeTabletWalker{tablets: map[string][]metadata.TabletInfo{
+			"1": discoveryTablets(),
+		}},
+		BatchWriterOptions{MaxLatency: 5 * time.Millisecond},
+	)
+	writer.startSession = func(
+		_ context.Context,
+		_ string,
+		_ ingestclient.Durability,
+	) (batchWriterSession, error) {
+		started <- struct{}{}
+		return &fakeBatchWriterSession{}, nil
+	}
+	time.Sleep(25 * time.Millisecond)
+	select {
+	case <-started:
+		t.Fatal("idle writer started an ingest session")
+	default:
+	}
+	if err := writer.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	waitForBatchWriterSignal(t, writer.autoFlushDone)
+}
+
+func TestBatchWriterExplicitFlushResetsAutomaticDeadline(t *testing.T) {
+	const latency = time.Hour
+	ingest := &fakeBatchWriterIngest{}
+	writer := newBatchWriterTestWriter(t, discoveryTablets(), BatchWriterOptions{
+		MaxLatency: latency,
+	}, ingest)
+	addBatchWriterMutation(t, writer, "a")
+	firstStart := batchWriterPendingStart(t, writer)
+	if err := writer.Flush(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(20 * time.Millisecond)
+	addBatchWriterMutation(t, writer, "b")
+	secondStart := batchWriterPendingStart(t, writer)
+	if !secondStart.After(firstStart) {
+		t.Fatalf("new deadline start = %v, want after %v", secondStart, firstStart)
+	}
+
+	delay, active := writer.automaticFlushStep(
+		context.Background(),
+		firstStart.Add(latency),
+	)
+	if !active || delay <= 0 {
+		t.Fatalf("old deadline active = %v delay = %v, want future reset deadline", active, delay)
+	}
+	ingest.mu.Lock()
+	if len(ingest.sessions) != 1 {
+		ingest.mu.Unlock()
+		t.Fatalf("sessions at old deadline = %d, want one explicit flush", len(ingest.sessions))
+	}
+	ingest.mu.Unlock()
+
+	if _, active := writer.automaticFlushStep(
+		context.Background(),
+		secondStart.Add(latency),
+	); active {
+		t.Fatal("automatic deadline remained active after flushing")
+	}
+	if err := writer.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	ingest.mu.Lock()
+	defer ingest.mu.Unlock()
+	if len(ingest.sessions) != 2 {
+		t.Fatalf("sessions = %d, want explicit and automatic flushes", len(ingest.sessions))
+	}
+	if got, want := appliedMutationRows(ingest.sessions[1]), []string{"b"}; !equalStrings(got, want) {
+		t.Fatalf("reset deadline rows = %v, want %v", got, want)
+	}
+}
+
+func TestBatchWriterCloseWaitsForAutomaticFlush(t *testing.T) {
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	defer releaseOnce.Do(func() { close(release) })
+	session := &fakeBatchWriterSession{
+		applyEntered: entered,
+		applyRelease: release,
+	}
+	writer := newBatchWriterTestWriterWithLocator(
+		t,
+		&fakeTabletWalker{tablets: map[string][]metadata.TabletInfo{
+			"1": discoveryTablets(),
+		}},
+		BatchWriterOptions{MaxLatency: 5 * time.Millisecond},
+	)
+	writer.startSession = func(
+		_ context.Context,
+		_ string,
+		_ ingestclient.Durability,
+	) (batchWriterSession, error) {
+		return session, nil
+	}
+	addBatchWriterMutation(t, writer, "a")
+	waitForBatchWriterSignal(t, entered)
+	closed := make(chan error, 1)
+	go func() {
+		closed <- writer.Close(context.Background())
+	}()
+	select {
+	case err := <-closed:
+		t.Fatalf("Close returned during automatic flush: %v", err)
+	case <-time.After(25 * time.Millisecond):
+	}
+	releaseOnce.Do(func() { close(release) })
+	if err := <-closed; err != nil {
+		t.Fatal(err)
+	}
+	waitForBatchWriterSignal(t, writer.autoFlushDone)
+	if got, want := appliedMutationRows(session), []string{"a"}; !equalStrings(got, want) {
+		t.Fatalf("automatic flush rows = %v, want %v", got, want)
+	}
+}
+
+func TestBatchWriterSafeAutomaticFlushErrorIsSticky(t *testing.T) {
+	startErr := errors.New("start unavailable")
+	starts := 0
+	writer := newBatchWriterTestWriterWithLocator(
+		t,
+		&fakeTabletWalker{tablets: map[string][]metadata.TabletInfo{
+			"1": discoveryTablets(),
+		}},
+		BatchWriterOptions{
+			MaxLatency:   time.Hour,
+			MaxRetries:   1,
+			RetryBackoff: time.Nanosecond,
+		},
+	)
+	writer.startSession = func(
+		_ context.Context,
+		_ string,
+		_ ingestclient.Durability,
+	) (batchWriterSession, error) {
+		starts++
+		return nil, startErr
+	}
+	addBatchWriterMutation(t, writer, "a")
+	writer.automaticFlushStep(
+		context.Background(),
+		batchWriterPendingStart(t, writer).Add(time.Hour),
+	)
+
+	err := writer.Flush(context.Background())
+	if !errors.Is(err, ErrBatchWriterAutoFlush) ||
+		!errors.Is(err, ErrBatchWriterRetryExhausted) ||
+		errors.Is(err, ErrBatchWriterFailed) ||
+		!errors.Is(err, startErr) {
+		t.Fatalf("Flush = %v, want safe sticky automatic failure", err)
+	}
+	mutation, _ := NewMutation([]byte("b"))
+	mutation.PutLatest([]byte("cf"), []byte("cq"), nil, []byte("b"))
+	if addErr := writer.Add(context.Background(), mutation); addErr != err {
+		t.Fatalf("Add error = %v, want stored error %v", addErr, err)
+	}
+	if closeErr := writer.Close(context.Background()); closeErr != err {
+		t.Fatalf("Close error = %v, want stored error %v", closeErr, err)
+	}
+	if starts != 2 {
+		t.Fatalf("start calls = %d, want initial attempt and one retry", starts)
+	}
+	waitForBatchWriterSignal(t, writer.autoFlushDone)
+}
+
+func TestBatchWriterAmbiguousAutomaticFlushErrorIsSticky(t *testing.T) {
+	applyErr := errors.New("apply interrupted")
+	session := &fakeBatchWriterSession{
+		applyErr:     applyErr,
+		cancelResult: true,
+	}
+	writer := newBatchWriterTestWriterWithLocator(
+		t,
+		&fakeTabletWalker{tablets: map[string][]metadata.TabletInfo{
+			"1": discoveryTablets(),
+		}},
+		BatchWriterOptions{MaxLatency: time.Hour},
+	)
+	writer.startSession = func(
+		_ context.Context,
+		_ string,
+		_ ingestclient.Durability,
+	) (batchWriterSession, error) {
+		return session, nil
+	}
+	addBatchWriterMutation(t, writer, "a")
+	writer.automaticFlushStep(
+		context.Background(),
+		batchWriterPendingStart(t, writer).Add(time.Hour),
+	)
+
+	err := writer.Flush(context.Background())
+	if !errors.Is(err, ErrBatchWriterAutoFlush) ||
+		!errors.Is(err, ErrBatchWriterFailed) ||
+		!errors.Is(err, applyErr) {
+		t.Fatalf("Flush = %v, want ambiguous sticky automatic failure", err)
+	}
+	if closeErr := writer.Close(context.Background()); closeErr != err {
+		t.Fatalf("Close error = %v, want stored error %v", closeErr, err)
+	}
+	waitForBatchWriterSignal(t, writer.autoFlushDone)
+}
+
+func TestBatchWriterAutomaticFlushLifecycleDoesNotLeak(t *testing.T) {
+	const writerCount = 32
+	for index := range writerCount {
+		ingest := &fakeBatchWriterIngest{}
+		writer := newBatchWriterTestWriter(t, discoveryTablets(), BatchWriterOptions{
+			MaxLatency: time.Hour,
+		}, ingest)
+		addBatchWriterMutation(t, writer, fmt.Sprintf("row-%d", index))
+		if err := writer.Close(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		waitForBatchWriterSignal(t, writer.autoFlushDone)
+	}
+}
+
 func TestBatchWriterRetryOptionsValidation(t *testing.T) {
+	if _, err := normalizeBatchWriterOptions(BatchWriterOptions{
+		MaxLatency: -time.Nanosecond,
+	}); err == nil {
+		t.Fatal("expected negative MaxLatency error")
+	}
 	if _, err := normalizeBatchWriterOptions(BatchWriterOptions{
 		MaxWriteThreads: -1,
 	}); err == nil {
@@ -292,6 +550,9 @@ func TestBatchWriterRetryOptionsValidation(t *testing.T) {
 	}
 	if options.maxWriteThreads != 3 {
 		t.Fatalf("default max write threads = %d, want 3", options.maxWriteThreads)
+	}
+	if options.maxLatency != 0 {
+		t.Fatalf("default max latency = %v, want disabled", options.maxLatency)
 	}
 }
 
@@ -1314,6 +1575,15 @@ func addBatchWriterMutation(t *testing.T, writer *BatchWriter, row string) {
 	if err := writer.Add(context.Background(), mutation); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func batchWriterPendingStart(t *testing.T, writer *BatchWriter) time.Time {
+	t.Helper()
+	if err := writer.lock(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer writer.unlock()
+	return writer.pendingSince
 }
 
 func waitForBatchWriterSignal(t *testing.T, signal <-chan struct{}) {
