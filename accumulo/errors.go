@@ -20,6 +20,10 @@ var (
 	// ErrInvalidTableName indicates that Accumulo rejected a table name.
 	ErrInvalidTableName = errors.New("accumulo: invalid table name")
 
+	// ErrInvalidProperty indicates that Accumulo rejected a property name or
+	// value.
+	ErrInvalidProperty = errors.New("accumulo: invalid property")
+
 	// ErrNamespaceNotFound indicates that a table's target namespace does not exist.
 	ErrNamespaceNotFound = errors.New("accumulo: namespace not found")
 

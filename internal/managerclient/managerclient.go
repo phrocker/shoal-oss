@@ -19,8 +19,9 @@ import (
 )
 
 const (
-	fateServiceName   = "fate"
-	fateFinishTimeout = 5 * time.Second
+	fateServiceName    = "fate"
+	managerServiceName = "mgr"
+	fateFinishTimeout  = 5 * time.Second
 )
 
 type Operation int
@@ -54,6 +55,7 @@ const (
 	ErrorNamespaceExists
 	ErrorNamespaceNotFound
 	ErrorInvalidName
+	ErrorInvalidProperty
 	ErrorSecurity
 	ErrorNotActive
 )
@@ -62,6 +64,8 @@ type Error struct {
 	Kind        ErrorKind
 	TableID     string
 	TableName   string
+	Property    string
+	Value       string
 	Description string
 	Code        string
 }
@@ -82,6 +86,8 @@ func (e *Error) Error() string {
 
 type Adapter interface {
 	Execute(context.Context, string, Request) error
+	SetTableProperty(context.Context, string, string, string, string) error
+	RemoveTableProperty(context.Context, string, string, string) error
 	Close() error
 }
 
@@ -97,6 +103,11 @@ type fateRPC interface {
 	Finish(context.Context, *security.TCredentials, fateID) error
 }
 
+type managerRPC interface {
+	SetTableProperty(context.Context, *security.TCredentials, string, string, string) error
+	RemoveTableProperty(context.Context, *security.TCredentials, string, string) error
+}
+
 type Pooled struct {
 	pool            *transportpool.Pool
 	instanceID      string
@@ -108,8 +119,9 @@ type Pooled struct {
 	credentials *security.TCredentials
 	closed      bool
 
-	dial      transportpool.DialFunc
-	newClient func(io.Closer) (fateRPC, error)
+	dial             transportpool.DialFunc
+	newClient        func(io.Closer) (fateRPC, error)
+	newManagerClient func(io.Closer) (managerRPC, error)
 }
 
 var _ Adapter = (*Pooled)(nil)
@@ -142,6 +154,7 @@ func NewPooled(
 	}
 	p.dial = p.dialThrift
 	p.newClient = p.newThriftRPC
+	p.newManagerClient = p.newThriftManagerRPC
 	return p, nil
 }
 
@@ -183,18 +196,71 @@ func (p *Pooled) Execute(ctx context.Context, address string, req Request) (err 
 	return nil
 }
 
+func (p *Pooled) SetTableProperty(
+	ctx context.Context,
+	address, tableName, property, value string,
+) error {
+	if err := validatePropertyRequest(tableName, property); err != nil {
+		return err
+	}
+	credentials, err := p.credentialsForRPC()
+	if err != nil {
+		return err
+	}
+	_, err = withManagerClient(p, ctx, address, func(rpc managerRPC) (struct{}, error) {
+		return struct{}{}, rpc.SetTableProperty(ctx, credentials, tableName, property, value)
+	})
+	return mapRPCError(err)
+}
+
+func (p *Pooled) RemoveTableProperty(
+	ctx context.Context,
+	address, tableName, property string,
+) error {
+	if err := validatePropertyRequest(tableName, property); err != nil {
+		return err
+	}
+	credentials, err := p.credentialsForRPC()
+	if err != nil {
+		return err
+	}
+	_, err = withManagerClient(p, ctx, address, func(rpc managerRPC) (struct{}, error) {
+		return struct{}{}, rpc.RemoveTableProperty(ctx, credentials, tableName, property)
+	})
+	return mapRPCError(err)
+}
+
 func withClient[T any](
 	p *Pooled,
 	ctx context.Context,
 	address string,
 	call func(fateRPC) (T, error),
 ) (result T, err error) {
+	return withServiceClient(p, ctx, address, fateServiceName, p.newClient, call)
+}
+
+func withManagerClient[T any](
+	p *Pooled,
+	ctx context.Context,
+	address string,
+	call func(managerRPC) (T, error),
+) (result T, err error) {
+	return withServiceClient(p, ctx, address, managerServiceName, p.newManagerClient, call)
+}
+
+func withServiceClient[T any, C any](
+	p *Pooled,
+	ctx context.Context,
+	address, service string,
+	newClient func(io.Closer) (C, error),
+	call func(C) (T, error),
+) (result T, err error) {
 	if err := ctx.Err(); err != nil {
 		return result, err
 	}
 	key := transportpool.Key{
 		Address:         address,
-		Service:         fateServiceName,
+		Service:         service,
 		InstanceID:      p.instanceID,
 		ProtocolVersion: p.accumuloVersion,
 	}
@@ -202,7 +268,7 @@ func withClient[T any](
 	if err != nil {
 		return result, err
 	}
-	client, err := p.newClient(lease.Transport())
+	client, err := newClient(lease.Transport())
 	if err != nil {
 		return result, errors.Join(err, lease.Invalidate())
 	}
@@ -270,6 +336,17 @@ func (p *Pooled) newThriftRPC(transport io.Closer) (fateRPC, error) {
 	return thriftFateRPC{raw: raw}, nil
 }
 
+func (p *Pooled) newThriftManagerRPC(transport io.Closer) (managerRPC, error) {
+	thriftTransport, ok := transport.(thrift.TTransport)
+	if !ok {
+		return nil, fmt.Errorf("managerclient: pooled transport %T is not a thrift transport", transport)
+	}
+	proto := protocol.NewClientFactory(p.instanceID, p.accumuloVersion).GetProtocol(thriftTransport)
+	muxed := thrift.NewTMultiplexedProtocol(proto, managerServiceName)
+	raw := manager.NewManagerClientServiceClient(thrift.NewTStandardClient(muxed, muxed))
+	return thriftManagerRPC{raw: raw}, nil
+}
+
 type thriftFateRPC struct {
 	raw *manager.FateServiceClient
 }
@@ -292,6 +369,39 @@ func (r thriftFateRPC) Begin(
 		return fateID{}, errors.New("managerclient: begin returned nil FATE ID")
 	}
 	return fateID{Type: int32(id.Type), UUID: id.TxUUIDStr}, nil
+}
+
+type thriftManagerRPC struct {
+	raw *manager.ManagerClientServiceClient
+}
+
+func (r thriftManagerRPC) SetTableProperty(
+	ctx context.Context,
+	credentials *security.TCredentials,
+	tableName, property, value string,
+) error {
+	return r.raw.SetTableProperty(
+		ctx,
+		&clientgen.TInfo{},
+		credentials,
+		tableName,
+		property,
+		value,
+	)
+}
+
+func (r thriftManagerRPC) RemoveTableProperty(
+	ctx context.Context,
+	credentials *security.TCredentials,
+	tableName, property string,
+) error {
+	return r.raw.RemoveTableProperty(
+		ctx,
+		&clientgen.TInfo{},
+		credentials,
+		tableName,
+		property,
+	)
 }
 
 func thriftFateInstance(instance FateInstance) manager.TFateInstanceType {
@@ -389,6 +499,16 @@ func validateRequest(req Request) error {
 	return nil
 }
 
+func validatePropertyRequest(tableName, property string) error {
+	if tableName == "" {
+		return errors.New("managerclient: empty table name")
+	}
+	if property == "" {
+		return errors.New("managerclient: empty property")
+	}
+	return nil
+}
+
 func mapRPCError(err error) error {
 	if err == nil {
 		return nil
@@ -414,6 +534,16 @@ func mapRPCError(err error) error {
 			TableName:   tableErr.TableName,
 			Description: tableErr.Description,
 			Code:        tableErr.Type.String(),
+		}
+	}
+	var propertyErr *manager.ThriftPropertyException
+	if errors.As(err, &propertyErr) {
+		return &Error{
+			Kind:        ErrorInvalidProperty,
+			Property:    propertyErr.Property,
+			Value:       propertyErr.Value,
+			Description: propertyErr.Description,
+			Code:        "INVALID_PROPERTY",
 		}
 	}
 	var securityErr *clientgen.ThriftSecurityException

@@ -12,6 +12,7 @@ import (
 	"github.com/apache/thrift/lib/go/thrift"
 
 	clientgen "github.com/phrocker/shoal/internal/thrift/gen/client"
+	"github.com/phrocker/shoal/internal/thrift/gen/manager"
 	"github.com/phrocker/shoal/internal/thrift/gen/security"
 	"github.com/phrocker/shoal/internal/transportpool"
 )
@@ -224,6 +225,138 @@ func TestPooledConcurrentOperationsUseExclusiveTransports(t *testing.T) {
 	}
 }
 
+func TestPooledTablePropertyMutationsUseManagerServiceAndReuse(t *testing.T) {
+	pooled, pool := newTestPooled(t)
+	defer pool.Close()
+
+	var dials atomic.Int32
+	rpc := &fakeManagerRPC{}
+	pooled.dial = func(_ context.Context, key transportpool.Key) (io.Closer, error) {
+		dials.Add(1)
+		want := transportpool.Key{
+			Address:         "manager:9997",
+			Service:         "mgr",
+			InstanceID:      "uuid-1",
+			ProtocolVersion: "4.0.0-SNAPSHOT",
+		}
+		if key != want {
+			t.Fatalf("key = %+v, want %+v", key, want)
+		}
+		return &fakeTransport{manager: rpc}, nil
+	}
+	pooled.newManagerClient = managerFromFakeTransport
+
+	if err := pooled.SetTableProperty(
+		context.Background(),
+		"manager:9997",
+		"events",
+		"table.file.compress.type",
+		"",
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := pooled.RemoveTableProperty(
+		context.Background(),
+		"manager:9997",
+		"events",
+		"table.file.compress.type",
+	); err != nil {
+		t.Fatal(err)
+	}
+	if dials.Load() != 1 {
+		t.Fatalf("dials = %d, want 1", dials.Load())
+	}
+	if rpc.setCalls.Load() != 1 || rpc.removeCalls.Load() != 1 {
+		t.Fatalf("set/remove calls = %d/%d, want 1/1", rpc.setCalls.Load(), rpc.removeCalls.Load())
+	}
+	if rpc.tableName != "events" || rpc.property != "table.file.compress.type" || rpc.value != "" {
+		t.Fatalf("set request = %q/%q/%q", rpc.tableName, rpc.property, rpc.value)
+	}
+}
+
+func TestPooledTablePropertyWireFailureEvictsTransport(t *testing.T) {
+	pooled, pool := newTestPooled(t)
+	defer pool.Close()
+
+	var dials atomic.Int32
+	var first *fakeTransport
+	pooled.dial = func(context.Context, transportpool.Key) (io.Closer, error) {
+		n := dials.Add(1)
+		rpc := &fakeManagerRPC{}
+		if n == 1 {
+			rpc.setErr = thrift.NewTTransportExceptionFromError(errors.New("reset"))
+		}
+		transport := &fakeTransport{manager: rpc}
+		if n == 1 {
+			first = transport
+		}
+		return transport, nil
+	}
+	pooled.newManagerClient = managerFromFakeTransport
+
+	if err := pooled.SetTableProperty(
+		context.Background(),
+		"manager:9997",
+		"events",
+		"table.file.compress.type",
+		"gz",
+	); err == nil {
+		t.Fatal("expected wire error")
+	}
+	if first.closes.Load() != 1 {
+		t.Fatalf("invalidated closes = %d, want 1", first.closes.Load())
+	}
+	if err := pooled.RemoveTableProperty(
+		context.Background(),
+		"manager:9997",
+		"events",
+		"table.file.compress.type",
+	); err != nil {
+		t.Fatal(err)
+	}
+	if dials.Load() != 2 {
+		t.Fatalf("dials = %d, want 2", dials.Load())
+	}
+}
+
+func TestPooledTablePropertyCancellationAndClose(t *testing.T) {
+	pooled, pool := newTestPooled(t)
+	defer pool.Close()
+
+	var dials atomic.Int32
+	pooled.dial = func(context.Context, transportpool.Key) (io.Closer, error) {
+		dials.Add(1)
+		return &fakeTransport{manager: &fakeManagerRPC{}}, nil
+	}
+	pooled.newManagerClient = managerFromFakeTransport
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := pooled.SetTableProperty(
+		ctx,
+		"manager:9997",
+		"events",
+		"table.file.compress.type",
+		"gz",
+	); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled error = %v", err)
+	}
+	if dials.Load() != 0 {
+		t.Fatalf("canceled operation dials = %d, want 0", dials.Load())
+	}
+	if err := pooled.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := pooled.RemoveTableProperty(
+		context.Background(),
+		"manager:9997",
+		"events",
+		"table.file.compress.type",
+	); err == nil {
+		t.Fatal("expected closed error")
+	}
+}
+
 func TestMapRPCError(t *testing.T) {
 	tests := []struct {
 		err  error
@@ -241,6 +374,11 @@ func TestMapRPCError(t *testing.T) {
 		{&clientgen.ThriftTableOperationException{
 			Type: clientgen.TableOperationExceptionType_INVALID_NAME,
 		}, ErrorInvalidName},
+		{&manager.ThriftPropertyException{
+			Property:    "table.invalid",
+			Value:       "x",
+			Description: "property is not valid",
+		}, ErrorInvalidProperty},
 		{&clientgen.ThriftSecurityException{
 			Code: clientgen.SecurityErrorCode_PERMISSION_DENIED,
 		}, ErrorSecurity},
@@ -264,6 +402,17 @@ func TestMapRPCError(t *testing.T) {
 	})
 	if got := securityErr.Error(); got != "managerclient: PERMISSION_DENIED" {
 		t.Fatalf("security error = %q, want code without principal", got)
+	}
+	var propertyErr *Error
+	if err := mapRPCError(&manager.ThriftPropertyException{
+		Property:    "table.invalid",
+		Value:       "x",
+		Description: "property is not valid",
+	}); !errors.As(err, &propertyErr) ||
+		propertyErr.Property != "table.invalid" ||
+		propertyErr.Value != "x" ||
+		propertyErr.Description != "property is not valid" {
+		t.Fatalf("property error = %#v", err)
 	}
 }
 
@@ -295,8 +444,9 @@ func createRequest(name string) Request {
 }
 
 type fakeTransport struct {
-	rpc    fateRPC
-	closes atomic.Int32
+	rpc     fateRPC
+	manager managerRPC
+	closes  atomic.Int32
 }
 
 func (t *fakeTransport) Close() error {
@@ -306,6 +456,43 @@ func (t *fakeTransport) Close() error {
 
 func clientFromFakeTransport(transport io.Closer) (fateRPC, error) {
 	return transport.(*fakeTransport).rpc, nil
+}
+
+func managerFromFakeTransport(transport io.Closer) (managerRPC, error) {
+	return transport.(*fakeTransport).manager, nil
+}
+
+type fakeManagerRPC struct {
+	setErr      error
+	removeErr   error
+	tableName   string
+	property    string
+	value       string
+	setCalls    atomic.Int32
+	removeCalls atomic.Int32
+}
+
+func (r *fakeManagerRPC) SetTableProperty(
+	_ context.Context,
+	_ *security.TCredentials,
+	tableName, property, value string,
+) error {
+	r.setCalls.Add(1)
+	r.tableName = tableName
+	r.property = property
+	r.value = value
+	return r.setErr
+}
+
+func (r *fakeManagerRPC) RemoveTableProperty(
+	_ context.Context,
+	_ *security.TCredentials,
+	tableName, property string,
+) error {
+	r.removeCalls.Add(1)
+	r.tableName = tableName
+	r.property = property
+	return r.removeErr
 }
 
 type fakeFateRPC struct {
