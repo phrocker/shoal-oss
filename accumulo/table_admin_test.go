@@ -103,11 +103,19 @@ func (r fakeManagerAddress) Address(context.Context) (string, error) {
 }
 
 type fakeManagerAdapter struct {
-	mu       sync.Mutex
-	address  string
-	requests []managerclient.Request
-	err      error
-	closed   int
+	mu               sync.Mutex
+	address          string
+	requests         []managerclient.Request
+	propertyRequests []fakePropertyRequest
+	err              error
+	closed           int
+}
+
+type fakePropertyRequest struct {
+	remove    bool
+	tableName string
+	property  string
+	value     string
 }
 
 func (m *fakeManagerAdapter) Execute(_ context.Context, address string, req managerclient.Request) error {
@@ -115,6 +123,36 @@ func (m *fakeManagerAdapter) Execute(_ context.Context, address string, req mana
 	defer m.mu.Unlock()
 	m.address = address
 	m.requests = append(m.requests, req)
+	return m.err
+}
+
+func (m *fakeManagerAdapter) SetTableProperty(
+	_ context.Context,
+	address, tableName, property, value string,
+) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.address = address
+	m.propertyRequests = append(m.propertyRequests, fakePropertyRequest{
+		tableName: tableName,
+		property:  property,
+		value:     value,
+	})
+	return m.err
+}
+
+func (m *fakeManagerAdapter) RemoveTableProperty(
+	_ context.Context,
+	address, tableName, property string,
+) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.address = address
+	m.propertyRequests = append(m.propertyRequests, fakePropertyRequest{
+		remove:    true,
+		tableName: tableName,
+		property:  property,
+	})
 	return m.err
 }
 
