@@ -106,9 +106,15 @@ type fakeManagerAdapter struct {
 	mu               sync.Mutex
 	address          string
 	requests         []managerclient.Request
+	flushRequests    []fakeFlushRequest
 	propertyRequests []fakePropertyRequest
 	err              error
 	closed           int
+}
+
+type fakeFlushRequest struct {
+	tableID string
+	wait    bool
 }
 
 type fakePropertyRequest struct {
@@ -123,6 +129,21 @@ func (m *fakeManagerAdapter) Execute(_ context.Context, address string, req mana
 	defer m.mu.Unlock()
 	m.address = address
 	m.requests = append(m.requests, req)
+	return m.err
+}
+
+func (m *fakeManagerAdapter) FlushTable(
+	_ context.Context,
+	address, tableID string,
+	wait bool,
+) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.address = address
+	m.flushRequests = append(m.flushRequests, fakeFlushRequest{
+		tableID: tableID,
+		wait:    wait,
+	})
 	return m.err
 }
 

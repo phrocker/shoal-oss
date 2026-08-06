@@ -98,15 +98,14 @@ thrift-verify: thrift-check
 # We do this generically: any writeField that contains `p.<Field>.Write(ctx, oprot)`
 # gets a `if p.<Field> == nil { return nil }` guard inserted at the top.
 # Same logic for binary fields (`p.<Field>` passed to WriteBinary) — we
-# only guard the explicitly-listed ones we know need it (TKeyExtent's
-# endRow/prevEndRow), since not all empty binary fields are equivalent
-# to absent on the Java side.
+# only guard the explicitly-listed ones we know need it, since not all
+# empty binary fields are equivalent to absent on the Java side.
 .PHONY: patch-thrift-nil-binary
 patch-thrift-nil-binary:
 	@$(MAKE) --no-print-directory _patch-binary-fields
 	@$(MAKE) --no-print-directory _patch-struct-fields
 
-# Patch the two known empty-binary-as-absent fields (TKeyExtent.endRow / prevEndRow).
+# Patch TKeyExtent infinite bounds and Manager waitForFlush unbounded rows.
 .PHONY: _patch-binary-fields
 _patch-binary-fields:
 	@f=$(THRIFT_OUT)/data/data.go; \
@@ -121,6 +120,19 @@ _patch-binary-fields:
 	       p==2 && /WriteFieldBegin\(ctx, "prevEndRow"/ { print "  // PATCH (shoal): null prevEndRow = \"infinite prev\" (start of table)."; print "  if p.PrevEndRow == nil { return nil }"; p=0 } \
 	       { print }' $$f > $$f.tmp && mv $$f.tmp $$f; \
 	  echo "_patch-binary-fields: applied"; \
+	fi
+	@f=$(THRIFT_OUT)/manager/manager.go; \
+	test -f $$f || { echo "$$f not found; run thrift-gen first"; exit 1; }; \
+	if grep -q 'PATCH (shoal): nil startRow = unbounded flush start' $$f; then \
+	  echo "_patch-binary-fields: waitForFlush already applied"; \
+	else \
+	  awk 'BEGIN { p=0 } \
+	       /^func \(p \*ManagerClientServiceWaitForFlushArgs\) writeField4\(/ { p=1; print; next } \
+	       /^func \(p \*ManagerClientServiceWaitForFlushArgs\) writeField5\(/ { p=2; print; next } \
+	       p==1 && /WriteFieldBegin\(ctx, "startRow"/ { print "  // PATCH (shoal): nil startRow = unbounded flush start."; print "  if p.StartRow == nil { return nil }"; p=0 } \
+	       p==2 && /WriteFieldBegin\(ctx, "endRow"/   { print "  // PATCH (shoal): nil endRow = unbounded flush end."; print "  if p.EndRow == nil { return nil }"; p=0 } \
+	       { print }' $$f > $$f.tmp && mv $$f.tmp $$f; \
+	  echo "_patch-binary-fields: waitForFlush applied"; \
 	fi
 
 # Generic struct-pointer guard: any writeFieldN across all generated .go

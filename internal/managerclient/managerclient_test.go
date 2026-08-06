@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -357,6 +358,140 @@ func TestPooledTablePropertyCancellationAndClose(t *testing.T) {
 	}
 }
 
+func TestPooledFlushTableLifecycleAndWaitModes(t *testing.T) {
+	pooled, pool := newTestPooled(t)
+	defer pool.Close()
+
+	var dials atomic.Int32
+	rpc := &fakeManagerRPC{flushID: 41}
+	pooled.dial = func(_ context.Context, key transportpool.Key) (io.Closer, error) {
+		dials.Add(1)
+		if key.Service != managerServiceName {
+			t.Fatalf("service = %q, want %q", key.Service, managerServiceName)
+		}
+		return &fakeTransport{manager: rpc}, nil
+	}
+	pooled.newManagerClient = managerFromFakeTransport
+
+	if err := pooled.FlushTable(context.Background(), "manager:9997", "1", false); err != nil {
+		t.Fatal(err)
+	}
+	if err := pooled.FlushTable(context.Background(), "manager:9997", "1", true); err != nil {
+		t.Fatal(err)
+	}
+	if dials.Load() != 1 {
+		t.Fatalf("dials = %d, want 1", dials.Load())
+	}
+	if rpc.initiateCalls.Load() != 2 || rpc.flushWaitCalls.Load() != 2 {
+		t.Fatalf(
+			"initiate/wait calls = %d/%d, want 2/2",
+			rpc.initiateCalls.Load(),
+			rpc.flushWaitCalls.Load(),
+		)
+	}
+	if rpc.flushTableID != "1" || rpc.waitFlushID != 41 {
+		t.Fatalf("flush table/ID = %q/%d", rpc.flushTableID, rpc.waitFlushID)
+	}
+	if !slices.Equal(rpc.maxLoops, []int64{noWaitFlushMaxLoops, waitForFlushMaxLoops}) {
+		t.Fatalf("max loops = %v", rpc.maxLoops)
+	}
+}
+
+func TestPooledFlushTableStopsAfterInitiateFailure(t *testing.T) {
+	pooled, pool := newTestPooled(t)
+	defer pool.Close()
+
+	rpc := &fakeManagerRPC{
+		initiateErr: &clientgen.ThriftTableOperationException{
+			Type:    clientgen.TableOperationExceptionType_NOTFOUND,
+			TableId: "1",
+		},
+	}
+	pooled.dial = func(context.Context, transportpool.Key) (io.Closer, error) {
+		return &fakeTransport{manager: rpc}, nil
+	}
+	pooled.newManagerClient = managerFromFakeTransport
+
+	err := pooled.FlushTable(context.Background(), "manager:9997", "1", true)
+	var managerErr *Error
+	if !errors.As(err, &managerErr) ||
+		managerErr.Kind != ErrorTableNotFound ||
+		managerErr.TableID != "1" {
+		t.Fatalf("error = %#v, want table-not-found for ID 1", err)
+	}
+	if rpc.flushWaitCalls.Load() != 0 {
+		t.Fatalf("wait calls = %d, want 0", rpc.flushWaitCalls.Load())
+	}
+}
+
+func TestPooledFlushCancellationEvictsTransport(t *testing.T) {
+	pooled, pool := newTestPooled(t)
+	defer pool.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	var dials atomic.Int32
+	var first *fakeTransport
+	pooled.dial = func(context.Context, transportpool.Key) (io.Closer, error) {
+		n := dials.Add(1)
+		rpc := &fakeManagerRPC{flushID: 41}
+		if n == 1 {
+			rpc.waitFlush = func(context.Context) error {
+				cancel()
+				return context.Canceled
+			}
+		}
+		transport := &fakeTransport{manager: rpc}
+		if n == 1 {
+			first = transport
+		}
+		return transport, nil
+	}
+	pooled.newManagerClient = managerFromFakeTransport
+
+	if err := pooled.FlushTable(ctx, "manager:9997", "1", true); !errors.Is(err, context.Canceled) {
+		t.Fatalf("flush error = %v, want context canceled", err)
+	}
+	if first.closes.Load() != 1 {
+		t.Fatalf("invalidated closes = %d, want 1", first.closes.Load())
+	}
+	if err := pooled.SetTableProperty(
+		context.Background(),
+		"manager:9997",
+		"events",
+		"table.file.compress.type",
+		"gz",
+	); err != nil {
+		t.Fatal(err)
+	}
+	if dials.Load() != 2 {
+		t.Fatalf("dials = %d, want 2", dials.Load())
+	}
+}
+
+func TestWaitForFlushNilRowsAreAbsentOnWire(t *testing.T) {
+	nilRows := manager.NewManagerClientServiceWaitForFlushArgs()
+	nilRows.Tinfo = &clientgen.TInfo{}
+	nilRows.Credentials = &security.TCredentials{}
+	nilRows.TableName = "1"
+	nilRows.FlushID = 41
+	nilRows.MaxLoops = 1
+	if got, want := thriftFieldIDs(t, nilRows), []int16{1, 2, 3, 6, 7}; !slices.Equal(got, want) {
+		t.Fatalf("nil-row field IDs = %v, want %v", got, want)
+	}
+
+	emptyRows := manager.NewManagerClientServiceWaitForFlushArgs()
+	emptyRows.Tinfo = &clientgen.TInfo{}
+	emptyRows.Credentials = &security.TCredentials{}
+	emptyRows.TableName = "1"
+	emptyRows.StartRow = []byte{}
+	emptyRows.EndRow = []byte{}
+	emptyRows.FlushID = 41
+	emptyRows.MaxLoops = 1
+	if got, want := thriftFieldIDs(t, emptyRows), []int16{1, 2, 3, 4, 5, 6, 7}; !slices.Equal(got, want) {
+		t.Fatalf("empty-row field IDs = %v, want %v", got, want)
+	}
+}
+
 func TestMapRPCError(t *testing.T) {
 	tests := []struct {
 		err  error
@@ -463,13 +598,48 @@ func managerFromFakeTransport(transport io.Closer) (managerRPC, error) {
 }
 
 type fakeManagerRPC struct {
-	setErr      error
-	removeErr   error
-	tableName   string
-	property    string
-	value       string
-	setCalls    atomic.Int32
-	removeCalls atomic.Int32
+	initiateErr    error
+	waitFlushErr   error
+	setErr         error
+	removeErr      error
+	waitFlush      func(context.Context) error
+	tableName      string
+	property       string
+	value          string
+	flushTableID   string
+	flushID        int64
+	waitFlushID    int64
+	maxLoops       []int64
+	initiateCalls  atomic.Int32
+	flushWaitCalls atomic.Int32
+	setCalls       atomic.Int32
+	removeCalls    atomic.Int32
+}
+
+func (r *fakeManagerRPC) InitiateFlush(
+	_ context.Context,
+	_ *security.TCredentials,
+	tableID string,
+) (int64, error) {
+	r.initiateCalls.Add(1)
+	r.flushTableID = tableID
+	return r.flushID, r.initiateErr
+}
+
+func (r *fakeManagerRPC) WaitForFlush(
+	ctx context.Context,
+	_ *security.TCredentials,
+	tableID string,
+	flushID, maxLoops int64,
+) error {
+	r.flushWaitCalls.Add(1)
+	r.flushTableID = tableID
+	r.waitFlushID = flushID
+	r.maxLoops = append(r.maxLoops, maxLoops)
+	if r.waitFlush != nil {
+		return r.waitFlush(ctx)
+	}
+	return r.waitFlushErr
 }
 
 func (r *fakeManagerRPC) SetTableProperty(
@@ -493,6 +663,45 @@ func (r *fakeManagerRPC) RemoveTableProperty(
 	r.tableName = tableName
 	r.property = property
 	return r.removeErr
+}
+
+func thriftFieldIDs(t *testing.T, value thrift.TStruct) []int16 {
+	t.Helper()
+	ctx := context.Background()
+	buffer := thrift.NewTMemoryBuffer()
+	writer := thrift.NewTCompactProtocol(buffer)
+	if err := value.Write(ctx, writer); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	reader := thrift.NewTCompactProtocol(buffer)
+	if _, err := reader.ReadStructBegin(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var ids []int16
+	for {
+		_, fieldType, fieldID, err := reader.ReadFieldBegin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if fieldType == thrift.STOP {
+			break
+		}
+		ids = append(ids, fieldID)
+		if err := reader.Skip(ctx, fieldType); err != nil {
+			t.Fatal(err)
+		}
+		if err := reader.ReadFieldEnd(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := reader.ReadStructEnd(ctx); err != nil {
+		t.Fatal(err)
+	}
+	return ids
 }
 
 type fakeFateRPC struct {
