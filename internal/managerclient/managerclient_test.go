@@ -551,6 +551,122 @@ func TestMapRPCError(t *testing.T) {
 	}
 }
 
+func TestPooledGetTableConfigurationReuseEmptyValuesAndCopyIsolation(t *testing.T) {
+	pooled, pool := newTestPooled(t)
+	defer pool.Close()
+
+	var dials atomic.Int32
+	rpc := &fakeClientRPC{properties: map[string]string{
+		"table.custom.empty": "",
+		"table.file.max":     "15",
+	}}
+	pooled.dial = func(_ context.Context, key transportpool.Key) (io.Closer, error) {
+		dials.Add(1)
+		want := transportpool.Key{
+			Address:         "tablet:9997",
+			Service:         "client",
+			InstanceID:      "uuid-1",
+			ProtocolVersion: "4.0.0-SNAPSHOT",
+		}
+		if key != want {
+			t.Fatalf("key = %+v, want %+v", key, want)
+		}
+		return &fakeTransport{service: rpc}, nil
+	}
+	pooled.newServiceClient = serviceFromFakeTransport
+
+	properties, err := pooled.GetTableConfiguration(context.Background(), "tablet:9997", "events")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if value, ok := properties["table.custom.empty"]; !ok || value != "" {
+		t.Fatalf("empty property = %q/%v, want present empty value", value, ok)
+	}
+	properties["table.file.max"] = "mutated"
+	delete(properties, "table.custom.empty")
+
+	again, err := pooled.GetTableConfiguration(context.Background(), "tablet:9997", "events")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again["table.file.max"] != "15" {
+		t.Fatalf("caller mutation leaked into subsequent result: %#v", again)
+	}
+	if value, ok := again["table.custom.empty"]; !ok || value != "" {
+		t.Fatalf("empty property after reuse = %q/%v", value, ok)
+	}
+	if dials.Load() != 1 || rpc.calls.Load() != 2 || rpc.tableName != "events" {
+		t.Fatalf("dials/calls/table = %d/%d/%q", dials.Load(), rpc.calls.Load(), rpc.tableName)
+	}
+}
+
+func TestPooledGetTableConfigurationMapsErrorsAndInvalidatesCancellation(t *testing.T) {
+	pooled, pool := newTestPooled(t)
+	defer pool.Close()
+
+	securityRPC := &fakeClientRPC{err: &clientgen.ThriftSecurityException{
+		Code: clientgen.SecurityErrorCode_PERMISSION_DENIED,
+	}}
+	pooled.dial = func(context.Context, transportpool.Key) (io.Closer, error) {
+		return &fakeTransport{service: securityRPC}, nil
+	}
+	pooled.newServiceClient = serviceFromFakeTransport
+	_, err := pooled.GetTableConfiguration(context.Background(), "tablet:9997", "events")
+	var managerErr *Error
+	if !errors.As(err, &managerErr) || managerErr.Kind != ErrorSecurity {
+		t.Fatalf("security error = %#v, want ErrorSecurity", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	started := make(chan struct{})
+	cancelRPC := &fakeClientRPC{call: func(ctx context.Context) error {
+		close(started)
+		<-ctx.Done()
+		return ctx.Err()
+	}}
+	var transport *fakeTransport
+	pooled.dial = func(context.Context, transportpool.Key) (io.Closer, error) {
+		transport = &fakeTransport{service: cancelRPC}
+		return transport, nil
+	}
+	pooled.newServiceClient = serviceFromFakeTransport
+
+	// The security response left its healthy transport idle under the same key.
+	// Use another address so cancellation exercises a newly leased transport.
+	result := make(chan error, 1)
+	go func() {
+		_, err := pooled.GetTableConfiguration(ctx, "scan:9997", "events")
+		result <- err
+	}()
+	<-started
+	cancel()
+	if err := <-result; !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancellation error = %v, want context.Canceled", err)
+	}
+	if transport.closes.Load() != 1 {
+		t.Fatalf("canceled transport closes = %d, want 1", transport.closes.Load())
+	}
+}
+
+func TestPooledGetTableConfigurationValidationAndRetryClassification(t *testing.T) {
+	pooled, pool := newTestPooled(t)
+	defer pool.Close()
+
+	if _, err := pooled.GetTableConfiguration(context.Background(), "tablet:9997", ""); err == nil {
+		t.Fatal("expected empty table name error")
+	}
+	if IsRetryableEndpointError(&Error{Kind: ErrorSecurity}) {
+		t.Fatal("application error must not be retried")
+	}
+	if IsRetryableEndpointError(context.Canceled) {
+		t.Fatal("context cancellation must not be retried")
+	}
+	wireErr := thrift.NewTTransportExceptionFromError(errors.New("reset"))
+	if !IsRetryableEndpointError(wireErr) {
+		t.Fatal("transport error should be retried")
+	}
+}
+
 func newTestPooled(t *testing.T) (*Pooled, *transportpool.Pool) {
 	t.Helper()
 	pool, err := transportpool.New(transportpool.Config{MaxIdlePerEndpoint: 1})
@@ -581,6 +697,7 @@ func createRequest(name string) Request {
 type fakeTransport struct {
 	rpc     fateRPC
 	manager managerRPC
+	service clientRPC
 	closes  atomic.Int32
 }
 
@@ -595,6 +712,33 @@ func clientFromFakeTransport(transport io.Closer) (fateRPC, error) {
 
 func managerFromFakeTransport(transport io.Closer) (managerRPC, error) {
 	return transport.(*fakeTransport).manager, nil
+}
+
+func serviceFromFakeTransport(transport io.Closer) (clientRPC, error) {
+	return transport.(*fakeTransport).service, nil
+}
+
+type fakeClientRPC struct {
+	properties map[string]string
+	err        error
+	call       func(context.Context) error
+	tableName  string
+	calls      atomic.Int32
+}
+
+func (r *fakeClientRPC) GetTableConfiguration(
+	ctx context.Context,
+	_ *security.TCredentials,
+	tableName string,
+) (map[string]string, error) {
+	r.calls.Add(1)
+	r.tableName = tableName
+	if r.call != nil {
+		if err := r.call(ctx); err != nil {
+			return nil, err
+		}
+	}
+	return r.properties, r.err
 }
 
 type fakeManagerRPC struct {

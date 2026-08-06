@@ -35,6 +35,10 @@ var (
 	// is currently advertised in ZooKeeper.
 	ErrManagerUnavailable = errors.New("accumulo: manager unavailable")
 
+	// ErrClientServiceUnavailable indicates that no live server currently
+	// advertises the Accumulo ClientService API in ZooKeeper.
+	ErrClientServiceUnavailable = errors.New("accumulo: client service unavailable")
+
 	// ErrNoTabletCoversRow indicates malformed or stale metadata with no extent
 	// covering the requested row.
 	ErrNoTabletCoversRow = errors.New("accumulo: no tablet covers row")
