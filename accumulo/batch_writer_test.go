@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -48,6 +49,29 @@ func (w *blockingBatchWriterWalker) LocateTable(
 	return nil, ctx.Err()
 }
 
+type sequencedBatchWriterWalker struct {
+	mu        sync.Mutex
+	snapshots [][]metadata.TabletInfo
+	calls     int
+}
+
+func (w *sequencedBatchWriterWalker) LocateTable(
+	ctx context.Context,
+	_ string,
+) ([]metadata.TabletInfo, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	index := w.calls
+	w.calls++
+	if index >= len(w.snapshots) {
+		index = len(w.snapshots) - 1
+	}
+	return append([]metadata.TabletInfo(nil), w.snapshots[index]...), nil
+}
+
 type batchWriterApply struct {
 	extent    *data.TKeyExtent
 	mutations []*data.TMutation
@@ -66,6 +90,7 @@ type fakeBatchWriterSession struct {
 	cancelErr     error
 	applyEntered  chan struct{}
 	applyRelease  <-chan struct{}
+	closeEntered  chan struct{}
 	cancelContext error
 }
 
@@ -100,6 +125,9 @@ func (f *fakeBatchWriterSession) Close(context.Context) (*data.UpdateErrors, err
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.closeCalls++
+	if f.closeEntered != nil {
+		f.closeEntered <- struct{}{}
+	}
 	return f.closeResult, f.closeErr
 }
 
@@ -118,9 +146,26 @@ func newBatchWriterTestWriter(
 	ingest *fakeBatchWriterIngest,
 ) *BatchWriter {
 	t.Helper()
-	connector := testConnectorWithDiscovery(
+	writer := newBatchWriterTestWriterWithLocator(
 		t,
 		&fakeTabletWalker{tablets: map[string][]metadata.TabletInfo{"1": tablets}},
+		options,
+	)
+	writer.startSession = ingest.start
+	return writer
+}
+
+func newBatchWriterTestWriterWithLocator(
+	t *testing.T,
+	locator interface {
+		LocateTable(context.Context, string) ([]metadata.TabletInfo, error)
+	},
+	options BatchWriterOptions,
+) *BatchWriter {
+	t.Helper()
+	connector := testConnectorWithDiscovery(
+		t,
+		locator,
 		&fakeTableNames{
 			byName: map[string]string{"events": "1"},
 			byID:   map[string]string{"1": "events"},
@@ -133,7 +178,6 @@ func newBatchWriterTestWriter(
 	if err != nil {
 		t.Fatal(err)
 	}
-	writer.startSession = ingest.start
 	return writer
 }
 
@@ -212,6 +256,19 @@ func TestBatchWriterMemoryBoundFlushesSynchronously(t *testing.T) {
 	defer ingest.mu.Unlock()
 	if len(ingest.sessions) != 1 || ingest.sessions[0].closeCalls != 1 {
 		t.Fatalf("sessions = %d close calls = %d, want synchronous submission", len(ingest.sessions), ingest.sessions[0].closeCalls)
+	}
+}
+
+func TestBatchWriterRetryOptionsValidation(t *testing.T) {
+	if _, err := normalizeBatchWriterOptions(BatchWriterOptions{
+		MaxRetries: -1,
+	}); err == nil {
+		t.Fatal("expected negative MaxRetries error")
+	}
+	if _, err := normalizeBatchWriterOptions(BatchWriterOptions{
+		RetryBackoff: -time.Nanosecond,
+	}); err == nil {
+		t.Fatal("expected negative RetryBackoff error")
 	}
 }
 
@@ -440,6 +497,398 @@ func TestBatchWriterSurfacesAccumuloUpdateErrors(t *testing.T) {
 	}
 }
 
+func TestMalformedUpdateErrorsIncludeTabletServer(t *testing.T) {
+	const server = "ts-malformed:9997"
+	extent := func(endRow string) *data.TKeyExtent {
+		return &data.TKeyExtent{
+			Table:  []byte("1"),
+			EndRow: []byte(endRow),
+		}
+	}
+	plan := serverPlan{
+		address: server,
+		extents: []extentPlan{
+			{
+				extent:    extent("k"),
+				mutations: []bufferedMutation{{row: []byte("a")}},
+			},
+		},
+	}
+	cases := []struct {
+		name   string
+		errors *data.UpdateErrors
+	}{
+		{
+			name: "nil failed extent",
+			errors: &data.UpdateErrors{
+				FailedExtents: map[*data.TKeyExtent]int64{nil: 0},
+			},
+		},
+		{
+			name: "unknown failed extent",
+			errors: &data.UpdateErrors{
+				FailedExtents: map[*data.TKeyExtent]int64{extent("z"): 0},
+			},
+		},
+		{
+			name: "invalid committed count",
+			errors: &data.UpdateErrors{
+				FailedExtents: map[*data.TKeyExtent]int64{extent("k"): 2},
+			},
+		},
+		{
+			name: "duplicate failed extent",
+			errors: &data.UpdateErrors{
+				FailedExtents: map[*data.TKeyExtent]int64{
+					extent("k"): 0,
+					extent("k"): 0,
+				},
+			},
+		},
+		{
+			name: "nil authorization extent",
+			errors: &data.UpdateErrors{
+				AuthorizationFailures: map[*data.TKeyExtent]clientpkg.SecurityErrorCode{
+					nil: clientpkg.SecurityErrorCode_PERMISSION_DENIED,
+				},
+			},
+		},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			_, err := decodeMutationUpdateErrors(plan, testCase.errors)
+			if err == nil {
+				t.Fatal("expected malformed update error")
+			}
+			if !strings.Contains(err.Error(), server) {
+				t.Fatalf("error = %q, want tablet server %q", err, server)
+			}
+		})
+	}
+}
+
+func TestBatchWriterRelocatesExplicitlyUncommittedSuffix(t *testing.T) {
+	walker := &sequencedBatchWriterWalker{
+		snapshots: [][]metadata.TabletInfo{
+			{
+				{
+					TableID: "1",
+					EndRow:  []byte("k"),
+					Location: &metadata.Location{
+						HostPort: "ts1:9997",
+						Session:  "old",
+					},
+				},
+			},
+			{
+				{
+					TableID: "1",
+					EndRow:  []byte("k"),
+					Location: &metadata.Location{
+						HostPort: "ts2:9997",
+						Session:  "new",
+					},
+				},
+			},
+		},
+	}
+	writer := newBatchWriterTestWriterWithLocator(t, walker, BatchWriterOptions{
+		MaxRetries:   1,
+		RetryBackoff: time.Nanosecond,
+	})
+	first := &fakeBatchWriterSession{
+		closeResult: &data.UpdateErrors{
+			FailedExtents: map[*data.TKeyExtent]int64{
+				&data.TKeyExtent{Table: []byte("1"), EndRow: []byte("k")}: 1,
+			},
+		},
+	}
+	second := &fakeBatchWriterSession{}
+	var starts []string
+	writer.startSession = func(
+		_ context.Context,
+		address string,
+		_ ingestclient.Durability,
+	) (batchWriterSession, error) {
+		starts = append(starts, address)
+		switch address {
+		case "ts1:9997":
+			return first, nil
+		case "ts2:9997":
+			return second, nil
+		default:
+			return nil, fmt.Errorf("unexpected tablet server %q", address)
+		}
+	}
+	for _, row := range []string{"a", "b"} {
+		mutation, _ := NewMutation([]byte(row))
+		mutation.PutLatest([]byte("cf"), []byte("cq"), nil, []byte(row))
+		if err := writer.Add(context.Background(), mutation); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := writer.Flush(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"ts1:9997", "ts2:9997"}; !equalStrings(starts, want) {
+		t.Fatalf("starts = %v, want %v", starts, want)
+	}
+	if got, want := appliedMutationRows(first), []string{"a", "b"}; !equalStrings(got, want) {
+		t.Fatalf("initial rows = %v, want %v", got, want)
+	}
+	if got, want := appliedMutationRows(second), []string{"b"}; !equalStrings(got, want) {
+		t.Fatalf("relocated rows = %v, want only uncommitted suffix %v", got, want)
+	}
+}
+
+func TestBatchWriterAcceptsFullyCommittedFailedExtent(t *testing.T) {
+	ingest := &fakeBatchWriterIngest{}
+	writer := newBatchWriterTestWriter(t, discoveryTablets(), BatchWriterOptions{
+		MaxRetries:   1,
+		RetryBackoff: time.Nanosecond,
+	}, ingest)
+	session := &fakeBatchWriterSession{
+		closeResult: &data.UpdateErrors{
+			FailedExtents: map[*data.TKeyExtent]int64{
+				&data.TKeyExtent{Table: []byte("1"), EndRow: []byte("k")}: 2,
+			},
+		},
+	}
+	starts := 0
+	writer.startSession = func(
+		_ context.Context,
+		_ string,
+		_ ingestclient.Durability,
+	) (batchWriterSession, error) {
+		starts++
+		return session, nil
+	}
+	for _, row := range []string{"a", "b"} {
+		mutation, _ := NewMutation([]byte(row))
+		mutation.PutLatest([]byte("cf"), []byte("cq"), nil, []byte(row))
+		if err := writer.Add(context.Background(), mutation); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := writer.Flush(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if starts != 1 {
+		t.Fatalf("start calls = %d, want no empty retry", starts)
+	}
+}
+
+func TestBatchWriterRetriesMovedTabletBeforeAcceptance(t *testing.T) {
+	walker := &sequencedBatchWriterWalker{
+		snapshots: [][]metadata.TabletInfo{
+			{
+				{
+					TableID:  "1",
+					Location: &metadata.Location{HostPort: "ts1:9997"},
+				},
+			},
+			{
+				{
+					TableID:  "1",
+					Location: &metadata.Location{HostPort: "ts2:9997"},
+				},
+			},
+		},
+	}
+	writer := newBatchWriterTestWriterWithLocator(t, walker, BatchWriterOptions{
+		MaxRetries:   1,
+		RetryBackoff: time.Nanosecond,
+	})
+	var starts []string
+	success := &fakeBatchWriterSession{}
+	writer.startSession = func(
+		_ context.Context,
+		address string,
+		_ ingestclient.Durability,
+	) (batchWriterSession, error) {
+		starts = append(starts, address)
+		if address == "ts1:9997" {
+			return nil, errors.New("tablet server moved")
+		}
+		return success, nil
+	}
+	mutation, _ := NewMutation([]byte("row"))
+	mutation.PutLatest([]byte("cf"), []byte("cq"), nil, []byte("value"))
+	if err := writer.Add(context.Background(), mutation); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Flush(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"ts1:9997", "ts2:9997"}; !equalStrings(starts, want) {
+		t.Fatalf("starts = %v, want %v", starts, want)
+	}
+	if got := appliedMutationRows(success); !equalStrings(got, []string{"row"}) {
+		t.Fatalf("successful rows = %v, want row", got)
+	}
+}
+
+func TestBatchWriterPreAcceptanceRetryExhaustionIsNotSticky(t *testing.T) {
+	ingest := &fakeBatchWriterIngest{}
+	writer := newBatchWriterTestWriter(t, discoveryTablets(), BatchWriterOptions{
+		MaxRetries:   1,
+		RetryBackoff: time.Nanosecond,
+	}, ingest)
+	attempts := 0
+	success := &fakeBatchWriterSession{}
+	writer.startSession = func(
+		_ context.Context,
+		_ string,
+		_ ingestclient.Durability,
+	) (batchWriterSession, error) {
+		attempts++
+		if attempts <= 2 {
+			return nil, errors.New("dial unavailable")
+		}
+		return success, nil
+	}
+	mutation, _ := NewMutation([]byte("a"))
+	mutation.PutLatest([]byte("cf"), []byte("cq"), nil, []byte("value"))
+	if err := writer.Add(context.Background(), mutation); err != nil {
+		t.Fatal(err)
+	}
+	err := writer.Flush(context.Background())
+	if !errors.Is(err, ErrBatchWriterRetryExhausted) {
+		t.Fatalf("Flush = %v, want ErrBatchWriterRetryExhausted", err)
+	}
+	if errors.Is(err, ErrBatchWriterFailed) {
+		t.Fatalf("pre-acceptance failure became sticky: %v", err)
+	}
+	if len(writer.pending) != 1 {
+		t.Fatalf("pending = %d, want retained mutation", len(writer.pending))
+	}
+	if err := writer.Flush(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := appliedMutationRows(success); !equalStrings(got, []string{"a"}) {
+		t.Fatalf("successful rows = %v, want a", got)
+	}
+}
+
+func TestBatchWriterExplicitRetryExhaustionIsSticky(t *testing.T) {
+	ingest := &fakeBatchWriterIngest{}
+	writer := newBatchWriterTestWriter(t, discoveryTablets(), BatchWriterOptions{
+		MaxRetries:   1,
+		RetryBackoff: time.Nanosecond,
+	}, ingest)
+	starts := 0
+	writer.startSession = func(
+		_ context.Context,
+		_ string,
+		_ ingestclient.Durability,
+	) (batchWriterSession, error) {
+		starts++
+		return &fakeBatchWriterSession{
+			closeResult: &data.UpdateErrors{
+				FailedExtents: map[*data.TKeyExtent]int64{
+					&data.TKeyExtent{Table: []byte("1"), EndRow: []byte("k")}: 0,
+				},
+			},
+		}, nil
+	}
+	mutation, _ := NewMutation([]byte("a"))
+	mutation.PutLatest([]byte("cf"), []byte("cq"), nil, []byte("value"))
+	if err := writer.Add(context.Background(), mutation); err != nil {
+		t.Fatal(err)
+	}
+	err := writer.Flush(context.Background())
+	var rejection *MutationRejectionError
+	if !errors.Is(err, ErrBatchWriterRetryExhausted) ||
+		!errors.Is(err, ErrBatchWriterFailed) ||
+		!errors.As(err, &rejection) {
+		t.Fatalf("Flush = %v, want sticky retry exhaustion with rejection details", err)
+	}
+	if starts != 2 {
+		t.Fatalf("start calls = %d, want initial attempt plus one retry", starts)
+	}
+	if got := rejection.FailedExtents[0]; got.Submitted != 1 || got.Committed != 0 {
+		t.Fatalf("failed extent = %+v", got)
+	}
+}
+
+func TestBatchWriterDoesNotRetryAmbiguousApplyFailure(t *testing.T) {
+	ingest := &fakeBatchWriterIngest{}
+	writer := newBatchWriterTestWriter(t, discoveryTablets(), BatchWriterOptions{
+		MaxRetries:   3,
+		RetryBackoff: time.Nanosecond,
+	}, ingest)
+	starts := 0
+	session := &fakeBatchWriterSession{
+		applyErr:     errors.New("apply response lost"),
+		cancelResult: true,
+	}
+	writer.startSession = func(
+		_ context.Context,
+		_ string,
+		_ ingestclient.Durability,
+	) (batchWriterSession, error) {
+		starts++
+		return session, nil
+	}
+	mutation, _ := NewMutation([]byte("a"))
+	mutation.PutLatest([]byte("cf"), []byte("cq"), nil, []byte("value"))
+	if err := writer.Add(context.Background(), mutation); err != nil {
+		t.Fatal(err)
+	}
+	err := writer.Flush(context.Background())
+	if !errors.Is(err, ErrBatchWriterFailed) {
+		t.Fatalf("Flush = %v, want ErrBatchWriterFailed", err)
+	}
+	if starts != 1 {
+		t.Fatalf("start calls = %d, want no ambiguous retry", starts)
+	}
+}
+
+func TestBatchWriterRetryBackoffHonorsCancellation(t *testing.T) {
+	ingest := &fakeBatchWriterIngest{}
+	writer := newBatchWriterTestWriter(t, discoveryTablets(), BatchWriterOptions{
+		MaxRetries:   3,
+		RetryBackoff: time.Hour,
+	}, ingest)
+	closeEntered := make(chan struct{}, 1)
+	session := &fakeBatchWriterSession{
+		closeEntered: closeEntered,
+		closeResult: &data.UpdateErrors{
+			FailedExtents: map[*data.TKeyExtent]int64{
+				&data.TKeyExtent{Table: []byte("1"), EndRow: []byte("k")}: 0,
+			},
+		},
+	}
+	starts := 0
+	writer.startSession = func(
+		_ context.Context,
+		_ string,
+		_ ingestclient.Durability,
+	) (batchWriterSession, error) {
+		starts++
+		return session, nil
+	}
+	mutation, _ := NewMutation([]byte("a"))
+	mutation.PutLatest([]byte("cf"), []byte("cq"), nil, []byte("value"))
+	if err := writer.Add(context.Background(), mutation); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- writer.Flush(ctx)
+	}()
+	<-closeEntered
+	cancel()
+	err := <-done
+	if !errors.Is(err, context.Canceled) || !errors.Is(err, ErrBatchWriterFailed) {
+		t.Fatalf("Flush = %v, want sticky context cancellation", err)
+	}
+	if starts != 1 {
+		t.Fatalf("start calls = %d, want cancellation before retry", starts)
+	}
+}
+
 func TestBatchWriterCloseCleanupErrorIsStable(t *testing.T) {
 	ingest := &fakeBatchWriterIngest{}
 	writer := newBatchWriterTestWriter(t, discoveryTablets(), BatchWriterOptions{}, ingest)
@@ -498,6 +947,18 @@ func cloneThriftMutations(mutations []*data.TMutation) []*data.TMutation {
 		}
 	}
 	return cloned
+}
+
+func appliedMutationRows(session *fakeBatchWriterSession) []string {
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	var rows []string
+	for _, apply := range session.applies {
+		for _, mutation := range apply.mutations {
+			rows = append(rows, string(mutation.Row))
+		}
+	}
+	return rows
 }
 
 func equalStrings(left, right []string) bool {
