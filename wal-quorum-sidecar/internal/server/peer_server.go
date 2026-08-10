@@ -8,7 +8,6 @@ import (
 	"io"
 	"log/slog"
 	"os"
-	"strings"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -64,19 +63,22 @@ func (s *PeerServer) PrepareSegment(ctx context.Context, req *pb.PrepareSegmentR
 		"expected_size", req.GetExpectedSize(),
 	)
 
-	_, err := s.mgr.Create(segID, walPath, originator)
+	// A repeat prepare from the same originator is expected: the originator
+	// retries PrepareSegment in the background and re-sends it on a repeat
+	// open. CreateOrAdopt makes that a no-op, while still rejecting a claim
+	// from a different originator or a different generation — those used to be
+	// swallowed by an "already exists" substring match and silently accepted.
+	_, adopted, err := s.mgr.CreateOrAdopt(segID, walPath, originator, segment.RoleReplica)
 	if err != nil {
-		// Treat "already exists" as success — the segment was likely created
-		// via auto-prepare during ReplicateEntries.
-		if strings.Contains(err.Error(), "already exists") {
-			s.logger.Debug("segment already exists, treating as success", "segment_id", segID)
-			return &pb.PrepareSegmentResponse{Success: true}, nil
-		}
 		s.logger.Error("failed to prepare replica segment", "segment_id", segID, "error", err)
 		return &pb.PrepareSegmentResponse{
 			Success: false,
 			Error:   err.Error(),
 		}, nil
+	}
+	if adopted {
+		s.logger.Warn("replica segment already prepared, treating repeat prepare as success",
+			"segment_id", segID, "originator", originator)
 	}
 
 	return &pb.PrepareSegmentResponse{Success: true}, nil

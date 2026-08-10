@@ -21,7 +21,14 @@ type PeerPool struct {
 // from the config. Connections are lazy and not established until the first
 // RPC call on each client.
 func NewPeerPool(cfg *config.Config, logger *slog.Logger) *PeerPool {
-	peerAddrs := cfg.Peers()
+	return NewPeerPoolFromAddresses(cfg.Peers(), logger)
+}
+
+// NewPeerPoolFromAddresses creates a PeerPool for an explicit list of peer
+// addresses. NewPeerPool derives the addresses from the StatefulSet DNS
+// convention; this entry point exists for callers (and tests) that already
+// know the addresses.
+func NewPeerPoolFromAddresses(peerAddrs []string, logger *slog.Logger) *PeerPool {
 	logger = logger.With("component", "peer-pool")
 
 	peers := make([]*PeerClient, 0, len(peerAddrs))
@@ -44,6 +51,18 @@ func NewPeerPool(cfg *config.Config, logger *slog.Logger) *PeerPool {
 // on each to filter to only reachable peers.
 func (pp *PeerPool) GetPeers() []*PeerClient {
 	return pp.peers
+}
+
+// Warm establishes the (otherwise lazy) gRPC connections to every peer and
+// asks each one to start connecting. It does not block on the handshake.
+//
+// Without this, PeerClient.IsHealthy() reports false for every peer until some
+// RPC happens to dial it, so any "wait for a reachable peer" loop waits out its
+// whole timeout against a perfectly healthy cluster.
+func (pp *PeerPool) Warm() {
+	for _, p := range pp.peers {
+		p.Connect()
+	}
 }
 
 // GetHealthyPeers returns only the peers whose gRPC connections are alive.

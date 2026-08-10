@@ -4,6 +4,7 @@ package replication
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -28,6 +29,20 @@ type SegmentInfo struct {
 	Sealed        bool
 }
 
+const (
+	// breakerThreshold is the number of consecutive replication failures to a
+	// peer before that peer is shed for a cooldown.
+	breakerThreshold = 3
+
+	// breakerCooldown is how long a shed peer is skipped before it is retried.
+	breakerCooldown = 5 * time.Second
+)
+
+// ErrPeerCoolingDown is returned instead of attempting replication while a peer
+// is shed by the failure breaker. Callers treat it as a normal peer failure but
+// need not log it per entry — the breaker logs its own state changes.
+var ErrPeerCoolingDown = errors.New("peer is cooling down after repeated replication failures")
+
 // PeerClient manages a gRPC connection to one peer sidecar.
 // The connection is lazy: it is not established until the first RPC call.
 type PeerClient struct {
@@ -42,6 +57,15 @@ type PeerClient struct {
 	// keyed by segment ID, so entries for the same segment reuse the stream.
 	streamsMu sync.Mutex
 	streams   map[string]*replicateStream
+
+	// Failure breaker. A peer that keeps failing is shed for a cooldown so a
+	// single unreachable or wedged peer cannot make every write on this node
+	// pay the full quorum timeout, and so we stop hammering it while it is
+	// down. State changes are logged at WARN.
+	breakerMu       sync.Mutex
+	failures        int
+	cooldownUntil   time.Time
+	suppressedCalls int
 }
 
 // replicateStream holds a persistent bidirectional stream for one segment.
@@ -99,6 +123,74 @@ func (pc *PeerClient) ensureConnected() (pb.WalQuorumPeerClient, error) {
 	return pc.client, nil
 }
 
+// Connect establishes the gRPC connection (if needed) and asks it to start
+// connecting, without blocking on the handshake. Used to warm up the lazily
+// dialed peers so health checks reflect reality.
+func (pc *PeerClient) Connect() {
+	client, err := pc.ensureConnected()
+	if err != nil || client == nil {
+		pc.logger.Warn("failed to create peer connection", "error", err)
+		return
+	}
+	pc.mu.Lock()
+	conn := pc.conn
+	pc.mu.Unlock()
+	if conn != nil {
+		conn.Connect()
+	}
+}
+
+// isCoolingDown reports whether the failure breaker is currently shedding this
+// peer, counting the suppressed call.
+func (pc *PeerClient) isCoolingDown() bool {
+	pc.breakerMu.Lock()
+	defer pc.breakerMu.Unlock()
+
+	if time.Now().Before(pc.cooldownUntil) {
+		pc.suppressedCalls++
+		// Re-state the situation periodically so a long outage stays visible.
+		if pc.suppressedCalls%1000 == 0 {
+			pc.logger.Warn("peer still shed by the failure breaker",
+				"suppressed_calls", pc.suppressedCalls,
+				"cooldown_remaining", time.Until(pc.cooldownUntil).String())
+		}
+		return true
+	}
+	return false
+}
+
+// recordFailure advances the failure breaker, shedding the peer once it has
+// failed breakerThreshold times in a row.
+func (pc *PeerClient) recordFailure(err error) {
+	pc.breakerMu.Lock()
+	defer pc.breakerMu.Unlock()
+
+	pc.failures++
+	if pc.failures >= breakerThreshold && time.Now().After(pc.cooldownUntil) {
+		pc.cooldownUntil = time.Now().Add(breakerCooldown)
+		pc.logger.Warn("shedding peer after consecutive replication failures — "+
+			"writes continue with the remaining replicas",
+			"consecutive_failures", pc.failures,
+			"cooldown", breakerCooldown.String(),
+			"error", err)
+	}
+}
+
+// recordSuccess clears the failure breaker.
+func (pc *PeerClient) recordSuccess() {
+	pc.breakerMu.Lock()
+	defer pc.breakerMu.Unlock()
+
+	if pc.failures >= breakerThreshold || pc.suppressedCalls > 0 {
+		pc.logger.Warn("peer recovered, resuming replication",
+			"consecutive_failures", pc.failures,
+			"suppressed_calls", pc.suppressedCalls)
+	}
+	pc.failures = 0
+	pc.suppressedCalls = 0
+	pc.cooldownUntil = time.Time{}
+}
+
 // PrepareSegment tells the peer to create a replica segment file.
 func (pc *PeerClient) PrepareSegment(ctx context.Context, segmentID, walPath, originatorPod string) error {
 	client, err := pc.ensureConnected()
@@ -126,7 +218,20 @@ func (pc *PeerClient) PrepareSegment(ctx context.Context, segmentID, walPath, or
 // It lazily opens a persistent bidirectional stream per segment ID and reuses
 // it for subsequent entries. Returns nil on success (peer ack received).
 func (pc *PeerClient) ReplicateEntry(ctx context.Context, segmentID string, walPath string, originatorPod string, data []byte, offset int64, seqNum uint64) error {
-	return pc.replicateEntryInner(ctx, segmentID, walPath, originatorPod, data, offset, seqNum, true)
+	// Shed the peer while the failure breaker is open: a peer that is down or
+	// wedged must not cost every write the full quorum timeout, and must not be
+	// re-dialed once per entry.
+	if pc.isCoolingDown() {
+		return ErrPeerCoolingDown
+	}
+
+	err := pc.replicateEntryInner(ctx, segmentID, walPath, originatorPod, data, offset, seqNum, true)
+	if err != nil {
+		pc.recordFailure(err)
+		return err
+	}
+	pc.recordSuccess()
+	return nil
 }
 
 func (pc *PeerClient) replicateEntryInner(ctx context.Context, segmentID, walPath, originatorPod string, data []byte, offset int64, seqNum uint64, retryPrepare bool) error {

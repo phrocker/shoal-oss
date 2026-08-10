@@ -153,6 +153,122 @@ func TestSegmentSealDoesNotBlockReplay(t *testing.T) {
 	seg.Close()
 }
 
+// TestManagerCreateIsIdempotentForSameOwner covers the write-outage case:
+// the TServer-side WAL open is retried for the same segment id after the
+// sidecar already created it. A repeat create by the same owner, on a live
+// (unsealed) segment, must return the existing segment instead of failing.
+func TestManagerCreateIsIdempotentForSameOwner(t *testing.T) {
+	mgr := segment.NewManager(t.TempDir(), testLogger())
+
+	const (
+		id         = "2648432f-dup"
+		walPath    = "/accumulo/wal/tserver-2+9997/2648432f-dup"
+		originator = "tserver-2"
+	)
+
+	first, err := mgr.Create(id, walPath, originator)
+	if err != nil {
+		t.Fatalf("first create failed: %v", err)
+	}
+	if _, _, err := first.Write([]byte("already-written"), 1); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	offsetBefore := first.Offset()
+
+	second, err := mgr.Create(id, walPath, originator)
+	if err != nil {
+		t.Fatalf("repeat create by the same owner must succeed, got: %v", err)
+	}
+	if second != first {
+		t.Error("repeat create must return the existing segment handle")
+	}
+	if second.Offset() != offsetBefore {
+		t.Errorf("repeat create must not truncate or rewind: offset %d, want %d",
+			second.Offset(), offsetBefore)
+	}
+	first.Close()
+}
+
+// TestManagerCreateRejectsDifferentOwner verifies the other half of the
+// contract: an id held by a different originator pod is a genuine conflict and
+// must stay an error.
+func TestManagerCreateRejectsDifferentOwner(t *testing.T) {
+	mgr := segment.NewManager(t.TempDir(), testLogger())
+
+	seg, err := mgr.Create("conflict-1", "/wal/a/conflict-1", "tserver-2")
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	defer seg.Close()
+
+	if _, err := mgr.Create("conflict-1", "/wal/a/conflict-1", "tserver-9"); err == nil {
+		t.Fatal("expected an error when another pod claims a live segment id")
+	}
+}
+
+// TestManagerCreateRejectsDifferentWalPath verifies that the same uuid pointing
+// at a different WAL path is a conflict, not an idempotent re-open.
+func TestManagerCreateRejectsDifferentWalPath(t *testing.T) {
+	mgr := segment.NewManager(t.TempDir(), testLogger())
+
+	seg, err := mgr.Create("conflict-2", "/wal/a/conflict-2", "tserver-2")
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	defer seg.Close()
+
+	if _, err := mgr.Create("conflict-2", "/wal/b/conflict-2", "tserver-2"); err == nil {
+		t.Fatal("expected an error when the same uuid maps to a different WAL path")
+	}
+}
+
+// TestManagerCreateRejectsSealedReopen verifies that a sealed segment's
+// generation is over: re-opening it would append past a finalized checksum.
+func TestManagerCreateRejectsSealedReopen(t *testing.T) {
+	mgr := segment.NewManager(t.TempDir(), testLogger())
+
+	seg, err := mgr.Create("sealed-1", "/wal/a/sealed-1", "tserver-2")
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if _, _, err := seg.Write([]byte("data"), 1); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if _, _, err := seg.Seal(); err != nil {
+		t.Fatalf("seal: %v", err)
+	}
+	defer seg.Close()
+
+	if _, err := mgr.Create("sealed-1", "/wal/a/sealed-1", "tserver-2"); err == nil {
+		t.Fatal("expected an error when re-opening a sealed segment")
+	}
+}
+
+// TestManagerCreateRejectsForeignEpoch verifies that a segment left behind by a
+// previous incarnation (loaded off disk, owner unknown) is never silently
+// adopted by a new local open — that would append this incarnation's entries
+// onto another generation's bytes.
+func TestManagerCreateRejectsForeignEpoch(t *testing.T) {
+	dir := t.TempDir()
+
+	// Previous incarnation writes a segment file and exits.
+	old := segment.NewManager(dir, testLogger())
+	oldSeg, err := old.Create("epoch-1", "/wal/a/epoch-1", "tserver-2")
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if _, _, err := oldSeg.Write([]byte("previous generation bytes"), 1); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	oldSeg.Close()
+
+	// New sidecar incarnation, same WAL directory.
+	fresh := segment.NewManager(dir, testLogger())
+	if _, err := fresh.Create("epoch-1", "/wal/a/epoch-1", "tserver-2"); err == nil {
+		t.Fatal("expected an error when opening a segment left by a previous incarnation")
+	}
+}
+
 // TestManagerOpenCount verifies segment tracking
 func TestManagerOpenCount(t *testing.T) {
 	dir := t.TempDir()

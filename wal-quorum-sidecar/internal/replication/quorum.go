@@ -4,6 +4,7 @@ package replication
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -139,12 +140,18 @@ func (qw *QuorumWriter) WriteAndReplicate(
 					peerAcks++
 				} else {
 					peerErrors = append(peerErrors, fmt.Errorf("peer %s: %w", r.source, r.err))
-					qw.logger.Warn("peer replication failed",
-						"peer", r.source,
-						"segment_id", seg.ID(),
-						"seq", seqNum,
-						"error", r.err,
-					)
+					// A peer shed by the failure breaker already logged itself
+					// at WARN when it was shed and keeps re-stating it while it
+					// is down; logging every suppressed entry here would bury
+					// the originator's own errors under thousands of lines.
+					if !errors.Is(r.err, ErrPeerCoolingDown) {
+						qw.logger.Warn("peer replication failed",
+							"peer", r.source,
+							"segment_id", seg.ID(),
+							"seq", seqNum,
+							"error", r.err,
+						)
+					}
 				}
 			}
 
