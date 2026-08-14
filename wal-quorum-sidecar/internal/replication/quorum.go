@@ -33,9 +33,9 @@ type quorumResult struct {
 // mode) with a warning logged. This ensures the TServer is never blocked
 // by peer failures.
 type QuorumWriter struct {
-	pool           *PeerPool
-	quorumTimeout  time.Duration
-	logger         *slog.Logger
+	pool          *PeerPool
+	quorumTimeout time.Duration
+	logger        *slog.Logger
 }
 
 // NewQuorumWriter creates a QuorumWriter with the given peer pool and timeout.
@@ -117,11 +117,11 @@ func (qw *QuorumWriter) WriteAndReplicate(
 	}
 
 	var (
-		localDone  bool
-		localErr   error
-		peerAcks   int
-		peerErrors []error
-		totalDone  int
+		localDone     bool
+		localErr      error
+		peerAcks      int
+		peerErrors    []error
+		totalDone     int
 		totalExpected = 1 + len(peers)
 	)
 
@@ -302,10 +302,10 @@ func (qw *QuorumWriter) SyncQuorum(ctx context.Context, seg *segment.Segment) er
 	}
 
 	var (
-		localDone bool
-		localErr  error
-		peerAcks  int
-		totalDone int
+		localDone     bool
+		localErr      error
+		peerAcks      int
+		totalDone     int
 		totalExpected = 1 + len(peers)
 	)
 
