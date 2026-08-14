@@ -142,9 +142,11 @@ func (qw *QuorumWriter) WriteAndReplicate(
 					peerErrors = append(peerErrors, fmt.Errorf("peer %s: %w", r.source, r.err))
 					// A peer shed by the failure breaker already logged itself
 					// at WARN when it was shed and keeps re-stating it while it
-					// is down; logging every suppressed entry here would bury
-					// the originator's own errors under thousands of lines.
-					if !errors.Is(r.err, ErrPeerCoolingDown) {
+					// is down, and a peer awaiting a catch-up replay is logged
+					// by the catch-up itself; logging every suppressed entry
+					// here would bury the originator's own errors under
+					// thousands of lines.
+					if !errors.Is(r.err, ErrPeerCoolingDown) && !errors.Is(r.err, ErrPeerReplicaBehind) {
 						qw.logger.Warn("peer replication failed",
 							"peer", r.source,
 							"segment_id", seg.ID(),

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"hash"
+	"io"
 	"os"
 	"sync"
 	"syscall"
@@ -97,6 +98,17 @@ func NewSegment(id, walPath, originatorPod, filePath string) (*Segment, error) {
 		return nil, fmt.Errorf("stat segment file %s: %w", filePath, err)
 	}
 
+	// Reopening a file that already has bytes means the running checksum has
+	// to cover them too, otherwise a later Seal would report the digest of the
+	// appended tail only and every checksum comparison against it would fail.
+	hasher := sha256.New()
+	if info.Size() > 0 {
+		if err := hashFileContents(filePath, hasher); err != nil {
+			_ = f.Close()
+			return nil, err
+		}
+	}
+
 	return &Segment{
 		id:            id,
 		walPath:       walPath,
@@ -104,8 +116,24 @@ func NewSegment(id, walPath, originatorPod, filePath string) (*Segment, error) {
 		file:          f,
 		offset:        info.Size(),
 		state:         StateOpen,
-		hasher:        sha256.New(),
+		hasher:        hasher,
 	}, nil
+}
+
+// hashFileContents feeds the current contents of filePath into h. It is used
+// when a segment file is reopened so the running digest reflects the bytes
+// already on disk.
+func hashFileContents(filePath string, h hash.Hash) error {
+	rf, err := os.Open(filePath)
+	if err != nil {
+		return fmt.Errorf("open segment file %s for checksum: %w", filePath, err)
+	}
+	defer rf.Close()
+
+	if _, err := io.Copy(h, rf); err != nil {
+		return fmt.Errorf("checksum existing contents of %s: %w", filePath, err)
+	}
+	return nil
 }
 
 // ID returns the segment's unique identifier.

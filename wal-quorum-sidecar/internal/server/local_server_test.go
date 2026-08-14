@@ -18,6 +18,7 @@
 package server_test
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"log/slog"
@@ -92,6 +93,62 @@ func startLocalWithPeerWait(t *testing.T, peerAddrs []string, peerWait time.Dura
 	t.Cleanup(func() { _ = conn.Close() })
 
 	return pb.NewWalQuorumLocalClient(conn), mgr
+}
+
+// startPeerAt starts a peer server on a specific address, for tests that need
+// a peer to appear after the originator has already opened its segment.
+func startPeerAt(t *testing.T, addr string, logger *slog.Logger) *segment.Manager {
+	t.Helper()
+
+	mgr := segment.NewManager(t.TempDir(), logger)
+	lis, err := net.Listen("tcp", addr)
+	if err != nil {
+		t.Fatalf("listen on %s: %v", addr, err)
+	}
+
+	srv := grpc.NewServer()
+	server.NewPeerServer(mgr, logger).Register(srv)
+	go func() { _ = srv.Serve(lis) }()
+	t.Cleanup(srv.Stop)
+
+	return mgr
+}
+
+// freeAddress returns a loopback address that nothing is listening on.
+func freeAddress(t *testing.T) string {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	addr := l.Addr().String()
+	_ = l.Close()
+	return addr
+}
+
+// silentListener accepts connections and then says nothing, standing in for a
+// peer that is reachable but wedged.
+func silentListener(t *testing.T) string {
+	t.Helper()
+
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { _ = l.Close() })
+
+	go func() {
+		for {
+			conn, err := l.Accept()
+			if err != nil {
+				return
+			}
+			// Hold the connection open without speaking HTTP/2.
+			t.Cleanup(func() { _ = conn.Close() })
+		}
+	}()
+
+	return l.Addr().String()
 }
 
 func openReq(segID, walPath, originator string) *pb.OpenSegmentRequest {
@@ -302,4 +359,98 @@ func TestOpenSegmentProceedsWhenPeersAreDown(t *testing.T) {
 	}
 	t.Logf("degraded open completed in %s with %d peers reported",
 		elapsed, len(resp.GetPreparedPeers()))
+}
+
+// TestLatePeerIsCaughtUpBeforeSeal is the end-to-end version of the gap
+// problem. The peer is down while the first entries are written, so those
+// entries never reach it. Replication must not simply resume when the peer
+// comes back: the replica would be missing that range, and the divergence
+// would only surface when the seal compares sizes and checksums. The
+// originator has to replay what the replica is missing first.
+func TestLatePeerIsCaughtUpBeforeSeal(t *testing.T) {
+	peerAddr := freeAddress(t)
+	client, mgr := startLocalWithPeerWait(t, []string{peerAddr}, 250*time.Millisecond)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	segID := "2648432f-0000-4000-8000-000000000005"
+	walPath := "/accumulo/wal/tserver-2+9997/" + segID
+
+	resp, err := client.OpenSegment(ctx, openReq(segID, walPath, "tserver-2"))
+	if err != nil {
+		t.Fatalf("OpenSegment RPC failed: %v", err)
+	}
+	if !resp.GetSuccess() {
+		t.Fatalf("OpenSegment failed: %s", resp.GetError())
+	}
+
+	stream, err := client.WriteEntries(ctx)
+	if err != nil {
+		t.Fatalf("WriteEntries: %v", err)
+	}
+	write := func(seq uint64, payload string) {
+		t.Helper()
+		if err := stream.Send(&pb.WriteEntryRequest{
+			SegmentId:   &pb.SegmentId{Uuid: segID, WalPath: walPath},
+			Data:        []byte(payload),
+			SequenceNum: seq,
+		}); err != nil {
+			t.Fatalf("send entry %d: %v", seq, err)
+		}
+		if _, err := stream.Recv(); err != nil {
+			t.Fatalf("ack for entry %d: %v", seq, err)
+		}
+	}
+
+	// Written while the peer is down — these are the bytes the replica misses.
+	for i := uint64(1); i <= 3; i++ {
+		write(i, fmt.Sprintf("entry-%d-written-while-the-peer-was-down;", i))
+	}
+
+	// The peer comes up; the background prepare retry catches it up.
+	peerMgr := startPeerAt(t, peerAddr, slog.Default())
+
+	deadline := time.Now().Add(60 * time.Second)
+	for {
+		if peerSeg := peerMgr.Get(segID); peerSeg != nil && peerSeg.Offset() == mgr.Get(segID).Offset() {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("peer replica was never caught up after the peer came back")
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+
+	// Writes after the catch-up must land on the replica too.
+	for i := uint64(4); i <= 6; i++ {
+		write(i, fmt.Sprintf("entry-%d-written-after-the-peer-returned;", i))
+	}
+	if err := stream.CloseSend(); err != nil {
+		t.Fatalf("close send: %v", err)
+	}
+
+	closeResp, err := client.CloseSegment(ctx, &pb.CloseSegmentRequest{
+		SegmentId: &pb.SegmentId{Uuid: segID, WalPath: walPath},
+	})
+	if err != nil {
+		t.Fatalf("CloseSegment RPC failed: %v", err)
+	}
+	if !closeResp.GetSuccess() {
+		t.Fatalf("CloseSegment failed: %s", closeResp.GetError())
+	}
+
+	local := mgr.Get(segID)
+	replica := peerMgr.Get(segID)
+	if replica == nil {
+		t.Fatal("peer never created the replica")
+	}
+	if replica.Offset() != local.Offset() {
+		t.Fatalf("replica holds %d bytes, originator sealed %d — the entries "+
+			"written while the peer was down were never replayed",
+			replica.Offset(), local.Offset())
+	}
+	if !bytes.Equal(replica.FinalChecksum(), local.FinalChecksum()) {
+		t.Error("replica checksum diverged from the originator's")
+	}
 }

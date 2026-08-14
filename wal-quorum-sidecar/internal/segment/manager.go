@@ -124,9 +124,12 @@ func (m *Manager) CreateOrAdopt(id, walPath, originatorPod string, role Role) (*
 	// A file on disk with no in-memory entry belongs to an earlier incarnation
 	// of this sidecar (the map does not survive a restart). Opening it in the
 	// originator role would append the new generation's entries onto the old
-	// generation's bytes, so refuse. Replicas keep the existing behaviour of
-	// reattaching to the file — that is how a restarted peer catches up — but
-	// say so loudly.
+	// generation's bytes, so refuse. A replica's bytes cannot be vouched for
+	// either — they are unverifiable against the originator's checksum, and
+	// appending to them would leave this replica something other than a strict
+	// prefix of the originator's segment, so no replay could ever repair it.
+	// Discard it instead: the originator replays the whole segment after a
+	// successful prepare.
 	if info, statErr := os.Stat(filePath); statErr == nil && info.Size() > 0 {
 		if role == RoleOriginator {
 			return nil, false, &OwnershipConflictError{
@@ -141,8 +144,12 @@ func (m *Manager) CreateOrAdopt(id, walPath, originatorPod string, role Role) (*
 				Requested: requested,
 			}
 		}
-		m.logger.Warn("reattaching to an existing segment file from a previous incarnation",
+		m.logger.Warn("discarding a stale replica segment file from a previous incarnation — "+
+			"the originator replays this segment from the start",
 			"id", id, "path", filePath, "size", info.Size(), "role", role.String())
+		if err := os.Remove(filePath); err != nil {
+			return nil, false, fmt.Errorf("discard stale replica segment file %s: %w", filePath, err)
+		}
 	}
 
 	seg, err := NewSegment(id, walPath, originatorPod, filePath)

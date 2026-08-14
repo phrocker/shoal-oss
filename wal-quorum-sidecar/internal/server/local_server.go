@@ -34,6 +34,26 @@ import (
 // duration, so a long wait here is itself an outage.
 const DefaultPeerReadyTimeout = 5 * time.Second
 
+const (
+	// prepareAttemptTimeout bounds one background PrepareSegment RPC. Without
+	// it a peer that accepts the connection and never answers blocks the retry
+	// goroutine forever, which both defeats the retry bound and keeps the
+	// (segment, peer) slot claimed so no later attempt can start.
+	prepareAttemptTimeout = 5 * time.Second
+
+	// catchUpTimeout bounds a background replica catch-up.
+	catchUpTimeout = 60 * time.Second
+
+	// catchUpChunkSize is how much of a segment is replayed per message. It
+	// stays well inside the 4 MiB gRPC message limit.
+	catchUpChunkSize = 1 << 20
+
+	// catchUpRetryDelay throttles catch-up attempts against a peer that is
+	// still down, so a steady stream of failing writes cannot start one per
+	// entry.
+	catchUpRetryDelay = 2 * time.Second
+)
+
 // LocalServer implements the WalQuorumLocal gRPC service.
 // It handles communication between the co-located TServer and this sidecar
 // over a Unix domain socket.
@@ -54,11 +74,12 @@ type LocalServer struct {
 	// opens no longer wait for peer readiness.
 	peersEverReady atomic.Bool
 
-	// prepareRetries tracks in-flight background PrepareSegment retry loops,
-	// keyed by "<segmentID>|<peer address>", so repeated opens of the same
-	// segment cannot pile up duplicate retry goroutines against a peer.
-	prepareMu      sync.Mutex
-	prepareRetries map[string]struct{}
+	// peerTasks tracks in-flight background work against a peer (a
+	// PrepareSegment retry loop or a replica catch-up), keyed by
+	// "<kind>|<segmentID>|<peer address>", so repeated opens or a stream of
+	// failing writes cannot pile up duplicate goroutines against a peer.
+	prepareMu sync.Mutex
+	peerTasks map[string]struct{}
 }
 
 // NewLocalServer creates a new LocalServer with quorum replication and GCS
@@ -72,7 +93,7 @@ func NewLocalServer(mgr *segment.Manager, cfg *config.Config, pool *replication.
 		uploader:         uploader,
 		logger:           logger.With("component", "local-server"),
 		peerReadyTimeout: DefaultPeerReadyTimeout,
-		prepareRetries:   make(map[string]struct{}),
+		peerTasks:        make(map[string]struct{}),
 	}
 }
 
@@ -249,29 +270,40 @@ func (s *LocalServer) awaitPeers(ctx context.Context) {
 	}
 }
 
+// claimPeerTask reserves the slot for background work against a peer,
+// reporting whether the caller now owns it.
+func (s *LocalServer) claimPeerTask(key string) bool {
+	s.prepareMu.Lock()
+	defer s.prepareMu.Unlock()
+	if _, running := s.peerTasks[key]; running {
+		return false
+	}
+	s.peerTasks[key] = struct{}{}
+	return true
+}
+
+// releasePeerTask frees a slot claimed by claimPeerTask.
+func (s *LocalServer) releasePeerTask(key string) {
+	s.prepareMu.Lock()
+	delete(s.peerTasks, key)
+	s.prepareMu.Unlock()
+}
+
 // retryPrepareInBackground keeps trying to prepare a segment on a peer that was
 // not ready, then replays whatever the segment has accumulated. At most one
 // retry loop runs per (segment, peer): a wedged or repeatedly reopened segment
 // must not spawn a new loop on every attempt.
 func (s *LocalServer) retryPrepareInBackground(peer *replication.PeerClient, segID, walPath, originator string) {
-	key := segID + "|" + peer.Address()
+	key := "prepare|" + segID + "|" + peer.Address()
 
-	s.prepareMu.Lock()
-	if _, running := s.prepareRetries[key]; running {
-		s.prepareMu.Unlock()
+	if !s.claimPeerTask(key) {
 		s.logger.Warn("prepare retry already running for this segment and peer",
 			"segment_id", segID, "peer", peer.Address())
 		return
 	}
-	s.prepareRetries[key] = struct{}{}
-	s.prepareMu.Unlock()
 
 	go func() {
-		defer func() {
-			s.prepareMu.Lock()
-			delete(s.prepareRetries, key)
-			s.prepareMu.Unlock()
-		}()
+		defer s.releasePeerTask(key)
 
 		for i := 0; i < 30; i++ { // retry for up to 60 seconds
 			time.Sleep(2 * time.Second)
@@ -284,14 +316,23 @@ func (s *LocalServer) retryPrepareInBackground(peer *replication.PeerClient, seg
 				// covered it. Nothing left to prepare.
 				return
 			}
-			if err := peer.PrepareSegment(context.Background(), segID, walPath, originator); err == nil {
+			// Each attempt gets its own deadline: a peer that accepts the
+			// connection but never answers must not park this goroutine (and
+			// this segment's retry slot) forever.
+			if err := s.prepareWithTimeout(peer, segID, walPath, originator); err == nil {
 				s.logger.Info("peer prepared segment (background retry)",
 					"segment_id", segID,
 					"peer", peer.Address(),
 					"attempt", i+1,
 				)
-				// Replay any data already written to this segment
-				s.replaySegmentToPeer(seg, peer)
+				// Replay whatever this segment has accumulated so far.
+				ctx, cancel := context.WithTimeout(context.Background(), catchUpTimeout)
+				err := s.catchUpPeer(ctx, seg, peer)
+				cancel()
+				if err != nil {
+					s.logger.Warn("failed to catch up peer after prepare",
+						"segment_id", segID, "peer", peer.Address(), "error", err)
+				}
 				return
 			}
 		}
@@ -301,6 +342,138 @@ func (s *LocalServer) retryPrepareInBackground(peer *replication.PeerClient, seg
 			"peer", peer.Address(),
 		)
 	}()
+}
+
+// prepareWithTimeout runs one PrepareSegment RPC under its own deadline.
+func (s *LocalServer) prepareWithTimeout(peer *replication.PeerClient, segID, walPath, originator string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), prepareAttemptTimeout)
+	defer cancel()
+	return peer.PrepareSegment(ctx, segID, walPath, originator)
+}
+
+// healReplicas starts a catch-up for every peer whose replica is known to be
+// missing entries. Replication to such a replica is suspended until it has
+// been replayed, so this is what lets a peer rejoin the quorum after a failure
+// or after the failure breaker shed it.
+func (s *LocalServer) healReplicas(seg *segment.Segment) {
+	if s.pool == nil {
+		return
+	}
+	for _, peer := range s.pool.GetPeers() {
+		if !peer.NeedsCatchUp(seg.ID()) {
+			continue
+		}
+		s.catchUpInBackground(seg, peer)
+	}
+}
+
+// catchUpInBackground replays a peer's missing range without blocking the
+// write path. At most one catch-up runs per (segment, peer).
+func (s *LocalServer) catchUpInBackground(seg *segment.Segment, peer *replication.PeerClient) {
+	key := "catchup|" + seg.ID() + "|" + peer.Address()
+	if !s.claimPeerTask(key) {
+		return
+	}
+
+	go func() {
+		defer s.releasePeerTask(key)
+
+		ctx, cancel := context.WithTimeout(context.Background(), catchUpTimeout)
+		defer cancel()
+
+		if err := s.catchUpPeer(ctx, seg, peer); err != nil {
+			s.logger.Warn("failed to catch up peer replica — it stays out of the quorum "+
+				"until the next attempt",
+				"segment_id", seg.ID(), "peer", peer.Address(), "error", err)
+			// Hold the slot a little longer so the next entry does not
+			// immediately start another attempt against a peer still down.
+			time.Sleep(catchUpRetryDelay)
+		}
+	}()
+}
+
+// catchUpPeer replays the byte range a peer's replica is missing, so that
+// replica is once again a complete prefix of the local segment and normal
+// replication can resume.
+//
+// Entries dropped while a peer was failing (or while the failure breaker had
+// shed it) are exactly this missing range. Resuming replication without
+// replaying it would leave a hole in the replica that is invisible until the
+// seal-time size and checksum comparison rejects it.
+func (s *LocalServer) catchUpPeer(ctx context.Context, seg *segment.Segment, peer *replication.PeerClient) error {
+	from, known := peer.ReplicaAcked(seg.ID())
+	if !known {
+		from = 0
+	}
+
+	err := s.sendCatchUpRange(ctx, seg, peer, from)
+	if err != nil && replication.IsSegmentMissing(err) {
+		// The peer lost the replica (restart, or it was never prepared), so
+		// prepare it again and replay the whole segment.
+		if prepErr := peer.PrepareSegment(ctx, seg.ID(), seg.WALPath(), seg.OriginatorPod()); prepErr != nil {
+			return prepErr
+		}
+		err = s.sendCatchUpRange(ctx, seg, peer, 0)
+	}
+	if err != nil {
+		return err
+	}
+
+	metrics.ReplicaCatchups.Inc()
+	s.logger.Info("peer replica caught up",
+		"segment_id", seg.ID(), "peer", peer.Address(),
+		"from_offset", from, "to_offset", seg.Offset())
+	return nil
+}
+
+// sendCatchUpRange streams the segment file from the given offset to the peer.
+// The peer skips any part of the range it already holds, so an overlapping
+// replay is harmless.
+func (s *LocalServer) sendCatchUpRange(ctx context.Context, seg *segment.Segment, peer *replication.PeerClient, from int64) error {
+	filePath := seg.FilePath()
+	if filePath == "" {
+		return fmt.Errorf("segment %s has no file to replay", seg.ID())
+	}
+
+	f, err := os.Open(filePath)
+	if err != nil {
+		return fmt.Errorf("open segment file %s for replay: %w", filePath, err)
+	}
+	defer f.Close()
+
+	if from > 0 {
+		if _, err := f.Seek(from, io.SeekStart); err != nil {
+			return fmt.Errorf("seek segment %s to offset %d: %w", seg.ID(), from, err)
+		}
+	}
+
+	offset := from
+	buf := make([]byte, catchUpChunkSize)
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		n, readErr := f.Read(buf)
+		if n > 0 {
+			if err := peer.CatchUpReplica(ctx, seg.ID(), buf[:n], offset); err != nil {
+				return err
+			}
+			offset += int64(n)
+		}
+		if readErr == io.EOF {
+			break
+		}
+		if readErr != nil {
+			return fmt.Errorf("read segment %s for replay: %w", seg.ID(), readErr)
+		}
+	}
+
+	if offset == from {
+		// Nothing outstanding, but the peer's position still has to be
+		// confirmed before normal replication may resume.
+		return peer.CatchUpReplica(ctx, seg.ID(), nil, from)
+	}
+	return nil
 }
 
 // WriteEntries is a bidirectional streaming RPC. The TServer streams WAL entry
@@ -340,6 +513,12 @@ func (s *LocalServer) WriteEntries(stream pb.WalQuorumLocal_WriteEntriesServer) 
 			)
 			return status.Errorf(codes.Internal, "quorum write failed: %v", err)
 		}
+
+		// A peer that missed this entry (it failed, or the failure breaker
+		// shed it) now holds a short replica, and replication to it stays
+		// suspended until the missing range is replayed. Start that replay in
+		// the background so the peer can rejoin the quorum.
+		s.healReplicas(seg)
 
 		// Ack with actual quorum count (1 = local only / degraded,
 		// 2 = local + 1 peer, 3 = local + 2 peers).
@@ -395,11 +574,21 @@ func (s *LocalServer) CloseSegment(ctx context.Context, req *pb.CloseSegmentRequ
 		return nil, status.Errorf(codes.NotFound, "segment %s not found", segID)
 	}
 
-	// Before sealing, replay data to any peers that were prepared late
-	// and may not have received all entries yet.
+	// Before sealing, replay whatever each peer is missing: a peer prepared
+	// late, restarted, or shed by the failure breaker holds a short replica,
+	// and the seal compares sizes and checksums. Writes have stopped by now,
+	// so this is the point at which a replica can be brought fully level.
 	if s.pool != nil {
 		for _, peer := range s.pool.GetPeers() {
-			s.replaySegmentToPeer(seg, peer)
+			acked, known := peer.ReplicaAcked(segID)
+			if known && !peer.NeedsCatchUp(segID) && acked == seg.Offset() {
+				continue
+			}
+			if err := s.catchUpPeer(ctx, seg, peer); err != nil {
+				s.logger.Warn("failed to catch up peer replica before seal — "+
+					"its seal will be rejected on the size/checksum check",
+					"segment_id", segID, "peer", peer.Address(), "error", err)
+			}
 		}
 	}
 
@@ -411,6 +600,12 @@ func (s *LocalServer) CloseSegment(ctx context.Context, req *pb.CloseSegmentRequ
 			Success: false,
 			Error:   err.Error(),
 		}, nil
+	}
+
+	if s.pool != nil {
+		for _, peer := range s.pool.GetPeers() {
+			peer.ForgetSegment(segID)
+		}
 	}
 
 	metrics.SegmentsOpen.Dec()
@@ -435,71 +630,6 @@ func (s *LocalServer) CloseSegment(ctx context.Context, req *pb.CloseSegmentRequ
 		SegmentSize:   size,
 		GcsObjectPath: gcsPath,
 	}, nil
-}
-
-// replaySegmentToPeer reads the local segment file and sends all its data to
-// a peer that was prepared late (after the segment already had writes).
-// This ensures the peer has a complete replica even if PrepareSegment failed at startup.
-//
-// To prevent data corruption from duplicate appends (if auto-prepare already wrote
-// partial data), the peer's segment is purged and re-prepared before replay.
-func (s *LocalServer) replaySegmentToPeer(seg *segment.Segment, peer *replication.PeerClient) {
-	filePath := seg.FilePath()
-	f, err := os.Open(filePath)
-	if err != nil {
-		s.logger.Warn("failed to open segment file for replay",
-			"segment_id", seg.ID(),
-			"peer", peer.Address(),
-			"error", err,
-		)
-		return
-	}
-	defer f.Close()
-
-	info, err := f.Stat()
-	if err != nil || info.Size() == 0 {
-		s.logger.Debug("nothing to replay", "segment_id", seg.ID(), "size", info.Size())
-		return
-	}
-
-	// Read the entire segment and send as one big replicate entry
-	data := make([]byte, info.Size())
-	n, err := io.ReadFull(f, data)
-	if err != nil && err != io.ErrUnexpectedEOF {
-		s.logger.Warn("failed to read segment file for replay",
-			"segment_id", seg.ID(),
-			"error", err,
-		)
-		return
-	}
-	data = data[:n]
-
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	s.logger.Info("replaying segment to peer",
-		"segment_id", seg.ID(),
-		"peer", peer.Address(),
-		"bytes", n,
-		"originator_offset", seg.Offset(),
-	)
-
-	err = peer.ReplicateEntry(ctx, seg.ID(), seg.WALPath(), seg.OriginatorPod(), data, 0, 0)
-	if err != nil {
-		s.logger.Warn("failed to replay segment to peer",
-			"segment_id", seg.ID(),
-			"peer", peer.Address(),
-			"bytes", n,
-			"error", err,
-		)
-		return
-	}
-
-	s.logger.Info("replayed segment to peer",
-		"segment_id", seg.ID(),
-		"peer", peer.Address(),
-		"bytes", n,
-	)
 }
 
 // HealthCheck returns the current health status of the sidecar.

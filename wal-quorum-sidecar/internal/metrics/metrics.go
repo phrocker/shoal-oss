@@ -52,6 +52,15 @@ var (
 		Help:      "Total number of segment opens refused due to an ownership conflict.",
 	})
 
+	// ReplicaCatchups counts replica ranges replayed to a peer after entries
+	// failed to reach it (a failed write, or one dropped while the failure
+	// breaker had the peer shed).
+	ReplicaCatchups = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: namespace,
+		Name:      "replica_catchups_total",
+		Help:      "Total number of peer replica catch-up replays performed.",
+	})
+
 	// SegmentsSealed is a counter of segments that have been sealed.
 	SegmentsSealed = promauto.NewCounter(prometheus.CounterOpts{
 		Namespace: namespace,

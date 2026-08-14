@@ -102,20 +102,54 @@ func (s *PeerServer) ReplicateEntries(stream pb.WalQuorumPeer_ReplicateEntriesSe
 			return status.Errorf(codes.NotFound, "replica segment %s not found — call PrepareSegment first", segID)
 		}
 
-		_, newOffset, err := seg.Write(req.GetData(), req.GetSequenceNum())
-		if err != nil {
-			s.logger.Error("replicate write failed",
+		// Entries carry the originator's offset, so honour it instead of
+		// blindly appending. A replica must stay a strict prefix of the
+		// originator's segment: appending an entry that starts past the end of
+		// this replica would bake a hole into the file that no replay could
+		// repair, and the divergence would only surface as a checksum failure
+		// at seal time. A range that is already persisted (the originator
+		// replaying a missing range) is acknowledged without rewriting it, and
+		// an overlapping range has its persisted prefix trimmed, so catch-up
+		// is idempotent.
+		data := req.GetData()
+		current := seg.Offset()
+		start := req.GetOffset()
+		end := start + int64(len(data))
+
+		newOffset := current
+		switch {
+		case start > current:
+			s.logger.Error("replica is behind the entry being replicated",
 				"segment_id", segID,
-				"seq", req.GetSequenceNum(),
-				"error", err,
+				"replica_offset", current,
+				"entry_offset", start,
 			)
-			return status.Errorf(codes.Internal, "replica write failed: %v", err)
+			return status.Errorf(codes.FailedPrecondition,
+				"replica %s is at offset %d but the entry starts at %d — replay the missing range",
+				segID, current, start)
+		case end <= current:
+			s.logger.Debug("entry already persisted on replica, acking without rewrite",
+				"segment_id", segID, "replica_offset", current, "entry_offset", start)
+		default:
+			if start < current {
+				data = data[current-start:]
+			}
+			var err error
+			_, newOffset, err = seg.Write(data, req.GetSequenceNum())
+			if err != nil {
+				s.logger.Error("replicate write failed",
+					"segment_id", segID,
+					"seq", req.GetSequenceNum(),
+					"error", err,
+				)
+				return status.Errorf(codes.Internal, "replica write failed: %v", err)
+			}
 		}
 
 		resp := &pb.ReplicateEntryResponse{
-			SegmentId:       req.GetSegmentId(),
+			SegmentId:        req.GetSegmentId(),
 			AckedSequenceNum: req.GetSequenceNum(),
-			PersistedOffset: newOffset,
+			PersistedOffset:  newOffset,
 		}
 		if err := stream.Send(resp); err != nil {
 			return status.Errorf(codes.Internal, "send replicate ack error: %v", err)

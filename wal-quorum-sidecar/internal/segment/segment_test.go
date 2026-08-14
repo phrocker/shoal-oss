@@ -3,8 +3,11 @@
 package segment_test
 
 import (
+	"bytes"
+	"crypto/sha256"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/accumulo/wal-quorum-sidecar/internal/segment"
@@ -297,4 +300,77 @@ func TestManagerOpenCount(t *testing.T) {
 
 	seg1.Close()
 	seg2.Close()
+}
+
+// TestSegmentChecksumCoversExistingBytes guards the seal path against a
+// reopened file: the running digest has to include the bytes already on disk,
+// or a seal reports the digest of the appended tail only and every comparison
+// against the originator's checksum fails.
+func TestSegmentChecksumCoversExistingBytes(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "reopen.wal")
+
+	first, err := segment.NewSegment("reopen", "/wal/a/reopen", "tserver-0", path)
+	if err != nil {
+		t.Fatalf("create segment: %v", err)
+	}
+	if _, _, err := first.Write([]byte("first-half"), 1); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	reopened, err := segment.NewSegment("reopen", "/wal/a/reopen", "tserver-0", path)
+	if err != nil {
+		t.Fatalf("reopen segment: %v", err)
+	}
+	defer reopened.Close()
+	if _, _, err := reopened.Write([]byte("second-half"), 2); err != nil {
+		t.Fatalf("write after reopen: %v", err)
+	}
+
+	checksum, size, err := reopened.Seal()
+	if err != nil {
+		t.Fatalf("seal: %v", err)
+	}
+
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read segment file: %v", err)
+	}
+	if size != int64(len(contents)) {
+		t.Errorf("sealed size %d, file holds %d bytes", size, len(contents))
+	}
+	want := sha256.Sum256(contents)
+	if !bytes.Equal(checksum, want[:]) {
+		t.Error("sealed checksum does not cover the bytes that were already on disk")
+	}
+}
+
+// TestManagerDiscardsStaleReplicaFile covers the replica side of a restart.
+// A replica file left by a previous incarnation cannot be vouched for, and
+// appending to it would leave the replica something other than a prefix of the
+// originator's segment, so no replay could repair it. It must be discarded and
+// replayed from the start instead.
+func TestManagerDiscardsStaleReplicaFile(t *testing.T) {
+	dir := t.TempDir()
+	stale := filepath.Join(dir, "stale-replica.wal")
+	if err := os.WriteFile(stale, []byte("bytes from a previous generation"), 0o640); err != nil {
+		t.Fatalf("seed stale replica: %v", err)
+	}
+
+	mgr := segment.NewManager(dir, testLogger())
+	seg, adopted, err := mgr.CreateOrAdopt("stale-replica", "/wal/a/stale-replica",
+		"tserver-0", segment.RoleReplica)
+	if err != nil {
+		t.Fatalf("replica prepare must succeed, got: %v", err)
+	}
+	if adopted {
+		t.Error("a stale on-disk file is not an adoptable live segment")
+	}
+	if seg.Offset() != 0 {
+		t.Errorf("replica reattached to %d stale bytes; the originator's replay "+
+			"would then never line up", seg.Offset())
+	}
 }
