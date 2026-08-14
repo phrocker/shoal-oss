@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -135,7 +136,20 @@ func silentListener(t *testing.T) string {
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	t.Cleanup(func() { _ = l.Close() })
+
+	var (
+		mu    sync.Mutex
+		conns []net.Conn
+	)
+	t.Cleanup(func() {
+		_ = l.Close()
+		mu.Lock()
+		defer mu.Unlock()
+		for _, c := range conns {
+			_ = c.Close()
+		}
+		conns = nil
+	})
 
 	go func() {
 		for {
@@ -144,7 +158,9 @@ func silentListener(t *testing.T) string {
 				return
 			}
 			// Hold the connection open without speaking HTTP/2.
-			t.Cleanup(func() { _ = conn.Close() })
+			mu.Lock()
+			conns = append(conns, conn)
+			mu.Unlock()
 		}
 	}()
 
