@@ -22,12 +22,17 @@ type scanOutput interface {
 	Close() error
 }
 
+const parquetRowsPerRowGroup = 64 * 1024
+
 func newScanOutput(format string, output io.Writer) (scanOutput, error) {
 	switch strings.ToLower(format) {
 	case "json":
 		return &jsonScanOutput{encoder: json.NewEncoder(output)}, nil
 	case "parquet":
-		return &parquetScanOutput{writer: parquet.NewGenericWriter[parquetCell](output)}, nil
+		return &parquetScanOutput{writer: parquet.NewGenericWriter[parquetCell](
+			output,
+			parquet.MaxRowsPerRowGroup(parquetRowsPerRowGroup),
+		)}, nil
 	default:
 		return nil, fmt.Errorf("unknown output format %q (want json or parquet)", format)
 	}
