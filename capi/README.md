@@ -27,6 +27,14 @@ Go emits next to a `c-shared` library.
   Freeing also performs best-effort close and sets the variable to `NULL`.
 - A connector owns the bootstrap instance created for it. Callers do not
   separately close ZooKeeper resources.
+- Scanner configuration, ranges, and all nested arrays/bytes are borrowed only
+  for the creating or scan call. Shoal copies every value it retains.
+- Scanner and batch-scanner handles support concurrent scan calls. Close
+  cancels and joins in-flight calls and is idempotent while the handle remains
+  alive; free performs best-effort close and sets the handle variable to
+  `NULL`.
+- Scan results own binary-safe key/value storage. Views returned by
+  `shoal_scan_result_get` remain valid until `shoal_scan_result_free`.
 - Failed calls can return an owned `shoal_error`. Its message is borrowed from
   that object and remains valid until `shoal_error_free`.
 - Do not copy opaque handles, access them after free, or free/use the same
@@ -42,6 +50,8 @@ Go emits next to a `c-shared` library.
   `zookeeper_servers` list. A zero session or bootstrap timeout selects the
   30-second default. `instance_secret` is optional.
 
-The ABI currently exposes connector bootstrap and lifecycle only. Scanner,
-mutation, writer, table administration, result-buffer, and Python wheel APIs
-are intentionally deferred.
+The ABI currently exposes connector bootstrap/lifecycle plus synchronous
+Scanner and BatchScanner reads with row/key ranges, authorizations, fetched
+columns, server-side iterators, deadlines, and owned result buffers. Mutation,
+writer, table administration, and Python wheel APIs are intentionally
+deferred.
