@@ -36,6 +36,31 @@ var (
 		Help:      "Number of WAL segments currently open for writing.",
 	})
 
+	// SegmentReopens counts repeat OpenSegment calls that were served
+	// idempotently from an existing live segment (i.e. a retried WAL open).
+	SegmentReopens = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: namespace,
+		Name:      "segment_reopens_total",
+		Help:      "Total number of repeat segment opens served from an existing live segment.",
+	})
+
+	// SegmentOpenConflicts counts opens refused because the segment id is held
+	// by a different owner, role, or incarnation.
+	SegmentOpenConflicts = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: namespace,
+		Name:      "segment_open_conflicts_total",
+		Help:      "Total number of segment opens refused due to an ownership conflict.",
+	})
+
+	// ReplicaCatchups counts replica ranges replayed to a peer after entries
+	// failed to reach it (a failed write, or one dropped while the failure
+	// breaker had the peer shed).
+	ReplicaCatchups = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: namespace,
+		Name:      "replica_catchups_total",
+		Help:      "Total number of peer replica catch-up replays performed.",
+	})
+
 	// SegmentsSealed is a counter of segments that have been sealed.
 	SegmentsSealed = promauto.NewCounter(prometheus.CounterOpts{
 		Namespace: namespace,

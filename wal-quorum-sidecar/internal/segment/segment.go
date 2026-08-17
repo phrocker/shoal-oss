@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"hash"
+	"io"
 	"os"
 	"sync"
 	"syscall"
@@ -20,21 +21,65 @@ const (
 	StateSealed              // No more writes; checksum finalized.
 )
 
+// Role describes why this sidecar holds a segment.
+type Role int
+
+const (
+	// RoleUnknown is used for segments recovered from disk, whose creator is
+	// not known to this process.
+	RoleUnknown Role = iota
+	// RoleOriginator means the co-located TServer writes this segment through
+	// the local (Unix socket) service.
+	RoleOriginator
+	// RoleReplica means a peer sidecar owns the segment and replicates entries
+	// into it via PrepareSegment/ReplicateEntries.
+	RoleReplica
+)
+
+// String renders the role for log messages.
+func (r Role) String() string {
+	switch r {
+	case RoleOriginator:
+		return "originator"
+	case RoleReplica:
+		return "replica"
+	default:
+		return "unknown"
+	}
+}
+
+// Owner identifies which generation of which writer a segment belongs to.
+//
+// Pod/WALPath come from the open request. Epoch is the incarnation of the
+// segment Manager (i.e. of this sidecar process) that created the segment;
+// segments recovered off disk carry epoch 0, meaning "created by some earlier
+// generation we cannot vouch for". Epoch is what separates a retried open from
+// a stale claim on a reused id: only a segment created by the running
+// incarnation may be handed back to a repeat open.
+type Owner struct {
+	Pod     string
+	WALPath string
+	Role    Role
+	Epoch   uint64
+}
+
 // Segment represents a single WAL segment file on disk.
 // It tracks the write offset, running checksum, and sealed state.
 // All methods are safe for concurrent use.
 type Segment struct {
 	mu sync.Mutex
 
-	id             string
-	walPath        string
-	originatorPod  string
-	file           *os.File
-	offset         int64
-	state          State
-	hasher         hash.Hash
-	finalChecksum  []byte
-	sequenceHigh   uint64 // highest sequence_num written
+	id            string
+	walPath       string
+	originatorPod string
+	owner         Owner
+	preparedPeers []string
+	file          *os.File
+	offset        int64
+	state         State
+	hasher        hash.Hash
+	finalChecksum []byte
+	sequenceHigh  uint64 // highest sequence_num written
 }
 
 // NewSegment opens (or creates) a segment file at the given path.
@@ -53,6 +98,17 @@ func NewSegment(id, walPath, originatorPod, filePath string) (*Segment, error) {
 		return nil, fmt.Errorf("stat segment file %s: %w", filePath, err)
 	}
 
+	// Reopening a file that already has bytes means the running checksum has
+	// to cover them too, otherwise a later Seal would report the digest of the
+	// appended tail only and every checksum comparison against it would fail.
+	hasher := sha256.New()
+	if info.Size() > 0 {
+		if err := hashFileContents(filePath, hasher); err != nil {
+			_ = f.Close()
+			return nil, err
+		}
+	}
+
 	return &Segment{
 		id:            id,
 		walPath:       walPath,
@@ -60,8 +116,24 @@ func NewSegment(id, walPath, originatorPod, filePath string) (*Segment, error) {
 		file:          f,
 		offset:        info.Size(),
 		state:         StateOpen,
-		hasher:        sha256.New(),
+		hasher:        hasher,
 	}, nil
+}
+
+// hashFileContents feeds the current contents of filePath into h. It is used
+// when a segment file is reopened so the running digest reflects the bytes
+// already on disk.
+func hashFileContents(filePath string, h hash.Hash) error {
+	rf, err := os.Open(filePath)
+	if err != nil {
+		return fmt.Errorf("open segment file %s for checksum: %w", filePath, err)
+	}
+	defer rf.Close()
+
+	if _, err := io.Copy(h, rf); err != nil {
+		return fmt.Errorf("checksum existing contents of %s: %w", filePath, err)
+	}
+	return nil
 }
 
 // ID returns the segment's unique identifier.
@@ -77,6 +149,42 @@ func (s *Segment) WALPath() string {
 // OriginatorPod returns the pod that created this segment.
 func (s *Segment) OriginatorPod() string {
 	return s.originatorPod
+}
+
+// Owner returns the ownership stamp (pod, WAL path, role, incarnation epoch)
+// recorded when this segment was created.
+func (s *Segment) Owner() Owner {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.owner
+}
+
+// setOwner records the ownership stamp. Called by the Manager at creation.
+func (s *Segment) setOwner(o Owner) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.owner = o
+}
+
+// PreparedPeers returns the peer addresses reported to the writer when the
+// segment was opened. A repeat open replays this same list so the TServer
+// stores a stable peer set in the metadata table.
+func (s *Segment) PreparedPeers() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.preparedPeers == nil {
+		return nil
+	}
+	out := make([]string, len(s.preparedPeers))
+	copy(out, s.preparedPeers)
+	return out
+}
+
+// SetPreparedPeers records the peer set reported for this segment.
+func (s *Segment) SetPreparedPeers(peers []string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.preparedPeers = append([]string(nil), peers...)
 }
 
 // Offset returns the current write offset (total bytes written).

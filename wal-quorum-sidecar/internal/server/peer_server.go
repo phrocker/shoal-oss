@@ -8,7 +8,6 @@ import (
 	"io"
 	"log/slog"
 	"os"
-	"strings"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -64,19 +63,22 @@ func (s *PeerServer) PrepareSegment(ctx context.Context, req *pb.PrepareSegmentR
 		"expected_size", req.GetExpectedSize(),
 	)
 
-	_, err := s.mgr.Create(segID, walPath, originator)
+	// A repeat prepare from the same originator is expected: the originator
+	// retries PrepareSegment in the background and re-sends it on a repeat
+	// open. CreateOrAdopt makes that a no-op, while still rejecting a claim
+	// from a different originator or a different generation — those used to be
+	// swallowed by an "already exists" substring match and silently accepted.
+	_, adopted, err := s.mgr.CreateOrAdopt(segID, walPath, originator, segment.RoleReplica)
 	if err != nil {
-		// Treat "already exists" as success — the segment was likely created
-		// via auto-prepare during ReplicateEntries.
-		if strings.Contains(err.Error(), "already exists") {
-			s.logger.Debug("segment already exists, treating as success", "segment_id", segID)
-			return &pb.PrepareSegmentResponse{Success: true}, nil
-		}
 		s.logger.Error("failed to prepare replica segment", "segment_id", segID, "error", err)
 		return &pb.PrepareSegmentResponse{
 			Success: false,
 			Error:   err.Error(),
 		}, nil
+	}
+	if adopted {
+		s.logger.Warn("replica segment already prepared, treating repeat prepare as success",
+			"segment_id", segID, "originator", originator)
 	}
 
 	return &pb.PrepareSegmentResponse{Success: true}, nil
@@ -100,20 +102,54 @@ func (s *PeerServer) ReplicateEntries(stream pb.WalQuorumPeer_ReplicateEntriesSe
 			return status.Errorf(codes.NotFound, "replica segment %s not found — call PrepareSegment first", segID)
 		}
 
-		_, newOffset, err := seg.Write(req.GetData(), req.GetSequenceNum())
-		if err != nil {
-			s.logger.Error("replicate write failed",
+		// Entries carry the originator's offset, so honour it instead of
+		// blindly appending. A replica must stay a strict prefix of the
+		// originator's segment: appending an entry that starts past the end of
+		// this replica would bake a hole into the file that no replay could
+		// repair, and the divergence would only surface as a checksum failure
+		// at seal time. A range that is already persisted (the originator
+		// replaying a missing range) is acknowledged without rewriting it, and
+		// an overlapping range has its persisted prefix trimmed, so catch-up
+		// is idempotent.
+		data := req.GetData()
+		current := seg.Offset()
+		start := req.GetOffset()
+		end := start + int64(len(data))
+
+		newOffset := current
+		switch {
+		case start > current:
+			s.logger.Error("replica is behind the entry being replicated",
 				"segment_id", segID,
-				"seq", req.GetSequenceNum(),
-				"error", err,
+				"replica_offset", current,
+				"entry_offset", start,
 			)
-			return status.Errorf(codes.Internal, "replica write failed: %v", err)
+			return status.Errorf(codes.FailedPrecondition,
+				"replica %s is at offset %d but the entry starts at %d — replay the missing range",
+				segID, current, start)
+		case end <= current:
+			s.logger.Debug("entry already persisted on replica, acking without rewrite",
+				"segment_id", segID, "replica_offset", current, "entry_offset", start)
+		default:
+			if start < current {
+				data = data[current-start:]
+			}
+			var err error
+			_, newOffset, err = seg.Write(data, req.GetSequenceNum())
+			if err != nil {
+				s.logger.Error("replicate write failed",
+					"segment_id", segID,
+					"seq", req.GetSequenceNum(),
+					"error", err,
+				)
+				return status.Errorf(codes.Internal, "replica write failed: %v", err)
+			}
 		}
 
 		resp := &pb.ReplicateEntryResponse{
-			SegmentId:       req.GetSegmentId(),
+			SegmentId:        req.GetSegmentId(),
 			AckedSequenceNum: req.GetSequenceNum(),
-			PersistedOffset: newOffset,
+			PersistedOffset:  newOffset,
 		}
 		if err := stream.Send(resp); err != nil {
 			return status.Errorf(codes.Internal, "send replicate ack error: %v", err)
