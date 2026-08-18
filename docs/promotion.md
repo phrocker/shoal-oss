@@ -147,13 +147,17 @@ RFileExportManifest (existing)  →  promotion.BuildLoadMapping
   invalid destinations and rejected split manifests never leave a
   half-staged directory. It also verifies every referenced RFile against
   the manifest's recorded size/SHA256 (`engine.VerifyRFileExport`) before
-  copying, and rejects any RFile whose destination path would alias its
-  own source path — including via an absolute-vs-relative path
-  difference or a symlink/hard link, not just an identical path string
-  (`bulkDir` coinciding with the export's own tablet directory) — before
-  copying it. `storage.Copy` truncates the destination for writing
-  before streaming the source, so an aliased copy would otherwise
-  destroy the source and report a false success.
+  copying, and preflights every RFile's computed destination path
+  against **every unique source path in the manifest** — not just its
+  own — rejecting any alias before any copying starts. An alias includes
+  an absolute-vs-relative path difference or a symlink/hard link, not
+  just an identical path string, and covers both `bulkDir` coinciding
+  with the export's own tablet directory *and* one RFile's destination
+  coinciding with a *different* RFile's source. `storage.Copy` truncates
+  the destination for writing before streaming the source, so an aliased
+  copy would otherwise destroy a source file (possibly one not yet
+  copied, whose earlier verification would not be repeated) and report a
+  false success.
 - `internal/promotion.Promote` — composes `StageBulkDir` with a
   `BulkImporter` (satisfied by `*accumulo.Connector`) to submit the FATE
   call. Submits nothing when the derived mapping is empty (nothing to
