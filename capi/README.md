@@ -65,5 +65,5 @@ failures. Table administration and Python wheel APIs are intentionally
 deferred.
 
 `docs/sharkbite-compatibility.md` enumerates the full Sharkbite compatibility
-contract, maps every element to this ABI, and defines the coverage gate that
-must close before any Python wheel work begins.
+contract, maps every element to this ABI, and defines the implementation-entry
+and release gates for any Sharkbite-compatible Python wheel.

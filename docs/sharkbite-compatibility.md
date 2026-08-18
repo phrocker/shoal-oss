@@ -1,7 +1,8 @@
 # Sharkbite → Shoal compatibility matrix
 
 Exhaustive enumeration of the public Sharkbite compatibility contract and its
-mapping onto Shoal. This document is the coverage gate for
+mapping onto Shoal. This document is the normative compatibility matrix and
+release gate for
 [phrocker/sharkbite#108](https://github.com/phrocker/sharkbite/issues/108) and
 Shoal issue [#81](https://github.com/phrocker/shoal-oss/issues/81) (umbrella
 [#59](https://github.com/phrocker/shoal-oss/issues/59)).
@@ -16,12 +17,14 @@ Shoal issue [#81](https://github.com/phrocker/shoal-oss/issues/81) (umbrella
 | Tracking issue | Shoal [#81](https://github.com/phrocker/shoal-oss/issues/81) — "docs: define and audit complete Sharkbite compatibility matrix" (parent [#59](https://github.com/phrocker/shoal-oss/issues/59); upstream target [phrocker/sharkbite#108](https://github.com/phrocker/sharkbite/issues/108)) |
 | Sharkbite reference | `phrocker/sharkbite` @ `7f2625f74331b0cd4a75dc0484949c40f1409686` ("Bump accumulo-core from 2.0.0 to 2.0.1 in /native-iterators-jni (#100)", 2022-07-22) |
 | Sharkbite release line | `sharkbite` 1.2.0.3 on PyPI (`setup.py:34-35`) |
-| Shoal reference | `phrocker/shoal-oss` `origin/main` @ `1c29447a36f48598059821107519514c059979a5` ("platform: make shoal-embed serve reachable, observable, and safely drainable (#79)") |
+| Shoal reference | `phrocker/shoal-oss` `main` @ `1c2944798faf5a5deb659065dfea0bee23593df0` ("platform: make shoal-embed serve reachable, observable, and safely drainable (#79)") |
 | Shoal C ABI version | `SHOAL_ABI_VERSION 1u` (`capi/include/shoal_types.h:19`) |
-| Rows | 333 |
-| Covered rows | 42 (12.6 percent) |
+| Rows | 350 |
+| Covered rows | 41 (11.7 percent) |
 
-This document does **not** authorize any Python implementation work. See
+This document is the normative backlog and release gate for Sharkbite
+compatibility work; it does **not** by itself authorize publishing a
+Sharkbite-compatible Python surface. See
 [§2 Release gate](#sec-2).
 
 <a id="sec-2"></a>
@@ -34,13 +37,20 @@ gate status, the independent omission/classification audit, and any approval
 decisions are recorded. Closing #81 requires this document plus that audit —
 not the document alone.
 
-> **Gate.** No Sharkbite-compatible Python implementation work, package name
-> reservation, wheel build, or release may begin until **every** row in
-> [§5](#sec-5) through [§20](#sec-20) is either
-> `Covered` with at least one **named** automated test on each layer it
-> claims (Go and, where applicable, C ABI), or is recorded as
-> `Intentional divergence` **and** has recorded explicit human approval in
-> [§26](#sec-26).
+> **Implementation-entry gate.** After this matrix and the independent
+> omission/classification audit are recorded on issue
+> [#81](https://github.com/phrocker/shoal-oss/issues/81), implementation may
+> proceed row-by-row. The matrix is the backlog: some rows may still be
+> `Missing Go`, `Missing C ABI`, or `Behavior mismatch` while other rows are
+> being implemented.
+
+> **Release gate.** No package named `sharkbite`, no wheel or sdist, and no
+> "Sharkbite compatible"/drop-in-replacement claim may be published until
+> every in-scope row in [§5](#sec-5) through [§20](#sec-20) is either
+> `Covered` with at least one **named** automated test on each layer it claims
+> (Go and, where applicable, C ABI), `Not required (rationale required)` with
+> an explicit scope decision in Notes, or `Intentional divergence` **and** has
+> recorded explicit human approval in [§26](#sec-26).
 
 Corollaries, all binding:
 
@@ -54,16 +64,19 @@ Corollaries, all binding:
    the Shoal symbol has been read and its semantics compared against the
    Sharkbite behavior. Matching identifiers (`Scanner`, `Mutation`, `flush`,
    `close`) are not evidence.
-3. **Ordered prerequisites.** Work proceeds strictly in the order
+3. **Ordered prerequisites.** For any given row, work proceeds
    Go parity → C ABI parity → compatibility tests → Python/wheels
-   ([§23](#sec-23)). A row cannot advance past a layer whose predecessor is
-   unmet.
+   ([§23](#sec-23)). The order is per-row, not a global freeze; no release
+   occurs until the final gate above is shut.
 4. **Named tests only.** "Covered by the existing suite" is not evidence. Each
    `Covered` row names test functions or C assertion blocks.
-5. **Divergence requires approval.** `Intentional divergence` rows are
+5. **Scope exclusions must be explicit.** `Not required` means "outside the
+   compatibility contract", not "to be reviewed later". The Notes column must
+   state why the row is excluded.
+6. **Divergence requires approval.** `Intentional divergence` rows are
    proposals until a named approver signs [§26](#sec-26). Unapproved
-   divergences block the gate exactly like `Missing Go`.
-6. **Live-cluster conformance is part of the gate.** Unit tests alone cannot
+   divergences block the release gate exactly like `Missing Go`.
+7. **Live-cluster conformance is part of the gate.** Unit tests alone cannot
    close rows whose semantics are defined by a real tablet server
    ([§24](#sec-24)).
 
@@ -77,7 +90,7 @@ Corollaries, all binding:
 | --- | --- | --- |
 | Python binding | `src/python/pysharkbite.cpp` (560 lines) | Every `pybind11::class_`, `enum_`, `def`, `def_static`, `def_readonly`, `init`, default argument, dunder, and exception registration. Read in full. |
 | Python package | `sharkbite/__init__.py` (171 lines) | `AccumuloBase`, `AccumuloWriter`, `AccumuloScanner`, `AccumuloIterator`, `from .pysharkbite import *` re-export. |
-| Torch package | `sharkbite/torch.py`, `pandashark/` | `AccumuloDataset`, `AccumuloValueDataset`, `AccumuloCluster`, `read_accumulo`. |
+| Optional data helpers | `sharkbite/torch.py`, `pandashark/__init__.py`, `pandashark/pandassharkbite.py` | `AccumuloDataset`, `AccumuloValueDataset`, `AccumuloCluster`, `read_accumulo`, `read_accumulo_nex`, `DataFrameIterator`. |
 | Packaging | `setup.py`, `PYTHONREADME.md`, `CMakeLists.txt`, `bootstrapper.sh`, `.github/workflows/ccpp.yml` | Distribution name/version, `python_requires`, ext-module wiring, module target `pysharkbite`, CI matrix. |
 | Public headers | `include/data/constructs/**`, `include/interconnect/**`, `include/scanner/**`, `include/writer/**`, `include/data/exceptions/**`, `include/extern/accumulo.h` | Signatures and defaults behind each binding, exception hierarchy, ownership annotations. Vendored `include/extern/libhdfs3/**` and generated Thrift excluded. |
 | Python tests | `test/python/*.py` (10 files), `test/python/testmodule/__init__.py`, `test/MainExecutor.py`, `test/performance/QuarterMillionWrites.py` | Behavioral contracts asserted against a live cluster. |
@@ -97,7 +110,7 @@ and the `internal/` packages named in matrix rows.
 ### 3.3 Evidence-validation method
 
 Every Shoal symbol, path, and test name cited below was validated against the
-`origin/main` worktree, not against memory or a prior summary:
+Shoal reference commit above, not against memory or a prior summary:
 
 1. **Path existence** — each cited file was confirmed present with
    `Test-Path` or a direct read.
@@ -191,7 +204,7 @@ importable and both are used by the pinned tests and examples.
 | SB-PKG-010 | Shared object must be `ctypes.cdll.LoadLibrary`-able before `import pysharkbite` (`test/python/testmodule/__init__.py:63-64`, `test/MainExecutor.py`) | — | — | — | Behavior mismatch | Sharkbite tests preload the `.so` explicitly. A Shoal binding over `libshoal` must not require preloading; the shim should make the `-s/--solocation` argument a no-op so pinned test drivers still run. |
 | SB-PKG-011 | CI builds one Ubuntu configuration, no wheel job (`.github/workflows/ccpp.yml`) | — | — | Shoal CI: `.github/workflows/ci.yml` build/vet/race jobs | Missing C ABI | Shoal has no wheel or `manylinux` job. Wheel matrix (CPython × platform) must be defined before any release. |
 | SB-PKG-012 | `sharkbite.torch` submodule import (`examples/torchexample.py`, `sharkbite/torch.py`) | — | — | — | Missing C ABI | See [SB-RFILE-024](#sec-15) family; PyTorch dataset surface. |
-| SB-PKG-013 | `pandashark` package with `read_accumulo` (`pandashark/__init__.py`, `examples/dataframe.py:68-69`) | — | — | — | Not required (rationale required) | Rationale: `pandashark` is a separate distribution from `sharkbite` in the pinned tree and is not imported by `sharkbite/__init__.py`. Track separately; it is not part of the `sharkbite` import contract. |
+| SB-PKG-013 | Top-level `pandashark` package boundary (`pandashark/__init__.py:1-4`, `examples/dataframe.py:26`, `setup.py:39-50`) | — | — | — | Not required (rationale required) | Rationale: the pinned repository contains `pandashark`, but the shipped `sharkbite` 1.2.0.3 wheel packages only `sharkbite` (`packages=['sharkbite']`). Track the helper rows below for exhaustiveness, but do not treat `pandashark` as part of the `sharkbite` import contract unless packaging scope changes. |
 | SB-PKG-014 | Accumulo version support: 1.6.x–2.x (`PYTHONREADME.md:9`) | `accumulo.DefaultAccumuloVersion = "4.0.0-SNAPSHOT"`; `normalizeConnectorOptions` rejects non-`4.` (`accumulo/config.go:13,55-61`) | `shoal_connector_config.accumulo_version` (`capi/include/shoal_types.h:125`) | `TestNewConnectorRejectsUnsupportedVersion` (`accumulo/connector_test.go:42`); `capi/tests/lifecycle.c:49-52` | Intentional divergence (approval required) | Shoal targets Accumulo 4 only. Every Sharkbite user on 1.x/2.x is unsupported. This is the single largest divergence in the document and must be approved explicitly, with a documented migration statement. |
 
 <a id="sec-6"></a>
@@ -216,7 +229,7 @@ importable and both are used by the pinned tests and examples.
 | SB-CFG-014 | `AuthInfo.getPassword()` / alias `password()` (`pysharkbite.cpp:80-81`) | — (deliberately unreadable; `Credentials.String()`/`GoString()` redact, `accumulo/credentials.go:37,42`) | — | `TestPasswordCredentialsCopiesAndRedacts` (`accumulo/credentials_test.go:11`) | Intentional divergence (approval required) | Sharkbite hands the plaintext password back to the caller. Shoal deliberately redacts. Reproducing a password getter re-introduces a credential-leak path (it lands in logs via `repr`). Proposal: raise `AttributeError` with a migration message, or return the value only when the caller passed it in-process. Requires approval. |
 | SB-CFG-015 | `AuthInfo.getInstanceId()` / alias `instance_id()` (`pysharkbite.cpp:82-83`) | `Connector.Instance().ID` (`accumulo/connector.go:124`) | — | `TestNewConnectorLifecycle` (`accumulo/connector_test.go:9`) | Missing C ABI | |
 | SB-CFG-016 | `AuthInfo` copy assignment silently drops the password (`include/data/constructs/security/AuthInfo.h:60-67`) | `Credentials.clone()` copies all fields (`accumulo/credentials.go:44`) | n/a | `TestPasswordCredentialsCopiesAndRedacts` (`accumulo/credentials_test.go:11`) | Not required (rationale required) | Rationale: this is an upstream defect, not a contract. See [§21](#sec-21). Do not reproduce. |
-| SB-CFG-017 | ZooKeeper session timeout is the only timeout in the Sharkbite public API (`include/data/constructs/client/zookeeperinstance.h:89-104`) | `ZooKeeperConfig.SessionTimeout`, `ConnectorOptions.DialTimeout`, `IdleTimeout` (`accumulo/config.go:22-42`) | `zookeeper_session_timeout_ms`, `bootstrap_timeout_ms`, `dial_timeout_ms` (`capi/include/shoal_types.h:126-129`) | `TestNewConnectorRejectsConflictingPoolOptions` (`accumulo/connector_test.go:70`); `capi/tests/lifecycle.c:36-38` | Covered | Shoal is a strict superset. Sharkbite's single timeout maps to `SessionTimeout`; the extra knobs default sensibly (`accumulo/config.go:51-99`). |
+| SB-CFG-017 | ZooKeeper session timeout is the only timeout in the Sharkbite public API (`include/data/constructs/client/zookeeperinstance.h:89-104`) | `ZooKeeperConfig.SessionTimeout`, `ConnectorOptions.DialTimeout`, `IdleTimeout` (`accumulo/config.go:22-42`) | `zookeeper_session_timeout_ms`, `bootstrap_timeout_ms`, `dial_timeout_ms` (`capi/include/shoal_types.h:126-129`) | `TestNewZooKeeperInstanceResolvesAndClosesOnce` (`accumulo/instance_test.go:19`); `cmd/shoal-capi/export.go:203-252` | Missing C ABI | Go proves the default `SessionTimeout`; the ABI exposes the three timeout knobs, but no named C ABI test yet proves the `zookeeper_session_timeout_ms` mapping/default end to end. |
 | SB-CFG-018 | Instance secret (not exposed in Sharkbite Python) | `ZooKeeperConfig.InstanceSecret` (`accumulo/config.go:26`) | `shoal_connector_config.instance_secret` (`capi/include/shoal_types.h:128`) | `TestNewZooKeeperInstanceValidatesConfig` (`accumulo/instance_test.go:54`) | Not required (rationale required) | Rationale: Shoal-only; no Sharkbite obligation. |
 
 <a id="sec-7"></a>
@@ -238,6 +251,7 @@ importable and both are used by the pinned tests and examples.
 | SB-CONN-011 | Process-wide table name/ID cache `Tables::getInstance()` (`include/interconnect/tableOps/TableOperations.h:30,40`) | Per-connector resolver `internal/tablenames.Resolver`; invalidation via `Connector.InvalidateTable` / `InvalidateDiscovery` (`accumulo/discovery.go:170,183`) | — | `TestDiscoveryInvalidationAndDefensiveCopies` (`accumulo/discovery_test.go:148`) | Missing C ABI | Per-connector scoping is safer and should be approved as part of SB-CONN-010. |
 | SB-CONN-012 | Reconnect with bad credentials raises `ClientException` (`test/python/TestBadOperations.py:85-94`, `test/python/TestSecurityOperations.py:110-116`) | `NewConnector` error path (`accumulo/connector.go:36`), `ErrPermissionDenied` (`accumulo/errors.go:32`) | `SHOAL_STATUS_PERMISSION_DENIED` (`capi/include/shoal_types.h:34`) | — | Behavior mismatch | No Shoal test asserts an authentication failure against a live or faked security-exception path. This row cannot close without a live-cluster conformance test ([§24](#sec-24)). |
 | SB-CONN-013 | No connection-level cancellation or deadline in the Python API | Every `Connector` method takes `context.Context` (`accumulo/connector.go`, `accumulo/discovery.go`, `accumulo/table_admin.go`) | Per-call `timeout_ms` on scan/write only (`capi/include/shoal.h:90,161,167,177`) | `TestDiscoveryErrorsAndCancellation` (`accumulo/discovery_test.go:212`); `TestOwnedScannerDeadline` (`cmd/shoal-capi/state_test.go:89`) | Behavior mismatch | Shoal is strictly better, but the ABI exposes no cancellation handle (only deadlines), so a Python `KeyboardInterrupt` cannot interrupt an in-flight scan. See [SB-XCUT-008](#sec-20). |
+| SB-CONN-014 | High-level `AccumuloBase(instance, zookeepers, username, password, table=None, auths=None)` (`sharkbite/__init__.py:24-36`) | Compose `NewZooKeeperInstance`, `PasswordCredentials`, and `NewConnector` | Compose `shoal_connector_create` plus later scanner/writer/table wrappers | `sharkbite/__init__.py:24-36`; `TestNewConnectorLifecycle` (`accumulo/connector_test.go:9`); `capi/tests/lifecycle.c:54-75` | Missing C ABI | Public convenience layer absent. The pinned helper hardcodes a 1000 ms ZooKeeper timeout (`sharkbite/__init__.py:30`) and eagerly binds `tableOps` when `table` is not `None`. |
 
 <a id="sec-8"></a>
 
@@ -380,6 +394,11 @@ bound as `BatchScanner` (`pysharkbite.cpp:434`) — returned by
 | SB-SCAN-025 | Scan cleanup failures | `CleanupError{ScanID, Err}` (`accumulo/scanner.go:116`) | `SHOAL_STATUS_CLEANUP_FAILED` (`capi/include/shoal_types.h:38`) | `TestScannerRangeAndCleanupErrors` (`accumulo/scanner_test.go:365`); `TestBatchScannerContinuesAfterCleanupError` (`accumulo/scanner_test.go:491`) | Not required (rationale required) | Rationale: Sharkbite has no equivalent (it silently ignores close failures). Shoal superset; shim should surface it as a warning, not an exception, to preserve behavior. |
 | SB-SCAN-026 | Tablet relocation during a scan (`test/vandv/testScanLocationMove.h`) | `Scanner` retries `NotServingTablet` once (`accumulo/scanner.go:227,350`) | Implicit — no separate ABI surface; `shoal_scanner_scan` inherits the Go behavior | `TestScannerRetriesNotServingAssignmentOnce` (`accumulo/scanner_test.go:294`) | Covered | User-visible outcome is identical (the scan completes and the exception never reaches the caller), although the retry shape differs: Sharkbite loops on `NotServingException`, Shoal retries once and then invalidates its locator cache. Live conformance still validates the end-to-end shim ([§24](#sec-24)). |
 | SB-SCAN-027 | Isolation, `waitForWrites`, sampler, execution hints, busy timeout | — (present in `internal/scanclient.StartRequest`, never populated by `accumulo`) | — | — | Not required (rationale required) | Rationale: not exposed by Sharkbite either. Listed to record that the internal plumbing exists if a future row needs it. |
+| SB-SCAN-028 | High-level `AccumuloScanner(instance, zookeepers, username, password, table=None, auths=None)` (`sharkbite/__init__.py:136-138`) | Compose [SB-CONN-014](#sec-7), then `Connector.NewScanner` / `Connector.NewBatchScanner` semantics | Compose `shoal_connector_create_scanner` / `shoal_connector_create_batch_scanner` | `sharkbite/__init__.py:136-138`; `TestScannerContinuationAndCleanup` (`accumulo/scanner_test.go:220`); `capi/tests/lifecycle.c:59-114` | Missing C ABI | Public convenience layer absent. The pinned helper eagerly creates the underlying scanner in `__init__`, unlike the compatibility-safe deferral called out in SB-SCAN-001. |
+| SB-SCAN-029 | `AccumuloScanner.get(begin_row, end_row=None, chunksize=1000)` (`sharkbite/__init__.py:146-154`) | Compose `Range`, `addRange`, and `AccumuloIterator(scanner, chunkSize)` | Compose scan calls plus a client-side iterator shim | `sharkbite/__init__.py:146-154`; `examples/torchexample.py:75,82` | Missing C ABI | Returns the defective client-side `AccumuloIterator` from SB-SCAN-024; `chunksize` is a helper-layer batching hint, not a server batch-size control. |
+| SB-SCAN-030 | `AccumuloScanner.fetch_range(range)` (`sharkbite/__init__.py:156-157`) | Compose SB-SCAN-002 | Compose SB-SCAN-002 | `examples/dataframe.py:67` | Missing C ABI | Thin one-range convenience wrapper over `addRange`. |
+| SB-SCAN-031 | `AccumuloScanner.fetch_ranges(ranges)` (`sharkbite/__init__.py:158-160`) | Compose SB-SCAN-002 repeatedly | Compose SB-SCAN-002 repeatedly | `pandashark/__init__.py:59-61` | Missing C ABI | Loops over the caller's list; no bulk validation beyond the underlying scanner. |
+| SB-SCAN-032 | `AccumuloScanner.__del__` best-effort close (`sharkbite/__init__.py:162-164`) | n/a | n/a | — | Not required (rationale required) | Rationale: like SB-WRITE-020, this performs network I/O during interpreter teardown and is an upstream defect, not a compatibility requirement. Keep only a best-effort finalizer and document `with`/`close()` as the contract. See [§21](#sec-21). |
 
 <a id="sec-10"></a>
 
@@ -414,6 +433,7 @@ Sharkbite's Python `BatchWriter` is `writer::Sink<KeyValue>`
 | SB-WRITE-020 | `AccumuloWriter.__del__` calling `close()` (`sharkbite/__init__.py:128-129`) | n/a | n/a | — | Not required (rationale required) | Rationale: `__del__`-driven network I/O at interpreter shutdown is unsafe (exceptions are swallowed, module globals may already be `None`). Shim should keep a best-effort `__del__` but must document `with`/`close()` as the contract. |
 | SB-WRITE-021 | `AccumuloBase.set_threads(n)` (`sharkbite/__init__.py:52-53`) | `BatchWriterOptions.MaxWriteThreads` / `ScannerOptions.Parallelism` | `max_write_threads` / `parallelism` | `TestBatchWriterBoundsParallelServerSubmission` (`accumulo/batch_writer_test.go:643`) | Missing C ABI | Default is 10 in Sharkbite (`sharkbite/__init__.py:19`) versus 3 in Shoal (`accumulo/batch_writer.go:19`). Shim must preserve 10. |
 | SB-WRITE-022 | `AccumuloBase.set_table` / `set_authorizations` / `list_tables` / `to_scanner` (`sharkbite/__init__.py:39-58`) | `Connector.Tables` (`accumulo/table_admin.go:29`) | — | `TestTableAdministrationListingAndExistence` (`accumulo/table_admin_test.go:13`) | Missing C ABI | `set_authorizations` accepts an `Authorizations` object, a list, or `None` (`sharkbite/__init__.py:43-50`); all three must work. |
+| SB-WRITE-023 | High-level `AccumuloWriter(instance, zookeepers, username, password, table=None, auths=None)` (`sharkbite/__init__.py:70-71`) | Compose [SB-CONN-014](#sec-7) plus lazy `NewBatchWriter` on first write | Compose `shoal_connector_create` plus lazy `shoal_connector_create_batch_writer` | `sharkbite/__init__.py:70-71`; `TestBatchWriterCloseLifecycle` (`accumulo/batch_writer_test.go:852`); `capi/tests/lifecycle.c:127-199` | Missing C ABI | Thin convenience subclass only; all writer semantics live in SB-WRITE-016…SB-WRITE-022. The constructor nevertheless needs its own row because it is public and imported directly from `sharkbite`. |
 
 <a id="sec-11"></a>
 
@@ -559,7 +579,13 @@ no status operation.
 
 <a id="sec-15"></a>
 
-## 15. Matrix: RFile, iterators, and streams (`SB-RFILE`)
+## 15. Matrix: RFile, iterators, streams, and higher-level data helpers (`SB-RFILE`)
+
+Rows 24 onward record the optional helper layers built on top of scanning.
+`sharkbite.torch` is part of the pinned `sharkbite` package; `pandashark` is
+present in the pinned repository but not shipped by `packages=['sharkbite']`,
+so its rows are tracked for exhaustiveness and currently classified
+`Not required` unless packaging scope changes.
 
 | ID | Sharkbite | Shoal Go | Shoal C ABI | Evidence | Status | Notes |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -586,7 +612,17 @@ no status operation.
 | SB-RFILE-021 | `StreamRelocation` opaque base type (`pysharkbite.cpp:578`) | — | — | — | Missing Go | Registered with no methods; exists only as the base class of `Seekable`. |
 | SB-RFILE-022 | Offline/standalone RFile compaction | `internal/offlinecompact.Run` + `cmd/shoal-offline-compact` — **internal/CLI** | — | `cmd/shoal-offline-compact/main_test.go` | Not required (rationale required) | Rationale: no Sharkbite equivalent (`examples/` has a `Compact` C++ target only). Recorded because it demonstrates Shoal already owns the RFile write path. |
 | SB-RFILE-023 | RFile compression codecs (`compressor.h`, `zlibCompressor.h` included by `pysharkbite.cpp:33-34`) | `internal/rfile.WriterOptions.Codec` — **internal** | — | — | Not required (rationale required) | Rationale: the compressor classes are included but never bound to Python; not part of the Python contract. |
-| SB-RFILE-024 | `sharkbite.torch.AccumuloDataset` / `AccumuloValueDataset` / `AccumuloCluster` (`sharkbite/torch.py`, `examples/torchexample.py`) | — | — | `examples/torchexample.py` | Missing C ABI | Pure-Python layer over the scanner; unblocked once scanning is reachable from Python. Depends on `torch` being an optional extra. |
+| SB-RFILE-024 | `sharkbite.torch.AccumuloCluster(instance, zookeepers, username, password, table=None, auths=None)` (`sharkbite/torch.py:5-7`) | Compose [SB-CONN-014](#sec-7) | Compose `shoal_connector_create` | `sharkbite/torch.py:5-7`; `examples/torchexample.py` | Missing C ABI | Thin `IterableDataset` wrapper over `AccumuloBase`; it adds no scan behavior on its own. |
+| SB-RFILE-025 | `sharkbite.torch.AccumuloDataset(instance, zookeepers, username, password, table, auths, start_key_string, end_key_string, user_lambda=None)` (`sharkbite/torch.py:14-22`) | Compose `Range`, `tableOps.createScanner`, and range buffering | Compose scanner creation plus range buffering | `sharkbite/torch.py:14-22`; `examples/torchexample.py` | Missing C ABI | Constructor eagerly creates a scanner, buffers one closed-open `Range`, and stores an optional coercion lambda. |
+| SB-RFILE-026 | `AccumuloDataset.coerce(key)` (`sharkbite/torch.py:24-36`) | n/a | n/a | `sharkbite/torch.py:24-36`; `examples/torchexample.py:73` | Missing C ABI | Public helper method. The `user_lambda` branch is the only working path shown by the pinned example; the default branch is defective (`key.getKey().getValue().get()` cannot succeed on a normal `KeyValue`) and is recorded in [§21](#sec-21). |
+| SB-RFILE-027 | `AccumuloDataset.__iter__` / `__next__` (`sharkbite/torch.py:38-61`) | Compose `Results.__iter__` and scanner cleanup on exhaustion | Compose scan result iteration plus explicit close on exhaustion | `sharkbite/torch.py:38-61`; `examples/torchexample.py:76` | Missing C ABI | Iteration is lazy only after the constructor's eager scanner setup. On `StopIteration` it closes the scanner and nils both iterator handles. |
+| SB-RFILE-028 | `AccumuloValueDataset(cluster, table, start_key_string, end_key_string)` (`sharkbite/torch.py:64-66`) | — | — | `sharkbite/torch.py:64-66` | Not required (rationale required) | Rationale: upstream defect, not a contract. The pinned constructor calls `super.__init__` instead of `super().__init__`, so it never initializes the base dataset state. See [§21](#sec-21). |
+| SB-RFILE-029 | `AccumuloValueDataset.coerce(key)` (`sharkbite/torch.py:68-69`) | — | — | `sharkbite/torch.py:68-69` | Not required (rationale required) | Rationale: reachable only through the broken constructor above. If this helper is intentionally brought into scope later, define it afresh alongside a working constructor. |
+| SB-RFILE-030 | `pandashark.read_accumulo(connector, ranges, columns=None, index_col=None, chunksize=1000)` overload (`pandashark/__init__.py:51-61`) | — | — | `pandashark/__init__.py:51-61` | Not required (rationale required) | Rationale: separate `pandashark` package boundary (see SB-PKG-013). This overload calls `connector.to_scanner()`, `fetch_ranges(ranges)`, then dispatches to the scanner overload. |
+| SB-RFILE-031 | `pandashark.read_accumulo(scanner, columns=None, index_col=None, chunksize=1000)` overload (`pandashark/__init__.py:64-98`) | — | — | `pandashark/__init__.py:64-98`; `examples/dataframe.py:68-69` | Not required (rationale required) | Rationale: separate `pandashark` package boundary. The pinned helper is also defective: it calls `scanner.get(chunksize)`, so `chunksize` is passed as `begin_row` instead of controlling DataFrame batch size. See [§21](#sec-21). |
+| SB-RFILE-032 | `pandashark.read_accumulo_nex(iterator, columns=None, index_col=None, chunksize=1000)` (`pandashark/__init__.py:100-110`) | — | — | `pandashark/__init__.py:100-110` | Not required (rationale required) | Rationale: separate `pandashark` package boundary. The helper is only a one-step alias over `iterator.__next__()`. |
+| SB-RFILE-033 | `pandashark.pandassharkbite.DataFrameIterator(iterator)` / `__iter__` / `get_columns()` (`pandashark/pandassharkbite.py:36-52`) | — | — | `pandashark/pandassharkbite.py:36-52` | Not required (rationale required) | Rationale: separate `pandashark` package boundary. The constructor seeds a shared class-level `set` with `row`, `column`, `visibility`, and `value`, then iteration delegates straight to the wrapped iterator. |
+| SB-RFILE-034 | `DataFrameIterator.__next__()` DataFrame conversion (`pandashark/pandassharkbite.py:54-73`) | — | — | `pandashark/pandassharkbite.py:54-73` | Not required (rationale required) | Rationale: separate `pandashark` package boundary. At exhaustion it calls `nextBatch()` on the wrapped iterator and returns the DataFrame accumulated so far (possibly empty) instead of raising `StopIteration`. |
 
 <a id="sec-16"></a>
 
@@ -630,22 +666,28 @@ Java-`DataInput`-compatible stream API.
 
 ## 18. Matrix: exceptions and error mapping (`SB-ERR`)
 
+Python-visible exceptions are a strict subset of Sharkbite's C++ hierarchy.
+`pysharkbite.cpp` registers only `TApplicationException` and `ClientException`;
+all other C++ exception types below are C++-scope unless a row explicitly says
+otherwise, and Python sees a generic `RuntimeError` when one escapes the
+binding.
+
 | ID | Sharkbite | Shoal Go | Shoal C ABI | Evidence | Status | Notes |
 | --- | --- | --- | --- | --- | --- | --- |
 | SB-ERR-001 | `pysharkbite.ClientException` registered as a Python exception with a translator (`pysharkbite.cpp:613-621`) | Error values, no exception type | `shoal_error` + `shoal_error_code` + `shoal_error_message` (`capi/include/shoal.h:224-237`) | `capi/tests/lifecycle.c:9-16`; `TestStatusForWriterErrors` (`cmd/shoal-capi/writer_export_test.go:67`) | Missing C ABI | The shim must define `sharkbite.ClientException` and raise it for every mapped status. Pinned tests catch it by name (`test/python/TestBadOperations.py:63`, `test/python/TestSecurityOperations.py:115`). |
-| SB-ERR-002 | `ClientException.getErrorCode()` with `CLIENT_ERROR_CODES` (0–13, including `TABLE_NOT_FOUND`, `RANGE_NOT_SPECIFIED`, `SCANNER_ALREADY_STARTED`) (`include/data/exceptions/ClientException.h:39,50-51`) | Sentinel errors (`accumulo/errors.go:5-52`) | `shoal_status` enum, 0–18 + 255 (`capi/include/shoal_types.h:23-43`) | `test/vandv/invalidscans.h`; `capi/tests/lifecycle.c:30-33,49-52` | Behavior mismatch | Numeric codes are **not** the same set and must be mapped deliberately. `test/vandv/invalidscans.h` asserts specific numeric codes, so the mapping table is part of the contract, not an implementation detail. |
+| SB-ERR-002 | C++ `ClientException.getErrorCode()` with `CLIENT_ERROR_CODES` (0–13, including `TABLE_NOT_FOUND`, `RANGE_NOT_SPECIFIED`, `SCANNER_ALREADY_STARTED`) (`include/data/exceptions/ClientException.h:39,50-51`) | Sentinel errors (`accumulo/errors.go:5-52`) | `shoal_status` enum, 0–18 + 255 (`capi/include/shoal_types.h:23-43`) | `test/vandv/invalidscans.h`; `pysharkbite.cpp:613-619`; `capi/tests/lifecycle.c:30-33,49-52` | Behavior mismatch | `getErrorCode()` is **not** Python-visible in the pinned binding; the numeric mapping matters for the C++/flat-C replacement claim and the port of `test/vandv/invalidscans.h`, not because Python ever saw the method. |
 | SB-ERR-003 | `pysharkbite.TApplicationException` (Thrift) registered (`pysharkbite.cpp:612`) | Thrift types are internal by design (`accumulo/batch_writer.go:116` comment) | Mapped to `shoal_status` | `TestStatusForWriterErrors` (`cmd/shoal-capi/writer_export_test.go:67`) | Intentional divergence (approval required) | Shoal deliberately never leaks generated Thrift types. Any Sharkbite user catching `TApplicationException` will not see it. Requires approval plus a documented replacement (`ClientException` with a transport status). |
 | SB-ERR-004 | Table not found | `ErrTableNotFound` (`accumulo/errors.go:15`) | `SHOAL_STATUS_NOT_FOUND` (9) | `TestTableMutationsMapErrorsAndLifecycle` (`accumulo/table_admin_test.go:263`) | Missing C ABI | Table admin is not on the ABI yet, so the status is unreachable for admin paths. |
 | SB-ERR-005 | Permission denied / `ThriftSecurityException` (`test/vandv/testSecurityOperations.h`) | `ErrPermissionDenied` (`accumulo/errors.go:32`) | `SHOAL_STATUS_PERMISSION_DENIED` (10) | — | Behavior mismatch | No named Shoal test asserts this mapping end to end; live-cluster conformance required. |
 | SB-ERR-006 | `NotServingException` → transparent relocation (`include/data/exceptions/NotServingException.h:22`) | `isStaleScanError` + retry (`accumulo/scanner.go:350`) | Implicit — no separate ABI surface | `TestScannerRetriesNotServingAssignmentOnce` (`accumulo/scanner_test.go:294`) | Covered | Neither surfaces the exception to the user. |
-| SB-ERR-007 | `IllegalArgumentException` (`include/data/exceptions/IllegalArgumentException.h:23`) | Plain `errors.New`/`fmt.Errorf` validation errors | `SHOAL_STATUS_INVALID_ARGUMENT` (1) | `capi/tests/lifecycle.c:77-96,116-142` | Behavior mismatch | Shim must map argument validation to the Sharkbite class, not Python `ValueError`, for pinned `except` clauses to keep working. |
-| SB-ERR-008 | `IllegalStateException` (`include/data/exceptions/IllegalStateException.h:23`) | `ErrBatchWriterClosed`, `ErrConnectorClosed` (`accumulo/batch_writer.go:27`, `accumulo/errors.go:51`) | `SHOAL_STATUS_CLOSED` (6) | `TestBatchWriterCloseLifecycle` (`accumulo/batch_writer_test.go:852`); `capi/tests/lifecycle.c:233-243` | Missing C ABI | Mapping exists; the Python class does not. |
+| SB-ERR-007 | Validation failures exposed to Python as generic `RuntimeError` (underlying C++ type `IllegalArgumentException`) (`include/data/exceptions/IllegalArgumentException.h:23`; `pysharkbite.cpp:613-619`) | Plain `errors.New`/`fmt.Errorf` validation errors | `SHOAL_STATUS_INVALID_ARGUMENT` (1) | `test/python/TestBadOperations.py:67-79`; `capi/tests/lifecycle.c:77-96,116-142` | Missing C ABI | Sharkbite does **not** bind `IllegalArgumentException` as a Python class; broad `except RuntimeError` blocks are the observable contract. If the shim later raises `ClientException` or `ValueError` instead, record it as a divergence. |
+| SB-ERR-008 | Lifecycle failures exposed to Python as generic `RuntimeError` (underlying C++ type `IllegalStateException`) (`include/data/exceptions/IllegalStateException.h:23`; `pysharkbite.cpp:613-619`) | `ErrBatchWriterClosed`, `ErrConnectorClosed` (`accumulo/batch_writer.go:27`, `accumulo/errors.go:51`) | `SHOAL_STATUS_CLOSED` (6) | `TestBatchWriterCloseLifecycle` (`accumulo/batch_writer_test.go:852`); `capi/tests/lifecycle.c:233-243` | Missing C ABI | As with SB-ERR-007, the Python-visible contract is a bare `RuntimeError`, not a bound `IllegalStateException` class. |
 | SB-ERR-009 | `HDFSException` (`include/data/exceptions/HDFSException.h:24`) | `storage.ErrNotFound`, `storage.ErrReadOnly` — **internal** | — | — | Missing Go | Blocked with the rest of HDFS ([§16](#sec-16)). |
-| SB-ERR-010 | `VisibilityParseException` with `terms`/`offset` fields (`include/data/exceptions/VisibilityParseException.h:23`) | `internal/visfilter` parse errors — **internal** | — | — | Missing Go | Field-level detail (offset within the expression) is part of the contract. |
-| SB-ERR-011 | `IterationInterruptedException` (`include/data/exceptions/InterationInterruptedException.h:23` — filename misspelled upstream) | `context.Canceled` propagation | `SHOAL_STATUS_CANCELLED` (7) | `TestScannerCancellationStillClosesServerScan` (`accumulo/scanner_test.go:396`) | Missing C ABI | |
+| SB-ERR-010 | Visibility parse failures exposed to Python as generic `RuntimeError` (underlying C++ type `VisibilityParseException`, with private `terms`/`offset`) (`include/data/exceptions/VisibilityParseException.h:23`; `pysharkbite.cpp:613-619`) | `internal/visfilter` parse errors — **internal** | — | — | Missing Go | `terms` and `offset` are C++-only in the pinned release; Python never receives them. If Shoal later exposes visibility-parse detail, treat it as additive, not required Sharkbite parity. |
+| SB-ERR-011 | Iteration interruption exposed to Python as generic `RuntimeError` (underlying C++ type `IterationInterruptedException`) (`include/data/exceptions/InterationInterruptedException.h:23` — filename misspelled upstream; `pysharkbite.cpp:613-619`) | `context.Canceled` propagation | `SHOAL_STATUS_CANCELLED` (7) | `TestScannerCancellationStillClosesServerScan` (`accumulo/scanner_test.go:396`) | Missing C ABI | The pinned binding does not register a Python `IterationInterruptedException`; cancellation observed from Python would be a bare `RuntimeError`. |
 | SB-ERR-012 | `APIException` (`include/interconnect/exceptions/APIException.h:23`) | — | — | — | Not required (rationale required) | Rationale: thrown only from the flat C API glue ([§19](#sec-19)), which is not part of the Python contract. |
 | SB-ERR-013 | `JavaException` (`include/jni/JavaException.h:36`) | — | — | — | Not required (rationale required) | Rationale: only reachable through the JNI iterator build (`PYTHON_ITERATOR_SUPPORT`), which is tracked by SB-SCAN-016. |
-| SB-ERR-014 | Python code catching bare `RuntimeError` alongside `ClientException` (`test/python/TestBadOperations.py:63,71,79,94`) | n/a | n/a | `test/python/TestBadOperations.py` | Missing C ABI | Because pybind11 maps unmapped C++ exceptions to `RuntimeError`, real Sharkbite code catches both. The shim must ensure `ClientException` derives from `RuntimeError` so existing `except RuntimeError` blocks keep working. |
+| SB-ERR-014 | Python code catching bare `RuntimeError` alongside `ClientException` (`test/python/TestBadOperations.py:63,71,79,94`) | n/a | n/a | `test/python/TestBadOperations.py` | Missing C ABI | Because only `ClientException`/`TApplicationException` are registered, real Sharkbite code catches both named and bare `RuntimeError`. The shim must ensure `ClientException` derives from `RuntimeError` so existing broad catches keep working. |
 | SB-ERR-015 | Errors carry no server identity | `MutationRejectionError.Server`, `BatchWriterCleanupError.Server`, `CleanupError.ScanID` (`accumulo/batch_writer.go:117,136`, `accumulo/scanner.go:117`) | `shoal_*_view.server` fields | `TestMalformedUpdateErrorsIncludeTabletServer` (`accumulo/batch_writer_test.go:993`) | Not required (rationale required) | Rationale: Shoal superset; additive detail on the exception object. |
 
 <a id="sec-19"></a>
@@ -729,6 +771,10 @@ here, because some code depends on the broken shape.
 | SB-UNSAFE-018 | Server-side update errors are never surfaced to Python | `pysharkbite.cpp:486-497` (no failure accessor on the `Sink` binding) | Rejected mutations look like successful writes. | Surface `MutationRejectionError` through `ClientException`; see SB-WRITE-010 and [§26](#sec-26). |
 | SB-UNSAFE-019 | `ZookeeperInstance` owns raw `ZooCache`/`ZooKeeper` pointers with manual `delete` | `include/data/constructs/client/zookeeperinstance.h` | Inconsistent with the rest of the API and easy to double-free. | Shoal's `Instance.Close()` is idempotent (`accumulo/instance.go:143`). |
 | SB-UNSAFE-020 | Committed build artifacts in the test tree (`test/zookeeper/construct_test`, `test/zookeeper/testInstance`) and an empty `test/services/CMakeLists.txt` | `test/` | The mock-server test path is dead; the harness cannot be trusted as evidence. | Ignore as evidence; port the behavior into live-cluster conformance instead. |
+| SB-UNSAFE-021 | `AccumuloScanner.__del__` performs network I/O during interpreter teardown | `sharkbite/__init__.py:162-164` | Same shutdown hazards as `AccumuloWriter.__del__`: exceptions are swallowed and module globals may already be torn down. | Keep only a best-effort finalizer and document `with`/`close()` as the contract. |
+| SB-UNSAFE-022 | `AccumuloValueDataset.__init__` calls `super.__init__` instead of `super().__init__` | `sharkbite/torch.py:64-66` | The subclass constructor never initializes the base dataset state, so the public helper is unusable as written. | Do not reproduce the broken constructor; if this helper ever enters scope, publish a working constructor and record the divergence. |
+| SB-UNSAFE-023 | `pandashark.read_accumulo(scanner, ..., chunksize)` passes `chunksize` as `begin_row` to `AccumuloScanner.get` | `pandashark/__init__.py:89-97` | The helper discards the scanner's configured ranges and misuses the `AccumuloScanner.get` signature. | Treat it as an upstream defect, not as a batching contract. |
+| SB-UNSAFE-024 | `AccumuloDataset.coerce` default path calls `key.getKey().getValue().get()` | `sharkbite/torch.py:24-30` | Normal `KeyValue` inputs do not have `getKey().getValue()`, so the helper prints an exception and returns `0`. | Preserve only the working callable-override path unless a future divergence decision intentionally redesigns the default coercion behavior. |
 
 <a id="sec-22"></a>
 
@@ -840,8 +886,8 @@ entry is either closed or reclassified in [§26](#sec-26).
 | --- | --- | --- | --- |
 | SB-GAP-P-001 | `sharkbite` package with `pysharkbite` compatibility module | SB-PKG-002…SB-PKG-004 | |
 | SB-GAP-P-002 | Exception hierarchy rooted at `RuntimeError` | SB-ERR-001, SB-ERR-014, SB-KEEP-018 | |
-| SB-GAP-P-003 | High-level helpers (`AccumuloBase`, `AccumuloWriter`, `AccumuloScanner`, `AccumuloIterator`) with the SB-UNSAFE fixes | SB-WRITE-016…SB-WRITE-022, SB-SCAN-024 | |
-| SB-GAP-P-004 | `sharkbite.torch` optional extra | SB-PKG-012, SB-RFILE-024 | |
+| SB-GAP-P-003 | High-level helpers (`AccumuloBase`, `AccumuloWriter`, `AccumuloScanner`, `AccumuloIterator`) with the SB-UNSAFE fixes | SB-CONN-014, SB-WRITE-016…SB-WRITE-023, SB-SCAN-024, SB-SCAN-028…SB-SCAN-032 | |
+| SB-GAP-P-004 | `sharkbite.torch` optional extra | SB-PKG-012, SB-RFILE-024…SB-RFILE-029 | `pandashark` remains separately tracked because the pinned `sharkbite` wheel does not ship it. |
 | SB-GAP-P-005 | Wheel matrix and `manylinux` build | SB-PKG-007…SB-PKG-011 | Includes the Python floor decision. |
 | SB-GAP-P-006 | Migration guide covering every approved divergence | [§26](#sec-26) | Ships with the first release. |
 
@@ -911,39 +957,39 @@ Sharkbite's `test/19x/st` SMAC project played), driven from CI, with the ported
 
 | Status | Rows |
 | --- | --- |
-| Covered | 42 |
+| Covered | 41 |
 | Missing Go | 133 |
-| Missing C ABI | 55 |
-| Behavior mismatch | 62 |
+| Missing C ABI | 66 |
+| Behavior mismatch | 61 |
 | Intentional divergence (approval required) | 4 |
-| Not required (rationale required) | 37 |
-| **Total** | **333** |
+| Not required (rationale required) | 45 |
+| **Total** | **350** |
 
 ### 25.2 By category
 
 | Section | Prefix | Rows | Covered | Missing Go | Missing C ABI | Behavior mismatch | Intentional divergence | Not required |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | [§5](#sec-5) Packaging and imports | `SB-PKG` | 14 | 0 | 0 | 9 | 1 | 1 | 3 |
-| [§6](#sec-6) Configuration and credentials | `SB-CFG` | 18 | 1 | 4 | 4 | 5 | 1 | 3 |
-| [§7](#sec-7) Connector and session | `SB-CONN` | 13 | 3 | 3 | 2 | 4 | 1 | 0 |
+| [§6](#sec-6) Configuration and credentials | `SB-CFG` | 18 | 0 | 4 | 5 | 5 | 1 | 3 |
+| [§7](#sec-7) Connector and session | `SB-CONN` | 14 | 3 | 3 | 3 | 4 | 1 | 0 |
 | [§8](#sec-8) Data model | `SB-DATA` | 64 | 16 | 10 | 10 | 23 | 0 | 5 |
-| [§9](#sec-9) Scanners and results | `SB-SCAN` | 27 | 2 | 9 | 2 | 9 | 0 | 5 |
-| [§10](#sec-10) Writers | `SB-WRITE` | 22 | 2 | 1 | 7 | 5 | 0 | 7 |
+| [§9](#sec-9) Scanners and results | `SB-SCAN` | 32 | 2 | 9 | 6 | 9 | 0 | 6 |
+| [§10](#sec-10) Writers | `SB-WRITE` | 23 | 2 | 1 | 8 | 5 | 0 | 7 |
 | [§11](#sec-11) Table operations | `SB-TABLE` | 22 | 0 | 3 | 11 | 2 | 0 | 6 |
 | [§12](#sec-12) Namespaces | `SB-NS` | 8 | 0 | 7 | 0 | 1 | 0 | 0 |
 | [§13](#sec-13) Security | `SB-SEC` | 19 | 0 | 17 | 0 | 1 | 0 | 1 |
 | [§14](#sec-14) Cluster status | `SB-STAT` | 38 | 0 | 37 | 0 | 0 | 0 | 1 |
-| [§15](#sec-15) RFile and streams | `SB-RFILE` | 24 | 0 | 20 | 1 | 1 | 0 | 2 |
+| [§15](#sec-15) RFile, streams, and helpers | `SB-RFILE` | 34 | 0 | 20 | 4 | 1 | 0 | 9 |
 | [§16](#sec-16) HDFS | `SB-HDFS` | 14 | 0 | 14 | 0 | 0 | 0 | 0 |
 | [§17](#sec-17) Logging | `SB-LOG` | 3 | 0 | 2 | 0 | 1 | 0 | 0 |
-| [§18](#sec-18) Errors | `SB-ERR` | 15 | 1 | 2 | 5 | 3 | 1 | 3 |
+| [§18](#sec-18) Errors | `SB-ERR` | 15 | 1 | 2 | 6 | 2 | 1 | 3 |
 | [§19](#sec-19) C++ and flat C | `SB-CPP` | 14 | 8 | 3 | 1 | 1 | 0 | 1 |
 | [§20](#sec-20) Cross-cutting | `SB-XCUT` | 18 | 9 | 1 | 3 | 5 | 0 | 0 |
-| **Total** | | **333** | **42** | **133** | **55** | **62** | **4** | **37** |
+| **Total** | | **350** | **41** | **133** | **66** | **61** | **4** | **45** |
 
 ### 25.3 Reading the counts
 
-Of 333 rows, **42 are `Covered`** — 12.6 percent. They are concentrated in
+Of 350 rows, **41 are `Covered`** — 11.7 percent. They are concentrated in
 connector lifecycle, the key/value/mutation data model, batch writing, ABI
 hygiene, and flat-C parity, which is exactly the ground the merged ABI work
 ([#48](https://github.com/phrocker/shoal-oss/issues/48)/[#52](https://github.com/phrocker/shoal-oss/pull/52),
@@ -951,14 +997,17 @@ hygiene, and flat-C parity, which is exactly the ground the merged ABI work
 [#63](https://github.com/phrocker/shoal-oss/issues/63)/[#64](https://github.com/phrocker/shoal-oss/pull/64))
 covers.
 
+Another 45 rows are explicit `Not required` scope exclusions or upstream
+defects. They are tracked so the audit stays exhaustive, but they do not need
+to become `Covered` unless their scope decision changes.
+
 The 133 `Missing Go` rows are dominated by cluster status (37), RFile and
 streams (20), security (17), and HDFS (14) — surfaces where Shoal has never had
-a client-side public implementation. The 55 `Missing C ABI` rows are mostly
-table administration (11) and Python-layer packaging (9), both already
-scheduled ([#82](https://github.com/phrocker/shoal-oss/issues/82) /
-PR [#84](https://github.com/phrocker/shoal-oss/pull/84)).
+a client-side public implementation. The 66 `Missing C ABI` rows are led by
+table administration (11), Python-layer packaging (9), writers (8), and
+scanners/results (6), with configuration/credential mapping close behind (5).
 
-The 62 `Behavior mismatch` rows are the most dangerous category for a
+The 61 `Behavior mismatch` rows are the most dangerous category for a
 compatibility project: the capability exists on both layers, so a naive
 implementer will mark them done, but the observable semantics differ — types
 (`str` versus `bytes`), defaults (`Key` timestamp, writer thread count, ZooKeeper
