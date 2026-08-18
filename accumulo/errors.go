@@ -49,4 +49,8 @@ var (
 
 	// ErrConnectorClosed indicates an operation attempted on a closed Connector.
 	ErrConnectorClosed = errors.New("accumulo: connector is closed")
+
+	// ErrInvalidBulkDir indicates that a bulk-import call was given an empty
+	// or otherwise unusable bulk directory path.
+	ErrInvalidBulkDir = errors.New("accumulo: invalid bulk directory")
 )
