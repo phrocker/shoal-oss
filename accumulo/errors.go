@@ -68,6 +68,19 @@ var (
 	// or otherwise unusable bulk directory path.
 	ErrInvalidBulkDir = errors.New("accumulo: invalid bulk directory")
 
+	// ErrInvalidTableSplit indicates that a split-point collection was empty
+	// or contained a nil or zero-length row.
+	ErrInvalidTableSplit = errors.New("accumulo: invalid table split")
+
+	// ErrTableOffline indicates that Accumulo rejected an operation because
+	// the table is not online.
+	ErrTableOffline = errors.New("accumulo: table offline")
+
+	// ErrTableSplitsIncomplete indicates that split points remained unapplied
+	// after the bounded tablet re-resolution retries were exhausted, which
+	// happens when tablets keep moving or splitting underneath the client.
+	ErrTableSplitsIncomplete = errors.New("accumulo: table splits incomplete")
+
 	// ErrInvalidUser indicates that a user name is empty or otherwise invalid.
 	ErrInvalidUser = errors.New("accumulo: invalid user")
 

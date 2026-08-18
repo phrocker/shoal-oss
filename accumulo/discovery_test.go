@@ -227,7 +227,30 @@ func testConnectorWithDiscovery(
 	},
 	names *fakeTableNames,
 ) *Connector {
-	return testConnectorWithNamespaceDiscovery(t, walker, newFakeNamespacesFromTables(names), names)
+	return testConnectorWithNamespaceDiscoveryAndState(
+		t,
+		walker,
+		newFakeNamespacesFromTables(names),
+		names,
+		nil,
+	)
+}
+
+func testConnectorWithDiscoveryAndState(
+	t *testing.T,
+	walker interface {
+		LocateTable(context.Context, string) ([]metadata.TabletInfo, error)
+	},
+	names *fakeTableNames,
+	state tableStateReader,
+) *Connector {
+	return testConnectorWithNamespaceDiscoveryAndState(
+		t,
+		walker,
+		newFakeNamespacesFromTables(names),
+		names,
+		state,
+	)
 }
 
 func testConnectorWithNamespaceDiscovery(
@@ -237,6 +260,18 @@ func testConnectorWithNamespaceDiscovery(
 	},
 	namespaces *fakeNamespaces,
 	names *fakeTableNames,
+) *Connector {
+	return testConnectorWithNamespaceDiscoveryAndState(t, walker, namespaces, names, nil)
+}
+
+func testConnectorWithNamespaceDiscoveryAndState(
+	t *testing.T,
+	walker interface {
+		LocateTable(context.Context, string) ([]metadata.TabletInfo, error)
+	},
+	namespaces *fakeNamespaces,
+	names *fakeTableNames,
+	state tableStateReader,
 ) *Connector {
 	t.Helper()
 	instance, err := NewStaticInstance("accumulo", "uuid-1")
@@ -261,7 +296,7 @@ func testConnectorWithNamespaceDiscovery(
 	if namespaces == nil {
 		namespaces = newFakeNamespacesFromTables(names)
 	}
-	connector.discovery = newConnectorDiscovery(walker, namespaces, names)
+	connector.discovery = newConnectorDiscovery(walker, namespaces, names, state)
 	t.Cleanup(func() { _ = connector.Close() })
 	return connector
 }

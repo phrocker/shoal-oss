@@ -122,6 +122,50 @@ func TestPooledFinishesAfterOperationFailure(t *testing.T) {
 	}
 }
 
+func TestPooledExecuteStatusContinuesWaitingAfterExecuteCleanupFailure(t *testing.T) {
+	pool, err := transportpool.New(transportpool.Config{MaxIdlePerEndpoint: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+
+	pooled, err := NewPooled(pool, "uuid-1", "4.0.0-SNAPSHOT", &security.TCredentials{
+		Principal:      "root",
+		TokenClassName: "PasswordToken",
+		Token:          []byte("secret"),
+		InstanceId:     "uuid-1",
+	}, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cleanupErr := thrift.NewTTransportExceptionFromError(errors.New("execute close failed"))
+	rpc := &fakeFateRPC{
+		id:         fateID{Type: 1, UUID: "abc"},
+		waitStatus: "COMMITTED",
+	}
+	var dials atomic.Int32
+	pooled.dial = func(context.Context, transportpool.Key) (io.Closer, error) {
+		if dials.Add(1) == 2 {
+			return &fakeTransport{rpc: rpc, closeErr: cleanupErr}, nil
+		}
+		return &fakeTransport{rpc: rpc}, nil
+	}
+	pooled.newClient = clientFromFakeTransport
+
+	status, err := pooled.ExecuteStatus(context.Background(), "manager:9997", createRequest("events"))
+	if status != "COMMITTED" {
+		t.Fatalf("status = %q, want wait status", status)
+	}
+	if !errors.Is(err, cleanupErr) {
+		t.Fatalf("error = %v, want execute cleanup preserved", err)
+	}
+	if rpc.begin.Load() != 1 || rpc.execute.Load() != 1 || rpc.waitCalls.Load() != 1 || rpc.finish.Load() != 1 {
+		t.Fatalf("calls begin/execute/wait/finish = %d/%d/%d/%d",
+			rpc.begin.Load(), rpc.execute.Load(), rpc.waitCalls.Load(), rpc.finish.Load())
+	}
+}
+
 func TestPooledFinishesWithCancelledContext(t *testing.T) {
 	pooled, pool := newTestPooled(t)
 	defer pool.Close()
@@ -802,6 +846,26 @@ func TestPooledSecuritySuccessPreservesPostResponseCleanupFailure(t *testing.T) 
 	}
 	if !slices.Equal(rpc.operations, []string{"changeLocalUserPassword"}) {
 		t.Fatalf("operations = %v", rpc.operations)
+	}
+}
+
+func TestMapRPCErrorPreservesJoinedCleanupCause(t *testing.T) {
+	cleanupErr := thrift.NewTTransportExceptionFromError(errors.New("close failed"))
+
+	err := mapRPCError(errors.Join(
+		&clientgen.ThriftTableOperationException{
+			Type:      clientgen.TableOperationExceptionType_OFFLINE,
+			TableName: "events",
+		},
+		cleanupErr,
+	))
+
+	var managerErr *Error
+	if !errors.As(err, &managerErr) || managerErr.Kind != ErrorTableOffline {
+		t.Fatalf("error = %#v, want ErrorTableOffline", err)
+	}
+	if !errors.Is(err, cleanupErr) {
+		t.Fatalf("error = %v, want cleanup cause preserved", err)
 	}
 }
 
@@ -1617,6 +1681,7 @@ type fakeFateRPC struct {
 	id         fateID
 	beginErr   error
 	executeErr error
+	waitStatus string
 	wait       func() error
 	finishErr  error
 	finishFunc func(context.Context) error
@@ -1656,7 +1721,7 @@ func (r *fakeFateRPC) Wait(context.Context, *security.TCredentials, fateID) (str
 	if r.wait != nil {
 		return "", r.wait()
 	}
-	return "", nil
+	return r.waitStatus, nil
 }
 
 func (r *fakeFateRPC) Finish(ctx context.Context, _ *security.TCredentials, _ fateID) error {

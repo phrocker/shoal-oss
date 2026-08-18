@@ -79,6 +79,7 @@ func testConnectorWithRealNamespaceResolver(
 		&fakeTabletWalker{},
 		nslookup.NewResolver(locator),
 		&fakeTableNames{byName: map[string]string{}, byID: map[string]string{}},
+		nil,
 	)
 	t.Cleanup(func() { _ = connector.Close() })
 	return connector

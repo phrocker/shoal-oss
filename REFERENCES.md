@@ -194,6 +194,81 @@ cribs land.
     `"4.0.0-SNAPSHOT"` becomes `"4.0"`)
 - `core/.../rpc/AccumuloTFramedTransportFactory.java:29` — TFramedTransport
 
+### Table splits (`TABLE_SPLIT`, port target for #88)
+
+Accumulo source revision `317c288568e9c46e7854aafb8bb8c4fda6260b12`.
+
+- `core/.../clientImpl/TableOperationsImpl.java`
+  - `addSplits` = `putSplits(tableName,
+    TabletMergeabilityUtil.userDefaultSplits(splits))`, i.e. every
+    user-requested split point carries `TabletMergeability.never()`
+  - `putSplits` first validates `EXISTING_TABLE_NAME`, resolves the table
+    ID, and calls `requireNotOffline(tableId, tableName)` before any
+    tablet mapping, so malformed names and OFFLINE tables fail before
+    either `updateTabletMergeability` or `TABLE_SPLIT`
+  - `putSplits` loops until nothing is pending: invalidate the tablet
+    cache, map each pending split row to the tablet whose
+    `(prevEndRow, endRow]` range contains it, then run one FATE
+    `TABLE_SPLIT` per tablet. FATE argument order is exactly
+    `[tableId.canonical(), endRow or EMPTY, prevEndRow or EMPTY,
+    encoded split…]`, options `Map.of()`, and `EMPTY` is a zero-length
+    buffer (`ByteBuffer.allocate(0)`) for an unbounded boundary
+  - pending-row mapping uses `Retry.builder().infiniteRetries()`
+    `.retryAfter(100ms).incrementBy(100ms).maxWait(2s).backOffFactor(1.5)`;
+    because `backOffFactor > 1`, `Retry.waitForNextAttempt` produces an
+    exponential schedule with ±5% jitter around the factor-derived
+    increment, capped at 2 seconds
+  - `SPLIT_SUCCESS_MSG = "SPLIT_SUCCEEDED"` — only when
+    `waitForFateOperation` returns this string are the tablet's splits
+    removed from the pending set; any other value (the server returns the
+    empty string when the requested extent no longer exists) means retry
+    against re-resolved tablets. The FATE op is finished in a `finally`
+    block even when the wait failed
+  - `mapSplitsToTablets` routes a split whose row already equals the
+    containing tablet's `endRow` to `existingSplits` instead of a new FATE
+    op; those are sent to the manager's `updateTabletMergeability` and only
+    the extents the manager returns are treated as done
+  - `FateInstanceType.fromNamespaceOrTableName` (see
+    `core/.../fate/FateInstanceType.java` + `clientImpl/Namespace.java`)
+    picks `META` when the qualified name starts with the literal
+    `"accumulo"`, else `USER`
+- `core/.../clientImpl/TabletMergeabilityUtil.java`
+  - split payload = `gson.toJson(GSonData(byte[] split, boolean never,
+    Long delay))` using
+    `ByteArrayToBase64TypeAdapter.createBase64Gson()`. Record component
+    order fixes the JSON key order (`split`, `never`, `delay`), the Base64
+    is URL-safe **and padded** (`Base64.getUrlEncoder()`, Go's
+    `base64.URLEncoding`), HTML escaping is disabled, and Gson's default
+    null-suppression drops `delay` entirely for `never()`. Byte-for-byte:
+    `{"split":"YQ==","never":true}` for row `a`, and
+    `{"split":"YQ==","never":false,"delay":86400000000000}` for
+    `after(1 day)`. Reproduced as goldens in
+    `accumulo/split_payload_test.go`
+  - `toThrift(never())` = `TTabletMergeability(never=true, delay=-1)`
+- `server/manager/.../FateServiceHandler.java`
+  - `TABLE_SPLIT` case: `SPLIT_OFFSET = 3`, requires at least 4 arguments,
+    validates argument 0 as a table **ID** (not a name — same as
+    `TABLE_BULK_IMPORT2`), treats zero-length arguments 1 and 2 as null
+    extent boundaries, decodes arguments 3..n with
+    `TabletMergeabilityUtil::decode`, and rejects any split outside the
+    extent or equal to its end row
+- `server/manager/.../ManagerClientServiceHandler.java`
+  - `updateTabletMergeability(tinfo, creds, tableName, Map<TKeyExtent,
+    TTabletMergeability>)` takes the **qualified table name**, requires
+    `canSplitTablet`, and returns only the extents whose conditional
+    mutation was `ACCEPTED`; rejected tablets must be retried by the client
+- `server/manager/.../tableOps/split/DeleteOperationIds.java`
+  - `getReturn()` is what surfaces `SPLIT_SUCCEEDED` to the client
+
+Shoal mapping: `accumulo.Connector.AddTableSplits` →
+`managerclient.TableSplit` / `managerclient.Pooled.ExecuteStatus` and
+`managerclient.Pooled.UpdateTabletMergeability`. Accumulo 4 removed the
+legacy tablet-server `splitTablet` RPC; Shoal never calls it. Unlike
+Accumulo, Shoal submits a table's groups sequentially (not through two
+thread pools) and bounds the outer retry loop to 10 attempts, failing
+with `ErrTableSplitsIncomplete` instead of looping forever, while
+mirroring Accumulo's per-round retry schedule.
+
 ### RFile (port target for V0)
 - `core/src/main/java/org/apache/accumulo/core/file/rfile/RFile.java`
 - `core/.../iterators/system/VisibilityFilter.java`

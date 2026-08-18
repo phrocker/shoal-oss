@@ -8,6 +8,7 @@ import (
 	"github.com/phrocker/shoal/internal/cache"
 	"github.com/phrocker/shoal/internal/metadata"
 	"github.com/phrocker/shoal/internal/tablenames"
+	"github.com/phrocker/shoal/internal/zk"
 )
 
 // Namespace is an Accumulo namespace identity.
@@ -57,6 +58,10 @@ type namespaceResolver interface {
 	Invalidate()
 }
 
+type tableStateReader interface {
+	TableState(context.Context, string) (zk.TableStateResult, error)
+}
+
 type tableNameResolver interface {
 	ResolveID(context.Context, string) (string, error)
 	ResolveName(context.Context, string) (string, error)
@@ -69,17 +74,20 @@ type connectorDiscovery struct {
 	tablets    *cache.LocatorCache
 	namespaces namespaceResolver
 	tables     tableNameResolver
+	states     tableStateReader
 }
 
 func newConnectorDiscovery(
 	tablets cache.TableLocator,
 	namespaces namespaceResolver,
 	tables tableNameResolver,
+	states tableStateReader,
 ) *connectorDiscovery {
 	return &connectorDiscovery{
 		tablets:    cache.New(tablets),
 		namespaces: namespaces,
 		tables:     tables,
+		states:     states,
 	}
 }
 
