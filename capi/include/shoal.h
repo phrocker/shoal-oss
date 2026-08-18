@@ -7,7 +7,33 @@
 extern "C" {
 #endif
 
+/*
+ * Legacy compatibility-major query preserved for existing callers. Use the
+ * version and capability queries below when negotiating additive features.
+ */
 SHOAL_API uint32_t SHOAL_CALL shoal_abi_version(void);
+
+/*
+ * These queries are deterministic, allocation-free, thread-safe, and valid
+ * before any connector or other handle is created.
+ */
+SHOAL_API uint32_t SHOAL_CALL shoal_abi_version_major(void);
+SHOAL_API uint32_t SHOAL_CALL shoal_abi_version_minor(void);
+SHOAL_API uint32_t SHOAL_CALL shoal_abi_version_patch(void);
+SHOAL_API uint32_t SHOAL_CALL shoal_abi_version_packed(void);
+
+/*
+ * Capability identifiers are append-only. word_count reports how many 64-bit
+ * words the current library uses. shoal_abi_capability_word() returns 0 for
+ * word_index values beyond that range. shoal_abi_has_capability() returns 1
+ * for supported capabilities and 0 for unsupported or unknown identifiers.
+ */
+SHOAL_API uint32_t SHOAL_CALL shoal_abi_capability_count(void);
+SHOAL_API uint32_t SHOAL_CALL shoal_abi_capability_word_count(void);
+SHOAL_API shoal_abi_capability_bits SHOAL_CALL
+shoal_abi_capability_word(uint32_t word_index);
+SHOAL_API uint8_t SHOAL_CALL
+shoal_abi_has_capability(shoal_abi_capability_id capability_id);
 
 SHOAL_API void SHOAL_CALL
 shoal_connector_config_init(shoal_connector_config *config);

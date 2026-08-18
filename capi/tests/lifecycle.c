@@ -5,6 +5,39 @@
 #include <stdint.h>
 #include <string.h>
 
+_Static_assert(SHOAL_ABI_VERSION == 1u, "unexpected compatibility ABI version");
+_Static_assert(SHOAL_ABI_VERSION_MAJOR == 1u, "unexpected ABI major");
+_Static_assert(SHOAL_ABI_VERSION_MINOR == 0u, "unexpected ABI minor");
+_Static_assert(SHOAL_ABI_VERSION_PATCH == 0u, "unexpected ABI patch");
+_Static_assert(SHOAL_ABI_VERSION_PACKED == 0x00010000u,
+               "unexpected packed ABI version");
+_Static_assert(SHOAL_ABI_CAPABILITY_CONNECTOR == 0u,
+               "unexpected connector capability id");
+_Static_assert(SHOAL_ABI_CAPABILITY_BOOTSTRAP == 1u,
+               "unexpected bootstrap capability id");
+_Static_assert(SHOAL_ABI_CAPABILITY_ERROR == 2u,
+               "unexpected error capability id");
+_Static_assert(SHOAL_ABI_CAPABILITY_SCANNER == 3u,
+               "unexpected scanner capability id");
+_Static_assert(SHOAL_ABI_CAPABILITY_BATCH_SCANNER == 4u,
+               "unexpected batch scanner capability id");
+_Static_assert(SHOAL_ABI_CAPABILITY_OWNED_SCAN_RESULT == 5u,
+               "unexpected scan result capability id");
+_Static_assert(SHOAL_ABI_CAPABILITY_MUTATION == 6u,
+               "unexpected mutation capability id");
+_Static_assert(SHOAL_ABI_CAPABILITY_BATCH_WRITER == 7u,
+               "unexpected batch writer capability id");
+_Static_assert(SHOAL_ABI_CAPABILITY_STRUCTURED_WRITE_FAILURE == 8u,
+               "unexpected structured write failure capability id");
+_Static_assert(SHOAL_ABI_CAPABILITY_TABLE_ADMIN == 9u,
+               "unexpected table admin capability id");
+_Static_assert(SHOAL_ABI_CAPABILITY_COUNT == 10u,
+               "unexpected capability count");
+_Static_assert(SHOAL_ABI_CAPABILITY_WORD_COUNT == 1u,
+               "unexpected capability word count");
+_Static_assert(SHOAL_ABI_CAPABILITY_WORD0 == UINT64_C(0x3ff),
+               "unexpected capability word 0");
+
 static void expect_error(shoal_status status, shoal_status expected,
                          shoal_error **error, const char *message_part) {
   assert(status == expected);
@@ -30,6 +63,29 @@ int main(void) {
   shoal_error *error = NULL;
 
   assert(shoal_abi_version() == SHOAL_ABI_VERSION);
+  assert(shoal_abi_version_major() == SHOAL_ABI_VERSION_MAJOR);
+  assert(shoal_abi_version_minor() == SHOAL_ABI_VERSION_MINOR);
+  assert(shoal_abi_version_patch() == SHOAL_ABI_VERSION_PATCH);
+  assert(shoal_abi_version_packed() == SHOAL_ABI_VERSION_PACKED);
+  assert(shoal_abi_capability_count() == SHOAL_ABI_CAPABILITY_COUNT);
+  assert(shoal_abi_capability_word_count() == SHOAL_ABI_CAPABILITY_WORD_COUNT);
+  assert(shoal_abi_capability_word(0) == SHOAL_ABI_CAPABILITY_WORD0);
+  assert(shoal_abi_capability_word(1) == 0);
+  assert(shoal_abi_has_capability(SHOAL_ABI_CAPABILITY_CONNECTOR) == 1);
+  assert(shoal_abi_has_capability(SHOAL_ABI_CAPABILITY_BOOTSTRAP) == 1);
+  assert(shoal_abi_has_capability(SHOAL_ABI_CAPABILITY_ERROR) == 1);
+  assert(shoal_abi_has_capability(SHOAL_ABI_CAPABILITY_SCANNER) == 1);
+  assert(shoal_abi_has_capability(SHOAL_ABI_CAPABILITY_BATCH_SCANNER) == 1);
+  assert(shoal_abi_has_capability(SHOAL_ABI_CAPABILITY_OWNED_SCAN_RESULT) ==
+         1);
+  assert(shoal_abi_has_capability(SHOAL_ABI_CAPABILITY_MUTATION) == 1);
+  assert(shoal_abi_has_capability(SHOAL_ABI_CAPABILITY_BATCH_WRITER) == 1);
+  assert(shoal_abi_has_capability(
+             SHOAL_ABI_CAPABILITY_STRUCTURED_WRITE_FAILURE) == 1);
+  assert(shoal_abi_has_capability(SHOAL_ABI_CAPABILITY_TABLE_ADMIN) == 1);
+  assert(shoal_abi_has_capability(SHOAL_ABI_CAPABILITY_COUNT) == 0);
+  assert(shoal_abi_has_capability(63u) == 0);
+  assert(shoal_abi_has_capability(64u) == 0);
   expect_error(shoal_connector_create(NULL, &connector, &error),
                SHOAL_STATUS_INVALID_ARGUMENT, &error, "config");
   assert(connector == NULL);

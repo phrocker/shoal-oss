@@ -16,7 +16,81 @@
 #define SHOAL_API __attribute__((visibility("default")))
 #endif
 
+/*
+ * SHOAL_ABI_VERSION is the stable compatibility-major used by the original
+ * shoal_abi_version() query and existing callers.
+ */
 #define SHOAL_ABI_VERSION 1u
+#define SHOAL_ABI_VERSION_MAJOR 1u
+#define SHOAL_ABI_VERSION_MINOR 0u
+#define SHOAL_ABI_VERSION_PATCH 0u
+#define SHOAL_ABI_PACK_VERSION(major, minor, patch)                           \
+  ((((uint32_t)(major) & 0xffu) << 16) |                                     \
+   (((uint32_t)(minor) & 0xffu) << 8) | ((uint32_t)(patch) & 0xffu))
+#define SHOAL_ABI_VERSION_PACKED                                             \
+  SHOAL_ABI_PACK_VERSION(SHOAL_ABI_VERSION_MAJOR,                            \
+                         SHOAL_ABI_VERSION_MINOR,                            \
+                         SHOAL_ABI_VERSION_PATCH)
+
+typedef uint32_t shoal_abi_capability_id;
+typedef uint64_t shoal_abi_capability_bits;
+
+/*
+ * Capability identifiers are append-only. Existing numeric assignments and the
+ * meaning of each reported bit never change.
+ */
+enum {
+  SHOAL_ABI_CAPABILITY_CONNECTOR = 0,
+  SHOAL_ABI_CAPABILITY_BOOTSTRAP = 1,
+  SHOAL_ABI_CAPABILITY_ERROR = 2,
+  SHOAL_ABI_CAPABILITY_SCANNER = 3,
+  SHOAL_ABI_CAPABILITY_BATCH_SCANNER = 4,
+  SHOAL_ABI_CAPABILITY_OWNED_SCAN_RESULT = 5,
+  SHOAL_ABI_CAPABILITY_MUTATION = 6,
+  SHOAL_ABI_CAPABILITY_BATCH_WRITER = 7,
+  SHOAL_ABI_CAPABILITY_STRUCTURED_WRITE_FAILURE = 8,
+  SHOAL_ABI_CAPABILITY_TABLE_ADMIN = 9
+};
+
+#define SHOAL_ABI_CAPABILITY_COUNT 10u
+#define SHOAL_ABI_CAPABILITY_WORD_BITS 64u
+#define SHOAL_ABI_CAPABILITY_WORD_INDEX(capability_id)                       \
+  ((uint32_t)(capability_id) / SHOAL_ABI_CAPABILITY_WORD_BITS)
+#define SHOAL_ABI_CAPABILITY_BIT_INDEX(capability_id)                        \
+  ((uint32_t)(capability_id) % SHOAL_ABI_CAPABILITY_WORD_BITS)
+#define SHOAL_ABI_CAPABILITY_MASK(capability_id)                             \
+  (((shoal_abi_capability_bits)UINT64_C(1))                                  \
+   << SHOAL_ABI_CAPABILITY_BIT_INDEX(capability_id))
+#define SHOAL_ABI_CAPABILITY_WORD_COUNT 1u
+#define SHOAL_ABI_CAPABILITY_CONNECTOR_MASK                                  \
+  SHOAL_ABI_CAPABILITY_MASK(SHOAL_ABI_CAPABILITY_CONNECTOR)
+#define SHOAL_ABI_CAPABILITY_BOOTSTRAP_MASK                                  \
+  SHOAL_ABI_CAPABILITY_MASK(SHOAL_ABI_CAPABILITY_BOOTSTRAP)
+#define SHOAL_ABI_CAPABILITY_ERROR_MASK                                      \
+  SHOAL_ABI_CAPABILITY_MASK(SHOAL_ABI_CAPABILITY_ERROR)
+#define SHOAL_ABI_CAPABILITY_SCANNER_MASK                                    \
+  SHOAL_ABI_CAPABILITY_MASK(SHOAL_ABI_CAPABILITY_SCANNER)
+#define SHOAL_ABI_CAPABILITY_BATCH_SCANNER_MASK                              \
+  SHOAL_ABI_CAPABILITY_MASK(SHOAL_ABI_CAPABILITY_BATCH_SCANNER)
+#define SHOAL_ABI_CAPABILITY_OWNED_SCAN_RESULT_MASK                          \
+  SHOAL_ABI_CAPABILITY_MASK(SHOAL_ABI_CAPABILITY_OWNED_SCAN_RESULT)
+#define SHOAL_ABI_CAPABILITY_MUTATION_MASK                                   \
+  SHOAL_ABI_CAPABILITY_MASK(SHOAL_ABI_CAPABILITY_MUTATION)
+#define SHOAL_ABI_CAPABILITY_BATCH_WRITER_MASK                               \
+  SHOAL_ABI_CAPABILITY_MASK(SHOAL_ABI_CAPABILITY_BATCH_WRITER)
+#define SHOAL_ABI_CAPABILITY_STRUCTURED_WRITE_FAILURE_MASK                   \
+  SHOAL_ABI_CAPABILITY_MASK(SHOAL_ABI_CAPABILITY_STRUCTURED_WRITE_FAILURE)
+#define SHOAL_ABI_CAPABILITY_TABLE_ADMIN_MASK                                \
+  SHOAL_ABI_CAPABILITY_MASK(SHOAL_ABI_CAPABILITY_TABLE_ADMIN)
+#define SHOAL_ABI_CAPABILITY_WORD0                                           \
+  (SHOAL_ABI_CAPABILITY_CONNECTOR_MASK | SHOAL_ABI_CAPABILITY_BOOTSTRAP_MASK | \
+   SHOAL_ABI_CAPABILITY_ERROR_MASK | SHOAL_ABI_CAPABILITY_SCANNER_MASK |     \
+   SHOAL_ABI_CAPABILITY_BATCH_SCANNER_MASK |                                 \
+   SHOAL_ABI_CAPABILITY_OWNED_SCAN_RESULT_MASK |                             \
+   SHOAL_ABI_CAPABILITY_MUTATION_MASK |                                      \
+   SHOAL_ABI_CAPABILITY_BATCH_WRITER_MASK |                                  \
+   SHOAL_ABI_CAPABILITY_STRUCTURED_WRITE_FAILURE_MASK |                      \
+   SHOAL_ABI_CAPABILITY_TABLE_ADMIN_MASK)
 
 typedef int32_t shoal_status;
 
@@ -114,8 +188,9 @@ typedef struct shoal_range_bound {
  * All pointer fields are borrowed for the duration of
  * shoal_connector_create. The library copies every value it retains.
  *
- * Set struct_size with shoal_connector_config_init. Future ABI versions may
- * append fields; version 1 readers ignore bytes beyond the known structure.
+ * Set struct_size with shoal_connector_config_init or sizeof(*config). Future
+ * ABI versions may append fields; version 1 readers ignore bytes beyond the
+ * known structure.
  */
 typedef struct shoal_connector_config {
   uint32_t struct_size;
@@ -138,6 +213,10 @@ typedef struct shoal_connector_config {
               sizeof(((shoal_connector_config *)0)->dial_timeout_ms)))
 
 /*
+ * Set struct_size with shoal_scanner_config_init or sizeof(*config). Future
+ * ABI versions may append fields; version 1 readers ignore bytes beyond the
+ * known structure.
+ *
  * Exactly one of table_name and table_id must be non-NULL and non-empty.
  * Arrays and all memory they reference are borrowed only during scanner
  * creation. Shoal copies every retained value.
@@ -162,6 +241,10 @@ typedef struct shoal_scanner_config {
               sizeof(((shoal_scanner_config *)0)->use_multi_scan)))
 
 /*
+ * Set struct_size with shoal_range_init or sizeof(*range). Future ABI
+ * versions may append fields; version 1 readers ignore bytes beyond the known
+ * structure.
+ *
  * ROW bounds include/exclude an entire row. KEY bounds use full Accumulo key
  * ordering. A range may not mix ROW and KEY bound kinds, though either side
  * may be UNBOUNDED. Pointer fields are borrowed only during a scan call.
@@ -211,6 +294,11 @@ enum {
   SHOAL_DURABILITY_NONE = 4
 };
 
+/*
+ * Set struct_size with shoal_batch_writer_config_init or sizeof(*config).
+ * Future ABI versions may append fields; version 1 readers ignore bytes
+ * beyond the known structure.
+ */
 typedef struct shoal_batch_writer_config {
   uint32_t struct_size;
   const char *table_name;

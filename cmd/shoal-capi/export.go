@@ -21,6 +21,10 @@ import (
 const defaultBootstrapTimeout = 30 * time.Second
 const connectorFreeTimeout = 5 * time.Second
 
+var abiCapabilityWords = [...]uint64{
+	uint64(C.SHOAL_ABI_CAPABILITY_WORD0),
+}
+
 type connectorConfig struct {
 	bootstrap        int32
 	instanceName     string
@@ -35,9 +39,93 @@ type connectorConfig struct {
 	dialTimeout      time.Duration
 }
 
+func abiVersionCompatibility() uint32 {
+	return uint32(C.SHOAL_ABI_VERSION)
+}
+
+func abiVersionMajor() uint32 {
+	return uint32(C.SHOAL_ABI_VERSION_MAJOR)
+}
+
+func abiVersionMinor() uint32 {
+	return uint32(C.SHOAL_ABI_VERSION_MINOR)
+}
+
+func abiVersionPatch() uint32 {
+	return uint32(C.SHOAL_ABI_VERSION_PATCH)
+}
+
+func abiVersionPacked() uint32 {
+	return uint32(C.SHOAL_ABI_VERSION_PACKED)
+}
+
+func abiCapabilityCount() uint32 {
+	return uint32(C.SHOAL_ABI_CAPABILITY_COUNT)
+}
+
+func abiCapabilityWordCount() uint32 {
+	return uint32(len(abiCapabilityWords))
+}
+
+func abiCapabilityWord(wordIndex uint32) uint64 {
+	if wordIndex >= abiCapabilityWordCount() {
+		return 0
+	}
+	return abiCapabilityWords[wordIndex]
+}
+
+func abiHasCapability(capabilityID uint32) bool {
+	wordIndex := capabilityID / 64
+	bitIndex := capabilityID % 64
+	return abiCapabilityWord(wordIndex)&(uint64(1)<<bitIndex) != 0
+}
+
 //export shoal_abi_version
 func shoal_abi_version() C.uint32_t {
-	return C.uint32_t(C.SHOAL_ABI_VERSION)
+	return C.uint32_t(abiVersionCompatibility())
+}
+
+//export shoal_abi_version_major
+func shoal_abi_version_major() C.uint32_t {
+	return C.uint32_t(abiVersionMajor())
+}
+
+//export shoal_abi_version_minor
+func shoal_abi_version_minor() C.uint32_t {
+	return C.uint32_t(abiVersionMinor())
+}
+
+//export shoal_abi_version_patch
+func shoal_abi_version_patch() C.uint32_t {
+	return C.uint32_t(abiVersionPatch())
+}
+
+//export shoal_abi_version_packed
+func shoal_abi_version_packed() C.uint32_t {
+	return C.uint32_t(abiVersionPacked())
+}
+
+//export shoal_abi_capability_count
+func shoal_abi_capability_count() C.uint32_t {
+	return C.uint32_t(abiCapabilityCount())
+}
+
+//export shoal_abi_capability_word_count
+func shoal_abi_capability_word_count() C.uint32_t {
+	return C.uint32_t(abiCapabilityWordCount())
+}
+
+//export shoal_abi_capability_word
+func shoal_abi_capability_word(wordIndex C.uint32_t) C.uint64_t {
+	return C.uint64_t(abiCapabilityWord(uint32(wordIndex)))
+}
+
+//export shoal_abi_has_capability
+func shoal_abi_has_capability(capabilityID C.uint32_t) C.uint8_t {
+	if abiHasCapability(uint32(capabilityID)) {
+		return 1
+	}
+	return 0
 }
 
 //export shoal_connector_config_init
