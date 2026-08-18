@@ -50,5 +50,56 @@ int main(void) {
   shoal_bridge_scan_result_free(result);
   shoal_bridge_scan_result_free(NULL);
   assert(shoal_bridge_scan_result_alloc(SIZE_MAX) == NULL);
+
+  static const uint8_t prev_row[] = {'a', '\0'};
+  static const uint8_t end_row[] = {'z'};
+  shoal_write_failure *failure = shoal_bridge_write_failure_alloc(
+      SHOAL_WRITE_FAILURE_AMBIGUOUS_COMMIT |
+          SHOAL_WRITE_FAILURE_RETRY_EXHAUSTED,
+      1, 1, 1, 1);
+  assert(failure != NULL);
+  assert(shoal_bridge_write_failure_set_failed_extent(
+      failure, 0, "server:9997", "5", prev_row, sizeof(prev_row), 1, end_row,
+      sizeof(end_row), 1, 3, 2));
+  assert(shoal_bridge_write_failure_set_constraint(
+      failure, 0, "server:9997", "Constraint", 7, "bad mutation", 4));
+  assert(shoal_bridge_write_failure_set_authorization(
+      failure, 0, "server:9997", "5", NULL, 0, 0, end_row, sizeof(end_row), 1,
+      "PERMISSION_DENIED"));
+  assert(shoal_bridge_write_failure_set_cleanup(
+      failure, 0, "server:9997", "cancel failed"));
+
+  assert(shoal_bridge_write_failure_flags(failure) ==
+         (SHOAL_WRITE_FAILURE_AMBIGUOUS_COMMIT |
+          SHOAL_WRITE_FAILURE_RETRY_EXHAUSTED));
+  assert(shoal_bridge_write_failure_failed_extent_count(failure) == 1);
+  shoal_failed_extent_view failed_extent;
+  assert(shoal_bridge_write_failure_get_failed_extent(failure, 0,
+                                                       &failed_extent));
+  assert(strcmp(failed_extent.server, "server:9997") == 0);
+  assert(strcmp(failed_extent.table_id, "5") == 0);
+  assert(failed_extent.has_prev_row == 1);
+  assert(failed_extent.prev_row.length == sizeof(prev_row));
+  assert(memcmp(failed_extent.prev_row.data, prev_row, sizeof(prev_row)) == 0);
+  assert(failed_extent.submitted == 3 && failed_extent.committed == 2);
+
+  shoal_constraint_violation_view constraint;
+  assert(shoal_bridge_write_failure_get_constraint(failure, 0, &constraint));
+  assert(strcmp(constraint.constraint_class, "Constraint") == 0);
+  assert(constraint.violation_code == 7);
+  assert(constraint.violating_mutation_count == 4);
+
+  shoal_authorization_failure_view authorization;
+  assert(shoal_bridge_write_failure_get_authorization(failure, 0,
+                                                       &authorization));
+  assert(authorization.has_prev_row == 0);
+  assert(authorization.prev_row.data == NULL);
+  assert(strcmp(authorization.code, "PERMISSION_DENIED") == 0);
+
+  shoal_cleanup_failure_view cleanup;
+  assert(shoal_bridge_write_failure_get_cleanup(failure, 0, &cleanup));
+  assert(strcmp(cleanup.message, "cancel failed") == 0);
+  assert(!shoal_bridge_write_failure_get_cleanup(failure, 1, &cleanup));
+  shoal_bridge_write_failure_free(failure);
   return 0;
 }

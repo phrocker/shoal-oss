@@ -32,7 +32,18 @@ func TestSharedLibraryCABI(t *testing.T) {
 		libraryName = "libshoal.dylib"
 	}
 	library := filepath.Join(artifacts, libraryName)
-	runCommand(t, root, nil, "go", "build", "-buildmode=c-shared", "-o", library, "./cmd/shoal-capi")
+	runCommand(
+		t,
+		root,
+		nil,
+		"go",
+		"build",
+		"-tags=shoal_capi_test",
+		"-buildmode=c-shared",
+		"-o",
+		library,
+		"./cmd/shoal-capi",
+	)
 
 	include := filepath.Join(root, "capi", "include")
 	cppObject := filepath.Join(artifacts, "header_cpp_test.o")
@@ -50,6 +61,7 @@ func TestSharedLibraryCABI(t *testing.T) {
 		append([]string{}, cc.args...),
 		"-std=c11", "-Wall", "-Wextra", "-Werror",
 		"-I", include,
+		"-I", filepath.Join(root, "capi", "tests"),
 		filepath.Join(root, "capi", "tests", "lifecycle.c"),
 		library,
 		"-o", executable,

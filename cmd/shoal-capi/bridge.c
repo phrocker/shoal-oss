@@ -62,6 +62,45 @@ void shoal_bridge_batch_scanner_free(shoal_batch_scanner *scanner) {
   }
 }
 
+shoal_mutation *shoal_bridge_mutation_alloc(uint64_t id) {
+  shoal_mutation *mutation = (shoal_mutation *)malloc(sizeof(*mutation));
+  if (mutation != NULL) {
+    mutation->id = id;
+  }
+  return mutation;
+}
+
+uint64_t shoal_bridge_mutation_id(const shoal_mutation *mutation) {
+  return mutation == NULL ? 0 : mutation->id;
+}
+
+void shoal_bridge_mutation_free(shoal_mutation *mutation) {
+  if (mutation != NULL) {
+    mutation->id = 0;
+    free(mutation);
+  }
+}
+
+shoal_batch_writer *shoal_bridge_batch_writer_alloc(uint64_t id) {
+  shoal_batch_writer *writer =
+      (shoal_batch_writer *)malloc(sizeof(*writer));
+  if (writer != NULL) {
+    writer->id = id;
+  }
+  return writer;
+}
+
+uint64_t shoal_bridge_batch_writer_id(const shoal_batch_writer *writer) {
+  return writer == NULL ? 0 : writer->id;
+}
+
+void shoal_bridge_batch_writer_free(shoal_batch_writer *writer) {
+  if (writer != NULL) {
+    writer->id = 0;
+    free(writer);
+  }
+}
+
 static uint8_t *shoal_bridge_copy_bytes(const uint8_t *value, size_t length) {
   if (length == 0) {
     return NULL;
@@ -72,6 +111,21 @@ static uint8_t *shoal_bridge_copy_bytes(const uint8_t *value, size_t length) {
   uint8_t *copy = (uint8_t *)malloc(length);
   if (copy != NULL) {
     memcpy(copy, value, length);
+  }
+  return copy;
+}
+
+static char *shoal_bridge_copy_string(const char *value) {
+  if (value == NULL) {
+    return NULL;
+  }
+  size_t length = strlen(value);
+  if (length == SIZE_MAX) {
+    return NULL;
+  }
+  char *copy = (char *)malloc(length + 1);
+  if (copy != NULL) {
+    memcpy(copy, value, length + 1);
   }
   return copy;
 }
@@ -193,6 +247,353 @@ void shoal_bridge_scan_result_free(shoal_scan_result *result) {
   free(result);
 }
 
+static void shoal_bridge_extent_clear(shoal_bridge_extent *extent) {
+  if (extent == NULL) {
+    return;
+  }
+  free(extent->server);
+  free(extent->table_id);
+  free(extent->prev_row);
+  free(extent->end_row);
+  memset(extent, 0, sizeof(*extent));
+}
+
+static int shoal_bridge_extent_set(
+    shoal_bridge_extent *extent, const char *server, const char *table_id,
+    const uint8_t *prev_row, size_t prev_row_length, uint8_t has_prev_row,
+    const uint8_t *end_row, size_t end_row_length, uint8_t has_end_row) {
+  if (extent == NULL || server == NULL || table_id == NULL ||
+      has_prev_row > 1 || has_end_row > 1 ||
+      (!has_prev_row && (prev_row != NULL || prev_row_length != 0)) ||
+      (!has_end_row && (end_row != NULL || end_row_length != 0)) ||
+      (has_prev_row && prev_row == NULL && prev_row_length != 0) ||
+      (has_end_row && end_row == NULL && end_row_length != 0)) {
+    return 0;
+  }
+  shoal_bridge_extent next;
+  memset(&next, 0, sizeof(next));
+  next.server = shoal_bridge_copy_string(server);
+  next.table_id = shoal_bridge_copy_string(table_id);
+  if (has_prev_row) {
+    next.prev_row = shoal_bridge_copy_bytes(prev_row, prev_row_length);
+  }
+  if (has_end_row) {
+    next.end_row = shoal_bridge_copy_bytes(end_row, end_row_length);
+  }
+  if (next.server == NULL || next.table_id == NULL ||
+      (has_prev_row && prev_row_length != 0 && next.prev_row == NULL) ||
+      (has_end_row && end_row_length != 0 && next.end_row == NULL)) {
+    shoal_bridge_extent_clear(&next);
+    return 0;
+  }
+  next.prev_row_length = prev_row_length;
+  next.end_row_length = end_row_length;
+  next.has_prev_row = has_prev_row;
+  next.has_end_row = has_end_row;
+  shoal_bridge_extent_clear(extent);
+  *extent = next;
+  return 1;
+}
+
+static void shoal_bridge_failed_extent_clear(
+    shoal_bridge_failed_extent *extent) {
+  if (extent == NULL) {
+    return;
+  }
+  shoal_bridge_extent_clear(&extent->extent);
+  extent->submitted = 0;
+  extent->committed = 0;
+}
+
+static void shoal_bridge_constraint_clear(
+    shoal_bridge_constraint_violation *violation) {
+  if (violation == NULL) {
+    return;
+  }
+  free(violation->server);
+  free(violation->constraint_class);
+  free(violation->description);
+  memset(violation, 0, sizeof(*violation));
+}
+
+static void shoal_bridge_authorization_clear(
+    shoal_bridge_authorization_failure *failure) {
+  if (failure == NULL) {
+    return;
+  }
+  shoal_bridge_extent_clear(&failure->extent);
+  free(failure->code);
+  failure->code = NULL;
+}
+
+static void shoal_bridge_cleanup_clear(
+    shoal_bridge_cleanup_failure *failure) {
+  if (failure == NULL) {
+    return;
+  }
+  free(failure->server);
+  free(failure->message);
+  memset(failure, 0, sizeof(*failure));
+}
+
+static void *shoal_bridge_calloc_array(size_t count, size_t element_size) {
+  if (count == 0) {
+    return NULL;
+  }
+  if (element_size != 0 && count > SIZE_MAX / element_size) {
+    return NULL;
+  }
+  return calloc(count, element_size);
+}
+
+shoal_write_failure *shoal_bridge_write_failure_alloc(
+    shoal_write_failure_flags flags, size_t failed_extent_count,
+    size_t constraint_count, size_t authorization_count, size_t cleanup_count) {
+  shoal_write_failure *failure =
+      (shoal_write_failure *)calloc(1, sizeof(*failure));
+  if (failure == NULL) {
+    return NULL;
+  }
+  failure->failed_extents = (shoal_bridge_failed_extent *)
+      shoal_bridge_calloc_array(failed_extent_count,
+                                sizeof(*failure->failed_extents));
+  failure->constraints = (shoal_bridge_constraint_violation *)
+      shoal_bridge_calloc_array(constraint_count, sizeof(*failure->constraints));
+  failure->authorizations = (shoal_bridge_authorization_failure *)
+      shoal_bridge_calloc_array(authorization_count,
+                                sizeof(*failure->authorizations));
+  failure->cleanups = (shoal_bridge_cleanup_failure *)
+      shoal_bridge_calloc_array(cleanup_count, sizeof(*failure->cleanups));
+  if ((failed_extent_count != 0 && failure->failed_extents == NULL) ||
+      (constraint_count != 0 && failure->constraints == NULL) ||
+      (authorization_count != 0 && failure->authorizations == NULL) ||
+      (cleanup_count != 0 && failure->cleanups == NULL)) {
+    shoal_bridge_write_failure_free(failure);
+    return NULL;
+  }
+  failure->flags = flags;
+  failure->failed_extent_count = failed_extent_count;
+  failure->constraint_count = constraint_count;
+  failure->authorization_count = authorization_count;
+  failure->cleanup_count = cleanup_count;
+  return failure;
+}
+
+int shoal_bridge_write_failure_set_failed_extent(
+    shoal_write_failure *failure, size_t index, const char *server,
+    const char *table_id, const uint8_t *prev_row, size_t prev_row_length,
+    uint8_t has_prev_row, const uint8_t *end_row, size_t end_row_length,
+    uint8_t has_end_row, size_t submitted, int64_t committed) {
+  if (failure == NULL || index >= failure->failed_extent_count) {
+    return 0;
+  }
+  shoal_bridge_failed_extent *entry = &failure->failed_extents[index];
+  if (!shoal_bridge_extent_set(&entry->extent, server, table_id, prev_row,
+                               prev_row_length, has_prev_row, end_row,
+                               end_row_length, has_end_row)) {
+    return 0;
+  }
+  entry->submitted = submitted;
+  entry->committed = committed;
+  return 1;
+}
+
+int shoal_bridge_write_failure_set_constraint(
+    shoal_write_failure *failure, size_t index, const char *server,
+    const char *constraint_class, int16_t violation_code,
+    const char *description, int64_t violating_mutation_count) {
+  if (failure == NULL || index >= failure->constraint_count ||
+      server == NULL || constraint_class == NULL || description == NULL) {
+    return 0;
+  }
+  shoal_bridge_constraint_violation next;
+  memset(&next, 0, sizeof(next));
+  next.server = shoal_bridge_copy_string(server);
+  next.constraint_class = shoal_bridge_copy_string(constraint_class);
+  next.description = shoal_bridge_copy_string(description);
+  if (next.server == NULL || next.constraint_class == NULL ||
+      next.description == NULL) {
+    shoal_bridge_constraint_clear(&next);
+    return 0;
+  }
+  next.violation_code = violation_code;
+  next.violating_mutation_count = violating_mutation_count;
+  shoal_bridge_constraint_clear(&failure->constraints[index]);
+  failure->constraints[index] = next;
+  return 1;
+}
+
+int shoal_bridge_write_failure_set_authorization(
+    shoal_write_failure *failure, size_t index, const char *server,
+    const char *table_id, const uint8_t *prev_row, size_t prev_row_length,
+    uint8_t has_prev_row, const uint8_t *end_row, size_t end_row_length,
+    uint8_t has_end_row, const char *code) {
+  if (failure == NULL || index >= failure->authorization_count ||
+      code == NULL) {
+    return 0;
+  }
+  shoal_bridge_authorization_failure next;
+  memset(&next, 0, sizeof(next));
+  if (!shoal_bridge_extent_set(&next.extent, server, table_id, prev_row,
+                               prev_row_length, has_prev_row, end_row,
+                               end_row_length, has_end_row)) {
+    return 0;
+  }
+  next.code = shoal_bridge_copy_string(code);
+  if (next.code == NULL) {
+    shoal_bridge_authorization_clear(&next);
+    return 0;
+  }
+  shoal_bridge_authorization_clear(&failure->authorizations[index]);
+  failure->authorizations[index] = next;
+  return 1;
+}
+
+int shoal_bridge_write_failure_set_cleanup(shoal_write_failure *failure,
+                                           size_t index, const char *server,
+                                           const char *message) {
+  if (failure == NULL || index >= failure->cleanup_count || server == NULL ||
+      message == NULL) {
+    return 0;
+  }
+  shoal_bridge_cleanup_failure next;
+  memset(&next, 0, sizeof(next));
+  next.server = shoal_bridge_copy_string(server);
+  next.message = shoal_bridge_copy_string(message);
+  if (next.server == NULL || next.message == NULL) {
+    shoal_bridge_cleanup_clear(&next);
+    return 0;
+  }
+  shoal_bridge_cleanup_clear(&failure->cleanups[index]);
+  failure->cleanups[index] = next;
+  return 1;
+}
+
+shoal_write_failure_flags shoal_bridge_write_failure_flags(
+    const shoal_write_failure *failure) {
+  return failure == NULL ? 0 : failure->flags;
+}
+
+size_t shoal_bridge_write_failure_failed_extent_count(
+    const shoal_write_failure *failure) {
+  return failure == NULL ? 0 : failure->failed_extent_count;
+}
+
+int shoal_bridge_write_failure_get_failed_extent(
+    const shoal_write_failure *failure, size_t index,
+    shoal_failed_extent_view *out_extent) {
+  if (failure == NULL || index >= failure->failed_extent_count ||
+      out_extent == NULL) {
+    return 0;
+  }
+  const shoal_bridge_failed_extent *entry = &failure->failed_extents[index];
+  memset(out_extent, 0, sizeof(*out_extent));
+  out_extent->server = entry->extent.server;
+  out_extent->table_id = entry->extent.table_id;
+  out_extent->prev_row.data = entry->extent.prev_row;
+  out_extent->prev_row.length = entry->extent.prev_row_length;
+  out_extent->end_row.data = entry->extent.end_row;
+  out_extent->end_row.length = entry->extent.end_row_length;
+  out_extent->has_prev_row = entry->extent.has_prev_row;
+  out_extent->has_end_row = entry->extent.has_end_row;
+  out_extent->submitted = entry->submitted;
+  out_extent->committed = entry->committed;
+  return 1;
+}
+
+size_t shoal_bridge_write_failure_constraint_count(
+    const shoal_write_failure *failure) {
+  return failure == NULL ? 0 : failure->constraint_count;
+}
+
+int shoal_bridge_write_failure_get_constraint(
+    const shoal_write_failure *failure, size_t index,
+    shoal_constraint_violation_view *out_violation) {
+  if (failure == NULL || index >= failure->constraint_count ||
+      out_violation == NULL) {
+    return 0;
+  }
+  const shoal_bridge_constraint_violation *entry =
+      &failure->constraints[index];
+  memset(out_violation, 0, sizeof(*out_violation));
+  out_violation->server = entry->server;
+  out_violation->constraint_class = entry->constraint_class;
+  out_violation->violation_code = entry->violation_code;
+  out_violation->description = entry->description;
+  out_violation->violating_mutation_count = entry->violating_mutation_count;
+  return 1;
+}
+
+size_t shoal_bridge_write_failure_authorization_count(
+    const shoal_write_failure *failure) {
+  return failure == NULL ? 0 : failure->authorization_count;
+}
+
+int shoal_bridge_write_failure_get_authorization(
+    const shoal_write_failure *failure, size_t index,
+    shoal_authorization_failure_view *out_failure) {
+  if (failure == NULL || index >= failure->authorization_count ||
+      out_failure == NULL) {
+    return 0;
+  }
+  const shoal_bridge_authorization_failure *entry =
+      &failure->authorizations[index];
+  memset(out_failure, 0, sizeof(*out_failure));
+  out_failure->server = entry->extent.server;
+  out_failure->table_id = entry->extent.table_id;
+  out_failure->prev_row.data = entry->extent.prev_row;
+  out_failure->prev_row.length = entry->extent.prev_row_length;
+  out_failure->end_row.data = entry->extent.end_row;
+  out_failure->end_row.length = entry->extent.end_row_length;
+  out_failure->has_prev_row = entry->extent.has_prev_row;
+  out_failure->has_end_row = entry->extent.has_end_row;
+  out_failure->code = entry->code;
+  return 1;
+}
+
+size_t shoal_bridge_write_failure_cleanup_count(
+    const shoal_write_failure *failure) {
+  return failure == NULL ? 0 : failure->cleanup_count;
+}
+
+int shoal_bridge_write_failure_get_cleanup(
+    const shoal_write_failure *failure, size_t index,
+    shoal_cleanup_failure_view *out_failure) {
+  if (failure == NULL || index >= failure->cleanup_count ||
+      out_failure == NULL) {
+    return 0;
+  }
+  const shoal_bridge_cleanup_failure *entry = &failure->cleanups[index];
+  memset(out_failure, 0, sizeof(*out_failure));
+  out_failure->server = entry->server;
+  out_failure->message = entry->message;
+  return 1;
+}
+
+void shoal_bridge_write_failure_free(shoal_write_failure *failure) {
+  if (failure == NULL) {
+    return;
+  }
+  for (size_t index = 0; index < failure->failed_extent_count; index++) {
+    shoal_bridge_failed_extent_clear(&failure->failed_extents[index]);
+  }
+  for (size_t index = 0; index < failure->constraint_count; index++) {
+    shoal_bridge_constraint_clear(&failure->constraints[index]);
+  }
+  for (size_t index = 0; index < failure->authorization_count; index++) {
+    shoal_bridge_authorization_clear(&failure->authorizations[index]);
+  }
+  for (size_t index = 0; index < failure->cleanup_count; index++) {
+    shoal_bridge_cleanup_clear(&failure->cleanups[index]);
+  }
+  free(failure->failed_extents);
+  free(failure->constraints);
+  free(failure->authorizations);
+  free(failure->cleanups);
+  memset(failure, 0, sizeof(*failure));
+  free(failure);
+}
+
 shoal_error *shoal_bridge_error_alloc(shoal_status code, const char *message,
                                       size_t message_length) {
   if (message_length == SIZE_MAX) {
@@ -263,4 +664,15 @@ void shoal_bridge_range_init(shoal_range *range) {
 
 uint32_t shoal_bridge_range_v1_size(void) {
   return SHOAL_RANGE_V1_SIZE;
+}
+
+void shoal_bridge_batch_writer_config_init(shoal_batch_writer_config *config) {
+  if (config != NULL) {
+    memset(config, 0, sizeof(*config));
+    config->struct_size = (uint32_t)sizeof(*config);
+  }
+}
+
+uint32_t shoal_bridge_batch_writer_config_v1_size(void) {
+  return SHOAL_BATCH_WRITER_CONFIG_V1_SIZE;
 }

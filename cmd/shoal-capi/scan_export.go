@@ -735,12 +735,20 @@ func statusForError(err error) C.shoal_status {
 	switch {
 	case err == nil:
 		return C.SHOAL_STATUS_OK
+	case errors.Is(err, accumulo.ErrBatchWriterFailed):
+		return C.SHOAL_STATUS_AMBIGUOUS_WRITE
 	case errors.Is(err, context.DeadlineExceeded):
 		return C.SHOAL_STATUS_DEADLINE_EXCEEDED
 	case errors.Is(err, context.Canceled):
 		return C.SHOAL_STATUS_CANCELLED
 	case errors.Is(err, accumulo.ErrConnectorClosed):
 		return C.SHOAL_STATUS_CLOSED
+	case errors.Is(err, accumulo.ErrBatchWriterClosed):
+		return C.SHOAL_STATUS_CLOSED
+	case errors.Is(err, accumulo.ErrBatchWriterRetryExhausted):
+		return C.SHOAL_STATUS_RETRY_EXHAUSTED
+	case hasMutationRejection(err):
+		return C.SHOAL_STATUS_MUTATION_REJECTED
 	case errors.Is(err, accumulo.ErrTableNotFound):
 		return C.SHOAL_STATUS_NOT_FOUND
 	case errors.Is(err, accumulo.ErrPermissionDenied):
@@ -757,6 +765,11 @@ func statusForError(err error) C.shoal_status {
 	default:
 		return C.SHOAL_STATUS_OPERATION_FAILED
 	}
+}
+
+func hasMutationRejection(err error) bool {
+	var rejection *accumulo.MutationRejectionError
+	return errors.As(err, &rejection)
 }
 
 func onlyCleanupErrors(err error) bool {
