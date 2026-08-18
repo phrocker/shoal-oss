@@ -372,23 +372,55 @@ func TestFileSerializesConcurrentReadAt(t *testing.T) {
 	}
 }
 
-func TestNewContextPassesContextToNamenodeDial(t *testing.T) {
+func TestNewContextRejectsCanceledContextBeforeDial(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	sawCanceled := false
+	dialed := false
 	_, err := NewContext(ctx, "nn:8020", WithClientOptions(hdfsclient.ClientOptions{
 		User: "shoal-test",
 		NamenodeDialFunc: func(dialCtx context.Context, network, addr string) (net.Conn, error) {
-			sawCanceled = errors.Is(dialCtx.Err(), context.Canceled)
+			dialed = true
 			return nil, dialCtx.Err()
 		},
 	}))
-	if err == nil {
-		t.Fatal("NewContext succeeded, want dial failure")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("NewContext error = %v, want context.Canceled", err)
 	}
-	if !sawCanceled {
-		t.Fatal("NewContext did not pass the canceled context into the namenode dialer")
+	if dialed {
+		t.Fatal("NewContext dialed after construction context was canceled")
+	}
+}
+
+func TestNewContextKeepsCleanupClientAliveUntilBackendClose(t *testing.T) {
+	constructorCtx, cancel := context.WithCancel(context.Background())
+	var cleanupCtx context.Context
+	client := newFakeClient()
+	backend, err := NewContext(constructorCtx, "nn:8020", func(c *config) {
+		c.clientLeaseFactory = func(ctx context.Context) (*leasedClient, error) {
+			if cleanupCtx == nil {
+				cleanupCtx = ctx
+			}
+			return newSharedLease(client), nil
+		}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cancel()
+	select {
+	case <-cleanupCtx.Done():
+		t.Fatal("cleanup client context ended with constructor context")
+	default:
+	}
+	if err := backend.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-cleanupCtx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("Backend.Close did not cancel cleanup client context")
 	}
 }
 
@@ -851,6 +883,60 @@ func TestBackendAbortUsesBoundedRemoveContext(t *testing.T) {
 	remaining := time.Until(client.lastRemoveDeadline)
 	if remaining <= 0 || remaining > cleanupTimeout {
 		t.Fatalf("remove deadline remaining = %v, want within %v", remaining, cleanupTimeout)
+	}
+}
+
+func TestBackendCloseIgnoresOperationClientReleaseFailureAfterCommit(t *testing.T) {
+	cleanupClient := newFakeClient()
+	operationClient := newFakeClient()
+	releaseErr := errors.New("injected operation client release failure")
+	backend, err := NewContext(context.Background(), "nn:8020",
+		WithClient(cleanupClient),
+		func(c *config) {
+			c.clientLeaseFactory = func(context.Context) (*leasedClient, error) {
+				return &leasedClient{client: operationClient, release: func() error { return releaseErr }}, nil
+			}
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w, err := backend.Create(context.Background(), "/tables/1.rf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write([]byte("new")); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close returned operation-client release error after commit: %v", err)
+	}
+	if got := string(operationClient.files["/tables/1.rf"]); got != "new" {
+		t.Fatalf("committed contents = %q, want new", got)
+	}
+}
+
+func TestBackendAbortIgnoresOperationClientReleaseFailureAfterCleanup(t *testing.T) {
+	cleanupClient := newFakeClient()
+	operationClient := newFakeClient()
+	releaseErr := errors.New("injected operation client release failure")
+	backend, err := NewContext(context.Background(), "nn:8020",
+		WithClient(cleanupClient),
+		func(c *config) {
+			c.clientLeaseFactory = func(context.Context) (*leasedClient, error) {
+				return &leasedClient{client: operationClient, release: func() error { return releaseErr }}, nil
+			}
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w, err := backend.Create(context.Background(), "/tables/1.rf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.(storage.Aborter).Abort(); err != nil {
+		t.Fatalf("Abort returned operation-client release error after cleanup: %v", err)
 	}
 }
 

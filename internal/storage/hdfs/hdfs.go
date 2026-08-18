@@ -80,11 +80,10 @@ func New(address string, opts ...Option) (*Backend, error) {
 	return NewContext(context.Background(), address, opts...)
 }
 
-// NewContext constructs a Backend like New. ctx scopes the backend's
-// long-lived cleanup/lease client, while the contexts later passed to
-// Open/Create/List/Remove are rebound into short-lived operation clients so
-// their namenode and datanode dials, handshakes, and blocked RPCs can be
-// interrupted by cancellation or deadlines.
+// NewContext constructs a Backend like New. The contexts later passed to
+// Open/Create/List/Remove are bound to short-lived operation clients so their
+// namenode and datanode dials, handshakes, and blocked RPCs can be interrupted.
+// The cleanup client remains usable until Backend.Close, even after ctx ends.
 func NewContext(ctx context.Context, address string, opts ...Option) (*Backend, error) {
 	authority, clientAddress, err := parseAddress(address)
 	if err != nil {
@@ -92,13 +91,18 @@ func NewContext(ctx context.Context, address string, opts ...Option) (*Backend, 
 	}
 
 	backgroundCtx := contextOrBackground(ctx)
+	if err := backgroundCtx.Err(); err != nil {
+		return nil, err
+	}
+	cleanupCtx, cleanupCancel := context.WithCancel(context.WithoutCancel(backgroundCtx))
 	cfg := &config{}
 	for _, opt := range opts {
 		opt(cfg)
 	}
 	if cfg.clientLeaseFactory != nil && cfg.client == nil {
-		lease, leaseErr := cfg.clientLeaseFactory(backgroundCtx)
+		lease, leaseErr := cfg.clientLeaseFactory(cleanupCtx)
 		if leaseErr != nil {
+			cleanupCancel()
 			return nil, leaseErr
 		}
 		cfg.client = lease.client
@@ -110,10 +114,11 @@ func NewContext(ctx context.Context, address string, opts ...Option) (*Backend, 
 			client:       cfg.client,
 			newOperation: cfg.clientLeaseFactory,
 			authority:    authority,
-			closeClient:  closeFn,
+			closeClient:  cancelThenClose(cleanupCancel, closeFn),
 		}, nil
 	}
 	if cfg.client != nil {
+		cleanupCancel()
 		opFactory := cfg.clientLeaseFactory
 		if opFactory == nil {
 			opFactory = func(context.Context) (*leasedClient, error) {
@@ -130,10 +135,12 @@ func NewContext(ctx context.Context, address string, opts ...Option) (*Backend, 
 
 	options, err := loadClientOptions(clientAddress, cfg)
 	if err != nil {
+		cleanupCancel()
 		return nil, err
 	}
-	baseClient, err := newHDFSClient(backgroundCtx, clientAddress, options)
+	baseClient, err := newHDFSClient(cleanupCtx, clientAddress, options)
 	if err != nil {
+		cleanupCancel()
 		return nil, err
 	}
 	return &Backend{
@@ -142,7 +149,7 @@ func NewContext(ctx context.Context, address string, opts ...Option) (*Backend, 
 			return newHDFSClient(opCtx, clientAddress, options)
 		},
 		authority:   authority,
-		closeClient: baseClient.release,
+		closeClient: cancelThenClose(cleanupCancel, baseClient.release),
 	}, nil
 }
 
@@ -510,12 +517,8 @@ func (w *replaceWriter) Write(p []byte) (int, error) {
 	return w.writer.Write(p)
 }
 
-func (w *replaceWriter) Close() (retErr error) {
-	defer func() {
-		if releaseErr := w.releaseOperationClient(); releaseErr != nil {
-			retErr = errors.Join(retErr, fmt.Errorf("hdfs: close operation client: %w", releaseErr))
-		}
-	}()
+func (w *replaceWriter) Close() error {
+	defer w.releaseOperationClient()
 	if w.aborted {
 		return errors.New("hdfs: writer already aborted")
 	}
@@ -595,12 +598,8 @@ func (w *replaceWriter) rollbackPublishedReplacement(client Client, backup strin
 	return nil
 }
 
-func (w *replaceWriter) Abort() (retErr error) {
-	defer func() {
-		if releaseErr := w.releaseOperationClient(); releaseErr != nil {
-			retErr = errors.Join(retErr, fmt.Errorf("hdfs: close operation client: %w", releaseErr))
-		}
-	}()
+func (w *replaceWriter) Abort() error {
+	defer w.releaseOperationClient()
 	if w.aborted {
 		return nil
 	}
@@ -728,6 +727,16 @@ func onceCloser(closeFn func() error) func() error {
 	}
 }
 
+func cancelThenClose(cancel context.CancelFunc, closeFn func() error) func() error {
+	return onceCloser(func() error {
+		cancel()
+		if closeFn == nil {
+			return nil
+		}
+		return closeFn()
+	})
+}
+
 func loadClientOptions(clientAddress string, cfg *config) (hdfsclient.ClientOptions, error) {
 	if cfg.clientOptions != nil {
 		options := *cfg.clientOptions
@@ -788,11 +797,11 @@ func bindConnContext(ctx context.Context, conn net.Conn) net.Conn {
 	}
 }
 
-func (w *replaceWriter) releaseOperationClient() error {
+func (w *replaceWriter) releaseOperationClient() {
 	if w.release == nil {
-		return nil
+		return
 	}
-	return w.release()
+	_ = w.release()
 }
 
 func (w *replaceWriter) removeTemp(ctx context.Context) error {
