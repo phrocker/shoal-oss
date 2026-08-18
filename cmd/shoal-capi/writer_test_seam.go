@@ -1,0 +1,108 @@
+//go:build shoal_capi_test
+
+package main
+
+/*
+#cgo CFLAGS: -I${SRCDIR}/../../capi/include -I${SRCDIR}/../../capi/tests
+#include "bridge.h"
+#include "test_seam.h"
+*/
+import "C"
+
+import (
+	"context"
+	"errors"
+	"sync"
+
+	"github.com/phrocker/shoal/accumulo"
+)
+
+type testBatchWriter struct {
+	mode int
+
+	mu       sync.Mutex
+	closeErr error
+}
+
+func (w *testBatchWriter) Add(_ context.Context, mutation *accumulo.Mutation) error {
+	if mutation == nil || mutation.Size() == 0 {
+		return errors.New("accumulo: mutation must contain at least one update")
+	}
+	return nil
+}
+
+func (w *testBatchWriter) Flush(context.Context) error {
+	if w.mode != int(C.SHOAL_TEST_WRITER_STRUCTURED_FAILURE) {
+		return nil
+	}
+	return errors.Join(
+		accumulo.ErrBatchWriterFailed,
+		accumulo.ErrBatchWriterRetryExhausted,
+		accumulo.ErrBatchWriterAutoFlush,
+		&accumulo.MutationRejectionError{
+			Server: "server:9997",
+			FailedExtents: []accumulo.FailedExtent{{
+				Extent: accumulo.TabletExtent{
+					TableID: "5",
+					PrevRow: []byte("a"),
+					EndRow:  []byte("z"),
+				},
+				Submitted: 3,
+				Committed: 2,
+			}},
+			ConstraintViolations: []accumulo.ConstraintViolation{{
+				ConstraintClass:            "Constraint",
+				ViolationCode:              7,
+				Description:                "bad mutation",
+				NumberOfViolatingMutations: 4,
+			}},
+			AuthorizationFailures: []accumulo.AuthorizationFailure{{
+				Extent: accumulo.TabletExtent{TableID: "5"},
+				Code:   "PERMISSION_DENIED",
+			}},
+		},
+		&accumulo.BatchWriterCleanupError{
+			Server: "server:9997",
+			Err:    errors.New("cancel failed"),
+		},
+	)
+}
+
+func (w *testBatchWriter) Close(context.Context) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closeErr != nil {
+		return w.closeErr
+	}
+	if w.mode == int(C.SHOAL_TEST_WRITER_STICKY_DEADLINE) {
+		w.closeErr = context.DeadlineExceeded
+	}
+	return w.closeErr
+}
+
+//export shoal_test_batch_writer_create
+func shoal_test_batch_writer_create(
+	mode C.int,
+	outWriter **C.shoal_batch_writer,
+) C.int {
+	if outWriter == nil {
+		return 0
+	}
+	*outWriter = nil
+	if mode < C.SHOAL_TEST_WRITER_SUCCESS ||
+		mode > C.SHOAL_TEST_WRITER_STICKY_DEADLINE {
+		return 0
+	}
+	owned := newOwnedBatchWriter(&testBatchWriter{mode: int(mode)})
+	id, ok := batchWriters.add(owned)
+	if !ok {
+		return 0
+	}
+	handle := C.shoal_bridge_batch_writer_alloc(C.uint64_t(id))
+	if handle == nil {
+		batchWriters.remove(id)
+		return 0
+	}
+	*outWriter = handle
+	return 1
+}

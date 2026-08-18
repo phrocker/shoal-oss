@@ -1,4 +1,5 @@
 #include "shoal.h"
+#include "test_seam.h"
 
 #include <assert.h>
 #include <stdint.h>
@@ -167,6 +168,62 @@ int main(void) {
                    mutation, family_bytes, qualifier_bytes, visibility_bytes,
                    malformed, &error),
                SHOAL_STATUS_INVALID_ARGUMENT, &error, "value");
+
+  assert(shoal_test_batch_writer_create(SHOAL_TEST_WRITER_SUCCESS, &writer));
+  assert(writer != NULL);
+  shoal_mutation *empty_mutation = NULL;
+  static const uint8_t empty_row[] = {'e'};
+  shoal_bytes empty_row_bytes = {empty_row, sizeof(empty_row)};
+  assert(shoal_mutation_create(empty_row_bytes, &empty_mutation, &error) ==
+         SHOAL_STATUS_OK);
+  expect_error(shoal_batch_writer_add(writer, empty_mutation, 0,
+                                      &write_failure, &error),
+               SHOAL_STATUS_OPERATION_FAILED, &error,
+               "at least one update");
+  assert(write_failure == NULL);
+  shoal_mutation_free(&empty_mutation);
+  assert(shoal_batch_writer_add(writer, mutation, 0, &write_failure, &error) ==
+         SHOAL_STATUS_OK);
+  assert(write_failure == NULL && error == NULL);
+  assert(shoal_batch_writer_flush(writer, 0, &write_failure, &error) ==
+         SHOAL_STATUS_OK);
+  assert(shoal_batch_writer_close(writer, 0, &write_failure, &error) ==
+         SHOAL_STATUS_OK);
+  assert(shoal_batch_writer_close(writer, 0, &write_failure, &error) ==
+         SHOAL_STATUS_OK);
+  shoal_batch_writer_free(&writer);
+  assert(writer == NULL);
+
+  assert(shoal_test_batch_writer_create(
+      SHOAL_TEST_WRITER_STRUCTURED_FAILURE, &writer));
+  expect_error(shoal_batch_writer_flush(writer, 0, &write_failure, &error),
+               SHOAL_STATUS_AMBIGUOUS_WRITE, &error, "batch writer failed");
+  assert(write_failure != NULL);
+  assert(shoal_write_failure_get_flags(write_failure) ==
+         (SHOAL_WRITE_FAILURE_AMBIGUOUS_COMMIT |
+          SHOAL_WRITE_FAILURE_RETRY_EXHAUSTED |
+          SHOAL_WRITE_FAILURE_AUTOMATIC_FLUSH));
+  assert(shoal_write_failure_failed_extent_count(write_failure) == 1);
+  assert(shoal_write_failure_constraint_count(write_failure) == 1);
+  assert(shoal_write_failure_authorization_count(write_failure) == 1);
+  assert(shoal_write_failure_cleanup_count(write_failure) == 1);
+  shoal_failed_extent_view structured_extent;
+  assert(shoal_write_failure_get_failed_extent(
+             write_failure, 0, &structured_extent, &error) == SHOAL_STATUS_OK);
+  assert(strcmp(structured_extent.server, "server:9997") == 0);
+  assert(structured_extent.submitted == 3);
+  assert(structured_extent.committed == 2);
+  shoal_write_failure_free(&write_failure);
+  shoal_batch_writer_free(&writer);
+
+  assert(shoal_test_batch_writer_create(SHOAL_TEST_WRITER_STICKY_DEADLINE,
+                                        &writer));
+  expect_error(shoal_batch_writer_close(writer, 1, &write_failure, &error),
+               SHOAL_STATUS_DEADLINE_EXCEEDED, &error, "deadline exceeded");
+  expect_error(shoal_batch_writer_close(writer, 1000, &write_failure, &error),
+               SHOAL_STATUS_DEADLINE_EXCEEDED, &error, "deadline exceeded");
+  shoal_batch_writer_free(&writer);
+
   shoal_mutation_free(&mutation);
   assert(mutation == NULL);
   shoal_mutation_free(&mutation);

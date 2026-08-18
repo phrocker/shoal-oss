@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"testing"
 
@@ -81,6 +82,14 @@ func TestStatusForWriterErrors(t *testing.T) {
 			errors.Join(
 				accumulo.ErrBatchWriterFailed,
 				&accumulo.MutationRejectionError{Server: "server:9997"},
+			),
+			18,
+		},
+		{
+			"ambiguous deadline",
+			errors.Join(
+				accumulo.ErrBatchWriterFailed,
+				context.DeadlineExceeded,
 			),
 			18,
 		},

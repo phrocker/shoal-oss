@@ -170,7 +170,8 @@ shoal_batch_writer_flush(shoal_batch_writer *writer, int64_t timeout_ms,
 
 /*
  * Close is idempotent, prevents new operations, cancels and joins in-flight
- * calls, then flushes remaining mutations. A timed-out close may be retried.
+ * calls, then flushes remaining mutations. Repeated calls return the first
+ * close result, including a deadline or cancellation failure.
  */
 SHOAL_API shoal_status SHOAL_CALL
 shoal_batch_writer_close(shoal_batch_writer *writer, int64_t timeout_ms,

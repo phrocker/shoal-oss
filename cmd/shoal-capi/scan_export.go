@@ -735,6 +735,8 @@ func statusForError(err error) C.shoal_status {
 	switch {
 	case err == nil:
 		return C.SHOAL_STATUS_OK
+	case errors.Is(err, accumulo.ErrBatchWriterFailed):
+		return C.SHOAL_STATUS_AMBIGUOUS_WRITE
 	case errors.Is(err, context.DeadlineExceeded):
 		return C.SHOAL_STATUS_DEADLINE_EXCEEDED
 	case errors.Is(err, context.Canceled):
@@ -743,8 +745,6 @@ func statusForError(err error) C.shoal_status {
 		return C.SHOAL_STATUS_CLOSED
 	case errors.Is(err, accumulo.ErrBatchWriterClosed):
 		return C.SHOAL_STATUS_CLOSED
-	case errors.Is(err, accumulo.ErrBatchWriterFailed):
-		return C.SHOAL_STATUS_AMBIGUOUS_WRITE
 	case errors.Is(err, accumulo.ErrBatchWriterRetryExhausted):
 		return C.SHOAL_STATUS_RETRY_EXHAUSTED
 	case hasMutationRejection(err):

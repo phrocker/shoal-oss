@@ -165,30 +165,6 @@ func TestOwnedBatchWriterCloseCancelsAndJoinsActiveCalls(t *testing.T) {
 	}
 }
 
-func TestOwnedBatchWriterCloseCanBeRetried(t *testing.T) {
-	var calls int
-	writer := newOwnedBatchWriter(&fakeCAPIWriter{
-		add:   func(context.Context, *accumulo.Mutation) error { return nil },
-		flush: func(context.Context) error { return nil },
-		close: func(context.Context) error {
-			calls++
-			if calls == 1 {
-				return context.DeadlineExceeded
-			}
-			return nil
-		},
-	})
-	if err := writer.close(time.Millisecond); !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("first close error = %v, want deadline exceeded", err)
-	}
-	if err := writer.close(time.Second); err != nil {
-		t.Fatalf("retry close: %v", err)
-	}
-	if calls != 2 {
-		t.Fatalf("close calls = %d, want 2", calls)
-	}
-}
-
 func TestOwnedBatchWriterCloseDeadlineBoundsActiveWait(t *testing.T) {
 	writer := newOwnedBatchWriter(&fakeCAPIWriter{
 		add:   func(context.Context, *accumulo.Mutation) error { return nil },
