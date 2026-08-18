@@ -677,7 +677,7 @@ binding.
 | SB-ERR-001 | `pysharkbite.ClientException` registered as a Python exception with a translator (`pysharkbite.cpp:613-621`) | Error values, no exception type | `shoal_error` + `shoal_error_code` + `shoal_error_message` (`capi/include/shoal.h:224-237`) | `capi/tests/lifecycle.c:9-16`; `TestStatusForWriterErrors` (`cmd/shoal-capi/writer_export_test.go:67`) | Missing C ABI | The shim must define `sharkbite.ClientException` and raise it for every mapped status. Pinned tests catch it by name (`test/python/TestBadOperations.py:63`, `test/python/TestSecurityOperations.py:115`). |
 | SB-ERR-002 | C++ `ClientException.getErrorCode()` with `CLIENT_ERROR_CODES` (0–13, including `TABLE_NOT_FOUND`, `RANGE_NOT_SPECIFIED`, `SCANNER_ALREADY_STARTED`) (`include/data/exceptions/ClientException.h:39,50-51`) | Sentinel errors (`accumulo/errors.go:5-52`) | `shoal_status` enum, 0–18 + 255 (`capi/include/shoal_types.h:23-43`) | `test/vandv/invalidscans.h`; `pysharkbite.cpp:613-619`; `capi/tests/lifecycle.c:30-33,49-52` | Behavior mismatch | `getErrorCode()` is **not** Python-visible in the pinned binding; the numeric mapping matters for the C++/flat-C replacement claim and the port of `test/vandv/invalidscans.h`, not because Python ever saw the method. |
 | SB-ERR-003 | `pysharkbite.TApplicationException` (Thrift) registered (`pysharkbite.cpp:612`) | Thrift types are internal by design (`accumulo/batch_writer.go:116` comment) | Mapped to `shoal_status` | `TestStatusForWriterErrors` (`cmd/shoal-capi/writer_export_test.go:67`) | Intentional divergence (approval required) | Shoal deliberately never leaks generated Thrift types. Any Sharkbite user catching `TApplicationException` will not see it. Requires approval plus a documented replacement (`ClientException` with a transport status). |
-| SB-ERR-004 | Table not found | `ErrTableNotFound` (`accumulo/errors.go:15`) | `SHOAL_STATUS_NOT_FOUND` (9) via `shoal_connector_delete_table` (`capi/include/shoal_types.h:107`; `capi/include/shoal.h:114`) | `TestTableMutationsMapErrorsAndLifecycle` (`accumulo/table_admin_test.go:263`); `TestStatusForTableAdministrationErrors` (`cmd/shoal-capi/table_admin_export_test.go:10`); `capi/tests/lifecycle.c:212-215` | Missing C ABI | The status is now reachable for table-admin ABI calls; the remaining gap is the Python `ClientException` shim from [SB-ERR-001](#sec-18). |
+| SB-ERR-004 | Table not found | `ErrTableNotFound` (`accumulo/errors.go:15`) | `SHOAL_STATUS_NOT_FOUND` (9) via `shoal_connector_delete_table` (`capi/include/shoal_types.h:107`; `capi/include/shoal.h:114`) | `TestTableMutationsMapErrorsAndLifecycle` (`accumulo/table_admin_test.go:263`); `TestStatusForTableAdministrationErrors` (`cmd/shoal-capi/table_admin_export_test.go:10`); `capi/tests/lifecycle.c:212-215` | Covered | The status is now reachable for table-admin ABI calls. The remaining gap is the Python `ClientException` shim from [SB-ERR-001](#sec-18), not the ABI status itself. |
 | SB-ERR-005 | Permission denied / `ThriftSecurityException` (`test/vandv/testSecurityOperations.h`) | `ErrPermissionDenied` (`accumulo/errors.go:32`) | `SHOAL_STATUS_PERMISSION_DENIED` (10) | — | Behavior mismatch | No named Shoal test asserts this mapping end to end; live-cluster conformance required. |
 | SB-ERR-006 | `NotServingException` → transparent relocation (`include/data/exceptions/NotServingException.h:22`) | `isStaleScanError` + retry (`accumulo/scanner.go:350`) | Implicit — no separate ABI surface | `TestScannerRetriesNotServingAssignmentOnce` (`accumulo/scanner_test.go:294`) | Covered | Neither surfaces the exception to the user. |
 | SB-ERR-007 | Validation failures exposed to Python as generic `RuntimeError` (underlying C++ type `IllegalArgumentException`) (`include/data/exceptions/IllegalArgumentException.h:23`; `pysharkbite.cpp:613-619`) | Plain `errors.New`/`fmt.Errorf` validation errors | `SHOAL_STATUS_INVALID_ARGUMENT` (1) | `test/python/TestBadOperations.py:67-79`; `capi/tests/lifecycle.c:77-96,116-142` | Missing C ABI | Sharkbite does **not** bind `IllegalArgumentException` as a Python class; broad `except RuntimeError` blocks are the observable contract. If the shim later raises `ClientException` or `ValueError` instead, record it as a divergence. |
@@ -957,9 +957,9 @@ Sharkbite's `test/19x/st` SMAC project played), driven from CI, with the ported
 
 | Status | Rows |
 | --- | --- |
-| Covered | 50 |
+| Covered | 51 |
 | Missing Go | 133 |
-| Missing C ABI | 53 |
+| Missing C ABI | 52 |
 | Behavior mismatch | 65 |
 | Intentional divergence (approval required) | 4 |
 | Not required (rationale required) | 45 |
@@ -982,14 +982,14 @@ Sharkbite's `test/19x/st` SMAC project played), driven from CI, with the ported
 | [§15](#sec-15) RFile, streams, and helpers | `SB-RFILE` | 34 | 0 | 20 | 4 | 1 | 0 | 9 |
 | [§16](#sec-16) HDFS | `SB-HDFS` | 14 | 0 | 14 | 0 | 0 | 0 | 0 |
 | [§17](#sec-17) Logging | `SB-LOG` | 3 | 0 | 2 | 0 | 1 | 0 | 0 |
-| [§18](#sec-18) Errors | `SB-ERR` | 15 | 1 | 2 | 6 | 2 | 1 | 3 |
+| [§18](#sec-18) Errors | `SB-ERR` | 15 | 2 | 2 | 5 | 2 | 1 | 3 |
 | [§19](#sec-19) C++ and flat C | `SB-CPP` | 14 | 8 | 3 | 0 | 2 | 0 | 1 |
 | [§20](#sec-20) Cross-cutting | `SB-XCUT` | 18 | 10 | 1 | 2 | 5 | 0 | 0 |
-| **Total** | | **350** | **50** | **133** | **53** | **65** | **4** | **45** |
+| **Total** | | **350** | **51** | **133** | **52** | **65** | **4** | **45** |
 
 ### 25.3 Reading the counts
 
-Of 350 rows, **50 are `Covered`** — 14.3 percent. They are concentrated in
+Of 350 rows, **51 are `Covered`** — 14.6 percent. They are concentrated in
 connector lifecycle, the key/value/mutation data model, table administration,
 batch writing, ABI hygiene, and flat-C parity, which is exactly the ground the
 merged ABI work
@@ -1004,9 +1004,9 @@ to become `Covered` unless their scope decision changes.
 
 The 133 `Missing Go` rows are dominated by cluster status (37), RFile and
 streams (20), security (17), and HDFS (14) — surfaces where Shoal has never had
-a client-side public implementation. The 53 `Missing C ABI` rows are led by the
+a client-side public implementation. The 52 `Missing C ABI` rows are led by the
 data model (10), Python-layer packaging (9), writers (8), and scanners/results
-plus errors (6 each), with configuration/credential mapping close behind (5).
+(6), with configuration/credential mapping and errors close behind (5 each).
 
 The 65 `Behavior mismatch` rows are the most dangerous category for a
 compatibility project: the capability exists on both layers, so a naive
