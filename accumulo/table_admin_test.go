@@ -168,6 +168,28 @@ func (m *fakeManagerAdapter) GetTableConfiguration(
 	return configuration, err
 }
 
+func (m *fakeManagerAdapter) GetNamespaceConfiguration(
+	ctx context.Context,
+	address, namespace string,
+) (map[string]string, error) {
+	return m.GetTableConfiguration(ctx, address, namespace)
+}
+
+func (m *fakeManagerAdapter) GetNamespaceProperties(
+	ctx context.Context,
+	address, namespace string,
+) (map[string]string, error) {
+	return m.GetTableConfiguration(ctx, address, namespace)
+}
+
+func (m *fakeManagerAdapter) GetVersionedNamespaceProperties(
+	ctx context.Context,
+	address, namespace string,
+) (managerclient.VersionedProperties, error) {
+	properties, err := m.GetTableConfiguration(ctx, address, namespace)
+	return managerclient.VersionedProperties{Version: 7, Properties: properties}, err
+}
+
 func (m *fakeManagerAdapter) SetTableProperty(
 	_ context.Context,
 	address, tableName, property, value string,
@@ -196,6 +218,20 @@ func (m *fakeManagerAdapter) RemoveTableProperty(
 		property:  property,
 	})
 	return m.err
+}
+
+func (m *fakeManagerAdapter) SetNamespaceProperty(
+	ctx context.Context,
+	address, namespace, property, value string,
+) error {
+	return m.SetTableProperty(ctx, address, namespace, property, value)
+}
+
+func (m *fakeManagerAdapter) RemoveNamespaceProperty(
+	ctx context.Context,
+	address, namespace, property string,
+) error {
+	return m.RemoveTableProperty(ctx, address, namespace, property)
 }
 
 func (m *fakeManagerAdapter) Close() error {

@@ -47,6 +47,7 @@ type Resolver struct {
 
 	loadedNamespaces    map[string]struct{}
 	namespaceGeneration uint64
+	namespaceTables     map[string]map[string]string
 }
 
 // NewResolver creates a table-name resolver backed by locator and the shared
@@ -64,6 +65,7 @@ func NewResolver(locator Locator, namespaces NamespaceResolver) *Resolver {
 		nameToID:         map[string]string{},
 		idToName:         map[string]string{},
 		loadedNamespaces: map[string]struct{}{},
+		namespaceTables:  map[string]map[string]string{},
 	}
 }
 
@@ -197,6 +199,41 @@ func (r *Resolver) List(ctx context.Context) (map[string]string, error) {
 	}
 }
 
+// ListNamespace returns the qualified table names mapped within one namespace.
+// It loads only the requested namespace's mapping.
+func (r *Resolver) ListNamespace(
+	ctx context.Context,
+	namespaceName string,
+) (map[string]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	r.opMu.Lock()
+	defer r.opMu.Unlock()
+	for {
+		r.syncNamespaceGeneration()
+		namespaceID, err := r.namespaces.ResolveID(ctx, namespaceName)
+		if err != nil {
+			return nil, err
+		}
+		generation := r.syncNamespaceGeneration()
+		if err := r.loadNamespace(ctx, namespaceID, namespaceName, generation); err != nil {
+			if errors.Is(err, errNamespaceChanged) {
+				continue
+			}
+			return nil, err
+		}
+
+		r.mu.RLock()
+		tables := cloneMapping(r.namespaceTables[namespaceID])
+		r.mu.RUnlock()
+		if r.namespaces.Generation() != generation {
+			continue
+		}
+		return tables, nil
+	}
+}
+
 // Invalidate clears all cached table mappings.
 func (r *Resolver) Invalidate() {
 	r.opMu.Lock()
@@ -206,6 +243,7 @@ func (r *Resolver) Invalidate() {
 	r.idToName = map[string]string{}
 	r.loadedNamespaces = map[string]struct{}{}
 	r.namespaceGeneration = r.namespaces.Generation()
+	r.namespaceTables = map[string]map[string]string{}
 	r.mu.Unlock()
 }
 
@@ -239,6 +277,7 @@ func (r *Resolver) loadNamespace(
 		r.mu.Unlock()
 		return errNamespaceChanged
 	}
+	namespaceTables := make(map[string]string, len(idToRawName))
 	for id, rawName := range idToRawName {
 		name := rawName
 		if namespaceName != defaultNamespaceName {
@@ -246,7 +285,9 @@ func (r *Resolver) loadNamespace(
 		}
 		r.nameToID[name] = id
 		r.idToName[id] = name
+		namespaceTables[name] = id
 	}
+	r.namespaceTables[namespaceID] = namespaceTables
 	r.loadedNamespaces[namespaceID] = struct{}{}
 	r.mu.Unlock()
 	return nil
@@ -259,6 +300,7 @@ func (r *Resolver) syncNamespaceGeneration() uint64 {
 		r.nameToID = map[string]string{}
 		r.idToName = map[string]string{}
 		r.loadedNamespaces = map[string]struct{}{}
+		r.namespaceTables = map[string]map[string]string{}
 		r.namespaceGeneration = generation
 	}
 	r.mu.Unlock()

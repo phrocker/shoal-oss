@@ -107,6 +107,44 @@ cribs land.
 - `core/src/main/thrift/security.thrift` — `TCredentials`
 - `core/src/main/thrift/client.thrift` — `TInfo`
 
+### Namespace administration (Accumulo revision `317c288568e9c46e7854aafb8bb8c4fda6260b12`)
+- `core/.../clientImpl/NamespaceOperationsImpl.java`
+  - `create`, `delete`, and `rename` submit `NAMESPACE_CREATE`,
+    `NAMESPACE_DELETE`, and `NAMESPACE_RENAME` through the shared table FATE
+    helper with UTF-8 namespace-name arguments and an empty options map
+  - FATE instance selection uses
+    `FateInstanceType.fromNamespaceOrTableName`: names beginning with
+    `accumulo` use META; all others (including the default namespace's empty
+    name) use USER
+  - property mutations call ManagerService `setNamespaceProperty` and
+    `removeNamespaceProperty`
+  - effective, local, and versioned property reads call ClientService
+    `getNamespaceConfiguration`, `getNamespaceProperties`, and
+    `getVersionedNamespaceProperties`
+  - `delete` resolves the namespace ID and checks
+    `context.getTableMapping(namespaceId).getIdToNameMap().isEmpty()` before
+    submitting `NAMESPACE_DELETE`, throwing `NamespaceNotEmptyException` when
+    any table remains
+- `server/manager/.../FateServiceHandler.java`
+  - namespace create/delete take exactly one name argument; rename takes old
+    and new names
+  - server validators enforce new/existing/built-in namespace rules, so Shoal
+    sends default and reserved names unchanged and maps the returned status
+- `server/manager/.../tableOps/namespace/delete/DeleteNamespace.java` and
+  `NamespaceCleanUp.java`
+  - FATE reserves the namespace and cleanup removes its ZooKeeper mapping and
+    permissions, but does not repeat the client-side table-emptiness check;
+    Shoal therefore mirrors the client preflight as a best-effort snapshot
+    while preserving FATE as the mutation and authorization authority
+- `core/src/main/thrift/manager.thrift`
+  - `NAMESPACE_CREATE = 13`, `NAMESPACE_DELETE = 14`,
+    `NAMESPACE_RENAME = 15`
+  - ManagerService namespace property RPC signatures and declared property,
+    security, namespace/table-operation, and not-active exceptions
+- `core/src/main/thrift/client.thrift`
+  - all three namespace property read RPCs take the namespace name; versioned
+    reads return `TVersionedProperties { version, properties }`
+
 ### Wire protocol
 - `core/.../rpc/AccumuloProtocolFactory.java`
   - `:49` `MAGIC_NUMBER = 0x41434355` ("ACCU" — A=41, C=43, C=43, U=55)

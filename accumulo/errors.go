@@ -29,6 +29,18 @@ var (
 	// exist.
 	ErrNamespaceNotFound = errors.New("accumulo: namespace not found")
 
+	// ErrNamespaceExists indicates that a requested namespace name is already
+	// in use.
+	ErrNamespaceExists = errors.New("accumulo: namespace exists")
+
+	// ErrNamespaceNotEmpty indicates that a namespace still owns one or more
+	// tables and cannot be safely deleted.
+	ErrNamespaceNotEmpty = errors.New("accumulo: namespace not empty")
+
+	// ErrInvalidNamespaceName indicates that Accumulo rejected a namespace
+	// name, including attempts to create, delete, or rename reserved namespaces.
+	ErrInvalidNamespaceName = errors.New("accumulo: invalid namespace name")
+
 	// ErrPermissionDenied indicates that the authenticated principal is not
 	// authorized for the requested operation.
 	ErrPermissionDenied = errors.New("accumulo: permission denied")

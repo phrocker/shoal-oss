@@ -37,6 +37,7 @@ type fakeTableNames struct {
 	mu           sync.Mutex
 	byName       map[string]string
 	byID         map[string]string
+	listErr      error
 	invalidates  int
 	onInvalidate func()
 }
@@ -73,9 +74,40 @@ func (f *fakeTableNames) List(ctx context.Context) (map[string]string, error) {
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
 	tables := make(map[string]string, len(f.byName))
 	for name, id := range f.byName {
 		tables[name] = id
+	}
+	return tables, nil
+}
+
+func (f *fakeTableNames) ListNamespace(
+	ctx context.Context,
+	namespace string,
+) (map[string]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
+	tables := make(map[string]string)
+	prefix := namespace + "."
+	for name, id := range f.byName {
+		if namespace == "" {
+			if !strings.ContainsRune(name, '.') {
+				tables[name] = id
+			}
+			continue
+		}
+		if strings.HasPrefix(name, prefix) {
+			tables[name] = id
+		}
 	}
 	return tables, nil
 }

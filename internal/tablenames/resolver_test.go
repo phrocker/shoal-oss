@@ -71,6 +71,21 @@ func TestResolverNamesAndSharedNamespaceCache(t *testing.T) {
 	if err != nil || name != "analytics.events" {
 		t.Fatalf("ResolveName(2) = %q, %v", name, err)
 	}
+	namespaceTables, err := resolver.ListNamespace(context.Background(), "analytics")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(namespaceTables) != 1 || namespaceTables["analytics.events"] != "2" {
+		t.Fatalf("ListNamespace(analytics) = %#v", namespaceTables)
+	}
+	namespaceTables["analytics.events"] = "mutated"
+	namespaceTables, err = resolver.ListNamespace(context.Background(), "analytics")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if namespaceTables["analytics.events"] != "2" {
+		t.Fatalf("ListNamespace returned mutable cache state: %#v", namespaceTables)
+	}
 	tables, err := resolver.List(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -292,6 +307,10 @@ func TestResolverRebuildsAfterSameIDNamespaceRename(t *testing.T) {
 
 	if id, err := resolver.ResolveID(context.Background(), "insights.events"); err != nil || id != "2" {
 		t.Fatalf("renamed ResolveID() = %q, %v", id, err)
+	}
+	if tables, err := resolver.ListNamespace(context.Background(), "insights"); err != nil ||
+		tables["insights.events"] != "2" {
+		t.Fatalf("renamed ListNamespace() = %#v, %v", tables, err)
 	}
 	if _, err := resolver.ResolveID(context.Background(), "analytics.events"); !errors.Is(err, ErrTableNotFound) {
 		t.Fatalf("old qualified name error = %v, want ErrTableNotFound", err)
