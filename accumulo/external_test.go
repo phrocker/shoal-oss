@@ -39,6 +39,7 @@ func TestPublicDiscoveryAPICompiles(t *testing.T) {
 	table := accumulo.Table{Name: "events", ID: "1"}
 	_, _ = connector.Tables(context.Background())
 	_, _ = connector.TableExists(context.Background(), "events")
+	_, _ = connector.ListTableSplits(context.Background(), "events")
 	_, _ = connector.Tablets(context.Background(), table)
 	_, _ = connector.LocateTablet(context.Background(), table, []byte("row"))
 	_ = connector.InvalidateTablet(table, []byte("row"))
