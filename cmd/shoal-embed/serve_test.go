@@ -19,6 +19,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -27,6 +28,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -79,7 +81,9 @@ func startTestServe(t *testing.T) *serveHandle {
 		h.Drain()
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		h.Stop(ctx)
+		if err := h.Stop(ctx); err != nil {
+			t.Errorf("Stop(ctx) = %v, want nil during cleanup", err)
+		}
 		select {
 		case <-serveErrCh:
 		case <-time.After(5 * time.Second):
@@ -111,6 +115,54 @@ func waitForStatus(t *testing.T, url string, wantStatus int) *http.Response {
 	}
 	t.Fatalf("GET %s never returned %d: %v", url, wantStatus, lastErr)
 	return nil
+}
+
+func waitForStatusRPC(t *testing.T, addr string) (*grpc.ClientConn, embedpb.ShoalEmbedClient) {
+	t.Helper()
+	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("grpc.NewClient: %v", err)
+	}
+	client := embedpb.NewShoalEmbedClient(conn)
+	deadline := time.Now().Add(5 * time.Second)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+		_, err := client.Status(ctx, &embedpb.StatusRequest{})
+		cancel()
+		if err == nil {
+			return conn, client
+		}
+		lastErr = err
+		time.Sleep(20 * time.Millisecond)
+	}
+	conn.Close()
+	t.Fatalf("Status RPC to %s never succeeded: %v", addr, lastErr)
+	return nil, nil
+}
+
+type blockingUnaryInterceptor struct {
+	enabled atomic.Bool
+	entered chan struct{}
+	release chan struct{}
+}
+
+func newBlockingUnaryInterceptor() *blockingUnaryInterceptor {
+	return &blockingUnaryInterceptor{
+		entered: make(chan struct{}, 1),
+		release: make(chan struct{}),
+	}
+}
+
+func (b *blockingUnaryInterceptor) intercept(ctx context.Context, req any, _ *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+	if b.enabled.Load() {
+		select {
+		case b.entered <- struct{}{}:
+		default:
+		}
+		<-b.release
+	}
+	return handler(ctx, req)
 }
 
 func TestStartServeReadyHealthAndMetrics(t *testing.T) {
@@ -186,7 +238,9 @@ func TestStartServeWithoutMetricsListener(t *testing.T) {
 	h.Drain()
 	stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer stopCancel()
-	h.Stop(stopCtx)
+	if err := h.Stop(stopCtx); err != nil {
+		t.Fatalf("Stop(ctx) = %v, want nil", err)
+	}
 
 	select {
 	case err := <-serveErrCh:
@@ -221,7 +275,9 @@ func TestServeHandleDrainThenStop(t *testing.T) {
 	// Stop closes the listeners and the engine.
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	h.Stop(ctx)
+	if err := h.Stop(ctx); err != nil {
+		t.Fatalf("Stop(ctx) = %v, want nil", err)
+	}
 
 	select {
 	case err := <-serveErrCh:
@@ -321,7 +377,9 @@ func TestServeHandleStopIsBoundedByDrainTimeout(t *testing.T) {
 	defer stopCancel()
 
 	start := time.Now()
-	h.Stop(stopCtx)
+	if err := h.Stop(stopCtx); err != nil {
+		t.Fatalf("Stop(ctx) = %v, want nil for transport-cancellable streaming RPCs", err)
+	}
 	elapsed := time.Since(start)
 
 	// Without the force-stop fallback this would hang until the client
@@ -494,6 +552,151 @@ func TestRunUntilSignalAppliesQuiesceDelay(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("RunUntilSignal did not return within 5s")
+	}
+}
+
+func TestRunUntilSignalSkipsQuiesceWithoutMetrics(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	h, err := startServe(serveConfig{
+		DataDir:     t.TempDir(),
+		GRPCAddress: "127.0.0.1:0",
+		Logger:      logger,
+	})
+	if err != nil {
+		t.Fatalf("startServe: %v", err)
+	}
+
+	sigCh := make(chan os.Signal, 1)
+	const quiesce = 1500 * time.Millisecond
+	runErrCh := make(chan error, 1)
+	go func() { runErrCh <- h.RunUntilSignal(sigCh, quiesce, 5*time.Second) }()
+
+	conn, client := waitForStatusRPC(t, h.GRPCAddr)
+	defer conn.Close()
+
+	start := time.Now()
+	sigCh <- syscall.SIGTERM
+
+	select {
+	case err := <-runErrCh:
+		if err != nil {
+			t.Fatalf("RunUntilSignal returned %v, want nil", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("RunUntilSignal did not return within 5s")
+	}
+
+	if elapsed := time.Since(start); elapsed >= quiesce/2 {
+		t.Fatalf("RunUntilSignal took %v with the HTTP surface disabled, want it to skip the %v quiesce delay", elapsed, quiesce)
+	}
+
+	rpcCtx, rpcCancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer rpcCancel()
+	if _, err := client.Status(rpcCtx, &embedpb.StatusRequest{}); err == nil {
+		t.Error("Status RPC succeeded after RunUntilSignal returned, want gRPC listener closed")
+	}
+}
+
+func TestServeHandleStopReturnsTimeoutErrorWithStuckUnary(t *testing.T) {
+	blocker := newBlockingUnaryInterceptor()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	h, err := startServe(serveConfig{
+		DataDir:          t.TempDir(),
+		GRPCAddress:      "127.0.0.1:0",
+		Logger:           logger,
+		UnaryInterceptor: blocker.intercept,
+	})
+	if err != nil {
+		t.Fatalf("startServe: %v", err)
+	}
+
+	closeEngineCalled := make(chan struct{}, 1)
+	origCloseEngine := h.closeEngine
+	h.closeEngine = func() error {
+		select {
+		case closeEngineCalled <- struct{}{}:
+		default:
+		}
+		return nil
+	}
+
+	serveErrCh := make(chan error, 1)
+	go func() { serveErrCh <- h.Serve() }()
+
+	conn, client := waitForStatusRPC(t, h.GRPCAddr)
+	defer conn.Close()
+
+	blocker.enabled.Store(true)
+	rpcErrCh := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_, err := client.Status(ctx, &embedpb.StatusRequest{})
+		rpcErrCh <- err
+	}()
+
+	select {
+	case <-blocker.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("blocking unary RPC never entered the interceptor")
+	}
+
+	h.Drain()
+	stopCtx, stopCancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer stopCancel()
+
+	start := time.Now()
+	err = h.Stop(stopCtx)
+	elapsed := time.Since(start)
+
+	if elapsed > 2*time.Second {
+		t.Fatalf("Stop(ctx) took %v with a %v deadline; want bounded return", elapsed, 150*time.Millisecond)
+	}
+
+	var timeoutErr *shutdownTimeoutError
+	if !errors.As(err, &timeoutErr) {
+		t.Fatalf("Stop(ctx) = %v, want shutdownTimeoutError", err)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Stop(ctx) = %v, want it to unwrap context.DeadlineExceeded", err)
+	}
+	if timeoutErr.inFlightUnaryRPCs < 1 {
+		t.Fatalf("shutdownTimeoutError.inFlightUnaryRPCs = %d, want >= 1", timeoutErr.inFlightUnaryRPCs)
+	}
+
+	select {
+	case <-closeEngineCalled:
+		t.Fatal("Stop(ctx) called closeEngine despite a stuck unary RPC still being in flight")
+	default:
+	}
+
+	close(blocker.release)
+
+	select {
+	case err := <-rpcErrCh:
+		if err == nil {
+			t.Fatal("blocked unary RPC unexpectedly succeeded after transport was force-stopped")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("blocked unary RPC did not return after release")
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) && h.inFlight.count() != 0 {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if h.inFlight.count() != 0 {
+		t.Fatalf("in-flight unary count stuck at %d after releasing the blocked RPC", h.inFlight.count())
+	}
+
+	select {
+	case <-serveErrCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Serve did not return within 5s of releasing the blocked unary RPC")
+	}
+
+	if err := origCloseEngine(); err != nil {
+		t.Fatalf("cleanup engine close: %v", err)
 	}
 }
 
@@ -752,7 +955,9 @@ func TestStartServeWithoutMetricsAddressDisablesHTTPSurface(t *testing.T) {
 	h.Drain()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	h.Stop(ctx)
+	if err := h.Stop(ctx); err != nil {
+		t.Fatalf("Stop(ctx) = %v, want nil", err)
+	}
 
 	select {
 	case err := <-serveErrCh:

@@ -19,10 +19,10 @@
 //
 // Subcommands:
 //
-//	shoal-embed serve   — start the gRPC data plane plus an HTTP health/metrics
-//	                      surface (/healthz, /readyz, /stats, /metrics) for
-//	                      external consumers and orchestrators (use --address /
-//	                      --metrics-address for container/k8s)
+//	shoal-embed serve   — start the gRPC data plane, with an opt-in HTTP
+//	                      health/metrics surface (/healthz, /readyz, /stats,
+//	                      /metrics) for external consumers and orchestrators
+//	                      when --metrics-port or --metrics-address is set
 //
 //	shoal-embed write   — write mutations from stdin (JSON lines)
 //	shoal-embed scan    — scan a table and print results as JSON lines or Parquet
@@ -329,10 +329,10 @@ func cmdStatus(args []string) {
 	fmt.Printf("%-24s %8d %8d\n", fmt.Sprintf("(%d tables)", len(stats)), totTablets, totRFiles)
 }
 
-// cmdServe starts the gRPC data-plane server plus the HTTP observability
-// surface (/healthz, /readyz, /stats, /metrics) for the embedded storage
-// engine — this is the binary the production write-tier manifests
-// (deploy/k8s, deploy/helm) run.
+// cmdServe starts the gRPC data-plane server for the embedded storage
+// engine. When explicitly enabled, it also serves the HTTP observability
+// surface (/healthz, /readyz, /stats, /metrics) used by the production
+// write-tier manifests (deploy/k8s, deploy/helm).
 //
 // By default the gRPC server binds loopback (127.0.0.1:<--port>); the HTTP
 // observability server, when enabled (see below), also defaults to
@@ -351,16 +351,16 @@ func cmdStatus(args []string) {
 // and are unaffected.
 //
 // On SIGINT/SIGTERM the server drains before stopping: it flips /readyz to
-// not-ready first, waits --quiesce-delay so a readiness-polling consumer
-// has a chance to observe the change before anything stops accepting work,
-// then gracefully stops the gRPC and HTTP servers (waiting for in-flight
-// RPCs, bounded by --drain-timeout — a stuck-but-cancellable RPC is
-// force-aborted rather than hanging shutdown forever; see serveHandle.Stop
-// for the one case that isn't cancellable) and closes the engine. The
-// process does not exit until this entire sequence finishes. This does not
-// migrate tablet ownership — mixed-fleet tablet reassignment on drain
-// remains owned by the Accumulo manager/coordinator and is out of scope
-// here.
+// not-ready first and, when the HTTP readiness surface is enabled, waits
+// --quiesce-delay so a readiness-polling consumer has a chance to observe
+// the change before anything stops accepting work. It then gracefully
+// stops the gRPC and HTTP servers, bounded by --drain-timeout. If a
+// non-cancellable unary RPC is still running when that deadline expires,
+// shutdown returns an explicit error after force-stopping the transport and
+// intentionally skips engine close rather than closing the engine
+// unsafely out from under the still-running call. This does not migrate
+// tablet ownership — mixed-fleet tablet reassignment on drain remains
+// owned by the Accumulo manager/coordinator and is out of scope here.
 func cmdServe(args []string) {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	dataDir := fs.String("data", defaultDataDir(), "data directory")
@@ -369,7 +369,7 @@ func cmdServe(args []string) {
 	metricsPort := fs.Int("metrics-port", 9877, "enable and bind the observability HTTP listen port for /healthz, /readyz, /stats, /metrics (ignored when --metrics-address is non-empty); the HTTP surface is off unless this or --metrics-address is set")
 	metricsAddress := fs.String("metrics-address", "", "enable the observability HTTP surface and override its bind host:port verbatim (e.g. 0.0.0.0:9877); when set, --metrics-port is ignored")
 	drainTimeout := fs.Duration("drain-timeout", 30*time.Second, "max time to wait for in-flight RPCs to finish during graceful shutdown")
-	quiesceDelay := fs.Duration("quiesce-delay", 5*time.Second, "on shutdown, how long to wait after flipping /readyz to not-ready before draining connections — gives a readiness-polling consumer (e.g. a Kubernetes endpoint controller) a chance to stop routing new work first")
+	quiesceDelay := fs.Duration("quiesce-delay", 5*time.Second, "when the HTTP readiness surface is enabled, how long to wait after flipping /readyz to not-ready before draining connections")
 	fs.Parse(args)
 
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
@@ -390,8 +390,11 @@ func cmdServe(args []string) {
 		die("serve: %v", err)
 	}
 
-	logger.Info("shoal-embed gRPC serve starting",
-		slog.String("addr", h.GRPCAddr), slog.String("metrics", h.MetricsAddr), slog.String("data", *dataDir))
+	logAttrs := []any{slog.String("addr", h.GRPCAddr), slog.String("data", *dataDir)}
+	if h.MetricsAddr != "" {
+		logAttrs = append(logAttrs, slog.String("metrics", h.MetricsAddr), slog.Duration("quiesce_delay", *quiesceDelay))
+	}
+	logger.Info("shoal-embed gRPC serve starting", logAttrs...)
 	fmt.Fprintf(os.Stderr, "shoal-embed serve: grpc://%s\n", h.GRPCAddr)
 	if h.MetricsAddr != "" {
 		fmt.Fprintf(os.Stderr, "  health/metrics: http://%s/{healthz,readyz,stats,metrics}\n", h.MetricsAddr)
@@ -401,10 +404,13 @@ func cmdServe(args []string) {
 
 	// RunUntilSignal owns the full graceful-shutdown sequence (drain,
 	// quiesce, bounded stop, engine close) and — critically — does not
-	// return until that sequence has actually finished, so this call
-	// cannot return (and the process cannot exit) mid-drain.
+	// return until that sequence has actually finished or a timeout error
+	// explains why engine close was skipped, so this call cannot return
+	// (and the process cannot exit) mid-drain while still claiming a
+	// completed shutdown.
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
 	if err := h.RunUntilSignal(sigCh, *quiesceDelay, *drainTimeout); err != nil {
 		die("serve: %v", err)
 	}
