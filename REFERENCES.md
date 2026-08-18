@@ -107,6 +107,40 @@ cribs land.
 - `core/src/main/thrift/security.thrift` — `TCredentials`
 - `core/src/main/thrift/client.thrift` — `TInfo`
 
+### Security administration (Accumulo revision
+`317c288568e9c46e7854aafb8bb8c4fda6260b12`)
+- `core/src/main/java/org/apache/accumulo/core/clientImpl/SecurityOperationsImpl.java`
+  - all user, authorization, and permission operations use the multiplexed
+    `ClientService` (`client`) rather than the Manager service
+  - RPC argument order is trace info, connector credentials, principal, then
+    password/authorizations/name/permission as applicable
+  - changing the authenticated principal's own password replaces the client
+    context credentials used by subsequent RPCs
+  - Shoal refreshes its scan, ingest, and manager adapter credential copies
+    before `ChangePassword` returns successfully; RPCs already in flight may
+    retain the prior snapshot. Adapter update failures are returned explicitly;
+    the cross-adapter refresh does not claim atomic swap or rollback semantics.
+  - table permission calls translate `NAMESPACE_DOESNT_EXIST` to
+    `TABLE_DOESNT_EXIST`
+- `core/src/main/java/org/apache/accumulo/core/security/SystemPermission.java`
+  - valid wire IDs are 0 through 11 (`GRANT` through
+    `OBTAIN_DELEGATION_TOKEN`)
+- `core/src/main/java/org/apache/accumulo/core/security/TablePermission.java`
+  - valid wire IDs are 2 through 8; 0 and 1 are intentionally unused legacy
+    gaps and must not be accepted
+- `core/src/main/java/org/apache/accumulo/core/security/NamespacePermission.java`
+  - valid wire IDs are 0 through 8
+- `core/src/main/java/org/apache/accumulo/core/security/Authorizations.java`
+  - authorization values are non-empty byte strings; collections are
+    duplicate-free, sorted, and defensively copied
+- `core/src/main/java/org/apache/accumulo/core/util/Validators.java`
+  - existing table and namespace segments use `\w+`; qualified table names
+    contain one namespace segment and one table segment
+  - the empty string is the valid, always-existing default namespace name
+- `core/src/main/thrift/client.thrift`
+  - authoritative Accumulo 4 RPC names, field IDs, argument order,
+    `SecurityErrorCode` values, and declared security/table exceptions
+
 ### Wire protocol
 - `core/.../rpc/AccumuloProtocolFactory.java`
   - `:49` `MAGIC_NUMBER = 0x41434355` ("ACCU" — A=41, C=43, C=43, U=55)

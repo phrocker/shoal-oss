@@ -72,6 +72,7 @@ const (
 
 type Error struct {
 	Kind        ErrorKind
+	User        string
 	TableID     string
 	TableName   string
 	Property    string
@@ -103,6 +104,24 @@ type Adapter interface {
 	Close() error
 }
 
+// SecurityAdapter is the version-neutral ClientService security RPC boundary.
+type SecurityAdapter interface {
+	CreateLocalUser(context.Context, string, string, []byte) error
+	DropLocalUser(context.Context, string, string) error
+	ChangeLocalUserPassword(context.Context, string, string, []byte) error
+	ChangeUserAuthorizations(context.Context, string, string, [][]byte) error
+	GetUserAuthorizations(context.Context, string, string) ([][]byte, error)
+	HasSystemPermission(context.Context, string, string, int8) (bool, error)
+	HasTablePermission(context.Context, string, string, string, int8) (bool, error)
+	HasNamespacePermission(context.Context, string, string, string, int8) (bool, error)
+	GrantSystemPermission(context.Context, string, string, int8) error
+	RevokeSystemPermission(context.Context, string, string, int8) error
+	GrantTablePermission(context.Context, string, string, string, int8) error
+	RevokeTablePermission(context.Context, string, string, string, int8) error
+	GrantNamespacePermission(context.Context, string, string, string, int8) error
+	RevokeNamespacePermission(context.Context, string, string, string, int8) error
+}
+
 type fateID struct {
 	Type int32
 	UUID string
@@ -128,6 +147,20 @@ type clientRPC interface {
 		*security.TCredentials,
 		string,
 	) (map[string]string, error)
+	CreateLocalUser(context.Context, *security.TCredentials, string, []byte) error
+	DropLocalUser(context.Context, *security.TCredentials, string) error
+	ChangeLocalUserPassword(context.Context, *security.TCredentials, string, []byte) error
+	ChangeUserAuthorizations(context.Context, *security.TCredentials, string, [][]byte) error
+	GetUserAuthorizations(context.Context, *security.TCredentials, string) ([][]byte, error)
+	HasSystemPermission(context.Context, *security.TCredentials, string, int8) (bool, error)
+	HasTablePermission(context.Context, *security.TCredentials, string, string, int8) (bool, error)
+	HasNamespacePermission(context.Context, *security.TCredentials, string, string, int8) (bool, error)
+	GrantSystemPermission(context.Context, *security.TCredentials, string, int8) error
+	RevokeSystemPermission(context.Context, *security.TCredentials, string, int8) error
+	GrantTablePermission(context.Context, *security.TCredentials, string, string, int8) error
+	RevokeTablePermission(context.Context, *security.TCredentials, string, string, int8) error
+	GrantNamespacePermission(context.Context, *security.TCredentials, string, string, int8) error
+	RevokeNamespacePermission(context.Context, *security.TCredentials, string, string, int8) error
 }
 
 type Pooled struct {
@@ -148,6 +181,7 @@ type Pooled struct {
 }
 
 var _ Adapter = (*Pooled)(nil)
+var _ SecurityAdapter = (*Pooled)(nil)
 
 func NewPooled(
 	pool *transportpool.Pool,
@@ -285,6 +319,176 @@ func (p *Pooled) GetTableConfiguration(
 	return cloneOptions(properties), nil
 }
 
+func (p *Pooled) CreateLocalUser(ctx context.Context, address, principal string, password []byte) error {
+	return p.securityVoid(ctx, address, func(rpc clientRPC, credentials *security.TCredentials) error {
+		return rpc.CreateLocalUser(ctx, credentials, principal, append([]byte(nil), password...))
+	})
+}
+
+func (p *Pooled) DropLocalUser(ctx context.Context, address, principal string) error {
+	return p.securityVoid(ctx, address, func(rpc clientRPC, credentials *security.TCredentials) error {
+		return rpc.DropLocalUser(ctx, credentials, principal)
+	})
+}
+
+func (p *Pooled) ChangeLocalUserPassword(
+	ctx context.Context,
+	address, principal string,
+	password []byte,
+) error {
+	return p.securityVoid(ctx, address, func(rpc clientRPC, credentials *security.TCredentials) error {
+		return rpc.ChangeLocalUserPassword(ctx, credentials, principal, append([]byte(nil), password...))
+	})
+}
+
+func (p *Pooled) ChangeUserAuthorizations(
+	ctx context.Context,
+	address, principal string,
+	authorizations [][]byte,
+) error {
+	authCopy := cloneArguments(authorizations)
+	return p.securityVoid(ctx, address, func(rpc clientRPC, credentials *security.TCredentials) error {
+		return rpc.ChangeUserAuthorizations(ctx, credentials, principal, authCopy)
+	})
+}
+
+func (p *Pooled) GetUserAuthorizations(
+	ctx context.Context,
+	address, principal string,
+) ([][]byte, error) {
+	credentials, err := p.credentialsForRPC()
+	if err != nil {
+		return nil, err
+	}
+	auths, err := withClientService(p, ctx, address, func(rpc clientRPC) ([][]byte, error) {
+		return rpc.GetUserAuthorizations(ctx, credentials, principal)
+	})
+	if err != nil {
+		return nil, mapRPCError(err)
+	}
+	return cloneArguments(auths), nil
+}
+
+func (p *Pooled) HasSystemPermission(
+	ctx context.Context,
+	address, principal string,
+	permission int8,
+) (bool, error) {
+	return p.securityBool(ctx, address, func(rpc clientRPC, credentials *security.TCredentials) (bool, error) {
+		return rpc.HasSystemPermission(ctx, credentials, principal, permission)
+	})
+}
+
+func (p *Pooled) HasTablePermission(
+	ctx context.Context,
+	address, principal, tableName string,
+	permission int8,
+) (bool, error) {
+	return p.securityBool(ctx, address, func(rpc clientRPC, credentials *security.TCredentials) (bool, error) {
+		return rpc.HasTablePermission(ctx, credentials, principal, tableName, permission)
+	})
+}
+
+func (p *Pooled) HasNamespacePermission(
+	ctx context.Context,
+	address, principal, namespace string,
+	permission int8,
+) (bool, error) {
+	return p.securityBool(ctx, address, func(rpc clientRPC, credentials *security.TCredentials) (bool, error) {
+		return rpc.HasNamespacePermission(ctx, credentials, principal, namespace, permission)
+	})
+}
+
+func (p *Pooled) GrantSystemPermission(
+	ctx context.Context,
+	address, principal string,
+	permission int8,
+) error {
+	return p.securityVoid(ctx, address, func(rpc clientRPC, credentials *security.TCredentials) error {
+		return rpc.GrantSystemPermission(ctx, credentials, principal, permission)
+	})
+}
+
+func (p *Pooled) RevokeSystemPermission(
+	ctx context.Context,
+	address, principal string,
+	permission int8,
+) error {
+	return p.securityVoid(ctx, address, func(rpc clientRPC, credentials *security.TCredentials) error {
+		return rpc.RevokeSystemPermission(ctx, credentials, principal, permission)
+	})
+}
+
+func (p *Pooled) GrantTablePermission(
+	ctx context.Context,
+	address, principal, tableName string,
+	permission int8,
+) error {
+	return p.securityVoid(ctx, address, func(rpc clientRPC, credentials *security.TCredentials) error {
+		return rpc.GrantTablePermission(ctx, credentials, principal, tableName, permission)
+	})
+}
+
+func (p *Pooled) RevokeTablePermission(
+	ctx context.Context,
+	address, principal, tableName string,
+	permission int8,
+) error {
+	return p.securityVoid(ctx, address, func(rpc clientRPC, credentials *security.TCredentials) error {
+		return rpc.RevokeTablePermission(ctx, credentials, principal, tableName, permission)
+	})
+}
+
+func (p *Pooled) GrantNamespacePermission(
+	ctx context.Context,
+	address, principal, namespace string,
+	permission int8,
+) error {
+	return p.securityVoid(ctx, address, func(rpc clientRPC, credentials *security.TCredentials) error {
+		return rpc.GrantNamespacePermission(ctx, credentials, principal, namespace, permission)
+	})
+}
+
+func (p *Pooled) RevokeNamespacePermission(
+	ctx context.Context,
+	address, principal, namespace string,
+	permission int8,
+) error {
+	return p.securityVoid(ctx, address, func(rpc clientRPC, credentials *security.TCredentials) error {
+		return rpc.RevokeNamespacePermission(ctx, credentials, principal, namespace, permission)
+	})
+}
+
+func (p *Pooled) securityVoid(
+	ctx context.Context,
+	address string,
+	call func(clientRPC, *security.TCredentials) error,
+) error {
+	credentials, err := p.credentialsForRPC()
+	if err != nil {
+		return err
+	}
+	_, err = withClientService(p, ctx, address, func(rpc clientRPC) (struct{}, error) {
+		return struct{}{}, call(rpc, credentials)
+	})
+	return mapRPCError(err)
+}
+
+func (p *Pooled) securityBool(
+	ctx context.Context,
+	address string,
+	call func(clientRPC, *security.TCredentials) (bool, error),
+) (bool, error) {
+	credentials, err := p.credentialsForRPC()
+	if err != nil {
+		return false, err
+	}
+	result, err := withClientService(p, ctx, address, func(rpc clientRPC) (bool, error) {
+		return call(rpc, credentials)
+	})
+	return result, mapRPCError(err)
+}
+
 func (p *Pooled) RemoveTableProperty(
 	ctx context.Context,
 	address, tableName, property string,
@@ -378,6 +582,30 @@ func (p *Pooled) Close() error {
 			p.credentials.Token[i] = 0
 		}
 		p.credentials.Token = nil
+	}
+	return nil
+}
+
+// UpdateCredentials atomically replaces the adapter's private credential copy.
+func (p *Pooled) UpdateCredentials(credentials *security.TCredentials) error {
+	if credentials == nil {
+		return errors.New("managerclient: nil Credentials")
+	}
+	replacement := cloneCredentials(credentials)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed {
+		for i := range replacement.Token {
+			replacement.Token[i] = 0
+		}
+		return errors.New("managerclient: pooled client is closed")
+	}
+	old := p.credentials
+	p.credentials = replacement
+	if old != nil {
+		for i := range old.Token {
+			old.Token[i] = 0
+		}
 	}
 	return nil
 }
@@ -481,6 +709,152 @@ func (r thriftClientRPC) GetTableConfiguration(
 		clientgen.NewTInfo(),
 		credentials,
 		tableName,
+	)
+}
+
+func (r thriftClientRPC) CreateLocalUser(
+	ctx context.Context,
+	credentials *security.TCredentials,
+	principal string,
+	password []byte,
+) error {
+	return r.raw.CreateLocalUser(ctx, clientgen.NewTInfo(), credentials, principal, password)
+}
+
+func (r thriftClientRPC) DropLocalUser(
+	ctx context.Context,
+	credentials *security.TCredentials,
+	principal string,
+) error {
+	return r.raw.DropLocalUser(ctx, clientgen.NewTInfo(), credentials, principal)
+}
+
+func (r thriftClientRPC) ChangeLocalUserPassword(
+	ctx context.Context,
+	credentials *security.TCredentials,
+	principal string,
+	password []byte,
+) error {
+	return r.raw.ChangeLocalUserPassword(ctx, clientgen.NewTInfo(), credentials, principal, password)
+}
+
+func (r thriftClientRPC) ChangeUserAuthorizations(
+	ctx context.Context,
+	credentials *security.TCredentials,
+	principal string,
+	authorizations [][]byte,
+) error {
+	return r.raw.ChangeAuthorizations(
+		ctx,
+		clientgen.NewTInfo(),
+		credentials,
+		principal,
+		cloneArguments(authorizations),
+	)
+}
+
+func (r thriftClientRPC) GetUserAuthorizations(
+	ctx context.Context,
+	credentials *security.TCredentials,
+	principal string,
+) ([][]byte, error) {
+	return r.raw.GetUserAuthorizations(ctx, clientgen.NewTInfo(), credentials, principal)
+}
+
+func (r thriftClientRPC) HasSystemPermission(
+	ctx context.Context,
+	credentials *security.TCredentials,
+	principal string,
+	permission int8,
+) (bool, error) {
+	return r.raw.HasSystemPermission(ctx, clientgen.NewTInfo(), credentials, principal, permission)
+}
+
+func (r thriftClientRPC) HasTablePermission(
+	ctx context.Context,
+	credentials *security.TCredentials,
+	principal, tableName string,
+	permission int8,
+) (bool, error) {
+	return r.raw.HasTablePermission(
+		ctx, clientgen.NewTInfo(), credentials, principal, tableName, permission,
+	)
+}
+
+func (r thriftClientRPC) HasNamespacePermission(
+	ctx context.Context,
+	credentials *security.TCredentials,
+	principal, namespace string,
+	permission int8,
+) (bool, error) {
+	return r.raw.HasNamespacePermission(
+		ctx, clientgen.NewTInfo(), credentials, principal, namespace, permission,
+	)
+}
+
+func (r thriftClientRPC) GrantSystemPermission(
+	ctx context.Context,
+	credentials *security.TCredentials,
+	principal string,
+	permission int8,
+) error {
+	return r.raw.GrantSystemPermission(
+		ctx, clientgen.NewTInfo(), credentials, principal, permission,
+	)
+}
+
+func (r thriftClientRPC) RevokeSystemPermission(
+	ctx context.Context,
+	credentials *security.TCredentials,
+	principal string,
+	permission int8,
+) error {
+	return r.raw.RevokeSystemPermission(
+		ctx, clientgen.NewTInfo(), credentials, principal, permission,
+	)
+}
+
+func (r thriftClientRPC) GrantTablePermission(
+	ctx context.Context,
+	credentials *security.TCredentials,
+	principal, tableName string,
+	permission int8,
+) error {
+	return r.raw.GrantTablePermission(
+		ctx, clientgen.NewTInfo(), credentials, principal, tableName, permission,
+	)
+}
+
+func (r thriftClientRPC) RevokeTablePermission(
+	ctx context.Context,
+	credentials *security.TCredentials,
+	principal, tableName string,
+	permission int8,
+) error {
+	return r.raw.RevokeTablePermission(
+		ctx, clientgen.NewTInfo(), credentials, principal, tableName, permission,
+	)
+}
+
+func (r thriftClientRPC) GrantNamespacePermission(
+	ctx context.Context,
+	credentials *security.TCredentials,
+	principal, namespace string,
+	permission int8,
+) error {
+	return r.raw.GrantNamespacePermission(
+		ctx, clientgen.NewTInfo(), credentials, principal, namespace, permission,
+	)
+}
+
+func (r thriftClientRPC) RevokeNamespacePermission(
+	ctx context.Context,
+	credentials *security.TCredentials,
+	principal, namespace string,
+	permission int8,
+) error {
+	return r.raw.RevokeNamespacePermission(
+		ctx, clientgen.NewTInfo(), credentials, principal, namespace, permission,
 	)
 }
 
@@ -696,7 +1070,7 @@ func mapRPCError(err error) error {
 		} else if securityErr.Code == clientgen.SecurityErrorCode_NAMESPACE_DOESNT_EXIST {
 			kind = ErrorNamespaceNotFound
 		}
-		return &Error{Kind: kind, Code: securityErr.Code.String()}
+		return &Error{Kind: kind, User: securityErr.User, Code: securityErr.Code.String()}
 	}
 	var inactiveErr *clientgen.ThriftNotActiveServiceException
 	if errors.As(err, &inactiveErr) {

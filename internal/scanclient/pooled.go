@@ -228,6 +228,30 @@ func (p *Pooled) Close() error {
 	return nil
 }
 
+// UpdateCredentials atomically replaces the adapter's private credential copy.
+func (p *Pooled) UpdateCredentials(credentials *security.TCredentials) error {
+	if credentials == nil {
+		return errors.New("scanclient: nil Credentials")
+	}
+	replacement := cloneCredentials(credentials)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed {
+		for i := range replacement.Token {
+			replacement.Token[i] = 0
+		}
+		return errors.New("scanclient: pooled client is closed")
+	}
+	old := p.credentials
+	p.credentials = replacement
+	if old != nil {
+		for i := range old.Token {
+			old.Token[i] = 0
+		}
+	}
+	return nil
+}
+
 func withLease[T any](
 	p *Pooled,
 	ctx context.Context,
