@@ -145,6 +145,7 @@ Version numbers change only when the public ABI contract changes:
   `zookeeper_servers` list. A zero session or bootstrap timeout selects the
   30-second default. `instance_secret` is optional.
 
+The ABI currently exposes connector bootstrap/lifecycle, synchronous Scanner
 and BatchScanner reads, Mutation/BatchWriter writes with owned structured
 failures, and table administration for listing, existence checks, create/
 delete/rename, full-table flush, table property mutation, and effective
