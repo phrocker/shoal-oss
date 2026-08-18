@@ -229,6 +229,124 @@ func TestOwnedConnectorCloseBoundedWait(t *testing.T) {
 	}
 }
 
+func TestOwnedConnectorCloseBoundedIncludesFinalClose(t *testing.T) {
+	connectorCloseStarted := make(chan struct{})
+	unblockConnectorClose := make(chan struct{})
+	instanceCloseStarted := make(chan struct{})
+	unblockInstanceClose := make(chan struct{})
+	instanceCloseFinished := make(chan struct{})
+	var connectorCloses atomic.Int32
+	var instanceCloses atomic.Int32
+	connector := newOwnedConnector(
+		&fakeConnectorAPI{close: func() error {
+			connectorCloses.Add(1)
+			close(connectorCloseStarted)
+			<-unblockConnectorClose
+			return nil
+		}},
+		fakeConnectorInstance{close: func() error {
+			instanceCloses.Add(1)
+			close(instanceCloseStarted)
+			<-unblockInstanceClose
+			close(instanceCloseFinished)
+			return nil
+		}},
+	)
+
+	closeReturned := make(chan error, 1)
+	go func() {
+		closeReturned <- connector.closeBounded(20 * time.Millisecond)
+	}()
+	select {
+	case <-connectorCloseStarted:
+	case <-time.After(time.Second):
+		t.Fatal("connector close did not start")
+	}
+	select {
+	case err := <-closeReturned:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("closeBounded error = %v, want deadline exceeded", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("closeBounded remained blocked in connector close")
+	}
+	if instanceCloses.Load() != 0 {
+		t.Fatalf("instance close count = %d before connector close completed, want 0", instanceCloses.Load())
+	}
+
+	close(unblockConnectorClose)
+	select {
+	case <-instanceCloseStarted:
+	case <-time.After(time.Second):
+		t.Fatal("instance close did not start after connector close completed")
+	}
+	if err := connector.closeBounded(time.Second); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("repeated closeBounded error = %v, want sticky deadline", err)
+	}
+	close(unblockInstanceClose)
+	select {
+	case <-instanceCloseFinished:
+	case <-time.After(time.Second):
+		t.Fatal("final close did not finish after being unblocked")
+	}
+	if connectorCloses.Load() != 1 || instanceCloses.Load() != 1 {
+		t.Fatalf("close counts = connector:%d instance:%d, want 1/1",
+			connectorCloses.Load(), instanceCloses.Load())
+	}
+}
+
+func TestOwnedConnectorCloseBoundedIncludesInstanceClose(t *testing.T) {
+	instanceCloseStarted := make(chan struct{})
+	unblockInstanceClose := make(chan struct{})
+	instanceCloseFinished := make(chan struct{})
+	var connectorCloses atomic.Int32
+	var instanceCloses atomic.Int32
+	connector := newOwnedConnector(
+		&fakeConnectorAPI{close: func() error {
+			connectorCloses.Add(1)
+			return nil
+		}},
+		fakeConnectorInstance{close: func() error {
+			instanceCloses.Add(1)
+			close(instanceCloseStarted)
+			<-unblockInstanceClose
+			close(instanceCloseFinished)
+			return nil
+		}},
+	)
+
+	closeReturned := make(chan error, 1)
+	go func() {
+		closeReturned <- connector.closeBounded(20 * time.Millisecond)
+	}()
+	select {
+	case <-instanceCloseStarted:
+	case <-time.After(time.Second):
+		t.Fatal("instance close did not start")
+	}
+	select {
+	case err := <-closeReturned:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("closeBounded error = %v, want deadline exceeded", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("closeBounded remained blocked in instance close")
+	}
+	if err := connector.closeBounded(time.Second); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("repeated closeBounded error = %v, want sticky deadline", err)
+	}
+	close(unblockInstanceClose)
+	select {
+	case <-instanceCloseFinished:
+	case <-time.After(time.Second):
+		t.Fatal("instance close did not finish after being unblocked")
+	}
+	if connectorCloses.Load() != 1 || instanceCloses.Load() != 1 {
+		t.Fatalf("close counts = connector:%d instance:%d, want 1/1",
+			connectorCloses.Load(), instanceCloses.Load())
+	}
+}
+
 func TestOwnedConnectorCloseIsConcurrentAndIdempotent(t *testing.T) {
 	var connectorCloses atomic.Int32
 	var instanceCloses atomic.Int32

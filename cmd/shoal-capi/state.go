@@ -153,7 +153,16 @@ func (c *ownedConnector) closeBoundedFirst(timeout time.Duration) error {
 	c.mu.Unlock()
 	select {
 	case <-idle:
-		return c.finishClose()
+		closeResult := make(chan error, 1)
+		go func() {
+			closeResult <- c.finishClose()
+		}()
+		select {
+		case err := <-closeResult:
+			return err
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	case <-ctx.Done():
 		go c.finishCloseAfterTimeout(idle)
 		return ctx.Err()

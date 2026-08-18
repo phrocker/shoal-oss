@@ -1,6 +1,8 @@
 #ifndef SHOAL_CAPI_TEST_SEAM_H
 #define SHOAL_CAPI_TEST_SEAM_H
 
+#include <stddef.h>
+
 #ifndef SHOAL_TYPES_H
 typedef struct shoal_connector shoal_connector;
 typedef struct shoal_batch_writer shoal_batch_writer;
@@ -15,5 +17,7 @@ enum {
 
 int shoal_test_connector_create(shoal_connector **out_connector);
 int shoal_test_batch_writer_create(int mode, shoal_batch_writer **out_writer);
+void shoal_test_string_alloc_fail_after(size_t successful_allocations);
+void shoal_test_string_alloc_reset(void);
 
 #endif

@@ -81,6 +81,13 @@ int main(void) {
   shoal_table_list_free(&table_list);
   assert(table_list == NULL);
 
+  shoal_test_string_alloc_fail_after(1);
+  expect_error(shoal_connector_list_tables(admin_connector, 0, &table_list,
+                                           &error),
+               SHOAL_STATUS_OUT_OF_MEMORY, &error, "table 0 id");
+  assert(table_list == NULL);
+  shoal_test_string_alloc_reset();
+
   uint8_t exists = 99;
   assert(shoal_connector_table_exists(admin_connector, "events", 0, &exists,
                                       &error) == SHOAL_STATUS_OK);
@@ -157,6 +164,12 @@ int main(void) {
                SHOAL_STATUS_INVALID_ARGUMENT, &error, "out of bounds");
   shoal_table_properties_free(&properties);
   assert(properties == NULL);
+  shoal_test_string_alloc_fail_after(3);
+  expect_error(shoal_connector_effective_table_properties(
+                   admin_connector, "events", 0, &properties, &error),
+               SHOAL_STATUS_OUT_OF_MEMORY, &error, "property 1 value");
+  assert(properties == NULL);
+  shoal_test_string_alloc_reset();
   expect_error(shoal_connector_effective_table_properties(
                    admin_connector, "down", 0, &properties, &error),
                SHOAL_STATUS_UNAVAILABLE, &error,

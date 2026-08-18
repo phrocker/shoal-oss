@@ -1,5 +1,6 @@
 #include "bridge.h"
 
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -99,6 +100,50 @@ void shoal_bridge_batch_writer_free(shoal_batch_writer *writer) {
     writer->id = 0;
     free(writer);
   }
+}
+
+static _Atomic size_t shoal_bridge_string_alloc_fail_after = SIZE_MAX;
+
+char *shoal_bridge_string_alloc(const char *value, size_t length) {
+  if ((value == NULL && length != 0) || length == SIZE_MAX) {
+    return NULL;
+  }
+  size_t remaining =
+      atomic_load_explicit(&shoal_bridge_string_alloc_fail_after,
+                           memory_order_relaxed);
+  while (remaining != SIZE_MAX) {
+    if (remaining == 0) {
+      return NULL;
+    }
+    if (atomic_compare_exchange_weak_explicit(
+            &shoal_bridge_string_alloc_fail_after, &remaining, remaining - 1,
+            memory_order_relaxed, memory_order_relaxed)) {
+      break;
+    }
+  }
+  char *copy = (char *)malloc(length + 1);
+  if (copy == NULL) {
+    return NULL;
+  }
+  if (length != 0) {
+    memcpy(copy, value, length);
+  }
+  copy[length] = '\0';
+  return copy;
+}
+
+void shoal_bridge_string_free(char *value) {
+  free(value);
+}
+
+void shoal_bridge_test_string_alloc_fail_after(size_t successful_allocations) {
+  atomic_store_explicit(&shoal_bridge_string_alloc_fail_after,
+                        successful_allocations, memory_order_relaxed);
+}
+
+void shoal_bridge_test_string_alloc_reset(void) {
+  atomic_store_explicit(&shoal_bridge_string_alloc_fail_after, SIZE_MAX,
+                        memory_order_relaxed);
 }
 
 static uint8_t *shoal_bridge_copy_bytes(const uint8_t *value, size_t length) {

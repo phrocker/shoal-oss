@@ -280,3 +280,13 @@ func shoal_test_connector_create(outConnector **C.shoal_connector) C.int {
 	*outConnector = handle
 	return 1
 }
+
+//export shoal_test_string_alloc_fail_after
+func shoal_test_string_alloc_fail_after(successfulAllocations C.size_t) {
+	C.shoal_bridge_test_string_alloc_fail_after(successfulAllocations)
+}
+
+//export shoal_test_string_alloc_reset
+func shoal_test_string_alloc_reset() {
+	C.shoal_bridge_test_string_alloc_reset()
+}

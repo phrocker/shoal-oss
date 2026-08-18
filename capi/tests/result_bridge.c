@@ -5,6 +5,18 @@
 #include <string.h>
 
 int main(void) {
+  assert(shoal_bridge_string_alloc(NULL, 1) == NULL);
+  char *string_copy = shoal_bridge_string_alloc("value", 5);
+  assert(string_copy != NULL);
+  assert(strcmp(string_copy, "value") == 0);
+  shoal_bridge_string_free(string_copy);
+  shoal_bridge_test_string_alloc_fail_after(1);
+  string_copy = shoal_bridge_string_alloc("first", 5);
+  assert(string_copy != NULL);
+  shoal_bridge_string_free(string_copy);
+  assert(shoal_bridge_string_alloc("second", 6) == NULL);
+  shoal_bridge_test_string_alloc_reset();
+
   static const uint8_t row[] = {'r', '\0', 'w'};
   static const uint8_t family[] = {'c', 'f'};
   static const uint8_t qualifier[] = {'c', 'q'};

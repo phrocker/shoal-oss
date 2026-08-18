@@ -134,6 +134,11 @@ shoal_batch_writer *shoal_bridge_batch_writer_alloc(uint64_t id);
 uint64_t shoal_bridge_batch_writer_id(const shoal_batch_writer *writer);
 void shoal_bridge_batch_writer_free(shoal_batch_writer *writer);
 
+char *shoal_bridge_string_alloc(const char *value, size_t length);
+void shoal_bridge_string_free(char *value);
+void shoal_bridge_test_string_alloc_fail_after(size_t successful_allocations);
+void shoal_bridge_test_string_alloc_reset(void);
+
 shoal_scan_result *shoal_bridge_scan_result_alloc(size_t count);
 int shoal_bridge_scan_result_set(
     shoal_scan_result *result, size_t index, const uint8_t *row,

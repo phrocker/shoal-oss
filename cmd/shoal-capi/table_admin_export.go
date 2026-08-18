@@ -475,13 +475,13 @@ func buildTableListResult(
 		}
 		cID, code, err := bridgeCString(table.ID, fmt.Sprintf("table %d id", index))
 		if err != nil {
-			C.free(unsafe.Pointer(cName))
+			C.shoal_bridge_string_free(cName)
 			C.shoal_bridge_table_list_free(result)
 			return nil, code, err
 		}
 		ok := C.shoal_bridge_table_list_set(result, C.size_t(index), cName, cID) != 0
-		C.free(unsafe.Pointer(cName))
-		C.free(unsafe.Pointer(cID))
+		C.shoal_bridge_string_free(cName)
+		C.shoal_bridge_string_free(cID)
 		if !ok {
 			C.shoal_bridge_table_list_free(result)
 			return nil, C.SHOAL_STATUS_OUT_OF_MEMORY, errors.New("shoal: allocate table list entry")
@@ -510,13 +510,13 @@ func buildTablePropertiesResult(
 		}
 		cValue, code, err := bridgeCString(properties[key], fmt.Sprintf("property %d value", index))
 		if err != nil {
-			C.free(unsafe.Pointer(cKey))
+			C.shoal_bridge_string_free(cKey)
 			C.shoal_bridge_table_properties_free(result)
 			return nil, code, err
 		}
 		ok := C.shoal_bridge_table_properties_set(result, C.size_t(index), cKey, cValue) != 0
-		C.free(unsafe.Pointer(cKey))
-		C.free(unsafe.Pointer(cValue))
+		C.shoal_bridge_string_free(cKey)
+		C.shoal_bridge_string_free(cValue)
 		if !ok {
 			C.shoal_bridge_table_properties_free(result)
 			return nil, C.SHOAL_STATUS_OUT_OF_MEMORY, errors.New("shoal: allocate table properties entry")
@@ -529,7 +529,11 @@ func bridgeCString(value, name string) (*C.char, C.shoal_status, error) {
 	if strings.IndexByte(value, 0) >= 0 {
 		return nil, C.SHOAL_STATUS_INTERNAL, fmt.Errorf("shoal: %s contains NUL", name)
 	}
-	result := C.CString(value)
+	var data *C.char
+	if len(value) != 0 {
+		data = (*C.char)(unsafe.Pointer(unsafe.StringData(value)))
+	}
+	result := C.shoal_bridge_string_alloc(data, C.size_t(len(value)))
 	if result == nil {
 		return nil, C.SHOAL_STATUS_OUT_OF_MEMORY, fmt.Errorf("shoal: allocate %s", name)
 	}
