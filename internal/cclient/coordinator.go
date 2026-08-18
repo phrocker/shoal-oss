@@ -52,8 +52,9 @@ type CoordinatorClient struct {
 // DialCoordinator opens a connection to the compaction coordinator at
 // addr (host:port). The coordinator address is published in the manager's
 // ServiceLock data in ZooKeeper under ThriftService.COORDINATOR; resolving
-// it from ZK is the caller's job (see cmd/shoal-compactor — currently a
-// flag, ZK lock-data parsing is the documented follow-up).
+// it from ZK is the caller's job — use zk.CoordinatorAddress, and
+// re-resolve before each dial so manager failover moves the connection to
+// the new primary (see cmd/shoal-compactor's poll loop).
 func DialCoordinator(addr, instanceID, accumuloVersion string) (*CoordinatorClient, error) {
 	if addr == "" {
 		return nil, errors.New("cclient: empty coordinator addr")

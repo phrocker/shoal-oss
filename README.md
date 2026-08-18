@@ -199,7 +199,7 @@ cmd/
   shoal-embed/          embedded standalone engine — CLI + ShoalEmbed gRPC server (no ZK/Accumulo)
   shoal/                distributed serving daemon — metadata + Thrift listener
   shoal-bootstrap/      diagnostic CLI: walks ZK → root → metadata → tablets
-  shoal-compactor/      standalone compaction worker
+  shoal-compactor/      external compaction worker — discovers the manager's CompactionCoordinator in ZK
   shoal-offline-compact/  offline (OFFLINE-fenced) full major compaction of a table's tablets, off-cluster
   shoal-compactor-shadow/  shadow-compaction harness
   shoal-probe/          one-shot RFile probe (version + LG summary + walk count)

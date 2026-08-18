@@ -17,11 +17,26 @@ import (
 const (
 	zManagerLock = "/managers/lock"
 	zLockPrefix  = "zlock#"
+
+	// ServiceLockData.ThriftService values the Accumulo 4 manager
+	// publishes on its lock znode once it is fully initialized. See
+	// server/manager/.../Manager.java, which replaces the bootstrap
+	// ThriftService.NONE descriptor with MANAGER + COORDINATOR +
+	// FATE_CLIENT descriptors, all pointing at the manager's advertise
+	// address, only after upgrade and dependent services are running.
+	svcManager     = "MANAGER"
+	svcCoordinator = "COORDINATOR"
 )
 
 var (
 	ErrManagerUnavailable       = errors.New("zk: manager unavailable")
+	ErrCoordinatorUnavailable   = errors.New("zk: compaction coordinator unavailable")
 	ErrClientServiceUnavailable = errors.New("zk: client service unavailable")
+
+	// errServiceNotAdvertised is the internal "the manager lock exists but
+	// does not advertise this service (yet)" signal. Exported wrappers map
+	// it to their own sentinel so callers keep a stable error surface.
+	errServiceNotAdvertised = errors.New("zk: service not advertised on manager lock")
 )
 
 type serviceLockData struct {
@@ -33,11 +48,56 @@ type serviceDescriptor struct {
 	Address string `json:"address"`
 }
 
-func ManagerAddress(ctx context.Context, locator interface {
+// LockReader is the subset of *Locator needed to read Accumulo
+// service-lock data out of ZooKeeper.
+type LockReader interface {
 	InstancePath() string
 	GetRaw(context.Context, string) ([]byte, error)
 	Children(context.Context, string) ([]string, error)
-}) (string, error) {
+}
+
+// ManagerAddress returns the Thrift address of the active Accumulo
+// manager, or ErrManagerUnavailable when no manager currently advertises
+// one.
+func ManagerAddress(ctx context.Context, locator LockReader) (string, error) {
+	address, err := managerLockAddress(ctx, locator, svcManager)
+	if errors.Is(err, errServiceNotAdvertised) {
+		return "", ErrManagerUnavailable
+	}
+	return address, err
+}
+
+// CoordinatorAddress returns the Thrift address of the
+// CompactionCoordinator, or ErrCoordinatorUnavailable when no manager
+// currently advertises one.
+//
+// The coordinator runs inside the manager process and is advertised on
+// the manager's lock znode under ThriftService.COORDINATOR. This mirrors
+// Java's ExternalCompactionUtil.findCompactionCoordinator, which reads
+// the same manager lock path and maps it through
+// ServiceLockData.getAddress(ThriftService.COORDINATOR).
+//
+// Because the address is re-read from the lowest-sequence lock node on
+// every call, callers that re-resolve before each connection attempt
+// follow manager failover without restarting: the new primary manager
+// creates a new lock node and republishes its own coordinator address.
+// Between the old manager dying and the new one finishing startup the
+// lock is missing or still carries the bootstrap ThriftService.NONE
+// descriptor, both of which surface as ErrCoordinatorUnavailable so
+// callers can back off and retry rather than dial a dead address.
+func CoordinatorAddress(ctx context.Context, locator LockReader) (string, error) {
+	address, err := managerLockAddress(ctx, locator, svcCoordinator)
+	if errors.Is(err, errServiceNotAdvertised) {
+		return "", ErrCoordinatorUnavailable
+	}
+	return address, err
+}
+
+// managerLockAddress reads the current manager lock znode and returns the
+// address advertised for service. ZooKeeper transport failures are
+// surfaced as-is; every "nothing usable is published" case collapses to
+// errServiceNotAdvertised.
+func managerLockAddress(ctx context.Context, locator LockReader, service string) (string, error) {
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
@@ -48,18 +108,18 @@ func ManagerAddress(ctx context.Context, locator interface {
 	children, err := locator.Children(ctx, lockPath)
 	if err != nil {
 		if errors.Is(err, gozk.ErrNoNode) {
-			return "", ErrManagerUnavailable
+			return "", errServiceNotAdvertised
 		}
 		return "", fmt.Errorf("list manager locks %s: %w", lockPath, err)
 	}
 	lockNode := firstLockNode(children)
 	if lockNode == "" {
-		return "", ErrManagerUnavailable
+		return "", errServiceNotAdvertised
 	}
 	data, err := locator.GetRaw(ctx, path.Join(lockPath, lockNode))
 	if err != nil {
 		if errors.Is(err, gozk.ErrNoNode) {
-			return "", ErrManagerUnavailable
+			return "", errServiceNotAdvertised
 		}
 		return "", fmt.Errorf("get manager lock %s: %w", lockPath, err)
 	}
@@ -68,24 +128,20 @@ func ManagerAddress(ctx context.Context, locator interface {
 		return "", fmt.Errorf("decode manager lock %s: %w", lockPath, err)
 	}
 	for _, descriptor := range lock.Descriptors {
-		if descriptor.Service != "MANAGER" {
+		if descriptor.Service != service {
 			continue
 		}
 		if descriptor.Address == "" || descriptor.Address == "0.0.0.0:0" {
-			return "", ErrManagerUnavailable
+			return "", errServiceNotAdvertised
 		}
 		return descriptor.Address, nil
 	}
-	return "", ErrManagerUnavailable
+	return "", errServiceNotAdvertised
 }
 
 // ClientServiceAddresses returns the live Accumulo 4 ClientService endpoints
 // advertised by tablet servers, scan servers, and compactors.
-func ClientServiceAddresses(ctx context.Context, locator interface {
-	InstancePath() string
-	GetRaw(context.Context, string) ([]byte, error)
-	Children(context.Context, string) ([]string, error)
-}) ([]string, error) {
+func ClientServiceAddresses(ctx context.Context, locator LockReader) ([]string, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
