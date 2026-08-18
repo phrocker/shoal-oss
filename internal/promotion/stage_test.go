@@ -1373,13 +1373,20 @@ func TestCheckNoStagingAliasesMemoizesRemoteCanonicalPaths(t *testing.T) {
 	const fileCount = 64
 
 	originalParseS3Path := parseS3Path
+	originalStagePathBackendKey := stagePathBackendKey
 	var parseCalls atomic.Int64
+	var backendKeyCalls atomic.Int64
 	parseS3Path = func(path string) (string, string, error) {
 		parseCalls.Add(1)
 		return s3.ParsePath(path)
 	}
+	stagePathBackendKey = func(backend shstorage.Backend) string {
+		backendKeyCalls.Add(1)
+		return canonicalPathBackendKey(backend)
+	}
 	t.Cleanup(func() {
 		parseS3Path = originalParseS3Path
+		stagePathBackendKey = originalStagePathBackendKey
 	})
 
 	flatNames := make(map[string]string, fileCount)
@@ -1395,6 +1402,9 @@ func TestCheckNoStagingAliasesMemoizesRemoteCanonicalPaths(t *testing.T) {
 	wantMax := int64(fileCount*2 + 1) // each source, each write target, and loadmap.json once
 	if got := parseCalls.Load(); got > wantMax {
 		t.Fatalf("parseS3Path called %d times, want <= %d cached canonicalizations", got, wantMax)
+	}
+	if got := backendKeyCalls.Load(); got > wantMax {
+		t.Fatalf("stagePathBackendKey called %d times, want <= %d precomputed backend identities", got, wantMax)
 	}
 }
 

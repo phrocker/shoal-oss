@@ -26,6 +26,7 @@ var (
 	parseGCSPath           = gcs.ParsePath
 	parseAzurePath         = azure.ParsePath
 	parseCanonicalHDFSPath = url.Parse
+	stagePathBackendKey    = canonicalPathBackendKey
 )
 
 // StageBulkDir copies every RFile referenced by manifest from src (the
@@ -164,7 +165,7 @@ func checkNoStagingAliases(src, dst storage.Backend, flatNames map[string]string
 	srcPaths := make([]stagePathRef, 0, len(flatNames))
 	targets := make([]stageWriteTarget, 0, len(flatNames)+1)
 	for srcPath, flatName := range flatNames {
-		srcPaths = append(srcPaths, stagePathRef{backend: src, path: srcPath})
+		srcPaths = append(srcPaths, newStagePathRef(src, srcPath))
 		targets = append(targets, stageWriteTarget{
 			name: flatName,
 			path: joinBulkPath(dst, bulkDir, flatName),
@@ -174,6 +175,10 @@ func checkNoStagingAliases(src, dst storage.Backend, flatNames map[string]string
 		name: bulkLoadMappingFile,
 		path: joinBulkPath(dst, bulkDir, bulkLoadMappingFile),
 	})
+	targetRefs := make([]stagePathRef, len(targets))
+	for i, target := range targets {
+		targetRefs[i] = newStagePathRef(dst, target.path)
+	}
 
 	cache := newPathIdentityCache(len(srcPaths) + len(targets))
 	for i := range srcPaths {
@@ -186,8 +191,8 @@ func checkNoStagingAliases(src, dst storage.Backend, flatNames map[string]string
 			}
 		}
 	}
-	for _, target := range targets {
-		targetRef := stagePathRef{backend: dst, path: target.path}
+	for i, target := range targets {
+		targetRef := targetRefs[i]
 		for _, srcPath := range srcPaths {
 			if pathsAlias(srcPath, targetRef, cache) {
 				return fmt.Errorf(
@@ -198,9 +203,9 @@ func checkNoStagingAliases(src, dst storage.Backend, flatNames map[string]string
 		}
 	}
 	for i := range targets {
-		left := stagePathRef{backend: dst, path: targets[i].path}
+		left := targetRefs[i]
 		for j := i + 1; j < len(targets); j++ {
-			right := stagePathRef{backend: dst, path: targets[j].path}
+			right := targetRefs[j]
 			if pathsAlias(left, right, cache) {
 				return fmt.Errorf(
 					"promotion: stage: write targets %s (%s) and %s (%s) resolve to the same location; refusing to write aliased staging outputs",
@@ -213,8 +218,9 @@ func checkNoStagingAliases(src, dst storage.Backend, flatNames map[string]string
 }
 
 type stagePathRef struct {
-	backend storage.Backend
-	path    string
+	backend    storage.Backend
+	backendKey string
+	path       string
 }
 
 type stageWriteTarget struct {
@@ -243,7 +249,7 @@ func dedupeStageSources(src storage.Backend, rfiles []engine.RFileExportFile) ([
 	cache := newPathIdentityCache(len(rfiles))
 	groups := make([]stageSourceAliasGroup, 0, len(rfiles))
 	for _, rf := range rfiles {
-		ref := stagePathRef{backend: src, path: rf.DestinationPath}
+		ref := newStagePathRef(src, rf.DestinationPath)
 		grouped := false
 		for i := range groups {
 			if sourceRefsAlias(ref, groups[i].reference, cache) {
@@ -332,16 +338,16 @@ func sourceRefsAlias(left, right stagePathRef, cache pathIdentityCache) bool {
 // same destination.
 func stagePathsAlias(srcPath, dstPath string) bool {
 	return pathsAlias(
-		stagePathRef{path: srcPath},
-		stagePathRef{path: dstPath},
+		newStagePathRef(nil, srcPath),
+		newStagePathRef(nil, dstPath),
 		newPathIdentityCache(0),
 	)
 }
 
 func stagePathsAliasOnBackends(src storage.Backend, srcPath string, dst storage.Backend, dstPath string) bool {
 	return pathsAlias(
-		stagePathRef{backend: src, path: srcPath},
-		stagePathRef{backend: dst, path: dstPath},
+		newStagePathRef(src, srcPath),
+		newStagePathRef(dst, dstPath),
 		newPathIdentityCache(0),
 	)
 }
@@ -359,7 +365,7 @@ func stagePathsAliasOnBackends(src storage.Backend, srcPath string, dst storage.
 type pathIdentityCache struct {
 	stats              map[string]os.FileInfo
 	resolvedLocalPaths map[string]string
-	publicationKeys    map[string]string
+	publicationPaths   map[string]localPublicationIdentity
 	canonicalPaths     map[canonicalPathCacheKey]canonicalPathIdentity
 }
 
@@ -367,7 +373,7 @@ func newPathIdentityCache(capacity int) pathIdentityCache {
 	return pathIdentityCache{
 		stats:              make(map[string]os.FileInfo, capacity),
 		resolvedLocalPaths: make(map[string]string, capacity),
-		publicationKeys:    make(map[string]string, capacity),
+		publicationPaths:   make(map[string]localPublicationIdentity, capacity),
 		canonicalPaths:     make(map[canonicalPathCacheKey]canonicalPathIdentity, capacity),
 	}
 }
@@ -409,12 +415,7 @@ func localStatCandidates(path string) []string {
 }
 
 func (c pathIdentityCache) publicationKey(path string) string {
-	if key, cached := c.publicationKeys[path]; cached {
-		return key
-	}
-	key := normalizeLocalPublicationPath(c.resolvedLocalPath(path))
-	c.publicationKeys[path] = key
-	return key
+	return c.publicationPath(path).normalizedKey
 }
 
 func (c pathIdentityCache) resolvedLocalPath(path string) string {
@@ -426,9 +427,22 @@ func (c pathIdentityCache) resolvedLocalPath(path string) string {
 	return resolved
 }
 
+func (c pathIdentityCache) publicationPath(path string) localPublicationIdentity {
+	if identity, cached := c.publicationPaths[path]; cached {
+		return identity
+	}
+	identity := buildLocalPublicationIdentity(c.resolvedLocalPath(path))
+	c.publicationPaths[path] = identity
+	return identity
+}
+
 func (c pathIdentityCache) canonicalPath(ref stagePathRef) (string, bool) {
+	backendKey := ref.backendKey
+	if backendKey == "" {
+		backendKey = stagePathBackendKey(unwrapBackend(ref.backend))
+	}
 	key := canonicalPathCacheKey{
-		backend: canonicalPathBackendKey(ref.backend),
+		backend: backendKey,
 		path:    ref.path,
 	}
 	if identity, cached := c.canonicalPaths[key]; cached {
@@ -451,6 +465,15 @@ func canonicalPathBackendKey(backend storage.Backend) string {
 	return fmt.Sprintf("%T:%#v", backend, backend)
 }
 
+func newStagePathRef(backend storage.Backend, path string) stagePathRef {
+	backend = unwrapBackend(backend)
+	return stagePathRef{
+		backend:    backend,
+		backendKey: stagePathBackendKey(backend),
+		path:       path,
+	}
+}
+
 // pathsAlias is StageBulkDir's alias detector, factored out so
 // checkNoStagingAliases's O(N^2) comparison can share one
 // pathIdentityCache across every call instead of stat'ing the same
@@ -463,9 +486,10 @@ func canonicalPathBackendKey(backend storage.Backend) string {
 // qualified vs scheme-less spellings compare equal. Local filesystem
 // paths compare a collision-safe publication key first (resolving
 // existing parent-prefix symlinks, dangling final symlink chains, and
-// conservative case/Unicode/trailing-dot-space equivalence), then fall
-// back to os.Stat + os.SameFile so existing symlink/hardlink aliases are
-// caught too.
+// conservative case/Unicode/trailing-dot-space equivalence plus Windows
+// DOS 8.3 literal-short-name ambiguity for not-yet-created targets),
+// then fall back to os.Stat + os.SameFile so existing symlink/hardlink
+// aliases are caught too.
 func pathsAlias(srcPath, dstPath stagePathRef, cache pathIdentityCache) bool {
 	srcCanonical, srcCanonicalOK := cache.canonicalPath(srcPath)
 	dstCanonical, dstCanonicalOK := cache.canonicalPath(dstPath)
@@ -496,12 +520,16 @@ func pathsAlias(srcPath, dstPath stagePathRef, cache pathIdentityCache) bool {
 }
 
 func localPathsLexicallyAlias(srcPath, dstPath string) bool {
-	return normalizeLocalPublicationPath(normalizeLocalPathForAlias(srcPath)) ==
-		normalizeLocalPublicationPath(normalizeLocalPathForAlias(dstPath))
+	left := buildLocalPublicationIdentity(normalizeLocalPathForAlias(srcPath))
+	right := buildLocalPublicationIdentity(normalizeLocalPathForAlias(dstPath))
+	return left.normalizedKey == right.normalizedKey || dos83PathAliases(left, right)
 }
 
 func localPublicationKeysAlias(srcPath, dstPath string, cache pathIdentityCache) bool {
-	return cache.publicationKey(srcPath) == cache.publicationKey(dstPath)
+	if cache.publicationKey(srcPath) == cache.publicationKey(dstPath) {
+		return true
+	}
+	return dos83PathAliases(cache.publicationPath(srcPath), cache.publicationPath(dstPath))
 }
 
 func resolveExistingLocalPathPrefixes(path string) string {

@@ -15,6 +15,20 @@ import (
 var windowsDrivePathRe = regexp.MustCompile(`^[A-Za-z]:(?:[\\/].*)?$`)
 var publicationCaseFold = cases.Fold()
 
+type localPublicationIdentity struct {
+	normalizedKey string
+	prefix        string
+	components    []localPublicationComponentIdentity
+}
+
+type localPublicationComponentIdentity struct {
+	normalized          string
+	dos83Prefix         string
+	dos83Ext            string
+	isDOS83Literal      bool
+	hasDOS83AliasFamily bool
+}
+
 func looksLikeWindowsDrivePath(path string) bool {
 	return windowsDrivePathRe.MatchString(path)
 }
@@ -97,4 +111,179 @@ func normalizeLocalPublicationComponent(component string) string {
 		component = strings.TrimRight(component, " .")
 	}
 	return publicationCaseFold.String(component)
+}
+
+func buildLocalPublicationIdentity(path string) localPublicationIdentity {
+	prefix, parts := splitLocalPath(path)
+	components := make([]localPublicationComponentIdentity, len(parts))
+	normalizedParts := make([]string, len(parts))
+	for i, part := range parts {
+		components[i] = buildLocalPublicationComponentIdentity(part)
+		normalizedParts[i] = components[i].normalized
+	}
+	normalizedPrefix := normalizeLocalPublicationPrefix(prefix)
+	return localPublicationIdentity{
+		normalizedKey: normalizedPrefix + strings.Join(normalizedParts, "/"),
+		prefix:        normalizedPrefix,
+		components:    components,
+	}
+}
+
+func normalizeLocalPublicationPrefix(prefix string) string {
+	prefix = strings.ReplaceAll(prefix, `\`, "/")
+	if prefix != "" && !strings.HasSuffix(prefix, "/") {
+		prefix += "/"
+	}
+	return prefix
+}
+
+func buildLocalPublicationComponentIdentity(component string) localPublicationComponentIdentity {
+	normalized := normalizeLocalPublicationComponent(component)
+	identity := localPublicationComponentIdentity{normalized: normalized}
+	if runtime.GOOS != "windows" {
+		return identity
+	}
+	if prefix, ext, ok := parseDOS83LiteralComponent(normalized); ok {
+		identity.dos83Prefix = prefix
+		identity.dos83Ext = ext
+		identity.isDOS83Literal = true
+		return identity
+	}
+	if prefix, ext, ok := dos83AliasFamilyComponent(normalized); ok {
+		identity.dos83Prefix = prefix
+		identity.dos83Ext = ext
+		identity.hasDOS83AliasFamily = true
+	}
+	return identity
+}
+
+// dos83PathAliases conservatively rejects Windows DOS 8.3 short-name
+// ambiguities for not-yet-created local paths. It intentionally catches
+// only literal short-name spellings (for example LONGFI~1.RF) against a
+// longer component that could generate that short-name family; two long
+// components sharing a six-character prefix are not treated as aliases
+// because NTFS assigns them distinct ~n ordinals rather than one path
+// truncating the other.
+func dos83PathAliases(left, right localPublicationIdentity) bool {
+	if runtime.GOOS != "windows" {
+		return false
+	}
+	if left.prefix != right.prefix || len(left.components) != len(right.components) {
+		return false
+	}
+	usedDOS83 := false
+	for i := range left.components {
+		if left.components[i].normalized == right.components[i].normalized {
+			continue
+		}
+		if !dos83ComponentsAlias(left.components[i], right.components[i]) {
+			return false
+		}
+		usedDOS83 = true
+	}
+	return usedDOS83
+}
+
+func dos83ComponentsAlias(left, right localPublicationComponentIdentity) bool {
+	return dos83LiteralMatchesFamily(left, right) || dos83LiteralMatchesFamily(right, left)
+}
+
+func dos83LiteralMatchesFamily(literal, family localPublicationComponentIdentity) bool {
+	return literal.isDOS83Literal &&
+		family.hasDOS83AliasFamily &&
+		literal.dos83Prefix == family.dos83Prefix &&
+		literal.dos83Ext == family.dos83Ext
+}
+
+func parseDOS83LiteralComponent(component string) (string, string, bool) {
+	stem, ext := splitDOS83Component(component)
+	tilde := strings.LastIndexByte(stem, '~')
+	if tilde <= 0 || tilde > 6 || tilde >= len(stem)-1 {
+		return "", "", false
+	}
+	prefix := stem[:tilde]
+	ordinal := stem[tilde+1:]
+	if !isDOS83Token(prefix, 1, 6) || strings.Contains(prefix, "~") {
+		return "", "", false
+	}
+	if ordinal[0] == '0' || !isASCIIUnsignedInteger(ordinal) {
+		return "", "", false
+	}
+	if !isDOS83Token(ext, 0, 3) {
+		return "", "", false
+	}
+	return prefix, ext, true
+}
+
+func dos83AliasFamilyComponent(component string) (string, string, bool) {
+	stem, ext := splitDOS83Component(component)
+	if isPlainDOS83Component(stem, ext) {
+		return "", "", false
+	}
+	prefix := sanitizeDOS83Token(stem)
+	if prefix == "" {
+		return "", "", false
+	}
+	if len(prefix) > 6 {
+		prefix = prefix[:6]
+	}
+	ext = sanitizeDOS83Token(ext)
+	if len(ext) > 3 {
+		ext = ext[:3]
+	}
+	return prefix, ext, true
+}
+
+func splitDOS83Component(component string) (string, string) {
+	lastDot := strings.LastIndexByte(component, '.')
+	if lastDot <= 0 {
+		return component, ""
+	}
+	return component[:lastDot], component[lastDot+1:]
+}
+
+func isPlainDOS83Component(stem, ext string) bool {
+	if strings.Contains(stem, ".") {
+		return false
+	}
+	return isDOS83Token(stem, 1, 8) && isDOS83Token(ext, 0, 3)
+}
+
+func isDOS83Token(token string, minLen, maxLen int) bool {
+	if len(token) < minLen || len(token) > maxLen {
+		return false
+	}
+	for i := 0; i < len(token); i++ {
+		if !isDOS83Char(token[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+func sanitizeDOS83Token(token string) string {
+	var builder strings.Builder
+	builder.Grow(len(token))
+	for i := 0; i < len(token); i++ {
+		if isDOS83Char(token[i]) {
+			builder.WriteByte(token[i])
+		}
+	}
+	return builder.String()
+}
+
+func isDOS83Char(b byte) bool {
+	return (b >= 'a' && b <= 'z') || (b >= '0' && b <= '9') || b == '_'
+}
+
+func isASCIIUnsignedInteger(value string) bool {
+	if value == "" {
+		return false
+	}
+	for i := 0; i < len(value); i++ {
+		if value[i] < '0' || value[i] > '9' {
+			return false
+		}
+	}
+	return true
 }

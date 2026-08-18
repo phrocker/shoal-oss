@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/phrocker/shoal/internal/engine"
 	"github.com/phrocker/shoal/internal/storage/local"
+	"golang.org/x/sys/windows"
 )
 
 func TestStagePathsAliasWindowsDrivePathReachesSameFile(t *testing.T) {
@@ -89,6 +91,42 @@ func TestLocalPathsLexicallyAliasTrailingDotsAndSpaces(t *testing.T) {
 				t.Fatalf("localPathsLexicallyAlias(%q, %q) = %v, want %v", tt.src, tt.dst, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestLocalPathsLexicallyAliasWindowsDOS83ShortNameAmbiguity(t *testing.T) {
+	tests := []struct {
+		name string
+		src  string
+		dst  string
+		want bool
+	}{
+		{name: "long name aliases literal dos short name", src: `C:\bulk\LongFilename.rf`, dst: `C:\bulk\LONGFI~1.RF`, want: true},
+		{name: "different ordinal still rejected conservatively", src: `C:\bulk\LongFilename.rf`, dst: `C:\bulk\LONGFI~9.RF`, want: true},
+		{name: "8dot3-compatible long name does not gain a dos alias family", src: `C:\bulk\PLAIN.RF`, dst: `C:\bulk\PLAIN~1.RF`, want: false},
+		{name: "different short-name prefix is distinct", src: `C:\bulk\LongFilename.rf`, dst: `C:\bulk\LONGFJ~1.RF`, want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := localPathsLexicallyAlias(tt.src, tt.dst); got != tt.want {
+				t.Fatalf("localPathsLexicallyAlias(%q, %q) = %v, want %v", tt.src, tt.dst, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestStagePathsAliasWindowsDOS83ShortNameReachesSameFile(t *testing.T) {
+	dir := t.TempDir()
+	longPath := filepath.Join(dir, "LongFilename.rf")
+	if err := os.WriteFile(longPath, []byte("data"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	shortPath := windowsShortPath(t, longPath)
+	if strings.EqualFold(shortPath, longPath) {
+		t.Skip("filesystem did not surface a distinct DOS 8.3 short name")
+	}
+	if !stagePathsAlias(shortPath, longPath) {
+		t.Fatalf("stagePathsAlias(%q, %q) = false, want true via local SameFile identity", shortPath, longPath)
 	}
 }
 
@@ -209,5 +247,89 @@ func TestStageBulkDirRejectsTrailingDotOrSpaceWriteTargetsBeforeCopying(t *testi
 				t.Fatalf("StageBulkDir with %s write-target alias = nil error, want error", tt.name)
 			}
 		})
+	}
+}
+
+func TestStageBulkDirRejectsWindowsDOS83AliasedAbsentWriteTargetsBeforeCopying(t *testing.T) {
+	src, manifest := memoryManifestFromBlobs(map[string][]byte{
+		"export/events/t-0000/LongFilename.rf": []byte("first"),
+		"export/events/t-0000/LONGFI~1.RF":     []byte("second"),
+	})
+	bulkDir := filepath.Join(t.TempDir(), "bulk")
+	if err := os.MkdirAll(bulkDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := StageBulkDir(context.Background(), src, manifest, local.New(), bulkDir); err == nil {
+		t.Fatal("StageBulkDir with absent Windows DOS 8.3-aliased write targets = nil error, want error")
+	}
+	for _, target := range []string{"LongFilename.rf", "LONGFI~1.RF", "loadmap.json"} {
+		if _, err := os.Stat(filepath.Join(bulkDir, target)); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("target %q exists after rejected DOS 8.3 absent-target stage: err=%v", target, err)
+		}
+	}
+}
+
+func TestStageBulkDirRejectsWindowsDOS83ExistingWriteTargetAliasBeforeCopying(t *testing.T) {
+	bulkDir := filepath.Join(t.TempDir(), "bulk")
+	if err := os.MkdirAll(bulkDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	longTarget := filepath.Join(bulkDir, "LongFilename.rf")
+	original := []byte("existing target bytes that must survive a rejected DOS 8.3 alias stage")
+	if err := os.WriteFile(longTarget, original, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	shortTarget := windowsShortPath(t, longTarget)
+	if strings.EqualFold(shortTarget, longTarget) {
+		t.Skip("filesystem did not surface a distinct DOS 8.3 short name")
+	}
+	shortBase := filepath.Base(shortTarget)
+
+	src, manifest := memoryManifestFromBlobs(map[string][]byte{
+		filepath.Join("export", "events", "t-0000", "LongFilename.rf"): []byte("first"),
+		filepath.Join("export", "events", "t-0000", shortBase):         []byte("second"),
+	})
+	if _, err := StageBulkDir(context.Background(), src, manifest, local.New(), bulkDir); err == nil {
+		t.Fatal("StageBulkDir with an existing DOS 8.3 write-target alias = nil error, want error")
+	}
+
+	got, err := os.ReadFile(longTarget)
+	if err != nil {
+		t.Fatalf("existing target missing after rejected DOS 8.3 alias stage: %v", err)
+	}
+	if string(got) != string(original) {
+		t.Fatalf("existing target corrupted by rejected DOS 8.3 alias stage: got %q, want %q", got, original)
+	}
+	gotShort, err := os.ReadFile(shortTarget)
+	if err != nil {
+		t.Fatalf("existing short-path alias missing after rejected stage: %v", err)
+	}
+	if string(gotShort) != string(original) {
+		t.Fatalf("existing short-path alias corrupted by rejected stage: got %q, want %q", gotShort, original)
+	}
+}
+
+func windowsShortPath(t *testing.T, path string) string {
+	t.Helper()
+
+	longPath, err := windows.UTF16PtrFromString(path)
+	if err != nil {
+		t.Fatalf("UTF16PtrFromString(%q): %v", path, err)
+	}
+	buf := make([]uint16, len(path)+32)
+	for {
+		n, err := windows.GetShortPathName(longPath, &buf[0], uint32(len(buf)))
+		if err != nil {
+			t.Skipf("GetShortPathName(%q): %v", path, err)
+		}
+		if n == 0 {
+			t.Skipf("GetShortPathName(%q) returned no short path", path)
+		}
+		if int(n) > len(buf) {
+			buf = make([]uint16, n)
+			continue
+		}
+		return windows.UTF16ToString(buf[:n])
 	}
 }
