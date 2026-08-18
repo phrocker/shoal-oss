@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -183,12 +184,21 @@ func (c *ownedConnector) finishCloseAfterTimeout(idle <-chan struct{}) {
 func (c *ownedConnector) finishClose() error {
 	var err error
 	if c.connector != nil {
-		err = errors.Join(err, c.connector.Close())
+		err = errors.Join(err, closeResource("connector", c.connector.Close))
 	}
 	if c.instance != nil {
-		err = errors.Join(err, c.instance.Close())
+		err = errors.Join(err, closeResource("instance", c.instance.Close))
 	}
 	return err
+}
+
+func closeResource(name string, close func() error) (err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("shoal: internal panic closing %s: %v", name, recovered)
+		}
+	}()
+	return close()
 }
 
 func (c *ownedConnector) ensureStateLocked() {

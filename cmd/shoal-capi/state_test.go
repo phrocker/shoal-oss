@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -343,6 +344,149 @@ func TestOwnedConnectorCloseBoundedIncludesInstanceClose(t *testing.T) {
 	}
 	if connectorCloses.Load() != 1 || instanceCloses.Load() != 1 {
 		t.Fatalf("close counts = connector:%d instance:%d, want 1/1",
+			connectorCloses.Load(), instanceCloses.Load())
+	}
+}
+
+func TestOwnedConnectorCloseRecoversResourcePanics(t *testing.T) {
+	tests := []struct {
+		name           string
+		connectorPanic bool
+		instancePanic  bool
+		wantErrors     []string
+	}{
+		{
+			name:           "connector panic",
+			connectorPanic: true,
+			wantErrors:     []string{"shoal: internal panic closing connector: connector exploded"},
+		},
+		{
+			name:          "instance panic",
+			instancePanic: true,
+			wantErrors:    []string{"shoal: internal panic closing instance: instance exploded"},
+		},
+		{
+			name:           "both panic",
+			connectorPanic: true,
+			instancePanic:  true,
+			wantErrors: []string{
+				"shoal: internal panic closing connector: connector exploded",
+				"shoal: internal panic closing instance: instance exploded",
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var connectorCloses atomic.Int32
+			var instanceCloses atomic.Int32
+			connector := newOwnedConnector(
+				&fakeConnectorAPI{close: func() error {
+					connectorCloses.Add(1)
+					if test.connectorPanic {
+						panic("connector exploded")
+					}
+					return nil
+				}},
+				fakeConnectorInstance{close: func() error {
+					instanceCloses.Add(1)
+					if test.instancePanic {
+						panic("instance exploded")
+					}
+					return nil
+				}},
+			)
+
+			err := connector.close()
+			if err == nil {
+				t.Fatal("close error = nil, want recovered panic")
+			}
+			for _, want := range test.wantErrors {
+				if !strings.Contains(err.Error(), want) {
+					t.Fatalf("close error = %q, want %q", err, want)
+				}
+			}
+			if connectorCloses.Load() != 1 || instanceCloses.Load() != 1 {
+				t.Fatalf("close counts = connector:%d instance:%d, want 1/1",
+					connectorCloses.Load(), instanceCloses.Load())
+			}
+
+			stickyErr := connector.close()
+			if stickyErr == nil || stickyErr.Error() != err.Error() {
+				t.Fatalf("repeated close error = %v, want sticky %v", stickyErr, err)
+			}
+			if connectorCloses.Load() != 1 || instanceCloses.Load() != 1 {
+				t.Fatalf("repeated close counts = connector:%d instance:%d, want 1/1",
+					connectorCloses.Load(), instanceCloses.Load())
+			}
+		})
+	}
+}
+
+func TestOwnedConnectorCloseBoundedRecoversBackgroundPanics(t *testing.T) {
+	connectorCloseStarted := make(chan struct{})
+	unblockConnectorClose := make(chan struct{})
+	backgroundCloseFinished := make(chan struct{})
+	var connectorCloses atomic.Int32
+	var instanceCloses atomic.Int32
+	connector := newOwnedConnector(
+		&fakeConnectorAPI{close: func() error {
+			connectorCloses.Add(1)
+			close(connectorCloseStarted)
+			<-unblockConnectorClose
+			panic("connector exploded")
+		}},
+		fakeConnectorInstance{close: func() error {
+			defer close(backgroundCloseFinished)
+			instanceCloses.Add(1)
+			panic("instance exploded")
+		}},
+	)
+	_, operationDone, err := connector.begin(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	closeReturned := make(chan error, 1)
+	go func() {
+		closeReturned <- connector.closeBounded(20 * time.Millisecond)
+	}()
+	select {
+	case err := <-closeReturned:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("closeBounded error = %v, want deadline exceeded", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("closeBounded remained blocked waiting for the active operation")
+	}
+	select {
+	case <-connectorCloseStarted:
+		t.Fatal("background close started before the active operation completed")
+	default:
+	}
+
+	operationDone()
+	select {
+	case <-connectorCloseStarted:
+	case <-time.After(time.Second):
+		t.Fatal("background connector close did not start")
+	}
+
+	close(unblockConnectorClose)
+	select {
+	case <-backgroundCloseFinished:
+	case <-time.After(time.Second):
+		t.Fatal("background close did not continue to the instance after connector panic")
+	}
+	if connectorCloses.Load() != 1 || instanceCloses.Load() != 1 {
+		t.Fatalf("background close counts = connector:%d instance:%d, want 1/1",
+			connectorCloses.Load(), instanceCloses.Load())
+	}
+	if err := connector.closeBounded(time.Second); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("repeated closeBounded error = %v, want sticky deadline", err)
+	}
+	if connectorCloses.Load() != 1 || instanceCloses.Load() != 1 {
+		t.Fatalf("repeated close counts = connector:%d instance:%d, want 1/1",
 			connectorCloses.Load(), instanceCloses.Load())
 	}
 }
