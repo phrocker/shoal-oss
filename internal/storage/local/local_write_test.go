@@ -151,6 +151,85 @@ func TestLocal_CreateReplacementPreservesExistingMode(t *testing.T) {
 	}
 }
 
+func TestLocal_ReplacementKeepsTargetVisibleUntilAtomicPublish(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "target")
+	if err := os.WriteFile(path, []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	w, err := New().Create(context.Background(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	localWriter := w.(*writer)
+	blockingOps := &blockingAtomicReplaceOps{
+		replacementOps: localWriter.ops,
+		entered:        make(chan struct{}),
+		release:        make(chan struct{}),
+	}
+	localWriter.ops = blockingOps
+	if _, err := w.Write([]byte("new")); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- w.Close() }()
+	<-blockingOps.entered
+	for range 100 {
+		got, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("observer saw target missing before publish: %v", err)
+		}
+		if string(got) != "old" {
+			t.Fatalf("observer saw %q before atomic publish, want old", got)
+		}
+	}
+	close(blockingOps.release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "new" {
+		t.Fatalf("target contents = %q, want new", got)
+	}
+}
+
+func TestLocal_AtomicReplaceFailureLeavesOldTargetIntact(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "target")
+	if err := os.WriteFile(path, []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	w, err := New().Create(context.Background(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	localWriter := w.(*writer)
+	replaceErr := errors.New("injected atomic replace failure")
+	localWriter.ops = atomicReplaceErrorOps{replacementOps: localWriter.ops, err: replaceErr}
+	if _, err := w.Write([]byte("new")); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); !errors.Is(err, replaceErr) {
+		t.Fatalf("Close error = %v, want %v", err, replaceErr)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "old" {
+		t.Fatalf("target contents = %q, want old", got)
+	}
+	if err := w.(storage.Aborter).Abort(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestLocal_CreateRejectsDirectoryTarget(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "target")
@@ -191,11 +270,30 @@ func TestLocal_BackupRemovalFailureRollsBackReplacement(t *testing.T) {
 	}
 	localWriter := w.(*writer)
 	removeErr := errors.New("injected backup removal failure")
-	localWriter.ops = failBackupRemoveOps{replacementOps: localWriter.ops, err: removeErr}
+	rollbackOps := &blockingRollbackOps{
+		replacementOps: localWriter.ops,
+		err:            removeErr,
+		entered:        make(chan struct{}),
+		release:        make(chan struct{}),
+	}
+	localWriter.ops = rollbackOps
 	if _, err := w.Write([]byte("new")); err != nil {
 		t.Fatal(err)
 	}
-	err = w.Close()
+	done := make(chan error, 1)
+	go func() { done <- w.Close() }()
+	<-rollbackOps.entered
+	for range 100 {
+		got, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("observer saw target missing before rollback: %v", err)
+		}
+		if string(got) != "new" {
+			t.Fatalf("observer saw %q before atomic rollback, want new", got)
+		}
+	}
+	close(rollbackOps.release)
+	err = <-done
 	if !errors.Is(err, removeErr) {
 		t.Fatalf("Close error = %v, want %v", err, removeErr)
 	}
@@ -221,6 +319,39 @@ func TestLocal_BackupRemovalFailureRollsBackReplacement(t *testing.T) {
 		t.Fatal(err)
 	} else if len(matches) != 0 {
 		t.Fatalf("replacement artifacts remain: %v", matches)
+	}
+}
+
+func TestPlatformAtomicReplaceAndRestore(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "target")
+	temp := filepath.Join(dir, "temp")
+	backup := filepath.Join(dir, "backup")
+	if err := os.WriteFile(target, []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(temp, []byte("new"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	ops := osReplacementOps{}
+	if err := ops.AtomicReplace(temp, target, backup, true); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.ReadFile(target); err != nil || string(got) != "new" {
+		t.Fatalf("published target = %q, %v; want new", got, err)
+	}
+	if got, err := os.ReadFile(backup); err != nil || string(got) != "old" {
+		t.Fatalf("backup = %q, %v; want old", got, err)
+	}
+	if err := ops.AtomicRestore(target, backup); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.ReadFile(target); err != nil || string(got) != "old" {
+		t.Fatalf("restored target = %q, %v; want old", got, err)
+	}
+	if _, err := os.Stat(backup); !os.IsNotExist(err) {
+		t.Fatalf("backup remains after restore: %v", err)
 	}
 }
 
@@ -280,14 +411,43 @@ func TestLocal_AbortAfterFailedCloseRemovesTemp(t *testing.T) {
 	}
 }
 
-type failBackupRemoveOps struct {
+type blockingAtomicReplaceOps struct {
+	replacementOps
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (o *blockingAtomicReplaceOps) AtomicReplace(temp, target, backup string, hadOld bool) error {
+	close(o.entered)
+	<-o.release
+	return o.replacementOps.AtomicReplace(temp, target, backup, hadOld)
+}
+
+type atomicReplaceErrorOps struct {
 	replacementOps
 	err error
 }
 
-func (o failBackupRemoveOps) Remove(name string) error {
+func (o atomicReplaceErrorOps) AtomicReplace(string, string, string, bool) error {
+	return o.err
+}
+
+type blockingRollbackOps struct {
+	replacementOps
+	err     error
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (o *blockingRollbackOps) Remove(name string) error {
 	if strings.Contains(name, ".shoal-backup-") {
 		return o.err
 	}
 	return o.replacementOps.Remove(name)
+}
+
+func (o *blockingRollbackOps) AtomicRestore(target, backup string) error {
+	close(o.entered)
+	<-o.release
+	return o.replacementOps.AtomicRestore(target, backup)
 }

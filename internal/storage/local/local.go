@@ -43,10 +43,11 @@ func (b *Backend) Open(_ context.Context, path string) (storage.File, error) {
 }
 
 // Create opens a temporary sibling file for writing and commits it into path
-// on Close. Existing regular-file permissions are preserved; new files use
-// 0644 subject to the process umask. Parent directories are created with 0755
-// if they don't already exist — matches "mkdir -p" behavior so callers don't
-// have to pre-create the path tree.
+// on Close without first removing or moving an existing target. Existing
+// regular-file permissions are preserved; new files use 0644 subject to the
+// process umask. Parent directories are created with 0755 if they don't
+// already exist — matches "mkdir -p" behavior so callers don't have to
+// pre-create the path tree.
 func (b *Backend) Create(_ context.Context, path string) (storage.Writer, error) {
 	if dir := filepath.Dir(path); dir != "" && dir != "." {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -135,14 +136,14 @@ const (
 	replacementStaged replacementState = iota
 	replacementPublished
 	replacementCommitted
-	replacementUnabortable
 )
 
 type replacementOps interface {
 	Lstat(string) (os.FileInfo, error)
 	Chmod(string, os.FileMode) error
-	Rename(string, string) error
 	Remove(string) error
+	AtomicReplace(temp, target, backup string, hadOld bool) error
+	AtomicRestore(target, backup string) error
 }
 
 type osReplacementOps struct{}
@@ -151,8 +152,13 @@ func (osReplacementOps) Lstat(name string) (os.FileInfo, error) { return os.Lsta
 func (osReplacementOps) Chmod(name string, mode os.FileMode) error {
 	return os.Chmod(name, mode)
 }
-func (osReplacementOps) Rename(oldPath, newPath string) error { return os.Rename(oldPath, newPath) }
-func (osReplacementOps) Remove(name string) error             { return os.Remove(name) }
+func (osReplacementOps) Remove(name string) error { return os.Remove(name) }
+func (osReplacementOps) AtomicReplace(temp, target, backup string, hadOld bool) error {
+	return platformAtomicReplace(temp, target, backup, hadOld)
+}
+func (osReplacementOps) AtomicRestore(target, backup string) error {
+	return platformAtomicRestore(target, backup)
+}
 
 func replacementTargetMode(ops replacementOps, target string) (os.FileMode, bool, error) {
 	info, err := ops.Lstat(target)
@@ -208,22 +214,14 @@ func (w *writer) commitReplacement() error {
 	}
 
 	backup := w.target + ".shoal-backup-" + uuid.NewString()
-	hadOld := true
-	if err := w.ops.Rename(w.target, backup); err != nil {
-		if !errors.Is(err, fs.ErrNotExist) {
-			return fmt.Errorf("local: preserve existing file %s: %w", w.target, err)
-		}
-		hadOld = false
-	}
-
-	if err := w.ops.Rename(w.temp, w.target); err != nil {
+	hadOld := preserveMode
+	if err := w.ops.AtomicReplace(w.temp, w.target, backup, hadOld); err != nil {
 		publishErr := fmt.Errorf("local: publish %s: %w", w.target, err)
 		if hadOld {
-			if restoreErr := w.ops.Rename(backup, w.target); restoreErr != nil {
-				w.state = replacementUnabortable
+			if cleanupErr := w.ops.Remove(backup); cleanupErr != nil && !errors.Is(cleanupErr, fs.ErrNotExist) {
 				publishErr = errors.Join(
 					publishErr,
-					fmt.Errorf("local: restore existing file %s from %s: %w", w.target, backup, restoreErr),
+					fmt.Errorf("local: remove unused replacement backup %s: %w", backup, cleanupErr),
 				)
 			}
 		}
@@ -244,20 +242,9 @@ func (w *writer) commitReplacement() error {
 }
 
 func (w *writer) rollbackPublishedReplacement(backup string) error {
-	if err := w.ops.Rename(w.target, w.temp); err != nil {
-		return fmt.Errorf("local: roll back published file %s: %w", w.target, err)
-	}
-	if err := w.ops.Rename(backup, w.target); err != nil {
-		restoreErr := fmt.Errorf("local: restore existing file %s from %s: %w", w.target, backup, err)
-		if republishErr := w.ops.Rename(w.temp, w.target); republishErr != nil {
-			w.state = replacementUnabortable
-			return errors.Join(
-				restoreErr,
-				fmt.Errorf("local: restore published file %s after rollback failure: %w", w.target, republishErr),
-			)
-		}
+	if err := w.ops.AtomicRestore(w.target, backup); err != nil {
 		w.state = replacementPublished
-		return restoreErr
+		return fmt.Errorf("local: atomically restore existing file %s from %s: %w", w.target, backup, err)
 	}
 	w.state = replacementStaged
 	return nil
