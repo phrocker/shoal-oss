@@ -46,9 +46,17 @@ type Options struct {
 // destination never writes any files or loadmap.json to dst before the
 // call fails.
 //
-// Promote does not itself retry on failure; callers wanting resumable
-// promotion can safely call Promote again with the same arguments (staging
-// is idempotent — see StageBulkDir) once the underlying cause is resolved.
+// Promote does not itself retry on failure, and retry safety differs by
+// which step failed. A failure in validation or StageBulkDir (before
+// BulkImport is ever called) is always safe to retry: staging is
+// deterministic and copy-based, so calling Promote again with the same
+// arguments reproduces the same staged bytes and loadmap.json. Once
+// BulkImport has been invoked, a blind retry is not always safe: FATE
+// submission has no built-in dedup/idempotency (see docs/promotion.md
+// §5), so an ambiguous failure there — for example a timeout after the
+// manager received the request but before the caller observed a
+// response — leaves the caller unable to tell whether the bulk import
+// already happened, and resubmitting risks a duplicate import.
 func Promote(
 	ctx context.Context,
 	src storage.Backend,

@@ -2,11 +2,16 @@ package promotion
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/phrocker/shoal/accumulo"
 	"github.com/phrocker/shoal/internal/engine"
+	"github.com/phrocker/shoal/internal/storage/local"
 	"github.com/phrocker/shoal/internal/storage/memory"
 )
 
@@ -229,5 +234,76 @@ func TestStageBulkDirRejectsSplitManifestBeforeCopying(t *testing.T) {
 	}
 	if got := dst.Keys(); len(got) != 0 {
 		t.Fatalf("StageBulkDir wrote %v on split-manifest rejection, want no partial writes", got)
+	}
+}
+
+// TestStageBulkDirRejectsInPlaceBulkDirBeforeCopying uses the real local
+// filesystem backend (not memory.Backend, which publishes writes
+// atomically on Close and so cannot reproduce this hazard) to prove
+// StageBulkDir refuses to stage into a bulkDir that aliases the source
+// RFile's own path, and — the part that actually matters — that the
+// source file on disk survives the rejected call untouched. Without the
+// guard, storage.Copy would call local.Backend.Create(dstPath), which
+// opens the aliased file with O_TRUNC and destroys it before the copy
+// loop ever reads from the (separately opened) source handle.
+func TestStageBulkDirRejectsInPlaceBulkDirBeforeCopying(t *testing.T) {
+	tabletDir := filepath.Join(t.TempDir(), "export", "events", "t-0000")
+	if err := os.MkdirAll(tabletDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	srcPath := filepath.Join(tabletDir, "F0001.rf")
+	content := []byte("original rfile bytes that must survive a rejected in-place stage")
+	if err := os.WriteFile(srcPath, content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(content)
+
+	manifest := &engine.RFileExportManifest{
+		Version:     engine.RFileExportManifestVersion,
+		SourceTable: "events",
+		Tablets:     []engine.RFileExportTablet{{Index: 0}},
+		RFiles: []engine.RFileExportFile{
+			{TabletIndex: 0, DestinationPath: srcPath, Size: int64(len(content)), SHA256: hex.EncodeToString(sum[:])},
+		},
+	}
+
+	be := local.New()
+	ctx := context.Background()
+	// bulkDir is the export's own tablet directory: flattening F0001.rf
+	// into it resolves to the exact same path the manifest exports from.
+	if _, err := StageBulkDir(ctx, be, manifest, be, tabletDir); err == nil {
+		t.Fatal("StageBulkDir with bulkDir aliasing the source tablet dir = nil error, want error")
+	}
+
+	got, err := os.ReadFile(srcPath)
+	if err != nil {
+		t.Fatalf("source file missing after rejected in-place stage: %v", err)
+	}
+	if string(got) != string(content) {
+		t.Fatalf("source file corrupted by rejected in-place stage: got %d bytes, want %d bytes intact", len(got), len(content))
+	}
+}
+
+func TestStagePathsAlias(t *testing.T) {
+	tests := []struct {
+		name string
+		src  string
+		dst  string
+		want bool
+	}{
+		{name: "identical local paths", src: `C:\data\t-0000\F0001.rf`, dst: `C:\data\t-0000\F0001.rf`, want: true},
+		{name: "local paths differing only by separator style", src: `/data/t-0000/F0001.rf`, dst: `/data/t-0000//F0001.rf`, want: true},
+		{name: "distinct local paths", src: `/data/t-0000/F0001.rf`, dst: `/bulk/events-1/F0001.rf`, want: false},
+		{name: "identical relative paths", src: "export/events/t-0000/F0001.rf", dst: "export/events/t-0000/F0001.rf", want: true},
+		{name: "identical url paths", src: "hdfs://nn/export/t-0000/F0001.rf", dst: "hdfs://nn/export/t-0000/F0001.rf", want: true},
+		{name: "url paths differing only by trailing slash", src: "hdfs://nn/export/t-0000/F0001.rf", dst: "hdfs://nn/export/t-0000/F0001.rf/", want: true},
+		{name: "distinct url paths", src: "hdfs://nn/export/t-0000/F0001.rf", dst: "hdfs://nn/bulk/events-1/F0001.rf", want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := stagePathsAlias(tt.src, tt.dst); got != tt.want {
+				t.Fatalf("stagePathsAlias(%q, %q) = %v, want %v", tt.src, tt.dst, got, tt.want)
+			}
+		})
 	}
 }

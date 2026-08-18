@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"strings"
 
 	"github.com/phrocker/shoal/internal/engine"
 	"github.com/phrocker/shoal/internal/storage"
@@ -40,6 +41,15 @@ import (
 // truncated, corrupted, or stale export manifest fails fast here rather
 // than silently staging incomplete or mismatched data for Accumulo to bulk
 // import.
+//
+// Each destination path is also checked against the source path it would
+// be copied from: if bulkDir happens to alias the RFile's own source
+// location (e.g. bulkDir is set to the export's own tablet directory),
+// copying would truncate the source before it's read (storage.Copy opens
+// the destination for writing, which truncates in place on backends like
+// local, before streaming the source's bytes) and silently "succeed" with
+// zero bytes copied. StageBulkDir rejects that case up front rather than
+// destroying the source export.
 func StageBulkDir(
 	ctx context.Context,
 	src storage.Backend,
@@ -74,6 +84,12 @@ func StageBulkDir(
 		}
 		staged[rf.DestinationPath] = true
 		dstPath := joinBulkPath(bulkDir, flatNames[rf.DestinationPath])
+		if stagePathsAlias(rf.DestinationPath, dstPath) {
+			return nil, fmt.Errorf(
+				"promotion: stage %s: bulk directory %s resolves to the same location as the source file; refusing to copy in place",
+				rf.DestinationPath, bulkDir,
+			)
+		}
 		if _, err := storage.Copy(ctx, src, rf.DestinationPath, dst, dstPath); err != nil {
 			return nil, fmt.Errorf("promotion: stage %s: %w", rf.DestinationPath, err)
 		}
@@ -82,6 +98,23 @@ func StageBulkDir(
 		return nil, err
 	}
 	return mapping, nil
+}
+
+// stagePathsAlias reports whether srcPath (opened for reading on src) and
+// dstPath (opened for writing on dst, which truncates in place on
+// backends such as local) resolve to the same physical location. src and
+// dst are not guaranteed comparable (e.g. local.Backend is a stateless
+// zero-field struct, so two independently constructed instances are
+// indistinguishable by identity even when they really are "the same
+// backend"), so this intentionally compares path strings only: a false
+// positive — rejecting a harmless coincidental collision between two
+// genuinely different backends — is far cheaper than a false negative
+// that silently destroys the source export.
+func stagePathsAlias(srcPath, dstPath string) bool {
+	if strings.Contains(srcPath, "://") || strings.Contains(dstPath, "://") {
+		return strings.TrimRight(srcPath, `/\`) == strings.TrimRight(dstPath, `/\`)
+	}
+	return filepath.Clean(srcPath) == filepath.Clean(dstPath)
 }
 
 // flattenNames validates that every RFile's basename is unique once

@@ -147,7 +147,11 @@ RFileExportManifest (existing)  →  promotion.BuildLoadMapping
   invalid destinations and rejected split manifests never leave a
   half-staged directory. It also verifies every referenced RFile against
   the manifest's recorded size/SHA256 (`engine.VerifyRFileExport`) before
-  copying.
+  copying, and rejects any RFile whose destination path would alias its
+  own source path (`bulkDir` coinciding with the export's own tablet
+  directory) before copying it — `storage.Copy` truncates the
+  destination for writing before streaming the source, so an aliased
+  copy would otherwise destroy the source and report a false success.
 - `internal/promotion.Promote` — composes `StageBulkDir` with a
   `BulkImporter` (satisfied by `*accumulo.Connector`) to submit the FATE
   call. Submits nothing when the derived mapping is empty (nothing to
@@ -174,7 +178,16 @@ Mapped against #70's five acceptance criteria:
    and `bulkDir` safely reproduces the same bytes. A persistent I/O failure
    partway through copying *multiple* files can still leave a partially
    staged bulk directory, but retrying the same call completes it without
-   manual repair.
+   manual repair. That guarantee covers staging only: once
+   `Promote` has called `BulkImporter.BulkImport`, retry safety ends,
+   because `TABLE_BULK_IMPORT2` FATE submission has no dedup/idempotency
+   of its own. An ambiguous failure at or after that call (e.g. a
+   timeout after the manager received the request but before the client
+   observed a response) leaves the caller unable to tell whether the
+   import already happened, so blindly calling `Promote` again in that
+   window risks a duplicate bulk import. Closing that gap needs a
+   promotion-state or idempotency-token API this slice does not yet
+   have (see item 4 below).
 3. **"split changes and partial uploads recover without manual metadata
    repair"** — not implemented for split-bearing exports, because those
    manifests are rejected before submission. A future rewrite or
