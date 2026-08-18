@@ -16,6 +16,13 @@ type Namespace struct {
 	ID   string
 }
 
+// VersionedProperties is an Accumulo property snapshot and its persistent
+// property-store version.
+type VersionedProperties struct {
+	Version    int64
+	Properties map[string]string
+}
+
 // Table is an Accumulo table identity.
 type Table struct {
 	Name string
@@ -54,6 +61,7 @@ type tableNameResolver interface {
 	ResolveID(context.Context, string) (string, error)
 	ResolveName(context.Context, string) (string, error)
 	List(context.Context) (map[string]string, error)
+	ListNamespace(context.Context, string) (map[string]string, error)
 	Invalidate()
 }
 

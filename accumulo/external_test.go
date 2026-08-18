@@ -59,6 +59,35 @@ func TestPublicDiscoveryAPICompiles(t *testing.T) {
 	}
 }
 
+func TestPublicNamespaceAdministrationAPICompiles(t *testing.T) {
+	instance, _ := accumulo.NewStaticInstance("accumulo", "uuid-1")
+	credentials, _ := accumulo.PasswordCredentials("root", []byte("secret"))
+	connector, err := accumulo.NewConnector(instance, credentials, accumulo.ConnectorOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connector.Close()
+
+	ctx := context.Background()
+	_ = connector.CreateNamespace(ctx, "analytics")
+	_ = connector.DeleteNamespace(ctx, "analytics")
+	_ = connector.RenameNamespace(ctx, "analytics", "reporting")
+	_ = connector.SetNamespaceProperty(ctx, "analytics", "table.file.max", "15")
+	_ = connector.RemoveNamespaceProperty(ctx, "analytics", "table.file.max")
+	_, _ = connector.EffectiveNamespaceProperties(ctx, "analytics")
+	_, _ = connector.NamespaceProperties(ctx, "analytics")
+	versioned, _ := connector.VersionedNamespaceProperties(ctx, "analytics")
+	_ = versioned.Version
+	_ = versioned.Properties
+
+	_ = accumulo.ErrNamespaceExists
+	_ = accumulo.ErrNamespaceNotFound
+	_ = accumulo.ErrNamespaceNotEmpty
+	_ = accumulo.ErrInvalidNamespaceName
+	_ = accumulo.ErrInvalidProperty
+	var _ accumulo.VersionedProperties
+}
+
 func TestPublicScannerAPICompiles(t *testing.T) {
 	instance, _ := accumulo.NewStaticInstance("accumulo", "uuid-1")
 	credentials, _ := accumulo.PasswordCredentials("root", []byte("secret"))
