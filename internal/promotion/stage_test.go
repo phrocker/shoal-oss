@@ -547,3 +547,137 @@ func TestPathIdentityCacheMemoizesStatResults(t *testing.T) {
 		}
 	})
 }
+
+// TestStageBulkDirRejectsLoadMappingAliasBeforeCopying proves the
+// preflight also protects bulkDir's own loadmap.json write target, not
+// just the flattened RFile destinations. Here bulkDir/loadmap.json
+// (created before StageBulkDir runs) is a symlink to the sole RFile's
+// source: without including the load-mapping path in the checked target
+// set, StageBulkDir would successfully copy the RFile, then destroy its
+// own just-copied source when WriteLoadMapping opens the symlinked
+// loadmap.json path for writing (WriteLoadMapping truncates exactly like
+// storage.Copy does, and it runs after every RFile copy, so this would
+// corrupt a source the rest of the stage already treated as verified and
+// safely staged).
+func TestStageBulkDirRejectsLoadMappingAliasBeforeCopying(t *testing.T) {
+	root := t.TempDir()
+	exportDir := filepath.Join(root, "export")
+	if err := os.MkdirAll(exportDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	srcPath := filepath.Join(exportDir, "F0001.rf")
+	content := []byte("rfile bytes that must survive a rejected stage")
+	if err := os.WriteFile(srcPath, content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	bulkDir := filepath.Join(root, "bulk")
+	if err := os.MkdirAll(bulkDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// bulkDir/loadmap.json is a symlink to the RFile's own source.
+	loadMapPath := filepath.Join(bulkDir, "loadmap.json")
+	if err := os.Symlink(srcPath, loadMapPath); err != nil {
+		t.Skipf("symlink not supported in this environment: %v", err)
+	}
+
+	sum := sha256.Sum256(content)
+	manifest := &engine.RFileExportManifest{
+		Version:     engine.RFileExportManifestVersion,
+		SourceTable: "events",
+		Tablets:     []engine.RFileExportTablet{{Index: 0}},
+		RFiles: []engine.RFileExportFile{
+			{TabletIndex: 0, DestinationPath: srcPath, Size: int64(len(content)), SHA256: hex.EncodeToString(sum[:])},
+		},
+	}
+
+	be := local.New()
+	ctx := context.Background()
+	if _, err := StageBulkDir(ctx, be, manifest, be, bulkDir); err == nil {
+		t.Fatal("StageBulkDir with loadmap.json aliasing the sole RFile's source = nil error, want error")
+	}
+
+	got, err := os.ReadFile(srcPath)
+	if err != nil {
+		t.Fatalf("source file missing after rejected stage: %v", err)
+	}
+	if string(got) != string(content) {
+		t.Fatalf("source file corrupted by rejected stage: got %q, want %q", got, content)
+	}
+}
+
+// TestStageBulkDirRejectsHardLinkedWriteTargetsBeforeCopying proves the
+// preflight also catches two different flattened destinations that are
+// hard-linked to each other, even though neither aliases any manifest
+// source. Here bulkDir/A.rf and bulkDir/B.rf (created before StageBulkDir
+// runs) are hard-linked to the same physical file: without a
+// target-vs-target check, both individually pass the target-vs-source
+// check (A's and B's sources are genuinely distinct files), so copying A
+// then B would silently overwrite A's just-staged bytes with B's, while
+// the load mapping still records both names as independent files with
+// independent sizes.
+func TestStageBulkDirRejectsHardLinkedWriteTargetsBeforeCopying(t *testing.T) {
+	root := t.TempDir()
+	exportDir := filepath.Join(root, "export")
+	if err := os.MkdirAll(exportDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	aPath := filepath.Join(exportDir, "A.rf")
+	bPath := filepath.Join(exportDir, "B.rf")
+	aContent := []byte("A file bytes")
+	bContent := []byte("B file bytes that must survive a rejected stage")
+	if err := os.WriteFile(aPath, aContent, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(bPath, bContent, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	bulkDir := filepath.Join(root, "bulk")
+	if err := os.MkdirAll(bulkDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// bulkDir/A.rf and bulkDir/B.rf pre-exist, hard-linked to the same
+	// physical file -- distinct names, one underlying file.
+	aDstPath := filepath.Join(bulkDir, "A.rf")
+	bDstPath := filepath.Join(bulkDir, "B.rf")
+	if err := os.WriteFile(aDstPath, []byte("stale placeholder"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(aDstPath, bDstPath); err != nil {
+		t.Skipf("hard links not supported in this environment: %v", err)
+	}
+
+	aSum := sha256.Sum256(aContent)
+	bSum := sha256.Sum256(bContent)
+	manifest := &engine.RFileExportManifest{
+		Version:     engine.RFileExportManifestVersion,
+		SourceTable: "events",
+		Tablets:     []engine.RFileExportTablet{{Index: 0}},
+		RFiles: []engine.RFileExportFile{
+			{TabletIndex: 0, DestinationPath: aPath, Size: int64(len(aContent)), SHA256: hex.EncodeToString(aSum[:])},
+			{TabletIndex: 0, DestinationPath: bPath, Size: int64(len(bContent)), SHA256: hex.EncodeToString(bSum[:])},
+		},
+	}
+
+	be := local.New()
+	ctx := context.Background()
+	if _, err := StageBulkDir(ctx, be, manifest, be, bulkDir); err == nil {
+		t.Fatal("StageBulkDir with two hard-linked write targets = nil error, want error")
+	}
+
+	gotA, err := os.ReadFile(aPath)
+	if err != nil {
+		t.Fatalf("source file A missing after rejected stage: %v", err)
+	}
+	if string(gotA) != string(aContent) {
+		t.Fatalf("source file A corrupted by rejected stage: got %q, want %q", gotA, aContent)
+	}
+	gotB, err := os.ReadFile(bPath)
+	if err != nil {
+		t.Fatalf("source file B missing after rejected stage: %v", err)
+	}
+	if string(gotB) != string(bContent) {
+		t.Fatalf("source file B corrupted by rejected stage: got %q, want %q", gotB, bContent)
+	}
+}

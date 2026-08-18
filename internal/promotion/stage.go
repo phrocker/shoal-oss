@@ -105,36 +105,62 @@ func StageBulkDir(
 	return mapping, nil
 }
 
-// checkNoStagingAliases rejects the whole stage before any copy starts if
-// any computed destination path (bulkDir + a flattened name from
-// flatNames) resolves to the same physical location as *any* unique
-// source path in flatNames — not only the source it's paired with.
-// Checking only the 1:1 pairing would miss a destination that aliases a
+// checkNoStagingAliases rejects the whole stage before any copy or the
+// load-mapping write starts if any write target StageBulkDir will open on
+// dst — every flattened RFile destination path, *and* bulkDir's own
+// loadmap.json (WriteLoadMapping truncates it exactly like storage.Copy
+// truncates an RFile destination, but it runs after every RFile copy, so
+// an aliased loadmap.json would destroy an already-staged source) —
+// resolves to the same physical location as *any* unique manifest source
+// path, or as any *other* write target. Checking only "does this RFile's
+// destination alias its own source" would miss a destination aliasing a
 // *different* manifest entry's source (for example via a symlink/hard
 // link), which would silently truncate that other file before it's ever
-// copied.
+// copied; checking only target-vs-source would separately miss two
+// distinct write targets (e.g. two RFiles' flattened basenames) that are
+// hard-linked to *each other* — individually harmless against every
+// source, but the second copy would silently overwrite the first while
+// the load mapping still lists both names as independent files.
 //
-// The all-pairs comparison is O(N^2) in the number of unique source
-// paths, but the underlying os.Stat calls are cached in one
-// pathIdentityCache shared across the whole comparison (O(N) stats: each
-// unique source path and each computed destination path is stat'd at
-// most once), rather than re-stat'ing the same handful of paths on every
-// iteration. Manifests are expected to hold at most a few thousand
-// RFiles per single-tablet export, so an O(N^2) in-memory comparison
-// over already-cached FileInfo values is not a practical concern.
+// The all-pairs comparison is O(N^2) in the number of write targets, but
+// the underlying os.Stat calls are cached in one pathIdentityCache shared
+// across the whole comparison (O(N) stats: each unique source path and
+// each write target is stat'd at most once), rather than re-stat'ing the
+// same handful of paths on every iteration. Manifests are expected to
+// hold at most a few thousand RFiles per single-tablet export, so an
+// O(N^2) in-memory comparison over already-cached FileInfo values is not
+// a practical concern.
 func checkNoStagingAliases(flatNames map[string]string, bulkDir string) error {
 	srcPaths := make([]string, 0, len(flatNames))
 	for srcPath := range flatNames {
 		srcPaths = append(srcPaths, srcPath)
 	}
-	cache := make(pathIdentityCache, 2*len(srcPaths))
+
+	// Every path StageBulkDir will open for writing: one per unique
+	// flattened RFile destination, plus the load mapping itself.
+	targets := make([]string, 0, len(srcPaths)+1)
 	for _, srcPath := range srcPaths {
-		dstPath := joinBulkPath(bulkDir, flatNames[srcPath])
-		for _, otherSrcPath := range srcPaths {
-			if pathsAlias(otherSrcPath, dstPath, cache) {
+		targets = append(targets, joinBulkPath(bulkDir, flatNames[srcPath]))
+	}
+	targets = append(targets, joinBulkPath(bulkDir, bulkLoadMappingFile))
+
+	cache := make(pathIdentityCache, len(srcPaths)+len(targets))
+	for i, target := range targets {
+		for _, srcPath := range srcPaths {
+			if pathsAlias(srcPath, target, cache) {
 				return fmt.Errorf(
-					"promotion: stage %s: bulk directory %s resolves to the same location as source file %s; refusing to copy in place",
-					srcPath, bulkDir, otherSrcPath,
+					"promotion: stage: bulk directory %s write target %s resolves to the same location as source file %s; refusing to copy in place",
+					bulkDir, target, srcPath,
+				)
+			}
+		}
+		// Compare against later targets only: an unordered pair (target,
+		// other) only needs checking once.
+		for _, other := range targets[i+1:] {
+			if pathsAlias(target, other, cache) {
+				return fmt.Errorf(
+					"promotion: stage: bulk directory %s has two write targets (%s and %s) that resolve to the same location; refusing to stage, since the second write would silently overwrite the first",
+					bulkDir, target, other,
 				)
 			}
 		}

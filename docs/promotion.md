@@ -158,6 +158,15 @@ RFileExportManifest (existing)  →  promotion.BuildLoadMapping
   copy would otherwise destroy a source file (possibly one not yet
   copied, whose earlier verification would not be repeated) and report a
   false success.
+  The same preflight also covers `bulkDir/loadmap.json` itself (written
+  by `WriteLoadMapping`, which truncates exactly like `storage.Copy`
+  does, but runs after every RFile copy — an aliased `loadmap.json`
+  would otherwise destroy an already-staged source), and checks every
+  write target against every *other* write target, not only against
+  manifest sources — catching two flattened destinations that are
+  hard-linked to each other, which would otherwise let the second copy
+  silently overwrite the first while the load mapping still lists both
+  names as independent files.
 - `internal/promotion.Promote` — composes `StageBulkDir` with a
   `BulkImporter` (satisfied by `*accumulo.Connector`) to submit the FATE
   call. Submits nothing when the derived mapping is empty (nothing to
