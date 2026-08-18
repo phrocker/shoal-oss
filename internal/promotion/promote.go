@@ -59,6 +59,10 @@ type Options struct {
 // call entirely: submitting a zero-file bulk import is a needless
 // round trip to the manager for a no-op.
 //
+// Promote validates tableName and bulkDir before staging, so an invalid
+// destination never writes any files or loadmap.json to dst before the
+// call fails.
+//
 // Promote does not itself retry on failure; callers wanting resumable
 // promotion can safely call Promote again with the same arguments (staging
 // is idempotent — see StageBulkDir) once the underlying cause is resolved.
@@ -72,6 +76,9 @@ func Promote(
 	tableName string,
 	opts Options,
 ) (LoadMapping, error) {
+	if err := validatePromotionDestination(tableName, bulkDir); err != nil {
+		return nil, err
+	}
 	if len(opts.DestinationTablets) > 0 {
 		preflight, err := BuildLoadMapping(manifest)
 		if err != nil {

@@ -29,6 +29,10 @@ import (
 // silently overwriting one file with another (see package docs for the
 // deferred auto-rename gap, mirroring Accumulo's own renames.json step).
 //
+// bulkDir itself is preflight-validated before any read or write: empty,
+// whitespace-padded, or backend-root destinations fail before staging can
+// mutate dst.
+//
 // The manifest is verified (engine.VerifyRFileExport: every RFile exists at
 // src and matches its recorded size/SHA256) before anything is copied, so a
 // truncated, corrupted, or stale export manifest fails fast here rather
@@ -44,6 +48,9 @@ func StageBulkDir(
 	if manifest == nil {
 		return nil, fmt.Errorf("promotion: nil export manifest")
 	}
+	if err := validateBulkDir(bulkDir); err != nil {
+		return nil, err
+	}
 	mapping, err := BuildLoadMapping(manifest)
 	if err != nil {
 		return nil, err
@@ -58,9 +65,9 @@ func StageBulkDir(
 	staged := make(map[string]bool, len(manifest.RFiles))
 	for _, rf := range manifest.RFiles {
 		if staged[rf.DestinationPath] {
-			// Same physical file referenced by more than one manifest
-			// entry (see flattenNames and BuildLoadMapping's dedup):
-			// already copied once, nothing more to do.
+			// Same physical file referenced by more than one identical
+			// manifest entry (see flattenNames and BuildLoadMapping's
+			// same-tablet dedup): already copied once, nothing more to do.
 			continue
 		}
 		staged[rf.DestinationPath] = true

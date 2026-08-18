@@ -178,20 +178,25 @@ RFileExportManifest (existing)  →  promotion.BuildLoadMapping
 ```
 
 - `internal/promotion.BuildLoadMapping` — pure function, manifest → load
-  mapping, per §3.
+  mapping, per §3. Rejects malformed manifests whose `RFiles` do not
+  resolve to exactly one declared tablet, and only preserves the legacy
+  no-`Tablets` single-tablet fallback when every `RFile` uses
+  `TabletIndex == 0`.
 - `internal/promotion.WriteLoadMapping` / `ReadLoadMapping` — the exact
   JSON shape from §2.
 - `internal/promotion.StageBulkDir` — flattens an export manifest's nested
   `t-NNNN/` files into a flat bulk directory via `storage.Copy` (copies,
   never moves, so a failed stage never loses the source export; re-running
   with the same inputs reproduces byte-identical output) and writes
-  `loadmap.json`. Detects basename collisions across the whole manifest
-  before copying anything, so a collision never leaves a half-staged
-  directory, and verifies every referenced RFile against the manifest's
+  `loadmap.json`. Preflight-validates `bulkDir` plus the manifest's tablet
+  coverage before copying anything, so invalid destinations and malformed
+  manifests never leave a half-staged directory. It also verifies every
+  referenced RFile against the manifest's
   recorded size/SHA256 (`engine.VerifyRFileExport`) before copying, so a
   stale or corrupted manifest fails fast instead of staging mismatched
-  data. Files sharing the same `DestinationPath` (the same physical file
-  listed under more than one manifest entry) are staged once.
+  data. Files sharing the same `DestinationPath` under the same tablet
+  (the same physical file listed under more than one identical manifest
+  entry) are staged once.
 - `internal/promotion.ValidateAgainstDestination` — optional client-side
   pre-flight (see §3's "Known limitation") that checks a load mapping's
   tablet boundaries against the destination table's real, current tablets;

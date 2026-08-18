@@ -2,6 +2,7 @@ package promotion
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/phrocker/shoal/accumulo"
@@ -178,5 +179,70 @@ func TestPromoteValidatesAgainstDestinationTabletsBeforeStaging(t *testing.T) {
 	}
 	if importer.calls != 1 {
 		t.Fatalf("BulkImport calls = %d, want 1 (matching destination must submit)", importer.calls)
+	}
+}
+
+func TestPromoteRejectsInvalidDestinationInputsBeforeStagingOrSubmitting(t *testing.T) {
+	src := memory.New()
+	src.Put("export/events/t-0000/F0001.rf", []byte("data"))
+	manifest := &engine.RFileExportManifest{
+		Version:     engine.RFileExportManifestVersion,
+		SourceTable: "events",
+		Tablets:     []engine.RFileExportTablet{{Index: 0}},
+		RFiles: []engine.RFileExportFile{
+			{TabletIndex: 0, DestinationPath: "export/events/t-0000/F0001.rf", Size: 4, SHA256: "3a6eb0790f39ac87c94f3856b2dd2c5d110e6811602261a9a923d3bb23adc8b7"},
+		},
+	}
+
+	tests := []struct {
+		name      string
+		tableName string
+		bulkDir   string
+		want      error
+	}{
+		{name: "empty table", tableName: "", bulkDir: "/bulk/events-1", want: accumulo.ErrInvalidTableName},
+		{name: "whitespace padded table", tableName: " events ", bulkDir: "/bulk/events-1", want: accumulo.ErrInvalidTableName},
+		{name: "empty bulk dir", tableName: "events", bulkDir: "", want: accumulo.ErrInvalidBulkDir},
+		{name: "backend root bulk dir", tableName: "events", bulkDir: "/", want: accumulo.ErrInvalidBulkDir},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dst := memory.New()
+			importer := &fakeBulkImporter{}
+			if _, err := Promote(context.Background(), src, manifest, dst, tt.bulkDir, importer, tt.tableName, Options{}); !errors.Is(err, tt.want) {
+				t.Fatalf("Promote error = %v, want %v", err, tt.want)
+			}
+			if importer.calls != 0 {
+				t.Fatalf("BulkImport calls = %d, want 0 (invalid destination input must fail before submission)", importer.calls)
+			}
+			if got := dst.Keys(); len(got) != 0 {
+				t.Fatalf("dst.Keys() = %v, want no staged files when destination validation fails first", got)
+			}
+		})
+	}
+}
+
+func TestPromoteRejectsMalformedManifestBeforeStagingOrSubmitting(t *testing.T) {
+	src := memory.New()
+	src.Put("export/events/t-0000/F0001.rf", []byte("data"))
+	manifest := &engine.RFileExportManifest{
+		Version:     engine.RFileExportManifestVersion,
+		SourceTable: "events",
+		Tablets:     []engine.RFileExportTablet{{Index: 0}},
+		RFiles: []engine.RFileExportFile{
+			{TabletIndex: 1, DestinationPath: "export/events/t-0000/F0001.rf", Size: 4, SHA256: "3a6eb0790f39ac87c94f3856b2dd2c5d110e6811602261a9a923d3bb23adc8b7"},
+		},
+	}
+
+	dst := memory.New()
+	importer := &fakeBulkImporter{}
+	if _, err := Promote(context.Background(), src, manifest, dst, "/bulk/events-1", importer, "events", Options{}); err == nil {
+		t.Fatal("Promote with undeclared tablet index = nil error, want error")
+	}
+	if importer.calls != 0 {
+		t.Fatalf("BulkImport calls = %d, want 0 (malformed manifest must fail before submission)", importer.calls)
+	}
+	if got := dst.Keys(); len(got) != 0 {
+		t.Fatalf("dst.Keys() = %v, want no staged files when manifest validation fails first", got)
 	}
 }

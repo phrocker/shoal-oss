@@ -124,6 +124,64 @@ func TestBuildLoadMappingDedupesRepeatedDestinationPath(t *testing.T) {
 	}
 }
 
+func TestBuildLoadMappingRejectsUndeclaredTabletIndex(t *testing.T) {
+	manifest := &engine.RFileExportManifest{
+		SourceTable: "events",
+		Tablets:     []engine.RFileExportTablet{{Index: 0}},
+		RFiles: []engine.RFileExportFile{
+			{TabletIndex: 1, DestinationPath: "events/t-0001/F0001.rf", Size: 10},
+		},
+	}
+	if _, err := BuildLoadMapping(manifest); err == nil {
+		t.Fatal("BuildLoadMapping with undeclared tablet index = nil error, want error")
+	}
+}
+
+func TestBuildLoadMappingRejectsDuplicateDeclaredTabletIndex(t *testing.T) {
+	manifest := &engine.RFileExportManifest{
+		SourceTable: "events",
+		Tablets: []engine.RFileExportTablet{
+			{Index: 0, EndRow: strPtr("g")},
+			{Index: 0, StartRow: strPtr("g")},
+		},
+		RFiles: []engine.RFileExportFile{
+			{TabletIndex: 0, DestinationPath: "events/t-0000/F0001.rf", Size: 10},
+		},
+	}
+	if _, err := BuildLoadMapping(manifest); err == nil {
+		t.Fatal("BuildLoadMapping with duplicate declared tablet index = nil error, want error")
+	}
+}
+
+func TestBuildLoadMappingRejectsAmbiguousLegacyManifest(t *testing.T) {
+	manifest := &engine.RFileExportManifest{
+		SourceTable: "events",
+		RFiles: []engine.RFileExportFile{
+			{TabletIndex: 1, DestinationPath: "events/t-0001/F0001.rf", Size: 10},
+		},
+	}
+	if _, err := BuildLoadMapping(manifest); err == nil {
+		t.Fatal("BuildLoadMapping with legacy manifest using non-zero tablet index = nil error, want error")
+	}
+}
+
+func TestBuildLoadMappingRejectsRepeatedDestinationPathAcrossTablets(t *testing.T) {
+	manifest := &engine.RFileExportManifest{
+		SourceTable: "events",
+		Tablets: []engine.RFileExportTablet{
+			{Index: 0, EndRow: strPtr("g")},
+			{Index: 1, StartRow: strPtr("g")},
+		},
+		RFiles: []engine.RFileExportFile{
+			{TabletIndex: 0, DestinationPath: "events/t-0000/F0001.rf", Size: 10},
+			{TabletIndex: 1, DestinationPath: "events/t-0000/F0001.rf", Size: 10},
+		},
+	}
+	if _, err := BuildLoadMapping(manifest); err == nil {
+		t.Fatal("BuildLoadMapping with one destination path assigned to multiple tablets = nil error, want error")
+	}
+}
+
 func destinationTablets(bounds ...string) []KeyExtent {
 	// bounds is a sequence of split points; destinationTablets builds the
 	// resulting (n+1) contiguous tablets, unbounded at both ends.

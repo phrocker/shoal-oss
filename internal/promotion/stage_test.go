@@ -2,8 +2,10 @@ package promotion
 
 import (
 	"context"
+	"errors"
 	"testing"
 
+	"github.com/phrocker/shoal/accumulo"
 	"github.com/phrocker/shoal/internal/engine"
 	"github.com/phrocker/shoal/internal/storage/memory"
 )
@@ -181,5 +183,62 @@ func TestStageBulkDirDedupesRepeatedDestinationPathCopy(t *testing.T) {
 	// Only one staged copy of the file, not a numbered/renamed second copy.
 	if got := dst.Keys(); len(got) != 2 { // F0001.rf + loadmap.json
 		t.Fatalf("dst.Keys() = %v, want exactly 2 entries (one staged file + loadmap.json)", got)
+	}
+}
+
+func TestStageBulkDirRejectsInvalidBulkDirBeforeCopying(t *testing.T) {
+	src := memory.New()
+	src.Put("export/events/t-0000/F0001.rf", []byte("data"))
+	manifest := &engine.RFileExportManifest{
+		Version:     engine.RFileExportManifestVersion,
+		SourceTable: "events",
+		Tablets:     []engine.RFileExportTablet{{Index: 0}},
+		RFiles: []engine.RFileExportFile{
+			{TabletIndex: 0, DestinationPath: "export/events/t-0000/F0001.rf", Size: 4, SHA256: "3a6eb0790f39ac87c94f3856b2dd2c5d110e6811602261a9a923d3bb23adc8b7"},
+		},
+	}
+
+	tests := []struct {
+		name    string
+		bulkDir string
+	}{
+		{name: "empty", bulkDir: ""},
+		{name: "whitespace padded", bulkDir: " /bulk/events-1 "},
+		{name: "local root", bulkDir: "/"},
+		{name: "url root", bulkDir: "hdfs://nn/"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dst := memory.New()
+			if _, err := StageBulkDir(context.Background(), src, manifest, dst, tt.bulkDir); !errors.Is(err, accumulo.ErrInvalidBulkDir) {
+				t.Fatalf("StageBulkDir error = %v, want ErrInvalidBulkDir", err)
+			}
+			if got := dst.Keys(); len(got) != 0 {
+				t.Fatalf("StageBulkDir wrote %v on invalid bulkDir, want no writes", got)
+			}
+		})
+	}
+}
+
+func TestStageBulkDirRejectsUndeclaredTabletIndexBeforeCopying(t *testing.T) {
+	src := memory.New()
+	src.Put("export/events/t-0000/F0001.rf", []byte("data"))
+
+	manifest := &engine.RFileExportManifest{
+		Version:     engine.RFileExportManifestVersion,
+		SourceTable: "events",
+		Tablets:     []engine.RFileExportTablet{{Index: 0}},
+		RFiles: []engine.RFileExportFile{
+			{TabletIndex: 1, DestinationPath: "export/events/t-0000/F0001.rf", Size: 4, SHA256: "3a6eb0790f39ac87c94f3856b2dd2c5d110e6811602261a9a923d3bb23adc8b7"},
+		},
+	}
+
+	dst := memory.New()
+	ctx := context.Background()
+	if _, err := StageBulkDir(ctx, src, manifest, dst, "/bulk/events-1"); err == nil {
+		t.Fatal("StageBulkDir with undeclared tablet index = nil error, want error")
+	}
+	if got := dst.Keys(); len(got) != 0 {
+		t.Fatalf("StageBulkDir wrote %v on undeclared tablet index, want no partial writes", got)
 	}
 }

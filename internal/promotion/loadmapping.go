@@ -133,29 +133,42 @@ type LoadMapping []Mapping
 // check that precondition locally before promoting.
 //
 // RFiles sharing the same DestinationPath (e.g. a manifest listing one
-// physical file under more than one tablet) contribute a single
+// physical file more than once under the same tablet) contribute a single
 // FileEntry: Accumulo's Bulk.Files is name-keyed and rejects duplicate
-// filenames outright.
+// filenames outright. A repeated DestinationPath under different
+// TabletIndex values is rejected as ambiguous before any staging can omit
+// it from loadmap.json.
 //
 // Legacy manifests with no Tablets entries (RFileExportManifest.Tablets
 // nil/empty) map every RFile (TabletIndex 0) to a single unbounded tablet,
 // mirroring RFileExportManifest.tabletCount()'s documented default.
+// Manifests that omit Tablets but use any other TabletIndex are rejected as
+// ambiguous legacy input.
 func BuildLoadMapping(manifest *engine.RFileExportManifest) (LoadMapping, error) {
 	if manifest == nil {
 		return nil, fmt.Errorf("promotion: nil export manifest")
 	}
-	tablets := manifest.Tablets
-	if len(tablets) == 0 {
-		tablets = []engine.RFileExportTablet{{Index: 0}}
+	tablets, declared, err := resolveManifestTablets(manifest)
+	if err != nil {
+		return nil, err
 	}
 
 	byIndex := make(map[int][]FileEntry, len(tablets))
-	seen := make(map[string]bool, len(manifest.RFiles))
+	seen := make(map[string]int, len(manifest.RFiles))
 	for _, rf := range manifest.RFiles {
-		if seen[rf.DestinationPath] {
+		if _, ok := declared[rf.TabletIndex]; !ok {
+			return nil, fmt.Errorf("promotion: rfile %q references undeclared tablet index %d", rf.DestinationPath, rf.TabletIndex)
+		}
+		if priorIndex, ok := seen[rf.DestinationPath]; ok {
+			if priorIndex != rf.TabletIndex {
+				return nil, fmt.Errorf(
+					"promotion: rfile %q is declared under multiple tablet indexes (%d and %d)",
+					rf.DestinationPath, priorIndex, rf.TabletIndex,
+				)
+			}
 			continue
 		}
-		seen[rf.DestinationPath] = true
+		seen[rf.DestinationPath] = rf.TabletIndex
 		byIndex[rf.TabletIndex] = append(byIndex[rf.TabletIndex], FileEntry{
 			Name:    filepath.Base(rf.DestinationPath),
 			EstSize: rf.Size,
@@ -178,6 +191,29 @@ func BuildLoadMapping(manifest *engine.RFileExportManifest) (LoadMapping, error)
 		})
 	}
 	return mapping, nil
+}
+
+func resolveManifestTablets(manifest *engine.RFileExportManifest) ([]engine.RFileExportTablet, map[int]struct{}, error) {
+	if len(manifest.Tablets) == 0 {
+		for _, rf := range manifest.RFiles {
+			if rf.TabletIndex != 0 {
+				return nil, nil, fmt.Errorf(
+					"promotion: legacy manifest without tablets is ambiguous: rfile %q references tablet index %d",
+					rf.DestinationPath, rf.TabletIndex,
+				)
+			}
+		}
+		return []engine.RFileExportTablet{{Index: 0}}, map[int]struct{}{0: {}}, nil
+	}
+
+	declared := make(map[int]struct{}, len(manifest.Tablets))
+	for _, t := range manifest.Tablets {
+		if _, ok := declared[t.Index]; ok {
+			return nil, nil, fmt.Errorf("promotion: manifest declares tablet index %d more than once", t.Index)
+		}
+		declared[t.Index] = struct{}{}
+	}
+	return manifest.Tablets, declared, nil
 }
 
 func rowBytes(s *string) []byte {
