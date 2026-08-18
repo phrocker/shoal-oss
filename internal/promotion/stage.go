@@ -63,9 +63,11 @@ import (
 // same location, and two manifest sources that are themselves the same
 // physical file reached through two different DestinationPath spellings
 // (for example a symlink/hard link, or a case/Unicode-normalization
-// difference) — which would otherwise each verify and flatten
-// independently, so StageBulkDir would "succeed" while staging two
-// duplicate copies of the same file for Accumulo to bulk import twice.
+// difference). If those aliases flatten to the same basename,
+// StageBulkDir dedupes them to one staged file; if they flatten to
+// different basenames, StageBulkDir rejects the manifest as ambiguous
+// rather than staging the same physical file twice under different
+// names for Accumulo to bulk import.
 //
 // Those aliases are dangerous because storage.Copy opens the destination
 // for writing before it reads the source bytes: on backends like local,
@@ -83,7 +85,7 @@ func StageBulkDir(
 	if manifest == nil {
 		return nil, fmt.Errorf("promotion: nil export manifest")
 	}
-	if err := validateBulkDir(bulkDir); err != nil {
+	if err := validateBulkDirOnBackend(dst, bulkDir); err != nil {
 		return nil, err
 	}
 	if _, _, err := resolveManifestTablet(manifest); err != nil {
@@ -111,7 +113,7 @@ func StageBulkDir(
 		return nil, err
 	}
 	for _, rf := range stageManifest.RFiles {
-		dstPath := joinBulkPath(bulkDir, flatNames[rf.DestinationPath])
+		dstPath := joinBulkPath(dst, bulkDir, flatNames[rf.DestinationPath])
 		if _, err := storage.Copy(ctx, src, rf.DestinationPath, dst, dstPath); err != nil {
 			return nil, fmt.Errorf("promotion: stage %s: %w", rf.DestinationPath, err)
 		}
@@ -156,12 +158,12 @@ func checkNoStagingAliases(src, dst storage.Backend, flatNames map[string]string
 		srcPaths = append(srcPaths, stagePathRef{backend: src, path: srcPath})
 		targets = append(targets, stageWriteTarget{
 			name: flatName,
-			path: joinBulkPath(bulkDir, flatName),
+			path: joinBulkPath(dst, bulkDir, flatName),
 		})
 	}
 	targets = append(targets, stageWriteTarget{
 		name: bulkLoadMappingFile,
-		path: joinBulkPath(bulkDir, bulkLoadMappingFile),
+		path: joinBulkPath(dst, bulkDir, bulkLoadMappingFile),
 	})
 
 	cache := newPathIdentityCache(len(srcPaths) + len(targets))
@@ -209,6 +211,10 @@ type stagePathRef struct {
 type stageWriteTarget struct {
 	name string
 	path string
+}
+
+type backendUnwrapper interface {
+	InnerBackend() storage.Backend
 }
 
 type stageSourceAliasGroup struct {
@@ -303,7 +309,7 @@ func sourceRefsAlias(left, right stagePathRef, cache pathIdentityCache) bool {
 		return os.SameFile(leftInfo, rightInfo)
 	}
 
-	if pathLooksURLLike(left.path) || pathLooksURLLike(right.path) {
+	if pathLooksURLLikeOnBackend(left.backend, left.path) || pathLooksURLLikeOnBackend(right.backend, right.path) {
 		return strings.TrimRight(left.path, `/\`) == strings.TrimRight(right.path, `/\`)
 	}
 	return left.path == right.path
@@ -393,14 +399,15 @@ func (c pathIdentityCache) resolvedLocalPath(path string) string {
 // handful of local paths repeatedly.
 //
 // Remote/object-store paths are canonicalized through the backend-aware
-// parsers already used by the storage packages (s3.ParsePath,
-// gcs.ParsePath, azure.ParsePath, and HDFS URI parsing) so equivalent
-// spellings compare equal even when one path is qualified and the other
-// uses the backend's scheme-less form. Local filesystem paths compare a
-// collision-safe publication key first (resolving existing parent-prefix
-// symlinks and applying conservative local name normalization for
-// case/Unicode/trailing-dot-space equivalence), then fall back to
-// os.Stat + os.SameFile so existing symlink/hardlink aliases are caught too.
+// parsers already used by the built-in storage packages (s3.ParsePath,
+// gcs.ParsePath, azure.ParsePath, and HDFS URI parsing), even when the
+// backend is wrapped (for example by diskcache.Backend), so equivalent
+// qualified vs scheme-less spellings compare equal. Local filesystem
+// paths compare a collision-safe publication key first (resolving
+// existing parent-prefix symlinks, dangling final symlink chains, and
+// conservative case/Unicode/trailing-dot-space equivalence), then fall
+// back to os.Stat + os.SameFile so existing symlink/hardlink aliases are
+// caught too.
 func pathsAlias(srcPath, dstPath stagePathRef, cache pathIdentityCache) bool {
 	srcCanonical, srcCanonicalOK := canonicalBackendPath(srcPath)
 	dstCanonical, dstCanonicalOK := canonicalBackendPath(dstPath)
@@ -423,7 +430,7 @@ func pathsAlias(srcPath, dstPath stagePathRef, cache pathIdentityCache) bool {
 		return os.SameFile(srcInfo, dstInfo)
 	}
 
-	if pathLooksURLLike(srcPath.path) || pathLooksURLLike(dstPath.path) {
+	if pathLooksURLLikeOnBackend(srcPath.backend, srcPath.path) || pathLooksURLLikeOnBackend(dstPath.backend, dstPath.path) {
 		return strings.TrimRight(srcPath.path, `/\`) == strings.TrimRight(dstPath.path, `/\`)
 	}
 
@@ -455,14 +462,14 @@ func resolveExistingLocalPathPrefixes(path string) string {
 		if err != nil {
 			return appendLocalPathParts(current, parts[i:])
 		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			current = resolveLocalSymlinkChain(candidate, 0)
+			continue
+		}
 		if !info.IsDir() && info.Mode()&os.ModeSymlink == 0 && i < len(parts)-1 {
 			return appendLocalPathParts(current, parts[i:])
 		}
-		if info.Mode()&os.ModeSymlink == 0 {
-			current = candidate
-			continue
-		}
-		current = normalizeLocalPathForAlias(resolveLocalSymlinkChain(candidate, 0))
+		current = candidate
 	}
 	if current == "" {
 		return path
@@ -494,6 +501,7 @@ func resolveExistingLocalPathPrefixes(path string) string {
 // matching this function's role as a conservative best-effort
 // approximation rather than a strict resolver.
 func resolveLocalSymlinkChain(path string, hops int) string {
+	path = normalizeLocalPathForAlias(path)
 	const maxHops = 40
 	if hops < maxHops {
 		if info, err := os.Lstat(path); err == nil && info.Mode()&os.ModeSymlink != 0 {
@@ -501,7 +509,7 @@ func resolveLocalSymlinkChain(path string, hops int) string {
 				if !filepath.IsAbs(target) {
 					target = filepath.Join(filepath.Dir(path), target)
 				}
-				return resolveLocalSymlinkChain(filepath.Clean(target), hops+1)
+				return resolveLocalSymlinkChain(target, hops+1)
 			}
 		}
 	}
@@ -565,19 +573,20 @@ func appendLocalPathParts(prefix string, parts []string) string {
 }
 
 func usesLocalFilesystemSemantics(ref stagePathRef) bool {
-	if explicitBackendScheme(ref.path) != "" {
+	if explicitBackendSchemeOnBackend(ref.backend, ref.path) != "" {
 		return false
 	}
-	if ref.backend == nil {
+	backend := unwrapBackend(ref.backend)
+	if backend == nil {
 		return true
 	}
-	_, ok := ref.backend.(*local.Backend)
+	_, ok := backend.(*local.Backend)
 	return ok
 }
 
 func canonicalBackendPath(ref stagePathRef) (string, bool) {
-	scheme := explicitBackendScheme(ref.path)
-	switch b := ref.backend.(type) {
+	scheme := explicitBackendSchemeOnBackend(ref.backend, ref.path)
+	switch b := unwrapBackend(ref.backend).(type) {
 	case *s3.Backend:
 		if scheme != "" && scheme != "s3" {
 			return "", false
@@ -680,17 +689,26 @@ func canonicalHDFSString(authority, resolved string) string {
 }
 
 func explicitBackendScheme(path string) string {
-	if looksLikeWindowsDrivePath(path) {
-		return ""
+	return explicitBackendSchemeOnBackend(nil, path)
+}
+
+func explicitBackendSchemeOnBackend(backend storage.Backend, path string) string {
+	return storage.ExplicitPathScheme(backend, path)
+}
+
+func unwrapBackend(backend storage.Backend) storage.Backend {
+	for backend != nil {
+		unwrapper, ok := backend.(backendUnwrapper)
+		if !ok {
+			break
+		}
+		inner := unwrapper.InnerBackend()
+		if inner == nil || inner == backend {
+			break
+		}
+		backend = inner
 	}
-	if strings.HasPrefix(path, "hdfs:/") {
-		return "hdfs"
-	}
-	matches := urlStylePathRe.FindStringSubmatch(path)
-	if len(matches) != 2 {
-		return ""
-	}
-	return strings.ToLower(matches[1])
+	return backend
 }
 
 // flattenNames validates that every RFile's basename is unique once

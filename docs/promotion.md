@@ -184,43 +184,41 @@ RFileExportManifest (existing)  →  promotion.BuildLoadMapping
   hard-linked to each other, which would otherwise let the second copy
   silently overwrite the first while the load mapping still lists both
   names as independent files.
-  Alias detection also treats two paths differing only by case as a
-  potential alias, purely lexically, even when neither exists yet:
-  Windows and macOS (by default) resolve filesystem paths
-  case-insensitively, so two manifest sources that flatten to
-  differently-cased basenames (e.g. `A.rf` and `a.rf`) would otherwise
-  name the same physical file there without either path ever being
-  stat-able beforehand, letting the second copy silently overwrite the
-  first while the load mapping still lists both as independent files.
-  The same case-insensitive comparison also normalizes Unicode
-  filenames to NFC before folding case, so composed and decomposed
-  spellings of the same character (e.g. NFC vs NFD `é`) are treated as a
-  potential alias too — macOS's default filesystem normalizes filenames
-  the same way, so two differently-encoded but visually identical
-  basenames would otherwise collide there just like a case difference
-  would.
+  Alias detection also treats two local publication paths that collapse
+  to the same filesystem-visible spelling as a potential alias, purely
+  lexically, even when neither final path exists yet: Windows and macOS
+  (by default) resolve paths case-insensitively, macOS normalizes
+  filenames to NFC, and Windows ignores trailing dots/spaces. So two
+  basenames that differ only by case, Unicode normalization (e.g. NFC vs
+  NFD `é`), or a trailing `.`/space are rejected before either write can
+  silently overwrite the other.
   Every unique manifest source path is additionally checked against
   every *other* unique source path, not only against write targets: two
   different `DestinationPath` values that are physically the same file
   (e.g. reached via a symlink/hard link, or differing only by case or
-  Unicode normalization) would each individually verify and flatten to
-  distinct basenames, so `StageBulkDir` would otherwise "succeed" while
-  staging two independent copies of the same underlying file — not
-  destroying data, but silently duplicating it once Accumulo bulk-imports
-  both flattened copies.
-  Remote/object-store paths (S3, GCS, Azure, HDFS) are canonicalized
-  through each backend's own path parser before comparison, so an
-  `s3://bucket/key`-qualified spelling and its scheme-less
-  `bucket/key` equivalent are recognized as the same destination even
-  though they're different strings. Local paths get Windows-drive
-  normalization first (so `C://data/F.rf` is recognized as local rather
-  than mistaken for a remote URL) and an explicit symlink-target
-  resolution step alongside the case/Unicode-insensitive lexical check
-  and `os.Stat` + `os.SameFile` fallback, so a symlink aliasing a path
-  that itself doesn't exist yet (nothing for `os.SameFile` to compare)
-  is still caught by comparing the symlink's resolved target lexically.
-  Symlink-target resolution also walks a path's ancestor directory
-  components, not only its own final component: a relative symlink
+  Unicode normalization) are deduped when they flatten to the same
+  basename, but rejected when they would flatten to different basenames:
+  staging the same underlying file twice under two bulk-import names
+  would silently duplicate it once Accumulo imports both flattened
+  copies.
+  Built-in remote/object-store paths (S3, GCS, Azure, HDFS) are
+  canonicalized through each backend's own path parser before
+  comparison, so a qualified spelling like `s3://bucket/key` and its
+  scheme-less `bucket/key` equivalent are recognized as the same
+  destination even though they're different strings. That same backend
+  identity still applies when the backend is wrapped (for example by
+  `diskcache.Backend`). Generic custom `scheme://...` backends keep
+  URL-style path joining, but unless they use one of those built-in
+  parsers they are otherwise compared lexically. Local paths get
+  Windows-drive normalization first (so `C://data/F.rf` is recognized
+  as local rather than mistaken for a remote URL), then an explicit
+  symlink-target resolution step alongside the case/Unicode-insensitive
+  lexical check and `os.Stat` + `os.SameFile` fallback, so a symlink
+  aliasing a path that itself doesn't exist yet (nothing for
+  `os.SameFile` to compare) is still caught by comparing the symlink's
+  resolved target lexically. Symlink-target resolution also walks a
+  path's ancestor directory components, not only its own final
+  component: a relative symlink
   reached through a *symlinked parent directory* (for example
   `bulk/alias -> "."` with `bulk/A.rf -> alias/B.rf`, where
   `bulk/B.rf` doesn't exist yet) is resolved to the same

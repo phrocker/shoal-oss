@@ -24,7 +24,7 @@ func TestStagePathsAliasWindowsDrivePathReachesSameFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := os.Link(realPath, aliasPath); err != nil {
-		t.Fatalf("Link(%q, %q): %v", realPath, aliasPath, err)
+		t.Skipf("hard links not supported in this environment: %v", err)
 	}
 
 	urlLikeAlias := toWindowsDoubleSlashDrivePath(t, aliasPath)

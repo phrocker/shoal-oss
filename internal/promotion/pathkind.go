@@ -7,12 +7,12 @@ import (
 	"runtime"
 	"strings"
 
+	"github.com/phrocker/shoal/internal/storage"
 	"golang.org/x/text/cases"
 	"golang.org/x/text/unicode/norm"
 )
 
 var windowsDrivePathRe = regexp.MustCompile(`^[A-Za-z]:(?:[\\/].*)?$`)
-var urlStylePathRe = regexp.MustCompile(`^([A-Za-z][A-Za-z0-9+.-]*):\/\/`)
 var publicationCaseFold = cases.Fold()
 
 func looksLikeWindowsDrivePath(path string) bool {
@@ -33,17 +33,19 @@ func looksLikeWindowsDrivePath(path string) bool {
 // authority) is also treated as backend-style even though it has no
 // "://" substring, matching Hadoop's own authorityless HDFS URI form.
 func pathUsesBackendSeparatorJoin(path string) bool {
-	if looksLikeWindowsDrivePath(path) {
-		return false
-	}
-	if strings.HasPrefix(path, "hdfs:/") {
-		return true
-	}
-	return urlStylePathRe.MatchString(path)
+	return pathUsesBackendSeparatorJoinOnBackend(nil, path)
 }
 
 func pathLooksURLLike(path string) bool {
-	return pathUsesBackendSeparatorJoin(path)
+	return pathLooksURLLikeOnBackend(nil, path)
+}
+
+func pathUsesBackendSeparatorJoinOnBackend(backend storage.Backend, path string) bool {
+	return storage.UsesBackendPathJoin(backend, path)
+}
+
+func pathLooksURLLikeOnBackend(backend storage.Backend, path string) bool {
+	return storage.ExplicitPathScheme(backend, path) != ""
 }
 
 func normalizeLocalPathForAlias(path string) string {

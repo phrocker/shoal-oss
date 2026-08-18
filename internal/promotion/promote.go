@@ -67,7 +67,7 @@ func Promote(
 	tableName string,
 	opts Options,
 ) (LoadMapping, error) {
-	if err := validatePromotionDestination(tableName, bulkDir); err != nil {
+	if err := validatePromotionDestination(dst, tableName, bulkDir); err != nil {
 		return nil, err
 	}
 	mapping, err := StageBulkDir(ctx, src, manifest, dst, bulkDir)
