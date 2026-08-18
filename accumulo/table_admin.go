@@ -34,7 +34,7 @@ func (c *Connector) Tables(ctx context.Context) ([]Table, error) {
 	if err != nil {
 		return nil, err
 	}
-	mapping, err := discovery.names.List(ctx)
+	mapping, err := discovery.tables.List(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("accumulo: list tables: %w", err)
 	}
@@ -61,7 +61,7 @@ func (c *Connector) TableExists(ctx context.Context, name string) (bool, error) 
 	if err != nil {
 		return false, err
 	}
-	_, err = discovery.names.ResolveID(ctx, name)
+	_, err = discovery.tables.ResolveID(ctx, name)
 	if errors.Is(err, tablenames.ErrTableNotFound) {
 		return false, nil
 	}
@@ -157,10 +157,7 @@ func (c *Connector) executeTableMutation(
 		return fmt.Errorf("accumulo: discover manager: %w", err)
 	}
 	if discovery != nil {
-		defer func() {
-			discovery.tablets.InvalidateAll()
-			discovery.names.Invalidate()
-		}()
+		defer discovery.invalidateAll()
 	}
 	if err := manager.Execute(ctx, address, req); err != nil {
 		return mapManagerError(name, err)

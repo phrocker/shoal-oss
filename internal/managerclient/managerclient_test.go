@@ -1040,6 +1040,105 @@ func (t *fakeTransport) Close() error {
 	return t.closeErr
 }
 
+func TestNamespaceFATEOperationEncoding(t *testing.T) {
+	tests := []struct {
+		operation Operation
+		want      manager.TFateOperation
+		args      [][]byte
+	}{
+		{NamespaceCreate, manager.TFateOperation_NAMESPACE_CREATE, [][]byte{[]byte("analytics")}},
+		{NamespaceDelete, manager.TFateOperation_NAMESPACE_DELETE, [][]byte{[]byte("")}},
+		{NamespaceRename, manager.TFateOperation_NAMESPACE_RENAME, [][]byte{[]byte("analytics"), []byte("reporting")}},
+	}
+	for _, tt := range tests {
+		request := Request{
+			Operation: tt.operation,
+			Instance:  FateUser,
+			Arguments: tt.args,
+			Options:   map[string]string{},
+		}
+		if err := validateRequest(request); err != nil {
+			t.Fatalf("%v validation: %v", tt.operation, err)
+		}
+		if got := thriftOperation(tt.operation); got != tt.want {
+			t.Fatalf("%v thrift operation = %v, want %v", tt.operation, got, tt.want)
+		}
+	}
+}
+
+func TestPooledNamespacePropertyRPCsAndReads(t *testing.T) {
+	pooled, pool := newTestPooled(t)
+	defer pool.Close()
+
+	managerRPC := &fakeManagerRPC{}
+	clientRPC := &fakeClientRPC{
+		properties: map[string]string{"table.file.max": "15"},
+		versioned: VersionedProperties{
+			Version:    9,
+			Properties: map[string]string{"table.file.max": "15"},
+		},
+	}
+	pooled.dial = func(_ context.Context, key transportpool.Key) (io.Closer, error) {
+		switch key.Service {
+		case managerServiceName:
+			return &fakeTransport{manager: managerRPC}, nil
+		case clientServiceName:
+			return &fakeTransport{service: clientRPC}, nil
+		default:
+			t.Fatalf("service = %q", key.Service)
+			return nil, nil
+		}
+	}
+	pooled.newManagerClient = managerFromFakeTransport
+	pooled.newServiceClient = serviceFromFakeTransport
+
+	if err := pooled.SetNamespaceProperty(
+		context.Background(),
+		"manager:9997",
+		"",
+		"table.file.max",
+		"",
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := pooled.RemoveNamespaceProperty(
+		context.Background(),
+		"manager:9997",
+		"analytics",
+		"table.file.max",
+	); err != nil {
+		t.Fatal(err)
+	}
+	if managerRPC.setCalls.Load() != 1 || managerRPC.removeCalls.Load() != 1 {
+		t.Fatalf("set/remove calls = %d/%d", managerRPC.setCalls.Load(), managerRPC.removeCalls.Load())
+	}
+
+	effective, err := pooled.GetNamespaceConfiguration(context.Background(), "scan:9997", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	local, err := pooled.GetNamespaceProperties(context.Background(), "scan:9997", "analytics")
+	if err != nil {
+		t.Fatal(err)
+	}
+	versioned, err := pooled.GetVersionedNamespaceProperties(
+		context.Background(),
+		"scan:9997",
+		"analytics",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	effective["table.file.max"] = "effective mutation"
+	local["table.file.max"] = "local mutation"
+	versioned.Properties["table.file.max"] = "versioned mutation"
+	if clientRPC.properties["table.file.max"] != "15" ||
+		clientRPC.versioned.Properties["table.file.max"] != "15" ||
+		versioned.Version != 9 {
+		t.Fatalf("namespace property copies/version = %#v/%#v", clientRPC, versioned)
+	}
+}
+
 func clientFromFakeTransport(transport io.Closer) (fateRPC, error) {
 	return transport.(*fakeTransport).rpc, nil
 }
@@ -1055,6 +1154,7 @@ func serviceFromFakeTransport(transport io.Closer) (clientRPC, error) {
 type fakeClientRPC struct {
 	noopClientRPC
 	properties map[string]string
+	versioned  VersionedProperties
 	err        error
 	call       func(context.Context) error
 	tableName  string
@@ -1082,6 +1182,21 @@ func (noopClientRPC) GetTableConfiguration(
 	context.Context, *security.TCredentials, string,
 ) (map[string]string, error) {
 	return nil, nil
+}
+func (noopClientRPC) GetNamespaceConfiguration(
+	context.Context, *security.TCredentials, string,
+) (map[string]string, error) {
+	return nil, nil
+}
+func (noopClientRPC) GetNamespaceProperties(
+	context.Context, *security.TCredentials, string,
+) (map[string]string, error) {
+	return nil, nil
+}
+func (noopClientRPC) GetVersionedNamespaceProperties(
+	context.Context, *security.TCredentials, string,
+) (VersionedProperties, error) {
+	return VersionedProperties{}, nil
 }
 func (noopClientRPC) CreateLocalUser(
 	context.Context, *security.TCredentials, string, []byte,
@@ -1344,6 +1459,37 @@ func (r *fakeClientRPC) GetTableConfiguration(
 	return r.properties, r.err
 }
 
+func (r *fakeClientRPC) GetNamespaceConfiguration(
+	ctx context.Context,
+	credentials *security.TCredentials,
+	namespace string,
+) (map[string]string, error) {
+	return r.GetTableConfiguration(ctx, credentials, namespace)
+}
+
+func (r *fakeClientRPC) GetNamespaceProperties(
+	ctx context.Context,
+	credentials *security.TCredentials,
+	namespace string,
+) (map[string]string, error) {
+	return r.GetTableConfiguration(ctx, credentials, namespace)
+}
+
+func (r *fakeClientRPC) GetVersionedNamespaceProperties(
+	ctx context.Context,
+	_ *security.TCredentials,
+	namespace string,
+) (VersionedProperties, error) {
+	r.calls.Add(1)
+	r.tableName = namespace
+	if r.call != nil {
+		if err := r.call(ctx); err != nil {
+			return VersionedProperties{}, err
+		}
+	}
+	return r.versioned, r.err
+}
+
 type fakeManagerRPC struct {
 	initiateErr    error
 	waitFlushErr   error
@@ -1410,6 +1556,22 @@ func (r *fakeManagerRPC) RemoveTableProperty(
 	r.tableName = tableName
 	r.property = property
 	return r.removeErr
+}
+
+func (r *fakeManagerRPC) SetNamespaceProperty(
+	ctx context.Context,
+	credentials *security.TCredentials,
+	namespace, property, value string,
+) error {
+	return r.SetTableProperty(ctx, credentials, namespace, property, value)
+}
+
+func (r *fakeManagerRPC) RemoveNamespaceProperty(
+	ctx context.Context,
+	credentials *security.TCredentials,
+	namespace, property string,
+) error {
+	return r.RemoveTableProperty(ctx, credentials, namespace, property)
 }
 
 func thriftFieldIDs(t *testing.T, value thrift.TStruct) []int16 {

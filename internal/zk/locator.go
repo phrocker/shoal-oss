@@ -43,9 +43,12 @@ type Location struct {
 // Locator resolves Accumulo metadata from ZooKeeper. Construct with New
 // and Close when done.
 type Locator struct {
-	conn         *gozk.Conn
-	instanceName string
-	instanceID   string
+	conn           *gozk.Conn
+	instanceName   string
+	instanceID     string
+	servers        []string
+	sessionTimeout time.Duration
+	instanceSecret string
 }
 
 // New connects to a ZK quorum, resolves the instance name to its instance
@@ -71,7 +74,13 @@ func NewWithAuth(servers []string, instanceName string, sessionTimeout time.Dura
 			return nil, fmt.Errorf("zk add digest auth: %w", err)
 		}
 	}
-	l := &Locator{conn: conn, instanceName: instanceName}
+	l := &Locator{
+		conn:           conn,
+		instanceName:   instanceName,
+		servers:        append([]string(nil), servers...),
+		sessionTimeout: sessionTimeout,
+		instanceSecret: instanceSecret,
+	}
 	id, err := l.lookupInstanceID()
 	if err != nil {
 		conn.Close()
@@ -121,13 +130,73 @@ func (l *Locator) InstancePath() string {
 // GetRaw fetches the raw znode bytes at an absolute path. ErrNoNode from
 // the underlying ZK client is surfaced as a wrapped error so callers can
 // distinguish "missing" from transport failures via errors.Is(err,
-// gozk.ErrNoNode).
-func (l *Locator) GetRaw(_ context.Context, znodePath string) ([]byte, error) {
+// gozk.ErrNoNode). Cancellable contexts use a dedicated ZooKeeper connection
+// so cancellation can close the in-flight read without disrupting the shared
+// locator session.
+func (l *Locator) GetRaw(ctx context.Context, znodePath string) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if ctx.Done() != nil {
+		return getRawWithContext(ctx, znodePath, l.instanceSecret, func() (rawZKConn, error) {
+			conn, _, err := gozk.Connect(l.servers, l.sessionTimeout)
+			return conn, err
+		})
+	}
 	data, _, err := l.conn.Get(znodePath)
 	if err != nil {
 		return nil, fmt.Errorf("get %s: %w", znodePath, err)
 	}
 	return data, nil
+}
+
+type rawZKConn interface {
+	AddAuth(string, []byte) error
+	Get(string) ([]byte, *gozk.Stat, error)
+	Close()
+}
+
+type rawResult struct {
+	data []byte
+	err  error
+}
+
+func getRawWithContext(
+	ctx context.Context,
+	znodePath, instanceSecret string,
+	connect func() (rawZKConn, error),
+) ([]byte, error) {
+	conn, err := connect()
+	if err != nil {
+		return nil, fmt.Errorf("zk connect: %w", err)
+	}
+	result := make(chan rawResult, 1)
+	go func() {
+		if instanceSecret != "" {
+			if err := conn.AddAuth("digest", []byte("accumulo:"+instanceSecret)); err != nil {
+				result <- rawResult{err: fmt.Errorf("zk add digest auth: %w", err)}
+				return
+			}
+		}
+		data, _, err := conn.Get(znodePath)
+		if err != nil {
+			err = fmt.Errorf("get %s: %w", znodePath, err)
+		}
+		result <- rawResult{data: data, err: err}
+	}()
+
+	select {
+	case response := <-result:
+		conn.Close()
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		return response.data, response.err
+	case <-ctx.Done():
+		conn.Close()
+		<-result
+		return nil, ctx.Err()
+	}
 }
 
 // Children returns the child znode names of znodePath. Names are NOT

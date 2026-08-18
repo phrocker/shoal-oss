@@ -54,7 +54,7 @@ func (c *Connector) BulkImport(ctx context.Context, tableName, bulkDir string, o
 	if err != nil {
 		return err
 	}
-	tableID, err := discovery.names.ResolveID(ctx, tableName)
+	tableID, err := discovery.tables.ResolveID(ctx, tableName)
 	if errors.Is(err, tablenames.ErrTableNotFound) {
 		return fmt.Errorf("%w: table name %q", ErrTableNotFound, tableName)
 	}

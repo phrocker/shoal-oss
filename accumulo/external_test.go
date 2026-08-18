@@ -36,7 +36,10 @@ func TestPublicDiscoveryAPICompiles(t *testing.T) {
 	}
 	defer connector.Close()
 
+	namespace := accumulo.Namespace{Name: "", ID: "+default"}
 	table := accumulo.Table{Name: "events", ID: "1"}
+	_, _ = connector.Namespaces(context.Background())
+	_, _ = connector.NamespaceExists(context.Background(), "")
 	_, _ = connector.Tables(context.Background())
 	_, _ = connector.TableExists(context.Background(), "events")
 	_, _ = connector.ListTableSplits(context.Background(), "events")
@@ -45,9 +48,44 @@ func TestPublicDiscoveryAPICompiles(t *testing.T) {
 	_ = connector.InvalidateTablet(table, []byte("row"))
 	_ = connector.InvalidateTable(table)
 	_ = connector.InvalidateDiscovery()
+	if _, err := connector.NamespaceByName(context.Background(), ""); !errors.Is(err, accumulo.ErrDiscoveryUnavailable) {
+		t.Fatalf("error = %v, want ErrDiscoveryUnavailable", err)
+	}
+	if _, err := connector.NamespaceByID(context.Background(), namespace.ID); !errors.Is(err, accumulo.ErrDiscoveryUnavailable) {
+		t.Fatalf("error = %v, want ErrDiscoveryUnavailable", err)
+	}
 	if _, err := connector.TableByName(context.Background(), "events"); !errors.Is(err, accumulo.ErrDiscoveryUnavailable) {
 		t.Fatalf("error = %v, want ErrDiscoveryUnavailable", err)
 	}
+}
+
+func TestPublicNamespaceAdministrationAPICompiles(t *testing.T) {
+	instance, _ := accumulo.NewStaticInstance("accumulo", "uuid-1")
+	credentials, _ := accumulo.PasswordCredentials("root", []byte("secret"))
+	connector, err := accumulo.NewConnector(instance, credentials, accumulo.ConnectorOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connector.Close()
+
+	ctx := context.Background()
+	_ = connector.CreateNamespace(ctx, "analytics")
+	_ = connector.DeleteNamespace(ctx, "analytics")
+	_ = connector.RenameNamespace(ctx, "analytics", "reporting")
+	_ = connector.SetNamespaceProperty(ctx, "analytics", "table.file.max", "15")
+	_ = connector.RemoveNamespaceProperty(ctx, "analytics", "table.file.max")
+	_, _ = connector.EffectiveNamespaceProperties(ctx, "analytics")
+	_, _ = connector.NamespaceProperties(ctx, "analytics")
+	versioned, _ := connector.VersionedNamespaceProperties(ctx, "analytics")
+	_ = versioned.Version
+	_ = versioned.Properties
+
+	_ = accumulo.ErrNamespaceExists
+	_ = accumulo.ErrNamespaceNotFound
+	_ = accumulo.ErrNamespaceNotEmpty
+	_ = accumulo.ErrInvalidNamespaceName
+	_ = accumulo.ErrInvalidProperty
+	var _ accumulo.VersionedProperties
 }
 
 func TestPublicScannerAPICompiles(t *testing.T) {

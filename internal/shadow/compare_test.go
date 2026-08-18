@@ -235,9 +235,9 @@ func TestCompare_T1Skipped(t *testing.T) {
 }
 
 // TestCompare_T1Passed: with a SHOAL_JAVA_RFILE_VALIDATE that always
-// returns 0, T1.Passed=true. We use /bin/true.
+// returns 0, T1.Passed=true.
 func TestCompare_T1Passed(t *testing.T) {
-	t.Setenv(EnvJavaRFileValidate, "true # $RFILE")
+	t.Setenv(EnvJavaRFileValidate, validatorCommand(true))
 	cells := [][2]any{
 		{mkKey("r1", "cf", "a", 10), "v"},
 	}
@@ -257,7 +257,7 @@ func TestCompare_T1Passed(t *testing.T) {
 // TestCompare_T1Failed: a validator that always exits non-zero surfaces
 // as T1.Passed=false with the stderr in T1.Error.
 func TestCompare_T1Failed(t *testing.T) {
-	t.Setenv(EnvJavaRFileValidate, fmt.Sprintf("sh -c 'echo simulated-rejection >&2; exit 7' # $RFILE"))
+	t.Setenv(EnvJavaRFileValidate, validatorCommand(false))
 	cells := [][2]any{
 		{mkKey("r1", "cf", "a", 10), "v"},
 	}
@@ -277,5 +277,26 @@ func TestCompare_T1Failed(t *testing.T) {
 	}
 	if report.T1.Error == "" {
 		t.Fatal("T1.Error should be populated on failure")
+	}
+}
+
+func validatorCommand(success bool) string {
+	shell, _ := validatorShell()
+	switch shell {
+	case "powershell":
+		if success {
+			return "exit 0 # $RFILE"
+		}
+		return "Write-Error 'simulated-rejection'; exit 7 # $RFILE"
+	case "cmd":
+		if success {
+			return "exit /b 0"
+		}
+		return "echo simulated-rejection 1>&2 & exit /b 7"
+	default:
+		if success {
+			return "true # $RFILE"
+		}
+		return fmt.Sprintf("echo simulated-rejection >&2; exit %d # $RFILE", 7)
 	}
 }
