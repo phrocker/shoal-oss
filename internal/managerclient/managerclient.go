@@ -254,7 +254,7 @@ func (p *Pooled) ExecuteStatus(
 		return rpc.Wait(ctx, credentials, id)
 	})
 	if err != nil {
-		return "", mapRPCError(err)
+		return status, mapRPCError(err)
 	}
 	return status, nil
 }

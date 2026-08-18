@@ -9,6 +9,8 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/apache/thrift/lib/go/thrift"
+
 	clientgen "github.com/phrocker/shoal/internal/thrift/gen/client"
 	"github.com/phrocker/shoal/internal/thrift/gen/manager"
 	"github.com/phrocker/shoal/internal/thrift/gen/security"
@@ -86,6 +88,17 @@ func (r *fakeSplitFateRPC) Finish(ctx context.Context, _ *security.TCredentials,
 
 func splitFateFromFakeTransport(transport io.Closer) (fateRPC, error) {
 	return transport.(*fakeTransport).rpc, nil
+}
+
+type splitCloseErrorTransport struct {
+	rpc      fateRPC
+	closeErr error
+	closes   atomic.Int32
+}
+
+func (t *splitCloseErrorTransport) Close() error {
+	t.closes.Add(1)
+	return t.closeErr
 }
 
 type fakeSplitRPC struct {
@@ -247,6 +260,60 @@ func TestPooledExecuteStatusKeepsStatusWhenCleanupFails(t *testing.T) {
 	}
 	if status != SplitSucceeded {
 		t.Fatalf("status = %q, want the split status to survive cleanup failure", status)
+	}
+}
+
+func TestPooledExecuteStatusKeepsWaitStatusWhenLeaseCleanupFails(t *testing.T) {
+	pool, err := transportpool.New(transportpool.Config{MaxIdlePerEndpoint: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	pooled, err := NewPooled(pool, "uuid-1", "4.0.0-SNAPSHOT", &security.TCredentials{
+		Principal:      "root",
+		TokenClassName: "PasswordToken",
+		Token:          []byte("secret"),
+		InstanceId:     "uuid-1",
+	}, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rpc := &fakeSplitFateRPC{id: fateID{Type: 1, UUID: "split-cleanup"}, waitStatus: SplitSucceeded}
+	cleanup := thrift.NewTTransportExceptionFromError(errors.New("wait transport close failed"))
+	var dials atomic.Int32
+	pooled.dial = func(context.Context, transportpool.Key) (io.Closer, error) {
+		transport := &splitCloseErrorTransport{rpc: rpc}
+		if dials.Add(1) == 3 {
+			transport.closeErr = cleanup
+		}
+		return transport, nil
+	}
+	pooled.newClient = func(transport io.Closer) (fateRPC, error) {
+		return transport.(*splitCloseErrorTransport).rpc, nil
+	}
+
+	status, err := pooled.ExecuteStatus(
+		context.Background(),
+		"manager:9997",
+		splitRequest("payload"),
+	)
+	if status != SplitSucceeded {
+		t.Fatalf("status = %q, want %q despite lease cleanup failure", status, SplitSucceeded)
+	}
+	if !errors.Is(err, cleanup) {
+		t.Fatalf("error = %v, want wait lease cleanup failure", err)
+	}
+	if !IsRetryableEndpointError(err) {
+		t.Fatalf("cleanup error = %v, want existing endpoint retry classification", err)
+	}
+	if dials.Load() != 4 {
+		t.Fatalf("dials = %d, want begin/execute/wait/finish", dials.Load())
+	}
+	if rpc.begin.Load() != 1 || rpc.execute.Load() != 1 ||
+		rpc.waitCalls.Load() != 1 || rpc.finish.Load() != 1 {
+		t.Fatalf("calls begin/execute/wait/finish = %d/%d/%d/%d",
+			rpc.begin.Load(), rpc.execute.Load(), rpc.waitCalls.Load(), rpc.finish.Load())
 	}
 }
 

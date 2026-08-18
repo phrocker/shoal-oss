@@ -702,6 +702,40 @@ func TestAddTableSplitsSurfacesCleanupErrorsWithoutResubmitting(t *testing.T) {
 	}
 }
 
+func TestApplySplitPlanRetainsSucceededGroupOnEndpointCleanupError(t *testing.T) {
+	walker := &scriptedTabletWalker{rounds: [][]metadata.TabletInfo{splitTestTablets()}}
+	connector, manager := splitTestConnector(t, walker, splitTestNames())
+	cleanup := thrift.NewTTransportExceptionFromError(errors.New("wait transport close failed"))
+	manager.statusFn = func(int, managerclient.Request) (string, error) {
+		return managerclient.SplitSucceeded, cleanup
+	}
+	target := splitTarget{
+		tableName: "events",
+		tableID:   "1",
+		address:   "manager:9997",
+		manager:   manager,
+		discovery: connector.discovery,
+		retry:     defaultSplitRetryPolicy(),
+	}
+	row := []byte("m")
+
+	completed, err := applySplitPlan(context.Background(), target, splitPlan{
+		groups: []splitGroup{{
+			extent: TabletExtent{TableID: "1", PrevRow: []byte("k"), EndRow: []byte("p")},
+			rows:   [][]byte{row},
+		}},
+	})
+	if !errors.Is(err, ErrManagerUnavailable) || !errors.Is(err, cleanup) {
+		t.Fatalf("error = %v, want manager unavailable with cleanup chain", err)
+	}
+	if len(completed) != 1 || !bytes.Equal(completed[0], row) {
+		t.Fatalf("completed = %q, want successful split row retained", completed)
+	}
+	if calls := manager.splitCalls(); len(calls) != 1 {
+		t.Fatalf("split calls = %d, want no replay", len(calls))
+	}
+}
+
 func TestAddTableSplitsKeepsCleanupErrorsJoinedWithMappedSentinels(t *testing.T) {
 	walker := &scriptedTabletWalker{rounds: [][]metadata.TabletInfo{splitTestTablets()}}
 	connector, manager := splitTestConnector(t, walker, splitTestNames())
