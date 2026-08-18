@@ -70,6 +70,42 @@ func TestPooledSessionKeepsExclusiveTransportThroughClose(t *testing.T) {
 	}
 }
 
+func TestPooledUpdateCredentialsCopiesReplacementForNextRPCAndRejectsClosed(t *testing.T) {
+	pooled, pool := newTestPooled(t)
+	defer pool.Close()
+
+	rpc := &fakeIngestRPC{startID: 73}
+	pooled.dial = func(context.Context, transportpool.Key) (io.Closer, error) {
+		return &fakeIngestTransport{rpc: rpc}, nil
+	}
+	replacement := &security.TCredentials{
+		Principal:      "root",
+		TokenClassName: "PasswordToken",
+		Token:          []byte("replacement"),
+		InstanceId:     "uuid-1",
+	}
+	if err := pooled.UpdateCredentials(replacement); err != nil {
+		t.Fatal(err)
+	}
+	replacement.Token[0] = 'X'
+	session, err := pooled.Start(context.Background(), "tablet-1:9997", DurabilityDefault)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := rpc.startCredentialToken(); string(got) != "replacement" || string(got) == "secret" {
+		t.Fatalf("RPC token = %q, want isolated replacement", got)
+	}
+	if _, err := session.Cancel(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := pooled.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := pooled.UpdateCredentials(&security.TCredentials{Token: []byte("later")}); !errors.Is(err, ErrClosed) {
+		t.Fatalf("closed update error = %v, want ErrClosed", err)
+	}
+}
+
 func TestPooledStartApplicationFailurePreservesTransport(t *testing.T) {
 	pooled, pool := newTestPooled(t)
 	defer pool.Close()
@@ -315,17 +351,25 @@ type fakeIngestRPC struct {
 	order       []string
 	closeCalls  int
 	cancelCalls int
+	startToken  []byte
 }
 
 func (r *fakeIngestRPC) Start(
-	context.Context,
-	*security.TCredentials,
-	Durability,
+	_ context.Context,
+	credentials *security.TCredentials,
+	_ Durability,
 ) (data.UpdateID, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.order = append(r.order, "start")
+	r.startToken = append([]byte(nil), credentials.Token...)
 	return r.startID, r.startErr
+}
+
+func (r *fakeIngestRPC) startCredentialToken() []byte {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]byte(nil), r.startToken...)
 }
 
 func (r *fakeIngestRPC) Apply(
