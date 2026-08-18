@@ -36,7 +36,10 @@ func TestPublicDiscoveryAPICompiles(t *testing.T) {
 	}
 	defer connector.Close()
 
+	namespace := accumulo.Namespace{Name: "", ID: "+default"}
 	table := accumulo.Table{Name: "events", ID: "1"}
+	_, _ = connector.Namespaces(context.Background())
+	_, _ = connector.NamespaceExists(context.Background(), "")
 	_, _ = connector.Tables(context.Background())
 	_, _ = connector.TableExists(context.Background(), "events")
 	_, _ = connector.Tablets(context.Background(), table)
@@ -44,6 +47,12 @@ func TestPublicDiscoveryAPICompiles(t *testing.T) {
 	_ = connector.InvalidateTablet(table, []byte("row"))
 	_ = connector.InvalidateTable(table)
 	_ = connector.InvalidateDiscovery()
+	if _, err := connector.NamespaceByName(context.Background(), ""); !errors.Is(err, accumulo.ErrDiscoveryUnavailable) {
+		t.Fatalf("error = %v, want ErrDiscoveryUnavailable", err)
+	}
+	if _, err := connector.NamespaceByID(context.Background(), namespace.ID); !errors.Is(err, accumulo.ErrDiscoveryUnavailable) {
+		t.Fatalf("error = %v, want ErrDiscoveryUnavailable", err)
+	}
 	if _, err := connector.TableByName(context.Background(), "events"); !errors.Is(err, accumulo.ErrDiscoveryUnavailable) {
 		t.Fatalf("error = %v, want ErrDiscoveryUnavailable", err)
 	}

@@ -24,7 +24,9 @@ var (
 	// value.
 	ErrInvalidProperty = errors.New("accumulo: invalid property")
 
-	// ErrNamespaceNotFound indicates that a table's target namespace does not exist.
+	// ErrNamespaceNotFound indicates that no namespace matches the requested
+	// name or ID, or that a table operation targeted a namespace that does not
+	// exist.
 	ErrNamespaceNotFound = errors.New("accumulo: namespace not found")
 
 	// ErrPermissionDenied indicates that the authenticated principal is not

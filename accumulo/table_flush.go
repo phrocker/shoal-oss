@@ -32,7 +32,7 @@ func (c *Connector) FlushTable(ctx context.Context, tableName string, wait bool)
 		return ErrDiscoveryUnavailable
 	}
 
-	tableID, err := discovery.names.ResolveID(ctx, tableName)
+	tableID, err := discovery.tables.ResolveID(ctx, tableName)
 	if errors.Is(err, tablenames.ErrTableNotFound) {
 		return fmt.Errorf("%w: table name %q", ErrTableNotFound, tableName)
 	}
@@ -52,7 +52,7 @@ func (c *Connector) FlushTable(ctx context.Context, tableName string, wait bool)
 		if errors.As(err, &managerErr) &&
 			(managerErr.Kind == managerclient.ErrorTableNotFound ||
 				managerErr.Kind == managerclient.ErrorNamespaceNotFound) {
-			discovery.names.Invalidate()
+			discovery.tables.Invalidate()
 		}
 		return mapManagerFlushError(tableName, err)
 	}
