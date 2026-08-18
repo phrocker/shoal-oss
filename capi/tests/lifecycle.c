@@ -218,6 +218,13 @@ int main(void) {
                                       &error) == SHOAL_STATUS_OK);
   assert(exists == 0);
 
+  expect_error(shoal_connector_flush_table(admin_connector, "events", 2, 0,
+                                           &error),
+               SHOAL_STATUS_INVALID_ARGUMENT, &error, "wait must be 0 or 1");
+  expect_error(shoal_connector_flush_table(admin_connector, "events", 0, -1,
+                                           &error),
+               SHOAL_STATUS_INVALID_ARGUMENT, &error,
+               "timeout_ms must not be negative");
   expect_error(shoal_connector_flush_table(admin_connector, "down", 0, 0,
                                            &error),
                SHOAL_STATUS_UNAVAILABLE, &error, "manager unavailable");
