@@ -22,7 +22,7 @@
 //	shoal-embed serve   — start an HTTP/gRPC server for external consumers (use --address for container/k8s)
 //
 //	shoal-embed write   — write mutations from stdin (JSON lines)
-//	shoal-embed scan    — scan a table and print results as JSON lines
+//	shoal-embed scan    — scan a table and print results as JSON lines or Parquet
 //	shoal-embed compact — run compaction (with optional REM iterator stack)
 //	shoal-embed init    — create a table with split points
 //	shoal-embed export  — flush and copy a table's RFiles plus manifest
@@ -104,7 +104,7 @@ Usage: shoal-embed <command> [flags]
 Commands:
   init       Create a table with optional split points
   write      Write mutations (JSON lines from stdin)
-  scan       Scan a table, print results as JSON lines
+  scan       Scan a table, print results as JSON lines or Parquet
   compact    Run compaction on a table
   export     Flush and copy a table's RFiles, writing manifest.json
   import     Verify a manifest and register/open the table
@@ -227,10 +227,15 @@ func cmdScan(args []string) {
 	tableName := fs.String("table", "", "table name (required)")
 	rowPrefix := fs.String("row-prefix", "", "filter by row prefix")
 	limit := fs.Int("limit", 0, "max cells to return (0 = unlimited)")
+	format := fs.String("format", "json", "output format: json | parquet")
 	fs.Parse(args)
 
 	if *tableName == "" {
 		die("scan: --table is required")
+	}
+	output, err := newScanOutput(*format, os.Stdout)
+	if err != nil {
+		die("scan: %v", err)
 	}
 
 	eng, err := engine.Open(*dataDir, engine.Options{})
@@ -260,26 +265,9 @@ func cmdScan(args []string) {
 	}
 	defer sc.Close()
 
-	enc := json.NewEncoder(os.Stdout)
-	count := 0
-	for sc.Next() {
-		k := sc.Key()
-		cell := CellJSON{
-			Row: string(k.Row),
-			CF:  string(k.ColumnFamily),
-			CQ:  string(k.ColumnQualifier),
-			CV:  string(k.ColumnVisibility),
-			TS:  k.Timestamp,
-			Val: string(sc.Value()),
-		}
-		enc.Encode(cell)
-		if err := sc.Advance(); err != nil {
-			die("scan: advance: %v", err)
-		}
-		count++
-		if *limit > 0 && count >= *limit {
-			break
-		}
+	count, err := writeScan(sc, output, *limit)
+	if err != nil {
+		die("scan: %v", err)
 	}
 	fmt.Fprintf(os.Stderr, "%d cell(s)\n", count)
 }
