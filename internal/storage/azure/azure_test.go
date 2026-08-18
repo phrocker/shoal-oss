@@ -109,6 +109,38 @@ func TestWriter_Write(t *testing.T) {
 	}
 }
 
+func TestWriter_AbortDiscardsBufferedDataAndRejectsLaterUse(t *testing.T) {
+	w := &writer{}
+	if _, err := w.Write([]byte("hello")); err != nil {
+		t.Fatalf("first Write: %v", err)
+	}
+	if _, err := w.Write([]byte(" azure")); err != nil {
+		t.Fatalf("second Write: %v", err)
+	}
+	if got := w.buf.Len(); got != len("hello azure") {
+		t.Fatalf("buf.Len() before Abort = %d, want %d", got, len("hello azure"))
+	}
+
+	if err := w.Abort(); err != nil {
+		t.Fatalf("Abort: %v", err)
+	}
+	if got := w.buf.Len(); got != 0 {
+		t.Fatalf("buf.Len() after Abort = %d, want 0", got)
+	}
+	if err := w.Abort(); err != nil {
+		t.Fatalf("second Abort: %v", err)
+	}
+	if got := w.buf.Len(); got != 0 {
+		t.Fatalf("buf.Len() after second Abort = %d, want 0", got)
+	}
+	if _, err := w.Write([]byte("late")); err == nil {
+		t.Fatal("Write after Abort succeeded, want error")
+	}
+	if err := w.Close(); err == nil {
+		t.Fatal("Close after Abort succeeded, want error")
+	}
+}
+
 // TestFile_ReadAt_EdgeCases exercises the code paths in file.ReadAt that do not
 // reach the Azure client (negative offset, zero-length, and at/past EOF).
 func TestFile_ReadAt_EdgeCases(t *testing.T) {

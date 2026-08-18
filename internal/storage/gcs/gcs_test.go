@@ -14,17 +14,17 @@ import (
 
 func TestParsePath(t *testing.T) {
 	cases := []struct {
-		in         string
-		bucket     string
-		object     string
-		wantErr    bool
+		in      string
+		bucket  string
+		object  string
+		wantErr bool
 	}{
 		{"gs://my-bucket/path/to/file.rf", "my-bucket", "path/to/file.rf", false},
 		{"my-bucket/path/to/file.rf", "my-bucket", "path/to/file.rf", false},
 		{"gs://b/o", "b", "o", false},
 		{"gs://", "", "", true},
 		{"no-slash", "", "", true},
-		{"gs://b/", "", "", true}, // empty object
+		{"gs://b/", "", "", true},          // empty object
 		{"/leading-slash/o", "", "", true}, // leading slash → empty bucket → error
 		{"", "", "", true},
 	}
@@ -45,6 +45,47 @@ func TestParsePath(t *testing.T) {
 				t.Errorf("got (%q, %q), want (%q, %q)", b, o, c.bucket, c.object)
 			}
 		})
+	}
+}
+
+func TestWriter_AbortUsesCloseWithErrorAndRejectsLaterUse(t *testing.T) {
+	inner := &recordingObjectWriter{}
+	w := &writer{inner: inner}
+
+	if _, err := w.Write([]byte("hello gcs")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if got := inner.buf.String(); got != "hello gcs" {
+		t.Fatalf("inner wrote %q, want %q", got, "hello gcs")
+	}
+
+	if err := w.Abort(); err != nil {
+		t.Fatalf("Abort: %v", err)
+	}
+	if inner.closeCalls != 0 {
+		t.Fatalf("Close calls = %d, want 0", inner.closeCalls)
+	}
+	if inner.closeWithErrorCalls != 1 {
+		t.Fatalf("CloseWithError calls = %d, want 1", inner.closeWithErrorCalls)
+	}
+	if inner.closeWithErrorArg == nil || !strings.Contains(inner.closeWithErrorArg.Error(), "gcs: write aborted") {
+		t.Fatalf("CloseWithError arg = %v, want gcs abort error", inner.closeWithErrorArg)
+	}
+
+	if err := w.Abort(); err != nil {
+		t.Fatalf("second Abort: %v", err)
+	}
+	if inner.closeWithErrorCalls != 1 {
+		t.Fatalf("CloseWithError calls after second Abort = %d, want 1", inner.closeWithErrorCalls)
+	}
+	if _, err := w.Write([]byte("late")); err == nil {
+		t.Fatal("Write after Abort succeeded, want error")
+	}
+	if err := w.Close(); err == nil {
+		t.Fatal("Close after Abort succeeded, want error")
+	}
+	if inner.closeCalls != 0 {
+		t.Fatalf("Close calls after Abort = %d, want 0", inner.closeCalls)
 	}
 }
 
@@ -149,6 +190,28 @@ func TestGCS_CloseIdempotent(t *testing.T) {
 	if err := be.Close(); err != nil {
 		t.Errorf("second Close: %v", err)
 	}
+}
+
+type recordingObjectWriter struct {
+	buf                 bytes.Buffer
+	closeCalls          int
+	closeWithErrorCalls int
+	closeWithErrorArg   error
+}
+
+func (w *recordingObjectWriter) Write(p []byte) (int, error) {
+	return w.buf.Write(p)
+}
+
+func (w *recordingObjectWriter) Close() error {
+	w.closeCalls++
+	return nil
+}
+
+func (w *recordingObjectWriter) CloseWithError(err error) error {
+	w.closeWithErrorCalls++
+	w.closeWithErrorArg = err
+	return nil
 }
 
 // silence unused-import on builds where TestGCS_RoundtripAgainstRealBucket is skipped

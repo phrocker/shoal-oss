@@ -224,8 +224,14 @@ func (g *file) ReadAt(p []byte, off int64) (int, error) {
 	return n, nil
 }
 
+type objectWriter interface {
+	Write([]byte) (int, error)
+	Close() error
+	CloseWithError(error) error
+}
+
 type writer struct {
-	inner   *storage.Writer
+	inner   objectWriter
 	closed  bool
 	aborted bool
 }

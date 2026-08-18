@@ -73,6 +73,8 @@ func main() {
 	level := parseLogLevel(*logLevel)
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
 	slog.SetDefault(logger)
+	cmdCtx, stopCommand := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stopCommand()
 
 	if *zkServers == "" {
 		die("shoal: -zk is required")
@@ -117,30 +119,30 @@ func main() {
 	var bk storage.Backend
 	switch *storageScheme {
 	case "gs", "gcs":
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		ctx, cancel := context.WithTimeout(cmdCtx, 30*time.Second)
 		bk, err = gcs.New(ctx)
 		cancel()
 		if err != nil {
 			die("shoal: gcs.New: %v", err)
 		}
 	case "s3":
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		ctx, cancel := context.WithTimeout(cmdCtx, 30*time.Second)
 		bk, err = s3.New(ctx)
 		cancel()
 		if err != nil {
 			die("shoal: s3.New: %v", err)
 		}
 	case "azure", "azblob", "az":
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		ctx, cancel := context.WithTimeout(cmdCtx, 30*time.Second)
 		bk, err = azure.New(ctx)
 		cancel()
 		if err != nil {
 			die("shoal: azure.New: %v", err)
 		}
 	case "hdfs":
-		hdfsBackend, hdfsErr := hdfs.New(os.Getenv("SHOAL_HDFS_NAMENODE"))
+		hdfsBackend, hdfsErr := hdfs.NewContext(cmdCtx, os.Getenv("SHOAL_HDFS_NAMENODE"))
 		if hdfsErr != nil {
-			die("shoal: hdfs.New: %v", hdfsErr)
+			die("shoal: hdfs.NewContext: %v", hdfsErr)
 		}
 		defer hdfsBackend.Close()
 		bk = hdfsBackend
@@ -215,11 +217,14 @@ func main() {
 	// listener is up.
 	if *prewarmTables != "" {
 		go func() {
-			ctx := context.Background()
+			ctx := cmdCtx
 			tableIDs := scanserver.ParseTableIDs(*prewarmTables)
 			if *prewarmTables == "auto" {
 				resolved, err := enumerateUserTables(ctx, walker, logger)
 				if err != nil {
+					if errors.Is(err, context.Canceled) {
+						return
+					}
 					logger.Warn("prewarm: auto-enumerate failed", slog.Any("err", err))
 					return
 				}
@@ -236,6 +241,7 @@ func main() {
 	// Graceful shutdown.
 	stopCh := make(chan os.Signal, 1)
 	signal.Notify(stopCh, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(stopCh)
 	sig := <-stopCh
 	logger.Info("shutdown signal", slog.String("sig", sig.String()))
 	if err := tserver.Stop(); err != nil {
