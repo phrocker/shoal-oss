@@ -334,10 +334,21 @@ func cmdStatus(args []string) {
 // engine — this is the binary the production write-tier manifests
 // (deploy/k8s, deploy/helm) run.
 //
-// By default both servers bind loopback (127.0.0.1:<--port> and
-// 127.0.0.1:<--metrics-port>). Use --address / --metrics-address to override
-// the bind address verbatim (e.g. 0.0.0.0:9876) — required in containers/k8s
-// pods, where loopback-only is unreachable from a Service.
+// By default the gRPC server binds loopback (127.0.0.1:<--port>); the HTTP
+// observability server, when enabled (see below), also defaults to
+// loopback (127.0.0.1:<--metrics-port>). Use --address / --metrics-address
+// to override either bind address verbatim (e.g. 0.0.0.0:9876) — required
+// in containers/k8s pods, where loopback-only is unreachable from a
+// Service.
+//
+// The gRPC data-plane listener always binds. The HTTP observability
+// surface, however, is opt-in: it only starts if --metrics-port or
+// --metrics-address is explicitly passed. This keeps a bare `shoal-embed
+// serve --port N` — the top-level README's quick-start, and any other
+// pre-existing single-port invocation — from silently gaining a second
+// listening port as a side effect of this flag being added; production
+// manifests (deploy/k8s, deploy/helm) pass --metrics-address explicitly
+// and are unaffected.
 //
 // On SIGINT/SIGTERM the server drains before stopping: it flips /readyz to
 // not-ready first, waits --quiesce-delay so a readiness-polling consumer
@@ -355,8 +366,8 @@ func cmdServe(args []string) {
 	dataDir := fs.String("data", defaultDataDir(), "data directory")
 	port := fs.Int("port", 9876, "gRPC listen port (ignored when --address is non-empty)")
 	address := fs.String("address", "", "override gRPC bind host:port verbatim (e.g. 0.0.0.0:9876 or :9876); when set, --port is ignored")
-	metricsPort := fs.Int("metrics-port", 9877, "observability HTTP listen port for /healthz, /readyz, /stats, /metrics (ignored when --metrics-address is non-empty)")
-	metricsAddress := fs.String("metrics-address", "", "override observability HTTP bind host:port verbatim (e.g. 0.0.0.0:9877); when set, --metrics-port is ignored")
+	metricsPort := fs.Int("metrics-port", 9877, "enable and bind the observability HTTP listen port for /healthz, /readyz, /stats, /metrics (ignored when --metrics-address is non-empty); the HTTP surface is off unless this or --metrics-address is set")
+	metricsAddress := fs.String("metrics-address", "", "enable the observability HTTP surface and override its bind host:port verbatim (e.g. 0.0.0.0:9877); when set, --metrics-port is ignored")
 	drainTimeout := fs.Duration("drain-timeout", 30*time.Second, "max time to wait for in-flight RPCs to finish during graceful shutdown")
 	quiesceDelay := fs.Duration("quiesce-delay", 5*time.Second, "on shutdown, how long to wait after flipping /readyz to not-ready before draining connections — gives a readiness-polling consumer (e.g. a Kubernetes endpoint controller) a chance to stop routing new work first")
 	fs.Parse(args)
@@ -367,10 +378,7 @@ func cmdServe(args []string) {
 	if *address != "" {
 		grpcAddr = *address
 	}
-	metricsAddr := "127.0.0.1:" + strconv.Itoa(*metricsPort)
-	if *metricsAddress != "" {
-		metricsAddr = *metricsAddress
-	}
+	metricsAddr := metricsAddrFromFlags(fs, *metricsPort, *metricsAddress)
 
 	h, err := startServe(serveConfig{
 		DataDir:        *dataDir,
@@ -385,7 +393,11 @@ func cmdServe(args []string) {
 	logger.Info("shoal-embed gRPC serve starting",
 		slog.String("addr", h.GRPCAddr), slog.String("metrics", h.MetricsAddr), slog.String("data", *dataDir))
 	fmt.Fprintf(os.Stderr, "shoal-embed serve: grpc://%s\n", h.GRPCAddr)
-	fmt.Fprintf(os.Stderr, "  health/metrics: http://%s/{healthz,readyz,stats,metrics}\n", h.MetricsAddr)
+	if h.MetricsAddr != "" {
+		fmt.Fprintf(os.Stderr, "  health/metrics: http://%s/{healthz,readyz,stats,metrics}\n", h.MetricsAddr)
+	} else {
+		fmt.Fprintf(os.Stderr, "  health/metrics: disabled (pass --metrics-port or --metrics-address to enable)\n")
+	}
 
 	// RunUntilSignal owns the full graceful-shutdown sequence (drain,
 	// quiesce, bounded stop, engine close) and — critically — does not
@@ -396,6 +408,29 @@ func cmdServe(args []string) {
 	if err := h.RunUntilSignal(sigCh, *quiesceDelay, *drainTimeout); err != nil {
 		die("serve: %v", err)
 	}
+}
+
+// metricsAddrFromFlags resolves the observability HTTP bind address from
+// the --metrics-port / --metrics-address flags, returning "" (disabling
+// the HTTP surface — see startServe) unless the caller explicitly set one
+// of them. fs.Visit only visits flags that were actually set on the
+// command line, so a --metrics-port value that happens to equal the
+// default (9877) still counts as explicit, and an entirely bare `serve`
+// invocation resolves to "".
+func metricsAddrFromFlags(fs *flag.FlagSet, metricsPort int, metricsAddress string) string {
+	if metricsAddress != "" {
+		return metricsAddress
+	}
+	explicit := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "metrics-port" || f.Name == "metrics-address" {
+			explicit = true
+		}
+	})
+	if !explicit {
+		return ""
+	}
+	return "127.0.0.1:" + strconv.Itoa(metricsPort)
 }
 
 func defaultDataDir() string {

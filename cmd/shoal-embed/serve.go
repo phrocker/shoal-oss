@@ -48,7 +48,13 @@ type serveConfig struct {
 	GRPCAddress string
 
 	// MetricsAddress is the bind host:port for the observability HTTP
-	// server. Same loopback-vs-0.0.0.0 tradeoff as GRPCAddress.
+	// server (/healthz, /readyz, /stats, /metrics). Same loopback-vs-
+	// 0.0.0.0 tradeoff as GRPCAddress. Empty disables the HTTP surface
+	// entirely: callers that don't ask for it (e.g. a bare `shoal-embed
+	// serve --port N`, matching the top-level README's quick-start) don't
+	// gain a second listening port as a side effect of upgrading — see
+	// cmdServe's flag handling, which only sets this when the caller
+	// explicitly passed --metrics-port or --metrics-address.
 	MetricsAddress string
 
 	Logger *slog.Logger
@@ -105,7 +111,9 @@ func (u *unaryInFlight) count() int64 { return u.n.Load() }
 
 // startServe opens the engine, binds the gRPC and HTTP listeners, registers
 // the ShoalEmbed and observability handlers, and marks the server ready. It
-// does not block or start accepting connections — call Serve for that.
+// does not block or start accepting connections — call Serve for that. The
+// HTTP observability listener is only bound when cfg.MetricsAddress is
+// non-empty; see its doc comment.
 func startServe(cfg serveConfig) (*serveHandle, error) {
 	logger := cfg.Logger
 	if logger == nil {
@@ -123,11 +131,14 @@ func startServe(cfg serveConfig) (*serveHandle, error) {
 		return nil, fmt.Errorf("grpc listen: %w", err)
 	}
 
-	httpLis, err := net.Listen("tcp", cfg.MetricsAddress)
-	if err != nil {
-		_ = grpcLis.Close()
-		_ = eng.Close()
-		return nil, fmt.Errorf("metrics listen: %w", err)
+	var httpLis net.Listener
+	if cfg.MetricsAddress != "" {
+		httpLis, err = net.Listen("tcp", cfg.MetricsAddress)
+		if err != nil {
+			_ = grpcLis.Close()
+			_ = eng.Close()
+			return nil, fmt.Errorf("metrics listen: %w", err)
+		}
 	}
 
 	inFlight := &unaryInFlight{}
@@ -135,16 +146,28 @@ func startServe(cfg serveConfig) (*serveHandle, error) {
 	embedpb.RegisterShoalEmbedServer(grpcSrv, newEmbedServer(eng))
 
 	obsSrv := obs.NewServer(eng)
-	httpSrv := &http.Server{Handler: obsSrv.Handler()}
+	// obsSrv tracks the ready/not-ready latch regardless of whether the
+	// HTTP surface is enabled, so Drain/SetReady never need to special-case
+	// a disabled httpSrv — only the listener and *http.Server are
+	// conditional.
+	var httpSrv *http.Server
+	if httpLis != nil {
+		httpSrv = &http.Server{Handler: obsSrv.Handler()}
+	}
 
-	// The engine is open and both listeners are bound: declare ready. This
-	// mirrors "shoal-embed up", which flips the same latch once its default
-	// table is provisioned.
+	// The engine is open and the gRPC listener is bound: declare ready.
+	// This mirrors "shoal-embed up", which flips the same latch once its
+	// default table is provisioned.
 	obsSrv.SetReady(true)
+
+	metricsAddr := ""
+	if httpLis != nil {
+		metricsAddr = httpLis.Addr().String()
+	}
 
 	return &serveHandle{
 		GRPCAddr:    grpcLis.Addr().String(),
-		MetricsAddr: httpLis.Addr().String(),
+		MetricsAddr: metricsAddr,
 		eng:         eng,
 		obs:         obsSrv,
 		grpcSrv:     grpcSrv,
@@ -158,13 +181,16 @@ func startServe(cfg serveConfig) (*serveHandle, error) {
 
 // Serve runs the HTTP observability server in the background and the gRPC
 // data-plane server in the foreground, blocking until the gRPC server stops
-// (via Stop, or a fatal accept error).
+// (via Stop, or a fatal accept error). The HTTP server only runs if the
+// observability surface was enabled (cfg.MetricsAddress was non-empty).
 func (h *serveHandle) Serve() error {
-	go func() {
-		if err := h.httpSrv.Serve(h.httpLis); err != nil && err != http.ErrServerClosed {
-			h.logger.Error("observability server stopped", slog.String("err", err.Error()))
-		}
-	}()
+	if h.httpSrv != nil {
+		go func() {
+			if err := h.httpSrv.Serve(h.httpLis); err != nil && err != http.ErrServerClosed {
+				h.logger.Error("observability server stopped", slog.String("err", err.Error()))
+			}
+		}()
+	}
 	return h.grpcSrv.Serve(h.grpcLis)
 }
 
@@ -213,18 +239,20 @@ func (h *serveHandle) Drain() {
 // deeper engine-layer change and is intentionally not attempted here.
 func (h *serveHandle) Stop(ctx context.Context) {
 	var httpDone sync.WaitGroup
-	httpDone.Add(1)
-	go func() {
-		defer httpDone.Done()
-		if err := h.httpSrv.Shutdown(ctx); err != nil {
-			if err == context.DeadlineExceeded {
-				h.logger.Warn("drain deadline exceeded; forcing http close")
-				_ = h.httpSrv.Close()
-			} else {
-				h.logger.Warn("observability server shutdown", slog.String("err", err.Error()))
+	if h.httpSrv != nil {
+		httpDone.Add(1)
+		go func() {
+			defer httpDone.Done()
+			if err := h.httpSrv.Shutdown(ctx); err != nil {
+				if err == context.DeadlineExceeded {
+					h.logger.Warn("drain deadline exceeded; forcing http close")
+					_ = h.httpSrv.Close()
+				} else {
+					h.logger.Warn("observability server shutdown", slog.String("err", err.Error()))
+				}
 			}
-		}
-	}()
+		}()
+	}
 
 	gracefulDone := make(chan struct{})
 	go func() {

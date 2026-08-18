@@ -19,6 +19,7 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"io"
 	"log/slog"
@@ -485,5 +486,120 @@ func TestUnaryInFlightInterceptorTracksActiveCalls(t *testing.T) {
 
 	if got := u.count(); got != 0 {
 		t.Errorf("count() after handler returns = %d, want 0", got)
+	}
+}
+
+// TestStartServeWithoutMetricsAddressDisablesHTTPSurface guards the fix for
+// a real deployability regression: shoal-embed serve used to bind the
+// observability HTTP port unconditionally, which would have broken any
+// pre-existing single-port invocation (e.g. the top-level README's
+// `shoal-embed serve --data ... --port 9876` quick-start) by adding a
+// second listening port as a side effect of upgrading. An empty
+// MetricsAddress must disable the HTTP surface entirely — no listener, no
+// *http.Server, and MetricsAddr left "" — while leaving the gRPC data
+// plane fully functional.
+func TestStartServeWithoutMetricsAddressDisablesHTTPSurface(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	h, err := startServe(serveConfig{
+		DataDir:        t.TempDir(),
+		GRPCAddress:    "127.0.0.1:0",
+		MetricsAddress: "",
+		Logger:         logger,
+	})
+	if err != nil {
+		t.Fatalf("startServe: %v", err)
+	}
+	if h.MetricsAddr != "" {
+		t.Fatalf("MetricsAddr = %q, want empty when MetricsAddress was not set", h.MetricsAddr)
+	}
+	if h.httpSrv != nil {
+		t.Error("httpSrv is non-nil, want nil when the observability HTTP surface is disabled")
+	}
+	if h.httpLis != nil {
+		t.Error("httpLis is non-nil, want nil when the observability HTTP surface is disabled")
+	}
+
+	serveErrCh := make(chan error, 1)
+	go func() { serveErrCh <- h.Serve() }()
+
+	// The gRPC data plane must still work with no HTTP surface at all.
+	conn, err := grpc.NewClient(h.GRPCAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("grpc.NewClient: %v", err)
+	}
+	defer conn.Close()
+	client := embedpb.NewShoalEmbedClient(conn)
+	rpcCtx, rpcCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer rpcCancel()
+	if _, err := client.Status(rpcCtx, &embedpb.StatusRequest{}); err != nil {
+		t.Fatalf("Status RPC with HTTP surface disabled: %v", err)
+	}
+
+	// Drain and Stop must not panic on the nil httpSrv/httpLis.
+	h.Drain()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	h.Stop(ctx)
+
+	select {
+	case err := <-serveErrCh:
+		if err != nil {
+			t.Errorf("Serve() returned %v, want nil after a clean Stop", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Serve did not return within 5s of Stop")
+	}
+}
+
+// TestMetricsAddrFromFlags proves the CLI opt-in contract cmdServe relies
+// on: the observability HTTP surface only turns on when the caller
+// explicitly passes --metrics-port or --metrics-address, even if
+// --metrics-port happens to be set to its own default value.
+func TestMetricsAddrFromFlags(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{
+			name: "no flags disables the HTTP surface",
+			args: nil,
+			want: "",
+		},
+		{
+			name: "explicit metrics-port enables it on loopback",
+			args: []string{"--metrics-port=8888"},
+			want: "127.0.0.1:8888",
+		},
+		{
+			name: "explicit metrics-port matching the default still counts as explicit",
+			args: []string{"--metrics-port=9877"},
+			want: "127.0.0.1:9877",
+		},
+		{
+			name: "explicit metrics-address enables it verbatim and wins over metrics-port",
+			args: []string{"--metrics-address=0.0.0.0:9999", "--metrics-port=1234"},
+			want: "0.0.0.0:9999",
+		},
+		{
+			name: "unrelated flags don't count as explicit",
+			args: []string{"--data=/tmp/x"},
+			want: "",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fs := flag.NewFlagSet("serve", flag.ContinueOnError)
+			fs.String("data", "", "")
+			metricsPort := fs.Int("metrics-port", 9877, "")
+			metricsAddress := fs.String("metrics-address", "", "")
+			if err := fs.Parse(tt.args); err != nil {
+				t.Fatalf("fs.Parse(%v): %v", tt.args, err)
+			}
+			got := metricsAddrFromFlags(fs, *metricsPort, *metricsAddress)
+			if got != tt.want {
+				t.Errorf("metricsAddrFromFlags(%v) = %q, want %q", tt.args, got, tt.want)
+			}
+		})
 	}
 }
