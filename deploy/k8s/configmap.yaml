@@ -6,10 +6,12 @@ metadata:
     app.kubernetes.io/name: shoal
     app.kubernetes.io/part-of: shoal-platform
 data:
-  # shoal-embed serve supports only --data and --port today.
-  # TODO(shoal): add a listen-address flag; cmd/shoal-embed currently binds 127.0.0.1.
+  # The write-tier manifest explicitly opts into shoal-embed serve's HTTP
+  # observability listener with --metrics-address (see write-tier.yaml); the
+  # CLI default remains the legacy one-port gRPC-only behavior.
   SHOAL_EMBED_DATA_DIR: /var/lib/shoal
   SHOAL_EMBED_GRPC_PORT: "9876"
+  SHOAL_EMBED_METRICS_PORT: "9877"
 
   # Desired shared object-store configuration for the write tier/read fleet.
   # TODO(shoal): cmd/shoal-embed has no storage backend/bucket/prefix flags yet,
