@@ -79,6 +79,17 @@ func testConnectorWithDiscovery(
 	},
 	names *fakeTableNames,
 ) *Connector {
+	return testConnectorWithDiscoveryAndState(t, walker, names, nil)
+}
+
+func testConnectorWithDiscoveryAndState(
+	t *testing.T,
+	walker interface {
+		LocateTable(context.Context, string) ([]metadata.TabletInfo, error)
+	},
+	names *fakeTableNames,
+	state tableStateReader,
+) *Connector {
 	t.Helper()
 	instance, err := NewStaticInstance("accumulo", "uuid-1")
 	if err != nil {
@@ -92,7 +103,7 @@ func testConnectorWithDiscovery(
 	if err != nil {
 		t.Fatal(err)
 	}
-	connector.discovery = newConnectorDiscovery(walker, names)
+	connector.discovery = newConnectorDiscovery(walker, names, state)
 	t.Cleanup(func() { _ = connector.Close() })
 	return connector
 }

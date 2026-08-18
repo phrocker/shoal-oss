@@ -5,13 +5,16 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/apache/thrift/lib/go/thrift"
 	"github.com/phrocker/shoal/internal/managerclient"
 	"github.com/phrocker/shoal/internal/metadata"
+	"github.com/phrocker/shoal/internal/zk"
 )
 
 // ExecuteStatus and UpdateTabletMergeability keep the shared
@@ -193,6 +196,29 @@ func (w *scriptedTabletWalker) callCount() int {
 	return w.calls
 }
 
+type fakeTableStateReader struct {
+	states map[string]zk.TableStateResult
+	err    error
+}
+
+func (r *fakeTableStateReader) TableState(
+	ctx context.Context,
+	tableID string,
+) (zk.TableStateResult, error) {
+	if err := ctx.Err(); err != nil {
+		return zk.TableStateResult{}, err
+	}
+	if r != nil && r.err != nil {
+		return zk.TableStateResult{}, r.err
+	}
+	if r != nil {
+		if state, ok := r.states[tableID]; ok {
+			return state, nil
+		}
+	}
+	return zk.TableStateResult{Exists: true, State: "ONLINE"}, nil
+}
+
 func splitTestTablets() []metadata.TabletInfo {
 	return []metadata.TabletInfo{
 		{TableID: "1", EndRow: []byte("k")},
@@ -208,8 +234,19 @@ func splitTestConnector(
 	},
 	names *fakeTableNames,
 ) (*Connector, *fakeSplitManager) {
+	return splitTestConnectorWithState(t, walker, names, nil)
+}
+
+func splitTestConnectorWithState(
+	t *testing.T,
+	walker interface {
+		LocateTable(context.Context, string) ([]metadata.TabletInfo, error)
+	},
+	names *fakeTableNames,
+	state tableStateReader,
+) (*Connector, *fakeSplitManager) {
 	t.Helper()
-	connector := testConnectorWithDiscovery(t, walker, names)
+	connector := testConnectorWithDiscoveryAndState(t, walker, names, state)
 	manager := &fakeSplitManager{}
 	connector.manager = manager
 	connector.managerAddr = fakeManagerAddress{address: "manager:9997"}
@@ -425,6 +462,32 @@ func TestAddTableSplitsExistingSplitOnlyRefreshesMergeability(t *testing.T) {
 	}
 }
 
+func TestAddTableSplitsRejectsOfflineTableBeforeAnyManagerWork(t *testing.T) {
+	walker := &scriptedTabletWalker{rounds: [][]metadata.TabletInfo{splitTestTablets()}}
+	state := &fakeTableStateReader{states: map[string]zk.TableStateResult{
+		"1": {Exists: true, State: zk.TableStateOffline},
+	}}
+	connector, manager := splitTestConnectorWithState(t, walker, splitTestNames(), state)
+
+	err := connector.AddTableSplits(
+		context.Background(),
+		"events",
+		[][]byte{[]byte("k"), []byte("m")},
+	)
+	if !errors.Is(err, ErrTableOffline) {
+		t.Fatalf("error = %v, want ErrTableOffline", err)
+	}
+	if calls := manager.splitCalls(); len(calls) != 0 {
+		t.Fatalf("offline table still started split FATE: %#v", calls)
+	}
+	if merges := manager.mergeCalls(); len(merges) != 0 {
+		t.Fatalf("offline table still refreshed mergeability: %#v", merges)
+	}
+	if walker.callCount() != 0 {
+		t.Fatalf("offline table still resolved tablets %d time(s)", walker.callCount())
+	}
+}
+
 func TestAddTableSplitsRetriesMergeabilityTabletsTheManagerRejected(t *testing.T) {
 	walker := &scriptedTabletWalker{rounds: [][]metadata.TabletInfo{splitTestTablets()}}
 	connector, manager := splitTestConnector(t, walker, splitTestNames())
@@ -553,6 +616,35 @@ func TestAddTableSplitsFailsAfterBoundedRetries(t *testing.T) {
 	}
 }
 
+func TestAddSplitsSkipsTheFinalRetryDelay(t *testing.T) {
+	walker := &scriptedTabletWalker{rounds: [][]metadata.TabletInfo{splitTestTablets()}}
+	connector, manager := splitTestConnector(t, walker, splitTestNames())
+	manager.statusFn = func(int, managerclient.Request) (string, error) {
+		return "", nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	target := splitTarget{
+		tableName: "events",
+		tableID:   "1",
+		address:   "manager:9997",
+		manager:   manager,
+		discovery: connector.discovery,
+		retry: splitRetryPolicy{
+			attempts:       1,
+			initialBackoff: 200 * time.Millisecond,
+			backoffStep:    200 * time.Millisecond,
+			maxBackoff:     200 * time.Millisecond,
+		},
+	}
+	err := addSplits(ctx, target, [][]byte{[]byte("m")})
+	if !errors.Is(err, ErrTableSplitsIncomplete) {
+		t.Fatalf("error = %v, want ErrTableSplitsIncomplete without a final delay", err)
+	}
+}
+
 func TestAddTableSplitsDefaultRetryPolicyIsBounded(t *testing.T) {
 	policy := defaultSplitRetryPolicy()
 	if policy.attempts != splitRetryAttempts ||
@@ -676,6 +768,52 @@ func TestAddTableSplitsMapsManagerErrors(t *testing.T) {
 	}
 }
 
+func TestAddTableSplitsMapsRetryableEndpointFailures(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+	}{
+		{
+			name: "transport",
+			err:  thrift.NewTTransportExceptionFromError(errors.New("reset")),
+		},
+		{
+			name: "network",
+			err:  &net.DNSError{Err: "lookup failed", Name: "manager", IsTemporary: true},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			walker := &scriptedTabletWalker{rounds: [][]metadata.TabletInfo{splitTestTablets()}}
+			connector, manager := splitTestConnector(t, walker, splitTestNames())
+			manager.statusFn = func(int, managerclient.Request) (string, error) {
+				return "", tt.err
+			}
+
+			err := connector.AddTableSplits(
+				context.Background(),
+				"events",
+				[][]byte{[]byte("m")},
+			)
+			if !errors.Is(err, ErrManagerUnavailable) {
+				t.Fatalf("error = %v, want ErrManagerUnavailable", err)
+			}
+			switch tt.name {
+			case "transport":
+				var transportErr thrift.TTransportException
+				if !errors.As(err, &transportErr) {
+					t.Fatalf("error = %v, want transport cause preserved", err)
+				}
+			case "network":
+				var networkErr net.Error
+				if !errors.As(err, &networkErr) {
+					t.Fatalf("error = %v, want network cause preserved", err)
+				}
+			}
+		})
+	}
+}
+
 func TestAddTableSplitsMapsMissingTableAndDiscoveryFailures(t *testing.T) {
 	walker := &scriptedTabletWalker{rounds: [][]metadata.TabletInfo{splitTestTablets()}}
 	connector, _ := splitTestConnector(t, walker, splitTestNames())
@@ -721,6 +859,27 @@ func TestAddTableSplitsValidatesInputs(t *testing.T) {
 	}
 	if calls := manager.splitCalls(); len(calls) != 0 {
 		t.Fatalf("rejected input still reached the manager: %#v", calls)
+	}
+}
+
+func TestAddTableSplitsRejectsMalformedExistingTableNames(t *testing.T) {
+	walker := &scriptedTabletWalker{rounds: [][]metadata.TabletInfo{splitTestTablets()}}
+	connector, manager := splitTestConnector(t, walker, splitTestNames())
+
+	for _, name := range []string{"bad name", ".events", "analytics.bad-name"} {
+		if err := connector.AddTableSplits(
+			context.Background(),
+			name,
+			[][]byte{[]byte("m")},
+		); !errors.Is(err, ErrInvalidTableName) {
+			t.Fatalf("table %q error = %v, want ErrInvalidTableName", name, err)
+		}
+	}
+	if calls := manager.splitCalls(); len(calls) != 0 {
+		t.Fatalf("invalid table name still reached the manager: %#v", calls)
+	}
+	if walker.callCount() != 0 {
+		t.Fatalf("invalid table name still resolved tablets %d time(s)", walker.callCount())
 	}
 }
 

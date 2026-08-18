@@ -131,6 +131,10 @@ Accumulo source revision `317c288568e9c46e7854aafb8bb8c4fda6260b12`.
   - `addSplits` = `putSplits(tableName,
     TabletMergeabilityUtil.userDefaultSplits(splits))`, i.e. every
     user-requested split point carries `TabletMergeability.never()`
+  - `putSplits` first validates `EXISTING_TABLE_NAME`, resolves the table
+    ID, and calls `requireNotOffline(tableId, tableName)` before any
+    tablet mapping, so malformed names and OFFLINE tables fail before
+    either `updateTabletMergeability` or `TABLE_SPLIT`
   - `putSplits` loops until nothing is pending: invalidate the tablet
     cache, map each pending split row to the tablet whose
     `(prevEndRow, endRow]` range contains it, then run one FATE

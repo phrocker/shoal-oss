@@ -8,6 +8,7 @@ import (
 	"github.com/phrocker/shoal/internal/cache"
 	"github.com/phrocker/shoal/internal/metadata"
 	"github.com/phrocker/shoal/internal/tablenames"
+	"github.com/phrocker/shoal/internal/zk"
 )
 
 // Table is an Accumulo table identity.
@@ -44,15 +45,25 @@ type tableNameResolver interface {
 	Invalidate()
 }
 
+type tableStateReader interface {
+	TableState(context.Context, string) (zk.TableStateResult, error)
+}
+
 type connectorDiscovery struct {
 	tablets *cache.LocatorCache
 	names   tableNameResolver
+	state   tableStateReader
 }
 
-func newConnectorDiscovery(tablets cache.TableLocator, names tableNameResolver) *connectorDiscovery {
+func newConnectorDiscovery(
+	tablets cache.TableLocator,
+	names tableNameResolver,
+	state tableStateReader,
+) *connectorDiscovery {
 	return &connectorDiscovery{
 		tablets: cache.New(tablets),
 		names:   names,
+		state:   state,
 	}
 }
 

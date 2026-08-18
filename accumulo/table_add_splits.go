@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/phrocker/shoal/internal/managerclient"
@@ -89,6 +90,12 @@ type splitPlan struct {
 // A nil or empty collection, or any nil or zero-length row, is rejected with
 // ErrInvalidTableSplit.
 //
+// tableName must satisfy Accumulo's existing-table-name validator before it
+// is resolved; malformed non-empty names fail with ErrInvalidTableName. The
+// table also must not be OFFLINE when planning starts, even if every
+// requested split row already exists and only mergeability refreshes are
+// needed.
+//
 // Each requested row is mapped to the tablet whose (PrevRow, EndRow] range
 // contains it and every row landing in the same tablet is submitted as a
 // single FATE operation, exactly as Accumulo's putSplits does. Rows that
@@ -112,8 +119,8 @@ type splitPlan struct {
 // ErrManagerUnavailable. The legacy tablet-server splitTablet RPC removed in
 // Accumulo 4 is never used.
 func (c *Connector) AddTableSplits(ctx context.Context, tableName string, splits [][]byte) error {
-	if tableName == "" {
-		return fmt.Errorf("%w: empty table name", ErrInvalidTableName)
+	if err := validateExistingTableName(tableName); err != nil {
+		return err
 	}
 	pending, err := normalizeSplitRows(splits)
 	if err != nil {
@@ -142,6 +149,9 @@ func (c *Connector) AddTableSplits(ctx context.Context, tableName string, splits
 	if err != nil {
 		return fmt.Errorf("accumulo: resolve table name %q: %w", tableName, err)
 	}
+	if err := requireTableNotOffline(ctx, discovery.state, tableID, tableName); err != nil {
+		return err
+	}
 
 	address, err := resolver.Address(ctx)
 	if errors.Is(err, zk.ErrManagerUnavailable) {
@@ -164,6 +174,80 @@ func (c *Connector) AddTableSplits(ctx context.Context, tableName string, splits
 		discovery: discovery,
 		retry:     defaultSplitRetryPolicy(),
 	}, pending)
+}
+
+func validateExistingTableName(tableName string) error {
+	if tableName == "" {
+		return fmt.Errorf("%w: empty table name", ErrInvalidTableName)
+	}
+	dot := strings.IndexByte(tableName, '.')
+	if dot == 0 {
+		return fmt.Errorf(
+			"%w: table name must include a namespace before '.'",
+			ErrInvalidTableName,
+		)
+	}
+	tablePart := tableName
+	if dot > 0 {
+		namespacePart := tableName[:dot]
+		if !isExistingTableNameSegment(namespacePart) {
+			return fmt.Errorf(
+				"%w: namespace %q contains invalid characters",
+				ErrInvalidTableName,
+				namespacePart,
+			)
+		}
+		tablePart = tableName[dot+1:]
+	}
+	if strings.TrimSpace(tablePart) == "" {
+		return fmt.Errorf("%w: table name must not be blank", ErrInvalidTableName)
+	}
+	if !isExistingTableNameSegment(tablePart) {
+		return fmt.Errorf(
+			"%w: table name %q contains invalid characters",
+			ErrInvalidTableName,
+			tablePart,
+		)
+	}
+	return nil
+}
+
+func isExistingTableNameSegment(segment string) bool {
+	if segment == "" {
+		return false
+	}
+	for _, r := range segment {
+		switch {
+		case r == '_':
+		case r >= '0' && r <= '9':
+		case r >= 'A' && r <= 'Z':
+		case r >= 'a' && r <= 'z':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func requireTableNotOffline(
+	ctx context.Context,
+	states tableStateReader,
+	tableID, tableName string,
+) error {
+	if states == nil {
+		return nil
+	}
+	state, err := states.TableState(ctx, tableID)
+	if err != nil {
+		return fmt.Errorf("accumulo: read table state for %q: %w", tableName, err)
+	}
+	if !state.Exists {
+		return fmt.Errorf("%w: table %q", ErrTableNotFound, tableName)
+	}
+	if state.State == zk.TableStateOffline {
+		return fmt.Errorf("%w: table %q", ErrTableOffline, tableName)
+	}
+	return nil
 }
 
 // addSplits runs bounded split rounds until nothing is pending, a manager
@@ -190,6 +274,9 @@ func addSplits(ctx context.Context, target splitTarget, pending [][]byte) error 
 		}
 		if len(pending) == 0 {
 			return nil
+		}
+		if attempt+1 == target.retry.attempts {
+			break
 		}
 		if err := waitForWriterRetry(ctx, backoff); err != nil {
 			return err
@@ -439,6 +526,9 @@ func nextSplitBackoff(backoff time.Duration, policy splitRetryPolicy) time.Durat
 // while preserving the original error chain, so a joined FATE cleanup
 // failure stays reachable through errors.Is alongside the sentinel.
 func mapSplitError(tableName string, err error) error {
+	if managerclient.IsRetryableEndpointError(err) {
+		return fmt.Errorf("%w: table %q: %w", ErrManagerUnavailable, tableName, err)
+	}
 	var managerErr *managerclient.Error
 	if !errors.As(err, &managerErr) {
 		return fmt.Errorf("accumulo: add splits to table %q: %w", tableName, err)
