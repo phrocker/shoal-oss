@@ -54,6 +54,29 @@ func newOwnedConnector(connector connectorAPI, instance accumulo.Instance) *owne
 	}
 }
 
+func (c *ownedConnector) retain() (func(), error) {
+	c.mu.Lock()
+	c.ensureStateLocked()
+	if c.closed.Load() {
+		c.mu.Unlock()
+		return nil, accumulo.ErrConnectorClosed
+	}
+	if c.active == 0 {
+		c.idle = make(chan struct{})
+	}
+	c.active++
+	c.mu.Unlock()
+
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			c.mu.Lock()
+			c.releaseActiveLocked()
+			c.mu.Unlock()
+		})
+	}, nil
+}
+
 func (c *ownedConnector) begin(timeout time.Duration) (context.Context, func(), error) {
 	c.mu.Lock()
 	c.ensureStateLocked()
@@ -98,10 +121,7 @@ func (c *ownedConnector) begin(timeout time.Duration) (context.Context, func(), 
 		once.Do(func() {
 			c.mu.Lock()
 			delete(c.cancels, id)
-			c.active--
-			if c.active == 0 {
-				close(c.idle)
-			}
+			c.releaseActiveLocked()
 			c.mu.Unlock()
 			cancel()
 		})
@@ -216,6 +236,13 @@ func (c *ownedConnector) ensureStateLocked() {
 	}
 }
 
+func (c *ownedConnector) releaseActiveLocked() {
+	c.active--
+	if c.active == 0 {
+		close(c.idle)
+	}
+}
+
 func (c *ownedConnector) isClosed() bool {
 	return c != nil && c.closed.Load()
 }
@@ -275,6 +302,7 @@ var connectors = newConnectorRegistry()
 type ownedScanner struct {
 	single *accumulo.Scanner
 	batch  *accumulo.BatchScanner
+	owner  *ownedConnector
 
 	mu      sync.Mutex
 	closed  bool
@@ -283,10 +311,15 @@ type ownedScanner struct {
 	active  sync.WaitGroup
 }
 
-func newOwnedScanner(single *accumulo.Scanner, batch *accumulo.BatchScanner) *ownedScanner {
+func newOwnedScanner(
+	single *accumulo.Scanner,
+	batch *accumulo.BatchScanner,
+	owner *ownedConnector,
+) *ownedScanner {
 	return &ownedScanner{
 		single:  single,
 		batch:   batch,
+		owner:   owner,
 		nextID:  1,
 		cancels: make(map[uint64]context.CancelFunc),
 	}
@@ -298,7 +331,26 @@ func (s *ownedScanner) begin(timeout time.Duration) (context.Context, func(), er
 		s.mu.Unlock()
 		return nil, nil, accumulo.ErrConnectorClosed
 	}
-	var id uint64
+	var ownerDone func()
+	if s.owner != nil {
+		var err error
+		ownerDone, err = s.owner.retain()
+		if err != nil {
+			s.mu.Unlock()
+			return nil, nil, err
+		}
+	}
+	var (
+		id     uint64
+		ctx    context.Context
+		cancel context.CancelFunc
+	)
+	var err error
+	defer func() {
+		if err != nil && ownerDone != nil {
+			ownerDone()
+		}
+	}()
 	for attempts := uint64(0); attempts < ^uint64(0); attempts++ {
 		id = s.nextID
 		s.nextID++
@@ -314,10 +366,9 @@ func (s *ownedScanner) begin(timeout time.Duration) (context.Context, func(), er
 	}
 	if id == 0 {
 		s.mu.Unlock()
-		return nil, nil, errors.New("shoal: scanner operation space exhausted")
+		err = errors.New("shoal: scanner operation space exhausted")
+		return nil, nil, err
 	}
-	var ctx context.Context
-	var cancel context.CancelFunc
 	if timeout == 0 {
 		ctx, cancel = context.WithCancel(context.Background())
 	} else {
@@ -335,6 +386,9 @@ func (s *ownedScanner) begin(timeout time.Duration) (context.Context, func(), er
 			s.mu.Unlock()
 			cancel()
 			s.active.Done()
+			if ownerDone != nil {
+				ownerDone()
+			}
 		})
 	}
 	return ctx, done, nil

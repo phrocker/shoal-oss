@@ -54,7 +54,7 @@ func shoal_connector_create_scanner(
 	if err != nil {
 		return failForError(outError, err)
 	}
-	owned := newOwnedScanner(scanner, nil)
+	owned := newOwnedScanner(scanner, nil, connector)
 	id, ok := scanners.add(owned)
 	if !ok {
 		return fail(outError, C.SHOAL_STATUS_INTERNAL, errors.New("shoal: scanner handle space exhausted"))
@@ -96,7 +96,7 @@ func shoal_connector_create_batch_scanner(
 	if err != nil {
 		return failForError(outError, err)
 	}
-	owned := newOwnedScanner(nil, scanner)
+	owned := newOwnedScanner(nil, scanner, connector)
 	id, ok := batchScanners.add(owned)
 	if !ok {
 		return fail(outError, C.SHOAL_STATUS_INTERNAL, errors.New("shoal: batch scanner handle space exhausted"))

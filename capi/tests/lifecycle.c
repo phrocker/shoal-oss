@@ -251,11 +251,17 @@ int main(void) {
          SHOAL_STATUS_OUT_OF_MEMORY);
   assert(error == NULL);
   shoal_test_error_message_alloc_reset();
+  assert(shoal_connector_flush_table(admin_connector, "events", 0, 0, &error) ==
+         SHOAL_STATUS_OK);
+  assert(error == NULL);
+  assert(shoal_connector_flush_table(admin_connector, "events", 1, 0, &error) ==
+         SHOAL_STATUS_OK);
+  assert(error == NULL);
+  assert(shoal_test_connector_flush_wait_count(admin_connector, 0) == 1);
+  assert(shoal_test_connector_flush_wait_count(admin_connector, 1) == 1);
   expect_error(shoal_connector_flush_table(admin_connector, "down", 0, 0,
                                            &error),
                SHOAL_STATUS_UNAVAILABLE, &error, "manager unavailable");
-  assert(shoal_connector_flush_table(admin_connector, "events", 1, 0, &error) ==
-         SHOAL_STATUS_OK);
 
   assert(shoal_connector_set_table_property(
              admin_connector, "events", "table.custom.alpha", "alpha", 0,
@@ -479,6 +485,38 @@ int main(void) {
   assert(structured_extent.committed == 2);
   shoal_write_failure_free(&write_failure);
   shoal_batch_writer_free(&writer);
+
+  {
+    static const struct {
+      size_t fail_after;
+      const char *message_part;
+    } write_failure_alloc_cases[] = {
+        {0, "failed extent 0 server"},
+        {1, "failed extent 0 table id"},
+        {2, "constraint 0 server"},
+        {3, "constraint 0 class"},
+        {4, "constraint 0 description"},
+        {5, "authorization 0 server"},
+        {6, "authorization 0 table id"},
+        {7, "authorization 0 code"},
+        {8, "cleanup 0 server"},
+        {9, "cleanup 0 message"},
+    };
+    for (size_t i = 0; i < sizeof(write_failure_alloc_cases) /
+                               sizeof(write_failure_alloc_cases[0]);
+         ++i) {
+      shoal_test_string_alloc_fail_after(write_failure_alloc_cases[i].fail_after);
+      assert(shoal_test_batch_writer_create(
+          SHOAL_TEST_WRITER_STRUCTURED_FAILURE, &writer));
+      expect_error(shoal_batch_writer_flush(writer, 0, &write_failure, &error),
+                   SHOAL_STATUS_OUT_OF_MEMORY, &error,
+                   write_failure_alloc_cases[i].message_part);
+      assert(write_failure == NULL);
+      shoal_batch_writer_free(&writer);
+      assert(writer == NULL);
+      shoal_test_string_alloc_reset();
+    }
+  }
 
   assert(shoal_test_batch_writer_create(SHOAL_TEST_WRITER_STICKY_DEADLINE,
                                         &writer));

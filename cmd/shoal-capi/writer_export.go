@@ -677,13 +677,19 @@ func finishWrite(
 		data := flattenWriteFailure(err)
 		if data.flags != 0 || len(data.failedExtents) != 0 || len(data.constraints) != 0 ||
 			len(data.authorizations) != 0 || len(data.cleanups) != 0 {
-			*outFailure = allocateWriteFailure(data)
+			failure, code, allocErr := allocateWriteFailure(data)
+			if allocErr != nil {
+				return fail(outError, code, allocErr)
+			}
+			*outFailure = failure
 		}
 	}
 	return failForError(outError, err)
 }
 
-func allocateWriteFailure(data writeFailureData) *C.shoal_write_failure {
+func allocateWriteFailure(
+	data writeFailureData,
+) (*C.shoal_write_failure, C.shoal_status, error) {
 	failure := C.shoal_bridge_write_failure_alloc(
 		data.flags,
 		C.size_t(len(data.failedExtents)),
@@ -692,30 +698,31 @@ func allocateWriteFailure(data writeFailureData) *C.shoal_write_failure {
 		C.size_t(len(data.cleanups)),
 	)
 	if failure == nil {
-		return nil
+		return nil, C.SHOAL_STATUS_OUT_OF_MEMORY, errors.New("shoal: allocate write failure")
 	}
 	for index, entry := range data.failedExtents {
-		if !setFailedExtent(failure, index, entry) {
+		code, err := setFailedExtent(failure, index, entry)
+		if err != nil {
 			C.shoal_bridge_write_failure_free(failure)
-			return nil
+			return nil, code, err
 		}
 	}
 	for index, entry := range data.constraints {
-		server, _, err := bridgeCString(entry.server, fmt.Sprintf("constraint %d server", index))
+		server, code, err := bridgeCString(entry.server, fmt.Sprintf("constraint %d server", index))
 		if err != nil {
 			C.shoal_bridge_write_failure_free(failure)
-			return nil
+			return nil, code, err
 		}
-		className, _, err := bridgeCString(
+		className, code, err := bridgeCString(
 			entry.value.ConstraintClass,
 			fmt.Sprintf("constraint %d class", index),
 		)
 		if err != nil {
 			C.shoal_bridge_string_free(server)
 			C.shoal_bridge_write_failure_free(failure)
-			return nil
+			return nil, code, err
 		}
-		description, _, err := bridgeCString(
+		description, code, err := bridgeCString(
 			entry.value.Description,
 			fmt.Sprintf("constraint %d description", index),
 		)
@@ -723,7 +730,7 @@ func allocateWriteFailure(data writeFailureData) *C.shoal_write_failure {
 			C.shoal_bridge_string_free(server)
 			C.shoal_bridge_string_free(className)
 			C.shoal_bridge_write_failure_free(failure)
-			return nil
+			return nil, code, err
 		}
 		ok := C.shoal_bridge_write_failure_set_constraint(
 			failure,
@@ -739,26 +746,27 @@ func allocateWriteFailure(data writeFailureData) *C.shoal_write_failure {
 		C.shoal_bridge_string_free(description)
 		if !ok {
 			C.shoal_bridge_write_failure_free(failure)
-			return nil
+			return nil, C.SHOAL_STATUS_OUT_OF_MEMORY, fmt.Errorf("shoal: allocate constraint %d entry", index)
 		}
 	}
 	for index, entry := range data.authorizations {
-		if !setAuthorizationFailure(failure, index, entry) {
+		code, err := setAuthorizationFailure(failure, index, entry)
+		if err != nil {
 			C.shoal_bridge_write_failure_free(failure)
-			return nil
+			return nil, code, err
 		}
 	}
 	for index, entry := range data.cleanups {
-		server, _, err := bridgeCString(entry.server, fmt.Sprintf("cleanup %d server", index))
+		server, code, err := bridgeCString(entry.server, fmt.Sprintf("cleanup %d server", index))
 		if err != nil {
 			C.shoal_bridge_write_failure_free(failure)
-			return nil
+			return nil, code, err
 		}
-		message, _, err := bridgeCString(entry.message, fmt.Sprintf("cleanup %d message", index))
+		message, code, err := bridgeCString(entry.message, fmt.Sprintf("cleanup %d message", index))
 		if err != nil {
 			C.shoal_bridge_string_free(server)
 			C.shoal_bridge_write_failure_free(failure)
-			return nil
+			return nil, code, err
 		}
 		ok := C.shoal_bridge_write_failure_set_cleanup(
 			failure,
@@ -770,25 +778,25 @@ func allocateWriteFailure(data writeFailureData) *C.shoal_write_failure {
 		C.shoal_bridge_string_free(message)
 		if !ok {
 			C.shoal_bridge_write_failure_free(failure)
-			return nil
+			return nil, C.SHOAL_STATUS_OUT_OF_MEMORY, fmt.Errorf("shoal: allocate cleanup %d entry", index)
 		}
 	}
-	return failure
+	return failure, C.SHOAL_STATUS_OK, nil
 }
 
 func setFailedExtent(
 	failure *C.shoal_write_failure,
 	index int,
 	entry flattenedFailedExtent,
-) bool {
-	server, _, err := bridgeCString(entry.server, fmt.Sprintf("failed extent %d server", index))
+) (C.shoal_status, error) {
+	server, code, err := bridgeCString(entry.server, fmt.Sprintf("failed extent %d server", index))
 	if err != nil {
-		return false
+		return code, err
 	}
-	tableID, _, err := bridgeCString(entry.value.Extent.TableID, fmt.Sprintf("failed extent %d table id", index))
+	tableID, code, err := bridgeCString(entry.value.Extent.TableID, fmt.Sprintf("failed extent %d table id", index))
 	if err != nil {
 		C.shoal_bridge_string_free(server)
-		return false
+		return code, err
 	}
 	ok := C.shoal_bridge_write_failure_set_failed_extent(
 		failure,
@@ -806,28 +814,31 @@ func setFailedExtent(
 	) != 0
 	C.shoal_bridge_string_free(server)
 	C.shoal_bridge_string_free(tableID)
-	return ok
+	if !ok {
+		return C.SHOAL_STATUS_OUT_OF_MEMORY, fmt.Errorf("shoal: allocate failed extent %d entry", index)
+	}
+	return C.SHOAL_STATUS_OK, nil
 }
 
 func setAuthorizationFailure(
 	failure *C.shoal_write_failure,
 	index int,
 	entry flattenedAuthorization,
-) bool {
-	server, _, err := bridgeCString(entry.server, fmt.Sprintf("authorization %d server", index))
+) (C.shoal_status, error) {
+	server, code, err := bridgeCString(entry.server, fmt.Sprintf("authorization %d server", index))
 	if err != nil {
-		return false
+		return code, err
 	}
-	tableID, _, err := bridgeCString(entry.value.Extent.TableID, fmt.Sprintf("authorization %d table id", index))
+	tableID, code, err := bridgeCString(entry.value.Extent.TableID, fmt.Sprintf("authorization %d table id", index))
 	if err != nil {
 		C.shoal_bridge_string_free(server)
-		return false
+		return code, err
 	}
-	code, _, err := bridgeCString(entry.value.Code, fmt.Sprintf("authorization %d code", index))
+	codeValue, code, err := bridgeCString(entry.value.Code, fmt.Sprintf("authorization %d code", index))
 	if err != nil {
 		C.shoal_bridge_string_free(server)
 		C.shoal_bridge_string_free(tableID)
-		return false
+		return code, err
 	}
 	ok := C.shoal_bridge_write_failure_set_authorization(
 		failure,
@@ -840,12 +851,15 @@ func setAuthorizationFailure(
 		bytePointer(entry.value.Extent.EndRow),
 		C.size_t(len(entry.value.Extent.EndRow)),
 		boolByte(entry.value.Extent.EndRow != nil),
-		code,
+		codeValue,
 	) != 0
 	C.shoal_bridge_string_free(server)
 	C.shoal_bridge_string_free(tableID)
-	C.shoal_bridge_string_free(code)
-	return ok
+	C.shoal_bridge_string_free(codeValue)
+	if !ok {
+		return C.SHOAL_STATUS_OUT_OF_MEMORY, fmt.Errorf("shoal: allocate authorization %d entry", index)
+	}
+	return C.SHOAL_STATUS_OK, nil
 }
 
 func boolByte(value bool) C.uint8_t {

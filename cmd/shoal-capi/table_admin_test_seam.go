@@ -23,6 +23,8 @@ type testAdminConnector struct {
 	nextID     int
 	tables     map[string]string
 	properties map[string]map[string]string
+	flushFalse int
+	flushTrue  int
 }
 
 func newTestAdminConnector() *testAdminConnector {
@@ -150,7 +152,7 @@ func (c *testAdminConnector) RenameTable(ctx context.Context, oldName, newName s
 func (c *testAdminConnector) FlushTable(
 	ctx context.Context,
 	name string,
-	_ bool,
+	wait bool,
 ) error {
 	if err := c.maybeTableError(ctx, name, accumulo.ErrManagerUnavailable); err != nil {
 		return err
@@ -160,7 +162,21 @@ func (c *testAdminConnector) FlushTable(
 	if _, exists := c.tables[name]; !exists {
 		return accumulo.ErrTableNotFound
 	}
+	if wait {
+		c.flushTrue++
+	} else {
+		c.flushFalse++
+	}
 	return nil
+}
+
+func (c *testAdminConnector) flushWaitCount(wait bool) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if wait {
+		return c.flushTrue
+	}
+	return c.flushFalse
 }
 
 func (c *testAdminConnector) SetTableProperty(
@@ -279,6 +295,26 @@ func shoal_test_connector_create(outConnector **C.shoal_connector) C.int {
 	}
 	*outConnector = handle
 	return 1
+}
+
+//export shoal_test_connector_flush_wait_count
+func shoal_test_connector_flush_wait_count(
+	handle *C.shoal_connector,
+	wait C.uint8_t,
+) C.size_t {
+	connector, err := lookupConnector(handle)
+	if err != nil {
+		return 0
+	}
+	admin, ok := connector.connector.(*testAdminConnector)
+	if !ok {
+		return 0
+	}
+	waitForCompletion, err := boolFlag(wait, "wait")
+	if err != nil {
+		return 0
+	}
+	return C.size_t(admin.flushWaitCount(waitForCompletion))
 }
 
 //export shoal_test_string_alloc_fail_after

@@ -103,14 +103,17 @@ Version numbers change only when the public ABI contract changes:
 - Table administration calls (`list_tables`, `table_exists`, `create`,
   `delete`, `rename`, `flush`, property mutation, and effective property
   reads) accept per-call deadlines. Connector close prevents new calls,
-  cancels and joins active table-administration calls, and remains idempotent
-  while the handle stays alive.
+  cancels and joins active table-administration calls, waits for any
+  already-started scanner or batch-scanner calls to finish before final
+  teardown, and remains idempotent while the handle stays alive.
 - Scanner configuration, ranges, and all nested arrays/bytes are borrowed only
   for the creating or scan call. Shoal copies every value it retains.
 - Scanner and batch-scanner handles support concurrent scan calls. Close
   cancels and joins in-flight calls and is idempotent while the handle remains
   alive; free performs best-effort close and sets the handle variable to
-  `NULL`.
+  `NULL`. Once connector close/free starts, new scan calls fail with
+  `SHOAL_STATUS_CLOSED`, but already-started scans are allowed to finish
+  before connector teardown.
 - Table list and effective-property results own all returned strings. Views
   from `shoal_table_list_get` and `shoal_table_properties_get` remain valid
   until the matching result is freed. Effective properties preserve explicit

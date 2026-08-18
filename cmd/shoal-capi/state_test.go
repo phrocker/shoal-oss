@@ -526,7 +526,7 @@ func TestOwnedConnectorCloseIsConcurrentAndIdempotent(t *testing.T) {
 }
 
 func TestOwnedScannerCloseCancelsAndJoinsActiveCalls(t *testing.T) {
-	scanner := newOwnedScanner(nil, nil)
+	scanner := newOwnedScanner(nil, nil, nil)
 	ctx, done, err := scanner.begin(0)
 	if err != nil {
 		t.Fatal(err)
@@ -564,7 +564,7 @@ func TestOwnedScannerCloseCancelsAndJoinsActiveCalls(t *testing.T) {
 }
 
 func TestOwnedScannerCloseIsConcurrentAndIdempotent(t *testing.T) {
-	scanner := newOwnedScanner(nil, nil)
+	scanner := newOwnedScanner(nil, nil, nil)
 	const callers = 16
 	var wait sync.WaitGroup
 	wait.Add(callers)
@@ -578,7 +578,7 @@ func TestOwnedScannerCloseIsConcurrentAndIdempotent(t *testing.T) {
 }
 
 func TestOwnedScannerDeadline(t *testing.T) {
-	scanner := newOwnedScanner(nil, nil)
+	scanner := newOwnedScanner(nil, nil, nil)
 	ctx, done, err := scanner.begin(time.Millisecond)
 	if err != nil {
 		t.Fatal(err)
@@ -591,6 +591,93 @@ func TestOwnedScannerDeadline(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("operation context did not reach deadline")
+	}
+}
+
+func TestOwnedScannerOwnerCloseBoundedRejectsNewCallsAndWaitsForInflightScans(t *testing.T) {
+	originalFreeTimeout := connectorFreeTimeout
+	connectorFreeTimeout = 20 * time.Millisecond
+	t.Cleanup(func() {
+		connectorFreeTimeout = originalFreeTimeout
+	})
+
+	connectorCloseStarted := make(chan struct{})
+	var connectorCloses atomic.Int32
+	var instanceCloses atomic.Int32
+	owner := newOwnedConnector(
+		&fakeConnectorAPI{close: func() error {
+			connectorCloses.Add(1)
+			close(connectorCloseStarted)
+			return nil
+		}},
+		fakeConnectorInstance{close: func() error {
+			instanceCloses.Add(1)
+			return nil
+		}},
+	)
+	adminCtx, adminDone, err := owner.begin(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scanner := newOwnedScanner(nil, nil, owner)
+	batchScanner := newOwnedScanner(nil, nil, owner)
+	scannerCtx, scannerDone, err := scanner.begin(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	closeReturned := make(chan error, 1)
+	go func() {
+		closeReturned <- owner.closeBounded(connectorFreeTimeout)
+	}()
+
+	select {
+	case err := <-closeReturned:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("closeBounded error = %v, want deadline exceeded", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("closeBounded remained blocked waiting for active admin call")
+	}
+	if !errors.Is(adminCtx.Err(), context.Canceled) {
+		t.Fatalf("admin context error = %v, want canceled", adminCtx.Err())
+	}
+	select {
+	case <-scannerCtx.Done():
+		t.Fatalf("scanner context error = %v, want in-flight scan to continue", scannerCtx.Err())
+	default:
+	}
+	if _, _, err := scanner.begin(0); !errors.Is(err, accumulo.ErrConnectorClosed) {
+		t.Fatalf("scanner begin after owner close error = %v, want connector closed", err)
+	}
+	if _, _, err := batchScanner.begin(0); !errors.Is(err, accumulo.ErrConnectorClosed) {
+		t.Fatalf("batch scanner begin after owner close error = %v, want connector closed", err)
+	}
+
+	adminDone()
+	select {
+	case <-connectorCloseStarted:
+		t.Fatal("connector close started before in-flight scanner completed")
+	default:
+	}
+
+	scannerDone()
+	select {
+	case <-connectorCloseStarted:
+	case <-time.After(time.Second):
+		t.Fatal("connector close did not start after scanner completed")
+	}
+	deadline := time.After(time.Second)
+	for connectorCloses.Load() != 1 || instanceCloses.Load() != 1 {
+		select {
+		case <-deadline:
+			t.Fatalf(
+				"close counts = connector:%d instance:%d, want 1/1",
+				connectorCloses.Load(),
+				instanceCloses.Load(),
+			)
+		case <-time.After(10 * time.Millisecond):
+		}
 	}
 }
 

@@ -63,8 +63,10 @@ shoal_connector_create(const shoal_connector_config *config,
 
 /*
  * Closes connector-owned transports and bootstrap resources. Close is
- * idempotent while the handle remains alive and cancels then joins active
- * table-administration calls.
+ * idempotent while the handle remains alive, cancels active
+ * table-administration calls, and waits for those plus any in-flight scanner
+ * or batch-scanner calls to finish before tearing down connector-owned
+ * resources.
  */
 SHOAL_API shoal_status SHOAL_CALL
 shoal_connector_close(shoal_connector *connector, shoal_error **out_error);
@@ -72,7 +74,10 @@ shoal_connector_close(shoal_connector *connector, shoal_error **out_error);
 /*
  * Closes and releases an owned connector handle, then sets *connector to NULL.
  * Passing NULL or a pointer whose value is NULL is a no-op. Call close first
- * when its error must be observed.
+ * when its error must be observed. Any scanner or batch-scanner created from
+ * this connector permanently rejects new operations as soon as close/free
+ * starts, while in-flight scan calls are allowed to finish before final
+ * teardown.
  */
 SHOAL_API void SHOAL_CALL shoal_connector_free(shoal_connector **connector);
 
@@ -172,8 +177,9 @@ shoal_table_properties_free(shoal_table_properties_result **result);
 
 /*
  * Creates a scanner. The configuration and all nested values are copied.
- * Scanner handles remain valid after connector free, but operations then fail
- * with CLOSED because the underlying connector has been shut down.
+ * Scanner handles remain valid after connector free, but once connector close
+ * or free starts, new operations fail with CLOSED while already-started scans
+ * are allowed to finish before connector teardown.
  */
 SHOAL_API shoal_status SHOAL_CALL
 shoal_connector_create_scanner(shoal_connector *connector,
