@@ -9,6 +9,7 @@ import (
 
 	"github.com/phrocker/shoal/internal/engine"
 	"github.com/phrocker/shoal/internal/storage"
+	"golang.org/x/text/unicode/norm"
 )
 
 // StageBulkDir copies every RFile referenced by manifest from src (the
@@ -122,6 +123,19 @@ func StageBulkDir(
 // source, but the second copy would silently overwrite the first while
 // the load mapping still lists both names as independent files.
 //
+// Every unique manifest source path is also checked against every
+// *other* unique source path: two different DestinationPath strings
+// that physically alias each other (e.g. one is a symlink or hard link
+// to the other, or they differ only by case or Unicode normalization
+// form) each individually verify against their own recorded size/SHA256
+// and flatten to distinct basenames, so neither the target-vs-source
+// nor the target-vs-target check above would reject them — StageBulkDir
+// would stage two independent, fully-successful copies of what is
+// really the same underlying file. That isn't data-destroying like the
+// aliases above, but it silently duplicates the source's rows once
+// Accumulo bulk-imports both flattened copies under loadmap.json's two
+// independent names.
+//
 // The all-pairs comparison is O(N^2) in the number of write targets, but
 // the underlying os.Stat calls are cached in one pathIdentityCache shared
 // across the whole comparison (O(N) stats: each unique source path and
@@ -145,6 +159,18 @@ func checkNoStagingAliases(flatNames map[string]string, bulkDir string) error {
 	targets = append(targets, joinBulkPath(bulkDir, bulkLoadMappingFile))
 
 	cache := make(pathIdentityCache, len(srcPaths)+len(targets))
+	for i, srcPath := range srcPaths {
+		// Compare against later sources only: an unordered pair
+		// (srcPath, other) only needs checking once.
+		for _, other := range srcPaths[i+1:] {
+			if pathsAlias(srcPath, other, cache) {
+				return fmt.Errorf(
+					"promotion: stage: manifest sources %s and %s resolve to the same physical file; refusing to stage duplicate copies",
+					srcPath, other,
+				)
+			}
+		}
+	}
 	for i, target := range targets {
 		for _, srcPath := range srcPaths {
 			if pathsAlias(srcPath, target, cache) {
@@ -183,12 +209,14 @@ func checkNoStagingAliases(flatNames map[string]string, bulkDir string) error {
 // URL-style paths (containing "://") have no local filesystem entry to
 // inspect, so those are compared as normalized strings only. Filesystem-
 // style paths are first compared the same way as a cheap common-case
-// check, then a case-insensitive lexical comparison (Windows and macOS
-// default to case-insensitive filesystems, where two differently-cased
-// paths can alias even before either exists, which os.Stat cannot
-// detect), then — because both lexical comparisons still miss an absolute
-// source path aliasing an equivalent relative destination path (or vice
-// versa), and misses a destination reached through a symlink or hard
+// check, then a case- and Unicode-normalization-insensitive lexical
+// comparison (Windows and macOS default to case-insensitive filesystems,
+// and macOS additionally normalizes Unicode filenames, so two paths
+// differing only in case and/or normalization form can alias even
+// before either exists, which os.Stat cannot detect), then — because
+// none of the lexical comparisons above catch an absolute source path
+// aliasing an equivalent relative destination path (or vice versa), nor
+// a destination reached through a symlink or hard
 // link to the same source file — checked for physical identity via
 // os.Stat + os.SameFile, which both backends ultimately resolve through
 // (local.Backend.Open/Create pass paths straight to the os package). If
@@ -234,17 +262,20 @@ func pathsAlias(srcPath, dstPath string, cache pathIdentityCache) bool {
 		return true
 	}
 	// Windows and macOS (by default) resolve filesystem paths
-	// case-insensitively, so two paths differing only in case can name
-	// the same file even before either exists — a case the physical-
-	// identity stat below cannot catch, since it needs an existing file
-	// to stat, and two not-yet-created destinations both correctly stat
-	// as "doesn't exist" right up until the second Create silently
-	// resolves onto the first. Treating a case-insensitive lexical match
-	// as a potential alias is conservative — it may also reject a
-	// legitimate same-case-insensitive-spelling collision on a genuinely
-	// case-sensitive filesystem — matching this package's preference for
-	// a safe false positive over a data-destroying false negative.
-	if strings.EqualFold(srcClean, dstClean) {
+	// case-insensitively, and macOS additionally normalizes Unicode
+	// filenames to NFD on disk, so composed and decomposed spellings of
+	// the same character (e.g. NFC vs NFD "é") also name the same file
+	// there — both cases can alias even before either path exists, which
+	// the physical-identity stat below cannot catch, since it needs an
+	// existing file to stat, and two not-yet-created destinations both
+	// correctly stat as "doesn't exist" right up until the second Create
+	// silently resolves onto the first. Normalizing both cleaned paths to
+	// NFC before folding case is conservative — it may also reject a
+	// legitimate same-spelling collision on a genuinely case-sensitive,
+	// normalization-preserving filesystem — matching this package's
+	// preference for a safe false positive over a data-destroying false
+	// negative.
+	if strings.EqualFold(norm.NFC.String(srcClean), norm.NFC.String(dstClean)) {
 		return true
 	}
 	srcInfo := cache.stat(srcPath)

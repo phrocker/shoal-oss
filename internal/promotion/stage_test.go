@@ -296,6 +296,17 @@ func TestStagePathsAlias(t *testing.T) {
 		{name: "distinct local paths", src: `/data/t-0000/F0001.rf`, dst: `/bulk/events-1/F0001.rf`, want: false},
 		{name: "identical relative paths", src: "export/events/t-0000/F0001.rf", dst: "export/events/t-0000/F0001.rf", want: true},
 		{name: "local paths differing only by case", src: `/bulk/events-1/A.rf`, dst: `/bulk/events-1/a.rf`, want: true},
+		{
+			name: "local paths differing only by unicode normalization form",
+			// "café.rf" spelled two ways: src uses the precomposed NFC
+			// "é" (U+00E9); dst uses the decomposed NFD form, "e"
+			// (U+0065) followed by a combining acute accent (U+0301).
+			// Visually identical, byte-for-byte different -- exactly the
+			// spelling macOS's default filesystem treats as one file.
+			src:  "/bulk/events-1/caf\u00e9.rf",
+			dst:  "/bulk/events-1/cafe\u0301.rf",
+			want: true,
+		},
 		{name: "identical url paths", src: "hdfs://nn/export/t-0000/F0001.rf", dst: "hdfs://nn/export/t-0000/F0001.rf", want: true},
 		{name: "url paths differing only by trailing slash", src: "hdfs://nn/export/t-0000/F0001.rf", dst: "hdfs://nn/export/t-0000/F0001.rf/", want: true},
 		{name: "distinct url paths", src: "hdfs://nn/export/t-0000/F0001.rf", dst: "hdfs://nn/bulk/events-1/F0001.rf", want: false},
@@ -755,5 +766,65 @@ func TestStageBulkDirRejectsCaseInsensitiveAliasBeforeCopying(t *testing.T) {
 	}
 	if string(gotLower) != string(lowerContent) {
 		t.Fatalf("source file a.rf corrupted by rejected stage: got %q, want %q", gotLower, lowerContent)
+	}
+}
+
+// TestStageBulkDirRejectsHardLinkedSourcesBeforeCopying proves the
+// preflight also catches two different manifest source paths that are
+// hard-linked to each other -- physically the same file, reached via
+// two distinct DestinationPath strings with distinct basenames. Neither
+// the target-vs-source nor the target-vs-target check catches this: each
+// source individually verifies (VerifyRFileExport reads the same
+// physical bytes twice, once per path, and both match their own
+// recorded size/SHA256), flattenNames assigns two distinct basenames
+// (A.rf and B.rf), and neither flattened destination aliases the other
+// or any source. Without a source-vs-source check, StageBulkDir would
+// "succeed," but Accumulo would receive the same underlying RFile
+// content twice under two independent names in loadmap.json --
+// silently duplicating every row the file contains.
+func TestStageBulkDirRejectsHardLinkedSourcesBeforeCopying(t *testing.T) {
+	root := t.TempDir()
+	exportDir := filepath.Join(root, "export")
+	if err := os.MkdirAll(exportDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	aPath := filepath.Join(exportDir, "A.rf")
+	bPath := filepath.Join(exportDir, "B.rf")
+	content := []byte("rfile bytes reachable through two different source paths")
+	if err := os.WriteFile(aPath, content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(aPath, bPath); err != nil {
+		t.Skipf("hard links not supported in this environment: %v", err)
+	}
+
+	bulkDir := filepath.Join(root, "bulk")
+	if err := os.MkdirAll(bulkDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	sum := sha256.Sum256(content)
+	manifest := &engine.RFileExportManifest{
+		Version:     engine.RFileExportManifestVersion,
+		SourceTable: "events",
+		Tablets:     []engine.RFileExportTablet{{Index: 0}},
+		RFiles: []engine.RFileExportFile{
+			{TabletIndex: 0, DestinationPath: aPath, Size: int64(len(content)), SHA256: hex.EncodeToString(sum[:])},
+			{TabletIndex: 0, DestinationPath: bPath, Size: int64(len(content)), SHA256: hex.EncodeToString(sum[:])},
+		},
+	}
+
+	be := local.New()
+	ctx := context.Background()
+	if _, err := StageBulkDir(ctx, be, manifest, be, bulkDir); err == nil {
+		t.Fatal("StageBulkDir with two hard-linked manifest sources = nil error, want error")
+	}
+
+	entries, err := os.ReadDir(bulkDir)
+	if err != nil {
+		t.Fatalf("reading bulkDir after rejected stage: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("bulkDir has %d entries after rejected stage, want 0 (no partial copy)", len(entries))
 	}
 }

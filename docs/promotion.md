@@ -175,6 +175,22 @@ RFileExportManifest (existing)  →  promotion.BuildLoadMapping
   name the same physical file there without either path ever being
   stat-able beforehand, letting the second copy silently overwrite the
   first while the load mapping still lists both as independent files.
+  The same case-insensitive comparison also normalizes Unicode
+  filenames to NFC before folding case, so composed and decomposed
+  spellings of the same character (e.g. NFC vs NFD `é`) are treated as a
+  potential alias too — macOS's default filesystem normalizes filenames
+  the same way, so two differently-encoded but visually identical
+  basenames would otherwise collide there just like a case difference
+  would.
+  Every unique manifest source path is additionally checked against
+  every *other* unique source path, not only against write targets: two
+  different `DestinationPath` values that are physically the same file
+  (e.g. reached via a symlink/hard link, or differing only by case or
+  Unicode normalization) would each individually verify and flatten to
+  distinct basenames, so `StageBulkDir` would otherwise "succeed" while
+  staging two independent copies of the same underlying file — not
+  destroying data, but silently duplicating it once Accumulo bulk-imports
+  both flattened copies.
 - `internal/promotion.Promote` — composes `StageBulkDir` with a
   `BulkImporter` (satisfied by `*accumulo.Connector`) to submit the FATE
   call. Submits nothing when the derived mapping is empty (nothing to
