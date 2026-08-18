@@ -63,9 +63,11 @@ import (
 // same location, and two manifest sources that are themselves the same
 // physical file reached through two different DestinationPath spellings
 // (for example a symlink/hard link, or a case/Unicode-normalization
-// difference) — which would otherwise each verify and flatten
-// independently, so StageBulkDir would "succeed" while staging two
-// duplicate copies of the same file for Accumulo to bulk import twice.
+// difference). If those aliases flatten to the same basename,
+// StageBulkDir dedupes them to one staged file; if they flatten to
+// different basenames, StageBulkDir rejects the manifest as ambiguous
+// rather than staging the same physical file twice under different
+// names for Accumulo to bulk import.
 //
 // Those aliases are dangerous because storage.Copy opens the destination
 // for writing before it reads the source bytes: on backends like local,
@@ -83,7 +85,7 @@ func StageBulkDir(
 	if manifest == nil {
 		return nil, fmt.Errorf("promotion: nil export manifest")
 	}
-	if err := validateBulkDir(bulkDir); err != nil {
+	if err := validateBulkDirOnBackend(dst, bulkDir); err != nil {
 		return nil, err
 	}
 	if _, _, err := resolveManifestTablet(manifest); err != nil {
@@ -111,7 +113,7 @@ func StageBulkDir(
 		return nil, err
 	}
 	for _, rf := range stageManifest.RFiles {
-		dstPath := joinBulkPath(bulkDir, flatNames[rf.DestinationPath])
+		dstPath := joinBulkPath(dst, bulkDir, flatNames[rf.DestinationPath])
 		if _, err := storage.Copy(ctx, src, rf.DestinationPath, dst, dstPath); err != nil {
 			return nil, fmt.Errorf("promotion: stage %s: %w", rf.DestinationPath, err)
 		}
@@ -156,12 +158,12 @@ func checkNoStagingAliases(src, dst storage.Backend, flatNames map[string]string
 		srcPaths = append(srcPaths, stagePathRef{backend: src, path: srcPath})
 		targets = append(targets, stageWriteTarget{
 			name: flatName,
-			path: joinBulkPath(bulkDir, flatName),
+			path: joinBulkPath(dst, bulkDir, flatName),
 		})
 	}
 	targets = append(targets, stageWriteTarget{
 		name: bulkLoadMappingFile,
-		path: joinBulkPath(bulkDir, bulkLoadMappingFile),
+		path: joinBulkPath(dst, bulkDir, bulkLoadMappingFile),
 	})
 
 	cache := newPathIdentityCache(len(srcPaths) + len(targets))
@@ -307,7 +309,7 @@ func sourceRefsAlias(left, right stagePathRef, cache pathIdentityCache) bool {
 		return os.SameFile(leftInfo, rightInfo)
 	}
 
-	if pathLooksURLLike(left.path) || pathLooksURLLike(right.path) {
+	if pathLooksURLLikeOnBackend(left.backend, left.path) || pathLooksURLLikeOnBackend(right.backend, right.path) {
 		return strings.TrimRight(left.path, `/\`) == strings.TrimRight(right.path, `/\`)
 	}
 	return left.path == right.path
@@ -428,7 +430,7 @@ func pathsAlias(srcPath, dstPath stagePathRef, cache pathIdentityCache) bool {
 		return os.SameFile(srcInfo, dstInfo)
 	}
 
-	if pathLooksURLLike(srcPath.path) || pathLooksURLLike(dstPath.path) {
+	if pathLooksURLLikeOnBackend(srcPath.backend, srcPath.path) || pathLooksURLLikeOnBackend(dstPath.backend, dstPath.path) {
 		return strings.TrimRight(srcPath.path, `/\`) == strings.TrimRight(dstPath.path, `/\`)
 	}
 
@@ -544,7 +546,7 @@ func appendLocalPathParts(prefix string, parts []string) string {
 }
 
 func usesLocalFilesystemSemantics(ref stagePathRef) bool {
-	if explicitBackendScheme(ref.path) != "" {
+	if explicitBackendSchemeOnBackend(ref.backend, ref.path) != "" {
 		return false
 	}
 	backend := unwrapBackend(ref.backend)
@@ -556,7 +558,7 @@ func usesLocalFilesystemSemantics(ref stagePathRef) bool {
 }
 
 func canonicalBackendPath(ref stagePathRef) (string, bool) {
-	scheme := explicitBackendScheme(ref.path)
+	scheme := explicitBackendSchemeOnBackend(ref.backend, ref.path)
 	switch b := unwrapBackend(ref.backend).(type) {
 	case *s3.Backend:
 		if scheme != "" && scheme != "s3" {
@@ -660,17 +662,11 @@ func canonicalHDFSString(authority, resolved string) string {
 }
 
 func explicitBackendScheme(path string) string {
-	if looksLikeWindowsDrivePath(path) {
-		return ""
-	}
-	if strings.HasPrefix(path, "hdfs:/") {
-		return "hdfs"
-	}
-	matches := urlStylePathRe.FindStringSubmatch(path)
-	if len(matches) != 2 {
-		return ""
-	}
-	return strings.ToLower(matches[1])
+	return explicitBackendSchemeOnBackend(nil, path)
+}
+
+func explicitBackendSchemeOnBackend(backend storage.Backend, path string) string {
+	return storage.ExplicitPathScheme(backend, path)
 }
 
 func unwrapBackend(backend storage.Backend) storage.Backend {

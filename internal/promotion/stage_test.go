@@ -22,6 +22,15 @@ import (
 	"github.com/phrocker/shoal/internal/storage/s3"
 )
 
+type schemeAwareBackend struct {
+	shstorage.Backend
+	schemes []string
+}
+
+func (b schemeAwareBackend) BackendPathSchemes() []string {
+	return b.schemes
+}
+
 func TestStageBulkDirFlattensCopiesAndWritesLoadMapping(t *testing.T) {
 	src := memory.New()
 	src.Put("export/events/t-0000/F0001.rf", []byte("tablet0-file1"))
@@ -472,7 +481,7 @@ func TestPathUsesBackendSeparatorJoin(t *testing.T) {
 }
 
 func TestJoinBulkPathTreatsWindowsDrivePathAsLocal(t *testing.T) {
-	got := joinBulkPath(`C://data`, "F0001.rf")
+	got := joinBulkPath(local.New(), `C://data`, "F0001.rf")
 	if got == `C://data/F0001.rf` {
 		t.Fatalf("joinBulkPath treated C://data as a backend URL root: got %q", got)
 	}
@@ -482,9 +491,27 @@ func TestJoinBulkPathTreatsWindowsDrivePathAsLocal(t *testing.T) {
 }
 
 func TestJoinBulkPathPreservesCustomSchemeRoot(t *testing.T) {
-	got := joinBulkPath("custom+backend://bucket/prefix", "F0001.rf")
+	got := joinBulkPath(memory.New(), "custom+backend://bucket/prefix", "F0001.rf")
 	if got != "custom+backend://bucket/prefix/F0001.rf" {
 		t.Fatalf("joinBulkPath(custom scheme) = %q, want %q", got, "custom+backend://bucket/prefix/F0001.rf")
+	}
+}
+
+func TestPathUsesBackendSeparatorJoinAcceptsDeclaredSingleCharacterScheme(t *testing.T) {
+	backend := schemeAwareBackend{Backend: memory.New(), schemes: []string{"x"}}
+	if !pathUsesBackendSeparatorJoinOnBackend(backend, "x://bucket/F0001.rf") {
+		t.Fatalf("pathUsesBackendSeparatorJoinOnBackend(x scheme backend, x://bucket/F0001.rf) = false, want true")
+	}
+	if pathUsesBackendSeparatorJoinOnBackend(local.New(), "x://bucket/F0001.rf") {
+		t.Fatalf("pathUsesBackendSeparatorJoinOnBackend(local backend, x://bucket/F0001.rf) = true, want false")
+	}
+}
+
+func TestJoinBulkPathPreservesDeclaredSingleCharacterSchemeRoot(t *testing.T) {
+	backend := schemeAwareBackend{Backend: memory.New(), schemes: []string{"x"}}
+	got := joinBulkPath(backend, "x://bucket/prefix", "F0001.rf")
+	if got != "x://bucket/prefix/F0001.rf" {
+		t.Fatalf("joinBulkPath(single-char scheme) = %q, want %q", got, "x://bucket/prefix/F0001.rf")
 	}
 }
 
@@ -509,6 +536,16 @@ func TestIsBackendRootDistinguishesWindowsDrivePaths(t *testing.T) {
 				t.Fatalf("isBackendRoot(%q) = %v, want %v", tt.path, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestIsBackendRootAcceptsDeclaredSingleCharacterScheme(t *testing.T) {
+	backend := schemeAwareBackend{Backend: memory.New(), schemes: []string{"x"}}
+	if !isBackendRootOnBackend(backend, "x://bucket/") {
+		t.Fatalf("isBackendRootOnBackend(x scheme backend, x://bucket/) = false, want true")
+	}
+	if isBackendRootOnBackend(local.New(), "x://bucket/") {
+		t.Fatalf("isBackendRootOnBackend(local backend, x://bucket/) = true, want false")
 	}
 }
 

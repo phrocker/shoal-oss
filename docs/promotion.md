@@ -179,11 +179,11 @@ RFileExportManifest (existing)  →  promotion.BuildLoadMapping
   every *other* unique source path, not only against write targets: two
   different `DestinationPath` values that are physically the same file
   (e.g. reached via a symlink/hard link, or differing only by case or
-  Unicode normalization) would each individually verify and flatten to
-  distinct basenames, so `StageBulkDir` would otherwise "succeed" while
-  staging two independent copies of the same underlying file — not
-  destroying data, but silently duplicating it once Accumulo bulk-imports
-  both flattened copies.
+  Unicode normalization) are deduped when they flatten to the same
+  basename, but rejected when they would flatten to different basenames:
+  staging the same underlying file twice under two bulk-import names
+  would silently duplicate it once Accumulo imports both flattened
+  copies.
   Built-in remote/object-store paths (S3, GCS, Azure, HDFS) are
   canonicalized through each backend's own path parser before
   comparison, so a qualified spelling like `s3://bucket/key` and its
