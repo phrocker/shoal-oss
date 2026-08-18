@@ -14,44 +14,33 @@ func TestStageBulkDirFlattensCopiesAndWritesLoadMapping(t *testing.T) {
 	src := memory.New()
 	src.Put("export/events/t-0000/F0001.rf", []byte("tablet0-file1"))
 	src.Put("export/events/t-0000/F0002.rf", []byte("tablet0-file2"))
-	src.Put("export/events/t-0002/F0003.rf", []byte("tablet2-file1"))
 
 	manifest := &engine.RFileExportManifest{
 		Version:     engine.RFileExportManifestVersion,
 		SourceTable: "events",
-		Tablets: []engine.RFileExportTablet{
-			{Index: 0, EndRow: strPtr("g")},
-			{Index: 1, StartRow: strPtr("g"), EndRow: strPtr("p")},
-			{Index: 2, StartRow: strPtr("p")},
-		},
-		// SHA256/Size must match the Put content above exactly: StageBulkDir
-		// now runs engine.VerifyRFileExport before copying anything.
+		Tablets:     []engine.RFileExportTablet{{Index: 0}},
 		RFiles: []engine.RFileExportFile{
 			{TabletIndex: 0, DestinationPath: "export/events/t-0000/F0001.rf", Size: 13, SHA256: "e47fb24ed70774dd8af7d59bf58fc740e126716aac3474bd262eb17f3e395e43"},
 			{TabletIndex: 0, DestinationPath: "export/events/t-0000/F0002.rf", Size: 13, SHA256: "066219c3f0f1a1bfccf12ef7e4d6957d102b3bf2e047fca44ba178a92e526cf0"},
-			{TabletIndex: 2, DestinationPath: "export/events/t-0002/F0003.rf", Size: 13, SHA256: "73595a5ac087b50583aaccc894558360559fa8406b808102cff9e4fe8816f466"},
 		},
 	}
 
 	dst := memory.New()
 	ctx := context.Background()
-	// Use a URL-style bulk dir (as a real deployment would: an HDFS or
-	// object-storage path) so the expected staged paths below are OS
-	// independent - joinBulkPath always joins URL-style roots with a
-	// literal "/", regardless of the host OS's path separator.
 	mapping, err := StageBulkDir(ctx, src, manifest, dst, "hdfs://nn/bulk/events-1")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(mapping) != 2 {
-		t.Fatalf("mapping entries = %d, want 2", len(mapping))
+	if len(mapping) != 1 {
+		t.Fatalf("mapping entries = %d, want 1", len(mapping))
+	}
+	if mapping[0].Tablet.EndRow != nil || mapping[0].Tablet.PrevEndRow != nil {
+		t.Fatalf("mapping tablet = %#v, want fully unbounded single tablet", mapping[0].Tablet)
 	}
 
-	// Files must be flattened directly into the bulk dir, not nested.
 	for _, want := range []string{
 		"hdfs://nn/bulk/events-1/F0001.rf",
 		"hdfs://nn/bulk/events-1/F0002.rf",
-		"hdfs://nn/bulk/events-1/F0003.rf",
 		"hdfs://nn/bulk/events-1/loadmap.json",
 	} {
 		f, err := dst.Open(ctx, want)
@@ -61,8 +50,6 @@ func TestStageBulkDirFlattensCopiesAndWritesLoadMapping(t *testing.T) {
 		f.Close()
 	}
 
-	// Content must match the source bytes exactly (a real copy, not a
-	// zero-length placeholder).
 	f, err := dst.Open(ctx, "hdfs://nn/bulk/events-1/F0001.rf")
 	if err != nil {
 		t.Fatal(err)
@@ -76,8 +63,6 @@ func TestStageBulkDirFlattensCopiesAndWritesLoadMapping(t *testing.T) {
 		t.Fatalf("staged content = %q, want %q", buf, "tablet0-file1")
 	}
 
-	// Round-tripping the written load mapping must match what StageBulkDir
-	// returned.
 	onDisk, err := ReadLoadMapping(ctx, dst, "hdfs://nn/bulk/events-1")
 	if err != nil {
 		t.Fatal(err)
@@ -89,19 +74,16 @@ func TestStageBulkDirFlattensCopiesAndWritesLoadMapping(t *testing.T) {
 
 func TestStageBulkDirRejectsBasenameCollisionBeforeCopying(t *testing.T) {
 	src := memory.New()
-	src.Put("export/events/t-0000/F0001.rf", []byte("a"))
-	src.Put("export/events/t-0002/F0001.rf", []byte("b")) // same basename, different tablet
+	src.Put("export/events/t-0000/part-a/F0001.rf", []byte("a"))
+	src.Put("export/events/t-0000/part-b/F0001.rf", []byte("b"))
 
 	manifest := &engine.RFileExportManifest{
 		Version:     engine.RFileExportManifestVersion,
 		SourceTable: "events",
-		Tablets: []engine.RFileExportTablet{
-			{Index: 0, EndRow: strPtr("g")},
-			{Index: 2, StartRow: strPtr("p")},
-		},
+		Tablets:     []engine.RFileExportTablet{{Index: 0}},
 		RFiles: []engine.RFileExportFile{
-			{TabletIndex: 0, DestinationPath: "export/events/t-0000/F0001.rf", Size: 1},
-			{TabletIndex: 2, DestinationPath: "export/events/t-0002/F0001.rf", Size: 1},
+			{TabletIndex: 0, DestinationPath: "export/events/t-0000/part-a/F0001.rf", Size: 1},
+			{TabletIndex: 0, DestinationPath: "export/events/t-0000/part-b/F0001.rf", Size: 1},
 		},
 	}
 
@@ -138,8 +120,6 @@ func TestStageBulkDirRejectsCorruptSourceBeforeCopying(t *testing.T) {
 		SourceTable: "events",
 		Tablets:     []engine.RFileExportTablet{{Index: 0}},
 		RFiles: []engine.RFileExportFile{
-			// Size/SHA256 deliberately don't match the real bytes above -
-			// e.g. a stale manifest from before the export was re-run.
 			{TabletIndex: 0, DestinationPath: "export/events/t-0000/F0001.rf", Size: 999, SHA256: "0000000000000000000000000000000000000000000000000000000000000000"},
 		},
 	}
@@ -161,11 +141,6 @@ func TestStageBulkDirDedupesRepeatedDestinationPathCopy(t *testing.T) {
 		Version:     engine.RFileExportManifestVersion,
 		SourceTable: "events",
 		Tablets:     []engine.RFileExportTablet{{Index: 0}},
-		// Same DestinationPath listed twice: flattenNames already allows
-		// this (TestFlattenNamesAllowsSameDestinationPathTwice), and
-		// BuildLoadMapping already dedupes the resulting FileEntry
-		// (TestBuildLoadMappingDedupesRepeatedDestinationPath). StageBulkDir
-		// must not copy the same source object twice either.
 		RFiles: []engine.RFileExportFile{
 			{TabletIndex: 0, DestinationPath: "export/events/t-0000/F0001.rf", Size: 13, SHA256: "e47fb24ed70774dd8af7d59bf58fc740e126716aac3474bd262eb17f3e395e43"},
 			{TabletIndex: 0, DestinationPath: "export/events/t-0000/F0001.rf", Size: 13, SHA256: "e47fb24ed70774dd8af7d59bf58fc740e126716aac3474bd262eb17f3e395e43"},
@@ -180,8 +155,7 @@ func TestStageBulkDirDedupesRepeatedDestinationPathCopy(t *testing.T) {
 	if len(mapping) != 1 || len(mapping[0].Files) != 1 {
 		t.Fatalf("mapping = %#v, want a single deduped FileEntry", mapping)
 	}
-	// Only one staged copy of the file, not a numbered/renamed second copy.
-	if got := dst.Keys(); len(got) != 2 { // F0001.rf + loadmap.json
+	if got := dst.Keys(); len(got) != 2 {
 		t.Fatalf("dst.Keys() = %v, want exactly 2 entries (one staged file + loadmap.json)", got)
 	}
 }
@@ -240,5 +214,20 @@ func TestStageBulkDirRejectsUndeclaredTabletIndexBeforeCopying(t *testing.T) {
 	}
 	if got := dst.Keys(); len(got) != 0 {
 		t.Fatalf("StageBulkDir wrote %v on undeclared tablet index, want no partial writes", got)
+	}
+}
+
+func TestStageBulkDirRejectsSplitManifestBeforeCopying(t *testing.T) {
+	src := memory.New()
+	src.Put("events/t-0000/F0001.rf", []byte("a"))
+	src.Put("events/t-0001/F0002.rf", []byte("b"))
+
+	dst := memory.New()
+	ctx := context.Background()
+	if _, err := StageBulkDir(ctx, src, splitManifest(), dst, "/bulk/events-1"); err == nil {
+		t.Fatal("StageBulkDir(split manifest) = nil error, want error")
+	}
+	if got := dst.Keys(); len(got) != 0 {
+		t.Fatalf("StageBulkDir wrote %v on split-manifest rejection, want no partial writes", got)
 	}
 }

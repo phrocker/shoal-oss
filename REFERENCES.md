@@ -184,9 +184,9 @@ cribs land.
     individually match some real tablet boundary (a file may span several
     destination tablets), rejecting the whole FATE operation with
     `BULK_CONCURRENT_MERGE` ("Concurrent merge happened") if that walk
-    fails. `internal/promotion.ValidateAgainstDestination` mirrors this
-    same per-boundary check locally, as an optional client-side pre-flight
-    (`docs/promotion.md` §3)
+    fails. Shoal's current safe promotion slice avoids that split-bearing
+    path entirely by rejecting multi-tablet/split manifests before
+    staging (`docs/promotion.md` §3).
 
 ## Sharkbite
 

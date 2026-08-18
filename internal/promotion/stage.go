@@ -31,7 +31,9 @@ import (
 //
 // bulkDir itself is preflight-validated before any read or write: empty,
 // whitespace-padded, or backend-root destinations fail before staging can
-// mutate dst.
+// mutate dst. BuildLoadMapping likewise rejects any split-bearing or
+// multi-tablet manifest before staging starts: this slice stages only
+// unambiguous single-tablet exports.
 //
 // The manifest is verified (engine.VerifyRFileExport: every RFile exists at
 // src and matches its recorded size/SHA256) before anything is copied, so a
