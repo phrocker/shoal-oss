@@ -831,6 +831,48 @@ func TestStageBulkDirRejectsInPlaceBulkDirViaRelativePath(t *testing.T) {
 	}
 }
 
+func TestStageBulkDirRejectsUnixRelativeCDriveHardlinkAliasBeforeCopying(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("C:/... is a Windows drive path on Windows, not a Unix-relative local path")
+	}
+
+	root := t.TempDir()
+	t.Chdir(root)
+
+	exportDir := filepath.Join(root, "C:", "export")
+	bulkDirPath := filepath.Join(root, "C:", "bulk")
+	if err := os.MkdirAll(exportDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(bulkDirPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	srcPath := filepath.Join("C:", "export", "F0001.rf")
+	content := []byte("original rfile bytes that must survive a rejected unix-relative C-drive hardlink alias stage")
+	if err := os.WriteFile(srcPath, content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	aliasPath := filepath.Join("C:", "bulk", "F0001.rf")
+	if err := os.Link(srcPath, aliasPath); err != nil {
+		t.Skipf("hard links not supported in this environment: %v", err)
+	}
+
+	manifest := localManifestFromFiles(t, srcPath)
+	be := local.New()
+	if _, err := StageBulkDir(context.Background(), be, manifest, be, filepath.Join("C:", "bulk")); err == nil {
+		t.Fatal("StageBulkDir with unix-relative C:/bulk/F0001.rf hard-linked to source C:/export/F0001.rf = nil error, want error")
+	}
+
+	got, err := os.ReadFile(srcPath)
+	if err != nil {
+		t.Fatalf("source file missing after rejected unix-relative C-drive stage: %v", err)
+	}
+	if string(got) != string(content) {
+		t.Fatalf("source file corrupted by rejected unix-relative C-drive stage: got %d bytes, want %d bytes intact", len(got), len(content))
+	}
+}
+
 func TestStageBulkDirRejectsHDFSSpelledLocalBulkDirAliasBeforeCopying(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("paths containing ':' are not valid local relative paths on Windows")

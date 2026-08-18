@@ -7,6 +7,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 
@@ -362,16 +363,26 @@ func (c pathIdentityCache) stat(path string) os.FileInfo {
 	if info, cached := c.stats[path]; cached {
 		return info
 	}
-	statPath := path
-	if normalized, ok := normalizeWindowsDrivePath(path); ok {
-		statPath = normalized
-	}
-	info, err := os.Stat(statPath)
-	if err != nil {
-		info = nil
+	var info os.FileInfo
+	for _, statPath := range localStatCandidates(path) {
+		candidateInfo, err := os.Stat(statPath)
+		if err == nil {
+			info = candidateInfo
+			break
+		}
 	}
 	c.stats[path] = info
 	return info
+}
+
+func localStatCandidates(path string) []string {
+	if normalized, ok := normalizeWindowsDrivePath(path); ok && normalized != path {
+		if runtime.GOOS == "windows" {
+			return []string{normalized, path}
+		}
+		return []string{path, normalized}
+	}
+	return []string{path}
 }
 
 func (c pathIdentityCache) publicationKey(path string) string {
