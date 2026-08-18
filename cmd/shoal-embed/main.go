@@ -19,7 +19,10 @@
 //
 // Subcommands:
 //
-//	shoal-embed serve   — start an HTTP/gRPC server for external consumers (use --address for container/k8s)
+//	shoal-embed serve   — start the gRPC data plane plus an HTTP health/metrics
+//	                      surface (/healthz, /readyz, /stats, /metrics) for
+//	                      external consumers and orchestrators (use --address /
+//	                      --metrics-address for container/k8s)
 //
 //	shoal-embed write   — write mutations from stdin (JSON lines)
 //	shoal-embed scan    — scan a table and print results as JSON lines or Parquet
@@ -39,21 +42,19 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"log/slog"
-	"net"
 	"os"
 	"os/signal"
 	"strconv"
 	"strings"
 	"syscall"
-
-	"google.golang.org/grpc"
+	"time"
 
 	"github.com/phrocker/shoal/internal/cclient"
-	"github.com/phrocker/shoal/internal/embedpb"
 	"github.com/phrocker/shoal/internal/engine"
 	"github.com/phrocker/shoal/internal/iterrt"
 )
@@ -329,50 +330,75 @@ func cmdStatus(args []string) {
 	fmt.Printf("%-24s %8d %8d\n", fmt.Sprintf("(%d tables)", len(stats)), totTablets, totRFiles)
 }
 
-// cmdServe starts the gRPC server for the embedded storage engine.
-// By default the server binds loopback (127.0.0.1:<--port>).
-// Use --address to override the bind address verbatim (e.g. 0.0.0.0:9876
-// or :9876) — useful in containers/k8s pods where loopback-only is unusable.
+// cmdServe starts the gRPC data-plane server plus the HTTP observability
+// surface (/healthz, /readyz, /stats, /metrics) for the embedded storage
+// engine — this is the binary the production write-tier manifests
+// (deploy/k8s, deploy/helm) run.
+//
+// By default both servers bind loopback (127.0.0.1:<--port> and
+// 127.0.0.1:<--metrics-port>). Use --address / --metrics-address to override
+// the bind address verbatim (e.g. 0.0.0.0:9876) — required in containers/k8s
+// pods, where loopback-only is unreachable from a Service.
+//
+// On SIGINT/SIGTERM the server drains before stopping: it flips /readyz to
+// not-ready first so an orchestrator's readiness probe can observe the
+// change and stop routing new work, then gracefully stops the gRPC and HTTP
+// servers (waiting for in-flight RPCs, bounded by --drain-timeout — a
+// stuck RPC is force-aborted rather than hanging shutdown forever) and
+// closes the engine. This does not migrate tablet ownership — mixed-fleet
+// tablet reassignment on drain remains owned by the Accumulo
+// manager/coordinator and is out of scope here.
 func cmdServe(args []string) {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	dataDir := fs.String("data", defaultDataDir(), "data directory")
 	port := fs.Int("port", 9876, "gRPC listen port (ignored when --address is non-empty)")
-	address := fs.String("address", "", "override bind host:port verbatim (e.g. 0.0.0.0:9876 or :9876); when set, --port is ignored")
+	address := fs.String("address", "", "override gRPC bind host:port verbatim (e.g. 0.0.0.0:9876 or :9876); when set, --port is ignored")
+	metricsPort := fs.Int("metrics-port", 9877, "observability HTTP listen port for /healthz, /readyz, /stats, /metrics (ignored when --metrics-address is non-empty)")
+	metricsAddress := fs.String("metrics-address", "", "override observability HTTP bind host:port verbatim (e.g. 0.0.0.0:9877); when set, --metrics-port is ignored")
+	drainTimeout := fs.Duration("drain-timeout", 30*time.Second, "max time to wait for in-flight RPCs to finish during graceful shutdown")
 	fs.Parse(args)
 
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
-	eng, err := engine.Open(*dataDir, engine.Options{Logger: logger})
+	grpcAddr := "127.0.0.1:" + strconv.Itoa(*port)
+	if *address != "" {
+		grpcAddr = *address
+	}
+	metricsAddr := "127.0.0.1:" + strconv.Itoa(*metricsPort)
+	if *metricsAddress != "" {
+		metricsAddr = *metricsAddress
+	}
+
+	h, err := startServe(serveConfig{
+		DataDir:        *dataDir,
+		GRPCAddress:    grpcAddr,
+		MetricsAddress: metricsAddr,
+		Logger:         logger,
+	})
 	if err != nil {
 		die("serve: %v", err)
 	}
 
-	addr := "127.0.0.1:" + strconv.Itoa(*port)
-	if *address != "" {
-		addr = *address
-	}
-	lis, err := net.Listen("tcp", addr)
-	if err != nil {
-		die("serve: listen: %v", err)
-	}
+	logger.Info("shoal-embed gRPC serve starting",
+		slog.String("addr", h.GRPCAddr), slog.String("metrics", h.MetricsAddr), slog.String("data", *dataDir))
+	fmt.Fprintf(os.Stderr, "shoal-embed serve: grpc://%s\n", h.GRPCAddr)
+	fmt.Fprintf(os.Stderr, "  health/metrics: http://%s/{healthz,readyz,stats,metrics}\n", h.MetricsAddr)
 
-	srv := grpc.NewServer()
-	embedpb.RegisterShoalEmbedServer(srv, newEmbedServer(eng))
-
-	logger.Info("shoal-embed gRPC serve starting", slog.String("addr", addr), slog.String("data", *dataDir))
-	fmt.Fprintf(os.Stderr, "shoal-embed serve: grpc://%s\n", addr)
-
-	// Graceful shutdown on SIGINT/SIGTERM
+	// Graceful shutdown on SIGINT/SIGTERM: drain (flip readiness) before
+	// stopping the listeners, so a readiness probe has a chance to observe
+	// the drained pod before it stops accepting work.
 	go func() {
 		sigCh := make(chan os.Signal, 1)
 		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 		<-sigCh
-		logger.Info("shutting down")
-		srv.GracefulStop()
-		eng.Close()
+		logger.Info("draining")
+		h.Drain()
+		ctx, cancel := context.WithTimeout(context.Background(), *drainTimeout)
+		defer cancel()
+		h.Stop(ctx)
 	}()
 
-	if err := srv.Serve(lis); err != nil {
+	if err := h.Serve(); err != nil {
 		die("serve: %v", err)
 	}
 }

@@ -16,6 +16,7 @@ writeTier:
   replicas: 1
   dataDir: /var/lib/shoal
   grpcPort: 9876
+  metricsPort: 9877
   storageSize: 50Gi
   resources:
     requests:

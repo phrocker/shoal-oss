@@ -5,8 +5,13 @@ metadata:
   labels:
     {{- include "shoal.labels" . | nindent 4 }}
 data:
+  # shoal-embed serve is started with --address/--metrics-address set to
+  # 0.0.0.0:<port> (see embed-statefulset.yaml) so the headless Service can
+  # reach both the gRPC data plane and the /healthz, /readyz, /metrics HTTP
+  # surface.
   SHOAL_EMBED_DATA_DIR: {{ .Values.writeTier.dataDir | quote }}
   SHOAL_EMBED_GRPC_PORT: {{ .Values.writeTier.grpcPort | quote }}
+  SHOAL_EMBED_METRICS_PORT: {{ .Values.writeTier.metricsPort | quote }}
   # TODO(shoal): object bucket/prefix are desired platform config but are not consumed by cmd/shoal-embed yet.
   SHOAL_OBJECT_STORAGE_BACKEND: {{ .Values.objectStorage.backend | quote }}
   SHOAL_OBJECT_BUCKET: {{ .Values.objectStorage.bucket | quote }}

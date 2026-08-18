@@ -16,3 +16,6 @@ spec:
     - name: grpc
       port: {{ .Values.writeTier.grpcPort }}
       targetPort: grpc
+    - name: metrics
+      port: {{ .Values.writeTier.metricsPort }}
+      targetPort: metrics
