@@ -35,6 +35,15 @@ Go emits next to a `c-shared` library.
   `NULL`.
 - Scan results own binary-safe key/value storage. Views returned by
   `shoal_scan_result_get` remain valid until `shoal_scan_result_free`.
+- Mutations copy every row, column, visibility, and value input. BatchWriter
+  add snapshots the mutation, so callers may immediately reuse or free it.
+- BatchWriter operations accept per-call deadlines. Close prevents new calls,
+  cancels and joins active calls, and flushes the remaining buffer; free uses a
+  bounded best-effort close.
+- Write failures optionally return an owned `shoal_write_failure` containing
+  ambiguous-commit/retry flags plus failed extents, constraint violations,
+  authorization failures, and cleanup failures. Borrowed views remain valid
+  until `shoal_write_failure_free`.
 - Failed calls can return an owned `shoal_error`. Its message is borrowed from
   that object and remains valid until `shoal_error_free`.
 - Do not copy opaque handles, access them after free, or free/use the same
@@ -50,8 +59,7 @@ Go emits next to a `c-shared` library.
   `zookeeper_servers` list. A zero session or bootstrap timeout selects the
   30-second default. `instance_secret` is optional.
 
-The ABI currently exposes connector bootstrap/lifecycle plus synchronous
-Scanner and BatchScanner reads with row/key ranges, authorizations, fetched
-columns, server-side iterators, deadlines, and owned result buffers. Mutation,
-writer, table administration, and Python wheel APIs are intentionally
+The ABI currently exposes connector bootstrap/lifecycle, synchronous Scanner
+and BatchScanner reads, and Mutation/BatchWriter writes with owned structured
+failures. Table administration and Python wheel APIs are intentionally
 deferred.

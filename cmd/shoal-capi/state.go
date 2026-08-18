@@ -207,3 +207,216 @@ func (r *scannerRegistry) remove(id uint64) (*ownedScanner, bool) {
 
 var scanners = newScannerRegistry()
 var batchScanners = newScannerRegistry()
+
+type mutationRegistry struct {
+	mu     sync.RWMutex
+	nextID uint64
+	items  map[uint64]*accumulo.Mutation
+}
+
+func newMutationRegistry() *mutationRegistry {
+	return &mutationRegistry{
+		nextID: 1,
+		items:  make(map[uint64]*accumulo.Mutation),
+	}
+}
+
+func (r *mutationRegistry) add(mutation *accumulo.Mutation) (uint64, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for attempts := uint64(0); attempts < ^uint64(0); attempts++ {
+		id := r.nextID
+		r.nextID++
+		if r.nextID == 0 {
+			r.nextID = 1
+		}
+		if id == 0 {
+			continue
+		}
+		if _, exists := r.items[id]; !exists {
+			r.items[id] = mutation
+			return id, true
+		}
+	}
+	return 0, false
+}
+
+func (r *mutationRegistry) get(id uint64) (*accumulo.Mutation, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	mutation, ok := r.items[id]
+	return mutation, ok
+}
+
+func (r *mutationRegistry) remove(id uint64) (*accumulo.Mutation, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	mutation, ok := r.items[id]
+	if ok {
+		delete(r.items, id)
+	}
+	return mutation, ok
+}
+
+var mutations = newMutationRegistry()
+
+type batchWriterAPI interface {
+	Add(context.Context, *accumulo.Mutation) error
+	Flush(context.Context) error
+	Close(context.Context) error
+}
+
+type ownedBatchWriter struct {
+	writer batchWriterAPI
+
+	mu      sync.Mutex
+	closed  bool
+	nextID  uint64
+	cancels map[uint64]context.CancelFunc
+	active  int
+	idle    chan struct{}
+}
+
+func newOwnedBatchWriter(writer batchWriterAPI) *ownedBatchWriter {
+	idle := make(chan struct{})
+	close(idle)
+	return &ownedBatchWriter{
+		writer:  writer,
+		nextID:  1,
+		cancels: make(map[uint64]context.CancelFunc),
+		idle:    idle,
+	}
+}
+
+func (w *ownedBatchWriter) begin(timeout time.Duration) (context.Context, func(), error) {
+	w.mu.Lock()
+	if w.closed {
+		w.mu.Unlock()
+		return nil, nil, accumulo.ErrBatchWriterClosed
+	}
+	var id uint64
+	for attempts := uint64(0); attempts < ^uint64(0); attempts++ {
+		id = w.nextID
+		w.nextID++
+		if w.nextID == 0 {
+			w.nextID = 1
+		}
+		if id != 0 {
+			if _, exists := w.cancels[id]; !exists {
+				break
+			}
+		}
+		id = 0
+	}
+	if id == 0 {
+		w.mu.Unlock()
+		return nil, nil, errors.New("shoal: batch writer operation space exhausted")
+	}
+	var ctx context.Context
+	var cancel context.CancelFunc
+	if timeout == 0 {
+		ctx, cancel = context.WithCancel(context.Background())
+	} else {
+		ctx, cancel = context.WithTimeout(context.Background(), timeout)
+	}
+	if w.active == 0 {
+		w.idle = make(chan struct{})
+	}
+	w.cancels[id] = cancel
+	w.active++
+	w.mu.Unlock()
+
+	var once sync.Once
+	done := func() {
+		once.Do(func() {
+			w.mu.Lock()
+			delete(w.cancels, id)
+			w.active--
+			if w.active == 0 {
+				close(w.idle)
+			}
+			w.mu.Unlock()
+			cancel()
+		})
+	}
+	return ctx, done, nil
+}
+
+func (w *ownedBatchWriter) close(timeout time.Duration) error {
+	var ctx context.Context
+	var cancel context.CancelFunc
+	if timeout == 0 {
+		ctx, cancel = context.WithCancel(context.Background())
+	} else {
+		ctx, cancel = context.WithTimeout(context.Background(), timeout)
+	}
+	defer cancel()
+
+	w.mu.Lock()
+	if !w.closed {
+		w.closed = true
+		for _, cancel := range w.cancels {
+			cancel()
+		}
+	}
+	idle := w.idle
+	w.mu.Unlock()
+	select {
+	case <-idle:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	return w.writer.Close(ctx)
+}
+
+type batchWriterRegistry struct {
+	mu     sync.RWMutex
+	nextID uint64
+	items  map[uint64]*ownedBatchWriter
+}
+
+func newBatchWriterRegistry() *batchWriterRegistry {
+	return &batchWriterRegistry{
+		nextID: 1,
+		items:  make(map[uint64]*ownedBatchWriter),
+	}
+}
+
+func (r *batchWriterRegistry) add(writer *ownedBatchWriter) (uint64, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for attempts := uint64(0); attempts < ^uint64(0); attempts++ {
+		id := r.nextID
+		r.nextID++
+		if r.nextID == 0 {
+			r.nextID = 1
+		}
+		if id == 0 {
+			continue
+		}
+		if _, exists := r.items[id]; !exists {
+			r.items[id] = writer
+			return id, true
+		}
+	}
+	return 0, false
+}
+
+func (r *batchWriterRegistry) get(id uint64) (*ownedBatchWriter, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	writer, ok := r.items[id]
+	return writer, ok
+}
+
+func (r *batchWriterRegistry) remove(id uint64) (*ownedBatchWriter, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	writer, ok := r.items[id]
+	if ok {
+		delete(r.items, id)
+	}
+	return writer, ok
+}
+
+var batchWriters = newBatchWriterRegistry()

@@ -17,6 +17,9 @@ shoal_scanner_config_init(shoal_scanner_config *config);
 
 SHOAL_API void SHOAL_CALL shoal_range_init(shoal_range *range);
 
+SHOAL_API void SHOAL_CALL
+shoal_batch_writer_config_init(shoal_batch_writer_config *config);
+
 /*
  * Creates a connector and stores its owned handle in out_connector.
  *
@@ -104,6 +107,117 @@ shoal_scan_result_get(const shoal_scan_result *result, size_t index,
 
 SHOAL_API void SHOAL_CALL
 shoal_scan_result_free(shoal_scan_result **result);
+
+/*
+ * Mutation inputs are copied before each call returns. A mutation may be
+ * reused or freed immediately after a successful BatchWriter add.
+ */
+SHOAL_API shoal_status SHOAL_CALL
+shoal_mutation_create(shoal_bytes row, shoal_mutation **out_mutation,
+                      shoal_error **out_error);
+
+SHOAL_API shoal_status SHOAL_CALL
+shoal_mutation_put(shoal_mutation *mutation, shoal_bytes column_family,
+                   shoal_bytes column_qualifier,
+                   shoal_bytes column_visibility, int64_t timestamp,
+                   shoal_bytes value, shoal_error **out_error);
+
+SHOAL_API shoal_status SHOAL_CALL
+shoal_mutation_put_latest(shoal_mutation *mutation, shoal_bytes column_family,
+                          shoal_bytes column_qualifier,
+                          shoal_bytes column_visibility, shoal_bytes value,
+                          shoal_error **out_error);
+
+SHOAL_API shoal_status SHOAL_CALL
+shoal_mutation_delete(shoal_mutation *mutation, shoal_bytes column_family,
+                      shoal_bytes column_qualifier,
+                      shoal_bytes column_visibility, int64_t timestamp,
+                      shoal_error **out_error);
+
+SHOAL_API shoal_status SHOAL_CALL
+shoal_mutation_delete_latest(shoal_mutation *mutation,
+                             shoal_bytes column_family,
+                             shoal_bytes column_qualifier,
+                             shoal_bytes column_visibility,
+                             shoal_error **out_error);
+
+SHOAL_API shoal_status SHOAL_CALL
+shoal_mutation_size(const shoal_mutation *mutation, size_t *out_size,
+                    shoal_error **out_error);
+
+SHOAL_API void SHOAL_CALL shoal_mutation_free(shoal_mutation **mutation);
+
+SHOAL_API shoal_status SHOAL_CALL
+shoal_connector_create_batch_writer(
+    shoal_connector *connector, const shoal_batch_writer_config *config,
+    shoal_batch_writer **out_writer, shoal_error **out_error);
+
+/*
+ * timeout_ms is zero for no deadline and must not be negative. out_failure is
+ * optional and receives owned structured details when the operation reaches
+ * the write path. Free every non-NULL failure object.
+ */
+SHOAL_API shoal_status SHOAL_CALL
+shoal_batch_writer_add(shoal_batch_writer *writer,
+                       const shoal_mutation *mutation, int64_t timeout_ms,
+                       shoal_write_failure **out_failure,
+                       shoal_error **out_error);
+
+SHOAL_API shoal_status SHOAL_CALL
+shoal_batch_writer_flush(shoal_batch_writer *writer, int64_t timeout_ms,
+                         shoal_write_failure **out_failure,
+                         shoal_error **out_error);
+
+/*
+ * Close is idempotent, prevents new operations, cancels and joins in-flight
+ * calls, then flushes remaining mutations. A timed-out close may be retried.
+ */
+SHOAL_API shoal_status SHOAL_CALL
+shoal_batch_writer_close(shoal_batch_writer *writer, int64_t timeout_ms,
+                         shoal_write_failure **out_failure,
+                         shoal_error **out_error);
+
+SHOAL_API void SHOAL_CALL
+shoal_batch_writer_free(shoal_batch_writer **writer);
+
+SHOAL_API shoal_write_failure_flags SHOAL_CALL
+shoal_write_failure_get_flags(const shoal_write_failure *failure);
+
+SHOAL_API size_t SHOAL_CALL
+shoal_write_failure_failed_extent_count(const shoal_write_failure *failure);
+
+SHOAL_API shoal_status SHOAL_CALL
+shoal_write_failure_get_failed_extent(
+    const shoal_write_failure *failure, size_t index,
+    shoal_failed_extent_view *out_extent, shoal_error **out_error);
+
+SHOAL_API size_t SHOAL_CALL shoal_write_failure_constraint_count(
+    const shoal_write_failure *failure);
+
+SHOAL_API shoal_status SHOAL_CALL
+shoal_write_failure_get_constraint(
+    const shoal_write_failure *failure, size_t index,
+    shoal_constraint_violation_view *out_violation, shoal_error **out_error);
+
+SHOAL_API size_t SHOAL_CALL shoal_write_failure_authorization_count(
+    const shoal_write_failure *failure);
+
+SHOAL_API shoal_status SHOAL_CALL
+shoal_write_failure_get_authorization(
+    const shoal_write_failure *failure, size_t index,
+    shoal_authorization_failure_view *out_failure, shoal_error **out_error);
+
+SHOAL_API size_t SHOAL_CALL
+shoal_write_failure_cleanup_count(const shoal_write_failure *failure);
+
+SHOAL_API shoal_status SHOAL_CALL
+shoal_write_failure_get_cleanup(const shoal_write_failure *failure,
+                                size_t index,
+                                shoal_cleanup_failure_view *out_failure,
+                                shoal_error **out_error);
+
+SHOAL_API void SHOAL_CALL
+shoal_write_failure_free(shoal_write_failure **failure);
 
 /* Returns the stable status stored in error, or INVALID_ARGUMENT for NULL. */
 SHOAL_API shoal_status SHOAL_CALL shoal_error_code(const shoal_error *error);

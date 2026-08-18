@@ -37,6 +37,9 @@ enum {
   SHOAL_STATUS_RANGE_SPANS_TABLETS = 13,
   SHOAL_STATUS_CLEANUP_FAILED = 14,
   SHOAL_STATUS_OPERATION_FAILED = 15,
+  SHOAL_STATUS_RETRY_EXHAUSTED = 16,
+  SHOAL_STATUS_MUTATION_REJECTED = 17,
+  SHOAL_STATUS_AMBIGUOUS_WRITE = 18,
   SHOAL_STATUS_INTERNAL = 255
 };
 
@@ -52,6 +55,9 @@ typedef struct shoal_connector shoal_connector;
 typedef struct shoal_scanner shoal_scanner;
 typedef struct shoal_batch_scanner shoal_batch_scanner;
 typedef struct shoal_scan_result shoal_scan_result;
+typedef struct shoal_mutation shoal_mutation;
+typedef struct shoal_batch_writer shoal_batch_writer;
+typedef struct shoal_write_failure shoal_write_failure;
 typedef struct shoal_error shoal_error;
 
 typedef struct shoal_bytes {
@@ -180,5 +186,74 @@ typedef struct shoal_key_value_view {
   int64_t timestamp;
   shoal_bytes value;
 } shoal_key_value_view;
+
+typedef int32_t shoal_durability;
+
+enum {
+  SHOAL_DURABILITY_DEFAULT = 0,
+  SHOAL_DURABILITY_SYNC = 1,
+  SHOAL_DURABILITY_FLUSH = 2,
+  SHOAL_DURABILITY_LOG = 3,
+  SHOAL_DURABILITY_NONE = 4
+};
+
+typedef struct shoal_batch_writer_config {
+  uint32_t struct_size;
+  const char *table_name;
+  const char *table_id;
+  int64_t max_memory_bytes;
+  int64_t max_batch_bytes;
+  int64_t max_latency_ms;
+  int32_t max_write_threads;
+  int32_t max_retries;
+  int64_t retry_backoff_ms;
+  shoal_durability durability;
+} shoal_batch_writer_config;
+
+#define SHOAL_BATCH_WRITER_CONFIG_V1_SIZE                                   \
+  ((uint32_t)(offsetof(shoal_batch_writer_config, durability) +              \
+              sizeof(((shoal_batch_writer_config *)0)->durability)))
+
+typedef uint32_t shoal_write_failure_flags;
+
+enum {
+  SHOAL_WRITE_FAILURE_AMBIGUOUS_COMMIT = 1u << 0,
+  SHOAL_WRITE_FAILURE_RETRY_EXHAUSTED = 1u << 1,
+  SHOAL_WRITE_FAILURE_AUTOMATIC_FLUSH = 1u << 2
+};
+
+typedef struct shoal_failed_extent_view {
+  const char *server;
+  const char *table_id;
+  shoal_bytes prev_row;
+  shoal_bytes end_row;
+  uint8_t has_prev_row;
+  uint8_t has_end_row;
+  size_t submitted;
+  int64_t committed;
+} shoal_failed_extent_view;
+
+typedef struct shoal_constraint_violation_view {
+  const char *server;
+  const char *constraint_class;
+  int16_t violation_code;
+  const char *description;
+  int64_t violating_mutation_count;
+} shoal_constraint_violation_view;
+
+typedef struct shoal_authorization_failure_view {
+  const char *server;
+  const char *table_id;
+  shoal_bytes prev_row;
+  shoal_bytes end_row;
+  uint8_t has_prev_row;
+  uint8_t has_end_row;
+  const char *code;
+} shoal_authorization_failure_view;
+
+typedef struct shoal_cleanup_failure_view {
+  const char *server;
+  const char *message;
+} shoal_cleanup_failure_view;
 
 #endif
