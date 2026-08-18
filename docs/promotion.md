@@ -250,7 +250,15 @@ RFileExportManifest (existing)  →  promotion.BuildLoadMapping
   (`s3/gs/az/hdfs`) this package knows how to canonicalize for alias
   comparison — so a custom or future backend with its own URI scheme
   still joins with `/` and validates correctly instead of silently
-  falling through to a native, OS-specific `filepath.Join`.
+  falling through to a native, OS-specific `filepath.Join`. A backend
+  can override this scheme-shaped heuristic entirely by declaring
+  itself local (`storage.LocalPathSemanticProvider`, which the local
+  backend implements and which still applies through a wrapper such as
+  `diskcache.Backend`, since scheme/identity checks unwrap to the
+  innermost backend first): a `bulkDir` that is itself a local
+  directory literally named e.g. `hdfs:/bulk` is then still recognized
+  and preflighted as local rather than mistaken for a remote HDFS root
+  purely because of its spelling.
 - `internal/promotion.Promote` — composes `StageBulkDir` with a
   `BulkImporter` (satisfied by `*accumulo.Connector`) to submit the FATE
   call. Submits nothing when the derived mapping is empty (nothing to

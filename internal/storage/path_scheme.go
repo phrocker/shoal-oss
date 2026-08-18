@@ -15,6 +15,13 @@ type PathSchemeProvider interface {
 	BackendPathSchemes() []string
 }
 
+// LocalPathSemanticProvider marks backends whose paths should always be
+// interpreted with local-filesystem semantics, regardless of whether the
+// spelling resembles a backend URI such as hdfs:/bulk.
+type LocalPathSemanticProvider interface {
+	UsesLocalPathSemantics() bool
+}
+
 type backendUnwrapper interface {
 	InnerBackend() Backend
 }
@@ -26,6 +33,9 @@ type backendUnwrapper interface {
 // otherwise they remain local-path spellings so Windows drive roots like
 // C://data keep local semantics.
 func ExplicitPathScheme(backend Backend, path string) string {
+	if UsesLocalPathSemantics(backend) {
+		return ""
+	}
 	if strings.HasPrefix(path, "hdfs:/") {
 		return "hdfs"
 	}
@@ -46,6 +56,15 @@ func ExplicitPathScheme(backend Backend, path string) string {
 // without misclassifying Windows drive spellings like C://data as remote.
 func UsesBackendPathJoin(backend Backend, root string) bool {
 	return ExplicitPathScheme(backend, root) != ""
+}
+
+// UsesLocalPathSemantics reports whether backend declares that its paths are
+// local filesystem paths, even when their spelling happens to resemble a
+// backend URI.
+func UsesLocalPathSemantics(backend Backend) bool {
+	backend = unwrapBackend(backend)
+	provider, ok := backend.(LocalPathSemanticProvider)
+	return ok && provider.UsesLocalPathSemantics()
 }
 
 func backendDeclaresScheme(backend Backend, scheme string) bool {

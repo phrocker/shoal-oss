@@ -22,6 +22,10 @@ type Backend struct{}
 // New returns a Backend ready to Open files by path.
 func New() *Backend { return &Backend{} }
 
+// UsesLocalPathSemantics reports that local backend paths are OS filesystem
+// paths even when their spelling happens to resemble a backend URI.
+func (b *Backend) UsesLocalPathSemantics() bool { return true }
+
 // Open opens path read-only and returns a storage.File backed by the
 // underlying os.File. Returns an error wrapping storage.ErrNotFound
 // when the path doesn't exist.

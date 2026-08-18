@@ -15,7 +15,6 @@ import (
 	"github.com/phrocker/shoal/internal/storage/azure"
 	"github.com/phrocker/shoal/internal/storage/gcs"
 	"github.com/phrocker/shoal/internal/storage/hdfs"
-	"github.com/phrocker/shoal/internal/storage/local"
 	"github.com/phrocker/shoal/internal/storage/s3"
 )
 
@@ -447,29 +446,38 @@ func localPublicationKeysAlias(srcPath, dstPath string, cache pathIdentityCache)
 }
 
 func resolveExistingLocalPathPrefixes(path string) string {
-	path = normalizeLocalPathForAlias(path)
-	if !looksLikeWindowsDrivePath(path) && !filepath.IsAbs(path) {
-		if absPath, err := filepath.Abs(path); err == nil {
-			path = absPath
-		}
-	}
+	const maxSymlinkHops = 40
+	return resolveExistingLocalPathPrefixesWithState(path, &localPathResolutionState{
+		hopsRemaining: maxSymlinkHops,
+		seen:          make(map[string]struct{}),
+	})
+}
 
+type localPathResolutionState struct {
+	hopsRemaining int
+	seen          map[string]struct{}
+}
+
+func resolveExistingLocalPathPrefixesWithState(path string, state *localPathResolutionState) string {
+	path = normalizeLocalPathForResolution(path)
 	prefix, parts := splitLocalPath(path)
 	current := prefix
-	for i, part := range parts {
-		candidate := joinLocalPath(current, part)
+	for i := 0; i < len(parts); {
+		candidate := joinLocalPath(current, parts[i])
 		info, err := os.Lstat(candidate)
 		if err != nil {
 			return appendLocalPathParts(current, parts[i:])
 		}
 		if info.Mode()&os.ModeSymlink != 0 {
-			current = resolveLocalSymlinkChain(candidate, 0)
+			current = resolveLocalSymlinkPathLexically(candidate, state)
+			i++
 			continue
 		}
-		if !info.IsDir() && info.Mode()&os.ModeSymlink == 0 && i < len(parts)-1 {
+		if !info.IsDir() && i < len(parts)-1 {
 			return appendLocalPathParts(current, parts[i:])
 		}
 		current = candidate
+		i++
 	}
 	if current == "" {
 		return path
@@ -477,52 +485,65 @@ func resolveExistingLocalPathPrefixes(path string) string {
 	return current
 }
 
-// resolveLocalSymlinkChain resolves candidate -- which the caller has
-// already confirmed via os.Lstat is a symlink -- to its final target,
-// following the symlink chain (a target that is itself a symlink) and
-// any symlinked ancestor directories those targets pass through along
-// the way, so a relative symlink target that traverses a symlinked
-// parent directory on its way to a not-yet-created file compares
-// correctly against a literal destination path.
+// resolveLocalSymlinkPathLexically resolves current -- which the caller
+// has already confirmed via os.Lstat is a symlink -- to its final
+// target, one hop at a time via os.Readlink. After each hop the new
+// target is re-run through resolveExistingLocalPathPrefixesWithState,
+// which recursively resolves any symlinked ancestor directory the
+// target's own path passes through, not only the target's final
+// component; this lets a relative symlink whose target traverses a
+// symlinked parent directory (for example a target under a directory
+// that is itself "bulk/alias -> .") compare correctly against a
+// literal destination path, even when the ultimate file does not exist
+// yet. A shared *localPathResolutionState carries a hop budget and a
+// "seen" set across every hop and every recursive call, so a symlink
+// cycle is detected exactly (returning the repeating path as-is)
+// rather than merely bounded by a hop count that could otherwise still
+// spin all the way through the cycle before giving up.
 //
-// It deliberately does not use filepath.EvalSymlinks: that resolves
+// This deliberately does not use filepath.EvalSymlinks: that resolves
 // the entire input path through the platform's native path-resolution
 // APIs, which on Windows can silently rewrite a path's *spelling* even
 // for components that are not themselves symlinks -- for example
 // expanding a short 8.3-style component such as MARCPA~1 to its long
 // form -- which would make an unrelated, never-symlinked path compare
 // unequal to another path purely because one of them happened to pass
-// through EvalSymlinks. Instead this walks one path component at a
-// time via os.Lstat/os.Readlink and substitutes a resolved value only
+// through EvalSymlinks. Instead this substitutes a resolved value only
 // where a real symlink is actually found, leaving every other
-// component's original spelling untouched. A hop budget guards against
-// symlink cycles; if it is exhausted, resolution silently stops and
-// the last-seen (still possibly symlinked) path is returned as-is,
-// matching this function's role as a conservative best-effort
-// approximation rather than a strict resolver.
-func resolveLocalSymlinkChain(path string, hops int) string {
+// component's original spelling untouched.
+func resolveLocalSymlinkPathLexically(path string, state *localPathResolutionState) string {
+	current := normalizeLocalPathForResolution(path)
+	for state.hopsRemaining > 0 {
+		if _, ok := state.seen[current]; ok {
+			return current
+		}
+		state.seen[current] = struct{}{}
+		target, err := os.Readlink(current)
+		if err != nil {
+			return current
+		}
+		if !filepath.IsAbs(target) {
+			target = filepath.Join(filepath.Dir(current), target)
+		}
+		state.hopsRemaining--
+		target = resolveExistingLocalPathPrefixesWithState(target, state)
+		info, err := os.Lstat(target)
+		if err != nil || info.Mode()&os.ModeSymlink == 0 {
+			return target
+		}
+		current = normalizeLocalPathForResolution(target)
+	}
+	return current
+}
+
+func normalizeLocalPathForResolution(path string) string {
 	path = normalizeLocalPathForAlias(path)
-	const maxHops = 40
-	if hops < maxHops {
-		if info, err := os.Lstat(path); err == nil && info.Mode()&os.ModeSymlink != 0 {
-			if target, err := os.Readlink(path); err == nil {
-				if !filepath.IsAbs(target) {
-					target = filepath.Join(filepath.Dir(path), target)
-				}
-				return resolveLocalSymlinkChain(target, hops+1)
-			}
+	if !looksLikeWindowsDrivePath(path) && !filepath.IsAbs(path) {
+		if absPath, err := filepath.Abs(path); err == nil {
+			path = absPath
 		}
 	}
-
-	parent := filepath.Dir(path)
-	if parent == path {
-		return path
-	}
-	resolvedParent := resolveLocalSymlinkChain(parent, hops)
-	if resolvedParent == parent {
-		return path
-	}
-	return filepath.Join(resolvedParent, filepath.Base(path))
+	return path
 }
 
 func normalizeLocalPublicationPath(path string) string {
@@ -573,20 +594,26 @@ func appendLocalPathParts(prefix string, parts []string) string {
 }
 
 func usesLocalFilesystemSemantics(ref stagePathRef) bool {
-	if explicitBackendSchemeOnBackend(ref.backend, ref.path) != "" {
+	backend := unwrapBackend(ref.backend)
+	if storage.UsesLocalPathSemantics(backend) {
+		return true
+	}
+	if explicitBackendSchemeOnBackend(backend, ref.path) != "" {
 		return false
 	}
-	backend := unwrapBackend(ref.backend)
 	if backend == nil {
 		return true
 	}
-	_, ok := backend.(*local.Backend)
-	return ok
+	return false
 }
 
 func canonicalBackendPath(ref stagePathRef) (string, bool) {
-	scheme := explicitBackendSchemeOnBackend(ref.backend, ref.path)
-	switch b := unwrapBackend(ref.backend).(type) {
+	backend := unwrapBackend(ref.backend)
+	if storage.UsesLocalPathSemantics(backend) {
+		return "", false
+	}
+	scheme := explicitBackendSchemeOnBackend(backend, ref.path)
+	switch b := backend.(type) {
 	case *s3.Backend:
 		if scheme != "" && scheme != "s3" {
 			return "", false
