@@ -15,6 +15,29 @@
 //     BulkImport.java): there is no need to open RFiles and rediscover
 //     tablet boundaries the way Accumulo's client does when importing
 //     externally-produced files of unknown provenance.
+//
+//     Known limitation: Shoal's local tablets use [StartRow, EndRow)
+//     (inclusive start, exclusive end — see engine/table.go's
+//     routeTablet), while Accumulo's KeyExtent is (PrevEndRow, EndRow]
+//     (exclusive start, inclusive end — see KeyExtent.java's contains()).
+//     The two conventions agree everywhere except exactly on a split
+//     value itself, and there is no general byte-math translation between
+//     them: no "predecessor" operation exists for arbitrary row bytes,
+//     only "successor" (append 0x00), which Accumulo itself relies on in
+//     rowAfterPrevRow() and which this package does not attempt to invert.
+//     BuildLoadMapping therefore copies each tablet's StartRow/EndRow into
+//     PrevEndRow/EndRow as-is, which is exactly correct only when the
+//     destination table is already split at those same row values.
+//     Accumulo's own PrepBulkImport enforces exactly that precondition —
+//     it validates each mapping entry's PrevEndRow/EndRow against the
+//     destination's real, current tablet boundaries, it does not create or
+//     reconcile splits (server/manager/.../tableOps/bulkVer2/
+//     PrepBulkImport.java; see docs/promotion.md §3). ValidateAgainstDestination
+//     performs that same check locally, ahead of the FATE call, when the
+//     caller supplies the destination's current tablets (e.g. via
+//     internal/metadata.Walker.LocateTable) through
+//     Options.DestinationTablets; PrepBulkImport remains the final
+//     authority regardless.
 //  2. Stages those RFiles flat into a bulk directory — Accumulo's bulk
 //     import lists the bulk directory non-recursively, so files must sit
 //     directly inside it, unlike ExportRFiles' per-tablet nesting — and
@@ -94,6 +117,16 @@ type LoadMapping []Mapping
 // without re-sorting. Tablets with no files are omitted: there is nothing
 // to import for that range.
 //
+// The returned KeyExtents are only correct against a destination table
+// already split at the exact same row values — see the package doc's
+// "Known limitation" paragraph above. Use ValidateAgainstDestination to
+// check that precondition locally before promoting.
+//
+// RFiles sharing the same DestinationPath (e.g. a manifest listing one
+// physical file under more than one tablet) contribute a single
+// FileEntry: Accumulo's Bulk.Files is name-keyed and rejects duplicate
+// filenames outright.
+//
 // Legacy manifests with no Tablets entries (RFileExportManifest.Tablets
 // nil/empty) map every RFile (TabletIndex 0) to a single unbounded tablet,
 // mirroring RFileExportManifest.tabletCount()'s documented default.
@@ -107,7 +140,12 @@ func BuildLoadMapping(manifest *engine.RFileExportManifest) (LoadMapping, error)
 	}
 
 	byIndex := make(map[int][]FileEntry, len(tablets))
+	seen := make(map[string]bool, len(manifest.RFiles))
 	for _, rf := range manifest.RFiles {
+		if seen[rf.DestinationPath] {
+			continue
+		}
+		seen[rf.DestinationPath] = true
 		byIndex[rf.TabletIndex] = append(byIndex[rf.TabletIndex], FileEntry{
 			Name:    filepath.Base(rf.DestinationPath),
 			EstSize: rf.Size,
@@ -137,6 +175,62 @@ func rowBytes(s *string) []byte {
 		return nil
 	}
 	return []byte(*s)
+}
+
+// ValidateAgainstDestination checks mapping's tablet boundaries against
+// destination, the destination table's real, current tablets, before a
+// promotion is submitted.
+//
+// Accumulo's PrepBulkImport does not create or reconcile splits (see the
+// package doc's "Known limitation" paragraph and docs/promotion.md §3):
+// it requires every mapping entry's PrevEndRow to exactly equal some
+// destination tablet's PrevEndRow, and its EndRow to exactly equal some —
+// the same or a later — destination tablet's EndRow, mirroring
+// PrepBulkImport.validateLoadMapping's own algorithm
+// (server/manager/.../tableOps/bulkVer2/PrepBulkImport.java). A single
+// file may legitimately span several destination tablets; what it may
+// never do is introduce a boundary value the destination doesn't already
+// have. When that happens, Accumulo fails the whole FATE operation with
+// BULK_CONCURRENT_MERGE ("Concurrent merge happened") — this function
+// catches the same condition locally, with an actionable error, instead
+// of leaving it to fail deep inside the manager.
+//
+// destination is supplied by the caller (e.g. from
+// internal/metadata.Walker.LocateTable); this package deliberately does
+// not fetch it itself, keeping promotion's producer-of-a-load-mapping
+// scope unchanged (see package doc). This is a client-side pre-flight
+// check only: the destination's real splits can still change concurrently
+// before the FATE operation actually runs, so a passing result here is
+// not a guarantee — PrepBulkImport remains the final authority.
+func ValidateAgainstDestination(mapping LoadMapping, destination []KeyExtent) error {
+	if len(destination) == 0 {
+		return fmt.Errorf("promotion: destination has no tablets")
+	}
+	prevEndRows := make(map[string]bool, len(destination))
+	endRows := make(map[string]bool, len(destination))
+	for _, t := range destination {
+		prevEndRows[boundaryKey(t.PrevEndRow)] = true
+		endRows[boundaryKey(t.EndRow)] = true
+	}
+	for _, m := range mapping {
+		if !prevEndRows[boundaryKey(m.Tablet.PrevEndRow)] {
+			return fmt.Errorf("promotion: destination table has no tablet split at prevEndRow %q; pre-split the destination to match the source table's tablet layout before promoting (see docs/promotion.md §3)", m.Tablet.PrevEndRow)
+		}
+		if !endRows[boundaryKey(m.Tablet.EndRow)] {
+			return fmt.Errorf("promotion: destination table has no tablet split at endRow %q; pre-split the destination to match the source table's tablet layout before promoting (see docs/promotion.md §3)", m.Tablet.EndRow)
+		}
+	}
+	return nil
+}
+
+// boundaryKey maps a KeyExtent boundary to a map key that distinguishes
+// nil (unbounded: negative/positive infinity) from an actual zero-length
+// row, both of which stringify identically as "".
+func boundaryKey(row []byte) string {
+	if row == nil {
+		return "\x00"
+	}
+	return "\x01" + string(row)
 }
 
 // jsonTablet/jsonFileInfo/jsonMapping mirror Accumulo's

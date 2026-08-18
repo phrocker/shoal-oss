@@ -77,7 +77,7 @@ sources listed in `REFERENCES.md` rather than assumed. The load mapping
   `[tableID, bulkDir, setTime]`), matching
   `FateServiceHandler`/`BulkImport.java`'s own call shape.
 
-## 3. Why no RFile-index reading or live destination lookup is needed
+## 3. Why no RFile-index reading is needed, and what that leaves unverified
 
 Accumulo's own bulk-import client normally must open each RFile's index to
 discover its row range and query the *destination* table's live tablet
@@ -87,9 +87,20 @@ importing arbitrary externally-produced files of unknown provenance.
 
 Accumulo also exposes a caller-supplied-partition mode
 (`LoadPlan`/`RangeType.TABLE`): callers may supply `(startRow, endRow)`
-pairs directly as destination `KeyExtent`s, and the server's
-`PrepBulkImport` FATE step creates matching splits if the destination table
-doesn't already have them.
+pairs directly as destination `KeyExtent`s. Critically, the server's
+`PrepBulkImport` FATE step does **not** create or reconcile splits to match
+them: `validateLoadMapping` walks the destination table's *real, current*
+tablet metadata and requires each mapping entry's `prevEndRow` to exactly
+equal some real tablet's `prevEndRow`, and its `endRow` to exactly equal
+some (the same or a later) real tablet's `endRow` — a single file may span
+several destination tablets, but every boundary value it introduces must
+already exist on the destination. If that walk fails, the whole FATE
+operation is rejected with `BULK_CONCURRENT_MERGE` ("Concurrent merge
+happened"). In other words: **the destination table must already be
+split at the source table's boundaries before promoting** — this package
+does not, and cannot, make that true on Accumulo's behalf (that would
+itself be a form of promotion code assuming authority over the
+destination's tablet layout, which violates the invariant in §1).
 
 Shoal's own `RFileExportManifest` already records, per RFile, exactly
 which of the *source* table's own tablet ranges it came from
@@ -98,10 +109,36 @@ and those ranges are already a valid, gapless, ordered partition of the
 source table's keyspace. `internal/promotion.BuildLoadMapping` uses that
 existing partition directly as the destination `KeyExtent` set — this is
 the `LoadPlan`-style path, fully supported by Accumulo, and it avoids
-opening RFile indexes or querying a live destination cluster. It also means
-the destination table's split points end up matching the source table's,
-which is what "cell-equivalent results" (acceptance criterion 1) requires
-in the first place.
+opening RFile indexes.
+
+**Known limitation — a boundary-convention mismatch.** Shoal's local
+tablets are `[StartRow, EndRow)` (inclusive start, exclusive end — see
+`internal/engine/table.go`'s `routeTablet`), but Accumulo's `KeyExtent` is
+`(PrevEndRow, EndRow]` (exclusive start, inclusive end — see
+`KeyExtent.java`'s `contains()`). The two conventions agree everywhere
+*except* for a row whose value exactly equals a split point: locally that
+row belongs to the tablet that *starts* at the split; in Accumulo it
+belongs to the tablet that *ends* at the split. `BuildLoadMapping` copies
+`StartRow`/`EndRow` into `PrevEndRow`/`EndRow` as-is — there is no general
+byte-math translation between the two conventions (no "predecessor"
+operation exists for arbitrary row bytes; only "successor", via appending
+`0x00`, which Accumulo itself relies on in `rowAfterPrevRow()`). This means
+a row that exactly equals one of the source table's split values can be
+promoted into the tablet *adjacent* to the one Shoal's own local engine
+would have routed it to. This is a genuine, currently **unresolved** gap
+against acceptance criterion 1 ("cell-equivalent results"), not something
+this slice claims to have fixed — see [§5, item 1](#5-whats-deferred).
+
+What this slice *does* add is a way to catch the more common failure mode
+— a destination that is not pre-split to match the source at all —
+locally and before staging: `internal/promotion.ValidateAgainstDestination`,
+wired in via `Promote`'s optional `Options.DestinationTablets`, mirrors
+`validateLoadMapping`'s own per-boundary check against a caller-supplied
+list of the destination's real tablets (e.g. from
+`internal/metadata.Walker.LocateTable`). It is a client-side pre-flight
+only: `PrepBulkImport` remains the sole, final authority, and a passing
+local check is not a guarantee against a concurrent split/merge on the
+destination between the check and the FATE call actually running.
 
 ## 4. What's implemented
 
@@ -137,10 +174,20 @@ RFileExportManifest (existing)  →  promotion.BuildLoadMapping
   with the same inputs reproduces byte-identical output) and writes
   `loadmap.json`. Detects basename collisions across the whole manifest
   before copying anything, so a collision never leaves a half-staged
-  directory.
+  directory, and verifies every referenced RFile against the manifest's
+  recorded size/SHA256 (`engine.VerifyRFileExport`) before copying, so a
+  stale or corrupted manifest fails fast instead of staging mismatched
+  data. Files sharing the same `DestinationPath` (the same physical file
+  listed under more than one manifest entry) are staged once.
+- `internal/promotion.ValidateAgainstDestination` — optional client-side
+  pre-flight (see §3's "Known limitation") that checks a load mapping's
+  tablet boundaries against the destination table's real, current tablets;
+  wired into `Promote` via `Options.DestinationTablets`.
 - `internal/promotion.Promote` — composes `StageBulkDir` with a
   `BulkImporter` (satisfied by `*accumulo.Connector`) to submit the FATE
-  call.
+  call. Submits nothing when the derived mapping is empty (nothing to
+  import), and validates against `Options.DestinationTablets` first when
+  supplied.
 - `accumulo.Connector.BulkImport` — resolves the destination table name to
   its stable ID, then submits `TABLE_BULK_IMPORT2` through the same
   `executeTableMutation` path (manager resolution, discovery-cache
@@ -154,24 +201,40 @@ RFileExportManifest (existing)  →  promotion.BuildLoadMapping
 Mapped against #70's five acceptance criteria:
 
 1. **"a local table can be promoted into an existing Accumulo instance and
-   queried with cell-equivalent results"** — the mechanism above is
-   protocol-correct against upstream Java source and unit-tested end to
-   end with fakes, but has **not been verified against a live Accumulo
-   cluster** (none is available in this environment). Split points are
-   carried over exactly (§3), which is the strongest available argument
-   for cell-equivalence short of an actual query.
+   queried with cell-equivalent results"** — the wire format and FATE call
+   shape are verified against upstream Java source and unit-tested end to
+   end with fakes, but this is **not fully solved**: §3's "Known
+   limitation" describes a real, unresolved gap (rows exactly equal to a
+   split value can land in the adjacent tablet, due to Shoal's
+   `[Start,End)` vs. Accumulo's `(Prev,End]` boundary conventions), and
+   none of this has been **verified against a live Accumulo cluster**
+   (none is available in this environment). `ValidateAgainstDestination`
+   catches the more common failure (destination not pre-split to match at
+   all) but does not close the exact-boundary gap.
 2. **"rerunning any interrupted transfer is safe"** — `StageBulkDir` is
-   idempotent (deterministic bulk dir contents, copy-based, no partial
-   writes on error), so re-running `Promote` before the FATE call is
-   submitted is safe. Detecting and skipping re-submission of a bulk
-   import that Accumulo already accepted (i.e. FATE-level idempotency) is
-   not implemented — that's inherent to Accumulo's own FATE operation and
+   idempotent: a basename collision is always detected and reported before
+   any copy happens, and a manifest verification failure (§4) is likewise
+   caught up front. A persistent I/O failure partway through copying
+   *multiple* files can still leave a partially-staged bulk directory, but
+   because staging is deterministic (the same manifest and bulk dir always
+   reproduce the same bytes at the same paths), simply re-running
+   `Promote`/`StageBulkDir` once the underlying cause is fixed safely
+   completes it — no manual cleanup is required, but this is "safe to
+   retry," not "no partial writes ever occur." Detecting and skipping
+   re-submission of a bulk import that Accumulo already accepted (i.e.
+   FATE-level idempotency) is not implemented — that's inherent to
+   Accumulo's own FATE operation and
    hasn't been exercised against a live manager here.
 3. **"split changes and partial uploads recover without manual metadata
-   repair"** — split reconciliation is delegated entirely to Accumulo's
-   own `PrepBulkImport` FATE step (§3); this package does not add any
-   split-repair logic of its own, and that delegation is unverified
-   against a live cluster.
+   repair"** — split *validation* (not reconciliation — see §3) is
+   delegated to Accumulo's own `PrepBulkImport` FATE step: if the
+   destination isn't already split at the source table's boundaries, the
+   whole FATE operation is rejected (`BULK_CONCURRENT_MERGE`), and this
+   package does not retry or adjust the mapping automatically.
+   `ValidateAgainstDestination` is an optional, local pre-flight version of
+   that same check (§3), not a substitute for it — `PrepBulkImport` remains
+   authoritative, and this delegation is unverified against a live
+   cluster.
 4. **"a documented cutover protocol"** — not implemented. No
    promotion-state or cutover API surface is exposed yet; this slice is
    promotion of a single point-in-time export, not the ongoing fan-in /

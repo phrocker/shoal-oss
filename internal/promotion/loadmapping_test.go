@@ -98,6 +98,132 @@ func TestBuildLoadMappingRejectsNilManifest(t *testing.T) {
 	}
 }
 
+func TestBuildLoadMappingDedupesRepeatedDestinationPath(t *testing.T) {
+	// Same physical file listed twice under the same tablet (a legitimate,
+	// already-tested manifest shape per flattenNames'
+	// TestFlattenNamesAllowsSameDestinationPathTwice) must contribute one
+	// FileEntry, not two: Accumulo's Bulk.Files is name-keyed and rejects
+	// duplicate filenames outright.
+	manifest := &engine.RFileExportManifest{
+		SourceTable: "events",
+		RFiles: []engine.RFileExportFile{
+			{TabletIndex: 0, DestinationPath: "events/t-0000/F0001.rf", Size: 10},
+			{TabletIndex: 0, DestinationPath: "events/t-0000/F0001.rf", Size: 10},
+			{TabletIndex: 0, DestinationPath: "events/t-0000/F0002.rf", Size: 20},
+		},
+	}
+	mapping, err := BuildLoadMapping(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(mapping) != 1 {
+		t.Fatalf("mapping entries = %d, want 1", len(mapping))
+	}
+	if len(mapping[0].Files) != 2 {
+		t.Fatalf("files = %#v, want 2 (F0001.rf deduped, F0002.rf kept)", mapping[0].Files)
+	}
+}
+
+func destinationTablets(bounds ...string) []KeyExtent {
+	// bounds is a sequence of split points; destinationTablets builds the
+	// resulting (n+1) contiguous tablets, unbounded at both ends.
+	tablets := make([]KeyExtent, 0, len(bounds)+1)
+	var prev []byte
+	for _, b := range bounds {
+		tablets = append(tablets, KeyExtent{PrevEndRow: prev, EndRow: []byte(b)})
+		prev = []byte(b)
+	}
+	tablets = append(tablets, KeyExtent{PrevEndRow: prev, EndRow: nil})
+	return tablets
+}
+
+func TestValidateAgainstDestinationAcceptsMatchingSplits(t *testing.T) {
+	mapping, err := BuildLoadMapping(threeTabletManifest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// threeTabletManifest's tablets split at "g" and "p" - a destination
+	// with the exact same splits (including the empty middle tablet, which
+	// BuildLoadMapping omitted from mapping since it has no files) must
+	// validate cleanly: mapping's entries only need their PrevEndRow/EndRow
+	// to each match *some* destination boundary, not a 1:1 tablet count.
+	destination := destinationTablets("g", "p")
+	if err := ValidateAgainstDestination(mapping, destination); err != nil {
+		t.Fatalf("ValidateAgainstDestination = %v, want nil", err)
+	}
+}
+
+func TestValidateAgainstDestinationAllowsFileSpanningMultipleDestinationTablets(t *testing.T) {
+	// A mapping entry covering (nil, "p"] is valid against a destination
+	// that is split more finely (nil,"g"],("g","p"]: PrepBulkImport's own
+	// validateLoadMapping walks forward from the entry's PrevEndRow across
+	// as many real destination tablets as needed until it finds one whose
+	// EndRow matches - it does not require a single destination tablet to
+	// span the whole mapping entry.
+	mapping := LoadMapping{{Tablet: KeyExtent{EndRow: []byte("p")}, Files: []FileEntry{{Name: "F0001.rf"}}}}
+	destination := destinationTablets("g", "p")
+	if err := ValidateAgainstDestination(mapping, destination); err != nil {
+		t.Fatalf("ValidateAgainstDestination = %v, want nil (file may span multiple destination tablets)", err)
+	}
+}
+
+func TestValidateAgainstDestinationRejectsMismatchedPrevEndRow(t *testing.T) {
+	mapping := LoadMapping{{Tablet: KeyExtent{PrevEndRow: []byte("m"), EndRow: []byte("p")}}}
+	destination := destinationTablets("g", "p") // no split at "m"
+	err := ValidateAgainstDestination(mapping, destination)
+	if err == nil {
+		t.Fatal("ValidateAgainstDestination = nil, want error (no destination split at prevEndRow)")
+	}
+}
+
+func TestValidateAgainstDestinationRejectsMismatchedEndRow(t *testing.T) {
+	mapping := LoadMapping{{Tablet: KeyExtent{EndRow: []byte("m")}}} // destination has no split at "m"
+	destination := destinationTablets("g", "p")
+	err := ValidateAgainstDestination(mapping, destination)
+	if err == nil {
+		t.Fatal("ValidateAgainstDestination = nil, want error (no destination split at endRow)")
+	}
+}
+
+func TestValidateAgainstDestinationRejectsEmptyDestination(t *testing.T) {
+	mapping := LoadMapping{{Tablet: KeyExtent{}}}
+	if err := ValidateAgainstDestination(mapping, nil); err == nil {
+		t.Fatal("ValidateAgainstDestination with no destination tablets = nil, want error")
+	}
+}
+
+func TestValidateAgainstDestinationDistinguishesNilFromEmptyRow(t *testing.T) {
+	// A destination whose first tablet has PrevEndRow nil (unbounded) must
+	// not be confused with a tablet whose PrevEndRow is the zero-length
+	// (but non-nil) row "": these mean different things (negative infinity
+	// vs. an actual split at the empty row) and must not collide in
+	// boundaryKey's map encoding.
+	mapping := LoadMapping{{Tablet: KeyExtent{PrevEndRow: []byte(""), EndRow: []byte("g")}}}
+	destination := []KeyExtent{
+		{PrevEndRow: nil, EndRow: []byte("g")}, // first tablet: unbounded start, not ""
+	}
+	err := ValidateAgainstDestination(mapping, destination)
+	if err == nil {
+		t.Fatal("ValidateAgainstDestination = nil, want error (mapping's \"\" PrevEndRow must not match destination's nil/unbounded start)")
+	}
+}
+
+func TestValidateAgainstDestinationAcceptsFullyUnboundedSingleTablet(t *testing.T) {
+	mapping, err := BuildLoadMapping(&engine.RFileExportManifest{
+		SourceTable: "events",
+		RFiles: []engine.RFileExportFile{
+			{TabletIndex: 0, DestinationPath: "events/t-0000/F0001.rf", Size: 10},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	destination := []KeyExtent{{}} // single tablet, fully unbounded both ends
+	if err := ValidateAgainstDestination(mapping, destination); err != nil {
+		t.Fatalf("ValidateAgainstDestination = %v, want nil", err)
+	}
+}
+
 func TestWriteLoadMappingMatchesAccumuloJSONShape(t *testing.T) {
 	// Row bytes chosen so standard base64 and URL-safe base64 diverge
 	// (0xFB 0xEF produces '+'/'/' in standard alphabet, '-'/'_' in URL-safe),

@@ -156,6 +156,14 @@ cribs land.
   - `compareTo` ordering: ascending by `endRow`, with a null (unbounded)
     `endRow` sorting **last** (`Comparator.nullsLast`) — this is the order
     `LoadMappingIterator` requires
+  - `contains(row)` = `(prevEndRow == null || prevEndRow < row) &&
+    (endRow == null || endRow >= row)`, i.e. `(prevEndRow, endRow]` —
+    exclusive start, inclusive end. `rowAfterPrevRow()` (append a trailing
+    `0x00` byte) is Accumulo's own "successor" helper for this convention;
+    there is no symmetric "predecessor" helper, which is why Shoal's
+    opposite-convention local tablets (`[start, end)`, see
+    `internal/engine/table.go`'s `routeTablet`) cannot be translated to
+    exact `KeyExtent`s via simple byte math (`docs/promotion.md` §3)
 - `core/.../clientImpl/bulk/BulkImport.java`
   - `computeMappingFromFiles` — the default path: opens each RFile's index
     and queries the destination table's live tablet metadata to compute a
@@ -166,10 +174,19 @@ cribs land.
 - `server/manager/.../FateServiceHandler.java` and
   `server/manager/.../tableOps/bulkVer2/PrepBulkImport.java`
   - FATE argument shape for `TABLE_BULK_IMPORT2` (tableId, bulk dir,
-    setTime) and the server-side split-reconciliation step
+    setTime), plus `validateLoadMapping`, the server-side split
+    **validation** step run before any file is loaded
     (`managerclient.TableBulkImport` / `accumulo.Connector.BulkImport`
-    mirror the client-side call shape only; the split-reconciliation logic
-    itself is entirely server-side and out of scope here)
+    mirror the client-side call shape only; validation itself is entirely
+    server-side and out of scope here). `validateLoadMapping` does **not**
+    create or reconcile splits: it walks the destination's real, current
+    tablets and requires each load-mapping entry's `prevEndRow`/`endRow` to
+    individually match some real tablet boundary (a file may span several
+    destination tablets), rejecting the whole FATE operation with
+    `BULK_CONCURRENT_MERGE` ("Concurrent merge happened") if that walk
+    fails. `internal/promotion.ValidateAgainstDestination` mirrors this
+    same per-boundary check locally, as an optional client-side pre-flight
+    (`docs/promotion.md` §3)
 
 ## Sharkbite
 

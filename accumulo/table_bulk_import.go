@@ -34,9 +34,12 @@ type BulkImportOptions struct {
 // through the same manager Execute path CreateTable/DeleteTable/RenameTable
 // use (begin/execute/wait/finish). BulkImport never edits
 // accumulo.metadata or ZooKeeper directly, so the manager remains the sole
-// authority over the resulting tablet layout and file set — Accumulo's own
-// FATE machinery decides how to reconcile the requested KeyExtents against
-// the table's current splits.
+// authority over the resulting tablet layout and file set — the manager's
+// PrepBulkImport step validates the requested KeyExtents against the
+// table's current splits (rejecting the whole FATE operation if they
+// don't already match); it does not create or reconcile splits to fit
+// them. See internal/promotion's package doc and docs/promotion.md §3 for
+// what that means for callers building the load mapping this submits.
 func (c *Connector) BulkImport(ctx context.Context, tableName, bulkDir string, opts BulkImportOptions) error {
 	if tableName == "" {
 		return fmt.Errorf("%w: empty table name", ErrInvalidTableName)

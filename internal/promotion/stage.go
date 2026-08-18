@@ -28,6 +28,12 @@ import (
 // collision is reported as an error before any copy happens, rather than
 // silently overwriting one file with another (see package docs for the
 // deferred auto-rename gap, mirroring Accumulo's own renames.json step).
+//
+// The manifest is verified (engine.VerifyRFileExport: every RFile exists at
+// src and matches its recorded size/SHA256) before anything is copied, so a
+// truncated, corrupted, or stale export manifest fails fast here rather
+// than silently staging incomplete or mismatched data for Accumulo to bulk
+// import.
 func StageBulkDir(
 	ctx context.Context,
 	src storage.Backend,
@@ -46,7 +52,18 @@ func StageBulkDir(
 	if err != nil {
 		return nil, err
 	}
+	if err := engine.VerifyRFileExport(ctx, src, manifest); err != nil {
+		return nil, fmt.Errorf("promotion: stage: %w", err)
+	}
+	staged := make(map[string]bool, len(manifest.RFiles))
 	for _, rf := range manifest.RFiles {
+		if staged[rf.DestinationPath] {
+			// Same physical file referenced by more than one manifest
+			// entry (see flattenNames and BuildLoadMapping's dedup):
+			// already copied once, nothing more to do.
+			continue
+		}
+		staged[rf.DestinationPath] = true
 		dstPath := joinBulkPath(bulkDir, flatNames[rf.DestinationPath])
 		if _, err := storage.Copy(ctx, src, rf.DestinationPath, dst, dstPath); err != nil {
 			return nil, fmt.Errorf("promotion: stage %s: %w", rf.DestinationPath, err)

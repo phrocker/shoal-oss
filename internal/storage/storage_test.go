@@ -20,6 +20,35 @@ func (r readOnlyBackend) Open(ctx context.Context, p string) (storage.File, erro
 	return r.inner.Open(ctx, p)
 }
 
+// faultyCloseBackend wraps a WritableBackend whose writes succeed but
+// whose Close always fails, simulating a backend that only detects a
+// commit/flush failure (e.g. an object-storage upload) when the writer is
+// closed - the scenario storage.Copy must surface instead of discarding.
+type faultyCloseBackend struct {
+	inner interface {
+		storage.Backend
+		Create(ctx context.Context, path string) (storage.Writer, error)
+	}
+}
+
+func (f faultyCloseBackend) Open(ctx context.Context, p string) (storage.File, error) {
+	return f.inner.Open(ctx, p)
+}
+
+func (f faultyCloseBackend) Create(ctx context.Context, path string) (storage.Writer, error) {
+	w, err := f.inner.Create(ctx, path)
+	if err != nil {
+		return nil, err
+	}
+	return faultyCloseWriter{w}, nil
+}
+
+type faultyCloseWriter struct{ storage.Writer }
+
+var errFaultyClose = errors.New("faultyCloseWriter: simulated commit failure")
+
+func (faultyCloseWriter) Close() error { return errFaultyClose }
+
 func TestCopy_MemoryToMemory(t *testing.T) {
 	src := memory.New()
 	src.Put("/src/x", []byte("the contents of x"))
@@ -138,5 +167,20 @@ func TestCopy_EmptyFile(t *testing.T) {
 	defer f.Close()
 	if f.Size() != 0 {
 		t.Errorf("dst size = %d, want 0", f.Size())
+	}
+}
+
+// TestCopy_PropagatesDestinationCloseError guards against silently
+// discarding a destination writer's Close error (e.g. a backend that only
+// surfaces an upload/commit failure on Close): Copy must report it
+// instead of returning a false success.
+func TestCopy_PropagatesDestinationCloseError(t *testing.T) {
+	src := memory.New()
+	src.Put("/x", []byte("data"))
+	dst := faultyCloseBackend{inner: memory.New()}
+
+	_, err := storage.Copy(context.Background(), src, "/x", dst, "/dst")
+	if !errors.Is(err, errFaultyClose) {
+		t.Fatalf("err = %v, want chain to errFaultyClose", err)
 	}
 }

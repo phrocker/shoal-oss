@@ -22,10 +22,12 @@ func TestStageBulkDirFlattensCopiesAndWritesLoadMapping(t *testing.T) {
 			{Index: 1, StartRow: strPtr("g"), EndRow: strPtr("p")},
 			{Index: 2, StartRow: strPtr("p")},
 		},
+		// SHA256/Size must match the Put content above exactly: StageBulkDir
+		// now runs engine.VerifyRFileExport before copying anything.
 		RFiles: []engine.RFileExportFile{
-			{TabletIndex: 0, DestinationPath: "export/events/t-0000/F0001.rf", Size: 13},
-			{TabletIndex: 0, DestinationPath: "export/events/t-0000/F0002.rf", Size: 13},
-			{TabletIndex: 2, DestinationPath: "export/events/t-0002/F0003.rf", Size: 13},
+			{TabletIndex: 0, DestinationPath: "export/events/t-0000/F0001.rf", Size: 13, SHA256: "e47fb24ed70774dd8af7d59bf58fc740e126716aac3474bd262eb17f3e395e43"},
+			{TabletIndex: 0, DestinationPath: "export/events/t-0000/F0002.rf", Size: 13, SHA256: "066219c3f0f1a1bfccf12ef7e4d6957d102b3bf2e047fca44ba178a92e526cf0"},
+			{TabletIndex: 2, DestinationPath: "export/events/t-0002/F0003.rf", Size: 13, SHA256: "73595a5ac087b50583aaccc894558360559fa8406b808102cff9e4fe8816f466"},
 		},
 	}
 
@@ -122,5 +124,62 @@ func TestFlattenNamesAllowsSameDestinationPathTwice(t *testing.T) {
 	}
 	if names["export/events/t-0000/F0001.rf"] != "F0001.rf" {
 		t.Fatalf("flattenNames = %v", names)
+	}
+}
+
+func TestStageBulkDirRejectsCorruptSourceBeforeCopying(t *testing.T) {
+	src := memory.New()
+	src.Put("export/events/t-0000/F0001.rf", []byte("actual bytes on disk"))
+
+	manifest := &engine.RFileExportManifest{
+		Version:     engine.RFileExportManifestVersion,
+		SourceTable: "events",
+		Tablets:     []engine.RFileExportTablet{{Index: 0}},
+		RFiles: []engine.RFileExportFile{
+			// Size/SHA256 deliberately don't match the real bytes above -
+			// e.g. a stale manifest from before the export was re-run.
+			{TabletIndex: 0, DestinationPath: "export/events/t-0000/F0001.rf", Size: 999, SHA256: "0000000000000000000000000000000000000000000000000000000000000000"},
+		},
+	}
+	dst := memory.New()
+	ctx := context.Background()
+	if _, err := StageBulkDir(ctx, src, manifest, dst, "/bulk/events-1"); err == nil {
+		t.Fatal("StageBulkDir with mismatched manifest size/sha256 = nil error, want error")
+	}
+	if got := dst.Keys(); len(got) != 0 {
+		t.Fatalf("StageBulkDir wrote %v on verification failure, want no partial writes", got)
+	}
+}
+
+func TestStageBulkDirDedupesRepeatedDestinationPathCopy(t *testing.T) {
+	src := memory.New()
+	src.Put("export/events/t-0000/F0001.rf", []byte("tablet0-file1"))
+
+	manifest := &engine.RFileExportManifest{
+		Version:     engine.RFileExportManifestVersion,
+		SourceTable: "events",
+		Tablets:     []engine.RFileExportTablet{{Index: 0}},
+		// Same DestinationPath listed twice: flattenNames already allows
+		// this (TestFlattenNamesAllowsSameDestinationPathTwice), and
+		// BuildLoadMapping already dedupes the resulting FileEntry
+		// (TestBuildLoadMappingDedupesRepeatedDestinationPath). StageBulkDir
+		// must not copy the same source object twice either.
+		RFiles: []engine.RFileExportFile{
+			{TabletIndex: 0, DestinationPath: "export/events/t-0000/F0001.rf", Size: 13, SHA256: "e47fb24ed70774dd8af7d59bf58fc740e126716aac3474bd262eb17f3e395e43"},
+			{TabletIndex: 0, DestinationPath: "export/events/t-0000/F0001.rf", Size: 13, SHA256: "e47fb24ed70774dd8af7d59bf58fc740e126716aac3474bd262eb17f3e395e43"},
+		},
+	}
+	dst := memory.New()
+	ctx := context.Background()
+	mapping, err := StageBulkDir(ctx, src, manifest, dst, "/bulk/events-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(mapping) != 1 || len(mapping[0].Files) != 1 {
+		t.Fatalf("mapping = %#v, want a single deduped FileEntry", mapping)
+	}
+	// Only one staged copy of the file, not a numbered/renamed second copy.
+	if got := dst.Keys(); len(got) != 2 { // F0001.rf + loadmap.json
+		t.Fatalf("dst.Keys() = %v, want exactly 2 entries (one staged file + loadmap.json)", got)
 	}
 }
