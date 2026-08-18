@@ -111,25 +111,41 @@ func (b *Backend) Create(_ context.Context, path string) (storage.Writer, error)
 // writer is the memory-backend's Writer. Buffers writes; on Close
 // publishes the buffered bytes to b.objects[path].
 type writer struct {
-	b      *Backend
-	path   string
-	buf    *bytes.Buffer
-	closed bool
+	b       *Backend
+	path    string
+	buf     *bytes.Buffer
+	closed  bool
+	aborted bool
 }
 
 func (w *writer) Write(p []byte) (int, error) {
-	if w.closed {
+	if w.closed || w.aborted {
 		return 0, fmt.Errorf("memory: write after close")
 	}
 	return w.buf.Write(p)
 }
 
 func (w *writer) Close() error {
+	if w.aborted {
+		return fmt.Errorf("memory: writer already aborted")
+	}
 	if w.closed {
 		return nil
 	}
 	w.closed = true
 	w.b.Put(w.path, w.buf.Bytes())
+	return nil
+}
+
+func (w *writer) Abort() error {
+	if w.aborted {
+		return nil
+	}
+	if w.closed {
+		return fmt.Errorf("memory: writer already closed")
+	}
+	w.aborted = true
+	w.buf.Reset()
 	return nil
 }
 

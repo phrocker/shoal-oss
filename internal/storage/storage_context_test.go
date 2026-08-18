@@ -14,13 +14,14 @@ import (
 
 const testTransferChunkSize = 64 * 1024
 
-func TestCopy_StopsWhenContextCanceledBetweenChunks(t *testing.T) {
+func TestCopy_CanceledAbortableWriterAbortsWithoutClose(t *testing.T) {
 	body := bytes.Repeat([]byte("x"), 2*testTransferChunkSize)
 	src := memory.New()
 	src.Put("/src", body)
 
 	ctx, cancel := context.WithCancel(context.Background())
-	dst := writerBackend{writer: &cancelAfterFirstWriteWriter{cancel: cancel}}
+	writer := &recordingAbortWriter{cancel: cancel, cancelAfterWrites: 1}
+	dst := writerBackend{writer: writer}
 
 	n, err := storage.Copy(ctx, src, "/src", dst, "/dst")
 	if !errors.Is(err, context.Canceled) {
@@ -29,11 +30,14 @@ func TestCopy_StopsWhenContextCanceledBetweenChunks(t *testing.T) {
 	if n != testTransferChunkSize {
 		t.Fatalf("Copy wrote %d bytes, want %d", n, testTransferChunkSize)
 	}
-	if got := dst.writer.(*cancelAfterFirstWriteWriter).buf.Len(); got != testTransferChunkSize {
+	if got := writer.buf.Len(); got != testTransferChunkSize {
 		t.Fatalf("dst length = %d, want %d", got, testTransferChunkSize)
 	}
-	if !dst.writer.(*cancelAfterFirstWriteWriter).closed {
-		t.Fatal("Copy did not close the destination writer")
+	if writer.abortCalls != 1 {
+		t.Fatalf("Abort calls = %d, want 1", writer.abortCalls)
+	}
+	if writer.closeCalls != 0 {
+		t.Fatalf("Close calls = %d, want 0", writer.closeCalls)
 	}
 }
 
@@ -50,6 +54,26 @@ func TestCopy_PropagatesCloseError(t *testing.T) {
 	}
 	if n != int64(len("hello")) {
 		t.Fatalf("Copy wrote %d bytes, want %d", n, len("hello"))
+	}
+}
+
+func TestCopy_SuccessfulAbortableWriterClosesWithoutAbort(t *testing.T) {
+	src := memory.New()
+	src.Put("/src", []byte("hello"))
+
+	writer := &recordingAbortWriter{}
+	n, err := storage.Copy(context.Background(), src, "/src", writerBackend{writer: writer}, "/dst")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != int64(len("hello")) {
+		t.Fatalf("Copy wrote %d bytes, want %d", n, len("hello"))
+	}
+	if writer.closeCalls != 1 {
+		t.Fatalf("Close calls = %d, want 1", writer.closeCalls)
+	}
+	if writer.abortCalls != 0 {
+		t.Fatalf("Abort calls = %d, want 0", writer.abortCalls)
 	}
 }
 
@@ -78,10 +102,10 @@ func TestReadAll_CanceledReadWaitsForBlockedCall(t *testing.T) {
 	}
 }
 
-func TestWriteAll_StopsWhenContextCanceledBetweenChunks(t *testing.T) {
+func TestWriteAll_CanceledAbortableWriterAbortsWithoutClose(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	data := bytes.Repeat([]byte("x"), 2*testTransferChunkSize)
-	writer := &cancelAfterFirstWriteWriter{cancel: cancel}
+	writer := &recordingAbortWriter{cancel: cancel, cancelAfterWrites: 1}
 
 	err := storage.WriteAll(ctx, writerBackend{writer: writer}, "/dst", data)
 	if !errors.Is(err, context.Canceled) {
@@ -90,8 +114,46 @@ func TestWriteAll_StopsWhenContextCanceledBetweenChunks(t *testing.T) {
 	if got := writer.buf.Len(); got != testTransferChunkSize {
 		t.Fatalf("WriteAll wrote %d bytes, want %d", got, testTransferChunkSize)
 	}
-	if !writer.closed {
-		t.Fatal("WriteAll did not close the writer")
+	if writer.abortCalls != 1 {
+		t.Fatalf("Abort calls = %d, want 1", writer.abortCalls)
+	}
+	if writer.closeCalls != 0 {
+		t.Fatalf("Close calls = %d, want 0", writer.closeCalls)
+	}
+}
+
+func TestWriteAll_AbortErrorJoinsPrimaryError(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	data := bytes.Repeat([]byte("x"), 2*testTransferChunkSize)
+	abortErr := errors.New("abort failed")
+	writer := &recordingAbortWriter{cancel: cancel, cancelAfterWrites: 1, abortErr: abortErr}
+
+	err := storage.WriteAll(ctx, writerBackend{writer: writer}, "/dst", data)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("WriteAll error = %v, want context.Canceled", err)
+	}
+	if !errors.Is(err, abortErr) {
+		t.Fatalf("WriteAll error = %v, want joined abort error", err)
+	}
+	if writer.abortCalls != 1 {
+		t.Fatalf("Abort calls = %d, want 1", writer.abortCalls)
+	}
+	if writer.closeCalls != 0 {
+		t.Fatalf("Close calls = %d, want 0", writer.closeCalls)
+	}
+}
+
+func TestWriteAll_SuccessfulAbortableWriterClosesWithoutAbort(t *testing.T) {
+	writer := &recordingAbortWriter{}
+	err := storage.WriteAll(context.Background(), writerBackend{writer: writer}, "/dst", []byte("hello"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if writer.closeCalls != 1 {
+		t.Fatalf("Close calls = %d, want 1", writer.closeCalls)
+	}
+	if writer.abortCalls != 0 {
+		t.Fatalf("Abort calls = %d, want 0", writer.abortCalls)
 	}
 }
 
@@ -143,25 +205,33 @@ func (b fileBackend) Open(context.Context, string) (storage.File, error) {
 	return b.file, nil
 }
 
-type cancelAfterFirstWriteWriter struct {
-	buf      bytes.Buffer
-	cancel   context.CancelFunc
-	writes   int
-	closeErr error
-	closed   bool
+type recordingAbortWriter struct {
+	buf               bytes.Buffer
+	cancel            context.CancelFunc
+	writes            int
+	cancelAfterWrites int
+	closeErr          error
+	abortErr          error
+	closeCalls        int
+	abortCalls        int
 }
 
-func (w *cancelAfterFirstWriteWriter) Write(p []byte) (int, error) {
+func (w *recordingAbortWriter) Write(p []byte) (int, error) {
 	w.writes++
-	if w.writes == 1 && w.cancel != nil {
+	if w.cancelAfterWrites > 0 && w.writes == w.cancelAfterWrites && w.cancel != nil {
 		w.cancel()
 	}
 	return w.buf.Write(p)
 }
 
-func (w *cancelAfterFirstWriteWriter) Close() error {
-	w.closed = true
+func (w *recordingAbortWriter) Close() error {
+	w.closeCalls++
 	return w.closeErr
+}
+
+func (w *recordingAbortWriter) Abort() error {
+	w.abortCalls++
+	return w.abortErr
 }
 
 type closeErrWriter struct {

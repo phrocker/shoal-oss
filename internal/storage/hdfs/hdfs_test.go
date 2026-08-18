@@ -92,6 +92,9 @@ func TestBackendCreateReplacesAndCreatesParents(t *testing.T) {
 	if client.mkdir != "/tables" {
 		t.Fatalf("MkdirAll path = %q, want /tables", client.mkdir)
 	}
+	if client.writerCloseCalls != 1 {
+		t.Fatalf("writer Close calls = %d, want 1", client.writerCloseCalls)
+	}
 	if got := string(client.files["/tables/1.rf"]); got != "new" {
 		t.Fatalf("created contents = %q, want new", got)
 	}
@@ -398,6 +401,86 @@ func TestBackendCreateStopsReplicationRetryOnContextDeadline(t *testing.T) {
 	}
 }
 
+func TestBackendAbortPreservesExistingTargetAndRemovesTemp(t *testing.T) {
+	client := newFakeClient()
+	client.files["/tables/1.rf"] = []byte("old")
+	backend, err := New("nn:8020", WithClient(client))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	w, err := backend.Create(context.Background(), "/tables/1.rf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write([]byte("new")); err != nil {
+		t.Fatal(err)
+	}
+	aborter, ok := w.(storage.Aborter)
+	if !ok {
+		t.Fatal("Create writer does not implement storage.Aborter")
+	}
+	if err := aborter.Abort(); err != nil {
+		t.Fatal(err)
+	}
+	if err := aborter.Abort(); err != nil {
+		t.Fatalf("second Abort: %v", err)
+	}
+
+	if got := string(client.files["/tables/1.rf"]); got != "old" {
+		t.Fatalf("existing contents = %q, want old", got)
+	}
+	if client.lastCreatePath == "" {
+		t.Fatal("Create did not record the temporary path")
+	}
+	if _, ok := client.files[client.lastCreatePath]; ok {
+		t.Fatalf("temporary file %s still exists after abort", client.lastCreatePath)
+	}
+	if client.writerCloseCalls != 1 {
+		t.Fatalf("writer Close calls = %d, want 1", client.writerCloseCalls)
+	}
+	if !slices.Contains(client.removeCalls, client.lastCreatePath) {
+		t.Fatalf("Remove calls = %v, want %s", client.removeCalls, client.lastCreatePath)
+	}
+	if len(client.renameCalls) != 0 {
+		t.Fatalf("Abort must not rename files, got %v", client.renameCalls)
+	}
+}
+
+func TestBackendAbortReportsCleanupFailure(t *testing.T) {
+	client := newFakeClient()
+	client.files["/tables/1.rf"] = []byte("old")
+	backend, err := New("nn:8020", WithClient(client))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	w, err := backend.Create(context.Background(), "/tables/1.rf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write([]byte("new")); err != nil {
+		t.Fatal(err)
+	}
+	client.failRemovePath = client.lastCreatePath
+	client.failRemoveErr = errors.New("injected remove failure")
+
+	aborter := w.(storage.Aborter)
+	err = aborter.Abort()
+	if err == nil {
+		t.Fatal("Abort succeeded, want cleanup failure")
+	}
+	if !strings.Contains(err.Error(), "remove temporary file") {
+		t.Fatalf("Abort error = %v, want remove failure", err)
+	}
+	if got := string(client.files["/tables/1.rf"]); got != "old" {
+		t.Fatalf("existing contents = %q, want old", got)
+	}
+	if len(client.renameCalls) != 0 {
+		t.Fatalf("Abort must not rename files, got %v", client.renameCalls)
+	}
+}
+
 type fakeClient struct {
 	files                    map[string][]byte
 	dirs                     map[string]bool
@@ -409,6 +492,11 @@ type fakeClient struct {
 	writerCloseCalls         int
 	lastReader               *fakeReader
 	lastWriter               *fakeWriter
+	lastCreatePath           string
+	removeCalls              []string
+	renameCalls              []renameCall
+	failRemovePath           string
+	failRemoveErr            error
 }
 
 func newFakeClient() *fakeClient {
@@ -436,6 +524,7 @@ func (c *fakeClient) Create(name string) (storage.Writer, error) {
 		c.files[name] = append([]byte(nil), data...)
 	}, client: c, failClose: c.failWriterClose}
 	c.lastWriter = writer
+	c.lastCreatePath = name
 	return writer, nil
 }
 
@@ -466,6 +555,10 @@ func (c *fakeClient) ReadDir(dirname string) ([]os.FileInfo, error) {
 }
 
 func (c *fakeClient) Remove(name string) error {
+	c.removeCalls = append(c.removeCalls, name)
+	if c.failRemovePath != "" && name == c.failRemovePath && c.failRemoveErr != nil {
+		return &os.PathError{Op: "remove", Path: name, Err: c.failRemoveErr}
+	}
 	if _, ok := c.files[name]; !ok {
 		return &os.PathError{Op: "remove", Path: name, Err: fs.ErrNotExist}
 	}
@@ -474,6 +567,7 @@ func (c *fakeClient) Remove(name string) error {
 }
 
 func (c *fakeClient) Rename(oldpath, newpath string) error {
+	c.renameCalls = append(c.renameCalls, renameCall{oldpath: oldpath, newpath: newpath})
 	if c.failPublish && strings.Contains(oldpath, ".shoal-tmp-") {
 		return &os.PathError{Op: "rename", Path: oldpath, Err: errors.New("injected publish failure")}
 	}
@@ -531,6 +625,11 @@ func (w *fakeWriter) Close() error {
 func (w *fakeWriter) SetDeadline(t time.Time) error {
 	w.deadline = t
 	return nil
+}
+
+type renameCall struct {
+	oldpath string
+	newpath string
 }
 
 type fakeInfo struct {

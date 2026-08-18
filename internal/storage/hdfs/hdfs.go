@@ -370,6 +370,14 @@ type deadlineSetter interface {
 	SetDeadline(time.Time) error
 }
 
+func clearDeadline(target any) error {
+	setter, ok := target.(deadlineSetter)
+	if !ok {
+		return nil
+	}
+	return setter.SetDeadline(time.Time{})
+}
+
 func applyDeadline(ctx context.Context, target any) error {
 	deadline, ok := contextOrBackground(ctx).Deadline()
 	if !ok {
@@ -404,22 +412,26 @@ func (f *file) Close() error {
 func (f *file) Size() int64 { return f.size }
 
 type replaceWriter struct {
-	client Client
-	writer storage.Writer
-	ctx    context.Context
-	temp   string
-	target string
-	closed bool
+	client  Client
+	writer  storage.Writer
+	ctx     context.Context
+	temp    string
+	target  string
+	closed  bool
+	aborted bool
 }
 
 func (w *replaceWriter) Write(p []byte) (int, error) {
-	if w.closed {
+	if w.closed || w.aborted {
 		return 0, errors.New("hdfs: write after close")
 	}
 	return w.writer.Write(p)
 }
 
 func (w *replaceWriter) Close() error {
+	if w.aborted {
+		return errors.New("hdfs: writer already aborted")
+	}
 	if w.closed {
 		return errors.New("hdfs: writer already closed")
 	}
@@ -463,6 +475,28 @@ func (w *replaceWriter) Close() error {
 		}
 	}
 	return nil
+}
+
+func (w *replaceWriter) Abort() error {
+	if w.aborted {
+		return nil
+	}
+	if w.closed {
+		return errors.New("hdfs: writer already closed")
+	}
+	w.aborted = true
+
+	var abortErr error
+	if err := clearDeadline(w.writer); err != nil {
+		abortErr = fmt.Errorf("hdfs: clear deadline on temporary file %s: %w", w.temp, err)
+	}
+	if err := closeAfterReplication(context.Background(), w.writer); err != nil {
+		abortErr = errors.Join(abortErr, fmt.Errorf("hdfs: close temporary file %s: %w", w.temp, err))
+	}
+	if err := w.client.Remove(w.temp); err != nil && !isNotFound(err) {
+		abortErr = errors.Join(abortErr, fmt.Errorf("hdfs: remove temporary file %s: %w", w.temp, err))
+	}
+	return abortErr
 }
 
 func closeAfterReplication(ctx context.Context, writer storage.Writer) error {
@@ -509,4 +543,5 @@ var (
 	_ storage.WritableBackend = (*Backend)(nil)
 	_ storage.Lister          = (*Backend)(nil)
 	_ storage.Remover         = (*Backend)(nil)
+	_ storage.Aborter         = (*replaceWriter)(nil)
 )

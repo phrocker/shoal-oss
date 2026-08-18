@@ -6,6 +6,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/phrocker/shoal/internal/storage"
 )
 
 func TestLocal_CreateAndReadBack(t *testing.T) {
@@ -80,5 +82,37 @@ func TestLocal_CreateReplacesExisting(t *testing.T) {
 	}
 	if string(got) != "new" {
 		t.Errorf("got %q, want \"new\" (Create should truncate)", got)
+	}
+}
+
+func TestLocal_AbortPreservesExistingFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "x.bin")
+	if err := os.WriteFile(path, []byte("old"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	be := New()
+	w, err := be.Create(context.Background(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write([]byte("new")); err != nil {
+		t.Fatal(err)
+	}
+	aborter, ok := w.(storage.Aborter)
+	if !ok {
+		t.Fatal("writer does not implement storage.Aborter")
+	}
+	if err := aborter.Abort(); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "old" {
+		t.Fatalf("got %q, want original file preserved", got)
 	}
 }

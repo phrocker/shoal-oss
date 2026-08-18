@@ -122,7 +122,7 @@ func (b *Backend) Create(ctx context.Context, path string) (shstorage.Writer, er
 	if err != nil {
 		return nil, err
 	}
-	return b.client.Bucket(bucket).Object(object).NewWriter(ctx), nil
+	return &writer{inner: b.client.Bucket(bucket).Object(object).NewWriter(ctx)}, nil
 }
 
 // List returns objects directly under prefix. The prefix may be gs://bucket/dir
@@ -222,4 +222,45 @@ func (g *file) ReadAt(p []byte, off int64) (int, error) {
 		return n, io.EOF
 	}
 	return n, nil
+}
+
+type writer struct {
+	inner   *storage.Writer
+	closed  bool
+	aborted bool
+}
+
+func (w *writer) Write(p []byte) (int, error) {
+	if w.closed || w.aborted {
+		return 0, fmt.Errorf("gcs: write after close")
+	}
+	return w.inner.Write(p)
+}
+
+func (w *writer) Close() error {
+	if w.aborted {
+		return fmt.Errorf("gcs: writer already aborted")
+	}
+	if w.closed {
+		return nil
+	}
+	w.closed = true
+	if err := w.inner.Close(); err != nil {
+		return fmt.Errorf("gcs: close writer: %w", err)
+	}
+	return nil
+}
+
+func (w *writer) Abort() error {
+	if w.aborted {
+		return nil
+	}
+	if w.closed {
+		return fmt.Errorf("gcs: writer already closed")
+	}
+	w.aborted = true
+	if err := w.inner.CloseWithError(errors.New("gcs: write aborted")); err != nil {
+		return fmt.Errorf("gcs: abort writer: %w", err)
+	}
+	return nil
 }

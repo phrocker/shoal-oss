@@ -76,3 +76,36 @@ func TestMemory_CreateReplacesExisting(t *testing.T) {
 		t.Errorf("size = %d, want 3", f.Size())
 	}
 }
+
+func TestMemory_AbortDiscardsBufferedWrite(t *testing.T) {
+	b := New()
+	b.Put("k", []byte("old"))
+
+	w, err := b.Create(context.Background(), "k")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write([]byte("new")); err != nil {
+		t.Fatal(err)
+	}
+	aborter, ok := w.(storage.Aborter)
+	if !ok {
+		t.Fatal("writer does not implement storage.Aborter")
+	}
+	if err := aborter.Abort(); err != nil {
+		t.Fatal(err)
+	}
+
+	f, err := b.Open(context.Background(), "k")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	got := make([]byte, f.Size())
+	if _, err := f.ReadAt(got, 0); err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "old" {
+		t.Fatalf("got %q, want old contents preserved", got)
+	}
+}

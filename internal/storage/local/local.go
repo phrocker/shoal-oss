@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/google/uuid"
 	"github.com/phrocker/shoal/internal/storage"
 )
 
@@ -41,21 +42,21 @@ func (b *Backend) Open(_ context.Context, path string) (storage.File, error) {
 	return &file{f: f, size: info.Size()}, nil
 }
 
-// Create opens path for writing in O_CREATE|O_WRONLY|O_TRUNC mode and
-// returns a Writer over the resulting *os.File. Parent directories are
-// created with 0755 if they don't already exist — matches "mkdir -p"
-// behavior so callers don't have to pre-create the path tree.
+// Create opens a temporary sibling file for writing and commits it into path
+// on Close. Parent directories are created with 0755 if they don't already
+// exist — matches "mkdir -p" behavior so callers don't have to pre-create the
+// path tree.
 func (b *Backend) Create(_ context.Context, path string) (storage.Writer, error) {
 	if dir := filepath.Dir(path); dir != "" && dir != "." {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return nil, fmt.Errorf("local: mkdir %s: %w", dir, err)
 		}
 	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	f, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".shoal-tmp-*")
 	if err != nil {
-		return nil, fmt.Errorf("local: create %s: %w", path, err)
+		return nil, fmt.Errorf("local: create temporary file for %s: %w", path, err)
 	}
-	return f, nil
+	return &writer{file: f, temp: f.Name(), target: path}, nil
 }
 
 // List enumerates the regular files directly under prefix (a directory
@@ -97,3 +98,86 @@ type file struct {
 func (l *file) ReadAt(p []byte, off int64) (int, error) { return l.f.ReadAt(p, off) }
 func (l *file) Close() error                            { return l.f.Close() }
 func (l *file) Size() int64                             { return l.size }
+
+type writer struct {
+	file    *os.File
+	temp    string
+	target  string
+	closed  bool
+	aborted bool
+}
+
+func (w *writer) Write(p []byte) (int, error) {
+	if w.closed || w.aborted {
+		return 0, fmt.Errorf("local: write after close")
+	}
+	return w.file.Write(p)
+}
+
+func (w *writer) Close() error {
+	if w.aborted {
+		return fmt.Errorf("local: writer already aborted")
+	}
+	if w.closed {
+		return nil
+	}
+	w.closed = true
+	if err := w.file.Close(); err != nil {
+		_ = os.Remove(w.temp)
+		return fmt.Errorf("local: close temporary file %s: %w", w.temp, err)
+	}
+
+	backup := w.target + ".shoal-backup-" + uuid.NewString()
+	hadOld := true
+	if err := os.Rename(w.target, backup); err != nil {
+		if !errors.Is(err, fs.ErrNotExist) {
+			_ = os.Remove(w.temp)
+			return fmt.Errorf("local: preserve existing file %s: %w", w.target, err)
+		}
+		hadOld = false
+	}
+
+	if err := os.Rename(w.temp, w.target); err != nil {
+		publishErr := fmt.Errorf("local: publish %s: %w", w.target, err)
+		if hadOld {
+			if restoreErr := os.Rename(backup, w.target); restoreErr != nil {
+				publishErr = errors.Join(
+					publishErr,
+					fmt.Errorf("local: restore existing file %s from %s: %w", w.target, backup, restoreErr),
+				)
+			}
+		}
+		if cleanupErr := os.Remove(w.temp); cleanupErr != nil && !errors.Is(cleanupErr, fs.ErrNotExist) {
+			publishErr = errors.Join(
+				publishErr,
+				fmt.Errorf("local: remove temporary file %s: %w", w.temp, cleanupErr),
+			)
+		}
+		return publishErr
+	}
+	if hadOld {
+		if err := os.Remove(backup); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return fmt.Errorf("local: remove replacement backup %s: %w", backup, err)
+		}
+	}
+	return nil
+}
+
+func (w *writer) Abort() error {
+	if w.aborted {
+		return nil
+	}
+	if w.closed {
+		return fmt.Errorf("local: writer already closed")
+	}
+	w.aborted = true
+
+	var abortErr error
+	if err := w.file.Close(); err != nil {
+		abortErr = fmt.Errorf("local: close temporary file %s: %w", w.temp, err)
+	}
+	if err := os.Remove(w.temp); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		abortErr = errors.Join(abortErr, fmt.Errorf("local: remove temporary file %s: %w", w.temp, err))
+	}
+	return abortErr
+}

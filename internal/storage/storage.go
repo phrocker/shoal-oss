@@ -66,9 +66,17 @@ type Writer interface {
 	io.Closer
 }
 
+// Aborter is an optional Writer capability that abandons an in-progress write
+// without publishing it. Copy and WriteAll call Abort on unsuccessful paths
+// when available; writers that do not implement Aborter retain their Close
+// semantics during cleanup.
+type Aborter interface {
+	Abort() error
+}
+
 // WritableBackend is a Backend that also supports creating + replacing
-// objects. Local + Memory implement this; GCS does not yet (would need
-// a streaming writer; can be added when we need GCS-side egress).
+// objects. Returned Writers commit on Close; if they also implement Aborter,
+// callers can abandon an unsuccessful write without publishing partial data.
 type WritableBackend interface {
 	Backend
 	// Create opens path for writing. Replaces any existing object with
@@ -114,8 +122,9 @@ var ErrReadOnly = errors.New("storage: backend is read-only")
 // request (GCS) absorb at most ceil(size/64KB) round trips. Increase
 // the chunk size for large files if perf matters. ctx is polled before
 // each backend read and write; if a backend call is already blocked,
-// Copy waits for it to return before observing ctx.Err().
-func Copy(ctx context.Context, src Backend, srcPath string, dst Backend, dstPath string) (int64, error) {
+// Copy waits for it to return before observing ctx.Err(). On an unsuccessful
+// path, Copy aborts the destination writer when it supports Aborter.
+func Copy(ctx context.Context, src Backend, srcPath string, dst Backend, dstPath string) (written int64, err error) {
 	wb, ok := dst.(WritableBackend)
 	if !ok {
 		return 0, ErrReadOnly
@@ -135,50 +144,52 @@ func Copy(ctx context.Context, src Backend, srcPath string, dst Backend, dstPath
 	if err != nil {
 		return 0, fmt.Errorf("copy: create dst %s: %w", dstPath, err)
 	}
-	closed := false
+	needsCleanup := true
 	defer func() {
-		if !closed {
-			_ = out.Close()
+		if needsCleanup {
+			err = cleanupUnsuccessfulWrite(err, out)
 		}
 	}()
 
 	buf := make([]byte, transferChunkSize)
-	var off int64
-	for off < in.Size() {
+	for written < in.Size() {
 		if err := ctx.Err(); err != nil {
-			return off, err
+			return written, err
 		}
 		want := int64(transferChunkSize)
-		if off+want > in.Size() {
-			want = in.Size() - off
+		if written+want > in.Size() {
+			want = in.Size() - written
 		}
-		n, err := in.ReadAt(buf[:want], off)
+		n, err := in.ReadAt(buf[:want], written)
 		if err != nil && !errors.Is(err, io.EOF) {
-			return off, fmt.Errorf("copy: read off=%d: %w", off, err)
+			return written, fmt.Errorf("copy: read off=%d: %w", written, err)
 		}
 		if n > 0 {
 			if err := ctx.Err(); err != nil {
-				return off, err
+				return written, err
 			}
-			writeOff := off
+			writeOff := written
 			wrote, werr := out.Write(buf[:n])
-			off += int64(wrote)
+			written += int64(wrote)
 			if werr != nil {
-				return off, fmt.Errorf("copy: write off=%d: %w", writeOff, werr)
+				return written, fmt.Errorf("copy: write off=%d: %w", writeOff, werr)
 			}
 			if wrote != n {
-				return off, fmt.Errorf("copy: write off=%d: %w", writeOff, io.ErrShortWrite)
+				return written, fmt.Errorf("copy: write off=%d: %w", writeOff, io.ErrShortWrite)
 			}
 		}
 		if errors.Is(err, io.EOF) {
 			break
 		}
 	}
-	if err := out.Close(); err != nil {
-		return off, fmt.Errorf("copy: close dst %s: %w", dstPath, err)
+	if err := ctx.Err(); err != nil {
+		return written, err
 	}
-	closed = true
-	return off, nil
+	needsCleanup = false
+	if err := out.Close(); err != nil {
+		return written, fmt.Errorf("copy: close dst %s: %w", dstPath, err)
+	}
+	return written, nil
 }
 
 // ReadAll opens path on b and reads the whole object into a single byte
@@ -224,8 +235,10 @@ func ReadAll(ctx context.Context, b Backend, path string) ([]byte, error) {
 // RFile produced by a flush or compaction. Returns ErrReadOnly if b can't
 // write. ctx is polled between chunk writes; a write already blocked in the
 // backend may still finish its current chunk, and if that completes the object,
-// WriteAll still closes/commits the writer before returning.
-func WriteAll(ctx context.Context, b Backend, path string, data []byte) error {
+// WriteAll still waits for that backend call to return before observing
+// ctx.Err(). On an unsuccessful path, WriteAll aborts the writer when it
+// supports Aborter.
+func WriteAll(ctx context.Context, b Backend, path string, data []byte) (err error) {
 	wb, ok := b.(WritableBackend)
 	if !ok {
 		return ErrReadOnly
@@ -237,10 +250,10 @@ func WriteAll(ctx context.Context, b Backend, path string, data []byte) error {
 	if err != nil {
 		return fmt.Errorf("writeall: create %s: %w", path, err)
 	}
-	closed := false
+	needsCleanup := true
 	defer func() {
-		if !closed {
-			_ = w.Close()
+		if needsCleanup {
+			err = cleanupUnsuccessfulWrite(err, w)
 		}
 	}()
 	for off := 0; off < len(data); {
@@ -258,9 +271,28 @@ func WriteAll(ctx context.Context, b Backend, path string, data []byte) error {
 			return fmt.Errorf("writeall: write %s off=%d: %w", path, writeOff, io.ErrShortWrite)
 		}
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	needsCleanup = false
 	if err := w.Close(); err != nil {
 		return fmt.Errorf("writeall: close %s: %w", path, err)
 	}
-	closed = true
 	return nil
+}
+
+func cleanupUnsuccessfulWrite(primaryErr error, w Writer) error {
+	if primaryErr == nil {
+		return nil
+	}
+	var cleanupErr error
+	if aborter, ok := w.(Aborter); ok {
+		cleanupErr = aborter.Abort()
+	} else {
+		cleanupErr = w.Close()
+	}
+	if cleanupErr == nil {
+		return primaryErr
+	}
+	return errors.Join(primaryErr, cleanupErr)
 }

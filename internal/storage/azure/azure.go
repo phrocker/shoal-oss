@@ -309,13 +309,39 @@ type writer struct {
 	name      string
 	ctx       context.Context //nolint:containedctx
 	buf       bytes.Buffer
+	closed    bool
+	aborted   bool
 }
 
-func (w *writer) Write(p []byte) (int, error) { return w.buf.Write(p) }
+func (w *writer) Write(p []byte) (int, error) {
+	if w.closed || w.aborted {
+		return 0, fmt.Errorf("azure: write after close")
+	}
+	return w.buf.Write(p)
+}
 
 func (w *writer) Close() error {
+	if w.aborted {
+		return fmt.Errorf("azure: writer already aborted")
+	}
+	if w.closed {
+		return nil
+	}
+	w.closed = true
 	if _, err := w.blob.UploadBuffer(w.ctx, w.buf.Bytes(), nil); err != nil {
 		return fmt.Errorf("azure: upload az://%s/%s: %w", w.container, w.name, err)
 	}
+	return nil
+}
+
+func (w *writer) Abort() error {
+	if w.aborted {
+		return nil
+	}
+	if w.closed {
+		return fmt.Errorf("azure: writer already closed")
+	}
+	w.aborted = true
+	w.buf.Reset()
 	return nil
 }

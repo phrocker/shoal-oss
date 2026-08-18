@@ -265,16 +265,30 @@ func (f *file) ReadAt(p []byte, off int64) (int, error) {
 // Close. S3 has no streaming-append API; buffering on Close matches the
 // one-shot usage pattern of storage.WriteAll.
 type writer struct {
-	client *s3sdk.Client
-	bucket string
-	key    string
-	ctx    context.Context //nolint:containedctx
-	buf    bytes.Buffer
+	client  *s3sdk.Client
+	bucket  string
+	key     string
+	ctx     context.Context //nolint:containedctx
+	buf     bytes.Buffer
+	closed  bool
+	aborted bool
 }
 
-func (w *writer) Write(p []byte) (int, error) { return w.buf.Write(p) }
+func (w *writer) Write(p []byte) (int, error) {
+	if w.closed || w.aborted {
+		return 0, fmt.Errorf("s3: write after close")
+	}
+	return w.buf.Write(p)
+}
 
 func (w *writer) Close() error {
+	if w.aborted {
+		return fmt.Errorf("s3: writer already aborted")
+	}
+	if w.closed {
+		return nil
+	}
+	w.closed = true
 	_, err := w.client.PutObject(w.ctx, &s3sdk.PutObjectInput{
 		Bucket:        aws.String(w.bucket),
 		Key:           aws.String(w.key),
@@ -284,6 +298,18 @@ func (w *writer) Close() error {
 	if err != nil {
 		return fmt.Errorf("s3: PutObject s3://%s/%s: %w", w.bucket, w.key, err)
 	}
+	return nil
+}
+
+func (w *writer) Abort() error {
+	if w.aborted {
+		return nil
+	}
+	if w.closed {
+		return fmt.Errorf("s3: writer already closed")
+	}
+	w.aborted = true
+	w.buf.Reset()
 	return nil
 }
 
