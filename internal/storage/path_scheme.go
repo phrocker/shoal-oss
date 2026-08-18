@@ -28,15 +28,15 @@ type backendUnwrapper interface {
 
 // ExplicitPathScheme returns the backend-style scheme for path when path is
 // explicitly qualified. HDFS's authorityless hdfs:/... form counts as an
-// explicit scheme too. Single-character schemes are treated as backend URLs
-// only when backend declares that scheme through PathSchemeProvider;
-// otherwise they remain local-path spellings so Windows drive roots like
-// C://data keep local semantics.
+// explicit scheme too, case-insensitively. Single-character schemes are
+// treated as backend URLs only when backend declares that scheme through
+// PathSchemeProvider; otherwise they remain local-path spellings so Windows
+// drive roots like C://data keep local semantics.
 func ExplicitPathScheme(backend Backend, path string) string {
 	if UsesLocalPathSemantics(backend) {
 		return ""
 	}
-	if strings.HasPrefix(path, "hdfs:/") {
+	if hasAuthoritylessHDFSScheme(path) {
 		return "hdfs"
 	}
 	matches := backendURLRootRe.FindStringSubmatch(path)
@@ -48,6 +48,10 @@ func ExplicitPathScheme(backend Backend, path string) string {
 		return scheme
 	}
 	return ""
+}
+
+func hasAuthoritylessHDFSScheme(path string) bool {
+	return len(path) >= len("hdfs:/") && strings.EqualFold(path[:len("hdfs:/")], "hdfs:/")
 }
 
 // UsesBackendPathJoin reports whether root should join children with literal

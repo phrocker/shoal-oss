@@ -288,6 +288,7 @@ func TestStageBulkDirRejectsInvalidBulkDirBeforeCopying(t *testing.T) {
 		{name: "whitespace padded", bulkDir: " /bulk/events-1 "},
 		{name: "local root", bulkDir: "/"},
 		{name: "url root", bulkDir: "hdfs://nn/"},
+		{name: "uppercase authorityless hdfs root", bulkDir: "HDFS:/"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -466,6 +467,7 @@ func TestPathUsesBackendSeparatorJoin(t *testing.T) {
 		{name: "custom scheme qualified path", path: "custom+backend://bucket/F0001.rf", want: true},
 		{name: "hdfs qualified path", path: "hdfs://nn/tables/F0001.rf", want: true},
 		{name: "hdfs authorityless path", path: "hdfs:/tables/F0001.rf", want: true},
+		{name: "uppercase hdfs authorityless path", path: "HDFS:/tables/F0001.rf", want: true},
 		{name: "opaque hdfs URI is not a joined backend path", path: "hdfs:tables/F0001.rf", want: false},
 		{name: "windows drive path is local", path: `C://data/F0001.rf`, want: false},
 		{name: "plain local path is local", path: `C:\data\F0001.rf`, want: false},
@@ -488,6 +490,13 @@ func TestJoinBulkPathTreatsWindowsDrivePathAsLocal(t *testing.T) {
 	}
 	if !localPathsLexicallyAlias(got, `C:\data\F0001.rf`) {
 		t.Fatalf("joinBulkPath(%q, %q) = %q, want a local Windows-drive path aliasing %q", `C://data`, "F0001.rf", got, `C:\data\F0001.rf`)
+	}
+}
+
+func TestJoinBulkPathTreatsAuthoritylessHDFSRootCaseInsensitively(t *testing.T) {
+	got := joinBulkPath(memory.New(), "HDFS:/bulk", "F0001.rf")
+	if got != "HDFS:/bulk/F0001.rf" {
+		t.Fatalf("joinBulkPath(HDFS:/bulk) = %q, want %q", got, "HDFS:/bulk/F0001.rf")
 	}
 }
 
@@ -579,6 +588,7 @@ func TestIsBackendRootDistinguishesWindowsDrivePaths(t *testing.T) {
 		{name: "custom backend root", path: "custom+backend://bucket/", want: true},
 		{name: "custom backend non-root", path: "custom+backend://bucket/path", want: false},
 		{name: "hdfs root", path: "hdfs:/", want: true},
+		{name: "uppercase hdfs root", path: "HDFS:/", want: true},
 		{name: "windows drive root with redundant separators", path: `C://`, want: true},
 		{name: "windows drive non-root with redundant separators", path: `C://data`, want: false},
 	}
@@ -641,6 +651,14 @@ func TestStagePathsAliasBackendCanonicalization(t *testing.T) {
 			name:       "hdfs authorityless aliases qualified path on same backend",
 			srcBackend: hdfsBackend,
 			srcPath:    "/tables/1.rf",
+			dstBackend: hdfsBackend,
+			dstPath:    "hdfs://nn:8020/tables/1.rf",
+			want:       true,
+		},
+		{
+			name:       "uppercase hdfs authorityless aliases qualified path on same backend",
+			srcBackend: hdfsBackend,
+			srcPath:    "HDFS:/tables/1.rf",
 			dstBackend: hdfsBackend,
 			dstPath:    "hdfs://nn:8020/tables/1.rf",
 			want:       true,

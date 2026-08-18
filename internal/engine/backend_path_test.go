@@ -25,6 +25,13 @@ func TestJoinBackendPathPreservesCustomSchemeRoots(t *testing.T) {
 	}
 }
 
+func TestJoinBackendPathTreatsAuthoritylessHDFSRootCaseInsensitively(t *testing.T) {
+	got := joinBackendPath(memory.New(), "HDFS:/bulk", "nested/F0001.rf")
+	if got != "HDFS:/bulk/nested/F0001.rf" {
+		t.Fatalf("joinBackendPath(HDFS:/bulk) = %q, want %q", got, "HDFS:/bulk/nested/F0001.rf")
+	}
+}
+
 func TestJoinBackendPathTreatsWindowsDriveRootsAsLocal(t *testing.T) {
 	got := joinBackendPath(local.New(), `C://bulk`, "F0001.rf")
 	want := filepath.Join(`C://bulk`, "F0001.rf")

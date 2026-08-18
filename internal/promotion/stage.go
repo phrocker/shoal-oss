@@ -697,7 +697,7 @@ func canonicalHDFSPath(objectPath, authorityHint string) (string, bool) {
 	if err != nil {
 		return "", false
 	}
-	if u.Scheme != "hdfs" || u.Opaque != "" || u.RawQuery != "" || u.Fragment != "" {
+	if !strings.EqualFold(u.Scheme, "hdfs") || u.Opaque != "" || u.RawQuery != "" || u.Fragment != "" {
 		return "", false
 	}
 
