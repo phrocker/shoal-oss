@@ -623,6 +623,90 @@ func TestIsBackendRootAcceptsDeclaredSingleCharacterScheme(t *testing.T) {
 	}
 }
 
+// TestParseDOS83LiteralComponent and TestDOS83AliasFamilyComponent
+// exercise dos83PathAliases's underlying component-parsing helpers
+// directly. Both helpers are plain string parsers with no
+// runtime.GOOS check of their own -- only dos83PathAliases and
+// buildLocalPublicationComponentIdentity (its callers) gate short-name
+// handling to Windows -- so, unlike the integration-level checks in
+// stage_windows_test.go, these run (and give CI real coverage of the
+// short-name matching rules) on every platform, which matters because
+// CI only runs on ubuntu-latest and therefore never executes any
+// //go:build windows test in this package. Inputs are passed through
+// normalizeLocalPublicationComponent first, matching how
+// buildLocalPublicationComponentIdentity actually feeds these helpers
+// in production: both expect an already case-folded component, not an
+// arbitrary-case raw string.
+func TestParseDOS83LiteralComponent(t *testing.T) {
+	tests := []struct {
+		name       string
+		raw        string
+		wantPrefix string
+		wantExt    string
+		wantOK     bool
+	}{
+		{name: "literal short name with an extension", raw: "LONGFI~1.RF", wantPrefix: "longfi", wantExt: "rf", wantOK: true},
+		{name: "literal short name without an extension", raw: "LONGFI~1", wantPrefix: "longfi", wantExt: "", wantOK: true},
+		{name: "a plain long name has no tilde and never parses", raw: "Plain.rf", wantOK: false},
+		{name: "a leading-zero ordinal is not a valid NTFS short name", raw: "LONGFI~01.RF", wantOK: false},
+		{name: "an over-long prefix before the tilde does not parse", raw: "TOOLONGFI~1.RF", wantOK: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			prefix, ext, ok := parseDOS83LiteralComponent(normalizeLocalPublicationComponent(tt.raw))
+			if ok != tt.wantOK || (ok && (prefix != tt.wantPrefix || ext != tt.wantExt)) {
+				t.Fatalf("parseDOS83LiteralComponent(%q) = (%q, %q, %v), want (%q, %q, %v)",
+					tt.raw, prefix, ext, ok, tt.wantPrefix, tt.wantExt, tt.wantOK)
+			}
+		})
+	}
+}
+
+func TestDOS83AliasFamilyComponent(t *testing.T) {
+	tests := []struct {
+		name       string
+		raw        string
+		wantPrefix string
+		wantExt    string
+		wantOK     bool
+	}{
+		{name: "long name derives the six-character alias prefix NTFS would generate", raw: "LongFilename.rf", wantPrefix: "longfi", wantExt: "rf", wantOK: true},
+		{name: "illegal characters are stripped before truncating the prefix", raw: "My File (v2).rf", wantPrefix: "myfile", wantExt: "rf", wantOK: true},
+		{
+			// NTFS never generates a distinct short name for a
+			// component that already fits 8.3 using only the
+			// unambiguously-safe charset, so a plain compliant name
+			// can never actually collide via this mechanism and must
+			// not be flagged as an alias family.
+			name:   "a name that already fits 8.3 gets no distinct alias family",
+			raw:    "PLAIN.RF",
+			wantOK: false,
+		},
+		{
+			// A tilde is not in the "definitely already compliant"
+			// charset isPlainDOS83Component checks, so a literal
+			// short-name spelling is conservatively still treated as
+			// its own alias family too: nothing here proves NTFS
+			// couldn't derive yet another short name for a file
+			// actually named "LONGFI~1.RF" verbatim.
+			name:       "a literal short-name spelling is conservatively still its own alias family",
+			raw:        "LONGFI~1.RF",
+			wantPrefix: "longfi",
+			wantExt:    "rf",
+			wantOK:     true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			prefix, ext, ok := dos83AliasFamilyComponent(normalizeLocalPublicationComponent(tt.raw))
+			if ok != tt.wantOK || (ok && (prefix != tt.wantPrefix || ext != tt.wantExt)) {
+				t.Fatalf("dos83AliasFamilyComponent(%q) = (%q, %q, %v), want (%q, %q, %v)",
+					tt.raw, prefix, ext, ok, tt.wantPrefix, tt.wantExt, tt.wantOK)
+			}
+		})
+	}
+}
+
 func TestStagePathsAliasBackendCanonicalization(t *testing.T) {
 	hdfsBackend := newTestHDFSBackend(t, "hdfs://nn:8020")
 
