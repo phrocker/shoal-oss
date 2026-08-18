@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"sort"
 	"testing"
 
 	"github.com/phrocker/shoal/accumulo"
@@ -170,6 +171,92 @@ func TestStageBulkDirDedupesRepeatedDestinationPathCopy(t *testing.T) {
 	}
 }
 
+func TestStageBulkDirDedupesPhysicalSourceAliasesBeforeCopying(t *testing.T) {
+	tests := []struct {
+		name  string
+		alias func(realPath string) (string, error)
+	}{
+		{
+			name: "hardlink alias with same basename",
+			alias: func(realPath string) (string, error) {
+				aliasDir := filepath.Join(filepath.Dir(filepath.Dir(realPath)), "hardlink-alias")
+				if err := os.MkdirAll(aliasDir, 0o755); err != nil {
+					return "", err
+				}
+				aliasPath := filepath.Join(aliasDir, filepath.Base(realPath))
+				return aliasPath, os.Link(realPath, aliasPath)
+			},
+		},
+		{
+			name: "symlinked parent alias with same basename",
+			alias: func(realPath string) (string, error) {
+				aliasDir := filepath.Join(filepath.Dir(filepath.Dir(realPath)), "symlink-alias")
+				if err := os.Symlink(filepath.Dir(realPath), aliasDir); err != nil {
+					return "", err
+				}
+				return filepath.Join(aliasDir, filepath.Base(realPath)), nil
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			root := t.TempDir()
+			realDir := filepath.Join(root, "real")
+			if err := os.MkdirAll(realDir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			realPath := filepath.Join(realDir, "F0001.rf")
+			content := []byte("physical source bytes")
+			if err := os.WriteFile(realPath, content, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			aliasPath, err := tt.alias(realPath)
+			if err != nil {
+				t.Skipf("alias setup not supported in this environment: %v", err)
+			}
+
+			manifest := localManifestFromFiles(t, realPath, aliasPath)
+			dst := memory.New()
+			mapping, err := StageBulkDir(context.Background(), local.New(), manifest, dst, "/bulk/events-1")
+			if err != nil {
+				t.Fatalf("StageBulkDir with physical source aliases: %v", err)
+			}
+			if len(mapping) != 1 || len(mapping[0].Files) != 1 {
+				t.Fatalf("mapping = %#v, want one deduped staged file", mapping)
+			}
+			if got := dst.Keys(); len(got) != 2 {
+				t.Fatalf("dst.Keys() = %v, want one staged file plus loadmap.json", got)
+			}
+		})
+	}
+}
+
+func TestStageBulkDirRejectsPhysicalSourceAliasesWithDifferentBasenames(t *testing.T) {
+	root := t.TempDir()
+	exportDir := filepath.Join(root, "export")
+	if err := os.MkdirAll(exportDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	aPath := filepath.Join(exportDir, "A.rf")
+	if err := os.WriteFile(aPath, []byte("same physical source"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	bPath := filepath.Join(exportDir, "B.rf")
+	if err := os.Link(aPath, bPath); err != nil {
+		t.Skipf("hard links not supported in this environment: %v", err)
+	}
+
+	manifest := localManifestFromFiles(t, aPath, bPath)
+	dst := memory.New()
+	if _, err := StageBulkDir(context.Background(), local.New(), manifest, dst, "/bulk/events-1"); err == nil {
+		t.Fatal("StageBulkDir with one physical source declared under two basenames = nil error, want error")
+	}
+	if got := dst.Keys(); len(got) != 0 {
+		t.Fatalf("StageBulkDir wrote %v on ambiguous physical source alias, want no writes", got)
+	}
+}
+
 func TestStageBulkDirRejectsInvalidBulkDirBeforeCopying(t *testing.T) {
 	src := memory.New()
 	src.Put("export/events/t-0000/F0001.rf", []byte("data"))
@@ -299,6 +386,7 @@ func TestStagePathsAlias(t *testing.T) {
 		{name: "identical local paths", src: `C:\data\t-0000\F0001.rf`, dst: `C:\data\t-0000\F0001.rf`, want: true},
 		{name: "windows drive path with redundant url-like separators", src: `C://data/F0001.rf`, dst: `C:\data\F0001.rf`, want: true},
 		{name: "local paths differing only by separator style", src: `/data/t-0000/F0001.rf`, dst: `/data/t-0000//F0001.rf`, want: true},
+		{name: "local paths differing only by unicode normalization", src: `/bulk/events-1/é.rf`, dst: "/bulk/events-1/e\u0301.rf", want: true},
 		{name: "distinct local paths", src: `/data/t-0000/F0001.rf`, dst: `/bulk/events-1/F0001.rf`, want: false},
 		{name: "identical relative paths", src: "export/events/t-0000/F0001.rf", dst: "export/events/t-0000/F0001.rf", want: true},
 		{name: "local paths differing only by case", src: `/bulk/events-1/A.rf`, dst: `/bulk/events-1/a.rf`, want: true},
@@ -306,6 +394,7 @@ func TestStagePathsAlias(t *testing.T) {
 		{name: "identical url paths", src: "hdfs://nn/export/t-0000/F0001.rf", dst: "hdfs://nn/export/t-0000/F0001.rf", want: true},
 		{name: "url paths differing only by trailing slash", src: "hdfs://nn/export/t-0000/F0001.rf", dst: "hdfs://nn/export/t-0000/F0001.rf/", want: true},
 		{name: "distinct url paths", src: "hdfs://nn/export/t-0000/F0001.rf", dst: "hdfs://nn/bulk/events-1/F0001.rf", want: false},
+		{name: "identical custom url paths", src: "custom+backend://bucket/path/F0001.rf", dst: "custom+backend://bucket/path/F0001.rf", want: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -325,6 +414,7 @@ func TestPathUsesBackendSeparatorJoin(t *testing.T) {
 		{name: "s3 qualified path", path: "s3://bucket/F0001.rf", want: true},
 		{name: "gcs qualified path", path: "gs://bucket/F0001.rf", want: true},
 		{name: "azure qualified path", path: "az://container/F0001.rf", want: true},
+		{name: "custom scheme qualified path", path: "custom+backend://bucket/F0001.rf", want: true},
 		{name: "hdfs qualified path", path: "hdfs://nn/tables/F0001.rf", want: true},
 		{name: "hdfs authorityless path", path: "hdfs:/tables/F0001.rf", want: true},
 		{name: "opaque hdfs URI is not a joined backend path", path: "hdfs:tables/F0001.rf", want: false},
@@ -367,6 +457,13 @@ func TestJoinBulkPathUsesSeparatorJoinForGenericBackendScheme(t *testing.T) {
 	}
 }
 
+func TestJoinBulkPathPreservesCustomSchemeRoot(t *testing.T) {
+	got := joinBulkPath("custom+backend://bucket/prefix", "F0001.rf")
+	if got != "custom+backend://bucket/prefix/F0001.rf" {
+		t.Fatalf("joinBulkPath(custom scheme) = %q, want %q", got, "custom+backend://bucket/prefix/F0001.rf")
+	}
+}
+
 func TestIsBackendRootDistinguishesWindowsDrivePaths(t *testing.T) {
 	tests := []struct {
 		name string
@@ -375,6 +472,8 @@ func TestIsBackendRootDistinguishesWindowsDrivePaths(t *testing.T) {
 	}{
 		{name: "backend root", path: "s3://bucket/", want: true},
 		{name: "backend non-root", path: "s3://bucket/path", want: false},
+		{name: "custom backend root", path: "custom+backend://bucket/", want: true},
+		{name: "custom backend non-root", path: "custom+backend://bucket/path", want: false},
 		{name: "hdfs root", path: "hdfs:/", want: true},
 		{name: "windows drive root with redundant separators", path: `C://`, want: true},
 		{name: "windows drive non-root with redundant separators", path: `C://data`, want: false},
@@ -541,6 +640,29 @@ func TestStagePathsAliasPhysicalIdentity(t *testing.T) {
 			t.Fatalf("stagePathsAlias(%q, %q) = false, want true (same not-yet-existing physical location via a symlinked parent directory)", linkPath, bPath)
 		}
 	})
+}
+
+func TestStagePathsAliasResolvesChainedParentSymlinksForNonexistentTargets(t *testing.T) {
+	root := t.TempDir()
+	realBulk := filepath.Join(root, "real-bulk")
+	if err := os.MkdirAll(realBulk, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	secondHop := filepath.Join(root, "second-hop")
+	if err := os.Symlink(realBulk, secondHop); err != nil {
+		t.Skipf("symlink not supported in this environment: %v", err)
+	}
+	firstHop := filepath.Join(root, "first-hop")
+	if err := os.Symlink(secondHop, firstHop); err != nil {
+		t.Skipf("symlink not supported in this environment: %v", err)
+	}
+
+	left := filepath.Join(firstHop, "nested", "F0001.rf")
+	right := filepath.Join(realBulk, "nested", "F0001.rf")
+	if !stagePathsAlias(left, right) {
+		t.Fatalf("stagePathsAlias(%q, %q) = false, want true after resolving chained parent symlinks for nonexistent targets", left, right)
+	}
 }
 
 // TestStageBulkDirRejectsInPlaceBulkDirViaRelativePath proves the alias
@@ -1157,6 +1279,22 @@ func TestStageBulkDirRejectsCaseInsensitiveAliasBeforeCopying(t *testing.T) {
 	}
 }
 
+func TestStageBulkDirRejectsUnicodeNormalizedWriteTargetsBeforeCopying(t *testing.T) {
+	src, manifest := memoryManifestFromBlobs(map[string][]byte{
+		"export/events/t-0000/é.rf":  []byte("composed"),
+		"export/events/t-0000/é.rf": []byte("decomposed"),
+	})
+
+	bulkDir := filepath.Join(t.TempDir(), "bulk")
+	if err := os.MkdirAll(bulkDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := StageBulkDir(context.Background(), src, manifest, local.New(), bulkDir); err == nil {
+		t.Fatal("StageBulkDir with Unicode-normalized write-target aliases = nil error, want error")
+	}
+}
+
 func localManifestFromFiles(t *testing.T, paths ...string) *engine.RFileExportManifest {
 	t.Helper()
 
@@ -1176,6 +1314,35 @@ func localManifestFromFiles(t *testing.T, paths ...string) *engine.RFileExportMa
 	}
 
 	return &engine.RFileExportManifest{
+		Version:     engine.RFileExportManifestVersion,
+		SourceTable: "events",
+		Tablets:     []engine.RFileExportTablet{{Index: 0}},
+		RFiles:      rfiles,
+	}
+}
+
+func memoryManifestFromBlobs(blobs map[string][]byte) (*memory.Backend, *engine.RFileExportManifest) {
+	src := memory.New()
+	paths := make([]string, 0, len(blobs))
+	for path := range blobs {
+		paths = append(paths, path)
+	}
+	sort.Strings(paths)
+
+	rfiles := make([]engine.RFileExportFile, 0, len(paths))
+	for _, path := range paths {
+		data := blobs[path]
+		src.Put(path, data)
+		sum := sha256.Sum256(data)
+		rfiles = append(rfiles, engine.RFileExportFile{
+			TabletIndex:     0,
+			DestinationPath: path,
+			Size:            int64(len(data)),
+			SHA256:          hex.EncodeToString(sum[:]),
+		})
+	}
+
+	return src, &engine.RFileExportManifest{
 		Version:     engine.RFileExportManifestVersion,
 		SourceTable: "events",
 		Tablets:     []engine.RFileExportTablet{{Index: 0}},

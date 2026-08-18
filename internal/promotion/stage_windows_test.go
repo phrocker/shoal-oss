@@ -36,6 +36,23 @@ func TestStagePathsAliasWindowsDrivePathReachesSameFile(t *testing.T) {
 	}
 }
 
+func TestStagePathsAliasWindowsTrailingDotOrSpaceAliases(t *testing.T) {
+	dir := t.TempDir()
+	realPath := filepath.Join(dir, "real.rf")
+	if err := os.WriteFile(realPath, []byte("data"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, alias := range []string{
+		filepath.Join(dir, "real.rf."),
+		filepath.Join(dir, "real.rf "),
+	} {
+		if !stagePathsAlias(alias, realPath) {
+			t.Fatalf("stagePathsAlias(%q, %q) = false, want true for a Windows trailing dot/space alias", alias, realPath)
+		}
+	}
+}
+
 func toWindowsDoubleSlashDrivePath(t *testing.T, path string) string {
 	t.Helper()
 
@@ -152,5 +169,45 @@ func TestStageBulkDirRejectsWindowsTrailingDotAliasedWriteTargetsBeforeCopying(t
 	}
 	if string(gotReal) != string(dottedContent) {
 		t.Fatalf("source file A.rf (dotted alias's real file) corrupted by rejected stage: got %q, want %q", gotReal, dottedContent)
+	}
+}
+
+// TestStageBulkDirRejectsTrailingDotOrSpaceWriteTargetsBeforeCopying
+// covers the same Win32 trailing-dot/space quirk as
+// TestStageBulkDirRejectsWindowsTrailingDotAliasedWriteTargetsBeforeCopying
+// above, but from an in-memory source manifest with two distinct blobs
+// (rather than one real source file reachable under two spellings),
+// matching TestStageBulkDirRejectsCaseInsensitiveAliasBeforeCopying's
+// and TestStageBulkDirRejectsUnicodeNormalizedWriteTargetsBeforeCopying's
+// pattern for the other publication-key equivalences. This scenario is
+// Windows-only: POSIX filesystems store trailing dots and spaces as
+// literal, significant filename bytes, so "F0001.rf" and "F0001.rf."
+// are genuinely distinct destination files there and StageBulkDir must
+// not reject them.
+func TestStageBulkDirRejectsTrailingDotOrSpaceWriteTargetsBeforeCopying(t *testing.T) {
+	tests := []struct {
+		name   string
+		first  string
+		second string
+	}{
+		{name: "trailing dot", first: "export/events/t-0000/F0001.rf", second: "export/events/t-0000/F0001.rf."},
+		{name: "trailing space", first: "export/events/t-0000/F0002.rf", second: "export/events/t-0000/F0002.rf "},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			src, manifest := memoryManifestFromBlobs(map[string][]byte{
+				tt.first:  []byte("first"),
+				tt.second: []byte("second"),
+			})
+			bulkDir := filepath.Join(t.TempDir(), "bulk")
+			if err := os.MkdirAll(bulkDir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+
+			if _, err := StageBulkDir(context.Background(), src, manifest, local.New(), bulkDir); err == nil {
+				t.Fatalf("StageBulkDir with %s write-target alias = nil error, want error", tt.name)
+			}
+		})
 	}
 }

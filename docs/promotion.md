@@ -158,6 +158,23 @@ RFileExportManifest (existing)  →  promotion.BuildLoadMapping
   copy would otherwise destroy a source file (possibly one not yet
   copied, whose earlier verification would not be repeated) and report a
   false success.
+  Before any destination path is even computed, manifest entries whose
+  *source* resolves to the same already-exported object are collapsed
+  into one (`dedupeStageSources`/`canonicalStageSource`): a source
+  reached through a symlink/hard link, or an equivalent
+  backend-canonicalized spelling (e.g. an `s3://bucket/key` entry and a
+  scheme-less `bucket/key` entry naming the same object), no longer has
+  to flatten and verify as two independent files. Collapsing is
+  conservative — it only happens when every aliased entry declares the
+  *same* tablet index and would flatten to the *same* basename; if the
+  same physical source is declared under two different flattened
+  filenames, `StageBulkDir` fails closed instead of guessing which name
+  to keep, since silently discarding one would otherwise drop a named
+  file the load mapping still expects to exist. This complements rather
+  than replaces the alias checks below, which still run against the
+  deduplicated set to catch purely lexical risks (case/Unicode
+  aliasing) that don't imply the same confirmed physical identity a
+  dedupe decision requires.
   The same preflight also covers `bulkDir/loadmap.json` itself (written
   by `WriteLoadMapping`, which truncates exactly like `storage.Copy`
   does, but runs after every RFile copy — an aliased `loadmap.json`

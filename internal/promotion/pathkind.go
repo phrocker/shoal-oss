@@ -4,10 +4,16 @@ import (
 	pathpkg "path"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
+
+	"golang.org/x/text/cases"
+	"golang.org/x/text/unicode/norm"
 )
 
 var windowsDrivePathRe = regexp.MustCompile(`^[A-Za-z]:(?:[\\/].*)?$`)
+var urlStylePathRe = regexp.MustCompile(`^([A-Za-z][A-Za-z0-9+.-]*):\/\/`)
+var publicationCaseFold = cases.Fold()
 
 func looksLikeWindowsDrivePath(path string) bool {
 	return windowsDrivePathRe.MatchString(path)
@@ -27,14 +33,17 @@ func looksLikeWindowsDrivePath(path string) bool {
 // authority) is also treated as backend-style even though it has no
 // "://" substring, matching Hadoop's own authorityless HDFS URI form.
 func pathUsesBackendSeparatorJoin(path string) bool {
-	if pathLooksURLLike(path) {
+	if looksLikeWindowsDrivePath(path) {
+		return false
+	}
+	if strings.HasPrefix(path, "hdfs:/") {
 		return true
 	}
-	return strings.HasPrefix(path, "hdfs:/")
+	return urlStylePathRe.MatchString(path)
 }
 
 func pathLooksURLLike(path string) bool {
-	return strings.Contains(path, "://") && !looksLikeWindowsDrivePath(path)
+	return pathUsesBackendSeparatorJoin(path)
 }
 
 func normalizeLocalPathForAlias(path string) string {
@@ -63,4 +72,27 @@ func normalizeWindowsDrivePath(path string) (string, bool) {
 func isWindowsDriveRootPath(path string) bool {
 	normalized, ok := normalizeWindowsDrivePath(path)
 	return ok && len(normalized) == 3 && normalized[1] == ':' && normalized[2] == '\\'
+}
+
+// normalizeLocalPublicationComponent normalizes a single local path
+// component for collision-safe publication-key comparison. NFC
+// normalization and case-folding apply on every platform because they
+// conservatively catch aliases on filesystems (Windows, and macOS's
+// default HFS+/APFS) that fold case and normalize Unicode spellings;
+// treating two components as equal when they might not be on some
+// other filesystem only causes an unnecessary staging rejection, never
+// a missed collision. Trailing-dot/space stripping is different: Win32
+// silently discards trailing dots and spaces from every path component
+// (so "A.rf", "A.rf.", and "A.rf " all name the same not-yet-created
+// NTFS file), but POSIX filesystems store them as literal, significant
+// bytes -- "A.rf." is a genuinely different filename from "A.rf" on
+// Linux and macOS. Applying that stripping unconditionally would
+// therefore treat truly distinct destination files as aliases outside
+// Windows, so it is gated to runtime.GOOS == "windows".
+func normalizeLocalPublicationComponent(component string) string {
+	component = norm.NFC.String(component)
+	if runtime.GOOS == "windows" {
+		component = strings.TrimRight(component, " .")
+	}
+	return publicationCaseFold.String(component)
 }
