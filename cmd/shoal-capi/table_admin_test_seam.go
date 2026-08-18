@@ -310,3 +310,13 @@ func shoal_test_error_alloc_fail_after(successfulAllocations C.size_t) {
 func shoal_test_error_alloc_reset() {
 	C.shoal_bridge_test_error_alloc_reset()
 }
+
+//export shoal_test_error_message_alloc_fail_after
+func shoal_test_error_message_alloc_fail_after(successfulAllocations C.size_t) {
+	C.shoal_bridge_test_error_message_alloc_fail_after(successfulAllocations)
+}
+
+//export shoal_test_error_message_alloc_reset
+func shoal_test_error_message_alloc_reset() {
+	C.shoal_bridge_test_error_message_alloc_reset()
+}

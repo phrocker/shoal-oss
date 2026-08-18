@@ -243,7 +243,7 @@ importable and both are used by the pinned tests and examples.
 | SB-CONN-003 | `AccumuloConnector.tableOps(table) -> AccumuloTableOperations` (`pysharkbite.cpp:269`) | No handle type; ops are `Connector` methods taking a table name (`accumulo/table_admin.go:76`) | No handle type; scanner/writer configs take `table_name`/`table_id` (`capi/include/shoal_types.h:143-144,202-203`) | `TestTableAdministrationListingAndExistence` (`accumulo/table_admin_test.go:13`) | Behavior mismatch | Sharkbite binds a table to a stateful handle whose methods take no table argument. Shim must provide the handle object and hold the table name. |
 | SB-CONN-004 | `AccumuloConnector.securityOps() -> SecurityOperations` (`pysharkbite.cpp:266`) | — | — | — | Missing Go | Entire security surface absent. See [§13](#sec-13). |
 | SB-CONN-005 | `AccumuloConnector.namespaceOps() -> AccumuloNamespaceOperations` (`pysharkbite.cpp:267`) | — | — | — | Missing Go | Entire namespace surface absent. See [§12](#sec-12). `internal/managerclient` defines `ErrorNamespaceExists`/`ErrorNamespaceNotFound` kinds but exposes no namespace operation. |
-| SB-CONN-006 | `AccumuloConnector.tableInfo() -> AccumuloTableInfo` (`pysharkbite.cpp:270`) | `Connector.Tables`, `TableByName`, `TableByID` (`accumulo/table_admin.go:29`, `accumulo/discovery.go:65,87`) | — | `TestTableAdministrationListingAndExistence` (`accumulo/table_admin_test.go:13`); `TestDiscoveryTableLookupAndRouting` (`accumulo/discovery_test.go:108`) | Missing C ABI | Capability exists in Go; no ABI entry point. Blocked behind issue [#82](https://github.com/phrocker/shoal-oss/issues/82) / PR [#84](https://github.com/phrocker/shoal-oss/pull/84). |
+| SB-CONN-006 | `AccumuloConnector.tableInfo() -> AccumuloTableInfo` (`pysharkbite.cpp:270`) | `Connector.Tables`, `TableByName`, `TableByID` (`accumulo/table_admin.go:29`, `accumulo/discovery.go:65,87`) | `shoal_connector_list_tables` / `shoal_table_list_get` / `shoal_connector_table_exists` (`capi/include/shoal.h:85-104`) | `TestTableAdministrationListingAndExistence` (`accumulo/table_admin_test.go:13`); `TestDiscoveryTableLookupAndRouting` (`accumulo/discovery_test.go:108`); `capi/tests/lifecycle.c:160-192` | Behavior mismatch | The lookup/list capability exists on the ABI, but there is no dedicated `AccumuloTableInfo`-style handle. The shim must synthesize that object from connector-scoped calls. |
 | SB-CONN-007 | `AccumuloConnector.getStatistics() -> AccumuloInfo` (`pysharkbite.cpp:268`) | — | — | — | Missing Go | Cluster status RPC absent. See [§14](#sec-14). |
 | SB-CONN-008 | Connector has no explicit `close()` in Python; lifetime ends with refcount | `Connector.Close() error` (`accumulo/connector.go:138`) | `shoal_connector_close` / `shoal_connector_free` (`capi/include/shoal.h:39-47`) | `TestNewConnectorLifecycle` (`accumulo/connector_test.go:9`); `capi/tests/lifecycle.c:257-264` | Behavior mismatch | Shoal requires explicit close for deterministic shutdown. Shim must close on `__del__` **and** support `with`; it must not rely on GC ordering at interpreter shutdown. |
 | SB-CONN-009 | Copy-assigning a connector shares pooled transports (`include/interconnect/Accumulo.h:126`) | `Connector` is a pointer type; copying the pointer shares state | Handles must not be copied (`capi/README.md`, "Do not copy opaque handles") | `TestNewConnectorLifecycle` (`accumulo/connector_test.go:9`); `TestConnectorRegistryLifecycle` (`cmd/shoal-capi/state_test.go:13`) | Covered | Both share state on copy; Shoal documents the rule and enforces handle validity. |
@@ -959,8 +959,8 @@ Sharkbite's `test/19x/st` SMAC project played), driven from CI, with the ported
 | --- | --- |
 | Covered | 51 |
 | Missing Go | 133 |
-| Missing C ABI | 52 |
-| Behavior mismatch | 65 |
+| Missing C ABI | 51 |
+| Behavior mismatch | 66 |
 | Intentional divergence (approval required) | 4 |
 | Not required (rationale required) | 45 |
 | **Total** | **350** |
@@ -971,7 +971,7 @@ Sharkbite's `test/19x/st` SMAC project played), driven from CI, with the ported
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | [§5](#sec-5) Packaging and imports | `SB-PKG` | 14 | 0 | 0 | 9 | 1 | 1 | 3 |
 | [§6](#sec-6) Configuration and credentials | `SB-CFG` | 18 | 0 | 4 | 5 | 5 | 1 | 3 |
-| [§7](#sec-7) Connector and session | `SB-CONN` | 14 | 3 | 3 | 3 | 4 | 1 | 0 |
+| [§7](#sec-7) Connector and session | `SB-CONN` | 14 | 3 | 3 | 2 | 5 | 1 | 0 |
 | [§8](#sec-8) Data model | `SB-DATA` | 64 | 16 | 10 | 10 | 23 | 0 | 5 |
 | [§9](#sec-9) Scanners and results | `SB-SCAN` | 32 | 2 | 9 | 6 | 9 | 0 | 6 |
 | [§10](#sec-10) Writers | `SB-WRITE` | 23 | 2 | 1 | 8 | 5 | 0 | 7 |
@@ -985,7 +985,7 @@ Sharkbite's `test/19x/st` SMAC project played), driven from CI, with the ported
 | [§18](#sec-18) Errors | `SB-ERR` | 15 | 2 | 2 | 5 | 2 | 1 | 3 |
 | [§19](#sec-19) C++ and flat C | `SB-CPP` | 14 | 8 | 3 | 0 | 2 | 0 | 1 |
 | [§20](#sec-20) Cross-cutting | `SB-XCUT` | 18 | 10 | 1 | 2 | 5 | 0 | 0 |
-| **Total** | | **350** | **51** | **133** | **52** | **65** | **4** | **45** |
+| **Total** | | **350** | **51** | **133** | **51** | **66** | **4** | **45** |
 
 ### 25.3 Reading the counts
 
@@ -1004,11 +1004,11 @@ to become `Covered` unless their scope decision changes.
 
 The 133 `Missing Go` rows are dominated by cluster status (37), RFile and
 streams (20), security (17), and HDFS (14) — surfaces where Shoal has never had
-a client-side public implementation. The 52 `Missing C ABI` rows are led by the
+a client-side public implementation. The 51 `Missing C ABI` rows are led by the
 data model (10), Python-layer packaging (9), writers (8), and scanners/results
 (6), with configuration/credential mapping and errors close behind (5 each).
 
-The 65 `Behavior mismatch` rows are the most dangerous category for a
+The 66 `Behavior mismatch` rows are the most dangerous category for a
 compatibility project: the capability exists on both layers, so a naive
 implementer will mark them done, but the observable semantics differ — types
 (`str` versus `bytes`), defaults (`Key` timestamp, writer thread count, ZooKeeper

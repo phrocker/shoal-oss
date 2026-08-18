@@ -13,7 +13,6 @@ import (
 	"fmt"
 	"sort"
 	"strings"
-	"unsafe"
 
 	"github.com/phrocker/shoal/accumulo"
 )
@@ -529,11 +528,7 @@ func bridgeCString(value, name string) (*C.char, C.shoal_status, error) {
 	if strings.IndexByte(value, 0) >= 0 {
 		return nil, C.SHOAL_STATUS_INTERNAL, fmt.Errorf("shoal: %s contains NUL", name)
 	}
-	var data *C.char
-	if len(value) != 0 {
-		data = (*C.char)(unsafe.Pointer(unsafe.StringData(value)))
-	}
-	result := C.shoal_bridge_string_alloc(data, C.size_t(len(value)))
+	result := C.shoal_bridge_string_alloc(cStringData(value), C.size_t(len(value)))
 	if result == nil {
 		return nil, C.SHOAL_STATUS_OUT_OF_MEMORY, fmt.Errorf("shoal: allocate %s", name)
 	}

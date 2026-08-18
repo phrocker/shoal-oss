@@ -105,6 +105,7 @@ void shoal_bridge_batch_writer_free(shoal_batch_writer *writer) {
 static _Atomic size_t shoal_bridge_string_alloc_fail_after = SIZE_MAX;
 static _Atomic size_t shoal_bridge_result_alloc_fail_after = SIZE_MAX;
 static _Atomic size_t shoal_bridge_error_alloc_fail_after = SIZE_MAX;
+static _Atomic size_t shoal_bridge_error_message_alloc_fail_after = SIZE_MAX;
 
 static int shoal_bridge_allocation_allowed(_Atomic size_t *fail_after) {
   size_t remaining =
@@ -174,6 +175,17 @@ void shoal_bridge_test_error_alloc_fail_after(
 
 void shoal_bridge_test_error_alloc_reset(void) {
   atomic_store_explicit(&shoal_bridge_error_alloc_fail_after, SIZE_MAX,
+                        memory_order_relaxed);
+}
+
+void shoal_bridge_test_error_message_alloc_fail_after(
+    size_t successful_allocations) {
+  atomic_store_explicit(&shoal_bridge_error_message_alloc_fail_after,
+                        successful_allocations, memory_order_relaxed);
+}
+
+void shoal_bridge_test_error_message_alloc_reset(void) {
+  atomic_store_explicit(&shoal_bridge_error_message_alloc_fail_after, SIZE_MAX,
                         memory_order_relaxed);
 }
 
@@ -839,8 +851,7 @@ void shoal_bridge_table_properties_free(shoal_table_properties_result *result) {
 
 shoal_error *shoal_bridge_error_alloc(shoal_status code, const char *message,
                                       size_t message_length) {
-  if ((message == NULL && message_length != 0) ||
-      message_length == SIZE_MAX) {
+  if ((message == NULL && message_length != 0) || message_length == SIZE_MAX) {
     return NULL;
   }
   if (!shoal_bridge_allocation_allowed(
@@ -853,6 +864,11 @@ shoal_error *shoal_bridge_error_alloc(shoal_status code, const char *message,
   }
   if (!shoal_bridge_allocation_allowed(
           &shoal_bridge_error_alloc_fail_after)) {
+    free(error);
+    return NULL;
+  }
+  if (!shoal_bridge_allocation_allowed(
+          &shoal_bridge_error_message_alloc_fail_after)) {
     free(error);
     return NULL;
   }

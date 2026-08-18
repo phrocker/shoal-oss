@@ -246,6 +246,11 @@ int main(void) {
                                            &error),
                SHOAL_STATUS_INVALID_ARGUMENT, &error,
                "timeout_ms must not be negative");
+  shoal_test_error_message_alloc_fail_after(0);
+  assert(shoal_connector_flush_table(admin_connector, "events", 2, 0, &error) ==
+         SHOAL_STATUS_OUT_OF_MEMORY);
+  assert(error == NULL);
+  shoal_test_error_message_alloc_reset();
   expect_error(shoal_connector_flush_table(admin_connector, "down", 0, 0,
                                            &error),
                SHOAL_STATUS_UNAVAILABLE, &error, "manager unavailable");

@@ -443,14 +443,29 @@ func clearError(outError **C.shoal_error) {
 	}
 }
 
+func cStringData(value string) *C.char {
+	if len(value) == 0 {
+		return nil
+	}
+	return (*C.char)(unsafe.Pointer(unsafe.StringData(value)))
+}
+
+func bridgeErrorAlloc(code C.shoal_status, message string) *C.shoal_error {
+	return C.shoal_bridge_error_alloc(code, cStringData(message), C.size_t(len(message)))
+}
+
 func fail(outError **C.shoal_error, code C.shoal_status, err error) C.shoal_status {
-	if outError != nil {
-		message := err.Error()
-		var data *C.char
-		if len(message) != 0 {
-			data = (*C.char)(unsafe.Pointer(unsafe.StringData(message)))
-		}
-		*outError = C.shoal_bridge_error_alloc(code, data, C.size_t(len(message)))
+	if outError == nil {
+		return code
+	}
+	*outError = nil
+	message := ""
+	if err != nil {
+		message = err.Error()
+	}
+	*outError = bridgeErrorAlloc(code, message)
+	if *outError == nil {
+		return C.SHOAL_STATUS_OUT_OF_MEMORY
 	}
 	return code
 }
