@@ -1,0 +1,33 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+// Package tserver holds the Accumulo tablet-server participation logic: the
+// state a Shoal process must keep so an unmodified Accumulo manager can
+// assign, monitor, migrate, and unassign the tablets it hosts.
+//
+// The manager is the only assignment authority. Nothing here decides what to
+// host: Host is a reactive state machine that applies manager-directed
+// transitions, rejects the ones that cannot be safely applied, and reports
+// what it currently hosts. It never assigns, migrates, or unassigns a tablet
+// on its own, and it never overrides a live manager's decision.
+//
+// What it does own is the fence. Every transition carries the ServiceLock
+// generation it was minted under, and anything that cannot be proven current
+// fails closed — a stale assignment is refused rather than applied, because a
+// wrongly accepted assignment means a multiply hosted tablet. See
+// docs/tserver-hosting-lifecycle.md for the state machine and fencing rules.
+package tserver

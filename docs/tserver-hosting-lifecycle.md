@@ -1,0 +1,181 @@
+<!--
+
+    Licensed to the Apache Software Foundation (ASF) under one
+    or more contributor license agreements.  See the NOTICE file
+    distributed with this work for additional information
+    regarding copyright ownership.  The ASF licenses this file
+    to you under the Apache License, Version 2.0 (the
+    "License"); you may not use this file except in compliance
+    with the License.  You may obtain a copy of the License at
+
+      https://www.apache.org/licenses/LICENSE-2.0
+
+    Unless required by applicable law or agreed to in writing,
+    software distributed under the License is distributed on an
+    "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+    KIND, either express or implied.  See the License for the
+    specific language governing permissions and limitations
+    under the License.
+
+-->
+# Tablet hosting lifecycle and fencing
+
+Status: **partial**. The fenced lifecycle state machine
+(`internal/tserver`) has landed. ServiceLock acquisition, the manager RPC
+surface, and tablet data loading are not wired to it yet — see
+[§6](#6-what-is-not-here-yet). Tracking issue: #67.
+
+## 1. Goal
+
+Let an unmodified Accumulo manager assign, monitor, migrate, and unassign
+tablets hosted by a Shoal process, without ever letting a tablet end up
+hosted in two places at once.
+
+`internal/tserver.Host` is the piece that holds that invariant. It tracks
+which tablets this process claims and refuses any transition it cannot
+prove is current.
+
+## 2. The manager is the only authority
+
+Nothing in `internal/tserver` decides what to host. `Host` has no policy,
+no balancer, and no way to give itself a tablet: `Assign` and `Unassign`
+exist only to apply what the manager asked for, and the manager's
+decisions are always applied when they can be applied safely.
+
+The one thing `Host` will refuse a manager is a request it can prove came
+from a **superseded** manager — see the manager fence in
+[§4](#4-the-fence). That is not a competing authority; it is how the live
+manager's authority is protected from a predecessor that has not noticed
+it lost the lock.
+
+## 3. States
+
+The happy path is one line — assigned, loaded, drained, released:
+
+```
+              Assign      LoadComplete   Unassign(graceful)  UnloadComplete
+ UNASSIGNED ──────────► LOADING ──────► HOSTED ───────────► UNLOADING ──────────► UNASSIGNED
+```
+
+| State | Meaning | Routable |
+| --- | --- | --- |
+| `UNASSIGNED` | not tracked here (the zero value, so an unknown extent reports as this) | no |
+| `LOADING` | assigned by the manager, being brought online | no |
+| `HOSTED` | online and serving | **yes** |
+| `UNLOADING` | draining before release; still claimed, so not re-assignable | no |
+
+Every transition, including the ones that leave the happy path:
+
+| From | Call | To |
+| --- | --- | --- |
+| `UNASSIGNED` | `Assign` | `LOADING` |
+| `LOADING` | `LoadComplete` | `HOSTED` |
+| `LOADING` | `LoadFailed` | `UNASSIGNED` |
+| `LOADING` | `Unassign(UnloadGraceful)` | `UNLOADING` |
+| `HOSTED` | `Unassign(UnloadGraceful)` | `UNLOADING` |
+| `UNLOADING` | `UnloadComplete` | `UNASSIGNED` |
+| any assigned state | `Unassign(UnloadImmediate)` | `UNASSIGNED` |
+| any assigned state | `LoseLock` (all tablets at once) | `UNASSIGNED` |
+
+`Hosted()` returns only `HOSTED` tablets — the set the manager may route
+to. `Tablets()` returns every tracked tablet with its state, so a slow
+handoff can be told apart from a stuck one.
+
+Two paths deliberately do **not** exist. A tablet cannot go from
+`LOADING` straight to `HOSTED` after the manager unassigned it: the
+unassignment moves it to `UNLOADING`, `LoadComplete` then fails with
+`ErrWrongState`, and the loader releases it with `UnloadComplete` rather
+than publishing a tablet the manager has already placed elsewhere. And a
+tablet cannot be re-assigned while it is `UNLOADING`, because this
+process has not let go of it yet.
+
+## 4. The fence
+
+Every manager-directed transition carries a `Fence` of two ServiceLock
+identities. A `LockID` mirrors the ephemeral ZooKeeper node a lock holder
+creates — `zlock#<uuid>#<sequence>` — and the sequence is the generation
+counter: ZooKeeper hands out strictly increasing sequence numbers, so a
+lock that was lost and re-acquired always carries a higher one.
+
+**Server lock** — the tablet-server lock the manager believed this
+process held. It must equal the lock held right now. An older generation
+was minted against a view of the cluster that no longer exists; a
+generation we do not hold cannot be verified at all. Both are refused.
+
+**Manager lock** — the lock held by the manager that issued the request.
+A newer manager lock is adopted on sight and becomes the authority. An
+older one, or a different holder at the same sequence, is refused.
+
+Local completions (`LoadComplete`, `LoadFailed`, `UnloadComplete`) carry
+only the server lock: they report the outcome of work this process
+started, and what matters is whether that work still belongs to us.
+
+### Fail closed, everywhere
+
+Every refusal leaves hosting state exactly as it was, so a non-nil error
+from any transition means nothing moved:
+
+| Situation | Result |
+| --- | --- |
+| no lock held | `ErrNoLock` |
+| stale or unheld server lock | `ErrStaleServerLock` |
+| superseded or missing manager lock | `ErrStaleManagerLock` |
+| tablet already assigned here | `ErrAlreadyAssigned` |
+| extent overlaps an assigned tablet | `ErrOverlapping` |
+| malformed extent | `ErrInvalidExtent` |
+| completion for a tablet in another state | `ErrWrongState` |
+
+Overlap is what catches stale split metadata. A parent extent arriving
+after its children are assigned — or a child arriving after its parent —
+would host the same rows twice, so it is refused even though the extent
+itself is not a duplicate.
+
+The manager-facing `Unassign` is the one deliberate exception, and it
+fails *open* rather than closed because doing so cannot multiply-host
+anything: unassigning a tablet this host does not have succeeds without
+changing anything. The manager asked for the tablet not to be hosted
+here, and it is not. The fence is still checked first, so a superseded
+manager cannot unassign anything.
+
+## 5. Lock loss and restart
+
+`LoseLock` drops **every** tracked tablet at once and returns them so the
+caller can close them. Once the lock is gone the manager is free to place
+those tablets elsewhere, so the host stops claiming them immediately
+rather than waiting to be told. Any work still in flight then fails
+closed, because its server lock no longer matches.
+
+`AdoptLock` refuses a generation that is not strictly newer than any this
+host has already used — including ones released by `LoseLock`, whose
+sequence is remembered for exactly this reason — and refuses to run at
+all while tablets are still assigned. A restarted or reconnected process
+therefore always starts from an empty hosted set under a fresh
+generation, which is what makes "process restart and ServiceLock loss do
+not leave a tablet multiply hosted" hold.
+
+## 6. What is not here yet
+
+This is the lifecycle core only. Still to land for #67:
+
+- acquiring and maintaining the real ServiceLock in ZooKeeper, and
+  registering health, resource group, address, version, and capability
+  descriptors the manager reads
+- the manager-facing Thrift surface that turns RPCs into `Assign` /
+  `Unassign` calls and reports `TabletServerStatus`
+- loading tablet metadata, file and log references, table properties,
+  constraints, and iterator configuration behind `StateLoading`
+- publishing the `Metrics()` counters through the observability endpoints
+- end-to-end tests against a live manager, including migration to and
+  from a Java tserver and rolling mixed-fleet replacement
+
+## 7. Metrics
+
+`Host.Metrics()` snapshots the operational surface #67 asks for:
+`Loading` / `Hosted` / `Unloading` gauges, and counters for
+`Assignments`, `Loads`, `LoadFailures`, `Unloads`, `ForcedUnloads`,
+`RejectedStale`, `RejectedDuplicate`, `LockLosses`, and
+`DroppedOnLockLoss`. The two rejection counters are the ones to alert on:
+a healthy cluster refuses almost nothing, so a rising `RejectedStale`
+means assignments are racing lock churn and a rising
+`RejectedDuplicate` means the manager is working from stale tablet
+metadata.
