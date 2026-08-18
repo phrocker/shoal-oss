@@ -11,7 +11,8 @@ import (
 
 func TestBulkImportUsesTableIDAndFateArguments(t *testing.T) {
 	names := &fakeTableNames{byName: map[string]string{"events": "1", "accumulo.audit": "+a"}}
-	connector := testConnectorWithDiscovery(t, &fakeTabletWalker{}, names)
+	namespaces := newFakeNamespacesFromTables(names)
+	connector := testConnectorWithNamespaceDiscovery(t, &fakeTabletWalker{}, namespaces, names)
 	manager := &fakeManagerAdapter{}
 	connector.manager = manager
 	connector.managerAddr = fakeManagerAddress{address: "manager:9997"}
@@ -56,6 +57,9 @@ func TestBulkImportUsesTableIDAndFateArguments(t *testing.T) {
 	if names.invalidates != 2 {
 		t.Fatalf("name invalidations = %d, want 2", names.invalidates)
 	}
+	if namespaces.invalidates != 2 {
+		t.Fatalf("namespace invalidations = %d, want 2", namespaces.invalidates)
+	}
 }
 
 func TestBulkImportResolvesTableNameNotFound(t *testing.T) {
@@ -78,7 +82,8 @@ func TestBulkImportResolvesTableNameNotFound(t *testing.T) {
 
 func TestBulkImportMapsManagerErrors(t *testing.T) {
 	names := &fakeTableNames{byName: map[string]string{"events": "1"}}
-	connector := testConnectorWithDiscovery(t, &fakeTabletWalker{}, names)
+	namespaces := newFakeNamespacesFromTables(names)
+	connector := testConnectorWithNamespaceDiscovery(t, &fakeTabletWalker{}, namespaces, names)
 	manager := &fakeManagerAdapter{}
 	connector.manager = manager
 	connector.managerAddr = fakeManagerAddress{address: "manager:9997"}
@@ -101,6 +106,9 @@ func TestBulkImportMapsManagerErrors(t *testing.T) {
 	}
 	if names.invalidates != len(tests) {
 		t.Fatalf("name invalidations = %d, want %d", names.invalidates, len(tests))
+	}
+	if namespaces.invalidates != len(tests) {
+		t.Fatalf("namespace invalidations = %d, want %d", namespaces.invalidates, len(tests))
 	}
 
 	manager.err = nil
