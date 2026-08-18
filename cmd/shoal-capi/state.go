@@ -165,19 +165,21 @@ func (c *ownedConnector) closeBoundedFirst(timeout time.Duration) error {
 			return ctx.Err()
 		}
 	case <-ctx.Done():
-		go c.finishCloseAfterTimeout(idle)
+		started := make(chan struct{})
+		go c.finishCloseAfterTimeout(idle, started)
+		<-started
 		return ctx.Err()
 	}
 }
 
-func (c *ownedConnector) finishCloseAfterTimeout(idle <-chan struct{}) {
-	timer := time.NewTimer(connectorFreeTimeout)
-	defer timer.Stop()
-	select {
-	case <-idle:
-	case <-timer.C:
-		return
+func (c *ownedConnector) finishCloseAfterTimeout(
+	idle <-chan struct{},
+	started chan<- struct{},
+) {
+	if started != nil {
+		close(started)
 	}
+	<-idle
 	_ = c.finishClose()
 }
 

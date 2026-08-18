@@ -423,7 +423,13 @@ func TestOwnedConnectorCloseRecoversResourcePanics(t *testing.T) {
 	}
 }
 
-func TestOwnedConnectorCloseBoundedRecoversBackgroundPanics(t *testing.T) {
+func TestOwnedConnectorCloseBoundedBackgroundCleanupWaitsAndRecoversPanics(t *testing.T) {
+	originalFreeTimeout := connectorFreeTimeout
+	connectorFreeTimeout = 20 * time.Millisecond
+	t.Cleanup(func() {
+		connectorFreeTimeout = originalFreeTimeout
+	})
+
 	connectorCloseStarted := make(chan struct{})
 	unblockConnectorClose := make(chan struct{})
 	backgroundCloseFinished := make(chan struct{})
@@ -449,7 +455,7 @@ func TestOwnedConnectorCloseBoundedRecoversBackgroundPanics(t *testing.T) {
 
 	closeReturned := make(chan error, 1)
 	go func() {
-		closeReturned <- connector.closeBounded(20 * time.Millisecond)
+		closeReturned <- connector.closeBounded(connectorFreeTimeout)
 	}()
 	select {
 	case err := <-closeReturned:
@@ -464,7 +470,11 @@ func TestOwnedConnectorCloseBoundedRecoversBackgroundPanics(t *testing.T) {
 		t.Fatal("background close started before the active operation completed")
 	default:
 	}
+	if err := connector.closeBounded(time.Second); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("repeated closeBounded error = %v, want sticky deadline", err)
+	}
 
+	time.Sleep(2 * connectorFreeTimeout)
 	operationDone()
 	select {
 	case <-connectorCloseStarted:
@@ -480,13 +490,6 @@ func TestOwnedConnectorCloseBoundedRecoversBackgroundPanics(t *testing.T) {
 	}
 	if connectorCloses.Load() != 1 || instanceCloses.Load() != 1 {
 		t.Fatalf("background close counts = connector:%d instance:%d, want 1/1",
-			connectorCloses.Load(), instanceCloses.Load())
-	}
-	if err := connector.closeBounded(time.Second); !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("repeated closeBounded error = %v, want sticky deadline", err)
-	}
-	if connectorCloses.Load() != 1 || instanceCloses.Load() != 1 {
-		t.Fatalf("repeated close counts = connector:%d instance:%d, want 1/1",
 			connectorCloses.Load(), instanceCloses.Load())
 	}
 }

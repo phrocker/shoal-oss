@@ -19,7 +19,9 @@ import (
 )
 
 const defaultBootstrapTimeout = 30 * time.Second
-const connectorFreeTimeout = 5 * time.Second
+
+// Mutable only so lifecycle tests can shorten the exported free bound.
+var connectorFreeTimeout = 5 * time.Second
 
 type connectorConfig struct {
 	bootstrap        int32
