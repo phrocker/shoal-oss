@@ -20,6 +20,7 @@ type fakeTabletWalker struct {
 	tablets map[string][]metadata.TabletInfo
 	calls   int
 	wait    bool
+	err     error
 }
 
 func (f *fakeTabletWalker) LocateTable(ctx context.Context, tableID string) ([]metadata.TabletInfo, error) {
@@ -30,6 +31,9 @@ func (f *fakeTabletWalker) LocateTable(ctx context.Context, tableID string) ([]m
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls++
+	if f.err != nil {
+		return nil, f.err
+	}
 	return append([]metadata.TabletInfo(nil), f.tablets[tableID]...), nil
 }
 
@@ -37,6 +41,7 @@ type fakeTableNames struct {
 	mu           sync.Mutex
 	byName       map[string]string
 	byID         map[string]string
+	resolveIDErr error
 	invalidates  int
 	onInvalidate func()
 }
@@ -47,6 +52,9 @@ func (f *fakeTableNames) ResolveID(ctx context.Context, name string) (string, er
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.resolveIDErr != nil {
+		return "", f.resolveIDErr
+	}
 	id, ok := f.byName[name]
 	if !ok {
 		return "", fmt.Errorf("%w: missing fake table", tablenames.ErrTableNotFound)

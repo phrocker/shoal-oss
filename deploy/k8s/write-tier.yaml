@@ -8,7 +8,6 @@ metadata:
     app.kubernetes.io/part-of: shoal-platform
 spec:
   clusterIP: None
-  publishNotReadyAddresses: true
   selector:
     app.kubernetes.io/name: shoal-embed
     app.kubernetes.io/component: write-tier
@@ -16,6 +15,9 @@ spec:
     - name: grpc
       port: 9876
       targetPort: grpc
+    - name: metrics
+      port: 9877
+      targetPort: metrics
 ---
 apiVersion: apps/v1
 kind: StatefulSet
@@ -41,7 +43,9 @@ spec:
         app.kubernetes.io/component: write-tier
         app.kubernetes.io/part-of: shoal-platform
     spec:
-      terminationGracePeriodSeconds: 30
+      # 10s readiness-withdrawal quiesce + 30s drain + margin for engine close
+      # before Kubernetes escalates to SIGKILL.
+      terminationGracePeriodSeconds: 50
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532
@@ -57,29 +61,34 @@ spec:
           args:
             - serve
             - --data=$(SHOAL_EMBED_DATA_DIR)
-            - --port=$(SHOAL_EMBED_GRPC_PORT)
+            - --address=0.0.0.0:$(SHOAL_EMBED_GRPC_PORT)
+            - --metrics-address=0.0.0.0:$(SHOAL_EMBED_METRICS_PORT)
+            - --quiesce-delay=10s
           envFrom:
             - configMapRef:
                 name: shoal-platform-config
           ports:
             - name: grpc
               containerPort: 9876
+            - name: metrics
+              containerPort: 9877
           volumeMounts:
             - name: data
               mountPath: /var/lib/shoal
             - name: object-storage-credentials
               mountPath: /var/run/secrets/shoal/gcs
               readOnly: true
-          # TODO(shoal): these TCP probes become externally useful after
-          # cmd/shoal-embed listens on 0.0.0.0 instead of 127.0.0.1.
           readinessProbe:
-            tcpSocket:
-              port: grpc
+            httpGet:
+              path: /readyz
+              port: metrics
             initialDelaySeconds: 5
-            periodSeconds: 10
+            periodSeconds: 5
+            failureThreshold: 1
           livenessProbe:
-            tcpSocket:
-              port: grpc
+            httpGet:
+              path: /healthz
+              port: metrics
             initialDelaySeconds: 15
             periodSeconds: 20
           resources:

@@ -7,7 +7,6 @@ metadata:
     app.kubernetes.io/component: write-tier
 spec:
   clusterIP: None
-  publishNotReadyAddresses: true
   selector:
     app.kubernetes.io/name: shoal-embed
     app.kubernetes.io/instance: {{ .Release.Name }}
@@ -16,3 +15,6 @@ spec:
     - name: grpc
       port: {{ .Values.writeTier.grpcPort }}
       targetPort: grpc
+    - name: metrics
+      port: {{ .Values.writeTier.metricsPort }}
+      targetPort: metrics

@@ -19,6 +19,7 @@ import (
 // share an Instance across connectors and must close it separately.
 type Connector struct {
 	mu          sync.RWMutex
+	passwordMu  sync.Mutex
 	instance    InstanceInfo
 	credentials Credentials
 	options     normalizedConnectorOptions
@@ -26,6 +27,7 @@ type Connector struct {
 	scan        scanclient.Adapter
 	ingest      ingestclient.Adapter
 	manager     managerclient.Adapter
+	security    managerclient.SecurityAdapter
 	managerAddr managerAddressResolver
 	clientAddr  clientServiceAddressResolver
 	discovery   *connectorDiscovery
@@ -108,6 +110,7 @@ func NewConnector(instance Instance, credentials Credentials, opts ConnectorOpti
 		scan:        scan,
 		ingest:      ingest,
 		manager:     managerAdapter,
+		security:    managerAdapter,
 	}
 	if source, ok := instance.(discoveryInstance); ok {
 		locator := source.discoveryLocator()
