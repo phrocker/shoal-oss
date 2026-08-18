@@ -90,6 +90,16 @@ type serveHandle struct {
 	httpLis  net.Listener
 	logger   *slog.Logger
 	inFlight *unaryInFlight
+
+	// httpServeDone is closed when the goroutine Serve starts to run
+	// h.httpSrv.Serve(h.httpLis) returns, i.e. once the HTTP accept loop
+	// has actually exited — not merely once Stop has asked it to. It is
+	// created here, during startServe's single-threaded construction
+	// (never later, and never by Serve itself), specifically so Stop can
+	// read the field without any synchronization: by the time either
+	// Serve or Stop can run, construction has already finished and the
+	// field is immutable. nil when the HTTP surface is disabled.
+	httpServeDone chan struct{}
 }
 
 // unaryInFlight counts currently-executing unary RPCs so Stop can report,
@@ -151,8 +161,20 @@ func startServe(cfg serveConfig) (*serveHandle, error) {
 	// a disabled httpSrv — only the listener and *http.Server are
 	// conditional.
 	var httpSrv *http.Server
+	var httpServeDone chan struct{}
 	if httpLis != nil {
-		httpSrv = &http.Server{Handler: obsSrv.Handler()}
+		httpSrv = &http.Server{
+			Handler: obsSrv.Handler(),
+			// This listener is bound to 0.0.0.0 by both production
+			// manifests, so it's reachable from outside the pod: without
+			// a read-header timeout, a client sending headers slowly
+			// could hold a connection (and a goroutine) open
+			// indefinitely. Matches the bound the repo's other exposed
+			// metrics server already uses
+			// (cmd/shoal-compactor-shadow/service.go).
+			ReadHeaderTimeout: 5 * time.Second,
+		}
+		httpServeDone = make(chan struct{})
 	}
 
 	// The engine is open and the gRPC listener is bound: declare ready.
@@ -166,16 +188,17 @@ func startServe(cfg serveConfig) (*serveHandle, error) {
 	}
 
 	return &serveHandle{
-		GRPCAddr:    grpcLis.Addr().String(),
-		MetricsAddr: metricsAddr,
-		eng:         eng,
-		obs:         obsSrv,
-		grpcSrv:     grpcSrv,
-		grpcLis:     grpcLis,
-		httpSrv:     httpSrv,
-		httpLis:     httpLis,
-		logger:      logger,
-		inFlight:    inFlight,
+		GRPCAddr:      grpcLis.Addr().String(),
+		MetricsAddr:   metricsAddr,
+		eng:           eng,
+		obs:           obsSrv,
+		grpcSrv:       grpcSrv,
+		grpcLis:       grpcLis,
+		httpSrv:       httpSrv,
+		httpLis:       httpLis,
+		logger:        logger,
+		inFlight:      inFlight,
+		httpServeDone: httpServeDone,
 	}, nil
 }
 
@@ -183,9 +206,22 @@ func startServe(cfg serveConfig) (*serveHandle, error) {
 // data-plane server in the foreground, blocking until the gRPC server stops
 // (via Stop, or a fatal accept error). The HTTP server only runs if the
 // observability surface was enabled (cfg.MetricsAddress was non-empty).
+//
+// Serve intentionally does NOT wait for the HTTP accept loop it starts:
+// gRPC can stop entirely on its own (a fatal accept error, or GracefulStop
+// called directly), with nothing yet telling the HTTP side to stop, so
+// blocking here for it too would deadlock in exactly that case — nothing
+// ever tells httpSrv to shut down otherwise. Stop is the function that
+// actually requests a shutdown, so it — not Serve — is what joins the HTTP
+// accept-loop goroutine (see Stop's doc comment); RunUntilSignal always
+// calls Stop unconditionally as part of its shutdown sequence, so callers
+// that go through it still get the "everything Serve started has fully
+// stopped by the time it returns" guarantee, just via Stop instead of
+// Serve.
 func (h *serveHandle) Serve() error {
 	if h.httpSrv != nil {
 		go func() {
+			defer close(h.httpServeDone)
 			if err := h.httpSrv.Serve(h.httpLis); err != nil && err != http.ErrServerClosed {
 				h.logger.Error("observability server stopped", slog.String("err", err.Error()))
 			}
@@ -199,12 +235,14 @@ func (h *serveHandle) Serve() error {
 // consumer (an orchestrator, a load balancer, or the Accumulo-model
 // manager/coordinator that actually owns shard-to-writer routing) a brief
 // quiesce window to observe /readyz before Stop closes the listeners —
-// RunUntilSignal does this for you. Whether that observation actually
-// removes this pod from routed traffic depends on what's consuming
-// /readyz; a Service with publishNotReadyAddresses: true (as the write-tier
-// headless Service intentionally is, for StatefulSet peer-DNS stability)
-// keeps publishing this pod's address regardless. Safe to call once,
-// before Stop.
+// RunUntilSignal does this for you. The write-tier Service's manifests
+// (k8s and Helm) do not set publishNotReadyAddresses, so this observation
+// does withdraw a draining pod's address from that Service's
+// Endpoints — generic consumers (kubectl, monitoring) see an accurate
+// ready/not-ready view. Per-shard write routing during drain remains a
+// decision made entirely by the Accumulo-model manager/coordinator
+// through its own mechanism, independent of this Service either way.
+// Safe to call once, before Stop.
 func (h *serveHandle) Drain() {
 	h.obs.SetReady(false)
 }
@@ -237,6 +275,16 @@ func (h *serveHandle) Drain() {
 // rather than a silent, unexplained delay. Making those engine calls
 // themselves cancellation-aware would close this gap fully; that's a
 // deeper engine-layer change and is intentionally not attempted here.
+//
+// Stop also joins the HTTP accept-loop goroutine Serve started (if the
+// observability surface is enabled): Shutdown/Close only ask that
+// goroutine to stop, asynchronously, and don't reliably wait for it to
+// have actually returned — Shutdown's own "no more listeners" check races
+// the goroutine's own startup if Stop is called early enough, and Close
+// doesn't wait for it at all, by design (see net/http's docs). Without
+// this join, Stop — and RunUntilSignal, which relies on Stop to fully
+// finish before it returns — could report shutdown complete while that
+// goroutine, and the listener it owns, were technically still open.
 func (h *serveHandle) Stop(ctx context.Context) {
 	var httpDone sync.WaitGroup
 	if h.httpSrv != nil {
@@ -286,6 +334,17 @@ func (h *serveHandle) Stop(ctx context.Context) {
 		<-gracefulDone
 	}
 	httpDone.Wait()
+	// httpDone.Wait, above, only waits for the goroutine that called
+	// Shutdown/Close to return from that call — not for the HTTP
+	// accept-loop goroutine itself (started by Serve) to have exited; see
+	// this method's doc comment for why that's a real gap, not a
+	// theoretical one. h.httpServeDone is nil when the HTTP surface is
+	// disabled, and already closed (so this returns immediately) in the
+	// common case where Serve's accept loop has long since noticed the
+	// listener close by the time Shutdown/Close returns.
+	if h.httpServeDone != nil {
+		<-h.httpServeDone
+	}
 
 	if err := h.eng.Close(); err != nil {
 		h.logger.Warn("engine close", slog.String("err", err.Error()))
@@ -319,11 +378,20 @@ func (h *serveHandle) Stop(ctx context.Context) {
 // because of a genuine, signal-independent fatal accept error. Both the
 // signal arriving and Serve returning are therefore raced against each
 // other explicitly, via select, rather than left to chance: Serve runs in
-// its own goroutine so a pending signal — even one already queued before
-// this method is called at all — can be observed without first waiting
-// for Serve's goroutine to be scheduled and to actually execute, so a
-// signal that raced ahead of Serve is reliably still recognized as the
-// reason for shutting down rather than mistaken for a Serve failure.
+// its own goroutine so a pending signal doesn't have to wait for Serve's
+// goroutine to be scheduled and to actually execute in order to be
+// observed. A pending signal is checked for first, on its own,
+// non-blocking — deliberately not folded into the same select as
+// serveErrCh: a select with more than one simultaneously-ready case
+// chooses among them pseudo-randomly, so if Serve's goroutine has *also*
+// already failed by the time a two-way select runs, a signal queued
+// before this method was even called would not be reliably preferred by
+// that select alone. Checking sigCh by itself first has no such tie to
+// break — it either fires or falls through to the blocking two-way
+// select below — which is what makes "a signal that raced ahead of Serve
+// is reliably still recognized as the reason for shutting down, not
+// mistaken for a Serve failure" an actual guarantee instead of an
+// empirical scheduling coincidence.
 // Whichever wins, this method runs the Drain/quiesce/Stop sequence
 // exactly once and always waits for it to fully finish — including the
 // engine close, and Serve's goroutine actually returning — before
@@ -340,10 +408,21 @@ func (h *serveHandle) RunUntilSignal(sigCh <-chan os.Signal, quiesce, drainTimeo
 
 	var serveErr error
 	signaled := false
+	// Non-blocking priority check: races sigCh only against default, never
+	// against serveErrCh, so a signal already queued before this method
+	// was called always wins here with no scheduler-dependent tie-break
+	// possible (see the doc comment above).
 	select {
 	case <-sigCh:
 		signaled = true
-	case serveErr = <-serveErrCh:
+	default:
+	}
+	if !signaled {
+		select {
+		case <-sigCh:
+			signaled = true
+		case serveErr = <-serveErrCh:
+		}
 	}
 
 	h.logger.Info("draining")

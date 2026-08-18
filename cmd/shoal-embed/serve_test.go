@@ -154,6 +154,26 @@ func TestStartServeReadyHealthAndMetrics(t *testing.T) {
 	}
 }
 
+// TestStartServeSetsObservabilityReadHeaderTimeout guards against a
+// Slowloris-style resource-exhaustion gap: the observability HTTP server
+// is bound to 0.0.0.0 by both production manifests, so it's reachable
+// from outside the pod, and http.Server leaves ReadHeaderTimeout
+// unbounded by default — a client that sends request headers slowly (or
+// never finishes them) would otherwise hold a connection, and a
+// goroutine, open indefinitely. This must match the bound the repo's
+// other exposed metrics server already uses
+// (cmd/shoal-compactor-shadow/service.go).
+func TestStartServeSetsObservabilityReadHeaderTimeout(t *testing.T) {
+	h := newRawTestServeHandle(t)
+	if h.httpSrv == nil {
+		t.Fatal("httpSrv is nil; test requires the observability HTTP surface enabled")
+	}
+	const want = 5 * time.Second
+	if got := h.httpSrv.ReadHeaderTimeout; got != want {
+		t.Errorf("httpSrv.ReadHeaderTimeout = %v, want %v", got, want)
+	}
+}
+
 func TestStartServeWithoutMetricsListener(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	h, err := startServe(serveConfig{
@@ -618,6 +638,60 @@ func TestStopForceClosesHTTPOnCanceledContext(t *testing.T) {
 	case <-serveErrCh:
 	case <-time.After(5 * time.Second):
 		t.Fatal("Serve did not return within 5s of a forced Stop")
+	}
+}
+
+// TestStopWaitsForHTTPServeGoroutineNotJustShutdownReturning guards the
+// fix for a real join gap: Stop's HTTP-side wait used to be satisfied as
+// soon as Shutdown/Close returned, but neither of those calls reliably
+// waits for the accept-loop goroutine Serve started
+// (h.httpSrv.Serve(h.httpLis)) to have actually returned — Shutdown's own
+// "no more listeners" check races that goroutine's registration if Stop
+// runs early enough, and Close does not wait for it at all, by net/http's
+// own design. Without joining h.httpServeDone explicitly, Stop (and
+// RunUntilSignal, which relies on Stop to fully finish) could report a
+// clean shutdown while that goroutine, and the listener it owns, were
+// technically still open.
+//
+// This test never starts the real accept loop goroutine (newRawTestServeHandle
+// deliberately doesn't call Serve), so nothing else will ever close
+// h.httpServeDone on its own — Shutdown/Close on an unserved http.Server
+// return almost immediately, since no listener was ever registered.  That
+// lets the test assert Stop's blocking behavior directly and
+// deterministically, instead of trying to reproduce the real race's
+// microsecond-scale timing window.
+func TestStopWaitsForHTTPServeGoroutineNotJustShutdownReturning(t *testing.T) {
+	h := newRawTestServeHandle(t)
+	if h.httpServeDone == nil {
+		t.Fatal("httpServeDone is nil; test requires the observability HTTP surface enabled")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	stopDone := make(chan struct{})
+	go func() {
+		h.Stop(ctx)
+		close(stopDone)
+	}()
+
+	// Shutdown/Close return almost immediately here (no listener was ever
+	// registered, since Serve was never called), so without the
+	// httpServeDone join, Stop would already have returned well within
+	// this window.
+	select {
+	case <-stopDone:
+		t.Fatal("Stop returned before httpServeDone was closed, want it to block on the HTTP accept-loop goroutine finishing")
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	// Simulate the accept-loop goroutine finally noticing the shutdown
+	// and exiting.
+	close(h.httpServeDone)
+
+	select {
+	case <-stopDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Stop did not return within 5s of httpServeDone closing")
 	}
 }
 
