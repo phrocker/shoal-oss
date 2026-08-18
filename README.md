@@ -168,6 +168,7 @@ format-compatible reader.
 ```bash
 make build       # go build ./... (builds shoal-embed and all binaries)
 make test        # full test suite (race-clean)
+make capi        # stable C connector ABI shared library + headers
 
 # only the distributed-serving mode needs generated Thrift bindings:
 make thrift-gen     # regenerate internal Go bindings from the vendored IDLs
