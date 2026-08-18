@@ -191,6 +191,17 @@ RFileExportManifest (existing)  →  promotion.BuildLoadMapping
   staging two independent copies of the same underlying file — not
   destroying data, but silently duplicating it once Accumulo bulk-imports
   both flattened copies.
+  Remote/object-store paths (S3, GCS, Azure, HDFS) are canonicalized
+  through each backend's own path parser before comparison, so an
+  `s3://bucket/key`-qualified spelling and its scheme-less
+  `bucket/key` equivalent are recognized as the same destination even
+  though they're different strings. Local paths get Windows-drive
+  normalization first (so `C://data/F.rf` is recognized as local rather
+  than mistaken for a remote URL) and an explicit symlink-target
+  resolution step alongside the case/Unicode-insensitive lexical check
+  and `os.Stat` + `os.SameFile` fallback, so a symlink aliasing a path
+  that itself doesn't exist yet (nothing for `os.SameFile` to compare)
+  is still caught by comparing the symlink's resolved target lexically.
 - `internal/promotion.Promote` — composes `StageBulkDir` with a
   `BulkImporter` (satisfied by `*accumulo.Connector`) to submit the FATE
   call. Submits nothing when the derived mapping is empty (nothing to

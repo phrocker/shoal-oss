@@ -11,8 +11,13 @@ import (
 
 	"github.com/phrocker/shoal/accumulo"
 	"github.com/phrocker/shoal/internal/engine"
+	shstorage "github.com/phrocker/shoal/internal/storage"
+	"github.com/phrocker/shoal/internal/storage/azure"
+	"github.com/phrocker/shoal/internal/storage/gcs"
+	"github.com/phrocker/shoal/internal/storage/hdfs"
 	"github.com/phrocker/shoal/internal/storage/local"
 	"github.com/phrocker/shoal/internal/storage/memory"
+	"github.com/phrocker/shoal/internal/storage/s3"
 )
 
 func TestStageBulkDirFlattensCopiesAndWritesLoadMapping(t *testing.T) {
@@ -292,21 +297,12 @@ func TestStagePathsAlias(t *testing.T) {
 		want bool
 	}{
 		{name: "identical local paths", src: `C:\data\t-0000\F0001.rf`, dst: `C:\data\t-0000\F0001.rf`, want: true},
+		{name: "windows drive path with redundant url-like separators", src: `C://data/F0001.rf`, dst: `C:\data\F0001.rf`, want: true},
 		{name: "local paths differing only by separator style", src: `/data/t-0000/F0001.rf`, dst: `/data/t-0000//F0001.rf`, want: true},
 		{name: "distinct local paths", src: `/data/t-0000/F0001.rf`, dst: `/bulk/events-1/F0001.rf`, want: false},
 		{name: "identical relative paths", src: "export/events/t-0000/F0001.rf", dst: "export/events/t-0000/F0001.rf", want: true},
 		{name: "local paths differing only by case", src: `/bulk/events-1/A.rf`, dst: `/bulk/events-1/a.rf`, want: true},
-		{
-			name: "local paths differing only by unicode normalization form",
-			// "café.rf" spelled two ways: src uses the precomposed NFC
-			// "é" (U+00E9); dst uses the decomposed NFD form, "e"
-			// (U+0065) followed by a combining acute accent (U+0301).
-			// Visually identical, byte-for-byte different -- exactly the
-			// spelling macOS's default filesystem treats as one file.
-			src:  "/bulk/events-1/caf\u00e9.rf",
-			dst:  "/bulk/events-1/cafe\u0301.rf",
-			want: true,
-		},
+		{name: "local paths differing only by unicode normalization form", src: "/bulk/events-1/caf\u00e9.rf", dst: "/bulk/events-1/cafe\u0301.rf", want: true},
 		{name: "identical url paths", src: "hdfs://nn/export/t-0000/F0001.rf", dst: "hdfs://nn/export/t-0000/F0001.rf", want: true},
 		{name: "url paths differing only by trailing slash", src: "hdfs://nn/export/t-0000/F0001.rf", dst: "hdfs://nn/export/t-0000/F0001.rf/", want: true},
 		{name: "distinct url paths", src: "hdfs://nn/export/t-0000/F0001.rf", dst: "hdfs://nn/bulk/events-1/F0001.rf", want: false},
@@ -315,6 +311,128 @@ func TestStagePathsAlias(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := stagePathsAlias(tt.src, tt.dst); got != tt.want {
 				t.Fatalf("stagePathsAlias(%q, %q) = %v, want %v", tt.src, tt.dst, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestPathUsesBackendSeparatorJoin(t *testing.T) {
+	tests := []struct {
+		name string
+		path string
+		want bool
+	}{
+		{name: "s3 qualified path", path: "s3://bucket/F0001.rf", want: true},
+		{name: "gcs qualified path", path: "gs://bucket/F0001.rf", want: true},
+		{name: "azure qualified path", path: "az://container/F0001.rf", want: true},
+		{name: "hdfs qualified path", path: "hdfs://nn/tables/F0001.rf", want: true},
+		{name: "hdfs authorityless path", path: "hdfs:/tables/F0001.rf", want: true},
+		{name: "opaque hdfs URI is not a joined backend path", path: "hdfs:tables/F0001.rf", want: false},
+		{name: "windows drive path is local", path: `C://data/F0001.rf`, want: false},
+		{name: "plain local path is local", path: `C:\data\F0001.rf`, want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := pathUsesBackendSeparatorJoin(tt.path); got != tt.want {
+				t.Fatalf("pathUsesBackendSeparatorJoin(%q) = %v, want %v", tt.path, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestJoinBulkPathTreatsWindowsDrivePathAsLocal(t *testing.T) {
+	got := joinBulkPath(`C://data`, "F0001.rf")
+	if got == `C://data/F0001.rf` {
+		t.Fatalf("joinBulkPath treated C://data as a backend URL root: got %q", got)
+	}
+	if !localPathsLexicallyAlias(got, `C:\data\F0001.rf`) {
+		t.Fatalf("joinBulkPath(%q, %q) = %q, want a local Windows-drive path aliasing %q", `C://data`, "F0001.rf", got, `C:\data\F0001.rf`)
+	}
+}
+
+func TestIsBackendRootDistinguishesWindowsDrivePaths(t *testing.T) {
+	tests := []struct {
+		name string
+		path string
+		want bool
+	}{
+		{name: "backend root", path: "s3://bucket/", want: true},
+		{name: "backend non-root", path: "s3://bucket/path", want: false},
+		{name: "hdfs root", path: "hdfs:/", want: true},
+		{name: "windows drive root with redundant separators", path: `C://`, want: true},
+		{name: "windows drive non-root with redundant separators", path: `C://data`, want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isBackendRoot(tt.path); got != tt.want {
+				t.Fatalf("isBackendRoot(%q) = %v, want %v", tt.path, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestStagePathsAliasBackendCanonicalization(t *testing.T) {
+	hdfsBackend := newTestHDFSBackend(t, "hdfs://nn:8020")
+
+	tests := []struct {
+		name       string
+		srcBackend shstorage.Backend
+		srcPath    string
+		dstBackend shstorage.Backend
+		dstPath    string
+		want       bool
+	}{
+		{
+			name:       "s3 scheme-less aliases qualified path",
+			srcBackend: &s3.Backend{},
+			srcPath:    "bucket/path/F0001.rf",
+			dstBackend: &s3.Backend{},
+			dstPath:    "s3://bucket/path/F0001.rf",
+			want:       true,
+		},
+		{
+			name:       "gcs scheme-less aliases qualified path",
+			srcBackend: &gcs.Backend{},
+			srcPath:    "bucket/path/F0001.rf",
+			dstBackend: &gcs.Backend{},
+			dstPath:    "gs://bucket/path/F0001.rf",
+			want:       true,
+		},
+		{
+			name:       "azure scheme-less aliases qualified path",
+			srcBackend: &azure.Backend{},
+			srcPath:    "container/path/F0001.rf",
+			dstBackend: &azure.Backend{},
+			dstPath:    "az://container/path/F0001.rf",
+			want:       true,
+		},
+		{
+			name:       "hdfs authorityless aliases qualified path on same backend",
+			srcBackend: hdfsBackend,
+			srcPath:    "/tables/1.rf",
+			dstBackend: hdfsBackend,
+			dstPath:    "hdfs://nn:8020/tables/1.rf",
+			want:       true,
+		},
+		{
+			name:       "local path does not alias s3 object spelling",
+			srcBackend: local.New(),
+			srcPath:    "bucket/path/F0001.rf",
+			dstBackend: &s3.Backend{},
+			dstPath:    "s3://bucket/path/F0001.rf",
+			want:       false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := stagePathsAliasOnBackends(tt.srcBackend, tt.srcPath, tt.dstBackend, tt.dstPath); got != tt.want {
+				t.Fatalf(
+					"stagePathsAliasOnBackends(%T, %q, %T, %q) = %v, want %v",
+					tt.srcBackend, tt.srcPath, tt.dstBackend, tt.dstPath, got, tt.want,
+				)
 			}
 		})
 	}
@@ -501,6 +619,106 @@ func TestStageBulkDirRejectsCrossFileAliasBeforeCopying(t *testing.T) {
 	}
 }
 
+func TestStageBulkDirRejectsSymlinkedWriteTargetsBeforeCopying(t *testing.T) {
+	root := t.TempDir()
+	exportDir := filepath.Join(root, "export")
+	bulkDir := filepath.Join(root, "bulk")
+	if err := os.MkdirAll(exportDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(bulkDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	aPath := filepath.Join(exportDir, "A.rf")
+	bPath := filepath.Join(exportDir, "B.rf")
+	aContent := []byte("A source bytes that must survive a rejected stage")
+	bContent := []byte("B source bytes that must survive a rejected stage")
+	if err := os.WriteFile(aPath, aContent, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(bPath, bContent, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	manifest := localManifestFromFiles(t, aPath, bPath)
+	aDstPath := filepath.Join(bulkDir, "A.rf")
+	bDstPath := filepath.Join(bulkDir, "B.rf")
+	if err := os.Symlink(bDstPath, aDstPath); err != nil {
+		t.Skipf("symlink not supported in this environment: %v", err)
+	}
+
+	be := local.New()
+	if _, err := StageBulkDir(context.Background(), be, manifest, be, bulkDir); err == nil {
+		t.Fatal("StageBulkDir with a symlinked write target = nil error, want error")
+	}
+
+	gotA, err := os.ReadFile(aPath)
+	if err != nil {
+		t.Fatalf("source file A missing after rejected stage: %v", err)
+	}
+	if string(gotA) != string(aContent) {
+		t.Fatalf("source file A corrupted by rejected stage: got %q, want %q", gotA, aContent)
+	}
+	gotB, err := os.ReadFile(bPath)
+	if err != nil {
+		t.Fatalf("source file B missing after rejected stage: %v", err)
+	}
+	if string(gotB) != string(bContent) {
+		t.Fatalf("source file B corrupted by rejected stage: got %q, want %q", gotB, bContent)
+	}
+	if _, err := os.Stat(bDstPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("symlink target unexpectedly exists after rejected stage: err=%v", err)
+	}
+}
+
+func TestStageBulkDirRejectsLoadMapAliasBeforeCopying(t *testing.T) {
+	root := t.TempDir()
+	exportDir := filepath.Join(root, "export")
+	bulkDir := filepath.Join(root, "bulk")
+	if err := os.MkdirAll(exportDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(bulkDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	srcPath := filepath.Join(exportDir, "F0001.rf")
+	content := []byte("source bytes that must survive a rejected loadmap alias stage")
+	if err := os.WriteFile(srcPath, content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	manifest := localManifestFromFiles(t, srcPath)
+
+	loadmapPath := filepath.Join(bulkDir, "loadmap.json")
+	if err := os.Link(srcPath, loadmapPath); err != nil {
+		t.Fatalf("Link(loadmap alias): %v", err)
+	}
+
+	be := local.New()
+	if _, err := StageBulkDir(context.Background(), be, manifest, be, bulkDir); err == nil {
+		t.Fatal("StageBulkDir with loadmap.json aliasing the source = nil error, want error")
+	}
+
+	got, err := os.ReadFile(srcPath)
+	if err != nil {
+		t.Fatalf("source file missing after rejected loadmap alias stage: %v", err)
+	}
+	if string(got) != string(content) {
+		t.Fatalf("source file corrupted by rejected loadmap alias stage: got %q, want %q", got, content)
+	}
+	gotLoadmap, err := os.ReadFile(loadmapPath)
+	if err != nil {
+		t.Fatalf("loadmap alias missing after rejected stage: %v", err)
+	}
+	if string(gotLoadmap) != string(content) {
+		t.Fatalf("loadmap alias content changed after rejected stage: got %q, want %q", gotLoadmap, content)
+	}
+	if _, err := os.Stat(filepath.Join(bulkDir, "F0001.rf")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("staged file exists after rejected loadmap alias stage: err=%v, want not-exist", err)
+	}
+}
+
 // TestPathIdentityCacheMemoizesStatResults proves pathIdentityCache
 // actually memoizes: checkNoStagingAliases's O(N^2) all-pairs comparison
 // only stays cheap in filesystem-syscall terms if repeated stat calls for
@@ -517,7 +735,7 @@ func TestPathIdentityCacheMemoizesStatResults(t *testing.T) {
 			t.Fatalf("WriteFile: %v", err)
 		}
 
-		cache := make(pathIdentityCache)
+		cache := newPathIdentityCache(1)
 		first := cache.stat(path)
 		if first == nil {
 			t.Fatalf("stat(%q) = nil, want a FileInfo for an existing file", path)
@@ -543,7 +761,7 @@ func TestPathIdentityCacheMemoizesStatResults(t *testing.T) {
 		dir := t.TempDir()
 		path := filepath.Join(dir, "does-not-exist-yet.rf")
 
-		cache := make(pathIdentityCache)
+		cache := newPathIdentityCache(1)
 		first := cache.stat(path)
 		if first != nil {
 			t.Fatalf("stat(%q) = %v, want nil for a nonexistent file", path, first)
@@ -694,6 +912,73 @@ func TestStageBulkDirRejectsHardLinkedWriteTargetsBeforeCopying(t *testing.T) {
 	}
 }
 
+// TestStageBulkDirRejectsHardLinkedSourcesBeforeCopying proves the
+// preflight also catches two manifest entries whose DestinationPath
+// values are different strings but physically the same file (for
+// example a hard link from one per-tablet export directory into
+// another). Each entry individually passes VerifyRFileExport and
+// flattens to a distinct basename (A.rf, B.rf), so neither the
+// target-vs-source nor the target-vs-target comparison has any reason
+// to reject them: without a source-vs-source comparison, StageBulkDir
+// would "succeed" while copying the same physical file's bytes twice
+// under two independent bulk-import filenames, so Accumulo would
+// import every row in that file twice.
+func TestStageBulkDirRejectsHardLinkedSourcesBeforeCopying(t *testing.T) {
+	root := t.TempDir()
+	exportDir0 := filepath.Join(root, "export", "t-0000")
+	exportDir1 := filepath.Join(root, "export", "t-0001")
+	if err := os.MkdirAll(exportDir0, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(exportDir1, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	aPath := filepath.Join(exportDir0, "A.rf")
+	bPath := filepath.Join(exportDir1, "B.rf")
+	content := []byte("shared physical file bytes")
+	if err := os.WriteFile(aPath, content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(aPath, bPath); err != nil {
+		t.Skipf("hard links not supported in this environment: %v", err)
+	}
+
+	bulkDir := filepath.Join(root, "bulk")
+	if err := os.MkdirAll(bulkDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Neither bulkDir/A.rf nor bulkDir/B.rf exists yet: this is not a
+	// write-target alias (they flatten to distinct names) but a
+	// source-vs-source alias -- the same physical file is referenced by
+	// two different manifest entries.
+
+	sum := sha256.Sum256(content)
+	manifest := &engine.RFileExportManifest{
+		Version:     engine.RFileExportManifestVersion,
+		SourceTable: "events",
+		Tablets:     []engine.RFileExportTablet{{Index: 0}},
+		RFiles: []engine.RFileExportFile{
+			{TabletIndex: 0, DestinationPath: aPath, Size: int64(len(content)), SHA256: hex.EncodeToString(sum[:])},
+			{TabletIndex: 0, DestinationPath: bPath, Size: int64(len(content)), SHA256: hex.EncodeToString(sum[:])},
+		},
+	}
+
+	be := local.New()
+	ctx := context.Background()
+	if _, err := StageBulkDir(ctx, be, manifest, be, bulkDir); err == nil {
+		t.Fatal("StageBulkDir with two hard-linked manifest sources = nil error, want error")
+	}
+
+	entries, err := os.ReadDir(bulkDir)
+	if err != nil {
+		t.Fatalf("ReadDir(%q): %v", bulkDir, err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("bulkDir has %d entries after rejected stage, want 0 (preflight must run before any copy): %v", len(entries), entries)
+	}
+}
+
 // TestStageBulkDirRejectsCaseInsensitiveAliasBeforeCopying proves the
 // preflight also catches two flattened destinations that differ only by
 // case, even though *neither exists yet* when the check runs. Windows
@@ -769,62 +1054,48 @@ func TestStageBulkDirRejectsCaseInsensitiveAliasBeforeCopying(t *testing.T) {
 	}
 }
 
-// TestStageBulkDirRejectsHardLinkedSourcesBeforeCopying proves the
-// preflight also catches two different manifest source paths that are
-// hard-linked to each other -- physically the same file, reached via
-// two distinct DestinationPath strings with distinct basenames. Neither
-// the target-vs-source nor the target-vs-target check catches this: each
-// source individually verifies (VerifyRFileExport reads the same
-// physical bytes twice, once per path, and both match their own
-// recorded size/SHA256), flattenNames assigns two distinct basenames
-// (A.rf and B.rf), and neither flattened destination aliases the other
-// or any source. Without a source-vs-source check, StageBulkDir would
-// "succeed," but Accumulo would receive the same underlying RFile
-// content twice under two independent names in loadmap.json --
-// silently duplicating every row the file contains.
-func TestStageBulkDirRejectsHardLinkedSourcesBeforeCopying(t *testing.T) {
-	root := t.TempDir()
-	exportDir := filepath.Join(root, "export")
-	if err := os.MkdirAll(exportDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	aPath := filepath.Join(exportDir, "A.rf")
-	bPath := filepath.Join(exportDir, "B.rf")
-	content := []byte("rfile bytes reachable through two different source paths")
-	if err := os.WriteFile(aPath, content, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Link(aPath, bPath); err != nil {
-		t.Skipf("hard links not supported in this environment: %v", err)
+func localManifestFromFiles(t *testing.T, paths ...string) *engine.RFileExportManifest {
+	t.Helper()
+
+	rfiles := make([]engine.RFileExportFile, 0, len(paths))
+	for _, srcPath := range paths {
+		data, err := os.ReadFile(srcPath)
+		if err != nil {
+			t.Fatalf("ReadFile(%q): %v", srcPath, err)
+		}
+		sum := sha256.Sum256(data)
+		rfiles = append(rfiles, engine.RFileExportFile{
+			TabletIndex:     0,
+			DestinationPath: srcPath,
+			Size:            int64(len(data)),
+			SHA256:          hex.EncodeToString(sum[:]),
+		})
 	}
 
-	bulkDir := filepath.Join(root, "bulk")
-	if err := os.MkdirAll(bulkDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-
-	sum := sha256.Sum256(content)
-	manifest := &engine.RFileExportManifest{
+	return &engine.RFileExportManifest{
 		Version:     engine.RFileExportManifestVersion,
 		SourceTable: "events",
 		Tablets:     []engine.RFileExportTablet{{Index: 0}},
-		RFiles: []engine.RFileExportFile{
-			{TabletIndex: 0, DestinationPath: aPath, Size: int64(len(content)), SHA256: hex.EncodeToString(sum[:])},
-			{TabletIndex: 0, DestinationPath: bPath, Size: int64(len(content)), SHA256: hex.EncodeToString(sum[:])},
-		},
-	}
-
-	be := local.New()
-	ctx := context.Background()
-	if _, err := StageBulkDir(ctx, be, manifest, be, bulkDir); err == nil {
-		t.Fatal("StageBulkDir with two hard-linked manifest sources = nil error, want error")
-	}
-
-	entries, err := os.ReadDir(bulkDir)
-	if err != nil {
-		t.Fatalf("reading bulkDir after rejected stage: %v", err)
-	}
-	if len(entries) != 0 {
-		t.Fatalf("bulkDir has %d entries after rejected stage, want 0 (no partial copy)", len(entries))
+		RFiles:      rfiles,
 	}
 }
+
+func newTestHDFSBackend(t *testing.T, address string) *hdfs.Backend {
+	t.Helper()
+
+	backend, err := hdfs.New(address, hdfs.WithClient(noopHDFSClient{}))
+	if err != nil {
+		t.Fatalf("hdfs.New(%q): %v", address, err)
+	}
+	return backend
+}
+
+type noopHDFSClient struct{}
+
+func (noopHDFSClient) Open(string) (hdfs.Reader, error)        { return nil, errors.New("unused") }
+func (noopHDFSClient) Create(string) (shstorage.Writer, error) { return nil, errors.New("unused") }
+func (noopHDFSClient) MkdirAll(string, os.FileMode) error      { return errors.New("unused") }
+func (noopHDFSClient) ReadDir(string) ([]os.FileInfo, error)   { return nil, errors.New("unused") }
+func (noopHDFSClient) Remove(string) error                     { return errors.New("unused") }
+func (noopHDFSClient) Rename(string, string) error             { return errors.New("unused") }
+func (noopHDFSClient) Close() error                            { return nil }

@@ -3,13 +3,21 @@ package promotion
 import (
 	"context"
 	"fmt"
+	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 
+	"golang.org/x/text/unicode/norm"
+
 	"github.com/phrocker/shoal/internal/engine"
 	"github.com/phrocker/shoal/internal/storage"
-	"golang.org/x/text/unicode/norm"
+	"github.com/phrocker/shoal/internal/storage/azure"
+	"github.com/phrocker/shoal/internal/storage/gcs"
+	"github.com/phrocker/shoal/internal/storage/hdfs"
+	"github.com/phrocker/shoal/internal/storage/local"
+	"github.com/phrocker/shoal/internal/storage/s3"
 )
 
 // StageBulkDir copies every RFile referenced by manifest from src (the
@@ -44,21 +52,28 @@ import (
 // than silently staging incomplete or mismatched data for Accumulo to bulk
 // import.
 //
-// Every computed destination path is also preflighted against every
-// unique source path in the manifest — not just the source it's paired
-// with — before any copy starts: if bulkDir happens to alias any
-// manifest source location (e.g. bulkDir is set to the export's own
-// tablet directory, or a destination is reached through a symlink/hard
-// link to a *different* RFile's source), copying would truncate that
-// source before it's read (storage.Copy opens the destination for
-// writing, which truncates in place on backends like local, before
-// streaming the source's bytes) and silently "succeed" with zero bytes
-// copied. A same-manifest cross-file alias is particularly dangerous:
-// the truncated file might not be staged until a later iteration of the
-// copy loop, by which point its already-completed VerifyRFileExport
-// check won't be repeated, so the corrupted bytes would be staged and
-// reported as a successful copy. StageBulkDir rejects every such case up
-// front rather than destroying any part of the source export.
+// Every write target is also preflighted before any copy starts: every
+// flattened RFile destination plus loadmap.json is compared against
+// every unique source path in the manifest, and every write target is
+// compared against every other write target, and every unique source
+// path is also compared against every other unique source path. That
+// catches in-place staging (bulkDir is the export's own tablet
+// directory), a destination reached through a symlink/hard link to a
+// *different* RFile's source, aliased write targets such as two staged
+// filenames (or a staged filename and loadmap.json) that resolve to the
+// same location, and two manifest sources that are themselves the same
+// physical file reached through two different DestinationPath spellings
+// (for example a symlink/hard link, or a case/Unicode-normalization
+// difference) — which would otherwise each verify and flatten
+// independently, so StageBulkDir would "succeed" while staging two
+// duplicate copies of the same file for Accumulo to bulk import twice.
+//
+// Those aliases are dangerous because storage.Copy opens the destination
+// for writing before it reads the source bytes: on backends like local,
+// the first write would truncate the aliased file in place, silently
+// corrupting a source export or previously written staging output before
+// StageBulkDir ever notices. StageBulkDir rejects every such case up
+// front rather than destroying any source or staging path.
 func StageBulkDir(
 	ctx context.Context,
 	src storage.Backend,
@@ -83,7 +98,7 @@ func StageBulkDir(
 	if err := engine.VerifyRFileExport(ctx, src, manifest); err != nil {
 		return nil, fmt.Errorf("promotion: stage: %w", err)
 	}
-	if err := checkNoStagingAliases(flatNames, bulkDir); err != nil {
+	if err := checkNoStagingAliases(src, dst, flatNames, bulkDir); err != nil {
 		return nil, err
 	}
 	staged := make(map[string]bool, len(manifest.RFiles))
@@ -106,87 +121,78 @@ func StageBulkDir(
 	return mapping, nil
 }
 
-// checkNoStagingAliases rejects the whole stage before any copy or the
-// load-mapping write starts if any write target StageBulkDir will open on
-// dst — every flattened RFile destination path, *and* bulkDir's own
-// loadmap.json (WriteLoadMapping truncates it exactly like storage.Copy
-// truncates an RFile destination, but it runs after every RFile copy, so
-// an aliased loadmap.json would destroy an already-staged source) —
-// resolves to the same physical location as *any* unique manifest source
-// path, or as any *other* write target. Checking only "does this RFile's
-// destination alias its own source" would miss a destination aliasing a
-// *different* manifest entry's source (for example via a symlink/hard
-// link), which would silently truncate that other file before it's ever
-// copied; checking only target-vs-source would separately miss two
-// distinct write targets (e.g. two RFiles' flattened basenames) that are
-// hard-linked to *each other* — individually harmless against every
-// source, but the second copy would silently overwrite the first while
-// the load mapping still lists both names as independent files.
+// checkNoStagingAliases rejects the whole stage before any copy starts
+// if any write target (every flattened RFile destination plus
+// loadmap.json) resolves to the same location as any unique source path,
+// if any two write targets resolve to the same location, or if any two
+// unique source paths resolve to the same location. Checking only the
+// 1:1 source/destination pairing would miss a destination that aliases
+// a *different* manifest entry's source (for example via a
+// symlink/hard link), while checking only target-vs-source would
+// separately miss two aliased write targets (for example two
+// hard-linked/symlinked flattened destinations, or loadmap.json
+// aliasing one of them) that would overwrite each other mid-stage.
+// Checking only the two write-side comparisons would still miss two
+// manifest sources that alias each other: each verifies and flattens to
+// a distinct basename independently of the other, so neither the
+// target-vs-source nor the target-vs-target check has any reason to
+// reject them, yet staging both would silently duplicate one physical
+// file's rows under two different bulk-import filenames.
 //
-// Every unique manifest source path is also checked against every
-// *other* unique source path: two different DestinationPath strings
-// that physically alias each other (e.g. one is a symlink or hard link
-// to the other, or they differ only by case or Unicode normalization
-// form) each individually verify against their own recorded size/SHA256
-// and flatten to distinct basenames, so neither the target-vs-source
-// nor the target-vs-target check above would reject them — StageBulkDir
-// would stage two independent, fully-successful copies of what is
-// really the same underlying file. That isn't data-destroying like the
-// aliases above, but it silently duplicates the source's rows once
-// Accumulo bulk-imports both flattened copies under loadmap.json's two
-// independent names.
-//
-// The all-pairs comparison is O(N^2) in the number of write targets, but
-// the underlying os.Stat calls are cached in one pathIdentityCache shared
-// across the whole comparison (O(N) stats: each unique source path and
-// each write target is stat'd at most once), rather than re-stat'ing the
-// same handful of paths on every iteration. Manifests are expected to
-// hold at most a few thousand RFiles per single-tablet export, so an
-// O(N^2) in-memory comparison over already-cached FileInfo values is not
-// a practical concern.
-func checkNoStagingAliases(flatNames map[string]string, bulkDir string) error {
-	srcPaths := make([]string, 0, len(flatNames))
-	for srcPath := range flatNames {
-		srcPaths = append(srcPaths, srcPath)
+// The all-pairs comparison is O(N^2) in the number of unique sources and
+// write targets across all three comparisons combined, but the
+// underlying local-filesystem os.Stat/symlink probes are cached in one
+// pathIdentityCache shared across the whole comparison (O(N) local path
+// probes overall), and remote backends are compared via backend-aware
+// canonicalized path strings only. Manifests are expected to hold at
+// most a few thousand RFiles per single-tablet export, so an O(N^2)
+// in-memory comparison over already-cached path identities is not a
+// practical concern.
+func checkNoStagingAliases(src, dst storage.Backend, flatNames map[string]string, bulkDir string) error {
+	srcPaths := make([]stagePathRef, 0, len(flatNames))
+	targets := make([]stageWriteTarget, 0, len(flatNames)+1)
+	for srcPath, flatName := range flatNames {
+		srcPaths = append(srcPaths, stagePathRef{backend: src, path: srcPath})
+		targets = append(targets, stageWriteTarget{
+			name: flatName,
+			path: joinBulkPath(bulkDir, flatName),
+		})
 	}
+	targets = append(targets, stageWriteTarget{
+		name: bulkLoadMappingFile,
+		path: joinBulkPath(bulkDir, bulkLoadMappingFile),
+	})
 
-	// Every path StageBulkDir will open for writing: one per unique
-	// flattened RFile destination, plus the load mapping itself.
-	targets := make([]string, 0, len(srcPaths)+1)
-	for _, srcPath := range srcPaths {
-		targets = append(targets, joinBulkPath(bulkDir, flatNames[srcPath]))
-	}
-	targets = append(targets, joinBulkPath(bulkDir, bulkLoadMappingFile))
-
-	cache := make(pathIdentityCache, len(srcPaths)+len(targets))
-	for i, srcPath := range srcPaths {
-		// Compare against later sources only: an unordered pair
-		// (srcPath, other) only needs checking once.
-		for _, other := range srcPaths[i+1:] {
-			if pathsAlias(srcPath, other, cache) {
+	cache := newPathIdentityCache(len(srcPaths) + len(targets))
+	for i := range srcPaths {
+		for j := i + 1; j < len(srcPaths); j++ {
+			if pathsAlias(srcPaths[i], srcPaths[j], cache) {
 				return fmt.Errorf(
 					"promotion: stage: manifest sources %s and %s resolve to the same physical file; refusing to stage duplicate copies",
-					srcPath, other,
+					srcPaths[i].path, srcPaths[j].path,
 				)
 			}
 		}
 	}
-	for i, target := range targets {
+	for _, target := range targets {
+		targetRef := stagePathRef{backend: dst, path: target.path}
 		for _, srcPath := range srcPaths {
-			if pathsAlias(srcPath, target, cache) {
+			if pathsAlias(srcPath, targetRef, cache) {
 				return fmt.Errorf(
-					"promotion: stage: bulk directory %s write target %s resolves to the same location as source file %s; refusing to copy in place",
-					bulkDir, target, srcPath,
+					"promotion: stage: write target %s (%s) resolves to the same location as source file %s; refusing to write aliased staging output",
+					target.name, target.path, srcPath.path,
 				)
 			}
 		}
-		// Compare against later targets only: an unordered pair (target,
-		// other) only needs checking once.
-		for _, other := range targets[i+1:] {
-			if pathsAlias(target, other, cache) {
+	}
+	for i := range targets {
+		left := stagePathRef{backend: dst, path: targets[i].path}
+		for j := i + 1; j < len(targets); j++ {
+			right := stagePathRef{backend: dst, path: targets[j].path}
+			if pathsAlias(left, right, cache) {
 				return fmt.Errorf(
-					"promotion: stage: bulk directory %s has two write targets (%s and %s) that resolve to the same location; refusing to stage, since the second write would silently overwrite the first",
-					bulkDir, target, other,
+					"promotion: stage: write targets %s (%s) and %s (%s) resolve to the same location; refusing to write aliased staging outputs",
+					targets[i].name, targets[i].path, targets[j].name, targets[j].path,
 				)
 			}
 		}
@@ -194,99 +200,324 @@ func checkNoStagingAliases(flatNames map[string]string, bulkDir string) error {
 	return nil
 }
 
-// stagePathsAlias reports whether srcPath (opened for reading on src) and
-// dstPath (opened for writing on dst, which truncates in place on
-// backends such as local) resolve to the same physical location. src and
-// dst are not guaranteed comparable (e.g. local.Backend is a stateless
-// zero-field struct, so two independently constructed instances are
-// indistinguishable by identity even when they really are "the same
-// backend"), so path identity is decided by string/filesystem inspection
-// rather than backend identity: a false positive — rejecting a harmless
-// coincidental collision between two genuinely different backends — is
-// far cheaper than a false negative that silently destroys the source
-// export.
-//
-// URL-style paths (containing "://") have no local filesystem entry to
-// inspect, so those are compared as normalized strings only. Filesystem-
-// style paths are first compared the same way as a cheap common-case
-// check, then a case- and Unicode-normalization-insensitive lexical
-// comparison (Windows and macOS default to case-insensitive filesystems,
-// and macOS additionally normalizes Unicode filenames, so two paths
-// differing only in case and/or normalization form can alias even
-// before either exists, which os.Stat cannot detect), then — because
-// none of the lexical comparisons above catch an absolute source path
-// aliasing an equivalent relative destination path (or vice versa), nor
-// a destination reached through a symlink or hard
-// link to the same source file — checked for physical identity via
-// os.Stat + os.SameFile, which both backends ultimately resolve through
-// (local.Backend.Open/Create pass paths straight to the os package). If
-// either path can't be stat'd (most commonly because dstPath doesn't
-// exist yet, the overwhelmingly common non-aliased case), that's decided
-// by the lexical result alone.
-func stagePathsAlias(srcPath, dstPath string) bool {
-	return pathsAlias(srcPath, dstPath, make(pathIdentityCache))
+type stagePathRef struct {
+	backend storage.Backend
+	path    string
 }
 
-// pathIdentityCache memoizes os.Stat results by path so a caller
-// comparing many paths against each other (checkNoStagingAliases) stats
-// each unique path once, not once per comparison. A cached nil FileInfo
-// means the path could not be stat'd (most commonly because it doesn't
-// exist yet); that's distinct from "not yet looked up," so a failed stat
-// is cached too rather than retried.
-type pathIdentityCache map[string]os.FileInfo
+type stageWriteTarget struct {
+	name string
+	path string
+}
+
+// stagePathsAlias reports whether srcPath and dstPath would resolve to
+// the same location under the default local/URL heuristics. It exists as
+// a lightweight wrapper for tests; StageBulkDir itself uses
+// stagePathsAliasOnBackends so backend-aware canonicalization can treat
+// equivalent spellings such as s3://bucket/key versus bucket/key as the
+// same destination.
+func stagePathsAlias(srcPath, dstPath string) bool {
+	return pathsAlias(
+		stagePathRef{path: srcPath},
+		stagePathRef{path: dstPath},
+		newPathIdentityCache(0),
+	)
+}
+
+func stagePathsAliasOnBackends(src storage.Backend, srcPath string, dst storage.Backend, dstPath string) bool {
+	return pathsAlias(
+		stagePathRef{backend: src, path: srcPath},
+		stagePathRef{backend: dst, path: dstPath},
+		newPathIdentityCache(0),
+	)
+}
+
+// pathIdentityCache memoizes local-filesystem identity probes by path so
+// callers comparing many paths against each other (checkNoStagingAliases)
+// stat each unique path once and resolve each direct symlink target once,
+// not once per comparison. A cached nil FileInfo means the path could not
+// be stat'd (most commonly because it doesn't exist yet); that's distinct
+// from "not yet looked up," so failed stats are cached too rather than
+// retried.
+type pathIdentityCache struct {
+	stats          map[string]os.FileInfo
+	symlinkTargets map[string]symlinkTargetResult
+}
+
+type symlinkTargetResult struct {
+	target   string
+	resolved bool
+}
+
+func newPathIdentityCache(capacity int) pathIdentityCache {
+	return pathIdentityCache{
+		stats:          make(map[string]os.FileInfo, capacity),
+		symlinkTargets: make(map[string]symlinkTargetResult, capacity),
+	}
+}
 
 func (c pathIdentityCache) stat(path string) os.FileInfo {
-	if info, cached := c[path]; cached {
+	if info, cached := c.stats[path]; cached {
 		return info
 	}
 	info, err := os.Stat(path)
 	if err != nil {
 		info = nil
 	}
-	c[path] = info
+	c.stats[path] = info
 	return info
 }
 
-// pathsAlias is stagePathsAlias's implementation, factored out so
-// checkNoStagingAliases's O(N^2) all-pairs comparison can share one
-// pathIdentityCache across every call instead of stat'ing the same
-// handful of paths repeatedly (each call to stagePathsAlias's physical-
-// identity fallback below performs up to two os.Stat calls).
-func pathsAlias(srcPath, dstPath string, cache pathIdentityCache) bool {
-	if strings.Contains(srcPath, "://") || strings.Contains(dstPath, "://") {
-		return strings.TrimRight(srcPath, `/\`) == strings.TrimRight(dstPath, `/\`)
+func (c pathIdentityCache) symlinkTarget(path string) (string, bool) {
+	if result, cached := c.symlinkTargets[path]; cached {
+		return result.target, result.resolved
 	}
-	srcClean := filepath.Clean(srcPath)
-	dstClean := filepath.Clean(dstPath)
+	target, resolved := resolveLocalSymlinkTarget(path)
+	c.symlinkTargets[path] = symlinkTargetResult{target: target, resolved: resolved}
+	return target, resolved
+}
+
+// pathsAlias is StageBulkDir's alias detector, factored out so
+// checkNoStagingAliases's O(N^2) comparison can share one
+// pathIdentityCache across every call instead of stat'ing the same
+// handful of local paths repeatedly.
+//
+// Remote/object-store paths are canonicalized through the backend-aware
+// parsers already used by the storage packages (s3.ParsePath,
+// gcs.ParsePath, azure.ParsePath, and HDFS URI parsing) so equivalent
+// spellings compare equal even when one path is qualified and the other
+// uses the backend's scheme-less form. Local filesystem paths still get
+// Windows-drive normalization (so C://data/F.rf stays local rather than
+// being mistaken for a remote URL), a Unicode-NFC-normalized,
+// case-insensitive lexical check (to conservatively catch not-yet-created
+// aliases on Windows and macOS's default filesystems, both of which fold
+// case and normalize Unicode spellings such as composed vs decomposed
+// "é" when resolving filenames), plus os.Stat + os.SameFile so
+// equivalent absolute/relative spellings and symlink/hardlink aliases
+// are caught too.
+func pathsAlias(srcPath, dstPath stagePathRef, cache pathIdentityCache) bool {
+	srcCanonical, srcCanonicalOK := canonicalBackendPath(srcPath)
+	dstCanonical, dstCanonicalOK := canonicalBackendPath(dstPath)
+	if srcCanonicalOK || dstCanonicalOK {
+		return srcCanonicalOK && dstCanonicalOK && srcCanonical == dstCanonical
+	}
+
+	if usesLocalFilesystemSemantics(srcPath) && usesLocalFilesystemSemantics(dstPath) {
+		if localPathsLexicallyAlias(srcPath.path, dstPath.path) {
+			return true
+		}
+		if localSymlinkTargetsAlias(srcPath.path, dstPath.path, cache) {
+			return true
+		}
+		srcInfo := cache.stat(srcPath.path)
+		if srcInfo == nil {
+			return false
+		}
+		dstInfo := cache.stat(dstPath.path)
+		if dstInfo == nil {
+			return false
+		}
+		return os.SameFile(srcInfo, dstInfo)
+	}
+
+	if pathLooksURLLike(srcPath.path) || pathLooksURLLike(dstPath.path) {
+		return strings.TrimRight(srcPath.path, `/\`) == strings.TrimRight(dstPath.path, `/\`)
+	}
+
+	return srcPath.path == dstPath.path
+}
+
+func localSymlinkTargetsAlias(srcPath, dstPath string, cache pathIdentityCache) bool {
+	srcClean := normalizeLocalPathForAlias(srcPath)
+	dstClean := normalizeLocalPathForAlias(dstPath)
+
+	if target, ok := cache.symlinkTarget(srcPath); ok && localPathsLexicallyAlias(target, dstClean) {
+		return true
+	}
+	if target, ok := cache.symlinkTarget(dstPath); ok && localPathsLexicallyAlias(target, srcClean) {
+		return true
+	}
+
+	srcTarget, srcIsSymlink := cache.symlinkTarget(srcPath)
+	dstTarget, dstIsSymlink := cache.symlinkTarget(dstPath)
+	return srcIsSymlink && dstIsSymlink && localPathsLexicallyAlias(srcTarget, dstTarget)
+}
+
+// localPathsLexicallyAlias compares two local paths after normalizing
+// Windows-drive spelling and folding case; both are additionally
+// normalized to Unicode NFC first so a composed and a decomposed
+// spelling of the same character (for example precomposed "é",
+// U+00E9, versus "e" + a combining acute accent, U+0065 U+0301)
+// compare equal too. macOS's default filesystem (HFS+/APFS) normalizes
+// filenames the same way it folds case, so without this a case-only
+// check would still miss a real alias there whenever neither
+// destination has been created yet for os.Stat + os.SameFile to catch.
+func localPathsLexicallyAlias(srcPath, dstPath string) bool {
+	srcClean := normalizeLocalPathForAlias(srcPath)
+	dstClean := normalizeLocalPathForAlias(dstPath)
 	if srcClean == dstClean {
 		return true
 	}
-	// Windows and macOS (by default) resolve filesystem paths
-	// case-insensitively, and macOS additionally normalizes Unicode
-	// filenames to NFD on disk, so composed and decomposed spellings of
-	// the same character (e.g. NFC vs NFD "é") also name the same file
-	// there — both cases can alias even before either path exists, which
-	// the physical-identity stat below cannot catch, since it needs an
-	// existing file to stat, and two not-yet-created destinations both
-	// correctly stat as "doesn't exist" right up until the second Create
-	// silently resolves onto the first. Normalizing both cleaned paths to
-	// NFC before folding case is conservative — it may also reject a
-	// legitimate same-spelling collision on a genuinely case-sensitive,
-	// normalization-preserving filesystem — matching this package's
-	// preference for a safe false positive over a data-destroying false
-	// negative.
-	if strings.EqualFold(norm.NFC.String(srcClean), norm.NFC.String(dstClean)) {
+	return strings.EqualFold(norm.NFC.String(srcClean), norm.NFC.String(dstClean))
+}
+
+func resolveLocalSymlinkTarget(path string) (string, bool) {
+	const maxSymlinkHops = 40
+
+	current := filepath.Clean(path)
+	info, err := os.Lstat(current)
+	if err != nil || info.Mode()&os.ModeSymlink == 0 {
+		return "", false
+	}
+	for hops := 0; hops < maxSymlinkHops; hops++ {
+		target, err := os.Readlink(current)
+		if err != nil {
+			return "", false
+		}
+		if !filepath.IsAbs(target) {
+			target = filepath.Join(filepath.Dir(current), target)
+		}
+		current = filepath.Clean(target)
+
+		info, err = os.Lstat(current)
+		if err != nil {
+			return current, true
+		}
+		if info.Mode()&os.ModeSymlink == 0 {
+			return current, true
+		}
+	}
+	return current, true
+}
+
+func usesLocalFilesystemSemantics(ref stagePathRef) bool {
+	if explicitBackendScheme(ref.path) != "" {
+		return false
+	}
+	if ref.backend == nil {
 		return true
 	}
-	srcInfo := cache.stat(srcPath)
-	if srcInfo == nil {
-		return false
+	_, ok := ref.backend.(*local.Backend)
+	return ok
+}
+
+func canonicalBackendPath(ref stagePathRef) (string, bool) {
+	scheme := explicitBackendScheme(ref.path)
+	switch b := ref.backend.(type) {
+	case *s3.Backend:
+		if scheme != "" && scheme != "s3" {
+			return "", false
+		}
+		return canonicalS3Path(ref.path)
+	case *gcs.Backend:
+		if scheme != "" && scheme != "gs" {
+			return "", false
+		}
+		return canonicalGCSPath(ref.path)
+	case *azure.Backend:
+		if scheme != "" && scheme != "az" {
+			return "", false
+		}
+		return canonicalAzurePath(ref.path)
+	case *hdfs.Backend:
+		if scheme != "" && scheme != "hdfs" {
+			return "", false
+		}
+		return canonicalHDFSPath(ref.path, b.Authority())
 	}
-	dstInfo := cache.stat(dstPath)
-	if dstInfo == nil {
-		return false
+
+	switch scheme {
+	case "s3":
+		return canonicalS3Path(ref.path)
+	case "gs":
+		return canonicalGCSPath(ref.path)
+	case "az":
+		return canonicalAzurePath(ref.path)
+	case "hdfs":
+		return canonicalHDFSPath(ref.path, "")
+	default:
+		return "", false
 	}
-	return os.SameFile(srcInfo, dstInfo)
+}
+
+func canonicalS3Path(path string) (string, bool) {
+	bucket, key, err := s3.ParsePath(path)
+	if err != nil {
+		return "", false
+	}
+	return "s3://" + bucket + "/" + key, true
+}
+
+func canonicalGCSPath(path string) (string, bool) {
+	bucket, object, err := gcs.ParsePath(path)
+	if err != nil {
+		return "", false
+	}
+	return "gs://" + bucket + "/" + object, true
+}
+
+func canonicalAzurePath(path string) (string, bool) {
+	container, blob, err := azure.ParsePath(path)
+	if err != nil {
+		return "", false
+	}
+	return "az://" + container + "/" + blob, true
+}
+
+func canonicalHDFSPath(objectPath, authorityHint string) (string, bool) {
+	if explicitBackendScheme(objectPath) == "" {
+		if !strings.HasPrefix(objectPath, "/") {
+			return "", false
+		}
+		return canonicalHDFSString(authorityHint, path.Clean(objectPath)), true
+	}
+
+	u, err := url.Parse(objectPath)
+	if err != nil {
+		return "", false
+	}
+	if u.Scheme != "hdfs" || u.Opaque != "" || u.RawQuery != "" || u.Fragment != "" {
+		return "", false
+	}
+
+	authority := u.Host
+	if authority == "" {
+		authority = authorityHint
+	}
+	resolved := u.Path
+	if resolved == "" {
+		resolved = "/"
+	}
+	return canonicalHDFSString(authority, path.Clean(resolved)), true
+}
+
+func canonicalHDFSString(authority, resolved string) string {
+	if resolved == "." || resolved == "" {
+		resolved = "/"
+	}
+	if !strings.HasPrefix(resolved, "/") {
+		resolved = "/" + resolved
+	}
+	authority = strings.ToLower(authority)
+	if authority == "" {
+		return "hdfs:" + resolved
+	}
+	return "hdfs://" + authority + resolved
+}
+
+func explicitBackendScheme(path string) string {
+	switch {
+	case strings.HasPrefix(path, "s3://"):
+		return "s3"
+	case strings.HasPrefix(path, "gs://"):
+		return "gs"
+	case strings.HasPrefix(path, "az://"):
+		return "az"
+	case strings.HasPrefix(path, "hdfs:"):
+		return "hdfs"
+	default:
+		return ""
+	}
 }
 
 // flattenNames validates that every RFile's basename is unique once

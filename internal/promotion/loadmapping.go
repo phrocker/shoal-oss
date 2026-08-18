@@ -310,11 +310,11 @@ func base64RowValue(s *string) ([]byte, error) {
 	return base64.URLEncoding.DecodeString(*s)
 }
 
-// joinBulkPath mirrors engine's joinBackendPath: URL-style roots
-// (scheme://...) join with a literal "/", local-style roots join with
-// filepath.Join.
+// joinBulkPath mirrors engine's joinBackendPath: backend-qualified roots
+// (s3://..., gs://..., az://..., hdfs:/..., hdfs://...) join with a
+// literal "/", local-style roots join with filepath.Join.
 func joinBulkPath(bulkDir, name string) string {
-	if strings.Contains(bulkDir, "://") {
+	if pathUsesBackendSeparatorJoin(bulkDir) {
 		return strings.TrimRight(bulkDir, `/\`) + "/" + name
 	}
 	return filepath.Join(bulkDir, name)
