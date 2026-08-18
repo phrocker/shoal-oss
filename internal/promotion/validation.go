@@ -57,11 +57,10 @@ func isBackendRootOnBackend(dst storage.Backend, bulkDir string) bool {
 		if err != nil {
 			return false
 		}
-		p := u.Path
-		if storage.ExplicitPathScheme(dst, bulkDir) == "hdfs" {
-			p = hdfsCleanRootPath(p)
+		if strings.EqualFold(storage.ExplicitPathScheme(dst, bulkDir), "hdfs") {
+			return hdfsURIPathIsRoot(u.Path)
 		}
-		return strings.Trim(p, "/\\") == ""
+		return strings.Trim(u.Path, "/\\") == ""
 	}
 	if isWindowsDriveRootPath(bulkDir) {
 		return true
@@ -75,21 +74,23 @@ func isBackendRootOnBackend(dst storage.Backend, bulkDir string) bool {
 	return vol != "" && clean == vol+sep
 }
 
-// hdfsCleanRootPath normalizes dot segments ("." and "..") in an HDFS URI
-// path per HDFS/POSIX path semantics, so a root alias like "/tmp/.." --
-// which HDFS itself resolves to "/" -- is recognized as the backend root
-// even though its literal spelling is not empty. pathpkg.Clean maps an
-// empty path to ".", which is mapped back to "" here so a bare authority
-// root (hdfs://nn, with no path segment at all) still trims to the empty
-// string and is correctly recognized as root. This normalization is
-// intentionally scoped to the HDFS scheme by the caller: object-store and
-// other custom backend URL schemes skip it, since their keys may
-// legitimately contain literal "." or ".." segments that are not
-// directory-traversal tokens.
-func hdfsCleanRootPath(p string) string {
-	cleaned := pathpkg.Clean(p)
-	if cleaned == "." {
-		return ""
+// hdfsURIPathIsRoot reports whether an HDFS URI's path component names the
+// backend root once dot segments ("." and "..") are resolved per
+// HDFS/POSIX path semantics. A root alias like "/tmp/.." -- which HDFS
+// itself resolves to "/" -- would not trim to empty as a raw string, so
+// this scheme cannot use the plain strings.Trim check used for other
+// backend URL schemes. pathpkg.Clean maps an empty path to ".", which
+// (like "") is mapped to "/" here so a bare authority root (hdfs://nn,
+// with no path segment at all) is still recognized as root. This
+// normalization is intentionally scoped to the HDFS scheme by the
+// caller: object-store and other custom backend URL schemes must not
+// resolve dot segments this way, since their keys may legitimately
+// contain literal "." or ".." characters that are not directory-
+// traversal tokens.
+func hdfsURIPathIsRoot(rawPath string) bool {
+	cleaned := pathpkg.Clean(rawPath)
+	if cleaned == "." || cleaned == "" {
+		cleaned = "/"
 	}
-	return cleaned
+	return strings.Trim(cleaned, "/\\") == ""
 }

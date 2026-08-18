@@ -5,10 +5,12 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
 	"sort"
+	"sync/atomic"
 	"testing"
 
 	"github.com/phrocker/shoal/accumulo"
@@ -289,7 +291,9 @@ func TestStageBulkDirRejectsInvalidBulkDirBeforeCopying(t *testing.T) {
 		{name: "local root", bulkDir: "/"},
 		{name: "url root", bulkDir: "hdfs://nn/"},
 		{name: "uppercase authorityless hdfs root", bulkDir: "HDFS:/"},
-		{name: "hdfs root alias via trailing parent dot segment", bulkDir: "hdfs://nn/tmp/.."},
+		{name: "qualified hdfs dotdot root", bulkDir: "hdfs://nn/tmp/.."},
+		{name: "authorityless hdfs dot root", bulkDir: "hdfs:/./"},
+		{name: "uppercase authorityless hdfs dotdot root", bulkDir: "HDFS:/tmp/.."},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -591,10 +595,11 @@ func TestIsBackendRootDistinguishesWindowsDrivePaths(t *testing.T) {
 		{name: "hdfs root", path: "hdfs:/", want: true},
 		{name: "uppercase hdfs root", path: "HDFS:/", want: true},
 		{name: "hdfs bare authority root has no path segment", path: "hdfs://nn", want: true},
-		{name: "hdfs root alias via trailing parent dot segment", path: "hdfs://nn/tmp/..", want: true},
-		{name: "hdfs authorityless root alias via trailing parent dot segment", path: "hdfs:/tmp/..", want: true},
+		{name: "qualified hdfs dotdot path normalizes to root", path: "hdfs://nn/tmp/..", want: true},
+		{name: "lowercase authorityless hdfs dotdot path normalizes to root", path: "hdfs:/tmp/..", want: true},
+		{name: "uppercase authorityless hdfs dotdot path normalizes to root", path: "HDFS:/tmp/..", want: true},
 		{name: "hdfs non-root path containing a parent dot segment", path: "hdfs://nn/tmp/../keep", want: false},
-		{name: "s3 dot segments are literal key characters, not a root alias", path: "s3://bucket/tmp/..", want: false},
+		{name: "object-store dotdot key is not a root", path: "s3://bucket/tmp/..", want: false},
 		{name: "windows drive root with redundant separators", path: `C://`, want: true},
 		{name: "windows drive non-root with redundant separators", path: `C://data`, want: false},
 	}
@@ -1362,6 +1367,35 @@ func TestPathIdentityCacheMemoizesStatResults(t *testing.T) {
 			t.Fatalf("stat(%q) after later creating the file = %v, want the cached nil (a fresh os.Stat would now succeed)", path, second)
 		}
 	})
+}
+
+func TestCheckNoStagingAliasesMemoizesRemoteCanonicalPaths(t *testing.T) {
+	const fileCount = 64
+
+	originalParseS3Path := parseS3Path
+	var parseCalls atomic.Int64
+	parseS3Path = func(path string) (string, string, error) {
+		parseCalls.Add(1)
+		return s3.ParsePath(path)
+	}
+	t.Cleanup(func() {
+		parseS3Path = originalParseS3Path
+	})
+
+	flatNames := make(map[string]string, fileCount)
+	for i := 0; i < fileCount; i++ {
+		name := fmt.Sprintf("F%04d.rf", i)
+		flatNames[fmt.Sprintf("s3://bucket/export/%s", name)] = name
+	}
+
+	if err := checkNoStagingAliases(&s3.Backend{}, &s3.Backend{}, flatNames, "s3://bucket/bulk"); err != nil {
+		t.Fatalf("checkNoStagingAliases(remote manifest): %v", err)
+	}
+
+	wantMax := int64(fileCount*2 + 1) // each source, each write target, and loadmap.json once
+	if got := parseCalls.Load(); got > wantMax {
+		t.Fatalf("parseS3Path called %d times, want <= %d cached canonicalizations", got, wantMax)
+	}
 }
 
 // TestStageBulkDirRejectsLoadMappingAliasBeforeCopying proves the
