@@ -23,6 +23,7 @@ import (
 	"errors"
 	"log/slog"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -99,15 +100,33 @@ func (f *fakeCoordinator) CompactionFailed(
 }
 
 type fakeConn struct {
-	svc    *fakeCoordinator
-	closed int
+	svc *fakeCoordinator
+
+	// The poll loop closes the transport from a context watcher while an
+	// RPC may still be running on another goroutine, so this bookkeeping
+	// has to be race-free.
+	mu      sync.Mutex
+	closed  int
+	onClose func()
 }
 
 func (c *fakeConn) Raw() compactioncoordinator.CompactionCoordinatorService { return c.svc }
 
 func (c *fakeConn) Close() error {
+	c.mu.Lock()
 	c.closed++
+	onClose := c.onClose
+	c.mu.Unlock()
+	if onClose != nil {
+		onClose()
+	}
 	return nil
+}
+
+func (c *fakeConn) closeCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.closed
 }
 
 // idleReply is the coordinator's "no work for this group" answer: a job
@@ -124,7 +143,10 @@ func testLogger() (*slog.Logger, *bytes.Buffer) {
 	return slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug})), buf
 }
 
-func testPollConfig(resolver coordinatorResolver, dial func(string, string, string) (coordinatorConn, error)) pollConfig {
+func testPollConfig(
+	resolver coordinatorResolver,
+	dial func(context.Context, string, string, string) (coordinatorConn, error),
+) pollConfig {
 	return pollConfig{
 		resolver:        resolver,
 		dial:            dial,
@@ -155,7 +177,7 @@ func TestRunPollLoopFollowsManagerFailover(t *testing.T) {
 	defer cancel()
 
 	var dialed []string
-	dial := func(addr, instanceID, accumuloVersion string) (coordinatorConn, error) {
+	dial := func(_ context.Context, addr, instanceID, accumuloVersion string) (coordinatorConn, error) {
 		if instanceID != "uuid-1" || accumuloVersion != "4.0.0-SNAPSHOT" {
 			t.Errorf("dial(%q) instance/version = %q/%q", addr, instanceID, accumuloVersion)
 		}
@@ -212,7 +234,7 @@ func TestRunPollLoopBacksOffWhileCoordinatorUnavailable(t *testing.T) {
 				}
 				return "", tt.err
 			})
-			dial := func(addr, _, _ string) (coordinatorConn, error) {
+			dial := func(_ context.Context, addr, _, _ string) (coordinatorConn, error) {
 				t.Fatalf("dialed %q despite failed discovery", addr)
 				return nil, nil
 			}
@@ -275,7 +297,7 @@ func TestRunPollLoopResetsBackoffAfterReconnect(t *testing.T) {
 		}
 		return "", zk.ErrCoordinatorUnavailable
 	})
-	dial := func(string, string, string) (coordinatorConn, error) {
+	dial := func(context.Context, string, string, string) (coordinatorConn, error) {
 		return &fakeConn{svc: &fakeCoordinator{
 			getJob: func(string) (*compactioncoordinator.TNextCompactionJob, error) {
 				return idleReply(), nil
@@ -293,6 +315,108 @@ func TestRunPollLoopResetsBackoffAfterReconnect(t *testing.T) {
 	out := logs.String()
 	if got := retryWaits(out); strings.Join(got, ",") != "1ms,2ms,4ms,2ms" {
 		t.Fatalf("backoff = %v, want [1ms 2ms 4ms 2ms]:\n%s", got, out)
+	}
+}
+
+// TestRunPollLoopAbortsWedgedRPCOnCancel: thrift transports ignore the
+// context once a call is in flight, so a manager that accepts the
+// connection and then goes silent would hold the loop until the socket
+// timeout expires. Cancellation must close the transport instead, so
+// SIGTERM is honoured immediately.
+func TestRunPollLoopAbortsWedgedRPCOnCancel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var (
+		inFlight    sync.Once
+		released    sync.Once
+		rpcStarted  = make(chan struct{})
+		rpcUnblocks = make(chan struct{})
+	)
+	release := func() { released.Do(func() { close(rpcUnblocks) }) }
+	defer release()
+
+	conn := &fakeConn{onClose: release}
+	conn.svc = &fakeCoordinator{
+		getJob: func(string) (*compactioncoordinator.TNextCompactionJob, error) {
+			inFlight.Do(func() { close(rpcStarted) })
+			// A wedged read only ends when the transport is closed.
+			<-rpcUnblocks
+			return nil, errors.New("read tcp 10.0.0.1:9999: use of closed network connection")
+		},
+	}
+
+	resolver := resolverFunc(func(context.Context) (string, error) { return "manager-a:9999", nil })
+	dial := func(context.Context, string, string, string) (coordinatorConn, error) { return conn, nil }
+
+	logger, _ := testLogger()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		runPollLoop(ctx, logger, testPollConfig(resolver, dial))
+	}()
+
+	select {
+	case <-rpcStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("getCompactionJob never started")
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("runPollLoop did not return after cancellation; a wedged RPC must be aborted by closing the transport")
+	}
+	if conn.closeCount() == 0 {
+		t.Fatal("transport was never closed")
+	}
+}
+
+// TestRunPollLoopReconnectsAfterRPCTimeout covers what the bounded
+// socket timeout buys: a silent manager surfaces as an RPC error, the
+// connection is dropped, and the next attempt re-resolves — which is how
+// the pool migrates to a new primary mid-poll.
+func TestRunPollLoopReconnectsAfterRPCTimeout(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	resolver := &scriptedResolver{results: []resolveResult{
+		{addr: "manager-a:9999"},
+		{addr: "manager-b:9999"},
+	}}
+
+	var conns []*fakeConn
+	dial := func(_ context.Context, addr, _, _ string) (coordinatorConn, error) {
+		conn := &fakeConn{}
+		conn.svc = &fakeCoordinator{
+			getJob: func(string) (*compactioncoordinator.TNextCompactionJob, error) {
+				if addr == "manager-a:9999" {
+					// What a bounded socket read surfaces as.
+					return nil, errors.New("read tcp 10.0.0.1:9999: i/o timeout")
+				}
+				cancel()
+				return idleReply(), nil
+			},
+		}
+		conns = append(conns, conn)
+		return conn, nil
+	}
+
+	logger, logs := testLogger()
+	runPollLoop(ctx, logger, testPollConfig(resolver, dial))
+
+	if len(conns) != 2 {
+		t.Fatalf("dials = %d, want 2 (timed-out connection must be replaced)", len(conns))
+	}
+	if got := conns[0].closeCount(); got == 0 {
+		t.Fatal("timed-out connection was not closed")
+	}
+	if resolver.calls < 2 {
+		t.Fatalf("resolver calls = %d, want re-resolution after the RPC failure", resolver.calls)
+	}
+	if out := logs.String(); !strings.Contains(out, `"getCompactionJob failed; will reconnect"`) {
+		t.Fatalf("RPC failure not logged:\n%s", out)
 	}
 }
 

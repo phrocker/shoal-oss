@@ -26,7 +26,10 @@
 //     /accumulo/<uuid>/managers/lock), the same lookup Java's
 //     ExternalCompactionUtil.findCompactionCoordinator performs.
 //  3. Dial that address over Thrift, multiplexed under "coordinator",
-//     in the manager process.
+//     in the manager process. Both the handshake (-connect-timeout) and
+//     every subsequent read/write (-rpc-timeout) are bounded, so a
+//     manager that accepts the connection and then goes silent cannot
+//     pin the pool to a dead primary.
 //  4. Loop:
 //     a. Generate a fresh externalCompactionId (ECID).
 //     b. Call getCompactionJob(group, host:port, ecid).
@@ -38,7 +41,9 @@
 // no manager holds the lock the lookup returns
 // zk.ErrCoordinatorUnavailable and the loop backs off; once the new
 // primary manager publishes its descriptors the loop dials the new
-// address. Discovery never elects a coordinator — it only reads the
+// address; a wedged connection is dropped once its RPC timeout fires,
+// which is what lets a mid-poll failover be picked up at all.
+// Discovery never elects a coordinator — it only reads the
 // address the manager itself published, so the manager stays the sole
 // authority over which process coordinates compactions.
 //
@@ -123,6 +128,8 @@ func main() {
 	user := flag.String("user", "root", "principal for the coordinator RPC (root-equivalent — same trust path Java compactor uses)")
 	password := flag.String("password", "", "password (prefer SHOAL_PASSWORD env)")
 	zkTimeout := flag.Duration("zk-timeout", 30*time.Second, "ZK session timeout")
+	connectTimeout := flag.Duration("connect-timeout", cclient.DefaultConnectTimeout, "cap on the TCP handshake to the coordinator; a manager that is unreachable at the network level fails fast so the address can be re-resolved")
+	rpcTimeout := flag.Duration("rpc-timeout", cclient.DefaultRPCTimeout, "cap on each coordinator read/write; bounds getCompactionJob against a manager that accepts the connection and then goes silent (Java's general.rpc.timeout)")
 	minWait := flag.Duration("min-wait", 1*time.Second, "minimum sleep when the coordinator has no job for this group")
 	maxWait := flag.Duration("max-wait", 30*time.Second, "maximum sleep when idle (backoff cap)")
 	logLevel := flag.String("log-level", "info", "slog level: debug, info, warn, error")
@@ -194,9 +201,16 @@ func main() {
 		cancel()
 	}()
 
+	dialOpts := cclient.DialOptions{
+		ConnectTimeout: *connectTimeout,
+		RPCTimeout:     *rpcTimeout,
+	}
+
 	runPollLoop(ctx, logger, pollConfig{
-		resolver:        resolver,
-		dial:            dialCoordinator,
+		resolver: resolver,
+		dial: func(ctx context.Context, addr, instanceID, accumuloVersion string) (coordinatorConn, error) {
+			return dialCoordinator(ctx, addr, instanceID, accumuloVersion, dialOpts)
+		},
 		instanceID:      loc.InstanceID(),
 		accumuloVersion: *accVersion,
 		groupName:       *groupName,
@@ -257,8 +271,12 @@ func (c coordinatorClientConn) Raw() compactioncoordinator.CompactionCoordinator
 	return c.CoordinatorClient.Raw()
 }
 
-func dialCoordinator(addr, instanceID, accumuloVersion string) (coordinatorConn, error) {
-	cc, err := cclient.DialCoordinator(addr, instanceID, accumuloVersion)
+func dialCoordinator(
+	ctx context.Context,
+	addr, instanceID, accumuloVersion string,
+	opts cclient.DialOptions,
+) (coordinatorConn, error) {
+	cc, err := cclient.DialCoordinator(ctx, addr, instanceID, accumuloVersion, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -267,7 +285,7 @@ func dialCoordinator(addr, instanceID, accumuloVersion string) (coordinatorConn,
 
 type pollConfig struct {
 	resolver        coordinatorResolver
-	dial            func(addr, instanceID, accumuloVersion string) (coordinatorConn, error)
+	dial            func(ctx context.Context, addr, instanceID, accumuloVersion string) (coordinatorConn, error)
 	instanceID      string
 	accumuloVersion string
 	groupName       string
@@ -329,7 +347,7 @@ func runPollLoop(ctx context.Context, logger *slog.Logger, cfg pollConfig) {
 			lastAddr = addr
 		}
 
-		cc, err := cfg.dial(addr, cfg.instanceID, cfg.accumuloVersion)
+		cc, err := cfg.dial(ctx, addr, cfg.instanceID, cfg.accumuloVersion)
 		if err != nil {
 			recovering = true
 			logger.Warn("coordinator dial failed; backing off",
@@ -350,7 +368,22 @@ func runPollLoop(ctx context.Context, logger *slog.Logger, cfg pollConfig) {
 		// One connection, drain jobs until the coordinator says "no work"
 		// or the transport errors. On any transport failure, drop the
 		// connection and reconnect.
+		//
+		// Thrift transports are not context-aware once a call is in
+		// flight: an RPC to a manager that accepted the connection and
+		// then went silent only unblocks when the socket timeout fires.
+		// Closing the transport from a watcher makes cancellation
+		// immediate, so SIGTERM never has to wait out -rpc-timeout.
+		watcherDone := make(chan struct{})
+		go func() {
+			select {
+			case <-ctx.Done():
+				_ = cc.Close()
+			case <-watcherDone:
+			}
+		}()
 		idle := drainCoordinator(ctx, logger, cc, cfg)
+		close(watcherDone)
 		_ = cc.Close()
 
 		if ctx.Err() != nil {
