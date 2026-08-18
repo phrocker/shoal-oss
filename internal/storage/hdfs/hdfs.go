@@ -67,6 +67,9 @@ type Backend struct {
 	authority string
 }
 
+// Authority returns the configured namenode authority, if any.
+func (b *Backend) Authority() string { return b.authority }
+
 // New constructs a Backend for a namenode address such as "namenode:8020" or
 // "hdfs://namenode:8020". The colinmarc/hdfs default configuration and
 // authentication behavior apply when New creates the client.

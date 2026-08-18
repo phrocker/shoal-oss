@@ -11,8 +11,13 @@ import (
 
 	"github.com/phrocker/shoal/accumulo"
 	"github.com/phrocker/shoal/internal/engine"
+	shstorage "github.com/phrocker/shoal/internal/storage"
+	"github.com/phrocker/shoal/internal/storage/azure"
+	"github.com/phrocker/shoal/internal/storage/gcs"
+	"github.com/phrocker/shoal/internal/storage/hdfs"
 	"github.com/phrocker/shoal/internal/storage/local"
 	"github.com/phrocker/shoal/internal/storage/memory"
+	"github.com/phrocker/shoal/internal/storage/s3"
 )
 
 func TestStageBulkDirFlattensCopiesAndWritesLoadMapping(t *testing.T) {
@@ -309,6 +314,71 @@ func TestStagePathsAlias(t *testing.T) {
 	}
 }
 
+func TestStagePathsAliasBackendCanonicalization(t *testing.T) {
+	hdfsBackend := newTestHDFSBackend(t, "hdfs://nn:8020")
+
+	tests := []struct {
+		name       string
+		srcBackend shstorage.Backend
+		srcPath    string
+		dstBackend shstorage.Backend
+		dstPath    string
+		want       bool
+	}{
+		{
+			name:       "s3 scheme-less aliases qualified path",
+			srcBackend: &s3.Backend{},
+			srcPath:    "bucket/path/F0001.rf",
+			dstBackend: &s3.Backend{},
+			dstPath:    "s3://bucket/path/F0001.rf",
+			want:       true,
+		},
+		{
+			name:       "gcs scheme-less aliases qualified path",
+			srcBackend: &gcs.Backend{},
+			srcPath:    "bucket/path/F0001.rf",
+			dstBackend: &gcs.Backend{},
+			dstPath:    "gs://bucket/path/F0001.rf",
+			want:       true,
+		},
+		{
+			name:       "azure scheme-less aliases qualified path",
+			srcBackend: &azure.Backend{},
+			srcPath:    "container/path/F0001.rf",
+			dstBackend: &azure.Backend{},
+			dstPath:    "az://container/path/F0001.rf",
+			want:       true,
+		},
+		{
+			name:       "hdfs authorityless aliases qualified path on same backend",
+			srcBackend: hdfsBackend,
+			srcPath:    "/tables/1.rf",
+			dstBackend: hdfsBackend,
+			dstPath:    "hdfs://nn:8020/tables/1.rf",
+			want:       true,
+		},
+		{
+			name:       "local path does not alias s3 object spelling",
+			srcBackend: local.New(),
+			srcPath:    "bucket/path/F0001.rf",
+			dstBackend: &s3.Backend{},
+			dstPath:    "s3://bucket/path/F0001.rf",
+			want:       false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := stagePathsAliasOnBackends(tt.srcBackend, tt.srcPath, tt.dstBackend, tt.dstPath); got != tt.want {
+				t.Fatalf(
+					"stagePathsAliasOnBackends(%T, %q, %T, %q) = %v, want %v",
+					tt.srcBackend, tt.srcPath, tt.dstBackend, tt.dstPath, got, tt.want,
+				)
+			}
+		})
+	}
+}
+
 // TestStagePathsAliasPhysicalIdentity covers the cases a purely lexical
 // path comparison misses: an absolute path and an equivalent relative
 // path (resolved against the process's working directory, exactly as
@@ -490,6 +560,106 @@ func TestStageBulkDirRejectsCrossFileAliasBeforeCopying(t *testing.T) {
 	}
 }
 
+func TestStageBulkDirRejectsSymlinkedWriteTargetsBeforeCopying(t *testing.T) {
+	root := t.TempDir()
+	exportDir := filepath.Join(root, "export")
+	bulkDir := filepath.Join(root, "bulk")
+	if err := os.MkdirAll(exportDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(bulkDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	aPath := filepath.Join(exportDir, "A.rf")
+	bPath := filepath.Join(exportDir, "B.rf")
+	aContent := []byte("A source bytes that must survive a rejected stage")
+	bContent := []byte("B source bytes that must survive a rejected stage")
+	if err := os.WriteFile(aPath, aContent, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(bPath, bContent, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	manifest := localManifestFromFiles(t, aPath, bPath)
+	aDstPath := filepath.Join(bulkDir, "A.rf")
+	bDstPath := filepath.Join(bulkDir, "B.rf")
+	if err := os.Symlink(bDstPath, aDstPath); err != nil {
+		t.Skipf("symlink not supported in this environment: %v", err)
+	}
+
+	be := local.New()
+	if _, err := StageBulkDir(context.Background(), be, manifest, be, bulkDir); err == nil {
+		t.Fatal("StageBulkDir with a symlinked write target = nil error, want error")
+	}
+
+	gotA, err := os.ReadFile(aPath)
+	if err != nil {
+		t.Fatalf("source file A missing after rejected stage: %v", err)
+	}
+	if string(gotA) != string(aContent) {
+		t.Fatalf("source file A corrupted by rejected stage: got %q, want %q", gotA, aContent)
+	}
+	gotB, err := os.ReadFile(bPath)
+	if err != nil {
+		t.Fatalf("source file B missing after rejected stage: %v", err)
+	}
+	if string(gotB) != string(bContent) {
+		t.Fatalf("source file B corrupted by rejected stage: got %q, want %q", gotB, bContent)
+	}
+	if _, err := os.Stat(bDstPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("symlink target unexpectedly exists after rejected stage: err=%v", err)
+	}
+}
+
+func TestStageBulkDirRejectsLoadMapAliasBeforeCopying(t *testing.T) {
+	root := t.TempDir()
+	exportDir := filepath.Join(root, "export")
+	bulkDir := filepath.Join(root, "bulk")
+	if err := os.MkdirAll(exportDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(bulkDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	srcPath := filepath.Join(exportDir, "F0001.rf")
+	content := []byte("source bytes that must survive a rejected loadmap alias stage")
+	if err := os.WriteFile(srcPath, content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	manifest := localManifestFromFiles(t, srcPath)
+
+	loadmapPath := filepath.Join(bulkDir, "loadmap.json")
+	if err := os.Link(srcPath, loadmapPath); err != nil {
+		t.Fatalf("Link(loadmap alias): %v", err)
+	}
+
+	be := local.New()
+	if _, err := StageBulkDir(context.Background(), be, manifest, be, bulkDir); err == nil {
+		t.Fatal("StageBulkDir with loadmap.json aliasing the source = nil error, want error")
+	}
+
+	got, err := os.ReadFile(srcPath)
+	if err != nil {
+		t.Fatalf("source file missing after rejected loadmap alias stage: %v", err)
+	}
+	if string(got) != string(content) {
+		t.Fatalf("source file corrupted by rejected loadmap alias stage: got %q, want %q", got, content)
+	}
+	gotLoadmap, err := os.ReadFile(loadmapPath)
+	if err != nil {
+		t.Fatalf("loadmap alias missing after rejected stage: %v", err)
+	}
+	if string(gotLoadmap) != string(content) {
+		t.Fatalf("loadmap alias content changed after rejected stage: got %q, want %q", gotLoadmap, content)
+	}
+	if _, err := os.Stat(filepath.Join(bulkDir, "F0001.rf")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("staged file exists after rejected loadmap alias stage: err=%v, want not-exist", err)
+	}
+}
+
 // TestPathIdentityCacheMemoizesStatResults proves pathIdentityCache
 // actually memoizes: checkNoStagingAliases's O(N^2) all-pairs comparison
 // only stays cheap in filesystem-syscall terms if repeated stat calls for
@@ -506,7 +676,7 @@ func TestPathIdentityCacheMemoizesStatResults(t *testing.T) {
 			t.Fatalf("WriteFile: %v", err)
 		}
 
-		cache := make(pathIdentityCache)
+		cache := newPathIdentityCache(1)
 		first := cache.stat(path)
 		if first == nil {
 			t.Fatalf("stat(%q) = nil, want a FileInfo for an existing file", path)
@@ -532,7 +702,7 @@ func TestPathIdentityCacheMemoizesStatResults(t *testing.T) {
 		dir := t.TempDir()
 		path := filepath.Join(dir, "does-not-exist-yet.rf")
 
-		cache := make(pathIdentityCache)
+		cache := newPathIdentityCache(1)
 		first := cache.stat(path)
 		if first != nil {
 			t.Fatalf("stat(%q) = %v, want nil for a nonexistent file", path, first)
@@ -757,3 +927,49 @@ func TestStageBulkDirRejectsCaseInsensitiveAliasBeforeCopying(t *testing.T) {
 		t.Fatalf("source file a.rf corrupted by rejected stage: got %q, want %q", gotLower, lowerContent)
 	}
 }
+
+func localManifestFromFiles(t *testing.T, paths ...string) *engine.RFileExportManifest {
+	t.Helper()
+
+	rfiles := make([]engine.RFileExportFile, 0, len(paths))
+	for _, srcPath := range paths {
+		data, err := os.ReadFile(srcPath)
+		if err != nil {
+			t.Fatalf("ReadFile(%q): %v", srcPath, err)
+		}
+		sum := sha256.Sum256(data)
+		rfiles = append(rfiles, engine.RFileExportFile{
+			TabletIndex:     0,
+			DestinationPath: srcPath,
+			Size:            int64(len(data)),
+			SHA256:          hex.EncodeToString(sum[:]),
+		})
+	}
+
+	return &engine.RFileExportManifest{
+		Version:     engine.RFileExportManifestVersion,
+		SourceTable: "events",
+		Tablets:     []engine.RFileExportTablet{{Index: 0}},
+		RFiles:      rfiles,
+	}
+}
+
+func newTestHDFSBackend(t *testing.T, address string) *hdfs.Backend {
+	t.Helper()
+
+	backend, err := hdfs.New(address, hdfs.WithClient(noopHDFSClient{}))
+	if err != nil {
+		t.Fatalf("hdfs.New(%q): %v", address, err)
+	}
+	return backend
+}
+
+type noopHDFSClient struct{}
+
+func (noopHDFSClient) Open(string) (hdfs.Reader, error)        { return nil, errors.New("unused") }
+func (noopHDFSClient) Create(string) (shstorage.Writer, error) { return nil, errors.New("unused") }
+func (noopHDFSClient) MkdirAll(string, os.FileMode) error      { return errors.New("unused") }
+func (noopHDFSClient) ReadDir(string) ([]os.FileInfo, error)   { return nil, errors.New("unused") }
+func (noopHDFSClient) Remove(string) error                     { return errors.New("unused") }
+func (noopHDFSClient) Rename(string, string) error             { return errors.New("unused") }
+func (noopHDFSClient) Close() error                            { return nil }
