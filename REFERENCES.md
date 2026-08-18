@@ -107,6 +107,32 @@ cribs land.
 - `core/src/main/thrift/security.thrift` — `TCredentials`
 - `core/src/main/thrift/client.thrift` — `TInfo`
 
+### Cluster status (issue #96)
+- Apache Accumulo revision
+  `317c288568e9c46e7854aafb8bb8c4fda6260b12`:
+  - `core/src/main/thrift/manager.thrift` — authoritative
+    `ManagerClientService.getManagerStats`, `ManagerMonitorInfo`,
+    `TabletServerStatus`, `TableInfo`, `Compacting`, `RecoveryStatus`,
+    `DeadServer`, `TabletLoadState`, `ManagerState`, and
+    `ManagerGoalState` wire definitions.
+  - `core/src/main/java/org/apache/accumulo/core/rpc/clients/ManagerThriftClient.java`
+    and `core/.../rpc/clients/ThriftClientTypes.java` — Manager client and
+    multiplexed `mgr` service selection.
+- Sharkbite revision `7f2625f74331b0cd4a75dc0484949c40f1409686`:
+  - `include/data/constructs/coordinator/AccumuloInfo.h`,
+    `TableInfo.h`, and `TabletServerStatus.h` — legacy status model.
+  - `src/python/pysharkbite.cpp` status bindings and
+    `examples/pythonstats.py` / `docs/stats.rst` — the
+    `AccumuloConnector.getStatistics` compatibility surface represented by
+    SB-STAT-001 through SB-STAT-037.
+- Shoal uses Accumulo 4's current schema rather than inventing removed wire
+  values. In particular, Accumulo 4 no longer reports the legacy
+  major-compaction count; `TableCompactions.Majors` is therefore always nil.
+  Accumulo 4 additionally reports index-cache requests, server version,
+  response time, and dead-server resource group, which Shoal preserves.
+  `DeadServer.LastContact` maps Accumulo 4's `lastStatus` field. Python
+  `dynamic_attr` behavior (SB-STAT-038) is intentionally outside the Go API.
+
 ### Wire protocol
 - `core/.../rpc/AccumuloProtocolFactory.java`
   - `:49` `MAGIC_NUMBER = 0x41434355` ("ACCU" — A=41, C=43, C=43, U=55)

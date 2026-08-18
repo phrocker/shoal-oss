@@ -49,6 +49,57 @@ func TestPublicDiscoveryAPICompiles(t *testing.T) {
 	}
 }
 
+func TestPublicClusterStatusAPICompiles(t *testing.T) {
+	var _ func(*accumulo.Connector, context.Context) (accumulo.ClusterStatus, error) = (*accumulo.Connector).ClusterStatus
+	var _ func(*accumulo.Connector, context.Context) (accumulo.ClusterStatus, error) = (*accumulo.Connector).Statistics
+	var _ = accumulo.ClusterStatus{
+		TableMap: map[string]accumulo.TableInfo{
+			"1": {
+				Records: 1,
+				Rates: accumulo.TableRates{
+					IngestRate: 1, IngestByteRate: 2, QueryRate: 3, QueryByteRate: 4, ScanRate: 5,
+				},
+				Compactions: accumulo.TableCompactions{
+					Minors: &accumulo.Compacting{Running: 1, Queued: 2},
+				},
+			},
+		},
+		TabletServerInfo: []accumulo.TabletServerStatus{{
+			LogSorts: []accumulo.RecoveryStatus{{Name: "wal", RuntimeMillis: 1, Progress: 0.5}},
+		}},
+		BadTabletServers: map[string]accumulo.TabletLoadState{
+			"bad:9997": accumulo.TabletLoadStateLoadFailure,
+		},
+		State:     accumulo.ManagerStateNormal,
+		GoalState: accumulo.ManagerGoalStateNormal,
+		DeadTabletServers: []accumulo.DeadServer{{
+			Server: "dead:9997", ResourceGroup: "default",
+		}},
+	}
+	_ = accumulo.ManagerStateInitial
+	_ = accumulo.ManagerStateHaveLock
+	_ = accumulo.ManagerStateSafeMode
+	_ = accumulo.ManagerStateUnloadMetadataTablets
+	_ = accumulo.ManagerStateUnloadRootTablet
+	_ = accumulo.ManagerStateStop
+	_ = accumulo.CoordinatorStateInitial
+	_ = accumulo.CoordinatorStateHaveLock
+	_ = accumulo.CoordinatorStateSafeMode
+	_ = accumulo.CoordinatorStateNormal
+	_ = accumulo.CoordinatorStateUnloadMetadataTablets
+	_ = accumulo.CoordinatorStateUnloadRootTablet
+	_ = accumulo.CoordinatorStateStop
+	_ = accumulo.ManagerGoalStateCleanStop
+	_ = accumulo.ManagerGoalStateSafeMode
+	_ = accumulo.CoordinatorGoalStateCleanStop
+	_ = accumulo.CoordinatorGoalStateSafeMode
+	_ = accumulo.CoordinatorGoalStateNormal
+	_ = accumulo.TabletLoadStateLoaded
+	_ = accumulo.TabletLoadStateUnloaded
+	_ = accumulo.TabletLoadStateUnloadFailureNotServing
+	_ = accumulo.TabletLoadStateUnloadError
+}
+
 func TestPublicScannerAPICompiles(t *testing.T) {
 	instance, _ := accumulo.NewStaticInstance("accumulo", "uuid-1")
 	credentials, _ := accumulo.PasswordCredentials("root", []byte("secret"))

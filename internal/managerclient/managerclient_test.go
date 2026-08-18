@@ -839,6 +839,8 @@ func (r *fakeClientRPC) GetTableConfiguration(
 }
 
 type fakeManagerRPC struct {
+	stats          *manager.ManagerMonitorInfo
+	statsErr       error
 	initiateErr    error
 	waitFlushErr   error
 	setErr         error
@@ -855,6 +857,13 @@ type fakeManagerRPC struct {
 	flushWaitCalls atomic.Int32
 	setCalls       atomic.Int32
 	removeCalls    atomic.Int32
+}
+
+func (r *fakeManagerRPC) GetManagerStats(
+	_ context.Context,
+	_ *security.TCredentials,
+) (*manager.ManagerMonitorInfo, error) {
+	return r.stats, r.statsErr
 }
 
 func (r *fakeManagerRPC) InitiateFlush(

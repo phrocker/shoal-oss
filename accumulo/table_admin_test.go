@@ -111,8 +111,26 @@ type fakeManagerAdapter struct {
 	configuration    map[string]string
 	configurationFn  func(context.Context, string, string) (map[string]string, error)
 	configurationRPC []string
+	status           managerclient.MonitorInfo
+	statusFn         func(context.Context, string) (managerclient.MonitorInfo, error)
 	err              error
 	closed           int
+}
+
+func (m *fakeManagerAdapter) GetManagerStats(
+	ctx context.Context,
+	address string,
+) (managerclient.MonitorInfo, error) {
+	m.mu.Lock()
+	m.address = address
+	fn := m.statusFn
+	status := m.status
+	err := m.err
+	m.mu.Unlock()
+	if fn != nil {
+		return fn(ctx, address)
+	}
+	return status, err
 }
 
 type fakeFlushRequest struct {

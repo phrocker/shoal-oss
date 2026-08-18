@@ -97,6 +97,7 @@ func (e *Error) Error() string {
 type Adapter interface {
 	Execute(context.Context, string, Request) error
 	FlushTable(context.Context, string, string, bool) error
+	GetManagerStats(context.Context, string) (MonitorInfo, error)
 	GetTableConfiguration(context.Context, string, string) (map[string]string, error)
 	SetTableProperty(context.Context, string, string, string, string) error
 	RemoveTableProperty(context.Context, string, string, string) error
@@ -118,6 +119,7 @@ type fateRPC interface {
 type managerRPC interface {
 	InitiateFlush(context.Context, *security.TCredentials, string) (int64, error)
 	WaitForFlush(context.Context, *security.TCredentials, string, int64, int64) error
+	GetManagerStats(context.Context, *security.TCredentials) (*manager.ManagerMonitorInfo, error)
 	SetTableProperty(context.Context, *security.TCredentials, string, string, string) error
 	RemoveTableProperty(context.Context, *security.TCredentials, string, string) error
 }
@@ -283,6 +285,20 @@ func (p *Pooled) GetTableConfiguration(
 		return nil, mapRPCError(err)
 	}
 	return cloneOptions(properties), nil
+}
+
+func (p *Pooled) GetManagerStats(ctx context.Context, address string) (MonitorInfo, error) {
+	credentials, err := p.credentialsForRPC()
+	if err != nil {
+		return MonitorInfo{}, err
+	}
+	info, err := withManagerClient(p, ctx, address, func(rpc managerRPC) (*manager.ManagerMonitorInfo, error) {
+		return rpc.GetManagerStats(ctx, credentials)
+	})
+	if err != nil {
+		return MonitorInfo{}, mapRPCError(err)
+	}
+	return monitorInfoFromThrift(info)
 }
 
 func (p *Pooled) RemoveTableProperty(
@@ -505,6 +521,13 @@ func (r thriftManagerRPC) InitiateFlush(
 	tableID string,
 ) (int64, error) {
 	return r.raw.InitiateFlush(ctx, &clientgen.TInfo{}, credentials, tableID)
+}
+
+func (r thriftManagerRPC) GetManagerStats(
+	ctx context.Context,
+	credentials *security.TCredentials,
+) (*manager.ManagerMonitorInfo, error) {
+	return r.raw.GetManagerStats(ctx, &clientgen.TInfo{}, credentials)
 }
 
 func (r thriftManagerRPC) WaitForFlush(
@@ -765,8 +788,7 @@ func shouldInvalidateTransport(err error) bool {
 }
 
 // IsRetryableEndpointError reports whether an RPC failed before receiving a
-// valid application response and can be retried against another advertised
-// ClientService endpoint.
+// valid application response and can be retried against another endpoint.
 func IsRetryableEndpointError(err error) bool {
 	if err == nil ||
 		errors.Is(err, context.Canceled) ||
