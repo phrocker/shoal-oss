@@ -244,8 +244,15 @@ func (h *serveHandle) Stop(ctx context.Context) {
 		go func() {
 			defer httpDone.Done()
 			if err := h.httpSrv.Shutdown(ctx); err != nil {
-				if err == context.DeadlineExceeded {
-					h.logger.Warn("drain deadline exceeded; forcing http close")
+				// http.Server.Shutdown returns ctx.Err() (either
+				// DeadlineExceeded or, for a caller-cancelable ctx,
+				// Canceled) if ctx is done before every connection
+				// finishes closing gracefully. Force-close on either —
+				// checking only for DeadlineExceeded would leave active
+				// HTTP handlers/connections open past an explicit cancel,
+				// letting Stop return with the HTTP surface still up.
+				if ctx.Err() != nil {
+					h.logger.Warn("drain deadline exceeded or canceled; forcing http close", slog.String("err", err.Error()))
 					_ = h.httpSrv.Close()
 				} else {
 					h.logger.Warn("observability server shutdown", slog.String("err", err.Error()))
@@ -293,7 +300,7 @@ func (h *serveHandle) Stop(ctx context.Context) {
 // drainTimeout — and does not return until that entire sequence, including
 // the final engine close, has completed.
 //
-// That last part fixes a real early-exit race: Serve only reflects
+// That covers one real early-exit race: Serve only reflects
 // grpc.Server's own internal stop bookkeeping — it says nothing about the
 // *additional* work this package's Stop wrapper does around that (waiting
 // for the HTTP server to finish shutting down, then closing the engine).
@@ -301,32 +308,61 @@ func (h *serveHandle) Stop(ctx context.Context) {
 // non-cancellable unary RPC, when Serve returns. A caller that reacts to
 // Serve returning by exiting the process (returning from main, for
 // example) can therefore terminate every other goroutine, including the
-// one still finishing Stop, before that work is done. RunUntilSignal
-// waits for the shutdown sequence itself — Drain, quiesce, and Stop
-// returning — to finish before returning, so its caller never can.
+// one still finishing Stop, before that work is done.
+//
+// It also covers the same race from the other direction: Serve can return
+// a non-nil error *before* sigCh ever fires — either because the signal
+// arrives (or, as here, was already queued) early enough that this
+// method's own Drain/quiesce/Stop sequence stops the gRPC server before
+// Serve is even called (grpc.Server.Serve returns grpc.ErrServerStopped
+// immediately if the server is already stopped when it's invoked), or
+// because of a genuine, signal-independent fatal accept error. Both the
+// signal arriving and Serve returning are therefore raced against each
+// other explicitly, via select, rather than left to chance: Serve runs in
+// its own goroutine so a pending signal — even one already queued before
+// this method is called at all — can be observed without first waiting
+// for Serve's goroutine to be scheduled and to actually execute, so a
+// signal that raced ahead of Serve is reliably still recognized as the
+// reason for shutting down rather than mistaken for a Serve failure.
+// Whichever wins, this method runs the Drain/quiesce/Stop sequence
+// exactly once and always waits for it to fully finish — including the
+// engine close, and Serve's goroutine actually returning — before
+// returning, so a caller can never see this method return and exit while
+// that work is still in progress. A signal-triggered shutdown always
+// reports success (nil), even if Serve's own return raced into a non-nil
+// error as a side effect of that same shutdown; a genuinely
+// signal-independent Serve failure still reports its real error, after
+// the resulting Drain/Stop has completed so the engine and HTTP server
+// are never left open.
 func (h *serveHandle) RunUntilSignal(sigCh <-chan os.Signal, quiesce, drainTimeout time.Duration) error {
-	shutdownDone := make(chan struct{})
-	go func() {
-		defer close(shutdownDone)
-		<-sigCh
-		h.logger.Info("draining")
-		h.Drain()
-		if quiesce > 0 {
-			time.Sleep(quiesce)
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), drainTimeout)
-		defer cancel()
-		h.Stop(ctx)
-	}()
+	serveErrCh := make(chan error, 1)
+	go func() { serveErrCh <- h.Serve() }()
 
-	err := h.Serve()
-	if err == nil {
-		// Serve only returns nil once the gRPC listener has been stopped,
-		// which in this function only happens after sigCh fires above —
-		// wait for that goroutine to actually finish Stop (HTTP shutdown
-		// and engine close included) before returning, per the doc
-		// comment.
-		<-shutdownDone
+	var serveErr error
+	signaled := false
+	select {
+	case <-sigCh:
+		signaled = true
+	case serveErr = <-serveErrCh:
 	}
-	return err
+
+	h.logger.Info("draining")
+	h.Drain()
+	if quiesce > 0 {
+		time.Sleep(quiesce)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), drainTimeout)
+	defer cancel()
+	h.Stop(ctx)
+
+	if !signaled {
+		return serveErr
+	}
+	// The signal branch above never consumed serveErrCh. Stop's
+	// GracefulStop/Stop calls guarantee Serve returns shortly if it
+	// hasn't already, so this always resolves promptly — wait for it so
+	// this method doesn't return until Serve's goroutine, including the
+	// HTTP accept loop it starts, has actually exited too.
+	<-serveErrCh
+	return nil
 }

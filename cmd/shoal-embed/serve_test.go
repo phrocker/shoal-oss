@@ -533,6 +533,175 @@ func TestUnaryInFlightInterceptorTracksActiveCalls(t *testing.T) {
 	}
 }
 
+// TestStopForceClosesHTTPOnCanceledContext guards a real bug: http.Server.
+// Shutdown(ctx) returns ctx.Err() — which can be either context.
+// DeadlineExceeded or context.Canceled — once ctx is done, even if active
+// connections haven't finished closing gracefully on their own yet. Stop
+// used to force-close the HTTP server only when that error was exactly
+// context.DeadlineExceeded, so an explicitly-canceled (rather than merely
+// expired) ctx left an in-flight request/connection open indefinitely
+// instead of being force-closed, letting Stop return with the HTTP
+// surface still up.
+func TestStopForceClosesHTTPOnCanceledContext(t *testing.T) {
+	h, serveErrCh := newTestServeHandle(t)
+	waitForStatus(t, "http://"+h.MetricsAddr+"/readyz", http.StatusOK).Body.Close()
+
+	orig := h.httpSrv.Handler
+	requestReceived := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseFn := func() { releaseOnce.Do(func() { close(release) }) }
+	defer releaseFn()
+	h.httpSrv.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/__test_slow__" {
+			close(requestReceived)
+			<-release
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		orig.ServeHTTP(w, r)
+	})
+
+	// A stuck request keeps an HTTP connection "active" (never idle), so
+	// Shutdown cannot complete gracefully on its own and must wait for ctx
+	// — forcing Stop to decide what to do when ctx ends instead of racing
+	// a shutdown that would have finished on its own regardless.
+	slowResultCh := make(chan error, 1)
+	go func() {
+		resp, err := http.Get("http://" + h.MetricsAddr + "/__test_slow__")
+		if err == nil {
+			resp.Body.Close()
+		}
+		slowResultCh <- err
+	}()
+	<-requestReceived
+
+	h.Drain()
+	// Already canceled, not merely time-limited — the exact case the
+	// fix's ctx.Err() check (rather than an err == context.DeadlineExceeded
+	// equality check) is needed for.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	stopDone := make(chan struct{})
+	go func() {
+		h.Stop(ctx)
+		close(stopDone)
+	}()
+
+	select {
+	case <-stopDone:
+	case <-time.After(5 * time.Second):
+		releaseFn()
+		t.Fatal("Stop did not return within 5s of an already-canceled ctx")
+	}
+
+	// http.Server.Shutdown closes the listener as its very first step
+	// regardless of what happens next, so a fresh connection attempt would
+	// fail either way and can't distinguish the fix from the bug. What
+	// only the fix does is force-close the *already-accepted, still
+	// in-flight* connection: releasing the stuck handler now must not let
+	// its response reach the client cleanly. Under the bug, Shutdown's
+	// context.Canceled error was only logged, the connection was left
+	// alone, and the client below would instead observe a normal 200.
+	releaseFn()
+	select {
+	case err := <-slowResultCh:
+		if err == nil {
+			t.Error("GET /__test_slow__ completed successfully after Stop with an already-canceled ctx, want a connection error (HTTP server should have force-closed the still in-flight connection)")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("slow request goroutine did not finish within 5s of releasing the handler")
+	}
+
+	select {
+	case <-serveErrCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Serve did not return within 5s of a forced Stop")
+	}
+}
+
+// TestRunUntilSignalRunsFullShutdownWhenServeFailsWithoutASignal guards a
+// real early-exit bug: the pre-fix RunUntilSignal only waited for the
+// Drain/quiesce/Stop sequence when Serve returned nil, so a Serve failure
+// with no signal involved at all returned that error immediately without
+// ever draining, stopping, or closing the engine — abandoning the HTTP
+// server and engine open instead of cleanly closing them before
+// propagating the failure. This forces that scenario deterministically —
+// grpc.Server.Serve returns grpc.ErrServerStopped immediately if the
+// server was already stopped before Serve was ever invoked — rather than
+// relying on a real, timing-dependent accept failure.
+func TestRunUntilSignalRunsFullShutdownWhenServeFailsWithoutASignal(t *testing.T) {
+	h := newRawTestServeHandle(t)
+	h.grpcSrv.GracefulStop()
+
+	sigCh := make(chan os.Signal, 1) // deliberately never signaled
+
+	runErrCh := make(chan error, 1)
+	go func() { runErrCh <- h.RunUntilSignal(sigCh, 0, 5*time.Second) }()
+
+	select {
+	case err := <-runErrCh:
+		if err != grpc.ErrServerStopped {
+			t.Errorf("RunUntilSignal returned %v, want grpc.ErrServerStopped (Serve's real, signal-independent failure)", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("RunUntilSignal did not return within 5s")
+	}
+
+	// The full Drain/Stop sequence must still have run even though Serve
+	// failed entirely on its own: the HTTP listener, which this test
+	// never touched directly, can only be closed if it did.
+	if _, err := http.Get("http://" + h.MetricsAddr + "/readyz"); err == nil {
+		t.Error("GET /readyz succeeded after RunUntilSignal returned, want connection error (Stop should have closed the HTTP listener even on a signal-independent Serve failure)")
+	}
+}
+
+// TestRunUntilSignalReportsCleanShutdownWhenSignalRacesServeFailure guards
+// the other half of the same early-exit bug, from the opposite direction:
+// a signal-triggered shutdown is a clean, expected outcome even if Serve's
+// own return races into a non-nil error as a side effect of that very
+// shutdown — concretely, if this method's own Stop call (triggered by the
+// signal) happens to stop the gRPC server before Serve is ever invoked,
+// Serve returns grpc.ErrServerStopped despite nothing having actually gone
+// wrong. The pre-fix code treated any non-nil Serve error as fatal
+// (returning it immediately, without even waiting for the shutdown
+// sequence to run), which would have made a perfectly normal shutdown look
+// like a crash — exactly backwards from what a caller like cmdServe, which
+// calls die()/os.Exit(1) on a non-nil error, needs. This test reproduces
+// the race deterministically instead of relying on signal-delivery timing:
+// it forces Serve to fail via the same pre-stopped-server trick as above,
+// and queues the shutdown signal before RunUntilSignal is even called, so
+// the signal is reliably observed before Serve's goroutine can be
+// scheduled to run and report its (spurious, in this case) failure.
+func TestRunUntilSignalReportsCleanShutdownWhenSignalRacesServeFailure(t *testing.T) {
+	h := newRawTestServeHandle(t)
+	h.grpcSrv.GracefulStop()
+
+	sigCh := make(chan os.Signal, 1)
+	sigCh <- syscall.SIGTERM // already queued before RunUntilSignal starts
+
+	runErrCh := make(chan error, 1)
+	go func() { runErrCh <- h.RunUntilSignal(sigCh, 0, 5*time.Second) }()
+
+	select {
+	case err := <-runErrCh:
+		if err != nil {
+			t.Errorf("RunUntilSignal returned %v, want nil — a signal-triggered shutdown must report success even when Serve's own return raced ahead into grpc.ErrServerStopped as a side effect of that same shutdown", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("RunUntilSignal did not return within 5s")
+	}
+
+	// The full Drain/Stop sequence — not just the pre-forced gRPC stop —
+	// must actually have run: Stop closes the HTTP listener, which this
+	// test never touched directly, so it can only be closed if the real
+	// sequence executed.
+	if _, err := http.Get("http://" + h.MetricsAddr + "/readyz"); err == nil {
+		t.Error("GET /readyz succeeded after RunUntilSignal returned, want connection error (Stop's real shutdown sequence should have closed the HTTP listener)")
+	}
+}
+
 // TestStartServeWithoutMetricsAddressDisablesHTTPSurface guards the fix for
 // a real deployability regression: shoal-embed serve used to bind the
 // observability HTTP port unconditionally, which would have broken any
