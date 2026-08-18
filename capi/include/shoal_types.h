@@ -188,9 +188,11 @@ typedef struct shoal_range_bound {
  * All pointer fields are borrowed for the duration of
  * shoal_connector_create. The library copies every value it retains.
  *
- * Set struct_size with shoal_connector_config_init or sizeof(*config). Future
- * ABI versions may append fields; version 1 readers ignore bytes beyond the
- * known structure.
+ * shoal_connector_config_init initializes only the V1 prefix and sets
+ * struct_size to SHOAL_CONNECTOR_CONFIG_V1_SIZE. Callers using appended fields
+ * must initialize their full structure and set struct_size = sizeof(*config).
+ * Future ABI versions may append fields; version 1 readers ignore bytes beyond
+ * the known structure.
  */
 typedef struct shoal_connector_config {
   uint32_t struct_size;
@@ -213,9 +215,11 @@ typedef struct shoal_connector_config {
               sizeof(((shoal_connector_config *)0)->dial_timeout_ms)))
 
 /*
- * Set struct_size with shoal_scanner_config_init or sizeof(*config). Future
- * ABI versions may append fields; version 1 readers ignore bytes beyond the
- * known structure.
+ * shoal_scanner_config_init initializes only the V1 prefix and sets struct_size
+ * to SHOAL_SCANNER_CONFIG_V1_SIZE. Callers using appended fields must
+ * initialize their full structure and set struct_size = sizeof(*config).
+ * Future ABI versions may append fields; version 1 readers ignore bytes beyond
+ * the known structure.
  *
  * Exactly one of table_name and table_id must be non-NULL and non-empty.
  * Arrays and all memory they reference are borrowed only during scanner
@@ -241,9 +245,10 @@ typedef struct shoal_scanner_config {
               sizeof(((shoal_scanner_config *)0)->use_multi_scan)))
 
 /*
- * Set struct_size with shoal_range_init or sizeof(*range). Future ABI
- * versions may append fields; version 1 readers ignore bytes beyond the known
- * structure.
+ * shoal_range_init initializes only the V1 prefix and sets struct_size to
+ * SHOAL_RANGE_V1_SIZE. Callers using appended fields must initialize their
+ * full structure and set struct_size = sizeof(*range). Future ABI versions may
+ * append fields; version 1 readers ignore bytes beyond the known structure.
  *
  * ROW bounds include/exclude an entire row. KEY bounds use full Accumulo key
  * ordering. A range may not mix ROW and KEY bound kinds, though either side
@@ -295,9 +300,11 @@ enum {
 };
 
 /*
- * Set struct_size with shoal_batch_writer_config_init or sizeof(*config).
- * Future ABI versions may append fields; version 1 readers ignore bytes
- * beyond the known structure.
+ * shoal_batch_writer_config_init initializes only the V1 prefix and sets
+ * struct_size to SHOAL_BATCH_WRITER_CONFIG_V1_SIZE. Callers using appended
+ * fields must initialize their full structure and set
+ * struct_size = sizeof(*config). Future ABI versions may append fields;
+ * version 1 readers ignore bytes beyond the known structure.
  */
 typedef struct shoal_batch_writer_config {
   uint32_t struct_size;

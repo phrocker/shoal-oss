@@ -49,6 +49,43 @@ static void expect_error(shoal_status status, shoal_status expected,
   assert(*error == NULL);
 }
 
+static void expect_v1_init(const void *value, size_t allocation_size,
+                           uint32_t v1_size) {
+  const uint8_t *bytes = (const uint8_t *)value;
+  uint32_t struct_size = 0;
+  memcpy(&struct_size, value, sizeof(struct_size));
+  assert(struct_size == v1_size);
+  for (size_t i = sizeof(struct_size); i < v1_size; ++i) {
+    assert(bytes[i] == 0);
+  }
+  for (size_t i = v1_size; i < allocation_size; ++i) {
+    assert(bytes[i] == UINT8_C(0xa5));
+  }
+}
+
+static void test_v1_initializers(void) {
+#define CHECK_V1_INIT(type, init, v1_size)                                   \
+  do {                                                                       \
+    struct {                                                                 \
+      type value;                                                            \
+      uint8_t guard[16];                                                     \
+    } allocation;                                                            \
+    memset(&allocation, 0xa5, sizeof(allocation));                            \
+    init(&allocation.value);                                                 \
+    expect_v1_init(&allocation.value, sizeof(allocation), v1_size);           \
+  } while (0)
+
+  CHECK_V1_INIT(shoal_connector_config, shoal_connector_config_init,
+                SHOAL_CONNECTOR_CONFIG_V1_SIZE);
+  CHECK_V1_INIT(shoal_scanner_config, shoal_scanner_config_init,
+                SHOAL_SCANNER_CONFIG_V1_SIZE);
+  CHECK_V1_INIT(shoal_range, shoal_range_init, SHOAL_RANGE_V1_SIZE);
+  CHECK_V1_INIT(shoal_batch_writer_config, shoal_batch_writer_config_init,
+                SHOAL_BATCH_WRITER_CONFIG_V1_SIZE);
+
+#undef CHECK_V1_INIT
+}
+
 int main(void) {
   shoal_connector *connector = NULL;
   shoal_connector *admin_connector = NULL;
@@ -62,6 +99,7 @@ int main(void) {
   shoal_table_properties_result *properties = NULL;
   shoal_error *error = NULL;
 
+  test_v1_initializers();
   assert(shoal_abi_version() == SHOAL_ABI_VERSION);
   assert(shoal_abi_version_major() == SHOAL_ABI_VERSION_MAJOR);
   assert(shoal_abi_version_minor() == SHOAL_ABI_VERSION_MINOR);
@@ -92,8 +130,7 @@ int main(void) {
 
   shoal_connector_config config;
   shoal_connector_config_init(&config);
-  assert(config.struct_size == sizeof(config));
-  assert(config.struct_size >= SHOAL_CONNECTOR_CONFIG_V1_SIZE);
+  assert(config.struct_size == SHOAL_CONNECTOR_CONFIG_V1_SIZE);
 
   config.bootstrap = SHOAL_BOOTSTRAP_STATIC;
   config.instance_name = "accumulo";
@@ -223,8 +260,7 @@ int main(void) {
 
   shoal_scanner_config scanner_config;
   shoal_scanner_config_init(&scanner_config);
-  assert(scanner_config.struct_size == sizeof(scanner_config));
-  assert(scanner_config.struct_size >= SHOAL_SCANNER_CONFIG_V1_SIZE);
+  assert(scanner_config.struct_size == SHOAL_SCANNER_CONFIG_V1_SIZE);
   scanner_config.table_name = "events";
 
   expect_error(
@@ -261,8 +297,7 @@ int main(void) {
 
   shoal_range range;
   shoal_range_init(&range);
-  assert(range.struct_size == sizeof(range));
-  assert(range.struct_size >= SHOAL_RANGE_V1_SIZE);
+  assert(range.struct_size == SHOAL_RANGE_V1_SIZE);
 
   assert(shoal_scan_result_count(NULL) == 0);
   expect_error(shoal_scan_result_get(NULL, 0, NULL, &error),
@@ -279,8 +314,7 @@ int main(void) {
 
   shoal_batch_writer_config writer_config;
   shoal_batch_writer_config_init(&writer_config);
-  assert(writer_config.struct_size == sizeof(writer_config));
-  assert(writer_config.struct_size >= SHOAL_BATCH_WRITER_CONFIG_V1_SIZE);
+  assert(writer_config.struct_size == SHOAL_BATCH_WRITER_CONFIG_V1_SIZE);
   writer_config.table_name = "events";
   uint32_t writer_config_size = writer_config.struct_size;
   writer_config.struct_size = SHOAL_BATCH_WRITER_CONFIG_V1_SIZE - 1;

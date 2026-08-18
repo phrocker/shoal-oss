@@ -15,7 +15,10 @@ SHOAL_API uint32_t SHOAL_CALL shoal_abi_version(void);
 
 /*
  * These queries are deterministic, allocation-free, thread-safe, and valid
- * before any connector or other handle is created.
+ * before any connector or other handle is created. When a caller may run
+ * against an older library, every additive symbol not guaranteed by that
+ * library must be dynamically resolved before use. Capability checks govern
+ * feature availability but do not make hard symbol references load-safe.
  */
 SHOAL_API uint32_t SHOAL_CALL shoal_abi_version_major(void);
 SHOAL_API uint32_t SHOAL_CALL shoal_abi_version_minor(void);

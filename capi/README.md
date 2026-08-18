@@ -28,8 +28,8 @@ Shoal separates **ABI compatibility** from **feature availability**:
   `SHOAL_ABI_VERSION_PACKED`, and the matching runtime queries provide a
   stable allocation-free version tuple that works before connector creation.
   `SHOAL_ABI_VERSION_PACKED` uses
-  `SHOAL_ABI_PACK_VERSION(major, minor, patch)` with an `0x00MMmmpp` layout,
-  so ABI `1.0.0` is `0x00010000`.
+  `SHOAL_ABI_PACK_VERSION(major, minor, patch)` with a hexadecimal
+  `0x00MMmmpp` layout, so ABI `1.0.0` is `0x00010000`.
 - Capability identifiers are append-only. Existing IDs and bits never change
   meaning. `shoal_abi_capability_word_count()` reports how many 64-bit words
   the current library uses, `shoal_abi_capability_word(i)` returns `0` for
@@ -60,21 +60,24 @@ Compatibility rules:
 - Older headers with newer libraries are safe: additive symbols, capability
   IDs, and trailing struct fields do not change existing numeric values or
   layouts.
-- Newer headers with older **post-discovery** libraries are safe when callers
-  check the reported capability words/IDs and treat missing words or IDs as
-  unavailable.
+- Newer headers with older libraries require dynamic resolution of every
+  optional additive symbol before use, followed by the corresponding
+  capability check where one exists. A capability check alone cannot make a
+  hard symbol reference load-safe on Windows or with eager ELF binding.
 - Libraries that predate this discovery surface do not export the new version
-  and capability symbols. Load those symbols dynamically when mixing library
-  vintages; a missing symbol means "pre-discovery library", not "feature
-  supported".
+  and capability symbols, so those queries must also be resolved dynamically
+  when mixing library vintages. A missing discovery symbol means
+  "pre-discovery library", not "feature supported".
 
-All forward-compatible input structs start with `uint32_t struct_size`. Call
-the matching `*_init` helper or set `struct_size = sizeof(struct)` from the
-header you compiled against. Future ABI revisions may append fields only at
-the end. Libraries must continue accepting the smallest prefix they actually
-read (today the `*_V1_SIZE` constants) and must ignore trailing bytes from
-newer callers. Existing fields must never be reordered, removed, or assigned
-new meanings.
+All forward-compatible input structs start with `uint32_t struct_size`. The
+existing `*_init` helpers initialize and advertise only their V1 prefix, so a
+newer library never writes beyond an older caller's allocation. Callers using
+fields appended after V1 must initialize their full structure and set
+`struct_size = sizeof(struct)` from the header they compiled against. Future
+ABI revisions may append fields only at the end. Libraries must continue
+accepting the smallest prefix they actually read (today the `*_V1_SIZE`
+constants) and must ignore trailing bytes from newer callers. Existing fields
+must never be reordered, removed, or assigned new meanings.
 
 Version numbers change only when the public ABI contract changes:
 
