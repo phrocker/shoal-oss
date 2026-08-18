@@ -126,7 +126,7 @@ func TestOwnedBatchWriterCloseCancelsAndJoinsActiveCalls(t *testing.T) {
 		add:   func(context.Context, *accumulo.Mutation) error { return nil },
 		flush: func(context.Context) error { return nil },
 		close: func(context.Context) error { return nil },
-	})
+	}, nil)
 	ctx, done, err := writer.begin(0)
 	if err != nil {
 		t.Fatal(err)
@@ -170,7 +170,7 @@ func TestOwnedBatchWriterCloseDeadlineBoundsActiveWait(t *testing.T) {
 		add:   func(context.Context, *accumulo.Mutation) error { return nil },
 		flush: func(context.Context) error { return nil },
 		close: func(context.Context) error { return nil },
-	})
+	}, nil)
 	ctx, done, err := writer.begin(0)
 	if err != nil {
 		t.Fatal(err)
@@ -186,6 +186,23 @@ func TestOwnedBatchWriterCloseDeadlineBoundsActiveWait(t *testing.T) {
 	}
 	if !errors.Is(ctx.Err(), context.Canceled) {
 		t.Fatalf("active context error = %v, want canceled", ctx.Err())
+	}
+	done()
+	if err := writer.close(time.Second); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("repeated close error = %v, want sticky deadline", err)
+	}
+}
+
+func TestOwnedBatchWriterRejectsOperationsAfterConnectorClose(t *testing.T) {
+	owner := &ownedConnector{}
+	owner.closed.Store(true)
+	writer := newOwnedBatchWriter(&fakeCAPIWriter{
+		add:   func(context.Context, *accumulo.Mutation) error { return nil },
+		flush: func(context.Context) error { return nil },
+		close: func(context.Context) error { return nil },
+	}, owner)
+	if _, _, err := writer.begin(0); !errors.Is(err, accumulo.ErrConnectorClosed) {
+		t.Fatalf("begin error = %v, want connector closed", err)
 	}
 }
 

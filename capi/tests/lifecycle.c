@@ -118,6 +118,12 @@ int main(void) {
   assert(writer_config.struct_size == sizeof(writer_config));
   assert(writer_config.struct_size >= SHOAL_BATCH_WRITER_CONFIG_V1_SIZE);
   writer_config.table_name = "events";
+  uint32_t writer_config_size = writer_config.struct_size;
+  writer_config.struct_size = SHOAL_BATCH_WRITER_CONFIG_V1_SIZE - 1;
+  expect_error(shoal_connector_create_batch_writer(
+                   connector, &writer_config, &writer, &error),
+               SHOAL_STATUS_INVALID_ARGUMENT, &error, "struct_size");
+  writer_config.struct_size = writer_config_size;
   expect_error(shoal_connector_create_batch_writer(
                    connector, &writer_config, &writer, &error),
                SHOAL_STATUS_DISCOVERY_UNAVAILABLE, &error,
@@ -222,6 +228,14 @@ int main(void) {
                SHOAL_STATUS_DEADLINE_EXCEEDED, &error, "deadline exceeded");
   expect_error(shoal_batch_writer_close(writer, 1000, &write_failure, &error),
                SHOAL_STATUS_DEADLINE_EXCEEDED, &error, "deadline exceeded");
+  shoal_batch_writer_free(&writer);
+
+  assert(shoal_test_batch_writer_create(SHOAL_TEST_WRITER_CONNECTOR_CLOSED,
+                                        &writer));
+  expect_error(shoal_batch_writer_add(writer, mutation, 0, &write_failure,
+                                      &error),
+               SHOAL_STATUS_CLOSED, &error, "connector is closed");
+  assert(write_failure == NULL);
   shoal_batch_writer_free(&writer);
 
   shoal_mutation_free(&mutation);

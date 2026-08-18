@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/phrocker/shoal/accumulo"
@@ -14,13 +15,19 @@ type ownedConnector struct {
 	instance  accumulo.Instance
 	once      sync.Once
 	closeErr  error
+	closed    atomic.Bool
 }
 
 func (c *ownedConnector) close() error {
+	c.closed.Store(true)
 	c.once.Do(func() {
 		c.closeErr = errors.Join(c.connector.Close(), c.instance.Close())
 	})
 	return c.closeErr
+}
+
+func (c *ownedConnector) isClosed() bool {
+	return c != nil && c.closed.Load()
 }
 
 type connectorRegistry struct {
@@ -268,6 +275,7 @@ type batchWriterAPI interface {
 
 type ownedBatchWriter struct {
 	writer batchWriterAPI
+	owner  *ownedConnector
 
 	mu      sync.Mutex
 	closed  bool
@@ -275,13 +283,17 @@ type ownedBatchWriter struct {
 	cancels map[uint64]context.CancelFunc
 	active  int
 	idle    chan struct{}
+
+	closeOnce sync.Once
+	closeErr  error
 }
 
-func newOwnedBatchWriter(writer batchWriterAPI) *ownedBatchWriter {
+func newOwnedBatchWriter(writer batchWriterAPI, owner *ownedConnector) *ownedBatchWriter {
 	idle := make(chan struct{})
 	close(idle)
 	return &ownedBatchWriter{
 		writer:  writer,
+		owner:   owner,
 		nextID:  1,
 		cancels: make(map[uint64]context.CancelFunc),
 		idle:    idle,
@@ -293,6 +305,10 @@ func (w *ownedBatchWriter) begin(timeout time.Duration) (context.Context, func()
 	if w.closed {
 		w.mu.Unlock()
 		return nil, nil, accumulo.ErrBatchWriterClosed
+	}
+	if w.owner.isClosed() {
+		w.mu.Unlock()
+		return nil, nil, accumulo.ErrConnectorClosed
 	}
 	var id uint64
 	for attempts := uint64(0); attempts < ^uint64(0); attempts++ {
@@ -343,6 +359,13 @@ func (w *ownedBatchWriter) begin(timeout time.Duration) (context.Context, func()
 }
 
 func (w *ownedBatchWriter) close(timeout time.Duration) error {
+	w.closeOnce.Do(func() {
+		w.closeErr = w.closeFirst(timeout)
+	})
+	return w.closeErr
+}
+
+func (w *ownedBatchWriter) closeFirst(timeout time.Duration) error {
 	var ctx context.Context
 	var cancel context.CancelFunc
 	if timeout == 0 {
@@ -364,9 +387,23 @@ func (w *ownedBatchWriter) close(timeout time.Duration) error {
 	select {
 	case <-idle:
 	case <-ctx.Done():
+		go w.finishCloseAfterTimeout(idle)
 		return ctx.Err()
 	}
 	return w.writer.Close(ctx)
+}
+
+func (w *ownedBatchWriter) finishCloseAfterTimeout(idle <-chan struct{}) {
+	timer := time.NewTimer(batchWriterFreeTimeout)
+	defer timer.Stop()
+	select {
+	case <-idle:
+	case <-timer.C:
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), batchWriterFreeTimeout)
+	defer cancel()
+	_ = w.writer.Close(ctx)
 }
 
 type batchWriterRegistry struct {

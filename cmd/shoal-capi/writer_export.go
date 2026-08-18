@@ -232,7 +232,7 @@ func shoal_connector_create_batch_writer(
 	if err != nil {
 		return failForError(outError, err)
 	}
-	owned := newOwnedBatchWriter(writer)
+	owned := newOwnedBatchWriter(writer, connector)
 	id, ok := batchWriters.add(owned)
 	if !ok {
 		_ = owned.close(batchWriterFreeTimeout)

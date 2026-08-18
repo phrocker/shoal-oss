@@ -90,10 +90,15 @@ func shoal_test_batch_writer_create(
 	}
 	*outWriter = nil
 	if mode < C.SHOAL_TEST_WRITER_SUCCESS ||
-		mode > C.SHOAL_TEST_WRITER_STICKY_DEADLINE {
+		mode > C.SHOAL_TEST_WRITER_CONNECTOR_CLOSED {
 		return 0
 	}
-	owned := newOwnedBatchWriter(&testBatchWriter{mode: int(mode)})
+	var owner *ownedConnector
+	if mode == C.SHOAL_TEST_WRITER_CONNECTOR_CLOSED {
+		owner = &ownedConnector{}
+		owner.closed.Store(true)
+	}
+	owned := newOwnedBatchWriter(&testBatchWriter{mode: int(mode)}, owner)
 	id, ok := batchWriters.add(owned)
 	if !ok {
 		return 0
