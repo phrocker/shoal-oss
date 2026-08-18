@@ -3,6 +3,7 @@ package promotion
 import (
 	"fmt"
 	"net/url"
+	pathpkg "path"
 	"path/filepath"
 	"strings"
 
@@ -56,6 +57,9 @@ func isBackendRootOnBackend(dst storage.Backend, bulkDir string) bool {
 		if err != nil {
 			return false
 		}
+		if strings.EqualFold(storage.ExplicitPathScheme(dst, bulkDir), "hdfs") {
+			return hdfsURIPathIsRoot(u.Path)
+		}
 		return strings.Trim(u.Path, "/\\") == ""
 	}
 	if isWindowsDriveRootPath(bulkDir) {
@@ -68,4 +72,12 @@ func isBackendRootOnBackend(dst storage.Backend, bulkDir string) bool {
 	}
 	vol := filepath.VolumeName(clean)
 	return vol != "" && clean == vol+sep
+}
+
+func hdfsURIPathIsRoot(rawPath string) bool {
+	cleaned := pathpkg.Clean(rawPath)
+	if cleaned == "." || cleaned == "" {
+		cleaned = "/"
+	}
+	return strings.Trim(cleaned, "/\\") == ""
 }

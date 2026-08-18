@@ -7,8 +7,10 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/phrocker/shoal/internal/engine"
@@ -17,6 +19,13 @@ import (
 	"github.com/phrocker/shoal/internal/storage/gcs"
 	"github.com/phrocker/shoal/internal/storage/hdfs"
 	"github.com/phrocker/shoal/internal/storage/s3"
+)
+
+var (
+	parseS3Path            = s3.ParsePath
+	parseGCSPath           = gcs.ParsePath
+	parseAzurePath         = azure.ParsePath
+	parseCanonicalHDFSPath = url.Parse
 )
 
 // StageBulkDir copies every RFile referenced by manifest from src (the
@@ -294,8 +303,8 @@ func canonicalStageSource(members []engine.RFileExportFile) (engine.RFileExportF
 }
 
 func sourceRefsAlias(left, right stagePathRef, cache pathIdentityCache) bool {
-	leftCanonical, leftCanonicalOK := canonicalBackendPath(left)
-	rightCanonical, rightCanonicalOK := canonicalBackendPath(right)
+	leftCanonical, leftCanonicalOK := cache.canonicalPath(left)
+	rightCanonical, rightCanonicalOK := cache.canonicalPath(right)
 	if leftCanonicalOK || rightCanonicalOK {
 		return leftCanonicalOK && rightCanonicalOK && leftCanonical == rightCanonical
 	}
@@ -337,11 +346,13 @@ func stagePathsAliasOnBackends(src storage.Backend, srcPath string, dst storage.
 	)
 }
 
-// pathIdentityCache memoizes local-filesystem identity probes by path so
-// callers comparing many paths against each other (checkNoStagingAliases,
-// dedupeStageSources) stat each unique path once, resolve each local path's
-// existing-parent symlink prefixes once, and compute each publication key
-// once rather than re-walking the same paths on every comparison. A cached
+// pathIdentityCache memoizes local-filesystem identity probes and remote
+// canonical path identities by path so callers comparing many paths against
+// each other (checkNoStagingAliases, dedupeStageSources) stat each unique
+// local path once, resolve each local path's existing-parent symlink
+// prefixes once, compute each publication key once, and parse each remote
+// path into its canonical backend-aware identity once rather than
+// re-walking or re-parsing the same inputs on every comparison. A cached
 // nil FileInfo means the path could not be stat'd (most commonly because it
 // doesn't exist yet); that's distinct from "not yet looked up," so failed
 // stats are cached too rather than retried.
@@ -349,6 +360,7 @@ type pathIdentityCache struct {
 	stats              map[string]os.FileInfo
 	resolvedLocalPaths map[string]string
 	publicationKeys    map[string]string
+	canonicalPaths     map[canonicalPathCacheKey]canonicalPathIdentity
 }
 
 func newPathIdentityCache(capacity int) pathIdentityCache {
@@ -356,7 +368,18 @@ func newPathIdentityCache(capacity int) pathIdentityCache {
 		stats:              make(map[string]os.FileInfo, capacity),
 		resolvedLocalPaths: make(map[string]string, capacity),
 		publicationKeys:    make(map[string]string, capacity),
+		canonicalPaths:     make(map[canonicalPathCacheKey]canonicalPathIdentity, capacity),
 	}
+}
+
+type canonicalPathCacheKey struct {
+	backend string
+	path    string
+}
+
+type canonicalPathIdentity struct {
+	value string
+	ok    bool
 }
 
 func (c pathIdentityCache) stat(path string) os.FileInfo {
@@ -403,6 +426,31 @@ func (c pathIdentityCache) resolvedLocalPath(path string) string {
 	return resolved
 }
 
+func (c pathIdentityCache) canonicalPath(ref stagePathRef) (string, bool) {
+	key := canonicalPathCacheKey{
+		backend: canonicalPathBackendKey(ref.backend),
+		path:    ref.path,
+	}
+	if identity, cached := c.canonicalPaths[key]; cached {
+		return identity.value, identity.ok
+	}
+	value, ok := canonicalBackendPath(ref)
+	c.canonicalPaths[key] = canonicalPathIdentity{value: value, ok: ok}
+	return value, ok
+}
+
+func canonicalPathBackendKey(backend storage.Backend) string {
+	backend = unwrapBackend(backend)
+	if backend == nil {
+		return "<nil>"
+	}
+	value := reflect.ValueOf(backend)
+	if value.Kind() == reflect.Pointer && !value.IsNil() {
+		return value.Type().String() + ":" + strconv.FormatUint(uint64(value.Pointer()), 16)
+	}
+	return fmt.Sprintf("%T:%#v", backend, backend)
+}
+
 // pathsAlias is StageBulkDir's alias detector, factored out so
 // checkNoStagingAliases's O(N^2) comparison can share one
 // pathIdentityCache across every call instead of stat'ing the same
@@ -419,8 +467,8 @@ func (c pathIdentityCache) resolvedLocalPath(path string) string {
 // back to os.Stat + os.SameFile so existing symlink/hardlink aliases are
 // caught too.
 func pathsAlias(srcPath, dstPath stagePathRef, cache pathIdentityCache) bool {
-	srcCanonical, srcCanonicalOK := canonicalBackendPath(srcPath)
-	dstCanonical, dstCanonicalOK := canonicalBackendPath(dstPath)
+	srcCanonical, srcCanonicalOK := cache.canonicalPath(srcPath)
+	dstCanonical, dstCanonicalOK := cache.canonicalPath(dstPath)
 	if srcCanonicalOK || dstCanonicalOK {
 		return srcCanonicalOK && dstCanonicalOK && srcCanonical == dstCanonical
 	}
@@ -662,7 +710,7 @@ func canonicalBackendPath(ref stagePathRef) (string, bool) {
 }
 
 func canonicalS3Path(path string) (string, bool) {
-	bucket, key, err := s3.ParsePath(path)
+	bucket, key, err := parseS3Path(path)
 	if err != nil {
 		return "", false
 	}
@@ -670,7 +718,7 @@ func canonicalS3Path(path string) (string, bool) {
 }
 
 func canonicalGCSPath(path string) (string, bool) {
-	bucket, object, err := gcs.ParsePath(path)
+	bucket, object, err := parseGCSPath(path)
 	if err != nil {
 		return "", false
 	}
@@ -678,7 +726,7 @@ func canonicalGCSPath(path string) (string, bool) {
 }
 
 func canonicalAzurePath(path string) (string, bool) {
-	container, blob, err := azure.ParsePath(path)
+	container, blob, err := parseAzurePath(path)
 	if err != nil {
 		return "", false
 	}
@@ -693,7 +741,7 @@ func canonicalHDFSPath(objectPath, authorityHint string) (string, bool) {
 		return canonicalHDFSString(authorityHint, path.Clean(objectPath)), true
 	}
 
-	u, err := url.Parse(objectPath)
+	u, err := parseCanonicalHDFSPath(objectPath)
 	if err != nil {
 		return "", false
 	}
