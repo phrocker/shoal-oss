@@ -307,3 +307,122 @@ func TestStagePathsAlias(t *testing.T) {
 		})
 	}
 }
+
+// TestStagePathsAliasPhysicalIdentity covers the cases a purely lexical
+// path comparison misses: an absolute path and an equivalent relative
+// path (resolved against the process's working directory, exactly as
+// os.Open/os.OpenFile would) naming the same file, and a symlink naming
+// the same file as its target. Both must still be detected as aliasing
+// so StageBulkDir doesn't truncate the source through a path form the
+// string comparison alone doesn't recognize.
+func TestStagePathsAliasPhysicalIdentity(t *testing.T) {
+	t.Run("absolute path aliases equivalent relative path", func(t *testing.T) {
+		dir := t.TempDir()
+		absPath := filepath.Join(dir, "F0001.rf")
+		if err := os.WriteFile(absPath, []byte("data"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		t.Chdir(dir)
+		relPath := "F0001.rf"
+
+		if !stagePathsAlias(absPath, relPath) {
+			t.Fatalf("stagePathsAlias(%q, %q) = false, want true (same physical file via absolute vs. relative path)", absPath, relPath)
+		}
+	})
+
+	t.Run("symlink aliases its target", func(t *testing.T) {
+		dir := t.TempDir()
+		realPath := filepath.Join(dir, "F0001.rf")
+		if err := os.WriteFile(realPath, []byte("data"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		linkPath := filepath.Join(dir, "F0001-link.rf")
+		if err := os.Symlink(realPath, linkPath); err != nil {
+			t.Skipf("symlink not supported in this environment: %v", err)
+		}
+
+		if !stagePathsAlias(realPath, linkPath) {
+			t.Fatalf("stagePathsAlias(%q, %q) = false, want true (same physical file via symlink)", realPath, linkPath)
+		}
+	})
+
+	t.Run("distinct files are not aliased", func(t *testing.T) {
+		dir := t.TempDir()
+		aPath := filepath.Join(dir, "a.rf")
+		bPath := filepath.Join(dir, "b.rf")
+		if err := os.WriteFile(aPath, []byte("a"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(bPath, []byte("b"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		if stagePathsAlias(aPath, bPath) {
+			t.Fatalf("stagePathsAlias(%q, %q) = true, want false (distinct files that happen to both exist)", aPath, bPath)
+		}
+	})
+
+	t.Run("nonexistent destination is not aliased", func(t *testing.T) {
+		dir := t.TempDir()
+		srcPath := filepath.Join(dir, "F0001.rf")
+		if err := os.WriteFile(srcPath, []byte("data"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		dstPath := filepath.Join(dir, "bulk", "F0001.rf")
+
+		if stagePathsAlias(srcPath, dstPath) {
+			t.Fatalf("stagePathsAlias(%q, %q) = true, want false (destination doesn't exist yet)", srcPath, dstPath)
+		}
+	})
+}
+
+// TestStageBulkDirRejectsInPlaceBulkDirViaRelativePath proves the alias
+// guard still catches an aliased bulkDir when it's expressed as a path
+// string that is lexically different from the manifest's absolute
+// DestinationPath — here, bulkDir is passed as a path relative to the
+// process's working directory that happens to resolve to the same
+// physical tablet directory the RFile was exported to. A purely lexical
+// comparison (the pre-fix behavior) would miss this and let
+// storage.Copy truncate the source in place.
+func TestStageBulkDirRejectsInPlaceBulkDirViaRelativePath(t *testing.T) {
+	root := t.TempDir()
+	tabletDir := filepath.Join(root, "export", "events", "t-0000")
+	if err := os.MkdirAll(tabletDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	srcPath := filepath.Join(tabletDir, "F0001.rf")
+	content := []byte("original rfile bytes that must survive a rejected in-place stage")
+	if err := os.WriteFile(srcPath, content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(content)
+
+	manifest := &engine.RFileExportManifest{
+		Version:     engine.RFileExportManifestVersion,
+		SourceTable: "events",
+		Tablets:     []engine.RFileExportTablet{{Index: 0}},
+		RFiles: []engine.RFileExportFile{
+			{TabletIndex: 0, DestinationPath: srcPath, Size: int64(len(content)), SHA256: hex.EncodeToString(sum[:])},
+		},
+	}
+
+	// The manifest's DestinationPath is absolute; pass bulkDir as an
+	// equivalent path relative to root instead, to prove the guard
+	// doesn't depend on both sides sharing the same path form.
+	t.Chdir(root)
+	relBulkDir := filepath.Join("export", "events", "t-0000")
+
+	be := local.New()
+	ctx := context.Background()
+	if _, err := StageBulkDir(ctx, be, manifest, be, relBulkDir); err == nil {
+		t.Fatal("StageBulkDir with relative bulkDir aliasing the absolute source tablet dir = nil error, want error")
+	}
+
+	got, err := os.ReadFile(srcPath)
+	if err != nil {
+		t.Fatalf("source file missing after rejected in-place stage: %v", err)
+	}
+	if string(got) != string(content) {
+		t.Fatalf("source file corrupted by rejected in-place stage: got %d bytes, want %d bytes intact", len(got), len(content))
+	}
+}

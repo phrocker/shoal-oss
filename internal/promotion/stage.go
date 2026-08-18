@@ -3,6 +3,7 @@ package promotion
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 
@@ -106,15 +107,40 @@ func StageBulkDir(
 // dst are not guaranteed comparable (e.g. local.Backend is a stateless
 // zero-field struct, so two independently constructed instances are
 // indistinguishable by identity even when they really are "the same
-// backend"), so this intentionally compares path strings only: a false
-// positive — rejecting a harmless coincidental collision between two
-// genuinely different backends — is far cheaper than a false negative
-// that silently destroys the source export.
+// backend"), so path identity is decided by string/filesystem inspection
+// rather than backend identity: a false positive — rejecting a harmless
+// coincidental collision between two genuinely different backends — is
+// far cheaper than a false negative that silently destroys the source
+// export.
+//
+// URL-style paths (containing "://") have no local filesystem entry to
+// inspect, so those are compared as normalized strings only. Filesystem-
+// style paths are first compared the same way as a cheap common-case
+// check, then — because a purely lexical comparison misses an absolute
+// source path aliasing an equivalent relative destination path (or vice
+// versa), and misses a destination reached through a symlink or hard
+// link to the same source file — checked for physical identity via
+// os.Stat + os.SameFile, which both backends ultimately resolve through
+// (local.Backend.Open/Create pass paths straight to the os package). If
+// either path can't be stat'd (most commonly because dstPath doesn't
+// exist yet, the overwhelmingly common non-aliased case), that's decided
+// by the lexical result alone.
 func stagePathsAlias(srcPath, dstPath string) bool {
 	if strings.Contains(srcPath, "://") || strings.Contains(dstPath, "://") {
 		return strings.TrimRight(srcPath, `/\`) == strings.TrimRight(dstPath, `/\`)
 	}
-	return filepath.Clean(srcPath) == filepath.Clean(dstPath)
+	if filepath.Clean(srcPath) == filepath.Clean(dstPath) {
+		return true
+	}
+	srcInfo, err := os.Stat(srcPath)
+	if err != nil {
+		return false
+	}
+	dstInfo, err := os.Stat(dstPath)
+	if err != nil {
+		return false
+	}
+	return os.SameFile(srcInfo, dstInfo)
 }
 
 // flattenNames validates that every RFile's basename is unique once
