@@ -402,6 +402,50 @@ func TestPooledUpdateTabletMergeabilityPassesNameAndUpdates(t *testing.T) {
 	}
 }
 
+func TestPooledUpdateTabletMergeabilityKeepsConfirmedUpdatesOnCleanupFailure(t *testing.T) {
+	pool, err := transportpool.New(transportpool.Config{MaxIdlePerEndpoint: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+
+	pooled, err := NewPooled(pool, "uuid-1", "4.0.0-SNAPSHOT", &security.TCredentials{
+		Principal:      "root",
+		TokenClassName: "PasswordToken",
+		Token:          []byte("secret"),
+		InstanceId:     "uuid-1",
+	}, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cleanupErr := thrift.NewTTransportExceptionFromError(errors.New("close failed"))
+	rpc := &fakeSplitRPC{result: []TabletExtent{
+		{TableID: "1", EndRow: []byte("p"), PrevEndRow: []byte("k")},
+	}}
+	pooled.dial = func(context.Context, transportpool.Key) (io.Closer, error) {
+		return &fakeTransport{manager: rpc, closeErr: cleanupErr}, nil
+	}
+	pooled.newManagerClient = managerFromFakeTransport
+
+	updated, err := pooled.UpdateTabletMergeability(
+		context.Background(),
+		"manager:9997",
+		"events",
+		[]MergeabilityUpdate{{
+			Extent:       TabletExtent{TableID: "1", EndRow: []byte("p"), PrevEndRow: []byte("k")},
+			Mergeability: NeverMergeable(),
+		}},
+	)
+	if len(updated) != 1 || updated[0].TableID != "1" {
+		t.Fatalf("updated = %#v, want the confirmed extent", updated)
+	}
+	var postResponseErr *PostResponseCleanupError
+	if !errors.As(err, &postResponseErr) || !errors.Is(err, cleanupErr) {
+		t.Fatalf("error = %#v, want post-response cleanup error", err)
+	}
+}
+
 func TestPooledUpdateTabletMergeabilityValidatesAndMapsErrors(t *testing.T) {
 	pooled, pool := newTestPooled(t)
 	defer pool.Close()

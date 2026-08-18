@@ -805,6 +805,26 @@ func TestPooledSecuritySuccessPreservesPostResponseCleanupFailure(t *testing.T) 
 	}
 }
 
+func TestMapRPCErrorPreservesJoinedCleanupCause(t *testing.T) {
+	cleanupErr := thrift.NewTTransportExceptionFromError(errors.New("close failed"))
+
+	err := mapRPCError(errors.Join(
+		&clientgen.ThriftTableOperationException{
+			Type:      clientgen.TableOperationExceptionType_OFFLINE,
+			TableName: "events",
+		},
+		cleanupErr,
+	))
+
+	var managerErr *Error
+	if !errors.As(err, &managerErr) || managerErr.Kind != ErrorTableOffline {
+		t.Fatalf("error = %#v, want ErrorTableOffline", err)
+	}
+	if !errors.Is(err, cleanupErr) {
+		t.Fatalf("error = %v, want cleanup cause preserved", err)
+	}
+}
+
 func TestPooledSecurityRPCSelectionArgumentsAndCopies(t *testing.T) {
 	pooled, pool := newTestPooled(t)
 	defer pool.Close()

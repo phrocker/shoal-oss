@@ -90,7 +90,7 @@ func (p *Pooled) UpdateTabletMergeability(
 		return rpc.UpdateTabletMergeability(ctx, credentials, tableName, updates)
 	})
 	if err != nil {
-		return nil, mapRPCError(err)
+		return updated, mapRPCError(err)
 	}
 	return updated, nil
 }

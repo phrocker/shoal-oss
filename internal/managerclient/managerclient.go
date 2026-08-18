@@ -1303,6 +1303,26 @@ func mapRPCError(err error) error {
 	if err == nil {
 		return nil
 	}
+	type joinError interface {
+		Unwrap() []error
+	}
+	if joined, ok := err.(joinError); ok {
+		mapped := make([]error, 0, len(joined.Unwrap()))
+		for _, cause := range joined.Unwrap() {
+			if cause == nil {
+				continue
+			}
+			mapped = append(mapped, mapRPCError(cause))
+		}
+		switch len(mapped) {
+		case 0:
+			return nil
+		case 1:
+			return mapped[0]
+		default:
+			return errors.Join(mapped...)
+		}
+	}
 	var tableErr *clientgen.ThriftTableOperationException
 	if errors.As(err, &tableErr) {
 		kind := ErrorUnknown

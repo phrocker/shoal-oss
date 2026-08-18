@@ -233,8 +233,9 @@ func (w *scriptedTabletWalker) callCount() int {
 }
 
 type fakeTableStateReader struct {
-	states map[string]zk.TableStateResult
-	err    error
+	states  map[string]zk.TableStateResult
+	missing *zk.TableStateResult
+	err     error
 }
 
 func (r *fakeTableStateReader) TableState(
@@ -250,6 +251,9 @@ func (r *fakeTableStateReader) TableState(
 	if r != nil {
 		if state, ok := r.states[tableID]; ok {
 			return state, nil
+		}
+		if r.missing != nil {
+			return *r.missing, nil
 		}
 	}
 	return zk.TableStateResult{Exists: true, State: "ONLINE"}, nil
@@ -901,6 +905,47 @@ func TestAddTableSplitsMapsMissingTableAndDiscoveryFailures(t *testing.T) {
 	}
 }
 
+func TestAddTableSplitsRefreshesTableIDBeforeResolve(t *testing.T) {
+	walker := &scriptedTabletWalker{rounds: [][]metadata.TabletInfo{{{TableID: "fresh"}}}}
+	names := &fakeTableNames{
+		byName: map[string]string{"events": "stale"},
+		byID:   map[string]string{"stale": "events"},
+	}
+	refreshed := false
+	names.onInvalidate = func() {
+		names.mu.Lock()
+		defer names.mu.Unlock()
+		if refreshed {
+			return
+		}
+		refreshed = true
+		names.byName["events"] = "fresh"
+		delete(names.byID, "stale")
+		names.byID["fresh"] = "events"
+	}
+	missing := zk.TableStateResult{Exists: false}
+	state := &fakeTableStateReader{
+		states:  map[string]zk.TableStateResult{"fresh": {Exists: true, State: "ONLINE"}},
+		missing: &missing,
+	}
+	connector, manager := splitTestConnectorWithState(t, walker, names, state)
+
+	if err := connector.AddTableSplits(
+		context.Background(),
+		"events",
+		[][]byte{[]byte("m")},
+	); err != nil {
+		t.Fatal(err)
+	}
+	calls := manager.splitCalls()
+	if len(calls) != 1 {
+		t.Fatalf("split calls = %d, want 1", len(calls))
+	}
+	if string(calls[0].request.Arguments[0]) != "fresh" {
+		t.Fatalf("table ID argument = %q, want refreshed ID", calls[0].request.Arguments[0])
+	}
+}
+
 func TestAddTableSplitsValidatesInputs(t *testing.T) {
 	walker := &scriptedTabletWalker{rounds: [][]metadata.TabletInfo{splitTestTablets()}}
 	connector, manager := splitTestConnector(t, walker, splitTestNames())
@@ -1033,8 +1078,8 @@ func TestAddTableSplitsInvalidatesDiscoveryAfterAttempts(t *testing.T) {
 	); err != nil {
 		t.Fatal(err)
 	}
-	if names.invalidates != 1 {
-		t.Fatalf("name invalidations = %d, want 1", names.invalidates)
+	if names.invalidates != 2 {
+		t.Fatalf("name invalidations = %d, want 2", names.invalidates)
 	}
 	if len(connector.discovery.tablets.Snapshot("1")) != 0 {
 		t.Fatal("tablet cache survived a completed split")
@@ -1050,8 +1095,8 @@ func TestAddTableSplitsInvalidatesDiscoveryAfterAttempts(t *testing.T) {
 	); !errors.Is(err, ErrPermissionDenied) {
 		t.Fatal("expected the scripted permission failure")
 	}
-	if names.invalidates != 2 {
-		t.Fatalf("name invalidations = %d, want 2 after a failed split", names.invalidates)
+	if names.invalidates != 4 {
+		t.Fatalf("name invalidations = %d, want 4 after a failed split", names.invalidates)
 	}
 }
 
