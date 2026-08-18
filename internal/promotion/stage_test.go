@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"testing"
 
@@ -507,6 +508,43 @@ func TestPathUsesBackendSeparatorJoinAcceptsDeclaredSingleCharacterScheme(t *tes
 	}
 }
 
+func TestLocalBackendPathsOverrideBackendSchemeHeuristics(t *testing.T) {
+	tests := []struct {
+		name string
+		be   shstorage.Backend
+	}{
+		{name: "local backend", be: local.New()},
+		{
+			name: "diskcache wrapped local backend",
+			be: func() shstorage.Backend {
+				backend, err := diskcache.New(local.New(), filepath.Join(t.TempDir(), "cache"), 1<<20)
+				if err != nil {
+					t.Fatalf("diskcache.New: %v", err)
+				}
+				return backend
+			}(),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ref := stagePathRef{backend: tt.be, path: "hdfs:/bulk/F0001.rf"}
+			if !usesLocalFilesystemSemantics(ref) {
+				t.Fatalf("usesLocalFilesystemSemantics(%s) = false, want true for a known local backend", ref.path)
+			}
+			if scheme := explicitBackendSchemeOnBackend(tt.be, ref.path); scheme != "" {
+				t.Fatalf("explicitBackendSchemeOnBackend(%s) = %q, want empty for a known local backend", ref.path, scheme)
+			}
+			if _, ok := canonicalBackendPath(ref); ok {
+				t.Fatalf("canonicalBackendPath(%s) unexpectedly treated a known local backend path as remote", ref.path)
+			}
+			if pathUsesBackendSeparatorJoinOnBackend(tt.be, "hdfs:/bulk") {
+				t.Fatalf("pathUsesBackendSeparatorJoinOnBackend(hdfs:/bulk) = true, want false for a known local backend")
+			}
+		})
+	}
+}
+
 func TestJoinBulkPathPreservesDeclaredSingleCharacterSchemeRoot(t *testing.T) {
 	backend := schemeAwareBackend{Backend: memory.New(), schemes: []string{"x"}}
 	got := joinBulkPath(backend, "x://bucket/prefix", "F0001.rf")
@@ -722,6 +760,26 @@ func TestStagePathsAliasResolvesDanglingRelativeSymlinkChains(t *testing.T) {
 	}
 }
 
+func TestStagePathsAliasResolvesDanglingTargetParentSymlinkComponents(t *testing.T) {
+	root := t.TempDir()
+	bulkDir := filepath.Join(root, "bulk")
+	if err := os.MkdirAll(bulkDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(".", filepath.Join(bulkDir, "dirlink")); err != nil {
+		t.Skipf("symlink not supported in this environment: %v", err)
+	}
+	aPath := filepath.Join(bulkDir, "A.rf")
+	if err := os.Symlink(filepath.Join("dirlink", "B.rf"), aPath); err != nil {
+		t.Skipf("symlink not supported in this environment: %v", err)
+	}
+	bPath := filepath.Join(bulkDir, "B.rf")
+
+	if !stagePathsAlias(aPath, bPath) {
+		t.Fatalf("stagePathsAlias(%q, %q) = false, want true after resolving parent symlink components in a dangling final target", aPath, bPath)
+	}
+}
+
 // TestStageBulkDirRejectsInPlaceBulkDirViaRelativePath proves the alias
 // guard still catches an aliased bulkDir when it's expressed as a path
 // string that is lexically different from the manifest's absolute
@@ -770,6 +828,67 @@ func TestStageBulkDirRejectsInPlaceBulkDirViaRelativePath(t *testing.T) {
 	}
 	if string(got) != string(content) {
 		t.Fatalf("source file corrupted by rejected in-place stage: got %d bytes, want %d bytes intact", len(got), len(content))
+	}
+}
+
+func TestStageBulkDirRejectsHDFSSpelledLocalBulkDirAliasBeforeCopying(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("paths containing ':' are not valid local relative paths on Windows")
+	}
+
+	root := t.TempDir()
+	bulkDir := filepath.Join("hdfs:", "bulk")
+	tabletDir := filepath.Join(root, bulkDir)
+	if err := os.MkdirAll(tabletDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	srcPath := filepath.Join(tabletDir, "F0001.rf")
+	content := []byte("original rfile bytes that must survive a rejected hdfs:-spelled local in-place stage")
+	if err := os.WriteFile(srcPath, content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(content)
+	manifest := &engine.RFileExportManifest{
+		Version:     engine.RFileExportManifestVersion,
+		SourceTable: "events",
+		Tablets:     []engine.RFileExportTablet{{Index: 0}},
+		RFiles: []engine.RFileExportFile{
+			{TabletIndex: 0, DestinationPath: srcPath, Size: int64(len(content)), SHA256: hex.EncodeToString(sum[:])},
+		},
+	}
+
+	tests := []struct {
+		name string
+		src  func(t *testing.T) shstorage.Backend
+	}{
+		{name: "local source", src: func(t *testing.T) shstorage.Backend { return local.New() }},
+		{
+			name: "diskcache wrapped local source",
+			src: func(t *testing.T) shstorage.Backend {
+				backend, err := diskcache.New(local.New(), filepath.Join(root, "cache"), 1<<20)
+				if err != nil {
+					t.Fatalf("diskcache.New: %v", err)
+				}
+				return backend
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Chdir(root)
+			be := local.New()
+			if _, err := StageBulkDir(context.Background(), tt.src(t), manifest, be, bulkDir); err == nil {
+				t.Fatal("StageBulkDir with bulkDir hdfs:/bulk aliasing the local source tablet dir = nil error, want error")
+			}
+			got, err := os.ReadFile(srcPath)
+			if err != nil {
+				t.Fatalf("source file missing after rejected hdfs:-spelled local stage: %v", err)
+			}
+			if string(got) != string(content) {
+				t.Fatalf("source file corrupted by rejected hdfs:-spelled local stage: got %d bytes, want %d bytes intact", len(got), len(content))
+			}
+		})
 	}
 }
 
@@ -924,6 +1043,45 @@ func TestStageBulkDirRejectsDanglingFinalSymlinkChainAliasBeforeCopying(t *testi
 	}
 	if _, err := os.Stat(filepath.Join(bulkDir, "B.rf")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("dangling symlink target unexpectedly exists after rejected stage: err=%v", err)
+	}
+}
+
+func TestStageBulkDirRejectsDanglingFinalSymlinkTargetWithParentAliasBeforeCopying(t *testing.T) {
+	root := t.TempDir()
+	exportDir := filepath.Join(root, "export")
+	bulkDir := filepath.Join(root, "bulk")
+	if err := os.MkdirAll(exportDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(bulkDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	aPath := filepath.Join(exportDir, "A.rf")
+	bPath := filepath.Join(exportDir, "B.rf")
+	aContent := []byte("A source bytes")
+	bContent := []byte("B source bytes")
+	if err := os.WriteFile(aPath, aContent, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(bPath, bContent, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.Symlink(".", filepath.Join(bulkDir, "dirlink")); err != nil {
+		t.Skipf("symlink not supported in this environment: %v", err)
+	}
+	if err := os.Symlink(filepath.Join("dirlink", "B.rf"), filepath.Join(bulkDir, "A.rf")); err != nil {
+		t.Skipf("symlink not supported in this environment: %v", err)
+	}
+
+	manifest := localManifestFromFiles(t, aPath, bPath)
+	be := local.New()
+	if _, err := StageBulkDir(context.Background(), be, manifest, be, bulkDir); err == nil {
+		t.Fatal("StageBulkDir with A.rf symlinked to dirlink/B.rf where dirlink aliases bulkDir = nil error, want error")
+	}
+	if _, err := os.Stat(filepath.Join(bulkDir, "B.rf")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("symlink target unexpectedly exists after rejected stage: err=%v", err)
 	}
 }
 

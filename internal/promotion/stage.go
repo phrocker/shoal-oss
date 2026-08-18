@@ -15,7 +15,6 @@ import (
 	"github.com/phrocker/shoal/internal/storage/azure"
 	"github.com/phrocker/shoal/internal/storage/gcs"
 	"github.com/phrocker/shoal/internal/storage/hdfs"
-	"github.com/phrocker/shoal/internal/storage/local"
 	"github.com/phrocker/shoal/internal/storage/s3"
 )
 
@@ -447,29 +446,38 @@ func localPublicationKeysAlias(srcPath, dstPath string, cache pathIdentityCache)
 }
 
 func resolveExistingLocalPathPrefixes(path string) string {
-	path = normalizeLocalPathForAlias(path)
-	if !looksLikeWindowsDrivePath(path) && !filepath.IsAbs(path) {
-		if absPath, err := filepath.Abs(path); err == nil {
-			path = absPath
-		}
-	}
+	const maxSymlinkHops = 40
+	return resolveExistingLocalPathPrefixesWithState(path, &localPathResolutionState{
+		hopsRemaining: maxSymlinkHops,
+		seen:          make(map[string]struct{}),
+	})
+}
 
+type localPathResolutionState struct {
+	hopsRemaining int
+	seen          map[string]struct{}
+}
+
+func resolveExistingLocalPathPrefixesWithState(path string, state *localPathResolutionState) string {
+	path = normalizeLocalPathForResolution(path)
 	prefix, parts := splitLocalPath(path)
 	current := prefix
-	for i, part := range parts {
-		candidate := joinLocalPath(current, part)
+	for i := 0; i < len(parts); {
+		candidate := joinLocalPath(current, parts[i])
 		info, err := os.Lstat(candidate)
 		if err != nil {
 			return appendLocalPathParts(current, parts[i:])
 		}
 		if info.Mode()&os.ModeSymlink != 0 {
-			current = resolveLocalSymlinkPathLexically(candidate)
+			current = resolveLocalSymlinkPathLexically(candidate, state)
+			i++
 			continue
 		}
-		if !info.IsDir() && info.Mode()&os.ModeSymlink == 0 && i < len(parts)-1 {
+		if !info.IsDir() && i < len(parts)-1 {
 			return appendLocalPathParts(current, parts[i:])
 		}
 		current = candidate
+		i++
 	}
 	if current == "" {
 		return path
@@ -477,11 +485,13 @@ func resolveExistingLocalPathPrefixes(path string) string {
 	return current
 }
 
-func resolveLocalSymlinkPathLexically(path string) string {
-	const maxSymlinkHops = 40
-
-	current := normalizeLocalPathForAlias(path)
-	for hops := 0; hops < maxSymlinkHops; hops++ {
+func resolveLocalSymlinkPathLexically(path string, state *localPathResolutionState) string {
+	current := normalizeLocalPathForResolution(path)
+	for state.hopsRemaining > 0 {
+		if _, ok := state.seen[current]; ok {
+			return current
+		}
+		state.seen[current] = struct{}{}
 		target, err := os.Readlink(current)
 		if err != nil {
 			return current
@@ -489,13 +499,25 @@ func resolveLocalSymlinkPathLexically(path string) string {
 		if !filepath.IsAbs(target) {
 			target = filepath.Join(filepath.Dir(current), target)
 		}
-		current = normalizeLocalPathForAlias(target)
-		info, err := os.Lstat(current)
+		state.hopsRemaining--
+		target = resolveExistingLocalPathPrefixesWithState(target, state)
+		info, err := os.Lstat(target)
 		if err != nil || info.Mode()&os.ModeSymlink == 0 {
-			return current
+			return target
 		}
+		current = normalizeLocalPathForResolution(target)
 	}
 	return current
+}
+
+func normalizeLocalPathForResolution(path string) string {
+	path = normalizeLocalPathForAlias(path)
+	if !looksLikeWindowsDrivePath(path) && !filepath.IsAbs(path) {
+		if absPath, err := filepath.Abs(path); err == nil {
+			path = absPath
+		}
+	}
+	return path
 }
 
 func normalizeLocalPublicationPath(path string) string {
@@ -546,20 +568,26 @@ func appendLocalPathParts(prefix string, parts []string) string {
 }
 
 func usesLocalFilesystemSemantics(ref stagePathRef) bool {
-	if explicitBackendSchemeOnBackend(ref.backend, ref.path) != "" {
+	backend := unwrapBackend(ref.backend)
+	if storage.UsesLocalPathSemantics(backend) {
+		return true
+	}
+	if explicitBackendSchemeOnBackend(backend, ref.path) != "" {
 		return false
 	}
-	backend := unwrapBackend(ref.backend)
 	if backend == nil {
 		return true
 	}
-	_, ok := backend.(*local.Backend)
-	return ok
+	return false
 }
 
 func canonicalBackendPath(ref stagePathRef) (string, bool) {
-	scheme := explicitBackendSchemeOnBackend(ref.backend, ref.path)
-	switch b := unwrapBackend(ref.backend).(type) {
+	backend := unwrapBackend(ref.backend)
+	if storage.UsesLocalPathSemantics(backend) {
+		return "", false
+	}
+	scheme := explicitBackendSchemeOnBackend(backend, ref.path)
+	switch b := backend.(type) {
 	case *s3.Backend:
 		if scheme != "" && scheme != "s3" {
 			return "", false
