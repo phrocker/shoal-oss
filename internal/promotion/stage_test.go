@@ -488,3 +488,62 @@ func TestStageBulkDirRejectsCrossFileAliasBeforeCopying(t *testing.T) {
 		t.Fatalf("source file B corrupted by rejected stage: got %q, want %q", got, bContent)
 	}
 }
+
+// TestPathIdentityCacheMemoizesStatResults proves pathIdentityCache
+// actually memoizes: checkNoStagingAliases's O(N^2) all-pairs comparison
+// only stays cheap in filesystem-syscall terms if repeated stat calls for
+// the same path are served from cache rather than re-stat'ing. This is
+// verified indirectly (mutating the filesystem between two stat calls
+// for the same path and confirming the second call still reflects the
+// first, cached, result) since the cache sits directly in front of the
+// os package and cannot be swapped for a counting fake.
+func TestPathIdentityCacheMemoizesStatResults(t *testing.T) {
+	t.Run("a successful stat is served from cache after the file is removed", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "f.rf")
+		if err := os.WriteFile(path, []byte("data"), 0o644); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+
+		cache := make(pathIdentityCache)
+		first := cache.stat(path)
+		if first == nil {
+			t.Fatalf("stat(%q) = nil, want a FileInfo for an existing file", path)
+		}
+
+		if err := os.Remove(path); err != nil {
+			t.Fatalf("Remove: %v", err)
+		}
+		if _, err := os.Stat(path); err == nil {
+			t.Fatalf("path %q still exists after Remove; test setup invalid", path)
+		}
+
+		second := cache.stat(path)
+		if second == nil {
+			t.Fatalf("stat(%q) after removal = nil, want the cached pre-removal FileInfo (a fresh os.Stat would fail here)", path)
+		}
+		if second != first {
+			t.Fatalf("stat(%q) after removal returned a different FileInfo than the first call; cache was not reused", path)
+		}
+	})
+
+	t.Run("a failed stat is cached too, not retried", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "does-not-exist-yet.rf")
+
+		cache := make(pathIdentityCache)
+		first := cache.stat(path)
+		if first != nil {
+			t.Fatalf("stat(%q) = %v, want nil for a nonexistent file", path, first)
+		}
+
+		if err := os.WriteFile(path, []byte("data"), 0o644); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+
+		second := cache.stat(path)
+		if second != nil {
+			t.Fatalf("stat(%q) after later creating the file = %v, want the cached nil (a fresh os.Stat would now succeed)", path, second)
+		}
+	})
+}

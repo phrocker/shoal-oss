@@ -113,15 +113,25 @@ func StageBulkDir(
 // *different* manifest entry's source (for example via a symlink/hard
 // link), which would silently truncate that other file before it's ever
 // copied.
+//
+// The all-pairs comparison is O(N^2) in the number of unique source
+// paths, but the underlying os.Stat calls are cached in one
+// pathIdentityCache shared across the whole comparison (O(N) stats: each
+// unique source path and each computed destination path is stat'd at
+// most once), rather than re-stat'ing the same handful of paths on every
+// iteration. Manifests are expected to hold at most a few thousand
+// RFiles per single-tablet export, so an O(N^2) in-memory comparison
+// over already-cached FileInfo values is not a practical concern.
 func checkNoStagingAliases(flatNames map[string]string, bulkDir string) error {
 	srcPaths := make([]string, 0, len(flatNames))
 	for srcPath := range flatNames {
 		srcPaths = append(srcPaths, srcPath)
 	}
+	cache := make(pathIdentityCache, 2*len(srcPaths))
 	for _, srcPath := range srcPaths {
 		dstPath := joinBulkPath(bulkDir, flatNames[srcPath])
 		for _, otherSrcPath := range srcPaths {
-			if stagePathsAlias(otherSrcPath, dstPath) {
+			if pathsAlias(otherSrcPath, dstPath, cache) {
 				return fmt.Errorf(
 					"promotion: stage %s: bulk directory %s resolves to the same location as source file %s; refusing to copy in place",
 					srcPath, bulkDir, otherSrcPath,
@@ -157,18 +167,47 @@ func checkNoStagingAliases(flatNames map[string]string, bulkDir string) error {
 // exist yet, the overwhelmingly common non-aliased case), that's decided
 // by the lexical result alone.
 func stagePathsAlias(srcPath, dstPath string) bool {
+	return pathsAlias(srcPath, dstPath, make(pathIdentityCache))
+}
+
+// pathIdentityCache memoizes os.Stat results by path so a caller
+// comparing many paths against each other (checkNoStagingAliases) stats
+// each unique path once, not once per comparison. A cached nil FileInfo
+// means the path could not be stat'd (most commonly because it doesn't
+// exist yet); that's distinct from "not yet looked up," so a failed stat
+// is cached too rather than retried.
+type pathIdentityCache map[string]os.FileInfo
+
+func (c pathIdentityCache) stat(path string) os.FileInfo {
+	if info, cached := c[path]; cached {
+		return info
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		info = nil
+	}
+	c[path] = info
+	return info
+}
+
+// pathsAlias is stagePathsAlias's implementation, factored out so
+// checkNoStagingAliases's O(N^2) all-pairs comparison can share one
+// pathIdentityCache across every call instead of stat'ing the same
+// handful of paths repeatedly (each call to stagePathsAlias's physical-
+// identity fallback below performs up to two os.Stat calls).
+func pathsAlias(srcPath, dstPath string, cache pathIdentityCache) bool {
 	if strings.Contains(srcPath, "://") || strings.Contains(dstPath, "://") {
 		return strings.TrimRight(srcPath, `/\`) == strings.TrimRight(dstPath, `/\`)
 	}
 	if filepath.Clean(srcPath) == filepath.Clean(dstPath) {
 		return true
 	}
-	srcInfo, err := os.Stat(srcPath)
-	if err != nil {
+	srcInfo := cache.stat(srcPath)
+	if srcInfo == nil {
 		return false
 	}
-	dstInfo, err := os.Stat(dstPath)
-	if err != nil {
+	dstInfo := cache.stat(dstPath)
+	if dstInfo == nil {
 		return false
 	}
 	return os.SameFile(srcInfo, dstInfo)
