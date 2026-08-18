@@ -642,6 +642,7 @@ func TestAddTableSplitsFailsAfterBoundedRetries(t *testing.T) {
 			initialBackoff: time.Millisecond,
 			backoffStep:    time.Millisecond,
 			maxBackoff:     2 * time.Millisecond,
+			backoffFactor:  1,
 		},
 	}
 	err := addSplits(context.Background(), target, [][]byte{[]byte("m")})
@@ -677,6 +678,7 @@ func TestAddSplitsSkipsTheFinalRetryDelay(t *testing.T) {
 			initialBackoff: 200 * time.Millisecond,
 			backoffStep:    200 * time.Millisecond,
 			maxBackoff:     200 * time.Millisecond,
+			backoffFactor:  1,
 		},
 	}
 	err := addSplits(ctx, target, [][]byte{[]byte("m")})
@@ -690,7 +692,9 @@ func TestAddTableSplitsDefaultRetryPolicyIsBounded(t *testing.T) {
 	if policy.attempts != splitRetryAttempts ||
 		policy.initialBackoff != splitRetryInitialBackoff ||
 		policy.backoffStep != splitRetryBackoffStep ||
-		policy.maxBackoff != splitRetryMaxBackoff {
+		policy.maxBackoff != splitRetryMaxBackoff ||
+		policy.backoffFactor != splitRetryBackoffFactor ||
+		policy.jitter == nil {
 		t.Fatalf("default retry policy = %+v", policy)
 	}
 	if policy.attempts <= 0 || policy.initialBackoff <= 0 {
@@ -1173,13 +1177,49 @@ func TestRemoveSplitRowsKeepsPendingOrder(t *testing.T) {
 	}
 }
 
-func TestNextSplitBackoffIsBounded(t *testing.T) {
+func TestSplitRetryScheduleMatchesAccumuloWithoutJitter(t *testing.T) {
 	policy := defaultSplitRetryPolicy()
-	backoff := policy.initialBackoff
-	for range 100 {
-		backoff = nextSplitBackoff(backoff, policy)
+	policy.jitter = func() float64 { return 0.5 }
+	retry := newSplitRetrySchedule(policy)
+
+	got := []time.Duration{retry.currentBackoff()}
+	for range 8 {
+		retry.advance()
+		got = append(got, retry.currentBackoff())
 	}
-	if backoff != policy.maxBackoff {
-		t.Fatalf("backoff = %v, want %v", backoff, policy.maxBackoff)
+
+	want := []time.Duration{
+		100 * time.Millisecond,
+		250 * time.Millisecond,
+		325 * time.Millisecond,
+		438 * time.Millisecond,
+		607 * time.Millisecond,
+		860 * time.Millisecond,
+		1240 * time.Millisecond,
+		1809 * time.Millisecond,
+		2 * time.Second,
+	}
+	if len(got) != len(want) {
+		t.Fatalf("backoff count = %d, want %d", len(got), len(want))
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("backoff[%d] = %v, want %v (all=%v)", i, got[i], want[i], got)
+		}
+	}
+}
+
+func TestSplitRetryScheduleIsBounded(t *testing.T) {
+	policy := defaultSplitRetryPolicy()
+	policy.jitter = func() float64 { return 1 }
+	retry := newSplitRetrySchedule(policy)
+	for range 100 {
+		if retry.currentBackoff() > policy.maxBackoff {
+			t.Fatalf("backoff = %v, exceeded %v", retry.currentBackoff(), policy.maxBackoff)
+		}
+		retry.advance()
+	}
+	if retry.currentBackoff() != policy.maxBackoff {
+		t.Fatalf("backoff = %v, want %v", retry.currentBackoff(), policy.maxBackoff)
 	}
 }

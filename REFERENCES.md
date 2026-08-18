@@ -213,6 +213,11 @@ Accumulo source revision `317c288568e9c46e7854aafb8bb8c4fda6260b12`.
     `[tableId.canonical(), endRow or EMPTY, prevEndRow or EMPTY,
     encoded split…]`, options `Map.of()`, and `EMPTY` is a zero-length
     buffer (`ByteBuffer.allocate(0)`) for an unbounded boundary
+  - pending-row mapping uses `Retry.builder().infiniteRetries()`
+    `.retryAfter(100ms).incrementBy(100ms).maxWait(2s).backOffFactor(1.5)`;
+    because `backOffFactor > 1`, `Retry.waitForNextAttempt` produces an
+    exponential schedule with ±5% jitter around the factor-derived
+    increment, capped at 2 seconds
   - `SPLIT_SUCCESS_MSG = "SPLIT_SUCCEEDED"` — only when
     `waitForFateOperation` returns this string are the tablet's splits
     removed from the pending set; any other value (the server returns the
@@ -260,8 +265,9 @@ Shoal mapping: `accumulo.Connector.AddTableSplits` →
 `managerclient.Pooled.UpdateTabletMergeability`. Accumulo 4 removed the
 legacy tablet-server `splitTablet` RPC; Shoal never calls it. Unlike
 Accumulo, Shoal submits a table's groups sequentially (not through two
-thread pools) and bounds the outer retry loop, failing with
-`ErrTableSplitsIncomplete` instead of looping forever.
+thread pools) and bounds the outer retry loop to 10 attempts, failing
+with `ErrTableSplitsIncomplete` instead of looping forever, while
+mirroring Accumulo's per-round retry schedule.
 
 ### RFile (port target for V0)
 - `core/src/main/java/org/apache/accumulo/core/file/rfile/RFile.java`

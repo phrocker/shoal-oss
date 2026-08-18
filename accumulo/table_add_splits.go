@@ -5,6 +5,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
+	"math/rand"
 	"sort"
 	"time"
 
@@ -22,12 +24,17 @@ const (
 	// of hanging.
 	splitRetryAttempts = 10
 
-	// splitRetryInitialBackoff, splitRetryBackoffStep and
-	// splitRetryMaxBackoff mirror Accumulo's split Retry builder
-	// (retryAfter 100ms, incrementBy 100ms, maxWait 2s).
+	// splitRetryInitialBackoff, splitRetryBackoffStep,
+	// splitRetryMaxBackoff, and splitRetryBackoffFactor mirror Accumulo's
+	// split Retry builder (retryAfter 100ms, incrementBy 100ms, maxWait 2s,
+	// backOffFactor 1.5). With backOffFactor > 1, Accumulo's Retry uses the
+	// factor plus ±5% jitter to produce the actual exponential wait
+	// schedule; Shoal mirrors that schedule and still caps the outer split
+	// loop at splitRetryAttempts.
 	splitRetryInitialBackoff = 100 * time.Millisecond
 	splitRetryBackoffStep    = 100 * time.Millisecond
 	splitRetryMaxBackoff     = 2 * time.Second
+	splitRetryBackoffFactor  = 1.5
 )
 
 // splitTarget carries the once-resolved state a split round needs.
@@ -47,6 +54,8 @@ type splitRetryPolicy struct {
 	initialBackoff time.Duration
 	backoffStep    time.Duration
 	maxBackoff     time.Duration
+	backoffFactor  float64
+	jitter         func() float64
 }
 
 func defaultSplitRetryPolicy() splitRetryPolicy {
@@ -55,6 +64,8 @@ func defaultSplitRetryPolicy() splitRetryPolicy {
 		initialBackoff: splitRetryInitialBackoff,
 		backoffStep:    splitRetryBackoffStep,
 		maxBackoff:     splitRetryMaxBackoff,
+		backoffFactor:  splitRetryBackoffFactor,
+		jitter:         rand.Float64,
 	}
 }
 
@@ -110,8 +121,10 @@ type splitPlan struct {
 // resolved tablets with bounded backoff; when rows still remain the call
 // fails with ErrTableSplitsIncomplete. Unlike Accumulo, which fans the
 // per-tablet operations out across two thread pools, Shoal submits them
-// sequentially. Table discovery and table-name caches are invalidated after
-// the attempts regardless of outcome.
+// sequentially. To avoid stale recreated-table IDs, the table-name mapping
+// is invalidated before ResolveID; after that, only the target table's
+// tablet cache is invalidated during split planning and once more before
+// return, regardless of outcome.
 //
 // Errors from the manager are mapped to ErrTableNotFound, ErrTableOffline,
 // ErrPermissionDenied, ErrNamespaceNotFound, ErrInvalidTableName and
@@ -199,7 +212,7 @@ func requireTableNotOffline(
 // addSplits runs bounded split rounds until nothing is pending, a manager
 // operation fails, ctx ends, or the retry budget is exhausted.
 func addSplits(ctx context.Context, target splitTarget, pending [][]byte) error {
-	backoff := target.retry.initialBackoff
+	retry := newSplitRetrySchedule(target.retry)
 	for attempt := 0; attempt < target.retry.attempts; attempt++ {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -224,10 +237,10 @@ func addSplits(ctx context.Context, target splitTarget, pending [][]byte) error 
 		if attempt+1 == target.retry.attempts {
 			break
 		}
-		if err := waitForWriterRetry(ctx, backoff); err != nil {
+		if err := waitForWriterRetry(ctx, retry.currentBackoff()); err != nil {
 			return err
 		}
-		backoff = nextSplitBackoff(backoff, target.retry)
+		retry.advance()
 	}
 	return fmt.Errorf(
 		"%w: table %q has %d unapplied split rows after %d attempts",
@@ -460,7 +473,59 @@ func removeSplitRows(pending, completed [][]byte) [][]byte {
 	return remaining
 }
 
-func nextSplitBackoff(backoff time.Duration, policy splitRetryPolicy) time.Duration {
+type splitRetrySchedule struct {
+	policy        splitRetryPolicy
+	backoff       time.Duration
+	backoffFactor float64
+}
+
+func newSplitRetrySchedule(policy splitRetryPolicy) splitRetrySchedule {
+	return splitRetrySchedule{
+		policy:        policy,
+		backoff:       policy.initialBackoff,
+		backoffFactor: policy.backoffFactor,
+	}
+}
+
+func (r *splitRetrySchedule) currentBackoff() time.Duration {
+	return r.backoff
+}
+
+func (r *splitRetrySchedule) advance() {
+	if r.backoff >= r.policy.maxBackoff {
+		r.backoff = r.policy.maxBackoff
+		return
+	}
+	if r.policy.backoffFactor <= 1 {
+		r.backoff = nextLinearSplitBackoff(r.backoff, r.policy)
+		return
+	}
+	jitter := 0.0
+	if r.policy.jitter != nil {
+		sample := r.policy.jitter()
+		if sample < 0 {
+			sample = 0
+		} else if sample > 1 {
+			sample = 1
+		}
+		jitter = (sample - 0.5) / 10.0
+	}
+	waitFactor := (1 + jitter) * r.backoffFactor
+	r.backoffFactor *= r.policy.backoffFactor
+	initialMillis := r.policy.initialBackoff.Milliseconds()
+	if initialMillis <= 0 {
+		initialMillis = 1
+	}
+	increment := time.Duration(math.Ceil(waitFactor*float64(initialMillis))) * time.Millisecond
+	next := r.policy.initialBackoff + increment
+	if next > r.policy.maxBackoff {
+		r.backoff = r.policy.maxBackoff
+		return
+	}
+	r.backoff = next
+}
+
+func nextLinearSplitBackoff(backoff time.Duration, policy splitRetryPolicy) time.Duration {
 	next := backoff + policy.backoffStep
 	if next > policy.maxBackoff {
 		return policy.maxBackoff
