@@ -174,6 +174,27 @@ int main(void) {
   shoal_table_list_free(&table_list);
   assert(table_list == NULL);
 
+  shoal_test_result_alloc_fail_after(0);
+  expect_error(shoal_connector_list_tables(admin_connector, 0, &table_list,
+                                           &error),
+               SHOAL_STATUS_OUT_OF_MEMORY, &error,
+               "allocate table list result");
+  assert(table_list == NULL);
+  shoal_test_result_alloc_reset();
+
+  shoal_test_result_alloc_fail_after(0);
+  shoal_test_error_alloc_fail_after(1);
+  assert(shoal_connector_list_tables(admin_connector, 0, &table_list, &error) ==
+         SHOAL_STATUS_OUT_OF_MEMORY);
+  assert(table_list == NULL && error == NULL);
+  shoal_test_result_alloc_reset();
+  shoal_test_error_alloc_reset();
+  assert(shoal_connector_list_tables(admin_connector, 0, &table_list, &error) ==
+         SHOAL_STATUS_OK);
+  assert(table_list != NULL && error == NULL);
+  shoal_table_list_free(&table_list);
+  assert(table_list == NULL);
+
   shoal_test_string_alloc_fail_after(1);
   expect_error(shoal_connector_list_tables(admin_connector, 0, &table_list,
                                            &error),
@@ -262,6 +283,20 @@ int main(void) {
   expect_error(shoal_table_properties_get(properties, 2, &property_view,
                                           &error),
                SHOAL_STATUS_INVALID_ARGUMENT, &error, "out of bounds");
+  shoal_table_properties_free(&properties);
+  assert(properties == NULL);
+  shoal_test_result_alloc_fail_after(0);
+  shoal_test_error_alloc_fail_after(1);
+  assert(shoal_connector_effective_table_properties(
+             admin_connector, "events", 0, &properties, &error) ==
+         SHOAL_STATUS_OUT_OF_MEMORY);
+  assert(properties == NULL && error == NULL);
+  shoal_test_result_alloc_reset();
+  shoal_test_error_alloc_reset();
+  assert(shoal_connector_effective_table_properties(
+             admin_connector, "events", 0, &properties, &error) ==
+         SHOAL_STATUS_OK);
+  assert(properties != NULL && error == NULL);
   shoal_table_properties_free(&properties);
   assert(properties == NULL);
   shoal_test_string_alloc_fail_after(3);

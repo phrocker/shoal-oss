@@ -103,23 +103,32 @@ void shoal_bridge_batch_writer_free(shoal_batch_writer *writer) {
 }
 
 static _Atomic size_t shoal_bridge_string_alloc_fail_after = SIZE_MAX;
+static _Atomic size_t shoal_bridge_result_alloc_fail_after = SIZE_MAX;
+static _Atomic size_t shoal_bridge_error_alloc_fail_after = SIZE_MAX;
+
+static int shoal_bridge_allocation_allowed(_Atomic size_t *fail_after) {
+  size_t remaining =
+      atomic_load_explicit(fail_after, memory_order_relaxed);
+  while (remaining != SIZE_MAX) {
+    if (remaining == 0) {
+      return 0;
+    }
+    if (atomic_compare_exchange_weak_explicit(
+            fail_after, &remaining, remaining - 1, memory_order_relaxed,
+            memory_order_relaxed)) {
+      break;
+    }
+  }
+  return 1;
+}
 
 char *shoal_bridge_string_alloc(const char *value, size_t length) {
   if ((value == NULL && length != 0) || length == SIZE_MAX) {
     return NULL;
   }
-  size_t remaining =
-      atomic_load_explicit(&shoal_bridge_string_alloc_fail_after,
-                           memory_order_relaxed);
-  while (remaining != SIZE_MAX) {
-    if (remaining == 0) {
-      return NULL;
-    }
-    if (atomic_compare_exchange_weak_explicit(
-            &shoal_bridge_string_alloc_fail_after, &remaining, remaining - 1,
-            memory_order_relaxed, memory_order_relaxed)) {
-      break;
-    }
+  if (!shoal_bridge_allocation_allowed(
+          &shoal_bridge_string_alloc_fail_after)) {
+    return NULL;
   }
   char *copy = (char *)malloc(length + 1);
   if (copy == NULL) {
@@ -143,6 +152,28 @@ void shoal_bridge_test_string_alloc_fail_after(size_t successful_allocations) {
 
 void shoal_bridge_test_string_alloc_reset(void) {
   atomic_store_explicit(&shoal_bridge_string_alloc_fail_after, SIZE_MAX,
+                        memory_order_relaxed);
+}
+
+void shoal_bridge_test_result_alloc_fail_after(
+    size_t successful_allocations) {
+  atomic_store_explicit(&shoal_bridge_result_alloc_fail_after,
+                        successful_allocations, memory_order_relaxed);
+}
+
+void shoal_bridge_test_result_alloc_reset(void) {
+  atomic_store_explicit(&shoal_bridge_result_alloc_fail_after, SIZE_MAX,
+                        memory_order_relaxed);
+}
+
+void shoal_bridge_test_error_alloc_fail_after(
+    size_t successful_allocations) {
+  atomic_store_explicit(&shoal_bridge_error_alloc_fail_after,
+                        successful_allocations, memory_order_relaxed);
+}
+
+void shoal_bridge_test_error_alloc_reset(void) {
+  atomic_store_explicit(&shoal_bridge_error_alloc_fail_after, SIZE_MAX,
                         memory_order_relaxed);
 }
 
@@ -303,6 +334,10 @@ static void shoal_bridge_table_entry_clear(shoal_bridge_table_entry *entry) {
 
 shoal_table_list_result *shoal_bridge_table_list_alloc(size_t count) {
   if (count > SIZE_MAX / sizeof(shoal_bridge_table_entry)) {
+    return NULL;
+  }
+  if (!shoal_bridge_allocation_allowed(
+          &shoal_bridge_result_alloc_fail_after)) {
     return NULL;
   }
   shoal_table_list_result *result =
@@ -730,6 +765,10 @@ shoal_table_properties_result *shoal_bridge_table_properties_alloc(size_t count)
   if (count > SIZE_MAX / sizeof(shoal_bridge_table_property_entry)) {
     return NULL;
   }
+  if (!shoal_bridge_allocation_allowed(
+          &shoal_bridge_result_alloc_fail_after)) {
+    return NULL;
+  }
   shoal_table_properties_result *result =
       (shoal_table_properties_result *)calloc(1, sizeof(*result));
   if (result == NULL) {
@@ -800,11 +839,21 @@ void shoal_bridge_table_properties_free(shoal_table_properties_result *result) {
 
 shoal_error *shoal_bridge_error_alloc(shoal_status code, const char *message,
                                       size_t message_length) {
-  if (message_length == SIZE_MAX) {
+  if ((message == NULL && message_length != 0) ||
+      message_length == SIZE_MAX) {
+    return NULL;
+  }
+  if (!shoal_bridge_allocation_allowed(
+          &shoal_bridge_error_alloc_fail_after)) {
     return NULL;
   }
   shoal_error *error = (shoal_error *)malloc(sizeof(*error));
   if (error == NULL) {
+    return NULL;
+  }
+  if (!shoal_bridge_allocation_allowed(
+          &shoal_bridge_error_alloc_fail_after)) {
+    free(error);
     return NULL;
   }
   error->message = (char *)malloc(message_length + 1);

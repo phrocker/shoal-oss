@@ -2,7 +2,6 @@ package main
 
 /*
 #cgo CFLAGS: -I${SRCDIR}/../../capi/include
-#include <stdlib.h>
 #include "bridge.h"
 */
 import "C"
@@ -447,11 +446,11 @@ func clearError(outError **C.shoal_error) {
 func fail(outError **C.shoal_error, code C.shoal_status, err error) C.shoal_status {
 	if outError != nil {
 		message := err.Error()
-		cMessage := C.CString(message)
-		if cMessage != nil {
-			*outError = C.shoal_bridge_error_alloc(code, cMessage, C.size_t(len(message)))
-			C.free(unsafe.Pointer(cMessage))
+		var data *C.char
+		if len(message) != 0 {
+			data = (*C.char)(unsafe.Pointer(unsafe.StringData(message)))
 		}
+		*outError = C.shoal_bridge_error_alloc(code, data, C.size_t(len(message)))
 	}
 	return code
 }
