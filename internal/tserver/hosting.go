@@ -49,6 +49,10 @@ var (
 	ErrOverlapping = errors.New("tserver: tablet overlaps an assigned tablet")
 	// ErrNotAssigned means the extent is not tracked by this host.
 	ErrNotAssigned = errors.New("tserver: tablet not assigned")
+	// ErrStaleAttempt means the completion belongs to an assignment attempt
+	// that has already ended, so the tablet it names is a later attempt at
+	// the same extent.
+	ErrStaleAttempt = errors.New("tserver: stale assignment attempt")
 	// ErrWrongState means the tablet is tracked but not in the state the
 	// transition requires.
 	ErrWrongState = errors.New("tserver: tablet in wrong hosting state")
@@ -135,6 +139,48 @@ type TabletStatus struct {
 	State  HostingState
 }
 
+// Attempt is an opaque handle to one assignment of one tablet, minted by
+// Assign and required by every local completion.
+//
+// It exists because the ServiceLock generation is not fine-grained enough to
+// fence a completion. The manager may unassign a tablet and assign it here
+// again without the lock ever changing — a migration that is rolled back, or
+// a reassignment after a forced unload. Loads run asynchronously, so a
+// completion from the first assignment can arrive after the second has begun,
+// and it would otherwise match on extent, lock and state alike: LoadFailed
+// would release the new assignment, and LoadComplete would publish it as
+// serving before its data was loaded. Carrying the attempt makes each
+// completion name the assignment it actually belongs to.
+//
+// The zero Attempt is invalid and names nothing. A caller cannot construct a
+// valid one; the only source is Assign.
+type Attempt struct {
+	extent Extent
+	lock   LockID
+	id     uint64
+}
+
+// Valid reports whether the attempt names an assignment. The zero value does
+// not.
+func (a Attempt) Valid() bool { return a.id != 0 }
+
+// Extent returns the tablet this attempt was minted for.
+func (a Attempt) Extent() Extent { return a.extent.clone() }
+
+// Equal reports whether both handles name the same assignment. An Attempt
+// carries row bounds, so it is not comparable with ==; use this instead.
+func (a Attempt) Equal(other Attempt) bool {
+	return a.id == other.id && a.lock.Equal(other.lock) && a.extent.Equal(other.extent)
+}
+
+// String renders the attempt for logs.
+func (a Attempt) String() string {
+	if !a.Valid() {
+		return "attempt#<none>"
+	}
+	return fmt.Sprintf("attempt#%d(%s under %s)", a.id, a.extent, a.lock)
+}
+
 // Metrics is a snapshot of the host's operational counters.
 //
 // Loading, Hosted and Unloading are gauges derived from the tracked tablets
@@ -156,8 +202,9 @@ type Metrics struct {
 	Unloads uint64
 	// ForcedUnloads counts the subset of Unloads that skipped draining.
 	ForcedUnloads uint64
-	// RejectedStale counts transitions refused because their fence did not
-	// match the current lock generation.
+	// RejectedStale counts transitions refused for naming a superseded
+	// caller: a fence that did not match the current lock generation, or a
+	// completion for an assignment attempt that has already ended.
 	RejectedStale uint64
 	// RejectedDuplicate counts assignments refused because the tablet, or a
 	// tablet overlapping it, was already assigned here.
@@ -194,20 +241,28 @@ type Host struct {
 	// byTable indexes the tracked tablets of each table in range order, so an
 	// overlap check reads two neighbours instead of scanning everything.
 	byTable map[string][]*tabletEntry
-	metrics Metrics
+	// nextAttempt mints attempt ids. It starts at 1 so the zero Attempt is
+	// never a real one, and never restarts, so an id identifies an assignment
+	// for the life of the process.
+	nextAttempt uint64
+	metrics     Metrics
 }
 
 type tabletEntry struct {
 	extent Extent
 	state  HostingState
+	// attempt is the assignment this entry belongs to. A completion carrying
+	// any other id is reporting on an assignment that has already ended.
+	attempt uint64
 }
 
 // NewHost returns a host that holds no lock. Until AdoptLock records an
 // acquired ServiceLock, every transition fails closed with ErrNoLock.
 func NewHost() *Host {
 	return &Host{
-		tablets: make(map[string]*tabletEntry),
-		byTable: make(map[string][]*tabletEntry),
+		tablets:     make(map[string]*tabletEntry),
+		byTable:     make(map[string][]*tabletEntry),
+		nextAttempt: 1,
 	}
 }
 
@@ -295,48 +350,54 @@ func (h *Host) ManagerLock() (LockID, bool) {
 }
 
 // Assign records a manager-directed assignment and moves the tablet to
-// StateLoading. The caller then brings the tablet online and reports the
-// outcome with LoadComplete or LoadFailed.
+// StateLoading, returning the attempt handle for it. The caller then brings
+// the tablet online and reports the outcome with LoadComplete or LoadFailed,
+// passing that handle back so the report can only ever apply to this
+// assignment.
 //
 // It fails closed — leaving hosting state untouched — when the extent is
 // malformed, the fence is stale, the tablet is already assigned here, or the
 // extent overlaps one that is. Overlap covers the stale-split case: a parent
 // extent arriving after its children are assigned (or the reverse) would host
 // the same rows twice, so it is refused.
-func (h *Host) Assign(fence Fence, extent Extent) error {
+func (h *Host) Assign(fence Fence, extent Extent) (Attempt, error) {
 	if err := extent.Validate(); err != nil {
-		return err
+		return Attempt{}, err
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
 	if err := h.checkFence(fence); err != nil {
-		return err
+		return Attempt{}, err
 	}
 	if existing, ok := h.tablets[extent.key()]; ok {
 		h.metrics.RejectedDuplicate++
-		return fmt.Errorf("%w: %s is %s", ErrAlreadyAssigned, existing.extent, existing.state)
+		return Attempt{}, fmt.Errorf("%w: %s is %s", ErrAlreadyAssigned, existing.extent, existing.state)
 	}
 	if conflict := h.overlapping(extent); conflict != nil {
 		h.metrics.RejectedDuplicate++
-		return fmt.Errorf("%w: %s overlaps %s (%s)",
+		return Attempt{}, fmt.Errorf("%w: %s overlaps %s (%s)",
 			ErrOverlapping, extent, conflict.extent, conflict.state)
 	}
-	h.track(&tabletEntry{extent: extent.clone(), state: StateLoading})
+	entry := &tabletEntry{extent: extent.clone(), state: StateLoading, attempt: h.nextAttempt}
+	h.nextAttempt++
+	h.track(entry)
 	h.metrics.Assignments++
-	return nil
+	return Attempt{extent: entry.extent, lock: h.held, id: entry.attempt}, nil
 }
 
 // LoadComplete reports that a loading tablet is online, moving it to
 // StateHosted.
 //
-// server is the lock the load ran under. If it no longer matches, the load
-// raced a lock loss and the tablet is not published — the manager has already
-// been free to place it elsewhere. If the manager unassigned the tablet while
-// it was loading it is in StateUnloading, and this returns ErrWrongState; the
-// caller releases it with UnloadComplete instead of publishing it.
-func (h *Host) LoadComplete(server LockID, extent Extent) error {
-	return h.transition(server, extent, StateLoading, func(entry *tabletEntry) {
+// attempt is the handle Assign returned. If its lock no longer matches, the
+// load raced a lock loss and the tablet is not published — the manager has
+// already been free to place it elsewhere. If the assignment itself has ended
+// and the extent was assigned again, this returns ErrStaleAttempt rather than
+// publishing somebody else's tablet. If the manager unassigned the tablet
+// while it was loading it is in StateUnloading, and this returns
+// ErrWrongState; the caller releases it with UnloadComplete instead.
+func (h *Host) LoadComplete(attempt Attempt) error {
+	return h.transition(attempt, StateLoading, func(entry *tabletEntry) {
 		entry.state = StateHosted
 		h.metrics.Loads++
 	})
@@ -345,8 +406,11 @@ func (h *Host) LoadComplete(server LockID, extent Extent) error {
 // LoadFailed reports that a loading tablet could not be brought online and
 // releases it. The caller logs why; the host only records that an assignment
 // was abandoned so the manager can place the tablet elsewhere.
-func (h *Host) LoadFailed(server LockID, extent Extent) error {
-	return h.transition(server, extent, StateLoading, func(entry *tabletEntry) {
+//
+// Like LoadComplete it applies only to the assignment attempt names, so a
+// late failure cannot release a tablet assigned here since.
+func (h *Host) LoadFailed(attempt Attempt) error {
+	return h.transition(attempt, StateLoading, func(entry *tabletEntry) {
 		h.release(entry)
 		h.metrics.LoadFailures++
 	})
@@ -368,38 +432,51 @@ func (h *Host) LoadFailed(server LockID, extent Extent) error {
 // An unload mode this host does not implement is refused outright rather than
 // guessed at, so a corrupted or newer mode cannot silently become a drain
 // that never completes when a forced release was meant.
-func (h *Host) Unassign(fence Fence, extent Extent, mode UnloadMode) error {
+//
+// A graceful unassignment returns the attempt handle of the tablet it began
+// draining, which the caller passes to UnloadComplete when the drain is done.
+// It is the same handle Assign minted, so a load that was unassigned
+// mid-flight can give the tablet back with the handle it already holds. In
+// every other case — the tablet was not tracked, or UnloadImmediate released
+// it outright — the returned attempt is invalid and there is nothing left to
+// finish.
+func (h *Host) Unassign(fence Fence, extent Extent, mode UnloadMode) (Attempt, error) {
 	if err := extent.Validate(); err != nil {
-		return err
+		return Attempt{}, err
 	}
 	if !mode.valid() {
-		return fmt.Errorf("%w: %s", ErrInvalidUnloadMode, mode)
+		return Attempt{}, fmt.Errorf("%w: %s", ErrInvalidUnloadMode, mode)
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
 	if err := h.checkFence(fence); err != nil {
-		return err
+		return Attempt{}, err
 	}
 	entry, ok := h.tablets[extent.key()]
 	if !ok {
-		return nil
+		return Attempt{}, nil
 	}
 	if mode == UnloadImmediate {
 		h.release(entry)
 		h.metrics.Unloads++
 		h.metrics.ForcedUnloads++
-		return nil
+		return Attempt{}, nil
 	}
 	entry.state = StateUnloading
-	return nil
+	return Attempt{extent: entry.extent, lock: h.held, id: entry.attempt}, nil
 }
 
 // UnloadComplete reports that a draining tablet has finished and releases it.
 // It is the last step of a graceful unload, and also how a load that was
 // unassigned mid-flight gives the tablet back.
-func (h *Host) UnloadComplete(server LockID, extent Extent) error {
-	return h.transition(server, extent, StateUnloading, func(entry *tabletEntry) {
+//
+// attempt is the handle Assign minted for the tablet, which Unassign returns
+// again when it starts a drain. A drain that finishes after its tablet was
+// released and the extent assigned here again is refused with
+// ErrStaleAttempt, so it cannot release the new assignment.
+func (h *Host) UnloadComplete(attempt Attempt) error {
+	return h.transition(attempt, StateUnloading, func(entry *tabletEntry) {
 		h.release(entry)
 		h.metrics.Unloads++
 	})
@@ -467,23 +544,39 @@ func (h *Host) Metrics() Metrics {
 }
 
 // transition runs a local completion: it verifies the tablet is still ours
-// under the given lock and is in the state the completion expects, then
-// applies apply. Unlike the manager-facing calls it is strict about unknown
-// extents — a completion for a tablet we never had is a bug in the caller,
-// not a stale view of the cluster.
-func (h *Host) transition(server LockID, extent Extent, want HostingState, apply func(*tabletEntry)) error {
+// under the attempt's lock, is the assignment the attempt was minted for, and
+// is in the state the completion expects, then applies apply. Unlike the
+// manager-facing calls it is strict about unknown extents — a completion for
+// a tablet we never had is a bug in the caller, not a stale view of the
+// cluster.
+//
+// The attempt check is what stops a slow completion from acting on a later
+// assignment of the same extent: extent, lock and state can all match again
+// after the tablet is released and assigned here once more, but the attempt
+// id cannot.
+func (h *Host) transition(attempt Attempt, want HostingState, apply func(*tabletEntry)) error {
+	if !attempt.Valid() {
+		return fmt.Errorf("%w: attempt was never assigned", ErrStaleAttempt)
+	}
+	extent := attempt.extent
 	if err := extent.Validate(); err != nil {
 		return err
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
-	if err := h.checkServerLock(server); err != nil {
+	if err := h.checkServerLock(attempt.lock); err != nil {
 		return err
 	}
 	entry, ok := h.tablets[extent.key()]
 	if !ok {
 		return fmt.Errorf("%w: %s", ErrNotAssigned, extent)
+	}
+	if entry.attempt != attempt.id {
+		h.metrics.RejectedStale++
+		return fmt.Errorf("%w: %s is now %s, not %s",
+			ErrStaleAttempt, extent,
+			Attempt{extent: entry.extent, lock: attempt.lock, id: entry.attempt}, attempt)
 	}
 	if entry.state != want {
 		return fmt.Errorf("%w: %s is %s, want %s", ErrWrongState, extent, entry.state, want)

@@ -89,6 +89,11 @@ than publishing a tablet the manager has already placed elsewhere. And a
 tablet cannot be re-assigned while it is `UNLOADING`, because this
 process has not let go of it yet.
 
+Each trip through this table is one *attempt*, identified by the handle
+`Assign` returns. A tablet that reaches `UNASSIGNED` and is assigned here
+again starts a new attempt, and the completions of the old one no longer
+apply to it — see §4.
+
 ## 4. The fence
 
 Every manager-directed transition carries a `Fence` of two ServiceLock
@@ -107,8 +112,27 @@ A newer manager lock is adopted on sight and becomes the authority. An
 older one, or a different holder at the same sequence, is refused.
 
 Local completions (`LoadComplete`, `LoadFailed`, `UnloadComplete`) carry
-only the server lock: they report the outcome of work this process
-started, and what matters is whether that work still belongs to us.
+an `Attempt` instead: an opaque handle minted by `Assign`, naming one
+assignment of one tablet under one server lock. They report the outcome
+of work this process started, and what matters is whether that work
+still belongs to us.
+
+The server lock alone is not fine-grained enough to decide that. The
+manager may unassign a tablet and assign it here again without the lock
+ever changing — a migration that is rolled back, or a reassignment after
+a forced unload — so a completion left over from the first assignment
+would find the extent, the lock and even the state all matching a second
+time. `LoadFailed` would release a tablet that is still loading, and
+`LoadComplete` would publish one whose data is not loaded yet. The
+attempt id is minted per assignment and never reused, so a completion
+can only ever apply to the assignment it belongs to; anything else is
+`ErrStaleAttempt`.
+
+A graceful `Unassign` hands the same attempt back, so the drain it starts
+can be finished with `UnloadComplete`, and a load that was unassigned
+mid-flight can give the tablet back with the handle it already holds.
+When there is nothing to finish — the tablet was not tracked, or
+`UnloadImmediate` released it outright — the returned attempt is invalid.
 
 ### Fail closed, everywhere
 
@@ -124,13 +148,16 @@ from any transition means nothing moved:
 | extent overlaps an assigned tablet | `ErrOverlapping` |
 | malformed extent | `ErrInvalidExtent` |
 | completion for a tablet this host does not track | `ErrNotAssigned` |
+| completion for an assignment that has already ended | `ErrStaleAttempt` |
 | completion for a tablet in another state | `ErrWrongState` |
 | unload mode this host does not implement | `ErrInvalidUnloadMode` |
 
-`ErrNotAssigned` and `ErrWrongState` are deliberately distinct: the first
-says the host never had the tablet (or has already released it), the
-second says it has it but the completion arrived for the wrong phase.
-Only the second is worth retrying.
+`ErrNotAssigned`, `ErrStaleAttempt` and `ErrWrongState` are deliberately
+distinct: the first says the host never had the tablet (or has already
+released it), the second says it has the extent but as a later assignment
+that this completion knows nothing about, and the third says it has the
+right assignment but the completion arrived for the wrong phase. Only the
+third is worth retrying.
 
 Overlap is what catches stale split metadata. A parent extent arriving
 after its children are assigned — or a child arriving after its parent —
@@ -207,6 +234,7 @@ This is the lifecycle core only. Still to land for #67:
 `RejectedStale`, `RejectedDuplicate`, `LockLosses`, and
 `DroppedOnLockLoss`. The two rejection counters are the ones to alert on:
 a healthy cluster refuses almost nothing, so a rising `RejectedStale`
-means assignments are racing lock churn and a rising
-`RejectedDuplicate` means the manager is working from stale tablet
+means transitions are naming a superseded caller — assignments racing
+lock churn, or completions arriving after their assignment ended — and a
+rising `RejectedDuplicate` means the manager is working from stale tablet
 metadata.

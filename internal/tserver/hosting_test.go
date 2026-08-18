@@ -19,6 +19,7 @@ package tserver
 
 import (
 	"errors"
+	"fmt"
 	"math/rand"
 	"sync"
 	"testing"
@@ -53,15 +54,28 @@ func newTestHost(t *testing.T) (*Host, LockID, Fence) {
 	return host, lock, Fence{Server: lock, Manager: managerLock(7)}
 }
 
-// hostTablet drives a tablet all the way to StateHosted.
-func hostTablet(t *testing.T, host *Host, fence Fence, e Extent) {
+// hostTablet drives a tablet all the way to StateHosted and returns the
+// attempt it was assigned under.
+func hostTablet(t *testing.T, host *Host, fence Fence, e Extent) Attempt {
 	t.Helper()
-	if err := host.Assign(fence, e); err != nil {
+	attempt, err := host.Assign(fence, e)
+	if err != nil {
 		t.Fatalf("Assign(%s): %v", e, err)
 	}
-	if err := host.LoadComplete(fence.Server, e); err != nil {
+	if err := host.LoadComplete(attempt); err != nil {
 		t.Fatalf("LoadComplete(%s): %v", e, err)
 	}
+	return attempt
+}
+
+// mustAssign assigns a tablet and returns its attempt.
+func mustAssign(t *testing.T, host *Host, fence Fence, e Extent) Attempt {
+	t.Helper()
+	attempt, err := host.Assign(fence, e)
+	if err != nil {
+		t.Fatalf("Assign(%s): %v", e, err)
+	}
+	return attempt
 }
 
 func wantState(t *testing.T, host *Host, e Extent, want HostingState) {
@@ -93,16 +107,19 @@ func TestHostWithoutLockRefusesEverything(t *testing.T) {
 	fence := Fence{Server: lock, Manager: managerLock(7)}
 	e := extent("2", "", "m")
 
-	if err := host.Assign(fence, e); !errors.Is(err, ErrNoLock) {
+	if _, err := host.Assign(fence, e); !errors.Is(err, ErrNoLock) {
 		t.Fatalf("Assign: want ErrNoLock, got %v", err)
 	}
-	if err := host.Unassign(fence, e, UnloadGraceful); !errors.Is(err, ErrNoLock) {
+	if _, err := host.Unassign(fence, e, UnloadGraceful); !errors.Is(err, ErrNoLock) {
 		t.Fatalf("Unassign: want ErrNoLock, got %v", err)
 	}
-	if err := host.LoadComplete(lock, e); !errors.Is(err, ErrNoLock) {
+	// A completion from a previous lock generation, replayed against a host
+	// that holds nothing.
+	orphan := Attempt{extent: e, lock: lock, id: 1}
+	if err := host.LoadComplete(orphan); !errors.Is(err, ErrNoLock) {
 		t.Fatalf("LoadComplete: want ErrNoLock, got %v", err)
 	}
-	if err := host.UnloadComplete(lock, e); !errors.Is(err, ErrNoLock) {
+	if err := host.UnloadComplete(orphan); !errors.Is(err, ErrNoLock) {
 		t.Fatalf("UnloadComplete: want ErrNoLock, got %v", err)
 	}
 	if _, held := host.Lock(); held {
@@ -114,16 +131,14 @@ func TestHostWithoutLockRefusesEverything(t *testing.T) {
 // TestAssignThroughHostedLifecycle is the happy path: the manager assigns,
 // the load finishes, and the tablet becomes visible as hosted.
 func TestAssignThroughHostedLifecycle(t *testing.T) {
-	host, lock, fence := newTestHost(t)
+	host, _, fence := newTestHost(t)
 	e := extent("2", "", "m")
 
-	if err := host.Assign(fence, e); err != nil {
-		t.Fatalf("Assign: %v", err)
-	}
+	attempt := mustAssign(t, host, fence, e)
 	wantState(t, host, e, StateLoading)
 	wantHosted(t, host) // still loading: not routable yet
 
-	if err := host.LoadComplete(lock, e); err != nil {
+	if err := host.LoadComplete(attempt); err != nil {
 		t.Fatalf("LoadComplete: %v", err)
 	}
 	wantState(t, host, e, StateHosted)
@@ -144,19 +159,20 @@ func TestAssignThroughHostedLifecycle(t *testing.T) {
 // directly: a second assignment of a tablet already assigned here is refused
 // and changes nothing.
 func TestDuplicateAssignmentFailsClosed(t *testing.T) {
-	host, lock, fence := newTestHost(t)
+	host, _, fence := newTestHost(t)
 	e := extent("2", "", "m")
+	var attempt Attempt
 
 	for _, state := range []HostingState{StateLoading, StateHosted} {
 		if state == StateHosted {
-			if err := host.LoadComplete(lock, e); err != nil {
+			if err := host.LoadComplete(attempt); err != nil {
 				t.Fatalf("LoadComplete: %v", err)
 			}
-		} else if err := host.Assign(fence, e); err != nil {
-			t.Fatalf("Assign: %v", err)
+		} else {
+			attempt = mustAssign(t, host, fence, e)
 		}
 
-		err := host.Assign(fence, e)
+		_, err := host.Assign(fence, e)
 		if !errors.Is(err, ErrAlreadyAssigned) {
 			t.Fatalf("duplicate assign while %s: want ErrAlreadyAssigned, got %v", state, err)
 		}
@@ -180,13 +196,11 @@ func TestOverlappingAssignmentFailsClosed(t *testing.T) {
 		host, _, fence := newTestHost(t)
 		left, right, parent := extent("2", "", "m"), extent("2", "m", ""), extent("2", "", "")
 
-		if err := host.Assign(fence, left); err != nil {
-			t.Fatalf("Assign left: %v", err)
-		}
-		if err := host.Assign(fence, right); err != nil {
+		mustAssign(t, host, fence, left)
+		if _, err := host.Assign(fence, right); err != nil {
 			t.Fatalf("split children must both be assignable: %v", err)
 		}
-		if err := host.Assign(fence, parent); !errors.Is(err, ErrOverlapping) {
+		if _, err := host.Assign(fence, parent); !errors.Is(err, ErrOverlapping) {
 			t.Fatalf("want ErrOverlapping, got %v", err)
 		}
 		wantState(t, host, parent, StateUnassigned)
@@ -198,10 +212,8 @@ func TestOverlappingAssignmentFailsClosed(t *testing.T) {
 		host, _, fence := newTestHost(t)
 		parent, child := extent("2", "", ""), extent("2", "d", "m")
 
-		if err := host.Assign(fence, parent); err != nil {
-			t.Fatalf("Assign parent: %v", err)
-		}
-		if err := host.Assign(fence, child); !errors.Is(err, ErrOverlapping) {
+		mustAssign(t, host, fence, parent)
+		if _, err := host.Assign(fence, child); !errors.Is(err, ErrOverlapping) {
 			t.Fatalf("want ErrOverlapping, got %v", err)
 		}
 		wantState(t, host, child, StateUnassigned)
@@ -209,10 +221,8 @@ func TestOverlappingAssignmentFailsClosed(t *testing.T) {
 
 	t.Run("other tables are unaffected", func(t *testing.T) {
 		host, _, fence := newTestHost(t)
-		if err := host.Assign(fence, extent("2", "", "")); err != nil {
-			t.Fatalf("Assign: %v", err)
-		}
-		if err := host.Assign(fence, extent("3", "", "")); err != nil {
+		mustAssign(t, host, fence, extent("2", "", ""))
+		if _, err := host.Assign(fence, extent("3", "", "")); err != nil {
 			t.Fatalf("the same range in another table must be assignable: %v", err)
 		}
 	})
@@ -220,7 +230,7 @@ func TestOverlappingAssignmentFailsClosed(t *testing.T) {
 
 func TestAssignRejectsMalformedExtent(t *testing.T) {
 	host, _, fence := newTestHost(t)
-	if err := host.Assign(fence, extent("2", "m", "d")); !errors.Is(err, ErrInvalidExtent) {
+	if _, err := host.Assign(fence, extent("2", "m", "d")); !errors.Is(err, ErrInvalidExtent) {
 		t.Fatalf("want ErrInvalidExtent, got %v", err)
 	}
 	if len(host.Tablets()) != 0 {
@@ -235,17 +245,17 @@ func TestStaleServerLockFailsClosed(t *testing.T) {
 	e := extent("2", "", "m")
 
 	stale := Fence{Server: serverLock(lock.Sequence - 1), Manager: fence.Manager}
-	if err := host.Assign(stale, e); !errors.Is(err, ErrStaleServerLock) {
+	if _, err := host.Assign(stale, e); !errors.Is(err, ErrStaleServerLock) {
 		t.Fatalf("older lock: want ErrStaleServerLock, got %v", err)
 	}
 	// A generation we do not hold yet is equally unusable.
 	ahead := Fence{Server: serverLock(lock.Sequence + 1), Manager: fence.Manager}
-	if err := host.Assign(ahead, e); !errors.Is(err, ErrStaleServerLock) {
+	if _, err := host.Assign(ahead, e); !errors.Is(err, ErrStaleServerLock) {
 		t.Fatalf("unheld lock: want ErrStaleServerLock, got %v", err)
 	}
 	// Same sequence, different holder: ambiguous, so refuse.
 	other := Fence{Server: LockID{UUID: otherUUID, Sequence: lock.Sequence}, Manager: fence.Manager}
-	if err := host.Assign(other, e); !errors.Is(err, ErrStaleServerLock) {
+	if _, err := host.Assign(other, e); !errors.Is(err, ErrStaleServerLock) {
 		t.Fatalf("other holder: want ErrStaleServerLock, got %v", err)
 	}
 
@@ -262,25 +272,23 @@ func TestSupersededManagerCannotCountermandTheLiveOne(t *testing.T) {
 	host, lock, fence := newTestHost(t)
 	old, current := extent("2", "", "m"), extent("2", "m", "")
 
-	if err := host.Assign(fence, old); err != nil {
-		t.Fatalf("Assign: %v", err)
-	}
+	mustAssign(t, host, fence, old)
 
 	newer := Fence{Server: lock, Manager: managerLock(fence.Manager.Sequence + 1)}
-	if err := host.Assign(newer, current); err != nil {
+	if _, err := host.Assign(newer, current); err != nil {
 		t.Fatalf("a newer manager is the authority: %v", err)
 	}
 	if got, ok := host.ManagerLock(); !ok || !got.Equal(newer.Manager) {
 		t.Fatalf("manager lock = %s (held=%v), want %s", got, ok, newer.Manager)
 	}
 
-	if err := host.Unassign(fence, current, UnloadImmediate); !errors.Is(err, ErrStaleManagerLock) {
+	if _, err := host.Unassign(fence, current, UnloadImmediate); !errors.Is(err, ErrStaleManagerLock) {
 		t.Fatalf("superseded manager: want ErrStaleManagerLock, got %v", err)
 	}
 	wantState(t, host, current, StateLoading)
 
 	unstamped := Fence{Server: lock}
-	if err := host.Assign(unstamped, extent("2", "q", "z")); !errors.Is(err, ErrStaleManagerLock) {
+	if _, err := host.Assign(unstamped, extent("2", "q", "z")); !errors.Is(err, ErrStaleManagerLock) {
 		t.Fatalf("missing manager lock: want ErrStaleManagerLock, got %v", err)
 	}
 }
@@ -289,28 +297,32 @@ func TestSupersededManagerCannotCountermandTheLiveOne(t *testing.T) {
 // stops being routable as soon as the manager asks for it back, but is only
 // released once the drain finishes.
 func TestGracefulUnloadDrainsThenReleases(t *testing.T) {
-	host, lock, fence := newTestHost(t)
+	host, _, fence := newTestHost(t)
 	e := extent("2", "", "m")
 	hostTablet(t, host, fence, e)
 
-	if err := host.Unassign(fence, e, UnloadGraceful); err != nil {
+	drain, err := host.Unassign(fence, e, UnloadGraceful)
+	if err != nil {
 		t.Fatalf("Unassign: %v", err)
+	}
+	if !drain.Valid() {
+		t.Fatal("a graceful unassignment must hand back the attempt to finish")
 	}
 	wantState(t, host, e, StateUnloading)
 	wantHosted(t, host) // no longer routable
 
 	// Still assigned here, so it cannot be handed back to this host yet.
-	if err := host.Assign(fence, e); !errors.Is(err, ErrAlreadyAssigned) {
+	if _, err := host.Assign(fence, e); !errors.Is(err, ErrAlreadyAssigned) {
 		t.Fatalf("re-assign while draining: want ErrAlreadyAssigned, got %v", err)
 	}
 
-	if err := host.UnloadComplete(lock, e); err != nil {
+	if err := host.UnloadComplete(drain); err != nil {
 		t.Fatalf("UnloadComplete: %v", err)
 	}
 	wantState(t, host, e, StateUnassigned)
 
 	// Released: the manager can migrate it straight back.
-	if err := host.Assign(fence, e); err != nil {
+	if _, err := host.Assign(fence, e); err != nil {
 		t.Fatalf("re-assign after release: %v", err)
 	}
 
@@ -326,13 +338,15 @@ func TestImmediateUnloadReleasesAtOnce(t *testing.T) {
 	host, _, fence := newTestHost(t)
 	hosted, loading := extent("2", "", "m"), extent("2", "m", "")
 	hostTablet(t, host, fence, hosted)
-	if err := host.Assign(fence, loading); err != nil {
-		t.Fatalf("Assign: %v", err)
-	}
+	mustAssign(t, host, fence, loading)
 
 	for _, e := range []Extent{hosted, loading} {
-		if err := host.Unassign(fence, e, UnloadImmediate); err != nil {
+		drain, err := host.Unassign(fence, e, UnloadImmediate)
+		if err != nil {
 			t.Fatalf("Unassign(%s): %v", e, err)
+		}
+		if drain.Valid() {
+			t.Fatalf("an immediate unload leaves nothing to finish, got %s", drain)
 		}
 		wantState(t, host, e, StateUnassigned)
 	}
@@ -347,25 +361,34 @@ func TestImmediateUnloadReleasesAtOnce(t *testing.T) {
 // unassigning a tablet this host never had: the requested end state already
 // holds, so there is nothing to refuse.
 func TestUnassignIsIdempotent(t *testing.T) {
-	host, lock, fence := newTestHost(t)
+	host, _, fence := newTestHost(t)
 	e := extent("2", "", "m")
 
-	if err := host.Unassign(fence, e, UnloadGraceful); err != nil {
+	unknown, err := host.Unassign(fence, e, UnloadGraceful)
+	if err != nil {
 		t.Fatalf("unknown extent: %v", err)
 	}
+	if unknown.Valid() {
+		t.Fatalf("a tablet we never had leaves nothing to finish, got %s", unknown)
+	}
 	hostTablet(t, host, fence, e)
-	if err := host.Unassign(fence, e, UnloadGraceful); err != nil {
+	first, err := host.Unassign(fence, e, UnloadGraceful)
+	if err != nil {
 		t.Fatalf("first unassign: %v", err)
 	}
-	if err := host.Unassign(fence, e, UnloadGraceful); err != nil {
+	repeat, err := host.Unassign(fence, e, UnloadGraceful)
+	if err != nil {
 		t.Fatalf("repeated unassign: %v", err)
+	}
+	if !repeat.Equal(first) {
+		t.Fatalf("a repeated unassign must name the same drain: %s then %s", first, repeat)
 	}
 	wantState(t, host, e, StateUnloading)
 
-	if err := host.UnloadComplete(lock, e); err != nil {
+	if err := host.UnloadComplete(first); err != nil {
 		t.Fatalf("UnloadComplete: %v", err)
 	}
-	if err := host.Unassign(fence, e, UnloadImmediate); err != nil {
+	if _, err := host.Unassign(fence, e, UnloadImmediate); err != nil {
 		t.Fatalf("unassign after release: %v", err)
 	}
 	if metrics := host.Metrics(); metrics.Unloads != 1 {
@@ -374,18 +397,16 @@ func TestUnassignIsIdempotent(t *testing.T) {
 }
 
 func TestLoadFailedReleasesTheAssignment(t *testing.T) {
-	host, lock, fence := newTestHost(t)
+	host, _, fence := newTestHost(t)
 	e := extent("2", "", "m")
-	if err := host.Assign(fence, e); err != nil {
-		t.Fatalf("Assign: %v", err)
-	}
+	attempt := mustAssign(t, host, fence, e)
 
-	if err := host.LoadFailed(lock, e); err != nil {
+	if err := host.LoadFailed(attempt); err != nil {
 		t.Fatalf("LoadFailed: %v", err)
 	}
 	wantState(t, host, e, StateUnassigned)
 
-	if err := host.LoadFailed(lock, e); !errors.Is(err, ErrNotAssigned) {
+	if err := host.LoadFailed(attempt); !errors.Is(err, ErrNotAssigned) {
 		t.Fatalf("want ErrNotAssigned, got %v", err)
 	}
 	if metrics := host.Metrics(); metrics.LoadFailures != 1 {
@@ -397,36 +418,40 @@ func TestLoadFailedReleasesTheAssignment(t *testing.T) {
 // after the manager already took the tablet back: publishing it would host a
 // tablet the manager has reassigned, so the load must release it instead.
 func TestLoadCompleteAfterUnassignDoesNotRepublish(t *testing.T) {
-	host, lock, fence := newTestHost(t)
+	host, _, fence := newTestHost(t)
 	e := extent("2", "", "m")
-	if err := host.Assign(fence, e); err != nil {
-		t.Fatalf("Assign: %v", err)
-	}
-	if err := host.Unassign(fence, e, UnloadGraceful); err != nil {
+	attempt := mustAssign(t, host, fence, e)
+	drain, err := host.Unassign(fence, e, UnloadGraceful)
+	if err != nil {
 		t.Fatalf("Unassign: %v", err)
 	}
+	// The drain is the same attempt, so the loader can finish with the handle
+	// it already holds.
+	if !drain.Equal(attempt) {
+		t.Fatalf("drain %s must be the loading attempt %s", drain, attempt)
+	}
 
-	if err := host.LoadComplete(lock, e); !errors.Is(err, ErrWrongState) {
+	if err := host.LoadComplete(attempt); !errors.Is(err, ErrWrongState) {
 		t.Fatalf("want ErrWrongState, got %v", err)
 	}
 	wantState(t, host, e, StateUnloading)
 	wantHosted(t, host)
 
-	if err := host.UnloadComplete(lock, e); err != nil {
+	if err := host.UnloadComplete(attempt); err != nil {
 		t.Fatalf("UnloadComplete: %v", err)
 	}
 	wantState(t, host, e, StateUnassigned)
 }
 
 func TestCompletionsRejectWrongState(t *testing.T) {
-	host, lock, fence := newTestHost(t)
+	host, _, fence := newTestHost(t)
 	e := extent("2", "", "m")
-	hostTablet(t, host, fence, e)
+	attempt := hostTablet(t, host, fence, e)
 
-	if err := host.LoadComplete(lock, e); !errors.Is(err, ErrWrongState) {
+	if err := host.LoadComplete(attempt); !errors.Is(err, ErrWrongState) {
 		t.Fatalf("LoadComplete on a hosted tablet: want ErrWrongState, got %v", err)
 	}
-	if err := host.UnloadComplete(lock, e); !errors.Is(err, ErrWrongState) {
+	if err := host.UnloadComplete(attempt); !errors.Is(err, ErrWrongState) {
 		t.Fatalf("UnloadComplete on a hosted tablet: want ErrWrongState, got %v", err)
 	}
 	wantState(t, host, e, StateHosted)
@@ -440,12 +465,10 @@ func TestLockLossDropsEverything(t *testing.T) {
 	host, lock, fence := newTestHost(t)
 	loading, hosted, draining := extent("2", "", "d"), extent("2", "d", "m"), extent("2", "m", "")
 
-	if err := host.Assign(fence, loading); err != nil {
-		t.Fatalf("Assign: %v", err)
-	}
+	loadingAttempt := mustAssign(t, host, fence, loading)
 	hostTablet(t, host, fence, hosted)
 	hostTablet(t, host, fence, draining)
-	if err := host.Unassign(fence, draining, UnloadGraceful); err != nil {
+	if _, err := host.Unassign(fence, draining, UnloadGraceful); err != nil {
 		t.Fatalf("Unassign: %v", err)
 	}
 
@@ -464,10 +487,10 @@ func TestLockLossDropsEverything(t *testing.T) {
 	}
 
 	// In-flight work stamped with the lost lock must not publish anything.
-	if err := host.LoadComplete(lock, loading); !errors.Is(err, ErrNoLock) {
+	if err := host.LoadComplete(loadingAttempt); !errors.Is(err, ErrNoLock) {
 		t.Fatalf("want ErrNoLock, got %v", err)
 	}
-	if err := host.Assign(fence, hosted); !errors.Is(err, ErrNoLock) {
+	if _, err := host.Assign(fence, hosted); !errors.Is(err, ErrNoLock) {
 		t.Fatalf("want ErrNoLock, got %v", err)
 	}
 
@@ -503,10 +526,10 @@ func TestReacquiredLockStartsEmpty(t *testing.T) {
 	}
 	wantState(t, host, e, StateUnassigned)
 
-	if err := host.Assign(fence, e); !errors.Is(err, ErrStaleServerLock) {
+	if _, err := host.Assign(fence, e); !errors.Is(err, ErrStaleServerLock) {
 		t.Fatalf("old-generation assign: want ErrStaleServerLock, got %v", err)
 	}
-	if err := host.Assign(Fence{Server: reacquired, Manager: fence.Manager}, e); err != nil {
+	if _, err := host.Assign(Fence{Server: reacquired, Manager: fence.Manager}, e); err != nil {
 		t.Fatalf("assign under the new generation: %v", err)
 	}
 	wantState(t, host, e, StateLoading)
@@ -525,9 +548,7 @@ func TestAdoptLockGuards(t *testing.T) {
 		t.Fatalf("older generation: want ErrLockNotNewer, got %v", err)
 	}
 
-	if err := host.Assign(fence, extent("2", "", "m")); err != nil {
-		t.Fatalf("Assign: %v", err)
-	}
+	mustAssign(t, host, fence, extent("2", "", "m"))
 	if err := host.AdoptLock(serverLock(lock.Sequence + 1)); !errors.Is(err, ErrTabletsAssigned) {
 		t.Fatalf("adopting while hosting: want ErrTabletsAssigned, got %v", err)
 	}
@@ -542,14 +563,12 @@ func TestAdoptLockGuards(t *testing.T) {
 // TestAssignCopiesExtentBounds makes sure a caller reusing its row buffers
 // cannot rewrite what the host thinks it hosts.
 func TestAssignCopiesExtentBounds(t *testing.T) {
-	host, lock, fence := newTestHost(t)
+	host, _, fence := newTestHost(t)
 	end := []byte("m")
 	e := Extent{TableID: "2", EndRow: end}
 
-	if err := host.Assign(fence, e); err != nil {
-		t.Fatalf("Assign: %v", err)
-	}
-	if err := host.LoadComplete(lock, e); err != nil {
+	attempt := mustAssign(t, host, fence, e)
+	if err := host.LoadComplete(attempt); err != nil {
 		t.Fatalf("LoadComplete: %v", err)
 	}
 	end[0] = 'z'
@@ -558,6 +577,12 @@ func TestAssignCopiesExtentBounds(t *testing.T) {
 	hosted := host.Hosted()
 	hosted[0].EndRow[0] = 'q'
 	wantHosted(t, host, "2;m;<")
+
+	// The attempt carries its own copy too, so a caller cannot retarget the
+	// completion it is holding.
+	if got := attempt.Extent(); !got.Equal(Extent{TableID: "2", EndRow: []byte("m")}) {
+		t.Fatalf("attempt extent = %s, want 2;m;<", got)
+	}
 }
 
 // TestConcurrentAssignHostsOnce is the race the fence exists for: several
@@ -577,7 +602,7 @@ func TestConcurrentAssignHostsOnce(t *testing.T) {
 	for i := 0; i < attempts; i++ {
 		go func() {
 			defer wg.Done()
-			err := host.Assign(fence, e)
+			_, err := host.Assign(fence, e)
 			mu.Lock()
 			defer mu.Unlock()
 			switch {
@@ -614,7 +639,7 @@ func TestConcurrentAssignAndLockLoss(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			e := Extent{TableID: "2", PrevEndRow: []byte{byte('a' + i)}, EndRow: []byte{byte('a' + i), 0}}
-			if err := host.Assign(fence, e); err != nil && !errors.Is(err, ErrNoLock) {
+			if _, err := host.Assign(fence, e); err != nil && !errors.Is(err, ErrNoLock) {
 				t.Errorf("assign %s: unexpected error: %v", e, err)
 			}
 		}(i)
@@ -681,7 +706,7 @@ func TestUnassignRejectsUnknownMode(t *testing.T) {
 	e := extent("2", "", "m")
 	hostTablet(t, host, fence, e)
 
-	if err := host.Unassign(fence, e, UnloadMode(42)); !errors.Is(err, ErrInvalidUnloadMode) {
+	if _, err := host.Unassign(fence, e, UnloadMode(42)); !errors.Is(err, ErrInvalidUnloadMode) {
 		t.Fatalf("want ErrInvalidUnloadMode, got %v", err)
 	}
 	wantState(t, host, e, StateHosted)
@@ -702,7 +727,7 @@ func TestUnassignReleasesTabletSpelledWithEmptyBound(t *testing.T) {
 	spelledEmpty := Extent{TableID: "2", PrevEndRow: []byte{}, EndRow: []byte("m")}
 
 	hostTablet(t, host, fence, assigned)
-	if err := host.Unassign(fence, spelledEmpty, UnloadImmediate); err != nil {
+	if _, err := host.Unassign(fence, spelledEmpty, UnloadImmediate); err != nil {
 		t.Fatalf("Unassign: %v", err)
 	}
 	wantState(t, host, assigned, StateUnassigned)
@@ -713,11 +738,131 @@ func TestUnassignReleasesTabletSpelledWithEmptyBound(t *testing.T) {
 
 	// The reverse spelling is also the same tablet, so re-assigning it is a
 	// duplicate rather than a second tablet covering the same rows.
-	if err := host.Assign(fence, spelledEmpty); err != nil {
-		t.Fatalf("Assign: %v", err)
-	}
-	if err := host.Assign(fence, assigned); !errors.Is(err, ErrAlreadyAssigned) {
+	mustAssign(t, host, fence, spelledEmpty)
+	if _, err := host.Assign(fence, assigned); !errors.Is(err, ErrAlreadyAssigned) {
 		t.Fatalf("want ErrAlreadyAssigned, got %v", err)
+	}
+}
+
+// TestStaleCompletionCannotDisturbALaterAssignment is the hazard the attempt
+// handle exists for. The manager may unassign a tablet and assign it here
+// again without the ServiceLock ever changing, so extent, lock and state all
+// match a second time. A completion left over from the first assignment would
+// otherwise land on the second one — releasing a tablet that is still loading,
+// or publishing one whose data is not loaded yet.
+func TestStaleCompletionCannotDisturbALaterAssignment(t *testing.T) {
+	// Both completions are checked from the same starting point: a tablet
+	// assigned, taken back, and assigned here again under one lock.
+	setup := func(t *testing.T) (*Host, Fence, Extent, Attempt, Attempt) {
+		t.Helper()
+		host, _, fence := newTestHost(t)
+		e := extent("2", "", "m")
+
+		first := mustAssign(t, host, fence, e)
+		if _, err := host.Unassign(fence, e, UnloadImmediate); err != nil {
+			t.Fatalf("Unassign: %v", err)
+		}
+		second := mustAssign(t, host, fence, e)
+		if first.Equal(second) {
+			t.Fatal("a second assignment must not reuse the first attempt")
+		}
+		return host, fence, e, first, second
+	}
+
+	t.Run("late failure does not release the new assignment", func(t *testing.T) {
+		host, _, e, first, second := setup(t)
+
+		if err := host.LoadFailed(first); !errors.Is(err, ErrStaleAttempt) {
+			t.Fatalf("want ErrStaleAttempt, got %v", err)
+		}
+		wantState(t, host, e, StateLoading)
+		if metrics := host.Metrics(); metrics.LoadFailures != 0 || metrics.RejectedStale != 1 {
+			t.Fatalf("metrics = %+v", metrics)
+		}
+
+		// The assignment that is actually loading still finishes normally.
+		if err := host.LoadComplete(second); err != nil {
+			t.Fatalf("LoadComplete: %v", err)
+		}
+		wantHosted(t, host, "2;m;<")
+	})
+
+	t.Run("late success does not publish the new assignment", func(t *testing.T) {
+		host, _, e, first, second := setup(t)
+
+		if err := host.LoadComplete(first); !errors.Is(err, ErrStaleAttempt) {
+			t.Fatalf("want ErrStaleAttempt, got %v", err)
+		}
+		wantState(t, host, e, StateLoading)
+		wantHosted(t, host) // never loaded, so never routable
+		if metrics := host.Metrics(); metrics.Loads != 0 {
+			t.Fatalf("a stale load was published: %+v", metrics)
+		}
+
+		if err := host.LoadFailed(second); err != nil {
+			t.Fatalf("LoadFailed: %v", err)
+		}
+		wantState(t, host, e, StateUnassigned)
+	})
+
+	t.Run("late drain does not release the new assignment", func(t *testing.T) {
+		host, fence, e, _, second := setup(t)
+
+		if err := host.LoadComplete(second); err != nil {
+			t.Fatalf("LoadComplete: %v", err)
+		}
+		drain, err := host.Unassign(fence, e, UnloadGraceful)
+		if err != nil {
+			t.Fatalf("Unassign: %v", err)
+		}
+		if err := host.UnloadComplete(drain); err != nil {
+			t.Fatalf("UnloadComplete: %v", err)
+		}
+		third := mustAssign(t, host, fence, e)
+
+		if err := host.UnloadComplete(drain); !errors.Is(err, ErrStaleAttempt) {
+			t.Fatalf("want ErrStaleAttempt, got %v", err)
+		}
+		wantState(t, host, e, StateLoading)
+		if err := host.LoadComplete(third); err != nil {
+			t.Fatalf("LoadComplete: %v", err)
+		}
+		wantHosted(t, host, "2;m;<")
+	})
+}
+
+// TestCompletionsRejectUnmintedAttempts covers a caller that fabricates a
+// completion instead of carrying the handle Assign gave it. The zero Attempt
+// names no assignment, so it can never satisfy one.
+func TestCompletionsRejectUnmintedAttempts(t *testing.T) {
+	host, _, fence := newTestHost(t)
+	e := extent("2", "", "m")
+	hostTablet(t, host, fence, e)
+
+	for name, err := range map[string]error{
+		"LoadComplete":   host.LoadComplete(Attempt{}),
+		"LoadFailed":     host.LoadFailed(Attempt{}),
+		"UnloadComplete": host.UnloadComplete(Attempt{}),
+	} {
+		if !errors.Is(err, ErrStaleAttempt) {
+			t.Fatalf("%s(zero attempt): want ErrStaleAttempt, got %v", name, err)
+		}
+	}
+	wantState(t, host, e, StateHosted)
+	wantHosted(t, host, "2;m;<")
+}
+
+// TestAttemptString keeps the log rendering readable, including the zero
+// value a caller may hold after an unassignment that had nothing to finish.
+func TestAttemptString(t *testing.T) {
+	if got := (Attempt{}).String(); got != "attempt#<none>" {
+		t.Fatalf("zero attempt = %q", got)
+	}
+	host, lock, fence := newTestHost(t)
+	attempt := mustAssign(t, host, fence, extent("2", "", "m"))
+	want := fmt.Sprintf("attempt#1(2;m;< under %s)", lock)
+	if got := attempt.String(); got != want {
+		t.Fatalf("attempt = %q, want %q", got, want)
 	}
 }
 
@@ -730,27 +875,27 @@ func TestOverlapDetectionSurvivesRelease(t *testing.T) {
 
 	hostTablet(t, host, fence, left)
 	hostTablet(t, host, fence, right)
-	if err := host.Assign(fence, whole); !errors.Is(err, ErrOverlapping) {
+	if _, err := host.Assign(fence, whole); !errors.Is(err, ErrOverlapping) {
 		t.Fatalf("parent over both children: want ErrOverlapping, got %v", err)
 	}
 
-	if err := host.Unassign(fence, left, UnloadImmediate); err != nil {
+	if _, err := host.Unassign(fence, left, UnloadImmediate); err != nil {
 		t.Fatalf("Unassign(left): %v", err)
 	}
-	if err := host.Assign(fence, whole); !errors.Is(err, ErrOverlapping) {
+	if _, err := host.Assign(fence, whole); !errors.Is(err, ErrOverlapping) {
 		t.Fatalf("parent over the remaining child: want ErrOverlapping, got %v", err)
 	}
-	if err := host.Assign(fence, left); err != nil {
+	if _, err := host.Assign(fence, left); err != nil {
 		t.Fatalf("the released child must be assignable again: %v", err)
 	}
-	if err := host.Unassign(fence, left, UnloadImmediate); err != nil {
+	if _, err := host.Unassign(fence, left, UnloadImmediate); err != nil {
 		t.Fatalf("Unassign(left): %v", err)
 	}
 
-	if err := host.Unassign(fence, right, UnloadImmediate); err != nil {
+	if _, err := host.Unassign(fence, right, UnloadImmediate); err != nil {
 		t.Fatalf("Unassign(right): %v", err)
 	}
-	if err := host.Assign(fence, whole); err != nil {
+	if _, err := host.Assign(fence, whole); err != nil {
 		t.Fatalf("with both children gone the parent must fit: %v", err)
 	}
 }
@@ -831,7 +976,7 @@ func TestOverlapIndexMatchesFullScan(t *testing.T) {
 			if _, tracked := host.tablets[e.key()]; tracked {
 				released++
 			}
-			if err := host.Unassign(fence, e, UnloadImmediate); err != nil {
+			if _, err := host.Unassign(fence, e, UnloadImmediate); err != nil {
 				t.Fatalf("step %d: Unassign(%s): %v", step, e, err)
 			}
 			checkIndex(t, host)
@@ -840,7 +985,7 @@ func TestOverlapIndexMatchesFullScan(t *testing.T) {
 
 		_, wantDuplicate := host.tablets[e.key()]
 		wantOverlap := anyOverlapByScan(host, e)
-		err := host.Assign(fence, e)
+		_, err := host.Assign(fence, e)
 		switch {
 		case wantDuplicate:
 			duplicate++
