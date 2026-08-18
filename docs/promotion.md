@@ -202,6 +202,40 @@ RFileExportManifest (existing)  →  promotion.BuildLoadMapping
   and `os.Stat` + `os.SameFile` fallback, so a symlink aliasing a path
   that itself doesn't exist yet (nothing for `os.SameFile` to compare)
   is still caught by comparing the symlink's resolved target lexically.
+  Symlink-target resolution also walks a path's ancestor directory
+  components, not only its own final component: a relative symlink
+  reached through a *symlinked parent directory* (for example
+  `bulk/alias -> "."` with `bulk/A.rf -> alias/B.rf`, where
+  `bulk/B.rf` doesn't exist yet) is resolved to the same
+  not-yet-existing `bulk/B.rf` target either path would actually reach,
+  rather than being compared as if `alias/B.rf` were itself the final,
+  non-symlink spelling. This ancestor walk deliberately avoids
+  `filepath.EvalSymlinks`, which on Windows also silently expands 8.3
+  short names (e.g. `MARCPA~1` to a real user's long name) even when no
+  symlink is present anywhere in the path, which would otherwise break
+  lexical comparison against a path that was never resolved; instead it
+  substitutes a resolved spelling only where `os.Lstat` actually
+  confirms a real symlink, leaving every other component untouched.
+  On Windows specifically, the lexical comparison also strips trailing
+  dots and spaces from every path component before comparing: Win32's
+  own path resolution silently discards them, so `A.rf`, `A.rf.`, and
+  `A.rf ` can all name the same not-yet-created file there even though
+  they are three distinct strings. This is gated to `runtime.GOOS ==
+  "windows"` rather than to a path's apparent syntax, since the quirk
+  depends on the filesystem the write actually lands on (always this
+  process's own OS for the local backend) — unconditionally stripping
+  trailing dots/spaces would misreport genuinely distinct filenames as
+  aliases on Linux/macOS, where a trailing dot or space is ordinary,
+  significant content.
+  `joinBulkPath` and the `bulkDir` root-validation preflight both
+  recognize a non-local write target the same, deliberately generic
+  way `internal/engine`'s own backend-path joining does: any
+  `scheme://...`-shaped path (plus HDFS's authorityless `hdfs:/` form)
+  is treated as backend-style, not only the four schemes
+  (`s3/gs/az/hdfs`) this package knows how to canonicalize for alias
+  comparison — so a custom or future backend with its own URI scheme
+  still joins with `/` and validates correctly instead of silently
+  falling through to a native, OS-specific `filepath.Join`.
 - `internal/promotion.Promote` — composes `StageBulkDir` with a
   `BulkImporter` (satisfied by `*accumulo.Connector`) to submit the FATE
   call. Submits nothing when the derived mapping is empty (nothing to

@@ -7,6 +7,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	"golang.org/x/text/unicode/norm"
@@ -292,7 +293,10 @@ func (c pathIdentityCache) symlinkTarget(path string) (string, bool) {
 // case-insensitive lexical check (to conservatively catch not-yet-created
 // aliases on Windows and macOS's default filesystems, both of which fold
 // case and normalize Unicode spellings such as composed vs decomposed
-// "é" when resolving filenames), plus os.Stat + os.SameFile so
+// "é" when resolving filenames), a further Windows-only fallback that
+// also strips trailing dots and spaces from each path component (Win32
+// silently discards them, so "A.rf", "A.rf.", and "A.rf " can all name
+// the same not-yet-created file there), plus os.Stat + os.SameFile so
 // equivalent absolute/relative spellings and symlink/hardlink aliases
 // are caught too.
 func pathsAlias(srcPath, dstPath stagePathRef, cache pathIdentityCache) bool {
@@ -352,15 +356,63 @@ func localSymlinkTargetsAlias(srcPath, dstPath string, cache pathIdentityCache) 
 // filenames the same way it folds case, so without this a case-only
 // check would still miss a real alias there whenever neither
 // destination has been created yet for os.Stat + os.SameFile to catch.
+// When running on Windows, a further pass also strips trailing dots
+// and spaces from every path component before comparing: Win32's own
+// path resolution (RtlDosPathNameToNtPathName_U, used by os.Stat,
+// os.Open, and os.Create) silently discards them, so "A.rf.", "A.rf ",
+// and "A.rf" all name the same file on NTFS even though they are three
+// distinct byte strings. This is gated to GOOS == "windows" because on
+// Linux/macOS a trailing dot or space is a normal, significant part of
+// the filename: two paths differing only by one would be genuinely
+// different files there, and stripping it unconditionally would
+// misreport them as aliases.
 func localPathsLexicallyAlias(srcPath, dstPath string) bool {
 	srcClean := normalizeLocalPathForAlias(srcPath)
 	dstClean := normalizeLocalPathForAlias(dstPath)
 	if srcClean == dstClean {
 		return true
 	}
-	return strings.EqualFold(norm.NFC.String(srcClean), norm.NFC.String(dstClean))
+	if strings.EqualFold(norm.NFC.String(srcClean), norm.NFC.String(dstClean)) {
+		return true
+	}
+	if runtime.GOOS != "windows" {
+		return false
+	}
+	return strings.EqualFold(
+		norm.NFC.String(trimWindowsTrailingDotsAndSpaces(srcClean)),
+		norm.NFC.String(trimWindowsTrailingDotsAndSpaces(dstClean)),
+	)
 }
 
+// trimWindowsTrailingDotsAndSpaces strips trailing dots and spaces
+// from every component of path (not only its final component: Win32
+// path resolution applies this to intermediate directory names too),
+// mirroring the same silent normalization os.Stat/os.Open/os.Create
+// perform on Windows before this package's aliasing checks ever get a
+// chance to os.Stat either side.
+func trimWindowsTrailingDotsAndSpaces(path string) string {
+	vol := filepath.VolumeName(path)
+	rest := path[len(vol):]
+	sep := string(filepath.Separator)
+	segments := strings.Split(rest, sep)
+	for i, seg := range segments {
+		segments[i] = strings.TrimRight(seg, ". ")
+	}
+	return vol + strings.Join(segments, sep)
+}
+
+// resolveLocalSymlinkTarget resolves path if it is itself a symlink,
+// following a bounded chain of whole-path symlinks, then resolves any
+// symlinks in the *ancestor* directories of the result via
+// resolveExistingAncestor. The second step matters because a relative
+// symlink target can traverse a symlinked parent directory on its way
+// to a file that does not exist yet: for example bulkDir/A.rf ->
+// alias/B.rf where bulkDir/alias -> "." and bulkDir/B.rf does not
+// exist. Stopping at the first failed os.Lstat (as a whole-path-only
+// resolution does) returns bulkDir/alias/B.rf, which is lexically
+// different from the literal bulkDir/B.rf even though writing through
+// either path reaches the same not-yet-created location once the
+// symlinked "alias" directory is followed.
 func resolveLocalSymlinkTarget(path string) (string, bool) {
 	const maxSymlinkHops = 40
 
@@ -381,13 +433,59 @@ func resolveLocalSymlinkTarget(path string) (string, bool) {
 
 		info, err = os.Lstat(current)
 		if err != nil {
-			return current, true
+			return resolveExistingAncestor(current), true
 		}
 		if info.Mode()&os.ModeSymlink == 0 {
-			return current, true
+			return resolveExistingAncestor(current), true
 		}
 	}
-	return current, true
+	return resolveExistingAncestor(current), true
+}
+
+// resolveExistingAncestor resolves path if some ancestor path prefix
+// (parent, grandparent, and so on -- not necessarily just the
+// immediate parent) is itself a symlink, so a relative symlink target
+// that traverses a symlinked parent directory on its way to a
+// not-yet-created file compares correctly against a literal
+// destination path. It deliberately does NOT use
+// filepath.EvalSymlinks: that resolves the entire existing path
+// prefix through the platform's native path-resolution APIs, which on
+// Windows can silently change a path's *spelling* even where no
+// symlink is involved anywhere -- for example expanding a short
+// 8.3-style component such as MARCPA~1 to its long form -- which
+// would make an unrelated, never-symlinked path compare unequal to
+// another path purely because one of them happened to pass through
+// EvalSymlinks. Instead this walks one path component at a time via
+// os.Lstat/os.Readlink and substitutes a resolved value only where a
+// real symlink is actually found, leaving every other component's
+// original spelling untouched; a path with no symlinked ancestor
+// anywhere is returned completely unchanged.
+func resolveExistingAncestor(path string) string {
+	return resolveAncestorSymlinks(path, 0)
+}
+
+func resolveAncestorSymlinks(path string, hops int) string {
+	const maxHops = 40
+
+	if info, err := os.Lstat(path); err == nil && info.Mode()&os.ModeSymlink != 0 && hops < maxHops {
+		target, err := os.Readlink(path)
+		if err == nil {
+			if !filepath.IsAbs(target) {
+				target = filepath.Join(filepath.Dir(path), target)
+			}
+			return resolveAncestorSymlinks(filepath.Clean(target), hops+1)
+		}
+	}
+
+	parent := filepath.Dir(path)
+	if parent == path {
+		return path
+	}
+	resolvedParent := resolveAncestorSymlinks(parent, hops)
+	if resolvedParent == parent {
+		return path
+	}
+	return filepath.Join(resolvedParent, filepath.Base(path))
 }
 
 func usesLocalFilesystemSemantics(ref stagePathRef) bool {

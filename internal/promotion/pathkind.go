@@ -13,15 +13,24 @@ func looksLikeWindowsDrivePath(path string) bool {
 	return windowsDrivePathRe.MatchString(path)
 }
 
+// pathUsesBackendSeparatorJoin reports whether path is a backend URL
+// root that must be joined with a literal "/" (mirroring engine's own
+// joinBackendPath) rather than filepath.Join. This is deliberately
+// generic -- any scheme://... path, not only the four backends this
+// package knows how to canonicalize (s3/gs/az/hdfs) -- so a custom or
+// future backend whose paths use their own URI scheme (for example a
+// test-only or in-memory backend) still joins and validates correctly
+// instead of silently falling through to a native filepath.Join that
+// would collapse the scheme's "//" or use OS-native separators.
+// pathLooksURLLike already excludes Windows drive paths such as
+// "C://data" from looking like a URL. hdfs:/ (single slash, no
+// authority) is also treated as backend-style even though it has no
+// "://" substring, matching Hadoop's own authorityless HDFS URI form.
 func pathUsesBackendSeparatorJoin(path string) bool {
-	switch explicitBackendScheme(path) {
-	case "s3", "gs", "az":
+	if pathLooksURLLike(path) {
 		return true
-	case "hdfs":
-		return strings.HasPrefix(path, "hdfs:/")
-	default:
-		return false
 	}
+	return strings.HasPrefix(path, "hdfs:/")
 }
 
 func pathLooksURLLike(path string) bool {

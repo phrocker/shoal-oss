@@ -330,6 +330,7 @@ func TestPathUsesBackendSeparatorJoin(t *testing.T) {
 		{name: "opaque hdfs URI is not a joined backend path", path: "hdfs:tables/F0001.rf", want: false},
 		{name: "windows drive path is local", path: `C://data/F0001.rf`, want: false},
 		{name: "plain local path is local", path: `C:\data\F0001.rf`, want: false},
+		{name: "generic non-builtin backend scheme", path: "memory://bucket/F0001.rf", want: true},
 	}
 
 	for _, tt := range tests {
@@ -348,6 +349,21 @@ func TestJoinBulkPathTreatsWindowsDrivePathAsLocal(t *testing.T) {
 	}
 	if !localPathsLexicallyAlias(got, `C:\data\F0001.rf`) {
 		t.Fatalf("joinBulkPath(%q, %q) = %q, want a local Windows-drive path aliasing %q", `C://data`, "F0001.rf", got, `C:\data\F0001.rf`)
+	}
+}
+
+// TestJoinBulkPathUsesSeparatorJoinForGenericBackendScheme proves
+// joinBulkPath joins with a literal "/" for a bulkDir using a backend
+// URI scheme it does not know how to canonicalize (contrast the four
+// built-in schemes s3/gs/az/hdfs), matching engine's own generic
+// joinBackendPath. A filepath.Join fallback here would collapse the
+// scheme's "//" (and use OS-native separators), producing a path the
+// backend would not recognize as its own root.
+func TestJoinBulkPathUsesSeparatorJoinForGenericBackendScheme(t *testing.T) {
+	got := joinBulkPath("memory://bucket", "F0001.rf")
+	want := "memory://bucket/F0001.rf"
+	if got != want {
+		t.Fatalf("joinBulkPath(%q, %q) = %q, want %q", "memory://bucket", "F0001.rf", got, want)
 	}
 }
 
@@ -502,6 +518,27 @@ func TestStagePathsAliasPhysicalIdentity(t *testing.T) {
 
 		if stagePathsAlias(srcPath, dstPath) {
 			t.Fatalf("stagePathsAlias(%q, %q) = true, want false (destination doesn't exist yet)", srcPath, dstPath)
+		}
+	})
+
+	t.Run("symlink resolves through a symlinked parent directory to a not-yet-existing file", func(t *testing.T) {
+		dir := t.TempDir()
+		aliasDir := filepath.Join(dir, "alias")
+		if err := os.Symlink(".", aliasDir); err != nil {
+			t.Skipf("symlink not supported in this environment: %v", err)
+		}
+		linkPath := filepath.Join(dir, "A.rf")
+		if err := os.Symlink(filepath.Join("alias", "B.rf"), linkPath); err != nil {
+			t.Skipf("symlink not supported in this environment: %v", err)
+		}
+		bPath := filepath.Join(dir, "B.rf")
+		// bPath does not exist yet: linkPath's target chain (A.rf ->
+		// alias/B.rf, alias -> ".") only physically reaches bPath once
+		// the symlinked "alias" parent directory component is followed
+		// too, not just linkPath's own, single-hop symlink target.
+
+		if !stagePathsAlias(linkPath, bPath) {
+			t.Fatalf("stagePathsAlias(%q, %q) = false, want true (same not-yet-existing physical location via a symlinked parent directory)", linkPath, bPath)
 		}
 	})
 }
@@ -669,6 +706,72 @@ func TestStageBulkDirRejectsSymlinkedWriteTargetsBeforeCopying(t *testing.T) {
 	}
 	if _, err := os.Stat(bDstPath); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("symlink target unexpectedly exists after rejected stage: err=%v", err)
+	}
+}
+
+// TestStageBulkDirRejectsWriteTargetAliasedThroughSymlinkedParentBeforeCopying
+// proves the write-target alias guard catches a case one hop deeper
+// than TestStageBulkDirRejectsSymlinkedWriteTargetsBeforeCopying: here
+// bulkDir/A.rf's own symlink target, "alias/B.rf", is lexically
+// different from bulkDir/B.rf and neither exists yet, so a naive
+// single-hop symlink resolution sees no alias at all. Only resolving
+// the symlinked "alias" *parent* directory component -- which points
+// back at bulkDir itself -- reveals that bulkDir/A.rf and bulkDir/B.rf
+// both reach the same not-yet-created physical location.
+func TestStageBulkDirRejectsWriteTargetAliasedThroughSymlinkedParentBeforeCopying(t *testing.T) {
+	root := t.TempDir()
+	exportDir := filepath.Join(root, "export")
+	bulkDir := filepath.Join(root, "bulk")
+	if err := os.MkdirAll(exportDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(bulkDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	aPath := filepath.Join(exportDir, "A.rf")
+	bPath := filepath.Join(exportDir, "B.rf")
+	aContent := []byte("A source bytes that must survive a rejected stage")
+	bContent := []byte("B source bytes that must survive a rejected stage")
+	if err := os.WriteFile(aPath, aContent, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(bPath, bContent, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	manifest := localManifestFromFiles(t, aPath, bPath)
+
+	aliasDir := filepath.Join(bulkDir, "alias")
+	if err := os.Symlink(".", aliasDir); err != nil {
+		t.Skipf("symlink not supported in this environment: %v", err)
+	}
+	aDstPath := filepath.Join(bulkDir, "A.rf")
+	if err := os.Symlink(filepath.Join("alias", "B.rf"), aDstPath); err != nil {
+		t.Skipf("symlink not supported in this environment: %v", err)
+	}
+	bDstPath := filepath.Join(bulkDir, "B.rf")
+
+	be := local.New()
+	if _, err := StageBulkDir(context.Background(), be, manifest, be, bulkDir); err == nil {
+		t.Fatal("StageBulkDir with a write target aliased through a symlinked parent directory = nil error, want error")
+	}
+
+	gotA, err := os.ReadFile(aPath)
+	if err != nil {
+		t.Fatalf("source file A missing after rejected stage: %v", err)
+	}
+	if string(gotA) != string(aContent) {
+		t.Fatalf("source file A corrupted by rejected stage: got %q, want %q", gotA, aContent)
+	}
+	gotB, err := os.ReadFile(bPath)
+	if err != nil {
+		t.Fatalf("source file B missing after rejected stage: %v", err)
+	}
+	if string(gotB) != string(bContent) {
+		t.Fatalf("source file B corrupted by rejected stage: got %q, want %q", gotB, bContent)
+	}
+	if _, err := os.Stat(bDstPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("write target aliased through symlinked parent unexpectedly exists after rejected stage: err=%v", err)
 	}
 }
 
