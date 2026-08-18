@@ -886,21 +886,39 @@ func TestBackendAbortUsesBoundedRemoveContext(t *testing.T) {
 	}
 }
 
-func TestBackendCloseIgnoresOperationClientReleaseFailureAfterCommit(t *testing.T) {
-	cleanupClient := newFakeClient()
-	operationClient := newFakeClient()
-	releaseErr := errors.New("injected operation client release failure")
-	backend, err := NewContext(context.Background(), "nn:8020",
-		WithClient(cleanupClient),
-		func(c *config) {
-			c.clientLeaseFactory = func(context.Context) (*leasedClient, error) {
-				return &leasedClient{client: operationClient, release: func() error { return releaseErr }}, nil
-			}
-		},
-	)
+func TestBackendCleanupClientOutlivesConstructorContext(t *testing.T) {
+	constructorCtx, cancelConstructor := context.WithCancel(context.Background())
+	factory := newCleanupLifetimeFactory(cancelConstructor)
+	backend, err := NewContext(constructorCtx, "nn:8020", func(c *config) {
+		c.clientLeaseFactory = factory.lease
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer backend.Close()
+
+	w, err := backend.Create(constructorCtx, "/tables/1.rf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = w.Close()
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Close error = %v, want context.Canceled", err)
+	}
+	if factory.state.cleanupClientCtxErr != nil {
+		t.Fatalf("cleanup client observed canceled constructor context: %v", factory.state.cleanupClientCtxErr)
+	}
+	if !slices.Contains(factory.state.removeCalls, factory.state.lastCreatePath) {
+		t.Fatalf("cleanup Remove calls = %v, want %s", factory.state.removeCalls, factory.state.lastCreatePath)
+	}
+	if _, ok := factory.state.files[factory.state.lastCreatePath]; ok {
+		t.Fatalf("temporary file %s remains after cleanup", factory.state.lastCreatePath)
+	}
+}
+
+func TestBackendCloseIgnoresOperationClientReleaseErrorAfterCommit(t *testing.T) {
+	client := newFakeClient()
+	backend := newReleaseErrorBackend(t, client)
 	w, err := backend.Create(context.Background(), "/tables/1.rf")
 	if err != nil {
 		t.Fatal(err)
@@ -909,34 +927,66 @@ func TestBackendCloseIgnoresOperationClientReleaseFailureAfterCommit(t *testing.
 		t.Fatal(err)
 	}
 	if err := w.Close(); err != nil {
-		t.Fatalf("Close returned operation-client release error after commit: %v", err)
+		t.Fatalf("Close error = %v, want nil", err)
 	}
-	if got := string(operationClient.files["/tables/1.rf"]); got != "new" {
-		t.Fatalf("committed contents = %q, want new", got)
+	if got := string(client.files["/tables/1.rf"]); got != "new" {
+		t.Fatalf("target contents = %q, want new", got)
 	}
 }
 
-func TestBackendAbortIgnoresOperationClientReleaseFailureAfterCleanup(t *testing.T) {
-	cleanupClient := newFakeClient()
-	operationClient := newFakeClient()
-	releaseErr := errors.New("injected operation client release failure")
-	backend, err := NewContext(context.Background(), "nn:8020",
-		WithClient(cleanupClient),
-		func(c *config) {
-			c.clientLeaseFactory = func(context.Context) (*leasedClient, error) {
-				return &leasedClient{client: operationClient, release: func() error { return releaseErr }}, nil
-			}
-		},
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
+func TestBackendAbortIgnoresOperationClientReleaseErrorAfterCleanup(t *testing.T) {
+	client := newFakeClient()
+	backend := newReleaseErrorBackend(t, client)
 	w, err := backend.Create(context.Background(), "/tables/1.rf")
 	if err != nil {
 		t.Fatal(err)
 	}
+	if _, err := w.Write([]byte("new")); err != nil {
+		t.Fatal(err)
+	}
 	if err := w.(storage.Aborter).Abort(); err != nil {
-		t.Fatalf("Abort returned operation-client release error after cleanup: %v", err)
+		t.Fatalf("Abort error = %v, want nil", err)
+	}
+	if _, ok := client.files[client.lastCreatePath]; ok {
+		t.Fatalf("temporary file %s remains after abort", client.lastCreatePath)
+	}
+}
+
+func TestBackendAbortRetriesTempRemovalAfterFailure(t *testing.T) {
+	client := newFakeClient()
+	backend, err := New("nn:8020", WithClient(client))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	w, err := backend.Create(context.Background(), "/tables/1.rf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write([]byte("new")); err != nil {
+		t.Fatal(err)
+	}
+	client.failRemovePath = client.lastCreatePath
+	client.failRemoveErr = errors.New("transient remove failure")
+
+	aborter := w.(storage.Aborter)
+	err = aborter.Abort()
+	if err == nil || !strings.Contains(err.Error(), "remove temporary file") {
+		t.Fatalf("Abort error = %v, want remove temporary file failure", err)
+	}
+	if err := w.Close(); err == nil || !strings.Contains(err.Error(), "writer already aborted") {
+		t.Fatalf("Close after failed Abort error = %v, want writer already aborted", err)
+	}
+
+	client.failRemoveErr = nil
+	if err := aborter.Abort(); err != nil {
+		t.Fatalf("second Abort: %v", err)
+	}
+	if countCalls(client.removeCalls, client.lastCreatePath) != 2 {
+		t.Fatalf("Remove calls = %v, want 2 calls for %s", client.removeCalls, client.lastCreatePath)
+	}
+	if _, ok := client.files[client.lastCreatePath]; ok {
+		t.Fatalf("temporary file %s remains after retry", client.lastCreatePath)
 	}
 }
 
@@ -959,6 +1009,26 @@ type fakeClient struct {
 	failBackupRemove         bool
 	writerCloseHook          func() error
 	lastRemoveDeadline       time.Time
+}
+
+func newReleaseErrorBackend(t *testing.T, client *fakeClient) *Backend {
+	t.Helper()
+
+	backend, err := NewContext(context.Background(), "nn:8020",
+		WithClient(client),
+		func(c *config) {
+			c.clientLeaseFactory = func(context.Context) (*leasedClient, error) {
+				return &leasedClient{
+					client:  client,
+					release: func() error { return errInjectedRelease },
+				}, nil
+			}
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return backend
 }
 
 func newFakeClient() *fakeClient {
@@ -1106,6 +1176,138 @@ func (w *stalledCompleteWriter) Close() error {
 	return w.ctx.Err()
 }
 
+type cleanupLifetimeState struct {
+	files               map[string][]byte
+	lastCreatePath      string
+	removeCalls         []string
+	cleanupClientCtxErr error
+}
+
+type cleanupLifetimeFactory struct {
+	mu         sync.Mutex
+	state      *cleanupLifetimeState
+	cancelSeed context.CancelFunc
+	seeded     bool
+}
+
+func newCleanupLifetimeFactory(cancelSeed context.CancelFunc) *cleanupLifetimeFactory {
+	return &cleanupLifetimeFactory{
+		state: &cleanupLifetimeState{
+			files: make(map[string][]byte),
+		},
+		cancelSeed: cancelSeed,
+	}
+}
+
+func (f *cleanupLifetimeFactory) lease(ctx context.Context) (*leasedClient, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if !f.seeded {
+		f.seeded = true
+		return &leasedClient{
+			client:  &cleanupLifetimeClient{ctx: ctx, state: f.state},
+			release: func() error { return nil },
+		}, nil
+	}
+	return &leasedClient{
+		client:  &cleanupLifetimeOperationClient{ctx: ctx, state: f.state, cancelSeed: f.cancelSeed},
+		release: func() error { return nil },
+	}, nil
+}
+
+type cleanupLifetimeClient struct {
+	ctx   context.Context
+	state *cleanupLifetimeState
+}
+
+func (*cleanupLifetimeClient) Open(string) (Reader, error) { return nil, errors.New("not implemented") }
+
+func (*cleanupLifetimeClient) Create(string) (storage.Writer, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (*cleanupLifetimeClient) MkdirAll(string, os.FileMode) error { return nil }
+
+func (*cleanupLifetimeClient) ReadDir(string) ([]os.FileInfo, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (c *cleanupLifetimeClient) Remove(name string) error {
+	return c.RemoveContext(context.Background(), name)
+}
+
+func (c *cleanupLifetimeClient) RemoveContext(_ context.Context, name string) error {
+	c.state.removeCalls = append(c.state.removeCalls, name)
+	c.state.cleanupClientCtxErr = c.ctx.Err()
+	if c.ctx.Err() != nil {
+		return c.ctx.Err()
+	}
+	if _, ok := c.state.files[name]; !ok {
+		return &os.PathError{Op: "remove", Path: name, Err: fs.ErrNotExist}
+	}
+	delete(c.state.files, name)
+	return nil
+}
+
+func (c *cleanupLifetimeClient) Rename(oldpath, newpath string) error {
+	if c.ctx.Err() != nil {
+		return c.ctx.Err()
+	}
+	data, ok := c.state.files[oldpath]
+	if !ok {
+		return &os.PathError{Op: "rename", Path: oldpath, Err: fs.ErrNotExist}
+	}
+	c.state.files[newpath] = data
+	delete(c.state.files, oldpath)
+	return nil
+}
+
+func (*cleanupLifetimeClient) Close() error { return nil }
+
+type cleanupLifetimeOperationClient struct {
+	ctx        context.Context
+	state      *cleanupLifetimeState
+	cancelSeed context.CancelFunc
+}
+
+func (*cleanupLifetimeOperationClient) Open(string) (Reader, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (c *cleanupLifetimeOperationClient) Create(name string) (storage.Writer, error) {
+	c.state.lastCreatePath = name
+	c.state.files[name] = []byte("temp")
+	return &cancelOnCloseWriter{ctx: c.ctx, cancel: c.cancelSeed}, nil
+}
+
+func (*cleanupLifetimeOperationClient) MkdirAll(string, os.FileMode) error { return nil }
+
+func (*cleanupLifetimeOperationClient) ReadDir(string) ([]os.FileInfo, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (*cleanupLifetimeOperationClient) Remove(string) error { return errors.New("not implemented") }
+
+func (*cleanupLifetimeOperationClient) Rename(string, string) error {
+	return errors.New("not implemented")
+}
+
+func (*cleanupLifetimeOperationClient) Close() error { return nil }
+
+type cancelOnCloseWriter struct {
+	ctx    context.Context
+	cancel context.CancelFunc
+}
+
+func (*cancelOnCloseWriter) Write(p []byte) (int, error) { return len(p), nil }
+
+func (w *cancelOnCloseWriter) Close() error {
+	w.cancel()
+	<-w.ctx.Done()
+	return w.ctx.Err()
+}
+
 type fakeReader struct {
 	*bytes.Reader
 	info     os.FileInfo
@@ -1146,6 +1348,17 @@ func (w *deadlineBlockingWriter) SetDeadline(deadline time.Time) error {
 }
 
 var errInjectedClose = errors.New("injected close failure")
+var errInjectedRelease = errors.New("injected release failure")
+
+func countCalls(values []string, want string) int {
+	count := 0
+	for _, value := range values {
+		if value == want {
+			count++
+		}
+	}
+	return count
+}
 
 type immediateErrorDeadlineWriter struct {
 	deadlines []time.Time

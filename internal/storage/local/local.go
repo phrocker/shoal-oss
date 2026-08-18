@@ -44,12 +44,13 @@ func (b *Backend) Open(_ context.Context, path string) (storage.File, error) {
 
 // Create opens a temporary sibling file for writing and commits it into path
 // on Close without first removing or moving an existing target. Existing
-// regular-file mode bits are preserved everywhere; on Unix we also preserve
-// owner/group and extended attributes (including xattr-backed ACLs such as
-// Linux POSIX ACLs) when the platform exposes them. New files use 0644 subject
-// to the process umask. Parent directories are created with 0755 if they don't
-// already exist — matches "mkdir -p" behavior so callers don't have to
-// pre-create the path tree.
+// regular-file mode bits (including setuid/setgid/sticky) are preserved
+// everywhere; on Unix we also preserve owner/group, and on Linux and Darwin we
+// preserve extended attributes (including xattr-backed ACLs such as Linux
+// POSIX ACLs) when the platform exposes them. New files use 0644 subject to
+// the process umask. Parent directories are created with 0755 if they don't
+// already exist — matches "mkdir -p" behavior so callers don't have to pre-
+// create the path tree.
 func (b *Backend) Create(_ context.Context, path string) (storage.Writer, error) {
 	if dir := filepath.Dir(path); dir != "" && dir != "." {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -116,14 +117,15 @@ func (l *file) Close() error                            { return l.f.Close() }
 func (l *file) Size() int64                             { return l.size }
 
 type writer struct {
-	file       *os.File
-	temp       string
-	target     string
-	ops        replacementOps
-	closed     bool
-	aborted    bool
-	fileClosed bool
-	state      replacementState
+	file           *os.File
+	temp           string
+	target         string
+	ops            replacementOps
+	closed         bool
+	abortRequested bool
+	aborted        bool
+	fileClosed     bool
+	state          replacementState
 }
 
 type replacementState uint8
@@ -144,6 +146,8 @@ type replacementOps interface {
 
 type osReplacementOps struct{}
 
+var preservePlatformMetadataFn = preservePlatformMetadata
+
 func (osReplacementOps) Lstat(name string) (os.FileInfo, error) { return os.Lstat(name) }
 func (osReplacementOps) Chmod(name string, mode os.FileMode) error {
 	return os.Chmod(name, mode)
@@ -156,6 +160,8 @@ func (osReplacementOps) AtomicRestore(target, backup string) error {
 	return platformAtomicRestore(target, backup)
 }
 
+const replacementModeMask = os.ModePerm | os.ModeSetuid | os.ModeSetgid | os.ModeSticky
+
 func replacementTargetMode(ops replacementOps, target string) (os.FileMode, bool, error) {
 	info, err := ops.Lstat(target)
 	if errors.Is(err, fs.ErrNotExist) {
@@ -167,7 +173,7 @@ func replacementTargetMode(ops replacementOps, target string) (os.FileMode, bool
 	if !info.Mode().IsRegular() {
 		return 0, false, fmt.Errorf("local: replace %s: target is not a regular file", target)
 	}
-	return info.Mode().Perm(), true, nil
+	return info.Mode() & replacementModeMask, true, nil
 }
 
 func preserveExistingMetadata(ops replacementOps, temp, target string) (bool, error) {
@@ -175,24 +181,24 @@ func preserveExistingMetadata(ops replacementOps, temp, target string) (bool, er
 	if err != nil || !hadOld {
 		return hadOld, err
 	}
-	if err := ops.Chmod(temp, mode); err != nil {
-		return true, fmt.Errorf("local: preserve permissions for %s: %w", target, err)
-	}
-	if err := preservePlatformMetadata(temp, target); err != nil {
+	if err := preservePlatformMetadataFn(temp, target); err != nil {
 		return true, err
+	}
+	if err := ops.Chmod(temp, mode); err != nil {
+		return true, fmt.Errorf("local: preserve mode bits for %s: %w", target, err)
 	}
 	return true, nil
 }
 
 func (w *writer) Write(p []byte) (int, error) {
-	if w.closed || w.aborted {
+	if w.closed || w.abortRequested {
 		return 0, fmt.Errorf("local: write after close")
 	}
 	return w.file.Write(p)
 }
 
 func (w *writer) Close() error {
-	if w.aborted {
+	if w.abortRequested {
 		return fmt.Errorf("local: writer already aborted")
 	}
 	if w.closed {
@@ -264,7 +270,7 @@ func (w *writer) Abort() error {
 	if w.state != replacementStaged {
 		return fmt.Errorf("local: replacement for %s cannot be safely aborted in state %d", w.target, w.state)
 	}
-	w.aborted = true
+	w.abortRequested = true
 
 	var abortErr error
 	if !w.fileClosed {
@@ -277,5 +283,9 @@ func (w *writer) Abort() error {
 	if err := w.ops.Remove(w.temp); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		abortErr = errors.Join(abortErr, fmt.Errorf("local: remove temporary file %s: %w", w.temp, err))
 	}
-	return abortErr
+	if abortErr != nil {
+		return abortErr
+	}
+	w.aborted = true
+	return nil
 }

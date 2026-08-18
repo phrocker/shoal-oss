@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/phrocker/shoal/internal/storage"
 )
@@ -437,6 +438,83 @@ func TestLocal_CloseErrorCleansUpTempViaReplacementOps(t *testing.T) {
 	}
 }
 
+func TestLocal_AbortRetriesTempRemovalAfterFailure(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "out.bin")
+	w, err := New().Create(context.Background(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	localWriter := w.(*writer)
+	ops := &flakyRemoveOps{
+		replacementOps: localWriter.ops,
+		failPath:       localWriter.temp,
+		failures:       1,
+		err:            errors.New("transient remove failure"),
+	}
+	localWriter.ops = ops
+
+	aborter := w.(storage.Aborter)
+	err = aborter.Abort()
+	if err == nil || !strings.Contains(err.Error(), "remove temporary file") {
+		t.Fatalf("Abort error = %v, want remove temporary file failure", err)
+	}
+	if err := w.Close(); err == nil || !strings.Contains(err.Error(), "writer already aborted") {
+		t.Fatalf("Close after failed Abort error = %v, want writer already aborted", err)
+	}
+
+	if err := aborter.Abort(); err != nil {
+		t.Fatalf("second Abort: %v", err)
+	}
+	if ops.removeAttempts != 2 {
+		t.Fatalf("Remove attempts = %d, want 2", ops.removeAttempts)
+	}
+	if _, err := os.Stat(localWriter.temp); !os.IsNotExist(err) {
+		t.Fatalf("temporary file still exists after retry: %v", err)
+	}
+}
+
+func TestPreserveExistingMetadataPreservesSpecialModeBitsAfterPlatformMetadata(t *testing.T) {
+	originalPreservePlatformMetadata := preservePlatformMetadataFn
+	t.Cleanup(func() {
+		preservePlatformMetadataFn = originalPreservePlatformMetadata
+	})
+
+	var calls []string
+	preservePlatformMetadataFn = func(_, _ string) error {
+		calls = append(calls, "platform")
+		return nil
+	}
+
+	ops := &metadataRecordingOps{
+		infos: map[string]os.FileInfo{
+			"target": stubFileInfo{mode: os.ModeSetuid | os.ModeSetgid | os.ModeSticky | 0o640},
+		},
+		onChmod: func() {
+			calls = append(calls, "chmod")
+		},
+	}
+
+	hadOld, err := preserveExistingMetadata(ops, "temp", "target")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hadOld {
+		t.Fatal("preserveExistingMetadata reported no existing target")
+	}
+	if len(ops.chmodModes) != 1 {
+		t.Fatalf("Chmod calls = %d, want 1", len(ops.chmodModes))
+	}
+	wantMode := os.ModeSetuid | os.ModeSetgid | os.ModeSticky | 0o640
+	if ops.chmodModes[0] != wantMode {
+		t.Fatalf("Chmod mode = %v, want %v", ops.chmodModes[0], wantMode)
+	}
+	if len(calls) != 2 || calls[0] != "platform" || calls[1] != "chmod" {
+		t.Fatalf("metadata call order = %v, want [platform chmod]", calls)
+	}
+}
+
 type blockingAtomicReplaceOps struct {
 	replacementOps
 	entered chan struct{}
@@ -487,3 +565,57 @@ func (o *recordingRemoveOps) Remove(name string) error {
 	o.removed = append(o.removed, name)
 	return o.replacementOps.Remove(name)
 }
+
+type flakyRemoveOps struct {
+	replacementOps
+	failPath       string
+	failures       int
+	err            error
+	removeAttempts int
+}
+
+func (o *flakyRemoveOps) Remove(name string) error {
+	o.removeAttempts++
+	if name == o.failPath && o.failures > 0 {
+		o.failures--
+		return o.err
+	}
+	return o.replacementOps.Remove(name)
+}
+
+type metadataRecordingOps struct {
+	infos      map[string]os.FileInfo
+	chmodModes []os.FileMode
+	onChmod    func()
+}
+
+func (o *metadataRecordingOps) Lstat(name string) (os.FileInfo, error) {
+	info, ok := o.infos[name]
+	if !ok {
+		return nil, os.ErrNotExist
+	}
+	return info, nil
+}
+
+func (o *metadataRecordingOps) Chmod(_ string, mode os.FileMode) error {
+	if o.onChmod != nil {
+		o.onChmod()
+	}
+	o.chmodModes = append(o.chmodModes, mode)
+	return nil
+}
+
+func (*metadataRecordingOps) Remove(string) error                              { return nil }
+func (*metadataRecordingOps) AtomicReplace(string, string, string, bool) error { return nil }
+func (*metadataRecordingOps) AtomicRestore(string, string) error               { return nil }
+
+type stubFileInfo struct {
+	mode os.FileMode
+}
+
+func (i stubFileInfo) Name() string       { return "target" }
+func (i stubFileInfo) Size() int64        { return 0 }
+func (i stubFileInfo) Mode() os.FileMode  { return i.mode }
+func (i stubFileInfo) ModTime() time.Time { return time.Time{} }
+func (i stubFileInfo) IsDir() bool        { return i.mode.IsDir() }
+func (i stubFileInfo) Sys() any           { return nil }
