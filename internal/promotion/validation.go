@@ -4,13 +4,10 @@ import (
 	"fmt"
 	"net/url"
 	"path/filepath"
-	"regexp"
 	"strings"
 
 	"github.com/phrocker/shoal/accumulo"
 )
-
-var windowsDriveRootRe = regexp.MustCompile(`^[A-Za-z]:[\\/]?$`)
 
 func validatePromotionDestination(tableName, bulkDir string) error {
 	if err := validateTableName(tableName); err != nil {
@@ -45,14 +42,14 @@ func validateBulkDir(bulkDir string) error {
 }
 
 func isBackendRoot(bulkDir string) bool {
-	if strings.Contains(bulkDir, "://") {
+	if pathUsesBackendSeparatorJoin(bulkDir) {
 		u, err := url.Parse(bulkDir)
 		if err != nil {
 			return false
 		}
 		return strings.Trim(u.Path, "/\\") == ""
 	}
-	if windowsDriveRootRe.MatchString(bulkDir) {
+	if isWindowsDriveRootPath(bulkDir) {
 		return true
 	}
 	clean := filepath.Clean(bulkDir)

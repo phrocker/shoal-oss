@@ -297,6 +297,7 @@ func TestStagePathsAlias(t *testing.T) {
 		want bool
 	}{
 		{name: "identical local paths", src: `C:\data\t-0000\F0001.rf`, dst: `C:\data\t-0000\F0001.rf`, want: true},
+		{name: "windows drive path with redundant url-like separators", src: `C://data/F0001.rf`, dst: `C:\data\F0001.rf`, want: true},
 		{name: "local paths differing only by separator style", src: `/data/t-0000/F0001.rf`, dst: `/data/t-0000//F0001.rf`, want: true},
 		{name: "distinct local paths", src: `/data/t-0000/F0001.rf`, dst: `/bulk/events-1/F0001.rf`, want: false},
 		{name: "identical relative paths", src: "export/events/t-0000/F0001.rf", dst: "export/events/t-0000/F0001.rf", want: true},
@@ -309,6 +310,63 @@ func TestStagePathsAlias(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := stagePathsAlias(tt.src, tt.dst); got != tt.want {
 				t.Fatalf("stagePathsAlias(%q, %q) = %v, want %v", tt.src, tt.dst, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestPathUsesBackendSeparatorJoin(t *testing.T) {
+	tests := []struct {
+		name string
+		path string
+		want bool
+	}{
+		{name: "s3 qualified path", path: "s3://bucket/F0001.rf", want: true},
+		{name: "gcs qualified path", path: "gs://bucket/F0001.rf", want: true},
+		{name: "azure qualified path", path: "az://container/F0001.rf", want: true},
+		{name: "hdfs qualified path", path: "hdfs://nn/tables/F0001.rf", want: true},
+		{name: "hdfs authorityless path", path: "hdfs:/tables/F0001.rf", want: true},
+		{name: "opaque hdfs URI is not a joined backend path", path: "hdfs:tables/F0001.rf", want: false},
+		{name: "windows drive path is local", path: `C://data/F0001.rf`, want: false},
+		{name: "plain local path is local", path: `C:\data\F0001.rf`, want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := pathUsesBackendSeparatorJoin(tt.path); got != tt.want {
+				t.Fatalf("pathUsesBackendSeparatorJoin(%q) = %v, want %v", tt.path, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestJoinBulkPathTreatsWindowsDrivePathAsLocal(t *testing.T) {
+	got := joinBulkPath(`C://data`, "F0001.rf")
+	if got == `C://data/F0001.rf` {
+		t.Fatalf("joinBulkPath treated C://data as a backend URL root: got %q", got)
+	}
+	if !localPathsLexicallyAlias(got, `C:\data\F0001.rf`) {
+		t.Fatalf("joinBulkPath(%q, %q) = %q, want a local Windows-drive path aliasing %q", `C://data`, "F0001.rf", got, `C:\data\F0001.rf`)
+	}
+}
+
+func TestIsBackendRootDistinguishesWindowsDrivePaths(t *testing.T) {
+	tests := []struct {
+		name string
+		path string
+		want bool
+	}{
+		{name: "backend root", path: "s3://bucket/", want: true},
+		{name: "backend non-root", path: "s3://bucket/path", want: false},
+		{name: "hdfs root", path: "hdfs:/", want: true},
+		{name: "windows drive root with redundant separators", path: `C://`, want: true},
+		{name: "windows drive non-root with redundant separators", path: `C://data`, want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isBackendRoot(tt.path); got != tt.want {
+				t.Fatalf("isBackendRoot(%q) = %v, want %v", tt.path, got, tt.want)
 			}
 		})
 	}

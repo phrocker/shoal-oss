@@ -260,10 +260,11 @@ func (c pathIdentityCache) symlinkTarget(path string) (string, bool) {
 // gcs.ParsePath, azure.ParsePath, and HDFS URI parsing) so equivalent
 // spellings compare equal even when one path is qualified and the other
 // uses the backend's scheme-less form. Local filesystem paths still get
-// a case-insensitive lexical check (to conservatively catch
-// not-yet-created aliases on Windows/macOS), plus os.Stat + os.SameFile
-// so equivalent absolute/relative spellings and symlink/hardlink aliases
-// are caught too.
+// Windows-drive normalization (so C://data/F.rf stays local rather than
+// being mistaken for a remote URL), a case-insensitive lexical check (to
+// conservatively catch not-yet-created aliases on Windows/macOS), plus
+// os.Stat + os.SameFile so equivalent absolute/relative spellings and
+// symlink/hardlink aliases are caught too.
 func pathsAlias(srcPath, dstPath stagePathRef, cache pathIdentityCache) bool {
 	srcCanonical, srcCanonicalOK := canonicalBackendPath(srcPath)
 	dstCanonical, dstCanonicalOK := canonicalBackendPath(dstPath)
@@ -272,9 +273,7 @@ func pathsAlias(srcPath, dstPath stagePathRef, cache pathIdentityCache) bool {
 	}
 
 	if usesLocalFilesystemSemantics(srcPath) && usesLocalFilesystemSemantics(dstPath) {
-		srcClean := filepath.Clean(srcPath.path)
-		dstClean := filepath.Clean(dstPath.path)
-		if localPathsLexicallyAlias(srcClean, dstClean) {
+		if localPathsLexicallyAlias(srcPath.path, dstPath.path) {
 			return true
 		}
 		if localSymlinkTargetsAlias(srcPath.path, dstPath.path, cache) {
@@ -291,7 +290,7 @@ func pathsAlias(srcPath, dstPath stagePathRef, cache pathIdentityCache) bool {
 		return os.SameFile(srcInfo, dstInfo)
 	}
 
-	if strings.Contains(srcPath.path, "://") || strings.Contains(dstPath.path, "://") {
+	if pathLooksURLLike(srcPath.path) || pathLooksURLLike(dstPath.path) {
 		return strings.TrimRight(srcPath.path, `/\`) == strings.TrimRight(dstPath.path, `/\`)
 	}
 
@@ -299,8 +298,8 @@ func pathsAlias(srcPath, dstPath stagePathRef, cache pathIdentityCache) bool {
 }
 
 func localSymlinkTargetsAlias(srcPath, dstPath string, cache pathIdentityCache) bool {
-	srcClean := filepath.Clean(srcPath)
-	dstClean := filepath.Clean(dstPath)
+	srcClean := normalizeLocalPathForAlias(srcPath)
+	dstClean := normalizeLocalPathForAlias(dstPath)
 
 	if target, ok := cache.symlinkTarget(srcPath); ok && localPathsLexicallyAlias(target, dstClean) {
 		return true
@@ -315,8 +314,8 @@ func localSymlinkTargetsAlias(srcPath, dstPath string, cache pathIdentityCache) 
 }
 
 func localPathsLexicallyAlias(srcPath, dstPath string) bool {
-	srcClean := filepath.Clean(srcPath)
-	dstClean := filepath.Clean(dstPath)
+	srcClean := normalizeLocalPathForAlias(srcPath)
+	dstClean := normalizeLocalPathForAlias(dstPath)
 	return srcClean == dstClean || strings.EqualFold(srcClean, dstClean)
 }
 
