@@ -436,6 +436,10 @@ func (c *Connector) securityVoid(
 	) (struct{}, error) {
 		return struct{}{}, call(security, address)
 	})
+	var cleanupErr *managerclient.PostResponseCleanupError
+	if errors.As(err, &cleanupErr) {
+		return nil
+	}
 	return err
 }
 

@@ -764,6 +764,47 @@ func TestPooledGetTableConfigurationValidationAndRetryClassification(t *testing.
 	}
 }
 
+func TestPooledSecuritySuccessPreservesPostResponseCleanupFailure(t *testing.T) {
+	pool, err := transportpool.New(transportpool.Config{MaxIdlePerEndpoint: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	pooled, err := NewPooled(pool, "uuid-1", "4.0.0-SNAPSHOT", &security.TCredentials{
+		Principal:      "root",
+		TokenClassName: "PasswordToken",
+		Token:          []byte("secret"),
+		InstanceId:     "uuid-1",
+	}, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cleanupErr := thrift.NewTTransportExceptionFromError(errors.New("close failed"))
+	rpc := &recordingSecurityRPC{}
+	pooled.dial = func(context.Context, transportpool.Key) (io.Closer, error) {
+		return &fakeTransport{service: rpc, closeErr: cleanupErr}, nil
+	}
+	pooled.newServiceClient = serviceFromFakeTransport
+
+	err = pooled.ChangeLocalUserPassword(
+		context.Background(),
+		"server:9997",
+		"root",
+		[]byte("new-secret"),
+	)
+	var postResponseErr *PostResponseCleanupError
+	if !errors.As(err, &postResponseErr) || !errors.Is(err, cleanupErr) {
+		t.Fatalf("error = %#v, want post-response cleanup error", err)
+	}
+	if IsRetryableEndpointError(err) {
+		t.Fatal("post-response cleanup error must not be retried")
+	}
+	if !slices.Equal(rpc.operations, []string{"changeLocalUserPassword"}) {
+		t.Fatalf("operations = %v", rpc.operations)
+	}
+}
+
 func TestPooledSecurityRPCSelectionArgumentsAndCopies(t *testing.T) {
 	pooled, pool := newTestPooled(t)
 	defer pool.Close()
@@ -987,15 +1028,16 @@ func createRequest(name string) Request {
 }
 
 type fakeTransport struct {
-	rpc     fateRPC
-	manager managerRPC
-	service clientRPC
-	closes  atomic.Int32
+	rpc      fateRPC
+	manager  managerRPC
+	service  clientRPC
+	closes   atomic.Int32
+	closeErr error
 }
 
 func (t *fakeTransport) Close() error {
 	t.closes.Add(1)
-	return nil
+	return t.closeErr
 }
 
 func clientFromFakeTransport(transport io.Closer) (fateRPC, error) {

@@ -277,6 +277,91 @@ func TestSecurityLifecycleRetryAndServerErrorMapping(t *testing.T) {
 	}
 }
 
+func TestSecurityMutationsDoNotRetryPostResponseCleanupErrors(t *testing.T) {
+	tests := []struct {
+		name string
+		call func(*Connector) error
+	}{
+		{"create user", func(c *Connector) error {
+			return c.CreateUser(context.Background(), "alice", []byte("secret"))
+		}},
+		{"drop user", func(c *Connector) error {
+			return c.DropUser(context.Background(), "alice")
+		}},
+		{"change password", func(c *Connector) error {
+			return c.ChangePassword(context.Background(), "alice", []byte("secret"))
+		}},
+		{"change authorizations", func(c *Connector) error {
+			return c.ChangeUserAuthorizations(context.Background(), "alice", [][]byte{[]byte("A")})
+		}},
+		{"grant system", func(c *Connector) error {
+			return c.GrantSystemPermission(context.Background(), "alice", SystemPermissionCreateTable)
+		}},
+		{"revoke system", func(c *Connector) error {
+			return c.RevokeSystemPermission(context.Background(), "alice", SystemPermissionCreateTable)
+		}},
+		{"grant table", func(c *Connector) error {
+			return c.GrantTablePermission(
+				context.Background(), "alice", "events", TablePermissionRead,
+			)
+		}},
+		{"revoke table", func(c *Connector) error {
+			return c.RevokeTablePermission(
+				context.Background(), "alice", "events", TablePermissionRead,
+			)
+		}},
+		{"grant namespace", func(c *Connector) error {
+			return c.GrantNamespacePermission(
+				context.Background(), "alice", "analytics", NamespacePermissionRead,
+			)
+		}},
+		{"revoke namespace", func(c *Connector) error {
+			return c.RevokeNamespacePermission(
+				context.Background(), "alice", "analytics", NamespacePermissionRead,
+			)
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			connector := newSecurityTestConnector(t)
+			defer connector.Close()
+			fake := &fakeSecurityAdapter{postResponseCleanupErr: errors.New("close failed")}
+			connector.security = fake
+			connector.clientAddr = fakeClientServiceAddresses{
+				addresses: []string{"first:9997", "second:9997"},
+			}
+
+			if err := test.call(connector); err != nil {
+				t.Fatalf("mutation error = %v", err)
+			}
+			if got := fake.addressValues(); !slices.Equal(got, []string{"first:9997"}) {
+				t.Fatalf("addresses = %v, want first endpoint only", got)
+			}
+		})
+	}
+}
+
+func TestChangeOwnPasswordRefreshesCredentialsAfterCleanupError(t *testing.T) {
+	connector := newSecurityTestConnector(t)
+	defer connector.Close()
+	fake := &fakeSecurityAdapter{postResponseCleanupErr: errors.New("close failed")}
+	connector.security = fake
+	connector.clientAddr = fakeClientServiceAddresses{
+		addresses: []string{"first:9997", "second:9997"},
+	}
+
+	password := []byte("new-secret")
+	if err := connector.ChangePassword(context.Background(), "root", password); err != nil {
+		t.Fatal(err)
+	}
+	if got := fake.addressValues(); !slices.Equal(got, []string{"first:9997"}) {
+		t.Fatalf("addresses = %v, want first endpoint only", got)
+	}
+	if !slices.Equal(connector.credentials.token, cred.EncodePasswordToken(password)) {
+		t.Fatal("connector credentials were not refreshed from successful response")
+	}
+}
+
 func TestSecurityErrorPreservesReclassifiedServerDetails(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -422,15 +507,16 @@ func newSecurityTestConnector(t *testing.T) *Connector {
 }
 
 type fakeSecurityAdapter struct {
-	mu             sync.Mutex
-	ops            []string
-	addresses      []string
-	password       []byte
-	authorizations [][]byte
-	authResult     [][]byte
-	boolResult     bool
-	failAddress    string
-	err            error
+	mu                     sync.Mutex
+	ops                    []string
+	addresses              []string
+	password               []byte
+	authorizations         [][]byte
+	authResult             [][]byte
+	boolResult             bool
+	failAddress            string
+	err                    error
+	postResponseCleanupErr error
 }
 
 type countingCredentialUpdater struct {
@@ -455,6 +541,9 @@ func (f *fakeSecurityAdapter) record(operation, address string) error {
 	f.addresses = append(f.addresses, address)
 	if address == f.failAddress {
 		return thrift.NewTTransportExceptionFromError(errors.New("connection reset"))
+	}
+	if f.postResponseCleanupErr != nil {
+		return &managerclient.PostResponseCleanupError{Err: f.postResponseCleanupErr}
 	}
 	return f.err
 }

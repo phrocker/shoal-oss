@@ -81,6 +81,26 @@ type Error struct {
 	Code        string
 }
 
+// PostResponseCleanupError reports that an RPC received a valid successful
+// application response, but releasing its transport failed afterward.
+type PostResponseCleanupError struct {
+	Err error
+}
+
+func (e *PostResponseCleanupError) Error() string {
+	if e == nil {
+		return "<nil>"
+	}
+	return fmt.Sprintf("managerclient: post-response cleanup: %v", e.Err)
+}
+
+func (e *PostResponseCleanupError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
+}
+
 func (e *Error) Error() string {
 	if e == nil {
 		return "<nil>"
@@ -566,6 +586,9 @@ func withServiceClient[T any, C any](
 		cleanupErr = lease.Invalidate()
 	} else {
 		cleanupErr = lease.Close()
+	}
+	if rpcErr == nil && cleanupErr != nil {
+		return result, &PostResponseCleanupError{Err: cleanupErr}
 	}
 	return result, errors.Join(rpcErr, cleanupErr)
 }
@@ -1145,6 +1168,10 @@ func IsRetryableEndpointError(err error) bool {
 	if err == nil ||
 		errors.Is(err, context.Canceled) ||
 		errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	var cleanupErr *PostResponseCleanupError
+	if errors.As(err, &cleanupErr) {
 		return false
 	}
 	var managerErr *Error
