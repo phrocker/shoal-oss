@@ -33,6 +33,11 @@ var (
 	// ErrBatchWriterRetryExhausted indicates that the bounded retries for a
 	// provably safe failure were exhausted.
 	ErrBatchWriterRetryExhausted = errors.New("accumulo: batch writer retry limit exhausted")
+
+	// ErrBatchWriterAutoFlush indicates that an automatic latency flush
+	// failed. The writer becomes terminal and subsequent operations return
+	// the same error.
+	ErrBatchWriterAutoFlush = errors.New("accumulo: automatic batch writer flush failed")
 )
 
 // Durability selects the tablet server's write-ahead-log behavior.
@@ -55,6 +60,11 @@ type BatchWriterOptions struct {
 	// MaxBatchBytes bounds each applyUpdates mutation batch. Zero uses 128 KiB.
 	MaxBatchBytes int64
 
+	// MaxLatency bounds how long the oldest buffered mutation waits before an
+	// automatic flush. Later Add calls do not extend its deadline. Zero
+	// disables automatic flushing.
+	MaxLatency time.Duration
+
 	// MaxWriteThreads bounds concurrent tablet-server submissions. Each
 	// tablet server is handled by only one worker per attempt. Zero uses three.
 	MaxWriteThreads int
@@ -72,6 +82,7 @@ type BatchWriterOptions struct {
 type normalizedBatchWriterOptions struct {
 	maxMemoryBytes  int64
 	maxBatchBytes   int64
+	maxLatency      time.Duration
 	maxWriteThreads int
 	maxRetries      int
 	retryBackoff    time.Duration
@@ -187,7 +198,8 @@ type mutationUpdateResult struct {
 // Accumulo 4 update sessions. Operations are serialized; concurrent callers
 // waiting for the writer honor their contexts. Independent tablet servers are
 // submitted concurrently up to MaxWriteThreads, while each server plan remains
-// ordered and single-threaded.
+// ordered and single-threaded. When MaxLatency is enabled, one writer-owned
+// goroutine and timer are stopped and joined by Close.
 type BatchWriter struct {
 	connector *Connector
 	table     Table
@@ -197,9 +209,14 @@ type BatchWriter struct {
 
 	pending      []bufferedMutation
 	pendingBytes int64
+	pendingSince time.Time
 	failure      error
 	closed       bool
 	closeErr     error
+
+	autoFlushWake   chan struct{}
+	autoFlushCancel context.CancelFunc
+	autoFlushDone   chan struct{}
 
 	startSession func(context.Context, string, ingestclient.Durability) (batchWriterSession, error)
 }
@@ -239,13 +256,15 @@ func (c *Connector) NewBatchWriter(
 	) (batchWriterSession, error) {
 		return c.ingest.Start(ctx, address, durability)
 	}
+	writer.startAutomaticFlush()
 	return writer, nil
 }
 
 // Add defensively snapshots mutation. When the configured memory bound is
 // reached, Add synchronously submits buffered mutations and applies
 // backpressure to the caller. An error before submission means mutation was
-// not accepted; ErrBatchWriterFailed means it may have committed.
+// not accepted; ErrBatchWriterFailed means it may have committed. A prior
+// automatic flush error is terminal and returned unchanged.
 func (w *BatchWriter) Add(ctx context.Context, mutation *Mutation) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -285,6 +304,11 @@ func (w *BatchWriter) Add(ctx context.Context, mutation *Mutation) error {
 	}
 	previousLen := len(w.pending)
 	previousBytes := w.pendingBytes
+	previousSince := w.pendingSince
+	startedBuffer := previousLen == 0
+	if startedBuffer {
+		w.pendingSince = time.Now()
+	}
 	w.pending = append(w.pending, buffered)
 	w.pendingBytes += buffered.size
 	if w.pendingBytes >= w.options.maxMemoryBytes {
@@ -292,8 +316,13 @@ func (w *BatchWriter) Add(ctx context.Context, mutation *Mutation) error {
 		if err != nil && w.failure == nil {
 			w.pending = w.pending[:previousLen]
 			w.pendingBytes = previousBytes
+			w.pendingSince = previousSince
 		}
+		w.wakeAutomaticFlush()
 		return err
+	}
+	if startedBuffer {
+		w.wakeAutomaticFlush()
 	}
 	return nil
 }
@@ -303,7 +332,8 @@ func (w *BatchWriter) Add(ctx context.Context, mutation *Mutation) error {
 // retried within the configured bound. Ambiguous apply or close failures are
 // sticky because Accumulo may have committed an unknown prefix. A retry limit
 // error without ErrBatchWriterFailed leaves the original buffer available for
-// a later Flush.
+// a later Flush. Automatic flush errors are terminal, include
+// ErrBatchWriterAutoFlush, and are returned unchanged.
 func (w *BatchWriter) Flush(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -315,11 +345,14 @@ func (w *BatchWriter) Flush(ctx context.Context) error {
 	if w.closed {
 		return ErrBatchWriterClosed
 	}
-	return w.flushLocked(ctx)
+	err := w.flushLocked(ctx)
+	w.wakeAutomaticFlush()
+	return err
 }
 
-// Close stops accepting mutations and commits the remaining buffer. Repeated
-// calls return the first Close result without submitting again.
+// Close stops accepting mutations, commits the remaining buffer, and joins the
+// optional automatic flush goroutine. Repeated calls return the first Close
+// result without submitting again.
 func (w *BatchWriter) Close(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -327,17 +360,21 @@ func (w *BatchWriter) Close(ctx context.Context) error {
 	if err := w.lock(ctx); err != nil {
 		return err
 	}
-	defer w.unlock()
 	if w.closed {
-		return w.closeErr
+		err := w.closeErr
+		w.unlock()
+		w.stopAutomaticFlush()
+		return err
 	}
 	w.closed = true
 	w.closeErr = w.flushLocked(ctx)
 	if w.closeErr != nil && w.failure == nil {
-		w.pending = nil
-		w.pendingBytes = 0
+		w.clearPendingLocked()
 	}
-	return w.closeErr
+	err := w.closeErr
+	w.unlock()
+	w.stopAutomaticFlush()
+	return err
 }
 
 func (w *BatchWriter) lock(ctx context.Context) error {
@@ -354,6 +391,102 @@ func (w *BatchWriter) lock(ctx context.Context) error {
 
 func (w *BatchWriter) unlock() {
 	w.gate <- struct{}{}
+}
+
+func (w *BatchWriter) startAutomaticFlush() {
+	if w.options.maxLatency == 0 {
+		return
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	w.autoFlushWake = make(chan struct{}, 1)
+	w.autoFlushCancel = cancel
+	w.autoFlushDone = make(chan struct{})
+	go w.automaticFlushLoop(ctx)
+}
+
+func (w *BatchWriter) wakeAutomaticFlush() {
+	if w.autoFlushWake == nil {
+		return
+	}
+	select {
+	case w.autoFlushWake <- struct{}{}:
+	default:
+	}
+}
+
+func (w *BatchWriter) stopAutomaticFlush() {
+	if w.autoFlushCancel == nil {
+		return
+	}
+	w.autoFlushCancel()
+	<-w.autoFlushDone
+}
+
+func (w *BatchWriter) automaticFlushLoop(ctx context.Context) {
+	defer close(w.autoFlushDone)
+	var timer *time.Timer
+	var timerC <-chan time.Time
+	defer func() {
+		if timer != nil {
+			timer.Stop()
+		}
+	}()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-w.autoFlushWake:
+		case <-timerC:
+		}
+
+		delay, active := w.automaticFlushStep(ctx, time.Now())
+		if !active {
+			if timer != nil {
+				timer.Stop()
+			}
+			timerC = nil
+			continue
+		}
+		if timer == nil {
+			timer = time.NewTimer(delay)
+		} else {
+			// go.mod requires Go 1.25; channel timers have guaranteed that
+			// Reset cannot expose a stale pre-reset tick since Go 1.23.
+			timer.Reset(delay)
+		}
+		timerC = timer.C
+	}
+}
+
+func (w *BatchWriter) automaticFlushStep(
+	ctx context.Context,
+	now time.Time,
+) (time.Duration, bool) {
+	if err := w.lock(ctx); err != nil {
+		return 0, false
+	}
+	defer w.unlock()
+	if w.closed || w.failure != nil || len(w.pending) == 0 {
+		return 0, false
+	}
+	if w.pendingSince.IsZero() {
+		w.pendingSince = now
+	}
+	if delay := w.pendingSince.Add(w.options.maxLatency).Sub(now); delay > 0 {
+		return delay, true
+	}
+	if err := w.flushLocked(ctx); err != nil {
+		w.failure = errors.Join(ErrBatchWriterAutoFlush, err)
+		w.clearPendingLocked()
+	}
+	return 0, false
+}
+
+func (w *BatchWriter) clearPendingLocked() {
+	w.pending = nil
+	w.pendingBytes = 0
+	w.pendingSince = time.Time{}
 }
 
 func (w *BatchWriter) flushLocked(ctx context.Context) error {
@@ -414,10 +547,8 @@ func (w *BatchWriter) flushLocked(ctx context.Context) error {
 		if sendFailed {
 			return w.finishSubmissionFailure(submitted, retryEvidence)
 		}
-
 		if len(retry) == 0 {
-			w.pending = nil
-			w.pendingBytes = 0
+			w.clearPendingLocked()
 			return nil
 		}
 		if invalidateErr := w.invalidateRetryRows(table, invalidateRows); invalidateErr != nil {
@@ -578,8 +709,7 @@ func (w *BatchWriter) finishSubmissionFailure(submitted bool, err error) error {
 		return err
 	}
 	w.failure = errors.Join(ErrBatchWriterFailed, err)
-	w.pending = nil
-	w.pendingBytes = 0
+	w.clearPendingLocked()
 	return w.failure
 }
 
@@ -831,6 +961,11 @@ func normalizeBatchWriterOptions(
 	if options.MaxBatchBytes == 0 {
 		options.MaxBatchBytes = defaultBatchWriterMaxBatchBytes
 	}
+	if options.MaxLatency < 0 {
+		return normalizedBatchWriterOptions{}, errors.New(
+			"accumulo: batch writer MaxLatency must not be negative",
+		)
+	}
 	if options.MaxWriteThreads < 0 {
 		return normalizedBatchWriterOptions{}, errors.New(
 			"accumulo: batch writer MaxWriteThreads must not be negative",
@@ -863,6 +998,7 @@ func normalizeBatchWriterOptions(
 	return normalizedBatchWriterOptions{
 		maxMemoryBytes:  options.MaxMemoryBytes,
 		maxBatchBytes:   options.MaxBatchBytes,
+		maxLatency:      options.MaxLatency,
 		maxWriteThreads: options.MaxWriteThreads,
 		maxRetries:      options.MaxRetries,
 		retryBackoff:    options.RetryBackoff,
