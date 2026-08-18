@@ -44,8 +44,10 @@ func (b *Backend) Open(_ context.Context, path string) (storage.File, error) {
 
 // Create opens a temporary sibling file for writing and commits it into path
 // on Close without first removing or moving an existing target. Existing
-// regular-file permissions are preserved; new files use 0644 subject to the
-// process umask. Parent directories are created with 0755 if they don't
+// regular-file mode bits are preserved everywhere; on Unix we also preserve
+// owner/group and extended attributes (including xattr-backed ACLs such as
+// Linux POSIX ACLs) when the platform exposes them. New files use 0644 subject
+// to the process umask. Parent directories are created with 0755 if they don't
 // already exist — matches "mkdir -p" behavior so callers don't have to
 // pre-create the path tree.
 func (b *Backend) Create(_ context.Context, path string) (storage.Writer, error) {
@@ -55,21 +57,15 @@ func (b *Backend) Create(_ context.Context, path string) (storage.Writer, error)
 		}
 	}
 	ops := osReplacementOps{}
-	mode, preserveMode, err := replacementTargetMode(ops, path)
-	if err != nil {
-		return nil, err
-	}
 	temp := filepath.Join(filepath.Dir(path), filepath.Base(path)+".shoal-tmp-"+uuid.NewString())
 	f, err := os.OpenFile(temp, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o644)
 	if err != nil {
 		return nil, fmt.Errorf("local: create temporary file for %s: %w", path, err)
 	}
-	if preserveMode {
-		if err := ops.Chmod(temp, mode); err != nil {
-			_ = f.Close()
-			_ = ops.Remove(temp)
-			return nil, fmt.Errorf("local: preserve permissions for %s: %w", path, err)
-		}
+	if _, err := preserveExistingMetadata(ops, temp, path); err != nil {
+		_ = f.Close()
+		_ = ops.Remove(temp)
+		return nil, err
 	}
 	return &writer{
 		file:   f,
@@ -174,6 +170,20 @@ func replacementTargetMode(ops replacementOps, target string) (os.FileMode, bool
 	return info.Mode().Perm(), true, nil
 }
 
+func preserveExistingMetadata(ops replacementOps, temp, target string) (bool, error) {
+	mode, hadOld, err := replacementTargetMode(ops, target)
+	if err != nil || !hadOld {
+		return hadOld, err
+	}
+	if err := ops.Chmod(temp, mode); err != nil {
+		return true, fmt.Errorf("local: preserve permissions for %s: %w", target, err)
+	}
+	if err := preservePlatformMetadata(temp, target); err != nil {
+		return true, err
+	}
+	return true, nil
+}
+
 func (w *writer) Write(p []byte) (int, error) {
 	if w.closed || w.aborted {
 		return 0, fmt.Errorf("local: write after close")
@@ -203,18 +213,12 @@ func (w *writer) Close() error {
 }
 
 func (w *writer) commitReplacement() error {
-	mode, preserveMode, err := replacementTargetMode(w.ops, w.target)
+	hadOld, err := preserveExistingMetadata(w.ops, w.temp, w.target)
 	if err != nil {
 		return err
 	}
-	if preserveMode {
-		if err := w.ops.Chmod(w.temp, mode); err != nil {
-			return fmt.Errorf("local: preserve permissions for %s: %w", w.target, err)
-		}
-	}
 
 	backup := w.target + ".shoal-backup-" + uuid.NewString()
-	hadOld := preserveMode
 	if err := w.ops.AtomicReplace(w.temp, w.target, backup, hadOld); err != nil {
 		publishErr := fmt.Errorf("local: publish %s: %w", w.target, err)
 		if hadOld {

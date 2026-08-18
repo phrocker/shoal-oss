@@ -392,6 +392,64 @@ func TestNewContextPassesContextToNamenodeDial(t *testing.T) {
 	}
 }
 
+func TestBindDialContextBoundsBlockedHandshakeOnDeadline(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+
+	local, remote := net.Pipe()
+	defer remote.Close()
+
+	dial := bindDialContext(ctx, func(context.Context, string, string) (net.Conn, error) {
+		return local, nil
+	})
+	conn, err := dial(context.Background(), "tcp", "dn:9866")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	start := time.Now()
+	_, err = conn.Read(make([]byte, 1))
+	if err == nil {
+		t.Fatal("blocked handshake read succeeded, want deadline failure")
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("blocked handshake read took %v; want bounded deadline failure", elapsed)
+	}
+}
+
+func TestBindDialContextInterruptsBlockedHandshakeOnCancel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	local, remote := net.Pipe()
+	defer remote.Close()
+
+	dial := bindDialContext(ctx, func(context.Context, string, string) (net.Conn, error) {
+		return local, nil
+	})
+	conn, err := dial(context.Background(), "tcp", "dn:9866")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := conn.Read(make([]byte, 1))
+		done <- err
+	}()
+
+	cancel()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("blocked handshake read succeeded after cancel, want failure")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("blocked handshake read did not unblock after cancel")
+	}
+}
+
 func TestBackendOpenAppliesContextDeadline(t *testing.T) {
 	client := newFakeClient()
 	client.files["/tables/1.rf"] = []byte("rfile")
@@ -524,6 +582,100 @@ func TestBackendCloseReturningNilAfterCancellationDoesNotPublish(t *testing.T) {
 	}
 	if _, ok := client.files[client.lastCreatePath]; ok {
 		t.Fatalf("temporary file %s remains after abort", client.lastCreatePath)
+	}
+}
+
+func TestBackendCloseBoundsStalledCompleteAndCleansUpTemp(t *testing.T) {
+	cleanupClient := newFakeClient()
+	state := &stalledCompleteState{cleanup: cleanupClient}
+	backend, err := NewContext(context.Background(), "nn:8020",
+		WithClient(cleanupClient),
+		func(c *config) {
+			c.clientLeaseFactory = func(ctx context.Context) (*leasedClient, error) {
+				return &leasedClient{
+					client:  &stalledCompleteClient{ctx: ctx, state: state},
+					release: func() error { return nil },
+				}, nil
+			}
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+
+	w, err := backend.Create(ctx, "/tables/1.rf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	err = w.Close()
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Close error = %v, want context deadline exceeded", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("Close took %v; want bounded stalled complete failure", elapsed)
+	}
+	if state.writerCloseCalls != 1 {
+		t.Fatalf("writer Close calls = %d, want 1", state.writerCloseCalls)
+	}
+	if !slices.Contains(cleanupClient.removeCalls, state.lastCreatePath) {
+		t.Fatalf("cleanup Remove calls = %v, want %s", cleanupClient.removeCalls, state.lastCreatePath)
+	}
+	if _, ok := cleanupClient.files[state.lastCreatePath]; ok {
+		t.Fatalf("temporary file %s remains after Close cleanup", state.lastCreatePath)
+	}
+	if len(cleanupClient.renameCalls) != 0 {
+		t.Fatalf("cleanup Rename calls = %v, want none", cleanupClient.renameCalls)
+	}
+}
+
+func TestBackendAbortBoundsStalledCompleteAndCleansUpTemp(t *testing.T) {
+	cleanupClient := newFakeClient()
+	state := &stalledCompleteState{cleanup: cleanupClient}
+	backend, err := NewContext(context.Background(), "nn:8020",
+		WithClient(cleanupClient),
+		func(c *config) {
+			c.clientLeaseFactory = func(ctx context.Context) (*leasedClient, error) {
+				return &leasedClient{
+					client:  &stalledCompleteClient{ctx: ctx, state: state},
+					release: func() error { return nil },
+				}, nil
+			}
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+
+	w, err := backend.Create(ctx, "/tables/1.rf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	err = w.(storage.Aborter).Abort()
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Abort error = %v, want context deadline exceeded", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("Abort took %v; want bounded stalled complete failure", elapsed)
+	}
+	if state.writerCloseCalls != 1 {
+		t.Fatalf("writer Close calls = %d, want 1", state.writerCloseCalls)
+	}
+	if !slices.Contains(cleanupClient.removeCalls, state.lastCreatePath) {
+		t.Fatalf("cleanup Remove calls = %v, want %s", cleanupClient.removeCalls, state.lastCreatePath)
+	}
+	if _, ok := cleanupClient.files[state.lastCreatePath]; ok {
+		t.Fatalf("temporary file %s remains after Abort cleanup", state.lastCreatePath)
+	}
+	if len(cleanupClient.renameCalls) != 0 {
+		t.Fatalf("cleanup Rename calls = %v, want none", cleanupClient.renameCalls)
 	}
 }
 
@@ -769,6 +921,54 @@ func (c *fakeClient) Rename(oldpath, newpath string) error {
 }
 
 func (c *fakeClient) Close() error { return nil }
+
+type stalledCompleteState struct {
+	cleanup          *fakeClient
+	lastCreatePath   string
+	writerCloseCalls int
+}
+
+type stalledCompleteClient struct {
+	ctx   context.Context
+	state *stalledCompleteState
+}
+
+func (c *stalledCompleteClient) Open(string) (Reader, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (c *stalledCompleteClient) Create(name string) (storage.Writer, error) {
+	c.state.lastCreatePath = name
+	c.state.cleanup.files[name] = []byte("temp")
+	return &stalledCompleteWriter{ctx: c.ctx, state: c.state}, nil
+}
+
+func (c *stalledCompleteClient) MkdirAll(string, os.FileMode) error { return nil }
+
+func (c *stalledCompleteClient) ReadDir(string) ([]os.FileInfo, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (c *stalledCompleteClient) Remove(string) error { return nil }
+
+func (c *stalledCompleteClient) Rename(string, string) error { return nil }
+
+func (c *stalledCompleteClient) Close() error { return nil }
+
+type stalledCompleteWriter struct {
+	ctx   context.Context
+	state *stalledCompleteState
+}
+
+func (w *stalledCompleteWriter) Write(p []byte) (int, error) {
+	return len(p), nil
+}
+
+func (w *stalledCompleteWriter) Close() error {
+	w.state.writerCloseCalls++
+	<-w.ctx.Done()
+	return w.ctx.Err()
+}
 
 type fakeReader struct {
 	*bytes.Reader

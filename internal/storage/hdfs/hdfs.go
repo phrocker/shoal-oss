@@ -47,8 +47,9 @@ type Reader interface {
 type Option func(*config)
 
 type config struct {
-	client        Client
-	clientOptions *hdfsclient.ClientOptions
+	client             Client
+	clientLeaseFactory func(context.Context) (*leasedClient, error)
+	clientOptions      *hdfsclient.ClientOptions
 }
 
 // WithClient supplies a pre-built HDFS client adapter. New otherwise creates a
@@ -65,8 +66,10 @@ func WithClientOptions(options hdfsclient.ClientOptions) Option {
 
 // Backend opens and manages files in one HDFS cluster.
 type Backend struct {
-	client    Client
-	authority string
+	client       Client
+	newOperation func(context.Context) (*leasedClient, error)
+	authority    string
+	closeClient  func() error
 }
 
 // New constructs a Backend for a namenode address such as "namenode:8020" or
@@ -77,71 +80,75 @@ func New(address string, opts ...Option) (*Backend, error) {
 	return NewContext(context.Background(), address, opts...)
 }
 
-// NewContext constructs a Backend like New, but also binds ctx to the
-// underlying HDFS client's future namenode and datanode dials. Use a context
-// whose lifetime matches the backend's connection lifetime. When ctx has a
-// deadline, new connections inherit it; reads and writes already blocked in the
-// upstream client still run until the current call returns.
+// NewContext constructs a Backend like New. ctx scopes the backend's
+// long-lived cleanup/lease client, while the contexts later passed to
+// Open/Create/List/Remove are rebound into short-lived operation clients so
+// their namenode and datanode dials, handshakes, and blocked RPCs can be
+// interrupted by cancellation or deadlines.
 func NewContext(ctx context.Context, address string, opts ...Option) (*Backend, error) {
 	authority, clientAddress, err := parseAddress(address)
 	if err != nil {
 		return nil, err
 	}
 
+	backgroundCtx := contextOrBackground(ctx)
 	cfg := &config{}
 	for _, opt := range opts {
 		opt(cfg)
 	}
-	if cfg.client == nil {
-		var client *hdfsclient.Client
-		if cfg.clientOptions != nil {
-			options := *cfg.clientOptions
-			if len(options.Addresses) == 0 && clientAddress != "" {
-				options.Addresses = []string{clientAddress}
-			}
-			options = bindClientOptions(ctx, options)
-			client, err = hdfsclient.NewClient(options)
-		} else if userName := os.Getenv("HADOOP_USER_NAME"); userName != "" {
-			conf, loadErr := hadoopconf.LoadFromEnvironment()
-			if loadErr != nil {
-				return nil, fmt.Errorf("hdfs: load Hadoop configuration: %w", loadErr)
-			}
-			options := hdfsclient.ClientOptionsFromConf(conf)
-			if clientAddress != "" {
-				options.Addresses = strings.Split(clientAddress, ",")
-			}
-			options.User = userName
-			options = bindClientOptions(ctx, options)
-			client, err = hdfsclient.NewClient(options)
-		} else {
-			conf, loadErr := hadoopconf.LoadFromEnvironment()
-			if loadErr != nil {
-				return nil, fmt.Errorf("hdfs: load Hadoop configuration: %w", loadErr)
-			}
-			options := hdfsclient.ClientOptionsFromConf(conf)
-			if clientAddress != "" {
-				options.Addresses = strings.Split(clientAddress, ",")
-			}
-			currentUser, userErr := osuser.Current()
-			if userErr != nil {
-				return nil, fmt.Errorf("hdfs: resolve current user: %w", userErr)
-			}
-			options.User = currentUser.Username
-			options = bindClientOptions(ctx, options)
-			client, err = hdfsclient.NewClient(options)
+	if cfg.clientLeaseFactory != nil && cfg.client == nil {
+		lease, leaseErr := cfg.clientLeaseFactory(backgroundCtx)
+		if leaseErr != nil {
+			return nil, leaseErr
 		}
-		if err != nil {
-			return nil, fmt.Errorf("hdfs: connect %s: %w", clientAddress, err)
+		cfg.client = lease.client
+		closeFn := lease.release
+		if closeFn == nil {
+			closeFn = func() error { return nil }
 		}
-		cfg.client = clientAdapter{client}
+		return &Backend{
+			client:       cfg.client,
+			newOperation: cfg.clientLeaseFactory,
+			authority:    authority,
+			closeClient:  closeFn,
+		}, nil
+	}
+	if cfg.client != nil {
+		opFactory := cfg.clientLeaseFactory
+		if opFactory == nil {
+			opFactory = func(context.Context) (*leasedClient, error) {
+				return newSharedLease(cfg.client), nil
+			}
+		}
+		return &Backend{
+			client:       cfg.client,
+			newOperation: opFactory,
+			authority:    authority,
+			closeClient:  onceCloser(cfg.client.Close),
+		}, nil
 	}
 
-	return &Backend{client: cfg.client, authority: authority}, nil
+	options, err := loadClientOptions(clientAddress, cfg)
+	if err != nil {
+		return nil, err
+	}
+	baseClient, err := newHDFSClient(backgroundCtx, clientAddress, options)
+	if err != nil {
+		return nil, err
+	}
+	return &Backend{
+		client: baseClient.client,
+		newOperation: func(opCtx context.Context) (*leasedClient, error) {
+			return newHDFSClient(opCtx, clientAddress, options)
+		},
+		authority:   authority,
+		closeClient: baseClient.release,
+	}, nil
 }
 
 // Close releases the underlying HDFS client and its open leases.
 func (b *Backend) Close() error {
-	if err := b.client.Close(); err != nil {
+	if err := b.closeClient(); err != nil {
 		return fmt.Errorf("hdfs: close client: %w", err)
 	}
 	return nil
@@ -152,12 +159,18 @@ func (b *Backend) Open(ctx context.Context, objectPath string) (storage.File, er
 	if err := contextOrBackground(ctx).Err(); err != nil {
 		return nil, err
 	}
-	resolved, _, err := b.resolve(objectPath)
+	lease, err := b.newOperation(ctx)
 	if err != nil {
 		return nil, err
 	}
-	reader, err := b.client.Open(resolved)
+	resolved, _, err := b.resolve(objectPath)
 	if err != nil {
+		_ = lease.release()
+		return nil, err
+	}
+	reader, err := lease.client.Open(resolved)
+	if err != nil {
+		_ = lease.release()
 		if isNotFound(err) {
 			return nil, fmt.Errorf("%w: %s", storage.ErrNotFound, objectPath)
 		}
@@ -165,9 +178,10 @@ func (b *Backend) Open(ctx context.Context, objectPath string) (storage.File, er
 	}
 	if err := applyDeadline(ctx, reader); err != nil {
 		_ = reader.Close()
+		_ = lease.release()
 		return nil, fmt.Errorf("hdfs: open %s: %w", objectPath, err)
 	}
-	return &file{reader: reader, size: reader.Stat().Size()}, nil
+	return &file{reader: reader, size: reader.Stat().Size(), release: lease.release}, nil
 }
 
 // Create creates or replaces path. Parent directories are created as needed.
@@ -175,32 +189,42 @@ func (b *Backend) Create(ctx context.Context, objectPath string) (storage.Writer
 	if err := contextOrBackground(ctx).Err(); err != nil {
 		return nil, err
 	}
-	resolved, _, err := b.resolve(objectPath)
+	lease, err := b.newOperation(ctx)
 	if err != nil {
 		return nil, err
 	}
+	resolved, _, err := b.resolve(objectPath)
+	if err != nil {
+		_ = lease.release()
+		return nil, err
+	}
 	if parent := path.Dir(resolved); parent != "." && parent != "/" {
-		if err := b.client.MkdirAll(parent, 0o755); err != nil {
+		if err := lease.client.MkdirAll(parent, 0o755); err != nil {
+			_ = lease.release()
 			return nil, fmt.Errorf("hdfs: mkdir %s: %w", parent, err)
 		}
 	}
 
 	tempPath := resolved + ".shoal-tmp-" + uuid.NewString()
-	writer, err := b.client.Create(tempPath)
+	writer, err := lease.client.Create(tempPath)
 	if err != nil {
+		_ = lease.release()
 		return nil, fmt.Errorf("hdfs: create temporary file %s: %w", tempPath, err)
 	}
 	if err := applyDeadline(ctx, writer); err != nil {
 		_ = writer.Close()
-		_ = b.client.Remove(tempPath)
+		_ = b.cleanupRemove(tempPath)
+		_ = lease.release()
 		return nil, fmt.Errorf("hdfs: create temporary file %s: %w", tempPath, err)
 	}
 	return &replaceWriter{
-		client: b.client,
-		writer: writer,
-		ctx:    ctx,
-		temp:   tempPath,
-		target: resolved,
+		client:        lease.client,
+		cleanupClient: b.client,
+		release:       lease.release,
+		writer:        writer,
+		ctx:           ctx,
+		temp:          tempPath,
+		target:        resolved,
 	}, nil
 }
 
@@ -209,11 +233,16 @@ func (b *Backend) List(ctx context.Context, prefix string) ([]string, error) {
 	if err := contextOrBackground(ctx).Err(); err != nil {
 		return nil, err
 	}
+	lease, err := b.newOperation(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer lease.release()
 	resolved, qualifier, err := b.resolve(prefix)
 	if err != nil {
 		return nil, err
 	}
-	entries, err := b.client.ReadDir(resolved)
+	entries, err := lease.client.ReadDir(resolved)
 	if err != nil {
 		if isNotFound(err) {
 			return nil, nil
@@ -240,12 +269,24 @@ func (b *Backend) Remove(ctx context.Context, objectPath string) error {
 	if err := contextOrBackground(ctx).Err(); err != nil {
 		return err
 	}
+	lease, err := b.newOperation(ctx)
+	if err != nil {
+		return err
+	}
+	defer lease.release()
 	resolved, _, err := b.resolve(objectPath)
 	if err != nil {
 		return err
 	}
-	if err := b.client.Remove(resolved); err != nil && !isNotFound(err) {
+	if err := lease.client.Remove(resolved); err != nil && !isNotFound(err) {
 		return fmt.Errorf("hdfs: remove %s: %w", objectPath, err)
+	}
+	return nil
+}
+
+func (b *Backend) cleanupRemove(resolved string) error {
+	if err := b.client.Remove(resolved); err != nil && !isNotFound(err) {
+		return fmt.Errorf("hdfs: remove temporary file %s: %w", resolved, err)
 	}
 	return nil
 }
@@ -338,6 +379,7 @@ func bindDialContext(ctx context.Context, dial func(context.Context, string, str
 		if err != nil {
 			return nil, err
 		}
+		conn = bindConnContext(ctx, conn)
 		if deadline, ok := ctx.Deadline(); ok {
 			if err := conn.SetDeadline(deadline); err != nil {
 				_ = conn.Close()
@@ -391,9 +433,11 @@ func applyDeadline(ctx context.Context, target any) error {
 }
 
 type file struct {
-	mu     sync.Mutex
-	reader Reader
-	size   int64
+	mu      sync.Mutex
+	reader  Reader
+	release func() error
+	size    int64
+	closed  bool
 }
 
 func (f *file) ReadAt(p []byte, off int64) (int, error) {
@@ -406,21 +450,31 @@ func (f *file) ReadAt(p []byte, off int64) (int, error) {
 func (f *file) Close() error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.reader.Close()
+	var err error
+	if !f.closed {
+		err = f.reader.Close()
+		f.closed = true
+	}
+	if f.release != nil {
+		err = errors.Join(err, f.release())
+	}
+	return err
 }
 
 func (f *file) Size() int64 { return f.size }
 
 type replaceWriter struct {
-	client       Client
-	writer       storage.Writer
-	ctx          context.Context
-	temp         string
-	target       string
-	closed       bool
-	aborted      bool
-	writerClosed bool
-	state        replacementState
+	client        Client
+	cleanupClient Client
+	release       func() error
+	writer        storage.Writer
+	ctx           context.Context
+	temp          string
+	target        string
+	closed        bool
+	aborted       bool
+	writerClosed  bool
+	state         replacementState
 }
 
 type replacementState uint8
@@ -439,7 +493,12 @@ func (w *replaceWriter) Write(p []byte) (int, error) {
 	return w.writer.Write(p)
 }
 
-func (w *replaceWriter) Close() error {
+func (w *replaceWriter) Close() (retErr error) {
+	defer func() {
+		if releaseErr := w.releaseOperationClient(); releaseErr != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("hdfs: close operation client: %w", releaseErr))
+		}
+	}()
 	if w.aborted {
 		return errors.New("hdfs: writer already aborted")
 	}
@@ -447,8 +506,10 @@ func (w *replaceWriter) Close() error {
 		return nil
 	}
 	if err := closeAfterReplication(w.ctx, w.writer); err != nil {
-		_ = w.client.Remove(w.temp)
-		return fmt.Errorf("hdfs: close temporary file %s: %w", w.temp, err)
+		return errors.Join(
+			fmt.Errorf("hdfs: close temporary file %s: %w", w.temp, err),
+			w.removeTemp(),
+		)
 	}
 	w.writerClosed = true
 
@@ -472,12 +533,9 @@ func (w *replaceWriter) commitReplacement() error {
 	if err := w.client.Rename(w.temp, w.target); err != nil {
 		publishErr := fmt.Errorf("hdfs: publish %s: %w", w.target, err)
 		if hadOld {
-			if restoreErr := w.client.Rename(backup, w.target); restoreErr != nil {
+			if restoreErr := w.restoreBackup(backup); restoreErr != nil {
 				w.state = replacementUnabortable
-				publishErr = errors.Join(
-					publishErr,
-					fmt.Errorf("hdfs: restore existing file %s from %s: %w", w.target, backup, restoreErr),
-				)
+				publishErr = errors.Join(publishErr, restoreErr)
 			}
 		}
 		return publishErr
@@ -486,7 +544,9 @@ func (w *replaceWriter) commitReplacement() error {
 	if hadOld {
 		if err := w.client.Remove(backup); err != nil && !isNotFound(err) {
 			cleanupErr := fmt.Errorf("hdfs: remove replacement backup %s: %w", backup, err)
-			if rollbackErr := w.rollbackPublishedReplacement(backup); rollbackErr != nil {
+			if rollbackErr := w.withCleanupClient(func(client Client) error {
+				return w.rollbackPublishedReplacement(client, backup)
+			}); rollbackErr != nil {
 				return errors.Join(cleanupErr, rollbackErr)
 			}
 			return cleanupErr
@@ -496,13 +556,13 @@ func (w *replaceWriter) commitReplacement() error {
 	return nil
 }
 
-func (w *replaceWriter) rollbackPublishedReplacement(backup string) error {
-	if err := w.client.Rename(w.target, w.temp); err != nil {
+func (w *replaceWriter) rollbackPublishedReplacement(client Client, backup string) error {
+	if err := client.Rename(w.target, w.temp); err != nil {
 		return fmt.Errorf("hdfs: roll back published file %s: %w", w.target, err)
 	}
-	if err := w.client.Rename(backup, w.target); err != nil {
+	if err := client.Rename(backup, w.target); err != nil {
 		restoreErr := fmt.Errorf("hdfs: restore existing file %s from %s: %w", w.target, backup, err)
-		if republishErr := w.client.Rename(w.temp, w.target); republishErr != nil {
+		if republishErr := client.Rename(w.temp, w.target); republishErr != nil {
 			w.state = replacementUnabortable
 			return errors.Join(
 				restoreErr,
@@ -516,7 +576,12 @@ func (w *replaceWriter) rollbackPublishedReplacement(backup string) error {
 	return nil
 }
 
-func (w *replaceWriter) Abort() error {
+func (w *replaceWriter) Abort() (retErr error) {
+	defer func() {
+		if releaseErr := w.releaseOperationClient(); releaseErr != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("hdfs: close operation client: %w", releaseErr))
+		}
+	}()
 	if w.aborted {
 		return nil
 	}
@@ -530,14 +595,14 @@ func (w *replaceWriter) Abort() error {
 
 	var abortErr error
 	if !w.writerClosed {
-		if err := closeAfterReplication(context.Background(), w.writer); err != nil {
+		if err := closeAfterReplication(w.ctx, w.writer); err != nil {
 			abortErr = fmt.Errorf("hdfs: close temporary file %s: %w", w.temp, err)
 		} else {
 			w.writerClosed = true
 		}
 	}
-	if err := w.client.Remove(w.temp); err != nil && !isNotFound(err) {
-		abortErr = errors.Join(abortErr, fmt.Errorf("hdfs: remove temporary file %s: %w", w.temp, err))
+	if cleanupErr := w.removeTemp(); cleanupErr != nil {
+		abortErr = errors.Join(abortErr, cleanupErr)
 	}
 	return abortErr
 }
@@ -599,6 +664,131 @@ func (c clientAdapter) Open(name string) (Reader, error) {
 
 func (c clientAdapter) Create(name string) (storage.Writer, error) {
 	return c.Client.Create(name)
+}
+
+type leasedClient struct {
+	client  Client
+	release func() error
+}
+
+func newSharedLease(client Client) *leasedClient {
+	return &leasedClient{
+		client: client,
+		release: func() error {
+			return nil
+		},
+	}
+}
+
+func newOwnedLease(client Client, closeFn func() error) *leasedClient {
+	return &leasedClient{
+		client:  client,
+		release: onceCloser(closeFn),
+	}
+}
+
+func onceCloser(closeFn func() error) func() error {
+	var once sync.Once
+	var closeErr error
+	return func() error {
+		if closeFn == nil {
+			return nil
+		}
+		once.Do(func() {
+			closeErr = closeFn()
+		})
+		return closeErr
+	}
+}
+
+func loadClientOptions(clientAddress string, cfg *config) (hdfsclient.ClientOptions, error) {
+	if cfg.clientOptions != nil {
+		options := *cfg.clientOptions
+		if len(options.Addresses) == 0 && clientAddress != "" {
+			options.Addresses = []string{clientAddress}
+		}
+		return options, nil
+	}
+	conf, err := hadoopconf.LoadFromEnvironment()
+	if err != nil {
+		return hdfsclient.ClientOptions{}, fmt.Errorf("hdfs: load Hadoop configuration: %w", err)
+	}
+	options := hdfsclient.ClientOptionsFromConf(conf)
+	if clientAddress != "" {
+		options.Addresses = strings.Split(clientAddress, ",")
+	}
+	if userName := os.Getenv("HADOOP_USER_NAME"); userName != "" {
+		options.User = userName
+		return options, nil
+	}
+	currentUser, err := osuser.Current()
+	if err != nil {
+		return hdfsclient.ClientOptions{}, fmt.Errorf("hdfs: resolve current user: %w", err)
+	}
+	options.User = currentUser.Username
+	return options, nil
+}
+
+func newHDFSClient(ctx context.Context, clientAddress string, options hdfsclient.ClientOptions) (*leasedClient, error) {
+	client, err := hdfsclient.NewClient(bindClientOptions(ctx, options))
+	if err != nil {
+		return nil, fmt.Errorf("hdfs: connect %s: %w", clientAddress, err)
+	}
+	return newOwnedLease(clientAdapter{client}, client.Close), nil
+}
+
+type contextBoundConn struct {
+	net.Conn
+	stop func() bool
+}
+
+func (c *contextBoundConn) Close() error {
+	if c.stop != nil {
+		c.stop()
+	}
+	return c.Conn.Close()
+}
+
+func bindConnContext(ctx context.Context, conn net.Conn) net.Conn {
+	if ctx.Done() == nil {
+		return conn
+	}
+	return &contextBoundConn{
+		Conn: conn,
+		stop: context.AfterFunc(ctx, func() {
+			_ = conn.Close()
+		}),
+	}
+}
+
+func (w *replaceWriter) releaseOperationClient() error {
+	if w.release == nil {
+		return nil
+	}
+	return w.release()
+}
+
+func (w *replaceWriter) removeTemp() error {
+	if err := w.cleanupClient.Remove(w.temp); err != nil && !isNotFound(err) {
+		return fmt.Errorf("hdfs: remove temporary file %s: %w", w.temp, err)
+	}
+	return nil
+}
+
+func (w *replaceWriter) restoreBackup(backup string) error {
+	return w.withCleanupClient(func(client Client) error {
+		if err := client.Rename(backup, w.target); err != nil {
+			return fmt.Errorf("hdfs: restore existing file %s from %s: %w", w.target, backup, err)
+		}
+		return nil
+	})
+}
+
+func (w *replaceWriter) withCleanupClient(fn func(Client) error) error {
+	if w.cleanupClient == nil {
+		return errors.New("hdfs: cleanup client is not configured")
+	}
+	return fn(w.cleanupClient)
 }
 
 var (
