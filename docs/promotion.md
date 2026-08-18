@@ -123,11 +123,24 @@ belongs to the tablet that *ends* at the split. `BuildLoadMapping` copies
 byte-math translation between the two conventions (no "predecessor"
 operation exists for arbitrary row bytes; only "successor", via appending
 `0x00`, which Accumulo itself relies on in `rowAfterPrevRow()`). This means
-a row that exactly equals one of the source table's split values can be
-promoted into the tablet *adjacent* to the one Shoal's own local engine
-would have routed it to. This is a genuine, currently **unresolved** gap
-against acceptance criterion 1 ("cell-equivalent results"), not something
-this slice claims to have fixed — see [§5, item 1](#5-whats-deferred).
+a row that exactly equals one of the source table's split values is
+excluded from *both* derived KeyExtents' scan-visible ranges, not merely
+relocated to the adjacent one. Concretely, for adjacent Shoal tablets
+`[X, Y)` and `[Y, Z)`, `BuildLoadMapping` produces `(X, Y]` and `(Y, Z]`;
+row `Y` is physically written into the *second* tablet's exported RFile
+(Shoal routes it there), but that RFile is mapped to the KeyExtent
+`(Y, Z]`, whose exclusive-start condition (`Y < r`) excludes `r = Y`
+itself. Accumulo always range-restricts a tablet's scans to its own
+extent — this is exactly what makes the "a file may span multiple
+destination tablets" behavior in §3 safe in the first place, since a
+shared file's rows outside a given tablet's range must be filtered out
+for that tablet's siblings — so row `Y` is filtered out of every scan
+against `(Y, Z]`, and `(X, Y]` never received that row's data at all
+(Shoal's own export excludes `Y` from tablet `[X, Y)`). The row is not
+findable under either destination tablet: it is **effectively lost**, not
+simply misplaced. This is a genuine, currently **unresolved** gap against
+acceptance criterion 1 ("cell-equivalent results"), not something this
+slice claims to have fixed — see [§5, item 1](#5-whats-deferred).
 
 What this slice *does* add is a way to catch the more common failure mode
 — a destination that is not pre-split to match the source at all —
@@ -205,9 +218,10 @@ Mapped against #70's five acceptance criteria:
    shape are verified against upstream Java source and unit-tested end to
    end with fakes, but this is **not fully solved**: §3's "Known
    limitation" describes a real, unresolved gap (rows exactly equal to a
-   split value can land in the adjacent tablet, due to Shoal's
-   `[Start,End)` vs. Accumulo's `(Prev,End]` boundary conventions), and
-   none of this has been **verified against a live Accumulo cluster**
+   split value are excluded from every destination tablet's scan-visible
+   range and are effectively lost, due to Shoal's `[Start,End)` vs.
+   Accumulo's `(Prev,End]` boundary conventions), and none of this has
+   been **verified against a live Accumulo cluster**
    (none is available in this environment). `ValidateAgainstDestination`
    catches the more common failure (destination not pre-split to match at
    all) but does not close the exact-boundary gap.

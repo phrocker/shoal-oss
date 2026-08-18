@@ -28,6 +28,16 @@
 //     BuildLoadMapping therefore copies each tablet's StartRow/EndRow into
 //     PrevEndRow/EndRow as-is, which is exactly correct only when the
 //     destination table is already split at those same row values.
+//     Even then, a row whose value exactly equals an interior split point
+//     is excluded from every destination tablet's scan-visible range (not
+//     merely relocated to the adjacent one) — see docs/promotion.md §3
+//     for the full derivation — because Shoal writes that row into the
+//     tablet that starts at the split, but the KeyExtent that file maps
+//     to has an exclusive-start boundary there, and the sibling KeyExtent
+//     that would include it never received that row's data at all.
+//     ValidateAgainstDestination cannot detect this: it only checks that
+//     boundary values exist on the destination, not whether individual
+//     rows within a file fall on the correct side of one.
 //     Accumulo's own PrepBulkImport enforces exactly that precondition —
 //     it validates each mapping entry's PrevEndRow/EndRow against the
 //     destination's real, current tablet boundaries, it does not create or
