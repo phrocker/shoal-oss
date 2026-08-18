@@ -9,6 +9,8 @@ import (
 	"path"
 	"strings"
 	"sync"
+
+	nslookup "github.com/phrocker/shoal/internal/namespaces"
 )
 
 const defaultNamespaceName = ""
@@ -16,35 +18,54 @@ const defaultNamespaceName = ""
 // ErrTableNotFound indicates that no table mapping matched a name or ID.
 var ErrTableNotFound = errors.New("table not found")
 
+var errNamespaceChanged = errors.New("namespace mapping changed during table-name lookup")
+
 // Locator is the ZooKeeper subset needed for table-name resolution.
 type Locator interface {
 	InstancePath() string
 	GetRaw(context.Context, string) ([]byte, error)
 }
 
-// Resolver caches table name and ID mappings until explicitly invalidated.
-type Resolver struct {
-	locator Locator
+// NamespaceResolver is the shared namespace lookup dependency needed for
+// table-name resolution.
+type NamespaceResolver interface {
+	ResolveID(context.Context, string) (string, error)
+	List(context.Context) (map[string]string, error)
+	Generation() uint64
+}
 
+// Resolver caches table name and ID mappings until explicitly invalidated or
+// the shared namespace resolver's generation changes.
+type Resolver struct {
+	locator    Locator
+	namespaces NamespaceResolver
+
+	opMu     sync.Mutex
 	mu       sync.RWMutex
 	nameToID map[string]string
 	idToName map[string]string
 
-	namespaceNames   map[string]string
-	loadedNamespaces map[string]struct{}
+	loadedNamespaces    map[string]struct{}
+	namespaceGeneration uint64
+	namespaceTables     map[string]map[string]string
 }
 
-// NewResolver creates a table-name resolver backed by locator.
-func NewResolver(locator Locator) *Resolver {
+// NewResolver creates a table-name resolver backed by locator and the shared
+// namespace resolver.
+func NewResolver(locator Locator, namespaces NamespaceResolver) *Resolver {
 	if locator == nil {
 		panic("tablenames.NewResolver: nil Locator")
 	}
+	if namespaces == nil {
+		panic("tablenames.NewResolver: nil NamespaceResolver")
+	}
 	return &Resolver{
 		locator:          locator,
+		namespaces:       namespaces,
 		nameToID:         map[string]string{},
 		idToName:         map[string]string{},
-		namespaceNames:   nil,
 		loadedNamespaces: map[string]struct{}{},
+		namespaceTables:  map[string]map[string]string{},
 	}
 }
 
@@ -53,40 +74,48 @@ func (r *Resolver) ResolveID(ctx context.Context, tableName string) (string, err
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
-	r.mu.RLock()
-	if id, ok := r.nameToID[tableName]; ok {
+	r.opMu.Lock()
+	defer r.opMu.Unlock()
+	for {
+		generation := r.syncNamespaceGeneration()
+		r.mu.RLock()
+		id, ok := r.nameToID[tableName]
 		r.mu.RUnlock()
-		return id, nil
-	}
-	r.mu.RUnlock()
+		if ok && r.namespaces.Generation() == generation {
+			return id, nil
+		}
 
-	namespaceName, rawName := splitQualifiedName(tableName)
-	namespaceID, err := r.resolveNamespaceID(ctx, namespaceName)
-	if err != nil {
-		return "", fmt.Errorf("%w: table %q: %v", ErrTableNotFound, tableName, err)
-	}
-	if err := r.loadNamespace(ctx, namespaceID, namespaceName); err != nil {
-		return "", err
-	}
+		namespaceName, rawName := splitQualifiedName(tableName)
+		namespaceID, err := r.namespaces.ResolveID(ctx, namespaceName)
+		if err != nil {
+			if errors.Is(err, nslookup.ErrNamespaceNotFound) {
+				return "", fmt.Errorf("%w: table %q: %v", ErrTableNotFound, tableName, err)
+			}
+			return "", err
+		}
+		generation = r.syncNamespaceGeneration()
+		if err := r.loadNamespace(ctx, namespaceID, namespaceName, generation); err != nil {
+			if errors.Is(err, errNamespaceChanged) {
+				continue
+			}
+			return "", err
+		}
 
-	r.mu.RLock()
-	id, ok := r.nameToID[tableName]
-	r.mu.RUnlock()
-	if ok {
-		return id, nil
+		qualifiedName := rawName
+		if namespaceName != defaultNamespaceName {
+			qualifiedName = namespaceName + "." + rawName
+		}
+		r.mu.RLock()
+		id, ok = r.nameToID[qualifiedName]
+		r.mu.RUnlock()
+		if r.namespaces.Generation() != generation {
+			continue
+		}
+		if ok {
+			return id, nil
+		}
+		return "", fmt.Errorf("%w: table %q in namespace %q", ErrTableNotFound, tableName, namespaceName)
 	}
-
-	qualifiedName := rawName
-	if namespaceName != defaultNamespaceName {
-		qualifiedName = namespaceName + "." + rawName
-	}
-	r.mu.RLock()
-	id, ok = r.nameToID[qualifiedName]
-	r.mu.RUnlock()
-	if ok {
-		return id, nil
-	}
-	return "", fmt.Errorf("%w: table %q in namespace %q", ErrTableNotFound, tableName, namespaceName)
 }
 
 // ResolveName resolves a table ID to its qualified operator-facing name.
@@ -94,29 +123,46 @@ func (r *Resolver) ResolveName(ctx context.Context, tableID string) (string, err
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
-	r.mu.RLock()
-	if name, ok := r.idToName[tableID]; ok {
-		r.mu.RUnlock()
-		return name, nil
-	}
-	r.mu.RUnlock()
-
-	namespaces, err := r.loadNamespaces(ctx)
-	if err != nil {
-		return "", err
-	}
-	for namespaceID, namespaceName := range namespaces {
-		if err := r.loadNamespace(ctx, namespaceID, namespaceName); err != nil {
-			return "", err
-		}
+	r.opMu.Lock()
+	defer r.opMu.Unlock()
+	for {
+		generation := r.syncNamespaceGeneration()
 		r.mu.RLock()
 		name, ok := r.idToName[tableID]
 		r.mu.RUnlock()
+		if ok && r.namespaces.Generation() == generation {
+			return name, nil
+		}
+
+		namespaces, err := r.namespaces.List(ctx)
+		if err != nil {
+			return "", err
+		}
+		generation = r.syncNamespaceGeneration()
+		retry := false
+		for namespaceName, namespaceID := range namespaces {
+			if err := r.loadNamespace(ctx, namespaceID, namespaceName, generation); err != nil {
+				if errors.Is(err, errNamespaceChanged) {
+					retry = true
+					break
+				}
+				return "", err
+			}
+			r.mu.RLock()
+			name, ok = r.idToName[tableID]
+			r.mu.RUnlock()
+			if ok {
+				break
+			}
+		}
+		if retry || r.namespaces.Generation() != generation {
+			continue
+		}
 		if ok {
 			return name, nil
 		}
+		return "", fmt.Errorf("%w: table id %q", ErrTableNotFound, tableID)
 	}
-	return "", fmt.Errorf("%w: table id %q", ErrTableNotFound, tableID)
 }
 
 // List returns every qualified table name mapped to its table ID.
@@ -124,72 +170,88 @@ func (r *Resolver) List(ctx context.Context) (map[string]string, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	namespaces, err := r.loadNamespaces(ctx)
-	if err != nil {
-		return nil, err
-	}
-	for namespaceID, namespaceName := range namespaces {
-		if err := r.loadNamespace(ctx, namespaceID, namespaceName); err != nil {
+	r.opMu.Lock()
+	defer r.opMu.Unlock()
+	for {
+		r.syncNamespaceGeneration()
+		namespaces, err := r.namespaces.List(ctx)
+		if err != nil {
 			return nil, err
 		}
+		generation := r.syncNamespaceGeneration()
+		retry := false
+		for namespaceName, namespaceID := range namespaces {
+			if err := r.loadNamespace(ctx, namespaceID, namespaceName, generation); err != nil {
+				if errors.Is(err, errNamespaceChanged) {
+					retry = true
+					break
+				}
+				return nil, err
+			}
+		}
+		if retry || r.namespaces.Generation() != generation {
+			continue
+		}
+		r.mu.RLock()
+		tables := cloneMapping(r.nameToID)
+		r.mu.RUnlock()
+		return tables, nil
 	}
-	r.mu.RLock()
-	tables := cloneMapping(r.nameToID)
-	r.mu.RUnlock()
-	return tables, nil
 }
 
-// Invalidate clears all cached mappings.
+// ListNamespace returns the qualified table names mapped within one namespace.
+// It loads only the requested namespace's mapping.
+func (r *Resolver) ListNamespace(
+	ctx context.Context,
+	namespaceName string,
+) (map[string]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	r.opMu.Lock()
+	defer r.opMu.Unlock()
+	for {
+		r.syncNamespaceGeneration()
+		namespaceID, err := r.namespaces.ResolveID(ctx, namespaceName)
+		if err != nil {
+			return nil, err
+		}
+		generation := r.syncNamespaceGeneration()
+		if err := r.loadNamespace(ctx, namespaceID, namespaceName, generation); err != nil {
+			if errors.Is(err, errNamespaceChanged) {
+				continue
+			}
+			return nil, err
+		}
+
+		r.mu.RLock()
+		tables := cloneMapping(r.namespaceTables[namespaceID])
+		r.mu.RUnlock()
+		if r.namespaces.Generation() != generation {
+			continue
+		}
+		return tables, nil
+	}
+}
+
+// Invalidate clears all cached table mappings.
 func (r *Resolver) Invalidate() {
+	r.opMu.Lock()
+	defer r.opMu.Unlock()
 	r.mu.Lock()
 	r.nameToID = map[string]string{}
 	r.idToName = map[string]string{}
-	r.namespaceNames = nil
 	r.loadedNamespaces = map[string]struct{}{}
+	r.namespaceGeneration = r.namespaces.Generation()
+	r.namespaceTables = map[string]map[string]string{}
 	r.mu.Unlock()
 }
 
-func (r *Resolver) resolveNamespaceID(ctx context.Context, namespaceName string) (string, error) {
-	namespaces, err := r.loadNamespaces(ctx)
-	if err != nil {
-		return "", err
-	}
-	for id, name := range namespaces {
-		if name == namespaceName {
-			return id, nil
-		}
-	}
-	return "", fmt.Errorf("namespace %q not found", namespaceName)
-}
-
-func (r *Resolver) loadNamespaces(ctx context.Context) (map[string]string, error) {
-	r.mu.RLock()
-	if r.namespaceNames != nil {
-		namespaces := cloneMapping(r.namespaceNames)
-		r.mu.RUnlock()
-		return namespaces, nil
-	}
-	r.mu.RUnlock()
-
-	namespacesPath := path.Join(r.locator.InstancePath(), "namespaces")
-	data, err := r.locator.GetRaw(ctx, namespacesPath)
-	if err != nil {
-		return nil, fmt.Errorf("get %s: %w", namespacesPath, err)
-	}
-	namespaces, err := decodeMappingJSON(data)
-	if err != nil {
-		return nil, fmt.Errorf("decode %s: %w", namespacesPath, err)
-	}
-	r.mu.Lock()
-	if r.namespaceNames == nil {
-		r.namespaceNames = namespaces
-	}
-	cached := cloneMapping(r.namespaceNames)
-	r.mu.Unlock()
-	return cached, nil
-}
-
-func (r *Resolver) loadNamespace(ctx context.Context, namespaceID, namespaceName string) error {
+func (r *Resolver) loadNamespace(
+	ctx context.Context,
+	namespaceID, namespaceName string,
+	namespaceGeneration uint64,
+) error {
 	r.mu.RLock()
 	_, loaded := r.loadedNamespaces[namespaceID]
 	r.mu.RUnlock()
@@ -206,8 +268,16 @@ func (r *Resolver) loadNamespace(ctx context.Context, namespaceID, namespaceName
 	if err != nil {
 		return fmt.Errorf("decode %s: %w", tablesPath, err)
 	}
+	if r.namespaces.Generation() != namespaceGeneration {
+		return errNamespaceChanged
+	}
 
 	r.mu.Lock()
+	if r.namespaceGeneration != namespaceGeneration {
+		r.mu.Unlock()
+		return errNamespaceChanged
+	}
+	namespaceTables := make(map[string]string, len(idToRawName))
 	for id, rawName := range idToRawName {
 		name := rawName
 		if namespaceName != defaultNamespaceName {
@@ -215,10 +285,26 @@ func (r *Resolver) loadNamespace(ctx context.Context, namespaceID, namespaceName
 		}
 		r.nameToID[name] = id
 		r.idToName[id] = name
+		namespaceTables[name] = id
 	}
+	r.namespaceTables[namespaceID] = namespaceTables
 	r.loadedNamespaces[namespaceID] = struct{}{}
 	r.mu.Unlock()
 	return nil
+}
+
+func (r *Resolver) syncNamespaceGeneration() uint64 {
+	generation := r.namespaces.Generation()
+	r.mu.Lock()
+	if r.namespaceGeneration != generation {
+		r.nameToID = map[string]string{}
+		r.idToName = map[string]string{}
+		r.loadedNamespaces = map[string]struct{}{}
+		r.namespaceTables = map[string]map[string]string{}
+		r.namespaceGeneration = generation
+	}
+	r.mu.Unlock()
+	return generation
 }
 
 func cloneMapping(mapping map[string]string) map[string]string {

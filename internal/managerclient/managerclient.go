@@ -48,6 +48,9 @@ const (
 	// per new split row. See splits.go and REFERENCES.md for the payload
 	// encoding.
 	TableSplit
+	NamespaceCreate
+	NamespaceDelete
+	NamespaceRename
 )
 
 type FateInstance int
@@ -62,6 +65,11 @@ type Request struct {
 	Instance  FateInstance
 	Arguments [][]byte
 	Options   map[string]string
+}
+
+type VersionedProperties struct {
+	Version    int64
+	Properties map[string]string
 }
 
 type ErrorKind int
@@ -135,8 +143,13 @@ type Adapter interface {
 	) ([]TabletExtent, error)
 	FlushTable(context.Context, string, string, bool) error
 	GetTableConfiguration(context.Context, string, string) (map[string]string, error)
+	GetNamespaceConfiguration(context.Context, string, string) (map[string]string, error)
+	GetNamespaceProperties(context.Context, string, string) (map[string]string, error)
+	GetVersionedNamespaceProperties(context.Context, string, string) (VersionedProperties, error)
 	SetTableProperty(context.Context, string, string, string, string) error
 	RemoveTableProperty(context.Context, string, string, string) error
+	SetNamespaceProperty(context.Context, string, string, string, string) error
+	RemoveNamespaceProperty(context.Context, string, string, string) error
 	Close() error
 }
 
@@ -181,6 +194,8 @@ type managerRPC interface {
 		string,
 		[]MergeabilityUpdate,
 	) ([]TabletExtent, error)
+	SetNamespaceProperty(context.Context, *security.TCredentials, string, string, string) error
+	RemoveNamespaceProperty(context.Context, *security.TCredentials, string, string) error
 }
 
 type clientRPC interface {
@@ -189,6 +204,21 @@ type clientRPC interface {
 		*security.TCredentials,
 		string,
 	) (map[string]string, error)
+	GetNamespaceConfiguration(
+		context.Context,
+		*security.TCredentials,
+		string,
+	) (map[string]string, error)
+	GetNamespaceProperties(
+		context.Context,
+		*security.TCredentials,
+		string,
+	) (map[string]string, error)
+	GetVersionedNamespaceProperties(
+		context.Context,
+		*security.TCredentials,
+		string,
+	) (VersionedProperties, error)
 	CreateLocalUser(context.Context, *security.TCredentials, string, []byte) error
 	DropLocalUser(context.Context, *security.TCredentials, string) error
 	ChangeLocalUserPassword(context.Context, *security.TCredentials, string, []byte) error
@@ -382,6 +412,58 @@ func (p *Pooled) GetTableConfiguration(
 	return cloneOptions(properties), nil
 }
 
+func (p *Pooled) GetNamespaceConfiguration(
+	ctx context.Context,
+	address, namespace string,
+) (map[string]string, error) {
+	credentials, err := p.credentialsForRPC()
+	if err != nil {
+		return nil, err
+	}
+	properties, err := withClientService(p, ctx, address, func(rpc clientRPC) (map[string]string, error) {
+		return rpc.GetNamespaceConfiguration(ctx, credentials, namespace)
+	})
+	if err != nil {
+		return nil, mapRPCError(err)
+	}
+	return cloneOptions(properties), nil
+}
+
+func (p *Pooled) GetNamespaceProperties(
+	ctx context.Context,
+	address, namespace string,
+) (map[string]string, error) {
+	credentials, err := p.credentialsForRPC()
+	if err != nil {
+		return nil, err
+	}
+	properties, err := withClientService(p, ctx, address, func(rpc clientRPC) (map[string]string, error) {
+		return rpc.GetNamespaceProperties(ctx, credentials, namespace)
+	})
+	if err != nil {
+		return nil, mapRPCError(err)
+	}
+	return cloneOptions(properties), nil
+}
+
+func (p *Pooled) GetVersionedNamespaceProperties(
+	ctx context.Context,
+	address, namespace string,
+) (VersionedProperties, error) {
+	credentials, err := p.credentialsForRPC()
+	if err != nil {
+		return VersionedProperties{}, err
+	}
+	properties, err := withClientService(p, ctx, address, func(rpc clientRPC) (VersionedProperties, error) {
+		return rpc.GetVersionedNamespaceProperties(ctx, credentials, namespace)
+	})
+	if err != nil {
+		return VersionedProperties{}, mapRPCError(err)
+	}
+	properties.Properties = cloneOptions(properties.Properties)
+	return properties, nil
+}
+
 func (p *Pooled) CreateLocalUser(ctx context.Context, address, principal string, password []byte) error {
 	return p.securityVoid(ctx, address, func(rpc clientRPC, credentials *security.TCredentials) error {
 		return rpc.CreateLocalUser(ctx, credentials, principal, append([]byte(nil), password...))
@@ -565,6 +647,40 @@ func (p *Pooled) RemoveTableProperty(
 	}
 	_, err = withManagerClient(p, ctx, address, func(rpc managerRPC) (struct{}, error) {
 		return struct{}{}, rpc.RemoveTableProperty(ctx, credentials, tableName, property)
+	})
+	return mapRPCError(err)
+}
+
+func (p *Pooled) SetNamespaceProperty(
+	ctx context.Context,
+	address, namespace, property, value string,
+) error {
+	if property == "" {
+		return errors.New("managerclient: empty property")
+	}
+	credentials, err := p.credentialsForRPC()
+	if err != nil {
+		return err
+	}
+	_, err = withManagerClient(p, ctx, address, func(rpc managerRPC) (struct{}, error) {
+		return struct{}{}, rpc.SetNamespaceProperty(ctx, credentials, namespace, property, value)
+	})
+	return mapRPCError(err)
+}
+
+func (p *Pooled) RemoveNamespaceProperty(
+	ctx context.Context,
+	address, namespace, property string,
+) error {
+	if property == "" {
+		return errors.New("managerclient: empty property")
+	}
+	credentials, err := p.credentialsForRPC()
+	if err != nil {
+		return err
+	}
+	_, err = withManagerClient(p, ctx, address, func(rpc managerRPC) (struct{}, error) {
+		return struct{}{}, rpc.RemoveNamespaceProperty(ctx, credentials, namespace, property)
 	})
 	return mapRPCError(err)
 }
@@ -778,6 +894,45 @@ func (r thriftClientRPC) GetTableConfiguration(
 	)
 }
 
+func (r thriftClientRPC) GetNamespaceConfiguration(
+	ctx context.Context,
+	credentials *security.TCredentials,
+	namespace string,
+) (map[string]string, error) {
+	return r.raw.GetNamespaceConfiguration(ctx, clientgen.NewTInfo(), credentials, namespace)
+}
+
+func (r thriftClientRPC) GetNamespaceProperties(
+	ctx context.Context,
+	credentials *security.TCredentials,
+	namespace string,
+) (map[string]string, error) {
+	return r.raw.GetNamespaceProperties(ctx, clientgen.NewTInfo(), credentials, namespace)
+}
+
+func (r thriftClientRPC) GetVersionedNamespaceProperties(
+	ctx context.Context,
+	credentials *security.TCredentials,
+	namespace string,
+) (VersionedProperties, error) {
+	properties, err := r.raw.GetVersionedNamespaceProperties(
+		ctx,
+		clientgen.NewTInfo(),
+		credentials,
+		namespace,
+	)
+	if err != nil {
+		return VersionedProperties{}, err
+	}
+	if properties == nil {
+		return VersionedProperties{}, errors.New("managerclient: versioned namespace properties returned nil")
+	}
+	return VersionedProperties{
+		Version:    properties.Version,
+		Properties: cloneOptions(properties.Properties),
+	}, nil
+}
+
 func (r thriftClientRPC) CreateLocalUser(
 	ctx context.Context,
 	credentials *security.TCredentials,
@@ -980,6 +1135,35 @@ func (r thriftManagerRPC) RemoveTableProperty(
 	)
 }
 
+func (r thriftManagerRPC) SetNamespaceProperty(
+	ctx context.Context,
+	credentials *security.TCredentials,
+	namespace, property, value string,
+) error {
+	return r.raw.SetNamespaceProperty(
+		ctx,
+		&clientgen.TInfo{},
+		credentials,
+		namespace,
+		property,
+		value,
+	)
+}
+
+func (r thriftManagerRPC) RemoveNamespaceProperty(
+	ctx context.Context,
+	credentials *security.TCredentials,
+	namespace, property string,
+) error {
+	return r.raw.RemoveNamespaceProperty(
+		ctx,
+		&clientgen.TInfo{},
+		credentials,
+		namespace,
+		property,
+	)
+}
+
 func thriftFateInstance(instance FateInstance) manager.TFateInstanceType {
 	switch instance {
 	case FateUser:
@@ -1044,6 +1228,12 @@ func thriftOperation(op Operation) manager.TFateOperation {
 		return manager.TFateOperation_TABLE_BULK_IMPORT2
 	case TableSplit:
 		return manager.TFateOperation_TABLE_SPLIT
+	case NamespaceCreate:
+		return manager.TFateOperation_NAMESPACE_CREATE
+	case NamespaceDelete:
+		return manager.TFateOperation_NAMESPACE_DELETE
+	case NamespaceRename:
+		return manager.TFateOperation_NAMESPACE_RENAME
 	default:
 		panic("managerclient: validated unknown operation")
 	}
@@ -1079,6 +1269,14 @@ func validateRequest(req Request) error {
 				splitMinimumArguments,
 				len(req.Arguments),
 			)
+		}
+	case NamespaceCreate, NamespaceDelete:
+		if len(req.Arguments) != 1 {
+			return fmt.Errorf("managerclient: namespace operation requires 1 argument, got %d", len(req.Arguments))
+		}
+	case NamespaceRename:
+		if len(req.Arguments) != 2 {
+			return fmt.Errorf("managerclient: namespace rename requires 2 arguments, got %d", len(req.Arguments))
 		}
 	default:
 		return fmt.Errorf("managerclient: unknown operation %d", req.Operation)

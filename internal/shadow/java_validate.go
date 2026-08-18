@@ -24,15 +24,17 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 )
 
 // EnvJavaRFileValidate is the env-var name. When set, runJavaValidator
 // drops shoal's output bytes to a tempfile, $RFILE-substitutes the value,
-// shells out via "sh -c", and reports the exit code. Reuses the
-// SHOAL_JAVA_RFILE_VALIDATE convention from the C0 parity harness so
-// CI / dev environments only need one variable set.
+// shells out via the platform shell (sh -c on POSIX, PowerShell or cmd on
+// Windows), and reports the exit code. Reuses the SHOAL_JAVA_RFILE_VALIDATE
+// convention from the C0 parity harness so CI / dev environments only need
+// one variable set.
 //
 // Suggested values:
 //
@@ -75,7 +77,7 @@ func runJavaValidator(shoalBytes []byte) T1Result {
 
 	ctx, cancel := context.WithTimeout(context.Background(), javaValidateTimeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "sh", "-c", cmdLine)
+	cmd := validatorShellCommand(ctx, cmdLine)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -100,4 +102,19 @@ func runJavaValidator(shoalBytes []byte) T1Result {
 		}
 	}
 	return T1Result{Attempted: true, Passed: true, CommandUsed: cmdLine, elapsedMs: elapsed}
+}
+
+func validatorShellCommand(ctx context.Context, cmdLine string) *exec.Cmd {
+	shell, args := validatorShell()
+	return exec.CommandContext(ctx, shell, append(args, cmdLine)...)
+}
+
+func validatorShell() (string, []string) {
+	if runtime.GOOS != "windows" {
+		return "sh", []string{"-c"}
+	}
+	if _, err := exec.LookPath("powershell"); err == nil {
+		return "powershell", []string{"-NoProfile", "-NonInteractive", "-Command"}
+	}
+	return "cmd", []string{"/C"}
 }

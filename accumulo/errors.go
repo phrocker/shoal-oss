@@ -24,8 +24,22 @@ var (
 	// value.
 	ErrInvalidProperty = errors.New("accumulo: invalid property")
 
-	// ErrNamespaceNotFound indicates that a table's target namespace does not exist.
+	// ErrNamespaceNotFound indicates that no namespace matches the requested
+	// name or ID, or that a table operation targeted a namespace that does not
+	// exist.
 	ErrNamespaceNotFound = errors.New("accumulo: namespace not found")
+
+	// ErrNamespaceExists indicates that a requested namespace name is already
+	// in use.
+	ErrNamespaceExists = errors.New("accumulo: namespace exists")
+
+	// ErrNamespaceNotEmpty indicates that a namespace still owns one or more
+	// tables and cannot be safely deleted.
+	ErrNamespaceNotEmpty = errors.New("accumulo: namespace not empty")
+
+	// ErrInvalidNamespaceName indicates that Accumulo rejected a namespace
+	// name, including attempts to create, delete, or rename reserved namespaces.
+	ErrInvalidNamespaceName = errors.New("accumulo: invalid namespace name")
 
 	// ErrPermissionDenied indicates that the authenticated principal is not
 	// authorized for the requested operation.
@@ -87,9 +101,6 @@ var (
 
 	// ErrInvalidPermission indicates a permission outside Accumulo's wire enum.
 	ErrInvalidPermission = errors.New("accumulo: invalid permission")
-
-	// ErrInvalidNamespaceName indicates a rejected namespace name.
-	ErrInvalidNamespaceName = errors.New("accumulo: invalid namespace name")
 
 	// ErrUnsupportedOperation indicates that the server rejected an operation
 	// as unsupported.

@@ -7,6 +7,7 @@ import (
 	"github.com/phrocker/shoal/internal/ingestclient"
 	"github.com/phrocker/shoal/internal/managerclient"
 	"github.com/phrocker/shoal/internal/metadata"
+	"github.com/phrocker/shoal/internal/namespaces"
 	"github.com/phrocker/shoal/internal/scanclient"
 	"github.com/phrocker/shoal/internal/tablenames"
 	"github.com/phrocker/shoal/internal/transportpool"
@@ -115,8 +116,14 @@ func NewConnector(instance Instance, credentials Credentials, opts ConnectorOpti
 		locator := source.discoveryLocator()
 		if locator != nil {
 			walker := metadata.NewWalkerWithLifecycle(locator, scan)
+			namespaceNames := namespaces.NewResolver(locator)
 			state, _ := locator.(tableStateReader)
-			connector.discovery = newConnectorDiscovery(walker, tablenames.NewResolver(locator), state)
+			connector.discovery = newConnectorDiscovery(
+				walker,
+				namespaceNames,
+				tablenames.NewResolver(locator, namespaceNames),
+				state,
+			)
 			connector.managerAddr = zkManagerAddressResolver{locator: locator}
 			connector.clientAddr = zkClientServiceAddressResolver{locator: locator}
 		}

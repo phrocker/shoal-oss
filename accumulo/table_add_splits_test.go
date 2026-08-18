@@ -129,6 +129,28 @@ func (m *fakeSplitManager) GetTableConfiguration(
 	return map[string]string{}, nil
 }
 
+func (m *fakeSplitManager) GetNamespaceConfiguration(
+	ctx context.Context,
+	address, namespace string,
+) (map[string]string, error) {
+	return m.GetTableConfiguration(ctx, address, namespace)
+}
+
+func (m *fakeSplitManager) GetNamespaceProperties(
+	ctx context.Context,
+	address, namespace string,
+) (map[string]string, error) {
+	return m.GetTableConfiguration(ctx, address, namespace)
+}
+
+func (m *fakeSplitManager) GetVersionedNamespaceProperties(
+	ctx context.Context,
+	address, namespace string,
+) (managerclient.VersionedProperties, error) {
+	properties, err := m.GetNamespaceProperties(ctx, address, namespace)
+	return managerclient.VersionedProperties{Properties: properties}, err
+}
+
 func (m *fakeSplitManager) SetTableProperty(context.Context, string, string, string, string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -136,11 +158,25 @@ func (m *fakeSplitManager) SetTableProperty(context.Context, string, string, str
 	return nil
 }
 
+func (m *fakeSplitManager) SetNamespaceProperty(
+	ctx context.Context,
+	address, namespace, property, value string,
+) error {
+	return m.SetTableProperty(ctx, address, namespace, property, value)
+}
+
 func (m *fakeSplitManager) RemoveTableProperty(context.Context, string, string, string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.propCalls++
 	return nil
+}
+
+func (m *fakeSplitManager) RemoveNamespaceProperty(
+	ctx context.Context,
+	address, namespace, property string,
+) error {
+	return m.RemoveTableProperty(ctx, address, namespace, property)
 }
 
 func (m *fakeSplitManager) Close() error {

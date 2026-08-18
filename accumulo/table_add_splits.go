@@ -141,14 +141,14 @@ func (c *Connector) AddTableSplits(ctx context.Context, tableName string, splits
 		return ErrDiscoveryUnavailable
 	}
 
-	tableID, err := discovery.names.ResolveID(ctx, tableName)
+	tableID, err := discovery.tables.ResolveID(ctx, tableName)
 	if errors.Is(err, tablenames.ErrTableNotFound) {
 		return fmt.Errorf("%w: table name %q", ErrTableNotFound, tableName)
 	}
 	if err != nil {
 		return fmt.Errorf("accumulo: resolve table name %q: %w", tableName, err)
 	}
-	if err := requireTableNotOffline(ctx, discovery.state, tableID, tableName); err != nil {
+	if err := requireTableNotOffline(ctx, discovery.states, tableID, tableName); err != nil {
 		return err
 	}
 
@@ -161,8 +161,7 @@ func (c *Connector) AddTableSplits(ctx context.Context, tableName string, splits
 	}
 
 	defer func() {
-		discovery.tablets.InvalidateAll()
-		discovery.names.Invalidate()
+		discovery.invalidateAll()
 	}()
 
 	return addSplits(ctx, splitTarget{

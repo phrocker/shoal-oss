@@ -3,6 +3,7 @@ package accumulo
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/phrocker/shoal/internal/managerclient"
@@ -19,6 +20,7 @@ func TestFlushTableUsesStableIDAndAccumulo4WaitModes(t *testing.T) {
 	if err := connector.FlushTable(context.Background(), "events", false); err != nil {
 		t.Fatal(err)
 	}
+
 	if err := connector.FlushTable(context.Background(), "events", true); err != nil {
 		t.Fatal(err)
 	}
@@ -170,5 +172,35 @@ func TestFlushTableValidationCancellationAndLifecycle(t *testing.T) {
 	defer manager.mu.Unlock()
 	if len(manager.flushRequests) != 0 {
 		t.Fatalf("invalid requests reached manager: %#v", manager.flushRequests)
+	}
+}
+
+func TestFlushNamespaceErrorInvalidatesNamespacesBeforeTables(t *testing.T) {
+	var order []string
+	namespaces := &fakeNamespaces{
+		byName: map[string]string{"": "+default"},
+		byID:   map[string]string{"+default": ""},
+		onInvalidate: func() {
+			order = append(order, "namespaces")
+		},
+	}
+	tables := &fakeTableNames{
+		byName: map[string]string{"events": "1"},
+		byID:   map[string]string{"1": "events"},
+		onInvalidate: func() {
+			order = append(order, "tables")
+		},
+	}
+	connector := testConnectorWithNamespaceDiscovery(t, &fakeTabletWalker{}, namespaces, tables)
+	connector.manager = &fakeManagerAdapter{
+		err: &managerclient.Error{Kind: managerclient.ErrorNamespaceNotFound},
+	}
+	connector.managerAddr = fakeManagerAddress{address: "manager:9997"}
+
+	if err := connector.FlushTable(context.Background(), "events", true); !errors.Is(err, ErrNamespaceNotFound) {
+		t.Fatalf("FlushTable error = %v", err)
+	}
+	if got := strings.Join(order, ","); got != "namespaces,tables" {
+		t.Fatalf("namespace error invalidation order = %q", got)
 	}
 }

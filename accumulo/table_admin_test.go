@@ -3,6 +3,7 @@ package accumulo
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 
@@ -167,6 +168,28 @@ func (m *fakeManagerAdapter) GetTableConfiguration(
 	return configuration, err
 }
 
+func (m *fakeManagerAdapter) GetNamespaceConfiguration(
+	ctx context.Context,
+	address, namespace string,
+) (map[string]string, error) {
+	return m.GetTableConfiguration(ctx, address, namespace)
+}
+
+func (m *fakeManagerAdapter) GetNamespaceProperties(
+	ctx context.Context,
+	address, namespace string,
+) (map[string]string, error) {
+	return m.GetTableConfiguration(ctx, address, namespace)
+}
+
+func (m *fakeManagerAdapter) GetVersionedNamespaceProperties(
+	ctx context.Context,
+	address, namespace string,
+) (managerclient.VersionedProperties, error) {
+	properties, err := m.GetTableConfiguration(ctx, address, namespace)
+	return managerclient.VersionedProperties{Version: 7, Properties: properties}, err
+}
+
 func (m *fakeManagerAdapter) SetTableProperty(
 	_ context.Context,
 	address, tableName, property, value string,
@@ -197,6 +220,20 @@ func (m *fakeManagerAdapter) RemoveTableProperty(
 	return m.err
 }
 
+func (m *fakeManagerAdapter) SetNamespaceProperty(
+	ctx context.Context,
+	address, namespace, property, value string,
+) error {
+	return m.SetTableProperty(ctx, address, namespace, property, value)
+}
+
+func (m *fakeManagerAdapter) RemoveNamespaceProperty(
+	ctx context.Context,
+	address, namespace, property string,
+) error {
+	return m.RemoveTableProperty(ctx, address, namespace, property)
+}
+
 func (m *fakeManagerAdapter) Close() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -214,6 +251,7 @@ func TestTableMutationsUseAccumulo4FATEArguments(t *testing.T) {
 	if err := connector.CreateTable(context.Background(), "analytics.events"); err != nil {
 		t.Fatal(err)
 	}
+
 	if err := connector.CreateTable(context.Background(), "accumulo.audit"); err != nil {
 		t.Fatal(err)
 	}
@@ -344,5 +382,43 @@ func TestMapManagerErrorUsesServerTableName(t *testing.T) {
 		if !errors.Is(err, tt.want) || err.Error() != tt.text {
 			t.Fatalf("kind %d error = %v, want %q", tt.kind, err, tt.text)
 		}
+	}
+}
+
+func TestTableMutationInvalidatesNamespacesBeforeTablesOnSuccessAndError(t *testing.T) {
+	var order []string
+	namespaces := &fakeNamespaces{
+		byName: map[string]string{"": "+default"},
+		byID:   map[string]string{"+default": ""},
+		onInvalidate: func() {
+			order = append(order, "namespaces")
+		},
+	}
+	tables := &fakeTableNames{
+		byName: map[string]string{},
+		byID:   map[string]string{},
+		onInvalidate: func() {
+			order = append(order, "tables")
+		},
+	}
+	connector := testConnectorWithNamespaceDiscovery(t, &fakeTabletWalker{}, namespaces, tables)
+	manager := &fakeManagerAdapter{}
+	connector.manager = manager
+	connector.managerAddr = fakeManagerAddress{address: "manager:9997"}
+
+	if err := connector.CreateTable(context.Background(), "events"); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(order, ","); got != "namespaces,tables" {
+		t.Fatalf("successful mutation invalidation order = %q", got)
+	}
+
+	order = nil
+	manager.err = &managerclient.Error{Kind: managerclient.ErrorNamespaceNotFound}
+	if err := connector.CreateTable(context.Background(), "missing.events"); !errors.Is(err, ErrNamespaceNotFound) {
+		t.Fatalf("namespace error = %v", err)
+	}
+	if got := strings.Join(order, ","); got != "namespaces,tables" {
+		t.Fatalf("failed mutation invalidation order = %q", got)
 	}
 }
