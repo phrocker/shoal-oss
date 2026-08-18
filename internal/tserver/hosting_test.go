@@ -328,6 +328,43 @@ func TestDelayedRPCFromSupersededManagerFailsBeforeSuccessorRequest(t *testing.T
 	wantState(t, host, e, StateUnassigned)
 }
 
+// TestObserveManagerLockClearKeepsMonotonicHistory covers a transient loss of
+// live-manager knowledge. Clearing the current observation must leave requests
+// fail-closed, and it must not let an older manager epoch become current if it
+// is observed before the real live manager is rediscovered.
+func TestObserveManagerLockClearKeepsMonotonicHistory(t *testing.T) {
+	host, lock, fence := newTestHost(t)
+	e := extent("2", "", "m")
+	current := Fence{Server: lock, Manager: managerLock(fence.Manager.Sequence + 1)}
+
+	mustObserveManager(t, host, current.Manager)
+	if err := host.ObserveManagerLock(LockID{}); err != nil {
+		t.Fatalf("clearing live manager: %v", err)
+	}
+	if got, ok := host.ManagerLock(); ok {
+		t.Fatalf("manager lock = %s (held=%v), want unknown after clear", got, ok)
+	}
+	if _, err := host.Assign(current, e); !errors.Is(err, ErrStaleManagerLock) {
+		t.Fatalf("request while live manager unknown: want ErrStaleManagerLock, got %v", err)
+	}
+
+	if err := host.ObserveManagerLock(fence.Manager); !errors.Is(err, ErrLockNotNewer) {
+		t.Fatalf("older re-observation: want ErrLockNotNewer, got %v", err)
+	}
+	if got, ok := host.ManagerLock(); ok {
+		t.Fatalf("manager lock = %s (held=%v), want still unknown after rollback attempt", got, ok)
+	}
+	if _, err := host.Assign(current, e); !errors.Is(err, ErrStaleManagerLock) {
+		t.Fatalf("request after rollback attempt while unknown: want ErrStaleManagerLock, got %v", err)
+	}
+
+	mustObserveManager(t, host, current.Manager)
+	if _, err := host.Assign(current, e); err != nil {
+		t.Fatalf("re-observed current manager: %v", err)
+	}
+	wantState(t, host, e, StateLoading)
+}
+
 // TestGracefulUnloadDrainsThenReleases is the migration path: the tablet
 // stops being routable as soon as the manager asks for it back, but is only
 // released once the drain finishes.

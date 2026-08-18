@@ -234,10 +234,14 @@ type Host struct {
 	// newest is the newest server lock ever adopted. It outlives a lock loss
 	// so a stale lock cannot be re-adopted after the session drops.
 	newest LockID
-	// manager is the authoritative live manager lock observed elsewhere.
-	// Manager-directed requests must match it exactly; request history never
-	// promotes itself to authority.
+	// manager is the authoritative live manager lock currently known from
+	// external observation. It is invalid when live manager authority is
+	// temporarily unknown.
 	manager LockID
+	// newestManager is the highest manager lock ever observed. It outlives a
+	// temporary loss of live-manager knowledge so clearing manager cannot make
+	// an older epoch look current again.
+	newestManager LockID
 
 	tablets map[string]*tabletEntry
 	// byTable indexes the tracked tablets of each table in range order, so an
@@ -351,8 +355,9 @@ func (h *Host) Lock() (LockID, bool) {
 //
 // The host never elects a manager from RPC traffic. Manager authority stays
 // external, and manager-directed requests are only accepted when their fence
-// matches the lock observed here. A stale observation cannot move authority
-// backwards.
+// matches the lock observed here. Clearing the current live-manager
+// observation does not discard monotonic history, so a stale observation
+// cannot move authority backwards after a transient unknown period.
 func (h *Host) ObserveManagerLock(lock LockID) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -364,20 +369,22 @@ func (h *Host) ObserveManagerLock(lock LockID) error {
 		}
 		return fmt.Errorf("%w: %s", ErrInvalidLock, lock)
 	}
-	if h.manager.Valid() {
+	if h.newestManager.Valid() {
 		switch {
-		case lock.Equal(h.manager):
+		case lock.Equal(h.newestManager):
+			h.manager = lock
 			return nil
-		case !lock.Supersedes(h.manager):
-			return fmt.Errorf("%w: observed %s, already saw %s", ErrLockNotNewer, lock, h.manager)
+		case !lock.Supersedes(h.newestManager):
+			return fmt.Errorf("%w: observed %s, already saw %s", ErrLockNotNewer, lock, h.newestManager)
 		}
 	}
 	h.manager = lock
+	h.newestManager = lock
 	return nil
 }
 
-// ManagerLock returns the authoritative live manager ServiceLock this host has
-// been told about, and whether one is currently known.
+// ManagerLock returns the authoritative live manager ServiceLock this host
+// currently knows, and whether one is currently known.
 func (h *Host) ManagerLock() (LockID, bool) {
 	h.mu.Lock()
 	defer h.mu.Unlock()

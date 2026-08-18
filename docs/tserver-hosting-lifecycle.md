@@ -112,7 +112,10 @@ The live manager lock is observed externally from ZooKeeper, and requests
 are accepted only when this lock exactly matches that authoritative live
 manager identity. A delayed predecessor RPC is therefore stale as soon as
 the live-manager observation moves on, even before the successor has sent
-this host any request.
+this host any request. If live-manager knowledge is temporarily cleared,
+requests fail closed until a manager lock is observed again — but the
+highest manager epoch already seen is retained, so re-observation cannot
+roll authority backward to an older epoch.
 
 Local completions (`LoadComplete`, `LoadFailed`, `UnloadComplete`) carry
 an `Attempt` instead: an opaque handle minted by `Assign`, naming one
