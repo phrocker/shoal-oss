@@ -4,11 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/phrocker/shoal/internal/metadata"
+	nslookup "github.com/phrocker/shoal/internal/namespaces"
 	"github.com/phrocker/shoal/internal/tablenames"
 	"github.com/phrocker/shoal/internal/zk"
 )
@@ -18,6 +20,7 @@ type fakeTabletWalker struct {
 	tablets map[string][]metadata.TabletInfo
 	calls   int
 	wait    bool
+	err     error
 }
 
 func (f *fakeTabletWalker) LocateTable(ctx context.Context, tableID string) ([]metadata.TabletInfo, error) {
@@ -28,18 +31,30 @@ func (f *fakeTabletWalker) LocateTable(ctx context.Context, tableID string) ([]m
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls++
+	if f.err != nil {
+		return nil, f.err
+	}
 	return append([]metadata.TabletInfo(nil), f.tablets[tableID]...), nil
 }
 
 type fakeTableNames struct {
-	byName      map[string]string
-	byID        map[string]string
-	invalidates int
+	mu           sync.Mutex
+	byName       map[string]string
+	byID         map[string]string
+	resolveIDErr error
+	listErr      error
+	invalidates  int
+	onInvalidate func()
 }
 
 func (f *fakeTableNames) ResolveID(ctx context.Context, name string) (string, error) {
 	if err := ctx.Err(); err != nil {
 		return "", err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.resolveIDErr != nil {
+		return "", f.resolveIDErr
 	}
 	id, ok := f.byName[name]
 	if !ok {
@@ -52,6 +67,8 @@ func (f *fakeTableNames) ResolveName(ctx context.Context, id string) (string, er
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	name, ok := f.byID[id]
 	if !ok {
 		return "", fmt.Errorf("%w: missing fake table", tablenames.ErrTableNotFound)
@@ -63,6 +80,11 @@ func (f *fakeTableNames) List(ctx context.Context) (map[string]string, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
 	tables := make(map[string]string, len(f.byName))
 	for name, id := range f.byName {
 		tables[name] = id
@@ -70,7 +92,133 @@ func (f *fakeTableNames) List(ctx context.Context) (map[string]string, error) {
 	return tables, nil
 }
 
-func (f *fakeTableNames) Invalidate() { f.invalidates++ }
+func (f *fakeTableNames) ListNamespace(
+	ctx context.Context,
+	namespace string,
+) (map[string]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
+	tables := make(map[string]string)
+	prefix := namespace + "."
+	for name, id := range f.byName {
+		if namespace == "" {
+			if !strings.ContainsRune(name, '.') {
+				tables[name] = id
+			}
+			continue
+		}
+		if strings.HasPrefix(name, prefix) {
+			tables[name] = id
+		}
+	}
+	return tables, nil
+}
+
+func (f *fakeTableNames) Invalidate() {
+	f.mu.Lock()
+	f.invalidates++
+	onInvalidate := f.onInvalidate
+	f.mu.Unlock()
+	if onInvalidate != nil {
+		onInvalidate()
+	}
+}
+
+type fakeNamespaces struct {
+	mu           sync.Mutex
+	byName       map[string]string
+	byID         map[string]string
+	invalidates  int
+	onInvalidate func()
+}
+
+func (f *fakeNamespaces) ResolveID(ctx context.Context, name string) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	id, ok := f.byName[name]
+	if !ok {
+		return "", fmt.Errorf("%w: missing fake namespace", nslookup.ErrNamespaceNotFound)
+	}
+	return id, nil
+}
+
+func (f *fakeNamespaces) ResolveName(ctx context.Context, id string) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	name, ok := f.byID[id]
+	if !ok {
+		return "", fmt.Errorf("%w: missing fake namespace", nslookup.ErrNamespaceNotFound)
+	}
+	return name, nil
+}
+
+func (f *fakeNamespaces) List(ctx context.Context) (map[string]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	namespaces := make(map[string]string, len(f.byName))
+	for name, id := range f.byName {
+		namespaces[name] = id
+	}
+	return namespaces, nil
+}
+
+func (f *fakeNamespaces) Invalidate() {
+	f.mu.Lock()
+	f.invalidates++
+	onInvalidate := f.onInvalidate
+	f.mu.Unlock()
+	if onInvalidate != nil {
+		onInvalidate()
+	}
+}
+
+func newFakeNamespacesFromTables(tables *fakeTableNames) *fakeNamespaces {
+	namespaces := &fakeNamespaces{
+		byName: map[string]string{
+			"":         "+default",
+			"accumulo": "+accumulo",
+		},
+		byID: map[string]string{
+			"+default":  "",
+			"+accumulo": "accumulo",
+		},
+	}
+	if tables == nil {
+		return namespaces
+	}
+	tables.mu.Lock()
+	defer tables.mu.Unlock()
+	nextID := 1
+	for fullName := range tables.byName {
+		namespace := ""
+		if cut := strings.IndexByte(fullName, '.'); cut >= 0 {
+			namespace = fullName[:cut]
+		}
+		if _, ok := namespaces.byName[namespace]; ok {
+			continue
+		}
+		id := fmt.Sprintf("ns%d", nextID)
+		nextID++
+		namespaces.byName[namespace] = id
+		namespaces.byID[id] = namespace
+	}
+	return namespaces
+}
 
 func testConnectorWithDiscovery(
 	t *testing.T,
@@ -79,11 +227,23 @@ func testConnectorWithDiscovery(
 	},
 	names *fakeTableNames,
 ) *Connector {
+	return testConnectorWithNamespaceDiscovery(t, walker, newFakeNamespacesFromTables(names), names)
+}
+
+func testConnectorWithNamespaceDiscovery(
+	t *testing.T,
+	walker interface {
+		LocateTable(context.Context, string) ([]metadata.TabletInfo, error)
+	},
+	namespaces *fakeNamespaces,
+	names *fakeTableNames,
+) *Connector {
 	t.Helper()
 	instance, err := NewStaticInstance("accumulo", "uuid-1")
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	credentials, err := PasswordCredentials("root", []byte("secret"))
 	if err != nil {
 		t.Fatal(err)
@@ -92,7 +252,16 @@ func testConnectorWithDiscovery(
 	if err != nil {
 		t.Fatal(err)
 	}
-	connector.discovery = newConnectorDiscovery(walker, names)
+	if names == nil {
+		names = &fakeTableNames{
+			byName: map[string]string{},
+			byID:   map[string]string{},
+		}
+	}
+	if namespaces == nil {
+		namespaces = newFakeNamespacesFromTables(names)
+	}
+	connector.discovery = newConnectorDiscovery(walker, namespaces, names)
 	t.Cleanup(func() { _ = connector.Close() })
 	return connector
 }
@@ -313,5 +482,31 @@ func TestConnectorDiscoveryLifecycleDoesNotCloseInstance(t *testing.T) {
 	}
 	if _, err := connector.TableByID(context.Background(), "1"); !errors.Is(err, ErrConnectorClosed) {
 		t.Fatalf("closed connector error = %v", err)
+	}
+}
+
+func TestDiscoveryInvalidatesNamespacesBeforeDependentTables(t *testing.T) {
+	var order []string
+	namespaces := &fakeNamespaces{
+		byName: map[string]string{},
+		byID:   map[string]string{},
+		onInvalidate: func() {
+			order = append(order, "namespaces")
+		},
+	}
+	tables := &fakeTableNames{
+		byName: map[string]string{},
+		byID:   map[string]string{},
+		onInvalidate: func() {
+			order = append(order, "tables")
+		},
+	}
+	connector := testConnectorWithNamespaceDiscovery(t, &fakeTabletWalker{}, namespaces, tables)
+
+	if err := connector.InvalidateDiscovery(); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(order, ","); got != "namespaces,tables" {
+		t.Fatalf("invalidation order = %q", got)
 	}
 }

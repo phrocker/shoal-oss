@@ -36,17 +36,56 @@ func TestPublicDiscoveryAPICompiles(t *testing.T) {
 	}
 	defer connector.Close()
 
+	namespace := accumulo.Namespace{Name: "", ID: "+default"}
 	table := accumulo.Table{Name: "events", ID: "1"}
+	_, _ = connector.Namespaces(context.Background())
+	_, _ = connector.NamespaceExists(context.Background(), "")
 	_, _ = connector.Tables(context.Background())
 	_, _ = connector.TableExists(context.Background(), "events")
+	_, _ = connector.ListTableSplits(context.Background(), "events")
 	_, _ = connector.Tablets(context.Background(), table)
 	_, _ = connector.LocateTablet(context.Background(), table, []byte("row"))
 	_ = connector.InvalidateTablet(table, []byte("row"))
 	_ = connector.InvalidateTable(table)
 	_ = connector.InvalidateDiscovery()
+	if _, err := connector.NamespaceByName(context.Background(), ""); !errors.Is(err, accumulo.ErrDiscoveryUnavailable) {
+		t.Fatalf("error = %v, want ErrDiscoveryUnavailable", err)
+	}
+	if _, err := connector.NamespaceByID(context.Background(), namespace.ID); !errors.Is(err, accumulo.ErrDiscoveryUnavailable) {
+		t.Fatalf("error = %v, want ErrDiscoveryUnavailable", err)
+	}
 	if _, err := connector.TableByName(context.Background(), "events"); !errors.Is(err, accumulo.ErrDiscoveryUnavailable) {
 		t.Fatalf("error = %v, want ErrDiscoveryUnavailable", err)
 	}
+}
+
+func TestPublicNamespaceAdministrationAPICompiles(t *testing.T) {
+	instance, _ := accumulo.NewStaticInstance("accumulo", "uuid-1")
+	credentials, _ := accumulo.PasswordCredentials("root", []byte("secret"))
+	connector, err := accumulo.NewConnector(instance, credentials, accumulo.ConnectorOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connector.Close()
+
+	ctx := context.Background()
+	_ = connector.CreateNamespace(ctx, "analytics")
+	_ = connector.DeleteNamespace(ctx, "analytics")
+	_ = connector.RenameNamespace(ctx, "analytics", "reporting")
+	_ = connector.SetNamespaceProperty(ctx, "analytics", "table.file.max", "15")
+	_ = connector.RemoveNamespaceProperty(ctx, "analytics", "table.file.max")
+	_, _ = connector.EffectiveNamespaceProperties(ctx, "analytics")
+	_, _ = connector.NamespaceProperties(ctx, "analytics")
+	versioned, _ := connector.VersionedNamespaceProperties(ctx, "analytics")
+	_ = versioned.Version
+	_ = versioned.Properties
+
+	_ = accumulo.ErrNamespaceExists
+	_ = accumulo.ErrNamespaceNotFound
+	_ = accumulo.ErrNamespaceNotEmpty
+	_ = accumulo.ErrInvalidNamespaceName
+	_ = accumulo.ErrInvalidProperty
+	var _ accumulo.VersionedProperties
 }
 
 func TestPublicScannerAPICompiles(t *testing.T) {
@@ -138,6 +177,7 @@ func TestPublicBatchWriterAPICompiles(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	defer connector.Close()
 
 	_, err = connector.NewBatchWriter(accumulo.Table{Name: "events"}, accumulo.BatchWriterOptions{
@@ -167,4 +207,54 @@ func TestPublicBatchWriterAPICompiles(t *testing.T) {
 	_ = accumulo.ErrBatchWriterFailed
 	_ = accumulo.ErrBatchWriterAutoFlush
 	_ = accumulo.ErrBatchWriterRetryExhausted
+}
+
+func TestPublicSecurityAPICompiles(t *testing.T) {
+	instance, _ := accumulo.NewStaticInstance("accumulo", "uuid-1")
+	credentials, _ := accumulo.PasswordCredentials("root", []byte("secret"))
+	connector, err := accumulo.NewConnector(instance, credentials, accumulo.ConnectorOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connector.Close()
+
+	ctx := context.Background()
+	_ = connector.CreateUser(ctx, "alice", []byte("secret"))
+	_ = connector.DropUser(ctx, "alice")
+	_ = connector.ChangePassword(ctx, "alice", []byte("changed"))
+	_ = connector.ChangeUserAuthorizations(ctx, "alice", [][]byte{[]byte("public")})
+	_, _ = connector.GetUserAuthorizations(ctx, "alice")
+	_, _ = connector.HasSystemPermission(ctx, "alice", accumulo.SystemPermissionCreateUser)
+	_, _ = connector.HasTablePermission(ctx, "alice", "events", accumulo.TablePermissionRead)
+	_, _ = connector.HasNamespacePermission(
+		ctx, "alice", "analytics", accumulo.NamespacePermissionRead,
+	)
+	_ = connector.GrantSystemPermission(ctx, "alice", accumulo.SystemPermissionCreateTable)
+	_ = connector.RevokeSystemPermission(ctx, "alice", accumulo.SystemPermissionDropTable)
+	_ = connector.GrantTablePermission(ctx, "alice", "events", accumulo.TablePermissionWrite)
+	_ = connector.RevokeTablePermission(ctx, "alice", "events", accumulo.TablePermissionGrant)
+	_ = connector.GrantNamespacePermission(
+		ctx, "alice", "analytics", accumulo.NamespacePermissionCreateTable,
+	)
+	_ = connector.RevokeNamespacePermission(
+		ctx, "alice", "analytics", accumulo.NamespacePermissionDropTable,
+	)
+
+	var _ *accumulo.SecurityError
+	_ = accumulo.SystemPermissionGrant
+	_ = accumulo.SystemPermissionObtainDelegationToken
+	_ = accumulo.TablePermissionBulkImport
+	_ = accumulo.TablePermissionGetSummaries
+	_ = accumulo.NamespacePermissionGrant
+	_ = accumulo.NamespacePermissionDropNamespace
+	_ = accumulo.ErrInvalidUser
+	_ = accumulo.ErrUserExists
+	_ = accumulo.ErrUserNotFound
+	_ = accumulo.ErrInvalidPassword
+	_ = accumulo.ErrBadCredentials
+	_ = accumulo.ErrInvalidAuthorizations
+	_ = accumulo.ErrInvalidPermission
+	_ = accumulo.ErrInvalidNamespaceName
+	_ = accumulo.ErrUnsupportedOperation
+	_ = accumulo.ErrSecurityUnavailable
 }

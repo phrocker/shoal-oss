@@ -40,6 +40,41 @@ func TestPooledConstructsScanKey(t *testing.T) {
 	}
 }
 
+func TestPooledUpdateCredentialsCopiesReplacementForNextRPCAndRejectsClosed(t *testing.T) {
+	pooled, pool := newTestPooled(t, transportpool.Config{MaxIdlePerEndpoint: 1})
+	defer pool.Close()
+
+	rpc := successfulRPC()
+	pooled.dial = func(context.Context, transportpool.Key) (io.Closer, error) {
+		return &fakePooledTransport{rpc: rpc}, nil
+	}
+	pooled.newClient = clientFromFakeTransport
+
+	replacement := &security.TCredentials{
+		Principal:      "root",
+		TokenClassName: "PasswordToken",
+		Token:          []byte("replacement"),
+		InstanceId:     "uuid-1",
+	}
+	if err := pooled.UpdateCredentials(replacement); err != nil {
+		t.Fatal(err)
+	}
+	replacement.Token[0] = 'X'
+	if _, err := pooled.Start(context.Background(), "tablet-1:9997", validStartRequest()); err != nil {
+		t.Fatal(err)
+	}
+	if got := rpc.startCredentialToken(); string(got) != "replacement" || string(got) == "secret" {
+		t.Fatalf("RPC token = %q, want isolated replacement", got)
+	}
+	if err := pooled.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := pooled.UpdateCredentials(&security.TCredentials{Token: []byte("later")}); err == nil ||
+		err.Error() != "scanclient: pooled client is closed" {
+		t.Fatalf("closed update error = %v", err)
+	}
+}
+
 func TestPooledReusesTransportAcrossLifecycle(t *testing.T) {
 	pooled, pool := newTestPooled(t, transportpool.Config{MaxIdlePerEndpoint: 1})
 	defer pool.Close()
@@ -403,11 +438,22 @@ type fakeScanRPC struct {
 	multiContinueCalls  atomic.Int32
 	closeCalls          atomic.Int32
 	multiCloseCalls     atomic.Int32
+	credentialsMu       sync.Mutex
+	startToken          []byte
 }
 
-func (c *fakeScanRPC) Start(context.Context, StartRequest) (*data.InitialScan, error) {
+func (c *fakeScanRPC) Start(_ context.Context, req StartRequest) (*data.InitialScan, error) {
 	c.startCalls.Add(1)
+	c.credentialsMu.Lock()
+	c.startToken = append([]byte(nil), req.Credentials.Token...)
+	c.credentialsMu.Unlock()
 	return c.startResult, c.startErr
+}
+
+func (c *fakeScanRPC) startCredentialToken() []byte {
+	c.credentialsMu.Lock()
+	defer c.credentialsMu.Unlock()
+	return append([]byte(nil), c.startToken...)
 }
 
 func (c *fakeScanRPC) StartMulti(

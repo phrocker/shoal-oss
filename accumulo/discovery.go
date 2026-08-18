@@ -10,6 +10,19 @@ import (
 	"github.com/phrocker/shoal/internal/tablenames"
 )
 
+// Namespace is an Accumulo namespace identity.
+type Namespace struct {
+	Name string
+	ID   string
+}
+
+// VersionedProperties is an Accumulo property snapshot and its persistent
+// property-store version.
+type VersionedProperties struct {
+	Version    int64
+	Properties map[string]string
+}
+
 // Table is an Accumulo table identity.
 type Table struct {
 	Name string
@@ -37,28 +50,52 @@ type Tablet struct {
 	Server *TabletServer
 }
 
-type tableNameResolver interface {
+type namespaceResolver interface {
 	ResolveID(context.Context, string) (string, error)
 	ResolveName(context.Context, string) (string, error)
 	List(context.Context) (map[string]string, error)
 	Invalidate()
 }
 
-type connectorDiscovery struct {
-	tablets *cache.LocatorCache
-	names   tableNameResolver
+type tableNameResolver interface {
+	ResolveID(context.Context, string) (string, error)
+	ResolveName(context.Context, string) (string, error)
+	List(context.Context) (map[string]string, error)
+	ListNamespace(context.Context, string) (map[string]string, error)
+	Invalidate()
 }
 
-func newConnectorDiscovery(tablets cache.TableLocator, names tableNameResolver) *connectorDiscovery {
+type connectorDiscovery struct {
+	tablets    *cache.LocatorCache
+	namespaces namespaceResolver
+	tables     tableNameResolver
+}
+
+func newConnectorDiscovery(
+	tablets cache.TableLocator,
+	namespaces namespaceResolver,
+	tables tableNameResolver,
+) *connectorDiscovery {
 	return &connectorDiscovery{
-		tablets: cache.New(tablets),
-		names:   names,
+		tablets:    cache.New(tablets),
+		namespaces: namespaces,
+		tables:     tables,
 	}
 }
 
 func (d *connectorDiscovery) close() {
+	d.invalidateAll()
+}
+
+func (d *connectorDiscovery) invalidateNames() {
+	d.namespaces.Invalidate()
+	d.tables.Invalidate()
+}
+
+func (d *connectorDiscovery) invalidateAll() {
+	d.namespaces.Invalidate()
 	d.tablets.InvalidateAll()
-	d.names.Invalidate()
+	d.tables.Invalidate()
 }
 
 // TableByName resolves a qualified or default-namespace table name.
@@ -73,7 +110,7 @@ func (c *Connector) TableByName(ctx context.Context, name string) (Table, error)
 	if err != nil {
 		return Table{}, err
 	}
-	id, err := discovery.names.ResolveID(ctx, name)
+	id, err := discovery.tables.ResolveID(ctx, name)
 	if err != nil {
 		if errors.Is(err, tablenames.ErrTableNotFound) {
 			return Table{}, fmt.Errorf("%w: table name %q", ErrTableNotFound, name)
@@ -98,7 +135,7 @@ func (c *Connector) TableByID(ctx context.Context, id string) (Table, error) {
 	if _, err := discovery.tablets.LocateTable(ctx, id); err != nil {
 		return Table{}, mapTabletDiscoveryError(id, nil, err)
 	}
-	name, err := discovery.names.ResolveName(ctx, id)
+	name, err := discovery.tables.ResolveName(ctx, id)
 	if err != nil {
 		if errors.Is(err, tablenames.ErrTableNotFound) {
 			return Table{}, fmt.Errorf("%w: table ID %q", ErrTableNotFound, id)
@@ -179,14 +216,13 @@ func (c *Connector) InvalidateTable(table Table) error {
 	return nil
 }
 
-// InvalidateDiscovery clears all tablet and table-name discovery caches.
+// InvalidateDiscovery clears all tablet, table-name, and namespace discovery caches.
 func (c *Connector) InvalidateDiscovery() error {
 	discovery, err := c.discoveryState()
 	if err != nil {
 		return err
 	}
-	discovery.tablets.InvalidateAll()
-	discovery.names.Invalidate()
+	discovery.invalidateAll()
 	return nil
 }
 

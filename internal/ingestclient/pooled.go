@@ -122,6 +122,24 @@ func (p *Pooled) Close() error {
 	return nil
 }
 
+// UpdateCredentials atomically replaces the adapter's private credential copy.
+func (p *Pooled) UpdateCredentials(credentials *security.TCredentials) error {
+	if credentials == nil {
+		return errors.New("ingestclient: nil Credentials")
+	}
+	replacement := cloneCredentials(credentials)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed {
+		wipeCredentials(replacement)
+		return ErrClosed
+	}
+	old := p.credentials
+	p.credentials = replacement
+	wipeCredentials(old)
+	return nil
+}
+
 func (p *Pooled) credentialsForRPC() (*security.TCredentials, error) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()

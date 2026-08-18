@@ -7,6 +7,7 @@ import (
 	"github.com/phrocker/shoal/internal/ingestclient"
 	"github.com/phrocker/shoal/internal/managerclient"
 	"github.com/phrocker/shoal/internal/metadata"
+	"github.com/phrocker/shoal/internal/namespaces"
 	"github.com/phrocker/shoal/internal/scanclient"
 	"github.com/phrocker/shoal/internal/tablenames"
 	"github.com/phrocker/shoal/internal/transportpool"
@@ -18,6 +19,7 @@ import (
 // share an Instance across connectors and must close it separately.
 type Connector struct {
 	mu          sync.RWMutex
+	passwordMu  sync.Mutex
 	instance    InstanceInfo
 	credentials Credentials
 	options     normalizedConnectorOptions
@@ -25,6 +27,7 @@ type Connector struct {
 	scan        scanclient.Adapter
 	ingest      ingestclient.Adapter
 	manager     managerclient.Adapter
+	security    managerclient.SecurityAdapter
 	managerAddr managerAddressResolver
 	clientAddr  clientServiceAddressResolver
 	discovery   *connectorDiscovery
@@ -107,12 +110,18 @@ func NewConnector(instance Instance, credentials Credentials, opts ConnectorOpti
 		scan:        scan,
 		ingest:      ingest,
 		manager:     managerAdapter,
+		security:    managerAdapter,
 	}
 	if source, ok := instance.(discoveryInstance); ok {
 		locator := source.discoveryLocator()
 		if locator != nil {
 			walker := metadata.NewWalkerWithLifecycle(locator, scan)
-			connector.discovery = newConnectorDiscovery(walker, tablenames.NewResolver(locator))
+			namespaceNames := namespaces.NewResolver(locator)
+			connector.discovery = newConnectorDiscovery(
+				walker,
+				namespaceNames,
+				tablenames.NewResolver(locator, namespaceNames),
+			)
 			connector.managerAddr = zkManagerAddressResolver{locator: locator}
 			connector.clientAddr = zkClientServiceAddressResolver{locator: locator}
 		}

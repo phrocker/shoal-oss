@@ -185,6 +185,11 @@ func Copy(ctx context.Context, src Backend, srcPath string, dst Backend, dstPath
 	if err := ctx.Err(); err != nil {
 		return written, err
 	}
+	// Close (not defer) so a flush/commit failure on the destination is
+	// reported instead of silently discarded — mirrors WriteAll. Several
+	// WritableBackend implementations (e.g. object-storage backends that
+	// buffer and upload on Close) can fail here even though every prior
+	// Write succeeded.
 	if err := out.Close(); err != nil {
 		return written, fmt.Errorf("copy: close dst %s: %w", dstPath, err)
 	}

@@ -24,8 +24,22 @@ var (
 	// value.
 	ErrInvalidProperty = errors.New("accumulo: invalid property")
 
-	// ErrNamespaceNotFound indicates that a table's target namespace does not exist.
+	// ErrNamespaceNotFound indicates that no namespace matches the requested
+	// name or ID, or that a table operation targeted a namespace that does not
+	// exist.
 	ErrNamespaceNotFound = errors.New("accumulo: namespace not found")
+
+	// ErrNamespaceExists indicates that a requested namespace name is already
+	// in use.
+	ErrNamespaceExists = errors.New("accumulo: namespace exists")
+
+	// ErrNamespaceNotEmpty indicates that a namespace still owns one or more
+	// tables and cannot be safely deleted.
+	ErrNamespaceNotEmpty = errors.New("accumulo: namespace not empty")
+
+	// ErrInvalidNamespaceName indicates that Accumulo rejected a namespace
+	// name, including attempts to create, delete, or rename reserved namespaces.
+	ErrInvalidNamespaceName = errors.New("accumulo: invalid namespace name")
 
 	// ErrPermissionDenied indicates that the authenticated principal is not
 	// authorized for the requested operation.
@@ -49,4 +63,36 @@ var (
 
 	// ErrConnectorClosed indicates an operation attempted on a closed Connector.
 	ErrConnectorClosed = errors.New("accumulo: connector is closed")
+
+	// ErrInvalidBulkDir indicates that a bulk-import call was given an empty
+	// or otherwise unusable bulk directory path.
+	ErrInvalidBulkDir = errors.New("accumulo: invalid bulk directory")
+
+	// ErrInvalidUser indicates that a user name is empty or otherwise invalid.
+	ErrInvalidUser = errors.New("accumulo: invalid user")
+
+	// ErrUserExists indicates that a requested user already exists.
+	ErrUserExists = errors.New("accumulo: user exists")
+
+	// ErrUserNotFound indicates that a requested user does not exist.
+	ErrUserNotFound = errors.New("accumulo: user not found")
+
+	// ErrInvalidPassword indicates that a nil password was supplied.
+	ErrInvalidPassword = errors.New("accumulo: invalid password")
+
+	// ErrBadCredentials indicates rejected, invalid, or expired credentials.
+	ErrBadCredentials = errors.New("accumulo: bad credentials")
+
+	// ErrInvalidAuthorizations indicates an invalid authorization set.
+	ErrInvalidAuthorizations = errors.New("accumulo: invalid authorizations")
+
+	// ErrInvalidPermission indicates a permission outside Accumulo's wire enum.
+	ErrInvalidPermission = errors.New("accumulo: invalid permission")
+
+	// ErrUnsupportedOperation indicates that the server rejected an operation
+	// as unsupported.
+	ErrUnsupportedOperation = errors.New("accumulo: unsupported operation")
+
+	// ErrSecurityUnavailable indicates a server-side security subsystem failure.
+	ErrSecurityUnavailable = errors.New("accumulo: security subsystem unavailable")
 )

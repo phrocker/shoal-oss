@@ -1,9 +1,61 @@
 package zk
 
 import (
+	"context"
+	"errors"
 	"strings"
+	"sync"
 	"testing"
+	"time"
+
+	gozk "github.com/go-zookeeper/zk"
 )
+
+type blockingRawConn struct {
+	started chan struct{}
+	closed  chan struct{}
+	done    chan struct{}
+	once    sync.Once
+}
+
+func (c *blockingRawConn) AddAuth(string, []byte) error { return nil }
+
+func (c *blockingRawConn) Get(string) ([]byte, *gozk.Stat, error) {
+	close(c.started)
+	<-c.closed
+	close(c.done)
+	return nil, nil, gozk.ErrClosing
+}
+
+func (c *blockingRawConn) Close() {
+	c.once.Do(func() { close(c.closed) })
+}
+
+func TestGetRawWithContextCancelsInFlightReadAndJoinsWorker(t *testing.T) {
+	conn := &blockingRawConn{
+		started: make(chan struct{}),
+		closed:  make(chan struct{}),
+		done:    make(chan struct{}),
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	result := make(chan error, 1)
+	go func() {
+		_, err := getRawWithContext(ctx, "/accumulo/uuid/namespaces", "", func() (rawZKConn, error) {
+			return conn, nil
+		})
+		result <- err
+	}()
+	<-conn.started
+	cancel()
+	if err := <-result; !errors.Is(err, context.Canceled) {
+		t.Fatalf("GetRaw error = %v, want context.Canceled", err)
+	}
+	select {
+	case <-conn.done:
+	default:
+		t.Fatal("GetRaw returned before its ZooKeeper read worker exited")
+	}
+}
 
 func TestParseRootTabletMetadata_CurrentLocation(t *testing.T) {
 	json := `{
