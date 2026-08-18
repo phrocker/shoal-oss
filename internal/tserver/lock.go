@@ -17,7 +17,12 @@
 
 package tserver
 
-import "fmt"
+import (
+	"fmt"
+	"math"
+
+	"github.com/google/uuid"
+)
 
 // LockID identifies one held Accumulo ServiceLock. It mirrors the ephemeral
 // ZooKeeper node a lock holder creates — "zlock#<uuid>#<sequence>" — where
@@ -33,10 +38,21 @@ type LockID struct {
 	Sequence int64
 }
 
-// Valid reports whether the lock identity is usable for fencing. A lock with
-// no UUID or a negative sequence names nothing and is never trusted.
+// Valid reports whether the lock identity could name a real ServiceLock node,
+// and so is usable for fencing.
+//
+// The checks mirror the node parser in internal/zk (see firstLockNode): the
+// UUID must parse as a UUID, and the sequence must fit the signed 32-bit
+// counter Accumulo's ServiceLock.validateAndSort reads with Integer.parseInt.
+// An identity outside that shape could never appear as a "zlock#<uuid>#<seq>"
+// node, so it cannot be a lock this process holds — trusting it as fencing
+// authority would be fencing against nothing.
 func (l LockID) Valid() bool {
-	return l.UUID != "" && l.Sequence >= 0
+	if l.Sequence < 0 || l.Sequence > math.MaxInt32 {
+		return false
+	}
+	_, err := uuid.Parse(l.UUID)
+	return err == nil
 }
 
 // Equal reports whether two lock identities are the same held lock.
@@ -49,12 +65,18 @@ func (l LockID) Supersedes(other LockID) bool {
 	return l.Sequence > other.Sequence
 }
 
-// String renders the lock in its ZooKeeper node form.
+// String renders the lock in its ZooKeeper node form. An identity that could
+// not name a real lock node keeps its raw fields so a refusal can be
+// diagnosed from the error text.
 func (l LockID) String() string {
-	if !l.Valid() {
+	switch {
+	case l.Valid():
+		return fmt.Sprintf("zlock#%s#%010d", l.UUID, l.Sequence)
+	case l.UUID == "" && l.Sequence == 0:
 		return "zlock#<none>"
+	default:
+		return fmt.Sprintf("zlock#<invalid %q#%d>", l.UUID, l.Sequence)
 	}
-	return fmt.Sprintf("zlock#%s#%010d", l.UUID, l.Sequence)
 }
 
 // Fence is the authority stamp that must accompany every manager-directed

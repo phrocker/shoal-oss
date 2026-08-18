@@ -30,9 +30,12 @@ import (
 // end row is exclusive and the end row is inclusive, so a tablet covers
 // (PrevEndRow, EndRow].
 //
-// A nil bound is infinite: nil PrevEndRow starts at the beginning of the
-// table, nil EndRow runs to its end. Nil and empty are different — an empty
-// (non-nil) bound is the empty row, not infinity.
+// An absent bound is infinite: an absent PrevEndRow starts at the beginning
+// of the table, an absent EndRow runs to its end. Nil and empty both mean
+// absent, matching cclient.KeyExtent and Accumulo's Java KeyExtent, where a
+// null Text and an empty one collapse on the wire. Every comparison, key and
+// copy below normalizes first, so the same tablet decoded either way is the
+// same tablet here.
 type Extent struct {
 	TableID    string
 	PrevEndRow []byte
@@ -40,25 +43,27 @@ type Extent struct {
 }
 
 // Validate reports whether the extent is a well-formed tablet identity. An
-// extent with no table, or whose bounds are inverted or empty, cannot name a
-// tablet and is refused rather than tracked.
+// extent with no table, or whose bounds are inverted or cover no rows, cannot
+// name a tablet and is refused rather than tracked.
 func (e Extent) Validate() error {
 	if e.TableID == "" {
 		return fmt.Errorf("%w: empty table id", ErrInvalidExtent)
 	}
-	if e.PrevEndRow != nil && e.EndRow != nil && bytes.Compare(e.PrevEndRow, e.EndRow) >= 0 {
+	prev, end := e.prev(), e.end()
+	if prev != nil && end != nil && bytes.Compare(prev, end) >= 0 {
 		return fmt.Errorf("%w: prev end row %q is not below end row %q",
-			ErrInvalidExtent, e.PrevEndRow, e.EndRow)
+			ErrInvalidExtent, prev, end)
 	}
 	return nil
 }
 
-// Equal reports whether two extents name the same tablet. Bound identity
-// includes nil-vs-empty: (nil, "m"] and ("", "m"] are different tablets.
+// Equal reports whether two extents name the same tablet. An absent bound
+// compares equal however it was spelled, so an extent decoded with a nil row
+// and one decoded with an empty row name the same tablet.
 func (e Extent) Equal(other Extent) bool {
 	return e.TableID == other.TableID &&
-		boundsEqual(e.PrevEndRow, other.PrevEndRow) &&
-		boundsEqual(e.EndRow, other.EndRow)
+		bytes.Equal(e.prev(), other.prev()) &&
+		bytes.Equal(e.end(), other.end())
 }
 
 // Overlaps reports whether two extents of the same table share any row. It is
@@ -69,15 +74,15 @@ func (e Extent) Overlaps(other Extent) bool {
 	if e.TableID != other.TableID {
 		return false
 	}
-	return !endsAtOrBelow(e.EndRow, other.PrevEndRow) &&
-		!endsAtOrBelow(other.EndRow, e.PrevEndRow)
+	return !endsAtOrBelow(e.end(), other.prev()) &&
+		!endsAtOrBelow(other.end(), e.prev())
 }
 
 // String renders the extent in Accumulo's KeyExtent form —
 // "tableId;endRow;prevEndRow" with "<" for an infinite bound — so operators
 // can match Shoal's logs against a Java tserver's.
 func (e Extent) String() string {
-	return e.TableID + ";" + boundString(e.EndRow) + ";" + boundString(e.PrevEndRow)
+	return e.TableID + ";" + boundString(e.end()) + ";" + boundString(e.prev())
 }
 
 // key is the canonical map key for an extent. The table id is length-prefixed
@@ -88,19 +93,42 @@ func (e Extent) key() string {
 	b.WriteString(strconv.Itoa(len(e.TableID)))
 	b.WriteByte(':')
 	b.WriteString(e.TableID)
-	writeBoundKey(&b, e.PrevEndRow)
-	writeBoundKey(&b, e.EndRow)
+	writeBoundKey(&b, e.prev())
+	writeBoundKey(&b, e.end())
 	return b.String()
 }
 
-// clone deep-copies the extent's bounds so tracked state cannot be mutated
-// through a slice the caller still holds.
+// clone deep-copies the extent into canonical form, so tracked state cannot
+// be mutated through a slice the caller still holds and an absent bound is
+// always stored as nil.
 func (e Extent) clone() Extent {
 	return Extent{
 		TableID:    e.TableID,
-		PrevEndRow: cloneBound(e.PrevEndRow),
-		EndRow:     cloneBound(e.EndRow),
+		PrevEndRow: cloneBound(e.prev()),
+		EndRow:     cloneBound(e.end()),
 	}
+}
+
+// prev and end return the extent's bounds in canonical form, with an absent
+// bound always nil.
+func (e Extent) prev() []byte { return normalizeBound(e.PrevEndRow) }
+func (e Extent) end() []byte  { return normalizeBound(e.EndRow) }
+
+// normalizeBound collapses a zero-length bound to nil so an absent boundary
+// has exactly one representation.
+//
+// This mirrors normalizeRow in internal/cclient, which does the same for
+// KeyExtent because Accumulo's Java KeyExtent collapses a null Text and an
+// empty one on the wire. Keeping them distinct here would let one tablet
+// arrive under two different keys — an assignment decoded with nil and an
+// unassignment decoded with an empty slice — and Unassign, which fails open
+// on an extent it does not track, would then report success without ever
+// releasing the tablet.
+func normalizeBound(b []byte) []byte {
+	if len(b) == 0 {
+		return nil
+	}
+	return b
 }
 
 func cloneBound(b []byte) []byte {
@@ -128,13 +156,6 @@ func boundString(bound []byte) string {
 	return string(bound)
 }
 
-func boundsEqual(a, b []byte) bool {
-	if (a == nil) != (b == nil) {
-		return false
-	}
-	return bytes.Equal(a, b)
-}
-
 // endsAtOrBelow reports whether an inclusive upper bound sits at or below an
 // exclusive lower bound, i.e. the two ranges do not meet. An infinite upper
 // bound is above everything and an infinite lower bound is below everything,
@@ -153,10 +174,10 @@ func compareExtents(a, b Extent) int {
 	if c := strings.Compare(a.TableID, b.TableID); c != 0 {
 		return c
 	}
-	if c := compareLowerBounds(a.PrevEndRow, b.PrevEndRow); c != 0 {
+	if c := compareLowerBounds(a.prev(), b.prev()); c != 0 {
 		return c
 	}
-	return compareUpperBounds(a.EndRow, b.EndRow)
+	return compareUpperBounds(a.end(), b.end())
 }
 
 func compareLowerBounds(a, b []byte) int {

@@ -52,6 +52,10 @@ var (
 	// ErrWrongState means the tablet is tracked but not in the state the
 	// transition requires.
 	ErrWrongState = errors.New("tserver: tablet in wrong hosting state")
+	// ErrInvalidUnloadMode means the unload mode is not one this host knows,
+	// so it cannot tell whether the manager asked for a drain or a forced
+	// release.
+	ErrInvalidUnloadMode = errors.New("tserver: invalid unload mode")
 	// ErrLockNotNewer means a lock was offered that is not a later generation
 	// than the newest one this host has already seen.
 	ErrLockNotNewer = errors.New("tserver: lock is not a later generation")
@@ -119,6 +123,12 @@ func (m UnloadMode) String() string {
 	}
 }
 
+// valid reports whether the mode is one of the two this host implements.
+// Anything else is refused rather than guessed at.
+func (m UnloadMode) valid() bool {
+	return m == UnloadGraceful || m == UnloadImmediate
+}
+
 // TabletStatus is one tracked tablet as the manager and operators see it.
 type TabletStatus struct {
 	Extent Extent
@@ -181,6 +191,9 @@ type Host struct {
 	manager LockID
 
 	tablets map[string]*tabletEntry
+	// byTable indexes the tracked tablets of each table in range order, so an
+	// overlap check reads two neighbours instead of scanning everything.
+	byTable map[string][]*tabletEntry
 	metrics Metrics
 }
 
@@ -192,7 +205,10 @@ type tabletEntry struct {
 // NewHost returns a host that holds no lock. Until AdoptLock records an
 // acquired ServiceLock, every transition fails closed with ErrNoLock.
 func NewHost() *Host {
-	return &Host{tablets: make(map[string]*tabletEntry)}
+	return &Host{
+		tablets: make(map[string]*tabletEntry),
+		byTable: make(map[string][]*tabletEntry),
+	}
 }
 
 // AdoptLock records a newly acquired tablet-server ServiceLock.
@@ -222,25 +238,34 @@ func (h *Host) AdoptLock(lock LockID) error {
 	return nil
 }
 
-// LoseLock records the loss of the tablet-server ServiceLock and drops every
-// tablet the host was tracking, returning them so the caller can close them.
+// LoseLock records the loss of the tablet-server ServiceLock named by lost,
+// dropping every tablet the host was tracking and returning them so the
+// caller can close them.
 //
 // This is what keeps a tablet from being multiply hosted across a session
 // loss. Once the lock is gone the manager is free to give these tablets to
 // somebody else, so the host stops claiming them immediately rather than
 // waiting to find out; any in-flight transition stamped with the lost lock
 // then fails closed.
-func (h *Host) LoseLock() []Extent {
+//
+// The notification is fenced to its own generation, exactly like the local
+// completions: a loss is applied only when lost is the lock still held. A
+// duplicate or delayed notification for a generation that has already been
+// replaced is ignored, because acting on it would tear down the generation
+// this host does hold and drop tablets the manager believes are served here.
+// Nothing is returned and no loss is counted in that case.
+func (h *Host) LoseLock(lost LockID) []Extent {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
-	if !h.held.Valid() {
-		// Already released: nothing to hand back, and no new loss to record.
+	if !h.held.Valid() || !lost.Equal(h.held) {
+		// Already released, or a stale notification for a generation we no
+		// longer hold: nothing to hand back, and no new loss to record.
 		return nil
 	}
 	h.held = LockID{}
+	h.metrics.LockLosses++
 	if len(h.tablets) == 0 {
-		h.metrics.LockLosses++
 		return nil
 	}
 	dropped := make([]Extent, 0, len(h.tablets))
@@ -249,7 +274,7 @@ func (h *Host) LoseLock() []Extent {
 	}
 	sort.Slice(dropped, func(i, j int) bool { return compareExtents(dropped[i], dropped[j]) < 0 })
 	h.tablets = make(map[string]*tabletEntry)
-	h.metrics.LockLosses++
+	h.byTable = make(map[string][]*tabletEntry)
 	h.metrics.DroppedOnLockLoss += uint64(len(dropped))
 	return dropped
 }
@@ -292,14 +317,12 @@ func (h *Host) Assign(fence Fence, extent Extent) error {
 		h.metrics.RejectedDuplicate++
 		return fmt.Errorf("%w: %s is %s", ErrAlreadyAssigned, existing.extent, existing.state)
 	}
-	for _, entry := range h.tablets {
-		if entry.extent.Overlaps(extent) {
-			h.metrics.RejectedDuplicate++
-			return fmt.Errorf("%w: %s overlaps %s (%s)",
-				ErrOverlapping, extent, entry.extent, entry.state)
-		}
+	if conflict := h.overlapping(extent); conflict != nil {
+		h.metrics.RejectedDuplicate++
+		return fmt.Errorf("%w: %s overlaps %s (%s)",
+			ErrOverlapping, extent, conflict.extent, conflict.state)
 	}
-	h.tablets[extent.key()] = &tabletEntry{extent: extent.clone(), state: StateLoading}
+	h.track(&tabletEntry{extent: extent.clone(), state: StateLoading})
 	h.metrics.Assignments++
 	return nil
 }
@@ -324,7 +347,7 @@ func (h *Host) LoadComplete(server LockID, extent Extent) error {
 // was abandoned so the manager can place the tablet elsewhere.
 func (h *Host) LoadFailed(server LockID, extent Extent) error {
 	return h.transition(server, extent, StateLoading, func(entry *tabletEntry) {
-		delete(h.tablets, entry.extent.key())
+		h.release(entry)
 		h.metrics.LoadFailures++
 	})
 }
@@ -341,9 +364,16 @@ func (h *Host) LoadFailed(server LockID, extent Extent) error {
 // — succeeds without changing anything. The manager asked for the tablet not
 // to be hosted here, and it is not. The fence is still checked first, so a
 // superseded manager cannot unassign anything.
+//
+// An unload mode this host does not implement is refused outright rather than
+// guessed at, so a corrupted or newer mode cannot silently become a drain
+// that never completes when a forced release was meant.
 func (h *Host) Unassign(fence Fence, extent Extent, mode UnloadMode) error {
 	if err := extent.Validate(); err != nil {
 		return err
+	}
+	if !mode.valid() {
+		return fmt.Errorf("%w: %s", ErrInvalidUnloadMode, mode)
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -356,7 +386,7 @@ func (h *Host) Unassign(fence Fence, extent Extent, mode UnloadMode) error {
 		return nil
 	}
 	if mode == UnloadImmediate {
-		delete(h.tablets, extent.key())
+		h.release(entry)
 		h.metrics.Unloads++
 		h.metrics.ForcedUnloads++
 		return nil
@@ -370,7 +400,7 @@ func (h *Host) Unassign(fence Fence, extent Extent, mode UnloadMode) error {
 // unassigned mid-flight gives the tablet back.
 func (h *Host) UnloadComplete(server LockID, extent Extent) error {
 	return h.transition(server, extent, StateUnloading, func(entry *tabletEntry) {
-		delete(h.tablets, entry.extent.key())
+		h.release(entry)
 		h.metrics.Unloads++
 	})
 }
@@ -460,6 +490,69 @@ func (h *Host) transition(server LockID, extent Extent, want HostingState, apply
 	}
 	apply(entry)
 	return nil
+}
+
+// track starts tracking a tablet, in both the key map and the range index.
+// Callers must hold h.mu.
+func (h *Host) track(entry *tabletEntry) {
+	h.tablets[entry.extent.key()] = entry
+	entries := h.byTable[entry.extent.TableID]
+	i := lowerBoundIndex(entries, entry.extent)
+	entries = append(entries, nil)
+	copy(entries[i+1:], entries[i:])
+	entries[i] = entry
+	h.byTable[entry.extent.TableID] = entries
+}
+
+// release stops tracking a tablet, removing it from both the key map and the
+// range index. Callers must hold h.mu.
+func (h *Host) release(entry *tabletEntry) {
+	delete(h.tablets, entry.extent.key())
+
+	table := entry.extent.TableID
+	entries := h.byTable[table]
+	i := lowerBoundIndex(entries, entry.extent)
+	if i >= len(entries) || entries[i] != entry {
+		return
+	}
+	entries = append(entries[:i], entries[i+1:]...)
+	if len(entries) == 0 {
+		delete(h.byTable, table)
+		return
+	}
+	h.byTable[table] = entries
+}
+
+// overlapping returns a tracked tablet that shares rows with extent, or nil
+// if none does. Callers must hold h.mu.
+//
+// Tracked extents within a table are pairwise disjoint — Assign refuses
+// anything that is not — so ordering them by lower bound orders them by upper
+// bound too, and their lower bounds are unique. That makes two comparisons
+// enough: everything below the insertion point's predecessor ends at or
+// before the predecessor starts, and everything above its successor starts at
+// or after the successor ends, so neither can reach extent without the
+// neighbour reaching it first. Assigning N tablets therefore costs
+// N log N comparisons rather than N², which matters on the startup and
+// recovery paths of a server hosting many thousands of tablets.
+func (h *Host) overlapping(extent Extent) *tabletEntry {
+	entries := h.byTable[extent.TableID]
+	i := lowerBoundIndex(entries, extent)
+	if i > 0 && entries[i-1].extent.Overlaps(extent) {
+		return entries[i-1]
+	}
+	if i < len(entries) && entries[i].extent.Overlaps(extent) {
+		return entries[i]
+	}
+	return nil
+}
+
+// lowerBoundIndex returns the position of the first entry whose lower bound
+// is at or above extent's. entries must be sorted by lower bound.
+func lowerBoundIndex(entries []*tabletEntry, extent Extent) int {
+	return sort.Search(len(entries), func(i int) bool {
+		return compareLowerBounds(entries[i].extent.prev(), extent.prev()) >= 0
+	})
 }
 
 // checkFence validates a manager-directed request against both locks. Callers

@@ -19,16 +19,26 @@ package tserver
 
 import (
 	"errors"
+	"math/rand"
 	"sync"
 	"testing"
 )
 
+// The UUIDs below are fixed so failures name a stable holder. They have to be
+// real UUIDs: a LockID is only trusted as fencing authority when it could
+// name an actual "zlock#<uuid>#<sequence>" node.
+const (
+	serverUUID  = "6f1b2c8e-6a4d-4c2e-9f3b-1d5e7a9c0b21"
+	managerUUID = "b91d4a70-3c85-4f11-8ad6-2e6c4b8f9d03"
+	otherUUID   = "0c7e5a13-9b62-4d8f-a41c-77e2f5b6c8a9"
+)
+
 func serverLock(sequence int64) LockID {
-	return LockID{UUID: "6f1b2c8e-tserver", Sequence: sequence}
+	return LockID{UUID: serverUUID, Sequence: sequence}
 }
 
 func managerLock(sequence int64) LockID {
-	return LockID{UUID: "b91d4a70-manager", Sequence: sequence}
+	return LockID{UUID: managerUUID, Sequence: sequence}
 }
 
 // newTestHost returns a host holding a lock, plus that lock and a fence
@@ -234,7 +244,7 @@ func TestStaleServerLockFailsClosed(t *testing.T) {
 		t.Fatalf("unheld lock: want ErrStaleServerLock, got %v", err)
 	}
 	// Same sequence, different holder: ambiguous, so refuse.
-	other := Fence{Server: LockID{UUID: "someone-else", Sequence: lock.Sequence}, Manager: fence.Manager}
+	other := Fence{Server: LockID{UUID: otherUUID, Sequence: lock.Sequence}, Manager: fence.Manager}
 	if err := host.Assign(other, e); !errors.Is(err, ErrStaleServerLock) {
 		t.Fatalf("other holder: want ErrStaleServerLock, got %v", err)
 	}
@@ -439,7 +449,7 @@ func TestLockLossDropsEverything(t *testing.T) {
 		t.Fatalf("Unassign: %v", err)
 	}
 
-	dropped := host.LoseLock()
+	dropped := host.LoseLock(lock)
 	if len(dropped) != 3 {
 		t.Fatalf("dropped = %v, want all three tablets", dropped)
 	}
@@ -467,7 +477,7 @@ func TestLockLossDropsEverything(t *testing.T) {
 	}
 
 	// A second call for the same loss is a no-op.
-	if dropped := host.LoseLock(); dropped != nil {
+	if dropped := host.LoseLock(lock); dropped != nil {
 		t.Fatalf("repeat LoseLock returned %v", dropped)
 	}
 	if metrics := host.Metrics(); metrics.LockLosses != 1 {
@@ -482,7 +492,7 @@ func TestReacquiredLockStartsEmpty(t *testing.T) {
 	host, lock, fence := newTestHost(t)
 	e := extent("2", "", "m")
 	hostTablet(t, host, fence, e)
-	host.LoseLock()
+	host.LoseLock(lock)
 
 	reacquired := serverLock(lock.Sequence + 5)
 	if err := host.AdoptLock(reacquired); err != nil {
@@ -523,7 +533,7 @@ func TestAdoptLockGuards(t *testing.T) {
 	}
 
 	// A generation already burned by a lock loss cannot come back.
-	host.LoseLock()
+	host.LoseLock(lock)
 	if err := host.AdoptLock(lock); !errors.Is(err, ErrLockNotNewer) {
 		t.Fatalf("replayed lock after loss: want ErrLockNotNewer, got %v", err)
 	}
@@ -595,7 +605,7 @@ func TestConcurrentAssignHostsOnce(t *testing.T) {
 // either land before it (and get dropped) or fail closed after it — never
 // leaving a tablet claimed by a host that no longer holds the lock.
 func TestConcurrentAssignAndLockLoss(t *testing.T) {
-	host, _, fence := newTestHost(t)
+	host, lock, fence := newTestHost(t)
 
 	const attempts = 16
 	var wg sync.WaitGroup
@@ -611,7 +621,7 @@ func TestConcurrentAssignAndLockLoss(t *testing.T) {
 	}
 	go func() {
 		defer wg.Done()
-		host.LoseLock()
+		host.LoseLock(lock)
 	}()
 	wg.Wait()
 
@@ -620,5 +630,240 @@ func TestConcurrentAssignAndLockLoss(t *testing.T) {
 	}
 	if _, held := host.Lock(); held {
 		t.Fatal("lock still reported as held")
+	}
+}
+
+// TestLoseLockIgnoresSupersededGeneration covers a delayed or duplicated
+// watcher callback. The loss notification is fenced to its own generation, so
+// a callback for a lock that has already been replaced must not tear down the
+// generation now held and hand back tablets the manager believes are served.
+func TestLoseLockIgnoresSupersededGeneration(t *testing.T) {
+	host, lock, fence := newTestHost(t)
+	e := extent("2", "", "m")
+	hostTablet(t, host, fence, e)
+
+	if dropped := host.LoseLock(lock); len(dropped) != 1 {
+		t.Fatalf("dropped = %v, want the hosted tablet", dropped)
+	}
+
+	// Reconnect under a newer generation and host the tablet again.
+	next := serverLock(lock.Sequence + 1)
+	if err := host.AdoptLock(next); err != nil {
+		t.Fatalf("AdoptLock: %v", err)
+	}
+	hostTablet(t, host, Fence{Server: next, Manager: fence.Manager}, e)
+
+	if dropped := host.LoseLock(lock); dropped != nil {
+		t.Fatalf("a superseded lock loss dropped %v", dropped)
+	}
+	if got, held := host.Lock(); !held || !got.Equal(next) {
+		t.Fatalf("lock = %s (held=%v), want %s still held", got, held, next)
+	}
+	wantHosted(t, host, "2;m;<")
+	if metrics := host.Metrics(); metrics.LockLosses != 1 || metrics.DroppedOnLockLoss != 1 {
+		t.Fatalf("a superseded loss was counted: %+v", metrics)
+	}
+
+	// The generation actually held can still be lost.
+	if dropped := host.LoseLock(next); len(dropped) != 1 {
+		t.Fatalf("dropped = %v, want the tablet hosted under %s", dropped, next)
+	}
+	if metrics := host.Metrics(); metrics.LockLosses != 2 || metrics.DroppedOnLockLoss != 2 {
+		t.Fatalf("metrics = %+v", metrics)
+	}
+}
+
+// TestUnassignRejectsUnknownMode checks that an unload mode this host does
+// not implement is refused rather than treated as a drain, which would leave
+// the tablet in UNLOADING forever when a forced release was meant.
+func TestUnassignRejectsUnknownMode(t *testing.T) {
+	host, _, fence := newTestHost(t)
+	e := extent("2", "", "m")
+	hostTablet(t, host, fence, e)
+
+	if err := host.Unassign(fence, e, UnloadMode(42)); !errors.Is(err, ErrInvalidUnloadMode) {
+		t.Fatalf("want ErrInvalidUnloadMode, got %v", err)
+	}
+	wantState(t, host, e, StateHosted)
+	wantHosted(t, host, "2;m;<")
+	if metrics := host.Metrics(); metrics.Unloads != 0 {
+		t.Fatalf("an uninterpretable mode released the tablet: %+v", metrics)
+	}
+}
+
+// TestUnassignReleasesTabletSpelledWithEmptyBound covers the decode mismatch
+// the shared nil-or-empty bound semantics prevent. A tablet assigned with a
+// nil bound and unassigned with an empty one is the same tablet, so the
+// unassignment must release it — if the two keyed differently, the fail-open
+// Unassign would report success while the tablet stayed hosted here.
+func TestUnassignReleasesTabletSpelledWithEmptyBound(t *testing.T) {
+	host, _, fence := newTestHost(t)
+	assigned := Extent{TableID: "2", PrevEndRow: nil, EndRow: []byte("m")}
+	spelledEmpty := Extent{TableID: "2", PrevEndRow: []byte{}, EndRow: []byte("m")}
+
+	hostTablet(t, host, fence, assigned)
+	if err := host.Unassign(fence, spelledEmpty, UnloadImmediate); err != nil {
+		t.Fatalf("Unassign: %v", err)
+	}
+	wantState(t, host, assigned, StateUnassigned)
+	wantHosted(t, host)
+	if metrics := host.Metrics(); metrics.Unloads != 1 {
+		t.Fatalf("the tablet was not released: %+v", metrics)
+	}
+
+	// The reverse spelling is also the same tablet, so re-assigning it is a
+	// duplicate rather than a second tablet covering the same rows.
+	if err := host.Assign(fence, spelledEmpty); err != nil {
+		t.Fatalf("Assign: %v", err)
+	}
+	if err := host.Assign(fence, assigned); !errors.Is(err, ErrAlreadyAssigned) {
+		t.Fatalf("want ErrAlreadyAssigned, got %v", err)
+	}
+}
+
+// TestOverlapDetectionSurvivesRelease pins the failure mode the range index
+// could introduce: a released tablet must leave the index, and the ones still
+// tracked must stay findable.
+func TestOverlapDetectionSurvivesRelease(t *testing.T) {
+	host, _, fence := newTestHost(t)
+	left, right, whole := extent("2", "", "m"), extent("2", "m", ""), extent("2", "", "")
+
+	hostTablet(t, host, fence, left)
+	hostTablet(t, host, fence, right)
+	if err := host.Assign(fence, whole); !errors.Is(err, ErrOverlapping) {
+		t.Fatalf("parent over both children: want ErrOverlapping, got %v", err)
+	}
+
+	if err := host.Unassign(fence, left, UnloadImmediate); err != nil {
+		t.Fatalf("Unassign(left): %v", err)
+	}
+	if err := host.Assign(fence, whole); !errors.Is(err, ErrOverlapping) {
+		t.Fatalf("parent over the remaining child: want ErrOverlapping, got %v", err)
+	}
+	if err := host.Assign(fence, left); err != nil {
+		t.Fatalf("the released child must be assignable again: %v", err)
+	}
+	if err := host.Unassign(fence, left, UnloadImmediate); err != nil {
+		t.Fatalf("Unassign(left): %v", err)
+	}
+
+	if err := host.Unassign(fence, right, UnloadImmediate); err != nil {
+		t.Fatalf("Unassign(right): %v", err)
+	}
+	if err := host.Assign(fence, whole); err != nil {
+		t.Fatalf("with both children gone the parent must fit: %v", err)
+	}
+}
+
+// overlapRows is a small ordered row alphabet, so randomly drawn extents
+// collide often enough to exercise both outcomes.
+var overlapRows = []string{"b", "d", "f", "h", "j"}
+
+// randomExtent draws a valid extent over overlapRows. Position 0 is the
+// absent lower bound and the last position the absent upper bound.
+func randomExtent(rng *rand.Rand, table string) Extent {
+	n := len(overlapRows) + 2
+	lo := rng.Intn(n - 1)
+	hi := lo + 1 + rng.Intn(n-lo-1)
+	e := Extent{TableID: table}
+	if lo > 0 {
+		e.PrevEndRow = []byte(overlapRows[lo-1])
+	}
+	if hi < n-1 {
+		e.EndRow = []byte(overlapRows[hi-1])
+	}
+	return e
+}
+
+// anyOverlapByScan is the full scan the per-table range index replaced, kept
+// as the reference implementation for the differential test below.
+func anyOverlapByScan(host *Host, e Extent) bool {
+	for _, entry := range host.tablets {
+		if entry.extent.Overlaps(e) {
+			return true
+		}
+	}
+	return false
+}
+
+// checkIndex asserts the range index still mirrors the tracked tablets: same
+// membership, grouped by table, ordered by lower bound, no empty leftovers.
+func checkIndex(t *testing.T, host *Host) {
+	t.Helper()
+	indexed := 0
+	for table, entries := range host.byTable {
+		if len(entries) == 0 {
+			t.Fatalf("table %q left behind an empty index slice", table)
+		}
+		indexed += len(entries)
+		for i, entry := range entries {
+			if entry.extent.TableID != table {
+				t.Fatalf("%s is indexed under table %q", entry.extent, table)
+			}
+			if host.tablets[entry.extent.key()] != entry {
+				t.Fatalf("index holds %s, which is not tracked", entry.extent)
+			}
+			if i > 0 && compareLowerBounds(entries[i-1].extent.prev(), entry.extent.prev()) >= 0 {
+				t.Fatalf("index out of order at %d: %s then %s",
+					i, entries[i-1].extent, entry.extent)
+			}
+		}
+	}
+	if indexed != len(host.tablets) {
+		t.Fatalf("index holds %d entries for %d tracked tablets", indexed, len(host.tablets))
+	}
+}
+
+// TestOverlapIndexMatchesFullScan is the differential test for the range
+// index: over a long randomized run of assignments and releases across
+// several tables, every Assign must reach exactly the outcome the original
+// full scan would have produced, and the index must stay consistent.
+func TestOverlapIndexMatchesFullScan(t *testing.T) {
+	host, _, fence := newTestHost(t)
+	rng := rand.New(rand.NewSource(1))
+	tables := []string{"2", "3", "!0"}
+
+	assigned, duplicate, overlapping, released := 0, 0, 0, 0
+	for step := 0; step < 3000; step++ {
+		e := randomExtent(rng, tables[rng.Intn(len(tables))])
+
+		if rng.Intn(3) == 0 {
+			if _, tracked := host.tablets[e.key()]; tracked {
+				released++
+			}
+			if err := host.Unassign(fence, e, UnloadImmediate); err != nil {
+				t.Fatalf("step %d: Unassign(%s): %v", step, e, err)
+			}
+			checkIndex(t, host)
+			continue
+		}
+
+		_, wantDuplicate := host.tablets[e.key()]
+		wantOverlap := anyOverlapByScan(host, e)
+		err := host.Assign(fence, e)
+		switch {
+		case wantDuplicate:
+			duplicate++
+			if !errors.Is(err, ErrAlreadyAssigned) {
+				t.Fatalf("step %d: Assign(%s): want ErrAlreadyAssigned, got %v", step, e, err)
+			}
+		case wantOverlap:
+			overlapping++
+			if !errors.Is(err, ErrOverlapping) {
+				t.Fatalf("step %d: Assign(%s): want ErrOverlapping, got %v", step, e, err)
+			}
+		default:
+			assigned++
+			if err != nil {
+				t.Fatalf("step %d: Assign(%s): %v", step, e, err)
+			}
+		}
+		checkIndex(t, host)
+	}
+
+	// Guard against the walk degenerating into one uninteresting outcome.
+	if assigned == 0 || duplicate == 0 || overlapping == 0 || released == 0 {
+		t.Fatalf("walk did not exercise every outcome: assigned=%d duplicate=%d overlapping=%d released=%d",
+			assigned, duplicate, overlapping, released)
 	}
 }

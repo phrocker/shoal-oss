@@ -23,9 +23,9 @@ import (
 	"testing"
 )
 
-// bound maps a test string to a row bound, with "" meaning the infinite
-// bound (nil). Tests that care about the nil-versus-empty distinction build
-// their extents literally instead.
+// bound maps a test string to a row bound, with "" meaning the absent
+// bound (nil). Tests that care how an absent bound was spelled build their
+// extents literally instead.
 func bound(s string) []byte {
 	if s == "" {
 		return nil
@@ -47,7 +47,8 @@ func TestExtentValidate(t *testing.T) {
 		{"bounded", extent("2", "d", "m"), false},
 		{"open start", extent("2", "", "m"), false},
 		{"open end", extent("2", "m", ""), false},
-		{"empty prev row is a real bound", Extent{TableID: "2", PrevEndRow: []byte{}, EndRow: []byte("m")}, false},
+		{"empty prev row means absent", Extent{TableID: "2", PrevEndRow: []byte{}, EndRow: []byte("m")}, false},
+		{"empty end row means absent", Extent{TableID: "2", PrevEndRow: []byte("m"), EndRow: []byte{}}, false},
 		{"no table", extent("", "d", "m"), true},
 		{"inverted", extent("2", "m", "d"), true},
 		{"empty range", extent("2", "m", "m"), true},
@@ -68,21 +69,53 @@ func TestExtentValidate(t *testing.T) {
 	}
 }
 
-func TestExtentEqualDistinguishesInfiniteFromEmptyBound(t *testing.T) {
-	infinite := Extent{TableID: "2", PrevEndRow: nil, EndRow: []byte("m")}
-	empty := Extent{TableID: "2", PrevEndRow: []byte{}, EndRow: []byte("m")}
+// TestExtentTreatsEmptyBoundAsAbsent pins the wire semantics this package
+// shares with cclient.KeyExtent and Accumulo's Java KeyExtent: nil and empty
+// are the same absent bound. If they were distinct, one tablet could be
+// assigned under one spelling and unassigned under the other, and the
+// fail-open Unassign would report success without releasing it.
+func TestExtentTreatsEmptyBoundAsAbsent(t *testing.T) {
+	nilBound := Extent{TableID: "2", PrevEndRow: nil, EndRow: []byte("m")}
+	emptyBound := Extent{TableID: "2", PrevEndRow: []byte{}, EndRow: []byte("m")}
 
-	if infinite.Equal(empty) {
-		t.Fatal("an infinite prev end row must not equal an empty one")
+	if !nilBound.Equal(emptyBound) {
+		t.Fatal("a nil prev end row must equal an empty one")
 	}
-	if infinite.key() == empty.key() {
-		t.Fatalf("keys collide: %q", infinite.key())
+	if nilBound.key() != emptyBound.key() {
+		t.Fatalf("keys differ: %q vs %q", nilBound.key(), emptyBound.key())
 	}
-	if !infinite.Equal(extent("2", "", "m")) {
+	if nilBound.String() != emptyBound.String() {
+		t.Fatalf("rendering differs: %q vs %q", nilBound, emptyBound)
+	}
+	if compareExtents(nilBound, emptyBound) != 0 {
+		t.Fatal("an absent bound must order identically however it is spelled")
+	}
+
+	// The same holds for the upper bound, and for an extent that is absent on
+	// both sides.
+	whole := Extent{TableID: "2", PrevEndRow: []byte{}, EndRow: []byte{}}
+	if !whole.Equal(extent("2", "", "")) || whole.key() != extent("2", "", "").key() {
+		t.Fatalf("an all-empty extent must be the whole table: %s / %q", whole, whole.key())
+	}
+
+	if !nilBound.Equal(extent("2", "", "m")) {
 		t.Fatal("identical extents must compare equal")
 	}
-	if infinite.Equal(extent("3", "", "m")) {
+	if nilBound.Equal(extent("3", "", "m")) {
 		t.Fatal("extents of different tables must not compare equal")
+	}
+}
+
+// TestExtentCloneCanonicalizesBounds checks that what the host stores is
+// already normalized, so a caller's empty slice cannot survive as a distinct
+// identity.
+func TestExtentCloneCanonicalizesBounds(t *testing.T) {
+	got := Extent{TableID: "2", PrevEndRow: []byte{}, EndRow: []byte("m")}.clone()
+	if got.PrevEndRow != nil {
+		t.Fatalf("clone kept an empty prev end row: %#v", got.PrevEndRow)
+	}
+	if string(got.EndRow) != "m" {
+		t.Fatalf("clone lost the end row: %#v", got.EndRow)
 	}
 }
 
@@ -96,7 +129,6 @@ func TestExtentKeyIsUnambiguous(t *testing.T) {
 		extent("2", "m", ""),
 		extent("2;m", "", ""),
 		extent("22", ";m", ""),
-		{TableID: "2", PrevEndRow: []byte{}, EndRow: nil},
 	} {
 		key := e.key()
 		if prior, ok := keys[key]; ok {

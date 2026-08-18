@@ -123,12 +123,25 @@ from any transition means nothing moved:
 | tablet already assigned here | `ErrAlreadyAssigned` |
 | extent overlaps an assigned tablet | `ErrOverlapping` |
 | malformed extent | `ErrInvalidExtent` |
+| completion for a tablet this host does not track | `ErrNotAssigned` |
 | completion for a tablet in another state | `ErrWrongState` |
+| unload mode this host does not implement | `ErrInvalidUnloadMode` |
+
+`ErrNotAssigned` and `ErrWrongState` are deliberately distinct: the first
+says the host never had the tablet (or has already released it), the
+second says it has it but the completion arrived for the wrong phase.
+Only the second is worth retrying.
 
 Overlap is what catches stale split metadata. A parent extent arriving
 after its children are assigned — or a child arriving after its parent —
 would host the same rows twice, so it is refused even though the extent
 itself is not a duplicate.
+
+Overlap is checked against the two neighbouring tablets of the extent's
+place in a per-table range index, not against every tablet the host has.
+Tracked extents in a table never overlap each other, so those two are the
+only ones that can reach it — which keeps loading N tablets at
+N log N comparisons instead of N².
 
 The manager-facing `Unassign` is the one deliberate exception, and it
 fails *open* rather than closed because doing so cannot multiply-host
@@ -136,6 +149,13 @@ anything: unassigning a tablet this host does not have succeeds without
 changing anything. The manager asked for the tablet not to be hosted
 here, and it is not. The fence is still checked first, so a superseded
 manager cannot unassign anything.
+
+A row bound is *absent* when it is nil or empty; the two are the same
+bound. That matches `cclient.KeyExtent` and Accumulo's Java `KeyExtent`,
+where a null and an empty `Text` collapse on the wire. If the two were
+kept distinct, one tablet could arrive under two identities — assigned
+with a nil bound and unassigned with an empty one — and the fail-open
+`Unassign` would report success without ever releasing it.
 
 ## 5. Lock loss and restart
 
@@ -145,6 +165,12 @@ those tablets elsewhere, so the host stops claiming them immediately
 rather than waiting to be told. Any work still in flight then fails
 closed, because its server lock no longer matches.
 
+The notification is fenced to its own generation: `LoseLock` takes the
+`LockID` that was lost and does nothing unless that is still the lock
+held. A delayed or duplicated watcher callback for a generation that has
+already been replaced would otherwise tear down its successor and drop
+tablets the manager believes are being served.
+
 `AdoptLock` refuses a generation that is not strictly newer than any this
 host has already used — including ones released by `LoseLock`, whose
 sequence is remembered for exactly this reason — and refuses to run at
@@ -152,6 +178,11 @@ all while tablets are still assigned. A restarted or reconnected process
 therefore always starts from an empty hosted set under a fresh
 generation, which is what makes "process restart and ServiceLock loss do
 not leave a tablet multiply hosted" hold.
+
+A `LockID` is only usable as fencing authority if it could name a real
+`zlock#<uuid>#<sequence>` node: the UUID must parse and the sequence must
+fit the signed 32-bit counter Accumulo reads with `Integer.parseInt`.
+The same checks live in `internal/zk`'s node parser.
 
 ## 6. What is not here yet
 
