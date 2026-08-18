@@ -289,6 +289,7 @@ func TestStageBulkDirRejectsInvalidBulkDirBeforeCopying(t *testing.T) {
 		{name: "local root", bulkDir: "/"},
 		{name: "url root", bulkDir: "hdfs://nn/"},
 		{name: "uppercase authorityless hdfs root", bulkDir: "HDFS:/"},
+		{name: "hdfs root alias via trailing parent dot segment", bulkDir: "hdfs://nn/tmp/.."},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -589,6 +590,11 @@ func TestIsBackendRootDistinguishesWindowsDrivePaths(t *testing.T) {
 		{name: "custom backend non-root", path: "custom+backend://bucket/path", want: false},
 		{name: "hdfs root", path: "hdfs:/", want: true},
 		{name: "uppercase hdfs root", path: "HDFS:/", want: true},
+		{name: "hdfs bare authority root has no path segment", path: "hdfs://nn", want: true},
+		{name: "hdfs root alias via trailing parent dot segment", path: "hdfs://nn/tmp/..", want: true},
+		{name: "hdfs authorityless root alias via trailing parent dot segment", path: "hdfs:/tmp/..", want: true},
+		{name: "hdfs non-root path containing a parent dot segment", path: "hdfs://nn/tmp/../keep", want: false},
+		{name: "s3 dot segments are literal key characters, not a root alias", path: "s3://bucket/tmp/..", want: false},
 		{name: "windows drive root with redundant separators", path: `C://`, want: true},
 		{name: "windows drive non-root with redundant separators", path: `C://data`, want: false},
 	}
