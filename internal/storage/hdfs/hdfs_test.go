@@ -727,6 +727,27 @@ func TestCloseAfterReplicationClearsDeadlineForBackgroundContext(t *testing.T) {
 	}
 }
 
+func TestCloseAfterReplicationUsesContextAwareClose(t *testing.T) {
+	writer := &contextCloseWriter{}
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	err := closeAfterReplication(ctx, writer)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("closeAfterReplication error = %v, want context deadline exceeded", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("closeAfterReplication took %v; context-aware Close was not bounded", elapsed)
+	}
+	if writer.contextCloseCalls != 1 {
+		t.Fatalf("CloseContext calls = %d, want 1", writer.contextCloseCalls)
+	}
+	if writer.closeCalls != 0 {
+		t.Fatalf("Close calls = %d, want 0", writer.closeCalls)
+	}
+}
+
 func TestBackendAbortPreservesExistingTargetAndRemovesTemp(t *testing.T) {
 	client := newFakeClient()
 	client.files["/tables/1.rf"] = []byte("old")
@@ -810,6 +831,29 @@ func TestBackendAbortReportsCleanupFailure(t *testing.T) {
 	}
 }
 
+func TestBackendAbortUsesBoundedRemoveContext(t *testing.T) {
+	client := newFakeClient()
+	backend, err := New("nn:8020", WithClient(client))
+	if err != nil {
+		t.Fatal(err)
+	}
+	w, err := backend.Create(context.Background(), "/tables/1.rf")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := w.(storage.Aborter).Abort(); err != nil {
+		t.Fatal(err)
+	}
+	if client.lastRemoveDeadline.IsZero() {
+		t.Fatal("Abort removed the temporary file without a deadline")
+	}
+	remaining := time.Until(client.lastRemoveDeadline)
+	if remaining <= 0 || remaining > cleanupTimeout {
+		t.Fatalf("remove deadline remaining = %v, want within %v", remaining, cleanupTimeout)
+	}
+}
+
 type fakeClient struct {
 	files                    map[string][]byte
 	dirs                     map[string]bool
@@ -828,6 +872,7 @@ type fakeClient struct {
 	failRemoveErr            error
 	failBackupRemove         bool
 	writerCloseHook          func() error
+	lastRemoveDeadline       time.Time
 }
 
 func newFakeClient() *fakeClient {
@@ -898,6 +943,11 @@ func (c *fakeClient) Remove(name string) error {
 	}
 	delete(c.files, name)
 	return nil
+}
+
+func (c *fakeClient) RemoveContext(ctx context.Context, name string) error {
+	c.lastRemoveDeadline, _ = ctx.Deadline()
+	return c.Remove(name)
 }
 
 func (c *fakeClient) Rename(oldpath, newpath string) error {
@@ -1014,6 +1064,23 @@ var errInjectedClose = errors.New("injected close failure")
 type immediateErrorDeadlineWriter struct {
 	deadlines []time.Time
 }
+
+type contextCloseWriter struct {
+	closeCalls        int
+	contextCloseCalls int
+}
+
+func (w *contextCloseWriter) Write(p []byte) (int, error) { return len(p), nil }
+func (w *contextCloseWriter) Close() error {
+	w.closeCalls++
+	return errors.New("unexpected Close call")
+}
+func (w *contextCloseWriter) CloseContext(ctx context.Context) error {
+	w.contextCloseCalls++
+	<-ctx.Done()
+	return ctx.Err()
+}
+func (w *contextCloseWriter) SetDeadline(time.Time) error { return nil }
 
 func (w *immediateErrorDeadlineWriter) Write(p []byte) (int, error) { return len(p), nil }
 func (w *immediateErrorDeadlineWriter) Close() error                { return errInjectedClose }

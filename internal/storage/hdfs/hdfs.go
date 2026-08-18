@@ -212,8 +212,10 @@ func (b *Backend) Create(ctx context.Context, objectPath string) (storage.Writer
 		return nil, fmt.Errorf("hdfs: create temporary file %s: %w", tempPath, err)
 	}
 	if err := applyDeadline(ctx, writer); err != nil {
-		_ = writer.Close()
-		_ = b.cleanupRemove(tempPath)
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), cleanupTimeout)
+		_ = closeAfterReplication(cleanupCtx, writer)
+		_ = b.cleanupRemove(cleanupCtx, tempPath)
+		cancel()
 		_ = lease.release()
 		return nil, fmt.Errorf("hdfs: create temporary file %s: %w", tempPath, err)
 	}
@@ -284,8 +286,8 @@ func (b *Backend) Remove(ctx context.Context, objectPath string) error {
 	return nil
 }
 
-func (b *Backend) cleanupRemove(resolved string) error {
-	if err := b.client.Remove(resolved); err != nil && !isNotFound(err) {
+func (b *Backend) cleanupRemove(ctx context.Context, resolved string) error {
+	if err := removeWithContext(ctx, b.client, resolved); err != nil && !isNotFound(err) {
 		return fmt.Errorf("hdfs: remove temporary file %s: %w", resolved, err)
 	}
 	return nil
@@ -412,6 +414,21 @@ type deadlineSetter interface {
 	SetDeadline(time.Time) error
 }
 
+type contextCloser interface {
+	CloseContext(context.Context) error
+}
+
+type contextRemover interface {
+	RemoveContext(context.Context, string) error
+}
+
+func removeWithContext(ctx context.Context, client Client, name string) error {
+	if remover, ok := client.(contextRemover); ok {
+		return remover.RemoveContext(contextOrBackground(ctx), name)
+	}
+	return client.Remove(name)
+}
+
 func clearDeadline(target any) error {
 	setter, ok := target.(deadlineSetter)
 	if !ok {
@@ -506,9 +523,11 @@ func (w *replaceWriter) Close() (retErr error) {
 		return nil
 	}
 	if err := closeAfterReplication(w.ctx, w.writer); err != nil {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), cleanupTimeout)
+		defer cancel()
 		return errors.Join(
 			fmt.Errorf("hdfs: close temporary file %s: %w", w.temp, err),
-			w.removeTemp(),
+			w.removeTemp(cleanupCtx),
 		)
 	}
 	w.writerClosed = true
@@ -594,28 +613,31 @@ func (w *replaceWriter) Abort() (retErr error) {
 	w.aborted = true
 
 	var abortErr error
+	cleanupCtx, cancel := context.WithTimeout(context.Background(), cleanupTimeout)
+	defer cancel()
 	if !w.writerClosed {
-		if err := closeAfterReplication(w.ctx, w.writer); err != nil {
+		if err := closeAfterReplication(cleanupCtx, w.writer); err != nil {
 			abortErr = fmt.Errorf("hdfs: close temporary file %s: %w", w.temp, err)
 		} else {
 			w.writerClosed = true
 		}
 	}
-	if cleanupErr := w.removeTemp(); cleanupErr != nil {
+	if cleanupErr := w.removeTemp(cleanupCtx); cleanupErr != nil {
 		abortErr = errors.Join(abortErr, cleanupErr)
 	}
 	return abortErr
 }
 
+const cleanupTimeout = 10 * time.Second
+
 func closeAfterReplication(ctx context.Context, writer storage.Writer) (retErr error) {
 	const (
 		initialDelay = 100 * time.Millisecond
 		maxDelay     = time.Second
-		timeout      = 10 * time.Second
 	)
 
 	ctx = contextOrBackground(ctx)
-	retryCtx, cancel := context.WithTimeout(ctx, timeout)
+	retryCtx, cancel := context.WithTimeout(ctx, cleanupTimeout)
 	defer cancel()
 	if err := applyDeadline(retryCtx, writer); err != nil {
 		return err
@@ -636,7 +658,12 @@ func closeAfterReplication(ctx context.Context, writer storage.Writer) (retErr e
 	}()
 	delay := initialDelay
 	for {
-		closeErr := writer.Close()
+		var closeErr error
+		if closer, ok := writer.(contextCloser); ok {
+			closeErr = closer.CloseContext(retryCtx)
+		} else {
+			closeErr = writer.Close()
+		}
 		if ctxErr := retryCtx.Err(); ctxErr != nil {
 			return errors.Join(closeErr, ctxErr)
 		}
@@ -768,8 +795,8 @@ func (w *replaceWriter) releaseOperationClient() error {
 	return w.release()
 }
 
-func (w *replaceWriter) removeTemp() error {
-	if err := w.cleanupClient.Remove(w.temp); err != nil && !isNotFound(err) {
+func (w *replaceWriter) removeTemp(ctx context.Context) error {
+	if err := removeWithContext(ctx, w.cleanupClient, w.temp); err != nil && !isNotFound(err) {
 		return fmt.Errorf("hdfs: remove temporary file %s: %w", w.temp, err)
 	}
 	return nil
@@ -797,4 +824,6 @@ var (
 	_ storage.Lister          = (*Backend)(nil)
 	_ storage.Remover         = (*Backend)(nil)
 	_ storage.Aborter         = (*replaceWriter)(nil)
+	_ contextCloser           = (*hdfsclient.FileWriter)(nil)
+	_ contextRemover          = clientAdapter{}
 )
