@@ -46,13 +46,17 @@ func TestSharedLibraryCABI(t *testing.T) {
 	)
 
 	include := filepath.Join(root, "capi", "include")
-	cppObject := filepath.Join(artifacts, "header_cpp_test.o")
+	cppExecutable := filepath.Join(artifacts, "header_cpp_test")
+	if runtime.GOOS == "windows" {
+		cppExecutable += ".exe"
+	}
 	cppArgs := append(
 		append([]string{}, cxx.args...),
 		"-std=c++11", "-Wall", "-Wextra", "-Werror",
 		"-I", include,
-		"-c", filepath.Join(root, "capi", "tests", "header_cpp_test.cpp"),
-		"-o", cppObject,
+		filepath.Join(root, "capi", "tests", "header_cpp_test.cpp"),
+		library,
+		"-o", cppExecutable,
 	)
 	runCommand(t, root, nil, cxx.name, cppArgs...)
 
@@ -77,7 +81,25 @@ func TestSharedLibraryCABI(t *testing.T) {
 	default:
 		env = prependEnvPath(env, "LD_LIBRARY_PATH", artifacts)
 	}
+	runCommand(t, artifacts, env, cppExecutable)
 	runCommand(t, artifacts, env, executable)
+
+	queryExecutable := filepath.Join(artifacts, "shared_library_query")
+	if runtime.GOOS == "windows" {
+		queryExecutable += ".exe"
+	}
+	queryArgs := append(
+		append([]string{}, cc.args...),
+		"-std=c11", "-Wall", "-Wextra", "-Werror",
+		"-I", include,
+		filepath.Join(root, "capi", "tests", "shared_library_query.c"),
+	)
+	if runtime.GOOS == "linux" {
+		queryArgs = append(queryArgs, "-ldl")
+	}
+	queryArgs = append(queryArgs, "-o", queryExecutable)
+	runCommand(t, root, nil, cc.name, queryArgs...)
+	runCommand(t, artifacts, env, queryExecutable, library)
 
 	bridgeExecutable := filepath.Join(artifacts, "result_bridge")
 	if runtime.GOOS == "windows" {

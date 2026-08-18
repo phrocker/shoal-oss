@@ -839,8 +839,8 @@ void shoal_bridge_error_free(shoal_error *error) {
 
 void shoal_bridge_connector_config_init(shoal_connector_config *config) {
   if (config != NULL) {
-    memset(config, 0, sizeof(*config));
-    config->struct_size = (uint32_t)sizeof(*config);
+    memset(config, 0, SHOAL_CONNECTOR_CONFIG_V1_SIZE);
+    config->struct_size = SHOAL_CONNECTOR_CONFIG_V1_SIZE;
   }
 }
 
@@ -850,8 +850,8 @@ uint32_t shoal_bridge_connector_config_v1_size(void) {
 
 void shoal_bridge_scanner_config_init(shoal_scanner_config *config) {
   if (config != NULL) {
-    memset(config, 0, sizeof(*config));
-    config->struct_size = (uint32_t)sizeof(*config);
+    memset(config, 0, SHOAL_SCANNER_CONFIG_V1_SIZE);
+    config->struct_size = SHOAL_SCANNER_CONFIG_V1_SIZE;
   }
 }
 
@@ -861,8 +861,8 @@ uint32_t shoal_bridge_scanner_config_v1_size(void) {
 
 void shoal_bridge_range_init(shoal_range *range) {
   if (range != NULL) {
-    memset(range, 0, sizeof(*range));
-    range->struct_size = (uint32_t)sizeof(*range);
+    memset(range, 0, SHOAL_RANGE_V1_SIZE);
+    range->struct_size = SHOAL_RANGE_V1_SIZE;
   }
 }
 
@@ -872,8 +872,8 @@ uint32_t shoal_bridge_range_v1_size(void) {
 
 void shoal_bridge_batch_writer_config_init(shoal_batch_writer_config *config) {
   if (config != NULL) {
-    memset(config, 0, sizeof(*config));
-    config->struct_size = (uint32_t)sizeof(*config);
+    memset(config, 0, SHOAL_BATCH_WRITER_CONFIG_V1_SIZE);
+    config->struct_size = SHOAL_BATCH_WRITER_CONFIG_V1_SIZE;
   }
 }
 
