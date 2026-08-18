@@ -87,6 +87,7 @@ import (
 	"time"
 
 	"github.com/phrocker/shoal/internal/iterrt"
+	nslookup "github.com/phrocker/shoal/internal/namespaces"
 	"github.com/phrocker/shoal/internal/tablenames"
 )
 
@@ -171,7 +172,8 @@ type Resolver struct {
 	ttl     time.Duration
 	logger  *slog.Logger
 
-	names *tablenames.Resolver
+	namespaceNames *nslookup.Resolver
+	names          *tablenames.Resolver
 
 	cacheMu sync.Mutex
 	cache   map[stackKey]*ResolvedStack
@@ -188,12 +190,14 @@ func NewResolver(locator tablenames.Locator, ttl time.Duration, logger *slog.Log
 	if logger == nil {
 		logger = slog.Default()
 	}
+	namespaceNames := nslookup.NewResolver(locator)
 	return &Resolver{
-		locator: locator,
-		ttl:     ttl,
-		logger:  logger,
-		names:   tablenames.NewResolver(locator),
-		cache:   map[stackKey]*ResolvedStack{},
+		locator:        locator,
+		ttl:            ttl,
+		logger:         logger,
+		namespaceNames: namespaceNames,
+		names:          tablenames.NewResolver(locator, namespaceNames),
+		cache:          map[stackKey]*ResolvedStack{},
 	}
 }
 
@@ -213,6 +217,7 @@ func (r *Resolver) ResolveTableID(ctx context.Context, tableName string) (string
 // re-scans ZK. Used by the poller after detecting a CreateTable / rename.
 func (r *Resolver) InvalidateNames() {
 	r.names.Invalidate()
+	r.namespaceNames.Invalidate()
 }
 
 // Resolve loads the iterator stack for tableID at scope, parses

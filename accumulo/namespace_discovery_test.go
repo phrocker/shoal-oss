@@ -13,9 +13,10 @@ import (
 )
 
 type namespaceDiscoveryLocator struct {
-	mu   sync.Mutex
-	data map[string][]byte
-	err  error
+	mu    sync.Mutex
+	data  map[string][]byte
+	reads map[string]int
+	err   error
 }
 
 func (l *namespaceDiscoveryLocator) InstanceID() string { return "uuid-1" }
@@ -32,6 +33,9 @@ func (l *namespaceDiscoveryLocator) GetRaw(ctx context.Context, znodePath string
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	if l.reads != nil {
+		l.reads[znodePath]++
+	}
 	if l.err != nil {
 		return nil, l.err
 	}
@@ -41,6 +45,18 @@ func (l *namespaceDiscoveryLocator) GetRaw(ctx context.Context, znodePath string
 func (l *namespaceDiscoveryLocator) Children(context.Context, string) ([]string, error) {
 	return nil, nil
 }
+
+type autoDiscoveryInstance struct {
+	locator *namespaceDiscoveryLocator
+}
+
+func (i *autoDiscoveryInstance) Info() InstanceInfo {
+	return InstanceInfo{Name: "accumulo", ID: "uuid-1"}
+}
+
+func (i *autoDiscoveryInstance) Close() error { return nil }
+
+func (i *autoDiscoveryInstance) discoveryLocator() discoveryLocator { return i.locator }
 
 func testConnectorWithRealNamespaceResolver(
 	t *testing.T,
@@ -64,6 +80,20 @@ func testConnectorWithRealNamespaceResolver(
 		nslookup.NewResolver(locator),
 		&fakeTableNames{byName: map[string]string{}, byID: map[string]string{}},
 	)
+	t.Cleanup(func() { _ = connector.Close() })
+	return connector
+}
+
+func newAutoDiscoveryConnector(t *testing.T, locator *namespaceDiscoveryLocator) *Connector {
+	t.Helper()
+	credentials, err := PasswordCredentials("root", []byte("secret"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	connector, err := NewConnector(&autoDiscoveryInstance{locator: locator}, credentials, ConnectorOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
 	t.Cleanup(func() { _ = connector.Close() })
 	return connector
 }
@@ -277,6 +307,105 @@ func TestNamespaceDiscoveryPropagatesZooKeeperMappingErrors(t *testing.T) {
 	}
 }
 
+func TestConnectorSharesNamespaceResolverAcrossNamespaceAndTableAPIs(t *testing.T) {
+	locator := &namespaceDiscoveryLocator{
+		data: map[string][]byte{
+			"/accumulo/uuid-1/namespaces":                  []byte(`{"+accumulo":"accumulo","+default":"","ns1":"analytics"}`),
+			"/accumulo/uuid-1/namespaces/+default/tables":  []byte(`{"1":"events"}`),
+			"/accumulo/uuid-1/namespaces/+accumulo/tables": []byte(`{"+r":"root"}`),
+			"/accumulo/uuid-1/namespaces/ns1/tables":       []byte(`{"2":"events"}`),
+		},
+		reads: map[string]int{},
+	}
+	connector := newAutoDiscoveryConnector(t, locator)
+
+	namespace, err := connector.NamespaceByName(context.Background(), "analytics")
+	if err != nil || namespace != (Namespace{Name: "analytics", ID: "ns1"}) {
+		t.Fatalf("NamespaceByName(analytics) = %#v, %v", namespace, err)
+	}
+	table, err := connector.TableByName(context.Background(), "analytics.events")
+	if err != nil || table != (Table{Name: "analytics.events", ID: "2"}) {
+		t.Fatalf("TableByName(analytics.events) = %#v, %v", table, err)
+	}
+	if exists, err := connector.TableExists(context.Background(), "events"); err != nil || !exists {
+		t.Fatalf("TableExists(events) = %v, %v", exists, err)
+	}
+	namespaces, err := connector.Namespaces(context.Background())
+	if err != nil || len(namespaces) != 3 {
+		t.Fatalf("Namespaces() = %#v, %v", namespaces, err)
+	}
+	if tables, err := connector.Tables(context.Background()); err != nil || len(tables) != 3 {
+		t.Fatalf("Tables() = %#v, %v", tables, err)
+	}
+	if got := locator.reads["/accumulo/uuid-1/namespaces"]; got != 1 {
+		t.Fatalf("namespace map reads = %d, want 1 shared warm-cache read", got)
+	}
+
+	locator.mu.Lock()
+	locator.data["/accumulo/uuid-1/namespaces"] = []byte(`{"+accumulo":"accumulo","+default":"","ns1":"analytics","ns2":"ingest"}`)
+	locator.data["/accumulo/uuid-1/namespaces/ns2/tables"] = []byte(`{"4":"logs"}`)
+	locator.mu.Unlock()
+	if err := connector.InvalidateDiscovery(); err != nil {
+		t.Fatal(err)
+	}
+	namespace, err = connector.NamespaceByName(context.Background(), "ingest")
+	if err != nil || namespace != (Namespace{Name: "ingest", ID: "ns2"}) {
+		t.Fatalf("NamespaceByName(ingest) = %#v, %v", namespace, err)
+	}
+	table, err = connector.TableByName(context.Background(), "ingest.logs")
+	if err != nil || table != (Table{Name: "ingest.logs", ID: "4"}) {
+		t.Fatalf("TableByName(ingest.logs) = %#v, %v", table, err)
+	}
+	if got := locator.reads["/accumulo/uuid-1/namespaces"]; got != 2 {
+		t.Fatalf("namespace map reads = %d, want 2 after shared invalidation", got)
+	}
+}
+
+func TestConnectorSharedNamespaceResolverPropagatesMalformedMaps(t *testing.T) {
+	tests := []struct {
+		name string
+		data []byte
+		want string
+	}{
+		{
+			name: "malformed json",
+			data: []byte("{"),
+			want: "unexpected end of JSON input",
+		},
+		{
+			name: "duplicate namespace names",
+			data: []byte(`{"+accumulo":"accumulo","+default":"","ns1":"analytics","ns2":"analytics"}`),
+			want: `duplicates namespace name "analytics"`,
+		},
+		{
+			name: "missing built in namespace",
+			data: []byte(`{"+default":""}`),
+			want: `missing built-in namespace ID "+accumulo"`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			connector := newAutoDiscoveryConnector(t, &namespaceDiscoveryLocator{
+				data: map[string][]byte{
+					"/accumulo/uuid-1/namespaces": tt.data,
+				},
+			})
+			_, namespaceErr := connector.NamespaceByName(context.Background(), "analytics")
+			if namespaceErr == nil || !strings.Contains(namespaceErr.Error(), tt.want) {
+				t.Fatalf("NamespaceByName error = %v, want substring %q", namespaceErr, tt.want)
+			}
+
+			_, tableErr := connector.TableByName(context.Background(), "analytics.events")
+			if tableErr == nil || !strings.Contains(tableErr.Error(), tt.want) {
+				t.Fatalf("TableByName error = %v, want substring %q", tableErr, tt.want)
+			}
+			if errors.Is(tableErr, ErrTableNotFound) {
+				t.Fatalf("TableByName incorrectly mapped shared namespace error to ErrTableNotFound: %v", tableErr)
+			}
+		})
+	}
+}
+
 func TestNamespaceDiscoveryConcurrentInvalidation(t *testing.T) {
 	connector := testConnectorWithRealNamespaceResolver(t, &namespaceDiscoveryLocator{
 		data: map[string][]byte{
@@ -321,6 +450,76 @@ func TestNamespaceDiscoveryConcurrentInvalidation(t *testing.T) {
 							errCh <- err
 						} else {
 							errCh <- errors.New("NamespaceExists returned false")
+						}
+					}
+				default:
+					if err := connector.InvalidateDiscovery(); err != nil {
+						errCh <- err
+					}
+				}
+			}
+		}(g)
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestConnectorSharedNamespaceResolverConcurrentLookups(t *testing.T) {
+	connector := newAutoDiscoveryConnector(t, &namespaceDiscoveryLocator{
+		data: map[string][]byte{
+			"/accumulo/uuid-1/namespaces":                  []byte(`{"+accumulo":"accumulo","+default":"","ns1":"analytics"}`),
+			"/accumulo/uuid-1/namespaces/+default/tables":  []byte(`{"1":"events"}`),
+			"/accumulo/uuid-1/namespaces/+accumulo/tables": []byte(`{"+r":"root"}`),
+			"/accumulo/uuid-1/namespaces/ns1/tables":       []byte(`{"2":"events"}`),
+		},
+	})
+
+	const goroutines = 10
+	const iterations = 200
+
+	errCh := make(chan error, goroutines*iterations)
+	var wg sync.WaitGroup
+	for g := 0; g < goroutines; g++ {
+		wg.Add(1)
+		go func(worker int) {
+			defer wg.Done()
+			for i := 0; i < iterations; i++ {
+				switch worker % 6 {
+				case 0:
+					if _, err := connector.Namespaces(context.Background()); err != nil {
+						errCh <- err
+					}
+				case 1:
+					if namespace, err := connector.NamespaceByName(context.Background(), "analytics"); err != nil || namespace.ID != "ns1" {
+						if err != nil {
+							errCh <- err
+						} else {
+							errCh <- errors.New("NamespaceByName returned wrong ID")
+						}
+					}
+				case 2:
+					if _, err := connector.Tables(context.Background()); err != nil {
+						errCh <- err
+					}
+				case 3:
+					if table, err := connector.TableByName(context.Background(), "analytics.events"); err != nil || table.ID != "2" {
+						if err != nil {
+							errCh <- err
+						} else {
+							errCh <- errors.New("TableByName returned wrong ID")
+						}
+					}
+				case 4:
+					if exists, err := connector.TableExists(context.Background(), "events"); err != nil || !exists {
+						if err != nil {
+							errCh <- err
+						} else {
+							errCh <- errors.New("TableExists returned false")
 						}
 					}
 				default:

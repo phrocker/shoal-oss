@@ -9,6 +9,8 @@ import (
 	"path"
 	"strings"
 	"sync"
+
+	nslookup "github.com/phrocker/shoal/internal/namespaces"
 )
 
 const defaultNamespaceName = ""
@@ -22,28 +24,40 @@ type Locator interface {
 	GetRaw(context.Context, string) ([]byte, error)
 }
 
+// NamespaceResolver is the shared namespace lookup dependency needed for
+// table-name resolution.
+type NamespaceResolver interface {
+	ResolveID(context.Context, string) (string, error)
+	List(context.Context) (map[string]string, error)
+}
+
 // Resolver caches table name and ID mappings until explicitly invalidated.
 type Resolver struct {
-	locator Locator
+	locator    Locator
+	namespaces NamespaceResolver
 
+	opMu     sync.Mutex
 	mu       sync.RWMutex
 	nameToID map[string]string
 	idToName map[string]string
 
-	namespaceNames   map[string]string
 	loadedNamespaces map[string]struct{}
 }
 
-// NewResolver creates a table-name resolver backed by locator.
-func NewResolver(locator Locator) *Resolver {
+// NewResolver creates a table-name resolver backed by locator and the shared
+// namespace resolver.
+func NewResolver(locator Locator, namespaces NamespaceResolver) *Resolver {
 	if locator == nil {
 		panic("tablenames.NewResolver: nil Locator")
 	}
+	if namespaces == nil {
+		panic("tablenames.NewResolver: nil NamespaceResolver")
+	}
 	return &Resolver{
 		locator:          locator,
+		namespaces:       namespaces,
 		nameToID:         map[string]string{},
 		idToName:         map[string]string{},
-		namespaceNames:   nil,
 		loadedNamespaces: map[string]struct{}{},
 	}
 }
@@ -53,6 +67,8 @@ func (r *Resolver) ResolveID(ctx context.Context, tableName string) (string, err
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
+	r.opMu.Lock()
+	defer r.opMu.Unlock()
 	r.mu.RLock()
 	if id, ok := r.nameToID[tableName]; ok {
 		r.mu.RUnlock()
@@ -61,9 +77,12 @@ func (r *Resolver) ResolveID(ctx context.Context, tableName string) (string, err
 	r.mu.RUnlock()
 
 	namespaceName, rawName := splitQualifiedName(tableName)
-	namespaceID, err := r.resolveNamespaceID(ctx, namespaceName)
+	namespaceID, err := r.namespaces.ResolveID(ctx, namespaceName)
 	if err != nil {
-		return "", fmt.Errorf("%w: table %q: %v", ErrTableNotFound, tableName, err)
+		if errors.Is(err, nslookup.ErrNamespaceNotFound) {
+			return "", fmt.Errorf("%w: table %q: %v", ErrTableNotFound, tableName, err)
+		}
+		return "", err
 	}
 	if err := r.loadNamespace(ctx, namespaceID, namespaceName); err != nil {
 		return "", err
@@ -94,6 +113,8 @@ func (r *Resolver) ResolveName(ctx context.Context, tableID string) (string, err
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
+	r.opMu.Lock()
+	defer r.opMu.Unlock()
 	r.mu.RLock()
 	if name, ok := r.idToName[tableID]; ok {
 		r.mu.RUnlock()
@@ -101,11 +122,11 @@ func (r *Resolver) ResolveName(ctx context.Context, tableID string) (string, err
 	}
 	r.mu.RUnlock()
 
-	namespaces, err := r.loadNamespaces(ctx)
+	namespaces, err := r.namespaces.List(ctx)
 	if err != nil {
 		return "", err
 	}
-	for namespaceID, namespaceName := range namespaces {
+	for namespaceName, namespaceID := range namespaces {
 		if err := r.loadNamespace(ctx, namespaceID, namespaceName); err != nil {
 			return "", err
 		}
@@ -124,11 +145,13 @@ func (r *Resolver) List(ctx context.Context) (map[string]string, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	namespaces, err := r.loadNamespaces(ctx)
+	r.opMu.Lock()
+	defer r.opMu.Unlock()
+	namespaces, err := r.namespaces.List(ctx)
 	if err != nil {
 		return nil, err
 	}
-	for namespaceID, namespaceName := range namespaces {
+	for namespaceName, namespaceID := range namespaces {
 		if err := r.loadNamespace(ctx, namespaceID, namespaceName); err != nil {
 			return nil, err
 		}
@@ -139,54 +162,17 @@ func (r *Resolver) List(ctx context.Context) (map[string]string, error) {
 	return tables, nil
 }
 
-// Invalidate clears all cached mappings.
+// Invalidate clears all cached table mappings. Callers that share a
+// NamespaceResolver should invalidate that separately when the namespace map
+// itself may have changed.
 func (r *Resolver) Invalidate() {
+	r.opMu.Lock()
+	defer r.opMu.Unlock()
 	r.mu.Lock()
 	r.nameToID = map[string]string{}
 	r.idToName = map[string]string{}
-	r.namespaceNames = nil
 	r.loadedNamespaces = map[string]struct{}{}
 	r.mu.Unlock()
-}
-
-func (r *Resolver) resolveNamespaceID(ctx context.Context, namespaceName string) (string, error) {
-	namespaces, err := r.loadNamespaces(ctx)
-	if err != nil {
-		return "", err
-	}
-	for id, name := range namespaces {
-		if name == namespaceName {
-			return id, nil
-		}
-	}
-	return "", fmt.Errorf("namespace %q not found", namespaceName)
-}
-
-func (r *Resolver) loadNamespaces(ctx context.Context) (map[string]string, error) {
-	r.mu.RLock()
-	if r.namespaceNames != nil {
-		namespaces := cloneMapping(r.namespaceNames)
-		r.mu.RUnlock()
-		return namespaces, nil
-	}
-	r.mu.RUnlock()
-
-	namespacesPath := path.Join(r.locator.InstancePath(), "namespaces")
-	data, err := r.locator.GetRaw(ctx, namespacesPath)
-	if err != nil {
-		return nil, fmt.Errorf("get %s: %w", namespacesPath, err)
-	}
-	namespaces, err := decodeMappingJSON(data)
-	if err != nil {
-		return nil, fmt.Errorf("decode %s: %w", namespacesPath, err)
-	}
-	r.mu.Lock()
-	if r.namespaceNames == nil {
-		r.namespaceNames = namespaces
-	}
-	cached := cloneMapping(r.namespaceNames)
-	r.mu.Unlock()
-	return cached, nil
 }
 
 func (r *Resolver) loadNamespace(ctx context.Context, namespaceID, namespaceName string) error {
