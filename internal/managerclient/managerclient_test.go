@@ -59,6 +59,43 @@ func TestPooledExecuteLifecycleAndReuse(t *testing.T) {
 	}
 }
 
+func TestPooledExecuteBulkImportLifecycle(t *testing.T) {
+	pooled, pool := newTestPooled(t)
+	defer pool.Close()
+
+	rpc := &fakeFateRPC{id: fateID{Type: 1, UUID: "bulk-1"}}
+	pooled.dial = func(context.Context, transportpool.Key) (io.Closer, error) {
+		return &fakeTransport{rpc: rpc}, nil
+	}
+	pooled.newClient = clientFromFakeTransport
+
+	req := Request{
+		Operation: TableBulkImport,
+		Instance:  FateUser,
+		Arguments: [][]byte{[]byte("t-1"), []byte("hdfs://nn/bulk/events"), []byte("true")},
+		Options:   map[string]string{},
+	}
+	if err := pooled.Execute(context.Background(), "manager:9997", req); err != nil {
+		t.Fatal(err)
+	}
+	if rpc.begin.Load() != 1 || rpc.execute.Load() != 1 || rpc.waitCalls.Load() != 1 || rpc.finish.Load() != 1 {
+		t.Fatalf("calls begin/execute/wait/finish = %d/%d/%d/%d",
+			rpc.begin.Load(), rpc.execute.Load(), rpc.waitCalls.Load(), rpc.finish.Load())
+	}
+	if rpc.request.Operation != TableBulkImport {
+		t.Fatalf("operation = %v, want TableBulkImport", rpc.request.Operation)
+	}
+	wantArgs := []string{"t-1", "hdfs://nn/bulk/events", "true"}
+	if len(rpc.request.Arguments) != len(wantArgs) {
+		t.Fatalf("arguments = %#v, want %v", rpc.request.Arguments, wantArgs)
+	}
+	for i, want := range wantArgs {
+		if got := string(rpc.request.Arguments[i]); got != want {
+			t.Fatalf("argument %d = %q, want %q", i, got, want)
+		}
+	}
+}
+
 func TestPooledFinishesAfterOperationFailure(t *testing.T) {
 	pooled, pool := newTestPooled(t)
 	defer pool.Close()
@@ -489,6 +526,66 @@ func TestWaitForFlushNilRowsAreAbsentOnWire(t *testing.T) {
 	emptyRows.MaxLoops = 1
 	if got, want := thriftFieldIDs(t, emptyRows), []int16{1, 2, 3, 4, 5, 6, 7}; !slices.Equal(got, want) {
 		t.Fatalf("empty-row field IDs = %v, want %v", got, want)
+	}
+}
+
+func TestThriftOperationMapping(t *testing.T) {
+	tests := []struct {
+		op   Operation
+		want manager.TFateOperation
+	}{
+		{TableCreate, manager.TFateOperation_TABLE_CREATE},
+		{TableDelete, manager.TFateOperation_TABLE_DELETE},
+		{TableRename, manager.TFateOperation_TABLE_RENAME},
+		{TableBulkImport, manager.TFateOperation_TABLE_BULK_IMPORT2},
+	}
+	for _, tt := range tests {
+		if got := thriftOperation(tt.op); got != tt.want {
+			t.Fatalf("thriftOperation(%v) = %v, want %v", tt.op, got, tt.want)
+		}
+	}
+}
+
+func TestThriftOperationPanicsOnUnknownOperation(t *testing.T) {
+	defer func() {
+		if recover() == nil {
+			t.Fatal("thriftOperation did not panic on an unknown operation")
+		}
+	}()
+	thriftOperation(Operation(-1))
+}
+
+func TestValidateRequestArgumentCounts(t *testing.T) {
+	args := func(n int) [][]byte {
+		out := make([][]byte, n)
+		for i := range out {
+			out[i] = []byte("x")
+		}
+		return out
+	}
+	tests := []struct {
+		name    string
+		req     Request
+		wantErr bool
+	}{
+		{"create exact", Request{Operation: TableCreate, Instance: FateUser, Arguments: args(5)}, false},
+		{"create short", Request{Operation: TableCreate, Instance: FateUser, Arguments: args(4)}, true},
+		{"delete exact", Request{Operation: TableDelete, Instance: FateUser, Arguments: args(1)}, false},
+		{"delete extra", Request{Operation: TableDelete, Instance: FateUser, Arguments: args(2)}, true},
+		{"rename exact", Request{Operation: TableRename, Instance: FateUser, Arguments: args(2)}, false},
+		{"rename short", Request{Operation: TableRename, Instance: FateUser, Arguments: args(1)}, true},
+		{"bulk import exact", Request{Operation: TableBulkImport, Instance: FateUser, Arguments: args(3)}, false},
+		{"bulk import short", Request{Operation: TableBulkImport, Instance: FateUser, Arguments: args(2)}, true},
+		{"bulk import extra", Request{Operation: TableBulkImport, Instance: FateMeta, Arguments: args(4)}, true},
+		{"unknown operation", Request{Operation: Operation(99), Instance: FateUser, Arguments: args(3)}, true},
+		{"unknown instance", Request{Operation: TableBulkImport, Instance: FateInstance(99), Arguments: args(3)}, true},
+		{"nil argument", Request{Operation: TableBulkImport, Instance: FateUser, Arguments: [][]byte{[]byte("id"), nil, []byte("true")}}, true},
+	}
+	for _, tt := range tests {
+		err := validateRequest(tt.req)
+		if (err != nil) != tt.wantErr {
+			t.Fatalf("%s: validateRequest error = %v, wantErr %v", tt.name, err, tt.wantErr)
+		}
 	}
 }
 

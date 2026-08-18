@@ -33,6 +33,13 @@ const (
 	TableCreate Operation = iota
 	TableDelete
 	TableRename
+	// TableBulkImport submits Accumulo's Bulk Import V2 FATE operation
+	// (TABLE_BULK_IMPORT2). It takes exactly 3 arguments: the destination
+	// table's canonical ID (not its name — unlike every other Operation
+	// here), the bulk directory path, and a "true"/"false" setTime flag. The
+	// caller is responsible for staging the bulk directory (files flat,
+	// loadmap.json written) before submitting; see internal/promotion.
+	TableBulkImport
 )
 
 type FateInstance int
@@ -593,6 +600,8 @@ func thriftOperation(op Operation) manager.TFateOperation {
 		return manager.TFateOperation_TABLE_DELETE
 	case TableRename:
 		return manager.TFateOperation_TABLE_RENAME
+	case TableBulkImport:
+		return manager.TFateOperation_TABLE_BULK_IMPORT2
 	default:
 		panic("managerclient: validated unknown operation")
 	}
@@ -616,6 +625,10 @@ func validateRequest(req Request) error {
 	case TableRename:
 		if len(req.Arguments) != 2 {
 			return fmt.Errorf("managerclient: rename requires 2 arguments, got %d", len(req.Arguments))
+		}
+	case TableBulkImport:
+		if len(req.Arguments) != 3 {
+			return fmt.Errorf("managerclient: bulk import requires 3 arguments, got %d", len(req.Arguments))
 		}
 	default:
 		return fmt.Errorf("managerclient: unknown operation %d", req.Operation)

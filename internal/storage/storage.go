@@ -125,7 +125,6 @@ func Copy(ctx context.Context, src Backend, srcPath string, dst Backend, dstPath
 	if err != nil {
 		return 0, fmt.Errorf("copy: create dst %s: %w", dstPath, err)
 	}
-	defer out.Close()
 
 	const chunk = 64 * 1024
 	buf := make([]byte, chunk)
@@ -137,10 +136,12 @@ func Copy(ctx context.Context, src Backend, srcPath string, dst Backend, dstPath
 		}
 		n, err := in.ReadAt(buf[:want], off)
 		if err != nil && !errors.Is(err, io.EOF) {
+			out.Close()
 			return off, fmt.Errorf("copy: read off=%d: %w", off, err)
 		}
 		if n > 0 {
 			if _, werr := out.Write(buf[:n]); werr != nil {
+				out.Close()
 				return off, fmt.Errorf("copy: write off=%d: %w", off, werr)
 			}
 			off += int64(n)
@@ -148,6 +149,14 @@ func Copy(ctx context.Context, src Backend, srcPath string, dst Backend, dstPath
 		if errors.Is(err, io.EOF) {
 			break
 		}
+	}
+	// Close (not defer) so a flush/commit failure on the destination is
+	// reported instead of silently discarded — mirrors WriteAll. Several
+	// WritableBackend implementations (e.g. object-storage backends that
+	// buffer and upload on Close) can fail here even though every prior
+	// Write succeeded.
+	if err := out.Close(); err != nil {
+		return off, fmt.Errorf("copy: close dst %s: %w", dstPath, err)
 	}
 	return off, nil
 }
