@@ -43,14 +43,21 @@ import (
 // than silently staging incomplete or mismatched data for Accumulo to bulk
 // import.
 //
-// Each destination path is also checked against the source path it would
-// be copied from: if bulkDir happens to alias the RFile's own source
-// location (e.g. bulkDir is set to the export's own tablet directory),
-// copying would truncate the source before it's read (storage.Copy opens
-// the destination for writing, which truncates in place on backends like
-// local, before streaming the source's bytes) and silently "succeed" with
-// zero bytes copied. StageBulkDir rejects that case up front rather than
-// destroying the source export.
+// Every computed destination path is also preflighted against every
+// unique source path in the manifest — not just the source it's paired
+// with — before any copy starts: if bulkDir happens to alias any
+// manifest source location (e.g. bulkDir is set to the export's own
+// tablet directory, or a destination is reached through a symlink/hard
+// link to a *different* RFile's source), copying would truncate that
+// source before it's read (storage.Copy opens the destination for
+// writing, which truncates in place on backends like local, before
+// streaming the source's bytes) and silently "succeed" with zero bytes
+// copied. A same-manifest cross-file alias is particularly dangerous:
+// the truncated file might not be staged until a later iteration of the
+// copy loop, by which point its already-completed VerifyRFileExport
+// check won't be repeated, so the corrupted bytes would be staged and
+// reported as a successful copy. StageBulkDir rejects every such case up
+// front rather than destroying any part of the source export.
 func StageBulkDir(
 	ctx context.Context,
 	src storage.Backend,
@@ -75,6 +82,9 @@ func StageBulkDir(
 	if err := engine.VerifyRFileExport(ctx, src, manifest); err != nil {
 		return nil, fmt.Errorf("promotion: stage: %w", err)
 	}
+	if err := checkNoStagingAliases(flatNames, bulkDir); err != nil {
+		return nil, err
+	}
 	staged := make(map[string]bool, len(manifest.RFiles))
 	for _, rf := range manifest.RFiles {
 		if staged[rf.DestinationPath] {
@@ -85,12 +95,6 @@ func StageBulkDir(
 		}
 		staged[rf.DestinationPath] = true
 		dstPath := joinBulkPath(bulkDir, flatNames[rf.DestinationPath])
-		if stagePathsAlias(rf.DestinationPath, dstPath) {
-			return nil, fmt.Errorf(
-				"promotion: stage %s: bulk directory %s resolves to the same location as the source file; refusing to copy in place",
-				rf.DestinationPath, bulkDir,
-			)
-		}
 		if _, err := storage.Copy(ctx, src, rf.DestinationPath, dst, dstPath); err != nil {
 			return nil, fmt.Errorf("promotion: stage %s: %w", rf.DestinationPath, err)
 		}
@@ -99,6 +103,33 @@ func StageBulkDir(
 		return nil, err
 	}
 	return mapping, nil
+}
+
+// checkNoStagingAliases rejects the whole stage before any copy starts if
+// any computed destination path (bulkDir + a flattened name from
+// flatNames) resolves to the same physical location as *any* unique
+// source path in flatNames — not only the source it's paired with.
+// Checking only the 1:1 pairing would miss a destination that aliases a
+// *different* manifest entry's source (for example via a symlink/hard
+// link), which would silently truncate that other file before it's ever
+// copied.
+func checkNoStagingAliases(flatNames map[string]string, bulkDir string) error {
+	srcPaths := make([]string, 0, len(flatNames))
+	for srcPath := range flatNames {
+		srcPaths = append(srcPaths, srcPath)
+	}
+	for _, srcPath := range srcPaths {
+		dstPath := joinBulkPath(bulkDir, flatNames[srcPath])
+		for _, otherSrcPath := range srcPaths {
+			if stagePathsAlias(otherSrcPath, dstPath) {
+				return fmt.Errorf(
+					"promotion: stage %s: bulk directory %s resolves to the same location as source file %s; refusing to copy in place",
+					srcPath, bulkDir, otherSrcPath,
+				)
+			}
+		}
+	}
+	return nil
 }
 
 // stagePathsAlias reports whether srcPath (opened for reading on src) and

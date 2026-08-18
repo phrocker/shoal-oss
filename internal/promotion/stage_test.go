@@ -426,3 +426,65 @@ func TestStageBulkDirRejectsInPlaceBulkDirViaRelativePath(t *testing.T) {
 		t.Fatalf("source file corrupted by rejected in-place stage: got %d bytes, want %d bytes intact", len(got), len(content))
 	}
 }
+
+// TestStageBulkDirRejectsCrossFileAliasBeforeCopying proves the preflight
+// check catches a destination that aliases a *different* manifest
+// entry's source file, not just its own. Here bulkDir/A.rf is a symlink
+// to B's source file: without checking every destination against every
+// unique source, StageBulkDir would only compare A's destination to A's
+// own source (finding no alias), start copying, and truncate B's source
+// through the symlink before B is ever staged or re-verified.
+func TestStageBulkDirRejectsCrossFileAliasBeforeCopying(t *testing.T) {
+	root := t.TempDir()
+	exportDir := filepath.Join(root, "export")
+	if err := os.MkdirAll(exportDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	aPath := filepath.Join(exportDir, "A.rf")
+	bPath := filepath.Join(exportDir, "B.rf")
+	aContent := []byte("A file bytes")
+	bContent := []byte("B file bytes that must survive a rejected stage")
+	if err := os.WriteFile(aPath, aContent, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(bPath, bContent, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	bulkDir := filepath.Join(root, "bulk")
+	if err := os.MkdirAll(bulkDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// A's computed destination (bulkDir/A.rf, since flattenNames uses the
+	// basename) is a symlink to B's source -- a different RFile entirely.
+	aDstPath := filepath.Join(bulkDir, "A.rf")
+	if err := os.Symlink(bPath, aDstPath); err != nil {
+		t.Skipf("symlink not supported in this environment: %v", err)
+	}
+
+	aSum := sha256.Sum256(aContent)
+	bSum := sha256.Sum256(bContent)
+	manifest := &engine.RFileExportManifest{
+		Version:     engine.RFileExportManifestVersion,
+		SourceTable: "events",
+		Tablets:     []engine.RFileExportTablet{{Index: 0}},
+		RFiles: []engine.RFileExportFile{
+			{TabletIndex: 0, DestinationPath: aPath, Size: int64(len(aContent)), SHA256: hex.EncodeToString(aSum[:])},
+			{TabletIndex: 0, DestinationPath: bPath, Size: int64(len(bContent)), SHA256: hex.EncodeToString(bSum[:])},
+		},
+	}
+
+	be := local.New()
+	ctx := context.Background()
+	if _, err := StageBulkDir(ctx, be, manifest, be, bulkDir); err == nil {
+		t.Fatal("StageBulkDir with a destination aliasing a different RFile's source = nil error, want error")
+	}
+
+	got, err := os.ReadFile(bPath)
+	if err != nil {
+		t.Fatalf("source file B missing after rejected stage: %v", err)
+	}
+	if string(got) != string(bContent) {
+		t.Fatalf("source file B corrupted by rejected stage: got %q, want %q", got, bContent)
+	}
+}
