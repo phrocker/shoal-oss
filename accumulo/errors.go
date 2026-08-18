@@ -66,4 +66,35 @@ var (
 	// after the bounded tablet re-resolution retries were exhausted, which
 	// happens when tablets keep moving or splitting underneath the client.
 	ErrTableSplitsIncomplete = errors.New("accumulo: table splits incomplete")
+
+	// ErrInvalidUser indicates that a user name is empty or otherwise invalid.
+	ErrInvalidUser = errors.New("accumulo: invalid user")
+
+	// ErrUserExists indicates that a requested user already exists.
+	ErrUserExists = errors.New("accumulo: user exists")
+
+	// ErrUserNotFound indicates that a requested user does not exist.
+	ErrUserNotFound = errors.New("accumulo: user not found")
+
+	// ErrInvalidPassword indicates that a nil password was supplied.
+	ErrInvalidPassword = errors.New("accumulo: invalid password")
+
+	// ErrBadCredentials indicates rejected, invalid, or expired credentials.
+	ErrBadCredentials = errors.New("accumulo: bad credentials")
+
+	// ErrInvalidAuthorizations indicates an invalid authorization set.
+	ErrInvalidAuthorizations = errors.New("accumulo: invalid authorizations")
+
+	// ErrInvalidPermission indicates a permission outside Accumulo's wire enum.
+	ErrInvalidPermission = errors.New("accumulo: invalid permission")
+
+	// ErrInvalidNamespaceName indicates a rejected namespace name.
+	ErrInvalidNamespaceName = errors.New("accumulo: invalid namespace name")
+
+	// ErrUnsupportedOperation indicates that the server rejected an operation
+	// as unsupported.
+	ErrUnsupportedOperation = errors.New("accumulo: unsupported operation")
+
+	// ErrSecurityUnavailable indicates a server-side security subsystem failure.
+	ErrSecurityUnavailable = errors.New("accumulo: security subsystem unavailable")
 )

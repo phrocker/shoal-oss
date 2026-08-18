@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"sort"
-	"strings"
 	"time"
 
 	"github.com/phrocker/shoal/internal/managerclient"
@@ -174,59 +173,6 @@ func (c *Connector) AddTableSplits(ctx context.Context, tableName string, splits
 		discovery: discovery,
 		retry:     defaultSplitRetryPolicy(),
 	}, pending)
-}
-
-func validateExistingTableName(tableName string) error {
-	if tableName == "" {
-		return fmt.Errorf("%w: empty table name", ErrInvalidTableName)
-	}
-	dot := strings.IndexByte(tableName, '.')
-	if dot == 0 {
-		return fmt.Errorf(
-			"%w: table name must include a namespace before '.'",
-			ErrInvalidTableName,
-		)
-	}
-	tablePart := tableName
-	if dot > 0 {
-		namespacePart := tableName[:dot]
-		if !isExistingTableNameSegment(namespacePart) {
-			return fmt.Errorf(
-				"%w: namespace %q contains invalid characters",
-				ErrInvalidTableName,
-				namespacePart,
-			)
-		}
-		tablePart = tableName[dot+1:]
-	}
-	if strings.TrimSpace(tablePart) == "" {
-		return fmt.Errorf("%w: table name must not be blank", ErrInvalidTableName)
-	}
-	if !isExistingTableNameSegment(tablePart) {
-		return fmt.Errorf(
-			"%w: table name %q contains invalid characters",
-			ErrInvalidTableName,
-			tablePart,
-		)
-	}
-	return nil
-}
-
-func isExistingTableNameSegment(segment string) bool {
-	if segment == "" {
-		return false
-	}
-	for _, r := range segment {
-		switch {
-		case r == '_':
-		case r >= '0' && r <= '9':
-		case r >= 'A' && r <= 'Z':
-		case r >= 'a' && r <= 'z':
-		default:
-			return false
-		}
-	}
-	return true
 }
 
 func requireTableNotOffline(
