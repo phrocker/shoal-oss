@@ -107,8 +107,7 @@ cribs land.
 - `core/src/main/thrift/security.thrift` — `TCredentials`
 - `core/src/main/thrift/client.thrift` — `TInfo`
 
-### Security administration (Accumulo revision
-`317c288568e9c46e7854aafb8bb8c4fda6260b12`)
+### Security administration (Accumulo revision `317c288568e9c46e7854aafb8bb8c4fda6260b12`)
 - `core/src/main/java/org/apache/accumulo/core/clientImpl/SecurityOperationsImpl.java`
   - all user, authorization, and permission operations use the multiplexed
     `ClientService` (`client`) rather than the Manager service
