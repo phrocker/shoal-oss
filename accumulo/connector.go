@@ -26,6 +26,7 @@ type Connector struct {
 	ingest      ingestclient.Adapter
 	manager     managerclient.Adapter
 	managerAddr managerAddressResolver
+	clientAddr  clientServiceAddressResolver
 	discovery   *connectorDiscovery
 	closed      bool
 }
@@ -113,6 +114,7 @@ func NewConnector(instance Instance, credentials Credentials, opts ConnectorOpti
 			walker := metadata.NewWalkerWithLifecycle(locator, scan)
 			connector.discovery = newConnectorDiscovery(walker, tablenames.NewResolver(locator))
 			connector.managerAddr = zkManagerAddressResolver{locator: locator}
+			connector.clientAddr = zkClientServiceAddressResolver{locator: locator}
 		}
 	}
 	return connector, nil
