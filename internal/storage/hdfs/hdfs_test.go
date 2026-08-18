@@ -122,6 +122,10 @@ func TestBackendCreateFailurePreservesExistingFile(t *testing.T) {
 	if got := string(client.files["/tables/1.rf"]); got != "old" {
 		t.Fatalf("existing contents = %q, want old", got)
 	}
+	client.lastWriter.failClose = false
+	if err := w.(storage.Aborter).Abort(); err != nil {
+		t.Fatalf("Abort after failed Close: %v", err)
+	}
 }
 
 func TestBackendCreateRetriesReplicationInProgress(t *testing.T) {
@@ -401,6 +405,43 @@ func TestBackendCreateStopsReplicationRetryOnContextDeadline(t *testing.T) {
 	}
 }
 
+func TestCloseAfterReplicationAppliesAndRestoresRetryDeadline(t *testing.T) {
+	writer := &deadlineBlockingWriter{}
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	err := closeAfterReplication(ctx, writer)
+	if !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("closeAfterReplication error = %v, want deadline exceeded", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("closeAfterReplication took %v; blocked Close was not interrupted", elapsed)
+	}
+	if len(writer.deadlines) < 2 {
+		t.Fatalf("SetDeadline calls = %v, want retry deadline and restoration", writer.deadlines)
+	}
+	if writer.deadlines[0].IsZero() {
+		t.Fatal("retry deadline was not applied before Close")
+	}
+	if !writer.deadlines[len(writer.deadlines)-1].Equal(writer.deadlines[0]) {
+		t.Fatalf("restored deadline = %v, want original context deadline %v", writer.deadlines[len(writer.deadlines)-1], writer.deadlines[0])
+	}
+}
+
+func TestCloseAfterReplicationClearsDeadlineForBackgroundContext(t *testing.T) {
+	writer := &immediateErrorDeadlineWriter{}
+	if err := closeAfterReplication(context.Background(), writer); !errors.Is(err, errInjectedClose) {
+		t.Fatalf("closeAfterReplication error = %v, want %v", err, errInjectedClose)
+	}
+	if len(writer.deadlines) != 2 {
+		t.Fatalf("SetDeadline calls = %v, want retry deadline and clear", writer.deadlines)
+	}
+	if writer.deadlines[0].IsZero() || !writer.deadlines[1].IsZero() {
+		t.Fatalf("deadlines = %v, want non-zero then zero", writer.deadlines)
+	}
+}
+
 func TestBackendAbortPreservesExistingTargetAndRemovesTemp(t *testing.T) {
 	client := newFakeClient()
 	client.files["/tables/1.rf"] = []byte("old")
@@ -607,6 +648,36 @@ type fakeWriter struct {
 	client    *fakeClient
 	failClose bool
 	deadline  time.Time
+}
+
+type deadlineBlockingWriter struct {
+	deadlines []time.Time
+}
+
+func (w *deadlineBlockingWriter) Write(p []byte) (int, error) { return len(p), nil }
+func (w *deadlineBlockingWriter) Close() error {
+	deadline := w.deadlines[len(w.deadlines)-1]
+	timer := time.NewTimer(time.Until(deadline))
+	defer timer.Stop()
+	<-timer.C
+	return os.ErrDeadlineExceeded
+}
+func (w *deadlineBlockingWriter) SetDeadline(deadline time.Time) error {
+	w.deadlines = append(w.deadlines, deadline)
+	return nil
+}
+
+var errInjectedClose = errors.New("injected close failure")
+
+type immediateErrorDeadlineWriter struct {
+	deadlines []time.Time
+}
+
+func (w *immediateErrorDeadlineWriter) Write(p []byte) (int, error) { return len(p), nil }
+func (w *immediateErrorDeadlineWriter) Close() error                { return errInjectedClose }
+func (w *immediateErrorDeadlineWriter) SetDeadline(deadline time.Time) error {
+	w.deadlines = append(w.deadlines, deadline)
+	return nil
 }
 
 func (w *fakeWriter) Close() error {

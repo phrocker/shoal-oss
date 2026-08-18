@@ -244,10 +244,10 @@ func (w *writer) Close() error {
 	if w.closed {
 		return nil
 	}
-	w.closed = true
 	if err := w.inner.Close(); err != nil {
 		return fmt.Errorf("gcs: close writer: %w", err)
 	}
+	w.closed = true
 	return nil
 }
 

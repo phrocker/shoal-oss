@@ -52,7 +52,8 @@ func (b *Backend) Create(_ context.Context, path string) (storage.Writer, error)
 			return nil, fmt.Errorf("local: mkdir %s: %w", dir, err)
 		}
 	}
-	f, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".shoal-tmp-*")
+	temp := filepath.Join(filepath.Dir(path), filepath.Base(path)+".shoal-tmp-"+uuid.NewString())
+	f, err := os.OpenFile(temp, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o644)
 	if err != nil {
 		return nil, fmt.Errorf("local: create temporary file for %s: %w", path, err)
 	}
@@ -100,11 +101,12 @@ func (l *file) Close() error                            { return l.f.Close() }
 func (l *file) Size() int64                             { return l.size }
 
 type writer struct {
-	file    *os.File
-	temp    string
-	target  string
-	closed  bool
-	aborted bool
+	file       *os.File
+	temp       string
+	target     string
+	closed     bool
+	aborted    bool
+	fileClosed bool
 }
 
 func (w *writer) Write(p []byte) (int, error) {
@@ -121,11 +123,12 @@ func (w *writer) Close() error {
 	if w.closed {
 		return nil
 	}
-	w.closed = true
 	if err := w.file.Close(); err != nil {
+		w.fileClosed = true
 		_ = os.Remove(w.temp)
 		return fmt.Errorf("local: close temporary file %s: %w", w.temp, err)
 	}
+	w.fileClosed = true
 
 	backup := w.target + ".shoal-backup-" + uuid.NewString()
 	hadOld := true
@@ -160,6 +163,7 @@ func (w *writer) Close() error {
 			return fmt.Errorf("local: remove replacement backup %s: %w", backup, err)
 		}
 	}
+	w.closed = true
 	return nil
 }
 
@@ -173,8 +177,12 @@ func (w *writer) Abort() error {
 	w.aborted = true
 
 	var abortErr error
-	if err := w.file.Close(); err != nil {
-		abortErr = fmt.Errorf("local: close temporary file %s: %w", w.temp, err)
+	if !w.fileClosed {
+		err := w.file.Close()
+		w.fileClosed = true
+		if err != nil {
+			abortErr = fmt.Errorf("local: close temporary file %s: %w", w.temp, err)
+		}
 	}
 	if err := os.Remove(w.temp); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		abortErr = errors.Join(abortErr, fmt.Errorf("local: remove temporary file %s: %w", w.temp, err))

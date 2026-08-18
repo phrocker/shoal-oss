@@ -185,10 +185,10 @@ func Copy(ctx context.Context, src Backend, srcPath string, dst Backend, dstPath
 	if err := ctx.Err(); err != nil {
 		return written, err
 	}
-	needsCleanup = false
 	if err := out.Close(); err != nil {
 		return written, fmt.Errorf("copy: close dst %s: %w", dstPath, err)
 	}
+	needsCleanup = false
 	return written, nil
 }
 
@@ -196,9 +196,10 @@ func Copy(ctx context.Context, src Backend, srcPath string, dst Backend, dstPath
 // slice via ReadAt. This is the "pull-through" read used when an RFile is
 // faulted into the local byte cache: one object fetch, fully resident.
 // For large objects where only a few blocks are needed, prefer wiring the
-// File's ReadAt directly into the reader instead of ReadAll. ctx is polled
-// before each backend read; once a read is already blocked, ReadAll waits for
-// it to return before observing ctx.Err().
+// File's ReadAt directly into the reader instead of ReadAll. Reads are bounded
+// to 64KB, and ctx is polled before and immediately after each backend read.
+// Once a read is already blocked, ReadAll waits for it to return before
+// observing ctx.Err().
 func ReadAll(ctx context.Context, b Backend, path string) ([]byte, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -208,6 +209,9 @@ func ReadAll(ctx context.Context, b Backend, path string) ([]byte, error) {
 		return nil, err
 	}
 	defer f.Close()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	size := f.Size()
 	if size == 0 {
 		return []byte{}, nil
@@ -218,7 +222,11 @@ func ReadAll(ctx context.Context, b Backend, path string) ([]byte, error) {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		n, err := f.ReadAt(buf[off:], off)
+		end := min(off+transferChunkSize, size)
+		n, err := f.ReadAt(buf[off:end], off)
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
 		off += int64(n)
 		if err != nil {
 			if errors.Is(err, io.EOF) && off >= size {
@@ -274,10 +282,10 @@ func WriteAll(ctx context.Context, b Backend, path string, data []byte) (err err
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	needsCleanup = false
 	if err := w.Close(); err != nil {
 		return fmt.Errorf("writeall: close %s: %w", path, err)
 	}
+	needsCleanup = false
 	return nil
 }
 

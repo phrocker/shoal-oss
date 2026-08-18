@@ -327,10 +327,10 @@ func (w *writer) Close() error {
 	if w.closed {
 		return nil
 	}
-	w.closed = true
 	if _, err := w.blob.UploadBuffer(w.ctx, w.buf.Bytes(), nil); err != nil {
 		return fmt.Errorf("azure: upload az://%s/%s: %w", w.container, w.name, err)
 	}
+	w.closed = true
 	return nil
 }
 

@@ -412,13 +412,14 @@ func (f *file) Close() error {
 func (f *file) Size() int64 { return f.size }
 
 type replaceWriter struct {
-	client  Client
-	writer  storage.Writer
-	ctx     context.Context
-	temp    string
-	target  string
-	closed  bool
-	aborted bool
+	client       Client
+	writer       storage.Writer
+	ctx          context.Context
+	temp         string
+	target       string
+	closed       bool
+	aborted      bool
+	writerClosed bool
 }
 
 func (w *replaceWriter) Write(p []byte) (int, error) {
@@ -435,11 +436,11 @@ func (w *replaceWriter) Close() error {
 	if w.closed {
 		return errors.New("hdfs: writer already closed")
 	}
-	w.closed = true
 	if err := closeAfterReplication(w.ctx, w.writer); err != nil {
 		_ = w.client.Remove(w.temp)
 		return fmt.Errorf("hdfs: close temporary file %s: %w", w.temp, err)
 	}
+	w.writerClosed = true
 
 	backup := w.target + ".shoal-backup-" + uuid.NewString()
 	hadOld := true
@@ -474,6 +475,7 @@ func (w *replaceWriter) Close() error {
 			return fmt.Errorf("hdfs: remove replacement backup %s: %w", backup, err)
 		}
 	}
+	w.closed = true
 	return nil
 }
 
@@ -487,11 +489,12 @@ func (w *replaceWriter) Abort() error {
 	w.aborted = true
 
 	var abortErr error
-	if err := clearDeadline(w.writer); err != nil {
-		abortErr = fmt.Errorf("hdfs: clear deadline on temporary file %s: %w", w.temp, err)
-	}
-	if err := closeAfterReplication(context.Background(), w.writer); err != nil {
-		abortErr = errors.Join(abortErr, fmt.Errorf("hdfs: close temporary file %s: %w", w.temp, err))
+	if !w.writerClosed {
+		if err := closeAfterReplication(context.Background(), w.writer); err != nil {
+			abortErr = fmt.Errorf("hdfs: close temporary file %s: %w", w.temp, err)
+		} else {
+			w.writerClosed = true
+		}
 	}
 	if err := w.client.Remove(w.temp); err != nil && !isNotFound(err) {
 		abortErr = errors.Join(abortErr, fmt.Errorf("hdfs: remove temporary file %s: %w", w.temp, err))
@@ -499,7 +502,7 @@ func (w *replaceWriter) Abort() error {
 	return abortErr
 }
 
-func closeAfterReplication(ctx context.Context, writer storage.Writer) error {
+func closeAfterReplication(ctx context.Context, writer storage.Writer) (retErr error) {
 	const (
 		initialDelay = 100 * time.Millisecond
 		maxDelay     = time.Second
@@ -509,6 +512,23 @@ func closeAfterReplication(ctx context.Context, writer storage.Writer) error {
 	ctx = contextOrBackground(ctx)
 	retryCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
+	if err := applyDeadline(retryCtx, writer); err != nil {
+		return err
+	}
+	defer func() {
+		if retErr == nil {
+			return
+		}
+		var restoreErr error
+		if _, ok := ctx.Deadline(); ok {
+			restoreErr = applyDeadline(ctx, writer)
+		} else {
+			restoreErr = clearDeadline(writer)
+		}
+		if restoreErr != nil {
+			retErr = errors.Join(retErr, restoreErr)
+		}
+	}()
 	delay := initialDelay
 	for {
 		err := writer.Close()

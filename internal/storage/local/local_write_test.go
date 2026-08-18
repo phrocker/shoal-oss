@@ -85,6 +85,78 @@ func TestLocal_CreateReplacesExisting(t *testing.T) {
 	}
 }
 
+func TestLocal_CreateUsesOpenFileModeSubjectToUmask(t *testing.T) {
+	dir := t.TempDir()
+	referencePath := filepath.Join(dir, "reference")
+	reference, err := os.OpenFile(referencePath, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reference.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	path := filepath.Join(dir, "created")
+	w, err := New().Create(context.Background(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	referenceInfo, err := os.Stat(referencePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	createdInfo, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := createdInfo.Mode().Perm(), referenceInfo.Mode().Perm(); got != want {
+		t.Fatalf("created mode = %04o, want OpenFile(0644) mode %04o", got, want)
+	}
+}
+
+func TestLocal_CreateReplacementUsesOpenFileMode(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "replaced")
+	if err := os.WriteFile(path, []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	referencePath := filepath.Join(dir, "reference")
+	reference, err := os.OpenFile(referencePath, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reference.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	w, err := New().Create(context.Background(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write([]byte("new")); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	referenceInfo, err := os.Stat(referencePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replacedInfo, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := replacedInfo.Mode().Perm(), referenceInfo.Mode().Perm(); got != want {
+		t.Fatalf("replacement mode = %04o, want OpenFile(0644) mode %04o", got, want)
+	}
+}
+
 func TestLocal_AbortPreservesExistingFile(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "x.bin")
@@ -114,5 +186,28 @@ func TestLocal_AbortPreservesExistingFile(t *testing.T) {
 	}
 	if string(got) != "old" {
 		t.Fatalf("got %q, want original file preserved", got)
+	}
+}
+
+func TestLocal_AbortAfterFailedCloseRemovesTemp(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "out.bin")
+	w, err := New().Create(context.Background(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	localWriter := w.(*writer)
+	temp := localWriter.temp
+	if err := localWriter.file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err == nil {
+		t.Fatal("Close succeeded after the temporary file was closed")
+	}
+	if err := w.(storage.Aborter).Abort(); err != nil {
+		t.Fatalf("Abort after failed Close: %v", err)
+	}
+	if _, err := os.Stat(temp); !os.IsNotExist(err) {
+		t.Fatalf("temporary file still exists after Abort: %v", err)
 	}
 }

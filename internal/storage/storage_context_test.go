@@ -57,6 +57,23 @@ func TestCopy_PropagatesCloseError(t *testing.T) {
 	}
 }
 
+func TestCopy_CloseErrorAbortsAndJoinsCleanupError(t *testing.T) {
+	src := memory.New()
+	src.Put("/src", []byte("hello"))
+
+	closeErr := errors.New("close failed")
+	abortErr := errors.New("abort failed")
+	writer := &recordingAbortWriter{closeErr: closeErr, abortErr: abortErr}
+
+	_, err := storage.Copy(context.Background(), src, "/src", writerBackend{writer: writer}, "/dst")
+	if !errors.Is(err, closeErr) || !errors.Is(err, abortErr) {
+		t.Fatalf("Copy error = %v, want joined close and abort errors", err)
+	}
+	if writer.closeCalls != 1 || writer.abortCalls != 1 {
+		t.Fatalf("Close calls = %d, Abort calls = %d; want 1 each", writer.closeCalls, writer.abortCalls)
+	}
+}
+
 func TestCopy_SuccessfulAbortableWriterClosesWithoutAbort(t *testing.T) {
 	src := memory.New()
 	src.Put("/src", []byte("hello"))
@@ -102,6 +119,38 @@ func TestReadAll_CanceledReadWaitsForBlockedCall(t *testing.T) {
 	}
 }
 
+func TestReadAll_BoundsReadRequestsAndChecksFinalCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	file := &recordingReadFile{
+		data:   bytes.Repeat([]byte("x"), testTransferChunkSize+1),
+		cancel: cancel,
+	}
+
+	_, err := storage.ReadAll(ctx, fileBackend{file: file}, "/src")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("ReadAll error = %v, want context.Canceled", err)
+	}
+	if file.maxRequest != testTransferChunkSize {
+		t.Fatalf("largest ReadAt request = %d, want %d", file.maxRequest, testTransferChunkSize)
+	}
+	if file.readCalls != 2 {
+		t.Fatalf("ReadAt calls = %d, want 2", file.readCalls)
+	}
+}
+
+func TestReadAll_CanceledDuringOpenDoesNotReturnEmptySuccess(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	backend := openFuncBackend(func(context.Context, string) (storage.File, error) {
+		cancel()
+		return &recordingReadFile{}, nil
+	})
+
+	got, err := storage.ReadAll(ctx, backend, "/empty")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("ReadAll = %v, %v; want context.Canceled", got, err)
+	}
+}
+
 func TestWriteAll_CanceledAbortableWriterAbortsWithoutClose(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	data := bytes.Repeat([]byte("x"), 2*testTransferChunkSize)
@@ -140,6 +189,20 @@ func TestWriteAll_AbortErrorJoinsPrimaryError(t *testing.T) {
 	}
 	if writer.closeCalls != 0 {
 		t.Fatalf("Close calls = %d, want 0", writer.closeCalls)
+	}
+}
+
+func TestWriteAll_CloseErrorAbortsAndJoinsCleanupError(t *testing.T) {
+	closeErr := errors.New("close failed")
+	abortErr := errors.New("abort failed")
+	writer := &recordingAbortWriter{closeErr: closeErr, abortErr: abortErr}
+
+	err := storage.WriteAll(context.Background(), writerBackend{writer: writer}, "/dst", []byte("hello"))
+	if !errors.Is(err, closeErr) || !errors.Is(err, abortErr) {
+		t.Fatalf("WriteAll error = %v, want joined close and abort errors", err)
+	}
+	if writer.closeCalls != 1 || writer.abortCalls != 1 {
+		t.Fatalf("Close calls = %d, Abort calls = %d; want 1 each", writer.closeCalls, writer.abortCalls)
 	}
 }
 
@@ -203,6 +266,12 @@ type fileBackend struct {
 
 func (b fileBackend) Open(context.Context, string) (storage.File, error) {
 	return b.file, nil
+}
+
+type openFuncBackend func(context.Context, string) (storage.File, error)
+
+func (f openFuncBackend) Open(ctx context.Context, path string) (storage.File, error) {
+	return f(ctx, path)
 }
 
 type recordingAbortWriter struct {
@@ -273,6 +342,29 @@ func (f *blockingFile) ReadAt(p []byte, off int64) (int, error) {
 
 func (f *blockingFile) Close() error { return nil }
 func (f *blockingFile) Size() int64  { return 2 }
+
+type recordingReadFile struct {
+	data       []byte
+	cancel     context.CancelFunc
+	readCalls  int
+	maxRequest int
+}
+
+func (f *recordingReadFile) ReadAt(p []byte, off int64) (int, error) {
+	f.readCalls++
+	f.maxRequest = max(f.maxRequest, len(p))
+	n := copy(p, f.data[off:])
+	if off+int64(n) == int64(len(f.data)) && f.cancel != nil {
+		f.cancel()
+	}
+	if n < len(p) {
+		return n, io.EOF
+	}
+	return n, nil
+}
+
+func (f *recordingReadFile) Close() error { return nil }
+func (f *recordingReadFile) Size() int64  { return int64(len(f.data)) }
 
 type blockingWriter struct {
 	buf     bytes.Buffer

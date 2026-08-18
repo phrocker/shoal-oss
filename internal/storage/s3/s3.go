@@ -288,7 +288,6 @@ func (w *writer) Close() error {
 	if w.closed {
 		return nil
 	}
-	w.closed = true
 	_, err := w.client.PutObject(w.ctx, &s3sdk.PutObjectInput{
 		Bucket:        aws.String(w.bucket),
 		Key:           aws.String(w.key),
@@ -298,6 +297,7 @@ func (w *writer) Close() error {
 	if err != nil {
 		return fmt.Errorf("s3: PutObject s3://%s/%s: %w", w.bucket, w.key, err)
 	}
+	w.closed = true
 	return nil
 }
 
