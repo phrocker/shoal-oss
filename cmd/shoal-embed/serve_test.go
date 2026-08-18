@@ -824,6 +824,63 @@ func TestStopForceClosesHTTPOnCanceledContext(t *testing.T) {
 	}
 }
 
+// TestStopWaitsForHTTPAcceptLoopBeforeClosingEngine guards a real gap:
+// http.Server.Shutdown/Close only ask the accept-loop goroutine Serve
+// started to stop — they don't reliably wait for it to have actually
+// returned. Close never waits for it at all, by net/http's own design;
+// Shutdown's own wait (numListeners() == 0) races that goroutine's
+// startup if Stop is called early enough. Without an explicit join, Stop
+// — and RunUntilSignal, which depends on Stop to fully finish — could
+// report a clean shutdown, and close the engine, while that goroutine
+// (and the listener it owns) were technically still running. This
+// constructs a handle via newRawTestServeHandle, which deliberately never
+// calls Serve, so nothing else will ever close httpServeDone on its own —
+// proving Stop actually blocks on it, rather than treating it as already
+// satisfied, before it will call closeEngine.
+func TestStopWaitsForHTTPAcceptLoopBeforeClosingEngine(t *testing.T) {
+	h := newRawTestServeHandle(t)
+	t.Cleanup(func() {
+		if h.httpLis != nil {
+			h.httpLis.Close()
+		}
+	})
+	if h.httpServeDone == nil {
+		t.Fatal("httpServeDone is nil, want non-nil when MetricsAddress is set")
+	}
+
+	closeEngineCalled := make(chan struct{})
+	h.closeEngine = func() error {
+		close(closeEngineCalled)
+		return nil
+	}
+
+	stopErrCh := make(chan error, 1)
+	go func() { stopErrCh <- h.Stop(context.Background()) }()
+
+	select {
+	case <-closeEngineCalled:
+		t.Fatal("Stop called closeEngine before httpServeDone was closed, want it to wait for the HTTP accept-loop goroutine first")
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	close(h.httpServeDone)
+
+	select {
+	case err := <-stopErrCh:
+		if err != nil {
+			t.Fatalf("Stop(ctx) = %v, want nil", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Stop did not return within 5s of httpServeDone closing")
+	}
+
+	select {
+	case <-closeEngineCalled:
+	default:
+		t.Error("closeEngine was never called after Stop returned")
+	}
+}
+
 // TestRunUntilSignalRunsFullShutdownWhenServeFailsWithoutASignal guards a
 // real early-exit bug: the pre-fix RunUntilSignal only waited for the
 // Drain/quiesce/Stop sequence when Serve returned nil, so a Serve failure
@@ -966,6 +1023,30 @@ func TestStartServeWithoutMetricsAddressDisablesHTTPSurface(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("Serve did not return within 5s of Stop")
+	}
+}
+
+// TestStartServeSetsObservabilityReadHeaderTimeout guards a real
+// robustness gap: the observability HTTP server had no read-header
+// timeout of its own, so a client that opens a connection and sends
+// request headers arbitrarily slowly (or never finishes them) could hold
+// a connection — and the goroutine net/http spins up per connection —
+// open indefinitely. This listener is bound to 0.0.0.0 by both production
+// manifests, so it's reachable from outside the pod, not just from
+// trusted local scrapers.
+func TestStartServeSetsObservabilityReadHeaderTimeout(t *testing.T) {
+	h := newRawTestServeHandle(t)
+	t.Cleanup(func() {
+		h.grpcSrv.Stop()
+		if h.httpLis != nil {
+			h.httpLis.Close()
+		}
+	})
+	if h.httpSrv == nil {
+		t.Fatal("httpSrv is nil, want non-nil when MetricsAddress is set")
+	}
+	if h.httpSrv.ReadHeaderTimeout <= 0 {
+		t.Errorf("httpSrv.ReadHeaderTimeout = %v, want > 0 (unbounded header reads let a slow client hold a connection open indefinitely)", h.httpSrv.ReadHeaderTimeout)
 	}
 }
 
