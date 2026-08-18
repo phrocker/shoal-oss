@@ -3,8 +3,10 @@ package local
 import (
 	"bytes"
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/phrocker/shoal/internal/storage"
@@ -118,18 +120,14 @@ func TestLocal_CreateUsesOpenFileModeSubjectToUmask(t *testing.T) {
 	}
 }
 
-func TestLocal_CreateReplacementUsesOpenFileMode(t *testing.T) {
+func TestLocal_CreateReplacementPreservesExistingMode(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "replaced")
 	if err := os.WriteFile(path, []byte("old"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	referencePath := filepath.Join(dir, "reference")
-	reference, err := os.OpenFile(referencePath, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o644)
+	originalInfo, err := os.Stat(path)
 	if err != nil {
-		t.Fatal(err)
-	}
-	if err := reference.Close(); err != nil {
 		t.Fatal(err)
 	}
 
@@ -144,16 +142,85 @@ func TestLocal_CreateReplacementUsesOpenFileMode(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	referenceInfo, err := os.Stat(referencePath)
-	if err != nil {
-		t.Fatal(err)
-	}
 	replacedInfo, err := os.Stat(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, want := replacedInfo.Mode().Perm(), referenceInfo.Mode().Perm(); got != want {
-		t.Fatalf("replacement mode = %04o, want OpenFile(0644) mode %04o", got, want)
+	if got, want := replacedInfo.Mode().Perm(), originalInfo.Mode().Perm(); got != want {
+		t.Fatalf("replacement mode = %04o, want existing mode %04o", got, want)
+	}
+}
+
+func TestLocal_CreateRejectsDirectoryTarget(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "target")
+	if err := os.Mkdir(path, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	w, err := New().Create(context.Background(), path)
+	if err == nil || !strings.Contains(err.Error(), "not a regular file") {
+		if w != nil {
+			_ = w.(storage.Aborter).Abort()
+		}
+		t.Fatalf("Create error = %v, want non-regular target rejection", err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.IsDir() {
+		t.Fatalf("target mode = %v, want directory preserved", info.Mode())
+	}
+}
+
+func TestLocal_BackupRemovalFailureRollsBackReplacement(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "target")
+	if err := os.WriteFile(path, []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	originalInfo, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	w, err := New().Create(context.Background(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	localWriter := w.(*writer)
+	removeErr := errors.New("injected backup removal failure")
+	localWriter.ops = failBackupRemoveOps{replacementOps: localWriter.ops, err: removeErr}
+	if _, err := w.Write([]byte("new")); err != nil {
+		t.Fatal(err)
+	}
+	err = w.Close()
+	if !errors.Is(err, removeErr) {
+		t.Fatalf("Close error = %v, want %v", err, removeErr)
+	}
+
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "old" {
+		t.Fatalf("target contents = %q, want original data", got)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotMode, wantMode := info.Mode().Perm(), originalInfo.Mode().Perm(); gotMode != wantMode {
+		t.Fatalf("target mode = %04o, want original mode %04o", gotMode, wantMode)
+	}
+	if err := w.(storage.Aborter).Abort(); err != nil {
+		t.Fatalf("Abort after rollback: %v", err)
+	}
+	if matches, err := filepath.Glob(path + ".shoal-*"); err != nil {
+		t.Fatal(err)
+	} else if len(matches) != 0 {
+		t.Fatalf("replacement artifacts remain: %v", matches)
 	}
 }
 
@@ -196,6 +263,7 @@ func TestLocal_AbortAfterFailedCloseRemovesTemp(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	localWriter := w.(*writer)
 	temp := localWriter.temp
 	if err := localWriter.file.Close(); err != nil {
@@ -210,4 +278,16 @@ func TestLocal_AbortAfterFailedCloseRemovesTemp(t *testing.T) {
 	if _, err := os.Stat(temp); !os.IsNotExist(err) {
 		t.Fatalf("temporary file still exists after Abort: %v", err)
 	}
+}
+
+type failBackupRemoveOps struct {
+	replacementOps
+	err error
+}
+
+func (o failBackupRemoveOps) Remove(name string) error {
+	if strings.Contains(name, ".shoal-backup-") {
+		return o.err
+	}
+	return o.replacementOps.Remove(name)
 }

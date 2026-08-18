@@ -155,6 +155,45 @@ func TestBackendCreateRetriesReplicationInProgress(t *testing.T) {
 	}
 }
 
+func TestBackendBackupRemovalFailureRollsBackPublishedReplacement(t *testing.T) {
+	client := newFakeClient()
+	client.files["/tables/1.rf"] = []byte("old")
+	client.failBackupRemove = true
+	backend, err := New("nn:8020", WithClient(client))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = storage.WriteAll(context.Background(), backend, "/tables/1.rf", []byte("new"))
+	if err == nil || !strings.Contains(err.Error(), "remove replacement backup") {
+		t.Fatalf("WriteAll error = %v, want backup cleanup failure", err)
+	}
+	if got := string(client.files["/tables/1.rf"]); got != "old" {
+		t.Fatalf("target contents = %q, want original data", got)
+	}
+	if _, ok := client.files[client.lastCreatePath]; ok {
+		t.Fatalf("temporary file %s remains after abort", client.lastCreatePath)
+	}
+	for name := range client.files {
+		if strings.Contains(name, ".shoal-backup-") {
+			t.Fatalf("backup %s remains after rollback", name)
+		}
+	}
+	if len(client.renameCalls) != 4 {
+		t.Fatalf("Rename calls = %v, want preserve, publish, unpublish, restore", client.renameCalls)
+	}
+	backup := client.renameCalls[0].newpath
+	wantRenames := []renameCall{
+		{oldpath: "/tables/1.rf", newpath: backup},
+		{oldpath: client.lastCreatePath, newpath: "/tables/1.rf"},
+		{oldpath: "/tables/1.rf", newpath: client.lastCreatePath},
+		{oldpath: backup, newpath: "/tables/1.rf"},
+	}
+	if !slices.Equal(client.renameCalls, wantRenames) {
+		t.Fatalf("Rename calls = %v, want %v", client.renameCalls, wantRenames)
+	}
+}
+
 func TestBackendListPreservesPathForm(t *testing.T) {
 	client := newFakeClient()
 	client.files["/tables/1.rf"] = []byte("one")
@@ -538,6 +577,7 @@ type fakeClient struct {
 	renameCalls              []renameCall
 	failRemovePath           string
 	failRemoveErr            error
+	failBackupRemove         bool
 }
 
 func newFakeClient() *fakeClient {
@@ -597,6 +637,9 @@ func (c *fakeClient) ReadDir(dirname string) ([]os.FileInfo, error) {
 
 func (c *fakeClient) Remove(name string) error {
 	c.removeCalls = append(c.removeCalls, name)
+	if c.failBackupRemove && strings.Contains(name, ".shoal-backup-") {
+		return &os.PathError{Op: "remove", Path: name, Err: errors.New("injected backup removal failure")}
+	}
 	if c.failRemovePath != "" && name == c.failRemovePath && c.failRemoveErr != nil {
 		return &os.PathError{Op: "remove", Path: name, Err: c.failRemoveErr}
 	}

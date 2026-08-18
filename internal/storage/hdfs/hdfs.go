@@ -420,7 +420,17 @@ type replaceWriter struct {
 	closed       bool
 	aborted      bool
 	writerClosed bool
+	state        replacementState
 }
+
+type replacementState uint8
+
+const (
+	replacementStaged replacementState = iota
+	replacementPublished
+	replacementCommitted
+	replacementUnabortable
+)
 
 func (w *replaceWriter) Write(p []byte) (int, error) {
 	if w.closed || w.aborted {
@@ -442,11 +452,18 @@ func (w *replaceWriter) Close() error {
 	}
 	w.writerClosed = true
 
+	if err := w.commitReplacement(); err != nil {
+		return err
+	}
+	w.closed = true
+	return nil
+}
+
+func (w *replaceWriter) commitReplacement() error {
 	backup := w.target + ".shoal-backup-" + uuid.NewString()
 	hadOld := true
 	if err := w.client.Rename(w.target, backup); err != nil {
 		if !isNotFound(err) {
-			_ = w.client.Remove(w.temp)
 			return fmt.Errorf("hdfs: preserve existing file %s: %w", w.target, err)
 		}
 		hadOld = false
@@ -456,26 +473,46 @@ func (w *replaceWriter) Close() error {
 		publishErr := fmt.Errorf("hdfs: publish %s: %w", w.target, err)
 		if hadOld {
 			if restoreErr := w.client.Rename(backup, w.target); restoreErr != nil {
+				w.state = replacementUnabortable
 				publishErr = errors.Join(
 					publishErr,
 					fmt.Errorf("hdfs: restore existing file %s from %s: %w", w.target, backup, restoreErr),
 				)
 			}
 		}
-		if cleanupErr := w.client.Remove(w.temp); cleanupErr != nil && !isNotFound(cleanupErr) {
-			publishErr = errors.Join(
-				publishErr,
-				fmt.Errorf("hdfs: remove temporary file %s: %w", w.temp, cleanupErr),
-			)
-		}
 		return publishErr
 	}
+	w.state = replacementPublished
 	if hadOld {
 		if err := w.client.Remove(backup); err != nil && !isNotFound(err) {
-			return fmt.Errorf("hdfs: remove replacement backup %s: %w", backup, err)
+			cleanupErr := fmt.Errorf("hdfs: remove replacement backup %s: %w", backup, err)
+			if rollbackErr := w.rollbackPublishedReplacement(backup); rollbackErr != nil {
+				return errors.Join(cleanupErr, rollbackErr)
+			}
+			return cleanupErr
 		}
 	}
-	w.closed = true
+	w.state = replacementCommitted
+	return nil
+}
+
+func (w *replaceWriter) rollbackPublishedReplacement(backup string) error {
+	if err := w.client.Rename(w.target, w.temp); err != nil {
+		return fmt.Errorf("hdfs: roll back published file %s: %w", w.target, err)
+	}
+	if err := w.client.Rename(backup, w.target); err != nil {
+		restoreErr := fmt.Errorf("hdfs: restore existing file %s from %s: %w", w.target, backup, err)
+		if republishErr := w.client.Rename(w.temp, w.target); republishErr != nil {
+			w.state = replacementUnabortable
+			return errors.Join(
+				restoreErr,
+				fmt.Errorf("hdfs: restore published file %s after rollback failure: %w", w.target, republishErr),
+			)
+		}
+		w.state = replacementPublished
+		return restoreErr
+	}
+	w.state = replacementStaged
 	return nil
 }
 
@@ -485,6 +522,9 @@ func (w *replaceWriter) Abort() error {
 	}
 	if w.closed {
 		return errors.New("hdfs: writer already closed")
+	}
+	if w.state != replacementStaged {
+		return fmt.Errorf("hdfs: replacement for %s cannot be safely aborted in state %d", w.target, w.state)
 	}
 	w.aborted = true
 
