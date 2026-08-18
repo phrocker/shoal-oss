@@ -21,10 +21,12 @@ spec:
         app.kubernetes.io/component: write-tier
         app.kubernetes.io/part-of: shoal-platform
     spec:
-      # shoal-embed serve's default --drain-timeout is 30s (bounds the
-      # gRPC drain phase only); this leaves headroom for engine close and
-      # process exit after that phase ends, so SIGKILL doesn't land mid-close.
-      terminationGracePeriodSeconds: 40
+      # shoal-embed serve's defaults are --quiesce-delay=5s (a pause after
+      # flipping /readyz to not-ready, before anything stops accepting
+      # work) plus --drain-timeout=30s (bounds the drain phase that
+      # follows); this leaves headroom for engine close and process exit
+      # after both phases end, so SIGKILL doesn't land mid-close.
+      terminationGracePeriodSeconds: 45
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532

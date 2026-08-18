@@ -8,6 +8,17 @@ metadata:
     app.kubernetes.io/part-of: shoal-platform
 spec:
   clusterIP: None
+  # NOTE: publishNotReadyAddresses keeps every pod's address published in
+  # this headless Service's Endpoints/EndpointSlices regardless of
+  # readiness, which is what StatefulSet peer-DNS resolution needs during
+  # cluster bootstrap/formation. One consequence: shoal-embed's readiness
+  # probe (below) cannot use this Service to stop routing traffic to a
+  # draining pod the way it could for a normal (non-headless, addresses-
+  # filtered) Service -- the probe still gates StatefulSet rollout
+  # ordering and gives operators/monitoring an accurate not-ready signal,
+  # but per-shard write routing during drain remains the responsibility of
+  # whatever owns shard-to-writer assignment (the Accumulo-model
+  # manager/coordinator), not this Service. See deploy/README.md.
   publishNotReadyAddresses: true
   selector:
     app.kubernetes.io/name: shoal-embed
@@ -44,10 +55,12 @@ spec:
         app.kubernetes.io/component: write-tier
         app.kubernetes.io/part-of: shoal-platform
     spec:
-      # shoal-embed serve's default --drain-timeout is 30s (bounds the
-      # gRPC drain phase only); this leaves headroom for engine close and
-      # process exit after that phase ends, so SIGKILL doesn't land mid-close.
-      terminationGracePeriodSeconds: 40
+      # shoal-embed serve's defaults are --quiesce-delay=5s (a pause after
+      # flipping /readyz to not-ready, before anything stops accepting
+      # work) plus --drain-timeout=30s (bounds the drain phase that
+      # follows); this leaves headroom for engine close and process exit
+      # after both phases end, so SIGKILL doesn't land mid-close.
+      terminationGracePeriodSeconds: 45
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532

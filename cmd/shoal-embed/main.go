@@ -42,7 +42,6 @@
 package main
 
 import (
-	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -341,13 +340,16 @@ func cmdStatus(args []string) {
 // pods, where loopback-only is unreachable from a Service.
 //
 // On SIGINT/SIGTERM the server drains before stopping: it flips /readyz to
-// not-ready first so an orchestrator's readiness probe can observe the
-// change and stop routing new work, then gracefully stops the gRPC and HTTP
-// servers (waiting for in-flight RPCs, bounded by --drain-timeout — a
-// stuck RPC is force-aborted rather than hanging shutdown forever) and
-// closes the engine. This does not migrate tablet ownership — mixed-fleet
-// tablet reassignment on drain remains owned by the Accumulo
-// manager/coordinator and is out of scope here.
+// not-ready first, waits --quiesce-delay so a readiness-polling consumer
+// has a chance to observe the change before anything stops accepting work,
+// then gracefully stops the gRPC and HTTP servers (waiting for in-flight
+// RPCs, bounded by --drain-timeout — a stuck-but-cancellable RPC is
+// force-aborted rather than hanging shutdown forever; see serveHandle.Stop
+// for the one case that isn't cancellable) and closes the engine. The
+// process does not exit until this entire sequence finishes. This does not
+// migrate tablet ownership — mixed-fleet tablet reassignment on drain
+// remains owned by the Accumulo manager/coordinator and is out of scope
+// here.
 func cmdServe(args []string) {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	dataDir := fs.String("data", defaultDataDir(), "data directory")
@@ -356,6 +358,7 @@ func cmdServe(args []string) {
 	metricsPort := fs.Int("metrics-port", 9877, "observability HTTP listen port for /healthz, /readyz, /stats, /metrics (ignored when --metrics-address is non-empty)")
 	metricsAddress := fs.String("metrics-address", "", "override observability HTTP bind host:port verbatim (e.g. 0.0.0.0:9877); when set, --metrics-port is ignored")
 	drainTimeout := fs.Duration("drain-timeout", 30*time.Second, "max time to wait for in-flight RPCs to finish during graceful shutdown")
+	quiesceDelay := fs.Duration("quiesce-delay", 5*time.Second, "on shutdown, how long to wait after flipping /readyz to not-ready before draining connections — gives a readiness-polling consumer (e.g. a Kubernetes endpoint controller) a chance to stop routing new work first")
 	fs.Parse(args)
 
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
@@ -384,21 +387,13 @@ func cmdServe(args []string) {
 	fmt.Fprintf(os.Stderr, "shoal-embed serve: grpc://%s\n", h.GRPCAddr)
 	fmt.Fprintf(os.Stderr, "  health/metrics: http://%s/{healthz,readyz,stats,metrics}\n", h.MetricsAddr)
 
-	// Graceful shutdown on SIGINT/SIGTERM: drain (flip readiness) before
-	// stopping the listeners, so a readiness probe has a chance to observe
-	// the drained pod before it stops accepting work.
-	go func() {
-		sigCh := make(chan os.Signal, 1)
-		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-		<-sigCh
-		logger.Info("draining")
-		h.Drain()
-		ctx, cancel := context.WithTimeout(context.Background(), *drainTimeout)
-		defer cancel()
-		h.Stop(ctx)
-	}()
-
-	if err := h.Serve(); err != nil {
+	// RunUntilSignal owns the full graceful-shutdown sequence (drain,
+	// quiesce, bounded stop, engine close) and — critically — does not
+	// return until that sequence has actually finished, so this call
+	// cannot return (and the process cannot exit) mid-drain.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	if err := h.RunUntilSignal(sigCh, *quiesceDelay, *drainTimeout); err != nil {
 		die("serve: %v", err)
 	}
 }

@@ -23,6 +23,10 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"os"
+	"sync"
+	"sync/atomic"
+	"time"
 
 	"google.golang.org/grpc"
 
@@ -60,6 +64,11 @@ type serveConfig struct {
 //	// ... on SIGTERM:
 //	h.Drain()
 //	h.Stop(ctx)
+//
+// Production callers should use RunUntilSignal instead of driving Serve /
+// Drain / Stop directly: it owns the ordering above AND waits for Stop to
+// fully finish before returning, which calling Serve directly does not (see
+// RunUntilSignal's doc comment).
 type serveHandle struct {
 	// GRPCAddr and MetricsAddr are the actual bound addresses (useful when
 	// the configured address used port 0 for an OS-assigned port, e.g. in
@@ -67,14 +76,32 @@ type serveHandle struct {
 	GRPCAddr    string
 	MetricsAddr string
 
-	eng     *engine.Engine
-	obs     *obs.Server
-	grpcSrv *grpc.Server
-	grpcLis net.Listener
-	httpSrv *http.Server
-	httpLis net.Listener
-	logger  *slog.Logger
+	eng      *engine.Engine
+	obs      *obs.Server
+	grpcSrv  *grpc.Server
+	grpcLis  net.Listener
+	httpSrv  *http.Server
+	httpLis  net.Listener
+	logger   *slog.Logger
+	inFlight *unaryInFlight
 }
+
+// unaryInFlight counts currently-executing unary RPCs so Stop can report,
+// rather than silently block on, the case that matters most for a bounded
+// drain: Write/Flush/Compact run a single synchronous engine call and
+// (unlike the streaming Scan handler) don't observe transport
+// cancellation, so force-stopping the gRPC server does not interrupt one
+// already in progress — Stop still has to wait for it to return before
+// closing the engine, or risk closing it out from under that call.
+type unaryInFlight struct{ n atomic.Int64 }
+
+func (u *unaryInFlight) intercept(ctx context.Context, req any, _ *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+	u.n.Add(1)
+	defer u.n.Add(-1)
+	return handler(ctx, req)
+}
+
+func (u *unaryInFlight) count() int64 { return u.n.Load() }
 
 // startServe opens the engine, binds the gRPC and HTTP listeners, registers
 // the ShoalEmbed and observability handlers, and marks the server ready. It
@@ -103,7 +130,8 @@ func startServe(cfg serveConfig) (*serveHandle, error) {
 		return nil, fmt.Errorf("metrics listen: %w", err)
 	}
 
-	grpcSrv := grpc.NewServer()
+	inFlight := &unaryInFlight{}
+	grpcSrv := grpc.NewServer(grpc.UnaryInterceptor(inFlight.intercept))
 	embedpb.RegisterShoalEmbedServer(grpcSrv, newEmbedServer(eng))
 
 	obsSrv := obs.NewServer(eng)
@@ -124,6 +152,7 @@ func startServe(cfg serveConfig) (*serveHandle, error) {
 		httpSrv:     httpSrv,
 		httpLis:     httpLis,
 		logger:      logger,
+		inFlight:    inFlight,
 	}, nil
 }
 
@@ -140,37 +169,62 @@ func (h *serveHandle) Serve() error {
 }
 
 // Drain marks the server not-ready without closing anything. Call this
-// first, on receipt of a shutdown signal: a Kubernetes readiness probe
-// polling /readyz observes the change and the endpoint controller removes
-// the pod from the Service before Stop closes the listeners, so in-flight
-// work can finish without new work arriving behind it. Safe to call once,
+// first, on receipt of a shutdown signal, and give any readiness-polling
+// consumer (an orchestrator, a load balancer, or the Accumulo-model
+// manager/coordinator that actually owns shard-to-writer routing) a brief
+// quiesce window to observe /readyz before Stop closes the listeners —
+// RunUntilSignal does this for you. Whether that observation actually
+// removes this pod from routed traffic depends on what's consuming
+// /readyz; a Service with publishNotReadyAddresses: true (as the write-tier
+// headless Service intentionally is, for StatefulSet peer-DNS stability)
+// keeps publishing this pod's address regardless. Safe to call once,
 // before Stop.
 func (h *serveHandle) Drain() {
 	h.obs.SetReady(false)
 }
 
-// Stop gracefully closes the HTTP server, then the gRPC server, then the
-// engine. Call Drain first so an orchestrator's readiness probe has a
-// chance to observe the drained state.
+// Stop gracefully stops the HTTP and gRPC servers, then closes the engine.
+// Call Drain first so a readiness-polling consumer has a chance to observe
+// the drained state.
 //
-// Shutdown is bounded by ctx end-to-end: grpc.Server.GracefulStop blocks
-// until all in-flight RPCs finish and — unlike http.Server.Shutdown —
-// accepts no deadline of its own, so a stuck client (or a long scan) could
-// otherwise hang shutdown forever. Stop races GracefulStop against ctx and,
-// if ctx expires first, force-closes the HTTP server and force-stops the
-// gRPC server (aborting any remaining in-flight RPCs). This is what makes
-// --drain-timeout an actual bound rather than a best-effort hint, so a
-// Pod's terminationGracePeriodSeconds only has to cover it plus a small
-// margin instead of an unbounded wait.
+// ctx bounds two things precisely: how long new connections keep being
+// accepted, and how long a stuck-but-cancellable in-flight RPC (a
+// streaming Scan blocked on client backpressure, for example, which
+// notices its stream erroring out) is allowed to keep running before being
+// force-aborted. http.Server.Shutdown and grpc.Server.GracefulStop run
+// concurrently under the same ctx — not sequentially — so a slow /stats or
+// /metrics request cannot eat into the budget meant for draining gRPC
+// writes, and vice versa. If ctx expires first, Stop force-closes the HTTP
+// server and force-stops the gRPC server (aborting connections and
+// cancellable RPCs).
+//
+// ctx does NOT bound a unary RPC (Write, Flush, Compact) that is already
+// executing: those run a single synchronous engine call, ignore their
+// request context today, and don't observe transport cancellation the way
+// a streaming Send/Recv does, so force-stopping the connection cannot
+// interrupt one already in progress. Stop still waits for it before
+// closing the engine — closing the engine while a call is still writing to
+// it is a correctness hazard --drain-timeout is not worth trading away —
+// so a pathologically slow or stuck engine call can extend shutdown past
+// --drain-timeout. Stop logs how many such calls are still outstanding
+// when the deadline fires so this shows up as an operator-visible warning
+// rather than a silent, unexplained delay. Making those engine calls
+// themselves cancellation-aware would close this gap fully; that's a
+// deeper engine-layer change and is intentionally not attempted here.
 func (h *serveHandle) Stop(ctx context.Context) {
-	if err := h.httpSrv.Shutdown(ctx); err != nil {
-		if err == context.DeadlineExceeded {
-			h.logger.Warn("drain deadline exceeded; forcing http close")
-			_ = h.httpSrv.Close()
-		} else {
-			h.logger.Warn("observability server shutdown", slog.String("err", err.Error()))
+	var httpDone sync.WaitGroup
+	httpDone.Add(1)
+	go func() {
+		defer httpDone.Done()
+		if err := h.httpSrv.Shutdown(ctx); err != nil {
+			if err == context.DeadlineExceeded {
+				h.logger.Warn("drain deadline exceeded; forcing http close")
+				_ = h.httpSrv.Close()
+			} else {
+				h.logger.Warn("observability server shutdown", slog.String("err", err.Error()))
+			}
 		}
-	}
+	}()
 
 	gracefulDone := make(chan struct{})
 	go func() {
@@ -180,15 +234,71 @@ func (h *serveHandle) Stop(ctx context.Context) {
 	select {
 	case <-gracefulDone:
 	case <-ctx.Done():
-		h.logger.Warn("drain deadline exceeded; forcing grpc stop", slog.String("err", ctx.Err().Error()))
+		if n := h.inFlight.count(); n > 0 {
+			h.logger.Warn("drain deadline exceeded; forcing new-work rejection, but waiting for non-cancellable unary RPC(s) to finish before closing the engine",
+				slog.Int64("inFlightUnaryRPCs", n), slog.String("err", ctx.Err().Error()))
+		} else {
+			h.logger.Warn("drain deadline exceeded; forcing grpc stop", slog.String("err", ctx.Err().Error()))
+		}
 		// Stop aborts in-flight RPCs and closes remaining connections,
 		// which unblocks the GracefulStop call above too (they share the
-		// same connection-tracking state), so this wait stays bounded.
+		// same connection-tracking state). This unblocks any streaming
+		// call watching for transport errors immediately; a unary call
+		// already inside the engine is unaffected and still has to return
+		// on its own (see the doc comment above), so this wait is not
+		// itself bounded by ctx in that case.
 		h.grpcSrv.Stop()
 		<-gracefulDone
 	}
+	httpDone.Wait()
 
 	if err := h.eng.Close(); err != nil {
 		h.logger.Warn("engine close", slog.String("err", err.Error()))
 	}
+}
+
+// RunUntilSignal is the production entry point for a shoal-embed serve
+// process: it blocks running the server until sigCh delivers a shutdown
+// signal, then performs the full two-phase drain — Drain, an optional
+// quiesce pause (letting a readiness-polling consumer observe /readyz
+// before anything actually stops accepting work), and a Stop bounded by
+// drainTimeout — and does not return until that entire sequence, including
+// the final engine close, has completed.
+//
+// That last part fixes a real early-exit race: Serve only reflects
+// grpc.Server's own internal stop bookkeeping — it says nothing about the
+// *additional* work this package's Stop wrapper does around that (waiting
+// for the HTTP server to finish shutting down, then closing the engine).
+// Those can still be in progress, e.g. blocked on a slow HTTP request or a
+// non-cancellable unary RPC, when Serve returns. A caller that reacts to
+// Serve returning by exiting the process (returning from main, for
+// example) can therefore terminate every other goroutine, including the
+// one still finishing Stop, before that work is done. RunUntilSignal
+// waits for the shutdown sequence itself — Drain, quiesce, and Stop
+// returning — to finish before returning, so its caller never can.
+func (h *serveHandle) RunUntilSignal(sigCh <-chan os.Signal, quiesce, drainTimeout time.Duration) error {
+	shutdownDone := make(chan struct{})
+	go func() {
+		defer close(shutdownDone)
+		<-sigCh
+		h.logger.Info("draining")
+		h.Drain()
+		if quiesce > 0 {
+			time.Sleep(quiesce)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), drainTimeout)
+		defer cancel()
+		h.Stop(ctx)
+	}()
+
+	err := h.Serve()
+	if err == nil {
+		// Serve only returns nil once the gRPC listener has been stopped,
+		// which in this function only happens after sigCh fires above —
+		// wait for that goroutine to actually finish Stop (HTTP shutdown
+		// and engine close included) before returning, per the doc
+		// comment.
+		<-shutdownDone
+	}
+	return err
 }

@@ -23,7 +23,10 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"os"
 	"strings"
+	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -33,11 +36,12 @@ import (
 	"github.com/phrocker/shoal/internal/embedpb"
 )
 
-// newTestServeHandle starts a serveHandle bound to OS-assigned loopback
-// ports and runs its accept loops in the background, returning the handle
-// plus the channel Serve's return value will arrive on. It performs no
-// teardown, so callers control the Drain/Stop sequence themselves.
-func newTestServeHandle(t *testing.T) (*serveHandle, <-chan error) {
+// newRawTestServeHandle starts a serveHandle bound to OS-assigned loopback
+// ports without starting its accept loops. Most tests want
+// newTestServeHandle instead; this exists for tests (RunUntilSignal's) that
+// need to drive Serve indirectly via a method that calls it internally,
+// where calling Serve a second time here too would race it.
+func newRawTestServeHandle(t *testing.T) *serveHandle {
 	t.Helper()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	h, err := startServe(serveConfig{
@@ -49,6 +53,16 @@ func newTestServeHandle(t *testing.T) (*serveHandle, <-chan error) {
 	if err != nil {
 		t.Fatalf("startServe: %v", err)
 	}
+	return h
+}
+
+// newTestServeHandle starts a serveHandle bound to OS-assigned loopback
+// ports and runs its accept loops in the background, returning the handle
+// plus the channel Serve's return value will arrive on. It performs no
+// teardown, so callers control the Drain/Stop sequence themselves.
+func newTestServeHandle(t *testing.T) (*serveHandle, <-chan error) {
+	t.Helper()
+	h := newRawTestServeHandle(t)
 	serveErrCh := make(chan error, 1)
 	go func() { serveErrCh <- h.Serve() }()
 	return h, serveErrCh
@@ -178,19 +192,17 @@ func TestServeHandleDrainThenStop(t *testing.T) {
 	}
 }
 
-// TestServeHandleStopIsBoundedByDrainTimeout guards a real bug found while
-// implementing Stop: grpc.Server.GracefulStop blocks until every in-flight
-// RPC finishes and accepts no deadline of its own, so a single slow or
-// stuck client could otherwise hang Stop — and shutdown — forever,
-// regardless of --drain-timeout. It starts a real streaming Scan RPC over a
-// client pinned to a small static (non-BDP-adaptive) flow-control window,
-// deliberately stops reading after the first message so the still-running
-// handler blocks on backpressure trying to send the rest, then asserts Stop
-// still returns close to the short deadline it was given instead of
-// hanging until the client resumes reading (it never does here).
-func TestServeHandleStopIsBoundedByDrainTimeout(t *testing.T) {
-	h, serveErrCh := newTestServeHandle(t)
-
+// startStuckStreamingScan starts a real streaming Scan RPC against h, using
+// a client pinned to a small static (non-BDP-adaptive) flow-control
+// window, and deliberately stops reading after the first message so the
+// still-running server-side handler blocks on send backpressure trying to
+// deliver the rest — a real in-flight, non-cancellable-by-closing-the-
+// connection-alone RPC that only unblocks once the connection itself is
+// torn down (e.g. by conn.Close, or by the server force-stopping). Callers
+// use this to exercise Stop's/RunUntilSignal's force-path deterministically
+// instead of racing a real slow client.
+func startStuckStreamingScan(t *testing.T, h *serveHandle) {
+	t.Helper()
 	const staticWindow = 128 * 1024 // bytes; disables BDP-based auto-growth.
 	conn, err := grpc.NewClient(h.GRPCAddr,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
@@ -200,7 +212,7 @@ func TestServeHandleStopIsBoundedByDrainTimeout(t *testing.T) {
 	if err != nil {
 		t.Fatalf("grpc.NewClient: %v", err)
 	}
-	defer conn.Close()
+	t.Cleanup(func() { conn.Close() })
 	client := embedpb.NewShoalEmbedClient(conn)
 
 	setupCtx, setupCancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -231,7 +243,7 @@ func TestServeHandleStopIsBoundedByDrainTimeout(t *testing.T) {
 	}
 
 	scanCtx, scanCancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer scanCancel()
+	t.Cleanup(scanCancel)
 	stream, err := client.Scan(scanCtx, &embedpb.ScanRequest{Table: "t", BatchSize: 1})
 	if err != nil {
 		t.Fatalf("Scan: %v", err)
@@ -242,6 +254,21 @@ func TestServeHandleStopIsBoundedByDrainTimeout(t *testing.T) {
 	// Deliberately never call Recv again: give the still-running handler
 	// goroutine time to fill the pinned window and block in Send.
 	time.Sleep(200 * time.Millisecond)
+}
+
+// TestServeHandleStopIsBoundedByDrainTimeout guards a real bug found while
+// implementing Stop: grpc.Server.GracefulStop blocks until every in-flight
+// RPC finishes and accepts no deadline of its own, so a single slow or
+// stuck client could otherwise hang Stop — and shutdown — forever,
+// regardless of --drain-timeout. It starts a real streaming Scan RPC over a
+// client pinned to a small static (non-BDP-adaptive) flow-control window,
+// deliberately stops reading after the first message so the still-running
+// handler blocks on backpressure trying to send the rest, then asserts Stop
+// still returns close to the short deadline it was given instead of
+// hanging until the client resumes reading (it never does here).
+func TestServeHandleStopIsBoundedByDrainTimeout(t *testing.T) {
+	h, serveErrCh := newTestServeHandle(t)
+	startStuckStreamingScan(t, h)
 
 	h.Drain()
 	const drainDeadline = 150 * time.Millisecond
@@ -263,5 +290,200 @@ func TestServeHandleStopIsBoundedByDrainTimeout(t *testing.T) {
 	case <-serveErrCh:
 	case <-time.After(5 * time.Second):
 		t.Fatal("Serve did not return within 5s of a forced Stop")
+	}
+}
+
+// TestRunUntilSignalWaitsForFullShutdownBeforeReturning guards the critical
+// bug the Copilot review's "suppressed" finding identified: the pre-fix
+// main.go reacted to Serve() returning by letting main() return right
+// behind it, from a goroutine that ran the drain/stop sequence but was
+// never joined — so the process could exit mid-drain, before eng.Close
+// ever ran. grpc.Server.Serve's return is driven entirely by the gRPC
+// server's own internal bookkeeping and is independent of the HTTP side
+// and of Stop's own subsequent work (waiting for the HTTP shutdown to
+// finish, then closing the engine) — with an otherwise-idle gRPC server,
+// Serve can return within microseconds of Stop being called. This test
+// makes that gap observable: it swaps in a test-controlled HTTP handler
+// that blocks a request indefinitely (via the unexported httpSrv field —
+// this file is in package main), which deterministically forces Stop's
+// httpSrv.Shutdown to block for the full --drain-timeout budget while the
+// idle gRPC server has nothing to wait for. If RunUntilSignal returned as
+// soon as Serve unblocked (the bug) rather than waiting for the whole
+// shutdown sequence — including that HTTP wait and the subsequent engine
+// close — to finish, it would return in microseconds instead of waiting
+// out the deadline.
+func TestRunUntilSignalWaitsForFullShutdownBeforeReturning(t *testing.T) {
+	h := newRawTestServeHandle(t)
+
+	orig := h.httpSrv.Handler
+	requestReceived := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseFn := func() { releaseOnce.Do(func() { close(release) }) }
+	defer releaseFn()
+	h.httpSrv.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/__test_slow__" {
+			close(requestReceived)
+			<-release
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		orig.ServeHTTP(w, r)
+	})
+
+	sigCh := make(chan os.Signal, 1)
+	const drainDeadline = 150 * time.Millisecond
+
+	runErrCh := make(chan error, 1)
+	go func() { runErrCh <- h.RunUntilSignal(sigCh, 0, drainDeadline) }()
+
+	// Wait for RunUntilSignal's internal Serve call to actually start
+	// accepting before using the server or sending the signal.
+	waitForStatus(t, "http://"+h.MetricsAddr+"/readyz", http.StatusOK).Body.Close()
+
+	// Start (and deliberately never finish, until releaseFn is called) the
+	// slow request so its connection stays "active" — never idle — from
+	// net/http's point of view.
+	slowDone := make(chan struct{})
+	go func() {
+		resp, err := http.Get("http://" + h.MetricsAddr + "/__test_slow__")
+		if err == nil {
+			resp.Body.Close()
+		}
+		close(slowDone)
+	}()
+	<-requestReceived
+
+	start := time.Now()
+	sigCh <- syscall.SIGTERM
+
+	select {
+	case err := <-runErrCh:
+		elapsed := time.Since(start)
+		if err != nil {
+			t.Errorf("RunUntilSignal returned %v, want nil after a clean shutdown", err)
+		}
+		// The stuck request forces Stop's httpDone.Wait() to block until
+		// ctx's drainDeadline expires and httpSrv.Close() force-closes it.
+		// If RunUntilSignal returned as soon as the (otherwise idle) gRPC
+		// server's Serve call unblocked (the bug) rather than waiting for
+		// the whole shutdown sequence to finish, elapsed would be far
+		// under drainDeadline instead.
+		if elapsed < drainDeadline {
+			t.Errorf("RunUntilSignal returned after %v, want at least the %v drain deadline (returned before the shutdown sequence, including engine close, finished)", elapsed, drainDeadline)
+		}
+	case <-time.After(5 * time.Second):
+		releaseFn()
+		t.Fatal("RunUntilSignal did not return within 5s of SIGTERM")
+	}
+
+	releaseFn()
+	<-slowDone
+
+	if _, err := http.Get("http://" + h.MetricsAddr + "/readyz"); err == nil {
+		t.Error("GET /readyz succeeded after RunUntilSignal returned, want connection error (listener closed)")
+	}
+}
+
+// TestRunUntilSignalAppliesQuiesceDelay proves the quiesce pause runs
+// strictly between Drain and Stop: /readyz must already report not-ready,
+// while the gRPC port must still accept a brand new connection and RPC,
+// throughout the quiesce window. That ordering is what actually gives a
+// readiness-polling consumer a chance to react before anything stops
+// accepting work — a quiesce implemented after Stop (or not at all) would
+// fail this.
+func TestRunUntilSignalAppliesQuiesceDelay(t *testing.T) {
+	h := newRawTestServeHandle(t)
+	sigCh := make(chan os.Signal, 1)
+	const quiesce = 1500 * time.Millisecond
+	const drainDeadline = 5 * time.Second
+
+	runErrCh := make(chan error, 1)
+	go func() { runErrCh <- h.RunUntilSignal(sigCh, quiesce, drainDeadline) }()
+	waitForStatus(t, "http://"+h.MetricsAddr+"/readyz", http.StatusOK).Body.Close()
+
+	sigCh <- syscall.SIGTERM
+
+	// Drain runs synchronously as soon as the signal is received, before
+	// the quiesce sleep — so /readyz should flip to 503 almost
+	// immediately. Poll briefly, well inside the quiesce window, rather
+	// than reusing the shared 5s-deadline waitForStatus helper: a slow
+	// poll here must not itself eat into the window the rest of this test
+	// depends on.
+	pollDeadline := time.Now().Add(250 * time.Millisecond)
+	var readyzStatus int
+	for time.Now().Before(pollDeadline) {
+		resp, err := http.Get("http://" + h.MetricsAddr + "/readyz")
+		if err == nil {
+			readyzStatus = resp.StatusCode
+			resp.Body.Close()
+			if readyzStatus == http.StatusServiceUnavailable {
+				break
+			}
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if readyzStatus != http.StatusServiceUnavailable {
+		t.Fatalf("/readyz = %d shortly after SIGTERM, want 503 (Drain runs before the quiesce sleep)", readyzStatus)
+	}
+
+	// Still well inside the quiesce window: the gRPC listener must still be
+	// open and accept a brand new connection and RPC, since Stop (which
+	// closes it) only runs once quiesce elapses.
+	conn, err := grpc.NewClient(h.GRPCAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("grpc.NewClient during quiesce window: %v", err)
+	}
+	defer conn.Close()
+	client := embedpb.NewShoalEmbedClient(conn)
+	rpcCtx, rpcCancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
+	defer rpcCancel()
+	if _, err := client.Status(rpcCtx, &embedpb.StatusRequest{}); err != nil {
+		t.Errorf("Status RPC during quiesce window: %v, want gRPC port still accepting connections", err)
+	}
+
+	select {
+	case err := <-runErrCh:
+		if err != nil {
+			t.Errorf("RunUntilSignal returned %v, want nil", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("RunUntilSignal did not return within 5s")
+	}
+}
+
+// TestUnaryInFlightInterceptorTracksActiveCalls is a direct unit test of
+// unaryInFlight's counting logic — no real gRPC transport needed — proving
+// the count reflects exactly the handlers currently running, which is the
+// signal Stop's deadline-exceeded log line depends on for the Write/Flush/
+// Compact case it can't otherwise detect.
+func TestUnaryInFlightInterceptorTracksActiveCalls(t *testing.T) {
+	var u unaryInFlight
+	if got := u.count(); got != 0 {
+		t.Fatalf("count() before any calls = %d, want 0", got)
+	}
+
+	handlerEntered := make(chan struct{})
+	release := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		_, _ = u.intercept(context.Background(), nil, &grpc.UnaryServerInfo{}, func(ctx context.Context, req any) (any, error) {
+			close(handlerEntered)
+			<-release
+			return nil, nil
+		})
+		close(done)
+	}()
+
+	<-handlerEntered
+	if got := u.count(); got != 1 {
+		t.Errorf("count() while handler is running = %d, want 1", got)
+	}
+
+	close(release)
+	<-done
+
+	if got := u.count(); got != 0 {
+		t.Errorf("count() after handler returns = %d, want 0", got)
 	}
 }
