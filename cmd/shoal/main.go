@@ -47,6 +47,10 @@ import (
 
 var version = "dev"
 
+type serverStopper interface {
+	Stop() error
+}
+
 func main() {
 	showVersion := flag.Bool("version", false, "print version and exit")
 	listenAddr := flag.String("listen", ":9800", "Thrift listener address")
@@ -74,7 +78,6 @@ func main() {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
 	slog.SetDefault(logger)
 	cmdCtx, stopCommand := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stopCommand()
 
 	if *zkServers == "" {
 		die("shoal: -zk is required")
@@ -239,15 +242,19 @@ func main() {
 	}
 
 	// Graceful shutdown.
-	stopCh := make(chan os.Signal, 1)
-	signal.Notify(stopCh, syscall.SIGINT, syscall.SIGTERM)
-	defer signal.Stop(stopCh)
-	sig := <-stopCh
-	logger.Info("shutdown signal", slog.String("sig", sig.String()))
-	if err := tserver.Stop(); err != nil {
+	waitForShutdown(cmdCtx, stopCommand, logger, tserver)
+	logger.Info("shoal exit clean")
+}
+
+func waitForShutdown(ctx context.Context, releaseSignals func(), logger *slog.Logger, server serverStopper) {
+	<-ctx.Done()
+	if releaseSignals != nil {
+		releaseSignals()
+	}
+	logger.Info("shutdown signal")
+	if err := server.Stop(); err != nil {
 		logger.Error("thrift Stop", slog.Any("err", err))
 	}
-	logger.Info("shoal exit clean")
 }
 
 // enumerateUserTables walks the metadata chain (root → !0 → user tables)

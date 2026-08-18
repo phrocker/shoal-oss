@@ -22,6 +22,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"strings"
 	"testing"
 
 	shstorage "github.com/phrocker/shoal/internal/storage"
@@ -133,11 +134,18 @@ func TestWriter_AbortDiscardsBufferedDataAndRejectsLaterUse(t *testing.T) {
 	if got := w.buf.Len(); got != 0 {
 		t.Fatalf("buf.Len() after second Abort = %d, want 0", got)
 	}
-	if _, err := w.Write([]byte("late")); err == nil {
-		t.Fatal("Write after Abort succeeded, want error")
+	if _, err := w.Write([]byte("late")); err == nil || !strings.Contains(err.Error(), "aborted") {
+		t.Fatalf("Write after Abort error = %v, want aborted state", err)
 	}
-	if err := w.Close(); err == nil {
-		t.Fatal("Close after Abort succeeded, want error")
+	if err := w.Close(); err == nil || !strings.Contains(err.Error(), "aborted") {
+		t.Fatalf("Close after Abort error = %v, want aborted state", err)
+	}
+}
+
+func TestWriter_WriteAfterCloseReportsClosedState(t *testing.T) {
+	w := &writer{closed: true}
+	if _, err := w.Write([]byte("late")); err == nil || !strings.Contains(err.Error(), "closed") {
+		t.Fatalf("Write after Close error = %v, want closed state", err)
 	}
 }
 

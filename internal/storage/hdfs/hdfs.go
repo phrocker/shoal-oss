@@ -444,7 +444,7 @@ func (w *replaceWriter) Close() error {
 		return errors.New("hdfs: writer already aborted")
 	}
 	if w.closed {
-		return errors.New("hdfs: writer already closed")
+		return nil
 	}
 	if err := closeAfterReplication(w.ctx, w.writer); err != nil {
 		_ = w.client.Remove(w.temp)

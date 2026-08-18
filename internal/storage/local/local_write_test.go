@@ -411,6 +411,32 @@ func TestLocal_AbortAfterFailedCloseRemovesTemp(t *testing.T) {
 	}
 }
 
+func TestLocal_CloseErrorCleansUpTempViaReplacementOps(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "out.bin")
+	w, err := New().Create(context.Background(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	localWriter := w.(*writer)
+	ops := &recordingRemoveOps{replacementOps: localWriter.ops}
+	localWriter.ops = ops
+	temp := localWriter.temp
+	if err := localWriter.file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err == nil {
+		t.Fatal("Close succeeded after the temporary file was already closed")
+	}
+	if len(ops.removed) != 1 || ops.removed[0] != temp {
+		t.Fatalf("Remove calls = %v, want [%s]", ops.removed, temp)
+	}
+	if _, err := os.Stat(temp); !os.IsNotExist(err) {
+		t.Fatalf("temporary file still exists after Close cleanup: %v", err)
+	}
+}
+
 type blockingAtomicReplaceOps struct {
 	replacementOps
 	entered chan struct{}
@@ -450,4 +476,14 @@ func (o *blockingRollbackOps) AtomicRestore(target, backup string) error {
 	close(o.entered)
 	<-o.release
 	return o.replacementOps.AtomicRestore(target, backup)
+}
+
+type recordingRemoveOps struct {
+	replacementOps
+	removed []string
+}
+
+func (o *recordingRemoveOps) Remove(name string) error {
+	o.removed = append(o.removed, name)
+	return o.replacementOps.Remove(name)
 }

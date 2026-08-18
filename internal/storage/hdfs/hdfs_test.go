@@ -100,6 +100,31 @@ func TestBackendCreateReplacesAndCreatesParents(t *testing.T) {
 	}
 }
 
+func TestBackendCreateSecondCloseIsNoop(t *testing.T) {
+	client := newFakeClient()
+	backend, err := New("nn:8020", WithClient(client))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	w, err := backend.Create(context.Background(), "/tables/1.rf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write([]byte("new")); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("second Close: %v", err)
+	}
+	if client.writerCloseCalls != 1 {
+		t.Fatalf("writer Close calls = %d, want 1", client.writerCloseCalls)
+	}
+}
+
 func TestBackendCreateFailurePreservesExistingFile(t *testing.T) {
 	client := newFakeClient()
 	client.files["/tables/1.rf"] = []byte("old")
@@ -574,6 +599,9 @@ func TestBackendAbortPreservesExistingTargetAndRemovesTemp(t *testing.T) {
 	}
 	if err := aborter.Abort(); err != nil {
 		t.Fatalf("second Abort: %v", err)
+	}
+	if err := w.Close(); err == nil || !strings.Contains(err.Error(), "writer already aborted") {
+		t.Fatalf("Close after Abort error = %v, want writer already aborted", err)
 	}
 
 	if got := string(client.files["/tables/1.rf"]); got != "old" {

@@ -275,8 +275,11 @@ type writer struct {
 }
 
 func (w *writer) Write(p []byte) (int, error) {
-	if w.closed || w.aborted {
-		return 0, fmt.Errorf("s3: write after close")
+	if w.aborted {
+		return 0, fmt.Errorf("s3: writer already aborted")
+	}
+	if w.closed {
+		return 0, fmt.Errorf("s3: writer already closed")
 	}
 	return w.buf.Write(p)
 }

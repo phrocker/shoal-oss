@@ -78,14 +78,21 @@ func TestWriter_AbortUsesCloseWithErrorAndRejectsLaterUse(t *testing.T) {
 	if inner.closeWithErrorCalls != 1 {
 		t.Fatalf("CloseWithError calls after second Abort = %d, want 1", inner.closeWithErrorCalls)
 	}
-	if _, err := w.Write([]byte("late")); err == nil {
-		t.Fatal("Write after Abort succeeded, want error")
+	if _, err := w.Write([]byte("late")); err == nil || !strings.Contains(err.Error(), "aborted") {
+		t.Fatalf("Write after Abort error = %v, want aborted state", err)
 	}
-	if err := w.Close(); err == nil {
-		t.Fatal("Close after Abort succeeded, want error")
+	if err := w.Close(); err == nil || !strings.Contains(err.Error(), "aborted") {
+		t.Fatalf("Close after Abort error = %v, want aborted state", err)
 	}
 	if inner.closeCalls != 0 {
 		t.Fatalf("Close calls after Abort = %d, want 0", inner.closeCalls)
+	}
+}
+
+func TestWriter_WriteAfterCloseReportsClosedState(t *testing.T) {
+	w := &writer{closed: true}
+	if _, err := w.Write([]byte("late")); err == nil || !strings.Contains(err.Error(), "closed") {
+		t.Fatalf("Write after Close error = %v, want closed state", err)
 	}
 }
 

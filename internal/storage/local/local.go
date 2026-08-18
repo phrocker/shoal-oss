@@ -190,7 +190,7 @@ func (w *writer) Close() error {
 	}
 	if err := w.file.Close(); err != nil {
 		w.fileClosed = true
-		_ = os.Remove(w.temp)
+		_ = w.ops.Remove(w.temp)
 		return fmt.Errorf("local: close temporary file %s: %w", w.temp, err)
 	}
 	w.fileClosed = true
