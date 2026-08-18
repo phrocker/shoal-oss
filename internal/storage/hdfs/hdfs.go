@@ -571,9 +571,12 @@ func closeAfterReplication(ctx context.Context, writer storage.Writer) (retErr e
 	}()
 	delay := initialDelay
 	for {
-		err := writer.Close()
-		if !errors.Is(err, hdfsclient.ErrReplicating) {
-			return err
+		closeErr := writer.Close()
+		if ctxErr := retryCtx.Err(); ctxErr != nil {
+			return errors.Join(closeErr, ctxErr)
+		}
+		if !errors.Is(closeErr, hdfsclient.ErrReplicating) {
+			return closeErr
 		}
 		timer := time.NewTimer(delay)
 		select {

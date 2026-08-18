@@ -444,6 +444,75 @@ func TestBackendCreateStopsReplicationRetryOnContextDeadline(t *testing.T) {
 	}
 }
 
+func TestBackendCloseJoinsCustomErrorAfterContextDeadlineWithoutPublish(t *testing.T) {
+	client := newFakeClient()
+	client.files["/tables/1.rf"] = []byte("old")
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+	customTimeout := errors.New("writer-specific timeout")
+	client.writerCloseHook = func() error {
+		<-ctx.Done()
+		return customTimeout
+	}
+	backend, err := New("nn:8020", WithClient(client))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = storage.WriteAll(ctx, backend, "/tables/1.rf", []byte("new"))
+	if !errors.Is(err, context.DeadlineExceeded) || !errors.Is(err, customTimeout) {
+		t.Fatalf("WriteAll error = %v, want deadline and custom timeout", err)
+	}
+	if got := string(client.files["/tables/1.rf"]); got != "old" {
+		t.Fatalf("target contents = %q, want old", got)
+	}
+	if len(client.renameCalls) != 0 {
+		t.Fatalf("Rename calls = %v, want no publish", client.renameCalls)
+	}
+	if _, ok := client.files[client.lastCreatePath]; ok {
+		t.Fatalf("temporary file %s remains after abort", client.lastCreatePath)
+	}
+}
+
+func TestBackendCloseReturningNilAfterCancellationDoesNotPublish(t *testing.T) {
+	client := newFakeClient()
+	client.files["/tables/1.rf"] = []byte("old")
+	ctx, cancel := context.WithCancel(context.Background())
+	client.writerCloseHook = func() error {
+		cancel()
+		return nil
+	}
+	backend, err := New("nn:8020", WithClient(client))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = storage.WriteAll(ctx, backend, "/tables/1.rf", []byte("new"))
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("WriteAll error = %v, want context.Canceled", err)
+	}
+	if got := string(client.files["/tables/1.rf"]); got != "old" {
+		t.Fatalf("target contents = %q, want old", got)
+	}
+	if len(client.renameCalls) != 0 {
+		t.Fatalf("Rename calls = %v, want no publish", client.renameCalls)
+	}
+	if _, ok := client.files[client.lastCreatePath]; ok {
+		t.Fatalf("temporary file %s remains after abort", client.lastCreatePath)
+	}
+}
+
+func TestCloseAfterReplicationSuccessfulCloseUnaffected(t *testing.T) {
+	client := newFakeClient()
+	writer := &fakeWriter{client: client}
+	if err := closeAfterReplication(context.Background(), writer); err != nil {
+		t.Fatal(err)
+	}
+	if client.writerCloseCalls != 1 {
+		t.Fatalf("Close calls = %d, want 1", client.writerCloseCalls)
+	}
+}
+
 func TestCloseAfterReplicationAppliesAndRestoresRetryDeadline(t *testing.T) {
 	writer := &deadlineBlockingWriter{}
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
@@ -578,6 +647,7 @@ type fakeClient struct {
 	failRemovePath           string
 	failRemoveErr            error
 	failBackupRemove         bool
+	writerCloseHook          func() error
 }
 
 func newFakeClient() *fakeClient {
@@ -603,7 +673,7 @@ func (c *fakeClient) Open(name string) (Reader, error) {
 func (c *fakeClient) Create(name string) (storage.Writer, error) {
 	writer := &fakeWriter{close: func(data []byte) {
 		c.files[name] = append([]byte(nil), data...)
-	}, client: c, failClose: c.failWriterClose}
+	}, client: c, failClose: c.failWriterClose, closeHook: c.writerCloseHook}
 	c.lastWriter = writer
 	c.lastCreatePath = name
 	return writer, nil
@@ -691,6 +761,7 @@ type fakeWriter struct {
 	client    *fakeClient
 	failClose bool
 	deadline  time.Time
+	closeHook func() error
 }
 
 type deadlineBlockingWriter struct {
@@ -725,6 +796,11 @@ func (w *immediateErrorDeadlineWriter) SetDeadline(deadline time.Time) error {
 
 func (w *fakeWriter) Close() error {
 	w.client.writerCloseCalls++
+	if w.closeHook != nil {
+		if err := w.closeHook(); err != nil {
+			return err
+		}
+	}
 	if w.client.replicatingCloseFailures > 0 {
 		w.client.replicatingCloseFailures--
 		return &os.PathError{Op: "create", Path: "temporary", Err: hdfsclient.ErrReplicating}
@@ -732,7 +808,9 @@ func (w *fakeWriter) Close() error {
 	if w.failClose {
 		return errors.New("injected close failure")
 	}
-	w.close(w.Bytes())
+	if w.close != nil {
+		w.close(w.Bytes())
+	}
 	return nil
 }
 
