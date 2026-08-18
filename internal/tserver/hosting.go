@@ -234,8 +234,9 @@ type Host struct {
 	// newest is the newest server lock ever adopted. It outlives a lock loss
 	// so a stale lock cannot be re-adopted after the session drops.
 	newest LockID
-	// manager is the newest manager lock observed. Requests from an older
-	// manager are refused; a newer one is adopted on sight.
+	// manager is the authoritative live manager lock observed elsewhere.
+	// Manager-directed requests must match it exactly; request history never
+	// promotes itself to authority.
 	manager LockID
 
 	tablets map[string]*tabletEntry
@@ -257,8 +258,11 @@ type tabletEntry struct {
 	attempt uint64
 }
 
-// NewHost returns a host that holds no lock. Until AdoptLock records an
-// acquired ServiceLock, every transition fails closed with ErrNoLock.
+// NewHost returns a host that holds no lock and knows no live manager.
+// Until AdoptLock records an acquired ServiceLock, every transition fails
+// closed with ErrNoLock. Manager-directed transitions additionally require
+// ObserveManagerLock to seed the live manager lock; until then they fail
+// closed with ErrStaleManagerLock.
 func NewHost() *Host {
 	return &Host{
 		tablets:     make(map[string]*tabletEntry),
@@ -342,8 +346,38 @@ func (h *Host) Lock() (LockID, bool) {
 	return h.held, h.held.Valid()
 }
 
-// ManagerLock returns the newest manager ServiceLock this host has accepted a
-// request from, and whether it has accepted any.
+// ObserveManagerLock records the authoritative live manager ServiceLock seen
+// elsewhere, or clears it when offered the zero LockID.
+//
+// The host never elects a manager from RPC traffic. Manager authority stays
+// external, and manager-directed requests are only accepted when their fence
+// matches the lock observed here. A stale observation cannot move authority
+// backwards.
+func (h *Host) ObserveManagerLock(lock LockID) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	if !lock.Valid() {
+		if lock == (LockID{}) {
+			h.manager = LockID{}
+			return nil
+		}
+		return fmt.Errorf("%w: %s", ErrInvalidLock, lock)
+	}
+	if h.manager.Valid() {
+		switch {
+		case lock.Equal(h.manager):
+			return nil
+		case !lock.Supersedes(h.manager):
+			return fmt.Errorf("%w: observed %s, already saw %s", ErrLockNotNewer, lock, h.manager)
+		}
+	}
+	h.manager = lock
+	return nil
+}
+
+// ManagerLock returns the authoritative live manager ServiceLock this host has
+// been told about, and whether one is currently known.
 func (h *Host) ManagerLock() (LockID, bool) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -424,11 +458,13 @@ func (h *Host) LoadFailed(attempt Attempt) error {
 // UnloadImmediate releases it on the spot for a forced unload or a
 // dead-server recovery handoff.
 //
-// It is idempotent by design: unassigning a tablet this host does not have —
-// because it was never assigned, already released, or dropped on a lock loss
-// — succeeds without changing anything. The manager asked for the tablet not
-// to be hosted here, and it is not. The fence is still checked first, so a
-// superseded manager cannot unassign anything.
+// It is idempotent only when the named extent is absent and no tracked tablet
+// still covers its rows. In that case the manager asked for the tablet not to
+// be hosted here, and it is not. A stale pre-split parent or post-merge child
+// is not safe to treat as "already gone": if overlapping coverage is still
+// tracked under another exact extent, reporting success would let the manager
+// place those rows elsewhere while this host still claims them. The fence is
+// still checked first, so a superseded manager cannot unassign anything.
 //
 // An unload mode this host does not implement is refused outright rather than
 // guessed at, so a corrupted or newer mode cannot silently become a drain
@@ -456,6 +492,10 @@ func (h *Host) Unassign(fence Fence, extent Extent, mode UnloadMode) (Attempt, e
 	}
 	entry, ok := h.tablets[extent.key()]
 	if !ok {
+		if conflict := h.overlapping(extent); conflict != nil {
+			return Attempt{}, fmt.Errorf("%w: %s is not tracked exactly; overlapping %s is %s",
+				ErrOverlapping, extent, conflict.extent, conflict.state)
+		}
 		return Attempt{}, nil
 	}
 	if mode == UnloadImmediate {
@@ -658,8 +698,10 @@ func lowerBoundIndex(entries []*tabletEntry, extent Extent) int {
 	})
 }
 
-// checkFence validates a manager-directed request against both locks. Callers
-// must hold h.mu.
+// checkFence validates a manager-directed request against both locks. The
+// manager lock must match the authoritative live manager lock observed through
+// ObserveManagerLock; request history alone never establishes authority.
+// Callers must hold h.mu.
 func (h *Host) checkFence(fence Fence) error {
 	if err := h.checkServerLock(fence.Server); err != nil {
 		return err
@@ -668,13 +710,14 @@ func (h *Host) checkFence(fence Fence) error {
 		h.metrics.RejectedStale++
 		return fmt.Errorf("%w: request carries no manager lock", ErrStaleManagerLock)
 	}
-	if h.manager.Valid() && !fence.Manager.Equal(h.manager) && !fence.Manager.Supersedes(h.manager) {
+	if !h.manager.Valid() {
 		h.metrics.RejectedStale++
-		return fmt.Errorf("%w: request from %s, following %s",
-			ErrStaleManagerLock, fence.Manager, h.manager)
+		return fmt.Errorf("%w: live manager lock unknown, request from %s", ErrStaleManagerLock, fence.Manager)
 	}
-	if !h.manager.Valid() || fence.Manager.Supersedes(h.manager) {
-		h.manager = fence.Manager
+	if !fence.Manager.Equal(h.manager) {
+		h.metrics.RejectedStale++
+		return fmt.Errorf("%w: request from %s, live manager is %s",
+			ErrStaleManagerLock, fence.Manager, h.manager)
 	}
 	return nil
 }

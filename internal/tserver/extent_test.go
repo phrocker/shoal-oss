@@ -73,7 +73,8 @@ func TestExtentValidate(t *testing.T) {
 // shares with cclient.KeyExtent and Accumulo's Java KeyExtent: nil and empty
 // are the same absent bound. If they were distinct, one tablet could be
 // assigned under one spelling and unassigned under the other, and the
-// fail-open Unassign would report success without releasing it.
+// idempotent missing-tablet path in Unassign would report success without
+// releasing it.
 func TestExtentTreatsEmptyBoundAsAbsent(t *testing.T) {
 	nilBound := Extent{TableID: "2", PrevEndRow: nil, EndRow: []byte("m")}
 	emptyBound := Extent{TableID: "2", PrevEndRow: []byte{}, EndRow: []byte("m")}

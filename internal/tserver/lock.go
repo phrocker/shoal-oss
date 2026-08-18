@@ -90,8 +90,9 @@ func (l LockID) String() string {
 //
 // Manager is the ServiceLock of the manager that issued the request. It exists
 // to keep a superseded manager from countermanding the live one — not to
-// second-guess the live manager, whose decisions are always applied. A newer
-// manager lock is adopted on sight.
+// second-guess the live manager, whose decisions are always applied. The live
+// manager lock is observed externally, and requests are only accepted when
+// this lock matches that authoritative observation.
 type Fence struct {
 	Server  LockID
 	Manager LockID

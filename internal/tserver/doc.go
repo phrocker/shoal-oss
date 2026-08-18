@@ -23,7 +23,9 @@
 // host: Host is a reactive state machine that applies manager-directed
 // transitions, rejects the ones that cannot be safely applied, and reports
 // what it currently hosts. It never assigns, migrates, or unassigns a tablet
-// on its own, and it never overrides a live manager's decision.
+// on its own, and it never overrides a live manager's decision. The live
+// manager lock that defines that authority is observed externally rather than
+// inferred from request history.
 //
 // What it does own is the fence. Every transition carries the ServiceLock
 // generation it was minted under, and anything that cannot be proven current

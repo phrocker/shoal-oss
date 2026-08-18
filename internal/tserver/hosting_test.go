@@ -42,6 +42,13 @@ func managerLock(sequence int64) LockID {
 	return LockID{UUID: managerUUID, Sequence: sequence}
 }
 
+func mustObserveManager(t *testing.T, host *Host, lock LockID) {
+	t.Helper()
+	if err := host.ObserveManagerLock(lock); err != nil {
+		t.Fatalf("ObserveManagerLock(%s): %v", lock, err)
+	}
+}
+
 // newTestHost returns a host holding a lock, plus that lock and a fence
 // stamped with it and a current manager.
 func newTestHost(t *testing.T) (*Host, LockID, Fence) {
@@ -51,7 +58,9 @@ func newTestHost(t *testing.T) (*Host, LockID, Fence) {
 	if err := host.AdoptLock(lock); err != nil {
 		t.Fatalf("AdoptLock: %v", err)
 	}
-	return host, lock, Fence{Server: lock, Manager: managerLock(7)}
+	manager := managerLock(7)
+	mustObserveManager(t, host, manager)
+	return host, lock, Fence{Server: lock, Manager: manager}
 }
 
 // hostTablet drives a tablet all the way to StateHosted and returns the
@@ -275,6 +284,7 @@ func TestSupersededManagerCannotCountermandTheLiveOne(t *testing.T) {
 	mustAssign(t, host, fence, old)
 
 	newer := Fence{Server: lock, Manager: managerLock(fence.Manager.Sequence + 1)}
+	mustObserveManager(t, host, newer.Manager)
 	if _, err := host.Assign(newer, current); err != nil {
 		t.Fatalf("a newer manager is the authority: %v", err)
 	}
@@ -291,6 +301,31 @@ func TestSupersededManagerCannotCountermandTheLiveOne(t *testing.T) {
 	if _, err := host.Assign(unstamped, extent("2", "q", "z")); !errors.Is(err, ErrStaleManagerLock) {
 		t.Fatalf("missing manager lock: want ErrStaleManagerLock, got %v", err)
 	}
+}
+
+// TestDelayedRPCFromSupersededManagerFailsBeforeSuccessorRequest covers the
+// first RPC that arrives after manager failover: once the live manager lock is
+// updated externally, the predecessor's delayed request is stale immediately
+// even if no request from the successor has reached this host yet.
+func TestDelayedRPCFromSupersededManagerFailsBeforeSuccessorRequest(t *testing.T) {
+	host, lock, fence := newTestHost(t)
+	e := extent("2", "", "m")
+
+	hostTablet(t, host, fence, e)
+
+	newer := Fence{Server: lock, Manager: managerLock(fence.Manager.Sequence + 1)}
+	mustObserveManager(t, host, newer.Manager)
+
+	if _, err := host.Unassign(fence, e, UnloadImmediate); !errors.Is(err, ErrStaleManagerLock) {
+		t.Fatalf("delayed predecessor RPC: want ErrStaleManagerLock, got %v", err)
+	}
+	wantState(t, host, e, StateHosted)
+	wantHosted(t, host, "2;m;<")
+
+	if _, err := host.Unassign(newer, e, UnloadImmediate); err != nil {
+		t.Fatalf("successor manager: %v", err)
+	}
+	wantState(t, host, e, StateUnassigned)
 }
 
 // TestGracefulUnloadDrainsThenReleases is the migration path: the tablet
@@ -357,9 +392,40 @@ func TestImmediateUnloadReleasesAtOnce(t *testing.T) {
 	}
 }
 
+// TestUnassignRejectsUnknownOverlappingExtent covers stale split/merge
+// metadata: when the exact extent is unknown but overlapping rows are still
+// assigned under another extent, treating the request as idempotent would let
+// those rows be hosted elsewhere too.
+func TestUnassignRejectsUnknownOverlappingExtent(t *testing.T) {
+	t.Run("parent after child", func(t *testing.T) {
+		host, _, fence := newTestHost(t)
+		child, parent := extent("2", "", "m"), extent("2", "", "")
+
+		hostTablet(t, host, fence, child)
+		if _, err := host.Unassign(fence, parent, UnloadImmediate); !errors.Is(err, ErrOverlapping) {
+			t.Fatalf("want ErrOverlapping, got %v", err)
+		}
+		wantState(t, host, child, StateHosted)
+		wantHosted(t, host, "2;m;<")
+	})
+
+	t.Run("child after parent", func(t *testing.T) {
+		host, _, fence := newTestHost(t)
+		parent, child := extent("2", "", ""), extent("2", "d", "m")
+
+		hostTablet(t, host, fence, parent)
+		if _, err := host.Unassign(fence, child, UnloadImmediate); !errors.Is(err, ErrOverlapping) {
+			t.Fatalf("want ErrOverlapping, got %v", err)
+		}
+		wantState(t, host, parent, StateHosted)
+		wantHosted(t, host, "2;<;<")
+	})
+}
+
 // TestUnassignIsIdempotent covers the manager retrying an unassignment, or
-// unassigning a tablet this host never had: the requested end state already
-// holds, so there is nothing to refuse.
+// unassigning a tablet this host never had once no tracked tablet still covers
+// those rows: the requested end state already holds, so there is nothing to
+// refuse.
 func TestUnassignIsIdempotent(t *testing.T) {
 	host, _, fence := newTestHost(t)
 	e := extent("2", "", "m")
@@ -722,8 +788,9 @@ func TestUnassignRejectsUnknownMode(t *testing.T) {
 // TestUnassignReleasesTabletSpelledWithEmptyBound covers the decode mismatch
 // the shared nil-or-empty bound semantics prevent. A tablet assigned with a
 // nil bound and unassigned with an empty one is the same tablet, so the
-// unassignment must release it — if the two keyed differently, the fail-open
-// Unassign would report success while the tablet stayed hosted here.
+// unassignment must release it — if the two keyed differently, the idempotent
+// missing-tablet path would report success while the tablet stayed hosted
+// here.
 func TestUnassignReleasesTabletSpelledWithEmptyBound(t *testing.T) {
 	host, _, fence := newTestHost(t)
 	assigned := Extent{TableID: "2", PrevEndRow: nil, EndRow: []byte("m")}
@@ -996,8 +1063,9 @@ func checkIndex(t *testing.T, host *Host) {
 
 // TestOverlapIndexMatchesFullScan is the differential test for the range
 // index: over a long randomized run of assignments and releases across
-// several tables, every Assign must reach exactly the outcome the original
-// full scan would have produced, and the index must stay consistent.
+// several tables, every Assign and the overlap-sensitive edge of Unassign
+// must reach exactly the outcome the original full scan would have produced,
+// and the index must stay consistent.
 func TestOverlapIndexMatchesFullScan(t *testing.T) {
 	host, _, fence := newTestHost(t)
 	rng := rand.New(rand.NewSource(1))
@@ -1008,11 +1076,25 @@ func TestOverlapIndexMatchesFullScan(t *testing.T) {
 		e := randomExtent(rng, tables[rng.Intn(len(tables))])
 
 		if rng.Intn(3) == 0 {
-			if _, tracked := host.tablets[e.key()]; tracked {
+			_, tracked := host.tablets[e.key()]
+			wantOverlap := anyOverlapByScan(host, e)
+			if tracked {
 				released++
 			}
-			if _, err := host.Unassign(fence, e, UnloadImmediate); err != nil {
-				t.Fatalf("step %d: Unassign(%s): %v", step, e, err)
+			_, err := host.Unassign(fence, e, UnloadImmediate)
+			switch {
+			case tracked:
+				if err != nil {
+					t.Fatalf("step %d: Unassign(%s): %v", step, e, err)
+				}
+			case wantOverlap:
+				if !errors.Is(err, ErrOverlapping) {
+					t.Fatalf("step %d: Unassign(%s): want ErrOverlapping, got %v", step, e, err)
+				}
+			default:
+				if err != nil {
+					t.Fatalf("step %d: Unassign(%s): %v", step, e, err)
+				}
 			}
 			checkIndex(t, host)
 			continue

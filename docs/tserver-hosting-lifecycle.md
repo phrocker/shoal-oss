@@ -108,8 +108,11 @@ was minted against a view of the cluster that no longer exists; a
 generation we do not hold cannot be verified at all. Both are refused.
 
 **Manager lock** — the lock held by the manager that issued the request.
-A newer manager lock is adopted on sight and becomes the authority. An
-older one, or a different holder at the same sequence, is refused.
+The live manager lock is observed externally from ZooKeeper, and requests
+are accepted only when this lock exactly matches that authoritative live
+manager identity. A delayed predecessor RPC is therefore stale as soon as
+the live-manager observation moves on, even before the successor has sent
+this host any request.
 
 Local completions (`LoadComplete`, `LoadFailed`, `UnloadComplete`) carry
 an `Attempt` instead: an opaque handle minted by `Assign`, naming one
@@ -184,19 +187,22 @@ Tracked extents in a table never overlap each other, so those two are the
 only ones that can reach it — which keeps loading N tablets at
 N log N comparisons instead of N².
 
-The manager-facing `Unassign` is the one deliberate exception, and it
-fails *open* rather than closed because doing so cannot multiply-host
-anything: unassigning a tablet this host does not have succeeds without
-changing anything. The manager asked for the tablet not to be hosted
-here, and it is not. The fence is still checked first, so a superseded
-manager cannot unassign anything.
+The manager-facing `Unassign` is the one deliberate exception, but only
+for an extent that is absent *and* has no overlapping coverage still
+tracked here. In that case the requested end state already holds:
+unassigning a tablet this host does not have succeeds without changing
+anything. A stale split/merge parent or child is not treated as
+idempotent, because returning success while another extent still covers
+those rows would let the manager place overlapping coverage elsewhere.
+The fence is still checked first, so a superseded manager cannot
+unassign anything.
 
 A row bound is *absent* when it is nil or empty; the two are the same
 bound. That matches `cclient.KeyExtent` and Accumulo's Java `KeyExtent`,
 where a null and an empty `Text` collapse on the wire. If the two were
 kept distinct, one tablet could arrive under two identities — assigned
-with a nil bound and unassigned with an empty one — and the fail-open
-`Unassign` would report success without ever releasing it.
+with a nil bound and unassigned with an empty one — and `Unassign`
+would report success without ever releasing it.
 
 ## 5. Lock loss and restart
 
