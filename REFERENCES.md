@@ -107,6 +107,39 @@ cribs land.
 - `core/src/main/thrift/security.thrift` — `TCredentials`
 - `core/src/main/thrift/client.thrift` — `TInfo`
 
+### Security administration (Accumulo revision `317c288568e9c46e7854aafb8bb8c4fda6260b12`)
+- `core/src/main/java/org/apache/accumulo/core/clientImpl/SecurityOperationsImpl.java`
+  - all user, authorization, and permission operations use the multiplexed
+    `ClientService` (`client`) rather than the Manager service
+  - RPC argument order is trace info, connector credentials, principal, then
+    password/authorizations/name/permission as applicable
+  - changing the authenticated principal's own password replaces the client
+    context credentials used by subsequent RPCs
+  - Shoal refreshes its scan, ingest, and manager adapter credential copies
+    before `ChangePassword` returns successfully; RPCs already in flight may
+    retain the prior snapshot. Adapter update failures are returned explicitly;
+    the cross-adapter refresh does not claim atomic swap or rollback semantics.
+  - table permission calls translate `NAMESPACE_DOESNT_EXIST` to
+    `TABLE_DOESNT_EXIST`
+- `core/src/main/java/org/apache/accumulo/core/security/SystemPermission.java`
+  - valid wire IDs are 0 through 11 (`GRANT` through
+    `OBTAIN_DELEGATION_TOKEN`)
+- `core/src/main/java/org/apache/accumulo/core/security/TablePermission.java`
+  - valid wire IDs are 2 through 8; 0 and 1 are intentionally unused legacy
+    gaps and must not be accepted
+- `core/src/main/java/org/apache/accumulo/core/security/NamespacePermission.java`
+  - valid wire IDs are 0 through 8
+- `core/src/main/java/org/apache/accumulo/core/security/Authorizations.java`
+  - authorization values are non-empty byte strings; collections are
+    duplicate-free, sorted, and defensively copied
+- `core/src/main/java/org/apache/accumulo/core/util/Validators.java`
+  - existing table and namespace segments use `\w+`; qualified table names
+    contain one namespace segment and one table segment
+  - the empty string is the valid, always-existing default namespace name
+- `core/src/main/thrift/client.thrift`
+  - authoritative Accumulo 4 RPC names, field IDs, argument order,
+    `SecurityErrorCode` values, and declared security/table exceptions
+
 ### Wire protocol
 - `core/.../rpc/AccumuloProtocolFactory.java`
   - `:49` `MAGIC_NUMBER = 0x41434355` ("ACCU" — A=41, C=43, C=43, U=55)
@@ -128,6 +161,65 @@ cribs land.
 - `core/.../iterators/system/VisibilityFilter.java`
 - `core/.../client/rfile/RFileScanner.java` — Marc's prior art (RFile reader
   upstream); reference, do not depend on
+
+### Bulk Import V2 (promotion, port target for #70)
+- `core/.../clientImpl/bulk/Bulk.java`
+  - Gson-serialized shape: `Mapping{tablet: Tablet{endRow, prevEndRow},
+    files: Collection<FileInfo>}`, `FileInfo{name, estSize, estEntries}` —
+    private field names are used verbatim as JSON keys (no Gson naming
+    policy)
+- `core/.../clientImpl/bulk/LoadMappingIterator.java`
+  - the load mapping file is a top-level JSON **array**, streamed via
+    `JsonReader.beginArray()`, one `Bulk.Mapping` per element
+  - entries must be in ascending `KeyExtent` order — throws
+    `IllegalStateException` otherwise
+  - `tableId` is supplied to the iterator's constructor separately; it is
+    not embedded in the per-entry JSON
+- `core/.../clientImpl/bulk/ByteArrayToBase64TypeAdapter.java`
+  - `endRow`/`prevEndRow` `byte[]` fields are serialized with
+    `Base64.getUrlEncoder()`/`getUrlDecoder()` (URL-safe, padded — Go's
+    `base64.URLEncoding`); Gson's default null-suppression omits the JSON
+    key entirely for a nil field rather than emitting `null`
+- `core/src/main/java/org/apache/accumulo/core/Constants.java`
+  - `BULK_LOAD_MAPPING = "loadmap.json"` — fixed filename at the bulk
+    directory root
+  - `BULK_RENAME_FILE = "renames.json"` — a separate, server-side-only
+    artifact from a later FATE phase; not a client concern
+- `core/.../dataImpl/KeyExtent.java`
+  - `compareTo` ordering: ascending by `endRow`, with a null (unbounded)
+    `endRow` sorting **last** (`Comparator.nullsLast`) — this is the order
+    `LoadMappingIterator` requires
+  - `contains(row)` = `(prevEndRow == null || prevEndRow < row) &&
+    (endRow == null || endRow >= row)`, i.e. `(prevEndRow, endRow]` —
+    exclusive start, inclusive end. `rowAfterPrevRow()` (append a trailing
+    `0x00` byte) is Accumulo's own "successor" helper for this convention;
+    there is no symmetric "predecessor" helper, which is why Shoal's
+    opposite-convention local tablets (`[start, end)`, see
+    `internal/engine/table.go`'s `routeTablet`) cannot be translated to
+    exact `KeyExtent`s via simple byte math (`docs/promotion.md` §3)
+- `core/.../clientImpl/bulk/BulkImport.java`
+  - `computeMappingFromFiles` — the default path: opens each RFile's index
+    and queries the destination table's live tablet metadata to compute a
+    load mapping. Shoal does not use this path (see `docs/promotion.md`
+    §3): it uses the caller-supplied-partition path instead
+    (`LoadPlan`/`RangeType.TABLE`), building KeyExtents directly from
+    Shoal's own `RFileExportManifest` tablet partitioning
+- `server/manager/.../FateServiceHandler.java` and
+  `server/manager/.../tableOps/bulkVer2/PrepBulkImport.java`
+  - FATE argument shape for `TABLE_BULK_IMPORT2` (tableId, bulk dir,
+    setTime), plus `validateLoadMapping`, the server-side split
+    **validation** step run before any file is loaded
+    (`managerclient.TableBulkImport` / `accumulo.Connector.BulkImport`
+    mirror the client-side call shape only; validation itself is entirely
+    server-side and out of scope here). `validateLoadMapping` does **not**
+    create or reconcile splits: it walks the destination's real, current
+    tablets and requires each load-mapping entry's `prevEndRow`/`endRow` to
+    individually match some real tablet boundary (a file may span several
+    destination tablets), rejecting the whole FATE operation with
+    `BULK_CONCURRENT_MERGE` ("Concurrent merge happened") if that walk
+    fails. Shoal's current safe promotion slice avoids that split-bearing
+    path entirely by rejecting multi-tablet/split manifests before
+    staging (`docs/promotion.md` §3).
 
 ## Sharkbite
 

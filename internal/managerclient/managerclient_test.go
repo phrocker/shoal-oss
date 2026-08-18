@@ -59,6 +59,43 @@ func TestPooledExecuteLifecycleAndReuse(t *testing.T) {
 	}
 }
 
+func TestPooledExecuteBulkImportLifecycle(t *testing.T) {
+	pooled, pool := newTestPooled(t)
+	defer pool.Close()
+
+	rpc := &fakeFateRPC{id: fateID{Type: 1, UUID: "bulk-1"}}
+	pooled.dial = func(context.Context, transportpool.Key) (io.Closer, error) {
+		return &fakeTransport{rpc: rpc}, nil
+	}
+	pooled.newClient = clientFromFakeTransport
+
+	req := Request{
+		Operation: TableBulkImport,
+		Instance:  FateUser,
+		Arguments: [][]byte{[]byte("t-1"), []byte("hdfs://nn/bulk/events"), []byte("true")},
+		Options:   map[string]string{},
+	}
+	if err := pooled.Execute(context.Background(), "manager:9997", req); err != nil {
+		t.Fatal(err)
+	}
+	if rpc.begin.Load() != 1 || rpc.execute.Load() != 1 || rpc.waitCalls.Load() != 1 || rpc.finish.Load() != 1 {
+		t.Fatalf("calls begin/execute/wait/finish = %d/%d/%d/%d",
+			rpc.begin.Load(), rpc.execute.Load(), rpc.waitCalls.Load(), rpc.finish.Load())
+	}
+	if rpc.request.Operation != TableBulkImport {
+		t.Fatalf("operation = %v, want TableBulkImport", rpc.request.Operation)
+	}
+	wantArgs := []string{"t-1", "hdfs://nn/bulk/events", "true"}
+	if len(rpc.request.Arguments) != len(wantArgs) {
+		t.Fatalf("arguments = %#v, want %v", rpc.request.Arguments, wantArgs)
+	}
+	for i, want := range wantArgs {
+		if got := string(rpc.request.Arguments[i]); got != want {
+			t.Fatalf("argument %d = %q, want %q", i, got, want)
+		}
+	}
+}
+
 func TestPooledFinishesAfterOperationFailure(t *testing.T) {
 	pooled, pool := newTestPooled(t)
 	defer pool.Close()
@@ -492,6 +529,66 @@ func TestWaitForFlushNilRowsAreAbsentOnWire(t *testing.T) {
 	}
 }
 
+func TestThriftOperationMapping(t *testing.T) {
+	tests := []struct {
+		op   Operation
+		want manager.TFateOperation
+	}{
+		{TableCreate, manager.TFateOperation_TABLE_CREATE},
+		{TableDelete, manager.TFateOperation_TABLE_DELETE},
+		{TableRename, manager.TFateOperation_TABLE_RENAME},
+		{TableBulkImport, manager.TFateOperation_TABLE_BULK_IMPORT2},
+	}
+	for _, tt := range tests {
+		if got := thriftOperation(tt.op); got != tt.want {
+			t.Fatalf("thriftOperation(%v) = %v, want %v", tt.op, got, tt.want)
+		}
+	}
+}
+
+func TestThriftOperationPanicsOnUnknownOperation(t *testing.T) {
+	defer func() {
+		if recover() == nil {
+			t.Fatal("thriftOperation did not panic on an unknown operation")
+		}
+	}()
+	thriftOperation(Operation(-1))
+}
+
+func TestValidateRequestArgumentCounts(t *testing.T) {
+	args := func(n int) [][]byte {
+		out := make([][]byte, n)
+		for i := range out {
+			out[i] = []byte("x")
+		}
+		return out
+	}
+	tests := []struct {
+		name    string
+		req     Request
+		wantErr bool
+	}{
+		{"create exact", Request{Operation: TableCreate, Instance: FateUser, Arguments: args(5)}, false},
+		{"create short", Request{Operation: TableCreate, Instance: FateUser, Arguments: args(4)}, true},
+		{"delete exact", Request{Operation: TableDelete, Instance: FateUser, Arguments: args(1)}, false},
+		{"delete extra", Request{Operation: TableDelete, Instance: FateUser, Arguments: args(2)}, true},
+		{"rename exact", Request{Operation: TableRename, Instance: FateUser, Arguments: args(2)}, false},
+		{"rename short", Request{Operation: TableRename, Instance: FateUser, Arguments: args(1)}, true},
+		{"bulk import exact", Request{Operation: TableBulkImport, Instance: FateUser, Arguments: args(3)}, false},
+		{"bulk import short", Request{Operation: TableBulkImport, Instance: FateUser, Arguments: args(2)}, true},
+		{"bulk import extra", Request{Operation: TableBulkImport, Instance: FateMeta, Arguments: args(4)}, true},
+		{"unknown operation", Request{Operation: Operation(99), Instance: FateUser, Arguments: args(3)}, true},
+		{"unknown instance", Request{Operation: TableBulkImport, Instance: FateInstance(99), Arguments: args(3)}, true},
+		{"nil argument", Request{Operation: TableBulkImport, Instance: FateUser, Arguments: [][]byte{[]byte("id"), nil, []byte("true")}}, true},
+	}
+	for _, tt := range tests {
+		err := validateRequest(tt.req)
+		if (err != nil) != tt.wantErr {
+			t.Fatalf("%s: validateRequest error = %v, wantErr %v", tt.name, err, tt.wantErr)
+		}
+	}
+}
+
 func TestMapRPCError(t *testing.T) {
 	tests := []struct {
 		err  error
@@ -667,6 +764,242 @@ func TestPooledGetTableConfigurationValidationAndRetryClassification(t *testing.
 	}
 }
 
+func TestPooledSecuritySuccessPreservesPostResponseCleanupFailure(t *testing.T) {
+	pool, err := transportpool.New(transportpool.Config{MaxIdlePerEndpoint: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	pooled, err := NewPooled(pool, "uuid-1", "4.0.0-SNAPSHOT", &security.TCredentials{
+		Principal:      "root",
+		TokenClassName: "PasswordToken",
+		Token:          []byte("secret"),
+		InstanceId:     "uuid-1",
+	}, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cleanupErr := thrift.NewTTransportExceptionFromError(errors.New("close failed"))
+	rpc := &recordingSecurityRPC{}
+	pooled.dial = func(context.Context, transportpool.Key) (io.Closer, error) {
+		return &fakeTransport{service: rpc, closeErr: cleanupErr}, nil
+	}
+	pooled.newServiceClient = serviceFromFakeTransport
+
+	err = pooled.ChangeLocalUserPassword(
+		context.Background(),
+		"server:9997",
+		"root",
+		[]byte("new-secret"),
+	)
+	var postResponseErr *PostResponseCleanupError
+	if !errors.As(err, &postResponseErr) || !errors.Is(err, cleanupErr) {
+		t.Fatalf("error = %#v, want post-response cleanup error", err)
+	}
+	if IsRetryableEndpointError(err) {
+		t.Fatal("post-response cleanup error must not be retried")
+	}
+	if !slices.Equal(rpc.operations, []string{"changeLocalUserPassword"}) {
+		t.Fatalf("operations = %v", rpc.operations)
+	}
+}
+
+func TestPooledSecurityRPCSelectionArgumentsAndCopies(t *testing.T) {
+	pooled, pool := newTestPooled(t)
+	defer pool.Close()
+
+	rpc := &recordingSecurityRPC{authResult: [][]byte{[]byte("server")}, boolResult: true}
+	pooled.dial = func(_ context.Context, key transportpool.Key) (io.Closer, error) {
+		if key.Service != clientServiceName {
+			t.Fatalf("service = %q, want %q", key.Service, clientServiceName)
+		}
+		return &fakeTransport{service: rpc}, nil
+	}
+	pooled.newServiceClient = serviceFromFakeTransport
+	ctx := context.Background()
+	password := []byte("secret")
+	auths := [][]byte{[]byte("alpha"), []byte("beta")}
+
+	if err := pooled.CreateLocalUser(ctx, "server:9997", "alice", password); err != nil {
+		t.Fatal(err)
+	}
+	if err := pooled.DropLocalUser(ctx, "server:9997", "alice"); err != nil {
+		t.Fatal(err)
+	}
+	if err := pooled.ChangeLocalUserPassword(ctx, "server:9997", "alice", password); err != nil {
+		t.Fatal(err)
+	}
+	if err := pooled.ChangeUserAuthorizations(ctx, "server:9997", "alice", auths); err != nil {
+		t.Fatal(err)
+	}
+	gotAuths, err := pooled.GetUserAuthorizations(ctx, "server:9997", "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := pooled.HasSystemPermission(ctx, "server:9997", "alice", 4); err != nil || !ok {
+		t.Fatalf("has system = %v, %v", ok, err)
+	}
+	if ok, err := pooled.HasTablePermission(ctx, "server:9997", "alice", "events", 6); err != nil || !ok {
+		t.Fatalf("has table = %v, %v", ok, err)
+	}
+	if ok, err := pooled.HasNamespacePermission(ctx, "server:9997", "alice", "analytics", 3); err != nil || !ok {
+		t.Fatalf("has namespace = %v, %v", ok, err)
+	}
+	for _, call := range []func() error{
+		func() error { return pooled.GrantSystemPermission(ctx, "server:9997", "alice", 1) },
+		func() error { return pooled.RevokeSystemPermission(ctx, "server:9997", "alice", 2) },
+		func() error { return pooled.GrantTablePermission(ctx, "server:9997", "alice", "events", 3) },
+		func() error { return pooled.RevokeTablePermission(ctx, "server:9997", "alice", "events", 4) },
+		func() error {
+			return pooled.GrantNamespacePermission(ctx, "server:9997", "alice", "analytics", 5)
+		},
+		func() error {
+			return pooled.RevokeNamespacePermission(ctx, "server:9997", "alice", "analytics", 6)
+		},
+	} {
+		if err := call(); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	wantOps := []string{
+		"createLocalUser", "dropLocalUser", "changeLocalUserPassword",
+		"changeAuthorizations", "getUserAuthorizations", "hasSystemPermission",
+		"hasTablePermission", "hasNamespacePermission", "grantSystemPermission",
+		"revokeSystemPermission", "grantTablePermission", "revokeTablePermission",
+		"grantNamespacePermission", "revokeNamespacePermission",
+	}
+	if !slices.Equal(rpc.operations, wantOps) {
+		t.Fatalf("operations = %v, want %v", rpc.operations, wantOps)
+	}
+	if rpc.principal != "alice" || rpc.tableName != "events" || rpc.namespace != "analytics" {
+		t.Fatalf("arguments principal/table/namespace = %q/%q/%q",
+			rpc.principal, rpc.tableName, rpc.namespace)
+	}
+	if !slices.Equal(rpc.password, []byte("secret")) ||
+		len(rpc.authorizations) != 2 ||
+		!slices.Equal(rpc.authorizations[0], []byte("alpha")) {
+		t.Fatalf("password/auth arguments = %q/%q", rpc.password, rpc.authorizations)
+	}
+	password[0] = 'X'
+	auths[0][0] = 'X'
+	gotAuths[0][0] = 'X'
+	if rpc.password[0] != 's' || rpc.authorizations[0][0] != 'a' || rpc.authResult[0][0] != 's' {
+		t.Fatal("caller mutation leaked into RPC-owned values")
+	}
+}
+
+func TestPooledUpdateCredentialsCopiesReplacementForNextRPCAndRejectsClosed(t *testing.T) {
+	pooled, pool := newTestPooled(t)
+	defer pool.Close()
+
+	rpc := &recordingSecurityRPC{}
+	pooled.dial = func(context.Context, transportpool.Key) (io.Closer, error) {
+		return &fakeTransport{service: rpc}, nil
+	}
+	pooled.newServiceClient = serviceFromFakeTransport
+	replacement := &security.TCredentials{
+		Principal:      "root",
+		TokenClassName: "PasswordToken",
+		Token:          []byte("replacement"),
+		InstanceId:     "uuid-1",
+	}
+	if err := pooled.UpdateCredentials(replacement); err != nil {
+		t.Fatal(err)
+	}
+	replacement.Token[0] = 'X'
+	if err := pooled.DropLocalUser(context.Background(), "server:9997", "alice"); err != nil {
+		t.Fatal(err)
+	}
+	if got := rpc.credentialToken(); string(got) != "replacement" || string(got) == "secret" {
+		t.Fatalf("RPC token = %q, want isolated replacement", got)
+	}
+	if err := pooled.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := pooled.UpdateCredentials(&security.TCredentials{Token: []byte("later")}); err == nil ||
+		err.Error() != "managerclient: pooled client is closed" {
+		t.Fatalf("closed update error = %v", err)
+	}
+}
+
+func TestThriftSecurityRPCMethodNamesAndGeneratedArgumentOrder(t *testing.T) {
+	capture := &captureThriftClient{}
+	rpc := thriftClientRPC{raw: clientgen.NewClientServiceClient(capture)}
+	ctx := context.Background()
+	credentials := &security.TCredentials{Principal: "root"}
+
+	calls := []func() error{
+		func() error { return rpc.CreateLocalUser(ctx, credentials, "alice", []byte("pw")) },
+		func() error { return rpc.DropLocalUser(ctx, credentials, "alice") },
+		func() error { return rpc.ChangeLocalUserPassword(ctx, credentials, "alice", []byte("new")) },
+		func() error {
+			return rpc.ChangeUserAuthorizations(ctx, credentials, "alice", [][]byte{[]byte("a")})
+		},
+		func() error {
+			_, err := rpc.GetUserAuthorizations(ctx, credentials, "alice")
+			return err
+		},
+		func() error {
+			_, err := rpc.HasSystemPermission(ctx, credentials, "alice", 4)
+			return err
+		},
+		func() error {
+			_, err := rpc.HasTablePermission(ctx, credentials, "alice", "events", 6)
+			return err
+		},
+		func() error {
+			_, err := rpc.HasNamespacePermission(ctx, credentials, "alice", "analytics", 3)
+			return err
+		},
+		func() error { return rpc.GrantSystemPermission(ctx, credentials, "alice", 1) },
+		func() error { return rpc.RevokeSystemPermission(ctx, credentials, "alice", 2) },
+		func() error { return rpc.GrantTablePermission(ctx, credentials, "alice", "events", 3) },
+		func() error { return rpc.RevokeTablePermission(ctx, credentials, "alice", "events", 4) },
+		func() error {
+			return rpc.GrantNamespacePermission(ctx, credentials, "alice", "analytics", 5)
+		},
+		func() error {
+			return rpc.RevokeNamespacePermission(ctx, credentials, "alice", "analytics", 6)
+		},
+	}
+	for _, call := range calls {
+		if err := call(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	wantMethods := []string{
+		"createLocalUser", "dropLocalUser", "changeLocalUserPassword",
+		"changeAuthorizations", "getUserAuthorizations", "hasSystemPermission",
+		"hasTablePermission", "hasNamespacePermission", "grantSystemPermission",
+		"revokeSystemPermission", "grantTablePermission", "revokeTablePermission",
+		"grantNamespacePermission", "revokeNamespacePermission",
+	}
+	if !slices.Equal(capture.methods, wantMethods) {
+		t.Fatalf("methods = %v, want %v", capture.methods, wantMethods)
+	}
+	create := capture.args[0].(*clientgen.ClientServiceCreateLocalUserArgs)
+	if create.Tinfo == nil || create.Credentials != credentials ||
+		create.Principal != "alice" || !slices.Equal(create.Password, []byte("pw")) {
+		t.Fatalf("create args = %#v", create)
+	}
+	changeAuths := capture.args[3].(*clientgen.ClientServiceChangeAuthorizationsArgs)
+	if changeAuths.Principal != "alice" || len(changeAuths.Authorizations) != 1 ||
+		!slices.Equal(changeAuths.Authorizations[0], []byte("a")) {
+		t.Fatalf("change auth args = %#v", changeAuths)
+	}
+	hasTable := capture.args[6].(*clientgen.ClientServiceHasTablePermissionArgs)
+	if hasTable.Principal != "alice" || hasTable.TableName != "events" || hasTable.TblPerm != 6 {
+		t.Fatalf("has table args = %#v", hasTable)
+	}
+	grantNamespace := capture.args[12].(*clientgen.ClientServiceGrantNamespacePermissionArgs)
+	if grantNamespace.Principal != "alice" || grantNamespace.Ns != "analytics" ||
+		grantNamespace.Permission != 5 {
+		t.Fatalf("grant namespace args = %#v", grantNamespace)
+	}
+}
+
 func newTestPooled(t *testing.T) (*Pooled, *transportpool.Pool) {
 	t.Helper()
 	pool, err := transportpool.New(transportpool.Config{MaxIdlePerEndpoint: 1})
@@ -695,15 +1028,16 @@ func createRequest(name string) Request {
 }
 
 type fakeTransport struct {
-	rpc     fateRPC
-	manager managerRPC
-	service clientRPC
-	closes  atomic.Int32
+	rpc      fateRPC
+	manager  managerRPC
+	service  clientRPC
+	closes   atomic.Int32
+	closeErr error
 }
 
 func (t *fakeTransport) Close() error {
 	t.closes.Add(1)
-	return nil
+	return t.closeErr
 }
 
 func clientFromFakeTransport(transport io.Closer) (fateRPC, error) {
@@ -719,11 +1053,280 @@ func serviceFromFakeTransport(transport io.Closer) (clientRPC, error) {
 }
 
 type fakeClientRPC struct {
+	noopClientRPC
 	properties map[string]string
 	err        error
 	call       func(context.Context) error
 	tableName  string
 	calls      atomic.Int32
+}
+
+type captureThriftClient struct {
+	methods []string
+	args    []thrift.TStruct
+}
+
+func (c *captureThriftClient) Call(
+	_ context.Context,
+	method string,
+	args, _ thrift.TStruct,
+) (thrift.ResponseMeta, error) {
+	c.methods = append(c.methods, method)
+	c.args = append(c.args, args)
+	return thrift.ResponseMeta{}, nil
+}
+
+type noopClientRPC struct{}
+
+func (noopClientRPC) GetTableConfiguration(
+	context.Context, *security.TCredentials, string,
+) (map[string]string, error) {
+	return nil, nil
+}
+func (noopClientRPC) CreateLocalUser(
+	context.Context, *security.TCredentials, string, []byte,
+) error {
+	return nil
+}
+func (noopClientRPC) DropLocalUser(context.Context, *security.TCredentials, string) error {
+	return nil
+}
+func (noopClientRPC) ChangeLocalUserPassword(
+	context.Context, *security.TCredentials, string, []byte,
+) error {
+	return nil
+}
+func (noopClientRPC) ChangeUserAuthorizations(
+	context.Context, *security.TCredentials, string, [][]byte,
+) error {
+	return nil
+}
+func (noopClientRPC) GetUserAuthorizations(
+	context.Context, *security.TCredentials, string,
+) ([][]byte, error) {
+	return nil, nil
+}
+func (noopClientRPC) HasSystemPermission(
+	context.Context, *security.TCredentials, string, int8,
+) (bool, error) {
+	return false, nil
+}
+func (noopClientRPC) HasTablePermission(
+	context.Context, *security.TCredentials, string, string, int8,
+) (bool, error) {
+	return false, nil
+}
+func (noopClientRPC) HasNamespacePermission(
+	context.Context, *security.TCredentials, string, string, int8,
+) (bool, error) {
+	return false, nil
+}
+func (noopClientRPC) GrantSystemPermission(
+	context.Context, *security.TCredentials, string, int8,
+) error {
+	return nil
+}
+func (noopClientRPC) RevokeSystemPermission(
+	context.Context, *security.TCredentials, string, int8,
+) error {
+	return nil
+}
+func (noopClientRPC) GrantTablePermission(
+	context.Context, *security.TCredentials, string, string, int8,
+) error {
+	return nil
+}
+func (noopClientRPC) RevokeTablePermission(
+	context.Context, *security.TCredentials, string, string, int8,
+) error {
+	return nil
+}
+func (noopClientRPC) GrantNamespacePermission(
+	context.Context, *security.TCredentials, string, string, int8,
+) error {
+	return nil
+}
+func (noopClientRPC) RevokeNamespacePermission(
+	context.Context, *security.TCredentials, string, string, int8,
+) error {
+	return nil
+}
+
+type recordingSecurityRPC struct {
+	noopClientRPC
+	operations     []string
+	principal      string
+	tableName      string
+	namespace      string
+	permission     int8
+	password       []byte
+	authorizations [][]byte
+	authResult     [][]byte
+	boolResult     bool
+	credentials    *security.TCredentials
+}
+
+func (r *recordingSecurityRPC) record(operation, principal string) {
+	r.operations = append(r.operations, operation)
+	r.principal = principal
+}
+
+func (r *recordingSecurityRPC) CreateLocalUser(
+	_ context.Context,
+	_ *security.TCredentials,
+	principal string,
+	password []byte,
+) error {
+	r.record("createLocalUser", principal)
+	r.password = append([]byte(nil), password...)
+	return nil
+}
+
+func (r *recordingSecurityRPC) DropLocalUser(
+	_ context.Context,
+	credentials *security.TCredentials,
+	principal string,
+) error {
+	r.record("dropLocalUser", principal)
+	r.credentials = cloneCredentials(credentials)
+	return nil
+}
+
+func (r *recordingSecurityRPC) credentialToken() []byte {
+	if r.credentials == nil {
+		return nil
+	}
+	return append([]byte(nil), r.credentials.Token...)
+}
+
+func (r *recordingSecurityRPC) ChangeLocalUserPassword(
+	_ context.Context,
+	_ *security.TCredentials,
+	principal string,
+	password []byte,
+) error {
+	r.record("changeLocalUserPassword", principal)
+	r.password = append([]byte(nil), password...)
+	return nil
+}
+
+func (r *recordingSecurityRPC) ChangeUserAuthorizations(
+	_ context.Context,
+	_ *security.TCredentials,
+	principal string,
+	authorizations [][]byte,
+) error {
+	r.record("changeAuthorizations", principal)
+	r.authorizations = cloneArguments(authorizations)
+	return nil
+}
+
+func (r *recordingSecurityRPC) GetUserAuthorizations(
+	_ context.Context,
+	_ *security.TCredentials,
+	principal string,
+) ([][]byte, error) {
+	r.record("getUserAuthorizations", principal)
+	return r.authResult, nil
+}
+
+func (r *recordingSecurityRPC) HasSystemPermission(
+	_ context.Context,
+	_ *security.TCredentials,
+	principal string,
+	permission int8,
+) (bool, error) {
+	r.record("hasSystemPermission", principal)
+	r.permission = permission
+	return r.boolResult, nil
+}
+
+func (r *recordingSecurityRPC) HasTablePermission(
+	_ context.Context,
+	_ *security.TCredentials,
+	principal, tableName string,
+	permission int8,
+) (bool, error) {
+	r.record("hasTablePermission", principal)
+	r.tableName, r.permission = tableName, permission
+	return r.boolResult, nil
+}
+
+func (r *recordingSecurityRPC) HasNamespacePermission(
+	_ context.Context,
+	_ *security.TCredentials,
+	principal, namespace string,
+	permission int8,
+) (bool, error) {
+	r.record("hasNamespacePermission", principal)
+	r.namespace, r.permission = namespace, permission
+	return r.boolResult, nil
+}
+
+func (r *recordingSecurityRPC) GrantSystemPermission(
+	_ context.Context,
+	_ *security.TCredentials,
+	principal string,
+	permission int8,
+) error {
+	r.record("grantSystemPermission", principal)
+	r.permission = permission
+	return nil
+}
+
+func (r *recordingSecurityRPC) RevokeSystemPermission(
+	_ context.Context,
+	_ *security.TCredentials,
+	principal string,
+	permission int8,
+) error {
+	r.record("revokeSystemPermission", principal)
+	r.permission = permission
+	return nil
+}
+
+func (r *recordingSecurityRPC) GrantTablePermission(
+	_ context.Context,
+	_ *security.TCredentials,
+	principal, tableName string,
+	permission int8,
+) error {
+	r.record("grantTablePermission", principal)
+	r.tableName, r.permission = tableName, permission
+	return nil
+}
+
+func (r *recordingSecurityRPC) RevokeTablePermission(
+	_ context.Context,
+	_ *security.TCredentials,
+	principal, tableName string,
+	permission int8,
+) error {
+	r.record("revokeTablePermission", principal)
+	r.tableName, r.permission = tableName, permission
+	return nil
+}
+
+func (r *recordingSecurityRPC) GrantNamespacePermission(
+	_ context.Context,
+	_ *security.TCredentials,
+	principal, namespace string,
+	permission int8,
+) error {
+	r.record("grantNamespacePermission", principal)
+	r.namespace, r.permission = namespace, permission
+	return nil
+}
+
+func (r *recordingSecurityRPC) RevokeNamespacePermission(
+	_ context.Context,
+	_ *security.TCredentials,
+	principal, namespace string,
+	permission int8,
+) error {
+	r.record("revokeNamespacePermission", principal)
+	r.namespace, r.permission = namespace, permission
+	return nil
 }
 
 func (r *fakeClientRPC) GetTableConfiguration(
