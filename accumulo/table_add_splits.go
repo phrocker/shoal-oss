@@ -162,7 +162,7 @@ func (c *Connector) AddTableSplits(ctx context.Context, tableName string, splits
 	}
 
 	defer func() {
-		discovery.invalidateAll()
+		discovery.tablets.InvalidateTable(tableID)
 	}()
 
 	return addSplits(ctx, splitTarget{

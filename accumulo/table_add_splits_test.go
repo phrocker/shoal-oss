@@ -1067,9 +1067,23 @@ func TestAddTableSplitsRequiresManagerAddress(t *testing.T) {
 var errManagerLookup = errors.New("manager lookup failed")
 
 func TestAddTableSplitsInvalidatesDiscoveryAfterAttempts(t *testing.T) {
-	walker := &scriptedTabletWalker{rounds: [][]metadata.TabletInfo{splitTestTablets()}}
+	walker := &fakeTabletWalker{tablets: map[string][]metadata.TabletInfo{
+		"1": splitTestTablets(),
+		"2": {
+			{TableID: "2", EndRow: []byte("n")},
+			{TableID: "2", PrevRow: []byte("n")},
+		},
+	}}
 	names := splitTestNames()
+	names.byName["reports"] = "2"
+	names.byID["2"] = "reports"
 	connector, manager := splitTestConnector(t, walker, names)
+	if _, err := connector.discovery.tablets.LocateTable(context.Background(), "2"); err != nil {
+		t.Fatal(err)
+	}
+	if len(connector.discovery.tablets.Snapshot("2")) == 0 {
+		t.Fatal("expected the unrelated table cache to be primed")
+	}
 
 	if err := connector.AddTableSplits(
 		context.Background(),
@@ -1078,11 +1092,14 @@ func TestAddTableSplitsInvalidatesDiscoveryAfterAttempts(t *testing.T) {
 	); err != nil {
 		t.Fatal(err)
 	}
-	if names.invalidates != 2 {
-		t.Fatalf("name invalidations = %d, want 2", names.invalidates)
+	if names.invalidates != 1 {
+		t.Fatalf("name invalidations = %d, want 1", names.invalidates)
 	}
 	if len(connector.discovery.tablets.Snapshot("1")) != 0 {
 		t.Fatal("tablet cache survived a completed split")
+	}
+	if len(connector.discovery.tablets.Snapshot("2")) == 0 {
+		t.Fatal("completed split evicted an unrelated table cache")
 	}
 
 	manager.statusFn = func(int, managerclient.Request) (string, error) {
@@ -1095,8 +1112,11 @@ func TestAddTableSplitsInvalidatesDiscoveryAfterAttempts(t *testing.T) {
 	); !errors.Is(err, ErrPermissionDenied) {
 		t.Fatal("expected the scripted permission failure")
 	}
-	if names.invalidates != 4 {
-		t.Fatalf("name invalidations = %d, want 4 after a failed split", names.invalidates)
+	if names.invalidates != 2 {
+		t.Fatalf("name invalidations = %d, want 2 after a failed split", names.invalidates)
+	}
+	if len(connector.discovery.tablets.Snapshot("2")) == 0 {
+		t.Fatal("failed split evicted an unrelated table cache")
 	}
 }
 

@@ -329,10 +329,16 @@ func (p *Pooled) ExecuteStatus(
 		return "", mapRPCError(err)
 	}
 
+	var executeCleanupErr error
 	if _, err := withClient(p, ctx, address, func(rpc fateRPC) (struct{}, error) {
 		return struct{}{}, rpc.Execute(ctx, credentials, id, req)
 	}); err != nil {
-		return "", mapRPCError(err)
+		var cleanupErr *PostResponseCleanupError
+		if errors.As(err, &cleanupErr) {
+			executeCleanupErr = cleanupErr.Err
+		} else {
+			return "", mapRPCError(err)
+		}
 	}
 	status, err = withClient(p, ctx, address, func(rpc fateRPC) (string, error) {
 		return rpc.Wait(ctx, credentials, id)
@@ -340,11 +346,11 @@ func (p *Pooled) ExecuteStatus(
 	if err != nil {
 		var cleanupErr *PostResponseCleanupError
 		if errors.As(err, &cleanupErr) {
-			return status, cleanupErr.Err
+			return status, errors.Join(executeCleanupErr, cleanupErr.Err)
 		}
-		return status, mapRPCError(err)
+		return status, errors.Join(executeCleanupErr, mapRPCError(err))
 	}
-	return status, nil
+	return status, executeCleanupErr
 }
 
 func (p *Pooled) SetTableProperty(
