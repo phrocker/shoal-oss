@@ -30,6 +30,23 @@ func TestStagePathsAliasWindowsDrivePathReachesSameFile(t *testing.T) {
 	}
 }
 
+func TestStagePathsAliasWindowsTrailingDotOrSpaceAliases(t *testing.T) {
+	dir := t.TempDir()
+	realPath := filepath.Join(dir, "real.rf")
+	if err := os.WriteFile(realPath, []byte("data"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, alias := range []string{
+		filepath.Join(dir, "real.rf."),
+		filepath.Join(dir, "real.rf "),
+	} {
+		if !stagePathsAlias(alias, realPath) {
+			t.Fatalf("stagePathsAlias(%q, %q) = false, want true for a Windows trailing dot/space alias", alias, realPath)
+		}
+	}
+}
+
 func toWindowsDoubleSlashDrivePath(t *testing.T, path string) string {
 	t.Helper()
 

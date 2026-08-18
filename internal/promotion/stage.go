@@ -7,9 +7,8 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"sort"
 	"strings"
-
-	"golang.org/x/text/unicode/norm"
 
 	"github.com/phrocker/shoal/internal/engine"
 	"github.com/phrocker/shoal/internal/storage"
@@ -87,29 +86,31 @@ func StageBulkDir(
 	if err := validateBulkDir(bulkDir); err != nil {
 		return nil, err
 	}
-	mapping, err := BuildLoadMapping(manifest)
-	if err != nil {
-		return nil, err
-	}
-	flatNames, err := flattenNames(manifest.RFiles)
-	if err != nil {
+	if _, _, err := resolveManifestTablet(manifest); err != nil {
 		return nil, err
 	}
 	if err := engine.VerifyRFileExport(ctx, src, manifest); err != nil {
 		return nil, fmt.Errorf("promotion: stage: %w", err)
 	}
+	stageRFiles, err := dedupeStageSources(src, manifest.RFiles)
+	if err != nil {
+		return nil, err
+	}
+	stageManifest := *manifest
+	stageManifest.RFiles = stageRFiles
+
+	mapping, err := BuildLoadMapping(&stageManifest)
+	if err != nil {
+		return nil, err
+	}
+	flatNames, err := flattenNames(stageManifest.RFiles)
+	if err != nil {
+		return nil, err
+	}
 	if err := checkNoStagingAliases(src, dst, flatNames, bulkDir); err != nil {
 		return nil, err
 	}
-	staged := make(map[string]bool, len(manifest.RFiles))
-	for _, rf := range manifest.RFiles {
-		if staged[rf.DestinationPath] {
-			// Same physical file referenced by more than one identical
-			// manifest entry (see flattenNames and BuildLoadMapping's
-			// same-tablet dedup): already copied once, nothing more to do.
-			continue
-		}
-		staged[rf.DestinationPath] = true
+	for _, rf := range stageManifest.RFiles {
 		dstPath := joinBulkPath(bulkDir, flatNames[rf.DestinationPath])
 		if _, err := storage.Copy(ctx, src, rf.DestinationPath, dst, dstPath); err != nil {
 			return nil, fmt.Errorf("promotion: stage %s: %w", rf.DestinationPath, err)
@@ -210,6 +211,104 @@ type stageWriteTarget struct {
 	path string
 }
 
+type stageSourceAliasGroup struct {
+	reference stagePathRef
+	members   []engine.RFileExportFile
+}
+
+// dedupeStageSources collapses manifest entries that resolve to the same
+// already-exported source object before any staging begins. This avoids
+// false flatten collisions and duplicate staged output when one source is
+// reachable through multiple symlink/hardlink or backend-equivalent path
+// spellings. Alias groups are only auto-deduped when every member would
+// flatten to the same basename; if the same physical source is advertised
+// under multiple flattened filenames, StageBulkDir fails closed rather
+// than arbitrarily picking one bulk-import name.
+func dedupeStageSources(src storage.Backend, rfiles []engine.RFileExportFile) ([]engine.RFileExportFile, error) {
+	cache := newPathIdentityCache(len(rfiles))
+	groups := make([]stageSourceAliasGroup, 0, len(rfiles))
+	for _, rf := range rfiles {
+		ref := stagePathRef{backend: src, path: rf.DestinationPath}
+		grouped := false
+		for i := range groups {
+			if sourceRefsAlias(ref, groups[i].reference, cache) {
+				groups[i].members = append(groups[i].members, rf)
+				grouped = true
+				break
+			}
+		}
+		if grouped {
+			continue
+		}
+		groups = append(groups, stageSourceAliasGroup{
+			reference: ref,
+			members:   []engine.RFileExportFile{rf},
+		})
+	}
+
+	deduped := make([]engine.RFileExportFile, 0, len(groups))
+	for _, group := range groups {
+		rf, err := canonicalStageSource(group.members)
+		if err != nil {
+			return nil, err
+		}
+		deduped = append(deduped, rf)
+	}
+	return deduped, nil
+}
+
+func canonicalStageSource(members []engine.RFileExportFile) (engine.RFileExportFile, error) {
+	if len(members) == 0 {
+		return engine.RFileExportFile{}, fmt.Errorf("promotion: empty source alias group")
+	}
+	sort.Slice(members, func(i, j int) bool {
+		if members[i].DestinationPath == members[j].DestinationPath {
+			return members[i].TabletIndex < members[j].TabletIndex
+		}
+		return members[i].DestinationPath < members[j].DestinationPath
+	})
+
+	reference := members[0]
+	referenceBase := filepath.Base(reference.DestinationPath)
+	for _, member := range members[1:] {
+		if member.TabletIndex != reference.TabletIndex {
+			return engine.RFileExportFile{}, fmt.Errorf(
+				"promotion: source alias %q is declared under multiple tablet indexes (%d and %d)",
+				reference.DestinationPath, reference.TabletIndex, member.TabletIndex,
+			)
+		}
+		if filepath.Base(member.DestinationPath) != referenceBase {
+			return engine.RFileExportFile{}, fmt.Errorf(
+				"promotion: source alias %q is also declared as %q with a different flattened filename; refusing ambiguous dedupe",
+				reference.DestinationPath, member.DestinationPath,
+			)
+		}
+	}
+	return reference, nil
+}
+
+func sourceRefsAlias(left, right stagePathRef, cache pathIdentityCache) bool {
+	leftCanonical, leftCanonicalOK := canonicalBackendPath(left)
+	rightCanonical, rightCanonicalOK := canonicalBackendPath(right)
+	if leftCanonicalOK || rightCanonicalOK {
+		return leftCanonicalOK && rightCanonicalOK && leftCanonical == rightCanonical
+	}
+
+	if usesLocalFilesystemSemantics(left) && usesLocalFilesystemSemantics(right) {
+		leftInfo := cache.stat(left.path)
+		rightInfo := cache.stat(right.path)
+		if leftInfo == nil || rightInfo == nil {
+			return false
+		}
+		return os.SameFile(leftInfo, rightInfo)
+	}
+
+	if pathLooksURLLike(left.path) || pathLooksURLLike(right.path) {
+		return strings.TrimRight(left.path, `/\`) == strings.TrimRight(right.path, `/\`)
+	}
+	return left.path == right.path
+}
+
 // stagePathsAlias reports whether srcPath and dstPath would resolve to
 // the same location under the default local/URL heuristics. It exists as
 // a lightweight wrapper for tests; StageBulkDir itself uses
@@ -233,26 +332,24 @@ func stagePathsAliasOnBackends(src storage.Backend, srcPath string, dst storage.
 }
 
 // pathIdentityCache memoizes local-filesystem identity probes by path so
-// callers comparing many paths against each other (checkNoStagingAliases)
-// stat each unique path once and resolve each direct symlink target once,
-// not once per comparison. A cached nil FileInfo means the path could not
-// be stat'd (most commonly because it doesn't exist yet); that's distinct
-// from "not yet looked up," so failed stats are cached too rather than
-// retried.
+// callers comparing many paths against each other (checkNoStagingAliases,
+// dedupeStageSources) stat each unique path once, resolve each local path's
+// existing-parent symlink prefixes once, and compute each publication key
+// once rather than re-walking the same paths on every comparison. A cached
+// nil FileInfo means the path could not be stat'd (most commonly because it
+// doesn't exist yet); that's distinct from "not yet looked up," so failed
+// stats are cached too rather than retried.
 type pathIdentityCache struct {
-	stats          map[string]os.FileInfo
-	symlinkTargets map[string]symlinkTargetResult
-}
-
-type symlinkTargetResult struct {
-	target   string
-	resolved bool
+	stats              map[string]os.FileInfo
+	resolvedLocalPaths map[string]string
+	publicationKeys    map[string]string
 }
 
 func newPathIdentityCache(capacity int) pathIdentityCache {
 	return pathIdentityCache{
-		stats:          make(map[string]os.FileInfo, capacity),
-		symlinkTargets: make(map[string]symlinkTargetResult, capacity),
+		stats:              make(map[string]os.FileInfo, capacity),
+		resolvedLocalPaths: make(map[string]string, capacity),
+		publicationKeys:    make(map[string]string, capacity),
 	}
 }
 
@@ -260,7 +357,11 @@ func (c pathIdentityCache) stat(path string) os.FileInfo {
 	if info, cached := c.stats[path]; cached {
 		return info
 	}
-	info, err := os.Stat(path)
+	statPath := path
+	if normalized, ok := normalizeWindowsDrivePath(path); ok {
+		statPath = normalized
+	}
+	info, err := os.Stat(statPath)
 	if err != nil {
 		info = nil
 	}
@@ -268,13 +369,22 @@ func (c pathIdentityCache) stat(path string) os.FileInfo {
 	return info
 }
 
-func (c pathIdentityCache) symlinkTarget(path string) (string, bool) {
-	if result, cached := c.symlinkTargets[path]; cached {
-		return result.target, result.resolved
+func (c pathIdentityCache) publicationKey(path string) string {
+	if key, cached := c.publicationKeys[path]; cached {
+		return key
 	}
-	target, resolved := resolveLocalSymlinkTarget(path)
-	c.symlinkTargets[path] = symlinkTargetResult{target: target, resolved: resolved}
-	return target, resolved
+	key := normalizeLocalPublicationPath(c.resolvedLocalPath(path))
+	c.publicationKeys[path] = key
+	return key
+}
+
+func (c pathIdentityCache) resolvedLocalPath(path string) string {
+	if resolved, cached := c.resolvedLocalPaths[path]; cached {
+		return resolved
+	}
+	resolved := resolveExistingLocalPathPrefixes(path)
+	c.resolvedLocalPaths[path] = resolved
+	return resolved
 }
 
 // pathsAlias is StageBulkDir's alias detector, factored out so
@@ -286,15 +396,11 @@ func (c pathIdentityCache) symlinkTarget(path string) (string, bool) {
 // parsers already used by the storage packages (s3.ParsePath,
 // gcs.ParsePath, azure.ParsePath, and HDFS URI parsing) so equivalent
 // spellings compare equal even when one path is qualified and the other
-// uses the backend's scheme-less form. Local filesystem paths still get
-// Windows-drive normalization (so C://data/F.rf stays local rather than
-// being mistaken for a remote URL), a Unicode-NFC-normalized,
-// case-insensitive lexical check (to conservatively catch not-yet-created
-// aliases on Windows and macOS's default filesystems, both of which fold
-// case and normalize Unicode spellings such as composed vs decomposed
-// "é" when resolving filenames), plus os.Stat + os.SameFile so
-// equivalent absolute/relative spellings and symlink/hardlink aliases
-// are caught too.
+// uses the backend's scheme-less form. Local filesystem paths compare a
+// collision-safe publication key first (resolving existing parent-prefix
+// symlinks and applying conservative local name normalization for
+// case/Unicode/trailing-dot-space equivalence), then fall back to
+// os.Stat + os.SameFile so existing symlink/hardlink aliases are caught too.
 func pathsAlias(srcPath, dstPath stagePathRef, cache pathIdentityCache) bool {
 	srcCanonical, srcCanonicalOK := canonicalBackendPath(srcPath)
 	dstCanonical, dstCanonicalOK := canonicalBackendPath(dstPath)
@@ -303,10 +409,7 @@ func pathsAlias(srcPath, dstPath stagePathRef, cache pathIdentityCache) bool {
 	}
 
 	if usesLocalFilesystemSemantics(srcPath) && usesLocalFilesystemSemantics(dstPath) {
-		if localPathsLexicallyAlias(srcPath.path, dstPath.path) {
-			return true
-		}
-		if localSymlinkTargetsAlias(srcPath.path, dstPath.path, cache) {
+		if localPublicationKeysAlias(srcPath.path, dstPath.path, cache) {
 			return true
 		}
 		srcInfo := cache.stat(srcPath.path)
@@ -327,67 +430,95 @@ func pathsAlias(srcPath, dstPath stagePathRef, cache pathIdentityCache) bool {
 	return srcPath.path == dstPath.path
 }
 
-func localSymlinkTargetsAlias(srcPath, dstPath string, cache pathIdentityCache) bool {
-	srcClean := normalizeLocalPathForAlias(srcPath)
-	dstClean := normalizeLocalPathForAlias(dstPath)
-
-	if target, ok := cache.symlinkTarget(srcPath); ok && localPathsLexicallyAlias(target, dstClean) {
-		return true
-	}
-	if target, ok := cache.symlinkTarget(dstPath); ok && localPathsLexicallyAlias(target, srcClean) {
-		return true
-	}
-
-	srcTarget, srcIsSymlink := cache.symlinkTarget(srcPath)
-	dstTarget, dstIsSymlink := cache.symlinkTarget(dstPath)
-	return srcIsSymlink && dstIsSymlink && localPathsLexicallyAlias(srcTarget, dstTarget)
-}
-
-// localPathsLexicallyAlias compares two local paths after normalizing
-// Windows-drive spelling and folding case; both are additionally
-// normalized to Unicode NFC first so a composed and a decomposed
-// spelling of the same character (for example precomposed "é",
-// U+00E9, versus "e" + a combining acute accent, U+0065 U+0301)
-// compare equal too. macOS's default filesystem (HFS+/APFS) normalizes
-// filenames the same way it folds case, so without this a case-only
-// check would still miss a real alias there whenever neither
-// destination has been created yet for os.Stat + os.SameFile to catch.
 func localPathsLexicallyAlias(srcPath, dstPath string) bool {
-	srcClean := normalizeLocalPathForAlias(srcPath)
-	dstClean := normalizeLocalPathForAlias(dstPath)
-	if srcClean == dstClean {
-		return true
-	}
-	return strings.EqualFold(norm.NFC.String(srcClean), norm.NFC.String(dstClean))
+	return normalizeLocalPublicationPath(normalizeLocalPathForAlias(srcPath)) ==
+		normalizeLocalPublicationPath(normalizeLocalPathForAlias(dstPath))
 }
 
-func resolveLocalSymlinkTarget(path string) (string, bool) {
-	const maxSymlinkHops = 40
+func localPublicationKeysAlias(srcPath, dstPath string, cache pathIdentityCache) bool {
+	return cache.publicationKey(srcPath) == cache.publicationKey(dstPath)
+}
 
-	current := filepath.Clean(path)
-	info, err := os.Lstat(current)
-	if err != nil || info.Mode()&os.ModeSymlink == 0 {
-		return "", false
+func resolveExistingLocalPathPrefixes(path string) string {
+	path = normalizeLocalPathForAlias(path)
+	if !looksLikeWindowsDrivePath(path) && !filepath.IsAbs(path) {
+		if absPath, err := filepath.Abs(path); err == nil {
+			path = absPath
+		}
 	}
-	for hops := 0; hops < maxSymlinkHops; hops++ {
-		target, err := os.Readlink(current)
-		if err != nil {
-			return "", false
-		}
-		if !filepath.IsAbs(target) {
-			target = filepath.Join(filepath.Dir(current), target)
-		}
-		current = filepath.Clean(target)
 
-		info, err = os.Lstat(current)
+	prefix, parts := splitLocalPath(path)
+	current := prefix
+	for i, part := range parts {
+		candidate := joinLocalPath(current, part)
+		info, err := os.Lstat(candidate)
 		if err != nil {
-			return current, true
+			return appendLocalPathParts(current, parts[i:])
+		}
+		if !info.IsDir() && info.Mode()&os.ModeSymlink == 0 && i < len(parts)-1 {
+			return appendLocalPathParts(current, parts[i:])
 		}
 		if info.Mode()&os.ModeSymlink == 0 {
-			return current, true
+			current = candidate
+			continue
 		}
+		resolved, err := filepath.EvalSymlinks(candidate)
+		if err != nil {
+			return appendLocalPathParts(current, parts[i:])
+		}
+		current = normalizeLocalPathForAlias(resolved)
 	}
-	return current, true
+	if current == "" {
+		return path
+	}
+	return current
+}
+
+func normalizeLocalPublicationPath(path string) string {
+	prefix, parts := splitLocalPath(path)
+	normalizedParts := make([]string, len(parts))
+	for i, part := range parts {
+		normalizedParts[i] = normalizeLocalPublicationComponent(part)
+	}
+
+	prefix = strings.ReplaceAll(prefix, `\`, "/")
+	if prefix != "" && !strings.HasSuffix(prefix, "/") {
+		prefix += "/"
+	}
+	return prefix + strings.Join(normalizedParts, "/")
+}
+
+func splitLocalPath(path string) (string, []string) {
+	path = normalizeLocalPathForAlias(path)
+	volume := filepath.VolumeName(path)
+	rest := strings.TrimPrefix(path, volume)
+	prefix := volume
+	if strings.HasPrefix(rest, `/`) || strings.HasPrefix(rest, `\`) {
+		prefix += string(filepath.Separator)
+		rest = strings.TrimLeft(rest, `/\`)
+	}
+	if rest == "" {
+		return prefix, nil
+	}
+	return prefix, strings.FieldsFunc(rest, func(r rune) bool { return r == '/' || r == '\\' })
+}
+
+func joinLocalPath(prefix, part string) string {
+	if prefix == "" {
+		return part
+	}
+	return filepath.Join(prefix, part)
+}
+
+func appendLocalPathParts(prefix string, parts []string) string {
+	current := prefix
+	for _, part := range parts {
+		current = joinLocalPath(current, part)
+	}
+	if current == "" {
+		return "."
+	}
+	return current
 }
 
 func usesLocalFilesystemSemantics(ref stagePathRef) bool {
@@ -506,18 +637,17 @@ func canonicalHDFSString(authority, resolved string) string {
 }
 
 func explicitBackendScheme(path string) string {
-	switch {
-	case strings.HasPrefix(path, "s3://"):
-		return "s3"
-	case strings.HasPrefix(path, "gs://"):
-		return "gs"
-	case strings.HasPrefix(path, "az://"):
-		return "az"
-	case strings.HasPrefix(path, "hdfs:"):
-		return "hdfs"
-	default:
+	if looksLikeWindowsDrivePath(path) {
 		return ""
 	}
+	if strings.HasPrefix(path, "hdfs:/") {
+		return "hdfs"
+	}
+	matches := urlStylePathRe.FindStringSubmatch(path)
+	if len(matches) != 2 {
+		return ""
+	}
+	return strings.ToLower(matches[1])
 }
 
 // flattenNames validates that every RFile's basename is unique once

@@ -29,6 +29,8 @@ const RFileExportManifestVersion = 1
 // both object keys and local file names and that exclude the "~" namespacing
 // separator used by exportRelPath.
 var producerIDRe = regexp.MustCompile(`^[A-Za-z0-9_.-]+$`)
+var backendURLRootRe = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9+.-]*://`)
+var windowsDrivePathRe = regexp.MustCompile(`^[A-Za-z]:(?:[\\/].*)?$`)
 
 // validateProducerID rejects producer ids that would break destination naming
 // (path separators, "~", or other unsafe characters). Empty is allowed and
@@ -207,10 +209,17 @@ func (m *RFileExportManifest) tabletCount() int {
 }
 
 func joinBackendPath(root, rel string) string {
-	if strings.Contains(root, "://") {
+	if usesBackendSeparatorJoinRoot(root) {
 		return strings.TrimRight(root, `/\`) + "/" + filepath.ToSlash(rel)
 	}
 	return filepath.Join(root, rel)
+}
+
+func usesBackendSeparatorJoinRoot(root string) bool {
+	if windowsDrivePathRe.MatchString(root) {
+		return false
+	}
+	return strings.HasPrefix(root, "hdfs:/") || backendURLRootRe.MatchString(root)
 }
 
 // VerifyRFileExport verifies that every manifest object exists and matches size/hash.
