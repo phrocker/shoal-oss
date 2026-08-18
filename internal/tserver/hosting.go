@@ -20,6 +20,7 @@ package tserver
 import (
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"sync"
 )
@@ -570,6 +571,12 @@ func (h *Host) transition(attempt Attempt, want HostingState, apply func(*tablet
 	}
 	entry, ok := h.tablets[extent.key()]
 	if !ok {
+		// Only Assign mints attempts, so a handle that reaches here named a
+		// tablet this host really had: the assignment ended before the
+		// completion arrived. That is the same superseded caller
+		// ErrStaleAttempt counts, and the error stays distinct only because
+		// there is no longer an assignment to name in its place.
+		h.metrics.RejectedStale++
 		return fmt.Errorf("%w: %s", ErrNotAssigned, extent)
 	}
 	if entry.attempt != attempt.id {
@@ -608,7 +615,10 @@ func (h *Host) release(entry *tabletEntry) {
 	if i >= len(entries) || entries[i] != entry {
 		return
 	}
-	entries = append(entries[:i], entries[i+1:]...)
+	// slices.Delete clears the vacated tail, so the released entry and the
+	// row buffers it holds do not stay reachable through the backing array
+	// of a table that still has tablets.
+	entries = slices.Delete(entries, i, i+1)
 	if len(entries) == 0 {
 		delete(h.byTable, table)
 		return

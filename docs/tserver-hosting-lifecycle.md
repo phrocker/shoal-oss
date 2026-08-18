@@ -152,12 +152,26 @@ from any transition means nothing moved:
 | completion for a tablet in another state | `ErrWrongState` |
 | unload mode this host does not implement | `ErrInvalidUnloadMode` |
 
+`AdoptLock` fails closed the same way, leaving the lock held — and so the
+tablets tracked under it — untouched:
+
+| Situation | Result |
+| --- | --- |
+| lock identity that could not name a `zlock` node | `ErrInvalidLock` |
+| lock no newer than one already used | `ErrLockNotNewer` |
+| tablets still tracked from an earlier generation | `ErrTabletsAssigned` |
+
 `ErrNotAssigned`, `ErrStaleAttempt` and `ErrWrongState` are deliberately
 distinct: the first says the host never had the tablet (or has already
 released it), the second says it has the extent but as a later assignment
 that this completion knows nothing about, and the third says it has the
 right assignment but the completion arrived for the wrong phase. Only the
 third is worth retrying.
+
+`ErrNotAssigned` and `ErrStaleAttempt` both count as `RejectedStale`: only
+`Assign` mints attempts, so a handle that finds nothing tracked named a
+tablet this host really had, and its assignment ended before the
+completion arrived.
 
 Overlap is what catches stale split metadata. A parent extent arriving
 after its children are assigned — or a child arriving after its parent —

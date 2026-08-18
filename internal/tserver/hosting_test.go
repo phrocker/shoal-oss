@@ -409,7 +409,10 @@ func TestLoadFailedReleasesTheAssignment(t *testing.T) {
 	if err := host.LoadFailed(attempt); !errors.Is(err, ErrNotAssigned) {
 		t.Fatalf("want ErrNotAssigned, got %v", err)
 	}
-	if metrics := host.Metrics(); metrics.LoadFailures != 1 {
+	// Only Assign mints attempts, so a handle that finds nothing tracked is
+	// reporting on an assignment that ended — the same superseded caller
+	// RejectedStale counts everywhere else.
+	if metrics := host.Metrics(); metrics.LoadFailures != 1 || metrics.RejectedStale != 1 {
 		t.Fatalf("metrics = %+v", metrics)
 	}
 }
@@ -829,6 +832,38 @@ func TestStaleCompletionCannotDisturbALaterAssignment(t *testing.T) {
 		}
 		wantHosted(t, host, "2;m;<")
 	})
+}
+
+// TestReleaseClearsTheIndexTail pins that a released tablet stops being
+// reachable through the range index. Deleting by reslicing alone would leave
+// the removed entry — and the row buffers it holds — live in the backing
+// array for as long as the table keeps any tablet at all.
+func TestReleaseClearsTheIndexTail(t *testing.T) {
+	host, _, fence := newTestHost(t)
+	left, right := extent("2", "", "m"), extent("2", "m", "")
+	hostTablet(t, host, fence, left)
+	hostTablet(t, host, fence, right)
+
+	entries := host.byTable["2"]
+	if len(entries) != 2 {
+		t.Fatalf("index = %v, want both tablets", entries)
+	}
+	backing := entries[:cap(entries)]
+
+	if _, err := host.Unassign(fence, left, UnloadImmediate); err != nil {
+		t.Fatalf("Unassign: %v", err)
+	}
+
+	remaining := host.byTable["2"]
+	if len(remaining) != 1 || !remaining[0].extent.Equal(right) {
+		t.Fatalf("index = %v, want only %s", remaining, right)
+	}
+	for i := len(remaining); i < len(backing); i++ {
+		if backing[i] != nil {
+			t.Fatalf("released entry %s is still reachable at backing index %d",
+				backing[i].extent, i)
+		}
+	}
 }
 
 // TestCompletionsRejectUnmintedAttempts covers a caller that fabricates a
