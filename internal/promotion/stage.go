@@ -211,6 +211,10 @@ type stageWriteTarget struct {
 	path string
 }
 
+type backendUnwrapper interface {
+	InnerBackend() storage.Backend
+}
+
 type stageSourceAliasGroup struct {
 	reference stagePathRef
 	members   []engine.RFileExportFile
@@ -393,14 +397,15 @@ func (c pathIdentityCache) resolvedLocalPath(path string) string {
 // handful of local paths repeatedly.
 //
 // Remote/object-store paths are canonicalized through the backend-aware
-// parsers already used by the storage packages (s3.ParsePath,
-// gcs.ParsePath, azure.ParsePath, and HDFS URI parsing) so equivalent
-// spellings compare equal even when one path is qualified and the other
-// uses the backend's scheme-less form. Local filesystem paths compare a
-// collision-safe publication key first (resolving existing parent-prefix
-// symlinks and applying conservative local name normalization for
-// case/Unicode/trailing-dot-space equivalence), then fall back to
-// os.Stat + os.SameFile so existing symlink/hardlink aliases are caught too.
+// parsers already used by the built-in storage packages (s3.ParsePath,
+// gcs.ParsePath, azure.ParsePath, and HDFS URI parsing), even when the
+// backend is wrapped (for example by diskcache.Backend), so equivalent
+// qualified vs scheme-less spellings compare equal. Local filesystem
+// paths compare a collision-safe publication key first (resolving
+// existing parent-prefix symlinks, dangling final symlink chains, and
+// conservative case/Unicode/trailing-dot-space equivalence), then fall
+// back to os.Stat + os.SameFile so existing symlink/hardlink aliases are
+// caught too.
 func pathsAlias(srcPath, dstPath stagePathRef, cache pathIdentityCache) bool {
 	srcCanonical, srcCanonicalOK := canonicalBackendPath(srcPath)
 	dstCanonical, dstCanonicalOK := canonicalBackendPath(dstPath)
@@ -455,21 +460,38 @@ func resolveExistingLocalPathPrefixes(path string) string {
 		if err != nil {
 			return appendLocalPathParts(current, parts[i:])
 		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			current = resolveLocalSymlinkPathLexically(candidate)
+			continue
+		}
 		if !info.IsDir() && info.Mode()&os.ModeSymlink == 0 && i < len(parts)-1 {
 			return appendLocalPathParts(current, parts[i:])
 		}
-		if info.Mode()&os.ModeSymlink == 0 {
-			current = candidate
-			continue
-		}
-		resolved, err := filepath.EvalSymlinks(candidate)
-		if err != nil {
-			return appendLocalPathParts(current, parts[i:])
-		}
-		current = normalizeLocalPathForAlias(resolved)
+		current = candidate
 	}
 	if current == "" {
 		return path
+	}
+	return current
+}
+
+func resolveLocalSymlinkPathLexically(path string) string {
+	const maxSymlinkHops = 40
+
+	current := normalizeLocalPathForAlias(path)
+	for hops := 0; hops < maxSymlinkHops; hops++ {
+		target, err := os.Readlink(current)
+		if err != nil {
+			return current
+		}
+		if !filepath.IsAbs(target) {
+			target = filepath.Join(filepath.Dir(current), target)
+		}
+		current = normalizeLocalPathForAlias(target)
+		info, err := os.Lstat(current)
+		if err != nil || info.Mode()&os.ModeSymlink == 0 {
+			return current
+		}
 	}
 	return current
 }
@@ -525,16 +547,17 @@ func usesLocalFilesystemSemantics(ref stagePathRef) bool {
 	if explicitBackendScheme(ref.path) != "" {
 		return false
 	}
-	if ref.backend == nil {
+	backend := unwrapBackend(ref.backend)
+	if backend == nil {
 		return true
 	}
-	_, ok := ref.backend.(*local.Backend)
+	_, ok := backend.(*local.Backend)
 	return ok
 }
 
 func canonicalBackendPath(ref stagePathRef) (string, bool) {
 	scheme := explicitBackendScheme(ref.path)
-	switch b := ref.backend.(type) {
+	switch b := unwrapBackend(ref.backend).(type) {
 	case *s3.Backend:
 		if scheme != "" && scheme != "s3" {
 			return "", false
@@ -648,6 +671,21 @@ func explicitBackendScheme(path string) string {
 		return ""
 	}
 	return strings.ToLower(matches[1])
+}
+
+func unwrapBackend(backend storage.Backend) storage.Backend {
+	for backend != nil {
+		unwrapper, ok := backend.(backendUnwrapper)
+		if !ok {
+			break
+		}
+		inner := unwrapper.InnerBackend()
+		if inner == nil || inner == backend {
+			break
+		}
+		backend = inner
+	}
+	return backend
 }
 
 // flattenNames validates that every RFile's basename is unique once

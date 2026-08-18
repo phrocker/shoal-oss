@@ -14,6 +14,7 @@ import (
 	"github.com/phrocker/shoal/internal/engine"
 	shstorage "github.com/phrocker/shoal/internal/storage"
 	"github.com/phrocker/shoal/internal/storage/azure"
+	"github.com/phrocker/shoal/internal/storage/diskcache"
 	"github.com/phrocker/shoal/internal/storage/gcs"
 	"github.com/phrocker/shoal/internal/storage/hdfs"
 	"github.com/phrocker/shoal/internal/storage/local"
@@ -376,6 +377,44 @@ func TestStageBulkDirRejectsInPlaceBulkDirBeforeCopying(t *testing.T) {
 	}
 }
 
+func TestStageBulkDirRejectsInPlaceBulkDirThroughDiskCacheWrappedLocalSource(t *testing.T) {
+	root := t.TempDir()
+	tabletDir := filepath.Join(root, "export", "events", "t-0000")
+	if err := os.MkdirAll(tabletDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	srcPath := filepath.Join(tabletDir, "F0001.rf")
+	content := []byte("original rfile bytes that must survive a rejected in-place stage through diskcache")
+	if err := os.WriteFile(srcPath, content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(content)
+	manifest := &engine.RFileExportManifest{
+		Version:     engine.RFileExportManifestVersion,
+		SourceTable: "events",
+		Tablets:     []engine.RFileExportTablet{{Index: 0}},
+		RFiles: []engine.RFileExportFile{
+			{TabletIndex: 0, DestinationPath: srcPath, Size: int64(len(content)), SHA256: hex.EncodeToString(sum[:])},
+		},
+	}
+
+	srcBackend, err := diskcache.New(local.New(), filepath.Join(root, "cache"), 1<<20)
+	if err != nil {
+		t.Fatalf("diskcache.New: %v", err)
+	}
+	if _, err := StageBulkDir(context.Background(), srcBackend, manifest, local.New(), tabletDir); err == nil {
+		t.Fatal("StageBulkDir with diskcache-wrapped local source aliasing bulkDir = nil error, want error")
+	}
+
+	got, err := os.ReadFile(srcPath)
+	if err != nil {
+		t.Fatalf("source file missing after rejected diskcache-wrapped stage: %v", err)
+	}
+	if string(got) != string(content) {
+		t.Fatalf("source file corrupted by rejected diskcache-wrapped stage: got %d bytes, want %d bytes intact", len(got), len(content))
+	}
+}
+
 func TestStagePathsAlias(t *testing.T) {
 	tests := []struct {
 		name string
@@ -629,6 +668,23 @@ func TestStagePathsAliasResolvesChainedParentSymlinksForNonexistentTargets(t *te
 	}
 }
 
+func TestStagePathsAliasResolvesDanglingRelativeSymlinkChains(t *testing.T) {
+	root := t.TempDir()
+	targetPath := filepath.Join(root, "target.rf")
+	link2 := filepath.Join(root, "link2.rf")
+	if err := os.Symlink("target.rf", link2); err != nil {
+		t.Skipf("symlink not supported in this environment: %v", err)
+	}
+	link1 := filepath.Join(root, "link1.rf")
+	if err := os.Symlink("link2.rf", link1); err != nil {
+		t.Skipf("symlink not supported in this environment: %v", err)
+	}
+
+	if !stagePathsAlias(link1, targetPath) {
+		t.Fatalf("stagePathsAlias(%q, %q) = false, want true after resolving a dangling relative symlink chain lexically", link1, targetPath)
+	}
+}
+
 // TestStageBulkDirRejectsInPlaceBulkDirViaRelativePath proves the alias
 // guard still catches an aliased bulkDir when it's expressed as a path
 // string that is lexically different from the manifest's absolute
@@ -795,6 +851,45 @@ func TestStageBulkDirRejectsSymlinkedWriteTargetsBeforeCopying(t *testing.T) {
 	}
 }
 
+func TestStageBulkDirRejectsDanglingFinalSymlinkChainAliasBeforeCopying(t *testing.T) {
+	root := t.TempDir()
+	exportDir := filepath.Join(root, "export")
+	bulkDir := filepath.Join(root, "bulk")
+	if err := os.MkdirAll(exportDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(bulkDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	aPath := filepath.Join(exportDir, "A.rf")
+	bPath := filepath.Join(exportDir, "B.rf")
+	aContent := []byte("A source bytes")
+	bContent := []byte("B source bytes")
+	if err := os.WriteFile(aPath, aContent, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(bPath, bContent, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.Symlink("B.rf", filepath.Join(bulkDir, "mid.rf")); err != nil {
+		t.Skipf("symlink not supported in this environment: %v", err)
+	}
+	if err := os.Symlink("mid.rf", filepath.Join(bulkDir, "A.rf")); err != nil {
+		t.Skipf("symlink not supported in this environment: %v", err)
+	}
+
+	manifest := localManifestFromFiles(t, aPath, bPath)
+	be := local.New()
+	if _, err := StageBulkDir(context.Background(), be, manifest, be, bulkDir); err == nil {
+		t.Fatal("StageBulkDir with A.rf symlinked through a dangling chain to B.rf = nil error, want error")
+	}
+	if _, err := os.Stat(filepath.Join(bulkDir, "B.rf")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("dangling symlink target unexpectedly exists after rejected stage: err=%v", err)
+	}
+}
+
 func TestStageBulkDirRejectsLoadMapAliasBeforeCopying(t *testing.T) {
 	root := t.TempDir()
 	exportDir := filepath.Join(root, "export")
@@ -815,7 +910,7 @@ func TestStageBulkDirRejectsLoadMapAliasBeforeCopying(t *testing.T) {
 
 	loadmapPath := filepath.Join(bulkDir, "loadmap.json")
 	if err := os.Link(srcPath, loadmapPath); err != nil {
-		t.Fatalf("Link(loadmap alias): %v", err)
+		t.Skipf("hard links not supported in this environment: %v", err)
 	}
 
 	be := local.New()
