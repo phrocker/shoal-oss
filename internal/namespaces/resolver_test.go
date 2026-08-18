@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 type fakeLocator struct {
@@ -14,6 +15,34 @@ type fakeLocator struct {
 	data  map[string][]byte
 	reads map[string]int
 	err   error
+}
+
+type controlledLocator struct {
+	mu        sync.Mutex
+	responses [][]byte
+	reads     int
+	started   chan int
+	releases  map[int]chan struct{}
+}
+
+func (f *controlledLocator) InstancePath() string { return "/accumulo/uuid-1" }
+
+func (f *controlledLocator) GetRaw(ctx context.Context, _ string) ([]byte, error) {
+	f.mu.Lock()
+	index := f.reads
+	f.reads++
+	data := append([]byte(nil), f.responses[index]...)
+	release := f.releases[index]
+	f.mu.Unlock()
+	f.started <- index
+	if release != nil {
+		select {
+		case <-release:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	return data, nil
 }
 
 func (f *fakeLocator) InstancePath() string { return "/accumulo/uuid-1" }
@@ -144,6 +173,36 @@ func TestResolverErrorsAndValidation(t *testing.T) {
 			want: "namespace mapping znode decoded to null",
 		},
 		{
+			name: "duplicate namespace id",
+			data: []byte(`{"+default":"","+accumulo":"accumulo","+default":""}`),
+			want: `duplicates namespace ID "+default"`,
+		},
+		{
+			name: "null namespace name",
+			data: []byte(`{"+default":null,"+accumulo":"accumulo"}`),
+			want: `value for ID "+default" must be a string`,
+		},
+		{
+			name: "numeric namespace name",
+			data: []byte(`{"+default":"","+accumulo":"accumulo","ns1":1}`),
+			want: `value for ID "ns1" must be a string`,
+		},
+		{
+			name: "object namespace name",
+			data: []byte(`{"+default":"","+accumulo":"accumulo","ns1":{}}`),
+			want: `value for ID "ns1" must be a string`,
+		},
+		{
+			name: "trailing json",
+			data: []byte(`{"+default":"","+accumulo":"accumulo"} {}`),
+			want: "trailing JSON value",
+		},
+		{
+			name: "top level array",
+			data: []byte(`[]`),
+			want: "must be a JSON object",
+		},
+		{
 			name: "missing built in",
 			data: []byte(`{"+default":""}`),
 			want: `missing built-in namespace ID "+accumulo"`,
@@ -164,6 +223,7 @@ func TestResolverErrorsAndValidation(t *testing.T) {
 			want: `assigned the default namespace name to non-default ID "ns1"`,
 		},
 	}
+
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			resolver := NewResolver(&fakeLocator{
@@ -243,5 +303,107 @@ func TestResolverConcurrentAccessAndInvalidation(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+	}
+}
+
+func TestResolverInvalidateDuringFetchWins(t *testing.T) {
+	release := make(chan struct{})
+	locator := &controlledLocator{
+		responses: [][]byte{
+			[]byte(`{"+accumulo":"accumulo","+default":"","ns1":"old"}`),
+			[]byte(`{"+accumulo":"accumulo","+default":"","ns2":"new"}`),
+		},
+		started:  make(chan int, 2),
+		releases: map[int]chan struct{}{0: release},
+	}
+	resolver := NewResolver(locator)
+
+	listResult := make(chan map[string]string, 1)
+	go func() {
+		names, _ := resolver.List(context.Background())
+		listResult <- names
+	}()
+	if index := <-locator.started; index != 0 {
+		t.Fatalf("first read index = %d", index)
+	}
+	invalidated := make(chan struct{})
+	go func() {
+		resolver.Invalidate()
+		close(invalidated)
+	}()
+	select {
+	case <-invalidated:
+		t.Fatal("Invalidate returned before the in-flight fetch committed")
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(release)
+	if names := <-listResult; names["old"] != "ns1" {
+		t.Fatalf("in-flight List() = %#v", names)
+	}
+	<-invalidated
+
+	names, err := resolver.List(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if index := <-locator.started; index != 1 {
+		t.Fatalf("second read index = %d", index)
+	}
+	if names["new"] != "ns2" || names["old"] != "" {
+		t.Fatalf("List() after invalidation = %#v", names)
+	}
+}
+
+func TestResolverForcedRefreshesCommitInOrder(t *testing.T) {
+	releaseFirstRefresh := make(chan struct{})
+	locator := &controlledLocator{
+		responses: [][]byte{
+			[]byte(`{"+accumulo":"accumulo","+default":""}`),
+			[]byte(`{"+accumulo":"accumulo","+default":"","ns1":"first"}`),
+			[]byte(`{"+accumulo":"accumulo","+default":"","ns2":"second"}`),
+		},
+		started:  make(chan int, 3),
+		releases: map[int]chan struct{}{1: releaseFirstRefresh},
+	}
+	resolver := NewResolver(locator)
+	if _, err := resolver.List(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	<-locator.started
+
+	firstResult := make(chan error, 1)
+	go func() {
+		_, err := resolver.ResolveID(context.Background(), "first")
+		firstResult <- err
+	}()
+	if index := <-locator.started; index != 1 {
+		t.Fatalf("first refresh index = %d", index)
+	}
+	secondResult := make(chan error, 1)
+	go func() {
+		_, err := resolver.ResolveID(context.Background(), "second")
+		secondResult <- err
+	}()
+	select {
+	case index := <-locator.started:
+		t.Fatalf("second refresh started out of order at index %d", index)
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(releaseFirstRefresh)
+	if err := <-firstResult; err != nil {
+		t.Fatal(err)
+	}
+	if index := <-locator.started; index != 2 {
+		t.Fatalf("second refresh index = %d", index)
+	}
+	if err := <-secondResult; err != nil {
+		t.Fatal(err)
+	}
+	names, err := resolver.List(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if names["second"] != "ns2" || names["first"] != "" {
+		t.Fatalf("final namespace snapshot = %#v", names)
 	}
 }

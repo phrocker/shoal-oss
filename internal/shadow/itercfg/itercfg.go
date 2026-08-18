@@ -216,8 +216,8 @@ func (r *Resolver) ResolveTableID(ctx context.Context, tableName string) (string
 // InvalidateNames clears the name→id cache so the next ResolveTableID
 // re-scans ZK. Used by the poller after detecting a CreateTable / rename.
 func (r *Resolver) InvalidateNames() {
-	r.names.Invalidate()
 	r.namespaceNames.Invalidate()
+	r.names.Invalidate()
 }
 
 // Resolve loads the iterator stack for tableID at scope, parses

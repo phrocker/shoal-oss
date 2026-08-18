@@ -34,10 +34,11 @@ func (f *fakeTabletWalker) LocateTable(ctx context.Context, tableID string) ([]m
 }
 
 type fakeTableNames struct {
-	mu          sync.Mutex
-	byName      map[string]string
-	byID        map[string]string
-	invalidates int
+	mu           sync.Mutex
+	byName       map[string]string
+	byID         map[string]string
+	invalidates  int
+	onInvalidate func()
 }
 
 func (f *fakeTableNames) ResolveID(ctx context.Context, name string) (string, error) {
@@ -82,14 +83,19 @@ func (f *fakeTableNames) List(ctx context.Context) (map[string]string, error) {
 func (f *fakeTableNames) Invalidate() {
 	f.mu.Lock()
 	f.invalidates++
+	onInvalidate := f.onInvalidate
 	f.mu.Unlock()
+	if onInvalidate != nil {
+		onInvalidate()
+	}
 }
 
 type fakeNamespaces struct {
-	mu          sync.Mutex
-	byName      map[string]string
-	byID        map[string]string
-	invalidates int
+	mu           sync.Mutex
+	byName       map[string]string
+	byID         map[string]string
+	invalidates  int
+	onInvalidate func()
 }
 
 func (f *fakeNamespaces) ResolveID(ctx context.Context, name string) (string, error) {
@@ -134,7 +140,11 @@ func (f *fakeNamespaces) List(ctx context.Context) (map[string]string, error) {
 func (f *fakeNamespaces) Invalidate() {
 	f.mu.Lock()
 	f.invalidates++
+	onInvalidate := f.onInvalidate
 	f.mu.Unlock()
+	if onInvalidate != nil {
+		onInvalidate()
+	}
 }
 
 func newFakeNamespacesFromTables(tables *fakeTableNames) *fakeNamespaces {
@@ -193,6 +203,7 @@ func testConnectorWithNamespaceDiscovery(
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	credentials, err := PasswordCredentials("root", []byte("secret"))
 	if err != nil {
 		t.Fatal(err)
@@ -431,5 +442,31 @@ func TestConnectorDiscoveryLifecycleDoesNotCloseInstance(t *testing.T) {
 	}
 	if _, err := connector.TableByID(context.Background(), "1"); !errors.Is(err, ErrConnectorClosed) {
 		t.Fatalf("closed connector error = %v", err)
+	}
+}
+
+func TestDiscoveryInvalidatesNamespacesBeforeDependentTables(t *testing.T) {
+	var order []string
+	namespaces := &fakeNamespaces{
+		byName: map[string]string{},
+		byID:   map[string]string{},
+		onInvalidate: func() {
+			order = append(order, "namespaces")
+		},
+	}
+	tables := &fakeTableNames{
+		byName: map[string]string{},
+		byID:   map[string]string{},
+		onInvalidate: func() {
+			order = append(order, "tables")
+		},
+	}
+	connector := testConnectorWithNamespaceDiscovery(t, &fakeTabletWalker{}, namespaces, tables)
+
+	if err := connector.InvalidateDiscovery(); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(order, ","); got != "namespaces,tables" {
+		t.Fatalf("invalidation order = %q", got)
 	}
 }

@@ -48,6 +48,7 @@ func TestResolverNamesAndSharedNamespaceCache(t *testing.T) {
 		},
 		reads: map[string]int{},
 	}
+
 	namespaceNames, resolver := newSharedResolvers(locator)
 
 	namespaces, err := namespaceNames.List(context.Background())
@@ -264,5 +265,38 @@ func TestResolverConcurrentLookupsShareNamespaceCache(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+	}
+}
+
+func TestResolverRebuildsAfterSameIDNamespaceRename(t *testing.T) {
+	namespacesPath := "/accumulo/uuid-1/namespaces"
+	tablesPath := "/accumulo/uuid-1/namespaces/ns1/tables"
+	locator := &fakeLocator{
+		data: map[string][]byte{
+			namespacesPath: []byte(`{"+accumulo":"accumulo","+default":"","ns1":"analytics"}`),
+			tablesPath:     []byte(`{"2":"events"}`),
+		},
+		reads: map[string]int{},
+	}
+	namespaceNames, resolver := newSharedResolvers(locator)
+
+	if id, err := resolver.ResolveID(context.Background(), "analytics.events"); err != nil || id != "2" {
+		t.Fatalf("initial ResolveID() = %q, %v", id, err)
+	}
+	locator.mu.Lock()
+	locator.data[namespacesPath] = []byte(`{"+accumulo":"accumulo","+default":"","ns1":"insights"}`)
+	locator.mu.Unlock()
+	if id, err := namespaceNames.ResolveID(context.Background(), "insights"); err != nil || id != "ns1" {
+		t.Fatalf("namespace refresh = %q, %v", id, err)
+	}
+
+	if id, err := resolver.ResolveID(context.Background(), "insights.events"); err != nil || id != "2" {
+		t.Fatalf("renamed ResolveID() = %q, %v", id, err)
+	}
+	if _, err := resolver.ResolveID(context.Background(), "analytics.events"); !errors.Is(err, ErrTableNotFound) {
+		t.Fatalf("old qualified name error = %v, want ErrTableNotFound", err)
+	}
+	if got := locator.reads[tablesPath]; got != 2 {
+		t.Fatalf("table mapping reads = %d, want 2 after namespace generation changed", got)
 	}
 }

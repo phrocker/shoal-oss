@@ -157,10 +157,7 @@ func (c *Connector) executeTableMutation(
 		return fmt.Errorf("accumulo: discover manager: %w", err)
 	}
 	if discovery != nil {
-		defer func() {
-			discovery.tablets.InvalidateAll()
-			discovery.tables.Invalidate()
-		}()
+		defer discovery.invalidateAll()
 	}
 	if err := manager.Execute(ctx, address, req); err != nil {
 		return mapManagerError(name, err)

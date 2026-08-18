@@ -76,9 +76,18 @@ func newConnectorDiscovery(
 }
 
 func (d *connectorDiscovery) close() {
+	d.invalidateAll()
+}
+
+func (d *connectorDiscovery) invalidateNames() {
+	d.namespaces.Invalidate()
+	d.tables.Invalidate()
+}
+
+func (d *connectorDiscovery) invalidateAll() {
+	d.namespaces.Invalidate()
 	d.tablets.InvalidateAll()
 	d.tables.Invalidate()
-	d.namespaces.Invalidate()
 }
 
 // TableByName resolves a qualified or default-namespace table name.
@@ -205,9 +214,7 @@ func (c *Connector) InvalidateDiscovery() error {
 	if err != nil {
 		return err
 	}
-	discovery.tablets.InvalidateAll()
-	discovery.tables.Invalidate()
-	discovery.namespaces.Invalidate()
+	discovery.invalidateAll()
 	return nil
 }
 

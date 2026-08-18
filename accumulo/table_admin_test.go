@@ -3,6 +3,7 @@ package accumulo
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 
@@ -214,6 +215,7 @@ func TestTableMutationsUseAccumulo4FATEArguments(t *testing.T) {
 	if err := connector.CreateTable(context.Background(), "analytics.events"); err != nil {
 		t.Fatal(err)
 	}
+
 	if err := connector.CreateTable(context.Background(), "accumulo.audit"); err != nil {
 		t.Fatal(err)
 	}
@@ -344,5 +346,43 @@ func TestMapManagerErrorUsesServerTableName(t *testing.T) {
 		if !errors.Is(err, tt.want) || err.Error() != tt.text {
 			t.Fatalf("kind %d error = %v, want %q", tt.kind, err, tt.text)
 		}
+	}
+}
+
+func TestTableMutationInvalidatesNamespacesBeforeTablesOnSuccessAndError(t *testing.T) {
+	var order []string
+	namespaces := &fakeNamespaces{
+		byName: map[string]string{"": "+default"},
+		byID:   map[string]string{"+default": ""},
+		onInvalidate: func() {
+			order = append(order, "namespaces")
+		},
+	}
+	tables := &fakeTableNames{
+		byName: map[string]string{},
+		byID:   map[string]string{},
+		onInvalidate: func() {
+			order = append(order, "tables")
+		},
+	}
+	connector := testConnectorWithNamespaceDiscovery(t, &fakeTabletWalker{}, namespaces, tables)
+	manager := &fakeManagerAdapter{}
+	connector.manager = manager
+	connector.managerAddr = fakeManagerAddress{address: "manager:9997"}
+
+	if err := connector.CreateTable(context.Background(), "events"); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(order, ","); got != "namespaces,tables" {
+		t.Fatalf("successful mutation invalidation order = %q", got)
+	}
+
+	order = nil
+	manager.err = &managerclient.Error{Kind: managerclient.ErrorNamespaceNotFound}
+	if err := connector.CreateTable(context.Background(), "missing.events"); !errors.Is(err, ErrNamespaceNotFound) {
+		t.Fatalf("namespace error = %v", err)
+	}
+	if got := strings.Join(order, ","); got != "namespaces,tables" {
+		t.Fatalf("failed mutation invalidation order = %q", got)
 	}
 }

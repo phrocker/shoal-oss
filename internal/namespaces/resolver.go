@@ -7,12 +7,16 @@
 package namespaces
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"maps"
 	"path"
 	"sync"
+	"sync/atomic"
 )
 
 const (
@@ -40,9 +44,11 @@ type snapshot struct {
 type Resolver struct {
 	locator Locator
 
-	mu       sync.RWMutex
-	nameToID map[string]string
-	idToName map[string]string
+	opMu       sync.Mutex
+	mu         sync.RWMutex
+	nameToID   map[string]string
+	idToName   map[string]string
+	generation atomic.Uint64
 }
 
 // NewResolver creates a namespace resolver backed by locator.
@@ -125,16 +131,34 @@ func (r *Resolver) List(ctx context.Context) (map[string]string, error) {
 
 // Invalidate clears all cached mappings.
 func (r *Resolver) Invalidate() {
+	r.opMu.Lock()
+	defer r.opMu.Unlock()
 	r.mu.Lock()
 	r.nameToID = nil
 	r.idToName = nil
 	r.mu.Unlock()
+	r.generation.Add(1)
+}
+
+// Generation changes whenever the cached namespace snapshot changes or is
+// invalidated. Dependent caches use it to reject entries qualified against an
+// older namespace map.
+func (r *Resolver) Generation() uint64 {
+	return r.generation.Load()
 }
 
 func (r *Resolver) load(ctx context.Context, force bool) (*snapshot, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	if !force {
+		if cached := r.cachedSnapshot(); cached != nil {
+			return cached, nil
+		}
+	}
+
+	r.opMu.Lock()
+	defer r.opMu.Unlock()
 	if !force {
 		if cached := r.cachedSnapshot(); cached != nil {
 			return cached, nil
@@ -153,8 +177,12 @@ func (r *Resolver) load(ctx context.Context, force bool) (*snapshot, error) {
 
 	r.mu.Lock()
 	if force || r.nameToID == nil || r.idToName == nil {
+		changed := !maps.Equal(r.nameToID, nameToID) || !maps.Equal(r.idToName, idToName)
 		r.nameToID = nameToID
 		r.idToName = idToName
+		if changed {
+			r.generation.Add(1)
+		}
 	}
 	cached := &snapshot{
 		nameToID: cloneMapping(r.nameToID),
@@ -181,12 +209,59 @@ func decodeNamespaceMapping(data []byte) (map[string]string, map[string]string, 
 		return nil, nil, errors.New("namespace mapping znode is empty")
 	}
 
-	idToName := map[string]string{}
-	if err := json.Unmarshal(data, &idToName); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	start, err := decoder.Token()
+	if err != nil {
 		return nil, nil, err
 	}
-	if idToName == nil {
+	if start == nil {
 		return nil, nil, errors.New("namespace mapping znode decoded to null")
+	}
+	if delimiter, ok := start.(json.Delim); !ok || delimiter != '{' {
+		return nil, nil, errors.New("namespace mapping znode must be a JSON object")
+	}
+
+	idToName := map[string]string{}
+	for decoder.More() {
+		key, err := decoder.Token()
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return nil, nil, errors.New("unexpected end of JSON input")
+			}
+			return nil, nil, err
+		}
+		id, ok := key.(string)
+		if !ok {
+			return nil, nil, errors.New("namespace mapping contains a non-string namespace ID")
+		}
+		if _, exists := idToName[id]; exists {
+			return nil, nil, fmt.Errorf("namespace mapping duplicates namespace ID %q", id)
+		}
+		value, err := decoder.Token()
+		if err != nil {
+			return nil, nil, err
+		}
+		name, ok := value.(string)
+		if !ok {
+			return nil, nil, fmt.Errorf("namespace mapping value for ID %q must be a string", id)
+		}
+		idToName[id] = name
+	}
+	end, err := decoder.Token()
+	if err != nil {
+		if errors.Is(err, io.EOF) {
+			return nil, nil, errors.New("unexpected end of JSON input")
+		}
+		return nil, nil, err
+	}
+	if delimiter, ok := end.(json.Delim); !ok || delimiter != '}' {
+		return nil, nil, errors.New("namespace mapping znode has an invalid object terminator")
+	}
+	if token, err := decoder.Token(); !errors.Is(err, io.EOF) {
+		if err != nil {
+			return nil, nil, err
+		}
+		return nil, nil, fmt.Errorf("namespace mapping znode has trailing JSON value %v", token)
 	}
 
 	nameToID := make(map[string]string, len(idToName))
