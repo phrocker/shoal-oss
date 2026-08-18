@@ -5,10 +5,9 @@ metadata:
   labels:
     {{- include "shoal.labels" . | nindent 4 }}
 data:
-  # shoal-embed serve is started with --address/--metrics-address set to
-  # 0.0.0.0:<port> (see embed-statefulset.yaml) so the headless Service can
-  # reach both the gRPC data plane and the /healthz, /readyz, /metrics HTTP
-  # surface.
+  # The write-tier manifest explicitly opts into shoal-embed serve's HTTP
+  # observability listener with --metrics-address (see embed-statefulset.yaml);
+  # the CLI default remains the legacy one-port gRPC-only behavior.
   SHOAL_EMBED_DATA_DIR: {{ .Values.writeTier.dataDir | quote }}
   SHOAL_EMBED_GRPC_PORT: {{ .Values.writeTier.grpcPort | quote }}
   SHOAL_EMBED_METRICS_PORT: {{ .Values.writeTier.metricsPort | quote }}

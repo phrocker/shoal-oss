@@ -7,18 +7,6 @@ metadata:
     app.kubernetes.io/component: write-tier
 spec:
   clusterIP: None
-  # NOTE: publishNotReadyAddresses keeps every pod's address published in
-  # this headless Service's Endpoints/EndpointSlices regardless of
-  # readiness, which is what StatefulSet peer-DNS resolution needs during
-  # cluster bootstrap/formation. One consequence: shoal-embed's readiness
-  # probe cannot use this Service to stop routing traffic to a draining
-  # pod the way it could for a normal (non-headless, addresses-filtered)
-  # Service -- the probe still gates StatefulSet rollout ordering and
-  # gives operators/monitoring an accurate not-ready signal, but per-shard
-  # write routing during drain remains the responsibility of whatever owns
-  # shard-to-writer assignment (the Accumulo-model manager/coordinator),
-  # not this Service. See deploy/README.md.
-  publishNotReadyAddresses: true
   selector:
     app.kubernetes.io/name: shoal-embed
     app.kubernetes.io/instance: {{ .Release.Name }}

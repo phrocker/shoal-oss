@@ -8,18 +8,6 @@ metadata:
     app.kubernetes.io/part-of: shoal-platform
 spec:
   clusterIP: None
-  # NOTE: publishNotReadyAddresses keeps every pod's address published in
-  # this headless Service's Endpoints/EndpointSlices regardless of
-  # readiness, which is what StatefulSet peer-DNS resolution needs during
-  # cluster bootstrap/formation. One consequence: shoal-embed's readiness
-  # probe (below) cannot use this Service to stop routing traffic to a
-  # draining pod the way it could for a normal (non-headless, addresses-
-  # filtered) Service -- the probe still gates StatefulSet rollout
-  # ordering and gives operators/monitoring an accurate not-ready signal,
-  # but per-shard write routing during drain remains the responsibility of
-  # whatever owns shard-to-writer assignment (the Accumulo-model
-  # manager/coordinator), not this Service. See deploy/README.md.
-  publishNotReadyAddresses: true
   selector:
     app.kubernetes.io/name: shoal-embed
     app.kubernetes.io/component: write-tier
@@ -55,12 +43,9 @@ spec:
         app.kubernetes.io/component: write-tier
         app.kubernetes.io/part-of: shoal-platform
     spec:
-      # shoal-embed serve's defaults are --quiesce-delay=5s (a pause after
-      # flipping /readyz to not-ready, before anything stops accepting
-      # work) plus --drain-timeout=30s (bounds the drain phase that
-      # follows); this leaves headroom for engine close and process exit
-      # after both phases end, so SIGKILL doesn't land mid-close.
-      terminationGracePeriodSeconds: 45
+      # 10s readiness-withdrawal quiesce + 30s drain + margin for engine close
+      # before Kubernetes escalates to SIGKILL.
+      terminationGracePeriodSeconds: 50
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532
@@ -78,6 +63,7 @@ spec:
             - --data=$(SHOAL_EMBED_DATA_DIR)
             - --address=0.0.0.0:$(SHOAL_EMBED_GRPC_PORT)
             - --metrics-address=0.0.0.0:$(SHOAL_EMBED_METRICS_PORT)
+            - --quiesce-delay=10s
           envFrom:
             - configMapRef:
                 name: shoal-platform-config
@@ -97,7 +83,8 @@ spec:
               path: /readyz
               port: metrics
             initialDelaySeconds: 5
-            periodSeconds: 10
+            periodSeconds: 5
+            failureThreshold: 1
           livenessProbe:
             httpGet:
               path: /healthz

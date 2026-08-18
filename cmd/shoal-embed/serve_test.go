@@ -154,6 +154,50 @@ func TestStartServeReadyHealthAndMetrics(t *testing.T) {
 	}
 }
 
+func TestStartServeWithoutMetricsListener(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	h, err := startServe(serveConfig{
+		DataDir:     t.TempDir(),
+		GRPCAddress: "127.0.0.1:0",
+		Logger:      logger,
+	})
+	if err != nil {
+		t.Fatalf("startServe: %v", err)
+	}
+	if h.MetricsAddr != "" {
+		t.Fatalf("MetricsAddr = %q, want empty when observability listener is disabled", h.MetricsAddr)
+	}
+
+	serveErrCh := make(chan error, 1)
+	go func() { serveErrCh <- h.Serve() }()
+
+	conn, err := grpc.NewClient(h.GRPCAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("grpc.NewClient: %v", err)
+	}
+	defer conn.Close()
+	client := embedpb.NewShoalEmbedClient(conn)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := client.Status(ctx, &embedpb.StatusRequest{}); err != nil {
+		t.Fatalf("Status RPC: %v", err)
+	}
+
+	h.Drain()
+	stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer stopCancel()
+	h.Stop(stopCtx)
+
+	select {
+	case err := <-serveErrCh:
+		if err != nil {
+			t.Fatalf("Serve() returned %v, want nil after Stop", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Serve did not return within 5s of Stop")
+	}
+}
+
 func TestServeHandleDrainThenStop(t *testing.T) {
 	h, serveErrCh := newTestServeHandle(t)
 

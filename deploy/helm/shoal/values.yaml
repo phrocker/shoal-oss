@@ -17,6 +17,10 @@ writeTier:
   dataDir: /var/lib/shoal
   grpcPort: 9876
   metricsPort: 9877
+  quiesceDelay: 10s
+  terminationGracePeriodSeconds: 50
+  readinessProbePeriodSeconds: 5
+  readinessProbeFailureThreshold: 1
   storageSize: 50Gi
   resources:
     requests:
