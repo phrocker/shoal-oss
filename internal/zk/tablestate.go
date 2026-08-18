@@ -2,7 +2,7 @@ package zk
 
 import (
 	"context"
-	"fmt"
+	"errors"
 	"path"
 	"strings"
 
@@ -44,14 +44,14 @@ type TableStateResult struct {
 // value together with the znode data version. A missing znode is reported
 // as Exists=false (not an error) so callers can distinguish "unknown
 // table" from a transport failure.
-func (l *Locator) TableState(_ context.Context, tableID string) (TableStateResult, error) {
+func (l *Locator) TableState(ctx context.Context, tableID string) (TableStateResult, error) {
 	p := path.Join(zRoot, l.instanceID, zTables, tableID, zTableState)
-	data, stat, err := l.conn.Get(p)
+	data, stat, err := l.get(ctx, p)
 	if err != nil {
-		if err == gozk.ErrNoNode {
+		if errors.Is(err, gozk.ErrNoNode) {
 			return TableStateResult{Exists: false}, nil
 		}
-		return TableStateResult{}, fmt.Errorf("get %s: %w", p, err)
+		return TableStateResult{}, err
 	}
 	return TableStateResult{
 		State:   strings.TrimSpace(string(data)),

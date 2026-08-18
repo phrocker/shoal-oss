@@ -49,6 +49,7 @@ type Locator struct {
 	servers        []string
 	sessionTimeout time.Duration
 	instanceSecret string
+	rawConnFactory func() (rawZKConn, error)
 }
 
 // New connects to a ZK quorum, resolves the instance name to its instance
@@ -80,6 +81,10 @@ func NewWithAuth(servers []string, instanceName string, sessionTimeout time.Dura
 		servers:        append([]string(nil), servers...),
 		sessionTimeout: sessionTimeout,
 		instanceSecret: instanceSecret,
+	}
+	l.rawConnFactory = func() (rawZKConn, error) {
+		conn, _, err := gozk.Connect(l.servers, l.sessionTimeout)
+		return conn, err
 	}
 	id, err := l.lookupInstanceID()
 	if err != nil {
@@ -134,20 +139,29 @@ func (l *Locator) InstancePath() string {
 // so cancellation can close the in-flight read without disrupting the shared
 // locator session.
 func (l *Locator) GetRaw(ctx context.Context, znodePath string) ([]byte, error) {
+	data, _, err := l.get(ctx, znodePath)
+	return data, err
+}
+
+func (l *Locator) get(ctx context.Context, znodePath string) ([]byte, *gozk.Stat, error) {
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if ctx.Done() != nil {
-		return getRawWithContext(ctx, znodePath, l.instanceSecret, func() (rawZKConn, error) {
-			conn, _, err := gozk.Connect(l.servers, l.sessionTimeout)
-			return conn, err
-		})
+		connect := l.rawConnFactory
+		if connect == nil {
+			connect = func() (rawZKConn, error) {
+				conn, _, err := gozk.Connect(l.servers, l.sessionTimeout)
+				return conn, err
+			}
+		}
+		return getWithContext(ctx, znodePath, l.instanceSecret, connect)
 	}
-	data, _, err := l.conn.Get(znodePath)
+	data, stat, err := l.conn.Get(znodePath)
 	if err != nil {
-		return nil, fmt.Errorf("get %s: %w", znodePath, err)
+		return nil, nil, fmt.Errorf("get %s: %w", znodePath, err)
 	}
-	return data, nil
+	return data, stat, nil
 }
 
 type rawZKConn interface {
@@ -158,6 +172,7 @@ type rawZKConn interface {
 
 type rawResult struct {
 	data []byte
+	stat *gozk.Stat
 	err  error
 }
 
@@ -166,9 +181,18 @@ func getRawWithContext(
 	znodePath, instanceSecret string,
 	connect func() (rawZKConn, error),
 ) ([]byte, error) {
+	data, _, err := getWithContext(ctx, znodePath, instanceSecret, connect)
+	return data, err
+}
+
+func getWithContext(
+	ctx context.Context,
+	znodePath, instanceSecret string,
+	connect func() (rawZKConn, error),
+) ([]byte, *gozk.Stat, error) {
 	conn, err := connect()
 	if err != nil {
-		return nil, fmt.Errorf("zk connect: %w", err)
+		return nil, nil, fmt.Errorf("zk connect: %w", err)
 	}
 	result := make(chan rawResult, 1)
 	go func() {
@@ -178,24 +202,24 @@ func getRawWithContext(
 				return
 			}
 		}
-		data, _, err := conn.Get(znodePath)
+		data, stat, err := conn.Get(znodePath)
 		if err != nil {
 			err = fmt.Errorf("get %s: %w", znodePath, err)
 		}
-		result <- rawResult{data: data, err: err}
+		result <- rawResult{data: data, stat: stat, err: err}
 	}()
 
 	select {
 	case response := <-result:
 		conn.Close()
 		if err := ctx.Err(); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
-		return response.data, response.err
+		return response.data, response.stat, response.err
 	case <-ctx.Done():
 		conn.Close()
 		<-result
-		return nil, ctx.Err()
+		return nil, nil, ctx.Err()
 	}
 }
 
