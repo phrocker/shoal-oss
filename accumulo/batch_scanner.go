@@ -126,8 +126,10 @@ func (s *Scanner) planBatchScan(
 				break
 			}
 			remaining = &Range{
-				startRow:       cloneRow(tablet.Extent.EndRow),
-				endRow:         cloneRow(remaining.endRow),
+				startKey:       keyForRow(tablet.Extent.EndRow),
+				endKey:         cloneKey(remaining.endKey),
+				startRowOnly:   true,
+				endRowOnly:     remaining.endRowOnly,
 				startInclusive: false,
 				endInclusive:   remaining.endInclusive,
 			}
@@ -428,8 +430,10 @@ func clipRangeToTablet(scanRange *Range, tablet Tablet) (*Range, bool) {
 		return cloneRange(scanRange), true
 	}
 	return &Range{
-		startRow:       cloneRow(scanRange.startRow),
-		endRow:         cloneRow(tablet.Extent.EndRow),
+		startKey:       cloneKey(scanRange.startKey),
+		endKey:         keyForRow(tablet.Extent.EndRow),
+		startRowOnly:   scanRange.startRowOnly,
+		endRowOnly:     true,
 		startInclusive: scanRange.startInclusive,
 		endInclusive:   true,
 	}, false
@@ -437,8 +441,10 @@ func clipRangeToTablet(scanRange *Range, tablet Tablet) (*Range, bool) {
 
 func cloneRange(scanRange *Range) *Range {
 	return &Range{
-		startRow:       cloneRow(scanRange.startRow),
-		endRow:         cloneRow(scanRange.endRow),
+		startKey:       cloneKey(scanRange.startKey),
+		endKey:         cloneKey(scanRange.endKey),
+		startRowOnly:   scanRange.startRowOnly,
+		endRowOnly:     scanRange.endRowOnly,
 		startInclusive: scanRange.startInclusive,
 		endInclusive:   scanRange.endInclusive,
 	}

@@ -66,6 +66,22 @@ func TestSharedLibraryCABI(t *testing.T) {
 		env = prependEnvPath(env, "LD_LIBRARY_PATH", artifacts)
 	}
 	runCommand(t, artifacts, env, executable)
+
+	bridgeExecutable := filepath.Join(artifacts, "result_bridge")
+	if runtime.GOOS == "windows" {
+		bridgeExecutable += ".exe"
+	}
+	bridgeArgs := append(
+		append([]string{}, cc.args...),
+		"-std=c11", "-Wall", "-Wextra", "-Werror",
+		"-I", include,
+		"-I", filepath.Join(root, "cmd", "shoal-capi"),
+		filepath.Join(root, "capi", "tests", "result_bridge.c"),
+		filepath.Join(root, "cmd", "shoal-capi", "bridge.c"),
+		"-o", bridgeExecutable,
+	)
+	runCommand(t, root, nil, cc.name, bridgeArgs...)
+	runCommand(t, artifacts, nil, bridgeExecutable)
 }
 
 type command struct {

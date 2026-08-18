@@ -198,8 +198,8 @@ func (s *Scanner) scanLocated(
 				"%w: table=%s start=%q end=%q tabletEnd=%q",
 				ErrRangeSpansTablets,
 				table.ID,
-				scanRange.startRow,
-				scanRange.endRow,
+				scanRange.StartRow(),
+				scanRange.EndRow(),
 				tablet.Extent.EndRow,
 			)
 		}

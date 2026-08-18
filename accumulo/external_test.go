@@ -64,9 +64,12 @@ func TestPublicScannerAPICompiles(t *testing.T) {
 	}
 	_ = scanRange.StartRow()
 	_ = scanRange.EndRow()
+	_ = scanRange.StartKey()
+	_ = scanRange.EndKey()
 	_ = scanRange.StartInclusive()
 	_ = scanRange.EndInclusive()
 	_, _ = accumulo.NewRangeRow([]byte("row"))
+	_, _ = accumulo.NewKeyRange(&accumulo.Key{Row: []byte("a")}, true, &accumulo.Key{Row: []byte("z")}, false)
 	_ = accumulo.InfiniteRange()
 	familyColumn := accumulo.NewColumnFamily([]byte("content"))
 	exactColumn := accumulo.NewColumn([]byte("meta"), []byte("type"))
