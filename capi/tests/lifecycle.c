@@ -18,12 +18,15 @@ static void expect_error(shoal_status status, shoal_status expected,
 
 int main(void) {
   shoal_connector *connector = NULL;
+  shoal_connector *admin_connector = NULL;
   shoal_scanner *scanner = NULL;
   shoal_batch_scanner *batch_scanner = NULL;
   shoal_scan_result *result = NULL;
+  shoal_table_list_result *table_list = NULL;
   shoal_mutation *mutation = NULL;
   shoal_batch_writer *writer = NULL;
   shoal_write_failure *write_failure = NULL;
+  shoal_table_properties_result *properties = NULL;
   shoal_error *error = NULL;
 
   assert(shoal_abi_version() == SHOAL_ABI_VERSION);
@@ -56,6 +59,111 @@ int main(void) {
          SHOAL_STATUS_OK);
   assert(connector != NULL);
   assert(error == NULL);
+
+  assert(shoal_test_connector_create(&admin_connector));
+  assert(admin_connector != NULL);
+
+  shoal_table_view table_view;
+  assert(shoal_connector_list_tables(admin_connector, 0, &table_list, &error) ==
+         SHOAL_STATUS_OK);
+  assert(table_list != NULL && error == NULL);
+  assert(shoal_table_list_count(table_list) == 2);
+  assert(shoal_table_list_get(table_list, 0, &table_view, &error) ==
+         SHOAL_STATUS_OK);
+  assert(strcmp(table_view.name, "analytics.orders") == 0);
+  assert(strcmp(table_view.id, "2") == 0);
+  assert(shoal_table_list_get(table_list, 1, &table_view, &error) ==
+         SHOAL_STATUS_OK);
+  assert(strcmp(table_view.name, "events") == 0);
+  assert(strcmp(table_view.id, "1") == 0);
+  expect_error(shoal_table_list_get(table_list, 2, &table_view, &error),
+               SHOAL_STATUS_INVALID_ARGUMENT, &error, "out of bounds");
+  shoal_table_list_free(&table_list);
+  assert(table_list == NULL);
+
+  uint8_t exists = 99;
+  assert(shoal_connector_table_exists(admin_connector, "events", 0, &exists,
+                                      &error) == SHOAL_STATUS_OK);
+  assert(exists == 1 && error == NULL);
+  exists = 99;
+  assert(shoal_connector_table_exists(admin_connector, "missing", 0, &exists,
+                                      &error) == SHOAL_STATUS_OK);
+  assert(exists == 0 && error == NULL);
+  expect_error(shoal_connector_table_exists(admin_connector, "block", 1,
+                                            &exists, &error),
+               SHOAL_STATUS_DEADLINE_EXCEEDED, &error, "deadline exceeded");
+
+  assert(shoal_connector_create_table(admin_connector, "created", 0, &error) ==
+         SHOAL_STATUS_OK);
+  assert(shoal_connector_table_exists(admin_connector, "created", 0, &exists,
+                                      &error) == SHOAL_STATUS_OK);
+  assert(exists == 1);
+  expect_error(shoal_connector_create_table(admin_connector, "events", 0,
+                                            &error),
+               SHOAL_STATUS_ALREADY_EXISTS, &error, "table exists");
+  assert(shoal_connector_rename_table(admin_connector, "created", "renamed", 0,
+                                      &error) == SHOAL_STATUS_OK);
+  assert(shoal_connector_table_exists(admin_connector, "created", 0, &exists,
+                                      &error) == SHOAL_STATUS_OK);
+  assert(exists == 0);
+  assert(shoal_connector_table_exists(admin_connector, "renamed", 0, &exists,
+                                      &error) == SHOAL_STATUS_OK);
+  assert(exists == 1);
+  expect_error(shoal_connector_delete_table(admin_connector, "missing", 0,
+                                            &error),
+               SHOAL_STATUS_NOT_FOUND, &error, "table not found");
+  assert(shoal_connector_delete_table(admin_connector, "renamed", 0, &error) ==
+         SHOAL_STATUS_OK);
+  assert(shoal_connector_table_exists(admin_connector, "renamed", 0, &exists,
+                                      &error) == SHOAL_STATUS_OK);
+  assert(exists == 0);
+
+  expect_error(shoal_connector_flush_table(admin_connector, "down", 0, 0,
+                                           &error),
+               SHOAL_STATUS_UNAVAILABLE, &error, "manager unavailable");
+  assert(shoal_connector_flush_table(admin_connector, "events", 1, 0, &error) ==
+         SHOAL_STATUS_OK);
+
+  assert(shoal_connector_set_table_property(
+             admin_connector, "events", "table.custom.alpha", "alpha", 0,
+             &error) == SHOAL_STATUS_OK);
+  assert(shoal_connector_set_table_property(
+             admin_connector, "events", "table.custom.empty", "", 0,
+             &error) == SHOAL_STATUS_OK);
+  expect_error(shoal_connector_set_table_property(
+                   admin_connector, "events", "invalid", "x", 0, &error),
+               SHOAL_STATUS_INVALID_ARGUMENT, &error, "invalid property");
+  assert(shoal_connector_remove_table_property(
+             admin_connector, "events", "table.custom.alpha", 0,
+             &error) == SHOAL_STATUS_OK);
+
+  shoal_table_property_view property_view;
+  assert(shoal_connector_effective_table_properties(admin_connector, "events",
+                                                    0, &properties,
+                                                    &error) ==
+         SHOAL_STATUS_OK);
+  assert(properties != NULL && error == NULL);
+  assert(shoal_table_properties_count(properties) == 2);
+  assert(shoal_table_properties_get(properties, 0, &property_view, &error) ==
+         SHOAL_STATUS_OK);
+  assert(strcmp(property_view.key, "table.custom.empty") == 0);
+  assert(strcmp(property_view.value, "") == 0);
+  assert(shoal_table_properties_get(properties, 1, &property_view, &error) ==
+         SHOAL_STATUS_OK);
+  assert(strcmp(property_view.key, "table.custom.mode") == 0);
+  assert(strcmp(property_view.value, "stream") == 0);
+  expect_error(shoal_table_properties_get(properties, 2, &property_view,
+                                          &error),
+               SHOAL_STATUS_INVALID_ARGUMENT, &error, "out of bounds");
+  shoal_table_properties_free(&properties);
+  assert(properties == NULL);
+  expect_error(shoal_connector_effective_table_properties(
+                   admin_connector, "down", 0, &properties, &error),
+               SHOAL_STATUS_UNAVAILABLE, &error,
+               "client service unavailable");
+  expect_error(shoal_connector_effective_table_properties(
+                   admin_connector, "denied", 0, &properties, &error),
+               SHOAL_STATUS_PERMISSION_DENIED, &error, "permission denied");
 
   shoal_scanner_config scanner_config;
   shoal_scanner_config_init(&scanner_config);
@@ -259,9 +367,17 @@ int main(void) {
   assert(shoal_connector_close(connector, &error) == SHOAL_STATUS_OK);
   assert(error == NULL);
 
+  assert(shoal_connector_close(admin_connector, &error) == SHOAL_STATUS_OK);
+  expect_error(shoal_connector_list_tables(admin_connector, 0, &table_list,
+                                           &error),
+               SHOAL_STATUS_CLOSED, &error, "connector is closed");
+
   shoal_connector_free(&connector);
   assert(connector == NULL);
   shoal_connector_free(&connector);
+  shoal_connector_free(&admin_connector);
+  assert(admin_connector == NULL);
+  shoal_connector_free(&admin_connector);
 
   shoal_connector_config_init(&config);
   config.struct_size = SHOAL_CONNECTOR_CONFIG_V1_SIZE - 1;

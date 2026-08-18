@@ -19,6 +19,7 @@ import (
 )
 
 const defaultBootstrapTimeout = 30 * time.Second
+const connectorFreeTimeout = 5 * time.Second
 
 type connectorConfig struct {
 	bootstrap        int32
@@ -124,7 +125,7 @@ func shoal_connector_free(handle **C.shoal_connector) {
 	*handle = nil
 	id := uint64(C.shoal_bridge_connector_id(value))
 	if owned, ok := connectors.remove(id); ok {
-		_ = owned.close()
+		_ = owned.closeBounded(connectorFreeTimeout)
 	}
 	C.shoal_bridge_connector_free(value)
 }
@@ -258,7 +259,7 @@ func openConnector(config connectorConfig) (*ownedConnector, C.shoal_status, err
 		}
 		return nil, C.SHOAL_STATUS_INTERNAL, err
 	}
-	return &ownedConnector{connector: connector, instance: instance}, C.SHOAL_STATUS_OK, nil
+	return newOwnedConnector(connector, instance), C.SHOAL_STATUS_OK, nil
 }
 
 func lookupConnector(handle *C.shoal_connector) (*ownedConnector, error) {
@@ -285,6 +286,13 @@ func requiredString(value *C.char, name string) (string, error) {
 		return "", fmt.Errorf("shoal: %s is required", name)
 	}
 	return converted, nil
+}
+
+func requiredStringAllowEmpty(value *C.char, name string) (string, error) {
+	if value == nil {
+		return "", fmt.Errorf("shoal: %s is required", name)
+	}
+	return C.GoString(value), nil
 }
 
 func optionalString(value *C.char) string {

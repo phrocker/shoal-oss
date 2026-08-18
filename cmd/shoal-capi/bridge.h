@@ -47,6 +47,16 @@ struct shoal_scan_result {
   shoal_bridge_scan_entry *entries;
 };
 
+typedef struct shoal_bridge_table_entry {
+  char *name;
+  char *id;
+} shoal_bridge_table_entry;
+
+struct shoal_table_list_result {
+  size_t count;
+  shoal_bridge_table_entry *entries;
+};
+
 typedef struct shoal_bridge_extent {
   char *server;
   char *table_id;
@@ -94,6 +104,16 @@ struct shoal_write_failure {
   shoal_bridge_cleanup_failure *cleanups;
 };
 
+typedef struct shoal_bridge_table_property_entry {
+  char *key;
+  char *value;
+} shoal_bridge_table_property_entry;
+
+struct shoal_table_properties_result {
+  size_t count;
+  shoal_bridge_table_property_entry *entries;
+};
+
 shoal_connector *shoal_bridge_connector_alloc(uint64_t id);
 uint64_t shoal_bridge_connector_id(const shoal_connector *connector);
 void shoal_bridge_connector_free(shoal_connector *connector);
@@ -126,6 +146,14 @@ size_t shoal_bridge_scan_result_count(const shoal_scan_result *result);
 int shoal_bridge_scan_result_get(const shoal_scan_result *result, size_t index,
                                  shoal_key_value_view *out_value);
 void shoal_bridge_scan_result_free(shoal_scan_result *result);
+
+shoal_table_list_result *shoal_bridge_table_list_alloc(size_t count);
+int shoal_bridge_table_list_set(shoal_table_list_result *result, size_t index,
+                                const char *name, const char *id);
+size_t shoal_bridge_table_list_count(const shoal_table_list_result *result);
+int shoal_bridge_table_list_get(const shoal_table_list_result *result,
+                                size_t index, shoal_table_view *out_table);
+void shoal_bridge_table_list_free(shoal_table_list_result *result);
 
 shoal_write_failure *shoal_bridge_write_failure_alloc(
     shoal_write_failure_flags flags, size_t failed_extent_count,
@@ -170,6 +198,17 @@ int shoal_bridge_write_failure_get_cleanup(
     const shoal_write_failure *failure, size_t index,
     shoal_cleanup_failure_view *out_failure);
 void shoal_bridge_write_failure_free(shoal_write_failure *failure);
+
+shoal_table_properties_result *shoal_bridge_table_properties_alloc(size_t count);
+int shoal_bridge_table_properties_set(shoal_table_properties_result *result,
+                                      size_t index, const char *key,
+                                      const char *value);
+size_t shoal_bridge_table_properties_count(
+    const shoal_table_properties_result *result);
+int shoal_bridge_table_properties_get(
+    const shoal_table_properties_result *result, size_t index,
+    shoal_table_property_view *out_property);
+void shoal_bridge_table_properties_free(shoal_table_properties_result *result);
 
 shoal_error *shoal_bridge_error_alloc(shoal_status code, const char *message,
                                       size_t message_length);

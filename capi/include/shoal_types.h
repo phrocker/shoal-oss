@@ -40,6 +40,8 @@ enum {
   SHOAL_STATUS_RETRY_EXHAUSTED = 16,
   SHOAL_STATUS_MUTATION_REJECTED = 17,
   SHOAL_STATUS_AMBIGUOUS_WRITE = 18,
+  SHOAL_STATUS_ALREADY_EXISTS = 19,
+  SHOAL_STATUS_UNAVAILABLE = 20,
   SHOAL_STATUS_INTERNAL = 255
 };
 
@@ -55,9 +57,11 @@ typedef struct shoal_connector shoal_connector;
 typedef struct shoal_scanner shoal_scanner;
 typedef struct shoal_batch_scanner shoal_batch_scanner;
 typedef struct shoal_scan_result shoal_scan_result;
+typedef struct shoal_table_list_result shoal_table_list_result;
 typedef struct shoal_mutation shoal_mutation;
 typedef struct shoal_batch_writer shoal_batch_writer;
 typedef struct shoal_write_failure shoal_write_failure;
+typedef struct shoal_table_properties_result shoal_table_properties_result;
 typedef struct shoal_error shoal_error;
 
 typedef struct shoal_bytes {
@@ -186,6 +190,16 @@ typedef struct shoal_key_value_view {
   int64_t timestamp;
   shoal_bytes value;
 } shoal_key_value_view;
+
+typedef struct shoal_table_view {
+  const char *name;
+  const char *id;
+} shoal_table_view;
+
+typedef struct shoal_table_property_view {
+  const char *key;
+  const char *value;
+} shoal_table_property_view;
 
 typedef int32_t shoal_durability;
 

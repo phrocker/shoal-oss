@@ -34,7 +34,8 @@ shoal_connector_create(const shoal_connector_config *config,
 
 /*
  * Closes connector-owned transports and bootstrap resources. Close is
- * idempotent while the handle remains alive.
+ * idempotent while the handle remains alive and cancels then joins active
+ * table-administration calls.
  */
 SHOAL_API shoal_status SHOAL_CALL
 shoal_connector_close(shoal_connector *connector, shoal_error **out_error);
@@ -45,6 +46,100 @@ shoal_connector_close(shoal_connector *connector, shoal_error **out_error);
  * when its error must be observed.
  */
 SHOAL_API void SHOAL_CALL shoal_connector_free(shoal_connector **connector);
+
+/*
+ * timeout_ms is zero for no deadline and must not be negative. The returned
+ * list owns every table name/ID pair and stays valid until freed. Entries are
+ * sorted by qualified table name.
+ */
+SHOAL_API shoal_status SHOAL_CALL
+shoal_connector_list_tables(shoal_connector *connector, int64_t timeout_ms,
+                            shoal_table_list_result **out_result,
+                            shoal_error **out_error);
+
+SHOAL_API size_t SHOAL_CALL
+shoal_table_list_count(const shoal_table_list_result *result);
+
+SHOAL_API shoal_status SHOAL_CALL
+shoal_table_list_get(const shoal_table_list_result *result, size_t index,
+                     shoal_table_view *out_table, shoal_error **out_error);
+
+SHOAL_API void SHOAL_CALL
+shoal_table_list_free(shoal_table_list_result **result);
+
+/*
+ * timeout_ms is zero for no deadline and must not be negative. out_exists is
+ * set to 0 before validation and to 1 only when the table is present.
+ */
+SHOAL_API shoal_status SHOAL_CALL
+shoal_connector_table_exists(shoal_connector *connector,
+                             const char *table_name, int64_t timeout_ms,
+                             uint8_t *out_exists, shoal_error **out_error);
+
+SHOAL_API shoal_status SHOAL_CALL
+shoal_connector_create_table(shoal_connector *connector,
+                             const char *table_name, int64_t timeout_ms,
+                             shoal_error **out_error);
+
+SHOAL_API shoal_status SHOAL_CALL
+shoal_connector_delete_table(shoal_connector *connector,
+                             const char *table_name, int64_t timeout_ms,
+                             shoal_error **out_error);
+
+SHOAL_API shoal_status SHOAL_CALL
+shoal_connector_rename_table(shoal_connector *connector,
+                             const char *table_name,
+                             const char *new_table_name, int64_t timeout_ms,
+                             shoal_error **out_error);
+
+/*
+ * wait must be 0 or 1. When set, the call waits until Accumulo reports the
+ * full-table flush complete or the operation deadline expires.
+ */
+SHOAL_API shoal_status SHOAL_CALL
+shoal_connector_flush_table(shoal_connector *connector,
+                            const char *table_name, uint8_t wait,
+                            int64_t timeout_ms, shoal_error **out_error);
+
+/*
+ * property_value is required but may be the empty string; use
+ * shoal_connector_remove_table_property to remove a property entirely.
+ */
+SHOAL_API shoal_status SHOAL_CALL
+shoal_connector_set_table_property(shoal_connector *connector,
+                                   const char *table_name,
+                                   const char *property_name,
+                                   const char *property_value,
+                                   int64_t timeout_ms,
+                                   shoal_error **out_error);
+
+SHOAL_API shoal_status SHOAL_CALL
+shoal_connector_remove_table_property(shoal_connector *connector,
+                                      const char *table_name,
+                                      const char *property_name,
+                                      int64_t timeout_ms,
+                                      shoal_error **out_error);
+
+/*
+ * timeout_ms is zero for no deadline and must not be negative. The returned
+ * key/value pairs own their storage, are sorted by property key, and preserve
+ * explicit empty string values until freed.
+ */
+SHOAL_API shoal_status SHOAL_CALL
+shoal_connector_effective_table_properties(
+    shoal_connector *connector, const char *table_name, int64_t timeout_ms,
+    shoal_table_properties_result **out_result, shoal_error **out_error);
+
+SHOAL_API size_t SHOAL_CALL
+shoal_table_properties_count(const shoal_table_properties_result *result);
+
+SHOAL_API shoal_status SHOAL_CALL
+shoal_table_properties_get(const shoal_table_properties_result *result,
+                           size_t index, shoal_table_property_view *out_entry,
+                           shoal_error **out_error);
+
+SHOAL_API void SHOAL_CALL
+shoal_table_properties_free(shoal_table_properties_result **result);
 
 /*
  * Creates a scanner. The configuration and all nested values are copied.

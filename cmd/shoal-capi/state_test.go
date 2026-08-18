@@ -34,6 +34,231 @@ func TestConnectorRegistryLifecycle(t *testing.T) {
 	}
 }
 
+type fakeConnectorAPI struct {
+	close func() error
+}
+
+func (c *fakeConnectorAPI) Close() error {
+	if c.close == nil {
+		return nil
+	}
+	return c.close()
+}
+
+func (c *fakeConnectorAPI) NewScanner(
+	accumulo.Table,
+	accumulo.ScannerOptions,
+) (*accumulo.Scanner, error) {
+	return nil, nil
+}
+
+func (c *fakeConnectorAPI) NewBatchScanner(
+	accumulo.Table,
+	accumulo.ScannerOptions,
+) (*accumulo.BatchScanner, error) {
+	return nil, nil
+}
+
+func (c *fakeConnectorAPI) NewBatchWriter(
+	accumulo.Table,
+	accumulo.BatchWriterOptions,
+) (*accumulo.BatchWriter, error) {
+	return nil, nil
+}
+
+func (c *fakeConnectorAPI) Tables(context.Context) ([]accumulo.Table, error) {
+	return nil, nil
+}
+
+func (c *fakeConnectorAPI) TableExists(context.Context, string) (bool, error) {
+	return false, nil
+}
+
+func (c *fakeConnectorAPI) CreateTable(context.Context, string) error {
+	return nil
+}
+
+func (c *fakeConnectorAPI) DeleteTable(context.Context, string) error {
+	return nil
+}
+
+func (c *fakeConnectorAPI) RenameTable(context.Context, string, string) error {
+	return nil
+}
+
+func (c *fakeConnectorAPI) FlushTable(context.Context, string, bool) error {
+	return nil
+}
+
+func (c *fakeConnectorAPI) SetTableProperty(
+	context.Context,
+	string,
+	string,
+	string,
+) error {
+	return nil
+}
+
+func (c *fakeConnectorAPI) RemoveTableProperty(
+	context.Context,
+	string,
+	string,
+) error {
+	return nil
+}
+
+func (c *fakeConnectorAPI) EffectiveTableProperties(
+	context.Context,
+	string,
+) (map[string]string, error) {
+	return nil, nil
+}
+
+type fakeConnectorInstance struct {
+	close func() error
+}
+
+func (i fakeConnectorInstance) Info() accumulo.InstanceInfo {
+	return accumulo.InstanceInfo{Name: "test", ID: "test-id"}
+}
+
+func (i fakeConnectorInstance) Close() error {
+	if i.close == nil {
+		return nil
+	}
+	return i.close()
+}
+
+func TestOwnedConnectorCloseCancelsAndJoinsActiveCalls(t *testing.T) {
+	var connectorCloses atomic.Int32
+	var instanceCloses atomic.Int32
+	connector := newOwnedConnector(
+		&fakeConnectorAPI{close: func() error {
+			connectorCloses.Add(1)
+			return nil
+		}},
+		fakeConnectorInstance{close: func() error {
+			instanceCloses.Add(1)
+			return nil
+		}},
+	)
+	ctx, done, err := connector.begin(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	closeReturned := make(chan error, 1)
+	go func() {
+		closeReturned <- connector.close()
+	}()
+
+	select {
+	case <-ctx.Done():
+		if !errors.Is(ctx.Err(), context.Canceled) {
+			t.Fatalf("context error = %v, want canceled", ctx.Err())
+		}
+	case <-time.After(time.Second):
+		t.Fatal("close did not cancel active connector call")
+	}
+	select {
+	case <-closeReturned:
+		t.Fatal("close returned before active connector call completed")
+	default:
+	}
+
+	done()
+	select {
+	case err := <-closeReturned:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("close did not join completed connector call")
+	}
+	if _, _, err := connector.begin(0); !errors.Is(err, accumulo.ErrConnectorClosed) {
+		t.Fatalf("begin after close error = %v, want connector closed", err)
+	}
+	if connectorCloses.Load() != 1 || instanceCloses.Load() != 1 {
+		t.Fatalf("close counts = connector:%d instance:%d, want 1/1",
+			connectorCloses.Load(), instanceCloses.Load())
+	}
+}
+
+func TestOwnedConnectorCloseBoundedWait(t *testing.T) {
+	var connectorCloses atomic.Int32
+	var instanceCloses atomic.Int32
+	connector := newOwnedConnector(
+		&fakeConnectorAPI{close: func() error {
+			connectorCloses.Add(1)
+			return nil
+		}},
+		fakeConnectorInstance{close: func() error {
+			instanceCloses.Add(1)
+			return nil
+		}},
+	)
+	ctx, done, err := connector.begin(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	start := time.Now()
+	if err := connector.closeBounded(20 * time.Millisecond); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("closeBounded error = %v, want deadline exceeded", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("closeBounded exceeded deadline bound: %v", elapsed)
+	}
+	if !errors.Is(ctx.Err(), context.Canceled) {
+		t.Fatalf("active context error = %v, want canceled", ctx.Err())
+	}
+	done()
+
+	deadline := time.After(time.Second)
+	for connectorCloses.Load() != 1 || instanceCloses.Load() != 1 {
+		select {
+		case <-deadline:
+			t.Fatalf("background close counts = connector:%d instance:%d, want 1/1",
+				connectorCloses.Load(), instanceCloses.Load())
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	if err := connector.closeBounded(time.Second); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("repeated closeBounded error = %v, want sticky deadline", err)
+	}
+}
+
+func TestOwnedConnectorCloseIsConcurrentAndIdempotent(t *testing.T) {
+	var connectorCloses atomic.Int32
+	var instanceCloses atomic.Int32
+	connector := newOwnedConnector(
+		&fakeConnectorAPI{close: func() error {
+			connectorCloses.Add(1)
+			return nil
+		}},
+		fakeConnectorInstance{close: func() error {
+			instanceCloses.Add(1)
+			return nil
+		}},
+	)
+	const callers = 16
+	var wait sync.WaitGroup
+	wait.Add(callers)
+	for range callers {
+		go func() {
+			defer wait.Done()
+			if err := connector.close(); err != nil {
+				t.Errorf("close error = %v", err)
+			}
+		}()
+	}
+	wait.Wait()
+	if connectorCloses.Load() != 1 || instanceCloses.Load() != 1 {
+		t.Fatalf("close counts = connector:%d instance:%d, want 1/1",
+			connectorCloses.Load(), instanceCloses.Load())
+	}
+}
+
 func TestOwnedScannerCloseCancelsAndJoinsActiveCalls(t *testing.T) {
 	scanner := newOwnedScanner(nil, nil)
 	ctx, done, err := scanner.begin(0)
