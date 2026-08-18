@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"io/fs"
+	"net"
 	"os"
 	"path"
 	"slices"
@@ -300,6 +301,103 @@ func TestFileSerializesConcurrentReadAt(t *testing.T) {
 	}
 }
 
+func TestNewContextPassesContextToNamenodeDial(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	sawCanceled := false
+	_, err := NewContext(ctx, "nn:8020", WithClientOptions(hdfsclient.ClientOptions{
+		User: "shoal-test",
+		NamenodeDialFunc: func(dialCtx context.Context, network, addr string) (net.Conn, error) {
+			sawCanceled = errors.Is(dialCtx.Err(), context.Canceled)
+			return nil, dialCtx.Err()
+		},
+	}))
+	if err == nil {
+		t.Fatal("NewContext succeeded, want dial failure")
+	}
+	if !sawCanceled {
+		t.Fatal("NewContext did not pass the canceled context into the namenode dialer")
+	}
+}
+
+func TestBackendOpenAppliesContextDeadline(t *testing.T) {
+	client := newFakeClient()
+	client.files["/tables/1.rf"] = []byte("rfile")
+	backend, err := New("nn:8020", WithClient(client))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.Now().Add(time.Minute)
+	ctx, cancel := context.WithDeadline(context.Background(), deadline)
+	defer cancel()
+
+	f, err := backend.Open(ctx, "/tables/1.rf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	if client.lastReader == nil {
+		t.Fatal("Open did not record a reader")
+	}
+	if !client.lastReader.deadline.Equal(deadline) {
+		t.Fatalf("reader deadline = %v, want %v", client.lastReader.deadline, deadline)
+	}
+}
+
+func TestBackendCreateAppliesContextDeadline(t *testing.T) {
+	client := newFakeClient()
+	backend, err := New("nn:8020", WithClient(client))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.Now().Add(time.Minute)
+	ctx, cancel := context.WithDeadline(context.Background(), deadline)
+	defer cancel()
+
+	w, err := backend.Create(ctx, "/tables/1.rf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	if client.lastWriter == nil {
+		t.Fatal("Create did not record a writer")
+	}
+	if !client.lastWriter.deadline.Equal(deadline) {
+		t.Fatalf("writer deadline = %v, want %v", client.lastWriter.deadline, deadline)
+	}
+}
+
+func TestBackendCreateStopsReplicationRetryOnContextDeadline(t *testing.T) {
+	client := newFakeClient()
+	client.replicatingCloseFailures = 1000
+	backend, err := New("nn:8020", WithClient(client))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	w, err := backend.Create(ctx, "/tables/1.rf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write([]byte("new")); err != nil {
+		t.Fatal(err)
+	}
+	err = w.Close()
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Close error = %v, want context deadline exceeded", err)
+	}
+	if client.writerCloseCalls == 0 {
+		t.Fatal("Close never retried the temporary file writer")
+	}
+}
+
 type fakeClient struct {
 	files                    map[string][]byte
 	dirs                     map[string]bool
@@ -309,6 +407,8 @@ type fakeClient struct {
 	failRestore              bool
 	replicatingCloseFailures int
 	writerCloseCalls         int
+	lastReader               *fakeReader
+	lastWriter               *fakeWriter
 }
 
 func newFakeClient() *fakeClient {
@@ -323,16 +423,20 @@ func (c *fakeClient) Open(name string) (Reader, error) {
 	if !ok {
 		return nil, &os.PathError{Op: "open", Path: name, Err: fs.ErrNotExist}
 	}
-	return &fakeReader{
+	reader := &fakeReader{
 		Reader: bytes.NewReader(data),
 		info:   fakeInfo{name: path.Base(name), size: int64(len(data))},
-	}, nil
+	}
+	c.lastReader = reader
+	return reader, nil
 }
 
 func (c *fakeClient) Create(name string) (storage.Writer, error) {
-	return &fakeWriter{close: func(data []byte) {
+	writer := &fakeWriter{close: func(data []byte) {
 		c.files[name] = append([]byte(nil), data...)
-	}, client: c, failClose: c.failWriterClose}, nil
+	}, client: c, failClose: c.failWriterClose}
+	c.lastWriter = writer
+	return writer, nil
 }
 
 func (c *fakeClient) MkdirAll(dirname string, _ os.FileMode) error {
@@ -392,17 +496,23 @@ func (c *fakeClient) Close() error { return nil }
 
 type fakeReader struct {
 	*bytes.Reader
-	info os.FileInfo
+	info     os.FileInfo
+	deadline time.Time
 }
 
 func (r *fakeReader) Close() error      { return nil }
 func (r *fakeReader) Stat() os.FileInfo { return r.info }
+func (r *fakeReader) SetDeadline(t time.Time) error {
+	r.deadline = t
+	return nil
+}
 
 type fakeWriter struct {
 	bytes.Buffer
 	close     func([]byte)
 	client    *fakeClient
 	failClose bool
+	deadline  time.Time
 }
 
 func (w *fakeWriter) Close() error {
@@ -415,6 +525,11 @@ func (w *fakeWriter) Close() error {
 		return errors.New("injected close failure")
 	}
 	w.close(w.Bytes())
+	return nil
+}
+
+func (w *fakeWriter) SetDeadline(t time.Time) error {
+	w.deadline = t
 	return nil
 }
 

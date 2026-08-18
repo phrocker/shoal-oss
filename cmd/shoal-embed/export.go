@@ -146,7 +146,7 @@ func openStorageBackend(ctx context.Context, name, pathHint string) (storage.Bac
 				return nil, nil, err
 			}
 		}
-		be, err := hdfs.New(address)
+		be, err := hdfs.NewContext(ctx, address)
 		if err != nil {
 			return nil, nil, err
 		}

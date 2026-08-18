@@ -7,8 +7,10 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"net"
 	"net/url"
 	"os"
+	osuser "os/user"
 	"path"
 	"strings"
 	"sync"
@@ -69,8 +71,18 @@ type Backend struct {
 
 // New constructs a Backend for a namenode address such as "namenode:8020" or
 // "hdfs://namenode:8020". The colinmarc/hdfs default configuration and
-// authentication behavior apply when New creates the client.
+// authentication behavior apply when New creates the client. Prefer
+// NewContext when the backend lifetime is already scoped by a context.
 func New(address string, opts ...Option) (*Backend, error) {
+	return NewContext(context.Background(), address, opts...)
+}
+
+// NewContext constructs a Backend like New, but also binds ctx to the
+// underlying HDFS client's future namenode and datanode dials. Use a context
+// whose lifetime matches the backend's connection lifetime. When ctx has a
+// deadline, new connections inherit it; reads and writes already blocked in the
+// upstream client still run until the current call returns.
+func NewContext(ctx context.Context, address string, opts ...Option) (*Backend, error) {
 	authority, clientAddress, err := parseAddress(address)
 	if err != nil {
 		return nil, err
@@ -87,8 +99,9 @@ func New(address string, opts ...Option) (*Backend, error) {
 			if len(options.Addresses) == 0 && clientAddress != "" {
 				options.Addresses = []string{clientAddress}
 			}
+			options = bindClientOptions(ctx, options)
 			client, err = hdfsclient.NewClient(options)
-		} else if user := os.Getenv("HADOOP_USER_NAME"); user != "" {
+		} else if userName := os.Getenv("HADOOP_USER_NAME"); userName != "" {
 			conf, loadErr := hadoopconf.LoadFromEnvironment()
 			if loadErr != nil {
 				return nil, fmt.Errorf("hdfs: load Hadoop configuration: %w", loadErr)
@@ -97,10 +110,25 @@ func New(address string, opts ...Option) (*Backend, error) {
 			if clientAddress != "" {
 				options.Addresses = strings.Split(clientAddress, ",")
 			}
-			options.User = user
+			options.User = userName
+			options = bindClientOptions(ctx, options)
 			client, err = hdfsclient.NewClient(options)
 		} else {
-			client, err = hdfsclient.New(clientAddress)
+			conf, loadErr := hadoopconf.LoadFromEnvironment()
+			if loadErr != nil {
+				return nil, fmt.Errorf("hdfs: load Hadoop configuration: %w", loadErr)
+			}
+			options := hdfsclient.ClientOptionsFromConf(conf)
+			if clientAddress != "" {
+				options.Addresses = strings.Split(clientAddress, ",")
+			}
+			currentUser, userErr := osuser.Current()
+			if userErr != nil {
+				return nil, fmt.Errorf("hdfs: resolve current user: %w", userErr)
+			}
+			options.User = currentUser.Username
+			options = bindClientOptions(ctx, options)
+			client, err = hdfsclient.NewClient(options)
 		}
 		if err != nil {
 			return nil, fmt.Errorf("hdfs: connect %s: %w", clientAddress, err)
@@ -120,7 +148,10 @@ func (b *Backend) Close() error {
 }
 
 // Open opens path read-only.
-func (b *Backend) Open(_ context.Context, objectPath string) (storage.File, error) {
+func (b *Backend) Open(ctx context.Context, objectPath string) (storage.File, error) {
+	if err := contextOrBackground(ctx).Err(); err != nil {
+		return nil, err
+	}
 	resolved, _, err := b.resolve(objectPath)
 	if err != nil {
 		return nil, err
@@ -132,11 +163,18 @@ func (b *Backend) Open(_ context.Context, objectPath string) (storage.File, erro
 		}
 		return nil, fmt.Errorf("hdfs: open %s: %w", objectPath, err)
 	}
+	if err := applyDeadline(ctx, reader); err != nil {
+		_ = reader.Close()
+		return nil, fmt.Errorf("hdfs: open %s: %w", objectPath, err)
+	}
 	return &file{reader: reader, size: reader.Stat().Size()}, nil
 }
 
 // Create creates or replaces path. Parent directories are created as needed.
-func (b *Backend) Create(_ context.Context, objectPath string) (storage.Writer, error) {
+func (b *Backend) Create(ctx context.Context, objectPath string) (storage.Writer, error) {
+	if err := contextOrBackground(ctx).Err(); err != nil {
+		return nil, err
+	}
 	resolved, _, err := b.resolve(objectPath)
 	if err != nil {
 		return nil, err
@@ -152,16 +190,25 @@ func (b *Backend) Create(_ context.Context, objectPath string) (storage.Writer, 
 	if err != nil {
 		return nil, fmt.Errorf("hdfs: create temporary file %s: %w", tempPath, err)
 	}
+	if err := applyDeadline(ctx, writer); err != nil {
+		_ = writer.Close()
+		_ = b.client.Remove(tempPath)
+		return nil, fmt.Errorf("hdfs: create temporary file %s: %w", tempPath, err)
+	}
 	return &replaceWriter{
 		client: b.client,
 		writer: writer,
+		ctx:    ctx,
 		temp:   tempPath,
 		target: resolved,
 	}, nil
 }
 
 // List returns regular files directly under prefix.
-func (b *Backend) List(_ context.Context, prefix string) ([]string, error) {
+func (b *Backend) List(ctx context.Context, prefix string) ([]string, error) {
+	if err := contextOrBackground(ctx).Err(); err != nil {
+		return nil, err
+	}
 	resolved, qualifier, err := b.resolve(prefix)
 	if err != nil {
 		return nil, err
@@ -189,7 +236,10 @@ func (b *Backend) List(_ context.Context, prefix string) ([]string, error) {
 }
 
 // Remove deletes path. A missing path is not an error.
-func (b *Backend) Remove(_ context.Context, objectPath string) error {
+func (b *Backend) Remove(ctx context.Context, objectPath string) error {
+	if err := contextOrBackground(ctx).Err(); err != nil {
+		return err
+	}
 	resolved, _, err := b.resolve(objectPath)
 	if err != nil {
 		return err
@@ -272,6 +322,39 @@ func parseAddress(address string) (authority, clientAddress string, err error) {
 	return u.Host, u.Host, nil
 }
 
+func bindClientOptions(ctx context.Context, options hdfsclient.ClientOptions) hdfsclient.ClientOptions {
+	options.NamenodeDialFunc = bindDialContext(ctx, options.NamenodeDialFunc)
+	options.DatanodeDialFunc = bindDialContext(ctx, options.DatanodeDialFunc)
+	return options
+}
+
+func bindDialContext(ctx context.Context, dial func(context.Context, string, string) (net.Conn, error)) func(context.Context, string, string) (net.Conn, error) {
+	ctx = contextOrBackground(ctx)
+	if dial == nil {
+		dial = (&net.Dialer{}).DialContext
+	}
+	return func(_ context.Context, network, addr string) (net.Conn, error) {
+		conn, err := dial(ctx, network, addr)
+		if err != nil {
+			return nil, err
+		}
+		if deadline, ok := ctx.Deadline(); ok {
+			if err := conn.SetDeadline(deadline); err != nil {
+				_ = conn.Close()
+				return nil, err
+			}
+		}
+		return conn, nil
+	}
+}
+
+func contextOrBackground(ctx context.Context) context.Context {
+	if ctx == nil {
+		return context.Background()
+	}
+	return ctx
+}
+
 func ensureLeadingSlash(value string) string {
 	if strings.HasPrefix(value, "/") {
 		return value
@@ -281,6 +364,22 @@ func ensureLeadingSlash(value string) string {
 
 func isNotFound(err error) bool {
 	return errors.Is(err, fs.ErrNotExist) || os.IsNotExist(err)
+}
+
+type deadlineSetter interface {
+	SetDeadline(time.Time) error
+}
+
+func applyDeadline(ctx context.Context, target any) error {
+	deadline, ok := contextOrBackground(ctx).Deadline()
+	if !ok {
+		return nil
+	}
+	setter, ok := target.(deadlineSetter)
+	if !ok {
+		return nil
+	}
+	return setter.SetDeadline(deadline)
 }
 
 type file struct {
@@ -307,6 +406,7 @@ func (f *file) Size() int64 { return f.size }
 type replaceWriter struct {
 	client Client
 	writer storage.Writer
+	ctx    context.Context
 	temp   string
 	target string
 	closed bool
@@ -324,7 +424,7 @@ func (w *replaceWriter) Close() error {
 		return errors.New("hdfs: writer already closed")
 	}
 	w.closed = true
-	if err := closeAfterReplication(w.writer); err != nil {
+	if err := closeAfterReplication(w.ctx, w.writer); err != nil {
 		_ = w.client.Remove(w.temp)
 		return fmt.Errorf("hdfs: close temporary file %s: %w", w.temp, err)
 	}
@@ -365,24 +465,29 @@ func (w *replaceWriter) Close() error {
 	return nil
 }
 
-func closeAfterReplication(writer storage.Writer) error {
+func closeAfterReplication(ctx context.Context, writer storage.Writer) error {
 	const (
 		initialDelay = 100 * time.Millisecond
 		maxDelay     = time.Second
 		timeout      = 10 * time.Second
 	)
 
-	deadline := time.Now().Add(timeout)
+	ctx = contextOrBackground(ctx)
+	retryCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
 	delay := initialDelay
 	for {
 		err := writer.Close()
 		if !errors.Is(err, hdfsclient.ErrReplicating) {
 			return err
 		}
-		if time.Now().Add(delay).After(deadline) {
-			return err
+		timer := time.NewTimer(delay)
+		select {
+		case <-retryCtx.Done():
+			timer.Stop()
+			return retryCtx.Err()
+		case <-timer.C:
 		}
-		time.Sleep(delay)
 		delay = min(delay*2, maxDelay)
 	}
 }

@@ -29,6 +29,8 @@ import (
 	"io"
 )
 
+const transferChunkSize = 64 * 1024
+
 // File is an open backend object. Random-access reads via ReadAt; total
 // length via Size; resource release via Close.
 //
@@ -110,28 +112,43 @@ var ErrReadOnly = errors.New("storage: backend is read-only")
 //
 // Reads are issued in 64KB chunks via ReadAt; backends that bill per
 // request (GCS) absorb at most ceil(size/64KB) round trips. Increase
-// the chunk size for large files if perf matters.
+// the chunk size for large files if perf matters. ctx is polled before
+// each backend read and write; if a backend call is already blocked,
+// Copy waits for it to return before observing ctx.Err().
 func Copy(ctx context.Context, src Backend, srcPath string, dst Backend, dstPath string) (int64, error) {
 	wb, ok := dst.(WritableBackend)
 	if !ok {
 		return 0, ErrReadOnly
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, err
 	}
 	in, err := src.Open(ctx, srcPath)
 	if err != nil {
 		return 0, fmt.Errorf("copy: open src %s: %w", srcPath, err)
 	}
 	defer in.Close()
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
 	out, err := wb.Create(ctx, dstPath)
 	if err != nil {
 		return 0, fmt.Errorf("copy: create dst %s: %w", dstPath, err)
 	}
-	defer out.Close()
+	closed := false
+	defer func() {
+		if !closed {
+			_ = out.Close()
+		}
+	}()
 
-	const chunk = 64 * 1024
-	buf := make([]byte, chunk)
+	buf := make([]byte, transferChunkSize)
 	var off int64
 	for off < in.Size() {
-		want := int64(chunk)
+		if err := ctx.Err(); err != nil {
+			return off, err
+		}
+		want := int64(transferChunkSize)
 		if off+want > in.Size() {
 			want = in.Size() - off
 		}
@@ -140,15 +157,27 @@ func Copy(ctx context.Context, src Backend, srcPath string, dst Backend, dstPath
 			return off, fmt.Errorf("copy: read off=%d: %w", off, err)
 		}
 		if n > 0 {
-			if _, werr := out.Write(buf[:n]); werr != nil {
-				return off, fmt.Errorf("copy: write off=%d: %w", off, werr)
+			if err := ctx.Err(); err != nil {
+				return off, err
 			}
-			off += int64(n)
+			writeOff := off
+			wrote, werr := out.Write(buf[:n])
+			off += int64(wrote)
+			if werr != nil {
+				return off, fmt.Errorf("copy: write off=%d: %w", writeOff, werr)
+			}
+			if wrote != n {
+				return off, fmt.Errorf("copy: write off=%d: %w", writeOff, io.ErrShortWrite)
+			}
 		}
 		if errors.Is(err, io.EOF) {
 			break
 		}
 	}
+	if err := out.Close(); err != nil {
+		return off, fmt.Errorf("copy: close dst %s: %w", dstPath, err)
+	}
+	closed = true
 	return off, nil
 }
 
@@ -156,8 +185,13 @@ func Copy(ctx context.Context, src Backend, srcPath string, dst Backend, dstPath
 // slice via ReadAt. This is the "pull-through" read used when an RFile is
 // faulted into the local byte cache: one object fetch, fully resident.
 // For large objects where only a few blocks are needed, prefer wiring the
-// File's ReadAt directly into the reader instead of ReadAll.
+// File's ReadAt directly into the reader instead of ReadAll. ctx is polled
+// before each backend read; once a read is already blocked, ReadAll waits for
+// it to return before observing ctx.Err().
 func ReadAll(ctx context.Context, b Backend, path string) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	f, err := b.Open(ctx, path)
 	if err != nil {
 		return nil, err
@@ -170,6 +204,9 @@ func ReadAll(ctx context.Context, b Backend, path string) ([]byte, error) {
 	buf := make([]byte, size)
 	var off int64
 	for off < size {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		n, err := f.ReadAt(buf[off:], off)
 		off += int64(n)
 		if err != nil {
@@ -185,22 +222,45 @@ func ReadAll(ctx context.Context, b Backend, path string) ([]byte, error) {
 // WriteAll creates path on b (which must be a WritableBackend) and writes
 // data in one shot, committing on Close. Used to publish an immutable
 // RFile produced by a flush or compaction. Returns ErrReadOnly if b can't
-// write.
+// write. ctx is polled between chunk writes; a write already blocked in the
+// backend may still finish its current chunk, and if that completes the object,
+// WriteAll still closes/commits the writer before returning.
 func WriteAll(ctx context.Context, b Backend, path string, data []byte) error {
 	wb, ok := b.(WritableBackend)
 	if !ok {
 		return ErrReadOnly
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	w, err := wb.Create(ctx, path)
 	if err != nil {
 		return fmt.Errorf("writeall: create %s: %w", path, err)
 	}
-	if _, err := w.Write(data); err != nil {
-		w.Close()
-		return fmt.Errorf("writeall: write %s: %w", path, err)
+	closed := false
+	defer func() {
+		if !closed {
+			_ = w.Close()
+		}
+	}()
+	for off := 0; off < len(data); {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		end := min(off+transferChunkSize, len(data))
+		writeOff := off
+		n, err := w.Write(data[off:end])
+		off += n
+		if err != nil {
+			return fmt.Errorf("writeall: write %s off=%d: %w", path, writeOff, err)
+		}
+		if n != end-writeOff {
+			return fmt.Errorf("writeall: write %s off=%d: %w", path, writeOff, io.ErrShortWrite)
+		}
 	}
 	if err := w.Close(); err != nil {
 		return fmt.Errorf("writeall: close %s: %w", path, err)
 	}
+	closed = true
 	return nil
 }

@@ -335,7 +335,7 @@ func backendFor(ctx context.Context, path string) (storage.Backend, string, func
 				return nil, "", nil, err
 			}
 		}
-		be, err := hdfs.New(address)
+		be, err := hdfs.NewContext(ctx, address)
 		if err != nil {
 			return nil, "", nil, fmt.Errorf("hdfs.New: %w", err)
 		}
