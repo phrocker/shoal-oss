@@ -295,6 +295,7 @@ func TestStagePathsAlias(t *testing.T) {
 		{name: "local paths differing only by separator style", src: `/data/t-0000/F0001.rf`, dst: `/data/t-0000//F0001.rf`, want: true},
 		{name: "distinct local paths", src: `/data/t-0000/F0001.rf`, dst: `/bulk/events-1/F0001.rf`, want: false},
 		{name: "identical relative paths", src: "export/events/t-0000/F0001.rf", dst: "export/events/t-0000/F0001.rf", want: true},
+		{name: "local paths differing only by case", src: `/bulk/events-1/A.rf`, dst: `/bulk/events-1/a.rf`, want: true},
 		{name: "identical url paths", src: "hdfs://nn/export/t-0000/F0001.rf", dst: "hdfs://nn/export/t-0000/F0001.rf", want: true},
 		{name: "url paths differing only by trailing slash", src: "hdfs://nn/export/t-0000/F0001.rf", dst: "hdfs://nn/export/t-0000/F0001.rf/", want: true},
 		{name: "distinct url paths", src: "hdfs://nn/export/t-0000/F0001.rf", dst: "hdfs://nn/bulk/events-1/F0001.rf", want: false},
@@ -679,5 +680,80 @@ func TestStageBulkDirRejectsHardLinkedWriteTargetsBeforeCopying(t *testing.T) {
 	}
 	if string(gotB) != string(bContent) {
 		t.Fatalf("source file B corrupted by rejected stage: got %q, want %q", gotB, bContent)
+	}
+}
+
+// TestStageBulkDirRejectsCaseInsensitiveAliasBeforeCopying proves the
+// preflight also catches two flattened destinations that differ only by
+// case, even though *neither exists yet* when the check runs. Windows
+// and macOS (by default) resolve filesystem paths case-insensitively, so
+// bulkDir/A.rf and bulkDir/a.rf name the same physical location there --
+// but an os.Stat-based physical-identity check cannot detect that: right
+// up until the second Create silently resolves onto the first, both
+// paths correctly stat as "doesn't exist yet." Without a case-
+// insensitive lexical check, StageBulkDir would copy the first source,
+// then silently overwrite it when copying the second, while the load
+// mapping still records both names (A.rf and a.rf) as independent files
+// with independent sizes.
+func TestStageBulkDirRejectsCaseInsensitiveAliasBeforeCopying(t *testing.T) {
+	root := t.TempDir()
+	exportDir0 := filepath.Join(root, "export", "t-0000")
+	exportDir1 := filepath.Join(root, "export", "t-0001")
+	if err := os.MkdirAll(exportDir0, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(exportDir1, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	upperPath := filepath.Join(exportDir0, "A.rf")
+	lowerPath := filepath.Join(exportDir1, "a.rf")
+	upperContent := []byte("upper file bytes that must survive a rejected stage")
+	lowerContent := []byte("lower file bytes")
+	if err := os.WriteFile(upperPath, upperContent, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(lowerPath, lowerContent, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	bulkDir := filepath.Join(root, "bulk")
+	if err := os.MkdirAll(bulkDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Neither bulkDir/A.rf nor bulkDir/a.rf exists yet -- the scenario an
+	// os.Stat-based physical-identity check cannot catch, since there's
+	// nothing to stat until after the (unsafe) first copy.
+
+	upperSum := sha256.Sum256(upperContent)
+	lowerSum := sha256.Sum256(lowerContent)
+	manifest := &engine.RFileExportManifest{
+		Version:     engine.RFileExportManifestVersion,
+		SourceTable: "events",
+		Tablets:     []engine.RFileExportTablet{{Index: 0}},
+		RFiles: []engine.RFileExportFile{
+			{TabletIndex: 0, DestinationPath: upperPath, Size: int64(len(upperContent)), SHA256: hex.EncodeToString(upperSum[:])},
+			{TabletIndex: 0, DestinationPath: lowerPath, Size: int64(len(lowerContent)), SHA256: hex.EncodeToString(lowerSum[:])},
+		},
+	}
+
+	be := local.New()
+	ctx := context.Background()
+	if _, err := StageBulkDir(ctx, be, manifest, be, bulkDir); err == nil {
+		t.Fatal("StageBulkDir with two case-insensitively-aliased write targets = nil error, want error")
+	}
+
+	gotUpper, err := os.ReadFile(upperPath)
+	if err != nil {
+		t.Fatalf("source file A.rf missing after rejected stage: %v", err)
+	}
+	if string(gotUpper) != string(upperContent) {
+		t.Fatalf("source file A.rf corrupted by rejected stage: got %q, want %q", gotUpper, upperContent)
+	}
+	gotLower, err := os.ReadFile(lowerPath)
+	if err != nil {
+		t.Fatalf("source file a.rf missing after rejected stage: %v", err)
+	}
+	if string(gotLower) != string(lowerContent) {
+		t.Fatalf("source file a.rf corrupted by rejected stage: got %q, want %q", gotLower, lowerContent)
 	}
 }

@@ -183,7 +183,10 @@ func checkNoStagingAliases(flatNames map[string]string, bulkDir string) error {
 // URL-style paths (containing "://") have no local filesystem entry to
 // inspect, so those are compared as normalized strings only. Filesystem-
 // style paths are first compared the same way as a cheap common-case
-// check, then — because a purely lexical comparison misses an absolute
+// check, then a case-insensitive lexical comparison (Windows and macOS
+// default to case-insensitive filesystems, where two differently-cased
+// paths can alias even before either exists, which os.Stat cannot
+// detect), then — because both lexical comparisons still miss an absolute
 // source path aliasing an equivalent relative destination path (or vice
 // versa), and misses a destination reached through a symlink or hard
 // link to the same source file — checked for physical identity via
@@ -225,7 +228,23 @@ func pathsAlias(srcPath, dstPath string, cache pathIdentityCache) bool {
 	if strings.Contains(srcPath, "://") || strings.Contains(dstPath, "://") {
 		return strings.TrimRight(srcPath, `/\`) == strings.TrimRight(dstPath, `/\`)
 	}
-	if filepath.Clean(srcPath) == filepath.Clean(dstPath) {
+	srcClean := filepath.Clean(srcPath)
+	dstClean := filepath.Clean(dstPath)
+	if srcClean == dstClean {
+		return true
+	}
+	// Windows and macOS (by default) resolve filesystem paths
+	// case-insensitively, so two paths differing only in case can name
+	// the same file even before either exists — a case the physical-
+	// identity stat below cannot catch, since it needs an existing file
+	// to stat, and two not-yet-created destinations both correctly stat
+	// as "doesn't exist" right up until the second Create silently
+	// resolves onto the first. Treating a case-insensitive lexical match
+	// as a potential alias is conservative — it may also reject a
+	// legitimate same-case-insensitive-spelling collision on a genuinely
+	// case-sensitive filesystem — matching this package's preference for
+	// a safe false positive over a data-destroying false negative.
+	if strings.EqualFold(srcClean, dstClean) {
 		return true
 	}
 	srcInfo := cache.stat(srcPath)

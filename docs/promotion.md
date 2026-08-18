@@ -167,6 +167,14 @@ RFileExportManifest (existing)  →  promotion.BuildLoadMapping
   hard-linked to each other, which would otherwise let the second copy
   silently overwrite the first while the load mapping still lists both
   names as independent files.
+  Alias detection also treats two paths differing only by case as a
+  potential alias, purely lexically, even when neither exists yet:
+  Windows and macOS (by default) resolve filesystem paths
+  case-insensitively, so two manifest sources that flatten to
+  differently-cased basenames (e.g. `A.rf` and `a.rf`) would otherwise
+  name the same physical file there without either path ever being
+  stat-able beforehand, letting the second copy silently overwrite the
+  first while the load mapping still lists both as independent files.
 - `internal/promotion.Promote` — composes `StageBulkDir` with a
   `BulkImporter` (satisfied by `*accumulo.Connector`) to submit the FATE
   call. Submits nothing when the derived mapping is empty (nothing to
