@@ -473,6 +473,15 @@ int main(void) {
   shoal_bytes empty_password = {NULL, 0};
   assert(shoal_connector_create_user(admin_connector, "alice", &empty_password,
                                      0, &error) == SHOAL_STATUS_OK);
+  assert(shoal_connector_change_user_authorizations(
+             admin_connector, "alice", NULL, 0, 0, &error) == SHOAL_STATUS_OK);
+  assert(error == NULL);
+  assert(shoal_connector_get_user_authorizations(
+             admin_connector, "alice", 0, &bytes_list, &error) ==
+         SHOAL_STATUS_OK);
+  assert(shoal_bytes_list_count(bytes_list) == 0);
+  shoal_bytes_list_free(&bytes_list);
+  shoal_bytes_list_free(&bytes_list);
   expect_error(shoal_connector_change_user_authorizations(
                    admin_connector, "alice", NULL, 1, 0, &error),
                SHOAL_STATUS_INVALID_ARGUMENT, &error, "authorizations");
