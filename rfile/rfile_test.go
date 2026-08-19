@@ -907,6 +907,43 @@ func TestEntryHelpers(t *testing.T) {
 	if !dead.Deleted || len(dead.Value) != 0 {
 		t.Fatalf("NewTombstone = %+v, want an empty deleted entry", dead)
 	}
+	if !dead.Key.Deleted {
+		t.Fatal("NewTombstone left the key's own deletion marker clear")
+	}
+	if got := dead.KeyValue(); !got.Key.Deleted {
+		t.Fatal("KeyValue dropped the tombstone marker")
+	}
+	// A key that already carries the marker produces a tombstone, so the two
+	// flags never disagree.
+	marked := kv
+	marked.Key.Deleted = true
+	if entry := rfile.NewEntry(marked); !entry.Deleted || !entry.Key.Deleted {
+		t.Fatalf("NewEntry on a marked key = %+v, want a tombstone", entry)
+	}
+}
+
+// TestKeyDeletionMarkerSurvivesTheFile pins that accumulo.Key.Deleted is the
+// same state as Entry.Deleted on both the write and the read side.
+func TestKeyDeletionMarkerSurvivesTheFile(t *testing.T) {
+	key := accumulo.Key{Row: []byte("row1"), ColumnFamily: []byte("cf"),
+		ColumnQualifier: []byte("cq"), Timestamp: 20, Deleted: true}
+	path := writeFile(t, "key-marker.rf",
+		rfile.Entry{Key: key},
+		entry("row2", "cf", "cq", 10, "live"),
+	)
+	reader, err := rfile.OpenSequential(context.Background(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	got := drain(t, reader)
+	requireRows(t, got, "row1", "row2")
+	if !got[0].Deleted || !got[0].Key.Deleted {
+		t.Fatalf("the marker did not survive: entry=%v key=%v", got[0].Deleted, got[0].Key.Deleted)
+	}
+	if got[1].Deleted || got[1].Key.Deleted {
+		t.Fatalf("a live entry came back marked: %+v", got[1])
+	}
 }
 
 // TestTombstonesRoundTrip pins that the deleted flag survives the file, which

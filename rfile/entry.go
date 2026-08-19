@@ -29,18 +29,26 @@ type Entry struct {
 }
 
 // NewEntry builds a live (non-tombstone) entry from a scanned key/value pair.
+// A key that already carries accumulo.Key.Deleted produces a tombstone, so the
+// two flags never disagree.
 func NewEntry(kv accumulo.KeyValue) Entry {
-	return Entry{Key: kv.Key, Value: kv.Value}
+	return Entry{Key: kv.Key, Value: kv.Value, Deleted: kv.Key.Deleted}
 }
 
 // NewTombstone builds a delete entry for key, which is what Sharkbite produces
-// when a KeyValue's key has isDeleted set.
+// when a KeyValue's key has isDeleted set. Both the entry flag and the key's
+// own marker are set, so either one identifies the tombstone.
 func NewTombstone(key accumulo.Key) Entry {
+	key.Deleted = true
 	return Entry{Key: key, Deleted: true}
 }
 
-// KeyValue drops the tombstone flag and returns the entry in the same shape a
-// scan yields, so RFile output can feed code written against accumulo.Scanner.
+// KeyValue returns the entry in the same shape a scan yields, so RFile output
+// can feed code written against accumulo.Scanner. The key carries the
+// tombstone marker, which a scan never surfaces because deletes are applied
+// before results are returned.
 func (e Entry) KeyValue() accumulo.KeyValue {
-	return accumulo.KeyValue{Key: e.Key, Value: e.Value}
+	key := e.Key
+	key.Deleted = e.Deleted || e.Key.Deleted
+	return accumulo.KeyValue{Key: key, Value: e.Value}
 }
