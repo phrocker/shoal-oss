@@ -17,9 +17,10 @@ func TestLocal_ListHidesGeneratedReplacementArtifacts(t *testing.T) {
 		".shl-aaaaaaaaa",
 		replacementTempPrefix + "visible",
 		replacementBackupPrefix + "visible",
+		replacementTempPrefix + strings.Repeat("A", replacementNameTokenBytes*2),
+		replacementBackupPrefix + strings.Repeat("B", replacementNameTokenBytes*2),
 		replacementTempPrefix + strings.Repeat("c", replacementNameTokenBytes*2+1),
 		replacementBackupPrefix + strings.Repeat("d", replacementNameTokenBytes*2+1),
-		replacementTempPrefix + strings.Repeat("A", replacementNameTokenBytes*2),
 		replacementTempPrefix + strings.Repeat("a", replacementNameTokenBytes*2),
 		replacementBackupPrefix + strings.Repeat("b", replacementNameTokenBytes*2),
 	}
@@ -39,9 +40,10 @@ func TestLocal_ListHidesGeneratedReplacementArtifacts(t *testing.T) {
 		filepath.Join(dir, ".shl-aaaaaaaaa"),
 		filepath.Join(dir, replacementTempPrefix+"visible"),
 		filepath.Join(dir, replacementBackupPrefix+"visible"),
+		filepath.Join(dir, replacementTempPrefix+strings.Repeat("A", replacementNameTokenBytes*2)),
+		filepath.Join(dir, replacementBackupPrefix+strings.Repeat("B", replacementNameTokenBytes*2)),
 		filepath.Join(dir, replacementTempPrefix+strings.Repeat("c", replacementNameTokenBytes*2+1)),
 		filepath.Join(dir, replacementBackupPrefix+strings.Repeat("d", replacementNameTokenBytes*2+1)),
-		filepath.Join(dir, replacementTempPrefix+strings.Repeat("A", replacementNameTokenBytes*2)),
 	}
 	slices.Sort(got)
 	slices.Sort(want)
@@ -69,6 +71,8 @@ func TestLocal_CreateAllowsUserNamesOutsideReservedNamespace(t *testing.T) {
 	names := []string{
 		".shl-final.rf",
 		".shl-aaaaaaaaa",
+		replacementTempPrefix + strings.Repeat("A", replacementNameTokenBytes*2),
+		replacementBackupPrefix + strings.Repeat("B", replacementNameTokenBytes*2),
 		replacementTempPrefix + strings.Repeat("e", replacementNameTokenBytes*2+1),
 		replacementBackupPrefix + strings.Repeat("f", replacementNameTokenBytes*2+1),
 		filepath.Join("nested", ".shl-final.rf"),

@@ -11,7 +11,8 @@ import (
 // These platforms lack hard-link snapshots, so replacement cannot keep the
 // destination continuously visible. We instead move the old file aside, rename
 // the new file into place, and restore the old file if the second rename
-// fails.
+// fails. A crash or ambiguous publish failure can therefore leave the reserved
+// backup as the only surviving copy until recovery puts it back.
 func platformAtomicReplace(temp, target, backup string, hadOld bool) error {
 	if !hadOld {
 		return os.Rename(temp, target)

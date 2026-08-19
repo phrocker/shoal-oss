@@ -1063,6 +1063,83 @@ func TestLocal_PublishFailureRetainsBackupWhenRestoreFails(t *testing.T) {
 	}
 }
 
+func TestLocal_PublishFailureDiscardsBackupWhenOriginalTargetIsIntact(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "target")
+	if err := os.WriteFile(path, []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	w, err := New().Create(context.Background(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	localWriter := w.(*writer)
+	publishErr := errors.New("injected publish failure")
+	ops := &linkedBackupPublishFailureOps{replacementOps: localWriter.ops, err: publishErr}
+	localWriter.ops = ops
+	if _, err := w.Write([]byte("new")); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); !errors.Is(err, publishErr) {
+		t.Fatalf("Close error = %v, want %v", err, publishErr)
+	}
+	if ops.backup == "" {
+		t.Fatal("no replacement backup recorded")
+	}
+	if _, err := os.Lstat(ops.backup); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("replacement backup %s still exists: %v", ops.backup, err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "old" {
+		t.Fatalf("target contents = %q, want old", got)
+	}
+}
+
+func TestLocal_PublishFailureRetainsBackupWhenPublishedReplacementIsInstalled(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "target")
+	if err := os.WriteFile(path, []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	w, err := New().Create(context.Background(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	localWriter := w.(*writer)
+	publishErr := errors.New("injected publish failure")
+	ops := &publishedReplacementErrorOps{replacementOps: localWriter.ops, err: publishErr}
+	localWriter.ops = ops
+	if _, err := w.Write([]byte("new")); err != nil {
+		t.Fatal(err)
+	}
+	err = w.Close()
+	if !errors.Is(err, publishErr) || !strings.Contains(err.Error(), "backup retained for recovery") {
+		t.Fatalf("Close error = %v, want publish failure with retained backup", err)
+	}
+	if ops.backup == "" {
+		t.Fatal("no replacement backup recorded")
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "new" {
+		t.Fatalf("target contents = %q, want new", got)
+	}
+	backup, err := os.ReadFile(ops.backup)
+	if err != nil {
+		t.Fatalf("replacement backup missing: %v", err)
+	}
+	if string(backup) != "old" {
+		t.Fatalf("backup contents = %q, want old", backup)
+	}
+}
+
 func TestLocal_PublishFailureRetainsBackupWhenDestinationChanged(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "target")
@@ -1075,7 +1152,7 @@ func TestLocal_PublishFailureRetainsBackupWhenDestinationChanged(t *testing.T) {
 		t.Fatal(err)
 	}
 	localWriter := w.(*writer)
-	publishErr := errors.New("injected ambiguous publish failure")
+	publishErr := errors.New("injected publish failure")
 	ops := &strandedBackupOps{
 		replacementOps:  localWriter.ops,
 		err:             publishErr,
@@ -1086,14 +1163,112 @@ func TestLocal_PublishFailureRetainsBackupWhenDestinationChanged(t *testing.T) {
 		t.Fatal(err)
 	}
 	err = w.Close()
-	if !errors.Is(err, publishErr) || !strings.Contains(err.Error(), "retained for recovery") {
-		t.Fatalf("Close error = %v, want publish failure and retained-backup notice", err)
+	if !errors.Is(err, publishErr) || !strings.Contains(err.Error(), "backup retained for recovery") {
+		t.Fatalf("Close error = %v, want publish failure with retained backup", err)
 	}
-	if got, err := os.ReadFile(path); err != nil || string(got) != "concurrent" {
-		t.Fatalf("destination = %q, %v; want concurrent", got, err)
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if got, err := os.ReadFile(ops.backup); err != nil || string(got) != "old" {
-		t.Fatalf("backup = %q, %v; want old", got, err)
+	if string(got) != "concurrent" {
+		t.Fatalf("target contents = %q, want concurrent", got)
+	}
+	backup, err := os.ReadFile(ops.backup)
+	if err != nil {
+		t.Fatalf("replacement backup missing: %v", err)
+	}
+	if string(backup) != "old" {
+		t.Fatalf("backup contents = %q, want old", backup)
+	}
+}
+
+func TestLocal_PublishFailureUsesContentFallbackWhenPhysicalIdentityUnavailable(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "target")
+	if err := os.WriteFile(path, []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	w, err := New().Create(context.Background(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	localWriter := w.(*writer)
+	publishErr := errors.New("injected publish failure")
+	ops := &fallbackIdentityPublishFailureOps{replacementOps: localWriter.ops, err: publishErr}
+	localWriter.ops = ops
+	originalSameFile := sameReplacementFile
+	sameReplacementFile = func(os.FileInfo, os.FileInfo) bool { return false }
+	defer func() { sameReplacementFile = originalSameFile }()
+
+	if _, err := w.Write([]byte("new")); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); !errors.Is(err, publishErr) {
+		t.Fatalf("Close error = %v, want %v", err, publishErr)
+	}
+	if ops.backup == "" {
+		t.Fatal("no replacement backup recorded")
+	}
+	if _, err := os.Lstat(ops.backup); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("replacement backup %s still exists: %v", ops.backup, err)
+	}
+}
+
+func TestLocal_CreateRejectsSymlinkDestinations(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "target")
+	link := filepath.Join(dir, "link")
+	if err := os.WriteFile(target, []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, link); err != nil {
+		if runtime.GOOS == "windows" {
+			t.Skipf("symlink creation unavailable: %v", err)
+		}
+		t.Fatalf("Symlink: %v", err)
+	}
+
+	f, err := New().Open(context.Background(), link)
+	if err != nil {
+		t.Fatalf("Open symlink: %v", err)
+	}
+	defer f.Close()
+	body := make([]byte, f.Size())
+	if _, err := f.ReadAt(body, 0); err != nil {
+		t.Fatalf("ReadAt symlink: %v", err)
+	}
+	if string(body) != "old" {
+		t.Fatalf("symlink open contents = %q, want old", body)
+	}
+
+	if _, err := New().Create(context.Background(), link); err == nil || !strings.Contains(err.Error(), "symlink destinations are not supported") {
+		t.Fatalf("Create symlink error = %v, want explicit symlink rejection", err)
+	}
+	got, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "old" {
+		t.Fatalf("target contents = %q, want old", got)
+	}
+}
+
+func TestLocal_CreateRejectsDanglingSymlinkDestinations(t *testing.T) {
+	dir := t.TempDir()
+	link := filepath.Join(dir, "link")
+	if err := os.Symlink(filepath.Join(dir, "missing"), link); err != nil {
+		if runtime.GOOS == "windows" {
+			t.Skipf("symlink creation unavailable: %v", err)
+		}
+		t.Fatalf("Symlink: %v", err)
+	}
+
+	if _, err := New().Create(context.Background(), link); err == nil || !strings.Contains(err.Error(), "symlink destinations are not supported") {
+		t.Fatalf("Create dangling symlink error = %v, want explicit symlink rejection", err)
+	}
+	if info, err := os.Lstat(link); err != nil || info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("dangling symlink changed after rejection: info=%v err=%v", info, err)
 	}
 }
 
@@ -1129,3 +1304,80 @@ func (o *strandedBackupOps) AtomicRestore(target, backup string) error {
 	}
 	return o.replacementOps.AtomicRestore(target, backup)
 }
+
+type linkedBackupPublishFailureOps struct {
+	replacementOps
+	err    error
+	backup string
+}
+
+func (o *linkedBackupPublishFailureOps) AtomicReplace(temp, target, backup string, hadOld bool) error {
+	if !hadOld {
+		return o.replacementOps.AtomicReplace(temp, target, backup, hadOld)
+	}
+	if err := os.Link(target, backup); err != nil {
+		return err
+	}
+	o.backup = backup
+	return o.err
+}
+
+type publishedReplacementErrorOps struct {
+	replacementOps
+	err    error
+	backup string
+}
+
+func (o *publishedReplacementErrorOps) AtomicReplace(temp, target, backup string, hadOld bool) error {
+	if !hadOld {
+		return o.replacementOps.AtomicReplace(temp, target, backup, hadOld)
+	}
+	if err := os.Rename(target, backup); err != nil {
+		return err
+	}
+	o.backup = backup
+	if err := os.Rename(temp, target); err != nil {
+		return err
+	}
+	return o.err
+}
+
+type fallbackIdentityPublishFailureOps struct {
+	replacementOps
+	err    error
+	backup string
+}
+
+func (o *fallbackIdentityPublishFailureOps) AtomicReplace(temp, target, backup string, hadOld bool) error {
+	if !hadOld {
+		return o.replacementOps.AtomicReplace(temp, target, backup, hadOld)
+	}
+	info, err := os.Lstat(target)
+	if err != nil {
+		return err
+	}
+	body, err := os.ReadFile(target)
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(backup, body, info.Mode()&os.ModePerm); err != nil {
+		return err
+	}
+	o.backup = backup
+	return o.err
+}
+
+func (o *fallbackIdentityPublishFailureOps) Lstat(name string) (os.FileInfo, error) {
+	info, err := o.replacementOps.Lstat(name)
+	if err != nil {
+		return nil, err
+	}
+	if name == o.backup {
+		return noSysFileInfo{FileInfo: info}, nil
+	}
+	return noSysFileInfo{FileInfo: info}, nil
+}
+
+type noSysFileInfo struct{ os.FileInfo }
+
+func (i noSysFileInfo) Sys() any { return nil }

@@ -78,9 +78,9 @@ type fakeS3WriteOperations struct {
 
 type fakeS3ArtifactOperations struct {
 	artifacts    []s3Artifact
+	listedPrefix string
 	removeErrors map[string]error
 	removed      []s3Artifact
-	listedPrefix string
 }
 
 func (o *fakeS3ArtifactOperations) list(ctx context.Context, _, prefix string) ([]s3Artifact, error) {
@@ -501,6 +501,9 @@ func TestIsTemporaryStageKeyMatchesOnlyReservedFormats(t *testing.T) {
 	if isTemporaryStageKey("tenant/.shoal-tmp-aaaaaaaaaa12345") {
 		t.Fatal("longer .shoal-tmp- key should remain visible")
 	}
+	if isTemporaryStageKey("tenant/.shoal-tmp-AAAAAAAAAAAAAA") {
+		t.Fatal("uppercase-shaped .shoal-tmp- key should remain visible")
+	}
 }
 
 func TestCleanupStaleArtifactsIsBoundedConditionalAndExplicit(t *testing.T) {
@@ -518,10 +521,12 @@ func TestCleanupStaleArtifactsIsBoundedConditionalAndExplicit(t *testing.T) {
 	recent := "dir/" + expectedTemporaryStageKeyComponent("dir/target", strings.Repeat("2", 64))
 	lookalike := "dir/" + expectedTemporaryStageKeyComponent("dir/user", strings.Repeat("3", 64))
 	marker := "dir/" + expectedTemporaryStageKeyComponent("dir/deleted", strings.Repeat("4", 64))
+	uppercase := "dir/" + tempStageKeyPrefix + strings.Repeat("A", tempStageRandomHexLen+tempStageHashHexLen)
 	ops := &fakeS3ArtifactOperations{
 		artifacts: []s3Artifact{
 			{key: recent, lastModified: now, etag: &recentETag, versionID: &recentVersion, owned: true},
 			{key: lookalike, lastModified: now.Add(-2 * time.Hour), etag: &oldETag, versionID: &userVersion},
+			{key: uppercase, lastModified: now.Add(-2 * time.Hour), etag: &oldETag, versionID: aws.String("uppercase-version"), owned: true},
 			{key: failing, lastModified: now.Add(-2 * time.Hour), etag: &oldETag, versionID: &failingVersion, owned: true},
 			{key: old, lastModified: now.Add(-2 * time.Hour), etag: &oldETag, versionID: &oldVersion, owned: true},
 			{key: marker, lastModified: now.Add(-2 * time.Hour), versionID: &markerVersion, deleteMarker: true},
@@ -556,6 +561,48 @@ func TestCleanupStaleArtifactsIsBoundedConditionalAndExplicit(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	if _, err := backend.CleanupStaleArtifacts(ctx, "s3://bucket/dir", now); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled cleanup error = %v, want context.Canceled", err)
+	}
+}
+
+func TestCleanupStaleArtifactsSupportsRootPrefix(t *testing.T) {
+	now := time.Now()
+	oldETag := `"old"`
+	recentETag := `"recent"`
+	oldVersion := "old-version"
+	recentVersion := "recent-version"
+	old := expectedTemporaryStageKeyComponent("target", strings.Repeat("0", 64))
+	recent := expectedTemporaryStageKeyComponent("target", strings.Repeat("1", 64))
+	uppercase := tempStageKeyPrefix + strings.Repeat("A", tempStageRandomHexLen+tempStageHashHexLen)
+	visible := ".shl-visible"
+	ops := &fakeS3ArtifactOperations{
+		artifacts: []s3Artifact{
+			{key: recent, lastModified: now, etag: &recentETag, versionID: &recentVersion, owned: true},
+			{key: uppercase, lastModified: now.Add(-2 * time.Hour), etag: &oldETag, versionID: aws.String("upper-version"), owned: true},
+			{key: visible, lastModified: now.Add(-2 * time.Hour), etag: &oldETag, versionID: aws.String("visible-version"), owned: true},
+			{key: old, lastModified: now.Add(-2 * time.Hour), etag: &oldETag, versionID: &oldVersion, owned: true},
+		},
+	}
+	backend := &Backend{artifactOps: ops}
+
+	result, err := backend.CleanupStaleArtifacts(context.Background(), "s3://bucket/", now.Add(-time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ops.listedPrefix != "" {
+		t.Fatalf("listed prefix = %q, want root prefix", ops.listedPrefix)
+	}
+	if result.Examined != 2 {
+		t.Fatalf("Examined = %d, want 2", result.Examined)
+	}
+	wantRemoved := "s3://bucket/" + old + "?versionId=" + oldVersion
+	if len(result.Removed) != 1 || result.Removed[0] != wantRemoved {
+		t.Fatalf("Removed = %v, want [%s]", result.Removed, wantRemoved)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := backend.CleanupStaleArtifacts(ctx, "s3://bucket/", now); !errors.Is(err, context.Canceled) {
 		t.Fatalf("canceled cleanup error = %v, want context.Canceled", err)
 	}
 }
@@ -910,6 +957,7 @@ func TestBackendCreateAllowsUserKeysOutsideReservedNamespace(t *testing.T) {
 	for _, key := range []string{
 		".shl-final.rf",
 		".shl-aaaaaaaaa",
+		".shoal-tmp-" + strings.Repeat("A", tempStageRandomHexLen+tempStageHashHexLen),
 		".shoal-tmp-aaaaaaaaaa12345",
 		"nested/.shl-final.rf",
 	} {

@@ -1190,8 +1190,11 @@ func isGeneratedReplacementName(name, prefix string) bool {
 	if !strings.HasPrefix(name, prefix) {
 		return false
 	}
-	token := name[len(prefix):]
-	if len(token) != replacementNameTokenBytes*2 {
+	return isLowerHexReplacementToken(name[len(prefix):])
+}
+
+func isLowerHexReplacementToken(token string) bool {
+	if len(token) != replacementNameTokenBytes*2 || token != strings.ToLower(token) {
 		return false
 	}
 	if token != strings.ToLower(token) {

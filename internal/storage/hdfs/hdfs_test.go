@@ -716,9 +716,10 @@ func TestBackendListHidesGeneratedReplacementArtifacts(t *testing.T) {
 	client.files["/tables/.shl-aaaaaaaaa"] = []byte("user")
 	client.files["/tables/"+replacementTempPrefix+"visible"] = []byte("visible")
 	client.files["/tables/"+replacementBackupPrefix+"visible"] = []byte("visible")
+	client.files["/tables/"+replacementTempPrefix+strings.Repeat("A", replacementNameTokenBytes*2)] = []byte("visible")
+	client.files["/tables/"+replacementBackupPrefix+strings.Repeat("B", replacementNameTokenBytes*2)] = []byte("visible")
 	client.files["/tables/"+replacementTempPrefix+strings.Repeat("c", replacementNameTokenBytes*2+1)] = []byte("visible")
 	client.files["/tables/"+replacementBackupPrefix+strings.Repeat("d", replacementNameTokenBytes*2+1)] = []byte("visible")
-	client.files["/tables/"+replacementTempPrefix+strings.Repeat("A", replacementNameTokenBytes*2)] = []byte("visible")
 	client.files["/tables/"+replacementTempPrefix+strings.Repeat("a", replacementNameTokenBytes*2)] = []byte("temp")
 	client.files["/tables/"+replacementBackupPrefix+strings.Repeat("b", replacementNameTokenBytes*2)] = []byte("backup")
 	backend, err := New("nn:8020", WithClient(client))
@@ -736,9 +737,10 @@ func TestBackendListHidesGeneratedReplacementArtifacts(t *testing.T) {
 		"hdfs://nn:8020/tables/.shl-aaaaaaaaa",
 		"hdfs://nn:8020/tables/" + replacementTempPrefix + "visible",
 		"hdfs://nn:8020/tables/" + replacementBackupPrefix + "visible",
+		"hdfs://nn:8020/tables/" + replacementTempPrefix + strings.Repeat("A", replacementNameTokenBytes*2),
+		"hdfs://nn:8020/tables/" + replacementBackupPrefix + strings.Repeat("B", replacementNameTokenBytes*2),
 		"hdfs://nn:8020/tables/" + replacementTempPrefix + strings.Repeat("c", replacementNameTokenBytes*2+1),
 		"hdfs://nn:8020/tables/" + replacementBackupPrefix + strings.Repeat("d", replacementNameTokenBytes*2+1),
-		"hdfs://nn:8020/tables/" + replacementTempPrefix + strings.Repeat("A", replacementNameTokenBytes*2),
 	}
 	slices.Sort(got)
 	slices.Sort(want)
@@ -754,7 +756,8 @@ func TestBackendCleanupStaleArtifacts(t *testing.T) {
 	oldBackup := "/tables/" + replacementBackupPrefix + "ffeeddccbbaa99887766554433221100"
 	recent := "/tables/" + replacementTempPrefix + "11112222333344445555666677778888"
 	lookalike := "/tables/" + replacementTempPrefix + "not-a-token"
-	for _, name := range []string{oldTemp, oldBackup, recent, lookalike} {
+	uppercase := "/tables/" + replacementTempPrefix + "AABBCCDDEEFF00112233445566778899"
+	for _, name := range []string{oldTemp, oldBackup, recent, lookalike, uppercase} {
 		client.files[name] = []byte("x")
 		client.modTimes[name] = now
 	}
@@ -779,7 +782,7 @@ func TestBackendCleanupStaleArtifacts(t *testing.T) {
 	if len(result.Recoverable) != 1 || result.Recoverable[0] != oldBackup {
 		t.Fatalf("Recoverable = %v, want [%s]", result.Recoverable, oldBackup)
 	}
-	for _, name := range []string{oldBackup, recent, lookalike} {
+	for _, name := range []string{oldBackup, recent, lookalike, uppercase} {
 		if _, ok := client.files[name]; !ok {
 			t.Fatalf("%s was removed", name)
 		}
@@ -885,6 +888,8 @@ func TestBackendCreateAllowsUserNamesOutsideReservedNamespace(t *testing.T) {
 	names := []string{
 		".shl-final.rf",
 		".shl-aaaaaaaaa",
+		replacementTempPrefix + strings.Repeat("A", replacementNameTokenBytes*2),
+		replacementBackupPrefix + strings.Repeat("B", replacementNameTokenBytes*2),
 		replacementTempPrefix + strings.Repeat("e", replacementNameTokenBytes*2+1),
 		replacementBackupPrefix + strings.Repeat("f", replacementNameTokenBytes*2+1),
 		"nested/.shl-final.rf",

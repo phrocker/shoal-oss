@@ -301,8 +301,15 @@ opt-in.
   deleted automatically. Cloud cleanup verifies Shoal ownership metadata and
   uses generation/ETag/version-conditional deletes. Cloud bucket/container
   roots are valid cleanup prefixes so root-level artifacts are reachable. S3
-  cleanup requires `GetBucketVersioning` plus object-version listing,
-  inspection, and deletion permissions.
+  cleanup requires `s3:GetBucketVersioning`, `s3:ListBucketVersions` for
+  versioned or suspended buckets, `s3:ListBucket` for never-versioned buckets,
+  `s3:GetObject`/HeadObject inspection, and conditional `s3:DeleteObject` or
+  `s3:DeleteObjectVersion` permissions. Local replacement on portable
+  rename-fallback paths can leave a reserved backup as the only surviving copy
+  after a crash or ambiguous publish failure, so janitor cleanup preserves such
+  backups for explicit recovery instead of deleting them automatically. Local
+  `Open` follows symlinks, but local `Create` intentionally rejects symlink
+  destinations; resolve the final target path before writing.
 
 ## License
 

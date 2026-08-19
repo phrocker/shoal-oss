@@ -543,6 +543,9 @@ func TestIsTemporaryObjectNameMatchesOnlyReservedFormats(t *testing.T) {
 	if isTemporaryObjectName("tenant/.shoal-tmp-aaaaaaaaaa12345") {
 		t.Fatal("longer .shoal-tmp- object should remain visible")
 	}
+	if isTemporaryObjectName("tenant/.shoal-tmp-AAAAAAAAAAAAAA") {
+		t.Fatal("uppercase-shaped .shoal-tmp- object should remain visible")
+	}
 	if isTemporaryObjectName("tenant/object.rf" + legacyTempObjectPrefix + "visible") {
 		t.Fatal("non-generated legacy-looking object should not be hidden")
 	}
@@ -555,10 +558,12 @@ func TestCleanupStaleArtifactsIsBoundedGenerationPinnedAndExplicit(t *testing.T)
 	failing := "dir/" + expectedTemporaryObjectComponent("dir/target", strings.Repeat("1", 64))
 	recent := "dir/" + expectedTemporaryObjectComponent("dir/target", strings.Repeat("2", 64))
 	lookalike := "dir/" + expectedTemporaryObjectComponent("dir/user", strings.Repeat("3", 64))
+	uppercase := "dir/" + tempObjectPrefix + strings.Repeat("A", tempObjectRandomHexLen+tempObjectHashHexLen)
 	ops := &fakeGCSArtifactOperations{
 		artifacts: []gcsArtifact{
 			{name: recent, updated: now, generation: 3, owned: true},
 			{name: lookalike, updated: now.Add(-2 * time.Hour), generation: 4},
+			{name: uppercase, updated: now.Add(-2 * time.Hour), generation: 7, owned: true},
 			{name: failing, updated: now.Add(-2 * time.Hour), generation: 5, owned: true},
 			{name: old, updated: now.Add(-2 * time.Hour), generation: 6, owned: true},
 		},
@@ -587,6 +592,43 @@ func TestCleanupStaleArtifactsIsBoundedGenerationPinnedAndExplicit(t *testing.T)
 	}
 }
 
+func TestCleanupStaleArtifactsSupportsRootPrefix(t *testing.T) {
+	now := time.Now()
+	old := expectedTemporaryObjectComponent("target", strings.Repeat("0", 64))
+	recent := expectedTemporaryObjectComponent("target", strings.Repeat("1", 64))
+	uppercase := tempObjectPrefix + strings.Repeat("A", tempObjectRandomHexLen+tempObjectHashHexLen)
+	visible := ".shl-visible"
+	ops := &fakeGCSArtifactOperations{
+		artifacts: []gcsArtifact{
+			{name: recent, updated: now, generation: 3, owned: true},
+			{name: uppercase, updated: now.Add(-2 * time.Hour), generation: 4, owned: true},
+			{name: visible, updated: now.Add(-2 * time.Hour), generation: 5, owned: true},
+			{name: old, updated: now.Add(-2 * time.Hour), generation: 6, owned: true},
+		},
+	}
+	backend := &Backend{artifactOps: ops}
+
+	result, err := backend.CleanupStaleArtifacts(context.Background(), "gs://bucket/", now.Add(-time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ops.listedPrefix != "" {
+		t.Fatalf("listed prefix = %q, want root prefix", ops.listedPrefix)
+	}
+	if result.Examined != 2 {
+		t.Fatalf("Examined = %d, want 2", result.Examined)
+	}
+	if len(result.Removed) != 1 || result.Removed[0] != "gs://bucket/"+old {
+		t.Fatalf("Removed = %v, want [gs://bucket/%s]", result.Removed, old)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := backend.CleanupStaleArtifacts(ctx, "gs://bucket/", now); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled cleanup error = %v, want context.Canceled", err)
+	}
+}
+
 func TestBackendCreateRejectsReservedInternalObjectNames(t *testing.T) {
 	backend, _ := newFakeBackend()
 	for _, object := range []string{
@@ -606,6 +648,7 @@ func TestBackendCreateAllowsUserObjectsOutsideReservedNamespace(t *testing.T) {
 	for _, object := range []string{
 		"tenant/.shl-final.rf",
 		"tenant/.shl-aaaaaaaaa",
+		"tenant/.shoal-tmp-" + strings.Repeat("A", tempObjectRandomHexLen+tempObjectHashHexLen),
 		"tenant/.shoal-tmp-aaaaaaaaaa12345",
 		"tenant/nested/.shl-final.rf",
 	} {
@@ -1631,9 +1674,9 @@ func (w cancelAfterWriteWriter) Write(p []byte) (int, error) {
 
 type fakeGCSArtifactOperations struct {
 	artifacts    []gcsArtifact
+	listedPrefix string
 	removeErrors map[string]error
 	removed      []gcsArtifact
-	listedPrefix string
 }
 
 func (o *fakeGCSArtifactOperations) list(ctx context.Context, _, prefix string) ([]gcsArtifact, error) {

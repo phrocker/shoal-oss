@@ -19,8 +19,11 @@ var (
 // snapshots the old inode, then rename atomically switches the destination.
 // Filesystems that reject hard links fall back to renaming the old target
 // aside, publishing the replacement, and restoring the old target if publish
-// fails. A crash leaves either the old target plus backup, or the new target
-// plus backup; cleanup removes the backup only after the switch succeeds.
+// fails. A crash or ambiguous publish failure in that fallback can leave the
+// target absent while the reserved backup is the only surviving copy, so
+// cleanup preserves any unreconciled backup for manual or application-driven
+// recovery. Once replacement is conclusively known to have succeeded, cleanup
+// removes the backup.
 func platformAtomicReplace(temp, target, backup string, hadOld bool) error {
 	if hadOld {
 		if err := linkReplacementPath(target, backup); err != nil {

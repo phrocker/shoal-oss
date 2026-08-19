@@ -5,6 +5,7 @@
 package local
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -61,9 +62,14 @@ func (b *Backend) Open(_ context.Context, path string) (storage.File, error) {
 // and on Unix filesystems that reject hard-link snapshots for same-directory
 // siblings, replacement falls back to a best-effort rename-based sequence that
 // restores the old file on failure but cannot keep the target continuously
-// visible. New files use 0644 subject to the process umask. Parent
-// directories are created with 0755 if they don't already exist — matches
-// "mkdir -p" behavior so callers don't have to pre-create the path tree.
+// visible. A crash or ambiguous publish failure in that fallback can leave the
+// hidden backup as the only surviving copy until an operator or
+// CleanupStaleArtifacts restores it. Open continues to follow symlinks like
+// os.Open, but Create intentionally rejects symlink destinations so replacement
+// never retargets a link unexpectedly; resolve the symlink yourself first. New
+// files use 0644 subject to the process umask. Parent directories are created
+// with 0755 if they don't already exist — matches "mkdir -p" behavior so
+// callers don't have to pre-create the path tree.
 func (b *Backend) Create(_ context.Context, path string) (storage.Writer, error) {
 	if isReplacementArtifactName(filepath.Base(path)) {
 		return nil, fmt.Errorf("local: destination %s uses a reserved internal namespace", path)
@@ -258,6 +264,8 @@ type durableReplacementOps interface {
 type osReplacementOps struct{}
 
 var preservePlatformMetadataFn = preservePlatformMetadata
+var sameReplacementFile = os.SameFile
+var readReplacementFile = os.ReadFile
 
 func (osReplacementOps) Lstat(name string) (os.FileInfo, error) { return os.Lstat(name) }
 func (osReplacementOps) Chmod(name string, mode os.FileMode) error {
@@ -294,6 +302,9 @@ func replacementTargetMode(ops replacementOps, target string) (os.FileMode, bool
 	}
 	if err != nil {
 		return 0, false, fmt.Errorf("local: inspect existing file %s: %w", target, err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return 0, false, fmt.Errorf("local: replace %s: symlink destinations are not supported; resolve the symlink target first", target)
 	}
 	if !info.Mode().IsRegular() {
 		return 0, false, fmt.Errorf("local: replace %s: target is not a regular file", target)
@@ -369,8 +380,11 @@ func isGeneratedReplacementName(name, prefix string) bool {
 	if !strings.HasPrefix(name, prefix) {
 		return false
 	}
-	token := name[len(prefix):]
-	if len(token) != replacementNameTokenBytes*2 {
+	return isLowerHexReplacementToken(name[len(prefix):])
+}
+
+func isLowerHexReplacementToken(token string) bool {
+	if len(token) != replacementNameTokenBytes*2 || token != strings.ToLower(token) {
 		return false
 	}
 	if token != strings.ToLower(token) {
@@ -502,8 +516,9 @@ func (w *writer) commitReplacement() error {
 }
 
 // discardUnusedBackup restores a missing destination after a failed publish.
-// If the destination exists, the publish outcome is ambiguous: it may be the
-// original, the staged replacement, or a concurrent writer's file. Retain the
+// If the destination still exists, it may be the original, the staged
+// replacement, or a concurrent writer's file. Only discard the backup once the
+// destination is proven to be the preserved original; otherwise retain the
 // backup for explicit recovery rather than risking deletion of the old bytes.
 func (w *writer) discardUnusedBackup(backup string) error {
 	_, err := w.ops.Lstat(w.target)
@@ -528,10 +543,69 @@ func (w *writer) discardUnusedBackup(backup string) error {
 		}
 		return nil
 	}
-	return fmt.Errorf(
-		"local: publish outcome for %s is ambiguous; backup %s retained for recovery",
-		w.target, backup,
-	)
+	backupPresent, err := replacementPathExists(w.ops, backup)
+	if err != nil {
+		return fmt.Errorf("local: inspect replacement backup %s after publish failure: %w", backup, err)
+	}
+	if !backupPresent {
+		return nil
+	}
+	reusedOriginal, err := replacementRestoredFromBackup(w.ops, w.target, backup)
+	if err != nil {
+		return fmt.Errorf(
+			"local: verify destination %s against replacement backup %s after publish failure; backup retained for recovery: %w",
+			w.target, backup, err,
+		)
+	}
+	if !reusedOriginal {
+		return fmt.Errorf(
+			"local: destination %s after publish failure does not match replacement backup %s; backup retained for recovery",
+			w.target, backup,
+		)
+	}
+	if err := w.ops.Remove(backup); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("local: remove unused replacement backup %s: %w", backup, err)
+	}
+	return nil
+}
+
+func replacementRestoredFromBackup(ops replacementOps, target, backup string) (bool, error) {
+	targetInfo, err := ops.Lstat(target)
+	if err != nil {
+		return false, err
+	}
+	backupInfo, err := ops.Lstat(backup)
+	if err != nil {
+		return false, err
+	}
+	if sameReplacementFile(targetInfo, backupInfo) {
+		return true, nil
+	}
+	if targetInfo.Sys() != nil && backupInfo.Sys() != nil {
+		return false, nil
+	}
+	return replacementMatchesBackupContents(target, backup, targetInfo, backupInfo)
+}
+
+func replacementMatchesBackupContents(target, backup string, targetInfo, backupInfo os.FileInfo) (bool, error) {
+	if !targetInfo.Mode().IsRegular() || !backupInfo.Mode().IsRegular() {
+		return false, nil
+	}
+	if targetInfo.Mode()&replacementModeMask != backupInfo.Mode()&replacementModeMask {
+		return false, nil
+	}
+	if targetInfo.Size() != backupInfo.Size() {
+		return false, nil
+	}
+	targetData, err := readReplacementFile(target)
+	if err != nil {
+		return false, err
+	}
+	backupData, err := readReplacementFile(backup)
+	if err != nil {
+		return false, err
+	}
+	return bytes.Equal(targetData, backupData), nil
 }
 
 func replacementPathExists(ops replacementOps, path string) (bool, error) {

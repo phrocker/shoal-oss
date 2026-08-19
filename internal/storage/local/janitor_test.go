@@ -16,13 +16,14 @@ func TestCleanupStaleArtifactsRemovesOnlyOldReservedFiles(t *testing.T) {
 	oldBackup := filepath.Join(dir, replacementBackupPrefix+"ffeeddccbbaa99887766554433221100")
 	recent := filepath.Join(dir, replacementTempPrefix+"11112222333344445555666677778888")
 	lookalike := filepath.Join(dir, replacementTempPrefix+"not-a-token")
-	for _, name := range []string{oldTemp, oldBackup, recent, lookalike} {
+	uppercase := filepath.Join(dir, replacementTempPrefix+"AABBCCDDEEFF00112233445566778899")
+	for _, name := range []string{oldTemp, oldBackup, recent, lookalike, uppercase} {
 		if err := os.WriteFile(name, []byte("x"), 0o600); err != nil {
 			t.Fatal(err)
 		}
 	}
 	old := now.Add(-2 * time.Hour)
-	for _, name := range []string{oldTemp, oldBackup, lookalike} {
+	for _, name := range []string{oldTemp, oldBackup, lookalike, uppercase} {
 		if err := os.Chtimes(name, old, old); err != nil {
 			t.Fatal(err)
 		}
@@ -44,7 +45,7 @@ func TestCleanupStaleArtifactsRemovesOnlyOldReservedFiles(t *testing.T) {
 	if _, err := os.Stat(oldTemp); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("%s still exists: %v", oldTemp, err)
 	}
-	for _, name := range []string{oldBackup, recent, lookalike} {
+	for _, name := range []string{oldBackup, recent, lookalike, uppercase} {
 		if _, err := os.Stat(name); err != nil {
 			t.Fatalf("%s was removed: %v", name, err)
 		}

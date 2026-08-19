@@ -51,9 +51,9 @@ type fakeAzureObject struct {
 
 type fakeAzureArtifactOperations struct {
 	artifacts    []azureArtifact
+	listedPrefix string
 	removeErrors map[string]error
 	removed      []azureArtifact
-	listedPrefix string
 }
 
 func (o *fakeAzureArtifactOperations) list(ctx context.Context, _, prefix string) ([]azureArtifact, error) {
@@ -600,6 +600,9 @@ func TestIsTemporaryStageNameMatchesOnlyReservedFormats(t *testing.T) {
 	if isTemporaryStageName("tenant/.shoal-tmp-aaaaaaaaaa12345") {
 		t.Fatal("longer .shoal-tmp- blob should remain visible")
 	}
+	if isTemporaryStageName("tenant/.shoal-tmp-AAAAAAAAAAAAAA") {
+		t.Fatal("uppercase-shaped .shoal-tmp- blob should remain visible")
+	}
 }
 
 func TestBackendCreateWithCustomServiceClientRejectsMissingSourceAuthorizationBeforeStaging(t *testing.T) {
@@ -741,10 +744,12 @@ func TestCleanupStaleArtifactsIsBoundedETagConditionalAndExplicit(t *testing.T) 
 	failing := "dir/" + expectedTemporaryStageComponent("dir/target", strings.Repeat("1", 64))
 	recent := "dir/" + expectedTemporaryStageComponent("dir/target", strings.Repeat("2", 64))
 	lookalike := "dir/" + expectedTemporaryStageComponent("dir/user", strings.Repeat("3", 64))
+	uppercase := "dir/" + tempStageNamePrefix + strings.Repeat("A", tempStageRandomHexLen+tempStageHashHexLen)
 	ops := &fakeAzureArtifactOperations{
 		artifacts: []azureArtifact{
 			{name: recent, lastModified: now, etag: &recentETag, owned: true},
 			{name: lookalike, lastModified: now.Add(-2 * time.Hour), etag: &oldETag},
+			{name: uppercase, lastModified: now.Add(-2 * time.Hour), etag: &oldETag, owned: true},
 			{name: failing, lastModified: now.Add(-2 * time.Hour), etag: &oldETag, owned: true},
 			{name: old, lastModified: now.Add(-2 * time.Hour), etag: &oldETag, owned: true},
 		},
@@ -773,6 +778,45 @@ func TestCleanupStaleArtifactsIsBoundedETagConditionalAndExplicit(t *testing.T) 
 	}
 }
 
+func TestCleanupStaleArtifactsSupportsRootPrefix(t *testing.T) {
+	now := time.Now()
+	oldETag := azcore.ETag(`"old"`)
+	recentETag := azcore.ETag(`"recent"`)
+	old := expectedTemporaryStageComponent("target", strings.Repeat("0", 64))
+	recent := expectedTemporaryStageComponent("target", strings.Repeat("1", 64))
+	uppercase := tempStageNamePrefix + strings.Repeat("A", tempStageRandomHexLen+tempStageHashHexLen)
+	visible := ".shl-visible"
+	ops := &fakeAzureArtifactOperations{
+		artifacts: []azureArtifact{
+			{name: recent, lastModified: now, etag: &recentETag, owned: true},
+			{name: uppercase, lastModified: now.Add(-2 * time.Hour), etag: &oldETag, owned: true},
+			{name: visible, lastModified: now.Add(-2 * time.Hour), etag: &oldETag, owned: true},
+			{name: old, lastModified: now.Add(-2 * time.Hour), etag: &oldETag, owned: true},
+		},
+	}
+	backend := &Backend{artifactOps: ops}
+
+	result, err := backend.CleanupStaleArtifacts(context.Background(), "az://container/", now.Add(-time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ops.listedPrefix != "" {
+		t.Fatalf("listed prefix = %q, want root prefix", ops.listedPrefix)
+	}
+	if result.Examined != 2 {
+		t.Fatalf("Examined = %d, want 2", result.Examined)
+	}
+	if len(result.Removed) != 1 || result.Removed[0] != "az://container/"+old {
+		t.Fatalf("Removed = %v, want [az://container/%s]", result.Removed, old)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := backend.CleanupStaleArtifacts(ctx, "az://container/", now); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled cleanup error = %v, want context.Canceled", err)
+	}
+}
+
 func TestBackendCreateRejectsReservedInternalBlobNames(t *testing.T) {
 	backend := &Backend{
 		ops:            newFakeAzureWriteOperations(),
@@ -795,6 +839,7 @@ func TestBackendCreateAllowsUserBlobNamesOutsideReservedNamespace(t *testing.T) 
 	for _, name := range []string{
 		".shl-final.rf",
 		".shl-aaaaaaaaa",
+		".shoal-tmp-" + strings.Repeat("A", tempStageRandomHexLen+tempStageHashHexLen),
 		".shoal-tmp-aaaaaaaaaa12345",
 		"nested/.shl-final.rf",
 	} {
