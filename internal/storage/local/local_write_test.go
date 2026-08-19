@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -408,6 +409,92 @@ func TestLocal_LongNameTargetsUseFixedLengthSiblingArtifacts(t *testing.T) {
 	}
 }
 
+func TestLocal_TemporaryNameCollisionRetriesAndAbortCleansAllocatedSibling(t *testing.T) {
+	dir := t.TempDir()
+	collision := filepath.Join(dir, replacementTempPrefix+"collision")
+	if err := os.WriteFile(collision, []byte("sentinel"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	setReplacementNameTokens(t, "collision", "allocated")
+
+	w, err := New().Create(context.Background(), filepath.Join(dir, "target"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	temp := w.(*writer).temp
+	if got := filepath.Base(temp); got != replacementTempPrefix+"allocated" {
+		t.Fatalf("temporary sibling = %q, want allocated retry", got)
+	}
+	if err := w.(storage.Aborter).Abort(); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.ReadFile(collision); err != nil || string(got) != "sentinel" {
+		t.Fatalf("colliding file = %q, %v; want preserved sentinel", got, err)
+	}
+	if _, err := os.Stat(temp); !os.IsNotExist(err) {
+		t.Fatalf("allocated temporary sibling remains after abort: %v", err)
+	}
+}
+
+func TestLocal_BackupNameCollisionRetriesAndCleansAllocatedBackup(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "target")
+	if err := os.WriteFile(target, []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	collision := filepath.Join(dir, replacementBackupPrefix+"collision")
+	if err := os.WriteFile(collision, []byte("sentinel"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	setReplacementNameTokens(t, "temporary", "collision", "allocated")
+
+	w, err := New().Create(context.Background(), target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	localWriter := w.(*writer)
+	ops := &collisionOnceAtomicReplaceOps{replacementOps: localWriter.ops}
+	localWriter.ops = ops
+	if _, err := w.Write([]byte("new")); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.ReadFile(target); err != nil || string(got) != "new" {
+		t.Fatalf("target = %q, %v; want new", got, err)
+	}
+	if got, err := os.ReadFile(collision); err != nil || string(got) != "sentinel" {
+		t.Fatalf("colliding backup = %q, %v; want preserved sentinel", got, err)
+	}
+	if len(ops.backups) != 2 {
+		t.Fatalf("backup attempts = %v, want collision and allocated", ops.backups)
+	}
+	if got := filepath.Base(ops.backups[1]); got != replacementBackupPrefix+"allocated" {
+		t.Fatalf("second backup = %q, want allocated retry", got)
+	}
+	if _, err := os.Stat(ops.backups[1]); !os.IsNotExist(err) {
+		t.Fatalf("allocated backup remains after commit: %v", err)
+	}
+}
+
+func setReplacementNameTokens(t *testing.T, tokens ...string) {
+	t.Helper()
+	original := randomReplacementNameToken
+	index := 0
+	randomReplacementNameToken = func() (string, error) {
+		if index >= len(tokens) {
+			return tokens[len(tokens)-1], nil
+		}
+		token := tokens[index]
+		index++
+		return token, nil
+	}
+	t.Cleanup(func() {
+		randomReplacementNameToken = original
+	})
+}
+
 func TestPlatformAtomicReplaceAndRestore(t *testing.T) {
 	dir := t.TempDir()
 	target := filepath.Join(dir, "target")
@@ -650,6 +737,19 @@ type atomicReplaceErrorOps struct {
 
 func (o atomicReplaceErrorOps) AtomicReplace(string, string, string, bool) error {
 	return o.err
+}
+
+type collisionOnceAtomicReplaceOps struct {
+	replacementOps
+	backups []string
+}
+
+func (o *collisionOnceAtomicReplaceOps) AtomicReplace(temp, target, backup string, hadOld bool) error {
+	o.backups = append(o.backups, backup)
+	if len(o.backups) == 1 {
+		return fs.ErrExist
+	}
+	return o.replacementOps.AtomicReplace(temp, target, backup, hadOld)
 }
 
 type blockingRollbackOps struct {
