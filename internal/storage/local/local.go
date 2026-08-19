@@ -387,9 +387,6 @@ func isLowerHexReplacementToken(token string) bool {
 	if len(token) != replacementNameTokenBytes*2 || token != strings.ToLower(token) {
 		return false
 	}
-	if token != strings.ToLower(token) {
-		return false
-	}
 	decoded, err := hex.DecodeString(token)
 	return err == nil && len(decoded) == replacementNameTokenBytes
 }
