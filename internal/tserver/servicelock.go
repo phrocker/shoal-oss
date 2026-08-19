@@ -1,0 +1,689 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+package tserver
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"path"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	gozk "github.com/go-zookeeper/zk"
+	"github.com/google/uuid"
+)
+
+// ServiceLock errors.
+var (
+	// ErrLockLost means the tablet-server ServiceLock is no longer held. It
+	// wraps every way a lock ends, so a caller can treat it as one condition:
+	// this process may no longer host anything under that generation.
+	ErrLockLost = errors.New("tserver: service lock lost")
+	// ErrNotHeld means the operation needs a held lock and there is none.
+	ErrNotHeld = errors.New("tserver: service lock not held")
+	// ErrLockInUse means the lock was already used for an acquisition. A
+	// ServiceLock covers one generation; a new one needs a new ServiceLock.
+	ErrLockInUse = errors.New("tserver: service lock already used")
+	// ErrLockNodeMissing means the ephemeral node this process created is not
+	// in the lock directory, so its claim cannot be established or proven.
+	ErrLockNodeMissing = errors.New("tserver: lock node missing")
+	// ErrInvalidLockPath means the configured lock directory cannot name a
+	// ZooKeeper znode.
+	ErrInvalidLockPath = errors.New("tserver: invalid lock path")
+)
+
+const (
+	// zLockPrefix is Accumulo's ServiceLock.ZLOCK_PREFIX.
+	zLockPrefix = "zlock#"
+	// lockSequenceDigits is the width of the counter ZooKeeper appends to a
+	// sequential node, and the width ServiceLock.validateAndSort requires.
+	lockSequenceDigits = 10
+	// zTabletServers is the znode root tablet servers register under.
+	zTabletServers = "tservers"
+)
+
+// LockConn is the ZooKeeper surface the ServiceLock protocol needs.
+// *github.com/go-zookeeper/zk.Conn satisfies it directly, so a caller passes
+// the session it already authenticated with the instance secret; this package
+// does not open or own ZooKeeper connections.
+type LockConn interface {
+	Create(path string, data []byte, flags int32, acl []gozk.ACL) (string, error)
+	Children(path string) ([]string, *gozk.Stat, error)
+	ExistsW(path string) (bool, *gozk.Stat, <-chan gozk.Event, error)
+	Delete(path string, version int32) error
+}
+
+// A live ZooKeeper session is the intended implementation; this pins the
+// interface to it so a signature drift is a compile error rather than a
+// runtime surprise.
+var _ LockConn = (*gozk.Conn)(nil)
+
+// LossReason says how a held lock ended. It is diagnostic: every reason means
+// the same thing to the fence, which is that this generation is over.
+type LossReason int
+
+const (
+	// LossNone means the lock has not been lost.
+	LossNone LossReason = iota
+	// LossNodeDeleted means the lock znode is gone: the session that owned it
+	// ended, or an operator deleted it.
+	LossNodeDeleted
+	// LossUnmonitorable means the lock can no longer be watched, so this
+	// process cannot prove it still holds it. Accumulo's tablet server halts
+	// on the equivalent LockWatcher.unableToMonitorLockNode; here the tablets
+	// are dropped, which is the same refusal to serve what cannot be proven.
+	LossUnmonitorable
+	// LossSuperseded means another holder now owns the lock directory's
+	// lowest sequence, so this process is no longer the holder.
+	LossSuperseded
+	// LossReleased means this process gave the lock up.
+	LossReleased
+)
+
+// String renders the reason for logs and errors.
+func (r LossReason) String() string {
+	switch r {
+	case LossNone:
+		return "NONE"
+	case LossNodeDeleted:
+		return "NODE_DELETED"
+	case LossUnmonitorable:
+		return "UNMONITORABLE"
+	case LossSuperseded:
+		return "SUPERSEDED"
+	case LossReleased:
+		return "RELEASED"
+	default:
+		return fmt.Sprintf("LossReason(%d)", int(r))
+	}
+}
+
+// PublicACL returns the ACL Accumulo applies to lock and server znodes
+// (ZooUtil.PUBLIC): full control for the authenticated creator, read for
+// anyone. The read entry is what lets unauthenticated clients enumerate live
+// servers; the creator entry is why the session must carry the instance
+// secret before any of this succeeds.
+func PublicACL() []gozk.ACL {
+	return append(gozk.AuthACL(gozk.PermAll), gozk.WorldACL(gozk.PermRead)...)
+}
+
+// TabletServerLockPath returns the lock directory a tablet server registers
+// under: <instancePath>/tservers/<group>/<address>, the Accumulo 4 layout
+// internal/zk walks when it enumerates live servers. An empty group means
+// DefaultResourceGroup.
+func TabletServerLockPath(instancePath, group, address string) string {
+	if group == "" {
+		group = DefaultResourceGroup
+	}
+	return path.Join(instancePath, zTabletServers, group, address)
+}
+
+// ParseLockNode maps a ZooKeeper lock child name onto the identity it names.
+//
+// The rules are ServiceLock.validateAndSort's: the name is
+// "zlock#<uuid>#<10-digit sequence>", the UUID must parse, and the sequence
+// must fit the signed 32-bit counter Java reads with Integer.parseInt. The
+// same rules are applied by internal/zk when it resolves a lock holder, so a
+// node either package accepts is a node the other accepts.
+func ParseLockNode(name string) (LockID, bool) {
+	if !strings.HasPrefix(name, zLockPrefix) {
+		return LockID{}, false
+	}
+	rest := strings.TrimPrefix(name, zLockPrefix)
+	separator := strings.Index(rest, "#")
+	if separator < 0 {
+		return LockID{}, false
+	}
+	holder, digits := rest[:separator], rest[separator+1:]
+	if len(digits) != lockSequenceDigits {
+		return LockID{}, false
+	}
+	if _, err := uuid.Parse(holder); err != nil {
+		return LockID{}, false
+	}
+	sequence, err := strconv.ParseInt(digits, 10, 32)
+	if err != nil {
+		return LockID{}, false
+	}
+	id := LockID{UUID: holder, Sequence: sequence}
+	if !id.Valid() {
+		return LockID{}, false
+	}
+	return id, true
+}
+
+// sortLockNodes returns the child names that could name a lock, ordered by
+// sequence with the holder first. Names that do not parse are dropped, exactly
+// as ServiceLock.validateAndSort drops them, so a stray child in the directory
+// cannot displace a real holder.
+func sortLockNodes(children []string) []string {
+	type candidate struct {
+		name     string
+		sequence int64
+	}
+	valid := make([]candidate, 0, len(children))
+	for _, child := range children {
+		id, ok := ParseLockNode(child)
+		if !ok {
+			continue
+		}
+		valid = append(valid, candidate{name: child, sequence: id.Sequence})
+	}
+	sort.Slice(valid, func(i, j int) bool { return valid[i].sequence < valid[j].sequence })
+	names := make([]string, 0, len(valid))
+	for _, entry := range valid {
+		names = append(names, entry.name)
+	}
+	return names
+}
+
+// findLowestPrevPrefix returns the node a queued candidate at index must watch:
+// the lowest-sequence node of the holder immediately ahead of it.
+//
+// Watching the immediate predecessor alone is not enough. A single process may
+// leave several nodes behind — a create whose response was lost still created
+// one — and they all carry that process's prefix. Watching its highest node
+// would wake this one when a duplicate is cleaned up rather than when the
+// holder actually leaves. Mirrors ServiceLock.findLowestPrevPrefix.
+func findLowestPrevPrefix(sorted []string, index int) string {
+	previous := sorted[index-1]
+	prefixEnd := strings.LastIndex(previous, "#")
+	prefix := previous[:prefixEnd]
+	lowest := previous
+	for i := index - 2; i >= 0; i-- {
+		if !strings.HasPrefix(sorted[i], prefix) {
+			break
+		}
+		lowest = sorted[i]
+	}
+	return lowest
+}
+
+// ServiceLockOptions configures one participation in the lock protocol.
+type ServiceLockOptions struct {
+	// Path is the lock directory — for a tablet server, the one
+	// TabletServerLockPath builds. Required.
+	Path string
+	// UUID is this process's lock identity, the middle field of every node it
+	// creates. A random one is minted when empty, which is what Accumulo does
+	// per server process.
+	UUID string
+	// ACL is applied to the znodes this process creates. PublicACL is used
+	// when empty, which is what Accumulo writes.
+	ACL []gozk.ACL
+	// VerifyInterval makes Maintain re-check the lock directory on a timer as
+	// well as on watch events, catching a watch that was silently dropped.
+	// Disabled when zero. Mirrors the tablet server's lock verification
+	// thread.
+	VerifyInterval time.Duration
+}
+
+// ServiceLock is one participation in Accumulo's ServiceLock protocol: it
+// creates an ephemeral sequential node in a lock directory, waits its turn,
+// and holds the lock until the node goes away.
+//
+// One ServiceLock covers one generation. It is deliberately not reusable: the
+// generation is the fence, and re-acquiring through the same object would blur
+// two generations into one identity. A process that loses its lock builds a
+// new ServiceLock, whose node necessarily carries a higher sequence.
+//
+// ServiceLock is safe for concurrent use.
+type ServiceLock struct {
+	conn           LockConn
+	dir            string
+	uuid           string
+	acl            []gozk.ACL
+	verifyInterval time.Duration
+
+	mu      sync.Mutex
+	started bool
+	node    string
+	id      LockID
+	held    bool
+	reason  LossReason
+}
+
+// NewServiceLock returns a lock participant for one generation.
+func NewServiceLock(conn LockConn, opts ServiceLockOptions) (*ServiceLock, error) {
+	if conn == nil {
+		return nil, errors.New("tserver: nil lock connection")
+	}
+	if err := validateLockPath(opts.Path); err != nil {
+		return nil, err
+	}
+	holder := opts.UUID
+	if holder == "" {
+		generated, err := uuid.NewRandom()
+		if err != nil {
+			return nil, fmt.Errorf("tserver: mint lock uuid: %w", err)
+		}
+		holder = generated.String()
+	}
+	if _, err := uuid.Parse(holder); err != nil {
+		return nil, fmt.Errorf("%w: lock uuid %q: %w", ErrInvalidLock, holder, err)
+	}
+	acl := opts.ACL
+	if len(acl) == 0 {
+		acl = PublicACL()
+	}
+	if opts.VerifyInterval < 0 {
+		return nil, fmt.Errorf("tserver: negative verify interval %s", opts.VerifyInterval)
+	}
+	return &ServiceLock{
+		conn:           conn,
+		dir:            path.Clean(opts.Path),
+		uuid:           holder,
+		acl:            append([]gozk.ACL(nil), acl...),
+		verifyInterval: opts.VerifyInterval,
+	}, nil
+}
+
+func validateLockPath(lockPath string) error {
+	if lockPath == "" {
+		return fmt.Errorf("%w: empty", ErrInvalidLockPath)
+	}
+	if !strings.HasPrefix(lockPath, "/") {
+		return fmt.Errorf("%w: %q is not absolute", ErrInvalidLockPath, lockPath)
+	}
+	if path.Clean(lockPath) == "/" {
+		return fmt.Errorf("%w: %q is the ZooKeeper root", ErrInvalidLockPath, lockPath)
+	}
+	return nil
+}
+
+// Path returns the lock directory.
+func (l *ServiceLock) Path() string { return l.dir }
+
+// UUID returns this process's lock identity.
+func (l *ServiceLock) UUID() string { return l.uuid }
+
+// nodePrefix is the name prefix of every node this process creates in the
+// lock directory. Because the UUID is this process's alone, a node carrying it
+// is one of ours and no one else's.
+func (l *ServiceLock) nodePrefix() string { return zLockPrefix + l.uuid + "#" }
+
+// LockID returns the identity of the lock held, and whether it is still held.
+// The identity survives the loss so a caller can fence the tablets it was
+// hosting against exactly the generation that ended.
+func (l *ServiceLock) LockID() (LockID, bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.id, l.held
+}
+
+// LossReason reports how the lock ended, or LossNone while it is held.
+func (l *ServiceLock) LossReason() LossReason {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.reason
+}
+
+// Node returns the name of the ephemeral node this process holds the lock
+// with, or "" when it holds none.
+func (l *ServiceLock) Node() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if !l.held {
+		return ""
+	}
+	return l.node
+}
+
+// Acquire creates this process's lock node and waits until it holds the lock,
+// returning the generation it acquired.
+//
+// The lock directory and its resource-group parent are created when missing,
+// as ServiceLockSupport.createNonHaServiceLockPath does — a tablet server
+// registering in a resource group nothing has used yet is normal.
+//
+// Waiting is cancellable: ctx ends the wait, and the node this process created
+// is deleted before returning, so a cancelled acquisition leaves nothing queued
+// behind. That matters because an abandoned ephemeral node would keep its place
+// in line and block every candidate behind it until the session ended.
+func (l *ServiceLock) Acquire(ctx context.Context, data ServiceLockData) (LockID, error) {
+	payload, err := data.Encode()
+	if err != nil {
+		return LockID{}, err
+	}
+	l.mu.Lock()
+	if l.started {
+		l.mu.Unlock()
+		return LockID{}, fmt.Errorf("%w: %s", ErrLockInUse, l.dir)
+	}
+	l.started = true
+	l.mu.Unlock()
+
+	if err := ctx.Err(); err != nil {
+		return LockID{}, err
+	}
+	if err := l.ensureLockDirectory(); err != nil {
+		return LockID{}, err
+	}
+	if _, err := l.conn.Create(l.dir+"/"+l.nodePrefix(), payload,
+		gozk.FlagEphemeral|gozk.FlagSequence, l.acl); err != nil {
+		// The create may have taken effect even though the answer was lost,
+		// so sweep before giving up rather than leaving a node in the queue.
+		l.deleteOwnNodes()
+		return LockID{}, fmt.Errorf("create lock node in %s: %w", l.dir, err)
+	}
+	id, err := l.waitForOwnership(ctx)
+	if err != nil {
+		l.deleteOwnNodes()
+		return LockID{}, err
+	}
+	return id, nil
+}
+
+// waitForOwnership collapses any duplicate nodes this process created, then
+// waits until its node is the lowest in the directory.
+func (l *ServiceLock) waitForOwnership(ctx context.Context) (LockID, error) {
+	node := ""
+	for {
+		children, _, err := l.conn.Children(l.dir)
+		if err != nil {
+			return LockID{}, fmt.Errorf("list lock nodes in %s: %w", l.dir, err)
+		}
+		sorted := sortLockNodes(children)
+		if node == "" {
+			// First pass: a create whose response was lost may have been
+			// retried, leaving several nodes with this process's prefix. Keep
+			// the one that entered the queue first and drop the rest, so this
+			// process occupies one place in line. Mirrors ServiceLock.lock.
+			ours := l.ownNodes(sorted)
+			if len(ours) == 0 {
+				return LockID{}, fmt.Errorf("%w: nothing with prefix %s in %s",
+					ErrLockNodeMissing, l.nodePrefix(), l.dir)
+			}
+			node = ours[0]
+			for _, duplicate := range ours[1:] {
+				l.deleteNode(duplicate)
+			}
+			sorted = removeNodes(sorted, ours[1:])
+		}
+		index := indexOfNode(sorted, node)
+		if index < 0 {
+			return LockID{}, fmt.Errorf("%w: %s is gone from %s", ErrLockNodeMissing, node, l.dir)
+		}
+		if index == 0 {
+			return l.acquired(node)
+		}
+		ahead := findLowestPrevPrefix(sorted, index)
+		exists, _, events, err := l.conn.ExistsW(path.Join(l.dir, ahead))
+		if err != nil {
+			return LockID{}, fmt.Errorf("watch lock node %s: %w", ahead, err)
+		}
+		if !exists {
+			// It left between the listing and the watch; re-read rather than
+			// wait for an event that will never come.
+			continue
+		}
+		select {
+		case <-ctx.Done():
+			return LockID{}, ctx.Err()
+		case <-events:
+		}
+	}
+}
+
+// acquired records the generation this process now holds. Callers must not
+// hold l.mu.
+func (l *ServiceLock) acquired(node string) (LockID, error) {
+	id, ok := ParseLockNode(node)
+	if !ok {
+		// sortLockNodes only returns parseable names, so this cannot happen
+		// through waitForOwnership; refuse rather than hold a lock whose
+		// generation cannot be named, because an unnameable generation cannot
+		// fence anything.
+		return LockID{}, fmt.Errorf("%w: %q is not a lock node", ErrInvalidLock, node)
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.node = node
+	l.id = id
+	l.held = true
+	l.reason = LossNone
+	return id, nil
+}
+
+// Maintain watches the held lock and returns when it ends or ctx does.
+//
+// A lock loss returns an error wrapping ErrLockLost; the lock is not held
+// afterwards and LockID still names the generation that ended. Cancellation
+// returns ctx.Err() with the lock still held, because being told to stop
+// watching is not being told to stop hosting — the caller decides whether to
+// release.
+//
+// Anything that cannot be proven fails closed. If the watch cannot be
+// established or is torn down — a session that expired, a watch invalidated by
+// the client — the lock is treated as lost, because a lock this process cannot
+// monitor is one it cannot prove it still holds, and the manager is free to
+// place those tablets elsewhere the moment the session ends.
+func (l *ServiceLock) Maintain(ctx context.Context) error {
+	l.mu.Lock()
+	held, node := l.held, l.node
+	l.mu.Unlock()
+	if !held {
+		return fmt.Errorf("%w: %s", ErrNotHeld, l.dir)
+	}
+	nodePath := path.Join(l.dir, node)
+
+	var ticks <-chan time.Time
+	if l.verifyInterval > 0 {
+		ticker := time.NewTicker(l.verifyInterval)
+		defer ticker.Stop()
+		ticks = ticker.C
+	}
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		exists, _, events, err := l.conn.ExistsW(nodePath)
+		if err != nil {
+			return l.lose(LossUnmonitorable, fmt.Errorf("watch %s: %w", nodePath, err))
+		}
+		if !exists {
+			return l.lose(LossNodeDeleted, nil)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticks:
+			if err := l.Verify(); err != nil {
+				return err
+			}
+		case event := <-events:
+			if err := l.classifyEvent(event); err != nil {
+				return err
+			}
+			// Anything else re-arms the watch on the next pass, which
+			// re-checks that the node is still there.
+		}
+	}
+}
+
+// classifyEvent turns a watch event into a loss, or nil to keep watching.
+func (l *ServiceLock) classifyEvent(event gozk.Event) error {
+	switch {
+	case event.Type == gozk.EventNodeDeleted:
+		return l.lose(LossNodeDeleted, nil)
+	case event.Type == gozk.EventNotWatching:
+		// The client gave up on this watch, which happens when the session
+		// ends. The ephemeral node went with it.
+		return l.lose(LossUnmonitorable, event.Err)
+	case event.State == gozk.StateExpired:
+		return l.lose(LossUnmonitorable, nil)
+	default:
+		return nil
+	}
+}
+
+// Verify re-reads the lock directory and confirms this process is still the
+// holder, returning an error wrapping ErrLockLost when it is not.
+//
+// The watch is the primary signal; this is the backstop for the cases a watch
+// does not cover — one dropped without an event, or a lock directory that was
+// deleted and recreated, which restarts ZooKeeper's sequence counter and lets
+// a later arrival take a lower number than the one held here.
+func (l *ServiceLock) Verify() error {
+	l.mu.Lock()
+	held, node := l.held, l.node
+	l.mu.Unlock()
+	if !held {
+		return fmt.Errorf("%w: %s", ErrNotHeld, l.dir)
+	}
+	children, _, err := l.conn.Children(l.dir)
+	if err != nil {
+		return l.lose(LossUnmonitorable, fmt.Errorf("list lock nodes in %s: %w", l.dir, err))
+	}
+	sorted := sortLockNodes(children)
+	if indexOfNode(sorted, node) < 0 {
+		return l.lose(LossNodeDeleted, nil)
+	}
+	if sorted[0] != node {
+		return l.lose(LossSuperseded, fmt.Errorf("%s now holds %s", sorted[0], l.dir))
+	}
+	return nil
+}
+
+// Release gives the lock up by deleting its node.
+//
+// It is safe to call after a loss and safe to call twice: the lock ends once,
+// and the first ending is the one reported. A delete that finds nothing is
+// success, because the node being gone is the outcome asked for.
+func (l *ServiceLock) Release() error {
+	l.mu.Lock()
+	node, started := l.node, l.started
+	l.mu.Unlock()
+	if !started {
+		return fmt.Errorf("%w: %s", ErrNotHeld, l.dir)
+	}
+	var err error
+	if node != "" {
+		err = l.deleteNode(node)
+	}
+	l.lose(LossReleased, nil)
+	return err
+}
+
+// lose records the end of the generation, once. Returns an error wrapping
+// ErrLockLost naming the reason the lock actually ended by, so a later cause
+// cannot rewrite an earlier one.
+func (l *ServiceLock) lose(reason LossReason, cause error) error {
+	l.mu.Lock()
+	if l.held {
+		l.held = false
+		l.reason = reason
+	} else if l.reason != LossNone {
+		reason = l.reason
+		cause = nil
+	}
+	id := l.id
+	l.mu.Unlock()
+	if cause != nil {
+		return fmt.Errorf("%w: %s (%s): %w", ErrLockLost, id, reason, cause)
+	}
+	return fmt.Errorf("%w: %s (%s)", ErrLockLost, id, reason)
+}
+
+// ensureLockDirectory creates the lock directory and every missing ancestor.
+func (l *ServiceLock) ensureLockDirectory() error {
+	segments := strings.Split(strings.Trim(l.dir, "/"), "/")
+	current := ""
+	for _, segment := range segments {
+		current += "/" + segment
+		_, err := l.conn.Create(current, []byte{}, 0, l.acl)
+		if err == nil || errors.Is(err, gozk.ErrNodeExists) {
+			continue
+		}
+		if errors.Is(err, gozk.ErrNoAuth) {
+			return fmt.Errorf("create %s: %w (the ZooKeeper session must carry the "+
+				"instance secret before it can register a server)", current, err)
+		}
+		return fmt.Errorf("create %s: %w", current, err)
+	}
+	return nil
+}
+
+// ownNodes returns the nodes in sorted that this process created.
+func (l *ServiceLock) ownNodes(sorted []string) []string {
+	prefix := l.nodePrefix()
+	ours := make([]string, 0, 1)
+	for _, child := range sorted {
+		if strings.HasPrefix(child, prefix) {
+			ours = append(ours, child)
+		}
+	}
+	return ours
+}
+
+// deleteOwnNodes removes every node this process created in the lock
+// directory. It is the cleanup for an acquisition that did not finish, so a
+// node cannot be left holding a place in the queue for a process that is no
+// longer waiting. Errors are not actionable — the session dropping is itself
+// the fallback that removes them.
+func (l *ServiceLock) deleteOwnNodes() {
+	children, _, err := l.conn.Children(l.dir)
+	if err != nil {
+		return
+	}
+	for _, child := range l.ownNodes(sortLockNodes(children)) {
+		_ = l.deleteNode(child)
+	}
+}
+
+// deleteNode removes one node from the lock directory, treating an already
+// absent node as success.
+func (l *ServiceLock) deleteNode(node string) error {
+	nodePath := path.Join(l.dir, node)
+	if err := l.conn.Delete(nodePath, -1); err != nil && !errors.Is(err, gozk.ErrNoNode) {
+		return fmt.Errorf("delete %s: %w", nodePath, err)
+	}
+	return nil
+}
+
+func indexOfNode(nodes []string, node string) int {
+	for i, candidate := range nodes {
+		if candidate == node {
+			return i
+		}
+	}
+	return -1
+}
+
+// removeNodes returns nodes without the named ones, preserving order.
+func removeNodes(nodes, remove []string) []string {
+	if len(remove) == 0 {
+		return nodes
+	}
+	dropped := make(map[string]struct{}, len(remove))
+	for _, node := range remove {
+		dropped[node] = struct{}{}
+	}
+	kept := make([]string, 0, len(nodes))
+	for _, node := range nodes {
+		if _, skip := dropped[node]; skip {
+			continue
+		}
+		kept = append(kept, node)
+	}
+	return kept
+}

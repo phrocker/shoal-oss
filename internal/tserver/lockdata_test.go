@@ -1,0 +1,289 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+package tserver
+
+import (
+	"encoding/json"
+	"errors"
+	"reflect"
+	"strings"
+	"testing"
+)
+
+// TestTabletServerLockDataMatchesTheAccumuloWireForm pins the exact bytes a
+// Shoal tablet server writes to its lock znode.
+//
+// This is the compatibility contract with an unmodified manager: it reads the
+// znode with Gson into ServiceLockData.ServiceDescriptorsGson, whose fields
+// are uuid, service, address and group in that order, and keys the result by
+// service. Field names, the descriptors wrapper, the enum spellings, and the
+// group being a bare string are all load-bearing — get any of them wrong and
+// the manager sees a server it cannot parse.
+func TestTabletServerLockDataMatchesTheAccumuloWireForm(t *testing.T) {
+	data, err := TabletServerLockData(serverUUID, testAddress, testGroup, TabletServerServices()...)
+	if err != nil {
+		t.Fatalf("TabletServerLockData: %v", err)
+	}
+	encoded, err := data.Encode()
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	want := `{"descriptors":[` +
+		`{"uuid":"` + serverUUID + `","service":"CLIENT","address":"` + testAddress + `","group":"default"},` +
+		`{"uuid":"` + serverUUID + `","service":"TABLET_INGEST","address":"` + testAddress + `","group":"default"},` +
+		`{"uuid":"` + serverUUID + `","service":"TABLET_MANAGEMENT","address":"` + testAddress + `","group":"default"},` +
+		`{"uuid":"` + serverUUID + `","service":"TABLET_SCAN","address":"` + testAddress + `","group":"default"},` +
+		`{"uuid":"` + serverUUID + `","service":"TSERV","address":"` + testAddress + `","group":"default"}` +
+		`]}`
+	if string(encoded) != want {
+		t.Fatalf("lock data mismatch\n got: %s\nwant: %s", encoded, want)
+	}
+}
+
+// TestEncodedLockDataIsReadableByTheLiveServerReader checks the payload
+// against the shape internal/zk decodes when it enumerates live servers: a
+// descriptors array whose entries carry a service name and an address. That
+// reader is how a Shoal process becomes visible to Shoal's own clients, so it
+// has to be able to read what this package writes.
+func TestEncodedLockDataIsReadableByTheLiveServerReader(t *testing.T) {
+	data, err := TabletServerLockData(serverUUID, testAddress, "ingest", ServiceClient, ServiceTabletScan)
+	if err != nil {
+		t.Fatalf("TabletServerLockData: %v", err)
+	}
+	encoded, err := data.Encode()
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	// The exact struct internal/zk decodes into: only service and address.
+	var reader struct {
+		Descriptors []struct {
+			Service string `json:"service"`
+			Address string `json:"address"`
+		} `json:"descriptors"`
+	}
+	if err := json.Unmarshal(encoded, &reader); err != nil {
+		t.Fatalf("decode as the live-server reader does: %v", err)
+	}
+	found := ""
+	for _, descriptor := range reader.Descriptors {
+		if descriptor.Service == "CLIENT" {
+			found = descriptor.Address
+		}
+	}
+	if found != testAddress {
+		t.Fatalf("CLIENT address = %q, want %q", found, testAddress)
+	}
+}
+
+func TestServiceLockDataRoundTrips(t *testing.T) {
+	data, err := TabletServerLockData(serverUUID, testAddress, "", TabletServerServices()...)
+	if err != nil {
+		t.Fatalf("TabletServerLockData: %v", err)
+	}
+	encoded, err := data.Encode()
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	decoded, err := DecodeServiceLockData(encoded)
+	if err != nil {
+		t.Fatalf("DecodeServiceLockData: %v", err)
+	}
+	if !reflect.DeepEqual(decoded.Descriptors, data.Descriptors) {
+		t.Fatalf("round trip changed the descriptors:\n got %+v\nwant %+v",
+			decoded.Descriptors, data.Descriptors)
+	}
+	for _, service := range TabletServerServices() {
+		address, ok := decoded.Address(service)
+		if !ok || address != testAddress {
+			t.Fatalf("Address(%s) = %q, %v; want %q, true", service, address, ok, testAddress)
+		}
+	}
+	if _, ok := decoded.Address("MANAGER"); ok {
+		t.Fatal("a tablet server must not advertise the manager service")
+	}
+}
+
+// TestEncodeRefusesUnusableAdvertisements checks that nothing which would
+// mislead the manager can be written. A lock znode is a claim to be a live
+// server; a claim the manager cannot act on is worse than staying invisible,
+// because it draws work to a process that cannot do it.
+func TestEncodeRefusesUnusableAdvertisements(t *testing.T) {
+	good := ServiceDescriptor{
+		UUID:    serverUUID,
+		Service: ServiceClient,
+		Address: testAddress,
+		Group:   testGroup,
+	}
+	with := func(mutate func(*ServiceDescriptor)) ServiceLockData {
+		descriptor := good
+		mutate(&descriptor)
+		return ServiceLockData{Descriptors: []ServiceDescriptor{descriptor}}
+	}
+	tests := []struct {
+		name string
+		data ServiceLockData
+	}{
+		{"no descriptors", ServiceLockData{}},
+		{"not a uuid", with(func(d *ServiceDescriptor) { d.UUID = "shoal-1" })},
+		{"no uuid", with(func(d *ServiceDescriptor) { d.UUID = "" })},
+		{"unknown service", with(func(d *ServiceDescriptor) { d.Service = "SHOAL_SCAN" })},
+		{"no service", with(func(d *ServiceDescriptor) { d.Service = "" })},
+		{"no group", with(func(d *ServiceDescriptor) { d.Group = "" })},
+		{"no address", with(func(d *ServiceDescriptor) { d.Address = "" })},
+		{"unbound placeholder", with(func(d *ServiceDescriptor) { d.Address = placeholderAddress })},
+		{"no port", with(func(d *ServiceDescriptor) { d.Address = "shoal-1.example" })},
+		{"no host", with(func(d *ServiceDescriptor) { d.Address = ":9997" })},
+		{"non-numeric port", with(func(d *ServiceDescriptor) { d.Address = "shoal-1.example:thrift" })},
+		{"port zero", with(func(d *ServiceDescriptor) { d.Address = "shoal-1.example:0" })},
+		{"port past the range", with(func(d *ServiceDescriptor) { d.Address = "shoal-1.example:70000" })},
+		{"duplicate service", ServiceLockData{Descriptors: []ServiceDescriptor{good, good}}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := tt.data.Validate(); !errors.Is(err, ErrInvalidLockData) {
+				t.Fatalf("Validate: want ErrInvalidLockData, got %v", err)
+			}
+			encoded, err := tt.data.Encode()
+			if !errors.Is(err, ErrInvalidLockData) {
+				t.Fatalf("Encode: want ErrInvalidLockData, got %v", err)
+			}
+			if encoded != nil {
+				t.Fatalf("Encode returned %q alongside its refusal", encoded)
+			}
+		})
+	}
+}
+
+// TestDuplicateServiceIsRefusedRatherThanCollapsed covers the one refusal that
+// is about Accumulo's reader rather than about reachability: descriptors land
+// in an EnumMap keyed by service, so a second address for a service is dropped
+// and which one survives depends on iteration order. Advertising an
+// arbitrarily chosen address is not something to do quietly.
+func TestDuplicateServiceIsRefusedRatherThanCollapsed(t *testing.T) {
+	data := ServiceLockData{Descriptors: []ServiceDescriptor{
+		{UUID: serverUUID, Service: ServiceClient, Address: testAddress, Group: testGroup},
+		{UUID: serverUUID, Service: ServiceClient, Address: "shoal-2.example:9997", Group: testGroup},
+	}}
+	err := data.Validate()
+	if !errors.Is(err, ErrInvalidLockData) {
+		t.Fatalf("Validate: want ErrInvalidLockData, got %v", err)
+	}
+	if got := err.Error(); !strings.Contains(got, "CLIENT") {
+		t.Fatalf("error %q does not name the duplicated service", got)
+	}
+}
+
+func TestTabletServerLockDataRefusesAnEmptyServiceSet(t *testing.T) {
+	if _, err := TabletServerLockData(serverUUID, testAddress, testGroup); !errors.Is(err, ErrInvalidLockData) {
+		t.Fatalf("want ErrInvalidLockData, got %v", err)
+	}
+}
+
+// TestTabletServerLockDataDefaultsTheResourceGroup mirrors Accumulo, where a
+// server with no configured group belongs to "default".
+func TestTabletServerLockDataDefaultsTheResourceGroup(t *testing.T) {
+	data, err := TabletServerLockData(serverUUID, testAddress, "", ServiceClient)
+	if err != nil {
+		t.Fatalf("TabletServerLockData: %v", err)
+	}
+	if got := data.Descriptors[0].Group; got != DefaultResourceGroup {
+		t.Fatalf("group = %q, want %q", got, DefaultResourceGroup)
+	}
+}
+
+// TestDecodeIsLenientAboutServicesItDoesNotKnow keeps reading and writing
+// asymmetric on purpose. This process must not publish a service it cannot
+// serve, but it reads znodes written by servers it does not control —
+// including Java ones and newer Accumulo versions — and a descriptor it does
+// not recognize is no reason to discard the ones it does.
+func TestDecodeIsLenientAboutServicesItDoesNotKnow(t *testing.T) {
+	raw := []byte(`{"descriptors":[` +
+		`{"uuid":"` + serverUUID + `","service":"SOME_FUTURE_SERVICE","address":"shoal-9.example:1","group":"default"},` +
+		`{"uuid":"` + serverUUID + `","service":"CLIENT","address":"` + testAddress + `","group":"default"}]}`)
+	decoded, err := DecodeServiceLockData(raw)
+	if err != nil {
+		t.Fatalf("DecodeServiceLockData: %v", err)
+	}
+	if len(decoded.Descriptors) != 2 {
+		t.Fatalf("kept %d descriptors, want 2", len(decoded.Descriptors))
+	}
+	if address, ok := decoded.Address(ServiceClient); !ok || address != testAddress {
+		t.Fatalf("Address(CLIENT) = %q, %v; want %q, true", address, ok, testAddress)
+	}
+	// Leniency stops at re-publishing: what was read cannot be written back.
+	if err := decoded.Validate(); !errors.Is(err, ErrInvalidLockData) {
+		t.Fatalf("Validate: want ErrInvalidLockData for an unknown service, got %v", err)
+	}
+}
+
+func TestDecodeRejectsUnusablePayloads(t *testing.T) {
+	for _, raw := range [][]byte{nil, {}, []byte("not json"), []byte(`{"descriptors":`)} {
+		if _, err := DecodeServiceLockData(raw); err == nil {
+			t.Fatalf("DecodeServiceLockData(%q) succeeded", raw)
+		}
+	}
+}
+
+// TestTabletServerServicesIsTheJavaSet pins the descriptor set a Java tablet
+// server publishes, which is the set a Shoal process has to reach before it
+// can stand in for one.
+func TestTabletServerServicesIsTheJavaSet(t *testing.T) {
+	want := []ThriftService{"CLIENT", "TABLET_INGEST", "TABLET_MANAGEMENT", "TABLET_SCAN", "TSERV"}
+	got := TabletServerServices()
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("TabletServerServices() = %v, want %v", got, want)
+	}
+	got[0] = "MANAGER"
+	if again := TabletServerServices(); !reflect.DeepEqual(again, want) {
+		t.Fatalf("a caller mutated the package's service set: %v", again)
+	}
+}
+
+// TestAdvertisingASubsetIsAllowed is the capability story: a process that has
+// scans but not the write path advertises exactly that, so the manager routes
+// it what it can serve rather than what it aspires to.
+func TestAdvertisingASubsetIsAllowed(t *testing.T) {
+	data, err := TabletServerLockData(serverUUID, testAddress, testGroup, ServiceClient, ServiceTabletScan)
+	if err != nil {
+		t.Fatalf("TabletServerLockData: %v", err)
+	}
+	if _, err := data.Encode(); err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	if _, ok := data.Address(ServiceTabletIngest); ok {
+		t.Fatal("a service that was not advertised must not resolve")
+	}
+}
+
+func TestThriftServiceKnown(t *testing.T) {
+	for _, service := range TabletServerServices() {
+		if !service.Known() {
+			t.Fatalf("%s must be a known service", service)
+		}
+	}
+	for _, service := range []ThriftService{"MANAGER", "COORDINATOR", "COMPACTOR", "GC", "NONE"} {
+		if !service.Known() {
+			t.Fatalf("%s is part of Accumulo's enum and must parse", service)
+		}
+	}
+	for _, service := range []ThriftService{"", "SHOAL", "tserv", "TSERV "} {
+		if service.Known() {
+			t.Fatalf("%q must not be treated as an Accumulo service", service)
+		}
+	}
+}

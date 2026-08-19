@@ -1,0 +1,1072 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+package tserver
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"path"
+	"reflect"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	gozk "github.com/go-zookeeper/zk"
+)
+
+// testLockData is the payload a tablet server publishes in these tests.
+func testLockData(t *testing.T) ServiceLockData {
+	t.Helper()
+	data, err := TabletServerLockData(serverUUID, testAddress, testGroup, TabletServerServices()...)
+	if err != nil {
+		t.Fatalf("TabletServerLockData: %v", err)
+	}
+	return data
+}
+
+func newTestLock(t *testing.T, conn LockConn, holder string) *ServiceLock {
+	t.Helper()
+	lock, err := NewServiceLock(conn, ServiceLockOptions{Path: testLockPath(), UUID: holder})
+	if err != nil {
+		t.Fatalf("NewServiceLock: %v", err)
+	}
+	return lock
+}
+
+// nextArmed returns the very next watch the code under test establishes,
+// which is how a test asserts *which* node is being watched rather than only
+// that something is.
+func nextArmed(t *testing.T, f *fakeZK) string {
+	t.Helper()
+	select {
+	case armed := <-f.armed:
+		return armed
+	case <-time.After(5 * time.Second):
+		t.Fatal("no watch was established")
+		return ""
+	}
+}
+
+// TestAcquireCreatesAnAccumuloCompatibleLockNode is the registration contract.
+// An unmodified manager finds live tablet servers by listing this directory,
+// picking the lowest zlock node and reading its payload, so the node name, the
+// ephemeral flag, the ACL and the bytes all have to match what a Java tablet
+// server would have written.
+func TestAcquireCreatesAnAccumuloCompatibleLockNode(t *testing.T) {
+	f := newFakeZK()
+	lock := newTestLock(t, f, serverUUID)
+	data := testLockData(t)
+
+	id, err := lock.Acquire(context.Background(), data)
+	if err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	want := LockID{UUID: serverUUID, Sequence: 0}
+	if id != want {
+		t.Fatalf("acquired %s, want %s", id, want)
+	}
+	node := lock.Node()
+	if node != fmt.Sprintf("zlock#%s#%010d", serverUUID, 0) {
+		t.Fatalf("lock node %q is not Accumulo's zlock#<uuid>#<sequence>", node)
+	}
+	held, ok := lock.LockID()
+	if !ok || held != want {
+		t.Fatalf("LockID() = %s, %v; want %s, true", held, ok, want)
+	}
+	if lock.LossReason() != LossNone {
+		t.Fatalf("a held lock reports loss %s", lock.LossReason())
+	}
+
+	stored, ok := f.node(path.Join(testLockPath(), node))
+	if !ok {
+		t.Fatal("the lock node was not created")
+	}
+	if !stored.ephemeral {
+		t.Fatal("the lock node must be ephemeral, or a crashed server keeps its lock forever")
+	}
+	payload, err := data.Encode()
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	if string(stored.data) != string(payload) {
+		t.Fatalf("lock node payload = %s, want %s", stored.data, payload)
+	}
+	if !reflect.DeepEqual(stored.acl, PublicACL()) {
+		t.Fatalf("lock node ACL = %+v, want ZooUtil.PUBLIC %+v", stored.acl, PublicACL())
+	}
+}
+
+// TestAcquireCreatesTheResourceGroupPath covers a tablet server starting in a
+// resource group no server has used yet, which Accumulo handles in
+// ServiceLockSupport.createNonHaServiceLockPath.
+func TestAcquireCreatesTheResourceGroupPath(t *testing.T) {
+	f := newFakeZK()
+	lock := newTestLock(t, f, serverUUID)
+	if _, err := lock.Acquire(context.Background(), testLockData(t)); err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	for _, required := range []string{
+		path.Join(testInstancePath, "tservers"),
+		path.Join(testInstancePath, "tservers", testGroup),
+		testLockPath(),
+	} {
+		if !f.exists(required) {
+			t.Fatalf("%s was not created", required)
+		}
+	}
+}
+
+// TestAcquireWaitsForTheHolderToLeave is the queueing contract: a second
+// process with the same address does not take over a live server's lock, it
+// waits behind it. This is what stops two processes believing they host the
+// same tablets.
+func TestAcquireWaitsForTheHolderToLeave(t *testing.T) {
+	f := newFakeZK()
+	holder := f.seedForeignLock(testLockPath(), otherUUID, 0)
+	lock := newTestLock(t, f, serverUUID)
+
+	type result struct {
+		id  LockID
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		id, err := lock.Acquire(context.Background(), testLockData(t))
+		done <- result{id, err}
+	}()
+
+	waitArmed(t, f, path.Join(testLockPath(), holder))
+	select {
+	case got := <-done:
+		t.Fatalf("Acquire returned %s/%v while another process held the lock", got.id, got.err)
+	default:
+	}
+
+	if err := f.Delete(path.Join(testLockPath(), holder), -1); err != nil {
+		t.Fatalf("delete the holder's node: %v", err)
+	}
+	got := <-done
+	if got.err != nil {
+		t.Fatalf("Acquire after the holder left: %v", got.err)
+	}
+	if got.id.Sequence != 1 {
+		t.Fatalf("acquired sequence %d, want 1", got.id.Sequence)
+	}
+	if !got.id.Supersedes(LockID{UUID: otherUUID, Sequence: 0}) {
+		t.Fatalf("%s must supersede the generation it replaced", got.id)
+	}
+}
+
+// TestAcquireWatchesTheHoldersLowestNode pins which node a queued candidate
+// watches. A holder that retried a create owns several nodes; watching the
+// immediate predecessor would wake this process when that holder tidies up a
+// duplicate rather than when it actually leaves, and it would then find the
+// lock still taken.
+func TestAcquireWatchesTheHoldersLowestNode(t *testing.T) {
+	f := newFakeZK()
+	lowest := f.seedForeignLock(testLockPath(), otherUUID, 0)
+	predecessor := f.seedForeignLock(testLockPath(), otherUUID, 1)
+	lock := newTestLock(t, f, serverUUID)
+
+	go func() {
+		_, _ = lock.Acquire(context.Background(), testLockData(t))
+	}()
+
+	armed := nextArmed(t, f)
+	if armed != path.Join(testLockPath(), lowest) {
+		t.Fatalf("watching %s, want the holder's lowest node %s (its highest is %s)",
+			armed, path.Join(testLockPath(), lowest), predecessor)
+	}
+}
+
+// TestAcquireCollapsesDuplicateNodes covers a create whose answer was lost and
+// retried. Every attempt left a node, and all of them carry this process's
+// prefix; keeping more than one would hold several places in the queue and
+// leave a stale node behind after the lock is released.
+func TestAcquireCollapsesDuplicateNodes(t *testing.T) {
+	f := newFakeZK()
+	f.duplicates = 2
+	lock := newTestLock(t, f, serverUUID)
+
+	id, err := lock.Acquire(context.Background(), testLockData(t))
+	if err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	if id.Sequence != 0 {
+		t.Fatalf("kept sequence %d, want the first node this process created (0)", id.Sequence)
+	}
+	remaining := f.lockNodes(testLockPath())
+	if len(remaining) != 1 {
+		t.Fatalf("lock directory holds %v, want exactly one node", remaining)
+	}
+	if remaining[0] != lock.Node() {
+		t.Fatalf("the surviving node is %s, but the lock believes it holds %s",
+			remaining[0], lock.Node())
+	}
+}
+
+// TestAcquireIsCancellableWhileQueued matters because a shutting-down process
+// that leaves a node in the queue blocks everyone behind it until its session
+// ends, which can be tens of seconds of an unhosted tablet range.
+func TestAcquireIsCancellableWhileQueued(t *testing.T) {
+	f := newFakeZK()
+	holder := f.seedForeignLock(testLockPath(), otherUUID, 0)
+	lock := newTestLock(t, f, serverUUID)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := lock.Acquire(ctx, testLockData(t))
+		done <- err
+	}()
+
+	waitArmed(t, f, path.Join(testLockPath(), holder))
+	cancel()
+
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Acquire: want context.Canceled, got %v", err)
+	}
+	if _, ok := lock.LockID(); ok {
+		t.Fatal("a cancelled acquisition must not report a held lock")
+	}
+	for _, node := range f.lockNodes(testLockPath()) {
+		if strings.Contains(node, serverUUID) {
+			t.Fatalf("cancelled acquisition left %s queued", node)
+		}
+	}
+}
+
+// TestAcquireRefusesToPublishUnusableLockData checks the refusal happens
+// before anything is written. A znode is a claim to be a live server, so a
+// payload the manager cannot act on must never reach ZooKeeper.
+func TestAcquireRefusesToPublishUnusableLockData(t *testing.T) {
+	f := newFakeZK()
+	lock := newTestLock(t, f, serverUUID)
+
+	_, err := lock.Acquire(context.Background(), ServiceLockData{})
+	if !errors.Is(err, ErrInvalidLockData) {
+		t.Fatalf("Acquire: want ErrInvalidLockData, got %v", err)
+	}
+	if created := f.createdPaths(); len(created) != 0 {
+		t.Fatalf("a refused acquisition wrote %v", created)
+	}
+}
+
+// TestAcquireRefusesASecondGeneration keeps one ServiceLock meaning one
+// generation. Re-acquiring through the same object would give two different
+// generations the same identity, and the fence is built on that identity.
+func TestAcquireRefusesASecondGeneration(t *testing.T) {
+	f := newFakeZK()
+	lock := newTestLock(t, f, serverUUID)
+	if _, err := lock.Acquire(context.Background(), testLockData(t)); err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	if _, err := lock.Acquire(context.Background(), testLockData(t)); !errors.Is(err, ErrLockInUse) {
+		t.Fatalf("second Acquire: want ErrLockInUse, got %v", err)
+	}
+}
+
+func TestAcquireReportsACreateFailure(t *testing.T) {
+	f := newFakeZK()
+	lock := newTestLock(t, f, serverUUID)
+	f.failCreate(testLockPath()+"/zlock#"+serverUUID+"#", gozk.ErrNoAuth)
+
+	_, err := lock.Acquire(context.Background(), testLockData(t))
+	if !errors.Is(err, gozk.ErrNoAuth) {
+		t.Fatalf("Acquire: want the ZooKeeper error, got %v", err)
+	}
+	if _, ok := lock.LockID(); ok {
+		t.Fatal("a failed acquisition must not report a held lock")
+	}
+}
+
+// TestAcquireExplainsAMissingInstanceSecret turns the least obvious ZooKeeper
+// failure into the thing an operator actually has to fix. A session that never
+// authenticated cannot write under the instance root, and "not authenticated"
+// on its own does not say why.
+func TestAcquireExplainsAMissingInstanceSecret(t *testing.T) {
+	f := newFakeZK()
+	f.seed(path.Join(testInstancePath, "tservers"), nil, false)
+	lock := newTestLock(t, f, serverUUID)
+	f.failCreate(path.Join(testInstancePath, "tservers", testGroup), gozk.ErrNoAuth)
+
+	_, err := lock.Acquire(context.Background(), testLockData(t))
+	if !errors.Is(err, gozk.ErrNoAuth) {
+		t.Fatalf("Acquire: want ErrNoAuth, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "instance secret") {
+		t.Fatalf("error %q does not point at the instance secret", err)
+	}
+}
+
+func TestAcquireReportsADirectoryFailure(t *testing.T) {
+	f := newFakeZK()
+	lock := newTestLock(t, f, serverUUID)
+	f.failCreate(path.Join(testInstancePath, "tservers"), gozk.ErrConnectionClosed)
+
+	if _, err := lock.Acquire(context.Background(), testLockData(t)); !errors.Is(err, gozk.ErrConnectionClosed) {
+		t.Fatalf("Acquire: want the ZooKeeper error, got %v", err)
+	}
+}
+
+func TestAcquireHonoursAnAlreadyCancelledContext(t *testing.T) {
+	f := newFakeZK()
+	lock := newTestLock(t, f, serverUUID)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if _, err := lock.Acquire(ctx, testLockData(t)); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Acquire: want context.Canceled, got %v", err)
+	}
+	if created := f.createdPaths(); len(created) != 0 {
+		t.Fatalf("a cancelled acquisition wrote %v", created)
+	}
+}
+
+// TestAcquireRereadsWhenThePredecessorVanishesBeforeTheWatch closes the window
+// between listing the directory and watching what the listing found. The node
+// ahead can leave in between, and an event for a node that is already gone
+// never arrives — so the queue is re-read rather than waited on.
+func TestAcquireRereadsWhenThePredecessorVanishesBeforeTheWatch(t *testing.T) {
+	f := newFakeZK()
+	holder := f.seedForeignLock(testLockPath(), otherUUID, 0)
+	holderPath := path.Join(testLockPath(), holder)
+
+	var once sync.Once
+	f.beforeExists = func(watched string) {
+		if watched != holderPath {
+			return
+		}
+		once.Do(func() { _ = f.Delete(holderPath, -1) })
+	}
+	lock := newTestLock(t, f, serverUUID)
+
+	id, err := lock.Acquire(context.Background(), testLockData(t))
+	if err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	if id.Sequence != 1 {
+		t.Fatalf("acquired sequence %d, want 1", id.Sequence)
+	}
+}
+
+// TestAcquireStopsWhenItsOwnNodeIsRemovedWhileQueued covers an operator or a
+// session hiccup taking this process out of the queue. Waiting on a place in
+// line that no longer exists would hang forever.
+func TestAcquireStopsWhenItsOwnNodeIsRemovedWhileQueued(t *testing.T) {
+	f := newFakeZK()
+	holder := f.seedForeignLock(testLockPath(), otherUUID, 0)
+	holderPath := path.Join(testLockPath(), holder)
+	lock := newTestLock(t, f, serverUUID)
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := lock.Acquire(context.Background(), testLockData(t))
+		done <- err
+	}()
+
+	waitArmed(t, f, holderPath)
+	if err := f.Delete(path.Join(testLockPath(), "zlock#"+serverUUID+"#0000000001"), -1); err != nil {
+		t.Fatalf("delete our queued node: %v", err)
+	}
+	// Wake the wait so it re-reads and finds itself gone.
+	if err := f.Delete(holderPath, -1); err != nil {
+		t.Fatalf("delete the holder's node: %v", err)
+	}
+
+	if err := <-done; !errors.Is(err, ErrLockNodeMissing) {
+		t.Fatalf("Acquire: want ErrLockNodeMissing, got %v", err)
+	}
+}
+
+// TestAcquireStopsWhenItsNodeNeverReachesTheQueue covers the node being
+// removed between the create and the first reading of the directory — an
+// operator clearing the lock path, say. A create that leaves nothing behind
+// has to be reported, not waited on.
+func TestAcquireStopsWhenItsNodeNeverReachesTheQueue(t *testing.T) {
+	f := newFakeZK()
+	var once sync.Once
+	f.beforeChildren = func(listed string) {
+		if listed != testLockPath() {
+			return
+		}
+		once.Do(func() {
+			_ = f.Delete(path.Join(testLockPath(), "zlock#"+serverUUID+"#0000000000"), -1)
+		})
+	}
+	lock := newTestLock(t, f, serverUUID)
+
+	_, err := lock.Acquire(context.Background(), testLockData(t))
+	if !errors.Is(err, ErrLockNodeMissing) {
+		t.Fatalf("Acquire: want ErrLockNodeMissing, got %v", err)
+	}
+	if _, ok := lock.LockID(); ok {
+		t.Fatal("a failed acquisition must not report a held lock")
+	}
+}
+
+// TestAcquireReportsAnUnreadableLockDirectory documents the one cleanup this
+// package cannot do: if the directory cannot be listed, the node that was
+// created cannot be found to delete it, and it is left to the session ending.
+func TestAcquireReportsAnUnreadableLockDirectory(t *testing.T) {
+	f := newFakeZK()
+	lock := newTestLock(t, f, serverUUID)
+	f.failChildren(testLockPath(), gozk.ErrConnectionClosed)
+
+	_, err := lock.Acquire(context.Background(), testLockData(t))
+	if !errors.Is(err, gozk.ErrConnectionClosed) {
+		t.Fatalf("Acquire: want the ZooKeeper error, got %v", err)
+	}
+	if _, ok := lock.LockID(); ok {
+		t.Fatal("a failed acquisition must not report a held lock")
+	}
+}
+
+// TestMaintainReportsTheLockNodeBeingDeleted is the ordinary loss: the session
+// ended, so ZooKeeper removed the ephemeral node and the manager is already
+// free to place these tablets elsewhere.
+func TestMaintainReportsTheLockNodeBeingDeleted(t *testing.T) {
+	f := newFakeZK()
+	lock := newTestLock(t, f, serverUUID)
+	id, err := lock.Acquire(context.Background(), testLockData(t))
+	if err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	nodePath := path.Join(testLockPath(), lock.Node())
+
+	done := make(chan error, 1)
+	go func() { done <- lock.Maintain(context.Background()) }()
+	waitArmed(t, f, nodePath)
+	if err := f.Delete(nodePath, -1); err != nil {
+		t.Fatalf("delete the lock node: %v", err)
+	}
+
+	err = <-done
+	if !errors.Is(err, ErrLockLost) {
+		t.Fatalf("Maintain: want ErrLockLost, got %v", err)
+	}
+	if lock.LossReason() != LossNodeDeleted {
+		t.Fatalf("loss reason %s, want NODE_DELETED", lock.LossReason())
+	}
+	lost, ok := lock.LockID()
+	if ok {
+		t.Fatal("the lock is still reported as held after it was lost")
+	}
+	if lost != id {
+		t.Fatalf("LockID() = %s after the loss, want the generation that ended (%s)", lost, id)
+	}
+	if !strings.Contains(err.Error(), id.String()) {
+		t.Fatalf("the loss %q does not name the generation that ended", err)
+	}
+}
+
+// TestMaintainReportsSessionExpiry covers the case the fence exists for: the
+// ZooKeeper session ended, every ephemeral node went with it, and this process
+// may not touch a tablet under that generation again.
+func TestMaintainReportsSessionExpiry(t *testing.T) {
+	f := newFakeZK()
+	lock := newTestLock(t, f, serverUUID)
+	if _, err := lock.Acquire(context.Background(), testLockData(t)); err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- lock.Maintain(context.Background()) }()
+	waitArmed(t, f, path.Join(testLockPath(), lock.Node()))
+	f.expire()
+
+	if err := <-done; !errors.Is(err, ErrLockLost) {
+		t.Fatalf("Maintain: want ErrLockLost, got %v", err)
+	}
+	if lock.LossReason() != LossUnmonitorable {
+		t.Fatalf("loss reason %s, want UNMONITORABLE", lock.LossReason())
+	}
+}
+
+// TestMaintainFailsClosedWhenTheLockCannotBeWatched is the equivalent of
+// Accumulo's LockWatcher.unableToMonitorLockNode, where the Java tablet server
+// halts. A lock this process cannot watch is one it cannot prove it still
+// holds, and hosting on an unprovable lock is what the fence exists to stop.
+func TestMaintainFailsClosedWhenTheLockCannotBeWatched(t *testing.T) {
+	f := newFakeZK()
+	lock := newTestLock(t, f, serverUUID)
+	if _, err := lock.Acquire(context.Background(), testLockData(t)); err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	f.failExists(path.Join(testLockPath(), lock.Node()), gozk.ErrConnectionClosed)
+
+	err := lock.Maintain(context.Background())
+	if !errors.Is(err, ErrLockLost) {
+		t.Fatalf("Maintain: want ErrLockLost, got %v", err)
+	}
+	if lock.LossReason() != LossUnmonitorable {
+		t.Fatalf("loss reason %s, want UNMONITORABLE", lock.LossReason())
+	}
+}
+
+// TestMaintainKeepsWatchingThroughBenignEvents stops the opposite failure: a
+// tablet server that drops everything because ZooKeeper mentioned its node.
+func TestMaintainKeepsWatchingThroughBenignEvents(t *testing.T) {
+	f := newFakeZK()
+	lock := newTestLock(t, f, serverUUID)
+	if _, err := lock.Acquire(context.Background(), testLockData(t)); err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	nodePath := path.Join(testLockPath(), lock.Node())
+
+	done := make(chan error, 1)
+	go func() { done <- lock.Maintain(context.Background()) }()
+
+	waitArmed(t, f, nodePath)
+	f.fire(nodePath, gozk.Event{
+		Type:  gozk.EventNodeDataChanged,
+		State: gozk.StateHasSession,
+		Path:  nodePath,
+	})
+
+	// The watch is re-armed rather than the lock given up.
+	waitArmed(t, f, nodePath)
+	select {
+	case err := <-done:
+		t.Fatalf("Maintain gave up on a data-changed event: %v", err)
+	default:
+	}
+	if _, ok := lock.LockID(); !ok {
+		t.Fatal("the lock was released on a benign event")
+	}
+
+	if err := f.Delete(nodePath, -1); err != nil {
+		t.Fatalf("delete the lock node: %v", err)
+	}
+	if err := <-done; !errors.Is(err, ErrLockLost) {
+		t.Fatalf("Maintain: want ErrLockLost, got %v", err)
+	}
+	if lock.LossReason() != LossNodeDeleted {
+		t.Fatalf("loss reason %s, want NODE_DELETED", lock.LossReason())
+	}
+}
+
+// TestMaintainCancellationKeepsTheLockHeld separates two decisions that look
+// alike: stopping the watch is not giving up the tablets. The caller decides
+// whether a shutdown releases, and until it does the lock is still this
+// process's.
+func TestMaintainCancellationKeepsTheLockHeld(t *testing.T) {
+	f := newFakeZK()
+	lock := newTestLock(t, f, serverUUID)
+	id, err := lock.Acquire(context.Background(), testLockData(t))
+	if err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	nodePath := path.Join(testLockPath(), lock.Node())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- lock.Maintain(ctx) }()
+	waitArmed(t, f, nodePath)
+	cancel()
+
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Maintain: want context.Canceled, got %v", err)
+	}
+	held, ok := lock.LockID()
+	if !ok || held != id {
+		t.Fatalf("LockID() = %s, %v after cancellation; want %s, true", held, ok, id)
+	}
+	if lock.LossReason() != LossNone {
+		t.Fatalf("cancellation recorded loss %s", lock.LossReason())
+	}
+	if !f.exists(nodePath) {
+		t.Fatal("cancelling the watch deleted the lock node")
+	}
+}
+
+func TestMaintainRequiresAHeldLock(t *testing.T) {
+	lock := newTestLock(t, newFakeZK(), serverUUID)
+	if err := lock.Maintain(context.Background()); !errors.Is(err, ErrNotHeld) {
+		t.Fatalf("Maintain: want ErrNotHeld, got %v", err)
+	}
+	if node := lock.Node(); node != "" {
+		t.Fatalf("Node() = %q with no lock held", node)
+	}
+}
+
+// TestMaintainTreatsAnExpiredSessionAsALoss covers the state change arriving
+// on its own, without the watch being torn down first. An expired session has
+// already taken the ephemeral node with it, whatever the event says.
+func TestMaintainTreatsAnExpiredSessionAsALoss(t *testing.T) {
+	f := newFakeZK()
+	lock := newTestLock(t, f, serverUUID)
+	if _, err := lock.Acquire(context.Background(), testLockData(t)); err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	nodePath := path.Join(testLockPath(), lock.Node())
+
+	done := make(chan error, 1)
+	go func() { done <- lock.Maintain(context.Background()) }()
+	waitArmed(t, f, nodePath)
+	f.fire(nodePath, gozk.Event{Type: gozk.EventSession, State: gozk.StateExpired, Path: nodePath})
+
+	if err := <-done; !errors.Is(err, ErrLockLost) {
+		t.Fatalf("Maintain: want ErrLockLost, got %v", err)
+	}
+	if lock.LossReason() != LossUnmonitorable {
+		t.Fatalf("loss reason %s, want UNMONITORABLE", lock.LossReason())
+	}
+}
+
+// TestReleaseReportsADeleteFailure keeps a lock node that could not be removed
+// visible. The session ending is the backstop, but until then the directory
+// still says this process is a live server.
+func TestReleaseReportsADeleteFailure(t *testing.T) {
+	f := newFakeZK()
+	lock := newTestLock(t, f, serverUUID)
+	if _, err := lock.Acquire(context.Background(), testLockData(t)); err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	nodePath := path.Join(testLockPath(), lock.Node())
+	f.failDelete(nodePath, gozk.ErrConnectionClosed)
+
+	err := lock.Release()
+	if !errors.Is(err, gozk.ErrConnectionClosed) {
+		t.Fatalf("Release: want the ZooKeeper error, got %v", err)
+	}
+	// The generation is over locally regardless: this process stops claiming
+	// to hold a lock it has given up on.
+	if _, ok := lock.LockID(); ok {
+		t.Fatal("the lock is still reported held after a failed release")
+	}
+	if lock.LossReason() != LossReleased {
+		t.Fatalf("loss reason %s, want RELEASED", lock.LossReason())
+	}
+}
+
+// TestVerifyDetectsASupersedingHolder covers the case a watch cannot see. If
+// the lock directory is deleted and recreated, ZooKeeper's sequence counter
+// restarts, so a server arriving afterwards can take a lower number than the
+// one held here — the node is still there, but it is no longer the holder.
+func TestVerifyDetectsASupersedingHolder(t *testing.T) {
+	f := newFakeZK()
+	stale := f.seedForeignLock(testLockPath(), otherUUID, 5)
+	if err := f.Delete(path.Join(testLockPath(), stale), -1); err != nil {
+		t.Fatalf("delete the seeded node: %v", err)
+	}
+	lock := newTestLock(t, f, serverUUID)
+	id, err := lock.Acquire(context.Background(), testLockData(t))
+	if err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	if id.Sequence != 6 {
+		t.Fatalf("acquired sequence %d, want 6", id.Sequence)
+	}
+	if err := lock.Verify(); err != nil {
+		t.Fatalf("Verify while holding: %v", err)
+	}
+
+	// The counter restarted underneath us and somebody took a lower number.
+	f.seedForeignLock(testLockPath(), managerUUID, 2)
+
+	err = lock.Verify()
+	if !errors.Is(err, ErrLockLost) {
+		t.Fatalf("Verify: want ErrLockLost, got %v", err)
+	}
+	if lock.LossReason() != LossSuperseded {
+		t.Fatalf("loss reason %s, want SUPERSEDED", lock.LossReason())
+	}
+}
+
+func TestVerifyDetectsAMissingNode(t *testing.T) {
+	f := newFakeZK()
+	lock := newTestLock(t, f, serverUUID)
+	if _, err := lock.Acquire(context.Background(), testLockData(t)); err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	if err := f.Delete(path.Join(testLockPath(), lock.Node()), -1); err != nil {
+		t.Fatalf("delete the lock node: %v", err)
+	}
+	if err := lock.Verify(); !errors.Is(err, ErrLockLost) {
+		t.Fatalf("Verify: want ErrLockLost, got %v", err)
+	}
+	if lock.LossReason() != LossNodeDeleted {
+		t.Fatalf("loss reason %s, want NODE_DELETED", lock.LossReason())
+	}
+}
+
+func TestVerifyFailsClosedWhenTheDirectoryCannotBeRead(t *testing.T) {
+	f := newFakeZK()
+	lock := newTestLock(t, f, serverUUID)
+	if _, err := lock.Acquire(context.Background(), testLockData(t)); err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	f.failChildren(testLockPath(), gozk.ErrConnectionClosed)
+
+	if err := lock.Verify(); !errors.Is(err, ErrLockLost) {
+		t.Fatalf("Verify: want ErrLockLost, got %v", err)
+	}
+	if lock.LossReason() != LossUnmonitorable {
+		t.Fatalf("loss reason %s, want UNMONITORABLE", lock.LossReason())
+	}
+}
+
+func TestVerifyRequiresAHeldLock(t *testing.T) {
+	lock := newTestLock(t, newFakeZK(), serverUUID)
+	if err := lock.Verify(); !errors.Is(err, ErrNotHeld) {
+		t.Fatalf("Verify: want ErrNotHeld, got %v", err)
+	}
+}
+
+// TestVerifyIntervalCatchesASilentlyDroppedWatch is why the timer exists: a
+// watch that never fires is indistinguishable from a quiet cluster, so the
+// holder re-reads the directory on its own schedule.
+func TestVerifyIntervalCatchesASilentlyDroppedWatch(t *testing.T) {
+	f := newFakeZK()
+	stale := f.seedForeignLock(testLockPath(), otherUUID, 5)
+	if err := f.Delete(path.Join(testLockPath(), stale), -1); err != nil {
+		t.Fatalf("delete the seeded node: %v", err)
+	}
+	lock, err := NewServiceLock(f, ServiceLockOptions{
+		Path:           testLockPath(),
+		UUID:           serverUUID,
+		VerifyInterval: 5 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("NewServiceLock: %v", err)
+	}
+	if _, err := lock.Acquire(context.Background(), testLockData(t)); err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	// No watch fires for this: our node is untouched, but it is no longer
+	// the lowest.
+	f.seedForeignLock(testLockPath(), managerUUID, 2)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	err = lock.Maintain(ctx)
+	if !errors.Is(err, ErrLockLost) {
+		t.Fatalf("Maintain: want ErrLockLost, got %v", err)
+	}
+	if lock.LossReason() != LossSuperseded {
+		t.Fatalf("loss reason %s, want SUPERSEDED", lock.LossReason())
+	}
+}
+
+func TestReleaseDeletesTheNodeAndIsIdempotent(t *testing.T) {
+	f := newFakeZK()
+	lock := newTestLock(t, f, serverUUID)
+	if _, err := lock.Acquire(context.Background(), testLockData(t)); err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	nodePath := path.Join(testLockPath(), lock.Node())
+
+	if err := lock.Release(); err != nil {
+		t.Fatalf("Release: %v", err)
+	}
+	if f.exists(nodePath) {
+		t.Fatal("Release left the lock node in place")
+	}
+	if _, ok := lock.LockID(); ok {
+		t.Fatal("a released lock still reports itself held")
+	}
+	if lock.LossReason() != LossReleased {
+		t.Fatalf("loss reason %s, want RELEASED", lock.LossReason())
+	}
+	if err := lock.Release(); err != nil {
+		t.Fatalf("second Release: %v", err)
+	}
+	if lock.LossReason() != LossReleased {
+		t.Fatalf("loss reason %s after a second Release, want RELEASED", lock.LossReason())
+	}
+}
+
+// TestReleaseAfterALossKeepsTheOriginalReason matters for diagnosis: the
+// interesting fact is that the session died, not that the shutdown path
+// afterwards also asked to let go.
+func TestReleaseAfterALossKeepsTheOriginalReason(t *testing.T) {
+	f := newFakeZK()
+	lock := newTestLock(t, f, serverUUID)
+	if _, err := lock.Acquire(context.Background(), testLockData(t)); err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	nodePath := path.Join(testLockPath(), lock.Node())
+
+	done := make(chan error, 1)
+	go func() { done <- lock.Maintain(context.Background()) }()
+	waitArmed(t, f, nodePath)
+	if err := f.Delete(nodePath, -1); err != nil {
+		t.Fatalf("delete the lock node: %v", err)
+	}
+	if err := <-done; !errors.Is(err, ErrLockLost) {
+		t.Fatalf("Maintain: want ErrLockLost, got %v", err)
+	}
+
+	if err := lock.Release(); err != nil {
+		t.Fatalf("Release after a loss: %v", err)
+	}
+	if lock.LossReason() != LossNodeDeleted {
+		t.Fatalf("loss reason %s, want the original NODE_DELETED", lock.LossReason())
+	}
+}
+
+func TestReleaseRequiresAnAcquisition(t *testing.T) {
+	lock := newTestLock(t, newFakeZK(), serverUUID)
+	if err := lock.Release(); !errors.Is(err, ErrNotHeld) {
+		t.Fatalf("Release: want ErrNotHeld, got %v", err)
+	}
+}
+
+// TestQueuedCandidatesAcquireInSequenceOrder is the whole point of the
+// protocol under contention: whatever order processes arrive in, they take the
+// lock one at a time and in the order ZooKeeper numbered them.
+func TestQueuedCandidatesAcquireInSequenceOrder(t *testing.T) {
+	f := newFakeZK()
+	f.seed(testLockPath(), nil, false)
+
+	holders := []string{serverUUID, managerUUID, otherUUID}
+	locks := make([]*ServiceLock, len(holders))
+	for i, holder := range holders {
+		locks[i] = newTestLock(t, f, holder)
+	}
+
+	type acquisition struct {
+		index int
+		id    LockID
+		err   error
+	}
+	acquired := make(chan acquisition, len(locks))
+	for i, lock := range locks {
+		go func(i int, lock *ServiceLock) {
+			id, err := lock.Acquire(context.Background(), testLockData(t))
+			acquired <- acquisition{i, id, err}
+		}(i, lock)
+	}
+
+	previous := int64(-1)
+	for range locks {
+		select {
+		case got := <-acquired:
+			if got.err != nil {
+				t.Fatalf("Acquire: %v", got.err)
+			}
+			if got.id.Sequence <= previous {
+				t.Fatalf("acquired sequence %d after %d: the queue is out of order",
+					got.id.Sequence, previous)
+			}
+			previous = got.id.Sequence
+			if err := locks[got.index].Release(); err != nil {
+				t.Fatalf("Release: %v", err)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatal("a queued candidate never acquired the lock")
+		}
+	}
+	if remaining := f.lockNodes(testLockPath()); len(remaining) != 0 {
+		t.Fatalf("lock nodes left behind: %v", remaining)
+	}
+}
+
+// TestConcurrentMaintainVerifyAndRelease is a race-detector test: the loss can
+// be recorded by whichever path notices first, and all of them must agree on
+// one outcome.
+func TestConcurrentMaintainVerifyAndRelease(t *testing.T) {
+	f := newFakeZK()
+	lock := newTestLock(t, f, serverUUID)
+	if _, err := lock.Acquire(context.Background(), testLockData(t)); err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	wg.Add(4)
+	go func() {
+		defer wg.Done()
+		<-start
+		_ = lock.Maintain(context.Background())
+	}()
+	for i := 0; i < 2; i++ {
+		go func() {
+			defer wg.Done()
+			<-start
+			for j := 0; j < 20; j++ {
+				_ = lock.Verify()
+				_, _ = lock.LockID()
+				_ = lock.LossReason()
+			}
+		}()
+	}
+	go func() {
+		defer wg.Done()
+		<-start
+		_ = lock.Release()
+	}()
+	close(start)
+	wg.Wait()
+
+	if _, ok := lock.LockID(); ok {
+		t.Fatal("the lock is still held after Release")
+	}
+	if lock.LossReason() == LossNone {
+		t.Fatal("the lock ended without recording a reason")
+	}
+}
+
+func TestParseLockNode(t *testing.T) {
+	tests := []struct {
+		name string
+		node string
+		want LockID
+		ok   bool
+	}{
+		{"holder", "zlock#" + serverUUID + "#0000000000", LockID{UUID: serverUUID, Sequence: 0}, true},
+		{"later generation", "zlock#" + serverUUID + "#0000000042", LockID{UUID: serverUUID, Sequence: 42}, true},
+		{"no prefix", serverUUID + "#0000000000", LockID{}, false},
+		{"wrong prefix", "lock#" + serverUUID + "#0000000000", LockID{}, false},
+		{"no separator", "zlock#" + serverUUID + "0000000000", LockID{}, false},
+		{"not a uuid", "zlock#shoal#0000000000", LockID{}, false},
+		{"short sequence", "zlock#" + serverUUID + "#000000000", LockID{}, false},
+		{"long sequence", "zlock#" + serverUUID + "#00000000000", LockID{}, false},
+		{"non-numeric sequence", "zlock#" + serverUUID + "#00000000zz", LockID{}, false},
+		{"negative sequence", "zlock#" + serverUUID + "#-000000001", LockID{}, false},
+		{"past the 32-bit counter", "zlock#" + serverUUID + "#9999999999", LockID{}, false},
+		{"empty", "", LockID{}, false},
+		{"directory marker", "zlock#", LockID{}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := ParseLockNode(tt.node)
+			if ok != tt.ok || got != tt.want {
+				t.Fatalf("ParseLockNode(%q) = %s, %v; want %s, %v", tt.node, got, ok, tt.want, tt.ok)
+			}
+		})
+	}
+}
+
+// TestSortLockNodesIgnoresStrangers keeps a stray child from displacing a real
+// holder. Accumulo's validateAndSort drops anything that is not a lock node,
+// and a directory with a leftover file in it must still resolve to the same
+// holder in both implementations.
+func TestSortLockNodesIgnoresStrangers(t *testing.T) {
+	holder := "zlock#" + serverUUID + "#0000000001"
+	queued := "zlock#" + otherUUID + "#0000000009"
+	got := sortLockNodes([]string{
+		queued,
+		"notes.txt",
+		"zlock#not-a-uuid#0000000000",
+		holder,
+		"zlock#" + managerUUID + "#bad",
+	})
+	want := []string{holder, queued}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("sortLockNodes = %v, want %v", got, want)
+	}
+	if len(sortLockNodes(nil)) != 0 {
+		t.Fatal("an empty directory must produce no candidates")
+	}
+}
+
+func TestFindLowestPrevPrefix(t *testing.T) {
+	first := "zlock#" + otherUUID + "#0000000000"
+	second := "zlock#" + otherUUID + "#0000000001"
+	third := "zlock#" + managerUUID + "#0000000002"
+	ours := "zlock#" + serverUUID + "#0000000003"
+
+	tests := []struct {
+		name   string
+		sorted []string
+		index  int
+		want   string
+	}{
+		{"single predecessor", []string{first, ours}, 1, first},
+		{"predecessor with duplicates", []string{first, second, ours}, 2, first},
+		{"nearest holder only", []string{first, second, third, ours}, 3, third},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := findLowestPrevPrefix(tt.sorted, tt.index); got != tt.want {
+				t.Fatalf("findLowestPrevPrefix = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestTabletServerLockPath(t *testing.T) {
+	if got, want := TabletServerLockPath(testInstancePath, "ingest", testAddress),
+		testInstancePath+"/tservers/ingest/"+testAddress; got != want {
+		t.Fatalf("TabletServerLockPath = %q, want %q", got, want)
+	}
+	if got, want := TabletServerLockPath(testInstancePath, "", testAddress),
+		testInstancePath+"/tservers/default/"+testAddress; got != want {
+		t.Fatalf("an unset group must mean %q: got %q, want %q", DefaultResourceGroup, got, want)
+	}
+}
+
+func TestNewServiceLockValidatesItsOptions(t *testing.T) {
+	f := newFakeZK()
+	if _, err := NewServiceLock(nil, ServiceLockOptions{Path: testLockPath()}); err == nil {
+		t.Fatal("NewServiceLock accepted a nil connection")
+	}
+	for _, tt := range []struct {
+		name string
+		opts ServiceLockOptions
+		want error
+	}{
+		{"empty path", ServiceLockOptions{}, ErrInvalidLockPath},
+		{"relative path", ServiceLockOptions{Path: "tservers/default"}, ErrInvalidLockPath},
+		{"zookeeper root", ServiceLockOptions{Path: "/"}, ErrInvalidLockPath},
+		{"bad uuid", ServiceLockOptions{Path: testLockPath(), UUID: "shoal-1"}, ErrInvalidLock},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := NewServiceLock(f, tt.opts); !errors.Is(err, tt.want) {
+				t.Fatalf("NewServiceLock: want %v, got %v", tt.want, err)
+			}
+		})
+	}
+	if _, err := NewServiceLock(f, ServiceLockOptions{
+		Path:           testLockPath(),
+		VerifyInterval: -time.Second,
+	}); err == nil {
+		t.Fatal("NewServiceLock accepted a negative verify interval")
+	}
+	// An unset UUID is minted, because a process that has not been given an
+	// identity still needs one that is nobody else's.
+	lock, err := NewServiceLock(f, ServiceLockOptions{Path: testLockPath()})
+	if err != nil {
+		t.Fatalf("NewServiceLock: %v", err)
+	}
+	if _, ok := ParseLockNode(zLockPrefix + lock.UUID() + "#0000000000"); !ok {
+		t.Fatalf("minted uuid %q cannot name a lock node", lock.UUID())
+	}
+	if lock.Path() != testLockPath() {
+		t.Fatalf("Path() = %q, want %q", lock.Path(), testLockPath())
+	}
+}
+
+func TestLossReasonString(t *testing.T) {
+	for reason, want := range map[LossReason]string{
+		LossNone:          "NONE",
+		LossNodeDeleted:   "NODE_DELETED",
+		LossUnmonitorable: "UNMONITORABLE",
+		LossSuperseded:    "SUPERSEDED",
+		LossReleased:      "RELEASED",
+		LossReason(42):    "LossReason(42)",
+	} {
+		if got := reason.String(); got != want {
+			t.Fatalf("LossReason(%d).String() = %q, want %q", int(reason), got, want)
+		}
+	}
+}

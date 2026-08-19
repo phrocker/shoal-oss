@@ -21,9 +21,12 @@
 # Tablet hosting lifecycle and fencing
 
 Status: **partial**. The fenced lifecycle state machine
-(`internal/tserver`) has landed. ServiceLock acquisition, the manager RPC
-surface, and tablet data loading are not wired to it yet — see
-[§6](#6-what-is-not-here-yet). Tracking issue: #67.
+(`internal/tserver`) has landed, and so has the ZooKeeper registration
+that makes it visible to a manager: the tablet-server ServiceLock, the
+service descriptors the manager reads, and the manager-lock observation
+that supplies live manager authority — see [§6](#6-registering-with-zookeeper).
+The manager RPC surface and tablet data loading are not wired to it yet
+— see [§7](#7-what-is-not-here-yet). Tracking issue: #67.
 
 ## 1. Goal
 
@@ -234,22 +237,114 @@ A `LockID` is only usable as fencing authority if it could name a real
 fit the signed 32-bit counter Accumulo reads with `Integer.parseInt`.
 The same checks live in `internal/zk`'s node parser.
 
-## 6. What is not here yet
+## 6. Registering with ZooKeeper
+
+A fenced state machine nobody can see is not a tablet server. Three
+pieces turn it into one, and none of them decide anything: they publish
+presence, and they read authority.
+
+### The lock node
+
+`ServiceLock` implements Accumulo's protocol as written, because the
+manager and every Java client already implement the other half of it. It
+creates an ephemeral sequential `zlock#<uuid>#<sequence>` node under
+`<instance>/tservers/<group>/<address>` with the `ZooUtil.PUBLIC` ACL,
+creating the resource-group path when it is the first server to use it,
+the way `ServiceLockSupport.createNonHaServiceLockPath` does. The holder
+is the lowest sequence that survives `validateAndSort`; a candidate that
+is not the holder queues behind the holder's **lowest** node rather than
+its immediate predecessor, so it wakes when that process leaves rather
+than when it tidies up a duplicate of its own.
+
+Duplicates are real: a create whose response was lost still created a
+node, and a retry creates another. Both carry this process's UUID, so
+the first is kept and the rest are deleted — otherwise one process would
+hold several places in line and leave a node behind when it released.
+
+A cancelled acquisition deletes whatever it created. An abandoned
+ephemeral node keeps its place in the queue until the session ends, which
+is a range nobody hosts for no reason.
+
+### What the node says
+
+The payload is `ServiceLockData` in the exact Gson wire form the manager
+reads — a `descriptors` array of `{uuid, service, address, group}` — and a
+tablet server publishes the same five services a Java one does: `CLIENT`,
+`TABLET_INGEST`, `TABLET_MANAGEMENT`, `TABLET_SCAN`, `TSERV`.
+
+The advertisement is refused rather than published when it would mislead
+the manager: no descriptors, an address that is empty, unbound, or not
+`host:port`, an unknown service, or two descriptors for one service —
+which Accumulo's `EnumMap` would silently collapse to whichever arrived
+last. A claim the manager cannot act on is worse than staying invisible,
+because it draws work to a process that cannot do it.
+
+That cuts both ways: a process should advertise what it can serve, not
+what it intends to serve. `TabletServerServices()` names the full Java
+set, but the caller chooses the subset, and until the Thrift endpoints
+behind a service exist, advertising it routes work into a black hole.
+
+### Holding it, and letting go
+
+`Maintain` watches the node and returns when the generation ends.
+Anything it cannot prove is treated as a loss: a watch that cannot be
+established, a session that expired, a watch the client tore down. That
+mirrors `LockWatcher.unableToMonitorLockNode`, where the Java tablet
+server halts — a lock this process cannot monitor is one it cannot prove
+it still holds, and hosting on an unprovable lock is exactly what
+[§4](#4-the-fence) exists to stop.
+
+An optional verify interval re-reads the directory on a timer. It catches
+what a watch cannot: a watch dropped without an event, and a lock
+directory deleted and recreated, which restarts ZooKeeper's sequence
+counter and lets a later arrival take a lower number than the one held
+here. The node is still there; it is simply no longer the holder.
+
+`Participate` is the only place ZooKeeper reality meets the fence. It
+acquires, hands the acquired generation to `AdoptLock`, watches it, and
+on the way out calls `LoseLock` with **that** generation before deleting
+the node. The order matters: deleting the node first would tell the
+manager these tablets may be placed elsewhere while this process still
+claimed them. If the host refuses the generation — one that is not newer
+than a generation it already used — the lock is given back rather than
+held, so the manager can place the work on a server that will take it.
+
+### Reading the manager's lock
+
+`Host` refuses every manager-directed transition until it has been told
+which manager is live, and [§2](#2-the-manager-is-the-only-authority) is
+why: authority is read from ZooKeeper, never inferred from the requests
+that arrive. `WatchManagerLock` supplies it by reading the manager's own
+ServiceLock directory and taking the lowest node — the same rule
+`internal/zk` applies to resolve the manager's address, so the standby
+managers queued behind it are not mistaken for authority.
+
+Two failures that look alike are kept apart. A directory that cannot be
+read leaves the previous observation in place, because failing to reach
+ZooKeeper is not evidence the manager changed and withdrawing authority
+would refuse the live manager's assignments for nothing. A directory that
+is readable and holds no lock is evidence, and clears it. An observation
+the host refuses — an epoch older than one it has already seen — is
+dropped, so authority never moves backwards.
+
+## 7. What is not here yet
 
 This is the lifecycle core only. Still to land for #67:
 
-- acquiring and maintaining the real ServiceLock in ZooKeeper, and
-  registering health, resource group, address, version, and capability
-  descriptors the manager reads
 - the manager-facing Thrift surface that turns RPCs into `Assign` /
   `Unassign` calls and reports `TabletServerStatus`
 - loading tablet metadata, file and log references, table properties,
   constraints, and iterator configuration behind `StateLoading`
+- advertising `TSERV` and the `TABLET_*` services for real, which is safe
+  only once the Thrift endpoints behind them exist
+- the process wiring that owns the ZooKeeper session, chooses the
+  advertised address and resource group, and restarts participation after
+  a lock loss
 - publishing the `Metrics()` counters through the observability endpoints
 - end-to-end tests against a live manager, including migration to and
   from a Java tserver and rolling mixed-fleet replacement
 
-## 7. Metrics
+## 8. Metrics
 
 `Host.Metrics()` snapshots the operational surface #67 asks for:
 `Loading` / `Hosted` / `Unloading` gauges, and counters for

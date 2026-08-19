@@ -1,0 +1,90 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+package tserver
+
+import (
+	"context"
+	"errors"
+	"fmt"
+)
+
+// Participate holds one tablet-server ServiceLock generation on behalf of a
+// Host, and keeps the two in step for exactly as long as the lock lasts.
+//
+// It acquires the lock, hands the generation to the host, watches it, and when
+// the generation ends — lost, or given up because ctx ended — drops every
+// tablet the host was claiming under it and passes them to release so the
+// caller can close them.
+//
+// The order on the way out is deliberate: the host stops claiming tablets
+// before the lock node is deleted. Deleting the node first would tell the
+// manager it may place those tablets elsewhere while this process still
+// claimed them.
+//
+// It covers one generation and returns when that generation is over. A process
+// that means to rejoin builds a new ServiceLock and calls Participate again;
+// the new node necessarily carries a higher sequence, which is what
+// Host.AdoptLock requires and what makes a rejoin distinguishable from a
+// replay of the generation that just ended.
+//
+// Returns an error wrapping ErrLockLost when the lock ended on its own, or
+// ctx.Err() when the caller ended it. Both mean the same thing to the host:
+// nothing is hosted here any more.
+func Participate(
+	ctx context.Context,
+	lock *ServiceLock,
+	host *Host,
+	data ServiceLockData,
+	release func([]Extent),
+) error {
+	if lock == nil {
+		return errors.New("tserver: nil service lock")
+	}
+	if host == nil {
+		return errors.New("tserver: nil host")
+	}
+	id, err := lock.Acquire(ctx, data)
+	if err != nil {
+		return err
+	}
+	if err := host.AdoptLock(id); err != nil {
+		// The lock is held but the host will not fence with it, so this
+		// process would sit in ZooKeeper looking like a live tablet server
+		// while refusing everything the manager asked of it. Give the lock
+		// back instead, so the manager can place the work on a server that
+		// will take it.
+		if releaseErr := lock.Release(); releaseErr != nil {
+			return fmt.Errorf("adopt %s: %w (releasing it also failed: %w)", id, err, releaseErr)
+		}
+		return fmt.Errorf("adopt %s: %w", id, err)
+	}
+
+	maintainErr := lock.Maintain(ctx)
+
+	dropped := host.LoseLock(id)
+	if release != nil && len(dropped) > 0 {
+		release(dropped)
+	}
+	if releaseErr := lock.Release(); releaseErr != nil {
+		// Both facts matter: why the generation ended, and that its node may
+		// still be in ZooKeeper. Joining them keeps errors.Is working for the
+		// first while the second stays visible to an operator.
+		return errors.Join(maintainErr, releaseErr)
+	}
+	return maintainErr
+}
