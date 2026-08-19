@@ -585,7 +585,10 @@ func TestDrainCoordinatorReleasesRefusedJobsWithPreciseClass(t *testing.T) {
 		{
 			name: "row-fenced input file",
 			mutate: func(j *tabletserver.TExternalCompactionJob) {
-				j.Files[0].MetadataFileEntry = `{"path":"hdfs://nn/t/2/F0001.rf","startRow":"d","endRow":"k"}`
+				// The rows travel base64-encoded
+				// (ByteArrayToBase64TypeAdapter); "ZA==" and "aw==" are
+				// "d" and "k".
+				j.Files[0].MetadataFileEntry = `{"path":"hdfs://nn/t/2/F0001.rf","startRow":"ZA==","endRow":"aw=="}`
 			},
 			wantClass: compactjob.ClassRangedInputFile,
 			wantLog:   "field=files[0]",

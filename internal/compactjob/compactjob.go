@@ -54,6 +54,8 @@ package compactjob
 
 import (
 	"bytes"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -211,11 +213,18 @@ type Options struct {
 	// compaction composer default. A caller that has read the table's
 	// configuration should pass the table's codec here so the output
 	// matches what Java would have written.
+	//
+	// The value is the writer's codec name (block.CodecNone,
+	// block.CodecGzip, block.CodecSnappy), not the Accumulo property
+	// spelling: the override path maps "gzip" onto block.CodecGzip, and
+	// a default skips that mapping. Anything else is refused rather
+	// than carried into a plan the writer would reject.
 	DefaultCodec string
 
 	// DefaultBlockSize is the output data-block threshold used when the
 	// job carries no table.file.compress.blocksize override. Zero defers
-	// to the RFile writer default.
+	// to the RFile writer default. Negative values, and values past the
+	// same cap the override honors, are refused.
 	DefaultBlockSize int
 
 	// Limits bounds the job's inputs. The zero value is unlimited; pass
@@ -541,8 +550,21 @@ func translateKind(job *tabletserver.TExternalCompactionJob) (tabletserver.TComp
 	fateID := ""
 	if job.IsSetFateId() && job.GetFateId() != nil {
 		fate := job.GetFateId()
-		if fate.GetTxUUIDStr() == "" {
-			return kind, "", refuse(ClassMalformedJob, "fateId", "empty transaction uuid")
+		// FateId.fromThrift switches over TFateInstanceType with only
+		// USER and META arms and then requires UuidUtil.isUUID, so a
+		// value Java would throw on must not become a plan here: the
+		// unknown enum would stringify to "<UNSET>" and a malformed
+		// uuid would follow the job into every log line as if it named
+		// a real transaction.
+		switch fate.GetType() {
+		case manager.TFateInstanceType_META, manager.TFateInstanceType_USER:
+		default:
+			return kind, "", refuse(ClassMalformedJob, "fateId",
+				"unknown FATE instance type %d", int64(fate.GetType()))
+		}
+		if txUUID := fate.GetTxUUIDStr(); !isCanonicalUUID(txUUID) {
+			return kind, "", refuse(ClassMalformedJob, "fateId",
+				"transaction uuid %q is not a canonical uuid", txUUID)
 		}
 		fateID = fateIDString(fate)
 	}
@@ -555,6 +577,32 @@ func translateKind(job *tabletserver.TExternalCompactionJob) (tabletserver.TComp
 
 func fateIDString(fate *manager.TFateId) string {
 	return fate.GetType().String() + ":" + fate.GetTxUUIDStr()
+}
+
+// isCanonicalUUID mirrors UuidUtil.isUUID, the check FateId.fromThrift
+// applies to a transaction id: exactly 36 characters, '-' at offsets 8,
+// 13, 18 and 23, and hex everywhere else. It is deliberately stricter
+// than uuid.Parse, which also accepts the urn, braced and unhyphenated
+// forms Java rejects here.
+func isCanonicalUUID(s string) bool {
+	if len(s) != 36 {
+		return false
+	}
+	for i := 0; i < 36; i++ {
+		c := s[i]
+		switch i {
+		case 8, 13, 18, 23:
+			if c != '-' {
+				return false
+			}
+		default:
+			isHex := (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
+			if !isHex {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // parsedInput is one structurally valid input entry, carrying the fence
@@ -671,6 +719,14 @@ func decodeFileEntry(entry, field string) (parsedInput, error) {
 		in.file.Path = entry
 		return in, nil
 	}
+	// The fence must be read before the path: an entry that merely
+	// omits startRow or endRow would otherwise decode to empty strings
+	// and be indistinguishable from a whole-file entry, which is the
+	// one misreading that silently widens a compaction's input beyond
+	// the range the manager authorized.
+	if err := checkFenceFields(entry, field); err != nil {
+		return parsedInput{}, err
+	}
 	decoded, err := metadata.DecodeStoredTabletFile([]byte(entry))
 	if err != nil {
 		return parsedInput{}, refuse(ClassMalformedJob, field,
@@ -679,6 +735,57 @@ func decodeFileEntry(entry, field string) (parsedInput, error) {
 	in.file.Path = decoded.Path
 	in.startRow, in.endRow = decoded.StartRow, decoded.EndRow
 	return in, nil
+}
+
+// checkFenceFields enforces the two StoredTabletFile invariants a Go
+// struct decode cannot express.
+//
+// StoredTabletFile.deserialize calls Objects.requireNonNull on path,
+// startRow and endRow, so an entry missing either row field is not a
+// whole-file entry — it is an entry Java refuses to parse at all. And
+// the rows are byte arrays written through ByteArrayToBase64TypeAdapter
+// (Base64.getUrlEncoder), so a value outside that alphabet is equally
+// unparseable. Only a present, well-encoded, zero-length row means
+// "unbounded on this side" (decodeRow returns null for an empty array).
+func checkFenceFields(entry, field string) error {
+	var probe struct {
+		StartRow *string `json:"startRow"`
+		EndRow   *string `json:"endRow"`
+	}
+	if err := json.Unmarshal([]byte(entry), &probe); err != nil {
+		return refuse(ClassMalformedJob, field,
+			"undecodable StoredTabletFile entry: %v", err)
+	}
+	for _, row := range []struct {
+		name  string
+		value *string
+	}{{"startRow", probe.StartRow}, {"endRow", probe.EndRow}} {
+		if row.value == nil {
+			return refuse(ClassMalformedJob, field,
+				"StoredTabletFile is missing %s; a fence is absent only when the field is present and empty",
+				row.name)
+		}
+		if err := checkBase64Row(*row.value); err != nil {
+			return refuse(ClassMalformedJob, field,
+				"StoredTabletFile %s %q: %v", row.name, *row.value, err)
+		}
+	}
+	return nil
+}
+
+// checkBase64Row accepts the row encodings Base64.getUrlDecoder accepts:
+// the URL-safe alphabet, with or without trailing padding.
+func checkBase64Row(value string) error {
+	if value == "" {
+		return nil
+	}
+	if _, err := base64.URLEncoding.DecodeString(value); err == nil {
+		return nil
+	}
+	if _, err := base64.RawURLEncoding.DecodeString(value); err != nil {
+		return errors.New("not url-safe base64")
+	}
+	return nil
 }
 
 // tmpSuffix renders the "_tmp_<ecid>" tail the coordinator appends to
@@ -824,6 +931,12 @@ func parseOverrides(overrides map[string]string) ([]string, int64, error) {
 // ignored: an override exists precisely because someone wanted this
 // compaction to behave differently, and silently dropping it would
 // produce an output that does not match the request.
+//
+// The resolved values are checked too, not just the overrides. A plan is
+// a promise that compaction.Compact can run the job, so a codec or block
+// size that only ever came from Options must fail here — as a refusal
+// the coordinator can act on — rather than deep inside the writer after
+// the slot has been taken.
 func resolveOutputEncoding(
 	overrides map[string]string,
 	keys []string,
@@ -862,7 +975,37 @@ func resolveOutputEncoding(
 				"shoal cannot honor this override when writing the output RFile")
 		}
 	}
+	// Only an Options-sourced value can still be bad: every override
+	// above was validated before it was assigned.
+	if codec != "" && !supportedOutputCodecs[codec] {
+		return "", 0, refuse(ClassUnsupportedProperty, "options.defaultCodec",
+			"configured default codec %q is not one of %s", codec, supportedCodecList())
+	}
+	if blockSize < 0 || int64(blockSize) > maxBlockSize {
+		return "", 0, refuse(ClassUnsupportedProperty, "options.defaultBlockSize",
+			"configured default block size %d is outside the supported range (0..%d bytes, 0 for the writer default)",
+			blockSize, maxBlockSize)
+	}
 	return codec, blockSize, nil
+}
+
+// supportedOutputCodecs is the set of codec names a Plan may carry,
+// derived from accumuloCodecs so the two cannot drift apart.
+var supportedOutputCodecs = func() map[string]bool {
+	set := make(map[string]bool, len(accumuloCodecs))
+	for _, codec := range accumuloCodecs {
+		set[codec] = true
+	}
+	return set
+}()
+
+func supportedCodecList() string {
+	names := make([]string, 0, len(supportedOutputCodecs))
+	for name := range supportedOutputCodecs {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return strings.Join(names, ", ")
 }
 
 func isCryptoOverride(key string) bool {

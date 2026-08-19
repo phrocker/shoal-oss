@@ -19,6 +19,7 @@ package compactjob
 
 import (
 	"bytes"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -52,8 +53,14 @@ func storedFile(path string) string {
 
 // fencedFile renders a row-fenced StoredTabletFile entry — a file whose
 // referenced range is only part of the underlying RFile.
+//
+// The rows travel as byte arrays through ByteArrayToBase64TypeAdapter,
+// which uses Base64.getUrlEncoder, so callers pass the logical row and
+// the helper renders the wire form.
 func fencedFile(path, start, end string) string {
-	return fmt.Sprintf(`{"path":"%s","startRow":"%s","endRow":"%s"}`, path, start, end)
+	return fmt.Sprintf(`{"path":"%s","startRow":"%s","endRow":"%s"}`,
+		path, base64.URLEncoding.EncodeToString([]byte(start)),
+		base64.URLEncoding.EncodeToString([]byte(end)))
 }
 
 // validJob is a well-formed SYSTEM compaction of two whole files, the
@@ -261,6 +268,97 @@ func TestTranslateRefusesFencedInput(t *testing.T) {
 	}
 }
 
+// TestTranslateRefusesEntryWithoutBothFenceFields is the counterpart to
+// the fence gate above: it pins that "no fence" is a positive statement
+// the entry has to make. StoredTabletFile.deserialize calls
+// Objects.requireNonNull on startRow and endRow, so an entry that omits
+// one is unparseable to Java — and if shoal read it as an empty string
+// it would call the file whole and merge rows the manager never put in
+// this compaction's range.
+func TestTranslateRefusesEntryWithoutBothFenceFields(t *testing.T) {
+	for _, tt := range []struct {
+		name  string
+		entry string
+		want  string
+	}{
+		{
+			name:  "startRow absent",
+			entry: `{"path":"hdfs://nn/t/2/F0002.rf","endRow":""}`,
+			want:  "startRow",
+		},
+		{
+			name:  "endRow absent",
+			entry: `{"path":"hdfs://nn/t/2/F0002.rf","startRow":""}`,
+			want:  "endRow",
+		},
+		{
+			name:  "both absent",
+			entry: `{"path":"hdfs://nn/t/2/F0002.rf"}`,
+			want:  "startRow",
+		},
+		{
+			name:  "startRow explicitly null",
+			entry: `{"path":"hdfs://nn/t/2/F0002.rf","startRow":null,"endRow":""}`,
+			want:  "startRow",
+		},
+		{
+			name:  "endRow explicitly null",
+			entry: `{"path":"hdfs://nn/t/2/F0002.rf","startRow":"","endRow":null}`,
+			want:  "endRow",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			job := validJob()
+			job.Files[1].MetadataFileEntry = tt.entry
+
+			r := assertRefused(t, job, Options{}, ClassMalformedJob, "files[1]")
+			if !strings.Contains(r.Detail, tt.want) {
+				t.Fatalf("detail = %q, want it to name the missing %s", r.Detail, tt.want)
+			}
+		})
+	}
+}
+
+// TestTranslateRefusesUndecodableFenceRows covers the other half of the
+// fence contract: the rows are base64 (Base64.getUrlEncoder), so a value
+// outside that alphabet is a parse failure in Java, not a fence.
+func TestTranslateRefusesUndecodableFenceRows(t *testing.T) {
+	for _, tt := range []struct {
+		name  string
+		entry string
+	}{
+		{
+			name:  "startRow is not base64",
+			entry: `{"path":"hdfs://nn/t/2/F0002.rf","startRow":"d","endRow":""}`,
+		},
+		{
+			name:  "endRow uses the non-url alphabet",
+			entry: `{"path":"hdfs://nn/t/2/F0002.rf","startRow":"","endRow":"a+/b"}`,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			job := validJob()
+			job.Files[1].MetadataFileEntry = tt.entry
+
+			r := assertRefused(t, job, Options{}, ClassMalformedJob, "files[1]")
+			if !strings.Contains(r.Detail, "base64") {
+				t.Fatalf("detail = %q, want it to name the encoding", r.Detail)
+			}
+		})
+	}
+}
+
+// TestTranslateAcceptsUnpaddedFenceRows pins the leniency boundary:
+// Base64.getUrlDecoder accepts input with or without trailing padding,
+// so an unpadded row is a fence, not a malformed entry.
+func TestTranslateAcceptsUnpaddedFenceRows(t *testing.T) {
+	job := validJob()
+	job.Files[1].MetadataFileEntry =
+		`{"path":"hdfs://nn/t/2/F0002.rf","startRow":"AQID","endRow":"AQI"}`
+
+	assertRefused(t, job, Options{}, ClassRangedInputFile, "files[1]")
+}
+
 // TestTranslateRefusesMalformedJobs walks the structural checks. Every
 // one of these would produce an uncommittable or cell-losing compaction,
 // so each must come back as a malformed-job refusal naming its field.
@@ -425,6 +523,69 @@ func TestTranslateRefusesMalformedJobs(t *testing.T) {
 			wantField: "fateId",
 		},
 		{
+			// FateId.fromThrift switches over TFateInstanceType with
+			// only USER and META arms; an unknown ordinal throws there
+			// and stringifies to "<UNSET>" here.
+			name: "fate id with an unknown instance type",
+			mutate: func(j *tabletserver.TExternalCompactionJob) {
+				j.Kind = tabletserver.TCompactionKind_USER
+				j.FateId = &manager.TFateId{
+					Type:      manager.TFateInstanceType(7),
+					TxUUIDStr: "b7f1c0de-0000-4000-8000-00000000abcd",
+				}
+			},
+			wantField: "fateId",
+		},
+		{
+			// UuidUtil.isUUID demands the canonical 36-character form.
+			name: "fate id transaction is not a uuid",
+			mutate: func(j *tabletserver.TExternalCompactionJob) {
+				j.Kind = tabletserver.TCompactionKind_USER
+				j.FateId = &manager.TFateId{
+					Type:      manager.TFateInstanceType_USER,
+					TxUUIDStr: "transaction-7",
+				}
+			},
+			wantField: "fateId",
+		},
+		{
+			// uuid.Parse accepts the unhyphenated form; isUUID does not.
+			name: "fate id transaction uuid is unhyphenated",
+			mutate: func(j *tabletserver.TExternalCompactionJob) {
+				j.Kind = tabletserver.TCompactionKind_USER
+				j.FateId = &manager.TFateId{
+					Type:      manager.TFateInstanceType_USER,
+					TxUUIDStr: "b7f1c0de00004000800000000000abcd",
+				}
+			},
+			wantField: "fateId",
+		},
+		{
+			// Right length, wrong separator: isUUID demands '-' at
+			// offsets 8, 13, 18 and 23.
+			name: "fate id transaction uuid has a bad separator",
+			mutate: func(j *tabletserver.TExternalCompactionJob) {
+				j.Kind = tabletserver.TCompactionKind_USER
+				j.FateId = &manager.TFateId{
+					Type:      manager.TFateInstanceType_USER,
+					TxUUIDStr: "b7f1c0de_0000-4000-8000-00000000abcd",
+				}
+			},
+			wantField: "fateId",
+		},
+		{
+			// Right length and separators, non-hex digit.
+			name: "fate id transaction uuid has a non-hex digit",
+			mutate: func(j *tabletserver.TExternalCompactionJob) {
+				j.Kind = tabletserver.TCompactionKind_USER
+				j.FateId = &manager.TFateId{
+					Type:      manager.TFateInstanceType_USER,
+					TxUUIDStr: "b7f1c0dg-0000-4000-8000-00000000abcd",
+				}
+			},
+			wantField: "fateId",
+		},
+		{
 			name: "nil iterator setting",
 			mutate: func(j *tabletserver.TExternalCompactionJob) {
 				j.IteratorSettings = iterConfig(nil)
@@ -475,6 +636,32 @@ func TestTranslateRefusesMalformedJobs(t *testing.T) {
 
 func TestTranslateRefusesNilJob(t *testing.T) {
 	assertRefused(t, nil, Options{}, ClassMalformedJob, "")
+}
+
+// TestTranslateAcceptsBothFateInstanceTypes pins the enum arms Java
+// accepts: FateId.fromThrift maps USER and META, and the plan records
+// the same "TYPE:uuid" pairing FateId's canonical form uses.
+func TestTranslateAcceptsBothFateInstanceTypes(t *testing.T) {
+	const txUUID = "b7f1c0de-0000-4000-8000-00000000abcd"
+	for _, tt := range []struct {
+		name string
+		typ  manager.TFateInstanceType
+		want string
+	}{
+		{"user", manager.TFateInstanceType_USER, "USER:" + txUUID},
+		{"meta", manager.TFateInstanceType_META, "META:" + txUUID},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			job := validJob()
+			job.Kind = tabletserver.TCompactionKind_USER
+			job.FateId = &manager.TFateId{Type: tt.typ, TxUUIDStr: txUUID}
+
+			plan := mustTranslate(t, job, Options{})
+			if plan.FateID != tt.want {
+				t.Fatalf("FateID = %q, want %q", plan.FateID, tt.want)
+			}
+		})
+	}
 }
 
 // TestTranslateKeepsTheCoordinatorsTempOutputName is the wire-shape
@@ -826,6 +1013,68 @@ func TestTranslateOverridesResolveOutputEncoding(t *testing.T) {
 				t.Errorf("BlockSize = %d, want %d", plan.BlockSize, tt.wantBlockSize)
 			}
 		})
+	}
+}
+
+// TestTranslateRefusesUnusableOptionDefaults closes the gap between what
+// a Plan claims and what compaction.Compact accepts. The defaults are
+// this compactor's own configuration, so they never appear as overrides
+// and were previously copied into the plan unchecked — a job would then
+// be accepted, take the slot, and fail in the writer.
+func TestTranslateRefusesUnusableOptionDefaults(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		opts      Options
+		wantField string
+		wantIn    string
+	}{
+		{
+			name:      "codec shoal cannot write",
+			opts:      Options{DefaultCodec: "zstd"},
+			wantField: "options.defaultCodec",
+			wantIn:    "zstd",
+		},
+		{
+			// The override path accepts "gzip" and maps it to the
+			// writer's "gz"; a default skips that mapping, and the
+			// compressor only registers none, gz and snappy.
+			name:      "unmapped accumulo codec alias",
+			opts:      Options{DefaultCodec: "gzip"},
+			wantField: "options.defaultCodec",
+			wantIn:    "gzip",
+		},
+		{
+			name:      "negative block size",
+			opts:      Options{DefaultBlockSize: -1},
+			wantField: "options.defaultBlockSize",
+			wantIn:    "-1",
+		},
+		{
+			name:      "block size past the cap",
+			opts:      Options{DefaultBlockSize: maxBlockSize + 1},
+			wantField: "options.defaultBlockSize",
+			wantIn:    "outside the supported range",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			r := assertRefused(t, validJob(), tt.opts, ClassUnsupportedProperty, tt.wantField)
+			if !strings.Contains(r.Detail, tt.wantIn) {
+				t.Fatalf("detail = %q, want it to name %q", r.Detail, tt.wantIn)
+			}
+		})
+	}
+}
+
+// TestTranslateAcceptsAnOverrideOverAnUnusableDefault: the default only
+// matters when the job is silent, so an override that names a codec
+// shoal can write must still run.
+func TestTranslateAcceptsAnOverrideOverAnUnusableDefault(t *testing.T) {
+	job := validJob()
+	job.Overrides = map[string]string{propCompressType: "snappy"}
+
+	plan := mustTranslate(t, job, Options{DefaultCodec: "zstd"})
+	if plan.Codec != block.CodecSnappy {
+		t.Fatalf("Codec = %q, want %q", plan.Codec, block.CodecSnappy)
 	}
 }
 
