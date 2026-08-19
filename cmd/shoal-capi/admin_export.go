@@ -321,20 +321,21 @@ func shoal_connector_change_password(handle *C.shoal_connector, user *C.char, pa
 }
 
 //export shoal_connector_change_user_authorizations
-func shoal_connector_change_user_authorizations(handle *C.shoal_connector, user *C.char, values *C.shoal_bytes, count C.size_t, timeout C.int64_t, outError **C.shoal_error) C.shoal_status {
+func shoal_connector_change_user_authorizations(handle *C.shoal_connector, user *C.char, values *C.shoal_bytes, count C.size_t, timeout C.int64_t, outError **C.shoal_error) (status C.shoal_status) {
+	clearError(outError)
+	defer recoverStatus(&status, outError)
 	name, err := requiredString(user, "user")
 	if err != nil {
-		clearError(outError)
 		return fail(outError, C.SHOAL_STATUS_INVALID_ARGUMENT, err)
 	}
 	authorizations, err := copyBytesArray(values, count, "authorizations")
 	if err != nil {
-		clearError(outError)
 		return fail(outError, C.SHOAL_STATUS_INVALID_ARGUMENT, err)
 	}
-	return securityVoid(handle, timeout, outError, func(ctx context.Context, admin securityAdminAPI) error {
+	status = securityVoid(handle, timeout, outError, func(ctx context.Context, admin securityAdminAPI) error {
 		return admin.ChangeUserAuthorizations(ctx, name, authorizations)
 	})
+	return status
 }
 
 //export shoal_connector_get_user_authorizations
@@ -461,28 +462,28 @@ func securityVoid(handle *C.shoal_connector, timeout C.int64_t, outError **C.sho
 	return failOrOK(outError, err)
 }
 
-func mutateUserPassword(handle *C.shoal_connector, user *C.char, password *C.shoal_bytes, timeout C.int64_t, outError **C.shoal_error, call func(context.Context, securityAdminAPI, string, []byte) error) C.shoal_status {
+func mutateUserPassword(handle *C.shoal_connector, user *C.char, password *C.shoal_bytes, timeout C.int64_t, outError **C.shoal_error, call func(context.Context, securityAdminAPI, string, []byte) error) (status C.shoal_status) {
+	clearError(outError)
+	defer recoverStatus(&status, outError)
 	name, err := requiredString(user, "user")
 	if err != nil {
-		clearError(outError)
 		return fail(outError, C.SHOAL_STATUS_INVALID_ARGUMENT, err)
 	}
 	if password == nil {
-		clearError(outError)
 		return fail(outError, C.SHOAL_STATUS_INVALID_ARGUMENT, errors.New("shoal: password is required"))
 	}
 	value, err := copyBytes(password.data, password.length, "password")
 	if err != nil {
-		clearError(outError)
 		return fail(outError, C.SHOAL_STATUS_INVALID_ARGUMENT, err)
 	}
 	if value == nil {
 		value = []byte{}
 	}
 	defer zeroBytes(value)
-	return securityVoid(handle, timeout, outError, func(ctx context.Context, admin securityAdminAPI) error {
+	status = securityVoid(handle, timeout, outError, func(ctx context.Context, admin securityAdminAPI) error {
 		return call(ctx, admin, name, value)
 	})
+	return status
 }
 
 func securityBool(handle *C.shoal_connector, user, target *C.char, timeout C.int64_t, out *C.uint8_t, outError **C.shoal_error, call func(context.Context, securityAdminAPI, string, string) (bool, error)) (status C.shoal_status) {

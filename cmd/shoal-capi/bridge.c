@@ -872,9 +872,14 @@ size_t shoal_bridge_namespace_list_count(
 int shoal_bridge_namespace_list_get(const shoal_namespace_list_result *result,
                                     size_t index,
                                     shoal_namespace_view *out_namespace) {
-  return shoal_bridge_table_list_get(
-      (const shoal_table_list_result *)result, index,
-      (shoal_table_view *)out_namespace);
+  if (result == NULL || index >= result->count || out_namespace == NULL) {
+    return 0;
+  }
+  const shoal_bridge_table_entry *entry = &result->entries[index];
+  memset(out_namespace, 0, sizeof(*out_namespace));
+  out_namespace->name = entry->name;
+  out_namespace->id = entry->id;
+  return 1;
 }
 
 void shoal_bridge_namespace_list_free(shoal_namespace_list_result *result) {

@@ -457,7 +457,7 @@ int main(void) {
   assert(shoal_connector_list_table_splits(admin_connector, "events", 0,
                                            &bytes_list, &error) ==
          SHOAL_STATUS_OK);
-  assert(shoal_bytes_list_count(bytes_list) == 2);
+  assert(shoal_bytes_list_count(bytes_list) == 3);
   shoal_bytes_list_free(&bytes_list);
   expect_error(shoal_connector_add_table_splits(admin_connector, "events",
                                                 NULL, 0, 0, &error),

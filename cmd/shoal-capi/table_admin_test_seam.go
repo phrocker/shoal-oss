@@ -10,6 +10,7 @@ package main
 import "C"
 
 import (
+	"bytes"
 	"context"
 	"sort"
 	"strconv"
@@ -543,7 +544,15 @@ func (c *testAdminConnector) AddTableSplits(ctx context.Context, table string, s
 	if _, ok := c.tables[table]; !ok {
 		return accumulo.ErrTableNotFound
 	}
-	c.splits[table] = cloneRows(splits)
+	merged := append(cloneRows(c.splits[table]), cloneRows(splits)...)
+	sort.Slice(merged, func(i, j int) bool { return bytes.Compare(merged[i], merged[j]) < 0 })
+	deduped := merged[:0]
+	for _, split := range merged {
+		if len(deduped) == 0 || !bytes.Equal(deduped[len(deduped)-1], split) {
+			deduped = append(deduped, split)
+		}
+	}
+	c.splits[table] = deduped
 	return nil
 }
 
