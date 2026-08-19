@@ -21,6 +21,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -30,9 +31,12 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
+	azblob "github.com/Azure/azure-sdk-for-go/sdk/storage/azblob"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/bloberror"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blockblob"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/service"
@@ -544,22 +548,118 @@ func TestIsTemporaryStageNameMatchesOnlyReservedFormats(t *testing.T) {
 }
 
 func TestBackendCreateWithCustomServiceClientRejectsMissingSourceAuthorizationBeforeStaging(t *testing.T) {
-	backend, ops := newCustomServiceBackend(t)
-	etag := azcore.ETag("\"old\"")
-	ops.objects["target"] = fakeAzureObject{
-		state: azureObjectState{etag: &etag, size: 3},
-		data:  "old",
+	accountKey := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0x42}, 32))
+	sharedKey, err := azblob.NewSharedKeyCredential("account", accountKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sharedKeyClient, err := service.NewClientWithSharedKeyCredential(
+		"https://account.blob.core.windows.net/", sharedKey, nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := &recordingTokenCredential{token: "private-token"}
+	tokenClient, err := service.NewClient("https://account.blob.core.windows.net/", token, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	customClient, err := service.NewClientWithNoCredential("https://account.blob.core.windows.net/", nil)
+	if err != nil {
+		t.Fatal(err)
 	}
 
-	if _, err := backend.Create(context.Background(), "az://container/target"); err == nil || !strings.Contains(err.Error(), "no source authorization configured") {
-		t.Fatalf("Create error = %v, want explicit source authorization failure", err)
+	for _, tc := range []struct {
+		name   string
+		client *service.Client
+		secret string
+	}{
+		{name: "shared-key", client: sharedKeyClient, secret: accountKey},
+		{name: "token", client: tokenClient, secret: token.token},
+		{name: "custom", client: customClient},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			backend, ops := newCustomServiceBackendWithClient(t, tc.client)
+			etag := azcore.ETag("\"old\"")
+			ops.objects["target"] = fakeAzureObject{
+				state: azureObjectState{etag: &etag, size: 3},
+				data:  "old",
+			}
+
+			_, err := backend.Create(context.Background(), "az://container/target")
+			if err == nil || !strings.Contains(err.Error(), "no source authorization configured") {
+				t.Fatalf("Create error = %v, want explicit source authorization failure", err)
+			}
+			if tc.secret != "" && strings.Contains(err.Error(), tc.secret) {
+				t.Fatalf("Create error leaked credential: %v", err)
+			}
+			if got := ops.objects["target"].data; got != "old" {
+				t.Fatalf("target data = %q, want old", got)
+			}
+			if len(ops.objects) != 1 {
+				t.Fatalf("objects after failed Create = %d, want only the original target", len(ops.objects))
+			}
+		})
 	}
-	if got := ops.objects["target"].data; got != "old" {
-		t.Fatalf("target data = %q, want old", got)
+	if token.calls != 0 {
+		t.Fatalf("opaque service client token credential was unexpectedly inspected %d times", token.calls)
 	}
-	if len(ops.objects) != 1 {
-		t.Fatalf("objects after failed Create = %d, want only the original target", len(ops.objects))
+}
+
+func TestCredentialAwareCopySourcesDoNotLeakRawCredentials(t *testing.T) {
+	svc, err := service.NewClientWithNoCredential("https://account.blob.core.windows.net/", nil)
+	if err != nil {
+		t.Fatal(err)
 	}
+	raw := rawAzureCopySourceProvider{svc: svc}
+
+	t.Run("token authorization header", func(t *testing.T) {
+		credential := &recordingTokenCredential{token: "private-token"}
+		source, err := (tokenAzureCopySourceProvider{
+			rawAzureCopySourceProvider: raw,
+			cred:                       credential,
+		}).source(context.Background(), "container", "private-stage")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if source.authorization == nil || *source.authorization != "Bearer private-token" {
+			t.Fatalf("authorization = %v, want bearer token", source.authorization)
+		}
+		if strings.Contains(source.url, credential.token) {
+			t.Fatalf("source URL leaked bearer token: %s", source.url)
+		}
+		if credential.calls != 1 {
+			t.Fatalf("GetToken calls = %d, want 1", credential.calls)
+		}
+	})
+
+	t.Run("shared-key read SAS", func(t *testing.T) {
+		accountKey := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0x42}, 32))
+		credential, err := azblob.NewSharedKeyCredential("account", accountKey)
+		if err != nil {
+			t.Fatal(err)
+		}
+		source, err := (sharedKeyAzureCopySourceProvider{
+			rawAzureCopySourceProvider: raw,
+			cred:                       credential,
+		}).source(context.Background(), "container", "private-stage")
+		if err != nil {
+			t.Fatal(err)
+		}
+		sourceURL, err := url.Parse(source.url)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if sourceURL.Query().Get("sp") != "r" || sourceURL.Query().Get("sig") == "" {
+			t.Fatalf("source SAS query = %q, want read-only signed URL", sourceURL.RawQuery)
+		}
+		if strings.Contains(source.url, accountKey) {
+			t.Fatalf("source URL leaked raw account key: %s", source.url)
+		}
+		if source.authorization != nil {
+			t.Fatalf("shared-key authorization header = %v, want nil", source.authorization)
+		}
+	})
 }
 
 func TestBackendCreateWithCustomServiceClientRejectsEmptySourceAuthorizationProvider(t *testing.T) {
@@ -767,32 +867,42 @@ func TestPromoteStagedBlobWriteScopedBlockIDsPreventCrossCommitBytes(t *testing.
 			"https://example.invalid/stage-b": "bravo",
 		},
 	}
-	promoter.stageHook = func() {
-		if _, err := stagePromotionBlocks(
-			context.Background(),
-			promoter,
-			azureCopySource{url: "https://example.invalid/stage-b"},
-			azureObjectState{size: int64(len("bravo"))},
-			"write-b",
-		); err != nil {
-			t.Fatalf("stage competing writer: %v", err)
-		}
-	}
 
-	err := promoteStagedBlob(
+	blocksA, err := stagePromotionBlocks(
 		context.Background(),
 		promoter,
 		azureCopySource{url: "https://example.invalid/stage-a"},
 		azureObjectState{size: int64(len("alpha"))},
 		"write-a",
-		false,
-		azureObjectState{},
 	)
 	if err != nil {
-		t.Fatalf("promoteStagedBlob: %v", err)
+		t.Fatalf("stage writer A: %v", err)
+	}
+	blocksB, err := stagePromotionBlocks(
+		context.Background(),
+		promoter,
+		azureCopySource{url: "https://example.invalid/stage-b"},
+		azureObjectState{size: int64(len("bravo"))},
+		"write-b",
+	)
+	if err != nil {
+		t.Fatalf("stage writer B: %v", err)
+	}
+	if err := commitPromotionBlocks(
+		context.Background(), promoter, blocksA, azureObjectState{}, false, azureObjectState{},
+	); err != nil {
+		t.Fatalf("commit writer A: %v", err)
 	}
 	if got := promoter.committedData; got != "alpha" {
 		t.Fatalf("committed data = %q, want alpha", got)
+	}
+	if err := commitPromotionBlocks(
+		context.Background(), promoter, blocksB, azureObjectState{}, false, azureObjectState{},
+	); err == nil {
+		t.Fatal("competing writer B unexpectedly committed")
+	}
+	if got := promoter.committedData; got != "alpha" {
+		t.Fatalf("losing writer changed committed data to %q, want alpha", got)
 	}
 	if len(promoter.stageCalls) != 2 {
 		t.Fatalf("stage calls = %d, want 2", len(promoter.stageCalls))
@@ -1209,8 +1319,8 @@ type fakeAzureBlockPromoter struct {
 	sources       map[string]string
 	uncommitted   map[string][]byte
 	committedData string
+	committed     bool
 	stageCalls    []fakeAzureBlockStageCall
-	stageHook     func()
 }
 
 func (p *fakeAzureBlockPromoter) StageBlockFromURL(
@@ -1235,28 +1345,46 @@ func (p *fakeAzureBlockPromoter) StageBlockFromURL(
 	}
 	p.uncommitted[blockID] = append([]byte(nil), data[start:end]...)
 	p.stageCalls = append(p.stageCalls, fakeAzureBlockStageCall{blockID: blockID})
-	if p.stageHook != nil {
-		hook := p.stageHook
-		p.stageHook = nil
-		hook()
-	}
 	return nil
 }
 
 func (p *fakeAzureBlockPromoter) CommitBlockList(
 	ctx context.Context,
 	blockIDs []string,
-	_ *blockblob.CommitBlockListOptions,
+	options *blockblob.CommitBlockListOptions,
 ) error {
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	if p.committed &&
+		options != nil &&
+		options.AccessConditions != nil &&
+		options.AccessConditions.ModifiedAccessConditions != nil &&
+		options.AccessConditions.ModifiedAccessConditions.IfNoneMatch != nil {
+		return &azcore.ResponseError{ErrorCode: string(bloberror.ConditionNotMet)}
 	}
 	var committed bytes.Buffer
 	for _, blockID := range blockIDs {
 		committed.Write(p.uncommitted[blockID])
 	}
 	p.committedData = committed.String()
+	p.committed = true
 	return nil
+}
+
+type recordingTokenCredential struct {
+	token string
+	calls int
+}
+
+func (c *recordingTokenCredential) GetToken(
+	context.Context, policy.TokenRequestOptions,
+) (azcore.AccessToken, error) {
+	c.calls++
+	return azcore.AccessToken{
+		Token:     c.token,
+		ExpiresOn: time.Now().Add(time.Hour),
+	}, nil
 }
 
 // TestFile_ReadAt_EdgeCases exercises the code paths in file.ReadAt that do not
