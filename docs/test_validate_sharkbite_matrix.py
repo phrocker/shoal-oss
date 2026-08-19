@@ -448,18 +448,54 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
         document_rows = validator.parse_rows(load_document_text().splitlines())[2]
         self.assertEqual(rows, document_rows)
 
+    def test_row_manifest_provenance_matches_expected_revision(self) -> None:
+        manifest_lines = validator.EXPECTED_ROW_MANIFEST.read_text(encoding="utf-8").splitlines()
+        validator.validate_expected_row_manifest_provenance(
+            manifest_lines, source=validator.EXPECTED_ROW_MANIFEST.name
+        )
+
+    def test_row_manifest_provenance_rejects_stale_revision_header(self) -> None:
+        manifest_lines = validator.EXPECTED_ROW_MANIFEST.read_text(encoding="utf-8").splitlines()
+        mutated = list(manifest_lines)
+        mutated[0] = mutated[0].replace("Revision-18", "Revision-17")
+        self.assert_validation_fails(
+            lambda: validator.validate_expected_row_manifest_provenance(
+                mutated, source=validator.EXPECTED_ROW_MANIFEST.name
+            ),
+            "row manifest header",
+            "revision 18",
+        )
+
     def test_gap_completion_consistency_accepts_complete_pairs(self) -> None:
         lines = load_fixture_lines("gap_completion_valid.md")
         rows = validator.parse_rows(lines)[2]
         validator.validate_gap_completion_consistency(lines, rows)
 
-    def test_gap_completion_consistency_rejects_completion_drift(self) -> None:
+    def test_gap_completion_consistency_rejects_c_stage_missing_c_abi_drift(self) -> None:
         lines = load_fixture_lines("gap_completion_drift.md")
         rows = validator.parse_rows(lines)[2]
         self.assert_validation_fails(
             lambda: validator.validate_gap_completion_consistency(lines, rows),
-            "SB-GAP-C-001 claims completion, but referenced rows remain Missing C ABI",
+            "SB-GAP-C-001 claims completion, but referenced rows remain one of Missing Go, Missing C ABI",
             "SB-CPP-016 (Missing C ABI)",
+        )
+
+    def test_gap_completion_consistency_rejects_go_stage_missing_go_drift(self) -> None:
+        lines = load_fixture_lines("gap_completion_go_drift.md")
+        rows = validator.parse_rows(lines)[2]
+        self.assert_validation_fails(
+            lambda: validator.validate_gap_completion_consistency(lines, rows),
+            "SB-GAP-GO-001 claims completion, but referenced rows remain one of Missing Go",
+            "SB-CONN-004 (Missing Go)",
+        )
+
+    def test_gap_completion_consistency_rejects_c_stage_missing_go_drift(self) -> None:
+        lines = load_fixture_lines("gap_completion_c_stage_missing_go_drift.md")
+        rows = validator.parse_rows(lines)[2]
+        self.assert_validation_fails(
+            lambda: validator.validate_gap_completion_consistency(lines, rows),
+            "SB-GAP-C-004 claims completion, but referenced rows remain one of Missing Go, Missing C ABI",
+            "SB-TABLE-010 (Missing Go)",
         )
 
     def test_pinned_inventory_rejects_status_swap_between_rows_in_one_section(self) -> None:

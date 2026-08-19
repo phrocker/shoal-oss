@@ -211,13 +211,23 @@ INVENTORY_CHANGE_HINT = (
     "audit evidence that justifies the new inventory"
 )
 
-GAP_COMPLETION_RULES: dict[str, str] = {
-    "SB-GAP-GO-001": "Missing Go",
-    "SB-GAP-GO-002": "Missing Go",
-    "SB-GAP-C-001": "Missing C ABI",
-    "SB-GAP-C-002": "Missing C ABI",
-    "SB-GAP-C-004": "Missing C ABI",
+GAP_COMPLETION_RULES: dict[str, tuple[str, ...]] = {
+    "SB-GAP-GO-001": ("Missing Go",),
+    "SB-GAP-GO-002": ("Missing Go",),
+    "SB-GAP-C-001": ("Missing Go", "Missing C ABI"),
+    "SB-GAP-C-002": ("Missing Go", "Missing C ABI"),
+    "SB-GAP-C-004": ("Missing Go", "Missing C ABI"),
 }
+
+EXPECTED_ROW_MANIFEST_HEADER = (
+    f"# Revision-{EXPECTED_REVISION} accepted matrix rows for docs/sharkbite-compatibility.md.",
+    "# One entry per row: ROW-ID followed by the audited status, in document order.",
+    "# Pinning the status next to the id means a swap of two rows' statuses inside one",
+    "# section cannot pass the aggregate count checks undetected.",
+    f"# Update only when the independently audited revision-{EXPECTED_REVISION} inventory itself changes.",
+    "# Regenerate from the audited document, review every added/removed/reclassified row",
+    "# in code review, and keep the list in document order for human auditability.",
+)
 
 C_ABI_EXPORT_HEADER_PATH = Path("capi/include/shoal.h")
 C_ABI_REFERENCE_PATHS = (
@@ -695,10 +705,40 @@ def parse_row_manifest_lines(
     return tuple(entries)
 
 
+def validate_expected_row_manifest_provenance(lines: Sequence[str], *, source: str) -> None:
+    filename_match = re.fullmatch(
+        r"sharkbite-compatibility-revision(?P<revision>\d+)-rows\.txt", source
+    )
+    require(
+        filename_match is not None,
+        f"unexpected row manifest filename {source!r}",
+    )
+    assert filename_match is not None
+    require(
+        int(filename_match.group("revision")) == EXPECTED_REVISION,
+        (
+            f"row manifest filename {source!r} does not match EXPECTED_REVISION "
+            f"{EXPECTED_REVISION}"
+        ),
+    )
+    comment_lines = tuple(raw_line.rstrip() for raw_line in lines if raw_line.startswith("#"))
+    require(
+        comment_lines[: len(EXPECTED_ROW_MANIFEST_HEADER)] == EXPECTED_ROW_MANIFEST_HEADER,
+        (
+            f"row manifest header in {source} does not match revision {EXPECTED_REVISION}: "
+            f"expected {EXPECTED_ROW_MANIFEST_HEADER[0]!r}"
+        ),
+    )
+
+
 @lru_cache(maxsize=1)
 def load_expected_rows() -> tuple[tuple[str, str], ...]:
+    manifest_lines = EXPECTED_ROW_MANIFEST.read_text(encoding="utf-8").splitlines()
+    validate_expected_row_manifest_provenance(
+        manifest_lines, source=str(EXPECTED_ROW_MANIFEST.name)
+    )
     rows = parse_row_manifest_lines(
-        EXPECTED_ROW_MANIFEST.read_text(encoding="utf-8").splitlines(),
+        manifest_lines,
         source=str(EXPECTED_ROW_MANIFEST.name),
     )
     require(
@@ -1056,7 +1096,7 @@ def validate_gap_completion_consistency(
     active_rules = GAP_COMPLETION_RULES if rules is None else rules
     gap_rows = parse_gap_completion_tables(lines)
     row_statuses = dict(rows)
-    for gap_id, forbidden_status in active_rules.items():
+    for gap_id, forbidden_statuses in active_rules.items():
         require(gap_id in gap_rows, f"missing audited gap row {gap_id}")
         matrix_rows_cell, _notes = gap_rows[gap_id]
         referenced_rows = expand_gap_row_references(
@@ -1065,12 +1105,13 @@ def validate_gap_completion_consistency(
         contradicting = [
             (row_id, row_statuses[row_id])
             for row_id in referenced_rows
-            if row_statuses[row_id] == forbidden_status
+            if row_statuses[row_id] in forbidden_statuses
         ]
         require(
             not contradicting,
             (
-                f"{gap_id} claims completion, but referenced rows remain {forbidden_status}: "
+                f"{gap_id} claims completion, but referenced rows remain one of "
+                f"{', '.join(forbidden_statuses)}: "
                 f"{preview_row_ids(contradicting)}"
             ),
         )

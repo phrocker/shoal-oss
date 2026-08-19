@@ -1,8 +1,8 @@
-# Revision-17 accepted matrix rows for docs/sharkbite-compatibility.md.
+# Revision-18 accepted matrix rows for docs/sharkbite-compatibility.md.
 # One entry per row: ROW-ID followed by the audited status, in document order.
 # Pinning the status next to the id means a swap of two rows' statuses inside one
 # section cannot pass the aggregate count checks undetected.
-# Update only when the independently audited revision-17 inventory itself changes.
+# Update only when the independently audited revision-18 inventory itself changes.
 # Regenerate from the audited document, review every added/removed/reclassified row
 # in code review, and keep the list in document order for human auditability.
 
