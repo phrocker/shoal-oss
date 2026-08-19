@@ -1,10 +1,13 @@
-# Revision-16 accepted matrix rows for docs/sharkbite-compatibility.md.
-# One entry per row: ROW-ID followed by the audited status, in document order.
+# Pinned matrix rows for docs/sharkbite-compatibility.md, current revision.
+# One entry per row: ROW-ID followed by the pinned status, in document order.
 # Pinning the status next to the id means a swap of two rows' statuses inside one
 # section cannot pass the aggregate count checks undetected.
-# Update only when the independently audited revision-16 inventory itself changes.
-# Regenerate from the audited document, review every added/removed/reclassified row
-# in code review, and keep the list in document order for human auditability.
+# Update whenever the pinned inventory itself changes: an audit that reclassifies
+# rows, or an implementation change that moves rows between statuses under the
+# decision procedure in section 4.2 of the document. Regenerate from the document,
+# bump EXPECTED_REVISION and the pinned counts in docs/validate_sharkbite_matrix.py
+# in the same commit, review every added, removed, or reclassified row in code
+# review, and keep the list in document order for human auditability.
 
 SB-PKG-001 Missing C ABI
 SB-PKG-002 Missing C ABI

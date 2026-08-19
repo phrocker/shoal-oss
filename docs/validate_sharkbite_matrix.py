@@ -9,8 +9,12 @@ import sys
 
 
 DOC_PATH = Path(__file__).with_name("sharkbite-compatibility.md")
-# Update this manifest only when the independently audited revision-16 inventory
-# itself changes; review every added/removed ID in code review.
+# The manifest pins the current inventory: one "ROW-ID STATUS" entry per row, in
+# document order. Update it whenever that inventory legitimately changes — an
+# audit that reclassifies rows, or an implementation change that moves rows
+# between statuses under the decision procedure in section 4.2 — together with
+# EXPECTED_REVISION and the pinned counts below, and review every added,
+# removed, or reclassified row in code review.
 ROW_MANIFEST = DOC_PATH.with_name("sharkbite-compatibility-rows.txt")
 
 STATUSES = {

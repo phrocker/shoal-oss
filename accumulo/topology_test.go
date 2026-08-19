@@ -9,6 +9,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	gozk "github.com/go-zookeeper/zk"
 
@@ -264,6 +265,8 @@ func TestInstanceServersRejectsMalformedAddresses(t *testing.T) {
 		"no port":      "tserver-a",
 		"bad port":     "tserver-a:port",
 		"port too big": "tserver-a:70000",
+		"no host":      ":9997",
+		"port zero":    "tserver-a:0",
 	} {
 		t.Run(name, func(t *testing.T) {
 			locator := &topologyLocator{
@@ -471,5 +474,93 @@ func TestInstanceTopologyAfterCloseStillReportsStaticWiring(t *testing.T) {
 	}
 	if locator.closes.Load() != 1 {
 		t.Fatalf("locator closed %d times, want 1", locator.closes.Load())
+	}
+}
+
+// blockingLocator blocks inside every live-state read until it is released,
+// so a caller can prove that cancelling the context releases the accessor.
+type blockingLocator struct {
+	id      string
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (l *blockingLocator) InstanceID() string { return l.id }
+func (l *blockingLocator) Close()             {}
+
+func (l *blockingLocator) block(ctx context.Context) error {
+	l.once.Do(func() { close(l.started) })
+	select {
+	case <-l.release:
+		return errors.New("released")
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (l *blockingLocator) RootTabletLocation(ctx context.Context) (*zk.Location, error) {
+	return nil, l.block(ctx)
+}
+
+func (l *blockingLocator) InstancePath() string { return zk.InstanceRoot(l.id) }
+
+func (l *blockingLocator) GetRaw(ctx context.Context, _ string) ([]byte, error) {
+	return nil, l.block(ctx)
+}
+
+func (l *blockingLocator) Children(ctx context.Context, _ string) ([]string, error) {
+	return nil, l.block(ctx)
+}
+
+func TestInstanceTopologyCancelsInFlightReads(t *testing.T) {
+	calls := map[string]func(Instance, context.Context) error{
+		"RootTabletLocation": func(instance Instance, ctx context.Context) error {
+			_, err := instance.RootTabletLocation(ctx)
+			return err
+		},
+		"ManagerLocations": func(instance Instance, ctx context.Context) error {
+			_, err := instance.ManagerLocations(ctx)
+			return err
+		},
+		"Servers": func(instance Instance, ctx context.Context) error {
+			_, err := instance.Servers(ctx)
+			return err
+		},
+	}
+	for name, call := range calls {
+		t.Run(name, func(t *testing.T) {
+			blocking := &blockingLocator{
+				id:      "uuid-1",
+				started: make(chan struct{}),
+				release: make(chan struct{}),
+			}
+			instance, err := newZooKeeperInstance(
+				context.Background(),
+				ZooKeeperConfig{Servers: []string{"zk:2181"}, InstanceName: "accumulo"},
+				func(ZooKeeperConfig) (locator, error) { return blocking, nil },
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				close(blocking.release)
+				_ = instance.Close()
+			})
+
+			ctx, cancel := context.WithCancel(context.Background())
+			result := make(chan error, 1)
+			go func() { result <- call(instance, ctx) }()
+			<-blocking.started
+			cancel()
+			select {
+			case err := <-result:
+				if !errors.Is(err, context.Canceled) {
+					t.Fatalf("error = %v, want context.Canceled", err)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("accessor did not return after its context was cancelled")
+			}
+		})
 	}
 }

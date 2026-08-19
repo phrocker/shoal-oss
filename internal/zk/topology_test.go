@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"path"
 	"strings"
+	"sync"
 	"testing"
 
 	gozk "github.com/go-zookeeper/zk"
@@ -308,4 +309,133 @@ func TestInstanceRoot(t *testing.T) {
 	if got := InstanceRoot(""); got != "/accumulo" {
 		t.Fatalf("InstanceRoot(\"\") = %q", got)
 	}
+}
+
+// blockingChildrenConn blocks inside Children until the connection is closed,
+// so a caller can prove that cancelling the context releases it.
+type blockingChildrenConn struct {
+	started chan struct{}
+	closed  chan struct{}
+	done    chan struct{}
+	once    sync.Once
+}
+
+func (c *blockingChildrenConn) AddAuth(string, []byte) error { return nil }
+
+func (c *blockingChildrenConn) Get(string) ([]byte, *gozk.Stat, error) {
+	return nil, nil, gozk.ErrClosing
+}
+
+func (c *blockingChildrenConn) Children(string) ([]string, *gozk.Stat, error) {
+	close(c.started)
+	<-c.closed
+	close(c.done)
+	return nil, nil, gozk.ErrClosing
+}
+
+func (c *blockingChildrenConn) Close() {
+	c.once.Do(func() { close(c.closed) })
+}
+
+func TestChildrenWithContextCancelsInFlightReadAndJoinsWorker(t *testing.T) {
+	conn := &blockingChildrenConn{
+		started: make(chan struct{}),
+		closed:  make(chan struct{}),
+		done:    make(chan struct{}),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		_, err := childrenWithContext(ctx, "/accumulo/uuid-1/managers/lock", "", func() (rawZKConn, error) {
+			return conn, nil
+		})
+		result <- err
+	}()
+	<-conn.started
+	cancel()
+	if err := <-result; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Children error = %v, want context.Canceled", err)
+	}
+	select {
+	case <-conn.done:
+	default:
+		t.Fatal("Children returned before its ZooKeeper read worker exited")
+	}
+}
+
+func TestLocatorChildrenCancelsInFlightRead(t *testing.T) {
+	conn := &blockingChildrenConn{
+		started: make(chan struct{}),
+		closed:  make(chan struct{}),
+		done:    make(chan struct{}),
+	}
+	locator := &Locator{
+		instanceID: "uuid-1",
+		rawConnFactory: func() (rawZKConn, error) {
+			return conn, nil
+		},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		_, err := locator.Children(ctx, "/accumulo/uuid-1/tservers")
+		result <- err
+	}()
+	<-conn.started
+	cancel()
+	if err := <-result; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Children error = %v, want context.Canceled", err)
+	}
+	<-conn.done
+}
+
+func TestLocatorRootTabletLocationCancelsInFlightRead(t *testing.T) {
+	conn := &blockingGetConn{
+		started: make(chan struct{}),
+		closed:  make(chan struct{}),
+		done:    make(chan struct{}),
+	}
+	locator := &Locator{
+		instanceID: "uuid-1",
+		rawConnFactory: func() (rawZKConn, error) {
+			return conn, nil
+		},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		_, err := locator.RootTabletLocation(ctx)
+		result <- err
+	}()
+	<-conn.started
+	cancel()
+	if err := <-result; !errors.Is(err, context.Canceled) {
+		t.Fatalf("RootTabletLocation error = %v, want context.Canceled", err)
+	}
+	<-conn.done
+}
+
+// blockingGetConn blocks inside Get until the connection is closed.
+type blockingGetConn struct {
+	started chan struct{}
+	closed  chan struct{}
+	done    chan struct{}
+	once    sync.Once
+}
+
+func (c *blockingGetConn) AddAuth(string, []byte) error { return nil }
+
+func (c *blockingGetConn) Get(string) ([]byte, *gozk.Stat, error) {
+	close(c.started)
+	<-c.closed
+	close(c.done)
+	return nil, nil, gozk.ErrClosing
+}
+
+func (c *blockingGetConn) Children(string) ([]string, *gozk.Stat, error) {
+	return nil, nil, gozk.ErrClosing
+}
+
+func (c *blockingGetConn) Close() {
+	c.once.Do(func() { close(c.closed) })
 }

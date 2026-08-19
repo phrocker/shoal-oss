@@ -12,8 +12,10 @@ import (
 // code builds before constructing an instance and reads back through
 // Instance.Configuration.
 //
-// A Configuration is safe for concurrent use. The zero value is not usable;
-// create one with NewConfiguration.
+// A Configuration is safe for concurrent use, and its zero value is ready to
+// use: reads report nothing set, and the first Set allocates the map under the
+// lock. NewConfiguration exists so that a Configuration can be built and
+// populated in one expression.
 type Configuration struct {
 	mu     sync.RWMutex
 	values map[string]string

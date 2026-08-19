@@ -116,11 +116,11 @@ func (l *Locator) lookupInstanceID() (string, error) {
 // RootTabletLocation reads the root-tablet znode and returns the current
 // tserver location. Returns (nil, nil) if no current location is set —
 // e.g. during tablet movement; caller should retry.
-func (l *Locator) RootTabletLocation(_ context.Context) (*Location, error) {
+func (l *Locator) RootTabletLocation(ctx context.Context) (*Location, error) {
 	p := path.Join(zRoot, l.instanceID, zRootTablet)
-	data, _, err := l.conn.Get(p)
+	data, _, err := l.get(ctx, p)
 	if err != nil {
-		return nil, fmt.Errorf("get %s: %w", p, err)
+		return nil, err
 	}
 	return parseRootTabletMetadata(data)
 }
@@ -156,14 +156,7 @@ func (l *Locator) get(ctx context.Context, znodePath string) ([]byte, *gozk.Stat
 		return nil, nil, err
 	}
 	if ctx.Done() != nil {
-		connect := l.rawConnFactory
-		if connect == nil {
-			connect = func() (rawZKConn, error) {
-				conn, _, err := gozk.Connect(l.servers, l.sessionTimeout)
-				return conn, err
-			}
-		}
-		return getWithContext(ctx, znodePath, l.instanceSecret, connect)
+		return getWithContext(ctx, znodePath, l.instanceSecret, l.rawConnFactoryOrDefault())
 	}
 	data, stat, err := l.conn.Get(znodePath)
 	if err != nil {
@@ -175,6 +168,7 @@ func (l *Locator) get(ctx context.Context, znodePath string) ([]byte, *gozk.Stat
 type rawZKConn interface {
 	AddAuth(string, []byte) error
 	Get(string) ([]byte, *gozk.Stat, error)
+	Children(string) ([]string, *gozk.Stat, error)
 	Close()
 }
 
@@ -234,12 +228,74 @@ func getWithContext(
 // Children returns the child znode names of znodePath. Names are NOT
 // joined with znodePath; callers join as needed. Empty slice for a
 // childless znode; ErrNoNode for a missing znode (wrapped).
-func (l *Locator) Children(_ context.Context, znodePath string) ([]string, error) {
+func (l *Locator) Children(ctx context.Context, znodePath string) ([]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if ctx.Done() != nil {
+		return childrenWithContext(ctx, znodePath, l.instanceSecret, l.rawConnFactoryOrDefault())
+	}
 	names, _, err := l.conn.Children(znodePath)
 	if err != nil {
 		return nil, fmt.Errorf("children %s: %w", znodePath, err)
 	}
 	return names, nil
+}
+
+func (l *Locator) rawConnFactoryOrDefault() func() (rawZKConn, error) {
+	if l.rawConnFactory != nil {
+		return l.rawConnFactory
+	}
+	return func() (rawZKConn, error) {
+		conn, _, err := gozk.Connect(l.servers, l.sessionTimeout)
+		return conn, err
+	}
+}
+
+type rawChildrenResult struct {
+	names []string
+	err   error
+}
+
+// childrenWithContext lists children on a dedicated ZooKeeper connection so
+// that cancelling ctx closes the in-flight read instead of leaving the caller
+// blocked on the shared locator session.
+func childrenWithContext(
+	ctx context.Context,
+	znodePath, instanceSecret string,
+	connect func() (rawZKConn, error),
+) ([]string, error) {
+	conn, err := connect()
+	if err != nil {
+		return nil, fmt.Errorf("zk connect: %w", err)
+	}
+	result := make(chan rawChildrenResult, 1)
+	go func() {
+		if instanceSecret != "" {
+			if err := conn.AddAuth("digest", []byte("accumulo:"+instanceSecret)); err != nil {
+				result <- rawChildrenResult{err: fmt.Errorf("zk add digest auth: %w", err)}
+				return
+			}
+		}
+		names, _, err := conn.Children(znodePath)
+		if err != nil {
+			err = fmt.Errorf("children %s: %w", znodePath, err)
+		}
+		result <- rawChildrenResult{names: names, err: err}
+	}()
+
+	select {
+	case response := <-result:
+		conn.Close()
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		return response.names, response.err
+	case <-ctx.Done():
+		conn.Close()
+		<-result
+		return nil, ctx.Err()
+	}
 }
 
 // rootTabletJSON mirrors RootTabletMetadata.Data (Gson struct).

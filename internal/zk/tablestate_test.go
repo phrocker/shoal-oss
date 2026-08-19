@@ -19,6 +19,10 @@ type staticRawConn struct {
 
 func (c *staticRawConn) AddAuth(string, []byte) error { return nil }
 
+func (c *staticRawConn) Children(string) ([]string, *gozk.Stat, error) {
+	return nil, nil, gozk.ErrNoNode
+}
+
 func (c *staticRawConn) Get(znodePath string) ([]byte, *gozk.Stat, error) {
 	c.path = znodePath
 	return c.data, c.stat, c.err

@@ -18,14 +18,16 @@ type InstanceInfo struct {
 	ID   string
 }
 
-// Instance provides the immutable identity, client configuration, cluster
-// topology, and lifecycle of an Accumulo instance source.
+// Instance provides the identity, client configuration, cluster topology, and
+// lifecycle of an Accumulo instance source.
 //
 // The topology accessors mirror Sharkbite's cclient::data::Instance base
-// class: RootTabletLocation, ManagerLocations, and Servers each resolve live
-// state from ZooKeeper on every call and honor ctx cancellation, while
-// ZooKeepers, Root, and Configuration report the instance's own immutable
-// wiring.
+// class. RootTabletLocation, ManagerLocations, and Servers resolve live state
+// from ZooKeeper on every call and honor ctx cancellation. Info, ZooKeepers,
+// and Root report wiring fixed at construction. Configuration is different:
+// it returns the instance's own mutable Configuration, so writes through the
+// returned pointer are observed by later calls, while the caller's original
+// Configuration stays independent because the instance stored a clone.
 type Instance interface {
 	Info() InstanceInfo
 

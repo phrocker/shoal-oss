@@ -255,11 +255,23 @@ func newServerConnection(service zk.ClientService) (ServerConnection, error) {
 			service.Kind, service.Address, err,
 		)
 	}
+	if host == "" {
+		return ServerConnection{}, fmt.Errorf(
+			"accumulo: %s client service address %q has no host",
+			service.Kind, service.Address,
+		)
+	}
 	port, err := strconv.ParseUint(portText, 10, 16)
 	if err != nil {
 		return ServerConnection{}, fmt.Errorf(
 			"accumulo: parse %s client service port %q: %w",
 			service.Kind, service.Address, err,
+		)
+	}
+	if port == 0 {
+		return ServerConnection{}, fmt.Errorf(
+			"accumulo: %s client service address %q has port 0, which cannot be dialled",
+			service.Kind, service.Address,
 		)
 	}
 	return ServerConnection{

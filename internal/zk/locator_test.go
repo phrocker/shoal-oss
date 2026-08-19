@@ -27,6 +27,13 @@ func (c *blockingRawConn) Get(string) ([]byte, *gozk.Stat, error) {
 	return nil, nil, gozk.ErrClosing
 }
 
+func (c *blockingRawConn) Children(string) ([]string, *gozk.Stat, error) {
+	close(c.started)
+	<-c.closed
+	close(c.done)
+	return nil, nil, gozk.ErrClosing
+}
+
 func (c *blockingRawConn) Close() {
 	c.once.Do(func() { close(c.closed) })
 }
