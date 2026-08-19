@@ -102,6 +102,27 @@ void shoal_bridge_batch_writer_free(shoal_batch_writer *writer) {
   }
 }
 
+shoal_configuration *shoal_bridge_configuration_alloc(uint64_t id) {
+    shoal_configuration *configuration =
+        (shoal_configuration *)malloc(sizeof(*configuration));
+    if (configuration != NULL) {
+      configuration->id = id;
+    }
+    return configuration;
+  }
+
+  uint64_t
+  shoal_bridge_configuration_id(const shoal_configuration *configuration) {
+    return configuration == NULL ? 0 : configuration->id;
+  }
+
+  void shoal_bridge_configuration_free(shoal_configuration *configuration) {
+    if (configuration != NULL) {
+      configuration->id = 0;
+      free(configuration);
+  }
+}
+
 #ifdef SHOAL_CAPI_TEST
 static _Atomic size_t shoal_bridge_string_alloc_fail_after = SIZE_MAX;
 static _Atomic size_t shoal_bridge_result_alloc_fail_after = SIZE_MAX;
@@ -303,6 +324,194 @@ static char *shoal_bridge_result_copy_string(const char *value) {
     memcpy(copy, value, length + 1);
   }
   return copy;
+}
+
+shoal_bytes_result *shoal_bridge_bytes_result_alloc(const uint8_t *value,
+                                                      size_t length) {
+    if ((value == NULL && length != 0) || length == SIZE_MAX) {
+      return NULL;
+    }
+    shoal_bytes_result *result =
+        (shoal_bytes_result *)shoal_bridge_result_calloc(1, sizeof(*result));
+    if (result == NULL) {
+      return NULL;
+    }
+    result->data = shoal_bridge_result_copy_bytes(value, length);
+    if (length != 0 && result->data == NULL) {
+      free(result);
+      return NULL;
+    }
+    result->length = length;
+    return result;
+  }
+
+  shoal_bytes shoal_bridge_bytes_result_get(const shoal_bytes_result *result) {
+    shoal_bytes value = {0};
+    if (result != NULL) {
+      value.data = result->data;
+      value.length = result->length;
+    }
+    return value;
+  }
+
+  void shoal_bridge_bytes_result_free(shoal_bytes_result *result) {
+    if (result != NULL) {
+      free(result->data);
+      memset(result, 0, sizeof(*result));
+      free(result);
+    }
+  }
+
+  shoal_string_list_result *shoal_bridge_string_list_alloc(size_t count) {
+    if (count > SIZE_MAX / sizeof(shoal_bridge_bytes_entry)) {
+      return NULL;
+    }
+    shoal_string_list_result *result =
+        (shoal_string_list_result *)shoal_bridge_result_calloc(1, sizeof(*result));
+    if (result == NULL) {
+      return NULL;
+    }
+    if (count != 0) {
+      result->entries = (shoal_bridge_bytes_entry *)shoal_bridge_result_calloc(
+          count, sizeof(*result->entries));
+      if (result->entries == NULL) {
+        free(result);
+        return NULL;
+      }
+    }
+    result->count = count;
+    return result;
+  }
+
+  int shoal_bridge_string_list_set(shoal_string_list_result *result, size_t index,
+                                   const uint8_t *value, size_t length) {
+    if (result == NULL || index >= result->count ||
+        (value == NULL && length != 0)) {
+      return 0;
+    }
+    uint8_t *copy = shoal_bridge_result_copy_bytes(value, length);
+    if (length != 0 && copy == NULL) {
+      return 0;
+    }
+    free(result->entries[index].data);
+    result->entries[index].data = copy;
+    result->entries[index].length = length;
+    return 1;
+  }
+
+  size_t shoal_bridge_string_list_count(const shoal_string_list_result *result) {
+    return result == NULL ? 0 : result->count;
+  }
+
+  int shoal_bridge_string_list_get(const shoal_string_list_result *result,
+                                   size_t index, shoal_bytes *out_value) {
+    if (result == NULL || out_value == NULL || index >= result->count) {
+      return 0;
+    }
+    out_value->data = result->entries[index].data;
+    out_value->length = result->entries[index].length;
+    return 1;
+  }
+
+  void shoal_bridge_string_list_free(shoal_string_list_result *result) {
+    if (result == NULL) {
+      return;
+    }
+    for (size_t i = 0; i < result->count; ++i) {
+      free(result->entries[i].data);
+    }
+    free(result->entries);
+    memset(result, 0, sizeof(*result));
+    free(result);
+  }
+
+  shoal_server_list_result *shoal_bridge_server_list_alloc(size_t count) {
+    if (count > SIZE_MAX / sizeof(shoal_bridge_server_entry)) {
+      return NULL;
+    }
+    shoal_server_list_result *result =
+        (shoal_server_list_result *)shoal_bridge_result_calloc(1, sizeof(*result));
+    if (result == NULL) {
+      return NULL;
+    }
+    if (count != 0) {
+      result->entries = (shoal_bridge_server_entry *)shoal_bridge_result_calloc(
+          count, sizeof(*result->entries));
+      if (result->entries == NULL) {
+        free(result);
+        return NULL;
+      }
+    }
+    result->count = count;
+    return result;
+  }
+
+  int shoal_bridge_server_list_set(shoal_server_list_result *result, size_t index,
+                                   const uint8_t *kind, size_t kind_length,
+                                   const uint8_t *group, size_t group_length,
+                                   const uint8_t *host, size_t host_length,
+                                   uint16_t port) {
+    if (result == NULL || index >= result->count ||
+        (kind == NULL && kind_length != 0) ||
+        (group == NULL && group_length != 0) ||
+        (host == NULL && host_length != 0)) {
+      return 0;
+    }
+    shoal_bridge_server_entry next = {0};
+    next.kind = shoal_bridge_result_copy_bytes(kind, kind_length);
+    next.group = shoal_bridge_result_copy_bytes(group, group_length);
+    next.host = shoal_bridge_result_copy_bytes(host, host_length);
+    if ((kind_length != 0 && next.kind == NULL) ||
+        (group_length != 0 && next.group == NULL) ||
+        (host_length != 0 && next.host == NULL)) {
+      free(next.kind);
+      free(next.group);
+      free(next.host);
+      return 0;
+    }
+    next.kind_length = kind_length;
+    next.group_length = group_length;
+    next.host_length = host_length;
+    next.port = port;
+    free(result->entries[index].kind);
+    free(result->entries[index].group);
+    free(result->entries[index].host);
+    result->entries[index] = next;
+    return 1;
+  }
+
+  size_t shoal_bridge_server_list_count(const shoal_server_list_result *result) {
+    return result == NULL ? 0 : result->count;
+  }
+
+  int shoal_bridge_server_list_get(const shoal_server_list_result *result,
+                                   size_t index, shoal_server_view *out_server) {
+    if (result == NULL || out_server == NULL || index >= result->count) {
+      return 0;
+    }
+    const shoal_bridge_server_entry *entry = &result->entries[index];
+    out_server->kind.data = entry->kind;
+    out_server->kind.length = entry->kind_length;
+    out_server->group.data = entry->group;
+    out_server->group.length = entry->group_length;
+    out_server->host.data = entry->host;
+    out_server->host.length = entry->host_length;
+    out_server->port = entry->port;
+    return 1;
+  }
+
+  void shoal_bridge_server_list_free(shoal_server_list_result *result) {
+    if (result == NULL) {
+      return;
+    }
+    for (size_t i = 0; i < result->count; ++i) {
+      free(result->entries[i].kind);
+      free(result->entries[i].group);
+      free(result->entries[i].host);
+    }
+    free(result->entries);
+    memset(result, 0, sizeof(*result));
+    free(result);
 }
 
 static void shoal_bridge_scan_entry_clear(shoal_bridge_scan_entry *entry) {

@@ -8,9 +8,9 @@
 
 _Static_assert(SHOAL_ABI_VERSION == 1u, "unexpected compatibility ABI version");
 _Static_assert(SHOAL_ABI_VERSION_MAJOR == 1u, "unexpected ABI major");
-_Static_assert(SHOAL_ABI_VERSION_MINOR == 3u, "unexpected ABI minor");
+_Static_assert(SHOAL_ABI_VERSION_MINOR == 4u, "unexpected ABI minor");
 _Static_assert(SHOAL_ABI_VERSION_PATCH == 0u, "unexpected ABI patch");
-_Static_assert(SHOAL_ABI_VERSION_PACKED == 0x00010300u,
+_Static_assert(SHOAL_ABI_VERSION_PACKED == 0x00010400u,
                "unexpected packed ABI version");
 _Static_assert(SHOAL_ABI_CAPABILITY_CONNECTOR == 0u,
                "unexpected connector capability id");
@@ -42,11 +42,13 @@ _Static_assert(SHOAL_ABI_CAPABILITY_CONNECTOR_IDENTITY == 13u,
                "unexpected connector identity capability id");
 _Static_assert(SHOAL_ABI_CAPABILITY_DATA_DESCRIPTORS == 14u,
                "unexpected data descriptors capability id");
-_Static_assert(SHOAL_ABI_CAPABILITY_COUNT == 15u,
+_Static_assert(SHOAL_ABI_CAPABILITY_CONFIGURATION_TOPOLOGY == 15u,
+               "unexpected configuration topology capability id");
+_Static_assert(SHOAL_ABI_CAPABILITY_COUNT == 16u,
                "unexpected capability count");
 _Static_assert(SHOAL_ABI_CAPABILITY_WORD_COUNT == 1u,
                "unexpected capability word count");
-_Static_assert(SHOAL_ABI_CAPABILITY_WORD0 == UINT64_C(0x7fff),
+_Static_assert(SHOAL_ABI_CAPABILITY_WORD0 == UINT64_C(0xffff),
                "unexpected capability word 0");
 
 #define ASSERT_PERMISSION_VALUE(name, value)                                  \
@@ -139,6 +141,8 @@ static void test_v1_initializers(void) {
   CHECK_V1_INIT(shoal_iterator_setting_view,
                 shoal_iterator_setting_view_init,
                 SHOAL_ITERATOR_SETTING_VIEW_V1_SIZE);
+  CHECK_V1_INIT(shoal_server_view, shoal_server_view_init,
+                SHOAL_SERVER_VIEW_V1_SIZE);
 
 #undef CHECK_V1_INIT
 }
@@ -161,6 +165,10 @@ int main(void) {
   shoal_connector_identity_result *identity = NULL;
   shoal_range_result *range_result = NULL;
   shoal_iterator_setting_result *iterator_result = NULL;
+  shoal_configuration *configuration = NULL;
+  shoal_bytes_result *bytes_result = NULL;
+  shoal_string_list_result *string_list = NULL;
+  shoal_server_list_result *server_list = NULL;
   shoal_error *error = NULL;
 
   test_v1_initializers();
@@ -222,6 +230,73 @@ int main(void) {
 
   assert(shoal_test_connector_create(&admin_connector));
   assert(admin_connector != NULL);
+
+  assert(shoal_configuration_create(&configuration, &error) == SHOAL_STATUS_OK);
+  assert(configuration != NULL && error == NULL);
+  const uint8_t binary_name[] = {'n', '\0', 'k'};
+  const uint8_t binary_value[] = {'v', '\0', 'x'};
+  shoal_bytes name = {binary_name, sizeof(binary_name)};
+  shoal_bytes value = {binary_value, sizeof(binary_value)};
+  assert(shoal_configuration_set(configuration, name, value, &error) ==
+         SHOAL_STATUS_OK);
+  assert(shoal_configuration_get(configuration, name, &bytes_result, &error) ==
+         SHOAL_STATUS_OK);
+  shoal_bytes got = shoal_bytes_result_get(bytes_result);
+  assert(got.length == sizeof(binary_value));
+  assert(memcmp(got.data, binary_value, sizeof(binary_value)) == 0);
+  shoal_bytes_result_free(&bytes_result);
+  shoal_bytes_result_free(&bytes_result);
+  const uint8_t number_value[] = {'4', '2'};
+  shoal_bytes number_name = {(const uint8_t *)"number", 6};
+  shoal_bytes number = {number_value, sizeof(number_value)};
+  uint32_t parsed = 0;
+  assert(shoal_configuration_set(configuration, number_name, number, &error) ==
+         SHOAL_STATUS_OK);
+  assert(shoal_configuration_get_uint32(configuration, number_name, &parsed,
+                                        &error) == SHOAL_STATUS_OK);
+  assert(parsed == 42);
+  shoal_bytes missing = {(const uint8_t *)"missing", 7};
+  assert(shoal_configuration_get_or(configuration, missing, value,
+                                    &bytes_result, &error) == SHOAL_STATUS_OK);
+  got = shoal_bytes_result_get(bytes_result);
+  assert(got.length == sizeof(binary_value));
+  shoal_bytes_result_free(&bytes_result);
+  assert(shoal_configuration_get_uint32_or(configuration, missing, 17, &parsed,
+                                           &error) == SHOAL_STATUS_OK);
+  assert(parsed == 17);
+  shoal_test_result_alloc_fail_after(0);
+  expect_error(shoal_configuration_get(configuration, name, &bytes_result,
+                                       &error),
+               SHOAL_STATUS_OUT_OF_MEMORY, &error, "allocate bytes result");
+  shoal_test_result_alloc_reset();
+  shoal_configuration_free(&configuration);
+  shoal_configuration_free(&configuration);
+
+  assert(shoal_connector_get_root(connector, &bytes_result, &error) ==
+         SHOAL_STATUS_OK);
+  got = shoal_bytes_result_get(bytes_result);
+  assert(got.length > 10);
+  assert(memcmp(got.data, "/accumulo/", 10) == 0);
+  shoal_bytes_result_free(&bytes_result);
+  assert(shoal_connector_get_zookeepers(connector, &string_list, &error) ==
+         SHOAL_STATUS_OK);
+  assert(shoal_string_list_count(string_list) == 0);
+  shoal_string_list_free(&string_list);
+  assert(shoal_connector_get_configuration(connector, &configuration, &error) ==
+         SHOAL_STATUS_OK);
+  assert(configuration != NULL);
+  shoal_configuration_free(&configuration);
+  expect_error(shoal_connector_get_root_tablet_location(
+                   connector, 0, &bytes_result, &error),
+               SHOAL_STATUS_DISCOVERY_UNAVAILABLE, &error,
+               "discovery unavailable");
+  expect_error(shoal_connector_get_manager_locations(
+                   connector, 0, &string_list, &error),
+               SHOAL_STATUS_DISCOVERY_UNAVAILABLE, &error,
+               "discovery unavailable");
+  expect_error(shoal_connector_get_servers(connector, 0, &server_list, &error),
+               SHOAL_STATUS_DISCOVERY_UNAVAILABLE, &error,
+               "discovery unavailable");
 
   expect_error(shoal_connector_get_identity(NULL, 0, &identity, &error),
                SHOAL_STATUS_INVALID_HANDLE, &error, "NULL");
@@ -285,6 +360,51 @@ int main(void) {
                SHOAL_STATUS_DEADLINE_EXCEEDED, &error, "deadline");
   assert(identity == NULL);
   assert(shoal_test_connector_identity_block(admin_connector, 0));
+
+  assert(shoal_connector_get_root_tablet_location(
+             admin_connector, 0, &bytes_result, &error) == SHOAL_STATUS_OK);
+  got = shoal_bytes_result_get(bytes_result);
+  assert(got.length == strlen("tablet.example:9997"));
+  assert(memcmp(got.data, "tablet.example:9997", got.length) == 0);
+  shoal_bytes_result_free(&bytes_result);
+  assert(shoal_connector_get_manager_locations(
+             admin_connector, 0, &string_list, &error) == SHOAL_STATUS_OK);
+  assert(shoal_string_list_count(string_list) == 1);
+  assert(shoal_string_list_get(string_list, 0, &got, &error) ==
+         SHOAL_STATUS_OK);
+  assert(got.length == strlen("manager.example:9999"));
+  shoal_string_list_free(&string_list);
+  assert(shoal_connector_get_servers(admin_connector, 0, &server_list,
+                                     &error) == SHOAL_STATUS_OK);
+  assert(shoal_server_list_count(server_list) == 1);
+  shoal_server_view server_view;
+  shoal_server_view_init(&server_view);
+  assert(shoal_server_list_get(server_list, 0, &server_view, &error) ==
+         SHOAL_STATUS_OK);
+  assert(server_view.port == 9997);
+  assert(server_view.kind.length == strlen("tserver"));
+  assert(server_view.group.length == strlen("default"));
+  assert(server_view.host.length == strlen("server.example"));
+  shoal_server_list_free(&server_list);
+  shoal_test_result_alloc_fail_after(0);
+  expect_error(shoal_connector_get_manager_locations(
+                   admin_connector, 0, &string_list, &error),
+               SHOAL_STATUS_OUT_OF_MEMORY, &error, "allocate string list");
+  expect_error(shoal_connector_get_servers(admin_connector, 0, &server_list,
+                                           &error),
+               SHOAL_STATUS_OUT_OF_MEMORY, &error, "allocate server list");
+  shoal_test_result_alloc_reset();
+  assert(shoal_test_connector_topology_block(admin_connector, 1));
+  expect_error(shoal_connector_get_root_tablet_location(
+                   admin_connector, 1, &bytes_result, &error),
+               SHOAL_STATUS_DEADLINE_EXCEEDED, &error, "deadline");
+  expect_error(shoal_connector_get_manager_locations(
+                   admin_connector, 1, &string_list, &error),
+               SHOAL_STATUS_DEADLINE_EXCEEDED, &error, "deadline");
+  expect_error(shoal_connector_get_servers(admin_connector, 1, &server_list,
+                                           &error),
+               SHOAL_STATUS_DEADLINE_EXCEEDED, &error, "deadline");
+  assert(shoal_test_connector_topology_block(admin_connector, 0));
 
   uint8_t start_row[] = {'s', '\0', 'r'};
   uint8_t start_cf[] = {'c', 'f'};
