@@ -800,6 +800,72 @@ func TestReleaseJobGivesUpWithinItsBudget(t *testing.T) {
 	}
 }
 
+// TestReleaseJobBoundsASilentCoordinator: a coordinator that accepts the
+// connection and then never answers must not hold shutdown open.
+//
+// The release context alone cannot do this. cclient's transports are not
+// context-aware once a call is on the wire, so compactionFailed only
+// returns when the socket timeout fires — which is longer than the
+// release budget. Only closing the socket enforces the budget, so the
+// fake here ignores the context entirely and unblocks solely on Close:
+// if the watcher regresses, this test hangs rather than passing.
+func TestReleaseJobBoundsASilentCoordinator(t *testing.T) {
+	// Closed by the connection watcher; the blocked RPC waits on it the
+	// way a real socket read waits on the transport being torn down.
+	socketTorn := make(chan struct{})
+	svc := &fakeCoordinator{
+		onFailed: func(int) error {
+			<-socketTorn
+			return errors.New("read tcp 10.0.0.1:9999: use of closed network connection")
+		},
+	}
+
+	var once sync.Once
+	cc := &fakeConn{svc: svc}
+	cc.onClose = func() { once.Do(func() { close(socketTorn) }) }
+
+	dial := func(context.Context, string, string, string) (coordinatorConn, error) {
+		t.Error("release redialed; the budget expired during the first attempt")
+		return nil, errors.New("unexpected dial")
+	}
+	cfg := testPollConfig(&scriptedResolver{results: []resolveResult{{addr: "manager-a:9999"}}}, dial)
+	cfg.releaseTimeout = 200 * time.Millisecond
+
+	logger, logs := testLogger()
+	job := translatableJob(ecidPrefix + "0d1a4b0e-0000-0000-0000-000000000003")
+
+	done := make(chan bool, 1)
+	start := time.Now()
+	go func() {
+		done <- releaseJob(context.Background(), logger, cc, cfg, job, compactjob.ClassCommitUnavailable)
+	}()
+
+	var usable bool
+	select {
+	case usable = <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("releaseJob never returned; the budget is not enforced on in-flight RPCs")
+	}
+	elapsed := time.Since(start)
+
+	if elapsed > 5*time.Second {
+		t.Fatalf("release took %s, want it bounded by the %s budget", elapsed, cfg.releaseTimeout)
+	}
+	if usable {
+		t.Error("releaseJob reported the connection usable after the watcher closed it")
+	}
+	if cc.closeCount() == 0 {
+		t.Error("the wedged connection was never closed")
+	}
+	if len(svc.releases()) != 0 {
+		t.Errorf("releases = %v, want none recorded; the coordinator never answered", svc.releases())
+	}
+	out := logs.String()
+	if !strings.Contains(out, "release: gave up") || !strings.Contains(out, "level=ERROR") {
+		t.Fatalf("give-up not logged for the operator:\n%s", out)
+	}
+}
+
 // TestDrainCoordinatorStopsAfterJobBudget: a coordinator that keeps
 // offering jobs shoal declines must not become a hot loop. The drain
 // yields after its budget and reports idle so the outer backoff applies.

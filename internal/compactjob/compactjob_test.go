@@ -22,6 +22,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"strings"
 	"testing"
 
@@ -756,6 +757,184 @@ func TestTranslateChecksStructureBeforeCapability(t *testing.T) {
 	})
 
 	assertRefused(t, job, Options{}, ClassMalformedJob, "files")
+}
+
+// TestTranslateChecksEveryFieldForStructureFirst pins the pass split
+// across fields, not just within one. Each case is a job with a
+// structural fault in one field and a capability gap in another; the
+// structural one must win regardless of which field it is in, because a
+// job nobody can run is more actionable than one only Java can run.
+//
+// Checking only within a field would let the first capability gap short
+// circuit the walk and hide the real fault.
+func TestTranslateChecksEveryFieldForStructureFirst(t *testing.T) {
+	tests := []struct {
+		name      string
+		mutate    func(*tabletserver.TExternalCompactionJob)
+		wantClass string
+		wantField string
+	}{
+		{
+			// Structural fault sits in a later field than the gap.
+			name: "unported iterator does not hide a malformed input",
+			mutate: func(job *tabletserver.TExternalCompactionJob) {
+				job.Files = append(job.Files, &tabletserver.InputFile{
+					MetadataFileEntry: storedFile("hdfs://nn/accumulo/tables/2/t-0001/F0003.rf"),
+					Size:              -1,
+				})
+				job.IteratorSettings = iterConfig(&tabletserver.TIteratorSetting{
+					Priority: 1, Name: "latent", IteratorClass: latentClass,
+				})
+			},
+			wantClass: ClassMalformedJob,
+			wantField: "files[2]",
+		},
+		{
+			// ...and in an earlier one.
+			name: "unsupported codec does not hide a malformed iterator",
+			mutate: func(job *tabletserver.TExternalCompactionJob) {
+				job.Overrides = map[string]string{propCompressType: "zstd"}
+				job.IteratorSettings = iterConfig(nil)
+			},
+			wantClass: ClassMalformedJob,
+			wantField: "iteratorSettings[0]",
+		},
+		{
+			// An unparsable memory value is a syntax fault, so it is
+			// pass 1 even though the property itself is supported.
+			name: "fenced input does not hide an unparsable block size",
+			mutate: func(job *tabletserver.TExternalCompactionJob) {
+				job.Files[0].MetadataFileEntry = fencedFile(
+					"hdfs://nn/accumulo/tables/2/t-0001/F0001.rf", "d", "f")
+				job.Overrides = map[string]string{propCompressBlockSize: "not-a-size"}
+			},
+			wantClass: ClassMalformedJob,
+			wantField: "overrides[" + propCompressBlockSize + "]",
+		},
+		{
+			// Inside pass 2 the order is inputs, encoding, iterators;
+			// these three cases pin each boundary.
+			name: "fenced input outranks an unsupported codec",
+			mutate: func(job *tabletserver.TExternalCompactionJob) {
+				job.Files[0].MetadataFileEntry = fencedFile(
+					"hdfs://nn/accumulo/tables/2/t-0001/F0001.rf", "d", "f")
+				job.Overrides = map[string]string{propCompressType: "zstd"}
+			},
+			wantClass: ClassRangedInputFile,
+			wantField: "files[0]",
+		},
+		{
+			name: "unsupported codec outranks an unported iterator",
+			mutate: func(job *tabletserver.TExternalCompactionJob) {
+				job.Overrides = map[string]string{propCompressType: "zstd"}
+				job.IteratorSettings = iterConfig(&tabletserver.TIteratorSetting{
+					Priority: 1, Name: "latent", IteratorClass: latentClass,
+				})
+			},
+			wantClass: ClassUnsupportedProperty,
+			wantField: "overrides[" + propCompressType + "]",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			job := validJob()
+			tc.mutate(job)
+			assertRefused(t, job, Options{}, tc.wantClass, tc.wantField)
+		})
+	}
+}
+
+// TestTranslateRefusesOverflowingInputTotals: the DataFileValue sizes
+// come off the wire. Summing them without a guard wraps negative, which
+// would make a job of impossible size compare *under* the byte budget
+// and be accepted — the limit has to survive hostile inputs, not just
+// large ones.
+func TestTranslateRefusesOverflowingInputTotals(t *testing.T) {
+	t.Run("bytes", func(t *testing.T) {
+		job := validJob()
+		job.Files[0].Size = math.MaxInt64
+		job.Files[1].Size = math.MaxInt64
+
+		r := assertRefused(t, job, Options{Limits: DefaultLimits()}, ClassMalformedJob, "files[1]")
+		if !strings.Contains(r.Detail, "overflow") {
+			t.Fatalf("detail = %q, want it to name the overflow", r.Detail)
+		}
+	})
+
+	t.Run("entries", func(t *testing.T) {
+		job := validJob()
+		job.Files[0].Entries = math.MaxInt64
+		job.Files[1].Entries = 1
+
+		assertRefused(t, job, Options{Limits: DefaultLimits()}, ClassMalformedJob, "files[1]")
+	})
+
+	t.Run("no budget configured still refuses", func(t *testing.T) {
+		// The guard is about the reported totals being truthful, not
+		// only about enforcing a limit.
+		job := validJob()
+		job.Files[0].Size = math.MaxInt64
+		job.Files[1].Size = 1
+
+		assertRefused(t, job, Options{Limits: Limits{}}, ClassMalformedJob, "files[1]")
+	})
+
+	t.Run("summing to exactly MaxInt64 is accepted", func(t *testing.T) {
+		job := validJob()
+		job.Files[0].Size = math.MaxInt64 - 1
+		job.Files[1].Size = 1
+		job.Files[0].Entries = math.MaxInt64
+		job.Files[1].Entries = 0
+
+		plan := mustTranslate(t, job, Options{Limits: Limits{}})
+		if plan.TotalInputBytes != math.MaxInt64 {
+			t.Fatalf("TotalInputBytes = %d, want %d", plan.TotalInputBytes, int64(math.MaxInt64))
+		}
+		if plan.TotalInputEntries != math.MaxInt64 {
+			t.Fatalf("TotalInputEntries = %d, want %d", plan.TotalInputEntries, int64(math.MaxInt64))
+		}
+	})
+}
+
+// TestTranslateDetectsDuplicatesByDecodedPath: the same RFile can be
+// spelled several ways in metadataFileEntry — different JSON field
+// order, or the legacy bare path. Comparing the raw entries would let
+// two spellings of one file through, and merging a file with itself
+// doubles every cell it holds.
+func TestTranslateDetectsDuplicatesByDecodedPath(t *testing.T) {
+	const dup = "hdfs://nn/accumulo/tables/2/t-0001/F0001.rf"
+
+	t.Run("different json field order", func(t *testing.T) {
+		job := validJob()
+		job.Files[1].MetadataFileEntry = fmt.Sprintf(
+			`{"endRow":"","startRow":"","path":"%s"}`, dup)
+
+		r := assertRefused(t, job, Options{}, ClassMalformedJob, "files[1]")
+		if !strings.Contains(r.Detail, dup) {
+			t.Fatalf("detail = %q, want the shared path", r.Detail)
+		}
+	})
+
+	t.Run("json and legacy bare path", func(t *testing.T) {
+		job := validJob()
+		job.Files[1].MetadataFileEntry = dup
+
+		assertRefused(t, job, Options{}, ClassMalformedJob, "files[1]")
+	})
+
+	t.Run("output aliasing an input spelled differently", func(t *testing.T) {
+		job := validJob()
+		job.OutputFile = dup
+
+		assertRefused(t, job, Options{}, ClassMalformedJob, "outputFile")
+	})
+
+	t.Run("distinct paths are not duplicates", func(t *testing.T) {
+		job := validJob()
+		job.Files[1].MetadataFileEntry = "hdfs://nn/accumulo/tables/2/t-0001/F0002.rf"
+		mustTranslate(t, job, Options{})
+	})
 }
 
 // TestPlanIsExecutable closes the loop: the translated plan, fed real

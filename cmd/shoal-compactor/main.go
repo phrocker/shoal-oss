@@ -106,6 +106,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -575,6 +576,9 @@ func executeJob(ctx context.Context, logger *slog.Logger, cc coordinatorConn, cf
 //   - A broken connection does not end it. The address is re-resolved
 //     (following a manager failover mid-job) and redialed until the
 //     budget runs out.
+//   - A silent coordinator does not extend it. Thrift I/O already in
+//     flight ignores context cancellation, so the budget is enforced by
+//     closing the socket rather than by the RPC's context alone.
 //
 // If the budget does run out the failure is logged loudly and the job is
 // left to the coordinator's own timeout — the alternative, blocking
@@ -586,7 +590,7 @@ func releaseJob(
 	cfg pollConfig,
 	job *tabletserver.TExternalCompactionJob,
 	class string,
-) bool {
+) (connUsable bool) {
 	ecid := job.GetExternalCompactionId()
 	shuttingDown := ctx.Err() != nil
 	if shuttingDown {
@@ -604,7 +608,7 @@ func releaseJob(
 	// The first attempt reuses the open connection unless shutdown has
 	// already closed it underneath us.
 	conn := cc
-	connUsable := true
+	connUsable = true
 	if shuttingDown {
 		conn = nil
 	}
@@ -615,6 +619,47 @@ func releaseJob(
 	defer func() {
 		if owned != nil {
 			_ = owned.Close()
+		}
+	}()
+
+	// releaseCtx bounds the retry loop, but not an RPC already on the
+	// wire: cclient's transports are not context-aware once a call is in
+	// flight, so a coordinator that accepts the connection and then goes
+	// silent only unblocks CompactionFailed when the socket timeout
+	// fires — which can outlast -release-timeout and stall shutdown.
+	// Closing the socket in use is what actually enforces the budget.
+	var (
+		mu              sync.Mutex
+		active          coordinatorConn
+		closedByWatcher bool
+	)
+	setActive := func(c coordinatorConn) {
+		mu.Lock()
+		active = c
+		mu.Unlock()
+	}
+	watcherDone := make(chan struct{})
+	watcherExited := make(chan struct{})
+	go func() {
+		defer close(watcherExited)
+		select {
+		case <-releaseCtx.Done():
+			mu.Lock()
+			if active != nil {
+				// Only the caller's connection is reported spent; one
+				// this function dialled is closed by its own defer.
+				closedByWatcher = active == cc
+				_ = active.Close()
+			}
+			mu.Unlock()
+		case <-watcherDone:
+		}
+	}()
+	defer func() {
+		close(watcherDone)
+		<-watcherExited
+		if closedByWatcher {
+			connUsable = false
 		}
 	}()
 
@@ -636,6 +681,7 @@ func releaseJob(
 			conn, owned = fresh, fresh
 		}
 
+		setActive(conn)
 		err := conn.Raw().CompactionFailed(
 			releaseCtx,
 			client.NewTInfo(),
@@ -645,6 +691,7 @@ func releaseJob(
 			class,
 			compactioncoordinator.TCompactionState_FAILED,
 		)
+		setActive(nil)
 		if err == nil {
 			logger.Info("compaction slot released to coordinator",
 				slog.String("ecid", ecid),

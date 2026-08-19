@@ -360,13 +360,26 @@ func ExtentString(ex *data.TKeyExtent) string {
 //	fateId               → Plan.FateID
 //	overrides            → Codec, BlockSize       (allowlisted properties)
 //
-// The checks run structure-first (a malformed job is reported as
-// malformed even if it also happens to use an unported iterator) so the
-// class an operator sees names the most actionable problem.
+// Checking happens in two complete passes, and the split is load-bearing
+// for the class an operator sees:
+//
+//	pass 1  every structural check, over every field: is this assignment
+//	        internally consistent? Failures are ClassMalformedJob and say
+//	        nothing about shoal.
+//	pass 2  every capability check: could *shoal* reproduce this exact
+//	        compaction? Failures name the missing capability.
+//
+// A job that is both malformed and unsupported is therefore always
+// reported as malformed, no matter which field each problem is in —
+// a job nobody can run is more actionable than a job only Java can run.
+// Within pass 2 the order is inputs, then output encoding, then
+// iterators, so a job with several gaps always reports the same one.
 func Translate(job *tabletserver.TExternalCompactionJob, opts Options) (*Plan, error) {
 	if job == nil {
 		return nil, refuse(ClassMalformedJob, "", "nil job")
 	}
+
+	// --- pass 1: structure ------------------------------------------
 
 	ecid := job.GetExternalCompactionId()
 	if ecid == "" {
@@ -387,7 +400,7 @@ func Translate(job *tabletserver.TExternalCompactionJob, opts Options) (*Plan, e
 		return nil, err
 	}
 
-	inputs, totalBytes, totalEntries, err := translateInputs(job, opts.Limits)
+	inputs, totalBytes, totalEntries, err := parseInputs(job)
 	if err != nil {
 		return nil, err
 	}
@@ -397,13 +410,29 @@ func Translate(job *tabletserver.TExternalCompactionJob, opts Options) (*Plan, e
 		return nil, err
 	}
 
-	codec, blockSize, err := translateOverrides(job.GetOverrides(), opts)
+	overrideKeys, blockSizeOverride, err := parseOverrides(job.GetOverrides())
+	if err != nil {
+		return nil, err
+	}
+
+	rawIters, err := parseIterators(job)
+	if err != nil {
+		return nil, err
+	}
+
+	// --- pass 2: capability -----------------------------------------
+
+	if err := checkInputCapability(inputs, totalBytes, opts.Limits); err != nil {
+		return nil, err
+	}
+
+	codec, blockSize, err := resolveOutputEncoding(job.GetOverrides(), overrideKeys, blockSizeOverride, opts)
 	if err != nil {
 		return nil, err
 	}
 
 	fullMajor := !job.GetPropagateDeletes()
-	iters, err := translateIterators(job, fullMajor)
+	iters, err := mapIterators(rawIters, fullMajor)
 	if err != nil {
 		return nil, err
 	}
@@ -419,7 +448,7 @@ func Translate(job *tabletserver.TExternalCompactionJob, opts Options) (*Plan, e
 		Extent:              extent,
 		Kind:                kind,
 		FateID:              fateID,
-		Inputs:              inputs,
+		Inputs:              inputFiles(inputs),
 		OutputFile:          outputFile,
 		PropagateDeletes:    job.GetPropagateDeletes(),
 		TotalInputBytes:     totalBytes,
@@ -484,21 +513,38 @@ func fateIDString(fate *manager.TFateId) string {
 	return fate.GetType().String() + ":" + fate.GetTxUUIDStr()
 }
 
-// translateInputs decodes every input file entry and enforces the input
-// budget. Fenced (ranged) entries are refused: shoal's composer reads
-// whole RFiles, so honoring a fence is not something it can currently do,
-// and ignoring one would merge cells from outside the tablet.
-func translateInputs(job *tabletserver.TExternalCompactionJob, limits Limits) ([]InputFile, int64, int64, error) {
+// parsedInput is one structurally valid input entry, carrying the fence
+// that pass 2 refuses on.
+type parsedInput struct {
+	file             InputFile
+	field            string
+	startRow, endRow string
+}
+
+func (p parsedInput) fenced() bool { return p.startRow != "" || p.endRow != "" }
+
+func inputFiles(inputs []parsedInput) []InputFile {
+	out := make([]InputFile, 0, len(inputs))
+	for _, in := range inputs {
+		out = append(out, in.file)
+	}
+	return out
+}
+
+// parseInputs decodes every input entry and checks the job's inputs for
+// internal consistency. Structure only: whether shoal can read a given
+// file, and whether the job fits this compactor's budget, are pass-2
+// questions (checkInputCapability).
+func parseInputs(job *tabletserver.TExternalCompactionJob) ([]parsedInput, int64, int64, error) {
 	files := job.GetFiles()
 	if len(files) == 0 {
 		return nil, 0, 0, refuse(ClassMalformedJob, "files", "job has no input files")
 	}
-	if limits.MaxInputFiles > 0 && len(files) > limits.MaxInputFiles {
-		return nil, 0, 0, refuse(ClassResourceLimitExceeded, "files",
-			"%d input files exceeds the configured limit of %d", len(files), limits.MaxInputFiles)
-	}
 
-	out := make([]InputFile, 0, len(files))
+	out := make([]parsedInput, 0, len(files))
+	// Duplicates are detected by decoded path, not by the raw entry: the
+	// same RFile can arrive as JSON with different field order or as a
+	// legacy bare path, and merging it twice would double its cells.
 	seen := make(map[string]int, len(files))
 	var totalBytes, totalEntries int64
 	for i, f := range files {
@@ -514,62 +560,87 @@ func translateInputs(job *tabletserver.TExternalCompactionJob, limits Limits) ([
 			return nil, 0, 0, refuse(ClassMalformedJob, field,
 				"negative DataFileValue (size=%d entries=%d)", f.GetSize(), f.GetEntries())
 		}
-		if prev, dup := seen[entry]; dup {
-			return nil, 0, 0, refuse(ClassMalformedJob, field,
-				"duplicates files[%d] (%s); compacting a file twice would double its cells", prev, entry)
-		}
-		seen[entry] = i
 
-		path, err := decodeFileEntry(entry, field)
+		in, err := decodeFileEntry(entry, field)
 		if err != nil {
 			return nil, 0, 0, err
 		}
+		in.file.Size = f.GetSize()
+		in.file.Entries = f.GetEntries()
+		in.file.Timestamp = f.GetTimestamp()
 
+		if prev, dup := seen[in.file.Path]; dup {
+			return nil, 0, 0, refuse(ClassMalformedJob, field,
+				"duplicates files[%d] (%s); compacting a file twice would double its cells",
+				prev, in.file.Path)
+		}
+		seen[in.file.Path] = i
+
+		// The declared sizes are attacker- or bug-supplied. Summing them
+		// blindly can wrap negative, which would slip past the budget
+		// check below and report nonsense totals in the plan.
+		if totalBytes > math.MaxInt64-f.GetSize() || totalEntries > math.MaxInt64-f.GetEntries() {
+			return nil, 0, 0, refuse(ClassMalformedJob, field,
+				"DataFileValue totals overflow int64 (size=%d entries=%d after %d files); "+
+					"the declared file sizes cannot describe a real tablet",
+				f.GetSize(), f.GetEntries(), i)
+		}
 		totalBytes += f.GetSize()
 		totalEntries += f.GetEntries()
-		out = append(out, InputFile{
-			Entry:     entry,
-			Path:      path,
-			Size:      f.GetSize(),
-			Entries:   f.GetEntries(),
-			Timestamp: f.GetTimestamp(),
-		})
-	}
-
-	if limits.MaxTotalInputBytes > 0 && totalBytes > limits.MaxTotalInputBytes {
-		return nil, 0, 0, refuse(ClassResourceLimitExceeded, "files",
-			"total input size %d bytes exceeds the configured limit of %d bytes",
-			totalBytes, limits.MaxTotalInputBytes)
+		out = append(out, in)
 	}
 	return out, totalBytes, totalEntries, nil
 }
 
-// decodeFileEntry extracts the file's URI from a metadata file entry.
-// Accumulo 3+ sends StoredTabletFile JSON ({"path":...,"startRow":...,
-// "endRow":...}); the legacy form is a bare path. A JSON entry carrying a
-// non-empty row fence is refused.
-func decodeFileEntry(entry, field string) (string, error) {
+// checkInputCapability refuses inputs shoal cannot read and jobs beyond
+// this compactor's configured budget. Fences are reported first: raising
+// a limit could never make a fenced job runnable, so it is the more
+// useful answer when a job has both problems.
+func checkInputCapability(inputs []parsedInput, totalBytes int64, limits Limits) error {
+	for _, in := range inputs {
+		if in.fenced() {
+			return refuse(ClassRangedInputFile, in.field,
+				"input %s is fenced to (%q,%q]; shoal reads whole RFiles, so the fence cannot be honored",
+				in.file.Path, in.startRow, in.endRow)
+		}
+	}
+	if limits.MaxInputFiles > 0 && len(inputs) > limits.MaxInputFiles {
+		return refuse(ClassResourceLimitExceeded, "files",
+			"%d input files exceeds the configured limit of %d", len(inputs), limits.MaxInputFiles)
+	}
+	if limits.MaxTotalInputBytes > 0 && totalBytes > limits.MaxTotalInputBytes {
+		return refuse(ClassResourceLimitExceeded, "files",
+			"total input size %d bytes exceeds the configured limit of %d bytes",
+			totalBytes, limits.MaxTotalInputBytes)
+	}
+	return nil
+}
+
+// decodeFileEntry extracts the file's URI and row fence from a metadata
+// file entry. Accumulo 3+ sends StoredTabletFile JSON ({"path":...,
+// "startRow":...,"endRow":...}); the legacy form is a bare path.
+func decodeFileEntry(entry, field string) (parsedInput, error) {
+	in := parsedInput{field: field, file: InputFile{Entry: entry}}
 	if !strings.HasPrefix(strings.TrimSpace(entry), "{") {
 		// Legacy bare-path form (Accumulo ≤ 2.0). Whole-file by
-		// definition, so nothing to fence-check.
-		return entry, nil
+		// definition, so there is no fence to carry.
+		in.file.Path = entry
+		return in, nil
 	}
 	decoded, err := metadata.DecodeStoredTabletFile([]byte(entry))
 	if err != nil {
-		return "", refuse(ClassMalformedJob, field, "undecodable StoredTabletFile entry: %v", err)
+		return parsedInput{}, refuse(ClassMalformedJob, field,
+			"undecodable StoredTabletFile entry: %v", err)
 	}
-	if decoded.StartRow != "" || decoded.EndRow != "" {
-		return "", refuse(ClassRangedInputFile, field,
-			"input %s is fenced to (%q,%q]; shoal reads whole RFiles, so the fence cannot be honored",
-			decoded.Path, decoded.StartRow, decoded.EndRow)
-	}
-	return decoded.Path, nil
+	in.file.Path = decoded.Path
+	in.startRow, in.endRow = decoded.StartRow, decoded.EndRow
+	return in, nil
 }
 
 // translateOutput validates the destination file. An output that aliases
 // an input would destroy the input mid-compaction, so it is refused even
 // though the coordinator should never produce one.
-func translateOutput(job *tabletserver.TExternalCompactionJob, inputs []InputFile) (string, error) {
+func translateOutput(job *tabletserver.TExternalCompactionJob, inputs []parsedInput) (string, error) {
 	out := job.GetOutputFile()
 	if out == "" {
 		return "", refuse(ClassMalformedJob, "outputFile", "missing")
@@ -583,7 +654,7 @@ func translateOutput(job *tabletserver.TExternalCompactionJob, inputs []InputFil
 			"%q does not name an RFile (.rf)", out)
 	}
 	for i, in := range inputs {
-		if in.Path == out {
+		if in.file.Path == out {
 			return "", refuse(ClassMalformedJob, "outputFile",
 				"output %s is also files[%d]", out, i)
 		}
@@ -633,24 +704,46 @@ var accumuloCodecs = map[string]string{
 // setting is refused rather than trusted.
 const maxBlockSize = 1 << 30 // 1 GiB
 
-// translateOverrides resolves the output encoding from the job's table
-// property overrides. Unknown properties are refused rather than ignored:
-// an override exists precisely because someone wanted this compaction to
-// behave differently, and silently dropping it would produce an output
-// that does not match the request.
+// parseOverrides checks the syntax of the job's property overrides and
+// returns the keys in sorted order. Sorting is what makes a job with
+// several unsupported overrides always report the same one: map
+// iteration order would otherwise change the class an operator sees
+// between identical jobs.
 //
-// Keys are visited in sorted order so a job with several unsupported
-// overrides always reports the same one — map iteration order would make
-// the refusal an operator sees change between identical jobs.
-func translateOverrides(overrides map[string]string, opts Options) (string, int, error) {
-	codec := opts.DefaultCodec
-	blockSize := opts.DefaultBlockSize
-
+// Whether shoal can *honor* a property is a pass-2 question
+// (resolveOutputEncoding); only a value that is not a legal property
+// value at all is malformed here.
+func parseOverrides(overrides map[string]string) ([]string, int64, error) {
 	keys := make([]string, 0, len(overrides))
 	for key := range overrides {
 		keys = append(keys, key)
 	}
 	sort.Strings(keys)
+
+	blockSize := int64(0)
+	if raw, ok := overrides[propCompressBlockSize]; ok {
+		n, err := parseMemoryBytes(raw)
+		if err != nil {
+			return nil, 0, refuse(ClassMalformedJob, "overrides["+propCompressBlockSize+"]", "%v", err)
+		}
+		blockSize = n
+	}
+	return keys, blockSize, nil
+}
+
+// resolveOutputEncoding turns the job's overrides into the output RFile's
+// codec and block size. Unknown properties are refused rather than
+// ignored: an override exists precisely because someone wanted this
+// compaction to behave differently, and silently dropping it would
+// produce an output that does not match the request.
+func resolveOutputEncoding(
+	overrides map[string]string,
+	keys []string,
+	blockSizeOverride int64,
+	opts Options,
+) (string, int, error) {
+	codec := opts.DefaultCodec
+	blockSize := opts.DefaultBlockSize
 
 	for _, key := range keys {
 		value := overrides[key]
@@ -668,15 +761,12 @@ func translateOverrides(overrides map[string]string, opts Options) (string, int,
 			}
 			codec = mapped
 		case key == propCompressBlockSize:
-			n, err := parseMemoryBytes(value)
-			if err != nil {
-				return "", 0, refuse(ClassMalformedJob, field, "%v", err)
-			}
-			if n <= 0 || n > maxBlockSize {
+			if blockSizeOverride <= 0 || blockSizeOverride > maxBlockSize {
 				return "", 0, refuse(ClassUnsupportedProperty, field,
-					"block size %d is outside the supported range (1..%d bytes)", n, maxBlockSize)
+					"block size %d is outside the supported range (1..%d bytes)",
+					blockSizeOverride, maxBlockSize)
 			}
-			blockSize = int(n)
+			blockSize = int(blockSizeOverride)
 		case ignorableOverrides[key]:
 			// Filesystem placement only — cannot change output cells.
 		default:
@@ -739,20 +829,26 @@ var systemIterators = map[string]bool{
 	iterrt.IterVisibility: true,
 }
 
-// translateIterators maps job.iteratorSettings onto shoal's iterator
-// registry.
+// rawIterator is one structurally valid stack entry, before it is mapped
+// onto a shoal iterator.
+type rawIterator struct {
+	name     string
+	class    string
+	field    string
+	priority int32
+	options  map[string]string
+}
+
+// parseIterators checks job.iteratorSettings for internal consistency,
+// over the whole list, before any entry is mapped: an unported class in
+// the first entry must not hide a malformed second one.
 //
 // Order is taken from the coordinator's list, not re-sorted: Java applies
 // the settings in list order (IteratorConfigUtil.loadIterators), and
 // re-sorting here could build a different stack than Java would from the
 // same job. Well-formed jobs are already priority-ordered, so a list that
 // is not is treated as malformed rather than silently reinterpreted.
-//
-// The translated stack is then built once against an empty source: that
-// runs every iterator's Init, which is where iterrt validates options, so
-// a bad option is refused before any input is read instead of failing
-// mid-compaction.
-func translateIterators(job *tabletserver.TExternalCompactionJob, fullMajor bool) ([]Iterator, error) {
+func parseIterators(job *tabletserver.TExternalCompactionJob) ([]rawIterator, error) {
 	if !job.IsSetIteratorSettings() || job.GetIteratorSettings() == nil {
 		return nil, nil
 	}
@@ -761,7 +857,7 @@ func translateIterators(job *tabletserver.TExternalCompactionJob, fullMajor bool
 		return nil, nil
 	}
 
-	out := make([]Iterator, 0, len(settings))
+	out := make([]rawIterator, 0, len(settings))
 	seen := make(map[string]int, len(settings))
 	prevPriority := int32(math.MinInt32)
 	for i, s := range settings {
@@ -789,26 +885,49 @@ func translateIterators(job *tabletserver.TExternalCompactionJob, fullMajor bool
 		}
 		prevPriority = s.GetPriority()
 
-		alias, ok := itercfg.ClassAllowlist[class]
-		if !ok {
-			return nil, refuse(ClassUnsupportedIterator, field,
-				"%s has no shoal port; the compaction would silently drop its behaviour", class)
-		}
-		if systemIterators[alias] {
-			return nil, refuse(ClassUnsupportedIterator, field,
-				"%s is a system iterator shoal's compaction composer installs itself; "+
-					"running it twice would change the output", class)
-		}
-
+		// Copied, not aliased: the plan must not change if the transport
+		// reuses or recycles the job struct.
 		options := make(map[string]string, len(s.GetProperties()))
 		for k, v := range s.GetProperties() {
 			options[k] = v
 		}
+		out = append(out, rawIterator{
+			name:     name,
+			class:    class,
+			field:    field,
+			priority: s.GetPriority(),
+			options:  options,
+		})
+	}
+	return out, nil
+}
+
+// mapIterators resolves each entry onto shoal's iterator registry, then
+// builds the stack once against an empty source: that runs every
+// iterator's Init, which is where iterrt validates options, so a bad
+// option is refused before any input is read instead of failing
+// mid-compaction.
+func mapIterators(raw []rawIterator, fullMajor bool) ([]Iterator, error) {
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	out := make([]Iterator, 0, len(raw))
+	for _, r := range raw {
+		alias, ok := itercfg.ClassAllowlist[r.class]
+		if !ok {
+			return nil, refuse(ClassUnsupportedIterator, r.field,
+				"%s has no shoal port; the compaction would silently drop its behaviour", r.class)
+		}
+		if systemIterators[alias] {
+			return nil, refuse(ClassUnsupportedIterator, r.field,
+				"%s is a system iterator shoal's compaction composer installs itself; "+
+					"running it twice would change the output", r.class)
+		}
 		out = append(out, Iterator{
-			Name:     name,
-			Class:    class,
-			Priority: s.GetPriority(),
-			Spec:     iterrt.IterSpec{Name: alias, Options: options},
+			Name:     r.name,
+			Class:    r.class,
+			Priority: r.priority,
+			Spec:     iterrt.IterSpec{Name: alias, Options: r.options},
 		})
 	}
 
