@@ -47,6 +47,41 @@ func (l *topologyLocator) Children(_ context.Context, p string) ([]string, error
 	return children, nil
 }
 
+type cancelAfterMissingLockLocator struct {
+	children        map[string][]string
+	data            map[string][]byte
+	cancel          context.CancelFunc
+	missingLockPath string
+}
+
+func (l *cancelAfterMissingLockLocator) InstancePath() string { return "/accumulo/uuid-1" }
+
+func (l *cancelAfterMissingLockLocator) GetRaw(ctx context.Context, p string) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if p == l.missingLockPath {
+		l.cancel()
+		return nil, fmt.Errorf("get %s: %w", p, gozk.ErrNoNode)
+	}
+	data, ok := l.data[p]
+	if !ok {
+		return nil, fmt.Errorf("get %s: %w", p, gozk.ErrNoNode)
+	}
+	return data, nil
+}
+
+func (l *cancelAfterMissingLockLocator) Children(ctx context.Context, p string) ([]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	children, ok := l.children[p]
+	if !ok {
+		return nil, fmt.Errorf("children %s: %w", p, gozk.ErrNoNode)
+	}
+	return children, nil
+}
+
 func lockNode(sequence string) string {
 	return "zlock#f50c7911-a203-4e3d-b006-bdb30848f5bd#" + sequence
 }
@@ -695,6 +730,39 @@ func (c *blockingGetConn) Close() {
 	c.once.Do(func() { close(c.closed) })
 }
 
+type scriptedRawTopologyConn struct {
+	children map[string][]string
+	get      func(string) ([]byte, error)
+	closes   *atomic.Int32
+}
+
+func (c *scriptedRawTopologyConn) AddAuth(string, []byte) error { return nil }
+
+func (c *scriptedRawTopologyConn) Get(znodePath string) ([]byte, *gozk.Stat, error) {
+	if c.get == nil {
+		return nil, nil, fmt.Errorf("get %s: %w", znodePath, gozk.ErrNoNode)
+	}
+	data, err := c.get(znodePath)
+	if err != nil {
+		return nil, nil, err
+	}
+	return data, &gozk.Stat{}, nil
+}
+
+func (c *scriptedRawTopologyConn) Children(znodePath string) ([]string, *gozk.Stat, error) {
+	children, ok := c.children[znodePath]
+	if !ok {
+		return nil, nil, fmt.Errorf("children %s: %w", znodePath, gozk.ErrNoNode)
+	}
+	return append([]string(nil), children...), &gozk.Stat{}, nil
+}
+
+func (c *scriptedRawTopologyConn) Close() {
+	if c.closes != nil {
+		c.closes.Add(1)
+	}
+}
+
 func TestClientServicesPromotesNextSurvivingServerLock(t *testing.T) {
 	root := "/accumulo/uuid-1"
 	serverPath := path.Join(root, "tservers", "default", "tserver-a:9997")
@@ -755,6 +823,28 @@ func TestClientServicesUsesOnlyTheSurvivingHolderLock(t *testing.T) {
 	}
 }
 
+func TestClientServicesSkipsPlaceholderHolderDuringHandoff(t *testing.T) {
+	root := "/accumulo/uuid-1"
+	serverPath := path.Join(root, "tservers", "default", "tserver-a:9997")
+	locator := &topologyLocator{
+		children: map[string][]string{
+			path.Join(root, "tservers"):            {"default"},
+			path.Join(root, "tservers", "default"): {"tserver-a:9997"},
+			serverPath:                             {lockNode("0000000001"), lockNode("0000000002")},
+		},
+		data: map[string][]byte{
+			path.Join(serverPath, lockNode("0000000001")): clientLockData("0.0.0.0:0"),
+			path.Join(serverPath, lockNode("0000000002")): clientLockData("queued:9997"),
+		},
+	}
+	if _, err := ClientServices(context.Background(), locator); !errors.Is(err, ErrClientServiceUnavailable) {
+		t.Fatalf("error = %v, want ErrClientServiceUnavailable", err)
+	}
+	if _, err := ClientServiceAddresses(context.Background(), locator); !errors.Is(err, ErrClientServiceUnavailable) {
+		t.Fatalf("address error = %v, want ErrClientServiceUnavailable", err)
+	}
+}
+
 func TestClientServicesSkipsServerWithNoSurvivingLock(t *testing.T) {
 	root := "/accumulo/uuid-1"
 	serverPath := path.Join(root, "tservers", "default", "tserver-a:9997")
@@ -768,5 +858,73 @@ func TestClientServicesSkipsServerWithNoSurvivingLock(t *testing.T) {
 	}
 	if _, err := ClientServices(context.Background(), locator); !errors.Is(err, ErrClientServiceUnavailable) {
 		t.Fatalf("error = %v, want ErrClientServiceUnavailable", err)
+	}
+	if _, err := ClientServiceAddresses(context.Background(), locator); !errors.Is(err, ErrClientServiceUnavailable) {
+		t.Fatalf("address error = %v, want ErrClientServiceUnavailable", err)
+	}
+}
+
+func TestClientServicesCancellationWinsMidHandoffIteration(t *testing.T) {
+	root := "/accumulo/uuid-1"
+	serverPath := path.Join(root, "tservers", "default", "tserver-a:9997")
+	ctx, cancel := context.WithCancel(context.Background())
+	locator := &cancelAfterMissingLockLocator{
+		children: map[string][]string{
+			path.Join(root, "tservers"):            {"default"},
+			path.Join(root, "tservers", "default"): {"tserver-a:9997"},
+			serverPath:                             {lockNode("0000000001"), lockNode("0000000002")},
+		},
+		data: map[string][]byte{
+			path.Join(serverPath, lockNode("0000000002")): clientLockData("tserver-a:9997"),
+		},
+		cancel:          cancel,
+		missingLockPath: path.Join(serverPath, lockNode("0000000001")),
+	}
+	if _, err := ClientServices(ctx, locator); !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want context.Canceled", err)
+	}
+}
+
+func TestClientServicesHandoffUsesSingleScopedConnection(t *testing.T) {
+	root := "/accumulo/uuid-1"
+	serverPath := path.Join(root, "tservers", "default", "tserver-a:9997")
+	var connects atomic.Int32
+	var closes atomic.Int32
+	locator := &Locator{
+		instanceID: "uuid-1",
+		rawConnFactory: func() (rawZKConn, error) {
+			connects.Add(1)
+			return &scriptedRawTopologyConn{
+				children: map[string][]string{
+					path.Join(root, "tservers"):            {"default"},
+					path.Join(root, "tservers", "default"): {"tserver-a:9997"},
+					serverPath:                             {lockNode("0000000001"), lockNode("0000000002")},
+				},
+				get: func(znodePath string) ([]byte, error) {
+					switch znodePath {
+					case path.Join(serverPath, lockNode("0000000001")):
+						return nil, fmt.Errorf("get %s: %w", znodePath, gozk.ErrNoNode)
+					case path.Join(serverPath, lockNode("0000000002")):
+						return clientLockData("tserver-a:9997"), nil
+					default:
+						return nil, fmt.Errorf("get %s: %w", znodePath, gozk.ErrNoNode)
+					}
+				},
+				closes: &closes,
+			}, nil
+		},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	services, err := ClientServices(ctx, locator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := ClientService{Kind: TabletServerKind, Group: "default", Address: "tserver-a:9997"}
+	if len(services) != 1 || services[0] != want {
+		t.Fatalf("services = %+v, want [%+v]", services, want)
+	}
+	if connects.Load() != 1 || closes.Load() != 1 {
+		t.Fatalf("connects/closes = %d/%d, want 1/1", connects.Load(), closes.Load())
 	}
 }
