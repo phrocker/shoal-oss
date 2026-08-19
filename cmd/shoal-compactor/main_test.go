@@ -225,7 +225,9 @@ func translatableJob(ecid string) *tabletserver.TExternalCompactionJob {
 		Size:              4096,
 		Entries:           40,
 	}}
-	job.OutputFile = "hdfs://nn/t/2/C0002.rf"
+	// The coordinator's compaction temp name, which carries this job's
+	// own ECID (TabletNameGenerator.getNextDataFilenameForMajc).
+	job.OutputFile = "hdfs://nn/t/2/C0002.rf_tmp_" + ecid
 	job.PropagateDeletes = true
 	job.Kind = tabletserver.TCompactionKind_SYSTEM
 	job.IteratorSettings = &tabletserver.IteratorConfig{
@@ -863,6 +865,113 @@ func TestReleaseJobBoundsASilentCoordinator(t *testing.T) {
 	out := logs.String()
 	if !strings.Contains(out, "release: gave up") || !strings.Contains(out, "level=ERROR") {
 		t.Fatalf("give-up not logged for the operator:\n%s", out)
+	}
+}
+
+// TestReleaseJobClosesAConnectionDialedAfterTheBudget covers the gap
+// between the watcher and a late redial. The watcher fires once and
+// exits, so a connection opened after the deadline has no one left to
+// close it: without a deadline-aware registration it would go on to
+// start an RPC whose only bound is the socket timeout, which is exactly
+// the stall the budget exists to prevent.
+func TestReleaseJobClosesAConnectionDialedAfterTheBudget(t *testing.T) {
+	svc := &fakeCoordinator{
+		onFailed: func(int) error {
+			t.Error("an RPC started on a connection dialed after the budget expired")
+			return nil
+		},
+	}
+
+	late := &fakeConn{svc: svc}
+	dialed := make(chan struct{}, 1)
+	dial := func(ctx context.Context, _, _, _ string) (coordinatorConn, error) {
+		// Outlast the budget, the way a slow TCP connect would.
+		time.Sleep(300 * time.Millisecond)
+		dialed <- struct{}{}
+		return late, nil
+	}
+
+	cfg := testPollConfig(&scriptedResolver{results: []resolveResult{
+		{addr: "manager-a:9999"}, {addr: "manager-a:9999"},
+	}}, dial)
+	cfg.releaseTimeout = 100 * time.Millisecond
+
+	// A cancelled parent makes releaseJob skip the caller's connection
+	// and dial, which is the path that can outrun the watcher.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	logger, logs := testLogger()
+	job := translatableJob(ecidPrefix + "0d1a4b0e-0000-0000-0000-000000000004")
+	caller := &fakeConn{svc: svc}
+
+	usable := releaseJob(ctx, logger, caller, cfg, job, compactjob.ClassCommitUnavailable)
+
+	select {
+	case <-dialed:
+	default:
+		t.Fatal("the test never reached the late dial it is meant to cover")
+	}
+	if late.closeCount() == 0 {
+		t.Error("the late connection was never closed; it would leak and its RPC would only be bounded by the socket timeout")
+	}
+	if !usable {
+		t.Error("the caller's connection was reported spent; releaseJob never touched it")
+	}
+	if n := len(svc.releases()); n != 0 {
+		t.Errorf("releases = %d, want none; the budget was already gone", n)
+	}
+	if out := logs.String(); !strings.Contains(out, "release: gave up") {
+		t.Fatalf("give-up not logged for the operator:\n%s", out)
+	}
+}
+
+// TestReleaseJobReportsShutdownThatStartsMidRelease: the shutdown class
+// is the manager's only record of *why* a slot came back. Sampling the
+// parent context once, before the first attempt, reports a stale reason
+// for a job that was abandoned while the first attempt was on the wire.
+func TestReleaseJobReportsShutdownThatStartsMidRelease(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	svc := &fakeCoordinator{}
+	svc.onFailed = func(attempt int) error {
+		if attempt == 1 {
+			// SIGTERM lands while the first hand-back is in flight.
+			cancel()
+			return errors.New("write tcp 10.0.0.1:9999: broken pipe")
+		}
+		return nil
+	}
+
+	fresh := &fakeConn{svc: svc}
+	dial := func(context.Context, string, string, string) (coordinatorConn, error) {
+		return fresh, nil
+	}
+	cfg := testPollConfig(&scriptedResolver{results: []resolveResult{
+		{addr: "manager-a:9999"}, {addr: "manager-a:9999"},
+	}}, dial)
+
+	logger, _ := testLogger()
+	job := translatableJob(ecidPrefix + "0d1a4b0e-0000-0000-0000-000000000005")
+
+	if usable := releaseJob(ctx, logger, &fakeConn{svc: svc}, cfg, job, compactjob.ClassCommitUnavailable); usable {
+		t.Error("the caller's connection failed an RPC but was still reported usable")
+	}
+
+	rel := svc.releases()
+	if len(rel) != 1 {
+		t.Fatalf("releases = %+v, want exactly the retry to have been recorded", rel)
+	}
+	if rel[0].class != compactjob.ClassShuttingDown {
+		t.Fatalf("class = %q, want %q; shutdown began before this attempt",
+			rel[0].class, compactjob.ClassShuttingDown)
+	}
+	if rel[0].state != compactioncoordinator.TCompactionState_FAILED {
+		t.Fatalf("state = %v, want FAILED", rel[0].state)
+	}
+	if n := svc.completedCount(); n != 0 {
+		t.Fatalf("compactionCompleted calls = %d; shoal must never tell the manager a compaction succeeded", n)
 	}
 }
 

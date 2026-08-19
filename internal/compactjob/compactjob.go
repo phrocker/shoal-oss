@@ -61,6 +61,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"unicode/utf16"
 
 	"github.com/google/uuid"
 
@@ -109,8 +110,10 @@ const (
 	// itself, or options the ported iterator rejects.
 	ClassUnsupportedIterator = "org.apache.accumulo.shoal.UnsupportedIterator"
 
-	// ClassUnsupportedProperty: job.overrides carries a table property
-	// shoal cannot honor when writing the output RFile.
+	// ClassUnsupportedProperty: the table is configured in a way shoal
+	// cannot honor when writing the output — either an override the job
+	// carries, or (via the output file's extension) a table.file.type
+	// that is not RFile.
 	ClassUnsupportedProperty = "org.apache.accumulo.shoal.UnsupportedTableProperty"
 
 	// ClassUnsupportedCrypto: job.overrides configures on-disk
@@ -268,7 +271,15 @@ type Plan struct {
 	FateID string
 	// Inputs are the files to merge, in the coordinator's order.
 	Inputs []InputFile
-	// OutputFile is the path the compactor must write.
+	// OutputFile is the path the compactor must write, verbatim. It is
+	// the coordinator's per-job temporary name
+	// (<dir>/<A|C><name>.rf_tmp_<ECID>, from
+	// TabletNameGenerator.getNextDataFilenameForMajc), not the file the
+	// tablet ends up referencing: the *manager* renames it at commit
+	// (manager/.../coordinator/commit/RenameCompactionFile). A compactor
+	// that wrote the final name directly, or renamed this one itself,
+	// would be publishing a file the manager has not accepted, so shoal
+	// writes this path and nothing else.
 	OutputFile string
 	// PropagateDeletes is the job flag as sent: false means this output
 	// becomes the tablet's only file, so tombstones may be dropped.
@@ -361,7 +372,7 @@ func ExtentString(ex *data.TKeyExtent) string {
 //	extent               → Plan.Extent, TableID   (must be populated)
 //	files                → Plan.Inputs            (fences refused)
 //	iteratorSettings     → Plan.Stack             (allowlisted classes)
-//	outputFile           → Plan.OutputFile        (must not alias an input)
+//	outputFile           → Plan.OutputFile        (this job's .rf_tmp_<ECID>)
 //	propagateDeletes     → FullMajorCompaction    (inverted, ScopeMajc)
 //	kind                 → Plan.Kind              (USER requires fateId)
 //	fateId               → Plan.FateID
@@ -411,7 +422,7 @@ func Translate(job *tabletserver.TExternalCompactionJob, opts Options) (*Plan, e
 		return nil, err
 	}
 
-	outputFile, err := translateOutput(job, inputs)
+	outputFile, err := parseOutput(job, inputs, ecid)
 	if err != nil {
 		return nil, err
 	}
@@ -429,6 +440,10 @@ func Translate(job *tabletserver.TExternalCompactionJob, opts Options) (*Plan, e
 	// --- pass 2: capability -----------------------------------------
 
 	if err := checkInputCapability(inputs, totalBytes, opts.Limits); err != nil {
+		return nil, err
+	}
+
+	if err := checkOutputCapability(outputFile, ecid); err != nil {
 		return nil, err
 	}
 
@@ -666,10 +681,27 @@ func decodeFileEntry(entry, field string) (parsedInput, error) {
 	return in, nil
 }
 
-// translateOutput validates the destination file. An output that aliases
-// an input would destroy the input mid-compaction, so it is refused even
-// though the coordinator should never produce one.
-func translateOutput(job *tabletserver.TExternalCompactionJob, inputs []parsedInput) (string, error) {
+// tmpSuffix renders the "_tmp_<ecid>" tail the coordinator appends to
+// every external-compaction output name.
+func tmpSuffix(ecid string) string { return "_tmp_" + ecid }
+
+// parseOutput validates the destination file's structure.
+//
+// The name is not free-form. TabletNameGenerator.getNextDataFilenameForMajc
+// builds it as getNextDataFilename(...) + "_tmp_" + ecid.canonical(),
+// the coordinator puts exactly that in the job
+// (CompactionCoordinator.createThriftJob passes
+// ecm.getCompactTmpName().getNormalizedPathStr()), and the manager
+// later strips at the first "_tmp" to derive the committed name
+// (TabletNameGenerator.computeCompactionFileDest). A name that does not
+// carry this job's own ECID therefore did not come from this
+// assignment, and writing it would put bytes somewhere the manager will
+// never look — or, worse, somewhere another compaction owns.
+//
+// The alias check runs first because it is the failure that destroys
+// data rather than merely wasting it: an output that is also an input
+// would truncate that input mid-read.
+func parseOutput(job *tabletserver.TExternalCompactionJob, inputs []parsedInput, ecid string) (string, error) {
 	out := job.GetOutputFile()
 	if out == "" {
 		return "", refuse(ClassMalformedJob, "outputFile", "missing")
@@ -678,17 +710,44 @@ func translateOutput(job *tabletserver.TExternalCompactionJob, inputs []parsedIn
 		return "", refuse(ClassMalformedJob, "outputFile",
 			"expected a plain path, got a StoredTabletFile entry: %s", out)
 	}
-	if !strings.HasSuffix(out, ".rf") {
-		return "", refuse(ClassMalformedJob, "outputFile",
-			"%q does not name an RFile (.rf)", out)
-	}
 	for i, in := range inputs {
 		if in.file.Path == out {
 			return "", refuse(ClassMalformedJob, "outputFile",
 				"output %s is also files[%d]", out, i)
 		}
 	}
+	if !strings.HasSuffix(out, tmpSuffix(ecid)) {
+		return "", refuse(ClassMalformedJob, "outputFile",
+			"%q is not this job's compaction temp name (expected a path ending in %q)",
+			out, tmpSuffix(ecid))
+	}
 	return out, nil
+}
+
+// checkOutputCapability gates the file format shoal is being asked to
+// produce. The extension under the temp suffix comes from
+// FileOperations.getNewFileExtension(table.file.type), which shoal does
+// not otherwise get to see: the job carries only overrides, and
+// table.file.type is not one. Accumulo ships only RFile today, so a
+// different extension means a table configured for a format shoal's
+// writer cannot emit, and producing an RFile under that name would hand
+// the tablet a file it cannot read.
+func checkOutputCapability(out, ecid string) error {
+	base := strings.TrimSuffix(out, tmpSuffix(ecid))
+	if !strings.HasSuffix(base, ".rf") {
+		return refuse(ClassUnsupportedProperty, "outputFile",
+			"%q names a %s file; shoal's writer emits RFiles only", out, outputExtension(base))
+	}
+	return nil
+}
+
+// outputExtension renders the extension in a refusal message, so an
+// operator sees the format that was asked for rather than the whole path.
+func outputExtension(base string) string {
+	if i := strings.LastIndex(base, "."); i >= 0 && i+1 < len(base) {
+		return base[i+1:]
+	}
+	return "extensionless"
 }
 
 // Table properties the compaction may override that shoal can honor when
@@ -882,10 +941,9 @@ type rawIterator struct {
 //
 // The sort is stable and by (priority, name), and names are unique by
 // the check below, so it is total: two runs over the same job always
-// produce the same stack. Go compares strings by byte and Java's
-// String.compareTo by UTF-16 code unit, which differ only for
-// supplementary characters — a distinction no iterator name in
-// Accumulo's shipped configuration makes.
+// produce the same stack. The name comparison is compareUTF16, not Go's
+// byte order, because the names come from user configuration
+// (IteratorSetting) rather than from a fixed set.
 func parseIterators(job *tabletserver.TExternalCompactionJob) ([]rawIterator, error) {
 	if !job.IsSetIteratorSettings() || job.GetIteratorSettings() == nil {
 		return nil, nil
@@ -934,9 +992,34 @@ func parseIterators(job *tabletserver.TExternalCompactionJob) ([]rawIterator, er
 		if out[i].priority != out[j].priority {
 			return out[i].priority < out[j].priority
 		}
-		return out[i].name < out[j].name
+		return compareUTF16(out[i].name, out[j].name) < 0
 	})
 	return out, nil
+}
+
+// compareUTF16 orders two strings the way java.lang.String.compareTo
+// does: by UTF-16 code unit. Go's own comparison is by UTF-8 byte, which
+// equals code-point order, and the two disagree exactly when one string
+// reaches a supplementary character (>= U+10000, encoded in UTF-16 as a
+// surrogate pair in D800-DFFF) where the other has a character in
+// E000-FFFF. Go sorts the supplementary character higher; Java sorts it
+// lower, because its surrogates are numerically below E000.
+//
+// Iterator names come from user configuration, so that case is reachable
+// and reversing two equal-priority iterators reorders the stack — which
+// changes cells. Comparing encoded code units removes the divergence
+// instead of assuming the names stay ASCII.
+func compareUTF16(a, b string) int {
+	if a == b {
+		return 0
+	}
+	ua, ub := utf16.Encode([]rune(a)), utf16.Encode([]rune(b))
+	for i := 0; i < len(ua) && i < len(ub); i++ {
+		if ua[i] != ub[i] {
+			return int(ua[i]) - int(ub[i])
+		}
+	}
+	return len(ua) - len(ub)
 }
 
 // mapIterators resolves each entry onto shoal's iterator registry, then

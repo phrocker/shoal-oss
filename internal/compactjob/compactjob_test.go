@@ -70,10 +70,18 @@ func validJob() *tabletserver.TExternalCompactionJob {
 		{MetadataFileEntry: storedFile("hdfs://nn/accumulo/tables/2/t-0001/F0001.rf"), Size: 1024, Entries: 10, Timestamp: 1700000000000},
 		{MetadataFileEntry: storedFile("hdfs://nn/accumulo/tables/2/t-0001/F0002.rf"), Size: 2048, Entries: 20, Timestamp: 1700000000001},
 	}
-	job.OutputFile = "hdfs://nn/accumulo/tables/2/t-0001/C0003.rf"
+	job.OutputFile = tmpOutput(testECID)
 	job.PropagateDeletes = true
 	job.Kind = tabletserver.TCompactionKind_SYSTEM
 	return job
+}
+
+// tmpOutput renders the name a real coordinator sends: the compaction
+// temp file from TabletNameGenerator.getNextDataFilenameForMajc, which
+// is the allocated RFile name plus "_tmp_" and the job's own ECID. The
+// manager strips the suffix when it commits the compaction.
+func tmpOutput(ecid string) string {
+	return "hdfs://nn/accumulo/tables/2/t-0001/C0003.rf_tmp_" + ecid
 }
 
 func iterConfig(settings ...*tabletserver.TIteratorSetting) *tabletserver.IteratorConfig {
@@ -373,8 +381,22 @@ func TestTranslateRefusesMalformedJobs(t *testing.T) {
 			wantField: "outputFile",
 		},
 		{
-			name:      "output file is not an rfile",
-			mutate:    func(j *tabletserver.TExternalCompactionJob) { j.OutputFile = "hdfs://nn/t/2/C0003.tmp" },
+			// The committed name, not the temp name the compactor is
+			// told to write; the manager renames the temp file itself.
+			name:      "output file is not this job's temp name",
+			mutate:    func(j *tabletserver.TExternalCompactionJob) { j.OutputFile = "hdfs://nn/t/2/C0003.rf" },
+			wantField: "outputFile",
+		},
+		{
+			name: "output file carries another job's ecid",
+			mutate: func(j *tabletserver.TExternalCompactionJob) {
+				j.OutputFile = tmpOutput(ECIDPrefix + "11111111-2222-3333-4444-555555555555")
+			},
+			wantField: "outputFile",
+		},
+		{
+			name:      "output file has the bare pre-3.0 temp suffix",
+			mutate:    func(j *tabletserver.TExternalCompactionJob) { j.OutputFile = "hdfs://nn/t/2/C0003.rf_tmp" },
 			wantField: "outputFile",
 		},
 		{
@@ -453,6 +475,42 @@ func TestTranslateRefusesMalformedJobs(t *testing.T) {
 
 func TestTranslateRefusesNilJob(t *testing.T) {
 	assertRefused(t, nil, Options{}, ClassMalformedJob, "")
+}
+
+// TestTranslateKeepsTheCoordinatorsTempOutputName is the wire-shape
+// guard for the output path. A real assignment names
+// <dir>/<A|C><n>.rf_tmp_<ECID>; shoal must plan to write exactly that,
+// not the committed name, because the manager is what renames the temp
+// file once it accepts the compaction.
+func TestTranslateKeepsTheCoordinatorsTempOutputName(t *testing.T) {
+	job := validJob()
+	want := "hdfs://nn/accumulo/tables/2/t-0001/A0007.rf_tmp_" + testECID
+	job.OutputFile = want
+
+	plan := mustTranslate(t, job, Options{})
+	if plan.OutputFile != want {
+		t.Fatalf("OutputFile = %q, want the temp name verbatim (%q)", plan.OutputFile, want)
+	}
+}
+
+// TestTranslateRefusesUnwritableOutputFormat: the extension under the
+// temp suffix comes from table.file.type, which the job never states
+// directly. Anything but RFile is a table shoal's writer cannot serve.
+func TestTranslateRefusesUnwritableOutputFormat(t *testing.T) {
+	for _, tt := range []struct{ name, output, wantIn string }{
+		{"another file format", "hdfs://nn/accumulo/tables/2/t-0001/C0003.parquet_tmp_" + testECID, "parquet"},
+		{"no extension at all", "hdfs://nn/accumulo/tables/2/t-0001/C0003_tmp_" + testECID, "extensionless"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			job := validJob()
+			job.OutputFile = tt.output
+
+			r := assertRefused(t, job, Options{}, ClassUnsupportedProperty, "outputFile")
+			if !strings.Contains(r.Detail, tt.wantIn) {
+				t.Fatalf("detail = %q, want it to name %q", r.Detail, tt.wantIn)
+			}
+		})
+	}
 }
 
 // TestTranslateRefusesUnportedIterator: an unknown class must fail the
@@ -575,6 +633,74 @@ func TestTranslateBreaksIteratorPriorityTiesByName(t *testing.T) {
 	if plan.Iterators[0].Name != "alpha" || plan.Iterators[1].Name != "zeta" {
 		t.Fatalf("order = %q then %q, want alpha then zeta",
 			plan.Iterators[0].Name, plan.Iterators[1].Name)
+	}
+}
+
+// TestTranslateBreaksTiesTheWayJavaComparesStrings: iterator names come
+// from user configuration, so they are not guaranteed ASCII. Java
+// compares by UTF-16 code unit, which puts a supplementary character
+// (encoded as a surrogate pair in D800-DFFF) *below* one in E000-FFFF;
+// Go's native string order puts it above. Getting this backwards
+// silently swaps two equal-priority iterators, which changes the cells
+// the compaction writes.
+func TestTranslateBreaksTiesTheWayJavaComparesStrings(t *testing.T) {
+	const (
+		supplementary = "\U00010000" // surrogate pair D800 DC00 in UTF-16
+		privateUse    = "\uE000"     // one code unit, numerically above D800
+	)
+
+	job := validJob()
+	job.IteratorSettings = iterConfig(
+		&tabletserver.TIteratorSetting{Priority: 7, Name: privateUse, IteratorClass: latentClass},
+		&tabletserver.TIteratorSetting{Priority: 7, Name: supplementary, IteratorClass: versClass},
+	)
+
+	plan := mustTranslate(t, job, Options{})
+
+	if privateUse >= supplementary {
+		t.Fatal("test premise broken: Go should sort the private-use character below the supplementary one")
+	}
+	if plan.Iterators[0].Name != supplementary {
+		t.Fatalf("first iterator = %q, want the supplementary name; Java's UTF-16 order puts its "+
+			"surrogate pair below U+E000 even though Go's byte order does not", plan.Iterators[0].Name)
+	}
+}
+
+// TestCompareUTF16 pins the comparator itself, including the cases the
+// stack test cannot reach through Translate.
+func TestCompareUTF16(t *testing.T) {
+	tests := []struct {
+		name string
+		a, b string
+		want int // sign only
+	}{
+		{"equal", "vers", "vers", 0},
+		{"ascii less", "alpha", "beta", -1},
+		{"ascii greater", "beta", "alpha", 1},
+		{"prefix is less", "age", "ageoff", -1},
+		{"longer is greater", "ageoff", "age", 1},
+		{"supplementary sorts below private use", "\U00010000", "\uE000", -1},
+		{"private use sorts above supplementary", "\uE000", "\U00010000", 1},
+		{"empty is least", "", "a", -1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := compareUTF16(tt.a, tt.b)
+			if sign(got) != tt.want {
+				t.Fatalf("compareUTF16(%q, %q) = %d, want sign %d", tt.a, tt.b, got, tt.want)
+			}
+		})
+	}
+}
+
+func sign(n int) int {
+	switch {
+	case n < 0:
+		return -1
+	case n > 0:
+		return 1
+	default:
+		return 0
 	}
 }
 
@@ -885,8 +1011,8 @@ func TestTranslateChecksEveryFieldForStructureFirst(t *testing.T) {
 			wantField: "overrides[" + propCompressBlockSize + "]",
 		},
 		{
-			// Inside pass 2 the order is inputs, encoding, iterators;
-			// these three cases pin each boundary.
+			// Inside pass 2 the order is inputs, output (file type then
+			// encoding), iterators; these cases pin each boundary.
 			name: "fenced input outranks an unsupported codec",
 			mutate: func(job *tabletserver.TExternalCompactionJob) {
 				job.Files[0].MetadataFileEntry = fencedFile(
@@ -895,6 +1021,15 @@ func TestTranslateChecksEveryFieldForStructureFirst(t *testing.T) {
 			},
 			wantClass: ClassRangedInputFile,
 			wantField: "files[0]",
+		},
+		{
+			name: "unwritable output format outranks an unsupported codec",
+			mutate: func(job *tabletserver.TExternalCompactionJob) {
+				job.OutputFile = "hdfs://nn/accumulo/tables/2/t-0001/C0003.parquet_tmp_" + testECID
+				job.Overrides = map[string]string{propCompressType: "zstd"}
+			},
+			wantClass: ClassUnsupportedProperty,
+			wantField: "outputFile",
 		},
 		{
 			name: "unsupported codec outranks an unported iterator",

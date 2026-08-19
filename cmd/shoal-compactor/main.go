@@ -632,11 +632,23 @@ func releaseJob(
 		mu              sync.Mutex
 		active          coordinatorConn
 		closedByWatcher bool
+		budgetSpent     bool
 	)
-	setActive := func(c coordinatorConn) {
+	// setActive registers the connection an RPC is about to use, and
+	// reports whether it is still safe to use it. Registration has to be
+	// deadline-aware: the watcher runs once and then exits, so a
+	// connection dialled after the budget expired would otherwise never
+	// be closed by anyone and would block on the socket timeout instead.
+	setActive := func(c coordinatorConn) (ok bool) {
 		mu.Lock()
+		defer mu.Unlock()
+		if budgetSpent && c != nil {
+			closedByWatcher = closedByWatcher || c == cc
+			_ = c.Close()
+			return false
+		}
 		active = c
-		mu.Unlock()
+		return true
 	}
 	watcherDone := make(chan struct{})
 	watcherExited := make(chan struct{})
@@ -645,10 +657,11 @@ func releaseJob(
 		select {
 		case <-releaseCtx.Done():
 			mu.Lock()
+			budgetSpent = true
 			if active != nil {
 				// Only the caller's connection is reported spent; one
 				// this function dialled is closed by its own defer.
-				closedByWatcher = active == cc
+				closedByWatcher = closedByWatcher || active == cc
 				_ = active.Close()
 			}
 			mu.Unlock()
@@ -681,7 +694,22 @@ func releaseJob(
 			conn, owned = fresh, fresh
 		}
 
-		setActive(conn)
+		// Shutdown may have started while the previous attempt was on
+		// the wire. The class is the manager's only record of why the
+		// slot came back, so re-read it here rather than reporting a
+		// stale reason for a job that is now being abandoned.
+		if !shuttingDown && ctx.Err() != nil {
+			shuttingDown = true
+			class = compactjob.ClassShuttingDown
+		}
+
+		if !setActive(conn) {
+			// The budget expired between the dial and now; the
+			// connection is already closed, so there is nothing left to
+			// try within this release.
+			conn, owned = nil, nil
+			break
+		}
 		err := conn.Raw().CompactionFailed(
 			releaseCtx,
 			client.NewTInfo(),
