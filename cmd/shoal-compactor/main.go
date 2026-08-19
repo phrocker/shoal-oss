@@ -34,7 +34,9 @@
 //     a. Generate a fresh externalCompactionId (ECID).
 //     b. Call getCompactionJob(group, host:port, ecid).
 //     c. If the returned job has no ECID set, sleep and retry.
-//     d. Otherwise: log the job and (today) stop short of execution.
+//     d. Otherwise: translate the job into an executable plan
+//     (internal/compactjob) and release the slot back to the
+//     coordinator, because the commit RPC does not exist yet (below).
 //
 // The coordinator address is re-resolved before every connection
 // attempt, so a manager failover is tolerated without a restart: while
@@ -76,15 +78,23 @@
 // exactly such authority bleeding) — keeping commit in one process is
 // strictly safer.
 //
-// This binary leaves a documented hole at the commit boundary: on a
-// successful drain it would log "would commit" with the file refs, then
-// discards the output without touching metadata. The current skeleton
-// stops earlier — it accepts the job, logs it, and calls compactionFailed
-// with a sentinel exception so the coordinator routes the job to a Java
-// compactor. Once Java-side CompactionCommit lands, the body of
-// executeJob flips to: fetch inputs via internal/storage, translate
-// IteratorSettings to []iterrt.IterSpec, call compaction.Compact, upload
-// the output, call CompactionCommit, then compactionCompleted.
+// This binary therefore stops at the commit boundary. What it does do,
+// for every job it is handed, is decide up front whether shoal could
+// reproduce that compaction cell-for-cell: internal/compactjob
+// translates the assignment into an executable plan (inputs, iterator
+// stack, output encoding) and refuses anything it cannot reproduce —
+// a row-fenced input file, an iterator shoal has not ported, an
+// encryption or codec setting it cannot write. The job is then released
+// with a class naming the exact reason, so a Java compactor picks it up
+// and the operator can see from the manager's log why shoal declined.
+//
+// Translating before releasing is not busywork: it is the gate that
+// keeps a future execution slice honest. When the manager-side
+// CompactionCommit RPC lands, the accepted plan is already the input to
+// compaction.Compact, and the refusals stay exactly where they are — so
+// the day shoal starts writing output files it can only ever write ones
+// it fully understands. Until then no job is ever left assigned to a
+// shoal compactor: every path out of executeJob releases the slot.
 package main
 
 import (
@@ -102,6 +112,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/phrocker/shoal/internal/cclient"
+	"github.com/phrocker/shoal/internal/compactjob"
 	"github.com/phrocker/shoal/internal/cred"
 	"github.com/phrocker/shoal/internal/thrift/gen/client"
 	"github.com/phrocker/shoal/internal/thrift/gen/compactioncoordinator"
@@ -115,7 +126,16 @@ var version = "dev"
 // ecidPrefix matches Accumulo's ExternalCompactionId format. The Java
 // generator produces "ECID:" + UUID; shoal does the same so logs and
 // metadata are interchangeable across the two compactor pools.
-const ecidPrefix = "ECID:"
+const ecidPrefix = compactjob.ECIDPrefix
+
+// maxJobsPerDrain caps how many jobs one connection accepts before the
+// loop goes back to its idle backoff. Every job shoal takes today is
+// handed straight back, and the coordinator may hand the same one to
+// the same compactor again; without a cap the pair would spin as fast
+// as the network allows. Draining a few keeps a queue of jobs shoal
+// *could* later execute moving, while the outer loop's exponential
+// backoff damps a persistent refusal to one round trip per -max-wait.
+const maxJobsPerDrain = 4
 
 func main() {
 	showVersion := flag.Bool("version", false, "print version and exit")
@@ -132,6 +152,9 @@ func main() {
 	rpcTimeout := flag.Duration("rpc-timeout", cclient.DefaultRPCTimeout, "cap on each coordinator read/write; bounds getCompactionJob against a manager that accepts the connection and then goes silent (Java's general.rpc.timeout)")
 	minWait := flag.Duration("min-wait", 1*time.Second, "minimum sleep when the coordinator has no job for this group")
 	maxWait := flag.Duration("max-wait", 30*time.Second, "maximum sleep when idle (backoff cap)")
+	releaseTimeout := flag.Duration("release-timeout", 15*time.Second, "total budget for handing an accepted job back to the coordinator, including retries. Applied even during shutdown: a job shoal has accepted must never stay assigned to a compactor that is going away.")
+	maxInputFiles := flag.Int("max-input-files", compactjob.DefaultMaxInputFiles, "refuse jobs with more input files than this (0 = no limit); the composer merges every input in one pass")
+	maxInputBytes := flag.Int64("max-input-bytes", compactjob.DefaultMaxTotalInputBytes, "refuse jobs whose inputs total more than this many bytes (0 = no limit); the composer reads whole RFile images into memory, so this bounds peak RSS")
 	logLevel := flag.String("log-level", "info", "slog level: debug, info, warn, error")
 	flag.Parse()
 
@@ -155,6 +178,12 @@ func main() {
 	}
 	if *password == "" {
 		die("shoal-compactor: password required (-password or SHOAL_PASSWORD env)")
+	}
+	if *releaseTimeout <= 0 {
+		die("shoal-compactor: -release-timeout must be positive (a job shoal accepted has to be released)")
+	}
+	if *maxInputFiles < 0 || *maxInputBytes < 0 {
+		die("shoal-compactor: -max-input-files and -max-input-bytes must not be negative (use 0 for no limit)")
 	}
 
 	coordinatorSource := *coordinatorAddr
@@ -218,6 +247,13 @@ func main() {
 		creds:           creds,
 		minWait:         *minWait,
 		maxWait:         *maxWait,
+		releaseTimeout:  *releaseTimeout,
+		jobOptions: compactjob.Options{
+			Limits: compactjob.Limits{
+				MaxInputFiles:      *maxInputFiles,
+				MaxTotalInputBytes: *maxInputBytes,
+			},
+		},
 	})
 
 	logger.Info("shoal-compactor exit clean")
@@ -293,6 +329,13 @@ type pollConfig struct {
 	creds           *security.TCredentials
 	minWait         time.Duration
 	maxWait         time.Duration
+	// releaseTimeout bounds the whole hand-back of one job, retries
+	// included. It is deliberately independent of the poll cadence:
+	// releasing is the one thing this binary owes the manager.
+	releaseTimeout time.Duration
+	// jobOptions carries the translation defaults and resource limits
+	// applied to every job the coordinator assigns.
+	jobOptions compactjob.Options
 }
 
 // runPollLoop is the main service loop. It re-dials the coordinator on
@@ -403,7 +446,12 @@ func runPollLoop(ctx context.Context, logger *slog.Logger, cfg pollConfig) {
 // drainCoordinator polls one open coordinator connection until either
 // (a) it returns no job (idle = true), or (b) a transport error happens
 // (idle = false). The bool drives the outer-loop sleep + reconnect.
+//
+// Accepting a job also ends the drain once maxJobsPerDrain of them have
+// been handed back, reported as idle so the outer loop's backoff damps a
+// coordinator that keeps offering work shoal declines.
 func drainCoordinator(ctx context.Context, logger *slog.Logger, cc coordinatorConn, cfg pollConfig) bool {
+	handled := 0
 	for {
 		if ctx.Err() != nil {
 			return false
@@ -443,102 +491,213 @@ func drainCoordinator(ctx context.Context, logger *slog.Logger, cc coordinatorCo
 			return false
 		}
 
-		executeJob(ctx, logger, cc, cfg, job)
+		if !executeJob(ctx, logger, cc, cfg, job) {
+			// The connection did not survive the hand-back (or shutdown
+			// closed it). Reconnecting is cheaper than discovering that
+			// with another doomed getCompactionJob.
+			return false
+		}
+
+		handled++
+		if handled >= maxJobsPerDrain {
+			logger.Debug("released the per-drain job budget; backing off",
+				slog.Int("jobs", handled),
+				slog.String("group", cfg.groupName))
+			return true
+		}
 	}
 }
 
-// executeJob logs the assignment and stops at the commit boundary.
-// Phase C3 groundwork: the iterator-stack composer (internal/compaction)
-// is fully built but the metadata-commit RPC does not yet exist on the
-// manager. Until it does, this binary refuses to write to
-// accumulo.metadata and instead:
+// executeJob decides what shoal would do with one assignment and hands
+// the slot back. It reports whether cc is still usable for further RPCs.
 //
-//  1. Logs the job's input files + output file.
-//  2. Reports compactionFailed with a sentinel exception class so the
-//     coordinator releases the compaction slot and a Java compactor
-//     picks it up.
+// Two outcomes, both ending in a release:
 //
-// Once the Java-side CompactionCommit RPC lands (see file-level doc),
-// the body of this function becomes:
+//   - The job translates. shoal has verified it could reproduce this
+//     compaction exactly — inputs are whole files, every iterator is
+//     ported and its options parse, the output encoding is writable.
+//     It still cannot commit the result (no manager-side CompactionCommit
+//     RPC exists; see the file-level doc), so the job goes back with
+//     ClassCommitUnavailable. The plan is logged at info: that line is
+//     the evidence that shoal's translation of a real production job is
+//     correct, and it is what the execution slice will act on.
 //
-//	a. fetch input RFile bytes via internal/storage (the same code shoal
-//	   uses for scan-time RFile pulls)
-//	b. translate job.GetIteratorSettings() into []iterrt.IterSpec via a
-//	   registry that mirrors the Java iterator-name → factory mapping
-//	   (today: iterrt only knows IterVersioning/IterVisibility; the C1
-//	   iterator ports add to that registry)
-//	c. call compaction.Compact(spec)
-//	d. upload the output bytes to job.GetOutputFile() via storage
-//	e. call coordinator.CompactionCommit(ecid, extent, file, size, ...)
-//	f. on success, call compactionCompleted; on any failure,
-//	   compactionFailed
-func executeJob(ctx context.Context, logger *slog.Logger, cc coordinatorConn, cfg pollConfig, job *tabletserver.TExternalCompactionJob) {
-	inputFiles := make([]string, 0, len(job.GetFiles()))
-	for _, f := range job.GetFiles() {
-		inputFiles = append(inputFiles, f.GetMetadataFileEntry())
-	}
-	logger.Info("compaction job received (NOT executing — awaits Java-side CompactionCommit RPC)",
-		slog.String("ecid", job.GetExternalCompactionId()),
-		slog.String("extent", extentString(job)),
-		slog.Int("inputs", len(inputFiles)),
-		slog.String("output_file", job.GetOutputFile()),
-		slog.Bool("propagate_deletes", job.GetPropagateDeletes()),
-		slog.Any("iterators", iteratorNames(job)),
-	)
-	logger.Info("would compact",
-		slog.String("ecid", job.GetExternalCompactionId()),
-		slog.Any("inputs", inputFiles),
-		slog.String("output", job.GetOutputFile()))
+//   - The job is refused. Something in it is malformed, or names a
+//     capability shoal has not ported. The refusal's class travels to the
+//     coordinator, so the manager log says *why* shoal declined instead
+//     of a generic failure.
+//
+// What never happens here is a metadata or ZooKeeper write. The manager
+// remains the only process that decides a compaction happened.
+func executeJob(ctx context.Context, logger *slog.Logger, cc coordinatorConn, cfg pollConfig, job *tabletserver.TExternalCompactionJob) bool {
+	ecid := job.GetExternalCompactionId()
 
-	// Release the slot back to the coordinator so a Java compactor can
-	// pick up this job. Sentinel class name signals a non-actionable
-	// refusal — matches how Java compactors signal an internal error.
-	err := cc.Raw().CompactionFailed(
-		ctx,
-		client.NewTInfo(),
-		cfg.creds,
-		job.GetExternalCompactionId(),
-		job.GetExtent(),
-		"org.apache.accumulo.shoal.NotYetImplemented",
-		compactioncoordinator.TCompactionState_FAILED,
-	)
+	plan, err := compactjob.Translate(job, cfg.jobOptions)
 	if err != nil {
-		logger.Warn("compactionFailed rpc failed",
-			slog.String("ecid", job.GetExternalCompactionId()),
+		refusal := compactjob.RefusalOf(err)
+		if refusal == nil {
+			// Translate only ever returns refusals; treat anything else as
+			// malformed rather than dropping the job on the floor.
+			refusal = &compactjob.Refusal{
+				Class:  compactjob.ClassMalformedJob,
+				Field:  "job",
+				Detail: err.Error(),
+			}
+		}
+		logger.Warn("compaction job refused",
+			slog.String("ecid", ecid),
+			slog.String("extent", compactjob.ExtentString(job.GetExtent())),
+			slog.String("class", refusal.Class),
+			slog.String("field", refusal.Field),
+			slog.String("reason", refusal.Detail))
+		return releaseJob(ctx, logger, cc, cfg, job, refusal.Class)
+	}
+
+	logger.Info("compaction job translated; releasing (shoal cannot commit: no manager-side CompactionCommit RPC)",
+		slog.String("ecid", ecid),
+		slog.Any("plan", plan))
+	return releaseJob(ctx, logger, cc, cfg, job, compactjob.ClassCommitUnavailable)
+}
+
+// releaseJob hands one accepted job back to the coordinator so the slot
+// is freed and a Java compactor can run it. It reports whether cc is
+// still usable afterwards.
+//
+// This is the one RPC this binary owes the manager, so it is the one
+// that retries. A job the coordinator handed out stays assigned until it
+// hears otherwise or its own dead-compactor sweep notices; both cost the
+// tablet a compaction cycle. So:
+//
+//   - Shutdown does not skip it. ctx is already cancelled by the time a
+//     SIGTERM reaches here, and the poll loop's watcher has closed the
+//     connection, so the release runs on a detached context with its own
+//     budget and dials a fresh connection.
+//   - A broken connection does not end it. The address is re-resolved
+//     (following a manager failover mid-job) and redialed until the
+//     budget runs out.
+//
+// If the budget does run out the failure is logged loudly and the job is
+// left to the coordinator's own timeout — the alternative, blocking
+// shutdown indefinitely, is worse.
+func releaseJob(
+	ctx context.Context,
+	logger *slog.Logger,
+	cc coordinatorConn,
+	cfg pollConfig,
+	job *tabletserver.TExternalCompactionJob,
+	class string,
+) bool {
+	ecid := job.GetExternalCompactionId()
+	shuttingDown := ctx.Err() != nil
+	if shuttingDown {
+		// The job was accepted before the signal arrived; say so, so the
+		// manager log distinguishes "shoal cannot do this" from "shoal
+		// went away mid-assignment".
+		class = compactjob.ClassShuttingDown
+	}
+
+	// context.WithoutCancel keeps the RPC's deadline ours alone: a
+	// cancelled parent must not abort the hand-back it caused.
+	releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cfg.releaseTimeout)
+	defer cancel()
+
+	// The first attempt reuses the open connection unless shutdown has
+	// already closed it underneath us.
+	conn := cc
+	connUsable := true
+	if shuttingDown {
+		conn = nil
+	}
+
+	// owned is the connection this function opened, if any; the poll
+	// loop owns cc and closes it itself.
+	var owned coordinatorConn
+	defer func() {
+		if owned != nil {
+			_ = owned.Close()
+		}
+	}()
+
+	wait := 100 * time.Millisecond
+	for attempt := 1; ; attempt++ {
+		if conn == nil {
+			fresh, err := redialCoordinator(releaseCtx, cfg)
+			if err != nil {
+				logger.Warn("release: reconnect failed",
+					slog.String("ecid", ecid),
+					slog.Int("attempt", attempt),
+					slog.String("err", err.Error()))
+				if !sleepCtx(releaseCtx, wait) {
+					break
+				}
+				wait = nextWait(wait, time.Second)
+				continue
+			}
+			conn, owned = fresh, fresh
+		}
+
+		err := conn.Raw().CompactionFailed(
+			releaseCtx,
+			client.NewTInfo(),
+			cfg.creds,
+			ecid,
+			job.GetExtent(),
+			class,
+			compactioncoordinator.TCompactionState_FAILED,
+		)
+		if err == nil {
+			logger.Info("compaction slot released to coordinator",
+				slog.String("ecid", ecid),
+				slog.String("class", class),
+				slog.Int("attempt", attempt))
+			return connUsable
+		}
+
+		logger.Warn("release: compactionFailed rpc failed",
+			slog.String("ecid", ecid),
+			slog.String("class", class),
+			slog.Int("attempt", attempt),
 			slog.String("err", err.Error()))
+
+		// The transport is suspect now; the next attempt gets a new one.
+		// Report the original connection as spent so the caller stops
+		// polling on it.
+		if conn == cc {
+			connUsable = false
+		} else if owned != nil {
+			_ = owned.Close()
+			owned = nil
+		}
+		conn = nil
+
+		if !sleepCtx(releaseCtx, wait) {
+			break
+		}
+		wait = nextWait(wait, time.Second)
 	}
+
+	logger.Error("release: gave up; job stays assigned until the coordinator's own timeout reclaims it",
+		slog.String("ecid", ecid),
+		slog.String("class", class),
+		slog.String("extent", compactjob.ExtentString(job.GetExtent())),
+		slog.Duration("budget", cfg.releaseTimeout))
+	return connUsable
 }
 
-// extentString is a defensive accessor — older coordinator builds have
-// shipped jobs missing a fully-populated extent, and slog should not
-// panic on a nil row.
-func extentString(job *tabletserver.TExternalCompactionJob) string {
-	if !job.IsSetExtent() {
-		return "<no-extent>"
+// redialCoordinator re-resolves the coordinator and opens a connection
+// for a release attempt. Re-resolving (rather than reusing the address
+// the job arrived on) is what lets a release land on the new primary
+// when the manager failed over while the job was in hand.
+func redialCoordinator(ctx context.Context, cfg pollConfig) (coordinatorConn, error) {
+	addr, err := cfg.resolver.Address(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("resolve coordinator: %w", err)
 	}
-	ex := job.GetExtent()
-	tableID := string(ex.GetTable())
-	end := "+inf"
-	if r := ex.GetEndRow(); r != nil {
-		end = fmt.Sprintf("%q", r)
+	conn, err := cfg.dial(ctx, addr, cfg.instanceID, cfg.accumuloVersion)
+	if err != nil {
+		return nil, fmt.Errorf("dial %s: %w", addr, err)
 	}
-	prev := "-inf"
-	if r := ex.GetPrevEndRow(); r != nil {
-		prev = fmt.Sprintf("%q", r)
-	}
-	return fmt.Sprintf("table=%s prev=%s end=%s", tableID, prev, end)
-}
-
-func iteratorNames(job *tabletserver.TExternalCompactionJob) []string {
-	if !job.IsSetIteratorSettings() || job.GetIteratorSettings() == nil {
-		return nil
-	}
-	specs := job.GetIteratorSettings().GetIterators()
-	out := make([]string, 0, len(specs))
-	for _, it := range specs {
-		out = append(out, it.GetName())
-	}
-	return out
+	return conn, nil
 }
 
 // newECID generates an ExternalCompactionId in Accumulo's canonical

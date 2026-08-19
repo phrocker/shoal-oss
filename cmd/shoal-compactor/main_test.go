@@ -27,6 +27,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/phrocker/shoal/internal/compactjob"
 	"github.com/phrocker/shoal/internal/thrift/gen/client"
 	"github.com/phrocker/shoal/internal/thrift/gen/compactioncoordinator"
 	"github.com/phrocker/shoal/internal/thrift/gen/data"
@@ -62,7 +63,14 @@ type fakeCoordinator struct {
 	compactioncoordinator.CompactionCoordinatorService
 
 	getJob func(ecid string) (*compactioncoordinator.TNextCompactionJob, error)
-	failed []failedCompaction
+	// onFailed, when set, decides whether each release attempt fails.
+	// Attempts are numbered from 1 across the whole fake.
+	onFailed func(attempt int) error
+
+	mu           sync.Mutex
+	failed       []failedCompaction
+	failAttempts int
+	completed    int
 }
 
 type failedCompaction struct {
@@ -91,12 +99,55 @@ func (f *fakeCoordinator) CompactionFailed(
 	exceptionClassName string,
 	failureState compactioncoordinator.TCompactionState,
 ) error {
+	f.mu.Lock()
+	f.failAttempts++
+	attempt := f.failAttempts
+	onFailed := f.onFailed
+	f.mu.Unlock()
+
+	if onFailed != nil {
+		if err := onFailed(attempt); err != nil {
+			return err
+		}
+	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.failed = append(f.failed, failedCompaction{
 		ecid:  ecid,
 		class: exceptionClassName,
 		state: failureState,
 	})
 	return nil
+}
+
+// CompactionCompleted is the manager's commit path. shoal must never
+// call it: recording the call lets tests assert that.
+func (f *fakeCoordinator) CompactionCompleted(
+	_ context.Context,
+	_ *client.TInfo,
+	_ *security.TCredentials,
+	_ string,
+	_ *data.TKeyExtent,
+	_ *tabletserver.TCompactionStats,
+) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.completed++
+	return nil
+}
+
+// releases returns a copy of the recorded hand-backs.
+func (f *fakeCoordinator) releases() []failedCompaction {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]failedCompaction(nil), f.failed...)
+}
+
+func (f *fakeCoordinator) completedCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.completed
 }
 
 type fakeConn struct {
@@ -157,7 +208,41 @@ func testPollConfig(
 		creds:           security.NewTCredentials(),
 		minWait:         time.Millisecond,
 		maxWait:         8 * time.Millisecond,
+		releaseTimeout:  2 * time.Second,
+		jobOptions:      compactjob.Options{Limits: compactjob.DefaultLimits()},
 	}
+}
+
+// translatableJob is an assignment shoal can fully reproduce: whole-file
+// inputs, a ported iterator, a writable output encoding. Everything past
+// translation is what the tests vary.
+func translatableJob(ecid string) *tabletserver.TExternalCompactionJob {
+	job := tabletserver.NewTExternalCompactionJob()
+	job.ExternalCompactionId = ecid
+	job.Extent = &data.TKeyExtent{Table: []byte("2"), PrevEndRow: []byte("c"), EndRow: []byte("m")}
+	job.Files = []*tabletserver.InputFile{{
+		MetadataFileEntry: `{"path":"hdfs://nn/t/2/F0001.rf","startRow":"","endRow":""}`,
+		Size:              4096,
+		Entries:           40,
+	}}
+	job.OutputFile = "hdfs://nn/t/2/C0002.rf"
+	job.PropagateDeletes = true
+	job.Kind = tabletserver.TCompactionKind_SYSTEM
+	job.IteratorSettings = &tabletserver.IteratorConfig{
+		Iterators: []*tabletserver.TIteratorSetting{{
+			Priority:      20,
+			Name:          "vers",
+			IteratorClass: "org.apache.accumulo.core.iterators.user.VersioningIterator",
+			Properties:    map[string]string{"maxVersions": "1"},
+		}},
+	}
+	return job
+}
+
+// jobReply serves one job and then reports the group idle, which is how
+// a drain terminates.
+func jobReply(job *tabletserver.TExternalCompactionJob) *compactioncoordinator.TNextCompactionJob {
+	return &compactioncoordinator.TNextCompactionJob{Job: job, CompactorCount: 1}
 }
 
 // TestRunPollLoopFollowsManagerFailover walks the loop through a manager
@@ -420,44 +505,378 @@ func TestRunPollLoopReconnectsAfterRPCTimeout(t *testing.T) {
 	}
 }
 
-// TestDrainCoordinatorRefusesJobToManager checks the current commit
-// boundary: an assigned job is handed straight back with a sentinel
-// failure so the manager can reschedule it onto a Java compactor. Shoal
-// never commits metadata itself.
-func TestDrainCoordinatorRefusesJobToManager(t *testing.T) {
-	svc := &fakeCoordinator{}
-	calls := 0
+// serveOneJob wires a fake coordinator that hands out a single job (built
+// by mk from the ecid the compactor generated) and is idle afterwards.
+func serveOneJob(svc *fakeCoordinator, mk func(ecid string) *tabletserver.TExternalCompactionJob) {
+	served := false
 	svc.getJob = func(ecid string) (*compactioncoordinator.TNextCompactionJob, error) {
-		calls++
-		if calls > 1 {
+		if served {
 			return idleReply(), nil
 		}
-		job := tabletserver.NewTExternalCompactionJob()
-		job.ExternalCompactionId = ecid
-		job.Extent = &data.TKeyExtent{Table: []byte("2"), EndRow: []byte("m")}
-		job.Files = []*tabletserver.InputFile{{MetadataFileEntry: "hdfs://nn/t/2/F0001.rf"}}
-		job.OutputFile = "hdfs://nn/t/2/C0002.rf"
-		return &compactioncoordinator.TNextCompactionJob{Job: job, CompactorCount: 1}, nil
+		served = true
+		return jobReply(mk(ecid)), nil
 	}
+}
+
+// TestDrainCoordinatorReleasesTranslatableJob is the commit boundary: a
+// job shoal fully understands is still handed back, because the
+// manager-side commit RPC does not exist. The plan is logged so the
+// translation of a real job is visible, and compactionCompleted — the
+// call that would tell the manager a compaction happened — is never
+// made.
+func TestDrainCoordinatorReleasesTranslatableJob(t *testing.T) {
+	svc := &fakeCoordinator{}
+	serveOneJob(svc, translatableJob)
 
 	cfg := testPollConfig(&scriptedResolver{results: []resolveResult{{addr: "manager-a:9999"}}}, nil)
-	logger, _ := testLogger()
+	logger, logs := testLogger()
 	if idle := drainCoordinator(context.Background(), logger, &fakeConn{svc: svc}, cfg); !idle {
 		t.Fatal("drain = busy, want idle after the coordinator ran out of jobs")
 	}
 
-	if len(svc.failed) != 1 {
-		t.Fatalf("compactionFailed calls = %d, want 1", len(svc.failed))
+	releases := svc.releases()
+	if len(releases) != 1 {
+		t.Fatalf("compactionFailed calls = %d, want 1", len(releases))
 	}
-	got := svc.failed[0]
-	if got.class != "org.apache.accumulo.shoal.NotYetImplemented" {
-		t.Fatalf("exception class = %q", got.class)
+	got := releases[0]
+	if got.class != compactjob.ClassCommitUnavailable {
+		t.Fatalf("exception class = %q, want %q", got.class, compactjob.ClassCommitUnavailable)
 	}
 	if got.state != compactioncoordinator.TCompactionState_FAILED {
 		t.Fatalf("failure state = %v, want FAILED", got.state)
 	}
 	if !strings.HasPrefix(got.ecid, ecidPrefix) {
 		t.Fatalf("ecid = %q, want %s-prefixed", got.ecid, ecidPrefix)
+	}
+	if n := svc.completedCount(); n != 0 {
+		t.Fatalf("compactionCompleted calls = %d; shoal must never tell the manager a compaction succeeded", n)
+	}
+
+	out := logs.String()
+	if !strings.Contains(out, "compaction job translated") {
+		t.Fatalf("translation not logged:\n%s", out)
+	}
+	for _, want := range []string{"plan.table=2", "plan.inputs=1", `plan.stack="[vers=versioning]"`, "plan.full_major=false"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("plan log missing %q:\n%s", want, out)
+		}
+	}
+}
+
+// TestDrainCoordinatorReleasesRefusedJobsWithPreciseClass: the class the
+// manager records has to say which capability was missing. A single
+// "shoal failed" for every cause would leave an operator with no way to
+// tell an unported iterator from a malformed assignment.
+func TestDrainCoordinatorReleasesRefusedJobsWithPreciseClass(t *testing.T) {
+	tests := []struct {
+		name      string
+		mutate    func(*tabletserver.TExternalCompactionJob)
+		wantClass string
+		wantLog   string
+	}{
+		{
+			name:      "malformed: no input files",
+			mutate:    func(j *tabletserver.TExternalCompactionJob) { j.Files = nil },
+			wantClass: compactjob.ClassMalformedJob,
+			wantLog:   "field=files",
+		},
+		{
+			name: "row-fenced input file",
+			mutate: func(j *tabletserver.TExternalCompactionJob) {
+				j.Files[0].MetadataFileEntry = `{"path":"hdfs://nn/t/2/F0001.rf","startRow":"d","endRow":"k"}`
+			},
+			wantClass: compactjob.ClassRangedInputFile,
+			wantLog:   "field=files[0]",
+		},
+		{
+			name: "unported iterator",
+			mutate: func(j *tabletserver.TExternalCompactionJob) {
+				j.IteratorSettings.Iterators[0].IteratorClass = "org.apache.accumulo.core.iterators.user.AgeOffFilter"
+			},
+			wantClass: compactjob.ClassUnsupportedIterator,
+			wantLog:   "AgeOffFilter",
+		},
+		{
+			name: "codec shoal cannot write",
+			mutate: func(j *tabletserver.TExternalCompactionJob) {
+				j.Overrides = map[string]string{"table.file.compress.type": "zstd"}
+			},
+			wantClass: compactjob.ClassUnsupportedProperty,
+			wantLog:   "zstd",
+		},
+		{
+			name: "encrypted table",
+			mutate: func(j *tabletserver.TExternalCompactionJob) {
+				j.Overrides = map[string]string{"table.crypto.opts.key": "kms://k1"}
+			},
+			wantClass: compactjob.ClassUnsupportedCrypto,
+			wantLog:   "field=overrides[table.crypto.opts.key]",
+		},
+		{
+			name: "job larger than this compactor's budget",
+			mutate: func(j *tabletserver.TExternalCompactionJob) {
+				j.Files[0].Size = 1 << 40
+			},
+			wantClass: compactjob.ClassResourceLimitExceeded,
+			wantLog:   "field=files",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			svc := &fakeCoordinator{}
+			serveOneJob(svc, func(ecid string) *tabletserver.TExternalCompactionJob {
+				job := translatableJob(ecid)
+				tt.mutate(job)
+				return job
+			})
+
+			cfg := testPollConfig(&scriptedResolver{results: []resolveResult{{addr: "manager-a:9999"}}}, nil)
+			logger, logs := testLogger()
+			if idle := drainCoordinator(context.Background(), logger, &fakeConn{svc: svc}, cfg); !idle {
+				t.Fatal("drain = busy, want idle")
+			}
+
+			releases := svc.releases()
+			if len(releases) != 1 {
+				t.Fatalf("compactionFailed calls = %d, want the slot released exactly once", len(releases))
+			}
+			if releases[0].class != tt.wantClass {
+				t.Fatalf("exception class = %q, want %q", releases[0].class, tt.wantClass)
+			}
+			out := logs.String()
+			if !strings.Contains(out, "compaction job refused") {
+				t.Fatalf("refusal not logged:\n%s", out)
+			}
+			if !strings.Contains(out, tt.wantLog) {
+				t.Fatalf("refusal log missing %q:\n%s", tt.wantLog, out)
+			}
+			if n := svc.completedCount(); n != 0 {
+				t.Fatalf("compactionCompleted calls = %d, want 0", n)
+			}
+		})
+	}
+}
+
+// TestReleaseJobRetriesOnFreshConnection: the release is the one RPC
+// shoal owes the manager, so a transport failure mid-hand-back must not
+// strand the job. The retry re-resolves the coordinator, which is also
+// what carries the release to a manager that failed over mid-job.
+func TestReleaseJobRetriesOnFreshConnection(t *testing.T) {
+	svc := &fakeCoordinator{
+		onFailed: func(attempt int) error {
+			if attempt == 1 {
+				return errors.New("write tcp 10.0.0.1:9999: broken pipe")
+			}
+			return nil
+		},
+	}
+	serveOneJob(svc, translatableJob)
+
+	resolver := &scriptedResolver{results: []resolveResult{
+		{addr: "manager-a:9999"},
+		{addr: "manager-b:9999"},
+	}}
+	var redialed []string
+	dial := func(_ context.Context, addr, _, _ string) (coordinatorConn, error) {
+		redialed = append(redialed, addr)
+		return &fakeConn{svc: svc}, nil
+	}
+
+	cfg := testPollConfig(resolver, dial)
+	original := &fakeConn{svc: svc}
+	logger, logs := testLogger()
+
+	if idle := drainCoordinator(context.Background(), logger, original, cfg); idle {
+		t.Fatal("drain = idle, want the spent connection reported so the loop reconnects")
+	}
+
+	releases := svc.releases()
+	if len(releases) != 1 {
+		t.Fatalf("recorded releases = %d, want 1 after the retry succeeded", len(releases))
+	}
+	if releases[0].class != compactjob.ClassCommitUnavailable {
+		t.Fatalf("class = %q", releases[0].class)
+	}
+	if len(redialed) != 1 || redialed[0] != "manager-a:9999" {
+		t.Fatalf("redials = %v, want one re-resolved dial", redialed)
+	}
+	if out := logs.String(); !strings.Contains(out, "release: compactionFailed rpc failed") ||
+		!strings.Contains(out, "attempt=2") {
+		t.Fatalf("retry not logged:\n%s", out)
+	}
+}
+
+// TestReleaseJobSurvivesShutdown: SIGTERM arrives while a job is in
+// hand. The poll loop's watcher has already closed the connection, so
+// the release has to dial its own — on a context the cancellation cannot
+// abort — and say the compactor is going away rather than that the job
+// is unsupported.
+func TestReleaseJobSurvivesShutdown(t *testing.T) {
+	svc := &fakeCoordinator{}
+	shutdownConn := &fakeConn{svc: svc}
+
+	var redialed []string
+	dial := func(ctx context.Context, addr, _, _ string) (coordinatorConn, error) {
+		if err := ctx.Err(); err != nil {
+			t.Errorf("release dialed with a cancelled context: %v", err)
+		}
+		redialed = append(redialed, addr)
+		return shutdownConn, nil
+	}
+	cfg := testPollConfig(&scriptedResolver{results: []resolveResult{{addr: "manager-b:9999"}}}, dial)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	// The connection the job arrived on: closed by the watcher, so any
+	// RPC on it would fail. Using it at all is the bug this guards.
+	stale := &fakeConn{svc: &fakeCoordinator{
+		onFailed: func(int) error {
+			t.Error("release used the connection shutdown had already closed")
+			return errors.New("closed")
+		},
+	}}
+
+	logger, logs := testLogger()
+	job := translatableJob(ecidPrefix + "0d1a4b0e-0000-0000-0000-000000000001")
+	if usable := releaseJob(ctx, logger, stale, cfg, job, compactjob.ClassCommitUnavailable); !usable {
+		t.Error("releaseJob reported the caller's connection spent; it was never used")
+	}
+
+	releases := svc.releases()
+	if len(releases) != 1 {
+		t.Fatalf("releases = %d, want the job handed back despite shutdown", len(releases))
+	}
+	if releases[0].class != compactjob.ClassShuttingDown {
+		t.Fatalf("class = %q, want %q so the manager can tell this from an unsupported job",
+			releases[0].class, compactjob.ClassShuttingDown)
+	}
+	if len(redialed) != 1 {
+		t.Fatalf("redials = %v, want exactly one fresh connection", redialed)
+	}
+	if shutdownConn.closeCount() != 1 {
+		t.Fatalf("release connection closed %d times, want 1", shutdownConn.closeCount())
+	}
+	if out := logs.String(); !strings.Contains(out, "compaction slot released to coordinator") {
+		t.Fatalf("release not logged:\n%s", out)
+	}
+}
+
+// TestReleaseJobGivesUpWithinItsBudget: an unreachable coordinator must
+// not hold shutdown open. The job is left to the coordinator's own
+// dead-compactor sweep, loudly.
+func TestReleaseJobGivesUpWithinItsBudget(t *testing.T) {
+	dials := 0
+	dial := func(context.Context, string, string, string) (coordinatorConn, error) {
+		dials++
+		return nil, errors.New("dial tcp 10.0.0.9:9999: connection refused")
+	}
+	cfg := testPollConfig(&scriptedResolver{results: []resolveResult{{addr: "manager-a:9999"}}}, dial)
+	cfg.releaseTimeout = 150 * time.Millisecond
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	logger, logs := testLogger()
+	job := translatableJob(ecidPrefix + "0d1a4b0e-0000-0000-0000-000000000002")
+
+	start := time.Now()
+	releaseJob(ctx, logger, &fakeConn{svc: &fakeCoordinator{}}, cfg, job, compactjob.ClassCommitUnavailable)
+	elapsed := time.Since(start)
+
+	if elapsed > time.Second {
+		t.Fatalf("release took %s, want it bounded by the %s budget", elapsed, cfg.releaseTimeout)
+	}
+	if dials < 2 {
+		t.Fatalf("dial attempts = %d, want retries inside the budget", dials)
+	}
+	out := logs.String()
+	if !strings.Contains(out, "release: gave up") {
+		t.Fatalf("give-up not logged at error level:\n%s", out)
+	}
+	if !strings.Contains(out, "level=ERROR") {
+		t.Fatalf("give-up must be operator-visible:\n%s", out)
+	}
+}
+
+// TestDrainCoordinatorStopsAfterJobBudget: a coordinator that keeps
+// offering jobs shoal declines must not become a hot loop. The drain
+// yields after its budget and reports idle so the outer backoff applies.
+func TestDrainCoordinatorStopsAfterJobBudget(t *testing.T) {
+	svc := &fakeCoordinator{
+		getJob: func(ecid string) (*compactioncoordinator.TNextCompactionJob, error) {
+			return jobReply(translatableJob(ecid)), nil
+		},
+	}
+
+	cfg := testPollConfig(&scriptedResolver{results: []resolveResult{{addr: "manager-a:9999"}}}, nil)
+	logger, logs := testLogger()
+
+	done := make(chan bool, 1)
+	go func() {
+		done <- drainCoordinator(context.Background(), logger, &fakeConn{svc: svc}, cfg)
+	}()
+
+	select {
+	case idle := <-done:
+		if !idle {
+			t.Fatal("drain = busy, want idle so the outer loop backs off")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("drain never yielded: an endlessly re-offered job spins the compactor")
+	}
+
+	if n := len(svc.releases()); n != maxJobsPerDrain {
+		t.Fatalf("releases = %d, want the per-drain budget of %d", n, maxJobsPerDrain)
+	}
+	if !strings.Contains(logs.String(), "released the per-drain job budget") {
+		t.Fatalf("budget exhaustion not logged:\n%s", logs.String())
+	}
+}
+
+// TestRunPollLoopReleasesJobWhenCancelledMidDrain is the shutdown race:
+// the signal lands while a job is being handled, so the watcher closes
+// the connection underneath the release. Under -race this also covers
+// the watcher's concurrent Close against the release's own dial.
+func TestRunPollLoopReleasesJobWhenCancelledMidDrain(t *testing.T) {
+	svc := &fakeCoordinator{}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var mu sync.Mutex
+	dials := 0
+	dial := func(_ context.Context, addr, _, _ string) (coordinatorConn, error) {
+		mu.Lock()
+		dials++
+		first := dials == 1
+		mu.Unlock()
+		conn := &fakeConn{svc: svc}
+		if first {
+			// The job arrives, then the signal — cancellation is racing
+			// the hand-back on purpose.
+			svc.getJob = func(ecid string) (*compactioncoordinator.TNextCompactionJob, error) {
+				job := translatableJob(ecid)
+				cancel()
+				return jobReply(job), nil
+			}
+		}
+		return conn, nil
+	}
+
+	logger, _ := testLogger()
+	cfg := testPollConfig(&scriptedResolver{results: []resolveResult{{addr: "manager-a:9999"}}}, dial)
+	runPollLoop(ctx, logger, cfg)
+
+	releases := svc.releases()
+	if len(releases) != 1 {
+		t.Fatalf("releases = %d, want the in-hand job released before exit", len(releases))
+	}
+	if releases[0].class != compactjob.ClassShuttingDown {
+		t.Fatalf("class = %q, want %q", releases[0].class, compactjob.ClassShuttingDown)
+	}
+	if svc.completedCount() != 0 {
+		t.Fatal("shoal reported a completed compaction")
 	}
 }
 
