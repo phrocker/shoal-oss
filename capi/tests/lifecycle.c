@@ -45,6 +45,40 @@ _Static_assert(SHOAL_ABI_CAPABILITY_WORD_COUNT == 1u,
 _Static_assert(SHOAL_ABI_CAPABILITY_WORD0 == UINT64_C(0x1fff),
                "unexpected capability word 0");
 
+#define ASSERT_PERMISSION_VALUE(name, value)                                  \
+  _Static_assert(name == value, "unexpected permission ordinal: " #name)
+
+ASSERT_PERMISSION_VALUE(SHOAL_SYSTEM_PERMISSION_GRANT, 0);
+ASSERT_PERMISSION_VALUE(SHOAL_SYSTEM_PERMISSION_CREATE_TABLE, 1);
+ASSERT_PERMISSION_VALUE(SHOAL_SYSTEM_PERMISSION_DROP_TABLE, 2);
+ASSERT_PERMISSION_VALUE(SHOAL_SYSTEM_PERMISSION_ALTER_TABLE, 3);
+ASSERT_PERMISSION_VALUE(SHOAL_SYSTEM_PERMISSION_CREATE_USER, 4);
+ASSERT_PERMISSION_VALUE(SHOAL_SYSTEM_PERMISSION_DROP_USER, 5);
+ASSERT_PERMISSION_VALUE(SHOAL_SYSTEM_PERMISSION_ALTER_USER, 6);
+ASSERT_PERMISSION_VALUE(SHOAL_SYSTEM_PERMISSION_SYSTEM, 7);
+ASSERT_PERMISSION_VALUE(SHOAL_SYSTEM_PERMISSION_CREATE_NAMESPACE, 8);
+ASSERT_PERMISSION_VALUE(SHOAL_SYSTEM_PERMISSION_DROP_NAMESPACE, 9);
+ASSERT_PERMISSION_VALUE(SHOAL_SYSTEM_PERMISSION_ALTER_NAMESPACE, 10);
+ASSERT_PERMISSION_VALUE(SHOAL_SYSTEM_PERMISSION_OBTAIN_DELEGATION_TOKEN, 11);
+ASSERT_PERMISSION_VALUE(SHOAL_TABLE_PERMISSION_READ, 2);
+ASSERT_PERMISSION_VALUE(SHOAL_TABLE_PERMISSION_WRITE, 3);
+ASSERT_PERMISSION_VALUE(SHOAL_TABLE_PERMISSION_BULK_IMPORT, 4);
+ASSERT_PERMISSION_VALUE(SHOAL_TABLE_PERMISSION_ALTER_TABLE, 5);
+ASSERT_PERMISSION_VALUE(SHOAL_TABLE_PERMISSION_GRANT, 6);
+ASSERT_PERMISSION_VALUE(SHOAL_TABLE_PERMISSION_DROP_TABLE, 7);
+ASSERT_PERMISSION_VALUE(SHOAL_TABLE_PERMISSION_GET_SUMMARIES, 8);
+ASSERT_PERMISSION_VALUE(SHOAL_NAMESPACE_PERMISSION_READ, 0);
+ASSERT_PERMISSION_VALUE(SHOAL_NAMESPACE_PERMISSION_WRITE, 1);
+ASSERT_PERMISSION_VALUE(SHOAL_NAMESPACE_PERMISSION_ALTER_NAMESPACE, 2);
+ASSERT_PERMISSION_VALUE(SHOAL_NAMESPACE_PERMISSION_GRANT, 3);
+ASSERT_PERMISSION_VALUE(SHOAL_NAMESPACE_PERMISSION_ALTER_TABLE, 4);
+ASSERT_PERMISSION_VALUE(SHOAL_NAMESPACE_PERMISSION_CREATE_TABLE, 5);
+ASSERT_PERMISSION_VALUE(SHOAL_NAMESPACE_PERMISSION_DROP_TABLE, 6);
+ASSERT_PERMISSION_VALUE(SHOAL_NAMESPACE_PERMISSION_BULK_IMPORT, 7);
+ASSERT_PERMISSION_VALUE(SHOAL_NAMESPACE_PERMISSION_DROP_NAMESPACE, 8);
+
+#undef ASSERT_PERMISSION_VALUE
+
 static void expect_error(shoal_status status, shoal_status expected,
                          shoal_error **error, const char *message_part) {
   if (status != expected) {
@@ -388,6 +422,19 @@ int main(void) {
   assert(strcmp(property_view.value, "") == 0);
   shoal_namespace_properties_free(&namespace_properties);
   shoal_namespace_properties_free(&namespace_properties);
+  assert(shoal_connector_effective_namespace_properties(
+             admin_connector, "work", 0, &namespace_properties, &error) ==
+         SHOAL_STATUS_OK);
+  assert(shoal_namespace_properties_count(namespace_properties) == 1);
+  shoal_namespace_properties_free(&namespace_properties);
+  assert(shoal_connector_remove_namespace_property(
+             admin_connector, "work", "table.custom.mode", 0, &error) ==
+         SHOAL_STATUS_OK);
+  assert(shoal_connector_namespace_properties(
+             admin_connector, "work", 0, &namespace_properties, &error) ==
+         SHOAL_STATUS_OK);
+  assert(shoal_namespace_properties_count(namespace_properties) == 0);
+  shoal_namespace_properties_free(&namespace_properties);
   assert(shoal_connector_versioned_namespace_properties(
              admin_connector, "analytics", 0, &versioned_properties, &error) ==
          SHOAL_STATUS_OK);
@@ -432,6 +479,40 @@ int main(void) {
   assert(shoal_connector_revoke_table_permission(
              admin_connector, "alice", "events", SHOAL_TABLE_PERMISSION_READ,
              0, &error) == SHOAL_STATUS_OK);
+  assert(shoal_connector_has_table_permission(
+             admin_connector, "alice", "events", SHOAL_TABLE_PERMISSION_READ,
+             0, &has_permission, &error) == SHOAL_STATUS_OK);
+  assert(has_permission == 0);
+  assert(shoal_connector_grant_system_permission(
+             admin_connector, "alice", SHOAL_SYSTEM_PERMISSION_CREATE_TABLE, 0,
+             &error) == SHOAL_STATUS_OK);
+  assert(shoal_connector_has_system_permission(
+             admin_connector, "alice", SHOAL_SYSTEM_PERMISSION_CREATE_TABLE, 0,
+             &has_permission, &error) == SHOAL_STATUS_OK);
+  assert(has_permission == 1);
+  assert(shoal_connector_revoke_system_permission(
+             admin_connector, "alice", SHOAL_SYSTEM_PERMISSION_CREATE_TABLE, 0,
+             &error) == SHOAL_STATUS_OK);
+  assert(shoal_connector_has_system_permission(
+             admin_connector, "alice", SHOAL_SYSTEM_PERMISSION_CREATE_TABLE, 0,
+             &has_permission, &error) == SHOAL_STATUS_OK);
+  assert(has_permission == 0);
+  assert(shoal_connector_grant_namespace_permission(
+             admin_connector, "alice", "analytics",
+             SHOAL_NAMESPACE_PERMISSION_READ, 0, &error) == SHOAL_STATUS_OK);
+  assert(shoal_connector_has_namespace_permission(
+             admin_connector, "alice", "analytics",
+             SHOAL_NAMESPACE_PERMISSION_READ, 0, &has_permission, &error) ==
+         SHOAL_STATUS_OK);
+  assert(has_permission == 1);
+  assert(shoal_connector_revoke_namespace_permission(
+             admin_connector, "alice", "analytics",
+             SHOAL_NAMESPACE_PERMISSION_READ, 0, &error) == SHOAL_STATUS_OK);
+  assert(shoal_connector_has_namespace_permission(
+             admin_connector, "alice", "analytics",
+             SHOAL_NAMESPACE_PERMISSION_READ, 0, &has_permission, &error) ==
+         SHOAL_STATUS_OK);
+  assert(has_permission == 0);
   assert(shoal_connector_change_password(admin_connector, "missing",
                                          &empty_password, 0, &error) ==
          SHOAL_STATUS_USER_NOT_FOUND);
