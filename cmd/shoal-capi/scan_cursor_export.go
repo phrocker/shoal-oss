@@ -32,10 +32,13 @@ type ownedScanCursor struct {
 	closed  bool
 	ended   bool
 	stopErr error
+	active  int
+	idle    chan struct{}
 
-	finishOnce sync.Once
-	finishErr  error
-	stopped    chan struct{}
+	interruptOnce sync.Once
+	interruptErr  error
+	completeOnce  sync.Once
+	stopped       chan struct{}
 }
 
 func newOwnedScanCursor(
@@ -43,9 +46,12 @@ func newOwnedScanCursor(
 	source scanCursorSource,
 	done func(),
 ) *ownedScanCursor {
+	idle := make(chan struct{})
+	close(idle)
 	cursor := &ownedScanCursor{
 		source:  source,
 		done:    done,
+		idle:    idle,
 		stopped: make(chan struct{}),
 	}
 	go func() {
@@ -58,13 +64,18 @@ func newOwnedScanCursor(
 	return cursor
 }
 
-func (c *ownedScanCursor) finish() error {
-	c.finishOnce.Do(func() {
-		c.finishErr = c.source.Close()
+func (c *ownedScanCursor) interrupt() error {
+	c.interruptOnce.Do(func() {
+		c.interruptErr = c.source.Close()
+	})
+	return c.interruptErr
+}
+
+func (c *ownedScanCursor) complete() {
+	c.completeOnce.Do(func() {
 		c.done()
 		close(c.stopped)
 	})
-	return c.finishErr
 }
 
 func (c *ownedScanCursor) abort(err error) {
@@ -75,15 +86,65 @@ func (c *ownedScanCursor) abort(err error) {
 	}
 	c.closed = true
 	c.stopErr = err
+	idle := c.idle
 	c.mu.Unlock()
-	_ = c.finish()
+	_ = c.interrupt()
+	<-idle
+	c.complete()
 }
 
 func (c *ownedScanCursor) close() error {
 	c.mu.Lock()
 	c.closed = true
+	idle := c.idle
 	c.mu.Unlock()
-	return c.finish()
+	err := c.interrupt()
+	<-idle
+	c.complete()
+	return err
+}
+
+func (c *ownedScanCursor) requestClose() {
+	c.mu.Lock()
+	c.closed = true
+	complete := c.active == 0
+	c.mu.Unlock()
+	_ = c.interrupt()
+	if complete {
+		c.complete()
+	}
+}
+
+func (c *ownedScanCursor) beginPull() (bool, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		if c.stopErr != nil {
+			return false, c.stopErr
+		}
+		return false, accumulo.ErrStreamClosed
+	}
+	if c.ended {
+		return true, nil
+	}
+	if c.active == 0 {
+		c.idle = make(chan struct{})
+	}
+	c.active++
+	return false, nil
+}
+
+func (c *ownedScanCursor) endPull() {
+	c.mu.Lock()
+	c.active--
+	if c.active == 0 {
+		close(c.idle)
+	}
+	complete := c.active == 0 && (c.closed || c.ended)
+	c.mu.Unlock()
+	if complete {
+		c.complete()
+	}
 }
 
 func (c *ownedScanCursor) next(maxEntries int) ([]accumulo.KeyValue, bool, error) {
@@ -114,8 +175,12 @@ func (c *ownedScanCursor) next(maxEntries int) ([]accumulo.KeyValue, bool, error
 		err := c.source.Err()
 		c.mu.Lock()
 		c.ended = true
+		complete := c.active == 0
 		c.mu.Unlock()
-		closeErr := c.finish()
+		closeErr := c.interrupt()
+		if complete {
+			c.complete()
+		}
 		return values, true, errors.Join(err, closeErr)
 	}
 	return values, false, nil
@@ -459,11 +524,20 @@ func shoal_scan_cursor_next(
 	if err != nil {
 		return fail(outError, C.SHOAL_STATUS_INVALID_HANDLE, err)
 	}
+	exhausted, err := cursor.beginPull()
+	if err != nil {
+		return failForError(outError, err)
+	}
+	if exhausted {
+		*outExhausted = 1
+		return C.SHOAL_STATUS_OK
+	}
+	defer cursor.endPull()
 	values, exhausted, scanErr := cursor.next(int(maxEntries))
 	if len(values) > 0 {
 		result, allocErr := allocateScanResult(values)
 		if allocErr != nil {
-			_ = cursor.close()
+			cursor.requestClose()
 			return fail(outError, C.SHOAL_STATUS_OUT_OF_MEMORY, allocErr)
 		}
 		*outResult = result

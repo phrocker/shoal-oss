@@ -115,11 +115,35 @@ func TestOwnedScanCursorCloseCancelsAndJoinsBlockedNext(t *testing.T) {
 	})
 
 	nextDone := make(chan error, 1)
+	entered := make(chan struct{})
+	pullReturned := make(chan struct{})
+	releasePull := make(chan struct{})
 	go func() {
-		_, _, err := cursor.next(1)
+		exhausted, err := cursor.beginPull()
+		if err != nil || exhausted {
+			nextDone <- err
+			return
+		}
+		close(entered)
+		defer cursor.endPull()
+		_, _, err = cursor.next(1)
+		close(pullReturned)
+		<-releasePull
 		nextDone <- err
 	}()
-	if err := cursor.close(); err != nil {
+	<-entered
+	closeDone := make(chan error, 1)
+	go func() {
+		closeDone <- cursor.close()
+	}()
+	<-pullReturned
+	select {
+	case err := <-closeDone:
+		t.Fatalf("close returned before pull exit: %v", err)
+	default:
+	}
+	close(releasePull)
+	if err := <-closeDone; err != nil {
 		t.Fatal(err)
 	}
 	if err := <-nextDone; !errors.Is(err, accumulo.ErrStreamClosed) {
