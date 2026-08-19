@@ -821,6 +821,8 @@ func statusForError(err error) C.shoal_status {
 		return C.SHOAL_STATUS_CANCELLED
 	case errors.Is(err, accumulo.ErrConnectorClosed):
 		return C.SHOAL_STATUS_CLOSED
+	case errors.Is(err, accumulo.ErrStreamClosed):
+		return C.SHOAL_STATUS_CLOSED
 	case errors.Is(err, publicrfile.ErrClosed):
 		return C.SHOAL_STATUS_CLOSED
 	case errors.Is(err, publicrfile.ErrNoTop):

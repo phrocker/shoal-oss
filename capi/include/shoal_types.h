@@ -22,7 +22,7 @@
  */
 #define SHOAL_ABI_VERSION 1u
 #define SHOAL_ABI_VERSION_MAJOR 1u
-#define SHOAL_ABI_VERSION_MINOR 12u
+#define SHOAL_ABI_VERSION_MINOR 13u
 #define SHOAL_ABI_VERSION_PATCH 0u
 #define SHOAL_ABI_PACK_VERSION(major, minor, patch)                           \
   ((((uint32_t)(major) & 0xffu) << 16) |                                     \
@@ -63,10 +63,11 @@ enum {
   SHOAL_ABI_CAPABILITY_CONNECTOR_CONTROL = 20,
   SHOAL_ABI_CAPABILITY_HIGH_LEVEL_CLIENT = 21,
   SHOAL_ABI_CAPABILITY_HIGH_LEVEL_SCANNER = 22,
-  SHOAL_ABI_CAPABILITY_COMPATIBILITY_ERRORS = 23
+  SHOAL_ABI_CAPABILITY_COMPATIBILITY_ERRORS = 23,
+  SHOAL_ABI_CAPABILITY_STREAMING_SCAN_CURSOR = 24
 };
 
-#define SHOAL_ABI_CAPABILITY_COUNT 24u
+#define SHOAL_ABI_CAPABILITY_COUNT 25u
 #define SHOAL_ABI_CAPABILITY_WORD_BITS 64u
 #define SHOAL_ABI_CAPABILITY_WORD_INDEX(capability_id)                       \
   ((uint32_t)(capability_id) / SHOAL_ABI_CAPABILITY_WORD_BITS)
@@ -124,6 +125,8 @@ enum {
   SHOAL_ABI_CAPABILITY_MASK(SHOAL_ABI_CAPABILITY_HIGH_LEVEL_SCANNER)
 #define SHOAL_ABI_CAPABILITY_COMPATIBILITY_ERRORS_MASK                       \
   SHOAL_ABI_CAPABILITY_MASK(SHOAL_ABI_CAPABILITY_COMPATIBILITY_ERRORS)
+#define SHOAL_ABI_CAPABILITY_STREAMING_SCAN_CURSOR_MASK                      \
+  SHOAL_ABI_CAPABILITY_MASK(SHOAL_ABI_CAPABILITY_STREAMING_SCAN_CURSOR)
 #define SHOAL_ABI_CAPABILITY_WORD0                                           \
   (SHOAL_ABI_CAPABILITY_CONNECTOR_MASK | SHOAL_ABI_CAPABILITY_BOOTSTRAP_MASK | \
    SHOAL_ABI_CAPABILITY_ERROR_MASK | SHOAL_ABI_CAPABILITY_SCANNER_MASK |     \
@@ -146,7 +149,8 @@ enum {
    SHOAL_ABI_CAPABILITY_CONNECTOR_CONTROL_MASK |                             \
    SHOAL_ABI_CAPABILITY_HIGH_LEVEL_CLIENT_MASK |                             \
    SHOAL_ABI_CAPABILITY_HIGH_LEVEL_SCANNER_MASK |                            \
-   SHOAL_ABI_CAPABILITY_COMPATIBILITY_ERRORS_MASK)
+   SHOAL_ABI_CAPABILITY_COMPATIBILITY_ERRORS_MASK |                          \
+   SHOAL_ABI_CAPABILITY_STREAMING_SCAN_CURSOR_MASK)
 
 typedef int32_t shoal_status;
 
@@ -211,6 +215,7 @@ typedef struct shoal_cancellation shoal_cancellation;
 typedef struct shoal_scanner shoal_scanner;
 typedef struct shoal_batch_scanner shoal_batch_scanner;
 typedef struct shoal_scan_result shoal_scan_result;
+typedef struct shoal_scan_cursor shoal_scan_cursor;
 typedef struct shoal_table_list_result shoal_table_list_result;
 typedef struct shoal_mutation shoal_mutation;
 typedef struct shoal_batch_writer shoal_batch_writer;

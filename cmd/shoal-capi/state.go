@@ -502,6 +502,9 @@ type ownedScanner struct {
 	batch  *accumulo.BatchScanner
 	owner  *ownedConnector
 
+	streamOne  func(context.Context, *accumulo.Range) (scanCursorSource, error)
+	streamMany func(context.Context, []*accumulo.Range) (scanCursorSource, error)
+
 	mu      sync.Mutex
 	closed  bool
 	nextID  uint64
@@ -514,13 +517,20 @@ func newOwnedScanner(
 	batch *accumulo.BatchScanner,
 	owner *ownedConnector,
 ) *ownedScanner {
-	return &ownedScanner{
+	scanner := &ownedScanner{
 		single:  single,
 		batch:   batch,
 		owner:   owner,
 		nextID:  1,
 		cancels: make(map[uint64]context.CancelFunc),
 	}
+	scanner.streamOne = func(ctx context.Context, scanRange *accumulo.Range) (scanCursorSource, error) {
+		return scanner.single.Stream(ctx, scanRange)
+	}
+	scanner.streamMany = func(ctx context.Context, ranges []*accumulo.Range) (scanCursorSource, error) {
+		return scanner.batch.Stream(ctx, ranges)
+	}
+	return scanner
 }
 
 func (s *ownedScanner) begin(timeout time.Duration) (context.Context, func(), error) {
@@ -618,6 +628,61 @@ func (s *ownedScanner) beginCancelable(
 	}, nil
 }
 
+func (s *ownedScanner) beginStream(
+	timeout time.Duration,
+	cancellation *ownedCancellation,
+) (context.Context, func(), error) {
+	ctx, scannerDone, err := s.begin(timeout)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	var (
+		ownerDone func()
+		stopOwner func() bool
+		cancel    context.CancelFunc
+	)
+	if s.owner != nil {
+		ownerCtx, done, ownerErr := s.owner.begin(timeout)
+		if ownerErr != nil {
+			scannerDone()
+			return nil, nil, ownerErr
+		}
+		ownerDone = done
+		ctx, cancel = context.WithCancel(ctx)
+		stopOwner = context.AfterFunc(ownerCtx, cancel)
+	}
+
+	var cancellationDone func()
+	if cancellation != nil {
+		ctx, cancellationDone, err = cancellation.attach(ctx)
+		if err != nil {
+			if stopOwner != nil {
+				stopOwner()
+				cancel()
+				ownerDone()
+			}
+			scannerDone()
+			return nil, nil, err
+		}
+	}
+
+	var once sync.Once
+	return ctx, func() {
+		once.Do(func() {
+			if cancellationDone != nil {
+				cancellationDone()
+			}
+			if stopOwner != nil {
+				stopOwner()
+				cancel()
+				ownerDone()
+			}
+			scannerDone()
+		})
+	}, nil
+}
+
 func (s *ownedScanner) close() {
 	s.mu.Lock()
 	if !s.closed {
@@ -682,6 +747,55 @@ func (r *scannerRegistry) remove(id uint64) (*ownedScanner, bool) {
 
 var scanners = newScannerRegistry()
 var batchScanners = newScannerRegistry()
+
+type scanCursorRegistry struct {
+	mu     sync.RWMutex
+	nextID uint64
+	items  map[uint64]*ownedScanCursor
+}
+
+func newScanCursorRegistry() *scanCursorRegistry {
+	return &scanCursorRegistry{
+		nextID: 1,
+		items:  make(map[uint64]*ownedScanCursor),
+	}
+}
+
+func (r *scanCursorRegistry) add(cursor *ownedScanCursor) (uint64, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for attempts := uint64(0); attempts < ^uint64(0); attempts++ {
+		id := r.nextID
+		r.nextID++
+		if r.nextID == 0 {
+			r.nextID = 1
+		}
+		if id != 0 {
+			if _, exists := r.items[id]; !exists {
+				r.items[id] = cursor
+				return id, true
+			}
+		}
+	}
+	return 0, false
+}
+
+func (r *scanCursorRegistry) get(id uint64) (*ownedScanCursor, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	cursor, ok := r.items[id]
+	return cursor, ok
+}
+
+func (r *scanCursorRegistry) remove(id uint64) (*ownedScanCursor, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	cursor, ok := r.items[id]
+	delete(r.items, id)
+	return cursor, ok
+}
+
+var scanCursors = newScanCursorRegistry()
 
 type mutationRegistry struct {
 	mu     sync.RWMutex
