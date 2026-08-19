@@ -14,7 +14,7 @@ import tempfile
 
 
 DOC_PATH = Path(__file__).with_name("sharkbite-compatibility.md")
-EXPECTED_REVISION = 18
+EXPECTED_REVISION = 19
 # Update this manifest only when the independently audited inventory itself
 # changes; review every added/removed or reclassified ID in code review.
 EXPECTED_ROW_MANIFEST = DOC_PATH.with_name(
@@ -61,8 +61,8 @@ def status_count_map(
 EXPECTED_STATUS_COUNTS = {
     "Covered": 1,
     "Missing Go": 2420,
-    "Missing C ABI": 99,
-    "Behavior mismatch": 204,
+    "Missing C ABI": 91,
+    "Behavior mismatch": 212,
     "Intentional divergence (approval required)": 87,
     "Not required (rationale required)": 392,
 }
@@ -71,8 +71,7 @@ EXPECTED_PREFIX_COUNTS = {
     "SB-BASE": status_count_map(missing_c_abi=18, not_required=2),
     "SB-CFG": status_count_map(
         missing_go=11,
-        missing_c_abi=8,
-        behavior_mismatch=9,
+        behavior_mismatch=17,
         intentional_divergence=2,
         not_required=6,
     ),
@@ -191,17 +190,18 @@ EXPECTED_METADATA_FIELDS = {
     ),
     "Sharkbite release line": "`sharkbite` 1.2.0.3 on PyPI (`setup.py:34-35`)",
     "Shoal reference": (
-        "`phrocker/shoal-oss` exact audited baseline for revision 18 "
-        "`9a320f9228a72297c5da4be80e90dcf8931fbf79` "
-        "(\"docs: compile C ABI audit inventory\")"
+        "`phrocker/shoal-oss` exact audited baseline for revision 19 "
+        "`04ff6ff072fdad78bc3104035feae64e9722bc5d` "
+        "(\"Merge pull request #103 from phrocker/rewrite/108-capi-admin-parity\") "
+        "plus this connector-identity ABI change"
     ),
     "Shoal C ABI version": "`SHOAL_ABI_VERSION 1u` (`capi/include/shoal_types.h`)",
 }
 
 EXPECTED_DOCUMENT_STATUS_SNIPPETS = (
     "Normative gate. Binding on all Sharkbite-compatibility work.",
-    f"Revision {EXPECTED_REVISION} — applies the seventeenth independent audit",
-    "Revision 17 applied the sixteenth audit",
+    f"Revision {EXPECTED_REVISION} — adds the merged connector-identity C ABI",
+    "Revision 18 applied the seventeenth independent audit",
     "Revision 9 applied the eighth audit",
 )
 
@@ -225,6 +225,7 @@ GAP_COMPLETION_RULES: dict[str, tuple[str, ...]] = {
     "SB-GAP-C-001": ("Missing Go", "Missing C ABI"),
     "SB-GAP-C-002": ("Missing Go", "Missing C ABI"),
     "SB-GAP-C-004": ("Missing Go", "Missing C ABI"),
+    "SB-GAP-C-011": ("Missing Go", "Missing C ABI"),
 }
 
 EXPECTED_ROW_MANIFEST_HEADER = (
@@ -247,8 +248,8 @@ DEFAULT_C_ABI_INCLUDE_PATHS = (
     Path("capi/include"),
     Path("capi/tests"),
 )
-EXPECTED_C_ABI_DECLARED_EXPORTS = 108
-EXPECTED_C_ABI_REFERENCED_EXPORTS = 102
+EXPECTED_C_ABI_DECLARED_EXPORTS = 112
+EXPECTED_C_ABI_REFERENCED_EXPORTS = 106
 EXPECTED_C_ABI_UNREFERENCED_EXPORTS = (
     "shoal_scanner_scan",
     "shoal_batch_scanner_scan",

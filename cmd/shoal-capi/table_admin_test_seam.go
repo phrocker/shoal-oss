@@ -16,23 +16,25 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/phrocker/shoal/accumulo"
 )
 
 type testAdminConnector struct {
-	mu          sync.Mutex
-	nextID      int
-	tables      map[string]string
-	properties  map[string]map[string]string
-	namespaces  map[string]string
-	nsProps     map[string]map[string]string
-	users       map[string][]byte
-	auths       map[string][][]byte
-	permissions map[string]bool
-	splits      map[string][][]byte
-	flushFalse  int
-	flushTrue   int
+	mu            sync.Mutex
+	nextID        int
+	tables        map[string]string
+	properties    map[string]map[string]string
+	namespaces    map[string]string
+	nsProps       map[string]map[string]string
+	users         map[string][]byte
+	auths         map[string][][]byte
+	permissions   map[string]bool
+	splits        map[string][][]byte
+	flushFalse    int
+	flushTrue     int
+	identityBlock atomic.Bool
 }
 
 func newTestAdminConnector() *testAdminConnector {
@@ -61,6 +63,18 @@ func newTestAdminConnector() *testAdminConnector {
 
 func (c *testAdminConnector) Close() error {
 	return nil
+}
+
+func (c *testAdminConnector) Principal() string {
+	return "root"
+}
+
+func (c *testAdminConnector) capiConnectorIdentity(ctx context.Context) (accumulo.InstanceInfo, string, error) {
+	if c.identityBlock.Load() {
+		<-ctx.Done()
+		return accumulo.InstanceInfo{}, "", ctx.Err()
+	}
+	return accumulo.InstanceInfo{Name: "test", ID: "test-id"}, c.Principal(), nil
 }
 
 func (c *testAdminConnector) NewScanner(
@@ -641,6 +655,27 @@ func shoal_test_connector_flush_wait_count(
 		return 0
 	}
 	return C.size_t(admin.flushWaitCount(waitForCompletion))
+}
+
+//export shoal_test_connector_identity_block
+func shoal_test_connector_identity_block(
+	handle *C.shoal_connector,
+	block C.uint8_t,
+) C.int {
+	connector, err := lookupConnector(handle)
+	if err != nil {
+		return 0
+	}
+	admin, ok := connector.connector.(*testAdminConnector)
+	if !ok {
+		return 0
+	}
+	value, err := boolFlag(block, "block")
+	if err != nil {
+		return 0
+	}
+	admin.identityBlock.Store(value)
+	return 1
 }
 
 //export shoal_test_string_alloc_fail_after

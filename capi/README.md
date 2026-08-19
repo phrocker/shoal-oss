@@ -29,14 +29,14 @@ Shoal separates **ABI compatibility** from **feature availability**:
   stable allocation-free version tuple that works before connector creation.
   `SHOAL_ABI_VERSION_PACKED` uses
   `SHOAL_ABI_PACK_VERSION(major, minor, patch)` with a hexadecimal
-  `0x00MMmmpp` layout, so ABI `1.1.0` is `0x00010100`.
+  `0x00MMmmpp` layout, so ABI `1.2.0` is `0x00010200`.
 - Capability identifiers are append-only. Existing IDs and bits never change
   meaning. `shoal_abi_capability_word_count()` reports how many 64-bit words
   the current library uses, `shoal_abi_capability_word(i)` returns `0` for
   `i >= word_count`, and `shoal_abi_has_capability(id)` returns `0` for both
   unsupported and unknown IDs.
 
-Current capability assignments (`word 0 == 0x0000000000001fff`):
+Current capability assignments (`word 0 == 0x0000000000003fff`):
 
 | ID | Mask | Surface |
 | --- | --- | --- |
@@ -53,6 +53,7 @@ Current capability assignments (`word 0 == 0x0000000000001fff`):
 | `SHOAL_ABI_CAPABILITY_NAMESPACE_ADMIN` | `0x0400` | namespace discovery, lifecycle, and property administration |
 | `SHOAL_ABI_CAPABILITY_SECURITY_ADMIN` | `0x0800` | users, authorizations, and permission administration |
 | `SHOAL_ABI_CAPABILITY_TABLE_SPLITS` | `0x1000` | binary-safe split listing and creation |
+| `SHOAL_ABI_CAPABILITY_CONNECTOR_IDENTITY` | `0x2000` | owned connector instance-name, instance-ID, and principal discovery |
 
 Shoal does **not** advertise instance status, compaction/import/export,
 Python/wheel, or any other unimplemented surface until the API exists and has
@@ -103,13 +104,18 @@ Version numbers change only when the public ABI contract changes:
   Freeing also performs best-effort close and sets the variable to `NULL`.
 - A connector owns the bootstrap instance created for it. Callers do not
   separately close ZooKeeper resources.
-- Administration calls (`list_tables`, `table_exists`, `create`,
+- Connector identity and administration calls (`get_identity`, `list_tables`, `table_exists`, `create`,
   `delete`, `rename`, `flush`, property mutation, and effective property
   reads; namespace discovery/lifecycle/property reads; security operations;
   and table split listing/creation) accept per-call deadlines. Connector close
   prevents new calls, cancels and joins active administration calls, waits for any
   already-started scanner or batch-scanner calls to finish before final
   teardown, and remains idempotent while the handle stays alive.
+- `shoal_connector_get_identity` returns one owned result containing copied
+  instance-name, instance-ID, and principal strings. Initialize
+  `shoal_connector_identity_view` with its init helper; the view borrows its
+  pointers only until `shoal_connector_identity_free`, which is idempotent
+  when called with the address of a `NULL` result variable.
 - Scanner configuration, ranges, and all nested arrays/bytes are borrowed only
   for the creating or scan call. Shoal copies every value it retains.
 - Scanner and batch-scanner handles support concurrent scan calls. Close

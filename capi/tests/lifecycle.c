@@ -8,9 +8,9 @@
 
 _Static_assert(SHOAL_ABI_VERSION == 1u, "unexpected compatibility ABI version");
 _Static_assert(SHOAL_ABI_VERSION_MAJOR == 1u, "unexpected ABI major");
-_Static_assert(SHOAL_ABI_VERSION_MINOR == 1u, "unexpected ABI minor");
+_Static_assert(SHOAL_ABI_VERSION_MINOR == 2u, "unexpected ABI minor");
 _Static_assert(SHOAL_ABI_VERSION_PATCH == 0u, "unexpected ABI patch");
-_Static_assert(SHOAL_ABI_VERSION_PACKED == 0x00010100u,
+_Static_assert(SHOAL_ABI_VERSION_PACKED == 0x00010200u,
                "unexpected packed ABI version");
 _Static_assert(SHOAL_ABI_CAPABILITY_CONNECTOR == 0u,
                "unexpected connector capability id");
@@ -38,11 +38,13 @@ _Static_assert(SHOAL_ABI_CAPABILITY_SECURITY_ADMIN == 11u,
                "unexpected security admin capability id");
 _Static_assert(SHOAL_ABI_CAPABILITY_TABLE_SPLITS == 12u,
                "unexpected table splits capability id");
-_Static_assert(SHOAL_ABI_CAPABILITY_COUNT == 13u,
+_Static_assert(SHOAL_ABI_CAPABILITY_CONNECTOR_IDENTITY == 13u,
+               "unexpected connector identity capability id");
+_Static_assert(SHOAL_ABI_CAPABILITY_COUNT == 14u,
                "unexpected capability count");
 _Static_assert(SHOAL_ABI_CAPABILITY_WORD_COUNT == 1u,
                "unexpected capability word count");
-_Static_assert(SHOAL_ABI_CAPABILITY_WORD0 == UINT64_C(0x1fff),
+_Static_assert(SHOAL_ABI_CAPABILITY_WORD0 == UINT64_C(0x3fff),
                "unexpected capability word 0");
 
 #define ASSERT_PERMISSION_VALUE(name, value)                                  \
@@ -127,6 +129,9 @@ static void test_v1_initializers(void) {
   CHECK_V1_INIT(shoal_range, shoal_range_init, SHOAL_RANGE_V1_SIZE);
   CHECK_V1_INIT(shoal_batch_writer_config, shoal_batch_writer_config_init,
                 SHOAL_BATCH_WRITER_CONFIG_V1_SIZE);
+  CHECK_V1_INIT(shoal_connector_identity_view,
+                shoal_connector_identity_view_init,
+                SHOAL_CONNECTOR_IDENTITY_VIEW_V1_SIZE);
 
 #undef CHECK_V1_INIT
 }
@@ -146,6 +151,7 @@ int main(void) {
   shoal_namespace_properties_result *namespace_properties = NULL;
   shoal_versioned_properties_result *versioned_properties = NULL;
   shoal_bytes_list_result *bytes_list = NULL;
+  shoal_connector_identity_result *identity = NULL;
   shoal_error *error = NULL;
 
   test_v1_initializers();
@@ -170,6 +176,8 @@ int main(void) {
   assert(shoal_abi_has_capability(
              SHOAL_ABI_CAPABILITY_STRUCTURED_WRITE_FAILURE) == 1);
   assert(shoal_abi_has_capability(SHOAL_ABI_CAPABILITY_TABLE_ADMIN) == 1);
+  assert(shoal_abi_has_capability(SHOAL_ABI_CAPABILITY_CONNECTOR_IDENTITY) ==
+         1);
   assert(shoal_abi_has_capability(SHOAL_ABI_CAPABILITY_COUNT) == 0);
   assert(shoal_abi_has_capability(63u) == 0);
   assert(shoal_abi_has_capability(64u) == 0);
@@ -204,6 +212,69 @@ int main(void) {
 
   assert(shoal_test_connector_create(&admin_connector));
   assert(admin_connector != NULL);
+
+  expect_error(shoal_connector_get_identity(NULL, 0, &identity, &error),
+               SHOAL_STATUS_INVALID_HANDLE, &error, "NULL");
+  expect_error(shoal_connector_get_identity(connector, -1, &identity, &error),
+               SHOAL_STATUS_INVALID_ARGUMENT, &error, "timeout");
+  expect_error(shoal_connector_get_identity(connector, 0, NULL, &error),
+               SHOAL_STATUS_INVALID_ARGUMENT, &error, "out_result");
+  assert(shoal_connector_get_identity(connector, 0, &identity, &error) ==
+         SHOAL_STATUS_OK);
+  assert(identity != NULL && error == NULL);
+  shoal_connector_identity_view identity_view;
+  memset(&identity_view, 0, sizeof(identity_view));
+  expect_error(shoal_connector_identity_get(identity, &identity_view, &error),
+               SHOAL_STATUS_INVALID_ARGUMENT, &error, "struct_size");
+  shoal_connector_identity_view_init(&identity_view);
+  assert(identity_view.struct_size == SHOAL_CONNECTOR_IDENTITY_VIEW_V1_SIZE);
+  assert(shoal_connector_identity_get(identity, &identity_view, &error) ==
+         SHOAL_STATUS_OK);
+  assert(strcmp(identity_view.instance_name, "accumulo") == 0);
+  assert(strcmp(identity_view.instance_id,
+                "00000000-0000-0000-0000-000000000001") == 0);
+  assert(strcmp(identity_view.principal, "root") == 0);
+  struct {
+    shoal_connector_identity_view view;
+    uint8_t future[16];
+  } future_identity;
+  memset(&future_identity, 0xa5, sizeof(future_identity));
+  shoal_connector_identity_view_init(&future_identity.view);
+  future_identity.view.struct_size = (uint32_t)sizeof(future_identity);
+  assert(shoal_connector_identity_get(identity, &future_identity.view,
+                                      &error) == SHOAL_STATUS_OK);
+  for (size_t i = 0; i < sizeof(future_identity.future); ++i) {
+    assert(future_identity.future[i] == UINT8_C(0xa5));
+  }
+  expect_error(shoal_connector_identity_get(identity, NULL, &error),
+               SHOAL_STATUS_INVALID_ARGUMENT, &error, "out_identity");
+  expect_error(shoal_connector_identity_get(NULL, &identity_view, &error),
+               SHOAL_STATUS_INVALID_ARGUMENT, &error, "identity result");
+  shoal_connector_identity_free(&identity);
+  assert(identity == NULL);
+  shoal_connector_identity_free(&identity);
+
+  for (size_t allocation = 0; allocation < 3; ++allocation) {
+    shoal_test_string_alloc_fail_after(allocation);
+    expect_error(shoal_connector_get_identity(admin_connector, 0, &identity,
+                                              &error),
+                 SHOAL_STATUS_OUT_OF_MEMORY, &error, "allocate");
+    assert(identity == NULL);
+    shoal_test_string_alloc_reset();
+  }
+  shoal_test_result_alloc_fail_after(0);
+  expect_error(shoal_connector_get_identity(admin_connector, 0, &identity,
+                                            &error),
+               SHOAL_STATUS_OUT_OF_MEMORY, &error,
+               "allocate connector identity result");
+  assert(identity == NULL);
+  shoal_test_result_alloc_reset();
+  assert(shoal_test_connector_identity_block(admin_connector, 1));
+  expect_error(shoal_connector_get_identity(admin_connector, 1, &identity,
+                                            &error),
+               SHOAL_STATUS_DEADLINE_EXCEEDED, &error, "deadline");
+  assert(identity == NULL);
+  assert(shoal_test_connector_identity_block(admin_connector, 0));
 
   shoal_table_view table_view;
   assert(shoal_connector_list_tables(admin_connector, 0, &table_list, &error) ==
@@ -954,6 +1025,9 @@ int main(void) {
                SHOAL_STATUS_CLOSED, &error, "connector is closed");
   expect_error(shoal_connector_list_table_splits(
                    admin_connector, "events", 0, &bytes_list, &error),
+               SHOAL_STATUS_CLOSED, &error, "connector is closed");
+  expect_error(shoal_connector_get_identity(admin_connector, 0, &identity,
+                                            &error),
                SHOAL_STATUS_CLOSED, &error, "connector is closed");
 
   shoal_connector_free(&connector);
