@@ -232,6 +232,14 @@ therefore always starts from an empty hosted set under a fresh
 generation, which is what makes "process restart and ServiceLock loss do
 not leave a tablet multiply hosted" hold.
 
+The lock the rejoin takes is a new `ServiceLock`, and it may carry the
+same lock UUID as the one before it: the generation is the node, not the
+UUID, and the sequence is what separates them. That makes a stale
+shutdown of the generation that ended dangerous in a way the state
+machine cannot see — it would be deleting a ZooKeeper node, not calling
+`LoseLock` — so the sweep that takes back nodes is fenced too, under
+"The lock node".
+
 A `LockID` is only usable as fencing authority if it could name a real
 `zlock#<uuid>#<sequence>` node: the UUID must parse and the sequence must
 fit the signed 32-bit counter Accumulo reads with `Integer.parseInt`.
@@ -342,6 +350,26 @@ cancellation lands is a race, and the outcome must not turn on it:
 committing there would hand back a lock the caller stopped waiting for
 and left nobody maintaining it, so both paths refuse and the node is
 swept.
+
+The prefix only identifies the sweep's own nodes while the lock is the
+one this process is participating with. The prefix carries the lock
+UUID, and Accumulo mints a fresh one per `ServiceLock` — `UUID
+.randomUUID()` inside `announceExistence`, used for both the node name
+and every descriptor — but nothing in the wire format says so, and a
+process that keeps a server identity in configuration would reuse it on
+every rejoin. Two generations would then share a prefix, and the older
+one's shutdown path would delete the live node of the one that replaced
+it: a lock revoked underneath a server the manager had just seen take
+it, with no event to say so.
+
+So a sweep by prefix is allowed only while the acquisition is in flight
+or the generation is held — the window in which the next `ServiceLock`
+cannot exist yet, because it is built after this one is done. That is
+also the window the prefix is needed in: a create whose answer was lost
+leaves a node under a name this process never learned, and only the
+directory can find it. Afterwards the sweep takes back what the lock
+recorded as its own, which is every node it created or adopted, and
+cannot include one it never made.
 
 ### What the node says
 

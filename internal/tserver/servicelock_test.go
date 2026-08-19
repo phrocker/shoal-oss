@@ -1945,6 +1945,127 @@ func TestReleaseSweepsEveryNodeThisProcessCreated(t *testing.T) {
 	}
 }
 
+// TestStaleReleaseLeavesTheGenerationThatReplacedItAlone is the fence across
+// ServiceLocks. A lock UUID names a lock, not a process, but nothing stops a
+// rejoin reusing one — Accumulo mints a fresh UUID per ServiceLock, and a
+// caller that keeps its server identity in a config file would not. So the
+// generations share a node prefix, and the older one must not sweep by it: the
+// shutdown path of a generation that already ended would delete the live node
+// of the one that replaced it, revoking a lock the manager had just seen taken
+// and leaving a server that answers as a holder ZooKeeper no longer knows.
+func TestStaleReleaseLeavesTheGenerationThatReplacedItAlone(t *testing.T) {
+	f := newFakeZK()
+	old := newTestLock(t, f, serverUUID)
+	if _, err := old.Acquire(context.Background(), testLockData(t)); err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	oldPath := path.Join(testLockPath(), old.Node())
+
+	// The generation ends the ordinary way: the node goes, and Maintain says
+	// so. Only then does the process rejoin.
+	lost := make(chan error, 1)
+	go func() { lost <- old.Maintain(context.Background()) }()
+	waitArmed(t, f, oldPath)
+	if err := f.Delete(oldPath, -1); err != nil {
+		t.Fatalf("delete the lock node: %v", err)
+	}
+	if err := <-lost; !errors.Is(err, ErrLockLost) {
+		t.Fatalf("Maintain: want ErrLockLost, got %v", err)
+	}
+
+	rejoined := newTestLock(t, f, serverUUID)
+	id, err := rejoined.Acquire(context.Background(), testLockData(t))
+	if err != nil {
+		t.Fatalf("rejoin: %v", err)
+	}
+	newPath := path.Join(testLockPath(), rejoined.Node())
+	if newPath == oldPath {
+		t.Fatalf("the rejoin reused %s, so this test proves nothing", newPath)
+	}
+
+	// The shutdown of the generation that already ended, arriving late.
+	if err := old.Release(); err != nil {
+		t.Fatalf("stale Release: %v", err)
+	}
+
+	if !f.exists(newPath) {
+		t.Fatalf("%s was swept by the release of a generation that had already ended", newPath)
+	}
+	held, ok := rejoined.LockID()
+	if !ok || held != id {
+		t.Fatalf("LockID() = %s, %t after a stale release, want the generation that rejoined (%s)", held, ok, id)
+	}
+	if err := rejoined.Verify(); err != nil {
+		t.Fatalf("Verify after a stale release: %v", err)
+	}
+}
+
+// TestReleaseCalledTwiceLeavesTheGenerationThatReplacedItAlone is the same
+// fence on the path that reaches it most easily. Release is documented as safe
+// to call twice, so a shutdown that runs from both a signal handler and a
+// defer is ordinary; if the rejoin happens in between, the second call must
+// still only take back what its own generation created.
+func TestReleaseCalledTwiceLeavesTheGenerationThatReplacedItAlone(t *testing.T) {
+	f := newFakeZK()
+	old := newTestLock(t, f, serverUUID)
+	if _, err := old.Acquire(context.Background(), testLockData(t)); err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	if err := old.Release(); err != nil {
+		t.Fatalf("Release: %v", err)
+	}
+
+	rejoined := newTestLock(t, f, serverUUID)
+	if _, err := rejoined.Acquire(context.Background(), testLockData(t)); err != nil {
+		t.Fatalf("rejoin: %v", err)
+	}
+	newPath := path.Join(testLockPath(), rejoined.Node())
+
+	if err := old.Release(); err != nil {
+		t.Fatalf("second Release: %v", err)
+	}
+	if !f.exists(newPath) {
+		t.Fatalf("%s was swept by a second release of the generation before it", newPath)
+	}
+	if _, ok := rejoined.LockID(); !ok {
+		t.Fatal("the rejoined generation stopped being held after a stale release")
+	}
+}
+
+// TestStaleReleaseStillTakesBackItsOwnNode is the other side: scoping the
+// sweep must not turn a stale release into a leak. The node of the generation
+// that ended is this session's, and until the session goes it keeps its place
+// in line, so a release arriving after a rejoin still has to take it back.
+func TestStaleReleaseStillTakesBackItsOwnNode(t *testing.T) {
+	f := newFakeZK()
+	old := newTestLock(t, f, serverUUID)
+	if _, err := old.Acquire(context.Background(), testLockData(t)); err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	oldPath := path.Join(testLockPath(), old.Node())
+
+	lost := make(chan error, 1)
+	go func() { lost <- old.Maintain(context.Background()) }()
+	waitArmed(t, f, oldPath)
+	// The generation ends without the node going. A session event reaches the
+	// watcher before ZooKeeper has removed the ephemeral nodes, which is how a
+	// lock is lost while its node is still in the directory.
+	f.fire(oldPath, gozk.Event{Type: gozk.EventSession, State: gozk.StateExpired, Path: oldPath})
+	if err := <-lost; !errors.Is(err, ErrLockLost) {
+		t.Fatalf("Maintain: want ErrLockLost, got %v", err)
+	}
+	if !f.exists(oldPath) {
+		t.Fatal("the node has to survive the loss for this test to mean anything")
+	}
+
+	if err := old.Release(); err != nil {
+		t.Fatalf("stale Release: %v", err)
+	}
+	if f.exists(oldPath) {
+		t.Fatalf("%s outlived the release of the generation that created it", oldPath)
+	}
+}
+
 // TestAcquireFailsWhenADuplicateCannotBeDropped is the other half of that
 // story, at the moment acquisition finds the duplicates. Reporting success
 // with one still standing would leave this session holding two places in line

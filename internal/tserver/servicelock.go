@@ -22,6 +22,7 @@ import (
 	"errors"
 	"fmt"
 	"path"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -322,6 +323,19 @@ type ServiceLock struct {
 	// released records that Release has been called, so an acquisition still
 	// in flight cannot go on to hold a lock the caller has already given up.
 	released bool
+	// claimed names the nodes this ServiceLock made or took over, and is what
+	// the cleanup sweeps. The node prefix is not enough to decide that: it
+	// carries the lock UUID, and nothing stops a later ServiceLock being built
+	// with the same one, so a sweep by prefix would let a release arriving
+	// after a rejoin delete the live node of the generation that replaced it.
+	claimed []string
+	// live records that this ServiceLock is still the process's participant in
+	// the directory: its acquisition is in flight, or its generation is held.
+	// While that is true every node carrying the prefix is this one's, because
+	// a later ServiceLock is only built after this one is done. Once it is
+	// false the prefix may be shared, and only the claim list is safe to
+	// sweep.
+	live bool
 
 	// release is closed by Release to wake a queued acquisition. Waiting on
 	// the lock directory alone would leave that acquisition asleep until an
@@ -531,6 +545,7 @@ func (l *ServiceLock) Acquire(ctx context.Context, data ServiceLockData) (LockID
 		return LockID{}, fmt.Errorf("%w: %s", ErrLockInUse, l.dir)
 	}
 	l.started = true
+	l.live = true
 	l.mu.Unlock()
 
 	if err := ctx.Err(); err != nil {
@@ -547,6 +562,8 @@ func (l *ServiceLock) Acquire(ctx context.Context, data ServiceLockData) (LockID
 		}
 		// The create may have taken effect even though the answer was lost,
 		// so sweep before giving up rather than leaving a node in the queue.
+		// The name was never returned, so only the directory can say whether
+		// there is one — which is why the sweep inside Acquire goes by prefix.
 		return LockID{}, l.withCleanup(err)
 	}
 	id, err := l.waitForOwnership(ctx)
@@ -572,19 +589,50 @@ func (l *ServiceLock) createNode(payload []byte) error {
 	if l.isReleased() {
 		return fmt.Errorf("%w: %s", ErrLockReleased, l.dir)
 	}
-	if _, err := l.conn.Create(l.dir+"/"+l.nodePrefix(), payload,
-		gozk.FlagEphemeral|gozk.FlagSequence, l.acl); err != nil {
+	created, err := l.conn.Create(l.dir+"/"+l.nodePrefix(), payload,
+		gozk.FlagEphemeral|gozk.FlagSequence, l.acl)
+	if err != nil {
 		return fmt.Errorf("create lock node in %s: %w", l.dir, err)
 	}
+	// Claimed under createMu, so a release waiting on it sweeps this node
+	// rather than reading a directory it is not in yet.
+	l.claim(path.Base(created))
 	return nil
+}
+
+// claim records nodes as this ServiceLock's, so the cleanup can sweep them
+// without asking the directory which nodes carry its prefix.
+func (l *ServiceLock) claim(nodes ...string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for _, node := range nodes {
+		if slices.Contains(l.claimed, node) {
+			continue
+		}
+		l.claimed = append(l.claimed, node)
+	}
+}
+
+// claimedNodes returns the nodes this ServiceLock made or took over.
+func (l *ServiceLock) claimedNodes() []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return slices.Clone(l.claimed)
 }
 
 // withCleanup sweeps the nodes of an acquisition that did not finish and
 // returns the failure that ended it, joined with an ErrLockNodeOrphaned when a
 // node survived the sweep. The failure is returned unwrapped in the ordinary
 // case so a caller can still compare a cancellation against context.Canceled.
+//
+// The acquisition is still in flight here, so the prefix is this ServiceLock's
+// and the sweep can use it. Nothing else in the directory can be carrying it:
+// a later ServiceLock is built only after this call returns.
 func (l *ServiceLock) withCleanup(failure error) error {
-	orphan := l.deleteOwnNodes()
+	orphan := l.sweep(true)
+	l.mu.Lock()
+	l.live = false
+	l.mu.Unlock()
 	if orphan == nil {
 		return failure
 	}
@@ -643,6 +691,12 @@ func (l *ServiceLock) queueForOwnership(ctx context.Context) (LockID, error) {
 			}
 			node = ours[0]
 			duplicates := ours[1:]
+			// Everything carrying this prefix now is this acquisition's: it is
+			// in flight, so no later ServiceLock can have created anything yet.
+			// Claiming them here is what lets the cleanup sweep a node this
+			// process created under a name it never learned, and what stops it
+			// from sweeping a node it never made.
+			l.claim(ours...)
 			// A duplicate that cannot be dropped fails the acquisition. It is
 			// this session's node, so it lives as long as the session, holding
 			// a second place in line that no ServiceLock maintains: once the
@@ -1005,6 +1059,11 @@ func (l *ServiceLock) Verify() error {
 // watching Maintain sees, and it would report an external NODE_DELETED for a
 // node this process took away on purpose — so whichever of them wins that race
 // would decide how a deliberate release was remembered.
+//
+// A release that arrives after the generation is over sweeps only the nodes
+// this ServiceLock recorded as its own. By then the process may have rejoined,
+// and a rejoin is free to reuse the lock UUID: sweeping the prefix would take
+// away the live node of the generation that replaced this one. See sweep.
 func (l *ServiceLock) Release() error {
 	l.mu.Lock()
 	if !l.started {
@@ -1012,6 +1071,11 @@ func (l *ServiceLock) Release() error {
 		return fmt.Errorf("%w: %s", ErrNotHeld, l.dir)
 	}
 	l.released = true
+	// Read before lose records the ending. A first release on a live
+	// generation is still the participant whose prefix it is; a second one, or
+	// one arriving after the lock was lost and the process rejoined, is not.
+	wasLive := l.live
+	l.live = false
 	l.mu.Unlock()
 	l.releaseOnce.Do(func() { close(l.release) })
 	l.lose(LossReleased, nil)
@@ -1019,7 +1083,7 @@ func (l *ServiceLock) Release() error {
 	// refused; taking createMu here waits out one that has. Between them the
 	// sweep below cannot miss a node this process made.
 	l.createMu.Lock()
-	err := l.deleteOwnNodes()
+	err := l.sweep(wasLive)
 	l.createMu.Unlock()
 	return err
 }
@@ -1029,6 +1093,14 @@ func (l *ServiceLock) Release() error {
 // cannot rewrite an earlier one.
 func (l *ServiceLock) lose(reason LossReason, cause error) error {
 	l.mu.Lock()
+	if reason != LossNone {
+		// The generation is over, so this ServiceLock is no longer the
+		// process's participant in the directory and the prefix is no longer
+		// proof that a node is its own: the caller is free to rejoin with the
+		// same lock UUID. Only ended() asks without ending anything, and it
+		// passes LossNone. See sweep.
+		l.live = false
+	}
 	if l.held {
 		l.held = false
 		l.reason = reason
@@ -1089,10 +1161,25 @@ func (l *ServiceLock) ownNodes(sorted []string) []string {
 	return ours
 }
 
-// deleteOwnNodes removes every node this process created in the lock
-// directory. It is the cleanup for an acquisition that did not finish, so a
-// node cannot be left holding a place in the queue for a process that is no
-// longer waiting.
+// sweep removes the nodes of this ServiceLock, so one cannot be left holding a
+// place in the queue for a process that is no longer waiting.
+//
+// What counts as this ServiceLock's depends on whether it is still the
+// process's participant in the directory. While it is — its acquisition in
+// flight, or its generation held — every node carrying the prefix is its own,
+// including one created by a create whose answer was lost and whose name it
+// therefore never learned. A later ServiceLock is built only after this one is
+// done, so nothing else can be carrying the prefix yet.
+//
+// Once it is done the prefix is no longer proof of anything. It carries the
+// lock UUID, which identifies a lock rather than a process only by convention,
+// and nothing stops the next ServiceLock being built with the same one: its
+// node would carry the same prefix and a higher sequence. A sweep by prefix
+// then lets a release arriving after a rejoin — a shutdown path that runs
+// twice, or a goroutine that outlived the generation — delete the live node of
+// the generation that replaced it, revoking a lock the manager had just seen
+// taken. So a finished ServiceLock sweeps only the nodes it recorded as its
+// own, which cannot include one it never made.
 //
 // A failure is reported rather than swallowed. An abandoned ephemeral node
 // keeps its sequence, and so its place in line, for as long as the session
@@ -1100,23 +1187,37 @@ func (l *ServiceLock) ownNodes(sorted []string) []string {
 // every candidate behind it. The session dropping is the fallback that
 // removes it, but only the session's owner can drop it, so the owner has to
 // be told.
-func (l *ServiceLock) deleteOwnNodes() error {
+func (l *ServiceLock) sweep(byPrefix bool) error {
+	nodes, err := l.nodesToSweep(byPrefix)
+	if err != nil {
+		return err
+	}
+	var failures []error
+	for _, node := range nodes {
+		if err := l.deleteNode(node); err != nil {
+			failures = append(failures, err)
+		}
+	}
+	return errors.Join(failures...)
+}
+
+// nodesToSweep returns the nodes sweep should remove: everything under the
+// prefix while this ServiceLock still owns it, and the recorded claims once it
+// does not.
+func (l *ServiceLock) nodesToSweep(byPrefix bool) ([]string, error) {
+	if !byPrefix {
+		return l.claimedNodes(), nil
+	}
 	children, _, err := l.conn.Children(l.dir)
 	if err != nil {
 		if errors.Is(err, gozk.ErrNoNode) {
 			// There is no directory, so no node of this process is holding a
 			// place in one. Nothing to clean up and nothing to report.
-			return nil
+			return nil, nil
 		}
-		return fmt.Errorf("list lock nodes in %s: %w", l.dir, err)
+		return nil, fmt.Errorf("list lock nodes in %s: %w", l.dir, err)
 	}
-	var failures []error
-	for _, child := range l.ownNodes(sortLockNodes(children)) {
-		if err := l.deleteNode(child); err != nil {
-			failures = append(failures, err)
-		}
-	}
-	return errors.Join(failures...)
+	return l.ownNodes(sortLockNodes(children)), nil
 }
 
 // deleteNode removes one node from the lock directory, treating an already
