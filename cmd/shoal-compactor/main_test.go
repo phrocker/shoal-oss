@@ -221,13 +221,13 @@ func translatableJob(ecid string) *tabletserver.TExternalCompactionJob {
 	job.ExternalCompactionId = ecid
 	job.Extent = &data.TKeyExtent{Table: []byte("2"), PrevEndRow: []byte("c"), EndRow: []byte("m")}
 	job.Files = []*tabletserver.InputFile{{
-		MetadataFileEntry: `{"path":"hdfs://nn/t/2/F0001.rf","startRow":"","endRow":""}`,
+		MetadataFileEntry: `{"path":"hdfs://nn/accumulo/tables/2/t-0001/F0001.rf","startRow":"","endRow":""}`,
 		Size:              4096,
 		Entries:           40,
 	}}
 	// The coordinator's compaction temp name, which carries this job's
 	// own ECID (TabletNameGenerator.getNextDataFilenameForMajc).
-	job.OutputFile = "hdfs://nn/t/2/C0002.rf_tmp_" + ecid
+	job.OutputFile = "hdfs://nn/accumulo/tables/2/t-0001/C0002.rf_tmp_" + ecid
 	job.PropagateDeletes = true
 	job.Kind = tabletserver.TCompactionKind_SYSTEM
 	job.IteratorSettings = &tabletserver.IteratorConfig{
@@ -588,7 +588,7 @@ func TestDrainCoordinatorReleasesRefusedJobsWithPreciseClass(t *testing.T) {
 				// The rows travel base64-encoded
 				// (ByteArrayToBase64TypeAdapter); "ZA==" and "aw==" are
 				// "d" and "k".
-				j.Files[0].MetadataFileEntry = `{"path":"hdfs://nn/t/2/F0001.rf","startRow":"ZA==","endRow":"aw=="}`
+				j.Files[0].MetadataFileEntry = `{"path":"hdfs://nn/accumulo/tables/2/t-0001/F0001.rf","startRow":"AWQ=","endRow":"AWs="}`
 			},
 			wantClass: compactjob.ClassRangedInputFile,
 			wantLog:   "field=files[0]",
@@ -660,6 +660,101 @@ func TestDrainCoordinatorReleasesRefusedJobsWithPreciseClass(t *testing.T) {
 				t.Fatalf("compactionCompleted calls = %d, want 0", n)
 			}
 		})
+	}
+}
+
+// TestDrainCoordinatorSurfacesJobsItCannotHandBack covers the one
+// refusal that cannot be released.
+//
+// CompactionCoordinator.compactionFailed starts with
+// KeyExtent.fromThrift(extent), which reads the extent's table bytes, so
+// a job whose extent is missing — or whose extent has no table — makes
+// the hand-back throw on the manager no matter how many times it is
+// tried. The pinned protocol offers no reclaim keyed on the ECID alone,
+// and inventing an extent would report a failure against a tablet this
+// compactor was never assigned. So the RPC must not be attempted at all,
+// and the operator must be told why.
+func TestDrainCoordinatorSurfacesJobsItCannotHandBack(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		mutate  func(*tabletserver.TExternalCompactionJob)
+		wantLog string
+	}{
+		{
+			name:    "no extent",
+			mutate:  func(j *tabletserver.TExternalCompactionJob) { j.Extent = nil },
+			wantLog: "carries no extent",
+		},
+		{
+			name: "extent without a table id",
+			mutate: func(j *tabletserver.TExternalCompactionJob) {
+				j.Extent = &data.TKeyExtent{PrevEndRow: []byte("c"), EndRow: []byte("m")}
+			},
+			wantLog: "carries no table id",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			svc := &fakeCoordinator{}
+			serveOneJob(svc, func(ecid string) *tabletserver.TExternalCompactionJob {
+				job := translatableJob(ecid)
+				tt.mutate(job)
+				return job
+			})
+
+			cfg := testPollConfig(&scriptedResolver{results: []resolveResult{{addr: "manager-a:9999"}}}, nil)
+			logger, logs := testLogger()
+			if idle := drainCoordinator(context.Background(), logger, &fakeConn{svc: svc}, cfg); !idle {
+				t.Fatal("drain = busy, want idle")
+			}
+
+			if releases := svc.releases(); len(releases) != 0 {
+				t.Fatalf("compactionFailed calls = %d, want none: the coordinator cannot process them",
+					len(releases))
+			}
+			if n := svc.completedCount(); n != 0 {
+				t.Fatalf("compactionCompleted calls = %d, want 0", n)
+			}
+			out := logs.String()
+			if !strings.Contains(out, "compaction slot cannot be released") {
+				t.Fatalf("the unreleasable slot was not surfaced:\n%s", out)
+			}
+			if !strings.Contains(out, tt.wantLog) {
+				t.Fatalf("log missing %q:\n%s", tt.wantLog, out)
+			}
+			if !strings.Contains(out, "level=ERROR") {
+				t.Fatalf("an unreleasable slot must be logged at error level:\n%s", out)
+			}
+			if !strings.Contains(out, compactjob.ClassMalformedJob) {
+				t.Fatalf("log missing the refusal class:\n%s", out)
+			}
+		})
+	}
+}
+
+// TestDrainCoordinatorStillReleasesWhenOnlyTheRowsAreMissing keeps the
+// guard from swallowing releasable jobs: KeyExtent.fromThrift maps a
+// null endRow or prevEndRow to a null Text, so an extent with only a
+// table id converts fine and the slot must still go back.
+func TestDrainCoordinatorStillReleasesWhenOnlyTheRowsAreMissing(t *testing.T) {
+	svc := &fakeCoordinator{}
+	serveOneJob(svc, func(ecid string) *tabletserver.TExternalCompactionJob {
+		job := translatableJob(ecid)
+		job.Extent = &data.TKeyExtent{Table: []byte("2")}
+		return job
+	})
+
+	cfg := testPollConfig(&scriptedResolver{results: []resolveResult{{addr: "manager-a:9999"}}}, nil)
+	logger, _ := testLogger()
+	if idle := drainCoordinator(context.Background(), logger, &fakeConn{svc: svc}, cfg); !idle {
+		t.Fatal("drain = busy, want idle")
+	}
+
+	releases := svc.releases()
+	if len(releases) != 1 {
+		t.Fatalf("compactionFailed calls = %d, want the slot released exactly once", len(releases))
+	}
+	if releases[0].class != compactjob.ClassCommitUnavailable {
+		t.Fatalf("exception class = %q, want %q", releases[0].class, compactjob.ClassCommitUnavailable)
 	}
 }
 

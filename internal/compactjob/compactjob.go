@@ -60,6 +60,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -216,9 +217,10 @@ type Options struct {
 	//
 	// The value is the writer's codec name (block.CodecNone,
 	// block.CodecGzip, block.CodecSnappy), not the Accumulo property
-	// spelling: the override path maps "gzip" onto block.CodecGzip, and
-	// a default skips that mapping. Anything else is refused rather
-	// than carried into a plan the writer would reject.
+	// spelling: the override path translates Accumulo's codec names
+	// through accumuloCodecs, and a default skips that translation.
+	// Anything the writer does not register is refused rather than
+	// carried into a plan it would reject.
 	DefaultCodec string
 
 	// DefaultBlockSize is the output data-block threshold used when the
@@ -668,6 +670,9 @@ func parseInputs(job *tabletserver.TExternalCompactionJob) ([]parsedInput, int64
 		if err != nil {
 			return nil, 0, 0, err
 		}
+		if err := checkTabletFilePath(in.file.Path, field); err != nil {
+			return nil, 0, 0, err
+		}
 		in.file.Size = f.GetSize()
 		in.file.Entries = f.GetEntries()
 		in.file.Timestamp = f.GetTimestamp()
@@ -748,6 +753,99 @@ func decodeFileEntry(entry, field string) (parsedInput, error) {
 	return in, nil
 }
 
+// hdfsTablesDirName mirrors ReferencedTabletFile.HDFS_TABLES_DIR_NAME,
+// which is Constants.HDFS_TABLES_DIR ("/tables") without its leading
+// slash. parsePath requires the fourth-from-last path segment to equal
+// it exactly.
+const hdfsTablesDirName = "tables"
+
+var (
+	// validFileNameRE mirrors ValidationUtil's
+	// VALID_FILE_NAME_MATCH_PATTERN, which parsePath applies to the last
+	// segment with Matcher.matches (whole-string).
+	validFileNameRE = regexp.MustCompile(`^[\dA-Za-z._-]+$`)
+	// validSchemeRE is the URI scheme grammar; parsePath only asserts
+	// that a scheme is present, but a value java.net.URI would reject
+	// could never have reached the coordinator as a Path in the first
+	// place.
+	validSchemeRE = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9+.-]*$`)
+)
+
+// checkTabletFilePath refuses a file path Accumulo could not turn back
+// into a ReferencedTabletFile.
+//
+// Every path in a job round-trips through that class: an input becomes a
+// StoredTabletFile, whose constructor calls ReferencedTabletFile.of, and
+// the output is renamed and stored as one at commit. parsePath demands a
+// fully qualified URI shaped
+// <volume>/tables/<tableId>/<tablet>/<file> — it requires a scheme, at
+// least four path segments, "tables" as the fourth-from-last, non-blank
+// volume/tablesPath/tabletDirectory/fileName, and a file name matching
+// ValidationUtil's pattern. Anything else throws, so a plan built on it
+// names a file the manager could never accept.
+//
+// The path must already be normalized. Hadoop's Path constructor
+// collapses "//" and resolves "."/".." before parsePath ever sees the
+// string, and the coordinator sends what that normalization produced
+// (getNormalizedPathStr, and the metadata entry serialized from a Path).
+// So a non-normalized spelling did not come from Accumulo, and treating
+// it as distinct is what would let the same RFile appear twice in one
+// job under two names and have every cell counted twice.
+func checkTabletFilePath(raw, field string) error {
+	if raw == "" {
+		return refuse(ClassMalformedJob, field, "empty file path")
+	}
+	if i := strings.IndexAny(raw, "?#"); i >= 0 {
+		return refuse(ClassMalformedJob, field,
+			"%q carries a %q; a tablet file path is a plain URI", raw, raw[i:i+1])
+	}
+	colon := strings.Index(raw, ":")
+	slash := strings.Index(raw, "/")
+	if colon <= 0 || (slash >= 0 && slash < colon) {
+		return refuse(ClassMalformedJob, field,
+			"%q has no URI scheme; ReferencedTabletFile requires a fully qualified path", raw)
+	}
+	if scheme := raw[:colon]; !validSchemeRE.MatchString(scheme) {
+		return refuse(ClassMalformedJob, field, "%q has an invalid URI scheme %q", raw, scheme)
+	}
+	rest := raw[colon+1:]
+	if authority, found := strings.CutPrefix(rest, "//"); found {
+		if i := strings.Index(authority, "/"); i >= 0 {
+			rest = authority[i:]
+		} else {
+			rest = ""
+		}
+	}
+	if !strings.HasPrefix(rest, "/") {
+		return refuse(ClassMalformedJob, field,
+			"%q has no absolute path after its scheme", raw)
+	}
+	segments := strings.Split(rest[1:], "/")
+	for _, segment := range segments {
+		switch segment {
+		case "":
+			return refuse(ClassMalformedJob, field,
+				"%q is not a normalized path (empty segment)", raw)
+		case ".", "..":
+			return refuse(ClassMalformedJob, field,
+				"%q is not a normalized path (%q segment)", raw, segment)
+		}
+	}
+	if len(segments) < 4 {
+		return refuse(ClassMalformedJob, field,
+			"%q is not shaped <volume>/%s/<tableId>/<tablet>/<file>", raw, hdfsTablesDirName)
+	}
+	if dir := segments[len(segments)-4]; dir != hdfsTablesDirName {
+		return refuse(ClassMalformedJob, field,
+			"%q: tables directory name is not %q, is %q", raw, hdfsTablesDirName, dir)
+	}
+	if name := segments[len(segments)-1]; !validFileNameRE.MatchString(name) {
+		return refuse(ClassMalformedJob, field,
+			"%q: file name %q is empty or contains invalid characters", raw, name)
+	}
+	return nil
+}
+
 // checkFenceFields enforces the two StoredTabletFile invariants a Go
 // struct decode cannot express.
 //
@@ -776,7 +874,7 @@ func checkFenceFields(entry, field string) error {
 				"StoredTabletFile is missing %s; a fence is absent only when the field is present and empty",
 				row.name)
 		}
-		if err := checkBase64Row(*row.value); err != nil {
+		if err := checkFenceRow(*row.value); err != nil {
 			return refuse(ClassMalformedJob, field,
 				"StoredTabletFile %s %q: %v", row.name, *row.value, err)
 		}
@@ -784,19 +882,114 @@ func checkFenceFields(entry, field string) error {
 	return nil
 }
 
-// checkBase64Row accepts the row encodings Base64.getUrlDecoder accepts:
+// checkFenceRow accepts exactly the row encodings
+// StoredTabletFile.decodeRow accepts.
+//
+// Two layers have to hold. The outer one is transport: the field is a
+// byte array written through ByteArrayToBase64TypeAdapter
+// (Base64.getUrlEncoder), so the string must be URL-safe base64 — the
+// decoder tolerates the padding being present or absent.
+//
+// The inner one is framing, and it is the one a base64 check alone
+// misses. decodeRow returns null only for a zero-length array; for
+// anything else it hands the bytes to Hadoop Text.readFields, which
+// reads a VInt length and then readFully's exactly that many bytes. So a
+// row like "AQ==" — a length of one with nothing after it — is not an
+// unsupported fence, it is an entry Java throws on, and reporting it as
+// a fence would blame the wrong thing and hide a corrupt job.
+func checkFenceRow(value string) error {
+	raw, err := decodeURLBase64(value)
+	if err != nil {
+		return err
+	}
+	if len(raw) == 0 {
+		// decodeRow: an empty array is how "unbounded on this side" is
+		// spelled, and it never reaches Text.readFields.
+		return nil
+	}
+	return checkTextFraming(raw)
+}
+
+// decodeURLBase64 accepts the encodings Base64.getUrlDecoder accepts:
 // the URL-safe alphabet, with or without trailing padding.
-func checkBase64Row(value string) error {
+func decodeURLBase64(value string) ([]byte, error) {
 	if value == "" {
-		return nil
+		return nil, nil
 	}
-	if _, err := base64.URLEncoding.DecodeString(value); err == nil {
-		return nil
+	if raw, err := base64.URLEncoding.DecodeString(value); err == nil {
+		return raw, nil
 	}
-	if _, err := base64.RawURLEncoding.DecodeString(value); err != nil {
-		return errors.New("not url-safe base64")
+	raw, err := base64.RawURLEncoding.DecodeString(value)
+	if err != nil {
+		return nil, errors.New("not url-safe base64")
+	}
+	return raw, nil
+}
+
+// checkTextFraming validates a Hadoop Text serialization the way
+// Text.readFields consumes one: a VInt length followed by that many
+// bytes. Trailing bytes are ignored, as they are by readFully.
+func checkTextFraming(raw []byte) error {
+	length, size, err := readVInt(raw)
+	if err != nil {
+		return err
+	}
+	if length < 0 {
+		// readWithKnownLength cannot allocate or read a negative count.
+		return fmt.Errorf("Text length %d is negative", length)
+	}
+	if available := int64(len(raw) - size); available < length {
+		return fmt.Errorf("Text declares %d byte(s) but only %d follow the length",
+			length, available)
 	}
 	return nil
+}
+
+// readVInt mirrors WritableUtils.readVInt: readVLong's first byte
+// encodes both the width and the sign, and a value outside int range is
+// rejected outright.
+func readVInt(raw []byte) (value int64, size int, err error) {
+	if len(raw) == 0 {
+		return 0, 0, errors.New("Text length is truncated")
+	}
+	first := int8(raw[0])
+	size = decodeVIntSize(first)
+	if size == 1 {
+		return int64(first), 1, nil
+	}
+	if len(raw) < size {
+		return 0, 0, fmt.Errorf("Text length needs %d bytes but only %d are present",
+			size, len(raw))
+	}
+	var magnitude uint64
+	for i := 1; i < size; i++ {
+		magnitude = magnitude<<8 | uint64(raw[i])
+	}
+	value = int64(magnitude)
+	if isNegativeVInt(first) {
+		value = ^value
+	}
+	if value > math.MaxInt32 || value < math.MinInt32 {
+		return 0, 0, fmt.Errorf("Text length %d does not fit in an int", value)
+	}
+	return value, size, nil
+}
+
+// decodeVIntSize mirrors WritableUtils.decodeVIntSize.
+func decodeVIntSize(first int8) int {
+	switch {
+	case first >= -112:
+		return 1
+	case first < -120:
+		return int(-119 - int32(first))
+	default:
+		return int(-111 - int32(first))
+	}
+}
+
+// isNegativeVInt mirrors WritableUtils.isNegativeVInt.
+func isNegativeVInt(first int8) bool {
+	return first < -120 || (first >= -112 && first < 0)
 }
 
 // tmpSuffix renders the "_tmp_<ecid>" tail the coordinator appends to
@@ -850,6 +1043,9 @@ func parseOutput(job *tabletserver.TExternalCompactionJob, inputs []parsedInput,
 		return "", refuse(ClassMalformedJob, "outputFile",
 			"%q is not this job's compaction temp name (expected a path ending in %q)",
 			out, tmpSuffix(ecid))
+	}
+	if err := checkTabletFilePath(out, "outputFile"); err != nil {
+		return "", err
 	}
 	return out, nil
 }

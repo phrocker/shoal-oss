@@ -560,6 +560,33 @@ func executeJob(ctx context.Context, logger *slog.Logger, cc coordinatorConn, cf
 	return releaseJob(ctx, logger, cc, cfg, job, compactjob.ClassCommitUnavailable)
 }
 
+// unreleasableReason reports why the coordinator could not act on a
+// hand-back for this job, or "" when the hand-back is worth attempting.
+//
+// CompactionCoordinator.compactionFailed converts the extent before it
+// records anything — KeyExtent.fromThrift(extent) — and fromThrift
+// starts with TableId.of(new String(tke.getTable(), UTF_8)). A null
+// extent, or an extent whose table is unset, therefore throws inside the
+// handler; the call comes back as an application error no matter how
+// often it is retried. The generated writer omits a nil struct field
+// entirely, so the coordinator does see exactly that null.
+//
+// The pinned protocol has no hand-back that takes the ECID alone, and
+// substituting an extent shoal invented would tell the manager a
+// compaction failed on a tablet it was never assigned to. So the slot is
+// left to the coordinator's own dead-compaction sweep, and the reason is
+// logged rather than buried under retries.
+func unreleasableReason(job *tabletserver.TExternalCompactionJob) string {
+	extent := job.GetExtent()
+	switch {
+	case extent == nil:
+		return "the assignment carries no extent, and compactionFailed cannot convert a missing one"
+	case extent.Table == nil:
+		return "the assignment's extent carries no table id, and compactionFailed cannot convert it"
+	}
+	return ""
+}
+
 // releaseJob hands one accepted job back to the coordinator so the slot
 // is freed and a Java compactor can run it. It reports whether cc is
 // still usable afterwards.
@@ -580,6 +607,9 @@ func executeJob(ctx context.Context, logger *slog.Logger, cc coordinatorConn, cf
 //     flight ignores context cancellation, so the budget is enforced by
 //     closing the socket rather than by the RPC's context alone.
 //
+// The one job it cannot hand back is one whose own extent is missing:
+// see unreleasableReason. That case is surfaced, not retried.
+//
 // If the budget does run out the failure is logged loudly and the job is
 // left to the coordinator's own timeout — the alternative, blocking
 // shutdown indefinitely, is worse.
@@ -598,6 +628,18 @@ func releaseJob(
 		// manager log distinguishes "shoal cannot do this" from "shoal
 		// went away mid-assignment".
 		class = compactjob.ClassShuttingDown
+	}
+
+	// A hand-back the coordinator cannot process is worse than no
+	// hand-back: retrying it burns the whole release budget, and during
+	// shutdown that budget is what bounds how long the process takes to
+	// exit. Surface it once, loudly, instead.
+	if why := unreleasableReason(job); why != "" {
+		logger.Error("compaction slot cannot be released; leaving it to the coordinator's dead-compaction sweep",
+			slog.String("ecid", ecid),
+			slog.String("class", class),
+			slog.String("reason", why))
+		return true
 	}
 
 	// context.WithoutCancel keeps the RPC's deadline ours alone: a

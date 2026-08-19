@@ -55,12 +55,25 @@ func storedFile(path string) string {
 // referenced range is only part of the underlying RFile.
 //
 // The rows travel as byte arrays through ByteArrayToBase64TypeAdapter,
-// which uses Base64.getUrlEncoder, so callers pass the logical row and
-// the helper renders the wire form.
+// which uses Base64.getUrlEncoder, and the bytes underneath are a Hadoop
+// Text serialization (StoredTabletFile.encodeRow calls Text.write). So
+// callers pass the logical row and the helper renders both layers.
 func fencedFile(path, start, end string) string {
 	return fmt.Sprintf(`{"path":"%s","startRow":"%s","endRow":"%s"}`,
-		path, base64.URLEncoding.EncodeToString([]byte(start)),
-		base64.URLEncoding.EncodeToString([]byte(end)))
+		path, encodeRow(start), encodeRow(end))
+}
+
+// encodeRow mirrors StoredTabletFile.encodeRow for the short rows these
+// tests use: Text.write emits a VInt length then the bytes, and a length
+// below 128 is a single byte.
+func encodeRow(row string) string {
+	if row == "" {
+		return ""
+	}
+	if len(row) >= 128 {
+		panic("encodeRow: test rows must be shorter than 128 bytes")
+	}
+	return base64.URLEncoding.EncodeToString(append([]byte{byte(len(row))}, row...))
 }
 
 // validJob is a well-formed SYSTEM compaction of two whole files, the
@@ -258,7 +271,7 @@ func TestTranslateRefusesFencedInput(t *testing.T) {
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			job := validJob()
-			job.Files[1].MetadataFileEntry = fencedFile("hdfs://nn/t/2/F0002.rf", tt.start, tt.end)
+			job.Files[1].MetadataFileEntry = fencedFile("hdfs://nn/accumulo/tables/2/t-0001/F0002.rf", tt.start, tt.end)
 
 			r := assertRefused(t, job, Options{}, ClassRangedInputFile, "files[1]")
 			if !strings.Contains(r.Detail, "fenced") {
@@ -283,27 +296,27 @@ func TestTranslateRefusesEntryWithoutBothFenceFields(t *testing.T) {
 	}{
 		{
 			name:  "startRow absent",
-			entry: `{"path":"hdfs://nn/t/2/F0002.rf","endRow":""}`,
+			entry: `{"path":"hdfs://nn/accumulo/tables/2/t-0001/F0002.rf","endRow":""}`,
 			want:  "startRow",
 		},
 		{
 			name:  "endRow absent",
-			entry: `{"path":"hdfs://nn/t/2/F0002.rf","startRow":""}`,
+			entry: `{"path":"hdfs://nn/accumulo/tables/2/t-0001/F0002.rf","startRow":""}`,
 			want:  "endRow",
 		},
 		{
 			name:  "both absent",
-			entry: `{"path":"hdfs://nn/t/2/F0002.rf"}`,
+			entry: `{"path":"hdfs://nn/accumulo/tables/2/t-0001/F0002.rf"}`,
 			want:  "startRow",
 		},
 		{
 			name:  "startRow explicitly null",
-			entry: `{"path":"hdfs://nn/t/2/F0002.rf","startRow":null,"endRow":""}`,
+			entry: `{"path":"hdfs://nn/accumulo/tables/2/t-0001/F0002.rf","startRow":null,"endRow":""}`,
 			want:  "startRow",
 		},
 		{
 			name:  "endRow explicitly null",
-			entry: `{"path":"hdfs://nn/t/2/F0002.rf","startRow":"","endRow":null}`,
+			entry: `{"path":"hdfs://nn/accumulo/tables/2/t-0001/F0002.rf","startRow":"","endRow":null}`,
 			want:  "endRow",
 		},
 	} {
@@ -329,11 +342,11 @@ func TestTranslateRefusesUndecodableFenceRows(t *testing.T) {
 	}{
 		{
 			name:  "startRow is not base64",
-			entry: `{"path":"hdfs://nn/t/2/F0002.rf","startRow":"d","endRow":""}`,
+			entry: `{"path":"hdfs://nn/accumulo/tables/2/t-0001/F0002.rf","startRow":"d","endRow":""}`,
 		},
 		{
 			name:  "endRow uses the non-url alphabet",
-			entry: `{"path":"hdfs://nn/t/2/F0002.rf","startRow":"","endRow":"a+/b"}`,
+			entry: `{"path":"hdfs://nn/accumulo/tables/2/t-0001/F0002.rf","startRow":"","endRow":"a+/b"}`,
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -354,9 +367,162 @@ func TestTranslateRefusesUndecodableFenceRows(t *testing.T) {
 func TestTranslateAcceptsUnpaddedFenceRows(t *testing.T) {
 	job := validJob()
 	job.Files[1].MetadataFileEntry =
-		`{"path":"hdfs://nn/t/2/F0002.rf","startRow":"AQID","endRow":"AQI"}`
+		`{"path":"hdfs://nn/accumulo/tables/2/t-0001/F0002.rf","startRow":"AQID","endRow":"AQI"}`
 
 	assertRefused(t, job, Options{}, ClassRangedInputFile, "files[1]")
+}
+
+// TestTranslateRefusesUnframedFenceRows covers the layer under base64.
+// decodeRow hands the decoded bytes to Hadoop Text.readFields, which
+// reads a VInt length and then readFully's that many bytes, so a row
+// that decodes cleanly but does not frame a Text is an entry Java throws
+// on — a malformed job, not an unsupported fence.
+func TestTranslateRefusesUnframedFenceRows(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		row  string
+		want string
+	}{
+		{
+			// [0x01]: a one-byte row with nothing after the length.
+			name: "length with no payload",
+			row:  "AQ==",
+			want: "only 0",
+		},
+		{
+			// [0x8f 0x05]: a two-byte VInt declaring five bytes.
+			name: "multi-byte length with no payload",
+			row:  base64.URLEncoding.EncodeToString([]byte{0x8f, 0x05}),
+			want: "only 0",
+		},
+		{
+			// [0x8f]: the VInt itself is cut off after its first byte.
+			name: "truncated length",
+			row:  base64.URLEncoding.EncodeToString([]byte{0x8f}),
+			want: "needs 2 bytes",
+		},
+		{
+			// [0x87 0x00]: decodeVIntSize 2, isNegativeVInt, so ~0 = -1.
+			name: "negative length",
+			row:  base64.URLEncoding.EncodeToString([]byte{0x87, 0x00}),
+			want: "is negative",
+		},
+		{
+			// [0x89 0x01 0 0 0 0 0 0]: 2^48, which readVInt rejects
+			// before Text ever sees it.
+			name: "length past int range",
+			row:  base64.URLEncoding.EncodeToString([]byte{0x89, 0x01, 0, 0, 0, 0, 0, 0}),
+			want: "does not fit in an int",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			job := validJob()
+			job.Files[1].MetadataFileEntry = fmt.Sprintf(
+				`{"path":"hdfs://nn/accumulo/tables/2/t-0001/F0002.rf","startRow":"%s","endRow":""}`,
+				tt.row)
+
+			r := assertRefused(t, job, Options{}, ClassMalformedJob, "files[1]")
+			if !strings.Contains(r.Detail, tt.want) {
+				t.Fatalf("detail = %q, want it to contain %q", r.Detail, tt.want)
+			}
+		})
+	}
+}
+
+// TestTranslateAcceptsFenceRowsWithTrailingBytes pins the other side of
+// the framing rule: Text.readFields readFully's exactly the declared
+// length and leaves the rest of the buffer alone, so trailing bytes are
+// not a parse failure.
+func TestTranslateAcceptsFenceRowsWithTrailingBytes(t *testing.T) {
+	job := validJob()
+	job.Files[1].MetadataFileEntry = fmt.Sprintf(
+		`{"path":"hdfs://nn/accumulo/tables/2/t-0001/F0002.rf","startRow":"%s","endRow":""}`,
+		base64.URLEncoding.EncodeToString([]byte{0x01, 'a', 'b', 'c'}))
+
+	assertRefused(t, job, Options{}, ClassRangedInputFile, "files[1]")
+}
+
+// TestTranslateRefusesUnparsableFilePaths covers the shape every path in
+// a job has to have. Each of these throws inside
+// ReferencedTabletFile.parsePath, which every input and the output run
+// through on the Java side, so a plan built on one names a file the
+// manager could never accept.
+func TestTranslateRefusesUnparsableFilePaths(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		path string
+		want string
+	}{
+		{"no scheme", "/accumulo/tables/2/t-0001/F0002.rf", "no URI scheme"},
+		{"invalid scheme", "9dfs://nn/accumulo/tables/2/t-0001/F0002.rf", "invalid URI scheme"},
+		{"authority only", "hdfs://nn", "no absolute path"},
+		{"too few segments", "hdfs://nn/tables/2/F0002.rf", "is not shaped"},
+		{"wrong tables dir", "hdfs://nn/accumulo/tablets/2/t-0001/F0002.rf", "tables directory name"},
+		// A non-normalized twin of files[0]: were it accepted, the raw
+		// string would miss the duplicate check and every cell in the
+		// file would be merged twice.
+		{"double slash", "hdfs://nn/accumulo/tables/2//t-0001/F0001.rf", "empty segment"},
+		{"dot segment", "hdfs://nn/accumulo/tables/2/./t-0001/F0002.rf", `"." segment`},
+		{"parent segment", "hdfs://nn/accumulo/tables/2/t-0001/../t-0002/F0002.rf", `".." segment`},
+		{"trailing slash", "hdfs://nn/accumulo/tables/2/t-0001/F0002.rf/", "empty segment"},
+		{"invalid file name", "hdfs://nn/accumulo/tables/2/t-0001/F 0002.rf", "invalid characters"},
+		{"fragment", "hdfs://nn/accumulo/tables/2/t-0001/F0002.rf#x", `"#"`},
+		{"query", "hdfs://nn/accumulo/tables/2/t-0001/F0002.rf?x=1", `"?"`},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			job := validJob()
+			job.Files[1].MetadataFileEntry = storedFile(tt.path)
+
+			r := assertRefused(t, job, Options{}, ClassMalformedJob, "files[1]")
+			if !strings.Contains(r.Detail, tt.want) {
+				t.Fatalf("detail = %q, want it to contain %q", r.Detail, tt.want)
+			}
+		})
+	}
+}
+
+// TestTranslateRefusesUnparsableOutputPath pins that the output runs
+// through the same shape check. The suffix alone is not enough: the
+// manager renames this file and stores it as a StoredTabletFile, so a
+// name parsePath rejects would strand the output where nothing can
+// reference it.
+func TestTranslateRefusesUnparsableOutputPath(t *testing.T) {
+	job := validJob()
+	job.OutputFile = "garbage.rf" + tmpSuffix(testECID)
+
+	r := assertRefused(t, job, Options{}, ClassMalformedJob, "outputFile")
+	if !strings.Contains(r.Detail, "no URI scheme") {
+		t.Fatalf("detail = %q, want it to name the missing scheme", r.Detail)
+	}
+}
+
+// TestTranslateAcceptsAnUnauthoritativeVolume keeps the path check from
+// overreaching: parsePath takes everything before /tables as the volume
+// and does not care what it is, so a job from a second configured volume
+// must still translate.
+func TestTranslateAcceptsAnUnauthoritativeVolume(t *testing.T) {
+	job := validJob()
+	job.Files[1].MetadataFileEntry =
+		storedFile("file:/srv/vol2/accumulo/tables/2/t-0001/F0002.rf")
+
+	plan := mustTranslate(t, job, Options{})
+	if got := plan.Inputs[1].Path; got != "file:/srv/vol2/accumulo/tables/2/t-0001/F0002.rf" {
+		t.Fatalf("input path = %q, want the second volume's path", got)
+	}
+}
+
+// TestEmptyInputGuards covers the two preconditions the callers already
+// satisfy — parseInputs rejects an empty entry and parseOutput an empty
+// output before either helper runs, and checkFenceRow returns early on a
+// zero-length row. They are checked here rather than deleted because
+// neither helper should depend on its caller to stay memory-safe.
+func TestEmptyInputGuards(t *testing.T) {
+	if err := checkTabletFilePath("", "files[0]"); err == nil {
+		t.Fatal("checkTabletFilePath(\"\") = nil, want a refusal")
+	}
+	if _, _, err := readVInt(nil); err == nil {
+		t.Fatal("readVInt(nil) = nil error, want a truncation error")
+	}
 }
 
 // TestTranslateRefusesMalformedJobs walks the structural checks. Every
@@ -474,15 +640,17 @@ func TestTranslateRefusesMalformedJobs(t *testing.T) {
 		{
 			name: "output file is a metadata entry",
 			mutate: func(j *tabletserver.TExternalCompactionJob) {
-				j.OutputFile = storedFile("hdfs://nn/t/2/C0003.rf")
+				j.OutputFile = storedFile("hdfs://nn/accumulo/tables/2/t-0001/C0003.rf")
 			},
 			wantField: "outputFile",
 		},
 		{
 			// The committed name, not the temp name the compactor is
 			// told to write; the manager renames the temp file itself.
-			name:      "output file is not this job's temp name",
-			mutate:    func(j *tabletserver.TExternalCompactionJob) { j.OutputFile = "hdfs://nn/t/2/C0003.rf" },
+			name: "output file is not this job's temp name",
+			mutate: func(j *tabletserver.TExternalCompactionJob) {
+				j.OutputFile = "hdfs://nn/accumulo/tables/2/t-0001/C0003.rf"
+			},
 			wantField: "outputFile",
 		},
 		{
@@ -493,8 +661,10 @@ func TestTranslateRefusesMalformedJobs(t *testing.T) {
 			wantField: "outputFile",
 		},
 		{
-			name:      "output file has the bare pre-3.0 temp suffix",
-			mutate:    func(j *tabletserver.TExternalCompactionJob) { j.OutputFile = "hdfs://nn/t/2/C0003.rf_tmp" },
+			name: "output file has the bare pre-3.0 temp suffix",
+			mutate: func(j *tabletserver.TExternalCompactionJob) {
+				j.OutputFile = "hdfs://nn/accumulo/tables/2/t-0001/C0003.rf_tmp"
+			},
 			wantField: "outputFile",
 		},
 		{
