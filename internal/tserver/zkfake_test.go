@@ -283,6 +283,13 @@ func (f *fakeZK) Delete(znodePath string, _ int32) error {
 
 // fire delivers an event to every watch on a path and clears them, as a
 // one-shot ZooKeeper watch does.
+//
+// The channel is closed after the event, which is what go-zookeeper does
+// ("ch <- ev; close(ch)" in Conn.notifyWatches). It matters for anything with
+// more than one receiver on a watch: production wakes the one that takes the
+// event and every other waiter through the close, so a fake that left the
+// channel open would leave those waiters blocked on a watch that has already
+// fired.
 func (f *fakeZK) fire(znodePath string, event gozk.Event) {
 	f.mu.Lock()
 	waiting := f.watches[znodePath]
@@ -290,11 +297,18 @@ func (f *fakeZK) fire(znodePath string, event gozk.Event) {
 	f.mu.Unlock()
 	for _, events := range waiting {
 		events <- event
+		close(events)
 	}
 }
 
 // expire ends the session: every ephemeral node disappears and every watch is
 // invalidated, which is what the client reports as EventNotWatching.
+//
+// The event matches go-zookeeper's Conn.invalidateWatches exactly — type
+// EventNotWatching, state StateDisconnected, and the cause in Err — because
+// the client reports the watch it gave up on, not the session state that made
+// it give up. StateExpired reaches the caller on the connection's own event
+// channel instead, which is not what a watch delivers.
 func (f *fakeZK) expire() {
 	f.mu.Lock()
 	for znodePath, node := range f.nodes {
@@ -310,10 +324,11 @@ func (f *fakeZK) expire() {
 		for _, events := range channels {
 			events <- gozk.Event{
 				Type:  gozk.EventNotWatching,
-				State: gozk.StateExpired,
+				State: gozk.StateDisconnected,
 				Path:  znodePath,
 				Err:   gozk.ErrSessionExpired,
 			}
+			close(events)
 		}
 	}
 }

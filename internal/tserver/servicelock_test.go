@@ -2061,8 +2061,18 @@ func TestMaintainReusesTheWatchACancelledOneLeftBehind(t *testing.T) {
 
 // TestConcurrentMaintainersAllReturnWhenTheGenerationEnds is the other half of
 // sharing one watch: the event that ends a generation can be received by only
-// one watcher, so the others have to learn of the ending some other way. They
-// are told, and they agree on how it ended.
+// one watcher — the client hands it to one receiver and closes the channel —
+// so the others have to learn of the ending some other way. They are told, and
+// they agree on how it ended.
+//
+// The wait below is for the shared watch to exist, and that is all it can
+// prove: the watchers share one registration, so there is nothing per-watcher
+// to count, and a watcher that has not reached its select when the node goes
+// is indistinguishable from one that has. That case is covered instead by
+// asking again after the generation has ended, which is the same question
+// asked from the far side of the race — so what a watcher is told does not
+// depend on when the scheduler ran it. Sharing itself is pinned exactly by
+// TestMaintainReusesTheWatchACancelledOneLeftBehind.
 func TestConcurrentMaintainersAllReturnWhenTheGenerationEnds(t *testing.T) {
 	f := newFakeZK()
 	lock := newTestLock(t, f, serverUUID)
@@ -2072,15 +2082,20 @@ func TestConcurrentMaintainersAllReturnWhenTheGenerationEnds(t *testing.T) {
 	nodePath := lockNodePath(serverUUID, 0)
 
 	const watchers = 4
-	ended := make(chan error, watchers)
+	ended := make(chan error, 2*watchers)
 	for i := 0; i < watchers; i++ {
 		go func() { ended <- lock.Maintain(context.Background()) }()
 	}
-	waitFor(t, "every watcher to be watching", func() bool { return f.watchCount(nodePath) >= 1 })
+	waitFor(t, "the shared watch to be armed", func() bool { return f.watchCount(nodePath) >= 1 })
 	if err := f.Delete(nodePath, -1); err != nil {
 		t.Fatalf("Delete: %v", err)
 	}
+	// Late arrivals: every one of these starts after the ending was recorded,
+	// which is the position a watcher the scheduler held back would be in.
 	for i := 0; i < watchers; i++ {
+		go func() { ended <- lock.Maintain(context.Background()) }()
+	}
+	for i := 0; i < 2*watchers; i++ {
 		select {
 		case err := <-ended:
 			if !errors.Is(err, ErrLockLost) {
@@ -2093,5 +2108,73 @@ func TestConcurrentMaintainersAllReturnWhenTheGenerationEnds(t *testing.T) {
 		case <-time.After(10 * time.Second):
 			t.Fatalf("watcher %d never returned after the generation ended", i)
 		}
+	}
+}
+
+// TestWatchingAfterTheGenerationEndedReportsHowItEnded pins the distinction
+// that keeps the answer above independent of scheduling: a lock that ended is
+// not a lock that was never held, and the two are reported differently.
+func TestWatchingAfterTheGenerationEndedReportsHowItEnded(t *testing.T) {
+	f := newFakeZK()
+	lock := newTestLock(t, f, serverUUID)
+	if _, err := lock.Acquire(context.Background(), testLockData(t)); err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	nodePath := lockNodePath(serverUUID, 0)
+	if err := f.Delete(nodePath, -1); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if err := lock.Verify(); !errors.Is(err, ErrLockLost) {
+		t.Fatalf("Verify: want ErrLockLost, got %v", err)
+	}
+
+	for _, tc := range []struct {
+		what string
+		call func() error
+	}{
+		{"Maintain", func() error { return lock.Maintain(context.Background()) }},
+		{"Verify", func() error { return lock.Verify() }},
+	} {
+		err := tc.call()
+		if !errors.Is(err, ErrLockLost) {
+			t.Fatalf("%s after the generation ended: want ErrLockLost, got %v", tc.what, err)
+		}
+		if errors.Is(err, ErrNotHeld) {
+			t.Fatalf("%s reported the generation as one that was never held: %v", tc.what, err)
+		}
+		if !strings.Contains(err.Error(), LossNodeDeleted.String()) {
+			t.Fatalf("%s reported %v, want the recorded %s ending", tc.what, err, LossNodeDeleted)
+		}
+	}
+
+	// A lock that never held a generation is still told exactly that; there is
+	// no ending to report, and inventing one would be worse than saying so.
+	fresh := newTestLock(t, newFakeZK(), serverUUID)
+	if err := fresh.Maintain(context.Background()); !errors.Is(err, ErrNotHeld) {
+		t.Fatalf("Maintain on a lock that never held one: want ErrNotHeld, got %v", err)
+	}
+	if err := fresh.Verify(); !errors.Is(err, ErrNotHeld) {
+		t.Fatalf("Verify on a lock that never held one: want ErrNotHeld, got %v", err)
+	}
+}
+
+// TestAnExpiredSessionOnAWatchIsALoss covers the defensive arm of the event
+// classifier. go-zookeeper reports a session it gave up on as EventNotWatching
+// and sends StateExpired on the connection's own event channel instead, so a
+// watch carrying that state is not something the client produces — but a lock
+// whose session is gone is one this process cannot prove it holds, and it is
+// classified that way rather than treated as an event worth ignoring.
+func TestAnExpiredSessionOnAWatchIsALoss(t *testing.T) {
+	f := newFakeZK()
+	lock := newTestLock(t, f, serverUUID)
+	if _, err := lock.Acquire(context.Background(), testLockData(t)); err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	err := lock.classifyEvent(gozk.Event{State: gozk.StateExpired, Path: lockNodePath(serverUUID, 0)})
+	if !errors.Is(err, ErrLockLost) {
+		t.Fatalf("classifyEvent: want ErrLockLost, got %v", err)
+	}
+	if lock.LossReason() != LossUnmonitorable {
+		t.Fatalf("loss reason %s, want UNMONITORABLE", lock.LossReason())
 	}
 }

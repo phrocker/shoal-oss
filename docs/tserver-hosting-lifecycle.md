@@ -388,6 +388,13 @@ ending rather than whatever woke them. Without that the watchers that did
 not receive the event would go on watching a generation that had already
 ended.
 
+A watcher that arrives after the generation ended is told how it ended,
+not that there is no lock. The two are different facts — a lock that
+ended and one that never held anything — and reporting the second for the
+first would make the answer depend on whether the caller reached the
+watch before the loss landed. `ErrNotHeld` is kept for the lock that
+genuinely never held a generation, where there is no ending to report.
+
 The same holds while queued. The watch on this process's own node — the
 one that says the turn will never come — is armed once and kept across
 passes, so climbing a long queue does not leave a registration behind at

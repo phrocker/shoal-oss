@@ -669,12 +669,16 @@ func (l *ServiceLock) acquired(node string) (LockID, error) {
 // a caller that stops and resumes watching does not leave a registration
 // behind each time it stops. Watchers that are not the one to receive the
 // event that ends the generation still return when it ends.
+//
+// A Maintain that arrives after the generation ended reports how it ended
+// rather than that there is no lock, so what a watcher is told does not depend
+// on whether it reached the watch before the loss landed.
 func (l *ServiceLock) Maintain(ctx context.Context) error {
 	l.mu.Lock()
 	held, node := l.held, l.node
 	l.mu.Unlock()
 	if !held {
-		return fmt.Errorf("%w: %s", ErrNotHeld, l.dir)
+		return l.nothingToWatch()
 	}
 	nodePath := path.Join(l.dir, node)
 
@@ -715,10 +719,18 @@ func (l *ServiceLock) Maintain(ctx context.Context) error {
 			if err := l.Verify(); err != nil {
 				return err
 			}
-		case event := <-events:
+		case event, open := <-events:
 			// The watch fired, so it is spent. Dropping it re-arms on the next
 			// pass, which re-checks that the node is still there.
 			l.spendWatch(events)
+			if !open {
+				// The client closes a watch channel once it has delivered, so
+				// a closed one means another watcher took the event. What it
+				// said is not known here, and the zero value it reads as is
+				// not an event to classify — the re-arm above is what finds
+				// out, and it ends the generation if the node is gone.
+				continue
+			}
 			if err := l.classifyEvent(event); err != nil {
 				return err
 			}
@@ -765,6 +777,25 @@ func (l *ServiceLock) spendWatch(spent <-chan gozk.Event) {
 	}
 }
 
+// nothingToWatch explains why there is no generation to watch: the ending
+// already recorded for one that has ended, or ErrNotHeld for a lock that never
+// held one.
+//
+// The distinction is what keeps a watcher's answer independent of when it
+// arrived. A caller that starts watching just after the loss landed has the
+// same interest in the loss as one that was already watching, and telling it
+// the lock was never held would drop a generation's ending on the floor for no
+// reason other than scheduling.
+func (l *ServiceLock) nothingToWatch() error {
+	l.mu.Lock()
+	ended := l.reason != LossNone
+	l.mu.Unlock()
+	if ended {
+		return l.ended()
+	}
+	return fmt.Errorf("%w: %s", ErrNotHeld, l.dir)
+}
+
 // classifyEvent turns a watch event into a loss, or nil to keep watching.
 func (l *ServiceLock) classifyEvent(event gozk.Event) error {
 	switch {
@@ -788,12 +819,15 @@ func (l *ServiceLock) classifyEvent(event gozk.Event) error {
 // does not cover — one dropped without an event, or a lock directory that was
 // deleted and recreated, which restarts ZooKeeper's sequence counter and lets
 // a later arrival take a lower number than the one held here.
+//
+// A verification made after the generation ended reports how it ended, the
+// same as Maintain, rather than that there is no lock to verify.
 func (l *ServiceLock) Verify() error {
 	l.mu.Lock()
 	held, node := l.held, l.node
 	l.mu.Unlock()
 	if !held {
-		return fmt.Errorf("%w: %s", ErrNotHeld, l.dir)
+		return l.nothingToWatch()
 	}
 	children, _, err := l.conn.Children(l.dir)
 	if err != nil {

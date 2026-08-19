@@ -39,10 +39,12 @@ type LockID struct {
 // Valid reports whether the lock identity could name a real ServiceLock node,
 // and so is usable for fencing.
 //
-// The checks mirror the node parser in internal/zk (see firstLockNode): the
+// The checks are the ones Accumulo's ServiceLock.validateAndSort makes: the
 // UUID must be the 36-character dashed form Java's UUID.fromString accepts,
-// and the sequence must fit the signed 32-bit counter Accumulo's
-// ServiceLock.validateAndSort reads with Integer.parseInt.
+// and the sequence must fit the signed 32-bit counter it reads with
+// Integer.parseInt. internal/zk's node parser is looser — it takes whatever
+// uuid.Parse accepts, including the undashed and URN spellings Java rejects —
+// so this is parity with Accumulo rather than with that parser.
 // An identity outside that shape could never appear as a "zlock#<uuid>#<seq>"
 // node, so it cannot be a lock this process holds — trusting it as fencing
 // authority would be fencing against nothing.
