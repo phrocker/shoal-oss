@@ -487,10 +487,20 @@ destination splits itself, or the eventual `BulkImport` fails closed (see
   `RequiredDestinationSplits`, conditionally submits `AddTableSplits` for
   a multi-tablet manifest, then calls `StageBulkDir`, then submits the
   bulk import through a `Promoter` (satisfied by `*accumulo.Connector`).
-  Validates `tableName`/`bulkDir`/the tablet chain before any Accumulo
-  call or destination write, so a malformed manifest or invalid
-  destination never adds a split, stages a file, or submits a bulk
-  import. Submits nothing when the derived mapping is empty (nothing to
+  Validates `tableName`/`bulkDir`/the tablet chain (via a
+  `RequiredDestinationSplits` preflight), every RFile's own reference
+  into that chain (via a `BuildLoadMapping` preflight), and everything
+  `StageBulkDir` itself would reject before writing a single byte (via a
+  `stagingPreflight` call covering source-alias dedup, flattened-basename
+  validity/uniqueness, and staging write-target aliasing) — all before
+  any Accumulo call or destination write — so a malformed manifest or
+  invalid destination never adds a split, stages a file, or submits a
+  bulk import. Each of these three preflights is redundant with
+  validation `StageBulkDir` (and, for the chain shape, `AddTableSplits`
+  reconciliation) performs again further on; every one of them is a pure
+  or local-probe-only function of the manifest and the backends alone,
+  so recomputing is cheap and never observes a different destination
+  state. Submits nothing when the derived mapping is empty (nothing to
   import) — but still reconciles splits first if the manifest declares a
   multi-tablet chain, even when every tablet in it ends up empty, so the
   destination's tablet boundaries don't depend on which tablets happened
@@ -649,7 +659,23 @@ existing single-tablet suite:
   manifest; `AddTableSplits` skipped entirely for a single-tablet manifest;
   zero staged writes and zero `BulkImport` calls when `AddTableSplits`
   fails (proving the fail-before-any-write ordering); and a full
-  three-tablet success path exercising every step end to end.
+  three-tablet success path exercising every step end to end. The
+  `stagingPreflight` ordering guarantee itself is proved by three
+  `Promote`-level tests, each a multi-tablet manifest that reaches
+  `AddTableSplits` unless the fix holds:
+  `TestPromoteRejectsCrossTabletBasenameCollisionBeforeAddTableSplits`
+  and `TestPromoteRejectsNonLeafBasenameBeforeAddTableSplits` cover
+  `flattenNames`'s two rejections (a shared basename across tablets, and
+  a basename that collapses to a non-leaf `.`/`..`), and
+  `TestPromoteRejectsLoadMapAliasBeforeAddTableSplits` covers
+  `checkNoStagingAliases` specifically — a real hard link between
+  `bulkDir/loadmap.json` and one of the manifest's own source files, on
+  the local backend, since alias detection for local paths depends on
+  `os.SameFile`, which the in-memory backend used by the other two tests
+  cannot exercise. All three assert zero `AddTableSplits` and zero
+  `BulkImport` calls, not just a non-nil error, so a regression that
+  moved the check back to only firing inside `StageBulkDir` would fail
+  them even if `Promote` still ultimately returned an error.
 - **Cross-tablet alias/path safety** —
   `TestStageBulkDirRejectsCrossTabletBasenameCollisionBeforeCopying` proves
   the flatten-collision check (previously only exercised within a single

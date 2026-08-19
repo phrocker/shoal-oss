@@ -234,6 +234,43 @@ func checkNoStagingAliases(src, dst storage.Backend, flatNames map[string]string
 	return nil
 }
 
+// stagingPreflight runs the same non-mutating, storage-probing
+// validation StageBulkDir itself performs before it copies a single
+// byte or writes loadmap.json: deduping source aliases
+// (dedupeStageSources), flattening every RFile to its bulk-directory
+// basename (flattenNames), and checking the flattened write targets
+// against src and dst for path aliases (checkNoStagingAliases).
+//
+// Promote calls this, and discards the result, immediately after its
+// own BuildLoadMapping preflight and before AddTableSplits ever runs.
+// Without it, a manifest that is only invalid at this specific layer —
+// a cross-tablet basename collision, an invalid/non-leaf flattened
+// basename, or a source/destination path alias — would only be caught
+// later, inside StageBulkDir's own call to these same three functions,
+// by which point AddTableSplits would already have reconciled the
+// destination's splits (see Promote's own doc comment, which explains
+// why the BuildLoadMapping preflight exists for the identical reason).
+//
+// Recomputing this inside StageBulkDir is cheap and never observes a
+// different destination state: dedupeStageSources and
+// checkNoStagingAliases only probe src/dst path identity (in-memory
+// comparisons for remote/object-store backends, cached local os.Stat
+// calls for local ones — see their own doc comments), and flattenNames
+// is a pure function of the RFile list alone. This mirrors
+// BuildLoadMapping's own preflight, which Promote also calls once early
+// and StageBulkDir recomputes again further on, for the same reason.
+func stagingPreflight(src storage.Backend, rfiles []engine.RFileExportFile, dst storage.Backend, bulkDir string) error {
+	stageRFiles, err := dedupeStageSources(src, rfiles)
+	if err != nil {
+		return err
+	}
+	flatNames, err := flattenNames(stageRFiles)
+	if err != nil {
+		return err
+	}
+	return checkNoStagingAliases(src, dst, flatNames, bulkDir)
+}
+
 func validateStagingWriteTarget(dst storage.Backend, target stageWriteTarget) error {
 	if runtime.GOOS == "windows" && localTargetUsesWindowsADSOnBackend(dst, target.path) {
 		return fmt.Errorf(

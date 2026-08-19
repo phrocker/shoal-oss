@@ -3,12 +3,15 @@ package promotion
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/phrocker/shoal/accumulo"
 	"github.com/phrocker/shoal/internal/engine"
+	"github.com/phrocker/shoal/internal/storage/local"
 	"github.com/phrocker/shoal/internal/storage/memory"
 )
 
@@ -342,6 +345,142 @@ func TestPromoteRejectsUnsupportedManifestVersionBeforeAddTableSplits(t *testing
 	}
 	if got := dst.Keys(); len(got) != 0 {
 		t.Fatalf("dst.Keys() = %v, want no staged files when manifest validation fails first", got)
+	}
+}
+
+// TestPromoteRejectsCrossTabletBasenameCollisionBeforeAddTableSplits
+// covers the staging-level check stagingPreflight now catches before
+// AddTableSplits: a two-tablet manifest whose tablet chain and RFile
+// index references are both individually well-formed (so BuildLoadMapping's
+// own preflight passes), but whose two RFiles -- one per tablet, so
+// BuildLoadMapping's DestinationPath-conflict check never sees the same
+// path declared twice -- flatten to the identical bulk-directory
+// basename. Without stagingPreflight, this was only ever caught later,
+// inside StageBulkDir's own call to flattenNames -- after AddTableSplits
+// had already reconciled the destination's splits.
+func TestPromoteRejectsCrossTabletBasenameCollisionBeforeAddTableSplits(t *testing.T) {
+	src := memory.New()
+	src.Put("events/t-0000/F0001.rf", []byte("a"))
+	src.Put("events/t-0001/F0001.rf", []byte("b"))
+	manifest := twoTabletManifest()
+	manifest.RFiles[0].DestinationPath = "events/t-0000/F0001.rf"
+	manifest.RFiles[1].DestinationPath = "events/t-0001/F0001.rf" // same basename as tablet 0's file
+
+	dst := memory.New()
+	importer := &fakePromoter{}
+	if _, err := Promote(context.Background(), src, manifest, dst, "/bulk/events-1", importer, "events", Options{}); err == nil {
+		t.Fatal("Promote with a cross-tablet basename collision = nil error, want error")
+	}
+	if importer.splitCalls != 0 {
+		t.Fatalf("AddTableSplits calls = %d, want 0 (a cross-tablet basename collision must fail before any split reconciliation)", importer.splitCalls)
+	}
+	if importer.calls != 0 {
+		t.Fatalf("BulkImport calls = %d, want 0", importer.calls)
+	}
+	if got := dst.Keys(); len(got) != 0 {
+		t.Fatalf("dst.Keys() = %v, want no staged files when manifest validation fails first", got)
+	}
+}
+
+// TestPromoteRejectsNonLeafBasenameBeforeAddTableSplits is the
+// stagingPreflight-side counterpart to
+// TestPromoteRejectsCrossTabletBasenameCollisionBeforeAddTableSplits, for
+// flattenNames's other rejection: a DestinationPath that collapses to a
+// non-leaf basename ("." or "..", here via a two-tablet manifest so
+// AddTableSplits is reachable at all, unlike
+// TestStageBulkDirRejectsNonLeafBasenameBeforeCopying's single-tablet
+// fixture).
+func TestPromoteRejectsNonLeafBasenameBeforeAddTableSplits(t *testing.T) {
+	src := memory.New()
+	src.Put("events/t-0000/F0001.rf", []byte("a"))
+	src.Put("events/t-0001/..", []byte("b"))
+	manifest := twoTabletManifest()
+	manifest.RFiles[0].DestinationPath = "events/t-0000/F0001.rf"
+	manifest.RFiles[1].DestinationPath = "events/t-0001/.."
+
+	dst := memory.New()
+	importer := &fakePromoter{}
+	if _, err := Promote(context.Background(), src, manifest, dst, "/bulk/events-1", importer, "events", Options{}); err == nil {
+		t.Fatal("Promote with a non-leaf-flattening basename = nil error, want error")
+	}
+	if importer.splitCalls != 0 {
+		t.Fatalf("AddTableSplits calls = %d, want 0 (a non-leaf-flattening basename must fail before any split reconciliation)", importer.splitCalls)
+	}
+	if importer.calls != 0 {
+		t.Fatalf("BulkImport calls = %d, want 0", importer.calls)
+	}
+	if got := dst.Keys(); len(got) != 0 {
+		t.Fatalf("dst.Keys() = %v, want no staged files when manifest validation fails first", got)
+	}
+}
+
+// TestPromoteRejectsLoadMapAliasBeforeAddTableSplits is the third
+// stagingPreflight-side counterpart. The two tests above both fail
+// inside flattenNames, before stagingPreflight ever reaches
+// checkNoStagingAliases; this test proves checkNoStagingAliases
+// specifically is also run, and enforced, before AddTableSplits: a
+// two-tablet manifest whose files and flattened basenames are otherwise
+// all individually valid and non-colliding, but whose bulk directory
+// already contains a loadmap.json hard-linked to one of the manifest's
+// own source files. Uses the local backend, since
+// checkNoStagingAliases's alias detection for local paths relies on
+// os.SameFile, which the in-memory backend used by the other Promote
+// tests in this file cannot exercise (compare
+// TestStageBulkDirRejectsLoadMapAliasBeforeCopying, StageBulkDir's own
+// single-tablet analogue of this same check).
+func TestPromoteRejectsLoadMapAliasBeforeAddTableSplits(t *testing.T) {
+	root := t.TempDir()
+	exportDir := filepath.Join(root, "export")
+	bulkDir := filepath.Join(root, "bulk")
+	if err := os.MkdirAll(filepath.Join(exportDir, "t-0000"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(exportDir, "t-0001"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(bulkDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	path0 := filepath.Join(exportDir, "t-0000", "F0001.rf")
+	path1 := filepath.Join(exportDir, "t-0001", "F0002.rf")
+	if err := os.WriteFile(path0, []byte("a"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path1, []byte("b"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	loadmapPath := filepath.Join(bulkDir, "loadmap.json")
+	if err := os.Link(path0, loadmapPath); err != nil {
+		t.Skipf("hard links not supported in this environment: %v", err)
+	}
+
+	manifest := twoTabletManifest()
+	manifest.RFiles[0].DestinationPath = path0
+	manifest.RFiles[1].DestinationPath = path1
+
+	be := local.New()
+	importer := &fakePromoter{}
+	if _, err := Promote(context.Background(), be, manifest, be, bulkDir, importer, "events", Options{}); err == nil {
+		t.Fatal("Promote with loadmap.json aliasing a manifest source file = nil error, want error")
+	}
+	if importer.splitCalls != 0 {
+		t.Fatalf("AddTableSplits calls = %d, want 0 (a staging write-target alias must fail before any split reconciliation)", importer.splitCalls)
+	}
+	if importer.calls != 0 {
+		t.Fatalf("BulkImport calls = %d, want 0", importer.calls)
+	}
+
+	gotSrc, err := os.ReadFile(path0)
+	if err != nil {
+		t.Fatalf("source file missing after rejected loadmap alias promotion: %v", err)
+	}
+	if string(gotSrc) != "a" {
+		t.Fatalf("source file corrupted by rejected loadmap alias promotion: got %q, want %q", gotSrc, "a")
+	}
+	if _, err := os.Stat(filepath.Join(bulkDir, "F0001.rf")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("staged file exists after rejected loadmap alias promotion: err=%v, want not-exist", err)
 	}
 }
 

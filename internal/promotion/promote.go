@@ -115,24 +115,35 @@ type Options struct {
 // tablet boundaries regardless of which tablets happened to carry files.
 //
 // Promote validates tableName and bulkDir, and the whole manifest --
-// both its tablet chain shape (via RequiredDestinationSplits) and its
-// RFiles' own references into that chain (via a BuildLoadMapping
-// preflight: every RFile.TabletIndex must be declared, and a repeated
-// DestinationPath must not disagree about which index it belongs to) --
-// before making any Accumulo call or writing anything to dst. Without
-// that second, RFile-level check, a manifest whose tablet chain is
-// well-formed but whose RFiles reference an undeclared index, or
-// declare one DestinationPath under two conflicting indexes, would only
-// be rejected later, inside StageBulkDir's own BuildLoadMapping call --
-// by which point AddTableSplits below would already have mutated the
-// destination's real splits. Running BuildLoadMapping here first, and
-// discarding its result (StageBulkDir recomputes it over the
-// deduplicated RFile list further on; both calls are pure, network-free
-// functions of the manifest alone, so recomputing is cheap and never
-// observes a different destination state), closes that gap: a
-// malformed manifest of either kind, or an invalid destination, never
-// adds a split, stages a file, or submits a bulk import before the call
-// fails.
+// its tablet chain shape (via RequiredDestinationSplits), its RFiles'
+// own references into that chain (via a BuildLoadMapping preflight:
+// every RFile.TabletIndex must be declared, and a repeated
+// DestinationPath must not disagree about which index it belongs to),
+// and everything StageBulkDir itself would reject before writing a
+// single byte (via a stagingPreflight call: source-alias dedup,
+// flattened-basename validity and uniqueness, and staging write-target
+// aliasing against both src and dst; see stagingPreflight) -- before
+// making any Accumulo call or writing anything to dst. Without the
+// RFile-level check, a manifest whose tablet chain is well-formed but
+// whose RFiles reference an undeclared index, or declare one
+// DestinationPath under two conflicting indexes, would only be
+// rejected later, inside StageBulkDir's own BuildLoadMapping call.
+// Without the staging-level check, a manifest whose tablets and RFiles
+// are otherwise well-formed but which flattens two different tablets'
+// files to the same bulk-directory basename (or an invalid one, or a
+// path that aliases src or dst) would only be rejected later still,
+// inside StageBulkDir's own calls to dedupeStageSources/
+// flattenNames/checkNoStagingAliases. Either gap, left unclosed, means
+// AddTableSplits below would already have mutated the destination's
+// real splits by the time a permanently unstageable manifest is finally
+// caught. Running both preflights here first, and discarding their
+// results (StageBulkDir recomputes both over the same manifest and
+// backends further on; every one of these calls is a pure or
+// local-probe-only function of the manifest and the backends alone, so
+// recomputing is cheap and never observes a different destination
+// state), closes both gaps: a malformed manifest of any of these
+// kinds, or an invalid destination, never adds a split, stages a file,
+// or submits a bulk import before the call fails.
 //
 // Promote does not itself retry on failure, and retry safety differs by
 // which step failed. A failure in validation, AddTableSplits, or
@@ -164,6 +175,9 @@ func Promote(
 		return nil, err
 	}
 	if _, err := BuildLoadMapping(manifest); err != nil {
+		return nil, err
+	}
+	if err := stagingPreflight(src, manifest.RFiles, dst, bulkDir); err != nil {
 		return nil, err
 	}
 	splits, err := RequiredDestinationSplits(manifest)
