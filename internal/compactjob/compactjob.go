@@ -899,10 +899,12 @@ func checkTabletFilePath(raw, field string) error {
 	return nil
 }
 
-// uriExtraChars are the non-alphanumeric characters java.net.URI's
-// single-argument parser accepts unescaped: RFC 2396's unreserved marks,
-// its reserved set, and the brackets URI allows for IPv6 literals.
-const uriExtraChars = "-_.!~*'();/:@&=+$,[]"
+// uriPunctuation is the non-alphanumeric ASCII java.net.URI's
+// single-argument parser accepts unescaped anywhere: RFC 2396's
+// unreserved marks and its reserved set, less "?" and "#", which
+// checkTabletFilePath has already refused as components a tablet file
+// path does not have.
+const uriPunctuation = "-_.!~*'();/:@&=+$,"
 
 // checkURISyntax rejects what java.net.URI's single-argument parser
 // rejects.
@@ -915,6 +917,7 @@ const uriExtraChars = "-_.!~*'();/:@&=+$,[]"
 // path through as an executable plan for a file Accumulo cannot even
 // name.
 func checkURISyntax(raw string) error {
+	authStart, authEnd := authoritySpan(raw)
 	for i := 0; i < len(raw); i++ {
 		c := raw[i]
 		switch {
@@ -924,12 +927,32 @@ func checkURISyntax(raw string) error {
 			}
 			i += 2
 		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
-		case strings.IndexByte(uriExtraChars, c) >= 0:
+		case strings.IndexByte(uriPunctuation, c) >= 0:
+		case c == '[' || c == ']':
+			// URI allows brackets only around an IPv6 literal host.
+			if i < authStart || i >= authEnd {
+				return fmt.Errorf("character %q at offset %d is only legal in an authority", string(rune(c)), i)
+			}
 		default:
 			return fmt.Errorf("character %q at offset %d must be percent-escaped", string(rune(c)), i)
 		}
 	}
 	return nil
+}
+
+// authoritySpan locates the authority component, if the URI has one, as
+// a half-open byte range. It returns an empty range when there is none,
+// so no offset can fall inside it.
+func authoritySpan(raw string) (start, end int) {
+	colon := strings.Index(raw, ":")
+	if colon < 0 || !strings.HasPrefix(raw[colon+1:], "//") {
+		return 0, 0
+	}
+	start = colon + 3
+	if i := strings.IndexByte(raw[start:], '/'); i >= 0 {
+		return start, start + i
+	}
+	return start, len(raw)
 }
 
 func isHexDigit(c byte) bool {

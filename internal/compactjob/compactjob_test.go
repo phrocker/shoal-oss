@@ -482,6 +482,9 @@ func TestTranslateRefusesUnparsableFilePaths(t *testing.T) {
 		// raw URI, so it cannot survive there.
 		{"escaped tablet directory", "hdfs://nn/accumulo/tables/2/t%2D0001/F0002.rf", `escapes "%2D" inside the path`},
 		{"escaped table id", "hdfs://nn/accumulo/tables/%32/t-0001/F0002.rf", `escapes "%32" inside the path`},
+		// URI allows brackets only around an IPv6 host.
+		{"bracket in a segment", "hdfs://nn/accumulo/tables/2/t[0]/F0002.rf", `"[" at offset 29 is only legal in an authority`},
+		{"bracket with no authority", "hdfs:/accumulo/tables/2/t[0]/F0002.rf", "only legal in an authority"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			job := validJob()
@@ -572,6 +575,20 @@ func TestTranslateAcceptsAnUnauthoritativeVolume(t *testing.T) {
 // the four segments it rebuilds from the decoded path cannot carry one.
 func TestTranslateAcceptsAnEscapeInTheVolume(t *testing.T) {
 	const path = "hdfs://nn/vol%20two/accumulo/tables/2/t-0001/F0002.rf"
+	job := validJob()
+	job.Files[1].MetadataFileEntry = storedFile(path)
+
+	plan := mustTranslate(t, job, Options{})
+	if got := plan.Inputs[1].Path; got != path {
+		t.Fatalf("input path = %q, want %q", got, path)
+	}
+}
+
+// TestTranslateAcceptsAnIPv6Volume keeps the URI character check from
+// refusing a namenode addressed by an IPv6 literal, which is the one
+// place java.net.URI allows brackets.
+func TestTranslateAcceptsAnIPv6Volume(t *testing.T) {
+	const path = "hdfs://[2001:db8::1]:9000/accumulo/tables/2/t-0001/F0002.rf"
 	job := validJob()
 	job.Files[1].MetadataFileEntry = storedFile(path)
 
