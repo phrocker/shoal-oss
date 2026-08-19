@@ -198,15 +198,20 @@ func TestCopyWithSHA256PreservesDestinationOnReadFailure(t *testing.T) {
 
 func TestCopyWithSHA256AbortsDestinationOnShortWrite(t *testing.T) {
 	src := exportFileBackend{file: &exportReadFuncFile{
-		size: 2,
+		size: 3,
 		read: func(p []byte, off int64) (int, error) {
-			copy(p, "xy")
-			return 2, nil
+			switch off {
+			case 0:
+				copy(p, []byte("xyz"))
+				return 3, io.EOF
+			default:
+				return 0, io.EOF
+			}
 		},
 	}}
 	dst := newExportTrackingBackend()
-	dst.shortWrite = true
 	dst.files["/dst.rf"] = []byte("old")
+	dst.shortWrite = 1
 
 	written, sum, bcVersion, err := copyWithSHA256(context.Background(), src, "/src.rf", dst, "/dst.rf")
 	if !errors.Is(err, io.ErrShortWrite) {
@@ -280,7 +285,7 @@ func (f *exportReadFuncFile) Size() int64 {
 type exportTrackingBackend struct {
 	files      map[string][]byte
 	lastWriter *exportTrackingWriter
-	shortWrite bool
+	shortWrite int
 }
 
 func newExportTrackingBackend() *exportTrackingBackend {
@@ -304,17 +309,16 @@ type exportTrackingWriter struct {
 	stagePresent bool
 	abortCalls   int
 	closed       bool
-	shortWrite   bool
+	shortWrite   int
 }
 
 func (w *exportTrackingWriter) Write(p []byte) (int, error) {
 	w.stagePresent = true
-	if w.shortWrite && len(p) > 0 {
-		n := len(p) - 1
-		_, _ = w.stage.Write(p[:n])
+	if w.shortWrite > 0 && len(p) > w.shortWrite {
+		n, _ := w.stage.WriteString(string(p[:w.shortWrite]))
 		return n, nil
 	}
-	return w.stage.Write(p)
+	return w.stage.WriteString(string(p))
 }
 
 func (w *exportTrackingWriter) Close() error {

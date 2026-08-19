@@ -844,74 +844,70 @@ func TestBackendCreateWithCustomServiceClientAuthorizationProviderPromotesStage(
 	}
 }
 
-func TestTemporaryBlockIDUsesWriteIdentityAndFixedLength(t *testing.T) {
-	writeA0 := temporaryBlockID("write-a", 0)
-	writeA1 := temporaryBlockID("write-a", 1)
-	writeB0 := temporaryBlockID("write-b", 0)
+func TestPromoteStagedBlobUsesSingleConditionalUploadForLargeSources(t *testing.T) {
+	promoter := &fakeAzureBlobPromoter{}
+	stageETag := azcore.ETag("\"stage\"")
+	targetETag := azcore.ETag("\"target\"")
+	writeID := "write-id"
+	auth := "Bearer token"
 
-	if writeA0 == writeB0 {
-		t.Fatalf("different writes produced the same block ID %q", writeA0)
+	err := promoteStagedBlob(
+		context.Background(),
+		promoter,
+		azureCopySource{
+			url:           "https://example.invalid/stage",
+			authorization: &auth,
+		},
+		azureObjectState{
+			etag:     &stageETag,
+			size:     int64(2*(100<<20) + 1),
+			metadata: map[string]*string{"shoal-write-id": &writeID},
+		},
+		true,
+		azureObjectState{etag: &targetETag},
+	)
+	if err != nil {
+		t.Fatalf("promoteStagedBlob: %v", err)
 	}
-	if writeA0 == writeA1 {
-		t.Fatalf("different block indexes produced the same block ID %q", writeA0)
+	if len(promoter.calls) != 1 {
+		t.Fatalf("upload calls = %d, want 1", len(promoter.calls))
 	}
-	if len(writeA0) != len(writeA1) || len(writeA0) != len(writeB0) {
-		t.Fatalf("block ID lengths = %d, %d, %d; want equal fixed length", len(writeA0), len(writeA1), len(writeB0))
+	call := promoter.calls[0]
+	if call.source != "https://example.invalid/stage" {
+		t.Fatalf("source URL = %q, want stage URL", call.source)
+	}
+	if call.authorization == nil || *call.authorization != auth {
+		t.Fatalf("source authorization = %v, want %q", call.authorization, auth)
+	}
+	if call.sourceIfMatch == nil || !call.sourceIfMatch.Equals(stageETag) {
+		t.Fatalf("source If-Match = %v, want %v", call.sourceIfMatch, stageETag)
+	}
+	if call.ifMatch == nil || !call.ifMatch.Equals(targetETag) {
+		t.Fatalf("target If-Match = %v, want %v", call.ifMatch, targetETag)
+	}
+	if call.copySourceBlobProperties == nil || *call.copySourceBlobProperties {
+		t.Fatalf("CopySourceBlobProperties = %v, want false", call.copySourceBlobProperties)
+	}
+	if got := metadataValue(call.metadata, "shoal-write-id"); got != writeID {
+		t.Fatalf("metadata shoal-write-id = %q, want %q", got, writeID)
 	}
 }
 
-func TestPromoteStagedBlobWriteScopedBlockIDsPreventCrossCommitBytes(t *testing.T) {
-	promoter := &fakeAzureBlockPromoter{
-		sources: map[string]string{
-			"https://example.invalid/stage-a": "alpha",
-			"https://example.invalid/stage-b": "bravo",
-		},
-	}
-
-	blocksA, err := stagePromotionBlocks(
+func TestPromoteStagedBlobFailureDoesNotStageDestinationBlocks(t *testing.T) {
+	promoter := &fakeAzureBlobPromoter{err: errors.New("upload failed")}
+	err := promoteStagedBlob(
 		context.Background(),
 		promoter,
-		azureCopySource{url: "https://example.invalid/stage-a"},
-		azureObjectState{size: int64(len("alpha"))},
-		"write-a",
+		azureCopySource{url: "https://example.invalid/stage"},
+		azureObjectState{size: int64(3 * (100 << 20))},
+		false,
+		azureObjectState{},
 	)
-	if err != nil {
-		t.Fatalf("stage writer A: %v", err)
+	if !errors.Is(err, promoter.err) {
+		t.Fatalf("promoteStagedBlob error = %v, want %v", err, promoter.err)
 	}
-	blocksB, err := stagePromotionBlocks(
-		context.Background(),
-		promoter,
-		azureCopySource{url: "https://example.invalid/stage-b"},
-		azureObjectState{size: int64(len("bravo"))},
-		"write-b",
-	)
-	if err != nil {
-		t.Fatalf("stage writer B: %v", err)
-	}
-	if err := commitPromotionBlocks(
-		context.Background(), promoter, blocksA, azureObjectState{}, false, azureObjectState{},
-	); err != nil {
-		t.Fatalf("commit writer A: %v", err)
-	}
-	if got := promoter.committedData; got != "alpha" {
-		t.Fatalf("committed data = %q, want alpha", got)
-	}
-	if err := commitPromotionBlocks(
-		context.Background(), promoter, blocksB, azureObjectState{}, false, azureObjectState{},
-	); err == nil {
-		t.Fatal("competing writer B unexpectedly committed")
-	}
-	if got := promoter.committedData; got != "alpha" {
-		t.Fatalf("losing writer changed committed data to %q, want alpha", got)
-	}
-	if len(promoter.stageCalls) != 2 {
-		t.Fatalf("stage calls = %d, want 2", len(promoter.stageCalls))
-	}
-	if promoter.stageCalls[0].blockID == promoter.stageCalls[1].blockID {
-		t.Fatalf("block IDs collided across writers: %q", promoter.stageCalls[0].blockID)
-	}
-	if len(promoter.stageCalls[0].blockID) != len(promoter.stageCalls[1].blockID) {
-		t.Fatalf("block ID lengths = %d and %d, want equal length", len(promoter.stageCalls[0].blockID), len(promoter.stageCalls[1].blockID))
+	if len(promoter.calls) != 1 {
+		t.Fatalf("upload calls = %d, want 1", len(promoter.calls))
 	}
 }
 
@@ -1311,65 +1307,49 @@ func TestWriter_AbortTreatsUnownedStageAsAlreadyCleanAfterAmbiguousUpload(t *tes
 	}
 }
 
-type fakeAzureBlockStageCall struct {
-	blockID string
+type fakeAzureUploadCall struct {
+	source                   string
+	authorization            *string
+	metadata                 map[string]*string
+	ifMatch                  *azcore.ETag
+	ifNoneMatch              *azcore.ETag
+	sourceIfMatch            *azcore.ETag
+	copySourceBlobProperties *bool
 }
 
-type fakeAzureBlockPromoter struct {
-	sources       map[string]string
-	uncommitted   map[string][]byte
-	committedData string
-	committed     bool
-	stageCalls    []fakeAzureBlockStageCall
+type fakeAzureBlobPromoter struct {
+	calls []fakeAzureUploadCall
+	err   error
 }
 
-func (p *fakeAzureBlockPromoter) StageBlockFromURL(
+func (p *fakeAzureBlobPromoter) UploadBlobFromURL(
 	ctx context.Context,
-	blockID, source string,
-	options *blockblob.StageBlockFromURLOptions,
+	source string,
+	options *blockblob.UploadBlobFromURLOptions,
 ) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if p.uncommitted == nil {
-		p.uncommitted = make(map[string][]byte)
+	call := fakeAzureUploadCall{
+		source:                   source,
+		copySourceBlobProperties: options.CopySourceBlobProperties,
 	}
-	data, ok := p.sources[source]
-	if !ok {
-		return fmt.Errorf("unknown source %s", source)
+	if options.CopySourceAuthorization != nil {
+		authorization := *options.CopySourceAuthorization
+		call.authorization = &authorization
 	}
-	start := int(options.Range.Offset)
-	end := start + int(options.Range.Count)
-	if start < 0 || end < start || end > len(data) {
-		return fmt.Errorf("range %d:%d out of bounds for %s", start, end, source)
+	if options.Metadata != nil {
+		call.metadata = cloneMetadataPtr(options.Metadata)
 	}
-	p.uncommitted[blockID] = append([]byte(nil), data[start:end]...)
-	p.stageCalls = append(p.stageCalls, fakeAzureBlockStageCall{blockID: blockID})
-	return nil
-}
-
-func (p *fakeAzureBlockPromoter) CommitBlockList(
-	ctx context.Context,
-	blockIDs []string,
-	options *blockblob.CommitBlockListOptions,
-) error {
-	if err := ctx.Err(); err != nil {
-		return err
+	if options.AccessConditions != nil && options.AccessConditions.ModifiedAccessConditions != nil {
+		call.ifMatch = options.AccessConditions.ModifiedAccessConditions.IfMatch
+		call.ifNoneMatch = options.AccessConditions.ModifiedAccessConditions.IfNoneMatch
 	}
-	if p.committed &&
-		options != nil &&
-		options.AccessConditions != nil &&
-		options.AccessConditions.ModifiedAccessConditions != nil &&
-		options.AccessConditions.ModifiedAccessConditions.IfNoneMatch != nil {
-		return &azcore.ResponseError{ErrorCode: string(bloberror.ConditionNotMet)}
+	if options.SourceModifiedAccessConditions != nil {
+		call.sourceIfMatch = options.SourceModifiedAccessConditions.SourceIfMatch
 	}
-	var committed bytes.Buffer
-	for _, blockID := range blockIDs {
-		committed.Write(p.uncommitted[blockID])
-	}
-	p.committedData = committed.String()
-	p.committed = true
-	return nil
+	p.calls = append(p.calls, call)
+	return p.err
 }
 
 type recordingTokenCredential struct {
@@ -1411,6 +1391,22 @@ func TestFile_ReadAt_EdgeCases(t *testing.T) {
 	if !errors.Is(err, io.EOF) {
 		t.Errorf("off>size ReadAt: got %v, want io.EOF", err)
 	}
+}
+
+func cloneMetadataPtr(metadata map[string]*string) map[string]*string {
+	if len(metadata) == 0 {
+		return nil
+	}
+	clone := make(map[string]*string, len(metadata))
+	for key, value := range metadata {
+		if value == nil {
+			clone[key] = nil
+			continue
+		}
+		copied := *value
+		clone[key] = &copied
+	}
+	return clone
 }
 
 func captureDefaultLogger(t *testing.T, buf *bytes.Buffer) func() {

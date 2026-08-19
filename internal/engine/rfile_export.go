@@ -371,16 +371,17 @@ func copyWithSHA256(ctx context.Context, src storage.Backend, srcPath string, ds
 		n, rerr := in.ReadAt(buf[:want], written)
 		if n > 0 {
 			chunk := buf[:n]
-			nw, err := out.Write(chunk)
-			if err != nil {
-				return written, "", "", fmt.Errorf("engine: write export %s: %w", dstPath, err)
+			wrote, werr := out.Write(chunk)
+			if wrote > 0 {
+				_, _ = h.Write(chunk[:wrote])
+				written += int64(wrote)
 			}
-			if nw != len(chunk) {
-				written += int64(nw)
+			if werr != nil {
+				return written, "", "", fmt.Errorf("engine: write export %s: %w", dstPath, werr)
+			}
+			if wrote != len(chunk) {
 				return written, "", "", fmt.Errorf("engine: write export %s: %w", dstPath, io.ErrShortWrite)
 			}
-			_, _ = h.Write(chunk)
-			written += int64(n)
 		}
 		if rerr != nil {
 			if errors.Is(rerr, io.EOF) {

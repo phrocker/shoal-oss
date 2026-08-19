@@ -53,10 +53,13 @@ func (b *Backend) Open(_ context.Context, path string) (storage.File, error) {
 // regular-file mode bits (including setuid/setgid/sticky) are preserved
 // everywhere; on Unix we also preserve owner/group, and on Linux and Darwin we
 // preserve extended attributes (including xattr-backed ACLs such as Linux
-// POSIX ACLs) when the platform exposes them. New files use 0644 subject to
-// the process umask. Parent directories are created with 0755 if they don't
-// already exist — matches "mkdir -p" behavior so callers don't have to pre-
-// create the path tree.
+// POSIX ACLs) when the platform exposes them. On Plan 9, the platform lacks
+// hard-link snapshots, so replacement falls back to a best-effort rename-based
+// sequence that restores the old file on failure but cannot keep the target
+// continuously visible. New files use 0644 subject to the process umask.
+// Parent directories are created with 0755 if they don't already exist —
+// matches "mkdir -p" behavior so callers don't have to pre-create the path
+// tree.
 func (b *Backend) Create(_ context.Context, path string) (storage.Writer, error) {
 	if isReplacementArtifactName(filepath.Base(path)) {
 		return nil, fmt.Errorf("local: destination %s uses a reserved internal namespace", path)
@@ -157,6 +160,11 @@ type replacementOps interface {
 	Remove(string) error
 	AtomicReplace(temp, target, backup string, hadOld bool) error
 	AtomicRestore(target, backup string) error
+}
+
+type durableReplacementOps interface {
+	SyncPath(string) error
+	SyncParent(string) error
 }
 
 type osReplacementOps struct{}
@@ -342,6 +350,9 @@ func (w *writer) Close() error {
 	w.fileClosed = true
 
 	if err := w.commitReplacement(); err != nil {
+		if storage.IsCommittedWriteError(err) {
+			w.closed = true
+		}
 		return err
 	}
 	w.closed = true
@@ -352,6 +363,9 @@ func (w *writer) commitReplacement() error {
 	hadOld, err := preserveExistingMetadata(w.ops, w.temp, w.target)
 	if err != nil {
 		return err
+	}
+	if err := syncReplacementPath(w.ops, w.temp); err != nil {
+		return fmt.Errorf("local: sync replacement file %s: %w", w.temp, err)
 	}
 
 	backup, err := w.publishReplacement(hadOld)
@@ -368,25 +382,34 @@ func (w *writer) commitReplacement() error {
 		return publishErr
 	}
 	w.state = replacementPublished
+	if err := syncReplacementParent(w.ops, w.target); err != nil {
+		w.state = replacementCommitted
+		return storage.MarkCommittedWrite(
+			fmt.Errorf("local: replacement for %s committed but parent directory sync failed: %w", w.target, err),
+		)
+	}
 	if hadOld {
+		var committedErr error
 		if err := w.ops.Remove(backup); err != nil && !errors.Is(err, fs.ErrNotExist) {
-			cleanupErr := fmt.Errorf("local: remove replacement backup %s: %w", backup, err)
-			if rollbackErr := w.rollbackPublishedReplacement(backup); rollbackErr != nil {
-				return errors.Join(cleanupErr, rollbackErr)
-			}
-			return cleanupErr
+			committedErr = errors.Join(
+				committedErr,
+				fmt.Errorf("local: remove replacement backup %s: %w", backup, err),
+			)
+		}
+		if err := syncReplacementParent(w.ops, backup); err != nil {
+			committedErr = errors.Join(
+				committedErr,
+				fmt.Errorf("local: sync parent directory after replacement cleanup for %s: %w", w.target, err),
+			)
+		}
+		if committedErr != nil {
+			w.state = replacementCommitted
+			return storage.MarkCommittedWrite(
+				fmt.Errorf("local: replacement for %s committed but cleanup was incomplete: %w", w.target, committedErr),
+			)
 		}
 	}
 	w.state = replacementCommitted
-	return nil
-}
-
-func (w *writer) rollbackPublishedReplacement(backup string) error {
-	if err := w.ops.AtomicRestore(w.target, backup); err != nil {
-		w.state = replacementPublished
-		return fmt.Errorf("local: atomically restore existing file %s from %s: %w", w.target, backup, err)
-	}
-	w.state = replacementStaged
 	return nil
 }
 
@@ -418,4 +441,20 @@ func (w *writer) Abort() error {
 	}
 	w.aborted = true
 	return nil
+}
+
+func syncReplacementPath(ops replacementOps, path string) error {
+	durable, ok := ops.(durableReplacementOps)
+	if !ok {
+		return nil
+	}
+	return durable.SyncPath(path)
+}
+
+func syncReplacementParent(ops replacementOps, path string) error {
+	durable, ok := ops.(durableReplacementOps)
+	if !ok {
+		return nil
+	}
+	return durable.SyncParent(path)
 }

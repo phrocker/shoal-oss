@@ -71,6 +71,17 @@ func TestCleanupUnsuccessfulWriteUsesAbort(t *testing.T) {
 	}
 }
 
+func TestCleanupUnsuccessfulWriteSkipsAbortAfterCommittedWrite(t *testing.T) {
+	primary := storage.MarkCommittedWrite(errors.New("write committed but cleanup failed"))
+	w := &abortTrackingWriter{}
+	if err := storage.CleanupUnsuccessfulWrite(primary, w); !errors.Is(err, primary) {
+		t.Fatalf("CleanupUnsuccessfulWrite error = %v, want committed primary error", err)
+	}
+	if w.aborted {
+		t.Fatal("CleanupUnsuccessfulWrite aborted a committed writer")
+	}
+}
+
 func TestCopy_MemoryToMemory(t *testing.T) {
 	src := memory.New()
 	src.Put("/src/x", []byte("the contents of x"))

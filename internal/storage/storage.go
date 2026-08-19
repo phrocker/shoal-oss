@@ -115,6 +115,30 @@ var ErrNotFound = errors.New("storage: not found")
 // not implement WritableBackend.
 var ErrReadOnly = errors.New("storage: backend is read-only")
 
+type committedWriteError struct {
+	err error
+}
+
+func (e committedWriteError) Error() string { return e.err.Error() }
+func (e committedWriteError) Unwrap() error { return e.err }
+
+// MarkCommittedWrite marks err as describing a write that already committed.
+// Callers can still return the error, but cleanup helpers will avoid aborting a
+// write that can no longer be rolled back.
+func MarkCommittedWrite(err error) error {
+	if err == nil || IsCommittedWriteError(err) {
+		return err
+	}
+	return committedWriteError{err: err}
+}
+
+// IsCommittedWriteError reports whether err describes a write that already
+// committed and therefore must not be aborted during deferred cleanup.
+func IsCommittedWriteError(err error) bool {
+	var committed committedWriteError
+	return errors.As(err, &committed)
+}
+
 // Copy copies an object from src to dst across (potentially different)
 // backends. Useful for "pull a small RFile from GCS to local disk for
 // debugging" workflows. dst must be a WritableBackend.
@@ -320,6 +344,9 @@ func joinContextCallError(callErr, ctxErr error) error {
 func CleanupUnsuccessfulWrite(primaryErr error, w Writer) error {
 	if primaryErr == nil {
 		return nil
+	}
+	if IsCommittedWriteError(primaryErr) {
+		return primaryErr
 	}
 	var cleanupErr error
 	if aborter, ok := w.(Aborter); ok {

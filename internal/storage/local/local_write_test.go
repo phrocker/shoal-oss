@@ -256,14 +256,10 @@ func TestLocal_CreateRejectsDirectoryTarget(t *testing.T) {
 	}
 }
 
-func TestLocal_BackupRemovalFailureRollsBackReplacement(t *testing.T) {
+func TestLocal_BackupRemovalFailureReturnsCommittedWriteError(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "target")
 	if err := os.WriteFile(path, []byte("old"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	originalInfo, err := os.Stat(path)
-	if err != nil {
 		t.Fatal(err)
 	}
 
@@ -273,37 +269,25 @@ func TestLocal_BackupRemovalFailureRollsBackReplacement(t *testing.T) {
 	}
 	localWriter := w.(*writer)
 	removeErr := errors.New("injected backup removal failure")
-	rollbackOps := &blockingRollbackOps{
+	ops := &committedCleanupFailureOps{
 		replacementOps: localWriter.ops,
 		err:            removeErr,
-		entered:        make(chan struct{}),
-		release:        make(chan struct{}),
 	}
-	localWriter.ops = rollbackOps
+	localWriter.ops = ops
 	if _, err := w.Write([]byte("new")); err != nil {
 		t.Fatal(err)
 	}
-	done := make(chan error, 1)
-	go func() { done <- w.Close() }()
-	<-rollbackOps.entered
-	for range 100 {
-		got, err := os.ReadFile(path)
-		if err != nil {
-			t.Fatalf("observer saw target missing before rollback: %v", err)
-		}
-		if string(got) != "new" {
-			t.Fatalf("observer saw %q before atomic rollback, want new", got)
-		}
-	}
-	close(rollbackOps.release)
-	err = <-done
+	err = w.Close()
 	if !errors.Is(err, removeErr) {
 		t.Fatalf("Close error = %v, want %v", err, removeErr)
 	}
-	if got := filepath.Dir(rollbackOps.backupPath); got != dir {
+	if !storage.IsCommittedWriteError(err) {
+		t.Fatalf("Close error = %v, want committed-write marker", err)
+	}
+	if got := filepath.Dir(ops.backupPath); got != dir {
 		t.Fatalf("backup directory = %s, want %s", got, dir)
 	}
-	if base := filepath.Base(rollbackOps.backupPath); !strings.HasPrefix(base, replacementBackupPrefix) {
+	if base := filepath.Base(ops.backupPath); !strings.HasPrefix(base, replacementBackupPrefix) {
 		t.Fatalf("backup name = %q, want prefix %q", base, replacementBackupPrefix)
 	} else if got, want := len(base), len(replacementBackupPrefix)+replacementNameTokenBytes*2; got != want {
 		t.Fatalf("backup name length = %d, want %d", got, want)
@@ -313,23 +297,84 @@ func TestLocal_BackupRemovalFailureRollsBackReplacement(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(got) != "old" {
-		t.Fatalf("target contents = %q, want original data", got)
+	if string(got) != "new" {
+		t.Fatalf("target contents = %q, want committed replacement", got)
 	}
-	info, err := os.Stat(path)
+	if got, err := os.ReadFile(ops.backupPath); err != nil || string(got) != "old" {
+		t.Fatalf("backup contents = %q, %v; want old", got, err)
+	}
+	if err := w.(storage.Aborter).Abort(); err == nil || !strings.Contains(err.Error(), "already closed") {
+		t.Fatalf("Abort after committed cleanup failure = %v, want already closed", err)
+	}
+}
+
+func TestLocal_CloseDurablySyncsReplacementBeforeAndAfterRename(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "target")
+	if err := os.WriteFile(path, []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	w, err := New().Create(context.Background(), path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if gotMode, wantMode := info.Mode().Perm(), originalInfo.Mode().Perm(); gotMode != wantMode {
-		t.Fatalf("target mode = %04o, want original mode %04o", gotMode, wantMode)
+	localWriter := w.(*writer)
+	ops := &durabilityRecordingOps{replacementOps: localWriter.ops}
+	localWriter.ops = ops
+
+	originalPreservePlatformMetadata := preservePlatformMetadataFn
+	t.Cleanup(func() { preservePlatformMetadataFn = originalPreservePlatformMetadata })
+	preservePlatformMetadataFn = func(_, _ string) error {
+		ops.events = append(ops.events, "platform")
+		return nil
 	}
-	if err := w.(storage.Aborter).Abort(); err != nil {
-		t.Fatalf("Abort after rollback: %v", err)
-	}
-	if matches, err := filepath.Glob(filepath.Join(dir, ".shoal-*")); err != nil {
+
+	if _, err := w.Write([]byte("new")); err != nil {
 		t.Fatal(err)
-	} else if len(matches) != 0 {
-		t.Fatalf("replacement artifacts remain: %v", matches)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if got, want := ops.events, []string{"platform", "chmod", "sync-temp", "replace", "sync-parent", "remove-backup", "sync-parent"}; !equalStringSlices(got, want) {
+		t.Fatalf("durability events = %v, want %v", got, want)
+	}
+}
+
+func TestLocal_CloseParentSyncFailureAfterRenameReturnsCommittedWriteError(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "target")
+	if err := os.WriteFile(path, []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	w, err := New().Create(context.Background(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	localWriter := w.(*writer)
+	ops := &durabilityRecordingOps{
+		replacementOps:      localWriter.ops,
+		syncParentFailAfter: 1,
+		syncParentErr:       errors.New("directory sync failed"),
+	}
+	localWriter.ops = ops
+
+	if _, err := w.Write([]byte("new")); err != nil {
+		t.Fatal(err)
+	}
+	err = w.Close()
+	if !errors.Is(err, ops.syncParentErr) {
+		t.Fatalf("Close error = %v, want %v", err, ops.syncParentErr)
+	}
+	if !storage.IsCommittedWriteError(err) {
+		t.Fatalf("Close error = %v, want committed-write marker", err)
+	}
+	if got, err := os.ReadFile(path); err != nil || string(got) != "new" {
+		t.Fatalf("target contents = %q, %v; want committed replacement", got, err)
+	}
+	if err := w.(storage.Aborter).Abort(); err == nil || !strings.Contains(err.Error(), "already closed") {
+		t.Fatalf("Abort after committed parent-sync failure = %v, want already closed", err)
 	}
 }
 
@@ -816,6 +861,20 @@ func (o *blockingRollbackOps) AtomicRestore(target, backup string) error {
 	return o.replacementOps.AtomicRestore(target, backup)
 }
 
+type committedCleanupFailureOps struct {
+	replacementOps
+	err        error
+	backupPath string
+}
+
+func (o *committedCleanupFailureOps) Remove(name string) error {
+	if strings.Contains(name, replacementBackupPrefix) {
+		o.backupPath = name
+		return o.err
+	}
+	return o.replacementOps.Remove(name)
+}
+
 type recordingRemoveOps struct {
 	replacementOps
 	removed []string
@@ -869,6 +928,45 @@ func (*metadataRecordingOps) Remove(string) error                              {
 func (*metadataRecordingOps) AtomicReplace(string, string, string, bool) error { return nil }
 func (*metadataRecordingOps) AtomicRestore(string, string) error               { return nil }
 
+type durabilityRecordingOps struct {
+	replacementOps
+	events              []string
+	syncParentCalls     int
+	syncParentFailAfter int
+	syncParentErr       error
+}
+
+func (o *durabilityRecordingOps) Chmod(name string, mode os.FileMode) error {
+	o.events = append(o.events, "chmod")
+	return o.replacementOps.Chmod(name, mode)
+}
+
+func (o *durabilityRecordingOps) AtomicReplace(temp, target, backup string, hadOld bool) error {
+	o.events = append(o.events, "replace")
+	return o.replacementOps.AtomicReplace(temp, target, backup, hadOld)
+}
+
+func (o *durabilityRecordingOps) Remove(name string) error {
+	if strings.Contains(name, replacementBackupPrefix) {
+		o.events = append(o.events, "remove-backup")
+	}
+	return o.replacementOps.Remove(name)
+}
+
+func (o *durabilityRecordingOps) SyncPath(string) error {
+	o.events = append(o.events, "sync-temp")
+	return nil
+}
+
+func (o *durabilityRecordingOps) SyncParent(string) error {
+	o.events = append(o.events, "sync-parent")
+	o.syncParentCalls++
+	if o.syncParentFailAfter > 0 && o.syncParentCalls >= o.syncParentFailAfter {
+		return o.syncParentErr
+	}
+	return nil
+}
+
 type stubFileInfo struct {
 	mode os.FileMode
 }
@@ -879,3 +977,15 @@ func (i stubFileInfo) Mode() os.FileMode  { return i.mode }
 func (i stubFileInfo) ModTime() time.Time { return time.Time{} }
 func (i stubFileInfo) IsDir() bool        { return i.mode.IsDir() }
 func (i stubFileInfo) Sys() any           { return nil }
+
+func equalStringSlices(got, want []string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			return false
+		}
+	}
+	return true
+}

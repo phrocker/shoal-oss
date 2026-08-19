@@ -45,8 +45,6 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
-	"encoding/base64"
-	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -384,9 +382,7 @@ const (
 	tempStageRandomHexLen = 10
 	tempStageComponentLen = len(tempStageNamePrefix) + tempStageHashHexLen + tempStageRandomHexLen
 	legacyStageDirPrefix  = ".shoal-tmp/"
-	azureCopyBlockSize    = 100 << 20
 	azureSourceSASExpiry  = 5 * time.Minute
-	azureBlockIDHashBytes = 16
 )
 
 var randomStageNameToken = func() (string, error) {
@@ -770,88 +766,35 @@ func (o sdkAzureWriteOperations) promote(
 	bb := o.svc.NewContainerClient(containerName).NewBlockBlobClient(name)
 	return promoteStagedBlob(
 		ctx,
-		sdkAzureBlockPromoter{client: bb},
+		sdkAzureBlobPromoter{client: bb},
 		source,
 		stage,
-		writeID,
 		targetExists,
 		target,
 	)
 }
 
-type azureBlockPromoter interface {
-	StageBlockFromURL(context.Context, string, string, *blockblob.StageBlockFromURLOptions) error
-	CommitBlockList(context.Context, []string, *blockblob.CommitBlockListOptions) error
+type azureBlobPromoter interface {
+	UploadBlobFromURL(context.Context, string, *blockblob.UploadBlobFromURLOptions) error
 }
 
-type sdkAzureBlockPromoter struct {
+type sdkAzureBlobPromoter struct {
 	client *blockblob.Client
 }
 
-func (p sdkAzureBlockPromoter) StageBlockFromURL(
+func (p sdkAzureBlobPromoter) UploadBlobFromURL(
 	ctx context.Context,
-	blockID, source string,
-	options *blockblob.StageBlockFromURLOptions,
+	source string,
+	options *blockblob.UploadBlobFromURLOptions,
 ) error {
-	_, err := p.client.StageBlockFromURL(ctx, blockID, source, options)
-	return err
-}
-
-func (p sdkAzureBlockPromoter) CommitBlockList(
-	ctx context.Context,
-	blockIDs []string,
-	options *blockblob.CommitBlockListOptions,
-) error {
-	_, err := p.client.CommitBlockList(ctx, blockIDs, options)
+	_, err := p.client.UploadBlobFromURL(ctx, source, options)
 	return err
 }
 
 func promoteStagedBlob(
 	ctx context.Context,
-	promoter azureBlockPromoter,
+	promoter azureBlobPromoter,
 	source azureCopySource,
-	stage azureObjectState,
-	writeID string,
-	targetExists bool,
-	target azureObjectState,
-) error {
-	blockIDs, err := stagePromotionBlocks(ctx, promoter, source, stage, writeID)
-	if err != nil {
-		return err
-	}
-	return commitPromotionBlocks(ctx, promoter, blockIDs, stage, targetExists, target)
-}
-
-func stagePromotionBlocks(
-	ctx context.Context,
-	promoter azureBlockPromoter,
-	source azureCopySource,
-	stage azureObjectState,
-	writeID string,
-) ([]string, error) {
-	blockIDs := make([]string, 0, max(1, int((stage.size+azureCopyBlockSize-1)/azureCopyBlockSize)))
-	for offset, index := int64(0), 0; offset < stage.size; offset, index = offset+azureCopyBlockSize, index+1 {
-		count := min(stage.size-offset, int64(azureCopyBlockSize))
-		blockID := temporaryBlockID(writeID, index)
-		options := &blockblob.StageBlockFromURLOptions{
-			CopySourceAuthorization: source.authorization,
-			SourceModifiedAccessConditions: &blob.SourceModifiedAccessConditions{
-				SourceIfMatch: stage.etag,
-			},
-			Range: blob.HTTPRange{Offset: offset, Count: count},
-		}
-		if err := promoter.StageBlockFromURL(ctx, blockID, source.url, options); err != nil {
-			return nil, err
-		}
-		blockIDs = append(blockIDs, blockID)
-	}
-	return blockIDs, nil
-}
-
-func commitPromotionBlocks(
-	ctx context.Context,
-	promoter azureBlockPromoter,
-	blockIDs []string,
 	stage azureObjectState,
 	targetExists bool,
 	target azureObjectState,
@@ -862,23 +805,17 @@ func commitPromotionBlocks(
 	} else {
 		conditions.IfNoneMatch = to.Ptr(azcore.ETagAny)
 	}
-	if err := promoter.CommitBlockList(ctx, blockIDs, &blockblob.CommitBlockListOptions{
-		Metadata: stage.metadata,
+	return promoter.UploadBlobFromURL(ctx, source.url, &blockblob.UploadBlobFromURLOptions{
+		CopySourceAuthorization:  source.authorization,
+		CopySourceBlobProperties: to.Ptr(false),
+		Metadata:                 stage.metadata,
+		SourceModifiedAccessConditions: &blob.SourceModifiedAccessConditions{
+			SourceIfMatch: stage.etag,
+		},
 		AccessConditions: &blob.AccessConditions{
 			ModifiedAccessConditions: conditions,
 		},
-	}); err != nil {
-		return err
-	}
-	return nil
-}
-
-func temporaryBlockID(writeID string, index int) string {
-	identity := sha256.Sum256([]byte(writeID))
-	raw := make([]byte, 0, azureBlockIDHashBytes+4)
-	raw = append(raw, identity[:azureBlockIDHashBytes]...)
-	raw = binary.BigEndian.AppendUint32(raw, uint32(index))
-	return base64.StdEncoding.EncodeToString(raw)
+	})
 }
 
 func (o sdkAzureWriteOperations) deleteStage(
