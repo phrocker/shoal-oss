@@ -931,6 +931,94 @@ func TestStreamCloseAfterDrainingReportsNoError(t *testing.T) {
 	}
 }
 
+func splitTablets() []metadata.TabletInfo {
+	return []metadata.TabletInfo{
+		{TableID: "1", EndRow: []byte("b"), Location: &metadata.Location{HostPort: "ts1:9997", Session: "a"}},
+		{TableID: "1", PrevRow: []byte("b"), EndRow: []byte("k"), Location: &metadata.Location{HostPort: "ts2:9997", Session: "b"}},
+		{TableID: "1", PrevRow: []byte("k"), EndRow: []byte("p"), Location: &metadata.Location{HostPort: "ts2:9997", Session: "b"}},
+		{TableID: "1", PrevRow: []byte("p"), Location: &metadata.Location{HostPort: "ts3:9997", Session: "c"}},
+	}
+}
+
+func TestBatchScannerStreamReplansASegmentWhoseTabletSplit(t *testing.T) {
+	walker := &fakeTabletWalker{tablets: map[string][]metadata.TabletInfo{"1": discoveryTablets()}}
+	connector := testConnectorWithDiscovery(t, walker, &fakeTableNames{
+		byName: map[string]string{"events": "1"},
+		byID:   map[string]string{"1": "events"},
+	})
+	adapter := &fakeScannerAdapter{
+		startErrors: []error{tabletserver.NewNotServingTabletException()},
+		startResults: []*data.InitialScan{
+			nil,
+			{ScanID: 201, Result_: &data.ScanResult_{Results: []*data.TKeyValue{testEntry("a", "one")}}},
+			{ScanID: 202, Result_: &data.ScanResult_{Results: []*data.TKeyValue{testEntry("c", "two")}}},
+		},
+		onFirstStart: func() {
+			walker.mu.Lock()
+			walker.tablets["1"] = splitTablets()
+			walker.mu.Unlock()
+		},
+	}
+	connector.scan = adapter
+	batch, err := connector.NewBatchScanner(Table{Name: "events"}, ScannerOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	scanRange, _ := NewRange([]byte("a"), true, []byte("c"), true)
+	stream, err := batch.Stream(context.Background(), []*Range{scanRange})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = stream.Close() }()
+	rows := rowsOf(drainStream(t, stream))
+	if err := stream.Err(); err != nil {
+		t.Fatalf("Err = %v", err)
+	}
+	if rows != "a,c" {
+		t.Fatalf("rows = %q", rows)
+	}
+	if got := strings.Join(adapter.addresses, ","); got != "ts1:9997,ts1:9997,ts2:9997" {
+		t.Fatalf("addresses = %q", got)
+	}
+}
+
+func TestStreamRejectsARangeWhoseTabletSplitDuringRetry(t *testing.T) {
+	walker := &fakeTabletWalker{tablets: map[string][]metadata.TabletInfo{"1": discoveryTablets()}}
+	connector := testConnectorWithDiscovery(t, walker, &fakeTableNames{
+		byName: map[string]string{"events": "1"},
+		byID:   map[string]string{"1": "events"},
+	})
+	adapter := &fakeScannerAdapter{
+		startErrors:  []error{tabletserver.NewNotServingTabletException()},
+		startResults: []*data.InitialScan{nil},
+		onFirstStart: func() {
+			walker.mu.Lock()
+			walker.tablets["1"] = splitTablets()
+			walker.mu.Unlock()
+		},
+	}
+	connector.scan = adapter
+	scanner, err := connector.NewScanner(Table{Name: "events"}, ScannerOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	scanRange, _ := NewRange([]byte("a"), true, []byte("c"), true)
+	stream, err := scanner.Stream(context.Background(), scanRange)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = stream.Close() }()
+	if got := rowsOf(drainStream(t, stream)); got != "" {
+		t.Fatalf("rows = %q", got)
+	}
+	if !errors.Is(stream.Err(), ErrRangeSpansTablets) {
+		t.Fatalf("Err = %v", stream.Err())
+	}
+	if adapter.startCalls != 1 {
+		t.Fatalf("start called %d times", adapter.startCalls)
+	}
+}
+
 type singleOnlyScanAdapter struct{}
 
 func (singleOnlyScanAdapter) Start(

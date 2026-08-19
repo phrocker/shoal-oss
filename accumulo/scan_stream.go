@@ -13,6 +13,14 @@ import (
 // ErrStreamClosed reports iteration on a result stream after Close.
 var ErrStreamClosed = errors.New("accumulo: result stream is closed")
 
+// errSourcesReplanned reports that a source split its work into new sources
+// instead of opening a session, so the stream must consult its queue again.
+var errSourcesReplanned = errors.New("accumulo: scan sources replanned")
+
+// maxSegmentReplans bounds how many times one planned segment may be re-split
+// after a stale tablet assignment before the stream gives up.
+const maxSegmentReplans = 3
+
 // ResultStream is a forward-only cursor over scan results.
 //
 // A stream holds at most one server batch at a time, so its memory use is
@@ -136,7 +144,7 @@ func (s *BatchScanner) Stream(ctx context.Context, ranges []*Range) (*ResultStre
 		}
 	} else {
 		for _, segment := range segments {
-			sources = append(sources, tabletSource{segment: segment})
+			sources = append(sources, tabletSource{segment: segment, replannable: true})
 		}
 	}
 	return newResultStream(ctx, &scanner, table, sources), nil
@@ -192,8 +200,14 @@ func (r *ResultStream) Next() bool {
 			r.fatal = err
 			return false
 		}
-		if r.session == nil && !r.openNextSession() {
-			return false
+		if r.session == nil {
+			if !r.openNextSession() {
+				return false
+			}
+			if r.session == nil {
+				// The source replanned itself into new sources.
+				continue
+			}
 		}
 		entries, more, err := r.session.fetch(r.ctx)
 		if len(entries) > 0 {
@@ -226,7 +240,8 @@ func (r *ResultStream) Next() bool {
 }
 
 // openNextSession opens the next queued source and reports whether iteration
-// may continue. It sets done when no sources remain.
+// may continue. It sets done when no sources remain, and leaves session nil
+// when a source replanned itself instead of opening.
 func (r *ResultStream) openNextSession() bool {
 	if r.next >= len(r.sources) {
 		r.done = true
@@ -235,12 +250,24 @@ func (r *ResultStream) openNextSession() bool {
 	source := r.sources[r.next]
 	r.next++
 	session, err := source.open(r.ctx, r)
+	if errors.Is(err, errSourcesReplanned) {
+		return true
+	}
 	if err != nil {
 		r.fatal = err
 		return false
 	}
 	r.session = session
 	return true
+}
+
+// prependSources queues sources ahead of the ones still waiting.
+func (r *ResultStream) prependSources(sources []streamSource) {
+	remaining := make([]streamSource, 0, len(sources)+len(r.sources)-r.next)
+	remaining = append(remaining, sources...)
+	remaining = append(remaining, r.sources[r.next:]...)
+	r.sources = remaining
+	r.next = 0
 }
 
 // finishSession drains the exhausted session, queues any follow-up sources it
@@ -257,11 +284,7 @@ func (r *ResultStream) finishSession() bool {
 		return false
 	}
 	if len(followers) > 0 {
-		remaining := make([]streamSource, 0, len(followers)+len(r.sources)-r.next)
-		remaining = append(remaining, followers...)
-		remaining = append(remaining, r.sources[r.next:]...)
-		r.sources = remaining
-		r.next = 0
+		r.prependSources(followers)
 	}
 	return true
 }
@@ -334,9 +357,16 @@ func (r *ResultStream) Close() error {
 
 // tabletSource opens a single-tablet scan session, retrying a stale tablet
 // assignment once, exactly as Scanner.Scan does. The retry happens before any
-// entry of the segment is delivered, so no row is repeated.
+// entry of the segment is delivered, so no row is repeated, and the relocated
+// tablet is rechecked against the range: if the tablet split, a batch-planned
+// segment is replanned across the new extents and a single-tablet stream
+// reports ErrRangeSpansTablets rather than scanning part of the range.
 type tabletSource struct {
 	segment batchScanSegment
+	// replannable marks segments that came from planBatchScan and may be split
+	// again when their tablet changes underneath them.
+	replannable bool
+	replans     int
 }
 
 func (t tabletSource) open(ctx context.Context, stream *ResultStream) (streamSession, error) {
@@ -350,6 +380,9 @@ func (t tabletSource) open(ctx context.Context, stream *ResultStream) (streamSes
 				ErrTabletNotLocated,
 				tablet.Extent.TableID,
 			))
+		}
+		if !t.segment.scanRange.fitsTablet(tablet) {
+			return t.handleSplitTablet(ctx, stream, tablet, priorErr)
 		}
 		session, err := startTabletSession(ctx, scanner, tablet, t.segment.scanRange)
 		if err == nil {
@@ -372,6 +405,46 @@ func (t tabletSource) open(ctx context.Context, stream *ResultStream) (streamSes
 		tablet = located
 	}
 	return nil, errors.Join(priorErr, ErrTabletNotLocated)
+}
+
+// handleSplitTablet reacts to a relocated tablet that no longer covers the
+// segment. Batch-planned segments are re-split across the new extents; a
+// single-tablet stream cannot silently read part of its range.
+func (t tabletSource) handleSplitTablet(
+	ctx context.Context,
+	stream *ResultStream,
+	tablet Tablet,
+	priorErr error,
+) (streamSession, error) {
+	spanErr := fmt.Errorf(
+		"%w: table=%s start=%q end=%q tabletEnd=%q",
+		ErrRangeSpansTablets,
+		stream.table.ID,
+		t.segment.scanRange.StartRow(),
+		t.segment.scanRange.EndRow(),
+		tablet.Extent.EndRow,
+	)
+	if !t.replannable || t.replans >= maxSegmentReplans {
+		return nil, errors.Join(priorErr, spanErr)
+	}
+	replanned, err := stream.scanner.planBatchScan(
+		ctx,
+		stream.table,
+		[]*Range{t.segment.scanRange},
+	)
+	if err != nil {
+		return nil, errors.Join(priorErr, err)
+	}
+	sources := make([]streamSource, 0, len(replanned))
+	for _, segment := range replanned {
+		sources = append(sources, tabletSource{
+			segment:     segment,
+			replannable: true,
+			replans:     t.replans + 1,
+		})
+	}
+	stream.prependSources(sources)
+	return nil, errSourcesReplanned
 }
 
 func startTabletSession(
@@ -572,7 +645,7 @@ func (m *multiSession) followers(ctx context.Context) ([]streamSource, error) {
 			return nil, err
 		}
 		for _, retry := range replanned {
-			sources = append(sources, tabletSource{segment: retry})
+			sources = append(sources, tabletSource{segment: retry, replannable: true})
 		}
 	}
 	return sources, nil
