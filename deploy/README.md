@@ -97,6 +97,8 @@ To enable TLS in the plain write-tier manifest: mount a Secret containing `tls.c
 
 With Helm TLS enabled, kubelet `httpGet` probes use `scheme: HTTPS` for `/readyz` and `/healthz`. When Helm mutual TLS is enabled, the chart switches those probes to `tcpSocket` checks against the metrics port instead, because kubelet HTTP probes cannot present a client certificate. That keeps mTLS pods schedulable/ready from Kubernetes' perspective, but the probe then proves only listener reachability rather than `/readyz`'s startup/shutdown-drain state; use a custom probe path if you need both kubelet-visible readiness semantics and client-certificate enforcement on the HTTP listener.
 
+The plain write-tier manifest has no templating, so that probe switch isn't automatic there: if you uncomment the TLS example in `deploy/k8s/write-tier.yaml`, also add `scheme: HTTPS` to its `readinessProbe`/`livenessProbe` `httpGet` blocks, or replace them with a `tcpSocket: {port: metrics}` check if you additionally uncomment `--tls-client-ca` (mutual TLS). The manifest carries an inline comment with these exact steps next to the probes.
+
 Certificate/key rotation is out of scope for this slice: `shoal-embed` loads the key pair (and CA bundle) once at startup, so rotating any of them requires a pod restart today — see the gaps list below.
 
 ## Rolling upgrades, rollback, and voluntary disruption

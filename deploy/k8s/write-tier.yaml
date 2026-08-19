@@ -100,6 +100,16 @@ spec:
             # - name: tls-credentials
             #   mountPath: /var/run/secrets/shoal/tls
             #   readOnly: true
+          # If TLS is enabled above (uncommented --tls-* args), these
+          # probes must change too: kubelet httpGet probes don't verify
+          # the server certificate, so add `scheme: HTTPS` to both probes
+          # below for plain TLS. Mutual TLS (--tls-client-ca) additionally
+          # requires a client certificate that kubelet cannot present, so
+          # httpGet cannot be used at all in that mode — replace both
+          # probes' `httpGet` block with `tcpSocket: {port: metrics}`
+          # instead (a reachability check only, not a /readyz check). The
+          # Helm chart makes this switch automatically; see
+          # deploy/helm/shoal/templates/embed-statefulset.yaml.
           readinessProbe:
             httpGet:
               path: /readyz

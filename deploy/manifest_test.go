@@ -185,6 +185,25 @@ func TestPlainManifestsCarryNoUnconditionalTLS(t *testing.T) {
 	}
 }
 
+// TestPlainManifestDocumentsTLSProbeSwitch guards write-tier.yaml's
+// operator guidance for adapting the readinessProbe/livenessProbe once
+// the commented-out TLS example is uncommented: plain YAML has no
+// conditionals, so (unlike the Helm chart's automatic switch, see
+// TestHelmWriteTierTLSProbeTemplates) an operator enabling TLS here must
+// manually add scheme: HTTPS, and switch to tcpSocket for mutual TLS. This
+// fails loudly if that guidance comment is ever removed.
+func TestPlainManifestDocumentsTLSProbeSwitch(t *testing.T) {
+	content := readManifest(t, "k8s/write-tier.yaml")
+	for _, want := range []string{
+		"scheme: HTTPS",
+		"tcpSocket",
+	} {
+		if !strings.Contains(content, want) {
+			t.Errorf("k8s/write-tier.yaml: want probe-guidance comment to mention %q", want)
+		}
+	}
+}
+
 // TestHelmValuesDeclareDisruptionRolloutAndTLSDefaults is
 // values.yaml's regression guard: the new keys backing PDBs, explicit
 // rollout strategies, and the TLS opt-in toggle must stay present and
