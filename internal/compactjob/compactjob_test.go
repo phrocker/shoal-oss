@@ -1748,14 +1748,50 @@ func TestTranslateRefusesMalformedJobs(t *testing.T) {
 		{
 			name: "iterator without a name",
 			mutate: func(j *tabletserver.TExternalCompactionJob) {
-				j.IteratorSettings = iterConfig(&tabletserver.TIteratorSetting{IteratorClass: versClass})
+				j.IteratorSettings = iterConfig(&tabletserver.TIteratorSetting{
+					Priority:      20,
+					IteratorClass: versClass,
+				})
+			},
+			wantField: "iteratorSettings[0]",
+		},
+		{
+			// setPriority runs first and demands a strictly positive
+			// value, so a zero or negative one never reaches the name.
+			name: "iterator with a zero priority",
+			mutate: func(j *tabletserver.TExternalCompactionJob) {
+				j.IteratorSettings = iterConfig(&tabletserver.TIteratorSetting{
+					Name: "vers", IteratorClass: versClass,
+				})
+			},
+			wantField: "iteratorSettings[0]",
+		},
+		{
+			name: "iterator with a negative priority",
+			mutate: func(j *tabletserver.TExternalCompactionJob) {
+				j.IteratorSettings = iterConfig(&tabletserver.TIteratorSetting{
+					Priority: -1, Name: "vers", IteratorClass: versClass,
+				})
+			},
+			wantField: "iteratorSettings[0]",
+		},
+		{
+			// setName rejects a dot outright, because Accumulo builds
+			// per-iterator property keys by joining on one.
+			name: "iterator name with a dot",
+			mutate: func(j *tabletserver.TExternalCompactionJob) {
+				j.IteratorSettings = iterConfig(&tabletserver.TIteratorSetting{
+					Priority: 20, Name: "vers.1", IteratorClass: versClass,
+				})
 			},
 			wantField: "iteratorSettings[0]",
 		},
 		{
 			name: "iterator without a class",
 			mutate: func(j *tabletserver.TExternalCompactionJob) {
-				j.IteratorSettings = iterConfig(&tabletserver.TIteratorSetting{Name: "vers"})
+				j.IteratorSettings = iterConfig(&tabletserver.TIteratorSetting{
+					Priority: 20, Name: "vers",
+				})
 			},
 			wantField: "iteratorSettings.vers",
 		},
@@ -2263,6 +2299,62 @@ func TestTranslateAcceptsAnIteratorWithAnEmptyOptionMap(t *testing.T) {
 	}
 	if got := len(plan.Iterators[0].Spec.Options); got != 0 {
 		t.Fatalf("Options = %d, want none", got)
+	}
+}
+
+// TestTranslateNamesTheIteratorCheckItFailed pins the detail text of the
+// two setter refusals, because "malformed iterator" alone does not tell
+// an operator which field to fix. Both come from IteratorSetting's
+// setters, which run while Compactor.initialize builds the stack.
+func TestTranslateNamesTheIteratorCheckItFailed(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		setting *tabletserver.TIteratorSetting
+		want    string
+	}{
+		{
+			name:    "zero priority",
+			setting: &tabletserver.TIteratorSetting{Name: "vers", IteratorClass: versClass},
+			want:    "IteratorSetting.setPriority",
+		},
+		{
+			name: "negative priority",
+			setting: &tabletserver.TIteratorSetting{
+				Priority: -1, Name: "vers", IteratorClass: versClass,
+			},
+			want: "IteratorSetting.setPriority",
+		},
+		{
+			name: "dotted name",
+			setting: &tabletserver.TIteratorSetting{
+				Priority: 20, Name: "vers.1", IteratorClass: versClass,
+			},
+			want: "IteratorSetting.setName",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			job := validJob()
+			job.IteratorSettings = iterConfig(tt.setting)
+
+			r := assertRefused(t, job, Options{}, ClassMalformedJob, "iteratorSettings[0]")
+			if !strings.Contains(r.Detail, tt.want) {
+				t.Fatalf("detail = %q, want it to name %q", r.Detail, tt.want)
+			}
+		})
+	}
+}
+
+// TestTranslateAcceptsThePriorityJavaAccepts pins the boundary: the
+// check is "> 0", so 1 is the lowest priority a job can carry.
+func TestTranslateAcceptsThePriorityJavaAccepts(t *testing.T) {
+	job := validJob()
+	job.IteratorSettings = iterConfig(&tabletserver.TIteratorSetting{
+		Priority: 1, Name: "vers", IteratorClass: versClass,
+	})
+
+	plan := mustTranslate(t, job, Options{})
+	if len(plan.Iterators) != 1 || plan.Iterators[0].Priority != 1 {
+		t.Fatalf("Iterators = %+v, want one entry at priority 1", plan.Iterators)
 	}
 }
 

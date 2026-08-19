@@ -1996,9 +1996,25 @@ func parseIterators(job *tabletserver.TExternalCompactionJob) ([]rawIterator, er
 		if s == nil {
 			return nil, refuse(ClassMalformedJob, field, "nil iterator setting")
 		}
+		// The constructor SystemIteratorUtil.toIteratorSetting calls
+		// validates in this order, and every one of these checks runs
+		// while Compactor.initialize is still assembling the stack, so a
+		// job that fails any of them is one the reference compactor
+		// throws on before it reads a file.
+		if s.GetPriority() <= 0 {
+			return nil, refuse(ClassMalformedJob, field,
+				"priority %d is not strictly positive, which IteratorSetting.setPriority rejects",
+				s.GetPriority())
+		}
 		name, class := s.GetName(), s.GetIteratorClass()
 		if name == "" {
 			return nil, refuse(ClassMalformedJob, field, "iterator has no name")
+		}
+		if strings.Contains(name, ".") {
+			// Reported against the index rather than the name: a dotted
+			// name is exactly what would make the field path ambiguous.
+			return nil, refuse(ClassMalformedJob, field,
+				"name %q contains a dot, which IteratorSetting.setName rejects", name)
 		}
 		field = "iteratorSettings." + name
 		if class == "" {
