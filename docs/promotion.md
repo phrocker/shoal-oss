@@ -248,26 +248,53 @@ split-then-import atomicity guarantee this package does not control; see
 ## 4. What's implemented
 
 ```
-RFileExportManifest (existing)  →  promotion.RequiredDestinationSplits
-                                          │  (nil unless manifest is multi-tablet)
+promotion.Promote(src, manifest, dst, bulkDir, conn, tableName, opts)
+                                          │
+                                          ▼
+              validatePromotionDestination(dst, tableName, bulkDir)
+                                          │
+                                          ▼
+                            promotion.BuildLoadMapping
+                (preflight: validates the manifest's tablet-chain
+                 shape and every RFile's reference into it; result
+                 discarded here -- see the Promote bullet below)
+                                          │
+                                          ▼
+                            promotion.stagingPreflight
+                (verifies every RFile's declared size/SHA256 against
+                 its actual bytes via engine.VerifyRFileExport, plus
+                 the source-alias dedup and flattened-basename/path-
+                 safety checks StageBulkDir itself repeats below)
+                                          │
+                                          ▼
+                     promotion.RequiredDestinationSplits
+                       (nil unless manifest is multi-tablet)
+                                          │
                                           ▼
                      accumulo.Connector.AddTableSplits(tableName, splits)
                         managerclient: FATE TABLE_SPLIT  [only if splits != nil]
                                           │
                                           ▼
-                                  promotion.BuildLoadMapping
-                       (widened per-tablet KeyExtents; see §3.1)
+                     accumulo.Connector.ListTableSplits(tableName)
+                        + verifyNoUnexpectedDestinationSplits    [only if splits != nil]
+                (fails closed if the destination has any split other than
+                 exactly `splits`, at or before the last required row --
+                 see §3.3)
                                           │
                                           ▼
                                   promotion.StageBulkDir
-                    (flattens nested export files into bulkDir,
-                     writes bulkDir/loadmap.json)
+                (re-verifies engine.VerifyRFileExport -- closes the
+                 AddTableSplits/ListTableSplits TOCTOU window above,
+                 see §6 -- then calls BuildLoadMapping again, for the
+                 real widened per-tablet KeyExtents from §3.1, flattens
+                 nested export files into bulkDir, and writes
+                 bulkDir/loadmap.json)
                                           │
                                           ▼
-                                  promotion.Promote
-                       (orchestrates every step above, in order)
+          mapping empty (nothing to import)? return here --
+                  BulkImport is never called
                                           │
-                                          ▼
+                                          ▼ mapping non-empty
                         accumulo.Connector.BulkImport(tableName, bulkDir)
                                           │
                                           ▼
