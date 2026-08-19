@@ -121,15 +121,36 @@ IGNORED_ANCHOR_TOKENS = {
     "Go",
     "and",
     "by",
+    "char",
+    "const",
+    "double",
+    "enum",
+    "extern",
+    "float",
     "full",
     "in",
+    "inline",
+    "int",
+    "interface",
+    "long",
+    "map",
     "on",
     "plus",
     "read",
+    "short",
+    "signed",
+    "static",
     "struct",
+    "typedef",
+    "union",
     "under",
+    "unsigned",
+    "var",
+    "void",
+    "volatile",
     "with",
 }
+WHITESPACE_TOLERANT_PUNCTUATION = frozenset("(),*&[]")
 
 
 def fail(message: str) -> None:
@@ -336,18 +357,27 @@ def anchor_boundary_pattern(anchor: str) -> re.Pattern[str]:
             pieces.append(identifier_boundary_pattern(part).pattern)
             continue
         pieces.append(re.escape(part))
+        if part in WHITESPACE_TOLERANT_PUNCTUATION:
+            pieces.append(r"\s*")
     return re.compile("".join(pieces), re.DOTALL)
+
+
+def significant_anchor_identifiers(anchor: str, ignored_tokens: set[str]) -> list[str]:
+    seen: set[str] = set()
+    significant: list[str] = []
+    for token in IDENT_RE.findall(anchor):
+        if token in ignored_tokens or token in seen:
+            continue
+        seen.add(token)
+        significant.append(token)
+    return significant
 
 
 def anchor_matches_content(anchor: str, content: str, ignored_tokens: set[str]) -> bool:
     if anchor_boundary_pattern(anchor).search(content):
         return True
-    for token in IDENT_RE.findall(anchor):
-        if token in ignored_tokens or len(token) < 3:
-            continue
-        if identifier_boundary_pattern(token).search(content):
-            return True
-    return False
+    tokens = significant_anchor_identifiers(anchor, ignored_tokens)
+    return bool(tokens) and all(identifier_boundary_pattern(token).search(content) for token in tokens)
 
 
 def validate_targeted_symbol_anchors(

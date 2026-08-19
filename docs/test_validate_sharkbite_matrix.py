@@ -137,6 +137,22 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
             targeted_paths=BOUNDARY_FIXTURE_PATHS,
         )
 
+    def test_validate_targeted_symbol_anchors_accepts_full_multiline_signature_anchor(self) -> None:
+        validator.validate_targeted_symbol_anchors(
+            load_fixture_lines("signature_full_multiline_ok.md"),
+            targeted_paths=BOUNDARY_FIXTURE_PATHS,
+        )
+
+    def test_validate_targeted_symbol_anchors_rejects_partial_signature_with_stale_type(self) -> None:
+        self.assert_validation_fails(
+            lambda: validator.validate_targeted_symbol_anchors(
+                load_fixture_lines("signature_anchor_partial_stale.md"),
+                targeted_paths=BOUNDARY_FIXTURE_PATHS,
+            ),
+            "fixture_signature(stale_type row, ...)",
+            "fixture_signature.h",
+        )
+
     def test_validate_targeted_symbol_anchors_resets_after_non_target_file_citation(self) -> None:
         validator.validate_targeted_symbol_anchors(
             load_fixture_lines("non_target_separator.md"),
