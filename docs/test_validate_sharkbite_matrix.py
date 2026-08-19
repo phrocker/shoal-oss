@@ -936,6 +936,22 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
 
     # ---- matrix table separators -------------------------------------------
 
+    def test_matrix_row_without_final_delimiter_is_rejected(self) -> None:
+        text = load_document_text()
+        lines = text.splitlines()
+        for index, line in enumerate(lines):
+            if line.startswith("| SB-CXX-1056 "):
+                self.assertTrue(line.endswith("|"))
+                lines[index] = line[:-1]
+                break
+        else:
+            self.fail("missing SB-CXX-1056 fixture row")
+        self.assert_validation_fails(
+            lambda: validator.parse_rows(lines),
+            "malformed SB row SB-CXX-1056",
+            "missing final table delimiter",
+        )
+
     def test_parse_rows_accepts_matrix_table_with_separator(self) -> None:
         status_counts, prefix_counts, row_ids = validator.parse_rows(
             matrix_table(MATRIX_HEADER, MATRIX_SEPARATOR, MATRIX_ROW)

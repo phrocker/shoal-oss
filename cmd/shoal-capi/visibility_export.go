@@ -171,7 +171,13 @@ func shoal_column_visibility_create(expression C.shoal_bytes, out **C.shoal_colu
 //export shoal_column_visibility_expression
 func shoal_column_visibility_expression(handle *C.shoal_column_visibility, out **C.shoal_bytes_result, outError **C.shoal_error) (status C.shoal_status) {
 	clearError(outError)
+	if out != nil {
+		*out = nil
+	}
 	defer recoverStatus(&status, outError)
+	if out == nil {
+		return fail(outError, C.SHOAL_STATUS_INVALID_ARGUMENT, errors.New("shoal: out_result is required"))
+	}
 	value, err := lookupColumnVisibility(handle)
 	if err != nil {
 		return fail(outError, C.SHOAL_STATUS_INVALID_HANDLE, err)
@@ -214,7 +220,13 @@ func shoal_column_visibility_normalized(handle *C.shoal_column_visibility, out *
 //export shoal_column_visibility_flatten
 func shoal_column_visibility_flatten(handle *C.shoal_column_visibility, out **C.shoal_bytes_result, outError **C.shoal_error) (status C.shoal_status) {
 	clearError(outError)
+	if out != nil {
+		*out = nil
+	}
 	defer recoverStatus(&status, outError)
+	if out == nil {
+		return fail(outError, C.SHOAL_STATUS_INVALID_ARGUMENT, errors.New("shoal: out_result is required"))
+	}
 	value, err := lookupColumnVisibility(handle)
 	if err != nil {
 		return fail(outError, C.SHOAL_STATUS_INVALID_HANDLE, err)
@@ -270,6 +282,12 @@ func shoal_node_expression_create(expression C.shoal_bytes, offset C.size_t, siz
 }
 
 func nodeExpressionBytes(handle *C.shoal_node_expression, out **C.shoal_bytes_result, outError **C.shoal_error, buffer bool) C.shoal_status {
+	if out != nil {
+		*out = nil
+	}
+	if out == nil {
+		return fail(outError, C.SHOAL_STATUS_INVALID_ARGUMENT, errors.New("shoal: out_result is required"))
+	}
 	value, err := lookupNodeExpression(handle)
 	if err != nil {
 		return fail(outError, C.SHOAL_STATUS_INVALID_HANDLE, err)
@@ -338,7 +356,13 @@ func shoal_visibility_node_get(handle *C.shoal_visibility_node, out *C.shoal_vis
 //export shoal_visibility_node_expression
 func shoal_visibility_node_expression(handle *C.shoal_visibility_node, out **C.shoal_bytes_result, outError **C.shoal_error) (status C.shoal_status) {
 	clearError(outError)
+	if out != nil {
+		*out = nil
+	}
 	defer recoverStatus(&status, outError)
+	if out == nil {
+		return fail(outError, C.SHOAL_STATUS_INVALID_ARGUMENT, errors.New("shoal: out_result is required"))
+	}
 	value, err := lookupVisibilityNode(handle)
 	if err != nil {
 		return fail(outError, C.SHOAL_STATUS_INVALID_HANDLE, err)
@@ -387,6 +411,13 @@ func shoal_visibility_node_term(handle *C.shoal_visibility_node, expression C.sh
 	bytes, err := visibilityBytes(expression, "visibility expression")
 	if err != nil {
 		return fail(outError, C.SHOAL_STATUS_INVALID_ARGUMENT, err)
+	}
+	if value.Type() != accumulo.VisibilityTerm {
+		return failForError(outError, &accumulo.VisibilityParseError{
+			Reason: fmt.Sprintf("%s node has no term", value.Type()),
+			Terms:  append([]byte(nil), bytes...),
+			Offset: value.TermStart(),
+		})
 	}
 	nodeExpression, err := value.Term(bytes)
 	if err != nil {

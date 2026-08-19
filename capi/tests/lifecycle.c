@@ -661,6 +661,17 @@ static void test_column_visibility(void) {
   assert(view.child_count == 2);
   assert(view.span_length == sizeof(expression_data) - 1);
   assert(!view.empty);
+  assert(shoal_visibility_node_term(
+             tree, (shoal_bytes){(const uint8_t *)"A&(B|C)", 7}, &term,
+             &error) == SHOAL_STATUS_INVALID_ARGUMENT);
+  shoal_visibility_parse_error_view nonterm_view;
+  shoal_visibility_parse_error_view_init(&nonterm_view);
+  assert(shoal_error_visibility_parse(error, &nonterm_view) ==
+         SHOAL_STATUS_OK);
+  assert(nonterm_view.offset == 0);
+  assert(nonterm_view.terms.length == 7);
+  assert(strstr(nonterm_view.reason, "AND node has no term") != NULL);
+  shoal_error_free(&error);
   assert(shoal_visibility_node_child(tree, 0, &child, &error) ==
          SHOAL_STATUS_OK);
   shoal_visibility_node_view_init(&view);
@@ -787,6 +798,22 @@ static void test_column_visibility(void) {
   memset(&parse_view, 0, sizeof(parse_view));
   assert(shoal_error_visibility_parse(NULL, &parse_view) ==
          SHOAL_STATUS_INVALID_ARGUMENT);
+  bytes_result = (shoal_bytes_result *)(uintptr_t)1;
+  expect_error(shoal_column_visibility_expression(NULL, &bytes_result, &error),
+               SHOAL_STATUS_INVALID_HANDLE, &error, "handle is NULL");
+  assert(bytes_result == NULL);
+  bytes_result = (shoal_bytes_result *)(uintptr_t)1;
+  expect_error(shoal_column_visibility_flatten(NULL, &bytes_result, &error),
+               SHOAL_STATUS_INVALID_HANDLE, &error, "handle is NULL");
+  assert(bytes_result == NULL);
+  bytes_result = (shoal_bytes_result *)(uintptr_t)1;
+  expect_error(shoal_node_expression_term(NULL, &bytes_result, &error),
+               SHOAL_STATUS_INVALID_HANDLE, &error, "handle is NULL");
+  assert(bytes_result == NULL);
+  bytes_result = (shoal_bytes_result *)(uintptr_t)1;
+  expect_error(shoal_visibility_node_expression(NULL, &bytes_result, &error),
+               SHOAL_STATUS_INVALID_HANDLE, &error, "handle is NULL");
+  assert(bytes_result == NULL);
 
   shoal_visibility_evaluator_free(&evaluator);
   shoal_visibility_evaluator_free(&evaluator);

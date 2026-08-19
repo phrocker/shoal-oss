@@ -743,6 +743,10 @@ def iter_matrix_rows(lines: list[str]) -> Iterator[tuple[int, str, list[str]]]:
             fail(f"unexpected separator row inside a matrix table on line {line_number}")
         if not line.startswith("| SB-"):
             continue
+        require(
+            line.rstrip().endswith("|"),
+            f"malformed SB row {row_identifier([], line)} on line {line_number}: missing final table delimiter",
+        )
         cells = split_matrix_cells(line)
         row_id = row_identifier(cells, line)
         if current_header_cells is None or row_id.startswith("SB-GAP"):
