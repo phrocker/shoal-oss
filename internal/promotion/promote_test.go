@@ -35,12 +35,23 @@ type fakePromoter struct {
 	listSplitsOverride [][]byte
 	listSplitsSet      bool
 	listSplitsErr      error
+
+	// onAddTableSplits, when set, runs as a side effect of
+	// AddTableSplits before it returns. Used to simulate an external
+	// actor mutating src while a real AddTableSplits round-trip to the
+	// manager would be in flight, proving StageBulkDir's own
+	// re-verification (not just stagingPreflight's, which already ran
+	// before this call) catches a source that changed in between.
+	onAddTableSplits func()
 }
 
 func (f *fakePromoter) AddTableSplits(_ context.Context, tableName string, splits [][]byte) error {
 	f.splitCalls++
 	f.splitTable = tableName
 	f.splitRows = splits
+	if f.onAddTableSplits != nil {
+		f.onAddTableSplits()
+	}
 	return f.splitErr
 }
 
@@ -517,6 +528,50 @@ func TestPromoteRejectsCorruptExportBeforeAddTableSplits(t *testing.T) {
 	}
 	if got := dst.Keys(); len(got) != 0 {
 		t.Fatalf("dst.Keys() = %v, want no staged files when export verification fails first", got)
+	}
+}
+
+// TestPromoteRejectsSourceMutatedDuringAddTableSplits proves the second
+// half of stagingPreflight's verify-twice tradeoff (see stagingPreflight
+// and Promote's own doc comments): stagingPreflight's verification, run
+// before AddTableSplits, cannot see a source object that is replaced
+// later, while AddTableSplits/ListTableSplits are themselves in flight.
+// StageBulkDir's own re-verification -- which Promote deliberately does
+// not skip, even though stagingPreflight just verified the identical
+// manifest -- is what actually catches this.
+func TestPromoteRejectsSourceMutatedDuringAddTableSplits(t *testing.T) {
+	src := memory.New()
+	src.Put("events/t-0000/F0001.rf", []byte("a"))
+	src.Put("events/t-0001/F0002.rf", []byte("b"))
+	manifest := twoTabletManifest()
+	manifest.RFiles[0].DestinationPath = "events/t-0000/F0001.rf"
+	manifest.RFiles[0].Size = 1
+	manifest.RFiles[0].SHA256 = "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb"
+	manifest.RFiles[1].DestinationPath = "events/t-0001/F0002.rf"
+	manifest.RFiles[1].Size = 1
+	manifest.RFiles[1].SHA256 = "3e23e8160039594a33894f6564e1b1348bbd7a0088d42c4acb73eeaed59c009d"
+
+	dst := memory.New()
+	importer := &fakePromoter{}
+	// Simulates an external actor overwriting the source object with
+	// different (but same-length, so only the hash check -- not a
+	// size check -- can catch it) bytes while AddTableSplits' manager
+	// round-trip is itself in flight, i.e. strictly after
+	// stagingPreflight already verified the original "a" content.
+	importer.onAddTableSplits = func() {
+		src.Put("events/t-0000/F0001.rf", []byte("X"))
+	}
+	if _, err := Promote(context.Background(), src, manifest, dst, "/bulk/events-1", importer, "events", Options{}); err == nil {
+		t.Fatal("Promote with src mutated during AddTableSplits = nil error, want error")
+	}
+	if importer.splitCalls != 1 {
+		t.Fatalf("AddTableSplits calls = %d, want 1 (the mutation happens as its own side effect, so it must have been called)", importer.splitCalls)
+	}
+	if importer.calls != 0 {
+		t.Fatalf("BulkImport calls = %d, want 0", importer.calls)
+	}
+	if got := dst.Keys(); len(got) != 0 {
+		t.Fatalf("dst.Keys() = %v, want no staged files when the post-AddTableSplits re-verification fails", got)
 	}
 }
 

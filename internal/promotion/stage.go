@@ -104,31 +104,6 @@ func StageBulkDir(
 	dst storage.Backend,
 	bulkDir string,
 ) (LoadMapping, error) {
-	return stageBulkDir(ctx, src, manifest, dst, bulkDir, true)
-}
-
-// stageBulkDir is StageBulkDir's real implementation. verify controls
-// whether engine.VerifyRFileExport runs here: Promote's stagingPreflight
-// already calls it once, before AddTableSplits, so Promote's own call
-// into this function passes verify=false to avoid reading and hashing
-// every RFile's full content a second time. Unlike stagingPreflight's
-// other checks (dedupeStageSources/flattenNames/checkNoStagingAliases),
-// which are cheap enough that recomputing them here is not worth
-// avoiding (see stagingPreflight's own doc comment), VerifyRFileExport
-// streams and hashes every RFile's actual bytes, so duplicating it would
-// double the I/O cost of every promotion in proportion to the export's
-// total size. StageBulkDir, the exported entry point every other caller
-// and every existing test uses, always passes verify=true, so it keeps
-// exactly the verify-before-copy behavior described in StageBulkDir's
-// own doc comment above.
-func stageBulkDir(
-	ctx context.Context,
-	src storage.Backend,
-	manifest *engine.RFileExportManifest,
-	dst storage.Backend,
-	bulkDir string,
-	verify bool,
-) (LoadMapping, error) {
 	if manifest == nil {
 		return nil, fmt.Errorf("promotion: nil export manifest")
 	}
@@ -138,10 +113,20 @@ func stageBulkDir(
 	if _, _, err := resolveManifestTablets(manifest); err != nil {
 		return nil, err
 	}
-	if verify {
-		if err := engine.VerifyRFileExport(ctx, src, manifest); err != nil {
-			return nil, fmt.Errorf("promotion: stage: %w", err)
-		}
+	// Verified again here even though Promote's stagingPreflight already
+	// verified this same manifest once, before AddTableSplits: an
+	// arbitrary amount of time, including a real manager round-trip for
+	// AddTableSplits/ListTableSplits, elapses between that preflight and
+	// this call, and src is not guaranteed immutable across it (a local
+	// path or an object-store key can be overwritten in place). Skipping
+	// this second check would let a source object replaced during that
+	// window be staged and bulk-imported without ever being checked
+	// against the manifest again -- see stagingPreflight's own doc
+	// comment for the corresponding pre-AddTableSplits half of this, and
+	// TestPromoteRejectsSourceMutatedDuringAddTableSplits for the
+	// regression test proving this specific window is closed.
+	if err := engine.VerifyRFileExport(ctx, src, manifest); err != nil {
+		return nil, fmt.Errorf("promotion: stage: %w", err)
 	}
 	stageRFiles, err := dedupeStageSources(src, manifest.RFiles)
 	if err != nil {
@@ -292,14 +277,27 @@ func checkNoStagingAliases(src, dst storage.Backend, flatNames map[string]string
 // again further on, for the same reason.
 //
 // engine.VerifyRFileExport is different: it streams and hashes every
-// RFile's actual bytes, so it is not cheap to recompute, and
-// stagingPreflight does NOT let StageBulkDir redo it. Promote instead
-// calls the unexported stageBulkDir helper directly with verify=false
-// after this preflight succeeds, so the manifest's content is verified
-// exactly once per Promote call, not twice — see stageBulkDir's own doc
-// comment. A caller invoking StageBulkDir directly (bypassing Promote)
-// still gets the usual verify-before-copy behavior from StageBulkDir
-// itself, unaffected by this.
+// RFile's actual bytes, so it is not cheap to recompute the way the
+// other three checks are -- but unlike them, StageBulkDir is still
+// deliberately left to run it again on its own, rather than having
+// Promote skip it there. AddTableSplits and ListTableSplits, which run
+// between this preflight and StageBulkDir, are a real manager
+// round-trip taking arbitrary time, and src is not guaranteed
+// immutable across it: a local path or an object-store key can be
+// overwritten in place while that call is in flight. Verifying only
+// here and trusting it to still hold by the time StageBulkDir copies
+// would leave exactly that window unchecked -- a source object
+// replaced during AddTableSplits/ListTableSplits would be staged and
+// bulk-imported without ever being verified against the manifest it
+// actually matches at copy time. So this preflight's verification and
+// StageBulkDir's own are deliberately redundant in the common case and
+// each close a different, non-overlapping window: this one guards
+// AddTableSplits against ever mutating the destination's splits for an
+// export that was already corrupt before either call started;
+// StageBulkDir's guards the copy itself against one that became
+// corrupt (or was replaced) during the calls in between. See
+// TestPromoteRejectsSourceMutatedDuringAddTableSplits for the
+// regression test proving the latter window specifically.
 func stagingPreflight(ctx context.Context, src storage.Backend, manifest *engine.RFileExportManifest, dst storage.Backend, bulkDir string) error {
 	if err := engine.VerifyRFileExport(ctx, src, manifest); err != nil {
 		return fmt.Errorf("promotion: stage: %w", err)

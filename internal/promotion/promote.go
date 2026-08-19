@@ -144,19 +144,27 @@ type Options struct {
 // fails.
 //
 // The RFile-level and path/naming parts of these preflights are cheap
-// to recompute -- StageBulkDir (through the unexported stageBulkDir it
-// and Promote both call) redoes its own equivalent chain/dedup/
+// to recompute -- StageBulkDir redoes its own equivalent chain/dedup/
 // flatten/alias checks further on regardless, since every one of those
 // calls is a pure or local-probe-only function of the manifest and the
 // backends alone, so recomputing never observes a different
-// destination state. engine.VerifyRFileExport is not cheap -- it
-// streams and hashes every RFile's actual bytes -- so Promote does not
-// let it run twice: once stagingPreflight's call to it succeeds here,
-// Promote calls stageBulkDir directly with verify=false instead of the
-// exported StageBulkDir, so the manifest's content is verified exactly
-// once per Promote call (see stageBulkDir's own doc comment). A caller
-// invoking the exported StageBulkDir directly, bypassing Promote, is
-// unaffected: it always verifies.
+// destination state. engine.VerifyRFileExport is not cheap the same
+// way -- it streams and hashes every RFile's actual bytes -- but
+// Promote still lets StageBulkDir run it again below, deliberately, at
+// the cost of hashing every RFile twice: AddTableSplits and
+// verifyNoUnexpectedDestinationSplits/ListTableSplits, both of which
+// run between this preflight and StageBulkDir, are a real manager
+// round-trip taking arbitrary time, and src is not guaranteed
+// immutable across it (a local path or an object-store key can be
+// overwritten in place while that call is in flight). Skipping
+// StageBulkDir's own verification to avoid the duplicate cost would
+// leave that window unchecked: a source object replaced during
+// AddTableSplits/ListTableSplits would be staged and bulk-imported
+// without ever being verified against the manifest it actually matches
+// at copy time (see stagingPreflight's own doc comment for the same
+// reasoning from the staging side, and
+// TestPromoteRejectsSourceMutatedDuringAddTableSplits for the
+// regression test proving this window is closed).
 //
 // Promote does not itself retry on failure, and retry safety differs by
 // which step failed. A failure in validation, AddTableSplits, or
@@ -205,12 +213,11 @@ func Promote(
 			return nil, err
 		}
 	}
-	// verify=false: stagingPreflight above already ran
-	// engine.VerifyRFileExport over this same manifest; re-verifying
-	// here would stream and hash every RFile's bytes a second time for
-	// no benefit, since neither src's content nor the manifest can have
-	// changed in between (see stageBulkDir's own doc comment).
-	mapping, err := stageBulkDir(ctx, src, manifest, dst, bulkDir, false)
+	// Deliberately re-verifies (see the doc comment above and
+	// stagingPreflight's own): AddTableSplits and
+	// verifyNoUnexpectedDestinationSplits/ListTableSplits just ran, and
+	// src is not guaranteed unchanged across that round-trip.
+	mapping, err := StageBulkDir(ctx, src, manifest, dst, bulkDir)
 	if err != nil {
 		return nil, err
 	}

@@ -511,16 +511,29 @@ destination splits itself, or the eventual `BulkImport` fails closed (see
   pure or local-probe-only function of the manifest and the backends
   alone, so recomputing costs nothing and never observes a different
   destination state. `VerifyRFileExport` is not cheap the same way — it
-  streams and hashes every RFile's full content — so `Promote` does not
-  let `StageBulkDir` redo it: internally it calls the same unexported
-  staging implementation with verification already satisfied, so every
-  RFile's bytes are only read and hashed once per promotion, not twice.
-  `StageBulkDir` itself, the entry point every other caller uses, is
-  unchanged and always verifies before copying. Submits nothing when the
-  derived mapping is empty (nothing to import) — but still reconciles
-  splits first if the manifest declares a multi-tablet chain, even when
-  every tablet in it ends up empty, so the destination's tablet
-  boundaries don't depend on which tablets happened to carry files.
+  streams and hashes every RFile's full content — but `Promote` still
+  lets `StageBulkDir` run it again below, deliberately paying that cost
+  twice: `AddTableSplits`/`verifyNoUnexpectedDestinationSplits` (via
+  `ListTableSplits`) run in between, a real manager round-trip taking
+  arbitrary time, and `src` is not guaranteed unchanged across it (a
+  local path or an object-store key can be overwritten while that call
+  is in flight). Skipping `StageBulkDir`'s own verification to avoid
+  the duplicate cost would leave that window unchecked — a source
+  object replaced during the split round-trip would be staged and
+  bulk-imported without ever being checked against the manifest it
+  actually matches at copy time. So the two verify calls guard
+  different, non-overlapping windows: `stagingPreflight`'s protects
+  `AddTableSplits` from ever mutating the destination's splits for an
+  export that was already corrupt beforehand; `StageBulkDir`'s own
+  protects the copy itself against one that became corrupt, or was
+  swapped out, during the calls in between (see
+  `TestPromoteRejectsSourceMutatedDuringAddTableSplits` in §6).
+
+  Submits nothing when the derived mapping is empty (nothing to
+  import) — but still reconciles splits first if the manifest declares
+  a multi-tablet chain, even when every tablet in it ends up empty, so
+  the destination's tablet boundaries don't depend on which tablets
+  happened to carry files.
 - `accumulo.Connector.AddTableSplits` — resolves the destination table
   name to its stable ID, then submits the split rows through the manager
   `TABLE_SPLIT` FATE operation, the same protocol
@@ -627,6 +640,52 @@ Mapped against #70's five acceptance criteria:
 5. **"graph, document, and vector fixtures pass before and after
    promotion"** — not exercised; requires a live cluster.
 
+**A manifest's `TabletIndex` is trusted, not verified against the
+RFile's actual content.** Every check in §3/§4 confirms that a
+manifest's tablet chain is well-formed (§3.1/§3.2) and that each
+`RFileExportFile` genuinely exists and matches its own declared
+`Size`/`SHA256` (`engine.VerifyRFileExport`, run twice — see §3.3 and
+§4's `stagingPreflight`/`StageBulkDir` description — specifically to
+close the window a manager round-trip opens). None of that checks
+whether an RFile's *actual* embedded key range genuinely falls inside
+the boundaries `Tablets[TabletIndex]` declares. A manifest that
+correctly hashes a byte-for-byte real RFile, but assigns it to the
+*wrong* `TabletIndex` — for example a file whose real keys belong under
+tablet 0's range, declared instead as tablet 3 in a four-tablet chain —
+passes every check this package performs, including
+`RequiredDestinationSplits`, `BuildLoadMapping`, `stagingPreflight`, and
+`StageBulkDir`, then loads successfully via `BulkImport`: Accumulo's own
+server-side `PrepBulkImport.validateLoadMapping` validates the load
+mapping's structure (extents, file counts — see item 3 above) and does
+not open RFiles to check their content against the extent they were
+declared under either. The practical effect is silent, not a rejection:
+the file's rows outside the extent it actually lands under become
+unreachable through any range-scoped read that trusts tablet
+boundaries, even though the bytes that were loaded are completely
+intact and pass every hash check that exists.
+
+Closing this needs one of two capabilities this slice does not have:
+reading each RFile's real first/last key at validation time and
+cross-checking it against its declared tablet's boundaries (the
+`internal/rfile` reader is a low-level streaming API today, with no
+cheap "just the key range" accessor, and no code in this package opens
+an RFile's content at all — every existing check is either a hash
+comparison against a manifest-declared value or a local/path-only
+probe), or authenticating the manifest itself from a trusted origin so
+`TabletIndex` does not need re-deriving from content at all. Both are
+substantial, separate features, not a gap in this slice's own new
+logic. What bounds the real-world exposure today: the one production
+code path that builds a manifest, `engine.ExportRFiles`, assigns
+`TabletIndex` directly from Shoal's own local per-tablet RFile
+bookkeeping, not from any input a caller supplies — so it is correct by
+construction for a manifest that has never left that path. The gap
+only matters once a manifest crosses a boundary where it could be
+altered before reaching `Promote` (written to disk, transferred over a
+network, hand-edited) — which is precisely the threat model every
+other check in §3/§4 already treats as real, so this is a genuine,
+currently-unaddressed blind spot in that same model, not a merely
+theoretical one.
+
 Also explicitly out of scope for this slice: an RFile-index-based
 per-key-range rewrite/materialization strategy for split-bearing exports
 (a different approach from the destination-split-widening one
@@ -694,14 +753,22 @@ existing single-tablet suite:
   them even if `Promote` still ultimately returned an error.
   `TestPromoteRejectsCorruptExportBeforeAddTableSplits` covers
   `engine.VerifyRFileExport` itself — a manifest RFile whose declared
-  SHA256 does not match its real source bytes — and doubles as the
-  regression test for the `verify=false` optimization described above:
-  because `Promote`'s own call into staging skips re-verification, a
-  `stagingPreflight` that stopped checking content would leave nothing
-  in the whole `Promote` call path to catch the corruption, so this
-  test failed with no error at all (not merely a wrong error) against a
-  build with the check removed, which was confirmed directly before
-  this test was added.
+  SHA256 does not match its real source bytes — proving
+  `stagingPreflight`'s verification specifically (the manifest is wrong
+  from the start, before `AddTableSplits` ever runs).
+  `TestPromoteRejectsSourceMutatedDuringAddTableSplits` proves the
+  companion half described above: it starts from an accurate manifest
+  (so `stagingPreflight` passes) and overwrites the source object as a
+  side effect of the fake `Promoter`'s `AddTableSplits` call, simulating
+  a real actor mutating `src` during that round-trip; asserts
+  `AddTableSplits` *was* called (`splitCalls == 1`, confirming the test
+  reaches the window after the preflight rather than being rejected
+  there) but `BulkImport` was not, and that `dst` stays empty. Verified
+  this one similarly: with `StageBulkDir`'s own re-verification call
+  temporarily removed (while `stagingPreflight`'s separate call stays
+  intact), this test — and only this one, not
+  `TestPromoteRejectsCorruptExportBeforeAddTableSplits` — fails, showing
+  each test isolates its own distinct window.
 - **Cross-tablet alias/path safety** —
   `TestStageBulkDirRejectsCrossTabletBasenameCollisionBeforeCopying` proves
   the flatten-collision check (previously only exercised within a single
