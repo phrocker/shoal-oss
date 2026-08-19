@@ -96,6 +96,7 @@ func windowsLocalPathContainsADS(path string) bool {
 }
 
 func splitWindowsLocalPathComponents(path string) []string {
+	path = stripWindowsExtendedLengthPrefix(path)
 	if hasWindowsDriveLetterPrefix(path) {
 		path = path[2:]
 	}
@@ -104,6 +105,33 @@ func splitWindowsLocalPathComponents(path string) []string {
 		return nil
 	}
 	return strings.FieldsFunc(path, func(r rune) bool { return r == '/' || r == '\\' })
+}
+
+// stripWindowsExtendedLengthPrefix removes the Win32 "\\?\" extended-length
+// prefix so splitWindowsLocalPathComponents doesn't have to special-case it
+// separately from the ordinary spelling of the same path: "\\?\C:\bulk\A.rf"
+// becomes "C:\bulk\A.rf" (its drive letter is then trimmed the same way as
+// any ordinary drive path, instead of surviving as a lone "C:" component
+// that windowsLocalPathContainsADS would otherwise misread as an alternate
+// data stream marker) and "\\?\UNC\server\share\A.rf" becomes
+// "server\share\A.rf" (the same components an ordinary
+// "\\server\share\A.rf" UNC path already produces). Any other extended-length
+// form (for example a volume-GUID path) is left with its leading segment
+// intact, which is harmless here since this function only looks for stray
+// colons and none of those forms contain one.
+func stripWindowsExtendedLengthPrefix(path string) string {
+	rest, ok := strings.CutPrefix(path, `\\?\`)
+	if !ok {
+		return path
+	}
+	segment, remainder, hasMore := strings.Cut(rest, `\`)
+	if strings.EqualFold(segment, "UNC") {
+		return remainder
+	}
+	if hasMore {
+		return segment + `\` + remainder
+	}
+	return segment
 }
 
 func hasWindowsDriveLetterPrefix(path string) bool {

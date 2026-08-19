@@ -783,6 +783,10 @@ func TestLocalTargetUsesWindowsADSOnBackend(t *testing.T) {
 		{name: "named stream is rejected", backend: local.New(), path: `C:\bulk\A.rf:Meta:$DATA`, want: true},
 		{name: "intermediate directory stream is rejected", backend: local.New(), path: `C:\bulk:meta\A.rf`, want: true},
 		{name: "trailing-dot interaction is rejected", backend: local.New(), path: `C:\bulk\A.rf.::$Data`, want: true},
+		{name: "extended-length drive path is allowed", backend: local.New(), path: `\\?\C:\bulk\A.rf`, want: false},
+		{name: "extended-length drive path ads is rejected", backend: local.New(), path: `\\?\C:\bulk\A.rf::$DATA`, want: true},
+		{name: "extended-length unc path is allowed", backend: local.New(), path: `\\?\UNC\server\share\bulk\A.rf`, want: false},
+		{name: "extended-length unc path ads is rejected", backend: local.New(), path: `\\?\UNC\server\share\bulk\A.rf:$DATA`, want: true},
 		{name: "remote uri path on s3 backend is not treated as local ads", backend: &s3.Backend{}, path: `s3://bucket/A.rf:$DATA`, want: false},
 		{name: "custom uri path on nonlocal backend is not treated as local ads", backend: schemeAwareBackend{Backend: memory.New(), schemes: []string{"custom"}}, path: `custom://bucket/A.rf:meta`, want: false},
 	}

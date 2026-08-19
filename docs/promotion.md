@@ -259,6 +259,12 @@ RFileExportManifest (existing)  →  promotion.BuildLoadMapping
   `A.rf:meta:$DATA`) instead of trying to canonicalize NTFS alternate
   data stream aliases; the only allowed colon is the drive-letter
   separator itself.
+  A Win32 extended-length `\\?\` prefix is stripped before this check
+  runs (recognizing both `\\?\C:\...` and `\\?\UNC\server\share\...`),
+  so a bulk directory expressed in extended-length form -- typically
+  chosen specifically to bypass `MAX_PATH` for a long staging path --
+  isn't rejected merely for the drive letter's own colon surviving as
+  a separate path component under the naive `\\?\` split.
   `joinBulkPath` and the `bulkDir` root-validation preflight both
   recognize a non-local write target the same, deliberately generic
   way `internal/engine`'s own backend-path joining does: any
