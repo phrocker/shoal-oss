@@ -14,7 +14,7 @@ import tempfile
 
 
 DOC_PATH = Path(__file__).with_name("sharkbite-compatibility.md")
-EXPECTED_REVISION = 30
+EXPECTED_REVISION = 31
 # Update this manifest only when the independently audited inventory itself
 # changes; review every added/removed or reclassified ID in code review.
 EXPECTED_ROW_MANIFEST = DOC_PATH.with_name(
@@ -60,9 +60,9 @@ def status_count_map(
 
 EXPECTED_STATUS_COUNTS = {
     "Covered": 71,
-    "Missing Go": 2361,
-    "Missing C ABI": 71,
-    "Behavior mismatch": 221,
+    "Missing Go": 2357,
+    "Missing C ABI": 77,
+    "Behavior mismatch": 219,
     "Intentional divergence (approval required)": 87,
     "Not required (rationale required)": 392,
 }
@@ -88,10 +88,11 @@ EXPECTED_PREFIX_COUNTS = {
         not_required=8,
     ),
     "SB-CXX": status_count_map(
-        missing_go=2297,
+        missing_go=2296,
         covered=10,
         behavior_mismatch=15,
         not_required=304,
+        missing_c_abi=1,
     ),
     "SB-DATA": status_count_map(
         covered=9,
@@ -125,9 +126,9 @@ EXPECTED_PREFIX_COUNTS = {
         not_required=3,
     ),
     "SB-SCAN": status_count_map(
-        missing_go=8,
-        missing_c_abi=4,
-        behavior_mismatch=11,
+        missing_go=5,
+        missing_c_abi=8,
+        behavior_mismatch=10,
         not_required=5,
     ),
     "SB-SEC": status_count_map(behavior_mismatch=18, not_required=1),
@@ -153,8 +154,8 @@ EXPECTED_PREFIX_COUNTS = {
     "SB-XCUT": status_count_map(
         covered=2,
         missing_go=1,
-        missing_c_abi=2,
-        behavior_mismatch=14,
+        missing_c_abi=3,
+        behavior_mismatch=13,
     ),
 }
 
@@ -195,17 +196,18 @@ EXPECTED_METADATA_FIELDS = {
     ),
     "Sharkbite release line": "`sharkbite` 1.2.0.3 on PyPI (`setup.py:34-35`)",
     "Shoal reference": (
-        "`phrocker/shoal-oss` exact audited baseline for revision 30 "
-        "`b19e17bf28cc51540ef4fa420b256c31f268df56` "
-        "(\"Add table maintenance C ABI (#137)\") "
-        "plus the connector-control C ABI introduced in this revision"
+        "`phrocker/shoal-oss` exact audited baseline for revision 31 "
+        "`c5e3552fc25d2fcbe94ce7cc1d91b46dfe27011c` "
+        "(\"Add connector control C ABI (#139)\") "
+        "plus the streaming scan cursor introduced in this revision"
     ),
     "Shoal C ABI version": "`SHOAL_ABI_VERSION 1u` (`capi/include/shoal_types.h`)",
 }
 
 EXPECTED_DOCUMENT_STATUS_SNIPPETS = (
     "Normative gate. Binding on all Sharkbite-compatibility work.",
-    f"Revision {EXPECTED_REVISION} — completes one-shot scan cancellation and connector cache invalidation",
+    f"Revision {EXPECTED_REVISION} — records the public streaming scan cursor",
+    "Revision 30 — completes one-shot scan cancellation and connector cache invalidation",
     "Revision 26 — completes the 17-row data-model value C ABI",
     "Revision 23 — records the public data-model value types",
     "Revision 22 — reclassifies the thirty-one RFile and stream rows of [§15](#sec-15)",
@@ -328,6 +330,11 @@ OPTIONAL_ANCHOR_CITATIONS = {
 # same reason: the matrix claims an exact public Go surface, so a rename or a
 # deleted method must fail the document, not just the build.
 # Implementation files behind the section 11 table-maintenance rows.
+TARGETED_SB_SCAN_CITATIONS = {
+    "accumulo/scan_stream.go",
+    "accumulo/scan_stream_test.go",
+}
+
 TARGETED_SB_TABLE_CITATIONS = {
     "accumulo/table_constraints.go",
     "accumulo/table_constraints_test.go",
@@ -361,6 +368,7 @@ ANCHOR_CHECKED_CITATIONS = (
     | TARGETED_SB_RFILE_CITATIONS
     | TARGETED_SB_DATA_CITATIONS
     | TARGETED_SB_TABLE_CITATIONS
+    | TARGETED_SB_SCAN_CITATIONS
 )
 COUNT_RE = re.compile(
     r"^(?P<bold>\*\*)?(?P<number>0|[1-9]\d*|[1-9]\d{0,2}(?:,\d{3})+)(?(bold)\*\*|)$"
@@ -1650,7 +1658,7 @@ def validate_status_narratives(
         f"The shape of the work is visible in the {status_counts['Missing Go']} `Missing Go` rows, of which {prefix_counts['SB-CXX']['Missing Go']} are the C++ members in [§19.2](#sec-19-2) that no Shoal layer exports.",
         f"`Behavior mismatch` ({status_counts['Behavior mismatch']}) is the bucket that sets the schedule: {python_visible_behavior} rows on the Python-visible and curated C++ surface each need a differential test against a live cluster or the exported ABI, and {prefix_counts['SB-CXX']['Behavior mismatch']} are destructors of classes bound into Python, where the destruction point is user-observable and the model differs from Go finalisation ([§19.1](#sec-19-1)).",
         f"`Intentional divergence` ({status_counts[INTENTIONAL_DIVERGENCE_STATUS]}) is dominated by one upstream fact: {prefix_counts['SB-STAT'][INTENTIONAL_DIVERGENCE_STATUS]} rows are cluster-status accessors Accumulo itself deleted ([§14](#sec-14), [SB-DIV-016](#sec-26)).",
-        f"`Missing C ABI` ({status_counts['Missing C ABI']}) is now led by pandas ({prefix_counts['SB-PANDA']['Missing C ABI']}), high-level helpers ({prefix_counts['SB-BASE']['Missing C ABI']}), packaging/import scaffolding ({prefix_counts['SB-PKG']['Missing C ABI']}), PyTorch ({prefix_counts['SB-TORCH']['Missing C ABI']}), and the remaining data-model row ({prefix_counts['SB-DATA']['Missing C ABI']}).",
+        f"`Missing C ABI` ({status_counts['Missing C ABI']}) is now led by pandas ({prefix_counts['SB-PANDA']['Missing C ABI']}), high-level helpers ({prefix_counts['SB-BASE']['Missing C ABI']}), packaging/import scaffolding ({prefix_counts['SB-PKG']['Missing C ABI']}), PyTorch ({prefix_counts['SB-TORCH']['Missing C ABI']}), the scanner cursor ({prefix_counts['SB-SCAN']['Missing C ABI']}), and the remaining data-model row ({prefix_counts['SB-DATA']['Missing C ABI']}).",
     ]
     for phrase in expected_phrases:
         require(phrase in normalized, f"missing or stale status narrative: {phrase}")
