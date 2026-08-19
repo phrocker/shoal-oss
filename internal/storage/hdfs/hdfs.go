@@ -1332,11 +1332,17 @@ func (w *replaceWriter) resolvePublishRenameAmbiguity(ctx context.Context, backu
 		if hadOld {
 			if targetPresent {
 				if tempPresent {
-					if err := removeWithContext(ctx, client, w.target); err != nil && !isNotFound(err) {
-						w.state = replacementUnabortable
-						return fmt.Errorf("hdfs: remove partial destination %s after publish failure: %w", w.target, err)
+					w.state = replacementUnabortable
+					if backupPresent {
+						return fmt.Errorf(
+							"hdfs: destination %s may have changed concurrently while temporary file %s and backup %s remain; refusing to delete destination or restore backup over it",
+							w.target, w.temp, backup,
+						)
 					}
-					targetPresent = false
+					return fmt.Errorf(
+						"hdfs: destination %s may have changed concurrently while temporary file %s remains; refusing to delete destination",
+						w.target, w.temp,
+					)
 				} else {
 					w.state = replacementUnabortable
 					return fmt.Errorf("hdfs: destination %s changed concurrently; refusing to roll it back", w.target)
@@ -1354,12 +1360,11 @@ func (w *replaceWriter) resolvePublishRenameAmbiguity(ctx context.Context, backu
 
 		if targetPresent {
 			if tempPresent {
-				if err := removeWithContext(ctx, client, w.target); err != nil && !isNotFound(err) {
-					w.state = replacementUnabortable
-					return fmt.Errorf("hdfs: remove partial destination %s after publish failure: %w", w.target, err)
-				}
-				w.state = replacementStaged
-				return nil
+				w.state = replacementUnabortable
+				return fmt.Errorf(
+					"hdfs: destination %s may have changed concurrently while temporary file %s remains; refusing to delete destination",
+					w.target, w.temp,
+				)
 			}
 			w.state = replacementUnabortable
 			return fmt.Errorf("hdfs: destination %s changed concurrently; refusing to remove it", w.target)

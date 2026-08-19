@@ -390,11 +390,14 @@ func TestBackendAmbiguousBackupRenameRestoresTargetBeforeReturning(t *testing.T)
 
 func TestBackendAmbiguousPublishRenameClassifiesCommittedTarget(t *testing.T) {
 	for _, tc := range []struct {
-		name     string
-		existing bool
+		name       string
+		existing   bool
+		retainTemp bool
 	}{
-		{name: "replace-existing-target", existing: true},
-		{name: "publish-absent-target", existing: false},
+		{name: "replace-existing-target", existing: true, retainTemp: false},
+		{name: "replace-existing-target-retained-temp", existing: true, retainTemp: true},
+		{name: "publish-absent-target", existing: false, retainTemp: false},
+		{name: "publish-absent-target-retained-temp", existing: false, retainTemp: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			client := newFakeClient()
@@ -404,7 +407,9 @@ func TestBackendAmbiguousPublishRenameClassifiesCommittedTarget(t *testing.T) {
 			client.renameContextHook = func(_ context.Context, oldpath, newpath string) error {
 				if strings.Contains(oldpath, replacementTempPrefix) && newpath == "/tables/1.rf" {
 					client.files[newpath] = append([]byte(nil), client.files[oldpath]...)
-					delete(client.files, oldpath)
+					if !tc.retainTemp {
+						delete(client.files, oldpath)
+					}
 					return context.DeadlineExceeded
 				}
 				return nil
@@ -432,12 +437,104 @@ func TestBackendAmbiguousPublishRenameClassifiesCommittedTarget(t *testing.T) {
 	}
 }
 
-func TestBackendAmbiguousPublishRenameRestoresBackupAndRetainsTempForAbort(t *testing.T) {
+func TestBackendAmbiguousPublishRenamePreservesConcurrentTargetAndBackup(t *testing.T) {
 	client := newFakeClient()
 	client.files["/tables/1.rf"] = []byte("old")
 	client.renameContextHook = func(_ context.Context, oldpath, newpath string) error {
 		if strings.Contains(oldpath, replacementTempPrefix) && newpath == "/tables/1.rf" {
-			client.files[newpath] = []byte("partial")
+			client.files[newpath] = []byte("concurrent")
+			return context.DeadlineExceeded
+		}
+		return nil
+	}
+	backend, err := New("nn:8020", WithClient(client))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	w, err := backend.Create(context.Background(), "/tables/1.rf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write([]byte("new")); err != nil {
+		t.Fatal(err)
+	}
+
+	err = w.Close()
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Close error = %v, want context deadline exceeded", err)
+	}
+	if !strings.Contains(err.Error(), "refusing to delete destination or restore backup over it") {
+		t.Fatalf("Close error = %v, want concurrent-target safeguard", err)
+	}
+	if got := string(client.files["/tables/1.rf"]); got != "concurrent" {
+		t.Fatalf("target contents = %q, want concurrent data preserved", got)
+	}
+	if _, ok := client.files[client.lastCreatePath]; !ok {
+		t.Fatalf("temporary file %s missing after unsuccessful Close", client.lastCreatePath)
+	}
+	if len(client.renameCalls) != 1 {
+		t.Fatalf("Rename calls = %v, want preserve only", client.renameCalls)
+	}
+	backup := client.renameCalls[0].newpath
+	if got := string(client.files[backup]); got != "old" {
+		t.Fatalf("backup contents = %q, want preserved old data", got)
+	}
+	if err := w.(storage.Aborter).Abort(); err == nil || !strings.Contains(err.Error(), "cannot be safely aborted") {
+		t.Fatalf("Abort after unsafe Close error = %v, want unabortable safeguard", err)
+	}
+}
+
+func TestBackendAmbiguousPublishRenamePreservesConcurrentTargetWithoutBackup(t *testing.T) {
+	client := newFakeClient()
+	client.renameContextHook = func(_ context.Context, oldpath, newpath string) error {
+		if strings.Contains(oldpath, replacementTempPrefix) && newpath == "/tables/1.rf" {
+			client.files[newpath] = []byte("concurrent")
+			return context.DeadlineExceeded
+		}
+		return nil
+	}
+	backend, err := New("nn:8020", WithClient(client))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	w, err := backend.Create(context.Background(), "/tables/1.rf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write([]byte("new")); err != nil {
+		t.Fatal(err)
+	}
+
+	err = w.Close()
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Close error = %v, want context deadline exceeded", err)
+	}
+	if !strings.Contains(err.Error(), "refusing to delete destination") {
+		t.Fatalf("Close error = %v, want concurrent-target safeguard", err)
+	}
+	if got := string(client.files["/tables/1.rf"]); got != "concurrent" {
+		t.Fatalf("target contents = %q, want concurrent data preserved", got)
+	}
+	if _, ok := client.files[client.lastCreatePath]; !ok {
+		t.Fatalf("temporary file %s missing after unsuccessful Close", client.lastCreatePath)
+	}
+	for name := range client.files {
+		if strings.Contains(name, replacementBackupPrefix) {
+			t.Fatalf("unexpected backup %s remains for absent original target", name)
+		}
+	}
+	if err := w.(storage.Aborter).Abort(); err == nil || !strings.Contains(err.Error(), "cannot be safely aborted") {
+		t.Fatalf("Abort after unsafe Close error = %v, want unabortable safeguard", err)
+	}
+}
+
+func TestBackendAmbiguousPublishRenameRestoresBackupWhenTargetAbsentAndRetainsTempForAbort(t *testing.T) {
+	client := newFakeClient()
+	client.files["/tables/1.rf"] = []byte("old")
+	client.renameContextHook = func(_ context.Context, oldpath, newpath string) error {
+		if strings.Contains(oldpath, replacementTempPrefix) && newpath == "/tables/1.rf" {
 			return context.DeadlineExceeded
 		}
 		return nil
