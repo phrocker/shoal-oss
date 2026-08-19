@@ -208,6 +208,24 @@ func TestHelmValuesDeclareDisruptionRolloutAndTLSDefaults(t *testing.T) {
 	}
 }
 
+// TestHelmWriteTierTLSProbeTemplates guards the chart-specific probe wiring
+// needed once the write tier's health listener is TLS-wrapped. Plain TLS
+// needs kubelet HTTP probes to use HTTPS; mutual TLS cannot use kubelet
+// httpGet probes because kubelet does not present a client certificate, so
+// the chart intentionally falls back to TCP reachability probes in that mode.
+func TestHelmWriteTierTLSProbeTemplates(t *testing.T) {
+	template := readManifest(t, "helm/shoal/templates/embed-statefulset.yaml")
+	for _, want := range []string{
+		"scheme: HTTPS",
+		"if and .Values.writeTier.tls.enabled .Values.writeTier.tls.requireClientCert",
+		"tcpSocket:",
+	} {
+		if !strings.Contains(template, want) {
+			t.Errorf("helm/shoal/templates/embed-statefulset.yaml: want to contain %q", want)
+		}
+	}
+}
+
 // TestHelmChartLintsAndRenders runs `helm lint` and `helm template`
 // (default values, then TLS + mutual-TLS enabled) against the chart when
 // a `helm` binary is available, and fails on any non-zero exit or on

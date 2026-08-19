@@ -74,16 +74,32 @@ spec:
               readOnly: true
             {{- end }}
           readinessProbe:
+            {{- if and .Values.writeTier.tls.enabled .Values.writeTier.tls.requireClientCert }}
+            tcpSocket:
+              port: metrics
+            {{- else }}
             httpGet:
               path: /readyz
               port: metrics
+              {{- if .Values.writeTier.tls.enabled }}
+              scheme: HTTPS
+              {{- end }}
+            {{- end }}
             initialDelaySeconds: 5
             periodSeconds: {{ .Values.writeTier.readinessProbePeriodSeconds }}
             failureThreshold: {{ .Values.writeTier.readinessProbeFailureThreshold }}
           livenessProbe:
+            {{- if and .Values.writeTier.tls.enabled .Values.writeTier.tls.requireClientCert }}
+            tcpSocket:
+              port: metrics
+            {{- else }}
             httpGet:
               path: /healthz
               port: metrics
+              {{- if .Values.writeTier.tls.enabled }}
+              scheme: HTTPS
+              {{- end }}
+            {{- end }}
             initialDelaySeconds: 15
             periodSeconds: 20
           resources:

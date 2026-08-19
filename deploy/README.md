@@ -95,6 +95,8 @@ Enable it by supplying a PEM certificate and private key, via flag or environmen
 
 To enable TLS in the plain write-tier manifest: mount a Secret containing `tls.crt` / `tls.key` (and, for mutual TLS, `ca.crt`) at `/var/run/secrets/shoal/tls`, then uncomment the matching `--tls-*` args, volumeMount, and volume already spelled out as comments in `deploy/k8s/write-tier.yaml`. With Helm, set `writeTier.tls.enabled=true` and `writeTier.tls.secretName=<your secret>` (add `writeTier.tls.requireClientCert=true` for mutual TLS); the chart wires the args/volume for you and fails the render with a clear error if `secretName` is left unset while `enabled=true`.
 
+With Helm TLS enabled, kubelet `httpGet` probes use `scheme: HTTPS` for `/readyz` and `/healthz`. When Helm mutual TLS is enabled, the chart switches those probes to `tcpSocket` checks against the metrics port instead, because kubelet HTTP probes cannot present a client certificate. That keeps mTLS pods schedulable/ready from Kubernetes' perspective, but the probe then proves only listener reachability rather than `/readyz`'s startup/shutdown-drain state; use a custom probe path if you need both kubelet-visible readiness semantics and client-certificate enforcement on the HTTP listener.
+
 Certificate/key rotation is out of scope for this slice: `shoal-embed` loads the key pair (and CA bundle) once at startup, so rotating any of them requires a pod restart today — see the gaps list below.
 
 ## Rolling upgrades, rollback, and voluntary disruption
