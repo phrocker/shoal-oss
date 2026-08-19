@@ -8,9 +8,9 @@
 
 _Static_assert(SHOAL_ABI_VERSION == 1u, "unexpected compatibility ABI version");
 _Static_assert(SHOAL_ABI_VERSION_MAJOR == 1u, "unexpected ABI major");
-_Static_assert(SHOAL_ABI_VERSION_MINOR == 6u, "unexpected ABI minor");
+_Static_assert(SHOAL_ABI_VERSION_MINOR == 7u, "unexpected ABI minor");
 _Static_assert(SHOAL_ABI_VERSION_PATCH == 0u, "unexpected ABI patch");
-_Static_assert(SHOAL_ABI_VERSION_PACKED == 0x00010600u,
+_Static_assert(SHOAL_ABI_VERSION_PACKED == 0x00010700u,
                "unexpected packed ABI version");
 _Static_assert(SHOAL_ABI_CAPABILITY_CONNECTOR == 0u,
                "unexpected connector capability id");
@@ -48,11 +48,11 @@ _Static_assert(SHOAL_ABI_CAPABILITY_RFILE == 16u,
                "unexpected RFile capability id");
 _Static_assert(SHOAL_ABI_CAPABILITY_DATA_VALUES == 17u,
                "unexpected data values capability id");
-_Static_assert(SHOAL_ABI_CAPABILITY_COUNT == 18u,
+_Static_assert(SHOAL_ABI_CAPABILITY_COUNT == 19u,
                "unexpected capability count");
 _Static_assert(SHOAL_ABI_CAPABILITY_WORD_COUNT == 1u,
                "unexpected capability word count");
-_Static_assert(SHOAL_ABI_CAPABILITY_WORD0 == UINT64_C(0x3ffff),
+_Static_assert(SHOAL_ABI_CAPABILITY_WORD0 == UINT64_C(0x7ffff),
                "unexpected capability word 0");
 
 #define ASSERT_PERMISSION_VALUE(name, value)                                  \
@@ -469,6 +469,97 @@ static void test_data_value_abi(void) {
   shoal_authorizations_free(&auths);
 }
 
+static void test_buffered_writer_abi(shoal_connector *connector) {
+  shoal_error *error = NULL;
+  shoal_write_failure *failure = NULL;
+  shoal_accumulo_writer *writer = NULL;
+  shoal_batch_writer_config config;
+  shoal_batch_writer_config_init(&config);
+  config.table_name = "events";
+
+  shoal_test_result_alloc_fail_after(0);
+  expect_error(shoal_connector_create_accumulo_writer(
+                   connector, &config, &writer, &error),
+               SHOAL_STATUS_OUT_OF_MEMORY, &error, "buffered writer");
+  assert(writer == NULL);
+  shoal_test_result_alloc_reset();
+
+  assert(shoal_connector_create_accumulo_writer(
+             connector, &config, &writer, &error) == SHOAL_STATUS_OK);
+  assert(writer != NULL && error == NULL);
+  static const uint8_t row_a[] = {'a', '\0'};
+  static const uint8_t family[] = {'f'};
+  static const uint8_t qualifier[] = {'q'};
+  static const uint8_t value[] = {'v', '\0'};
+  shoal_bytes row_a_bytes = {row_a, sizeof(row_a)};
+  shoal_bytes family_bytes = {family, sizeof(family)};
+  shoal_bytes qualifier_bytes = {qualifier, sizeof(qualifier)};
+  shoal_bytes empty = {NULL, 0};
+  shoal_bytes value_bytes = {value, sizeof(value)};
+  expect_error(shoal_accumulo_writer_put(
+                   writer, row_a_bytes, family_bytes, qualifier_bytes, empty,
+                   0, value_bytes, 0, &failure, &error),
+               SHOAL_STATUS_DISCOVERY_UNAVAILABLE, &error,
+               "discovery unavailable");
+  assert(failure == NULL);
+  assert(shoal_accumulo_writer_close(writer, 0, &failure, &error) ==
+         SHOAL_STATUS_OK);
+  shoal_accumulo_writer_free(&writer);
+  shoal_accumulo_writer_free(&writer);
+
+  assert(shoal_test_accumulo_writer_create(
+      SHOAL_TEST_WRITER_SUCCESS, &writer));
+  shoal_bytes malformed = {NULL, 1};
+  expect_error(shoal_accumulo_writer_put(
+                   writer, malformed, family_bytes, qualifier_bytes, empty, 0,
+                   value_bytes, 0, &failure, &error),
+               SHOAL_STATUS_INVALID_ARGUMENT, &error, "row");
+  expect_error(shoal_accumulo_writer_put(
+                   writer, row_a_bytes, family_bytes, qualifier_bytes, empty,
+                   0, value_bytes, -1, &failure, &error),
+               SHOAL_STATUS_INVALID_ARGUMENT, &error, "timeout");
+  assert(shoal_accumulo_writer_put(
+             writer, row_a_bytes, family_bytes, qualifier_bytes, empty, 0,
+             value_bytes, 0, &failure, &error) == SHOAL_STATUS_OK);
+  assert(shoal_accumulo_writer_put(
+             writer, row_a_bytes, family_bytes, qualifier_bytes, empty, 7,
+             value_bytes, 0, &failure, &error) == SHOAL_STATUS_OK);
+  static const uint8_t row_b[] = {'b'};
+  shoal_bytes row_b_bytes = {row_b, sizeof(row_b)};
+  assert(shoal_accumulo_writer_put_delete(
+             writer, row_b_bytes, family_bytes, qualifier_bytes, empty, 0, 0,
+             &failure, &error) == SHOAL_STATUS_OK);
+  shoal_key key = {
+      row_a_bytes,
+      family_bytes,
+      qualifier_bytes,
+      empty,
+      INT64_MAX,
+  };
+  assert(shoal_accumulo_writer_delete(writer, &key, 0, &failure, &error) ==
+         SHOAL_STATUS_OK);
+  assert(shoal_accumulo_writer_close(writer, 0, &failure, &error) ==
+         SHOAL_STATUS_OK);
+  assert(shoal_accumulo_writer_close(writer, 0, &failure, &error) ==
+         SHOAL_STATUS_OK);
+  shoal_accumulo_writer_free(&writer);
+
+  assert(shoal_test_accumulo_writer_create(
+      SHOAL_TEST_WRITER_STRUCTURED_FAILURE, &writer));
+  assert(shoal_accumulo_writer_put(
+             writer, row_a_bytes, family_bytes, qualifier_bytes, empty, 1,
+             value_bytes, 0, &failure, &error) == SHOAL_STATUS_OK);
+  assert(shoal_accumulo_writer_put(
+             writer, row_b_bytes, family_bytes, qualifier_bytes, empty, 2,
+             value_bytes, 0, &failure, &error) == SHOAL_STATUS_OK);
+  expect_error(shoal_accumulo_writer_close(writer, 0, &failure, &error),
+               SHOAL_STATUS_AMBIGUOUS_WRITE, &error, "batch writer failed");
+  assert(failure != NULL);
+  assert(shoal_write_failure_get_flags(failure) != 0);
+  shoal_write_failure_free(&failure);
+  shoal_accumulo_writer_free(&writer);
+}
+
 int main(void) {
   shoal_connector *connector = NULL;
   shoal_connector *admin_connector = NULL;
@@ -522,6 +613,7 @@ int main(void) {
   assert(shoal_abi_has_capability(SHOAL_ABI_CAPABILITY_DATA_DESCRIPTORS) == 1);
   assert(shoal_abi_has_capability(SHOAL_ABI_CAPABILITY_RFILE) == 1);
   assert(shoal_abi_has_capability(SHOAL_ABI_CAPABILITY_DATA_VALUES) == 1);
+  assert(shoal_abi_has_capability(SHOAL_ABI_CAPABILITY_BUFFERED_WRITER) == 1);
   assert(shoal_abi_has_capability(SHOAL_ABI_CAPABILITY_COUNT) == 0);
   assert(shoal_abi_has_capability(63u) == 0);
   assert(shoal_abi_has_capability(64u) == 0);
@@ -553,6 +645,7 @@ int main(void) {
          SHOAL_STATUS_OK);
   assert(connector != NULL);
   assert(error == NULL);
+  test_buffered_writer_abi(connector);
 
   assert(shoal_test_connector_create(&admin_connector));
   assert(admin_connector != NULL);

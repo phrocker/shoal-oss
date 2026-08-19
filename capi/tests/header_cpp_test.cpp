@@ -10,7 +10,7 @@ static_assert(std::is_same<shoal_abi_capability_bits, std::uint64_t>::value,
               "capability bitset words must remain 64-bit");
 static_assert(SHOAL_ABI_VERSION == 1u, "unexpected ABI version");
 static_assert(SHOAL_ABI_VERSION_MAJOR == 1u, "unexpected ABI major");
-static_assert(SHOAL_ABI_VERSION_MINOR == 6u, "unexpected ABI minor");
+static_assert(SHOAL_ABI_VERSION_MINOR == 7u, "unexpected ABI minor");
 static_assert(SHOAL_ABI_VERSION_PATCH == 0u, "unexpected ABI patch");
 static_assert(SHOAL_ABI_VERSION_PACKED ==
                   SHOAL_ABI_PACK_VERSION(SHOAL_ABI_VERSION_MAJOR,
@@ -37,9 +37,11 @@ static_assert(SHOAL_ABI_CAPABILITY_RFILE == 16u,
               "unexpected RFile capability id");
 static_assert(SHOAL_ABI_CAPABILITY_DATA_VALUES == 17u,
               "unexpected data values capability id");
-static_assert(SHOAL_ABI_CAPABILITY_COUNT == 18u,
+static_assert(SHOAL_ABI_CAPABILITY_BUFFERED_WRITER == 18u,
+              "unexpected buffered writer capability id");
+static_assert(SHOAL_ABI_CAPABILITY_COUNT == 19u,
               "unexpected capability count");
-static_assert(SHOAL_ABI_CAPABILITY_WORD0 == 0x000000000003ffffull,
+static_assert(SHOAL_ABI_CAPABILITY_WORD0 == 0x000000000007ffffull,
               "unexpected capability word 0");
 static_assert(std::is_standard_layout<shoal_connector_identity_view>::value,
               "identity view must remain standard-layout");
@@ -127,6 +129,7 @@ int main() {
   shoal_rfile_entry_view rfile_entry_view{};
   shoal_authorizations *authorizations = nullptr;
   shoal_key_value_result *key_value_result = nullptr;
+  shoal_accumulo_writer *accumulo_writer = nullptr;
   shoal_key_value key_value{};
   assert(shoal_abi_version() == SHOAL_ABI_VERSION);
   assert(shoal_abi_version_major() == SHOAL_ABI_VERSION_MAJOR);
@@ -149,6 +152,7 @@ int main() {
              SHOAL_ABI_CAPABILITY_CONFIGURATION_TOPOLOGY) == 1);
   assert(shoal_abi_has_capability(SHOAL_ABI_CAPABILITY_RFILE) == 1);
   assert(shoal_abi_has_capability(SHOAL_ABI_CAPABILITY_DATA_VALUES) == 1);
+  assert(shoal_abi_has_capability(SHOAL_ABI_CAPABILITY_BUFFERED_WRITER) == 1);
   assert(shoal_abi_has_capability(SHOAL_ABI_CAPABILITY_COUNT) == 0);
   assert(shoal_versioned_properties_version(versioned_properties) == 0);
   assert(shoal_versioned_properties_count(versioned_properties) == 0);
@@ -219,6 +223,7 @@ int main() {
   shoal_rfile_entry_result_free(&rfile_entry);
   shoal_authorizations_free(&authorizations);
   shoal_key_value_result_free(&key_value_result);
+  shoal_accumulo_writer_free(&accumulo_writer);
   shoal_error_free(&error);
   return 0;
 }

@@ -43,6 +43,10 @@ struct shoal_authorizations {
   uint64_t id;
 };
 
+struct shoal_accumulo_writer {
+  uint64_t id;
+};
+
 struct shoal_error {
   shoal_status code;
   char *message;
@@ -257,6 +261,10 @@ shoal_authorizations *shoal_bridge_authorizations_alloc(uint64_t id);
 uint64_t
 shoal_bridge_authorizations_id(const shoal_authorizations *authorizations);
 void shoal_bridge_authorizations_free(shoal_authorizations *authorizations);
+shoal_accumulo_writer *shoal_bridge_accumulo_writer_alloc(uint64_t id);
+uint64_t
+shoal_bridge_accumulo_writer_id(const shoal_accumulo_writer *writer);
+void shoal_bridge_accumulo_writer_free(shoal_accumulo_writer *writer);
 
 char *shoal_bridge_string_alloc(const char *value, size_t length);
 void shoal_bridge_string_free(char *value);

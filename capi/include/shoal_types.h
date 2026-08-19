@@ -22,7 +22,7 @@
  */
 #define SHOAL_ABI_VERSION 1u
 #define SHOAL_ABI_VERSION_MAJOR 1u
-#define SHOAL_ABI_VERSION_MINOR 6u
+#define SHOAL_ABI_VERSION_MINOR 7u
 #define SHOAL_ABI_VERSION_PATCH 0u
 #define SHOAL_ABI_PACK_VERSION(major, minor, patch)                           \
   ((((uint32_t)(major) & 0xffu) << 16) |                                     \
@@ -57,10 +57,11 @@ enum {
   SHOAL_ABI_CAPABILITY_DATA_DESCRIPTORS = 14,
   SHOAL_ABI_CAPABILITY_CONFIGURATION_TOPOLOGY = 15,
   SHOAL_ABI_CAPABILITY_RFILE = 16,
-  SHOAL_ABI_CAPABILITY_DATA_VALUES = 17
+  SHOAL_ABI_CAPABILITY_DATA_VALUES = 17,
+  SHOAL_ABI_CAPABILITY_BUFFERED_WRITER = 18
 };
 
-#define SHOAL_ABI_CAPABILITY_COUNT 18u
+#define SHOAL_ABI_CAPABILITY_COUNT 19u
 #define SHOAL_ABI_CAPABILITY_WORD_BITS 64u
 #define SHOAL_ABI_CAPABILITY_WORD_INDEX(capability_id)                       \
   ((uint32_t)(capability_id) / SHOAL_ABI_CAPABILITY_WORD_BITS)
@@ -106,6 +107,8 @@ enum {
   SHOAL_ABI_CAPABILITY_MASK(SHOAL_ABI_CAPABILITY_RFILE)
 #define SHOAL_ABI_CAPABILITY_DATA_VALUES_MASK                                \
   SHOAL_ABI_CAPABILITY_MASK(SHOAL_ABI_CAPABILITY_DATA_VALUES)
+#define SHOAL_ABI_CAPABILITY_BUFFERED_WRITER_MASK                            \
+  SHOAL_ABI_CAPABILITY_MASK(SHOAL_ABI_CAPABILITY_BUFFERED_WRITER)
 #define SHOAL_ABI_CAPABILITY_WORD0                                           \
   (SHOAL_ABI_CAPABILITY_CONNECTOR_MASK | SHOAL_ABI_CAPABILITY_BOOTSTRAP_MASK | \
    SHOAL_ABI_CAPABILITY_ERROR_MASK | SHOAL_ABI_CAPABILITY_SCANNER_MASK |     \
@@ -122,7 +125,8 @@ enum {
    SHOAL_ABI_CAPABILITY_DATA_DESCRIPTORS_MASK |                              \
    SHOAL_ABI_CAPABILITY_CONFIGURATION_TOPOLOGY_MASK |                        \
    SHOAL_ABI_CAPABILITY_RFILE_MASK |                                         \
-   SHOAL_ABI_CAPABILITY_DATA_VALUES_MASK)
+   SHOAL_ABI_CAPABILITY_DATA_VALUES_MASK |                                  \
+   SHOAL_ABI_CAPABILITY_BUFFERED_WRITER_MASK)
 
 typedef int32_t shoal_status;
 
@@ -191,6 +195,7 @@ typedef struct shoal_rfile_seekable shoal_rfile_seekable;
 typedef struct shoal_rfile_entry_result shoal_rfile_entry_result;
 typedef struct shoal_authorizations shoal_authorizations;
 typedef struct shoal_key_value_result shoal_key_value_result;
+typedef struct shoal_accumulo_writer shoal_accumulo_writer;
 typedef struct shoal_error shoal_error;
 
 typedef struct shoal_connector_identity_view {
