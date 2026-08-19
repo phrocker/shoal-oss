@@ -649,13 +649,13 @@ one table at construction, so no method takes a table name.
 | SB-TABLE-013 | `import(dir, fail_path, setTime=False) -> bool` (`pysharkbite.cpp:241`, `PythonStructures.h:98`) | `Connector.BulkImport(ctx, tableName, bulkDir, BulkImportOptions{SetTime})` (`accumulo/table_bulk_import.go`); `TestBulkImportUsesTableIDAndFateArguments`, `TestBulkImportResolvesTableNameNotFound`, `TestBulkImportMapsManagerErrors`, `TestBulkImportValidationCancellationAndLifecycle` | — | — | Behavior mismatch | Shoal exposes Accumulo 4 Bulk Import V2 on `Connector`, but requires a pre-staged `loadmap.json` and has no Sharkbite `fail_path` behavior or compatibility adapter. Reachable only via `getattr(tableOps, "import")(...)` because `import` is a Python keyword; the shim must expose both `import` and a usable alias such as `import_directory`. |
 | SB-TABLE-014 | Table export | — (no Sharkbite Python binding either) | — | — | Not required (rationale required) | Rationale: not in the Sharkbite Python surface. Listed so future readers do not re-derive it. |
 | SB-TABLE-015 | Table clone / online / offline / merge / delete-rows | — (no Sharkbite Python binding) | — | — | Not required (rationale required) | Rationale: absent from the Sharkbite Python contract; confirmed absent from `accumulo/` as well. |
-| SB-TABLE-016 | `AccumuloTableInfo.table_id(table) -> str` (`pysharkbite.cpp:253`, `PythonStructures.h:40`) | `Connector.TableByName(ctx, name) (Table, error)`; `Table.ID` (`accumulo/discovery.go:65`, `accumulo/discovery.go:14`) | — | `TestDiscoveryTableLookupAndRouting` (`accumulo/discovery_test.go:108`) | Missing C ABI | |
-| SB-TABLE-017 | `AccumuloTableInfo.table_name(tableid) -> str` (`pysharkbite.cpp:254`, `PythonStructures.h:49`) | `Connector.TableByID(ctx, id) (Table, error)` (`accumulo/discovery.go:87`) | — | `TestDiscoveryTableLookupAndRouting` (`accumulo/discovery_test.go:108`) | Missing C ABI | |
-| SB-TABLE-018 | `AccumuloTableInfo.list_tables() -> list[str]` (`pysharkbite.cpp:255`) | `Connector.Tables(ctx) ([]Table, error)` (`accumulo/table_admin.go:29`) | — | `TestTableAdministrationListingAndExistence` (`accumulo/table_admin_test.go:13`) | Missing C ABI | Sharkbite returns names; Shoal returns `Table{ID, Name}` pairs. Shim must project to names. |
-| SB-TABLE-019 | `AccumuloTableInfo.exists(table) -> bool` (`pysharkbite.cpp:256`, `PythonStructures.h:34`) | `Connector.TableExists(ctx, name)` (`accumulo/table_admin.go:53`) | — | `TestTableAdministrationListingAndExistence` (`accumulo/table_admin_test.go:13`) | Missing C ABI | Distinct from SB-TABLE-002: takes an explicit table name and has no create side effect. |
+| SB-TABLE-016 | `AccumuloTableInfo.table_id(table) -> str` (`pysharkbite.cpp:253`, `PythonStructures.h:40`) | `Connector.TableByName(ctx, name) (Table, error)`; `Table.ID` (`accumulo/discovery.go:65`, `accumulo/discovery.go:14`) | `shoal_connector_list_tables` + owned `shoal_table_list_result` | `TestDiscoveryTableLookupAndRouting` (`accumulo/discovery_test.go:312`); `main()` (`capi/tests/lifecycle.c`) | Behavior mismatch | The C ABI exposes the same ID/name pairs through `list_tables`, but not as a dedicated `table_id(table)` helper; a compatibility shim must project the pair list into Sharkbite's direct lookup. |
+| SB-TABLE-017 | `AccumuloTableInfo.table_name(tableid) -> str` (`pysharkbite.cpp:254`, `PythonStructures.h:49`) | `Connector.TableByID(ctx, id) (Table, error)` (`accumulo/discovery.go:87`) | `shoal_connector_list_tables` + owned `shoal_table_list_result` | `TestDiscoveryTableLookupAndRouting` (`accumulo/discovery_test.go:312`); `main()` (`capi/tests/lifecycle.c`) | Behavior mismatch | The C ABI exposes the same ID/name pairs through `list_tables`, but not as a dedicated `table_name(tableid)` helper; a compatibility shim must project the pair list into Sharkbite's direct lookup. |
+| SB-TABLE-018 | `AccumuloTableInfo.list_tables() -> list[str]` (`pysharkbite.cpp:255`) | `Connector.Tables(ctx) ([]Table, error)` (`accumulo/table_admin.go:29`) | `shoal_connector_list_tables` + owned `shoal_table_list_result` | `TestTableAdministrationListingAndExistence` (`accumulo/table_admin_test.go:14`); `main()` (`capi/tests/lifecycle.c`) | Behavior mismatch | Sharkbite returns names; Shoal returns `Table{ID, Name}` pairs. A compatibility shim must project either Go or C results down to names. |
+| SB-TABLE-019 | `AccumuloTableInfo.exists(table) -> bool` (`pysharkbite.cpp:256`, `PythonStructures.h:34`) | `Connector.TableExists(ctx, name)` (`accumulo/table_admin.go:53`) | `shoal_connector_table_exists` | `TestTableAdministrationListingAndExistence` (`accumulo/table_admin_test.go:14`); `main()` (`capi/tests/lifecycle.c`) | Behavior mismatch | Distinct from SB-TABLE-002: takes an explicit table name and has no create side effect, but the Go/C layers still report status-or-error rather than Sharkbite's direct `bool` return. |
 | SB-TABLE-020 | Tablet discovery (not bound in Python) | `Connector.Tablets`, `LocateTablet`, `InvalidateTablet`, `InvalidateTable`, `InvalidateDiscovery` (`accumulo/discovery.go:112,135,157,170,183`) | — | `TestDiscoveryInvalidationAndDefensiveCopies` (`accumulo/discovery_test.go:148`) | Not required (rationale required) | Rationale: Shoal superset; Sharkbite hides locator state entirely. |
-| SB-TABLE-021 | Table-operation errors: table does not exist after `remove()` (`test/python/TestBadOperations.py:33-62`) | `ErrTableNotFound` (`accumulo/errors.go:15`), `mapManagerError` (`accumulo/table_admin.go:171`) | `SHOAL_STATUS_NOT_FOUND` (9) (`capi/include/shoal_types.h`) | `TestTableMutationsMapErrorsAndLifecycle` (`accumulo/table_admin_test.go:263`); `TestMapManagerErrorUsesServerTableName` (`accumulo/table_admin_test.go:328`) | Missing C ABI | Sharkbite raises `ClientException` with code `TABLE_NOT_FOUND` (`test/vandv/invalidscans.h`). Mapping is [SB-ERR-004](#sec-18). |
-| SB-TABLE-022 | Creating an existing table | `ErrTableExists` (`accumulo/errors.go:18`) | — | `TestTableMutationsMapErrorsAndLifecycle` (`accumulo/table_admin_test.go:263`) | Missing C ABI | Sharkbite's `create(False)` returns `False` rather than raising (`test/python/TestWrites.py:17-19`). The shim must return `False`, not raise. |
+| SB-TABLE-021 | Table-operation errors: table does not exist after `remove()` (`test/python/TestBadOperations.py:33-62`) | `ErrTableNotFound` (`accumulo/errors.go:15`), `mapManagerError` (`accumulo/table_admin.go:171`) | `SHOAL_STATUS_NOT_FOUND` (9) (`capi/include/shoal_types.h`) | `TestTableMutationsMapErrorsAndLifecycle` (`accumulo/table_admin_test.go:301`); `TestMapManagerErrorUsesServerTableName` (`accumulo/table_admin_test.go:366`); `TestStatusForTableAdministrationErrors` (`cmd/shoal-capi/table_admin_export_test.go`); `main()` (`capi/tests/lifecycle.c`) | Behavior mismatch | Sharkbite raises `ClientException` with code `TABLE_NOT_FOUND` (`test/vandv/invalidscans.h`); Shoal's Go/C layers map that condition, but the compatibility shim still has to raise Sharkbite's object/result shape. Mapping is [SB-ERR-004](#sec-18). |
+| SB-TABLE-022 | Creating an existing table | `ErrTableExists` (`accumulo/errors.go:18`) | `SHOAL_STATUS_ALREADY_EXISTS` (19) (`capi/include/shoal_types.h`) | `TestTableMutationsMapErrorsAndLifecycle` (`accumulo/table_admin_test.go:301`); `TestStatusForTableAdministrationErrors` (`cmd/shoal-capi/table_admin_export_test.go`); `main()` (`capi/tests/lifecycle.c`) | Behavior mismatch | Sharkbite's `create(False)` returns `False` rather than raising (`test/python/TestWrites.py:17-19`). Shoal's Go/C layers surface the condition, but the compatibility shim must return `False`, not raise. |
 
 <a id="sec-12"></a>
 
@@ -4407,8 +4407,8 @@ Sharkbite's `test/19x/st` SMAC project played), driven from CI, with the ported
 | --- | --- |
 | Covered | 0 |
 | Missing Go | 2422 |
-| Missing C ABI | 111 |
-| Behavior mismatch | 191 |
+| Missing C ABI | 105 |
+| Behavior mismatch | 197 |
 | Intentional divergence (approval required) | 87 |
 | Not required (rationale required) | 392 |
 | **Total** | **3203** |
@@ -4435,7 +4435,7 @@ every non-vendored header maps to exactly one row, proved arithmetically in
 | [§9.3](#sec-9-3) pandas surface | `SB-PANDA` | 21 | 0 | 0 | 20 | 0 | 0 | 1 |
 | [§10](#sec-10) Writers | `SB-WRITE` | 23 | 0 | 1 | 6 | 7 | 0 | 9 |
 | [§10.1](#sec-10-1) High-level helpers | `SB-BASE` | 20 | 0 | 0 | 18 | 0 | 0 | 2 |
-| [§11](#sec-11) Table operations | `SB-TABLE` | 22 | 0 | 2 | 6 | 8 | 0 | 6 |
+| [§11](#sec-11) Table operations | `SB-TABLE` | 22 | 0 | 2 | 0 | 14 | 0 | 6 |
 | [§12](#sec-12) Namespaces | `SB-NS` | 8 | 0 | 0 | 0 | 8 | 0 | 0 |
 | [§13](#sec-13) Security | `SB-SEC` | 19 | 0 | 0 | 0 | 18 | 0 | 1 |
 | [§14](#sec-14) Cluster status | `SB-STAT` | 84 | 0 | 1 | 0 | 0 | 82 | 1 |
@@ -4447,7 +4447,7 @@ every non-vendored header maps to exactly one row, proved arithmetically in
 | [§19.2](#sec-19-2) C++ complete member enumeration | `SB-CXX` | 2626 | 0 | 2307 | 0 | 15 | 0 | 304 |
 | [§19.4](#sec-19-4) Dead embedded-module surface | `SB-EMB` | 35 | 0 | 0 | 0 | 0 | 0 | 35 |
 | [§20](#sec-20) Cross-cutting | `SB-XCUT` | 19 | 0 | 1 | 4 | 14 | 0 | 0 |
-| **Total** | | **3203** | **0** | **2422** | **111** | **191** | **87** | **392** |
+| **Total** | | **3203** | **0** | **2422** | **105** | **197** | **87** | **392** |
 
 ### 25.3 Reading the counts
 
@@ -4466,16 +4466,15 @@ on. The Python-visible subset is far smaller, which is why [§5](#sec-5)–
 [§19.2](#sec-19-2) rows carry a per-area rationale rather than an implied
 promise to port all of it.
 
-`Behavior mismatch` (191) is the bucket that sets the schedule: 176 rows on the
+`Behavior mismatch` (197) is the bucket that sets the schedule: 182 rows on the
 Python-visible and curated C++ surface each need a differential test against a
 live cluster or the exported ABI, and 15 are destructors of classes bound into
 Python, where the destruction point is user-observable and the model differs
 from Go finalisation ([§19.1](#sec-19-1)). `Intentional divergence` (87) is
 dominated by one upstream fact: 82 rows are cluster-status accessors Accumulo
-itself deleted ([§14](#sec-14), [SB-DIV-016](#sec-26)). `Missing C ABI` (111)
-is concentrated in the Python layers — pandas (20), high-level helpers (18),
-PyTorch (9). Revision 17 moved the implemented administration rows out of this
-bucket without claiming Python equivalence.
+itself deleted ([§14](#sec-14), [SB-DIV-016](#sec-26)). `Missing C ABI` (105)
+is now concentrated in the packaging and Python helper layers — pandas (20),
+high-level helpers (18), packaging/import scaffolding (10), and PyTorch (9).
 
 ### 25.4 Revision history
 
@@ -4483,15 +4482,15 @@ bucket without claiming Python equivalence.
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | Covered | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
 | Missing Go | 2455 | 2451 | 2454 | 2448 | 2448 | 2447 | 2447 | 2422 | -25 |
-| Missing C ABI | 116 | 116 | 116 | 116 | 116 | 116 | 116 | 111 | -5 |
-| Behavior mismatch | 161 | 161 | 161 | 161 | 161 | 161 | 161 | 191 | +30 |
+| Missing C ABI | 116 | 116 | 116 | 116 | 116 | 116 | 116 | 105 | -11 |
+| Behavior mismatch | 161 | 161 | 161 | 161 | 161 | 161 | 161 | 197 | +36 |
 | Intentional divergence | 87 | 87 | 87 | 87 | 87 | 87 | 87 | 87 | 0 |
 | Not required | 358 | 356 | 356 | 356 | 356 | 392 | 392 | 392 | 0 |
 | **Total** | **3177** | **3171** | **3174** | **3168** | **3168** | **3203** | **3203** | **3203** | **0** |
 
-Revision 17 changes 30 statuses without changing the inventory: 25 merged Go
+Revision 17 changes 36 statuses without changing the inventory: 25 merged Go
 namespace/security/split rows move from `Missing Go` to `Behavior mismatch`,
-and five merged table-administration rows move from `Missing C ABI` to
+and 11 merged table-administration rows move from `Missing C ABI` to
 `Behavior mismatch`. Exact Go and C evidence now exists, while Python-visible
 defaults, return values, and object composition still differ.
 

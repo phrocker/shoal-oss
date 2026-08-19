@@ -260,13 +260,13 @@ SB-TABLE-012 Missing Go
 SB-TABLE-013 Behavior mismatch
 SB-TABLE-014 Not required (rationale required)
 SB-TABLE-015 Not required (rationale required)
-SB-TABLE-016 Missing C ABI
-SB-TABLE-017 Missing C ABI
-SB-TABLE-018 Missing C ABI
-SB-TABLE-019 Missing C ABI
+SB-TABLE-016 Behavior mismatch
+SB-TABLE-017 Behavior mismatch
+SB-TABLE-018 Behavior mismatch
+SB-TABLE-019 Behavior mismatch
 SB-TABLE-020 Not required (rationale required)
-SB-TABLE-021 Missing C ABI
-SB-TABLE-022 Missing C ABI
+SB-TABLE-021 Behavior mismatch
+SB-TABLE-022 Behavior mismatch
 SB-NS-001 Behavior mismatch
 SB-NS-002 Behavior mismatch
 SB-NS-003 Behavior mismatch

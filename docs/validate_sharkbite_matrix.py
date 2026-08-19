@@ -55,8 +55,8 @@ def status_count_map(
 EXPECTED_STATUS_COUNTS = {
     "Covered": 0,
     "Missing Go": 2422,
-    "Missing C ABI": 111,
-    "Behavior mismatch": 191,
+    "Missing C ABI": 105,
+    "Behavior mismatch": 197,
     "Intentional divergence (approval required)": 87,
     "Not required (rationale required)": 392,
 }
@@ -130,8 +130,7 @@ EXPECTED_PREFIX_COUNTS = {
     ),
     "SB-TABLE": status_count_map(
         missing_go=2,
-        missing_c_abi=6,
-        behavior_mismatch=8,
+        behavior_mismatch=14,
         not_required=6,
     ),
     "SB-TORCH": status_count_map(missing_c_abi=9),
@@ -991,7 +990,7 @@ def validate_status_narratives(
         f"The shape of the work is visible in the {status_counts['Missing Go']} `Missing Go` rows, of which {prefix_counts['SB-CXX']['Missing Go']} are the C++ members in [§19.2](#sec-19-2) that no Shoal layer exports.",
         f"`Behavior mismatch` ({status_counts['Behavior mismatch']}) is the bucket that sets the schedule: {python_visible_behavior} rows on the Python-visible and curated C++ surface each need a differential test against a live cluster or the exported ABI, and {prefix_counts['SB-CXX']['Behavior mismatch']} are destructors of classes bound into Python, where the destruction point is user-observable and the model differs from Go finalisation ([§19.1](#sec-19-1)).",
         f"`Intentional divergence` ({status_counts[INTENTIONAL_DIVERGENCE_STATUS]}) is dominated by one upstream fact: {prefix_counts['SB-STAT'][INTENTIONAL_DIVERGENCE_STATUS]} rows are cluster-status accessors Accumulo itself deleted ([§14](#sec-14), [SB-DIV-016](#sec-26)).",
-        f"`Missing C ABI` ({status_counts['Missing C ABI']}) is concentrated in the Python layers — pandas ({prefix_counts['SB-PANDA']['Missing C ABI']}), high-level helpers ({prefix_counts['SB-BASE']['Missing C ABI']}), PyTorch ({prefix_counts['SB-TORCH']['Missing C ABI']}).",
+        f"`Missing C ABI` ({status_counts['Missing C ABI']}) is now concentrated in the packaging and Python helper layers — pandas ({prefix_counts['SB-PANDA']['Missing C ABI']}), high-level helpers ({prefix_counts['SB-BASE']['Missing C ABI']}), packaging/import scaffolding ({prefix_counts['SB-PKG']['Missing C ABI']}), and PyTorch ({prefix_counts['SB-TORCH']['Missing C ABI']}).",
     ]
     for phrase in expected_phrases:
         require(phrase in normalized, f"missing or stale status narrative: {phrase}")
