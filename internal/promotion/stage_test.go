@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -865,6 +866,94 @@ func TestStageBulkDirRejectsSourceMutatedBetweenPreflightVerifyAndItsOwnCopy(t *
 	}
 	if _, err := dst.Open(ctx, "hdfs://nn/bulk/events-1/F0002.rf"); err == nil {
 		t.Fatal("F0002.rf present after F0001.rf failed its post-copy verification, want absent (fails closed before copying later files)")
+	}
+}
+
+// cancelDuringReadFile is a storage.File whose ReadAt cancels ctx (via a
+// stored context.CancelFunc) the moment each call is made, before
+// returning its (otherwise normal) chunk of data. size is deliberately
+// several 256KB chunks large so a hashing loop that still fails to poll
+// ctx.Err() promptly would keep issuing ReadAt calls for every
+// remaining chunk instead of stopping after the first one.
+type cancelDuringReadFile struct {
+	size      int64
+	cancel    context.CancelFunc
+	readCalls int32
+}
+
+func (f *cancelDuringReadFile) ReadAt(p []byte, off int64) (int, error) {
+	atomic.AddInt32(&f.readCalls, 1)
+	f.cancel()
+	for i := range p {
+		p[i] = 'x'
+	}
+	if off+int64(len(p)) >= f.size {
+		return len(p), io.EOF
+	}
+	return len(p), nil
+}
+
+func (f *cancelDuringReadFile) Close() error { return nil }
+func (f *cancelDuringReadFile) Size() int64  { return f.size }
+
+type cancelDuringReadBackend struct{ file *cancelDuringReadFile }
+
+func (b cancelDuringReadBackend) Open(context.Context, string) (shstorage.File, error) {
+	return b.file, nil
+}
+
+// openFuncBackend is a storage.Backend whose Open delegates to an
+// arbitrary func, letting a test observe (or refuse) an Open call
+// without a full backend implementation.
+type openFuncBackend func(ctx context.Context, path string) (shstorage.File, error)
+
+func (f openFuncBackend) Open(ctx context.Context, path string) (shstorage.File, error) {
+	return f(ctx, path)
+}
+
+// TestVerifyStagedRFileStopsPromptlyOnCancellationDuringHash proves a
+// round-11 Copilot review fix: verifyStagedRFile's read-and-hash loop
+// now polls ctx.Err() before and immediately after every ReadAt, so
+// cancellation mid-hash is observed within a single 256KB chunk instead
+// of only after the whole (potentially very large) RFile has been read.
+// The fake file here is more than 3 chunks large and cancels ctx on its
+// very first ReadAt call; if the fix regressed to checking ctx.Err()
+// only once (or not polling the loop at all), this test would observe
+// readCalls > 1 -- the loop would keep reading every remaining chunk
+// before its next (or only) chance to notice cancellation.
+func TestVerifyStagedRFileStopsPromptlyOnCancellationDuringHash(t *testing.T) {
+	const chunkSize = 256 * 1024
+	ctx, cancel := context.WithCancel(context.Background())
+	file := &cancelDuringReadFile{size: chunkSize*3 + 100}
+	file.cancel = cancel
+	dst := cancelDuringReadBackend{file: file}
+
+	err := verifyStagedRFile(ctx, dst, "bulk/F0001.rf", file.size, "irrelevant-sha256")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("verifyStagedRFile error = %v, want context.Canceled in the chain", err)
+	}
+	if got := atomic.LoadInt32(&file.readCalls); got != 1 {
+		t.Fatalf("ReadAt calls = %d, want exactly 1 (cancellation observed after the first 256KB chunk of a %d-byte file, not after reading it all)", got, file.size)
+	}
+}
+
+// TestVerifyStagedRFileRejectsAlreadyCanceledContextBeforeOpen proves
+// verifyStagedRFile checks ctx.Err() before it ever calls dst.Open, so
+// an already-canceled context short-circuits before any backend I/O is
+// attempted at all, mirroring storage.Copy's own pre-Open poll.
+func TestVerifyStagedRFileRejectsAlreadyCanceledContextBeforeOpen(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	opened := false
+	dst := openFuncBackend(func(context.Context, string) (shstorage.File, error) {
+		opened = true
+		return nil, errors.New("dst.Open must not be called once ctx is already canceled")
+	})
+	if err := verifyStagedRFile(ctx, dst, "bulk/F0001.rf", 4, "irrelevant"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("verifyStagedRFile error = %v, want context.Canceled", err)
+	}
+	if opened {
+		t.Fatal("verifyStagedRFile called dst.Open with an already-canceled context, want it to fail before opening")
 	}
 }
 

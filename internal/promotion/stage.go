@@ -237,9 +237,25 @@ func StageBulkDir(
 // mirrors engine's own unexported hashObject helper; it is duplicated
 // here in small form rather than exported from engine or added to
 // storage's public surface, since this is its only call site.
+//
+// ctx is polled before Open and both before and immediately after every
+// ReadAt, mirroring storage.Copy's own polling pattern, so cancellation
+// during a large RFile's re-hash is observed within one 256KB chunk
+// rather than only after the whole file has been read. As with
+// storage.Copy, any ctx.Err() observed here still returns the
+// cancellation itself as the failure, even on the loop's last,
+// otherwise-successful read, rather than racing to decide whether the
+// read "finished in time" -- keeping this function's cancellation
+// semantics identical to Copy's.
 func verifyStagedRFile(ctx context.Context, dst storage.Backend, dstPath string, wantSize int64, wantSHA256 string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	f, err := dst.Open(ctx, dstPath)
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return fmt.Errorf("open staged copy %s: %w", dstPath, errors.Join(err, ctxErr))
+		}
 		return fmt.Errorf("open staged copy %s: %w", dstPath, err)
 	}
 	defer f.Close()
@@ -247,6 +263,9 @@ func verifyStagedRFile(ctx context.Context, dst storage.Backend, dstPath string,
 	buf := make([]byte, 256*1024)
 	var off int64
 	for off < f.Size() {
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("read staged copy %s: %w", dstPath, err)
+		}
 		want := int64(len(buf))
 		if off+want > f.Size() {
 			want = f.Size() - off
@@ -255,6 +274,12 @@ func verifyStagedRFile(ctx context.Context, dst storage.Backend, dstPath string,
 		if n > 0 {
 			_, _ = h.Write(buf[:n])
 			off += int64(n)
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			if rerr != nil && !errors.Is(rerr, io.EOF) {
+				return fmt.Errorf("read staged copy %s: %w", dstPath, errors.Join(rerr, ctxErr))
+			}
+			return fmt.Errorf("read staged copy %s: %w", dstPath, ctxErr)
 		}
 		if rerr != nil {
 			if errors.Is(rerr, io.EOF) {

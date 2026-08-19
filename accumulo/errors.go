@@ -95,6 +95,13 @@ var (
 	// happens when tablets keep moving or splitting underneath the client.
 	ErrTableSplitsIncomplete = errors.New("accumulo: table splits incomplete")
 
+	// ErrTableIdentityChanged indicates that AddTableSplitsForTable's own
+	// fresh table-name resolution returned a table ID different from the
+	// caller's expected/pinned one, meaning the table was deleted and
+	// recreated under the same name after the caller resolved that ID. It
+	// is returned before any split or mergeability mutation is attempted.
+	ErrTableIdentityChanged = errors.New("accumulo: table changed identity")
+
 	// ErrInvalidUser indicates that a user name is empty or otherwise invalid.
 	ErrInvalidUser = errors.New("accumulo: invalid user")
 

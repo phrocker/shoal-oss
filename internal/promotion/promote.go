@@ -17,27 +17,40 @@ import (
 // submitting the staged bulk directory as a Bulk Import V2 FATE
 // operation. *accumulo.Connector satisfies this.
 type Promoter interface {
-	// AddTableSplits reconciles tableName's destination splits through
-	// Accumulo's manager TABLE_SPLIT FATE operation (never a direct
-	// metadata/ZooKeeper edit), so a subsequent BulkImport carrying a
-	// widened multi-tablet load mapping (see RequiredDestinationSplits)
-	// can pass Accumulo's own server-side load-mapping validation.
-	AddTableSplits(ctx context.Context, tableName string, splits [][]byte) error
+	// AddTableSplitsForTable reconciles table.Name's destination splits
+	// through Accumulo's manager TABLE_SPLIT FATE operation (never a
+	// direct metadata/ZooKeeper edit), so a subsequent BulkImport
+	// carrying a widened multi-tablet load mapping (see
+	// RequiredDestinationSplits) can pass Accumulo's own server-side
+	// load-mapping validation.
+	//
+	// Promote always calls this with table.ID already set to the
+	// pinnedTableID it captured from ResolveTableID immediately before
+	// this call, rather than calling the plain
+	// accumulo.Connector.AddTableSplits: that pin lets
+	// AddTableSplitsForTable itself fail closed, before making any
+	// mutation, if its own fresh resolution of table.Name no longer
+	// matches — see accumulo.Connector.AddTableSplitsForTable's own doc
+	// comment for exactly what this can and cannot prove, and
+	// TestPromoteRejectsWhenDestinationTableChangesIdentityBeforeAddTableSplits
+	// for the regression test.
+	AddTableSplitsForTable(ctx context.Context, table accumulo.Table, splits [][]byte) error
 	// ListTableSplits reports tableName's real, current bounded split
 	// rows in ascending order (accumulo.Connector.ListTableSplits).
-	// Promote uses it, immediately after AddTableSplits, to confirm the
-	// destination has exactly the required rows and nothing else in the
-	// range BuildLoadMapping's widened mapping depends on — see
-	// verifyNoUnexpectedDestinationSplits.
+	// Promote uses it, immediately after AddTableSplitsForTable, to
+	// confirm the destination has exactly the required rows and nothing
+	// else in the range BuildLoadMapping's widened mapping depends on —
+	// see verifyNoUnexpectedDestinationSplits.
 	ListTableSplits(ctx context.Context, tableName string) ([][]byte, error)
 	// ResolveTableID forces a fresh resolution of tableName's current
 	// table ID, invalidating any cached mapping this connection already
 	// holds before resolving (*accumulo.Connector.ResolveTableID) --
-	// unlike AddTableSplits, ListTableSplits, and BulkImport, each of
-	// which may independently resolve tableName from a cache with no
-	// enforced TTL. Promote uses it to pin the destination table's real
-	// identity across the wall-clock time StageBulkDir's copying takes;
-	// see verifyDestinationTableIdentity.
+	// unlike ListTableSplits and BulkImport, each of which may
+	// independently resolve tableName from a cache with no enforced TTL.
+	// Promote uses it to pin the destination table's real identity
+	// across the wall-clock time StageBulkDir's copying takes, and
+	// passes that pin into AddTableSplitsForTable itself; see
+	// verifyDestinationTableIdentity.
 	ResolveTableID(ctx context.Context, tableName string) (string, error)
 	// BulkImport submits bulkDir as a Bulk Import V2 (TABLE_BULK_IMPORT2)
 	// FATE operation against tableName.
@@ -60,14 +73,14 @@ type Options struct {
 //
 // For a multi-tablet manifest, Promote first calls
 // RequiredDestinationSplits (a pure, network-free check) and, if it
-// reports any rows, submits them through conn.AddTableSplits before doing
+// reports any rows, submits them through conn.AddTableSplitsForTable before doing
 // anything else. That reconciles the destination's real tablet
 // boundaries to the exact rows BuildLoadMapping's widened KeyExtents
 // reference, which Accumulo's own server-side
 // PrepBulkImport.validateLoadMapping check otherwise requires to already
 // exist. A single-tablet (or legacy) manifest requires no splits at all,
-// so AddTableSplits is never called for one. Every Accumulo-facing step —
-// AddTableSplits and BulkImport alike — goes exclusively through the
+// so AddTableSplitsForTable is never called for one. Every Accumulo-facing step —
+// AddTableSplitsForTable and BulkImport alike — goes exclusively through the
 // manager's FATE machinery (TABLE_SPLIT and TABLE_BULK_IMPORT2
 // respectively); Promote never edits tablet metadata directly, so the
 // manager remains the sole authority over the promoted table's resulting
@@ -76,14 +89,14 @@ type Options struct {
 // BuildLoadMapping's widening rule is only provably correct against
 // Accumulo's own PrepBulkImport.validateLoadMapping walk when the
 // destination's real splits, at or before the last required row, are
-// exactly the required rows — no fewer (AddTableSplits already
+// exactly the required rows — no fewer (AddTableSplitsForTable already
 // guarantees that) and, just as importantly, no more. An extra,
 // unrelated split anywhere in that range — pre-existing or added by
 // another actor between reconciliation attempts — silently changes the
 // real predecessor row an earlier mapping entry leaves Accumulo's
 // validation walk resting on, which the next entry's widened
 // prevEndRow can then never re-match (see docs/promotion.md §3.2/§5 for
-// the full trace). So immediately after AddTableSplits, Promote calls
+// the full trace). So immediately after AddTableSplitsForTable, Promote calls
 // conn.ListTableSplits and runs verifyNoUnexpectedDestinationSplits: if
 // the destination has any such extra split, Promote fails closed with a
 // clear, actionable error before staging or submitting anything, rather
@@ -117,19 +130,27 @@ type Options struct {
 //
 // A table name is not a stable handle across that same window: Accumulo
 // lets a table be deleted and a differently-scoped table created under
-// the identical name, and AddTableSplits, ListTableSplits, and
+// the identical name, and AddTableSplitsForTable, ListTableSplits, and
 // BulkImport each independently resolve tableName to a table ID on
 // their own, through a cache with no enforced TTL (see
 // internal/tablenames.Resolver). To guard against that, whenever splits
 // are reconciled Promote pins the destination's real table ID via
-// conn.ResolveTableID once before AddTableSplits, and checks it again,
-// via verifyDestinationTableIdentity, immediately before BulkImport --
-// failing closed if tableName now resolves to a different table than
-// the one splits were just reconciled against. This is a narrower,
-// independent check from verifyNoUnexpectedDestinationSplits above: it
-// catches an identity change even when the replacement table happens to
-// end up with the same splits, and it covers the entire staging window,
-// not just the AddTableSplits/ListTableSplits round-trip. See
+// conn.ResolveTableID once, before calling AddTableSplitsForTable, and
+// passes that same pin straight into it: AddTableSplitsForTable's own
+// fresh resolve is checked against the pin before it makes any split or
+// mergeability mutation, so a delete-and-recreate landing in the window
+// between Promote's own pin and that call's internal resolve is caught
+// there, before it can mutate the wrong table, instead of only being
+// noticed afterwards (see accumulo.Connector.AddTableSplitsForTable's
+// own doc comment for exactly what that check can and cannot close).
+// Promote checks the same pin again, via verifyDestinationTableIdentity,
+// immediately before BulkImport -- failing closed if tableName now
+// resolves to a different table than the one splits were just
+// reconciled against. This is a narrower, independent check from
+// verifyNoUnexpectedDestinationSplits above: it catches an identity
+// change even when the replacement table happens to end up with the
+// same splits, and it covers the entire staging window, not just the
+// AddTableSplitsForTable/ListTableSplits round-trip. See
 // verifyDestinationTableIdentity's own doc comment for exactly what it
 // can and cannot prove. A single-tablet (or legacy) manifest -- the
 // "safe single-tablet staging" case this package already handled before
@@ -168,7 +189,7 @@ type Options struct {
 // different tablets' files to the same bulk-directory basename (or an
 // invalid one), or aliases src or dst, would only be rejected later
 // still, inside StageBulkDir's own verification and staging calls.
-// Either gap, left unclosed, means AddTableSplits below would already
+// Either gap, left unclosed, means AddTableSplitsForTable below would already
 // have mutated the destination's real splits by the time a permanently
 // unstageable manifest is finally caught. Running both preflights here
 // first, and discarding their results, closes both gaps: a malformed
@@ -184,7 +205,7 @@ type Options struct {
 // destination state. engine.VerifyRFileExport is not cheap the same
 // way -- it streams and hashes every RFile's actual bytes -- but
 // Promote still lets StageBulkDir run it again below, deliberately, at
-// the cost of hashing every RFile twice: AddTableSplits and
+// the cost of hashing every RFile twice: AddTableSplitsForTable and
 // verifyNoUnexpectedDestinationSplits/ListTableSplits, both of which
 // run between this preflight and StageBulkDir, are a real manager
 // round-trip taking arbitrary time, and src is not guaranteed
@@ -192,7 +213,7 @@ type Options struct {
 // overwritten in place while that call is in flight). Skipping
 // StageBulkDir's own verification to avoid the duplicate cost would
 // leave that window unchecked: a source object replaced during
-// AddTableSplits/ListTableSplits would be staged and bulk-imported
+// AddTableSplitsForTable/ListTableSplits would be staged and bulk-imported
 // without ever being verified against the manifest it actually matches
 // at copy time (see stagingPreflight's own doc comment for the same
 // reasoning from the staging side, and
@@ -200,11 +221,11 @@ type Options struct {
 // regression test proving this window is closed).
 //
 // Promote does not itself retry on failure, and retry safety differs by
-// which step failed. A failure in validation, AddTableSplits, or
+// which step failed. A failure in validation, AddTableSplitsForTable, or
 // verifyNoUnexpectedDestinationSplits, verifyDestinationTableIdentity,
 // or StageBulkDir (before BulkImport is ever called) is always safe to
 // retry: split
-// reconciliation is idempotent (AddTableSplits treats a row that
+// reconciliation is idempotent (AddTableSplitsForTable treats a row that
 // already is a tablet's end row as already satisfied, refreshing only
 // its mergeability metadata), the split-verification check is a
 // read-only comparison, and staging is deterministic and copy-based, so
@@ -245,7 +266,7 @@ func Promote(
 		if err != nil {
 			return nil, err
 		}
-		if err := conn.AddTableSplits(ctx, tableName, splits); err != nil {
+		if err := conn.AddTableSplitsForTable(ctx, accumulo.Table{Name: tableName, ID: pinnedTableID}, splits); err != nil {
 			return nil, err
 		}
 		if err := verifyNoUnexpectedDestinationSplits(ctx, conn, tableName, splits); err != nil {
@@ -253,20 +274,30 @@ func Promote(
 		}
 	}
 	// Deliberately re-verifies (see the doc comment above and
-	// stagingPreflight's own): AddTableSplits and
+	// stagingPreflight's own): AddTableSplitsForTable and
 	// verifyNoUnexpectedDestinationSplits/ListTableSplits just ran, and
 	// src is not guaranteed unchanged across that round-trip.
 	mapping, err := StageBulkDir(ctx, src, manifest, dst, bulkDir)
 	if err != nil {
 		return nil, err
 	}
-	if len(mapping) == 0 {
-		return mapping, nil
-	}
+	// Checked here, before the empty-mapping return below, not only
+	// before BulkImport: an empty multi-tablet manifest (every declared
+	// tablet ends up with zero files -- see BuildLoadMapping's own doc
+	// comment) still sets pinnedTableID whenever RequiredDestinationSplits
+	// reported any rows, even though there is nothing left to bulk-import.
+	// Checking only in the non-empty branch below would let a destination
+	// deleted and recreated while StageBulkDir ran report success despite
+	// the table AddTableSplitsForTable actually reconciled splits against
+	// no longer being the one that exists — see
+	// TestPromoteRejectsIdentityChangeEvenWithEmptyLoadMapping.
 	if pinnedTableID != "" {
 		if err := verifyDestinationTableIdentity(ctx, conn, tableName, pinnedTableID); err != nil {
 			return nil, err
 		}
+	}
+	if len(mapping) == 0 {
+		return mapping, nil
 	}
 	if err := conn.BulkImport(ctx, tableName, bulkDir, accumulo.BulkImportOptions{SetTime: opts.SetTime}); err != nil {
 		return nil, err
@@ -285,7 +316,7 @@ func Promote(
 // rule only produces a mapping Accumulo's own
 // PrepBulkImport.validateLoadMapping walk can validate when the
 // destination's splits in that range are exactly the required ones.
-// AddTableSplits guarantees the required rows are present once it
+// AddTableSplitsForTable guarantees the required rows are present once it
 // succeeds, but it does not — and, submitting through Accumulo's
 // manager-owned TABLE_SPLIT FATE operation as it does, safely cannot —
 // remove a pre-existing or concurrently-added split that doesn't
@@ -339,7 +370,7 @@ func verifyNoUnexpectedDestinationSplits(ctx context.Context, conn Promoter, tab
 //
 // This exists because tableName is a mutable label, not a stable
 // handle: Accumulo lets a table be deleted and a new, unrelated table
-// created under the identical name, and each of AddTableSplits,
+// created under the identical name, and each of AddTableSplitsForTable,
 // ListTableSplits, and BulkImport independently resolves tableName to
 // a table ID on its own, through a cache with no enforced TTL (see
 // internal/tablenames.Resolver) that is only refreshed by an explicit
@@ -354,7 +385,7 @@ func verifyNoUnexpectedDestinationSplits(ctx context.Context, conn Promoter, tab
 // conn.ResolveTableID forces a fresh resolve, invalidating any cached
 // mapping first, so this check observes a delete-and-recreate that
 // happened at any point since Promote's own first ResolveTableID call
-// -- including one that raced entirely inside the AddTableSplits/
+// -- including one that raced entirely inside the AddTableSplitsForTable/
 // ListTableSplits round-trip, a window verifyNoUnexpectedDestinationSplits
 // alone cannot fully cover on its own. It still trusts one guarantee
 // this client cannot independently verify: that Accumulo's manager

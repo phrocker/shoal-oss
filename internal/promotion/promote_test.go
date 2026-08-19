@@ -16,7 +16,7 @@ import (
 	"github.com/phrocker/shoal/internal/storage/memory"
 )
 
-// fakePromoter records AddTableSplits and BulkImport calls instead of
+// fakePromoter records AddTableSplitsForTable and BulkImport calls instead of
 // talking to Accumulo, so Promote's orchestration can be tested without
 // any of accumulo's own discovery/manager fakes.
 type fakePromoter struct {
@@ -28,8 +28,17 @@ type fakePromoter struct {
 
 	splitCalls int
 	splitTable string
-	splitRows  [][]byte
-	splitErr   error
+	// splitTableID records the accumulo.Table.ID AddTableSplitsForTable
+	// was called with -- the pinnedTableID Promote captured via
+	// ResolveTableID before calling it. Tests that need to simulate
+	// the real accumulo.Connector.AddTableSplitsForTable rejecting a
+	// stale pin set splitErr directly to an error wrapping
+	// accumulo.ErrTableIdentityChanged; this fake does not re-derive
+	// that check itself, since the check is accumulo's own
+	// responsibility and already has its own dedicated tests there.
+	splitTableID string
+	splitRows    [][]byte
+	splitErr     error
 
 	listSplitsCalls    int
 	listSplitsTable    string
@@ -56,7 +65,7 @@ type fakePromoter struct {
 	onResolveTableID func(callNum int)
 
 	// onAddTableSplits, when set, runs as a side effect of
-	// AddTableSplits before it returns. Used to simulate an external
+	// AddTableSplitsForTable before it returns. Used to simulate an external
 	// actor mutating src while a real AddTableSplits round-trip to the
 	// manager would be in flight, proving StageBulkDir's own
 	// re-verification (not just stagingPreflight's, which already ran
@@ -84,9 +93,10 @@ func (f *fakePromoter) ResolveTableID(_ context.Context, tableName string) (stri
 	return id, nil
 }
 
-func (f *fakePromoter) AddTableSplits(_ context.Context, tableName string, splits [][]byte) error {
+func (f *fakePromoter) AddTableSplitsForTable(_ context.Context, table accumulo.Table, splits [][]byte) error {
 	f.splitCalls++
-	f.splitTable = tableName
+	f.splitTable = table.Name
+	f.splitTableID = table.ID
 	f.splitRows = splits
 	if f.onAddTableSplits != nil {
 		f.onAddTableSplits()
@@ -324,7 +334,7 @@ func TestPromoteRejectsUndeclaredTabletIndexBeforeAddTableSplitsForMultiTabletMa
 		t.Fatal("Promote with an RFile referencing an undeclared tablet index = nil error, want error")
 	}
 	if importer.splitCalls != 0 {
-		t.Fatalf("AddTableSplits calls = %d, want 0 (an RFile-level manifest error must fail before any split reconciliation)", importer.splitCalls)
+		t.Fatalf("AddTableSplitsForTable calls = %d, want 0 (an RFile-level manifest error must fail before any split reconciliation)", importer.splitCalls)
 	}
 	if importer.calls != 0 {
 		t.Fatalf("BulkImport calls = %d, want 0", importer.calls)
@@ -358,7 +368,7 @@ func TestPromoteRejectsDestinationPathDeclaredUnderConflictingTabletIndexes(t *t
 		t.Fatal("Promote with a DestinationPath declared under conflicting tablet indexes = nil error, want error")
 	}
 	if importer.splitCalls != 0 {
-		t.Fatalf("AddTableSplits calls = %d, want 0 (an RFile-level manifest error must fail before any split reconciliation)", importer.splitCalls)
+		t.Fatalf("AddTableSplitsForTable calls = %d, want 0 (an RFile-level manifest error must fail before any split reconciliation)", importer.splitCalls)
 	}
 	if importer.calls != 0 {
 		t.Fatalf("BulkImport calls = %d, want 0", importer.calls)
@@ -388,7 +398,7 @@ func TestPromoteRejectsUnsupportedManifestVersionBeforeAddTableSplits(t *testing
 		t.Fatal("Promote with an unsupported manifest version = nil error, want error")
 	}
 	if importer.splitCalls != 0 {
-		t.Fatalf("AddTableSplits calls = %d, want 0 (an unsupported manifest version must fail before any split reconciliation)", importer.splitCalls)
+		t.Fatalf("AddTableSplitsForTable calls = %d, want 0 (an unsupported manifest version must fail before any split reconciliation)", importer.splitCalls)
 	}
 	if importer.calls != 0 {
 		t.Fatalf("BulkImport calls = %d, want 0", importer.calls)
@@ -422,7 +432,7 @@ func TestPromoteRejectsCrossTabletBasenameCollisionBeforeAddTableSplits(t *testi
 		t.Fatal("Promote with a cross-tablet basename collision = nil error, want error")
 	}
 	if importer.splitCalls != 0 {
-		t.Fatalf("AddTableSplits calls = %d, want 0 (a cross-tablet basename collision must fail before any split reconciliation)", importer.splitCalls)
+		t.Fatalf("AddTableSplitsForTable calls = %d, want 0 (a cross-tablet basename collision must fail before any split reconciliation)", importer.splitCalls)
 	}
 	if importer.calls != 0 {
 		t.Fatalf("BulkImport calls = %d, want 0", importer.calls)
@@ -454,7 +464,7 @@ func TestPromoteRejectsNonLeafBasenameBeforeAddTableSplits(t *testing.T) {
 		t.Fatal("Promote with a non-leaf-flattening basename = nil error, want error")
 	}
 	if importer.splitCalls != 0 {
-		t.Fatalf("AddTableSplits calls = %d, want 0 (a non-leaf-flattening basename must fail before any split reconciliation)", importer.splitCalls)
+		t.Fatalf("AddTableSplitsForTable calls = %d, want 0 (a non-leaf-flattening basename must fail before any split reconciliation)", importer.splitCalls)
 	}
 	if importer.calls != 0 {
 		t.Fatalf("BulkImport calls = %d, want 0", importer.calls)
@@ -516,7 +526,7 @@ func TestPromoteRejectsLoadMapAliasBeforeAddTableSplits(t *testing.T) {
 		t.Fatal("Promote with loadmap.json aliasing a manifest source file = nil error, want error")
 	}
 	if importer.splitCalls != 0 {
-		t.Fatalf("AddTableSplits calls = %d, want 0 (a staging write-target alias must fail before any split reconciliation)", importer.splitCalls)
+		t.Fatalf("AddTableSplitsForTable calls = %d, want 0 (a staging write-target alias must fail before any split reconciliation)", importer.splitCalls)
 	}
 	if importer.calls != 0 {
 		t.Fatalf("BulkImport calls = %d, want 0", importer.calls)
@@ -560,7 +570,7 @@ func TestPromoteRejectsCorruptExportBeforeAddTableSplits(t *testing.T) {
 		t.Fatal("Promote with a SHA256 mismatch against the manifest = nil error, want error")
 	}
 	if importer.splitCalls != 0 {
-		t.Fatalf("AddTableSplits calls = %d, want 0 (a corrupt/mismatched export must fail before any split reconciliation)", importer.splitCalls)
+		t.Fatalf("AddTableSplitsForTable calls = %d, want 0 (a corrupt/mismatched export must fail before any split reconciliation)", importer.splitCalls)
 	}
 	if importer.calls != 0 {
 		t.Fatalf("BulkImport calls = %d, want 0", importer.calls)
@@ -604,7 +614,7 @@ func TestPromoteRejectsSourceMutatedDuringAddTableSplits(t *testing.T) {
 		t.Fatal("Promote with src mutated during AddTableSplits = nil error, want error")
 	}
 	if importer.splitCalls != 1 {
-		t.Fatalf("AddTableSplits calls = %d, want 1 (the mutation happens as its own side effect, so it must have been called)", importer.splitCalls)
+		t.Fatalf("AddTableSplitsForTable calls = %d, want 1 (the mutation happens as its own side effect, so it must have been called)", importer.splitCalls)
 	}
 	if importer.calls != 0 {
 		t.Fatalf("BulkImport calls = %d, want 0", importer.calls)
@@ -636,14 +646,17 @@ func TestPromoteReconcilesSplitsThenStagesThenSubmitsForMultiTabletManifest(t *t
 		t.Fatalf("mapping entries = %d, want 2", len(mapping))
 	}
 	if importer.splitCalls != 1 {
-		t.Fatalf("AddTableSplits calls = %d, want 1", importer.splitCalls)
+		t.Fatalf("AddTableSplitsForTable calls = %d, want 1", importer.splitCalls)
 	}
 	if importer.splitTable != "events" {
-		t.Fatalf("AddTableSplits table = %q, want %q", importer.splitTable, "events")
+		t.Fatalf("AddTableSplitsForTable table = %q, want %q", importer.splitTable, "events")
+	}
+	if importer.splitTableID != "stable-table-id" {
+		t.Fatalf("AddTableSplitsForTable table.ID = %q, want %q (the pinnedTableID captured via ResolveTableID must be passed straight into AddTableSplitsForTable, not just checked separately later)", importer.splitTableID, "stable-table-id")
 	}
 	wantSplits := [][]byte{[]byte("g")}
 	if !reflect.DeepEqual(importer.splitRows, wantSplits) {
-		t.Fatalf("AddTableSplits rows = %#v, want %#v", importer.splitRows, wantSplits)
+		t.Fatalf("AddTableSplitsForTable rows = %#v, want %#v", importer.splitRows, wantSplits)
 	}
 	if importer.listSplitsCalls != 1 {
 		t.Fatalf("ListTableSplits calls = %d, want 1 (Promote must verify reconciled splits before staging)", importer.listSplitsCalls)
@@ -675,7 +688,7 @@ func TestPromoteSkipsAddTableSplitsForSingleTabletManifest(t *testing.T) {
 		t.Fatal(err)
 	}
 	if importer.splitCalls != 0 {
-		t.Fatalf("AddTableSplits calls = %d, want 0 for a single-tablet manifest", importer.splitCalls)
+		t.Fatalf("AddTableSplitsForTable calls = %d, want 0 for a single-tablet manifest", importer.splitCalls)
 	}
 	if importer.listSplitsCalls != 0 {
 		t.Fatalf("ListTableSplits calls = %d, want 0 for a single-tablet manifest (no splits required, nothing to verify)", importer.listSplitsCalls)
@@ -700,7 +713,7 @@ func TestPromoteAbortsBeforeStagingWhenAddTableSplitsFails(t *testing.T) {
 		t.Fatalf("Promote error = %v, want %v", err, accumulo.ErrTableOffline)
 	}
 	if importer.splitCalls != 1 {
-		t.Fatalf("AddTableSplits calls = %d, want 1", importer.splitCalls)
+		t.Fatalf("AddTableSplitsForTable calls = %d, want 1", importer.splitCalls)
 	}
 	if importer.calls != 0 {
 		t.Fatalf("BulkImport calls = %d, want 0 (AddTableSplits failure must abort before submission)", importer.calls)
@@ -735,7 +748,7 @@ func TestPromoteEndToEndThreeTabletSuccess(t *testing.T) {
 	}
 	wantSplits := [][]byte{[]byte("d"), []byte("m")}
 	if !reflect.DeepEqual(importer.splitRows, wantSplits) {
-		t.Fatalf("AddTableSplits rows = %#v, want %#v", importer.splitRows, wantSplits)
+		t.Fatalf("AddTableSplitsForTable rows = %#v, want %#v", importer.splitRows, wantSplits)
 	}
 	if importer.calls != 1 {
 		t.Fatalf("BulkImport calls = %d, want 1", importer.calls)
@@ -795,7 +808,7 @@ func TestPromoteRejectsExtraDestinationSplitBeforeLastRequiredRow(t *testing.T) 
 		t.Fatalf("error %q does not name the offending split row", err.Error())
 	}
 	if importer.splitCalls != 1 {
-		t.Fatalf("AddTableSplits calls = %d, want 1 (reconciliation still runs before verification)", importer.splitCalls)
+		t.Fatalf("AddTableSplitsForTable calls = %d, want 1 (reconciliation still runs before verification)", importer.splitCalls)
 	}
 	if importer.listSplitsCalls != 1 {
 		t.Fatalf("ListTableSplits calls = %d, want 1", importer.listSplitsCalls)
@@ -862,6 +875,122 @@ func TestPromoteRejectsWhenDestinationTableChangesIdentityDuringStaging(t *testi
 	}
 }
 
+// TestPromoteRejectsWhenDestinationTableChangesIdentityBeforeAddTableSplits
+// is the regression test for round 11's anchored finding: the pin
+// Promote captures via ResolveTableID immediately before
+// AddTableSplitsForTable must actually reach it and be checked there,
+// not merely be threaded through as an unused value. This fake does
+// not re-derive accumulo.Connector.AddTableSplitsForTable's own
+// resolve-and-compare logic -- that belongs to, and is already
+// covered by, the accumulo package's own
+// TestAddTableSplitsForTableRejectsMismatchedPinBeforeAnyManagerCall.
+// Instead, splitErr simulates AddTableSplitsForTable itself returning
+// the accumulo.ErrTableIdentityChanged it would return in that case,
+// so this test can focus purely on proving Promote propagates that
+// failure and aborts before ever staging a file or calling
+// ListTableSplits/BulkImport.
+func TestPromoteRejectsWhenDestinationTableChangesIdentityBeforeAddTableSplits(t *testing.T) {
+	src := memory.New()
+	src.Put("events/t-0000/F0001.rf", []byte("a"))
+	src.Put("events/t-0001/F0002.rf", []byte("b"))
+	manifest := twoTabletManifest()
+	manifest.RFiles[0].DestinationPath = "events/t-0000/F0001.rf"
+	manifest.RFiles[0].Size = 1
+	manifest.RFiles[0].SHA256 = "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb"
+	manifest.RFiles[1].DestinationPath = "events/t-0001/F0002.rf"
+	manifest.RFiles[1].Size = 1
+	manifest.RFiles[1].SHA256 = "3e23e8160039594a33894f6564e1b1348bbd7a0088d42c4acb73eeaed59c009d"
+
+	dst := memory.New()
+	wantErr := errors.Join(accumulo.ErrTableIdentityChanged, errors.New(`accumulo: table "events" changed identity (was table ID "original-id", is now "recreated-id") before AddTableSplits`))
+	importer := &fakePromoter{tableID: "original-id", splitErr: wantErr}
+
+	_, err := Promote(context.Background(), src, manifest, dst, "hdfs://nn/bulk/events-1", importer, "events", Options{})
+	if err == nil {
+		t.Fatal("Promote when AddTableSplitsForTable rejects a stale pin = nil error, want error")
+	}
+	if !errors.Is(err, accumulo.ErrTableIdentityChanged) {
+		t.Fatalf("Promote error = %v, want it to wrap accumulo.ErrTableIdentityChanged", err)
+	}
+	if importer.splitCalls != 1 {
+		t.Fatalf("AddTableSplitsForTable calls = %d, want 1", importer.splitCalls)
+	}
+	if importer.splitTableID != "original-id" {
+		t.Fatalf("AddTableSplitsForTable table.ID = %q, want the pin Promote resolved (%q)", importer.splitTableID, "original-id")
+	}
+	if importer.listSplitsCalls != 0 {
+		t.Fatalf("ListTableSplits calls = %d, want 0 (must not run once AddTableSplitsForTable itself already failed)", importer.listSplitsCalls)
+	}
+	if importer.calls != 0 {
+		t.Fatalf("BulkImport calls = %d, want 0", importer.calls)
+	}
+	// Nothing should have been staged either: AddTableSplitsForTable
+	// failing must abort before StageBulkDir ever runs, not merely
+	// before BulkImport.
+	for _, name := range []string{"F0001.rf", "F0002.rf"} {
+		if _, openErr := dst.Open(context.Background(), "hdfs://nn/bulk/events-1/"+name); openErr == nil {
+			t.Fatalf("expected %s to not be staged when AddTableSplitsForTable fails before it", name)
+		}
+	}
+}
+
+// TestPromoteRejectsIdentityChangeEvenWithEmptyLoadMapping is the
+// regression test for round 11's other suppressed finding: the
+// destination-identity check that runs after StageBulkDir must not be
+// skippable by the len(mapping) == 0 early return that follows it.
+// twoTabletManifest's chain (two declared tablets, boundary "g") is
+// used unmodified except for RFiles, which is cleared entirely: with
+// no RFiles at all, BuildLoadMapping returns (nil, nil) for every
+// caller, including StageBulkDir -- see BuildLoadMapping's own doc
+// comment on what "every declared tablet ends up with zero files"
+// produces. RequiredDestinationSplits, unlike BuildLoadMapping, derives
+// its splits purely from the declared tablet chain shape and is
+// unaffected by RFiles being empty, so this manifest still reports one
+// required split row ("g"), which still makes Promote resolve and pin
+// the destination's table ID and call AddTableSplitsForTable before
+// ever reaching StageBulkDir. Before this round's reordering fix,
+// Promote's identity check ran only in the branch guarded by
+// len(mapping) != 0, so a destination deleted and recreated while
+// StageBulkDir ran (here simulated between the pre-AddTableSplits pin
+// and the post-staging check, exactly like
+// TestPromoteRejectsWhenDestinationTableChangesIdentityDuringStaging)
+// would have been silently reported as success: (nil, nil), with no
+// indication the splits AddTableSplitsForTable just reconciled belong
+// to a table that no longer exists.
+func TestPromoteRejectsIdentityChangeEvenWithEmptyLoadMapping(t *testing.T) {
+	src := memory.New() // never read: the manifest below declares zero RFiles.
+	manifest := twoTabletManifest()
+	manifest.RFiles = nil
+
+	dst := memory.New()
+	importer := &fakePromoter{tableID: "original-id"}
+	importer.onResolveTableID = func(callNum int) {
+		if callNum == 1 {
+			// Runs once the pre-AddTableSplitsForTable pin has already
+			// captured "original-id"; only the second ResolveTableID
+			// call, in the post-staging identity check, observes this.
+			importer.tableID = "recreated-id"
+		}
+	}
+
+	mapping, err := Promote(context.Background(), src, manifest, dst, "hdfs://nn/bulk/events-1", importer, "events", Options{})
+	if err == nil {
+		t.Fatalf("Promote with destination identity changed and an empty load mapping = (%v, nil), want an error", mapping)
+	}
+	if !strings.Contains(err.Error(), "original-id") || !strings.Contains(err.Error(), "recreated-id") {
+		t.Fatalf("error %q does not name both the pinned and current table IDs", err.Error())
+	}
+	if importer.resolveTableIDCalls != 2 {
+		t.Fatalf("ResolveTableID calls = %d, want 2 (pre-AddTableSplitsForTable pin + the post-staging identity check this test covers)", importer.resolveTableIDCalls)
+	}
+	if importer.splitCalls != 1 {
+		t.Fatalf("AddTableSplitsForTable calls = %d, want 1 (splits are still reconciled even though the mapping ends up empty)", importer.splitCalls)
+	}
+	if importer.calls != 0 {
+		t.Fatalf("BulkImport calls = %d, want 0", importer.calls)
+	}
+}
+
 // TestPromoteAbortsBeforeAddTableSplitsWhenResolveTableIDFails proves
 // the pre-AddTableSplits identity pin itself fails closed: if Promote
 // cannot even resolve the destination table's current ID, it must not
@@ -889,7 +1018,7 @@ func TestPromoteAbortsBeforeAddTableSplitsWhenResolveTableIDFails(t *testing.T) 
 		t.Fatalf("ResolveTableID calls = %d, want 1", importer.resolveTableIDCalls)
 	}
 	if importer.splitCalls != 0 {
-		t.Fatalf("AddTableSplits calls = %d, want 0 (ResolveTableID failure must abort before reconciliation)", importer.splitCalls)
+		t.Fatalf("AddTableSplitsForTable calls = %d, want 0 (ResolveTableID failure must abort before reconciliation)", importer.splitCalls)
 	}
 	if importer.calls != 0 {
 		t.Fatalf("BulkImport calls = %d, want 0", importer.calls)
@@ -924,7 +1053,7 @@ func TestPromoteRejectsReadOnlyDestinationBeforeAddTableSplits(t *testing.T) {
 		t.Fatalf("Promote error = %v, want %v", err, storage.ErrReadOnly)
 	}
 	if importer.splitCalls != 0 {
-		t.Fatalf("AddTableSplits calls = %d, want 0 (read-only destination must be rejected before reconciliation)", importer.splitCalls)
+		t.Fatalf("AddTableSplitsForTable calls = %d, want 0 (read-only destination must be rejected before reconciliation)", importer.splitCalls)
 	}
 	if importer.resolveTableIDCalls != 0 {
 		t.Fatalf("ResolveTableID calls = %d, want 0 (destination validation runs first)", importer.resolveTableIDCalls)
