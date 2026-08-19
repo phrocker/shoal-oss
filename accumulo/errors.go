@@ -64,6 +64,12 @@ var (
 	// ErrConnectorClosed indicates an operation attempted on a closed Connector.
 	ErrConnectorClosed = errors.New("accumulo: connector is closed")
 
+	// ErrInstanceClosed indicates a live-state topology accessor called after
+	// Instance.Close. Close releases the instance permanently, so discovery
+	// cannot reconnect; the accessors that report construction-time wiring
+	// (Info, ZooKeepers, Root, Configuration) keep working.
+	ErrInstanceClosed = errors.New("accumulo: instance is closed")
+
 	// ErrInvalidBulkDir indicates that a bulk-import call was given an empty
 	// or otherwise unusable bulk directory path.
 	ErrInvalidBulkDir = errors.New("accumulo: invalid bulk directory")

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/phrocker/shoal/internal/zk"
@@ -18,10 +19,50 @@ type InstanceInfo struct {
 	ID   string
 }
 
-// Instance provides the immutable identity and lifecycle of an Accumulo
-// instance source.
+// Instance provides the identity, client configuration, cluster topology, and
+// lifecycle of an Accumulo instance source.
+//
+// The topology accessors mirror Sharkbite's cclient::data::Instance base
+// class. RootTabletLocation, ManagerLocations, and Servers resolve live state
+// from ZooKeeper on every call and honor ctx cancellation; when ctx is
+// cancellable, each call reuses one operation-scoped authenticated ZooKeeper
+// session for the whole traversal and closes it on return or cancellation.
+// Info, ZooKeepers, and Root report wiring fixed at construction.
+// Configuration is different: it returns the instance's own stable mutable
+// Configuration pointer, so writes through the returned pointer are observed
+// by later calls, while the caller's original Configuration stays independent
+// because the instance stored a clone.
 type Instance interface {
 	Info() InstanceInfo
+
+	// RootTabletLocation resolves the tablet server currently hosting the
+	// root tablet.
+	RootTabletLocation(ctx context.Context) (TabletLocation, error)
+
+	// ManagerLocations lists the manager addresses advertised in ZooKeeper,
+	// ordered by lock sequence, active manager first. If the active
+	// lowest-sequence lock holder still advertises only a bootstrap
+	// placeholder, the call reports ErrManagerUnavailable instead of
+	// promoting a queued candidate to index 0.
+	ManagerLocations(ctx context.Context) ([]string, error)
+
+	// Servers lists the live tablet servers, scan servers, and compactors
+	// that advertise the Accumulo client service, ordered by role, then
+	// resource group, then the publishing ZooKeeper server child identity.
+	Servers(ctx context.Context) ([]ServerConnection, error)
+
+	// ZooKeepers returns the ZooKeeper servers this instance was configured
+	// with.
+	ZooKeepers() []string
+
+	// Root returns the instance's ZooKeeper root path,
+	// "/accumulo/<instance-id>".
+	Root() string
+
+	// Configuration returns the instance's client configuration. It is never
+	// nil.
+	Configuration() *Configuration
+
 	Close() error
 }
 
@@ -43,9 +84,12 @@ type discoveryInstance interface {
 }
 
 type zkLocator struct {
-	info    InstanceInfo
-	locator locator
-	once    sync.Once
+	info          InstanceInfo
+	locator       locator
+	zooKeepers    []string
+	configuration *Configuration
+	once          sync.Once
+	closed        atomic.Bool
 }
 
 // NewZooKeeperInstance resolves an Accumulo 4 instance name through ZooKeeper.
@@ -131,7 +175,9 @@ func newZooKeeperInstance(
 			Name: cfg.InstanceName,
 			ID:   loc.InstanceID(),
 		},
-		locator: loc,
+		locator:       loc,
+		zooKeepers:    cfg.Servers,
+		configuration: cfg.Configuration.Clone(),
 	}, nil
 }
 
@@ -141,12 +187,18 @@ func (i *zkLocator) discoveryLocator() discoveryLocator {
 }
 
 func (i *zkLocator) Close() error {
-	i.once.Do(i.locator.Close)
+	i.once.Do(func() {
+		// Mark first: a live accessor racing with Close must fail rather than
+		// open a fresh ZooKeeper session behind the closing one.
+		i.closed.Store(true)
+		i.locator.Close()
+	})
 	return nil
 }
 
 type staticInstance struct {
-	info InstanceInfo
+	info          InstanceInfo
+	configuration *Configuration
 }
 
 // NewStaticInstance creates an instance identity without ZooKeeper discovery.
@@ -157,7 +209,10 @@ func NewStaticInstance(name, id string) (Instance, error) {
 	if id == "" {
 		return nil, errors.New("accumulo: instance ID is required")
 	}
-	return &staticInstance{info: InstanceInfo{Name: name, ID: id}}, nil
+	return &staticInstance{
+		info:          InstanceInfo{Name: name, ID: id},
+		configuration: NewConfiguration(),
+	}, nil
 }
 
 func (i *staticInstance) Info() InstanceInfo { return i.info }

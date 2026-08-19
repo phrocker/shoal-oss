@@ -14,7 +14,7 @@ import tempfile
 
 
 DOC_PATH = Path(__file__).with_name("sharkbite-compatibility.md")
-EXPECTED_REVISION = 19
+EXPECTED_REVISION = 20
 # Update this manifest only when the independently audited inventory itself
 # changes; review every added/removed or reclassified ID in code review.
 EXPECTED_ROW_MANIFEST = DOC_PATH.with_name(
@@ -60,9 +60,9 @@ def status_count_map(
 
 EXPECTED_STATUS_COUNTS = {
     "Covered": 1,
-    "Missing Go": 2420,
-    "Missing C ABI": 91,
-    "Behavior mismatch": 212,
+    "Missing Go": 2409,
+    "Missing C ABI": 103,
+    "Behavior mismatch": 211,
     "Intentional divergence (approval required)": 87,
     "Not required (rationale required)": 392,
 }
@@ -70,8 +70,8 @@ EXPECTED_STATUS_COUNTS = {
 EXPECTED_PREFIX_COUNTS = {
     "SB-BASE": status_count_map(missing_c_abi=18, not_required=2),
     "SB-CFG": status_count_map(
-        missing_go=11,
-        behavior_mismatch=17,
+        missing_c_abi=12,
+        behavior_mismatch=16,
         intentional_divergence=2,
         not_required=6,
     ),
@@ -190,17 +190,20 @@ EXPECTED_METADATA_FIELDS = {
     ),
     "Sharkbite release line": "`sharkbite` 1.2.0.3 on PyPI (`setup.py:34-35`)",
     "Shoal reference": (
-        "`phrocker/shoal-oss` exact audited baseline for revision 19 "
-        "`04ff6ff072fdad78bc3104035feae64e9722bc5d` "
-        "(\"Merge pull request #103 from phrocker/rewrite/108-capi-admin-parity\") "
-        "plus this connector-identity ABI change"
+        "`phrocker/shoal-oss` exact audited baseline for revision 20 "
+        "`e05daeac0675807763aad9d2720211c312e52965` "
+        "(\"Merge PR #107: expose owned connector identity discovery\") "
+        "plus the client-configuration and instance-topology Go additions "
+        "introduced in the same change as this revision"
     ),
     "Shoal C ABI version": "`SHOAL_ABI_VERSION 1u` (`capi/include/shoal_types.h`)",
 }
 
 EXPECTED_DOCUMENT_STATUS_SNIPPETS = (
     "Normative gate. Binding on all Sharkbite-compatibility work.",
-    f"Revision {EXPECTED_REVISION} — adds the merged connector-identity C ABI",
+    f"Revision {EXPECTED_REVISION} — reclassifies the twelve client-configuration "
+    f"and instance-topology rows of [§6](#sec-6)",
+    "Revision 19 added the merged connector-identity C ABI",
     "Revision 18 applied the seventeenth independent audit",
     "Revision 9 applied the eighth audit",
 )
@@ -288,10 +291,30 @@ TARGETED_LOCAL_CITATIONS = {
     "cmd/shoal-capi/state_test.go",
     "cmd/shoal-capi/writer_export_test.go",
 }
+# Implementation files behind the section 6 client-configuration and instance
+# topology rows. Their citations are anchor-checked exactly like the C ABI
+# ones so a rename or a moved declaration cannot leave the normative evidence
+# pointing at the wrong symbol.
+TARGETED_SB_CFG_CITATIONS = {
+    "accumulo/config.go",
+    "accumulo/configuration.go",
+    "accumulo/configuration_test.go",
+    "accumulo/instance.go",
+    "accumulo/topology.go",
+    "accumulo/topology_test.go",
+    "internal/zk/locator.go",
+    "internal/zk/manager.go",
+    "internal/zk/topology_test.go",
+}
+
 OPTIONAL_ANCHOR_CITATIONS = {
     "capi/include/shoal.h",
     "capi/include/shoal_types.h",
 }
+
+# Every path whose citations are anchor-checked: the C ABI surface plus the
+# section 6 implementation files.
+ANCHOR_CHECKED_CITATIONS = TARGETED_LOCAL_CITATIONS | TARGETED_SB_CFG_CITATIONS
 COUNT_RE = re.compile(
     r"^(?P<bold>\*\*)?(?P<number>0|[1-9]\d*|[1-9]\d{0,2}(?:,\d{3})+)(?(bold)\*\*|)$"
 )
@@ -1800,7 +1823,7 @@ def filtered_local_anchors(ref: str, anchors: list[str]) -> list[str]:
 def validate_targeted_symbol_anchors(
     lines: list[str],
     *,
-    targeted_paths: set[str] = TARGETED_LOCAL_CITATIONS,
+    targeted_paths: set[str] = ANCHOR_CHECKED_CITATIONS,
     repo_root: Path | None = None,
 ) -> None:
     contents = load_targeted_contents(targeted_paths, repo_root=repo_root)

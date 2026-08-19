@@ -11,7 +11,7 @@ import (
 
 func TestReadConnectorIdentityUsesCapturedValues(t *testing.T) {
 	connector := &fakeConnectorAPI{principal: "alice"}
-	owned := newOwnedConnector(connector, fakeConnectorInstance{})
+	owned := newOwnedConnector(connector, &fakeConnectorInstance{})
 
 	ctx, done, err := owned.begin(0)
 	if err != nil {
@@ -37,7 +37,7 @@ func TestReadConnectorIdentityHonorsDeadline(t *testing.T) {
 			return accumulo.InstanceInfo{}, "", ctx.Err()
 		},
 	}
-	owned := newOwnedConnector(connector, fakeConnectorInstance{})
+	owned := newOwnedConnector(connector, &fakeConnectorInstance{})
 	ctx, done, err := owned.begin(time.Millisecond)
 	if err != nil {
 		t.Fatal(err)
@@ -58,7 +58,7 @@ func TestReadConnectorIdentityConcurrentCloseCancelsAndJoins(t *testing.T) {
 			return accumulo.InstanceInfo{}, "", ctx.Err()
 		},
 	}
-	owned := newOwnedConnector(connector, fakeConnectorInstance{})
+	owned := newOwnedConnector(connector, &fakeConnectorInstance{})
 
 	readDone := make(chan error, 1)
 	go func() {
