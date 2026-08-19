@@ -405,6 +405,9 @@ int main(void) {
   assert(shoal_connector_namespace_exists(admin_connector, "analytics", 0,
                                           &exists, &error) == SHOAL_STATUS_OK);
   assert(exists == 1);
+  expect_error(shoal_connector_namespace_exists(admin_connector, NULL, 0,
+                                                &exists, &error),
+               SHOAL_STATUS_INVALID_ARGUMENT, &error, "namespace_name");
   expect_error(shoal_connector_delete_namespace(admin_connector, "", 0,
                                                 &error),
                SHOAL_STATUS_NAMESPACE_NOT_EMPTY, &error,
@@ -416,6 +419,12 @@ int main(void) {
   assert(shoal_connector_set_namespace_property(
              admin_connector, "work", "table.custom.mode", "", 0, &error) ==
          SHOAL_STATUS_OK);
+  expect_error(shoal_connector_set_namespace_property(
+                   admin_connector, NULL, "table.custom.mode", "", 0, &error),
+               SHOAL_STATUS_INVALID_ARGUMENT, &error, "namespace_name");
+  expect_error(shoal_connector_remove_namespace_property(
+                   admin_connector, NULL, "table.custom.mode", 0, &error),
+               SHOAL_STATUS_INVALID_ARGUMENT, &error, "namespace_name");
   assert(shoal_connector_namespace_properties(
              admin_connector, "work", 0, &namespace_properties, &error) ==
          SHOAL_STATUS_OK);
@@ -431,6 +440,12 @@ int main(void) {
          SHOAL_STATUS_OK);
   assert(shoal_namespace_properties_count(namespace_properties) == 1);
   shoal_namespace_properties_free(&namespace_properties);
+  expect_error(shoal_connector_effective_namespace_properties(
+                   admin_connector, NULL, 0, &namespace_properties, &error),
+               SHOAL_STATUS_INVALID_ARGUMENT, &error, "namespace_name");
+  expect_error(shoal_connector_namespace_properties(
+                   admin_connector, NULL, 0, &namespace_properties, &error),
+               SHOAL_STATUS_INVALID_ARGUMENT, &error, "namespace_name");
   assert(shoal_connector_remove_namespace_property(
              admin_connector, "work", "table.custom.mode", 0, &error) ==
          SHOAL_STATUS_OK);
@@ -446,6 +461,9 @@ int main(void) {
   assert(shoal_versioned_properties_count(versioned_properties) == 1);
   shoal_versioned_properties_free(&versioned_properties);
   shoal_versioned_properties_free(&versioned_properties);
+  expect_error(shoal_connector_versioned_namespace_properties(
+                   admin_connector, NULL, 0, &versioned_properties, &error),
+               SHOAL_STATUS_INVALID_ARGUMENT, &error, "namespace_name");
   assert(shoal_connector_delete_namespace(admin_connector, "work", 0,
                                           &error) == SHOAL_STATUS_OK);
   expect_error(shoal_connector_create_namespace(admin_connector, "block", 1,
@@ -478,6 +496,30 @@ int main(void) {
              admin_connector, "alice", "events", SHOAL_TABLE_PERMISSION_READ,
              0, &error) == SHOAL_STATUS_OK);
   uint8_t has_permission = 0;
+  expect_error(shoal_connector_has_table_permission(
+                   admin_connector, "alice", NULL, SHOAL_TABLE_PERMISSION_READ,
+                   0, &has_permission, &error),
+               SHOAL_STATUS_INVALID_ARGUMENT, &error, "target_name");
+  expect_error(shoal_connector_grant_table_permission(
+                   admin_connector, "alice", NULL, SHOAL_TABLE_PERMISSION_READ,
+                   0, &error),
+               SHOAL_STATUS_INVALID_ARGUMENT, &error, "target_name");
+  expect_error(shoal_connector_revoke_table_permission(
+                   admin_connector, "alice", NULL, SHOAL_TABLE_PERMISSION_READ,
+                   0, &error),
+               SHOAL_STATUS_INVALID_ARGUMENT, &error, "target_name");
+  expect_error(shoal_connector_has_namespace_permission(
+                   admin_connector, "alice", NULL,
+                   SHOAL_NAMESPACE_PERMISSION_READ, 0, &has_permission, &error),
+               SHOAL_STATUS_INVALID_ARGUMENT, &error, "target_name");
+  expect_error(shoal_connector_grant_namespace_permission(
+                   admin_connector, "alice", NULL,
+                   SHOAL_NAMESPACE_PERMISSION_READ, 0, &error),
+               SHOAL_STATUS_INVALID_ARGUMENT, &error, "target_name");
+  expect_error(shoal_connector_revoke_namespace_permission(
+                   admin_connector, "alice", NULL,
+                   SHOAL_NAMESPACE_PERMISSION_READ, 0, &error),
+               SHOAL_STATUS_INVALID_ARGUMENT, &error, "target_name");
   assert(shoal_connector_has_table_permission(
              admin_connector, "alice", "events", SHOAL_TABLE_PERMISSION_READ,
              0, &has_permission, &error) == SHOAL_STATUS_OK);
@@ -519,6 +561,16 @@ int main(void) {
              SHOAL_NAMESPACE_PERMISSION_READ, 0, &has_permission, &error) ==
          SHOAL_STATUS_OK);
   assert(has_permission == 0);
+  assert(shoal_connector_grant_namespace_permission(
+             admin_connector, "alice", "", SHOAL_NAMESPACE_PERMISSION_READ, 0,
+             &error) == SHOAL_STATUS_OK);
+  assert(shoal_connector_has_namespace_permission(
+             admin_connector, "alice", "", SHOAL_NAMESPACE_PERMISSION_READ, 0,
+             &has_permission, &error) == SHOAL_STATUS_OK);
+  assert(has_permission == 1);
+  assert(shoal_connector_revoke_namespace_permission(
+             admin_connector, "alice", "", SHOAL_NAMESPACE_PERMISSION_READ, 0,
+             &error) == SHOAL_STATUS_OK);
   assert(shoal_connector_change_password(admin_connector, "missing",
                                          &empty_password, 0, &error) ==
          SHOAL_STATUS_USER_NOT_FOUND);

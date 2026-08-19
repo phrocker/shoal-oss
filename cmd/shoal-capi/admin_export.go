@@ -100,7 +100,10 @@ func shoal_connector_namespace_exists(handle *C.shoal_connector, name *C.char, t
 	if outExists == nil {
 		return fail(outError, C.SHOAL_STATUS_INVALID_ARGUMENT, errors.New("shoal: out_exists is required"))
 	}
-	namespace := optionalString(name)
+	namespace, err := requiredStringAllowEmpty(name, "namespace_name")
+	if err != nil {
+		return fail(outError, C.SHOAL_STATUS_INVALID_ARGUMENT, err)
+	}
 	_, admin, ctx, done, code, err := beginNamespaceAdmin(handle, timeout)
 	if err != nil {
 		return fail(outError, code, err)
@@ -143,7 +146,10 @@ func shoal_connector_rename_namespace(handle *C.shoal_connector, name, newName *
 func shoal_connector_set_namespace_property(handle *C.shoal_connector, name, property, value *C.char, timeout C.int64_t, outError **C.shoal_error) (status C.shoal_status) {
 	clearError(outError)
 	defer recoverStatus(&status, outError)
-	namespace := optionalString(name)
+	namespace, err := requiredStringAllowEmpty(name, "namespace_name")
+	if err != nil {
+		return fail(outError, C.SHOAL_STATUS_INVALID_ARGUMENT, err)
+	}
 	propertyName, err := requiredString(property, "property_name")
 	if err != nil {
 		return fail(outError, C.SHOAL_STATUS_INVALID_ARGUMENT, err)
@@ -167,7 +173,10 @@ func shoal_connector_set_namespace_property(handle *C.shoal_connector, name, pro
 func shoal_connector_remove_namespace_property(handle *C.shoal_connector, name, property *C.char, timeout C.int64_t, outError **C.shoal_error) (status C.shoal_status) {
 	clearError(outError)
 	defer recoverStatus(&status, outError)
-	namespace := optionalString(name)
+	namespace, err := requiredStringAllowEmpty(name, "namespace_name")
+	if err != nil {
+		return fail(outError, C.SHOAL_STATUS_INVALID_ARGUMENT, err)
+	}
 	propertyName, err := requiredString(property, "property_name")
 	if err != nil {
 		return fail(outError, C.SHOAL_STATUS_INVALID_ARGUMENT, err)
@@ -207,7 +216,10 @@ func shoal_connector_versioned_namespace_properties(handle *C.shoal_connector, n
 	if out == nil {
 		return fail(outError, C.SHOAL_STATUS_INVALID_ARGUMENT, errors.New("shoal: out_result is required"))
 	}
-	namespace := optionalString(name)
+	namespace, err := requiredStringAllowEmpty(name, "namespace_name")
+	if err != nil {
+		return fail(outError, C.SHOAL_STATUS_INVALID_ARGUMENT, err)
+	}
 	_, admin, ctx, done, code, err := beginNamespaceAdmin(handle, timeout)
 	if err != nil {
 		return fail(outError, code, err)
@@ -278,7 +290,10 @@ func readNamespaceProperties(handle *C.shoal_connector, name *C.char, timeout C.
 	if out == nil {
 		return fail(outError, C.SHOAL_STATUS_INVALID_ARGUMENT, errors.New("shoal: out_result is required"))
 	}
-	namespace := optionalString(name)
+	namespace, err := requiredStringAllowEmpty(name, "namespace_name")
+	if err != nil {
+		return fail(outError, C.SHOAL_STATUS_INVALID_ARGUMENT, err)
+	}
 	_, admin, ctx, done, code, err := beginNamespaceAdmin(handle, timeout)
 	if err != nil {
 		return fail(outError, code, err)
@@ -378,63 +393,63 @@ func shoal_connector_get_user_authorizations(handle *C.shoal_connector, user *C.
 
 //export shoal_connector_has_system_permission
 func shoal_connector_has_system_permission(handle *C.shoal_connector, user *C.char, permission C.shoal_system_permission, timeout C.int64_t, out *C.uint8_t, outError **C.shoal_error) C.shoal_status {
-	return securityBool(handle, user, nil, timeout, out, outError, func(ctx context.Context, admin securityAdminAPI, name, _ string) (bool, error) {
+	return securityBool(handle, user, nil, nil, timeout, out, outError, func(ctx context.Context, admin securityAdminAPI, name, _ string) (bool, error) {
 		return admin.HasSystemPermission(ctx, name, accumulo.SystemPermission(permission))
 	})
 }
 
 //export shoal_connector_has_table_permission
 func shoal_connector_has_table_permission(handle *C.shoal_connector, user, table *C.char, permission C.shoal_table_permission, timeout C.int64_t, out *C.uint8_t, outError **C.shoal_error) C.shoal_status {
-	return securityBool(handle, user, table, timeout, out, outError, func(ctx context.Context, admin securityAdminAPI, name, target string) (bool, error) {
+	return securityBool(handle, user, table, requiredString, timeout, out, outError, func(ctx context.Context, admin securityAdminAPI, name, target string) (bool, error) {
 		return admin.HasTablePermission(ctx, name, target, accumulo.TablePermission(permission))
 	})
 }
 
 //export shoal_connector_has_namespace_permission
 func shoal_connector_has_namespace_permission(handle *C.shoal_connector, user, namespace *C.char, permission C.shoal_namespace_permission, timeout C.int64_t, out *C.uint8_t, outError **C.shoal_error) C.shoal_status {
-	return securityBool(handle, user, namespace, timeout, out, outError, func(ctx context.Context, admin securityAdminAPI, name, target string) (bool, error) {
+	return securityBool(handle, user, namespace, requiredStringAllowEmpty, timeout, out, outError, func(ctx context.Context, admin securityAdminAPI, name, target string) (bool, error) {
 		return admin.HasNamespacePermission(ctx, name, target, accumulo.NamespacePermission(permission))
 	})
 }
 
 //export shoal_connector_grant_system_permission
 func shoal_connector_grant_system_permission(handle *C.shoal_connector, user *C.char, permission C.shoal_system_permission, timeout C.int64_t, outError **C.shoal_error) C.shoal_status {
-	return securityPermissionChange(handle, user, nil, timeout, outError, func(ctx context.Context, admin securityAdminAPI, name, _ string) error {
+	return securityPermissionChange(handle, user, nil, nil, timeout, outError, func(ctx context.Context, admin securityAdminAPI, name, _ string) error {
 		return admin.GrantSystemPermission(ctx, name, accumulo.SystemPermission(permission))
 	})
 }
 
 //export shoal_connector_revoke_system_permission
 func shoal_connector_revoke_system_permission(handle *C.shoal_connector, user *C.char, permission C.shoal_system_permission, timeout C.int64_t, outError **C.shoal_error) C.shoal_status {
-	return securityPermissionChange(handle, user, nil, timeout, outError, func(ctx context.Context, admin securityAdminAPI, name, _ string) error {
+	return securityPermissionChange(handle, user, nil, nil, timeout, outError, func(ctx context.Context, admin securityAdminAPI, name, _ string) error {
 		return admin.RevokeSystemPermission(ctx, name, accumulo.SystemPermission(permission))
 	})
 }
 
 //export shoal_connector_grant_table_permission
 func shoal_connector_grant_table_permission(handle *C.shoal_connector, user, table *C.char, permission C.shoal_table_permission, timeout C.int64_t, outError **C.shoal_error) C.shoal_status {
-	return securityPermissionChange(handle, user, table, timeout, outError, func(ctx context.Context, admin securityAdminAPI, name, target string) error {
+	return securityPermissionChange(handle, user, table, requiredString, timeout, outError, func(ctx context.Context, admin securityAdminAPI, name, target string) error {
 		return admin.GrantTablePermission(ctx, name, target, accumulo.TablePermission(permission))
 	})
 }
 
 //export shoal_connector_revoke_table_permission
 func shoal_connector_revoke_table_permission(handle *C.shoal_connector, user, table *C.char, permission C.shoal_table_permission, timeout C.int64_t, outError **C.shoal_error) C.shoal_status {
-	return securityPermissionChange(handle, user, table, timeout, outError, func(ctx context.Context, admin securityAdminAPI, name, target string) error {
+	return securityPermissionChange(handle, user, table, requiredString, timeout, outError, func(ctx context.Context, admin securityAdminAPI, name, target string) error {
 		return admin.RevokeTablePermission(ctx, name, target, accumulo.TablePermission(permission))
 	})
 }
 
 //export shoal_connector_grant_namespace_permission
 func shoal_connector_grant_namespace_permission(handle *C.shoal_connector, user, namespace *C.char, permission C.shoal_namespace_permission, timeout C.int64_t, outError **C.shoal_error) C.shoal_status {
-	return securityPermissionChange(handle, user, namespace, timeout, outError, func(ctx context.Context, admin securityAdminAPI, name, target string) error {
+	return securityPermissionChange(handle, user, namespace, requiredStringAllowEmpty, timeout, outError, func(ctx context.Context, admin securityAdminAPI, name, target string) error {
 		return admin.GrantNamespacePermission(ctx, name, target, accumulo.NamespacePermission(permission))
 	})
 }
 
 //export shoal_connector_revoke_namespace_permission
 func shoal_connector_revoke_namespace_permission(handle *C.shoal_connector, user, namespace *C.char, permission C.shoal_namespace_permission, timeout C.int64_t, outError **C.shoal_error) C.shoal_status {
-	return securityPermissionChange(handle, user, namespace, timeout, outError, func(ctx context.Context, admin securityAdminAPI, name, target string) error {
+	return securityPermissionChange(handle, user, namespace, requiredStringAllowEmpty, timeout, outError, func(ctx context.Context, admin securityAdminAPI, name, target string) error {
 		return admin.RevokeNamespacePermission(ctx, name, target, accumulo.NamespacePermission(permission))
 	})
 }
@@ -490,7 +505,7 @@ func mutateUserPassword(handle *C.shoal_connector, user *C.char, password *C.sho
 	return status
 }
 
-func securityBool(handle *C.shoal_connector, user, target *C.char, timeout C.int64_t, out *C.uint8_t, outError **C.shoal_error, call func(context.Context, securityAdminAPI, string, string) (bool, error)) (status C.shoal_status) {
+func securityBool(handle *C.shoal_connector, user, target *C.char, parseTarget func(*C.char, string) (string, error), timeout C.int64_t, out *C.uint8_t, outError **C.shoal_error, call func(context.Context, securityAdminAPI, string, string) (bool, error)) (status C.shoal_status) {
 	clearError(outError)
 	if out != nil {
 		*out = 0
@@ -504,8 +519,8 @@ func securityBool(handle *C.shoal_connector, user, target *C.char, timeout C.int
 		return fail(outError, C.SHOAL_STATUS_INVALID_ARGUMENT, err)
 	}
 	targetName := ""
-	if target != nil {
-		targetName, err = requiredStringAllowEmpty(target, "target_name")
+	if parseTarget != nil {
+		targetName, err = parseTarget(target, "target_name")
 		if err != nil {
 			return fail(outError, C.SHOAL_STATUS_INVALID_ARGUMENT, err)
 		}
@@ -527,15 +542,15 @@ func securityBool(handle *C.shoal_connector, user, target *C.char, timeout C.int
 	return C.SHOAL_STATUS_OK
 }
 
-func securityPermissionChange(handle *C.shoal_connector, user, target *C.char, timeout C.int64_t, outError **C.shoal_error, call func(context.Context, securityAdminAPI, string, string) error) C.shoal_status {
+func securityPermissionChange(handle *C.shoal_connector, user, target *C.char, parseTarget func(*C.char, string) (string, error), timeout C.int64_t, outError **C.shoal_error, call func(context.Context, securityAdminAPI, string, string) error) C.shoal_status {
 	name, err := requiredString(user, "user")
 	if err != nil {
 		clearError(outError)
 		return fail(outError, C.SHOAL_STATUS_INVALID_ARGUMENT, err)
 	}
 	targetName := ""
-	if target != nil {
-		targetName, err = requiredStringAllowEmpty(target, "target_name")
+	if parseTarget != nil {
+		targetName, err = parseTarget(target, "target_name")
 		if err != nil {
 			clearError(outError)
 			return fail(outError, C.SHOAL_STATUS_INVALID_ARGUMENT, err)
