@@ -352,11 +352,12 @@ func ParsePath(path string) (containerName, blobName string, err error) {
 }
 
 const (
-	maxBlobNameBytes      = 1024
+	maxBlobNameCharacters = 1024
 	tempStageNamePrefix   = ".shl-"
 	tempStageHashHexLen   = 4
 	tempStageRandomHexLen = 10
 	tempStageComponentLen = len(tempStageNamePrefix) + tempStageHashHexLen + tempStageRandomHexLen
+	tempStageMinimumLen   = len(tempStageNamePrefix) + tempStageRandomHexLen
 	legacyStageDirPrefix  = ".shoal-tmp/"
 	azureCopyBlockSize    = 100 << 20
 	azureSourceSASExpiry  = 5 * time.Minute
@@ -383,9 +384,12 @@ func nextTemporaryStageName(name string) (string, error) {
 		return "", fmt.Errorf("temporary blob token material too short")
 	}
 	component := tempStageNamePrefix + token[:tempStageRandomHexLen] + hashHex[:tempStageHashHexLen]
-	available := maxBlobNameBytes - len(prefix)
-	if available < 1 {
-		return "", fmt.Errorf("blob prefix %q leaves no room for a temporary blob", prefix)
+	available := maxBlobNameCharacters - len([]rune(prefix))
+	if available < tempStageMinimumLen {
+		return "", fmt.Errorf(
+			"blob prefix %q leaves %d characters for a temporary blob; need at least %d",
+			prefix, available, tempStageMinimumLen,
+		)
 	}
 	if len(component) > available {
 		component = component[:available]

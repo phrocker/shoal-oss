@@ -214,6 +214,7 @@ const (
 	tempObjectHashHexLen   = 4
 	tempObjectRandomHexLen = 10
 	tempObjectComponentLen = len(tempObjectPrefix) + tempObjectHashHexLen + tempObjectRandomHexLen
+	tempObjectMinimumLen   = len(tempObjectPrefix) + tempObjectRandomHexLen
 	legacyTempObjectPrefix = ".shoal-tmp-"
 )
 
@@ -238,8 +239,11 @@ func nextTemporaryObjectName(object string) (string, error) {
 	}
 	component := temporaryObjectComponent(hashHex, token)
 	available := min(maxObjectNameBytes-len(prefix), maxObjectSegmentBytes)
-	if available < 1 {
-		return "", fmt.Errorf("object prefix %q leaves no room for a temporary object", prefix)
+	if available < tempObjectMinimumLen {
+		return "", fmt.Errorf(
+			"object prefix %q leaves %d bytes for a temporary object; need at least %d",
+			prefix, available, tempObjectMinimumLen,
+		)
 	}
 	if len(component) > available {
 		component = component[:available]

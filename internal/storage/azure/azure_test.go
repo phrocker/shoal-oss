@@ -325,7 +325,7 @@ func TestWriter_WriteAfterCloseReportsClosedState(t *testing.T) {
 	}
 }
 
-func TestNextTemporaryStageNamePreservesPrefixAndBoundsUTF8Bytes(t *testing.T) {
+func TestNextTemporaryStageNamePreservesPrefixAndBoundsCharacters(t *testing.T) {
 	original := randomStageNameToken
 	randomStageNameToken = func() (string, error) {
 		return strings.Repeat("a", tempStageRandomHexLen), nil
@@ -342,12 +342,12 @@ func TestNextTemporaryStageNamePreservesPrefixAndBoundsUTF8Bytes(t *testing.T) {
 	if got, want := stageNameParentPrefix(stageName), stageNameParentPrefix(name); got != want {
 		t.Fatalf("stage prefix = %q, want %q", got, want)
 	}
-	if len(stageName) > maxBlobNameBytes {
-		t.Fatalf("stage name length = %d bytes, want <= %d", len(stageName), maxBlobNameBytes)
+	if len([]rune(stageName)) > maxBlobNameCharacters {
+		t.Fatalf("stage name length = %d characters, want <= %d", len([]rune(stageName)), maxBlobNameCharacters)
 	}
 }
 
-func TestNextTemporaryStageNameRetainsDeepPrefixNearMaxBytes(t *testing.T) {
+func TestNextTemporaryStageNameRejectsPrefixWithoutFullRandomToken(t *testing.T) {
 	original := randomStageNameToken
 	randomStageNameToken = func() (string, error) {
 		return strings.Repeat("b", tempStageRandomHexLen), nil
@@ -357,15 +357,47 @@ func TestNextTemporaryStageNameRetainsDeepPrefixNearMaxBytes(t *testing.T) {
 	})
 
 	name := strings.Repeat("a", 1015) + "/x"
+	if _, err := nextTemporaryStageName(name); err == nil {
+		t.Fatal("nextTemporaryStageName succeeded without room for the full random token")
+	}
+}
+
+func TestNextTemporaryStageNameKeepsFullRandomTokenAtMinimumSpace(t *testing.T) {
+	original := randomStageNameToken
+	tokens := []string{
+		strings.Repeat("c", tempStageRandomHexLen),
+		strings.Repeat("d", tempStageRandomHexLen),
+	}
+	randomStageNameToken = func() (string, error) {
+		token := tokens[0]
+		tokens = tokens[1:]
+		return token, nil
+	}
+	t.Cleanup(func() {
+		randomStageNameToken = original
+	})
+
+	name := strings.Repeat("界", 1008) + "/x"
 	stageName, err := nextTemporaryStageName(name)
 	if err != nil {
 		t.Fatalf("nextTemporaryStageName: %v", err)
 	}
-	if got, want := stageNameParentPrefix(stageName), stageNameParentPrefix(name); got != want {
-		t.Fatalf("stage prefix = %q, want deep prefix %q", got, want)
+	component := stageName[len(stageNameParentPrefix(stageName)):]
+	if got, want := component, tempStageNamePrefix+strings.Repeat("c", tempStageRandomHexLen); got != want {
+		t.Fatalf("temporary component = %q, want %q", got, want)
 	}
-	if len(stageName) > maxBlobNameBytes {
-		t.Fatalf("stage name length = %d bytes, want <= %d", len(stageName), maxBlobNameBytes)
+	if !isTemporaryStageName(stageName) {
+		t.Fatalf("temporary blob %q is visible to List", stageName)
+	}
+	if len([]rune(stageName)) > maxBlobNameCharacters {
+		t.Fatalf("stage name length = %d characters, want <= %d", len([]rune(stageName)), maxBlobNameCharacters)
+	}
+	other, err := nextTemporaryStageName(name)
+	if err != nil {
+		t.Fatalf("second nextTemporaryStageName: %v", err)
+	}
+	if other == stageName {
+		t.Fatalf("distinct random tokens produced the same temporary blob %q", stageName)
 	}
 }
 

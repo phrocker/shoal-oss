@@ -238,6 +238,7 @@ const (
 	tempStageHashHexLen   = 4
 	tempStageRandomHexLen = 10
 	tempStageComponentLen = len(tempStageKeyPrefix) + tempStageHashHexLen + tempStageRandomHexLen
+	tempStageMinimumLen   = len(tempStageKeyPrefix) + tempStageRandomHexLen
 	legacyStageDirPrefix  = ".shoal-tmp/"
 )
 
@@ -262,8 +263,11 @@ func nextTemporaryStageKey(key string) (string, error) {
 	}
 	component := tempStageKeyPrefix + token[:tempStageRandomHexLen] + hashHex[:tempStageHashHexLen]
 	available := maxObjectKeyBytes - len(prefix)
-	if available < 1 {
-		return "", fmt.Errorf("key prefix %q leaves no room for a temporary object", prefix)
+	if available < tempStageMinimumLen {
+		return "", fmt.Errorf(
+			"key prefix %q leaves %d bytes for a temporary object; need at least %d",
+			prefix, available, tempStageMinimumLen,
+		)
 	}
 	if len(component) > available {
 		component = component[:available]

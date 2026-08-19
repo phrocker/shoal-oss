@@ -201,6 +201,57 @@ func TestNextTemporaryObjectNameRetainsDeepPrefixNearMaxBytes(t *testing.T) {
 	}
 }
 
+func TestNextTemporaryObjectNameRejectsPrefixWithoutFullRandomToken(t *testing.T) {
+	originalToken := randomTempObjectToken
+	randomTempObjectToken = func() (string, error) {
+		return strings.Repeat("f", tempObjectRandomHexLen), nil
+	}
+	t.Cleanup(func() {
+		randomTempObjectToken = originalToken
+	})
+
+	object := strings.Repeat("a", 1010) + "/x"
+	if _, err := nextTemporaryObjectName(object); err == nil {
+		t.Fatal("nextTemporaryObjectName succeeded without room for the full random token")
+	}
+}
+
+func TestNextTemporaryObjectNameKeepsFullRandomTokenAtMinimumSpace(t *testing.T) {
+	originalToken := randomTempObjectToken
+	tokens := []string{
+		strings.Repeat("9", tempObjectRandomHexLen),
+		strings.Repeat("8", tempObjectRandomHexLen),
+	}
+	randomTempObjectToken = func() (string, error) {
+		token := tokens[0]
+		tokens = tokens[1:]
+		return token, nil
+	}
+	t.Cleanup(func() {
+		randomTempObjectToken = originalToken
+	})
+
+	object := strings.Repeat("a", 1008) + "/x"
+	tempName, err := nextTemporaryObjectName(object)
+	if err != nil {
+		t.Fatalf("nextTemporaryObjectName: %v", err)
+	}
+	component := tempName[len(tempObjectParentPrefix(tempName)):]
+	if got, want := component, tempObjectPrefix+strings.Repeat("9", tempObjectRandomHexLen); got != want {
+		t.Fatalf("temporary component = %q, want %q", got, want)
+	}
+	if !isTemporaryObjectName(tempName) {
+		t.Fatalf("temporary object %q is visible to List", tempName)
+	}
+	other, err := nextTemporaryObjectName(object)
+	if err != nil {
+		t.Fatalf("second nextTemporaryObjectName: %v", err)
+	}
+	if other == tempName {
+		t.Fatalf("distinct random tokens produced the same temporary object %q", tempName)
+	}
+}
+
 func TestNextTemporaryObjectNameSupportsHierarchicalSegmentLimit(t *testing.T) {
 	originalToken := randomTempObjectToken
 	randomTempObjectToken = func() (string, error) {
