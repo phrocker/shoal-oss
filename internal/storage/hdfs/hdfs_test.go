@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"net"
 	"os"
@@ -1619,6 +1620,54 @@ func TestCleanupReaderAfterDeadlineFailureJoinsCleanupErrors(t *testing.T) {
 	}
 }
 
+func TestFileMatchesAppliesCleanupDeadlineBeforeAndDuringReads(t *testing.T) {
+	reader := &perReadDeadlineReader{
+		data: []byte("ab"),
+		info: fakeInfo{name: "1.rf", size: 2},
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	sum := sha256.Sum256(reader.data)
+
+	matches, err := fileMatches(ctx, &openReaderClient{reader: reader}, "/tables/1.rf", int64(len(reader.data)), sum[:])
+	if err != nil {
+		t.Fatalf("fileMatches: %v", err)
+	}
+	if !matches {
+		t.Fatal("fileMatches returned false, want true")
+	}
+	if got, want := len(reader.deadlines), 3; got != want {
+		t.Fatalf("SetDeadline calls = %d, want %d (open + each read)", got, want)
+	}
+	for i, deadline := range reader.deadlines {
+		if deadline.IsZero() {
+			t.Fatalf("deadline %d = zero, want cleanup deadline", i)
+		}
+	}
+}
+
+func TestFileMatchesBlockedReadUsesCleanupDeadline(t *testing.T) {
+	reader := &deadlineBlockingReadReader{info: fakeInfo{name: "1.rf", size: 1}}
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+	sum := sha256.Sum256([]byte("x"))
+
+	start := time.Now()
+	matches, err := fileMatches(ctx, &openReaderClient{reader: reader}, "/tables/1.rf", 1, sum[:])
+	if matches {
+		t.Fatal("fileMatches succeeded, want bounded read failure")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("fileMatches error = %v, want context deadline exceeded", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("fileMatches took %v; cleanup deadline did not bound ReadAt", elapsed)
+	}
+	if len(reader.deadlines) < 2 {
+		t.Fatalf("SetDeadline calls = %d, want open + read deadline application", len(reader.deadlines))
+	}
+}
+
 func TestBackendAbortPreservesExistingTargetAndRemovesTemp(t *testing.T) {
 	client := newFakeClient()
 	client.files["/tables/1.rf"] = []byte("old")
@@ -2695,6 +2744,71 @@ func (r *contextReadReader) ReadAt([]byte, int64) (int, error) {
 
 func (*contextReadReader) Close() error        { return nil }
 func (r *contextReadReader) Stat() os.FileInfo { return r.info }
+
+type openReaderClient struct {
+	reader Reader
+}
+
+func (c *openReaderClient) Open(string) (Reader, error) { return c.reader, nil }
+func (*openReaderClient) Create(string) (storage.Writer, error) {
+	return nil, errors.New("not implemented")
+}
+func (*openReaderClient) MkdirAll(string, os.FileMode) error { return nil }
+func (*openReaderClient) ReadDir(string) ([]os.FileInfo, error) {
+	return nil, errors.New("not implemented")
+}
+func (*openReaderClient) Remove(string) error         { return errors.New("not implemented") }
+func (*openReaderClient) Rename(string, string) error { return errors.New("not implemented") }
+func (*openReaderClient) Close() error                { return nil }
+
+type perReadDeadlineReader struct {
+	data      []byte
+	info      os.FileInfo
+	deadlines []time.Time
+}
+
+func (r *perReadDeadlineReader) ReadAt(p []byte, off int64) (int, error) {
+	if len(r.deadlines) == 0 || r.deadlines[len(r.deadlines)-1].IsZero() {
+		return 0, errors.New("missing read deadline")
+	}
+	if off >= int64(len(r.data)) {
+		return 0, io.EOF
+	}
+	n := copy(p, r.data[off:off+1])
+	if off+int64(n) >= int64(len(r.data)) {
+		return n, io.EOF
+	}
+	return n, nil
+}
+
+func (*perReadDeadlineReader) Close() error        { return nil }
+func (r *perReadDeadlineReader) Stat() os.FileInfo { return r.info }
+func (r *perReadDeadlineReader) SetDeadline(deadline time.Time) error {
+	r.deadlines = append(r.deadlines, deadline)
+	return nil
+}
+
+type deadlineBlockingReadReader struct {
+	info      os.FileInfo
+	deadlines []time.Time
+}
+
+func (r *deadlineBlockingReadReader) ReadAt([]byte, int64) (int, error) {
+	if len(r.deadlines) == 0 || r.deadlines[len(r.deadlines)-1].IsZero() {
+		return 0, errors.New("missing read deadline")
+	}
+	timer := time.NewTimer(time.Until(r.deadlines[len(r.deadlines)-1]))
+	defer timer.Stop()
+	<-timer.C
+	return 0, context.DeadlineExceeded
+}
+
+func (*deadlineBlockingReadReader) Close() error        { return nil }
+func (r *deadlineBlockingReadReader) Stat() os.FileInfo { return r.info }
+func (r *deadlineBlockingReadReader) SetDeadline(deadline time.Time) error {
+	r.deadlines = append(r.deadlines, deadline)
+	return nil
+}
 
 type fakeWriter struct {
 	bytes.Buffer

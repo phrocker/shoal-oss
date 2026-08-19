@@ -67,8 +67,9 @@ type Writer interface {
 }
 
 // Aborter is an optional Writer capability that abandons an in-progress write
-// without publishing it. Copy and WriteAll call Abort on unsuccessful paths
-// when available; writers that do not implement Aborter retain their Close
+// without publishing it. Copy, WriteAll, CleanupUnsuccessfulWrite, and direct
+// Writer users that call AbortOnError invoke Abort on unsuccessful paths when
+// available; writers that do not implement Aborter retain their Close
 // semantics during cleanup.
 type Aborter interface {
 	Abort() error
@@ -145,12 +146,7 @@ func Copy(ctx context.Context, src Backend, srcPath string, dst Backend, dstPath
 	if err != nil {
 		return 0, fmt.Errorf("copy: create dst %s: %w", dstPath, err)
 	}
-	needsCleanup := true
-	defer func() {
-		if needsCleanup {
-			err = CleanupUnsuccessfulWrite(err, out)
-		}
-	}()
+	defer AbortOnError(&err, out)
 
 	buf := make([]byte, transferChunkSize)
 	for written < in.Size() {
@@ -204,7 +200,6 @@ func Copy(ctx context.Context, src Backend, srcPath string, dst Backend, dstPath
 	if err := out.Close(); err != nil {
 		return written, fmt.Errorf("copy: close dst %s: %w", dstPath, err)
 	}
-	needsCleanup = false
 	return written, nil
 }
 
@@ -238,10 +233,11 @@ func ReadAll(ctx context.Context, b Backend, path string) ([]byte, error) {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
+		readOff := off
 		end := min(off+transferChunkSize, size)
 		n, err := f.ReadAt(buf[off:end], off)
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			return nil, joinContextCallError(err, ctxErr)
+			return nil, fmt.Errorf("readall: read %s off=%d: %w", path, readOff, joinContextCallError(err, ctxErr))
 		}
 		off += int64(n)
 		if err != nil {
@@ -274,12 +270,7 @@ func WriteAll(ctx context.Context, b Backend, path string, data []byte) (err err
 	if err != nil {
 		return fmt.Errorf("writeall: create %s: %w", path, err)
 	}
-	needsCleanup := true
-	defer func() {
-		if needsCleanup {
-			err = CleanupUnsuccessfulWrite(err, w)
-		}
-	}()
+	defer AbortOnError(&err, w)
 	for off := 0; off < len(data); {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -310,7 +301,6 @@ func WriteAll(ctx context.Context, b Backend, path string, data []byte) (err err
 	if err := w.Close(); err != nil {
 		return fmt.Errorf("writeall: close %s: %w", path, err)
 	}
-	needsCleanup = false
 	return nil
 }
 
@@ -341,4 +331,17 @@ func CleanupUnsuccessfulWrite(primaryErr error, w Writer) error {
 		return primaryErr
 	}
 	return errors.Join(primaryErr, cleanupErr)
+}
+
+// AbortOnError abandons w when errp points at a non-nil error. It is intended
+// for use in deferred cleanup by direct Writer users:
+//
+//	defer func() { storage.AbortOnError(&err, w) }()
+//
+// Writers that do not implement Aborter fall back to Close during cleanup.
+func AbortOnError(errp *error, w Writer) {
+	if errp == nil || *errp == nil || w == nil {
+		return
+	}
+	*errp = CleanupUnsuccessfulWrite(*errp, w)
 }

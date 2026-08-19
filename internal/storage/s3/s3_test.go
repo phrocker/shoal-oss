@@ -18,12 +18,14 @@
 package s3
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"strings"
 	"testing"
@@ -625,14 +627,8 @@ func TestWriter_CleanupUsesIndependentContextAndCanRetryAfterCommit(t *testing.T
 		if err := w.Close(); err != nil {
 			t.Fatalf("Close promoted cleanup failure: %v", err)
 		}
-		if _, ok := f.objects[w.stageKey]; !ok {
-			t.Fatal("temporary object unexpectedly removed")
-		}
-		if err := w.Close(); err != nil {
-			t.Fatalf("second Close: %v", err)
-		}
 		if _, ok := f.objects[w.stageKey]; ok {
-			t.Fatal("second Close did not retry temporary cleanup")
+			t.Fatal("committed cleanup did not retry and remove the temporary object")
 		}
 	})
 
@@ -655,6 +651,33 @@ func TestWriter_CleanupUsesIndependentContextAndCanRetryAfterCommit(t *testing.T
 			t.Fatal("Abort did not discover and remove temporary object")
 		}
 	})
+}
+
+func TestWriter_CloseLogsExhaustedCommittedCleanupFailure(t *testing.T) {
+	var logs bytes.Buffer
+	restore := captureDefaultLogger(t, &logs)
+	defer restore()
+
+	f := newFakeS3WriteOperations()
+	f.deleteFailures = committedCleanupAttempts
+	w := newFakeS3Writer(f, "target")
+	_, _ = w.Write([]byte("new"))
+
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close promoted committed destination failure: %v", err)
+	}
+	if _, ok := f.objects[w.stageKey]; !ok {
+		t.Fatal("committed cleanup unexpectedly removed the temporary object")
+	}
+	if got := logs.String(); !strings.Contains(got, "temporary stage pending cleanup") || !strings.Contains(got, w.stageKey) {
+		t.Fatalf("cleanup warning log = %q, want pending cleanup warning for %s", got, w.stageKey)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("second Close: %v", err)
+	}
+	if _, ok := f.objects[w.stageKey]; ok {
+		t.Fatal("second Close did not retry exhausted committed cleanup")
+	}
 }
 
 func TestWriter_AbortRetriesOwnedCleanupAfterAmbiguousStageUpload(t *testing.T) {
@@ -759,6 +782,13 @@ func TestFile_ReadAt_EdgeCases(t *testing.T) {
 	if !errors.Is(err, io.EOF) {
 		t.Errorf("off>size ReadAt: got %v, want io.EOF", err)
 	}
+}
+
+func captureDefaultLogger(t *testing.T, buf *bytes.Buffer) func() {
+	t.Helper()
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(buf, nil)))
+	return func() { slog.SetDefault(previous) }
 }
 
 // TestS3_ErrNotFoundSentinel verifies the sentinel is accessible without a

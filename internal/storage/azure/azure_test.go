@@ -25,6 +25,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/url"
 	"os"
 	"strings"
@@ -908,14 +909,8 @@ func TestWriter_CleanupUsesIndependentContextAndCanRetryAfterCommit(t *testing.T
 		if err := w.Close(); err != nil {
 			t.Fatalf("Close promoted cleanup failure: %v", err)
 		}
-		if _, ok := f.objects[w.stageName]; !ok {
-			t.Fatal("temporary blob unexpectedly removed")
-		}
-		if err := w.Close(); err != nil {
-			t.Fatalf("second Close: %v", err)
-		}
 		if _, ok := f.objects[w.stageName]; ok {
-			t.Fatal("second Close did not retry temporary cleanup")
+			t.Fatal("committed cleanup did not retry and remove the temporary blob")
 		}
 	})
 
@@ -938,6 +933,33 @@ func TestWriter_CleanupUsesIndependentContextAndCanRetryAfterCommit(t *testing.T
 			t.Fatal("Abort did not discover and remove temporary blob")
 		}
 	})
+}
+
+func TestWriter_CloseLogsExhaustedCommittedCleanupFailure(t *testing.T) {
+	var logs bytes.Buffer
+	restore := captureDefaultLogger(t, &logs)
+	defer restore()
+
+	f := newFakeAzureWriteOperations()
+	f.deleteFailures = committedCleanupAttempts
+	w := newFakeAzureWriter(f, "target")
+	_, _ = w.Write([]byte("new"))
+
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close promoted committed destination failure: %v", err)
+	}
+	if _, ok := f.objects[w.stageName]; !ok {
+		t.Fatal("committed cleanup unexpectedly removed the temporary blob")
+	}
+	if got := logs.String(); !strings.Contains(got, "temporary blob pending cleanup") || !strings.Contains(got, w.stageName) {
+		t.Fatalf("cleanup warning log = %q, want pending cleanup warning for %s", got, w.stageName)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("second Close: %v", err)
+	}
+	if _, ok := f.objects[w.stageName]; ok {
+		t.Fatal("second Close did not retry exhausted committed cleanup")
+	}
 }
 
 func TestWriter_AbortRetriesOwnedCleanupAfterAmbiguousStageUpload(t *testing.T) {
@@ -1097,6 +1119,13 @@ func TestFile_ReadAt_EdgeCases(t *testing.T) {
 	if !errors.Is(err, io.EOF) {
 		t.Errorf("off>size ReadAt: got %v, want io.EOF", err)
 	}
+}
+
+func captureDefaultLogger(t *testing.T, buf *bytes.Buffer) func() {
+	t.Helper()
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(buf, nil)))
+	return func() { slog.SetDefault(previous) }
 }
 
 // TestErrNotFoundSentinel verifies the sentinel is accessible without a live

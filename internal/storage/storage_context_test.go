@@ -153,6 +153,23 @@ func TestReadAll_CanceledDuringOpenDoesNotReturnEmptySuccess(t *testing.T) {
 	}
 }
 
+func TestReadAll_CanceledReadJoinsBackendError(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	readErr := errors.New("read failed")
+
+	_, err := storage.ReadAll(ctx, fileBackend{file: &readFuncFile{
+		size: 1,
+		read: func(p []byte, _ int64) (int, error) {
+			p[0] = 'x'
+			cancel()
+			return 1, readErr
+		},
+	}}, "/src")
+	if !errors.Is(err, readErr) || !errors.Is(err, context.Canceled) {
+		t.Fatalf("ReadAll error = %v, want joined read error and context.Canceled", err)
+	}
+}
+
 func TestWriteAll_CanceledAbortableWriterAbortsWithoutClose(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	data := bytes.Repeat([]byte("x"), 2*testTransferChunkSize)

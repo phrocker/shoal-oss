@@ -9,6 +9,7 @@ import (
 	"errors"
 	"hash/crc32"
 	"io"
+	"log/slog"
 	"os"
 	"strings"
 	"testing"
@@ -840,6 +841,10 @@ func TestWriter_AbortTreatsUnownedTempAsAlreadyCleanAfterAmbiguousClose(t *testi
 }
 
 func TestWriter_CloseSuccessIgnoresTempCleanupFailure(t *testing.T) {
+	var logs bytes.Buffer
+	restore := captureDefaultLogger(t, &logs)
+	defer restore()
+
 	backend, bucket := newFakeBackend()
 	cleanupErr := errors.New("cleanup failed")
 	bucket.deleteHook = func(_ context.Context, object *fakeObject) error {
@@ -866,6 +871,16 @@ func TestWriter_CloseSuccessIgnoresTempCleanupFailure(t *testing.T) {
 	if _, ok := bucket.objects[tempName]; !ok {
 		t.Fatalf("cleanup failure should leave temp object %q for observation", tempName)
 	}
+	if got := logs.String(); !strings.Contains(got, "temporary object pending cleanup") || !strings.Contains(got, tempName) {
+		t.Fatalf("cleanup warning log = %q, want pending cleanup warning for %s", got, tempName)
+	}
+	bucket.deleteHook = nil
+	if err := w.Close(); err != nil {
+		t.Fatalf("second Close: %v", err)
+	}
+	if _, ok := bucket.objects[tempName]; ok {
+		t.Fatalf("second Close did not retry exhausted committed cleanup for %q", tempName)
+	}
 }
 
 func TestWriter_CloseRetriesTempCleanupAfterCommittedPromotion(t *testing.T) {
@@ -891,14 +906,8 @@ func TestWriter_CloseRetriesTempCleanupAfterCommittedPromotion(t *testing.T) {
 	if err := w.Close(); err != nil {
 		t.Fatalf("first Close: %v", err)
 	}
-	if _, ok := bucket.objects[tempName]; !ok {
-		t.Fatalf("cleanup retry test lost temp object %q before retry", tempName)
-	}
-	if err := w.Close(); err != nil {
-		t.Fatalf("second Close: %v", err)
-	}
 	if _, ok := bucket.objects[tempName]; ok {
-		t.Fatalf("second Close did not retry cleanup for %q", tempName)
+		t.Fatalf("committed cleanup did not retry and remove temp object %q", tempName)
 	}
 }
 
@@ -1406,4 +1415,11 @@ func cloneObjectAttrs(attrs *cloudstorage.ObjectAttrs) *cloudstorage.ObjectAttrs
 	clone.MD5 = append([]byte(nil), attrs.MD5...)
 	clone.Metadata = cloneMetadata(attrs.Metadata)
 	return &clone
+}
+
+func captureDefaultLogger(t *testing.T, buf *bytes.Buffer) func() {
+	t.Helper()
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(buf, nil)))
+	return func() { slog.SetDefault(previous) }
 }

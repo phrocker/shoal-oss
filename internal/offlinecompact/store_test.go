@@ -18,8 +18,10 @@
 package offlinecompact
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"io"
 	"testing"
 
 	"github.com/phrocker/shoal/internal/storage"
@@ -63,80 +65,140 @@ func TestBackendStore_ReadMissing(t *testing.T) {
 	}
 }
 
-type abortingBackend struct {
-	writer *abortingWriter
+func TestBackendStore_WriteAbortsOnWriteFailure(t *testing.T) {
+	backend := newTrackingWritableBackend()
+	backend.files["x.rf"] = []byte("old")
+	backend.writeLimit = 2
+	backend.writeErr = errors.New("write failed")
+
+	s := NewBackendStore(backend)
+	err := s.Write(context.Background(), "x.rf", []byte("data"))
+	if !errors.Is(err, backend.writeErr) {
+		t.Fatalf("Write error = %v, want %v", err, backend.writeErr)
+	}
+	if got := string(backend.files["x.rf"]); got != "old" {
+		t.Fatalf("destination contents = %q, want old", got)
+	}
+	if backend.lastWriter == nil || backend.lastWriter.abortCalls != 1 {
+		t.Fatalf("Abort calls = %d, want 1", backend.lastWriter.abortCalls)
+	}
+	if backend.lastWriter.stagePresent {
+		t.Fatal("failed write left staged bytes behind")
+	}
+	if backend.lastWriter.syncCalls != 0 {
+		t.Fatalf("Sync calls = %d, want 0 after write failure", backend.lastWriter.syncCalls)
+	}
 }
 
-func (*abortingBackend) Open(context.Context, string) (storage.File, error) {
+func TestBackendStore_WriteAbortsOnSyncFailureAndPreservesTarget(t *testing.T) {
+	backend := newTrackingWritableBackend()
+	backend.files["x.rf"] = []byte("old")
+	backend.syncErr = errors.New("sync failed")
+
+	s := NewBackendStore(backend)
+	err := s.Write(context.Background(), "x.rf", []byte("data"))
+	if !errors.Is(err, backend.syncErr) {
+		t.Fatalf("Write error = %v, want %v", err, backend.syncErr)
+	}
+	if got := string(backend.files["x.rf"]); got != "old" {
+		t.Fatalf("destination contents = %q, want old", got)
+	}
+	if backend.lastWriter == nil || backend.lastWriter.abortCalls != 1 {
+		t.Fatalf("Abort calls = %d, want 1", backend.lastWriter.abortCalls)
+	}
+	if backend.lastWriter.syncCalls != 1 {
+		t.Fatalf("Sync calls = %d, want 1", backend.lastWriter.syncCalls)
+	}
+	if backend.lastWriter.stagePresent {
+		t.Fatal("failed sync left staged bytes behind")
+	}
+}
+
+type trackingWritableBackend struct {
+	files      map[string][]byte
+	lastWriter *trackingWriter
+	writeLimit int
+	writeErr   error
+	syncErr    error
+}
+
+func newTrackingWritableBackend() *trackingWritableBackend {
+	return &trackingWritableBackend{
+		files:      make(map[string][]byte),
+		writeLimit: -1,
+	}
+}
+
+func (b *trackingWritableBackend) Open(context.Context, string) (storage.File, error) {
 	return nil, storage.ErrNotFound
 }
 
-func (b *abortingBackend) Create(context.Context, string) (storage.Writer, error) {
-	return b.writer, nil
+func (b *trackingWritableBackend) Create(_ context.Context, path string) (storage.Writer, error) {
+	writer := &trackingWriter{
+		backend:    b,
+		path:       path,
+		writeLimit: b.writeLimit,
+		writeErr:   b.writeErr,
+		syncErr:    b.syncErr,
+	}
+	b.lastWriter = writer
+	return writer, nil
 }
 
-type abortingWriter struct {
-	aborted bool
-	closed  bool
+type trackingWriter struct {
+	backend      *trackingWritableBackend
+	path         string
+	stage        bytes.Buffer
+	stagePresent bool
+	writeLimit   int
+	writeErr     error
+	syncErr      error
+	closeCalls   int
+	abortCalls   int
+	syncCalls    int
+	closed       bool
+	aborted      bool
 }
 
-func (*abortingWriter) Write([]byte) (int, error) { return 0, errors.New("write failed") }
-func (w *abortingWriter) Close() error {
+func (w *trackingWriter) Write(p []byte) (int, error) {
+	w.stagePresent = true
+	if w.writeErr != nil && w.writeLimit >= 0 {
+		remaining := w.writeLimit - w.stage.Len()
+		if remaining <= 0 {
+			return 0, w.writeErr
+		}
+		if remaining < len(p) {
+			_, _ = w.stage.Write(p[:remaining])
+			return remaining, w.writeErr
+		}
+	}
+	return w.stage.Write(p)
+}
+
+func (w *trackingWriter) Sync() error {
+	w.syncCalls++
+	return w.syncErr
+}
+
+func (w *trackingWriter) Close() error {
+	w.closeCalls++
+	if w.closed {
+		return nil
+	}
 	w.closed = true
+	w.stagePresent = false
+	w.backend.files[w.path] = append([]byte(nil), w.stage.Bytes()...)
 	return nil
 }
-func (w *abortingWriter) Abort() error {
+
+func (w *trackingWriter) Abort() error {
+	w.abortCalls++
 	w.aborted = true
+	w.stagePresent = false
+	w.stage.Reset()
 	return nil
 }
 
-func TestBackendStore_WriteAbortsInsteadOfClosingOnFailure(t *testing.T) {
-	writer := &abortingWriter{}
-	s := NewBackendStore(&abortingBackend{writer: writer})
-	if err := s.Write(context.Background(), "target.rf", []byte("data")); err == nil {
-		t.Fatal("Write succeeded despite writer failure")
-	}
-	if !writer.aborted {
-		t.Fatal("failed Write did not abort transactional writer")
-	}
-	if writer.closed {
-		t.Fatal("failed Write closed and could have committed transactional writer")
-	}
-}
-
-type syncFailWriter struct {
-	abortingWriter
-	synced bool
-}
-
-func (*syncFailWriter) Write(p []byte) (int, error) { return len(p), nil }
-func (w *syncFailWriter) Sync() error {
-	w.synced = true
-	return errors.New("sync failed")
-}
-
-func TestBackendStore_WriteSyncFailureAborts(t *testing.T) {
-	writer := &syncFailWriter{}
-	s := NewBackendStore(writableBackendFunc(func(context.Context, string) (storage.Writer, error) {
-		return writer, nil
-	}))
-	if err := s.Write(context.Background(), "target.rf", []byte("data")); err == nil {
-		t.Fatal("Write succeeded despite sync failure")
-	}
-	if !writer.synced || !writer.aborted {
-		t.Fatalf("sync/abort state = %v/%v, want true/true", writer.synced, writer.aborted)
-	}
-	if writer.closed {
-		t.Fatal("sync failure closed and could have committed transactional writer")
-	}
-}
-
-type writableBackendFunc func(context.Context, string) (storage.Writer, error)
-
-func (writableBackendFunc) Open(context.Context, string) (storage.File, error) {
-	return nil, storage.ErrNotFound
-}
-
-func (f writableBackendFunc) Create(ctx context.Context, path string) (storage.Writer, error) {
-	return f(ctx, path)
-}
+var _ storage.Aborter = (*trackingWriter)(nil)
+var _ io.Writer = (*trackingWriter)(nil)
+var _ io.Writer = (*trackingWriter)(nil)

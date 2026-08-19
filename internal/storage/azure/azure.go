@@ -51,6 +51,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/url"
 	"os"
 	"strings"
@@ -896,6 +897,8 @@ func (o sdkAzureWriteOperations) deleteStage(
 
 var azureCleanupTimeout = 10 * time.Second
 
+const committedCleanupAttempts = 2
+
 func (b *Backend) writeOperations() azureWriteOperations {
 	if b.ops != nil {
 		return b.ops
@@ -940,7 +943,7 @@ func (w *writer) Close() error {
 		return fmt.Errorf("azure: writer already aborted")
 	}
 	if w.closed {
-		_ = w.cleanupStage()
+		w.cleanupCommittedStageBestEffort()
 		return nil
 	}
 	if !w.stageCreated {
@@ -985,7 +988,7 @@ func (w *writer) Close() error {
 		}
 	}
 	w.closed = true
-	_ = w.cleanupStage()
+	w.cleanupCommittedStageBestEffort()
 	return nil
 }
 
@@ -1030,6 +1033,17 @@ func (w *writer) verifyDestination() (bool, error) {
 	}
 	return state.size == int64(w.buf.Len()) &&
 		metadataValue(state.metadata, "shoal-write-id") == w.writeID, nil
+}
+
+func (w *writer) cleanupCommittedStageBestEffort() {
+	if err := w.retryCommittedCleanup(w.cleanupStage); err != nil {
+		slog.Warn(
+			"azure committed write left temporary blob pending cleanup",
+			"target", "az://"+w.container+"/"+w.name,
+			"stage", "az://"+w.container+"/"+w.stageName,
+			"error", err,
+		)
+	}
 }
 
 func (w *writer) cleanupStage() error {
@@ -1094,6 +1108,18 @@ func (w *writer) clearStage() {
 	w.stageCreated = false
 	w.stageUnknown = false
 	w.stageOwned = false
+}
+
+func (w *writer) retryCommittedCleanup(cleanup func() error) error {
+	var combined error
+	for attempt := 0; attempt < committedCleanupAttempts; attempt++ {
+		if err := cleanup(); err != nil {
+			combined = errors.Join(combined, err)
+			continue
+		}
+		return nil
+	}
+	return combined
 }
 
 func (w *writer) promotionSource() (azureCopySource, error) {

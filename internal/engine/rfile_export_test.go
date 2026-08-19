@@ -155,6 +155,47 @@ func TestRFileExportImportMemoryRoundTrip(t *testing.T) {
 	}
 }
 
+func TestCopyWithSHA256PreservesDestinationOnReadFailure(t *testing.T) {
+	readErr := errors.New("read failed")
+	src := exportFileBackend{file: &exportReadFuncFile{
+		size: 2,
+		read: func(p []byte, off int64) (int, error) {
+			switch off {
+			case 0:
+				p[0] = 'x'
+				return 1, nil
+			default:
+				return 0, readErr
+			}
+		},
+	}}
+	dst := newExportTrackingBackend()
+	dst.files["/dst.rf"] = []byte("old")
+
+	written, sum, bcVersion, err := copyWithSHA256(context.Background(), src, "/src.rf", dst, "/dst.rf")
+	if !errors.Is(err, readErr) {
+		t.Fatalf("copyWithSHA256 error = %v, want %v", err, readErr)
+	}
+	if written != 1 {
+		t.Fatalf("written = %d, want 1", written)
+	}
+	if sum != "" {
+		t.Fatalf("sum = %q, want empty on failure", sum)
+	}
+	if bcVersion != "" {
+		t.Fatalf("bcVersion = %q, want empty on failure", bcVersion)
+	}
+	if got := string(dst.files["/dst.rf"]); got != "old" {
+		t.Fatalf("destination contents = %q, want old", got)
+	}
+	if dst.lastWriter == nil || dst.lastWriter.abortCalls != 1 {
+		t.Fatalf("Abort calls = %d, want 1", dst.lastWriter.abortCalls)
+	}
+	if dst.lastWriter.stagePresent {
+		t.Fatal("failed export copy left staged bytes behind")
+	}
+}
+
 func scanAll(t *testing.T, eng *Engine, table string) []string {
 	t.Helper()
 	sc, err := eng.Scan(table, iterrt.InfiniteRange(), ScanOptions{})
@@ -173,4 +214,76 @@ func scanAll(t *testing.T, eng *Engine, table string) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+type exportFileBackend struct {
+	file storage.File
+}
+
+func (b exportFileBackend) Open(context.Context, string) (storage.File, error) {
+	return b.file, nil
+}
+
+type exportReadFuncFile struct {
+	size int64
+	read func([]byte, int64) (int, error)
+}
+
+func (f *exportReadFuncFile) ReadAt(p []byte, off int64) (int, error) {
+	return f.read(p, off)
+}
+
+func (*exportReadFuncFile) Close() error { return nil }
+func (f *exportReadFuncFile) Size() int64 {
+	return f.size
+}
+
+type exportTrackingBackend struct {
+	files      map[string][]byte
+	lastWriter *exportTrackingWriter
+}
+
+func newExportTrackingBackend() *exportTrackingBackend {
+	return &exportTrackingBackend{files: make(map[string][]byte)}
+}
+
+func (b *exportTrackingBackend) Open(context.Context, string) (storage.File, error) {
+	return nil, storage.ErrNotFound
+}
+
+func (b *exportTrackingBackend) Create(_ context.Context, path string) (storage.Writer, error) {
+	writer := &exportTrackingWriter{backend: b, path: path}
+	b.lastWriter = writer
+	return writer, nil
+}
+
+type exportTrackingWriter struct {
+	backend      *exportTrackingBackend
+	path         string
+	stage        strings.Builder
+	stagePresent bool
+	abortCalls   int
+	closed       bool
+}
+
+func (w *exportTrackingWriter) Write(p []byte) (int, error) {
+	w.stagePresent = true
+	return w.stage.WriteString(string(p))
+}
+
+func (w *exportTrackingWriter) Close() error {
+	if w.closed {
+		return nil
+	}
+	w.closed = true
+	w.stagePresent = false
+	w.backend.files[w.path] = []byte(w.stage.String())
+	return nil
+}
+
+func (w *exportTrackingWriter) Abort() error {
+	w.abortCalls++
+	w.stagePresent = false
+	w.stage.Reset()
+	return nil
 }

@@ -26,6 +26,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -423,7 +424,7 @@ func (w *writer) Close() error {
 		return fmt.Errorf("gcs: writer already aborted")
 	}
 	if w.closed {
-		w.cleanupTempObjectBestEffort()
+		w.cleanupCommittedTempBestEffort()
 		return nil
 	}
 	if !w.tempClosed {
@@ -470,7 +471,7 @@ func (w *writer) Close() error {
 	}
 	w.closed = true
 	w.stopWriter()
-	w.cleanupTempObjectBestEffort()
+	w.cleanupCommittedTempBestEffort()
 	return nil
 }
 
@@ -567,6 +568,8 @@ func (c storageObjectCopier) Run(ctx context.Context) (*storage.ObjectAttrs, err
 }
 
 var tempCleanupTimeout = 10 * time.Second
+
+const committedCleanupAttempts = 2
 
 func (b *Backend) bucket(name string) bucketHandle {
 	if b.bucketFactory != nil {
@@ -713,8 +716,15 @@ func (w *writer) cleanupTempObject() error {
 	return nil
 }
 
-func (w *writer) cleanupTempObjectBestEffort() {
-	_ = w.cleanupTempObject()
+func (w *writer) cleanupCommittedTempBestEffort() {
+	if err := w.retryCommittedCleanup(w.cleanupTempObject); err != nil {
+		slog.Warn(
+			"gcs committed write left temporary object pending cleanup",
+			"target", w.targetPath,
+			"temp", w.tempPath,
+			"error", err,
+		)
+	}
 }
 
 func (w *writer) tempForCleanup() objectHandle {
@@ -728,4 +738,16 @@ func (w *writer) clearTemp() {
 	w.tempGeneration = 0
 	w.tempAttrs = nil
 	w.tempUnknown = false
+}
+
+func (w *writer) retryCommittedCleanup(cleanup func() error) error {
+	var combined error
+	for attempt := 0; attempt < committedCleanupAttempts; attempt++ {
+		if err := cleanup(); err != nil {
+			combined = errors.Join(combined, err)
+			continue
+		}
+		return nil
+	}
+	return combined
 }
