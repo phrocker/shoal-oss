@@ -204,6 +204,17 @@ RFileExportManifest (existing)  →  promotion.BuildLoadMapping
   drive-letter prefix (`C:\...`) needs no separate folding here --
   it's already uppercased upstream before the path is split into a
   prefix and components.
+  Those extended-length forms don't just fold their own case
+  independently of each other -- they fold to the exact same
+  publication key as their ordinary-form equivalent.
+  `\\?\UNC\server\share\...` normalizes identically to
+  `\\server\share\...` (both collapse marker, server, and share down to
+  the same shared prefix shape), and `\\?\C:\...` normalizes
+  identically to `C:\...` (its drive letter is uppercased the same way
+  the ordinary form's already is). Without that convergence, a source
+  published under one spelling and a not-yet-created write target
+  expressed under the other would look like two distinct locations
+  right up until the second write silently overwrote the first.
   Every unique manifest source path is additionally checked against
   every *other* unique source path, not only against write targets: two
   different `DestinationPath` values that are physically the same file

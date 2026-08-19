@@ -126,8 +126,14 @@ func TestLocalPathsLexicallyAliasWindowsUNCSharePrefixNormalization(t *testing.T
 		{name: "standard UNC path aliases differing only by server case", src: `\\SERVER\share\B.rf`, dst: `\\server\share\B.rf`, want: true},
 		{name: "standard UNC path aliases differing only by unicode normalization", src: "\\\\SERV\u00c9R\\shar\u00e9\\B.rf", dst: "\\\\serve\u0301r\\share\u0301\\B.rf", want: true},
 		{name: "extended UNC path aliases differing only by marker and server case", src: `\\?\UNC\SERVER\share\B.rf`, dst: `\\?\unc\server\share\B.rf`, want: true},
+		{name: "extended UNC path aliases ordinary UNC path with no case difference", src: `\\?\UNC\SERVER\share\B.rf`, dst: `\\SERVER\share\B.rf`, want: true},
+		{name: "extended UNC path aliases ordinary UNC path with server case difference", src: `\\?\UNC\SERVER\share\B.rf`, dst: `\\server\share\B.rf`, want: true},
+		{name: "extended drive path aliases ordinary drive path", src: `\\?\C:\bulk\B.rf`, dst: `C:\bulk\B.rf`, want: true},
+		{name: "extended drive path aliases ordinary drive path with case difference", src: `\\?\c:\bulk\B.rf`, dst: `C:\bulk\B.rf`, want: true},
 		{name: "distinct shares stay distinct", src: `\\SERVER\share-a\B.rf`, dst: `\\server\share-b\B.rf`, want: false},
 		{name: "distinct servers stay distinct", src: `\\SERVER-a\share\B.rf`, dst: `\\server-b\share\B.rf`, want: false},
+		{name: "extended UNC path to distinct share stays distinct from ordinary UNC path", src: `\\?\UNC\SERVER\share-a\B.rf`, dst: `\\server\share-b\B.rf`, want: false},
+		{name: "extended drive path to distinct directory stays distinct from ordinary drive path", src: `\\?\C:\bulk-a\B.rf`, dst: `C:\bulk-b\B.rf`, want: false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -281,6 +287,7 @@ func TestCheckNoStagingAliasesRejectsDanglingWindowsUNCAliasBeforeAnyWrites(t *t
 	}{
 		{name: "standard UNC case variant", srcPath: `\\SERVER\share\B.rf`, bulkDir: `\\server\share`},
 		{name: "extended UNC case variant", srcPath: `\\?\UNC\SERVER\share\B.rf`, bulkDir: `\\?\unc\server\share`},
+		{name: "extended UNC form vs ordinary UNC form", srcPath: `\\?\UNC\SERVER\share\B.rf`, bulkDir: `\\server\share`},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

@@ -229,42 +229,72 @@ func normalizeWindowsUNCPublicationPrefix(prefix string) (string, bool) {
 		return "", false
 	}
 
-	if strings.HasPrefix(prefix, "//?/") {
-		remainder := strings.TrimPrefix(prefix, "//?/")
-		parts := strings.Split(remainder, "/")
-		if len(parts) == 0 || !strings.EqualFold(parts[0], "unc") {
-			return "", false
-		}
-		normalized := []string{"?", normalizeWindowsPublicationLabel(parts[0])}
-		for _, part := range parts[1:] {
-			if part == "" {
-				continue
+	if remainder, ok := strings.CutPrefix(prefix, "//?/"); ok {
+		segment, rest, hasRest := strings.Cut(remainder, "/")
+
+		if strings.EqualFold(segment, "unc") {
+			// filepath.VolumeName on a real "\\?\UNC\server\share\..."
+			// path returns only the bare "\\?\UNC" marker -- the server
+			// and share names that follow are ordinary path components
+			// split out separately, and already get folded the same
+			// way any other component does. That leaves nothing else
+			// to fold here, so the marker alone must normalize to the
+			// same "//" the ordinary "\\server\share\..." form
+			// contributes once its own server/share segments are moved
+			// into normalizeWindowsUNCServerShare below, so extended
+			// and ordinary UNC paths to the same share converge on one
+			// publication identity. If a caller instead supplies the
+			// server and share inline (as this function's own unit
+			// tests do, for convenience), fold them here too so that
+			// shape keeps working exactly as before.
+			if !hasRest {
+				return "//", true
 			}
-			normalized = append(normalized, normalizeWindowsPublicationLabel(part))
+			return normalizeWindowsUNCServerShare(rest)
 		}
-		return "//" + strings.Join(normalized, "/") + "/", true
+
+		// A bare extended-length drive prefix, e.g. "\\?\C:", is the
+		// only other form filepath.VolumeName recognizes under "\\?\".
+		// Fold its case the same way the ordinary "C:" prefix already
+		// is, so "\\?\c:\bulk\A.rf" and "C:\bulk\A.rf" resolve to the
+		// identical publication identity instead of silently aliasing
+		// a not-yet-created write target under two different keys.
+		if !hasRest && hasWindowsDriveLetterPrefix(segment) && len(segment) == 2 {
+			return strings.ToUpper(segment) + "/", true
+		}
+
+		return "", false
 	}
 
-	if strings.HasPrefix(prefix, "//") {
-		remainder := strings.TrimPrefix(prefix, "//")
-		parts := strings.Split(remainder, "/")
-		if len(parts) < 2 {
-			return "", false
-		}
-		normalized := make([]string, 0, len(parts))
-		for _, part := range parts {
-			if part == "" {
-				continue
-			}
-			normalized = append(normalized, normalizeWindowsPublicationLabel(part))
-		}
-		if len(normalized) < 2 {
-			return "", false
-		}
-		return "//" + strings.Join(normalized, "/") + "/", true
+	if remainder, ok := strings.CutPrefix(prefix, "//"); ok {
+		return normalizeWindowsUNCServerShare(remainder)
 	}
 
 	return "", false
+}
+
+// normalizeWindowsUNCServerShare folds a "server/share" (and any
+// further path segments already merged into the same string) UNC
+// remainder into the shared publication-prefix shape used for both
+// the ordinary "\\server\share\..." spelling and, when the caller
+// supplies server/share inline, the extended "\\?\UNC\server\share\..."
+// spelling -- so the two converge on the same normalized prefix.
+func normalizeWindowsUNCServerShare(remainder string) (string, bool) {
+	parts := strings.Split(remainder, "/")
+	if len(parts) < 2 {
+		return "", false
+	}
+	normalized := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if part == "" {
+			continue
+		}
+		normalized = append(normalized, normalizeWindowsPublicationLabel(part))
+	}
+	if len(normalized) < 2 {
+		return "", false
+	}
+	return "//" + strings.Join(normalized, "/") + "/", true
 }
 
 func buildLocalPublicationComponentIdentity(component string) localPublicationComponentIdentity {
