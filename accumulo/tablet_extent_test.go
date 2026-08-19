@@ -304,16 +304,25 @@ func TestTabletExtentString(t *testing.T) {
 }
 
 func TestRootTabletExtent(t *testing.T) {
-	if RootTabletExtent.TableID != MetadataTableID {
-		t.Fatalf("RootTabletExtent table = %q", RootTabletExtent.TableID)
+	root := RootTabletExtent()
+	if root.TableID != MetadataTableID {
+		t.Fatalf("RootTabletExtent table = %q", root.TableID)
 	}
-	if string(RootTabletExtent.EndRow) != MetadataTableID+"<" {
-		t.Fatalf("RootTabletExtent end row = %q", RootTabletExtent.EndRow)
+	if string(root.EndRow) != MetadataTableID+"<" {
+		t.Fatalf("RootTabletExtent end row = %q", root.EndRow)
 	}
-	if RootTabletExtent.PrevRow != nil {
-		t.Fatalf("RootTabletExtent prev row = %q", RootTabletExtent.PrevRow)
+	if root.PrevRow != nil {
+		t.Fatalf("RootTabletExtent prev row = %q", root.PrevRow)
 	}
-	if got := RootTabletExtent.MetadataEntry(); got != "!0;!0<" {
+	if got := root.MetadataEntry(); got != "!0;!0<" {
 		t.Fatalf("RootTabletExtent metadata entry = %q", got)
+	}
+	// Each call hands out a value the caller owns, so one consumer cannot
+	// rewrite the extent the next one reads.
+	root.EndRow[0] = 'X'
+	root.SetTableID("2")
+	fresh := RootTabletExtent()
+	if fresh.TableID != MetadataTableID || string(fresh.EndRow) != MetadataTableID+"<" {
+		t.Fatalf("a mutated copy changed the root extent: %+v", fresh)
 	}
 }

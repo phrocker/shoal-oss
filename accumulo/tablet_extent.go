@@ -13,12 +13,17 @@ const MetadataTableID = "!0"
 // ErrInvalidTabletExtent reports an extent that cannot describe a tablet.
 var ErrInvalidTabletExtent = errors.New("accumulo: invalid tablet extent")
 
-// RootTabletExtent is the extent of the tablet that holds the metadata table's
-// own entries, which is where tablet lookups start.
-var RootTabletExtent = TabletExtent{
+// rootTabletExtent is the value RootTabletExtent hands out copies of. It is
+// unexported so no caller can rewrite the extent every other caller reads.
+var rootTabletExtent = TabletExtent{
 	TableID: MetadataTableID,
 	EndRow:  []byte(MetadataEntry(MetadataTableID, nil)),
 }
+
+// RootTabletExtent returns the extent of the tablet that holds the metadata
+// table's own entries, which is where tablet lookups start. Each call returns
+// a fresh value whose slices the caller owns.
+func RootTabletExtent() TabletExtent { return rootTabletExtent.Clone() }
 
 // MetadataEntry renders the metadata row that names a tablet: "<table>;<row>"
 // for a bounded tablet and "<table><" for the last tablet of the table, whose
