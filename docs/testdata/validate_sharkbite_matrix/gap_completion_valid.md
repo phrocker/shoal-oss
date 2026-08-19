@@ -7,6 +7,8 @@
 | SB-CFG-009 | — | — | — | — | Behavior mismatch | |
 | SB-DATA-025 | — | — | — | — | Behavior mismatch | |
 | SB-DATA-057 | — | — | — | — | Behavior mismatch | |
+| SB-DATA-031 | — | — | — | — | Missing C ABI | |
+| SB-DATA-047 | — | — | — | — | Behavior mismatch | |
 | SB-SEC-001 | — | — | — | — | Behavior mismatch | |
 | SB-SEC-002 | — | — | — | — | Behavior mismatch | |
 | SB-NS-001 | — | — | — | — | Behavior mismatch | |
@@ -22,6 +24,8 @@
 | --- | --- | --- | --- | --- |
 | SB-GAP-GO-001 | Security operations | SB-SEC-001…SB-SEC-002, SB-CONN-004 | merged | **Complete in Go.** |
 | SB-GAP-GO-002 | Namespace operations | SB-NS-001, SB-CONN-005 | merged | **Complete in Go.** |
+| SB-GAP-GO-011 | Range predicates | SB-DATA-031 | merged | **Complete in Go.** |
+| SB-GAP-GO-012 | Authorizations | SB-DATA-047 | merged | **Complete in Go.** |
 
 ### 23.2 Stage 2 — C ABI parity (blocked by Stage 1 per row)
 
