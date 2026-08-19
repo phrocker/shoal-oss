@@ -320,6 +320,9 @@ func (c *testAdminConnector) DeleteNamespace(ctx context.Context, name string) e
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	if name == "" {
+		return accumulo.ErrNamespaceNotEmpty
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if _, ok := c.namespaces[name]; !ok {

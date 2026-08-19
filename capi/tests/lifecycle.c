@@ -405,6 +405,10 @@ int main(void) {
   assert(shoal_connector_namespace_exists(admin_connector, "analytics", 0,
                                           &exists, &error) == SHOAL_STATUS_OK);
   assert(exists == 1);
+  expect_error(shoal_connector_delete_namespace(admin_connector, "", 0,
+                                                &error),
+               SHOAL_STATUS_NAMESPACE_NOT_EMPTY, &error,
+               "namespace not empty");
   assert(shoal_connector_create_namespace(admin_connector, "scratch", 0,
                                           &error) == SHOAL_STATUS_OK);
   assert(shoal_connector_rename_namespace(admin_connector, "scratch", "work",

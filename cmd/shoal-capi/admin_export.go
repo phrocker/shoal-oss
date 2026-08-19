@@ -120,21 +120,21 @@ func shoal_connector_namespace_exists(handle *C.shoal_connector, name *C.char, t
 
 //export shoal_connector_create_namespace
 func shoal_connector_create_namespace(handle *C.shoal_connector, name *C.char, timeout C.int64_t, outError **C.shoal_error) C.shoal_status {
-	return mutateNamespace(handle, name, nil, timeout, outError, func(ctx context.Context, admin namespaceAdminAPI, first, _ string) error {
+	return mutateNamespace(handle, name, nil, false, timeout, outError, func(ctx context.Context, admin namespaceAdminAPI, first, _ string) error {
 		return admin.CreateNamespace(ctx, first)
 	})
 }
 
 //export shoal_connector_delete_namespace
 func shoal_connector_delete_namespace(handle *C.shoal_connector, name *C.char, timeout C.int64_t, outError **C.shoal_error) C.shoal_status {
-	return mutateNamespace(handle, name, nil, timeout, outError, func(ctx context.Context, admin namespaceAdminAPI, first, _ string) error {
+	return mutateNamespace(handle, name, nil, true, timeout, outError, func(ctx context.Context, admin namespaceAdminAPI, first, _ string) error {
 		return admin.DeleteNamespace(ctx, first)
 	})
 }
 
 //export shoal_connector_rename_namespace
 func shoal_connector_rename_namespace(handle *C.shoal_connector, name, newName *C.char, timeout C.int64_t, outError **C.shoal_error) C.shoal_status {
-	return mutateNamespace(handle, name, newName, timeout, outError, func(ctx context.Context, admin namespaceAdminAPI, first, second string) error {
+	return mutateNamespace(handle, name, newName, true, timeout, outError, func(ctx context.Context, admin namespaceAdminAPI, first, second string) error {
 		return admin.RenameNamespace(ctx, first, second)
 	})
 }
@@ -240,10 +240,14 @@ func beginNamespaceAdmin(handle *C.shoal_connector, timeout C.int64_t) (*ownedCo
 	return owned, admin, ctx, done, code, err
 }
 
-func mutateNamespace(handle *C.shoal_connector, first, second *C.char, timeout C.int64_t, outError **C.shoal_error, call func(context.Context, namespaceAdminAPI, string, string) error) (status C.shoal_status) {
+func mutateNamespace(handle *C.shoal_connector, first, second *C.char, allowEmptyFirst bool, timeout C.int64_t, outError **C.shoal_error, call func(context.Context, namespaceAdminAPI, string, string) error) (status C.shoal_status) {
 	clearError(outError)
 	defer recoverStatus(&status, outError)
-	firstName, err := requiredString(first, "namespace_name")
+	parseFirst := requiredString
+	if allowEmptyFirst {
+		parseFirst = requiredStringAllowEmpty
+	}
+	firstName, err := parseFirst(first, "namespace_name")
 	if err != nil {
 		return fail(outError, C.SHOAL_STATUS_INVALID_ARGUMENT, err)
 	}

@@ -193,6 +193,11 @@ shoal_connector_namespace_exists(shoal_connector *connector,
                                  const char *namespace_name,
                                  int64_t timeout_ms, uint8_t *out_exists,
                                  shoal_error **out_error);
+/*
+ * An empty namespace_name identifies Accumulo's default namespace for
+ * existence, deletion, rename-source, and property operations. Creation and
+ * rename destinations require non-empty names.
+ */
 SHOAL_API shoal_status SHOAL_CALL
 shoal_connector_create_namespace(shoal_connector *connector,
                                  const char *namespace_name,
