@@ -156,9 +156,11 @@ func managerLockAddress(ctx context.Context, locator LockReader, service string)
 // ManagerAddresses returns every manager address advertised under the
 // instance's manager lock path, ordered by lock sequence: the first element
 // is the manager that currently holds the lock, and any later elements are
-// queued candidates that would take over on failover. Returns
-// ErrManagerUnavailable when no lock node advertises a usable MANAGER
-// endpoint.
+// queued candidates that would take over on failover. If the active lock
+// holder exists but still advertises only bootstrap placeholders, the result
+// is ErrManagerUnavailable rather than promoting a queued candidate to index
+// 0. Returns ErrManagerUnavailable when no active lock node advertises a
+// usable MANAGER endpoint.
 func ManagerAddresses(ctx context.Context, locator LockReader) ([]string, error) {
 	reader, closeScope, err := acquireTopologyLockReader(ctx, locator)
 	if err != nil {
@@ -186,6 +188,7 @@ func managerAddresses(ctx context.Context, locator LockReader) ([]string, error)
 	lockNodes := sortedLockNodes(children)
 	addresses := make([]string, 0, len(lockNodes))
 	seen := make(map[string]struct{}, len(lockNodes))
+	activeFound := false
 	for _, lockNode := range lockNodes {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -202,6 +205,16 @@ func managerAddresses(ctx context.Context, locator LockReader) ([]string, error)
 		if err := json.Unmarshal(data, &lock); err != nil {
 			return nil, fmt.Errorf("decode manager lock %s: %w", lockNodePath, err)
 		}
+		if !activeFound {
+			activeFound = true
+			address, ok := usableServiceAddress(lock.Descriptors, svcManager)
+			if !ok {
+				return nil, ErrManagerUnavailable
+			}
+			seen[address] = struct{}{}
+			addresses = append(addresses, address)
+			continue
+		}
 		for _, descriptor := range lock.Descriptors {
 			if descriptor.Service != svcManager ||
 				descriptor.Address == "" ||
@@ -215,10 +228,23 @@ func managerAddresses(ctx context.Context, locator LockReader) ([]string, error)
 			addresses = append(addresses, descriptor.Address)
 		}
 	}
-	if len(addresses) == 0 {
+	if !activeFound || len(addresses) == 0 {
 		return nil, ErrManagerUnavailable
 	}
 	return addresses, nil
+}
+
+func usableServiceAddress(descriptors []serviceDescriptor, service string) (string, bool) {
+	for _, descriptor := range descriptors {
+		if descriptor.Service != service {
+			continue
+		}
+		if descriptor.Address == "" || descriptor.Address == "0.0.0.0:0" {
+			return "", false
+		}
+		return descriptor.Address, true
+	}
+	return "", false
 }
 
 // ServerKind names the Accumulo 4 server role that published a

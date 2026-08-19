@@ -185,6 +185,10 @@ type rawResult struct {
 	err  error
 }
 
+type authResult struct {
+	err error
+}
+
 type scopedTopologyReader struct {
 	instancePath string
 	conn         rawZKConn
@@ -341,17 +345,42 @@ func (l *Locator) topologyReadScope(ctx context.Context) (LockReader, func(), er
 	if err != nil {
 		return nil, nil, fmt.Errorf("zk connect: %w", err)
 	}
-	if l.instanceSecret != "" {
-		if err := conn.AddAuth("digest", []byte("accumulo:"+l.instanceSecret)); err != nil {
-			conn.Close()
-			return nil, nil, fmt.Errorf("zk add digest auth: %w", err)
-		}
+	if err := addAuthWithContext(ctx, conn, l.instanceSecret); err != nil {
+		conn.Close()
+		return nil, nil, err
 	}
 	scope := &scopedTopologyReader{
 		instancePath: l.InstancePath(),
 		conn:         conn,
 	}
 	return scope, scope.Close, nil
+}
+
+func addAuthWithContext(ctx context.Context, conn rawZKConn, instanceSecret string) error {
+	if instanceSecret == "" {
+		return nil
+	}
+	result := make(chan authResult, 1)
+	go func() {
+		err := conn.AddAuth("digest", []byte("accumulo:"+instanceSecret))
+		if err != nil {
+			err = fmt.Errorf("zk add digest auth: %w", err)
+		}
+		result <- authResult{err: err}
+	}()
+
+	select {
+	case response := <-result:
+		if err := ctx.Err(); err != nil {
+			conn.Close()
+			return err
+		}
+		return response.err
+	case <-ctx.Done():
+		conn.Close()
+		<-result
+		return ctx.Err()
+	}
 }
 
 type rawChildrenResult struct {

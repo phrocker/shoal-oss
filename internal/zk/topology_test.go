@@ -103,21 +103,35 @@ func TestManagerAddressesOrdersByLockSequenceAndDeduplicates(t *testing.T) {
 	}
 }
 
-func TestManagerAddressesSkipsBootstrapDescriptors(t *testing.T) {
+func TestManagerAddressesSkipsQueuedBootstrapDescriptors(t *testing.T) {
 	lockPath := "/accumulo/uuid-1/managers/lock"
 	locator := &topologyLocator{
 		children: map[string][]string{lockPath: {lockNode("0000000001"), lockNode("0000000002")}},
 		data: map[string][]byte{
-			path.Join(lockPath, lockNode("0000000001")): managerLockData("0.0.0.0:0", ""),
-			path.Join(lockPath, lockNode("0000000002")): managerLockData("manager-b:9997"),
+			path.Join(lockPath, lockNode("0000000001")): managerLockData("manager-a:9997"),
+			path.Join(lockPath, lockNode("0000000002")): managerLockData("0.0.0.0:0", ""),
 		},
 	}
 	got, err := ManagerAddresses(context.Background(), locator)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 1 || got[0] != "manager-b:9997" {
-		t.Fatalf("addresses = %v, want [manager-b:9997]", got)
+	if len(got) != 1 || got[0] != "manager-a:9997" {
+		t.Fatalf("addresses = %v, want [manager-a:9997]", got)
+	}
+}
+
+func TestManagerAddressesDoesNotPromoteQueuedCandidateOverPlaceholderHolder(t *testing.T) {
+	lockPath := "/accumulo/uuid-1/managers/lock"
+	locator := &topologyLocator{
+		children: map[string][]string{lockPath: {lockNode("0000000001"), lockNode("0000000002")}},
+		data: map[string][]byte{
+			path.Join(lockPath, lockNode("0000000001")): managerLockData("0.0.0.0:0"),
+			path.Join(lockPath, lockNode("0000000002")): managerLockData("manager-b:9997"),
+		},
+	}
+	if _, err := ManagerAddresses(context.Background(), locator); !errors.Is(err, ErrManagerUnavailable) {
+		t.Fatalf("error = %v, want ErrManagerUnavailable", err)
 	}
 }
 
@@ -496,6 +510,71 @@ func TestLocatorChildrenCancelsInFlightRead(t *testing.T) {
 		t.Fatalf("Children error = %v, want context.Canceled", err)
 	}
 	<-conn.done
+}
+
+func TestTopologyAccessorsCancelBlockingAddAuth(t *testing.T) {
+	tests := []struct {
+		name string
+		call func(context.Context, *Locator) error
+	}{
+		{
+			name: "RootTabletLocation",
+			call: func(ctx context.Context, locator *Locator) error {
+				_, err := locator.RootTabletLocation(ctx)
+				return err
+			},
+		},
+		{
+			name: "ManagerAddresses",
+			call: func(ctx context.Context, locator *Locator) error {
+				_, err := ManagerAddresses(ctx, locator)
+				return err
+			},
+		},
+		{
+			name: "ClientServices",
+			call: func(ctx context.Context, locator *Locator) error {
+				_, err := ClientServices(ctx, locator)
+				return err
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			conn := &blockingAuthConn{
+				started: make(chan struct{}),
+				closed:  make(chan struct{}),
+				done:    make(chan struct{}),
+			}
+			var connects atomic.Int32
+			locator := &Locator{
+				instanceID:     "uuid-1",
+				instanceSecret: "secret",
+				rawConnFactory: func() (rawZKConn, error) {
+					connects.Add(1)
+					return conn, nil
+				},
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			result := make(chan error, 1)
+			go func() {
+				result <- test.call(ctx, locator)
+			}()
+			<-conn.started
+			cancel()
+			if err := <-result; !errors.Is(err, context.Canceled) {
+				t.Fatalf("error = %v, want context.Canceled", err)
+			}
+			select {
+			case <-conn.done:
+			default:
+				t.Fatal("accessor returned before AddAuth worker exited")
+			}
+			if connects.Load() != 1 {
+				t.Fatalf("connects = %d, want 1", connects.Load())
+			}
+		})
+	}
 }
 
 func TestManagerAddressesCancelsInFlightWithSingleScopedConnection(t *testing.T) {

@@ -103,7 +103,8 @@ func (i *zkLocator) RootTabletLocation(ctx context.Context) (TabletLocation, err
 // validated and ordered exactly as Accumulo's ServiceLock.validateAndSort
 // does, and each lock node's ServiceLockData JSON is decoded to collect
 // descriptors whose service is MANAGER. Bootstrap descriptors that advertise
-// no address, or the "0.0.0.0:0" placeholder, are skipped.
+// no address, or the "0.0.0.0:0" placeholder, make the active manager
+// unavailable rather than promoting a queued candidate to the first slot.
 //
 // Returns ErrManagerUnavailable when no lock node advertises a usable
 // manager. Sharkbite's getMasterLocations returns an empty vector in that

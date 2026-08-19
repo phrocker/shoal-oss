@@ -44,9 +44,16 @@ type staticRawTopologyConn struct {
 	data     map[string][]byte
 	children map[string][]string
 	closes   *atomic.Int32
+	auths    *atomic.Int32
+	authErr  error
 }
 
-func (c *staticRawTopologyConn) AddAuth(string, []byte) error { return nil }
+func (c *staticRawTopologyConn) AddAuth(string, []byte) error {
+	if c.auths != nil {
+		c.auths.Add(1)
+	}
+	return c.authErr
+}
 
 func (c *staticRawTopologyConn) Get(znodePath string) ([]byte, *gozk.Stat, error) {
 	data, ok := c.data[znodePath]
@@ -68,6 +75,33 @@ func (c *staticRawTopologyConn) Close() {
 	if c.closes != nil {
 		c.closes.Add(1)
 	}
+}
+
+type blockingAuthConn struct {
+	started chan struct{}
+	closed  chan struct{}
+	done    chan struct{}
+	once    sync.Once
+	authErr error
+}
+
+func (c *blockingAuthConn) AddAuth(string, []byte) error {
+	close(c.started)
+	<-c.closed
+	close(c.done)
+	return c.authErr
+}
+
+func (c *blockingAuthConn) Get(string) ([]byte, *gozk.Stat, error) {
+	return nil, nil, gozk.ErrClosing
+}
+
+func (c *blockingAuthConn) Children(string) ([]string, *gozk.Stat, error) {
+	return nil, nil, gozk.ErrClosing
+}
+
+func (c *blockingAuthConn) Close() {
+	c.once.Do(func() { close(c.closed) })
 }
 
 func TestGetRawWithContextCancelsInFlightReadAndJoinsWorker(t *testing.T) {
@@ -99,8 +133,10 @@ func TestGetRawWithContextCancelsInFlightReadAndJoinsWorker(t *testing.T) {
 func TestLocatorRootTabletLocationUsesSingleScopedConnection(t *testing.T) {
 	var connects atomic.Int32
 	var closes atomic.Int32
+	var auths atomic.Int32
 	loc := &Locator{
-		instanceID: "uuid-1",
+		instanceID:     "uuid-1",
+		instanceSecret: "secret",
 		rawConnFactory: func() (rawZKConn, error) {
 			connects.Add(1)
 			return &staticRawTopologyConn{
@@ -108,6 +144,7 @@ func TestLocatorRootTabletLocationUsesSingleScopedConnection(t *testing.T) {
 					"/accumulo/uuid-1/root_tablet": []byte(`{"version":1,"columnValues":{"loc":{"session-1":"tserver-a:9997"}}}`),
 				},
 				closes: &closes,
+				auths:  &auths,
 			}, nil
 		},
 	}
@@ -122,6 +159,63 @@ func TestLocatorRootTabletLocationUsesSingleScopedConnection(t *testing.T) {
 	}
 	if connects.Load() != 1 || closes.Load() != 1 {
 		t.Fatalf("connects/closes = %d/%d, want 1/1", connects.Load(), closes.Load())
+	}
+	if auths.Load() != 1 {
+		t.Fatalf("auth calls = %d, want 1", auths.Load())
+	}
+}
+
+func TestTopologyReadScopeCancelsBlockingAddAuth(t *testing.T) {
+	conn := &blockingAuthConn{
+		started: make(chan struct{}),
+		closed:  make(chan struct{}),
+		done:    make(chan struct{}),
+	}
+	loc := &Locator{
+		instanceID:     "uuid-1",
+		instanceSecret: "secret",
+		rawConnFactory: func() (rawZKConn, error) {
+			return conn, nil
+		},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		_, closeScope, err := loc.topologyReadScope(ctx)
+		if closeScope != nil {
+			defer closeScope()
+		}
+		result <- err
+	}()
+	<-conn.started
+	cancel()
+	if err := <-result; !errors.Is(err, context.Canceled) {
+		t.Fatalf("topologyReadScope error = %v, want context.Canceled", err)
+	}
+	select {
+	case <-conn.done:
+	default:
+		t.Fatal("topologyReadScope returned before AddAuth worker exited")
+	}
+}
+
+func TestTopologyReadScopeReturnsAddAuthError(t *testing.T) {
+	want := errors.New("auth failed")
+	loc := &Locator{
+		instanceID:     "uuid-1",
+		instanceSecret: "secret",
+		rawConnFactory: func() (rawZKConn, error) {
+			return &staticRawTopologyConn{authErr: want}, nil
+		},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	_, closeScope, err := loc.topologyReadScope(ctx)
+	if closeScope != nil {
+		defer closeScope()
+	}
+	if !errors.Is(err, want) {
+		t.Fatalf("topologyReadScope error = %v, want %v", err, want)
 	}
 }
 
