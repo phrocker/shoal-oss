@@ -1033,4 +1033,12 @@ func TestNewECIDMatchesAccumuloFormat(t *testing.T) {
 	if first == second {
 		t.Fatal("ecid repeated across calls")
 	}
+	// ExternalCompactionId.of parses the suffix with UUID.fromString and
+	// throws on anything else, so an id the compactor generates but the
+	// coordinator cannot parse would fail every poll. Translate applies
+	// the same rule, which makes it the local proxy for that check.
+	job := translatableJob(first)
+	if _, err := compactjob.Translate(job, compactjob.Options{Limits: compactjob.DefaultLimits()}); err != nil {
+		t.Fatalf("Translate(%q) = %v; the id this compactor generates must be one Accumulo accepts", first, err)
+	}
 }

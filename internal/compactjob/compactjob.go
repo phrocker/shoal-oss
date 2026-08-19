@@ -62,6 +62,8 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/google/uuid"
+
 	"github.com/phrocker/shoal/internal/compaction"
 	"github.com/phrocker/shoal/internal/iterrt"
 	"github.com/phrocker/shoal/internal/metadata"
@@ -72,11 +74,16 @@ import (
 	"github.com/phrocker/shoal/internal/thrift/gen/tabletserver"
 )
 
-// ECIDPrefix is the prefix Accumulo's ExternalCompactionId carries
-// ("ECID:" + UUID, see core/.../metadata/schema/ExternalCompactionId.java).
+// ECIDPrefix is the prefix Accumulo's ExternalCompactionId carries. It
+// is the literal PREFIX constant in
+// core/src/main/java/org/apache/accumulo/core/metadata/schema/ExternalCompactionId.java,
+// and it is a hyphen, not a colon — an unrelated javadoc in that file
+// still says "ECID:", but ExternalCompactionId.of rejects anything that
+// does not start with "ECID-", so a compactor that invents the colon
+// form has every poll rejected before a job can be assigned.
 // Jobs whose id is not in this form did not come from a coordinator this
 // compactor can talk to.
-const ECIDPrefix = "ECID:"
+const ECIDPrefix = "ECID-"
 
 // Sentinel exception-class names reported to the coordinator through
 // compactionFailed(..., exceptionClassName, ...). Java only logs and
@@ -385,9 +392,8 @@ func Translate(job *tabletserver.TExternalCompactionJob, opts Options) (*Plan, e
 	if ecid == "" {
 		return nil, refuse(ClassMalformedJob, "externalCompactionId", "missing")
 	}
-	if !strings.HasPrefix(ecid, ECIDPrefix) || len(ecid) == len(ECIDPrefix) {
-		return nil, refuse(ClassMalformedJob, "externalCompactionId",
-			"%q is not in Accumulo's %s<uuid> form", ecid, ECIDPrefix)
+	if err := checkECID(ecid); err != nil {
+		return nil, err
 	}
 
 	extent, tableID, err := translateExtent(job)
@@ -460,6 +466,29 @@ func Translate(job *tabletserver.TExternalCompactionJob, opts Options) (*Plan, e
 		Codec:               codec,
 		BlockSize:           blockSize,
 	}, nil
+}
+
+// checkECID mirrors ExternalCompactionId.of: the prefix, then the
+// suffix parsed as a UUID. Java rejects both failures with
+// IllegalArgumentException, so an id it would reject can never name a
+// compaction the manager is able to track — building a plan for one
+// would mean doing work no coordinator will ever accept a result for.
+//
+// uuid.Parse also accepts the urn: and braced spellings Java's
+// UUID.fromString does not; that only matters for an id no coordinator
+// generates, and the canonical form both agree on is the one on the
+// wire.
+func checkECID(ecid string) error {
+	suffix, ok := strings.CutPrefix(ecid, ECIDPrefix)
+	if !ok {
+		return refuse(ClassMalformedJob, "externalCompactionId",
+			"%q is not in Accumulo's %s<uuid> form", ecid, ECIDPrefix)
+	}
+	if _, err := uuid.Parse(suffix); err != nil {
+		return refuse(ClassMalformedJob, "externalCompactionId",
+			"%q does not carry a UUID after %q: %v", ecid, ECIDPrefix, err)
+	}
+	return nil
 }
 
 // translateExtent validates the tablet the job names. A compaction whose
@@ -843,11 +872,20 @@ type rawIterator struct {
 // over the whole list, before any entry is mapped: an unported class in
 // the first entry must not hide a malformed second one.
 //
-// Order is taken from the coordinator's list, not re-sorted: Java applies
-// the settings in list order (IteratorConfigUtil.loadIterators), and
-// re-sorting here could build a different stack than Java would from the
-// same job. Well-formed jobs are already priority-ordered, so a list that
-// is not is treated as malformed rather than silently reinterpreted.
+// The stack is then ordered the way Java orders it, which is *not* wire
+// order: IteratorConfigUtil.parseIterConf sorts by ITER_INFO_COMPARATOR
+// (priority, then iterator name, a null name sorting as "") before
+// loadIterators builds the stack bottom-up, so an unsorted or
+// equal-priority list is a job Java runs happily rather than a malformed
+// one. Sorting here is what makes the plan match; taking wire order
+// would build a different stack than Java from the same job.
+//
+// The sort is stable and by (priority, name), and names are unique by
+// the check below, so it is total: two runs over the same job always
+// produce the same stack. Go compares strings by byte and Java's
+// String.compareTo by UTF-16 code unit, which differ only for
+// supplementary characters — a distinction no iterator name in
+// Accumulo's shipped configuration makes.
 func parseIterators(job *tabletserver.TExternalCompactionJob) ([]rawIterator, error) {
 	if !job.IsSetIteratorSettings() || job.GetIteratorSettings() == nil {
 		return nil, nil
@@ -859,7 +897,6 @@ func parseIterators(job *tabletserver.TExternalCompactionJob) ([]rawIterator, er
 
 	out := make([]rawIterator, 0, len(settings))
 	seen := make(map[string]int, len(settings))
-	prevPriority := int32(math.MinInt32)
 	for i, s := range settings {
 		field := fmt.Sprintf("iteratorSettings[%d]", i)
 		if s == nil {
@@ -878,12 +915,6 @@ func parseIterators(job *tabletserver.TExternalCompactionJob) ([]rawIterator, er
 				"duplicates iteratorSettings[%d]", prev)
 		}
 		seen[name] = i
-		if s.GetPriority() < prevPriority {
-			return nil, refuse(ClassMalformedJob, field,
-				"priority %d follows %d; the stack order is ambiguous",
-				s.GetPriority(), prevPriority)
-		}
-		prevPriority = s.GetPriority()
 
 		// Copied, not aliased: the plan must not change if the transport
 		// reuses or recycles the job struct.
@@ -899,6 +930,12 @@ func parseIterators(job *tabletserver.TExternalCompactionJob) ([]rawIterator, er
 			options:  options,
 		})
 	}
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].priority != out[j].priority {
+			return out[i].priority < out[j].priority
+		}
+		return out[i].name < out[j].name
+	})
 	return out, nil
 }
 
@@ -907,6 +944,10 @@ func parseIterators(job *tabletserver.TExternalCompactionJob) ([]rawIterator, er
 // iterator's Init, which is where iterrt validates options, so a bad
 // option is refused before any input is read instead of failing
 // mid-compaction.
+//
+// raw arrives in execution order (parseIterators sorted it), so the
+// unsupported iterator this reports is the first one the compaction
+// would have reached.
 func mapIterators(raw []rawIterator, fullMajor bool) ([]Iterator, error) {
 	if len(raw) == 0 {
 		return nil, nil

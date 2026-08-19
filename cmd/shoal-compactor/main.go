@@ -125,7 +125,7 @@ import (
 var version = "dev"
 
 // ecidPrefix matches Accumulo's ExternalCompactionId format. The Java
-// generator produces "ECID:" + UUID; shoal does the same so logs and
+// generator produces "ECID-" + UUID; shoal does the same so logs and
 // metadata are interchangeable across the two compactor pools.
 const ecidPrefix = compactjob.ECIDPrefix
 
@@ -748,7 +748,7 @@ func redialCoordinator(ctx context.Context, cfg pollConfig) (coordinatorConn, er
 }
 
 // newECID generates an ExternalCompactionId in Accumulo's canonical
-// "ECID:<uuid>" form. The coordinator echoes this back in the job
+// "ECID-<uuid>" form. The coordinator echoes this back in the job
 // (job.ExternalCompactionId), and we verify the echo to catch
 // out-of-band assignments.
 func newECID() string {

@@ -38,7 +38,8 @@ import (
 )
 
 const (
-	testECID    = ECIDPrefix + "3f2504e0-4f89-11d3-9a0c-0305e82c3301"
+	testUUID    = "3f2504e0-4f89-11d3-9a0c-0305e82c3301"
+	testECID    = ECIDPrefix + testUUID
 	versClass   = "org.apache.accumulo.core.iterators.user.VersioningIterator"
 	latentClass = "org.apache.accumulo.core.graph.LatentEdgeDiscoveryIterator"
 )
@@ -277,6 +278,25 @@ func TestTranslateRefusesMalformedJobs(t *testing.T) {
 			wantField: "externalCompactionId",
 		},
 		{
+			// The colon spelling is the one an unrelated javadoc in
+			// ExternalCompactionId still shows; PREFIX is the hyphen.
+			name:      "ecid using the colon spelling",
+			mutate:    func(j *tabletserver.TExternalCompactionJob) { j.ExternalCompactionId = "ECID:" + testUUID },
+			wantField: "externalCompactionId",
+		},
+		{
+			name:      "ecid suffix is not a uuid",
+			mutate:    func(j *tabletserver.TExternalCompactionJob) { j.ExternalCompactionId = ECIDPrefix + "not-a-uuid" },
+			wantField: "externalCompactionId",
+		},
+		{
+			name: "ecid suffix is a truncated uuid",
+			mutate: func(j *tabletserver.TExternalCompactionJob) {
+				j.ExternalCompactionId = ECIDPrefix + testUUID[:len(testUUID)-1]
+			},
+			wantField: "externalCompactionId",
+		},
+		{
 			name:      "no extent",
 			mutate:    func(j *tabletserver.TExternalCompactionJob) { j.Extent = nil },
 			wantField: "extent",
@@ -414,16 +434,6 @@ func TestTranslateRefusesMalformedJobs(t *testing.T) {
 			wantField: "iteratorSettings.vers",
 		},
 		{
-			name: "priorities out of order",
-			mutate: func(j *tabletserver.TExternalCompactionJob) {
-				j.IteratorSettings = iterConfig(
-					&tabletserver.TIteratorSetting{Priority: 30, Name: "late", IteratorClass: versClass},
-					&tabletserver.TIteratorSetting{Priority: 10, Name: "early", IteratorClass: latentClass},
-				)
-			},
-			wantField: "iteratorSettings.early",
-		},
-		{
 			name: "non-numeric block size override",
 			mutate: func(j *tabletserver.TExternalCompactionJob) {
 				j.Overrides = map[string]string{propCompressBlockSize: "big"}
@@ -521,6 +531,69 @@ func TestTranslateCopiesIteratorOptions(t *testing.T) {
 	if got := plan.Stack[0].Options["maxVersions"]; got != "3" {
 		t.Fatalf("plan option = %q after mutating the job, want the translated 3", got)
 	}
+}
+
+// TestTranslateOrdersIteratorsLikeJava pins the ordering rule to the
+// Java one. IteratorConfigUtil.parseIterConf sorts the settings by
+// ITER_INFO_COMPARATOR before loadIterators builds the stack, so wire
+// order is not stack order and a descending list is a job Java runs
+// rather than a broken one.
+func TestTranslateOrdersIteratorsLikeJava(t *testing.T) {
+	job := validJob()
+	job.IteratorSettings = iterConfig(
+		&tabletserver.TIteratorSetting{Priority: 30, Name: "late", IteratorClass: latentClass},
+		&tabletserver.TIteratorSetting{Priority: 10, Name: "early", IteratorClass: versClass},
+	)
+
+	plan := mustTranslate(t, job, Options{})
+
+	if len(plan.Iterators) != 2 {
+		t.Fatalf("Iterators = %d, want 2", len(plan.Iterators))
+	}
+	if plan.Iterators[0].Name != "early" || plan.Iterators[1].Name != "late" {
+		t.Fatalf("order = %q then %q, want early (priority 10) then late (priority 30)",
+			plan.Iterators[0].Name, plan.Iterators[1].Name)
+	}
+	if plan.Stack[0].Name != iterrt.IterVersioning || plan.Stack[1].Name != iterrt.IterLatentEdgeDiscovery {
+		t.Fatalf("Stack = %+v, want the built stack in the same order as Iterators", plan.Stack)
+	}
+}
+
+// TestTranslateBreaksIteratorPriorityTiesByName: Java's comparator falls
+// back to the iterator name when priorities are equal, which makes the
+// order total. Equal priorities are legal there, so shoal must order
+// them the same way instead of refusing or trusting wire order.
+func TestTranslateBreaksIteratorPriorityTiesByName(t *testing.T) {
+	job := validJob()
+	job.IteratorSettings = iterConfig(
+		&tabletserver.TIteratorSetting{Priority: 10, Name: "zeta", IteratorClass: latentClass},
+		&tabletserver.TIteratorSetting{Priority: 10, Name: "alpha", IteratorClass: versClass},
+	)
+
+	plan := mustTranslate(t, job, Options{})
+
+	if plan.Iterators[0].Name != "alpha" || plan.Iterators[1].Name != "zeta" {
+		t.Fatalf("order = %q then %q, want alpha then zeta",
+			plan.Iterators[0].Name, plan.Iterators[1].Name)
+	}
+}
+
+// TestTranslateRefusesTheFirstIteratorInExecutionOrder: the refusal an
+// operator reads must name the iterator the compaction would have hit
+// first, which is the lowest-priority one regardless of where the
+// coordinator put it in the list.
+func TestTranslateRefusesTheFirstIteratorInExecutionOrder(t *testing.T) {
+	job := validJob()
+	job.IteratorSettings = iterConfig(
+		&tabletserver.TIteratorSetting{
+			Priority: 30, Name: "late", IteratorClass: "org.apache.accumulo.core.iterators.user.AgeOffFilter",
+		},
+		&tabletserver.TIteratorSetting{
+			Priority: 10, Name: "early", IteratorClass: "org.apache.accumulo.core.iterators.user.RegExFilter",
+		},
+	)
+
+	assertRefused(t, job, Options{}, ClassUnsupportedIterator, "iteratorSettings.early")
 }
 
 // TestTranslateAcceptsEmptyIteratorStack: no majc iterators configured is
