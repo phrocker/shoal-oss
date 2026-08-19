@@ -10,7 +10,7 @@ static_assert(std::is_same<shoal_abi_capability_bits, std::uint64_t>::value,
               "capability bitset words must remain 64-bit");
 static_assert(SHOAL_ABI_VERSION == 1u, "unexpected ABI version");
 static_assert(SHOAL_ABI_VERSION_MAJOR == 1u, "unexpected ABI major");
-static_assert(SHOAL_ABI_VERSION_MINOR == 4u, "unexpected ABI minor");
+static_assert(SHOAL_ABI_VERSION_MINOR == 5u, "unexpected ABI minor");
 static_assert(SHOAL_ABI_VERSION_PATCH == 0u, "unexpected ABI patch");
 static_assert(SHOAL_ABI_VERSION_PACKED ==
                   SHOAL_ABI_PACK_VERSION(SHOAL_ABI_VERSION_MAJOR,
@@ -33,9 +33,11 @@ static_assert(SHOAL_ABI_CAPABILITY_DATA_DESCRIPTORS == 14u,
               "unexpected data descriptors capability id");
 static_assert(SHOAL_ABI_CAPABILITY_CONFIGURATION_TOPOLOGY == 15u,
               "unexpected configuration topology capability id");
-static_assert(SHOAL_ABI_CAPABILITY_COUNT == 16u,
+static_assert(SHOAL_ABI_CAPABILITY_RFILE == 16u,
+              "unexpected RFile capability id");
+static_assert(SHOAL_ABI_CAPABILITY_COUNT == 17u,
               "unexpected capability count");
-static_assert(SHOAL_ABI_CAPABILITY_WORD0 == 0x000000000000ffffull,
+static_assert(SHOAL_ABI_CAPABILITY_WORD0 == 0x000000000001ffffull,
               "unexpected capability word 0");
 static_assert(std::is_standard_layout<shoal_connector_identity_view>::value,
               "identity view must remain standard-layout");
@@ -45,6 +47,12 @@ static_assert(std::is_standard_layout<shoal_iterator_setting_view>::value,
               "iterator setting view must remain standard-layout");
 static_assert(std::is_standard_layout<shoal_server_view>::value,
               "server view must remain standard-layout");
+static_assert(std::is_standard_layout<shoal_rfile_writer_config>::value,
+              "RFile writer config must remain standard-layout");
+static_assert(std::is_standard_layout<shoal_rfile_merge_config>::value,
+              "RFile merge config must remain standard-layout");
+static_assert(std::is_standard_layout<shoal_rfile_entry_view>::value,
+              "RFile entry view must remain standard-layout");
 
 #define ASSERT_PERMISSION_VALUE(name, value)                                 \
   static_assert(name == value, "unexpected permission ordinal: " #name)
@@ -108,6 +116,11 @@ int main() {
   shoal_string_list_result *strings = nullptr;
   shoal_server_list_result *servers = nullptr;
   shoal_server_view server_view{};
+  shoal_rfile_writer *rfile_writer = nullptr;
+  shoal_rfile_reader *rfile_reader = nullptr;
+  shoal_rfile_seekable *rfile_seekable = nullptr;
+  shoal_rfile_entry_result *rfile_entry = nullptr;
+  shoal_rfile_entry_view rfile_entry_view{};
   assert(shoal_abi_version() == SHOAL_ABI_VERSION);
   assert(shoal_abi_version_major() == SHOAL_ABI_VERSION_MAJOR);
   assert(shoal_abi_version_minor() == SHOAL_ABI_VERSION_MINOR);
@@ -127,6 +140,7 @@ int main() {
   assert(shoal_abi_has_capability(SHOAL_ABI_CAPABILITY_DATA_DESCRIPTORS) == 1);
   assert(shoal_abi_has_capability(
              SHOAL_ABI_CAPABILITY_CONFIGURATION_TOPOLOGY) == 1);
+  assert(shoal_abi_has_capability(SHOAL_ABI_CAPABILITY_RFILE) == 1);
   assert(shoal_abi_has_capability(SHOAL_ABI_CAPABILITY_COUNT) == 0);
   assert(shoal_versioned_properties_version(versioned_properties) == 0);
   assert(shoal_versioned_properties_count(versioned_properties) == 0);
@@ -148,6 +162,8 @@ int main() {
   assert(copied.length == sizeof(value_data));
   shoal_server_view_init(&server_view);
   assert(server_view.struct_size == SHOAL_SERVER_VIEW_V1_SIZE);
+  shoal_rfile_entry_view_init(&rfile_entry_view);
+  assert(rfile_entry_view.struct_size == SHOAL_RFILE_ENTRY_VIEW_V1_SIZE);
   assert(error == nullptr);
   shoal_connector_identity_view_init(&identity_view);
   assert(identity_view.struct_size == SHOAL_CONNECTOR_IDENTITY_VIEW_V1_SIZE);
@@ -187,6 +203,10 @@ int main() {
   shoal_bytes_result_free(&bytes_result);
   shoal_string_list_free(&strings);
   shoal_server_list_free(&servers);
+  shoal_rfile_writer_free(&rfile_writer);
+  shoal_rfile_reader_free(&rfile_reader);
+  shoal_rfile_seekable_free(&rfile_seekable);
+  shoal_rfile_entry_result_free(&rfile_entry);
   shoal_error_free(&error);
   return 0;
 }

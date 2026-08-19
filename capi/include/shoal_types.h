@@ -22,7 +22,7 @@
  */
 #define SHOAL_ABI_VERSION 1u
 #define SHOAL_ABI_VERSION_MAJOR 1u
-#define SHOAL_ABI_VERSION_MINOR 4u
+#define SHOAL_ABI_VERSION_MINOR 5u
 #define SHOAL_ABI_VERSION_PATCH 0u
 #define SHOAL_ABI_PACK_VERSION(major, minor, patch)                           \
   ((((uint32_t)(major) & 0xffu) << 16) |                                     \
@@ -55,10 +55,11 @@ enum {
   SHOAL_ABI_CAPABILITY_TABLE_SPLITS = 12,
   SHOAL_ABI_CAPABILITY_CONNECTOR_IDENTITY = 13,
   SHOAL_ABI_CAPABILITY_DATA_DESCRIPTORS = 14,
-  SHOAL_ABI_CAPABILITY_CONFIGURATION_TOPOLOGY = 15
+  SHOAL_ABI_CAPABILITY_CONFIGURATION_TOPOLOGY = 15,
+  SHOAL_ABI_CAPABILITY_RFILE = 16
 };
 
-#define SHOAL_ABI_CAPABILITY_COUNT 16u
+#define SHOAL_ABI_CAPABILITY_COUNT 17u
 #define SHOAL_ABI_CAPABILITY_WORD_BITS 64u
 #define SHOAL_ABI_CAPABILITY_WORD_INDEX(capability_id)                       \
   ((uint32_t)(capability_id) / SHOAL_ABI_CAPABILITY_WORD_BITS)
@@ -100,6 +101,8 @@ enum {
   SHOAL_ABI_CAPABILITY_MASK(SHOAL_ABI_CAPABILITY_DATA_DESCRIPTORS)
 #define SHOAL_ABI_CAPABILITY_CONFIGURATION_TOPOLOGY_MASK                     \
   SHOAL_ABI_CAPABILITY_MASK(SHOAL_ABI_CAPABILITY_CONFIGURATION_TOPOLOGY)
+#define SHOAL_ABI_CAPABILITY_RFILE_MASK                                      \
+  SHOAL_ABI_CAPABILITY_MASK(SHOAL_ABI_CAPABILITY_RFILE)
 #define SHOAL_ABI_CAPABILITY_WORD0                                           \
   (SHOAL_ABI_CAPABILITY_CONNECTOR_MASK | SHOAL_ABI_CAPABILITY_BOOTSTRAP_MASK | \
    SHOAL_ABI_CAPABILITY_ERROR_MASK | SHOAL_ABI_CAPABILITY_SCANNER_MASK |     \
@@ -114,7 +117,8 @@ enum {
    SHOAL_ABI_CAPABILITY_TABLE_SPLITS_MASK |                                  \
    SHOAL_ABI_CAPABILITY_CONNECTOR_IDENTITY_MASK |                            \
    SHOAL_ABI_CAPABILITY_DATA_DESCRIPTORS_MASK |                              \
-   SHOAL_ABI_CAPABILITY_CONFIGURATION_TOPOLOGY_MASK)
+   SHOAL_ABI_CAPABILITY_CONFIGURATION_TOPOLOGY_MASK |                        \
+   SHOAL_ABI_CAPABILITY_RFILE_MASK)
 
 typedef int32_t shoal_status;
 
@@ -177,6 +181,10 @@ typedef struct shoal_configuration shoal_configuration;
 typedef struct shoal_bytes_result shoal_bytes_result;
 typedef struct shoal_string_list_result shoal_string_list_result;
 typedef struct shoal_server_list_result shoal_server_list_result;
+typedef struct shoal_rfile_reader shoal_rfile_reader;
+typedef struct shoal_rfile_writer shoal_rfile_writer;
+typedef struct shoal_rfile_seekable shoal_rfile_seekable;
+typedef struct shoal_rfile_entry_result shoal_rfile_entry_result;
 typedef struct shoal_error shoal_error;
 
 typedef struct shoal_connector_identity_view {
@@ -246,6 +254,50 @@ typedef struct shoal_key {
   shoal_bytes column_visibility;
   int64_t timestamp;
 } shoal_key;
+
+typedef struct shoal_rfile_writer_config {
+  uint32_t struct_size;
+  const char *codec;
+  int64_t block_size;
+} shoal_rfile_writer_config;
+
+#define SHOAL_RFILE_WRITER_CONFIG_V1_SIZE                                    \
+  ((uint32_t)(offsetof(shoal_rfile_writer_config, block_size) +              \
+              sizeof(((shoal_rfile_writer_config *)0)->block_size)))
+
+typedef struct shoal_rfile_merge_config {
+  uint32_t struct_size;
+  int32_t versions;
+  uint8_t apply_deletes;
+  uint8_t propagate;
+  int64_t min_timestamp;
+} shoal_rfile_merge_config;
+
+#define SHOAL_RFILE_MERGE_CONFIG_V1_SIZE                                     \
+  ((uint32_t)(offsetof(shoal_rfile_merge_config, min_timestamp) +            \
+              sizeof(((shoal_rfile_merge_config *)0)->min_timestamp)))
+
+typedef struct shoal_rfile_entry {
+  uint32_t struct_size;
+  shoal_key key;
+  shoal_bytes value;
+  uint8_t deleted;
+} shoal_rfile_entry;
+
+#define SHOAL_RFILE_ENTRY_V1_SIZE                                            \
+  ((uint32_t)(offsetof(shoal_rfile_entry, deleted) +                         \
+              sizeof(((shoal_rfile_entry *)0)->deleted)))
+
+typedef struct shoal_rfile_entry_view {
+  uint32_t struct_size;
+  shoal_key key;
+  shoal_bytes value;
+  uint8_t deleted;
+} shoal_rfile_entry_view;
+
+#define SHOAL_RFILE_ENTRY_VIEW_V1_SIZE                                       \
+  ((uint32_t)(offsetof(shoal_rfile_entry_view, deleted) +                    \
+              sizeof(((shoal_rfile_entry_view *)0)->deleted)))
 
 typedef int32_t shoal_range_bound_kind;
 

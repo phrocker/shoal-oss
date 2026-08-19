@@ -8,9 +8,9 @@
 
 _Static_assert(SHOAL_ABI_VERSION == 1u, "unexpected compatibility ABI version");
 _Static_assert(SHOAL_ABI_VERSION_MAJOR == 1u, "unexpected ABI major");
-_Static_assert(SHOAL_ABI_VERSION_MINOR == 4u, "unexpected ABI minor");
+_Static_assert(SHOAL_ABI_VERSION_MINOR == 5u, "unexpected ABI minor");
 _Static_assert(SHOAL_ABI_VERSION_PATCH == 0u, "unexpected ABI patch");
-_Static_assert(SHOAL_ABI_VERSION_PACKED == 0x00010400u,
+_Static_assert(SHOAL_ABI_VERSION_PACKED == 0x00010500u,
                "unexpected packed ABI version");
 _Static_assert(SHOAL_ABI_CAPABILITY_CONNECTOR == 0u,
                "unexpected connector capability id");
@@ -44,11 +44,13 @@ _Static_assert(SHOAL_ABI_CAPABILITY_DATA_DESCRIPTORS == 14u,
                "unexpected data descriptors capability id");
 _Static_assert(SHOAL_ABI_CAPABILITY_CONFIGURATION_TOPOLOGY == 15u,
                "unexpected configuration topology capability id");
-_Static_assert(SHOAL_ABI_CAPABILITY_COUNT == 16u,
+_Static_assert(SHOAL_ABI_CAPABILITY_RFILE == 16u,
+               "unexpected RFile capability id");
+_Static_assert(SHOAL_ABI_CAPABILITY_COUNT == 17u,
                "unexpected capability count");
 _Static_assert(SHOAL_ABI_CAPABILITY_WORD_COUNT == 1u,
                "unexpected capability word count");
-_Static_assert(SHOAL_ABI_CAPABILITY_WORD0 == UINT64_C(0xffff),
+_Static_assert(SHOAL_ABI_CAPABILITY_WORD0 == UINT64_C(0x1ffff),
                "unexpected capability word 0");
 
 #define ASSERT_PERMISSION_VALUE(name, value)                                  \
@@ -143,8 +145,200 @@ static void test_v1_initializers(void) {
                 SHOAL_ITERATOR_SETTING_VIEW_V1_SIZE);
   CHECK_V1_INIT(shoal_server_view, shoal_server_view_init,
                 SHOAL_SERVER_VIEW_V1_SIZE);
+  CHECK_V1_INIT(shoal_rfile_writer_config, shoal_rfile_writer_config_init,
+                SHOAL_RFILE_WRITER_CONFIG_V1_SIZE);
+  CHECK_V1_INIT(shoal_rfile_merge_config, shoal_rfile_merge_config_init,
+                SHOAL_RFILE_MERGE_CONFIG_V1_SIZE);
+  CHECK_V1_INIT(shoal_rfile_entry, shoal_rfile_entry_init,
+                SHOAL_RFILE_ENTRY_V1_SIZE);
+  CHECK_V1_INIT(shoal_rfile_entry_view, shoal_rfile_entry_view_init,
+                SHOAL_RFILE_ENTRY_VIEW_V1_SIZE);
 
 #undef CHECK_V1_INIT
+}
+
+static void append_rfile_entry(shoal_rfile_writer *writer, const uint8_t *row,
+                               size_t row_length, const uint8_t *family,
+                               size_t family_length, const uint8_t *value,
+                               size_t value_length, int64_t timestamp,
+                               uint8_t deleted) {
+  shoal_rfile_entry entry;
+  shoal_error *error = NULL;
+  shoal_rfile_entry_init(&entry);
+  entry.key.row = (shoal_bytes){row, row_length};
+  entry.key.column_family = (shoal_bytes){family, family_length};
+  entry.key.timestamp = timestamp;
+  entry.value = (shoal_bytes){value, value_length};
+  entry.deleted = deleted;
+  assert(shoal_rfile_writer_append(writer, &entry, 0, &error) ==
+         SHOAL_STATUS_OK);
+  assert(error == NULL);
+}
+
+static void test_rfile_abi(void) {
+  static const char path_one[] = "shoal-capi-rfile-one.rf";
+  static const char path_two[] = "shoal-capi-rfile-two.rf";
+  static const uint8_t row_a[] = {'a', '\0'};
+  static const uint8_t row_b[] = {'b'};
+  static const uint8_t row_c[] = {'c'};
+  static const uint8_t family[] = {'f', '\0'};
+  static const uint8_t value_a[] = {'v', '\0', 'a'};
+  static const uint8_t value_b[] = {'v', 'b'};
+  static const uint8_t value_c[] = {'v', 'c'};
+  shoal_rfile_writer_config writer_config;
+  shoal_rfile_merge_config merge_config;
+  shoal_rfile_writer *writer = NULL;
+  shoal_rfile_reader *reader = NULL;
+  shoal_rfile_seekable *seekable = NULL;
+  shoal_rfile_entry_result *entry_result = NULL;
+  shoal_bytes_result *bytes_result = NULL;
+  shoal_range_result *range_result = NULL;
+  shoal_error *error = NULL;
+
+  remove(path_one);
+  remove(path_two);
+  assert(shoal_rfile_reader_open(path_one, 0, &reader, &error) ==
+         SHOAL_STATUS_NOT_FOUND);
+  assert(reader == NULL && error != NULL);
+  shoal_error_free(&error);
+  shoal_rfile_writer_config_init(&writer_config);
+  assert(shoal_rfile_writer_create(path_one, &writer_config, -1, &writer,
+                                   &error) ==
+         SHOAL_STATUS_INVALID_ARGUMENT);
+  assert(writer == NULL && error != NULL);
+  shoal_error_free(&error);
+  writer_config.codec = "not-a-codec";
+  assert(shoal_rfile_writer_create(path_one, &writer_config, 0, &writer,
+                                   &error) == SHOAL_STATUS_UNSUPPORTED);
+  assert(writer == NULL && error != NULL);
+  shoal_error_free(&error);
+  writer_config.codec = "gz";
+  writer_config.block_size = 64;
+  assert(shoal_rfile_writer_create(path_one, &writer_config, 0, &writer,
+                                   &error) == SHOAL_STATUS_OK);
+  append_rfile_entry(writer, row_a, sizeof(row_a), family, sizeof(family),
+                     value_a, sizeof(value_a), 7, 0);
+  append_rfile_entry(writer, row_b, sizeof(row_b), family, sizeof(family),
+                     value_b, sizeof(value_b), 6, 1);
+  assert(shoal_rfile_writer_entries(writer) == 2);
+  assert(shoal_rfile_writer_close(writer, &error) == SHOAL_STATUS_OK);
+  assert(shoal_rfile_writer_close(writer, &error) == SHOAL_STATUS_OK);
+  shoal_rfile_writer_free(&writer);
+  shoal_rfile_writer_free(&writer);
+  assert(writer == NULL);
+
+  shoal_rfile_writer_config_init(&writer_config);
+  assert(shoal_rfile_writer_create(path_two, &writer_config, 0, &writer,
+                                   &error) == SHOAL_STATUS_OK);
+  append_rfile_entry(writer, row_c, sizeof(row_c), family, sizeof(family),
+                     value_c, sizeof(value_c), 5, 0);
+  assert(shoal_rfile_writer_close(writer, &error) == SHOAL_STATUS_OK);
+  shoal_rfile_writer_free(&writer);
+
+  assert(shoal_rfile_reader_open(path_one, 0, &reader, &error) ==
+         SHOAL_STATUS_OK);
+  assert(shoal_rfile_reader_has_top(reader) == 0);
+  assert(shoal_rfile_reader_top(reader, &entry_result, &error) ==
+         SHOAL_STATUS_NOT_FOUND);
+  assert(entry_result == NULL && error != NULL);
+  shoal_error_free(&error);
+
+  shoal_range range;
+  shoal_range_init(&range);
+  shoal_bytes families[] = {{family, sizeof(family)}};
+  assert(shoal_rfile_seekable_create(&range, families, 1, 1, &seekable,
+                                     &error) == SHOAL_STATUS_OK);
+  assert(shoal_rfile_seekable_column_family_count(seekable) == 1);
+  assert(shoal_rfile_seekable_is_inclusive(seekable) == 1);
+  assert(shoal_rfile_seekable_get_column_family(seekable, 0, &bytes_result,
+                                                &error) == SHOAL_STATUS_OK);
+  shoal_bytes copied = shoal_bytes_result_get(bytes_result);
+  assert(copied.length == sizeof(family));
+  assert(memcmp(copied.data, family, sizeof(family)) == 0);
+  shoal_bytes_result_free(&bytes_result);
+  assert(shoal_rfile_seekable_get_range(seekable, &range_result, &error) ==
+         SHOAL_STATUS_OK);
+  shoal_range_view range_view;
+  shoal_range_view_init(&range_view);
+  assert(shoal_range_get(range_result, &range_view, &error) == SHOAL_STATUS_OK);
+  shoal_range_free(&range_result);
+  assert(shoal_rfile_reader_seek(reader, seekable, 0, &error) ==
+         SHOAL_STATUS_OK);
+  assert(shoal_rfile_reader_has_top(reader) == 1);
+
+  shoal_test_result_alloc_fail_after(0);
+  assert(shoal_rfile_reader_top(reader, &entry_result, &error) ==
+         SHOAL_STATUS_OUT_OF_MEMORY);
+  assert(entry_result == NULL && error != NULL);
+  shoal_error_free(&error);
+  shoal_test_result_alloc_reset();
+
+  assert(shoal_rfile_reader_top(reader, &entry_result, &error) ==
+         SHOAL_STATUS_OK);
+  shoal_rfile_entry_view entry_view;
+  shoal_rfile_entry_view_init(&entry_view);
+  assert(shoal_rfile_entry_result_get(entry_result, &entry_view, &error) ==
+         SHOAL_STATUS_OK);
+  assert(entry_view.key.row.length == sizeof(row_a));
+  assert(memcmp(entry_view.key.row.data, row_a, sizeof(row_a)) == 0);
+  assert(entry_view.key.column_family.length == sizeof(family));
+  assert(entry_view.key.timestamp == 7);
+  assert(entry_view.value.length == sizeof(value_a));
+  assert(memcmp(entry_view.value.data, value_a, sizeof(value_a)) == 0);
+  assert(entry_view.deleted == 0);
+  shoal_rfile_entry_result_free(&entry_result);
+  shoal_rfile_entry_result_free(&entry_result);
+  assert(shoal_rfile_reader_top_key(reader, &entry_result, &error) ==
+         SHOAL_STATUS_OK);
+  shoal_rfile_entry_view_init(&entry_view);
+  assert(shoal_rfile_entry_result_get(entry_result, &entry_view, &error) ==
+         SHOAL_STATUS_OK);
+  assert(entry_view.value.length == 0);
+  shoal_rfile_entry_result_free(&entry_result);
+  assert(shoal_rfile_reader_top_value(reader, &bytes_result, &error) ==
+         SHOAL_STATUS_OK);
+  copied = shoal_bytes_result_get(bytes_result);
+  assert(copied.length == sizeof(value_a));
+  assert(memcmp(copied.data, value_a, sizeof(value_a)) == 0);
+  shoal_bytes_result_free(&bytes_result);
+  assert(shoal_rfile_reader_next(reader, 0, &error) == SHOAL_STATUS_OK);
+  assert(shoal_rfile_reader_top(reader, &entry_result, &error) ==
+         SHOAL_STATUS_OK);
+  shoal_rfile_entry_view_init(&entry_view);
+  assert(shoal_rfile_entry_result_get(entry_result, &entry_view, &error) ==
+         SHOAL_STATUS_OK);
+  assert(entry_view.deleted == 1);
+  shoal_rfile_entry_result_free(&entry_result);
+  assert(shoal_rfile_reader_next(reader, 0, &error) == SHOAL_STATUS_OK);
+  assert(shoal_rfile_reader_has_top(reader) == 0);
+  assert(shoal_rfile_reader_close(reader, &error) == SHOAL_STATUS_OK);
+  assert(shoal_rfile_reader_close(reader, &error) == SHOAL_STATUS_OK);
+  shoal_rfile_reader_free(&reader);
+  shoal_rfile_reader_free(&reader);
+  shoal_rfile_seekable_free(&seekable);
+  shoal_rfile_seekable_free(&seekable);
+
+  const char *paths[] = {path_two, path_one};
+  shoal_rfile_merge_config_init(&merge_config);
+  merge_config.versions = 1;
+  assert(shoal_rfile_reader_open_many(paths, 2, &merge_config, 0, &reader,
+                                     &error) == SHOAL_STATUS_OK);
+  assert(shoal_rfile_reader_has_top(reader) == 1);
+  assert(shoal_rfile_reader_top(reader, &entry_result, &error) ==
+         SHOAL_STATUS_OK);
+  shoal_rfile_entry_view_init(&entry_view);
+  assert(shoal_rfile_entry_result_get(entry_result, &entry_view, &error) ==
+         SHOAL_STATUS_OK);
+  assert(entry_view.key.row.length == sizeof(row_a));
+  shoal_rfile_entry_result_free(&entry_result);
+  shoal_rfile_reader_free(&reader);
+
+  assert(shoal_rfile_reader_open_sequential(path_two, 0, &reader, &error) ==
+         SHOAL_STATUS_OK);
+  assert(shoal_rfile_reader_has_top(reader) == 1);
+  shoal_rfile_reader_free(&reader);
+  remove(path_one);
+  remove(path_two);
 }
 
 int main(void) {
@@ -172,6 +366,7 @@ int main(void) {
   shoal_error *error = NULL;
 
   test_v1_initializers();
+  test_rfile_abi();
   assert(shoal_abi_version() == SHOAL_ABI_VERSION);
   assert(shoal_abi_version_major() == SHOAL_ABI_VERSION_MAJOR);
   assert(shoal_abi_version_minor() == SHOAL_ABI_VERSION_MINOR);
@@ -196,6 +391,7 @@ int main(void) {
   assert(shoal_abi_has_capability(SHOAL_ABI_CAPABILITY_CONNECTOR_IDENTITY) ==
          1);
   assert(shoal_abi_has_capability(SHOAL_ABI_CAPABILITY_DATA_DESCRIPTORS) == 1);
+  assert(shoal_abi_has_capability(SHOAL_ABI_CAPABILITY_RFILE) == 1);
   assert(shoal_abi_has_capability(SHOAL_ABI_CAPABILITY_COUNT) == 0);
   assert(shoal_abi_has_capability(63u) == 0);
   assert(shoal_abi_has_capability(64u) == 0);
