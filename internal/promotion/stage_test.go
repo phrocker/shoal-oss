@@ -295,6 +295,24 @@ func TestSourceRefsAliasRequiresExactMatchOnUnrecognizedBackendScheme(t *testing
 	}
 }
 
+// pathsAlias is intentionally more conservative than sourceRefsAlias:
+// write-target safety may reject a maybe-aliased unknown-backend path
+// pair on spelling alone, but source dedupe must never drop one unless
+// the backend's actual semantics confirm the alias.
+func TestUnknownBackendWriteSafetyHeuristicsDoNotDriveSourceDedupe(t *testing.T) {
+	backend := memory.New()
+	cache := newPathIdentityCache(0)
+	left := newStagePathRef(backend, "custom://bucket/A.rf")
+	right := newStagePathRef(backend, "custom://bucket/A.rf/")
+
+	if !pathsAlias(left, right, cache) {
+		t.Fatalf("pathsAlias(%q, %q) = false, want true: write-safety heuristics should conservatively reject maybe-aliased unknown-backend paths", left.path, right.path)
+	}
+	if sourceRefsAlias(left, right, cache) {
+		t.Fatalf("sourceRefsAlias(%q, %q) = true, want false: the same heuristic must not silently dedupe a source", left.path, right.path)
+	}
+}
+
 // TestStageBulkDirDoesNotSilentlyDedupeDistinctSourcesOnUnrecognizedBackendScheme
 // proves the fix for the "custom://bucket/A.rf" vs
 // "custom://bucket/A.rf/" scenario end to end. Before the fix,
@@ -379,6 +397,24 @@ func TestCanonicalBackendPathRequiresMatchingBackendType(t *testing.T) {
 		cleanValue, cleanOK := canonicalBackendPath(newStagePathRef(backend, cleanPath))
 		if !dotSegmentOK || !cleanOK || dotSegmentValue != cleanValue {
 			t.Fatalf("canonicalBackendPath on a real hdfs.Backend: (%q, %v) and (%q, %v), want equal canonical values with ok=true", dotSegmentValue, dotSegmentOK, cleanValue, cleanOK)
+		}
+	})
+
+	t.Run("wrapped hdfs backend still canonicalizes after unwrapping", func(t *testing.T) {
+		inner := newTestHDFSBackend(t, "hdfs://nn:8020")
+		backend, err := diskcache.New(inner, filepath.Join(t.TempDir(), "cache"), 1<<20)
+		if err != nil {
+			t.Fatalf("diskcache.New: %v", err)
+		}
+		dotSegment := newStagePathRef(backend, dotSegmentPath)
+		clean := newStagePathRef(backend, cleanPath)
+		dotSegmentValue, dotSegmentOK := canonicalBackendPath(dotSegment)
+		cleanValue, cleanOK := canonicalBackendPath(clean)
+		if !dotSegmentOK || !cleanOK || dotSegmentValue != cleanValue {
+			t.Fatalf("canonicalBackendPath on a diskcache-wrapped hdfs.Backend: (%q, %v) and (%q, %v), want equal canonical values with ok=true", dotSegmentValue, dotSegmentOK, cleanValue, cleanOK)
+		}
+		if !sourceRefsAlias(dotSegment, clean, newPathIdentityCache(0)) {
+			t.Fatalf("sourceRefsAlias(%q, %q) on a diskcache-wrapped hdfs.Backend = false, want true after unwrapping the known backend", dotSegment.path, clean.path)
 		}
 	})
 }
