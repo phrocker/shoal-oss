@@ -1588,8 +1588,12 @@ func checkOutputCapability(out, ecid string) error {
 // already spent and no capability reported.
 //
 // Probing with the parser rather than modelling it keeps the two in
-// step: any future divergence is reported as a refusal instead of
-// becoming a late failure.
+// step, and the scope id shows why that matters: net/url's handling of
+// the percent-encoded spelling ("%25") is not even stable across Go
+// releases — 1.25 accepts it, 1.26 rejects the empty zone it decodes to
+// — so a model written against one toolchain would refuse work the
+// running binary can do, or promise work it cannot. url.Parse always
+// answers for the binary actually doing the opening.
 func checkVolumeCapability(raw, field string) error {
 	if _, err := url.Parse(raw); err != nil {
 		return refuse(ClassUnsupportedVolume, field,

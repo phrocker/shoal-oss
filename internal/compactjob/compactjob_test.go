@@ -650,17 +650,20 @@ func TestTranslateAcceptsEveryIPv6HostURIDoes(t *testing.T) {
 
 // TestTranslateRefusesAnIPv6ScopeIDShoalCannotOpen covers the gap
 // between the two parsers. URI$Parser.parseServer reads "%" inside the
-// brackets as the scope-id introducer, so java.net.URI takes every one
-// of these hosts and Accumulo can name the file. net/url.Parse, which
+// brackets as the scope-id introducer, so java.net.URI takes these
+// hosts verbatim and Accumulo can name the file. net/url.Parse, which
 // is what internal/storage/hdfs's Backend.resolve calls, has no such
-// rule: it reads the "%" as an escape and fails, or unescapes it and
-// finds an empty zone. Every scope-id spelling Java accepts therefore
-// fails on shoal, so the job is refused as a capability gap rather than
+// rule: the "%" is an escape, and a scope id is not two hex digits, so
+// the parse fails. The job is refused as a capability gap rather than
 // declared executable and left to die on its first read.
+//
+// Only the unencoded spelling is asserted. "%25" decodes to a "%" and
+// leaves an empty zone, which Go 1.25 accepts and Go 1.26 rejects —
+// pinning either answer here would pin a toolchain, and the refusal
+// deliberately follows whichever parser the binary was built with.
 func TestTranslateRefusesAnIPv6ScopeIDShoalCannotOpen(t *testing.T) {
 	for _, host := range []string{
 		"[fe80::1%eth0]",
-		"[fe80::1%25]:9000",
 		"[fe80::1%en_0.1]",
 	} {
 		t.Run(host, func(t *testing.T) {
