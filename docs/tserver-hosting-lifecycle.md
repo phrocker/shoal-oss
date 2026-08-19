@@ -289,6 +289,18 @@ already had to pass, which is what keeps the directory's name and the
 advertised address the same address: a reader that finds them
 disagreeing has no server it can reach.
 
+Passing the same check is not the same as being the same value, so the
+two are compared. The lock path and the payload arrive separately here —
+Accumulo's `announceExistence` builds both from one address and one
+resource group, but nothing about the API forces that — and they are
+read for different things: the directory is how a server is enumerated,
+the descriptor is what a client dials. A lock registered under one
+address advertising another is a server the manager can see and nothing
+can reach, so an advertisement whose address or group disagrees with the
+directory is refused before the node is created. A lock path that names
+no server, like the manager's `<instance>/managers/lock`, has no address
+to be held to and is not checked this way.
+
 Duplicates are real: a create whose response was lost still created a
 node, and a retry creates another. Both carry this process's UUID, so
 the first is kept and the rest are deleted — otherwise one process would
@@ -491,17 +503,29 @@ would refuse the live manager's assignments for nothing. A directory that
 is readable and holds no lock is evidence, and clears it.
 
 An observation the host refuses — a live holder whose epoch is older
-than one already seen — ends the watch with `ErrLockNotNewer`. The host
-keeps the newer epoch, so authority still does not move backwards, but
-the refusal is reported rather than swallowed. A session reads ZooKeeper
-monotonically, so the live holder's sequence only goes backwards when
-the manager lock directory itself was deleted and recreated, and that
-does not heal: polling through it would leave this host fenced to a
-manager that no longer exists, taking a dead manager's requests and
-refusing the live one's — authority invented here rather than observed.
+than one already seen — ends the watch with `ErrLockNotNewer`, once a
+second reading refuses the same way. The host keeps the newer epoch, so
+authority does not move backwards whether the watch ends or not; ending
+it is how a condition further polling cannot fix gets reported rather
+than swallowed. That condition is the manager lock directory having been
+deleted and recreated, and it does not heal: polling through it would
+leave this host fenced to a manager that no longer exists, taking a dead
+manager's requests and refusing the live one's — authority invented here
+rather than observed.
 Recovery is the supervisor's, and it is the one `AdoptLock`'s refusal
 already calls for: a fresh `Host`, which carries no epoch history and
 takes the live manager on its first reading.
+
+One refused reading is not that condition. ZooKeeper promises a client
+its own reads never go backwards, but that is a promise about a session,
+and the reader is free to use more than one: `internal/zk.Locator` opens
+a scoped connection per read when the context can be cancelled, so a
+reading can land on a server that has not caught up and return the
+directory as it was — indistinguishable, from here, from a sequence that
+went backwards. A recreated directory reads that way on every poll after
+it, so requiring the refusal to survive one more reading tells the two
+apart. Neither reading is believed in the meantime: both are refused,
+and authority stays where it was.
 
 ## 7. What is not here yet
 

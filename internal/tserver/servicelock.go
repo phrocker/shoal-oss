@@ -164,14 +164,36 @@ func TabletServerLockPath(instancePath, group, address string) (string, error) {
 	return path.Join(instancePath, zTabletServers, group, address), nil
 }
 
+// tabletServerLockIdentity returns the resource group and address a
+// tablet-server lock directory names — the two variable segments of
+// <instance>/tservers/<group>/<address>.
+//
+// A directory of another shape names no server: the manager's lock lives at
+// <instance>/managers/lock, where nothing in the path identifies a process.
+// Those report false rather than a guess, so a lock that is not a server
+// registration is not held to a server registration's rules.
+func tabletServerLockIdentity(dir string) (group, address string, ok bool) {
+	segments := strings.Split(strings.Trim(dir, "/"), "/")
+	if len(segments) < 3 {
+		return "", "", false
+	}
+	tail := segments[len(segments)-3:]
+	if tail[0] != zTabletServers {
+		return "", "", false
+	}
+	return tail[1], tail[2], true
+}
+
 // ParseLockNode maps a ZooKeeper lock child name onto the identity it names.
 //
 // The rules are ServiceLock.validateAndSort's: the name is
 // "zlock#<uuid>#<10-digit sequence>", the UUID must be the dashed form
 // Java's UUID.fromString accepts, and the sequence must fit the signed 32-bit
-// counter Java reads with Integer.parseInt. The same rules are applied by
-// internal/zk when it resolves a lock holder, so a node either package
-// accepts is a node the other accepts.
+// counter Java reads with Integer.parseInt. internal/zk, which resolves a lock
+// holder from the same directories, is looser about the UUID — it takes any
+// spelling uuid.Parse accepts — so a node this rejects is not always one it
+// rejects. Accumulo's rules are the ones that decide what a lock node is, so
+// they are the ones applied here.
 func ParseLockNode(name string) (LockID, bool) {
 	if !strings.HasPrefix(name, zLockPrefix) {
 		return LockID{}, false
@@ -432,15 +454,37 @@ func (l *ServiceLock) Node() string {
 // what fences a generation, the descriptor is what a client dials. Publishing
 // one server's descriptors from another's lock node would split those apart,
 // so it is refused here rather than left for the manager to find.
+//
+// The address and resource group are checked the same way, against the
+// directory the lock is registered in. TabletServerLockPath and the descriptor
+// carry the same two values in Accumulo — announceExistence builds the path
+// from the address and group it advertises — but they arrive here separately,
+// so nothing but this check keeps them together. They are read for different
+// things as well: the directory is how a server is enumerated, the descriptor
+// is what a client dials, and a lock that registers under one address while
+// advertising another is a server the manager can see but nothing can reach.
+// A lock path of another shape names no server and is not checked this way.
 func (l *ServiceLock) Acquire(ctx context.Context, data ServiceLockData) (LockID, error) {
 	payload, err := data.Encode()
 	if err != nil {
 		return LockID{}, err
 	}
+	group, address, registersAServer := tabletServerLockIdentity(l.dir)
 	for _, descriptor := range data.Descriptors {
 		if descriptor.UUID != l.uuid {
 			return LockID{}, fmt.Errorf("%w: %s descriptor names server %s, but this lock is held as %s",
 				ErrInvalidLockData, descriptor.Service, descriptor.UUID, l.uuid)
+		}
+		if !registersAServer {
+			continue
+		}
+		if descriptor.Address != address {
+			return LockID{}, fmt.Errorf("%w: %s descriptor advertises %s, but this lock registers %s",
+				ErrInvalidLockData, descriptor.Service, descriptor.Address, address)
+		}
+		if descriptor.Group != group {
+			return LockID{}, fmt.Errorf("%w: %s descriptor is in resource group %s, but this lock registers under %s",
+				ErrInvalidLockData, descriptor.Service, descriptor.Group, group)
 		}
 	}
 	l.mu.Lock()

@@ -332,6 +332,53 @@ func TestWatchManagerLockSurfacesARefusedEpoch(t *testing.T) {
 	})
 }
 
+// TestWatchManagerLockRidesOutAReadingThatWentBackwards is the other side of
+// the test above. Readings are not monotonic across calls — a reader that
+// opens a session per read can land on a ZooKeeper server that has not caught
+// up — so a single reading that appears to move the manager backwards is not
+// evidence the lock directory was recreated. Ending the watch on it would cost
+// a Host restart, the recovery documented for a condition that does not heal,
+// for a replica that was a moment behind.
+func TestWatchManagerLockRidesOutAReadingThatWentBackwards(t *testing.T) {
+	host := NewHost()
+	reader := &fakeManagerReader{
+		children: []string{managerNode(otherUUID, 9)},
+		script: []func(*fakeManagerReader){
+			// The second reading is the stale one; every one after it sees the
+			// live manager again, as a caught-up replica would.
+			func(r *fakeManagerReader) { r.children = []string{managerNode(managerUUID, 2)} },
+			func(r *fakeManagerReader) { r.children = []string{managerNode(otherUUID, 9)} },
+		},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	watch := make(chan error, 1)
+	go func() { watch <- WatchManagerLock(ctx, reader, host, time.Millisecond) }()
+
+	waitFor(t, "the watch to poll past the stale reading", func() bool { return reader.readCount() >= 6 })
+	select {
+	case err := <-watch:
+		t.Fatalf("WatchManagerLock ended on one stale reading: %v", err)
+	default:
+	}
+	// The stale reading was refused rather than believed, both times it could
+	// have been: authority is still the epoch that was already seen.
+	observed, ok := host.ManagerLock()
+	if !ok || observed != (LockID{UUID: otherUUID, Sequence: 9}) {
+		t.Fatalf("manager authority = %s, %v; want the epoch already observed", observed, ok)
+	}
+
+	cancel()
+	select {
+	case err := <-watch:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("WatchManagerLock: want context.Canceled, got %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("WatchManagerLock did not stop when cancelled")
+	}
+}
+
 // TestWatchManagerLockObservesBeforeItWaits matters at startup: a tablet
 // server that waited a poll interval before its first reading would refuse the
 // manager's first assignments after every restart.

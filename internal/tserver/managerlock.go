@@ -39,8 +39,17 @@ const zManagerLock = "managers/lock"
 var ErrNoManagerLock = errors.New("tserver: no manager lock held")
 
 // ManagerLockReader is the ZooKeeper read surface needed to see which manager
-// holds the manager lock. *internal/zk.Locator satisfies it, so the same
-// session that resolves tablet locations observes manager authority.
+// holds the manager lock. *internal/zk.Locator satisfies it, so the component
+// that resolves tablet locations is the one that observes manager authority.
+//
+// Reads are not assumed to be monotonic across calls. ZooKeeper promises a
+// client its own reads never go backwards within a session, but that is a
+// promise about a session, and an implementation is free to use more than one:
+// internal/zk.Locator opens a scoped connection per read when the context can
+// be cancelled, so consecutive readings here can come from different sessions,
+// and a newer one may land on a server that has not caught up. What that costs
+// is described on WatchManagerLock, which is where a reading that appears to
+// move backwards is handled.
 type ManagerLockReader interface {
 	InstancePath() string
 	Children(ctx context.Context, path string) ([]string, error)
@@ -109,17 +118,29 @@ func ReadManagerLock(ctx context.Context, reader ManagerLockReader) (LockID, err
 // and clears the observation.
 //
 // An observation the host refuses — a live holder whose epoch is older than
-// one already seen — ends the watch with an error wrapping ErrLockNotNewer.
-// The host keeps the newer epoch, so authority still does not move backwards
-// on the way out, but the refusal is reported rather than swallowed. A
-// ZooKeeper session reads monotonically, so the live holder's sequence only
-// goes backwards when the lock directory itself was deleted and recreated,
-// which restarts the counter and does not heal on its own: polling through it
-// would leave this host fenced to a manager that no longer exists, taking a
-// dead manager's requests and refusing the live one's, which is authority
-// invented here rather than observed. The recovery belongs to the supervisor
-// and is the one AdoptLock's refusal already calls for — a fresh Host, which
-// carries no epoch history and takes the live manager on its first reading.
+// one already seen — ends the watch with an error wrapping ErrLockNotNewer,
+// but only once a second reading refuses in the same way. The host keeps the
+// newer epoch either way, so authority never moves backwards whether the watch
+// ends or not; ending it is how a condition no further polling can fix gets
+// reported instead of being swallowed.
+//
+// That condition is the lock directory having been deleted and recreated,
+// which restarts the sequence counter. It does not heal on its own: polling
+// through it would leave this host fenced to a manager that no longer exists,
+// taking a dead manager's requests and refusing the live one's, which is
+// authority invented here rather than observed. The recovery belongs to the
+// supervisor and is the one AdoptLock's refusal already calls for — a fresh
+// Host, which carries no epoch history and takes the live manager on its first
+// reading.
+//
+// A single refusal is not that condition, because readings are not monotonic
+// across calls: a reader that opens a session per read can land on a ZooKeeper
+// server that has not caught up and return the directory as it was, which
+// looks exactly like a sequence going backwards. A recreated directory reads
+// the same way on the next poll and every one after it, so requiring the
+// refusal to survive one more reading tells the two apart without giving a
+// stale reading any authority — it is refused both times. Ending the watch on
+// the first would hand the supervisor a Host restart for a lagging replica.
 func WatchManagerLock(
 	ctx context.Context,
 	reader ManagerLockReader,
@@ -137,9 +158,17 @@ func WatchManagerLock(
 	}
 	timer := time.NewTimer(interval)
 	defer timer.Stop()
+	// Consecutive refusals. Reset by any reading the host accepts, so this
+	// counts a condition that persists rather than refusals in total.
+	refused := 0
 	for {
 		if err := observeManagerLockOnce(ctx, reader, host); err != nil {
-			return err
+			refused++
+			if refused > 1 {
+				return err
+			}
+		} else {
+			refused = 0
 		}
 		if err := ctx.Err(); err != nil {
 			return err

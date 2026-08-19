@@ -517,6 +517,83 @@ func TestMaintainReportsSessionExpiry(t *testing.T) {
 	}
 }
 
+// TestAcquireRefusesDescriptorsThatDoNotMatchTheDirectory covers the other
+// half of the identity a lock publishes. The directory is how a server is
+// enumerated and the descriptor is what a client dials, and Accumulo builds
+// both from the same address and resource group. They arrive here separately,
+// so a lock could register under one address and advertise another — a server
+// the manager can see and nothing can reach.
+func TestAcquireRefusesDescriptorsThatDoNotMatchTheDirectory(t *testing.T) {
+	for _, tc := range []struct {
+		what string
+		data func(t *testing.T) ServiceLockData
+	}{
+		{
+			"another address",
+			func(t *testing.T) ServiceLockData {
+				data, err := TabletServerLockData(serverUUID, "shoal-2.example:9997", testGroup,
+					TabletServerServices()...)
+				if err != nil {
+					t.Fatalf("TabletServerLockData: %v", err)
+				}
+				return data
+			},
+		},
+		{
+			"another resource group",
+			func(t *testing.T) ServiceLockData {
+				data, err := TabletServerLockData(serverUUID, testAddress, "analytics",
+					TabletServerServices()...)
+				if err != nil {
+					t.Fatalf("TabletServerLockData: %v", err)
+				}
+				return data
+			},
+		},
+	} {
+		t.Run(tc.what, func(t *testing.T) {
+			f := newFakeZK()
+			lock := newTestLock(t, f, serverUUID)
+			_, err := lock.Acquire(context.Background(), tc.data(t))
+			if !errors.Is(err, ErrInvalidLockData) {
+				t.Fatalf("Acquire = %v, want ErrInvalidLockData", err)
+			}
+			if nodes := f.lockNodes(testLockPath()); len(nodes) != 0 {
+				t.Fatalf("a refused advertisement still left %v in %s", nodes, testLockPath())
+			}
+		})
+	}
+}
+
+// TestAcquireLeavesALockThatNamesNoServerAlone keeps that check where it
+// belongs. The manager's lock lives at <instance>/managers/lock, where nothing
+// in the path identifies a process, so there is no address to hold a
+// descriptor to — and inventing one from the last two segments would refuse
+// every lock that is not a tablet server's.
+func TestAcquireLeavesALockThatNamesNoServerAlone(t *testing.T) {
+	f := newFakeZK()
+	managerPath := testInstancePath + "/managers/lock"
+	lock, err := NewServiceLock(f, ServiceLockOptions{Path: managerPath, UUID: managerUUID})
+	if err != nil {
+		t.Fatalf("NewServiceLock: %v", err)
+	}
+	// The package names constants for the services a tablet server publishes;
+	// MANAGER is one Accumulo knows and this process does not announce, which
+	// is the point of the case.
+	data := ServiceLockData{Descriptors: []ServiceDescriptor{{
+		UUID:    managerUUID,
+		Service: ThriftService("MANAGER"),
+		Address: "shoal-manager.example:9999",
+		Group:   testGroup,
+	}}}
+	if _, err := lock.Acquire(context.Background(), data); err != nil {
+		t.Fatalf("Acquire on a lock that names no server: %v", err)
+	}
+	if nodes := f.lockNodes(managerPath); len(nodes) != 1 {
+		t.Fatalf("lock nodes in %s = %v, want the one just created", managerPath, nodes)
+	}
+}
+
 // TestMaintainFailsClosedWhenTheLockCannotBeWatched is the equivalent of
 // Accumulo's LockWatcher.unableToMonitorLockNode, where the Java tablet server
 // halts. A lock this process cannot watch is one it cannot prove it still
