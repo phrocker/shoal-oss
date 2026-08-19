@@ -24,6 +24,11 @@ STATUSES = {
 
 NOT_REQUIRED_STATUS = "Not required (rationale required)"
 INTENTIONAL_DIVERGENCE_STATUS = "Intentional divergence (approval required)"
+# Revision of the independently audited inventory pinned below. A document
+# revision bump cannot land without updating this constant, because the
+# expected document-status snippet and the narrative phrasing are derived from
+# it.
+EXPECTED_REVISION = 16
 EXPECTED_TOTAL_ROWS = 3203
 EXPECTED_REQUIRED_ROWS = 2811
 
@@ -189,9 +194,22 @@ EXPECTED_METADATA_FIELDS = {
 
 EXPECTED_DOCUMENT_STATUS_SNIPPETS = (
     "Normative gate. Binding on all Sharkbite-compatibility work.",
-    "Revision 16 — applies the fifteenth independent audit",
+    f"Revision {EXPECTED_REVISION} — applies the fifteenth independent audit",
     "Revision 15 applied the fourteenth audit",
     "Revision 9 applied the eighth audit",
+)
+
+# Every pin above describes one audited revision. Changing the inventory is
+# therefore an explicit, reviewable edit of this file: the revision number, the
+# totals, the per-status counts and the per-section counts must move together,
+# in the same commit as the document change and the audit that justifies it.
+INVENTORY_CHANGE_HINT = (
+    "the audited inventory is pinned in docs/validate_sharkbite_matrix.py; an intentional "
+    "inventory revision must update EXPECTED_REVISION, EXPECTED_TOTAL_ROWS, "
+    "EXPECTED_REQUIRED_ROWS, EXPECTED_STATUS_COUNTS, EXPECTED_PREFIX_TOTALS, "
+    "EXPECTED_PREFIX_COUNTS and the row-id manifest "
+    "docs/sharkbite-compatibility-revision16-row-ids.txt in the same commit, together with the "
+    "audit evidence that justifies the new inventory"
 )
 
 CATEGORY_STATUS_COLUMNS = {
@@ -326,8 +344,44 @@ def split_matrix_cells(line: str) -> list[str]:
     return [part.strip() for part in line.split("|")[1:-1]]
 
 
+def separator_cell_problem(cell: str) -> str | None:
+    if not cell:
+        return "empty separator cell"
+    if not re.fullmatch(r":?-{3,}:?", cell):
+        return f"invalid separator cell {cell!r} (expected ---, :---, ---: or :---:)"
+    return None
+
+
 def is_markdown_separator_row(cells: list[str]) -> bool:
-    return bool(cells) and all(re.fullmatch(r":?-{3,}:?", cell) for cell in cells)
+    return bool(cells) and all(separator_cell_problem(cell) is None for cell in cells)
+
+
+def require_matrix_separator(line: str | None, expected_cells: int, header_line_number: int) -> None:
+    context = f"the matrix table header on line {header_line_number}"
+    cells = split_matrix_cells(line) if line is not None and line.startswith("|") else []
+    require(
+        any(separator_cell_problem(cell) is None for cell in cells),
+        (
+            f"missing separator row after {context}"
+            + (f": found {line.strip()!r}" if line is not None else "")
+        ),
+    )
+    problems = [
+        f"column {index}: {problem}"
+        for index, problem in enumerate((separator_cell_problem(cell) for cell in cells), start=1)
+        if problem is not None
+    ]
+    require(
+        not problems,
+        f"malformed separator row after {context}: {'; '.join(problems)}",
+    )
+    require(
+        len(cells) == expected_cells,
+        (
+            f"malformed separator row after {context}: expected {expected_cells} cells, "
+            f"found {len(cells)}"
+        ),
+    )
 
 
 def parse_markdown_table(lines: list[str], heading: str) -> tuple[list[str], list[list[str]]]:
@@ -364,9 +418,13 @@ def parse_markdown_table(lines: list[str], heading: str) -> tuple[list[str], lis
     line_index = separator_index + 1
     while line_index < len(lines) and lines[line_index].startswith("|"):
         cells = split_matrix_cells(lines[line_index])
-        if is_markdown_separator_row(cells):
-            line_index += 1
-            continue
+        require(
+            not is_markdown_separator_row(cells),
+            (
+                f"unexpected extra separator row under {heading} on line "
+                f"{line_index + 1}"
+            ),
+        )
         require(
             len(cells) == len(header_cells),
             (
@@ -509,11 +567,26 @@ def row_identifier(cells: list[str], line: str) -> str:
 
 def iter_matrix_rows(lines: list[str]) -> Iterator[tuple[int, str, list[str]]]:
     current_header_cells: int | None = None
+    pending_separator: tuple[int, int] | None = None
     for line_number, line in enumerate(lines, start=1):
+        if pending_separator is not None:
+            header_line_number, header_cell_count = pending_separator
+            pending_separator = None
+            require_matrix_separator(line, header_cell_count, header_line_number)
+            continue
+        if not line.startswith("|"):
+            current_header_cells = None
+            continue
         if line.startswith("| ID |"):
             header_cells = split_matrix_cells(line)
-            current_header_cells = len(header_cells) if "Status" in header_cells else None
+            if "Status" in header_cells:
+                current_header_cells = len(header_cells)
+                pending_separator = (line_number, len(header_cells))
+            else:
+                current_header_cells = None
             continue
+        if current_header_cells is not None and is_markdown_separator_row(split_matrix_cells(line)):
+            fail(f"unexpected separator row inside a matrix table on line {line_number}")
         if not line.startswith("| SB-"):
             continue
         cells = split_matrix_cells(line)
@@ -529,6 +602,8 @@ def iter_matrix_rows(lines: list[str]) -> Iterator[tuple[int, str, list[str]]]:
             ),
         )
         yield line_number, row_id, cells
+    if pending_separator is not None:
+        require_matrix_separator(None, pending_separator[1], pending_separator[0])
 
 
 def parse_rows(lines: list[str]) -> tuple[Counter[str], dict[str, Counter[str]], set[str]]:
@@ -588,11 +663,69 @@ def preview_row_ids(row_ids: list[str], *, limit: int = 5) -> str:
     return ", ".join(preview) + suffix
 
 
+def validate_pinned_inventory_constants() -> None:
+    require(
+        set(EXPECTED_STATUS_COUNTS) == STATUSES,
+        f"EXPECTED_STATUS_COUNTS does not cover the six statuses: {sorted(EXPECTED_STATUS_COUNTS)}",
+    )
+    pinned_status_total = sum(EXPECTED_STATUS_COUNTS.values())
+    require(
+        pinned_status_total == EXPECTED_TOTAL_ROWS,
+        (
+            f"pinned per-status counts sum to {pinned_status_total}, but EXPECTED_TOTAL_ROWS is "
+            f"{EXPECTED_TOTAL_ROWS}"
+        ),
+    )
+    pinned_required = EXPECTED_TOTAL_ROWS - EXPECTED_STATUS_COUNTS[NOT_REQUIRED_STATUS]
+    require(
+        pinned_required == EXPECTED_REQUIRED_ROWS,
+        (
+            f"pinned required rows should be {pinned_required}, but EXPECTED_REQUIRED_ROWS is "
+            f"{EXPECTED_REQUIRED_ROWS}"
+        ),
+    )
+    require(
+        set(EXPECTED_PREFIX_TOTALS) == set(EXPECTED_PREFIX_COUNTS),
+        (
+            "pinned section totals and pinned section status counts describe different sections: "
+            f"{sorted(EXPECTED_PREFIX_TOTALS)} vs {sorted(EXPECTED_PREFIX_COUNTS)}"
+        ),
+    )
+    pinned_prefix_total = sum(EXPECTED_PREFIX_TOTALS.values())
+    require(
+        pinned_prefix_total == EXPECTED_TOTAL_ROWS,
+        (
+            f"pinned section totals sum to {pinned_prefix_total}, but EXPECTED_TOTAL_ROWS is "
+            f"{EXPECTED_TOTAL_ROWS}"
+        ),
+    )
+    for prefix, expected_counts in EXPECTED_PREFIX_COUNTS.items():
+        pinned_section_total = sum(expected_counts.values())
+        require(
+            pinned_section_total == EXPECTED_PREFIX_TOTALS[prefix],
+            (
+                f"pinned status counts for {prefix} sum to {pinned_section_total}, but "
+                f"EXPECTED_PREFIX_TOTALS pins {EXPECTED_PREFIX_TOTALS[prefix]}"
+            ),
+        )
+    for status in STATUSES:
+        pinned_by_section = sum(counts[status] for counts in EXPECTED_PREFIX_COUNTS.values())
+        require(
+            pinned_by_section == EXPECTED_STATUS_COUNTS[status],
+            (
+                f"pinned section counts sum to {pinned_by_section} rows for {status}, but "
+                f"EXPECTED_STATUS_COUNTS pins {EXPECTED_STATUS_COUNTS[status]}"
+            ),
+        )
+
+
 def validate_revision_16_inventory(
     row_ids: set[str],
     status_counts: Counter[str],
     prefix_counts: dict[str, Counter[str]],
 ) -> None:
+    validate_pinned_inventory_constants()
+
     expected_row_ids = set(load_expected_revision_16_row_ids())
     missing_row_ids = sorted(expected_row_ids - row_ids)
     unexpected_row_ids = sorted(row_ids - expected_row_ids)
@@ -601,21 +734,25 @@ def validate_revision_16_inventory(
         (
             "revision 16 inventory row ids changed: "
             f"missing [{preview_row_ids(missing_row_ids)}]; "
-            f"unexpected [{preview_row_ids(unexpected_row_ids)}]"
+            f"unexpected [{preview_row_ids(unexpected_row_ids)}]; "
+            f"{INVENTORY_CHANGE_HINT}"
         ),
     )
 
     total_rows = sum(status_counts.values())
     require(
         total_rows == EXPECTED_TOTAL_ROWS,
-        f"revision 16 inventory expects {EXPECTED_TOTAL_ROWS} rows, found {total_rows}",
+        (
+            f"revision {EXPECTED_REVISION} inventory expects {EXPECTED_TOTAL_ROWS} rows, found "
+            f"{total_rows}; {INVENTORY_CHANGE_HINT}"
+        ),
     )
     required_rows = total_rows - status_counts[NOT_REQUIRED_STATUS]
     require(
         required_rows == EXPECTED_REQUIRED_ROWS,
         (
-            f"revision 16 inventory expects {EXPECTED_REQUIRED_ROWS} required rows, "
-            f"found {required_rows}"
+            f"revision {EXPECTED_REVISION} inventory expects {EXPECTED_REQUIRED_ROWS} required "
+            f"rows, found {required_rows}; {INVENTORY_CHANGE_HINT}"
         ),
     )
 
@@ -623,14 +760,17 @@ def validate_revision_16_inventory(
         actual = status_counts[status]
         require(
             actual == expected,
-            f"revision 16 inventory expects {expected} rows for {status}, found {actual}",
+            (
+                f"revision {EXPECTED_REVISION} inventory expects {expected} rows for {status}, "
+                f"found {actual}; {INVENTORY_CHANGE_HINT}"
+            ),
         )
 
     require(
         set(prefix_counts) == set(EXPECTED_PREFIX_COUNTS),
         (
-            "revision 16 inventory prefixes do not match: "
-            f"{sorted(prefix_counts)} vs {sorted(EXPECTED_PREFIX_COUNTS)}"
+            f"revision {EXPECTED_REVISION} inventory prefixes do not match: "
+            f"{sorted(prefix_counts)} vs {sorted(EXPECTED_PREFIX_COUNTS)}; {INVENTORY_CHANGE_HINT}"
         ),
     )
     for prefix, expected_counts in EXPECTED_PREFIX_COUNTS.items():
@@ -638,15 +778,19 @@ def validate_revision_16_inventory(
         require(
             actual_total == EXPECTED_PREFIX_TOTALS[prefix],
             (
-                f"revision 16 inventory expects {EXPECTED_PREFIX_TOTALS[prefix]} rows for {prefix}, "
-                f"found {actual_total}"
+                f"revision {EXPECTED_REVISION} inventory expects "
+                f"{EXPECTED_PREFIX_TOTALS[prefix]} rows for {prefix}, found {actual_total}; "
+                f"{INVENTORY_CHANGE_HINT}"
             ),
         )
         for status, expected in expected_counts.items():
             actual = prefix_counts[prefix][status]
             require(
                 actual == expected,
-                f"revision 16 inventory expects {expected} rows for {prefix} / {status}, found {actual}",
+                (
+                    f"revision {EXPECTED_REVISION} inventory expects {expected} rows for "
+                    f"{prefix} / {status}, found {actual}; {INVENTORY_CHANGE_HINT}"
+                ),
             )
 
 
@@ -748,7 +892,7 @@ def validate_status_narratives(
     python_visible_behavior = status_counts["Behavior mismatch"] - prefix_counts["SB-CXX"]["Behavior mismatch"]
 
     expected_phrases = [
-        f"As of revision 16 that is {required_rows} of {total_rows} rows, and **none of them is satisfied**",
+        f"As of revision {EXPECTED_REVISION} that is {required_rows} of {total_rows} rows, and **none of them is satisfied**",
         f"{required_rows} rows are **required** by the final release gate ([§2.2](#sec-2)); the {status_counts[NOT_REQUIRED_STATUS]} `Not required` rows are excluded by construction, and {prefix_counts['SB-CXX'][NOT_REQUIRED_STATUS]} of those are the evidence-proved duplicates described in [§19.1](#sec-19-1).",
         "No row is `Covered`.",
         f"The shape of the work is visible in the {status_counts['Missing Go']} `Missing Go` rows, of which {prefix_counts['SB-CXX']['Missing Go']} are the C++ members in [§19.2](#sec-19-2) that no Shoal layer exports.",

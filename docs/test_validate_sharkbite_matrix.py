@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import redirect_stderr
 from io import StringIO
 from pathlib import Path
+from unittest import mock
 import re
 import sys
 import unittest
@@ -77,6 +78,72 @@ def make_anchor_fixture_lines(evidence: str) -> list[str]:
         "| --- | --- | --- | --- | --- | --- | --- |",
         f"| SB-FIXTURE-401 | Example | — | — | {evidence} | Missing Go | |",
     ]
+
+
+MATRIX_HEADER = "| ID | Sharkbite | Shoal Go | Shoal C ABI | Evidence | Status | Notes |"
+MATRIX_SEPARATOR = "| --- | --- | --- | --- | --- | --- | --- |"
+MATRIX_ROW = "| SB-FIXTURE-101 | — | — | — | — | Covered | fixture row |"
+
+
+def matrix_table(header: str, separator: str | None, *rows: str) -> list[str]:
+    lines = ["## Fixture heading", "", header]
+    if separator is not None:
+        lines.append(separator)
+    lines.extend(rows)
+    lines.append("")
+    return lines
+
+
+def replace_standalone_number(text: str, old: int, new: int) -> str:
+    return re.sub(rf"(?<![\d,]){old}(?![\d,])", str(new), text)
+
+
+def delete_matrix_row_consistently(text: str, row_id: str, prefix: str) -> str:
+    """Delete one `Not required` row and restate every number the document derives.
+
+    The result satisfies every internal cross-check — metadata, per-status
+    summary, per-category summary and the narrative prose — while holding one
+    row fewer than the audited inventory.
+    """
+    lines = text.splitlines()
+    kept = [line for line in lines if not line.startswith(f"| {row_id} |")]
+    assert len(kept) == len(lines) - 1, f"row {row_id} was not unique in the document"
+
+    mutated = "\n".join(kept)
+    mutated = replace_standalone_number(mutated, 3203, 3202)
+    mutated = replace_standalone_number(mutated, 392, 391)
+
+    adjusted: list[str] = []
+    for line in mutated.splitlines():
+        cells = [cell.strip() for cell in line.split("|")[1:-1]]
+        if len(cells) == 9 and cells[1] == f"`{prefix}`":
+            cells[2] = str(int(cells[2]) - 1)
+            cells[8] = str(int(cells[8]) - 1)
+            line = "| " + " | ".join(cells) + " |"
+        adjusted.append(line)
+    return "\n".join(adjusted) + "\n"
+
+
+def pinned_constants_for_deleted_not_required_row(prefix: str, row_id: str) -> dict:
+    status_counts = dict(validator.EXPECTED_STATUS_COUNTS)
+    status_counts[validator.NOT_REQUIRED_STATUS] -= 1
+    prefix_totals = dict(validator.EXPECTED_PREFIX_TOTALS)
+    prefix_totals[prefix] -= 1
+    prefix_counts = {
+        name: dict(counts) for name, counts in validator.EXPECTED_PREFIX_COUNTS.items()
+    }
+    prefix_counts[prefix][validator.NOT_REQUIRED_STATUS] -= 1
+    manifest = tuple(
+        entry for entry in validator.load_expected_revision_16_row_ids() if entry != row_id
+    )
+    return {
+        "EXPECTED_TOTAL_ROWS": validator.EXPECTED_TOTAL_ROWS - 1,
+        "EXPECTED_REQUIRED_ROWS": validator.EXPECTED_REQUIRED_ROWS,
+        "EXPECTED_STATUS_COUNTS": status_counts,
+        "EXPECTED_PREFIX_TOTALS": prefix_totals,
+        "EXPECTED_PREFIX_COUNTS": prefix_counts,
+        "load_expected_revision_16_row_ids": lambda: manifest,
+    }
 
 
 def fixture_evidence_cell(name: str) -> str:
@@ -437,6 +504,225 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
                 "`TestAlpha` (`docs/testdata/validate_sharkbite_matrix/fixture_a.go`)"
             ),
             targeted_paths={"docs/testdata/validate_sharkbite_matrix/fixture_a.go"},
+        )
+
+    # ---- pinned audited inventory ------------------------------------------
+
+    def test_pinned_inventory_constants_are_internally_consistent(self) -> None:
+        validator.validate_pinned_inventory_constants()
+        self.assertEqual(validator.EXPECTED_REVISION, 16)
+        self.assertEqual(validator.EXPECTED_TOTAL_ROWS, 3203)
+        self.assertEqual(validator.EXPECTED_REQUIRED_ROWS, 2811)
+        self.assertEqual(
+            validator.EXPECTED_STATUS_COUNTS,
+            {
+                "Covered": 0,
+                "Missing Go": 2447,
+                "Missing C ABI": 116,
+                "Behavior mismatch": 161,
+                validator.INTENTIONAL_DIVERGENCE_STATUS: 87,
+                validator.NOT_REQUIRED_STATUS: 392,
+            },
+        )
+
+    def test_pinned_inventory_constants_reject_incoherent_edit(self) -> None:
+        with mock.patch.object(validator, "EXPECTED_TOTAL_ROWS", 3202):
+            self.assert_validation_fails(
+                validator.validate_pinned_inventory_constants,
+                "pinned per-status counts sum to 3203",
+                "EXPECTED_TOTAL_ROWS is 3202",
+            )
+
+    def test_pinned_inventory_constants_reject_section_count_drift(self) -> None:
+        drifted = {
+            prefix: dict(counts) for prefix, counts in validator.EXPECTED_PREFIX_COUNTS.items()
+        }
+        drifted["SB-EMB"][validator.NOT_REQUIRED_STATUS] -= 1
+        with mock.patch.object(validator, "EXPECTED_PREFIX_COUNTS", drifted):
+            self.assert_validation_fails(
+                validator.validate_pinned_inventory_constants,
+                "pinned status counts for SB-EMB sum to 34",
+                "EXPECTED_PREFIX_TOTALS pins 35",
+            )
+
+    def test_pinned_inventory_rejects_row_deletion_with_consistent_prose(self) -> None:
+        mutated = delete_matrix_row_consistently(load_document_text(), "SB-EMB-035", "SB-EMB")
+        message = self.assert_validation_fails(
+            lambda: validator.validate_counts(mutated.splitlines(), mutated),
+            "revision 16 inventory row ids changed: missing [SB-EMB-035]",
+        )
+        self.assertIn("must update EXPECTED_REVISION", message)
+        self.assertIn("row-id manifest", message)
+
+    def test_pinned_counts_reject_row_deletion_when_the_manifest_is_relaxed(self) -> None:
+        mutated = delete_matrix_row_consistently(load_document_text(), "SB-EMB-035", "SB-EMB")
+        manifest = tuple(
+            entry
+            for entry in validator.load_expected_revision_16_row_ids()
+            if entry != "SB-EMB-035"
+        )
+        with mock.patch.object(
+            validator, "load_expected_revision_16_row_ids", lambda: manifest
+        ):
+            self.assert_validation_fails(
+                lambda: validator.validate_counts(mutated.splitlines(), mutated),
+                "revision 16 inventory expects 3203 rows, found 3202",
+            )
+
+    def test_row_deletion_with_consistent_prose_satisfies_only_internal_cross_checks(self) -> None:
+        mutated = delete_matrix_row_consistently(load_document_text(), "SB-EMB-035", "SB-EMB")
+        with mock.patch.multiple(
+            validator,
+            **pinned_constants_for_deleted_not_required_row("SB-EMB", "SB-EMB-035"),
+        ):
+            validator.validate_counts(mutated.splitlines(), mutated)
+
+    def test_pinned_inventory_rejects_section_total_shift(self) -> None:
+        status_counts, prefix_counts, row_ids = validator.parse_rows(
+            load_document_text().splitlines()
+        )
+        shifted = {prefix: counts.copy() for prefix, counts in prefix_counts.items()}
+        shifted["SB-EMB"]["Missing Go"] += 1
+        shifted["SB-XCUT"]["Missing Go"] -= 1
+        self.assert_validation_fails(
+            lambda: validator.validate_revision_16_inventory(row_ids, status_counts, shifted),
+            "revision 16 inventory expects 35 rows for SB-EMB, found 36",
+        )
+
+    def test_pinned_inventory_rejects_status_reclassification(self) -> None:
+        status_counts, prefix_counts, row_ids = validator.parse_rows(
+            load_document_text().splitlines()
+        )
+        reclassified = status_counts.copy()
+        reclassified["Missing Go"] -= 1
+        reclassified["Covered"] += 1
+        self.assert_validation_fails(
+            lambda: validator.validate_revision_16_inventory(
+                row_ids, reclassified, prefix_counts
+            ),
+            "revision 16 inventory expects 0 rows for Covered, found 1",
+        )
+
+    def test_declared_count_edit_still_fails_internal_cross_check(self) -> None:
+        text = load_document_text()
+        mutated = replace_pattern_once(
+            text, re.escape("| Missing Go | 2447 |"), "| Missing Go | 2446 |"
+        )
+        self.assert_validation_fails(
+            lambda: validator.validate_counts(mutated.splitlines(), mutated),
+            "status summary says 2446 rows for Missing Go, but parsed 2447",
+        )
+
+    def test_revision_bump_requires_validator_constant_update(self) -> None:
+        text = load_document_text()
+        mutated = text.replace(
+            f"Revision {validator.EXPECTED_REVISION} — applies the fifteenth independent audit",
+            f"Revision {validator.EXPECTED_REVISION + 1} — applies the sixteenth independent audit",
+        ).replace(
+            f"As of revision {validator.EXPECTED_REVISION} that is",
+            f"As of revision {validator.EXPECTED_REVISION + 1} that is",
+        )
+        self.assertNotEqual(mutated, text)
+        self.assert_validation_fails(
+            lambda: validator.validate_counts(mutated.splitlines(), mutated),
+            "document status is missing expected detail: Revision 16 — applies the fifteenth",
+        )
+
+    # ---- matrix table separators -------------------------------------------
+
+    def test_parse_rows_accepts_matrix_table_with_separator(self) -> None:
+        status_counts, prefix_counts, row_ids = validator.parse_rows(
+            matrix_table(MATRIX_HEADER, MATRIX_SEPARATOR, MATRIX_ROW)
+        )
+        self.assertEqual(row_ids, {"SB-FIXTURE-101"})
+        self.assertEqual(status_counts["Covered"], 1)
+        self.assertEqual(prefix_counts["SB-FIXTURE"]["Covered"], 1)
+
+    def test_parse_rows_requires_separator_after_matrix_header(self) -> None:
+        self.assert_validation_fails(
+            lambda: validator.parse_rows(matrix_table(MATRIX_HEADER, None, MATRIX_ROW)),
+            "missing separator row after the matrix table header on line 3",
+        )
+
+    def test_parse_rows_requires_separator_when_matrix_header_ends_the_document(self) -> None:
+        self.assert_validation_fails(
+            lambda: validator.parse_rows([MATRIX_HEADER]),
+            "missing separator row after the matrix table header on line 1",
+        )
+
+    def test_parse_rows_rejects_malformed_separator_after_matrix_header(self) -> None:
+        self.assert_validation_fails(
+            lambda: validator.parse_rows(
+                matrix_table(
+                    MATRIX_HEADER,
+                    "| --- | --- | -- | --- | --- | --- | --- |",
+                    MATRIX_ROW,
+                )
+            ),
+            "malformed separator row after the matrix table header on line 3",
+            "column 3: invalid separator cell '--'",
+        )
+
+    def test_parse_rows_rejects_wrong_width_separator_after_matrix_header(self) -> None:
+        self.assert_validation_fails(
+            lambda: validator.parse_rows(
+                matrix_table(MATRIX_HEADER, "| --- | --- | --- |", MATRIX_ROW)
+            ),
+            "malformed separator row after the matrix table header on line 3",
+            "expected 7 cells, found 3",
+        )
+
+    def test_parse_rows_rejects_separator_inside_matrix_table(self) -> None:
+        self.assert_validation_fails(
+            lambda: validator.parse_rows(
+                matrix_table(MATRIX_HEADER, MATRIX_SEPARATOR, MATRIX_ROW, MATRIX_SEPARATOR)
+            ),
+            "unexpected separator row inside a matrix table on line 6",
+        )
+
+    def test_matrix_rows_are_scoped_to_their_own_table(self) -> None:
+        _status_counts, _prefix_counts, row_ids = validator.parse_rows(
+            [
+                MATRIX_HEADER,
+                MATRIX_SEPARATOR,
+                MATRIX_ROW,
+                "",
+                "| Other | Table |",
+                "| --- | --- |",
+                "| value | value |",
+            ]
+        )
+        self.assertEqual(row_ids, {"SB-FIXTURE-101"})
+
+    def test_parse_markdown_table_accepts_alignment_separators(self) -> None:
+        headers, rows = validator.parse_markdown_table(
+            [
+                "## Example heading",
+                "",
+                "| Field | Value | Extra |",
+                "| :--- | ---: | :---: |",
+                "| Alpha | Beta | Gamma |",
+            ],
+            "## Example heading",
+        )
+        self.assertEqual(headers, ["Field", "Value", "Extra"])
+        self.assertEqual(rows, [["Alpha", "Beta", "Gamma"]])
+
+    def test_parse_markdown_table_rejects_extra_separator_row(self) -> None:
+        self.assert_validation_fails(
+            lambda: validator.parse_markdown_table(
+                [
+                    "## Example heading",
+                    "",
+                    "| Field | Value |",
+                    "| --- | --- |",
+                    "| Alpha | Beta |",
+                    "| --- | --- |",
+                    "| Gamma | Delta |",
+                ],
+                "## Example heading",
+            ),
+            "unexpected extra separator row under ## Example heading on line 6",
         )
 
 
