@@ -291,6 +291,9 @@ int main(void) {
   uint8_t start_cq[] = {'c', 'q'};
   uint8_t start_cv[] = {'v'};
   uint8_t end_row[] = {'t', '\0', 'r'};
+  uint8_t end_cf[] = {'e', 'f'};
+  uint8_t end_cq[] = {'e', 'q'};
+  uint8_t end_cv[] = {'e', 'v'};
   shoal_range descriptor_range;
   shoal_range_init(&descriptor_range);
   descriptor_range.start.kind = SHOAL_RANGE_BOUND_KEY;
@@ -305,6 +308,12 @@ int main(void) {
   descriptor_range.start.key.timestamp = 17;
   descriptor_range.end.kind = SHOAL_RANGE_BOUND_KEY;
   descriptor_range.end.key.row = (shoal_bytes){end_row, sizeof(end_row)};
+  descriptor_range.end.key.column_family =
+      (shoal_bytes){end_cf, sizeof(end_cf)};
+  descriptor_range.end.key.column_qualifier =
+      (shoal_bytes){end_cq, sizeof(end_cq)};
+  descriptor_range.end.key.column_visibility =
+      (shoal_bytes){end_cv, sizeof(end_cv)};
   descriptor_range.end.key.timestamp = 23;
   descriptor_range.start_inclusive = 1;
   descriptor_range.end_inclusive = 0;
@@ -317,7 +326,12 @@ int main(void) {
   assert(range_result != NULL && error == NULL);
   memset(start_row, 'x', sizeof(start_row));
   memset(start_cf, 'x', sizeof(start_cf));
+  memset(start_cq, 'x', sizeof(start_cq));
+  memset(start_cv, 'x', sizeof(start_cv));
   memset(end_row, 'x', sizeof(end_row));
+  memset(end_cf, 'x', sizeof(end_cf));
+  memset(end_cq, 'x', sizeof(end_cq));
+  memset(end_cv, 'x', sizeof(end_cv));
   shoal_range_view range_view;
   memset(&range_view, 0, sizeof(range_view));
   expect_error(shoal_range_get(range_result, &range_view, &error),
@@ -326,7 +340,13 @@ int main(void) {
   assert(shoal_range_get(range_result, &range_view, &error) ==
          SHOAL_STATUS_OK);
   static const uint8_t expected_start_row[] = {'s', '\0', 'r'};
+  static const uint8_t expected_start_cf[] = {'c', 'f'};
+  static const uint8_t expected_start_cq[] = {'c', 'q'};
+  static const uint8_t expected_start_cv[] = {'v'};
   static const uint8_t expected_end_row[] = {'t', '\0', 'r'};
+  static const uint8_t expected_end_cf[] = {'e', 'f'};
+  static const uint8_t expected_end_cq[] = {'e', 'q'};
+  static const uint8_t expected_end_cv[] = {'e', 'v'};
   assert(range_view.has_start_key == 1 && range_view.has_end_key == 1);
   assert(range_view.start_kind == SHOAL_RANGE_BOUND_KEY &&
          range_view.end_kind == SHOAL_RANGE_BOUND_KEY);
@@ -334,10 +354,31 @@ int main(void) {
   assert(range_view.start_key.row.length == sizeof(expected_start_row));
   assert(memcmp(range_view.start_key.row.data, expected_start_row,
                 sizeof(expected_start_row)) == 0);
+  assert(range_view.start_key.column_family.length ==
+         sizeof(expected_start_cf));
+  assert(memcmp(range_view.start_key.column_family.data, expected_start_cf,
+                sizeof(expected_start_cf)) == 0);
+  assert(range_view.start_key.column_qualifier.length ==
+         sizeof(expected_start_cq));
+  assert(memcmp(range_view.start_key.column_qualifier.data, expected_start_cq,
+                sizeof(expected_start_cq)) == 0);
+  assert(range_view.start_key.column_visibility.length ==
+         sizeof(expected_start_cv));
+  assert(memcmp(range_view.start_key.column_visibility.data, expected_start_cv,
+                sizeof(expected_start_cv)) == 0);
   assert(range_view.start_key.timestamp == 17);
   assert(range_view.end_key.row.length == sizeof(expected_end_row));
   assert(memcmp(range_view.end_key.row.data, expected_end_row,
                 sizeof(expected_end_row)) == 0);
+  assert(range_view.end_key.column_family.length == sizeof(expected_end_cf));
+  assert(memcmp(range_view.end_key.column_family.data, expected_end_cf,
+                sizeof(expected_end_cf)) == 0);
+  assert(range_view.end_key.column_qualifier.length == sizeof(expected_end_cq));
+  assert(memcmp(range_view.end_key.column_qualifier.data, expected_end_cq,
+                sizeof(expected_end_cq)) == 0);
+  assert(range_view.end_key.column_visibility.length == sizeof(expected_end_cv));
+  assert(memcmp(range_view.end_key.column_visibility.data, expected_end_cv,
+                sizeof(expected_end_cv)) == 0);
   assert(range_view.end_key.timestamp == 23);
   struct {
     shoal_range_view view;

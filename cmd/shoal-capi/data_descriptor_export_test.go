@@ -17,7 +17,13 @@ func TestOwnedDataDescriptorConstructionIsConcurrent(t *testing.T) {
 		ColumnVisibility: []byte("A&B"),
 		Timestamp:        17,
 	}
-	end := &accumulo.Key{Row: []byte{'t', 0, 'r'}, Timestamp: 23}
+	end := &accumulo.Key{
+		Row:              []byte{'t', 0, 'r'},
+		ColumnFamily:     []byte("ef"),
+		ColumnQualifier:  []byte("eq"),
+		ColumnVisibility: []byte("C|D"),
+		Timestamp:        23,
+	}
 	scanRange, err := accumulo.NewKeyRange(start, true, end, false)
 	if err != nil {
 		t.Fatal(err)
@@ -52,7 +58,15 @@ func TestOwnedDataDescriptorConstructionIsConcurrent(t *testing.T) {
 				!rangeSnapshot.hasStart || !rangeSnapshot.hasEnd ||
 				!rangeSnapshot.startInclusive || rangeSnapshot.endInclusive ||
 				!bytes.Equal(rangeSnapshot.start.Row, start.Row) ||
-				!bytes.Equal(rangeSnapshot.end.Row, end.Row) {
+				!bytes.Equal(rangeSnapshot.start.ColumnFamily, start.ColumnFamily) ||
+				!bytes.Equal(rangeSnapshot.start.ColumnQualifier, start.ColumnQualifier) ||
+				!bytes.Equal(rangeSnapshot.start.ColumnVisibility, start.ColumnVisibility) ||
+				rangeSnapshot.start.Timestamp != start.Timestamp ||
+				!bytes.Equal(rangeSnapshot.end.Row, end.Row) ||
+				!bytes.Equal(rangeSnapshot.end.ColumnFamily, end.ColumnFamily) ||
+				!bytes.Equal(rangeSnapshot.end.ColumnQualifier, end.ColumnQualifier) ||
+				!bytes.Equal(rangeSnapshot.end.ColumnVisibility, end.ColumnVisibility) ||
+				rangeSnapshot.end.Timestamp != end.Timestamp {
 				errors <- fmt.Errorf("unexpected range snapshot: %#v", rangeSnapshot)
 				return
 			}
