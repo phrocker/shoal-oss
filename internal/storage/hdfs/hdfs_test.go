@@ -267,6 +267,43 @@ func TestBackendNotFoundSemantics(t *testing.T) {
 	}
 }
 
+func TestBackendRemoveUsesCallerContextForSharedClient(t *testing.T) {
+	client := newFakeClient()
+	client.files["/tables/1.rf"] = []byte("old")
+	client.removeContextHook = func(ctx context.Context, name string) error {
+		if name == "/tables/1.rf" {
+			<-ctx.Done()
+			return ctx.Err()
+		}
+		return nil
+	}
+	backend, err := New("nn:8020", WithClient(client))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	err = backend.Remove(ctx, "/tables/1.rf")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Remove error = %v, want context deadline exceeded", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("Remove took %v; caller context did not bound shared-client removal", elapsed)
+	}
+	if client.lastRemoveDeadline.IsZero() {
+		t.Fatal("Remove did not pass a context deadline to RemoveContext")
+	}
+	if !slices.Contains(client.removeContextCalls, "/tables/1.rf") {
+		t.Fatalf("RemoveContext calls = %v, want /tables/1.rf", client.removeContextCalls)
+	}
+	if got := string(client.files["/tables/1.rf"]); got != "old" {
+		t.Fatalf("target contents = %q, want unchanged file after timed-out removal", got)
+	}
+}
+
 func TestBackendRejectsDifferentAuthority(t *testing.T) {
 	backend, err := New("nn1:8020", WithClient(newFakeClient()))
 	if err != nil {
@@ -1309,6 +1346,9 @@ func TestBackendCloseUsesOperationContextForBackupRemovalRollback(t *testing.T) 
 	}
 	if !client.lastRenameDeadline.After(client.lastRemoveDeadline) {
 		t.Fatalf("rollback deadline = %v, want later than backup remove deadline %v", client.lastRenameDeadline, client.lastRemoveDeadline)
+	}
+	if len(client.removeContextCalls) != 1 || !strings.Contains(client.removeContextCalls[0], ".shoal-backup-") {
+		t.Fatalf("RemoveContext calls = %v, want single backup removal via context-aware delete", client.removeContextCalls)
 	}
 	if got := string(client.files["/tables/1.rf"]); got != "old" {
 		t.Fatalf("target contents = %q, want rollback to restore old data", got)

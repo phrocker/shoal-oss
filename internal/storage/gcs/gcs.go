@@ -23,8 +23,10 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"time"
 
 	"cloud.google.com/go/storage"
+	"github.com/google/uuid"
 	"google.golang.org/api/iterator"
 	"google.golang.org/api/option"
 
@@ -34,7 +36,8 @@ import (
 // Backend opens GCS objects via a shared *storage.Client. Safe for
 // concurrent Open and concurrent ReadAt across many Files.
 type Backend struct {
-	client *storage.Client
+	client        *storage.Client
+	bucketFactory func(string) bucketHandle
 }
 
 // Option customizes Backend construction. Use WithClient if you've
@@ -75,7 +78,12 @@ func New(ctx context.Context, opts ...Option) (*Backend, error) {
 		}
 		cfg.client = c
 	}
-	return &Backend{client: cfg.client}, nil
+	return &Backend{
+		client: cfg.client,
+		bucketFactory: func(name string) bucketHandle {
+			return storageBucketHandle{bucket: cfg.client.Bucket(name)}
+		},
+	}, nil
 }
 
 // Close releases the underlying GCS client. Idempotent.
@@ -116,13 +124,36 @@ func (b *Backend) Open(ctx context.Context, path string) (shstorage.File, error)
 	}, nil
 }
 
-// Create opens a GCS object writer. The object is visible after Close.
+// Create stages writes through a temporary GCS object and promotes it into the
+// destination on Close. An unsuccessful Close preserves any pre-existing
+// destination object.
 func (b *Backend) Create(ctx context.Context, path string) (shstorage.Writer, error) {
 	bucket, object, err := ParsePath(path)
 	if err != nil {
 		return nil, err
 	}
-	return &writer{inner: b.client.Bucket(bucket).Object(object).NewWriter(ctx)}, nil
+	ctx = contextOrBackground(ctx)
+	bucketHandle := b.bucket(bucket)
+	target := bucketHandle.Object(object)
+	targetConditions, err := loadPromotionConditions(ctx, target)
+	if err != nil {
+		return nil, fmt.Errorf("gcs: inspect destination gs://%s/%s: %w", bucket, object, err)
+	}
+
+	writeCtx, cancel := context.WithCancel(ctx)
+	tempObject := object + ".shoal-tmp-" + uuid.NewString()
+	temp := bucketHandle.Object(tempObject)
+	return &writer{
+		ctx:                ctx,
+		cancel:             cancel,
+		inner:              temp.NewWriter(writeCtx),
+		target:             target,
+		targetPath:         "gs://" + bucket + "/" + object,
+		targetConditions:   targetConditions,
+		temp:               temp,
+		tempPath:           "gs://" + bucket + "/" + tempObject,
+		tempCleanupTimeout: tempCleanupTimeout,
+	}, nil
 }
 
 // List returns objects directly under prefix. The prefix may be gs://bucket/dir
@@ -228,35 +259,73 @@ type objectWriter interface {
 	Write([]byte) (int, error)
 	Close() error
 	CloseWithError(error) error
+	Attrs() *storage.ObjectAttrs
 }
 
 type writer struct {
-	inner   objectWriter
-	closed  bool
-	aborted bool
+	ctx                context.Context
+	cancel             context.CancelFunc
+	inner              objectWriter
+	target             objectHandle
+	targetPath         string
+	targetConditions   storage.Conditions
+	temp               objectHandle
+	tempPath           string
+	tempGeneration     int64
+	tempClosed         bool
+	tempCleanupTimeout time.Duration
+	closed             bool
+	abortRequested     bool
+	aborted            bool
 }
 
 func (w *writer) Write(p []byte) (int, error) {
-	if w.aborted {
+	if w.abortRequested {
 		return 0, fmt.Errorf("gcs: writer already aborted")
 	}
-	if w.closed {
+	if w.closed || w.tempClosed {
 		return 0, fmt.Errorf("gcs: writer already closed")
 	}
 	return w.inner.Write(p)
 }
 
 func (w *writer) Close() error {
-	if w.aborted {
+	if w.abortRequested {
 		return fmt.Errorf("gcs: writer already aborted")
 	}
 	if w.closed {
 		return nil
 	}
-	if err := w.inner.Close(); err != nil {
-		return fmt.Errorf("gcs: close writer: %w", err)
+	if !w.tempClosed {
+		w.tempClosed = true
+		if err := w.inner.Close(); err != nil {
+			w.stopWriter()
+			return errors.Join(
+				fmt.Errorf("gcs: close temporary object %s: %w", w.tempPath, err),
+				w.cleanupTempObject(),
+			)
+		}
+		attrs := w.inner.Attrs()
+		if attrs == nil || attrs.Generation == 0 {
+			w.stopWriter()
+			return errors.Join(
+				fmt.Errorf("gcs: close temporary object %s: missing generation after successful close", w.tempPath),
+				w.cleanupTempObject(),
+			)
+		}
+		w.tempGeneration = attrs.Generation
+	}
+
+	if w.tempGeneration == 0 {
+		return fmt.Errorf("gcs: temporary object %s is not promotable", w.tempPath)
+	}
+	if err := w.promoteTempObject(); err != nil {
+		w.stopWriter()
+		return errors.Join(err, w.cleanupTempObject())
 	}
 	w.closed = true
+	w.stopWriter()
+	w.cleanupTempObjectBestEffort()
 	return nil
 }
 
@@ -267,9 +336,152 @@ func (w *writer) Abort() error {
 	if w.closed {
 		return fmt.Errorf("gcs: writer already closed")
 	}
+	w.abortRequested = true
+
+	var abortErr error
+	if !w.tempClosed {
+		w.tempClosed = true
+		if err := w.inner.CloseWithError(errors.New("gcs: write aborted")); err != nil {
+			abortErr = fmt.Errorf("gcs: abort temporary object %s: %w", w.tempPath, err)
+		}
+	}
+	w.stopWriter()
+	if cleanupErr := w.cleanupTempObject(); cleanupErr != nil {
+		abortErr = errors.Join(abortErr, cleanupErr)
+	}
+	if abortErr != nil {
+		return abortErr
+	}
 	w.aborted = true
-	if err := w.inner.CloseWithError(errors.New("gcs: write aborted")); err != nil {
-		return fmt.Errorf("gcs: abort writer: %w", err)
+	return nil
+}
+
+type bucketHandle interface {
+	Object(name string) objectHandle
+}
+
+type objectHandle interface {
+	NewWriter(context.Context) objectWriter
+	Attrs(context.Context) (*storage.ObjectAttrs, error)
+	If(storage.Conditions) objectHandle
+	Generation(int64) objectHandle
+	CopierFrom(objectHandle) objectCopier
+	Delete(context.Context) error
+}
+
+type objectCopier interface {
+	Run(context.Context) (*storage.ObjectAttrs, error)
+}
+
+type storageBucketHandle struct {
+	bucket *storage.BucketHandle
+}
+
+func (b storageBucketHandle) Object(name string) objectHandle {
+	return storageObjectHandle{object: b.bucket.Object(name)}
+}
+
+type storageObjectHandle struct {
+	object *storage.ObjectHandle
+}
+
+func (o storageObjectHandle) NewWriter(ctx context.Context) objectWriter {
+	return o.object.NewWriter(ctx)
+}
+
+func (o storageObjectHandle) Attrs(ctx context.Context) (*storage.ObjectAttrs, error) {
+	return o.object.Attrs(ctx)
+}
+
+func (o storageObjectHandle) If(conds storage.Conditions) objectHandle {
+	return storageObjectHandle{object: o.object.If(conds)}
+}
+
+func (o storageObjectHandle) Generation(generation int64) objectHandle {
+	return storageObjectHandle{object: o.object.Generation(generation)}
+}
+
+func (o storageObjectHandle) CopierFrom(src objectHandle) objectCopier {
+	source, ok := src.(storageObjectHandle)
+	if !ok {
+		panic(fmt.Sprintf("gcs: unsupported storage object source type %T", src))
+	}
+	return storageObjectCopier{copier: o.object.CopierFrom(source.object)}
+}
+
+func (o storageObjectHandle) Delete(ctx context.Context) error {
+	return o.object.Delete(ctx)
+}
+
+type storageObjectCopier struct {
+	copier *storage.Copier
+}
+
+func (c storageObjectCopier) Run(ctx context.Context) (*storage.ObjectAttrs, error) {
+	return c.copier.Run(ctx)
+}
+
+var tempCleanupTimeout = 10 * time.Second
+
+func (b *Backend) bucket(name string) bucketHandle {
+	if b.bucketFactory != nil {
+		return b.bucketFactory(name)
+	}
+	return storageBucketHandle{bucket: b.client.Bucket(name)}
+}
+
+func loadPromotionConditions(ctx context.Context, target objectHandle) (storage.Conditions, error) {
+	attrs, err := target.Attrs(ctx)
+	if errors.Is(err, storage.ErrObjectNotExist) {
+		return storage.Conditions{DoesNotExist: true}, nil
+	}
+	if err != nil {
+		return storage.Conditions{}, err
+	}
+	return storage.Conditions{GenerationMatch: attrs.Generation}, nil
+}
+
+func contextOrBackground(ctx context.Context) context.Context {
+	if ctx == nil {
+		return context.Background()
+	}
+	return ctx
+}
+
+func (w *writer) stopWriter() {
+	if w.cancel != nil {
+		w.cancel()
+		w.cancel = nil
+	}
+}
+
+func (w *writer) promoteTempObject() error {
+	_, err := w.target.
+		If(w.targetConditions).
+		CopierFrom(w.temp.Generation(w.tempGeneration)).
+		Run(w.ctx)
+	if err != nil {
+		return fmt.Errorf("gcs: promote temporary object %s to %s: %w", w.tempPath, w.targetPath, err)
 	}
 	return nil
+}
+
+func (w *writer) cleanupTempObject() error {
+	cleanupCtx, cancel := context.WithTimeout(context.Background(), w.tempCleanupTimeout)
+	defer cancel()
+	if err := w.tempForCleanup().Delete(cleanupCtx); err != nil && !errors.Is(err, storage.ErrObjectNotExist) {
+		return fmt.Errorf("gcs: remove temporary object %s: %w", w.tempPath, err)
+	}
+	return nil
+}
+
+func (w *writer) cleanupTempObjectBestEffort() {
+	_ = w.cleanupTempObject()
+}
+
+func (w *writer) tempForCleanup() objectHandle {
+	if w.tempGeneration != 0 {
+		return w.temp.Generation(w.tempGeneration)
+	}
+	return w.temp
 }

@@ -11,11 +11,28 @@ import (
 )
 
 func preservePlatformXattrs(temp, target string) error {
-	names, err := listXattrs(target)
+	targetNames, err := listXattrs(target)
 	if err != nil {
 		return fmt.Errorf("local: list extended attributes for %s: %w", target, err)
 	}
-	for _, name := range names {
+	tempNames, err := listXattrs(temp)
+	if err != nil {
+		return fmt.Errorf("local: list extended attributes for %s: %w", temp, err)
+	}
+
+	targetSet := make(map[string]struct{}, len(targetNames))
+	for _, name := range targetNames {
+		targetSet[name] = struct{}{}
+	}
+	for _, name := range tempNames {
+		if _, ok := targetSet[name]; ok {
+			continue
+		}
+		if err := removeXattr(temp, name); err != nil {
+			return fmt.Errorf("local: remove inherited extended attribute %s from %s: %w", name, temp, err)
+		}
+	}
+	for _, name := range targetNames {
 		value, err := getXattr(target, name)
 		if err != nil {
 			return fmt.Errorf("local: read extended attribute %s for %s: %w", name, target, err)
@@ -60,6 +77,16 @@ func getXattr(path, name string) ([]byte, error) {
 		return nil, err
 	}
 	return buf[:n], nil
+}
+
+func removeXattr(path, name string) error {
+	if err := unix.Removexattr(path, name); err != nil {
+		if isMissingXattr(err) {
+			return nil
+		}
+		return err
+	}
+	return nil
 }
 
 func splitXattrNames(raw []byte) []string {

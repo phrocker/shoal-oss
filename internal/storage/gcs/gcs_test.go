@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	cloudstorage "cloud.google.com/go/storage"
 	shstorage "github.com/phrocker/shoal/internal/storage"
 )
 
@@ -49,8 +50,13 @@ func TestParsePath(t *testing.T) {
 }
 
 func TestWriter_AbortUsesCloseWithErrorAndRejectsLaterUse(t *testing.T) {
-	inner := &recordingObjectWriter{}
-	w := &writer{inner: inner}
+	backend, bucket := newFakeBackend()
+	w, err := backend.Create(context.Background(), "bucket/path/to/object.rf")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	gcsWriter := w.(*writer)
+	inner := gcsWriter.inner.(*fakeObjectWriter)
 
 	if _, err := w.Write([]byte("hello gcs")); err != nil {
 		t.Fatalf("Write: %v", err)
@@ -59,7 +65,7 @@ func TestWriter_AbortUsesCloseWithErrorAndRejectsLaterUse(t *testing.T) {
 		t.Fatalf("inner wrote %q, want %q", got, "hello gcs")
 	}
 
-	if err := w.Abort(); err != nil {
+	if err := w.(shstorage.Aborter).Abort(); err != nil {
 		t.Fatalf("Abort: %v", err)
 	}
 	if inner.closeCalls != 0 {
@@ -71,8 +77,14 @@ func TestWriter_AbortUsesCloseWithErrorAndRejectsLaterUse(t *testing.T) {
 	if inner.closeWithErrorArg == nil || !strings.Contains(inner.closeWithErrorArg.Error(), "gcs: write aborted") {
 		t.Fatalf("CloseWithError arg = %v, want gcs abort error", inner.closeWithErrorArg)
 	}
+	if _, ok := bucket.objects["path/to/object.rf"]; ok {
+		t.Fatal("Abort published the destination object")
+	}
+	if _, ok := bucket.objects[gcsWriter.temp.(*fakeObject).name]; ok {
+		t.Fatal("Abort left the temporary object behind")
+	}
 
-	if err := w.Abort(); err != nil {
+	if err := w.(shstorage.Aborter).Abort(); err != nil {
 		t.Fatalf("second Abort: %v", err)
 	}
 	if inner.closeWithErrorCalls != 1 {
@@ -93,6 +105,174 @@ func TestWriter_WriteAfterCloseReportsClosedState(t *testing.T) {
 	w := &writer{closed: true}
 	if _, err := w.Write([]byte("late")); err == nil || !strings.Contains(err.Error(), "closed") {
 		t.Fatalf("Write after Close error = %v, want closed state", err)
+	}
+}
+
+func TestWriter_CloseStagesAndPromotesObject(t *testing.T) {
+	backend, bucket := newFakeBackend()
+	bucket.putObject("path/to/object.rf", []byte("old"))
+
+	w, err := backend.Create(context.Background(), "bucket/path/to/object.rf")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	gcsWriter := w.(*writer)
+	tempName := gcsWriter.temp.(*fakeObject).name
+
+	if _, err := w.Write([]byte("new")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	got, ok := bucket.objects["path/to/object.rf"]
+	if !ok || string(got.body) != "new" {
+		t.Fatalf("destination object = %q, present=%v; want new", got.body, ok)
+	}
+	if _, ok := bucket.objects[tempName]; ok {
+		t.Fatalf("successful Close left temp object %q behind", tempName)
+	}
+	if len(bucket.copyCalls) != 1 {
+		t.Fatalf("copy calls = %v, want 1", bucket.copyCalls)
+	}
+	if cond := bucket.copyCalls[0].conditions; cond.GenerationMatch == 0 {
+		t.Fatalf("promotion conditions = %+v, want GenerationMatch", cond)
+	}
+}
+
+func TestWriter_CloseErrorPreservesExistingObjectAndCleansTemp(t *testing.T) {
+	backend, bucket := newFakeBackend()
+	bucket.putObject("path/to/object.rf", []byte("old"))
+
+	closeErr := errors.New("checksum mismatch")
+	bucket.writerPlan = func(name string) fakeWriterPlan {
+		if strings.Contains(name, ".shoal-tmp-") {
+			return fakeWriterPlan{closeErr: closeErr, publishOnClose: true}
+		}
+		return fakeWriterPlan{}
+	}
+
+	w, err := backend.Create(context.Background(), "bucket/path/to/object.rf")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	gcsWriter := w.(*writer)
+	tempName := gcsWriter.temp.(*fakeObject).name
+
+	if _, err := w.Write([]byte("new")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	err = w.Close()
+	if !errors.Is(err, closeErr) {
+		t.Fatalf("Close error = %v, want checksum mismatch", err)
+	}
+	if got := string(bucket.objects["path/to/object.rf"].body); got != "old" {
+		t.Fatalf("destination contents = %q, want preserved old object", got)
+	}
+	if _, ok := bucket.objects[tempName]; ok {
+		t.Fatalf("Close error left temp object %q behind", tempName)
+	}
+}
+
+func TestWriter_ClosePreconditionFailurePreservesNewerTarget(t *testing.T) {
+	backend, bucket := newFakeBackend()
+	bucket.putObject("path/to/object.rf", []byte("old"))
+
+	w, err := backend.Create(context.Background(), "bucket/path/to/object.rf")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	gcsWriter := w.(*writer)
+	tempName := gcsWriter.temp.(*fakeObject).name
+
+	bucket.putObject("path/to/object.rf", []byte("newer"))
+	if _, err := w.Write([]byte("replacement")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	err = w.Close()
+	if !errors.Is(err, errFakePrecondition) {
+		t.Fatalf("Close error = %v, want precondition failure", err)
+	}
+	if got := string(bucket.objects["path/to/object.rf"].body); got != "newer" {
+		t.Fatalf("destination contents = %q, want concurrent newer object preserved", got)
+	}
+	if _, ok := bucket.objects[tempName]; ok {
+		t.Fatalf("precondition failure left temp object %q behind", tempName)
+	}
+}
+
+func TestWriter_AbortDeleteFailureAllowsRetry(t *testing.T) {
+	backend, bucket := newFakeBackend()
+
+	attempts := 0
+	deleteErr := errors.New("delete failed")
+	bucket.deleteHook = func(_ context.Context, object *fakeObject) error {
+		if strings.Contains(object.name, ".shoal-tmp-") && attempts == 0 {
+			attempts++
+			return deleteErr
+		}
+		return nil
+	}
+
+	w, err := backend.Create(context.Background(), "bucket/path/to/object.rf")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	gcsWriter := w.(*writer)
+	tempName := gcsWriter.temp.(*fakeObject).name
+
+	if _, err := w.Write([]byte("abort")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	err = w.(shstorage.Aborter).Abort()
+	if !errors.Is(err, deleteErr) {
+		t.Fatalf("Abort error = %v, want delete failure", err)
+	}
+	if _, err := w.Write([]byte("late")); err == nil || !strings.Contains(err.Error(), "aborted") {
+		t.Fatalf("Write after failed Abort error = %v, want aborted state", err)
+	}
+	if err := w.Close(); err == nil || !strings.Contains(err.Error(), "aborted") {
+		t.Fatalf("Close after failed Abort error = %v, want aborted state", err)
+	}
+	if _, ok := bucket.objects[tempName]; ok {
+		t.Fatal("failed Abort should not publish or retain a committed temp object")
+	}
+
+	if err := w.(shstorage.Aborter).Abort(); err != nil {
+		t.Fatalf("second Abort: %v", err)
+	}
+	if gcsWriter.inner.(*fakeObjectWriter).closeWithErrorCalls != 1 {
+		t.Fatalf("CloseWithError calls after retry = %d, want 1", gcsWriter.inner.(*fakeObjectWriter).closeWithErrorCalls)
+	}
+}
+
+func TestWriter_CloseSuccessIgnoresTempCleanupFailure(t *testing.T) {
+	backend, bucket := newFakeBackend()
+	cleanupErr := errors.New("cleanup failed")
+	bucket.deleteHook = func(_ context.Context, object *fakeObject) error {
+		if strings.Contains(object.name, ".shoal-tmp-") {
+			return cleanupErr
+		}
+		return nil
+	}
+
+	w, err := backend.Create(context.Background(), "bucket/path/to/object.rf")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	tempName := w.(*writer).temp.(*fakeObject).name
+	if _, err := w.Write([]byte("new")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close error = %v, want success after committed promotion", err)
+	}
+	if got := string(bucket.objects["path/to/object.rf"].body); got != "new" {
+		t.Fatalf("destination contents = %q, want new", got)
+	}
+	if _, ok := bucket.objects[tempName]; !ok {
+		t.Fatalf("cleanup failure should leave temp object %q for observation", tempName)
 	}
 }
 
@@ -199,27 +379,243 @@ func TestGCS_CloseIdempotent(t *testing.T) {
 	}
 }
 
-type recordingObjectWriter struct {
+func newFakeBackend() (*Backend, *fakeBucket) {
+	bucket := newFakeBucket()
+	return &Backend{
+		bucketFactory: func(string) bucketHandle { return bucket },
+	}, bucket
+}
+
+var errFakePrecondition = errors.New("fake gcs: precondition failed")
+
+type fakeBucket struct {
+	objects     map[string]fakeObjectData
+	nextGen     int64
+	writerPlan  func(string) fakeWriterPlan
+	deleteHook  func(context.Context, *fakeObject) error
+	copyHook    func(context.Context, *fakeObject, *fakeObject) error
+	lastWriter  *fakeObjectWriter
+	copyCalls   []fakeCopyCall
+	deleteCalls []fakeDeleteCall
+}
+
+type fakeObjectData struct {
+	body       []byte
+	generation int64
+}
+
+type fakeWriterPlan struct {
+	closeErr       error
+	publishOnClose bool
+	closeAbortErr  error
+}
+
+type fakeCopyCall struct {
+	src        string
+	dst        string
+	srcGen     int64
+	conditions cloudstorage.Conditions
+}
+
+type fakeDeleteCall struct {
+	name       string
+	generation int64
+}
+
+func newFakeBucket() *fakeBucket {
+	return &fakeBucket{
+		objects: make(map[string]fakeObjectData),
+		nextGen: 1,
+		writerPlan: func(string) fakeWriterPlan {
+			return fakeWriterPlan{}
+		},
+	}
+}
+
+func (b *fakeBucket) Object(name string) objectHandle {
+	return &fakeObject{bucket: b, name: name}
+}
+
+func (b *fakeBucket) putObject(name string, body []byte) *cloudstorage.ObjectAttrs {
+	attrs := &cloudstorage.ObjectAttrs{
+		Name:       name,
+		Generation: b.nextGen,
+		Size:       int64(len(body)),
+	}
+	b.nextGen++
+	b.objects[name] = fakeObjectData{
+		body:       append([]byte(nil), body...),
+		generation: attrs.Generation,
+	}
+	return attrs
+}
+
+func (b *fakeBucket) currentObject(name string) (fakeObjectData, bool) {
+	data, ok := b.objects[name]
+	return data, ok
+}
+
+type fakeObject struct {
+	bucket     *fakeBucket
+	name       string
+	conditions cloudstorage.Conditions
+	generation int64
+}
+
+func (o *fakeObject) NewWriter(context.Context) objectWriter {
+	plan := fakeWriterPlan{}
+	if o.bucket.writerPlan != nil {
+		plan = o.bucket.writerPlan(o.name)
+	}
+	writer := &fakeObjectWriter{
+		bucket: o.bucket,
+		name:   o.name,
+		plan:   plan,
+	}
+	o.bucket.lastWriter = writer
+	return writer
+}
+
+func (o *fakeObject) Attrs(ctx context.Context) (*cloudstorage.ObjectAttrs, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	data, ok := o.lookup()
+	if !ok {
+		return nil, cloudstorage.ErrObjectNotExist
+	}
+	return &cloudstorage.ObjectAttrs{
+		Name:       o.name,
+		Generation: data.generation,
+		Size:       int64(len(data.body)),
+	}, nil
+}
+
+func (o *fakeObject) If(conditions cloudstorage.Conditions) objectHandle {
+	clone := *o
+	clone.conditions = conditions
+	return &clone
+}
+
+func (o *fakeObject) Generation(generation int64) objectHandle {
+	clone := *o
+	clone.generation = generation
+	return &clone
+}
+
+func (o *fakeObject) CopierFrom(src objectHandle) objectCopier {
+	return &fakeObjectCopier{
+		dst: o,
+		src: src.(*fakeObject),
+	}
+}
+
+func (o *fakeObject) Delete(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	o.bucket.deleteCalls = append(o.bucket.deleteCalls, fakeDeleteCall{name: o.name, generation: o.generation})
+	if o.bucket.deleteHook != nil {
+		if err := o.bucket.deleteHook(ctx, o); err != nil {
+			return err
+		}
+	}
+	data, ok := o.lookup()
+	if !ok {
+		return cloudstorage.ErrObjectNotExist
+	}
+	if o.generation != 0 && data.generation != o.generation {
+		return cloudstorage.ErrObjectNotExist
+	}
+	delete(o.bucket.objects, o.name)
+	return nil
+}
+
+func (o *fakeObject) lookup() (fakeObjectData, bool) {
+	data, ok := o.bucket.currentObject(o.name)
+	if !ok {
+		return fakeObjectData{}, false
+	}
+	if o.generation != 0 && data.generation != o.generation {
+		return fakeObjectData{}, false
+	}
+	return data, true
+}
+
+type fakeObjectCopier struct {
+	dst *fakeObject
+	src *fakeObject
+}
+
+func (c *fakeObjectCopier) Run(ctx context.Context) (*cloudstorage.ObjectAttrs, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	c.dst.bucket.copyCalls = append(c.dst.bucket.copyCalls, fakeCopyCall{
+		src:        c.src.name,
+		dst:        c.dst.name,
+		srcGen:     c.src.generation,
+		conditions: c.dst.conditions,
+	})
+	if c.dst.bucket.copyHook != nil {
+		if err := c.dst.bucket.copyHook(ctx, c.dst, c.src); err != nil {
+			return nil, err
+		}
+	}
+	srcData, ok := c.src.lookup()
+	if !ok {
+		return nil, cloudstorage.ErrObjectNotExist
+	}
+	if err := c.dst.checkConditions(); err != nil {
+		return nil, err
+	}
+	return c.dst.bucket.putObject(c.dst.name, srcData.body), nil
+}
+
+func (o *fakeObject) checkConditions() error {
+	current, exists := o.bucket.currentObject(o.name)
+	switch {
+	case o.conditions.DoesNotExist:
+		if exists {
+			return errFakePrecondition
+		}
+	case o.conditions.GenerationMatch != 0:
+		if !exists || current.generation != o.conditions.GenerationMatch {
+			return errFakePrecondition
+		}
+	}
+	return nil
+}
+
+type fakeObjectWriter struct {
+	bucket              *fakeBucket
+	name                string
+	plan                fakeWriterPlan
 	buf                 bytes.Buffer
+	attrs               *cloudstorage.ObjectAttrs
 	closeCalls          int
 	closeWithErrorCalls int
 	closeWithErrorArg   error
 }
 
-func (w *recordingObjectWriter) Write(p []byte) (int, error) {
+func (w *fakeObjectWriter) Write(p []byte) (int, error) {
 	return w.buf.Write(p)
 }
 
-func (w *recordingObjectWriter) Close() error {
+func (w *fakeObjectWriter) Close() error {
 	w.closeCalls++
-	return nil
+	if w.plan.publishOnClose || w.plan.closeErr == nil {
+		w.attrs = w.bucket.putObject(w.name, w.buf.Bytes())
+	}
+	return w.plan.closeErr
 }
 
-func (w *recordingObjectWriter) CloseWithError(err error) error {
+func (w *fakeObjectWriter) CloseWithError(err error) error {
 	w.closeWithErrorCalls++
 	w.closeWithErrorArg = err
-	return nil
+	return w.plan.closeAbortErr
 }
 
-// silence unused-import on builds where TestGCS_RoundtripAgainstRealBucket is skipped
-var _ = bytes.Equal
+func (w *fakeObjectWriter) Attrs() *cloudstorage.ObjectAttrs {
+	return w.attrs
+}

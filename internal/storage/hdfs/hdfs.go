@@ -287,7 +287,7 @@ func (b *Backend) Remove(ctx context.Context, objectPath string) error {
 	if err != nil {
 		return err
 	}
-	if err := lease.client.Remove(resolved); err != nil && !isNotFound(err) {
+	if err := removeWithContext(ctx, lease.client, resolved); err != nil && !isNotFound(err) {
 		return fmt.Errorf("hdfs: remove %s: %w", objectPath, err)
 	}
 	return nil
@@ -800,6 +800,9 @@ func closeAfterReplication(ctx context.Context, writer storage.Writer) (retErr e
 			closeErr = closer.CloseContext(retryCtx)
 		} else {
 			closeErr = writer.Close()
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return errors.Join(closeErr, ctxErr)
 		}
 		if ctxErr := retryCtx.Err(); ctxErr != nil {
 			return errors.Join(closeErr, ctxErr)
