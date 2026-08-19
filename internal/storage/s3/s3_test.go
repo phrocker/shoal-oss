@@ -1055,6 +1055,13 @@ func TestWriter_VerifiesCommittedResponsesWithoutReplayingPromotion(t *testing.T
 	}
 }
 
+func TestIsAmbiguousPromotionErrorUsesStructuredPreconditionCode(t *testing.T) {
+	err := &smithy.GenericAPIError{Code: "PreconditionFailed", Message: "condition did not match"}
+	if isAmbiguousPromotionError(err) {
+		t.Fatal("structured precondition failure classified as ambiguous")
+	}
+}
+
 func TestWriter_IndeterminatePromotionCommittedRetrySucceeds(t *testing.T) {
 	f := newFakeS3WriteOperations()
 	f.promoteResponseLost = true

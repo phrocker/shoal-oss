@@ -1076,6 +1076,9 @@ func (w *writer) Write(p []byte) (int, error) {
 	if w.closed || w.promotionIndeterminate {
 		return 0, fmt.Errorf("azure: writer already closed")
 	}
+	if err := validateAzurePromotionAppend(int64(w.buf.Len()), int64(len(p))); err != nil {
+		return 0, err
+	}
 	return w.buf.Write(p)
 }
 
@@ -1165,6 +1168,16 @@ func validateAzurePromotionSize(size int64) error {
 		return fmt.Errorf(
 			"azure: staged write size %d exceeds Put Blob From URL promotion limit %d",
 			size,
+			maxUploadBlobFromURLBytes,
+		)
+	}
+	return nil
+}
+
+func validateAzurePromotionAppend(current, appended int64) error {
+	if appended > maxUploadBlobFromURLBytes-current {
+		return fmt.Errorf(
+			"azure: staged write size would exceed Put Blob From URL promotion limit %d",
 			maxUploadBlobFromURLBytes,
 		)
 	}

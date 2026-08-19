@@ -1068,7 +1068,7 @@ func (w *writer) indeterminateAbortError() error {
 }
 
 func isAmbiguousPromotionError(err error) bool {
-	if err == nil || isNotFound(err) {
+	if err == nil || isNotFound(err) || isPreconditionFailed(err) {
 		return false
 	}
 	text := strings.ToLower(err.Error())

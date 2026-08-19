@@ -867,6 +867,12 @@ func TestValidateAzurePromotionSize(t *testing.T) {
 	if err := validateAzurePromotionSize(maxUploadBlobFromURLBytes + 1); err == nil {
 		t.Fatal("oversized write was not rejected before staging")
 	}
+	if err := validateAzurePromotionAppend(maxUploadBlobFromURLBytes-1, 1); err != nil {
+		t.Fatalf("boundary append rejected: %v", err)
+	}
+	if err := validateAzurePromotionAppend(maxUploadBlobFromURLBytes, 1); err == nil {
+		t.Fatal("oversized append was not rejected before buffering")
+	}
 }
 
 func TestBackendCreateRejectsReservedInternalBlobNames(t *testing.T) {
