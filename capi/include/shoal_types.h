@@ -22,7 +22,7 @@
  */
 #define SHOAL_ABI_VERSION 1u
 #define SHOAL_ABI_VERSION_MAJOR 1u
-#define SHOAL_ABI_VERSION_MINOR 9u
+#define SHOAL_ABI_VERSION_MINOR 10u
 #define SHOAL_ABI_VERSION_PATCH 0u
 #define SHOAL_ABI_PACK_VERSION(major, minor, patch)                           \
   ((((uint32_t)(major) & 0xffu) << 16) |                                     \
@@ -60,10 +60,11 @@ enum {
   SHOAL_ABI_CAPABILITY_DATA_VALUES = 17,
   SHOAL_ABI_CAPABILITY_BUFFERED_WRITER = 18,
   SHOAL_ABI_CAPABILITY_TABLE_MAINTENANCE = 19,
-  SHOAL_ABI_CAPABILITY_CONNECTOR_CONTROL = 20
+  SHOAL_ABI_CAPABILITY_CONNECTOR_CONTROL = 20,
+  SHOAL_ABI_CAPABILITY_HIGH_LEVEL_CLIENT = 21
 };
 
-#define SHOAL_ABI_CAPABILITY_COUNT 21u
+#define SHOAL_ABI_CAPABILITY_COUNT 22u
 #define SHOAL_ABI_CAPABILITY_WORD_BITS 64u
 #define SHOAL_ABI_CAPABILITY_WORD_INDEX(capability_id)                       \
   ((uint32_t)(capability_id) / SHOAL_ABI_CAPABILITY_WORD_BITS)
@@ -115,6 +116,8 @@ enum {
   SHOAL_ABI_CAPABILITY_MASK(SHOAL_ABI_CAPABILITY_TABLE_MAINTENANCE)
 #define SHOAL_ABI_CAPABILITY_CONNECTOR_CONTROL_MASK                          \
   SHOAL_ABI_CAPABILITY_MASK(SHOAL_ABI_CAPABILITY_CONNECTOR_CONTROL)
+#define SHOAL_ABI_CAPABILITY_HIGH_LEVEL_CLIENT_MASK                          \
+  SHOAL_ABI_CAPABILITY_MASK(SHOAL_ABI_CAPABILITY_HIGH_LEVEL_CLIENT)
 #define SHOAL_ABI_CAPABILITY_WORD0                                           \
   (SHOAL_ABI_CAPABILITY_CONNECTOR_MASK | SHOAL_ABI_CAPABILITY_BOOTSTRAP_MASK | \
    SHOAL_ABI_CAPABILITY_ERROR_MASK | SHOAL_ABI_CAPABILITY_SCANNER_MASK |     \
@@ -134,7 +137,8 @@ enum {
    SHOAL_ABI_CAPABILITY_DATA_VALUES_MASK |                                  \
    SHOAL_ABI_CAPABILITY_BUFFERED_WRITER_MASK |                              \
    SHOAL_ABI_CAPABILITY_TABLE_MAINTENANCE_MASK |                             \
-   SHOAL_ABI_CAPABILITY_CONNECTOR_CONTROL_MASK)
+   SHOAL_ABI_CAPABILITY_CONNECTOR_CONTROL_MASK |                             \
+   SHOAL_ABI_CAPABILITY_HIGH_LEVEL_CLIENT_MASK)
 
 typedef int32_t shoal_status;
 
@@ -178,6 +182,7 @@ enum {
 };
 
 typedef struct shoal_connector shoal_connector;
+typedef struct shoal_client shoal_client;
 typedef struct shoal_cancellation shoal_cancellation;
 typedef struct shoal_scanner shoal_scanner;
 typedef struct shoal_batch_scanner shoal_batch_scanner;
@@ -374,6 +379,24 @@ typedef struct shoal_connector_config {
 #define SHOAL_CONNECTOR_CONFIG_V1_SIZE                                      \
   ((uint32_t)(offsetof(shoal_connector_config, dial_timeout_ms) +            \
               sizeof(((shoal_connector_config *)0)->dial_timeout_ms)))
+
+/*
+ * High-level client defaults mirror Sharkbite's facade: thread_count is 10,
+ * table_name is optional until a scanner or writer is created, and an empty
+ * authorization array means no labels. All retained values are copied.
+ */
+typedef struct shoal_client_config {
+  uint32_t struct_size;
+  const shoal_connector_config *connector;
+  const char *table_name;
+  const shoal_bytes *authorizations;
+  size_t authorization_count;
+  int32_t thread_count;
+} shoal_client_config;
+
+#define SHOAL_CLIENT_CONFIG_V1_SIZE                                          \
+  ((uint32_t)(offsetof(shoal_client_config, thread_count) +                   \
+              sizeof(((shoal_client_config *)0)->thread_count)))
 
 /*
  * shoal_scanner_config_init initializes only the V1 prefix and sets struct_size

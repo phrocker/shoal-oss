@@ -8,9 +8,9 @@
 
 _Static_assert(SHOAL_ABI_VERSION == 1u, "unexpected compatibility ABI version");
 _Static_assert(SHOAL_ABI_VERSION_MAJOR == 1u, "unexpected ABI major");
-_Static_assert(SHOAL_ABI_VERSION_MINOR == 9u, "unexpected ABI minor");
+_Static_assert(SHOAL_ABI_VERSION_MINOR == 10u, "unexpected ABI minor");
 _Static_assert(SHOAL_ABI_VERSION_PATCH == 0u, "unexpected ABI patch");
-_Static_assert(SHOAL_ABI_VERSION_PACKED == 0x00010900u,
+_Static_assert(SHOAL_ABI_VERSION_PACKED == 0x00010a00u,
                "unexpected packed ABI version");
 _Static_assert(SHOAL_ABI_CAPABILITY_CONNECTOR == 0u,
                "unexpected connector capability id");
@@ -52,11 +52,13 @@ _Static_assert(SHOAL_ABI_CAPABILITY_TABLE_MAINTENANCE == 19u,
                "unexpected table maintenance capability id");
 _Static_assert(SHOAL_ABI_CAPABILITY_CONNECTOR_CONTROL == 20u,
                "unexpected connector control capability id");
-_Static_assert(SHOAL_ABI_CAPABILITY_COUNT == 21u,
+_Static_assert(SHOAL_ABI_CAPABILITY_HIGH_LEVEL_CLIENT == 21u,
+               "unexpected high-level client capability id");
+_Static_assert(SHOAL_ABI_CAPABILITY_COUNT == 22u,
                "unexpected capability count");
 _Static_assert(SHOAL_ABI_CAPABILITY_WORD_COUNT == 1u,
                "unexpected capability word count");
-_Static_assert(SHOAL_ABI_CAPABILITY_WORD0 == UINT64_C(0x1fffff),
+_Static_assert(SHOAL_ABI_CAPABILITY_WORD0 == UINT64_C(0x3fffff),
                "unexpected capability word 0");
 
 #define ASSERT_PERMISSION_VALUE(name, value)                                  \
@@ -136,6 +138,23 @@ static void test_v1_initializers(void) {
 
   CHECK_V1_INIT(shoal_connector_config, shoal_connector_config_init,
                 SHOAL_CONNECTOR_CONFIG_V1_SIZE);
+  {
+    struct {
+      shoal_client_config value;
+      uint8_t guard[16];
+    } allocation;
+    memset(&allocation, 0xa5, sizeof(allocation));
+    shoal_client_config_init(&allocation.value);
+    assert(allocation.value.struct_size == SHOAL_CLIENT_CONFIG_V1_SIZE);
+    assert(allocation.value.connector == NULL);
+    assert(allocation.value.table_name == NULL);
+    assert(allocation.value.authorizations == NULL);
+    assert(allocation.value.authorization_count == 0);
+    assert(allocation.value.thread_count == 10);
+    for (size_t i = 0; i < sizeof(allocation.guard); ++i) {
+      assert(allocation.guard[i] == UINT8_C(0xa5));
+    }
+  }
   CHECK_V1_INIT(shoal_scanner_config, shoal_scanner_config_init,
                 SHOAL_SCANNER_CONFIG_V1_SIZE);
   CHECK_V1_INIT(shoal_range, shoal_range_init, SHOAL_RANGE_V1_SIZE);
@@ -567,6 +586,8 @@ static void test_buffered_writer_abi(shoal_connector *connector) {
 int main(void) {
   shoal_connector *connector = NULL;
   shoal_connector *admin_connector = NULL;
+  shoal_client *client = NULL;
+  shoal_client *admin_client = NULL;
   shoal_cancellation *cancellation = NULL;
   shoal_scanner *scanner = NULL;
   shoal_batch_scanner *batch_scanner = NULL;
@@ -574,6 +595,7 @@ int main(void) {
   shoal_table_list_result *table_list = NULL;
   shoal_mutation *mutation = NULL;
   shoal_batch_writer *writer = NULL;
+  shoal_accumulo_writer *client_writer = NULL;
   shoal_write_failure *write_failure = NULL;
   shoal_table_properties_result *properties = NULL;
   shoal_namespace_list_result *namespace_list = NULL;
@@ -620,6 +642,7 @@ int main(void) {
   assert(shoal_abi_has_capability(SHOAL_ABI_CAPABILITY_DATA_VALUES) == 1);
   assert(shoal_abi_has_capability(SHOAL_ABI_CAPABILITY_BUFFERED_WRITER) == 1);
   assert(shoal_abi_has_capability(SHOAL_ABI_CAPABILITY_CONNECTOR_CONTROL) == 1);
+  assert(shoal_abi_has_capability(SHOAL_ABI_CAPABILITY_HIGH_LEVEL_CLIENT) == 1);
   assert(shoal_abi_has_capability(SHOAL_ABI_CAPABILITY_COUNT) == 0);
   assert(shoal_abi_has_capability(63u) == 0);
   assert(shoal_abi_has_capability(64u) == 0);
@@ -710,6 +733,129 @@ int main(void) {
   assert(shoal_connector_invalidate_discovery(admin_connector, &error) ==
          SHOAL_STATUS_OK);
   assert(shoal_test_connector_invalidation_matches(admin_connector, "5", 1));
+
+  shoal_client_config client_config;
+  shoal_client_config_init(&client_config);
+  assert(client_config.struct_size == SHOAL_CLIENT_CONFIG_V1_SIZE);
+  assert(client_config.thread_count == 10);
+  expect_error(shoal_client_create(NULL, &client, &error),
+               SHOAL_STATUS_INVALID_ARGUMENT, &error,
+               "client config is required");
+  expect_error(shoal_client_create(&client_config, NULL, &error),
+               SHOAL_STATUS_INVALID_ARGUMENT, &error,
+               "out_client is required");
+  client_config.struct_size = SHOAL_CLIENT_CONFIG_V1_SIZE - 1;
+  expect_error(shoal_client_create(&client_config, &client, &error),
+               SHOAL_STATUS_INVALID_ARGUMENT, &error, "struct_size");
+  shoal_client_config_init(&client_config);
+  expect_error(shoal_client_create(&client_config, &client, &error),
+               SHOAL_STATUS_INVALID_ARGUMENT, &error,
+               "connector config is required");
+  client_config.connector = &config;
+  client_config.thread_count = 0;
+  expect_error(shoal_client_create(&client_config, &client, &error),
+               SHOAL_STATUS_INVALID_ARGUMENT, &error,
+               "thread_count must be positive");
+  char initial_table[] = "events";
+  uint8_t initial_authorization_data[] = {'A', 0, 'B'};
+  shoal_bytes initial_authorization = {
+      initial_authorization_data, sizeof(initial_authorization_data)};
+  client_config.thread_count = 10;
+  client_config.table_name = initial_table;
+  client_config.authorizations = &initial_authorization;
+  client_config.authorization_count = 1;
+  shoal_test_result_alloc_fail_after(0);
+  assert(shoal_client_create(&client_config, &client, &error) ==
+         SHOAL_STATUS_OUT_OF_MEMORY);
+  assert(client == NULL && error != NULL);
+  shoal_error_free(&error);
+  shoal_test_result_alloc_reset();
+  assert(shoal_client_create(&client_config, &client, &error) ==
+         SHOAL_STATUS_OK);
+  assert(client != NULL && error == NULL);
+  initial_table[0] = 'x';
+  initial_authorization_data[0] = 'Z';
+  const uint8_t expected_initial_authorization_data[] = {'A', 0, 'B'};
+  shoal_bytes expected_initial_authorization = {
+      expected_initial_authorization_data,
+      sizeof(expected_initial_authorization_data)};
+  assert(shoal_test_client_settings_match(
+      client, "events", expected_initial_authorization, 10));
+  expect_error(shoal_client_set_threads(client, 0, &error),
+               SHOAL_STATUS_INVALID_ARGUMENT, &error,
+               "thread_count must be positive");
+  assert(shoal_client_set_table(client, NULL, &error) == SHOAL_STATUS_OK);
+  assert(shoal_test_client_settings_match(
+      client, "events", expected_initial_authorization, 10));
+  expect_error(shoal_client_set_authorizations(client, NULL, 1, &error),
+               SHOAL_STATUS_INVALID_ARGUMENT, &error, "authorizations");
+  char updated_table[] = "analytics";
+  uint8_t updated_authorization_data[] = {'x', 0, 'y'};
+  shoal_bytes updated_authorization = {
+      updated_authorization_data, sizeof(updated_authorization_data)};
+  assert(shoal_client_set_table(client, updated_table, &error) ==
+         SHOAL_STATUS_OK);
+  assert(shoal_client_set_authorizations(
+             client, &updated_authorization, 1, &error) == SHOAL_STATUS_OK);
+  assert(shoal_client_set_threads(client, 17, &error) == SHOAL_STATUS_OK);
+  updated_table[0] = 'z';
+  updated_authorization_data[0] = 'z';
+  const uint8_t expected_updated_authorization_data[] = {'x', 0, 'y'};
+  shoal_bytes expected_updated_authorization = {
+      expected_updated_authorization_data,
+      sizeof(expected_updated_authorization_data)};
+  assert(shoal_test_client_settings_match(
+      client, "analytics", expected_updated_authorization, 17));
+  expect_error(shoal_client_create_batch_writer(client, NULL, &error),
+               SHOAL_STATUS_INVALID_ARGUMENT, &error,
+               "out_writer is required");
+  shoal_test_result_alloc_fail_after(0);
+  expect_error(
+      shoal_client_create_batch_writer(client, &client_writer, &error),
+      SHOAL_STATUS_OUT_OF_MEMORY, &error, "buffered writer handle");
+  assert(client_writer == NULL);
+  shoal_test_result_alloc_reset();
+  assert(shoal_client_create_batch_writer(client, &client_writer, &error) ==
+         SHOAL_STATUS_OK);
+  assert(client_writer != NULL && error == NULL);
+  shoal_accumulo_writer_free(&client_writer);
+  assert(shoal_client_close(client, &error) == SHOAL_STATUS_OK);
+  assert(shoal_client_close(client, &error) == SHOAL_STATUS_OK);
+  expect_error(shoal_client_set_table(client, "later", &error),
+               SHOAL_STATUS_CLOSED, &error, "connector is closed");
+  expect_error(shoal_client_create_scanner(client, &scanner, &error),
+               SHOAL_STATUS_CLOSED, &error, "connector is closed");
+  expect_error(shoal_client_create_batch_writer(client, &client_writer, &error),
+               SHOAL_STATUS_CLOSED, &error, "connector is closed");
+  shoal_client_free(&client);
+  assert(client == NULL);
+  shoal_client_free(&client);
+
+  assert(shoal_test_client_create(&admin_client));
+  assert(admin_client != NULL);
+  expect_error(shoal_client_create_scanner(admin_client, NULL, &error),
+               SHOAL_STATUS_INVALID_ARGUMENT, &error,
+               "out_scanner is required");
+  assert(shoal_client_create_scanner(admin_client, &scanner, &error) ==
+         SHOAL_STATUS_OK);
+  assert(scanner != NULL && error == NULL);
+  shoal_scanner_free(&scanner);
+  expect_error(shoal_client_list_tables(admin_client, 0, NULL, &error),
+               SHOAL_STATUS_INVALID_ARGUMENT, &error,
+               "out_result is required");
+  assert(shoal_client_list_tables(
+             admin_client, 0, &table_list, &error) == SHOAL_STATUS_OK);
+  assert(table_list != NULL && shoal_table_list_count(table_list) == 2);
+  shoal_table_list_free(&table_list);
+  shoal_test_result_alloc_fail_after(0);
+  assert(shoal_client_list_tables(
+             admin_client, 0, &table_list, &error) ==
+         SHOAL_STATUS_OUT_OF_MEMORY);
+  assert(table_list == NULL && error != NULL);
+  shoal_error_free(&error);
+  shoal_test_result_alloc_reset();
+  shoal_client_free(&admin_client);
+  assert(admin_client == NULL);
 
   assert(shoal_configuration_create(&configuration, &error) == SHOAL_STATUS_OK);
   assert(configuration != NULL && error == NULL);

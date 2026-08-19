@@ -323,6 +323,26 @@ static void *shoal_bridge_result_calloc(size_t count, size_t size) {
   return calloc(count, size);
 }
 
+shoal_client *shoal_bridge_client_alloc(uint64_t id) {
+  shoal_client *client =
+      (shoal_client *)shoal_bridge_result_calloc(1, sizeof(*client));
+  if (client != NULL) {
+    client->id = id;
+  }
+  return client;
+}
+
+uint64_t shoal_bridge_client_id(const shoal_client *client) {
+  return client == NULL ? 0 : client->id;
+}
+
+void shoal_bridge_client_free(shoal_client *client) {
+  if (client != NULL) {
+    client->id = 0;
+    free(client);
+  }
+}
+
 shoal_cancellation *shoal_bridge_cancellation_alloc(uint64_t id) {
   shoal_cancellation *cancellation =
       (shoal_cancellation *)shoal_bridge_result_calloc(1, sizeof(*cancellation));
@@ -2012,6 +2032,18 @@ void shoal_bridge_connector_config_init(shoal_connector_config *config) {
 
 uint32_t shoal_bridge_connector_config_v1_size(void) {
   return SHOAL_CONNECTOR_CONFIG_V1_SIZE;
+}
+
+void shoal_bridge_client_config_init(shoal_client_config *config) {
+  if (config != NULL) {
+    memset(config, 0, SHOAL_CLIENT_CONFIG_V1_SIZE);
+    config->struct_size = SHOAL_CLIENT_CONFIG_V1_SIZE;
+    config->thread_count = 10;
+  }
+}
+
+uint32_t shoal_bridge_client_config_v1_size(void) {
+  return SHOAL_CLIENT_CONFIG_V1_SIZE;
 }
 
 void shoal_bridge_scanner_config_init(shoal_scanner_config *config) {

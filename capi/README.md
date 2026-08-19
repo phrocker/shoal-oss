@@ -29,14 +29,14 @@ Shoal separates **ABI compatibility** from **feature availability**:
   stable allocation-free version tuple that works before connector creation.
   `SHOAL_ABI_VERSION_PACKED` uses
   `SHOAL_ABI_PACK_VERSION(major, minor, patch)` with a hexadecimal
-  `0x00MMmmpp` layout, so ABI `1.9.0` is `0x00010900`.
+  `0x00MMmmpp` layout, so ABI `1.10.0` is `0x00010a00`.
 - Capability identifiers are append-only. Existing IDs and bits never change
   meaning. `shoal_abi_capability_word_count()` reports how many 64-bit words
   the current library uses, `shoal_abi_capability_word(i)` returns `0` for
   `i >= word_count`, and `shoal_abi_has_capability(id)` returns `0` for both
   unsupported and unknown IDs.
 
-Current capability assignments (`word 0 == 0x00000000001fffff`):
+Current capability assignments (`word 0 == 0x00000000003fffff`):
 
 | ID | Mask | Surface |
 | --- | --- | --- |
@@ -61,6 +61,7 @@ Current capability assignments (`word 0 == 0x00000000001fffff`):
 | `SHOAL_ABI_CAPABILITY_BUFFERED_WRITER` | `0x40000` | owned lazy row-buffered high-level writer with close coordination |
 | `SHOAL_ABI_CAPABILITY_TABLE_MAINTENANCE` | `0x80000` | row-bounded table flush and owned constraint administration |
 | `SHOAL_ABI_CAPABILITY_CONNECTOR_CONTROL` | `0x100000` | one-shot scan cancellation and connector cache invalidation |
+| `SHOAL_ABI_CAPABILITY_HIGH_LEVEL_CLIENT` | `0x200000` | owned mutable high-level client facade and scanner/writer construction |
 
 Shoal does **not** advertise instance status, compaction/import/export,
 Python/wheel, or any other unimplemented surface until the API exists and has
@@ -108,6 +109,14 @@ Version numbers change only when the public ABI contract changes:
 - `shoal_connector_create` returns an opaque, library-owned connector handle.
   Call `shoal_connector_close` to observe shutdown errors, then
   `shoal_connector_free` exactly once with the address of the handle variable.
+- `shoal_client_create` copies its connector configuration, table name, and
+  binary authorization labels and returns an owned facade with a default thread
+  count of 10. Setters affect only subsequently created scanners and writers.
+  `shoal_client_create_scanner` returns an owned scanner; the lazy
+  `shoal_client_create_batch_writer` returns an owned
+  `shoal_accumulo_writer`. Client close cancels and joins active facade calls;
+  child operations coordinate with the same connector lifecycle and reject
+  work once client close begins.
   Freeing also performs best-effort close and sets the variable to `NULL`.
 - A connector owns the bootstrap instance created for it. Callers do not
   separately close ZooKeeper resources.
