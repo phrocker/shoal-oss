@@ -1,6 +1,7 @@
 package accumulo
 
 import (
+	"errors"
 	"sort"
 	"testing"
 )
@@ -269,25 +270,33 @@ func TestKeyEqualComparesEveryOrderedComponent(t *testing.T) {
 	}
 }
 
-func TestRangeBoundsPreserveTheDeletionMarker(t *testing.T) {
+func TestRangeRejectsDeletionMarkedBounds(t *testing.T) {
+	deleted := NewKey([]byte("a"))
+	deleted.SetDeleted(true)
+	live := NewKey([]byte("z"))
+	if _, err := NewKeyRange(&deleted, true, &live, true); !errors.Is(err, ErrDeletedRangeBound) {
+		t.Fatalf("deleted start = %v", err)
+	}
+	if _, err := NewKeyRange(&live, true, &deleted, true); !errors.Is(err, ErrDeletedRangeBound) {
+		t.Fatalf("deleted end = %v", err)
+	}
 	start := NewKey([]byte("a"))
-	start.SetDeleted(true)
-	end := NewKey([]byte("z"))
-	scanRange, err := NewKeyRange(&start, true, &end, true)
+	scanRange, err := NewKeyRange(&start, true, &live, true)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if bound := scanRange.StartKey(); bound == nil || !bound.Deleted {
-		t.Fatalf("StartKey dropped the deletion marker: %+v", bound)
+	if bound := scanRange.StartKey(); bound == nil || bound.Deleted {
+		t.Fatalf("StartKey = %+v", bound)
 	}
-	if bound := scanRange.EndKey(); bound == nil || bound.Deleted {
-		t.Fatalf("EndKey invented a deletion marker: %+v", bound)
+	// cloneKey still carries the marker for keys that are not range bounds, so
+	// range predicates agree with the ordering the key type publishes.
+	clone := cloneKey(&deleted)
+	if clone == nil || !clone.Deleted {
+		t.Fatalf("cloneKey dropped the deletion marker: %+v", clone)
 	}
-	// A deletion marker sorts before the live key with the same components, so
-	// the range predicates must agree with Key.Compare.
-	live := NewKey([]byte("a"))
-	if compareKeys(start, live) != start.Compare(live) {
-		t.Fatalf("compareKeys = %d, Key.Compare = %d", compareKeys(start, live), start.Compare(live))
+	if compareKeys(deleted, start) != deleted.Compare(start) {
+		t.Fatalf("compareKeys = %d, Key.Compare = %d",
+			compareKeys(deleted, start), deleted.Compare(start))
 	}
 }
 

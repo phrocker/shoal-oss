@@ -122,4 +122,9 @@ var (
 
 	// ErrSecurityUnavailable indicates a server-side security subsystem failure.
 	ErrSecurityUnavailable = errors.New("accumulo: security subsystem unavailable")
+
+	// ErrDeletedRangeBound indicates a range bound that carries a deletion
+	// marker. The scan wire's TKey has no field for it, so such a bound would
+	// mean one thing locally and another on the server.
+	ErrDeletedRangeBound = errors.New("accumulo: range bound carries a deletion marker")
 )

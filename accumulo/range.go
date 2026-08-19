@@ -38,8 +38,14 @@ func NewRange(startRow []byte, startInclusive bool, endRow []byte, endInclusive 
 }
 
 // NewKeyRange constructs a range with full Accumulo key bounds. A nil start or
-// end key is unbounded.
+// end key is unbounded. A bound may not carry a deletion marker: Key.Compare
+// orders deletions before the matching live key, but the scan wire's TKey has
+// no field for the marker, so such a bound would exclude a key locally and
+// include it on the server.
 func NewKeyRange(start *Key, startInclusive bool, end *Key, endInclusive bool) (*Range, error) {
+	if (start != nil && start.Deleted) || (end != nil && end.Deleted) {
+		return nil, ErrDeletedRangeBound
+	}
 	startCopy := cloneKey(start)
 	endCopy := cloneKey(end)
 	if startCopy != nil && endCopy != nil && compareKeys(*endCopy, *startCopy) < 0 {
