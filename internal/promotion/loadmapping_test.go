@@ -152,6 +152,21 @@ func TestBuildLoadMappingRejectsNilManifest(t *testing.T) {
 	}
 }
 
+// TestBuildLoadMappingRejectsUnsupportedManifestVersion is the direct
+// unit-level counterpart to
+// TestPromoteRejectsUnsupportedManifestVersionBeforeAddTableSplits in
+// promote_test.go: it exercises resolveManifestTablets's version check
+// through BuildLoadMapping itself, on an otherwise perfectly valid
+// multi-tablet manifest, rather than only through Promote's higher-level
+// integration path.
+func TestBuildLoadMappingRejectsUnsupportedManifestVersion(t *testing.T) {
+	manifest := twoTabletManifest()
+	manifest.Version = engine.RFileExportManifestVersion + 1
+	if _, err := BuildLoadMapping(manifest); err == nil {
+		t.Fatal("BuildLoadMapping with an unsupported manifest version = nil error, want error")
+	}
+}
+
 func TestBuildLoadMappingDedupesRepeatedDestinationPath(t *testing.T) {
 	manifest := &engine.RFileExportManifest{
 		Version:     engine.RFileExportManifestVersion,
@@ -411,6 +426,31 @@ func TestBuildLoadMappingRejectsDegenerateTabletRange(t *testing.T) {
 	}
 }
 
+// TestBuildLoadMappingRejectsEmptyBoundaryRow covers a chain shape the
+// degenerate-range check above cannot see: it only compares a tablet's
+// own StartRow against its own EndRow, and only when *both* are non-nil.
+// Tablet 0's StartRow and the last tablet's EndRow are always nil by the
+// chain-shape requirement itself, so an empty (non-nil, zero-length)
+// value on the *other* boundary of one of those two tablets -- tablet
+// 0's EndRow, or the last tablet's StartRow -- never has a same-tablet
+// partner to compare against and so never tripped the degenerate check.
+// A 2-tablet manifest makes this concrete: tablet 0's StartRow and
+// tablet 1's EndRow are both nil unconditionally, so the only boundary
+// either tablet carries is the single row they share, and if that
+// shared row is "" neither tablet's own degenerate check ever fires --
+// this manifest would otherwise reach AddTableSplits, which rejects a
+// zero-length split row itself (accumulo.Connector.AddTableSplits's
+// normalizeSplitRows), but for a reason expressed in that lower layer's
+// own terms instead of this package's manifest-shape validation.
+func TestBuildLoadMappingRejectsEmptyBoundaryRow(t *testing.T) {
+	manifest := twoTabletManifest()
+	manifest.Tablets[0].EndRow = strPtr("")
+	manifest.Tablets[1].StartRow = strPtr("")
+	if _, err := BuildLoadMapping(manifest); err == nil {
+		t.Fatal("BuildLoadMapping with an empty (non-nil) shared boundary row = nil error, want error")
+	}
+}
+
 func TestBuildLoadMappingRejectsUndeclaredTabletIndexMultiTablet(t *testing.T) {
 	manifest := threeTabletManifest()
 	manifest.RFiles = append(manifest.RFiles, engine.RFileExportFile{
@@ -447,6 +487,7 @@ func TestRequiredDestinationSplitsNilForSingleTabletManifest(t *testing.T) {
 
 func TestRequiredDestinationSplitsNilForLegacyManifest(t *testing.T) {
 	manifest := &engine.RFileExportManifest{
+		Version:     engine.RFileExportManifestVersion,
 		SourceTable: "events",
 		RFiles: []engine.RFileExportFile{
 			{TabletIndex: 0, DestinationPath: "events/t-0000/F0001.rf", Size: 10},
@@ -499,6 +540,40 @@ func TestRequiredDestinationSplitsPropagatesChainValidationError(t *testing.T) {
 	manifest.Tablets[1].StartRow = strPtr("e") // chain gap, same as BuildLoadMapping rejects
 	if _, err := RequiredDestinationSplits(manifest); err == nil {
 		t.Fatal("RequiredDestinationSplits with a malformed chain = nil error, want error")
+	}
+}
+
+// TestRequiredDestinationSplitsRejectsUnsupportedManifestVersion is the
+// RequiredDestinationSplits-side counterpart to
+// TestBuildLoadMappingRejectsUnsupportedManifestVersion: it exercises
+// the same resolveManifestTablets version check through
+// RequiredDestinationSplits's own call path. RequiredDestinationSplits's
+// doc comment claims it "performs the same" validation BuildLoadMapping
+// does, including on a manifest whose Version predates or postdates
+// what this build understands, precisely because it is documented as
+// safe to call standalone -- typically to pre-create splits through
+// accumulo.Connector.AddTableSplits ahead of staging -- so a caller
+// following that documented pattern must be able to rely on the version
+// check firing here too, not only inside BuildLoadMapping.
+func TestRequiredDestinationSplitsRejectsUnsupportedManifestVersion(t *testing.T) {
+	manifest := threeTabletManifest()
+	manifest.Version = engine.RFileExportManifestVersion + 1
+	if _, err := RequiredDestinationSplits(manifest); err == nil {
+		t.Fatal("RequiredDestinationSplits with an unsupported manifest version = nil error, want error")
+	}
+}
+
+// TestRequiredDestinationSplitsRejectsEmptyBoundaryRow is the
+// RequiredDestinationSplits-side counterpart to
+// TestBuildLoadMappingRejectsEmptyBoundaryRow, proving the same
+// zero-length shared boundary is rejected regardless of which of
+// resolveManifestTablets's two callers reaches resolveTabletChain first.
+func TestRequiredDestinationSplitsRejectsEmptyBoundaryRow(t *testing.T) {
+	manifest := twoTabletManifest()
+	manifest.Tablets[0].EndRow = strPtr("")
+	manifest.Tablets[1].StartRow = strPtr("")
+	if _, err := RequiredDestinationSplits(manifest); err == nil {
+		t.Fatal("RequiredDestinationSplits with an empty (non-nil) shared boundary row = nil error, want error")
 	}
 }
 

@@ -40,14 +40,20 @@ That invariant drives every design choice here:
 
 - Promotion **never writes to `accumulo.metadata` or ZooKeeper**, and never
   invents its own notion of a tablet, split, or load state.
-- The only Accumulo-facing calls this package makes are two standard
+- The only *mutating* Accumulo-facing calls this package makes are two standard
   **FATE** operations submitted through the table's **manager**: a
   `TABLE_SPLIT` operation (`accumulo.Connector.AddTableSplits`, submitted
   only when a multi-tablet manifest's widened load mapping requires
   destination splits that don't already exist — see §3) and the
   `TABLE_BULK_IMPORT2` operation itself — the same two operations
   Accumulo's own `TableOperations.addSplits()` and
-  `.importDirectory()` submit.
+  `.importDirectory()` submit. `Promote` also makes one read-only
+  metadata query, `accumulo.Connector.ListTableSplits`, immediately
+  after `AddTableSplits`, to positively verify the destination's
+  resulting splits rather than merely assume them (see §3.3) — this
+  reads tablet metadata through the manager's own client-facing API,
+  the same way any Accumulo client (including the shell's `getsplits`)
+  would, not a direct ZooKeeper/metadata table access.
 - Shoal's promotion code is a **producer of a staged bulk directory plus
   load mapping**, not a participant in tablet assignment or metadata
   mutation. If Accumulo's FATE operation fails or rejects the request,

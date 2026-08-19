@@ -165,19 +165,17 @@ type LoadMapping []Mapping
 // Manifests that omit Tablets but use any other TabletIndex are rejected as
 // ambiguous legacy input.
 //
-// manifest.Version is checked first, against engine.RFileExportManifestVersion,
-// before any chain or RFile validation: a manifest from an unsupported
-// export format is rejected here, in Promote's own preflight call to this
-// function, rather than only later inside StageBulkDir's call to
-// engine.VerifyRFileExport -- which, unlike this one, runs after
-// AddTableSplits has already reconciled the destination's splits (see
-// Promote's doc comment).
+// manifest.Version is checked first (inside resolveManifestTablets,
+// shared with RequiredDestinationSplits below), against
+// engine.RFileExportManifestVersion, before any chain or RFile
+// validation: a manifest from an unsupported export format is rejected
+// here, in Promote's own preflight call to this function, rather than
+// only later inside StageBulkDir's call to engine.VerifyRFileExport --
+// which, unlike this one, runs after AddTableSplits has already
+// reconciled the destination's splits (see Promote's doc comment).
 func BuildLoadMapping(manifest *engine.RFileExportManifest) (LoadMapping, error) {
 	if manifest == nil {
 		return nil, fmt.Errorf("promotion: nil export manifest")
-	}
-	if manifest.Version != engine.RFileExportManifestVersion {
-		return nil, fmt.Errorf("promotion: unsupported manifest version %d", manifest.Version)
 	}
 	tablets, declared, err := resolveManifestTablets(manifest)
 	if err != nil {
@@ -234,7 +232,20 @@ type resolvedTablet struct {
 // (0..N-1), plus the set of indexes BuildLoadMapping may accept RFiles
 // under. See resolveTabletChain for the exact chain-shape requirements and
 // BuildLoadMapping's doc comment for the widening rule.
+//
+// manifest.Version is checked first, against
+// engine.RFileExportManifestVersion: both of resolveManifestTablets's
+// two callers (BuildLoadMapping and RequiredDestinationSplits) document
+// themselves as performing "the same" validation, so the version check
+// belongs here, once, rather than duplicated (or, worse, present in one
+// and silently missing from the other -- RequiredDestinationSplits is
+// exported and documented as safe to call standalone specifically to
+// pre-create splits through AddTableSplits, so it must reject an
+// unsupported version just as eagerly as BuildLoadMapping does).
 func resolveManifestTablets(manifest *engine.RFileExportManifest) ([]resolvedTablet, map[int]struct{}, error) {
+	if manifest.Version != engine.RFileExportManifestVersion {
+		return nil, nil, fmt.Errorf("promotion: unsupported manifest version %d", manifest.Version)
+	}
 	if len(manifest.Tablets) == 0 {
 		for _, rf := range manifest.RFiles {
 			if rf.TabletIndex != 0 {
@@ -290,6 +301,16 @@ func resolveManifestTablets(manifest *engine.RFileExportManifest) ([]resolvedTab
 // tablet i's EndRow exactly equals tablet i+1's StartRow for every
 // adjacent pair (rejecting both gaps and overlaps — anything short of
 // exact equality is one or the other).
+//
+// A non-nil but empty (zero-length) StartRow or EndRow is rejected
+// outright, at any chain position: an empty row string is never a
+// meaningful Accumulo split point (there is nothing before it to bound),
+// and accumulo.Connector.AddTableSplits's own normalizeSplitRows rejects
+// a zero-length split unconditionally (table_add_splits.go), so a
+// manifest containing one would otherwise pass every check above only
+// to have AddTableSplits reject it later for a reason expressed in
+// terms of that lower layer's own row-normalization contract instead of
+// this package's own manifest-shape validation.
 func resolveTabletChain(tablets []engine.RFileExportTablet) ([]engine.RFileExportTablet, error) {
 	n := len(tablets)
 	byIndex := make(map[int]engine.RFileExportTablet, n)
@@ -325,6 +346,12 @@ func resolveTabletChain(tablets []engine.RFileExportTablet) ([]engine.RFileExpor
 		}
 		if i < n-1 && tablet.EndRow == nil {
 			return nil, fmt.Errorf("promotion: tablet index %d is missing its EndRow", tablet.Index)
+		}
+		if tablet.StartRow != nil && len(*tablet.StartRow) == 0 {
+			return nil, fmt.Errorf("promotion: tablet index %d has an empty StartRow, which Accumulo cannot use as a split row", tablet.Index)
+		}
+		if tablet.EndRow != nil && len(*tablet.EndRow) == 0 {
+			return nil, fmt.Errorf("promotion: tablet index %d has an empty EndRow, which Accumulo cannot use as a split row", tablet.Index)
 		}
 		if tablet.StartRow != nil && tablet.EndRow != nil && !(*tablet.StartRow < *tablet.EndRow) {
 			return nil, fmt.Errorf(
@@ -389,10 +416,19 @@ func formatRow(row *string) string {
 // construction; see BuildLoadMapping — can match. The iterator can
 // never rewind, so the whole submission is rejected with a spurious
 // BULK_CONCURRENT_MERGE-style error even though nothing actually
-// merged. A split strictly *after* the last required row is genuinely
-// harmless: the final Mapping entry is always fully unbounded (nil
-// EndRow) and absorbs it regardless of how many further splits exist
-// beyond it.
+// merged. A split strictly *after* the last required row is harmless
+// with respect to *this* validation walk specifically: the final
+// Mapping entry is always fully unbounded (nil EndRow) and absorbs it
+// regardless of how many further splits exist beyond it, so it can
+// never reproduce the iterator-can't-rewind failure above. That is not
+// the same as harmless in every sense a bulk import can fail, though:
+// Accumulo's PrepBulkImport.validateLoadMapping separately enforces
+// table.bulk.max.tablets (default 100, admin-configurable, since
+// Accumulo 2.1.0) by counting how many real destination tablets the
+// final entry's files overlap, a count trailing splits inflate
+// directly — see Promote's own doc comment and docs/promotion.md §5
+// item 3 for the full reasoning on why this package does not enforce
+// that limit itself.
 //
 // This function only reports what rows are required; it cannot detect
 // an unsafe pre-existing split on its own, since it is a pure function
