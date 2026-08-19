@@ -65,7 +65,9 @@ type janitorBackend struct {
 	result storage.ArtifactCleanupResult
 }
 
-func (janitorBackend) Open(context.Context, string) (storage.File, error) { return nil, storage.ErrNotFound }
+func (janitorBackend) Open(context.Context, string) (storage.File, error) {
+	return nil, storage.ErrNotFound
+}
 func (b janitorBackend) CleanupStaleArtifacts(context.Context, string, time.Time) (storage.ArtifactCleanupResult, error) {
 	return b.result, nil
 }
