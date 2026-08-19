@@ -114,6 +114,10 @@ type fakeManagerAdapter struct {
 	configurationRPC []string
 	err              error
 	closed           int
+	propertyVersion  int64
+	modifyRequests   []managerclient.VersionedProperties
+	rejectedModifies int
+	beforeModify     func()
 }
 
 type fakeFlushRequest struct {
@@ -199,6 +203,61 @@ func (m *fakeManagerAdapter) GetVersionedNamespaceProperties(
 ) (managerclient.VersionedProperties, error) {
 	properties, err := m.GetTableConfiguration(ctx, address, namespace)
 	return managerclient.VersionedProperties{Version: 7, Properties: properties}, err
+}
+
+// GetVersionedTableProperties and ModifyTableProperties model the
+// compare-and-set the manager performs: the version advances on every accepted
+// write, and a write presenting a stale version is rejected the way Accumulo
+// rejects one.
+func (m *fakeManagerAdapter) GetVersionedTableProperties(
+	_ context.Context,
+	address, tableName string,
+) (managerclient.VersionedProperties, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.address = address
+	if m.err != nil {
+		return managerclient.VersionedProperties{}, m.err
+	}
+	copied := make(map[string]string, len(m.configuration))
+	for key, value := range m.configuration {
+		copied[key] = value
+	}
+	return managerclient.VersionedProperties{Version: m.propertyVersion, Properties: copied}, nil
+}
+
+func (m *fakeManagerAdapter) ModifyTableProperties(
+	_ context.Context,
+	address, tableName string,
+	properties managerclient.VersionedProperties,
+) error {
+	m.mu.Lock()
+	hook := m.beforeModify
+	m.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.address = address
+	if m.err != nil {
+		return m.err
+	}
+	if properties.Version != m.propertyVersion {
+		m.rejectedModifies++
+		return &managerclient.Error{
+			Kind:        managerclient.ErrorConcurrentModification,
+			TableName:   tableName,
+			Description: "stale version",
+		}
+	}
+	m.modifyRequests = append(m.modifyRequests, properties)
+	m.configuration = make(map[string]string, len(properties.Properties))
+	for key, value := range properties.Properties {
+		m.configuration[key] = value
+	}
+	m.propertyVersion++
+	return nil
 }
 
 func (m *fakeManagerAdapter) SetTableProperty(

@@ -41,12 +41,20 @@ func TestAddConstraintAssignsTheLowestFreeNumber(t *testing.T) {
 
 	manager.mu.Lock()
 	defer manager.mu.Unlock()
-	if len(manager.propertyRequests) != 1 {
-		t.Fatalf("property requests = %d, want 1", len(manager.propertyRequests))
+	if len(manager.modifyRequests) != 1 {
+		t.Fatalf("versioned writes = %d, want 1", len(manager.modifyRequests))
 	}
-	request := manager.propertyRequests[0]
-	if request.remove || request.property != "table.constraint.2" || request.value != "org.example.Second" {
-		t.Fatalf("property request = %#v", request)
+	written := manager.modifyRequests[0]
+	if written.Version != 0 {
+		t.Fatalf("write presented version %d, want the version it read", written.Version)
+	}
+	if got := written.Properties["table.constraint.2"]; got != "org.example.Second" {
+		t.Fatalf("written constraint = %q", got)
+	}
+	for _, kept := range []string{"table.constraint.1", "table.constraint.3", "table.split.threshold"} {
+		if _, present := written.Properties[kept]; !present {
+			t.Fatalf("versioned write dropped %q: %#v", kept, written.Properties)
+		}
 	}
 }
 
@@ -74,8 +82,8 @@ func TestAddConstraintStartsAtOneAndIsIdempotent(t *testing.T) {
 	}
 	manager.mu.Lock()
 	defer manager.mu.Unlock()
-	if len(manager.propertyRequests) != 0 {
-		t.Fatalf("property requests = %d, want none for an installed class", len(manager.propertyRequests))
+	if len(manager.modifyRequests) != 0 {
+		t.Fatalf("versioned writes = %d, want none for an installed class", len(manager.modifyRequests))
 	}
 }
 
@@ -155,8 +163,11 @@ func TestConstraintOperationsValidateTheirArguments(t *testing.T) {
 
 	manager.mu.Lock()
 	defer manager.mu.Unlock()
-	if len(manager.propertyRequests) != 0 {
-		t.Fatalf("rejected arguments still wrote %d properties", len(manager.propertyRequests))
+	if len(manager.propertyRequests)+len(manager.modifyRequests) != 0 {
+		t.Fatalf(
+			"rejected arguments still wrote %d properties",
+			len(manager.propertyRequests)+len(manager.modifyRequests),
+		)
 	}
 }
 
@@ -371,7 +382,85 @@ func TestConcurrentAddConstraintAllocatesDistinctNumbers(t *testing.T) {
 	}
 	manager.mu.Lock()
 	defer manager.mu.Unlock()
-	if len(manager.propertyRequests) != writers {
-		t.Fatalf("property writes = %d, want exactly one per class", len(manager.propertyRequests))
+	if len(manager.modifyRequests) != writers {
+		t.Fatalf("versioned writes = %d, want exactly one per class", len(manager.modifyRequests))
+	}
+}
+
+// constraintConnectorOver builds a connector over an existing fake manager, so
+// two connectors can share one server's property state.
+func constraintConnectorOver(t *testing.T, manager *fakeManagerAdapter) *Connector {
+	t.Helper()
+	names := &fakeTableNames{byName: map[string]string{"events": "1"}}
+	connector := testConnectorWithDiscovery(t, &fakeTabletWalker{}, names)
+	connector.manager = manager
+	connector.managerAddr = fakeManagerAddress{address: "manager:9997"}
+	connector.clientAddr = fakeClientServiceAddresses{addresses: []string{"tserver:9997"}}
+	return connector
+}
+
+// TestAddConstraintRetriesWhenAnotherConnectorWinsTheVersion pins the
+// cross-connector case: a per-connector lock cannot order two clients, so the
+// write is a compare-and-set. The loser must retry against the winner's state
+// rather than overwrite it.
+func TestAddConstraintRetriesWhenAnotherConnectorWinsTheVersion(t *testing.T) {
+	shared := &fakeManagerAdapter{configuration: map[string]string{}}
+	first := constraintConnectorOver(t, shared)
+	second := constraintConnectorOver(t, shared)
+
+	// A plain guard rather than sync.Once: the nested call re-enters the hook,
+	// and Once.Do is not reentrant.
+	var hookMu sync.Mutex
+	fired := false
+	var winnerNumber int32
+	var winnerErr error
+	shared.mu.Lock()
+	shared.beforeModify = func() {
+		hookMu.Lock()
+		if fired {
+			hookMu.Unlock()
+			return
+		}
+		fired = true
+		hookMu.Unlock()
+		// Runs while the first connector still holds the version it read.
+		winnerNumber, winnerErr = second.AddConstraint(
+			context.Background(), "events", "org.example.Winner",
+		)
+	}
+	shared.mu.Unlock()
+
+	loserNumber, err := first.AddConstraint(context.Background(), "events", "org.example.Loser")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if winnerErr != nil {
+		t.Fatal(winnerErr)
+	}
+	if winnerNumber != 1 {
+		t.Fatalf("winner number = %d, want 1", winnerNumber)
+	}
+	if loserNumber != 2 {
+		t.Fatalf("loser number = %d, want 2 after retrying against the winner's state", loserNumber)
+	}
+
+	shared.mu.Lock()
+	rejected := shared.rejectedModifies
+	shared.mu.Unlock()
+	if rejected != 1 {
+		t.Fatalf("rejected writes = %d, want the stale write to be rejected once", rejected)
+	}
+
+	installed, err := first.ListConstraints(context.Background(), "events")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(installed) != 2 {
+		t.Fatalf("installed = %#v, want both classes", installed)
+	}
+	for _, want := range []string{"org.example.Winner", "org.example.Loser"} {
+		if _, found := constraintNumberOf(installed, want); !found {
+			t.Fatalf("%s was overwritten: %#v", want, installed)
+		}
 	}
 }

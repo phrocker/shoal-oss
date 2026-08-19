@@ -1262,6 +1262,11 @@ func (noopClientRPC) GetVersionedNamespaceProperties(
 ) (VersionedProperties, error) {
 	return VersionedProperties{}, nil
 }
+func (noopClientRPC) GetVersionedTableProperties(
+	context.Context, *security.TCredentials, string,
+) (VersionedProperties, error) {
+	return VersionedProperties{}, nil
+}
 func (noopClientRPC) CreateLocalUser(
 	context.Context, *security.TCredentials, string, []byte,
 ) error {
@@ -1539,6 +1544,14 @@ func (r *fakeClientRPC) GetNamespaceProperties(
 	return r.GetTableConfiguration(ctx, credentials, namespace)
 }
 
+func (r *fakeClientRPC) GetVersionedTableProperties(
+	ctx context.Context,
+	credentials *security.TCredentials,
+	tableName string,
+) (VersionedProperties, error) {
+	return r.GetVersionedNamespaceProperties(ctx, credentials, tableName)
+}
+
 func (r *fakeClientRPC) GetVersionedNamespaceProperties(
 	ctx context.Context,
 	_ *security.TCredentials,
@@ -1555,24 +1568,27 @@ func (r *fakeClientRPC) GetVersionedNamespaceProperties(
 }
 
 type fakeManagerRPC struct {
-	initiateErr    error
-	waitFlushErr   error
-	setErr         error
-	removeErr      error
-	waitFlush      func(context.Context) error
-	tableName      string
-	property       string
-	value          string
-	flushTableID   string
-	flushStartRow  []byte
-	flushEndRow    []byte
-	flushID        int64
-	waitFlushID    int64
-	maxLoops       []int64
-	initiateCalls  atomic.Int32
-	flushWaitCalls atomic.Int32
-	setCalls       atomic.Int32
-	removeCalls    atomic.Int32
+	initiateErr        error
+	waitFlushErr       error
+	setErr             error
+	removeErr          error
+	waitFlush          func(context.Context) error
+	tableName          string
+	property           string
+	value              string
+	flushTableID       string
+	modifiedTable      string
+	modifiedProperties VersionedProperties
+	modifyErr          error
+	flushStartRow      []byte
+	flushEndRow        []byte
+	flushID            int64
+	waitFlushID        int64
+	maxLoops           []int64
+	initiateCalls      atomic.Int32
+	flushWaitCalls     atomic.Int32
+	setCalls           atomic.Int32
+	removeCalls        atomic.Int32
 }
 
 func (r *fakeManagerRPC) InitiateFlush(
@@ -1602,6 +1618,17 @@ func (r *fakeManagerRPC) WaitForFlush(
 		return r.waitFlush(ctx)
 	}
 	return r.waitFlushErr
+}
+
+func (r *fakeManagerRPC) ModifyTableProperties(
+	_ context.Context,
+	_ *security.TCredentials,
+	tableName string,
+	properties VersionedProperties,
+) error {
+	r.modifiedTable = tableName
+	r.modifiedProperties = properties
+	return r.modifyErr
 }
 
 func (r *fakeManagerRPC) SetTableProperty(

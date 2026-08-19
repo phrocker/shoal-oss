@@ -114,6 +114,23 @@ func (m *fakeSplitManager) UpdateTabletMergeability(
 	return fn(index, updates)
 }
 
+func (m *fakeSplitManager) GetVersionedTableProperties(
+	context.Context,
+	string,
+	string,
+) (managerclient.VersionedProperties, error) {
+	return managerclient.VersionedProperties{}, nil
+}
+
+func (m *fakeSplitManager) ModifyTableProperties(
+	context.Context,
+	string,
+	string,
+	managerclient.VersionedProperties,
+) error {
+	return nil
+}
+
 func (m *fakeSplitManager) FlushTable(
 	context.Context,
 	string,

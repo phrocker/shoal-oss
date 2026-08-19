@@ -1,7 +1,7 @@
-# Revision-24 compiled C ABI symbol inventory for docs/sharkbite-compatibility.md.
+# Revision-25 compiled C ABI symbol inventory for docs/sharkbite-compatibility.md.
 # Generated from the undefined/imported shoal_* references emitted by compiling the exact C/C++
 # sources that cmd/shoal-capi/cabi_test.go links in TestSharedLibraryCABI.
-# Update only when the independently audited revision-24 compiled inventory changes.
+# Update only when the independently audited revision-25 compiled inventory changes.
 
 [declared]
 shoal_abi_version

@@ -85,6 +85,9 @@ const (
 	ErrorSecurity
 	ErrorNotActive
 	ErrorTableOffline
+	// ErrorConcurrentModification reports that a versioned property write lost
+	// its compare-and-set: another writer changed the set first.
+	ErrorConcurrentModification
 )
 
 type Error struct {
@@ -146,6 +149,8 @@ type Adapter interface {
 	GetNamespaceConfiguration(context.Context, string, string) (map[string]string, error)
 	GetNamespaceProperties(context.Context, string, string) (map[string]string, error)
 	GetVersionedNamespaceProperties(context.Context, string, string) (VersionedProperties, error)
+	GetVersionedTableProperties(context.Context, string, string) (VersionedProperties, error)
+	ModifyTableProperties(context.Context, string, string, VersionedProperties) error
 	SetTableProperty(context.Context, string, string, string, string) error
 	RemoveTableProperty(context.Context, string, string, string) error
 	SetNamespaceProperty(context.Context, string, string, string, string) error
@@ -187,6 +192,7 @@ type managerRPC interface {
 	InitiateFlush(context.Context, *security.TCredentials, string) (int64, error)
 	WaitForFlush(context.Context, *security.TCredentials, string, []byte, []byte, int64, int64) error
 	SetTableProperty(context.Context, *security.TCredentials, string, string, string) error
+	ModifyTableProperties(context.Context, *security.TCredentials, string, VersionedProperties) error
 	RemoveTableProperty(context.Context, *security.TCredentials, string, string) error
 	UpdateTabletMergeability(
 		context.Context,
@@ -215,6 +221,11 @@ type clientRPC interface {
 		string,
 	) (map[string]string, error)
 	GetVersionedNamespaceProperties(
+		context.Context,
+		*security.TCredentials,
+		string,
+	) (VersionedProperties, error)
+	GetVersionedTableProperties(
 		context.Context,
 		*security.TCredentials,
 		string,
@@ -400,6 +411,49 @@ func (p *Pooled) FlushTable(
 	start, end := cloneRow(startRow), cloneRow(endRow)
 	_, err = withManagerClient(p, ctx, address, func(rpc managerRPC) (struct{}, error) {
 		return struct{}{}, rpc.WaitForFlush(ctx, credentials, tableID, start, end, flushID, maxLoops)
+	})
+	return mapRPCError(err)
+}
+
+// GetVersionedTableProperties reads a table's own properties together with the
+// version a compare-and-set write must present.
+func (p *Pooled) GetVersionedTableProperties(
+	ctx context.Context,
+	address, tableName string,
+) (VersionedProperties, error) {
+	if tableName == "" {
+		return VersionedProperties{}, errors.New("managerclient: empty table name")
+	}
+	credentials, err := p.credentialsForRPC()
+	if err != nil {
+		return VersionedProperties{}, err
+	}
+	properties, err := withClientService(p, ctx, address, func(rpc clientRPC) (VersionedProperties, error) {
+		return rpc.GetVersionedTableProperties(ctx, credentials, tableName)
+	})
+	if err != nil {
+		return VersionedProperties{}, mapRPCError(err)
+	}
+	return properties, nil
+}
+
+// ModifyTableProperties replaces a table's own properties, but only while the
+// stored version still matches the one read. A losing writer gets
+// ErrorConcurrentModification rather than silently overwriting.
+func (p *Pooled) ModifyTableProperties(
+	ctx context.Context,
+	address, tableName string,
+	properties VersionedProperties,
+) error {
+	if tableName == "" {
+		return errors.New("managerclient: empty table name")
+	}
+	credentials, err := p.credentialsForRPC()
+	if err != nil {
+		return err
+	}
+	_, err = withManagerClient(p, ctx, address, func(rpc managerRPC) (struct{}, error) {
+		return struct{}{}, rpc.ModifyTableProperties(ctx, credentials, tableName, properties)
 	})
 	return mapRPCError(err)
 }
@@ -945,6 +999,29 @@ func (r thriftClientRPC) GetVersionedNamespaceProperties(
 	}, nil
 }
 
+func (r thriftClientRPC) GetVersionedTableProperties(
+	ctx context.Context,
+	credentials *security.TCredentials,
+	tableName string,
+) (VersionedProperties, error) {
+	properties, err := r.raw.GetVersionedTableProperties(
+		ctx,
+		clientgen.NewTInfo(),
+		credentials,
+		tableName,
+	)
+	if err != nil {
+		return VersionedProperties{}, err
+	}
+	if properties == nil {
+		return VersionedProperties{}, errors.New("managerclient: versioned table properties returned nil")
+	}
+	return VersionedProperties{
+		Version:    properties.Version,
+		Properties: cloneOptions(properties.Properties),
+	}, nil
+}
+
 func (r thriftClientRPC) CreateLocalUser(
 	ctx context.Context,
 	credentials *security.TCredentials,
@@ -1132,6 +1209,24 @@ func (r thriftManagerRPC) WaitForFlush(
 		endRow,
 		flushID,
 		maxLoops,
+	)
+}
+
+func (r thriftManagerRPC) ModifyTableProperties(
+	ctx context.Context,
+	credentials *security.TCredentials,
+	tableName string,
+	properties VersionedProperties,
+) error {
+	return r.raw.ModifyTableProperties(
+		ctx,
+		&clientgen.TInfo{},
+		credentials,
+		tableName,
+		&clientgen.TVersionedProperties{
+			Version:    properties.Version,
+			Properties: cloneOptions(properties.Properties),
+		},
 	)
 }
 
@@ -1381,6 +1476,14 @@ func mapRPCError(err error) error {
 			kind = ErrorNamespaceNotFound
 		}
 		return &Error{Kind: kind, User: securityErr.User, Code: securityErr.Code.String()}
+	}
+	var concurrentErr *clientgen.ThriftConcurrentModificationException
+	if errors.As(err, &concurrentErr) {
+		return &Error{
+			Kind:        ErrorConcurrentModification,
+			Description: concurrentErr.Description,
+			Code:        "CONCURRENT_MODIFICATION",
+		}
 	}
 	var inactiveErr *clientgen.ThriftNotActiveServiceException
 	if errors.As(err, &inactiveErr) {

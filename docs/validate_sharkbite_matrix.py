@@ -14,7 +14,7 @@ import tempfile
 
 
 DOC_PATH = Path(__file__).with_name("sharkbite-compatibility.md")
-EXPECTED_REVISION = 24
+EXPECTED_REVISION = 25
 # Update this manifest only when the independently audited inventory itself
 # changes; review every added/removed or reclassified ID in code review.
 EXPECTED_ROW_MANIFEST = DOC_PATH.with_name(
@@ -60,9 +60,9 @@ def status_count_map(
 
 EXPECTED_STATUS_COUNTS = {
     "Covered": 13,
-    "Missing Go": 2364,
-    "Missing C ABI": 125,
-    "Behavior mismatch": 222,
+    "Missing Go": 2361,
+    "Missing C ABI": 129,
+    "Behavior mismatch": 221,
     "Intentional divergence (approval required)": 87,
     "Not required (rationale required)": 392,
 }
@@ -88,8 +88,8 @@ EXPECTED_PREFIX_COUNTS = {
         not_required=8,
     ),
     "SB-CXX": status_count_map(
-        missing_go=2299,
-        missing_c_abi=8,
+        missing_go=2297,
+        missing_c_abi=10,
         behavior_mismatch=15,
         not_required=304,
     ),
@@ -136,8 +136,9 @@ EXPECTED_PREFIX_COUNTS = {
         not_required=1,
     ),
     "SB-TABLE": status_count_map(
-        missing_go=2,
-        behavior_mismatch=14,
+        missing_go=1,
+        missing_c_abi=2,
+        behavior_mismatch=13,
         not_required=6,
     ),
     "SB-TORCH": status_count_map(missing_c_abi=9),
@@ -202,7 +203,8 @@ EXPECTED_METADATA_FIELDS = {
 
 EXPECTED_DOCUMENT_STATUS_SNIPPETS = (
     "Normative gate. Binding on all Sharkbite-compatibility work.",
-    f"Revision {EXPECTED_REVISION} — completes the configuration and instance-topology C ABI",
+    f"Revision {EXPECTED_REVISION} — records constraint administration and row-bounded flush",
+    "Revision 24 — completes the configuration and instance-topology C ABI",
     "Revision 23 — records the public data-model value types",
     "Revision 22 — reclassifies the thirty-one RFile and stream rows of [§15](#sec-15)",
     "Revision 21 — adds owned range and iterator-setting descriptor ABIs",
@@ -322,6 +324,13 @@ OPTIONAL_ANCHOR_CITATIONS = {
 # Implementation files behind the section 15 RFile rows. Anchor-checked for the
 # same reason: the matrix claims an exact public Go surface, so a rename or a
 # deleted method must fail the document, not just the build.
+# Implementation files behind the section 11 table-maintenance rows.
+TARGETED_SB_TABLE_CITATIONS = {
+    "accumulo/table_constraints.go",
+    "accumulo/table_constraints_test.go",
+    "accumulo/table_flush.go",
+}
+
 # Implementation files behind the section 8 data-model value types.
 TARGETED_SB_DATA_CITATIONS = {
     "accumulo/authorizations.go",
@@ -348,6 +357,7 @@ ANCHOR_CHECKED_CITATIONS = (
     | TARGETED_SB_CFG_CITATIONS
     | TARGETED_SB_RFILE_CITATIONS
     | TARGETED_SB_DATA_CITATIONS
+    | TARGETED_SB_TABLE_CITATIONS
 )
 COUNT_RE = re.compile(
     r"^(?P<bold>\*\*)?(?P<number>0|[1-9]\d*|[1-9]\d{0,2}(?:,\d{3})+)(?(bold)\*\*|)$"

@@ -2,10 +2,14 @@ package accumulo
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strconv"
 	"strings"
+
+	"github.com/phrocker/shoal/internal/managerclient"
+	"github.com/phrocker/shoal/internal/zk"
 )
 
 // ConstraintPropertyPrefix is the table-property prefix Accumulo stores
@@ -68,37 +72,116 @@ func (c *Connector) AddConstraint(
 	defer c.constraintMu.Unlock()
 
 	for attempt := 0; attempt < constraintAllocationAttempts; attempt++ {
-		installed, err := c.ListConstraints(ctx, tableName)
+		owned, err := c.versionedTableProperties(ctx, tableName)
 		if err != nil {
 			return 0, err
 		}
-		if number, found := constraintNumberOf(installed, className); found {
-			return number, nil
-		}
-
-		number := nextConstraintNumber(installed)
-		property := ConstraintPropertyPrefix + strconv.FormatInt(int64(number), 10)
-		if err := c.SetTableProperty(ctx, tableName, property, className); err != nil {
-			return 0, err
-		}
-
-		// Another client may have written the same number between the read and
-		// the write. Confirm the number holds this class before reporting it.
-		confirmed, err := c.ListConstraints(ctx, tableName)
+		effective, err := c.EffectiveTableProperties(ctx, tableName)
 		if err != nil {
 			return 0, err
 		}
-		if class, found := constraintClassAt(confirmed, number); found && class == className {
+		// Allocate against everything the table sees, so a table-local number
+		// cannot shadow one a namespace already installed, and write against
+		// the table's own set, which is what the versioned write governs.
+		visible := parseConstraints(mergeProperties(effective, owned.Properties))
+		if number, found := constraintNumberOf(visible, className); found {
 			return number, nil
 		}
-		if number, found := constraintNumberOf(confirmed, className); found {
+
+		number := nextConstraintNumber(visible)
+		next := mergeProperties(owned.Properties, nil)
+		next[ConstraintPropertyPrefix+strconv.FormatInt(int64(number), 10)] = className
+		err = c.modifyTableProperties(ctx, tableName, managerclient.VersionedProperties{
+			Version:    owned.Version,
+			Properties: next,
+		})
+		if err == nil {
 			return number, nil
+		}
+		if !isConcurrentModification(err) {
+			return 0, err
 		}
 	}
 	return 0, fmt.Errorf(
 		"%w: table %q after %d attempts",
 		ErrConstraintNumberUnavailable, tableName, constraintAllocationAttempts,
 	)
+}
+
+// versionedTableProperties reads the table's own properties and the version a
+// compare-and-set write must present.
+func (c *Connector) versionedTableProperties(
+	ctx context.Context,
+	tableName string,
+) (managerclient.VersionedProperties, error) {
+	manager, address, err := c.managerEndpoint(ctx)
+	if err != nil {
+		return managerclient.VersionedProperties{}, err
+	}
+	properties, err := manager.GetVersionedTableProperties(ctx, address, tableName)
+	if err != nil {
+		return managerclient.VersionedProperties{}, mapManagerPropertyError(tableName, "", err)
+	}
+	return properties, nil
+}
+
+// modifyTableProperties replaces the table's own properties at a version.
+func (c *Connector) modifyTableProperties(
+	ctx context.Context,
+	tableName string,
+	properties managerclient.VersionedProperties,
+) error {
+	manager, address, err := c.managerEndpoint(ctx)
+	if err != nil {
+		return err
+	}
+	if err := manager.ModifyTableProperties(ctx, address, tableName, properties); err != nil {
+		return mapManagerPropertyError(tableName, ConstraintPropertyPrefix, err)
+	}
+	return nil
+}
+
+// managerEndpoint resolves the manager adapter and address, applying the same
+// lifecycle checks every table operation performs.
+func (c *Connector) managerEndpoint(ctx context.Context) (managerclient.Adapter, string, error) {
+	c.mu.RLock()
+	if c.closed {
+		c.mu.RUnlock()
+		return nil, "", ErrConnectorClosed
+	}
+	manager := c.manager
+	resolver := c.managerAddr
+	c.mu.RUnlock()
+	if manager == nil || resolver == nil {
+		return nil, "", ErrDiscoveryUnavailable
+	}
+	address, err := resolver.Address(ctx)
+	if errors.Is(err, zk.ErrManagerUnavailable) {
+		return nil, "", ErrManagerUnavailable
+	}
+	if err != nil {
+		return nil, "", fmt.Errorf("accumulo: discover manager: %w", err)
+	}
+	return manager, address, nil
+}
+
+// isConcurrentModification reports whether a versioned write lost its
+// compare-and-set and should be retried against a fresh read.
+func isConcurrentModification(err error) bool {
+	var managerErr *managerclient.Error
+	return errors.As(err, &managerErr) && managerErr.Kind == managerclient.ErrorConcurrentModification
+}
+
+// mergeProperties returns a new map holding base overlaid with overlay.
+func mergeProperties(base, overlay map[string]string) map[string]string {
+	merged := make(map[string]string, len(base)+len(overlay))
+	for key, value := range base {
+		merged[key] = value
+	}
+	for key, value := range overlay {
+		merged[key] = value
+	}
+	return merged
 }
 
 // ListConstraints returns the constraints installed on a table, ordered by
