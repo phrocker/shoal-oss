@@ -37,7 +37,7 @@ type Backend struct {
 	maxBytes int64
 
 	mu      sync.Mutex
-	cond    *sync.Cond          // signals when an in-flight download finishes
+	cond    *sync.Cond // signals when an in-flight download finishes
 	lru     *lruList
 	index   map[string]*lruNode // hash → node
 	flights map[string]bool     // hashes with an in-flight download
@@ -47,6 +47,11 @@ type Backend struct {
 }
 
 var _ storage.Backend = (*Backend)(nil)
+
+// InnerBackend exposes the wrapped backend so callers that need to reason
+// about the original path semantics (for example local-vs-remote alias
+// detection) can unwrap the cache layer.
+func (b *Backend) InnerBackend() storage.Backend { return b.inner }
 
 // New constructs a disk cache over inner, storing files under dir (created
 // if absent) and bounding total resident bytes to maxBytes. Existing files

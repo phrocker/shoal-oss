@@ -160,7 +160,7 @@ func (e *Engine) ExportRFiles(ctx context.Context, tableName string, dst storage
 	for _, f := range files {
 		rel := e.exportRelPath(f, tableName, opts.ProducerID)
 		manifestRel := rel
-		dstPath := joinBackendPath(opts.DestinationRoot, filepath.FromSlash(rel))
+		dstPath := joinBackendPath(dst, opts.DestinationRoot, filepath.FromSlash(rel))
 		size, sum, bcVersion, err := copyOrStampRFile(ctx, e.backend, f.Path, dst, dstPath, opts)
 		if err != nil {
 			return nil, err
@@ -184,7 +184,7 @@ func (e *Engine) ExportRFiles(ctx context.Context, tableName string, dst storage
 
 	manifestPath := opts.ManifestPath
 	if manifestPath == "" {
-		manifestPath = joinBackendPath(opts.DestinationRoot, "manifest.json")
+		manifestPath = joinBackendPath(dst, opts.DestinationRoot, "manifest.json")
 	}
 	data, err := json.MarshalIndent(manifest, "", "  ")
 	if err != nil {
@@ -206,11 +206,15 @@ func (m *RFileExportManifest) tabletCount() int {
 	return len(m.Tablets)
 }
 
-func joinBackendPath(root, rel string) string {
-	if strings.Contains(root, "://") {
+func joinBackendPath(dst storage.Backend, root, rel string) string {
+	if usesBackendSeparatorJoinRoot(dst, root) {
 		return strings.TrimRight(root, `/\`) + "/" + filepath.ToSlash(rel)
 	}
 	return filepath.Join(root, rel)
+}
+
+func usesBackendSeparatorJoinRoot(dst storage.Backend, root string) bool {
+	return storage.UsesBackendPathJoin(dst, root)
 }
 
 // VerifyRFileExport verifies that every manifest object exists and matches size/hash.
