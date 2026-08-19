@@ -397,7 +397,7 @@ func TestStaticInstanceTopology(t *testing.T) {
 }
 
 func TestNoTopologyStub(t *testing.T) {
-	var stub NoTopology
+	stub := &NoTopology{}
 	if _, err := stub.RootTabletLocation(context.Background()); !errors.Is(err, ErrDiscoveryUnavailable) {
 		t.Fatalf("RootTabletLocation error = %v", err)
 	}
@@ -410,8 +410,18 @@ func TestNoTopologyStub(t *testing.T) {
 	if stub.ZooKeepers() != nil || stub.Root() != "" {
 		t.Fatal("stub reported wiring it does not have")
 	}
-	if config := stub.Configuration(); config == nil || config.Len() != 0 {
+	config := stub.Configuration()
+	if config == nil || config.Len() != 0 {
 		t.Fatal("stub configuration is not an empty configuration")
+	}
+	config.Set("key", "value")
+	if got := stub.Configuration().Get("key"); got != "value" {
+		t.Fatal("stub configuration is not stable across calls")
+	}
+
+	other := &NoTopology{}
+	if _, ok := other.Configuration().Lookup("key"); ok {
+		t.Fatal("stub configurations leaked across instances")
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())

@@ -269,11 +269,11 @@ func cloneProperties(source map[string]string) map[string]string {
 
 type testAdminInstance struct{ accumulo.NoTopology }
 
-func (testAdminInstance) Info() accumulo.InstanceInfo {
+func (*testAdminInstance) Info() accumulo.InstanceInfo {
 	return accumulo.InstanceInfo{Name: "test", ID: "test-id"}
 }
 
-func (testAdminInstance) Close() error {
+func (*testAdminInstance) Close() error {
 	return nil
 }
 
@@ -283,7 +283,7 @@ func shoal_test_connector_create(outConnector **C.shoal_connector) C.int {
 		return 0
 	}
 	*outConnector = nil
-	owned := newOwnedConnector(newTestAdminConnector(), testAdminInstance{})
+	owned := newOwnedConnector(newTestAdminConnector(), &testAdminInstance{})
 	id, ok := connectors.add(owned)
 	if !ok {
 		return 0

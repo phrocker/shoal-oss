@@ -118,14 +118,22 @@ func (c *fakeConnectorAPI) EffectiveTableProperties(
 
 type fakeConnectorInstance struct {
 	accumulo.NoTopology
-	close func() error
+	configuration *accumulo.Configuration
+	close         func() error
 }
 
-func (i fakeConnectorInstance) Info() accumulo.InstanceInfo {
+func (i *fakeConnectorInstance) Info() accumulo.InstanceInfo {
 	return accumulo.InstanceInfo{Name: "test", ID: "test-id"}
 }
 
-func (i fakeConnectorInstance) Close() error {
+func (i *fakeConnectorInstance) Configuration() *accumulo.Configuration {
+	if i.configuration == nil {
+		i.configuration = accumulo.NewConfiguration()
+	}
+	return i.configuration
+}
+
+func (i *fakeConnectorInstance) Close() error {
 	if i.close == nil {
 		return nil
 	}
@@ -140,7 +148,7 @@ func TestOwnedConnectorCloseCancelsAndJoinsActiveCalls(t *testing.T) {
 			connectorCloses.Add(1)
 			return nil
 		}},
-		fakeConnectorInstance{close: func() error {
+		&fakeConnectorInstance{close: func() error {
 			instanceCloses.Add(1)
 			return nil
 		}},
@@ -195,7 +203,7 @@ func TestOwnedConnectorCloseBoundedWait(t *testing.T) {
 			connectorCloses.Add(1)
 			return nil
 		}},
-		fakeConnectorInstance{close: func() error {
+		&fakeConnectorInstance{close: func() error {
 			instanceCloses.Add(1)
 			return nil
 		}},
@@ -246,7 +254,7 @@ func TestOwnedConnectorCloseBoundedIncludesFinalClose(t *testing.T) {
 			<-unblockConnectorClose
 			return nil
 		}},
-		fakeConnectorInstance{close: func() error {
+		&fakeConnectorInstance{close: func() error {
 			instanceCloses.Add(1)
 			close(instanceCloseStarted)
 			<-unblockInstanceClose
@@ -308,7 +316,7 @@ func TestOwnedConnectorCloseBoundedIncludesInstanceClose(t *testing.T) {
 			connectorCloses.Add(1)
 			return nil
 		}},
-		fakeConnectorInstance{close: func() error {
+		&fakeConnectorInstance{close: func() error {
 			instanceCloses.Add(1)
 			close(instanceCloseStarted)
 			<-unblockInstanceClose
@@ -389,7 +397,7 @@ func TestOwnedConnectorCloseRecoversResourcePanics(t *testing.T) {
 					}
 					return nil
 				}},
-				fakeConnectorInstance{close: func() error {
+				&fakeConnectorInstance{close: func() error {
 					instanceCloses.Add(1)
 					if test.instancePanic {
 						panic("instance exploded")
@@ -443,7 +451,7 @@ func TestOwnedConnectorCloseBoundedBackgroundCleanupWaitsAndRecoversPanics(t *te
 			<-unblockConnectorClose
 			panic("connector exploded")
 		}},
-		fakeConnectorInstance{close: func() error {
+		&fakeConnectorInstance{close: func() error {
 			defer close(backgroundCloseFinished)
 			instanceCloses.Add(1)
 			panic("instance exploded")
@@ -503,7 +511,7 @@ func TestOwnedConnectorCloseIsConcurrentAndIdempotent(t *testing.T) {
 			connectorCloses.Add(1)
 			return nil
 		}},
-		fakeConnectorInstance{close: func() error {
+		&fakeConnectorInstance{close: func() error {
 			instanceCloses.Add(1)
 			return nil
 		}},
@@ -611,7 +619,7 @@ func TestOwnedScannerOwnerCloseBoundedRejectsNewCallsAndWaitsForInflightScans(t 
 			close(connectorCloseStarted)
 			return nil
 		}},
-		fakeConnectorInstance{close: func() error {
+		&fakeConnectorInstance{close: func() error {
 			instanceCloses.Add(1)
 			return nil
 		}},

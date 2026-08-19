@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"path"
+	"sync"
 	"time"
 
 	gozk "github.com/go-zookeeper/zk"
@@ -75,6 +76,7 @@ func NewWithAuth(servers []string, instanceName string, sessionTimeout time.Dura
 			return nil, fmt.Errorf("zk add digest auth: %w", err)
 		}
 	}
+
 	l := &Locator{
 		conn:           conn,
 		instanceName:   instanceName,
@@ -118,7 +120,12 @@ func (l *Locator) lookupInstanceID() (string, error) {
 // e.g. during tablet movement; caller should retry.
 func (l *Locator) RootTabletLocation(ctx context.Context) (*Location, error) {
 	p := path.Join(zRoot, l.instanceID, zRootTablet)
-	data, _, err := l.get(ctx, p)
+	reader, closeScope, err := l.topologyReadScope(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer closeScope()
+	data, err := reader.GetRaw(ctx, p)
 	if err != nil {
 		return nil, err
 	}
@@ -176,6 +183,77 @@ type rawResult struct {
 	data []byte
 	stat *gozk.Stat
 	err  error
+}
+
+type scopedTopologyReader struct {
+	instancePath string
+	conn         rawZKConn
+	closeOnce    sync.Once
+}
+
+func (r *scopedTopologyReader) InstancePath() string { return r.instancePath }
+
+func (r *scopedTopologyReader) GetRaw(ctx context.Context, znodePath string) ([]byte, error) {
+	data, _, err := r.get(ctx, znodePath)
+	return data, err
+}
+
+func (r *scopedTopologyReader) get(ctx context.Context, znodePath string) ([]byte, *gozk.Stat, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
+	result := make(chan rawResult, 1)
+	go func() {
+		data, stat, err := r.conn.Get(znodePath)
+		if err != nil {
+			err = fmt.Errorf("get %s: %w", znodePath, err)
+		}
+		result <- rawResult{data: data, stat: stat, err: err}
+	}()
+
+	select {
+	case response := <-result:
+		if err := ctx.Err(); err != nil {
+			r.Close()
+			return nil, nil, err
+		}
+		return response.data, response.stat, response.err
+	case <-ctx.Done():
+		r.Close()
+		<-result
+		return nil, nil, ctx.Err()
+	}
+}
+
+func (r *scopedTopologyReader) Children(ctx context.Context, znodePath string) ([]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	result := make(chan rawChildrenResult, 1)
+	go func() {
+		names, _, err := r.conn.Children(znodePath)
+		if err != nil {
+			err = fmt.Errorf("children %s: %w", znodePath, err)
+		}
+		result <- rawChildrenResult{names: names, err: err}
+	}()
+
+	select {
+	case response := <-result:
+		if err := ctx.Err(); err != nil {
+			r.Close()
+			return nil, err
+		}
+		return response.names, response.err
+	case <-ctx.Done():
+		r.Close()
+		<-result
+		return nil, ctx.Err()
+	}
+}
+
+func (r *scopedTopologyReader) Close() {
+	r.closeOnce.Do(func() { r.conn.Close() })
 }
 
 func getRawWithContext(
@@ -250,6 +328,30 @@ func (l *Locator) rawConnFactoryOrDefault() func() (rawZKConn, error) {
 		conn, _, err := gozk.Connect(l.servers, l.sessionTimeout)
 		return conn, err
 	}
+}
+
+func (l *Locator) topologyReadScope(ctx context.Context) (LockReader, func(), error) {
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
+	if ctx.Done() == nil {
+		return l, func() {}, nil
+	}
+	conn, err := l.rawConnFactoryOrDefault()()
+	if err != nil {
+		return nil, nil, fmt.Errorf("zk connect: %w", err)
+	}
+	if l.instanceSecret != "" {
+		if err := conn.AddAuth("digest", []byte("accumulo:"+l.instanceSecret)); err != nil {
+			conn.Close()
+			return nil, nil, fmt.Errorf("zk add digest auth: %w", err)
+		}
+	}
+	scope := &scopedTopologyReader{
+		instancePath: l.InstancePath(),
+		conn:         conn,
+	}
+	return scope, scope.Close, nil
 }
 
 type rawChildrenResult struct {

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"strconv"
+	"sync"
 
 	"github.com/phrocker/shoal/internal/zk"
 )
@@ -126,7 +127,7 @@ func (i *zkLocator) ManagerLocations(ctx context.Context) ([]string, error) {
 // /accumulo/<instance-id>/{tservers,sservers,compactors}/<resource-group>/<server>,
 // and the lowest-sequence lock node of every server carries ServiceLockData
 // JSON whose CLIENT descriptor holds the client-service address. Results are
-// ordered by role, then resource group, then server. Sharkbite reads the flat
+// ordered by role, then resource group, then advertised address. Sharkbite reads the flat
 // Accumulo 1.x /<root>/tservers layout, which has no resource groups and no
 // scan servers or compactors.
 //
@@ -211,10 +212,13 @@ func (i *staticInstance) Configuration() *Configuration { return i.configuration
 // live-state accessor reports ErrDiscoveryUnavailable instead of pretending
 // to resolve anything. Embed it to satisfy Instance and override the methods
 // that a particular implementation can answer.
-type NoTopology struct{}
+type NoTopology struct {
+	configurationOnce sync.Once
+	configuration     *Configuration
+}
 
 // RootTabletLocation reports ErrDiscoveryUnavailable.
-func (NoTopology) RootTabletLocation(ctx context.Context) (TabletLocation, error) {
+func (*NoTopology) RootTabletLocation(ctx context.Context) (TabletLocation, error) {
 	if err := ctx.Err(); err != nil {
 		return TabletLocation{}, err
 	}
@@ -222,7 +226,7 @@ func (NoTopology) RootTabletLocation(ctx context.Context) (TabletLocation, error
 }
 
 // ManagerLocations reports ErrDiscoveryUnavailable.
-func (NoTopology) ManagerLocations(ctx context.Context) ([]string, error) {
+func (*NoTopology) ManagerLocations(ctx context.Context) ([]string, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -230,7 +234,7 @@ func (NoTopology) ManagerLocations(ctx context.Context) ([]string, error) {
 }
 
 // Servers reports ErrDiscoveryUnavailable.
-func (NoTopology) Servers(ctx context.Context) ([]ServerConnection, error) {
+func (*NoTopology) Servers(ctx context.Context) ([]ServerConnection, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -238,14 +242,22 @@ func (NoTopology) Servers(ctx context.Context) ([]ServerConnection, error) {
 }
 
 // ZooKeepers returns nil.
-func (NoTopology) ZooKeepers() []string { return nil }
+func (*NoTopology) ZooKeepers() []string { return nil }
 
 // Root returns the empty string, because no instance root is known.
-func (NoTopology) Root() string { return "" }
+func (*NoTopology) Root() string { return "" }
 
-// Configuration returns a new empty Configuration on every call. Embedders
-// that carry client configuration should override it.
-func (NoTopology) Configuration() *Configuration { return NewConfiguration() }
+// Configuration returns a stable empty Configuration for this stub instance.
+// Embedders that carry client configuration should override it.
+func (i *NoTopology) Configuration() *Configuration {
+	if i == nil {
+		return NewConfiguration()
+	}
+	i.configurationOnce.Do(func() {
+		i.configuration = NewConfiguration()
+	})
+	return i.configuration
+}
 
 func newServerConnection(service zk.ClientService) (ServerConnection, error) {
 	host, portText, err := net.SplitHostPort(service.Address)

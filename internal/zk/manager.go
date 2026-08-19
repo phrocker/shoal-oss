@@ -56,11 +56,20 @@ type LockReader interface {
 	Children(context.Context, string) ([]string, error)
 }
 
+type topologyScopeProvider interface {
+	topologyReadScope(context.Context) (LockReader, func(), error)
+}
+
 // ManagerAddress returns the Thrift address of the active Accumulo
 // manager, or ErrManagerUnavailable when no manager currently advertises
 // one.
 func ManagerAddress(ctx context.Context, locator LockReader) (string, error) {
-	address, err := managerLockAddress(ctx, locator, svcManager)
+	reader, closeScope, err := acquireTopologyLockReader(ctx, locator)
+	if err != nil {
+		return "", err
+	}
+	defer closeScope()
+	address, err := managerLockAddress(ctx, reader, svcManager)
 	if errors.Is(err, errServiceNotAdvertised) {
 		return "", ErrManagerUnavailable
 	}
@@ -86,7 +95,12 @@ func ManagerAddress(ctx context.Context, locator LockReader) (string, error) {
 // descriptor, both of which surface as ErrCoordinatorUnavailable so
 // callers can back off and retry rather than dial a dead address.
 func CoordinatorAddress(ctx context.Context, locator LockReader) (string, error) {
-	address, err := managerLockAddress(ctx, locator, svcCoordinator)
+	reader, closeScope, err := acquireTopologyLockReader(ctx, locator)
+	if err != nil {
+		return "", err
+	}
+	defer closeScope()
+	address, err := managerLockAddress(ctx, reader, svcCoordinator)
 	if errors.Is(err, errServiceNotAdvertised) {
 		return "", ErrCoordinatorUnavailable
 	}
@@ -146,6 +160,15 @@ func managerLockAddress(ctx context.Context, locator LockReader, service string)
 // ErrManagerUnavailable when no lock node advertises a usable MANAGER
 // endpoint.
 func ManagerAddresses(ctx context.Context, locator LockReader) ([]string, error) {
+	reader, closeScope, err := acquireTopologyLockReader(ctx, locator)
+	if err != nil {
+		return nil, err
+	}
+	defer closeScope()
+	return managerAddresses(ctx, reader)
+}
+
+func managerAddresses(ctx context.Context, locator LockReader) ([]string, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -228,13 +251,28 @@ var clientServiceRoots = []struct {
 	{root: "compactors", kind: CompactorKind},
 }
 
+var clientServiceKindOrder = map[ServerKind]int{
+	TabletServerKind: 0,
+	ScanServerKind:   1,
+	CompactorKind:    2,
+}
+
 // ClientServices returns the live Accumulo 4 ClientService endpoints
 // advertised by tablet servers, scan servers, and compactors, each tagged
 // with the publishing server role and resource group. Results are ordered by
-// role (tserver, sserver, compactor), then group, then address. An address
+// role (tserver, sserver, compactor), then group, then advertised address. An address
 // published by several roles or groups is reported once per (role, group).
 // Returns ErrClientServiceUnavailable when nothing is advertised.
 func ClientServices(ctx context.Context, locator LockReader) ([]ClientService, error) {
+	reader, closeScope, err := acquireTopologyLockReader(ctx, locator)
+	if err != nil {
+		return nil, err
+	}
+	defer closeScope()
+	return clientServices(ctx, reader)
+}
+
+func clientServices(ctx context.Context, locator LockReader) ([]ClientService, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -316,12 +354,30 @@ func ClientServices(ctx context.Context, locator LockReader) ([]ClientService, e
 	if len(services) == 0 {
 		return nil, ErrClientServiceUnavailable
 	}
+	sort.Slice(services, func(i, j int) bool {
+		if services[i].Kind != services[j].Kind {
+			return clientServiceKindOrder[services[i].Kind] < clientServiceKindOrder[services[j].Kind]
+		}
+		if services[i].Group != services[j].Group {
+			return services[i].Group < services[j].Group
+		}
+		return services[i].Address < services[j].Address
+	})
 	return services, nil
 }
 
 // ClientServiceAddresses returns the live Accumulo 4 ClientService endpoints
 // advertised by tablet servers, scan servers, and compactors.
 func ClientServiceAddresses(ctx context.Context, locator LockReader) ([]string, error) {
+	reader, closeScope, err := acquireTopologyLockReader(ctx, locator)
+	if err != nil {
+		return nil, err
+	}
+	defer closeScope()
+	return clientServiceAddresses(ctx, reader)
+}
+
+func clientServiceAddresses(ctx context.Context, locator LockReader) ([]string, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -400,6 +456,13 @@ func ClientServiceAddresses(ctx context.Context, locator LockReader) ([]string, 
 	}
 	sort.Strings(result)
 	return result, nil
+}
+
+func acquireTopologyLockReader(ctx context.Context, locator LockReader) (LockReader, func(), error) {
+	if provider, ok := locator.(topologyScopeProvider); ok {
+		return provider.topologyReadScope(ctx)
+	}
+	return locator, func() {}, nil
 }
 
 func firstLockNode(children []string) string {

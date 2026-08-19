@@ -3,8 +3,10 @@ package zk
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -38,6 +40,36 @@ func (c *blockingRawConn) Close() {
 	c.once.Do(func() { close(c.closed) })
 }
 
+type staticRawTopologyConn struct {
+	data     map[string][]byte
+	children map[string][]string
+	closes   *atomic.Int32
+}
+
+func (c *staticRawTopologyConn) AddAuth(string, []byte) error { return nil }
+
+func (c *staticRawTopologyConn) Get(znodePath string) ([]byte, *gozk.Stat, error) {
+	data, ok := c.data[znodePath]
+	if !ok {
+		return nil, nil, fmt.Errorf("get %s: %w", znodePath, gozk.ErrNoNode)
+	}
+	return data, &gozk.Stat{}, nil
+}
+
+func (c *staticRawTopologyConn) Children(znodePath string) ([]string, *gozk.Stat, error) {
+	children, ok := c.children[znodePath]
+	if !ok {
+		return nil, nil, fmt.Errorf("children %s: %w", znodePath, gozk.ErrNoNode)
+	}
+	return append([]string(nil), children...), &gozk.Stat{}, nil
+}
+
+func (c *staticRawTopologyConn) Close() {
+	if c.closes != nil {
+		c.closes.Add(1)
+	}
+}
+
 func TestGetRawWithContextCancelsInFlightReadAndJoinsWorker(t *testing.T) {
 	conn := &blockingRawConn{
 		started: make(chan struct{}),
@@ -61,6 +93,35 @@ func TestGetRawWithContextCancelsInFlightReadAndJoinsWorker(t *testing.T) {
 	case <-conn.done:
 	default:
 		t.Fatal("GetRaw returned before its ZooKeeper read worker exited")
+	}
+}
+
+func TestLocatorRootTabletLocationUsesSingleScopedConnection(t *testing.T) {
+	var connects atomic.Int32
+	var closes atomic.Int32
+	loc := &Locator{
+		instanceID: "uuid-1",
+		rawConnFactory: func() (rawZKConn, error) {
+			connects.Add(1)
+			return &staticRawTopologyConn{
+				data: map[string][]byte{
+					"/accumulo/uuid-1/root_tablet": []byte(`{"version":1,"columnValues":{"loc":{"session-1":"tserver-a:9997"}}}`),
+				},
+				closes: &closes,
+			}, nil
+		},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	location, err := loc.RootTabletLocation(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if location == nil || location.HostPort != "tserver-a:9997" || location.Session != "session-1" {
+		t.Fatalf("location = %+v, want tserver-a:9997/session-1", location)
+	}
+	if connects.Load() != 1 || closes.Load() != 1 {
+		t.Fatalf("connects/closes = %d/%d, want 1/1", connects.Load(), closes.Load())
 	}
 }
 

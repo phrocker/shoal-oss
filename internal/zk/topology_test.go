@@ -7,6 +7,7 @@ import (
 	"path"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	gozk "github.com/go-zookeeper/zk"
@@ -185,6 +186,41 @@ func TestManagerAddressesPropagatesFailuresAndCancellation(t *testing.T) {
 	}
 }
 
+func TestManagerAddressesUsesSingleScopedConnection(t *testing.T) {
+	lockPath := "/accumulo/uuid-1/managers/lock"
+	var connects atomic.Int32
+	var closes atomic.Int32
+	locator := &Locator{
+		instanceID: "uuid-1",
+		rawConnFactory: func() (rawZKConn, error) {
+			connects.Add(1)
+			return &staticRawTopologyConn{
+				children: map[string][]string{
+					lockPath: {lockNode("0000000002"), lockNode("0000000001")},
+				},
+				data: map[string][]byte{
+					path.Join(lockPath, lockNode("0000000001")): managerLockData("manager-a:9997"),
+					path.Join(lockPath, lockNode("0000000002")): managerLockData("manager-b:9997"),
+				},
+				closes: &closes,
+			}, nil
+		},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	got, err := ManagerAddresses(ctx, locator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"manager-a:9997", "manager-b:9997"}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("addresses = %v, want %v", got, want)
+	}
+	if connects.Load() != 1 || closes.Load() != 1 {
+		t.Fatalf("connects/closes = %d/%d, want 1/1", connects.Load(), closes.Load())
+	}
+}
+
 func clientServiceTree() *topologyLocator {
 	root := "/accumulo/uuid-1"
 	return &topologyLocator{
@@ -229,6 +265,33 @@ func TestClientServicesReportsKindGroupAndOrder(t *testing.T) {
 		if got[i] != want[i] {
 			t.Fatalf("services[%d] = %+v, want %+v", i, got[i], want[i])
 		}
+	}
+}
+
+func TestClientServicesOrdersByAdvertisedAddress(t *testing.T) {
+	root := "/accumulo/uuid-1"
+	locator := &topologyLocator{
+		children: map[string][]string{
+			path.Join(root, "tservers"):                        {"default"},
+			path.Join(root, "tservers", "default"):             {"server-b", "server-a"},
+			path.Join(root, "tservers", "default", "server-b"): {lockNode("0000000001")},
+			path.Join(root, "tservers", "default", "server-a"): {lockNode("0000000002")},
+		},
+		data: map[string][]byte{
+			path.Join(root, "tservers", "default", "server-b", lockNode("0000000001")): clientLockData("zeta:9997"),
+			path.Join(root, "tservers", "default", "server-a", lockNode("0000000002")): clientLockData("alpha:9997"),
+		},
+	}
+	got, err := ClientServices(context.Background(), locator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []ClientService{
+		{Kind: TabletServerKind, Group: "default", Address: "alpha:9997"},
+		{Kind: TabletServerKind, Group: "default", Address: "zeta:9997"},
+	}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("services = %+v, want %+v", got, want)
 	}
 }
 
@@ -299,6 +362,52 @@ func TestClientServicesUnavailableAndFailures(t *testing.T) {
 	}
 	if _, err := ClientServices(context.Background(), nil); err == nil {
 		t.Fatal("nil locator accepted")
+	}
+}
+
+func TestClientServicesUsesSingleScopedConnection(t *testing.T) {
+	root := "/accumulo/uuid-1"
+	var connects atomic.Int32
+	var closes atomic.Int32
+	locator := &Locator{
+		instanceID: "uuid-1",
+		rawConnFactory: func() (rawZKConn, error) {
+			connects.Add(1)
+			return &staticRawTopologyConn{
+				children: map[string][]string{
+					path.Join(root, "tservers"):                        {"default"},
+					path.Join(root, "tservers", "default"):             {"server-b", "server-a"},
+					path.Join(root, "tservers", "default", "server-b"): {lockNode("0000000001")},
+					path.Join(root, "tservers", "default", "server-a"): {lockNode("0000000002")},
+					path.Join(root, "sservers"):                        {"query"},
+					path.Join(root, "sservers", "query"):               {"scan"},
+					path.Join(root, "sservers", "query", "scan"):       {lockNode("0000000001")},
+				},
+				data: map[string][]byte{
+					path.Join(root, "tservers", "default", "server-b", lockNode("0000000001")): clientLockData("zeta:9997"),
+					path.Join(root, "tservers", "default", "server-a", lockNode("0000000002")): clientLockData("alpha:9997"),
+					path.Join(root, "sservers", "query", "scan", lockNode("0000000001")):       clientLockData("scan:9996"),
+				},
+				closes: &closes,
+			}, nil
+		},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	got, err := ClientServices(ctx, locator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []ClientService{
+		{Kind: TabletServerKind, Group: "default", Address: "alpha:9997"},
+		{Kind: TabletServerKind, Group: "default", Address: "zeta:9997"},
+		{Kind: ScanServerKind, Group: "query", Address: "scan:9996"},
+	}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("services = %+v, want %+v", got, want)
+	}
+	if connects.Load() != 1 || closes.Load() != 1 {
+		t.Fatalf("connects/closes = %d/%d, want 1/1", connects.Load(), closes.Load())
 	}
 }
 
@@ -389,15 +498,79 @@ func TestLocatorChildrenCancelsInFlightRead(t *testing.T) {
 	<-conn.done
 }
 
+func TestManagerAddressesCancelsInFlightWithSingleScopedConnection(t *testing.T) {
+	conn := &blockingChildrenConn{
+		started: make(chan struct{}),
+		closed:  make(chan struct{}),
+		done:    make(chan struct{}),
+	}
+	var connects atomic.Int32
+	locator := &Locator{
+		instanceID: "uuid-1",
+		rawConnFactory: func() (rawZKConn, error) {
+			connects.Add(1)
+			return conn, nil
+		},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		_, err := ManagerAddresses(ctx, locator)
+		result <- err
+	}()
+	<-conn.started
+	cancel()
+	if err := <-result; !errors.Is(err, context.Canceled) {
+		t.Fatalf("ManagerAddresses error = %v, want context.Canceled", err)
+	}
+	<-conn.done
+	if connects.Load() != 1 {
+		t.Fatalf("connects = %d, want 1", connects.Load())
+	}
+}
+
+func TestClientServicesCancelsInFlightWithSingleScopedConnection(t *testing.T) {
+	conn := &blockingChildrenConn{
+		started: make(chan struct{}),
+		closed:  make(chan struct{}),
+		done:    make(chan struct{}),
+	}
+	var connects atomic.Int32
+	locator := &Locator{
+		instanceID: "uuid-1",
+		rawConnFactory: func() (rawZKConn, error) {
+			connects.Add(1)
+			return conn, nil
+		},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		_, err := ClientServices(ctx, locator)
+		result <- err
+	}()
+	<-conn.started
+	cancel()
+	if err := <-result; !errors.Is(err, context.Canceled) {
+		t.Fatalf("ClientServices error = %v, want context.Canceled", err)
+	}
+	<-conn.done
+	if connects.Load() != 1 {
+		t.Fatalf("connects = %d, want 1", connects.Load())
+	}
+}
+
 func TestLocatorRootTabletLocationCancelsInFlightRead(t *testing.T) {
 	conn := &blockingGetConn{
 		started: make(chan struct{}),
 		closed:  make(chan struct{}),
 		done:    make(chan struct{}),
 	}
+	var connects atomic.Int32
 	locator := &Locator{
 		instanceID: "uuid-1",
 		rawConnFactory: func() (rawZKConn, error) {
+			connects.Add(1)
 			return conn, nil
 		},
 	}
@@ -413,6 +586,9 @@ func TestLocatorRootTabletLocationCancelsInFlightRead(t *testing.T) {
 		t.Fatalf("RootTabletLocation error = %v, want context.Canceled", err)
 	}
 	<-conn.done
+	if connects.Load() != 1 {
+		t.Fatalf("connects = %d, want 1", connects.Load())
+	}
 }
 
 // blockingGetConn blocks inside Get until the connection is closed.
