@@ -7,15 +7,20 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"hash/crc32"
 	"io"
 	"log/slog"
+	"net/http"
 	"os"
 	"strings"
 	"testing"
 
 	cloudstorage "cloud.google.com/go/storage"
 	shstorage "github.com/phrocker/shoal/internal/storage"
+	"google.golang.org/api/googleapi"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 func expectedTemporaryObjectComponent(object, token string) string {
@@ -55,6 +60,66 @@ func TestParsePath(t *testing.T) {
 			}
 			if b != c.bucket || o != c.object {
 				t.Errorf("got (%q, %q), want (%q, %q)", b, o, c.bucket, c.object)
+			}
+		})
+	}
+}
+
+func TestIsAmbiguousPromotionErrorUsesStructuredPreconditionSignals(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{
+			name: "googleapi 412 conditionNotMet",
+			err:  &googleapi.Error{Code: http.StatusPreconditionFailed, Message: "conditionNotMet"},
+			want: false,
+		},
+		{
+			name: "wrapped googleapi 412",
+			err:  fmt.Errorf("wrapped: %w", &googleapi.Error{Code: http.StatusPreconditionFailed, Message: "pre-conditions mismatch"}),
+			want: false,
+		},
+		{
+			name: "grpc failed precondition",
+			err:  status.Error(codes.FailedPrecondition, "condition not met"),
+			want: false,
+		},
+		{
+			name: "wrapped grpc failed precondition",
+			err:  fmt.Errorf("wrapped: %w", status.Error(codes.FailedPrecondition, "conditionNotMet")),
+			want: false,
+		},
+		{
+			name: "misleading googleapi text with unknown code stays ambiguous",
+			err:  &googleapi.Error{Code: http.StatusInternalServerError, Message: "precondition failed"},
+			want: true,
+		},
+		{
+			name: "misleading grpc text with unknown code stays ambiguous",
+			err:  status.Error(codes.Aborted, "conditionNotMet"),
+			want: true,
+		},
+		{
+			name: "plain text without structured code stays ambiguous",
+			err:  errors.New("precondition failed"),
+			want: true,
+		},
+		{
+			name: "wrapped not found stays non ambiguous",
+			err:  fmt.Errorf("wrapped: %w", cloudstorage.ErrObjectNotExist),
+			want: false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := isAmbiguousPromotionError(tc.err)
+			if got != tc.want {
+				t.Fatalf("isAmbiguousPromotionError(%v) = %v, want %v", tc.err, got, tc.want)
 			}
 		})
 	}
@@ -1580,20 +1645,27 @@ func checkObjectConditions(bucket *fakeBucket, name string, conditions cloudstor
 	switch {
 	case conditions.DoesNotExist:
 		if exists {
-			return errFakePrecondition
+			return fakePreconditionError()
 		}
 	case conditions.GenerationMatch != 0:
 		if !exists ||
 			current.generation != conditions.GenerationMatch ||
 			current.metageneration != conditions.MetagenerationMatch {
-			return errFakePrecondition
+			return fakePreconditionError()
 		}
 	case conditions.MetagenerationMatch != 0:
 		if !exists || current.metageneration != conditions.MetagenerationMatch {
-			return errFakePrecondition
+			return fakePreconditionError()
 		}
 	}
 	return nil
+}
+
+func fakePreconditionError() error {
+	return errors.Join(
+		errFakePrecondition,
+		&googleapi.Error{Code: http.StatusPreconditionFailed, Message: "conditionNotMet"},
+	)
 }
 
 func md5Bytes(data []byte) []byte {

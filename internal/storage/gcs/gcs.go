@@ -27,13 +27,17 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
 	"strings"
 	"time"
 
 	"cloud.google.com/go/storage"
 	"github.com/google/uuid"
+	"google.golang.org/api/googleapi"
 	"google.golang.org/api/iterator"
 	"google.golang.org/api/option"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	shstorage "github.com/phrocker/shoal/internal/storage"
 )
@@ -836,6 +840,16 @@ func isAmbiguousPromotionError(err error) bool {
 	if err == nil || errors.Is(err, storage.ErrObjectNotExist) {
 		return false
 	}
-	text := strings.ToLower(err.Error())
-	return !strings.Contains(text, "precondition")
+	var httpErr *googleapi.Error
+	if errors.As(err, &httpErr) {
+		return httpErr.Code != http.StatusPreconditionFailed
+	}
+	switch status.Code(err) {
+	case codes.FailedPrecondition:
+		return false
+	case codes.OK, codes.Unknown:
+		return true
+	default:
+		return true
+	}
 }
