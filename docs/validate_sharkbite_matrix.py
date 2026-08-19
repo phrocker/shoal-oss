@@ -14,7 +14,7 @@ import tempfile
 
 
 DOC_PATH = Path(__file__).with_name("sharkbite-compatibility.md")
-EXPECTED_REVISION = 20
+EXPECTED_REVISION = 21
 # Update this manifest only when the independently audited inventory itself
 # changes; review every added/removed or reclassified ID in code review.
 EXPECTED_ROW_MANIFEST = DOC_PATH.with_name(
@@ -61,8 +61,8 @@ def status_count_map(
 EXPECTED_STATUS_COUNTS = {
     "Covered": 1,
     "Missing Go": 2409,
-    "Missing C ABI": 103,
-    "Behavior mismatch": 211,
+    "Missing C ABI": 90,
+    "Behavior mismatch": 224,
     "Intentional divergence (approval required)": 87,
     "Not required (rationale required)": 392,
 }
@@ -94,8 +94,8 @@ EXPECTED_PREFIX_COUNTS = {
     ),
     "SB-DATA": status_count_map(
         missing_go=15,
-        missing_c_abi=15,
-        behavior_mismatch=39,
+        missing_c_abi=2,
+        behavior_mismatch=52,
         not_required=6,
     ),
     "SB-EMB": status_count_map(not_required=35),
@@ -190,19 +190,18 @@ EXPECTED_METADATA_FIELDS = {
     ),
     "Sharkbite release line": "`sharkbite` 1.2.0.3 on PyPI (`setup.py:34-35`)",
     "Shoal reference": (
-        "`phrocker/shoal-oss` exact audited baseline for revision 20 "
-        "`e05daeac0675807763aad9d2720211c312e52965` "
-        "(\"Merge PR #107: expose owned connector identity discovery\") "
-        "plus the client-configuration and instance-topology Go additions "
-        "introduced in the same change as this revision"
+        "`phrocker/shoal-oss` exact audited baseline for revision 21 "
+        "`f344f70e331c339d5406a35bf33eeb230d0314ce` "
+        "(\"Merge PR #105: add client configuration and instance topology discovery\") "
+        "plus this data-descriptor ABI change"
     ),
     "Shoal C ABI version": "`SHOAL_ABI_VERSION 1u` (`capi/include/shoal_types.h`)",
 }
 
 EXPECTED_DOCUMENT_STATUS_SNIPPETS = (
     "Normative gate. Binding on all Sharkbite-compatibility work.",
-    f"Revision {EXPECTED_REVISION} — reclassifies the twelve client-configuration "
-    f"and instance-topology rows of [§6](#sec-6)",
+    f"Revision {EXPECTED_REVISION} — adds owned range and iterator-setting descriptor ABIs",
+    "Revision 20 reclassifies the twelve client-configuration and instance-topology rows",
     "Revision 19 added the merged connector-identity C ABI",
     "Revision 18 applied the seventeenth independent audit",
     "Revision 9 applied the eighth audit",
@@ -229,6 +228,8 @@ GAP_COMPLETION_RULES: dict[str, tuple[str, ...]] = {
     "SB-GAP-C-002": ("Missing Go", "Missing C ABI"),
     "SB-GAP-C-004": ("Missing Go", "Missing C ABI"),
     "SB-GAP-C-011": ("Missing Go", "Missing C ABI"),
+    "SB-GAP-C-008": ("Missing Go", "Missing C ABI"),
+    "SB-GAP-C-009": ("Missing Go", "Missing C ABI"),
 }
 
 EXPECTED_ROW_MANIFEST_HEADER = (
@@ -251,12 +252,11 @@ DEFAULT_C_ABI_INCLUDE_PATHS = (
     Path("capi/include"),
     Path("capi/tests"),
 )
-EXPECTED_C_ABI_DECLARED_EXPORTS = 112
-EXPECTED_C_ABI_REFERENCED_EXPORTS = 106
+EXPECTED_C_ABI_DECLARED_EXPORTS = 120
+EXPECTED_C_ABI_REFERENCED_EXPORTS = 115
 EXPECTED_C_ABI_UNREFERENCED_EXPORTS = (
     "shoal_scanner_scan",
     "shoal_batch_scanner_scan",
-    "shoal_mutation_delete",
     "shoal_write_failure_get_constraint",
     "shoal_write_failure_get_authorization",
     "shoal_write_failure_get_cleanup",

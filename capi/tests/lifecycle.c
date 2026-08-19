@@ -8,9 +8,9 @@
 
 _Static_assert(SHOAL_ABI_VERSION == 1u, "unexpected compatibility ABI version");
 _Static_assert(SHOAL_ABI_VERSION_MAJOR == 1u, "unexpected ABI major");
-_Static_assert(SHOAL_ABI_VERSION_MINOR == 2u, "unexpected ABI minor");
+_Static_assert(SHOAL_ABI_VERSION_MINOR == 3u, "unexpected ABI minor");
 _Static_assert(SHOAL_ABI_VERSION_PATCH == 0u, "unexpected ABI patch");
-_Static_assert(SHOAL_ABI_VERSION_PACKED == 0x00010200u,
+_Static_assert(SHOAL_ABI_VERSION_PACKED == 0x00010300u,
                "unexpected packed ABI version");
 _Static_assert(SHOAL_ABI_CAPABILITY_CONNECTOR == 0u,
                "unexpected connector capability id");
@@ -40,11 +40,13 @@ _Static_assert(SHOAL_ABI_CAPABILITY_TABLE_SPLITS == 12u,
                "unexpected table splits capability id");
 _Static_assert(SHOAL_ABI_CAPABILITY_CONNECTOR_IDENTITY == 13u,
                "unexpected connector identity capability id");
-_Static_assert(SHOAL_ABI_CAPABILITY_COUNT == 14u,
+_Static_assert(SHOAL_ABI_CAPABILITY_DATA_DESCRIPTORS == 14u,
+               "unexpected data descriptors capability id");
+_Static_assert(SHOAL_ABI_CAPABILITY_COUNT == 15u,
                "unexpected capability count");
 _Static_assert(SHOAL_ABI_CAPABILITY_WORD_COUNT == 1u,
                "unexpected capability word count");
-_Static_assert(SHOAL_ABI_CAPABILITY_WORD0 == UINT64_C(0x3fff),
+_Static_assert(SHOAL_ABI_CAPABILITY_WORD0 == UINT64_C(0x7fff),
                "unexpected capability word 0");
 
 #define ASSERT_PERMISSION_VALUE(name, value)                                  \
@@ -132,6 +134,11 @@ static void test_v1_initializers(void) {
   CHECK_V1_INIT(shoal_connector_identity_view,
                 shoal_connector_identity_view_init,
                 SHOAL_CONNECTOR_IDENTITY_VIEW_V1_SIZE);
+  CHECK_V1_INIT(shoal_range_view, shoal_range_view_init,
+                SHOAL_RANGE_VIEW_V1_SIZE);
+  CHECK_V1_INIT(shoal_iterator_setting_view,
+                shoal_iterator_setting_view_init,
+                SHOAL_ITERATOR_SETTING_VIEW_V1_SIZE);
 
 #undef CHECK_V1_INIT
 }
@@ -152,6 +159,8 @@ int main(void) {
   shoal_versioned_properties_result *versioned_properties = NULL;
   shoal_bytes_list_result *bytes_list = NULL;
   shoal_connector_identity_result *identity = NULL;
+  shoal_range_result *range_result = NULL;
+  shoal_iterator_setting_result *iterator_result = NULL;
   shoal_error *error = NULL;
 
   test_v1_initializers();
@@ -178,6 +187,7 @@ int main(void) {
   assert(shoal_abi_has_capability(SHOAL_ABI_CAPABILITY_TABLE_ADMIN) == 1);
   assert(shoal_abi_has_capability(SHOAL_ABI_CAPABILITY_CONNECTOR_IDENTITY) ==
          1);
+  assert(shoal_abi_has_capability(SHOAL_ABI_CAPABILITY_DATA_DESCRIPTORS) == 1);
   assert(shoal_abi_has_capability(SHOAL_ABI_CAPABILITY_COUNT) == 0);
   assert(shoal_abi_has_capability(63u) == 0);
   assert(shoal_abi_has_capability(64u) == 0);
@@ -275,6 +285,237 @@ int main(void) {
                SHOAL_STATUS_DEADLINE_EXCEEDED, &error, "deadline");
   assert(identity == NULL);
   assert(shoal_test_connector_identity_block(admin_connector, 0));
+
+  uint8_t start_row[] = {'s', '\0', 'r'};
+  uint8_t start_cf[] = {'c', 'f'};
+  uint8_t start_cq[] = {'c', 'q'};
+  uint8_t start_cv[] = {'v'};
+  uint8_t end_row[] = {'t', '\0', 'r'};
+  uint8_t end_cf[] = {'e', 'f'};
+  uint8_t end_cq[] = {'e', 'q'};
+  uint8_t end_cv[] = {'e', 'v'};
+  shoal_range descriptor_range;
+  shoal_range_init(&descriptor_range);
+  descriptor_range.start.kind = SHOAL_RANGE_BOUND_KEY;
+  descriptor_range.start.key.row =
+      (shoal_bytes){start_row, sizeof(start_row)};
+  descriptor_range.start.key.column_family =
+      (shoal_bytes){start_cf, sizeof(start_cf)};
+  descriptor_range.start.key.column_qualifier =
+      (shoal_bytes){start_cq, sizeof(start_cq)};
+  descriptor_range.start.key.column_visibility =
+      (shoal_bytes){start_cv, sizeof(start_cv)};
+  descriptor_range.start.key.timestamp = 17;
+  descriptor_range.end.kind = SHOAL_RANGE_BOUND_KEY;
+  descriptor_range.end.key.row = (shoal_bytes){end_row, sizeof(end_row)};
+  descriptor_range.end.key.column_family =
+      (shoal_bytes){end_cf, sizeof(end_cf)};
+  descriptor_range.end.key.column_qualifier =
+      (shoal_bytes){end_cq, sizeof(end_cq)};
+  descriptor_range.end.key.column_visibility =
+      (shoal_bytes){end_cv, sizeof(end_cv)};
+  descriptor_range.end.key.timestamp = 23;
+  descriptor_range.start_inclusive = 1;
+  descriptor_range.end_inclusive = 0;
+  expect_error(shoal_range_create(NULL, &range_result, &error),
+               SHOAL_STATUS_INVALID_ARGUMENT, &error, "range is required");
+  expect_error(shoal_range_create(&descriptor_range, NULL, &error),
+               SHOAL_STATUS_INVALID_ARGUMENT, &error, "out_result");
+  assert(shoal_range_create(&descriptor_range, &range_result, &error) ==
+         SHOAL_STATUS_OK);
+  assert(range_result != NULL && error == NULL);
+  memset(start_row, 'x', sizeof(start_row));
+  memset(start_cf, 'x', sizeof(start_cf));
+  memset(start_cq, 'x', sizeof(start_cq));
+  memset(start_cv, 'x', sizeof(start_cv));
+  memset(end_row, 'x', sizeof(end_row));
+  memset(end_cf, 'x', sizeof(end_cf));
+  memset(end_cq, 'x', sizeof(end_cq));
+  memset(end_cv, 'x', sizeof(end_cv));
+  shoal_range_view range_view;
+  memset(&range_view, 0, sizeof(range_view));
+  expect_error(shoal_range_get(range_result, &range_view, &error),
+               SHOAL_STATUS_INVALID_ARGUMENT, &error, "struct_size");
+  shoal_range_view_init(&range_view);
+  assert(shoal_range_get(range_result, &range_view, &error) ==
+         SHOAL_STATUS_OK);
+  static const uint8_t expected_start_row[] = {'s', '\0', 'r'};
+  static const uint8_t expected_start_cf[] = {'c', 'f'};
+  static const uint8_t expected_start_cq[] = {'c', 'q'};
+  static const uint8_t expected_start_cv[] = {'v'};
+  static const uint8_t expected_end_row[] = {'t', '\0', 'r'};
+  static const uint8_t expected_end_cf[] = {'e', 'f'};
+  static const uint8_t expected_end_cq[] = {'e', 'q'};
+  static const uint8_t expected_end_cv[] = {'e', 'v'};
+  assert(range_view.has_start_key == 1 && range_view.has_end_key == 1);
+  assert(range_view.start_kind == SHOAL_RANGE_BOUND_KEY &&
+         range_view.end_kind == SHOAL_RANGE_BOUND_KEY);
+  assert(range_view.start_inclusive == 1 && range_view.end_inclusive == 0);
+  assert(range_view.start_key.row.length == sizeof(expected_start_row));
+  assert(memcmp(range_view.start_key.row.data, expected_start_row,
+                sizeof(expected_start_row)) == 0);
+  assert(range_view.start_key.column_family.length ==
+         sizeof(expected_start_cf));
+  assert(memcmp(range_view.start_key.column_family.data, expected_start_cf,
+                sizeof(expected_start_cf)) == 0);
+  assert(range_view.start_key.column_qualifier.length ==
+         sizeof(expected_start_cq));
+  assert(memcmp(range_view.start_key.column_qualifier.data, expected_start_cq,
+                sizeof(expected_start_cq)) == 0);
+  assert(range_view.start_key.column_visibility.length ==
+         sizeof(expected_start_cv));
+  assert(memcmp(range_view.start_key.column_visibility.data, expected_start_cv,
+                sizeof(expected_start_cv)) == 0);
+  assert(range_view.start_key.timestamp == 17);
+  assert(range_view.end_key.row.length == sizeof(expected_end_row));
+  assert(memcmp(range_view.end_key.row.data, expected_end_row,
+                sizeof(expected_end_row)) == 0);
+  assert(range_view.end_key.column_family.length == sizeof(expected_end_cf));
+  assert(memcmp(range_view.end_key.column_family.data, expected_end_cf,
+                sizeof(expected_end_cf)) == 0);
+  assert(range_view.end_key.column_qualifier.length == sizeof(expected_end_cq));
+  assert(memcmp(range_view.end_key.column_qualifier.data, expected_end_cq,
+                sizeof(expected_end_cq)) == 0);
+  assert(range_view.end_key.column_visibility.length == sizeof(expected_end_cv));
+  assert(memcmp(range_view.end_key.column_visibility.data, expected_end_cv,
+                sizeof(expected_end_cv)) == 0);
+  assert(range_view.end_key.timestamp == 23);
+  struct {
+    shoal_range_view view;
+    uint8_t future[16];
+  } future_range;
+  memset(&future_range, 0xa5, sizeof(future_range));
+  shoal_range_view_init(&future_range.view);
+  future_range.view.struct_size = (uint32_t)sizeof(future_range);
+  assert(shoal_range_get(range_result, &future_range.view, &error) ==
+         SHOAL_STATUS_OK);
+  for (size_t i = 0; i < sizeof(future_range.future); ++i) {
+    assert(future_range.future[i] == UINT8_C(0xa5));
+  }
+  expect_error(shoal_range_get(NULL, &range_view, &error),
+               SHOAL_STATUS_INVALID_ARGUMENT, &error, "range result");
+  expect_error(shoal_range_get(range_result, NULL, &error),
+               SHOAL_STATUS_INVALID_ARGUMENT, &error, "out_range");
+  shoal_range_free(&range_result);
+  shoal_range_free(&range_result);
+  assert(range_result == NULL);
+
+  shoal_range infinite_range;
+  shoal_range_init(&infinite_range);
+  infinite_range.start.kind = SHOAL_RANGE_BOUND_UNBOUNDED;
+  infinite_range.end.kind = SHOAL_RANGE_BOUND_UNBOUNDED;
+  assert(shoal_range_create(&infinite_range, &range_result, &error) ==
+         SHOAL_STATUS_OK);
+  shoal_range_view_init(&range_view);
+  assert(shoal_range_get(range_result, &range_view, &error) ==
+         SHOAL_STATUS_OK);
+  assert(range_view.start_kind == SHOAL_RANGE_BOUND_UNBOUNDED &&
+         range_view.end_kind == SHOAL_RANGE_BOUND_UNBOUNDED);
+  assert(range_view.has_start_key == 0 && range_view.has_end_key == 0);
+  shoal_range_free(&range_result);
+
+  shoal_range empty_row_range;
+  shoal_range_init(&empty_row_range);
+  empty_row_range.start.kind = SHOAL_RANGE_BOUND_ROW;
+  empty_row_range.end.kind = SHOAL_RANGE_BOUND_ROW;
+  empty_row_range.start_inclusive = 1;
+  empty_row_range.end_inclusive = 1;
+  assert(shoal_range_create(&empty_row_range, &range_result, &error) ==
+         SHOAL_STATUS_OK);
+  shoal_range_view_init(&range_view);
+  assert(shoal_range_get(range_result, &range_view, &error) ==
+         SHOAL_STATUS_OK);
+  assert(range_view.start_kind == SHOAL_RANGE_BOUND_ROW &&
+         range_view.end_kind == SHOAL_RANGE_BOUND_ROW);
+  assert(range_view.has_start_key == 1 && range_view.has_end_key == 1);
+  assert(range_view.start_key.row.length == 0 &&
+         range_view.end_key.row.length == 0);
+  shoal_range_free(&range_result);
+  descriptor_range.start_inclusive = 2;
+  expect_error(shoal_range_create(&descriptor_range, &range_result, &error),
+               SHOAL_STATUS_INVALID_ARGUMENT, &error, "flags");
+  descriptor_range.start_inclusive = 1;
+  for (size_t allocation = 0; allocation < 9; ++allocation) {
+    shoal_test_result_alloc_fail_after(allocation);
+    expect_error(shoal_range_create(&descriptor_range, &range_result, &error),
+                 SHOAL_STATUS_OUT_OF_MEMORY, &error, "allocate range");
+    assert(range_result == NULL);
+    shoal_test_result_alloc_reset();
+  }
+
+  char iterator_name[] = "age";
+  char iterator_class[] = "com.example.Age";
+  char option_z_key[] = "zeta";
+  char option_z_value[] = "last";
+  char option_a_key[] = "alpha";
+  char option_a_value[] = "first";
+  shoal_iterator_option iterator_options[] = {
+      {option_z_key, option_z_value}, {option_a_key, option_a_value}};
+  shoal_iterator_setting iterator_setting = {
+      iterator_name, iterator_class, 19, iterator_options, 2};
+  expect_error(shoal_iterator_setting_create(NULL, &iterator_result, &error),
+               SHOAL_STATUS_INVALID_ARGUMENT, &error,
+               "iterator setting is required");
+  expect_error(
+      shoal_iterator_setting_create(&iterator_setting, NULL, &error),
+      SHOAL_STATUS_INVALID_ARGUMENT, &error, "out_result");
+  assert(shoal_iterator_setting_create(&iterator_setting, &iterator_result,
+                                       &error) == SHOAL_STATUS_OK);
+  memset(iterator_name, 'x', sizeof(iterator_name) - 1);
+  memset(iterator_class, 'x', sizeof(iterator_class) - 1);
+  memset(option_a_value, 'x', sizeof(option_a_value) - 1);
+  shoal_iterator_setting_view iterator_view;
+  memset(&iterator_view, 0, sizeof(iterator_view));
+  expect_error(
+      shoal_iterator_setting_get(iterator_result, &iterator_view, &error),
+      SHOAL_STATUS_INVALID_ARGUMENT, &error, "struct_size");
+  shoal_iterator_setting_view_init(&iterator_view);
+  assert(shoal_iterator_setting_get(iterator_result, &iterator_view, &error) ==
+         SHOAL_STATUS_OK);
+  assert(strcmp(iterator_view.name, "age") == 0);
+  assert(strcmp(iterator_view.class_name, "com.example.Age") == 0);
+  assert(iterator_view.priority == 19 && iterator_view.option_count == 2);
+  assert(strcmp(iterator_view.options[0].key, "alpha") == 0);
+  assert(strcmp(iterator_view.options[0].value, "first") == 0);
+  assert(strcmp(iterator_view.options[1].key, "zeta") == 0);
+  assert(strcmp(iterator_view.options[1].value, "last") == 0);
+  struct {
+    shoal_iterator_setting_view view;
+    uint8_t future[16];
+  } future_iterator;
+  memset(&future_iterator, 0xa5, sizeof(future_iterator));
+  shoal_iterator_setting_view_init(&future_iterator.view);
+  future_iterator.view.struct_size = (uint32_t)sizeof(future_iterator);
+  assert(shoal_iterator_setting_get(iterator_result, &future_iterator.view,
+                                    &error) == SHOAL_STATUS_OK);
+  for (size_t i = 0; i < sizeof(future_iterator.future); ++i) {
+    assert(future_iterator.future[i] == UINT8_C(0xa5));
+  }
+  expect_error(shoal_iterator_setting_get(NULL, &iterator_view, &error),
+               SHOAL_STATUS_INVALID_ARGUMENT, &error,
+               "iterator setting result");
+  expect_error(shoal_iterator_setting_get(iterator_result, NULL, &error),
+               SHOAL_STATUS_INVALID_ARGUMENT, &error, "out_setting");
+  shoal_iterator_setting_free(&iterator_result);
+  shoal_iterator_setting_free(&iterator_result);
+  assert(iterator_result == NULL);
+  shoal_iterator_setting invalid_iterator = {NULL, "class", 1, NULL, 0};
+  expect_error(shoal_iterator_setting_create(&invalid_iterator,
+                                             &iterator_result, &error),
+               SHOAL_STATUS_INVALID_ARGUMENT, &error, "name");
+  for (size_t allocation = 0; allocation < 8; ++allocation) {
+    shoal_test_result_alloc_fail_after(allocation);
+    expect_error(shoal_iterator_setting_create(&iterator_setting,
+                                               &iterator_result, &error),
+                 SHOAL_STATUS_OUT_OF_MEMORY, &error, "allocate iterator");
+    assert(iterator_result == NULL);
+    shoal_test_result_alloc_reset();
+  }
+  shoal_test_string_alloc_fail_after(0);
+  expect_error(shoal_iterator_setting_create(&iterator_setting,
+                                             &iterator_result, &error),
+               SHOAL_STATUS_OUT_OF_MEMORY, &error, "iterator name");
+  shoal_test_string_alloc_reset();
 
   shoal_table_view table_view;
   assert(shoal_connector_list_tables(admin_connector, 0, &table_list, &error) ==
@@ -887,9 +1128,12 @@ int main(void) {
   assert(shoal_mutation_delete_latest(mutation, family_bytes, qualifier_bytes,
                                       visibility_bytes,
                                       &error) == SHOAL_STATUS_OK);
+  assert(shoal_mutation_delete(mutation, family_bytes, qualifier_bytes,
+                               visibility_bytes, 43,
+                               &error) == SHOAL_STATUS_OK);
   assert(shoal_mutation_size(mutation, &mutation_size, &error) ==
          SHOAL_STATUS_OK);
-  assert(mutation_size == 2);
+  assert(mutation_size == 3);
 
   shoal_bytes malformed = {NULL, 1};
   expect_error(shoal_mutation_put_latest(

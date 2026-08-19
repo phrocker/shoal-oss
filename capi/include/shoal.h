@@ -46,8 +46,40 @@ shoal_scanner_config_init(shoal_scanner_config *config);
 
 SHOAL_API void SHOAL_CALL shoal_range_init(shoal_range *range);
 
+SHOAL_API void SHOAL_CALL shoal_range_view_init(shoal_range_view *view);
+
+SHOAL_API void SHOAL_CALL
+shoal_iterator_setting_view_init(shoal_iterator_setting_view *view);
+
 SHOAL_API void SHOAL_CALL
 shoal_batch_writer_config_init(shoal_batch_writer_config *config);
+
+/*
+ * Data-descriptor constructors copy all caller-owned strings and bytes into
+ * owned results. Range views preserve each bound's ROW, KEY, or UNBOUNDED
+ * kind, including bounded empty rows. Views borrow result memory until free.
+ * These local operations do not use connectors or I/O, cannot block, and
+ * therefore have no deadline or cancellation parameter. Concurrent getters
+ * are safe while the caller guarantees that free does not race with them.
+ */
+SHOAL_API shoal_status SHOAL_CALL
+shoal_range_create(const shoal_range *range, shoal_range_result **out_result,
+                   shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_range_get(const shoal_range_result *result, shoal_range_view *out_range,
+                shoal_error **out_error);
+SHOAL_API void SHOAL_CALL shoal_range_free(shoal_range_result **result);
+
+SHOAL_API shoal_status SHOAL_CALL
+shoal_iterator_setting_create(
+    const shoal_iterator_setting *setting,
+    shoal_iterator_setting_result **out_result, shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_iterator_setting_get(const shoal_iterator_setting_result *result,
+                           shoal_iterator_setting_view *out_setting,
+                           shoal_error **out_error);
+SHOAL_API void SHOAL_CALL
+shoal_iterator_setting_free(shoal_iterator_setting_result **result);
 
 /*
  * Creates a connector and stores its owned handle in out_connector.

@@ -10,7 +10,7 @@ static_assert(std::is_same<shoal_abi_capability_bits, std::uint64_t>::value,
               "capability bitset words must remain 64-bit");
 static_assert(SHOAL_ABI_VERSION == 1u, "unexpected ABI version");
 static_assert(SHOAL_ABI_VERSION_MAJOR == 1u, "unexpected ABI major");
-static_assert(SHOAL_ABI_VERSION_MINOR == 2u, "unexpected ABI minor");
+static_assert(SHOAL_ABI_VERSION_MINOR == 3u, "unexpected ABI minor");
 static_assert(SHOAL_ABI_VERSION_PATCH == 0u, "unexpected ABI patch");
 static_assert(SHOAL_ABI_VERSION_PACKED ==
                   SHOAL_ABI_PACK_VERSION(SHOAL_ABI_VERSION_MAJOR,
@@ -29,12 +29,18 @@ static_assert(SHOAL_ABI_CAPABILITY_TABLE_SPLITS == 12u,
               "unexpected table splits capability id");
 static_assert(SHOAL_ABI_CAPABILITY_CONNECTOR_IDENTITY == 13u,
               "unexpected connector identity capability id");
-static_assert(SHOAL_ABI_CAPABILITY_COUNT == 14u,
+static_assert(SHOAL_ABI_CAPABILITY_DATA_DESCRIPTORS == 14u,
+              "unexpected data descriptors capability id");
+static_assert(SHOAL_ABI_CAPABILITY_COUNT == 15u,
               "unexpected capability count");
-static_assert(SHOAL_ABI_CAPABILITY_WORD0 == 0x0000000000003fffull,
+static_assert(SHOAL_ABI_CAPABILITY_WORD0 == 0x0000000000007fffull,
               "unexpected capability word 0");
 static_assert(std::is_standard_layout<shoal_connector_identity_view>::value,
               "identity view must remain standard-layout");
+static_assert(std::is_standard_layout<shoal_range_view>::value,
+              "range view must remain standard-layout");
+static_assert(std::is_standard_layout<shoal_iterator_setting_view>::value,
+              "iterator setting view must remain standard-layout");
 
 #define ASSERT_PERMISSION_VALUE(name, value)                                 \
   static_assert(name == value, "unexpected permission ordinal: " #name)
@@ -83,6 +89,10 @@ int main() {
   shoal_bytes_list_result *bytes = nullptr;
   shoal_connector_identity_result *identity = nullptr;
   shoal_connector_identity_view identity_view{};
+  shoal_range_result *range_result = nullptr;
+  shoal_range_view range_view{};
+  shoal_iterator_setting_result *iterator_result = nullptr;
+  shoal_iterator_setting_view iterator_view{};
   shoal_scanner *scanner = nullptr;
   shoal_batch_scanner *batch_scanner = nullptr;
   shoal_scan_result *scan_result = nullptr;
@@ -105,6 +115,7 @@ int main() {
   assert(shoal_abi_has_capability(SHOAL_ABI_CAPABILITY_TABLE_SPLITS) == 1);
   assert(shoal_abi_has_capability(SHOAL_ABI_CAPABILITY_CONNECTOR_IDENTITY) ==
          1);
+  assert(shoal_abi_has_capability(SHOAL_ABI_CAPABILITY_DATA_DESCRIPTORS) == 1);
   assert(shoal_abi_has_capability(SHOAL_ABI_CAPABILITY_COUNT) == 0);
   assert(shoal_versioned_properties_version(versioned_properties) == 0);
   assert(shoal_versioned_properties_count(versioned_properties) == 0);
@@ -119,6 +130,14 @@ int main() {
   assert(shoal_connector_get_identity(connector, 0, &identity, &error) ==
          SHOAL_STATUS_INVALID_HANDLE);
   shoal_error_free(&error);
+  shoal_range_view_init(&range_view);
+  assert(shoal_range_get(range_result, &range_view, &error) ==
+         SHOAL_STATUS_INVALID_ARGUMENT);
+  shoal_error_free(&error);
+  shoal_iterator_setting_view_init(&iterator_view);
+  assert(shoal_iterator_setting_get(iterator_result, &iterator_view, &error) ==
+         SHOAL_STATUS_INVALID_ARGUMENT);
+  shoal_error_free(&error);
   assert(shoal_connector_identity_get(identity, &identity_view, &error) ==
          SHOAL_STATUS_INVALID_ARGUMENT);
   shoal_error_free(&error);
@@ -132,6 +151,8 @@ int main() {
   shoal_versioned_properties_free(&versioned_properties);
   shoal_bytes_list_free(&bytes);
   shoal_connector_identity_free(&identity);
+  shoal_range_free(&range_result);
+  shoal_iterator_setting_free(&iterator_result);
   shoal_scanner_free(&scanner);
   shoal_batch_scanner_free(&batch_scanner);
   shoal_scan_result_free(&scan_result);

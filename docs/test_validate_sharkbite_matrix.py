@@ -457,7 +457,7 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
     def test_row_manifest_provenance_rejects_stale_revision_header(self) -> None:
         manifest_lines = validator.EXPECTED_ROW_MANIFEST.read_text(encoding="utf-8").splitlines()
         mutated = list(manifest_lines)
-        mutated[0] = mutated[0].replace("Revision-20", "Revision-18")
+        mutated[0] = mutated[0].replace("Revision-21", "Revision-18")
         self.assert_validation_fails(
             lambda: validator.validate_expected_row_manifest_provenance(
                 mutated, source=validator.EXPECTED_ROW_MANIFEST.name
@@ -720,7 +720,7 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
 
     def test_pinned_inventory_constants_are_internally_consistent(self) -> None:
         validator.validate_pinned_inventory_constants()
-        self.assertEqual(validator.EXPECTED_REVISION, 20)
+        self.assertEqual(validator.EXPECTED_REVISION, 21)
         self.assertEqual(validator.EXPECTED_TOTAL_ROWS, 3203)
         self.assertEqual(validator.EXPECTED_REQUIRED_ROWS, 2811)
         self.assertEqual(
@@ -728,20 +728,19 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
             {
                 "Covered": 1,
                 "Missing Go": 2409,
-                "Missing C ABI": 103,
-                "Behavior mismatch": 211,
+                "Missing C ABI": 90,
+                "Behavior mismatch": 224,
                 validator.INTENTIONAL_DIVERGENCE_STATUS: 87,
                 validator.NOT_REQUIRED_STATUS: 392,
             },
         )
-        self.assertEqual(validator.EXPECTED_C_ABI_DECLARED_EXPORTS, 112)
-        self.assertEqual(validator.EXPECTED_C_ABI_REFERENCED_EXPORTS, 106)
+        self.assertEqual(validator.EXPECTED_C_ABI_DECLARED_EXPORTS, 120)
+        self.assertEqual(validator.EXPECTED_C_ABI_REFERENCED_EXPORTS, 115)
         self.assertEqual(
             validator.EXPECTED_C_ABI_UNREFERENCED_EXPORTS,
             (
                 "shoal_scanner_scan",
                 "shoal_batch_scanner_scan",
-                "shoal_mutation_delete",
                 "shoal_write_failure_get_constraint",
                 "shoal_write_failure_get_authorization",
                 "shoal_write_failure_get_cleanup",
@@ -756,13 +755,18 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
         self.assertIn("shoal_versioned_properties_get", referenced)
         self.assertIn("shoal_connector_get_identity", referenced)
         self.assertIn("shoal_connector_identity_get", referenced)
+        self.assertIn("shoal_range_create", referenced)
+        self.assertIn("shoal_iterator_setting_get", referenced)
+        self.assertIn("shoal_mutation_delete", referenced)
 
     def test_collect_c_abi_free_function_inventory_matches_header(self) -> None:
         free_functions = validator.collect_c_abi_free_function_inventory()
-        self.assertEqual(len(free_functions), 15)
+        self.assertEqual(len(free_functions), 17)
         self.assertIn("shoal_versioned_properties_free", free_functions)
         self.assertIn("shoal_bytes_list_free", free_functions)
         self.assertIn("shoal_connector_identity_free", free_functions)
+        self.assertIn("shoal_range_free", free_functions)
+        self.assertIn("shoal_iterator_setting_free", free_functions)
 
     def test_compiled_c_abi_reference_inventory_ignores_non_linking_mentions(self) -> None:
         references = validator.compiled_c_abi_reference_inventory(
@@ -780,7 +784,7 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
 
     def test_stale_typed_free_inventory_narrative_is_rejected(self) -> None:
         text = load_document_text()
-        mutated = text.replace("15 typed free functions", "8 typed free functions", 1)
+        mutated = text.replace("17 typed free functions", "8 typed free functions", 1)
         self.assertNotEqual(mutated, text)
         self.assert_validation_fails(
             lambda: validator.validate_counts(mutated.splitlines(), mutated),
@@ -878,7 +882,7 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
     def test_stale_c_abi_symbol_inventory_narrative_is_rejected(self) -> None:
         text = load_document_text()
         mutated = text.replace(
-            "applied to 112 declared exports in `capi/include/shoal.h`",
+            "applied to 120 declared exports in `capi/include/shoal.h`",
             "applied to 44 declared exports in `capi/include/shoal.h`",
             1,
         )
@@ -891,7 +895,7 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
     def test_revision_bump_requires_validator_constant_update(self) -> None:
         text = load_document_text()
         mutated = text.replace(
-            f"Revision {validator.EXPECTED_REVISION} — reclassifies the twelve client-configuration ",
+            f"Revision {validator.EXPECTED_REVISION} — adds owned range and iterator-setting descriptor ABIs",
             f"Revision {validator.EXPECTED_REVISION + 1} — adds the next audited ABI slice",
         ).replace(
             f"As of revision {validator.EXPECTED_REVISION} that is",
@@ -900,7 +904,7 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
         self.assertNotEqual(mutated, text)
         self.assert_validation_fails(
             lambda: validator.validate_counts(mutated.splitlines(), mutated),
-            f"document status is missing expected detail: Revision {validator.EXPECTED_REVISION} — reclassifies",
+            f"document status is missing expected detail: Revision {validator.EXPECTED_REVISION} — adds owned range and iterator-setting",
         )
 
     # ---- matrix table separators -------------------------------------------

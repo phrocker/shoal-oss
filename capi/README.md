@@ -29,14 +29,14 @@ Shoal separates **ABI compatibility** from **feature availability**:
   stable allocation-free version tuple that works before connector creation.
   `SHOAL_ABI_VERSION_PACKED` uses
   `SHOAL_ABI_PACK_VERSION(major, minor, patch)` with a hexadecimal
-  `0x00MMmmpp` layout, so ABI `1.2.0` is `0x00010200`.
+  `0x00MMmmpp` layout, so ABI `1.3.0` is `0x00010300`.
 - Capability identifiers are append-only. Existing IDs and bits never change
   meaning. `shoal_abi_capability_word_count()` reports how many 64-bit words
   the current library uses, `shoal_abi_capability_word(i)` returns `0` for
   `i >= word_count`, and `shoal_abi_has_capability(id)` returns `0` for both
   unsupported and unknown IDs.
 
-Current capability assignments (`word 0 == 0x0000000000003fff`):
+Current capability assignments (`word 0 == 0x0000000000007fff`):
 
 | ID | Mask | Surface |
 | --- | --- | --- |
@@ -54,6 +54,7 @@ Current capability assignments (`word 0 == 0x0000000000003fff`):
 | `SHOAL_ABI_CAPABILITY_SECURITY_ADMIN` | `0x0800` | users, authorizations, and permission administration |
 | `SHOAL_ABI_CAPABILITY_TABLE_SPLITS` | `0x1000` | binary-safe split listing and creation |
 | `SHOAL_ABI_CAPABILITY_CONNECTOR_IDENTITY` | `0x2000` | owned connector instance-name, instance-ID, and principal discovery |
+| `SHOAL_ABI_CAPABILITY_DATA_DESCRIPTORS` | `0x4000` | owned range and iterator-setting descriptors with versioned borrowed views |
 
 Shoal does **not** advertise instance status, compaction/import/export,
 Python/wheel, or any other unimplemented surface until the API exists and has
@@ -116,6 +117,14 @@ Version numbers change only when the public ABI contract changes:
   `shoal_connector_identity_view` with its init helper; the view borrows its
   pointers only until `shoal_connector_identity_free`, which is idempotent
   when called with the address of a `NULL` result variable.
+- `shoal_range_create` and `shoal_iterator_setting_create` validate and copy
+  every nested byte/string input into owned results. Their versioned views
+  borrow result memory and expose range bound kinds, keys, inclusivity, and
+  unboundedness plus iterator name/class/priority/options. The bound kind keeps
+  empty row bounds distinct from unbounded bounds and preserves ROW versus KEY
+  semantics for lossless reuse. These are local, non-blocking
+  descriptor operations, so connector close, deadlines, and cancellation do
+  not apply. Concurrent getters are safe while free is externally serialized.
 - Scanner configuration, ranges, and all nested arrays/bytes are borrowed only
   for the creating or scan call. Shoal copies every value it retains.
 - Scanner and batch-scanner handles support concurrent scan calls. Close
