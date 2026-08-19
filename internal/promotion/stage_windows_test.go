@@ -116,6 +116,28 @@ func TestLocalPathsLexicallyAliasWindowsDOS83ShortNameAmbiguity(t *testing.T) {
 	}
 }
 
+func TestLocalPathsLexicallyAliasWindowsUNCSharePrefixNormalization(t *testing.T) {
+	tests := []struct {
+		name string
+		src  string
+		dst  string
+		want bool
+	}{
+		{name: "standard UNC path aliases differing only by server case", src: `\\SERVER\share\B.rf`, dst: `\\server\share\B.rf`, want: true},
+		{name: "standard UNC path aliases differing only by unicode normalization", src: "\\\\SERV\u00c9R\\shar\u00e9\\B.rf", dst: "\\\\serve\u0301r\\share\u0301\\B.rf", want: true},
+		{name: "extended UNC path aliases differing only by marker and server case", src: `\\?\UNC\SERVER\share\B.rf`, dst: `\\?\unc\server\share\B.rf`, want: true},
+		{name: "distinct shares stay distinct", src: `\\SERVER\share-a\B.rf`, dst: `\\server\share-b\B.rf`, want: false},
+		{name: "distinct servers stay distinct", src: `\\SERVER-a\share\B.rf`, dst: `\\server-b\share\B.rf`, want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := localPathsLexicallyAlias(tt.src, tt.dst); got != tt.want {
+				t.Fatalf("localPathsLexicallyAlias(%q, %q) = %v, want %v", tt.src, tt.dst, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestStagePathsAliasWindowsDOS83ShortNameReachesSameFile(t *testing.T) {
 	dir := t.TempDir()
 	longPath := filepath.Join(dir, "LongFilename.rf")
@@ -246,6 +268,25 @@ func TestStageBulkDirRejectsTrailingDotOrSpaceWriteTargetsBeforeCopying(t *testi
 
 			if _, err := StageBulkDir(context.Background(), src, manifest, local.New(), bulkDir); err == nil {
 				t.Fatalf("StageBulkDir with %s write-target alias = nil error, want error", tt.name)
+			}
+		})
+	}
+}
+
+func TestCheckNoStagingAliasesRejectsDanglingWindowsUNCAliasBeforeAnyWrites(t *testing.T) {
+	tests := []struct {
+		name    string
+		srcPath string
+		bulkDir string
+	}{
+		{name: "standard UNC case variant", srcPath: `\\SERVER\share\B.rf`, bulkDir: `\\server\share`},
+		{name: "extended UNC case variant", srcPath: `\\?\UNC\SERVER\share\B.rf`, bulkDir: `\\?\unc\server\share`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			flatNames := map[string]string{tt.srcPath: "B.rf"}
+			if err := checkNoStagingAliases(local.New(), local.New(), flatNames, tt.bulkDir); err == nil {
+				t.Fatalf("checkNoStagingAliases with dangling UNC source %q and bulkDir %q = nil error, want error", tt.srcPath, tt.bulkDir)
 			}
 		})
 	}

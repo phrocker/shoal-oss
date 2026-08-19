@@ -796,6 +796,37 @@ func TestLocalTargetUsesWindowsADSOnBackend(t *testing.T) {
 	}
 }
 
+func TestNormalizeWindowsUNCPublicationPrefix(t *testing.T) {
+	tests := []struct {
+		name   string
+		left   string
+		right  string
+		wantEq bool
+		wantOK bool
+	}{
+		{name: "standard UNC server and share are case-insensitive", left: `\\SERVER\share\`, right: `\\server\share\`, wantEq: true, wantOK: true},
+		{name: "standard UNC server and share normalize unicode", left: "\\\\SERV\u00c9R\\shar\u00e9\\", right: "\\\\serve\u0301r\\share\u0301\\", wantEq: true, wantOK: true},
+		{name: "distinct share stays distinct", left: `\\server\share-a\`, right: `\\server\share-b\`, wantEq: false, wantOK: true},
+		{name: "distinct server stays distinct", left: `\\server-a\share\`, right: `\\server-b\share\`, wantEq: false, wantOK: true},
+		{name: "extended UNC marker and server components normalize case", left: `\\?\UNC\SERVER\share\`, right: `\\?\unc\server\share\`, wantEq: true, wantOK: true},
+		{name: "drive-letter prefix is not treated as UNC", left: `C:\bulk\`, right: `C:\bulk\`, wantOK: false},
+		{name: "uri prefix is not treated as UNC", left: `s3://bucket`, right: `s3://bucket`, wantOK: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			left, leftOK := normalizeWindowsUNCPublicationPrefix(tt.left)
+			right, rightOK := normalizeWindowsUNCPublicationPrefix(tt.right)
+			if leftOK != tt.wantOK || rightOK != tt.wantOK {
+				t.Fatalf("normalizeWindowsUNCPublicationPrefix(%q) ok=%v, normalizeWindowsUNCPublicationPrefix(%q) ok=%v, want %v", tt.left, leftOK, tt.right, rightOK, tt.wantOK)
+			}
+			if leftOK && rightOK && (left == right) != tt.wantEq {
+				t.Fatalf("normalized UNC prefixes %q and %q equality=%v, want %v", left, right, left == right, tt.wantEq)
+			}
+		})
+	}
+}
+
 func TestJoinBulkPathPreservesDeclaredSingleCharacterSchemeRoot(t *testing.T) {
 	backend := schemeAwareBackend{Backend: memory.New(), schemes: []string{"x"}}
 	got := joinBulkPath(backend, "x://bucket/prefix", "F0001.rf")

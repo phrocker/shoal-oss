@@ -72,6 +72,10 @@ func pathLooksURLLikeOnBackend(backend storage.Backend, path string) bool {
 	return storage.ExplicitPathScheme(backend, path) != ""
 }
 
+func normalizeWindowsPublicationLabel(value string) string {
+	return publicationCaseFold.String(norm.NFC.String(value))
+}
+
 // localTargetUsesWindowsADSOnBackend reports whether path would be an unsafe
 // NTFS alternate-data-stream write target when interpreted as a local Windows
 // destination on backend. It is intentionally lexical and conservative: any
@@ -153,11 +157,11 @@ func isWindowsDriveRootPath(path string) bool {
 // therefore treat truly distinct destination files as aliases outside
 // Windows, so it is gated to runtime.GOOS == "windows".
 func normalizeLocalPublicationComponent(component string) string {
-	component = norm.NFC.String(component)
+	component = normalizeWindowsPublicationLabel(component)
 	if runtime.GOOS == "windows" {
 		component = strings.TrimRight(component, " .")
 	}
-	return publicationCaseFold.String(component)
+	return component
 }
 
 func buildLocalPublicationIdentity(path string) localPublicationIdentity {
@@ -177,11 +181,62 @@ func buildLocalPublicationIdentity(path string) localPublicationIdentity {
 }
 
 func normalizeLocalPublicationPrefix(prefix string) string {
+	if normalized, ok := normalizeWindowsUNCPublicationPrefix(prefix); ok {
+		return normalized
+	}
 	prefix = strings.ReplaceAll(prefix, `\`, "/")
 	if prefix != "" && !strings.HasSuffix(prefix, "/") {
 		prefix += "/"
 	}
 	return prefix
+}
+
+func normalizeWindowsUNCPublicationPrefix(prefix string) (string, bool) {
+	if prefix == "" {
+		return "", false
+	}
+	prefix = strings.ReplaceAll(prefix, `\`, "/")
+	prefix = strings.TrimRight(prefix, "/")
+	if prefix == "" {
+		return "", false
+	}
+
+	if strings.HasPrefix(prefix, "//?/") {
+		remainder := strings.TrimPrefix(prefix, "//?/")
+		parts := strings.Split(remainder, "/")
+		if len(parts) == 0 || !strings.EqualFold(parts[0], "unc") {
+			return "", false
+		}
+		normalized := []string{"?", normalizeWindowsPublicationLabel(parts[0])}
+		for _, part := range parts[1:] {
+			if part == "" {
+				continue
+			}
+			normalized = append(normalized, normalizeWindowsPublicationLabel(part))
+		}
+		return "//" + strings.Join(normalized, "/") + "/", true
+	}
+
+	if strings.HasPrefix(prefix, "//") {
+		remainder := strings.TrimPrefix(prefix, "//")
+		parts := strings.Split(remainder, "/")
+		if len(parts) < 2 {
+			return "", false
+		}
+		normalized := make([]string, 0, len(parts))
+		for _, part := range parts {
+			if part == "" {
+				continue
+			}
+			normalized = append(normalized, normalizeWindowsPublicationLabel(part))
+		}
+		if len(normalized) < 2 {
+			return "", false
+		}
+		return "//" + strings.Join(normalized, "/") + "/", true
+	}
+
+	return "", false
 }
 
 func buildLocalPublicationComponentIdentity(component string) localPublicationComponentIdentity {
