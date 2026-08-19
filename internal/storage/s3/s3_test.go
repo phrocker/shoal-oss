@@ -520,7 +520,7 @@ func TestCleanupStaleArtifactsIsBoundedConditionalAndExplicit(t *testing.T) {
 	failing := "dir/" + expectedTemporaryStageKeyComponent("dir/target", strings.Repeat("1", 64))
 	recent := "dir/" + expectedTemporaryStageKeyComponent("dir/target", strings.Repeat("2", 64))
 	lookalike := "dir/" + expectedTemporaryStageKeyComponent("dir/user", strings.Repeat("3", 64))
-	marker := "dir/" + expectedTemporaryStageKeyComponent("dir/deleted", strings.Repeat("4", 64))
+	marker := lookalike
 	uppercase := "dir/" + tempStageKeyPrefix + strings.Repeat("A", tempStageRandomHexLen+tempStageHashHexLen)
 	ops := &fakeS3ArtifactOperations{
 		artifacts: []s3Artifact{
@@ -542,14 +542,15 @@ func TestCleanupStaleArtifactsIsBoundedConditionalAndExplicit(t *testing.T) {
 	if result.Examined != 5 {
 		t.Fatalf("Examined = %d, want 5", result.Examined)
 	}
-	wantRemoved := []string{
-		"s3://bucket/" + old + "?versionId=" + oldVersion,
-		"s3://bucket/" + marker + "?versionId=" + markerVersion,
-	}
+	wantRemoved := []string{"s3://bucket/" + old + "?versionId=" + oldVersion}
 	if fmt.Sprint(result.Removed) != fmt.Sprint(wantRemoved) {
 		t.Fatalf("Removed = %v", result.Removed)
 	}
-	if len(ops.removed) != 3 {
+	wantRecoverable := []string{"s3://bucket/" + marker + "?versionId=" + markerVersion}
+	if fmt.Sprint(result.Recoverable) != fmt.Sprint(wantRecoverable) {
+		t.Fatalf("Recoverable = %v, want %v", result.Recoverable, wantRecoverable)
+	}
+	if len(ops.removed) != 2 {
 		t.Fatalf("conditional removals = %#v", ops.removed)
 	}
 	for _, removed := range ops.removed {

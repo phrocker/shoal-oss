@@ -58,7 +58,10 @@ func (b *Backend) Open(_ context.Context, path string) (storage.File, error) {
 // stripping of truncating an existing file in place. On Unix we also preserve
 // owner/group, and on Linux and Darwin we preserve extended attributes
 // (including xattr-backed ACLs such as Linux POSIX ACLs) when the platform
-// exposes them. On platforms without hard-link snapshots (Plan 9, js, wasip1),
+// exposes them. A final-component symlink is resolved once at Create time and
+// the replacement is staged beside its referent, preserving the prior
+// truncating-write behavior without replacing the symlink itself. On platforms
+// without hard-link snapshots (Plan 9, js, wasip1),
 // and on Unix filesystems that reject hard-link snapshots for same-directory
 // siblings, replacement falls back to a best-effort rename-based sequence that
 // restores the old file on failure but cannot keep the target continuously
@@ -80,20 +83,53 @@ func (b *Backend) Create(_ context.Context, path string) (storage.Writer, error)
 			return nil, fmt.Errorf("local: mkdir %s: %w", dir, err)
 		}
 	}
+	target, err := resolveReplacementTarget(path)
+	if err != nil {
+		return nil, err
+	}
+	if isReplacementArtifactName(filepath.Base(target)) {
+		return nil, fmt.Errorf("local: symlink destination %s resolves into a reserved internal namespace", path)
+	}
+	dir = filepath.Dir(target)
 	ops := osReplacementOps{}
 	f, err := openReplacementSiblingFile(dir)
 	if err != nil {
 		return nil, fmt.Errorf("local: create temporary file for %s: %w", path, err)
 	}
-	if _, err := preserveExistingMetadata(ops, f.Name(), path); err != nil {
+	if _, err := preserveExistingMetadata(ops, f.Name(), target); err != nil {
 		return nil, errors.Join(err, cleanupTemporaryCreateFile(f, ops))
 	}
 	return &writer{
 		file:   f,
 		temp:   f.Name(),
-		target: path,
+		target: target,
 		ops:    ops,
 	}, nil
+}
+
+func resolveReplacementTarget(path string) (string, error) {
+	target := path
+	for links := 0; links < 255; links++ {
+		info, err := os.Lstat(target)
+		if errors.Is(err, fs.ErrNotExist) {
+			return target, nil
+		}
+		if err != nil {
+			return "", fmt.Errorf("local: inspect destination %s: %w", path, err)
+		}
+		if info.Mode()&os.ModeSymlink == 0 {
+			return target, nil
+		}
+		next, err := os.Readlink(target)
+		if err != nil {
+			return "", fmt.Errorf("local: read destination symlink %s: %w", path, err)
+		}
+		if !filepath.IsAbs(next) {
+			next = filepath.Join(filepath.Dir(target), next)
+		}
+		target = filepath.Clean(next)
+	}
+	return "", fmt.Errorf("local: resolve destination symlink %s: too many links", path)
 }
 
 // List enumerates the regular files directly under prefix (a directory

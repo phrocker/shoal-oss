@@ -274,16 +274,18 @@ func (b *Backend) CleanupStaleArtifacts(ctx context.Context, prefix string, cuto
 		}
 		result.Examined++
 		if artifact.deleteMarker {
-			artifact.owned = true
-		} else {
-			artifact, err = b.artifactOps.inspect(ctx, bucket, artifact)
-			if err != nil {
-				if isNotFound(err) {
-					continue
-				}
-				cleanupErr = errors.Join(cleanupErr, fmt.Errorf("s3: inspect stale artifact s3://%s/%s: %w", bucket, artifact.key, err))
+			// Delete markers have no object metadata, so their ownership cannot
+			// be proven. Removing one can resurrect an older user-owned version.
+			result.Recoverable = append(result.Recoverable, s3ArtifactPath(bucket, artifact))
+			continue
+		}
+		artifact, err = b.artifactOps.inspect(ctx, bucket, artifact)
+		if err != nil {
+			if isNotFound(err) {
 				continue
 			}
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("s3: inspect stale artifact s3://%s/%s: %w", bucket, artifact.key, err))
+			continue
 		}
 		if !artifact.owned {
 			continue

@@ -1022,6 +1022,65 @@ func TestLocal_PublishFailureRestoresStrandedBackup(t *testing.T) {
 	}
 }
 
+func TestLocal_CreateThroughSymlinkReplacesReferent(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "target")
+	link := filepath.Join(dir, "link")
+	if err := os.WriteFile(target, []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, link); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+
+	w, err := New().Create(context.Background(), link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write([]byte("new")); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Lstat(link)
+	if err != nil {
+		t.Fatalf("Lstat symlink: %v", err)
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("destination symlink was replaced: mode=%v", info.Mode())
+	}
+	if got, err := os.ReadFile(target); err != nil || string(got) != "new" {
+		t.Fatalf("referent = %q, %v; want new", got, err)
+	}
+}
+
+func TestLocal_CreateThroughDanglingSymlinkCreatesReferent(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "created")
+	link := filepath.Join(dir, "link")
+	if err := os.Symlink(filepath.Base(target), link); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+
+	w, err := New().Create(context.Background(), link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write([]byte("new")); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.ReadFile(target); err != nil || string(got) != "new" {
+		t.Fatalf("referent = %q, %v; want new", got, err)
+	}
+	if info, err := os.Lstat(link); err != nil || info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("destination symlink not preserved: info=%v err=%v", info, err)
+	}
+}
+
 func TestLocal_PublishFailureRetainsBackupWhenRestoreFails(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "target")
