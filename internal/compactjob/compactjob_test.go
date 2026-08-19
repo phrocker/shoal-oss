@@ -805,11 +805,12 @@ func TestTranslateRefusesAnOutputAliasingAnInputByCase(t *testing.T) {
 	}
 }
 
-// TestPathIdentityFoldsOnlyWhatURIFolds pins the folding rule directly,
-// including the parts java.net.URI leaves alone. Userinfo and the path
-// are case-sensitive, a port is not a host, and an IPv6 literal folds
-// through its closing bracket.
-func TestPathIdentityFoldsOnlyWhatURIFolds(t *testing.T) {
+// TestPathIdentityFoldsWhatOpensOneFile pins the folding rule directly,
+// against the measure that matters: what hdfs.Backend.resolve keeps.
+// It keeps u.Host, compared with EqualFold, and url.Parse's decoded
+// u.Path — so the path stays case-sensitive, the port stays, and
+// userinfo drops out.
+func TestPathIdentityFoldsWhatOpensOneFile(t *testing.T) {
 	for _, tt := range []struct {
 		name string
 		in   string
@@ -817,8 +818,12 @@ func TestPathIdentityFoldsOnlyWhatURIFolds(t *testing.T) {
 	}{
 		{"scheme and host", "HDFS://NN/A/B.rf", "hdfs://nn/A/B.rf"},
 		{"host with a port", "HDFS://NN:9000/A/B.rf", "hdfs://nn:9000/A/B.rf"},
-		{"userinfo is not folded", "hdfs://User@NN/A/B.rf", "hdfs://User@nn/A/B.rf"},
+		// Backend.resolve never looks at u.User, so a credential in the
+		// path selects nothing.
+		{"userinfo drops out", "hdfs://User@NN/A/B.rf", "hdfs://nn/A/B.rf"},
+		{"userinfo with a password", "hdfs://u:p@NN:90/A/B.rf", "hdfs://nn:90/A/B.rf"},
 		{"ipv6 literal", "HDFS://[2001:DB8::1]:9000/A/B.rf", "hdfs://[2001:db8::1]:9000/A/B.rf"},
+		{"userinfo before an ipv6 literal", "hdfs://u@[2001:DB8::1]/A/B.rf", "hdfs://[2001:db8::1]/A/B.rf"},
 		{"no authority", "FILE:/A/B.rf", "file:/A/B.rf"},
 		{"authority runs to the end", "HDFS://NN", "hdfs://nn"},
 		{"no scheme at all", "/A/B.rf", "/A/B.rf"},
@@ -869,6 +874,39 @@ func TestTranslateRefusesAnOutputAliasingAnInputByEscape(t *testing.T) {
 		{MetadataFileEntry: storedFile("hdfs://nn/vol/accumulo/tables/2/t-0001/F0001.rf"), Size: 8, Entries: 1},
 	}
 	job.OutputFile = "hdfs://nn/v%6Fl/accumulo/tables/2/t-0001/F0001.rf" + tmpSuffix(testECID)
+
+	r := assertRefused(t, job, Options{}, ClassMalformedJob, "outputFile")
+	if !strings.Contains(r.Detail, "which is also files[0]") {
+		t.Fatalf("detail = %q, want it to name the input it commits over", r.Detail)
+	}
+}
+
+// TestTranslateRefusesOnePathSpelledWithUserinfo closes the last
+// spelling that selects one file twice. hdfs.Backend.resolve never
+// reads u.User, so a credential in a tablet file path picks nothing —
+// two entries that differ only there open the same RFile.
+func TestTranslateRefusesOnePathSpelledWithUserinfo(t *testing.T) {
+	job := validJob()
+	job.Files = []*tabletserver.InputFile{
+		{MetadataFileEntry: storedFile("hdfs://nn/accumulo/tables/2/t-0001/F0001.rf"), Size: 8, Entries: 1},
+		{MetadataFileEntry: storedFile("hdfs://alice@nn/accumulo/tables/2/t-0001/F0001.rf"), Size: 8, Entries: 1},
+	}
+
+	r := assertRefused(t, job, Options{}, ClassMalformedJob, "files[1]")
+	if !strings.Contains(r.Detail, "duplicates files[0]") {
+		t.Fatalf("detail = %q, want it to name the entry it duplicates", r.Detail)
+	}
+}
+
+// TestTranslateRefusesAnOutputAliasingAnInputByUserinfo is the same
+// spelling on the output side, where the manager's rename would land on
+// a file the tablet still references.
+func TestTranslateRefusesAnOutputAliasingAnInputByUserinfo(t *testing.T) {
+	job := validJob()
+	job.Files = []*tabletserver.InputFile{
+		{MetadataFileEntry: storedFile("hdfs://alice@nn/accumulo/tables/2/t-0001/F0001.rf"), Size: 8, Entries: 1},
+	}
+	job.OutputFile = "hdfs://nn/accumulo/tables/2/t-0001/F0001.rf" + tmpSuffix(testECID)
 
 	r := assertRefused(t, job, Options{}, ClassMalformedJob, "outputFile")
 	if !strings.Contains(r.Detail, "which is also files[0]") {
@@ -932,6 +970,48 @@ func TestTranslateAcceptsInputsFromAnotherTable(t *testing.T) {
 	plan := mustTranslate(t, job, Options{})
 	if got := plan.Inputs[1].Path; got != cloned {
 		t.Fatalf("input path = %q, want the source table's file %q", got, cloned)
+	}
+}
+
+// TestTranslateRefusesEntriesTheTwoDecodersReadDifferently closes the
+// gap between the exact-name check and the struct decode that follows
+// it. Gson binds only the exact member and ignores the other spelling;
+// encoding/json falls back to a case-insensitive match and takes
+// whichever comes last. An entry carrying both is therefore a fenced
+// file to Java and a whole one to shoal — or, with "path", a different
+// file altogether.
+func TestTranslateRefusesEntriesTheTwoDecodersReadDifferently(t *testing.T) {
+	const path = "hdfs://nn/accumulo/tables/2/t-0001/F0002.rf"
+	for _, tt := range []struct {
+		name  string
+		entry string
+		want  string
+	}{
+		{
+			"a fence a struct decode would drop",
+			fmt.Sprintf(`{"path":"%s","startRow":"%s","endRow":"","StartRow":""}`, path, encodeRow("d")),
+			`"StartRow" alongside "startRow"`,
+		},
+		{
+			"a path a struct decode would replace",
+			fmt.Sprintf(`{"path":"%s","startRow":"","endRow":"","Path":"hdfs://nn/accumulo/tables/2/t-0001/F0009.rf"}`, path),
+			`"Path" alongside "path"`,
+		},
+		{
+			"an end bound a struct decode would drop",
+			fmt.Sprintf(`{"path":"%s","startRow":"","endRow":"%s","ENDROW":""}`, path, encodeRow("k")),
+			`"ENDROW" alongside "endRow"`,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			job := validJob()
+			job.Files[1].MetadataFileEntry = tt.entry
+
+			r := assertRefused(t, job, Options{}, ClassMalformedJob, "files[1]")
+			if !strings.Contains(r.Detail, tt.want) {
+				t.Fatalf("detail = %q, want it to contain %q", r.Detail, tt.want)
+			}
+		})
 	}
 }
 

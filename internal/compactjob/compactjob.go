@@ -670,27 +670,25 @@ func (p parsedInput) key() string {
 	return b.String()
 }
 
-// pathIdentity folds the parts of a path URI that name one file under
-// more than one spelling.
+// pathIdentity reduces a path URI to what actually selects a file, so
+// that two spellings of one file compare equal.
 //
-// A tablet file is opened through Hadoop, and both java.net.URI.equals
-// and this repository's own HDFS client compare the scheme and the host
-// without regard to case — HDFS://NN/x and hdfs://nn/x are one file.
-// Accumulo's ReferencedTabletFile compares normalized path strings, so
-// it would not notice, which is exactly why shoal has to: two entries
-// spelled that way would have every cell in the file merged twice, and
-// an output that collides with an input that way would overwrite it at
-// commit.
+// The measure is shoal's own storage backend, because that is what
+// opens these paths. hdfs.Backend.resolve parses the URI and keeps only
+// u.Host — compared with EqualFold — and u.Path, which url.Parse has
+// already decoded. So the scheme and host fold by case, percent escapes
+// decode, and userinfo drops out entirely: hdfs://alice@NN/v%6Fl/x and
+// HDFS://nn/vol/x are one file on the namenode.
 //
-// Percent escapes are decoded for the same reason. checkTabletFilePath
-// allows them in the volume, and shoal's own HDFS backend resolves a
-// path by handing url.Parse's decoded Path to the namenode, so
-// /v%6Fl/... and /vol/... are one file to the filesystem while being
-// two strings here.
+// Accumulo's ReferencedTabletFile compares normalized path strings and
+// would call all of those distinct, which is exactly why shoal has to
+// fold them: two inputs spelled differently would have every cell in
+// the file merged twice, and an output colliding with an input would
+// overwrite it at commit.
 //
-// Beyond that only the scheme and the host fold. The path is
-// case-sensitive on every filesystem Accumulo runs on, and userinfo and
-// port are left alone because URI does not fold them either.
+// The path itself stays case-sensitive, as it is on every filesystem
+// Accumulo runs on, and the port stays because resolve compares it as
+// part of the authority.
 func pathIdentity(raw string) string {
 	colon := strings.Index(raw, ":")
 	if colon <= 0 {
@@ -702,8 +700,8 @@ func pathIdentity(raw string) string {
 		return decodeEscapes(id)
 	}
 	authority := id[start:end]
-	// Fold only the host: everything after an "@" and, for an IPv6
-	// literal, everything through the "]".
+	// Drop the userinfo and fold the host: for an IPv6 literal that runs
+	// through the "]", otherwise up to a port.
 	host := 0
 	if at := strings.LastIndexByte(authority, '@'); at >= 0 {
 		host = at + 1
@@ -714,7 +712,7 @@ func pathIdentity(raw string) string {
 	} else if port := strings.IndexByte(authority[host:], ':'); port >= 0 {
 		rest = host + port
 	}
-	folded := authority[:host] + strings.ToLower(authority[host:rest]) + authority[rest:]
+	folded := strings.ToLower(authority[host:rest]) + authority[rest:]
 	return decodeEscapes(id[:start] + folded + id[end:])
 }
 
@@ -1181,6 +1179,10 @@ func isHexDigit(c byte) bool {
 	return c >= '0' && c <= '9' || c >= 'a' && c <= 'f' || c >= 'A' && c <= 'F'
 }
 
+// storedTabletFileMembers are the members TabletFileCqMetadataGson
+// declares, spelled the way Gson binds them.
+var storedTabletFileMembers = [...]string{"path", "startRow", "endRow"}
+
 // checkEntryFields enforces the StoredTabletFile invariants a Go struct
 // decode cannot express.
 //
@@ -1197,6 +1199,15 @@ func isHexDigit(c byte) bool {
 // {"StartRow":...} and hand back a plausible entry for JSON that leaves
 // every one of those fields null on the Java side.
 //
+// An entry carrying both spellings is refused for the same reason from
+// the other direction. Gson would bind the exact member and ignore the
+// other; encoding/json falls back to a case-insensitive match and
+// assigns whichever comes last, so {"startRow":"AWQ=","StartRow":""}
+// is a fenced file to Java and a whole one to the struct decode below —
+// the misreading that widens a compaction past the range the manager
+// authorized. Requiring exactly one member per name makes the two
+// decoders agree by construction.
+//
 // The decoded rows come back so the caller can identify the reference by
 // path and range without decoding them a second time.
 func checkEntryFields(entry, field string) (startRaw, endRaw []byte, err error) {
@@ -1204,6 +1215,22 @@ func checkEntryFields(entry, field string) (startRaw, endRaw []byte, err error) 
 	if err != nil {
 		return nil, nil, refuse(ClassMalformedJob, field,
 			"undecodable StoredTabletFile entry: %v", err)
+	}
+	for name := range members {
+		for _, bound := range storedTabletFileMembers {
+			if name == bound || !strings.EqualFold(name, bound) {
+				continue
+			}
+			// Without the exact member Gson binds nothing and
+			// requireNonNull throws, which the presence checks below
+			// report more precisely. It is the pair that diverges.
+			if _, exact := members[bound]; !exact {
+				continue
+			}
+			return nil, nil, refuse(ClassMalformedJob, field,
+				"StoredTabletFile has %q alongside %q; Gson binds only the exact name, so the two decoders would disagree about this entry",
+				name, bound)
+		}
 	}
 	if member, ok := members["path"]; !ok || isJSONNull(member) {
 		return nil, nil, refuse(ClassMalformedJob, field,
