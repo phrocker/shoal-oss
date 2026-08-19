@@ -53,6 +53,7 @@ type fakeS3WriteOperations struct {
 	deleteFailures      int
 	promoteCalls        int
 	cleanupCanceled     bool
+	headFailures        int
 	nextETag            int
 }
 
@@ -63,6 +64,10 @@ func newFakeS3WriteOperations() *fakeS3WriteOperations {
 func (f *fakeS3WriteOperations) head(
 	_ context.Context, _, key string,
 ) (s3ObjectState, error) {
+	if f.headFailures > 0 {
+		f.headFailures--
+		return s3ObjectState{}, context.DeadlineExceeded
+	}
 	obj, ok := f.objects[key]
 	if !ok {
 		return s3ObjectState{}, &types.NotFound{}
@@ -617,6 +622,26 @@ func TestWriter_CleanupUsesIndependentContextAndCanRetryAfterCommit(t *testing.T
 		}
 		if _, ok := f.objects[w.stageKey]; ok {
 			t.Fatal("second Close did not retry temporary cleanup")
+		}
+	})
+
+	t.Run("retry unknown stage after ambiguous upload", func(t *testing.T) {
+		f := newFakeS3WriteOperations()
+		f.stageResponseLost = true
+		w := newFakeS3Writer(f, "target")
+		f.headFailures = 2
+		_, _ = w.Write([]byte("new"))
+		if err := w.Close(); err == nil {
+			t.Fatal("Close succeeded despite upload and verification failures")
+		}
+		if _, ok := f.objects[w.stageKey]; !ok {
+			t.Fatal("ambiguous temporary object unexpectedly absent before retry")
+		}
+		if err := w.Abort(); err != nil {
+			t.Fatalf("Abort retry: %v", err)
+		}
+		if _, ok := f.objects[w.stageKey]; ok {
+			t.Fatal("Abort did not discover and remove temporary object")
 		}
 	})
 }

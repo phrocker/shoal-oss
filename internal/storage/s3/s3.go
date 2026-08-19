@@ -511,6 +511,7 @@ type writer struct {
 	target         s3ObjectState
 	stage          s3ObjectState
 	stageCreated   bool
+	stageUnknown   bool
 	cleanupTimeout time.Duration
 	buf            bytes.Buffer
 	closed         bool
@@ -536,6 +537,7 @@ func (w *writer) Close() error {
 		return nil
 	}
 	if !w.stageCreated {
+		w.stageUnknown = true
 		stage, err := w.ops.putStage(w.ctx, w.bucket, w.stageKey, w.buf.Bytes(), w.writeID)
 		if err != nil {
 			if verified, verifyErr := w.verifyStage(); verifyErr != nil || !verified {
@@ -549,6 +551,7 @@ func (w *writer) Close() error {
 		}
 		w.stage = stage
 		w.stageCreated = true
+		w.stageUnknown = false
 	}
 	if w.stage.etag == nil {
 		if verified, err := w.verifyStage(); err != nil || !verified || w.stage.etag == nil {
@@ -597,15 +600,18 @@ func (w *writer) verifyStage() (bool, error) {
 	state, err := w.ops.head(ctx, w.bucket, w.stageKey)
 	if err != nil {
 		if isNotFound(err) {
+			w.stageUnknown = false
 			return false, nil
 		}
 		return false, fmt.Errorf("s3: verify temporary object s3://%s/%s: %w", w.bucket, w.stageKey, err)
 	}
 	if state.size != int64(w.buf.Len()) || state.metadata["shoal-write-id"] != w.writeID {
+		w.stageUnknown = false
 		return false, nil
 	}
 	w.stage = state
 	w.stageCreated = true
+	w.stageUnknown = false
 	return true, nil
 }
 
@@ -628,7 +634,16 @@ func (w *writer) verifyDestination() (bool, error) {
 
 func (w *writer) cleanupStage() error {
 	if !w.stageCreated {
-		return nil
+		if !w.stageUnknown {
+			return nil
+		}
+		verified, err := w.verifyStage()
+		if err != nil {
+			return err
+		}
+		if !verified {
+			return nil
+		}
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), w.cleanupTimeout)
 	defer cancel()
@@ -636,6 +651,7 @@ func (w *writer) cleanupStage() error {
 		return fmt.Errorf("s3: remove temporary object s3://%s/%s: %w", w.bucket, w.stageKey, err)
 	}
 	w.stageCreated = false
+	w.stageUnknown = false
 	return nil
 }
 

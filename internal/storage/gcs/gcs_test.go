@@ -519,6 +519,62 @@ func TestWriter_CloseAmbiguousPromotionErrorDoesNotReplayMutation(t *testing.T) 
 	}
 }
 
+func TestWriter_AmbiguousPromotionDoesNotAcceptConcurrentIdenticalObject(t *testing.T) {
+	backend, bucket := newFakeBackend()
+	bucket.putObject("path/to/object.rf", []byte("old"))
+	bucket.copyHook = func(_ context.Context, dst, _ *fakeObject) error {
+		bucket.putObjectWithMetadata(dst.name, []byte("new"), map[string]string{"shoal-write-id": "other-writer"})
+		return nil
+	}
+
+	w, err := backend.Create(context.Background(), "bucket/path/to/object.rf")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if _, err := w.Write([]byte("new")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if err := w.Close(); !errors.Is(err, errFakePrecondition) {
+		t.Fatalf("Close error = %v, want concurrent precondition failure", err)
+	}
+	if got := bucket.objects["path/to/object.rf"].metadata["shoal-write-id"]; got != "other-writer" {
+		t.Fatalf("destination write ID = %q, want concurrent writer", got)
+	}
+}
+
+func TestWriter_AbortRetriesUnknownTemporaryObjectVerification(t *testing.T) {
+	backend, bucket := newFakeBackend()
+	w, err := backend.Create(context.Background(), "bucket/path/to/object.rf")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	tempName := w.(*writer).temp.(*fakeObject).name
+	if _, err := w.Write([]byte("new")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	bucket.writerPlan = func(name string) fakeWriterPlan {
+		if name == tempName {
+			return fakeWriterPlan{closeErr: context.DeadlineExceeded, publishOnClose: true}
+		}
+		return fakeWriterPlan{}
+	}
+	// The writer was already created, so update its plan directly.
+	bucket.lastWriter.plan = bucket.writerPlan(tempName)
+	bucket.attrsFailures = 2
+	if err := w.Close(); err == nil {
+		t.Fatal("Close succeeded despite ambiguous upload and verification failures")
+	}
+	if _, ok := bucket.objects[tempName]; !ok {
+		t.Fatal("ambiguous temporary object unexpectedly absent before retry")
+	}
+	if err := w.(*writer).Abort(); err != nil {
+		t.Fatalf("Abort retry: %v", err)
+	}
+	if _, ok := bucket.objects[tempName]; ok {
+		t.Fatal("Abort did not discover and remove temporary object")
+	}
+}
+
 func TestWriter_CanceledPromotionUsesIndependentCleanupContext(t *testing.T) {
 	backend, bucket := newFakeBackend()
 	bucket.putObject("path/to/object.rf", []byte("old"))
@@ -859,6 +915,7 @@ type fakeBucket struct {
 	deleteHook         func(context.Context, *fakeObject) error
 	copyHook           func(context.Context, *fakeObject, *fakeObject) error
 	copyAfterCommitErr error
+	attrsFailures      int
 	lastWriter         *fakeObjectWriter
 	copyCalls          []fakeCopyCall
 	deleteCalls        []fakeDeleteCall
@@ -960,6 +1017,10 @@ func (o *fakeObject) Attrs(ctx context.Context) (*cloudstorage.ObjectAttrs, erro
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	if o.bucket.attrsFailures > 0 {
+		o.bucket.attrsFailures--
+		return nil, context.DeadlineExceeded
+	}
 	data, ok := o.lookup()
 	if !ok {
 		return nil, cloudstorage.ErrObjectNotExist
@@ -1053,7 +1114,7 @@ func (c *fakeObjectCopier) Run(ctx context.Context) (*cloudstorage.ObjectAttrs, 
 	if err := c.dst.checkConditions(); err != nil {
 		return nil, err
 	}
-	attrs := c.dst.bucket.putObject(c.dst.name, srcData.body)
+	attrs := c.dst.bucket.putObjectWithMetadata(c.dst.name, srcData.body, srcData.metadata)
 	if c.dst.bucket.copyAfterCommitErr != nil {
 		return nil, c.dst.bucket.copyAfterCommitErr
 	}

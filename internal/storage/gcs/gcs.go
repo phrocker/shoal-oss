@@ -399,6 +399,7 @@ type writer struct {
 	tempPath           string
 	tempGeneration     int64
 	tempAttrs          *storage.ObjectAttrs
+	tempUnknown        bool
 	tempClosed         bool
 	tempCleanupTimeout time.Duration
 	closed             bool
@@ -426,6 +427,7 @@ func (w *writer) Close() error {
 	}
 	if !w.tempClosed {
 		w.tempClosed = true
+		w.tempUnknown = true
 		err := w.inner.Close()
 		verifyErr := w.verifyTempObject()
 		if err != nil {
@@ -611,16 +613,21 @@ func (w *writer) verifyTempObject() error {
 
 	attrs, err := w.temp.Attrs(verifyCtx)
 	if err != nil {
+		if errors.Is(err, storage.ErrObjectNotExist) {
+			w.tempUnknown = false
+		}
 		return fmt.Errorf("gcs: verify temporary object %s: %w", w.tempPath, err)
 	}
 	if attrs.Generation == 0 {
 		return fmt.Errorf("gcs: verify temporary object %s: missing generation", w.tempPath)
 	}
 	if attrs.Metadata["shoal-write-id"] != w.writeID {
+		w.tempUnknown = false
 		return fmt.Errorf("gcs: verify temporary object %s: mismatched shoal-write-id", w.tempPath)
 	}
 	w.tempGeneration = attrs.Generation
 	w.tempAttrs = attrs
+	w.tempUnknown = false
 	return nil
 }
 
@@ -654,12 +661,21 @@ func (w *writer) destinationMatchesTemp() bool {
 	}
 	return attrs.Size == w.tempAttrs.Size &&
 		attrs.CRC32C == w.tempAttrs.CRC32C &&
-		bytes.Equal(attrs.MD5, w.tempAttrs.MD5)
+		bytes.Equal(attrs.MD5, w.tempAttrs.MD5) &&
+		attrs.Metadata["shoal-write-id"] == w.writeID
 }
 
 func (w *writer) cleanupTempObject() error {
 	if w.tempGeneration == 0 {
-		return nil
+		if !w.tempUnknown {
+			return nil
+		}
+		if err := w.verifyTempObject(); err != nil {
+			if !w.tempUnknown {
+				return nil
+			}
+			return err
+		}
 	}
 	cleanupCtx, cancel := context.WithTimeout(context.Background(), w.tempCleanupTimeout)
 	defer cancel()
@@ -668,6 +684,7 @@ func (w *writer) cleanupTempObject() error {
 	}
 	w.tempGeneration = 0
 	w.tempAttrs = nil
+	w.tempUnknown = false
 	return nil
 }
 

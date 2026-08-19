@@ -53,6 +53,7 @@ type fakeAzureWriteOperations struct {
 	deleteFailures      int
 	promoteCalls        int
 	cleanupCanceled     bool
+	headFailures        int
 	nextETag            int
 	lastPromoteSource   azureCopySource
 	lastPromoteWriteID  string
@@ -69,6 +70,10 @@ func azureNotFoundError() error {
 func (f *fakeAzureWriteOperations) head(
 	_ context.Context, _, name string,
 ) (azureObjectState, error) {
+	if f.headFailures > 0 {
+		f.headFailures--
+		return azureObjectState{}, context.DeadlineExceeded
+	}
 	obj, ok := f.objects[name]
 	if !ok {
 		return azureObjectState{}, azureNotFoundError()
@@ -900,6 +905,26 @@ func TestWriter_CleanupUsesIndependentContextAndCanRetryAfterCommit(t *testing.T
 		}
 		if _, ok := f.objects[w.stageName]; ok {
 			t.Fatal("second Close did not retry temporary cleanup")
+		}
+	})
+
+	t.Run("retry unknown stage after ambiguous upload", func(t *testing.T) {
+		f := newFakeAzureWriteOperations()
+		f.stageResponseLost = true
+		w := newFakeAzureWriter(f, "target")
+		f.headFailures = 2
+		_, _ = w.Write([]byte("new"))
+		if err := w.Close(); err == nil {
+			t.Fatal("Close succeeded despite upload and verification failures")
+		}
+		if _, ok := f.objects[w.stageName]; !ok {
+			t.Fatal("ambiguous temporary blob unexpectedly absent before retry")
+		}
+		if err := w.Abort(); err != nil {
+			t.Fatalf("Abort retry: %v", err)
+		}
+		if _, ok := f.objects[w.stageName]; ok {
+			t.Fatal("Abort did not discover and remove temporary blob")
 		}
 	})
 }
