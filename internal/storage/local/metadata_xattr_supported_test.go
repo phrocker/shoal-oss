@@ -47,34 +47,29 @@ func TestReconcilePlatformXattrsReportsRemovalFailure(t *testing.T) {
 	}
 }
 
-func TestReconcilePlatformXattrsDropsSecurityCapability(t *testing.T) {
+func TestReconcilePlatformXattrsDoesNotRestoreContentSecurityLabels(t *testing.T) {
 	attrs := map[string]map[string][]byte{
 		"target": {
 			"user.keep":           []byte("target"),
-			"security.capability": []byte("cap"),
-			"security.ima":        []byte("ima"),
-			"security.evm":        []byte("evm"),
+			"security.capability": []byte("old-capability"),
+			"security.ima":        []byte("old-signature"),
+			"security.evm":        []byte("old-integrity"),
 		},
 		"temp": {
 			"user.keep":           []byte("inherited"),
-			"security.capability": []byte("cap"),
-			"security.ima":        []byte("ima"),
-			"security.evm":        []byte("evm"),
+			"security.capability": []byte("inherited-capability"),
+			"security.ima":        []byte("inherited-signature"),
+			"security.evm":        []byte("inherited-integrity"),
 			"user.inherited":      []byte("remove"),
 		},
 	}
-	ops := mapXattrOperations(attrs)
 
-	if err := reconcilePlatformXattrs("temp", "target", ops); err != nil {
+	if err := reconcilePlatformXattrs("temp", "target", mapXattrOperations(attrs)); err != nil {
 		t.Fatal(err)
 	}
-	for _, name := range []string{"security.capability", "security.ima", "security.evm"} {
-		if _, ok := attrs["temp"][name]; ok {
-			t.Fatalf("temporary xattrs = %v, unexpected %s", attrs["temp"], name)
-		}
-	}
-	if got := string(attrs["temp"]["user.keep"]); got != "target" {
-		t.Fatalf("preserved attribute = %q, want target", got)
+	want := map[string][]byte{"user.keep": []byte("target")}
+	if !reflect.DeepEqual(attrs["temp"], want) {
+		t.Fatalf("temporary xattrs = %v, want content-safe set %v", attrs["temp"], want)
 	}
 }
 

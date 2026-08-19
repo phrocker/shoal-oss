@@ -38,7 +38,7 @@ func reconcilePlatformXattrs(temp, target string, ops xattrOperations) error {
 
 	targetSet := make(map[string]struct{}, len(targetNames))
 	for _, name := range targetNames {
-		if !shouldPreserveXattr(name) {
+		if !preserveContentXattr(name) {
 			continue
 		}
 		targetSet[name] = struct{}{}
@@ -52,7 +52,7 @@ func reconcilePlatformXattrs(temp, target string, ops xattrOperations) error {
 		}
 	}
 	for _, name := range targetNames {
-		if !shouldPreserveXattr(name) {
+		if !preserveContentXattr(name) {
 			continue
 		}
 		value, err := ops.get(target, name)
@@ -66,7 +66,7 @@ func reconcilePlatformXattrs(temp, target string, ops xattrOperations) error {
 	return nil
 }
 
-func shouldPreserveXattr(name string) bool {
+func preserveContentXattr(name string) bool {
 	// Linux clears file capabilities when file contents change. The atomic
 	// rewrite path should mirror that in-place truncation behavior rather than
 	// restoring privilege-bearing content security labels onto rewritten bytes.
