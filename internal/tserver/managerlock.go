@@ -97,9 +97,18 @@ func ReadManagerLock(ctx context.Context, reader ManagerLockReader) (LockID, err
 // for no reason. A directory that is readable and holds no lock is evidence,
 // and clears the observation.
 //
-// An observation the host refuses — an epoch older than one it has already
-// seen — is dropped rather than retried. The host keeps the newer epoch, which
-// is the safe direction: authority never moves backwards.
+// An observation the host refuses — a live holder whose epoch is older than
+// one already seen — ends the watch with an error wrapping ErrLockNotNewer.
+// The host keeps the newer epoch, so authority still does not move backwards
+// on the way out, but the refusal is reported rather than swallowed. A
+// ZooKeeper session reads monotonically, so the live holder's sequence only
+// goes backwards when the lock directory itself was deleted and recreated,
+// which restarts the counter and does not heal on its own: polling through it
+// would leave this host fenced to a manager that no longer exists, taking a
+// dead manager's requests and refusing the live one's, which is authority
+// invented here rather than observed. The recovery belongs to the supervisor
+// and is the one AdoptLock's refusal already calls for — a fresh Host, which
+// carries no epoch history and takes the live manager on its first reading.
 func WatchManagerLock(
 	ctx context.Context,
 	reader ManagerLockReader,
@@ -118,7 +127,9 @@ func WatchManagerLock(
 	timer := time.NewTimer(interval)
 	defer timer.Stop()
 	for {
-		observeManagerLockOnce(ctx, reader, host)
+		if err := observeManagerLockOnce(ctx, reader, host); err != nil {
+			return err
+		}
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -131,17 +142,22 @@ func WatchManagerLock(
 	}
 }
 
-// observeManagerLockOnce applies one reading of the manager lock to the host.
-func observeManagerLockOnce(ctx context.Context, reader ManagerLockReader, host *Host) {
+// observeManagerLockOnce applies one reading of the manager lock to the host,
+// returning an error only when the host refuses the reading — the one outcome
+// another poll cannot change.
+func observeManagerLockOnce(ctx context.Context, reader ManagerLockReader, host *Host) error {
 	id, err := ReadManagerLock(ctx, reader)
 	switch {
 	case err == nil:
-		// A refusal means the host already knows a newer manager than this
-		// reading; keeping the newer one is the fail-closed direction.
-		_ = host.ObserveManagerLock(id)
+		if err := host.ObserveManagerLock(id); err != nil {
+			return fmt.Errorf("observe manager lock %s: %w",
+				path.Join(reader.InstancePath(), zManagerLock), err)
+		}
 	case errors.Is(err, ErrNoManagerLock):
+		// The zero LockID clears the observation and is never refused.
 		_ = host.ObserveManagerLock(LockID{})
 	default:
 		// Unreadable is not the same as absent: hold the last observation.
 	}
+	return nil
 }

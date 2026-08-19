@@ -384,6 +384,9 @@ func TestEncodeRefusesUnusableAdvertisements(t *testing.T) {
 		{"no group", with(func(d *ServiceDescriptor) { d.Group = "" })},
 		{"no address", with(func(d *ServiceDescriptor) { d.Address = "" })},
 		{"unbound placeholder", with(func(d *ServiceDescriptor) { d.Address = placeholderAddress })},
+		{"wildcard listen address", with(func(d *ServiceDescriptor) { d.Address = "0.0.0.0:9997" })},
+		{"wildcard ipv6 listen address", with(func(d *ServiceDescriptor) { d.Address = "[::]:9997" })},
+		{"host with a separator", with(func(d *ServiceDescriptor) { d.Address = "../..:9997" })},
 		{"no port", with(func(d *ServiceDescriptor) { d.Address = "shoal-1.example" })},
 		{"no host", with(func(d *ServiceDescriptor) { d.Address = ":9997" })},
 		{"non-numeric port", with(func(d *ServiceDescriptor) { d.Address = "shoal-1.example:thrift" })},
@@ -402,6 +405,39 @@ func TestEncodeRefusesUnusableAdvertisements(t *testing.T) {
 			}
 			if encoded != nil {
 				t.Fatalf("Encode returned %q alongside its refusal", encoded)
+			}
+		})
+	}
+}
+
+// TestWildcardListenAddressIsRefused separates what a server binds from what
+// it advertises. 0.0.0.0 and :: are how a process says "every interface"; they
+// are not an identity, and a manager reading one out of this lock would have
+// to substitute a host of its own choosing to dial anything. Real endpoints —
+// a name, a loopback, an interface address — stay accepted, because refusing
+// those would refuse ordinary deployments.
+func TestWildcardListenAddressIsRefused(t *testing.T) {
+	for _, address := range []string{
+		"0.0.0.0:9997",
+		"[::]:9997",
+		"[0:0:0:0:0:0:0:0]:9997",
+	} {
+		t.Run(address, func(t *testing.T) {
+			_, err := TabletServerLockData(serverUUID, address, testGroup, ServiceClient)
+			if !errors.Is(err, ErrInvalidLockData) {
+				t.Fatalf("TabletServerLockData(%q): want ErrInvalidLockData, got %v", address, err)
+			}
+		})
+	}
+	for _, address := range []string{
+		testAddress,
+		"127.0.0.1:9997",
+		"[::1]:9997",
+		"10.0.0.7:9997",
+	} {
+		t.Run(address, func(t *testing.T) {
+			if _, err := TabletServerLockData(serverUUID, address, testGroup, ServiceClient); err != nil {
+				t.Fatalf("TabletServerLockData(%q): %v", address, err)
 			}
 		})
 	}

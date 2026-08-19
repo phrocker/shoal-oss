@@ -141,11 +141,15 @@ func PublicACL() []gozk.ACL {
 // internal/zk walks when it enumerates live servers. An empty group means
 // DefaultResourceGroup.
 //
-// A group outside Accumulo's resource-group grammar is refused rather than
-// joined into a path. Segments are cleaned when they are joined, so a name
-// like "../managers" would not register this server under tservers at all —
+// Both variable segments are checked before they are joined, because segments
+// are cleaned when they are joined: a group like "../managers", or an address
+// like "../..:9997", would not register this server under tservers at all —
 // it would put it in another role's subtree, where nothing looking for a
-// tablet server would find it and something looking for a manager might.
+// tablet server would find it and something looking for a manager might. The
+// group must match Accumulo's resource-group grammar, and the address must be
+// one the manager could dial, which is the same check the descriptor written
+// into the node gets: the directory name and the advertised address are the
+// same address, and a reader that finds them disagreeing has no server.
 func TabletServerLockPath(instancePath, group, address string) (string, error) {
 	if group == "" {
 		group = DefaultResourceGroup
@@ -153,6 +157,9 @@ func TabletServerLockPath(instancePath, group, address string) (string, error) {
 	if !validResourceGroup(group) {
 		return "", fmt.Errorf("%w: resource group %q is not a name Accumulo reads (must match %s)",
 			ErrInvalidLockData, group, resourceGroupPattern)
+	}
+	if err := validateAdvertiseAddress(address); err != nil {
+		return "", fmt.Errorf("%w: %w", ErrInvalidLockData, err)
 	}
 	return path.Join(instancePath, zTabletServers, group, address), nil
 }
@@ -525,6 +532,16 @@ func (l *ServiceLock) queueForOwnership(ctx context.Context) (LockID, error) {
 			return LockID{}, fmt.Errorf("%w: %s is gone from %s", ErrLockNodeMissing, node, l.dir)
 		}
 		if index == 0 {
+			// First in line, but the caller stopped waiting. Committing here
+			// would hand back a lock nobody is waiting for any more, while the
+			// queued path below refuses the same cancellation — so the outcome
+			// of a cancelled acquisition would depend on how far it happened
+			// to get. Failing lets Acquire's cleanup take the node back out of
+			// the directory instead of leaving this process holding a lock it
+			// was never told to maintain.
+			if err := ctx.Err(); err != nil {
+				return LockID{}, err
+			}
 			return l.acquired(node)
 		}
 		// Watch this process's own node as well as the one ahead of it. The
@@ -642,6 +659,14 @@ func (l *ServiceLock) Maintain(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
+		case <-l.release:
+			// The caller gave the lock up. Waiting for the node's deletion to
+			// arrive as a watch event would keep watching a lock this process
+			// has already released, and if that delete failed and left the
+			// node in place no event is coming at all: with no verify
+			// interval configured there is nothing else in this select to
+			// wake it, and it would watch a released lock until ctx ended.
+			return l.lose(LossReleased, nil)
 		case <-ticks:
 			// The watch armed above is still live and still the only one, so
 			// it is left in place. Verify re-reads the directory itself, which

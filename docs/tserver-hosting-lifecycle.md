@@ -280,6 +280,15 @@ so a group like `../managers` would not be rejected by the join — it
 would quietly register this server in another role's subtree, where
 nothing looking for a tablet server would find it.
 
+The address gets the same treatment, because it is the other variable
+segment of that path as well as the endpoint written into the node. An
+address carrying a separator — `../../managers/lock:9997` — is cleaned
+into the manager's subtree by exactly the same join, so both segments
+are checked before either is used. The check is the one the descriptor
+already had to pass, which is what keeps the directory's name and the
+advertised address the same address: a reader that finds them
+disagreeing has no server it can reach.
+
 Duplicates are real: a create whose response was lost still created a
 node, and a retry creates another. Both carry this process's UUID, so
 the first is kept and the rest are deleted — otherwise one process would
@@ -291,6 +300,13 @@ ephemeral node keeps its place in the queue until the session ends —
 it can become the holder of a lock nobody is waiting on — and only the
 session's owner can close the session, so the owner has to be told
 rather than left to discover a range nobody hosts for no reason.
+
+Cancellation is honoured at the moment ownership would be taken, not
+only while queued. Whether this process is first by the time the
+cancellation lands is a race, and the outcome must not turn on it:
+committing there would hand back a lock the caller stopped waiting for
+and left nobody maintaining it, so both paths refuse and the node is
+swept.
 
 ### What the node says
 
@@ -305,6 +321,13 @@ the manager: no descriptors, an address that is empty, unbound, or not
 which Accumulo's `EnumMap` would silently collapse to whichever arrived
 last. A claim the manager cannot act on is worse than staying invisible,
 because it draws work to a process that cannot do it.
+
+A wildcard is refused for the same reason. `0.0.0.0` and `::` are how a
+process says which interfaces it binds; neither is an identity, and a
+manager reading one out of this lock would have to substitute some host
+of its own to dial, landing the work on whichever server it substituted.
+What a server binds and what it advertises are different questions, and
+only the second belongs in the lock.
 
 That cuts both ways: a process should advertise what it can serve, not
 what it intends to serve. `TabletServerServices()` names the full Java
@@ -357,6 +380,13 @@ held node would leave a caller that was told the lock was gone going on
 to hold it, and would promote a surviving duplicate to holder of a lock
 nobody is waiting on.
 
+`Maintain` is woken by the release directly rather than by the node's
+deletion coming back as a watch event. Ordinarily both happen; but a
+delete that fails leaves the node in place, and with no verify interval
+configured there is nothing else to wake the watch — it would go on
+watching a generation the caller had already given up until the process
+stopped.
+
 A create that was already in flight is waited out before the sweep. The
 two are mutually exclusive, so either the create happens and the sweep
 that follows finds its node, or the release wins and there is no create
@@ -387,9 +417,20 @@ Two failures that look alike are kept apart. A directory that cannot be
 read leaves the previous observation in place, because failing to reach
 ZooKeeper is not evidence the manager changed and withdrawing authority
 would refuse the live manager's assignments for nothing. A directory that
-is readable and holds no lock is evidence, and clears it. An observation
-the host refuses — an epoch older than one it has already seen — is
-dropped, so authority never moves backwards.
+is readable and holds no lock is evidence, and clears it.
+
+An observation the host refuses — a live holder whose epoch is older
+than one already seen — ends the watch with `ErrLockNotNewer`. The host
+keeps the newer epoch, so authority still does not move backwards, but
+the refusal is reported rather than swallowed. A session reads ZooKeeper
+monotonically, so the live holder's sequence only goes backwards when
+the manager lock directory itself was deleted and recreated, and that
+does not heal: polling through it would leave this host fenced to a
+manager that no longer exists, taking a dead manager's requests and
+refusing the live one's — authority invented here rather than observed.
+Recovery is the supervisor's, and it is the one `AdoptLock`'s refusal
+already calls for: a fresh `Host`, which carries no epoch history and
+takes the live manager on its first reading.
 
 ## 7. What is not here yet
 

@@ -1263,6 +1263,138 @@ func TestTabletServerLockPathTraversalWouldHaveEscaped(t *testing.T) {
 	}
 }
 
+// TestTabletServerLockPathRefusesAnAddressAccumuloCouldNotDial covers the
+// other variable segment. The address is the directory's name as well as the
+// endpoint written into the node, so a value that fails in either sense is
+// refused before it is registered: a name nothing can dial draws work to a
+// process that cannot answer, and a name carrying a separator registers this
+// server somewhere else entirely.
+func TestTabletServerLockPathRefusesAnAddressAccumuloCouldNotDial(t *testing.T) {
+	for _, address := range []string{
+		"",
+		"shoal-1.example",
+		"shoal-1.example:thrift",
+		"../..:9997",
+		"0.0.0.0:9997",
+		"[::]:9997",
+		placeholderAddress,
+	} {
+		t.Run(address, func(t *testing.T) {
+			got, err := TabletServerLockPath(testInstancePath, testGroup, address)
+			if err == nil {
+				t.Fatalf("TabletServerLockPath accepted address %q and returned %q", address, got)
+			}
+			if !errors.Is(err, ErrInvalidLockData) {
+				t.Fatalf("error for address %q = %v, want ErrInvalidLockData", address, err)
+			}
+			if got != "" {
+				t.Fatalf("a refused address must yield no path, got %q", got)
+			}
+		})
+	}
+}
+
+// TestTabletServerLockPathAddressTraversalWouldHaveEscaped is the same
+// demonstration for the address: it is a path segment too, and one carrying a
+// traversal lands in the manager's subtree rather than being rejected.
+func TestTabletServerLockPathAddressTraversalWouldHaveEscaped(t *testing.T) {
+	const traversal = "../../managers/lock:9997"
+	escaped := path.Join(testInstancePath, zTabletServers, testGroup, traversal)
+	if strings.Contains(escaped, "/"+zTabletServers+"/") {
+		t.Fatalf("expected the traversal to leave the tservers subtree, got %q", escaped)
+	}
+	if want := testInstancePath + "/managers/lock:9997"; escaped != want {
+		t.Fatalf("traversal landed at %q, want %q", escaped, want)
+	}
+	if got, err := TabletServerLockPath(testInstancePath, testGroup, traversal); err == nil {
+		t.Fatalf("TabletServerLockPath accepted %q and returned %q", traversal, got)
+	}
+}
+
+// TestAcquireRefusesToCommitAnOwnershipTheCallerCancelled covers a
+// cancellation that lands after the node is created and before the queue is
+// read. Whether this process is first by then is a race, and the outcome must
+// not turn on it: a caller that stopped waiting gets the same refusal either
+// way, and the node it created goes back out of the directory instead of
+// staying there as a lock nobody is maintaining.
+func TestAcquireRefusesToCommitAnOwnershipTheCallerCancelled(t *testing.T) {
+	f := newFakeZK()
+	lock := newTestLock(t, f, serverUUID)
+	dir := testLockPath()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	f.beforeChildren = func(listing string) {
+		if listing != dir {
+			return
+		}
+		f.beforeChildren = nil
+		cancel()
+	}
+
+	if _, err := lock.Acquire(ctx, testLockData(t)); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Acquire: want context.Canceled, got %v", err)
+	}
+	// The node existed before the cancellation was noticed, so this is the
+	// commit point being refused rather than the check made before the create.
+	node := lockNodePath(serverUUID, 0)
+	swept := false
+	for _, deleted := range f.deletedPaths() {
+		if deleted == node {
+			swept = true
+		}
+	}
+	if !swept {
+		t.Fatalf("%s was never created and swept: created %v, deleted %v",
+			node, f.createdPaths(), f.deletedPaths())
+	}
+	if nodes := f.lockNodes(dir); len(nodes) != 0 {
+		t.Fatalf("a cancelled acquisition left %v queued in %s", nodes, dir)
+	}
+	if err := lock.Verify(); !errors.Is(err, ErrNotHeld) {
+		t.Fatalf("Verify after a cancelled acquisition: want ErrNotHeld, got %v", err)
+	}
+}
+
+// TestMaintainStopsWhenAReleaseCannotDeleteTheNode covers the release that
+// produces no watch event. Maintain normally learns of one the same way it
+// learns of anything else — the node disappears and the watch fires — but a
+// delete that fails leaves the node in place, and with no verify interval
+// configured there is nothing else in the select to wake it. The generation
+// has still ended: the caller gave it up, and a watch left running would be
+// watching a lock nobody holds until the process stopped.
+func TestMaintainStopsWhenAReleaseCannotDeleteTheNode(t *testing.T) {
+	f := newFakeZK()
+	lock := newTestLock(t, f, serverUUID)
+	id, err := lock.Acquire(context.Background(), testLockData(t))
+	if err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	node := path.Join(testLockPath(), id.String())
+	injected := errors.New("zookeeper is unavailable")
+	f.failDelete(node, injected)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	maintained := make(chan error, 1)
+	go func() { maintained <- lock.Maintain(ctx) }()
+	waitFor(t, "the held node to be watched", func() bool { return f.watchCount(node) == 1 })
+
+	if err := lock.Release(); !errors.Is(err, injected) {
+		t.Fatalf("Release: want the injected delete failure, got %v", err)
+	}
+	select {
+	case err := <-maintained:
+		if !errors.Is(err, ErrLockLost) {
+			t.Fatalf("Maintain: want ErrLockLost, got %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Maintain kept watching a lock that had already been released")
+	}
+	if !f.exists(node) {
+		t.Fatal("the delete was meant to fail: with the node gone, a watch event could have woken Maintain")
+	}
+}
+
 func TestNewServiceLockValidatesItsOptions(t *testing.T) {
 	f := newFakeZK()
 	if _, err := NewServiceLock(nil, ServiceLockOptions{Path: testLockPath()}); err == nil {

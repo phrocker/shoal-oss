@@ -285,15 +285,21 @@ func TestWatchManagerLockClearsAuthorityWhenTheManagerIsGone(t *testing.T) {
 	}
 }
 
-// TestWatchManagerLockIgnoresAnOlderEpoch stops authority moving backwards.
-// A reading of an older manager node — a stale cache, a directory that was
-// rebuilt — must not unseat the newer manager this host already knows.
-func TestWatchManagerLockIgnoresAnOlderEpoch(t *testing.T) {
+// TestWatchManagerLockSurfacesARefusedEpoch covers the one reading a later
+// poll cannot fix. ZooKeeper hands out sequence numbers from a counter on the
+// parent, so a manager lock directory that was deleted and remade starts again
+// at zero: the manager holding it is live, and its epoch is older than the one
+// this host has already seen. Refusing it is right — authority does not move
+// backwards — but polling on through it is not, because every later reading is
+// the same refusal and the host answers to a manager that is gone in the
+// meantime.
+func TestWatchManagerLockSurfacesARefusedEpoch(t *testing.T) {
 	host := NewHost()
 	reader := &fakeManagerReader{children: []string{managerNode(otherUUID, 9)}}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go func() { _ = WatchManagerLock(ctx, reader, host, time.Millisecond) }()
+	watch := make(chan error, 1)
+	go func() { watch <- WatchManagerLock(ctx, reader, host, time.Millisecond) }()
 
 	waitFor(t, "the manager lock to be observed", func() bool {
 		_, ok := host.ManagerLock()
@@ -301,13 +307,29 @@ func TestWatchManagerLockIgnoresAnOlderEpoch(t *testing.T) {
 	})
 
 	reader.set([]string{managerNode(managerUUID, 2)}, nil)
-	before := reader.readCount()
-	waitFor(t, "several stale readings", func() bool { return reader.readCount() > before+3 })
+	select {
+	case err := <-watch:
+		if !errors.Is(err, ErrLockNotNewer) {
+			t.Fatalf("WatchManagerLock: want ErrLockNotNewer, got %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("WatchManagerLock kept polling a refusal no later reading can resolve")
+	}
 
+	// Nothing moved backwards on the way out.
 	observed, ok := host.ManagerLock()
 	if !ok || observed != (LockID{UUID: otherUUID, Sequence: 9}) {
 		t.Fatalf("manager authority = %s, %v; want the newer epoch retained", observed, ok)
 	}
+
+	// And the documented recovery works: a host with no epoch history takes
+	// the live manager on its first reading.
+	fresh := NewHost()
+	go func() { _ = WatchManagerLock(ctx, reader, fresh, time.Millisecond) }()
+	waitFor(t, "a fresh host to take the live manager", func() bool {
+		seen, ok := fresh.ManagerLock()
+		return ok && seen == managerLock(2)
+	})
 }
 
 // TestWatchManagerLockObservesBeforeItWaits matters at startup: a tablet

@@ -25,6 +25,7 @@ import (
 	"regexp"
 	"sort"
 	"strconv"
+	"strings"
 
 	"github.com/google/uuid"
 )
@@ -210,7 +211,9 @@ func (d ServiceDescriptor) Validate() error {
 }
 
 // validateAdvertiseAddress rejects anything that is not a host:port another
-// process could dial.
+// process could dial, and anything that could not also name the directory the
+// lock is registered in. The advertised address is both: the manager dials it,
+// and it is the last segment of <instance>/tservers/<group>/<address>.
 func validateAdvertiseAddress(address string) error {
 	if address == "" {
 		return errors.New("empty address")
@@ -224,6 +227,21 @@ func validateAdvertiseAddress(address string) error {
 	}
 	if host == "" {
 		return fmt.Errorf("address %q has no host", address)
+	}
+	if strings.ContainsRune(host, '/') || host == "." || host == ".." {
+		// Segments are cleaned when they are joined, so a host carrying a
+		// separator or a dot segment would move the lock directory out of the
+		// tablet-server subtree entirely — the same escape the resource group
+		// is checked for. ZooKeeper refuses "." and ".." as path components in
+		// any case, and neither is a host anything could dial.
+		return fmt.Errorf("address %q host %q is not a single path segment", address, host)
+	}
+	if ip := net.ParseIP(host); ip != nil && ip.IsUnspecified() {
+		// A wildcard is what a server binds, not what it is reachable at.
+		// Published to the manager it identifies no host: every reader would
+		// have to substitute one, and work routed from that guess lands on
+		// whichever server the reader guessed rather than this one.
+		return fmt.Errorf("address %q is a wildcard listen address, not a reachable one", address)
 	}
 	number, err := strconv.Atoi(port)
 	if err != nil {
