@@ -102,6 +102,12 @@ creates — `zlock#<uuid>#<sequence>` — and the sequence is the generation
 counter: ZooKeeper hands out strictly increasing sequence numbers, so a
 lock that was lost and re-acquired always carries a higher one.
 
+This is the Accumulo-connected implementation of the repository-wide
+[coordination authority model](./coordination-authority.md): ZooKeeper and the
+manager remain the sole coordination authority for hosted tablets. A
+Kubernetes Lease may coordinate a separate Shoal-only table, but it must never
+mirror or supplement ownership of an Accumulo-hosted tablet.
+
 **Server lock** — the tablet-server lock the manager believed this
 process held. It must equal the lock held right now. An older generation
 was minted against a view of the cluster that no longer exists; a

@@ -7,6 +7,15 @@ This directory contains platform artifacts for running Shoal as two Kubernetes t
 
 For local development these collapse into a single `shoal-embed` process. The intended platform shape is: writes land in a shard-local `shoal-embed`, flush/compaction emits RFiles to a shared object-store prefix, and read-fleet pods open those same RFiles for hedged scans.
 
+Shoal's accepted
+[coordination authority model](../docs/coordination-authority.md) deliberately
+separates this Shoal-only pod topology from Accumulo-connected ownership:
+Kubernetes Leases may coordinate a Shoal-only writer group, while
+Accumulo-connected roles use ZooKeeper ServiceLocks and manager/coordinator
+authority. The same logical table must never be writable under both domains.
+The current manifests do not yet implement the Kubernetes Lease adapter; that
+work is ordered under #128 rather than implied by the StatefulSet alone.
+
 ## Artifacts
 
 - `../Dockerfile`: multi-stage Linux/amd64 image. It builds the two platform runtime binaries, `/shoal-embed` and `/shoal`, into a distroless static image. The image has no fixed entrypoint; choose a binary with Kubernetes `command`.
