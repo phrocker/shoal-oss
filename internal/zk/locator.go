@@ -125,6 +125,14 @@ func (l *Locator) RootTabletLocation(_ context.Context) (*Location, error) {
 	return parseRootTabletMetadata(data)
 }
 
+// InstanceRoot returns the absolute ZK path for an instance ID, i.e.
+// "/accumulo/<instance-id>". It is the path form used by every
+// instance-scoped subtree (root tablet, manager locks, server locks,
+// table config).
+func InstanceRoot(instanceID string) string {
+	return path.Join(zRoot, instanceID)
+}
+
 // InstancePath returns the absolute ZK path for the bound instance,
 // i.e. "/accumulo/<instance-id>". Useful for callers that need to walk
 // instance-scoped subtrees (table config, etc.).

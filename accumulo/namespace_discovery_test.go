@@ -47,6 +47,7 @@ func (l *namespaceDiscoveryLocator) Children(context.Context, string) ([]string,
 }
 
 type autoDiscoveryInstance struct {
+	NoTopology
 	locator *namespaceDiscoveryLocator
 }
 

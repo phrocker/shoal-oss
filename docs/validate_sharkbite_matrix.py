@@ -11,7 +11,7 @@ import sys
 DOC_PATH = Path(__file__).with_name("sharkbite-compatibility.md")
 # Update this manifest only when the independently audited revision-16 inventory
 # itself changes; review every added/removed ID in code review.
-REVISION16_ROW_MANIFEST = DOC_PATH.with_name("sharkbite-compatibility-revision16-rows.txt")
+ROW_MANIFEST = DOC_PATH.with_name("sharkbite-compatibility-rows.txt")
 
 STATUSES = {
     "Covered",
@@ -28,7 +28,7 @@ INTENTIONAL_DIVERGENCE_STATUS = "Intentional divergence (approval required)"
 # revision bump cannot land without updating this constant, because the
 # expected document-status snippet and the narrative phrasing are derived from
 # it.
-EXPECTED_REVISION = 16
+EXPECTED_REVISION = 17
 EXPECTED_TOTAL_ROWS = 3203
 EXPECTED_REQUIRED_ROWS = 2811
 
@@ -54,8 +54,8 @@ def status_count_map(
 
 EXPECTED_STATUS_COUNTS = {
     "Covered": 0,
-    "Missing Go": 2447,
-    "Missing C ABI": 116,
+    "Missing Go": 2436,
+    "Missing C ABI": 127,
     "Behavior mismatch": 161,
     "Intentional divergence (approval required)": 87,
     "Not required (rationale required)": 392,
@@ -64,8 +64,7 @@ EXPECTED_STATUS_COUNTS = {
 EXPECTED_PREFIX_COUNTS = {
     "SB-BASE": status_count_map(missing_c_abi=18, not_required=2),
     "SB-CFG": status_count_map(
-        missing_go=11,
-        missing_c_abi=8,
+        missing_c_abi=19,
         behavior_mismatch=9,
         intentional_divergence=2,
         not_required=6,
@@ -185,16 +184,19 @@ EXPECTED_METADATA_FIELDS = {
     ),
     "Sharkbite release line": "`sharkbite` 1.2.0.3 on PyPI (`setup.py:34-35`)",
     "Shoal reference": (
-        "`phrocker/shoal-oss` exact audited baseline for revision 16 "
-        "`1c2944798faf5a5deb659065dfea0bee23593df0` "
-        "(\"platform: make shoal-embed serve reachable, observable, and safely drainable (#79)\")"
+        "`phrocker/shoal-oss` exact audited baseline for revision 17 "
+        "`298a036d32247a85941724798c85033cb939cde7` "
+        "(\"Merge pull request #101 from phrocker/rewrite/108-compatibility-matrix-followup\"), "
+        "plus the `accumulo` client-configuration and instance-topology additions "
+        "introduced in the same change as this revision"
     ),
     "Shoal C ABI version": "`SHOAL_ABI_VERSION 1u` (`capi/include/shoal_types.h`)",
 }
 
 EXPECTED_DOCUMENT_STATUS_SNIPPETS = (
     "Normative gate. Binding on all Sharkbite-compatibility work.",
-    f"Revision {EXPECTED_REVISION} — applies the fifteenth independent audit",
+    f"Revision {EXPECTED_REVISION} — the first implementation-driven revision",
+    "Revision 16 applied the fifteenth independent audit",
     "Revision 15 applied the fourteenth audit",
     "Revision 9 applied the eighth audit",
 )
@@ -208,7 +210,7 @@ INVENTORY_CHANGE_HINT = (
     "inventory revision must update EXPECTED_REVISION, EXPECTED_TOTAL_ROWS, "
     "EXPECTED_REQUIRED_ROWS, EXPECTED_STATUS_COUNTS, EXPECTED_PREFIX_TOTALS, "
     "EXPECTED_PREFIX_COUNTS and the row manifest "
-    "docs/sharkbite-compatibility-revision16-rows.txt (row ids, order and pinned statuses) "
+    "docs/sharkbite-compatibility-rows.txt (row ids, order and pinned statuses) "
     "in the same commit, together with the "
     "audit evidence that justifies the new inventory"
 )
@@ -669,10 +671,10 @@ def parse_row_manifest_lines(
 
 
 @lru_cache(maxsize=1)
-def load_expected_revision_16_rows() -> tuple[tuple[str, str], ...]:
+def load_expected_rows() -> tuple[tuple[str, str], ...]:
     rows = parse_row_manifest_lines(
-        REVISION16_ROW_MANIFEST.read_text(encoding="utf-8").splitlines(),
-        source=str(REVISION16_ROW_MANIFEST.name),
+        ROW_MANIFEST.read_text(encoding="utf-8").splitlines(),
+        source=str(ROW_MANIFEST.name),
     )
     require(
         len(rows) == EXPECTED_TOTAL_ROWS,
@@ -823,13 +825,13 @@ def validate_expected_row_sequence(
     )
 
 
-def validate_revision_16_inventory(
+def validate_pinned_inventory(
     rows: Sequence[tuple[str, str]],
     status_counts: Counter[str],
     prefix_counts: dict[str, Counter[str]],
 ) -> None:
     validate_pinned_inventory_constants()
-    expected_rows = load_expected_revision_16_rows()
+    expected_rows = load_expected_rows()
     validate_expected_row_sequence(rows, expected_rows)
 
     total_rows = sum(status_counts.values())
@@ -902,7 +904,7 @@ def validate_counts(lines: list[str], full_text: str) -> None:
     status_counts, prefix_counts, rows = parse_rows(lines)
     total_rows = len(rows)
     require(sum(status_counts.values()) == total_rows, f"expected {total_rows} rows, found {sum(status_counts.values())}")
-    validate_revision_16_inventory(rows, status_counts, prefix_counts)
+    validate_pinned_inventory(rows, status_counts, prefix_counts)
 
     metadata_total_rows, metadata_required_rows = parse_rows_metadata(metadata.get("Rows", ""))
     require(

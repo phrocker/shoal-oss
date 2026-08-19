@@ -267,7 +267,7 @@ func cloneProperties(source map[string]string) map[string]string {
 	return result
 }
 
-type testAdminInstance struct{}
+type testAdminInstance struct{ accumulo.NoTopology }
 
 func (testAdminInstance) Info() accumulo.InstanceInfo {
 	return accumulo.InstanceInfo{Name: "test", ID: "test-id"}

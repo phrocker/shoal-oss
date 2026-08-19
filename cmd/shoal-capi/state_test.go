@@ -117,6 +117,7 @@ func (c *fakeConnectorAPI) EffectiveTableProperties(
 }
 
 type fakeConnectorInstance struct {
+	accumulo.NoTopology
 	close func() error
 }
 

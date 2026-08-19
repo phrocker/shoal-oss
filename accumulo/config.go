@@ -24,6 +24,13 @@ type ZooKeeperConfig struct {
 	InstanceName   string
 	SessionTimeout time.Duration
 	InstanceSecret string
+
+	// Configuration is optional client configuration carried by the
+	// resulting Instance and read back through Instance.Configuration. The
+	// instance stores a copy, so later mutations of the caller's
+	// Configuration do not change what the instance reports. A nil
+	// Configuration yields an empty one.
+	Configuration *Configuration
 }
 
 // ConnectorOptions controls transport behavior for a Connector.

@@ -1,0 +1,311 @@
+package zk
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"path"
+	"strings"
+	"testing"
+
+	gozk "github.com/go-zookeeper/zk"
+)
+
+// topologyLocator serves a fixed ZooKeeper tree: children by path and raw
+// data by path. Missing paths behave like ZooKeeper's ErrNoNode.
+type topologyLocator struct {
+	children map[string][]string
+	data     map[string][]byte
+	failOn   string
+	reads    []string
+}
+
+func (l *topologyLocator) InstancePath() string { return "/accumulo/uuid-1" }
+
+func (l *topologyLocator) GetRaw(_ context.Context, p string) ([]byte, error) {
+	l.reads = append(l.reads, p)
+	if l.failOn == p {
+		return nil, errors.New("transport failure")
+	}
+	data, ok := l.data[p]
+	if !ok {
+		return nil, fmt.Errorf("get %s: %w", p, gozk.ErrNoNode)
+	}
+	return data, nil
+}
+
+func (l *topologyLocator) Children(_ context.Context, p string) ([]string, error) {
+	if l.failOn == p {
+		return nil, errors.New("transport failure")
+	}
+	children, ok := l.children[p]
+	if !ok {
+		return nil, fmt.Errorf("children %s: %w", p, gozk.ErrNoNode)
+	}
+	return children, nil
+}
+
+func lockNode(sequence string) string {
+	return "zlock#f50c7911-a203-4e3d-b006-bdb30848f5bd#" + sequence
+}
+
+func managerLockData(addresses ...string) []byte {
+	descriptors := make([]string, 0, len(addresses)+1)
+	descriptors = append(descriptors, `{"uuid":"1","service":"FATE_CLIENT","address":"manager:9999"}`)
+	for _, address := range addresses {
+		descriptors = append(descriptors,
+			fmt.Sprintf(`{"uuid":"1","service":"MANAGER","address":%q}`, address))
+	}
+	return []byte(`{"descriptors":[` + strings.Join(descriptors, ",") + `]}`)
+}
+
+func clientLockData(address string) []byte {
+	return []byte(fmt.Sprintf(
+		`{"descriptors":[{"uuid":"1","service":"TABLET_SCAN","address":"ignored:1"},`+
+			`{"uuid":"1","service":"CLIENT","address":%q}]}`, address))
+}
+
+func TestManagerAddressesOrdersByLockSequenceAndDeduplicates(t *testing.T) {
+	lockPath := "/accumulo/uuid-1/managers/lock"
+	locator := &topologyLocator{
+		children: map[string][]string{
+			lockPath: {
+				"not-a-lock",
+				lockNode("0000000003"),
+				lockNode("0000000001"),
+				lockNode("0000000002"),
+			},
+		},
+		data: map[string][]byte{
+			path.Join(lockPath, lockNode("0000000001")): managerLockData("manager-a:9997", "manager-a:9997"),
+			path.Join(lockPath, lockNode("0000000002")): managerLockData("manager-b:9997"),
+			// 0000000003 is missing: a candidate that dropped its lock.
+		},
+	}
+
+	got, err := ManagerAddresses(context.Background(), locator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"manager-a:9997", "manager-b:9997"}
+	if len(got) != len(want) {
+		t.Fatalf("addresses = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("addresses = %v, want %v", got, want)
+		}
+	}
+	if first, err := ManagerAddress(context.Background(), locator); err != nil || first != want[0] {
+		t.Fatalf("ManagerAddress = %q, %v; want %q", first, err, want[0])
+	}
+}
+
+func TestManagerAddressesSkipsBootstrapDescriptors(t *testing.T) {
+	lockPath := "/accumulo/uuid-1/managers/lock"
+	locator := &topologyLocator{
+		children: map[string][]string{lockPath: {lockNode("0000000001"), lockNode("0000000002")}},
+		data: map[string][]byte{
+			path.Join(lockPath, lockNode("0000000001")): managerLockData("0.0.0.0:0", ""),
+			path.Join(lockPath, lockNode("0000000002")): managerLockData("manager-b:9997"),
+		},
+	}
+	got, err := ManagerAddresses(context.Background(), locator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0] != "manager-b:9997" {
+		t.Fatalf("addresses = %v, want [manager-b:9997]", got)
+	}
+}
+
+func TestManagerAddressesUnavailable(t *testing.T) {
+	lockPath := "/accumulo/uuid-1/managers/lock"
+	for name, locator := range map[string]*topologyLocator{
+		"no lock path": {children: map[string][]string{}},
+		"no valid lock nodes": {
+			children: map[string][]string{lockPath: {"not-a-lock"}},
+		},
+		"lock without manager descriptor": {
+			children: map[string][]string{lockPath: {lockNode("0000000001")}},
+			data: map[string][]byte{
+				path.Join(lockPath, lockNode("0000000001")): []byte(`{"descriptors":[]}`),
+			},
+		},
+		"every lock node vanished": {
+			children: map[string][]string{lockPath: {lockNode("0000000001")}},
+			data:     map[string][]byte{},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := ManagerAddresses(context.Background(), locator); !errors.Is(err, ErrManagerUnavailable) {
+				t.Fatalf("error = %v, want ErrManagerUnavailable", err)
+			}
+		})
+	}
+}
+
+func TestManagerAddressesPropagatesFailuresAndCancellation(t *testing.T) {
+	lockPath := "/accumulo/uuid-1/managers/lock"
+
+	listFailure := &topologyLocator{failOn: lockPath}
+	if _, err := ManagerAddresses(context.Background(), listFailure); err == nil ||
+		errors.Is(err, ErrManagerUnavailable) {
+		t.Fatalf("error = %v, want a transport failure", err)
+	}
+
+	nodePath := path.Join(lockPath, lockNode("0000000001"))
+	readFailure := &topologyLocator{
+		children: map[string][]string{lockPath: {lockNode("0000000001")}},
+		data:     map[string][]byte{nodePath: managerLockData("manager:9997")},
+		failOn:   nodePath,
+	}
+	if _, err := ManagerAddresses(context.Background(), readFailure); err == nil ||
+		errors.Is(err, ErrManagerUnavailable) {
+		t.Fatalf("error = %v, want a transport failure", err)
+	}
+
+	decodeFailure := &topologyLocator{
+		children: map[string][]string{lockPath: {lockNode("0000000001")}},
+		data:     map[string][]byte{nodePath: []byte("not json")},
+	}
+	if _, err := ManagerAddresses(context.Background(), decodeFailure); err == nil ||
+		errors.Is(err, ErrManagerUnavailable) {
+		t.Fatalf("error = %v, want a decode failure", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := ManagerAddresses(ctx, &topologyLocator{}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want context.Canceled", err)
+	}
+	if _, err := ManagerAddresses(context.Background(), nil); err == nil {
+		t.Fatal("nil locator accepted")
+	}
+}
+
+func clientServiceTree() *topologyLocator {
+	root := "/accumulo/uuid-1"
+	return &topologyLocator{
+		children: map[string][]string{
+			path.Join(root, "tservers"):                                  {"default", "ingest"},
+			path.Join(root, "tservers", "default"):                       {"tserver-a:9997", "tserver-b:9997"},
+			path.Join(root, "tservers", "default", "tserver-a:9997"):     {lockNode("0000000001")},
+			path.Join(root, "tservers", "default", "tserver-b:9997"):     {"not-a-lock"},
+			path.Join(root, "tservers", "ingest"):                        {"tserver-c:9997"},
+			path.Join(root, "tservers", "ingest", "tserver-c:9997"):      {lockNode("0000000002")},
+			path.Join(root, "sservers"):                                  {"query"},
+			path.Join(root, "sservers", "query"):                         {"sserver-a:9996"},
+			path.Join(root, "sservers", "query", "sserver-a:9996"):       {lockNode("0000000001")},
+			path.Join(root, "compactors"):                                {"default"},
+			path.Join(root, "compactors", "default"):                     {"compactor-a:9995"},
+			path.Join(root, "compactors", "default", "compactor-a:9995"): {lockNode("0000000001")},
+		},
+		data: map[string][]byte{
+			path.Join(root, "tservers", "default", "tserver-a:9997", lockNode("0000000001")):     clientLockData("tserver-a:9997"),
+			path.Join(root, "tservers", "ingest", "tserver-c:9997", lockNode("0000000002")):      clientLockData("tserver-c:9997"),
+			path.Join(root, "sservers", "query", "sserver-a:9996", lockNode("0000000001")):       clientLockData("sserver-a:9996"),
+			path.Join(root, "compactors", "default", "compactor-a:9995", lockNode("0000000001")): clientLockData("compactor-a:9995"),
+		},
+	}
+}
+
+func TestClientServicesReportsKindGroupAndOrder(t *testing.T) {
+	got, err := ClientServices(context.Background(), clientServiceTree())
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []ClientService{
+		{Kind: TabletServerKind, Group: "default", Address: "tserver-a:9997"},
+		{Kind: TabletServerKind, Group: "ingest", Address: "tserver-c:9997"},
+		{Kind: ScanServerKind, Group: "query", Address: "sserver-a:9996"},
+		{Kind: CompactorKind, Group: "default", Address: "compactor-a:9995"},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("services = %+v, want %+v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("services[%d] = %+v, want %+v", i, got[i], want[i])
+		}
+	}
+}
+
+func TestClientServiceAddressesMatchesClientServices(t *testing.T) {
+	locator := clientServiceTree()
+	addresses, err := ClientServiceAddresses(context.Background(), locator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"compactor-a:9995", "sserver-a:9996", "tserver-a:9997", "tserver-c:9997"}
+	if len(addresses) != len(want) {
+		t.Fatalf("addresses = %v, want %v", addresses, want)
+	}
+	for i := range want {
+		if addresses[i] != want[i] {
+			t.Fatalf("addresses = %v, want %v", addresses, want)
+		}
+	}
+}
+
+func TestClientServicesDeduplicatesWithinAGroup(t *testing.T) {
+	root := "/accumulo/uuid-1"
+	locator := &topologyLocator{
+		children: map[string][]string{
+			path.Join(root, "tservers"):                              {"default"},
+			path.Join(root, "tservers", "default"):                   {"tserver-a:9997", "tserver-b:9997"},
+			path.Join(root, "tservers", "default", "tserver-a:9997"): {lockNode("0000000001")},
+			path.Join(root, "tservers", "default", "tserver-b:9997"): {lockNode("0000000002")},
+		},
+		data: map[string][]byte{
+			path.Join(root, "tservers", "default", "tserver-a:9997", lockNode("0000000001")): clientLockData("shared:9997"),
+			path.Join(root, "tservers", "default", "tserver-b:9997", lockNode("0000000002")): clientLockData("shared:9997"),
+		},
+	}
+	got, err := ClientServices(context.Background(), locator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Address != "shared:9997" {
+		t.Fatalf("services = %+v, want one shared:9997 entry", got)
+	}
+}
+
+func TestClientServicesUnavailableAndFailures(t *testing.T) {
+	if _, err := ClientServices(context.Background(), &topologyLocator{}); !errors.Is(err, ErrClientServiceUnavailable) {
+		t.Fatalf("error = %v, want ErrClientServiceUnavailable", err)
+	}
+
+	root := "/accumulo/uuid-1"
+	failing := clientServiceTree()
+	failing.failOn = path.Join(root, "tservers", "default")
+	if _, err := ClientServices(context.Background(), failing); err == nil ||
+		errors.Is(err, ErrClientServiceUnavailable) {
+		t.Fatalf("error = %v, want a transport failure", err)
+	}
+
+	decodeFailure := clientServiceTree()
+	decodeFailure.data[path.Join(root, "tservers", "default", "tserver-a:9997", lockNode("0000000001"))] = []byte("not json")
+	if _, err := ClientServices(context.Background(), decodeFailure); err == nil ||
+		errors.Is(err, ErrClientServiceUnavailable) {
+		t.Fatalf("error = %v, want a decode failure", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := ClientServices(ctx, clientServiceTree()); !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want context.Canceled", err)
+	}
+	if _, err := ClientServices(context.Background(), nil); err == nil {
+		t.Fatal("nil locator accepted")
+	}
+}
+
+func TestInstanceRoot(t *testing.T) {
+	if got := InstanceRoot("uuid-1"); got != "/accumulo/uuid-1" {
+		t.Fatalf("InstanceRoot = %q", got)
+	}
+	if got := InstanceRoot(""); got != "/accumulo" {
+		t.Fatalf("InstanceRoot(\"\") = %q", got)
+	}
+}

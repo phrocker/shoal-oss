@@ -479,6 +479,7 @@ func (l *lifecycleLocator) GetRaw(context.Context, string) ([]byte, error) {
 func (l *lifecycleLocator) Children(context.Context, string) ([]string, error) { return nil, nil }
 
 type lifecycleInstance struct {
+	NoTopology
 	locator *lifecycleLocator
 	closes  int
 }

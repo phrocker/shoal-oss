@@ -139,6 +139,186 @@ func managerLockAddress(ctx context.Context, locator LockReader, service string)
 	return "", errServiceNotAdvertised
 }
 
+// ManagerAddresses returns every manager address advertised under the
+// instance's manager lock path, ordered by lock sequence: the first element
+// is the manager that currently holds the lock, and any later elements are
+// queued candidates that would take over on failover. Returns
+// ErrManagerUnavailable when no lock node advertises a usable MANAGER
+// endpoint.
+func ManagerAddresses(ctx context.Context, locator LockReader) ([]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if locator == nil {
+		return nil, errors.New("zk: nil locator")
+	}
+	lockPath := path.Join(locator.InstancePath(), zManagerLock)
+	children, err := locator.Children(ctx, lockPath)
+	if err != nil {
+		if errors.Is(err, gozk.ErrNoNode) {
+			return nil, ErrManagerUnavailable
+		}
+		return nil, fmt.Errorf("list manager locks %s: %w", lockPath, err)
+	}
+	lockNodes := sortedLockNodes(children)
+	addresses := make([]string, 0, len(lockNodes))
+	seen := make(map[string]struct{}, len(lockNodes))
+	for _, lockNode := range lockNodes {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		lockNodePath := path.Join(lockPath, lockNode)
+		data, err := locator.GetRaw(ctx, lockNodePath)
+		if errors.Is(err, gozk.ErrNoNode) {
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("get manager lock %s: %w", lockNodePath, err)
+		}
+		var lock serviceLockData
+		if err := json.Unmarshal(data, &lock); err != nil {
+			return nil, fmt.Errorf("decode manager lock %s: %w", lockNodePath, err)
+		}
+		for _, descriptor := range lock.Descriptors {
+			if descriptor.Service != svcManager ||
+				descriptor.Address == "" ||
+				descriptor.Address == "0.0.0.0:0" {
+				continue
+			}
+			if _, duplicate := seen[descriptor.Address]; duplicate {
+				continue
+			}
+			seen[descriptor.Address] = struct{}{}
+			addresses = append(addresses, descriptor.Address)
+		}
+	}
+	if len(addresses) == 0 {
+		return nil, ErrManagerUnavailable
+	}
+	return addresses, nil
+}
+
+// ServerKind names the Accumulo 4 server role that published a
+// ClientService endpoint.
+type ServerKind string
+
+const (
+	// TabletServerKind is a tablet server (znode root "tservers").
+	TabletServerKind ServerKind = "tserver"
+	// ScanServerKind is a scan server (znode root "sservers").
+	ScanServerKind ServerKind = "sserver"
+	// CompactorKind is a compactor (znode root "compactors").
+	CompactorKind ServerKind = "compactor"
+)
+
+// ClientService is one live ClientService endpoint together with the server
+// role and resource group that published it.
+type ClientService struct {
+	Kind    ServerKind
+	Group   string
+	Address string
+}
+
+var clientServiceRoots = []struct {
+	root string
+	kind ServerKind
+}{
+	{root: "tservers", kind: TabletServerKind},
+	{root: "sservers", kind: ScanServerKind},
+	{root: "compactors", kind: CompactorKind},
+}
+
+// ClientServices returns the live Accumulo 4 ClientService endpoints
+// advertised by tablet servers, scan servers, and compactors, each tagged
+// with the publishing server role and resource group. Results are ordered by
+// role (tserver, sserver, compactor), then group, then address. An address
+// published by several roles or groups is reported once per (role, group).
+// Returns ErrClientServiceUnavailable when nothing is advertised.
+func ClientServices(ctx context.Context, locator LockReader) ([]ClientService, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if locator == nil {
+		return nil, errors.New("zk: nil locator")
+	}
+	services := make([]ClientService, 0, 8)
+	for _, serverRoot := range clientServiceRoots {
+		root := path.Join(locator.InstancePath(), serverRoot.root)
+		groups, err := locator.Children(ctx, root)
+		if errors.Is(err, gozk.ErrNoNode) {
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("list client service resource groups %s: %w", root, err)
+		}
+		sort.Strings(groups)
+		for _, group := range groups {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			groupPath := path.Join(root, group)
+			servers, err := locator.Children(ctx, groupPath)
+			if errors.Is(err, gozk.ErrNoNode) {
+				continue
+			}
+			if err != nil {
+				return nil, fmt.Errorf("list client service servers %s: %w", groupPath, err)
+			}
+			sort.Strings(servers)
+			groupAddresses := make(map[string]struct{}, len(servers))
+			for _, server := range servers {
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
+				serverPath := path.Join(groupPath, server)
+				children, err := locator.Children(ctx, serverPath)
+				if errors.Is(err, gozk.ErrNoNode) {
+					continue
+				}
+				if err != nil {
+					return nil, fmt.Errorf("list client service locks %s: %w", serverPath, err)
+				}
+				lockNode := firstLockNode(children)
+				if lockNode == "" {
+					continue
+				}
+				lockNodePath := path.Join(serverPath, lockNode)
+				data, err := locator.GetRaw(ctx, lockNodePath)
+				if errors.Is(err, gozk.ErrNoNode) {
+					continue
+				}
+				if err != nil {
+					return nil, fmt.Errorf("get client service lock %s: %w", lockNodePath, err)
+				}
+				var lock serviceLockData
+				if err := json.Unmarshal(data, &lock); err != nil {
+					return nil, fmt.Errorf("decode client service lock %s: %w", lockNodePath, err)
+				}
+				for _, descriptor := range lock.Descriptors {
+					if descriptor.Service != "CLIENT" ||
+						descriptor.Address == "" ||
+						descriptor.Address == "0.0.0.0:0" {
+						continue
+					}
+					if _, duplicate := groupAddresses[descriptor.Address]; duplicate {
+						continue
+					}
+					groupAddresses[descriptor.Address] = struct{}{}
+					services = append(services, ClientService{
+						Kind:    serverRoot.kind,
+						Group:   group,
+						Address: descriptor.Address,
+					})
+				}
+			}
+		}
+	}
+	if len(services) == 0 {
+		return nil, ErrClientServiceUnavailable
+	}
+	return services, nil
+}
+
 // ClientServiceAddresses returns the live Accumulo 4 ClientService endpoints
 // advertised by tablet servers, scan servers, and compactors.
 func ClientServiceAddresses(ctx context.Context, locator LockReader) ([]string, error) {
@@ -223,6 +403,19 @@ func ClientServiceAddresses(ctx context.Context, locator LockReader) ([]string, 
 }
 
 func firstLockNode(children []string) string {
+	sorted := sortedLockNodes(children)
+	if len(sorted) == 0 {
+		return ""
+	}
+	return sorted[0]
+}
+
+// sortedLockNodes returns the valid ServiceLock child names ordered by lock
+// sequence, lowest first. The lowest sequence holds the lock; the rest are
+// queued candidates. Names that do not match Accumulo's
+// "zlock#<uuid>#<10-digit sequence>" form are ignored, mirroring
+// ServiceLock.validateAndSort.
+func sortedLockNodes(children []string) []string {
 	type candidate struct {
 		name     string
 		sequence int64
@@ -249,8 +442,9 @@ func firstLockNode(children []string) string {
 	sort.Slice(valid, func(i, j int) bool {
 		return valid[i].sequence < valid[j].sequence
 	})
-	if len(valid) == 0 {
-		return ""
+	names := make([]string, 0, len(valid))
+	for _, entry := range valid {
+		names = append(names, entry.name)
 	}
-	return valid[0].name
+	return names
 }
