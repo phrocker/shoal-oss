@@ -74,6 +74,9 @@ func testRawBackend(t *testing.T, backend liveBackend, filePath string) {
 	if err := reader.Close(); err != nil {
 		t.Fatalf("Close raw reader: %v", err)
 	}
+	if err := reader.Close(); err != nil {
+		t.Fatalf("Close raw reader again: %v", err)
+	}
 	if !bytes.Equal(got, want) {
 		t.Fatalf("raw file = %q, want %q", got, want)
 	}

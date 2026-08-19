@@ -286,7 +286,7 @@ func (b *Backend) Open(ctx context.Context, objectPath string) (storage.File, er
 		size:    reader.Stat().Size(),
 		release: lease.release,
 	}
-	if err := b.registerHandle(f.Close, func(done func()) { f.complete = done }); err != nil {
+	if err := b.registerHandle(f.shutdown, func(done func()) { f.complete = done }); err != nil {
 		_ = reader.Close()
 		_ = lease.release()
 		return nil, err
@@ -1015,15 +1015,28 @@ func (f *file) ReadAt(p []byte, off int64) (int, error) {
 }
 
 func (f *file) Close() error {
+	return f.close()
+}
+
+func (f *file) shutdown() error {
+	return f.close()
+}
+
+func (f *file) close() error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	var err error
 	if !f.closed {
 		err = f.reader.Close()
+		if isExpectedOperationCloseError(err) {
+			err = nil
+		}
 		f.closed = true
 	}
 	if f.release != nil {
-		err = errors.Join(err, f.release())
+		release := f.release
+		f.release = nil
+		err = errors.Join(err, release())
 	}
 	if f.complete != nil {
 		f.complete()

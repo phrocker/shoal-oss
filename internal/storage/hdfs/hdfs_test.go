@@ -1982,6 +1982,82 @@ func TestBackendReaderCloseIgnoresExpectedOperationClientCloseAfterCancellation(
 	})
 }
 
+func TestReaderCloseRacingBackendCloseSuppressesForcedTransportError(t *testing.T) {
+	for _, backendFirst := range []bool{false, true} {
+		t.Run(fmt.Sprintf("backend-first=%t", backendFirst), func(t *testing.T) {
+			reader := &controlledCloseReader{
+				Reader:       bytes.NewReader([]byte("data")),
+				info:         fakeInfo{name: "1.rf", size: 4},
+				closeStarted: make(chan struct{}),
+				allowClose:   make(chan struct{}),
+				closeErr:     errors.New("close tcp 127.0.0.1:1234->127.0.0.1:8020: use of closed network connection"),
+			}
+			client := &controlledCloseClient{fakeClient: newFakeClient(), reader: reader}
+			client.files["/tables/1.rf"] = []byte("data")
+			backend, err := New("nn:8020", WithClient(client))
+			if err != nil {
+				t.Fatal(err)
+			}
+			f, err := backend.Open(context.Background(), "/tables/1.rf")
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			readerDone := make(chan error, 1)
+			backendDone := make(chan error, 1)
+			if backendFirst {
+				go func() { backendDone <- backend.Close() }()
+			} else {
+				go func() { readerDone <- f.Close() }()
+			}
+			<-reader.closeStarted
+			if backendFirst {
+				go func() { readerDone <- f.Close() }()
+			} else {
+				go func() { backendDone <- backend.Close() }()
+			}
+			close(reader.allowClose)
+
+			if err := <-readerDone; err != nil {
+				t.Fatalf("reader Close error = %v, want nil", err)
+			}
+			if err := <-backendDone; err != nil {
+				t.Fatalf("Backend.Close error = %v, want nil", err)
+			}
+			if err := f.Close(); err != nil {
+				t.Fatalf("second reader Close error = %v, want nil", err)
+			}
+		})
+	}
+}
+
+func TestReaderClosePreservesGenuineErrorAndIsIdempotent(t *testing.T) {
+	closeErr := errors.New("reader checksum finalization failed")
+	reader := &controlledCloseReader{
+		Reader:   bytes.NewReader([]byte("data")),
+		info:     fakeInfo{name: "1.rf", size: 4},
+		closeErr: closeErr,
+	}
+	client := &controlledCloseClient{fakeClient: newFakeClient(), reader: reader}
+	client.files["/tables/1.rf"] = []byte("data")
+	backend, err := New("nn:8020", WithClient(client))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer backend.Close()
+	f, err := backend.Open(context.Background(), "/tables/1.rf")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := f.Close(); !errors.Is(err, closeErr) {
+		t.Fatalf("reader Close error = %v, want %v", err, closeErr)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("second reader Close error = %v, want nil", err)
+	}
+}
+
 func TestBackendCloseAbortsActiveWriterWithoutLeakingTemp(t *testing.T) {
 	client := newFakeClient()
 	backend, err := New("nn:8020", WithClient(client))
@@ -2697,6 +2773,36 @@ type fakeReader struct {
 	info     os.FileInfo
 	deadline time.Time
 }
+
+type controlledCloseClient struct {
+	*fakeClient
+	reader Reader
+}
+
+func (c *controlledCloseClient) Open(string) (Reader, error) {
+	return c.reader, nil
+}
+
+type controlledCloseReader struct {
+	*bytes.Reader
+	info         os.FileInfo
+	closeStarted chan struct{}
+	allowClose   chan struct{}
+	closeErr     error
+	startOnce    sync.Once
+}
+
+func (r *controlledCloseReader) Close() error {
+	if r.closeStarted != nil {
+		r.startOnce.Do(func() { close(r.closeStarted) })
+	}
+	if r.allowClose != nil {
+		<-r.allowClose
+	}
+	return r.closeErr
+}
+
+func (r *controlledCloseReader) Stat() os.FileInfo { return r.info }
 
 func (r *fakeReader) Close() error      { return nil }
 func (r *fakeReader) Stat() os.FileInfo { return r.info }
