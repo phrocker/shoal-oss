@@ -29,7 +29,19 @@ func platformAtomicReplace(temp, target, backup string, hadOld bool) error {
 }
 
 func platformAtomicRestore(target, backup string) error {
-	return callReplaceFile(target, backup, "")
+	err := callReplaceFile(target, backup, "")
+	if err != windows.ERROR_FILE_NOT_FOUND {
+		return err
+	}
+	backupPtr, ptrErr := windows.UTF16PtrFromString(backup)
+	if ptrErr != nil {
+		return ptrErr
+	}
+	targetPtr, ptrErr := windows.UTF16PtrFromString(target)
+	if ptrErr != nil {
+		return ptrErr
+	}
+	return windows.MoveFileEx(backupPtr, targetPtr, windows.MOVEFILE_WRITE_THROUGH)
 }
 
 func callReplaceFile(target, replacement, backup string) error {
