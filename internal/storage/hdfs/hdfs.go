@@ -71,7 +71,12 @@ type Backend struct {
 	newOperation func(context.Context) (*leasedClient, error)
 	authority    string
 	closeClient  func() error
+	operations   *operationRegistry
+	closeOnce    sync.Once
+	closeErr     error
 }
+
+var errBackendClosed = errors.New("hdfs: backend closed")
 
 // New constructs a Backend for a namenode address such as "namenode:8020" or
 // "hdfs://namenode:8020". The colinmarc/hdfs default configuration and
@@ -108,12 +113,13 @@ func NewContext(ctx context.Context, address string, opts ...Option) (*Backend, 
 			return nil, leaseErr
 		}
 		closeFn := lease.release
-		return &Backend{
-			client:       lease.client,
-			newOperation: bindOperationLeaseFactory(opFactoryCtx, cfg.clientLeaseFactory),
-			authority:    authority,
-			closeClient:  newBackendCloser(stopCleanupClient, closeFn),
-		}, nil
+		return newManagedBackend(
+			lease.client,
+			cfg.clientLeaseFactory,
+			opFactoryCtx,
+			authority,
+			newBackendCloser(stopCleanupClient, closeFn),
+		), nil
 	}
 	if cfg.client != nil {
 		stopCleanupClient()
@@ -123,12 +129,13 @@ func NewContext(ctx context.Context, address string, opts ...Option) (*Backend, 
 				return newSharedLease(cfg.client), nil
 			}
 		}
-		return &Backend{
-			client:       cfg.client,
-			newOperation: bindOperationLeaseFactory(opFactoryCtx, opFactory),
-			authority:    authority,
-			closeClient:  onceCloser(cfg.client.Close),
-		}, nil
+		return newManagedBackend(
+			cfg.client,
+			opFactory,
+			opFactoryCtx,
+			authority,
+			onceCloser(cfg.client.Close),
+		), nil
 	}
 
 	options, err := loadClientOptions(clientAddress, cfg)
@@ -143,22 +150,37 @@ func NewContext(ctx context.Context, address string, opts ...Option) (*Backend, 
 		return nil, err
 	}
 	dialSource.Store(cleanupClientCtx)
-	return &Backend{
-		client: baseClient.client,
-		newOperation: bindOperationLeaseFactory(opFactoryCtx, func(opCtx context.Context) (*leasedClient, error) {
+	return newManagedBackend(
+		baseClient.client,
+		func(opCtx context.Context) (*leasedClient, error) {
 			return newHDFSClient(opCtx, clientAddress, options)
-		}),
-		authority:   authority,
-		closeClient: newBackendCloser(stopCleanupClient, baseClient.release),
-	}, nil
+		},
+		opFactoryCtx,
+		authority,
+		newBackendCloser(stopCleanupClient, baseClient.release),
+	), nil
 }
 
 // Close releases the underlying HDFS client and its open leases.
 func (b *Backend) Close() error {
-	if err := b.closeClient(); err != nil {
-		return fmt.Errorf("hdfs: close client: %w", err)
-	}
-	return nil
+	b.closeOnce.Do(func() {
+		var operationErr error
+		if b.operations != nil {
+			operationErr = b.operations.Close()
+		}
+		var clientErr error
+		if b.closeClient != nil {
+			clientErr = b.closeClient()
+		}
+		if operationErr != nil {
+			operationErr = fmt.Errorf("hdfs: close operation clients: %w", operationErr)
+		}
+		if clientErr != nil {
+			clientErr = fmt.Errorf("hdfs: close client: %w", clientErr)
+		}
+		b.closeErr = errors.Join(operationErr, clientErr)
+	})
+	return b.closeErr
 }
 
 // Open opens path read-only.
@@ -525,6 +547,112 @@ func newBackendCloser(cancel context.CancelFunc, closeFn func() error) func() er
 		}
 		return closeFn()
 	})
+}
+
+func newManagedBackend(
+	client Client,
+	factory func(context.Context) (*leasedClient, error),
+	factoryCtx context.Context,
+	authority string,
+	closeClient func() error,
+) *Backend {
+	operationCtx, stopOperations := context.WithCancel(contextOrBackground(factoryCtx))
+	operations := newOperationRegistry(stopOperations)
+	return &Backend{
+		client: client,
+		newOperation: operations.Bind(
+			bindOperationLeaseFactory(operationCtx, factory),
+		),
+		authority:   authority,
+		closeClient: closeClient,
+		operations:  operations,
+	}
+}
+
+type operationRegistry struct {
+	mu       sync.Mutex
+	closed   bool
+	nextID   uint64
+	active   map[uint64]*leasedClient
+	cancel   context.CancelFunc
+	closeErr error
+}
+
+func newOperationRegistry(cancel context.CancelFunc) *operationRegistry {
+	return &operationRegistry{
+		active: make(map[uint64]*leasedClient),
+		cancel: cancel,
+	}
+}
+
+func (r *operationRegistry) Bind(factory func(context.Context) (*leasedClient, error)) func(context.Context) (*leasedClient, error) {
+	return func(ctx context.Context) (*leasedClient, error) {
+		r.mu.Lock()
+		if r.closed {
+			r.mu.Unlock()
+			return nil, errBackendClosed
+		}
+		r.mu.Unlock()
+
+		lease, err := factory(ctx)
+		if err != nil {
+			return nil, err
+		}
+
+		r.mu.Lock()
+		if r.closed {
+			r.mu.Unlock()
+			_ = lease.release()
+			return nil, errBackendClosed
+		}
+		r.nextID++
+		id := r.nextID
+		release := lease.release
+		lease.release = onceCloser(func() error {
+			var releaseErr error
+			if release != nil {
+				releaseErr = release()
+			}
+			r.mu.Lock()
+			delete(r.active, id)
+			r.mu.Unlock()
+			return releaseErr
+		})
+		r.active[id] = lease
+		r.mu.Unlock()
+		return lease, nil
+	}
+}
+
+func (r *operationRegistry) Close() error {
+	r.mu.Lock()
+	if r.closed {
+		err := r.closeErr
+		r.mu.Unlock()
+		return err
+	}
+	r.closed = true
+	if r.cancel != nil {
+		r.cancel()
+		r.cancel = nil
+	}
+	leases := make([]*leasedClient, 0, len(r.active))
+	for _, lease := range r.active {
+		leases = append(leases, lease)
+	}
+	r.mu.Unlock()
+
+	var closeErr error
+	for _, lease := range leases {
+		if lease != nil && lease.release != nil {
+			closeErr = errors.Join(closeErr, lease.release())
+		}
+	}
+
+	r.mu.Lock()
+	r.closeErr = closeErr
+	r.mu.Unlock()
+	return closeErr
 }
 
 func bindOperationLeaseFactory(boundCtx context.Context, factory func(context.Context) (*leasedClient, error)) func(context.Context) (*leasedClient, error) {

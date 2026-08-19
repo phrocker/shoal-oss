@@ -1402,6 +1402,131 @@ func TestBackendCloseUsesOperationContextForBackupRemovalRollback(t *testing.T) 
 	}
 }
 
+func TestBackendCloseReleasesActiveOperationClientsAndRejectsNewOperations(t *testing.T) {
+	baseClient := newFakeClient()
+	var factoryCalls atomic.Int32
+	var releaseCalls atomic.Int32
+	backend, err := New("nn:8020",
+		WithClient(baseClient),
+		func(c *config) {
+			c.clientLeaseFactory = func(context.Context) (*leasedClient, error) {
+				factoryCalls.Add(1)
+				client := newFakeClient()
+				client.files["/tables/1.rf"] = []byte("data")
+				return &leasedClient{
+					client: client,
+					release: func() error {
+						releaseCalls.Add(1)
+						return client.Close()
+					},
+				}, nil
+			}
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	reader, err := backend.Open(context.Background(), "/tables/1.rf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	writer, err := backend.Create(context.Background(), "/tables/2.rf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := factoryCalls.Load(); got != 2 {
+		t.Fatalf("operation factory calls = %d, want 2", got)
+	}
+
+	if err := backend.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if got := releaseCalls.Load(); got != 2 {
+		t.Fatalf("operation release calls after Backend.Close = %d, want 2", got)
+	}
+	if err := backend.Close(); err != nil {
+		t.Fatalf("second Backend.Close: %v", err)
+	}
+
+	if _, err := backend.Open(context.Background(), "/tables/1.rf"); !errors.Is(err, errBackendClosed) {
+		t.Fatalf("Open after Close error = %v, want errBackendClosed", err)
+	}
+	if _, err := backend.Create(context.Background(), "/tables/3.rf"); !errors.Is(err, errBackendClosed) {
+		t.Fatalf("Create after Close error = %v, want errBackendClosed", err)
+	}
+	if _, err := backend.List(context.Background(), "/tables"); !errors.Is(err, errBackendClosed) {
+		t.Fatalf("List after Close error = %v, want errBackendClosed", err)
+	}
+	if err := backend.Remove(context.Background(), "/tables/1.rf"); !errors.Is(err, errBackendClosed) {
+		t.Fatalf("Remove after Close error = %v, want errBackendClosed", err)
+	}
+	if got := factoryCalls.Load(); got != 2 {
+		t.Fatalf("post-Close operations invoked factory; calls = %d, want 2", got)
+	}
+
+	if err := reader.Close(); err != nil {
+		t.Fatalf("reader Close after Backend.Close: %v", err)
+	}
+	if err := writer.(storage.Aborter).Abort(); err != nil {
+		t.Fatalf("writer Abort after Backend.Close: %v", err)
+	}
+	if got := releaseCalls.Load(); got != 2 {
+		t.Fatalf("resources released operation clients again; calls = %d, want 2", got)
+	}
+}
+
+func TestBackendCloseWinsRaceWithOperationClientConstruction(t *testing.T) {
+	baseClient := newFakeClient()
+	factoryEntered := make(chan struct{})
+	allowFactoryReturn := make(chan struct{})
+	var releaseCalls atomic.Int32
+	backend, err := New("nn:8020",
+		WithClient(baseClient),
+		func(c *config) {
+			c.clientLeaseFactory = func(context.Context) (*leasedClient, error) {
+				close(factoryEntered)
+				<-allowFactoryReturn
+				client := newFakeClient()
+				client.files["/tables/1.rf"] = []byte("data")
+				return &leasedClient{
+					client: client,
+					release: func() error {
+						releaseCalls.Add(1)
+						return nil
+					},
+				}, nil
+			}
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	openDone := make(chan error, 1)
+	go func() {
+		_, err := backend.Open(context.Background(), "/tables/1.rf")
+		openDone <- err
+	}()
+	<-factoryEntered
+	if err := backend.Close(); err != nil {
+		t.Fatal(err)
+	}
+	close(allowFactoryReturn)
+
+	select {
+	case err := <-openDone:
+		if !errors.Is(err, errBackendClosed) {
+			t.Fatalf("racing Open error = %v, want errBackendClosed", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("racing Open did not finish after Backend.Close")
+	}
+	if got := releaseCalls.Load(); got != 1 {
+		t.Fatalf("late operation lease release calls = %d, want 1", got)
+	}
+}
+
 type fakeClient struct {
 	files                    map[string][]byte
 	dirs                     map[string]bool
