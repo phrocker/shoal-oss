@@ -29,14 +29,14 @@ Shoal separates **ABI compatibility** from **feature availability**:
   stable allocation-free version tuple that works before connector creation.
   `SHOAL_ABI_VERSION_PACKED` uses
   `SHOAL_ABI_PACK_VERSION(major, minor, patch)` with a hexadecimal
-  `0x00MMmmpp` layout, so ABI `1.0.0` is `0x00010000`.
+  `0x00MMmmpp` layout, so ABI `1.1.0` is `0x00010100`.
 - Capability identifiers are append-only. Existing IDs and bits never change
   meaning. `shoal_abi_capability_word_count()` reports how many 64-bit words
   the current library uses, `shoal_abi_capability_word(i)` returns `0` for
   `i >= word_count`, and `shoal_abi_has_capability(id)` returns `0` for both
   unsupported and unknown IDs.
 
-Current capability assignments (`word 0 == 0x00000000000003ff`):
+Current capability assignments (`word 0 == 0x0000000000001fff`):
 
 | ID | Mask | Surface |
 | --- | --- | --- |
@@ -50,10 +50,13 @@ Current capability assignments (`word 0 == 0x00000000000003ff`):
 | `SHOAL_ABI_CAPABILITY_BATCH_WRITER` | `0x0080` | batch writer creation, add, flush, close, and free |
 | `SHOAL_ABI_CAPABILITY_STRUCTURED_WRITE_FAILURE` | `0x0100` | owned structured write failure details |
 | `SHOAL_ABI_CAPABILITY_TABLE_ADMIN` | `0x0200` | list/exists/create/delete/rename/flush/property administration |
+| `SHOAL_ABI_CAPABILITY_NAMESPACE_ADMIN` | `0x0400` | namespace discovery, lifecycle, and property administration |
+| `SHOAL_ABI_CAPABILITY_SECURITY_ADMIN` | `0x0800` | users, authorizations, and permission administration |
+| `SHOAL_ABI_CAPABILITY_TABLE_SPLITS` | `0x1000` | binary-safe split listing and creation |
 
-Shoal does **not** advertise namespace/security/status, split creation/listing,
-compaction/import/export, Python/wheel, or any other unimplemented surface
-until the API exists and has coverage.
+Shoal does **not** advertise instance status, compaction/import/export,
+Python/wheel, or any other unimplemented surface until the API exists and has
+coverage.
 
 Compatibility rules:
 
@@ -100,10 +103,11 @@ Version numbers change only when the public ABI contract changes:
   Freeing also performs best-effort close and sets the variable to `NULL`.
 - A connector owns the bootstrap instance created for it. Callers do not
   separately close ZooKeeper resources.
-- Table administration calls (`list_tables`, `table_exists`, `create`,
+- Administration calls (`list_tables`, `table_exists`, `create`,
   `delete`, `rename`, `flush`, property mutation, and effective property
-  reads) accept per-call deadlines. Connector close prevents new calls,
-  cancels and joins active table-administration calls, waits for any
+  reads; namespace discovery/lifecycle/property reads; security operations;
+  and table split listing/creation) accept per-call deadlines. Connector close
+  prevents new calls, cancels and joins active administration calls, waits for any
   already-started scanner or batch-scanner calls to finish before final
   teardown, and remains idempotent while the handle stays alive.
 - Scanner configuration, ranges, and all nested arrays/bytes are borrowed only
@@ -118,6 +122,16 @@ Version numbers change only when the public ABI contract changes:
   from `shoal_table_list_get` and `shoal_table_properties_get` remain valid
   until the matching result is freed. Effective properties preserve explicit
   empty string values.
+- Namespace lists and property results own all returned strings. Versioned
+  property results additionally preserve the Accumulo property-store version.
+- Authorization and split results own binary-safe byte arrays. Their borrowed
+  views remain valid until `shoal_bytes_list_free`.
+- Passwords, authorization arrays, and split arrays are copied before calls
+  return. Empty passwords are represented by a non-NULL `shoal_bytes` input
+  whose length is zero.
+- Security failures retain the stable Accumulo user and code on the owned
+  `shoal_error`; `shoal_error_security_user` and
+  `shoal_error_security_code` return borrowed strings or `NULL`.
 - Scan results own binary-safe key/value storage. Views returned by
   `shoal_scan_result_get` remain valid until `shoal_scan_result_free`.
 - Mutations copy every row, column, visibility, and value input. BatchWriter
@@ -150,10 +164,9 @@ Version numbers change only when the public ABI contract changes:
 
 The ABI currently exposes connector bootstrap/lifecycle, synchronous Scanner
 and BatchScanner reads, Mutation/BatchWriter writes with owned structured
-failures, and table administration for listing, existence checks, create/
-delete/rename, full-table flush, table property mutation, and effective
-property reads. Namespace/security/status, split/compaction, bulk import/
-export, local-only property surfaces, and Python wheel APIs remain deferred.
+failures, table and namespace administration, complete merged security
+administration, and binary-safe table split listing/creation. Instance status,
+compaction, bulk import/export, and Python wheel APIs remain deferred.
 
 `docs/sharkbite-compatibility.md` enumerates the full Sharkbite compatibility
 contract, maps every element to this ABI, and defines the implementation-entry

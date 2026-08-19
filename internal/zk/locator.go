@@ -52,9 +52,10 @@ type Locator struct {
 	instanceSecret string
 	rawConnFactory func() (rawZKConn, error)
 
-	mu     sync.Mutex
-	closed bool
-	scopes map[*scopedTopologyReader]struct{}
+	mu                    sync.Mutex
+	closed                bool
+	scopes                map[*scopedTopologyReader]struct{}
+	pendingScopedConnects int
 }
 
 // ErrClosed reports a read attempted after the locator was closed. Close
@@ -151,6 +152,9 @@ func (l *Locator) isClosed() bool {
 func (l *Locator) trackScope(scope *scopedTopologyReader) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	if l.pendingScopedConnects > 0 {
+		l.pendingScopedConnects--
+	}
 	if l.closed {
 		return ErrClosed
 	}
@@ -168,6 +172,24 @@ func (l *Locator) releaseScope(scope *scopedTopologyReader) {
 	}
 	l.mu.Unlock()
 	scope.Close()
+}
+
+func (l *Locator) beginScopedConnect() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.closed {
+		return ErrClosed
+	}
+	l.pendingScopedConnects++
+	return nil
+}
+
+func (l *Locator) cancelScopedConnect() {
+	l.mu.Lock()
+	if l.pendingScopedConnects > 0 {
+		l.pendingScopedConnects--
+	}
+	l.mu.Unlock()
 }
 
 func (l *Locator) lookupInstanceID() (string, error) {
@@ -233,7 +255,12 @@ func (l *Locator) get(ctx context.Context, znodePath string) ([]byte, *gozk.Stat
 		return nil, nil, ErrClosed
 	}
 	if ctx.Done() != nil {
-		return getWithContext(ctx, znodePath, l.instanceSecret, l.rawConnFactoryOrDefault())
+		scope, err := l.newScopedTopologyReader(ctx)
+		if err != nil {
+			return nil, nil, err
+		}
+		defer l.releaseScope(scope)
+		return scope.get(ctx, znodePath)
 	}
 	data, stat, err := l.conn.Get(znodePath)
 	if err != nil {
@@ -388,7 +415,12 @@ func (l *Locator) Children(ctx context.Context, znodePath string) ([]string, err
 		return nil, ErrClosed
 	}
 	if ctx.Done() != nil {
-		return childrenWithContext(ctx, znodePath, l.instanceSecret, l.rawConnFactoryOrDefault())
+		scope, err := l.newScopedTopologyReader(ctx)
+		if err != nil {
+			return nil, err
+		}
+		defer l.releaseScope(scope)
+		return scope.Children(ctx, znodePath)
 	}
 	names, _, err := l.conn.Children(znodePath)
 	if err != nil {
@@ -417,13 +449,25 @@ func (l *Locator) topologyReadScope(ctx context.Context) (LockReader, func(), er
 	if ctx.Done() == nil {
 		return l, func() {}, nil
 	}
+	scope, err := l.newScopedTopologyReader(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	return scope, func() { l.releaseScope(scope) }, nil
+}
+
+func (l *Locator) newScopedTopologyReader(ctx context.Context) (*scopedTopologyReader, error) {
+	if err := l.beginScopedConnect(); err != nil {
+		return nil, err
+	}
 	conn, err := l.rawConnFactoryOrDefault()()
 	if err != nil {
-		return nil, nil, fmt.Errorf("zk connect: %w", err)
+		l.cancelScopedConnect()
+		return nil, fmt.Errorf("zk connect: %w", err)
 	}
 	if err := addAuthWithContext(ctx, conn, l.instanceSecret); err != nil {
-		conn.Close()
-		return nil, nil, err
+		l.cancelScopedConnect()
+		return nil, err
 	}
 	scope := &scopedTopologyReader{
 		instancePath: l.InstancePath(),
@@ -433,9 +477,9 @@ func (l *Locator) topologyReadScope(ctx context.Context) (LockReader, func(), er
 	// behind: trackScope rejects the scope and the connection is dropped.
 	if err := l.trackScope(scope); err != nil {
 		scope.Close()
-		return nil, nil, err
+		return nil, err
 	}
-	return scope, func() { l.releaseScope(scope) }, nil
+	return scope, nil
 }
 
 func addAuthWithContext(ctx context.Context, conn rawZKConn, instanceSecret string) error {

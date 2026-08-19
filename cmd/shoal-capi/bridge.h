@@ -26,6 +26,8 @@ struct shoal_batch_writer {
 struct shoal_error {
   shoal_status code;
   char *message;
+  char *security_user;
+  char *security_code;
 };
 
 typedef struct shoal_bridge_scan_entry {
@@ -112,6 +114,32 @@ typedef struct shoal_bridge_table_property_entry {
 struct shoal_table_properties_result {
   size_t count;
   shoal_bridge_table_property_entry *entries;
+};
+
+struct shoal_namespace_list_result {
+  size_t count;
+  shoal_bridge_table_entry *entries;
+};
+
+struct shoal_namespace_properties_result {
+  size_t count;
+  shoal_bridge_table_property_entry *entries;
+};
+
+struct shoal_versioned_properties_result {
+  int64_t version;
+  size_t count;
+  shoal_bridge_table_property_entry *entries;
+};
+
+typedef struct shoal_bridge_bytes_entry {
+  uint8_t *data;
+  size_t length;
+} shoal_bridge_bytes_entry;
+
+struct shoal_bytes_list_result {
+  size_t count;
+  shoal_bridge_bytes_entry *entries;
 };
 
 shoal_connector *shoal_bridge_connector_alloc(uint64_t id);
@@ -224,10 +252,61 @@ int shoal_bridge_table_properties_get(
     shoal_table_property_view *out_property);
 void shoal_bridge_table_properties_free(shoal_table_properties_result *result);
 
-shoal_error *shoal_bridge_error_alloc(shoal_status code, const char *message,
-                                      size_t message_length);
+shoal_namespace_list_result *shoal_bridge_namespace_list_alloc(size_t count);
+int shoal_bridge_namespace_list_set(shoal_namespace_list_result *result,
+                                    size_t index, const char *name,
+                                    const char *id);
+size_t shoal_bridge_namespace_list_count(
+    const shoal_namespace_list_result *result);
+int shoal_bridge_namespace_list_get(const shoal_namespace_list_result *result,
+                                    size_t index,
+                                    shoal_namespace_view *out_namespace);
+void shoal_bridge_namespace_list_free(shoal_namespace_list_result *result);
+
+shoal_namespace_properties_result *
+shoal_bridge_namespace_properties_alloc(size_t count);
+int shoal_bridge_namespace_properties_set(
+    shoal_namespace_properties_result *result, size_t index, const char *key,
+    const char *value);
+size_t shoal_bridge_namespace_properties_count(
+    const shoal_namespace_properties_result *result);
+int shoal_bridge_namespace_properties_get(
+    const shoal_namespace_properties_result *result, size_t index,
+    shoal_table_property_view *out_property);
+void shoal_bridge_namespace_properties_free(
+    shoal_namespace_properties_result *result);
+
+shoal_versioned_properties_result *
+shoal_bridge_versioned_properties_alloc(int64_t version, size_t count);
+int shoal_bridge_versioned_properties_set(
+    shoal_versioned_properties_result *result, size_t index, const char *key,
+    const char *value);
+int64_t shoal_bridge_versioned_properties_version(
+    const shoal_versioned_properties_result *result);
+size_t shoal_bridge_versioned_properties_count(
+    const shoal_versioned_properties_result *result);
+int shoal_bridge_versioned_properties_get(
+    const shoal_versioned_properties_result *result, size_t index,
+    shoal_table_property_view *out_property);
+void shoal_bridge_versioned_properties_free(
+    shoal_versioned_properties_result *result);
+
+shoal_bytes_list_result *shoal_bridge_bytes_list_alloc(size_t count);
+int shoal_bridge_bytes_list_set(shoal_bytes_list_result *result, size_t index,
+                                const uint8_t *data, size_t length);
+size_t shoal_bridge_bytes_list_count(const shoal_bytes_list_result *result);
+int shoal_bridge_bytes_list_get(const shoal_bytes_list_result *result,
+                                size_t index, shoal_bytes *out_value);
+void shoal_bridge_bytes_list_free(shoal_bytes_list_result *result);
+
+shoal_error *shoal_bridge_error_alloc(
+    shoal_status code, const char *message, size_t message_length,
+    const char *security_user, size_t security_user_length,
+    const char *security_code, size_t security_code_length);
 shoal_status shoal_bridge_error_code(const shoal_error *error);
 char *shoal_bridge_error_message(const shoal_error *error);
+char *shoal_bridge_error_security_user(const shoal_error *error);
+char *shoal_bridge_error_security_code(const shoal_error *error);
 void shoal_bridge_error_free(shoal_error *error);
 
 void shoal_bridge_connector_config_init(shoal_connector_config *config);

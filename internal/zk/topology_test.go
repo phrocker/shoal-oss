@@ -1005,6 +1005,70 @@ func TestLocatorCloseReleasesOutstandingScopes(t *testing.T) {
 	}
 }
 
+func TestLocatorCloseRejectsPendingCancellableReconnect(t *testing.T) {
+	tests := []struct {
+		name string
+		call func(context.Context, *Locator) error
+	}{
+		{
+			name: "GetRaw",
+			call: func(ctx context.Context, locator *Locator) error {
+				_, err := locator.GetRaw(ctx, "/accumulo/uuid-1/root_tablet")
+				return err
+			},
+		},
+		{
+			name: "RootTabletLocation",
+			call: func(ctx context.Context, locator *Locator) error {
+				_, err := locator.RootTabletLocation(ctx)
+				return err
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			started := make(chan struct{})
+			release := make(chan struct{})
+			conn := &countingConn{}
+			locator := &Locator{
+				instanceID: "uuid-1",
+				rawConnFactory: func() (rawZKConn, error) {
+					close(started)
+					<-release
+					return conn, nil
+				},
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			errCh := make(chan error, 1)
+			go func() {
+				errCh <- test.call(ctx, locator)
+			}()
+
+			<-started
+			locator.closeScopes()
+			close(release)
+
+			if err := <-errCh; !errors.Is(err, ErrClosed) {
+				t.Fatalf("error = %v, want ErrClosed", err)
+			}
+			if conn.closes != 1 {
+				t.Fatalf("connection closed %d times, want 1", conn.closes)
+			}
+			locator.mu.Lock()
+			pending := locator.pendingScopedConnects
+			tracked := len(locator.scopes)
+			closed := locator.closed
+			locator.mu.Unlock()
+			if !closed || pending != 0 || tracked != 0 {
+				t.Fatalf("closed/pending/tracked = %t/%d/%d, want true/0/0", closed, pending, tracked)
+			}
+		})
+	}
+}
+
 type countingConn struct {
 	closes int
 }
