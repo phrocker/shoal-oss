@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter, defaultdict
+from functools import lru_cache
 from pathlib import Path
 import re
 import sys
@@ -93,6 +94,7 @@ EXPECTED_METADATA_LINES = [
 
 CODE_SPAN_RE = re.compile(r"`([^`]+)`")
 IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+ANCHOR_PART_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*|\.{3}|\s+|.")
 FILE_CITATION_SUFFIXES = {
     ".c",
     ".cc",
@@ -112,6 +114,22 @@ FILE_CITATION_SUFFIXES = {
     ".yml",
 }
 FILE_CITATION_BASENAMES = {"ARCHITECTURE.md", "CMakeLists.txt", "Dockerfile", "Makefile", "README.md"}
+IDENTIFIER_BOUNDARY_CLASS = r"A-Za-z0-9_"
+IGNORED_ANCHOR_TOKENS = {
+    "ABI",
+    "C",
+    "Go",
+    "and",
+    "by",
+    "full",
+    "in",
+    "on",
+    "plus",
+    "read",
+    "struct",
+    "under",
+    "with",
+}
 
 
 def fail(message: str) -> None:
@@ -124,10 +142,11 @@ def require(condition: bool, message: str) -> None:
         fail(message)
 
 
-def parse_rows(lines: list[str]) -> tuple[Counter[str], dict[str, Counter[str]]]:
+def parse_rows(lines: list[str]) -> tuple[Counter[str], dict[str, Counter[str]], set[str]]:
     status_counts: Counter[str] = Counter()
     prefix_counts: dict[str, Counter[str]] = defaultdict(Counter)
-    for line in lines:
+    accepted_row_ids: dict[str, tuple[int, str]] = {}
+    for line_number, line in enumerate(lines, start=1):
         if not line.startswith("| SB-") or line.startswith("| SB-GAP"):
             continue
         parts = [part.strip() for part in line.split("|")[1:-1]]
@@ -137,17 +156,25 @@ def parse_rows(lines: list[str]) -> tuple[Counter[str], dict[str, Counter[str]]]
         status = parts[-2]
         if status not in STATUSES:
             continue
+        previous = accepted_row_ids.get(row_id)
+        if previous is not None:
+            fail(
+                f"duplicate accepted row id {row_id} on lines {previous[0]} and {line_number} "
+                f"({previous[1]} vs {status})"
+            )
+        accepted_row_ids[row_id] = (line_number, status)
         prefix = "-".join(row_id.split("-")[:2])
         status_counts[status] += 1
         prefix_counts[prefix][status] += 1
-    return status_counts, prefix_counts
+    return status_counts, prefix_counts, set(accepted_row_ids)
 
 
 def validate_counts(lines: list[str], full_text: str) -> None:
     for metadata_line in EXPECTED_METADATA_LINES:
         require(metadata_line in full_text, f"missing metadata line: {metadata_line}")
 
-    status_counts, prefix_counts = parse_rows(lines)
+    status_counts, prefix_counts, row_ids = parse_rows(lines)
+    require(len(row_ids) == 350, f"expected 350 unique rows, found {len(row_ids)}")
     require(sum(status_counts.values()) == 350, f"expected 350 rows, found {sum(status_counts.values())}")
 
     for status, expected in EXPECTED_STATUS_COUNTS.items():
@@ -287,13 +314,38 @@ def extract_path_anchor_bindings(cell: str, targeted_paths: set[str]) -> dict[st
     return dict(bindings)
 
 
+@lru_cache(maxsize=None)
+def identifier_boundary_pattern(token: str) -> re.Pattern[str]:
+    return re.compile(
+        rf"(?<![{IDENTIFIER_BOUNDARY_CLASS}]){re.escape(token)}(?![{IDENTIFIER_BOUNDARY_CLASS}])",
+        re.DOTALL,
+    )
+
+
+@lru_cache(maxsize=None)
+def anchor_boundary_pattern(anchor: str) -> re.Pattern[str]:
+    pieces: list[str] = []
+    for part in ANCHOR_PART_RE.findall(anchor):
+        if part == "...":
+            pieces.append(r"[\s\S]*?")
+            continue
+        if part.isspace():
+            pieces.append(r"\s+")
+            continue
+        if IDENT_RE.fullmatch(part):
+            pieces.append(identifier_boundary_pattern(part).pattern)
+            continue
+        pieces.append(re.escape(part))
+    return re.compile("".join(pieces), re.DOTALL)
+
+
 def anchor_matches_content(anchor: str, content: str, ignored_tokens: set[str]) -> bool:
-    if anchor in content:
+    if anchor_boundary_pattern(anchor).search(content):
         return True
     for token in IDENT_RE.findall(anchor):
         if token in ignored_tokens or len(token) < 3:
             continue
-        if token in content:
+        if identifier_boundary_pattern(token).search(content):
             return True
     return False
 
@@ -305,21 +357,6 @@ def validate_targeted_symbol_anchors(
     repo_root: Path | None = None,
 ) -> None:
     contents = load_targeted_contents(targeted_paths, repo_root=repo_root)
-    ignored_tokens = {
-        "ABI",
-        "C",
-        "Go",
-        "and",
-        "by",
-        "full",
-        "in",
-        "on",
-        "plus",
-        "read",
-        "struct",
-        "under",
-        "with",
-    }
 
     for line in lines:
         if not line.startswith("| SB-"):
@@ -336,7 +373,7 @@ def validate_targeted_symbol_anchors(
                 missing = [
                     anchor
                     for anchor in anchors
-                    if not anchor_matches_content(anchor, content, ignored_tokens)
+                    if not anchor_matches_content(anchor, content, IGNORED_ANCHOR_TOKENS)
                 ]
                 require(
                     not missing,

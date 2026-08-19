@@ -14,9 +14,14 @@ import validate_sharkbite_matrix as validator
 
 
 FIXTURE_DIR = DOCS_DIR / "testdata" / "validate_sharkbite_matrix"
-FIXTURE_PATHS = {
+CROSS_FILE_FIXTURE_PATHS = {
     "docs/testdata/validate_sharkbite_matrix/fixture_a.go",
     "docs/testdata/validate_sharkbite_matrix/fixture_b.go",
+}
+BOUNDARY_FIXTURE_PATHS = {
+    "docs/testdata/validate_sharkbite_matrix/fixture_a.go",
+    "docs/testdata/validate_sharkbite_matrix/fixture_identifier_old.go",
+    "docs/testdata/validate_sharkbite_matrix/fixture_signature.h",
 }
 
 
@@ -32,10 +37,20 @@ def fixture_evidence_cell(name: str) -> str:
 
 
 class ValidateSharkbiteMatrixTests(unittest.TestCase):
+    def assert_validation_fails(self, func, *expected_parts: str) -> str:
+        stderr = StringIO()
+        with redirect_stderr(stderr):
+            with self.assertRaises(SystemExit):
+                func()
+        message = stderr.getvalue()
+        for part in expected_parts:
+            self.assertIn(part, message)
+        return message
+
     def test_extract_path_anchor_bindings_keeps_adjacent_pairs(self) -> None:
         bindings = validator.extract_path_anchor_bindings(
             fixture_evidence_cell("multi_file_ok.md"),
-            FIXTURE_PATHS,
+            CROSS_FILE_FIXTURE_PATHS,
         )
         self.assertEqual(
             bindings["docs/testdata/validate_sharkbite_matrix/fixture_a.go"],
@@ -51,7 +66,7 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
             "`TestAlpha` via `TestBeta` "
             "(`docs/testdata/validate_sharkbite_matrix/fixture_a.go`; "
             "`docs/testdata/validate_sharkbite_matrix/fixture_b.go`)",
-            FIXTURE_PATHS,
+            CROSS_FILE_FIXTURE_PATHS,
         )
         self.assertEqual(
             bindings["docs/testdata/validate_sharkbite_matrix/fixture_a.go"],
@@ -62,27 +77,70 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
             ["TestBeta"],
         )
 
+    def test_parse_rows_accepts_unique_row_ids(self) -> None:
+        status_counts, prefix_counts, row_ids = validator.parse_rows(load_fixture_lines("unique_rows.md"))
+        self.assertEqual(row_ids, {"SB-FIXTURE-101", "SB-FIXTURE-102"})
+        self.assertEqual(status_counts["Covered"], 1)
+        self.assertEqual(status_counts["Missing Go"], 1)
+        self.assertEqual(prefix_counts["SB-FIXTURE"]["Covered"], 1)
+        self.assertEqual(prefix_counts["SB-FIXTURE"]["Missing Go"], 1)
+
+    def test_parse_rows_rejects_duplicate_ids_with_same_status(self) -> None:
+        self.assert_validation_fails(
+            lambda: validator.parse_rows(load_fixture_lines("duplicate_same_status.md")),
+            "duplicate accepted row id SB-FIXTURE-101",
+            "Covered vs Covered",
+        )
+
+    def test_parse_rows_rejects_duplicate_ids_with_different_status(self) -> None:
+        self.assert_validation_fails(
+            lambda: validator.parse_rows(load_fixture_lines("duplicate_different_status.md")),
+            "duplicate accepted row id SB-FIXTURE-101",
+            "Covered vs Missing Go",
+        )
+
     def test_validate_targeted_symbol_anchors_rejects_cross_file_anchor_leakage(self) -> None:
-        stderr = StringIO()
-        with redirect_stderr(stderr):
-            with self.assertRaises(SystemExit):
-                validator.validate_targeted_symbol_anchors(
-                    load_fixture_lines("multi_file_stale.md"),
-                    targeted_paths=FIXTURE_PATHS,
-                )
-        self.assertIn("StaleTest", stderr.getvalue())
-        self.assertIn("fixture_b.go", stderr.getvalue())
+        self.assert_validation_fails(
+            lambda: validator.validate_targeted_symbol_anchors(
+                load_fixture_lines("multi_file_stale.md"),
+                targeted_paths=CROSS_FILE_FIXTURE_PATHS,
+            ),
+            "StaleTest",
+            "fixture_b.go",
+        )
 
     def test_validate_targeted_symbol_anchors_accepts_adjacent_multi_file_fixture(self) -> None:
         validator.validate_targeted_symbol_anchors(
             load_fixture_lines("multi_file_ok.md"),
-            targeted_paths=FIXTURE_PATHS,
+            targeted_paths=CROSS_FILE_FIXTURE_PATHS,
+        )
+
+    def test_validate_targeted_symbol_anchors_accepts_exact_identifier_boundaries(self) -> None:
+        validator.validate_targeted_symbol_anchors(
+            load_fixture_lines("identifier_boundary_ok.md"),
+            targeted_paths=BOUNDARY_FIXTURE_PATHS,
+        )
+
+    def test_validate_targeted_symbol_anchors_rejects_identifier_substrings(self) -> None:
+        self.assert_validation_fails(
+            lambda: validator.validate_targeted_symbol_anchors(
+                load_fixture_lines("identifier_boundary_stale.md"),
+                targeted_paths=BOUNDARY_FIXTURE_PATHS,
+            ),
+            "TestAlpha",
+            "fixture_identifier_old.go",
+        )
+
+    def test_validate_targeted_symbol_anchors_accepts_multiline_signature_anchor(self) -> None:
+        validator.validate_targeted_symbol_anchors(
+            load_fixture_lines("signature_anchor_ok.md"),
+            targeted_paths=BOUNDARY_FIXTURE_PATHS,
         )
 
     def test_validate_targeted_symbol_anchors_resets_after_non_target_file_citation(self) -> None:
         validator.validate_targeted_symbol_anchors(
             load_fixture_lines("non_target_separator.md"),
-            targeted_paths=FIXTURE_PATHS,
+            targeted_paths=CROSS_FILE_FIXTURE_PATHS,
         )
 
 
