@@ -815,6 +815,8 @@ func TestNormalizeWindowsUNCPublicationPrefix(t *testing.T) {
 		{name: "extended UNC marker and server components normalize case", left: `\\?\UNC\SERVER\share\`, right: `\\?\unc\server\share\`, wantEq: true, wantOK: true},
 		{name: "bare extended UNC marker normalizes without inline server or share", left: `\\?\UNC\`, right: `\\?\unc\`, wantEq: true, wantOK: true},
 		{name: "bare extended drive prefix normalizes case", left: `\\?\c:\`, right: `\\?\C:\`, wantEq: true, wantOK: true},
+		{name: "bare drive-relative prefix normalizes case", left: `c:`, right: `C:`, wantEq: true, wantOK: true},
+		{name: "drive-relative and drive-absolute prefixes stay distinct", left: `c:`, right: `C:\`, wantEq: false, wantOK: true},
 		{name: "drive-letter prefix is not treated as UNC", left: `C:\bulk\`, right: `C:\bulk\`, wantOK: false},
 		{name: "uri prefix is not treated as UNC", left: `s3://bucket`, right: `s3://bucket`, wantOK: false},
 	}
