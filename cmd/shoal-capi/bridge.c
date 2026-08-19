@@ -865,11 +865,6 @@ shoal_error *shoal_bridge_error_alloc(shoal_status code, const char *message,
   }
 #ifdef SHOAL_CAPI_TEST
   if (!shoal_bridge_allocation_allowed(
-          &shoal_bridge_error_alloc_fail_after)) {
-    free(error);
-    return NULL;
-  }
-  if (!shoal_bridge_allocation_allowed(
           &shoal_bridge_error_message_alloc_fail_after)) {
     free(error);
     return NULL;

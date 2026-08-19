@@ -9,16 +9,53 @@ import (
 	"github.com/phrocker/shoal/accumulo"
 )
 
-func TestFailReturnsOutOfMemoryWhenErrorMessageAllocationFails(t *testing.T) {
-	testErrorMessageAllocFailAfter(0)
-	defer testErrorMessageAllocReset()
+func TestFailReturnsOutOfMemoryWhenErrorObjectAllocationFailsImmediately(t *testing.T) {
+	testErrorAllocFailAfter(0)
+	defer testErrorAllocReset()
 
-	status, outErrorNil := testFailStatusWhenErrorMessageAllocationFails("shoal: invalid input")
+	status, outErrorNil, message := testFailResult("shoal: invalid input")
 	if status != 3 {
 		t.Fatalf("status = %d, want 3", status)
 	}
 	if !outErrorNil {
-		t.Fatal("outError should remain nil when error allocation fails")
+		t.Fatal("outError should remain nil when error object allocation fails")
+	}
+	if message != "" {
+		t.Fatalf("message = %q, want empty", message)
+	}
+}
+
+func TestFailReturnsOriginalStatusWhenErrorObjectAllocationSucceeds(t *testing.T) {
+	testErrorAllocFailAfter(1)
+	defer testErrorAllocReset()
+
+	status, outErrorNil, message := testFailResult("shoal: invalid input")
+	if status != 1 {
+		t.Fatalf("status = %d, want 1", status)
+	}
+	if outErrorNil {
+		t.Fatal("outError should be populated when error object allocation succeeds")
+	}
+	if message != "shoal: invalid input" {
+		t.Fatalf("message = %q, want exact propagated error", message)
+	}
+}
+
+func TestFailReturnsOutOfMemoryWhenErrorMessageAllocationFails(t *testing.T) {
+	testErrorAllocFailAfter(1)
+	defer testErrorAllocReset()
+	testErrorMessageAllocFailAfter(0)
+	defer testErrorMessageAllocReset()
+
+	status, outErrorNil, message := testFailResult("shoal: invalid input")
+	if status != 3 {
+		t.Fatalf("status = %d, want 3", status)
+	}
+	if !outErrorNil {
+		t.Fatal("outError should remain nil when error message allocation fails")
+	}
+	if message != "" {
+		t.Fatalf("message = %q, want empty", message)
 	}
 }
 

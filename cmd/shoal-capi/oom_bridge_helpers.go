@@ -22,6 +22,14 @@ func testErrorMessageAllocReset() {
 	C.shoal_bridge_test_error_message_alloc_reset()
 }
 
+func testErrorAllocFailAfter(successfulAllocations uint) {
+	C.shoal_bridge_test_error_alloc_fail_after(C.size_t(successfulAllocations))
+}
+
+func testErrorAllocReset() {
+	C.shoal_bridge_test_error_alloc_reset()
+}
+
 func testStringAllocFailAfter(successfulAllocations uint) {
 	C.shoal_bridge_test_string_alloc_fail_after(C.size_t(successfulAllocations))
 }
@@ -30,14 +38,15 @@ func testStringAllocReset() {
 	C.shoal_bridge_test_string_alloc_reset()
 }
 
-func testFailStatusWhenErrorMessageAllocationFails(message string) (status int32, outErrorNil bool) {
+func testFailResult(message string) (status int32, outErrorNil bool, errorMessage string) {
 	var outError *C.shoal_error
 	result := fail(&outError, C.SHOAL_STATUS_INVALID_ARGUMENT, errors.New(message))
 	if outError != nil {
+		errorMessage = C.GoString(C.shoal_bridge_error_message(outError))
 		C.shoal_bridge_error_free(outError)
-		return int32(result), false
+		return int32(result), false, errorMessage
 	}
-	return int32(result), true
+	return int32(result), true, ""
 }
 
 func structuredWriteFailureError() error {
