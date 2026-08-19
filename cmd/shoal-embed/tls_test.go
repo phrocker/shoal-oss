@@ -18,6 +18,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -561,4 +562,147 @@ func waitForHTTPStatus(t *testing.T, client *http.Client, url string, wantStatus
 	}
 	t.Fatalf("GET %s never returned %d: %v", url, wantStatus, lastErr)
 	return nil
+}
+
+// TestTLSProbeSuppressingWriterFiltersOnlyHandshakeEOF unit-tests
+// tlsProbeSuppressingWriter's filter in isolation (no networking, no
+// timing): only the exact "http: TLS handshake error from <addr>: EOF"
+// shape — what net/http logs for a bare TCP connect-then-close, i.e. a
+// Kubernetes tcpSocket probe against a TLS-wrapped listener — is
+// suppressed (downgraded to a Debug entry instead of reaching the
+// wrapped writer). Every other handshake-error text, and unrelated
+// http.Server error-log lines, must still reach the wrapped writer
+// unchanged so a real problem is never silently dropped.
+func TestTLSProbeSuppressingWriterFiltersOnlyHandshakeEOF(t *testing.T) {
+	tests := []struct {
+		name           string
+		line           string
+		wantSuppressed bool
+	}{
+		{name: "bare probe EOF", line: "http: TLS handshake error from 10.0.0.5:54321: EOF", wantSuppressed: true},
+		{name: "bare probe EOF with trailing newline", line: "http: TLS handshake error from 10.0.0.5:54321: EOF\n", wantSuppressed: true},
+		{name: "garbage bytes handshake failure", line: "http: TLS handshake error from 10.0.0.5:54321: tls: first record does not look like a TLS handshake", wantSuppressed: false},
+		{name: "handshake read timeout", line: "http: TLS handshake error from 10.0.0.5:54321: read tcp 10.0.0.5:54321: i/o timeout", wantSuppressed: false},
+		{name: "connection reset is not the probe EOF shape", line: "http: TLS handshake error from 10.0.0.5:54321: read: connection reset by peer", wantSuppressed: false},
+		{name: "unrelated http error line", line: "http: proxy error: some other message", wantSuppressed: false},
+		{name: "EOF as a substring elsewhere does not match", line: "http: TLS handshake error from 10.0.0.5:54321: unexpected EOF while reading extra data", wantSuppressed: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var passthrough bytes.Buffer
+			var debugBuf bytes.Buffer
+			logger := slog.New(slog.NewTextHandler(&debugBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+			w := &tlsProbeSuppressingWriter{out: &passthrough, logger: logger}
+
+			n, err := w.Write([]byte(tt.line))
+			if err != nil {
+				t.Fatalf("Write: %v", err)
+			}
+			if n != len(tt.line) {
+				t.Errorf("Write returned n=%d, want %d (must report the full length so log.Logger.Output doesn't treat this as a short write)", n, len(tt.line))
+			}
+
+			gotSuppressed := passthrough.Len() == 0
+			if gotSuppressed != tt.wantSuppressed {
+				t.Errorf("suppressed = %v, want %v\npassthrough=%q\ndebug=%q", gotSuppressed, tt.wantSuppressed, passthrough.String(), debugBuf.String())
+			}
+			if tt.wantSuppressed {
+				if !strings.Contains(debugBuf.String(), "suppressed expected TLS probe disconnect") {
+					t.Errorf("suppressed line was not recorded at Debug: %q", debugBuf.String())
+				}
+			} else if !strings.Contains(passthrough.String(), strings.TrimRight(tt.line, "\n")) {
+				t.Errorf("non-suppressed line did not reach the wrapped writer unchanged: passthrough=%q, want to contain %q", passthrough.String(), tt.line)
+			}
+		})
+	}
+}
+
+// TestHTTPErrorLogSuppressesExpectedProbeEOFButNotRealTLSErrors is
+// TestTLSProbeSuppressingWriterFiltersOnlyHandshakeEOF's end-to-end
+// counterpart: it drives a real startServe HTTP listener with TLS
+// enabled and confirms the *actual* net/http-emitted messages behave as
+// designed — a bare connect-then-close (what a Kubernetes tcpSocket
+// probe does, and what the write tier's mutual-TLS probes use; see
+// deploy/helm/shoal/templates/embed-statefulset.yaml) never reaches
+// Warn, while a real broken handshake attempt (garbage bytes instead of
+// a TLS ClientHello) still does, unaffected by the fix.
+func TestHTTPErrorLogSuppressesExpectedProbeEOFButNotRealTLSErrors(t *testing.T) {
+	ca := newTestCA(t)
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	h, err := startServe(serveConfig{
+		DataDir:        t.TempDir(),
+		GRPCAddress:    "127.0.0.1:0",
+		MetricsAddress: "127.0.0.1:0",
+		TLS: tlsFilesConfig{
+			CertFile: ca.serverCertFile,
+			KeyFile:  ca.serverKeyFile,
+		},
+		Logger: logger,
+	})
+	if err != nil {
+		t.Fatalf("startServe: %v", err)
+	}
+	serveErrCh := make(chan error, 1)
+	go func() { serveErrCh <- h.Serve() }()
+	t.Cleanup(func() {
+		h.Drain()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := h.Stop(ctx); err != nil {
+			t.Errorf("Stop(ctx) = %v, want nil during cleanup", err)
+		}
+		select {
+		case <-serveErrCh:
+		case <-time.After(5 * time.Second):
+			t.Error("Serve did not return within 5s of Stop")
+		}
+	})
+
+	// Wait for the HTTPS listener to actually be accepting connections.
+	resp := waitForHTTPStatus(t, ca.httpsClient(nil), "https://"+h.MetricsAddr+"/healthz", http.StatusOK)
+	resp.Body.Close()
+
+	// Simulate a kubelet tcpSocket probe: connect, then close without
+	// sending anything.
+	probeConn, err := net.Dial("tcp", h.MetricsAddr)
+	if err != nil {
+		t.Fatalf("dial (probe simulation): %v", err)
+	}
+	probeConn.Close()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && !strings.Contains(logBuf.String(), "suppressed expected TLS probe disconnect") {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if strings.Contains(logBuf.String(), "level=WARN") && strings.Contains(logBuf.String(), "TLS handshake error") {
+		t.Errorf("bare probe connect-then-close was logged at Warn, want it suppressed to Debug:\n%s", logBuf.String())
+	}
+	if !strings.Contains(logBuf.String(), "suppressed expected TLS probe disconnect") {
+		t.Errorf("bare probe connect-then-close was not recorded at Debug either — it should still be observable at verbose log levels:\n%s", logBuf.String())
+	}
+	logBuf.Reset()
+
+	// Simulate a real broken/malicious handshake attempt: connect and
+	// send bytes that aren't a TLS ClientHello at all.
+	garbageConn, err := net.Dial("tcp", h.MetricsAddr)
+	if err != nil {
+		t.Fatalf("dial (garbage-bytes simulation): %v", err)
+	}
+	if _, err := garbageConn.Write([]byte("not a tls client hello, just garbage bytes 1234567890")); err != nil {
+		t.Fatalf("write garbage bytes: %v", err)
+	}
+
+	deadline = time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && !strings.Contains(logBuf.String(), "TLS handshake error") {
+		time.Sleep(20 * time.Millisecond)
+	}
+	garbageConn.Close()
+	if !strings.Contains(logBuf.String(), "level=WARN") || !strings.Contains(logBuf.String(), "TLS handshake error") {
+		t.Errorf("a real TLS handshake failure (garbage bytes) was not logged at Warn as before; got:\n%s", logBuf.String())
+	}
+	if strings.Contains(logBuf.String(), "suppressed expected TLS probe disconnect") {
+		t.Errorf("a real TLS handshake failure must not be reported as a suppressed probe disconnect:\n%s", logBuf.String())
+	}
 }

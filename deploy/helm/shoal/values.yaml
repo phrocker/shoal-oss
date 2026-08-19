@@ -75,11 +75,15 @@ readFleet:
       cpu: "2"
       memory: 2Gi
   # Explicit rollout contract instead of relying on the apps/v1 default
-  # (which happens to already be these values today). Keeps at least
-  # replicas-1 pods serving during a rollout while proving out a new
-  # revision's readiness before removing an old one.
+  # (25% maxUnavailable/maxSurge, which round down/up to 0/1 for the
+  # default 3 replicas — spelling out maxUnavailable: 0 here pins that
+  # exact behavior explicitly rather than leaving it to rounding at a
+  # different replica count). Keeps all replicas serving throughout a
+  # rollout: an old pod is never removed until the surge pod has proven
+  # readiness, since the controller isn't allowed any unavailable pods in
+  # between.
   strategy:
-    maxUnavailable: 1
+    maxUnavailable: 0
     maxSurge: 1
   podDisruptionBudget:
     enabled: true

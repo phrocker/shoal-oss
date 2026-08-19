@@ -168,12 +168,16 @@ spec:
   # here). maxUnavailable: 0 means the Eviction API (kubectl drain, cluster
   # autoscaler node consolidation, and similar voluntary-disruption paths)
   # will refuse to evict this pod rather than silently taking the shard's
-  # only writer offline. This does NOT block an operator-initiated rolling
-  # update (kubectl rollout restart / helm upgrade): the StatefulSet
-  # controller replaces pods directly and is not subject to PDBs. It DOES
-  # mean a node drain targeting this pod's node will report a failure
-  # until the operator explicitly scales up first, deletes the pod
-  # directly (bypassing the Eviction API), or temporarily raises this
+  # only writer offline, regardless of replica count: this budget is
+  # enforced against every pod the selector matches, so scaling the
+  # StatefulSet up does not by itself unblock a drain of an existing pod —
+  # maxUnavailable: 0 still permits zero unavailable pods no matter how
+  # many replicas exist. This does NOT block an operator-initiated
+  # rolling update (kubectl rollout restart / helm upgrade): the
+  # StatefulSet controller replaces pods directly and is not subject to
+  # PDBs. It DOES mean a node drain targeting this pod's node will report
+  # a failure until the operator either deletes the pod directly
+  # (bypassing the Eviction API) or temporarily raises/removes this
   # budget — see deploy/README.md's rolling-upgrade/rollback runbook.
   maxUnavailable: 0
   selector:

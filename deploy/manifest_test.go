@@ -153,7 +153,11 @@ func TestReadFleetManifestHasDisruptionAndRolloutHardening(t *testing.T) {
 
 	dep := requireDoc(t, docs, "Deployment", "shoal-read")
 	requireContains(t, dep, "strategy:")
-	requireContains(t, dep, "maxUnavailable: 1")
+	// maxUnavailable: 0 (not the apps/v1-default-shaped "1") is what
+	// actually keeps all 3 replicas available throughout a rollout: the
+	// controller cannot remove an old pod until the maxSurge pod is
+	// ready, since it has zero unavailable budget to spend in between.
+	requireContains(t, dep, "maxUnavailable: 0")
 	requireContains(t, dep, "maxSurge: 1")
 	requireContains(t, dep, "podAntiAffinity:")
 	requireContains(t, dep, "tcpSocket:")
@@ -162,6 +166,11 @@ func TestReadFleetManifestHasDisruptionAndRolloutHardening(t *testing.T) {
 	}
 
 	pdb := requireDoc(t, docs, "PodDisruptionBudget", "shoal-read")
+	// The PDB's own maxUnavailable is intentionally a separate, more
+	// permissive value (1) than the rollout strategy's maxUnavailable
+	// (0) above: it governs voluntary disruptions outside a rollout
+	// (node drains, cluster-autoscaler consolidation), which aren't
+	// gated on a replacement pod being ready first the way a rollout is.
 	requireContains(t, pdb, "maxUnavailable: 1")
 	requireContains(t, pdb, "app.kubernetes.io/component: read-fleet")
 }
@@ -218,12 +227,32 @@ func TestHelmValuesDeclareDisruptionRolloutAndTLSDefaults(t *testing.T) {
 		"tls:",
 		"enabled: false",
 		"strategy:",
-		"maxUnavailable: 1",
 		"maxSurge: 1",
 	} {
 		if !strings.Contains(values, want) {
 			t.Errorf("helm/shoal/values.yaml: want to contain %q", want)
 		}
+	}
+
+	// readFleet is the last top-level section in values.yaml, so scoping
+	// to everything from its header onward isolates its own
+	// strategy.maxUnavailable (0 — keeps all replicas available
+	// throughout a rollout) from its separate, more permissive
+	// podDisruptionBudget.maxUnavailable (1 — voluntary disruptions
+	// outside a rollout). A plain whole-file substring check can't tell
+	// those two apart, so checking them unscoped could keep passing even
+	// if the strategy value regressed back to the weaker "1" as long as
+	// the PDB's "1" was still present.
+	idx := strings.Index(values, "\nreadFleet:")
+	if idx == -1 {
+		t.Fatal("helm/shoal/values.yaml: no top-level readFleet: section found")
+	}
+	readFleetSection := values[idx:]
+	if !strings.Contains(readFleetSection, "maxUnavailable: 0") {
+		t.Error("helm/shoal/values.yaml: readFleet.strategy.maxUnavailable must be 0 to keep all replicas available throughout a rollout (see deploy/README.md's rollout section)")
+	}
+	if !strings.Contains(readFleetSection, "maxUnavailable: 1") {
+		t.Error("helm/shoal/values.yaml: readFleet.podDisruptionBudget.maxUnavailable must stay 1 (voluntary-disruption budget, deliberately separate from the rollout strategy above)")
 	}
 }
 
@@ -265,15 +294,41 @@ func TestHelmChartLintsAndRenders(t *testing.T) {
 	}
 
 	cases := []struct {
-		name string
-		args []string
+		name            string
+		args            []string
+		wantContains    []string
+		wantNotContains []string
 	}{
-		{name: "defaults"},
+		{
+			name:            "defaults",
+			wantNotContains: []string{"scheme: HTTPS", "tcpSocket:"},
+		},
+		{
+			// The only mode that renders the HTTPS httpGet branch: TLS
+			// enabled, but requireClientCert left false (its chart
+			// default). Distinct from "tls and mTLS enabled" below,
+			// which renders the tcpSocket branch instead — a
+			// string-presence check against the raw template source
+			// (see TestHelmWriteTierTLSProbeTemplates) can't tell these
+			// two rendered shapes apart or catch malformed YAML
+			// specific to this branch, so this case renders it for
+			// real.
+			name: "tls enabled, no mutual TLS",
+			args: []string{
+				"--set", "writeTier.tls.enabled=true",
+				"--set", "writeTier.tls.secretName=shoal-embed-tls",
+			},
+			wantContains:    []string{"scheme: HTTPS", "httpGet:"},
+			wantNotContains: []string{"tcpSocket:"},
+		},
 		{name: "tls and mTLS enabled", args: []string{
 			"--set", "writeTier.tls.enabled=true",
 			"--set", "writeTier.tls.secretName=shoal-embed-tls",
 			"--set", "writeTier.tls.requireClientCert=true",
-		}},
+		},
+			wantContains:    []string{"tcpSocket:"},
+			wantNotContains: []string{"scheme: HTTPS"},
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -289,6 +344,23 @@ func TestHelmChartLintsAndRenders(t *testing.T) {
 			for _, d := range docs {
 				if d.kind == "" {
 					t.Errorf("a rendered document has no recognizable \"kind:\" line:\n%s", d.text)
+				}
+			}
+
+			// Scope the probe-shape assertions to the write-tier
+			// StatefulSet specifically: the read-fleet Deployment always
+			// renders its own unconditional tcpSocket probes regardless
+			// of writeTier.tls settings, so an unscoped whole-output
+			// check would false-fail the "no tcpSocket" cases above.
+			if len(tc.wantContains) > 0 || len(tc.wantNotContains) > 0 {
+				sts := requireDoc(t, docs, "StatefulSet", "shoal-embed")
+				for _, want := range tc.wantContains {
+					requireContains(t, sts, want)
+				}
+				for _, notWant := range tc.wantNotContains {
+					if strings.Contains(sts.text, notWant) {
+						t.Errorf("shoal-embed StatefulSet unexpectedly contains %q:\n%s", notWant, sts.text)
+					}
 				}
 			}
 		})

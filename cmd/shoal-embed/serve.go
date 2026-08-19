@@ -239,8 +239,12 @@ func startServe(cfg serveConfig) (*serveHandle, error) {
 			// garbage traffic reaching the port) through the same
 			// structured logger as everything else here, instead of
 			// net/http's default behavior of writing them straight to
-			// os.Stderr via the global "log" package.
-			ErrorLog: slog.NewLogLogger(logger.Handler(), slog.LevelWarn),
+			// os.Stderr via the global "log" package. newHTTPErrorLog
+			// additionally downgrades the specific, expected "TLS
+			// handshake error ...: EOF" line a bare tcpSocket probe
+			// produces against a TLS-wrapped listener — see its doc
+			// comment in tls.go.
+			ErrorLog: newHTTPErrorLog(logger),
 		}
 		httpServeDone = make(chan struct{})
 	}

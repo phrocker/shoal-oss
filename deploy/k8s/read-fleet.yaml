@@ -27,15 +27,17 @@ metadata:
 spec:
   replicas: 3
   # Explicit rollout contract instead of relying on the apps/v1 default
-  # (which happens to already be these exact values today). Keeps at
-  # least 2 of 3 replicas serving during a rollout (maxUnavailable: 1)
-  # while allowing one extra pod briefly during the transition
-  # (maxSurge: 1) so the new revision's readiness is proven before an old
-  # replica is removed.
+  # (25% maxUnavailable/maxSurge, which round down/up to 0/1 for these 3
+  # replicas — spelling it out as maxUnavailable: 0 here pins that exact
+  # behavior explicitly rather than leaving it to rounding). Keeps all 3
+  # replicas serving throughout a rollout: an old replica is never
+  # removed until the one extra (maxSurge: 1) surge pod has passed
+  # readiness, since the controller isn't allowed any unavailable pods in
+  # between.
   strategy:
     type: RollingUpdate
     rollingUpdate:
-      maxUnavailable: 1
+      maxUnavailable: 0
       maxSurge: 1
   selector:
     matchLabels:
