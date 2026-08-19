@@ -1,8 +1,8 @@
-# Revision-22 accepted matrix rows for docs/sharkbite-compatibility.md.
+# Revision-23 accepted matrix rows for docs/sharkbite-compatibility.md.
 # One entry per row: ROW-ID followed by the audited status, in document order.
 # Pinning the status next to the id means a swap of two rows' statuses inside one
 # section cannot pass the aggregate count checks undetected.
-# Update only when the independently audited revision-22 inventory itself changes.
+# Update only when the independently audited revision-23 inventory itself changes.
 # Regenerate from the audited document, review every added/removed/reclassified row
 # in code review, and keep the list in document order for human auditability.
 
@@ -84,8 +84,8 @@ SB-DATA-011 Behavior mismatch
 SB-DATA-012 Behavior mismatch
 SB-DATA-013 Behavior mismatch
 SB-DATA-014 Behavior mismatch
-SB-DATA-015 Behavior mismatch
-SB-DATA-073 Behavior mismatch
+SB-DATA-015 Missing C ABI
+SB-DATA-073 Missing C ABI
 SB-DATA-016 Behavior mismatch
 SB-DATA-017 Missing C ABI
 SB-DATA-018 Behavior mismatch
@@ -101,10 +101,10 @@ SB-DATA-027 Behavior mismatch
 SB-DATA-028 Behavior mismatch
 SB-DATA-029 Behavior mismatch
 SB-DATA-030 Behavior mismatch
-SB-DATA-031 Missing Go
-SB-DATA-032 Missing Go
-SB-DATA-033 Missing Go
-SB-DATA-074 Missing Go
+SB-DATA-031 Missing C ABI
+SB-DATA-032 Missing C ABI
+SB-DATA-033 Missing C ABI
+SB-DATA-074 Missing C ABI
 SB-DATA-034 Behavior mismatch
 SB-DATA-035 Behavior mismatch
 SB-DATA-036 Behavior mismatch
@@ -122,8 +122,8 @@ SB-DATA-047 Behavior mismatch
 SB-DATA-048 Behavior mismatch
 SB-DATA-049 Behavior mismatch
 SB-DATA-050 Behavior mismatch
-SB-DATA-051 Missing Go
-SB-DATA-052 Missing Go
+SB-DATA-051 Missing C ABI
+SB-DATA-052 Missing C ABI
 SB-DATA-053 Not required (rationale required)
 SB-DATA-075 Not required (rationale required)
 SB-DATA-054 Behavior mismatch

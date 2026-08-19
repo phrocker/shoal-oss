@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"strings"
 
 	"github.com/phrocker/shoal/internal/thrift/gen/data"
 )
@@ -164,6 +165,108 @@ func firstKeyOfRow(row []byte, following bool) *Key {
 		bound = append(bound, 0)
 	}
 	return &Key{Row: bound, Timestamp: math.MaxInt64}
+}
+
+// AfterEndKey reports whether key sorts after this range's upper bound, which
+// is the Go form of Sharkbite's after_end_key.
+//
+// The comparison uses the range's effective bounds ([Range.KeyBounds]), so a
+// row bound covers every cell of the row: a key in the end row is inside an
+// inclusive row-bounded range and outside an exclusive one, whatever its column
+// family or timestamp.
+func (r *Range) AfterEndKey(key Key) bool {
+	if r == nil {
+		return false
+	}
+	_, _, end, endInclusive := r.KeyBounds()
+	if end == nil {
+		return false
+	}
+	if endInclusive {
+		return compareKeys(*end, key) < 0
+	}
+	return compareKeys(*end, key) <= 0
+}
+
+// BeforeStartKey reports whether key sorts before this range's lower bound,
+// which is the Go form of Sharkbite's before_start_key. It resolves row bounds
+// exactly as AfterEndKey does.
+func (r *Range) BeforeStartKey(key Key) bool {
+	if r == nil {
+		return false
+	}
+	start, startInclusive, _, _ := r.KeyBounds()
+	if start == nil {
+		return false
+	}
+	if startInclusive {
+		return compareKeys(key, *start) < 0
+	}
+	return compareKeys(key, *start) <= 0
+}
+
+// Contains reports whether key falls inside the range: not before its start and
+// not after its end. Sharkbite has no such predicate — a caller composes the
+// two — but composing them is the only correct way to ask the question, so the
+// composition is published rather than left to every caller.
+func (r *Range) Contains(key Key) bool {
+	return !r.BeforeStartKey(key) && !r.AfterEndKey(key)
+}
+
+// String renders the range the way Sharkbite's operator<< does, which is what
+// its __str__ and __repr__ return: "Range " then the start bound, a comma, and
+// the end bound, with a trailing space.
+//
+// An unbounded side is "(-inf" or "+inf) "; a bounded side is the key in
+// [Key.String] form, bracketed by "[" or "(" for the start and "]" or ")" for
+// the end according to inclusivity. Row bounds render as the first key of the
+// row, which is how Sharkbite's Range(std::string) constructor stores them
+// (Key(row) carries the maximum timestamp).
+func (r *Range) String() string {
+	if r == nil {
+		return "Range (-inf,+inf) "
+	}
+	var builder strings.Builder
+	builder.WriteString("Range ")
+	if start := r.boundKey(true); start == nil {
+		builder.WriteString("(-inf")
+	} else {
+		if r.startInclusive {
+			builder.WriteString("[")
+		} else {
+			builder.WriteString("(")
+		}
+		builder.WriteString(start.String())
+	}
+	builder.WriteString(",")
+	if end := r.boundKey(false); end == nil {
+		builder.WriteString("+inf) ")
+	} else {
+		builder.WriteString(end.String())
+		if r.endInclusive {
+			builder.WriteString("] ")
+		} else {
+			builder.WriteString(") ")
+		}
+	}
+	return builder.String()
+}
+
+// boundKey returns the declared bound as the key Sharkbite would hold: a
+// row-only bound becomes the first key of that row, and a key bound is
+// returned as it was given.
+func (r *Range) boundKey(start bool) *Key {
+	key, rowOnly := r.endKey, r.endRowOnly
+	if start {
+		key, rowOnly = r.startKey, r.startRowOnly
+	}
+	if key == nil {
+		return nil
+	}
+	if rowOnly {
+		return firstKeyOfRow(key.Row, false)
+	}
+	return cloneKey(key)
 }
 
 func (r *Range) routingRow() []byte {
