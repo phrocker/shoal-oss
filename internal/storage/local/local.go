@@ -56,11 +56,12 @@ func (b *Backend) Open(_ context.Context, path string) (storage.File, error) {
 // owner/group, and on Linux and Darwin we preserve extended attributes
 // (including xattr-backed ACLs such as Linux POSIX ACLs) when the platform
 // exposes them. On platforms without hard-link snapshots (Plan 9, js, wasip1),
-// replacement falls back to a best-effort rename-based sequence that restores
-// the old file on failure but cannot keep the target continuously visible. New
-// files use 0644 subject to the process umask. Parent directories are created
-// with 0755 if they don't already exist — matches "mkdir -p" behavior so
-// callers don't have to pre-create the path tree.
+// and on Unix filesystems that reject hard-link snapshots for same-directory
+// siblings, replacement falls back to a best-effort rename-based sequence that
+// restores the old file on failure but cannot keep the target continuously
+// visible. New files use 0644 subject to the process umask. Parent
+// directories are created with 0755 if they don't already exist — matches
+// "mkdir -p" behavior so callers don't have to pre-create the path tree.
 func (b *Backend) Create(_ context.Context, path string) (storage.Writer, error) {
 	if isReplacementArtifactName(filepath.Base(path)) {
 		return nil, fmt.Errorf("local: destination %s uses a reserved internal namespace", path)

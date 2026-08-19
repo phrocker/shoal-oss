@@ -420,17 +420,12 @@ func nextTemporaryStageName(name string) (string, error) {
 
 func temporaryStageNamePrefixFor(name string) (string, error) {
 	prefix := stageNameParentPrefix(name)
-	for prefix != "" && maxBlobNameChars-utf8.RuneCountInString(prefix) < tempStageComponentLen {
-		trimmed := strings.TrimSuffix(prefix, "/")
-		next := stageNameParentPrefix(trimmed)
-		if next == "" {
-			available := maxBlobNameChars - utf8.RuneCountInString(prefix)
-			return "", fmt.Errorf(
-				"blob prefix %q leaves %d characters for a temporary blob; need at least %d",
-				prefix, available, tempStageComponentLen,
-			)
-		}
-		prefix = next
+	if maxBlobNameChars-utf8.RuneCountInString(prefix) < tempStageComponentLen {
+		available := maxBlobNameChars - utf8.RuneCountInString(prefix)
+		return "", fmt.Errorf(
+			"blob prefix %q leaves %d characters for a temporary blob; need at least %d",
+			prefix, available, tempStageComponentLen,
+		)
 	}
 	return prefix, nil
 }

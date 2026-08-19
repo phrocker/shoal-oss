@@ -62,6 +62,7 @@ type fakeAzureWriteOperations struct {
 	promoteCalls          int
 	cleanupCanceled       bool
 	headFailures          int
+	headCalls             int
 	nextETag              int
 	lastPromoteSource     azureCopySource
 	lastPromoteWriteID    string
@@ -81,6 +82,7 @@ func azureNotFoundError() error {
 func (f *fakeAzureWriteOperations) head(
 	_ context.Context, _, name string,
 ) (azureObjectState, error) {
+	f.headCalls++
 	if f.headFailures > 0 {
 		f.headFailures--
 		return azureObjectState{}, context.DeadlineExceeded
@@ -481,7 +483,7 @@ func TestNextTemporaryStageNameKeepsFullRandomTokenAtMinimumSpace(t *testing.T) 
 	}
 }
 
-func TestNextTemporaryStageNameTrimsToDeepestAncestorPrefixWhenSpaceIsTight(t *testing.T) {
+func TestNextTemporaryStageNameRejectsDeepPrefixWithoutAncestorFallback(t *testing.T) {
 	original := randomStageNameToken
 	randomStageNameToken = func() (string, error) {
 		return strings.Repeat("c", tempStageRandomHexLen), nil
@@ -491,40 +493,30 @@ func TestNextTemporaryStageNameTrimsToDeepestAncestorPrefixWhenSpaceIsTight(t *t
 	})
 
 	name := strings.Repeat("a", 600) + "/" + strings.Repeat("b", 420) + "/x"
-	stageName, err := nextTemporaryStageName(name)
-	if err != nil {
-		t.Fatalf("nextTemporaryStageName: %v", err)
-	}
-	wantPrefix := strings.Repeat("a", 600) + "/"
-	if got := stageNameParentPrefix(stageName); got != wantPrefix {
-		t.Fatalf("stage prefix = %q, want deepest compatible prefix %q", got, wantPrefix)
-	}
-	if got := utf8.RuneCountInString(stageName) - utf8.RuneCountInString(wantPrefix); got != tempStageComponentLen {
-		t.Fatalf("stage component length = %d, want %d", got, tempStageComponentLen)
+	if _, err := nextTemporaryStageName(name); err == nil {
+		t.Fatal("nextTemporaryStageName succeeded by walking to an ancestor prefix")
 	}
 }
 
-func TestNextTemporaryStageNamePreservesFullEntropyWhenPrefixTrims(t *testing.T) {
-	original := randomStageNameToken
-	randomStageNameToken = func() (string, error) {
-		return strings.Repeat("d", tempStageRandomHexLen), nil
-	}
-	t.Cleanup(func() {
-		randomStageNameToken = original
-	})
+func TestBackendCreateRejectsImmediatePrefixOverflowBeforeMutation(t *testing.T) {
+	backend, ops := newCustomServiceBackend(t)
+	name := strings.Repeat("a", 600) + "/" + strings.Repeat("界", 399) + "/x"
 
-	nameA := strings.Repeat("a", 600) + "/" + strings.Repeat("b", 420) + "/x"
-	nameB := strings.Repeat("a", 600) + "/" + strings.Repeat("b", 420) + "/y"
-	stageA, err := nextTemporaryStageName(nameA)
-	if err != nil {
-		t.Fatalf("nextTemporaryStageName nameA: %v", err)
+	w, err := backend.Create(context.Background(), "az://container/"+name)
+	if err == nil {
+		if w != nil {
+			_ = w.(shstorage.Aborter).Abort()
+		}
+		t.Fatal("Create succeeded without room in the immediate destination prefix")
 	}
-	stageB, err := nextTemporaryStageName(nameB)
-	if err != nil {
-		t.Fatalf("nextTemporaryStageName nameB: %v", err)
+	if !strings.Contains(err.Error(), "leaves 23 characters for a temporary blob; need at least 25") {
+		t.Fatalf("Create error = %v, want deterministic immediate-prefix overflow", err)
 	}
-	if stageA == stageB {
-		t.Fatalf("trimmed temporary stage names collided: %q", stageA)
+	if ops.headCalls != 0 {
+		t.Fatalf("headCalls = %d, want 0 when Create fails before backend mutation", ops.headCalls)
+	}
+	if len(ops.objects) != 0 {
+		t.Fatalf("objects after failed Create = %d, want 0", len(ops.objects))
 	}
 }
 
