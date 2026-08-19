@@ -650,6 +650,26 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
                 validator.NOT_REQUIRED_STATUS: 392,
             },
         )
+        self.assertEqual(validator.EXPECTED_C_ABI_DECLARED_EXPORTS, 108)
+        self.assertEqual(validator.EXPECTED_C_ABI_REFERENCED_EXPORTS, 102)
+        self.assertEqual(
+            validator.EXPECTED_C_ABI_UNREFERENCED_EXPORTS,
+            (
+                "shoal_scanner_scan",
+                "shoal_batch_scanner_scan",
+                "shoal_mutation_delete",
+                "shoal_write_failure_get_constraint",
+                "shoal_write_failure_get_authorization",
+                "shoal_write_failure_get_cleanup",
+            ),
+        )
+
+    def test_collect_c_abi_symbol_inventory_matches_pinned_values(self) -> None:
+        exports, referenced, unreferenced = validator.collect_c_abi_symbol_inventory()
+        self.assertEqual(len(exports), validator.EXPECTED_C_ABI_DECLARED_EXPORTS)
+        self.assertEqual(len(referenced), validator.EXPECTED_C_ABI_REFERENCED_EXPORTS)
+        self.assertEqual(unreferenced, validator.EXPECTED_C_ABI_UNREFERENCED_EXPORTS)
+        self.assertIn("shoal_versioned_properties_get", referenced)
 
     def test_pinned_inventory_constants_reject_incoherent_edit(self) -> None:
         with mock.patch.object(validator, "EXPECTED_TOTAL_ROWS", 3202):
@@ -737,6 +757,19 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
         self.assert_validation_fails(
             lambda: validator.validate_counts(mutated.splitlines(), mutated),
             "status summary says 2419 rows for Missing Go, but parsed 2420",
+        )
+
+    def test_stale_c_abi_symbol_inventory_narrative_is_rejected(self) -> None:
+        text = load_document_text()
+        mutated = text.replace(
+            "applied to 108 declared exports in `capi/include/shoal.h`",
+            "applied to 44 declared exports in `capi/include/shoal.h`",
+            1,
+        )
+        self.assertNotEqual(mutated, text)
+        self.assert_validation_fails(
+            lambda: validator.validate_counts(mutated.splitlines(), mutated),
+            "missing or stale C ABI export-total narrative for SB-XCUT-013",
         )
 
     def test_revision_bump_requires_validator_constant_update(self) -> None:

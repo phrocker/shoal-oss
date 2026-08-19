@@ -184,8 +184,8 @@ EXPECTED_METADATA_FIELDS = {
     "Sharkbite release line": "`sharkbite` 1.2.0.3 on PyPI (`setup.py:34-35`)",
     "Shoal reference": (
         "`phrocker/shoal-oss` exact audited baseline for revision 18 "
-        "`ce9d36d814fcc7984a3aa009fe58246fcdb1588b` "
-        "(\"test(capi): exercise versioned property getter\")"
+        "`dc19413604a72a9303b61e380ea84cb5a0bcb405` "
+        "(\"test(capi): strengthen property getter coverage\")"
     ),
     "Shoal C ABI version": "`SHOAL_ABI_VERSION 1u` (`capi/include/shoal_types.h`)",
 }
@@ -218,6 +218,23 @@ GAP_COMPLETION_RULES: dict[str, str] = {
     "SB-GAP-C-002": "Missing C ABI",
     "SB-GAP-C-004": "Missing C ABI",
 }
+
+C_ABI_EXPORT_HEADER_PATH = Path("capi/include/shoal.h")
+C_ABI_REFERENCE_PATHS = (
+    Path("capi/tests/lifecycle.c"),
+    Path("capi/tests/shared_library_query.c"),
+    Path("capi/tests/header_cpp_test.cpp"),
+)
+EXPECTED_C_ABI_DECLARED_EXPORTS = 108
+EXPECTED_C_ABI_REFERENCED_EXPORTS = 102
+EXPECTED_C_ABI_UNREFERENCED_EXPORTS = (
+    "shoal_scanner_scan",
+    "shoal_batch_scanner_scan",
+    "shoal_mutation_delete",
+    "shoal_write_failure_get_constraint",
+    "shoal_write_failure_get_authorization",
+    "shoal_write_failure_get_cleanup",
+)
 
 CATEGORY_STATUS_COLUMNS = {
     "Covered": "Covered",
@@ -270,6 +287,10 @@ FILE_CITATION_SUFFIXES = {
     ".yaml",
     ".yml",
 }
+EXPORT_SYMBOL_RE = re.compile(
+    r"SHOAL_API\s+[^;]*?\b(?:SHOAL_CALL\s+)?(?P<name>shoal_[A-Za-z0-9_]+)\s*\(",
+    re.S,
+)
 FILE_CITATION_BASENAMES = {"ARCHITECTURE.md", "CMakeLists.txt", "Dockerfile", "Makefile", "README.md"}
 IDENTIFIER_BOUNDARY_CLASS = r"A-Za-z0-9_"
 IGNORED_ANCHOR_TOKENS = {
@@ -766,6 +787,84 @@ def validate_pinned_inventory_constants() -> None:
                 f"EXPECTED_STATUS_COUNTS pins {EXPECTED_STATUS_COUNTS[status]}"
             ),
         )
+    require(
+        len(EXPECTED_C_ABI_UNREFERENCED_EXPORTS)
+        == EXPECTED_C_ABI_DECLARED_EXPORTS - EXPECTED_C_ABI_REFERENCED_EXPORTS,
+        (
+            "pinned C ABI symbol counts drifted: "
+            f"{len(EXPECTED_C_ABI_UNREFERENCED_EXPORTS)} missing symbols vs "
+            f"{EXPECTED_C_ABI_DECLARED_EXPORTS} declared and {EXPECTED_C_ABI_REFERENCED_EXPORTS} referenced"
+        ),
+    )
+
+
+def collect_c_abi_symbol_inventory(
+    repo_root: Path | None = None,
+) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+    root = repo_root or DOC_PATH.parent.parent
+    exports = tuple(
+        match.group("name")
+        for match in EXPORT_SYMBOL_RE.finditer(
+            (root / C_ABI_EXPORT_HEADER_PATH).read_text(encoding="utf-8")
+        )
+    )
+    require(exports, f"no SHOAL_API exports found in {C_ABI_EXPORT_HEADER_PATH}")
+    require(
+        len(exports) == len(set(exports)),
+        f"duplicate SHOAL_API export declarations found in {C_ABI_EXPORT_HEADER_PATH}",
+    )
+    combined_reference_text = "\n".join(
+        (root / path).read_text(encoding="utf-8") for path in C_ABI_REFERENCE_PATHS
+    )
+    referenced = tuple(
+        symbol
+        for symbol in exports
+        if re.search(rf"\b{re.escape(symbol)}\b", combined_reference_text) is not None
+    )
+    unreferenced = tuple(symbol for symbol in exports if symbol not in referenced)
+    return exports, referenced, unreferenced
+
+
+def validate_c_abi_symbol_inventory(full_text: str, repo_root: Path | None = None) -> None:
+    exports, referenced, unreferenced = collect_c_abi_symbol_inventory(repo_root)
+    require(
+        len(exports) == EXPECTED_C_ABI_DECLARED_EXPORTS,
+        (
+            f"expected {EXPECTED_C_ABI_DECLARED_EXPORTS} SHOAL_API exports in "
+            f"{C_ABI_EXPORT_HEADER_PATH}, found {len(exports)}"
+        ),
+    )
+    require(
+        len(referenced) == EXPECTED_C_ABI_REFERENCED_EXPORTS,
+        (
+            f"expected {EXPECTED_C_ABI_REFERENCED_EXPORTS} C/C++ test-referenced exports, "
+            f"found {len(referenced)}"
+        ),
+    )
+    require(
+        unreferenced == EXPECTED_C_ABI_UNREFERENCED_EXPORTS,
+        (
+            "stale unreferenced C ABI export inventory: "
+            f"expected {EXPECTED_C_ABI_UNREFERENCED_EXPORTS}, found {unreferenced}"
+        ),
+    )
+    normalized = normalize_whitespace(full_text)
+    require(
+        (
+            f"applied to {len(exports)} declared exports in `{C_ABI_EXPORT_HEADER_PATH.as_posix()}`"
+            in normalized
+        ),
+        "missing or stale C ABI export-total narrative for SB-XCUT-013",
+    )
+    require(
+        f"reference **{len(referenced)} of the {len(exports)}** exports" in normalized,
+        "missing or stale C ABI export-reference narrative for SB-XCUT-013",
+    )
+    missing_list = ", ".join(f"`{symbol}`" for symbol in unreferenced)
+    require(
+        missing_list in normalized,
+        "missing or stale C ABI unreferenced-export list for SB-XCUT-013",
+    )
 
 
 def moved_row_diagnostics(
@@ -1063,6 +1162,7 @@ def validate_counts(lines: list[str], full_text: str) -> None:
         )
 
     validate_status_narratives(full_text, status_counts, prefix_counts)
+    validate_c_abi_symbol_inventory(full_text)
 
 
 def validate_status_narratives(
