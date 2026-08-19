@@ -457,3 +457,100 @@ func TestRejoinIntoARecreatedLockDirectoryNeedsAFreshHost(t *testing.T) {
 		t.Fatalf("a fresh host refused %s: %v", thirdID, err)
 	}
 }
+
+// TestRejoiningARecreatedDirectoryUnderTheSameUUIDRemintsTheDeadGeneration is
+// why the recovery is a fresh identity and not only a fresh host.
+//
+// A recreated directory hands out sequences from zero again, so a process that
+// rejoins under the UUID it used before is handed back the identity it already
+// had. The fence is LockID equality, and the two are equal, so a manager
+// request stamped with the generation that died is accepted by the generation
+// that replaced it. That is not the fence failing — it is the identity being
+// reused, which is the thing Participate's documentation forbids.
+func TestRejoiningARecreatedDirectoryUnderTheSameUUIDRemintsTheDeadGeneration(t *testing.T) {
+	f := newFakeZK()
+	f.seed(testLockPath(), nil, false)
+
+	first := newTestLock(t, f, serverUUID)
+	deadID, err := first.Acquire(context.Background(), testLockData(t))
+	if err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	if err := first.Release(); err != nil {
+		t.Fatalf("Release: %v", err)
+	}
+
+	f.recreate(testLockPath())
+
+	second := newTestLock(t, f, serverUUID)
+	liveID, err := second.Acquire(context.Background(), testLockData(t))
+	if err != nil {
+		t.Fatalf("Acquire after the recreation: %v", err)
+	}
+	if !liveID.Equal(deadID) {
+		t.Fatalf("rejoined as %s after holding %s: the collision this test is about did not happen",
+			liveID, deadID)
+	}
+
+	rejoined := NewHost()
+	if err := rejoined.AdoptLock(liveID); err != nil {
+		t.Fatalf("AdoptLock: %v", err)
+	}
+	if err := rejoined.ObserveManagerLock(managerLock(1)); err != nil {
+		t.Fatalf("ObserveManagerLock: %v", err)
+	}
+	stale := Fence{Server: deadID, Manager: managerLock(1)}
+	if _, err := rejoined.Assign(stale, Extent{TableID: "2", EndRow: []byte("m")}); err != nil {
+		t.Fatalf("Assign stamped with the dead generation = %v, want it accepted: "+
+			"an identity that was reused cannot be fenced, which is the whole point", err)
+	}
+}
+
+// TestRejoiningARecreatedDirectoryUnderAFreshUUIDFencesTheDeadGeneration is
+// the documented recovery, and the reason for it. A new UUID makes the dead
+// generation nameable, so a delayed request stamped with it is refused while
+// the live generation is served.
+func TestRejoiningARecreatedDirectoryUnderAFreshUUIDFencesTheDeadGeneration(t *testing.T) {
+	f := newFakeZK()
+	f.seed(testLockPath(), nil, false)
+
+	first := newTestLock(t, f, serverUUID)
+	deadID, err := first.Acquire(context.Background(), testLockData(t))
+	if err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	if err := first.Release(); err != nil {
+		t.Fatalf("Release: %v", err)
+	}
+
+	f.recreate(testLockPath())
+
+	second := newTestLock(t, f, otherUUID)
+	liveID, err := second.Acquire(context.Background(), testLockDataFor(t, otherUUID))
+	if err != nil {
+		t.Fatalf("Acquire after the recreation: %v", err)
+	}
+	if liveID.Equal(deadID) {
+		t.Fatalf("rejoined as %s, the identity it had already used", liveID)
+	}
+	if liveID.Sequence != deadID.Sequence {
+		t.Fatalf("the recreated directory numbered %s, not %d: the sequence is meant to collide here",
+			liveID, deadID.Sequence)
+	}
+
+	rejoined := NewHost()
+	if err := rejoined.AdoptLock(liveID); err != nil {
+		t.Fatalf("AdoptLock: %v", err)
+	}
+	if err := rejoined.ObserveManagerLock(managerLock(1)); err != nil {
+		t.Fatalf("ObserveManagerLock: %v", err)
+	}
+	extent := Extent{TableID: "2", EndRow: []byte("m")}
+	stale := Fence{Server: deadID, Manager: managerLock(1)}
+	if _, err := rejoined.Assign(stale, extent); !errors.Is(err, ErrStaleServerLock) {
+		t.Fatalf("Assign stamped with the dead generation = %v, want ErrStaleServerLock", err)
+	}
+	if _, err := rejoined.Assign(Fence{Server: liveID, Manager: managerLock(1)}, extent); err != nil {
+		t.Fatalf("Assign under the live generation: %v", err)
+	}
+}

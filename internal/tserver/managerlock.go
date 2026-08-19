@@ -49,10 +49,21 @@ type ManagerLockReader interface {
 // ReadManagerLock returns the identity of the manager that currently holds the
 // manager ServiceLock.
 //
-// The holder is the lowest-sequence node in the lock directory, which is the
-// same rule Accumulo applies and the same one internal/zk applies when it
-// resolves the manager's address. Queued candidates — the standby managers
-// waiting to take over — are not authority and are ignored.
+// The holder is the lowest-sequence node in the lock directory, the rule
+// Accumulo applies in ServiceLock.validateAndSort. Queued candidates — the
+// standby managers waiting to take over — are not authority and are ignored.
+//
+// A node counts here only when its UUID is the canonical 36-character form,
+// which is what Java's UUID.fromString takes and therefore what Accumulo ever
+// writes. internal/zk, which resolves the manager's Thrift address from this
+// same directory, is looser: it counts any spelling uuid.Parse accepts, the
+// undashed and URN forms among them. On a directory Accumulo wrote the two
+// always agree. On one holding a node in a spelling only internal/zk counts,
+// numbered below the real holder, they would not — this side would observe the
+// manager Accumulo calls the holder while internal/zk resolved an address that
+// is not one. Following Accumulo is the right side of that divergence, but the
+// two readers should share one parser, and that is a change to internal/zk
+// rather than a second opinion here.
 //
 // Returns ErrNoManagerLock when the directory is missing or holds no valid
 // lock node.

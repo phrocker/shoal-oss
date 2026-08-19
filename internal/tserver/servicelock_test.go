@@ -2009,3 +2009,89 @@ func TestReleaseRecordsItsEndingBeforeTheNodeGoes(t *testing.T) {
 		t.Fatalf("watcher saw %v: a release was remembered as an external loss", watcher)
 	}
 }
+
+// TestMaintainReusesTheWatchACancelledOneLeftBehind covers the restart the
+// contract invites. Cancelling Maintain leaves the lock held, so a caller is
+// expected to watch again — and a ZooKeeper watch stays registered until it
+// fires, so arming a fresh one per call would leave the cancelled call's
+// registration behind every time, which is the accumulation the one-watch
+// invariant exists to prevent.
+func TestMaintainReusesTheWatchACancelledOneLeftBehind(t *testing.T) {
+	f := newFakeZK()
+	lock := newTestLock(t, f, serverUUID)
+	if _, err := lock.Acquire(context.Background(), testLockData(t)); err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	nodePath := lockNodePath(serverUUID, 0)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	stopped := make(chan error, 1)
+	go func() { stopped <- lock.Maintain(ctx) }()
+	waitArmed(t, f, nodePath)
+	cancel()
+	if err := <-stopped; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Maintain: want context.Canceled, got %v", err)
+	}
+	if got := f.watchCount(nodePath); got != 1 {
+		t.Fatalf("%d watches outstanding after cancellation, want the one that was armed", got)
+	}
+	if _, held := lock.LockID(); !held {
+		t.Fatal("cancelling the watch must not give the lock up")
+	}
+
+	var rearmed atomic.Bool
+	f.beforeExists = func(znodePath string) {
+		if znodePath == nodePath {
+			rearmed.Store(true)
+		}
+	}
+
+	resumed := make(chan error, 1)
+	go func() { resumed <- lock.Maintain(context.Background()) }()
+	if err := f.Delete(nodePath, -1); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if err := <-resumed; !errors.Is(err, ErrLockLost) {
+		t.Fatalf("Maintain after the node went: want ErrLockLost, got %v", err)
+	}
+	if rearmed.Load() {
+		t.Fatal("the resumed watcher armed a second watch instead of reusing the one it left behind")
+	}
+}
+
+// TestConcurrentMaintainersAllReturnWhenTheGenerationEnds is the other half of
+// sharing one watch: the event that ends a generation can be received by only
+// one watcher, so the others have to learn of the ending some other way. They
+// are told, and they agree on how it ended.
+func TestConcurrentMaintainersAllReturnWhenTheGenerationEnds(t *testing.T) {
+	f := newFakeZK()
+	lock := newTestLock(t, f, serverUUID)
+	if _, err := lock.Acquire(context.Background(), testLockData(t)); err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	nodePath := lockNodePath(serverUUID, 0)
+
+	const watchers = 4
+	ended := make(chan error, watchers)
+	for i := 0; i < watchers; i++ {
+		go func() { ended <- lock.Maintain(context.Background()) }()
+	}
+	waitFor(t, "every watcher to be watching", func() bool { return f.watchCount(nodePath) >= 1 })
+	if err := f.Delete(nodePath, -1); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	for i := 0; i < watchers; i++ {
+		select {
+		case err := <-ended:
+			if !errors.Is(err, ErrLockLost) {
+				t.Fatalf("watcher %d: want ErrLockLost, got %v", i, err)
+			}
+			if !strings.Contains(err.Error(), LossNodeDeleted.String()) {
+				t.Fatalf("watcher %d saw %v, want the %s ending every watcher must agree on",
+					i, err, LossNodeDeleted)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatalf("watcher %d never returned after the generation ended", i)
+		}
+	}
+}

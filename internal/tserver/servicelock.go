@@ -303,6 +303,22 @@ type ServiceLock struct {
 	// report success, and be followed by a create it never saw, leaving a
 	// node in the queue that the caller was told did not exist.
 	createMu sync.Mutex
+
+	// watchMu serializes arming the existence watch and guards watch, which
+	// is the one registration outstanding on this generation's node.
+	//
+	// It lives here rather than inside Maintain because a cancelled Maintain
+	// leaves the lock held and invites the caller to watch again: a watch
+	// stays registered until it fires, so arming per call would accumulate
+	// one per restart exactly as arming per pass accumulated one per verify
+	// interval. Concurrent callers share it for the same reason.
+	watchMu sync.Mutex
+	watch   <-chan gozk.Event
+
+	// done is closed when the generation ends. The event that ends it can be
+	// received by only one watcher, so this is how the others find out.
+	done     chan struct{}
+	doneOnce sync.Once
 }
 
 // NewServiceLock returns a lock participant for one generation.
@@ -339,6 +355,7 @@ func NewServiceLock(conn LockConn, opts ServiceLockOptions) (*ServiceLock, error
 		acl:            append([]gozk.ACL(nil), acl...),
 		verifyInterval: opts.VerifyInterval,
 		release:        make(chan struct{}),
+		done:           make(chan struct{}),
 	}, nil
 }
 
@@ -646,6 +663,12 @@ func (l *ServiceLock) acquired(node string) (LockID, error) {
 // the client — the lock is treated as lost, because a lock this process cannot
 // monitor is one it cannot prove it still holds, and the manager is free to
 // place those tablets elsewhere the moment the session ends.
+//
+// The watch belongs to the lock, not to the call. A Maintain that returns on
+// cancellation leaves its registration in place and a later one reuses it, so
+// a caller that stops and resumes watching does not leave a registration
+// behind each time it stops. Watchers that are not the one to receive the
+// event that ends the generation still return when it ends.
 func (l *ServiceLock) Maintain(ctx context.Context) error {
 	l.mu.Lock()
 	held, node := l.held, l.node
@@ -661,26 +684,13 @@ func (l *ServiceLock) Maintain(ctx context.Context) error {
 		defer ticker.Stop()
 		ticks = ticker.C
 	}
-	// One watch is outstanding at a time. A ZooKeeper watch is one-shot but
-	// stays registered on both client and server until it fires, so arming a
-	// new one on every pass would leave the old one behind: on a healthy
-	// cluster the verify timer alone would accumulate a registration per
-	// interval for the life of the lock, and they would all fire at once the
-	// moment the node finally changed.
-	var events <-chan gozk.Event
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if events == nil {
-			exists, _, armed, err := l.conn.ExistsW(nodePath)
-			if err != nil {
-				return l.lose(LossUnmonitorable, fmt.Errorf("watch %s: %w", nodePath, err))
-			}
-			if !exists {
-				return l.lose(LossNodeDeleted, nil)
-			}
-			events = armed
+		events, err := l.armWatch(nodePath)
+		if err != nil {
+			return err
 		}
 		select {
 		case <-ctx.Done():
@@ -693,6 +703,11 @@ func (l *ServiceLock) Maintain(ctx context.Context) error {
 			// interval configured there is nothing else in this select to
 			// wake it, and it would watch a released lock until ctx ended.
 			return l.lose(LossReleased, nil)
+		case <-l.done:
+			// The generation ended somewhere else — another watcher, a
+			// verification, a release. Report the ending that was recorded
+			// rather than waiting for an event that has already been taken.
+			return l.ended()
 		case <-ticks:
 			// The watch armed above is still live and still the only one, so
 			// it is left in place. Verify re-reads the directory itself, which
@@ -703,11 +718,50 @@ func (l *ServiceLock) Maintain(ctx context.Context) error {
 		case event := <-events:
 			// The watch fired, so it is spent. Dropping it re-arms on the next
 			// pass, which re-checks that the node is still there.
-			events = nil
+			l.spendWatch(events)
 			if err := l.classifyEvent(event); err != nil {
 				return err
 			}
 		}
+	}
+}
+
+// armWatch returns the existence watch on this generation's node, arming one
+// only when there is none outstanding.
+//
+// A ZooKeeper watch is one-shot but stays registered on both client and server
+// until it fires, so arming a new one whenever a watcher happened to want one
+// would leave the old one behind: on a healthy cluster the verify timer alone
+// would accumulate a registration per interval for the life of the lock, and
+// they would all fire at once the moment the node finally changed.
+//
+// A node that is already gone, or a watch that cannot be established, ends the
+// generation: a lock this process cannot monitor is one it cannot prove it
+// still holds.
+func (l *ServiceLock) armWatch(nodePath string) (<-chan gozk.Event, error) {
+	l.watchMu.Lock()
+	defer l.watchMu.Unlock()
+	if l.watch != nil {
+		return l.watch, nil
+	}
+	exists, _, armed, err := l.conn.ExistsW(nodePath)
+	if err != nil {
+		return nil, l.lose(LossUnmonitorable, fmt.Errorf("watch %s: %w", nodePath, err))
+	}
+	if !exists {
+		return nil, l.lose(LossNodeDeleted, nil)
+	}
+	l.watch = armed
+	return armed, nil
+}
+
+// spendWatch drops a watch that has fired, so the next pass arms another. A
+// watch armed since is left alone: it is the outstanding one now.
+func (l *ServiceLock) spendWatch(spent <-chan gozk.Event) {
+	l.watchMu.Lock()
+	defer l.watchMu.Unlock()
+	if l.watch == spent {
+		l.watch = nil
 	}
 }
 
@@ -811,12 +865,21 @@ func (l *ServiceLock) lose(reason LossReason, cause error) error {
 		l.reason = reason
 	}
 	id := l.id
+	// Closed under the lock, so a watcher that sees it closed and then reads
+	// the ending sees the one recorded just above rather than a generation
+	// that still looks held.
+	l.doneOnce.Do(func() { close(l.done) })
 	l.mu.Unlock()
 	if cause != nil {
 		return fmt.Errorf("%w: %s (%s): %w", ErrLockLost, id, reason, cause)
 	}
 	return fmt.Errorf("%w: %s (%s)", ErrLockLost, id, reason)
 }
+
+// ended returns the ending already recorded for this generation. lose reports
+// the first ending recorded, so asking it again names that one rather than
+// inventing another.
+func (l *ServiceLock) ended() error { return l.lose(LossNone, nil) }
 
 // ensureLockDirectory creates the lock directory and every missing ancestor.
 func (l *ServiceLock) ensureLockDirectory() error {

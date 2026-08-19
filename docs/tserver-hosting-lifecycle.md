@@ -373,6 +373,21 @@ consumed. Arming per pass would make a healthy tablet server accumulate
 a registration per verify interval for the life of its lock, and deliver
 all of them at once when the node finally changed.
 
+The outstanding watch belongs to the lock, not to the call that armed
+it. `Maintain` takes the caller's context and cancelling it does not
+release the lock, so a watch scoped to the call would be left registered
+with nobody to consume it and the next `Maintain` would arm another — a
+supervisor that restarts its watcher accumulates one registration per
+restart, which is the same leak as arming per pass. Concurrent watchers
+share the one registration for the same reason.
+
+Sharing a watch means only one watcher receives the event, so the ending
+is broadcast as well: whoever observes it records it and closes a channel
+every `Maintain` is selecting on, and they all return the recorded
+ending rather than whatever woke them. Without that the watchers that did
+not receive the event would go on watching a generation that had already
+ended.
+
 The same holds while queued. The watch on this process's own node — the
 one that says the turn will never come — is armed once and kept across
 passes, so climbing a long queue does not leave a registration behind at
@@ -434,15 +449,33 @@ indistinguishable from a replay of a lock it no longer holds. The
 high-water mark is per-host state, so recovery is a fresh `Host`, not a
 retry; retrying against the same one fails identically every time.
 
+Recovery from a recreated directory needs a fresh lock UUID as well. A
+generation is the UUID and the sequence together, so rejoining under the
+process's old UUID against a restarted counter remints the *same*
+generation the dead one had. A fresh `Host` has no history to refuse it,
+and it will also accept a request that was fenced with the dead
+generation and is still in flight — the fence would be satisfied by
+something that is no longer true. Leaving `ServiceLockOptions.UUID`
+empty mints a new one, which makes the two generations distinguishable;
+the descriptors follow it without any extra care, because `Acquire`
+refuses descriptors that name a server other than the lock's own UUID.
+
 ### Reading the manager's lock
 
 `Host` refuses every manager-directed transition until it has been told
 which manager is live, and [§2](#2-the-manager-is-the-only-authority) is
 why: authority is read from ZooKeeper, never inferred from the requests
 that arrive. `WatchManagerLock` supplies it by reading the manager's own
-ServiceLock directory and taking the lowest node — the same rule
-`internal/zk` applies to resolve the manager's address, so the standby
-managers queued behind it are not mistaken for authority.
+ServiceLock directory and taking the lowest node, so the standby managers
+queued behind it are not mistaken for authority. That is the selection
+rule `internal/zk` uses to resolve the manager's address, but the two do
+not agree on which node names are legal: this parser requires the
+canonical 36-character UUID, matching `UUID.fromString`, while
+`internal/zk` accepts whatever `uuid.Parse` takes, including the undashed
+and URN spellings Accumulo rejects. Only a writer other than Accumulo
+could produce such a name, and the two would then disagree about who
+holds the lock; the fix belongs in `internal/zk`, which is the lenient
+one.
 
 Two failures that look alike are kept apart. A directory that cannot be
 read leaves the previous observation in place, because failing to reach

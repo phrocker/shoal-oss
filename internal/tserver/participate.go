@@ -48,10 +48,23 @@ import (
 // zero again. It is the same case ServiceLock.Verify reports as
 // LossSuperseded, seen from the other side — a rejoin into a recreated
 // directory can be handed a sequence the host has already used, and AdoptLock
-// refuses it with ErrLockNotNewer. Recovering means building a fresh Host: the
-// high-water mark it compares against is per-host state, so only a host that
-// has used nothing can accept a generation numbered below the one it lost. A
-// caller that rebuilds the lock without rebuilding the host has to read
+// refuses it with ErrLockNotNewer.
+//
+// Recovering means a fresh Host and a fresh lock identity, and the second is
+// the one that is easy to miss. The high-water mark AdoptLock compares against
+// is per-host state, so only a host that has used nothing can accept a
+// generation numbered below the one it lost — but a host that has used nothing
+// also has nothing left to tell two generations apart with. A process that
+// rejoins under the same UUID after the counter restarted is handed back the
+// identity it already had: LockID is the UUID and the sequence, both match,
+// and a manager request stamped with the generation that died is then
+// indistinguishable from one stamped with the generation that is live. Minting
+// a new UUID makes the dead generation nameable and therefore refusable —
+// NewServiceLock mints one whenever ServiceLockOptions.UUID is left empty, and
+// because every descriptor has to carry the lock's UUID the advertisement is
+// necessarily replaced along with it.
+//
+// A caller that rebuilds the lock without rebuilding the host has to read
 // ErrLockNotNewer as that instruction rather than as a transient failure to
 // retry, because retrying against the same host will refuse it every time.
 //
