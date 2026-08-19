@@ -175,6 +175,60 @@ func TestReadAll_CanceledDuringOpenDoesNotReturnEmptySuccess(t *testing.T) {
 	}
 }
 
+func TestHelpersJoinCancellationWithOpenAndCreateErrors(t *testing.T) {
+	callErr := errors.New("backend call failed")
+
+	t.Run("readall open", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		backend := openFuncBackend(func(context.Context, string) (storage.File, error) {
+			cancel()
+			return nil, callErr
+		})
+		_, err := storage.ReadAll(ctx, backend, "/src")
+		if !errors.Is(err, context.Canceled) || !errors.Is(err, callErr) {
+			t.Fatalf("ReadAll error = %v, want joined cancellation and backend error", err)
+		}
+	})
+
+	t.Run("copy open", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		src := openFuncBackend(func(context.Context, string) (storage.File, error) {
+			cancel()
+			return nil, callErr
+		})
+		_, err := storage.Copy(ctx, src, "/src", writerBackend{writer: &recordingAbortWriter{}}, "/dst")
+		if !errors.Is(err, context.Canceled) || !errors.Is(err, callErr) {
+			t.Fatalf("Copy open error = %v, want joined cancellation and backend error", err)
+		}
+	})
+
+	t.Run("copy create", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		src := memory.New()
+		src.Put("/src", []byte("data"))
+		dst := createFuncBackend(func(context.Context, string) (storage.Writer, error) {
+			cancel()
+			return nil, callErr
+		})
+		_, err := storage.Copy(ctx, src, "/src", dst, "/dst")
+		if !errors.Is(err, context.Canceled) || !errors.Is(err, callErr) {
+			t.Fatalf("Copy create error = %v, want joined cancellation and backend error", err)
+		}
+	})
+
+	t.Run("writeall create", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		backend := createFuncBackend(func(context.Context, string) (storage.Writer, error) {
+			cancel()
+			return nil, callErr
+		})
+		err := storage.WriteAll(ctx, backend, "/dst", []byte("data"))
+		if !errors.Is(err, context.Canceled) || !errors.Is(err, callErr) {
+			t.Fatalf("WriteAll error = %v, want joined cancellation and backend error", err)
+		}
+	})
+}
+
 func TestReadAll_CanceledReadJoinsBackendError(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	readErr := errors.New("read failed")
@@ -482,6 +536,16 @@ func (b fileBackend) Open(context.Context, string) (storage.File, error) {
 type openFuncBackend func(context.Context, string) (storage.File, error)
 
 func (f openFuncBackend) Open(ctx context.Context, path string) (storage.File, error) {
+	return f(ctx, path)
+}
+
+type createFuncBackend func(context.Context, string) (storage.Writer, error)
+
+func (f createFuncBackend) Open(context.Context, string) (storage.File, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (f createFuncBackend) Create(ctx context.Context, path string) (storage.Writer, error) {
 	return f(ctx, path)
 }
 
