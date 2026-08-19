@@ -275,8 +275,12 @@ type Plan struct {
 	// Kind is SYSTEM (the coordinator's own planning) or USER (a
 	// client-requested compaction driven by a FATE transaction).
 	Kind tabletserver.TCompactionKind
-	// FateID renders job.fateId ("<INSTANCE_TYPE>:<uuid>") for USER
-	// compactions; empty for SYSTEM jobs that carry none.
+	// FateID renders job.fateId in FateId's canonical form,
+	// "FATE:<INSTANCE_TYPE>:<uuid>", for USER compactions; empty for
+	// SYSTEM jobs that carry none. The canonical spelling is what
+	// FateId.from(String) round-trips and what Accumulo's own logs and
+	// fate admin commands show, so an operator can grep one string
+	// across both systems.
 	FateID string
 	// Inputs are the files to merge, in the coordinator's order.
 	Inputs []InputFile
@@ -575,9 +579,16 @@ func translateKind(job *tabletserver.TExternalCompactionJob) (tabletserver.TComp
 	return kind, fateID, nil
 }
 
+// fateIDString renders FateId's canonical form. FateId.from builds it as
+// PREFIX + type + ":" + txUUID with PREFIX = "FATE:", and isFateId
+// requires that prefix, so dropping it would produce a string that
+// names the right transaction but cannot be fed back to Accumulo.
 func fateIDString(fate *manager.TFateId) string {
-	return fate.GetType().String() + ":" + fate.GetTxUUIDStr()
+	return fatePrefix + fate.GetType().String() + ":" + fate.GetTxUUIDStr()
 }
+
+// fatePrefix is FateId.PREFIX.
+const fatePrefix = "FATE:"
 
 // isCanonicalUUID mirrors UuidUtil.isUUID, the check FateId.fromThrift
 // applies to a transaction id: exactly 36 characters, '-' at offsets 8,
@@ -808,6 +819,13 @@ func tmpSuffix(ecid string) string { return "_tmp_" + ecid }
 // The alias check runs first because it is the failure that destroys
 // data rather than merely wasting it: an output that is also an input
 // would truncate that input mid-read.
+//
+// The alias is checked against both names the file will have. Shoal
+// writes the temp name, but the manager renames it to
+// computeCompactionFileDest(out) at commit, so an output whose
+// committed name collides with an input would have the manager
+// overwrite a file this compaction is supposed to be replacing —
+// after shoal has already reported success.
 func parseOutput(job *tabletserver.TExternalCompactionJob, inputs []parsedInput, ecid string) (string, error) {
 	out := job.GetOutputFile()
 	if out == "" {
@@ -817,10 +835,15 @@ func parseOutput(job *tabletserver.TExternalCompactionJob, inputs []parsedInput,
 		return "", refuse(ClassMalformedJob, "outputFile",
 			"expected a plain path, got a StoredTabletFile entry: %s", out)
 	}
+	committed, hasTmp := committedName(out)
 	for i, in := range inputs {
 		if in.file.Path == out {
 			return "", refuse(ClassMalformedJob, "outputFile",
 				"output %s is also files[%d]", out, i)
+		}
+		if hasTmp && in.file.Path == committed {
+			return "", refuse(ClassMalformedJob, "outputFile",
+				"output %s commits as %s, which is also files[%d]", out, committed, i)
 		}
 	}
 	if !strings.HasSuffix(out, tmpSuffix(ecid)) {
@@ -829,6 +852,20 @@ func parseOutput(job *tabletserver.TExternalCompactionJob, inputs []parsedInput,
 			out, tmpSuffix(ecid))
 	}
 	return out, nil
+}
+
+// committedName reproduces TabletNameGenerator.computeCompactionFileDest:
+// the manager truncates the temp name at the *first* "_tmp", not at the
+// trailing "_tmp_<ecid>", so a base that itself contains "_tmp" commits
+// somewhere shorter than trimming the suffix would suggest. ok is false
+// when there is no "_tmp" at a positive index, the case the manager
+// rejects outright.
+func committedName(out string) (name string, ok bool) {
+	idx := strings.Index(out, "_tmp")
+	if idx <= 0 {
+		return "", false
+	}
+	return out[:idx], true
 }
 
 // checkOutputCapability gates the file format shoal is being asked to
@@ -890,7 +927,6 @@ var cryptoOverridePrefixes = []string{
 var accumuloCodecs = map[string]string{
 	"none":   block.CodecNone,
 	"gz":     block.CodecGzip,
-	"gzip":   block.CodecGzip,
 	"snappy": block.CodecSnappy,
 }
 
@@ -955,10 +991,15 @@ func resolveOutputEncoding(
 		}
 		switch {
 		case key == propCompressType:
-			mapped, ok := accumuloCodecs[strings.ToLower(strings.TrimSpace(value))]
+			// Verbatim: Compression.getCompressionAlgorithmByName is a
+			// plain map lookup keyed by each algorithm's getName(), so
+			// "GZ" and " gz " are as unusable to Java as "zstd" is to
+			// shoal, and accepting them here would run a compaction the
+			// tablet server would have refused.
+			mapped, ok := accumuloCodecs[value]
 			if !ok {
 				return "", 0, refuse(ClassUnsupportedProperty, field,
-					"unsupported compression codec %q (shoal writes none, gz or snappy)", value)
+					"unsupported compression codec %q (shoal writes %s)", value, supportedCodecList())
 			}
 			codec = mapped
 		case key == propCompressBlockSize:
@@ -1017,11 +1058,17 @@ func isCryptoOverride(key string) bool {
 	return false
 }
 
-// parseMemoryBytes mirrors Java's ConfigurationTypeHelper.getMemoryAsBytes:
-// an optional B/K/M/G suffix (case-insensitive) scales a decimal value by
-// 2^0/2^10/2^20/2^30; no suffix means bytes.
+// parseMemoryBytes mirrors Java's
+// ConfigurationTypeHelper.getFixedMemoryAsBytes: an optional B/K/M/G
+// suffix (case-insensitive, via Character.toUpperCase) scales a decimal
+// value by 2^0/2^10/2^20/2^30; no suffix means bytes.
+//
+// The value is parsed verbatim. Java reads the last character of the
+// raw string and hands the rest to Long.parseLong, which rejects
+// surrounding whitespace, so trimming here would make " 128K" a
+// property shoal honors and the tablet server does not.
 func parseMemoryBytes(raw string) (int64, error) {
-	s := strings.TrimSpace(raw)
+	s := raw
 	if s == "" {
 		return 0, errors.New("empty memory value")
 	}
@@ -1040,7 +1087,7 @@ func parseMemoryBytes(raw string) (int64, error) {
 		shift = 30
 		s = s[:len(s)-1]
 	}
-	n, err := strconv.ParseInt(strings.TrimSpace(s), 10, 64)
+	n, err := strconv.ParseInt(s, 10, 64)
 	if err != nil {
 		return 0, fmt.Errorf("%q is not a memory size: %w", raw, err)
 	}

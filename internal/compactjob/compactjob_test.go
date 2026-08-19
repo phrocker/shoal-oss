@@ -172,7 +172,7 @@ func TestTranslateMapsEveryJobField(t *testing.T) {
 	if plan.Kind != tabletserver.TCompactionKind_USER {
 		t.Errorf("Kind = %v, want USER", plan.Kind)
 	}
-	if want := "USER:b7f1c0de-0000-4000-8000-00000000abcd"; plan.FateID != want {
+	if want := "FATE:USER:b7f1c0de-0000-4000-8000-00000000abcd"; plan.FateID != want {
 		t.Errorf("FateID = %q, want %q", plan.FateID, want)
 	}
 	if plan.OutputFile != job.OutputFile {
@@ -640,7 +640,8 @@ func TestTranslateRefusesNilJob(t *testing.T) {
 
 // TestTranslateAcceptsBothFateInstanceTypes pins the enum arms Java
 // accepts: FateId.fromThrift maps USER and META, and the plan records
-// the same "TYPE:uuid" pairing FateId's canonical form uses.
+// FateId's canonical "FATE:TYPE:uuid" form, the spelling
+// FateId.from(String) round-trips.
 func TestTranslateAcceptsBothFateInstanceTypes(t *testing.T) {
 	const txUUID = "b7f1c0de-0000-4000-8000-00000000abcd"
 	for _, tt := range []struct {
@@ -648,8 +649,8 @@ func TestTranslateAcceptsBothFateInstanceTypes(t *testing.T) {
 		typ  manager.TFateInstanceType
 		want string
 	}{
-		{"user", manager.TFateInstanceType_USER, "USER:" + txUUID},
-		{"meta", manager.TFateInstanceType_META, "META:" + txUUID},
+		{"user", manager.TFateInstanceType_USER, "FATE:USER:" + txUUID},
+		{"meta", manager.TFateInstanceType_META, "FATE:META:" + txUUID},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			job := validJob()
@@ -662,6 +663,52 @@ func TestTranslateAcceptsBothFateInstanceTypes(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestTranslateRefusesOutputThatCommitsOverAnInput closes the alias gate
+// on the name the file actually ends up with. Shoal writes the temp
+// name, but the manager renames it with computeCompactionFileDest,
+// which truncates at the *first* "_tmp". An output whose committed name
+// is one of the inputs therefore differs from every input while shoal
+// looks at it, and destroys one of them at commit — after shoal has
+// already reported the compaction done.
+func TestTranslateRefusesOutputThatCommitsOverAnInput(t *testing.T) {
+	const input = "hdfs://nn/accumulo/tables/2/t-0001/F0001.rf"
+	for _, tt := range []struct{ name, output string }{
+		{
+			name:   "temp name of an input",
+			output: input + tmpSuffix(testECID),
+		},
+		{
+			// The manager stops at the first "_tmp", so everything
+			// after it — including a second, well-formed temp tail —
+			// is discarded.
+			name:   "input whose own name contains the marker",
+			output: input + "_tmp_x" + tmpSuffix(testECID),
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			job := validJob()
+			job.Files[0].MetadataFileEntry = storedFile(input)
+			job.OutputFile = tt.output
+
+			r := assertRefused(t, job, Options{}, ClassMalformedJob, "outputFile")
+			if !strings.Contains(r.Detail, "commits as "+input) {
+				t.Fatalf("detail = %q, want it to name the committed collision", r.Detail)
+			}
+		})
+	}
+}
+
+// TestTranslateAcceptsAnOutputThatOnlySharesAPrefix guards the other
+// side: a fresh file counter shares the input's directory and most of
+// its name, and that is the normal case, not a collision.
+func TestTranslateAcceptsAnOutputThatOnlySharesAPrefix(t *testing.T) {
+	job := validJob()
+	job.Files[0].MetadataFileEntry = storedFile("hdfs://nn/accumulo/tables/2/t-0001/F0001.rf")
+	job.OutputFile = "hdfs://nn/accumulo/tables/2/t-0001/F0001x.rf" + tmpSuffix(testECID)
+
+	mustTranslate(t, job, Options{})
 }
 
 // TestTranslateKeepsTheCoordinatorsTempOutputName is the wire-shape
@@ -960,11 +1007,6 @@ func TestTranslateOverridesResolveOutputEncoding(t *testing.T) {
 			wantCodec: block.CodecGzip,
 		},
 		{
-			name:      "codec gzip alias",
-			overrides: map[string]string{propCompressType: "GZIP"},
-			wantCodec: block.CodecGzip,
-		},
-		{
 			name:      "codec snappy overrides the table default",
 			overrides: map[string]string{propCompressType: "snappy"},
 			opts:      Options{DefaultCodec: block.CodecNone},
@@ -1035,10 +1077,10 @@ func TestTranslateRefusesUnusableOptionDefaults(t *testing.T) {
 			wantIn:    "zstd",
 		},
 		{
-			// The override path accepts "gzip" and maps it to the
-			// writer's "gz"; a default skips that mapping, and the
-			// compressor only registers none, gz and snappy.
-			name:      "unmapped accumulo codec alias",
+			// A near-miss spelling: the compressor registers exactly
+			// none, gz and snappy, and a default skips the override
+			// path's mapping table entirely.
+			name:      "codec spelled gzip",
 			opts:      Options{DefaultCodec: "gzip"},
 			wantField: "options.defaultCodec",
 			wantIn:    "gzip",
@@ -1093,6 +1135,38 @@ func TestTranslateRefusesUnsupportedOverrides(t *testing.T) {
 			overrides: map[string]string{propCompressType: "zstd"},
 			wantClass: ClassUnsupportedProperty,
 			wantField: "overrides[" + propCompressType + "]",
+		},
+		{
+			// Compression.getCompressionAlgorithmByName is a map
+			// lookup keyed by each algorithm's getName(); Gz's is "gz",
+			// so "gzip" is as unusable to Java as it is here.
+			name:      "codec spelled gzip",
+			overrides: map[string]string{propCompressType: "gzip"},
+			wantClass: ClassUnsupportedProperty,
+			wantField: "overrides[" + propCompressType + "]",
+		},
+		{
+			// The same lookup is case-sensitive.
+			name:      "codec in the wrong case",
+			overrides: map[string]string{propCompressType: "GZ"},
+			wantClass: ClassUnsupportedProperty,
+			wantField: "overrides[" + propCompressType + "]",
+		},
+		{
+			// ...and does no trimming.
+			name:      "codec padded with whitespace",
+			overrides: map[string]string{propCompressType: " gz "},
+			wantClass: ClassUnsupportedProperty,
+			wantField: "overrides[" + propCompressType + "]",
+		},
+		{
+			// getFixedMemoryAsBytes hands the value straight to
+			// Long.parseLong, which rejects surrounding whitespace, so
+			// this is a syntax fault rather than an unsupported size.
+			name:      "block size padded with whitespace",
+			overrides: map[string]string{propCompressBlockSize: " 128K"},
+			wantClass: ClassMalformedJob,
+			wantField: "overrides[" + propCompressBlockSize + "]",
 		},
 		{
 			name:      "block size of zero",
@@ -1502,7 +1576,6 @@ func TestParseMemoryBytes(t *testing.T) {
 		wantErr bool
 	}{
 		{in: "1024", want: 1024},
-		{in: " 2048 ", want: 2048},
 		{in: "512b", want: 512},
 		{in: "1K", want: 1024},
 		{in: "1k", want: 1024},
@@ -1513,6 +1586,13 @@ func TestParseMemoryBytes(t *testing.T) {
 		{in: "K", wantErr: true},
 		{in: "1.5M", wantErr: true},
 		{in: "9223372036854775807G", wantErr: true},
+		// getFixedMemoryAsBytes reads the raw string: the last
+		// character decides the multiplier and Long.parseLong takes the
+		// rest, and neither tolerates surrounding whitespace.
+		{in: " 2048", wantErr: true},
+		{in: "2048 ", wantErr: true},
+		{in: " 2048 ", wantErr: true},
+		{in: "128 K", wantErr: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.in, func(t *testing.T) {
