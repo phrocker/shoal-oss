@@ -373,7 +373,7 @@ func (b *Backend) List(ctx context.Context, prefix string) ([]string, error) {
 
 	out := make([]string, 0, len(entries))
 	for _, entry := range entries {
-		if entry.IsDir() {
+		if entry.IsDir() || isReplacementArtifactName(entry.Name()) {
 			continue
 		}
 		child := path.Join(resolved, entry.Name())
@@ -1078,6 +1078,23 @@ func nextReplacementSiblingPath(target, prefix string) (string, error) {
 		return "", err
 	}
 	return path.Join(path.Dir(target), prefix+token), nil
+}
+
+func isReplacementArtifactName(name string) bool {
+	return isGeneratedReplacementName(name, replacementTempPrefix) ||
+		isGeneratedReplacementName(name, replacementBackupPrefix)
+}
+
+func isGeneratedReplacementName(name, prefix string) bool {
+	if !strings.HasPrefix(name, prefix) {
+		return false
+	}
+	token := name[len(prefix):]
+	if len(token) != replacementNameTokenBytes*2 {
+		return false
+	}
+	decoded, err := hex.DecodeString(token)
+	return err == nil && len(decoded) == replacementNameTokenBytes
 }
 
 func createTemporaryFile(client Client, target string) (string, storage.Writer, error) {

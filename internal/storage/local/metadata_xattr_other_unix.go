@@ -1,4 +1,4 @@
-//go:build unix && !plan9 && !linux && !darwin
+//go:build aix || android || dragonfly || freebsd || illumos || ios || netbsd || openbsd || solaris
 
 package local
 

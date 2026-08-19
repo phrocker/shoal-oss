@@ -29,7 +29,8 @@
 // Auth (in precedence order):
 //  1. WithServiceClient — a pre-built *service.Client. Reads always work;
 //     writes that promote private staged blobs also require
-//     WithSourceSASQuery or WithSourceAuthorizationProvider.
+//     WithSourceSASQuery, WithCopySourceAuthorization, or
+//     WithSourceAuthorizationProvider.
 //  2. WithConnectionString / AZURE_STORAGE_CONNECTION_STRING — shared-key or SAS.
 //  3. AZURE_STORAGE_ACCOUNT (or WithAccount / WithServiceURL) + the default
 //     Azure credential chain (env vars, managed identity, workload identity,
@@ -75,9 +76,10 @@ import (
 // Backend opens Azure blobs via a shared *service.Client. Safe for concurrent
 // Open and concurrent ReadAt across many Files.
 type Backend struct {
-	svc            *service.Client
-	ops            azureWriteOperations
-	sourceProvider azureCopySourceProvider
+	svc                    *service.Client
+	ops                    azureWriteOperations
+	sourceProvider         azureCopySourceProvider
+	validateSourceOnCreate bool
 }
 
 // Option customizes Backend construction.
@@ -181,9 +183,10 @@ func New(_ context.Context, opts ...Option) (*Backend, error) {
 	if c.svc != nil {
 		base := rawAzureCopySourceProvider{svc: c.svc}
 		return &Backend{
-			svc:            c.svc,
-			ops:            sdkAzureWriteOperations{svc: c.svc},
-			sourceProvider: configuredOrAutomaticSourceProvider(base, sourceProviderFromServiceClient(c.svc), c.sourceAuthorizationProvider, true),
+			svc:                    c.svc,
+			ops:                    sdkAzureWriteOperations{svc: c.svc},
+			sourceProvider:         configuredOrAutomaticSourceProvider(base, sourceProviderFromServiceClient(c.svc), c.sourceAuthorizationProvider, true),
+			validateSourceOnCreate: true,
 		}, nil
 	}
 
@@ -283,6 +286,15 @@ func (b *Backend) Create(ctx context.Context, path string) (shstorage.Writer, er
 		return nil, err
 	}
 	ctx = contextOrBackground(ctx)
+	stageName, err := nextTemporaryStageName(name)
+	if err != nil {
+		return nil, fmt.Errorf("azure: stage temporary blob for az://%s/%s: %w", cont, name, err)
+	}
+	if b.validateSourceOnCreate {
+		if err := validatePromotionSource(ctx, b.sourceProvider, cont, stageName); err != nil {
+			return nil, err
+		}
+	}
 	ops := b.writeOperations()
 	target, err := ops.head(ctx, cont, name)
 	if err != nil && !isBlobNotFound(err) {
@@ -291,10 +303,6 @@ func (b *Backend) Create(ctx context.Context, path string) (shstorage.Writer, er
 	targetExists := err == nil
 	if targetExists && target.etag == nil {
 		return nil, fmt.Errorf("azure: inspect destination az://%s/%s: missing ETag", cont, name)
-	}
-	stageName, err := nextTemporaryStageName(name)
-	if err != nil {
-		return nil, fmt.Errorf("azure: stage temporary blob for az://%s/%s: %w", cont, name, err)
 	}
 	return &writer{
 		ops:            ops,
@@ -365,10 +373,9 @@ func ParsePath(path string) (containerName, blobName string, err error) {
 
 const (
 	maxBlobNameChars      = 1024
-	tempStageNamePrefix   = ".shl-"
+	tempStageNamePrefix   = ".shoal-tmp-"
 	tempStageHashHexLen   = 4
 	tempStageRandomHexLen = 10
-	tempStageMinimumLen   = len(tempStageNamePrefix) + tempStageRandomHexLen
 	tempStageComponentLen = len(tempStageNamePrefix) + tempStageHashHexLen + tempStageRandomHexLen
 	legacyStageDirPrefix  = ".shoal-tmp/"
 	azureCopyBlockSize    = 100 << 20
@@ -400,28 +407,25 @@ func nextTemporaryStageName(name string) (string, error) {
 	}
 	component := tempStageNamePrefix + token[:tempStageRandomHexLen] + hashHex[:tempStageHashHexLen]
 	available := maxBlobNameChars - utf8.RuneCountInString(prefix)
-	if available < tempStageMinimumLen {
+	if available < tempStageComponentLen {
 		return "", fmt.Errorf(
 			"blob prefix %q leaves %d characters for a temporary blob; need at least %d",
-			prefix, available, tempStageMinimumLen,
+			prefix, available, tempStageComponentLen,
 		)
-	}
-	if len(component) > available {
-		component = component[:available]
 	}
 	return prefix + component, nil
 }
 
 func temporaryStageNamePrefixFor(name string) (string, error) {
 	prefix := stageNameParentPrefix(name)
-	for prefix != "" && maxBlobNameChars-utf8.RuneCountInString(prefix) < tempStageMinimumLen {
+	for prefix != "" && maxBlobNameChars-utf8.RuneCountInString(prefix) < tempStageComponentLen {
 		trimmed := strings.TrimSuffix(prefix, "/")
 		next := stageNameParentPrefix(trimmed)
 		if next == "" {
 			available := maxBlobNameChars - utf8.RuneCountInString(prefix)
 			return "", fmt.Errorf(
 				"blob prefix %q leaves %d characters for a temporary blob; need at least %d",
-				prefix, available, tempStageMinimumLen,
+				prefix, available, tempStageComponentLen,
 			)
 		}
 		prefix = next
@@ -457,16 +461,12 @@ func isLegacyTemporaryStageName(name string) bool {
 }
 
 func isGeneratedTemporaryStageComponent(name string) bool {
-	if !strings.HasPrefix(name, tempStageNamePrefix) {
+	if len(name) != tempStageComponentLen || !strings.HasPrefix(name, tempStageNamePrefix) {
 		return false
 	}
-	suffix := name[len(tempStageNamePrefix):]
-	if len(suffix) < tempStageRandomHexLen || len(suffix) > tempStageRandomHexLen+tempStageHashHexLen {
-		return false
-	}
-	token := suffix[:tempStageRandomHexLen]
-	hash := suffix[tempStageRandomHexLen:]
-	return isLowerHex(token) && (hash == "" || isLowerHex(hash))
+	token := name[len(tempStageNamePrefix) : len(tempStageNamePrefix)+tempStageRandomHexLen]
+	hash := name[len(tempStageNamePrefix)+tempStageRandomHexLen:]
+	return isLowerHex(token) && isLowerHex(hash)
 }
 
 type azureCopySource struct {
@@ -1076,4 +1076,29 @@ func contextOrBackground(ctx context.Context) context.Context {
 		return context.Background()
 	}
 	return ctx
+}
+
+func validatePromotionSource(
+	ctx context.Context,
+	provider azureCopySourceProvider,
+	containerName, blobName string,
+) error {
+	if provider == nil {
+		return fmt.Errorf("azure: no source authorization configured for az://%s/%s", containerName, blobName)
+	}
+	source, err := provider.source(ctx, containerName, blobName)
+	if err != nil {
+		return fmt.Errorf("azure: authorize staged source az://%s/%s: %w", containerName, blobName, err)
+	}
+	if source.authorization != nil {
+		return nil
+	}
+	sourceURL, err := url.Parse(source.url)
+	if err != nil {
+		return fmt.Errorf("azure: authorize staged source az://%s/%s: %w", containerName, blobName, err)
+	}
+	if sourceURL.RawQuery == "" {
+		return fmt.Errorf("azure: no source authorization configured for az://%s/%s", containerName, blobName)
+	}
+	return nil
 }

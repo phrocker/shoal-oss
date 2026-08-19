@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"crypto/md5"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"hash/crc32"
 	"io"
@@ -14,6 +16,12 @@ import (
 	cloudstorage "cloud.google.com/go/storage"
 	shstorage "github.com/phrocker/shoal/internal/storage"
 )
+
+func expectedTemporaryObjectComponent(object, token string) string {
+	hash := sha256.Sum256([]byte(object))
+	hashHex := hex.EncodeToString(hash[:tempObjectHashHexLen/2])
+	return tempObjectPrefix + token[:tempObjectRandomHexLen] + hashHex
+}
 
 func TestParsePath(t *testing.T) {
 	cases := []struct {
@@ -226,9 +234,9 @@ func TestNextTemporaryObjectNameRejectsPrefixWithoutFullRandomToken(t *testing.T
 		randomTempObjectToken = originalToken
 	})
 
-	object := strings.Repeat("a", 1010) + "/x"
+	object := strings.Repeat("a", 999) + "/x"
 	if _, err := nextTemporaryObjectName(object); err == nil {
-		t.Fatal("nextTemporaryObjectName succeeded without room for the full random token")
+		t.Fatal("nextTemporaryObjectName succeeded without room for the full generated temporary name")
 	}
 }
 
@@ -247,7 +255,7 @@ func TestNextTemporaryObjectNameKeepsFullRandomTokenAtMinimumSpace(t *testing.T)
 		randomTempObjectToken = originalToken
 	})
 
-	object := strings.Repeat("a", 1008) + "/x"
+	object := strings.Repeat("a", 998) + "/x"
 	tempName, err := nextTemporaryObjectName(object)
 	if err != nil {
 		t.Fatalf("nextTemporaryObjectName: %v", err)
@@ -256,7 +264,7 @@ func TestNextTemporaryObjectNameKeepsFullRandomTokenAtMinimumSpace(t *testing.T)
 		t.Fatalf("temp prefix = %q, want %q", got, want)
 	}
 	component := tempName[len(tempObjectParentPrefix(tempName)):]
-	if got, want := component, tempObjectPrefix+strings.Repeat("9", tempObjectRandomHexLen); got != want {
+	if got, want := component, expectedTemporaryObjectComponent(object, strings.Repeat("9", tempObjectRandomHexLen)); got != want {
 		t.Fatalf("temporary component = %q, want %q", got, want)
 	}
 	if !isTemporaryObjectName(tempName) {
@@ -293,11 +301,11 @@ func TestNextTemporaryObjectNameSupportsHierarchicalSegmentLimit(t *testing.T) {
 
 func TestIsTemporaryObjectNameMatchesOnlyReservedFormats(t *testing.T) {
 	legacyUUID := "123e4567-e89b-12d3-a456-426614174000"
-	if !isTemporaryObjectName("tenant/.shl-aaaaaaaaaa1234") {
+	if !isTemporaryObjectName("tenant/.shoal-tmp-aaaaaaaaaa1234") {
 		t.Fatal("generated temporary object was not detected")
 	}
-	if !isTemporaryObjectName("tenant/.shl-aaaaaaaaaa") {
-		t.Fatal("minimum generated temporary object was not detected")
+	if isTemporaryObjectName("tenant/.shoal-tmp-aaaaaaaaaa") {
+		t.Fatal("partial generated temporary object should remain visible")
 	}
 	if !isTemporaryObjectName("tenant/object.rf" + legacyTempObjectPrefix + legacyUUID) {
 		t.Fatal("legacy temporary object was not detected")
@@ -640,6 +648,47 @@ func TestWriter_CloseUsesVerifiedTempObjectWhenWriterAttrsAreUnreliable(t *testi
 	}
 	if _, ok := bucket.objects[tempName]; ok {
 		t.Fatalf("verified cleanup left temp object %q behind", tempName)
+	}
+}
+
+func TestWriter_CloseErrorDeletesOnlyVerifiedTempGeneration(t *testing.T) {
+	backend, bucket := newFakeBackend()
+	bucket.putObject("path/to/object.rf", []byte("old"))
+	closeErr := errors.New("checksum mismatch")
+	bucket.writerPlan = func(name string) fakeWriterPlan {
+		if isTemporaryObjectName(name) {
+			return fakeWriterPlan{closeErr: closeErr, publishOnClose: true}
+		}
+		return fakeWriterPlan{}
+	}
+	bucket.deleteHook = func(_ context.Context, object *fakeObject) error {
+		if !isTemporaryObjectName(object.name) {
+			return nil
+		}
+		bucket.putObjectWithMetadata(object.name, []byte("intruder"), map[string]string{"shoal-write-id": "intruder"})
+		return nil
+	}
+
+	w, err := backend.Create(context.Background(), "bucket/path/to/object.rf")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	tempName := w.(*writer).temp.(*fakeObject).name
+	if _, err := w.Write([]byte("new")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	err = w.Close()
+	if !errors.Is(err, closeErr) {
+		t.Fatalf("Close error = %v, want checksum mismatch", err)
+	}
+	if got := string(bucket.objects["path/to/object.rf"].body); got != "old" {
+		t.Fatalf("destination contents = %q, want old", got)
+	}
+	if len(bucket.deleteCalls) != 1 || bucket.deleteCalls[0].generation == 0 {
+		t.Fatalf("delete calls = %+v, want generation-scoped cleanup", bucket.deleteCalls)
+	}
+	if got := string(bucket.objects[tempName].body); got != "intruder" {
+		t.Fatalf("temporary object %q = %q, want preserved replacement object", tempName, got)
 	}
 }
 

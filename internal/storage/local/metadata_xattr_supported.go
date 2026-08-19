@@ -1,4 +1,4 @@
-//go:build linux || darwin
+//go:build (linux && !android) || (darwin && !ios)
 
 package local
 
@@ -38,6 +38,9 @@ func reconcilePlatformXattrs(temp, target string, ops xattrOperations) error {
 
 	targetSet := make(map[string]struct{}, len(targetNames))
 	for _, name := range targetNames {
+		if !shouldPreserveXattr(name) {
+			continue
+		}
 		targetSet[name] = struct{}{}
 	}
 	for _, name := range tempNames {
@@ -49,6 +52,9 @@ func reconcilePlatformXattrs(temp, target string, ops xattrOperations) error {
 		}
 	}
 	for _, name := range targetNames {
+		if !shouldPreserveXattr(name) {
+			continue
+		}
 		value, err := ops.get(target, name)
 		if err != nil {
 			return fmt.Errorf("local: read extended attribute %s for %s: %w", name, target, err)
@@ -58,6 +64,18 @@ func reconcilePlatformXattrs(temp, target string, ops xattrOperations) error {
 		}
 	}
 	return nil
+}
+
+func shouldPreserveXattr(name string) bool {
+	// Linux clears file capabilities when file contents change. The atomic
+	// rewrite path should mirror that in-place truncation behavior rather than
+	// restoring privilege-bearing content security labels onto rewritten bytes.
+	switch name {
+	case "security.capability", "security.ima", "security.evm":
+		return false
+	default:
+		return true
+	}
 }
 
 func listXattrs(path string) ([]string, error) {

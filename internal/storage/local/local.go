@@ -13,6 +13,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/phrocker/shoal/internal/storage"
 )
@@ -93,9 +94,10 @@ func (b *Backend) List(_ context.Context, prefix string) ([]string, error) {
 	}
 	var out []string
 	for _, e := range entries {
-		if !e.IsDir() {
-			out = append(out, filepath.Join(prefix, e.Name()))
+		if e.IsDir() || isReplacementArtifactName(e.Name()) {
+			continue
 		}
+		out = append(out, filepath.Join(prefix, e.Name()))
 	}
 	return out, nil
 }
@@ -255,6 +257,23 @@ func nextReplacementSiblingPath(dir, prefix string) (string, error) {
 		return "", err
 	}
 	return filepath.Join(dir, prefix+token), nil
+}
+
+func isReplacementArtifactName(name string) bool {
+	return isGeneratedReplacementName(name, replacementTempPrefix) ||
+		isGeneratedReplacementName(name, replacementBackupPrefix)
+}
+
+func isGeneratedReplacementName(name, prefix string) bool {
+	if !strings.HasPrefix(name, prefix) {
+		return false
+	}
+	token := name[len(prefix):]
+	if len(token) != replacementNameTokenBytes*2 {
+		return false
+	}
+	decoded, err := hex.DecodeString(token)
+	return err == nil && len(decoded) == replacementNameTokenBytes
 }
 
 func (w *writer) publishReplacement(hadOld bool) (string, error) {

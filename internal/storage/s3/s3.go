@@ -159,7 +159,8 @@ func (b *Backend) Create(ctx context.Context, path string) (shstorage.Writer, er
 	if err != nil && !isNotFound(err) {
 		return nil, fmt.Errorf("s3: inspect destination s3://%s/%s: %w", bucket, key, err)
 	}
-	if err == nil && target.etag == nil {
+	targetExists := err == nil
+	if targetExists && target.etag == nil {
 		return nil, fmt.Errorf("s3: inspect destination s3://%s/%s: missing ETag", bucket, key)
 	}
 	stageKey, err := nextTemporaryStageKey(key)
@@ -173,7 +174,7 @@ func (b *Backend) Create(ctx context.Context, path string) (shstorage.Writer, er
 		stageKey:       stageKey,
 		writeID:        uuid.NewString(),
 		ctx:            ctx,
-		targetExists:   err == nil,
+		targetExists:   targetExists,
 		target:         target,
 		cleanupTimeout: s3CleanupTimeout,
 	}, nil
@@ -233,10 +234,9 @@ func ParsePath(path string) (bucket, key string, err error) {
 
 const (
 	maxObjectKeyBytes     = 1024
-	tempStageKeyPrefix    = ".shl-"
+	tempStageKeyPrefix    = ".shoal-tmp-"
 	tempStageHashHexLen   = 4
 	tempStageRandomHexLen = 10
-	tempStageMinimumLen   = len(tempStageKeyPrefix) + tempStageRandomHexLen
 	tempStageComponentLen = len(tempStageKeyPrefix) + tempStageHashHexLen + tempStageRandomHexLen
 	legacyStageDirPrefix  = ".shoal-tmp/"
 )
@@ -265,28 +265,25 @@ func nextTemporaryStageKey(key string) (string, error) {
 	}
 	component := tempStageKeyPrefix + token[:tempStageRandomHexLen] + hashHex[:tempStageHashHexLen]
 	available := maxObjectKeyBytes - len(prefix)
-	if available < tempStageMinimumLen {
+	if available < tempStageComponentLen {
 		return "", fmt.Errorf(
 			"key prefix %q leaves %d bytes for a temporary object; need at least %d",
-			prefix, available, tempStageMinimumLen,
+			prefix, available, tempStageComponentLen,
 		)
-	}
-	if len(component) > available {
-		component = component[:available]
 	}
 	return prefix + component, nil
 }
 
 func temporaryStageKeyPrefixFor(key string) (string, error) {
 	prefix := stageKeyParentPrefix(key)
-	for prefix != "" && maxObjectKeyBytes-len(prefix) < tempStageMinimumLen {
+	for prefix != "" && maxObjectKeyBytes-len(prefix) < tempStageComponentLen {
 		trimmed := strings.TrimSuffix(prefix, "/")
 		next := stageKeyParentPrefix(trimmed)
 		if next == "" {
 			available := maxObjectKeyBytes - len(prefix)
 			return "", fmt.Errorf(
 				"key prefix %q leaves %d bytes for a temporary object; need at least %d",
-				prefix, available, tempStageMinimumLen,
+				prefix, available, tempStageComponentLen,
 			)
 		}
 		prefix = next
@@ -322,16 +319,12 @@ func isLegacyTemporaryStageKey(key string) bool {
 }
 
 func isGeneratedTemporaryStageComponent(name string) bool {
-	if !strings.HasPrefix(name, tempStageKeyPrefix) {
+	if len(name) != tempStageComponentLen || !strings.HasPrefix(name, tempStageKeyPrefix) {
 		return false
 	}
-	suffix := name[len(tempStageKeyPrefix):]
-	if len(suffix) < tempStageRandomHexLen || len(suffix) > tempStageRandomHexLen+tempStageHashHexLen {
-		return false
-	}
-	token := suffix[:tempStageRandomHexLen]
-	hash := suffix[tempStageRandomHexLen:]
-	return isLowerHex(token) && (hash == "" || isLowerHex(hash))
+	token := name[len(tempStageKeyPrefix) : len(tempStageKeyPrefix)+tempStageRandomHexLen]
+	hash := name[len(tempStageKeyPrefix)+tempStageRandomHexLen:]
+	return isLowerHex(token) && isLowerHex(hash)
 }
 
 func isLowerHex(value string) bool {

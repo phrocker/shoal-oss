@@ -47,6 +47,37 @@ func TestReconcilePlatformXattrsReportsRemovalFailure(t *testing.T) {
 	}
 }
 
+func TestReconcilePlatformXattrsDropsSecurityCapability(t *testing.T) {
+	attrs := map[string]map[string][]byte{
+		"target": {
+			"user.keep":           []byte("target"),
+			"security.capability": []byte("cap"),
+			"security.ima":        []byte("ima"),
+			"security.evm":        []byte("evm"),
+		},
+		"temp": {
+			"user.keep":           []byte("inherited"),
+			"security.capability": []byte("cap"),
+			"security.ima":        []byte("ima"),
+			"security.evm":        []byte("evm"),
+			"user.inherited":      []byte("remove"),
+		},
+	}
+	ops := mapXattrOperations(attrs)
+
+	if err := reconcilePlatformXattrs("temp", "target", ops); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"security.capability", "security.ima", "security.evm"} {
+		if _, ok := attrs["temp"][name]; ok {
+			t.Fatalf("temporary xattrs = %v, unexpected %s", attrs["temp"], name)
+		}
+	}
+	if got := string(attrs["temp"]["user.keep"]); got != "target" {
+		t.Fatalf("preserved attribute = %q, want target", got)
+	}
+}
+
 func mapXattrOperations(attrs map[string]map[string][]byte) xattrOperations {
 	return xattrOperations{
 		list: func(path string) ([]string, error) {

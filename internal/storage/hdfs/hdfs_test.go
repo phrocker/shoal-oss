@@ -520,6 +520,36 @@ func TestBackendListPreservesPathForm(t *testing.T) {
 	}
 }
 
+func TestBackendListHidesGeneratedReplacementArtifacts(t *testing.T) {
+	client := newFakeClient()
+	client.files["/tables/1.rf"] = []byte("one")
+	client.files["/tables/.shl-user-visible"] = []byte("user")
+	client.files["/tables/"+replacementTempPrefix+"visible"] = []byte("visible")
+	client.files["/tables/"+replacementBackupPrefix+"visible"] = []byte("visible")
+	client.files["/tables/"+replacementTempPrefix+strings.Repeat("a", replacementNameTokenBytes*2)] = []byte("temp")
+	client.files["/tables/"+replacementBackupPrefix+strings.Repeat("b", replacementNameTokenBytes*2)] = []byte("backup")
+	backend, err := New("nn:8020", WithClient(client))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := backend.List(context.Background(), "hdfs://nn:8020/tables")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		"hdfs://nn:8020/tables/1.rf",
+		"hdfs://nn:8020/tables/.shl-user-visible",
+		"hdfs://nn:8020/tables/" + replacementTempPrefix + "visible",
+		"hdfs://nn:8020/tables/" + replacementBackupPrefix + "visible",
+	}
+	slices.Sort(got)
+	slices.Sort(want)
+	if !slices.Equal(got, want) {
+		t.Fatalf("List returned %v, want %v", got, want)
+	}
+}
+
 func TestBackendNotFoundSemantics(t *testing.T) {
 	client := newFakeClient()
 	backend, err := New("nn:8020", WithClient(client))

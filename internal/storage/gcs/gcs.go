@@ -215,10 +215,9 @@ func ParsePath(path string) (bucket, object string, err error) {
 const (
 	maxObjectNameBytes     = 1024
 	maxObjectSegmentBytes  = 512
-	tempObjectPrefix       = ".shl-"
+	tempObjectPrefix       = ".shoal-tmp-"
 	tempObjectHashHexLen   = 4
 	tempObjectRandomHexLen = 10
-	tempObjectMinimumLen   = len(tempObjectPrefix) + tempObjectRandomHexLen
 	tempObjectComponentLen = len(tempObjectPrefix) + tempObjectHashHexLen + tempObjectRandomHexLen
 	legacyTempObjectPrefix = ".shoal-tmp-"
 )
@@ -247,14 +246,11 @@ func nextTemporaryObjectName(object string) (string, error) {
 	}
 	component := temporaryObjectComponent(hashHex, token)
 	available := min(maxObjectNameBytes-len(prefix), maxObjectSegmentBytes)
-	if available < tempObjectMinimumLen {
+	if available < tempObjectComponentLen {
 		return "", fmt.Errorf(
 			"object prefix %q leaves %d bytes for a temporary object; need at least %d",
-			prefix, available, tempObjectMinimumLen,
+			prefix, available, tempObjectComponentLen,
 		)
-	}
-	if len(component) > available {
-		component = component[:available]
 	}
 	return prefix + component, nil
 }
@@ -268,14 +264,14 @@ func tempObjectParentPrefix(object string) string {
 
 func temporaryObjectPrefixFor(object string) (string, error) {
 	prefix := tempObjectParentPrefix(object)
-	for prefix != "" && min(maxObjectNameBytes-len(prefix), maxObjectSegmentBytes) < tempObjectMinimumLen {
+	for prefix != "" && min(maxObjectNameBytes-len(prefix), maxObjectSegmentBytes) < tempObjectComponentLen {
 		trimmed := strings.TrimSuffix(prefix, "/")
 		next := tempObjectParentPrefix(trimmed)
 		if next == "" {
 			available := min(maxObjectNameBytes-len(prefix), maxObjectSegmentBytes)
 			return "", fmt.Errorf(
 				"object prefix %q leaves %d bytes for a temporary object; need at least %d",
-				prefix, available, tempObjectMinimumLen,
+				prefix, available, tempObjectComponentLen,
 			)
 		}
 		prefix = next
@@ -305,16 +301,12 @@ func isLegacyTemporaryObjectName(name string) bool {
 }
 
 func isGeneratedTemporaryObjectComponent(name string) bool {
-	if !strings.HasPrefix(name, tempObjectPrefix) {
+	if len(name) != tempObjectComponentLen || !strings.HasPrefix(name, tempObjectPrefix) {
 		return false
 	}
-	suffix := name[len(tempObjectPrefix):]
-	if len(suffix) < tempObjectRandomHexLen || len(suffix) > tempObjectRandomHexLen+tempObjectHashHexLen {
-		return false
-	}
-	token := suffix[:tempObjectRandomHexLen]
-	hash := suffix[tempObjectRandomHexLen:]
-	return isLowerHex(token) && (hash == "" || isLowerHex(hash))
+	token := name[len(tempObjectPrefix) : len(tempObjectPrefix)+tempObjectRandomHexLen]
+	hash := name[len(tempObjectPrefix)+tempObjectRandomHexLen:]
+	return isLowerHex(token) && isLowerHex(hash)
 }
 
 func isLowerHex(value string) bool {

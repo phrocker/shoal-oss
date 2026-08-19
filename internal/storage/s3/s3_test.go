@@ -19,6 +19,8 @@ package s3
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -30,6 +32,12 @@ import (
 
 	shstorage "github.com/phrocker/shoal/internal/storage"
 )
+
+func expectedTemporaryStageKeyComponent(key, token string) string {
+	hash := sha256.Sum256([]byte(key))
+	hashHex := hex.EncodeToString(hash[:tempStageHashHexLen/2])
+	return tempStageKeyPrefix + token[:tempStageRandomHexLen] + hashHex
+}
 
 type fakeS3Object struct {
 	state s3ObjectState
@@ -323,9 +331,9 @@ func TestNextTemporaryStageKeyRejectsPrefixWithoutFullRandomToken(t *testing.T) 
 		randomStageKeyToken = original
 	})
 
-	key := strings.Repeat("a", 1015) + "/x"
+	key := strings.Repeat("a", 999) + "/x"
 	if _, err := nextTemporaryStageKey(key); err == nil {
-		t.Fatal("nextTemporaryStageKey succeeded without room for the full random token")
+		t.Fatal("nextTemporaryStageKey succeeded without room for the full generated stage key")
 	}
 }
 
@@ -344,7 +352,7 @@ func TestNextTemporaryStageKeyKeepsFullRandomTokenAtMinimumSpace(t *testing.T) {
 		randomStageKeyToken = original
 	})
 
-	key := strings.Repeat("a", 1008) + "/x"
+	key := strings.Repeat("a", 998) + "/x"
 	stageKey, err := nextTemporaryStageKey(key)
 	if err != nil {
 		t.Fatalf("nextTemporaryStageKey: %v", err)
@@ -353,7 +361,7 @@ func TestNextTemporaryStageKeyKeepsFullRandomTokenAtMinimumSpace(t *testing.T) {
 		t.Fatalf("stage prefix = %q, want %q", got, want)
 	}
 	component := stageKey[len(stageKeyParentPrefix(stageKey)):]
-	if got, want := component, tempStageKeyPrefix+strings.Repeat("c", tempStageRandomHexLen); got != want {
+	if got, want := component, expectedTemporaryStageKeyComponent(key, strings.Repeat("c", tempStageRandomHexLen)); got != want {
 		t.Fatalf("temporary component = %q, want %q", got, want)
 	}
 	if !isTemporaryStageKey(stageKey) {
@@ -403,11 +411,11 @@ func TestIsTemporaryStageKeyMatchesOnlyReservedFormats(t *testing.T) {
 	if !isTemporaryStageKey(".shoal-tmp/" + legacyUUID) {
 		t.Fatal("legacy temporary stage key was not detected")
 	}
-	if !isTemporaryStageKey("tenant/.shl-aaaaaaaaaa1234") {
+	if !isTemporaryStageKey("tenant/.shoal-tmp-aaaaaaaaaa1234") {
 		t.Fatal("generated temporary stage key was not detected")
 	}
-	if !isTemporaryStageKey("tenant/.shl-aaaaaaaaaa") {
-		t.Fatal("minimum generated temporary stage key was not detected")
+	if isTemporaryStageKey("tenant/.shoal-tmp-aaaaaaaaaa") {
+		t.Fatal("partial generated temporary stage key should remain visible")
 	}
 	if isTemporaryStageKey(".shoal-tmp/user-visible") {
 		t.Fatal("arbitrary .shoal-tmp/ key should remain visible")
@@ -440,6 +448,32 @@ func TestWriter_StagedCreateAndReplace(t *testing.T) {
 				t.Fatal("temporary object was not removed")
 			}
 		})
+	}
+}
+
+func TestBackendCreateProtectsConcurrentlyCreatedDestination(t *testing.T) {
+	f := newFakeS3WriteOperations()
+	backend := &Backend{ops: f}
+	created, err := backend.Create(context.Background(), "s3://bucket/target")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	w := created.(*writer)
+	if w.targetExists {
+		t.Fatal("missing destination was recorded as existing")
+	}
+	_, _ = w.Write([]byte("new"))
+
+	etag := "\"concurrent\""
+	f.objects["target"] = fakeS3Object{
+		state: s3ObjectState{etag: &etag, size: int64(len("concurrent"))},
+		data:  "concurrent",
+	}
+	if err := w.Close(); err == nil {
+		t.Fatal("Close overwrote a concurrently created destination")
+	}
+	if got := f.objects["target"].data; got != "concurrent" {
+		t.Fatalf("destination data = %q, want concurrent", got)
 	}
 }
 

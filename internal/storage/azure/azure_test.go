@@ -20,6 +20,8 @@ package azure
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -173,7 +175,7 @@ func newFakeAzureWriter(f *fakeAzureWriteOperations, target string) *writer {
 		ops:            f,
 		container:      "container",
 		name:           target,
-		stageName:      ".shl-stage0000",
+		stageName:      tempStageNamePrefix + "aaaaaaaaaa1234",
 		writeID:        "write-id",
 		ctx:            context.Background(),
 		targetExists:   err == nil,
@@ -219,6 +221,12 @@ type staticAzureCopySourceProvider struct{}
 
 func (staticAzureCopySourceProvider) source(context.Context, string, string) (azureCopySource, error) {
 	return azureCopySource{url: "https://example.invalid/stage"}, nil
+}
+
+func expectedTemporaryStageComponent(name, token string) string {
+	hash := sha256.Sum256([]byte(name))
+	hashHex := hex.EncodeToString(hash[:tempStageHashHexLen/2])
+	return tempStageNamePrefix + token[:tempStageRandomHexLen] + hashHex
 }
 
 func TestParsePath(t *testing.T) {
@@ -373,7 +381,7 @@ func TestNextTemporaryStageNameUsesCharacterLimitInsteadOfUTF8Bytes(t *testing.T
 		randomStageNameToken = original
 	})
 
-	name := strings.Repeat("界", 1004) + "/x"
+	name := strings.Repeat("界", 990) + "/leaf/x"
 	stageName, err := nextTemporaryStageName(name)
 	if err != nil {
 		t.Fatalf("nextTemporaryStageName: %v", err)
@@ -395,9 +403,9 @@ func TestNextTemporaryStageNameRejectsPrefixWithoutFullRandomToken(t *testing.T)
 		randomStageNameToken = original
 	})
 
-	name := strings.Repeat("界", 1015) + "/x"
+	name := strings.Repeat("界", 999) + "/x"
 	if _, err := nextTemporaryStageName(name); err == nil {
-		t.Fatal("nextTemporaryStageName succeeded without room for the full random token")
+		t.Fatal("nextTemporaryStageName succeeded without room for the full generated stage name")
 	}
 }
 
@@ -416,7 +424,7 @@ func TestNextTemporaryStageNameKeepsFullRandomTokenAtMinimumSpace(t *testing.T) 
 		randomStageNameToken = original
 	})
 
-	name := strings.Repeat("界", 1008) + "/x"
+	name := strings.Repeat("界", 998) + "/x"
 	stageName, err := nextTemporaryStageName(name)
 	if err != nil {
 		t.Fatalf("nextTemporaryStageName: %v", err)
@@ -425,7 +433,7 @@ func TestNextTemporaryStageNameKeepsFullRandomTokenAtMinimumSpace(t *testing.T) 
 		t.Fatalf("stage prefix = %q, want %q", got, want)
 	}
 	component := stageName[len(stageNameParentPrefix(stageName)):]
-	if got, want := component, tempStageNamePrefix+strings.Repeat("c", tempStageRandomHexLen); got != want {
+	if got, want := component, expectedTemporaryStageComponent(name, strings.Repeat("c", tempStageRandomHexLen)); got != want {
 		t.Fatalf("temporary component = %q, want %q", got, want)
 	}
 	if !isTemporaryStageName(stageName) {
@@ -492,11 +500,11 @@ func TestIsTemporaryStageNameMatchesOnlyReservedFormats(t *testing.T) {
 	if !isTemporaryStageName(".shoal-tmp/" + legacyUUID) {
 		t.Fatal("legacy temporary stage blob was not detected")
 	}
-	if !isTemporaryStageName("tenant/.shl-aaaaaaaaaa1234") {
+	if !isTemporaryStageName("tenant/.shoal-tmp-aaaaaaaaaa1234") {
 		t.Fatal("generated temporary stage blob was not detected")
 	}
-	if !isTemporaryStageName("tenant/.shl-aaaaaaaaaa") {
-		t.Fatal("minimum generated temporary stage blob was not detected")
+	if isTemporaryStageName("tenant/.shoal-tmp-aaaaaaaaaa") {
+		t.Fatal("partial generated temporary stage blob should remain visible")
 	}
 	if isTemporaryStageName(".shoal-tmp/user-visible") {
 		t.Fatal("arbitrary .shoal-tmp/ blob should remain visible")
@@ -506,7 +514,7 @@ func TestIsTemporaryStageNameMatchesOnlyReservedFormats(t *testing.T) {
 	}
 }
 
-func TestBackendCreateWithCustomServiceClientRequiresSourceAuthorization(t *testing.T) {
+func TestBackendCreateWithCustomServiceClientRejectsMissingSourceAuthorizationBeforeStaging(t *testing.T) {
 	backend, ops := newCustomServiceBackend(t)
 	etag := azcore.ETag("\"old\"")
 	ops.objects["target"] = fakeAzureObject{
@@ -514,23 +522,29 @@ func TestBackendCreateWithCustomServiceClientRequiresSourceAuthorization(t *test
 		data:  "old",
 	}
 
-	w, err := backend.Create(context.Background(), "az://container/target")
-	if err != nil {
-		t.Fatalf("Create: %v", err)
-	}
-	writer := w.(*writer)
-	if _, err := w.Write([]byte("new")); err != nil {
-		t.Fatalf("Write: %v", err)
-	}
-	err = w.Close()
-	if err == nil || !strings.Contains(err.Error(), "no source authorization configured") {
-		t.Fatalf("Close error = %v, want explicit source authorization failure", err)
+	if _, err := backend.Create(context.Background(), "az://container/target"); err == nil || !strings.Contains(err.Error(), "no source authorization configured") {
+		t.Fatalf("Create error = %v, want explicit source authorization failure", err)
 	}
 	if got := ops.objects["target"].data; got != "old" {
 		t.Fatalf("target data = %q, want old", got)
 	}
-	if _, ok := ops.objects[writer.stageName]; ok {
-		t.Fatal("temporary blob was not removed after authorization failure")
+	if len(ops.objects) != 1 {
+		t.Fatalf("objects after failed Create = %d, want only the original target", len(ops.objects))
+	}
+}
+
+func TestBackendCreateWithCustomServiceClientRejectsEmptySourceAuthorizationProvider(t *testing.T) {
+	backend, ops := newCustomServiceBackend(t, WithSourceAuthorizationProvider(
+		SourceAuthorizationProviderFunc(func(context.Context, string, string) (SourceAuthorization, error) {
+			return SourceAuthorization{}, nil
+		}),
+	))
+
+	if _, err := backend.Create(context.Background(), "az://container/target"); err == nil || !strings.Contains(err.Error(), "no source authorization configured") {
+		t.Fatalf("Create error = %v, want explicit source authorization failure", err)
+	}
+	if len(ops.objects) != 0 {
+		t.Fatalf("objects after failed Create = %d, want no staged blobs", len(ops.objects))
 	}
 }
 
@@ -638,8 +652,8 @@ func TestBackendCreateWithCustomServiceClientAuthorizationProviderPromotesStage(
 		t.Fatalf("Close: %v", err)
 	}
 
-	if authCalls != 1 {
-		t.Fatalf("authorization provider calls = %d, want 1", authCalls)
+	if authCalls != 2 {
+		t.Fatalf("authorization provider calls = %d, want 2 (Create preflight + Close)", authCalls)
 	}
 	if ops.lastPromoteSource.authorization == nil || *ops.lastPromoteSource.authorization != "Bearer test-token" {
 		t.Fatalf("source authorization = %v, want Bearer test-token", ops.lastPromoteSource.authorization)
