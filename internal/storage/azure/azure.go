@@ -40,17 +40,22 @@ package azure
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"strings"
+	"time"
 
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blob"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/bloberror"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blockblob"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/container"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/service"
+	"github.com/google/uuid"
 
 	shstorage "github.com/phrocker/shoal/internal/storage"
 )
@@ -59,6 +64,7 @@ import (
 // Open and concurrent ReadAt across many Files.
 type Backend struct {
 	svc *service.Client
+	ops azureWriteOperations
 }
 
 // Option customizes Backend construction.
@@ -105,7 +111,7 @@ func New(_ context.Context, opts ...Option) (*Backend, error) {
 		o(c)
 	}
 	if c.svc != nil {
-		return &Backend{svc: c.svc}, nil
+		return &Backend{svc: c.svc, ops: sdkAzureWriteOperations{svc: c.svc}}, nil
 	}
 
 	connString := c.connString
@@ -117,7 +123,7 @@ func New(_ context.Context, opts ...Option) (*Backend, error) {
 		if err != nil {
 			return nil, fmt.Errorf("azure: NewClientFromConnectionString: %w", err)
 		}
-		return &Backend{svc: svc}, nil
+		return &Backend{svc: svc, ops: sdkAzureWriteOperations{svc: svc}}, nil
 	}
 
 	serviceURL := c.serviceURL
@@ -139,7 +145,7 @@ func New(_ context.Context, opts ...Option) (*Backend, error) {
 	if err != nil {
 		return nil, fmt.Errorf("azure: NewClient: %w", err)
 	}
-	return &Backend{svc: svc}, nil
+	return &Backend{svc: svc, ops: sdkAzureWriteOperations{svc: svc}}, nil
 }
 
 // Close is a no-op: the service client holds no persistent connection.
@@ -174,18 +180,32 @@ func (b *Backend) Open(ctx context.Context, path string) (shstorage.File, error)
 	}, nil
 }
 
-// Create opens a block-blob writer. Bytes are buffered in memory and uploaded
-// as a single block blob on Close. Replaces any existing blob at path.
+// Create opens a block-blob writer. Close first stages the bytes under an
+// internal blob name, then conditionally publishes them to the destination.
 func (b *Backend) Create(ctx context.Context, path string) (shstorage.Writer, error) {
 	cont, name, err := ParsePath(path)
 	if err != nil {
 		return nil, err
 	}
+	ctx = contextOrBackground(ctx)
+	ops := b.writeOperations()
+	target, err := ops.head(ctx, cont, name)
+	if err != nil && !isBlobNotFound(err) {
+		return nil, fmt.Errorf("azure: inspect destination az://%s/%s: %w", cont, name, err)
+	}
+	if err == nil && target.etag == nil {
+		return nil, fmt.Errorf("azure: inspect destination az://%s/%s: missing ETag", cont, name)
+	}
 	return &writer{
-		blob:      b.svc.NewContainerClient(cont).NewBlockBlobClient(name),
-		container: cont,
-		name:      name,
-		ctx:       ctx,
+		ops:            ops,
+		container:      cont,
+		name:           name,
+		stageName:      ".shoal-tmp/" + uuid.NewString(),
+		writeID:        uuid.NewString(),
+		ctx:            ctx,
+		targetExists:   err == nil,
+		target:         target,
+		cleanupTimeout: azureCleanupTimeout,
 	}, nil
 }
 
@@ -212,7 +232,8 @@ func (b *Backend) List(ctx context.Context, prefix string) ([]string, error) {
 			continue
 		}
 		for _, item := range page.Segment.BlobItems {
-			if item == nil || item.Name == nil || strings.HasSuffix(*item.Name, "/") {
+			if item == nil || item.Name == nil || strings.HasSuffix(*item.Name, "/") ||
+				strings.HasPrefix(*item.Name, ".shoal-tmp/") {
 				continue
 			}
 			out = append(out, "az://"+cont+"/"+*item.Name)
@@ -300,17 +321,110 @@ func (f *file) ReadAt(p []byte, off int64) (int, error) {
 	return n, nil
 }
 
-// writer buffers bytes in memory and uploads them as a single block blob on
-// Close. Azure block blobs have no streaming-append API; buffering on Close
-// matches the one-shot usage pattern of storage.WriteAll.
+type azureObjectState struct {
+	etag     *azcore.ETag
+	size     int64
+	metadata map[string]*string
+}
+
+type azureWriteOperations interface {
+	head(context.Context, string, string) (azureObjectState, error)
+	upload(context.Context, string, string, []byte, string, bool, azureObjectState) (azureObjectState, error)
+	deleteStage(context.Context, string, string, azureObjectState) error
+}
+
+type sdkAzureWriteOperations struct {
+	svc *service.Client
+}
+
+func (o sdkAzureWriteOperations) head(
+	ctx context.Context, containerName, name string,
+) (azureObjectState, error) {
+	out, err := o.svc.NewContainerClient(containerName).NewBlobClient(name).GetProperties(ctx, nil)
+	if err != nil {
+		return azureObjectState{}, err
+	}
+	state := azureObjectState{etag: out.ETag, metadata: out.Metadata}
+	if out.ContentLength != nil {
+		state.size = *out.ContentLength
+	}
+	return state, nil
+}
+
+func (o sdkAzureWriteOperations) upload(
+	ctx context.Context,
+	containerName, name string,
+	data []byte,
+	writeID string,
+	targetExists bool,
+	target azureObjectState,
+) (azureObjectState, error) {
+	conditions := &blob.ModifiedAccessConditions{}
+	if targetExists {
+		conditions.IfMatch = target.etag
+	} else {
+		conditions.IfNoneMatch = to.Ptr(azcore.ETagAny)
+	}
+	out, err := o.svc.NewContainerClient(containerName).NewBlockBlobClient(name).UploadBuffer(
+		ctx,
+		data,
+		&blockblob.UploadBufferOptions{
+			Metadata: map[string]*string{"shoal-write-id": to.Ptr(writeID)},
+			AccessConditions: &blob.AccessConditions{
+				ModifiedAccessConditions: conditions,
+			},
+		},
+	)
+	if err != nil {
+		return azureObjectState{}, err
+	}
+	return azureObjectState{
+		etag:     out.ETag,
+		size:     int64(len(data)),
+		metadata: map[string]*string{"shoal-write-id": to.Ptr(writeID)},
+	}, nil
+}
+
+func (o sdkAzureWriteOperations) deleteStage(
+	ctx context.Context, containerName, name string, stage azureObjectState,
+) error {
+	_, err := o.svc.NewContainerClient(containerName).NewBlobClient(name).Delete(
+		ctx,
+		&blob.DeleteOptions{
+			AccessConditions: &blob.AccessConditions{
+				ModifiedAccessConditions: &blob.ModifiedAccessConditions{IfMatch: stage.etag},
+			},
+		},
+	)
+	return err
+}
+
+var azureCleanupTimeout = 10 * time.Second
+
+func (b *Backend) writeOperations() azureWriteOperations {
+	if b.ops != nil {
+		return b.ops
+	}
+	return sdkAzureWriteOperations{svc: b.svc}
+}
+
+// writer buffers bytes in memory, stages them, and conditionally publishes
+// them on Close.
 type writer struct {
-	blob      *blockblob.Client
-	container string
-	name      string
-	ctx       context.Context //nolint:containedctx
-	buf       bytes.Buffer
-	closed    bool
-	aborted   bool
+	ops            azureWriteOperations
+	container      string
+	name           string
+	stageName      string
+	writeID        string
+	ctx            context.Context //nolint:containedctx
+	targetExists   bool
+	target         azureObjectState
+	stage          azureObjectState
+	stageCreated   bool
+	cleanupTimeout time.Duration
+	buf            bytes.Buffer
+	closed         bool
+	aborted        bool
 }
 
 func (w *writer) Write(p []byte) (int, error) {
@@ -328,12 +442,53 @@ func (w *writer) Close() error {
 		return fmt.Errorf("azure: writer already aborted")
 	}
 	if w.closed {
+		_ = w.cleanupStage()
 		return nil
 	}
-	if _, err := w.blob.UploadBuffer(w.ctx, w.buf.Bytes(), nil); err != nil {
-		return fmt.Errorf("azure: upload az://%s/%s: %w", w.container, w.name, err)
+	if !w.stageCreated {
+		stage, err := w.ops.upload(
+			w.ctx, w.container, w.stageName, w.buf.Bytes(), w.writeID, false, azureObjectState{},
+		)
+		if err != nil {
+			if verified, verifyErr := w.verifyStage(); verifyErr != nil || !verified {
+				return errors.Join(
+					fmt.Errorf("azure: stage upload az://%s/%s: %w", w.container, w.stageName, err),
+					verifyErr,
+					w.cleanupStage(),
+				)
+			}
+			stage = w.stage
+		}
+		w.stage = stage
+		w.stageCreated = true
+	}
+	if w.stage.etag == nil {
+		if verified, err := w.verifyStage(); err != nil || !verified || w.stage.etag == nil {
+			return errors.Join(
+				fmt.Errorf("azure: temporary blob az://%s/%s is missing an ETag", w.container, w.stageName),
+				err,
+				w.cleanupStage(),
+			)
+		}
+	}
+	// Publish from the verified buffer instead of a source URL. Private
+	// copy-from-URL requires a second source authorization token for some AAD
+	// configurations; a conditional upload works for every supported credential
+	// mode and still commits atomically against the destination ETag.
+	if _, err := w.ops.upload(
+		w.ctx, w.container, w.name, w.buf.Bytes(), w.writeID, w.targetExists, w.target,
+	); err != nil {
+		if verified, verifyErr := w.verifyDestination(); verifyErr != nil || !verified {
+			return errors.Join(
+				fmt.Errorf("azure: promote az://%s/%s to az://%s/%s: %w",
+					w.container, w.stageName, w.container, w.name, err),
+				verifyErr,
+				w.cleanupStage(),
+			)
+		}
 	}
 	w.closed = true
+	_ = w.cleanupStage()
 	return nil
 }
 
@@ -344,7 +499,81 @@ func (w *writer) Abort() error {
 	if w.closed {
 		return fmt.Errorf("azure: writer already closed")
 	}
+	if err := w.cleanupStage(); err != nil {
+		return err
+	}
 	w.aborted = true
 	w.buf.Reset()
 	return nil
+}
+
+func (w *writer) verifyStage() (bool, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), w.cleanupTimeout)
+	defer cancel()
+	state, err := w.ops.head(ctx, w.container, w.stageName)
+	if err != nil {
+		if isBlobNotFound(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("azure: verify temporary blob az://%s/%s: %w", w.container, w.stageName, err)
+	}
+	if state.size != int64(w.buf.Len()) || metadataValue(state.metadata, "shoal-write-id") != w.writeID {
+		return false, nil
+	}
+	w.stage = state
+	w.stageCreated = true
+	return true, nil
+}
+
+func (w *writer) verifyDestination() (bool, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), w.cleanupTimeout)
+	defer cancel()
+	state, err := w.ops.head(ctx, w.container, w.name)
+	if err != nil {
+		if isBlobNotFound(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("azure: verify destination az://%s/%s: %w", w.container, w.name, err)
+	}
+	if w.targetExists && equalETags(state.etag, w.target.etag) {
+		return false, nil
+	}
+	return state.size == int64(w.buf.Len()) &&
+		metadataValue(state.metadata, "shoal-write-id") == w.writeID, nil
+}
+
+func (w *writer) cleanupStage() error {
+	if !w.stageCreated {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), w.cleanupTimeout)
+	defer cancel()
+	if err := w.ops.deleteStage(ctx, w.container, w.stageName, w.stage); err != nil && !isBlobNotFound(err) {
+		return fmt.Errorf("azure: remove temporary blob az://%s/%s: %w", w.container, w.stageName, err)
+	}
+	w.stageCreated = false
+	return nil
+}
+
+func metadataValue(metadata map[string]*string, key string) string {
+	value := metadata[key]
+	if value == nil {
+		return ""
+	}
+	return *value
+}
+
+func equalETags(a, b *azcore.ETag) bool {
+	return a != nil && b != nil && a.Equals(*b)
+}
+
+func isBlobNotFound(err error) bool {
+	return bloberror.HasCode(err, bloberror.BlobNotFound, bloberror.ContainerNotFound)
+}
+
+func contextOrBackground(ctx context.Context) context.Context {
+	if ctx == nil {
+		return context.Background()
+	}
+	return ctx
 }

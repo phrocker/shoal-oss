@@ -18,6 +18,7 @@
 package s3
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -29,6 +30,131 @@ import (
 
 	shstorage "github.com/phrocker/shoal/internal/storage"
 )
+
+type fakeS3Object struct {
+	state s3ObjectState
+	data  string
+}
+
+type fakeS3WriteOperations struct {
+	objects             map[string]fakeS3Object
+	stageFailure        bool
+	stageResponseLost   bool
+	promoteResponseLost bool
+	mutateBeforePromote bool
+	deleteFailures      int
+	promoteCalls        int
+	cleanupCanceled     bool
+	nextETag            int
+}
+
+func newFakeS3WriteOperations() *fakeS3WriteOperations {
+	return &fakeS3WriteOperations{objects: make(map[string]fakeS3Object)}
+}
+
+func (f *fakeS3WriteOperations) head(
+	_ context.Context, _, key string,
+) (s3ObjectState, error) {
+	obj, ok := f.objects[key]
+	if !ok {
+		return s3ObjectState{}, &types.NotFound{}
+	}
+	return obj.state, nil
+}
+
+func (f *fakeS3WriteOperations) putStage(
+	ctx context.Context, _, key string, data []byte, writeID string,
+) (s3ObjectState, error) {
+	if f.stageFailure {
+		return s3ObjectState{}, errors.New("stage checksum failed")
+	}
+	f.nextETag++
+	etag := fmt.Sprintf("\"etag-%d\"", f.nextETag)
+	state := s3ObjectState{
+		etag:     &etag,
+		size:     int64(len(data)),
+		metadata: map[string]string{"shoal-write-id": writeID},
+	}
+	f.objects[key] = fakeS3Object{state: state, data: string(data)}
+	if f.stageResponseLost {
+		f.stageResponseLost = false
+		return s3ObjectState{}, errors.New("stage response lost")
+	}
+	if err := ctx.Err(); err != nil {
+		return s3ObjectState{}, err
+	}
+	return state, nil
+}
+
+func (f *fakeS3WriteOperations) promote(
+	ctx context.Context,
+	_, stageKey, key string,
+	_ s3ObjectState,
+	targetExists bool,
+	target s3ObjectState,
+) error {
+	f.promoteCalls++
+	if f.mutateBeforePromote {
+		f.mutateBeforePromote = false
+		f.nextETag++
+		etag := fmt.Sprintf("\"etag-%d\"", f.nextETag)
+		f.objects[key] = fakeS3Object{
+			state: s3ObjectState{etag: &etag, size: int64(len("concurrent"))},
+			data:  "concurrent",
+		}
+	}
+	current, exists := f.objects[key]
+	if exists != targetExists ||
+		(exists && !equalStringPointers(current.state.etag, target.etag)) {
+		return errors.New("destination precondition failed")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	stage := f.objects[stageKey]
+	f.nextETag++
+	etag := fmt.Sprintf("\"etag-%d\"", f.nextETag)
+	stage.state.etag = &etag
+	f.objects[key] = stage
+	if f.promoteResponseLost {
+		f.promoteResponseLost = false
+		return errors.New("copy response lost")
+	}
+	return nil
+}
+
+func (f *fakeS3WriteOperations) deleteStage(
+	ctx context.Context, _, key string, _ s3ObjectState,
+) error {
+	if ctx.Err() != nil {
+		f.cleanupCanceled = true
+		return ctx.Err()
+	}
+	if f.deleteFailures > 0 {
+		f.deleteFailures--
+		return errors.New("delete failed")
+	}
+	if _, ok := f.objects[key]; !ok {
+		return &types.NotFound{}
+	}
+	delete(f.objects, key)
+	return nil
+}
+
+func newFakeS3Writer(f *fakeS3WriteOperations, target string) *writer {
+	targetState, err := f.head(context.Background(), "bucket", target)
+	return &writer{
+		ops:            f,
+		bucket:         "bucket",
+		key:            target,
+		stageKey:       ".shoal-tmp/stage",
+		writeID:        "write-id",
+		ctx:            context.Background(),
+		targetExists:   err == nil,
+		target:         targetState,
+		cleanupTimeout: s3CleanupTimeout,
+	}
+}
 
 func TestParsePath(t *testing.T) {
 	cases := []struct {
@@ -138,6 +264,128 @@ func TestWriter_WriteAfterCloseReportsClosedState(t *testing.T) {
 	if _, err := w.Write([]byte("late")); err == nil || !strings.Contains(err.Error(), "closed") {
 		t.Fatalf("Write after Close error = %v, want closed state", err)
 	}
+}
+
+func TestWriter_StagedCreateAndReplace(t *testing.T) {
+	for _, existing := range []bool{false, true} {
+		t.Run(fmt.Sprintf("existing=%v", existing), func(t *testing.T) {
+			f := newFakeS3WriteOperations()
+			if existing {
+				etag := "\"old\""
+				f.objects["target"] = fakeS3Object{
+					state: s3ObjectState{etag: &etag, size: 3},
+					data:  "old",
+				}
+			}
+			w := newFakeS3Writer(f, "target")
+			_, _ = w.Write([]byte("new"))
+			if err := w.Close(); err != nil {
+				t.Fatalf("Close: %v", err)
+			}
+			if got := f.objects["target"].data; got != "new" {
+				t.Fatalf("target data = %q, want new", got)
+			}
+			if _, ok := f.objects[w.stageKey]; ok {
+				t.Fatal("temporary object was not removed")
+			}
+		})
+	}
+}
+
+func TestWriter_VerifiesCommittedResponsesWithoutReplayingPromotion(t *testing.T) {
+	f := newFakeS3WriteOperations()
+	f.stageResponseLost = true
+	f.promoteResponseLost = true
+	w := newFakeS3Writer(f, "target")
+	_, _ = w.Write([]byte("new"))
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	if f.promoteCalls != 1 {
+		t.Fatalf("promote calls = %d, want 1", f.promoteCalls)
+	}
+	if got := f.objects["target"].data; got != "new" {
+		t.Fatalf("target data = %q, want new", got)
+	}
+}
+
+func TestWriter_StageFailurePreservesExistingTarget(t *testing.T) {
+	f := newFakeS3WriteOperations()
+	etag := "\"old\""
+	f.objects["target"] = fakeS3Object{
+		state: s3ObjectState{etag: &etag, size: 3},
+		data:  "old",
+	}
+	f.stageFailure = true
+	w := newFakeS3Writer(f, "target")
+	_, _ = w.Write([]byte("new"))
+	if err := w.Close(); err == nil {
+		t.Fatal("Close succeeded after stage failure")
+	}
+	if got := f.objects["target"].data; got != "old" {
+		t.Fatalf("target data = %q, want old", got)
+	}
+}
+
+func TestWriter_ConcurrentTargetMutationIsPreserved(t *testing.T) {
+	f := newFakeS3WriteOperations()
+	etag := "\"old\""
+	f.objects["target"] = fakeS3Object{
+		state: s3ObjectState{etag: &etag, size: 3},
+		data:  "old",
+	}
+	f.mutateBeforePromote = true
+	w := newFakeS3Writer(f, "target")
+	_, _ = w.Write([]byte("new"))
+	if err := w.Close(); err == nil {
+		t.Fatal("Close succeeded after concurrent target mutation")
+	}
+	if got := f.objects["target"].data; got != "concurrent" {
+		t.Fatalf("target data = %q, want concurrent", got)
+	}
+	if _, ok := f.objects[w.stageKey]; ok {
+		t.Fatal("temporary object was not removed after failed promotion")
+	}
+}
+
+func TestWriter_CleanupUsesIndependentContextAndCanRetryAfterCommit(t *testing.T) {
+	t.Run("request cancellation", func(t *testing.T) {
+		f := newFakeS3WriteOperations()
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		w := newFakeS3Writer(f, "target")
+		w.ctx = ctx
+		_, _ = w.Write([]byte("new"))
+		if err := w.Close(); err == nil {
+			t.Fatal("Close succeeded with canceled promotion context")
+		}
+		if f.cleanupCanceled {
+			t.Fatal("cleanup inherited canceled request context")
+		}
+		if _, ok := f.objects[w.stageKey]; ok {
+			t.Fatal("temporary object was not removed")
+		}
+	})
+
+	t.Run("retry after committed close", func(t *testing.T) {
+		f := newFakeS3WriteOperations()
+		f.deleteFailures = 1
+		w := newFakeS3Writer(f, "target")
+		_, _ = w.Write([]byte("new"))
+		if err := w.Close(); err != nil {
+			t.Fatalf("Close promoted cleanup failure: %v", err)
+		}
+		if _, ok := f.objects[w.stageKey]; !ok {
+			t.Fatal("temporary object unexpectedly removed")
+		}
+		if err := w.Close(); err != nil {
+			t.Fatalf("second Close: %v", err)
+		}
+		if _, ok := f.objects[w.stageKey]; ok {
+			t.Fatal("second Close did not retry temporary cleanup")
+		}
+	})
 }
 
 // TestFile_ReadAt_EdgeCases exercises the code paths in file.ReadAt that do

@@ -42,12 +42,15 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"strings"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	s3sdk "github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/google/uuid"
 
 	shstorage "github.com/phrocker/shoal/internal/storage"
 )
@@ -56,6 +59,7 @@ import (
 // concurrent Open and concurrent ReadAt across many Files.
 type Backend struct {
 	client *s3sdk.Client
+	ops    s3WriteOperations
 }
 
 // Option customizes Backend construction. Use WithClient if you've already
@@ -96,7 +100,7 @@ func New(ctx context.Context, opts ...Option) (*Backend, error) {
 		}
 		c.client = s3sdk.NewFromConfig(awsCfg, c.clientOpts...)
 	}
-	return &Backend{client: c.client}, nil
+	return &Backend{client: c.client, ops: sdkS3WriteOperations{client: c.client}}, nil
 }
 
 // Close is a no-op: the v2 S3 client holds no persistent connection.
@@ -139,14 +143,33 @@ func (b *Backend) Open(ctx context.Context, path string) (shstorage.File, error)
 	}, nil
 }
 
-// Create opens an S3 object writer. Bytes are buffered in memory and uploaded
-// as a single PutObject on Close. Replaces any existing object at path.
+// Create opens an S3 object writer. Close stages the bytes under an internal
+// key, then conditionally copies that exact object into the destination.
 func (b *Backend) Create(ctx context.Context, path string) (shstorage.Writer, error) {
 	bucket, key, err := ParsePath(path)
 	if err != nil {
 		return nil, err
 	}
-	return &writer{client: b.client, bucket: bucket, key: key, ctx: ctx}, nil
+	ctx = contextOrBackground(ctx)
+	ops := b.writeOperations()
+	target, err := ops.head(ctx, bucket, key)
+	if err != nil && !isNotFound(err) {
+		return nil, fmt.Errorf("s3: inspect destination s3://%s/%s: %w", bucket, key, err)
+	}
+	if err == nil && target.etag == nil {
+		return nil, fmt.Errorf("s3: inspect destination s3://%s/%s: missing ETag", bucket, key)
+	}
+	return &writer{
+		ops:            ops,
+		bucket:         bucket,
+		key:            key,
+		stageKey:       ".shoal-tmp/" + uuid.NewString(),
+		writeID:        uuid.NewString(),
+		ctx:            ctx,
+		targetExists:   err == nil,
+		target:         target,
+		cleanupTimeout: s3CleanupTimeout,
+	}, nil
 }
 
 // List returns paths of objects directly under prefix (using delimiter="/").
@@ -171,7 +194,8 @@ func (b *Backend) List(ctx context.Context, prefix string) ([]string, error) {
 			return nil, fmt.Errorf("s3: ListObjectsV2 s3://%s/%s: %w", bucket, objectPrefix, err)
 		}
 		for _, obj := range page.Contents {
-			if obj.Key == nil || strings.HasSuffix(*obj.Key, "/") {
+			if obj.Key == nil || strings.HasSuffix(*obj.Key, "/") ||
+				strings.HasPrefix(*obj.Key, ".shoal-tmp/") {
 				continue
 			}
 			out = append(out, "s3://"+bucket+"/"+*obj.Key)
@@ -261,17 +285,121 @@ func (f *file) ReadAt(p []byte, off int64) (int, error) {
 	return n, nil
 }
 
-// writer buffers bytes in memory and uploads them as a single PutObject on
-// Close. S3 has no streaming-append API; buffering on Close matches the
-// one-shot usage pattern of storage.WriteAll.
+type s3ObjectState struct {
+	etag      *string
+	versionID *string
+	size      int64
+	metadata  map[string]string
+}
+
+type s3WriteOperations interface {
+	head(context.Context, string, string) (s3ObjectState, error)
+	putStage(context.Context, string, string, []byte, string) (s3ObjectState, error)
+	promote(context.Context, string, string, string, s3ObjectState, bool, s3ObjectState) error
+	deleteStage(context.Context, string, string, s3ObjectState) error
+}
+
+type sdkS3WriteOperations struct {
+	client *s3sdk.Client
+}
+
+func (o sdkS3WriteOperations) head(ctx context.Context, bucket, key string) (s3ObjectState, error) {
+	out, err := o.client.HeadObject(ctx, &s3sdk.HeadObjectInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String(key),
+	})
+	if err != nil {
+		return s3ObjectState{}, err
+	}
+	state := s3ObjectState{etag: out.ETag, versionID: out.VersionId, metadata: out.Metadata}
+	if out.ContentLength != nil {
+		state.size = *out.ContentLength
+	}
+	return state, nil
+}
+
+func (o sdkS3WriteOperations) putStage(
+	ctx context.Context, bucket, key string, data []byte, writeID string,
+) (s3ObjectState, error) {
+	out, err := o.client.PutObject(ctx, &s3sdk.PutObjectInput{
+		Bucket:        aws.String(bucket),
+		Key:           aws.String(key),
+		Body:          bytes.NewReader(data),
+		ContentLength: aws.Int64(int64(len(data))),
+		IfNoneMatch:   aws.String("*"),
+		Metadata:      map[string]string{"shoal-write-id": writeID},
+	})
+	if err != nil {
+		return s3ObjectState{}, err
+	}
+	return s3ObjectState{
+		etag:      out.ETag,
+		versionID: out.VersionId,
+		size:      int64(len(data)),
+		metadata:  map[string]string{"shoal-write-id": writeID},
+	}, nil
+}
+
+func (o sdkS3WriteOperations) promote(
+	ctx context.Context,
+	bucket, stageKey, key string,
+	stage s3ObjectState,
+	targetExists bool,
+	target s3ObjectState,
+) error {
+	in := &s3sdk.CopyObjectInput{
+		Bucket:            aws.String(bucket),
+		Key:               aws.String(key),
+		CopySource:        aws.String(url.PathEscape(bucket + "/" + stageKey)),
+		CopySourceIfMatch: stage.etag,
+	}
+	if targetExists {
+		in.IfMatch = target.etag
+	} else {
+		in.IfNoneMatch = aws.String("*")
+	}
+	_, err := o.client.CopyObject(ctx, in)
+	return err
+}
+
+func (o sdkS3WriteOperations) deleteStage(
+	ctx context.Context, bucket, key string, stage s3ObjectState,
+) error {
+	_, err := o.client.DeleteObject(ctx, &s3sdk.DeleteObjectInput{
+		Bucket:    aws.String(bucket),
+		Key:       aws.String(key),
+		IfMatch:   stage.etag,
+		VersionId: stage.versionID,
+	})
+	return err
+}
+
+var s3CleanupTimeout = 10 * time.Second
+
+func (b *Backend) writeOperations() s3WriteOperations {
+	if b.ops != nil {
+		return b.ops
+	}
+	return sdkS3WriteOperations{client: b.client}
+}
+
+// writer buffers bytes in memory, stages them, and conditionally publishes the
+// staged object on Close.
 type writer struct {
-	client  *s3sdk.Client
-	bucket  string
-	key     string
-	ctx     context.Context //nolint:containedctx
-	buf     bytes.Buffer
-	closed  bool
-	aborted bool
+	ops            s3WriteOperations
+	bucket         string
+	key            string
+	stageKey       string
+	writeID        string
+	ctx            context.Context //nolint:containedctx
+	targetExists   bool
+	target         s3ObjectState
+	stage          s3ObjectState
+	stageCreated   bool
+	cleanupTimeout time.Duration
+	buf            bytes.Buffer
+	closed         bool
+	aborted        bool
 }
 
 func (w *writer) Write(p []byte) (int, error) {
@@ -289,18 +417,47 @@ func (w *writer) Close() error {
 		return fmt.Errorf("s3: writer already aborted")
 	}
 	if w.closed {
+		_ = w.cleanupStage()
 		return nil
 	}
-	_, err := w.client.PutObject(w.ctx, &s3sdk.PutObjectInput{
-		Bucket:        aws.String(w.bucket),
-		Key:           aws.String(w.key),
-		Body:          bytes.NewReader(w.buf.Bytes()),
-		ContentLength: aws.Int64(int64(w.buf.Len())),
-	})
-	if err != nil {
-		return fmt.Errorf("s3: PutObject s3://%s/%s: %w", w.bucket, w.key, err)
+	if !w.stageCreated {
+		stage, err := w.ops.putStage(w.ctx, w.bucket, w.stageKey, w.buf.Bytes(), w.writeID)
+		if err != nil {
+			if verified, verifyErr := w.verifyStage(); verifyErr != nil || !verified {
+				return errors.Join(
+					fmt.Errorf("s3: stage upload s3://%s/%s: %w", w.bucket, w.stageKey, err),
+					verifyErr,
+					w.cleanupStage(),
+				)
+			}
+			stage = w.stage
+		}
+		w.stage = stage
+		w.stageCreated = true
+	}
+	if w.stage.etag == nil {
+		if verified, err := w.verifyStage(); err != nil || !verified || w.stage.etag == nil {
+			return errors.Join(
+				fmt.Errorf("s3: temporary object s3://%s/%s is missing an ETag", w.bucket, w.stageKey),
+				err,
+				w.cleanupStage(),
+			)
+		}
+	}
+	if err := w.ops.promote(
+		w.ctx, w.bucket, w.stageKey, w.key, w.stage, w.targetExists, w.target,
+	); err != nil {
+		if verified, verifyErr := w.verifyDestination(); verifyErr != nil || !verified {
+			return errors.Join(
+				fmt.Errorf("s3: promote s3://%s/%s to s3://%s/%s: %w",
+					w.bucket, w.stageKey, w.bucket, w.key, err),
+				verifyErr,
+				w.cleanupStage(),
+			)
+		}
 	}
 	w.closed = true
+	_ = w.cleanupStage()
 	return nil
 }
 
@@ -311,9 +468,71 @@ func (w *writer) Abort() error {
 	if w.closed {
 		return fmt.Errorf("s3: writer already closed")
 	}
+	if err := w.cleanupStage(); err != nil {
+		return err
+	}
 	w.aborted = true
 	w.buf.Reset()
 	return nil
+}
+
+func (w *writer) verifyStage() (bool, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), w.cleanupTimeout)
+	defer cancel()
+	state, err := w.ops.head(ctx, w.bucket, w.stageKey)
+	if err != nil {
+		if isNotFound(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("s3: verify temporary object s3://%s/%s: %w", w.bucket, w.stageKey, err)
+	}
+	if state.size != int64(w.buf.Len()) || state.metadata["shoal-write-id"] != w.writeID {
+		return false, nil
+	}
+	w.stage = state
+	w.stageCreated = true
+	return true, nil
+}
+
+func (w *writer) verifyDestination() (bool, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), w.cleanupTimeout)
+	defer cancel()
+	state, err := w.ops.head(ctx, w.bucket, w.key)
+	if err != nil {
+		if isNotFound(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("s3: verify destination s3://%s/%s: %w", w.bucket, w.key, err)
+	}
+	if w.targetExists && equalStringPointers(state.etag, w.target.etag) {
+		return false, nil
+	}
+	return state.size == int64(w.buf.Len()) &&
+		state.metadata["shoal-write-id"] == w.writeID, nil
+}
+
+func (w *writer) cleanupStage() error {
+	if !w.stageCreated {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), w.cleanupTimeout)
+	defer cancel()
+	if err := w.ops.deleteStage(ctx, w.bucket, w.stageKey, w.stage); err != nil && !isNotFound(err) {
+		return fmt.Errorf("s3: remove temporary object s3://%s/%s: %w", w.bucket, w.stageKey, err)
+	}
+	w.stageCreated = false
+	return nil
+}
+
+func equalStringPointers(a, b *string) bool {
+	return a != nil && b != nil && *a == *b
+}
+
+func contextOrBackground(ctx context.Context) context.Context {
+	if ctx == nil {
+		return context.Background()
+	}
+	return ctx
 }
 
 // isNotFound reports whether err is an S3 "key does not exist" error.

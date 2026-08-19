@@ -20,13 +20,140 @@ package azure
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"strings"
 	"testing"
 
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/bloberror"
+
 	shstorage "github.com/phrocker/shoal/internal/storage"
 )
+
+type fakeAzureObject struct {
+	state azureObjectState
+	data  string
+}
+
+type fakeAzureWriteOperations struct {
+	objects             map[string]fakeAzureObject
+	stageFailure        bool
+	stageResponseLost   bool
+	promoteResponseLost bool
+	mutateBeforePromote bool
+	deleteFailures      int
+	promoteCalls        int
+	cleanupCanceled     bool
+	nextETag            int
+}
+
+func newFakeAzureWriteOperations() *fakeAzureWriteOperations {
+	return &fakeAzureWriteOperations{objects: make(map[string]fakeAzureObject)}
+}
+
+func azureNotFoundError() error {
+	return &azcore.ResponseError{ErrorCode: string(bloberror.BlobNotFound)}
+}
+
+func (f *fakeAzureWriteOperations) head(
+	_ context.Context, _, name string,
+) (azureObjectState, error) {
+	obj, ok := f.objects[name]
+	if !ok {
+		return azureObjectState{}, azureNotFoundError()
+	}
+	return obj.state, nil
+}
+
+func (f *fakeAzureWriteOperations) upload(
+	ctx context.Context,
+	_, name string,
+	data []byte,
+	writeID string,
+	targetExists bool,
+	target azureObjectState,
+) (azureObjectState, error) {
+	isStage := strings.HasPrefix(name, ".shoal-tmp/")
+	if isStage && f.stageFailure {
+		return azureObjectState{}, errors.New("stage checksum failed")
+	}
+	if !isStage {
+		f.promoteCalls++
+		if f.mutateBeforePromote {
+			f.mutateBeforePromote = false
+			f.nextETag++
+			etag := azcore.ETag(fmt.Sprintf("\"etag-%d\"", f.nextETag))
+			f.objects[name] = fakeAzureObject{
+				state: azureObjectState{etag: &etag, size: int64(len("concurrent"))},
+				data:  "concurrent",
+			}
+		}
+		current, exists := f.objects[name]
+		if exists != targetExists ||
+			(exists && !equalETags(current.state.etag, target.etag)) {
+			return azureObjectState{}, errors.New("destination precondition failed")
+		}
+		if err := ctx.Err(); err != nil {
+			return azureObjectState{}, err
+		}
+	}
+	f.nextETag++
+	etag := azcore.ETag(fmt.Sprintf("\"etag-%d\"", f.nextETag))
+	id := writeID
+	state := azureObjectState{
+		etag:     &etag,
+		size:     int64(len(data)),
+		metadata: map[string]*string{"shoal-write-id": &id},
+	}
+	f.objects[name] = fakeAzureObject{state: state, data: string(data)}
+	if isStage && f.stageResponseLost {
+		f.stageResponseLost = false
+		return azureObjectState{}, errors.New("stage response lost")
+	}
+	if !isStage && f.promoteResponseLost {
+		f.promoteResponseLost = false
+		return azureObjectState{}, errors.New("upload response lost")
+	}
+	if err := ctx.Err(); err != nil {
+		return azureObjectState{}, err
+	}
+	return state, nil
+}
+
+func (f *fakeAzureWriteOperations) deleteStage(
+	ctx context.Context, _, name string, _ azureObjectState,
+) error {
+	if ctx.Err() != nil {
+		f.cleanupCanceled = true
+		return ctx.Err()
+	}
+	if f.deleteFailures > 0 {
+		f.deleteFailures--
+		return errors.New("delete failed")
+	}
+	if _, ok := f.objects[name]; !ok {
+		return azureNotFoundError()
+	}
+	delete(f.objects, name)
+	return nil
+}
+
+func newFakeAzureWriter(f *fakeAzureWriteOperations, target string) *writer {
+	targetState, err := f.head(context.Background(), "container", target)
+	return &writer{
+		ops:            f,
+		container:      "container",
+		name:           target,
+		stageName:      ".shoal-tmp/stage",
+		writeID:        "write-id",
+		ctx:            context.Background(),
+		targetExists:   err == nil,
+		target:         targetState,
+		cleanupTimeout: azureCleanupTimeout,
+	}
+}
 
 func TestParsePath(t *testing.T) {
 	cases := []struct {
@@ -147,6 +274,128 @@ func TestWriter_WriteAfterCloseReportsClosedState(t *testing.T) {
 	if _, err := w.Write([]byte("late")); err == nil || !strings.Contains(err.Error(), "closed") {
 		t.Fatalf("Write after Close error = %v, want closed state", err)
 	}
+}
+
+func TestWriter_StagedCreateAndReplace(t *testing.T) {
+	for _, existing := range []bool{false, true} {
+		t.Run(fmt.Sprintf("existing=%v", existing), func(t *testing.T) {
+			f := newFakeAzureWriteOperations()
+			if existing {
+				etag := azcore.ETag("\"old\"")
+				f.objects["target"] = fakeAzureObject{
+					state: azureObjectState{etag: &etag, size: 3},
+					data:  "old",
+				}
+			}
+			w := newFakeAzureWriter(f, "target")
+			_, _ = w.Write([]byte("new"))
+			if err := w.Close(); err != nil {
+				t.Fatalf("Close: %v", err)
+			}
+			if got := f.objects["target"].data; got != "new" {
+				t.Fatalf("target data = %q, want new", got)
+			}
+			if _, ok := f.objects[w.stageName]; ok {
+				t.Fatal("temporary blob was not removed")
+			}
+		})
+	}
+}
+
+func TestWriter_VerifiesCommittedResponsesWithoutReplayingPromotion(t *testing.T) {
+	f := newFakeAzureWriteOperations()
+	f.stageResponseLost = true
+	f.promoteResponseLost = true
+	w := newFakeAzureWriter(f, "target")
+	_, _ = w.Write([]byte("new"))
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	if f.promoteCalls != 1 {
+		t.Fatalf("promote calls = %d, want 1", f.promoteCalls)
+	}
+	if got := f.objects["target"].data; got != "new" {
+		t.Fatalf("target data = %q, want new", got)
+	}
+}
+
+func TestWriter_StageFailurePreservesExistingTarget(t *testing.T) {
+	f := newFakeAzureWriteOperations()
+	etag := azcore.ETag("\"old\"")
+	f.objects["target"] = fakeAzureObject{
+		state: azureObjectState{etag: &etag, size: 3},
+		data:  "old",
+	}
+	f.stageFailure = true
+	w := newFakeAzureWriter(f, "target")
+	_, _ = w.Write([]byte("new"))
+	if err := w.Close(); err == nil {
+		t.Fatal("Close succeeded after stage failure")
+	}
+	if got := f.objects["target"].data; got != "old" {
+		t.Fatalf("target data = %q, want old", got)
+	}
+}
+
+func TestWriter_ConcurrentTargetMutationIsPreserved(t *testing.T) {
+	f := newFakeAzureWriteOperations()
+	etag := azcore.ETag("\"old\"")
+	f.objects["target"] = fakeAzureObject{
+		state: azureObjectState{etag: &etag, size: 3},
+		data:  "old",
+	}
+	f.mutateBeforePromote = true
+	w := newFakeAzureWriter(f, "target")
+	_, _ = w.Write([]byte("new"))
+	if err := w.Close(); err == nil {
+		t.Fatal("Close succeeded after concurrent target mutation")
+	}
+	if got := f.objects["target"].data; got != "concurrent" {
+		t.Fatalf("target data = %q, want concurrent", got)
+	}
+	if _, ok := f.objects[w.stageName]; ok {
+		t.Fatal("temporary blob was not removed after failed promotion")
+	}
+}
+
+func TestWriter_CleanupUsesIndependentContextAndCanRetryAfterCommit(t *testing.T) {
+	t.Run("request cancellation", func(t *testing.T) {
+		f := newFakeAzureWriteOperations()
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		w := newFakeAzureWriter(f, "target")
+		w.ctx = ctx
+		_, _ = w.Write([]byte("new"))
+		if err := w.Close(); err == nil {
+			t.Fatal("Close succeeded with canceled promotion context")
+		}
+		if f.cleanupCanceled {
+			t.Fatal("cleanup inherited canceled request context")
+		}
+		if _, ok := f.objects[w.stageName]; ok {
+			t.Fatal("temporary blob was not removed")
+		}
+	})
+
+	t.Run("retry after committed close", func(t *testing.T) {
+		f := newFakeAzureWriteOperations()
+		f.deleteFailures = 1
+		w := newFakeAzureWriter(f, "target")
+		_, _ = w.Write([]byte("new"))
+		if err := w.Close(); err != nil {
+			t.Fatalf("Close promoted cleanup failure: %v", err)
+		}
+		if _, ok := f.objects[w.stageName]; !ok {
+			t.Fatal("temporary blob unexpectedly removed")
+		}
+		if err := w.Close(); err != nil {
+			t.Fatalf("second Close: %v", err)
+		}
+		if _, ok := f.objects[w.stageName]; ok {
+			t.Fatal("second Close did not retry temporary cleanup")
+		}
+	})
 }
 
 // TestFile_ReadAt_EdgeCases exercises the code paths in file.ReadAt that do not
