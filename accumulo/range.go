@@ -144,17 +144,33 @@ func (r *Range) KeyBounds() (start *Key, startInclusive bool, end *Key, endInclu
 	if r == nil {
 		return nil, true, nil, false
 	}
-	start, startInclusive = r.StartKey(), r.startInclusive
-	if start != nil && r.startRowOnly {
-		start = firstKeyOfRow(start.Row, !r.startInclusive)
-		startInclusive = true
+	start, startInclusive = r.effectiveStart()
+	end, endInclusive = r.effectiveEnd()
+	return cloneKey(start), startInclusive, cloneKey(end), endInclusive
+}
+
+// effectiveStart resolves the lower bound without copying. A row-only bound
+// allocates its boundary key; a key bound is the stored key, which callers here
+// only read. KeyBounds copies before handing either to a caller.
+func (r *Range) effectiveStart() (*Key, bool) {
+	if r.startKey == nil {
+		return nil, r.startInclusive
 	}
-	end, endInclusive = r.EndKey(), r.endInclusive
-	if end != nil && r.endRowOnly {
-		end = firstKeyOfRow(end.Row, r.endInclusive)
-		endInclusive = false
+	if r.startRowOnly {
+		return firstKeyOfRow(r.startKey.Row, !r.startInclusive), true
 	}
-	return start, startInclusive, end, endInclusive
+	return r.startKey, r.startInclusive
+}
+
+// effectiveEnd resolves the upper bound without copying, as effectiveStart does.
+func (r *Range) effectiveEnd() (*Key, bool) {
+	if r.endKey == nil {
+		return nil, r.endInclusive
+	}
+	if r.endRowOnly {
+		return firstKeyOfRow(r.endKey.Row, r.endInclusive), false
+	}
+	return r.endKey, r.endInclusive
 }
 
 // firstKeyOfRow returns the smallest key Accumulo can hold in row, or in the
@@ -170,15 +186,15 @@ func firstKeyOfRow(row []byte, following bool) *Key {
 // AfterEndKey reports whether key sorts after this range's upper bound, which
 // is the Go form of Sharkbite's after_end_key.
 //
-// The comparison uses the range's effective bounds ([Range.KeyBounds]), so a
-// row bound covers every cell of the row: a key in the end row is inside an
-// inclusive row-bounded range and outside an exclusive one, whatever its column
-// family or timestamp.
+// The comparison uses the range's effective bounds (the same ones
+// [Range.KeyBounds] returns), so a row bound covers every cell of the row: a key
+// in the end row is inside an inclusive row-bounded range and outside an
+// exclusive one, whatever its column family or timestamp.
 func (r *Range) AfterEndKey(key Key) bool {
 	if r == nil {
 		return false
 	}
-	_, _, end, endInclusive := r.KeyBounds()
+	end, endInclusive := r.effectiveEnd()
 	if end == nil {
 		return false
 	}
@@ -195,7 +211,7 @@ func (r *Range) BeforeStartKey(key Key) bool {
 	if r == nil {
 		return false
 	}
-	start, startInclusive, _, _ := r.KeyBounds()
+	start, startInclusive := r.effectiveStart()
 	if start == nil {
 		return false
 	}

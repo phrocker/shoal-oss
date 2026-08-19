@@ -179,18 +179,17 @@ func (a *Authorizations) String() string {
 // Validate reports the first label that holds a character outside the set
 // Sharkbite declares valid: ASCII letters, digits, '_', '-' and ':'.
 //
-// Nothing in Shoal calls it, exactly as nothing in Sharkbite calls its
-// equivalent. It exists so a caller that wants the declared rule can apply it
-// before a label reaches a cluster, without Shoal silently rejecting labels the
-// pinned release accepts.
+// It applies exactly the rule the pinned validateAuths() walks, and nothing
+// more: that loop only inspects the characters a label holds, so an empty label
+// passes there and passes here. Nothing in Shoal calls it, exactly as nothing in
+// Sharkbite calls its equivalent. It exists so a caller that wants the declared
+// rule can apply it before a label reaches a cluster, without Shoal silently
+// rejecting labels the pinned release accepts.
 func (a *Authorizations) Validate() error {
 	if a == nil {
 		return nil
 	}
 	for _, label := range a.labels {
-		if len(label) == 0 {
-			return fmt.Errorf("%w: empty authorization label", ErrInvalidAuthorizations)
-		}
 		for _, character := range label {
 			if !ValidAuthorizationCharacter(character) {
 				return fmt.Errorf(

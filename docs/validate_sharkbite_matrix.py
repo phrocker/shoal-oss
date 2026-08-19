@@ -60,8 +60,8 @@ def status_count_map(
 
 EXPECTED_STATUS_COUNTS = {
     "Covered": 1,
-    "Missing Go": 2372,
-    "Missing C ABI": 129,
+    "Missing Go": 2364,
+    "Missing C ABI": 137,
     "Behavior mismatch": 222,
     "Intentional divergence (approval required)": 87,
     "Not required (rationale required)": 392,
@@ -88,7 +88,8 @@ EXPECTED_PREFIX_COUNTS = {
         not_required=8,
     ),
     "SB-CXX": status_count_map(
-        missing_go=2307,
+        missing_go=2299,
+        missing_c_abi=8,
         behavior_mismatch=15,
         not_required=304,
     ),
@@ -325,6 +326,7 @@ OPTIONAL_ANCHOR_CITATIONS = {
 TARGETED_SB_DATA_CITATIONS = {
     "accumulo/authorizations.go",
     "accumulo/key_string.go",
+    "accumulo/range.go",
     "accumulo/value_types_test.go",
 }
 
@@ -1635,7 +1637,7 @@ def validate_status_narratives(
         f"The shape of the work is visible in the {status_counts['Missing Go']} `Missing Go` rows, of which {prefix_counts['SB-CXX']['Missing Go']} are the C++ members in [§19.2](#sec-19-2) that no Shoal layer exports.",
         f"`Behavior mismatch` ({status_counts['Behavior mismatch']}) is the bucket that sets the schedule: {python_visible_behavior} rows on the Python-visible and curated C++ surface each need a differential test against a live cluster or the exported ABI, and {prefix_counts['SB-CXX']['Behavior mismatch']} are destructors of classes bound into Python, where the destruction point is user-observable and the model differs from Go finalisation ([§19.1](#sec-19-1)).",
         f"`Intentional divergence` ({status_counts[INTENTIONAL_DIVERGENCE_STATUS]}) is dominated by one upstream fact: {prefix_counts['SB-STAT'][INTENTIONAL_DIVERGENCE_STATUS]} rows are cluster-status accessors Accumulo itself deleted ([§14](#sec-14), [SB-DIV-016](#sec-26)).",
-        f"`Missing C ABI` ({status_counts['Missing C ABI']}) is now led by the RFile and stream surface ({prefix_counts['SB-RFILE']['Missing C ABI']}), ahead of pandas ({prefix_counts['SB-PANDA']['Missing C ABI']}), high-level helpers ({prefix_counts['SB-BASE']['Missing C ABI']}), client configuration ({prefix_counts['SB-CFG']['Missing C ABI']}), the data model ({prefix_counts['SB-DATA']['Missing C ABI']}), packaging/import scaffolding ({prefix_counts['SB-PKG']['Missing C ABI']}), and PyTorch ({prefix_counts['SB-TORCH']['Missing C ABI']}).",
+        f"`Missing C ABI` ({status_counts['Missing C ABI']}) is now led by the RFile and stream surface ({prefix_counts['SB-RFILE']['Missing C ABI']}), ahead of pandas ({prefix_counts['SB-PANDA']['Missing C ABI']}), high-level helpers ({prefix_counts['SB-BASE']['Missing C ABI']}), client configuration ({prefix_counts['SB-CFG']['Missing C ABI']}), the data model ({prefix_counts['SB-DATA']['Missing C ABI']}), packaging/import scaffolding ({prefix_counts['SB-PKG']['Missing C ABI']}), PyTorch ({prefix_counts['SB-TORCH']['Missing C ABI']}), and the enumerated C++ members ({prefix_counts['SB-CXX']['Missing C ABI']}).",
     ]
     for phrase in expected_phrases:
         require(phrase in normalized, f"missing or stale status narrative: {phrase}")

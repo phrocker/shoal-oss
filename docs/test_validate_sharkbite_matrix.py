@@ -727,8 +727,8 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
             validator.EXPECTED_STATUS_COUNTS,
             {
                 "Covered": 1,
-                "Missing Go": 2372,
-                "Missing C ABI": 129,
+                "Missing Go": 2364,
+                "Missing C ABI": 137,
                 "Behavior mismatch": 222,
                 validator.INTENTIONAL_DIVERGENCE_STATUS: 87,
                 validator.NOT_REQUIRED_STATUS: 392,
@@ -872,11 +872,11 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
     def test_declared_count_edit_still_fails_internal_cross_check(self) -> None:
         text = load_document_text()
         mutated = replace_pattern_once(
-            text, re.escape("| Missing Go | 2372 |"), "| Missing Go | 2371 |"
+            text, re.escape("| Missing Go | 2364 |"), "| Missing Go | 2363 |"
         )
         self.assert_validation_fails(
             lambda: validator.validate_counts(mutated.splitlines(), mutated),
-            "status summary says 2371 rows for Missing Go, but parsed 2372",
+            "status summary says 2363 rows for Missing Go, but parsed 2364",
         )
 
     def test_stale_c_abi_symbol_inventory_narrative_is_rejected(self) -> None:

@@ -1039,9 +1039,9 @@ SB-CXX-0507 Missing Go
 SB-CXX-0508 Missing Go
 SB-CXX-0509 Missing Go
 SB-CXX-0510 Missing Go
-SB-CXX-0511 Missing Go
-SB-CXX-0512 Missing Go
-SB-CXX-0513 Missing Go
+SB-CXX-0511 Missing C ABI
+SB-CXX-0512 Missing C ABI
+SB-CXX-0513 Missing C ABI
 SB-CXX-0514 Missing Go
 SB-CXX-0515 Missing Go
 SB-CXX-0516 Missing Go
@@ -1146,8 +1146,8 @@ SB-CXX-0614 Not required (rationale required)
 SB-CXX-0615 Not required (rationale required)
 SB-CXX-0616 Missing Go
 SB-CXX-0617 Behavior mismatch
-SB-CXX-0618 Missing Go
-SB-CXX-0619 Missing Go
+SB-CXX-0618 Missing C ABI
+SB-CXX-0619 Missing C ABI
 SB-CXX-0620 Missing Go
 SB-CXX-0621 Missing Go
 SB-CXX-0622 Missing Go
@@ -1570,10 +1570,10 @@ SB-CXX-1038 Missing Go
 SB-CXX-1039 Not required (rationale required)
 SB-CXX-1040 Not required (rationale required)
 SB-CXX-1041 Not required (rationale required)
-SB-CXX-1042 Missing Go
+SB-CXX-1042 Missing C ABI
 SB-CXX-1043 Not required (rationale required)
-SB-CXX-1044 Missing Go
-SB-CXX-1045 Missing Go
+SB-CXX-1044 Missing C ABI
+SB-CXX-1045 Missing C ABI
 SB-CXX-1046 Missing Go
 SB-CXX-1047 Missing Go
 SB-CXX-1048 Missing Go

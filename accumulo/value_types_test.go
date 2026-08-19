@@ -89,6 +89,16 @@ func TestAuthorizationsAcceptsWhatSharkbiteAccepts(t *testing.T) {
 	if err := clean.Validate(); err != nil {
 		t.Fatalf("Validate over legal labels = %v, want nil", err)
 	}
+	// The pinned validateAuths() only walks the characters a label holds, so an
+	// empty label passes it. The opt-in check must not be stricter than the
+	// rule it exposes.
+	empty := NewAuthorizations([]byte(""))
+	if empty.Len() != 1 {
+		t.Fatalf("Len = %d, want the empty label stored", empty.Len())
+	}
+	if err := empty.Validate(); err != nil {
+		t.Fatalf("Validate over an empty label = %v, want nil", err)
+	}
 	for _, character := range []byte("azAZ09_-:") {
 		if !ValidAuthorizationCharacter(character) {
 			t.Fatalf("ValidAuthorizationCharacter(%q) = false", character)
