@@ -232,13 +232,15 @@ therefore always starts from an empty hosted set under a fresh
 generation, which is what makes "process restart and ServiceLock loss do
 not leave a tablet multiply hosted" hold.
 
-The lock the rejoin takes is a new `ServiceLock`, and it may carry the
-same lock UUID as the one before it: the generation is the node, not the
-UUID, and the sequence is what separates them. That makes a stale
-shutdown of the generation that ended dangerous in a way the state
-machine cannot see — it would be deleting a ZooKeeper node, not calling
-`LoseLock` — so the sweep that takes back nodes is fenced too, under
-"The lock node".
+The lock the rejoin takes is a new `ServiceLock`, and it carries a lock
+UUID of its own: `NewServiceLock` mints one and offers no way to supply
+one, which is what `announceExistence` does with `UUID.randomUUID()` per
+`ServiceLock`. Two generations of the same process therefore never share
+a node prefix. That is what makes a stale shutdown of the generation
+that ended harmless in a way the state machine could not have made it —
+it deletes ZooKeeper nodes rather than calling `LoseLock`, so the host's
+fence never sees it — and it is why the cleanup can identify its nodes
+by prefix at all. See "The lock node".
 
 A `LockID` is only usable as fencing authority if it could name a real
 `zlock#<uuid>#<sequence>` node: the UUID must parse and the sequence must
@@ -351,51 +353,54 @@ committing there would hand back a lock the caller stopped waiting for
 and left nobody maintaining it, so both paths refuse and the node is
 swept.
 
-The prefix only identifies the sweep's own nodes while the lock is the
-one this process is participating with. The prefix carries the lock
-UUID, and Accumulo mints a fresh one per `ServiceLock` — `UUID
-.randomUUID()` inside `announceExistence`, used for both the node name
-and every descriptor — but nothing in the wire format says so, and a
-process that keeps a server identity in configuration would reuse it on
-every rejoin. Two generations would then share a prefix, and the older
-one's shutdown path would delete the live node of the one that replaced
-it: a lock revoked underneath a server the manager had just seen take
-it, with no event to say so.
+Both of those steps — adopting the lowest node under this process's
+prefix, and sweeping everything under it — treat the prefix as a
+statement of ownership. It carries the lock UUID, so that is only true
+if a UUID belongs to one `ServiceLock` and never to two. Accumulo makes
+it true by construction: `announceExistence` calls `UUID.randomUUID()`
+immediately before building the `ServiceLock` and uses that value for
+the node prefix and for every descriptor. `NewServiceLock` does the
+same, and offers no option to supply one, so a caller keeping a server
+identity in configuration cannot reintroduce the collision.
 
-So a sweep by prefix is allowed only while the acquisition is in flight
-or the generation is held — the window in which the next `ServiceLock`
-cannot exist yet, because it is built after this one is done. That is
-also the window the prefix is needed in: a create whose answer was lost
-leaves a node under a name this process never learned, and only the
-directory can find it. Afterwards the sweep takes back what the lock
-recorded as its own, which is every node it created or adopted, and
-cannot include one it never made.
+Both directions fail if two generations can share a prefix, and they
+fail in opposite ways. The sweep would reach too far: a `Release`
+arriving after its generation ended — a shutdown path that runs twice, a
+goroutine that outlived its lock — would delete the live node of the
+generation that replaced it, revoking a lock underneath a server the
+manager had just seen take it, with no event to say so. The acquisition
+would reach too far as well: it adopts the lowest node under the prefix,
+so a rejoin would take over the node its predecessor left behind, hand
+back the `LockID` the dead generation had, and publish the payload
+already sitting in that node. A request stamped with the generation that
+ended would then be accepted — the fence defeated by the mechanism meant
+to complete it.
 
-Every way out of acquisition without a lock closes that window, not
-only the ones that created something. A cancellation caught before the
-first create, and a lock directory this session is not yet allowed to
-make, both leave nothing to sweep — but a caller whose shutdown path is
-`Release` calls it regardless, and a server that could not create the
-directory is a server that will retry. The attempt that failed must not
-be able to sweep the one that worked.
+With the UUID minted per lock, neither is reachable and nothing else has
+to be tracked. The sweep does not depend on how far the acquisition got,
+on whether the generation is still held, or on a record of what was
+created: it lists the directory and deletes what carries its prefix. So
+a cancellation caught before the first create and a lock directory this
+session is not yet allowed to make — both of which leave nothing behind
+— are as safe as a held generation being released, which matters because
+a caller whose shutdown path is `Release` calls it regardless and a
+server that could not create the directory is a server that will retry.
 
-The recorded list is kept complete rather than assumed complete. Every
-listing the lock makes while it is the live participant — each pass of
-the queue, and each `Verify` — records what carries the prefix, so a
-node it never created but is nonetheless responsible for is swept with
-the rest. It has to be. A generation can end with the session still
-alive: a read that fails closed, or a node an operator removed. Whatever
-is left under the prefix survives that, and once the adopted node goes
-it is the lowest in the directory and so the holder the manager reads —
-the same server-that-maintains-nothing this file refuses everywhere else.
+Reaching far enough is the same property read the other way. A node this
+lock created but never learned the name of — a create whose answer was
+lost — still carries the prefix and is still swept. It has to be. A
+generation can end with the session still alive: a read that fails
+closed, or a node an operator removed. Anything left under the prefix
+survives that, and once the adopted node goes it is the lowest in the
+directory and so the holder the manager reads — the same
+server-that-maintains-nothing this file refuses everywhere else.
 
-The client cannot leave one behind those listings. go-zookeeper does not
-replay requests across a reconnect; it fails every pending one and
-resends only auth. So a create either returns the node it made or an
-error, and the error ends the acquisition through a sweep taken while
-the lock is still live. One that arrives some other way is collapsed by
-the next acquisition under the same prefix, which drops every duplicate
-it finds, and goes with the session.
+The client is not expected to leave one. go-zookeeper does not replay
+requests across a reconnect; it fails every pending one and resends only
+auth. So a create either returns the node it made or an error, and the
+error ends the acquisition through the same sweep. One that arrives some
+other way is collapsed by the acquisition, which drops every duplicate
+under the prefix, and goes with the session.
 
 ### What the node says
 
@@ -550,8 +555,8 @@ claimed them. If the host refuses the generation — one that is not newer
 than a generation it already used — the lock is given back rather than
 held, so the manager can place the work on a server that will take it.
 
-`Release` sweeps every node this process created, not just the one it
-holds, and it is safe against an acquisition that has not finished:
+`Release` sweeps every node under this lock's prefix, not just the one
+it holds, and it is safe against an acquisition that has not finished:
 the wait is woken and refused with `ErrLockReleased`. Releasing only the
 held node would leave a caller that was told the lock was gone going on
 to hold it, and would promote a surviving duplicate to holder of a lock
@@ -588,16 +593,17 @@ indistinguishable from a replay of a lock it no longer holds. The
 high-water mark is per-host state, so recovery is a fresh `Host`, not a
 retry; retrying against the same one fails identically every time.
 
-Recovery from a recreated directory needs a fresh lock UUID as well. A
-generation is the UUID and the sequence together, so rejoining under the
-process's old UUID against a restarted counter remints the *same*
-generation the dead one had. A fresh `Host` has no history to refuse it,
-and it will also accept a request that was fenced with the dead
-generation and is still in flight — the fence would be satisfied by
-something that is no longer true. Leaving `ServiceLockOptions.UUID`
-empty mints a new one, which makes the two generations distinguishable;
-the descriptors follow it without any extra care, because `Acquire`
-refuses descriptors that name a server other than the lock's own UUID.
+A recreated directory is also why the lock UUID cannot be a caller's
+choice. A generation is the UUID and the sequence together, so a rejoin
+under the process's old UUID against a restarted counter would remint
+the *same* generation the dead one had. A fresh `Host` has no history to
+refuse it, and it would also accept a request fenced with the dead
+generation that is still in flight — the fence satisfied by something
+that is no longer true. `NewServiceLock` mints the UUID itself and takes
+none, so the two generations are always distinguishable; the descriptors
+follow without extra care, because `Acquire` refuses descriptors that
+name a server other than the lock's own UUID, which is how
+`announceExistence` keeps the node and its payload in agreement.
 
 ### Reading the manager's lock
 

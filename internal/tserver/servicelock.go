@@ -22,7 +22,6 @@ import (
 	"errors"
 	"fmt"
 	"path"
-	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -283,10 +282,6 @@ type ServiceLockOptions struct {
 	// Path is the lock directory — for a tablet server, the one
 	// TabletServerLockPath builds. Required.
 	Path string
-	// UUID is this process's lock identity, the middle field of every node it
-	// creates. A random one is minted when empty, which is what Accumulo does
-	// per server process.
-	UUID string
 	// ACL is applied to the znodes this process creates. PublicACL is used
 	// when empty, which is what Accumulo writes.
 	ACL []gozk.ACL
@@ -306,10 +301,25 @@ type ServiceLockOptions struct {
 // two generations into one identity. A process that loses its lock builds a
 // new ServiceLock, whose node necessarily carries a higher sequence.
 //
+// Each one mints its own lock UUID, which is what Accumulo does — a fresh
+// UUID.randomUUID() per ServiceLock in announceExistence, used for the node
+// prefix and for every descriptor. The UUID names a lock, not a process, and
+// that is what makes the prefix a reliable statement of ownership: no other
+// ServiceLock can create a node under it, so what the cleanup finds by prefix
+// is exactly what this lock is responsible for, whether or not it learned the
+// name. A UUID reused across generations would break both directions at once —
+// a stale cleanup could take the successor's node, and an acquisition could
+// adopt the node its predecessor left and hand back the generation that had
+// already ended.
+//
 // ServiceLock is safe for concurrent use.
 type ServiceLock struct {
-	conn           LockConn
-	dir            string
+	conn LockConn
+	dir  string
+	// uuid is minted for this ServiceLock and used by no other. It names the
+	// nodes this lock creates and the descriptors it publishes, so a node
+	// carrying it is this lock's and no one else's, in this process or any
+	// other.
 	uuid           string
 	acl            []gozk.ACL
 	verifyInterval time.Duration
@@ -323,19 +333,6 @@ type ServiceLock struct {
 	// released records that Release has been called, so an acquisition still
 	// in flight cannot go on to hold a lock the caller has already given up.
 	released bool
-	// claimed names the nodes this ServiceLock made or took over, and is what
-	// the cleanup sweeps. The node prefix is not enough to decide that: it
-	// carries the lock UUID, and nothing stops a later ServiceLock being built
-	// with the same one, so a sweep by prefix would let a release arriving
-	// after a rejoin delete the live node of the generation that replaced it.
-	claimed []string
-	// live records that this ServiceLock is still the process's participant in
-	// the directory: its acquisition is in flight, or its generation is held.
-	// While that is true every node carrying the prefix is this one's, because
-	// a later ServiceLock is only built after this one is done. Once it is
-	// false the prefix may be shared, and only the claim list is safe to
-	// sweep.
-	live bool
 
 	// release is closed by Release to wake a queued acquisition. Waiting on
 	// the lock directory alone would leave that acquisition asleep until an
@@ -366,7 +363,9 @@ type ServiceLock struct {
 	doneOnce sync.Once
 }
 
-// NewServiceLock returns a lock participant for one generation.
+// NewServiceLock returns a lock participant for one generation, with a lock
+// UUID of its own. The caller reads it back with UUID and builds the
+// descriptors it advertises from it, as announceExistence does.
 func NewServiceLock(conn LockConn, opts ServiceLockOptions) (*ServiceLock, error) {
 	if conn == nil {
 		return nil, errors.New("tserver: nil lock connection")
@@ -374,18 +373,11 @@ func NewServiceLock(conn LockConn, opts ServiceLockOptions) (*ServiceLock, error
 	if err := validateLockPath(opts.Path); err != nil {
 		return nil, err
 	}
-	holder := opts.UUID
-	if holder == "" {
-		generated, err := uuid.NewRandom()
-		if err != nil {
-			return nil, fmt.Errorf("tserver: mint lock uuid: %w", err)
-		}
-		holder = generated.String()
+	generated, err := uuid.NewRandom()
+	if err != nil {
+		return nil, fmt.Errorf("tserver: mint lock uuid: %w", err)
 	}
-	if !validAccumuloUUID(holder) {
-		return nil, fmt.Errorf("%w: lock uuid %q is not the 36-character dashed form Accumulo reads",
-			ErrInvalidLock, holder)
-	}
+	holder := generated.String()
 	acl := opts.ACL
 	if len(acl) == 0 {
 		acl = PublicACL()
@@ -420,12 +412,13 @@ func validateLockPath(lockPath string) error {
 // Path returns the lock directory.
 func (l *ServiceLock) Path() string { return l.dir }
 
-// UUID returns this process's lock identity.
+// UUID returns this lock's identity: the middle field of every node it
+// creates, and the UUID every descriptor it publishes has to carry.
 func (l *ServiceLock) UUID() string { return l.uuid }
 
-// nodePrefix is the name prefix of every node this process creates in the
-// lock directory. Because the UUID is this process's alone, a node carrying it
-// is one of ours and no one else's.
+// nodePrefix is the name prefix of every node this lock creates in the lock
+// directory. Because the UUID is this lock's alone, a node carrying it is this
+// lock's and no one else's — including across the process's own generations.
 func (l *ServiceLock) nodePrefix() string { return zLockPrefix + l.uuid + "#" }
 
 // LockID returns the identity of the lock held, and whether it is still held.
@@ -545,35 +538,24 @@ func (l *ServiceLock) Acquire(ctx context.Context, data ServiceLockData) (LockID
 		return LockID{}, fmt.Errorf("%w: %s", ErrLockInUse, l.dir)
 	}
 	l.started = true
-	l.live = true
 	l.mu.Unlock()
 
 	if err := ctx.Err(); err != nil {
-		// Nothing was created, so there is nothing to sweep — but this
-		// ServiceLock has to stop looking live, or a Release that follows
-		// would sweep the prefix, and by then the caller may have rejoined
-		// under it. See sweep.
-		l.notLive()
 		return LockID{}, err
 	}
 	if err := l.ensureLockDirectory(); err != nil {
-		l.notLive()
 		return LockID{}, err
 	}
 	if err := l.createNode(payload); err != nil {
 		if errors.Is(err, ErrLockReleased) {
 			// Released before anything was created: there is nothing to clean
-			// up and nothing to wait for. Release already recorded that this
-			// ServiceLock is no longer live; saying so again keeps that true
-			// of every failing return here rather than of another method's
-			// field order.
-			l.notLive()
+			// up and nothing to wait for.
 			return LockID{}, err
 		}
 		// The create may have taken effect even though the answer was lost,
 		// so sweep before giving up rather than leaving a node in the queue.
 		// The name was never returned, so only the directory can say whether
-		// there is one — which is why the sweep inside Acquire goes by prefix.
+		// there is one — which is why the sweep goes by prefix.
 		return LockID{}, l.withCleanup(err)
 	}
 	id, err := l.waitForOwnership(ctx)
@@ -599,66 +581,27 @@ func (l *ServiceLock) createNode(payload []byte) error {
 	if l.isReleased() {
 		return fmt.Errorf("%w: %s", ErrLockReleased, l.dir)
 	}
-	created, err := l.conn.Create(l.dir+"/"+l.nodePrefix(), payload,
+	// The name is not kept. The prefix names it, and the acquisition reads it
+	// back from the directory so that a create whose answer is lost is treated
+	// the same as one whose answer arrived.
+	_, err := l.conn.Create(l.dir+"/"+l.nodePrefix(), payload,
 		gozk.FlagEphemeral|gozk.FlagSequence, l.acl)
 	if err != nil {
 		return fmt.Errorf("create lock node in %s: %w", l.dir, err)
 	}
-	// Claimed under createMu, so a release waiting on it sweeps this node
-	// rather than reading a directory it is not in yet.
-	l.claim(path.Base(created))
 	return nil
-}
-
-// claim records nodes as this ServiceLock's, so the cleanup can sweep them
-// without asking the directory which nodes carry its prefix.
-func (l *ServiceLock) claim(nodes ...string) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	for _, node := range nodes {
-		if slices.Contains(l.claimed, node) {
-			continue
-		}
-		l.claimed = append(l.claimed, node)
-	}
-}
-
-// claimedNodes returns the nodes this ServiceLock made or took over.
-func (l *ServiceLock) claimedNodes() []string {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	return slices.Clone(l.claimed)
 }
 
 // withCleanup sweeps the nodes of an acquisition that did not finish and
 // returns the failure that ended it, joined with an ErrLockNodeOrphaned when a
 // node survived the sweep. The failure is returned unwrapped in the ordinary
 // case so a caller can still compare a cancellation against context.Canceled.
-//
-// The acquisition is still in flight here, so the prefix is this ServiceLock's
-// and the sweep can use it. Nothing else in the directory can be carrying it:
-// a later ServiceLock is built only after this call returns.
 func (l *ServiceLock) withCleanup(failure error) error {
-	orphan := l.sweep(true)
-	l.notLive()
+	orphan := l.sweep()
 	if orphan == nil {
 		return failure
 	}
 	return errors.Join(failure, fmt.Errorf("%w in %s: %w", ErrLockNodeOrphaned, l.dir, orphan))
-}
-
-// notLive records that this ServiceLock is no longer the process's
-// participant in the lock directory, without ending a generation.
-//
-// Every path that leaves Acquire without a held lock goes through here, so
-// what a later Release is allowed to sweep does not depend on how far the
-// acquisition got. An acquisition that failed before creating anything has
-// nothing to sweep, but one still looking live would have its prefix swept —
-// and the prefix is shared with whatever the caller rejoined as. See sweep.
-func (l *ServiceLock) notLive() {
-	l.mu.Lock()
-	l.live = false
-	l.mu.Unlock()
 }
 
 // isReleased reports whether Release has already been called.
@@ -701,18 +644,16 @@ func (l *ServiceLock) queueForOwnership(ctx context.Context) (LockID, error) {
 			return LockID{}, fmt.Errorf("list lock nodes in %s: %w", l.dir, err)
 		}
 		sorted := sortLockNodes(children)
-		// Every node carrying this prefix right now is this acquisition's: it
-		// is in flight, so no later ServiceLock can have created anything yet.
-		// Recorded on every pass, not only the first, so a node that appears
-		// under the prefix while this one waits is swept with the rest rather
-		// than left behind by a cleanup that only knows what it created.
 		ours := l.ownNodes(sorted)
-		l.claim(ours...)
 		if node == "" {
 			// First pass: a create whose response was lost may have been
 			// retried, leaving several nodes with this process's prefix. Keep
 			// the one that entered the queue first and drop the rest, so this
 			// process occupies one place in line. Mirrors ServiceLock.lock.
+			//
+			// The prefix carries this lock's own UUID, so all of them are this
+			// acquisition's: no other ServiceLock can create under it, and no
+			// earlier one can have left anything there.
 			if len(ours) == 0 {
 				return LockID{}, fmt.Errorf("%w: nothing with prefix %s in %s",
 					ErrLockNodeMissing, l.nodePrefix(), l.dir)
@@ -1053,12 +994,6 @@ func (l *ServiceLock) Verify() error {
 		return l.lose(LossUnmonitorable, fmt.Errorf("list lock nodes in %s: %w", l.dir, err))
 	}
 	sorted := sortLockNodes(children)
-	// This lock is still the live participant for its prefix, so every node
-	// carrying it is this one's. Recording them here keeps the cleanup's list
-	// complete for the whole life of the generation rather than only as it was
-	// at acquisition: a node that turns up under the prefix afterwards would
-	// otherwise outlive the release and become the holder the manager reads.
-	l.claim(l.ownNodes(sorted)...)
 	if indexOfNode(sorted, node) < 0 {
 		return l.lose(LossNodeDeleted, nil)
 	}
@@ -1088,10 +1023,10 @@ func (l *ServiceLock) Verify() error {
 // node this process took away on purpose — so whichever of them wins that race
 // would decide how a deliberate release was remembered.
 //
-// A release that arrives after the generation is over sweeps only the nodes
-// this ServiceLock recorded as its own. By then the process may have rejoined,
-// and a rejoin is free to reuse the lock UUID: sweeping the prefix would take
-// away the live node of the generation that replaced this one. See sweep.
+// A release that arrives after the generation is over is still safe, however
+// long after: the prefix carries this lock's own UUID, so the sweep can only
+// reach nodes of the generation being released. Whatever replaced it is under
+// a UUID of its own. See sweep.
 func (l *ServiceLock) Release() error {
 	l.mu.Lock()
 	if !l.started {
@@ -1099,11 +1034,6 @@ func (l *ServiceLock) Release() error {
 		return fmt.Errorf("%w: %s", ErrNotHeld, l.dir)
 	}
 	l.released = true
-	// Read before lose records the ending. A first release on a live
-	// generation is still the participant whose prefix it is; a second one, or
-	// one arriving after the lock was lost and the process rejoined, is not.
-	wasLive := l.live
-	l.live = false
 	l.mu.Unlock()
 	l.releaseOnce.Do(func() { close(l.release) })
 	l.lose(LossReleased, nil)
@@ -1111,7 +1041,7 @@ func (l *ServiceLock) Release() error {
 	// refused; taking createMu here waits out one that has. Between them the
 	// sweep below cannot miss a node this process made.
 	l.createMu.Lock()
-	err := l.sweep(wasLive)
+	err := l.sweep()
 	l.createMu.Unlock()
 	return err
 }
@@ -1121,14 +1051,6 @@ func (l *ServiceLock) Release() error {
 // cannot rewrite an earlier one.
 func (l *ServiceLock) lose(reason LossReason, cause error) error {
 	l.mu.Lock()
-	if reason != LossNone {
-		// The generation is over, so this ServiceLock is no longer the
-		// process's participant in the directory and the prefix is no longer
-		// proof that a node is its own: the caller is free to rejoin with the
-		// same lock UUID. Only ended() asks without ending anything, and it
-		// passes LossNone. See sweep.
-		l.live = false
-	}
 	if l.held {
 		l.held = false
 		l.reason = reason
@@ -1192,38 +1114,32 @@ func (l *ServiceLock) ownNodes(sorted []string) []string {
 // sweep removes the nodes of this ServiceLock, so one cannot be left holding a
 // place in the queue for a process that is no longer waiting.
 //
-// What counts as this ServiceLock's depends on whether it is still the
-// process's participant in the directory. While it is — its acquisition in
-// flight, or its generation held — every node carrying the prefix is its own,
-// including one created by a create whose answer was lost and whose name it
-// therefore never learned. A later ServiceLock is built only after this one is
-// done, so nothing else can be carrying the prefix yet.
+// The prefix decides, and it decides completely: it carries this ServiceLock's
+// own UUID, minted for it and used by nothing else, so every node under it was
+// created by this lock and every node this lock created is under it. That
+// makes the sweep sound in both directions at once, without a record of what
+// was created and without asking whether the generation is still live.
 //
-// Once it is done the prefix is no longer proof of anything. It carries the
-// lock UUID, which identifies a lock rather than a process only by convention,
-// and nothing stops the next ServiceLock being built with the same one: its
-// node would carry the same prefix and a higher sequence. A sweep by prefix
-// then lets a release arriving after a rejoin — a shutdown path that runs
-// twice, or a goroutine that outlived the generation — delete the live node of
-// the generation that replaced it, revoking a lock the manager had just seen
-// taken. So a finished ServiceLock sweeps only the nodes it recorded as its
-// own, which cannot include one it never made.
+// Reaching too far is what a shared UUID would cost. If a rejoin could carry
+// the same prefix, a release arriving after the generation ended — a shutdown
+// path that runs twice, a goroutine that outlived its lock — would delete the
+// live node of the generation that replaced it, revoking a lock the manager
+// had just seen taken. Minting per ServiceLock removes the possibility rather
+// than fencing it: there is no window in which the prefix means two things.
 //
-// That list is kept complete rather than assumed complete. Every listing this
-// lock makes while it is the live participant — each pass of the queue, and
-// each Verify — records what carries the prefix, so a node this lock never
-// created but is nonetheless responsible for is swept with the rest. It has to
-// be: an ephemeral left under the prefix outlives the generation, and once the
-// adopted node goes it becomes the lowest in the directory and so the holder
-// the manager reads, a server that looks live and maintains nothing.
+// Reaching far enough matters just as much. A node this lock created but never
+// learned the name of — a create whose answer was lost — still carries the
+// prefix and is still swept. It has to be: an ephemeral left behind outlives
+// the generation, and once the adopted node goes it becomes the lowest in the
+// directory and so the holder the manager reads, a server that looks live and
+// maintains nothing.
 //
-// go-zookeeper cannot produce one behind those listings. It does not replay
-// requests across a reconnect — flushRequests fails every pending one and only
-// auth is resent — so a create either returns the node it made or an error,
-// and the error aborts the acquisition into a sweep taken while this lock is
-// still live. One that arrives by some other means is collapsed by the next
-// acquisition under the same prefix, which drops every duplicate it finds, and
-// removed outright when the session ends.
+// go-zookeeper is not expected to produce one. It does not replay requests
+// across a reconnect — flushRequests fails every pending one and only auth is
+// resent — so a create either returns the node it made or an error, and the
+// error aborts the acquisition into this sweep. One that arrives by some other
+// means is collapsed by the acquisition, which drops every duplicate under the
+// prefix, and removed outright when the session ends.
 //
 // A failure is reported rather than swallowed. An abandoned ephemeral node
 // keeps its sequence, and so its place in line, for as long as the session
@@ -1231,8 +1147,8 @@ func (l *ServiceLock) ownNodes(sorted []string) []string {
 // every candidate behind it. The session dropping is the fallback that
 // removes it, but only the session's owner can drop it, so the owner has to
 // be told.
-func (l *ServiceLock) sweep(byPrefix bool) error {
-	nodes, err := l.nodesToSweep(byPrefix)
+func (l *ServiceLock) sweep() error {
+	nodes, err := l.nodesToSweep()
 	if err != nil {
 		return err
 	}
@@ -1245,13 +1161,9 @@ func (l *ServiceLock) sweep(byPrefix bool) error {
 	return errors.Join(failures...)
 }
 
-// nodesToSweep returns the nodes sweep should remove: everything under the
-// prefix while this ServiceLock still owns it, and the recorded claims once it
-// does not.
-func (l *ServiceLock) nodesToSweep(byPrefix bool) ([]string, error) {
-	if !byPrefix {
-		return l.claimedNodes(), nil
-	}
+// nodesToSweep returns the nodes sweep should remove: everything in the lock
+// directory carrying this ServiceLock's prefix.
+func (l *ServiceLock) nodesToSweep() ([]string, error) {
 	children, _, err := l.conn.Children(l.dir)
 	if err != nil {
 		if errors.Is(err, gozk.ErrNoNode) {

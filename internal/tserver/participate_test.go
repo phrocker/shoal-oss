@@ -36,6 +36,13 @@ func lockNodePath(holder string, sequence int) string {
 	return path.Join(testLockPath(), fmt.Sprintf("zlock#%s#%010d", holder, sequence))
 }
 
+// heldBy names a generation of a particular lock, for the fences a test stamps
+// requests with. NewServiceLock mints the UUID, so a test cannot spell one out
+// and has to ask the lock that acquired the generation.
+func heldBy(lock *ServiceLock, sequence int64) LockID {
+	return LockID{UUID: lock.UUID(), Sequence: sequence}
+}
+
 // waitFor polls until cond holds, for tests where the moment of interest is
 // reached by another goroutine.
 func waitFor(t *testing.T, what string, cond func() bool) {
@@ -56,19 +63,19 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 func TestParticipateAdoptsTheGenerationItAcquired(t *testing.T) {
 	f := newFakeZK()
 	host := NewHost()
-	lock := newTestLock(t, f, serverUUID)
+	lock := newTestLock(t, f)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan error, 1)
-	go func() { done <- Participate(ctx, lock, host, testLockData(t), nil) }()
+	go func() { done <- Participate(ctx, lock, host, testLockData(t, lock), nil) }()
 
-	waitArmed(t, f, lockNodePath(serverUUID, 0))
+	waitArmed(t, f, lockNodePath(lock.UUID(), 0))
 	held, ok := host.Lock()
 	if !ok {
 		t.Fatal("the host holds no lock while participating")
 	}
-	want := LockID{UUID: serverUUID, Sequence: 0}
+	want := LockID{UUID: lock.UUID(), Sequence: 0}
 	if held != want {
 		t.Fatalf("host holds %s, want the acquired generation %s", held, want)
 	}
@@ -85,7 +92,7 @@ func TestParticipateAdoptsTheGenerationItAcquired(t *testing.T) {
 func TestParticipateDropsTabletsWhenTheLockIsLost(t *testing.T) {
 	f := newFakeZK()
 	host := NewHost()
-	lock := newTestLock(t, f, serverUUID)
+	lock := newTestLock(t, f)
 	if err := host.ObserveManagerLock(managerLock(1)); err != nil {
 		t.Fatalf("ObserveManagerLock: %v", err)
 	}
@@ -93,14 +100,14 @@ func TestParticipateDropsTabletsWhenTheLockIsLost(t *testing.T) {
 	released := make(chan []Extent, 1)
 	done := make(chan error, 1)
 	go func() {
-		done <- Participate(context.Background(), lock, host, testLockData(t),
+		done <- Participate(context.Background(), lock, host, testLockData(t, lock),
 			func(dropped []Extent) { released <- dropped })
 	}()
 
-	nodePath := lockNodePath(serverUUID, 0)
+	nodePath := lockNodePath(lock.UUID(), 0)
 	waitArmed(t, f, nodePath)
 
-	fence := Fence{Server: serverLock(0), Manager: managerLock(1)}
+	fence := Fence{Server: heldBy(lock, 0), Manager: managerLock(1)}
 	first := Extent{TableID: "2", EndRow: []byte("m")}
 	second := Extent{TableID: "2", PrevEndRow: []byte("m")}
 	hostTablet(t, host, fence, first)
@@ -139,11 +146,11 @@ func TestParticipateDropsTabletsWhenTheLockIsLost(t *testing.T) {
 func TestParticipateStopsClaimingBeforeGivingUpTheLock(t *testing.T) {
 	f := newFakeZK()
 	host := NewHost()
-	lock := newTestLock(t, f, serverUUID)
+	lock := newTestLock(t, f)
 	if err := host.ObserveManagerLock(managerLock(1)); err != nil {
 		t.Fatalf("ObserveManagerLock: %v", err)
 	}
-	nodePath := lockNodePath(serverUUID, 0)
+	nodePath := lockNodePath(lock.UUID(), 0)
 
 	var mu sync.Mutex
 	hostedAtDelete := -1
@@ -158,10 +165,10 @@ func TestParticipateStopsClaimingBeforeGivingUpTheLock(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { done <- Participate(ctx, lock, host, testLockData(t), nil) }()
+	go func() { done <- Participate(ctx, lock, host, testLockData(t, lock), nil) }()
 
 	waitArmed(t, f, nodePath)
-	hostTablet(t, host, Fence{Server: serverLock(0), Manager: managerLock(1)},
+	hostTablet(t, host, Fence{Server: heldBy(lock, 0), Manager: managerLock(1)},
 		Extent{TableID: "2", EndRow: []byte("m")})
 
 	cancel()
@@ -191,9 +198,9 @@ func TestParticipateGivesBackALockTheHostRefuses(t *testing.T) {
 	if err := host.AdoptLock(serverLock(5)); err != nil {
 		t.Fatalf("AdoptLock: %v", err)
 	}
-	lock := newTestLock(t, f, serverUUID)
+	lock := newTestLock(t, f)
 
-	err := Participate(context.Background(), lock, host, testLockData(t), nil)
+	err := Participate(context.Background(), lock, host, testLockData(t, lock), nil)
 	if !errors.Is(err, ErrLockNotNewer) {
 		t.Fatalf("Participate: want ErrLockNotNewer, got %v", err)
 	}
@@ -215,10 +222,10 @@ func TestParticipateReportsARefusedGenerationItCouldNotGiveBack(t *testing.T) {
 	if err := host.AdoptLock(serverLock(5)); err != nil {
 		t.Fatalf("AdoptLock: %v", err)
 	}
-	lock := newTestLock(t, f, serverUUID)
-	f.failDelete(lockNodePath(serverUUID, 0), gozk.ErrConnectionClosed)
+	lock := newTestLock(t, f)
+	f.failDelete(lockNodePath(lock.UUID(), 0), gozk.ErrConnectionClosed)
 
-	err := Participate(context.Background(), lock, host, testLockData(t), nil)
+	err := Participate(context.Background(), lock, host, testLockData(t, lock), nil)
 	if !errors.Is(err, ErrLockNotNewer) {
 		t.Fatalf("Participate: want ErrLockNotNewer, got %v", err)
 	}
@@ -238,23 +245,23 @@ func TestParticipateRejoinsWithALaterGeneration(t *testing.T) {
 		t.Fatalf("ObserveManagerLock: %v", err)
 	}
 
-	first := newTestLock(t, f, serverUUID)
+	first := newTestLock(t, f)
 	firstDone := make(chan error, 1)
-	go func() { firstDone <- Participate(context.Background(), first, host, testLockData(t), nil) }()
-	waitArmed(t, f, lockNodePath(serverUUID, 0))
-	hostTablet(t, host, Fence{Server: serverLock(0), Manager: managerLock(1)},
+	go func() { firstDone <- Participate(context.Background(), first, host, testLockData(t, first), nil) }()
+	waitArmed(t, f, lockNodePath(first.UUID(), 0))
+	hostTablet(t, host, Fence{Server: heldBy(first, 0), Manager: managerLock(1)},
 		Extent{TableID: "2", EndRow: []byte("m")})
 	f.expire()
 	if err := <-firstDone; !errors.Is(err, ErrLockLost) {
 		t.Fatalf("first participation: want ErrLockLost, got %v", err)
 	}
 
-	second := newTestLock(t, f, serverUUID)
+	second := newTestLock(t, f)
 	secondDone := make(chan error, 1)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go func() { secondDone <- Participate(ctx, second, host, testLockData(t), nil) }()
-	waitArmed(t, f, lockNodePath(serverUUID, 1))
+	go func() { secondDone <- Participate(ctx, second, host, testLockData(t, second), nil) }()
+	waitArmed(t, f, lockNodePath(second.UUID(), 1))
 
 	rejoined, ok := host.Lock()
 	if !ok || rejoined.Sequence != 1 {
@@ -266,11 +273,11 @@ func TestParticipateRejoinsWithALaterGeneration(t *testing.T) {
 
 	// A request stamped with the generation that died is refused, even though
 	// this is the same process at the same address.
-	stale := Fence{Server: serverLock(0), Manager: managerLock(1)}
+	stale := Fence{Server: heldBy(first, 0), Manager: managerLock(1)}
 	if _, err := host.Assign(stale, Extent{TableID: "2", EndRow: []byte("m")}); !errors.Is(err, ErrStaleServerLock) {
 		t.Fatalf("Assign with the dead generation: want ErrStaleServerLock, got %v", err)
 	}
-	current := Fence{Server: serverLock(1), Manager: managerLock(1)}
+	current := Fence{Server: heldBy(second, 1), Manager: managerLock(1)}
 	if _, err := host.Assign(current, Extent{TableID: "2", EndRow: []byte("m")}); err != nil {
 		t.Fatalf("Assign under the rejoined generation: %v", err)
 	}
@@ -287,11 +294,11 @@ func TestParticipateCancelledWhileQueuedNeverAdopts(t *testing.T) {
 	f := newFakeZK()
 	holder := f.seedForeignLock(testLockPath(), otherUUID, 0)
 	host := NewHost()
-	lock := newTestLock(t, f, serverUUID)
+	lock := newTestLock(t, f)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { done <- Participate(ctx, lock, host, testLockData(t), nil) }()
+	go func() { done <- Participate(ctx, lock, host, testLockData(t, lock), nil) }()
 
 	waitArmed(t, f, path.Join(testLockPath(), holder))
 	cancel()
@@ -310,15 +317,15 @@ func TestParticipateCancelledWhileQueuedNeverAdopts(t *testing.T) {
 func TestParticipateWithoutTabletsSkipsTheReleaseCallback(t *testing.T) {
 	f := newFakeZK()
 	host := NewHost()
-	lock := newTestLock(t, f, serverUUID)
+	lock := newTestLock(t, f)
 
 	called := false
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
-		done <- Participate(ctx, lock, host, testLockData(t), func([]Extent) { called = true })
+		done <- Participate(ctx, lock, host, testLockData(t, lock), func([]Extent) { called = true })
 	}()
-	waitArmed(t, f, lockNodePath(serverUUID, 0))
+	waitArmed(t, f, lockNodePath(lock.UUID(), 0))
 	cancel()
 
 	if err := <-done; !errors.Is(err, context.Canceled) {
@@ -335,12 +342,12 @@ func TestParticipateWithoutTabletsSkipsTheReleaseCallback(t *testing.T) {
 func TestParticipateReportsBothTheLossAndAFailedRelease(t *testing.T) {
 	f := newFakeZK()
 	host := NewHost()
-	lock := newTestLock(t, f, serverUUID)
-	nodePath := lockNodePath(serverUUID, 0)
+	lock := newTestLock(t, f)
+	nodePath := lockNodePath(lock.UUID(), 0)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { done <- Participate(ctx, lock, host, testLockData(t), nil) }()
+	go func() { done <- Participate(ctx, lock, host, testLockData(t, lock), nil) }()
 
 	waitArmed(t, f, nodePath)
 	f.failDelete(nodePath, gozk.ErrConnectionClosed)
@@ -360,11 +367,11 @@ func TestParticipateReportsBothTheLossAndAFailedRelease(t *testing.T) {
 
 func TestParticipateRefusesMissingArguments(t *testing.T) {
 	f := newFakeZK()
-	lock := newTestLock(t, f, serverUUID)
-	if err := Participate(context.Background(), nil, NewHost(), testLockData(t), nil); err == nil {
+	lock := newTestLock(t, f)
+	if err := Participate(context.Background(), nil, NewHost(), testLockData(t, lock), nil); err == nil {
 		t.Fatal("Participate accepted a nil lock")
 	}
-	if err := Participate(context.Background(), lock, nil, testLockData(t), nil); err == nil {
+	if err := Participate(context.Background(), lock, nil, testLockData(t, lock), nil); err == nil {
 		t.Fatal("Participate accepted a nil host")
 	}
 	if created := f.createdPaths(); len(created) != 0 {
@@ -377,7 +384,7 @@ func TestParticipateRefusesMissingArguments(t *testing.T) {
 func TestParticipateRefusesUnusableLockData(t *testing.T) {
 	f := newFakeZK()
 	host := NewHost()
-	lock := newTestLock(t, f, serverUUID)
+	lock := newTestLock(t, f)
 
 	err := Participate(context.Background(), lock, host, ServiceLockData{}, nil)
 	if !errors.Is(err, ErrInvalidLockData) {
@@ -410,8 +417,8 @@ func TestRejoinIntoARecreatedLockDirectoryNeedsAFreshHost(t *testing.T) {
 	if err := f.Delete(path.Join(testLockPath(), stale), -1); err != nil {
 		t.Fatalf("delete the seeded node: %v", err)
 	}
-	first := newTestLock(t, f, serverUUID)
-	firstID, err := first.Acquire(context.Background(), testLockData(t))
+	first := newTestLock(t, f)
+	firstID, err := first.Acquire(context.Background(), testLockData(t, first))
 	if err != nil {
 		t.Fatalf("Acquire: %v", err)
 	}
@@ -428,8 +435,8 @@ func TestRejoinIntoARecreatedLockDirectoryNeedsAFreshHost(t *testing.T) {
 
 	f.recreate(testLockPath())
 
-	second := newTestLock(t, f, serverUUID)
-	err = Participate(context.Background(), second, host, testLockData(t), nil)
+	second := newTestLock(t, f)
+	err = Participate(context.Background(), second, host, testLockData(t, second), nil)
 	if !errors.Is(err, ErrLockNotNewer) {
 		t.Fatalf("Participate: want ErrLockNotNewer, got %v", err)
 	}
@@ -445,8 +452,8 @@ func TestRejoinIntoARecreatedLockDirectoryNeedsAFreshHost(t *testing.T) {
 	// The documented recovery. The high-water mark is per-host state, so a
 	// host that has used nothing accepts the very generation the old one
 	// refused.
-	third := newTestLock(t, f, serverUUID)
-	thirdID, err := third.Acquire(context.Background(), testLockData(t))
+	third := newTestLock(t, f)
+	thirdID, err := third.Acquire(context.Background(), testLockData(t, third))
 	if err != nil {
 		t.Fatalf("Acquire after the recreation: %v", err)
 	}
@@ -458,21 +465,23 @@ func TestRejoinIntoARecreatedLockDirectoryNeedsAFreshHost(t *testing.T) {
 	}
 }
 
-// TestRejoiningARecreatedDirectoryUnderTheSameUUIDRemintsTheDeadGeneration is
-// why the recovery is a fresh identity and not only a fresh host.
+// TestRejoiningARecreatedDirectoryCannotBeHandedBackTheDeadIdentity is why the
+// recovery is a fresh identity and not only a fresh host, and why that
+// identity is not the caller's to choose.
 //
-// A recreated directory hands out sequences from zero again, so a process that
-// rejoins under the UUID it used before is handed back the identity it already
-// had. The fence is LockID equality, and the two are equal, so a manager
-// request stamped with the generation that died is accepted by the generation
-// that replaced it. That is not the fence failing — it is the identity being
-// reused, which is the thing Participate's documentation forbids.
-func TestRejoiningARecreatedDirectoryUnderTheSameUUIDRemintsTheDeadGeneration(t *testing.T) {
+// A recreated directory hands out sequences from zero again, so a rejoin can
+// be handed the very sequence the dead generation had. The fence is LockID
+// equality, so if the UUID came back too the dead generation would be equal to
+// the live one and a manager request stamped with it would be accepted by the
+// server that replaced it. NewServiceLock mints a UUID per lock, so the two
+// halves cannot both repeat: the sequence collides here and the identity still
+// does not.
+func TestRejoiningARecreatedDirectoryCannotBeHandedBackTheDeadIdentity(t *testing.T) {
 	f := newFakeZK()
 	f.seed(testLockPath(), nil, false)
 
-	first := newTestLock(t, f, serverUUID)
-	deadID, err := first.Acquire(context.Background(), testLockData(t))
+	first := newTestLock(t, f)
+	deadID, err := first.Acquire(context.Background(), testLockData(t, first))
 	if err != nil {
 		t.Fatalf("Acquire: %v", err)
 	}
@@ -482,60 +491,17 @@ func TestRejoiningARecreatedDirectoryUnderTheSameUUIDRemintsTheDeadGeneration(t 
 
 	f.recreate(testLockPath())
 
-	second := newTestLock(t, f, serverUUID)
-	liveID, err := second.Acquire(context.Background(), testLockData(t))
+	second := newTestLock(t, f)
+	liveID, err := second.Acquire(context.Background(), testLockData(t, second))
 	if err != nil {
 		t.Fatalf("Acquire after the recreation: %v", err)
-	}
-	if !liveID.Equal(deadID) {
-		t.Fatalf("rejoined as %s after holding %s: the collision this test is about did not happen",
-			liveID, deadID)
-	}
-
-	rejoined := NewHost()
-	if err := rejoined.AdoptLock(liveID); err != nil {
-		t.Fatalf("AdoptLock: %v", err)
-	}
-	if err := rejoined.ObserveManagerLock(managerLock(1)); err != nil {
-		t.Fatalf("ObserveManagerLock: %v", err)
-	}
-	stale := Fence{Server: deadID, Manager: managerLock(1)}
-	if _, err := rejoined.Assign(stale, Extent{TableID: "2", EndRow: []byte("m")}); err != nil {
-		t.Fatalf("Assign stamped with the dead generation = %v, want it accepted: "+
-			"an identity that was reused cannot be fenced, which is the whole point", err)
-	}
-}
-
-// TestRejoiningARecreatedDirectoryUnderAFreshUUIDFencesTheDeadGeneration is
-// the documented recovery, and the reason for it. A new UUID makes the dead
-// generation nameable, so a delayed request stamped with it is refused while
-// the live generation is served.
-func TestRejoiningARecreatedDirectoryUnderAFreshUUIDFencesTheDeadGeneration(t *testing.T) {
-	f := newFakeZK()
-	f.seed(testLockPath(), nil, false)
-
-	first := newTestLock(t, f, serverUUID)
-	deadID, err := first.Acquire(context.Background(), testLockData(t))
-	if err != nil {
-		t.Fatalf("Acquire: %v", err)
-	}
-	if err := first.Release(); err != nil {
-		t.Fatalf("Release: %v", err)
-	}
-
-	f.recreate(testLockPath())
-
-	second := newTestLock(t, f, otherUUID)
-	liveID, err := second.Acquire(context.Background(), testLockDataFor(t, otherUUID))
-	if err != nil {
-		t.Fatalf("Acquire after the recreation: %v", err)
-	}
-	if liveID.Equal(deadID) {
-		t.Fatalf("rejoined as %s, the identity it had already used", liveID)
 	}
 	if liveID.Sequence != deadID.Sequence {
 		t.Fatalf("the recreated directory numbered %s, not %d: the sequence is meant to collide here",
 			liveID, deadID.Sequence)
+	}
+	if liveID.Equal(deadID) {
+		t.Fatalf("rejoined as %s, the identity it had already used", liveID)
 	}
 
 	rejoined := NewHost()
