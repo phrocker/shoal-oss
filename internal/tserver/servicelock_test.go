@@ -653,6 +653,72 @@ func TestAcquireRefusesAnotherRolesServiceOnATabletServerPath(t *testing.T) {
 	}
 }
 
+// TestAcquireRefusesATabletServerLockWithoutTSERV is the service every lock in
+// the tablet-server tree has to carry. LiveTServerSet.checkServer reads
+// getAddress(TSERV) off each held lock it finds there and passes the result
+// straight to a TServerInstance, which dereferences it: no TSERV descriptor
+// means a null address and a NullPointerException that ends the scan for every
+// server in that pass, not just this one. A subset that leaves it out would
+// look like a modest advertisement and stop the manager seeing the cluster.
+func TestAcquireRefusesATabletServerLockWithoutTSERV(t *testing.T) {
+	for _, tc := range []struct {
+		what     string
+		services []ThriftService
+	}{
+		{"a subset without it", []ThriftService{ServiceClient, ServiceTabletScan}},
+		{"every other tablet-server service", []ThriftService{
+			ServiceClient, ServiceTabletIngest, ServiceTabletManagement, ServiceTabletScan,
+		}},
+		{"no services at all", nil},
+	} {
+		t.Run(tc.what, func(t *testing.T) {
+			f := newFakeZK()
+			lock := newTestLock(t, f, serverUUID)
+			data := ServiceLockData{}
+			for _, service := range tc.services {
+				data.Descriptors = append(data.Descriptors, ServiceDescriptor{
+					UUID:    serverUUID,
+					Service: service,
+					Address: testAddress,
+					Group:   testGroup,
+				})
+			}
+			_, err := lock.Acquire(context.Background(), data)
+			if !errors.Is(err, ErrInvalidLockData) {
+				t.Fatalf("Acquire = %v, want ErrInvalidLockData", err)
+			}
+			// An advertisement with no descriptors at all never reaches this
+			// check: encoding refuses an empty one first, for its own reasons.
+			if len(tc.services) > 0 && !strings.Contains(err.Error(), string(ServiceTabletServer)) {
+				t.Fatalf("Acquire = %v, want the missing service named", err)
+			}
+			if nodes := f.lockNodes(testLockPath()); len(nodes) != 0 {
+				t.Fatalf("a refused advertisement still left %v in %s", nodes, testLockPath())
+			}
+		})
+	}
+}
+
+// TestAcquireTakesATabletServerLockThatAdvertisesTSERV is the other side: the
+// check is about the one service the manager reads, not about publishing all
+// five. A process that serves TSERV and nothing else is visible and dialable.
+func TestAcquireTakesATabletServerLockThatAdvertisesTSERV(t *testing.T) {
+	f := newFakeZK()
+	lock := newTestLock(t, f, serverUUID)
+	data := ServiceLockData{Descriptors: []ServiceDescriptor{{
+		UUID:    serverUUID,
+		Service: ServiceTabletServer,
+		Address: testAddress,
+		Group:   testGroup,
+	}}}
+	if _, err := lock.Acquire(context.Background(), data); err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	if nodes := f.lockNodes(testLockPath()); len(nodes) != 1 {
+		t.Fatalf("lock nodes in %s = %v, want the one just created", testLockPath(), nodes)
+	}
+}
+
 // TestAcquireLeavesALockThatNamesNoServerAlone keeps both checks where they
 // belong. The manager's lock lives at <instance>/managers/lock, where nothing
 // in the path identifies a process, so there is no address to hold a

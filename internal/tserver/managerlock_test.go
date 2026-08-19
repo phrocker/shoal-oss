@@ -84,6 +84,34 @@ func managerNode(holder string, sequence int) string {
 	return fmt.Sprintf("zlock#%s#%010d", holder, sequence)
 }
 
+// refusalLog collects what WatchManagerLock reports, so a test can tell a
+// refusal that was reported from one that was swallowed.
+type refusalLog struct {
+	mu   sync.Mutex
+	errs []error
+}
+
+func (l *refusalLog) record(err error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.errs = append(l.errs, err)
+}
+
+func (l *refusalLog) count() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return len(l.errs)
+}
+
+func (l *refusalLog) first() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if len(l.errs) == 0 {
+		return nil
+	}
+	return l.errs[0]
+}
+
 // TestReadManagerLockTakesTheLowestNode is the authority rule. Standby
 // managers queue in the same directory as the live one, so reading anything
 // but the lowest sequence would treat a manager that has not taken over as if
@@ -191,7 +219,7 @@ func TestManagerAuthorityIsObservedNotAsserted(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	watch := make(chan error, 1)
-	go func() { watch <- WatchManagerLock(ctx, reader, host, time.Millisecond) }()
+	go func() { watch <- WatchManagerLock(ctx, reader, host, time.Millisecond, nil) }()
 
 	waitFor(t, "the manager lock to be observed", func() bool {
 		observed, ok := host.ManagerLock()
@@ -214,7 +242,7 @@ func TestWatchManagerLockFollowsAFailover(t *testing.T) {
 	reader := &fakeManagerReader{children: []string{managerNode(managerUUID, 4)}}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go func() { _ = WatchManagerLock(ctx, reader, host, time.Millisecond) }()
+	go func() { _ = WatchManagerLock(ctx, reader, host, time.Millisecond, nil) }()
 
 	waitFor(t, "the first manager", func() bool {
 		observed, ok := host.ManagerLock()
@@ -238,7 +266,7 @@ func TestWatchManagerLockKeepsAuthorityThroughAReadFailure(t *testing.T) {
 	reader := &fakeManagerReader{children: []string{managerNode(managerUUID, 4)}}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go func() { _ = WatchManagerLock(ctx, reader, host, time.Millisecond) }()
+	go func() { _ = WatchManagerLock(ctx, reader, host, time.Millisecond, nil) }()
 
 	waitFor(t, "the manager lock to be observed", func() bool {
 		_, ok := host.ManagerLock()
@@ -266,7 +294,7 @@ func TestWatchManagerLockClearsAuthorityWhenTheManagerIsGone(t *testing.T) {
 	reader := &fakeManagerReader{children: []string{managerNode(managerUUID, 4)}}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go func() { _ = WatchManagerLock(ctx, reader, host, time.Millisecond) }()
+	go func() { _ = WatchManagerLock(ctx, reader, host, time.Millisecond, nil) }()
 
 	waitFor(t, "the manager lock to be observed", func() bool {
 		_, ok := host.ManagerLock()
@@ -285,21 +313,21 @@ func TestWatchManagerLockClearsAuthorityWhenTheManagerIsGone(t *testing.T) {
 	}
 }
 
-// TestWatchManagerLockSurfacesARefusedEpoch covers the one reading a later
-// poll cannot fix. ZooKeeper hands out sequence numbers from a counter on the
-// parent, so a manager lock directory that was deleted and remade starts again
-// at zero: the manager holding it is live, and its epoch is older than the one
+// TestWatchManagerLockSurfacesARefusedEpoch covers a reading no later poll
+// resolves. ZooKeeper hands out sequence numbers from a counter on the parent,
+// so a manager lock directory that was deleted and remade starts again at
+// zero: the manager holding it is live, and its epoch is older than the one
 // this host has already seen. Refusing it is right — authority does not move
-// backwards — but polling on through it is not, because every later reading is
-// the same refusal and the host answers to a manager that is gone in the
-// meantime.
+// backwards — and swallowing it is not, because the host answers to a manager
+// that is gone in the meantime and nothing else would say so.
 func TestWatchManagerLockSurfacesARefusedEpoch(t *testing.T) {
 	host := NewHost()
 	reader := &fakeManagerReader{children: []string{managerNode(otherUUID, 9)}}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	watch := make(chan error, 1)
-	go func() { watch <- WatchManagerLock(ctx, reader, host, time.Millisecond) }()
+	reports := &refusalLog{}
+	go func() { watch <- WatchManagerLock(ctx, reader, host, time.Millisecond, reports.record) }()
 
 	waitFor(t, "the manager lock to be observed", func() bool {
 		_, ok := host.ManagerLock()
@@ -307,38 +335,145 @@ func TestWatchManagerLockSurfacesARefusedEpoch(t *testing.T) {
 	})
 
 	reader.set([]string{managerNode(managerUUID, 2)}, nil)
-	select {
-	case err := <-watch:
-		if !errors.Is(err, ErrLockNotNewer) {
-			t.Fatalf("WatchManagerLock: want ErrLockNotNewer, got %v", err)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("WatchManagerLock kept polling a refusal no later reading can resolve")
+	waitFor(t, "the refusal to be reported", func() bool { return reports.count() > 0 })
+	if err := reports.first(); !errors.Is(err, ErrLockNotNewer) {
+		t.Fatalf("reported %v, want ErrLockNotNewer", err)
 	}
 
-	// Nothing moved backwards on the way out.
+	// The watch is still running: the report is a report, not a verdict.
+	select {
+	case err := <-watch:
+		t.Fatalf("WatchManagerLock ended on a refusal it cannot explain: %v", err)
+	default:
+	}
+
+	// And nothing moved backwards.
 	observed, ok := host.ManagerLock()
 	if !ok || observed != (LockID{UUID: otherUUID, Sequence: 9}) {
 		t.Fatalf("manager authority = %s, %v; want the newer epoch retained", observed, ok)
 	}
 
-	// And the documented recovery works: a host with no epoch history takes
-	// the live manager on its first reading.
+	// The recovery a recreated directory needs still works, and is the
+	// supervisor's to start: a host with no epoch history takes the live
+	// manager on its first reading.
 	fresh := NewHost()
-	go func() { _ = WatchManagerLock(ctx, reader, fresh, time.Millisecond) }()
+	go func() { _ = WatchManagerLock(ctx, reader, fresh, time.Millisecond, nil) }()
 	waitFor(t, "a fresh host to take the live manager", func() bool {
 		seen, ok := fresh.ManagerLock()
 		return ok && seen == managerLock(2)
 	})
 }
 
+// TestWatchManagerLockOutlivesALaggingReplica is why a refusal is reported
+// rather than acted on. A reader that opens a session per read can land on a
+// ZooKeeper server that has not caught up, and can do it on consecutive polls,
+// so a run of refusals is not evidence the directory was recreated. Ending the
+// watch on one would restart a healthy host — and, since every tablet server
+// reads the same lagging ensemble, restart the fleet — throwing away the
+// high-water marks that were rejecting the stale readings. The observer has to
+// still be there when the replica catches up.
+func TestWatchManagerLockOutlivesALaggingReplica(t *testing.T) {
+	host := NewHost()
+	reader := &fakeManagerReader{children: []string{managerNode(otherUUID, 9)}}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	watch := make(chan error, 1)
+	reports := &refusalLog{}
+	go func() { watch <- WatchManagerLock(ctx, reader, host, time.Millisecond, reports.record) }()
+	waitFor(t, "the manager lock to be observed", func() bool {
+		_, ok := host.ManagerLock()
+		return ok
+	})
+
+	// A replica that is behind, for as many polls as it takes.
+	reader.set([]string{managerNode(managerUUID, 2)}, nil)
+	waitFor(t, "the refusal to be reported", func() bool { return reports.count() > 0 })
+	before := reader.readCount()
+	waitFor(t, "the lag to persist across many polls", func() bool { return reader.readCount() > before+20 })
+
+	// It catches up, and the manager has failed over in the meantime.
+	reader.set([]string{managerNode(managerUUID, 12)}, nil)
+	waitFor(t, "authority to follow the caught-up reading", func() bool {
+		seen, ok := host.ManagerLock()
+		return ok && seen == managerLock(12)
+	})
+	select {
+	case err := <-watch:
+		t.Fatalf("WatchManagerLock ended before the replica caught up: %v", err)
+	default:
+	}
+	if got := reports.count(); got != 1 {
+		t.Fatalf("reported %d refusals, want exactly 1 for one run of them", got)
+	}
+}
+
+// TestWatchManagerLockReportsEachRunOfRefusalsOnce pins the reporting rule. A
+// condition that persists is one condition, so it is reported once however
+// many polls it spans; a reading the host accepts ends the run, and a refusal
+// after that is a new one.
+func TestWatchManagerLockReportsEachRunOfRefusalsOnce(t *testing.T) {
+	host := NewHost()
+	reader := &fakeManagerReader{children: []string{managerNode(otherUUID, 9)}}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	reports := &refusalLog{}
+	go func() { _ = WatchManagerLock(ctx, reader, host, time.Millisecond, reports.record) }()
+	waitFor(t, "the manager lock to be observed", func() bool {
+		_, ok := host.ManagerLock()
+		return ok
+	})
+
+	reader.set([]string{managerNode(managerUUID, 2)}, nil)
+	waitFor(t, "the first run to be reported", func() bool { return reports.count() == 1 })
+	before := reader.readCount()
+	waitFor(t, "the run to span several polls", func() bool { return reader.readCount() > before+10 })
+	if got := reports.count(); got != 1 {
+		t.Fatalf("reported %d times during one run, want 1", got)
+	}
+
+	// An accepted reading ends the run. Authority cannot show that — it never
+	// moved — so wait for polls to have consumed the reading instead: one may
+	// have been in flight when it was set, so two of them.
+	accepted := reader.readCount()
+	reader.set([]string{managerNode(otherUUID, 9)}, nil)
+	waitFor(t, "the accepted reading to be polled", func() bool { return reader.readCount() >= accepted+2 })
+
+	// So the next refusal is a new condition and reported again.
+	reader.set([]string{managerNode(managerUUID, 2)}, nil)
+	waitFor(t, "the second run to be reported", func() bool { return reports.count() == 2 })
+}
+
+// TestWatchManagerLockReportsNowhereWithoutACallback keeps the report
+// optional: a caller that does not want it should not have to invent one, and
+// must not get a nil call for its trouble.
+func TestWatchManagerLockReportsNowhereWithoutACallback(t *testing.T) {
+	host := NewHost()
+	reader := &fakeManagerReader{children: []string{managerNode(otherUUID, 9)}}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	watch := make(chan error, 1)
+	go func() { watch <- WatchManagerLock(ctx, reader, host, time.Millisecond, nil) }()
+	waitFor(t, "the manager lock to be observed", func() bool {
+		_, ok := host.ManagerLock()
+		return ok
+	})
+
+	reader.set([]string{managerNode(managerUUID, 2)}, nil)
+	before := reader.readCount()
+	waitFor(t, "the refusals to keep coming", func() bool { return reader.readCount() > before+10 })
+	select {
+	case err := <-watch:
+		t.Fatalf("WatchManagerLock ended without a callback to report to: %v", err)
+	default:
+	}
+}
+
 // TestWatchManagerLockRidesOutAReadingThatWentBackwards is the other side of
 // the test above. Readings are not monotonic across calls — a reader that
 // opens a session per read can land on a ZooKeeper server that has not caught
 // up — so a single reading that appears to move the manager backwards is not
-// evidence the lock directory was recreated. Ending the watch on it would cost
-// a Host restart, the recovery documented for a condition that does not heal,
-// for a replica that was a moment behind.
+// evidence of anything worth reporting. Reporting it would cost an operator a
+// recreated-directory investigation for a replica that was a moment behind.
 func TestWatchManagerLockRidesOutAReadingThatWentBackwards(t *testing.T) {
 	host := NewHost()
 	reader := &fakeManagerReader{
@@ -353,13 +488,17 @@ func TestWatchManagerLockRidesOutAReadingThatWentBackwards(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	watch := make(chan error, 1)
-	go func() { watch <- WatchManagerLock(ctx, reader, host, time.Millisecond) }()
+	reports := &refusalLog{}
+	go func() { watch <- WatchManagerLock(ctx, reader, host, time.Millisecond, reports.record) }()
 
 	waitFor(t, "the watch to poll past the stale reading", func() bool { return reader.readCount() >= 6 })
 	select {
 	case err := <-watch:
 		t.Fatalf("WatchManagerLock ended on one stale reading: %v", err)
 	default:
+	}
+	if got := reports.count(); got != 0 {
+		t.Fatalf("reported %d refusals for one stale reading, want none", got)
 	}
 	// The stale reading was refused rather than believed, both times it could
 	// have been: authority is still the epoch that was already seen.
@@ -380,17 +519,16 @@ func TestWatchManagerLockRidesOutAReadingThatWentBackwards(t *testing.T) {
 }
 
 // TestWatchManagerLockKeepsARefusalAcrossAnUnreadablePoll pins what clears the
-// count of refusals. A poll that could not be read is not evidence of
+// run of refusals. A poll that could not be read is not evidence of
 // anything: the previous observation stands and the host is told nothing. If
-// it cleared the count, a recreated lock directory interleaved with transient
+// it ended the run, a recreated lock directory interleaved with transient
 // ZooKeeper failures would refuse every reading and never be reported, leaving
-// the host fenced to a dead manager — exactly the case ending the watch exists
-// for.
+// the host fenced to a dead manager with nothing said about it.
 func TestWatchManagerLockKeepsARefusalAcrossAnUnreadablePoll(t *testing.T) {
 	host := NewHost()
 	// Every reading after the first is the recreated directory, and every
 	// other poll fails to read it at all, so no two refusals are ever
-	// adjacent. A count an unreadable poll cleared would never reach two.
+	// adjacent. A run an unreadable poll ended would never reach two.
 	var alternate func(*fakeManagerReader)
 	alternate = func(r *fakeManagerReader) {
 		if r.err == nil {
@@ -411,16 +549,14 @@ func TestWatchManagerLockKeepsARefusalAcrossAnUnreadablePoll(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	watch := make(chan error, 1)
-	go func() { watch <- WatchManagerLock(ctx, reader, host, time.Millisecond) }()
+	reports := &refusalLog{}
+	go func() { _ = WatchManagerLock(ctx, reader, host, time.Millisecond, reports.record) }()
 
-	select {
-	case err := <-watch:
-		if !errors.Is(err, ErrLockNotNewer) {
-			t.Fatalf("WatchManagerLock: want ErrLockNotNewer, got %v", err)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("an unreadable poll cleared a refusal that no reading resolved")
+	waitFor(t, "the refusal to be reported across the unreadable polls", func() bool {
+		return reports.count() > 0
+	})
+	if err := reports.first(); !errors.Is(err, ErrLockNotNewer) {
+		t.Fatalf("reported %v, want ErrLockNotNewer", err)
 	}
 	observed, ok := host.ManagerLock()
 	if !ok || observed != (LockID{UUID: otherUUID, Sequence: 9}) {
@@ -436,7 +572,7 @@ func TestWatchManagerLockObservesBeforeItWaits(t *testing.T) {
 	reader := &fakeManagerReader{children: []string{managerNode(managerUUID, 4)}}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go func() { _ = WatchManagerLock(ctx, reader, host, time.Hour) }()
+	go func() { _ = WatchManagerLock(ctx, reader, host, time.Hour, nil) }()
 
 	waitFor(t, "the first reading", func() bool {
 		observed, ok := host.ManagerLock()
@@ -449,7 +585,7 @@ func TestWatchManagerLockStopsWhenCancelled(t *testing.T) {
 	reader := &fakeManagerReader{children: []string{managerNode(managerUUID, 4)}}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { done <- WatchManagerLock(ctx, reader, host, time.Millisecond) }()
+	go func() { done <- WatchManagerLock(ctx, reader, host, time.Millisecond, nil) }()
 
 	waitFor(t, "the manager lock to be observed", func() bool {
 		_, ok := host.ManagerLock()
@@ -476,14 +612,14 @@ func TestWatchManagerLockStopsWhenCancelled(t *testing.T) {
 func TestWatchManagerLockValidatesArguments(t *testing.T) {
 	host := NewHost()
 	reader := &fakeManagerReader{}
-	if err := WatchManagerLock(context.Background(), nil, host, time.Second); err == nil {
+	if err := WatchManagerLock(context.Background(), nil, host, time.Second, nil); err == nil {
 		t.Fatal("WatchManagerLock accepted a nil reader")
 	}
-	if err := WatchManagerLock(context.Background(), reader, nil, time.Second); err == nil {
+	if err := WatchManagerLock(context.Background(), reader, nil, time.Second, nil); err == nil {
 		t.Fatal("WatchManagerLock accepted a nil host")
 	}
 	for _, interval := range []time.Duration{0, -time.Second} {
-		if err := WatchManagerLock(context.Background(), reader, host, interval); err == nil {
+		if err := WatchManagerLock(context.Background(), reader, host, interval, nil); err == nil {
 			t.Fatalf("WatchManagerLock accepted a %s poll interval", interval)
 		}
 	}

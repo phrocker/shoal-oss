@@ -391,6 +391,25 @@ implement them; a tablet-server lock claiming one would point a client
 at an endpoint this process does not serve, in a combination Accumulo
 itself never writes and so has no reason to guard against.
 
+`TSERV` is not one of the five the caller may drop. Every lock in the
+tablet-server tree is read for it: `LiveTServerSet.checkServer` calls
+`getAddress(ThriftService.TSERV)` on each held lock it finds and hands
+the result straight to `new TServerInstance(address, …)`, which
+dereferences it. A lock without that descriptor produces a null address
+and a `NullPointerException` inside the scan — not a server the manager
+skips, but a scan that stops, taking every other tablet server in that
+pass with it. One Shoal registration would be enough, and it would repeat
+on every scan for as long as the lock was held. So the check is at the
+publication gate rather than in the constructor, which a caller building
+`ServiceLockData` directly does not go through: a lock that registers a
+server and does not advertise `TSERV` is refused before it is created.
+
+That is the reason a process which cannot serve `TSERV` yet belongs
+outside the tree rather than in it with a smaller advertisement.
+Registering with the descriptor and no endpoint behind it is the ordinary
+unreachable-server case, which Accumulo already handles by dooming the
+instance; registering without it is a manager-wide failure.
+
 ### Holding it, and letting go
 
 `Maintain` watches the node and returns when the generation ends.
@@ -544,36 +563,43 @@ would refuse the live manager's assignments for nothing. A directory that
 is readable and holds no lock is evidence, and clears it.
 
 An observation the host refuses — a live holder whose epoch is older
-than one already seen — ends the watch with `ErrLockNotNewer`, once a
-second reading refuses the same way. The host keeps the newer epoch, so
-authority does not move backwards whether the watch ends or not; ending
-it is how a condition further polling cannot fix gets reported rather
-than swallowed. That condition is the manager lock directory having been
-deleted and recreated, and it does not heal: polling through it would
-leave this host fenced to a manager that no longer exists, taking a dead
-manager's requests and refusing the live one's — authority invented here
-rather than observed.
-Recovery is the supervisor's, and it is the one `AdoptLock`'s refusal
-already calls for: a fresh `Host`, which carries no epoch history and
-takes the live manager on its first reading.
+than one already seen — is reported to the caller, and the watch goes on
+polling. Two very different things read that way. The manager lock
+directory may have been deleted and recreated, restarting the sequence
+counter, which does not heal: polling through it leaves this host fenced
+to a manager that no longer exists. Or the reading came from a ZooKeeper
+server that had not caught up. ZooKeeper promises a client its own reads
+never go backwards, but that is a promise about a session, and the reader
+is free to use more than one: `internal/zk.Locator` opens a scoped
+connection per read when the context can be cancelled, so consecutive
+polls are consecutive sessions and any of them can land behind.
 
-One refused reading is not that condition. ZooKeeper promises a client
-its own reads never go backwards, but that is a promise about a session,
-and the reader is free to use more than one: `internal/zk.Locator` opens
-a scoped connection per read when the context can be cancelled, so a
-reading can land on a server that has not caught up and return the
-directory as it was — indistinguishable, from here, from a sequence that
-went backwards. A recreated directory reads that way on every poll after
-it, so requiring the refusal to survive one more reading tells the two
-apart. Neither reading is believed in the meantime: both are refused,
-and authority stays where it was.
+Nothing here can tell those apart. A recreated directory refuses every
+poll after it, and so does a replica that stays behind; counting the
+refusals makes the mistake less frequent and never impossible. So the
+watch does not act on the guess. Safety never depended on it: the host
+keeps the newer epoch whatever a reading says, so a stale one gains no
+authority on the first refusal or the thousandth. Ending the watch would
+add only the cost of being wrong — every tablet server reads the same
+lagging ensemble, so ending on it restarts the fleet, discarding the
+high-water marks that were doing the rejecting.
 
-Only a reading the host accepts clears a pending refusal. A poll that
+A recreated directory does need recovery, and it is the one `AdoptLock`'s
+refusal already calls for: a fresh `Host`, which carries no epoch history
+and takes the live manager on its first reading. That call is the
+supervisor's, which can establish the cause; this package reports what it
+saw and keeps observing, so a replica that catches up needs no
+intervention at all.
+
+The report is made once per run of refusals rather than once per poll,
+because a condition that persists is one condition, and a single refusal
+is not reported at all — one stale reading is ordinary and has already
+been refused. Only a reading the host accepts ends a run. A poll that
 could not be read is not evidence of anything — it leaves the previous
-observation standing and tells the host nothing — so it leaves the count
-where it was. Clearing it there would let a recreated directory
+observation standing and tells the host nothing — so it leaves the run
+where it was. Ending it there would let a recreated directory
 interleaved with transient ZooKeeper failures refuse every reading and
-never be reported, which is the case ending the watch exists for.
+never be reported.
 
 ## 7. What is not here yet
 
@@ -583,8 +609,12 @@ This is the lifecycle core only. Still to land for #67:
   `Unassign` calls and reports `TabletServerStatus`
 - loading tablet metadata, file and log references, table properties,
   constraints, and iterator configuration behind `StateLoading`
-- advertising `TSERV` and the `TABLET_*` services for real, which is safe
-  only once the Thrift endpoints behind them exist
+- serving the `TSERV` and `TABLET_*` endpoints that are advertised. A
+  lock in the tablet-server tree must carry a `TSERV` descriptor or the
+  manager's scan throws on it, so the advertisement cannot wait for the
+  endpoint; a process that registers before serving it is an unreachable
+  server, which Accumulo dooms and retries, and that is why nothing wires
+  this into a cluster yet
 - the process wiring that owns the ZooKeeper session, chooses the
   advertised address and resource group, and restarts participation after
   a lock loss

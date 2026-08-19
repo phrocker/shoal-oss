@@ -481,12 +481,22 @@ func (l *ServiceLock) Node() string {
 // endpoint that role owns while pointing at a process that does not implement
 // it. Locks that name no server carry their own roles' services and are left
 // alone.
+//
+// TSERV must be one of them. It is not one advertisement among five: the
+// manager reads it off every held lock under the tablet-server tree, and
+// LiveTServerSet.checkServer hands the result straight to a TServerInstance
+// that dereferences it. A lock without a TSERV descriptor yields a null
+// address there and a NullPointerException that ends the whole scan, not this
+// server's part of it — one such registration stops the manager seeing any
+// tablet server, including the healthy ones. A process that cannot serve TSERV
+// yet belongs outside the tree, not in it without the descriptor.
 func (l *ServiceLock) Acquire(ctx context.Context, data ServiceLockData) (LockID, error) {
 	payload, err := data.Encode()
 	if err != nil {
 		return LockID{}, err
 	}
 	group, address, registersAServer := tabletServerLockIdentity(l.dir)
+	publishesTabletServer := false
 	for _, descriptor := range data.Descriptors {
 		if descriptor.UUID != l.uuid {
 			return LockID{}, fmt.Errorf("%w: %s descriptor names server %s, but this lock is held as %s",
@@ -494,6 +504,9 @@ func (l *ServiceLock) Acquire(ctx context.Context, data ServiceLockData) (LockID
 		}
 		if !registersAServer {
 			continue
+		}
+		if descriptor.Service == ServiceTabletServer {
+			publishesTabletServer = true
 		}
 		if _, ours := tabletServerServiceSet[descriptor.Service]; !ours {
 			return LockID{}, fmt.Errorf("%w: %q is not a tablet-server service, but this lock registers a tablet server",
@@ -507,6 +520,10 @@ func (l *ServiceLock) Acquire(ctx context.Context, data ServiceLockData) (LockID
 			return LockID{}, fmt.Errorf("%w: %s descriptor is in resource group %s, but this lock registers under %s",
 				ErrInvalidLockData, descriptor.Service, descriptor.Group, group)
 		}
+	}
+	if registersAServer && !publishesTabletServer {
+		return LockID{}, fmt.Errorf("%w: this lock registers a tablet server but advertises no %s descriptor, which the manager reads off every lock in the tree",
+			ErrInvalidLockData, ServiceTabletServer)
 	}
 	l.mu.Lock()
 	if l.started {
