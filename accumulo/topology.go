@@ -76,7 +76,9 @@ func (l TabletLocation) String() string { return l.HostPort }
 // /accumulo/<instance-id>/root_tablet, whose RootTabletMetadata JSON carries
 // the current location under the "loc" column family. Sharkbite reads the
 // Accumulo 1.x layout /<root>/root_tablet/location and splits the value on
-// '|', a format Accumulo 4 no longer writes.
+// '|', a format Accumulo 4 no longer writes. When ctx is cancellable, the
+// lookup reuses one authenticated operation-scoped ZooKeeper session for the
+// whole read and closes it on return or cancellation.
 //
 // Returns ErrTabletNotLocated while the root tablet has no current
 // assignment, which happens during tablet movement; callers should retry.
@@ -105,6 +107,8 @@ func (i *zkLocator) RootTabletLocation(ctx context.Context) (TabletLocation, err
 // descriptors whose service is MANAGER. Bootstrap descriptors that advertise
 // no address, or the "0.0.0.0:0" placeholder, make the active manager
 // unavailable rather than promoting a queued candidate to the first slot.
+// When ctx is cancellable, the traversal reuses one authenticated
+// operation-scoped ZooKeeper session and closes it on return or cancellation.
 //
 // Returns ErrManagerUnavailable when no lock node advertises a usable
 // manager. Sharkbite's getMasterLocations returns an empty vector in that
@@ -128,7 +132,9 @@ func (i *zkLocator) ManagerLocations(ctx context.Context) ([]string, error) {
 // /accumulo/<instance-id>/{tservers,sservers,compactors}/<resource-group>/<server>,
 // and the lowest-sequence lock node of every server carries ServiceLockData
 // JSON whose CLIENT descriptor holds the client-service address. Results are
-// ordered by role, then resource group, then advertised address. Sharkbite reads the flat
+// ordered by role, then resource group, then advertised address. When ctx is
+// cancellable, the traversal reuses one authenticated operation-scoped
+// ZooKeeper session and closes it on return or cancellation. Sharkbite reads the flat
 // Accumulo 1.x /<root>/tservers layout, which has no resource groups and no
 // scan servers or compactors.
 //
@@ -166,8 +172,9 @@ func (i *zkLocator) Root() string { return i.locator.InstancePath() }
 
 // Configuration returns the client configuration this instance was created
 // with, mirroring Sharkbite's ZookeeperInstance::getConfiguration. The
-// returned Configuration is the instance's own copy: mutating it changes
-// what later calls observe, and it is never aliased to the caller's original.
+// returned Configuration is the instance's own stable mutable pointer:
+// mutating it changes what later calls observe, and it is never aliased to
+// the caller's original.
 func (i *zkLocator) Configuration() *Configuration { return i.configuration }
 
 // RootTabletLocation reports ErrDiscoveryUnavailable: a static instance has

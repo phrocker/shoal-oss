@@ -23,11 +23,14 @@ type InstanceInfo struct {
 //
 // The topology accessors mirror Sharkbite's cclient::data::Instance base
 // class. RootTabletLocation, ManagerLocations, and Servers resolve live state
-// from ZooKeeper on every call and honor ctx cancellation. Info, ZooKeepers,
-// and Root report wiring fixed at construction. Configuration is different:
-// it returns the instance's own mutable Configuration, so writes through the
-// returned pointer are observed by later calls, while the caller's original
-// Configuration stays independent because the instance stored a clone.
+// from ZooKeeper on every call and honor ctx cancellation; when ctx is
+// cancellable, each call reuses one operation-scoped authenticated ZooKeeper
+// session for the whole traversal and closes it on return or cancellation.
+// Info, ZooKeepers, and Root report wiring fixed at construction.
+// Configuration is different: it returns the instance's own stable mutable
+// Configuration pointer, so writes through the returned pointer are observed
+// by later calls, while the caller's original Configuration stays independent
+// because the instance stored a clone.
 type Instance interface {
 	Info() InstanceInfo
 
@@ -36,7 +39,10 @@ type Instance interface {
 	RootTabletLocation(ctx context.Context) (TabletLocation, error)
 
 	// ManagerLocations lists the manager addresses advertised in ZooKeeper,
-	// ordered by lock sequence, active manager first.
+	// ordered by lock sequence, active manager first. If the active
+	// lowest-sequence lock holder still advertises only a bootstrap
+	// placeholder, the call reports ErrManagerUnavailable instead of
+	// promoting a queued candidate to index 0.
 	ManagerLocations(ctx context.Context) ([]string, error)
 
 	// Servers lists the live tablet servers, scan servers, and compactors
