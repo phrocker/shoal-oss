@@ -476,6 +476,7 @@ func internalKey(key accumulo.Key) *wire.Key {
 		ColumnQualifier:  append([]byte(nil), key.ColumnQualifier...),
 		ColumnVisibility: append([]byte(nil), key.ColumnVisibility...),
 		Timestamp:        key.Timestamp,
+		Deleted:          key.Deleted,
 	}
 }
 
@@ -489,5 +490,6 @@ func publicKey(key *wire.Key) accumulo.Key {
 		ColumnQualifier:  append([]byte(nil), key.ColumnQualifier...),
 		ColumnVisibility: append([]byte(nil), key.ColumnVisibility...),
 		Timestamp:        key.Timestamp,
+		Deleted:          key.Deleted,
 	}
 }

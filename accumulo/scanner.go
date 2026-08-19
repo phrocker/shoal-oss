@@ -25,6 +25,10 @@ type Key struct {
 	ColumnQualifier  []byte
 	ColumnVisibility []byte
 	Timestamp        int64
+	// Deleted marks a deletion entry. Scans never surface deleted keys, so it
+	// is false for scan results; it is part of the key's value semantics and
+	// participates in Compare, where deletion markers sort first.
+	Deleted bool
 }
 
 // KeyValue is one scanned Accumulo entry.

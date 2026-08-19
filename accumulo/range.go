@@ -38,8 +38,14 @@ func NewRange(startRow []byte, startInclusive bool, endRow []byte, endInclusive 
 }
 
 // NewKeyRange constructs a range with full Accumulo key bounds. A nil start or
-// end key is unbounded.
+// end key is unbounded. A bound may not carry a deletion marker: Key.Compare
+// orders deletions before the matching live key, but the scan wire's TKey has
+// no field for the marker, so such a bound would exclude a key locally and
+// include it on the server.
 func NewKeyRange(start *Key, startInclusive bool, end *Key, endInclusive bool) (*Range, error) {
+	if (start != nil && start.Deleted) || (end != nil && end.Deleted) {
+		return nil, ErrDeletedRangeBound
+	}
 	startCopy := cloneKey(start)
 	endCopy := cloneKey(end)
 	if startCopy != nil && endCopy != nil && compareKeys(*endCopy, *startCopy) < 0 {
@@ -356,32 +362,12 @@ func cloneKey(key *Key) *Key {
 	if key == nil {
 		return nil
 	}
-	return &Key{
-		Row:              cloneRow(key.Row),
-		ColumnFamily:     cloneRow(key.ColumnFamily),
-		ColumnQualifier:  cloneRow(key.ColumnQualifier),
-		ColumnVisibility: cloneRow(key.ColumnVisibility),
-		Timestamp:        key.Timestamp,
-	}
+	clone := key.Clone()
+	return &clone
 }
 
+// compareKeys orders range bounds. It is Key.Compare, so a range predicate can
+// never disagree with the ordering the key type publishes.
 func compareKeys(left, right Key) int {
-	for _, pair := range [][2][]byte{
-		{left.Row, right.Row},
-		{left.ColumnFamily, right.ColumnFamily},
-		{left.ColumnQualifier, right.ColumnQualifier},
-		{left.ColumnVisibility, right.ColumnVisibility},
-	} {
-		if comparison := bytes.Compare(pair[0], pair[1]); comparison != 0 {
-			return comparison
-		}
-	}
-	switch {
-	case left.Timestamp > right.Timestamp:
-		return -1
-	case left.Timestamp < right.Timestamp:
-		return 1
-	default:
-		return 0
-	}
+	return left.Compare(right)
 }
