@@ -395,7 +395,19 @@ func (b *Backend) CleanupStaleArtifacts(ctx context.Context, prefix string, cuto
 	if err != nil {
 		return result, fmt.Errorf("azure: list stale artifacts az://%s/%s: %w", cont, blobPrefix, err)
 	}
-	slices.SortFunc(artifacts, func(a, b azureArtifact) int { return strings.Compare(a.name, b.name) })
+	slices.SortFunc(artifacts, func(a, b azureArtifact) int {
+		if order := strings.Compare(a.name, b.name); order != 0 {
+			return order
+		}
+		var aVersion, bVersion string
+		if a.versionID != nil {
+			aVersion = *a.versionID
+		}
+		if b.versionID != nil {
+			bVersion = *b.versionID
+		}
+		return strings.Compare(aVersion, bVersion)
+	})
 	var cleanupErr error
 	for _, artifact := range artifacts {
 		if err := contextOrBackground(ctx).Err(); err != nil {

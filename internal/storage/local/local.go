@@ -81,16 +81,14 @@ func (b *Backend) Create(_ context.Context, path string) (storage.Writer, error)
 			return nil, fmt.Errorf("local: mkdir %s: %w", dir, err)
 		}
 	}
-	target, symlinkTarget, err := resolveCreateTarget(path)
-	if err != nil {
-		return nil, err
-	}
-	if symlinkTarget != nil {
+	info, err := os.Lstat(path)
+	if err == nil && info.Mode()&os.ModeSymlink != 0 {
 		return nil, fmt.Errorf("local: symlink destination %s is not supported for atomic replacement", path)
 	}
-	if isReplacementArtifactName(filepath.Base(target)) {
-		return nil, fmt.Errorf("local: symlink destination %s resolves into a reserved internal namespace", path)
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return nil, fmt.Errorf("local: inspect existing file %s: %w", path, err)
 	}
+	target := path
 	ops := osReplacementOps{}
 	f, err := openReplacementSiblingFile(filepath.Dir(target))
 	if err != nil {
@@ -100,11 +98,10 @@ func (b *Backend) Create(_ context.Context, path string) (storage.Writer, error)
 		return nil, errors.Join(err, cleanupTemporaryCreateFile(f, ops))
 	}
 	return &writer{
-		file:          f,
-		temp:          f.Name(),
-		target:        target,
-		ops:           ops,
-		symlinkTarget: symlinkTarget,
+		file:   f,
+		temp:   f.Name(),
+		target: target,
+		ops:    ops,
 	}, nil
 }
 
@@ -245,27 +242,12 @@ type writer struct {
 	temp           string
 	target         string
 	ops            replacementOps
-	symlinkTarget  *symlinkTargetState
 	closed         bool
 	abortRequested bool
 	aborted        bool
 	fileClosed     bool
 	tempDiscarded  bool
 	state          replacementState
-}
-
-type symlinkTargetState struct {
-	displayPath  string
-	requestedAbs string
-	referentPath string
-	referentInfo os.FileInfo
-	chain        []symlinkPathState
-}
-
-type symlinkPathState struct {
-	path   string
-	target string
-	info   os.FileInfo
 }
 
 type replacementState uint8
@@ -295,8 +277,6 @@ type osReplacementOps struct{}
 var preservePlatformMetadataFn = preservePlatformMetadata
 var sameReplacementFile = os.SameFile
 var readReplacementFile = os.ReadFile
-
-const maxSymlinkResolutionDepth = 255
 
 func (osReplacementOps) Lstat(name string) (os.FileInfo, error) { return os.Lstat(name) }
 func (osReplacementOps) Chmod(name string, mode os.FileMode) error {
@@ -429,101 +409,6 @@ func isLowerHexReplacementToken(token string) bool {
 	return err == nil && len(decoded) == replacementNameTokenBytes
 }
 
-func resolveCreateTarget(path string) (string, *symlinkTargetState, error) {
-	info, err := os.Lstat(path)
-	if errors.Is(err, fs.ErrNotExist) {
-		return path, nil, nil
-	}
-	if err != nil {
-		return "", nil, fmt.Errorf("local: inspect existing file %s: %w", path, err)
-	}
-	if info.Mode()&os.ModeSymlink == 0 {
-		return path, nil, nil
-	}
-	requestedAbs, err := filepath.Abs(path)
-	if err != nil {
-		return "", nil, fmt.Errorf("local: resolve symlink destination %s: absolute path: %w", path, err)
-	}
-	target, err := captureSymlinkTargetState(path, requestedAbs)
-	if err != nil {
-		return "", nil, err
-	}
-	return target.referentPath, target, nil
-}
-
-func captureSymlinkTargetState(displayPath, requestedAbs string) (*symlinkTargetState, error) {
-	state := &symlinkTargetState{
-		displayPath:  displayPath,
-		requestedAbs: requestedAbs,
-	}
-	current := requestedAbs
-	visited := make(map[string]struct{})
-	for depth := 0; depth < maxSymlinkResolutionDepth; depth++ {
-		info, err := os.Lstat(current)
-		if err != nil {
-			if errors.Is(err, fs.ErrNotExist) {
-				return nil, fmt.Errorf("local: resolve symlink destination %s: dangling symlink referent %s", displayPath, current)
-			}
-			return nil, fmt.Errorf("local: resolve symlink destination %s: inspect %s: %w", displayPath, current, err)
-		}
-		if info.Mode()&os.ModeSymlink == 0 {
-			if depth == 0 {
-				return nil, fmt.Errorf("local: resolve symlink destination %s: symlink changed during resolution", displayPath)
-			}
-			if !info.Mode().IsRegular() {
-				return nil, fmt.Errorf("local: resolve symlink destination %s: referent %s is not a regular file", displayPath, current)
-			}
-			state.referentPath = current
-			state.referentInfo = info
-			return state, nil
-		}
-		linkTarget, err := os.Readlink(current)
-		if err != nil {
-			return nil, fmt.Errorf("local: resolve symlink destination %s: readlink %s: %w", displayPath, current, err)
-		}
-		state.chain = append(state.chain, symlinkPathState{
-			path:   current,
-			target: linkTarget,
-			info:   info,
-		})
-		visited[current] = struct{}{}
-		next := linkTarget
-		if !filepath.IsAbs(next) {
-			next = filepath.Join(filepath.Dir(current), next)
-		}
-		next = filepath.Clean(next)
-		if _, ok := visited[next]; ok {
-			return nil, fmt.Errorf("local: resolve symlink destination %s: symlink loop through %s", displayPath, next)
-		}
-		current = next
-	}
-	return nil, fmt.Errorf("local: resolve symlink destination %s: exceeded %d symlink hops", displayPath, maxSymlinkResolutionDepth)
-}
-
-func (s *symlinkTargetState) revalidate() error {
-	if s == nil {
-		return nil
-	}
-	current, err := captureSymlinkTargetState(s.displayPath, s.requestedAbs)
-	if err != nil {
-		return fmt.Errorf("local: revalidate symlink destination %s: %w", s.displayPath, err)
-	}
-	if len(current.chain) != len(s.chain) {
-		return fmt.Errorf("local: symlink destination %s changed before publish", s.displayPath)
-	}
-	for i := range s.chain {
-		if current.chain[i].path != s.chain[i].path ||
-			current.chain[i].target != s.chain[i].target ||
-			!sameReplacementFile(current.chain[i].info, s.chain[i].info) {
-			return fmt.Errorf("local: symlink destination %s changed before publish", s.displayPath)
-		}
-	}
-	if current.referentPath != s.referentPath || !sameReplacementFile(current.referentInfo, s.referentInfo) {
-		return fmt.Errorf("local: symlink referent for %s changed before publish", s.displayPath)
-	}
-	return nil
-}
-
 func (w *writer) publishReplacement(hadOld bool) (string, error) {
 	if !hadOld {
 		return "", w.ops.AtomicReplace(w.temp, w.target, "", false)
@@ -607,10 +492,6 @@ func (w *writer) commitReplacement() error {
 	if err := syncReplacementPath(w.ops, w.temp); err != nil {
 		return fmt.Errorf("local: sync replacement file %s: %w", w.temp, err)
 	}
-	if err := w.symlinkTarget.revalidate(); err != nil {
-		return err
-	}
-
 	backup, err := w.publishReplacement(hadOld)
 	if err != nil {
 		publishErr := fmt.Errorf("local: publish %s: %w", w.target, err)

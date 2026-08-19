@@ -1455,7 +1455,7 @@ func TestLocal_CreateRejectsInvalidSymlinkReferents(t *testing.T) {
 				createFileSymlinkOrSkip(t, "missing.rf", link)
 				return link
 			},
-			wantErr: "dangling symlink referent",
+			wantErr: "symlink destination",
 		},
 		{
 			name: "loop",
@@ -1466,7 +1466,7 @@ func TestLocal_CreateRejectsInvalidSymlinkReferents(t *testing.T) {
 				createFileSymlinkOrSkip(t, filepath.Base(first), second)
 				return first
 			},
-			wantErr: "symlink loop",
+			wantErr: "symlink destination",
 		},
 		{
 			name: "nonregular",
@@ -1479,7 +1479,7 @@ func TestLocal_CreateRejectsInvalidSymlinkReferents(t *testing.T) {
 				createFileSymlinkOrSkip(t, filepath.Base(targetDir), link)
 				return link
 			},
-			wantErr: "not a regular file",
+			wantErr: "symlink destination",
 		},
 	}
 

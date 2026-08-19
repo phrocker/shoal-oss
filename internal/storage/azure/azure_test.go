@@ -29,6 +29,7 @@ import (
 	"log/slog"
 	"net/url"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -780,6 +781,33 @@ func TestCleanupStaleArtifactsIsBoundedETagConditionalAndExplicit(t *testing.T) 
 	cancel()
 	if _, err := backend.CleanupStaleArtifacts(ctx, "az://container/dir", now); !errors.Is(err, context.Canceled) {
 		t.Fatalf("canceled cleanup error = %v, want context.Canceled", err)
+	}
+}
+
+func TestCleanupStaleArtifactsOrdersBlobVersionsDeterministically(t *testing.T) {
+	now := time.Now()
+	etag := azcore.ETag(`"old"`)
+	name := "dir/" + expectedTemporaryStageComponent("dir/target", strings.Repeat("0", 64))
+	firstVersion := "version-a"
+	secondVersion := "version-b"
+	ops := &fakeAzureArtifactOperations{
+		artifacts: []azureArtifact{
+			{name: name, versionID: &secondVersion, lastModified: now.Add(-2 * time.Hour), etag: &etag, owned: true},
+			{name: name, versionID: &firstVersion, lastModified: now.Add(-2 * time.Hour), etag: &etag, owned: true},
+		},
+	}
+	backend := &Backend{artifactOps: ops}
+
+	result, err := backend.CleanupStaleArtifacts(context.Background(), "az://container/dir", now.Add(-time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		"az://container/" + name + "?versionId=" + url.QueryEscape(firstVersion),
+		"az://container/" + name + "?versionId=" + url.QueryEscape(secondVersion),
+	}
+	if !slices.Equal(result.Removed, want) {
+		t.Fatalf("Removed = %v, want %v", result.Removed, want)
 	}
 }
 
