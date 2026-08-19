@@ -248,6 +248,96 @@ func TestWriteAll_CanceledWriteWaitsForBlockedCall(t *testing.T) {
 	}
 }
 
+func TestCopy_CanceledReadJoinsBackendError(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	readErr := errors.New("read failed")
+	writer := &writeFuncWriter{
+		write: func([]byte) (int, error) {
+			t.Fatal("Copy wrote data after a canceled read")
+			return 0, nil
+		},
+	}
+
+	_, err := storage.Copy(ctx, fileBackend{file: &readFuncFile{
+		size: 1,
+		read: func([]byte, int64) (int, error) {
+			cancel()
+			return 0, readErr
+		},
+	}}, "/src", writerBackend{writer: writer}, "/dst")
+	if !errors.Is(err, readErr) || !errors.Is(err, context.Canceled) {
+		t.Fatalf("Copy error = %v, want joined read error and context.Canceled", err)
+	}
+	if writer.abortCalls != 1 {
+		t.Fatalf("Abort calls = %d, want 1", writer.abortCalls)
+	}
+}
+
+func TestCopy_CanceledEOFReadDoesNotWriteAndJoinsEOF(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	writer := &writeFuncWriter{}
+
+	_, err := storage.Copy(ctx, fileBackend{file: &readFuncFile{
+		size: 1,
+		read: func(p []byte, _ int64) (int, error) {
+			p[0] = 'x'
+			cancel()
+			return 1, io.EOF
+		},
+	}}, "/src", writerBackend{writer: writer}, "/dst")
+	if !errors.Is(err, io.EOF) || !errors.Is(err, context.Canceled) {
+		t.Fatalf("Copy error = %v, want joined EOF and context.Canceled", err)
+	}
+	if writer.writeCalls != 0 {
+		t.Fatalf("Write calls = %d, want 0", writer.writeCalls)
+	}
+	if writer.abortCalls != 1 {
+		t.Fatalf("Abort calls = %d, want 1", writer.abortCalls)
+	}
+}
+
+func TestCopy_CanceledShortWriteJoinsContextError(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	src := memory.New()
+	src.Put("/src", []byte("hello"))
+	writer := &writeFuncWriter{
+		write: func(p []byte) (int, error) {
+			cancel()
+			return len(p) - 1, nil
+		},
+	}
+
+	n, err := storage.Copy(ctx, src, "/src", writerBackend{writer: writer}, "/dst")
+	if !errors.Is(err, io.ErrShortWrite) || !errors.Is(err, context.Canceled) {
+		t.Fatalf("Copy error = %v, want joined short write and context.Canceled", err)
+	}
+	if n != int64(len("hell")) {
+		t.Fatalf("Copy wrote %d bytes, want %d", n, len("hell"))
+	}
+	if writer.abortCalls != 1 {
+		t.Fatalf("Abort calls = %d, want 1", writer.abortCalls)
+	}
+}
+
+func TestWriteAll_CanceledWriteJoinsBackendError(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	writeErr := errors.New("write failed")
+	writer := &writeFuncWriter{
+		write: func([]byte) (int, error) {
+			cancel()
+			return 0, writeErr
+		},
+	}
+
+	err := storage.WriteAll(ctx, writerBackend{writer: writer}, "/dst", []byte("hello"))
+	if !errors.Is(err, writeErr) || !errors.Is(err, context.Canceled) {
+		t.Fatalf("WriteAll error = %v, want joined write error and context.Canceled", err)
+	}
+	if writer.abortCalls != 1 {
+		t.Fatalf("Abort calls = %d, want 1", writer.abortCalls)
+	}
+}
+
 type writerBackend struct {
 	writer storage.Writer
 }
@@ -366,6 +456,20 @@ func (f *recordingReadFile) ReadAt(p []byte, off int64) (int, error) {
 func (f *recordingReadFile) Close() error { return nil }
 func (f *recordingReadFile) Size() int64  { return int64(len(f.data)) }
 
+type readFuncFile struct {
+	size int64
+	read func([]byte, int64) (int, error)
+}
+
+func (f *readFuncFile) ReadAt(p []byte, off int64) (int, error) {
+	return f.read(p, off)
+}
+
+func (*readFuncFile) Close() error { return nil }
+func (f *readFuncFile) Size() int64 {
+	return f.size
+}
+
 type blockingWriter struct {
 	buf     bytes.Buffer
 	entered chan struct{}
@@ -390,4 +494,31 @@ func (w *blockingWriter) Write(p []byte) (int, error) {
 func (w *blockingWriter) Close() error {
 	w.closed = true
 	return nil
+}
+
+type writeFuncWriter struct {
+	write      func([]byte) (int, error)
+	closeErr   error
+	abortErr   error
+	writeCalls int
+	closeCalls int
+	abortCalls int
+}
+
+func (w *writeFuncWriter) Write(p []byte) (int, error) {
+	w.writeCalls++
+	if w.write != nil {
+		return w.write(p)
+	}
+	return len(p), nil
+}
+
+func (w *writeFuncWriter) Close() error {
+	w.closeCalls++
+	return w.closeErr
+}
+
+func (w *writeFuncWriter) Abort() error {
+	w.abortCalls++
+	return w.abortErr
 }

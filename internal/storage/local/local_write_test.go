@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -298,6 +299,14 @@ func TestLocal_BackupRemovalFailureRollsBackReplacement(t *testing.T) {
 	if !errors.Is(err, removeErr) {
 		t.Fatalf("Close error = %v, want %v", err, removeErr)
 	}
+	if got := filepath.Dir(rollbackOps.backupPath); got != dir {
+		t.Fatalf("backup directory = %s, want %s", got, dir)
+	}
+	if base := filepath.Base(rollbackOps.backupPath); !strings.HasPrefix(base, replacementBackupPrefix) {
+		t.Fatalf("backup name = %q, want prefix %q", base, replacementBackupPrefix)
+	} else if got, want := len(base), len(replacementBackupPrefix)+replacementNameTokenBytes*2; got != want {
+		t.Fatalf("backup name length = %d, want %d", got, want)
+	}
 
 	got, err := os.ReadFile(path)
 	if err != nil {
@@ -316,7 +325,83 @@ func TestLocal_BackupRemovalFailureRollsBackReplacement(t *testing.T) {
 	if err := w.(storage.Aborter).Abort(); err != nil {
 		t.Fatalf("Abort after rollback: %v", err)
 	}
-	if matches, err := filepath.Glob(path + ".shoal-*"); err != nil {
+	if matches, err := filepath.Glob(filepath.Join(dir, ".shoal-*")); err != nil {
+		t.Fatal(err)
+	} else if len(matches) != 0 {
+		t.Fatalf("replacement artifacts remain: %v", matches)
+	}
+}
+
+func TestLocal_LongNameTargetsUseFixedLengthSiblingArtifacts(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("long NAME_MAX-style filename regression is not portable on Windows")
+	}
+
+	dir := t.TempDir()
+	checkTemp := func(t *testing.T, w storage.Writer) {
+		t.Helper()
+		localWriter := w.(*writer)
+		if got := filepath.Dir(localWriter.temp); got != dir {
+			t.Fatalf("temporary directory = %s, want %s", got, dir)
+		}
+		if base := filepath.Base(localWriter.temp); !strings.HasPrefix(base, replacementTempPrefix) {
+			t.Fatalf("temporary name = %q, want prefix %q", base, replacementTempPrefix)
+		} else if got, want := len(base), len(replacementTempPrefix)+replacementNameTokenBytes*2; got != want {
+			t.Fatalf("temporary name length = %d, want %d", got, want)
+		}
+	}
+
+	createPath := filepath.Join(dir, strings.Repeat("c", 255))
+	w, err := New().Create(context.Background(), createPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkTemp(t, w)
+	if _, err := w.Write([]byte("create")); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.ReadFile(createPath); err != nil || string(got) != "create" {
+		t.Fatalf("created file = %q, %v; want create", got, err)
+	}
+
+	replacePath := filepath.Join(dir, strings.Repeat("r", 255))
+	if err := os.WriteFile(replacePath, []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	w, err = New().Create(context.Background(), replacePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkTemp(t, w)
+	if _, err := w.Write([]byte("replace")); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.ReadFile(replacePath); err != nil || string(got) != "replace" {
+		t.Fatalf("replaced file = %q, %v; want replace", got, err)
+	}
+
+	abortPath := filepath.Join(dir, strings.Repeat("a", 255))
+	w, err = New().Create(context.Background(), abortPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkTemp(t, w)
+	if _, err := w.Write([]byte("abort")); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.(storage.Aborter).Abort(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(abortPath); !os.IsNotExist(err) {
+		t.Fatalf("aborted target exists: %v", err)
+	}
+	if matches, err := filepath.Glob(filepath.Join(dir, ".shoal-*")); err != nil {
 		t.Fatal(err)
 	} else if len(matches) != 0 {
 		t.Fatalf("replacement artifacts remain: %v", matches)
@@ -569,16 +654,23 @@ func (o atomicReplaceErrorOps) AtomicReplace(string, string, string, bool) error
 
 type blockingRollbackOps struct {
 	replacementOps
-	err     error
-	entered chan struct{}
-	release chan struct{}
+	err        error
+	entered    chan struct{}
+	release    chan struct{}
+	backupPath string
 }
 
 func (o *blockingRollbackOps) Remove(name string) error {
-	if strings.Contains(name, ".shoal-backup-") {
+	if strings.Contains(name, replacementBackupPrefix) {
+		o.backupPath = name
 		return o.err
 	}
 	return o.replacementOps.Remove(name)
+}
+
+func (o *blockingRollbackOps) AtomicReplace(temp, target, backup string, hadOld bool) error {
+	o.backupPath = backup
+	return o.replacementOps.AtomicReplace(temp, target, backup, hadOld)
 }
 
 func (o *blockingRollbackOps) AtomicRestore(target, backup string) error {

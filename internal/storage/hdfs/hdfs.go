@@ -96,6 +96,7 @@ func NewContext(ctx context.Context, address string, opts ...Option) (*Backend, 
 		return nil, err
 	}
 	cleanupClientCtx, stopCleanupClient := newBackendClientContext(backgroundCtx)
+	opFactoryCtx := backgroundCtx
 	cfg := &config{}
 	for _, opt := range opts {
 		opt(cfg)
@@ -109,7 +110,7 @@ func NewContext(ctx context.Context, address string, opts ...Option) (*Backend, 
 		closeFn := lease.release
 		return &Backend{
 			client:       lease.client,
-			newOperation: cfg.clientLeaseFactory,
+			newOperation: bindOperationLeaseFactory(opFactoryCtx, cfg.clientLeaseFactory),
 			authority:    authority,
 			closeClient:  newBackendCloser(stopCleanupClient, closeFn),
 		}, nil
@@ -124,7 +125,7 @@ func NewContext(ctx context.Context, address string, opts ...Option) (*Backend, 
 		}
 		return &Backend{
 			client:       cfg.client,
-			newOperation: opFactory,
+			newOperation: bindOperationLeaseFactory(opFactoryCtx, opFactory),
 			authority:    authority,
 			closeClient:  onceCloser(cfg.client.Close),
 		}, nil
@@ -144,9 +145,9 @@ func NewContext(ctx context.Context, address string, opts ...Option) (*Backend, 
 	dialSource.Store(cleanupClientCtx)
 	return &Backend{
 		client: baseClient.client,
-		newOperation: func(opCtx context.Context) (*leasedClient, error) {
+		newOperation: bindOperationLeaseFactory(opFactoryCtx, func(opCtx context.Context) (*leasedClient, error) {
 			return newHDFSClient(opCtx, clientAddress, options)
-		},
+		}),
 		authority:   authority,
 		closeClient: newBackendCloser(stopCleanupClient, baseClient.release),
 	}, nil
@@ -461,6 +462,29 @@ func newBackendCloser(cancel context.CancelFunc, closeFn func() error) func() er
 	})
 }
 
+func bindOperationLeaseFactory(boundCtx context.Context, factory func(context.Context) (*leasedClient, error)) func(context.Context) (*leasedClient, error) {
+	if factory == nil {
+		return nil
+	}
+	return func(opCtx context.Context) (*leasedClient, error) {
+		effectiveCtx, releaseCtx := combineDialContexts(opCtx, boundCtx)
+		lease, err := factory(effectiveCtx)
+		if err != nil {
+			releaseCtx()
+			return nil, err
+		}
+		release := lease.release
+		lease.release = onceCloser(func() error {
+			releaseCtx()
+			if release == nil {
+				return nil
+			}
+			return release()
+		})
+		return lease, nil
+	}
+}
+
 func combineDialContexts(requestCtx, boundCtx context.Context) (context.Context, func()) {
 	requestCtx = contextOrBackground(requestCtx)
 	boundCtx = contextOrBackground(boundCtx)
@@ -666,7 +690,7 @@ func (w *replaceWriter) commitReplacement() error {
 	}
 	w.state = replacementPublished
 	if hadOld {
-		if err := w.client.Remove(backup); err != nil && !isNotFound(err) {
+		if err := removeWithContext(w.ctx, w.client, backup); err != nil && !isNotFound(err) {
 			cleanupErr := fmt.Errorf("hdfs: remove replacement backup %s: %w", backup, err)
 			if rollbackErr := withCleanupContext(func(cleanupCtx context.Context) error {
 				return w.withCleanupClient(func(client Client) error {

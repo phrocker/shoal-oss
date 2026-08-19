@@ -121,9 +121,10 @@ var ErrReadOnly = errors.New("storage: backend is read-only")
 // Reads are issued in 64KB chunks via ReadAt; backends that bill per
 // request (GCS) absorb at most ceil(size/64KB) round trips. Increase
 // the chunk size for large files if perf matters. ctx is polled before
-// each backend read and write; if a backend call is already blocked,
-// Copy waits for it to return before observing ctx.Err(). On an unsuccessful
-// path, Copy aborts the destination writer when it supports Aborter.
+// and immediately after each backend read and write; if a backend call is
+// already blocked, Copy waits for it to return before observing ctx.Err().
+// On an unsuccessful path, Copy aborts the destination writer when it
+// supports Aborter.
 func Copy(ctx context.Context, src Backend, srcPath string, dst Backend, dstPath string) (written int64, err error) {
 	wb, ok := dst.(WritableBackend)
 	if !ok {
@@ -156,21 +157,31 @@ func Copy(ctx context.Context, src Backend, srcPath string, dst Backend, dstPath
 		if err := ctx.Err(); err != nil {
 			return written, err
 		}
+		readOff := written
 		want := int64(transferChunkSize)
 		if written+want > in.Size() {
 			want = in.Size() - written
 		}
-		n, err := in.ReadAt(buf[:want], written)
+		n, err := in.ReadAt(buf[:want], readOff)
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return written, fmt.Errorf("copy: read off=%d: %w", readOff, joinContextCallError(err, ctxErr))
+		}
 		if err != nil && !errors.Is(err, io.EOF) {
-			return written, fmt.Errorf("copy: read off=%d: %w", written, err)
+			return written, fmt.Errorf("copy: read off=%d: %w", readOff, err)
 		}
 		if n > 0 {
-			if err := ctx.Err(); err != nil {
-				return written, err
-			}
 			writeOff := written
 			wrote, werr := out.Write(buf[:n])
 			written += int64(wrote)
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				if werr != nil {
+					return written, fmt.Errorf("copy: write off=%d: %w", writeOff, joinContextCallError(werr, ctxErr))
+				}
+				if wrote != n {
+					return written, fmt.Errorf("copy: write off=%d: %w", writeOff, joinContextCallError(io.ErrShortWrite, ctxErr))
+				}
+				return written, fmt.Errorf("copy: write off=%d: %w", writeOff, ctxErr)
+			}
 			if werr != nil {
 				return written, fmt.Errorf("copy: write off=%d: %w", writeOff, werr)
 			}
@@ -246,11 +257,11 @@ func ReadAll(ctx context.Context, b Backend, path string) ([]byte, error) {
 // WriteAll creates path on b (which must be a WritableBackend) and writes
 // data in one shot, committing on Close. Used to publish an immutable
 // RFile produced by a flush or compaction. Returns ErrReadOnly if b can't
-// write. ctx is polled between chunk writes; a write already blocked in the
-// backend may still finish its current chunk, and if that completes the object,
-// WriteAll still waits for that backend call to return before observing
-// ctx.Err(). On an unsuccessful path, WriteAll aborts the writer when it
-// supports Aborter.
+// write. ctx is polled before and immediately after each chunk write; a
+// write already blocked in the backend may still finish its current chunk,
+// and if that completes the object, WriteAll still waits for that backend
+// call to return before observing ctx.Err(). On an unsuccessful path,
+// WriteAll aborts the writer when it supports Aborter.
 func WriteAll(ctx context.Context, b Backend, path string, data []byte) (err error) {
 	wb, ok := b.(WritableBackend)
 	if !ok {
@@ -277,6 +288,15 @@ func WriteAll(ctx context.Context, b Backend, path string, data []byte) (err err
 		writeOff := off
 		n, err := w.Write(data[off:end])
 		off += n
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			if err != nil {
+				return fmt.Errorf("writeall: write %s off=%d: %w", path, writeOff, joinContextCallError(err, ctxErr))
+			}
+			if n != end-writeOff {
+				return fmt.Errorf("writeall: write %s off=%d: %w", path, writeOff, joinContextCallError(io.ErrShortWrite, ctxErr))
+			}
+			return fmt.Errorf("writeall: write %s off=%d: %w", path, writeOff, ctxErr)
+		}
 		if err != nil {
 			return fmt.Errorf("writeall: write %s off=%d: %w", path, writeOff, err)
 		}
@@ -292,6 +312,16 @@ func WriteAll(ctx context.Context, b Backend, path string, data []byte) (err err
 	}
 	needsCleanup = false
 	return nil
+}
+
+func joinContextCallError(callErr, ctxErr error) error {
+	if ctxErr == nil {
+		return callErr
+	}
+	if callErr == nil {
+		return ctxErr
+	}
+	return errors.Join(callErr, ctxErr)
 }
 
 func cleanupUnsuccessfulWrite(primaryErr error, w Writer) error {

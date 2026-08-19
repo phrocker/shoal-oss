@@ -6,13 +6,14 @@ package local
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
 
-	"github.com/google/uuid"
 	"github.com/phrocker/shoal/internal/storage"
 )
 
@@ -52,20 +53,20 @@ func (b *Backend) Open(_ context.Context, path string) (storage.File, error) {
 // already exist — matches "mkdir -p" behavior so callers don't have to pre-
 // create the path tree.
 func (b *Backend) Create(_ context.Context, path string) (storage.Writer, error) {
-	if dir := filepath.Dir(path); dir != "" && dir != "." {
+	dir := filepath.Dir(path)
+	if dir != "" && dir != "." {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return nil, fmt.Errorf("local: mkdir %s: %w", dir, err)
 		}
 	}
 	ops := osReplacementOps{}
-	temp := filepath.Join(filepath.Dir(path), filepath.Base(path)+".shoal-tmp-"+uuid.NewString())
-	f, err := os.OpenFile(temp, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o644)
+	f, err := openReplacementSiblingFile(dir)
 	if err != nil {
 		return nil, fmt.Errorf("local: create temporary file for %s: %w", path, err)
 	}
-	if _, err := preserveExistingMetadata(ops, temp, path); err != nil {
+	if _, err := preserveExistingMetadata(ops, f.Name(), path); err != nil {
 		_ = f.Close()
-		_ = ops.Remove(temp)
+		_ = ops.Remove(f.Name())
 		return nil, err
 	}
 	return &writer{
@@ -160,7 +161,21 @@ func (osReplacementOps) AtomicRestore(target, backup string) error {
 	return platformAtomicRestore(target, backup)
 }
 
-const replacementModeMask = os.ModePerm | os.ModeSetuid | os.ModeSetgid | os.ModeSticky
+const (
+	replacementModeMask       = os.ModePerm | os.ModeSetuid | os.ModeSetgid | os.ModeSticky
+	replacementTempPrefix     = ".shoal-tmp-"
+	replacementBackupPrefix   = ".shoal-backup-"
+	replacementNameTokenBytes = 16
+	replacementNameAttempts   = 32
+)
+
+var randomReplacementNameToken = func() (string, error) {
+	buf := make([]byte, replacementNameTokenBytes)
+	if _, err := rand.Read(buf); err != nil {
+		return "", fmt.Errorf("local: generate replacement name token: %w", err)
+	}
+	return hex.EncodeToString(buf), nil
+}
 
 func replacementTargetMode(ops replacementOps, target string) (os.FileMode, bool, error) {
 	info, err := ops.Lstat(target)
@@ -188,6 +203,63 @@ func preserveExistingMetadata(ops replacementOps, temp, target string) (bool, er
 		return true, fmt.Errorf("local: preserve mode bits for %s: %w", target, err)
 	}
 	return true, nil
+}
+
+func openReplacementSiblingFile(dir string) (*os.File, error) {
+	var lastErr error
+	for attempts := 0; attempts < replacementNameAttempts; attempts++ {
+		temp, err := nextReplacementSiblingPath(dir, replacementTempPrefix)
+		if err != nil {
+			return nil, err
+		}
+		f, err := os.OpenFile(temp, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o644)
+		if err == nil {
+			return f, nil
+		}
+		if errors.Is(err, fs.ErrExist) {
+			lastErr = err
+			continue
+		}
+		return nil, err
+	}
+	if lastErr == nil {
+		lastErr = fs.ErrExist
+	}
+	return nil, fmt.Errorf("local: exhausted unique temporary sibling names: %w", lastErr)
+}
+
+func nextReplacementSiblingPath(dir, prefix string) (string, error) {
+	token, err := randomReplacementNameToken()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, prefix+token), nil
+}
+
+func (w *writer) publishReplacement(hadOld bool) (string, error) {
+	if !hadOld {
+		return "", w.ops.AtomicReplace(w.temp, w.target, "", false)
+	}
+
+	var lastErr error
+	for attempts := 0; attempts < replacementNameAttempts; attempts++ {
+		backup, err := nextReplacementSiblingPath(filepath.Dir(w.target), replacementBackupPrefix)
+		if err != nil {
+			return "", fmt.Errorf("local: create replacement backup path for %s: %w", w.target, err)
+		}
+		if err := w.ops.AtomicReplace(w.temp, w.target, backup, true); err != nil {
+			if errors.Is(err, fs.ErrExist) {
+				lastErr = err
+				continue
+			}
+			return backup, err
+		}
+		return backup, nil
+	}
+	if lastErr == nil {
+		lastErr = fs.ErrExist
+	}
+	return "", fmt.Errorf("local: exhausted unique replacement backup names for %s: %w", w.target, lastErr)
 }
 
 func (w *writer) Write(p []byte) (int, error) {
@@ -237,10 +309,10 @@ func (w *writer) commitReplacement() error {
 		return err
 	}
 
-	backup := w.target + ".shoal-backup-" + uuid.NewString()
-	if err := w.ops.AtomicReplace(w.temp, w.target, backup, hadOld); err != nil {
+	backup, err := w.publishReplacement(hadOld)
+	if err != nil {
 		publishErr := fmt.Errorf("local: publish %s: %w", w.target, err)
-		if hadOld {
+		if hadOld && backup != "" {
 			if cleanupErr := w.ops.Remove(backup); cleanupErr != nil && !errors.Is(cleanupErr, fs.ErrNotExist) {
 				publishErr = errors.Join(
 					publishErr,

@@ -424,6 +424,81 @@ func TestNewContextKeepsCleanupClientAliveUntilBackendClose(t *testing.T) {
 	}
 }
 
+func TestNewContextOperationClientReadStopsOnEitherContext(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		cancel func(context.CancelFunc, context.CancelFunc)
+	}{
+		{
+			name: "operation",
+			cancel: func(_ context.CancelFunc, cancelOp context.CancelFunc) {
+				cancelOp()
+			},
+		},
+		{
+			name: "backend",
+			cancel: func(cancelBackend context.CancelFunc, _ context.CancelFunc) {
+				cancelBackend()
+			},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			constructorCtx, cancelConstructor := context.WithCancel(context.Background())
+			opCtx, cancelOperation := context.WithCancel(context.Background())
+			defer cancelConstructor()
+			defer cancelOperation()
+
+			leaseCalls := 0
+			var cleanupCtx context.Context
+			backend, err := NewContext(constructorCtx, "nn:8020", func(c *config) {
+				c.clientLeaseFactory = func(ctx context.Context) (*leasedClient, error) {
+					leaseCalls++
+					if leaseCalls == 1 {
+						cleanupCtx = ctx
+						return &leasedClient{client: newFakeClient(), release: func() error { return nil }}, nil
+					}
+					return &leasedClient{client: &contextReadClient{ctx: ctx}, release: func() error { return nil }}, nil
+				}
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer backend.Close()
+
+			f, err := backend.Open(opCtx, "/tables/1.rf")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer f.Close()
+
+			done := make(chan error, 1)
+			go func() {
+				_, err := f.ReadAt(make([]byte, 1), 0)
+				done <- err
+			}()
+
+			tt.cancel(cancelConstructor, cancelOperation)
+
+			select {
+			case err := <-done:
+				if !errors.Is(err, context.Canceled) {
+					t.Fatalf("ReadAt error = %v, want context.Canceled", err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("ReadAt did not stop after context cancellation")
+			}
+
+			if tt.name == "backend" {
+				select {
+				case <-cleanupCtx.Done():
+					t.Fatal("cleanup client context ended with backend lifetime cancellation")
+				default:
+				}
+			}
+		})
+	}
+}
+
 func TestDialContextSourceStoresMixedContextTypes(t *testing.T) {
 	source := newDialContextSource(nil)
 	if got := source.Context(); got == nil {
@@ -1191,6 +1266,58 @@ func TestBackendCloseBoundsStalledRollbackRename(t *testing.T) {
 	}
 }
 
+func TestBackendCloseUsesOperationContextForBackupRemovalRollback(t *testing.T) {
+	setCleanupTimeoutForTest(t, 100*time.Millisecond)
+
+	client := newFakeClient()
+	client.files["/tables/1.rf"] = []byte("old")
+	client.removeContextHook = func(ctx context.Context, name string) error {
+		if strings.Contains(name, ".shoal-backup-") {
+			<-ctx.Done()
+			return ctx.Err()
+		}
+		return nil
+	}
+	backend, err := New("nn:8020", WithClient(client))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+	w, err := backend.Create(ctx, "/tables/1.rf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write([]byte("new")); err != nil {
+		t.Fatal(err)
+	}
+
+	start := time.Now()
+	err = w.Close()
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Close error = %v, want context deadline exceeded", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("Close took %v; backup removal was not bounded by the operation context", elapsed)
+	}
+	if client.lastRemoveDeadline.IsZero() {
+		t.Fatal("backup removal did not receive the operation deadline")
+	}
+	if client.lastRenameDeadline.IsZero() {
+		t.Fatal("rollback rename did not receive a cleanup deadline")
+	}
+	if !client.lastRenameDeadline.After(client.lastRemoveDeadline) {
+		t.Fatalf("rollback deadline = %v, want later than backup remove deadline %v", client.lastRenameDeadline, client.lastRemoveDeadline)
+	}
+	if got := string(client.files["/tables/1.rf"]); got != "old" {
+		t.Fatalf("target contents = %q, want rollback to restore old data", got)
+	}
+	if err := w.(storage.Aborter).Abort(); err != nil {
+		t.Fatalf("Abort after bounded rollback: %v", err)
+	}
+}
+
 type fakeClient struct {
 	files                    map[string][]byte
 	dirs                     map[string]bool
@@ -1210,6 +1337,8 @@ type fakeClient struct {
 	failBackupRemove         bool
 	writerCloseHook          func() error
 	lastRemoveDeadline       time.Time
+	removeContextCalls       []string
+	removeContextHook        func(context.Context, string) error
 	lastRenameDeadline       time.Time
 	renameContextCalls       []renameCall
 	renameContextHook        func(context.Context, string, string) error
@@ -1307,6 +1436,12 @@ func (c *fakeClient) Remove(name string) error {
 
 func (c *fakeClient) RemoveContext(ctx context.Context, name string) error {
 	c.lastRemoveDeadline, _ = ctx.Deadline()
+	c.removeContextCalls = append(c.removeContextCalls, name)
+	if c.removeContextHook != nil {
+		if err := c.removeContextHook(ctx, name); err != nil {
+			return err
+		}
+	}
 	return c.Remove(name)
 }
 
@@ -1535,6 +1670,46 @@ func (r *fakeReader) SetDeadline(t time.Time) error {
 	r.deadline = t
 	return nil
 }
+
+type contextReadClient struct {
+	ctx context.Context
+}
+
+func (c *contextReadClient) Open(name string) (Reader, error) {
+	return &contextReadReader{
+		ctx:  c.ctx,
+		info: fakeInfo{name: path.Base(name), size: 1},
+	}, nil
+}
+
+func (*contextReadClient) Create(string) (storage.Writer, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (*contextReadClient) MkdirAll(string, os.FileMode) error { return nil }
+
+func (*contextReadClient) ReadDir(string) ([]os.FileInfo, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (*contextReadClient) Remove(string) error { return errors.New("not implemented") }
+
+func (*contextReadClient) Rename(string, string) error { return errors.New("not implemented") }
+
+func (*contextReadClient) Close() error { return nil }
+
+type contextReadReader struct {
+	ctx  context.Context
+	info os.FileInfo
+}
+
+func (r *contextReadReader) ReadAt([]byte, int64) (int, error) {
+	<-r.ctx.Done()
+	return 0, r.ctx.Err()
+}
+
+func (*contextReadReader) Close() error        { return nil }
+func (r *contextReadReader) Stat() os.FileInfo { return r.info }
 
 type fakeWriter struct {
 	bytes.Buffer
