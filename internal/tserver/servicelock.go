@@ -408,10 +408,23 @@ func (l *ServiceLock) Node() string {
 // When that cleanup itself fails, the returned error also wraps
 // ErrLockNodeOrphaned: a node survived, and only closing the ZooKeeper session
 // will remove it.
+//
+// The data has to describe this process: every descriptor must carry the UUID
+// the lock is held as. Accumulo's tablet server announces itself with one UUID
+// in both places, and the two are read for different things — the node name is
+// what fences a generation, the descriptor is what a client dials. Publishing
+// one server's descriptors from another's lock node would split those apart,
+// so it is refused here rather than left for the manager to find.
 func (l *ServiceLock) Acquire(ctx context.Context, data ServiceLockData) (LockID, error) {
 	payload, err := data.Encode()
 	if err != nil {
 		return LockID{}, err
+	}
+	for _, descriptor := range data.Descriptors {
+		if descriptor.UUID != l.uuid {
+			return LockID{}, fmt.Errorf("%w: %s descriptor names server %s, but this lock is held as %s",
+				ErrInvalidLockData, descriptor.Service, descriptor.UUID, l.uuid)
+		}
 	}
 	l.mu.Lock()
 	if l.started {
@@ -505,6 +518,14 @@ func (l *ServiceLock) waitForOwnership(ctx context.Context) (LockID, error) {
 // queueForOwnership is waitForOwnership without the release reporting.
 func (l *ServiceLock) queueForOwnership(ctx context.Context) (LockID, error) {
 	node := ""
+	// The watch on this process's own node outlives a pass. A ZooKeeper watch
+	// stays registered until it fires, so arming one per pass would leave a
+	// registration behind for every place this process moves up the queue, and
+	// a long queue would end with every one of them firing at once. It is
+	// re-armed only after it has fired. The node ahead is a different node on
+	// each pass, so its watch is not the same kind of accumulation: each one
+	// belongs to the node it was armed on and is spent when that node goes.
+	var mineEvents <-chan gozk.Event
 	for {
 		children, _, err := l.conn.Children(l.dir)
 		if err != nil {
@@ -550,12 +571,15 @@ func (l *ServiceLock) queueForOwnership(ctx context.Context) (LockID, error) {
 		// acquisition whose node was deleted — by an operator, or by the
 		// session dropping just that node — asleep on an event about a queue
 		// it is no longer in, until an unrelated holder happens to leave.
-		mineExists, _, mineEvents, err := l.conn.ExistsW(path.Join(l.dir, node))
-		if err != nil {
-			return LockID{}, fmt.Errorf("watch lock node %s: %w", node, err)
-		}
-		if !mineExists {
-			return LockID{}, fmt.Errorf("%w: %s is gone from %s", ErrLockNodeMissing, node, l.dir)
+		if mineEvents == nil {
+			mineExists, _, armed, err := l.conn.ExistsW(path.Join(l.dir, node))
+			if err != nil {
+				return LockID{}, fmt.Errorf("watch lock node %s: %w", node, err)
+			}
+			if !mineExists {
+				return LockID{}, fmt.Errorf("%w: %s is gone from %s", ErrLockNodeMissing, node, l.dir)
+			}
+			mineEvents = armed
 		}
 		ahead := findLowestPrevPrefix(sorted, index)
 		exists, _, aheadEvents, err := l.conn.ExistsW(path.Join(l.dir, ahead))
@@ -564,10 +588,9 @@ func (l *ServiceLock) queueForOwnership(ctx context.Context) (LockID, error) {
 		}
 		if !exists {
 			// It left between the listing and the watch; re-read rather than
-			// wait for an event that will never come. The watch already left
-			// on this process's own node costs one extra pass at worst,
-			// because every pass re-reads the directory and decides again
-			// from what it finds there.
+			// wait for an event that will never come. The watch already armed
+			// on this process's own node is kept and reused by the next pass,
+			// so re-reading does not cost another registration.
 			continue
 		}
 		select {
@@ -576,6 +599,9 @@ func (l *ServiceLock) queueForOwnership(ctx context.Context) (LockID, error) {
 		case <-l.release:
 			return LockID{}, fmt.Errorf("%w: %s", ErrLockReleased, l.dir)
 		case <-mineEvents:
+			// Spent. The next pass re-arms it, and re-reads the directory to
+			// find out whether the node it watched is really gone.
+			mineEvents = nil
 		case <-aheadEvents:
 		}
 	}
@@ -743,6 +769,11 @@ func (l *ServiceLock) Verify() error {
 //
 // A create that was already in flight is waited out before the sweep, so the
 // success this reports covers that node too rather than racing past it.
+//
+// The ending is recorded before the delete, not after. The delete is what a
+// watching Maintain sees, and it would report an external NODE_DELETED for a
+// node this process took away on purpose — so whichever of them wins that race
+// would decide how a deliberate release was remembered.
 func (l *ServiceLock) Release() error {
 	l.mu.Lock()
 	if !l.started {
@@ -752,13 +783,13 @@ func (l *ServiceLock) Release() error {
 	l.released = true
 	l.mu.Unlock()
 	l.releaseOnce.Do(func() { close(l.release) })
+	l.lose(LossReleased, nil)
 	// released is set above, so a create that has not started yet is already
 	// refused; taking createMu here waits out one that has. Between them the
 	// sweep below cannot miss a node this process made.
 	l.createMu.Lock()
 	err := l.deleteOwnNodes()
 	l.createMu.Unlock()
-	l.lose(LossReleased, nil)
 	return err
 }
 

@@ -35,7 +35,15 @@ import (
 // testLockData is the payload a tablet server publishes in these tests.
 func testLockData(t *testing.T) ServiceLockData {
 	t.Helper()
-	data, err := TabletServerLockData(serverUUID, testAddress, testGroup, TabletServerServices()...)
+	return testLockDataFor(t, serverUUID)
+}
+
+// testLockDataFor is the same payload announced by a named server. A lock and
+// the descriptors published from it have to name the same server, so a test
+// running several candidates gives each one its own.
+func testLockDataFor(t *testing.T, holder string) ServiceLockData {
+	t.Helper()
+	data, err := TabletServerLockData(holder, testAddress, testGroup, TabletServerServices()...)
 	if err != nil {
 		t.Fatalf("TabletServerLockData: %v", err)
 	}
@@ -1055,7 +1063,7 @@ func TestQueuedCandidatesAcquireInSequenceOrder(t *testing.T) {
 	acquired := make(chan acquisition, len(locks))
 	for i, lock := range locks {
 		go func(i int, lock *ServiceLock) {
-			id, err := lock.Acquire(context.Background(), testLockData(t))
+			id, err := lock.Acquire(context.Background(), testLockDataFor(t, holders[i]))
 			acquired <- acquisition{i, id, err}
 		}(i, lock)
 	}
@@ -1887,5 +1895,117 @@ func TestAcquireFailsWhenItsNodeVanishesBeforeTheWatch(t *testing.T) {
 	}
 	if _, held := lock.LockID(); held {
 		t.Fatal("a lock whose node vanished must not be held")
+	}
+}
+
+// TestAcquireRefusesDescriptorsThatNameAnotherServer keeps the two halves of a
+// server's identity together. The node name is what a generation is fenced by
+// and the descriptor is what a client dials; publishing one server's
+// descriptors from another's lock node would make the manager route work to a
+// server this process is not fencing on behalf of.
+func TestAcquireRefusesDescriptorsThatNameAnotherServer(t *testing.T) {
+	f := newFakeZK()
+	lock := newTestLock(t, f, serverUUID)
+
+	_, err := lock.Acquire(context.Background(), testLockDataFor(t, otherUUID))
+	if !errors.Is(err, ErrInvalidLockData) {
+		t.Fatalf("Acquire = %v, want ErrInvalidLockData", err)
+	}
+	if !strings.Contains(err.Error(), otherUUID) || !strings.Contains(err.Error(), serverUUID) {
+		t.Fatalf("Acquire = %v, want both server names so the mismatch is diagnosable", err)
+	}
+	if created := f.createdPaths(); len(created) != 0 {
+		t.Fatalf("a refused advertisement created %v", created)
+	}
+	if _, held := lock.LockID(); held {
+		t.Fatal("a refused advertisement must not leave a lock held")
+	}
+}
+
+// TestAQueuedCandidateKeepsOneWatchOnItsOwnNode is the queued counterpart of
+// TestMaintainKeepsExactlyOneWatchOutstanding. A ZooKeeper watch stays
+// registered until it fires, and this process's own node does not fire while
+// it is climbing the queue — so re-arming it on every pass would leave a
+// registration behind at every place it stood, and a server joining a busy
+// resource group would pay for the whole queue.
+func TestAQueuedCandidateKeepsOneWatchOnItsOwnNode(t *testing.T) {
+	const thirdUUID = "3f9c0d21-5b47-4e08-9a12-6c8de4f70b35"
+
+	f := newFakeZK()
+	dir := testLockPath()
+	f.seed(dir, nil, false)
+	predecessors := make([]string, 0, 3)
+	for i, holder := range []string{otherUUID, managerUUID, thirdUUID} {
+		predecessors = append(predecessors, path.Join(dir, f.seedForeignLock(dir, holder, int32(i))))
+	}
+	ours := lockNodePath(serverUUID, len(predecessors))
+
+	lock := newTestLock(t, f, serverUUID)
+	acquired := make(chan error, 1)
+	go func() {
+		_, err := lock.Acquire(context.Background(), testLockData(t))
+		acquired <- err
+	}()
+
+	// A candidate watches the node immediately ahead of it, so the queue is
+	// climbed nearest-first: each departure moves this one up a place and
+	// starts another pass.
+	for gone := range predecessors {
+		ahead := predecessors[len(predecessors)-1-gone]
+		waitFor(t, "the candidate to watch "+path.Base(ahead), func() bool {
+			return f.watchCount(ahead) == 1
+		})
+		// The own-node watch is armed before the one ahead, so by the time
+		// that one exists this pass has done all the arming it will do.
+		if got := f.watchCount(ours); got != 1 {
+			t.Fatalf("own node watched %d times after %d places moved up: want exactly 1", got, gone)
+		}
+		if err := f.Delete(ahead, -1); err != nil {
+			t.Fatalf("Delete(%s): %v", ahead, err)
+		}
+	}
+	if err := <-acquired; err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	if got := f.watchCount(ours); got > 1 {
+		t.Fatalf("own node watched %d times after acquiring: want at most 1", got)
+	}
+}
+
+// TestReleaseRecordsItsEndingBeforeTheNodeGoes pins which ending a deliberate
+// release is remembered by. The delete is what a watching Maintain sees, so a
+// watcher that reached the loss first would record an external NODE_DELETED
+// for a node this process took away on purpose — and since the first ending
+// recorded is the one kept, the answer would depend on who won the race.
+func TestReleaseRecordsItsEndingBeforeTheNodeGoes(t *testing.T) {
+	f := newFakeZK()
+	lock := newTestLock(t, f, serverUUID)
+	if _, err := lock.Acquire(context.Background(), testLockData(t)); err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+
+	var watcher error
+	f.beforeDelete = func(znodePath string) {
+		if !strings.HasPrefix(path.Base(znodePath), zLockPrefix) {
+			return
+		}
+		f.beforeDelete = nil
+		// Stands in for Maintain reacting to the deletion: this is the call
+		// its watch-event path makes, at the earliest moment a watcher could
+		// make it — the delete has been asked for but has not landed.
+		watcher = lock.lose(LossNodeDeleted, nil)
+	}
+
+	if err := lock.Release(); err != nil {
+		t.Fatalf("Release: %v", err)
+	}
+	if watcher == nil {
+		t.Fatal("the stand-in watcher never ran, so nothing was raced")
+	}
+	if !strings.Contains(watcher.Error(), LossReleased.String()) {
+		t.Fatalf("watcher saw %v, want the deliberate %s ending", watcher, LossReleased)
+	}
+	if strings.Contains(watcher.Error(), LossNodeDeleted.String()) {
+		t.Fatalf("watcher saw %v: a release was remembered as an external loss", watcher)
 	}
 }

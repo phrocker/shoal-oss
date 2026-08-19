@@ -116,9 +116,14 @@ const (
 )
 
 // thriftServiceOrder is the declaration order of ServiceLockData.ThriftService.
-// Accumulo holds descriptors in an EnumMap, so a Java-written lock znode lists
-// them in this order; encoding in the same order keeps a Shoal-written znode
-// byte-comparable with the equivalent Java one.
+// Encoding in it makes a Shoal-written znode the same bytes every time, which
+// is what lets the wire form be pinned by a test and diffed by an operator.
+//
+// It is not what Java emits. ServiceLockData serializes through
+// Collectors.toSet(), so the array a Java tablet server writes is in hash
+// order. Nothing reads the array positionally — Accumulo deserializes it into
+// a set and keys it by service — so the order is this process's to choose, and
+// a stable order is worth more than an imitation of an unstable one.
 var thriftServiceOrder = map[ThriftService]int{
 	"CLIENT":            0,
 	"COORDINATOR":       1,

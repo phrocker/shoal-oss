@@ -322,6 +322,21 @@ which Accumulo's `EnumMap` would silently collapse to whichever arrived
 last. A claim the manager cannot act on is worse than staying invisible,
 because it draws work to a process that cannot do it.
 
+Every descriptor has to carry the UUID the lock is held as. Accumulo's
+tablet server announces itself with one UUID in both places, and the two
+are read for different things: the node name is what a generation is
+fenced by, the descriptor is what a client dials. Publishing one
+server's descriptors from another's lock node splits those apart — the
+generation this process would fence on and the server the manager reads
+would not be the same server — so it is refused at acquisition rather
+than left for the manager to find.
+
+The order of the array is this process's own. Accumulo serializes its
+descriptors through `Collectors.toSet()`, so a Java-written node is in
+hash order and no reader can be relying on position; sorting by the
+`ThriftService` declaration order makes the same advertisement the same
+bytes every time, which is what makes it testable and diffable.
+
 A wildcard is refused for the same reason. `0.0.0.0` and `::` are how a
 process says which interfaces it binds; neither is an identity, and a
 manager reading one out of this lock would have to substitute some host
@@ -358,6 +373,14 @@ consumed. Arming per pass would make a healthy tablet server accumulate
 a registration per verify interval for the life of its lock, and deliver
 all of them at once when the node finally changed.
 
+The same holds while queued. The watch on this process's own node — the
+one that says the turn will never come — is armed once and kept across
+passes, so climbing a long queue does not leave a registration behind at
+every place this process stood. The watch on the node ahead is a
+different node on each pass, so it is not the same kind of accumulation:
+each one belongs to the node it was armed on and is spent when that node
+goes.
+
 An optional verify interval re-reads the directory on a timer. It catches
 what a watch cannot: a watch dropped without an event, and a lock
 directory deleted and recreated, which restarts ZooKeeper's sequence
@@ -386,6 +409,14 @@ delete that fails leaves the node in place, and with no verify interval
 configured there is nothing else to wake the watch — it would go on
 watching a generation the caller had already given up until the process
 stopped.
+
+The ending is recorded before the node is deleted, not after. The delete
+is what a watching `Maintain` sees, and a watcher that got there first
+would record an external `NODE_DELETED` for a node this process took
+away on purpose. Since the first ending recorded is the one kept, that
+would leave how a deliberate release is remembered depending on who won
+the race; recording `RELEASED` up front makes the answer the same either
+way.
 
 A create that was already in flight is waited out before the sweep. The
 two are mutually exclusive, so either the create happens and the sweep

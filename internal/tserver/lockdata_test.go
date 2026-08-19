@@ -272,6 +272,12 @@ func TestLockIDValidRequiresTheCanonicalUUID(t *testing.T) {
 // service. Field names, the descriptors wrapper, the enum spellings, and the
 // group being a bare string are all load-bearing — get any of them wrong and
 // the manager sees a server it cannot parse.
+//
+// The order of the array is not part of that contract in either direction:
+// Accumulo serializes through Collectors.toSet() and deserializes into a set
+// keyed by service, so a Java-written node is in hash order and no reader
+// depends on position. Pinning an order here is what makes the same
+// advertisement the same bytes every time.
 func TestTabletServerLockDataMatchesTheAccumuloWireForm(t *testing.T) {
 	data, err := TabletServerLockData(serverUUID, testAddress, testGroup, TabletServerServices()...)
 	if err != nil {
