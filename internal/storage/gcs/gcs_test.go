@@ -3,7 +3,9 @@ package gcs
 import (
 	"bytes"
 	"context"
+	"crypto/md5"
 	"errors"
+	"hash/crc32"
 	"io"
 	"os"
 	"strings"
@@ -202,6 +204,63 @@ func TestWriter_ClosePreconditionFailurePreservesNewerTarget(t *testing.T) {
 	}
 }
 
+func TestWriter_CloseAmbiguousPromotionErrorDoesNotReplayMutation(t *testing.T) {
+	backend, bucket := newFakeBackend()
+	bucket.putObject("path/to/object.rf", []byte("old"))
+	bucket.copyAfterCommitErr = context.DeadlineExceeded
+
+	w, err := backend.Create(context.Background(), "bucket/path/to/object.rf")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if _, err := w.Write([]byte("new")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close after committed ambiguous copy response: %v", err)
+	}
+	if got := string(bucket.objects["path/to/object.rf"].body); got != "new" {
+		t.Fatalf("destination contents = %q, want committed new object", got)
+	}
+	if len(bucket.copyCalls) != 1 {
+		t.Fatalf("copy calls = %d, want exactly 1 (no mutation replay)", len(bucket.copyCalls))
+	}
+}
+
+func TestWriter_CanceledPromotionUsesIndependentCleanupContext(t *testing.T) {
+	backend, bucket := newFakeBackend()
+	bucket.putObject("path/to/object.rf", []byte("old"))
+	cleanupSawCanceledContext := false
+	bucket.deleteHook = func(ctx context.Context, _ *fakeObject) error {
+		cleanupSawCanceledContext = ctx.Err() != nil
+		return nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+
+	w, err := backend.Create(ctx, "bucket/path/to/object.rf")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	tempName := w.(*writer).temp.(*fakeObject).name
+	if _, err := w.Write([]byte("new")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	cancel()
+	err = w.Close()
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Close error = %v, want context.Canceled", err)
+	}
+	if got := string(bucket.objects["path/to/object.rf"].body); got != "old" {
+		t.Fatalf("destination contents = %q, want preserved old object", got)
+	}
+	if _, ok := bucket.objects[tempName]; ok {
+		t.Fatalf("canceled promotion left temp object %q behind", tempName)
+	}
+	if cleanupSawCanceledContext {
+		t.Fatal("temporary cleanup reused the canceled operation context")
+	}
+}
+
 func TestWriter_AbortDeleteFailureAllowsRetry(t *testing.T) {
 	backend, bucket := newFakeBackend()
 
@@ -389,19 +448,21 @@ func newFakeBackend() (*Backend, *fakeBucket) {
 var errFakePrecondition = errors.New("fake gcs: precondition failed")
 
 type fakeBucket struct {
-	objects     map[string]fakeObjectData
-	nextGen     int64
-	writerPlan  func(string) fakeWriterPlan
-	deleteHook  func(context.Context, *fakeObject) error
-	copyHook    func(context.Context, *fakeObject, *fakeObject) error
-	lastWriter  *fakeObjectWriter
-	copyCalls   []fakeCopyCall
-	deleteCalls []fakeDeleteCall
+	objects            map[string]fakeObjectData
+	nextGen            int64
+	writerPlan         func(string) fakeWriterPlan
+	deleteHook         func(context.Context, *fakeObject) error
+	copyHook           func(context.Context, *fakeObject, *fakeObject) error
+	copyAfterCommitErr error
+	lastWriter         *fakeObjectWriter
+	copyCalls          []fakeCopyCall
+	deleteCalls        []fakeDeleteCall
 }
 
 type fakeObjectData struct {
-	body       []byte
-	generation int64
+	body           []byte
+	generation     int64
+	metageneration int64
 }
 
 type fakeWriterPlan struct {
@@ -438,14 +499,19 @@ func (b *fakeBucket) Object(name string) objectHandle {
 
 func (b *fakeBucket) putObject(name string, body []byte) *cloudstorage.ObjectAttrs {
 	attrs := &cloudstorage.ObjectAttrs{
-		Name:       name,
-		Generation: b.nextGen,
-		Size:       int64(len(body)),
+		Name:           name,
+		Generation:     b.nextGen,
+		Metageneration: 1,
+		Size:           int64(len(body)),
+		CRC32C:         crc32.Checksum(body, crc32.MakeTable(crc32.Castagnoli)),
 	}
+	md5Sum := md5.Sum(body)
+	attrs.MD5 = append([]byte(nil), md5Sum[:]...)
 	b.nextGen++
 	b.objects[name] = fakeObjectData{
-		body:       append([]byte(nil), body...),
-		generation: attrs.Generation,
+		body:           append([]byte(nil), body...),
+		generation:     attrs.Generation,
+		metageneration: attrs.Metageneration,
 	}
 	return attrs
 }
@@ -485,9 +551,12 @@ func (o *fakeObject) Attrs(ctx context.Context) (*cloudstorage.ObjectAttrs, erro
 		return nil, cloudstorage.ErrObjectNotExist
 	}
 	return &cloudstorage.ObjectAttrs{
-		Name:       o.name,
-		Generation: data.generation,
-		Size:       int64(len(data.body)),
+		Name:           o.name,
+		Generation:     data.generation,
+		Metageneration: data.metageneration,
+		Size:           int64(len(data.body)),
+		CRC32C:         crc32.Checksum(data.body, crc32.MakeTable(crc32.Castagnoli)),
+		MD5:            md5Bytes(data.body),
 	}, nil
 }
 
@@ -569,7 +638,11 @@ func (c *fakeObjectCopier) Run(ctx context.Context) (*cloudstorage.ObjectAttrs, 
 	if err := c.dst.checkConditions(); err != nil {
 		return nil, err
 	}
-	return c.dst.bucket.putObject(c.dst.name, srcData.body), nil
+	attrs := c.dst.bucket.putObject(c.dst.name, srcData.body)
+	if c.dst.bucket.copyAfterCommitErr != nil {
+		return nil, c.dst.bucket.copyAfterCommitErr
+	}
+	return attrs, nil
 }
 
 func (o *fakeObject) checkConditions() error {
@@ -580,7 +653,9 @@ func (o *fakeObject) checkConditions() error {
 			return errFakePrecondition
 		}
 	case o.conditions.GenerationMatch != 0:
-		if !exists || current.generation != o.conditions.GenerationMatch {
+		if !exists ||
+			current.generation != o.conditions.GenerationMatch ||
+			current.metageneration != o.conditions.MetagenerationMatch {
 			return errFakePrecondition
 		}
 	}
@@ -618,4 +693,9 @@ func (w *fakeObjectWriter) CloseWithError(err error) error {
 
 func (w *fakeObjectWriter) Attrs() *cloudstorage.ObjectAttrs {
 	return w.attrs
+}
+
+func md5Bytes(data []byte) []byte {
+	sum := md5.Sum(data)
+	return append([]byte(nil), sum[:]...)
 }

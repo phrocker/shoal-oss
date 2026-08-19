@@ -18,6 +18,7 @@
 package gcs
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -146,7 +147,7 @@ func (b *Backend) Create(ctx context.Context, path string) (shstorage.Writer, er
 	return &writer{
 		ctx:                ctx,
 		cancel:             cancel,
-		inner:              temp.NewWriter(writeCtx),
+		inner:              temp.If(storage.Conditions{DoesNotExist: true}).NewWriter(writeCtx),
 		target:             target,
 		targetPath:         "gs://" + bucket + "/" + object,
 		targetConditions:   targetConditions,
@@ -272,6 +273,7 @@ type writer struct {
 	temp               objectHandle
 	tempPath           string
 	tempGeneration     int64
+	tempAttrs          *storage.ObjectAttrs
 	tempClosed         bool
 	tempCleanupTimeout time.Duration
 	closed             bool
@@ -314,6 +316,7 @@ func (w *writer) Close() error {
 			)
 		}
 		w.tempGeneration = attrs.Generation
+		w.tempAttrs = attrs
 	}
 
 	if w.tempGeneration == 0 {
@@ -438,7 +441,10 @@ func loadPromotionConditions(ctx context.Context, target objectHandle) (storage.
 	if err != nil {
 		return storage.Conditions{}, err
 	}
-	return storage.Conditions{GenerationMatch: attrs.Generation}, nil
+	return storage.Conditions{
+		GenerationMatch:     attrs.Generation,
+		MetagenerationMatch: attrs.Metageneration,
+	}, nil
 }
 
 func contextOrBackground(ctx context.Context) context.Context {
@@ -461,9 +467,31 @@ func (w *writer) promoteTempObject() error {
 		CopierFrom(w.temp.Generation(w.tempGeneration)).
 		Run(w.ctx)
 	if err != nil {
+		if w.destinationMatchesTemp() {
+			return nil
+		}
 		return fmt.Errorf("gcs: promote temporary object %s to %s: %w", w.tempPath, w.targetPath, err)
 	}
 	return nil
+}
+
+func (w *writer) destinationMatchesTemp() bool {
+	if w.tempAttrs == nil {
+		return false
+	}
+	verifyCtx, cancel := context.WithTimeout(context.Background(), w.tempCleanupTimeout)
+	defer cancel()
+	attrs, err := w.target.Attrs(verifyCtx)
+	if err != nil {
+		return false
+	}
+	if w.targetConditions.GenerationMatch != 0 &&
+		attrs.Generation == w.targetConditions.GenerationMatch {
+		return false
+	}
+	return attrs.Size == w.tempAttrs.Size &&
+		attrs.CRC32C == w.tempAttrs.CRC32C &&
+		bytes.Equal(attrs.MD5, w.tempAttrs.MD5)
 }
 
 func (w *writer) cleanupTempObject() error {

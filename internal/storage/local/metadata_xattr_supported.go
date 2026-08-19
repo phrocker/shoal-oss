@@ -11,11 +11,27 @@ import (
 )
 
 func preservePlatformXattrs(temp, target string) error {
-	targetNames, err := listXattrs(target)
+	return reconcilePlatformXattrs(temp, target, xattrOperations{
+		list:   listXattrs,
+		get:    getXattr,
+		set:    unix.Setxattr,
+		remove: removeXattr,
+	})
+}
+
+type xattrOperations struct {
+	list   func(string) ([]string, error)
+	get    func(string, string) ([]byte, error)
+	set    func(string, string, []byte, int) error
+	remove func(string, string) error
+}
+
+func reconcilePlatformXattrs(temp, target string, ops xattrOperations) error {
+	targetNames, err := ops.list(target)
 	if err != nil {
 		return fmt.Errorf("local: list extended attributes for %s: %w", target, err)
 	}
-	tempNames, err := listXattrs(temp)
+	tempNames, err := ops.list(temp)
 	if err != nil {
 		return fmt.Errorf("local: list extended attributes for %s: %w", temp, err)
 	}
@@ -28,16 +44,16 @@ func preservePlatformXattrs(temp, target string) error {
 		if _, ok := targetSet[name]; ok {
 			continue
 		}
-		if err := removeXattr(temp, name); err != nil {
+		if err := ops.remove(temp, name); err != nil {
 			return fmt.Errorf("local: remove inherited extended attribute %s from %s: %w", name, temp, err)
 		}
 	}
 	for _, name := range targetNames {
-		value, err := getXattr(target, name)
+		value, err := ops.get(target, name)
 		if err != nil {
 			return fmt.Errorf("local: read extended attribute %s for %s: %w", name, target, err)
 		}
-		if err := unix.Setxattr(temp, name, value, 0); err != nil {
+		if err := ops.set(temp, name, value, 0); err != nil {
 			return fmt.Errorf("local: preserve extended attribute %s for %s: %w", name, target, err)
 		}
 	}
