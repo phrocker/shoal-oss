@@ -148,6 +148,25 @@ struct shoal_connector_identity_result {
   char *principal;
 };
 
+struct shoal_range_result {
+  shoal_range_bound_kind start_kind;
+  uint8_t has_start_key;
+  shoal_bridge_scan_entry start_key;
+  shoal_range_bound_kind end_kind;
+  uint8_t has_end_key;
+  shoal_bridge_scan_entry end_key;
+  uint8_t start_inclusive;
+  uint8_t end_inclusive;
+};
+
+struct shoal_iterator_setting_result {
+  char *name;
+  char *class_name;
+  int32_t priority;
+  size_t option_count;
+  shoal_iterator_option *options;
+};
+
 shoal_connector *shoal_bridge_connector_alloc(uint64_t id);
 uint64_t shoal_bridge_connector_id(const shoal_connector *connector);
 void shoal_bridge_connector_free(shoal_connector *connector);
@@ -202,6 +221,41 @@ int shoal_bridge_connector_identity_get(
     shoal_connector_identity_view *out_identity);
 void shoal_bridge_connector_identity_free(
     shoal_connector_identity_result *result);
+
+shoal_range_result *shoal_bridge_range_result_alloc(void);
+int shoal_bridge_range_result_set_start(
+    shoal_range_result *result, const uint8_t *row, size_t row_length,
+    const uint8_t *column_family, size_t column_family_length,
+    const uint8_t *column_qualifier, size_t column_qualifier_length,
+    const uint8_t *column_visibility, size_t column_visibility_length,
+    int64_t timestamp);
+int shoal_bridge_range_result_set_end(
+    shoal_range_result *result, const uint8_t *row, size_t row_length,
+    const uint8_t *column_family, size_t column_family_length,
+    const uint8_t *column_qualifier, size_t column_qualifier_length,
+    const uint8_t *column_visibility, size_t column_visibility_length,
+    int64_t timestamp);
+void shoal_bridge_range_result_set_metadata(
+    shoal_range_result *result, shoal_range_bound_kind start_kind,
+    shoal_range_bound_kind end_kind, uint8_t start_inclusive,
+    uint8_t end_inclusive);
+int shoal_bridge_range_result_get(const shoal_range_result *result,
+                                  shoal_range_view *out_range);
+void shoal_bridge_range_result_free(shoal_range_result *result);
+
+shoal_iterator_setting_result *
+shoal_bridge_iterator_setting_result_alloc(size_t option_count);
+int shoal_bridge_iterator_setting_result_set_identity(
+    shoal_iterator_setting_result *result, const char *name,
+    const char *class_name, int32_t priority);
+int shoal_bridge_iterator_setting_result_set_option(
+    shoal_iterator_setting_result *result, size_t index, const char *key,
+    const char *value);
+int shoal_bridge_iterator_setting_result_get(
+    const shoal_iterator_setting_result *result,
+    shoal_iterator_setting_view *out_setting);
+void shoal_bridge_iterator_setting_result_free(
+    shoal_iterator_setting_result *result);
 
 shoal_table_list_result *shoal_bridge_table_list_alloc(size_t count);
 int shoal_bridge_table_list_set(shoal_table_list_result *result, size_t index,

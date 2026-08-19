@@ -37,6 +37,51 @@ int main(void) {
   shoal_bridge_connector_identity_free(identity);
   shoal_bridge_connector_identity_free(NULL);
 
+  static const uint8_t range_row[] = {'r', '\0', 'w'};
+  shoal_range_result *range = shoal_bridge_range_result_alloc();
+  assert(range != NULL);
+  assert(shoal_bridge_range_result_set_start(
+      range, range_row, sizeof(range_row), NULL, 0, NULL, 0, NULL, 0, 7));
+  shoal_bridge_range_result_set_metadata(
+      range, SHOAL_RANGE_BOUND_KEY, SHOAL_RANGE_BOUND_UNBOUNDED, 1, 0);
+  shoal_range_view range_view;
+  memset(&range_view, 0, sizeof(range_view));
+  range_view.struct_size = SHOAL_RANGE_VIEW_V1_SIZE;
+  assert(shoal_bridge_range_result_get(range, &range_view));
+  assert(range_view.start_kind == SHOAL_RANGE_BOUND_KEY);
+  assert(range_view.end_kind == SHOAL_RANGE_BOUND_UNBOUNDED);
+  assert(range_view.has_start_key == 1 && range_view.has_end_key == 0);
+  assert(range_view.start_key.row.length == sizeof(range_row));
+  assert(memcmp(range_view.start_key.row.data, range_row,
+                sizeof(range_row)) == 0);
+  assert(range_view.start_key.timestamp == 7);
+  assert(range_view.start_inclusive == 1 && range_view.end_inclusive == 0);
+  assert(!shoal_bridge_range_result_get(NULL, &range_view));
+  assert(!shoal_bridge_range_result_get(range, NULL));
+  shoal_bridge_range_result_free(range);
+  shoal_bridge_range_result_free(NULL);
+
+  shoal_iterator_setting_result *iterator =
+      shoal_bridge_iterator_setting_result_alloc(1);
+  assert(iterator != NULL);
+  assert(shoal_bridge_iterator_setting_result_set_identity(
+      iterator, "name", "class", 11));
+  assert(shoal_bridge_iterator_setting_result_set_option(
+      iterator, 0, "key", "value"));
+  shoal_iterator_setting_view iterator_view;
+  memset(&iterator_view, 0, sizeof(iterator_view));
+  iterator_view.struct_size = SHOAL_ITERATOR_SETTING_VIEW_V1_SIZE;
+  assert(shoal_bridge_iterator_setting_result_get(iterator, &iterator_view));
+  assert(strcmp(iterator_view.name, "name") == 0);
+  assert(strcmp(iterator_view.class_name, "class") == 0);
+  assert(iterator_view.priority == 11 && iterator_view.option_count == 1);
+  assert(strcmp(iterator_view.options[0].key, "key") == 0);
+  assert(strcmp(iterator_view.options[0].value, "value") == 0);
+  assert(!shoal_bridge_iterator_setting_result_get(NULL, &iterator_view));
+  assert(!shoal_bridge_iterator_setting_result_get(iterator, NULL));
+  shoal_bridge_iterator_setting_result_free(iterator);
+  shoal_bridge_iterator_setting_result_free(NULL);
+
   static const uint8_t row[] = {'r', '\0', 'w'};
   static const uint8_t family[] = {'c', 'f'};
   static const uint8_t qualifier[] = {'c', 'q'};

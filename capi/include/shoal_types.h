@@ -22,7 +22,7 @@
  */
 #define SHOAL_ABI_VERSION 1u
 #define SHOAL_ABI_VERSION_MAJOR 1u
-#define SHOAL_ABI_VERSION_MINOR 2u
+#define SHOAL_ABI_VERSION_MINOR 3u
 #define SHOAL_ABI_VERSION_PATCH 0u
 #define SHOAL_ABI_PACK_VERSION(major, minor, patch)                           \
   ((((uint32_t)(major) & 0xffu) << 16) |                                     \
@@ -53,10 +53,11 @@ enum {
   SHOAL_ABI_CAPABILITY_NAMESPACE_ADMIN = 10,
   SHOAL_ABI_CAPABILITY_SECURITY_ADMIN = 11,
   SHOAL_ABI_CAPABILITY_TABLE_SPLITS = 12,
-  SHOAL_ABI_CAPABILITY_CONNECTOR_IDENTITY = 13
+  SHOAL_ABI_CAPABILITY_CONNECTOR_IDENTITY = 13,
+  SHOAL_ABI_CAPABILITY_DATA_DESCRIPTORS = 14
 };
 
-#define SHOAL_ABI_CAPABILITY_COUNT 14u
+#define SHOAL_ABI_CAPABILITY_COUNT 15u
 #define SHOAL_ABI_CAPABILITY_WORD_BITS 64u
 #define SHOAL_ABI_CAPABILITY_WORD_INDEX(capability_id)                       \
   ((uint32_t)(capability_id) / SHOAL_ABI_CAPABILITY_WORD_BITS)
@@ -94,6 +95,8 @@ enum {
   SHOAL_ABI_CAPABILITY_MASK(SHOAL_ABI_CAPABILITY_TABLE_SPLITS)
 #define SHOAL_ABI_CAPABILITY_CONNECTOR_IDENTITY_MASK                         \
   SHOAL_ABI_CAPABILITY_MASK(SHOAL_ABI_CAPABILITY_CONNECTOR_IDENTITY)
+#define SHOAL_ABI_CAPABILITY_DATA_DESCRIPTORS_MASK                           \
+  SHOAL_ABI_CAPABILITY_MASK(SHOAL_ABI_CAPABILITY_DATA_DESCRIPTORS)
 #define SHOAL_ABI_CAPABILITY_WORD0                                           \
   (SHOAL_ABI_CAPABILITY_CONNECTOR_MASK | SHOAL_ABI_CAPABILITY_BOOTSTRAP_MASK | \
    SHOAL_ABI_CAPABILITY_ERROR_MASK | SHOAL_ABI_CAPABILITY_SCANNER_MASK |     \
@@ -106,7 +109,8 @@ enum {
    SHOAL_ABI_CAPABILITY_NAMESPACE_ADMIN_MASK |                               \
    SHOAL_ABI_CAPABILITY_SECURITY_ADMIN_MASK |                                \
    SHOAL_ABI_CAPABILITY_TABLE_SPLITS_MASK |                                  \
-   SHOAL_ABI_CAPABILITY_CONNECTOR_IDENTITY_MASK)
+   SHOAL_ABI_CAPABILITY_CONNECTOR_IDENTITY_MASK |                            \
+   SHOAL_ABI_CAPABILITY_DATA_DESCRIPTORS_MASK)
 
 typedef int32_t shoal_status;
 
@@ -163,6 +167,8 @@ typedef struct shoal_namespace_properties_result shoal_namespace_properties_resu
 typedef struct shoal_versioned_properties_result shoal_versioned_properties_result;
 typedef struct shoal_bytes_list_result shoal_bytes_list_result;
 typedef struct shoal_connector_identity_result shoal_connector_identity_result;
+typedef struct shoal_range_result shoal_range_result;
+typedef struct shoal_iterator_setting_result shoal_iterator_setting_result;
 typedef struct shoal_error shoal_error;
 
 typedef struct shoal_connector_identity_view {
@@ -199,6 +205,19 @@ typedef struct shoal_iterator_setting {
   const shoal_iterator_option *options;
   size_t option_count;
 } shoal_iterator_setting;
+
+typedef struct shoal_iterator_setting_view {
+  uint32_t struct_size;
+  const char *name;
+  const char *class_name;
+  int32_t priority;
+  const shoal_iterator_option *options;
+  size_t option_count;
+} shoal_iterator_setting_view;
+
+#define SHOAL_ITERATOR_SETTING_VIEW_V1_SIZE                                 \
+  ((uint32_t)(offsetof(shoal_iterator_setting_view, option_count) +          \
+              sizeof(((shoal_iterator_setting_view *)0)->option_count)))
 
 typedef struct shoal_key {
   shoal_bytes row;
@@ -303,6 +322,22 @@ typedef struct shoal_range {
 #define SHOAL_RANGE_V1_SIZE                                                  \
   ((uint32_t)(offsetof(shoal_range, end_inclusive) +                         \
               sizeof(((shoal_range *)0)->end_inclusive)))
+
+typedef struct shoal_range_view {
+  uint32_t struct_size;
+  shoal_range_bound_kind start_kind;
+  uint8_t has_start_key;
+  shoal_key start_key;
+  shoal_range_bound_kind end_kind;
+  uint8_t has_end_key;
+  shoal_key end_key;
+  uint8_t start_inclusive;
+  uint8_t end_inclusive;
+} shoal_range_view;
+
+#define SHOAL_RANGE_VIEW_V1_SIZE                                             \
+  ((uint32_t)(offsetof(shoal_range_view, end_inclusive) +                    \
+              sizeof(((shoal_range_view *)0)->end_inclusive)))
 
 /*
  * Every pointer in a key/value view is borrowed from its shoal_scan_result

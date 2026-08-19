@@ -5,6 +5,8 @@
 | SB-CONN-004 | — | — | — | — | Behavior mismatch | |
 | SB-CONN-005 | — | — | — | — | Behavior mismatch | |
 | SB-CFG-009 | — | — | — | — | Behavior mismatch | |
+| SB-DATA-025 | — | — | — | — | Behavior mismatch | |
+| SB-DATA-057 | — | — | — | — | Behavior mismatch | |
 | SB-SEC-001 | — | — | — | — | Behavior mismatch | |
 | SB-SEC-002 | — | — | — | — | Behavior mismatch | |
 | SB-NS-001 | — | — | — | — | Behavior mismatch | |
@@ -29,3 +31,5 @@
 | SB-GAP-C-002 | Capability discovery | SB-XCUT-012 | merged | **Complete on the ABI.** |
 | SB-GAP-C-004 | Security, namespace, and table-split ABI | SB-SEC-*, SB-NS-001, SB-TABLE-010 | merged | **Complete on the ABI.** |
 | SB-GAP-C-011 | Connector identity discovery | SB-CFG-009 | merged | **Complete on the ABI.** |
+| SB-GAP-C-008 | Range accessors | SB-DATA-025 | merged | **Complete on the ABI.** |
+| SB-GAP-C-009 | Iterator accessors | SB-DATA-057 | merged | **Complete on the ABI.** |

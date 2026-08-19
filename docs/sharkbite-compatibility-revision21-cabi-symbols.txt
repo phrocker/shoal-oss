@@ -1,7 +1,7 @@
-# Revision-20 compiled C ABI symbol inventory for docs/sharkbite-compatibility.md.
+# Revision-21 compiled C ABI symbol inventory for docs/sharkbite-compatibility.md.
 # Generated from the undefined/imported shoal_* references emitted by compiling the exact C/C++
 # sources that cmd/shoal-capi/cabi_test.go links in TestSharedLibraryCABI.
-# Update only when the independently audited revision-20 compiled inventory changes.
+# Update only when the independently audited revision-21 compiled inventory changes.
 
 [declared]
 shoal_abi_version
@@ -16,7 +16,15 @@ shoal_abi_has_capability
 shoal_connector_config_init
 shoal_scanner_config_init
 shoal_range_init
+shoal_range_view_init
+shoal_iterator_setting_view_init
 shoal_batch_writer_config_init
+shoal_range_create
+shoal_range_get
+shoal_range_free
+shoal_iterator_setting_create
+shoal_iterator_setting_get
+shoal_iterator_setting_free
 shoal_connector_create
 shoal_connector_close
 shoal_connector_free
@@ -188,7 +196,12 @@ shoal_error_free
 shoal_error_message
 shoal_error_security_code
 shoal_error_security_user
+shoal_iterator_setting_create
+shoal_iterator_setting_free
+shoal_iterator_setting_get
+shoal_iterator_setting_view_init
 shoal_mutation_create
+shoal_mutation_delete
 shoal_mutation_delete_latest
 shoal_mutation_free
 shoal_mutation_put
@@ -200,7 +213,11 @@ shoal_namespace_list_get
 shoal_namespace_properties_count
 shoal_namespace_properties_free
 shoal_namespace_properties_get
+shoal_range_create
+shoal_range_free
+shoal_range_get
 shoal_range_init
+shoal_range_view_init
 shoal_scan_result_count
 shoal_scan_result_free
 shoal_scan_result_get
@@ -228,7 +245,6 @@ shoal_write_failure_get_flags
 [unreferenced]
 shoal_scanner_scan
 shoal_batch_scanner_scan
-shoal_mutation_delete
 shoal_write_failure_get_constraint
 shoal_write_failure_get_authorization
 shoal_write_failure_get_cleanup

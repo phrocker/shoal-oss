@@ -1,8 +1,8 @@
-# Revision-20 accepted matrix rows for docs/sharkbite-compatibility.md.
+# Revision-21 accepted matrix rows for docs/sharkbite-compatibility.md.
 # One entry per row: ROW-ID followed by the audited status, in document order.
 # Pinning the status next to the id means a swap of two rows' statuses inside one
 # section cannot pass the aggregate count checks undetected.
-# Update only when the independently audited revision-20 inventory itself changes.
+# Update only when the independently audited revision-21 inventory itself changes.
 # Regenerate from the audited document, review every added/removed/reclassified row
 # in code review, and keep the list in document order for human auditability.
 
@@ -95,12 +95,12 @@ SB-DATA-021 Behavior mismatch
 SB-DATA-022 Behavior mismatch
 SB-DATA-023 Behavior mismatch
 SB-DATA-024 Behavior mismatch
-SB-DATA-025 Missing C ABI
-SB-DATA-026 Missing C ABI
-SB-DATA-027 Missing C ABI
-SB-DATA-028 Missing C ABI
-SB-DATA-029 Missing C ABI
-SB-DATA-030 Missing C ABI
+SB-DATA-025 Behavior mismatch
+SB-DATA-026 Behavior mismatch
+SB-DATA-027 Behavior mismatch
+SB-DATA-028 Behavior mismatch
+SB-DATA-029 Behavior mismatch
+SB-DATA-030 Behavior mismatch
 SB-DATA-031 Missing Go
 SB-DATA-032 Missing Go
 SB-DATA-033 Missing Go
@@ -112,7 +112,7 @@ SB-DATA-037 Behavior mismatch
 SB-DATA-038 Behavior mismatch
 SB-DATA-039 Behavior mismatch
 SB-DATA-040 Missing C ABI
-SB-DATA-041 Missing C ABI
+SB-DATA-041 Behavior mismatch
 SB-DATA-042 Behavior mismatch
 SB-DATA-043 Not required (rationale required)
 SB-DATA-044 Not required (rationale required)
@@ -129,12 +129,12 @@ SB-DATA-075 Not required (rationale required)
 SB-DATA-054 Behavior mismatch
 SB-DATA-055 Behavior mismatch
 SB-DATA-056 Missing Go
-SB-DATA-057 Missing C ABI
-SB-DATA-069 Missing C ABI
-SB-DATA-058 Missing C ABI
-SB-DATA-070 Missing C ABI
-SB-DATA-059 Missing C ABI
-SB-DATA-071 Missing C ABI
+SB-DATA-057 Behavior mismatch
+SB-DATA-069 Behavior mismatch
+SB-DATA-058 Behavior mismatch
+SB-DATA-070 Behavior mismatch
+SB-DATA-059 Behavior mismatch
+SB-DATA-071 Behavior mismatch
 SB-DATA-060 Not required (rationale required)
 SB-DATA-061 Missing Go
 SB-DATA-062 Missing Go

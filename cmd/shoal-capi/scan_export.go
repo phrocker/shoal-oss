@@ -525,6 +525,9 @@ func parseRangeBound(input C.shoal_range_bound, name string) (parsedRangeBound, 
 		if err != nil {
 			return parsedRangeBound{}, err
 		}
+		if row == nil {
+			row = make([]byte, 0)
+		}
 		return parsedRangeBound{kind: input.kind, row: row}, nil
 	case C.SHOAL_RANGE_BOUND_KEY:
 		if !emptyBytes(input.row) {

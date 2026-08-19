@@ -283,6 +283,44 @@ static void shoal_bridge_scan_entry_clear(shoal_bridge_scan_entry *entry) {
   memset(entry, 0, sizeof(*entry));
 }
 
+static int shoal_bridge_key_entry_set(
+    shoal_bridge_scan_entry *entry, const uint8_t *row, size_t row_length,
+    const uint8_t *column_family, size_t column_family_length,
+    const uint8_t *column_qualifier, size_t column_qualifier_length,
+    const uint8_t *column_visibility, size_t column_visibility_length,
+    int64_t timestamp) {
+  if (entry == NULL || (row == NULL && row_length != 0) ||
+      (column_family == NULL && column_family_length != 0) ||
+      (column_qualifier == NULL && column_qualifier_length != 0) ||
+      (column_visibility == NULL && column_visibility_length != 0)) {
+    return 0;
+  }
+  shoal_bridge_scan_entry next;
+  memset(&next, 0, sizeof(next));
+  next.row = shoal_bridge_copy_bytes(row, row_length);
+  next.column_family =
+      shoal_bridge_copy_bytes(column_family, column_family_length);
+  next.column_qualifier =
+      shoal_bridge_copy_bytes(column_qualifier, column_qualifier_length);
+  next.column_visibility =
+      shoal_bridge_copy_bytes(column_visibility, column_visibility_length);
+  if ((row_length != 0 && next.row == NULL) ||
+      (column_family_length != 0 && next.column_family == NULL) ||
+      (column_qualifier_length != 0 && next.column_qualifier == NULL) ||
+      (column_visibility_length != 0 && next.column_visibility == NULL)) {
+    shoal_bridge_scan_entry_clear(&next);
+    return 0;
+  }
+  next.row_length = row_length;
+  next.column_family_length = column_family_length;
+  next.column_qualifier_length = column_qualifier_length;
+  next.column_visibility_length = column_visibility_length;
+  next.timestamp = timestamp;
+  shoal_bridge_scan_entry_clear(entry);
+  *entry = next;
+  return 1;
+}
+
 shoal_scan_result *shoal_bridge_scan_result_alloc(size_t count) {
   if (count > SIZE_MAX / sizeof(shoal_bridge_scan_entry)) {
     return NULL;
@@ -322,27 +360,17 @@ int shoal_bridge_scan_result_set(
 
   shoal_bridge_scan_entry next;
   memset(&next, 0, sizeof(next));
-  next.row = shoal_bridge_copy_bytes(row, row_length);
-  next.column_family =
-      shoal_bridge_copy_bytes(column_family, column_family_length);
-  next.column_qualifier =
-      shoal_bridge_copy_bytes(column_qualifier, column_qualifier_length);
-  next.column_visibility =
-      shoal_bridge_copy_bytes(column_visibility, column_visibility_length);
+  if (!shoal_bridge_key_entry_set(
+          &next, row, row_length, column_family, column_family_length,
+          column_qualifier, column_qualifier_length, column_visibility,
+          column_visibility_length, timestamp)) {
+    return 0;
+  }
   next.value = shoal_bridge_copy_bytes(value, value_length);
-  if ((row_length != 0 && next.row == NULL) ||
-      (column_family_length != 0 && next.column_family == NULL) ||
-      (column_qualifier_length != 0 && next.column_qualifier == NULL) ||
-      (column_visibility_length != 0 && next.column_visibility == NULL) ||
-      (value_length != 0 && next.value == NULL)) {
+  if (value_length != 0 && next.value == NULL) {
     shoal_bridge_scan_entry_clear(&next);
     return 0;
   }
-  next.row_length = row_length;
-  next.column_family_length = column_family_length;
-  next.column_qualifier_length = column_qualifier_length;
-  next.column_visibility_length = column_visibility_length;
-  next.timestamp = timestamp;
   next.value_length = value_length;
 
   shoal_bridge_scan_entry_clear(&result->entries[index]);
@@ -385,6 +413,203 @@ void shoal_bridge_scan_result_free(shoal_scan_result *result) {
   free(result->entries);
   result->entries = NULL;
   result->count = 0;
+  free(result);
+}
+
+static void shoal_bridge_key_entry_get(const shoal_bridge_scan_entry *entry,
+                                       shoal_key *out_key) {
+  memset(out_key, 0, sizeof(*out_key));
+  out_key->row.data = entry->row;
+  out_key->row.length = entry->row_length;
+  out_key->column_family.data = entry->column_family;
+  out_key->column_family.length = entry->column_family_length;
+  out_key->column_qualifier.data = entry->column_qualifier;
+  out_key->column_qualifier.length = entry->column_qualifier_length;
+  out_key->column_visibility.data = entry->column_visibility;
+  out_key->column_visibility.length = entry->column_visibility_length;
+  out_key->timestamp = entry->timestamp;
+}
+
+shoal_range_result *shoal_bridge_range_result_alloc(void) {
+  SHOAL_BRIDGE_TEST_ALLOC_GUARD(shoal_bridge_result_alloc_fail_after);
+  return (shoal_range_result *)calloc(1, sizeof(shoal_range_result));
+}
+
+int shoal_bridge_range_result_set_start(
+    shoal_range_result *result, const uint8_t *row, size_t row_length,
+    const uint8_t *column_family, size_t column_family_length,
+    const uint8_t *column_qualifier, size_t column_qualifier_length,
+    const uint8_t *column_visibility, size_t column_visibility_length,
+    int64_t timestamp) {
+  if (result == NULL) {
+    return 0;
+  }
+  if (!shoal_bridge_key_entry_set(
+          &result->start_key, row, row_length, column_family,
+          column_family_length, column_qualifier, column_qualifier_length,
+          column_visibility, column_visibility_length, timestamp)) {
+    return 0;
+  }
+  result->has_start_key = 1;
+  return 1;
+}
+
+int shoal_bridge_range_result_set_end(
+    shoal_range_result *result, const uint8_t *row, size_t row_length,
+    const uint8_t *column_family, size_t column_family_length,
+    const uint8_t *column_qualifier, size_t column_qualifier_length,
+    const uint8_t *column_visibility, size_t column_visibility_length,
+    int64_t timestamp) {
+  if (result == NULL) {
+    return 0;
+  }
+  if (!shoal_bridge_key_entry_set(
+          &result->end_key, row, row_length, column_family,
+          column_family_length, column_qualifier, column_qualifier_length,
+          column_visibility, column_visibility_length, timestamp)) {
+    return 0;
+  }
+  result->has_end_key = 1;
+  return 1;
+}
+
+void shoal_bridge_range_result_set_metadata(
+    shoal_range_result *result, shoal_range_bound_kind start_kind,
+    shoal_range_bound_kind end_kind, uint8_t start_inclusive,
+    uint8_t end_inclusive) {
+  if (result != NULL) {
+    result->start_kind = start_kind;
+    result->end_kind = end_kind;
+    result->start_inclusive = start_inclusive;
+    result->end_inclusive = end_inclusive;
+  }
+}
+
+int shoal_bridge_range_result_get(const shoal_range_result *result,
+                                  shoal_range_view *out_range) {
+  if (result == NULL || out_range == NULL) {
+    return 0;
+  }
+  out_range->start_kind = result->start_kind;
+  out_range->has_start_key = result->has_start_key;
+  if (result->has_start_key) {
+    shoal_bridge_key_entry_get(&result->start_key, &out_range->start_key);
+  } else {
+    memset(&out_range->start_key, 0, sizeof(out_range->start_key));
+  }
+  out_range->end_kind = result->end_kind;
+  out_range->has_end_key = result->has_end_key;
+  if (result->has_end_key) {
+    shoal_bridge_key_entry_get(&result->end_key, &out_range->end_key);
+  } else {
+    memset(&out_range->end_key, 0, sizeof(out_range->end_key));
+  }
+  out_range->start_inclusive = result->start_inclusive;
+  out_range->end_inclusive = result->end_inclusive;
+  return 1;
+}
+
+void shoal_bridge_range_result_free(shoal_range_result *result) {
+  if (result == NULL) {
+    return;
+  }
+  shoal_bridge_scan_entry_clear(&result->start_key);
+  shoal_bridge_scan_entry_clear(&result->end_key);
+  free(result);
+}
+
+shoal_iterator_setting_result *
+shoal_bridge_iterator_setting_result_alloc(size_t option_count) {
+  if (option_count > SIZE_MAX / sizeof(shoal_iterator_option)) {
+    return NULL;
+  }
+  SHOAL_BRIDGE_TEST_ALLOC_GUARD(shoal_bridge_result_alloc_fail_after);
+  shoal_iterator_setting_result *result =
+      (shoal_iterator_setting_result *)calloc(1, sizeof(*result));
+  if (result == NULL) {
+    return NULL;
+  }
+  if (option_count != 0) {
+    result->options =
+        (shoal_iterator_option *)calloc(option_count, sizeof(*result->options));
+    if (result->options == NULL) {
+      free(result);
+      return NULL;
+    }
+  }
+  result->option_count = option_count;
+  return result;
+}
+
+int shoal_bridge_iterator_setting_result_set_identity(
+    shoal_iterator_setting_result *result, const char *name,
+    const char *class_name, int32_t priority) {
+  if (result == NULL || name == NULL || class_name == NULL) {
+    return 0;
+  }
+  char *name_copy = shoal_bridge_copy_string(name);
+  char *class_copy = shoal_bridge_copy_string(class_name);
+  if (name_copy == NULL || class_copy == NULL) {
+    free(name_copy);
+    free(class_copy);
+    return 0;
+  }
+  free(result->name);
+  free(result->class_name);
+  result->name = name_copy;
+  result->class_name = class_copy;
+  result->priority = priority;
+  return 1;
+}
+
+int shoal_bridge_iterator_setting_result_set_option(
+    shoal_iterator_setting_result *result, size_t index, const char *key,
+    const char *value) {
+  if (result == NULL || index >= result->option_count || key == NULL ||
+      value == NULL) {
+    return 0;
+  }
+  char *key_copy = shoal_bridge_copy_string(key);
+  char *value_copy = shoal_bridge_copy_string(value);
+  if (key_copy == NULL || value_copy == NULL) {
+    free(key_copy);
+    free(value_copy);
+    return 0;
+  }
+  free((void *)result->options[index].key);
+  free((void *)result->options[index].value);
+  result->options[index].key = key_copy;
+  result->options[index].value = value_copy;
+  return 1;
+}
+
+int shoal_bridge_iterator_setting_result_get(
+    const shoal_iterator_setting_result *result,
+    shoal_iterator_setting_view *out_setting) {
+  if (result == NULL || out_setting == NULL || result->name == NULL ||
+      result->class_name == NULL) {
+    return 0;
+  }
+  out_setting->name = result->name;
+  out_setting->class_name = result->class_name;
+  out_setting->priority = result->priority;
+  out_setting->options = result->options;
+  out_setting->option_count = result->option_count;
+  return 1;
+}
+
+void shoal_bridge_iterator_setting_result_free(
+    shoal_iterator_setting_result *result) {
+  if (result == NULL) {
+    return;
+  }
+  free(result->name);
+  free(result->class_name);
+  for (size_t index = 0; index < result->option_count; ++index) {
+    free((void *)result->options[index].key);
+    free((void *)result->options[index].value);
+  }
+  free(result->options);
   free(result);
 }
 
