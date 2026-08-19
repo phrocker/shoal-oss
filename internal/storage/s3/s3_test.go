@@ -50,6 +50,7 @@ type fakeS3WriteOperations struct {
 	objects             map[string]fakeS3Object
 	stageFailure        bool
 	stageResponseLost   bool
+	promoteFailure      error
 	promoteResponseLost bool
 	mutateBeforePromote bool
 	headErrs            map[string][]error
@@ -135,6 +136,11 @@ func (f *fakeS3WriteOperations) promote(
 		return errors.New("destination precondition failed")
 	}
 	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if f.promoteFailure != nil {
+		err := f.promoteFailure
+		f.promoteFailure = nil
 		return err
 	}
 	stage := f.objects[stageKey]
@@ -558,6 +564,163 @@ func TestWriter_VerifiesCommittedResponsesWithoutReplayingPromotion(t *testing.T
 	}
 	if got := f.objects["target"].data; got != "new" {
 		t.Fatalf("target data = %q, want new", got)
+	}
+}
+
+func TestWriter_IndeterminatePromotionCommittedRetrySucceeds(t *testing.T) {
+	f := newFakeS3WriteOperations()
+	f.promoteResponseLost = true
+	w := newFakeS3Writer(f, "target")
+	f.headErrs["target"] = []error{context.DeadlineExceeded}
+
+	if _, err := w.Write([]byte("new")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if err := w.Close(); err == nil || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("first Close error = %v, want transient verification failure", err)
+	}
+	if !w.promotionIndeterminate {
+		t.Fatal("first Close did not retain indeterminate promotion state")
+	}
+	if _, ok := f.objects[w.stageKey]; !ok {
+		t.Fatal("indeterminate promotion removed the staged object")
+	}
+
+	if err := w.Close(); err != nil {
+		t.Fatalf("second Close: %v", err)
+	}
+	if f.promoteCalls != 1 {
+		t.Fatalf("promote calls = %d, want 1", f.promoteCalls)
+	}
+	if got := f.objects["target"].data; got != "new" {
+		t.Fatalf("target data = %q, want new", got)
+	}
+	if _, ok := f.objects[w.stageKey]; ok {
+		t.Fatal("second Close did not clean up the staged object")
+	}
+}
+
+func TestWriter_IndeterminatePromotionUncommittedRetriesSafely(t *testing.T) {
+	f := newFakeS3WriteOperations()
+	oldETag := "\"old\""
+	f.objects["target"] = fakeS3Object{
+		state: s3ObjectState{etag: &oldETag, size: 3},
+		data:  "old",
+	}
+	f.promoteFailure = errors.New("copy response lost")
+	w := newFakeS3Writer(f, "target")
+	f.headErrs["target"] = []error{context.DeadlineExceeded}
+
+	if _, err := w.Write([]byte("new")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if err := w.Close(); err == nil || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("first Close error = %v, want transient verification failure", err)
+	}
+	if !w.promotionIndeterminate {
+		t.Fatal("first Close did not retain indeterminate promotion state")
+	}
+	if got := f.objects["target"].data; got != "old" {
+		t.Fatalf("target data after failed promote = %q, want old", got)
+	}
+
+	if err := w.Close(); err != nil {
+		t.Fatalf("second Close: %v", err)
+	}
+	if f.promoteCalls != 2 {
+		t.Fatalf("promote calls = %d, want 2", f.promoteCalls)
+	}
+	if got := f.objects["target"].data; got != "new" {
+		t.Fatalf("target data after retry = %q, want new", got)
+	}
+	if _, ok := f.objects[w.stageKey]; ok {
+		t.Fatal("retry success did not clean up the staged object")
+	}
+}
+
+func TestWriter_IndeterminatePromotionDoesNotOverwriteCompetingWriter(t *testing.T) {
+	f := newFakeS3WriteOperations()
+	f.promoteFailure = errors.New("copy response lost")
+	w := newFakeS3Writer(f, "target")
+	f.headErrs["target"] = []error{context.DeadlineExceeded}
+
+	if _, err := w.Write([]byte("new")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if err := w.Close(); err == nil || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("first Close error = %v, want transient verification failure", err)
+	}
+
+	intruderETag := "\"intruder\""
+	f.objects["target"] = fakeS3Object{
+		state: s3ObjectState{
+			etag:     &intruderETag,
+			size:     int64(len("intruder")),
+			metadata: map[string]string{"shoal-write-id": "intruder"},
+		},
+		data: "intruder",
+	}
+
+	if err := w.Close(); err == nil || !strings.Contains(err.Error(), "indeterminate") {
+		t.Fatalf("second Close error = %v, want indeterminate competing-writer failure", err)
+	}
+	if f.promoteCalls != 1 {
+		t.Fatalf("promote calls = %d, want 1", f.promoteCalls)
+	}
+	if got := f.objects["target"].data; got != "intruder" {
+		t.Fatalf("target data = %q, want intruder", got)
+	}
+	if _, ok := f.objects[w.stageKey]; !ok {
+		t.Fatal("competing writer resolution lost the staged object")
+	}
+}
+
+func TestWriter_AbortPreservesRecoverabilityDuringIndeterminatePromotion(t *testing.T) {
+	f := newFakeS3WriteOperations()
+	f.promoteResponseLost = true
+	w := newFakeS3Writer(f, "target")
+	f.headErrs["target"] = []error{context.DeadlineExceeded}
+
+	if _, err := w.Write([]byte("new")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if err := w.Close(); err == nil || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Close error = %v, want transient verification failure", err)
+	}
+	if err := w.Abort(); err == nil || !strings.Contains(err.Error(), "indeterminate") {
+		t.Fatalf("Abort error = %v, want indeterminate abort failure", err)
+	}
+	if w.aborted {
+		t.Fatal("Abort marked an indeterminate promotion as aborted")
+	}
+	if _, ok := f.objects[w.stageKey]; !ok {
+		t.Fatal("Abort removed the staged object needed for recovery")
+	}
+}
+
+func TestWriter_IndeterminatePromotionRetainsStageAcrossRepeatedVerificationFailures(t *testing.T) {
+	f := newFakeS3WriteOperations()
+	f.promoteResponseLost = true
+	w := newFakeS3Writer(f, "target")
+	f.headErrs["target"] = []error{context.DeadlineExceeded, context.DeadlineExceeded}
+
+	if _, err := w.Write([]byte("new")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if err := w.Close(); err == nil || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("first Close error = %v, want transient verification failure", err)
+	}
+	if err := w.Close(); err == nil || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("second Close error = %v, want repeated transient verification failure", err)
+	}
+	if !w.promotionIndeterminate {
+		t.Fatal("repeated failures cleared the indeterminate promotion state")
+	}
+	if f.promoteCalls != 1 {
+		t.Fatalf("promote calls = %d, want 1", f.promoteCalls)
+	}
+	if _, ok := f.objects[w.stageKey]; !ok {
+		t.Fatal("repeated failures removed the staged object")
 	}
 }
 

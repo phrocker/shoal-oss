@@ -899,6 +899,14 @@ var azureCleanupTimeout = 10 * time.Second
 
 const committedCleanupAttempts = 2
 
+type destinationVerificationState uint8
+
+const (
+	destinationVerificationCommitted destinationVerificationState = iota
+	destinationVerificationNotCommitted
+	destinationVerificationIndeterminate
+)
+
 func (b *Backend) writeOperations() azureWriteOperations {
 	if b.ops != nil {
 		return b.ops
@@ -909,30 +917,31 @@ func (b *Backend) writeOperations() azureWriteOperations {
 // writer buffers bytes in memory, stages them, and conditionally publishes
 // them on Close.
 type writer struct {
-	ops            azureWriteOperations
-	container      string
-	name           string
-	stageName      string
-	writeID        string
-	ctx            context.Context //nolint:containedctx
-	targetExists   bool
-	target         azureObjectState
-	sourceProvider azureCopySourceProvider
-	stage          azureObjectState
-	stageCreated   bool
-	stageUnknown   bool
-	stageOwned     bool
-	cleanupTimeout time.Duration
-	buf            bytes.Buffer
-	closed         bool
-	aborted        bool
+	ops                    azureWriteOperations
+	container              string
+	name                   string
+	stageName              string
+	writeID                string
+	ctx                    context.Context //nolint:containedctx
+	targetExists           bool
+	target                 azureObjectState
+	sourceProvider         azureCopySourceProvider
+	stage                  azureObjectState
+	stageCreated           bool
+	stageUnknown           bool
+	stageOwned             bool
+	promotionIndeterminate bool
+	cleanupTimeout         time.Duration
+	buf                    bytes.Buffer
+	closed                 bool
+	aborted                bool
 }
 
 func (w *writer) Write(p []byte) (int, error) {
 	if w.aborted {
 		return 0, fmt.Errorf("azure: writer already aborted")
 	}
-	if w.closed {
+	if w.closed || w.promotionIndeterminate {
 		return 0, fmt.Errorf("azure: writer already closed")
 	}
 	return w.buf.Write(p)
@@ -945,6 +954,9 @@ func (w *writer) Close() error {
 	if w.closed {
 		w.cleanupCommittedStageBestEffort()
 		return nil
+	}
+	if resolved, err := w.resolveIndeterminateClose(); resolved || err != nil {
+		return err
 	}
 	if !w.stageCreated {
 		w.stageUnknown = true
@@ -978,7 +990,22 @@ func (w *writer) Close() error {
 	if err := w.ops.promote(
 		w.ctx, w.container, w.stageName, w.name, source, w.stage, w.writeID, w.targetExists, w.target,
 	); err != nil {
-		if verified, verifyErr := w.verifyDestination(); verifyErr != nil || !verified {
+		verifyState, verifyErr := w.verifyDestination()
+		if verifyState == destinationVerificationCommitted {
+			w.closed = true
+			w.cleanupCommittedStageBestEffort()
+			return nil
+		}
+		if isAmbiguousPromotionError(err) {
+			w.promotionIndeterminate = true
+			return errors.Join(
+				w.indeterminatePromotionError(),
+				fmt.Errorf("azure: promote az://%s/%s to az://%s/%s: %w",
+					w.container, w.stageName, w.container, w.name, err),
+				verifyErr,
+			)
+		}
+		if verifyErr != nil || verifyState == destinationVerificationCommitted {
 			return errors.Join(
 				fmt.Errorf("azure: promote az://%s/%s to az://%s/%s: %w",
 					w.container, w.stageName, w.container, w.name, err),
@@ -986,6 +1013,11 @@ func (w *writer) Close() error {
 				w.cleanupStage(),
 			)
 		}
+		return errors.Join(
+			fmt.Errorf("azure: promote az://%s/%s to az://%s/%s: %w",
+				w.container, w.stageName, w.container, w.name, err),
+			w.cleanupStage(),
+		)
 	}
 	w.closed = true
 	w.cleanupCommittedStageBestEffort()
@@ -998,6 +1030,19 @@ func (w *writer) Abort() error {
 	}
 	if w.closed {
 		return fmt.Errorf("azure: writer already closed")
+	}
+	if w.promotionIndeterminate {
+		verifyState, verifyErr := w.verifyDestination()
+		switch {
+		case verifyErr != nil:
+			return errors.Join(w.indeterminateAbortError(), verifyErr)
+		case verifyState == destinationVerificationCommitted:
+			return w.indeterminateAbortError()
+		case verifyState == destinationVerificationIndeterminate:
+			return w.indeterminateAbortError()
+		default:
+			w.promotionIndeterminate = false
+		}
 	}
 	if err := w.cleanupStage(); err != nil {
 		return err
@@ -1018,21 +1063,49 @@ func (w *writer) verifyStage() (bool, error) {
 	return true, nil
 }
 
-func (w *writer) verifyDestination() (bool, error) {
+func (w *writer) resolveIndeterminateClose() (bool, error) {
+	if !w.promotionIndeterminate {
+		return false, nil
+	}
+	verifyState, verifyErr := w.verifyDestination()
+	if verifyErr != nil {
+		return true, errors.Join(w.indeterminatePromotionError(), verifyErr)
+	}
+	switch verifyState {
+	case destinationVerificationCommitted:
+		w.promotionIndeterminate = false
+		w.closed = true
+		w.cleanupCommittedStageBestEffort()
+		return true, nil
+	case destinationVerificationNotCommitted:
+		w.promotionIndeterminate = false
+		return false, nil
+	default:
+		return true, w.indeterminatePromotionError()
+	}
+}
+
+func (w *writer) verifyDestination() (destinationVerificationState, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), w.cleanupTimeout)
 	defer cancel()
 	state, err := w.ops.head(ctx, w.container, w.name)
 	if err != nil {
 		if isBlobNotFound(err) {
-			return false, nil
+			if w.targetExists {
+				return destinationVerificationIndeterminate, nil
+			}
+			return destinationVerificationNotCommitted, nil
 		}
-		return false, fmt.Errorf("azure: verify destination az://%s/%s: %w", w.container, w.name, err)
+		return destinationVerificationIndeterminate, fmt.Errorf("azure: verify destination az://%s/%s: %w", w.container, w.name, err)
+	}
+	if state.size == int64(w.buf.Len()) &&
+		metadataValue(state.metadata, "shoal-write-id") == w.writeID {
+		return destinationVerificationCommitted, nil
 	}
 	if w.targetExists && equalETags(state.etag, w.target.etag) {
-		return false, nil
+		return destinationVerificationNotCommitted, nil
 	}
-	return state.size == int64(w.buf.Len()) &&
-		metadataValue(state.metadata, "shoal-write-id") == w.writeID, nil
+	return destinationVerificationIndeterminate, nil
 }
 
 func (w *writer) cleanupCommittedStageBestEffort() {
@@ -1108,6 +1181,7 @@ func (w *writer) clearStage() {
 	w.stageCreated = false
 	w.stageUnknown = false
 	w.stageOwned = false
+	w.promotionIndeterminate = false
 }
 
 func (w *writer) retryCommittedCleanup(cleanup func() error) error {
@@ -1149,11 +1223,39 @@ func isBlobNotFound(err error) bool {
 	return bloberror.HasCode(err, bloberror.BlobNotFound, bloberror.ContainerNotFound)
 }
 
+func isAmbiguousPromotionError(err error) bool {
+	if err == nil || isBlobNotFound(err) {
+		return false
+	}
+	if errors.Is(err, context.Canceled) {
+		return false
+	}
+	if bloberror.HasCode(err, bloberror.ConditionNotMet, bloberror.BlobAlreadyExists) {
+		return false
+	}
+	text := strings.ToLower(err.Error())
+	return !strings.Contains(text, "precondition")
+}
+
 func contextOrBackground(ctx context.Context) context.Context {
 	if ctx == nil {
 		return context.Background()
 	}
 	return ctx
+}
+
+func (w *writer) indeterminatePromotionError() error {
+	return fmt.Errorf(
+		"azure: promotion of az://%s/%s is indeterminate; staged blob az://%s/%s retained for retry",
+		w.container, w.name, w.container, w.stageName,
+	)
+}
+
+func (w *writer) indeterminateAbortError() error {
+	return fmt.Errorf(
+		"azure: cannot abort indeterminate promotion of az://%s/%s; staged blob az://%s/%s retained for retry",
+		w.container, w.name, w.container, w.stageName,
+	)
 }
 
 func validatePromotionSource(

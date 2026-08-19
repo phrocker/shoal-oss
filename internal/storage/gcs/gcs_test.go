@@ -520,6 +520,91 @@ func TestWriter_CloseAmbiguousPromotionErrorDoesNotReplayMutation(t *testing.T) 
 	}
 }
 
+func TestWriter_CloseIndeterminateCommittedPromotionRetriesVerification(t *testing.T) {
+	backend, bucket := newFakeBackend()
+	bucket.putObject("path/to/object.rf", []byte("old"))
+	bucket.copyAfterCommitErr = context.DeadlineExceeded
+
+	w, err := backend.Create(context.Background(), "bucket/path/to/object.rf")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	gcsWriter := w.(*writer)
+	bucket.attrsErrs["path/to/object.rf"] = []error{context.DeadlineExceeded}
+	tempName := gcsWriter.temp.(*fakeObject).name
+	if _, err := w.Write([]byte("new")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if err := w.Close(); err == nil || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("first Close error = %v, want transient verification failure", err)
+	}
+	if !gcsWriter.promotionIndeterminate {
+		t.Fatal("first Close did not retain indeterminate promotion state")
+	}
+	if _, ok := bucket.objects[tempName]; !ok {
+		t.Fatalf("indeterminate Close removed temp object %q", tempName)
+	}
+
+	if err := w.Close(); err != nil {
+		t.Fatalf("second Close: %v", err)
+	}
+	if len(bucket.copyCalls) != 1 {
+		t.Fatalf("copy calls = %d, want exactly 1", len(bucket.copyCalls))
+	}
+	if got := string(bucket.objects["path/to/object.rf"].body); got != "new" {
+		t.Fatalf("destination contents = %q, want new", got)
+	}
+	if _, ok := bucket.objects[tempName]; ok {
+		t.Fatalf("second Close did not clean temp object %q", tempName)
+	}
+}
+
+func TestWriter_CloseIndeterminateUncommittedPromotionRetriesCopy(t *testing.T) {
+	backend, bucket := newFakeBackend()
+	bucket.putObject("path/to/object.rf", []byte("old"))
+	attempts := 0
+	bucket.copyHook = func(_ context.Context, _, _ *fakeObject) error {
+		if attempts == 0 {
+			attempts++
+			return context.DeadlineExceeded
+		}
+		return nil
+	}
+
+	w, err := backend.Create(context.Background(), "bucket/path/to/object.rf")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	gcsWriter := w.(*writer)
+	bucket.attrsErrs["path/to/object.rf"] = []error{context.DeadlineExceeded}
+	tempName := gcsWriter.temp.(*fakeObject).name
+	if _, err := w.Write([]byte("new")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if err := w.Close(); err == nil || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("first Close error = %v, want transient verification failure", err)
+	}
+	if !gcsWriter.promotionIndeterminate {
+		t.Fatal("first Close did not retain indeterminate promotion state")
+	}
+	if got := string(bucket.objects["path/to/object.rf"].body); got != "old" {
+		t.Fatalf("destination contents after failed copy = %q, want old", got)
+	}
+
+	if err := w.Close(); err != nil {
+		t.Fatalf("second Close: %v", err)
+	}
+	if len(bucket.copyCalls) != 2 {
+		t.Fatalf("copy calls = %d, want 2", len(bucket.copyCalls))
+	}
+	if got := string(bucket.objects["path/to/object.rf"].body); got != "new" {
+		t.Fatalf("destination contents after retry = %q, want new", got)
+	}
+	if _, ok := bucket.objects[tempName]; ok {
+		t.Fatalf("retry success did not clean temp object %q", tempName)
+	}
+}
+
 func TestWriter_CloseAmbiguousPromotionRequiresMatchingWriteID(t *testing.T) {
 	backend, bucket := newFakeBackend()
 	bucket.putObject("path/to/object.rf", []byte("old"))
@@ -547,8 +632,14 @@ func TestWriter_CloseAmbiguousPromotionRequiresMatchingWriteID(t *testing.T) {
 	if got := bucket.objects["path/to/object.rf"].metadata["shoal-write-id"]; got != "intruder" {
 		t.Fatalf("destination write-id = %q, want intruder competing writer", got)
 	}
-	if _, ok := bucket.objects[tempName]; ok {
-		t.Fatalf("failed promotion should clean temp object %q", tempName)
+	if _, ok := bucket.objects[tempName]; !ok {
+		t.Fatalf("failed promotion should retain temp object %q for retry", tempName)
+	}
+	if err := w.Close(); err == nil || !strings.Contains(err.Error(), "indeterminate") {
+		t.Fatalf("second Close error = %v, want indeterminate competing-writer failure", err)
+	}
+	if len(bucket.copyCalls) != 1 {
+		t.Fatalf("copy calls = %d, want exactly 1 after competing writer", len(bucket.copyCalls))
 	}
 }
 
@@ -607,6 +698,67 @@ func TestWriter_CloseAmbiguousPromotionAcceptsMatchingWriteID(t *testing.T) {
 	}
 	if _, ok := bucket.objects[tempName]; ok {
 		t.Fatalf("successful committed copy should clean temp object %q", tempName)
+	}
+}
+
+func TestWriter_AbortPreservesRecoverabilityDuringIndeterminatePromotion(t *testing.T) {
+	backend, bucket := newFakeBackend()
+	bucket.putObject("path/to/object.rf", []byte("old"))
+	bucket.copyAfterCommitErr = context.DeadlineExceeded
+
+	w, err := backend.Create(context.Background(), "bucket/path/to/object.rf")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	gcsWriter := w.(*writer)
+	bucket.attrsErrs["path/to/object.rf"] = []error{context.DeadlineExceeded}
+	tempName := gcsWriter.temp.(*fakeObject).name
+	if _, err := w.Write([]byte("new")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if err := w.Close(); err == nil || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Close error = %v, want transient verification failure", err)
+	}
+	if err := gcsWriter.Abort(); err == nil || !strings.Contains(err.Error(), "indeterminate") {
+		t.Fatalf("Abort error = %v, want indeterminate abort failure", err)
+	}
+	if gcsWriter.aborted {
+		t.Fatal("Abort marked an indeterminate promotion as aborted")
+	}
+	if _, ok := bucket.objects[tempName]; !ok {
+		t.Fatalf("Abort removed temp object %q needed for recovery", tempName)
+	}
+}
+
+func TestWriter_IndeterminatePromotionRetainsTempAcrossRepeatedVerificationFailures(t *testing.T) {
+	backend, bucket := newFakeBackend()
+	bucket.putObject("path/to/object.rf", []byte("old"))
+	bucket.copyAfterCommitErr = context.DeadlineExceeded
+
+	w, err := backend.Create(context.Background(), "bucket/path/to/object.rf")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	gcsWriter := w.(*writer)
+	bucket.attrsErrs["path/to/object.rf"] = []error{context.DeadlineExceeded, context.DeadlineExceeded}
+	tempName := gcsWriter.temp.(*fakeObject).name
+	if _, err := w.Write([]byte("new")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if err := w.Close(); err == nil || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("first Close error = %v, want transient verification failure", err)
+	}
+	if err := w.Close(); err == nil || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("second Close error = %v, want repeated transient verification failure", err)
+	}
+	if !gcsWriter.promotionIndeterminate {
+		t.Fatal("repeated verification failures cleared the indeterminate promotion state")
+	}
+	if len(bucket.copyCalls) != 1 {
+		t.Fatalf("copy calls = %d, want 1", len(bucket.copyCalls))
+	}
+	if _, ok := bucket.objects[tempName]; !ok {
+		t.Fatalf("repeated failures removed temp object %q", tempName)
 	}
 }
 

@@ -388,25 +388,34 @@ type metadataSetter interface {
 	SetMetadata(map[string]string)
 }
 
+type destinationVerificationState uint8
+
+const (
+	destinationVerificationCommitted destinationVerificationState = iota
+	destinationVerificationNotCommitted
+	destinationVerificationIndeterminate
+)
+
 type writer struct {
-	ctx                context.Context
-	cancel             context.CancelFunc
-	inner              objectWriter
-	writeID            string
-	target             objectHandle
-	targetPath         string
-	targetConditions   storage.Conditions
-	temp               objectHandle
-	tempPath           string
-	tempGeneration     int64
-	tempAttrs          *storage.ObjectAttrs
-	tempUnknown        bool
-	tempClosed         bool
-	tempPromotable     bool
-	tempCleanupTimeout time.Duration
-	closed             bool
-	abortRequested     bool
-	aborted            bool
+	ctx                    context.Context
+	cancel                 context.CancelFunc
+	inner                  objectWriter
+	writeID                string
+	target                 objectHandle
+	targetPath             string
+	targetConditions       storage.Conditions
+	temp                   objectHandle
+	tempPath               string
+	tempGeneration         int64
+	tempAttrs              *storage.ObjectAttrs
+	tempUnknown            bool
+	tempClosed             bool
+	tempPromotable         bool
+	tempCleanupTimeout     time.Duration
+	promotionIndeterminate bool
+	closed                 bool
+	abortRequested         bool
+	aborted                bool
 }
 
 func (w *writer) Write(p []byte) (int, error) {
@@ -426,6 +435,9 @@ func (w *writer) Close() error {
 	if w.closed {
 		w.cleanupCommittedTempBestEffort()
 		return nil
+	}
+	if resolved, err := w.resolveIndeterminateClose(); resolved || err != nil {
+		return err
 	}
 	if !w.tempClosed {
 		w.tempClosed = true
@@ -467,6 +479,9 @@ func (w *writer) Close() error {
 	}
 	if err := w.promoteTempObject(); err != nil {
 		w.stopWriter()
+		if w.promotionIndeterminate {
+			return err
+		}
 		return errors.Join(err, w.cleanupTempObject())
 	}
 	w.closed = true
@@ -481,6 +496,19 @@ func (w *writer) Abort() error {
 	}
 	if w.closed {
 		return fmt.Errorf("gcs: writer already closed")
+	}
+	if w.promotionIndeterminate {
+		verifyState, verifyErr := w.verifyDestination()
+		switch {
+		case verifyErr != nil:
+			return errors.Join(w.indeterminateAbortError(), verifyErr)
+		case verifyState == destinationVerificationCommitted:
+			return w.indeterminateAbortError()
+		case verifyState == destinationVerificationIndeterminate:
+			return w.indeterminateAbortError()
+		default:
+			w.promotionIndeterminate = false
+		}
 	}
 	w.abortRequested = true
 
@@ -623,6 +651,29 @@ func (w *writer) stopWriter() {
 	}
 }
 
+func (w *writer) resolveIndeterminateClose() (bool, error) {
+	if !w.promotionIndeterminate {
+		return false, nil
+	}
+	verifyState, verifyErr := w.verifyDestination()
+	if verifyErr != nil {
+		return true, errors.Join(w.indeterminatePromotionError(), verifyErr)
+	}
+	switch verifyState {
+	case destinationVerificationCommitted:
+		w.promotionIndeterminate = false
+		w.closed = true
+		w.stopWriter()
+		w.cleanupCommittedTempBestEffort()
+		return true, nil
+	case destinationVerificationNotCommitted:
+		w.promotionIndeterminate = false
+		return false, nil
+	default:
+		return true, w.indeterminatePromotionError()
+	}
+}
+
 func (w *writer) verifyTempObject() error {
 	found, err := w.lookupOwnedTemp()
 	if err != nil {
@@ -665,32 +716,51 @@ func (w *writer) promoteTempObject() error {
 		CopierFrom(w.temp.Generation(w.tempGeneration)).
 		Run(w.ctx)
 	if err != nil {
-		if w.destinationMatchesTemp() {
+		verifyState, verifyErr := w.verifyDestination()
+		if verifyState == destinationVerificationCommitted {
 			return nil
+		}
+		if isAmbiguousPromotionError(err) {
+			w.promotionIndeterminate = true
+			return errors.Join(
+				w.indeterminatePromotionError(),
+				fmt.Errorf("gcs: promote temporary object %s to %s: %w", w.tempPath, w.targetPath, err),
+				verifyErr,
+			)
 		}
 		return fmt.Errorf("gcs: promote temporary object %s to %s: %w", w.tempPath, w.targetPath, err)
 	}
 	return nil
 }
 
-func (w *writer) destinationMatchesTemp() bool {
+func (w *writer) verifyDestination() (destinationVerificationState, error) {
 	if w.tempAttrs == nil {
-		return false
+		return destinationVerificationIndeterminate, nil
 	}
 	verifyCtx, cancel := context.WithTimeout(context.Background(), w.tempCleanupTimeout)
 	defer cancel()
 	attrs, err := w.target.Attrs(verifyCtx)
 	if err != nil {
-		return false
+		if errors.Is(err, storage.ErrObjectNotExist) {
+			if w.targetConditions.DoesNotExist {
+				return destinationVerificationNotCommitted, nil
+			}
+			return destinationVerificationIndeterminate, nil
+		}
+		return destinationVerificationIndeterminate, fmt.Errorf("gcs: verify destination %s: %w", w.targetPath, err)
 	}
-	if w.targetConditions.GenerationMatch != 0 &&
-		attrs.Generation == w.targetConditions.GenerationMatch {
-		return false
-	}
-	return attrs.Size == w.tempAttrs.Size &&
+	if attrs.Size == w.tempAttrs.Size &&
 		attrs.CRC32C == w.tempAttrs.CRC32C &&
 		bytes.Equal(attrs.MD5, w.tempAttrs.MD5) &&
-		attrs.Metadata["shoal-write-id"] == w.writeID
+		attrs.Metadata["shoal-write-id"] == w.writeID {
+		return destinationVerificationCommitted, nil
+	}
+	if w.targetConditions.GenerationMatch != 0 &&
+		attrs.Generation == w.targetConditions.GenerationMatch &&
+		attrs.Metageneration == w.targetConditions.MetagenerationMatch {
+		return destinationVerificationNotCommitted, nil
+	}
+	return destinationVerificationIndeterminate, nil
 }
 
 func (w *writer) cleanupTempObject() error {
@@ -738,6 +808,7 @@ func (w *writer) clearTemp() {
 	w.tempGeneration = 0
 	w.tempAttrs = nil
 	w.tempUnknown = false
+	w.promotionIndeterminate = false
 }
 
 func (w *writer) retryCommittedCleanup(cleanup func() error) error {
@@ -750,4 +821,29 @@ func (w *writer) retryCommittedCleanup(cleanup func() error) error {
 		return nil
 	}
 	return combined
+}
+
+func (w *writer) indeterminatePromotionError() error {
+	return fmt.Errorf(
+		"gcs: promotion of %s is indeterminate; temporary object %s retained for retry",
+		w.targetPath, w.tempPath,
+	)
+}
+
+func (w *writer) indeterminateAbortError() error {
+	return fmt.Errorf(
+		"gcs: cannot abort indeterminate promotion of %s; temporary object %s retained for retry",
+		w.targetPath, w.tempPath,
+	)
+}
+
+func isAmbiguousPromotionError(err error) bool {
+	if err == nil || errors.Is(err, storage.ErrObjectNotExist) {
+		return false
+	}
+	if errors.Is(err, context.Canceled) {
+		return false
+	}
+	text := strings.ToLower(err.Error())
+	return !strings.Contains(text, "precondition")
 }

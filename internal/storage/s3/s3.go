@@ -494,6 +494,14 @@ var s3CleanupTimeout = 10 * time.Second
 
 const committedCleanupAttempts = 2
 
+type destinationVerificationState uint8
+
+const (
+	destinationVerificationCommitted destinationVerificationState = iota
+	destinationVerificationNotCommitted
+	destinationVerificationIndeterminate
+)
+
 func (b *Backend) writeOperations() s3WriteOperations {
 	if b.ops != nil {
 		return b.ops
@@ -504,29 +512,30 @@ func (b *Backend) writeOperations() s3WriteOperations {
 // writer buffers bytes in memory, stages them, and conditionally publishes the
 // staged object on Close.
 type writer struct {
-	ops            s3WriteOperations
-	bucket         string
-	key            string
-	stageKey       string
-	writeID        string
-	ctx            context.Context //nolint:containedctx
-	targetExists   bool
-	target         s3ObjectState
-	stage          s3ObjectState
-	stageCreated   bool
-	stageUnknown   bool
-	stageOwned     bool
-	cleanupTimeout time.Duration
-	buf            bytes.Buffer
-	closed         bool
-	aborted        bool
+	ops                    s3WriteOperations
+	bucket                 string
+	key                    string
+	stageKey               string
+	writeID                string
+	ctx                    context.Context //nolint:containedctx
+	targetExists           bool
+	target                 s3ObjectState
+	stage                  s3ObjectState
+	stageCreated           bool
+	stageUnknown           bool
+	stageOwned             bool
+	promotionIndeterminate bool
+	cleanupTimeout         time.Duration
+	buf                    bytes.Buffer
+	closed                 bool
+	aborted                bool
 }
 
 func (w *writer) Write(p []byte) (int, error) {
 	if w.aborted {
 		return 0, fmt.Errorf("s3: writer already aborted")
 	}
-	if w.closed {
+	if w.closed || w.promotionIndeterminate {
 		return 0, fmt.Errorf("s3: writer already closed")
 	}
 	return w.buf.Write(p)
@@ -539,6 +548,9 @@ func (w *writer) Close() error {
 	if w.closed {
 		w.cleanupCommittedStageBestEffort()
 		return nil
+	}
+	if resolved, err := w.resolveIndeterminateClose(); resolved || err != nil {
+		return err
 	}
 	if !w.stageCreated {
 		w.stageUnknown = true
@@ -568,7 +580,22 @@ func (w *writer) Close() error {
 	if err := w.ops.promote(
 		w.ctx, w.bucket, w.stageKey, w.key, w.stage, w.targetExists, w.target,
 	); err != nil {
-		if verified, verifyErr := w.verifyDestination(); verifyErr != nil || !verified {
+		verifyState, verifyErr := w.verifyDestination()
+		if verifyState == destinationVerificationCommitted {
+			w.closed = true
+			w.cleanupCommittedStageBestEffort()
+			return nil
+		}
+		if isAmbiguousPromotionError(err) {
+			w.promotionIndeterminate = true
+			return errors.Join(
+				w.indeterminatePromotionError(),
+				fmt.Errorf("s3: promote s3://%s/%s to s3://%s/%s: %w",
+					w.bucket, w.stageKey, w.bucket, w.key, err),
+				verifyErr,
+			)
+		}
+		if verifyErr != nil || verifyState == destinationVerificationCommitted {
 			return errors.Join(
 				fmt.Errorf("s3: promote s3://%s/%s to s3://%s/%s: %w",
 					w.bucket, w.stageKey, w.bucket, w.key, err),
@@ -576,6 +603,11 @@ func (w *writer) Close() error {
 				w.cleanupStage(),
 			)
 		}
+		return errors.Join(
+			fmt.Errorf("s3: promote s3://%s/%s to s3://%s/%s: %w",
+				w.bucket, w.stageKey, w.bucket, w.key, err),
+			w.cleanupStage(),
+		)
 	}
 	w.closed = true
 	w.cleanupCommittedStageBestEffort()
@@ -588,6 +620,19 @@ func (w *writer) Abort() error {
 	}
 	if w.closed {
 		return fmt.Errorf("s3: writer already closed")
+	}
+	if w.promotionIndeterminate {
+		verifyState, verifyErr := w.verifyDestination()
+		switch {
+		case verifyErr != nil:
+			return errors.Join(w.indeterminateAbortError(), verifyErr)
+		case verifyState == destinationVerificationCommitted:
+			return w.indeterminateAbortError()
+		case verifyState == destinationVerificationIndeterminate:
+			return w.indeterminateAbortError()
+		default:
+			w.promotionIndeterminate = false
+		}
 	}
 	if err := w.cleanupStage(); err != nil {
 		return err
@@ -608,21 +653,49 @@ func (w *writer) verifyStage() (bool, error) {
 	return true, nil
 }
 
-func (w *writer) verifyDestination() (bool, error) {
+func (w *writer) resolveIndeterminateClose() (bool, error) {
+	if !w.promotionIndeterminate {
+		return false, nil
+	}
+	verifyState, verifyErr := w.verifyDestination()
+	if verifyErr != nil {
+		return true, errors.Join(w.indeterminatePromotionError(), verifyErr)
+	}
+	switch verifyState {
+	case destinationVerificationCommitted:
+		w.promotionIndeterminate = false
+		w.closed = true
+		w.cleanupCommittedStageBestEffort()
+		return true, nil
+	case destinationVerificationNotCommitted:
+		w.promotionIndeterminate = false
+		return false, nil
+	default:
+		return true, w.indeterminatePromotionError()
+	}
+}
+
+func (w *writer) verifyDestination() (destinationVerificationState, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), w.cleanupTimeout)
 	defer cancel()
 	state, err := w.ops.head(ctx, w.bucket, w.key)
 	if err != nil {
 		if isNotFound(err) {
-			return false, nil
+			if w.targetExists {
+				return destinationVerificationIndeterminate, nil
+			}
+			return destinationVerificationNotCommitted, nil
 		}
-		return false, fmt.Errorf("s3: verify destination s3://%s/%s: %w", w.bucket, w.key, err)
+		return destinationVerificationIndeterminate, fmt.Errorf("s3: verify destination s3://%s/%s: %w", w.bucket, w.key, err)
+	}
+	if state.size == int64(w.buf.Len()) &&
+		state.metadata["shoal-write-id"] == w.writeID {
+		return destinationVerificationCommitted, nil
 	}
 	if w.targetExists && equalStringPointers(state.etag, w.target.etag) {
-		return false, nil
+		return destinationVerificationNotCommitted, nil
 	}
-	return state.size == int64(w.buf.Len()) &&
-		state.metadata["shoal-write-id"] == w.writeID, nil
+	return destinationVerificationIndeterminate, nil
 }
 
 func (w *writer) cleanupCommittedStageBestEffort() {
@@ -698,6 +771,7 @@ func (w *writer) clearStage() {
 	w.stageCreated = false
 	w.stageUnknown = false
 	w.stageOwned = false
+	w.promotionIndeterminate = false
 }
 
 func (w *writer) retryCommittedCleanup(cleanup func() error) error {
@@ -721,6 +795,31 @@ func contextOrBackground(ctx context.Context) context.Context {
 		return context.Background()
 	}
 	return ctx
+}
+
+func (w *writer) indeterminatePromotionError() error {
+	return fmt.Errorf(
+		"s3: promotion of s3://%s/%s is indeterminate; staged object s3://%s/%s retained for retry",
+		w.bucket, w.key, w.bucket, w.stageKey,
+	)
+}
+
+func (w *writer) indeterminateAbortError() error {
+	return fmt.Errorf(
+		"s3: cannot abort indeterminate promotion of s3://%s/%s; staged object s3://%s/%s retained for retry",
+		w.bucket, w.key, w.bucket, w.stageKey,
+	)
+}
+
+func isAmbiguousPromotionError(err error) bool {
+	if err == nil || isNotFound(err) {
+		return false
+	}
+	if errors.Is(err, context.Canceled) {
+		return false
+	}
+	text := strings.ToLower(err.Error())
+	return !strings.Contains(text, "precondition")
 }
 
 // isNotFound reports whether err is an S3 "key does not exist" error.
