@@ -38,6 +38,57 @@ shoal_abi_capability_word(uint32_t word_index);
 SHOAL_API uint8_t SHOAL_CALL
 shoal_abi_has_capability(shoal_abi_capability_id capability_id);
 
+/*
+ * Configuration inputs are binary-safe and copied before return. Handles are
+ * owned, safe for concurrent getters/setters, and released idempotently by
+ * shoal_configuration_free. Result views borrow owned result memory.
+ */
+SHOAL_API shoal_status SHOAL_CALL
+shoal_configuration_create(shoal_configuration **out_configuration,
+                           shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_configuration_set(shoal_configuration *configuration, shoal_bytes name,
+                        shoal_bytes value, shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_configuration_get(shoal_configuration *configuration, shoal_bytes name,
+                        shoal_bytes_result **out_result,
+                        shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_configuration_get_or(shoal_configuration *configuration,
+                           shoal_bytes name, shoal_bytes default_value,
+                           shoal_bytes_result **out_result,
+                           shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_configuration_get_uint32(shoal_configuration *configuration,
+                               shoal_bytes name, uint32_t *out_value,
+                               shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_configuration_get_uint32_or(shoal_configuration *configuration,
+                                  shoal_bytes name, uint32_t default_value,
+                                  uint32_t *out_value,
+                                  shoal_error **out_error);
+SHOAL_API void SHOAL_CALL
+shoal_configuration_free(shoal_configuration **configuration);
+
+SHOAL_API shoal_bytes SHOAL_CALL
+shoal_bytes_result_get(const shoal_bytes_result *result);
+SHOAL_API void SHOAL_CALL shoal_bytes_result_free(shoal_bytes_result **result);
+SHOAL_API size_t SHOAL_CALL
+shoal_string_list_count(const shoal_string_list_result *result);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_string_list_get(const shoal_string_list_result *result, size_t index,
+                      shoal_bytes *out_value, shoal_error **out_error);
+SHOAL_API void SHOAL_CALL
+shoal_string_list_free(shoal_string_list_result **result);
+SHOAL_API void SHOAL_CALL shoal_server_view_init(shoal_server_view *view);
+SHOAL_API size_t SHOAL_CALL
+shoal_server_list_count(const shoal_server_list_result *result);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_server_list_get(const shoal_server_list_result *result, size_t index,
+                      shoal_server_view *out_server, shoal_error **out_error);
+SHOAL_API void SHOAL_CALL
+shoal_server_list_free(shoal_server_list_result **result);
+
 SHOAL_API void SHOAL_CALL
 shoal_connector_config_init(shoal_connector_config *config);
 
@@ -136,6 +187,36 @@ shoal_connector_identity_get(const shoal_connector_identity_result *result,
 
 SHOAL_API void SHOAL_CALL
 shoal_connector_identity_free(shoal_connector_identity_result **result);
+
+/*
+ * Live topology calls use timeout_ms (zero means no deadline), participate in
+ * connector cancellation, and return fully owned snapshots. Immutable wiring
+ * calls are also coordinated with concurrent connector close.
+ */
+SHOAL_API shoal_status SHOAL_CALL
+shoal_connector_get_root_tablet_location(
+    shoal_connector *connector, int64_t timeout_ms,
+    shoal_bytes_result **out_result, shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_connector_get_manager_locations(
+    shoal_connector *connector, int64_t timeout_ms,
+    shoal_string_list_result **out_result, shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_connector_get_zookeepers(shoal_connector *connector,
+                               shoal_string_list_result **out_result,
+                               shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_connector_get_configuration(shoal_connector *connector,
+                                  shoal_configuration **out_configuration,
+                                  shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_connector_get_servers(shoal_connector *connector, int64_t timeout_ms,
+                            shoal_server_list_result **out_result,
+                            shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_connector_get_root(shoal_connector *connector,
+                         shoal_bytes_result **out_result,
+                         shoal_error **out_error);
 
 /*
  * timeout_ms is zero for no deadline and must not be negative. The returned

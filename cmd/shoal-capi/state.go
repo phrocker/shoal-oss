@@ -311,6 +311,50 @@ func (r *connectorRegistry) remove(id uint64) (*ownedConnector, bool) {
 
 var connectors = newConnectorRegistry()
 
+type configurationRegistry struct {
+	mu     sync.RWMutex
+	nextID uint64
+	items  map[uint64]*accumulo.Configuration
+}
+
+func newConfigurationRegistry() *configurationRegistry {
+	return &configurationRegistry{nextID: 1, items: make(map[uint64]*accumulo.Configuration)}
+}
+
+func (r *configurationRegistry) add(configuration *accumulo.Configuration) (uint64, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for attempts := uint64(0); attempts < ^uint64(0); attempts++ {
+		id := r.nextID
+		r.nextID++
+		if r.nextID == 0 {
+			r.nextID = 1
+		}
+		if id != 0 {
+			if _, exists := r.items[id]; !exists {
+				r.items[id] = configuration
+				return id, true
+			}
+		}
+	}
+	return 0, false
+}
+
+func (r *configurationRegistry) get(id uint64) (*accumulo.Configuration, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	configuration, ok := r.items[id]
+	return configuration, ok
+}
+
+func (r *configurationRegistry) remove(id uint64) {
+	r.mu.Lock()
+	delete(r.items, id)
+	r.mu.Unlock()
+}
+
+var configurations = newConfigurationRegistry()
+
 type ownedScanner struct {
 	single *accumulo.Scanner
 	batch  *accumulo.BatchScanner
