@@ -27,6 +27,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/bloberror"
@@ -189,6 +190,22 @@ func newCustomServiceBackend(t *testing.T, opts ...Option) (*Backend, *fakeAzure
 	if err != nil {
 		t.Fatalf("NewClientWithNoCredential: %v", err)
 	}
+	return newCustomServiceBackendWithClient(t, svc, opts...)
+}
+
+func newCustomServiceBackendWithURL(t *testing.T, serviceURL string, opts ...Option) (*Backend, *fakeAzureWriteOperations) {
+	t.Helper()
+
+	svc, err := service.NewClientWithNoCredential(serviceURL, nil)
+	if err != nil {
+		t.Fatalf("NewClientWithNoCredential: %v", err)
+	}
+	return newCustomServiceBackendWithClient(t, svc, opts...)
+}
+
+func newCustomServiceBackendWithClient(t *testing.T, svc *service.Client, opts ...Option) (*Backend, *fakeAzureWriteOperations) {
+	t.Helper()
+
 	backend, err := New(context.Background(), append([]Option{WithServiceClient(svc)}, opts...)...)
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -325,7 +342,7 @@ func TestWriter_WriteAfterCloseReportsClosedState(t *testing.T) {
 	}
 }
 
-func TestNextTemporaryStageNamePreservesPrefixAndBoundsUTF8Bytes(t *testing.T) {
+func TestNextTemporaryStageNamePreservesPrefixAndBoundsCharacters(t *testing.T) {
 	original := randomStageNameToken
 	randomStageNameToken = func() (string, error) {
 		return strings.Repeat("a", tempStageRandomHexLen), nil
@@ -342,12 +359,12 @@ func TestNextTemporaryStageNamePreservesPrefixAndBoundsUTF8Bytes(t *testing.T) {
 	if got, want := stageNameParentPrefix(stageName), stageNameParentPrefix(name); got != want {
 		t.Fatalf("stage prefix = %q, want %q", got, want)
 	}
-	if len(stageName) > maxBlobNameBytes {
-		t.Fatalf("stage name length = %d bytes, want <= %d", len(stageName), maxBlobNameBytes)
+	if got := utf8.RuneCountInString(stageName); got > maxBlobNameChars {
+		t.Fatalf("stage name length = %d chars, want <= %d", got, maxBlobNameChars)
 	}
 }
 
-func TestNextTemporaryStageNameRetainsDeepPrefixNearMaxBytes(t *testing.T) {
+func TestNextTemporaryStageNameUsesCharacterLimitInsteadOfUTF8Bytes(t *testing.T) {
 	original := randomStageNameToken
 	randomStageNameToken = func() (string, error) {
 		return strings.Repeat("b", tempStageRandomHexLen), nil
@@ -356,16 +373,79 @@ func TestNextTemporaryStageNameRetainsDeepPrefixNearMaxBytes(t *testing.T) {
 		randomStageNameToken = original
 	})
 
-	name := strings.Repeat("a", 1015) + "/x"
+	name := strings.Repeat("界", 1004) + "/x"
 	stageName, err := nextTemporaryStageName(name)
 	if err != nil {
 		t.Fatalf("nextTemporaryStageName: %v", err)
 	}
 	if got, want := stageNameParentPrefix(stageName), stageNameParentPrefix(name); got != want {
-		t.Fatalf("stage prefix = %q, want deep prefix %q", got, want)
+		t.Fatalf("stage prefix = %q, want %q", got, want)
 	}
-	if len(stageName) > maxBlobNameBytes {
-		t.Fatalf("stage name length = %d bytes, want <= %d", len(stageName), maxBlobNameBytes)
+	if got := utf8.RuneCountInString(stageName); got > maxBlobNameChars {
+		t.Fatalf("stage name length = %d chars, want <= %d", got, maxBlobNameChars)
+	}
+}
+
+func TestNextTemporaryStageNameTrimsToDeepestAncestorPrefixWhenSpaceIsTight(t *testing.T) {
+	original := randomStageNameToken
+	randomStageNameToken = func() (string, error) {
+		return strings.Repeat("c", tempStageRandomHexLen), nil
+	}
+	t.Cleanup(func() {
+		randomStageNameToken = original
+	})
+
+	name := strings.Repeat("a", 600) + "/" + strings.Repeat("b", 420) + "/x"
+	stageName, err := nextTemporaryStageName(name)
+	if err != nil {
+		t.Fatalf("nextTemporaryStageName: %v", err)
+	}
+	wantPrefix := strings.Repeat("a", 600) + "/"
+	if got := stageNameParentPrefix(stageName); got != wantPrefix {
+		t.Fatalf("stage prefix = %q, want deepest compatible prefix %q", got, wantPrefix)
+	}
+	if got := utf8.RuneCountInString(stageName) - utf8.RuneCountInString(wantPrefix); got != tempStageComponentLen {
+		t.Fatalf("stage component length = %d, want %d", got, tempStageComponentLen)
+	}
+}
+
+func TestNextTemporaryStageNamePreservesFullEntropyWhenPrefixTrims(t *testing.T) {
+	original := randomStageNameToken
+	randomStageNameToken = func() (string, error) {
+		return strings.Repeat("d", tempStageRandomHexLen), nil
+	}
+	t.Cleanup(func() {
+		randomStageNameToken = original
+	})
+
+	nameA := strings.Repeat("a", 600) + "/" + strings.Repeat("b", 420) + "/x"
+	nameB := strings.Repeat("a", 600) + "/" + strings.Repeat("b", 420) + "/y"
+	stageA, err := nextTemporaryStageName(nameA)
+	if err != nil {
+		t.Fatalf("nextTemporaryStageName nameA: %v", err)
+	}
+	stageB, err := nextTemporaryStageName(nameB)
+	if err != nil {
+		t.Fatalf("nextTemporaryStageName nameB: %v", err)
+	}
+	if stageA == stageB {
+		t.Fatalf("trimmed temporary stage names collided: %q", stageA)
+	}
+}
+
+func TestIsTemporaryStageNameMatchesOnlyReservedFormats(t *testing.T) {
+	legacyUUID := "123e4567-e89b-12d3-a456-426614174000"
+	if !isTemporaryStageName(".shoal-tmp/" + legacyUUID) {
+		t.Fatal("legacy temporary stage blob was not detected")
+	}
+	if !isTemporaryStageName("tenant/.shl-aaaaaaaaaa1234") {
+		t.Fatal("generated temporary stage blob was not detected")
+	}
+	if isTemporaryStageName(".shoal-tmp/user-visible") {
+		t.Fatal("arbitrary .shoal-tmp/ blob should remain visible")
+	}
+	if isTemporaryStageName("tenant/.shl-visible-blob") {
+		t.Fatal("arbitrary .shl- blob should remain visible")
 	}
 }
 
@@ -397,6 +477,29 @@ func TestBackendCreateWithCustomServiceClientRequiresSourceAuthorization(t *test
 	}
 }
 
+func TestBackendCreateWithCustomServiceClientSASURLPromotesStage(t *testing.T) {
+	backend, ops := newCustomServiceBackendWithURL(t, "https://example.blob.core.windows.net/?sig=client-sas")
+
+	w, err := backend.Create(context.Background(), "az://container/target")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if _, err := w.Write([]byte("new")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	sourceURL, err := url.Parse(ops.lastPromoteSource.url)
+	if err != nil {
+		t.Fatalf("Parse source URL: %v", err)
+	}
+	if got := sourceURL.Query().Get("sig"); got != "client-sas" {
+		t.Fatalf("source SAS signature = %q, want client-sas", got)
+	}
+}
+
 func TestBackendCreateWithCustomServiceClientSourceSASPromotesStage(t *testing.T) {
 	backend, ops := newCustomServiceBackend(t, WithSourceSASQuery("sig=shared-key"))
 
@@ -423,6 +526,32 @@ func TestBackendCreateWithCustomServiceClientSourceSASPromotesStage(t *testing.T
 	}
 	if got := ops.lastPromoteWriteID; got == "" {
 		t.Fatal("promote write ID was not recorded")
+	}
+}
+
+func TestBackendCreateWithCustomServiceClientCopySourceAuthorizationPromotesStage(t *testing.T) {
+	backend, ops := newCustomServiceBackend(t, WithCopySourceAuthorization("Bearer test-token"))
+
+	w, err := backend.Create(context.Background(), "az://container/target")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if _, err := w.Write([]byte("new")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	if ops.lastPromoteSource.authorization == nil || *ops.lastPromoteSource.authorization != "Bearer test-token" {
+		t.Fatalf("source authorization = %v, want Bearer test-token", ops.lastPromoteSource.authorization)
+	}
+	sourceURL, err := url.Parse(ops.lastPromoteSource.url)
+	if err != nil {
+		t.Fatalf("Parse source URL: %v", err)
+	}
+	if sourceURL.RawQuery != "" {
+		t.Fatalf("source query = %q, want empty", sourceURL.RawQuery)
 	}
 }
 
@@ -464,6 +593,22 @@ func TestBackendCreateWithCustomServiceClientAuthorizationProviderPromotesStage(
 	}
 	if sourceURL.RawQuery != "" {
 		t.Fatalf("source query = %q, want empty", sourceURL.RawQuery)
+	}
+}
+
+func TestTemporaryBlockIDUsesWriteIdentityAndFixedLength(t *testing.T) {
+	writeA0 := temporaryBlockID("write-a", 0)
+	writeA1 := temporaryBlockID("write-a", 1)
+	writeB0 := temporaryBlockID("write-b", 0)
+
+	if writeA0 == writeB0 {
+		t.Fatalf("different writes produced the same block ID %q", writeA0)
+	}
+	if writeA0 == writeA1 {
+		t.Fatalf("different block indexes produced the same block ID %q", writeA0)
+	}
+	if len(writeA0) != len(writeA1) || len(writeA0) != len(writeB0) {
+		t.Fatalf("block ID lengths = %d, %d, %d; want equal fixed length", len(writeA0), len(writeA1), len(writeB0))
 	}
 }
 

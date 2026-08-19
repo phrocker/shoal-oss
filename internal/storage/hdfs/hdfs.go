@@ -520,12 +520,10 @@ func bindDialContextWithSource(ctxSource func() context.Context, dial func(conte
 			return nil, err
 		}
 		conn = bindConnContext(effectiveCtx, conn, release)
-		if deadline, ok := effectiveCtx.Deadline(); ok {
-			if err := conn.SetDeadline(deadline); err != nil {
-				release()
-				_ = conn.Close()
-				return nil, err
-			}
+		if err := applyCombinedConnDeadline(conn, requestCtx, ctxSource); err != nil {
+			release()
+			_ = conn.Close()
+			return nil, err
 		}
 		return conn, nil
 	}
@@ -545,12 +543,10 @@ func bindDialContextWithDialContextSource(source *dialContextSource, dial func(c
 			release()
 			return nil, err
 		}
-		if deadline, ok := effectiveCtx.Deadline(); ok {
-			if err := conn.SetDeadline(deadline); err != nil {
-				release()
-				_ = conn.Close()
-				return nil, err
-			}
+		if err := applyCombinedConnDeadline(conn, requestCtx, source.Context); err != nil {
+			release()
+			_ = conn.Close()
+			return nil, err
 		}
 		return bindConnContextWithSource(requestCtx, conn, source, release), nil
 	}
@@ -817,6 +813,36 @@ func combineDialContexts(requestCtx, boundCtx context.Context) (context.Context,
 	return ctx, func() {
 		_ = stop()
 	}
+}
+
+func combinedDeadline(a, b context.Context) (time.Time, bool) {
+	a = contextOrBackground(a)
+	b = contextOrBackground(b)
+	aDeadline, aOK := a.Deadline()
+	bDeadline, bOK := b.Deadline()
+	switch {
+	case aOK && bOK:
+		if bDeadline.Before(aDeadline) {
+			return bDeadline, true
+		}
+		return aDeadline, true
+	case aOK:
+		return aDeadline, true
+	case bOK:
+		return bDeadline, true
+	default:
+		return time.Time{}, false
+	}
+}
+
+func applyCombinedConnDeadline(conn net.Conn, requestCtx context.Context, source func() context.Context) error {
+	if conn == nil {
+		return nil
+	}
+	if deadline, ok := combinedDeadline(requestCtx, source()); ok {
+		return conn.SetDeadline(deadline)
+	}
+	return conn.SetDeadline(time.Time{})
 }
 
 func isHDFSScheme(value string) bool {
@@ -1503,6 +1529,7 @@ func bindConnContext(ctx context.Context, conn net.Conn, release func()) net.Con
 type sourceBoundConn struct {
 	net.Conn
 	mu          sync.Mutex
+	requestCtx  context.Context
 	stopRequest func() bool
 	stopSource  func() bool
 	unsubscribe func()
@@ -1515,8 +1542,9 @@ func bindConnContextWithSource(requestCtx context.Context, conn net.Conn, source
 		return conn
 	}
 	bound := &sourceBoundConn{
-		Conn:    conn,
-		release: release,
+		Conn:       conn,
+		requestCtx: requestCtx,
+		release:    release,
 	}
 	if requestCtx != nil && requestCtx.Done() != nil {
 		bound.stopRequest = context.AfterFunc(requestCtx, func() {
@@ -1531,7 +1559,7 @@ func bindConnContextWithSource(requestCtx context.Context, conn net.Conn, source
 
 func (c *sourceBoundConn) bindSourceContext(ctx context.Context) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
+	requestCtx := c.requestCtx
 	if c.stopSource != nil {
 		c.stopSource()
 		c.stopSource = nil
@@ -1541,6 +1569,10 @@ func (c *sourceBoundConn) bindSourceContext(ctx context.Context) {
 		c.stopSource = context.AfterFunc(ctx, func() {
 			_ = conn.Close()
 		})
+	}
+	c.mu.Unlock()
+	if err := applyCombinedConnDeadline(c.Conn, requestCtx, func() context.Context { return ctx }); err != nil && !isExpectedOperationCloseError(err) {
+		_ = c.Conn.Close()
 	}
 }
 

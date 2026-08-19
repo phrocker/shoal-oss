@@ -160,7 +160,7 @@ func TestNextTemporaryObjectNameSupportsMaxUTF8ByteName(t *testing.T) {
 	}
 }
 
-func TestNextTemporaryObjectNameRetainsParentPrefixWhenSpaceIsTight(t *testing.T) {
+func TestNextTemporaryObjectNameTrimsToDeepestAncestorPrefixWhenSpaceIsTight(t *testing.T) {
 	originalToken := randomTempObjectToken
 	randomTempObjectToken = func() (string, error) {
 		return strings.Repeat("d", tempObjectRandomHexLen), nil
@@ -169,20 +169,25 @@ func TestNextTemporaryObjectNameRetainsParentPrefixWhenSpaceIsTight(t *testing.T
 		randomTempObjectToken = originalToken
 	})
 
-	object := strings.Repeat("a", 1005) + "/b"
+	object := strings.Repeat("a", 600) + "/" + strings.Repeat("b", 420) + "/x"
 	tempName, err := nextTemporaryObjectName(object)
 	if err != nil {
 		t.Fatalf("nextTemporaryObjectName: %v", err)
 	}
-	if got, want := tempObjectParentPrefix(tempName), tempObjectParentPrefix(object); got != want {
-		t.Fatalf("temp prefix = %q, want permission-compatible prefix %q", got, want)
+	wantPrefix := strings.Repeat("a", 600) + "/"
+	if got := tempObjectParentPrefix(tempName); got != wantPrefix {
+		t.Fatalf("temp prefix = %q, want deepest compatible prefix %q", got, wantPrefix)
 	}
 	if len(tempName) > maxObjectNameBytes {
 		t.Fatalf("temp object length = %d bytes, want <= %d", len(tempName), maxObjectNameBytes)
 	}
+	component := tempName[len(wantPrefix):]
+	if len(component) != tempObjectComponentLen {
+		t.Fatalf("temp component length = %d, want %d", len(component), tempObjectComponentLen)
+	}
 }
 
-func TestNextTemporaryObjectNameRetainsDeepPrefixNearMaxBytes(t *testing.T) {
+func TestNextTemporaryObjectNamePreservesFullEntropyWhenPrefixTrims(t *testing.T) {
 	originalToken := randomTempObjectToken
 	randomTempObjectToken = func() (string, error) {
 		return strings.Repeat("e", tempObjectRandomHexLen), nil
@@ -191,13 +196,24 @@ func TestNextTemporaryObjectNameRetainsDeepPrefixNearMaxBytes(t *testing.T) {
 		randomTempObjectToken = originalToken
 	})
 
-	object := strings.Repeat("a", 1004) + "/x"
-	tempName, err := nextTemporaryObjectName(object)
+	objectA := strings.Repeat("a", 600) + "/" + strings.Repeat("b", 420) + "/x"
+	objectB := strings.Repeat("a", 600) + "/" + strings.Repeat("b", 420) + "/y"
+	tempA, err := nextTemporaryObjectName(objectA)
 	if err != nil {
-		t.Fatalf("nextTemporaryObjectName: %v", err)
+		t.Fatalf("nextTemporaryObjectName objectA: %v", err)
 	}
-	if got, want := tempObjectParentPrefix(tempName), tempObjectParentPrefix(object); got != want {
-		t.Fatalf("temp prefix = %q, want deep prefix %q", got, want)
+	tempB, err := nextTemporaryObjectName(objectB)
+	if err != nil {
+		t.Fatalf("nextTemporaryObjectName objectB: %v", err)
+	}
+	if tempA == tempB {
+		t.Fatalf("trimmed temporary names collided: %q", tempA)
+	}
+	if got, want := len(tempA)-len(tempObjectParentPrefix(tempA)), tempObjectComponentLen; got != want {
+		t.Fatalf("tempA component length = %d, want %d", got, want)
+	}
+	if got, want := len(tempB)-len(tempObjectParentPrefix(tempB)), tempObjectComponentLen; got != want {
+		t.Fatalf("tempB component length = %d, want %d", got, want)
 	}
 }
 
@@ -218,6 +234,22 @@ func TestNextTemporaryObjectNameSupportsHierarchicalSegmentLimit(t *testing.T) {
 	component := tempName[len(tempObjectParentPrefix(tempName)):]
 	if len(component) > maxObjectSegmentBytes {
 		t.Fatalf("temp component length = %d bytes, want <= %d", len(component), maxObjectSegmentBytes)
+	}
+}
+
+func TestIsTemporaryObjectNameMatchesOnlyReservedFormats(t *testing.T) {
+	legacyUUID := "123e4567-e89b-12d3-a456-426614174000"
+	if !isTemporaryObjectName("tenant/.shl-aaaaaaaaaa1234") {
+		t.Fatal("generated temporary object was not detected")
+	}
+	if !isTemporaryObjectName("tenant/object.rf" + legacyTempObjectPrefix + legacyUUID) {
+		t.Fatal("legacy temporary object was not detected")
+	}
+	if isTemporaryObjectName("tenant/.shl-visible-data") {
+		t.Fatal("user-visible .shl- object should not be hidden")
+	}
+	if isTemporaryObjectName("tenant/object.rf" + legacyTempObjectPrefix + "visible") {
+		t.Fatal("non-generated legacy-looking object should not be hidden")
 	}
 }
 
@@ -485,6 +517,75 @@ func TestWriter_CloseSuccessIgnoresTempCleanupFailure(t *testing.T) {
 	}
 }
 
+func TestWriter_CloseRetriesTempCleanupAfterCommittedPromotion(t *testing.T) {
+	backend, bucket := newFakeBackend()
+	attempts := 0
+	bucket.deleteHook = func(_ context.Context, object *fakeObject) error {
+		if isTemporaryObjectName(object.name) && attempts == 0 {
+			attempts++
+			return errors.New("delete failed")
+		}
+		return nil
+	}
+
+	w, err := backend.Create(context.Background(), "bucket/path/to/object.rf")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	gcsWriter := w.(*writer)
+	tempName := gcsWriter.temp.(*fakeObject).name
+	if _, err := w.Write([]byte("new")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("first Close: %v", err)
+	}
+	if _, ok := bucket.objects[tempName]; !ok {
+		t.Fatalf("cleanup retry test lost temp object %q before retry", tempName)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("second Close: %v", err)
+	}
+	if _, ok := bucket.objects[tempName]; ok {
+		t.Fatalf("second Close did not retry cleanup for %q", tempName)
+	}
+}
+
+func TestWriter_CloseUsesVerifiedTempObjectWhenWriterAttrsAreUnreliable(t *testing.T) {
+	backend, bucket := newFakeBackend()
+	bucket.putObject("path/to/object.rf", []byte("old"))
+	closeErr := errors.New("checksum mismatch")
+	bucket.writerPlan = func(name string) fakeWriterPlan {
+		if isTemporaryObjectName(name) {
+			return fakeWriterPlan{
+				closeErr:       closeErr,
+				publishOnClose: true,
+				attrsOverride:  &cloudstorage.ObjectAttrs{Name: name, Generation: 999},
+			}
+		}
+		return fakeWriterPlan{}
+	}
+
+	w, err := backend.Create(context.Background(), "bucket/path/to/object.rf")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	tempName := w.(*writer).temp.(*fakeObject).name
+	if _, err := w.Write([]byte("new")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	err = w.Close()
+	if !errors.Is(err, closeErr) {
+		t.Fatalf("Close error = %v, want checksum mismatch", err)
+	}
+	if got := string(bucket.objects["path/to/object.rf"].body); got != "old" {
+		t.Fatalf("destination contents = %q, want old", got)
+	}
+	if _, ok := bucket.objects[tempName]; ok {
+		t.Fatalf("verified cleanup left temp object %q behind", tempName)
+	}
+}
+
 // TestGCS_RoundtripAgainstRealBucket exercises Open + ReadAt against a
 // real GCS bucket. Skipped when SHOAL_GCS_TEST_BUCKET / _OBJECT aren't
 // set — CI without GCS creds will skip cleanly.
@@ -613,12 +714,14 @@ type fakeObjectData struct {
 	body           []byte
 	generation     int64
 	metageneration int64
+	metadata       map[string]string
 }
 
 type fakeWriterPlan struct {
 	closeErr       error
 	publishOnClose bool
 	closeAbortErr  error
+	attrsOverride  *cloudstorage.ObjectAttrs
 }
 
 type fakeCopyCall struct {
@@ -648,12 +751,17 @@ func (b *fakeBucket) Object(name string) objectHandle {
 }
 
 func (b *fakeBucket) putObject(name string, body []byte) *cloudstorage.ObjectAttrs {
+	return b.putObjectWithMetadata(name, body, nil)
+}
+
+func (b *fakeBucket) putObjectWithMetadata(name string, body []byte, metadata map[string]string) *cloudstorage.ObjectAttrs {
 	attrs := &cloudstorage.ObjectAttrs{
 		Name:           name,
 		Generation:     b.nextGen,
 		Metageneration: 1,
 		Size:           int64(len(body)),
 		CRC32C:         crc32.Checksum(body, crc32.MakeTable(crc32.Castagnoli)),
+		Metadata:       cloneMetadata(metadata),
 	}
 	md5Sum := md5.Sum(body)
 	attrs.MD5 = append([]byte(nil), md5Sum[:]...)
@@ -662,6 +770,7 @@ func (b *fakeBucket) putObject(name string, body []byte) *cloudstorage.ObjectAtt
 		body:           append([]byte(nil), body...),
 		generation:     attrs.Generation,
 		metageneration: attrs.Metageneration,
+		metadata:       cloneMetadata(metadata),
 	}
 	return attrs
 }
@@ -708,6 +817,7 @@ func (o *fakeObject) Attrs(ctx context.Context) (*cloudstorage.ObjectAttrs, erro
 		Size:           int64(len(data.body)),
 		CRC32C:         crc32.Checksum(data.body, crc32.MakeTable(crc32.Castagnoli)),
 		MD5:            md5Bytes(data.body),
+		Metadata:       cloneMetadata(data.metadata),
 	}, nil
 }
 
@@ -807,6 +917,7 @@ type fakeObjectWriter struct {
 	plan                fakeWriterPlan
 	buf                 bytes.Buffer
 	attrs               *cloudstorage.ObjectAttrs
+	metadata            map[string]string
 	closeCalls          int
 	closeWithErrorCalls int
 	closeWithErrorArg   error
@@ -822,7 +933,10 @@ func (w *fakeObjectWriter) Close() error {
 		return err
 	}
 	if w.plan.publishOnClose || w.plan.closeErr == nil {
-		w.attrs = w.bucket.putObject(w.name, w.buf.Bytes())
+		w.attrs = w.bucket.putObjectWithMetadata(w.name, w.buf.Bytes(), w.metadata)
+		if w.plan.attrsOverride != nil {
+			w.attrs = cloneObjectAttrs(w.plan.attrsOverride)
+		}
 	}
 	return w.plan.closeErr
 }
@@ -835,6 +949,10 @@ func (w *fakeObjectWriter) CloseWithError(err error) error {
 
 func (w *fakeObjectWriter) Attrs() *cloudstorage.ObjectAttrs {
 	return w.attrs
+}
+
+func (w *fakeObjectWriter) SetMetadata(metadata map[string]string) {
+	w.metadata = cloneMetadata(metadata)
 }
 
 func checkObjectConditions(bucket *fakeBucket, name string, conditions cloudstorage.Conditions) error {
@@ -861,4 +979,25 @@ func checkObjectConditions(bucket *fakeBucket, name string, conditions cloudstor
 func md5Bytes(data []byte) []byte {
 	sum := md5.Sum(data)
 	return append([]byte(nil), sum[:]...)
+}
+
+func cloneMetadata(metadata map[string]string) map[string]string {
+	if len(metadata) == 0 {
+		return nil
+	}
+	clone := make(map[string]string, len(metadata))
+	for key, value := range metadata {
+		clone[key] = value
+	}
+	return clone
+}
+
+func cloneObjectAttrs(attrs *cloudstorage.ObjectAttrs) *cloudstorage.ObjectAttrs {
+	if attrs == nil {
+		return nil
+	}
+	clone := *attrs
+	clone.MD5 = append([]byte(nil), attrs.MD5...)
+	clone.Metadata = cloneMetadata(attrs.Metadata)
+	return &clone
 }

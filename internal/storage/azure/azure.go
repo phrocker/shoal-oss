@@ -54,6 +54,7 @@ import (
 	"os"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
@@ -91,16 +92,17 @@ type config struct {
 }
 
 // WithServiceClient supplies a pre-built service client. If set, New ignores
-// all other credential options. Reads always work; writes also need
-// WithSourceSASQuery or WithSourceAuthorizationProvider so Azure can authorize
-// reads from staged private source blobs during promotion.
+// all other credential options. Reads always work; writes also need staged
+// source authorization, either from a SAS-bearing service URL or from
+// WithSourceSASQuery, WithCopySourceAuthorization, or
+// WithSourceAuthorizationProvider.
 func WithServiceClient(svc *service.Client) Option {
 	return func(c *config) { c.svc = svc }
 }
 
 // SourceAuthorization configures how Azure authorizes reads from a staged
 // source blob during promotion. SASQuery may include or omit the leading "?";
-// Authorization should be a full header value such as "Bearer <token>".
+// Authorization should be the full CopySourceAuthorization header value.
 type SourceAuthorization struct {
 	SASQuery      string
 	Authorization string
@@ -133,6 +135,17 @@ func WithSourceSASQuery(sasQuery string) Option {
 	return WithSourceAuthorizationProvider(SourceAuthorizationProviderFunc(
 		func(context.Context, string, string) (SourceAuthorization, error) {
 			return SourceAuthorization{SASQuery: sasQuery}, nil
+		},
+	))
+}
+
+// WithCopySourceAuthorization supplies a static CopySourceAuthorization header
+// value for reads from staged source blobs during promotion, primarily for
+// WithServiceClient.
+func WithCopySourceAuthorization(authorization string) Option {
+	return WithSourceAuthorizationProvider(SourceAuthorizationProviderFunc(
+		func(context.Context, string, string) (SourceAuthorization, error) {
+			return SourceAuthorization{Authorization: authorization}, nil
 		},
 	))
 }
@@ -170,7 +183,7 @@ func New(_ context.Context, opts ...Option) (*Backend, error) {
 		return &Backend{
 			svc:            c.svc,
 			ops:            sdkAzureWriteOperations{svc: c.svc},
-			sourceProvider: configuredOrAutomaticSourceProvider(base, nil, c.sourceAuthorizationProvider, false),
+			sourceProvider: configuredOrAutomaticSourceProvider(base, sourceProviderFromServiceClient(c.svc), c.sourceAuthorizationProvider, true),
 		}, nil
 	}
 
@@ -320,8 +333,7 @@ func (b *Backend) List(ctx context.Context, prefix string) ([]string, error) {
 			continue
 		}
 		for _, item := range page.Segment.BlobItems {
-			if item == nil || item.Name == nil || strings.HasSuffix(*item.Name, "/") ||
-				strings.HasPrefix(*item.Name, legacyStageDirPrefix) || isTemporaryStageName(*item.Name) {
+			if item == nil || item.Name == nil || strings.HasSuffix(*item.Name, "/") || isTemporaryStageName(*item.Name) {
 				continue
 			}
 			out = append(out, "az://"+cont+"/"+*item.Name)
@@ -352,7 +364,7 @@ func ParsePath(path string) (containerName, blobName string, err error) {
 }
 
 const (
-	maxBlobNameBytes      = 1024
+	maxBlobNameChars      = 1024
 	tempStageNamePrefix   = ".shl-"
 	tempStageHashHexLen   = 4
 	tempStageRandomHexLen = 10
@@ -383,18 +395,19 @@ func nextTemporaryStageName(name string) (string, error) {
 		return "", fmt.Errorf("temporary blob token material too short")
 	}
 	component := tempStageNamePrefix + token[:tempStageRandomHexLen] + hashHex[:tempStageHashHexLen]
-	available := maxBlobNameBytes - len(prefix)
-	if available < 1 {
+	if utf8.RuneCountInString(prefix)+len(component) > maxBlobNameChars {
 		return "", fmt.Errorf("blob prefix %q leaves no room for a temporary blob", prefix)
-	}
-	if len(component) > available {
-		component = component[:available]
 	}
 	return prefix + component, nil
 }
 
 func temporaryStageNamePrefixFor(name string) string {
-	return stageNameParentPrefix(name)
+	prefix := stageNameParentPrefix(name)
+	for prefix != "" && maxBlobNameChars-utf8.RuneCountInString(prefix) < tempStageComponentLen {
+		trimmed := strings.TrimSuffix(prefix, "/")
+		prefix = stageNameParentPrefix(trimmed)
+	}
+	return prefix
 }
 
 func stageNameParentPrefix(name string) string {
@@ -409,8 +422,28 @@ func isTemporaryStageName(name string) bool {
 	if idx := strings.LastIndexByte(base, '/'); idx >= 0 {
 		base = base[idx+1:]
 	}
-	return strings.HasPrefix(name, legacyStageDirPrefix) ||
-		strings.HasPrefix(base, tempStageNamePrefix)
+	return isLegacyTemporaryStageName(name) || isGeneratedTemporaryStageComponent(base)
+}
+
+func isLegacyTemporaryStageName(name string) bool {
+	if !strings.HasPrefix(name, legacyStageDirPrefix) {
+		return false
+	}
+	remainder := name[len(legacyStageDirPrefix):]
+	if remainder == "" || strings.ContainsRune(remainder, '/') {
+		return false
+	}
+	_, err := uuid.Parse(remainder)
+	return err == nil
+}
+
+func isGeneratedTemporaryStageComponent(name string) bool {
+	if len(name) != tempStageComponentLen || !strings.HasPrefix(name, tempStageNamePrefix) {
+		return false
+	}
+	token := name[len(tempStageNamePrefix) : len(tempStageNamePrefix)+tempStageRandomHexLen]
+	hash := name[len(tempStageNamePrefix)+tempStageRandomHexLen:]
+	return isLowerHex(token) && isLowerHex(hash)
 }
 
 type azureCopySource struct {
@@ -513,6 +546,15 @@ func (p tokenAzureCopySourceProvider) source(ctx context.Context, containerName,
 	}, nil
 }
 
+func sourceProviderFromServiceClient(svc *service.Client) azureCopySourceProvider {
+	base := rawAzureCopySourceProvider{svc: svc}
+	serviceURL, err := url.Parse(svc.URL())
+	if err != nil || serviceURL.RawQuery == "" {
+		return nil
+	}
+	return sasAzureCopySourceProvider{rawAzureCopySourceProvider: base, sasQuery: serviceURL.RawQuery}
+}
+
 func configuredOrAutomaticSourceProvider(
 	base rawAzureCopySourceProvider,
 	automatic azureCopySourceProvider,
@@ -529,6 +571,14 @@ func configuredOrAutomaticSourceProvider(
 		return automatic
 	}
 	return nil
+}
+
+func isLowerHex(value string) bool {
+	if value == "" {
+		return false
+	}
+	decoded, err := hex.DecodeString(value)
+	return err == nil && len(decoded)*2 == len(value)
 }
 
 func sourceProviderFromConnectionString(svc *service.Client, connString string) azureCopySourceProvider {

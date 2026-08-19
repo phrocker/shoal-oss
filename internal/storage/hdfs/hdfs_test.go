@@ -1112,6 +1112,67 @@ func TestDialContextSourceRebindsEstablishedConnection(t *testing.T) {
 	}
 }
 
+func TestDialContextSourceRebindClearsEstablishedDeadline(t *testing.T) {
+	constructorCtx, cancelConstructor := context.WithDeadline(context.Background(), time.Now().Add(time.Minute))
+	defer cancelConstructor()
+	cleanupCtx, cancelCleanup := context.WithCancel(context.Background())
+	defer cancelCleanup()
+
+	source := newDialContextSource(constructorCtx)
+	conn := &recordingConn{}
+	dial := bindDialContextWithDialContextSource(source, func(context.Context, string, string) (net.Conn, error) {
+		return conn, nil
+	})
+	bound, err := dial(context.Background(), "tcp", "nn:8020")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bound.Close()
+
+	if got := conn.lastDeadline(); got.IsZero() {
+		t.Fatal("initial dial did not apply constructor deadline")
+	}
+
+	source.Store(cleanupCtx)
+	if got := conn.lastDeadline(); !got.IsZero() {
+		t.Fatalf("rebound deadline = %v, want cleared zero deadline", got)
+	}
+}
+
+func TestDialContextSourceRebindRecomputesEarliestDeadline(t *testing.T) {
+	requestDeadline := time.Now().Add(2 * time.Minute)
+	requestCtx, cancelRequest := context.WithDeadline(context.Background(), requestDeadline)
+	defer cancelRequest()
+
+	source := newDialContextSource(context.Background())
+	conn := &recordingConn{}
+	dial := bindDialContextWithDialContextSource(source, func(context.Context, string, string) (net.Conn, error) {
+		return conn, nil
+	})
+	bound, err := dial(requestCtx, "tcp", "nn:8020")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bound.Close()
+
+	if got := conn.lastDeadline(); !got.Equal(requestDeadline) {
+		t.Fatalf("initial deadline = %v, want request deadline %v", got, requestDeadline)
+	}
+
+	sourceDeadline := time.Now().Add(time.Minute)
+	sourceCtx, cancelSource := context.WithDeadline(context.Background(), sourceDeadline)
+	defer cancelSource()
+	source.Store(sourceCtx)
+	if got := conn.lastDeadline(); !got.Equal(sourceDeadline) {
+		t.Fatalf("updated deadline = %v, want rebound source deadline %v", got, sourceDeadline)
+	}
+
+	source.Store(context.Background())
+	if got := conn.lastDeadline(); !got.Equal(requestDeadline) {
+		t.Fatalf("restored deadline = %v, want request deadline %v", got, requestDeadline)
+	}
+}
+
 func TestBackendOpenAppliesContextDeadline(t *testing.T) {
 	client := newFakeClient()
 	client.files["/tables/1.rf"] = []byte("rfile")
@@ -2606,6 +2667,34 @@ func checkReplacementSiblingPath(t *testing.T, sibling, wantDir, wantPrefix stri
 		t.Fatalf("sibling base length = %d, want <= 255", len(base))
 	}
 }
+
+type recordingConn struct {
+	deadlines []time.Time
+}
+
+func (*recordingConn) Read([]byte) (int, error)         { return 0, nil }
+func (*recordingConn) Write(p []byte) (int, error)      { return len(p), nil }
+func (*recordingConn) Close() error                     { return nil }
+func (*recordingConn) LocalAddr() net.Addr              { return fakeConnAddr("local") }
+func (*recordingConn) RemoteAddr() net.Addr             { return fakeConnAddr("remote") }
+func (*recordingConn) SetReadDeadline(time.Time) error  { return nil }
+func (*recordingConn) SetWriteDeadline(time.Time) error { return nil }
+func (c *recordingConn) SetDeadline(deadline time.Time) error {
+	c.deadlines = append(c.deadlines, deadline)
+	return nil
+}
+
+func (c *recordingConn) lastDeadline() time.Time {
+	if len(c.deadlines) == 0 {
+		return time.Time{}
+	}
+	return c.deadlines[len(c.deadlines)-1]
+}
+
+type fakeConnAddr string
+
+func (a fakeConnAddr) Network() string { return "tcp" }
+func (a fakeConnAddr) String() string  { return string(a) }
 
 type immediateErrorDeadlineWriter struct {
 	deadlines []time.Time

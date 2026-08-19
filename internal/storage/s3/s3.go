@@ -201,8 +201,7 @@ func (b *Backend) List(ctx context.Context, prefix string) ([]string, error) {
 			return nil, fmt.Errorf("s3: ListObjectsV2 s3://%s/%s: %w", bucket, objectPrefix, err)
 		}
 		for _, obj := range page.Contents {
-			if obj.Key == nil || strings.HasSuffix(*obj.Key, "/") ||
-				strings.HasPrefix(*obj.Key, ".shoal-tmp/") || isTemporaryStageKey(*obj.Key) {
+			if obj.Key == nil || strings.HasSuffix(*obj.Key, "/") || isTemporaryStageKey(*obj.Key) {
 				continue
 			}
 			out = append(out, "s3://"+bucket+"/"+*obj.Key)
@@ -261,18 +260,19 @@ func nextTemporaryStageKey(key string) (string, error) {
 		return "", fmt.Errorf("temporary key token material too short")
 	}
 	component := tempStageKeyPrefix + token[:tempStageRandomHexLen] + hashHex[:tempStageHashHexLen]
-	available := maxObjectKeyBytes - len(prefix)
-	if available < 1 {
+	if len(prefix)+len(component) > maxObjectKeyBytes {
 		return "", fmt.Errorf("key prefix %q leaves no room for a temporary object", prefix)
-	}
-	if len(component) > available {
-		component = component[:available]
 	}
 	return prefix + component, nil
 }
 
 func temporaryStageKeyPrefixFor(key string) string {
-	return stageKeyParentPrefix(key)
+	prefix := stageKeyParentPrefix(key)
+	for prefix != "" && maxObjectKeyBytes-len(prefix) < tempStageComponentLen {
+		trimmed := strings.TrimSuffix(prefix, "/")
+		prefix = stageKeyParentPrefix(trimmed)
+	}
+	return prefix
 }
 
 func stageKeyParentPrefix(key string) string {
@@ -287,8 +287,36 @@ func isTemporaryStageKey(key string) bool {
 	if idx := strings.LastIndexByte(name, '/'); idx >= 0 {
 		name = name[idx+1:]
 	}
-	return strings.HasPrefix(key, legacyStageDirPrefix) ||
-		strings.HasPrefix(name, tempStageKeyPrefix)
+	return isLegacyTemporaryStageKey(key) || isGeneratedTemporaryStageComponent(name)
+}
+
+func isLegacyTemporaryStageKey(key string) bool {
+	if !strings.HasPrefix(key, legacyStageDirPrefix) {
+		return false
+	}
+	remainder := key[len(legacyStageDirPrefix):]
+	if remainder == "" || strings.ContainsRune(remainder, '/') {
+		return false
+	}
+	_, err := uuid.Parse(remainder)
+	return err == nil
+}
+
+func isGeneratedTemporaryStageComponent(name string) bool {
+	if len(name) != tempStageComponentLen || !strings.HasPrefix(name, tempStageKeyPrefix) {
+		return false
+	}
+	token := name[len(tempStageKeyPrefix) : len(tempStageKeyPrefix)+tempStageRandomHexLen]
+	hash := name[len(tempStageKeyPrefix)+tempStageRandomHexLen:]
+	return isLowerHex(token) && isLowerHex(hash)
+}
+
+func isLowerHex(value string) bool {
+	if value == "" {
+		return false
+	}
+	decoded, err := hex.DecodeString(value)
+	return err == nil && len(decoded)*2 == len(value)
 }
 
 // file is the S3 File implementation. Each ReadAt issues a fresh Range GET —

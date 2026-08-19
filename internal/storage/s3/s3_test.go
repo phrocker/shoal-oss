@@ -288,7 +288,7 @@ func TestNextTemporaryStageKeyPreservesPrefixAndBoundsUTF8Bytes(t *testing.T) {
 	}
 }
 
-func TestNextTemporaryStageKeyRetainsDeepPrefixNearMaxBytes(t *testing.T) {
+func TestNextTemporaryStageKeyTrimsToDeepestAncestorPrefixWhenSpaceIsTight(t *testing.T) {
 	original := randomStageKeyToken
 	randomStageKeyToken = func() (string, error) {
 		return strings.Repeat("b", tempStageRandomHexLen), nil
@@ -297,16 +297,66 @@ func TestNextTemporaryStageKeyRetainsDeepPrefixNearMaxBytes(t *testing.T) {
 		randomStageKeyToken = original
 	})
 
-	key := strings.Repeat("a", 1015) + "/x"
+	key := strings.Repeat("a", 600) + "/" + strings.Repeat("b", 420) + "/x"
 	stageKey, err := nextTemporaryStageKey(key)
 	if err != nil {
 		t.Fatalf("nextTemporaryStageKey: %v", err)
 	}
-	if got, want := stageKeyParentPrefix(stageKey), stageKeyParentPrefix(key); got != want {
-		t.Fatalf("stage prefix = %q, want deep prefix %q", got, want)
+	wantPrefix := strings.Repeat("a", 600) + "/"
+	if got := stageKeyParentPrefix(stageKey); got != wantPrefix {
+		t.Fatalf("stage prefix = %q, want deepest compatible prefix %q", got, wantPrefix)
 	}
 	if len(stageKey) > maxObjectKeyBytes {
 		t.Fatalf("stage key length = %d bytes, want <= %d", len(stageKey), maxObjectKeyBytes)
+	}
+	if got, want := len(stageKey)-len(wantPrefix), tempStageComponentLen; got != want {
+		t.Fatalf("stage component length = %d, want %d", got, want)
+	}
+}
+
+func TestNextTemporaryStageKeyPreservesFullEntropyWhenPrefixTrims(t *testing.T) {
+	original := randomStageKeyToken
+	randomStageKeyToken = func() (string, error) {
+		return strings.Repeat("c", tempStageRandomHexLen), nil
+	}
+	t.Cleanup(func() {
+		randomStageKeyToken = original
+	})
+
+	keyA := strings.Repeat("a", 600) + "/" + strings.Repeat("b", 420) + "/x"
+	keyB := strings.Repeat("a", 600) + "/" + strings.Repeat("b", 420) + "/y"
+	stageA, err := nextTemporaryStageKey(keyA)
+	if err != nil {
+		t.Fatalf("nextTemporaryStageKey keyA: %v", err)
+	}
+	stageB, err := nextTemporaryStageKey(keyB)
+	if err != nil {
+		t.Fatalf("nextTemporaryStageKey keyB: %v", err)
+	}
+	if stageA == stageB {
+		t.Fatalf("trimmed temporary stage keys collided: %q", stageA)
+	}
+	if got, want := len(stageA)-len(stageKeyParentPrefix(stageA)), tempStageComponentLen; got != want {
+		t.Fatalf("stageA component length = %d, want %d", got, want)
+	}
+	if got, want := len(stageB)-len(stageKeyParentPrefix(stageB)), tempStageComponentLen; got != want {
+		t.Fatalf("stageB component length = %d, want %d", got, want)
+	}
+}
+
+func TestIsTemporaryStageKeyMatchesOnlyReservedFormats(t *testing.T) {
+	legacyUUID := "123e4567-e89b-12d3-a456-426614174000"
+	if !isTemporaryStageKey(".shoal-tmp/" + legacyUUID) {
+		t.Fatal("legacy temporary stage key was not detected")
+	}
+	if !isTemporaryStageKey("tenant/.shl-aaaaaaaaaa1234") {
+		t.Fatal("generated temporary stage key was not detected")
+	}
+	if isTemporaryStageKey(".shoal-tmp/user-visible") {
+		t.Fatal("arbitrary .shoal-tmp/ key should remain visible")
+	}
+	if isTemporaryStageKey("tenant/.shl-visible-object") {
+		t.Fatal("arbitrary .shl- key should remain visible")
 	}
 }
 

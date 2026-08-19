@@ -30,6 +30,7 @@ import (
 	"time"
 
 	"cloud.google.com/go/storage"
+	"github.com/google/uuid"
 	"google.golang.org/api/iterator"
 	"google.golang.org/api/option"
 
@@ -149,10 +150,14 @@ func (b *Backend) Create(ctx context.Context, path string) (shstorage.Writer, er
 	}
 	writeCtx, cancel := context.WithCancel(ctx)
 	temp := bucketHandle.Object(tempObject)
+	writeID := uuid.NewString()
+	inner := temp.If(storage.Conditions{DoesNotExist: true}).NewWriter(writeCtx)
+	setObjectWriterMetadata(inner, map[string]string{"shoal-write-id": writeID})
 	return &writer{
 		ctx:                ctx,
 		cancel:             cancel,
-		inner:              temp.If(storage.Conditions{DoesNotExist: true}).NewWriter(writeCtx),
+		inner:              inner,
+		writeID:            writeID,
 		target:             target,
 		targetPath:         "gs://" + bucket + "/" + object,
 		targetConditions:   targetConditions,
@@ -237,12 +242,11 @@ func nextTemporaryObjectName(object string) (string, error) {
 		return "", fmt.Errorf("temporary object token material too short")
 	}
 	component := temporaryObjectComponent(hashHex, token)
-	available := min(maxObjectNameBytes-len(prefix), maxObjectSegmentBytes)
-	if available < 1 {
-		return "", fmt.Errorf("object prefix %q leaves no room for a temporary object", prefix)
+	if len(component) > maxObjectSegmentBytes {
+		return "", fmt.Errorf("temporary object component exceeds segment limit")
 	}
-	if len(component) > available {
-		component = component[:available]
+	if len(prefix)+len(component) > maxObjectNameBytes {
+		return "", fmt.Errorf("object prefix %q leaves no room for a temporary object", prefix)
 	}
 	return prefix + component, nil
 }
@@ -255,7 +259,12 @@ func tempObjectParentPrefix(object string) string {
 }
 
 func temporaryObjectPrefixFor(object string) string {
-	return tempObjectParentPrefix(object)
+	prefix := tempObjectParentPrefix(object)
+	for prefix != "" && maxObjectNameBytes-len(prefix) < tempObjectComponentLen {
+		trimmed := strings.TrimSuffix(prefix, "/")
+		prefix = tempObjectParentPrefix(trimmed)
+	}
+	return prefix
 }
 
 func temporaryObjectComponent(hash, token string) string {
@@ -267,8 +276,33 @@ func isTemporaryObjectName(object string) bool {
 	if idx := strings.LastIndexByte(name, '/'); idx >= 0 {
 		name = name[idx+1:]
 	}
-	return strings.HasPrefix(name, legacyTempObjectPrefix) ||
-		strings.HasPrefix(name, tempObjectPrefix)
+	return isLegacyTemporaryObjectName(name) || isGeneratedTemporaryObjectComponent(name)
+}
+
+func isLegacyTemporaryObjectName(name string) bool {
+	idx := strings.LastIndex(name, legacyTempObjectPrefix)
+	if idx <= 0 {
+		return false
+	}
+	_, err := uuid.Parse(name[idx+len(legacyTempObjectPrefix):])
+	return err == nil
+}
+
+func isGeneratedTemporaryObjectComponent(name string) bool {
+	if len(name) != tempObjectComponentLen || !strings.HasPrefix(name, tempObjectPrefix) {
+		return false
+	}
+	token := name[len(tempObjectPrefix) : len(tempObjectPrefix)+tempObjectRandomHexLen]
+	hash := name[len(tempObjectPrefix)+tempObjectRandomHexLen:]
+	return isLowerHex(token) && isLowerHex(hash)
+}
+
+func isLowerHex(value string) bool {
+	if value == "" {
+		return false
+	}
+	decoded, err := hex.DecodeString(value)
+	return err == nil && len(decoded)*2 == len(value)
 }
 
 // file is the GCS File implementation. Each ReadAt opens a fresh
@@ -332,10 +366,15 @@ type objectWriter interface {
 	Attrs() *storage.ObjectAttrs
 }
 
+type metadataSetter interface {
+	SetMetadata(map[string]string)
+}
+
 type writer struct {
 	ctx                context.Context
 	cancel             context.CancelFunc
 	inner              objectWriter
+	writeID            string
 	target             objectHandle
 	targetPath         string
 	targetConditions   storage.Conditions
@@ -365,26 +404,26 @@ func (w *writer) Close() error {
 		return fmt.Errorf("gcs: writer already aborted")
 	}
 	if w.closed {
+		w.cleanupTempObjectBestEffort()
 		return nil
 	}
 	if !w.tempClosed {
 		w.tempClosed = true
 		err := w.inner.Close()
-		if attrs := w.inner.Attrs(); attrs != nil && attrs.Generation != 0 {
-			w.tempGeneration = attrs.Generation
-			w.tempAttrs = attrs
-		}
+		verifyErr := w.verifyTempObject()
 		if err != nil {
 			w.stopWriter()
 			return errors.Join(
 				fmt.Errorf("gcs: close temporary object %s: %w", w.tempPath, err),
+				verifyErr,
 				w.cleanupTempObject(),
 			)
 		}
-		if w.tempAttrs == nil || w.tempGeneration == 0 {
+		if verifyErr != nil {
 			w.stopWriter()
 			return errors.Join(
-				fmt.Errorf("gcs: close temporary object %s: missing generation after successful close", w.tempPath),
+				fmt.Errorf("gcs: close temporary object %s: missing verified staged object", w.tempPath),
+				verifyErr,
 				w.cleanupTempObject(),
 			)
 		}
@@ -525,11 +564,47 @@ func contextOrBackground(ctx context.Context) context.Context {
 	return ctx
 }
 
+func setObjectWriterMetadata(writer objectWriter, metadata map[string]string) {
+	if writer == nil || len(metadata) == 0 {
+		return
+	}
+	clone := make(map[string]string, len(metadata))
+	for key, value := range metadata {
+		clone[key] = value
+	}
+	if setter, ok := writer.(metadataSetter); ok {
+		setter.SetMetadata(clone)
+		return
+	}
+	if storageWriter, ok := any(writer).(*storage.Writer); ok {
+		storageWriter.Metadata = clone
+	}
+}
+
 func (w *writer) stopWriter() {
 	if w.cancel != nil {
 		w.cancel()
 		w.cancel = nil
 	}
+}
+
+func (w *writer) verifyTempObject() error {
+	verifyCtx, cancel := context.WithTimeout(context.Background(), w.tempCleanupTimeout)
+	defer cancel()
+
+	attrs, err := w.temp.Attrs(verifyCtx)
+	if err != nil {
+		return fmt.Errorf("gcs: verify temporary object %s: %w", w.tempPath, err)
+	}
+	if attrs.Generation == 0 {
+		return fmt.Errorf("gcs: verify temporary object %s: missing generation", w.tempPath)
+	}
+	if attrs.Metadata["shoal-write-id"] != w.writeID {
+		return fmt.Errorf("gcs: verify temporary object %s: mismatched shoal-write-id", w.tempPath)
+	}
+	w.tempGeneration = attrs.Generation
+	w.tempAttrs = attrs
+	return nil
 }
 
 func (w *writer) promoteTempObject() error {
@@ -574,6 +649,8 @@ func (w *writer) cleanupTempObject() error {
 	if err := w.tempForCleanup().Delete(cleanupCtx); err != nil && !errors.Is(err, storage.ErrObjectNotExist) {
 		return fmt.Errorf("gcs: remove temporary object %s: %w", w.tempPath, err)
 	}
+	w.tempGeneration = 0
+	w.tempAttrs = nil
 	return nil
 }
 
