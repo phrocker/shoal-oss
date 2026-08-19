@@ -289,7 +289,7 @@ importable and both are used by the pinned tests and examples.
 
 | ID | Sharkbite | Shoal Go | Shoal C ABI | Evidence | Status | Notes |
 | --- | --- | --- | --- | --- | --- | --- |
-| SB-CFG-001 | `Configuration()` (`pysharkbite.cpp:57-58`) | `accumulo.ConnectorOptions{}` struct (`accumulo/config.go:30`) | `shoal_connector_config` + `shoal_connector_config_init` (`capi/include/shoal.h`) | `TestNewConnectorCanDisablePooling` (`accumulo/connector_test.go:51`); `main()` in `capi/tests/lifecycle.c` | Behavior mismatch | Sharkbite is an untyped string bag; Shoal is a typed struct. Shim must accept arbitrary keys and either map or reject them explicitly — silently dropping keys such as `FILE_SYSTEM_ROOT` changes behavior. |
+| SB-CFG-001 | `Configuration()` (`pysharkbite.cpp:57-58`) | `accumulo.NewConfiguration()` (`accumulo/configuration.go:23`), carried into an instance through `ZooKeeperConfig.Configuration` (`accumulo/config.go:33`) | — | `TestConfigurationGetAndSet`, `TestConfigurationKeysLenAndClone` (`accumulo/configuration_test.go`); `TestInstanceZooKeepersRootAndConfiguration` (`accumulo/topology_test.go`) | Missing C ABI | Constructs the same untyped string bag Sharkbite constructs, so arbitrary keys such as `FILE_SYSTEM_ROOT` are accepted and readable rather than silently dropped. Transport wiring stays in the typed `ConnectorOptions` struct (`accumulo/config.go:30`), which is Shoal's own surface and is mapped by [SB-CFG-017](#sec-6); no ABI entry point exports the configuration bag yet. |
 | SB-CFG-002 | `Configuration.set(key, value)` (`pysharkbite.cpp:59`) | `Configuration.Set(name, value string)` (`accumulo/configuration.go:28`) | — | `TestConfigurationGetAndSet`, `TestConfigurationGetUint32`, `TestConfigurationKeysLenAndClone`, `TestConfigurationNilReceiverIsSafe`, `TestConfigurationConcurrentUse` (`accumulo/configuration_test.go`) | Missing C ABI | Last write wins, exactly as Sharkbite's ``configurationMap[name] = value``. Safe for concurrent use, which the C++ map is not. Reachable from Go through `ZooKeeperConfig.Configuration` (`accumulo/config.go:33`); no C ABI entry point exports it yet. |
 | SB-CFG-003 | `Configuration.get(key)` (`pysharkbite.cpp:60`) | `Configuration.Get(name string) string` (`accumulo/configuration.go:43`) | — | `TestConfigurationGetAndSet`, `TestConfigurationGetUint32`, `TestConfigurationKeysLenAndClone`, `TestConfigurationNilReceiverIsSafe`, `TestConfigurationConcurrentUse` (`accumulo/configuration_test.go`) | Missing C ABI | Returns the empty string for an unset name, matching Sharkbite's `get(name)`, which delegates to `get(name, "")`. `Configuration.Lookup` (`accumulo/configuration.go:61`) is the Go-idiomatic form that distinguishes unset from set-to-empty, which Sharkbite cannot express. |
 | SB-CFG-004 | `Configuration.get(key, default)` (`pysharkbite.cpp:61`) | `Configuration.GetOr(name, def string) string` (`accumulo/configuration.go:50`) | — | `TestConfigurationGetAndSet`, `TestConfigurationGetUint32`, `TestConfigurationKeysLenAndClone`, `TestConfigurationNilReceiverIsSafe`, `TestConfigurationConcurrentUse` (`accumulo/configuration_test.go`) | Missing C ABI | Returns `def` only when the name is unset; a name set to the empty string returns the empty string, matching the C++ map lookup. |
@@ -4265,7 +4265,6 @@ entry is either closed or reclassified in [§26](#sec-26).
 | SB-GAP-GO-010 | Logging control | SB-LOG-001…SB-LOG-003 | none | Needs a public, process-global switch. |
 | SB-GAP-GO-011 | Range predicates (`after_end_key`, `before_start_key`) and `Range.__str__` | SB-DATA-031…SB-DATA-033 | none | Logic exists unexported in `accumulo/range.go` and `internal/iterrt`. |
 | SB-GAP-GO-012 | Authorizations as a first-class validated type | SB-DATA-047…SB-DATA-052 | none | Includes character validation (SB-KEEP-016) and `contains`. |
-| SB-GAP-GO-013 | Configuration key/value bag | SB-CFG-002…SB-CFG-005 | none | Must at minimum accept and honor or explicitly reject `FILE_SYSTEM_ROOT`. |
 | SB-GAP-GO-014 | Writer buffered-size accessor | SB-WRITE-006 | none | |
 | SB-GAP-GO-015 | Live-cluster conformance harness | SB-XCUT-015, SB-CPP-010, SB-CPP-013 | [#74](https://github.com/phrocker/shoal-oss/issues/74) (conformance release gates) | Delivery vehicle for [§24](#sec-24). |
 
@@ -4283,6 +4282,7 @@ entry is either closed or reclassified in [§26](#sec-26).
 | SB-GAP-C-008 | Range and key accessors on the ABI | SB-DATA-025…SB-DATA-030 | none | Needed so the shim can round-trip `Range` objects without shadow state. |
 | SB-GAP-C-009 | Iterator-setting accessors | SB-DATA-057…SB-DATA-059 | none | |
 | SB-GAP-C-010 | Windows and macOS artifact verification | SB-XCUT-014, SB-PKG-008 | none | `make capi` is not exercised by CI on any platform. |
+| SB-GAP-C-011 | Client configuration and instance topology on the ABI | SB-CFG-001…SB-CFG-005, SB-CFG-024, SB-CFG-029…SB-CFG-032, SB-CFG-035, SB-CFG-036 | [#104](https://github.com/phrocker/shoal-oss/issues/104)/PR [#105](https://github.com/phrocker/shoal-oss/pull/105) delivered the Go surface | Stage 1 is done for these rows: `Configuration` and the `Instance` topology accessors exist and are tested in Go, so the only remaining work is exporting them through `capi/include/shoal.h`. The bag is untyped, so the ABI needs string-in/string-out entry points plus an owned list type for `ManagerLocations` and `Servers`. |
 
 ### 23.3 Stage 3 — Compatibility tests (blocked by Stages 1 and 2)
 
@@ -4414,8 +4414,8 @@ Sharkbite's `test/19x/st` SMAC project played), driven from CI, with the ported
 | --- | --- |
 | Covered | 0 |
 | Missing Go | 2436 |
-| Missing C ABI | 127 |
-| Behavior mismatch | 161 |
+| Missing C ABI | 128 |
+| Behavior mismatch | 160 |
 | Intentional divergence (approval required) | 87 |
 | Not required (rationale required) | 392 |
 | **Total** | **3203** |
@@ -4434,7 +4434,7 @@ every non-vendored header maps to exactly one row, proved arithmetically in
 | Section | Prefix | Rows | Covered | Missing Go | Missing C ABI | Behavior mismatch | Intentional divergence | Not required |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | [§5](#sec-5) Packaging and imports | `SB-PKG` | 14 | 0 | 0 | 10 | 1 | 1 | 2 |
-| [§6](#sec-6) Configuration and credentials | `SB-CFG` | 36 | 0 | 0 | 19 | 9 | 2 | 6 |
+| [§6](#sec-6) Configuration and credentials | `SB-CFG` | 36 | 0 | 0 | 20 | 8 | 2 | 6 |
 | [§7](#sec-7) Connector and session | `SB-CONN` | 13 | 0 | 3 | 2 | 7 | 1 | 0 |
 | [§8](#sec-8) Data model | `SB-DATA` | 75 | 0 | 15 | 15 | 39 | 0 | 6 |
 | [§9](#sec-9) Scanners and results | `SB-SCAN` | 28 | 0 | 8 | 4 | 11 | 0 | 5 |
@@ -4454,7 +4454,7 @@ every non-vendored header maps to exactly one row, proved arithmetically in
 | [§19.2](#sec-19-2) C++ complete member enumeration | `SB-CXX` | 2626 | 0 | 2307 | 0 | 15 | 0 | 304 |
 | [§19.4](#sec-19-4) Dead embedded-module surface | `SB-EMB` | 35 | 0 | 0 | 0 | 0 | 0 | 35 |
 | [§20](#sec-20) Cross-cutting | `SB-XCUT` | 19 | 0 | 1 | 4 | 14 | 0 | 0 |
-| **Total** | | **3203** | **0** | **2436** | **127** | **161** | **87** | **392** |
+| **Total** | | **3203** | **0** | **2436** | **128** | **160** | **87** | **392** |
 
 ### 25.3 Reading the counts
 
@@ -4473,15 +4473,15 @@ on. The Python-visible subset is far smaller, which is why [§5](#sec-5)–
 [§19.2](#sec-19-2) rows carry a per-area rationale rather than an implied
 promise to port all of it.
 
-`Behavior mismatch` (161) is the bucket that sets the schedule: 146 rows on the
+`Behavior mismatch` (160) is the bucket that sets the schedule: 145 rows on the
 Python-visible and curated C++ surface each need a differential test against a
 live cluster or the exported ABI, and 15 are destructors of classes bound into
 Python, where the destruction point is user-observable and the model differs
 from Go finalisation ([§19.1](#sec-19-1)). `Intentional divergence` (87) is
 dominated by one upstream fact: 82 rows are cluster-status accessors Accumulo
-itself deleted ([§14](#sec-14), [SB-DIV-016](#sec-26)). `Missing C ABI` (127)
+itself deleted ([§14](#sec-14), [SB-DIV-016](#sec-26)). `Missing C ABI` (128)
 is concentrated in the Python layers — pandas (20), high-level helpers (18),
-PyTorch (9). Revision 17 added the 11 client-configuration and instance-
+PyTorch (9). Revision 17 added the 12 client-configuration and instance-
 topology rows of [§6](#sec-6) to that bucket: they are implemented and tested
 on the Go layer and wait only on an ABI entry point.
 
@@ -4491,8 +4491,8 @@ on the Go layer and wait only on an ABI entry point.
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | Covered | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
 | Missing Go | 2451 | 2454 | 2448 | 2448 | 2447 | 2447 | 2436 | −11 |
-| Missing C ABI | 116 | 116 | 116 | 116 | 116 | 116 | 127 | +11 |
-| Behavior mismatch | 161 | 161 | 161 | 161 | 161 | 161 | 161 | 0 |
+| Missing C ABI | 116 | 116 | 116 | 116 | 116 | 116 | 128 | +12 |
+| Behavior mismatch | 161 | 161 | 161 | 161 | 161 | 161 | 160 | −1 |
 | Intentional divergence | 87 | 87 | 87 | 87 | 87 | 87 | 87 | 0 |
 | Not required | 356 | 356 | 356 | 356 | 392 | 392 | 392 | 0 |
 | **Total** | **3171** | **3174** | **3168** | **3168** | **3203** | **3203** | **3203** | **0** |
@@ -4501,7 +4501,9 @@ Revision 17 is the first revision driven by implementation rather than by an
 audit. Shoal grew the complete Go surface for Sharkbite's client
 `Configuration` and for the instance topology accessors of its `Instance` base
 class, so the 11 rows in [§6](#sec-6) that had no Go implementation moved from
-`Missing Go` to `Missing C ABI` under rule 2 of [§4.2](#sec-4): the capability now exists and
+`Missing Go` to `Missing C ABI` under rule 2 of [§4.2](#sec-4), and the
+constructor row [SB-CFG-001](#sec-6) moved from `Behavior mismatch` to the same
+bucket because `NewConfiguration` now builds the untyped bag Sharkbite builds: the capability now exists and
 is tested in Go, and only an ABI entry point is missing. The row population is
 unchanged, no row became `Covered`, and no other section moved.
 

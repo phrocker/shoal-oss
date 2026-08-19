@@ -247,6 +247,40 @@ func usableServiceAddress(descriptors []serviceDescriptor, service string) (stri
 	return "", false
 }
 
+// currentServiceLock returns the ServiceLockData published by the lock holder
+// of serverPath: the lowest-sequence lock node that still exists. Lock nodes
+// that vanish between listing the children and reading them are skipped, so a
+// lock handoff that happens mid-scan promotes the next surviving candidate
+// instead of dropping the server, exactly as managerAddresses resolves its
+// holder. Reports ok=false when no lock node survives, which means the server
+// currently holds no lock at all.
+func currentServiceLock(
+	ctx context.Context,
+	locator LockReader,
+	serverPath string,
+	children []string,
+) (serviceLockData, bool, error) {
+	for _, lockNode := range sortedLockNodes(children) {
+		if err := ctx.Err(); err != nil {
+			return serviceLockData{}, false, err
+		}
+		lockNodePath := path.Join(serverPath, lockNode)
+		data, err := locator.GetRaw(ctx, lockNodePath)
+		if errors.Is(err, gozk.ErrNoNode) {
+			continue
+		}
+		if err != nil {
+			return serviceLockData{}, false, fmt.Errorf("get client service lock %s: %w", lockNodePath, err)
+		}
+		var lock serviceLockData
+		if err := json.Unmarshal(data, &lock); err != nil {
+			return serviceLockData{}, false, fmt.Errorf("decode client service lock %s: %w", lockNodePath, err)
+		}
+		return lock, true, nil
+	}
+	return serviceLockData{}, false, nil
+}
+
 // ServerKind names the Accumulo 4 server role that published a
 // ClientService endpoint.
 type ServerKind string
@@ -342,21 +376,12 @@ func clientServices(ctx context.Context, locator LockReader) ([]ClientService, e
 				if err != nil {
 					return nil, fmt.Errorf("list client service locks %s: %w", serverPath, err)
 				}
-				lockNode := firstLockNode(children)
-				if lockNode == "" {
-					continue
-				}
-				lockNodePath := path.Join(serverPath, lockNode)
-				data, err := locator.GetRaw(ctx, lockNodePath)
-				if errors.Is(err, gozk.ErrNoNode) {
-					continue
-				}
+				lock, held, err := currentServiceLock(ctx, locator, serverPath, children)
 				if err != nil {
-					return nil, fmt.Errorf("get client service lock %s: %w", lockNodePath, err)
+					return nil, err
 				}
-				var lock serviceLockData
-				if err := json.Unmarshal(data, &lock); err != nil {
-					return nil, fmt.Errorf("decode client service lock %s: %w", lockNodePath, err)
+				if !held {
+					continue
 				}
 				for _, descriptor := range lock.Descriptors {
 					if descriptor.Service != "CLIENT" ||
@@ -446,21 +471,12 @@ func clientServiceAddresses(ctx context.Context, locator LockReader) ([]string, 
 				if err != nil {
 					return nil, fmt.Errorf("list client service locks %s: %w", serverPath, err)
 				}
-				lockNode := firstLockNode(children)
-				if lockNode == "" {
-					continue
-				}
-				lockNodePath := path.Join(serverPath, lockNode)
-				data, err := locator.GetRaw(ctx, lockNodePath)
-				if errors.Is(err, gozk.ErrNoNode) {
-					continue
-				}
+				lock, held, err := currentServiceLock(ctx, locator, serverPath, children)
 				if err != nil {
-					return nil, fmt.Errorf("get client service lock %s: %w", lockNodePath, err)
+					return nil, err
 				}
-				var lock serviceLockData
-				if err := json.Unmarshal(data, &lock); err != nil {
-					return nil, fmt.Errorf("decode client service lock %s: %w", lockNodePath, err)
+				if !held {
+					continue
 				}
 				for _, descriptor := range lock.Descriptors {
 					if descriptor.Service != "CLIENT" ||

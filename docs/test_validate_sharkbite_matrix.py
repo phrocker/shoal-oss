@@ -632,8 +632,8 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
             {
                 "Covered": 0,
                 "Missing Go": 2436,
-                "Missing C ABI": 127,
-                "Behavior mismatch": 161,
+                "Missing C ABI": 128,
+                "Behavior mismatch": 160,
                 validator.INTENTIONAL_DIVERGENCE_STATUS: 87,
                 validator.NOT_REQUIRED_STATUS: 392,
             },

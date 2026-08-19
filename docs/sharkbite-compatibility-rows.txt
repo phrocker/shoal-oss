@@ -23,7 +23,7 @@ SB-PKG-011 Missing C ABI
 SB-PKG-012 Missing C ABI
 SB-PKG-013 Missing C ABI
 SB-PKG-014 Intentional divergence (approval required)
-SB-CFG-001 Behavior mismatch
+SB-CFG-001 Missing C ABI
 SB-CFG-002 Missing C ABI
 SB-CFG-003 Missing C ABI
 SB-CFG-004 Missing C ABI

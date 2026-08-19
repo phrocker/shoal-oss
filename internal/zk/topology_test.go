@@ -694,3 +694,79 @@ func (c *blockingGetConn) Children(string) ([]string, *gozk.Stat, error) {
 func (c *blockingGetConn) Close() {
 	c.once.Do(func() { close(c.closed) })
 }
+
+func TestClientServicesPromotesNextSurvivingServerLock(t *testing.T) {
+	root := "/accumulo/uuid-1"
+	serverPath := path.Join(root, "tservers", "default", "tserver-a:9997")
+	locator := &topologyLocator{
+		children: map[string][]string{
+			path.Join(root, "tservers"):            {"default"},
+			path.Join(root, "tservers", "default"): {"tserver-a:9997"},
+			// Both lock nodes are listed, but the lowest-sequence node is
+			// released before it can be read: the server handed its lock to
+			// the next candidate between the Children call and the read.
+			serverPath: {lockNode("0000000001"), lockNode("0000000002")},
+		},
+		data: map[string][]byte{
+			path.Join(serverPath, lockNode("0000000002")): clientLockData("tserver-a:9997"),
+		},
+	}
+
+	services, err := ClientServices(context.Background(), locator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := ClientService{Kind: TabletServerKind, Group: "default", Address: "tserver-a:9997"}
+	if len(services) != 1 || services[0] != want {
+		t.Fatalf("services = %+v, want [%+v]; a lock handoff must not drop the server", services, want)
+	}
+
+	addresses, err := ClientServiceAddresses(context.Background(), locator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(addresses) != 1 || addresses[0] != "tserver-a:9997" {
+		t.Fatalf("addresses = %v, want [tserver-a:9997]", addresses)
+	}
+}
+
+func TestClientServicesUsesOnlyTheSurvivingHolderLock(t *testing.T) {
+	root := "/accumulo/uuid-1"
+	serverPath := path.Join(root, "tservers", "default", "tserver-a:9997")
+	locator := &topologyLocator{
+		children: map[string][]string{
+			path.Join(root, "tservers"):            {"default"},
+			path.Join(root, "tservers", "default"): {"tserver-a:9997"},
+			serverPath:                             {lockNode("0000000001"), lockNode("0000000002")},
+		},
+		data: map[string][]byte{
+			// The holder is authoritative: the queued candidate's stale
+			// address must never be reported alongside it.
+			path.Join(serverPath, lockNode("0000000001")): clientLockData("tserver-a:9997"),
+			path.Join(serverPath, lockNode("0000000002")): clientLockData("stale:9997"),
+		},
+	}
+	services, err := ClientServices(context.Background(), locator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(services) != 1 || services[0].Address != "tserver-a:9997" {
+		t.Fatalf("services = %+v, want only the holder's address", services)
+	}
+}
+
+func TestClientServicesSkipsServerWithNoSurvivingLock(t *testing.T) {
+	root := "/accumulo/uuid-1"
+	serverPath := path.Join(root, "tservers", "default", "tserver-a:9997")
+	locator := &topologyLocator{
+		children: map[string][]string{
+			path.Join(root, "tservers"):            {"default"},
+			path.Join(root, "tservers", "default"): {"tserver-a:9997"},
+			serverPath:                             {lockNode("0000000001"), lockNode("0000000002")},
+		},
+		data: map[string][]byte{},
+	}
+	if _, err := ClientServices(context.Background(), locator); !errors.Is(err, ErrClientServiceUnavailable) {
+		t.Fatalf("error = %v, want ErrClientServiceUnavailable", err)
+	}
+}

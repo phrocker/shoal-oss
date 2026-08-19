@@ -59,8 +59,8 @@ def status_count_map(
 EXPECTED_STATUS_COUNTS = {
     "Covered": 0,
     "Missing Go": 2436,
-    "Missing C ABI": 127,
-    "Behavior mismatch": 161,
+    "Missing C ABI": 128,
+    "Behavior mismatch": 160,
     "Intentional divergence (approval required)": 87,
     "Not required (rationale required)": 392,
 }
@@ -68,8 +68,8 @@ EXPECTED_STATUS_COUNTS = {
 EXPECTED_PREFIX_COUNTS = {
     "SB-BASE": status_count_map(missing_c_abi=18, not_required=2),
     "SB-CFG": status_count_map(
-        missing_c_abi=19,
-        behavior_mismatch=9,
+        missing_c_abi=20,
+        behavior_mismatch=8,
         intentional_divergence=2,
         not_required=6,
     ),
