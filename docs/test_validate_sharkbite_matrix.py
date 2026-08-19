@@ -457,7 +457,9 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
     def test_row_manifest_provenance_rejects_stale_revision_header(self) -> None:
         manifest_lines = validator.EXPECTED_ROW_MANIFEST.read_text(encoding="utf-8").splitlines()
         mutated = list(manifest_lines)
-        mutated[0] = mutated[0].replace("Revision-25", "Revision-18")
+        mutated[0] = mutated[0].replace(
+            f"Revision-{validator.EXPECTED_REVISION}", "Revision-18"
+        )
         self.assert_validation_fails(
             lambda: validator.validate_expected_row_manifest_provenance(
                 mutated, source=validator.EXPECTED_ROW_MANIFEST.name
@@ -726,16 +728,16 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
         self.assertEqual(
             validator.EXPECTED_STATUS_COUNTS,
             {
-                "Covered": 13,
-                "Missing Go": 2361,
-                "Missing C ABI": 129,
-                "Behavior mismatch": 221,
+                "Covered": 44,
+                "Missing Go": 2364,
+                "Missing C ABI": 94,
+                "Behavior mismatch": 222,
                 validator.INTENTIONAL_DIVERGENCE_STATUS: 87,
                 validator.NOT_REQUIRED_STATUS: 392,
             },
         )
-        self.assertEqual(validator.EXPECTED_C_ABI_DECLARED_EXPORTS, 142)
-        self.assertEqual(validator.EXPECTED_C_ABI_REFERENCED_EXPORTS, 137)
+        self.assertEqual(validator.EXPECTED_C_ABI_DECLARED_EXPORTS, 170)
+        self.assertEqual(validator.EXPECTED_C_ABI_REFERENCED_EXPORTS, 165)
         self.assertEqual(
             validator.EXPECTED_C_ABI_UNREFERENCED_EXPORTS,
             (
@@ -758,15 +760,19 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
         self.assertIn("shoal_range_create", referenced)
         self.assertIn("shoal_iterator_setting_get", referenced)
         self.assertIn("shoal_mutation_delete", referenced)
+        self.assertIn("shoal_rfile_reader_open_many", referenced)
+        self.assertIn("shoal_rfile_entry_result_get", referenced)
 
     def test_collect_c_abi_free_function_inventory_matches_header(self) -> None:
         free_functions = validator.collect_c_abi_free_function_inventory()
-        self.assertEqual(len(free_functions), 21)
+        self.assertEqual(len(free_functions), 25)
         self.assertIn("shoal_versioned_properties_free", free_functions)
         self.assertIn("shoal_bytes_list_free", free_functions)
         self.assertIn("shoal_connector_identity_free", free_functions)
         self.assertIn("shoal_range_free", free_functions)
         self.assertIn("shoal_iterator_setting_free", free_functions)
+        self.assertIn("shoal_rfile_writer_free", free_functions)
+        self.assertIn("shoal_rfile_entry_result_free", free_functions)
 
     def test_compiled_c_abi_reference_inventory_ignores_non_linking_mentions(self) -> None:
         references = validator.compiled_c_abi_reference_inventory(
@@ -784,7 +790,7 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
 
     def test_stale_typed_free_inventory_narrative_is_rejected(self) -> None:
         text = load_document_text()
-        mutated = text.replace("21 typed free functions", "8 typed free functions", 1)
+        mutated = text.replace("25 typed free functions", "8 typed free functions", 1)
         self.assertNotEqual(mutated, text)
         self.assert_validation_fails(
             lambda: validator.validate_counts(mutated.splitlines(), mutated),
@@ -866,23 +872,23 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
             lambda: validator.validate_revision_inventory(
                 row_ids, reclassified, prefix_counts
             ),
-            f"revision {validator.EXPECTED_REVISION} inventory expects 13 rows for Covered, found 14",
+            f"revision {validator.EXPECTED_REVISION} inventory expects 44 rows for Covered, found 45",
         )
 
     def test_declared_count_edit_still_fails_internal_cross_check(self) -> None:
         text = load_document_text()
         mutated = replace_pattern_once(
-            text, re.escape("| Missing Go | 2361 |"), "| Missing Go | 2360 |"
+            text, re.escape("| Missing Go | 2364 |"), "| Missing Go | 2363 |"
         )
         self.assert_validation_fails(
             lambda: validator.validate_counts(mutated.splitlines(), mutated),
-            "status summary says 2360 rows for Missing Go, but parsed 2361",
+            "status summary says 2363 rows for Missing Go, but parsed 2364",
         )
 
     def test_stale_c_abi_symbol_inventory_narrative_is_rejected(self) -> None:
         text = load_document_text()
         mutated = text.replace(
-            "applied to 142 declared exports in `capi/include/shoal.h`",
+            "applied to 170 declared exports in `capi/include/shoal.h`",
             "applied to 44 declared exports in `capi/include/shoal.h`",
             1,
         )
@@ -895,7 +901,7 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
     def test_revision_bump_requires_validator_constant_update(self) -> None:
         text = load_document_text()
         mutated = text.replace(
-            f"Revision {validator.EXPECTED_REVISION} — records constraint administration and row-bounded flush",
+            f"Revision {validator.EXPECTED_REVISION} — completes the 31-row RFile and stream C ABI",
             f"Revision {validator.EXPECTED_REVISION + 1} — adds the next audited ABI slice",
         ).replace(
             f"As of revision {validator.EXPECTED_REVISION} that is",
@@ -904,7 +910,7 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
         self.assertNotEqual(mutated, text)
         self.assert_validation_fails(
             lambda: validator.validate_counts(mutated.splitlines(), mutated),
-            f"document status is missing expected detail: Revision {validator.EXPECTED_REVISION} — records constraint administration and row-bounded flush",
+            f"document status is missing expected detail: Revision {validator.EXPECTED_REVISION} — completes the 31-row RFile and stream C ABI",
         )
 
     # ---- matrix table separators -------------------------------------------

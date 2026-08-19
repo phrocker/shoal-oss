@@ -115,6 +115,7 @@ int main(int argc, char **argv) {
   assert(has_capability(SHOAL_ABI_CAPABILITY_CONNECTOR_IDENTITY) == 1);
   assert(has_capability(SHOAL_ABI_CAPABILITY_DATA_DESCRIPTORS) == 1);
   assert(has_capability(SHOAL_ABI_CAPABILITY_CONFIGURATION_TOPOLOGY) == 1);
+  assert(has_capability(SHOAL_ABI_CAPABILITY_RFILE) == 1);
   assert(has_capability(SHOAL_ABI_CAPABILITY_COUNT) == 0);
   assert(has_capability(63u) == 0);
   assert(has_capability(64u) == 0);

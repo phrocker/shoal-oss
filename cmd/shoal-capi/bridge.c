@@ -103,25 +103,49 @@ void shoal_bridge_batch_writer_free(shoal_batch_writer *writer) {
 }
 
 shoal_configuration *shoal_bridge_configuration_alloc(uint64_t id) {
-    shoal_configuration *configuration =
-        (shoal_configuration *)malloc(sizeof(*configuration));
-    if (configuration != NULL) {
-      configuration->id = id;
-    }
-    return configuration;
+  shoal_configuration *configuration =
+      (shoal_configuration *)malloc(sizeof(*configuration));
+  if (configuration != NULL) {
+    configuration->id = id;
   }
+  return configuration;
+}
 
-  uint64_t
-  shoal_bridge_configuration_id(const shoal_configuration *configuration) {
-    return configuration == NULL ? 0 : configuration->id;
-  }
+uint64_t
+shoal_bridge_configuration_id(const shoal_configuration *configuration) {
+  return configuration == NULL ? 0 : configuration->id;
+}
 
-  void shoal_bridge_configuration_free(shoal_configuration *configuration) {
-    if (configuration != NULL) {
-      configuration->id = 0;
-      free(configuration);
+void shoal_bridge_configuration_free(shoal_configuration *configuration) {
+  if (configuration != NULL) {
+    configuration->id = 0;
+    free(configuration);
   }
 }
+
+#define SHOAL_BRIDGE_DEFINE_HANDLE(name, type)                               \
+    type *shoal_bridge_##name##_alloc(uint64_t id) {                           \
+      type *value = (type *)malloc(sizeof(*value));                            \
+      if (value != NULL) {                                                     \
+        value->id = id;                                                        \
+      }                                                                        \
+      return value;                                                            \
+    }                                                                          \
+    uint64_t shoal_bridge_##name##_id(const type *value) {                     \
+      return value == NULL ? 0 : value->id;                                    \
+    }                                                                          \
+    void shoal_bridge_##name##_free(type *value) {                             \
+      if (value != NULL) {                                                     \
+        value->id = 0;                                                         \
+        free(value);                                                           \
+      }                                                                        \
+    }
+
+SHOAL_BRIDGE_DEFINE_HANDLE(rfile_reader, shoal_rfile_reader)
+SHOAL_BRIDGE_DEFINE_HANDLE(rfile_writer, shoal_rfile_writer)
+SHOAL_BRIDGE_DEFINE_HANDLE(rfile_seekable, shoal_rfile_seekable)
+
+#undef SHOAL_BRIDGE_DEFINE_HANDLE
 
 #ifdef SHOAL_CAPI_TEST
 static _Atomic size_t shoal_bridge_string_alloc_fail_after = SIZE_MAX;
@@ -573,6 +597,66 @@ static int shoal_bridge_key_entry_set(
   shoal_bridge_scan_entry_clear(entry);
   *entry = next;
   return 1;
+}
+
+shoal_rfile_entry_result *shoal_bridge_rfile_entry_alloc(
+    const uint8_t *row, size_t row_length, const uint8_t *column_family,
+    size_t column_family_length, const uint8_t *column_qualifier,
+    size_t column_qualifier_length, const uint8_t *column_visibility,
+    size_t column_visibility_length, int64_t timestamp, const uint8_t *value,
+    size_t value_length, uint8_t deleted) {
+  shoal_rfile_entry_result *result =
+      (shoal_rfile_entry_result *)shoal_bridge_result_calloc(1, sizeof(*result));
+  if (result == NULL) {
+    return NULL;
+  }
+  if (!shoal_bridge_key_entry_set(
+          &result->entry, row, row_length, column_family, column_family_length,
+          column_qualifier, column_qualifier_length, column_visibility,
+          column_visibility_length, timestamp, 1)) {
+    free(result);
+    return NULL;
+  }
+  result->entry.value = shoal_bridge_result_copy_bytes(value, value_length);
+  if (value_length != 0 && result->entry.value == NULL) {
+    shoal_bridge_scan_entry_clear(&result->entry);
+    free(result);
+    return NULL;
+  }
+  result->entry.value_length = value_length;
+  result->deleted = deleted != 0;
+  return result;
+}
+
+int shoal_bridge_rfile_entry_get(const shoal_rfile_entry_result *result,
+                                 shoal_rfile_entry_view *out_entry) {
+  if (result == NULL || out_entry == NULL) {
+    return 0;
+  }
+  out_entry->key.row.data = result->entry.row;
+  out_entry->key.row.length = result->entry.row_length;
+  out_entry->key.column_family.data = result->entry.column_family;
+  out_entry->key.column_family.length = result->entry.column_family_length;
+  out_entry->key.column_qualifier.data = result->entry.column_qualifier;
+  out_entry->key.column_qualifier.length =
+      result->entry.column_qualifier_length;
+  out_entry->key.column_visibility.data = result->entry.column_visibility;
+  out_entry->key.column_visibility.length =
+      result->entry.column_visibility_length;
+  out_entry->key.timestamp = result->entry.timestamp;
+  out_entry->value.data = result->entry.value;
+  out_entry->value.length = result->entry.value_length;
+  out_entry->deleted = result->deleted;
+  return 1;
+}
+
+void shoal_bridge_rfile_entry_free(shoal_rfile_entry_result *result) {
+  if (result == NULL) {
+    return;
+  }
+  shoal_bridge_scan_entry_clear(&result->entry);
+  result->deleted = 0;
+  free(result);
 }
 
 shoal_scan_result *shoal_bridge_scan_result_alloc(size_t count) {

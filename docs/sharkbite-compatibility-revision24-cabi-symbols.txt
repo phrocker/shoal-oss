@@ -1,7 +1,7 @@
-# Revision-25 compiled C ABI symbol inventory for docs/sharkbite-compatibility.md.
+# Revision-24 compiled C ABI symbol inventory for docs/sharkbite-compatibility.md.
 # Generated from the undefined/imported shoal_* references emitted by compiling the exact C/C++
 # sources that cmd/shoal-capi/cabi_test.go links in TestSharedLibraryCABI.
-# Update only when the independently audited revision-25 compiled inventory changes.
+# Update only when the independently audited revision-24 compiled inventory changes.
 
 [declared]
 shoal_abi_version
@@ -13,34 +13,6 @@ shoal_abi_capability_count
 shoal_abi_capability_word_count
 shoal_abi_capability_word
 shoal_abi_has_capability
-shoal_rfile_writer_config_init
-shoal_rfile_merge_config_init
-shoal_rfile_entry_init
-shoal_rfile_entry_view_init
-shoal_rfile_writer_create
-shoal_rfile_writer_append
-shoal_rfile_writer_entries
-shoal_rfile_writer_close
-shoal_rfile_writer_free
-shoal_rfile_reader_open
-shoal_rfile_reader_open_sequential
-shoal_rfile_reader_open_many
-shoal_rfile_reader_seek
-shoal_rfile_reader_has_top
-shoal_rfile_reader_top
-shoal_rfile_reader_top_key
-shoal_rfile_reader_top_value
-shoal_rfile_reader_next
-shoal_rfile_reader_close
-shoal_rfile_reader_free
-shoal_rfile_seekable_create
-shoal_rfile_seekable_get_range
-shoal_rfile_seekable_column_family_count
-shoal_rfile_seekable_get_column_family
-shoal_rfile_seekable_is_inclusive
-shoal_rfile_seekable_free
-shoal_rfile_entry_result_get
-shoal_rfile_entry_result_free
 shoal_configuration_create
 shoal_configuration_set
 shoal_configuration_get
@@ -283,34 +255,6 @@ shoal_range_free
 shoal_range_get
 shoal_range_init
 shoal_range_view_init
-shoal_rfile_entry_init
-shoal_rfile_entry_result_free
-shoal_rfile_entry_result_get
-shoal_rfile_entry_view_init
-shoal_rfile_merge_config_init
-shoal_rfile_reader_close
-shoal_rfile_reader_free
-shoal_rfile_reader_has_top
-shoal_rfile_reader_next
-shoal_rfile_reader_open
-shoal_rfile_reader_open_many
-shoal_rfile_reader_open_sequential
-shoal_rfile_reader_seek
-shoal_rfile_reader_top
-shoal_rfile_reader_top_key
-shoal_rfile_reader_top_value
-shoal_rfile_seekable_column_family_count
-shoal_rfile_seekable_create
-shoal_rfile_seekable_free
-shoal_rfile_seekable_get_column_family
-shoal_rfile_seekable_get_range
-shoal_rfile_seekable_is_inclusive
-shoal_rfile_writer_append
-shoal_rfile_writer_close
-shoal_rfile_writer_config_init
-shoal_rfile_writer_create
-shoal_rfile_writer_entries
-shoal_rfile_writer_free
 shoal_scan_result_count
 shoal_scan_result_free
 shoal_scan_result_get
