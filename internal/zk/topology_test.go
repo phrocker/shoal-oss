@@ -317,7 +317,7 @@ func TestClientServicesReportsKindGroupAndOrder(t *testing.T) {
 	}
 }
 
-func TestClientServicesOrdersByAdvertisedAddress(t *testing.T) {
+func TestClientServicesOrdersByServerIdentity(t *testing.T) {
 	root := "/accumulo/uuid-1"
 	locator := &topologyLocator{
 		children: map[string][]string{
@@ -327,8 +327,8 @@ func TestClientServicesOrdersByAdvertisedAddress(t *testing.T) {
 			path.Join(root, "tservers", "default", "server-a"): {lockNode("0000000002")},
 		},
 		data: map[string][]byte{
-			path.Join(root, "tservers", "default", "server-b", lockNode("0000000001")): clientLockData("zeta:9997"),
-			path.Join(root, "tservers", "default", "server-a", lockNode("0000000002")): clientLockData("alpha:9997"),
+			path.Join(root, "tservers", "default", "server-b", lockNode("0000000001")): clientLockData("alpha:9997"),
+			path.Join(root, "tservers", "default", "server-a", lockNode("0000000002")): clientLockData("zeta:9997"),
 		},
 	}
 	got, err := ClientServices(context.Background(), locator)
@@ -336,8 +336,8 @@ func TestClientServicesOrdersByAdvertisedAddress(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := []ClientService{
-		{Kind: TabletServerKind, Group: "default", Address: "alpha:9997"},
 		{Kind: TabletServerKind, Group: "default", Address: "zeta:9997"},
+		{Kind: TabletServerKind, Group: "default", Address: "alpha:9997"},
 	}
 	if fmt.Sprint(got) != fmt.Sprint(want) {
 		t.Fatalf("services = %+v, want %+v", got, want)

@@ -397,7 +397,7 @@ func TestStaticInstanceTopology(t *testing.T) {
 }
 
 func TestNoTopologyStub(t *testing.T) {
-	stub := &NoTopology{}
+	stub := NewNoTopology()
 	if _, err := stub.RootTabletLocation(context.Background()); !errors.Is(err, ErrDiscoveryUnavailable) {
 		t.Fatalf("RootTabletLocation error = %v", err)
 	}
@@ -419,7 +419,7 @@ func TestNoTopologyStub(t *testing.T) {
 		t.Fatal("stub configuration is not stable across calls")
 	}
 
-	other := &NoTopology{}
+	other := NewNoTopology()
 	if _, ok := other.Configuration().Lookup("key"); ok {
 		t.Fatal("stub configurations leaked across instances")
 	}
@@ -435,6 +435,38 @@ func TestNoTopologyStub(t *testing.T) {
 	if _, err := stub.Servers(ctx); !errors.Is(err, context.Canceled) {
 		t.Fatalf("Servers error = %v, want context.Canceled", err)
 	}
+}
+
+func TestNoTopologyNilConfigurationPanics(t *testing.T) {
+	var stub *NoTopology
+	defer func() {
+		recovered := recover()
+		if recovered == nil {
+			t.Fatal("Configuration did not panic on nil *NoTopology")
+		}
+		if !strings.Contains(fmt.Sprint(recovered), "nil NoTopology") {
+			t.Fatalf("panic = %v, want nil NoTopology guidance", recovered)
+		}
+	}()
+	_ = stub.Configuration()
+}
+
+func TestNoTopologyNilEmbeddedPointerPanicsOnConfiguration(t *testing.T) {
+	type embeddingStub struct {
+		*NoTopology
+	}
+
+	var stub embeddingStub
+	defer func() {
+		recovered := recover()
+		if recovered == nil {
+			t.Fatal("promoted Configuration did not panic on nil embedded *NoTopology")
+		}
+		if !strings.Contains(fmt.Sprint(recovered), "NewNoTopology") {
+			t.Fatalf("panic = %v, want initialization guidance", recovered)
+		}
+	}()
+	_ = stub.Configuration()
 }
 
 func TestInstanceTopologyIsConcurrentlyUsable(t *testing.T) {

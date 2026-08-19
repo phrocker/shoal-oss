@@ -320,9 +320,10 @@ var clientServiceKindOrder = map[ServerKind]int{
 // ClientServices returns the live Accumulo 4 ClientService endpoints
 // advertised by tablet servers, scan servers, and compactors, each tagged
 // with the publishing server role and resource group. Results are ordered by
-// role (tserver, sserver, compactor), then group, then advertised address. An address
-// published by several roles or groups is reported once per (role, group).
-// Returns ErrClientServiceUnavailable when nothing is advertised.
+// role (tserver, sserver, compactor), then group, then the publishing server
+// child identity. An address published by several roles or groups is reported
+// once per (role, group). Returns ErrClientServiceUnavailable when nothing is
+// advertised.
 func ClientServices(ctx context.Context, locator LockReader) ([]ClientService, error) {
 	reader, closeScope, err := acquireTopologyLockReader(ctx, locator)
 	if err != nil {
@@ -339,7 +340,11 @@ func clientServices(ctx context.Context, locator LockReader) ([]ClientService, e
 	if locator == nil {
 		return nil, errors.New("zk: nil locator")
 	}
-	services := make([]ClientService, 0, 8)
+	type clientServiceRecord struct {
+		service ClientService
+		server  string
+	}
+	records := make([]clientServiceRecord, 0, 8)
 	for _, serverRoot := range clientServiceRoots {
 		root := path.Join(locator.InstancePath(), serverRoot.root)
 		groups, err := locator.Children(ctx, root)
@@ -393,27 +398,37 @@ func clientServices(ctx context.Context, locator LockReader) ([]ClientService, e
 						continue
 					}
 					groupAddresses[descriptor.Address] = struct{}{}
-					services = append(services, ClientService{
-						Kind:    serverRoot.kind,
-						Group:   group,
-						Address: descriptor.Address,
+					records = append(records, clientServiceRecord{
+						service: ClientService{
+							Kind:    serverRoot.kind,
+							Group:   group,
+							Address: descriptor.Address,
+						},
+						server: server,
 					})
 				}
 			}
 		}
 	}
-	if len(services) == 0 {
+	if len(records) == 0 {
 		return nil, ErrClientServiceUnavailable
 	}
-	sort.Slice(services, func(i, j int) bool {
-		if services[i].Kind != services[j].Kind {
-			return clientServiceKindOrder[services[i].Kind] < clientServiceKindOrder[services[j].Kind]
+	sort.Slice(records, func(i, j int) bool {
+		if records[i].service.Kind != records[j].service.Kind {
+			return clientServiceKindOrder[records[i].service.Kind] < clientServiceKindOrder[records[j].service.Kind]
 		}
-		if services[i].Group != services[j].Group {
-			return services[i].Group < services[j].Group
+		if records[i].service.Group != records[j].service.Group {
+			return records[i].service.Group < records[j].service.Group
 		}
-		return services[i].Address < services[j].Address
+		if records[i].server != records[j].server {
+			return records[i].server < records[j].server
+		}
+		return records[i].service.Address < records[j].service.Address
 	})
+	services := make([]ClientService, 0, len(records))
+	for _, record := range records {
+		services = append(services, record.service)
+	}
 	return services, nil
 }
 

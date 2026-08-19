@@ -138,11 +138,11 @@ func (i *zkLocator) ManagerLocations(ctx context.Context) ([]string, error) {
 // /accumulo/<instance-id>/{tservers,sservers,compactors}/<resource-group>/<server>,
 // and the lowest-sequence lock node of every server carries ServiceLockData
 // JSON whose CLIENT descriptor holds the client-service address. Results are
-// ordered by role, then resource group, then advertised address. When ctx is
-// cancellable, the traversal reuses one authenticated operation-scoped
-// ZooKeeper session and closes it on return or cancellation. Sharkbite reads the flat
-// Accumulo 1.x /<root>/tservers layout, which has no resource groups and no
-// scan servers or compactors.
+// ordered by role, then resource group, then the publishing ZooKeeper server
+// child identity. When ctx is cancellable, the traversal reuses one
+// authenticated operation-scoped ZooKeeper session and closes it on return or
+// cancellation. Sharkbite reads the flat Accumulo 1.x /<root>/tservers
+// layout, which has no resource groups and no scan servers or compactors.
 //
 // Returns ErrClientServiceUnavailable when no server advertises the client
 // service.
@@ -227,18 +227,17 @@ func (i *staticInstance) Configuration() *Configuration { return i.configuration
 // NoTopology implements the cluster-topology half of Instance for
 // implementations that are not backed by a ZooKeeper session: every
 // live-state accessor reports ErrDiscoveryUnavailable instead of pretending
-// to resolve anything. Embed it to satisfy Instance and override the methods
-// that a particular implementation can answer.
-//
-// Embed it by value, as `struct { accumulo.NoTopology }`, and use the
-// embedding type through a pointer. A nil embedded *NoTopology cannot own
-// state, so Configuration would hand back a different empty Configuration on
-// every call instead of the stable one this type promises; that case is
-// reported rather than silently tolerated.
+// to resolve anything. Embed it by value, or initialize pointer fields with
+// NewNoTopology, to satisfy Instance and override the methods that a
+// particular implementation can answer.
 type NoTopology struct {
 	configurationOnce sync.Once
 	configuration     *Configuration
 }
+
+// NewNoTopology returns an initialized topology stub whose Configuration
+// method owns a stable empty Configuration.
+func NewNoTopology() *NoTopology { return &NoTopology{} }
 
 // RootTabletLocation reports ErrDiscoveryUnavailable.
 func (*NoTopology) RootTabletLocation(ctx context.Context) (TabletLocation, error) {
@@ -277,10 +276,11 @@ func (*NoTopology) Root() string { return "" }
 //
 // A nil *NoTopology has nowhere to keep that configuration, so it panics
 // instead of silently returning a fresh Configuration whose writes would be
-// lost. Embed NoTopology by value; see the type documentation.
+// lost. Embed NoTopology by value, or initialize pointer fields with
+// NewNoTopology; see the type documentation.
 func (i *NoTopology) Configuration() *Configuration {
 	if i == nil {
-		panic("accumulo: Configuration called on a nil *NoTopology; embed NoTopology by value")
+		panic("accumulo: nil NoTopology has no stable Configuration; embed NoTopology by value or initialize it with NewNoTopology")
 	}
 	i.configurationOnce.Do(func() {
 		i.configuration = NewConfiguration()

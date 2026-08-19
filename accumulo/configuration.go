@@ -7,6 +7,14 @@ import (
 	"sync"
 )
 
+// noCopy marks a type as non-copyable after first use. `go vet -copylocks`
+// recognizes the Lock method on an embedded field and reports accidental
+// copies.
+type noCopy struct{}
+
+func (*noCopy) Lock()   {}
+func (*noCopy) Unlock() {}
+
 // Configuration is a mutable, string-keyed client configuration map. It is
 // the Go equivalent of Sharkbite's cclient::impl::Configuration, which client
 // code builds before constructing an instance and reads back through
@@ -22,6 +30,7 @@ import (
 // different lock. Pass it by pointer and use Clone when an independent copy is
 // wanted. `go vet`'s copylocks check enforces this.
 type Configuration struct {
+	_      noCopy
 	mu     sync.RWMutex
 	values map[string]string
 }
@@ -133,10 +142,11 @@ func (c *Configuration) Len() int {
 	return len(c.values)
 }
 
-// Clone returns an independent copy of the configuration. Sharkbite copies
-// its configuration map through the ZookeeperInstance copy constructor;
-// Shoal makes the copy explicit so that a Configuration handed to an
-// Instance cannot be mutated through an alias.
+// Clone returns an independent copy of the configuration. Sharkbite copies its
+// configuration map through the ZookeeperInstance copy constructor; Shoal
+// makes the copy explicit so that a Configuration handed to an Instance cannot
+// be mutated through an alias or by copying the mutex-bearing Configuration
+// value itself.
 func (c *Configuration) Clone() *Configuration {
 	clone := NewConfiguration()
 	if c == nil {

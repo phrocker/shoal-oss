@@ -144,6 +144,22 @@ func TestConfigurationKeysLenAndClone(t *testing.T) {
 	}
 }
 
+func TestConfigurationZeroValueIsUsable(t *testing.T) {
+	var config Configuration
+	if got := config.Get("missing"); got != "" {
+		t.Fatalf("Get(missing) = %q, want empty", got)
+	}
+	config.Set("FILE_SYSTEM_ROOT", "/accumulo")
+	if got := config.Get("FILE_SYSTEM_ROOT"); got != "/accumulo" {
+		t.Fatalf("Get(FILE_SYSTEM_ROOT) = %q", got)
+	}
+	clone := config.Clone()
+	config.Set("FILE_SYSTEM_ROOT", "/mutated")
+	if got := clone.Get("FILE_SYSTEM_ROOT"); got != "/accumulo" {
+		t.Fatalf("Clone() did not detach the zero-value configuration: %q", got)
+	}
+}
+
 func TestConfigurationNilReceiverIsSafe(t *testing.T) {
 	var config *Configuration
 	config.Set("key", "value")

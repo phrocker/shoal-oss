@@ -242,6 +242,15 @@ TARGETED_LOCAL_CITATIONS = {
     "cmd/shoal-capi/state_test.go",
     "cmd/shoal-capi/writer_export_test.go",
 }
+TARGETED_SB_CFG_CITATIONS = {
+    "accumulo/configuration.go",
+    "accumulo/configuration_test.go",
+    "accumulo/instance.go",
+    "accumulo/topology.go",
+    "accumulo/topology_test.go",
+    "internal/zk/manager.go",
+    "internal/zk/topology_test.go",
+}
 OPTIONAL_ANCHOR_CITATIONS = {
     "capi/include/shoal.h",
     "capi/include/shoal_types.h",
@@ -277,6 +286,7 @@ IGNORED_ANCHOR_TOKENS = {
     "C",
     "Go",
     "and",
+    "accumulo",
     "by",
     "char",
     "const",
@@ -287,6 +297,7 @@ IGNORED_ANCHOR_TOKENS = {
     "full",
     "in",
     "inline",
+    "internal",
     "int",
     "interface",
     "long",
@@ -306,6 +317,7 @@ IGNORED_ANCHOR_TOKENS = {
     "void",
     "volatile",
     "with",
+    "zk",
 }
 WHITESPACE_TOLERANT_PUNCTUATION = frozenset("(),*&[]")
 DECLARATION_PATTERNS = (
@@ -1254,6 +1266,7 @@ def main() -> None:
     validate_counts(lines, full_text)
     validate_local_line_number_removal(full_text)
     validate_targeted_symbol_anchors(lines)
+    validate_targeted_symbol_anchors(lines, targeted_paths=TARGETED_SB_CFG_CITATIONS)
     print("matrix-counts-ok")
     print("matrix-citations-ok")
 

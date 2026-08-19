@@ -47,7 +47,8 @@ type Instance interface {
 	ManagerLocations(ctx context.Context) ([]string, error)
 
 	// Servers lists the live tablet servers, scan servers, and compactors
-	// that advertise the Accumulo client service.
+	// that advertise the Accumulo client service, ordered by role, then
+	// resource group, then the publishing ZooKeeper server child identity.
 	Servers(ctx context.Context) ([]ServerConnection, error)
 
 	// ZooKeepers returns the ZooKeeper servers this instance was configured
