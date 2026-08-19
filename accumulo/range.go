@@ -114,6 +114,39 @@ func (r *Range) EndInclusive() bool {
 	return r != nil && r.endInclusive
 }
 
+// KeyBounds returns the range as absolute key bounds, which is what a
+// key-ordered reader needs.
+//
+// NewRange builds a row-bounded range, and a row bound is not the key that
+// spells the row: every key in row R with a non-empty column family sorts
+// after Key{Row: R}. Resolving the two forms therefore differs:
+//
+//   - an exclusive row start becomes the following row boundary (R+NUL),
+//     inclusive, so the whole row is skipped;
+//   - an inclusive row end becomes the following row boundary (R+NUL),
+//     exclusive, so the whole row is kept — the same conversion toThrift
+//     performs on the wire;
+//   - a range built by NewKeyRange already carries absolute keys and is
+//     returned with its own inclusivity.
+//
+// The returned keys are copies, and a nil key means that side is unbounded.
+func (r *Range) KeyBounds() (start *Key, startInclusive bool, end *Key, endInclusive bool) {
+	if r == nil {
+		return nil, true, nil, false
+	}
+	start, startInclusive = r.StartKey(), r.startInclusive
+	if start != nil && r.startRowOnly && !r.startInclusive {
+		start.Row = append(cloneRow(start.Row), 0)
+		startInclusive = true
+	}
+	end, endInclusive = r.EndKey(), r.endInclusive
+	if end != nil && r.endRowOnly && r.endInclusive {
+		end.Row = append(cloneRow(end.Row), 0)
+		endInclusive = false
+	}
+	return start, startInclusive, end, endInclusive
+}
+
 func (r *Range) routingRow() []byte {
 	if r.startKey == nil {
 		return nil

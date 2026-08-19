@@ -507,6 +507,101 @@ func TestReaderRejectsUseAfterClose(t *testing.T) {
 	}
 }
 
+// TestCreateRejectsAnUnsupportedCodecWithoutTouchingTheFile pins that option
+// validation happens before the file is created or truncated, so a rejected
+// codec cannot destroy an existing RFile.
+func TestCreateRejectsAnUnsupportedCodecWithoutTouchingTheFile(t *testing.T) {
+	path := writeFile(t, "codec.rf", entry("row1", "cf", "cq", 10, "v1"))
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := rfile.Create(context.Background(), path, rfile.WriterOptions{Codec: "brotli"}); !errors.Is(err, rfile.ErrUnsupportedCodec) {
+		t.Fatalf("Create with an unregistered codec = %v, want ErrUnsupportedCodec", err)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatalf("the existing file was modified: %d bytes before, %d after", len(before), len(after))
+	}
+
+	reader, err := rfile.OpenSequential(context.Background(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	requireRows(t, drain(t, reader), "row1")
+}
+
+func TestTombstoneAndLiveEntryAtOneTimestampAppendInOrder(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "deleteorder.rf")
+	writer, err := rfile.Create(context.Background(), path, rfile.WriterOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Append(context.Background(), tombstone("row1", "cf", "cq", 10)); err != nil {
+		t.Fatal(err)
+	}
+	// Accumulo sorts a tombstone before the live entry at the same
+	// coordinate and timestamp, so this pair is ordered, not duplicated.
+	if err := writer.Append(context.Background(), entry("row1", "cf", "cq", 10, "v1")); err != nil {
+		t.Fatalf("live entry after its tombstone = %v, want it accepted", err)
+	}
+	if err := writer.Append(context.Background(), tombstone("row1", "cf", "cq", 10)); !errors.Is(err, rfile.ErrOutOfOrder) {
+		t.Fatalf("re-appending the tombstone = %v, want ErrOutOfOrder", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reader, err := rfile.OpenSequential(context.Background(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	got := drain(t, reader)
+	if len(got) != 2 || !got[0].Deleted || got[1].Deleted {
+		t.Fatalf("entries = %+v, want the tombstone then the live entry", got)
+	}
+}
+
+// TestSeekHonorsRowBoundsForKeysWithFamilies pins that a row bound covers the
+// whole row: every key in the row has a non-empty family and still sorts after
+// the key that spells the row alone.
+func TestSeekHonorsRowBoundsForKeysWithFamilies(t *testing.T) {
+	path := writeFile(t, "rowbounds.rf",
+		entry("row1", "cf", "cq", 10, "v1"),
+		entry("row2", "cf", "cq", 10, "v2"),
+		entry("row3", "cf", "cq", 10, "v3"),
+	)
+	reader, err := rfile.Open(context.Background(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+
+	seek := func(t *testing.T, start any, startInclusive bool, end any, endInclusive bool) []rfile.Entry {
+		t.Helper()
+		seekable, err := rfile.NewSeekable(mustRange(t, start, startInclusive, end, endInclusive))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := reader.Seek(context.Background(), seekable); err != nil {
+			t.Fatal(err)
+		}
+		return drain(t, reader)
+	}
+
+	requireRows(t, seek(t, "row2", false, nil, true), "row3")
+	requireRows(t, seek(t, "row2", true, nil, true), "row2", "row3")
+	requireRows(t, seek(t, nil, true, "row2", true), "row1", "row2")
+	requireRows(t, seek(t, nil, true, "row2", false), "row1")
+	requireRows(t, seek(t, "row1", false, "row2", true), "row2")
+}
+
 func TestOperationsHonorCancelledContext(t *testing.T) {
 	path := writeFile(t, "cancel.rf", entry("row1", "cf", "cq", 10, "v"))
 	reader, err := rfile.OpenSequential(context.Background(), path)

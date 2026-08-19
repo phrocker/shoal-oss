@@ -1,7 +1,6 @@
 package rfile
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -9,6 +8,7 @@ import (
 	"sync"
 
 	"github.com/phrocker/shoal/internal/rfile"
+	"github.com/phrocker/shoal/internal/rfile/bcfile/block"
 	"github.com/phrocker/shoal/internal/rfile/wire"
 )
 
@@ -16,19 +16,22 @@ import (
 // Close. It is the Go equivalent of Sharkbite's SequentialRFile write side,
 // which RFileOperations.openForWrite returns.
 type Writer struct {
-	mu      sync.Mutex
-	inner   *rfile.Writer
-	file    *os.File
-	path    string
-	lastKey *wire.Key
-	closed  bool
-	entries int64
+	mu       sync.Mutex
+	inner    *rfile.Writer
+	file     *os.File
+	path     string
+	lastKey  *wire.Key
+	closed   bool
+	closeErr error
+	entries  int64
 }
 
 // WriterOptions controls how Create lays out the file. The zero value uses
 // Shoal's defaults, which is what Sharkbite's openForWrite(path) produces.
 type WriterOptions struct {
 	// Codec is the block compression algorithm: "none" (default) or "gz".
+	// An unregistered name is ErrUnsupportedCodec and is rejected before the
+	// file is created.
 	Codec string
 
 	// BlockSize is the uncompressed byte threshold at which a data block is
@@ -40,12 +43,18 @@ type WriterOptions struct {
 // first entry, mirroring Sharkbite's RFileOperations.openForWrite. The file is
 // created, or truncated if it already exists, and it is only a valid RFile
 // once Close returns without error.
+//
+// Options are validated before the file is touched, so a rejected codec cannot
+// destroy an existing RFile at path.
 func Create(ctx context.Context, path string, opts WriterOptions) (*Writer, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	if path == "" {
 		return nil, fmt.Errorf("%w: path is required", ErrInvalidPath)
+	}
+	if opts.Codec != "" && !block.DefaultCompressor().Has(opts.Codec) {
+		return nil, fmt.Errorf("%w: %q", ErrUnsupportedCodec, opts.Codec)
 	}
 	file, err := os.Create(path)
 	if err != nil {
@@ -57,7 +66,6 @@ func Create(ctx context.Context, path string, opts WriterOptions) (*Writer, erro
 	})
 	if err != nil {
 		_ = file.Close()
-		_ = os.Remove(path)
 		return nil, fmt.Errorf("rfile: create %s: %w", path, err)
 	}
 	return &Writer{inner: inner, file: file, path: path}, nil
@@ -118,11 +126,14 @@ func (w *Writer) Entries() int64 {
 // Close finalizes the file: it writes the index and trailer, then releases the
 // handle. It is idempotent, and Append afterwards reports ErrClosed. Until
 // Close returns without error the file on disk is not a readable RFile.
+//
+// A failed finalization is remembered: every later Close returns the same
+// error, so a caller cannot mistake a malformed file for a complete one.
 func (w *Writer) Close() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.closed {
-		return nil
+		return w.closeErr
 	}
 	w.closed = true
 	var errs []error
@@ -133,32 +144,12 @@ func (w *Writer) Close() error {
 		errs = append(errs, err)
 	}
 	if len(errs) > 0 {
-		return fmt.Errorf("rfile: close %s: %w", w.path, errors.Join(errs...))
+		w.closeErr = fmt.Errorf("rfile: close %s: %w", w.path, errors.Join(errs...))
 	}
-	return nil
+	return w.closeErr
 }
 
-// compareKeys orders two keys the way Accumulo does: row, then family, then
-// qualifier, then visibility, then timestamp descending.
-func compareKeys(a, b *wire.Key) int {
-	if cmp := bytes.Compare(a.Row, b.Row); cmp != 0 {
-		return cmp
-	}
-	if cmp := bytes.Compare(a.ColumnFamily, b.ColumnFamily); cmp != 0 {
-		return cmp
-	}
-	if cmp := bytes.Compare(a.ColumnQualifier, b.ColumnQualifier); cmp != 0 {
-		return cmp
-	}
-	if cmp := bytes.Compare(a.ColumnVisibility, b.ColumnVisibility); cmp != 0 {
-		return cmp
-	}
-	switch {
-	case a.Timestamp > b.Timestamp:
-		return -1
-	case a.Timestamp < b.Timestamp:
-		return 1
-	default:
-		return 0
-	}
-}
+// compareKeys orders two keys exactly as Accumulo does, including the deleted
+// bit: at one coordinate and timestamp a tombstone sorts before the live entry,
+// so appending the pair in that order is valid.
+func compareKeys(a, b *wire.Key) int { return a.Compare(b) }

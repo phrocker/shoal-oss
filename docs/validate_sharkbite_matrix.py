@@ -320,6 +320,7 @@ OPTIONAL_ANCHOR_CITATIONS = {
 # same reason: the matrix claims an exact public Go surface, so a rename or a
 # deleted method must fail the document, not just the build.
 TARGETED_SB_RFILE_CITATIONS = {
+    "rfile/close_internal_test.go",
     "rfile/entry.go",
     "rfile/errors.go",
     "rfile/reader.go",

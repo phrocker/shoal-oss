@@ -54,11 +54,12 @@ type KeyValueIterator interface {
 // positioned at the first entry, and OpenMany returns one that merges several
 // files into a single ordered stream.
 type Reader struct {
-	mu      sync.Mutex
-	source  iterrt.SortedKeyValueIterator
-	closers []func() error
-	closed  bool
-	seeked  bool
+	mu       sync.Mutex
+	source   iterrt.SortedKeyValueIterator
+	closers  []func() error
+	closed   bool
+	closeErr error
+	seeked   bool
 }
 
 var _ KeyValueIterator = (*Reader)(nil)
@@ -343,12 +344,13 @@ func (r *Reader) Next(ctx context.Context) error {
 }
 
 // Close releases every file this reader opened. It is idempotent, and later
-// operations report ErrClosed.
+// operations report ErrClosed. A failed close is remembered, so every later
+// Close reports the same error rather than a misleading success.
 func (r *Reader) Close() error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.closed {
-		return nil
+		return r.closeErr
 	}
 	r.closed = true
 	var errs []error
@@ -359,9 +361,9 @@ func (r *Reader) Close() error {
 	}
 	r.closers = nil
 	if len(errs) > 0 {
-		return fmt.Errorf("rfile: close: %w", errors.Join(errs...))
+		r.closeErr = fmt.Errorf("rfile: close: %w", errors.Join(errs...))
 	}
-	return nil
+	return r.closeErr
 }
 
 func (r *Reader) checkTop() error {
@@ -422,18 +424,20 @@ func (f *ageOffFilter) DeepCopy(env iterrt.IteratorEnvironment) iterrt.SortedKey
 	return &ageOffFilter{source: f.source.DeepCopy(env), minTimestamp: f.minTimestamp}
 }
 
-// internalRange converts the public range into the iterator runtime's form.
+// internalRange converts the public range into the iterator runtime's form,
+// resolving row bounds into the absolute key bounds a key-ordered reader needs.
 func internalRange(r *accumulo.Range) iterrt.Range {
+	start, startInclusive, end, endInclusive := r.KeyBounds()
 	converted := iterrt.Range{
-		StartInclusive: r.StartInclusive(),
-		EndInclusive:   r.EndInclusive(),
+		StartInclusive: startInclusive,
+		EndInclusive:   endInclusive,
 	}
-	if start := r.StartKey(); start != nil {
+	if start != nil {
 		converted.Start = internalKey(*start)
 	} else {
 		converted.InfiniteStart = true
 	}
-	if end := r.EndKey(); end != nil {
+	if end != nil {
 		converted.End = internalKey(*end)
 	} else {
 		converted.InfiniteEnd = true
