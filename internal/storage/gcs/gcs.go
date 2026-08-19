@@ -417,6 +417,8 @@ type writer struct {
 	aborted                bool
 }
 
+var errWriteAborted = errors.New("gcs: write aborted")
+
 func (w *writer) Write(p []byte) (int, error) {
 	if w.abortRequested {
 		return 0, fmt.Errorf("gcs: writer already aborted")
@@ -514,7 +516,8 @@ func (w *writer) Abort() error {
 	var abortErr error
 	if !w.tempClosed {
 		w.tempClosed = true
-		if err := w.inner.CloseWithError(errors.New("gcs: write aborted")); err != nil {
+		w.tempUnknown = true
+		if err := w.inner.CloseWithError(errWriteAborted); err != nil && !isExpectedAbortCloseError(err) {
 			abortErr = fmt.Errorf("gcs: abort temporary object %s: %w", w.tempPath, err)
 		}
 	}
@@ -527,6 +530,38 @@ func (w *writer) Abort() error {
 	}
 	w.aborted = true
 	return nil
+}
+
+func isExpectedAbortCloseError(err error) bool {
+	if err == nil {
+		return true
+	}
+	type unwrapMany interface {
+		Unwrap() []error
+	}
+	if unwrapped, ok := err.(unwrapMany); ok {
+		children := unwrapped.Unwrap()
+		if len(children) == 0 {
+			return errors.Is(err, errWriteAborted)
+		}
+		for _, child := range children {
+			if !isExpectedAbortCloseError(child) {
+				return false
+			}
+		}
+		return true
+	}
+	type unwrapOne interface {
+		Unwrap() error
+	}
+	if unwrapped, ok := err.(unwrapOne); ok {
+		child := unwrapped.Unwrap()
+		if child == nil {
+			return errors.Is(err, errWriteAborted)
+		}
+		return isExpectedAbortCloseError(child)
+	}
+	return errors.Is(err, errWriteAborted)
 }
 
 type bucketHandle interface {

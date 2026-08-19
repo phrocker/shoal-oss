@@ -18,6 +18,7 @@ import (
 
 	cloudstorage "cloud.google.com/go/storage"
 	shstorage "github.com/phrocker/shoal/internal/storage"
+	memorystorage "github.com/phrocker/shoal/internal/storage/memory"
 	"google.golang.org/api/googleapi"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -174,6 +175,172 @@ func TestWriter_AbortUsesCloseWithErrorAndRejectsLaterUse(t *testing.T) {
 	}
 	if inner.closeCalls != 0 {
 		t.Fatalf("Close calls after Abort = %d, want 0", inner.closeCalls)
+	}
+}
+
+func TestWriter_AbortTreatsReturnedAbortCauseAsSuccess(t *testing.T) {
+	backend, _ := newFakeBackend()
+	w, err := backend.Create(context.Background(), "bucket/path/to/object.rf")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	gcsWriter := w.(*writer)
+	gcsWriter.inner.(*fakeObjectWriter).plan.closeAbortFn = func(err error) error { return err }
+
+	if _, err := w.Write([]byte("hello")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if err := gcsWriter.Abort(); err != nil {
+		t.Fatalf("Abort: %v", err)
+	}
+	if !gcsWriter.aborted {
+		t.Fatal("Abort did not mark the writer aborted")
+	}
+}
+
+func TestWriter_AbortTreatsWrappedAbortCauseAsSuccess(t *testing.T) {
+	backend, _ := newFakeBackend()
+	w, err := backend.Create(context.Background(), "bucket/path/to/object.rf")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	gcsWriter := w.(*writer)
+	gcsWriter.inner.(*fakeObjectWriter).plan.closeAbortFn = func(err error) error {
+		return fmt.Errorf("wrapped abort: %w", err)
+	}
+
+	if _, err := w.Write([]byte("hello")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if err := gcsWriter.Abort(); err != nil {
+		t.Fatalf("Abort: %v", err)
+	}
+	if !gcsWriter.aborted {
+		t.Fatal("Abort did not mark the writer aborted")
+	}
+}
+
+func TestWriter_AbortPropagatesDistinctCloseWithErrorFailureAndAllowsRetry(t *testing.T) {
+	backend, _ := newFakeBackend()
+	w, err := backend.Create(context.Background(), "bucket/path/to/object.rf")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	gcsWriter := w.(*writer)
+	distinctErr := errors.New("close aborted stream failed")
+	gcsWriter.inner.(*fakeObjectWriter).plan.closeAbortErr = distinctErr
+
+	if _, err := w.Write([]byte("hello")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if err := gcsWriter.Abort(); !errors.Is(err, distinctErr) {
+		t.Fatalf("first Abort error = %v, want %v", err, distinctErr)
+	}
+	if gcsWriter.aborted {
+		t.Fatal("first Abort unexpectedly marked the writer aborted")
+	}
+	if err := gcsWriter.Abort(); err != nil {
+		t.Fatalf("second Abort: %v", err)
+	}
+	if !gcsWriter.aborted {
+		t.Fatal("second Abort did not mark the writer aborted")
+	}
+}
+
+func TestWriter_AbortRetriesCleanupAfterExpectedCloseWithErrorCause(t *testing.T) {
+	backend, bucket := newFakeBackend()
+	w, err := backend.Create(context.Background(), "bucket/path/to/object.rf")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	gcsWriter := w.(*writer)
+	gcsWriter.inner.(*fakeObjectWriter).plan.closeAbortFn = func(err error) error { return err }
+	tempName := gcsWriter.temp.(*fakeObject).name
+	bucket.putObjectWithMetadata(tempName, []byte("owned"), map[string]string{"shoal-write-id": gcsWriter.writeID})
+
+	attempts := 0
+	bucket.deleteHook = func(_ context.Context, object *fakeObject) error {
+		if object.name == tempName && attempts == 0 {
+			attempts++
+			return errors.New("delete failed")
+		}
+		return nil
+	}
+
+	if _, err := w.Write([]byte("hello")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	abortErr := gcsWriter.Abort()
+	if abortErr == nil || !strings.Contains(abortErr.Error(), "remove temporary object") {
+		t.Fatalf("first Abort error = %v, want cleanup failure", abortErr)
+	}
+	if strings.Contains(abortErr.Error(), errWriteAborted.Error()) {
+		t.Fatalf("first Abort error = %v, want cleanup failure without synthetic abort noise", abortErr)
+	}
+	if gcsWriter.aborted {
+		t.Fatal("first Abort unexpectedly marked the writer aborted")
+	}
+	if _, ok := bucket.objects[tempName]; !ok {
+		t.Fatalf("first Abort removed temp object %q unexpectedly", tempName)
+	}
+	if err := gcsWriter.Abort(); err != nil {
+		t.Fatalf("second Abort: %v", err)
+	}
+	if !gcsWriter.aborted {
+		t.Fatal("second Abort did not mark the writer aborted")
+	}
+	if _, ok := bucket.objects[tempName]; ok {
+		t.Fatalf("second Abort did not remove temp object %q", tempName)
+	}
+}
+
+func TestWriteAllCancellationDoesNotReportSyntheticAbortError(t *testing.T) {
+	backend, bucket := newFakeBackend()
+	bucket.writerPlan = func(name string) fakeWriterPlan {
+		if isTemporaryObjectName(name) {
+			return fakeWriterPlan{closeAbortFn: func(err error) error { return err }}
+		}
+		return fakeWriterPlan{}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	err := shstorage.WriteAll(ctx, cancelAfterWriteBackend{WritableBackend: backend, cancel: cancel}, "bucket/path/to/object.rf", []byte("payload"))
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("WriteAll error = %v, want context canceled", err)
+	}
+	if strings.Contains(err.Error(), errWriteAborted.Error()) || strings.Contains(err.Error(), "abort temporary object") {
+		t.Fatalf("WriteAll error = %v, want no synthetic abort noise", err)
+	}
+	if _, ok := bucket.objects["path/to/object.rf"]; ok {
+		t.Fatal("WriteAll published the destination object")
+	}
+}
+
+func TestCopyCancellationDoesNotReportSyntheticAbortError(t *testing.T) {
+	src := memorystorage.New()
+	src.Put("src.rf", []byte("payload"))
+
+	backend, bucket := newFakeBackend()
+	bucket.writerPlan = func(name string) fakeWriterPlan {
+		if isTemporaryObjectName(name) {
+			return fakeWriterPlan{closeAbortFn: func(err error) error { return err }}
+		}
+		return fakeWriterPlan{}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	written, err := shstorage.Copy(ctx, src, "src.rf", cancelAfterWriteBackend{WritableBackend: backend, cancel: cancel}, "bucket/path/to/object.rf")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Copy error = %v, want context canceled", err)
+	}
+	if strings.Contains(err.Error(), errWriteAborted.Error()) || strings.Contains(err.Error(), "abort temporary object") {
+		t.Fatalf("Copy error = %v, want no synthetic abort noise", err)
+	}
+	if written != int64(len("payload")) {
+		t.Fatalf("Copy wrote %d bytes, want %d", written, len("payload"))
+	}
+	if _, ok := bucket.objects["path/to/object.rf"]; ok {
+		t.Fatal("Copy published the destination object")
 	}
 }
 
@@ -1369,6 +1536,32 @@ func newFakeBackend() (*Backend, *fakeBucket) {
 
 var errFakePrecondition = errors.New("fake gcs: precondition failed")
 
+type cancelAfterWriteBackend struct {
+	shstorage.WritableBackend
+	cancel func()
+}
+
+func (b cancelAfterWriteBackend) Create(ctx context.Context, path string) (shstorage.Writer, error) {
+	writer, err := b.WritableBackend.Create(ctx, path)
+	if err != nil {
+		return nil, err
+	}
+	return cancelAfterWriteWriter{Writer: writer, cancel: b.cancel}, nil
+}
+
+type cancelAfterWriteWriter struct {
+	shstorage.Writer
+	cancel func()
+}
+
+func (w cancelAfterWriteWriter) Write(p []byte) (int, error) {
+	n, err := w.Writer.Write(p)
+	if w.cancel != nil {
+		w.cancel()
+	}
+	return n, err
+}
+
 type fakeBucket struct {
 	objects            map[string]fakeObjectData
 	nextGen            int64
@@ -1394,6 +1587,7 @@ type fakeWriterPlan struct {
 	closeErr       error
 	publishOnClose bool
 	closeAbortErr  error
+	closeAbortFn   func(error) error
 	attrsOverride  *cloudstorage.ObjectAttrs
 }
 
@@ -1629,6 +1823,9 @@ func (w *fakeObjectWriter) Close() error {
 func (w *fakeObjectWriter) CloseWithError(err error) error {
 	w.closeWithErrorCalls++
 	w.closeWithErrorArg = err
+	if w.plan.closeAbortFn != nil {
+		return w.plan.closeAbortFn(err)
+	}
 	return w.plan.closeAbortErr
 }
 
