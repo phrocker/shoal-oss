@@ -230,7 +230,7 @@ func WriteLoadMapping(ctx context.Context, dst storage.Backend, bulkDir string, 
 	if err != nil {
 		return err
 	}
-	path := joinBulkPath(bulkDir, bulkLoadMappingFile)
+	path := joinBulkPath(dst, bulkDir, bulkLoadMappingFile)
 	if err := storage.WriteAll(ctx, dst, path, data); err != nil {
 		return fmt.Errorf("promotion: write load mapping %s: %w", path, err)
 	}
@@ -241,7 +241,7 @@ func WriteLoadMapping(ctx context.Context, dst storage.Backend, bulkDir string, 
 // WriteLoadMapping (or a real Accumulo client) at <bulkDir>/loadmap.json on
 // src. Intended for tests and operator verification.
 func ReadLoadMapping(ctx context.Context, src storage.Backend, bulkDir string) (LoadMapping, error) {
-	path := joinBulkPath(bulkDir, bulkLoadMappingFile)
+	path := joinBulkPath(src, bulkDir, bulkLoadMappingFile)
 	data, err := storage.ReadAll(ctx, src, path)
 	if err != nil {
 		return nil, fmt.Errorf("promotion: read load mapping %s: %w", path, err)
@@ -310,11 +310,13 @@ func base64RowValue(s *string) ([]byte, error) {
 	return base64.URLEncoding.DecodeString(*s)
 }
 
-// joinBulkPath mirrors engine's joinBackendPath: URL-style roots
-// (scheme://...) join with a literal "/", local-style roots join with
-// filepath.Join.
-func joinBulkPath(bulkDir, name string) string {
-	if strings.Contains(bulkDir, "://") {
+// joinBulkPath mirrors engine's joinBackendPath: URL-style backend roots
+// (scheme://..., plus HDFS's hdfs:/... authorityless form) join with a
+// literal "/". Ambiguous one-character roots such as x://... are treated
+// as backend URLs only when dst declares that scheme; otherwise they keep
+// local Windows-drive semantics.
+func joinBulkPath(dst storage.Backend, bulkDir, name string) string {
+	if pathUsesBackendSeparatorJoinOnBackend(dst, bulkDir) {
 		return strings.TrimRight(bulkDir, `/\`) + "/" + name
 	}
 	return filepath.Join(bulkDir, name)

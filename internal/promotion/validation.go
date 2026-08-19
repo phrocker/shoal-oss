@@ -3,20 +3,19 @@ package promotion
 import (
 	"fmt"
 	"net/url"
+	pathpkg "path"
 	"path/filepath"
-	"regexp"
 	"strings"
 
 	"github.com/phrocker/shoal/accumulo"
+	"github.com/phrocker/shoal/internal/storage"
 )
 
-var windowsDriveRootRe = regexp.MustCompile(`^[A-Za-z]:[\\/]?$`)
-
-func validatePromotionDestination(tableName, bulkDir string) error {
+func validatePromotionDestination(dst storage.Backend, tableName, bulkDir string) error {
 	if err := validateTableName(tableName); err != nil {
 		return err
 	}
-	return validateBulkDir(bulkDir)
+	return validateBulkDirOnBackend(dst, bulkDir)
 }
 
 func validateTableName(tableName string) error {
@@ -31,6 +30,10 @@ func validateTableName(tableName string) error {
 }
 
 func validateBulkDir(bulkDir string) error {
+	return validateBulkDirOnBackend(nil, bulkDir)
+}
+
+func validateBulkDirOnBackend(dst storage.Backend, bulkDir string) error {
 	trimmed := strings.TrimSpace(bulkDir)
 	if trimmed == "" {
 		return fmt.Errorf("%w: empty bulk directory", accumulo.ErrInvalidBulkDir)
@@ -38,21 +41,28 @@ func validateBulkDir(bulkDir string) error {
 	if trimmed != bulkDir {
 		return fmt.Errorf("%w: %q has leading or trailing whitespace", accumulo.ErrInvalidBulkDir, bulkDir)
 	}
-	if isBackendRoot(trimmed) {
+	if isBackendRootOnBackend(dst, trimmed) {
 		return fmt.Errorf("%w: backend root %q", accumulo.ErrInvalidBulkDir, bulkDir)
 	}
 	return nil
 }
 
 func isBackendRoot(bulkDir string) bool {
-	if strings.Contains(bulkDir, "://") {
+	return isBackendRootOnBackend(nil, bulkDir)
+}
+
+func isBackendRootOnBackend(dst storage.Backend, bulkDir string) bool {
+	if pathUsesBackendSeparatorJoinOnBackend(dst, bulkDir) {
 		u, err := url.Parse(bulkDir)
 		if err != nil {
 			return false
 		}
+		if strings.EqualFold(storage.ExplicitPathScheme(dst, bulkDir), "hdfs") {
+			return hdfsURIPathIsRoot(u.Path)
+		}
 		return strings.Trim(u.Path, "/\\") == ""
 	}
-	if windowsDriveRootRe.MatchString(bulkDir) {
+	if isWindowsDriveRootPath(bulkDir) {
 		return true
 	}
 	clean := filepath.Clean(bulkDir)
@@ -62,4 +72,25 @@ func isBackendRoot(bulkDir string) bool {
 	}
 	vol := filepath.VolumeName(clean)
 	return vol != "" && clean == vol+sep
+}
+
+// hdfsURIPathIsRoot reports whether an HDFS URI's path component names the
+// backend root once dot segments ("." and "..") are resolved per
+// HDFS/POSIX path semantics. A root alias like "/tmp/.." -- which HDFS
+// itself resolves to "/" -- would not trim to empty as a raw string, so
+// this scheme cannot use the plain strings.Trim check used for other
+// backend URL schemes. pathpkg.Clean maps an empty path to ".", which
+// (like "") is mapped to "/" here so a bare authority root (hdfs://nn,
+// with no path segment at all) is still recognized as root. This
+// normalization is intentionally scoped to the HDFS scheme by the
+// caller: object-store and other custom backend URL schemes must not
+// resolve dot segments this way, since their keys may legitimately
+// contain literal "." or ".." characters that are not directory-
+// traversal tokens.
+func hdfsURIPathIsRoot(rawPath string) bool {
+	cleaned := pathpkg.Clean(rawPath)
+	if cleaned == "." || cleaned == "" {
+		cleaned = "/"
+	}
+	return strings.Trim(cleaned, "/\\") == ""
 }

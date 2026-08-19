@@ -402,12 +402,79 @@ func TestBackendAcceptsAuthoritylessHDFSPaths(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for _, objectPath := range []string{"hdfs:/tables/1.rf", "hdfs:///tables/1.rf"} {
+	for _, objectPath := range []string{
+		"hdfs:/tables/1.rf",
+		"hdfs:///tables/1.rf",
+		"HDFS:/tables/1.rf",
+		"HDFS:///tables/1.rf",
+		"HDFS://nn:8020/tables/1.rf",
+	} {
 		f, err := backend.Open(context.Background(), objectPath)
 		if err != nil {
 			t.Fatalf("Open(%q): %v", objectPath, err)
 		}
 		_ = f.Close()
+	}
+}
+
+func TestBackendResolveCanonicalizesCaseInsensitiveHDFSPaths(t *testing.T) {
+	backend, err := New("nn:8020", WithClient(newFakeClient()))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		path          string
+		wantResolved  string
+		wantQualifier string
+	}{
+		{path: "HDFS:/tables/1.rf", wantResolved: "/tables/1.rf", wantQualifier: "hdfs:"},
+		{path: "HDFS:///tables/1.rf", wantResolved: "/tables/1.rf", wantQualifier: "hdfs:"},
+		{path: "HDFS://nn:8020/tables/1.rf", wantResolved: "/tables/1.rf", wantQualifier: "hdfs://nn:8020"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.path, func(t *testing.T) {
+			resolved, qualifier, err := backend.resolve(tt.path)
+			if err != nil {
+				t.Fatalf("resolve(%q): %v", tt.path, err)
+			}
+			if resolved != tt.wantResolved || qualifier != tt.wantQualifier {
+				t.Fatalf("resolve(%q) = (%q, %q), want (%q, %q)", tt.path, resolved, qualifier, tt.wantResolved, tt.wantQualifier)
+			}
+		})
+	}
+}
+
+func TestBackendCreateAcceptsCaseInsensitiveHDFSPaths(t *testing.T) {
+	tests := []struct {
+		path string
+		want string
+	}{
+		{path: "HDFS:/tables/1.rf", want: "/tables/1.rf"},
+		{path: "HDFS://nn:8020/tables/2.rf", want: "/tables/2.rf"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.path, func(t *testing.T) {
+			client := newFakeClient()
+			backend, err := New("nn:8020", WithClient(client))
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			w, err := backend.Create(context.Background(), tt.path)
+			if err != nil {
+				t.Fatalf("Create(%q): %v", tt.path, err)
+			}
+			if _, err := w.Write([]byte("new")); err != nil {
+				t.Fatal(err)
+			}
+			if err := w.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if got := string(client.files[tt.want]); got != "new" {
+				t.Fatalf("created contents at %q = %q, want new", tt.want, got)
+			}
+		})
 	}
 }
 
@@ -442,6 +509,9 @@ func TestAddressFromPath(t *testing.T) {
 		{path: "hdfs://nn:8020/tables/1.rf", want: "nn:8020"},
 		{path: "hdfs:/tables/1.rf", want: ""},
 		{path: "hdfs:///tables/1.rf", want: ""},
+		{path: "HDFS://nn:8020/tables/1.rf", want: "nn:8020"},
+		{path: "HDFS:/tables/1.rf", want: ""},
+		{path: "HDFS:///tables/1.rf", want: ""},
 	}
 	for _, test := range valid {
 		got, err := AddressFromPath(test.path)
@@ -463,6 +533,16 @@ func TestAddressFromPath(t *testing.T) {
 		if _, err := AddressFromPath(objectPath); err == nil {
 			t.Fatalf("AddressFromPath(%q) succeeded, want error", objectPath)
 		}
+	}
+}
+
+func TestNewAcceptsUppercaseHDFSAddress(t *testing.T) {
+	backend, err := New("HDFS://nn:8020", WithClient(newFakeClient()))
+	if err != nil {
+		t.Fatalf("New(HDFS://nn:8020): %v", err)
+	}
+	if !strings.EqualFold(backend.Authority(), "nn:8020") {
+		t.Fatalf("Authority() = %q, want nn:8020", backend.Authority())
 	}
 }
 

@@ -40,6 +40,14 @@ const (
 	// caller is responsible for staging the bulk directory (files flat,
 	// loadmap.json written) before submitting; see internal/promotion.
 	TableBulkImport
+	// TableSplit submits Accumulo 4's manager split FATE operation
+	// (TABLE_SPLIT). Arguments are positional and variadic: the table's
+	// canonical ID, the target tablet's end row (empty for the unbounded
+	// last tablet), the target tablet's previous end row (empty for the
+	// unbounded first tablet), then one encoded split/mergeability payload
+	// per new split row. See splits.go and REFERENCES.md for the payload
+	// encoding.
+	TableSplit
 	NamespaceCreate
 	NamespaceDelete
 	NamespaceRename
@@ -76,6 +84,7 @@ const (
 	ErrorInvalidProperty
 	ErrorSecurity
 	ErrorNotActive
+	ErrorTableOffline
 )
 
 type Error struct {
@@ -125,6 +134,13 @@ func (e *Error) Error() string {
 
 type Adapter interface {
 	Execute(context.Context, string, Request) error
+	ExecuteStatus(context.Context, string, Request) (string, error)
+	UpdateTabletMergeability(
+		context.Context,
+		string,
+		string,
+		[]MergeabilityUpdate,
+	) ([]TabletExtent, error)
 	FlushTable(context.Context, string, string, bool) error
 	GetTableConfiguration(context.Context, string, string) (map[string]string, error)
 	GetNamespaceConfiguration(context.Context, string, string) (map[string]string, error)
@@ -172,6 +188,12 @@ type managerRPC interface {
 	WaitForFlush(context.Context, *security.TCredentials, string, int64, int64) error
 	SetTableProperty(context.Context, *security.TCredentials, string, string, string) error
 	RemoveTableProperty(context.Context, *security.TCredentials, string, string) error
+	UpdateTabletMergeability(
+		context.Context,
+		*security.TCredentials,
+		string,
+		[]MergeabilityUpdate,
+	) ([]TabletExtent, error)
 	SetNamespaceProperty(context.Context, *security.TCredentials, string, string, string) error
 	RemoveNamespaceProperty(context.Context, *security.TCredentials, string, string) error
 }
@@ -266,13 +288,29 @@ func NewPooled(
 	return p, nil
 }
 
-func (p *Pooled) Execute(ctx context.Context, address string, req Request) (err error) {
+func (p *Pooled) Execute(ctx context.Context, address string, req Request) error {
+	_, err := p.ExecuteStatus(ctx, address, req)
+	return err
+}
+
+// ExecuteStatus runs a FATE operation and returns the status string the
+// manager reported from waitForFateOperation. Accumulo uses that string to
+// distinguish "the operation ran" from "the operation exited without work"
+// — TABLE_SPLIT returns SplitSucceeded only when the requested tablet was
+// actually split. The FATE transaction is always finished, even when the
+// call fails or ctx is already done, and any cleanup error is joined onto
+// the returned error.
+func (p *Pooled) ExecuteStatus(
+	ctx context.Context,
+	address string,
+	req Request,
+) (status string, err error) {
 	if err := validateRequest(req); err != nil {
-		return err
+		return "", err
 	}
 	credentials, err := p.credentialsForRPC()
 	if err != nil {
-		return err
+		return "", err
 	}
 	id, err := withClient(p, ctx, address, func(rpc fateRPC) (fateID, error) {
 		return rpc.Begin(ctx, credentials, req.Instance)
@@ -288,20 +326,31 @@ func (p *Pooled) Execute(ctx context.Context, address string, req Request) (err 
 		}()
 	}
 	if err != nil {
-		return mapRPCError(err)
+		return "", mapRPCError(err)
 	}
 
+	var executeCleanupErr error
 	if _, err := withClient(p, ctx, address, func(rpc fateRPC) (struct{}, error) {
 		return struct{}{}, rpc.Execute(ctx, credentials, id, req)
 	}); err != nil {
-		return mapRPCError(err)
+		var cleanupErr *PostResponseCleanupError
+		if errors.As(err, &cleanupErr) {
+			executeCleanupErr = cleanupErr.Err
+		} else {
+			return "", mapRPCError(err)
+		}
 	}
-	if _, err := withClient(p, ctx, address, func(rpc fateRPC) (string, error) {
+	status, err = withClient(p, ctx, address, func(rpc fateRPC) (string, error) {
 		return rpc.Wait(ctx, credentials, id)
-	}); err != nil {
-		return mapRPCError(err)
+	})
+	if err != nil {
+		var cleanupErr *PostResponseCleanupError
+		if errors.As(err, &cleanupErr) {
+			return status, errors.Join(executeCleanupErr, cleanupErr.Err)
+		}
+		return status, errors.Join(executeCleanupErr, mapRPCError(err))
 	}
-	return nil
+	return status, executeCleanupErr
 }
 
 func (p *Pooled) SetTableProperty(
@@ -1183,6 +1232,8 @@ func thriftOperation(op Operation) manager.TFateOperation {
 		return manager.TFateOperation_TABLE_RENAME
 	case TableBulkImport:
 		return manager.TFateOperation_TABLE_BULK_IMPORT2
+	case TableSplit:
+		return manager.TFateOperation_TABLE_SPLIT
 	case NamespaceCreate:
 		return manager.TFateOperation_NAMESPACE_CREATE
 	case NamespaceDelete:
@@ -1217,6 +1268,14 @@ func validateRequest(req Request) error {
 		if len(req.Arguments) != 3 {
 			return fmt.Errorf("managerclient: bulk import requires 3 arguments, got %d", len(req.Arguments))
 		}
+	case TableSplit:
+		if len(req.Arguments) < splitMinimumArguments {
+			return fmt.Errorf(
+				"managerclient: split requires at least %d arguments, got %d",
+				splitMinimumArguments,
+				len(req.Arguments),
+			)
+		}
 	case NamespaceCreate, NamespaceDelete:
 		if len(req.Arguments) != 1 {
 			return fmt.Errorf("managerclient: namespace operation requires 1 argument, got %d", len(req.Arguments))
@@ -1250,6 +1309,26 @@ func mapRPCError(err error) error {
 	if err == nil {
 		return nil
 	}
+	type joinError interface {
+		Unwrap() []error
+	}
+	if joined, ok := err.(joinError); ok {
+		mapped := make([]error, 0, len(joined.Unwrap()))
+		for _, cause := range joined.Unwrap() {
+			if cause == nil {
+				continue
+			}
+			mapped = append(mapped, mapRPCError(cause))
+		}
+		switch len(mapped) {
+		case 0:
+			return nil
+		case 1:
+			return mapped[0]
+		default:
+			return errors.Join(mapped...)
+		}
+	}
 	var tableErr *clientgen.ThriftTableOperationException
 	if errors.As(err, &tableErr) {
 		kind := ErrorUnknown
@@ -1264,6 +1343,8 @@ func mapRPCError(err error) error {
 			kind = ErrorNamespaceNotFound
 		case clientgen.TableOperationExceptionType_INVALID_NAME:
 			kind = ErrorInvalidName
+		case clientgen.TableOperationExceptionType_OFFLINE:
+			kind = ErrorTableOffline
 		}
 		return &Error{
 			Kind:        kind,

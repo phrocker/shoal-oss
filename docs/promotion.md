@@ -147,7 +147,169 @@ RFileExportManifest (existing)  →  promotion.BuildLoadMapping
   invalid destinations and rejected split manifests never leave a
   half-staged directory. It also verifies every referenced RFile against
   the manifest's recorded size/SHA256 (`engine.VerifyRFileExport`) before
-  copying.
+  copying, and preflights every RFile's computed destination path
+  against **every unique source path in the manifest** — not just its
+  own — rejecting any alias before any copying starts. An alias includes
+  an absolute-vs-relative path difference or a symlink/hard link, not
+  just an identical path string, and covers both `bulkDir` coinciding
+  with the export's own tablet directory *and* one RFile's destination
+  coinciding with a *different* RFile's source. `storage.Copy` truncates
+  the destination for writing before streaming the source, so an aliased
+  copy would otherwise destroy a source file (possibly one not yet
+  copied, whose earlier verification would not be repeated) and report a
+  false success.
+  Before any destination path is even computed, manifest entries whose
+  *source* resolves to the same already-exported object are collapsed
+  into one (`dedupeStageSources`/`canonicalStageSource`): a source
+  reached through a symlink/hard link, or an equivalent
+  backend-canonicalized spelling (e.g. an `s3://bucket/key` entry and a
+  scheme-less `bucket/key` entry naming the same object), no longer has
+  to flatten and verify as two independent files. Collapsing is
+  conservative — it only happens when every aliased entry declares the
+  *same* tablet index and would flatten to the *same* basename; if the
+  same physical source is declared under two different flattened
+  filenames, `StageBulkDir` fails closed instead of guessing which name
+  to keep, since silently discarding one would otherwise drop a named
+  file the load mapping still expects to exist. This complements rather
+  than replaces the alias checks below, which still run against the
+  deduplicated set to catch purely lexical risks (case/Unicode
+  aliasing) that don't imply the same confirmed physical identity a
+  dedupe decision requires.
+  The same preflight also covers `bulkDir/loadmap.json` itself (written
+  by `WriteLoadMapping`, which truncates exactly like `storage.Copy`
+  does, but runs after every RFile copy — an aliased `loadmap.json`
+  would otherwise destroy an already-staged source), and checks every
+  write target against every *other* write target, not only against
+  manifest sources — catching two flattened destinations that are
+  hard-linked to each other, which would otherwise let the second copy
+  silently overwrite the first while the load mapping still lists both
+  names as independent files.
+  Alias detection also treats two local publication paths that collapse
+  to the same filesystem-visible spelling as a potential alias, purely
+  lexically, even when neither final path exists yet: Windows and macOS
+  (by default) resolve paths case-insensitively, macOS normalizes
+  filenames to NFC, and Windows ignores trailing dots/spaces. So two
+  basenames that differ only by case, Unicode normalization (e.g. NFC vs
+  NFD `é`), or a trailing `.`/space are rejected before either write can
+  silently overwrite the other.
+  That same case/Unicode fold applies to a Windows volume prefix, not
+  only to the path components after it: both the standard UNC form
+  (`\\server\share\...`) and the Win32 extended-length form
+  (`\\?\UNC\server\share\...`, which bypasses ordinary path processing
+  and would otherwise keep its own distinct literal spelling) have
+  their server and share segments case-folded and NFC-normalized
+  identically to ordinary components, so `\\SERVER\Share\B.rf` and
+  `\\server\share\B.rf` (or their `\\?\UNC\...` equivalents) collapse
+  to the same publication key instead of aliasing past this check. A
+  drive-letter prefix (`C:\...`) needs no separate folding here --
+  it's already uppercased upstream before the path is split into a
+  prefix and components.
+  Those extended-length forms don't just fold their own case
+  independently of each other -- they fold to the exact same
+  publication key as their ordinary-form equivalent.
+  `\\?\UNC\server\share\...` normalizes identically to
+  `\\server\share\...` (both collapse marker, server, and share down to
+  the same shared prefix shape), and `\\?\C:\...` normalizes
+  identically to `C:\...` (its drive letter is uppercased the same way
+  the ordinary form's already is). Without that convergence, a source
+  published under one spelling and a not-yet-created write target
+  expressed under the other would look like two distinct locations
+  right up until the second write silently overwrote the first.
+  Every unique manifest source path is additionally checked against
+  every *other* unique source path, not only against write targets: two
+  different `DestinationPath` values that are physically the same file
+  (e.g. reached via a symlink/hard link, or differing only by case or
+  Unicode normalization) are deduped when they flatten to the same
+  basename, but rejected when they would flatten to different basenames:
+  staging the same underlying file twice under two bulk-import names
+  would silently duplicate it once Accumulo imports both flattened
+  copies.
+  Built-in remote/object-store paths (S3, GCS, Azure, HDFS) are
+  canonicalized through each backend's own path parser before
+  comparison, so a qualified spelling like `s3://bucket/key` and its
+  scheme-less `bucket/key` equivalent are recognized as the same
+  destination even though they're different strings. That same backend
+  identity still applies when the backend is wrapped (for example by
+  `diskcache.Backend`). Generic custom `scheme://...` backends keep
+  URL-style path joining, but unless they use one of those built-in
+  parsers they are otherwise compared lexically. Local paths get
+  Windows-drive normalization first (so `C://data/F.rf` is recognized
+  as local rather than mistaken for a remote URL), then an explicit
+  symlink-target resolution step alongside the case/Unicode-insensitive
+  lexical check and `os.Stat` + `os.SameFile` fallback, so a symlink
+  aliasing a path that itself doesn't exist yet (nothing for
+  `os.SameFile` to compare) is still caught by comparing the symlink's
+  resolved target lexically. Symlink-target resolution also walks a
+  path's ancestor directory components, not only its own final
+  component: a relative symlink
+  reached through a *symlinked parent directory* (for example
+  `bulk/alias -> "."` with `bulk/A.rf -> alias/B.rf`, where
+  `bulk/B.rf` doesn't exist yet) is resolved to the same
+  not-yet-existing `bulk/B.rf` target either path would actually reach,
+  rather than being compared as if `alias/B.rf` were itself the final,
+  non-symlink spelling. This ancestor walk deliberately avoids
+  `filepath.EvalSymlinks`, which on Windows also silently expands 8.3
+  short names (e.g. `MARCPA~1` to a real user's long name) even when no
+  symlink is present anywhere in the path, which would otherwise break
+  lexical comparison against a path that was never resolved; instead it
+  substitutes a resolved spelling only where `os.Lstat` actually
+  confirms a real symlink, leaving every other component untouched.
+  On Windows specifically, the lexical comparison also strips trailing
+  dots and spaces from every path component before comparing: Win32's
+  own path resolution silently discards them, so `A.rf`, `A.rf.`, and
+  `A.rf ` can all name the same not-yet-created file there even though
+  they are three distinct strings. This is gated to `runtime.GOOS ==
+  "windows"` rather than to a path's apparent syntax, since the quirk
+  depends on the filesystem the write actually lands on (always this
+  process's own OS for the local backend) — unconditionally stripping
+  trailing dots/spaces would misreport genuinely distinct filenames as
+  aliases on Linux/macOS, where a trailing dot or space is ordinary,
+  significant content. On local Windows destinations, `StageBulkDir`
+  also rejects any additional `:` inside a target path component (for
+  example `A.rf:$DATA`, `A.rf::$DATA`, or named streams such as
+  `A.rf:meta:$DATA`) instead of trying to canonicalize NTFS alternate
+  data stream aliases; the only allowed colon is the drive-letter
+  separator itself.
+  A Win32 extended-length `\\?\` prefix is stripped before this check
+  runs (recognizing both `\\?\C:\...` and `\\?\UNC\server\share\...`),
+  so a bulk directory expressed in extended-length form -- typically
+  chosen specifically to bypass `MAX_PATH` for a long staging path --
+  isn't rejected merely for the drive letter's own colon surviving as
+  a separate path component under the naive `\\?\` split.
+  `StageBulkDir` also conservatively treats a literal Windows DOS 8.3
+  short-name spelling (for example `LONGFI~1.RF`) as a possible alias of
+  any not-yet-created long-name write target sharing the same extension
+  in the same directory, even when the two stems don't lexically match.
+  NTFS only derives a short name's stem from the long name's own leading
+  characters under its simple, non-colliding scheme; once a directory
+  accumulates enough short-name collisions, NTFS instead assigns a
+  hashed stem with no predictable relationship to the long name's
+  characters. Because both write targets are still absent at this point
+  (`os.Stat` can't disambiguate them), and NTFS's own hashing scheme
+  can't be reliably replicated here, requiring an exact stem match would
+  risk silently missing that hash-based alias. The extension isn't
+  subject to this hash substitution, so it remains a reliable narrowing
+  signal instead: only same-extension pairs are treated as ambiguous. A
+  long-name component that already fits within 8.3 using its
+  definitely-safe character set is exempt, since NTFS never generates a
+  distinct short name for it.
+  `joinBulkPath` and the `bulkDir` root-validation preflight both
+  recognize a non-local write target the same, deliberately generic
+  way `internal/engine`'s own backend-path joining does: any
+  `scheme://...`-shaped path (plus HDFS's authorityless `hdfs:/` form)
+  is treated as backend-style, not only the four schemes
+  (`s3/gs/az/hdfs`) this package knows how to canonicalize for alias
+  comparison — so a custom or future backend with its own URI scheme
+  still joins with `/` and validates correctly instead of silently
+  falling through to a native, OS-specific `filepath.Join`. A backend
+  can override this scheme-shaped heuristic entirely by declaring
+  itself local (`storage.LocalPathSemanticProvider`, which the local
+  backend implements and which still applies through a wrapper such as
+  `diskcache.Backend`, since scheme/identity checks unwrap to the
+  innermost backend first): a `bulkDir` that is itself a local
+  directory literally named e.g. `hdfs:/bulk` is then still recognized
+  and preflighted as local rather than mistaken for a remote HDFS root
+  purely because of its spelling.
 - `internal/promotion.Promote` — composes `StageBulkDir` with a
   `BulkImporter` (satisfied by `*accumulo.Connector`) to submit the FATE
   call. Submits nothing when the derived mapping is empty (nothing to
@@ -174,7 +336,16 @@ Mapped against #70's five acceptance criteria:
    and `bulkDir` safely reproduces the same bytes. A persistent I/O failure
    partway through copying *multiple* files can still leave a partially
    staged bulk directory, but retrying the same call completes it without
-   manual repair.
+   manual repair. That guarantee covers staging only: once
+   `Promote` has called `BulkImporter.BulkImport`, retry safety ends,
+   because `TABLE_BULK_IMPORT2` FATE submission has no dedup/idempotency
+   of its own. An ambiguous failure at or after that call (e.g. a
+   timeout after the manager received the request but before the client
+   observed a response) leaves the caller unable to tell whether the
+   import already happened, so blindly calling `Promote` again in that
+   window risks a duplicate bulk import. Closing that gap needs a
+   promotion-state or idempotency-token API this slice does not yet
+   have (see item 4 below).
 3. **"split changes and partial uploads recover without manual metadata
    repair"** — not implemented for split-bearing exports, because those
    manifests are rejected before submission. A future rewrite or

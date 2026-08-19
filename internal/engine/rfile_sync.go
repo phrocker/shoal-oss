@@ -123,7 +123,7 @@ func (e *Engine) ExportRFilesIncremental(ctx context.Context, tableName string, 
 	current := make(map[string]bool, len(files))
 	for _, f := range files {
 		rel := e.exportRelPath(f, tableName, opts.ProducerID)
-		dstPath := joinBackendPath(opts.DestinationRoot, filepath.FromSlash(rel))
+		dstPath := joinBackendPath(dst, opts.DestinationRoot, filepath.FromSlash(rel))
 		current[rel] = true
 
 		if prev, ok := priorShipped[rel]; ok && prev.DestinationPath == dstPath {
@@ -171,7 +171,7 @@ func (e *Engine) ExportRFilesIncremental(ctx context.Context, tableName string, 
 
 	manifestPath := opts.ManifestPath
 	if manifestPath == "" {
-		manifestPath = joinBackendPath(opts.DestinationRoot, "manifest.json")
+		manifestPath = joinBackendPath(dst, opts.DestinationRoot, "manifest.json")
 	}
 	data, err := json.MarshalIndent(manifest, "", "  ")
 	if err != nil {
@@ -181,7 +181,7 @@ func (e *Engine) ExportRFilesIncremental(ctx context.Context, tableName string, 
 	if err := storage.WriteAll(ctx, dst, manifestPath, data); err != nil {
 		return nil, fmt.Errorf("engine: write manifest %s: %w", manifestPath, err)
 	}
-	seqPath := joinBackendPath(opts.DestinationRoot, fmt.Sprintf("manifest-%06d.json", state.Sequence))
+	seqPath := joinBackendPath(dst, opts.DestinationRoot, fmt.Sprintf("manifest-%06d.json", state.Sequence))
 	if err := storage.WriteAll(ctx, dst, seqPath, data); err != nil {
 		return nil, fmt.Errorf("engine: write manifest snapshot %s: %w", seqPath, err)
 	}

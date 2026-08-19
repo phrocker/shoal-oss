@@ -117,10 +117,12 @@ func NewConnector(instance Instance, credentials Credentials, opts ConnectorOpti
 		if locator != nil {
 			walker := metadata.NewWalkerWithLifecycle(locator, scan)
 			namespaceNames := namespaces.NewResolver(locator)
+			state, _ := locator.(tableStateReader)
 			connector.discovery = newConnectorDiscovery(
 				walker,
 				namespaceNames,
 				tablenames.NewResolver(locator, namespaceNames),
+				state,
 			)
 			connector.managerAddr = zkManagerAddressResolver{locator: locator}
 			connector.clientAddr = zkClientServiceAddressResolver{locator: locator}

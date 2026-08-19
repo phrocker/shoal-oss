@@ -89,6 +89,9 @@ type activeHandle struct {
 
 var errBackendClosed = errors.New("hdfs: backend closed")
 
+// Authority returns the configured namenode authority, if any.
+func (b *Backend) Authority() string { return b.authority }
+
 // New constructs a Backend for a namenode address such as "namenode:8020" or
 // "hdfs://namenode:8020". The colinmarc/hdfs default configuration and
 // authentication behavior apply when New creates the client. Prefer
@@ -414,7 +417,7 @@ func (b *Backend) resolve(objectPath string) (resolved, qualifier string, err er
 	if u.Scheme == "" {
 		return objectPath, "", nil
 	}
-	if u.Scheme != "hdfs" {
+	if !isHDFSScheme(u.Scheme) {
 		return "", "", fmt.Errorf("hdfs: unsupported path scheme %q", u.Scheme)
 	}
 	if u.Opaque != "" {
@@ -449,7 +452,7 @@ func AddressFromPath(objectPath string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("hdfs: parse path %q: %w", objectPath, err)
 	}
-	if u.Scheme != "hdfs" {
+	if !isHDFSScheme(u.Scheme) {
 		return "", fmt.Errorf("hdfs: path %q does not use the hdfs scheme", objectPath)
 	}
 	if u.Opaque != "" {
@@ -472,7 +475,7 @@ func parseAddress(address string) (authority, clientAddress string, err error) {
 	if err != nil {
 		return "", "", fmt.Errorf("hdfs: parse address %q: %w", address, err)
 	}
-	if u.Scheme != "hdfs" || u.Host == "" || (u.Path != "" && u.Path != "/") {
+	if !isHDFSScheme(u.Scheme) || u.Host == "" || (u.Path != "" && u.Path != "/") {
 		return "", "", fmt.Errorf("hdfs: invalid namenode address %q", address)
 	}
 	return u.Host, u.Host, nil
@@ -805,6 +808,10 @@ func combineDialContexts(requestCtx, boundCtx context.Context) (context.Context,
 	return ctx, func() {
 		_ = stop()
 	}
+}
+
+func isHDFSScheme(value string) bool {
+	return strings.EqualFold(value, "hdfs")
 }
 
 func ensureLeadingSlash(value string) string {
