@@ -928,3 +928,92 @@ func TestClientServicesHandoffUsesSingleScopedConnection(t *testing.T) {
 		t.Fatalf("connects/closes = %d/%d, want 1/1", connects.Load(), closes.Load())
 	}
 }
+
+func TestLocatorRejectsReadsAfterClose(t *testing.T) {
+	factoryCalls := 0
+	locator := &Locator{
+		instanceID: "uuid-1",
+		conn:       nil,
+		rawConnFactory: func() (rawZKConn, error) {
+			factoryCalls++
+			return &countingConn{}, nil
+		},
+	}
+	// Close without a shared connection: mark the locator closed directly,
+	// which is what Close does before dropping the session.
+	locator.mu.Lock()
+	locator.closed = true
+	locator.mu.Unlock()
+
+	cancellable, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	for name, ctx := range map[string]context.Context{
+		"background":  context.Background(),
+		"cancellable": cancellable,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := locator.Children(ctx, "/accumulo/uuid-1/tservers"); !errors.Is(err, ErrClosed) {
+				t.Fatalf("Children error = %v, want ErrClosed", err)
+			}
+			if _, err := locator.GetRaw(ctx, "/accumulo/uuid-1/root_tablet"); !errors.Is(err, ErrClosed) {
+				t.Fatalf("GetRaw error = %v, want ErrClosed", err)
+			}
+			if _, err := locator.RootTabletLocation(ctx); !errors.Is(err, ErrClosed) {
+				t.Fatalf("RootTabletLocation error = %v, want ErrClosed", err)
+			}
+			if _, _, err := locator.topologyReadScope(ctx); !errors.Is(err, ErrClosed) {
+				t.Fatalf("topologyReadScope error = %v, want ErrClosed", err)
+			}
+		})
+	}
+	if factoryCalls != 0 {
+		t.Fatalf("closed locator opened %d ZooKeeper connections, want 0", factoryCalls)
+	}
+}
+
+func TestLocatorCloseReleasesOutstandingScopes(t *testing.T) {
+	conn := &countingConn{}
+	locator := &Locator{
+		instanceID:     "uuid-1",
+		conn:           nil,
+		rawConnFactory: func() (rawZKConn, error) { return conn, nil },
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	_, release, err := locator.topologyReadScope(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	locator.mu.Lock()
+	tracked := len(locator.scopes)
+	locator.mu.Unlock()
+	if tracked != 1 {
+		t.Fatalf("tracked scopes = %d, want 1", tracked)
+	}
+
+	locator.closeScopes()
+	if conn.closes != 1 {
+		t.Fatalf("scope connection closed %d times, want 1", conn.closes)
+	}
+	// Releasing after Close must stay safe and must not resurrect tracking.
+	release()
+	locator.mu.Lock()
+	tracked = len(locator.scopes)
+	locator.mu.Unlock()
+	if tracked != 0 {
+		t.Fatalf("tracked scopes after close = %d, want 0", tracked)
+	}
+}
+
+type countingConn struct {
+	closes int
+}
+
+func (c *countingConn) AddAuth(string, []byte) error { return nil }
+func (c *countingConn) Get(string) ([]byte, *gozk.Stat, error) {
+	return nil, nil, gozk.ErrNoNode
+}
+func (c *countingConn) Children(string) ([]string, *gozk.Stat, error) {
+	return nil, nil, gozk.ErrNoNode
+}
+func (c *countingConn) Close() { c.closes++ }

@@ -51,7 +51,16 @@ type Locator struct {
 	sessionTimeout time.Duration
 	instanceSecret string
 	rawConnFactory func() (rawZKConn, error)
+
+	mu     sync.Mutex
+	closed bool
+	scopes map[*scopedTopologyReader]struct{}
 }
+
+// ErrClosed reports a read attempted after the locator was closed. Close
+// releases the instance permanently: it must not be possible to reconnect
+// through a scoped read afterwards.
+var ErrClosed = errors.New("zk: locator closed")
 
 // New connects to a ZK quorum, resolves the instance name to its instance
 // UUID, and returns a Locator ready to issue further lookups.
@@ -101,7 +110,65 @@ func NewWithAuth(servers []string, instanceName string, sessionTimeout time.Dura
 func (l *Locator) InstanceID() string { return l.instanceID }
 
 // Close terminates the ZK session.
-func (l *Locator) Close() { l.conn.Close() }
+// Close terminates the ZK session and permanently disables further reads.
+// Scoped connections handed out for cancellable reads are closed too, so an
+// in-flight topology read is released rather than outliving the locator.
+func (l *Locator) Close() {
+	l.mu.Lock()
+	if l.closed {
+		l.mu.Unlock()
+		return
+	}
+	l.mu.Unlock()
+
+	l.closeScopes()
+	l.conn.Close()
+}
+
+// closeScopes marks the locator closed and closes every scoped connection it
+// handed out, so no cancellable read can outlive Close or reconnect after it.
+func (l *Locator) closeScopes() {
+	l.mu.Lock()
+	l.closed = true
+	scopes := make([]*scopedTopologyReader, 0, len(l.scopes))
+	for scope := range l.scopes {
+		scopes = append(scopes, scope)
+	}
+	l.scopes = nil
+	l.mu.Unlock()
+
+	for _, scope := range scopes {
+		scope.Close()
+	}
+}
+
+func (l *Locator) isClosed() bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.closed
+}
+
+func (l *Locator) trackScope(scope *scopedTopologyReader) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.closed {
+		return ErrClosed
+	}
+	if l.scopes == nil {
+		l.scopes = make(map[*scopedTopologyReader]struct{})
+	}
+	l.scopes[scope] = struct{}{}
+	return nil
+}
+
+func (l *Locator) releaseScope(scope *scopedTopologyReader) {
+	l.mu.Lock()
+	if l.scopes != nil {
+		delete(l.scopes, scope)
+	}
+	l.mu.Unlock()
+	scope.Close()
+}
 
 func (l *Locator) lookupInstanceID() (string, error) {
 	p := path.Join(zRoot, zInstances, l.instanceName)
@@ -161,6 +228,9 @@ func (l *Locator) GetRaw(ctx context.Context, znodePath string) ([]byte, error) 
 func (l *Locator) get(ctx context.Context, znodePath string) ([]byte, *gozk.Stat, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, nil, err
+	}
+	if l.isClosed() {
+		return nil, nil, ErrClosed
 	}
 	if ctx.Done() != nil {
 		return getWithContext(ctx, znodePath, l.instanceSecret, l.rawConnFactoryOrDefault())
@@ -314,6 +384,9 @@ func (l *Locator) Children(ctx context.Context, znodePath string) ([]string, err
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	if l.isClosed() {
+		return nil, ErrClosed
+	}
 	if ctx.Done() != nil {
 		return childrenWithContext(ctx, znodePath, l.instanceSecret, l.rawConnFactoryOrDefault())
 	}
@@ -338,6 +411,9 @@ func (l *Locator) topologyReadScope(ctx context.Context) (LockReader, func(), er
 	if err := ctx.Err(); err != nil {
 		return nil, nil, err
 	}
+	if l.isClosed() {
+		return nil, nil, ErrClosed
+	}
 	if ctx.Done() == nil {
 		return l, func() {}, nil
 	}
@@ -353,7 +429,13 @@ func (l *Locator) topologyReadScope(ctx context.Context) (LockReader, func(), er
 		instancePath: l.InstancePath(),
 		conn:         conn,
 	}
-	return scope, scope.Close, nil
+	// Closing between the connect and here must not leave a live session
+	// behind: trackScope rejects the scope and the connection is dropped.
+	if err := l.trackScope(scope); err != nil {
+		scope.Close()
+		return nil, nil, err
+	}
+	return scope, func() { l.releaseScope(scope) }, nil
 }
 
 func addAuthWithContext(ctx context.Context, conn rawZKConn, instanceSecret string) error {

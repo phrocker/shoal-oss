@@ -467,6 +467,40 @@ func TestInstanceTopologyIsConcurrentlyUsable(t *testing.T) {
 	wg.Wait()
 }
 
+func TestInstanceTopologyAfterCloseRejectsLiveDiscovery(t *testing.T) {
+	locator := topologyTree("uuid-1")
+	instance := newTopologyInstance(t, locator, ZooKeeperConfig{})
+	if err := instance.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Both a cancellable and a background context must fail: Close releases
+	// the instance permanently, and the outcome must not depend on whether
+	// the caller passed a context that can be cancelled.
+	cancellable, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	for name, ctx := range map[string]context.Context{
+		"background":  context.Background(),
+		"cancellable": cancellable,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := instance.RootTabletLocation(ctx); !errors.Is(err, ErrInstanceClosed) {
+				t.Fatalf("RootTabletLocation error = %v, want ErrInstanceClosed", err)
+			}
+			if _, err := instance.ManagerLocations(ctx); !errors.Is(err, ErrInstanceClosed) {
+				t.Fatalf("ManagerLocations error = %v, want ErrInstanceClosed", err)
+			}
+			if _, err := instance.Servers(ctx); !errors.Is(err, ErrInstanceClosed) {
+				t.Fatalf("Servers error = %v, want ErrInstanceClosed", err)
+			}
+		})
+	}
+	if locator.rootCalls.Load() != 0 || locator.childCalls.Load() != 0 {
+		t.Fatalf("closed instance still reached ZooKeeper: root=%d children=%d",
+			locator.rootCalls.Load(), locator.childCalls.Load())
+	}
+}
+
 func TestInstanceTopologyAfterCloseStillReportsStaticWiring(t *testing.T) {
 	locator := topologyTree("uuid-1")
 	instance := newTopologyInstance(t, locator, ZooKeeperConfig{})

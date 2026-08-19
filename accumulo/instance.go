@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/phrocker/shoal/internal/zk"
@@ -87,6 +88,7 @@ type zkLocator struct {
 	zooKeepers    []string
 	configuration *Configuration
 	once          sync.Once
+	closed        atomic.Bool
 }
 
 // NewZooKeeperInstance resolves an Accumulo 4 instance name through ZooKeeper.
@@ -184,7 +186,12 @@ func (i *zkLocator) discoveryLocator() discoveryLocator {
 }
 
 func (i *zkLocator) Close() error {
-	i.once.Do(i.locator.Close)
+	i.once.Do(func() {
+		// Mark first: a live accessor racing with Close must fail rather than
+		// open a fresh ZooKeeper session behind the closing one.
+		i.closed.Store(true)
+		i.locator.Close()
+	})
 	return nil
 }
 

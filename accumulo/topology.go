@@ -86,6 +86,9 @@ func (i *zkLocator) RootTabletLocation(ctx context.Context) (TabletLocation, err
 	if err := ctx.Err(); err != nil {
 		return TabletLocation{}, err
 	}
+	if i.closed.Load() {
+		return TabletLocation{}, fmt.Errorf("%w: root tablet location", ErrInstanceClosed)
+	}
 	location, err := i.locator.RootTabletLocation(ctx)
 	if err != nil {
 		return TabletLocation{}, fmt.Errorf("accumulo: resolve root tablet location: %w", err)
@@ -118,6 +121,9 @@ func (i *zkLocator) ManagerLocations(ctx context.Context) ([]string, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	if i.closed.Load() {
+		return nil, fmt.Errorf("%w: manager locations", ErrInstanceClosed)
+	}
 	addresses, err := zk.ManagerAddresses(ctx, i.locator)
 	if err != nil {
 		return nil, mapManagerDiscoveryError(err)
@@ -143,6 +149,9 @@ func (i *zkLocator) ManagerLocations(ctx context.Context) ([]string, error) {
 func (i *zkLocator) Servers(ctx context.Context) ([]ServerConnection, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+	if i.closed.Load() {
+		return nil, fmt.Errorf("%w: servers", ErrInstanceClosed)
 	}
 	services, err := zk.ClientServices(ctx, i.locator)
 	if err != nil {
