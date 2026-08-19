@@ -1014,6 +1014,7 @@ func (o sdkAzureWriteOperations) deleteStage(
 var azureCleanupTimeout = 10 * time.Second
 
 const committedCleanupAttempts = 2
+const maxUploadBlobFromURLBytes int64 = 5000 << 20
 
 type destinationVerificationState uint8
 
@@ -1075,6 +1076,9 @@ func (w *writer) Close() error {
 	if resolved, err := w.resolveIndeterminateClose(); resolved || err != nil {
 		return err
 	}
+	if err := validateAzurePromotionSize(int64(w.buf.Len())); err != nil {
+		return err
+	}
 	if !w.stageCreated {
 		w.stageUnknown = true
 		stage, err := w.ops.uploadStage(w.ctx, w.container, w.stageName, w.buf.Bytes(), w.writeID)
@@ -1086,6 +1090,7 @@ func (w *writer) Close() error {
 					w.cleanupStage(),
 				)
 			}
+
 			stage = w.stage
 		}
 		w.rememberStage(stage)
@@ -1138,6 +1143,17 @@ func (w *writer) Close() error {
 	}
 	w.closed = true
 	w.cleanupCommittedStageBestEffort()
+	return nil
+}
+
+func validateAzurePromotionSize(size int64) error {
+	if size > maxUploadBlobFromURLBytes {
+		return fmt.Errorf(
+			"azure: staged write size %d exceeds Put Blob From URL promotion limit %d",
+			size,
+			maxUploadBlobFromURLBytes,
+		)
+	}
 	return nil
 }
 

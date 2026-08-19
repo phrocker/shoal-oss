@@ -306,7 +306,9 @@ opt-in.
   `s3:GetObject`/HeadObject inspection, and conditional `s3:DeleteObject` or
   `s3:DeleteObjectVersion` permissions. Azure cleanup enumerates blob versions
   and deletes the exact owned stage version so versioned containers do not
-  retain hidden staging data. Local replacement on portable
+  retain hidden staging data. Azure writes larger than the 5,000 MiB
+  `Put Blob From URL` promotion limit are rejected before staging. Local
+  replacement on portable
   rename-fallback paths can leave a reserved backup as the only surviving copy
   after a crash or ambiguous publish failure, so janitor cleanup preserves such
   backups for explicit recovery instead of deleting them automatically. Local

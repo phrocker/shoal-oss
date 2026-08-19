@@ -822,6 +822,15 @@ func TestCleanupStaleArtifactsSupportsRootPrefix(t *testing.T) {
 	}
 }
 
+func TestValidateAzurePromotionSize(t *testing.T) {
+	if err := validateAzurePromotionSize(maxUploadBlobFromURLBytes); err != nil {
+		t.Fatalf("limit-sized write rejected: %v", err)
+	}
+	if err := validateAzurePromotionSize(maxUploadBlobFromURLBytes + 1); err == nil {
+		t.Fatal("oversized write was not rejected before staging")
+	}
+}
+
 func TestBackendCreateRejectsReservedInternalBlobNames(t *testing.T) {
 	backend := &Backend{
 		ops:            newFakeAzureWriteOperations(),
