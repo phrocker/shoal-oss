@@ -1456,6 +1456,118 @@ func TestBackendCloseCancelsActiveReadAndRejectsNewOperations(t *testing.T) {
 	}
 }
 
+func TestBackendReadCloseDoesNotSurfaceExpectedOperationClientClose(t *testing.T) {
+	backend, err := NewContext(context.Background(), "nn:8020",
+		WithClient(newFakeClient()),
+		func(c *config) {
+			c.clientLeaseFactory = func(ctx context.Context) (*leasedClient, error) {
+				client := newFakeClient()
+				client.files["/tables/1.rf"] = []byte("data")
+				return &leasedClient{
+					client: client,
+					release: func() error {
+						if ctx.Err() != nil {
+							return net.ErrClosed
+						}
+						return nil
+					},
+				}, nil
+			}
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer backend.Close()
+
+	f, err := backend.Open(context.Background(), "/tables/1.rf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := make([]byte, 4)
+	if _, err := f.ReadAt(got, 0); err != nil {
+		t.Fatalf("ReadAt: %v", err)
+	}
+	if string(got) != "data" {
+		t.Fatalf("ReadAt data = %q, want data", got)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("Close error = %v, want nil", err)
+	}
+}
+
+func TestBackendReaderCloseIgnoresExpectedOperationClientCloseAfterCancellation(t *testing.T) {
+	t.Run("request cancellation", func(t *testing.T) {
+		backend, err := NewContext(context.Background(), "nn:8020",
+			WithClient(newFakeClient()),
+			func(c *config) {
+				c.clientLeaseFactory = func(ctx context.Context) (*leasedClient, error) {
+					client := newFakeClient()
+					client.files["/tables/1.rf"] = []byte("data")
+					return &leasedClient{
+						client: client,
+						release: func() error {
+							if ctx.Err() != nil {
+								return errors.New("use of closed network connection")
+							}
+							return nil
+						},
+					}, nil
+				}
+			},
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer backend.Close()
+
+		opCtx, cancel := context.WithCancel(context.Background())
+		f, err := backend.Open(opCtx, "/tables/1.rf")
+		if err != nil {
+			t.Fatal(err)
+		}
+		cancel()
+		if err := f.Close(); err != nil {
+			t.Fatalf("Close after cancel error = %v, want nil", err)
+		}
+	})
+
+	t.Run("backend close", func(t *testing.T) {
+		backend, err := NewContext(context.Background(), "nn:8020",
+			WithClient(newFakeClient()),
+			func(c *config) {
+				c.clientLeaseFactory = func(ctx context.Context) (*leasedClient, error) {
+					client := newFakeClient()
+					client.files["/tables/1.rf"] = []byte("data")
+					return &leasedClient{
+						client: client,
+						release: func() error {
+							if ctx.Err() != nil {
+								return errors.New("use of closed network connection")
+							}
+							return nil
+						},
+					}, nil
+				}
+			},
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		f, err := backend.Open(context.Background(), "/tables/1.rf")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := backend.Close(); err != nil {
+			t.Fatalf("Backend.Close error = %v, want nil", err)
+		}
+		if err := f.Close(); err != nil {
+			t.Fatalf("file Close after Backend.Close: %v", err)
+		}
+	})
+}
+
 func TestBackendCloseAbortsActiveWriterWithoutLeakingTemp(t *testing.T) {
 	client := newFakeClient()
 	backend, err := New("nn:8020", WithClient(client))

@@ -767,11 +767,17 @@ func bindOperationLeaseFactory(boundCtx context.Context, factory func(context.Co
 		}
 		release := lease.release
 		lease.release = onceCloser(func() error {
-			releaseCtx()
+			var releaseErr error
 			if release == nil {
+				releaseCtx()
 				return nil
 			}
-			return release()
+			releaseErr = release()
+			releaseCtx()
+			if isExpectedOperationCloseError(releaseErr) {
+				return nil
+			}
+			return releaseErr
 		})
 		return lease, nil
 	}
@@ -922,6 +928,35 @@ func cleanupWriterAfterDeadlineFailure(
 		}
 	}
 	return cleanupErr
+}
+
+type multiUnwrapper interface {
+	Unwrap() []error
+}
+
+func isExpectedOperationCloseError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, net.ErrClosed) || strings.Contains(err.Error(), "use of closed network connection") {
+		return true
+	}
+	if unwrapper, ok := err.(multiUnwrapper); ok {
+		unwrapped := unwrapper.Unwrap()
+		if len(unwrapped) == 0 {
+			return false
+		}
+		for _, inner := range unwrapped {
+			if !isExpectedOperationCloseError(inner) {
+				return false
+			}
+		}
+		return true
+	}
+	if inner := errors.Unwrap(err); inner != nil {
+		return isExpectedOperationCloseError(inner)
+	}
+	return false
 }
 
 type file struct {
