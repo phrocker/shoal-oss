@@ -308,8 +308,9 @@ opt-in.
   rename-fallback paths can leave a reserved backup as the only surviving copy
   after a crash or ambiguous publish failure, so janitor cleanup preserves such
   backups for explicit recovery instead of deleting them automatically. Local
-  `Open` follows symlinks, but local `Create` intentionally rejects symlink
-  destinations; resolve the final target path before writing.
+  `Create` follows a final-component symlink by resolving it once and staging
+  beside its referent, preserving the symlink and prior truncating-write
+  behavior.
 
 ## License
 

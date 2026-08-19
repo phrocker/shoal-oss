@@ -1274,63 +1274,6 @@ func TestLocal_PublishFailureUsesContentFallbackWhenPhysicalIdentityUnavailable(
 	}
 }
 
-func TestLocal_CreateRejectsSymlinkDestinations(t *testing.T) {
-	dir := t.TempDir()
-	target := filepath.Join(dir, "target")
-	link := filepath.Join(dir, "link")
-	if err := os.WriteFile(target, []byte("old"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Symlink(target, link); err != nil {
-		if runtime.GOOS == "windows" {
-			t.Skipf("symlink creation unavailable: %v", err)
-		}
-		t.Fatalf("Symlink: %v", err)
-	}
-
-	f, err := New().Open(context.Background(), link)
-	if err != nil {
-		t.Fatalf("Open symlink: %v", err)
-	}
-	defer f.Close()
-	body := make([]byte, f.Size())
-	if _, err := f.ReadAt(body, 0); err != nil {
-		t.Fatalf("ReadAt symlink: %v", err)
-	}
-	if string(body) != "old" {
-		t.Fatalf("symlink open contents = %q, want old", body)
-	}
-
-	if _, err := New().Create(context.Background(), link); err == nil || !strings.Contains(err.Error(), "symlink destinations are not supported") {
-		t.Fatalf("Create symlink error = %v, want explicit symlink rejection", err)
-	}
-	got, err := os.ReadFile(target)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(got) != "old" {
-		t.Fatalf("target contents = %q, want old", got)
-	}
-}
-
-func TestLocal_CreateRejectsDanglingSymlinkDestinations(t *testing.T) {
-	dir := t.TempDir()
-	link := filepath.Join(dir, "link")
-	if err := os.Symlink(filepath.Join(dir, "missing"), link); err != nil {
-		if runtime.GOOS == "windows" {
-			t.Skipf("symlink creation unavailable: %v", err)
-		}
-		t.Fatalf("Symlink: %v", err)
-	}
-
-	if _, err := New().Create(context.Background(), link); err == nil || !strings.Contains(err.Error(), "symlink destinations are not supported") {
-		t.Fatalf("Create dangling symlink error = %v, want explicit symlink rejection", err)
-	}
-	if info, err := os.Lstat(link); err != nil || info.Mode()&os.ModeSymlink == 0 {
-		t.Fatalf("dangling symlink changed after rejection: info=%v err=%v", info, err)
-	}
-}
-
 // strandedBackupOps mimics the rename fallback failing after the old target has
 // already been moved aside, leaving the backup as the only copy.
 type strandedBackupOps struct {
