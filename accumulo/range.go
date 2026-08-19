@@ -356,32 +356,12 @@ func cloneKey(key *Key) *Key {
 	if key == nil {
 		return nil
 	}
-	return &Key{
-		Row:              cloneRow(key.Row),
-		ColumnFamily:     cloneRow(key.ColumnFamily),
-		ColumnQualifier:  cloneRow(key.ColumnQualifier),
-		ColumnVisibility: cloneRow(key.ColumnVisibility),
-		Timestamp:        key.Timestamp,
-	}
+	clone := key.Clone()
+	return &clone
 }
 
+// compareKeys orders range bounds. It is Key.Compare, so a range predicate can
+// never disagree with the ordering the key type publishes.
 func compareKeys(left, right Key) int {
-	for _, pair := range [][2][]byte{
-		{left.Row, right.Row},
-		{left.ColumnFamily, right.ColumnFamily},
-		{left.ColumnQualifier, right.ColumnQualifier},
-		{left.ColumnVisibility, right.ColumnVisibility},
-	} {
-		if comparison := bytes.Compare(pair[0], pair[1]); comparison != 0 {
-			return comparison
-		}
-	}
-	switch {
-	case left.Timestamp > right.Timestamp:
-		return -1
-	case left.Timestamp < right.Timestamp:
-		return 1
-	default:
-		return 0
-	}
+	return left.Compare(right)
 }

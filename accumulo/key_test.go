@@ -89,15 +89,31 @@ func TestKeySettersCopyAndReplace(t *testing.T) {
 	}
 }
 
-func TestKeyEmptyTracksTheRow(t *testing.T) {
+func TestKeyEmptyTracksEveryComponent(t *testing.T) {
 	var key Key
 	if !key.Empty() {
 		t.Fatal("the zero key is not empty")
 	}
-	key.SetRow([]byte("r"))
-	if key.Empty() {
-		t.Fatal("a key with a row is empty")
+	for _, populate := range []func(*Key){
+		func(k *Key) { k.SetRow([]byte("r")) },
+		func(k *Key) { k.SetColumnFamily([]byte("cf")) },
+		func(k *Key) { k.SetColumnQualifier([]byte("cq")) },
+		func(k *Key) { k.SetColumnVisibility([]byte("cv")) },
+	} {
+		var populated Key
+		populate(&populated)
+		if populated.Empty() {
+			t.Fatalf("a key with one populated component is empty: %+v", populated)
+		}
 	}
+	// Neither the timestamp nor the deletion marker makes a key non-empty.
+	var marked Key
+	marked.SetTimestamp(7)
+	marked.SetDeleted(true)
+	if !marked.Empty() {
+		t.Fatal("the timestamp or the deletion marker made the key non-empty")
+	}
+	key.SetRow([]byte("r"))
 	key.SetRow(nil)
 	if !key.Empty() {
 		t.Fatal("clearing the row did not empty the key")
@@ -145,6 +161,7 @@ func TestKeyCompareOrdersLikeAccumulo(t *testing.T) {
 		{"row", NewKey([]byte("a")), NewKey([]byte("b")), -1},
 		{"family", func() Key { k := base(); k.SetColumnFamily([]byte("aa")); return k }(), base(), -1},
 		{"qualifier", func() Key { k := base(); k.SetColumnQualifier([]byte("aa")); return k }(), base(), -1},
+		{"visibility", func() Key { k := base(); k.SetColumnVisibility([]byte("aa")); return k }(), base(), -1},
 		{"newer timestamp first", func() Key { k := base(); k.SetTimestamp(9); return k }(), base(), -1},
 		{"older timestamp last", func() Key { k := base(); k.SetTimestamp(1); return k }(), base(), 1},
 		{"deleted first", func() Key { k := base(); k.SetDeleted(true); return k }(), base(), -1},
@@ -161,21 +178,34 @@ func TestKeyCompareOrdersLikeAccumulo(t *testing.T) {
 	}
 }
 
-func TestKeyCompareIgnoresVisibility(t *testing.T) {
+func TestKeyCompareOrdersVisibilityBeforeTheTimestamp(t *testing.T) {
 	left := NewKeyWithColumns([]byte("r"), []byte("cf"), []byte("cq"), []byte("a"), 5)
 	right := NewKeyWithColumns([]byte("r"), []byte("cf"), []byte("cq"), []byte("b"), 5)
-	if left.Compare(right) != 0 {
-		t.Fatalf("Compare = %d, want 0", left.Compare(right))
+	if left.Compare(right) >= 0 {
+		t.Fatalf("Compare = %d, want negative", left.Compare(right))
+	}
+	if left.Equal(right) {
+		t.Fatal("cells with distinct visibilities compared equal")
+	}
+	// Visibility outranks the timestamp: a newer version of the "b" label
+	// still sorts after every "a" label.
+	newerRight := right.Clone()
+	newerRight.SetTimestamp(9)
+	if left.Compare(newerRight) >= 0 {
+		t.Fatalf("Compare across visibilities = %d", left.Compare(newerRight))
 	}
 	if left.CompareToVisibility(right) >= 0 {
 		t.Fatalf("CompareToVisibility = %d", left.CompareToVisibility(right))
 	}
-	// CompareToVisibility ignores the timestamp and the deletion marker.
+	// CompareToVisibility, and only it, ignores the timestamp and the marker.
 	older := right.Clone()
 	older.SetTimestamp(1)
 	older.SetDeleted(true)
 	if right.CompareToVisibility(older) != 0 {
 		t.Fatalf("CompareToVisibility across versions = %d", right.CompareToVisibility(older))
+	}
+	if right.Compare(older) >= 0 {
+		t.Fatalf("Compare across versions = %d", right.Compare(older))
 	}
 }
 
@@ -229,6 +259,7 @@ func TestKeyEqualComparesEveryOrderedComponent(t *testing.T) {
 		func(k Key) Key { k.SetRow([]byte("other")); return k },
 		func(k Key) Key { k.SetColumnFamily([]byte("other")); return k },
 		func(k Key) Key { k.SetColumnQualifier([]byte("other")); return k },
+		func(k Key) Key { k.SetColumnVisibility([]byte("other")); return k },
 		func(k Key) Key { k.SetTimestamp(6); return k },
 		func(k Key) Key { k.SetDeleted(true); return k },
 	} {
@@ -236,11 +267,27 @@ func TestKeyEqualComparesEveryOrderedComponent(t *testing.T) {
 			t.Fatal("a mutated key compared equal")
 		}
 	}
-	// Visibility is not part of the ordered identity, matching Accumulo.
-	withVisibility := base.Clone()
-	withVisibility.SetColumnVisibility([]byte("other"))
-	if !base.Equal(withVisibility) {
-		t.Fatal("visibility changed the ordered identity")
+}
+
+func TestRangeBoundsPreserveTheDeletionMarker(t *testing.T) {
+	start := NewKey([]byte("a"))
+	start.SetDeleted(true)
+	end := NewKey([]byte("z"))
+	scanRange, err := NewKeyRange(&start, true, &end, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bound := scanRange.StartKey(); bound == nil || !bound.Deleted {
+		t.Fatalf("StartKey dropped the deletion marker: %+v", bound)
+	}
+	if bound := scanRange.EndKey(); bound == nil || bound.Deleted {
+		t.Fatalf("EndKey invented a deletion marker: %+v", bound)
+	}
+	// A deletion marker sorts before the live key with the same components, so
+	// the range predicates must agree with Key.Compare.
+	live := NewKey([]byte("a"))
+	if compareKeys(start, live) != start.Compare(live) {
+		t.Fatalf("compareKeys = %d, Key.Compare = %d", compareKeys(start, live), start.Compare(live))
 	}
 }
 

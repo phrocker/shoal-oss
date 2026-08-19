@@ -35,8 +35,12 @@ func (k Key) Clone() Key {
 	}
 }
 
-// Empty reports whether the key names no row.
-func (k Key) Empty() bool { return len(k.Row) == 0 }
+// Empty reports whether the key carries no bytes in any component, which is
+// how the pinned type defines empty.
+func (k Key) Empty() bool {
+	return len(k.Row) == 0 && len(k.ColumnFamily) == 0 &&
+		len(k.ColumnQualifier) == 0 && len(k.ColumnVisibility) == 0
+}
 
 // SetRow replaces the row with a copy of row.
 func (k *Key) SetRow(row []byte) { k.Row = cloneRow(row) }
@@ -79,10 +83,12 @@ func (k Key) Length() int {
 // Size returns the number of bytes the key's components occupy.
 func (k Key) Size() int { return k.Length() }
 
-// Compare orders two keys the way Accumulo does: by row, column family and
-// column qualifier ascending, then by timestamp descending so the newest
-// version sorts first, then with deletion markers before live entries. It
-// returns a negative number, zero, or a positive number.
+// Compare orders two keys the way Accumulo does: by row, column family,
+// column qualifier and column visibility ascending, then by timestamp
+// descending so the newest version sorts first, then with deletion markers
+// before live entries. It is the ROW_COLFAM_COLQUAL_COLVIS_TIME_DEL ordering
+// `internal/rfile/wire` already uses. It returns a negative number, zero, or a
+// positive number.
 func (k Key) Compare(other Key) int {
 	if order := bytes.Compare(k.Row, other.Row); order != 0 {
 		return order
@@ -91,6 +97,9 @@ func (k Key) Compare(other Key) int {
 		return order
 	}
 	if order := bytes.Compare(k.ColumnQualifier, other.ColumnQualifier); order != 0 {
+		return order
+	}
+	if order := bytes.Compare(k.ColumnVisibility, other.ColumnVisibility); order != 0 {
 		return order
 	}
 	switch {
