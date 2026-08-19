@@ -23,6 +23,10 @@ int shoal_test_client_settings_match(
     char *table_name,
     shoal_bytes authorization,
     int32_t thread_count);
+int shoal_test_client_columns_match(shoal_client *client, shoal_bytes family,
+                                    shoal_bytes qualifier,
+                                    uint8_t has_qualifier,
+                                    size_t column_count);
 size_t shoal_test_connector_flush_wait_count(shoal_connector *connector,
                                              uint8_t wait);
 int shoal_test_connector_identity_block(                                        shoal_connector *connector,

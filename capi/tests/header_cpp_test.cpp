@@ -10,7 +10,7 @@ static_assert(std::is_same<shoal_abi_capability_bits, std::uint64_t>::value,
               "capability bitset words must remain 64-bit");
 static_assert(SHOAL_ABI_VERSION == 1u, "unexpected ABI version");
 static_assert(SHOAL_ABI_VERSION_MAJOR == 1u, "unexpected ABI major");
-static_assert(SHOAL_ABI_VERSION_MINOR == 10u, "unexpected ABI minor");
+static_assert(SHOAL_ABI_VERSION_MINOR == 11u, "unexpected ABI minor");
 static_assert(SHOAL_ABI_VERSION_PATCH == 0u, "unexpected ABI patch");
 static_assert(SHOAL_ABI_VERSION_PACKED ==
                   SHOAL_ABI_PACK_VERSION(SHOAL_ABI_VERSION_MAJOR,
@@ -45,9 +45,11 @@ static_assert(SHOAL_ABI_CAPABILITY_CONNECTOR_CONTROL == 20u,
               "unexpected connector control capability id");
 static_assert(SHOAL_ABI_CAPABILITY_HIGH_LEVEL_CLIENT == 21u,
               "unexpected high-level client capability id");
-static_assert(SHOAL_ABI_CAPABILITY_COUNT == 22u,
+static_assert(SHOAL_ABI_CAPABILITY_HIGH_LEVEL_SCANNER == 22u,
+              "unexpected high-level scanner capability id");
+static_assert(SHOAL_ABI_CAPABILITY_COUNT == 23u,
               "unexpected capability count");
-static_assert(SHOAL_ABI_CAPABILITY_WORD0 == 0x00000000003fffffull,
+static_assert(SHOAL_ABI_CAPABILITY_WORD0 == 0x00000000007fffffull,
               "unexpected capability word 0");
 static_assert(std::is_standard_layout<shoal_connector_identity_view>::value,
               "identity view must remain standard-layout");
@@ -170,6 +172,8 @@ int main() {
   assert(shoal_abi_has_capability(SHOAL_ABI_CAPABILITY_TABLE_MAINTENANCE) == 1);
   assert(shoal_abi_has_capability(SHOAL_ABI_CAPABILITY_CONNECTOR_CONTROL) == 1);
   assert(shoal_abi_has_capability(SHOAL_ABI_CAPABILITY_HIGH_LEVEL_CLIENT) == 1);
+  assert(shoal_abi_has_capability(SHOAL_ABI_CAPABILITY_HIGH_LEVEL_SCANNER) ==
+         1);
   assert(shoal_abi_has_capability(SHOAL_ABI_CAPABILITY_COUNT) == 0);
   assert(shoal_versioned_properties_version(versioned_properties) == 0);
   assert(shoal_versioned_properties_count(versioned_properties) == 0);
@@ -198,6 +202,18 @@ int main() {
   shoal_client_config_init(&client_config);
   assert(client_config.struct_size == SHOAL_CLIENT_CONFIG_V1_SIZE);
   assert(client_config.thread_count == 10);
+  const auto client_select_column = &shoal_client_select_column;
+  const auto client_scan_range = &shoal_client_scan_range;
+  const auto client_scan_range_cancel =
+      &shoal_client_scan_range_with_cancellation;
+  const auto client_scan_ranges = &shoal_client_scan_ranges;
+  const auto client_scan_ranges_cancel =
+      &shoal_client_scan_ranges_with_cancellation;
+  (void)client_select_column;
+  (void)client_scan_range;
+  (void)client_scan_range_cancel;
+  (void)client_scan_ranges;
+  (void)client_scan_ranges_cancel;
   assert(shoal_client_create(&client_config, &client, &error) ==
          SHOAL_STATUS_INVALID_ARGUMENT);
   shoal_error_free(&error);

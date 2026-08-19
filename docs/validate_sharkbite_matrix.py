@@ -14,7 +14,7 @@ import tempfile
 
 
 DOC_PATH = Path(__file__).with_name("sharkbite-compatibility.md")
-EXPECTED_REVISION = 31
+EXPECTED_REVISION = 32
 # Update this manifest only when the independently audited inventory itself
 # changes; review every added/removed or reclassified ID in code review.
 EXPECTED_ROW_MANIFEST = DOC_PATH.with_name(
@@ -59,16 +59,16 @@ def status_count_map(
 
 
 EXPECTED_STATUS_COUNTS = {
-    "Covered": 79,
+    "Covered": 84,
     "Missing Go": 2361,
-    "Missing C ABI": 63,
+    "Missing C ABI": 58,
     "Behavior mismatch": 221,
     "Intentional divergence (approval required)": 87,
     "Not required (rationale required)": 392,
 }
 
 EXPECTED_PREFIX_COUNTS = {
-    "SB-BASE": status_count_map(covered=8, missing_c_abi=10, not_required=2),
+    "SB-BASE": status_count_map(covered=13, missing_c_abi=5, not_required=2),
     "SB-CFG": status_count_map(
         covered=12,
         behavior_mismatch=16,
@@ -195,17 +195,17 @@ EXPECTED_METADATA_FIELDS = {
     ),
     "Sharkbite release line": "`sharkbite` 1.2.0.3 on PyPI (`setup.py:34-35`)",
     "Shoal reference": (
-        "`phrocker/shoal-oss` exact audited baseline for revision 31 "
-        "`c5e3552fc25d2fcbe94ce7cc1d91b46dfe27011c` "
-        "(\"Add connector control C ABI (#139)\") "
-        "plus the high-level client C ABI introduced in this revision"
+        "`phrocker/shoal-oss` exact audited baseline for revision 32 "
+        "`09a6e473753794dc83bd559e7efe3d36d224588f` "
+        "(\"Add high-level client C ABI (#141)\") "
+        "plus the high-level scanner C ABI introduced in this revision"
     ),
     "Shoal C ABI version": "`SHOAL_ABI_VERSION 1u` (`capi/include/shoal_types.h`)",
 }
 
 EXPECTED_DOCUMENT_STATUS_SNIPPETS = (
     "Normative gate. Binding on all Sharkbite-compatibility work.",
-    f"Revision {EXPECTED_REVISION} — completes the eight-row high-level client facade",
+    f"Revision {EXPECTED_REVISION} — completes the five-row high-level scanner facade",
     "Revision 26 — completes the 17-row data-model value C ABI",
     "Revision 23 — records the public data-model value types",
     "Revision 22 — reclassifies the thirty-one RFile and stream rows of [§15](#sec-15)",
@@ -263,8 +263,8 @@ DEFAULT_C_ABI_INCLUDE_PATHS = (
     Path("capi/include"),
     Path("capi/tests"),
 )
-EXPECTED_C_ABI_DECLARED_EXPORTS = 218
-EXPECTED_C_ABI_REFERENCED_EXPORTS = 213
+EXPECTED_C_ABI_DECLARED_EXPORTS = 223
+EXPECTED_C_ABI_REFERENCED_EXPORTS = 218
 EXPECTED_C_ABI_UNREFERENCED_EXPORTS = (
     "shoal_scanner_scan",
     "shoal_batch_scanner_scan",
@@ -1644,9 +1644,9 @@ def validate_status_narratives(
     python_visible_behavior = status_counts["Behavior mismatch"] - prefix_counts["SB-CXX"]["Behavior mismatch"]
 
     expected_phrases = [
-        f"As of revision {EXPECTED_REVISION} that is {required_rows} of {total_rows} rows, and **only {status_counts['Covered']} are satisfied** ([SB-XCUT-012](#sec-20), the twelve configuration/topology rows in [§6](#sec-6), the 31 RFile/stream rows in [§15](#sec-15), the 17 data-model value rows in [§8](#sec-8) and [§19.2](#sec-19-2), the four buffered-writer rows in [§10](#sec-10), the four row-bounded flush/constraint rows in [§11](#sec-11) and [§19.2](#sec-19-2), the connector invalidation/cancellation rows in [§7](#sec-7) and [§20](#sec-20), and the eight high-level client rows in [§10.1](#sec-10-1))",
+        f"As of revision {EXPECTED_REVISION} that is {required_rows} of {total_rows} rows, and **only {status_counts['Covered']} are satisfied** ([SB-XCUT-012](#sec-20), the twelve configuration/topology rows in [§6](#sec-6), the 31 RFile/stream rows in [§15](#sec-15), the 17 data-model value rows in [§8](#sec-8) and [§19.2](#sec-19-2), the four buffered-writer rows in [§10](#sec-10), the four row-bounded flush/constraint rows in [§11](#sec-11) and [§19.2](#sec-19-2), the connector invalidation/cancellation rows in [§7](#sec-7) and [§20](#sec-20), the eight high-level client rows in [§10.1](#sec-10-1), and the five high-level scanner rows in [§10.1](#sec-10-1))",
         f"{required_rows} rows are **required** by the final release gate ([§2.2](#sec-2)); the {status_counts[NOT_REQUIRED_STATUS]} `Not required` rows are excluded by construction, and {prefix_counts['SB-CXX'][NOT_REQUIRED_STATUS]} of those are the evidence-proved duplicates described in [§19.1](#sec-19-1).",
-        "**Exactly 79 rows are `Covered`: [SB-XCUT-012](#sec-20), the twelve configuration/topology rows completed in revision 24, the 31 RFile/stream rows completed in revision 25, the 17 data-model value rows completed in revision 26, the four buffered-writer rows completed in revision 28, the four row-bounded flush/constraint rows completed in revision 29, the connector invalidation/cancellation rows completed in revision 30, and the eight high-level client rows completed in revision 31.**",
+        "**Exactly 84 rows are `Covered`: [SB-XCUT-012](#sec-20), the twelve configuration/topology rows completed in revision 24, the 31 RFile/stream rows completed in revision 25, the 17 data-model value rows completed in revision 26, the four buffered-writer rows completed in revision 28, the four row-bounded flush/constraint rows completed in revision 29, the connector invalidation/cancellation rows completed in revision 30, the eight high-level client rows completed in revision 31, and the five high-level scanner rows completed in revision 32.**",
         f"The shape of the work is visible in the {status_counts['Missing Go']} `Missing Go` rows, of which {prefix_counts['SB-CXX']['Missing Go']} are the C++ members in [§19.2](#sec-19-2) that no Shoal layer exports.",
         f"`Behavior mismatch` ({status_counts['Behavior mismatch']}) is the bucket that sets the schedule: {python_visible_behavior} rows on the Python-visible and curated C++ surface each need a differential test against a live cluster or the exported ABI, and {prefix_counts['SB-CXX']['Behavior mismatch']} are destructors of classes bound into Python, where the destruction point is user-observable and the model differs from Go finalisation ([§19.1](#sec-19-1)).",
         f"`Intentional divergence` ({status_counts[INTENTIONAL_DIVERGENCE_STATUS]}) is dominated by one upstream fact: {prefix_counts['SB-STAT'][INTENTIONAL_DIVERGENCE_STATUS]} rows are cluster-status accessors Accumulo itself deleted ([§14](#sec-14), [SB-DIV-016](#sec-26)).",

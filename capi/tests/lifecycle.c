@@ -8,9 +8,9 @@
 
 _Static_assert(SHOAL_ABI_VERSION == 1u, "unexpected compatibility ABI version");
 _Static_assert(SHOAL_ABI_VERSION_MAJOR == 1u, "unexpected ABI major");
-_Static_assert(SHOAL_ABI_VERSION_MINOR == 10u, "unexpected ABI minor");
+_Static_assert(SHOAL_ABI_VERSION_MINOR == 11u, "unexpected ABI minor");
 _Static_assert(SHOAL_ABI_VERSION_PATCH == 0u, "unexpected ABI patch");
-_Static_assert(SHOAL_ABI_VERSION_PACKED == 0x00010a00u,
+_Static_assert(SHOAL_ABI_VERSION_PACKED == 0x00010b00u,
                "unexpected packed ABI version");
 _Static_assert(SHOAL_ABI_CAPABILITY_CONNECTOR == 0u,
                "unexpected connector capability id");
@@ -54,11 +54,13 @@ _Static_assert(SHOAL_ABI_CAPABILITY_CONNECTOR_CONTROL == 20u,
                "unexpected connector control capability id");
 _Static_assert(SHOAL_ABI_CAPABILITY_HIGH_LEVEL_CLIENT == 21u,
                "unexpected high-level client capability id");
-_Static_assert(SHOAL_ABI_CAPABILITY_COUNT == 22u,
+_Static_assert(SHOAL_ABI_CAPABILITY_HIGH_LEVEL_SCANNER == 22u,
+               "unexpected high-level scanner capability id");
+_Static_assert(SHOAL_ABI_CAPABILITY_COUNT == 23u,
                "unexpected capability count");
 _Static_assert(SHOAL_ABI_CAPABILITY_WORD_COUNT == 1u,
                "unexpected capability word count");
-_Static_assert(SHOAL_ABI_CAPABILITY_WORD0 == UINT64_C(0x3fffff),
+_Static_assert(SHOAL_ABI_CAPABILITY_WORD0 == UINT64_C(0x7fffff),
                "unexpected capability word 0");
 
 #define ASSERT_PERMISSION_VALUE(name, value)                                  \
@@ -643,6 +645,8 @@ int main(void) {
   assert(shoal_abi_has_capability(SHOAL_ABI_CAPABILITY_BUFFERED_WRITER) == 1);
   assert(shoal_abi_has_capability(SHOAL_ABI_CAPABILITY_CONNECTOR_CONTROL) == 1);
   assert(shoal_abi_has_capability(SHOAL_ABI_CAPABILITY_HIGH_LEVEL_CLIENT) == 1);
+  assert(shoal_abi_has_capability(SHOAL_ABI_CAPABILITY_HIGH_LEVEL_SCANNER) ==
+         1);
   assert(shoal_abi_has_capability(SHOAL_ABI_CAPABILITY_COUNT) == 0);
   assert(shoal_abi_has_capability(63u) == 0);
   assert(shoal_abi_has_capability(64u) == 0);
@@ -840,6 +844,80 @@ int main(void) {
          SHOAL_STATUS_OK);
   assert(scanner != NULL && error == NULL);
   shoal_scanner_free(&scanner);
+  uint8_t client_family_data[] = {'f', 0, 'm'};
+  uint8_t client_qualifier_data[] = {'q', 0};
+  shoal_bytes client_family = {
+      client_family_data, sizeof(client_family_data)};
+  shoal_bytes client_qualifier = {
+      client_qualifier_data, sizeof(client_qualifier_data)};
+  shoal_bytes empty_bytes = {NULL, 0};
+  assert(shoal_client_select_column(
+             admin_client, client_family, NULL, &error) == SHOAL_STATUS_OK);
+  client_family_data[0] = 'x';
+  const uint8_t expected_client_family_data[] = {'f', 0, 'm'};
+  shoal_bytes expected_client_family = {
+      expected_client_family_data, sizeof(expected_client_family_data)};
+  assert(shoal_test_client_columns_match(
+      admin_client, expected_client_family, empty_bytes, 0, 1));
+  client_family_data[0] = 'f';
+  assert(shoal_client_select_column(
+             admin_client, client_family, &client_qualifier, &error) ==
+         SHOAL_STATUS_OK);
+  client_family_data[0] = 'x';
+  client_qualifier_data[0] = 'x';
+  const uint8_t expected_client_qualifier_data[] = {'q', 0};
+  shoal_bytes expected_client_qualifier = {
+      expected_client_qualifier_data, sizeof(expected_client_qualifier_data)};
+  assert(shoal_test_client_columns_match(
+      admin_client, expected_client_family, expected_client_qualifier, 1, 2));
+  shoal_bytes malformed_column = {NULL, 1};
+  expect_error(shoal_client_select_column(
+                   admin_client, malformed_column, NULL, &error),
+               SHOAL_STATUS_INVALID_ARGUMENT, &error, "column family");
+
+  shoal_range client_ranges[2];
+  shoal_range_init(&client_ranges[0]);
+  shoal_range_init(&client_ranges[1]);
+  expect_error(shoal_client_scan_range(
+                   admin_client, NULL, 0, &result, &error),
+               SHOAL_STATUS_INVALID_ARGUMENT, &error, "range is required");
+  expect_error(shoal_client_scan_range(
+                   admin_client, &client_ranges[0], -1, &result, &error),
+               SHOAL_STATUS_INVALID_ARGUMENT, &error,
+               "timeout_ms must not be negative");
+  expect_error(shoal_client_scan_ranges(
+                   admin_client, NULL, 0, 0, &result, &error),
+               SHOAL_STATUS_INVALID_ARGUMENT, &error,
+               "at least one range is required");
+  assert(shoal_client_scan_range(
+             admin_client, &client_ranges[0], 0, &result, &error) ==
+         SHOAL_STATUS_OK);
+  assert(result != NULL && shoal_scan_result_count(result) == 1);
+  shoal_scan_result_free(&result);
+  assert(shoal_client_scan_ranges(
+             admin_client, client_ranges, 2, 0, &result, &error) ==
+         SHOAL_STATUS_OK);
+  assert(result != NULL && shoal_scan_result_count(result) == 2);
+  shoal_scan_result_free(&result);
+  shoal_test_result_alloc_fail_after(0);
+  expect_error(shoal_client_scan_range(
+                   admin_client, &client_ranges[0], 0, &result, &error),
+               SHOAL_STATUS_OUT_OF_MEMORY, &error, "scan result");
+  assert(result == NULL);
+  shoal_test_result_alloc_reset();
+  assert(shoal_cancellation_create(&cancellation, &error) == SHOAL_STATUS_OK);
+  assert(shoal_cancellation_cancel(cancellation, &error) == SHOAL_STATUS_OK);
+  expect_error(shoal_client_scan_range_with_cancellation(
+                   admin_client, &client_ranges[0], 0, cancellation, &result,
+                   &error),
+               SHOAL_STATUS_CANCELLED, &error, "context canceled");
+  assert(result == NULL);
+  expect_error(shoal_client_scan_ranges_with_cancellation(
+                   admin_client, client_ranges, 2, 0, cancellation, &result,
+                   &error),
+               SHOAL_STATUS_CANCELLED, &error, "context canceled");
+  assert(result == NULL);
+  shoal_cancellation_free(&cancellation);
   expect_error(shoal_client_list_tables(admin_client, 0, NULL, &error),
                SHOAL_STATUS_INVALID_ARGUMENT, &error,
                "out_result is required");
@@ -854,6 +932,13 @@ int main(void) {
   assert(table_list == NULL && error != NULL);
   shoal_error_free(&error);
   shoal_test_result_alloc_reset();
+  assert(shoal_client_close(admin_client, &error) == SHOAL_STATUS_OK);
+  expect_error(shoal_client_scan_range(
+                   admin_client, &client_ranges[0], 0, &result, &error),
+               SHOAL_STATUS_CLOSED, &error, "connector is closed");
+  expect_error(shoal_client_select_column(
+                   admin_client, expected_client_family, NULL, &error),
+               SHOAL_STATUS_CLOSED, &error, "connector is closed");
   shoal_client_free(&admin_client);
   assert(admin_client == NULL);
 
