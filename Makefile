@@ -87,7 +87,7 @@ thrift-gen: thrift-check
 	$(MAKE) patch-thrift-nil-binary
 
 .PHONY: thrift-verify
-thrift-verify: thrift-check
+thrift-verify: validate thrift-check
 	@test -d "$(THRIFT_OUT)" || { \
 	  echo "generated Thrift bindings not found at $(THRIFT_OUT); run make thrift-gen"; \
 	  exit 1; \
@@ -183,6 +183,14 @@ capi:
 	mv bin/capi/$(CAPI_INTERMEDIATE) bin/capi/$(CAPI_LIBRARY)
 	rm -f bin/capi/shoal-cgo.h
 	cp capi/include/shoal.h capi/include/shoal_types.h bin/capi/
+
+.PHONY: docs-validate
+docs-validate:
+	python docs/test_validate_sharkbite_matrix.py
+	python docs/validate_sharkbite_matrix.py
+
+.PHONY: validate
+validate: docs-validate
 
 .PHONY: test
 test:

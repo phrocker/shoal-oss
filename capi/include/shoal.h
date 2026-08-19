@@ -7,7 +7,36 @@
 extern "C" {
 #endif
 
+/*
+ * Legacy compatibility-major query preserved for existing callers. Use the
+ * version and capability queries below when negotiating additive features.
+ */
 SHOAL_API uint32_t SHOAL_CALL shoal_abi_version(void);
+
+/*
+ * These queries are deterministic, allocation-free, thread-safe, and valid
+ * before any connector or other handle is created. When a caller may run
+ * against an older library, every additive symbol not guaranteed by that
+ * library must be dynamically resolved before use. Capability checks govern
+ * feature availability but do not make hard symbol references load-safe.
+ */
+SHOAL_API uint32_t SHOAL_CALL shoal_abi_version_major(void);
+SHOAL_API uint32_t SHOAL_CALL shoal_abi_version_minor(void);
+SHOAL_API uint32_t SHOAL_CALL shoal_abi_version_patch(void);
+SHOAL_API uint32_t SHOAL_CALL shoal_abi_version_packed(void);
+
+/*
+ * Capability identifiers are append-only. word_count reports how many 64-bit
+ * words the current library uses. shoal_abi_capability_word() returns 0 for
+ * word_index values beyond that range. shoal_abi_has_capability() returns 1
+ * for supported capabilities and 0 for unsupported or unknown identifiers.
+ */
+SHOAL_API uint32_t SHOAL_CALL shoal_abi_capability_count(void);
+SHOAL_API uint32_t SHOAL_CALL shoal_abi_capability_word_count(void);
+SHOAL_API shoal_abi_capability_bits SHOAL_CALL
+shoal_abi_capability_word(uint32_t word_index);
+SHOAL_API uint8_t SHOAL_CALL
+shoal_abi_has_capability(shoal_abi_capability_id capability_id);
 
 SHOAL_API void SHOAL_CALL
 shoal_connector_config_init(shoal_connector_config *config);
@@ -34,7 +63,10 @@ shoal_connector_create(const shoal_connector_config *config,
 
 /*
  * Closes connector-owned transports and bootstrap resources. Close is
- * idempotent while the handle remains alive.
+ * idempotent while the handle remains alive, cancels active
+ * table-administration calls, and waits for those plus any in-flight scanner
+ * or batch-scanner calls to finish before tearing down connector-owned
+ * resources.
  */
 SHOAL_API shoal_status SHOAL_CALL
 shoal_connector_close(shoal_connector *connector, shoal_error **out_error);
@@ -42,14 +74,112 @@ shoal_connector_close(shoal_connector *connector, shoal_error **out_error);
 /*
  * Closes and releases an owned connector handle, then sets *connector to NULL.
  * Passing NULL or a pointer whose value is NULL is a no-op. Call close first
- * when its error must be observed.
+ * when its error must be observed. Any scanner or batch-scanner created from
+ * this connector permanently rejects new operations as soon as close/free
+ * starts, while in-flight scan calls are allowed to finish before final
+ * teardown.
  */
 SHOAL_API void SHOAL_CALL shoal_connector_free(shoal_connector **connector);
 
 /*
+ * timeout_ms is zero for no deadline and must not be negative. The returned
+ * list owns every table name/ID pair and stays valid until freed. Entries are
+ * sorted by qualified table name.
+ */
+SHOAL_API shoal_status SHOAL_CALL
+shoal_connector_list_tables(shoal_connector *connector, int64_t timeout_ms,
+                            shoal_table_list_result **out_result,
+                            shoal_error **out_error);
+
+SHOAL_API size_t SHOAL_CALL
+shoal_table_list_count(const shoal_table_list_result *result);
+
+SHOAL_API shoal_status SHOAL_CALL
+shoal_table_list_get(const shoal_table_list_result *result, size_t index,
+                     shoal_table_view *out_table, shoal_error **out_error);
+
+SHOAL_API void SHOAL_CALL
+shoal_table_list_free(shoal_table_list_result **result);
+
+/*
+ * timeout_ms is zero for no deadline and must not be negative. out_exists is
+ * set to 0 before validation and to 1 only when the table is present.
+ */
+SHOAL_API shoal_status SHOAL_CALL
+shoal_connector_table_exists(shoal_connector *connector,
+                             const char *table_name, int64_t timeout_ms,
+                             uint8_t *out_exists, shoal_error **out_error);
+
+SHOAL_API shoal_status SHOAL_CALL
+shoal_connector_create_table(shoal_connector *connector,
+                             const char *table_name, int64_t timeout_ms,
+                             shoal_error **out_error);
+
+SHOAL_API shoal_status SHOAL_CALL
+shoal_connector_delete_table(shoal_connector *connector,
+                             const char *table_name, int64_t timeout_ms,
+                             shoal_error **out_error);
+
+SHOAL_API shoal_status SHOAL_CALL
+shoal_connector_rename_table(shoal_connector *connector,
+                             const char *table_name,
+                             const char *new_table_name, int64_t timeout_ms,
+                             shoal_error **out_error);
+
+/*
+ * wait must be 0 or 1. When set, the call waits until Accumulo reports the
+ * full-table flush complete or the operation deadline expires.
+ */
+SHOAL_API shoal_status SHOAL_CALL
+shoal_connector_flush_table(shoal_connector *connector,
+                            const char *table_name, uint8_t wait,
+                            int64_t timeout_ms, shoal_error **out_error);
+
+/*
+ * property_value is required but may be the empty string; use
+ * shoal_connector_remove_table_property to remove a property entirely.
+ */
+SHOAL_API shoal_status SHOAL_CALL
+shoal_connector_set_table_property(shoal_connector *connector,
+                                   const char *table_name,
+                                   const char *property_name,
+                                   const char *property_value,
+                                   int64_t timeout_ms,
+                                   shoal_error **out_error);
+
+SHOAL_API shoal_status SHOAL_CALL
+shoal_connector_remove_table_property(shoal_connector *connector,
+                                      const char *table_name,
+                                      const char *property_name,
+                                      int64_t timeout_ms,
+                                      shoal_error **out_error);
+
+/*
+ * timeout_ms is zero for no deadline and must not be negative. The returned
+ * key/value pairs own their storage, are sorted by property key, and preserve
+ * explicit empty string values until freed.
+ */
+SHOAL_API shoal_status SHOAL_CALL
+shoal_connector_effective_table_properties(
+    shoal_connector *connector, const char *table_name, int64_t timeout_ms,
+    shoal_table_properties_result **out_result, shoal_error **out_error);
+
+SHOAL_API size_t SHOAL_CALL
+shoal_table_properties_count(const shoal_table_properties_result *result);
+
+SHOAL_API shoal_status SHOAL_CALL
+shoal_table_properties_get(const shoal_table_properties_result *result,
+                           size_t index, shoal_table_property_view *out_entry,
+                           shoal_error **out_error);
+
+SHOAL_API void SHOAL_CALL
+shoal_table_properties_free(shoal_table_properties_result **result);
+
+/*
  * Creates a scanner. The configuration and all nested values are copied.
- * Scanner handles remain valid after connector free, but operations then fail
- * with CLOSED because the underlying connector has been shut down.
+ * Scanner handles remain valid after connector free, but once connector close
+ * or free starts, new operations fail with CLOSED while already-started scans
+ * are allowed to finish before connector teardown.
  */
 SHOAL_API shoal_status SHOAL_CALL
 shoal_connector_create_scanner(shoal_connector *connector,
