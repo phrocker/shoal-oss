@@ -239,6 +239,26 @@ func shoal_error_security_code(err *C.shoal_error) *C.char {
 	return C.shoal_bridge_error_security_code(err)
 }
 
+//export shoal_error_source
+func shoal_error_source(err *C.shoal_error) C.shoal_error_source_class {
+	return C.shoal_bridge_error_source(err)
+}
+
+//export shoal_error_source_name
+func shoal_error_source_name(err *C.shoal_error) *C.char {
+	return (*C.char)(unsafe.Pointer(C.shoal_bridge_error_source_name(err)))
+}
+
+//export shoal_error_compatibility
+func shoal_error_compatibility(err *C.shoal_error) C.shoal_error_compatibility_class {
+	return C.shoal_bridge_error_compatibility(err)
+}
+
+//export shoal_error_compatibility_name
+func shoal_error_compatibility_name(err *C.shoal_error) *C.char {
+	return (*C.char)(unsafe.Pointer(C.shoal_bridge_error_compatibility_name(err)))
+}
+
 //export shoal_error_free
 func shoal_error_free(err **C.shoal_error) {
 	if err == nil || *err == nil {
@@ -472,8 +492,11 @@ func bridgeErrorAlloc(code C.shoal_status, err error) *C.shoal_error {
 			securityCode = securityErr.Code
 		}
 	}
+	source, compatibility := compatibilityClassesForStatus(int32(code))
 	return C.shoal_bridge_error_alloc(
 		code,
+		C.shoal_error_source_class(source),
+		C.shoal_error_compatibility_class(compatibility),
 		cStringData(message),
 		C.size_t(len(message)),
 		cStringData(user),
@@ -481,6 +504,47 @@ func bridgeErrorAlloc(code C.shoal_status, err error) *C.shoal_error {
 		cStringData(securityCode),
 		C.size_t(len(securityCode)),
 	)
+}
+
+const (
+	errorSourceRuntime                       int32 = 0
+	errorSourceClientException               int32 = 1
+	errorSourceIllegalStateException         int32 = 2
+	errorSourceIterationInterruptedException int32 = 3
+
+	errorCompatibilityRuntimeError    int32 = 0
+	errorCompatibilityClientException int32 = 1
+)
+
+func compatibilityClassesForStatus(status int32) (int32, int32) {
+	switch status {
+	case int32(C.SHOAL_STATUS_CLOSED):
+		return errorSourceIllegalStateException, errorCompatibilityRuntimeError
+	case int32(C.SHOAL_STATUS_CANCELLED):
+		return errorSourceIterationInterruptedException, errorCompatibilityRuntimeError
+	case int32(C.SHOAL_STATUS_UNSUPPORTED),
+		int32(C.SHOAL_STATUS_BOOTSTRAP_FAILED),
+		int32(C.SHOAL_STATUS_NOT_FOUND),
+		int32(C.SHOAL_STATUS_PERMISSION_DENIED),
+		int32(C.SHOAL_STATUS_DISCOVERY_UNAVAILABLE),
+		int32(C.SHOAL_STATUS_TABLET_UNAVAILABLE),
+		int32(C.SHOAL_STATUS_RANGE_SPANS_TABLETS),
+		int32(C.SHOAL_STATUS_CLEANUP_FAILED),
+		int32(C.SHOAL_STATUS_RETRY_EXHAUSTED),
+		int32(C.SHOAL_STATUS_MUTATION_REJECTED),
+		int32(C.SHOAL_STATUS_AMBIGUOUS_WRITE),
+		int32(C.SHOAL_STATUS_ALREADY_EXISTS),
+		int32(C.SHOAL_STATUS_UNAVAILABLE),
+		int32(C.SHOAL_STATUS_NAMESPACE_NOT_EMPTY),
+		int32(C.SHOAL_STATUS_TABLE_OFFLINE),
+		int32(C.SHOAL_STATUS_USER_NOT_FOUND),
+		int32(C.SHOAL_STATUS_BAD_CREDENTIALS),
+		int32(C.SHOAL_STATUS_SECURITY_UNAVAILABLE),
+		int32(C.SHOAL_STATUS_INCOMPLETE):
+		return errorSourceClientException, errorCompatibilityClientException
+	default:
+		return errorSourceRuntime, errorCompatibilityRuntimeError
+	}
 }
 
 func fail(outError **C.shoal_error, code C.shoal_status, err error) C.shoal_status {

@@ -29,14 +29,14 @@ Shoal separates **ABI compatibility** from **feature availability**:
   stable allocation-free version tuple that works before connector creation.
   `SHOAL_ABI_VERSION_PACKED` uses
   `SHOAL_ABI_PACK_VERSION(major, minor, patch)` with a hexadecimal
-  `0x00MMmmpp` layout, so ABI `1.11.0` is `0x00010b00`.
+  `0x00MMmmpp` layout, so ABI `1.12.0` is `0x00010c00`.
 - Capability identifiers are append-only. Existing IDs and bits never change
   meaning. `shoal_abi_capability_word_count()` reports how many 64-bit words
   the current library uses, `shoal_abi_capability_word(i)` returns `0` for
   `i >= word_count`, and `shoal_abi_has_capability(id)` returns `0` for both
   unsupported and unknown IDs.
 
-Current capability assignments (`word 0 == 0x00000000007fffff`):
+Current capability assignments (`word 0 == 0x0000000000ffffff`):
 
 | ID | Mask | Surface |
 | --- | --- | --- |
@@ -63,6 +63,7 @@ Current capability assignments (`word 0 == 0x00000000007fffff`):
 | `SHOAL_ABI_CAPABILITY_CONNECTOR_CONTROL` | `0x100000` | one-shot scan cancellation and connector cache invalidation |
 | `SHOAL_ABI_CAPABILITY_HIGH_LEVEL_CLIENT` | `0x200000` | owned mutable high-level client facade and scanner/writer construction |
 | `SHOAL_ABI_CAPABILITY_HIGH_LEVEL_SCANNER` | `0x400000` | copied column selection and direct owned-result client scans |
+| `SHOAL_ABI_CAPABILITY_COMPATIBILITY_ERRORS` | `0x800000` | stable Sharkbite source and Python exception classification for owned errors |
 
 Shoal does **not** advertise instance status, compaction/import/export,
 Python/wheel, or any other unimplemented surface until the API exists and has
@@ -216,6 +217,13 @@ Version numbers change only when the public ABI contract changes:
   until `shoal_write_failure_free`.
 - Failed calls can return an owned `shoal_error`. Its message is borrowed from
   that object and remains valid until `shoal_error_free`.
+- Compatibility error getters distinguish Sharkbite's source category from
+  the Python-facing exception. Application failures map to
+  `ClientException`; closed and cancelled operations retain
+  `IllegalStateException` and `IterationInterruptedException` source names
+  while mapping to `RuntimeError`, matching pybind11's unregistered-exception
+  behavior. The immutable names are library-owned and concurrent getters are
+  safe until the owned error is freed.
 - Status mapping is stable across the ABI: duplicate table names return
   `SHOAL_STATUS_ALREADY_EXISTS`, invalid table/property inputs return
   `SHOAL_STATUS_INVALID_ARGUMENT`, and missing manager/client-service

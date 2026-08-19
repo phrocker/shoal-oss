@@ -39,6 +39,24 @@ SHOAL_API uint8_t SHOAL_CALL
 shoal_abi_has_capability(shoal_abi_capability_id capability_id);
 
 /*
+ * Compatibility error classification is allocation-free and deterministic.
+ * Source class records the closest Sharkbite C++ error category. Compatibility
+ * class records the Python exception a compatibility binding must raise:
+ * ClientException is distinct from RuntimeError. Returned names are immutable
+ * library-owned C strings valid for the lifetime of the loaded library.
+ * Concurrent getters on one owned error are safe; free must be externally
+ * serialized and remains NULL-safe and idempotent.
+ */
+SHOAL_API shoal_error_source_class SHOAL_CALL
+shoal_error_source(const shoal_error *error);
+SHOAL_API const char *SHOAL_CALL
+shoal_error_source_name(const shoal_error *error);
+SHOAL_API shoal_error_compatibility_class SHOAL_CALL
+shoal_error_compatibility(const shoal_error *error);
+SHOAL_API const char *SHOAL_CALL
+shoal_error_compatibility_name(const shoal_error *error);
+
+/*
  * Data-value operations are local and do not take deadlines. Every byte input
  * is copied before return. Authorizations handles are immutable after
  * construction, so concurrent getters are safe; free must be externally
