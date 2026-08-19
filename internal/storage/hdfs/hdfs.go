@@ -209,6 +209,9 @@ func (b *Backend) Close() error {
 		var clientErr error
 		if b.closeClient != nil {
 			clientErr = b.closeClient()
+			if isExpectedOperationCloseError(clientErr) {
+				clientErr = nil
+			}
 		}
 
 		if operationErr != nil {

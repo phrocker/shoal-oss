@@ -2058,6 +2058,43 @@ func TestReaderClosePreservesGenuineErrorAndIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestBackendCloseFiltersOnlyExpectedBaseClientTransportErrors(t *testing.T) {
+	t.Run("already closed transport", func(t *testing.T) {
+		closeCalls := 0
+		backend := &Backend{
+			activeHandles: make(map[uint64]activeHandle),
+			closeClient: func() error {
+				closeCalls++
+				return errors.New("close tcp 127.0.0.1:1234->127.0.0.1:8020: use of closed network connection")
+			},
+		}
+		if err := backend.Close(); err != nil {
+			t.Fatalf("Backend.Close error = %v, want nil", err)
+		}
+		if err := backend.Close(); err != nil {
+			t.Fatalf("second Backend.Close error = %v, want nil", err)
+		}
+		if closeCalls != 1 {
+			t.Fatalf("close client calls = %d, want 1", closeCalls)
+		}
+	})
+
+	t.Run("genuine client failure", func(t *testing.T) {
+		wantErr := errors.New("namenode finalization failed")
+		backend := &Backend{
+			activeHandles: make(map[uint64]activeHandle),
+			closeClient:   func() error { return wantErr },
+		}
+		err := backend.Close()
+		if !errors.Is(err, wantErr) {
+			t.Fatalf("Backend.Close error = %v, want wrapped %v", err, wantErr)
+		}
+		if !strings.Contains(err.Error(), "close client") {
+			t.Fatalf("Backend.Close error = %v, want close-client context", err)
+		}
+	})
+}
+
 func TestBackendCloseAbortsActiveWriterWithoutLeakingTemp(t *testing.T) {
 	client := newFakeClient()
 	backend, err := New("nn:8020", WithClient(client))
