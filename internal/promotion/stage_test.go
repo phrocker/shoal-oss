@@ -270,6 +270,76 @@ func TestStageBulkDirRejectsPhysicalSourceAliasesWithDifferentBasenames(t *testi
 	}
 }
 
+// TestSourceRefsAliasRequiresExactMatchOnUnrecognizedBackendScheme
+// exercises sourceRefsAlias directly: unlike pathsAlias (the
+// write-target collision check, where a false positive only causes a
+// safe refusal to write), a false positive here causes
+// canonicalStageSource to silently drop a distinct manifest entry.
+// Two paths on a backend whose scheme none of the built-in
+// canonicalizers recognize -- and which isn't local -- must therefore
+// only be treated as the same source when they are exactly equal
+// strings, never via the trailing-slash-trimmed heuristic that is
+// appropriate for the write side.
+func TestSourceRefsAliasRequiresExactMatchOnUnrecognizedBackendScheme(t *testing.T) {
+	backend := memory.New()
+	cache := newPathIdentityCache(0)
+	left := newStagePathRef(backend, "custom://bucket/A.rf")
+	trailingSlash := newStagePathRef(backend, "custom://bucket/A.rf/")
+	if sourceRefsAlias(left, trailingSlash, cache) {
+		t.Fatalf("sourceRefsAlias(%q, %q) = true, want false: an unrecognized backend scheme must not merge distinct source keys on a trailing-slash heuristic", left.path, trailingSlash.path)
+	}
+
+	exact := newStagePathRef(backend, "custom://bucket/A.rf")
+	if !sourceRefsAlias(left, exact, cache) {
+		t.Fatalf("sourceRefsAlias(%q, %q) = false, want true: identically-spelled paths on an unrecognized backend scheme are still the same source", left.path, exact.path)
+	}
+}
+
+// TestStageBulkDirDoesNotSilentlyDedupeDistinctSourcesOnUnrecognizedBackendScheme
+// proves the fix for the "custom://bucket/A.rf" vs
+// "custom://bucket/A.rf/" scenario end to end. Before the fix,
+// sourceRefsAlias's trailing-slash-trimmed fallback treated these two
+// manifest entries -- each backed by genuinely different, independently
+// verified bytes on an unrecognized backend scheme -- as the same
+// source; canonicalStageSource kept only the lexicographically-first
+// one and silently dropped the other, so StageBulkDir would have
+// succeeded having staged one fewer file than the export actually
+// produced. Now that dedupeStageSources correctly keeps both distinct,
+// they collide at the destination-flatten step instead (both basenames
+// are "A.rf" once the trailing slash is stripped), so StageBulkDir must
+// fail closed with an explicit error and write nothing, rather than
+// ever silently discarding one source's data.
+func TestStageBulkDirDoesNotSilentlyDedupeDistinctSourcesOnUnrecognizedBackendScheme(t *testing.T) {
+	aPath := "custom://bucket/A.rf"
+	bPath := "custom://bucket/A.rf/"
+	aContent := []byte("distinct source A bytes")
+	bContent := []byte("distinct source B bytes, must not be lost")
+
+	src := memory.New()
+	src.Put(aPath, aContent)
+	src.Put(bPath, bContent)
+
+	aSum := sha256.Sum256(aContent)
+	bSum := sha256.Sum256(bContent)
+	manifest := &engine.RFileExportManifest{
+		Version:     engine.RFileExportManifestVersion,
+		SourceTable: "events",
+		Tablets:     []engine.RFileExportTablet{{Index: 0}},
+		RFiles: []engine.RFileExportFile{
+			{TabletIndex: 0, DestinationPath: aPath, Size: int64(len(aContent)), SHA256: hex.EncodeToString(aSum[:])},
+			{TabletIndex: 0, DestinationPath: bPath, Size: int64(len(bContent)), SHA256: hex.EncodeToString(bSum[:])},
+		},
+	}
+
+	dst := memory.New()
+	if _, err := StageBulkDir(context.Background(), src, manifest, dst, "/bulk/events-1"); err == nil {
+		t.Fatal("StageBulkDir with two distinct sources aliased only by a trailing-slash heuristic = nil error, want error")
+	}
+	if got := dst.Keys(); len(got) != 0 {
+		t.Fatalf("StageBulkDir wrote %v before rejecting the ambiguous flatten, want no writes", got)
+	}
+}
+
 func TestStageBulkDirRejectsInvalidBulkDirBeforeCopying(t *testing.T) {
 	src := memory.New()
 	src.Put("export/events/t-0000/F0001.rf", []byte("data"))

@@ -308,6 +308,21 @@ func canonicalStageSource(members []engine.RFileExportFile) (engine.RFileExportF
 	return reference, nil
 }
 
+// sourceRefsAlias reports whether left and right name the same
+// already-exported source object, so dedupeStageSources may safely
+// collapse them into one staged entry. This is deliberately more
+// conservative than pathsAlias's write-target collision check: a
+// false positive there only causes StageBulkDir to refuse a write
+// (fail safe), but a false positive here would cause
+// canonicalStageSource to silently drop a manifest entry, staging one
+// fewer RFile than the export actually produced (fail unsafe). So,
+// unlike pathsAlias, this never falls back to the trailing-slash-
+// trimmed "looks like a URL" heuristic: on an unrecognized backend
+// (canonicalPath not ok) with non-local semantics, two paths are only
+// treated as the same source when they are exactly equal strings --
+// for example, on a bare in-memory or other custom backend,
+// "custom://bucket/A.rf" and "custom://bucket/A.rf/" are kept as
+// distinct sources rather than merged on a guess.
 func sourceRefsAlias(left, right stagePathRef, cache pathIdentityCache) bool {
 	leftCanonical, leftCanonicalOK := cache.canonicalPath(left)
 	rightCanonical, rightCanonicalOK := cache.canonicalPath(right)
@@ -324,9 +339,6 @@ func sourceRefsAlias(left, right stagePathRef, cache pathIdentityCache) bool {
 		return os.SameFile(leftInfo, rightInfo)
 	}
 
-	if pathLooksURLLikeOnBackend(left.backend, left.path) || pathLooksURLLikeOnBackend(right.backend, right.path) {
-		return strings.TrimRight(left.path, `/\`) == strings.TrimRight(right.path, `/\`)
-	}
 	return left.path == right.path
 }
 
