@@ -197,6 +197,19 @@ func (w *writer) Write(p []byte) (int, error) {
 	return w.file.Write(p)
 }
 
+func (w *writer) Sync() error {
+	if w.abortRequested {
+		return fmt.Errorf("local: writer already aborted")
+	}
+	if w.closed {
+		return fmt.Errorf("local: writer already closed")
+	}
+	if err := w.file.Sync(); err != nil {
+		return fmt.Errorf("local: sync temporary file %s: %w", w.temp, err)
+	}
+	return nil
+}
+
 func (w *writer) Close() error {
 	if w.abortRequested {
 		return fmt.Errorf("local: writer already aborted")

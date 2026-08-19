@@ -14,6 +14,7 @@ import (
 	"path"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	hdfsclient "github.com/colinmarc/hdfs/v2"
@@ -134,11 +135,13 @@ func NewContext(ctx context.Context, address string, opts ...Option) (*Backend, 
 		stopCleanupClient()
 		return nil, err
 	}
-	baseClient, err := newHDFSClient(cleanupClientCtx, clientAddress, options)
+	dialSource := newDialContextSource(backgroundCtx)
+	baseClient, err := newHDFSClientWithContextSource(dialSource.Context, clientAddress, options)
 	if err != nil {
 		stopCleanupClient()
 		return nil, err
 	}
+	dialSource.Store(cleanupClientCtx)
 	return &Backend{
 		client: baseClient.client,
 		newOperation: func(opCtx context.Context) (*leasedClient, error) {
@@ -369,24 +372,38 @@ func parseAddress(address string) (authority, clientAddress string, err error) {
 }
 
 func bindClientOptions(ctx context.Context, options hdfsclient.ClientOptions) hdfsclient.ClientOptions {
-	options.NamenodeDialFunc = bindDialContext(ctx, options.NamenodeDialFunc)
-	options.DatanodeDialFunc = bindDialContext(ctx, options.DatanodeDialFunc)
+	return bindClientOptionsWithContextSource(func() context.Context {
+		return contextOrBackground(ctx)
+	}, options)
+}
+
+func bindClientOptionsWithContextSource(ctxSource func() context.Context, options hdfsclient.ClientOptions) hdfsclient.ClientOptions {
+	options.NamenodeDialFunc = bindDialContextWithSource(ctxSource, options.NamenodeDialFunc)
+	options.DatanodeDialFunc = bindDialContextWithSource(ctxSource, options.DatanodeDialFunc)
 	return options
 }
 
 func bindDialContext(ctx context.Context, dial func(context.Context, string, string) (net.Conn, error)) func(context.Context, string, string) (net.Conn, error) {
-	ctx = contextOrBackground(ctx)
+	return bindDialContextWithSource(func() context.Context {
+		return contextOrBackground(ctx)
+	}, dial)
+}
+
+func bindDialContextWithSource(ctxSource func() context.Context, dial func(context.Context, string, string) (net.Conn, error)) func(context.Context, string, string) (net.Conn, error) {
 	if dial == nil {
 		dial = (&net.Dialer{}).DialContext
 	}
-	return func(_ context.Context, network, addr string) (net.Conn, error) {
-		conn, err := dial(ctx, network, addr)
+	return func(requestCtx context.Context, network, addr string) (net.Conn, error) {
+		effectiveCtx, release := combineDialContexts(requestCtx, ctxSource())
+		conn, err := dial(effectiveCtx, network, addr)
 		if err != nil {
+			release()
 			return nil, err
 		}
-		conn = bindConnContext(ctx, conn)
-		if deadline, ok := ctx.Deadline(); ok {
+		conn = bindConnContext(effectiveCtx, conn, release)
+		if deadline, ok := effectiveCtx.Deadline(); ok {
 			if err := conn.SetDeadline(deadline); err != nil {
+				release()
 				_ = conn.Close()
 				return nil, err
 			}
@@ -400,6 +417,24 @@ func contextOrBackground(ctx context.Context) context.Context {
 		return context.Background()
 	}
 	return ctx
+}
+
+type dialContextSource struct {
+	current atomic.Value
+}
+
+func newDialContextSource(ctx context.Context) *dialContextSource {
+	source := &dialContextSource{}
+	source.current.Store(contextOrBackground(ctx))
+	return source
+}
+
+func (s *dialContextSource) Context() context.Context {
+	return s.current.Load().(context.Context)
+}
+
+func (s *dialContextSource) Store(ctx context.Context) {
+	s.current.Store(contextOrBackground(ctx))
 }
 
 func newBackendClientContext(ctx context.Context) (context.Context, context.CancelFunc) {
@@ -416,6 +451,39 @@ func newBackendCloser(cancel context.CancelFunc, closeFn func() error) func() er
 		}
 		return closeFn()
 	})
+}
+
+func combineDialContexts(requestCtx, boundCtx context.Context) (context.Context, func()) {
+	requestCtx = contextOrBackground(requestCtx)
+	boundCtx = contextOrBackground(boundCtx)
+
+	parent := requestCtx
+	requestDeadline, requestHasDeadline := requestCtx.Deadline()
+	if boundDeadline, boundHasDeadline := boundCtx.Deadline(); boundHasDeadline && (!requestHasDeadline || boundDeadline.Before(requestDeadline)) {
+		parent = boundCtx
+	}
+
+	ctx, cancel := context.WithCancel(parent)
+	stops := make([]func() bool, 0, 2)
+	for _, source := range []context.Context{requestCtx, boundCtx} {
+		if source.Done() == nil {
+			continue
+		}
+		stops = append(stops, context.AfterFunc(source, cancel))
+	}
+
+	stop := onceCloser(func() error {
+		for _, stop := range stops {
+			if stop != nil {
+				stop()
+			}
+		}
+		cancel()
+		return nil
+	})
+	return ctx, func() {
+		_ = stop()
+	}
 }
 
 func ensureLeadingSlash(value string) string {
@@ -441,11 +509,22 @@ type contextRemover interface {
 	RemoveContext(context.Context, string) error
 }
 
+type contextRenamer interface {
+	RenameContext(context.Context, string, string) error
+}
+
 func removeWithContext(ctx context.Context, client Client, name string) error {
 	if remover, ok := client.(contextRemover); ok {
 		return remover.RemoveContext(contextOrBackground(ctx), name)
 	}
 	return client.Remove(name)
+}
+
+func renameWithContext(ctx context.Context, client Client, oldpath, newpath string) error {
+	if renamer, ok := client.(contextRenamer); ok {
+		return renamer.RenameContext(contextOrBackground(ctx), oldpath, newpath)
+	}
+	return client.Rename(oldpath, newpath)
 }
 
 func clearDeadline(target any) error {
@@ -558,17 +637,19 @@ func (w *replaceWriter) Close() (retErr error) {
 func (w *replaceWriter) commitReplacement() error {
 	backup := w.target + ".shoal-backup-" + uuid.NewString()
 	hadOld := true
-	if err := w.client.Rename(w.target, backup); err != nil {
+	if err := renameWithContext(w.ctx, w.client, w.target, backup); err != nil {
 		if !isNotFound(err) {
 			return fmt.Errorf("hdfs: preserve existing file %s: %w", w.target, err)
 		}
 		hadOld = false
 	}
 
-	if err := w.client.Rename(w.temp, w.target); err != nil {
+	if err := renameWithContext(w.ctx, w.client, w.temp, w.target); err != nil {
 		publishErr := fmt.Errorf("hdfs: publish %s: %w", w.target, err)
 		if hadOld {
-			if restoreErr := w.restoreBackup(backup); restoreErr != nil {
+			if restoreErr := withCleanupContext(func(cleanupCtx context.Context) error {
+				return w.restoreBackup(cleanupCtx, backup)
+			}); restoreErr != nil {
 				w.state = replacementUnabortable
 				publishErr = errors.Join(publishErr, restoreErr)
 			}
@@ -579,8 +660,10 @@ func (w *replaceWriter) commitReplacement() error {
 	if hadOld {
 		if err := w.client.Remove(backup); err != nil && !isNotFound(err) {
 			cleanupErr := fmt.Errorf("hdfs: remove replacement backup %s: %w", backup, err)
-			if rollbackErr := w.withCleanupClient(func(client Client) error {
-				return w.rollbackPublishedReplacement(client, backup)
+			if rollbackErr := withCleanupContext(func(cleanupCtx context.Context) error {
+				return w.withCleanupClient(func(client Client) error {
+					return w.rollbackPublishedReplacement(cleanupCtx, client, backup)
+				})
 			}); rollbackErr != nil {
 				return errors.Join(cleanupErr, rollbackErr)
 			}
@@ -591,13 +674,13 @@ func (w *replaceWriter) commitReplacement() error {
 	return nil
 }
 
-func (w *replaceWriter) rollbackPublishedReplacement(client Client, backup string) error {
-	if err := client.Rename(w.target, w.temp); err != nil {
+func (w *replaceWriter) rollbackPublishedReplacement(ctx context.Context, client Client, backup string) error {
+	if err := renameWithContext(ctx, client, w.target, w.temp); err != nil {
 		return fmt.Errorf("hdfs: roll back published file %s: %w", w.target, err)
 	}
-	if err := client.Rename(backup, w.target); err != nil {
+	if err := renameWithContext(ctx, client, backup, w.target); err != nil {
 		restoreErr := fmt.Errorf("hdfs: restore existing file %s from %s: %w", w.target, backup, err)
-		if republishErr := client.Rename(w.temp, w.target); republishErr != nil {
+		if republishErr := renameWithContext(ctx, client, w.temp, w.target); republishErr != nil {
 			w.state = replacementUnabortable
 			return errors.Join(
 				restoreErr,
@@ -644,7 +727,13 @@ func (w *replaceWriter) Abort() (retErr error) {
 	return nil
 }
 
-const cleanupTimeout = 10 * time.Second
+var cleanupTimeout = 10 * time.Second
+
+func withCleanupContext(fn func(context.Context) error) error {
+	cleanupCtx, cancel := context.WithTimeout(context.Background(), cleanupTimeout)
+	defer cancel()
+	return fn(cleanupCtx)
+}
 
 func closeAfterReplication(ctx context.Context, writer storage.Writer) (retErr error) {
 	const (
@@ -709,6 +798,10 @@ func (c clientAdapter) Create(name string) (storage.Writer, error) {
 	return c.Client.Create(name)
 }
 
+func (c clientAdapter) RenameContext(ctx context.Context, oldpath, newpath string) error {
+	return c.Client.RenameContext(ctx, oldpath, newpath)
+}
+
 type leasedClient struct {
 	client  Client
 	release func() error
@@ -744,16 +837,6 @@ func onceCloser(closeFn func() error) func() error {
 	}
 }
 
-func cancelThenClose(cancel context.CancelFunc, closeFn func() error) func() error {
-	return onceCloser(func() error {
-		cancel()
-		if closeFn == nil {
-			return nil
-		}
-		return closeFn()
-	})
-}
-
 func loadClientOptions(clientAddress string, cfg *config) (hdfsclient.ClientOptions, error) {
 	if cfg.clientOptions != nil {
 		options := *cfg.clientOptions
@@ -783,8 +866,17 @@ func loadClientOptions(clientAddress string, cfg *config) (hdfsclient.ClientOpti
 }
 
 func newHDFSClient(ctx context.Context, clientAddress string, options hdfsclient.ClientOptions) (*leasedClient, error) {
-	client, err := hdfsclient.NewClient(bindClientOptions(ctx, options))
+	return newHDFSClientWithContextSource(func() context.Context {
+		return contextOrBackground(ctx)
+	}, clientAddress, options)
+}
+
+func newHDFSClientWithContextSource(ctxSource func() context.Context, clientAddress string, options hdfsclient.ClientOptions) (*leasedClient, error) {
+	client, err := hdfsclient.NewClient(bindClientOptionsWithContextSource(ctxSource, options))
 	if err != nil {
+		if ctxErr := ctxSource().Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
 		return nil, fmt.Errorf("hdfs: connect %s: %w", clientAddress, err)
 	}
 	return newOwnedLease(clientAdapter{client}, client.Close), nil
@@ -792,7 +884,7 @@ func newHDFSClient(ctx context.Context, clientAddress string, options hdfsclient
 
 type contextBoundConn struct {
 	net.Conn
-	stop func() bool
+	stop func()
 }
 
 func (c *contextBoundConn) Close() error {
@@ -802,15 +894,26 @@ func (c *contextBoundConn) Close() error {
 	return c.Conn.Close()
 }
 
-func bindConnContext(ctx context.Context, conn net.Conn) net.Conn {
-	if ctx.Done() == nil {
+func bindConnContext(ctx context.Context, conn net.Conn, release func()) net.Conn {
+	if ctx.Done() == nil && release == nil {
 		return conn
+	}
+	var interruptStop func() bool
+	if ctx.Done() != nil {
+		interruptStop = context.AfterFunc(ctx, func() {
+			_ = conn.Close()
+		})
 	}
 	return &contextBoundConn{
 		Conn: conn,
-		stop: context.AfterFunc(ctx, func() {
-			_ = conn.Close()
-		}),
+		stop: func() {
+			if interruptStop != nil {
+				interruptStop()
+			}
+			if release != nil {
+				release()
+			}
+		},
 	}
 }
 
@@ -836,9 +939,9 @@ func (w *replaceWriter) removeTemp(ctx context.Context) error {
 	return nil
 }
 
-func (w *replaceWriter) restoreBackup(backup string) error {
+func (w *replaceWriter) restoreBackup(ctx context.Context, backup string) error {
 	return w.withCleanupClient(func(client Client) error {
-		if err := client.Rename(backup, w.target); err != nil {
+		if err := renameWithContext(ctx, client, backup, w.target); err != nil {
 			return fmt.Errorf("hdfs: restore existing file %s from %s: %w", w.target, backup, err)
 		}
 		return nil
@@ -860,4 +963,5 @@ var (
 	_ storage.Aborter         = (*replaceWriter)(nil)
 	_ contextCloser           = (*hdfsclient.FileWriter)(nil)
 	_ contextRemover          = clientAdapter{}
+	_ contextRenamer          = clientAdapter{}
 )

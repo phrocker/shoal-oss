@@ -438,6 +438,37 @@ func TestLocal_CloseErrorCleansUpTempViaReplacementOps(t *testing.T) {
 	}
 }
 
+func TestLocal_WriterSyncForwardsToTemporaryFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "out.bin")
+	w, err := New().Create(context.Background(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sy, ok := w.(interface{ Sync() error })
+	if !ok {
+		t.Fatal("Create writer does not implement Sync")
+	}
+	if _, err := w.Write([]byte("new")); err != nil {
+		t.Fatal(err)
+	}
+	if err := sy.Sync(); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+
+	localWriter := w.(*writer)
+	if err := localWriter.file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	localWriter.fileClosed = true
+	if err := sy.Sync(); err == nil || !strings.Contains(err.Error(), "sync temporary file") {
+		t.Fatalf("Sync after underlying file close error = %v, want sync temporary file failure", err)
+	}
+	if err := w.(storage.Aborter).Abort(); err != nil {
+		t.Fatalf("Abort after Sync regression: %v", err)
+	}
+}
+
 func TestLocal_AbortRetriesTempRemovalAfterFailure(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "out.bin")

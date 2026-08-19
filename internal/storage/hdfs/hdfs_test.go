@@ -424,6 +424,37 @@ func TestNewContextKeepsCleanupClientAliveUntilBackendClose(t *testing.T) {
 	}
 }
 
+func TestNewContextCancelsStalledInitialCleanupDial(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	started := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		_, err := NewContext(ctx, "nn:8020", WithClientOptions(hdfsclient.ClientOptions{
+			User: "shoal-test",
+			NamenodeDialFunc: func(dialCtx context.Context, network, addr string) (net.Conn, error) {
+				close(started)
+				<-dialCtx.Done()
+				return nil, dialCtx.Err()
+			},
+		}))
+		done <- err
+	}()
+
+	<-started
+	cancel()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("NewContext error = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("NewContext did not unblock after constructor cancellation")
+	}
+}
+
 func TestBindDialContextBoundsBlockedHandshakeOnDeadline(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
 	defer cancel()
@@ -479,6 +510,28 @@ func TestBindDialContextInterruptsBlockedHandshakeOnCancel(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("blocked handshake read did not unblock after cancel")
+	}
+}
+
+func TestBindDialContextReconnectUsesRequestDeadline(t *testing.T) {
+	boundCtx, boundCancel := context.WithCancel(context.Background())
+	defer boundCancel()
+
+	dial := bindDialContext(boundCtx, func(ctx context.Context, network, addr string) (net.Conn, error) {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	})
+
+	requestCtx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	_, err := dial(requestCtx, "tcp", "nn:8020")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("dial error = %v, want context deadline exceeded", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("dial took %v; request deadline did not bound reconnect", elapsed)
 	}
 }
 
@@ -990,6 +1043,84 @@ func TestBackendAbortRetriesTempRemovalAfterFailure(t *testing.T) {
 	}
 }
 
+func TestBackendCloseBoundsStalledRestoreBackupRename(t *testing.T) {
+	setCleanupTimeoutForTest(t, 25*time.Millisecond)
+
+	client := newFakeClient()
+	client.files["/tables/1.rf"] = []byte("old")
+	client.failPublish = true
+	client.renameContextHook = func(ctx context.Context, oldpath, newpath string) error {
+		if strings.Contains(oldpath, ".shoal-backup-") && newpath == "/tables/1.rf" {
+			<-ctx.Done()
+			return ctx.Err()
+		}
+		return nil
+	}
+	backend, err := New("nn:8020", WithClient(client))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	w, err := backend.Create(context.Background(), "/tables/1.rf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write([]byte("new")); err != nil {
+		t.Fatal(err)
+	}
+
+	start := time.Now()
+	err = w.Close()
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Close error = %v, want context deadline exceeded", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("Close took %v; stalled restore rename was not bounded", elapsed)
+	}
+	if client.lastRenameDeadline.IsZero() {
+		t.Fatal("restore backup rename did not receive a cleanup deadline")
+	}
+}
+
+func TestBackendCloseBoundsStalledRollbackRename(t *testing.T) {
+	setCleanupTimeoutForTest(t, 25*time.Millisecond)
+
+	client := newFakeClient()
+	client.files["/tables/1.rf"] = []byte("old")
+	client.failBackupRemove = true
+	client.renameContextHook = func(ctx context.Context, oldpath, newpath string) error {
+		if oldpath == "/tables/1.rf" && strings.Contains(newpath, ".shoal-tmp-") {
+			<-ctx.Done()
+			return ctx.Err()
+		}
+		return nil
+	}
+	backend, err := New("nn:8020", WithClient(client))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	w, err := backend.Create(context.Background(), "/tables/1.rf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write([]byte("new")); err != nil {
+		t.Fatal(err)
+	}
+
+	start := time.Now()
+	err = w.Close()
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Close error = %v, want context deadline exceeded", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("Close took %v; stalled rollback rename was not bounded", elapsed)
+	}
+	if client.lastRenameDeadline.IsZero() {
+		t.Fatal("rollback rename did not receive a cleanup deadline")
+	}
+}
+
 type fakeClient struct {
 	files                    map[string][]byte
 	dirs                     map[string]bool
@@ -1009,6 +1140,9 @@ type fakeClient struct {
 	failBackupRemove         bool
 	writerCloseHook          func() error
 	lastRemoveDeadline       time.Time
+	lastRenameDeadline       time.Time
+	renameContextCalls       []renameCall
+	renameContextHook        func(context.Context, string, string) error
 }
 
 func newReleaseErrorBackend(t *testing.T, client *fakeClient) *Backend {
@@ -1104,6 +1238,17 @@ func (c *fakeClient) Remove(name string) error {
 func (c *fakeClient) RemoveContext(ctx context.Context, name string) error {
 	c.lastRemoveDeadline, _ = ctx.Deadline()
 	return c.Remove(name)
+}
+
+func (c *fakeClient) RenameContext(ctx context.Context, oldpath, newpath string) error {
+	c.lastRenameDeadline, _ = ctx.Deadline()
+	c.renameContextCalls = append(c.renameContextCalls, renameCall{oldpath: oldpath, newpath: newpath})
+	if c.renameContextHook != nil {
+		if err := c.renameContextHook(ctx, oldpath, newpath); err != nil {
+			return err
+		}
+	}
+	return c.Rename(oldpath, newpath)
 }
 
 func (c *fakeClient) Rename(oldpath, newpath string) error {
@@ -1349,6 +1494,15 @@ func (w *deadlineBlockingWriter) SetDeadline(deadline time.Time) error {
 
 var errInjectedClose = errors.New("injected close failure")
 var errInjectedRelease = errors.New("injected release failure")
+
+func setCleanupTimeoutForTest(t *testing.T, timeout time.Duration) {
+	t.Helper()
+	original := cleanupTimeout
+	cleanupTimeout = timeout
+	t.Cleanup(func() {
+		cleanupTimeout = original
+	})
+}
 
 func countCalls(values []string, want string) int {
 	count := 0
