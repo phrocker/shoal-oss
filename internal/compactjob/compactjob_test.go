@@ -278,6 +278,12 @@ func TestTranslateRefusesFencedInput(t *testing.T) {
 			if !strings.Contains(r.Detail, "fenced") {
 				t.Fatalf("detail = %q, want it to name the fence", r.Detail)
 			}
+			// StoredTabletFile.deserialize rebuilds the fence with
+			// new Range(startRow, true, endRow, false), so the bounds an
+			// operator reads must be start-inclusive, end-exclusive.
+			if want := fmt.Sprintf("[%q,%q)", tt.start, tt.end); !strings.Contains(r.Detail, want) {
+				t.Fatalf("detail = %q, want it to report the fence as %s", r.Detail, want)
+			}
 		})
 	}
 }
@@ -484,8 +490,27 @@ func TestTranslateRefusesUnparsableFilePaths(t *testing.T) {
 		{"escaped tablet directory", "hdfs://nn/accumulo/tables/2/t%2D0001/F0002.rf", `escapes "%2D" inside the path`},
 		{"escaped table id", "hdfs://nn/accumulo/tables/%32/t-0001/F0002.rf", `escapes "%32" inside the path`},
 		// URI allows brackets only around an IPv6 host.
-		{"bracket in a segment", "hdfs://nn/accumulo/tables/2/t[0]/F0002.rf", `"[" at offset 29 is only legal in an authority`},
-		{"bracket with no authority", "hdfs:/accumulo/tables/2/t[0]/F0002.rf", "only legal in an authority"},
+		{"bracket in a segment", "hdfs://nn/accumulo/tables/2/t[0]/F0002.rf", `"[" at offset 29 is legal only around an IPv6 literal host`},
+		{"bracket with no authority", "hdfs:/accumulo/tables/2/t[0]/F0002.rf", "legal only around an IPv6 literal host"},
+		// A bracket in the authority is not enough: parseServer runs the
+		// IPv6 grammar over what it encloses, and parseAuthority cannot
+		// fall back to a registry-based authority because REG_NAME has
+		// no brackets, so it rethrows the literal's failure.
+		{"not an ipv6 host", "hdfs://[not-ip]/accumulo/tables/2/t-0001/F0002.rf", `"not-ip" is not an IPv6 address`},
+		{"unclosed ipv6 host", "hdfs://[fe80::1/accumulo/tables/2/t-0001/F0002.rf", "no closing bracket"},
+		{"closing bracket alone", "hdfs://nn]/accumulo/tables/2/t-0001/F0002.rf", "does not open an IPv6 literal host"},
+		{"bracket after the host", "hdfs://nn[::1]/accumulo/tables/2/t-0001/F0002.rf", "does not open an IPv6 literal host"},
+		{"empty ipv6 host", "hdfs://[]/accumulo/tables/2/t-0001/F0002.rf", "IPv6 literal host is empty"},
+		// The grammar admits IPv4 only as the tail of an IPv6 address,
+		// so a bare one never reaches the 16 bytes the parser counts.
+		{"bracketed ipv4", "hdfs://[10.0.0.1]/accumulo/tables/2/t-0001/F0002.rf", "is an IPv4 address"},
+		{"junk after the literal", "hdfs://[::1]x/accumulo/tables/2/t-0001/F0002.rf", `"x" follows an IPv6 literal host`},
+		{"non-numeric port", "hdfs://[::1]:80a/accumulo/tables/2/t-0001/F0002.rf", `port "80a" after an IPv6 literal host`},
+		{"empty scope id", "hdfs://[fe80::1%]/accumulo/tables/2/t-0001/F0002.rf", "with no scope id"},
+		{"invalid scope id", "hdfs://[fe80::1%eth-0]/accumulo/tables/2/t-0001/F0002.rf", `scope id "eth-0" contains "-"`},
+		{"bad literal behind userinfo", "hdfs://u@[not-ip]/accumulo/tables/2/t-0001/F0002.rf", "is not an IPv6 address"},
+		{"bracket in the userinfo", "hdfs://u[x]@nn/accumulo/tables/2/t-0001/F0002.rf", "does not open an IPv6 literal host"},
+		{"bracket after the port", "hdfs://[::1]:90/accumulo/tables/2/t-0001/F[0].rf", "legal only around an IPv6 literal host"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			job := validJob()
@@ -596,6 +621,33 @@ func TestTranslateAcceptsAnEscapeInTheVolume(t *testing.T) {
 	plan := mustTranslate(t, job, Options{})
 	if got := plan.Inputs[1].Path; got != path {
 		t.Fatalf("input path = %q, want %q", got, path)
+	}
+}
+
+// TestTranslateAcceptsEveryIPv6HostURIDoes keeps the literal check as
+// permissive as parseIPv6Reference: a scope id of alpha, digit, "_" or
+// ".", an IPv4 tail, and the all-zeros compression are all in the
+// grammar, and refusing any of them would strand a real namenode.
+func TestTranslateAcceptsEveryIPv6HostURIDoes(t *testing.T) {
+	for _, host := range []string{
+		"[fe80::1%eth0]",
+		"[fe80::1%25]:9000",
+		"[fe80::1%en_0.1]",
+		"[::ffff:10.0.0.1]",
+		"[::]",
+		"[2001:0db8:0000:0000:0000:0000:0000:0001]",
+		"[::1]:",
+	} {
+		t.Run(host, func(t *testing.T) {
+			path := "hdfs://" + host + "/accumulo/tables/2/t-0001/F0002.rf"
+			job := validJob()
+			job.Files[1].MetadataFileEntry = storedFile(path)
+
+			plan := mustTranslate(t, job, Options{})
+			if got := plan.Inputs[1].Path; got != path {
+				t.Fatalf("input path = %q, want %q", got, path)
+			}
+		})
 	}
 }
 
@@ -770,12 +822,116 @@ func TestPathIdentityFoldsOnlyWhatURIFolds(t *testing.T) {
 		{"no authority", "FILE:/A/B.rf", "file:/A/B.rf"},
 		{"authority runs to the end", "HDFS://NN", "hdfs://nn"},
 		{"no scheme at all", "/A/B.rf", "/A/B.rf"},
+		// Escapes are decoded because that is the path shoal's HDFS
+		// backend resolves: Backend.resolve hands url.Parse's decoded
+		// Path to the namenode.
+		{"escape in the volume", "hdfs://nn/v%6Fl/A/B.rf", "hdfs://nn/vol/A/B.rf"},
+		{"escape hex case", "hdfs://nn/v%6fl/A/B.rf", "hdfs://nn/vol/A/B.rf"},
+		{"escaped separator", "hdfs://nn/a%2Fb/B.rf", "hdfs://nn/a/b/B.rf"},
+		{"escape with no scheme", "/v%6Fl/B.rf", "/vol/B.rf"},
+		// A malformed escape is checkTabletFilePath's refusal to report,
+		// so identity leaves it exactly as it found it.
+		{"truncated escape", "hdfs://nn/vol%2/B.rf", "hdfs://nn/vol%2/B.rf"},
+		{"non-hex escape", "hdfs://nn/vol%zz/B.rf", "hdfs://nn/vol%zz/B.rf"},
+		{"escape at the very end", "hdfs://nn/vol/B.rf%", "hdfs://nn/vol/B.rf%"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := pathIdentity(tt.in); got != tt.want {
 				t.Fatalf("pathIdentity(%q) = %q, want %q", tt.in, got, tt.want)
 			}
 		})
+	}
+}
+
+// TestTranslateRefusesOnePathSpelledWithAnEscape is the escape twin of
+// the case-folding duplicate test. checkTabletFilePath allows an escape
+// in the volume, and shoal's HDFS backend resolves url.Parse's decoded
+// Path, so /v%6Fl/... and /vol/... are one file on the namenode.
+func TestTranslateRefusesOnePathSpelledWithAnEscape(t *testing.T) {
+	job := validJob()
+	job.Files = []*tabletserver.InputFile{
+		{MetadataFileEntry: storedFile("hdfs://nn/vol/accumulo/tables/2/t-0001/F0001.rf"), Size: 8, Entries: 1},
+		{MetadataFileEntry: storedFile("hdfs://nn/v%6Fl/accumulo/tables/2/t-0001/F0001.rf"), Size: 8, Entries: 1},
+	}
+
+	r := assertRefused(t, job, Options{}, ClassMalformedJob, "files[1]")
+	if !strings.Contains(r.Detail, "duplicates files[0]") {
+		t.Fatalf("detail = %q, want it to name the entry it duplicates", r.Detail)
+	}
+}
+
+// TestTranslateRefusesAnOutputAliasingAnInputByEscape closes the same
+// hole on the output side, where the manager's rename would land on a
+// file the tablet still references.
+func TestTranslateRefusesAnOutputAliasingAnInputByEscape(t *testing.T) {
+	job := validJob()
+	job.Files = []*tabletserver.InputFile{
+		{MetadataFileEntry: storedFile("hdfs://nn/vol/accumulo/tables/2/t-0001/F0001.rf"), Size: 8, Entries: 1},
+	}
+	job.OutputFile = "hdfs://nn/v%6Fl/accumulo/tables/2/t-0001/F0001.rf" + tmpSuffix(testECID)
+
+	r := assertRefused(t, job, Options{}, ClassMalformedJob, "outputFile")
+	if !strings.Contains(r.Detail, "which is also files[0]") {
+		t.Fatalf("detail = %q, want it to name the input it commits over", r.Detail)
+	}
+}
+
+// TestTranslateKeepsBinaryRowsApart pins that a fence identity cannot be
+// forged by moving a byte across a delimiter. Every row
+// KeyExtent.toDataRange stores is a followingKey(ROW) result and so ends
+// in a zero byte, which is exactly the byte a delimited key would use to
+// separate the bounds: ("a", "\x00b") and ("a\x00", "b") are different
+// ranges, and a delimited key would call the second a duplicate of the
+// first and refuse a job Accumulo built.
+func TestTranslateKeepsBinaryRowsApart(t *testing.T) {
+	const path = "hdfs://nn/accumulo/tables/2/t-0001/F0002.rf"
+	job := validJob()
+	job.Files = append(job.Files,
+		&tabletserver.InputFile{MetadataFileEntry: fencedFile(path, "a", "\x00b"), Size: 8, Entries: 1},
+		&tabletserver.InputFile{MetadataFileEntry: fencedFile(path, "a\x00", "b"), Size: 8, Entries: 1},
+	)
+
+	// Both are fenced, so the job is refused for the fence — the point
+	// is that it is not refused as a duplicate.
+	r := assertRefused(t, job, Options{}, ClassRangedInputFile, "files[2]")
+	if strings.Contains(r.Detail, "duplicates") {
+		t.Fatalf("detail = %q, want the fence refusal rather than a duplicate", r.Detail)
+	}
+}
+
+// TestTranslateRefusesAnOutputUnderAnotherTable pins that the output
+// belongs to the extent's own table.
+//
+// TabletNameGenerator.getNextDataFilenameForMajc builds the name under
+// chooseTabletDir, which is <volume>/tables/<extent.tableId()>/<dir>, so
+// a job naming a different table has fields that disagree with each
+// other — and executing it would write into another table's directory
+// and have the manager commit the rename there.
+func TestTranslateRefusesAnOutputUnderAnotherTable(t *testing.T) {
+	job := validJob()
+	job.OutputFile = "hdfs://nn/accumulo/tables/3/t-0001/C0003.rf" + tmpSuffix(testECID)
+
+	r := assertRefused(t, job, Options{}, ClassMalformedJob, "outputFile")
+	if !strings.Contains(r.Detail, `under table "3"`) ||
+		!strings.Contains(r.Detail, `extent assigns table "2"`) {
+		t.Fatalf("detail = %q, want it to name both tables", r.Detail)
+	}
+}
+
+// TestTranslateAcceptsInputsFromAnotherTable is the deliberate other
+// half: a cloned table's tablets reference the *source* table's files.
+// MetadataTableUtil.createCloneMutation copies the source tablet's file
+// column qualifiers verbatim, so requiring inputs to sit under the
+// extent's table would leave every cloned tablet permanently
+// uncompactable.
+func TestTranslateAcceptsInputsFromAnotherTable(t *testing.T) {
+	const cloned = "hdfs://nn/accumulo/tables/7/t-0001/F0009.rf"
+	job := validJob()
+	job.Files[1].MetadataFileEntry = storedFile(cloned)
+
+	plan := mustTranslate(t, job, Options{})
+	if got := plan.Inputs[1].Path; got != cloned {
+		t.Fatalf("input path = %q, want the source table's file %q", got, cloned)
 	}
 }
 

@@ -60,6 +60,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"net/netip"
 	"regexp"
 	"sort"
 	"strconv"
@@ -442,6 +443,10 @@ func Translate(job *tabletserver.TExternalCompactionJob, opts Options) (*Plan, e
 		return nil, err
 	}
 
+	if err := checkOutputTable(outputFile, tableID); err != nil {
+		return nil, err
+	}
+
 	overrideKeys, blockSizeOverride, err := parseOverrides(job.GetOverrides())
 	if err != nil {
 		return nil, err
@@ -648,8 +653,21 @@ func (p parsedInput) fenced() bool { return p.startRow != "" || p.endRow != "" }
 // entries that name one range differ in the key — padded against
 // unpadded base64, or bytes past the declared length, which readFully
 // never looks at — and a file would be merged twice.
+//
+// The three parts are length-prefixed rather than delimited. A row is
+// arbitrary binary and routinely ends in a zero byte, because the rows
+// KeyExtent.toDataRange stores are followingKey(ROW) results, so no
+// byte value is available to separate them: ("a", "\x00b") and
+// ("a\x00", "b") are different ranges that a delimiter would map to one
+// key, and a job naming both would be refused as a duplicate.
 func (p parsedInput) key() string {
-	return pathIdentity(p.file.Path) + "\x00" + string(p.startRaw) + "\x00" + string(p.endRaw)
+	var b strings.Builder
+	for _, part := range []string{pathIdentity(p.file.Path), string(p.startRaw), string(p.endRaw)} {
+		b.WriteString(strconv.Itoa(len(part)))
+		b.WriteByte(':')
+		b.WriteString(part)
+	}
+	return b.String()
 }
 
 // pathIdentity folds the parts of a path URI that name one file under
@@ -664,18 +682,24 @@ func (p parsedInput) key() string {
 // an output that collides with an input that way would overwrite it at
 // commit.
 //
-// Only the scheme and the host fold. The path is case-sensitive on
-// every filesystem Accumulo runs on, and userinfo and port are left
-// alone because URI does not fold them either.
+// Percent escapes are decoded for the same reason. checkTabletFilePath
+// allows them in the volume, and shoal's own HDFS backend resolves a
+// path by handing url.Parse's decoded Path to the namenode, so
+// /v%6Fl/... and /vol/... are one file to the filesystem while being
+// two strings here.
+//
+// Beyond that only the scheme and the host fold. The path is
+// case-sensitive on every filesystem Accumulo runs on, and userinfo and
+// port are left alone because URI does not fold them either.
 func pathIdentity(raw string) string {
 	colon := strings.Index(raw, ":")
 	if colon <= 0 {
-		return raw
+		return decodeEscapes(raw)
 	}
 	id := strings.ToLower(raw[:colon]) + raw[colon:]
 	start, end := authoritySpan(id)
 	if start >= end {
-		return id
+		return decodeEscapes(id)
 	}
 	authority := id[start:end]
 	// Fold only the host: everything after an "@" and, for an IPv6
@@ -691,7 +715,33 @@ func pathIdentity(raw string) string {
 		rest = host + port
 	}
 	folded := authority[:host] + strings.ToLower(authority[host:rest]) + authority[rest:]
-	return id[:start] + folded + id[end:]
+	return decodeEscapes(id[:start] + folded + id[end:])
+}
+
+// decodeEscapes replaces every well-formed percent escape with the byte
+// it names, which is what url.Parse hands the namenode and what
+// Hadoop's Path.toString renders. A malformed escape is left alone:
+// pathIdentity runs before checkTabletFilePath on the output, and a
+// truncated escape is that function's refusal to report, not this one's
+// to guess at.
+func decodeEscapes(raw string) string {
+	if !strings.ContainsRune(raw, '%') {
+		return raw
+	}
+	var b strings.Builder
+	b.Grow(len(raw))
+	for i := 0; i < len(raw); i++ {
+		if raw[i] == '%' && i+2 < len(raw) && isHexDigit(raw[i+1]) && isHexDigit(raw[i+2]) {
+			value, err := strconv.ParseUint(raw[i+1:i+3], 16, 8)
+			if err == nil {
+				b.WriteByte(byte(value))
+				i += 2
+				continue
+			}
+		}
+		b.WriteByte(raw[i])
+	}
+	return b.String()
 }
 
 func inputFiles(inputs []parsedInput) []InputFile {
@@ -775,9 +825,14 @@ func parseInputs(job *tabletserver.TExternalCompactionJob) ([]parsedInput, int64
 func checkInputCapability(inputs []parsedInput, totalBytes int64, limits Limits) error {
 	for _, in := range inputs {
 		if in.fenced() {
+			// StoredTabletFile.deserialize rebuilds the fence as
+			// new Range(startRow, true, endRow, false), so the bound an
+			// operator sees here has to read as start-inclusive and
+			// end-exclusive. The rows are the decoded ones, not the
+			// base64 the entry spells them with.
 			return refuse(ClassRangedInputFile, in.field,
-				"input %s is fenced to (%q,%q]; shoal reads whole RFiles, so the fence cannot be honored",
-				in.file.Path, in.startRow, in.endRow)
+				"input %s is fenced to [%q,%q); shoal reads whole RFiles, so the fence cannot be honored",
+				in.file.Path, in.startRaw, in.endRaw)
 		}
 	}
 	// compaction.Compact opens every input through bcfile.NewReader and
@@ -964,7 +1019,19 @@ const uriPunctuation = "-_.!~*'();/:@&=+$,"
 // name.
 func checkURISyntax(raw string) error {
 	authStart, authEnd := authoritySpan(raw)
+	litStart, litEnd, err := checkAuthorityBrackets(raw, authStart, authEnd)
+	if err != nil {
+		return err
+	}
 	for i := 0; i < len(raw); i++ {
+		if i >= litStart && i < litEnd {
+			// Inside an IPv6 literal, which checkIPv6Literal has already
+			// read under its own grammar. A "%" there opens a scope id,
+			// not an escape: parseServer reaches the literal only after
+			// parseAuthority has scanned the authority with
+			// L_SERVER_PERCENT, which admits a bare "%".
+			continue
+		}
 		c := raw[i]
 		switch {
 		case c == '%':
@@ -975,10 +1042,10 @@ func checkURISyntax(raw string) error {
 		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
 		case strings.IndexByte(uriPunctuation, c) >= 0:
 		case c == '[' || c == ']':
-			// URI allows brackets only around an IPv6 literal host.
-			if i < authStart || i >= authEnd {
-				return fmt.Errorf("character %q at offset %d is only legal in an authority", string(rune(c)), i)
-			}
+			// The only legal bracket is one bounding the IPv6 literal
+			// this loop skips over.
+			return fmt.Errorf("character %q at offset %d is legal only around an IPv6 literal host",
+				string(rune(c)), i)
 		case c >= utf8.RuneSelf:
 			// URI$Parser.scanEscape lets an unescaped character above
 			// U+0080 through as long as it is visible, so a volume named
@@ -994,6 +1061,96 @@ func checkURISyntax(raw string) error {
 		default:
 			return fmt.Errorf("character %q at offset %d must be percent-escaped", string(rune(c)), i)
 		}
+	}
+	return nil
+}
+
+// checkAuthorityBrackets enforces the one construction java.net.URI
+// brackets: an IPv6 literal host.
+//
+// URI$Parser.parseServer takes "[" as the start of a literal, demands a
+// matching "]", and runs the RFC 2373 grammar over what is between them
+// (with an optional "%<scope-id>" tail). Nothing else in an authority
+// may carry a bracket: REG_NAME has neither character, so parseAuthority
+// cannot fall back to a registry-based authority and rethrows the
+// literal's parse failure. So "hdfs://[not-ip]/..." and an unmatched
+// "[" both throw out of URI.create — which is the call
+// StoredTabletFile.deserialize makes — and a plan built on either would
+// name a file the manager can never construct.
+func checkAuthorityBrackets(raw string, start, end int) (litStart, litEnd int, err error) {
+	authority := raw[start:end]
+	host := 0
+	// parseServer takes userinfo up to the *first* "@" and then parses
+	// the host from there.
+	if at := strings.IndexByte(authority, '@'); at >= 0 {
+		host = at + 1
+	}
+	if i := strings.IndexAny(authority[:host], "[]"); i >= 0 {
+		return 0, 0, fmt.Errorf("bracket at offset %d does not open an IPv6 literal host", start+i)
+	}
+	literal, found := strings.CutPrefix(authority[host:], "[")
+	if !found {
+		if i := strings.IndexAny(authority[host:], "[]"); i >= 0 {
+			return 0, 0, fmt.Errorf("bracket at offset %d does not open an IPv6 literal host",
+				start+host+i)
+		}
+		return 0, 0, nil
+	}
+	close := strings.IndexByte(literal, ']')
+	if close < 0 {
+		return 0, 0, errors.New("IPv6 literal host has no closing bracket")
+	}
+	if err := checkIPv6Literal(literal[:close]); err != nil {
+		return 0, 0, err
+	}
+	// parseServer accepts only ":<digits>" after the literal, and
+	// parseAuthority fails on anything left over.
+	switch port := literal[close+1:]; {
+	case port == "":
+	case port[0] != ':':
+		return 0, 0, fmt.Errorf("%q follows an IPv6 literal host; only a port may", port)
+	default:
+		for i := 1; i < len(port); i++ {
+			if port[i] < '0' || port[i] > '9' {
+				return 0, 0, fmt.Errorf("port %q after an IPv6 literal host is not numeric", port[1:])
+			}
+		}
+	}
+	litStart = start + host
+	return litStart, litStart + close + 2, nil
+}
+
+// checkIPv6Literal applies URI$Parser.parseIPv6Reference: an IPv6
+// address, optionally followed by "%" and a scope id of
+// alpha | digit | "_" | ".". A bare IPv4 address is not one — the
+// grammar admits IPv4 only as the tail of an IPv6 address, so the
+// 4-byte count never reaches the 16 the parser requires.
+func checkIPv6Literal(literal string) error {
+	if literal == "" {
+		return errors.New("IPv6 literal host is empty")
+	}
+	address := literal
+	if pct := strings.IndexByte(literal, '%'); pct >= 0 {
+		address = literal[:pct]
+		switch scope := literal[pct+1:]; {
+		case scope == "":
+			return errors.New("IPv6 literal host ends in %, with no scope id")
+		default:
+			for i := 0; i < len(scope); i++ {
+				c := scope[i]
+				if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' ||
+					c >= '0' && c <= '9' || c == '_' || c == '.') {
+					return fmt.Errorf("IPv6 scope id %q contains %q", scope, string(rune(c)))
+				}
+			}
+		}
+	}
+	parsed, err := netip.ParseAddr(address)
+	if err != nil {
+		return fmt.Errorf("%q is not an IPv6 address", address)
+	}
+	if parsed.Is4() {
+		return fmt.Errorf("%q is an IPv4 address; URI brackets an IPv6 address only", address)
 	}
 	return nil
 }
@@ -1290,6 +1447,37 @@ func parseOutput(job *tabletserver.TExternalCompactionJob, inputs []parsedInput,
 		return "", err
 	}
 	return out, nil
+}
+
+// committedName reproduces TabletNameGenerator.computeCompactionFileDest:
+// checkOutputTable requires the output to be written under the table
+// directory of the extent the job assigns.
+//
+// The coordinator does not invent this name: getNextDataFilenameForMajc
+// builds it under chooseTabletDir, which is
+// <volume>/tables/<extent.tableId()>/<dirName>. So an output naming a
+// different table is a job whose own fields disagree, and executing it
+// would write into another table's directory and have the manager
+// commit the rename there.
+//
+// Only the output is checked. An input legitimately names another
+// table: MetadataTableUtil.createCloneMutation copies the source
+// tablet's file column qualifiers into the clone verbatim, so every
+// tablet of a cloned table references files under the *source* table's
+// directory until a compaction rewrites them. Requiring inputs to match
+// would leave those tablets permanently uncompactable.
+//
+// out has already been through checkTabletFilePath, so its path holds at
+// least four segments and the whole URI splits into at least five: the
+// table id is the third from the end either way.
+func checkOutputTable(out, tableID string) error {
+	segments := strings.Split(out, "/")
+	if named := segments[len(segments)-3]; named != tableID {
+		return refuse(ClassMalformedJob, "outputFile",
+			"output %s is under table %q, but the extent assigns table %q",
+			out, named, tableID)
+	}
+	return nil
 }
 
 // committedName reproduces TabletNameGenerator.computeCompactionFileDest:
