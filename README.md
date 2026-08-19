@@ -298,7 +298,9 @@ opt-in.
   deletes only exact reserved artifacts older than that cutoff; any backup
   artifacts that cannot be mapped back to one safe target are reported in
   `ArtifactCleanupResult.Recoverable` for manual recovery instead of being
-  deleted automatically.
+  deleted automatically. Cloud cleanup verifies Shoal ownership metadata and
+  uses generation/ETag/version-conditional deletes; S3 cleanup therefore
+  requires object-version listing, inspection, and deletion permissions.
 
 ## License
 
