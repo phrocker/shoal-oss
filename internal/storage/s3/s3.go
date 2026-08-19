@@ -72,6 +72,8 @@ type s3Artifact struct {
 	key          string
 	lastModified time.Time
 	etag         *string
+	versionID    *string
+	deleteMarker bool
 	owned        bool
 }
 
@@ -250,7 +252,12 @@ func (b *Backend) CleanupStaleArtifacts(ctx context.Context, prefix string, cuto
 	if err != nil {
 		return result, fmt.Errorf("s3: list stale artifacts s3://%s/%s: %w", bucket, objectPrefix, err)
 	}
-	slices.SortFunc(artifacts, func(a, b s3Artifact) int { return strings.Compare(a.key, b.key) })
+	slices.SortFunc(artifacts, func(a, b s3Artifact) int {
+		if order := strings.Compare(a.key, b.key); order != 0 {
+			return order
+		}
+		return strings.Compare(aws.ToString(a.versionID), aws.ToString(b.versionID))
+	})
 	var cleanupErr error
 	for _, artifact := range artifacts {
 		if err := contextOrBackground(ctx).Err(); err != nil {
@@ -260,13 +267,17 @@ func (b *Backend) CleanupStaleArtifacts(ctx context.Context, prefix string, cuto
 			continue
 		}
 		result.Examined++
-		artifact, err = b.artifactOps.inspect(ctx, bucket, artifact)
-		if err != nil {
-			if isNotFound(err) {
+		if artifact.deleteMarker {
+			artifact.owned = true
+		} else {
+			artifact, err = b.artifactOps.inspect(ctx, bucket, artifact)
+			if err != nil {
+				if isNotFound(err) {
+					continue
+				}
+				cleanupErr = errors.Join(cleanupErr, fmt.Errorf("s3: inspect stale artifact s3://%s/%s: %w", bucket, artifact.key, err))
 				continue
 			}
-			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("s3: inspect stale artifact s3://%s/%s: %w", bucket, artifact.key, err))
-			continue
 		}
 		if !artifact.owned {
 			continue
@@ -274,7 +285,11 @@ func (b *Backend) CleanupStaleArtifacts(ctx context.Context, prefix string, cuto
 		if artifact.lastModified.IsZero() || !artifact.lastModified.Before(cutoff) {
 			continue
 		}
-		if artifact.etag == nil {
+		if artifact.versionID == nil {
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("s3: stale artifact s3://%s/%s has no version ID", bucket, artifact.key))
+			continue
+		}
+		if !artifact.deleteMarker && artifact.etag == nil {
 			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("s3: stale artifact s3://%s/%s has no ETag", bucket, artifact.key))
 			continue
 		}
@@ -285,9 +300,13 @@ func (b *Backend) CleanupStaleArtifacts(ctx context.Context, prefix string, cuto
 			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("s3: remove stale artifact s3://%s/%s: %w", bucket, artifact.key, err))
 			continue
 		}
-		result.Removed = append(result.Removed, "s3://"+bucket+"/"+artifact.key)
+		result.Removed = append(result.Removed, s3ArtifactPath(bucket, artifact))
 	}
 	return result, cleanupErr
+}
+
+func s3ArtifactPath(bucket string, artifact s3Artifact) string {
+	return "s3://" + bucket + "/" + artifact.key + "?versionId=" + url.QueryEscape(aws.ToString(artifact.versionID))
 }
 
 // ParsePath splits a path string into (bucket, key). Exposed so callers
@@ -493,7 +512,7 @@ type sdkS3ArtifactOperations struct {
 
 func (o sdkS3ArtifactOperations) list(ctx context.Context, bucket, prefix string) ([]s3Artifact, error) {
 	var artifacts []s3Artifact
-	paginator := s3sdk.NewListObjectsV2Paginator(o.client, &s3sdk.ListObjectsV2Input{
+	paginator := s3sdk.NewListObjectVersionsPaginator(o.client, &s3sdk.ListObjectVersionsInput{
 		Bucket: aws.String(bucket),
 		Prefix: aws.String(prefix),
 	})
@@ -502,7 +521,7 @@ func (o sdkS3ArtifactOperations) list(ctx context.Context, bucket, prefix string
 		if err != nil {
 			return nil, err
 		}
-		for _, object := range page.Contents {
+		for _, object := range page.Versions {
 			if object.Key == nil {
 				continue
 			}
@@ -510,6 +529,18 @@ func (o sdkS3ArtifactOperations) list(ctx context.Context, bucket, prefix string
 				key:          *object.Key,
 				lastModified: aws.ToTime(object.LastModified),
 				etag:         object.ETag,
+				versionID:    object.VersionId,
+			})
+		}
+		for _, marker := range page.DeleteMarkers {
+			if marker.Key == nil {
+				continue
+			}
+			artifacts = append(artifacts, s3Artifact{
+				key:          *marker.Key,
+				lastModified: aws.ToTime(marker.LastModified),
+				versionID:    marker.VersionId,
+				deleteMarker: true,
 			})
 		}
 	}
@@ -518,17 +549,19 @@ func (o sdkS3ArtifactOperations) list(ctx context.Context, bucket, prefix string
 
 func (o sdkS3ArtifactOperations) remove(ctx context.Context, bucket string, artifact s3Artifact) error {
 	_, err := o.client.DeleteObject(ctx, &s3sdk.DeleteObjectInput{
-		Bucket:  aws.String(bucket),
-		Key:     aws.String(artifact.key),
-		IfMatch: artifact.etag,
+		Bucket:    aws.String(bucket),
+		Key:       aws.String(artifact.key),
+		IfMatch:   artifact.etag,
+		VersionId: artifact.versionID,
 	})
 	return err
 }
 
 func (o sdkS3ArtifactOperations) inspect(ctx context.Context, bucket string, artifact s3Artifact) (s3Artifact, error) {
 	out, err := o.client.HeadObject(ctx, &s3sdk.HeadObjectInput{
-		Bucket: aws.String(bucket),
-		Key:    aws.String(artifact.key),
+		Bucket:    aws.String(bucket),
+		Key:       aws.String(artifact.key),
+		VersionId: artifact.versionID,
 	})
 	if err != nil {
 		return artifact, err

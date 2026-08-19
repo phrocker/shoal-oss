@@ -458,17 +458,24 @@ func TestCleanupStaleArtifactsIsBoundedConditionalAndExplicit(t *testing.T) {
 	now := time.Now()
 	oldETag := `"old"`
 	recentETag := `"recent"`
+	oldVersion := "old-version"
+	failingVersion := "failing-version"
+	recentVersion := "recent-version"
+	userVersion := "user-version"
+	markerVersion := "marker-version"
 	removeErr := errors.New("delete failed")
 	old := "dir/" + expectedTemporaryStageKeyComponent("dir/target", strings.Repeat("0", 64))
 	failing := "dir/" + expectedTemporaryStageKeyComponent("dir/target", strings.Repeat("1", 64))
 	recent := "dir/" + expectedTemporaryStageKeyComponent("dir/target", strings.Repeat("2", 64))
 	lookalike := "dir/" + expectedTemporaryStageKeyComponent("dir/user", strings.Repeat("3", 64))
+	marker := "dir/" + expectedTemporaryStageKeyComponent("dir/deleted", strings.Repeat("4", 64))
 	ops := &fakeS3ArtifactOperations{
 		artifacts: []s3Artifact{
-			{key: recent, lastModified: now, etag: &recentETag, owned: true},
-			{key: lookalike, lastModified: now.Add(-2 * time.Hour), etag: &oldETag},
-			{key: failing, lastModified: now.Add(-2 * time.Hour), etag: &oldETag, owned: true},
-			{key: old, lastModified: now.Add(-2 * time.Hour), etag: &oldETag, owned: true},
+			{key: recent, lastModified: now, etag: &recentETag, versionID: &recentVersion, owned: true},
+			{key: lookalike, lastModified: now.Add(-2 * time.Hour), etag: &oldETag, versionID: &userVersion},
+			{key: failing, lastModified: now.Add(-2 * time.Hour), etag: &oldETag, versionID: &failingVersion, owned: true},
+			{key: old, lastModified: now.Add(-2 * time.Hour), etag: &oldETag, versionID: &oldVersion, owned: true},
+			{key: marker, lastModified: now.Add(-2 * time.Hour), versionID: &markerVersion, deleteMarker: true},
 		},
 		removeErrors: map[string]error{failing: removeErr},
 	}
@@ -478,14 +485,23 @@ func TestCleanupStaleArtifactsIsBoundedConditionalAndExplicit(t *testing.T) {
 	if !errors.Is(err, removeErr) {
 		t.Fatalf("error = %v, want delete failure", err)
 	}
-	if result.Examined != 4 {
-		t.Fatalf("Examined = %d, want 4", result.Examined)
+	if result.Examined != 5 {
+		t.Fatalf("Examined = %d, want 5", result.Examined)
 	}
-	if len(result.Removed) != 1 || result.Removed[0] != "s3://bucket/"+old {
+	wantRemoved := []string{
+		"s3://bucket/" + old + "?versionId=" + oldVersion,
+		"s3://bucket/" + marker + "?versionId=" + markerVersion,
+	}
+	if fmt.Sprint(result.Removed) != fmt.Sprint(wantRemoved) {
 		t.Fatalf("Removed = %v", result.Removed)
 	}
-	if len(ops.removed) != 2 || ops.removed[0].etag == nil || *ops.removed[0].etag != oldETag {
+	if len(ops.removed) != 3 {
 		t.Fatalf("conditional removals = %#v", ops.removed)
+	}
+	for _, removed := range ops.removed {
+		if removed.versionID == nil {
+			t.Fatalf("removal missing version ID: %#v", removed)
+		}
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
