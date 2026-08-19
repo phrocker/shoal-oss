@@ -775,6 +775,43 @@ shoal_batch_writer_close(shoal_batch_writer *writer, int64_t timeout_ms,
 SHOAL_API void SHOAL_CALL
 shoal_batch_writer_free(shoal_batch_writer **writer);
 
+/*
+ * The buffered writer is an owned, lazy high-level writer. It copies config
+ * and byte inputs, creates its underlying batch writer on the first update,
+ * and buffers one mutation until the row changes or close is called. Calls on
+ * one handle are serialized. close cancels and joins concurrent updates;
+ * connector close cancels them as well. timeout_ms is zero for no deadline.
+ * Free is NULL-safe and idempotent; callers must externally serialize free
+ * against access through aliases to the same C handle.
+ */
+SHOAL_API shoal_status SHOAL_CALL
+shoal_connector_create_accumulo_writer(
+    shoal_connector *connector, const shoal_batch_writer_config *config,
+    shoal_accumulo_writer **out_writer, shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_accumulo_writer_put(
+    shoal_accumulo_writer *writer, shoal_bytes row, shoal_bytes column_family,
+    shoal_bytes column_qualifier, shoal_bytes column_visibility,
+    int64_t timestamp, shoal_bytes value, int64_t timeout_ms,
+    shoal_write_failure **out_failure, shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_accumulo_writer_put_delete(
+    shoal_accumulo_writer *writer, shoal_bytes row, shoal_bytes column_family,
+    shoal_bytes column_qualifier, shoal_bytes column_visibility,
+    int64_t timestamp, int64_t timeout_ms,
+    shoal_write_failure **out_failure, shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_accumulo_writer_delete(
+    shoal_accumulo_writer *writer, const shoal_key *key, int64_t timeout_ms,
+    shoal_write_failure **out_failure, shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_accumulo_writer_close(shoal_accumulo_writer *writer,
+                            int64_t timeout_ms,
+                            shoal_write_failure **out_failure,
+                            shoal_error **out_error);
+SHOAL_API void SHOAL_CALL
+shoal_accumulo_writer_free(shoal_accumulo_writer **writer);
+
 SHOAL_API shoal_write_failure_flags SHOAL_CALL
 shoal_write_failure_get_flags(const shoal_write_failure *failure);
 

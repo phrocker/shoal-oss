@@ -322,6 +322,27 @@ static void *shoal_bridge_result_calloc(size_t count, size_t size) {
   return calloc(count, size);
 }
 
+shoal_accumulo_writer *shoal_bridge_accumulo_writer_alloc(uint64_t id) {
+  shoal_accumulo_writer *writer =
+      (shoal_accumulo_writer *)shoal_bridge_result_calloc(1, sizeof(*writer));
+  if (writer != NULL) {
+    writer->id = id;
+  }
+  return writer;
+}
+
+uint64_t
+shoal_bridge_accumulo_writer_id(const shoal_accumulo_writer *writer) {
+  return writer == NULL ? 0 : writer->id;
+}
+
+void shoal_bridge_accumulo_writer_free(shoal_accumulo_writer *writer) {
+  if (writer != NULL) {
+    writer->id = 0;
+    free(writer);
+  }
+}
+
 static uint8_t *shoal_bridge_result_copy_bytes(const uint8_t *value,
                                                size_t length) {
   if (length == 0 || value == NULL) {

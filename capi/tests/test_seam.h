@@ -24,6 +24,8 @@ int shoal_test_connector_identity_block(shoal_connector *connector,
 int shoal_test_connector_topology_block(shoal_connector *connector,
                                         uint8_t block);
 int shoal_test_batch_writer_create(int mode, shoal_batch_writer **out_writer);
+int shoal_test_accumulo_writer_create(
+    int mode, shoal_accumulo_writer **out_writer);
 void shoal_test_string_alloc_fail_after(size_t successful_allocations);
 void shoal_test_string_alloc_reset(void);
 void shoal_test_result_alloc_fail_after(size_t successful_allocations);

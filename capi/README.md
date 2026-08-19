@@ -29,7 +29,7 @@ Shoal separates **ABI compatibility** from **feature availability**:
   stable allocation-free version tuple that works before connector creation.
   `SHOAL_ABI_VERSION_PACKED` uses
   `SHOAL_ABI_PACK_VERSION(major, minor, patch)` with a hexadecimal
-  `0x00MMmmpp` layout, so ABI `1.6.0` is `0x00010600`.
+  `0x00MMmmpp` layout, so ABI `1.7.0` is `0x00010700`.
 - Capability identifiers are append-only. Existing IDs and bits never change
   meaning. `shoal_abi_capability_word_count()` reports how many 64-bit words
   the current library uses, `shoal_abi_capability_word(i)` returns `0` for
@@ -58,6 +58,7 @@ Current capability assignments (`word 0 == 0x000000000003ffff`):
 | `SHOAL_ABI_CAPABILITY_CONFIGURATION_TOPOLOGY` | `0x8000` | binary-safe configuration handles and owned instance-topology snapshots |
 | `SHOAL_ABI_CAPABILITY_RFILE` | `0x10000` | owned standalone RFile readers, writers, seekable relocations, and copied results |
 | `SHOAL_ABI_CAPABILITY_DATA_VALUES` | `0x20000` | copied key/range/authorization operations and owned key/value results |
+| `SHOAL_ABI_CAPABILITY_BUFFERED_WRITER` | `0x40000` | owned lazy row-buffered high-level writer with close coordination |
 
 Shoal does **not** advertise instance status, compaction/import/export,
 Python/wheel, or any other unimplemented surface until the API exists and has
@@ -172,6 +173,13 @@ Version numbers change only when the public ABI contract changes:
 - BatchWriter operations accept per-call deadlines. Close prevents new calls,
   cancels and joins active calls, and flushes the remaining buffer; free uses a
   bounded best-effort close.
+- The owned buffered writer copies its batch-writer configuration and every
+  binary update, creates the underlying BatchWriter lazily on the first
+  update, combines adjacent updates for one row, and submits the pending
+  mutation on row change or close. `put` replaces timestamp zero with the
+  current Unix time in milliseconds; `put_delete` preserves an explicit zero.
+  Calls are serialized, connector close cancels active work, and writer close
+  cancels, joins, flushes, and closes with the caller's deadline.
 - Write failures optionally return an owned `shoal_write_failure` containing
   ambiguous-commit/retry flags plus failed extents, constraint violations,
   authorization failures, and cleanup failures. Borrowed views remain valid
