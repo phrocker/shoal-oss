@@ -2790,6 +2790,69 @@ func TestAQueuedCandidateKeepsOneWatchOnItsOwnNode(t *testing.T) {
 	}
 }
 
+// TestMaintainInheritsTheWatchTheQueuedAcquisitionArmed continues the one-watch
+// invariant across the handover from Acquire to Maintain. A candidate that
+// waited in the queue armed a watch on its own node and still holds it when it
+// reaches the front, so a Maintain that armed its own would leave that one
+// registered on the client and the server for as long as the generation lasts.
+//
+// Reusing it is also what makes the handover fail closed for free: a node
+// deleted between the directory read that decided ownership and the first
+// Maintain has already fired the inherited watch, so the ending is delivered
+// rather than looked for.
+func TestMaintainInheritsTheWatchTheQueuedAcquisitionArmed(t *testing.T) {
+	f := newFakeZK()
+	dir := testLockPath()
+	f.seed(dir, nil, false)
+	ahead := path.Join(dir, f.seedForeignLock(dir, otherUUID, 0))
+
+	lock := newTestLock(t, f)
+	ours := lockNodePath(lock.UUID(), 1)
+	acquired := make(chan error, 1)
+	go func() {
+		_, err := lock.Acquire(context.Background(), testLockData(t, lock))
+		acquired <- err
+	}()
+
+	// Queued: the own-node watch is armed before the one ahead, so waiting for
+	// the node ahead to be watched proves both exist.
+	waitArmed(t, f, ahead)
+	if got := f.watchCount(ours); got != 1 {
+		t.Fatalf("own node watched %d times while queued, want the one the queue arms", got)
+	}
+	if err := f.Delete(ahead, -1); err != nil {
+		t.Fatalf("Delete(%s): %v", ahead, err)
+	}
+	if err := <-acquired; err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	if got := f.watchCount(ours); got != 1 {
+		t.Fatalf("own node watched %d times after acquiring, want the queue's watch kept", got)
+	}
+
+	var rearmed atomic.Bool
+	f.beforeGet = func(znodePath string) {
+		if znodePath == ours {
+			rearmed.Store(true)
+		}
+	}
+	watched := make(chan error, 1)
+	go func() { watched <- lock.Maintain(context.Background()) }()
+	if err := f.Delete(ours, -1); err != nil {
+		t.Fatalf("Delete(%s): %v", ours, err)
+	}
+	if err := <-watched; !errors.Is(err, ErrLockLost) {
+		t.Fatalf("Maintain: want ErrLockLost, got %v", err)
+	}
+	if lock.LossReason() != LossNodeDeleted {
+		t.Fatalf("loss reason %s, want NODE_DELETED", lock.LossReason())
+	}
+	if rearmed.Load() {
+		t.Fatal("Maintain armed a second watch instead of inheriting the one the " +
+			"acquisition left armed on the same node")
+	}
+}
+
 // TestReleaseRecordsItsEndingBeforeTheNodeGoes pins which ending a deliberate
 // release is remembered by. The delete is what a watching Maintain sees, so a
 // watcher that reached the loss first would record an external NODE_DELETED

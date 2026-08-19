@@ -532,6 +532,24 @@ different node on each pass, so it is not the same kind of accumulation:
 each one belongs to the node it was armed on and is spent when that node
 goes.
 
+The own-node watch is kept across the handover too. Reaching the front of
+the queue does not change which node this process is watching, so the
+registration the wait armed is the generation's, and `Maintain` inherits
+it rather than arming another — otherwise a candidate that queued would
+carry a second registration on one node for as long as it held the lock,
+which is the per-pass leak moved to the handover. An acquisition that was
+first in line has nothing to hand over, and `Maintain` arms its own.
+
+Inheriting it also closes the gap between deciding ownership and watching
+it. The directory listing that says this process is first is a read of
+the past by the time the caller acts on it, and the node can go in
+between — an operator, a session that dropped just that node. A watch
+already armed has already fired, so the ending is waiting to be
+delivered; when there is none to inherit, the arming read finds the node
+missing and ends the generation there. Both fail closed, which is what
+lets `Participate` adopt a generation and be told immediately that it is
+gone, rather than hosting against one that no longer exists.
+
 An optional verify interval re-reads the directory on a timer. It catches
 what a watch cannot: a watch dropped without an event, and a lock
 directory deleted and recreated, which restarts ZooKeeper's sequence

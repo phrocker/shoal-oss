@@ -697,7 +697,25 @@ func (l *ServiceLock) queueForOwnership(ctx context.Context) (LockID, error) {
 			if err := ctx.Err(); err != nil {
 				return LockID{}, err
 			}
-			return l.acquired(node)
+			id, err := l.acquired(node)
+			if err != nil {
+				return LockID{}, err
+			}
+			// The watch armed while queued is on the node this generation is
+			// now held as, so it is the generation's watch and Maintain
+			// inherits it. Leaving it behind would put a second registration
+			// on one node for as long as the generation lasts — the same
+			// accumulation the one-watch invariant exists to prevent, just
+			// spent at the handover instead of per pass.
+			//
+			// It also closes the handover without a second read. A node
+			// deleted between the listing that decided ownership and the
+			// first Maintain has already fired this watch, so the ending is
+			// waiting to be delivered rather than looked for. Nothing is
+			// inherited when this acquisition was first in line and never
+			// queued; Maintain arms its own, and finds the node gone if it is.
+			l.adoptWatch(mineEvents)
+			return id, nil
 		}
 		// Watch this process's own node as well as the one ahead of it. The
 		// node ahead says when the turn arrives; the own node says when the
@@ -914,6 +932,24 @@ func (l *ServiceLock) spendWatch(spent <-chan gozk.Event) {
 	defer l.watchMu.Unlock()
 	if l.watch == spent {
 		l.watch = nil
+	}
+}
+
+// adoptWatch hands an acquisition's own-node watch to the generation it just
+// took, so watchers reuse it instead of arming another on the same node.
+//
+// A watch already outstanding wins, matching armWatch: a Maintain that got
+// there first is parked on that one, and replacing it would leave spendWatch
+// unable to recognise the watch that fires. Passing no watch is the ordinary
+// case of an acquisition that was first in line and never had to wait.
+func (l *ServiceLock) adoptWatch(armed <-chan gozk.Event) {
+	if armed == nil {
+		return
+	}
+	l.watchMu.Lock()
+	defer l.watchMu.Unlock()
+	if l.watch == nil {
+		l.watch = armed
 	}
 }
 
