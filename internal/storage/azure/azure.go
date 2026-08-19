@@ -85,6 +85,7 @@ type Backend struct {
 
 type azureArtifact struct {
 	name         string
+	versionID    *string
 	lastModified time.Time
 	etag         *azcore.ETag
 	owned        bool
@@ -429,9 +430,17 @@ func (b *Backend) CleanupStaleArtifacts(ctx context.Context, prefix string, cuto
 			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("azure: remove stale artifact az://%s/%s: %w", cont, artifact.name, err))
 			continue
 		}
-		result.Removed = append(result.Removed, "az://"+cont+"/"+artifact.name)
+		result.Removed = append(result.Removed, azureArtifactPath(cont, artifact))
 	}
 	return result, cleanupErr
+}
+
+func azureArtifactPath(containerName string, artifact azureArtifact) string {
+	path := "az://" + containerName + "/" + artifact.name
+	if artifact.versionID == nil {
+		return path
+	}
+	return path + "?versionId=" + url.QueryEscape(*artifact.versionID)
 }
 
 // ParsePath splits a path string into (container, blob). Exposed so callers
@@ -788,9 +797,10 @@ func (f *file) ReadAt(p []byte, off int64) (int, error) {
 }
 
 type azureObjectState struct {
-	etag     *azcore.ETag
-	size     int64
-	metadata map[string]*string
+	etag      *azcore.ETag
+	versionID *string
+	size      int64
+	metadata  map[string]*string
 }
 
 type azureWriteOperations interface {
@@ -809,7 +819,10 @@ type sdkAzureArtifactOperations struct {
 }
 
 func (o sdkAzureArtifactOperations) list(ctx context.Context, containerName, prefix string) ([]azureArtifact, error) {
-	pager := o.svc.NewContainerClient(containerName).NewListBlobsFlatPager(&container.ListBlobsFlatOptions{Prefix: &prefix})
+	pager := o.svc.NewContainerClient(containerName).NewListBlobsFlatPager(&container.ListBlobsFlatOptions{
+		Prefix:  &prefix,
+		Include: container.ListBlobsInclude{Metadata: true, Versions: true},
+	})
 	var artifacts []azureArtifact
 	for pager.More() {
 		page, err := pager.NextPage(ctx)
@@ -823,7 +836,12 @@ func (o sdkAzureArtifactOperations) list(ctx context.Context, containerName, pre
 			if item == nil || item.Name == nil || item.Properties == nil {
 				continue
 			}
-			artifact := azureArtifact{name: *item.Name, etag: item.Properties.ETag}
+			artifact := azureArtifact{
+				name:      *item.Name,
+				versionID: item.VersionID,
+				etag:      item.Properties.ETag,
+				owned:     metadataValue(item.Metadata, "shoal-write-id") != "",
+			}
 			if item.Properties.LastModified != nil {
 				artifact.lastModified = *item.Properties.LastModified
 			}
@@ -834,7 +852,11 @@ func (o sdkAzureArtifactOperations) list(ctx context.Context, containerName, pre
 }
 
 func (o sdkAzureArtifactOperations) remove(ctx context.Context, containerName string, artifact azureArtifact) error {
-	_, err := o.svc.NewContainerClient(containerName).NewBlobClient(artifact.name).Delete(ctx, &blob.DeleteOptions{
+	client, err := azureVersionClient(o.svc.NewContainerClient(containerName).NewBlobClient(artifact.name), artifact.versionID)
+	if err != nil {
+		return err
+	}
+	_, err = client.Delete(ctx, &blob.DeleteOptions{
 		AccessConditions: &blob.AccessConditions{
 			ModifiedAccessConditions: &blob.ModifiedAccessConditions{IfMatch: artifact.etag},
 		},
@@ -843,7 +865,11 @@ func (o sdkAzureArtifactOperations) remove(ctx context.Context, containerName st
 }
 
 func (o sdkAzureArtifactOperations) inspect(ctx context.Context, containerName string, artifact azureArtifact) (azureArtifact, error) {
-	out, err := o.svc.NewContainerClient(containerName).NewBlobClient(artifact.name).GetProperties(ctx, nil)
+	client, err := azureVersionClient(o.svc.NewContainerClient(containerName).NewBlobClient(artifact.name), artifact.versionID)
+	if err != nil {
+		return artifact, err
+	}
+	out, err := client.GetProperties(ctx, nil)
 	if err != nil {
 		return artifact, err
 	}
@@ -855,6 +881,13 @@ func (o sdkAzureArtifactOperations) inspect(ctx context.Context, containerName s
 	return artifact, nil
 }
 
+func azureVersionClient(client *blob.Client, versionID *string) (*blob.Client, error) {
+	if versionID == nil {
+		return client, nil
+	}
+	return client.WithVersionID(*versionID)
+}
+
 func (o sdkAzureWriteOperations) head(
 	ctx context.Context, containerName, name string,
 ) (azureObjectState, error) {
@@ -862,7 +895,7 @@ func (o sdkAzureWriteOperations) head(
 	if err != nil {
 		return azureObjectState{}, err
 	}
-	state := azureObjectState{etag: out.ETag, metadata: out.Metadata}
+	state := azureObjectState{etag: out.ETag, versionID: out.VersionID, metadata: out.Metadata}
 	if out.ContentLength != nil {
 		state.size = *out.ContentLength
 	}
@@ -889,9 +922,10 @@ func (o sdkAzureWriteOperations) uploadStage(
 		return azureObjectState{}, err
 	}
 	return azureObjectState{
-		etag:     out.ETag,
-		size:     int64(len(data)),
-		metadata: map[string]*string{"shoal-write-id": to.Ptr(writeID)},
+		etag:      out.ETag,
+		versionID: out.VersionID,
+		size:      int64(len(data)),
+		metadata:  map[string]*string{"shoal-write-id": to.Ptr(writeID)},
 	}, nil
 }
 
@@ -962,7 +996,11 @@ func promoteStagedBlob(
 func (o sdkAzureWriteOperations) deleteStage(
 	ctx context.Context, containerName, name string, stage azureObjectState,
 ) error {
-	_, err := o.svc.NewContainerClient(containerName).NewBlobClient(name).Delete(
+	client, err := azureVersionClient(o.svc.NewContainerClient(containerName).NewBlobClient(name), stage.versionID)
+	if err != nil {
+		return err
+	}
+	_, err = client.Delete(
 		ctx,
 		&blob.DeleteOptions{
 			AccessConditions: &blob.AccessConditions{

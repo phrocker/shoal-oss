@@ -96,6 +96,7 @@ type fakeAzureWriteOperations struct {
 	nextETag              int
 	lastPromoteSource     azureCopySource
 	lastPromoteWriteID    string
+	lastDeletedStage      azureObjectState
 }
 
 func newFakeAzureWriteOperations() *fakeAzureWriteOperations {
@@ -145,11 +146,13 @@ func (f *fakeAzureWriteOperations) uploadStage(
 	}
 	f.nextETag++
 	etag := azcore.ETag(fmt.Sprintf("\"etag-%d\"", f.nextETag))
+	versionID := fmt.Sprintf("version-%d", f.nextETag)
 	id := writeID
 	state := azureObjectState{
-		etag:     &etag,
-		size:     int64(len(data)),
-		metadata: map[string]*string{"shoal-write-id": &id},
+		etag:      &etag,
+		versionID: &versionID,
+		size:      int64(len(data)),
+		metadata:  map[string]*string{"shoal-write-id": &id},
 	}
 	f.objects[name] = fakeAzureObject{state: state, data: string(data)}
 	if f.stageResponseLost {
@@ -217,8 +220,9 @@ func (f *fakeAzureWriteOperations) promote(
 }
 
 func (f *fakeAzureWriteOperations) deleteStage(
-	ctx context.Context, _, name string, _ azureObjectState,
+	ctx context.Context, _, name string, stage azureObjectState,
 ) error {
+	f.lastDeletedStage = stage
 	if ctx.Err() != nil {
 		f.cleanupCanceled = true
 		return ctx.Err()
@@ -739,6 +743,7 @@ func TestCleanupStaleArtifactsIsBoundedETagConditionalAndExplicit(t *testing.T) 
 	now := time.Now()
 	oldETag := azcore.ETag(`"old"`)
 	recentETag := azcore.ETag(`"recent"`)
+	oldVersion := "2026-08-19T00:00:00.0000000Z"
 	removeErr := errors.New("delete failed")
 	old := "dir/" + expectedTemporaryStageComponent("dir/target", strings.Repeat("0", 64))
 	failing := "dir/" + expectedTemporaryStageComponent("dir/target", strings.Repeat("1", 64))
@@ -751,7 +756,7 @@ func TestCleanupStaleArtifactsIsBoundedETagConditionalAndExplicit(t *testing.T) 
 			{name: lookalike, lastModified: now.Add(-2 * time.Hour), etag: &oldETag},
 			{name: uppercase, lastModified: now.Add(-2 * time.Hour), etag: &oldETag, owned: true},
 			{name: failing, lastModified: now.Add(-2 * time.Hour), etag: &oldETag, owned: true},
-			{name: old, lastModified: now.Add(-2 * time.Hour), etag: &oldETag, owned: true},
+			{name: old, versionID: &oldVersion, lastModified: now.Add(-2 * time.Hour), etag: &oldETag, owned: true},
 		},
 		removeErrors: map[string]error{failing: removeErr},
 	}
@@ -764,7 +769,7 @@ func TestCleanupStaleArtifactsIsBoundedETagConditionalAndExplicit(t *testing.T) 
 	if result.Examined != 4 {
 		t.Fatalf("Examined = %d, want 4", result.Examined)
 	}
-	if len(result.Removed) != 1 || result.Removed[0] != "az://container/"+old {
+	if len(result.Removed) != 1 || result.Removed[0] != "az://container/"+old+"?versionId="+url.QueryEscape(oldVersion) {
 		t.Fatalf("Removed = %v", result.Removed)
 	}
 	if len(ops.removed) != 2 || ops.removed[0].etag == nil || !ops.removed[0].etag.Equals(oldETag) {
@@ -1073,6 +1078,9 @@ func TestWriter_StagedCreateAndReplace(t *testing.T) {
 			}
 			if _, ok := f.objects[w.stageName]; ok {
 				t.Fatal("temporary blob was not removed")
+			}
+			if f.lastDeletedStage.versionID == nil {
+				t.Fatal("stage cleanup did not retain the uploaded version ID")
 			}
 		})
 	}
