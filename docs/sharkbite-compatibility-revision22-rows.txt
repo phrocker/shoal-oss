@@ -1,8 +1,8 @@
-# Revision-21 accepted matrix rows for docs/sharkbite-compatibility.md.
+# Revision-22 accepted matrix rows for docs/sharkbite-compatibility.md.
 # One entry per row: ROW-ID followed by the audited status, in document order.
 # Pinning the status next to the id means a swap of two rows' statuses inside one
 # section cannot pass the aggregate count checks undetected.
-# Update only when the independently audited revision-21 inventory itself changes.
+# Update only when the independently audited revision-22 inventory itself changes.
 # Regenerate from the audited document, review every added/removed/reclassified row
 # in code review, and keep the list in document order for human auditability.
 
@@ -378,39 +378,39 @@ SB-STAT-053 Intentional divergence (approval required)
 SB-STAT-036 Intentional divergence (approval required)
 SB-STAT-037 Intentional divergence (approval required)
 SB-STAT-038 Missing Go
-SB-RFILE-001 Missing Go
-SB-RFILE-002 Missing Go
-SB-RFILE-003 Missing Go
-SB-RFILE-004 Missing Go
+SB-RFILE-001 Missing C ABI
+SB-RFILE-002 Missing C ABI
+SB-RFILE-003 Missing C ABI
+SB-RFILE-004 Missing C ABI
 SB-RFILE-005 Behavior mismatch
-SB-RFILE-006 Missing Go
-SB-RFILE-007 Missing Go
-SB-RFILE-008 Missing Go
-SB-RFILE-009 Missing Go
-SB-RFILE-010 Missing Go
-SB-RFILE-011 Missing Go
+SB-RFILE-006 Missing C ABI
+SB-RFILE-007 Missing C ABI
+SB-RFILE-008 Missing C ABI
+SB-RFILE-009 Missing C ABI
+SB-RFILE-010 Missing C ABI
+SB-RFILE-011 Missing C ABI
 SB-RFILE-012 Missing Go
-SB-RFILE-013 Missing Go
-SB-RFILE-014 Missing Go
-SB-RFILE-025 Missing Go
-SB-RFILE-026 Missing Go
-SB-RFILE-027 Missing Go
-SB-RFILE-028 Missing Go
-SB-RFILE-015 Missing Go
-SB-RFILE-036 Missing Go
-SB-RFILE-016 Missing Go
-SB-RFILE-017 Missing Go
-SB-RFILE-029 Missing Go
-SB-RFILE-030 Missing Go
-SB-RFILE-031 Missing Go
-SB-RFILE-032 Missing Go
-SB-RFILE-033 Missing Go
-SB-RFILE-018 Missing Go
-SB-RFILE-019 Missing Go
-SB-RFILE-020 Missing Go
-SB-RFILE-034 Missing Go
-SB-RFILE-035 Missing Go
-SB-RFILE-021 Missing Go
+SB-RFILE-013 Missing C ABI
+SB-RFILE-014 Missing C ABI
+SB-RFILE-025 Missing C ABI
+SB-RFILE-026 Missing C ABI
+SB-RFILE-027 Missing C ABI
+SB-RFILE-028 Missing C ABI
+SB-RFILE-015 Missing C ABI
+SB-RFILE-036 Missing C ABI
+SB-RFILE-016 Missing C ABI
+SB-RFILE-017 Missing C ABI
+SB-RFILE-029 Missing C ABI
+SB-RFILE-030 Missing C ABI
+SB-RFILE-031 Missing C ABI
+SB-RFILE-032 Missing C ABI
+SB-RFILE-033 Missing C ABI
+SB-RFILE-018 Missing C ABI
+SB-RFILE-019 Missing C ABI
+SB-RFILE-020 Missing C ABI
+SB-RFILE-034 Missing C ABI
+SB-RFILE-035 Missing C ABI
+SB-RFILE-021 Missing C ABI
 SB-RFILE-022 Not required (rationale required)
 SB-RFILE-023 Not required (rationale required)
 SB-RFILE-024 Not required (rationale required)

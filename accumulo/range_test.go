@@ -2,6 +2,7 @@ package accumulo
 
 import (
 	"bytes"
+	"math"
 	"testing"
 )
 
@@ -88,5 +89,84 @@ func TestKeyRangeRejectsReversedFields(t *testing.T) {
 	end := &Key{Row: []byte("row"), ColumnFamily: []byte("a")}
 	if _, err := NewKeyRange(start, true, end, true); err == nil {
 		t.Fatal("reversed full-key range accepted")
+	}
+}
+
+// TestKeyBoundsResolvesRowBoundsToAbsoluteKeys pins the conversion a
+// key-ordered reader needs: a row bound covers every key in the row, and every
+// such key sorts after the key that spells the row alone.
+func TestKeyBoundsResolvesRowBoundsToAbsoluteKeys(t *testing.T) {
+	exclusiveStart, err := NewRange([]byte("row2"), false, nil, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	start, startInclusive, end, _ := exclusiveStart.KeyBounds()
+	if start == nil || !bytes.Equal(start.Row, []byte("row2\x00")) || !startInclusive {
+		t.Fatalf("exclusive row start = %+v inclusive=%t, want row2+NUL inclusive", start, startInclusive)
+	}
+	if start.Timestamp != math.MaxInt64 {
+		t.Fatalf("start timestamp = %d, want the maximum: timestamps sort descending, so the first key of a row carries it", start.Timestamp)
+	}
+	if end != nil {
+		t.Fatalf("unbounded end = %+v, want nil", end)
+	}
+
+	inclusiveEnd, err := NewRange(nil, true, []byte("row2"), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, end, endInclusive := inclusiveEnd.KeyBounds()
+	if end == nil || !bytes.Equal(end.Row, []byte("row2\x00")) || endInclusive || end.Timestamp != math.MaxInt64 {
+		t.Fatalf("inclusive row end = %+v inclusive=%t, want row2+NUL exclusive at the maximum timestamp", end, endInclusive)
+	}
+
+	exclusiveEnd, err := NewRange(nil, true, []byte("row2"), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, end, endInclusive = exclusiveEnd.KeyBounds()
+	if end == nil || !bytes.Equal(end.Row, []byte("row2")) || endInclusive || end.Timestamp != math.MaxInt64 {
+		t.Fatalf("exclusive row end = %+v inclusive=%t, want row2 exclusive at the maximum timestamp", end, endInclusive)
+	}
+
+	inclusiveStart, err := NewRange([]byte("row2"), true, nil, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	start, startInclusive, _, _ = inclusiveStart.KeyBounds()
+	if start == nil || !bytes.Equal(start.Row, []byte("row2")) || !startInclusive || start.Timestamp != math.MaxInt64 {
+		t.Fatalf("inclusive row start = %+v inclusive=%t, want row2 inclusive at the maximum timestamp", start, startInclusive)
+	}
+}
+
+// TestKeyBoundsLeavesKeyRangesAlone pins that a range built from full keys is
+// returned as it was given: only row bounds carry the row-covering convention.
+func TestKeyBoundsLeavesKeyRangesAlone(t *testing.T) {
+	start := &Key{Row: []byte("row2"), ColumnFamily: []byte("cf"), Timestamp: 7}
+	end := &Key{Row: []byte("row9"), ColumnFamily: []byte("cf"), Timestamp: 3}
+	keyRange, err := NewKeyRange(start, false, end, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotStart, startInclusive, gotEnd, endInclusive := keyRange.KeyBounds()
+	if !bytes.Equal(gotStart.Row, start.Row) || !bytes.Equal(gotStart.ColumnFamily, start.ColumnFamily) || startInclusive {
+		t.Fatalf("start = %+v inclusive=%t, want the key it was built with, exclusive", gotStart, startInclusive)
+	}
+	if !bytes.Equal(gotEnd.Row, end.Row) || !endInclusive {
+		t.Fatalf("end = %+v inclusive=%t, want the key it was built with, inclusive", gotEnd, endInclusive)
+	}
+	gotStart.Row[0] = 'X'
+	if again, _, _, _ := keyRange.KeyBounds(); !bytes.Equal(again.Row, []byte("row2")) {
+		t.Fatalf("KeyBounds returned an aliased key: %q", again.Row)
+	}
+}
+
+// TestKeyBoundsOnNilRangeIsUnbounded pins the nil-receiver contract the other
+// accessors already have.
+func TestKeyBoundsOnNilRangeIsUnbounded(t *testing.T) {
+	var nilRange *Range
+	start, startInclusive, end, endInclusive := nilRange.KeyBounds()
+	if start != nil || end != nil || !startInclusive || endInclusive {
+		t.Fatalf("nil range bounds = %+v/%t %+v/%t, want unbounded", start, startInclusive, end, endInclusive)
 	}
 }

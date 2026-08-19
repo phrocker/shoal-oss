@@ -457,7 +457,7 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
     def test_row_manifest_provenance_rejects_stale_revision_header(self) -> None:
         manifest_lines = validator.EXPECTED_ROW_MANIFEST.read_text(encoding="utf-8").splitlines()
         mutated = list(manifest_lines)
-        mutated[0] = mutated[0].replace("Revision-21", "Revision-18")
+        mutated[0] = mutated[0].replace("Revision-22", "Revision-18")
         self.assert_validation_fails(
             lambda: validator.validate_expected_row_manifest_provenance(
                 mutated, source=validator.EXPECTED_ROW_MANIFEST.name
@@ -720,15 +720,15 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
 
     def test_pinned_inventory_constants_are_internally_consistent(self) -> None:
         validator.validate_pinned_inventory_constants()
-        self.assertEqual(validator.EXPECTED_REVISION, 21)
+        self.assertEqual(validator.EXPECTED_REVISION, 22)
         self.assertEqual(validator.EXPECTED_TOTAL_ROWS, 3203)
         self.assertEqual(validator.EXPECTED_REQUIRED_ROWS, 2811)
         self.assertEqual(
             validator.EXPECTED_STATUS_COUNTS,
             {
                 "Covered": 1,
-                "Missing Go": 2409,
-                "Missing C ABI": 90,
+                "Missing Go": 2378,
+                "Missing C ABI": 121,
                 "Behavior mismatch": 224,
                 validator.INTENTIONAL_DIVERGENCE_STATUS: 87,
                 validator.NOT_REQUIRED_STATUS: 392,
@@ -872,11 +872,11 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
     def test_declared_count_edit_still_fails_internal_cross_check(self) -> None:
         text = load_document_text()
         mutated = replace_pattern_once(
-            text, re.escape("| Missing Go | 2409 |"), "| Missing Go | 2408 |"
+            text, re.escape("| Missing Go | 2378 |"), "| Missing Go | 2377 |"
         )
         self.assert_validation_fails(
             lambda: validator.validate_counts(mutated.splitlines(), mutated),
-            "status summary says 2408 rows for Missing Go, but parsed 2409",
+            "status summary says 2377 rows for Missing Go, but parsed 2378",
         )
 
     def test_stale_c_abi_symbol_inventory_narrative_is_rejected(self) -> None:
@@ -895,7 +895,7 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
     def test_revision_bump_requires_validator_constant_update(self) -> None:
         text = load_document_text()
         mutated = text.replace(
-            f"Revision {validator.EXPECTED_REVISION} — adds owned range and iterator-setting descriptor ABIs",
+            f"Revision {validator.EXPECTED_REVISION} — reclassifies the thirty-one RFile and stream rows ",
             f"Revision {validator.EXPECTED_REVISION + 1} — adds the next audited ABI slice",
         ).replace(
             f"As of revision {validator.EXPECTED_REVISION} that is",
@@ -904,7 +904,7 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
         self.assertNotEqual(mutated, text)
         self.assert_validation_fails(
             lambda: validator.validate_counts(mutated.splitlines(), mutated),
-            f"document status is missing expected detail: Revision {validator.EXPECTED_REVISION} — adds owned range and iterator-setting",
+            f"document status is missing expected detail: Revision {validator.EXPECTED_REVISION} — reclassifies the thirty-one RFile",
         )
 
     # ---- matrix table separators -------------------------------------------
