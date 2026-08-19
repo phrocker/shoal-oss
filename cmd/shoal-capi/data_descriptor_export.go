@@ -288,9 +288,15 @@ type rangeResultSnapshot struct {
 
 func snapshotRangeResult(result *C.shoal_range_result) (rangeResultSnapshot, error) {
 	var view C.shoal_range_view
+	var outError *C.shoal_error
 	view.struct_size = C.SHOAL_RANGE_VIEW_V1_SIZE
-	if C.shoal_bridge_range_result_get(result, &view) == 0 {
-		return rangeResultSnapshot{}, errors.New("shoal: snapshot range result")
+	if shoal_range_get(result, &view, &outError) != C.SHOAL_STATUS_OK {
+		message := "shoal: snapshot range result"
+		if outError != nil {
+			message = C.GoString(C.shoal_bridge_error_message(outError))
+			C.shoal_bridge_error_free(outError)
+		}
+		return rangeResultSnapshot{}, errors.New(message)
 	}
 	return rangeResultSnapshot{
 		startKind:      rangeBoundKind(view.start_kind),
@@ -317,9 +323,15 @@ type iteratorSettingResultSnapshot struct {
 
 func snapshotIteratorSettingResult(result *C.shoal_iterator_setting_result) (iteratorSettingResultSnapshot, error) {
 	var view C.shoal_iterator_setting_view
+	var outError *C.shoal_error
 	view.struct_size = C.SHOAL_ITERATOR_SETTING_VIEW_V1_SIZE
-	if C.shoal_bridge_iterator_setting_result_get(result, &view) == 0 {
-		return iteratorSettingResultSnapshot{}, errors.New("shoal: snapshot iterator setting result")
+	if shoal_iterator_setting_get(result, &view, &outError) != C.SHOAL_STATUS_OK {
+		message := "shoal: snapshot iterator setting result"
+		if outError != nil {
+			message = C.GoString(C.shoal_bridge_error_message(outError))
+			C.shoal_bridge_error_free(outError)
+		}
+		return iteratorSettingResultSnapshot{}, errors.New(message)
 	}
 	options := make(map[string]string, int(view.option_count))
 	for _, option := range unsafe.Slice(view.options, int(view.option_count)) {
