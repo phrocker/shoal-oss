@@ -624,7 +624,8 @@ type parsedInput struct {
 	file             InputFile
 	field            string
 	startRow, endRow string
-	// startRaw and endRaw are the rows after base64 decoding. They are
+	// startRaw and endRaw are the rows the entry declares, after base64
+	// decoding and after the Hadoop Text length is applied. They are
 	// what identifies the reference, because a StoredTabletFile is its
 	// path *and* its range, and two spellings of one range have to
 	// compare equal.
@@ -636,9 +637,13 @@ func (p parsedInput) fenced() bool { return p.startRow != "" || p.endRow != "" }
 // key identifies the tablet-file reference this entry names. Accumulo
 // deliberately allows several StoredTabletFiles over one path with
 // different ranges — that is how a fenced file is referenced after a
-// split or merge — so the range belongs in the identity. Comparing the
-// decoded rows rather than the JSON collapses equivalent spellings, such
-// as padded and unpadded base64.
+// split or merge — so the range belongs in the identity.
+//
+// The rows compared are the ones Java would build: base64 decoded, then
+// cut to the length the Text declares. Anything shallower would let two
+// entries that name one range differ in the key — padded against
+// unpadded base64, or bytes past the declared length, which readFully
+// never looks at — and a file would be merged twice.
 func (p parsedInput) key() string {
 	return p.file.Path + "\x00" + string(p.startRaw) + "\x00" + string(p.endRaw)
 }
@@ -831,6 +836,9 @@ func checkTabletFilePath(raw, field string) error {
 		return refuse(ClassMalformedJob, field,
 			"%q carries a %q; a tablet file path is a plain URI", raw, raw[i:i+1])
 	}
+	if err := checkURISyntax(raw); err != nil {
+		return refuse(ClassMalformedJob, field, "%q is not a valid URI: %v", raw, err)
+	}
 	colon := strings.Index(raw, ":")
 	slash := strings.Index(raw, "/")
 	if colon <= 0 || (slash >= 0 && slash < colon) {
@@ -871,11 +879,61 @@ func checkTabletFilePath(raw, field string) error {
 		return refuse(ClassMalformedJob, field,
 			"%q: tables directory name is not %q, is %q", raw, hdfsTablesDirName, dir)
 	}
+	// parsePath splits uri.getPath(), which is decoded, but rebuilds and
+	// compares against uri.toString(), which is not. So a percent-escape
+	// anywhere in the four segments it reassembles makes the rebuilt
+	// path a string that is not in the raw one, and lastIndexOf returns
+	// -1. An escape in the volume is fine: that part is copied out of
+	// the raw string and never decoded.
+	for _, segment := range segments[len(segments)-4:] {
+		if i := strings.IndexByte(segment, '%'); i >= 0 {
+			return refuse(ClassMalformedJob, field,
+				"%q escapes %q inside the path parsePath rebuilds; that rebuild is decoded and is compared against the raw URI, which would not contain it",
+				raw, segment[i:min(i+3, len(segment))])
+		}
+	}
 	if name := segments[len(segments)-1]; !validFileNameRE.MatchString(name) {
 		return refuse(ClassMalformedJob, field,
 			"%q: file name %q is empty or contains invalid characters", raw, name)
 	}
 	return nil
+}
+
+// uriExtraChars are the non-alphanumeric characters java.net.URI's
+// single-argument parser accepts unescaped: RFC 2396's unreserved marks,
+// its reserved set, and the brackets URI allows for IPv6 literals.
+const uriExtraChars = "-_.!~*'();/:@&=+$,[]"
+
+// checkURISyntax rejects what java.net.URI's single-argument parser
+// rejects.
+//
+// StoredTabletFile.deserialize builds its path with
+// new Path(URI.create(metadata.path)), and URI.create is the strict
+// parser: an unescaped space, a stray control byte, a non-ASCII byte or
+// a truncated percent-escape is a URISyntaxException, not something it
+// quotes for the caller. Splitting on "/" without this would let such a
+// path through as an executable plan for a file Accumulo cannot even
+// name.
+func checkURISyntax(raw string) error {
+	for i := 0; i < len(raw); i++ {
+		c := raw[i]
+		switch {
+		case c == '%':
+			if i+2 >= len(raw) || !isHexDigit(raw[i+1]) || !isHexDigit(raw[i+2]) {
+				return fmt.Errorf("truncated or non-hex escape at offset %d", i)
+			}
+			i += 2
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+		case strings.IndexByte(uriExtraChars, c) >= 0:
+		default:
+			return fmt.Errorf("character %q at offset %d must be percent-escaped", string(rune(c)), i)
+		}
+	}
+	return nil
+}
+
+func isHexDigit(c byte) bool {
+	return c >= '0' && c <= '9' || c >= 'a' && c <= 'f' || c >= 'A' && c <= 'F'
 }
 
 // checkFenceFields enforces the two StoredTabletFile invariants a Go
@@ -945,10 +1003,7 @@ func checkFenceRow(value string) ([]byte, error) {
 		// spelled, and it never reaches Text.readFields.
 		return nil, nil
 	}
-	if err := checkTextFraming(raw); err != nil {
-		return nil, err
-	}
-	return raw, nil
+	return textPayload(raw)
 }
 
 // decodeURLBase64 accepts the encodings Base64.getUrlDecoder accepts:
@@ -956,6 +1011,13 @@ func checkFenceRow(value string) ([]byte, error) {
 func decodeURLBase64(value string) ([]byte, error) {
 	if value == "" {
 		return nil, nil
+	}
+	// Go's decoders skip CR and LF; Java's URL decoder has no such
+	// leniency and throws on any character outside the alphabet, so
+	// accepting them here would call a row Accumulo cannot deserialize
+	// a supported-looking fence.
+	if strings.ContainsAny(value, "\r\n") {
+		return nil, errors.New("not url-safe base64: contains a line break")
 	}
 	if raw, err := base64.URLEncoding.DecodeString(value); err == nil {
 		return raw, nil
@@ -967,23 +1029,27 @@ func decodeURLBase64(value string) ([]byte, error) {
 	return raw, nil
 }
 
-// checkTextFraming validates a Hadoop Text serialization the way
-// Text.readFields consumes one: a VInt length followed by that many
-// bytes. Trailing bytes are ignored, as they are by readFully.
-func checkTextFraming(raw []byte) error {
+// textPayload reads a Hadoop Text serialization the way Text.readFields
+// consumes one — a VInt length followed by that many bytes — and returns
+// the row it declares.
+//
+// Bytes past the declared length are ignored, because readFully never
+// reads them: two entries that differ only there name the same row, so
+// the row and not the buffer is what callers must compare.
+func textPayload(raw []byte) ([]byte, error) {
 	length, size, err := readVInt(raw)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if length < 0 {
 		// readWithKnownLength cannot allocate or read a negative count.
-		return fmt.Errorf("Text length %d is negative", length)
+		return nil, fmt.Errorf("Text length %d is negative", length)
 	}
 	if available := int64(len(raw) - size); available < length {
-		return fmt.Errorf("Text declares %d byte(s) but only %d follow the length",
+		return nil, fmt.Errorf("Text declares %d byte(s) but only %d follow the length",
 			length, available)
 	}
-	return nil
+	return raw[size : size+int(length)], nil
 }
 
 // readVInt mirrors WritableUtils.readVInt: readVLong's first byte
@@ -1080,10 +1146,22 @@ func parseOutput(job *tabletserver.TExternalCompactionJob, inputs []parsedInput,
 				"output %s commits as %s, which is also files[%d]", out, committed, i)
 		}
 	}
-	if !strings.HasSuffix(out, tmpSuffix(ecid)) {
+	marker := tmpSuffix(ecid)
+	if !strings.HasSuffix(out, marker) {
 		return "", refuse(ClassMalformedJob, "outputFile",
 			"%q is not this job's compaction temp name (expected a path ending in %q)",
-			out, tmpSuffix(ecid))
+			out, marker)
+	}
+	// computeCompactionFileDest truncates the whole normalized path at
+	// the first "_tmp", not at the trailing marker, so an earlier one —
+	// in a volume or tablet directory, or in the base name — would have
+	// the manager rename this file to a destination shorter than the
+	// name it asked for. The temp file would look right and the commit
+	// would not.
+	if idx := strings.Index(out, "_tmp"); idx != len(out)-len(marker) {
+		return "", refuse(ClassMalformedJob, "outputFile",
+			"%q contains %q before its own temp marker; the manager truncates at the first one and would commit as %q",
+			out, "_tmp", out[:idx])
 	}
 	if err := checkTabletFilePath(out, "outputFile"); err != nil {
 		return "", err

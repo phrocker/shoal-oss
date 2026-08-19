@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -465,9 +466,22 @@ func TestTranslateRefusesUnparsableFilePaths(t *testing.T) {
 		{"dot segment", "hdfs://nn/accumulo/tables/2/./t-0001/F0002.rf", `"." segment`},
 		{"parent segment", "hdfs://nn/accumulo/tables/2/t-0001/../t-0002/F0002.rf", `".." segment`},
 		{"trailing slash", "hdfs://nn/accumulo/tables/2/t-0001/F0002.rf/", "empty segment"},
-		{"invalid file name", "hdfs://nn/accumulo/tables/2/t-0001/F 0002.rf", "invalid characters"},
+		{"invalid file name", "hdfs://nn/accumulo/tables/2/t-0001/F+0002.rf", "invalid characters"},
 		{"fragment", "hdfs://nn/accumulo/tables/2/t-0001/F0002.rf#x", `"#"`},
 		{"query", "hdfs://nn/accumulo/tables/2/t-0001/F0002.rf?x=1", `"?"`},
+		// URI.create is the strict parser, so these never reach
+		// parsePath: deserialize throws while building the Path.
+		{"unescaped space", "hdfs://nn/accumulo/tables/2/t 0001/F0002.rf", `" " at offset 29 must be percent-escaped`},
+		{"control byte", "hdfs://nn/accumulo/tables/2/t-0001/\x7fF0002.rf", "must be percent-escaped"},
+		{"non-ascii byte", "hdfs://nn/accumulo/tables/2/t\u00e9/F0002.rf", "must be percent-escaped"},
+		{"truncated escape", "hdfs://nn/accumulo/tables/2/t-0001%/F0002.rf", "truncated or non-hex escape at offset 34"},
+		{"non-hex escape", "hdfs://nn/accumulo/tables/2/t-%ZZ01/F0002.rf", "truncated or non-hex escape at offset 30"},
+		{"escape at end", "hdfs://nn/accumulo/tables/2/t-0001/F0002.rf%2", "truncated or non-hex escape at offset 43"},
+		// A well-formed escape parses, but parsePath rebuilds these four
+		// segments from the decoded path and looks for the result in the
+		// raw URI, so it cannot survive there.
+		{"escaped tablet directory", "hdfs://nn/accumulo/tables/2/t%2D0001/F0002.rf", `escapes "%2D" inside the path`},
+		{"escaped table id", "hdfs://nn/accumulo/tables/%32/t-0001/F0002.rf", `escapes "%32" inside the path`},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			job := validJob()
@@ -496,6 +510,47 @@ func TestTranslateRefusesUnparsableOutputPath(t *testing.T) {
 	}
 }
 
+// TestTranslateRefusesAnEarlierTmpMarker pins the rename the manager
+// would perform. computeCompactionFileDest truncates the whole
+// normalized path at the *first* "_tmp", not at the trailing marker, so
+// any earlier occurrence — a tablet directory, or the base name itself —
+// makes the committed destination a truncated path that names a
+// different tablet or no file at all. The temp file would be written
+// correctly and the commit would still be wrong.
+func TestTranslateRefusesAnEarlierTmpMarker(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		out  string
+		want string
+	}{
+		{
+			"in the tablet directory",
+			"hdfs://nn/accumulo/tables/2/t-0001_tmp/C0003.rf",
+			"hdfs://nn/accumulo/tables/2/t-0001",
+		},
+		{
+			"in the base name",
+			"hdfs://nn/accumulo/tables/2/t-0001/C0003_tmp.rf",
+			"hdfs://nn/accumulo/tables/2/t-0001/C0003",
+		},
+		{
+			"in the volume",
+			"hdfs://nn/accumulo_tmp/tables/2/t-0001/C0003.rf",
+			"hdfs://nn/accumulo",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			job := validJob()
+			job.OutputFile = tt.out + tmpSuffix(testECID)
+
+			r := assertRefused(t, job, Options{}, ClassMalformedJob, "outputFile")
+			if !strings.Contains(r.Detail, "would commit as "+strconv.Quote(tt.want)) {
+				t.Fatalf("detail = %q, want it to name the truncated destination %q", r.Detail, tt.want)
+			}
+		})
+	}
+}
+
 // TestTranslateAcceptsAnUnauthoritativeVolume keeps the path check from
 // overreaching: parsePath takes everything before /tables as the volume
 // and does not care what it is, so a job from a second configured volume
@@ -508,6 +563,21 @@ func TestTranslateAcceptsAnUnauthoritativeVolume(t *testing.T) {
 	plan := mustTranslate(t, job, Options{})
 	if got := plan.Inputs[1].Path; got != "file:/srv/vol2/accumulo/tables/2/t-0001/F0002.rf" {
 		t.Fatalf("input path = %q, want the second volume's path", got)
+	}
+}
+
+// TestTranslateAcceptsAnEscapeInTheVolume is the other side of the
+// escape rule. parsePath copies the volume out of the raw URI without
+// decoding it, so an escape there round-trips and the path parses; only
+// the four segments it rebuilds from the decoded path cannot carry one.
+func TestTranslateAcceptsAnEscapeInTheVolume(t *testing.T) {
+	const path = "hdfs://nn/vol%20two/accumulo/tables/2/t-0001/F0002.rf"
+	job := validJob()
+	job.Files[1].MetadataFileEntry = storedFile(path)
+
+	plan := mustTranslate(t, job, Options{})
+	if got := plan.Inputs[1].Path; got != path {
+		t.Fatalf("input path = %q, want %q", got, path)
 	}
 }
 
@@ -579,6 +649,61 @@ func TestTranslateRefusesOnePathUnderTheSameFence(t *testing.T) {
 	r := assertRefused(t, job, Options{}, ClassMalformedJob, "files[3]")
 	if !strings.Contains(r.Detail, "duplicates files[2]") {
 		t.Fatalf("detail = %q, want it to name the entry it duplicates", r.Detail)
+	}
+}
+
+// TestTranslateRefusesOneFenceSpelledWithTrailingBytes is the framing
+// half of the same rule. Text.readFields readFully's the declared length
+// and stops, so [1,'d'] and [1,'d','x'] deserialize to the identical
+// row: they are one StoredTabletFile, and comparing the buffers rather
+// than the row would let a caller list it twice and merge every cell in
+// it twice.
+func TestTranslateRefusesOneFenceSpelledWithTrailingBytes(t *testing.T) {
+	const path = "hdfs://nn/accumulo/tables/2/t-0001/F0002.rf"
+	exact := base64.URLEncoding.EncodeToString([]byte{0x01, 'd'})
+	trailing := base64.URLEncoding.EncodeToString([]byte{0x01, 'd', 'x'})
+	job := validJob()
+	job.Files = append(job.Files,
+		&tabletserver.InputFile{
+			MetadataFileEntry: fmt.Sprintf(`{"path":"%s","startRow":"%s","endRow":""}`, path, exact),
+		},
+		&tabletserver.InputFile{
+			MetadataFileEntry: fmt.Sprintf(`{"path":"%s","startRow":"%s","endRow":""}`, path, trailing),
+		},
+	)
+
+	r := assertRefused(t, job, Options{}, ClassMalformedJob, "files[3]")
+	if !strings.Contains(r.Detail, "duplicates files[2]") {
+		t.Fatalf("detail = %q, want it to name the entry it duplicates", r.Detail)
+	}
+}
+
+// TestTranslateRefusesFenceRowsWithLineBreaks pins that a row Java
+// cannot decode is reported as malformed. Go's base64 decoders skip CR
+// and LF; Base64.getUrlDecoder throws on them, so without the guard an
+// escaped newline would decode here into a plausible fence and be
+// refused as an unsupported range — the wrong class, and the wrong
+// message for whoever has to fix the entry.
+func TestTranslateRefusesFenceRowsWithLineBreaks(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		row  string
+	}{
+		{"embedded LF", "AW\nQ="},
+		{"embedded CR", "AW\rQ="},
+		{"trailing LF", "AWQ=\n"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			job := validJob()
+			job.Files[1].MetadataFileEntry = fmt.Sprintf(
+				`{"path":"hdfs://nn/accumulo/tables/2/t-0001/F0002.rf","startRow":%q,"endRow":""}`,
+				tt.row)
+
+			r := assertRefused(t, job, Options{}, ClassMalformedJob, "files[1]")
+			if !strings.Contains(r.Detail, "line break") {
+				t.Fatalf("detail = %q, want it to name the line break", r.Detail)
+			}
+		})
 	}
 }
 
