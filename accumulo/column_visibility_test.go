@@ -71,6 +71,7 @@ func TestColumnVisibilityRejectsMalformedExpressions(t *testing.T) {
 		{`"a"b`, "expression needs & or |", 3},
 		{`"a\z"`, "invalid escaping within quotes", 3},
 		{"a b", "bad character ( )", 1},
+		{"a,b", "bad character (,)", 1},
 	}
 	for _, tc := range cases {
 		_, err := NewColumnVisibility([]byte(tc.expression))
@@ -190,7 +191,7 @@ func TestNewNodeExpressionValidatesItsSpan(t *testing.T) {
 	if string(term.Term()) != "bc" {
 		t.Fatalf("term followed the caller's slice: %q", term.Term())
 	}
-	for _, bad := range [][2]int{{-1, 1}, {0, 4}, {2, 2}, {4, 0}} {
+	for _, bad := range [][2]int{{-1, 1}, {0, 4}, {2, 2}, {4, 0}, {maxInt, maxInt}, {1, maxInt}} {
 		if _, err := NewNodeExpression([]byte("abc"), bad[0], bad[1]); err == nil {
 			t.Fatalf("NewNodeExpression%v accepted an out-of-range span", bad)
 		}
@@ -199,6 +200,8 @@ func TestNewNodeExpressionValidatesItsSpan(t *testing.T) {
 		t.Fatalf("NewNodeExpression(3,0) = %v, %v", empty, err)
 	}
 }
+
+const maxInt = int(^uint(0) >> 1)
 
 func TestColumnVisibilityFlattenNormalizes(t *testing.T) {
 	cases := []struct{ expression, want string }{
@@ -363,6 +366,58 @@ func TestVisibilityEvaluatorDropsCachedDecisionsWhenAuthorizationsChange(t *test
 	visible, err = evaluator.Evaluate([]byte("a"))
 	if err != nil || visible {
 		t.Fatalf("Evaluate after clearing = %v, %v", visible, err)
+	}
+}
+
+func TestColumnVisibilityAcceptsAccumulosTermCharacters(t *testing.T) {
+	// The pinned parser only allows the Sharkbite authorization character set,
+	// so expressions Accumulo itself writes are rejected as malformed.
+	for _, expression := range []string{"team.alpha", "org/admin", "team.alpha&org/admin"} {
+		if _, err := NewColumnVisibility([]byte(expression)); err != nil {
+			t.Fatalf("NewColumnVisibility(%q) = %v", expression, err)
+		}
+	}
+	evaluator := NewVisibilityEvaluator(NewAuthorizationStrings("team.alpha", "org/admin"))
+	visible, err := evaluator.Evaluate([]byte("team.alpha&org/admin"))
+	if err != nil || !visible {
+		t.Fatalf("Evaluate = %v, %v", visible, err)
+	}
+	if ValidAuthorizationCharacter('.') || ValidAuthorizationCharacter('/') {
+		t.Fatal("ValidAuthorizationCharacter drifted from the pinned Sharkbite set")
+	}
+}
+
+func TestVisibilityEvaluatorDoesNotCacheAcrossAnAuthorizationChange(t *testing.T) {
+	evaluator := NewVisibilityEvaluator(NewAuthorizationStrings("a"))
+	// Snapshot the old authorizations, replace them, then let the in-flight
+	// evaluation finish: its result must not land in the new cache.
+	evaluator.mu.Lock()
+	auths, generation := evaluator.auths, evaluator.generation
+	evaluator.mu.Unlock()
+
+	evaluator.SetAuthorizations(NewAuthorizationStrings("b"))
+
+	stale, err := evaluateVisibilityNode(
+		[]byte("a"),
+		mustVisibility(t, "a").Tree(),
+		auths,
+	)
+	if err != nil || !stale {
+		t.Fatalf("stale evaluation = %v, %v", stale, err)
+	}
+	evaluator.mu.Lock()
+	if evaluator.generation == generation {
+		evaluator.mu.Unlock()
+		t.Fatal("SetAuthorizations did not advance the generation")
+	}
+	evaluator.mu.Unlock()
+
+	visible, err := evaluator.Evaluate([]byte("a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if visible {
+		t.Fatal("evaluator served a decision made against the previous authorizations")
 	}
 }
 

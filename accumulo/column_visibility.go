@@ -80,7 +80,9 @@ type NodeExpression struct {
 // NewNodeExpression builds a term from the slice of expression that starts at
 // offset and runs for size bytes.
 func NewNodeExpression(expression []byte, offset, size int) (NodeExpression, error) {
-	if offset < 0 || size < 0 || offset+size > len(expression) {
+	// Check offset first and then size against what is left, so a span whose
+	// sum overflows cannot pass the bounds check.
+	if offset < 0 || offset > len(expression) || size < 0 || size > len(expression)-offset {
 		return NodeExpression{}, visibilityError("term is outside the expression", expression, offset)
 	}
 	return NodeExpression{term: cloneRow(expression[offset : offset+size])}, nil
@@ -358,6 +360,15 @@ type visibilityParser struct {
 	index      int
 }
 
+// validVisibilityTermByte reports whether a byte may appear in an unquoted
+// term. Accumulo's own visibility grammar admits '.' and '/' on top of the set
+// Sharkbite's Authorizations::isValidAuthCharacter allows, and rejecting them
+// would make expressions Accumulo itself writes - "team.alpha", "org/admin" -
+// unreadable. ValidAuthorizationCharacter stays pinned to the Sharkbite rule.
+func validVisibilityTermByte(character byte) bool {
+	return ValidAuthorizationCharacter(character) || character == '.' || character == '/'
+}
+
 func (p *visibilityParser) parse(depth int) (VisibilityNode, error) {
 	var result VisibilityNode
 	var current VisibilityNode
@@ -459,7 +470,7 @@ func (p *visibilityParser) parse(depth int) (VisibilityNode, error) {
 					p.index-1,
 				)
 			}
-			if !ValidAuthorizationCharacter(character) {
+			if !validVisibilityTermByte(character) {
 				return VisibilityNode{}, visibilityError(
 					fmt.Sprintf("bad character (%s)", string(character)),
 					p.expression,
@@ -547,7 +558,10 @@ func (p *visibilityParser) consumeQuotedTerm(start int) error {
 type VisibilityEvaluator struct {
 	mu    sync.Mutex
 	auths *Authorizations
-	cache map[string]bool
+	// generation changes with every authorization replacement so a decision
+	// computed against an older set is never written into the newer cache.
+	generation uint64
+	cache      map[string]bool
 }
 
 // NewVisibilityEvaluator builds an evaluator for auths. A nil or empty set
@@ -578,6 +592,7 @@ func (e *VisibilityEvaluator) SetAuthorizations(auths *Authorizations) {
 	} else {
 		e.auths = auths.Clone()
 	}
+	e.generation++
 	e.cache = make(map[string]bool)
 }
 
@@ -589,6 +604,7 @@ func (e *VisibilityEvaluator) Evaluate(expression []byte) (bool, error) {
 	}
 	e.mu.Lock()
 	cached, ok := e.cache[string(expression)]
+	auths, generation := e.auths, e.generation
 	e.mu.Unlock()
 	if ok {
 		return cached, nil
@@ -597,12 +613,14 @@ func (e *VisibilityEvaluator) Evaluate(expression []byte) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	result, err := e.EvaluateTree(expression, visibility.Tree())
+	result, err := evaluateVisibilityNode(expression, visibility.Tree(), auths)
 	if err != nil {
 		return false, err
 	}
 	e.mu.Lock()
-	e.cache[string(expression)] = result
+	if e.generation == generation {
+		e.cache[string(expression)] = result
+	}
 	e.mu.Unlock()
 	return result, nil
 }
