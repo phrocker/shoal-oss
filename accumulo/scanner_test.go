@@ -25,6 +25,9 @@ type fakeScannerAdapter struct {
 	closeErr     error
 	closeErrors  []error
 
+	continueEntered chan<- struct{}
+	continueRelease <-chan struct{}
+
 	multiStartResults []*data.InitialMultiScan
 	multiStartErrors  []error
 	multiContinues    []*data.MultiScanResult_
@@ -107,19 +110,36 @@ func (f *fakeScannerAdapter) Continue(
 	_ int64,
 ) (*data.ScanResult_, error) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	index := f.continueCalls
 	f.continueCalls++
+	continueEntered := f.continueEntered
+	continueRelease := f.continueRelease
+	continueErr := f.continueErr
+	var result *data.ScanResult_
+	if index < len(f.continues) {
+		result = f.continues[index]
+	} else {
+		result = &data.ScanResult_{}
+	}
+	f.mu.Unlock()
+
+	if continueEntered != nil {
+		continueEntered <- struct{}{}
+	}
+	if continueRelease != nil {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-continueRelease:
+		}
+	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if f.continueErr != nil {
-		return nil, f.continueErr
+	if continueErr != nil {
+		return nil, continueErr
 	}
-	if index >= len(f.continues) {
-		return &data.ScanResult_{}, nil
-	}
-	return f.continues[index], nil
+	return result, nil
 }
 
 func (f *fakeScannerAdapter) CloseScan(ctx context.Context, _ string, _ data.ScanID) error {

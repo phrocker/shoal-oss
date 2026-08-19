@@ -1,8 +1,8 @@
-# Revision-28 accepted matrix rows for docs/sharkbite-compatibility.md.
+# Revision-29 accepted matrix rows for docs/sharkbite-compatibility.md.
 # One entry per row: ROW-ID followed by the audited status, in document order.
 # Pinning the status next to the id means a swap of two rows' statuses inside one
 # section cannot pass the aggregate count checks undetected.
-# Update only when the independently audited revision-28 inventory itself changes.
+# Update only when the independently audited revision-29 inventory itself changes.
 # Regenerate from the audited document, review every added/removed/reclassified row
 # in code review, and keep the list in document order for human auditability.
 
@@ -147,7 +147,7 @@ SB-DATA-068 Missing Go
 SB-SCAN-001 Behavior mismatch
 SB-SCAN-002 Behavior mismatch
 SB-SCAN-003 Missing C ABI
-SB-SCAN-004 Behavior mismatch
+SB-SCAN-004 Missing C ABI
 SB-SCAN-005 Behavior mismatch
 SB-SCAN-006 Behavior mismatch
 SB-SCAN-007 Missing Go
@@ -163,9 +163,9 @@ SB-SCAN-015 Missing Go
 SB-SCAN-016 Not required (rationale required)
 SB-SCAN-017 Behavior mismatch
 SB-SCAN-018 Behavior mismatch
-SB-SCAN-019 Missing Go
-SB-SCAN-020 Missing Go
-SB-SCAN-021 Missing Go
+SB-SCAN-019 Missing C ABI
+SB-SCAN-020 Missing C ABI
+SB-SCAN-021 Missing C ABI
 SB-SCAN-022 Behavior mismatch
 SB-SCAN-023 Not required (rationale required)
 SB-SCAN-024 Missing C ABI
@@ -2942,7 +2942,7 @@ SB-CXX-2410 Missing Go
 SB-CXX-2411 Missing Go
 SB-CXX-2412 Missing Go
 SB-CXX-2413 Missing Go
-SB-CXX-2414 Missing Go
+SB-CXX-2414 Missing C ABI
 SB-CXX-2415 Missing Go
 SB-CXX-2416 Missing Go
 SB-CXX-2417 Missing Go
@@ -3199,7 +3199,7 @@ SB-XCUT-006 Behavior mismatch
 SB-XCUT-007 Behavior mismatch
 SB-XCUT-008 Missing C ABI
 SB-XCUT-009 Behavior mismatch
-SB-XCUT-010 Behavior mismatch
+SB-XCUT-010 Missing C ABI
 SB-XCUT-011 Behavior mismatch
 SB-XCUT-012 Covered
 SB-XCUT-013 Behavior mismatch
