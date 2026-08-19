@@ -156,6 +156,55 @@ func TestLocalPathsLexicallyAliasWindowsUNCSharePrefixNormalization(t *testing.T
 	}
 }
 
+// TestLocalPathsLexicallyAliasWindowsDriveRelativePathCaseFold exercises a
+// drive-relative Windows path: a drive letter and colon with no separator
+// immediately after it (for example "c:bulk\A.rf"), which Windows resolves
+// against that drive's own current directory rather than its root.
+// windowsDrivePathRe deliberately does not match this shape -- it is also
+// used by normalizeLocalPathForResolution to decide whether filepath.Abs is
+// needed, and a drive-relative path genuinely needs that resolution -- so
+// normalizeWindowsDrivePath never fires for it and it previously fell
+// through to filepath.Clean, which never folds case. That left two
+// drive-relative paths differing only by drive-letter case aliasing the
+// same not-yet-created write target under two different publication keys.
+// normalizeWindowsUNCPublicationPrefix now folds a bare, separator-less
+// drive-letter prefix's case directly, so these converge like every other
+// case-only Windows path difference, while still staying distinct from the
+// drive-absolute spelling of the same drive and path, which names a
+// genuinely different location whenever the drive's current directory is
+// not its root.
+//
+// This exercises localPathsLexicallyAlias specifically (not
+// checkNoStagingAliases/StageBulkDir): that higher-level path resolves
+// existing prefixes first, which calls filepath.Abs for any
+// non-drive-rooted relative path, including this drive-relative shape, and
+// Windows's own path resolution happens to fold the drive letter's case as
+// a side effect of substituting in the resolved current-directory string --
+// masking this gap for paths that reach that resolution step. Testing at
+// the lexical, non-resolving layer instead keeps this regression coverage
+// tied to the actual fixed function rather than to that unrelated,
+// resolution-time side effect.
+func TestLocalPathsLexicallyAliasWindowsDriveRelativePathCaseFold(t *testing.T) {
+	tests := []struct {
+		name string
+		src  string
+		dst  string
+		want bool
+	}{
+		{name: "drive-relative path aliases differing only by drive-letter case", src: `c:bulk\A.rf`, dst: `C:bulk\A.rf`, want: true},
+		{name: "drive-relative path aliases differing only by drive-letter case with forward slashes", src: `c:bulk/A.rf`, dst: `C:bulk/A.rf`, want: true},
+		{name: "drive-relative path stays distinct from drive-absolute path to the same drive and parts", src: `c:bulk\A.rf`, dst: `C:\bulk\A.rf`, want: false},
+		{name: "drive-relative paths to different drives stay distinct", src: `c:bulk\A.rf`, dst: `d:bulk\A.rf`, want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := localPathsLexicallyAlias(tt.src, tt.dst); got != tt.want {
+				t.Fatalf("localPathsLexicallyAlias(%q, %q) = %v, want %v", tt.src, tt.dst, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestStagePathsAliasWindowsDOS83ShortNameReachesSameFile(t *testing.T) {
 	dir := t.TempDir()
 	longPath := filepath.Join(dir, "LongFilename.rf")
