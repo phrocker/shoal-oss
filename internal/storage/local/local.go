@@ -567,13 +567,14 @@ func (w *writer) Close() error {
 	if w.closed {
 		return nil
 	}
-	if err := w.file.Close(); err != nil {
+	if !w.fileClosed {
+		if err := w.file.Close(); err != nil {
+			w.fileClosed = true
+			_ = w.ops.Remove(w.temp)
+			return fmt.Errorf("local: close temporary file %s: %w", w.temp, err)
+		}
 		w.fileClosed = true
-		_ = w.ops.Remove(w.temp)
-		return fmt.Errorf("local: close temporary file %s: %w", w.temp, err)
 	}
-	w.fileClosed = true
-
 	if err := w.commitReplacement(); err != nil {
 		if storage.IsCommittedWriteError(err) {
 			w.closed = true

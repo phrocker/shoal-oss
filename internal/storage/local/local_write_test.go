@@ -1023,6 +1023,38 @@ func TestLocal_PublishFailureRestoresStrandedBackup(t *testing.T) {
 	}
 }
 
+func TestLocal_RetriedCloseAfterPublishFailureRepublishesStagedData(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "target")
+	if err := os.WriteFile(path, []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	w, err := New().Create(context.Background(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	localWriter := w.(*writer)
+	publishErr := errors.New("injected publish failure")
+	localWriter.ops = &onceFailingReplaceOps{replacementOps: localWriter.ops, err: publishErr}
+	if _, err := w.Write([]byte("new")); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); !errors.Is(err, publishErr) {
+		t.Fatalf("Close error = %v, want %v", err, publishErr)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("retried Close error = %v, want the staged write to be republished", err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "new" {
+		t.Fatalf("target contents = %q, want new", got)
+	}
+}
+
 func TestLocal_PublishFailureRetainsBackupWhenRestoreFails(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "target")
@@ -1532,6 +1564,25 @@ func TestLocal_AbortRemovesSymlinkArtifactsFromReferentDir(t *testing.T) {
 
 // strandedBackupOps mimics the rename fallback failing after the old target has
 // already been moved aside, leaving the backup as the only copy.
+type onceFailingReplaceOps struct {
+	replacementOps
+	err   error
+	calls int
+}
+
+func (o *onceFailingReplaceOps) AtomicReplace(temp, target, backup string, hadOld bool) error {
+	o.calls++
+	if o.calls > 1 {
+		return o.replacementOps.AtomicReplace(temp, target, backup, hadOld)
+	}
+	if hadOld {
+		if err := os.Rename(target, backup); err != nil {
+			return err
+		}
+	}
+	return o.err
+}
+
 type strandedBackupOps struct {
 	replacementOps
 	err             error

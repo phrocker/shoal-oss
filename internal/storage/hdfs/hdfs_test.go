@@ -1880,10 +1880,11 @@ func TestCloseAfterReplicationReportsClosedWhenContextCanceledAfterClose(t *test
 	}
 }
 
-func TestCloseAfterReplicationAppliesAndRestoresRetryDeadline(t *testing.T) {
+func TestCloseAfterReplicationAppliesCallerDeadline(t *testing.T) {
 	writer := &deadlineBlockingWriter{}
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
 	defer cancel()
+	callerDeadline, _ := ctx.Deadline()
 
 	start := time.Now()
 	closed, err := closeAfterReplication(ctx, writer)
@@ -1896,14 +1897,32 @@ func TestCloseAfterReplicationAppliesAndRestoresRetryDeadline(t *testing.T) {
 	if elapsed := time.Since(start); elapsed > time.Second {
 		t.Fatalf("closeAfterReplication took %v; blocked Close was not interrupted", elapsed)
 	}
-	if len(writer.deadlines) < 2 {
-		t.Fatalf("SetDeadline calls = %v, want retry deadline and restoration", writer.deadlines)
+	if len(writer.deadlines) != 1 {
+		t.Fatalf("SetDeadline calls = %v, want the caller deadline only", writer.deadlines)
 	}
-	if writer.deadlines[0].IsZero() {
-		t.Fatal("retry deadline was not applied before Close")
+	if !writer.deadlines[0].Equal(callerDeadline) {
+		t.Fatalf("applied deadline = %v, want caller deadline %v", writer.deadlines[0], callerDeadline)
 	}
-	if !writer.deadlines[len(writer.deadlines)-1].Equal(writer.deadlines[0]) {
-		t.Fatalf("restored deadline = %v, want original context deadline %v", writer.deadlines[len(writer.deadlines)-1], writer.deadlines[0])
+}
+
+func TestCloseAfterReplicationDoesNotShortenGenerousCallerDeadline(t *testing.T) {
+	writer := &immediateErrorDeadlineWriter{}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*replicationRetryBudget)
+	defer cancel()
+	callerDeadline, _ := ctx.Deadline()
+
+	closed, err := closeAfterReplication(ctx, writer)
+	if closed {
+		t.Fatal("closeAfterReplication reported writer closed on injected close failure")
+	}
+	if !errors.Is(err, errInjectedClose) {
+		t.Fatalf("closeAfterReplication error = %v, want %v", err, errInjectedClose)
+	}
+	if len(writer.deadlines) != 1 {
+		t.Fatalf("SetDeadline calls = %v, want the caller deadline only", writer.deadlines)
+	}
+	if !writer.deadlines[0].Equal(callerDeadline) {
+		t.Fatalf("applied deadline = %v, want caller deadline %v; commit must not inherit the retry budget", writer.deadlines[0], callerDeadline)
 	}
 }
 
@@ -1916,11 +1935,11 @@ func TestCloseAfterReplicationClearsDeadlineForBackgroundContext(t *testing.T) {
 	if !errors.Is(err, errInjectedClose) {
 		t.Fatalf("closeAfterReplication error = %v, want %v", err, errInjectedClose)
 	}
-	if len(writer.deadlines) != 2 {
-		t.Fatalf("SetDeadline calls = %v, want retry deadline and clear", writer.deadlines)
+	if len(writer.deadlines) != 1 {
+		t.Fatalf("SetDeadline calls = %v, want a single clearing call", writer.deadlines)
 	}
-	if writer.deadlines[0].IsZero() || !writer.deadlines[1].IsZero() {
-		t.Fatalf("deadlines = %v, want non-zero then zero", writer.deadlines)
+	if !writer.deadlines[0].IsZero() {
+		t.Fatalf("deadlines = %v, want a cleared deadline", writer.deadlines)
 	}
 }
 

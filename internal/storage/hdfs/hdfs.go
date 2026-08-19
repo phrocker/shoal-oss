@@ -1002,6 +1002,16 @@ func applyDeadline(ctx context.Context, target any) error {
 	return setter.SetDeadline(deadline)
 }
 
+// syncDeadline makes target's deadline match ctx exactly: the context deadline
+// when one exists, and no deadline otherwise. Unlike applyDeadline it clears a
+// deadline left over from an earlier operation on the same handle.
+func syncDeadline(ctx context.Context, target any) error {
+	if _, ok := contextOrBackground(ctx).Deadline(); !ok {
+		return clearDeadline(target)
+	}
+	return applyDeadline(ctx, target)
+}
+
 func cleanupReaderAfterDeadlineFailure(path string, reader Reader, release func() error) error {
 	var cleanupErr error
 	if reader != nil {
@@ -1561,6 +1571,12 @@ func withCleanupContext(fn func(context.Context) error) error {
 	return fn(cleanupCtx)
 }
 
+// replicationRetryBudget bounds how long closeAfterReplication keeps retrying a
+// close that reports ErrReplicating. It bounds retry scheduling only: each
+// individual close runs under the caller's deadline, or none when the caller
+// imposes none.
+var replicationRetryBudget = 10 * time.Second
+
 func closeAfterReplication(ctx context.Context, writer storage.Writer) (writerClosed bool, retErr error) {
 	const (
 		initialDelay = 100 * time.Millisecond
@@ -1568,30 +1584,18 @@ func closeAfterReplication(ctx context.Context, writer storage.Writer) (writerCl
 	)
 
 	ctx = contextOrBackground(ctx)
-	retryCtx, cancel := context.WithTimeout(ctx, cleanupTimeout)
-	defer cancel()
-	if err := applyDeadline(retryCtx, writer); err != nil {
+	// Commit is a data path: the flush and pipeline acks inherit the caller's
+	// deadline, and any stale deadline left over from create is cleared when
+	// the caller imposes none.
+	if err := syncDeadline(ctx, writer); err != nil {
 		return false, err
 	}
-	defer func() {
-		if retErr == nil {
-			return
-		}
-		var restoreErr error
-		if _, ok := ctx.Deadline(); ok {
-			restoreErr = applyDeadline(ctx, writer)
-		} else {
-			restoreErr = clearDeadline(writer)
-		}
-		if restoreErr != nil {
-			retErr = errors.Join(retErr, restoreErr)
-		}
-	}()
+	retryDeadline := time.Now().Add(replicationRetryBudget)
 	delay := initialDelay
 	for {
 		var closeErr error
 		if closer, ok := writer.(contextCloser); ok {
-			closeErr = closer.CloseContext(retryCtx)
+			closeErr = closer.CloseContext(ctx)
 		} else {
 			closeErr = writer.Close()
 		}
@@ -1599,18 +1603,18 @@ func closeAfterReplication(ctx context.Context, writer storage.Writer) (writerCl
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return writerClosed, errors.Join(closeErr, ctxErr)
 		}
-		if ctxErr := retryCtx.Err(); ctxErr != nil {
-			return writerClosed, errors.Join(closeErr, ctxErr)
-		}
 		if !errors.Is(closeErr, hdfsclient.ErrReplicating) {
 			return writerClosed, closeErr
 		}
 		writerClosed = false
+		if time.Now().Add(delay).After(retryDeadline) {
+			return false, closeErr
+		}
 		timer := time.NewTimer(delay)
 		select {
-		case <-retryCtx.Done():
+		case <-ctx.Done():
 			timer.Stop()
-			return false, retryCtx.Err()
+			return false, errors.Join(closeErr, ctx.Err())
 		case <-timer.C:
 		}
 		delay = min(delay*2, maxDelay)
