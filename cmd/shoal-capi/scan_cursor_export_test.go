@@ -94,6 +94,17 @@ func TestOwnedScanCursorChunksAndExhausts(t *testing.T) {
 	}
 }
 
+func TestOwnedScanCursorHugeChunkDoesNotPreallocate(t *testing.T) {
+	cursor := newOwnedScanCursor(context.Background(), newFakeScanCursor(nil), func() {})
+	values, exhausted, err := cursor.next(maxInt())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(values) != 0 || !exhausted {
+		t.Fatalf("values = %v, exhausted = %v", values, exhausted)
+	}
+}
+
 func TestOwnedScanCursorCloseCancelsAndJoinsBlockedNext(t *testing.T) {
 	block := make(chan struct{})
 	source := newFakeScanCursor(nil)

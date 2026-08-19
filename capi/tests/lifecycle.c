@@ -980,6 +980,52 @@ int main(void) {
   assert(entry.value.length == 1 && entry.value.data[0] == 1);
   shoal_scan_result_free(&result);
 
+  assert(shoal_test_scanners_create(&scanner, &batch_scanner) == 1);
+  assert(scanner != NULL && batch_scanner != NULL);
+  assert(shoal_scanner_stream(
+             scanner, &client_ranges[0], 0, &cursor, &error) ==
+         SHOAL_STATUS_OK);
+  assert(shoal_scan_cursor_next(
+             cursor, 8, &result, &exhausted, &error) == SHOAL_STATUS_OK);
+  assert(result != NULL && shoal_scan_result_count(result) == 1);
+  assert(exhausted == 1);
+  shoal_scan_result_free(&result);
+  shoal_scan_cursor_free(&cursor);
+
+  assert(shoal_cancellation_create(&cancellation, &error) == SHOAL_STATUS_OK);
+  assert(shoal_scanner_stream_with_cancellation(
+             scanner, &client_ranges[0], 0, cancellation, &cursor, &error) ==
+         SHOAL_STATUS_OK);
+  assert(shoal_scan_cursor_next(
+             cursor, 8, &result, &exhausted, &error) == SHOAL_STATUS_OK);
+  assert(result != NULL && shoal_scan_result_count(result) == 1);
+  shoal_scan_result_free(&result);
+  shoal_scan_cursor_free(&cursor);
+
+  assert(shoal_batch_scanner_stream(
+             batch_scanner, client_ranges, 2, 0, &cursor, &error) ==
+         SHOAL_STATUS_OK);
+  assert(shoal_scan_cursor_next(
+             cursor, 8, &result, &exhausted, &error) == SHOAL_STATUS_OK);
+  assert(result != NULL && shoal_scan_result_count(result) == 2);
+  assert(exhausted == 1);
+  shoal_scan_result_free(&result);
+  shoal_scan_cursor_free(&cursor);
+
+  assert(shoal_batch_scanner_stream_with_cancellation(
+             batch_scanner, client_ranges, 2, 0, cancellation, &cursor,
+             &error) == SHOAL_STATUS_OK);
+  assert(shoal_scan_cursor_next(
+             cursor, 8, &result, &exhausted, &error) == SHOAL_STATUS_OK);
+  assert(result != NULL && shoal_scan_result_count(result) == 2);
+  shoal_scan_result_free(&result);
+  shoal_scan_cursor_free(&cursor);
+  shoal_cancellation_free(&cancellation);
+  assert(shoal_scanner_close(scanner, &error) == SHOAL_STATUS_OK);
+  assert(shoal_batch_scanner_close(batch_scanner, &error) == SHOAL_STATUS_OK);
+  shoal_scanner_free(&scanner);
+  shoal_batch_scanner_free(&batch_scanner);
+
   shoal_test_result_alloc_fail_after(0);
   expect_error(shoal_client_stream_range(
                    admin_client, &client_ranges[0], 0, &cursor, &error),

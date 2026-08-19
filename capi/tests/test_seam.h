@@ -17,6 +17,8 @@ enum {
 };
 
 int shoal_test_connector_create(shoal_connector **out_connector);
+int shoal_test_scanners_create(shoal_scanner **out_scanner,
+                               shoal_batch_scanner **out_batch_scanner);
 int shoal_test_client_create(shoal_client **out_client);
 int shoal_test_client_settings_match(
     shoal_client *client,

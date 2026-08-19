@@ -105,7 +105,7 @@ func (c *ownedScanCursor) next(maxEntries int) ([]accumulo.KeyValue, bool, error
 	}
 	c.mu.Unlock()
 
-	values := make([]accumulo.KeyValue, 0, maxEntries)
+	values := make([]accumulo.KeyValue, 0)
 	for len(values) < maxEntries {
 		if c.source.Next() {
 			values = append(values, c.source.Entry())
