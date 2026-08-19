@@ -112,6 +112,107 @@ shoal_authorization_character_is_valid(uint8_t character);
 SHOAL_API void SHOAL_CALL
 shoal_authorizations_free(shoal_authorizations **authorizations);
 
+/*
+ * Column-visibility inputs are binary-safe and copied before return. Visibility,
+ * node, and node-expression handles are immutable and support concurrent
+ * getters. Evaluators synchronize evaluation with authorization replacement.
+ * Free is NULL-safe/idempotent and must be serialized with calls using the same
+ * handle. Every returned result or handle is independently owned.
+ */
+SHOAL_API void SHOAL_CALL
+shoal_visibility_node_view_init(shoal_visibility_node_view *view);
+SHOAL_API void SHOAL_CALL shoal_visibility_parse_error_view_init(
+    shoal_visibility_parse_error_view *view);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_column_visibility_create(shoal_bytes expression,
+                               shoal_column_visibility **out_visibility,
+                               shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_column_visibility_expression(const shoal_column_visibility *visibility,
+                                   shoal_bytes_result **out_result,
+                                   shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_column_visibility_tree(const shoal_column_visibility *visibility,
+                             shoal_visibility_node **out_node,
+                             shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_column_visibility_normalized(const shoal_column_visibility *visibility,
+                                   shoal_visibility_node **out_node,
+                                   shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_column_visibility_flatten(const shoal_column_visibility *visibility,
+                                shoal_bytes_result **out_result,
+                                shoal_error **out_error);
+SHOAL_API void SHOAL_CALL
+shoal_column_visibility_free(shoal_column_visibility **visibility);
+
+SHOAL_API shoal_status SHOAL_CALL
+shoal_node_expression_create(shoal_bytes expression, size_t offset,
+                             size_t size,
+                             shoal_node_expression **out_expression,
+                             shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_node_expression_term(const shoal_node_expression *expression,
+                           shoal_bytes_result **out_result,
+                           shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_node_expression_buffer(const shoal_node_expression *expression,
+                             shoal_bytes_result **out_result,
+                             shoal_error **out_error);
+SHOAL_API size_t SHOAL_CALL
+shoal_node_expression_size(const shoal_node_expression *expression);
+SHOAL_API void SHOAL_CALL
+shoal_node_expression_free(shoal_node_expression **expression);
+
+SHOAL_API shoal_status SHOAL_CALL
+shoal_visibility_node_get(const shoal_visibility_node *node,
+                          shoal_visibility_node_view *out_node,
+                          shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_visibility_node_expression(const shoal_visibility_node *node,
+                                 shoal_bytes_result **out_result,
+                                 shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_visibility_node_child(const shoal_visibility_node *node, size_t index,
+                            shoal_visibility_node **out_child,
+                            shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_visibility_node_term(const shoal_visibility_node *node,
+                           shoal_bytes expression,
+                           shoal_node_expression **out_expression,
+                           shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_visibility_node_compare(const shoal_visibility_node *left,
+                              const shoal_visibility_node *right,
+                              int32_t *out_comparison,
+                              shoal_error **out_error);
+SHOAL_API void SHOAL_CALL
+shoal_visibility_node_free(shoal_visibility_node **node);
+
+SHOAL_API shoal_status SHOAL_CALL
+shoal_visibility_evaluator_create(
+    const shoal_authorizations *authorizations,
+    shoal_visibility_evaluator **out_evaluator, shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_visibility_evaluator_authorizations(
+    const shoal_visibility_evaluator *evaluator,
+    shoal_authorizations **out_authorizations, shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_visibility_evaluator_set_authorizations(
+    shoal_visibility_evaluator *evaluator,
+    const shoal_authorizations *authorizations, shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_visibility_evaluator_evaluate(
+    shoal_visibility_evaluator *evaluator, shoal_bytes expression,
+    uint8_t *out_satisfied, shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_visibility_evaluator_evaluate_tree(
+    shoal_visibility_evaluator *evaluator, shoal_bytes expression,
+    const shoal_visibility_node *node, uint8_t *out_satisfied,
+    shoal_error **out_error);
+SHOAL_API void SHOAL_CALL
+shoal_visibility_evaluator_free(shoal_visibility_evaluator **evaluator);
+
 SHOAL_API void SHOAL_CALL
 shoal_rfile_writer_config_init(shoal_rfile_writer_config *config);
 SHOAL_API void SHOAL_CALL
@@ -1100,6 +1201,8 @@ SHOAL_API const char *SHOAL_CALL
 shoal_error_security_user(const shoal_error *error);
 SHOAL_API const char *SHOAL_CALL
 shoal_error_security_code(const shoal_error *error);
+SHOAL_API shoal_status SHOAL_CALL shoal_error_visibility_parse(
+    const shoal_error *error, shoal_visibility_parse_error_view *out_details);
 
 /*
  * Releases an owned error and sets *error to NULL. Passing NULL or a pointer

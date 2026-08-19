@@ -59,9 +59,9 @@ def status_count_map(
 
 
 EXPECTED_STATUS_COUNTS = {
-    "Covered": 100,
-    "Missing Go": 2274,
-    "Missing C ABI": 131,
+    "Covered": 131,
+    "Missing Go": 2290,
+    "Missing C ABI": 84,
     "Behavior mismatch": 219,
     "Intentional divergence (approval required)": 87,
     "Not required (rationale required)": 392,
@@ -88,11 +88,11 @@ EXPECTED_PREFIX_COUNTS = {
         not_required=8,
     ),
     "SB-CXX": status_count_map(
-        missing_go=2214,
-        covered=11,
+        missing_go=2230,
+        covered=41,
         behavior_mismatch=15,
         not_required=304,
-        missing_c_abi=82,
+        missing_c_abi=36,
     ),
     "SB-DATA": status_count_map(
         covered=9,
@@ -103,12 +103,11 @@ EXPECTED_PREFIX_COUNTS = {
     ),
     "SB-EMB": status_count_map(not_required=35),
     "SB-ERR": status_count_map(
-        covered=4,
+        covered=5,
         missing_go=1,
         behavior_mismatch=6,
         intentional_divergence=1,
         not_required=3,
-        missing_c_abi=1,
     ),
     "SB-HDFS": status_count_map(missing_go=26),
     "SB-LOG": status_count_map(missing_go=2, behavior_mismatch=1),
@@ -201,15 +200,14 @@ EXPECTED_METADATA_FIELDS = {
         "`phrocker/shoal-oss` exact audited baseline for revision 38 "
         "`3b28b8ea4364cbafc0f357727a75413dd68995c2` "
         "(\"Merge PR #151: complete the public key value API\") "
-        "plus the tablet extent API introduced in this revision"
+        "plus the column-visibility C ABI introduced in this revision"
     ),
     "Shoal C ABI version": "`SHOAL_ABI_VERSION 1u` (`capi/include/shoal_types.h`)",
 }
 
 EXPECTED_DOCUMENT_STATUS_SNIPPETS = (
     "Normative gate. Binding on all Sharkbite-compatibility work.",
-    f"Revision {EXPECTED_REVISION} — records the public tablet extent API",
-    "Revision 37 — records the public key value API",
+    f"Revision {EXPECTED_REVISION} — completes the 31-row column-visibility expression tranche",
     "Revision 36 — completes the twelve-row streaming cursor tranche",
     "Revision 34 — completes the four-row compatibility-error tranche",
     "Revision 32 — completes the five-row high-level scanner facade",
@@ -270,8 +268,8 @@ DEFAULT_C_ABI_INCLUDE_PATHS = (
     Path("capi/include"),
     Path("capi/tests"),
 )
-EXPECTED_C_ABI_DECLARED_EXPORTS = 238
-EXPECTED_C_ABI_REFERENCED_EXPORTS = 233
+EXPECTED_C_ABI_DECLARED_EXPORTS = 264
+EXPECTED_C_ABI_REFERENCED_EXPORTS = 259
 EXPECTED_C_ABI_UNREFERENCED_EXPORTS = (
     "shoal_scanner_scan",
     "shoal_batch_scanner_scan",
@@ -335,11 +333,6 @@ OPTIONAL_ANCHOR_CITATIONS = {
 # same reason: the matrix claims an exact public Go surface, so a rename or a
 # deleted method must fail the document, not just the build.
 # Implementation files behind the section 11 table-maintenance rows.
-TARGETED_SB_EXTENT_CITATIONS = {
-    "accumulo/tablet_extent.go",
-    "accumulo/tablet_extent_test.go",
-}
-
 TARGETED_SB_KEY_CITATIONS = {
     "accumulo/key.go",
     "accumulo/key_test.go",
@@ -391,7 +384,6 @@ ANCHOR_CHECKED_CITATIONS = (
     | TARGETED_SB_SCAN_CITATIONS
     | TARGETED_SB_VIS_CITATIONS
     | TARGETED_SB_KEY_CITATIONS
-    | TARGETED_SB_EXTENT_CITATIONS
 )
 COUNT_RE = re.compile(
     r"^(?P<bold>\*\*)?(?P<number>0|[1-9]\d*|[1-9]\d{0,2}(?:,\d{3})+)(?(bold)\*\*|)$"
@@ -751,6 +743,10 @@ def iter_matrix_rows(lines: list[str]) -> Iterator[tuple[int, str, list[str]]]:
             fail(f"unexpected separator row inside a matrix table on line {line_number}")
         if not line.startswith("| SB-"):
             continue
+        require(
+            line.rstrip().endswith("|"),
+            f"malformed SB row {row_identifier([], line)} on line {line_number}: missing final table delimiter",
+        )
         cells = split_matrix_cells(line)
         row_id = row_identifier(cells, line)
         if current_header_cells is None or row_id.startswith("SB-GAP"):
@@ -1675,13 +1671,13 @@ def validate_status_narratives(
     python_visible_behavior = status_counts["Behavior mismatch"] - prefix_counts["SB-CXX"]["Behavior mismatch"]
 
     expected_phrases = [
-        f"As of revision {EXPECTED_REVISION} that is {required_rows} of {total_rows} rows, and **only {status_counts['Covered']} are satisfied** ([SB-XCUT-012](#sec-20), the twelve configuration/topology rows in [§6](#sec-6), the 31 RFile/stream rows in [§15](#sec-15), the 17 data-model value rows in [§8](#sec-8) and [§19.2](#sec-19-2), the four buffered-writer rows in [§10](#sec-10), the four row-bounded flush/constraint rows in [§11](#sec-11) and [§19.2](#sec-19-2), the connector invalidation/cancellation rows in [§7](#sec-7) and [§20](#sec-20), the eight high-level client rows in [§10.1](#sec-10-1), the five high-level scanner rows in [§10.1](#sec-10-1), the four compatibility-error rows in [§18](#sec-18), and the twelve streaming cursor rows in [§9](#sec-9), [§10.1](#sec-10-1), [§19.2](#sec-19-2), and [§20](#sec-20))",
+        f"As of revision {EXPECTED_REVISION} that is {required_rows} of {total_rows} rows, and **only {status_counts['Covered']} are satisfied** ([SB-XCUT-012](#sec-20), the twelve configuration/topology rows in [§6](#sec-6), the 31 RFile/stream rows in [§15](#sec-15), the 17 data-model value rows in [§8](#sec-8) and [§19.2](#sec-19-2), the four buffered-writer rows in [§10](#sec-10), the four row-bounded flush/constraint rows in [§11](#sec-11) and [§19.2](#sec-19-2), the connector invalidation/cancellation rows in [§7](#sec-7) and [§20](#sec-20), the eight high-level client rows in [§10.1](#sec-10-1), the five high-level scanner rows in [§10.1](#sec-10-1), the four compatibility-error rows in [§18](#sec-18), the twelve streaming cursor rows in [§9](#sec-9), [§10.1](#sec-10-1), [§19.2](#sec-19-2), and [§20](#sec-20), and the 31 column-visibility rows in [§18](#sec-18) and [§19.2](#sec-19-2))",
         f"{required_rows} rows are **required** by the final release gate ([§2.2](#sec-2)); the {status_counts[NOT_REQUIRED_STATUS]} `Not required` rows are excluded by construction, and {prefix_counts['SB-CXX'][NOT_REQUIRED_STATUS]} of those are the evidence-proved duplicates described in [§19.1](#sec-19-1).",
-        "**Exactly 100 rows are `Covered`: [SB-XCUT-012](#sec-20), the twelve configuration/topology rows completed in revision 24, the 31 RFile/stream rows completed in revision 25, the 17 data-model value rows completed in revision 26, the four buffered-writer rows completed in revision 28, the four row-bounded flush/constraint rows completed in revision 29, the connector invalidation/cancellation rows completed in revision 30, the eight high-level client rows completed in revision 31, the five high-level scanner rows completed in revision 32, the four compatibility-error rows completed in revision 34, and the twelve streaming cursor rows completed in revision 36.**",
+        "**Exactly 131 rows are `Covered`: [SB-XCUT-012](#sec-20), the twelve configuration/topology rows completed in revision 24, the 31 RFile/stream rows completed in revision 25, the 17 data-model value rows completed in revision 26, the four buffered-writer rows completed in revision 28, the four row-bounded flush/constraint rows completed in revision 29, the connector invalidation/cancellation rows completed in revision 30, the eight high-level client rows completed in revision 31, the five high-level scanner rows completed in revision 32, the four compatibility-error rows completed in revision 34, the twelve streaming cursor rows completed in revision 36, and the 31 column-visibility rows completed in revision 38.**",
         f"The shape of the work is visible in the {status_counts['Missing Go']} `Missing Go` rows, of which {prefix_counts['SB-CXX']['Missing Go']} are the C++ members in [§19.2](#sec-19-2) that no Shoal layer exports.",
         f"`Behavior mismatch` ({status_counts['Behavior mismatch']}) is the bucket that sets the schedule: {python_visible_behavior} rows on the Python-visible and curated C++ surface each need a differential test against a live cluster or the exported ABI, and {prefix_counts['SB-CXX']['Behavior mismatch']} are destructors of classes bound into Python, where the destruction point is user-observable and the model differs from Go finalisation ([§19.1](#sec-19-1)).",
         f"`Intentional divergence` ({status_counts[INTENTIONAL_DIVERGENCE_STATUS]}) is dominated by one upstream fact: {prefix_counts['SB-STAT'][INTENTIONAL_DIVERGENCE_STATUS]} rows are cluster-status accessors Accumulo itself deleted ([§14](#sec-14), [SB-DIV-016](#sec-26)).",
-        f"`Missing C ABI` ({status_counts['Missing C ABI']}) is now led by the key value API (36), the visibility expression surface (30), the tablet extent (16), pandas ({prefix_counts['SB-PANDA']['Missing C ABI']}), packaging/import scaffolding ({prefix_counts['SB-PKG']['Missing C ABI']}), PyTorch ({prefix_counts['SB-TORCH']['Missing C ABI']}), the remaining scanner rows ({prefix_counts['SB-SCAN']['Missing C ABI']}), and the remaining data-model row ({prefix_counts['SB-DATA']['Missing C ABI']}).",
+        f"`Missing C ABI` ({status_counts['Missing C ABI']}) is now led by the key value API (36), pandas ({prefix_counts['SB-PANDA']['Missing C ABI']}), packaging/import scaffolding ({prefix_counts['SB-PKG']['Missing C ABI']}), PyTorch ({prefix_counts['SB-TORCH']['Missing C ABI']}), the remaining scanner rows ({prefix_counts['SB-SCAN']['Missing C ABI']}), and the remaining data-model row ({prefix_counts['SB-DATA']['Missing C ABI']}).",
     ]
     for phrase in expected_phrases:
         require(phrase in normalized, f"missing or stale status narrative: {phrase}")

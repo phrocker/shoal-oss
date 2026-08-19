@@ -728,16 +728,16 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
         self.assertEqual(
             validator.EXPECTED_STATUS_COUNTS,
             {
-                "Covered": 100,
-                "Missing Go": 2274,
-                "Missing C ABI": 131,
+                "Covered": 131,
+                "Missing Go": 2290,
+                "Missing C ABI": 84,
                 "Behavior mismatch": 219,
                 validator.INTENTIONAL_DIVERGENCE_STATUS: 87,
                 validator.NOT_REQUIRED_STATUS: 392,
             },
         )
-        self.assertEqual(validator.EXPECTED_C_ABI_DECLARED_EXPORTS, 238)
-        self.assertEqual(validator.EXPECTED_C_ABI_REFERENCED_EXPORTS, 233)
+        self.assertEqual(validator.EXPECTED_C_ABI_DECLARED_EXPORTS, 264)
+        self.assertEqual(validator.EXPECTED_C_ABI_REFERENCED_EXPORTS, 259)
         self.assertEqual(
             validator.EXPECTED_C_ABI_UNREFERENCED_EXPORTS,
             (
@@ -771,12 +771,19 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
         self.assertIn("shoal_client_stream_ranges_with_cancellation", referenced)
         self.assertIn("shoal_scan_cursor_next", referenced)
         self.assertIn("shoal_scan_cursor_free", referenced)
+        self.assertIn("shoal_column_visibility_create", referenced)
+        self.assertIn("shoal_visibility_evaluator_evaluate_tree", referenced)
+        self.assertIn("shoal_error_visibility_parse", referenced)
 
     def test_collect_c_abi_free_function_inventory_matches_header(self) -> None:
         free_functions = validator.collect_c_abi_free_function_inventory()
-        self.assertEqual(len(free_functions), 32)
+        self.assertEqual(len(free_functions), 36)
         self.assertIn("shoal_key_value_result_free", free_functions)
         self.assertIn("shoal_authorizations_free", free_functions)
+        self.assertIn("shoal_column_visibility_free", free_functions)
+        self.assertIn("shoal_visibility_node_free", free_functions)
+        self.assertIn("shoal_node_expression_free", free_functions)
+        self.assertIn("shoal_visibility_evaluator_free", free_functions)
         self.assertIn("shoal_accumulo_writer_free", free_functions)
         self.assertIn("shoal_versioned_properties_free", free_functions)
         self.assertIn("shoal_bytes_list_free", free_functions)
@@ -804,7 +811,7 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
 
     def test_stale_typed_free_inventory_narrative_is_rejected(self) -> None:
         text = load_document_text()
-        mutated = text.replace("32 typed free functions", "8 typed free functions", 1)
+        mutated = text.replace("36 typed free functions", "8 typed free functions", 1)
         self.assertNotEqual(mutated, text)
         self.assert_validation_fails(
             lambda: validator.validate_counts(mutated.splitlines(), mutated),
@@ -886,23 +893,23 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
             lambda: validator.validate_revision_inventory(
                 row_ids, reclassified, prefix_counts
             ),
-            f"revision {validator.EXPECTED_REVISION} inventory expects 100 rows for Covered, found 101",
+            f"revision {validator.EXPECTED_REVISION} inventory expects 131 rows for Covered, found 132",
         )
 
     def test_declared_count_edit_still_fails_internal_cross_check(self) -> None:
         text = load_document_text()
         mutated = replace_pattern_once(
-            text, re.escape("| Missing Go | 2274 |"), "| Missing Go | 2273 |"
+            text, re.escape("| Missing Go | 2290 |"), "| Missing Go | 2289 |"
         )
         self.assert_validation_fails(
             lambda: validator.validate_counts(mutated.splitlines(), mutated),
-            "status summary says 2273 rows for Missing Go, but parsed 2274",
+            "status summary says 2289 rows for Missing Go, but parsed 2290",
         )
 
     def test_stale_c_abi_symbol_inventory_narrative_is_rejected(self) -> None:
         text = load_document_text()
         mutated = text.replace(
-            "applied to 238 declared exports in `capi/include/shoal.h`",
+            "applied to 264 declared exports in `capi/include/shoal.h`",
             "applied to 44 declared exports in `capi/include/shoal.h`",
             1,
         )
@@ -915,7 +922,7 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
     def test_revision_bump_requires_validator_constant_update(self) -> None:
         text = load_document_text()
         mutated = text.replace(
-            f"Revision {validator.EXPECTED_REVISION} — records the public tablet extent API",
+            f"Revision {validator.EXPECTED_REVISION} — completes the 31-row column-visibility expression tranche",
             f"Revision {validator.EXPECTED_REVISION + 1} — adds the next audited ABI slice",
         ).replace(
             f"As of revision {validator.EXPECTED_REVISION} that is",
@@ -924,10 +931,26 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
         self.assertNotEqual(mutated, text)
         self.assert_validation_fails(
             lambda: validator.validate_counts(mutated.splitlines(), mutated),
-            f"document status is missing expected detail: Revision {validator.EXPECTED_REVISION} — records the public tablet extent API",
+            f"document status is missing expected detail: Revision {validator.EXPECTED_REVISION} — completes the 31-row column-visibility expression tranche",
         )
 
     # ---- matrix table separators -------------------------------------------
+
+    def test_matrix_row_without_final_delimiter_is_rejected(self) -> None:
+        text = load_document_text()
+        lines = text.splitlines()
+        for index, line in enumerate(lines):
+            if line.startswith("| SB-CXX-1056 "):
+                self.assertTrue(line.endswith("|"))
+                lines[index] = line[:-1]
+                break
+        else:
+            self.fail("missing SB-CXX-1056 fixture row")
+        self.assert_validation_fails(
+            lambda: validator.parse_rows(lines),
+            "malformed SB row SB-CXX-1056",
+            "missing final table delimiter",
+        )
 
     def test_parse_rows_accepts_matrix_table_with_separator(self) -> None:
         status_counts, prefix_counts, row_ids = validator.parse_rows(

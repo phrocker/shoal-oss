@@ -10,7 +10,7 @@ static_assert(std::is_same<shoal_abi_capability_bits, std::uint64_t>::value,
               "capability bitset words must remain 64-bit");
 static_assert(SHOAL_ABI_VERSION == 1u, "unexpected ABI version");
 static_assert(SHOAL_ABI_VERSION_MAJOR == 1u, "unexpected ABI major");
-static_assert(SHOAL_ABI_VERSION_MINOR == 13u, "unexpected ABI minor");
+static_assert(SHOAL_ABI_VERSION_MINOR == 14u, "unexpected ABI minor");
 static_assert(SHOAL_ABI_VERSION_PATCH == 0u, "unexpected ABI patch");
 static_assert(SHOAL_ABI_VERSION_PACKED ==
                   SHOAL_ABI_PACK_VERSION(SHOAL_ABI_VERSION_MAJOR,
@@ -51,9 +51,11 @@ static_assert(SHOAL_ABI_CAPABILITY_COMPATIBILITY_ERRORS == 23u,
               "unexpected compatibility errors capability id");
 static_assert(SHOAL_ABI_CAPABILITY_STREAMING_SCAN_CURSOR == 24u,
               "unexpected streaming scan cursor capability id");
-static_assert(SHOAL_ABI_CAPABILITY_COUNT == 25u,
+static_assert(SHOAL_ABI_CAPABILITY_COLUMN_VISIBILITY == 25u,
+              "unexpected column visibility capability id");
+static_assert(SHOAL_ABI_CAPABILITY_COUNT == 26u,
               "unexpected capability count");
-static_assert(SHOAL_ABI_CAPABILITY_WORD0 == 0x0000000001ffffffull,
+static_assert(SHOAL_ABI_CAPABILITY_WORD0 == 0x0000000003ffffffull,
               "unexpected capability word 0");
 static_assert(std::is_standard_layout<shoal_connector_identity_view>::value,
               "identity view must remain standard-layout");
@@ -75,6 +77,11 @@ static_assert(std::is_standard_layout<shoal_client_config>::value,
               "client config must remain standard-layout");
 static_assert(std::is_standard_layout<shoal_table_constraint_view>::value,
               "table constraint view must remain standard-layout");
+static_assert(std::is_standard_layout<shoal_visibility_node_view>::value,
+              "visibility node view must remain standard-layout");
+static_assert(
+    std::is_standard_layout<shoal_visibility_parse_error_view>::value,
+    "visibility parse error view must remain standard-layout");
 
 #define ASSERT_PERMISSION_VALUE(name, value)                                 \
   static_assert(name == value, "unexpected permission ordinal: " #name)
@@ -156,6 +163,15 @@ int main() {
   shoal_table_constraint_list_result *constraints = nullptr;
   shoal_table_constraint_view constraint_view{};
   shoal_key_value key_value{};
+  shoal_column_visibility *visibility = nullptr;
+  shoal_visibility_node *visibility_tree = nullptr;
+  shoal_visibility_node *visibility_child = nullptr;
+  shoal_node_expression *node_expression = nullptr;
+  shoal_visibility_evaluator *visibility_evaluator = nullptr;
+  shoal_visibility_node_view visibility_view{};
+  shoal_visibility_parse_error_view parse_error_view{};
+  uint8_t satisfied = 0;
+  int32_t comparison = 0;
   assert(shoal_abi_version() == SHOAL_ABI_VERSION);
   assert(shoal_abi_version_major() == SHOAL_ABI_VERSION_MAJOR);
   assert(shoal_abi_version_minor() == SHOAL_ABI_VERSION_MINOR);
@@ -185,7 +201,71 @@ int main() {
          1);
   assert(shoal_abi_has_capability(
              SHOAL_ABI_CAPABILITY_STREAMING_SCAN_CURSOR) == 1);
+  assert(shoal_abi_has_capability(SHOAL_ABI_CAPABILITY_COLUMN_VISIBILITY) == 1);
   assert(shoal_abi_has_capability(SHOAL_ABI_CAPABILITY_COUNT) == 0);
+  shoal_visibility_node_view_init(&visibility_view);
+  shoal_visibility_parse_error_view_init(&parse_error_view);
+  assert(shoal_column_visibility_create(
+             {reinterpret_cast<const uint8_t *>("A"), 1}, &visibility,
+             &error) == SHOAL_STATUS_OK);
+  assert(shoal_column_visibility_expression(visibility, &bytes_result,
+                                            &error) == SHOAL_STATUS_OK);
+  shoal_bytes_result_free(&bytes_result);
+  assert(shoal_column_visibility_tree(visibility, &visibility_tree, &error) ==
+         SHOAL_STATUS_OK);
+  assert(shoal_column_visibility_normalized(visibility, &visibility_child,
+                                            &error) == SHOAL_STATUS_OK);
+  assert(shoal_visibility_node_compare(visibility_tree, visibility_child,
+                                       &comparison, &error) ==
+         SHOAL_STATUS_OK);
+  shoal_visibility_node_free(&visibility_child);
+  assert(shoal_visibility_node_get(visibility_tree, &visibility_view, &error) ==
+         SHOAL_STATUS_OK);
+  assert(shoal_visibility_node_expression(visibility_tree, &bytes_result,
+                                          &error) == SHOAL_STATUS_OK);
+  shoal_bytes_result_free(&bytes_result);
+  assert(shoal_visibility_node_term(
+             visibility_tree,
+             {reinterpret_cast<const uint8_t *>("A"), 1}, &node_expression,
+             &error) == SHOAL_STATUS_OK);
+  assert(shoal_node_expression_size(node_expression) == 1);
+  assert(shoal_node_expression_term(node_expression, &bytes_result, &error) ==
+         SHOAL_STATUS_OK);
+  shoal_bytes_result_free(&bytes_result);
+  assert(shoal_node_expression_buffer(node_expression, &bytes_result, &error) ==
+         SHOAL_STATUS_OK);
+  shoal_bytes_result_free(&bytes_result);
+  shoal_node_expression_free(&node_expression);
+  assert(shoal_node_expression_create(
+             {reinterpret_cast<const uint8_t *>("A"), 1}, 0, 1,
+             &node_expression, &error) == SHOAL_STATUS_OK);
+  shoal_node_expression_free(&node_expression);
+  assert(shoal_column_visibility_flatten(visibility, &bytes_result, &error) ==
+         SHOAL_STATUS_OK);
+  shoal_bytes_result_free(&bytes_result);
+  assert(shoal_visibility_node_child(visibility_tree, 0, &visibility_child,
+                                     &error) == SHOAL_STATUS_INVALID_ARGUMENT);
+  assert(shoal_error_visibility_parse(error, &parse_error_view) ==
+         SHOAL_STATUS_NOT_FOUND);
+  shoal_error_free(&error);
+  assert(shoal_visibility_evaluator_create(nullptr, &visibility_evaluator,
+                                           &error) == SHOAL_STATUS_OK);
+  assert(shoal_visibility_evaluator_evaluate(
+             visibility_evaluator,
+             {reinterpret_cast<const uint8_t *>(""), 0}, &satisfied,
+             &error) == SHOAL_STATUS_OK);
+  assert(shoal_visibility_evaluator_evaluate_tree(
+             visibility_evaluator,
+             {reinterpret_cast<const uint8_t *>("A"), 1}, visibility_tree,
+             &satisfied, &error) == SHOAL_STATUS_OK);
+  assert(shoal_visibility_evaluator_set_authorizations(
+             visibility_evaluator, nullptr, &error) == SHOAL_STATUS_OK);
+  assert(shoal_visibility_evaluator_authorizations(
+             visibility_evaluator, &authorizations, &error) == SHOAL_STATUS_OK);
+  shoal_authorizations_free(&authorizations);
+  shoal_visibility_evaluator_free(&visibility_evaluator);
+  shoal_visibility_node_free(&visibility_tree);
+  shoal_column_visibility_free(&visibility);
   assert(shoal_versioned_properties_version(versioned_properties) == 0);
   assert(shoal_versioned_properties_count(versioned_properties) == 0);
   assert(shoal_versioned_properties_get(versioned_properties, 0, &property,

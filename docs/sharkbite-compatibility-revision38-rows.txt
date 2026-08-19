@@ -452,7 +452,7 @@ SB-ERR-006 Behavior mismatch
 SB-ERR-007 Behavior mismatch
 SB-ERR-008 Covered
 SB-ERR-009 Missing Go
-SB-ERR-010 Missing C ABI
+SB-ERR-010 Covered
 SB-ERR-011 Covered
 SB-ERR-012 Not required (rationale required)
 SB-ERR-013 Not required (rationale required)
@@ -1051,25 +1051,25 @@ SB-CXX-0519 Missing C ABI
 SB-CXX-0520 Missing C ABI
 SB-CXX-0521 Missing C ABI
 SB-CXX-0522 Missing Go
-SB-CXX-0523 Missing C ABI
-SB-CXX-0524 Missing C ABI
-SB-CXX-0525 Missing C ABI
-SB-CXX-0526 Missing C ABI
-SB-CXX-0527 Missing C ABI
+SB-CXX-0523 Missing Go
+SB-CXX-0524 Missing Go
+SB-CXX-0525 Missing Go
+SB-CXX-0526 Missing Go
+SB-CXX-0527 Missing Go
 SB-CXX-0528 Missing Go
-SB-CXX-0529 Missing C ABI
+SB-CXX-0529 Missing Go
 SB-CXX-0530 Missing Go
 SB-CXX-0531 Missing Go
-SB-CXX-0532 Missing C ABI
-SB-CXX-0533 Missing C ABI
-SB-CXX-0534 Missing C ABI
-SB-CXX-0535 Missing C ABI
-SB-CXX-0536 Missing C ABI
-SB-CXX-0537 Missing C ABI
-SB-CXX-0538 Missing C ABI
-SB-CXX-0539 Missing C ABI
-SB-CXX-0540 Missing C ABI
-SB-CXX-0541 Missing C ABI
+SB-CXX-0532 Missing Go
+SB-CXX-0533 Missing Go
+SB-CXX-0534 Missing Go
+SB-CXX-0535 Missing Go
+SB-CXX-0536 Missing Go
+SB-CXX-0537 Missing Go
+SB-CXX-0538 Missing Go
+SB-CXX-0539 Missing Go
+SB-CXX-0540 Missing Go
+SB-CXX-0541 Missing Go
 SB-CXX-0542 Not required (rationale required)
 SB-CXX-0543 Behavior mismatch
 SB-CXX-0544 Not required (rationale required)
@@ -1574,49 +1574,49 @@ SB-CXX-1042 Covered
 SB-CXX-1043 Not required (rationale required)
 SB-CXX-1044 Covered
 SB-CXX-1045 Covered
-SB-CXX-1046 Missing C ABI
-SB-CXX-1047 Missing C ABI
-SB-CXX-1048 Missing C ABI
-SB-CXX-1049 Missing C ABI
+SB-CXX-1046 Covered
+SB-CXX-1047 Covered
+SB-CXX-1048 Covered
+SB-CXX-1049 Covered
 SB-CXX-1050 Missing Go
 SB-CXX-1051 Missing Go
 SB-CXX-1052 Missing Go
 SB-CXX-1053 Missing Go
 SB-CXX-1054 Missing Go
 SB-CXX-1055 Missing Go
-SB-CXX-1056 Missing C ABI
-SB-CXX-1057 Missing C ABI
-SB-CXX-1058 Missing C ABI
-SB-CXX-1059 Missing C ABI
-SB-CXX-1060 Missing C ABI
-SB-CXX-1061 Missing C ABI
-SB-CXX-1062 Missing C ABI
-SB-CXX-1063 Missing C ABI
-SB-CXX-1064 Missing C ABI
-SB-CXX-1065 Missing C ABI
-SB-CXX-1066 Missing C ABI
-SB-CXX-1067 Missing C ABI
-SB-CXX-1068 Missing C ABI
-SB-CXX-1069 Missing C ABI
-SB-CXX-1070 Missing C ABI
-SB-CXX-1071 Missing C ABI
+SB-CXX-1056 Covered
+SB-CXX-1057 Covered
+SB-CXX-1058 Covered
+SB-CXX-1059 Covered
+SB-CXX-1060 Covered
+SB-CXX-1061 Covered
+SB-CXX-1062 Covered
+SB-CXX-1063 Covered
+SB-CXX-1064 Covered
+SB-CXX-1065 Covered
+SB-CXX-1066 Covered
+SB-CXX-1067 Covered
+SB-CXX-1068 Covered
+SB-CXX-1069 Covered
+SB-CXX-1070 Covered
+SB-CXX-1071 Covered
 SB-CXX-1072 Missing Go
 SB-CXX-1073 Missing Go
 SB-CXX-1074 Missing Go
-SB-CXX-1075 Missing C ABI
+SB-CXX-1075 Covered
 SB-CXX-1076 Missing Go
 SB-CXX-1077 Missing Go
-SB-CXX-1078 Missing C ABI
+SB-CXX-1078 Covered
 SB-CXX-1079 Missing Go
-SB-CXX-1080 Missing C ABI
+SB-CXX-1080 Covered
 SB-CXX-1081 Missing Go
-SB-CXX-1082 Missing C ABI
-SB-CXX-1083 Missing C ABI
-SB-CXX-1084 Missing C ABI
-SB-CXX-1085 Missing C ABI
-SB-CXX-1086 Missing C ABI
-SB-CXX-1087 Missing C ABI
-SB-CXX-1088 Missing C ABI
+SB-CXX-1082 Covered
+SB-CXX-1083 Covered
+SB-CXX-1084 Covered
+SB-CXX-1085 Covered
+SB-CXX-1086 Covered
+SB-CXX-1087 Covered
+SB-CXX-1088 Covered
 SB-CXX-1089 Missing Go
 SB-CXX-1090 Missing Go
 SB-CXX-1091 Missing Go
