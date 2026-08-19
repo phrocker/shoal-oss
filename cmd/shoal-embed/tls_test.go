@@ -36,6 +36,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -63,6 +64,29 @@ type testCA struct {
 	clientCertFile string
 	clientKeyFile  string
 	clientCert     tls.Certificate
+}
+
+type lockedBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (lb *lockedBuffer) Write(p []byte) (int, error) {
+	lb.mu.Lock()
+	defer lb.mu.Unlock()
+	return lb.b.Write(p)
+}
+
+func (lb *lockedBuffer) String() string {
+	lb.mu.Lock()
+	defer lb.mu.Unlock()
+	return lb.b.String()
+}
+
+func (lb *lockedBuffer) Reset() {
+	lb.mu.Lock()
+	defer lb.mu.Unlock()
+	lb.b.Reset()
 }
 
 func newTestCA(t *testing.T) *testCA {
@@ -628,7 +652,7 @@ func TestTLSProbeSuppressingWriterFiltersOnlyHandshakeEOF(t *testing.T) {
 // a TLS ClientHello) still does, unaffected by the fix.
 func TestHTTPErrorLogSuppressesExpectedProbeEOFButNotRealTLSErrors(t *testing.T) {
 	ca := newTestCA(t)
-	var logBuf bytes.Buffer
+	var logBuf lockedBuffer
 	logger := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
 	h, err := startServe(serveConfig{
