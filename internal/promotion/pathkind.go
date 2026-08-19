@@ -223,6 +223,7 @@ func normalizeWindowsUNCPublicationPrefix(prefix string) (string, bool) {
 		return "", false
 	}
 	prefix = strings.ReplaceAll(prefix, `\`, "/")
+	hasRootSeparator := strings.HasSuffix(prefix, "/")
 	prefix = strings.TrimRight(prefix, "/")
 	if prefix == "" {
 		return "", false
@@ -267,6 +268,28 @@ func normalizeWindowsUNCPublicationPrefix(prefix string) (string, bool) {
 
 	if remainder, ok := strings.CutPrefix(prefix, "//"); ok {
 		return normalizeWindowsUNCServerShare(remainder)
+	}
+
+	// A bare drive-letter prefix with no root separator (for example
+	// "c:", which splitLocalPath produces for a drive-relative path
+	// like "c:bulk\A.rf") is not covered by normalizeWindowsDrivePath,
+	// which only recognizes drive paths that have a separator
+	// immediately after the colon; a drive-relative path falls through
+	// to filepath.Clean instead, which never changes case. Fold its
+	// case here too, so "c:bulk\A.rf" and "C:bulk\A.rf" -- which
+	// Windows resolves against the same drive's current directory --
+	// converge on the same publication prefix instead of aliasing a
+	// not-yet-created write target under two different keys. Whether
+	// the original prefix carried a root separator is preserved
+	// (rather than always adding or dropping one), so this doesn't
+	// conflate a drive-relative prefix with an absolute "C:\..." one,
+	// which names a genuinely different location.
+	if hasWindowsDriveLetterPrefix(prefix) && len(prefix) == 2 {
+		upper := strings.ToUpper(prefix)
+		if hasRootSeparator {
+			upper += "/"
+		}
+		return upper, true
 	}
 
 	return "", false

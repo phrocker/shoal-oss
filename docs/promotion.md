@@ -215,6 +215,18 @@ RFileExportManifest (existing)  →  promotion.BuildLoadMapping
   published under one spelling and a not-yet-created write target
   expressed under the other would look like two distinct locations
   right up until the second write silently overwrote the first.
+  A drive-*relative* spelling is a separate wrinkle from the rooted
+  drive-letter prefix above: a drive letter and colon with no separator
+  immediately after it (`C:bulk\A.rf`, meaning "`bulk\A.rf` relative to
+  drive C's own current directory", as distinct from the rooted
+  `C:\bulk\A.rf`) doesn't go through that upstream folding, since it
+  only fires once a separator follows the colon. This same
+  volume-prefix folding step now recognizes a bare, separator-less
+  drive-letter prefix directly and uppercases it, so `c:bulk\A.rf` and
+  `C:bulk\A.rf` converge on the same publication key too -- while
+  still staying distinct from the rooted `C:\bulk\A.rf` spelling of the
+  same drive and path, which names a different location whenever that
+  drive's current directory isn't its root.
   Every unique manifest source path is additionally checked against
   every *other* unique source path, not only against write targets: two
   different `DestinationPath` values that are physically the same file

@@ -135,6 +135,59 @@ func TestFlattenNamesAllowsSameDestinationPathTwice(t *testing.T) {
 	}
 }
 
+// TestFlattenNamesRejectsNonLeafBasenames covers the review finding that
+// filepath.Base collapses a DestinationPath ending in an empty, ".", or
+// ".." segment to a non-leaf name ("." or "..") instead of erroring.
+// Left unrejected, joinBulkPath would resolve that entry's write target
+// to bulkDir itself or to bulkDir's parent directory rather than a new
+// file inside bulkDir.
+func TestFlattenNamesRejectsNonLeafBasenames(t *testing.T) {
+	for _, destinationPath := range []string{
+		"",
+		".",
+		"..",
+		"export/events/t-0000/.",
+		"export/events/t-0000/..",
+	} {
+		t.Run(fmt.Sprintf("path=%q", destinationPath), func(t *testing.T) {
+			rfiles := []engine.RFileExportFile{{DestinationPath: destinationPath}}
+			if _, err := flattenNames(rfiles); err == nil {
+				t.Fatalf("flattenNames(%q) = nil error, want error rejecting non-leaf basename", destinationPath)
+			}
+		})
+	}
+}
+
+// TestStageBulkDirRejectsNonLeafBasenameBeforeCopying is the end-to-end
+// counterpart to TestFlattenNamesRejectsNonLeafBasenames: it confirms
+// StageBulkDir itself refuses a manifest entry that flattens to ".." and
+// performs no partial writes, rather than letting the copy loop resolve
+// the write target to bulkDir's parent directory.
+func TestStageBulkDirRejectsNonLeafBasenameBeforeCopying(t *testing.T) {
+	src := memory.New()
+	content := []byte("payload")
+	src.Put("export/events/t-0000/..", content)
+	sum := sha256.Sum256(content)
+
+	manifest := &engine.RFileExportManifest{
+		Version:     engine.RFileExportManifestVersion,
+		SourceTable: "events",
+		Tablets:     []engine.RFileExportTablet{{Index: 0}},
+		RFiles: []engine.RFileExportFile{
+			{TabletIndex: 0, DestinationPath: "export/events/t-0000/..", Size: int64(len(content)), SHA256: hex.EncodeToString(sum[:])},
+		},
+	}
+
+	dst := memory.New()
+	ctx := context.Background()
+	if _, err := StageBulkDir(ctx, src, manifest, dst, "/bulk/events-1"); err == nil {
+		t.Fatal("StageBulkDir with a \"..\"-flattening basename = nil error, want error")
+	}
+	if got := dst.Keys(); len(got) != 0 {
+		t.Fatalf("StageBulkDir wrote %v on non-leaf basename error, want no partial writes", got)
+	}
+}
+
 func TestStageBulkDirRejectsCorruptSourceBeforeCopying(t *testing.T) {
 	src := memory.New()
 	src.Put("export/events/t-0000/F0001.rf", []byte("actual bytes on disk"))
@@ -815,6 +868,8 @@ func TestNormalizeWindowsUNCPublicationPrefix(t *testing.T) {
 		{name: "extended UNC marker and server components normalize case", left: `\\?\UNC\SERVER\share\`, right: `\\?\unc\server\share\`, wantEq: true, wantOK: true},
 		{name: "bare extended UNC marker normalizes without inline server or share", left: `\\?\UNC\`, right: `\\?\unc\`, wantEq: true, wantOK: true},
 		{name: "bare extended drive prefix normalizes case", left: `\\?\c:\`, right: `\\?\C:\`, wantEq: true, wantOK: true},
+		{name: "bare drive-relative prefix normalizes case", left: `c:`, right: `C:`, wantEq: true, wantOK: true},
+		{name: "drive-relative and drive-absolute prefixes stay distinct", left: `c:`, right: `C:\`, wantEq: false, wantOK: true},
 		{name: "drive-letter prefix is not treated as UNC", left: `C:\bulk\`, right: `C:\bulk\`, wantOK: false},
 		{name: "uri prefix is not treated as UNC", left: `s3://bucket`, right: `s3://bucket`, wantOK: false},
 	}
