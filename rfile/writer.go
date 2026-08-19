@@ -16,14 +16,15 @@ import (
 // Close. It is the Go equivalent of Sharkbite's SequentialRFile write side,
 // which RFileOperations.openForWrite returns.
 type Writer struct {
-	mu       sync.Mutex
-	inner    *rfile.Writer
-	file     *os.File
-	path     string
-	lastKey  *wire.Key
-	closed   bool
-	closeErr error
-	entries  int64
+	mu        sync.Mutex
+	inner     *rfile.Writer
+	file      *os.File
+	path      string
+	lastKey   *wire.Key
+	closed    bool
+	appendErr error
+	closeErr  error
+	entries   int64
 }
 
 // WriterOptions controls how Create lays out the file. The zero value uses
@@ -76,6 +77,13 @@ func Create(ctx context.Context, path string, opts WriterOptions) (*Writer, erro
 // ErrOutOfOrder, where Sharkbite's append returns false or corrupts the file.
 //
 // The entry's key and value are copied, so the caller may reuse its buffers.
+//
+// A failed append is terminal. The underlying writer has already encoded the
+// entry into its block stream by the time a flush can fail, so the file can no
+// longer be trusted: the error is latched, every later Append returns it, and
+// Close reports it even when finalization itself succeeds. ErrOutOfOrder is
+// the exception — it is rejected before anything is written, so the writer
+// stays usable.
 func (w *Writer) Append(ctx context.Context, entry Entry) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -84,6 +92,9 @@ func (w *Writer) Append(ctx context.Context, entry Entry) error {
 	defer w.mu.Unlock()
 	if w.closed {
 		return ErrClosed
+	}
+	if w.appendErr != nil {
+		return w.appendErr
 	}
 	key := internalKey(entry.Key)
 	key.Deleted = entry.Deleted
@@ -94,7 +105,8 @@ func (w *Writer) Append(ctx context.Context, entry Entry) error {
 		)
 	}
 	if err := w.inner.Append(key, append([]byte(nil), entry.Value...)); err != nil {
-		return fmt.Errorf("rfile: append to %s: %w", w.path, err)
+		w.appendErr = fmt.Errorf("rfile: append to %s: %w", w.path, err)
+		return w.appendErr
 	}
 	w.lastKey = key
 	w.entries++
@@ -127,8 +139,9 @@ func (w *Writer) Entries() int64 {
 // handle. It is idempotent, and Append afterwards reports ErrClosed. Until
 // Close returns without error the file on disk is not a readable RFile.
 //
-// A failed finalization is remembered: every later Close returns the same
-// error, so a caller cannot mistake a malformed file for a complete one.
+// A failed append or a failed finalization is remembered: every later Close
+// returns the same error, so a caller cannot mistake a malformed file for a
+// complete one.
 func (w *Writer) Close() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -137,6 +150,9 @@ func (w *Writer) Close() error {
 	}
 	w.closed = true
 	var errs []error
+	if w.appendErr != nil {
+		errs = append(errs, w.appendErr)
+	}
 	if err := w.inner.Close(); err != nil {
 		errs = append(errs, err)
 	}
