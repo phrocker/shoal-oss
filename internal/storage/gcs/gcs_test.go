@@ -169,60 +169,23 @@ func TestNextTemporaryObjectNameSupportsMaxUTF8ByteName(t *testing.T) {
 	}
 }
 
-func TestNextTemporaryObjectNameTrimsToDeepestAncestorPrefixWhenSpaceIsTight(t *testing.T) {
+func TestNextTemporaryObjectNameRejectsInsteadOfEscapingPrefixScope(t *testing.T) {
 	originalToken := randomTempObjectToken
+	tokenCalls := 0
 	randomTempObjectToken = func() (string, error) {
+		tokenCalls++
 		return strings.Repeat("d", tempObjectRandomHexLen), nil
 	}
 	t.Cleanup(func() {
 		randomTempObjectToken = originalToken
 	})
 
-	object := strings.Repeat("a", 600) + "/" + strings.Repeat("b", 420) + "/x"
-	tempName, err := nextTemporaryObjectName(object)
-	if err != nil {
-		t.Fatalf("nextTemporaryObjectName: %v", err)
+	object := strings.Repeat("a", 500) + "/" + strings.Repeat("b", 498) + "/x"
+	if _, err := nextTemporaryObjectName(object); err == nil || !strings.Contains(err.Error(), "refusing to stage outside the destination prefix") {
+		t.Fatalf("nextTemporaryObjectName error = %v, want prefix-scope rejection", err)
 	}
-	wantPrefix := strings.Repeat("a", 600) + "/"
-	if got := tempObjectParentPrefix(tempName); got != wantPrefix {
-		t.Fatalf("temp prefix = %q, want deepest compatible prefix %q", got, wantPrefix)
-	}
-	if len(tempName) > maxObjectNameBytes {
-		t.Fatalf("temp object length = %d bytes, want <= %d", len(tempName), maxObjectNameBytes)
-	}
-	component := tempName[len(wantPrefix):]
-	if len(component) != tempObjectComponentLen {
-		t.Fatalf("temp component length = %d, want %d", len(component), tempObjectComponentLen)
-	}
-}
-
-func TestNextTemporaryObjectNamePreservesFullEntropyWhenPrefixTrims(t *testing.T) {
-	originalToken := randomTempObjectToken
-	randomTempObjectToken = func() (string, error) {
-		return strings.Repeat("e", tempObjectRandomHexLen), nil
-	}
-	t.Cleanup(func() {
-		randomTempObjectToken = originalToken
-	})
-
-	objectA := strings.Repeat("a", 600) + "/" + strings.Repeat("b", 420) + "/x"
-	objectB := strings.Repeat("a", 600) + "/" + strings.Repeat("b", 420) + "/y"
-	tempA, err := nextTemporaryObjectName(objectA)
-	if err != nil {
-		t.Fatalf("nextTemporaryObjectName objectA: %v", err)
-	}
-	tempB, err := nextTemporaryObjectName(objectB)
-	if err != nil {
-		t.Fatalf("nextTemporaryObjectName objectB: %v", err)
-	}
-	if tempA == tempB {
-		t.Fatalf("trimmed temporary names collided: %q", tempA)
-	}
-	if got, want := len(tempA)-len(tempObjectParentPrefix(tempA)), tempObjectComponentLen; got != want {
-		t.Fatalf("tempA component length = %d, want %d", got, want)
-	}
-	if got, want := len(tempB)-len(tempObjectParentPrefix(tempB)), tempObjectComponentLen; got != want {
-		t.Fatalf("tempB component length = %d, want %d", got, want)
+	if tokenCalls != 0 {
+		t.Fatalf("random token generated %d times before prefix validation", tokenCalls)
 	}
 }
 

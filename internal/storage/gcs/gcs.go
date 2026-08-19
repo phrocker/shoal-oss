@@ -270,17 +270,12 @@ func tempObjectParentPrefix(object string) string {
 
 func temporaryObjectPrefixFor(object string) (string, error) {
 	prefix := tempObjectParentPrefix(object)
-	for prefix != "" && min(maxObjectNameBytes-len(prefix), maxObjectSegmentBytes) < tempObjectComponentLen {
-		trimmed := strings.TrimSuffix(prefix, "/")
-		next := tempObjectParentPrefix(trimmed)
-		if next == "" {
-			available := min(maxObjectNameBytes-len(prefix), maxObjectSegmentBytes)
-			return "", fmt.Errorf(
-				"object prefix %q leaves %d bytes for a temporary object; need at least %d",
-				prefix, available, tempObjectComponentLen,
-			)
-		}
-		prefix = next
+	available := min(maxObjectNameBytes-len(prefix), maxObjectSegmentBytes)
+	if available < tempObjectComponentLen {
+		return "", fmt.Errorf(
+			"object prefix %q leaves %d bytes for a temporary object; need at least %d; refusing to stage outside the destination prefix",
+			prefix, available, tempObjectComponentLen,
+		)
 	}
 	return prefix, nil
 }

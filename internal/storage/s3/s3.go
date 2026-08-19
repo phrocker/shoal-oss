@@ -282,17 +282,12 @@ func nextTemporaryStageKey(key string) (string, error) {
 
 func temporaryStageKeyPrefixFor(key string) (string, error) {
 	prefix := stageKeyParentPrefix(key)
-	for prefix != "" && maxObjectKeyBytes-len(prefix) < tempStageComponentLen {
-		trimmed := strings.TrimSuffix(prefix, "/")
-		next := stageKeyParentPrefix(trimmed)
-		if next == "" {
-			available := maxObjectKeyBytes - len(prefix)
-			return "", fmt.Errorf(
-				"key prefix %q leaves %d bytes for a temporary object; need at least %d",
-				prefix, available, tempStageComponentLen,
-			)
-		}
-		prefix = next
+	available := maxObjectKeyBytes - len(prefix)
+	if available < tempStageComponentLen {
+		return "", fmt.Errorf(
+			"key prefix %q leaves %d bytes for a temporary object; need at least %d; refusing to stage outside the destination prefix",
+			prefix, available, tempStageComponentLen,
+		)
 	}
 	return prefix, nil
 }

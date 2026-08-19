@@ -320,29 +320,23 @@ func TestNextTemporaryStageKeyPreservesPrefixAndBoundsUTF8Bytes(t *testing.T) {
 	}
 }
 
-func TestNextTemporaryStageKeyTrimsToDeepestAncestorPrefixWhenSpaceIsTight(t *testing.T) {
+func TestNextTemporaryStageKeyRejectsInsteadOfEscapingPrefixScope(t *testing.T) {
 	original := randomStageKeyToken
+	tokenCalls := 0
 	randomStageKeyToken = func() (string, error) {
+		tokenCalls++
 		return strings.Repeat("b", tempStageRandomHexLen), nil
 	}
 	t.Cleanup(func() {
 		randomStageKeyToken = original
 	})
 
-	key := strings.Repeat("a", 600) + "/" + strings.Repeat("b", 420) + "/x"
-	stageKey, err := nextTemporaryStageKey(key)
-	if err != nil {
-		t.Fatalf("nextTemporaryStageKey: %v", err)
+	key := strings.Repeat("a", 500) + "/" + strings.Repeat("b", 498) + "/x"
+	if _, err := nextTemporaryStageKey(key); err == nil || !strings.Contains(err.Error(), "refusing to stage outside the destination prefix") {
+		t.Fatalf("nextTemporaryStageKey error = %v, want prefix-scope rejection", err)
 	}
-	wantPrefix := strings.Repeat("a", 600) + "/"
-	if got := stageKeyParentPrefix(stageKey); got != wantPrefix {
-		t.Fatalf("stage prefix = %q, want deepest compatible prefix %q", got, wantPrefix)
-	}
-	if len(stageKey) > maxObjectKeyBytes {
-		t.Fatalf("stage key length = %d bytes, want <= %d", len(stageKey), maxObjectKeyBytes)
-	}
-	if got, want := len(stageKey)-len(wantPrefix), tempStageComponentLen; got != want {
-		t.Fatalf("stage component length = %d, want %d", got, want)
+	if tokenCalls != 0 {
+		t.Fatalf("random token generated %d times before prefix validation", tokenCalls)
 	}
 }
 
@@ -397,36 +391,6 @@ func TestNextTemporaryStageKeyKeepsFullRandomTokenAtMinimumSpace(t *testing.T) {
 	}
 	if other == stageKey {
 		t.Fatalf("distinct random tokens produced the same temporary key %q", stageKey)
-	}
-}
-
-func TestNextTemporaryStageKeyPreservesFullEntropyWhenPrefixTrims(t *testing.T) {
-	original := randomStageKeyToken
-	randomStageKeyToken = func() (string, error) {
-		return strings.Repeat("c", tempStageRandomHexLen), nil
-	}
-	t.Cleanup(func() {
-		randomStageKeyToken = original
-	})
-
-	keyA := strings.Repeat("a", 600) + "/" + strings.Repeat("b", 420) + "/x"
-	keyB := strings.Repeat("a", 600) + "/" + strings.Repeat("b", 420) + "/y"
-	stageA, err := nextTemporaryStageKey(keyA)
-	if err != nil {
-		t.Fatalf("nextTemporaryStageKey keyA: %v", err)
-	}
-	stageB, err := nextTemporaryStageKey(keyB)
-	if err != nil {
-		t.Fatalf("nextTemporaryStageKey keyB: %v", err)
-	}
-	if stageA == stageB {
-		t.Fatalf("trimmed temporary stage keys collided: %q", stageA)
-	}
-	if got, want := len(stageA)-len(stageKeyParentPrefix(stageA)), tempStageComponentLen; got != want {
-		t.Fatalf("stageA component length = %d, want %d", got, want)
-	}
-	if got, want := len(stageB)-len(stageKeyParentPrefix(stageB)), tempStageComponentLen; got != want {
-		t.Fatalf("stageB component length = %d, want %d", got, want)
 	}
 }
 
