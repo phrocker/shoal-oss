@@ -86,7 +86,9 @@ func (b *Backend) Create(_ context.Context, path string) (storage.Writer, error)
 // List enumerates the regular files directly under prefix (a directory
 // path), returning their full paths. Mirrors the os.ReadDir-based RFile
 // discovery the tablet did before storage was abstracted. A non-existent
-// prefix yields an empty list, not an error (an empty tablet dir).
+// prefix yields an empty list, not an error (an empty tablet dir). Internal
+// replacement-artifact names are reserved and omitted; pre-existing matching
+// files remain accessible through Open and Remove.
 func (b *Backend) List(_ context.Context, prefix string) ([]string, error) {
 	entries, err := os.ReadDir(prefix)
 	if err != nil {

@@ -323,7 +323,9 @@ func (b *Backend) Create(ctx context.Context, path string) (shstorage.Writer, er
 
 // List returns paths of blobs directly under prefix (using delimiter "/").
 // Returned paths are in az://container/blob form. Virtual "directory" prefixes
-// are skipped — only leaf blobs are returned, mirroring gcs/s3 List.
+// are skipped — only leaf blobs are returned, mirroring gcs/s3 List. Internal
+// staging-name shapes are reserved and omitted; pre-existing matching blobs
+// remain accessible through Open and Remove.
 func (b *Backend) List(ctx context.Context, prefix string) ([]string, error) {
 	cont, blobPrefix, err := ParsePath(prefix)
 	if err != nil {

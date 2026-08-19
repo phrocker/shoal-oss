@@ -186,6 +186,8 @@ func (b *Backend) Create(ctx context.Context, path string) (shstorage.Writer, er
 // List returns paths of objects directly under prefix (using delimiter="/").
 // Returned paths are in s3://bucket/key form. "Directory" keys (ending with
 // "/") are skipped — only leaf objects are returned, mirroring gcs.List.
+// Internal staging-name shapes are reserved and omitted; pre-existing matching
+// objects remain accessible through Open and Remove.
 func (b *Backend) List(ctx context.Context, prefix string) ([]string, error) {
 	bucket, objectPrefix, err := ParsePath(prefix)
 	if err != nil {

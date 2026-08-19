@@ -353,7 +353,9 @@ func (b *Backend) Create(ctx context.Context, objectPath string) (storage.Writer
 	return w, nil
 }
 
-// List returns regular files directly under prefix.
+// List returns regular files directly under prefix. Internal replacement
+// artifact names are reserved and omitted; pre-existing matching files remain
+// accessible through Open and Remove.
 func (b *Backend) List(ctx context.Context, prefix string) ([]string, error) {
 	if err := contextOrBackground(ctx).Err(); err != nil {
 		return nil, err

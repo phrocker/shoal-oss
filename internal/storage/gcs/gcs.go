@@ -171,7 +171,9 @@ func (b *Backend) Create(ctx context.Context, path string) (shstorage.Writer, er
 }
 
 // List returns objects directly under prefix. The prefix may be gs://bucket/dir
-// or bucket/dir and is treated like a tablet directory.
+// or bucket/dir and is treated like a tablet directory. Internal staging-name
+// shapes are reserved and omitted; pre-existing matching objects remain
+// accessible through Open and Remove.
 func (b *Backend) List(ctx context.Context, prefix string) ([]string, error) {
 	bucket, objectPrefix, err := ParsePath(prefix)
 	if err != nil {
