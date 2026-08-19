@@ -8,9 +8,9 @@
 
 _Static_assert(SHOAL_ABI_VERSION == 1u, "unexpected compatibility ABI version");
 _Static_assert(SHOAL_ABI_VERSION_MAJOR == 1u, "unexpected ABI major");
-_Static_assert(SHOAL_ABI_VERSION_MINOR == 5u, "unexpected ABI minor");
+_Static_assert(SHOAL_ABI_VERSION_MINOR == 6u, "unexpected ABI minor");
 _Static_assert(SHOAL_ABI_VERSION_PATCH == 0u, "unexpected ABI patch");
-_Static_assert(SHOAL_ABI_VERSION_PACKED == 0x00010500u,
+_Static_assert(SHOAL_ABI_VERSION_PACKED == 0x00010600u,
                "unexpected packed ABI version");
 _Static_assert(SHOAL_ABI_CAPABILITY_CONNECTOR == 0u,
                "unexpected connector capability id");
@@ -46,11 +46,13 @@ _Static_assert(SHOAL_ABI_CAPABILITY_CONFIGURATION_TOPOLOGY == 15u,
                "unexpected configuration topology capability id");
 _Static_assert(SHOAL_ABI_CAPABILITY_RFILE == 16u,
                "unexpected RFile capability id");
-_Static_assert(SHOAL_ABI_CAPABILITY_COUNT == 17u,
+_Static_assert(SHOAL_ABI_CAPABILITY_DATA_VALUES == 17u,
+               "unexpected data values capability id");
+_Static_assert(SHOAL_ABI_CAPABILITY_COUNT == 18u,
                "unexpected capability count");
 _Static_assert(SHOAL_ABI_CAPABILITY_WORD_COUNT == 1u,
                "unexpected capability word count");
-_Static_assert(SHOAL_ABI_CAPABILITY_WORD0 == UINT64_C(0x1ffff),
+_Static_assert(SHOAL_ABI_CAPABILITY_WORD0 == UINT64_C(0x3ffff),
                "unexpected capability word 0");
 
 #define ASSERT_PERMISSION_VALUE(name, value)                                  \
@@ -153,6 +155,8 @@ static void test_v1_initializers(void) {
                 SHOAL_RFILE_ENTRY_V1_SIZE);
   CHECK_V1_INIT(shoal_rfile_entry_view, shoal_rfile_entry_view_init,
                 SHOAL_RFILE_ENTRY_VIEW_V1_SIZE);
+  CHECK_V1_INIT(shoal_key_value, shoal_key_value_init,
+                SHOAL_KEY_VALUE_V1_SIZE);
 
 #undef CHECK_V1_INIT
 }
@@ -341,6 +345,130 @@ static void test_rfile_abi(void) {
   remove(path_two);
 }
 
+static void test_data_value_abi(void) {
+  uint8_t row[] = {'r', '\0'};
+  uint8_t family[] = {'f'};
+  uint8_t qualifier[] = {'q'};
+  uint8_t visibility[] = {'A'};
+  uint8_t value[] = {'v', '\0', 'x'};
+  shoal_key key = {
+      {row, sizeof(row)},
+      {family, sizeof(family)},
+      {qualifier, sizeof(qualifier)},
+      {visibility, sizeof(visibility)},
+      7,
+  };
+  shoal_error *error = NULL;
+  shoal_bytes_result *text = NULL;
+  expect_error(shoal_key_to_string(NULL, &text, &error),
+               SHOAL_STATUS_INVALID_ARGUMENT, &error, "key");
+  assert(shoal_key_to_string(&key, &text, &error) == SHOAL_STATUS_OK);
+  shoal_bytes rendered = shoal_bytes_result_get(text);
+  assert(rendered.length > sizeof(row));
+  assert(memchr(rendered.data, '\0', rendered.length) == NULL);
+  shoal_bytes_result_free(&text);
+
+  shoal_range range;
+  shoal_range_init(&range);
+  range.start.kind = SHOAL_RANGE_BOUND_ROW;
+  range.start.row = (shoal_bytes){(const uint8_t *)"b", 1};
+  range.end.kind = SHOAL_RANGE_BOUND_ROW;
+  range.end.row = (shoal_bytes){(const uint8_t *)"y", 1};
+  range.start_inclusive = 1;
+  range.end_inclusive = 0;
+  uint8_t predicate = 9;
+  expect_error(shoal_range_before_start_key(&range, NULL, &predicate, &error),
+               SHOAL_STATUS_INVALID_ARGUMENT, &error, "key");
+  assert(predicate == 0);
+  assert(shoal_range_before_start_key(&range, &key, &predicate, &error) ==
+         SHOAL_STATUS_OK);
+  assert(predicate == 0);
+  assert(shoal_range_after_end_key(&range, &key, &predicate, &error) ==
+         SHOAL_STATUS_OK);
+  assert(predicate == 0);
+  assert(shoal_range_to_string(&range, &text, &error) == SHOAL_STATUS_OK);
+  rendered = shoal_bytes_result_get(text);
+  assert(rendered.length >= 6);
+  assert(memcmp(rendered.data, "Range ", 6) == 0);
+  shoal_bytes_result_free(&text);
+
+  shoal_key_value input;
+  shoal_key_value_init(&input);
+  input.key = key;
+  input.value = (shoal_bytes){value, sizeof(value)};
+  shoal_key_value_result *key_value = NULL;
+  uint32_t key_value_size = input.struct_size;
+  input.struct_size = SHOAL_KEY_VALUE_V1_SIZE - 1;
+  expect_error(shoal_key_value_create(&input, &key_value, &error),
+               SHOAL_STATUS_INVALID_ARGUMENT, &error, "too small");
+  input.struct_size = key_value_size;
+  assert(shoal_key_value_create(&input, &key_value, &error) ==
+         SHOAL_STATUS_OK);
+  row[0] = 'z';
+  value[0] = 'z';
+  shoal_key_value_view view;
+  memset(&view, 0, sizeof(view));
+  assert(shoal_key_value_result_get(key_value, &view, &error) ==
+         SHOAL_STATUS_OK);
+  assert(view.row.length == sizeof(row) && view.row.data[0] == 'r');
+  assert(view.value.length == sizeof(value) && view.value.data[0] == 'v');
+  shoal_key_value_result_free(&key_value);
+  shoal_key_value_result_free(&key_value);
+
+  row[0] = 'r';
+  value[0] = 'v';
+  shoal_test_result_alloc_fail_after(0);
+  assert(shoal_key_value_create(&input, &key_value, &error) ==
+         SHOAL_STATUS_OUT_OF_MEMORY);
+  assert(key_value == NULL && error != NULL);
+  shoal_error_free(&error);
+  shoal_test_result_alloc_reset();
+
+  uint8_t label_binary[] = {'b', '\0'};
+  shoal_bytes labels[] = {
+      {(const uint8_t *)"z", 1},
+      {label_binary, sizeof(label_binary)},
+      {(const uint8_t *)"a", 1},
+      {(const uint8_t *)"a", 1},
+  };
+  shoal_authorizations *auths = NULL;
+  shoal_authorizations *same = NULL;
+  shoal_bytes_list_result *listed = NULL;
+  expect_error(shoal_authorizations_create(NULL, 1, &auths, &error),
+               SHOAL_STATUS_INVALID_ARGUMENT, &error, "labels");
+  assert(shoal_authorizations_create(labels, 4, &auths, &error) ==
+         SHOAL_STATUS_OK);
+  label_binary[0] = 'x';
+  assert(shoal_authorizations_count(auths) == 3);
+  assert(shoal_authorizations_empty(auths) == 0);
+  shoal_bytes original_binary = {(const uint8_t *)"b\0", 2};
+  assert(shoal_authorizations_contains(auths, original_binary) == 1);
+  assert(shoal_authorizations_contains(
+             auths, (shoal_bytes){(const uint8_t *)"missing", 7}) == 0);
+  assert(shoal_authorizations_list(auths, &listed, &error) == SHOAL_STATUS_OK);
+  assert(shoal_bytes_list_count(listed) == 3);
+  shoal_bytes listed_value = {0};
+  assert(shoal_bytes_list_get(listed, 0, &listed_value, &error) ==
+         SHOAL_STATUS_OK);
+  assert(listed_value.length == 1 && listed_value.data[0] == 'a');
+  shoal_bytes_list_free(&listed);
+  shoal_test_result_alloc_fail_after(0);
+  expect_error(shoal_authorizations_list(auths, &listed, &error),
+               SHOAL_STATUS_OUT_OF_MEMORY, &error, "authorization list");
+  assert(listed == NULL);
+  shoal_test_result_alloc_reset();
+  label_binary[0] = 'b';
+  assert(shoal_authorizations_create(labels, 4, &same, &error) ==
+         SHOAL_STATUS_OK);
+  assert(shoal_authorizations_equal(auths, same) == 1);
+  assert(shoal_authorization_character_is_valid('A') == 1);
+  assert(shoal_authorization_character_is_valid(':') == 1);
+  assert(shoal_authorization_character_is_valid('!') == 0);
+  shoal_authorizations_free(&same);
+  shoal_authorizations_free(&auths);
+  shoal_authorizations_free(&auths);
+}
+
 int main(void) {
   shoal_connector *connector = NULL;
   shoal_connector *admin_connector = NULL;
@@ -367,6 +495,7 @@ int main(void) {
 
   test_v1_initializers();
   test_rfile_abi();
+  test_data_value_abi();
   assert(shoal_abi_version() == SHOAL_ABI_VERSION);
   assert(shoal_abi_version_major() == SHOAL_ABI_VERSION_MAJOR);
   assert(shoal_abi_version_minor() == SHOAL_ABI_VERSION_MINOR);
@@ -392,6 +521,7 @@ int main(void) {
          1);
   assert(shoal_abi_has_capability(SHOAL_ABI_CAPABILITY_DATA_DESCRIPTORS) == 1);
   assert(shoal_abi_has_capability(SHOAL_ABI_CAPABILITY_RFILE) == 1);
+  assert(shoal_abi_has_capability(SHOAL_ABI_CAPABILITY_DATA_VALUES) == 1);
   assert(shoal_abi_has_capability(SHOAL_ABI_CAPABILITY_COUNT) == 0);
   assert(shoal_abi_has_capability(63u) == 0);
   assert(shoal_abi_has_capability(64u) == 0);
