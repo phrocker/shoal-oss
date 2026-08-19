@@ -2853,6 +2853,75 @@ func TestMaintainInheritsTheWatchTheQueuedAcquisitionArmed(t *testing.T) {
 	}
 }
 
+// TestAnAbandonedAcquisitionArmsNoWatchOnAnotherCandidate covers the one watch
+// this package cannot take back. A ZooKeeper watch is released only by firing:
+// go-zookeeper has no removeWatches, and it re-registers the outstanding ones
+// after a reconnect, so a watch armed on another candidate's node lives until
+// that node goes. This lock's own node is not exposed to that — the cleanup
+// deletes the node its watch sits on — but a holder that stays put would
+// collect one registration from every attempt that gave up beneath it.
+//
+// So an acquisition that is already over arms nothing. What it cannot avoid is
+// the watch it was parked on when it was told to stop, which is why the wait
+// is entered only once per predecessor.
+//
+// The two endings reach that through different exits. Cancellation leaves the
+// queue intact, so the guard before the arm is the only thing standing between
+// a dead acquisition and a registration on a stranger's node — that case fails
+// without it. A release takes this lock's node away first, so the pass ends at
+// the missing node and never reaches the arm; it is here because the property
+// asserted is the end state, which has to hold however the acquisition ended.
+func TestAnAbandonedAcquisitionArmsNoWatchOnAnotherCandidate(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		stop func(*ServiceLock, context.CancelFunc)
+		want error
+	}{
+		{
+			name: "cancelled",
+			stop: func(_ *ServiceLock, cancel context.CancelFunc) { cancel() },
+			want: context.Canceled,
+		},
+		{
+			name: "released",
+			stop: func(lock *ServiceLock, _ context.CancelFunc) { _ = lock.Release() },
+			want: ErrLockReleased,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFakeZK()
+			dir := testLockPath()
+			f.seed(dir, nil, false)
+			ahead := path.Join(dir, f.seedForeignLock(dir, otherUUID, 0))
+
+			lock := newTestLock(t, f)
+			ours := lockNodePath(lock.UUID(), 1)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			// The own-node watch is armed one statement before the one ahead,
+			// so ending the acquisition here lands in the window where it has
+			// work left to do and no reason left to do it.
+			var once sync.Once
+			f.beforeGet = func(watched string) {
+				if watched != ours {
+					return
+				}
+				once.Do(func() { tc.stop(lock, cancel) })
+			}
+
+			_, err := lock.Acquire(ctx, testLockData(t, lock))
+			if !errors.Is(err, tc.want) {
+				t.Fatalf("Acquire: want %v, got %v", tc.want, err)
+			}
+			if got := f.watchCount(ahead); got != 0 {
+				t.Fatalf("%d watches left on %s, a node this lock never owned and "+
+					"cannot take a watch back from", got, ahead)
+			}
+		})
+	}
+}
+
 // TestReleaseRecordsItsEndingBeforeTheNodeGoes pins which ending a deliberate
 // release is remembered by. The delete is what a watching Maintain sees, so a
 // watcher that reached the loss first would record an external NODE_DELETED

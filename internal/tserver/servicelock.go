@@ -733,6 +733,20 @@ func (l *ServiceLock) queueForOwnership(ctx context.Context) (LockID, error) {
 			}
 			mineEvents = armed
 		}
+		// An acquisition that is already over does not arm the watch below.
+		// It goes on another candidate's node, and a ZooKeeper watch cannot
+		// be taken back: this client has no removeWatches, and it
+		// re-registers the outstanding ones after a reconnect, so one armed
+		// here outlives this call and is released only when that node goes.
+		// The own-node watch above is not exposed to that — the cleanup
+		// deletes the node it sits on — but a holder that stays put would
+		// collect one registration from every attempt that gave up beneath
+		// it. The wait itself is entered once per predecessor, so the watch
+		// this acquisition is parked on when it is told to stop is the only
+		// one it can leave behind.
+		if err := l.abandoned(ctx); err != nil {
+			return LockID{}, err
+		}
 		ahead := findLowestPrevPrefix(sorted, index)
 		aheadEvents, exists, err := l.watchNode(path.Join(l.dir, ahead))
 		if err != nil {
@@ -758,6 +772,25 @@ func (l *ServiceLock) queueForOwnership(ctx context.Context) (LockID, error) {
 			mineEvents = nil
 		case <-aheadEvents:
 		}
+	}
+}
+
+// abandoned reports why this acquisition is over, or nil while it is still
+// running. It answers the same two questions the wait selects on, without
+// waiting for either.
+//
+// The wait learns of both the moment they happen; this is for the work done
+// between waits, which is where an acquisition that has already been given up
+// can still register a watch it will never consume.
+func (l *ServiceLock) abandoned(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	select {
+	case <-l.release:
+		return fmt.Errorf("%w: %s", ErrLockReleased, l.dir)
+	default:
+		return nil
 	}
 }
 

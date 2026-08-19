@@ -532,6 +532,25 @@ different node on each pass, so it is not the same kind of accumulation:
 each one belongs to the node it was armed on and is spent when that node
 goes.
 
+A watch cannot be taken back, which decides what an abandoned acquisition
+may leave. go-zookeeper has no `removeWatches`, and it re-registers the
+outstanding ones after a reconnect, so a watch is released only by
+firing. The watch on this process's own node is not exposed to that — the
+cleanup deletes the node it sits on, which fires it — but a watch on
+another candidate's node outlives the acquisition that armed it and goes
+only when that node does. A holder that stays put would collect one
+registration from every attempt that gave up beneath it.
+
+So an acquisition that is already over does not arm it: cancellation and
+release are checked again immediately before, not only in the wait. What
+remains is the watch an acquisition was parked on when it was told to
+stop, one per attempt, released when the holder it names finally goes.
+That is inherent to the primitive rather than to this design — upstream's
+`ServiceLock` watches its predecessor the same way — and the alternative,
+watching the lock directory instead, trades it for waking every candidate
+on every change to the queue, which is the thundering herd that watching
+one node ahead exists to avoid.
+
 The own-node watch is kept across the handover too. Reaching the front of
 the queue does not change which node this process is watching, so the
 registration the wait armed is the generation's, and `Maintain` inherits
