@@ -448,10 +448,12 @@ int main(void) {
                                                 &error),
                SHOAL_STATUS_DEADLINE_EXCEEDED, &error, "deadline");
 
-  uint8_t empty_password_marker = 0;
-  shoal_bytes empty_password = {&empty_password_marker, 0};
+  shoal_bytes empty_password = {NULL, 0};
   assert(shoal_connector_create_user(admin_connector, "alice", &empty_password,
                                      0, &error) == SHOAL_STATUS_OK);
+  expect_error(shoal_connector_change_user_authorizations(
+                   admin_connector, "alice", NULL, 1, 0, &error),
+               SHOAL_STATUS_INVALID_ARGUMENT, &error, "authorizations");
   const uint8_t auth_a[] = {'A', 0, 'B'};
   shoal_bytes auths[] = {{auth_a, sizeof(auth_a)}};
   assert(shoal_connector_change_user_authorizations(
