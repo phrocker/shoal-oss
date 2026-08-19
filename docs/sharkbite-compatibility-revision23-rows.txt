@@ -1,8 +1,8 @@
-# Revision-24 accepted matrix rows for docs/sharkbite-compatibility.md.
+# Revision-23 accepted matrix rows for docs/sharkbite-compatibility.md.
 # One entry per row: ROW-ID followed by the audited status, in document order.
 # Pinning the status next to the id means a swap of two rows' statuses inside one
 # section cannot pass the aggregate count checks undetected.
-# Update only when the independently audited revision-24 inventory itself changes.
+# Update only when the independently audited revision-23 inventory itself changes.
 # Regenerate from the audited document, review every added/removed/reclassified row
 # in code review, and keep the list in document order for human auditability.
 
@@ -20,26 +20,26 @@ SB-PKG-011 Missing C ABI
 SB-PKG-012 Missing C ABI
 SB-PKG-013 Missing C ABI
 SB-PKG-014 Intentional divergence (approval required)
-SB-CFG-001 Covered
-SB-CFG-002 Covered
-SB-CFG-003 Covered
-SB-CFG-004 Covered
-SB-CFG-005 Covered
-SB-CFG-024 Covered
+SB-CFG-001 Missing C ABI
+SB-CFG-002 Missing C ABI
+SB-CFG-003 Missing C ABI
+SB-CFG-004 Missing C ABI
+SB-CFG-005 Missing C ABI
+SB-CFG-024 Missing C ABI
 SB-CFG-025 Not required (rationale required)
 SB-CFG-006 Behavior mismatch
 SB-CFG-007 Behavior mismatch
 SB-CFG-026 Behavior mismatch
 SB-CFG-027 Behavior mismatch
 SB-CFG-028 Behavior mismatch
-SB-CFG-029 Covered
-SB-CFG-030 Covered
-SB-CFG-031 Covered
-SB-CFG-032 Covered
+SB-CFG-029 Missing C ABI
+SB-CFG-030 Missing C ABI
+SB-CFG-031 Missing C ABI
+SB-CFG-032 Missing C ABI
 SB-CFG-033 Not required (rationale required)
 SB-CFG-034 Not required (rationale required)
-SB-CFG-035 Covered
-SB-CFG-036 Covered
+SB-CFG-035 Missing C ABI
+SB-CFG-036 Missing C ABI
 SB-CFG-008 Behavior mismatch
 SB-CFG-009 Behavior mismatch
 SB-CFG-019 Behavior mismatch

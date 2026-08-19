@@ -1,7 +1,7 @@
-# Revision-24 compiled C ABI symbol inventory for docs/sharkbite-compatibility.md.
+# Revision-23 compiled C ABI symbol inventory for docs/sharkbite-compatibility.md.
 # Generated from the undefined/imported shoal_* references emitted by compiling the exact C/C++
 # sources that cmd/shoal-capi/cabi_test.go links in TestSharedLibraryCABI.
-# Update only when the independently audited revision-24 compiled inventory changes.
+# Update only when the independently audited revision-23 compiled inventory changes.
 
 [declared]
 shoal_abi_version
@@ -13,22 +13,6 @@ shoal_abi_capability_count
 shoal_abi_capability_word_count
 shoal_abi_capability_word
 shoal_abi_has_capability
-shoal_configuration_create
-shoal_configuration_set
-shoal_configuration_get
-shoal_configuration_get_or
-shoal_configuration_get_uint32
-shoal_configuration_get_uint32_or
-shoal_configuration_free
-shoal_bytes_result_get
-shoal_bytes_result_free
-shoal_string_list_count
-shoal_string_list_get
-shoal_string_list_free
-shoal_server_view_init
-shoal_server_list_count
-shoal_server_list_get
-shoal_server_list_free
 shoal_connector_config_init
 shoal_scanner_config_init
 shoal_range_init
@@ -48,12 +32,6 @@ shoal_connector_identity_view_init
 shoal_connector_get_identity
 shoal_connector_identity_get
 shoal_connector_identity_free
-shoal_connector_get_root_tablet_location
-shoal_connector_get_manager_locations
-shoal_connector_get_zookeepers
-shoal_connector_get_configuration
-shoal_connector_get_servers
-shoal_connector_get_root
 shoal_connector_list_tables
 shoal_table_list_count
 shoal_table_list_get
@@ -167,15 +145,6 @@ shoal_batch_writer_free
 shoal_bytes_list_count
 shoal_bytes_list_free
 shoal_bytes_list_get
-shoal_bytes_result_free
-shoal_bytes_result_get
-shoal_configuration_create
-shoal_configuration_free
-shoal_configuration_get
-shoal_configuration_get_or
-shoal_configuration_get_uint32
-shoal_configuration_get_uint32_or
-shoal_configuration_set
 shoal_connector_add_table_splits
 shoal_connector_change_password
 shoal_connector_change_user_authorizations
@@ -195,14 +164,8 @@ shoal_connector_effective_namespace_properties
 shoal_connector_effective_table_properties
 shoal_connector_flush_table
 shoal_connector_free
-shoal_connector_get_configuration
 shoal_connector_get_identity
-shoal_connector_get_manager_locations
-shoal_connector_get_root
-shoal_connector_get_root_tablet_location
-shoal_connector_get_servers
 shoal_connector_get_user_authorizations
-shoal_connector_get_zookeepers
 shoal_connector_grant_namespace_permission
 shoal_connector_grant_system_permission
 shoal_connector_grant_table_permission
@@ -261,13 +224,6 @@ shoal_scan_result_get
 shoal_scanner_close
 shoal_scanner_config_init
 shoal_scanner_free
-shoal_server_list_count
-shoal_server_list_free
-shoal_server_list_get
-shoal_server_view_init
-shoal_string_list_count
-shoal_string_list_free
-shoal_string_list_get
 shoal_table_list_count
 shoal_table_list_free
 shoal_table_list_get

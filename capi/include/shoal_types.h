@@ -22,7 +22,7 @@
  */
 #define SHOAL_ABI_VERSION 1u
 #define SHOAL_ABI_VERSION_MAJOR 1u
-#define SHOAL_ABI_VERSION_MINOR 3u
+#define SHOAL_ABI_VERSION_MINOR 4u
 #define SHOAL_ABI_VERSION_PATCH 0u
 #define SHOAL_ABI_PACK_VERSION(major, minor, patch)                           \
   ((((uint32_t)(major) & 0xffu) << 16) |                                     \
@@ -54,10 +54,11 @@ enum {
   SHOAL_ABI_CAPABILITY_SECURITY_ADMIN = 11,
   SHOAL_ABI_CAPABILITY_TABLE_SPLITS = 12,
   SHOAL_ABI_CAPABILITY_CONNECTOR_IDENTITY = 13,
-  SHOAL_ABI_CAPABILITY_DATA_DESCRIPTORS = 14
+  SHOAL_ABI_CAPABILITY_DATA_DESCRIPTORS = 14,
+  SHOAL_ABI_CAPABILITY_CONFIGURATION_TOPOLOGY = 15
 };
 
-#define SHOAL_ABI_CAPABILITY_COUNT 15u
+#define SHOAL_ABI_CAPABILITY_COUNT 16u
 #define SHOAL_ABI_CAPABILITY_WORD_BITS 64u
 #define SHOAL_ABI_CAPABILITY_WORD_INDEX(capability_id)                       \
   ((uint32_t)(capability_id) / SHOAL_ABI_CAPABILITY_WORD_BITS)
@@ -97,6 +98,8 @@ enum {
   SHOAL_ABI_CAPABILITY_MASK(SHOAL_ABI_CAPABILITY_CONNECTOR_IDENTITY)
 #define SHOAL_ABI_CAPABILITY_DATA_DESCRIPTORS_MASK                           \
   SHOAL_ABI_CAPABILITY_MASK(SHOAL_ABI_CAPABILITY_DATA_DESCRIPTORS)
+#define SHOAL_ABI_CAPABILITY_CONFIGURATION_TOPOLOGY_MASK                     \
+  SHOAL_ABI_CAPABILITY_MASK(SHOAL_ABI_CAPABILITY_CONFIGURATION_TOPOLOGY)
 #define SHOAL_ABI_CAPABILITY_WORD0                                           \
   (SHOAL_ABI_CAPABILITY_CONNECTOR_MASK | SHOAL_ABI_CAPABILITY_BOOTSTRAP_MASK | \
    SHOAL_ABI_CAPABILITY_ERROR_MASK | SHOAL_ABI_CAPABILITY_SCANNER_MASK |     \
@@ -110,7 +113,8 @@ enum {
    SHOAL_ABI_CAPABILITY_SECURITY_ADMIN_MASK |                                \
    SHOAL_ABI_CAPABILITY_TABLE_SPLITS_MASK |                                  \
    SHOAL_ABI_CAPABILITY_CONNECTOR_IDENTITY_MASK |                            \
-   SHOAL_ABI_CAPABILITY_DATA_DESCRIPTORS_MASK)
+   SHOAL_ABI_CAPABILITY_DATA_DESCRIPTORS_MASK |                              \
+   SHOAL_ABI_CAPABILITY_CONFIGURATION_TOPOLOGY_MASK)
 
 typedef int32_t shoal_status;
 
@@ -169,6 +173,10 @@ typedef struct shoal_bytes_list_result shoal_bytes_list_result;
 typedef struct shoal_connector_identity_result shoal_connector_identity_result;
 typedef struct shoal_range_result shoal_range_result;
 typedef struct shoal_iterator_setting_result shoal_iterator_setting_result;
+typedef struct shoal_configuration shoal_configuration;
+typedef struct shoal_bytes_result shoal_bytes_result;
+typedef struct shoal_string_list_result shoal_string_list_result;
+typedef struct shoal_server_list_result shoal_server_list_result;
 typedef struct shoal_error shoal_error;
 
 typedef struct shoal_connector_identity_view {
@@ -186,6 +194,18 @@ typedef struct shoal_bytes {
   const uint8_t *data;
   size_t length;
 } shoal_bytes;
+
+typedef struct shoal_server_view {
+  uint32_t struct_size;
+  shoal_bytes kind;
+  shoal_bytes group;
+  shoal_bytes host;
+  uint16_t port;
+} shoal_server_view;
+
+#define SHOAL_SERVER_VIEW_V1_SIZE                                            \
+  ((uint32_t)(offsetof(shoal_server_view, port) +                            \
+              sizeof(((shoal_server_view *)0)->port)))
 
 typedef struct shoal_column {
   shoal_bytes family;

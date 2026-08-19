@@ -23,6 +23,10 @@ struct shoal_batch_writer {
   uint64_t id;
 };
 
+struct shoal_configuration {
+  uint64_t id;
+};
+
 struct shoal_error {
   shoal_status code;
   char *message;
@@ -167,6 +171,31 @@ struct shoal_iterator_setting_result {
   shoal_iterator_option *options;
 };
 
+struct shoal_bytes_result {
+  uint8_t *data;
+  size_t length;
+};
+
+struct shoal_string_list_result {
+  size_t count;
+  shoal_bridge_bytes_entry *entries;
+};
+
+typedef struct shoal_bridge_server_entry {
+  uint8_t *kind;
+  size_t kind_length;
+  uint8_t *group;
+  size_t group_length;
+  uint8_t *host;
+  size_t host_length;
+  uint16_t port;
+} shoal_bridge_server_entry;
+
+struct shoal_server_list_result {
+  size_t count;
+  shoal_bridge_server_entry *entries;
+};
+
 shoal_connector *shoal_bridge_connector_alloc(uint64_t id);
 uint64_t shoal_bridge_connector_id(const shoal_connector *connector);
 void shoal_bridge_connector_free(shoal_connector *connector);
@@ -187,8 +216,33 @@ shoal_batch_writer *shoal_bridge_batch_writer_alloc(uint64_t id);
 uint64_t shoal_bridge_batch_writer_id(const shoal_batch_writer *writer);
 void shoal_bridge_batch_writer_free(shoal_batch_writer *writer);
 
+shoal_configuration *shoal_bridge_configuration_alloc(uint64_t id);
+uint64_t shoal_bridge_configuration_id(const shoal_configuration *configuration);
+void shoal_bridge_configuration_free(shoal_configuration *configuration);
+
 char *shoal_bridge_string_alloc(const char *value, size_t length);
 void shoal_bridge_string_free(char *value);
+shoal_bytes_result *shoal_bridge_bytes_result_alloc(const uint8_t *value,
+                                                    size_t length);
+shoal_bytes shoal_bridge_bytes_result_get(const shoal_bytes_result *result);
+void shoal_bridge_bytes_result_free(shoal_bytes_result *result);
+shoal_string_list_result *shoal_bridge_string_list_alloc(size_t count);
+int shoal_bridge_string_list_set(shoal_string_list_result *result, size_t index,
+                                 const uint8_t *value, size_t length);
+size_t shoal_bridge_string_list_count(const shoal_string_list_result *result);
+int shoal_bridge_string_list_get(const shoal_string_list_result *result,
+                                 size_t index, shoal_bytes *out_value);
+void shoal_bridge_string_list_free(shoal_string_list_result *result);
+shoal_server_list_result *shoal_bridge_server_list_alloc(size_t count);
+int shoal_bridge_server_list_set(shoal_server_list_result *result, size_t index,
+                                 const uint8_t *kind, size_t kind_length,
+                                 const uint8_t *group, size_t group_length,
+                                 const uint8_t *host, size_t host_length,
+                                 uint16_t port);
+size_t shoal_bridge_server_list_count(const shoal_server_list_result *result);
+int shoal_bridge_server_list_get(const shoal_server_list_result *result,
+                                 size_t index, shoal_server_view *out_server);
+void shoal_bridge_server_list_free(shoal_server_list_result *result);
 #ifdef SHOAL_CAPI_TEST
 void shoal_bridge_test_string_alloc_fail_after(size_t successful_allocations);
 void shoal_bridge_test_string_alloc_reset(void);

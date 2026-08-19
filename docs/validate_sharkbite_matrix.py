@@ -59,10 +59,10 @@ def status_count_map(
 
 
 EXPECTED_STATUS_COUNTS = {
-    "Covered": 1,
-    "Missing Go": 2361,
-    "Missing C ABI": 141,
-    "Behavior mismatch": 221,
+    "Covered": 13,
+    "Missing Go": 2364,
+    "Missing C ABI": 125,
+    "Behavior mismatch": 222,
     "Intentional divergence (approval required)": 87,
     "Not required (rationale required)": 392,
 }
@@ -70,7 +70,7 @@ EXPECTED_STATUS_COUNTS = {
 EXPECTED_PREFIX_COUNTS = {
     "SB-BASE": status_count_map(missing_c_abi=18, not_required=2),
     "SB-CFG": status_count_map(
-        missing_c_abi=12,
+        covered=12,
         behavior_mismatch=16,
         intentional_divergence=2,
         not_required=6,
@@ -88,8 +88,8 @@ EXPECTED_PREFIX_COUNTS = {
         not_required=8,
     ),
     "SB-CXX": status_count_map(
-        missing_go=2297,
-        missing_c_abi=10,
+        missing_go=2299,
+        missing_c_abi=8,
         behavior_mismatch=15,
         not_required=304,
     ),
@@ -136,9 +136,8 @@ EXPECTED_PREFIX_COUNTS = {
         not_required=1,
     ),
     "SB-TABLE": status_count_map(
-        missing_go=1,
-        missing_c_abi=2,
-        behavior_mismatch=13,
+        missing_go=2,
+        behavior_mismatch=14,
         not_required=6,
     ),
     "SB-TORCH": status_count_map(missing_c_abi=9),
@@ -196,15 +195,14 @@ EXPECTED_METADATA_FIELDS = {
         "`phrocker/shoal-oss` exact audited baseline for revision 24 "
         "`d26c1d2e4d994ed8a4154ab87fa35b6e6fb9fade` "
         "(\"Merge PR #116: publish the data-model value types\") "
-        "plus the constraint administration and row-bounded flush "
-        "introduced in the same change as this revision"
+        "plus the configuration/topology C ABI introduced in this revision"
     ),
     "Shoal C ABI version": "`SHOAL_ABI_VERSION 1u` (`capi/include/shoal_types.h`)",
 }
 
 EXPECTED_DOCUMENT_STATUS_SNIPPETS = (
     "Normative gate. Binding on all Sharkbite-compatibility work.",
-    f"Revision {EXPECTED_REVISION} — records constraint administration and row-bounded flush",
+    f"Revision {EXPECTED_REVISION} — completes the configuration and instance-topology C ABI",
     "Revision 23 — records the public data-model value types",
     "Revision 22 — reclassifies the thirty-one RFile and stream rows of [§15](#sec-15)",
     "Revision 21 — adds owned range and iterator-setting descriptor ABIs",
@@ -261,8 +259,8 @@ DEFAULT_C_ABI_INCLUDE_PATHS = (
     Path("capi/include"),
     Path("capi/tests"),
 )
-EXPECTED_C_ABI_DECLARED_EXPORTS = 120
-EXPECTED_C_ABI_REFERENCED_EXPORTS = 115
+EXPECTED_C_ABI_DECLARED_EXPORTS = 142
+EXPECTED_C_ABI_REFERENCED_EXPORTS = 137
 EXPECTED_C_ABI_UNREFERENCED_EXPORTS = (
     "shoal_scanner_scan",
     "shoal_batch_scanner_scan",
@@ -324,13 +322,6 @@ OPTIONAL_ANCHOR_CITATIONS = {
 # Implementation files behind the section 15 RFile rows. Anchor-checked for the
 # same reason: the matrix claims an exact public Go surface, so a rename or a
 # deleted method must fail the document, not just the build.
-# Implementation files behind the section 11 table-maintenance rows.
-TARGETED_SB_TABLE_CITATIONS = {
-    "accumulo/table_constraints.go",
-    "accumulo/table_constraints_test.go",
-    "accumulo/table_flush.go",
-}
-
 # Implementation files behind the section 8 data-model value types.
 TARGETED_SB_DATA_CITATIONS = {
     "accumulo/authorizations.go",
@@ -357,7 +348,6 @@ ANCHOR_CHECKED_CITATIONS = (
     | TARGETED_SB_CFG_CITATIONS
     | TARGETED_SB_RFILE_CITATIONS
     | TARGETED_SB_DATA_CITATIONS
-    | TARGETED_SB_TABLE_CITATIONS
 )
 COUNT_RE = re.compile(
     r"^(?P<bold>\*\*)?(?P<number>0|[1-9]\d*|[1-9]\d{0,2}(?:,\d{3})+)(?(bold)\*\*|)$"
@@ -1641,13 +1631,13 @@ def validate_status_narratives(
     python_visible_behavior = status_counts["Behavior mismatch"] - prefix_counts["SB-CXX"]["Behavior mismatch"]
 
     expected_phrases = [
-        f"As of revision {EXPECTED_REVISION} that is {required_rows} of {total_rows} rows, and **only {status_counts['Covered']} is satisfied** ([SB-XCUT-012](#sec-20))",
+        f"As of revision {EXPECTED_REVISION} that is {required_rows} of {total_rows} rows, and **only {status_counts['Covered']} are satisfied** ([SB-XCUT-012](#sec-20) and the twelve configuration/topology rows in [§6](#sec-6))",
         f"{required_rows} rows are **required** by the final release gate ([§2.2](#sec-2)); the {status_counts[NOT_REQUIRED_STATUS]} `Not required` rows are excluded by construction, and {prefix_counts['SB-CXX'][NOT_REQUIRED_STATUS]} of those are the evidence-proved duplicates described in [§19.1](#sec-19-1).",
-        "**Exactly 1 row is `Covered`: [SB-XCUT-012](#sec-20).**",
+        "**Exactly 13 rows are `Covered`: [SB-XCUT-012](#sec-20) and the twelve configuration/topology rows completed in revision 24.**",
         f"The shape of the work is visible in the {status_counts['Missing Go']} `Missing Go` rows, of which {prefix_counts['SB-CXX']['Missing Go']} are the C++ members in [§19.2](#sec-19-2) that no Shoal layer exports.",
         f"`Behavior mismatch` ({status_counts['Behavior mismatch']}) is the bucket that sets the schedule: {python_visible_behavior} rows on the Python-visible and curated C++ surface each need a differential test against a live cluster or the exported ABI, and {prefix_counts['SB-CXX']['Behavior mismatch']} are destructors of classes bound into Python, where the destruction point is user-observable and the model differs from Go finalisation ([§19.1](#sec-19-1)).",
         f"`Intentional divergence` ({status_counts[INTENTIONAL_DIVERGENCE_STATUS]}) is dominated by one upstream fact: {prefix_counts['SB-STAT'][INTENTIONAL_DIVERGENCE_STATUS]} rows are cluster-status accessors Accumulo itself deleted ([§14](#sec-14), [SB-DIV-016](#sec-26)).",
-        f"`Missing C ABI` ({status_counts['Missing C ABI']}) is now led by the RFile and stream surface ({prefix_counts['SB-RFILE']['Missing C ABI']}), ahead of pandas ({prefix_counts['SB-PANDA']['Missing C ABI']}), high-level helpers ({prefix_counts['SB-BASE']['Missing C ABI']}), client configuration ({prefix_counts['SB-CFG']['Missing C ABI']}), the data model ({prefix_counts['SB-DATA']['Missing C ABI']}), packaging/import scaffolding ({prefix_counts['SB-PKG']['Missing C ABI']}), the enumerated C++ members ({prefix_counts['SB-CXX']['Missing C ABI']}), and PyTorch ({prefix_counts['SB-TORCH']['Missing C ABI']}).",
+        f"`Missing C ABI` ({status_counts['Missing C ABI']}) is now led by the RFile and stream surface ({prefix_counts['SB-RFILE']['Missing C ABI']}), ahead of pandas ({prefix_counts['SB-PANDA']['Missing C ABI']}), high-level helpers ({prefix_counts['SB-BASE']['Missing C ABI']}), the data model ({prefix_counts['SB-DATA']['Missing C ABI']}), packaging/import scaffolding ({prefix_counts['SB-PKG']['Missing C ABI']}), PyTorch ({prefix_counts['SB-TORCH']['Missing C ABI']}), and the enumerated C++ members ({prefix_counts['SB-CXX']['Missing C ABI']}).",
     ]
     for phrase in expected_phrases:
         require(phrase in normalized, f"missing or stale status narrative: {phrase}")

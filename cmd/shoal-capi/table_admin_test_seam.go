@@ -607,7 +607,10 @@ func cloneProperties(source map[string]string) map[string]string {
 	return result
 }
 
-type testAdminInstance struct{ accumulo.NoTopology }
+type testAdminInstance struct {
+	block         atomic.Bool
+	configuration *accumulo.Configuration
+}
 
 func (*testAdminInstance) Info() accumulo.InstanceInfo {
 	return accumulo.InstanceInfo{Name: "test", ID: "test-id"}
@@ -617,23 +620,86 @@ func (*testAdminInstance) Close() error {
 	return nil
 }
 
+func (i *testAdminInstance) RootTabletLocation(ctx context.Context) (accumulo.TabletLocation, error) {
+	if i.block.Load() {
+		<-ctx.Done()
+		return accumulo.TabletLocation{}, ctx.Err()
+	}
+	return accumulo.TabletLocation{HostPort: "tablet.example:9997", Session: "lock-1"}, nil
+}
+
+func (i *testAdminInstance) ManagerLocations(ctx context.Context) ([]string, error) {
+	if i.block.Load() {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	return []string{"manager.example:9999"}, nil
+}
+
+func (i *testAdminInstance) Servers(ctx context.Context) ([]accumulo.ServerConnection, error) {
+	if i.block.Load() {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	return []accumulo.ServerConnection{{
+		Kind:  accumulo.TabletServerKind,
+		Group: "default",
+		Host:  "server.example",
+		Port:  9997,
+	}}, nil
+}
+
+func (*testAdminInstance) ZooKeepers() []string { return []string{"zk-a:2181", "zk-b:2181"} }
+func (*testAdminInstance) Root() string         { return "/accumulo/test-id" }
+
+func (i *testAdminInstance) Configuration() *accumulo.Configuration {
+	if i.configuration == nil {
+		i.configuration = accumulo.NewConfiguration()
+	}
+	return i.configuration
+}
+
 //export shoal_test_connector_create
 func shoal_test_connector_create(outConnector **C.shoal_connector) C.int {
 	if outConnector == nil {
 		return 0
 	}
 	*outConnector = nil
-	owned := newOwnedConnector(newTestAdminConnector(), &testAdminInstance{})
+	owned := newOwnedConnector(newTestAdminConnector(), &testAdminInstance{
+		configuration: accumulo.NewConfiguration(),
+	})
 	id, ok := connectors.add(owned)
 	if !ok {
 		return 0
 	}
+
 	handle := C.shoal_bridge_connector_alloc(C.uint64_t(id))
 	if handle == nil {
 		connectors.remove(id)
 		return 0
 	}
 	*outConnector = handle
+	return 1
+}
+
+//export shoal_test_connector_topology_block
+func shoal_test_connector_topology_block(
+	handle *C.shoal_connector,
+	block C.uint8_t,
+) C.int {
+	connector, err := lookupConnector(handle)
+	if err != nil {
+		return 0
+	}
+	instance, ok := connector.instance.(*testAdminInstance)
+	if !ok {
+		return 0
+	}
+	value, err := boolFlag(block, "block")
+	if err != nil {
+		return 0
+	}
+	instance.block.Store(value)
 	return 1
 }
 
