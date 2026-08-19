@@ -29,6 +29,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 
@@ -39,6 +40,13 @@ func expectedTemporaryStageKeyComponent(key, token string) string {
 	hash := sha256.Sum256([]byte(key))
 	hashHex := hex.EncodeToString(hash[:tempStageHashHexLen/2])
 	return tempStageKeyPrefix + token[:tempStageRandomHexLen] + hashHex
+}
+
+func (o *fakeS3ArtifactOperations) inspect(ctx context.Context, _ string, artifact s3Artifact) (s3Artifact, error) {
+	if err := ctx.Err(); err != nil {
+		return artifact, err
+	}
+	return artifact, nil
 }
 
 type fakeS3Object struct {
@@ -60,6 +68,27 @@ type fakeS3WriteOperations struct {
 	cleanupCanceled       bool
 	headFailures          int
 	nextETag              int
+}
+
+type fakeS3ArtifactOperations struct {
+	artifacts    []s3Artifact
+	removeErrors map[string]error
+	removed      []s3Artifact
+}
+
+func (o *fakeS3ArtifactOperations) list(ctx context.Context, _, _ string) ([]s3Artifact, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return append([]s3Artifact(nil), o.artifacts...), nil
+}
+
+func (o *fakeS3ArtifactOperations) remove(ctx context.Context, _ string, artifact s3Artifact) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	o.removed = append(o.removed, artifact)
+	return o.removeErrors[artifact.key]
 }
 
 func newFakeS3WriteOperations() *fakeS3WriteOperations {
@@ -422,6 +451,47 @@ func TestIsTemporaryStageKeyMatchesOnlyReservedFormats(t *testing.T) {
 	}
 	if isTemporaryStageKey("tenant/.shoal-tmp-aaaaaaaaaa12345") {
 		t.Fatal("longer .shoal-tmp- key should remain visible")
+	}
+}
+
+func TestCleanupStaleArtifactsIsBoundedConditionalAndExplicit(t *testing.T) {
+	now := time.Now()
+	oldETag := `"old"`
+	recentETag := `"recent"`
+	removeErr := errors.New("delete failed")
+	old := "dir/" + expectedTemporaryStageKeyComponent("dir/target", strings.Repeat("0", 64))
+	failing := "dir/" + expectedTemporaryStageKeyComponent("dir/target", strings.Repeat("1", 64))
+	recent := "dir/" + expectedTemporaryStageKeyComponent("dir/target", strings.Repeat("2", 64))
+	lookalike := "dir/" + expectedTemporaryStageKeyComponent("dir/user", strings.Repeat("3", 64))
+	ops := &fakeS3ArtifactOperations{
+		artifacts: []s3Artifact{
+			{key: recent, lastModified: now, etag: &recentETag, owned: true},
+			{key: lookalike, lastModified: now.Add(-2 * time.Hour), etag: &oldETag},
+			{key: failing, lastModified: now.Add(-2 * time.Hour), etag: &oldETag, owned: true},
+			{key: old, lastModified: now.Add(-2 * time.Hour), etag: &oldETag, owned: true},
+		},
+		removeErrors: map[string]error{failing: removeErr},
+	}
+	backend := &Backend{artifactOps: ops}
+
+	result, err := backend.CleanupStaleArtifacts(context.Background(), "s3://bucket/dir", now.Add(-time.Hour))
+	if !errors.Is(err, removeErr) {
+		t.Fatalf("error = %v, want delete failure", err)
+	}
+	if result.Examined != 4 {
+		t.Fatalf("Examined = %d, want 4", result.Examined)
+	}
+	if len(result.Removed) != 1 || result.Removed[0] != "s3://bucket/"+old {
+		t.Fatalf("Removed = %v", result.Removed)
+	}
+	if len(ops.removed) != 2 || ops.removed[0].etag == nil || *ops.removed[0].etag != oldETag {
+		t.Fatalf("conditional removals = %#v", ops.removed)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := backend.CleanupStaleArtifacts(ctx, "s3://bucket/dir", now); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled cleanup error = %v, want context.Canceled", err)
 	}
 }
 

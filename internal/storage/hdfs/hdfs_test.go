@@ -745,6 +745,103 @@ func TestBackendListHidesGeneratedReplacementArtifacts(t *testing.T) {
 	}
 }
 
+func TestBackendCleanupStaleArtifacts(t *testing.T) {
+	client := newFakeClient()
+	now := time.Now()
+	oldTemp := "/tables/" + replacementTempPrefix + "00112233445566778899aabbccddeeff"
+	oldBackup := "/tables/" + replacementBackupPrefix + "ffeeddccbbaa99887766554433221100"
+	recent := "/tables/" + replacementTempPrefix + "11112222333344445555666677778888"
+	lookalike := "/tables/" + replacementTempPrefix + "not-a-token"
+	for _, name := range []string{oldTemp, oldBackup, recent, lookalike} {
+		client.files[name] = []byte("x")
+		client.modTimes[name] = now
+	}
+	client.modTimes[oldTemp] = now.Add(-2 * time.Hour)
+	client.modTimes[oldBackup] = now.Add(-2 * time.Hour)
+	backend, err := New("nn:8020", WithClient(client))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := backend.CleanupStaleArtifacts(context.Background(), "/tables", now.Add(-time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Examined != 3 {
+		t.Fatalf("Examined = %d, want 3", result.Examined)
+	}
+	want := []string{oldTemp}
+	if fmt.Sprint(result.Removed) != fmt.Sprint(want) {
+		t.Fatalf("Removed = %v, want %v", result.Removed, want)
+	}
+	for _, name := range []string{oldBackup, recent, lookalike} {
+		if _, ok := client.files[name]; !ok {
+			t.Fatalf("%s was removed", name)
+		}
+	}
+	if err := client.Remove(recent); err != nil {
+		t.Fatal(err)
+	}
+	result, err = backend.CleanupStaleArtifacts(context.Background(), "/tables", now.Add(-time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Removed) != 1 || result.Removed[0] != oldBackup {
+		t.Fatalf("second Removed = %v, want [%s]", result.Removed, oldBackup)
+	}
+}
+
+func TestBackendCleanupStaleArtifactsPreservesActiveAndReportsFailures(t *testing.T) {
+	client := newFakeClient()
+	backend, err := New("nn:8020", WithClient(client))
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := backend.Create(context.Background(), "/tables/target")
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := out.(*replaceWriter)
+	oldBackup := "/tables/" + replacementBackupPrefix + "00112233445566778899aabbccddeeff"
+	client.files[oldBackup] = []byte("old")
+	client.modTimes[oldBackup] = time.Now().Add(-2 * time.Hour)
+	removeErr := errors.New("janitor remove failed")
+	client.removeContextHook = func(_ context.Context, name string) error {
+		if name == oldBackup {
+			return removeErr
+		}
+		return nil
+	}
+
+	result, err := backend.CleanupStaleArtifacts(context.Background(), "/tables", time.Now().Add(-time.Hour))
+	if err != nil {
+		t.Fatalf("cleanup with active writer: %v", err)
+	}
+	if len(result.Removed) != 0 {
+		t.Fatalf("Removed = %v, want none", result.Removed)
+	}
+	if _, ok := client.files[w.temp]; !ok {
+		t.Fatal("active temporary file was removed")
+	}
+	if err := out.(storage.Aborter).Abort(); err != nil {
+		t.Fatal(err)
+	}
+	result, err = backend.CleanupStaleArtifacts(context.Background(), "/tables", time.Now().Add(-time.Hour))
+	if !errors.Is(err, removeErr) {
+		t.Fatalf("error = %v, want remove failure", err)
+	}
+	if len(result.Removed) != 0 {
+		t.Fatalf("Removed after failure = %v, want none", result.Removed)
+	}
+	client.removeContextHook = nil
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := backend.CleanupStaleArtifacts(ctx, "/tables", time.Now()); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled cleanup error = %v, want context.Canceled", err)
+	}
+}
+
 func TestBackendCreateRejectsReservedReplacementArtifactNames(t *testing.T) {
 	client := newFakeClient()
 	backend, err := New("nn:8020", WithClient(client))
@@ -2712,6 +2809,7 @@ func TestBackendCloseWinsRaceWithOperationClientConstruction(t *testing.T) {
 
 type fakeClient struct {
 	files                    map[string][]byte
+	modTimes                 map[string]time.Time
 	dirs                     map[string]bool
 	mkdir                    string
 	failWriterClose          bool
@@ -2758,8 +2856,9 @@ func newReleaseErrorBackend(t *testing.T, client *fakeClient) *Backend {
 
 func newFakeClient() *fakeClient {
 	return &fakeClient{
-		files: make(map[string][]byte),
-		dirs:  make(map[string]bool),
+		files:    make(map[string][]byte),
+		modTimes: make(map[string]time.Time),
+		dirs:     make(map[string]bool),
 	}
 }
 
@@ -2780,8 +2879,11 @@ func (c *fakeClient) Create(name string) (storage.Writer, error) {
 	if _, exists := c.files[name]; exists {
 		return nil, &os.PathError{Op: "create", Path: name, Err: fs.ErrExist}
 	}
+	c.files[name] = nil
+	c.modTimes[name] = time.Now()
 	writer := &fakeWriter{close: func(data []byte) {
 		c.files[name] = append([]byte(nil), data...)
+		c.modTimes[name] = time.Now()
 	}, client: c, failClose: c.failWriterClose, closeHook: c.writerCloseHook}
 	c.lastWriter = writer
 	c.lastCreatePath = name
@@ -2799,7 +2901,7 @@ func (c *fakeClient) ReadDir(dirname string) ([]os.FileInfo, error) {
 	prefix := dirname + "/"
 	for name, data := range c.files {
 		if path.Dir(name) == dirname {
-			out = append(out, fakeInfo{name: path.Base(name), size: int64(len(data))})
+			out = append(out, fakeInfo{name: path.Base(name), size: int64(len(data)), modTime: c.modTimes[name]})
 		}
 	}
 	for name := range c.dirs {
@@ -2826,6 +2928,7 @@ func (c *fakeClient) Remove(name string) error {
 		return &os.PathError{Op: "remove", Path: name, Err: fs.ErrNotExist}
 	}
 	delete(c.files, name)
+	delete(c.modTimes, name)
 	return nil
 }
 
@@ -2867,7 +2970,9 @@ func (c *fakeClient) Rename(oldpath, newpath string) error {
 		return &os.PathError{Op: "rename", Path: newpath, Err: fs.ErrExist}
 	}
 	c.files[newpath] = data
+	c.modTimes[newpath] = c.modTimes[oldpath]
 	delete(c.files, oldpath)
+	delete(c.modTimes, oldpath)
 	return nil
 }
 
@@ -3403,9 +3508,10 @@ type renameCall struct {
 }
 
 type fakeInfo struct {
-	name string
-	size int64
-	dir  bool
+	name    string
+	size    int64
+	dir     bool
+	modTime time.Time
 }
 
 func (i fakeInfo) Name() string { return i.name }
@@ -3416,7 +3522,7 @@ func (i fakeInfo) Mode() os.FileMode {
 	}
 	return 0o644
 }
-func (i fakeInfo) ModTime() time.Time { return time.Time{} }
+func (i fakeInfo) ModTime() time.Time { return i.modTime }
 func (i fakeInfo) IsDir() bool        { return i.dir }
 func (i fakeInfo) Sys() any           { return nil }
 

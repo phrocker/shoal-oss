@@ -49,6 +49,34 @@ type fakeAzureObject struct {
 	data  string
 }
 
+type fakeAzureArtifactOperations struct {
+	artifacts    []azureArtifact
+	removeErrors map[string]error
+	removed      []azureArtifact
+}
+
+func (o *fakeAzureArtifactOperations) list(ctx context.Context, _, _ string) ([]azureArtifact, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return append([]azureArtifact(nil), o.artifacts...), nil
+}
+
+func (o *fakeAzureArtifactOperations) inspect(ctx context.Context, _ string, artifact azureArtifact) (azureArtifact, error) {
+	if err := ctx.Err(); err != nil {
+		return artifact, err
+	}
+	return artifact, nil
+}
+
+func (o *fakeAzureArtifactOperations) remove(ctx context.Context, _ string, artifact azureArtifact) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	o.removed = append(o.removed, artifact)
+	return o.removeErrors[artifact.name]
+}
+
 type fakeAzureWriteOperations struct {
 	objects               map[string]fakeAzureObject
 	stageFailure          bool
@@ -672,6 +700,47 @@ func TestBackendCreateWithCustomServiceClientRejectsEmptySourceAuthorizationProv
 	}
 	if len(ops.objects) != 0 {
 		t.Fatalf("objects after failed Create = %d, want no staged blobs", len(ops.objects))
+	}
+}
+
+func TestCleanupStaleArtifactsIsBoundedETagConditionalAndExplicit(t *testing.T) {
+	now := time.Now()
+	oldETag := azcore.ETag(`"old"`)
+	recentETag := azcore.ETag(`"recent"`)
+	removeErr := errors.New("delete failed")
+	old := "dir/" + expectedTemporaryStageComponent("dir/target", strings.Repeat("0", 64))
+	failing := "dir/" + expectedTemporaryStageComponent("dir/target", strings.Repeat("1", 64))
+	recent := "dir/" + expectedTemporaryStageComponent("dir/target", strings.Repeat("2", 64))
+	lookalike := "dir/" + expectedTemporaryStageComponent("dir/user", strings.Repeat("3", 64))
+	ops := &fakeAzureArtifactOperations{
+		artifacts: []azureArtifact{
+			{name: recent, lastModified: now, etag: &recentETag, owned: true},
+			{name: lookalike, lastModified: now.Add(-2 * time.Hour), etag: &oldETag},
+			{name: failing, lastModified: now.Add(-2 * time.Hour), etag: &oldETag, owned: true},
+			{name: old, lastModified: now.Add(-2 * time.Hour), etag: &oldETag, owned: true},
+		},
+		removeErrors: map[string]error{failing: removeErr},
+	}
+	backend := &Backend{artifactOps: ops}
+
+	result, err := backend.CleanupStaleArtifacts(context.Background(), "az://container/dir", now.Add(-time.Hour))
+	if !errors.Is(err, removeErr) {
+		t.Fatalf("error = %v, want delete failure", err)
+	}
+	if result.Examined != 4 {
+		t.Fatalf("Examined = %d, want 4", result.Examined)
+	}
+	if len(result.Removed) != 1 || result.Removed[0] != "az://container/"+old {
+		t.Fatalf("Removed = %v", result.Removed)
+	}
+	if len(ops.removed) != 2 || ops.removed[0].etag == nil || !ops.removed[0].etag.Equals(oldETag) {
+		t.Fatalf("ETag-conditional removals = %#v", ops.removed)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := backend.CleanupStaleArtifacts(ctx, "az://container/dir", now); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled cleanup error = %v, want context.Canceled", err)
 	}
 }
 

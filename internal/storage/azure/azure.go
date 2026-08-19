@@ -52,6 +52,7 @@ import (
 	"log/slog"
 	"net/url"
 	"os"
+	"slices"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -77,8 +78,22 @@ import (
 type Backend struct {
 	svc                    *service.Client
 	ops                    azureWriteOperations
+	artifactOps            azureArtifactOperations
 	sourceProvider         azureCopySourceProvider
 	validateSourceOnCreate bool
+}
+
+type azureArtifact struct {
+	name         string
+	lastModified time.Time
+	etag         *azcore.ETag
+	owned        bool
+}
+
+type azureArtifactOperations interface {
+	list(context.Context, string, string) ([]azureArtifact, error)
+	inspect(context.Context, string, azureArtifact) (azureArtifact, error)
+	remove(context.Context, string, azureArtifact) error
 }
 
 // Option customizes Backend construction.
@@ -184,6 +199,7 @@ func New(_ context.Context, opts ...Option) (*Backend, error) {
 		return &Backend{
 			svc:                    c.svc,
 			ops:                    sdkAzureWriteOperations{svc: c.svc},
+			artifactOps:            sdkAzureArtifactOperations{svc: c.svc},
 			sourceProvider:         configuredOrAutomaticSourceProvider(base, sourceProviderFromServiceClient(c.svc), c.sourceAuthorizationProvider, true),
 			validateSourceOnCreate: true,
 		}, nil
@@ -199,8 +215,9 @@ func New(_ context.Context, opts ...Option) (*Backend, error) {
 			return nil, fmt.Errorf("azure: NewClientFromConnectionString: %w", err)
 		}
 		return &Backend{
-			svc: svc,
-			ops: sdkAzureWriteOperations{svc: svc},
+			svc:         svc,
+			ops:         sdkAzureWriteOperations{svc: svc},
+			artifactOps: sdkAzureArtifactOperations{svc: svc},
 			sourceProvider: configuredOrAutomaticSourceProvider(
 				rawAzureCopySourceProvider{svc: svc},
 				sourceProviderFromConnectionString(svc, connString),
@@ -230,8 +247,9 @@ func New(_ context.Context, opts ...Option) (*Backend, error) {
 		return nil, fmt.Errorf("azure: NewClient: %w", err)
 	}
 	return &Backend{
-		svc: svc,
-		ops: sdkAzureWriteOperations{svc: svc},
+		svc:         svc,
+		ops:         sdkAzureWriteOperations{svc: svc},
+		artifactOps: sdkAzureArtifactOperations{svc: svc},
 		sourceProvider: configuredOrAutomaticSourceProvider(
 			rawAzureCopySourceProvider{svc: svc},
 			tokenAzureCopySourceProvider{
@@ -352,6 +370,63 @@ func (b *Backend) List(ctx context.Context, prefix string) ([]string, error) {
 		}
 	}
 	return out, nil
+}
+
+// CleanupStaleArtifacts removes reserved staging blobs under prefix whose
+// LastModified time is strictly before cutoff. Deletes are ETag-conditional so
+// a blob replaced after enumeration is never removed.
+func (b *Backend) CleanupStaleArtifacts(ctx context.Context, prefix string, cutoff time.Time) (shstorage.ArtifactCleanupResult, error) {
+	var result shstorage.ArtifactCleanupResult
+	if cutoff.IsZero() {
+		return result, fmt.Errorf("azure: stale artifact cutoff must be non-zero")
+	}
+	cont, blobPrefix, err := ParsePath(prefix)
+	if err != nil {
+		return result, err
+	}
+	blobPrefix = strings.TrimRight(blobPrefix, "/\\") + "/"
+	artifacts, err := b.artifactOps.list(ctx, cont, blobPrefix)
+	if err != nil {
+		return result, fmt.Errorf("azure: list stale artifacts az://%s/%s: %w", cont, blobPrefix, err)
+	}
+	slices.SortFunc(artifacts, func(a, b azureArtifact) int { return strings.Compare(a.name, b.name) })
+	var cleanupErr error
+	for _, artifact := range artifacts {
+		if err := contextOrBackground(ctx).Err(); err != nil {
+			return result, errors.Join(cleanupErr, err)
+		}
+		if !isTemporaryStageName(artifact.name) {
+			continue
+		}
+		result.Examined++
+		artifact, err = b.artifactOps.inspect(ctx, cont, artifact)
+		if err != nil {
+			if isBlobNotFound(err) {
+				continue
+			}
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("azure: inspect stale artifact az://%s/%s: %w", cont, artifact.name, err))
+			continue
+		}
+		if !artifact.owned {
+			continue
+		}
+		if artifact.lastModified.IsZero() || !artifact.lastModified.Before(cutoff) {
+			continue
+		}
+		if artifact.etag == nil {
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("azure: stale artifact az://%s/%s has no ETag", cont, artifact.name))
+			continue
+		}
+		if err := b.artifactOps.remove(ctx, cont, artifact); err != nil {
+			if isBlobNotFound(err) {
+				continue
+			}
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("azure: remove stale artifact az://%s/%s: %w", cont, artifact.name, err))
+			continue
+		}
+		result.Removed = append(result.Removed, "az://"+cont+"/"+artifact.name)
+	}
+	return result, cleanupErr
 }
 
 // ParsePath splits a path string into (container, blob). Exposed so callers
@@ -707,6 +782,57 @@ type azureWriteOperations interface {
 
 type sdkAzureWriteOperations struct {
 	svc *service.Client
+}
+
+type sdkAzureArtifactOperations struct {
+	svc *service.Client
+}
+
+func (o sdkAzureArtifactOperations) list(ctx context.Context, containerName, prefix string) ([]azureArtifact, error) {
+	pager := o.svc.NewContainerClient(containerName).NewListBlobsFlatPager(&container.ListBlobsFlatOptions{Prefix: &prefix})
+	var artifacts []azureArtifact
+	for pager.More() {
+		page, err := pager.NextPage(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if page.Segment == nil {
+			continue
+		}
+		for _, item := range page.Segment.BlobItems {
+			if item == nil || item.Name == nil || item.Properties == nil {
+				continue
+			}
+			artifact := azureArtifact{name: *item.Name, etag: item.Properties.ETag}
+			if item.Properties.LastModified != nil {
+				artifact.lastModified = *item.Properties.LastModified
+			}
+			artifacts = append(artifacts, artifact)
+		}
+	}
+	return artifacts, nil
+}
+
+func (o sdkAzureArtifactOperations) remove(ctx context.Context, containerName string, artifact azureArtifact) error {
+	_, err := o.svc.NewContainerClient(containerName).NewBlobClient(artifact.name).Delete(ctx, &blob.DeleteOptions{
+		AccessConditions: &blob.AccessConditions{
+			ModifiedAccessConditions: &blob.ModifiedAccessConditions{IfMatch: artifact.etag},
+		},
+	})
+	return err
+}
+
+func (o sdkAzureArtifactOperations) inspect(ctx context.Context, containerName string, artifact azureArtifact) (azureArtifact, error) {
+	out, err := o.svc.NewContainerClient(containerName).NewBlobClient(artifact.name).GetProperties(ctx, nil)
+	if err != nil {
+		return artifact, err
+	}
+	artifact.etag = out.ETag
+	if out.LastModified != nil {
+		artifact.lastModified = *out.LastModified
+	}
+	artifact.owned = metadataValue(out.Metadata, "shoal-write-id") != ""
+	return artifact, nil
 }
 
 func (o sdkAzureWriteOperations) head(

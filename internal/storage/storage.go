@@ -27,6 +27,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"time"
 )
 
 const transferChunkSize = 64 * 1024
@@ -95,6 +96,27 @@ type WritableBackend interface {
 type Lister interface {
 	Backend
 	List(ctx context.Context, prefix string) ([]string, error)
+}
+
+// ArtifactCleanupResult reports completed internal-artifact cleanup. Removed
+// contains backend-qualified paths in deterministic discovery order. If cleanup
+// returns an error, Removed still reports every deletion that completed before
+// or alongside the partial failure.
+type ArtifactCleanupResult struct {
+	Examined int
+	Removed  []string
+}
+
+// ArtifactCleaner is an optional backend lifecycle capability for explicitly
+// removing crash-leftover staging and replacement artifacts. Cleanup only
+// considers names in the backend's reserved internal namespace whose backend
+// modification time is strictly before cutoff. Callers must choose a cutoff
+// older than their maximum write duration. Implementations preserve recent
+// artifacts, never return artifacts as user data, honor ctx, and report partial
+// deletion failures.
+type ArtifactCleaner interface {
+	Backend
+	CleanupStaleArtifacts(ctx context.Context, prefix string, cutoff time.Time) (ArtifactCleanupResult, error)
 }
 
 // Remover is a Backend that can delete an object by path. Used to drop a

@@ -15,6 +15,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	cloudstorage "cloud.google.com/go/storage"
 	shstorage "github.com/phrocker/shoal/internal/storage"
@@ -517,6 +518,45 @@ func TestIsTemporaryObjectNameMatchesOnlyReservedFormats(t *testing.T) {
 	}
 	if isTemporaryObjectName("tenant/object.rf" + legacyTempObjectPrefix + "visible") {
 		t.Fatal("non-generated legacy-looking object should not be hidden")
+	}
+}
+
+func TestCleanupStaleArtifactsIsBoundedGenerationPinnedAndExplicit(t *testing.T) {
+	now := time.Now()
+	removeErr := errors.New("delete failed")
+	old := "dir/" + expectedTemporaryObjectComponent("dir/target", strings.Repeat("0", 64))
+	failing := "dir/" + expectedTemporaryObjectComponent("dir/target", strings.Repeat("1", 64))
+	recent := "dir/" + expectedTemporaryObjectComponent("dir/target", strings.Repeat("2", 64))
+	lookalike := "dir/" + expectedTemporaryObjectComponent("dir/user", strings.Repeat("3", 64))
+	ops := &fakeGCSArtifactOperations{
+		artifacts: []gcsArtifact{
+			{name: recent, updated: now, generation: 3, owned: true},
+			{name: lookalike, updated: now.Add(-2 * time.Hour), generation: 4},
+			{name: failing, updated: now.Add(-2 * time.Hour), generation: 5, owned: true},
+			{name: old, updated: now.Add(-2 * time.Hour), generation: 6, owned: true},
+		},
+		removeErrors: map[string]error{failing: removeErr},
+	}
+	backend := &Backend{artifactOps: ops}
+
+	result, err := backend.CleanupStaleArtifacts(context.Background(), "gs://bucket/dir", now.Add(-time.Hour))
+	if !errors.Is(err, removeErr) {
+		t.Fatalf("error = %v, want delete failure", err)
+	}
+	if result.Examined != 4 {
+		t.Fatalf("Examined = %d, want 4", result.Examined)
+	}
+	if len(result.Removed) != 1 || result.Removed[0] != "gs://bucket/"+old {
+		t.Fatalf("Removed = %v", result.Removed)
+	}
+	if len(ops.removed) != 2 || ops.removed[0].generation == 0 {
+		t.Fatalf("generation-pinned removals = %#v", ops.removed)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := backend.CleanupStaleArtifacts(ctx, "gs://bucket/dir", now); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled cleanup error = %v, want context.Canceled", err)
 	}
 }
 
@@ -1560,6 +1600,27 @@ func (w cancelAfterWriteWriter) Write(p []byte) (int, error) {
 		w.cancel()
 	}
 	return n, err
+}
+
+type fakeGCSArtifactOperations struct {
+	artifacts    []gcsArtifact
+	removeErrors map[string]error
+	removed      []gcsArtifact
+}
+
+func (o *fakeGCSArtifactOperations) list(ctx context.Context, _, _ string) ([]gcsArtifact, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return append([]gcsArtifact(nil), o.artifacts...), nil
+}
+
+func (o *fakeGCSArtifactOperations) remove(ctx context.Context, _ string, artifact gcsArtifact) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	o.removed = append(o.removed, artifact)
+	return o.removeErrors[artifact.name]
 }
 
 type fakeBucket struct {

@@ -19,6 +19,7 @@ import (
 	"os"
 	osuser "os/user"
 	"path"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -401,6 +402,75 @@ func (b *Backend) List(ctx context.Context, prefix string) ([]string, error) {
 		out = append(out, child)
 	}
 	return out, nil
+}
+
+// CleanupStaleArtifacts removes reserved temporary and backup files directly
+// under prefix whose HDFS modification time is strictly before cutoff.
+func (b *Backend) CleanupStaleArtifacts(ctx context.Context, prefix string, cutoff time.Time) (storage.ArtifactCleanupResult, error) {
+	var result storage.ArtifactCleanupResult
+	if cutoff.IsZero() {
+		return result, fmt.Errorf("hdfs: stale artifact cutoff must be non-zero")
+	}
+	if err := contextOrBackground(ctx).Err(); err != nil {
+		return result, err
+	}
+	lease, err := b.newOperation(ctx)
+	if err != nil {
+		return result, err
+	}
+	defer lease.release()
+	resolved, qualifier, err := b.resolve(prefix)
+	if err != nil {
+		return result, err
+	}
+	entries, err := lease.client.ReadDir(resolved)
+	if err != nil {
+		if isNotFound(err) {
+			return result, nil
+		}
+		return result, fmt.Errorf("hdfs: list stale artifacts %s: %w", prefix, err)
+	}
+	slices.SortFunc(entries, func(a, b os.FileInfo) int {
+		return strings.Compare(a.Name(), b.Name())
+	})
+	hasRecentTemp := false
+	for _, entry := range entries {
+		if !entry.IsDir() &&
+			isGeneratedReplacementName(entry.Name(), replacementTempPrefix) &&
+			!entry.ModTime().Before(cutoff) {
+			hasRecentTemp = true
+			break
+		}
+	}
+	var cleanupErr error
+	for _, entry := range entries {
+		if err := contextOrBackground(ctx).Err(); err != nil {
+			return result, errors.Join(cleanupErr, err)
+		}
+		if entry.IsDir() || !isReplacementArtifactName(entry.Name()) {
+			continue
+		}
+		result.Examined++
+		if !entry.ModTime().Before(cutoff) {
+			continue
+		}
+		if hasRecentTemp && isGeneratedReplacementName(entry.Name(), replacementBackupPrefix) {
+			continue
+		}
+		artifact := path.Join(resolved, entry.Name())
+		if err := removeWithContext(ctx, lease.client, artifact); err != nil {
+			if isNotFound(err) {
+				continue
+			}
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("hdfs: remove stale artifact %s: %w", artifact, err))
+			continue
+		}
+		if qualifier != "" {
+			artifact = qualifier + ensureLeadingSlash(artifact)
+		}
+		result.Removed = append(result.Removed, artifact)
+	}
+	return result, cleanupErr
 }
 
 // Remove deletes path. A missing path is not an error.

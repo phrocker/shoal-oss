@@ -47,6 +47,7 @@ import (
 	"io"
 	"log/slog"
 	"net/url"
+	"slices"
 	"strings"
 	"time"
 
@@ -62,8 +63,22 @@ import (
 // Backend opens S3 objects via a shared *s3sdk.Client. Safe for
 // concurrent Open and concurrent ReadAt across many Files.
 type Backend struct {
-	client *s3sdk.Client
-	ops    s3WriteOperations
+	client      *s3sdk.Client
+	ops         s3WriteOperations
+	artifactOps s3ArtifactOperations
+}
+
+type s3Artifact struct {
+	key          string
+	lastModified time.Time
+	etag         *string
+	owned        bool
+}
+
+type s3ArtifactOperations interface {
+	list(context.Context, string, string) ([]s3Artifact, error)
+	inspect(context.Context, string, s3Artifact) (s3Artifact, error)
+	remove(context.Context, string, s3Artifact) error
 }
 
 // Option customizes Backend construction. Use WithClient if you've already
@@ -104,7 +119,8 @@ func New(ctx context.Context, opts ...Option) (*Backend, error) {
 		}
 		c.client = s3sdk.NewFromConfig(awsCfg, c.clientOpts...)
 	}
-	return &Backend{client: c.client, ops: sdkS3WriteOperations{client: c.client}}, nil
+	sdkOps := sdkS3WriteOperations{client: c.client}
+	return &Backend{client: c.client, ops: sdkOps, artifactOps: sdkS3ArtifactOperations{client: c.client}}, nil
 }
 
 // Close is a no-op: the v2 S3 client holds no persistent connection.
@@ -215,6 +231,63 @@ func (b *Backend) List(ctx context.Context, prefix string) ([]string, error) {
 		}
 	}
 	return out, nil
+}
+
+// CleanupStaleArtifacts removes reserved staging objects under prefix whose
+// LastModified time is strictly before cutoff. Deletes are ETag-conditional so
+// an object replaced after enumeration is never removed.
+func (b *Backend) CleanupStaleArtifacts(ctx context.Context, prefix string, cutoff time.Time) (shstorage.ArtifactCleanupResult, error) {
+	var result shstorage.ArtifactCleanupResult
+	if cutoff.IsZero() {
+		return result, fmt.Errorf("s3: stale artifact cutoff must be non-zero")
+	}
+	bucket, objectPrefix, err := ParsePath(prefix)
+	if err != nil {
+		return result, err
+	}
+	objectPrefix = strings.TrimRight(objectPrefix, "/\\") + "/"
+	artifacts, err := b.artifactOps.list(ctx, bucket, objectPrefix)
+	if err != nil {
+		return result, fmt.Errorf("s3: list stale artifacts s3://%s/%s: %w", bucket, objectPrefix, err)
+	}
+	slices.SortFunc(artifacts, func(a, b s3Artifact) int { return strings.Compare(a.key, b.key) })
+	var cleanupErr error
+	for _, artifact := range artifacts {
+		if err := contextOrBackground(ctx).Err(); err != nil {
+			return result, errors.Join(cleanupErr, err)
+		}
+		if !isTemporaryStageKey(artifact.key) {
+			continue
+		}
+		result.Examined++
+		artifact, err = b.artifactOps.inspect(ctx, bucket, artifact)
+		if err != nil {
+			if isNotFound(err) {
+				continue
+			}
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("s3: inspect stale artifact s3://%s/%s: %w", bucket, artifact.key, err))
+			continue
+		}
+		if !artifact.owned {
+			continue
+		}
+		if artifact.lastModified.IsZero() || !artifact.lastModified.Before(cutoff) {
+			continue
+		}
+		if artifact.etag == nil {
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("s3: stale artifact s3://%s/%s has no ETag", bucket, artifact.key))
+			continue
+		}
+		if err := b.artifactOps.remove(ctx, bucket, artifact); err != nil {
+			if isNotFound(err) {
+				continue
+			}
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("s3: remove stale artifact s3://%s/%s: %w", bucket, artifact.key, err))
+			continue
+		}
+		result.Removed = append(result.Removed, "s3://"+bucket+"/"+artifact.key)
+	}
+	return result, cleanupErr
 }
 
 // ParsePath splits a path string into (bucket, key). Exposed so callers
@@ -412,6 +485,58 @@ type s3WriteOperations interface {
 
 type sdkS3WriteOperations struct {
 	client *s3sdk.Client
+}
+
+type sdkS3ArtifactOperations struct {
+	client *s3sdk.Client
+}
+
+func (o sdkS3ArtifactOperations) list(ctx context.Context, bucket, prefix string) ([]s3Artifact, error) {
+	var artifacts []s3Artifact
+	paginator := s3sdk.NewListObjectsV2Paginator(o.client, &s3sdk.ListObjectsV2Input{
+		Bucket: aws.String(bucket),
+		Prefix: aws.String(prefix),
+	})
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return nil, err
+		}
+		for _, object := range page.Contents {
+			if object.Key == nil {
+				continue
+			}
+			artifacts = append(artifacts, s3Artifact{
+				key:          *object.Key,
+				lastModified: aws.ToTime(object.LastModified),
+				etag:         object.ETag,
+			})
+		}
+	}
+	return artifacts, nil
+}
+
+func (o sdkS3ArtifactOperations) remove(ctx context.Context, bucket string, artifact s3Artifact) error {
+	_, err := o.client.DeleteObject(ctx, &s3sdk.DeleteObjectInput{
+		Bucket:  aws.String(bucket),
+		Key:     aws.String(artifact.key),
+		IfMatch: artifact.etag,
+	})
+	return err
+}
+
+func (o sdkS3ArtifactOperations) inspect(ctx context.Context, bucket string, artifact s3Artifact) (s3Artifact, error) {
+	out, err := o.client.HeadObject(ctx, &s3sdk.HeadObjectInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String(artifact.key),
+	})
+	if err != nil {
+		return artifact, err
+	}
+	artifact.etag = out.ETag
+	artifact.lastModified = aws.ToTime(out.LastModified)
+	artifact.owned = out.Metadata["shoal-write-id"] != ""
+	return artifact, nil
 }
 
 func (o sdkS3WriteOperations) head(ctx context.Context, bucket, key string) (s3ObjectState, error) {

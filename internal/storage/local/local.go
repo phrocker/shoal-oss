@@ -13,7 +13,9 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
+	"time"
 
 	"github.com/phrocker/shoal/internal/storage"
 )
@@ -110,6 +112,95 @@ func (b *Backend) List(_ context.Context, prefix string) ([]string, error) {
 		out = append(out, filepath.Join(prefix, e.Name()))
 	}
 	return out, nil
+}
+
+// CleanupStaleArtifacts removes reserved temporary and backup files directly
+// under prefix whose modification time is strictly before cutoff.
+func (b *Backend) CleanupStaleArtifacts(ctx context.Context, prefix string, cutoff time.Time) (storage.ArtifactCleanupResult, error) {
+	return cleanupStaleArtifacts(ctx, prefix, cutoff, os.ReadDir, os.Remove)
+}
+
+func cleanupStaleArtifacts(
+	ctx context.Context,
+	prefix string,
+	cutoff time.Time,
+	readDir func(string) ([]os.DirEntry, error),
+	remove func(string) error,
+) (storage.ArtifactCleanupResult, error) {
+	var result storage.ArtifactCleanupResult
+	if cutoff.IsZero() {
+		return result, fmt.Errorf("local: stale artifact cutoff must be non-zero")
+	}
+	if err := contextOrBackground(ctx).Err(); err != nil {
+		return result, err
+	}
+	entries, err := readDir(prefix)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return result, nil
+		}
+		return result, fmt.Errorf("local: readdir stale artifacts %s: %w", prefix, err)
+	}
+	slices.SortFunc(entries, func(a, b os.DirEntry) int {
+		return strings.Compare(a.Name(), b.Name())
+	})
+	type candidate struct {
+		entry os.DirEntry
+		info  os.FileInfo
+	}
+	var candidates []candidate
+	var cleanupErr error
+	for _, entry := range entries {
+		if err := contextOrBackground(ctx).Err(); err != nil {
+			return result, errors.Join(cleanupErr, err)
+		}
+		if entry.IsDir() || !isReplacementArtifactName(entry.Name()) {
+			continue
+		}
+		result.Examined++
+		info, err := entry.Info()
+		if err != nil {
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("local: stat stale artifact %s: %w", filepath.Join(prefix, entry.Name()), err))
+			continue
+		}
+		candidates = append(candidates, candidate{entry: entry, info: info})
+	}
+	hasRecentTemp := false
+	for _, candidate := range candidates {
+		if isGeneratedReplacementName(candidate.entry.Name(), replacementTempPrefix) &&
+			!candidate.info.ModTime().Before(cutoff) {
+			hasRecentTemp = true
+			break
+		}
+	}
+	for _, candidate := range candidates {
+		if err := contextOrBackground(ctx).Err(); err != nil {
+			return result, errors.Join(cleanupErr, err)
+		}
+		if !candidate.info.ModTime().Before(cutoff) {
+			continue
+		}
+		if hasRecentTemp && isGeneratedReplacementName(candidate.entry.Name(), replacementBackupPrefix) {
+			continue
+		}
+		artifact := filepath.Join(prefix, candidate.entry.Name())
+		if err := remove(artifact); err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				continue
+			}
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("local: remove stale artifact %s: %w", artifact, err))
+			continue
+		}
+		result.Removed = append(result.Removed, artifact)
+	}
+	return result, cleanupErr
+}
+
+func contextOrBackground(ctx context.Context) context.Context {
+	if ctx == nil {
+		return context.Background()
+	}
+	return ctx
 }
 
 type namedCloser interface {

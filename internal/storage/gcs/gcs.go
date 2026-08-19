@@ -28,6 +28,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 
@@ -47,6 +48,19 @@ import (
 type Backend struct {
 	client        *storage.Client
 	bucketFactory func(string) bucketHandle
+	artifactOps   gcsArtifactOperations
+}
+
+type gcsArtifact struct {
+	name       string
+	updated    time.Time
+	generation int64
+	owned      bool
+}
+
+type gcsArtifactOperations interface {
+	list(context.Context, string, string) ([]gcsArtifact, error)
+	remove(context.Context, string, gcsArtifact) error
 }
 
 // Option customizes Backend construction. Use WithClient if you've
@@ -92,6 +106,7 @@ func New(ctx context.Context, opts ...Option) (*Backend, error) {
 		bucketFactory: func(name string) bucketHandle {
 			return storageBucketHandle{bucket: cfg.client.Bucket(name)}
 		},
+		artifactOps: sdkGCSArtifactOperations{client: cfg.client},
 	}, nil
 }
 
@@ -204,6 +219,55 @@ func (b *Backend) List(ctx context.Context, prefix string) ([]string, error) {
 		out = append(out, "gs://"+bucket+"/"+attrs.Name)
 	}
 	return out, nil
+}
+
+// CleanupStaleArtifacts removes reserved staging objects under prefix whose
+// Updated time is strictly before cutoff. Deletes are generation-pinned so an
+// object replaced after enumeration is never removed.
+func (b *Backend) CleanupStaleArtifacts(ctx context.Context, prefix string, cutoff time.Time) (shstorage.ArtifactCleanupResult, error) {
+	var result shstorage.ArtifactCleanupResult
+	if cutoff.IsZero() {
+		return result, fmt.Errorf("gcs: stale artifact cutoff must be non-zero")
+	}
+	bucket, objectPrefix, err := ParsePath(prefix)
+	if err != nil {
+		return result, err
+	}
+	objectPrefix = strings.TrimRight(objectPrefix, "/\\") + "/"
+	artifacts, err := b.artifactOps.list(ctx, bucket, objectPrefix)
+	if err != nil {
+		return result, fmt.Errorf("gcs: list stale artifacts gs://%s/%s: %w", bucket, objectPrefix, err)
+	}
+	slices.SortFunc(artifacts, func(a, b gcsArtifact) int { return strings.Compare(a.name, b.name) })
+	var cleanupErr error
+	for _, artifact := range artifacts {
+		if err := contextOrBackground(ctx).Err(); err != nil {
+			return result, errors.Join(cleanupErr, err)
+		}
+		if !isTemporaryObjectName(artifact.name) {
+			continue
+		}
+		result.Examined++
+		if !artifact.owned {
+			continue
+		}
+		if artifact.updated.IsZero() || !artifact.updated.Before(cutoff) {
+			continue
+		}
+		if artifact.generation == 0 {
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("gcs: stale artifact gs://%s/%s has no generation", bucket, artifact.name))
+			continue
+		}
+		if err := b.artifactOps.remove(ctx, bucket, artifact); err != nil {
+			if errors.Is(err, storage.ErrObjectNotExist) {
+				continue
+			}
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("gcs: remove stale artifact gs://%s/%s: %w", bucket, artifact.name, err))
+			continue
+		}
+		result.Removed = append(result.Removed, "gs://"+bucket+"/"+artifact.name)
+	}
+	return result, cleanupErr
 }
 
 // ParsePath splits a path string into (bucket, object). Exposed so
@@ -591,6 +655,37 @@ func (b storageBucketHandle) Object(name string) objectHandle {
 
 type storageObjectHandle struct {
 	object *storage.ObjectHandle
+}
+
+type sdkGCSArtifactOperations struct {
+	client *storage.Client
+}
+
+func (o sdkGCSArtifactOperations) list(ctx context.Context, bucket, prefix string) ([]gcsArtifact, error) {
+	it := o.client.Bucket(bucket).Objects(ctx, &storage.Query{Prefix: prefix})
+	var artifacts []gcsArtifact
+	for {
+		attrs, err := it.Next()
+		if errors.Is(err, iterator.Done) {
+			return artifacts, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		if attrs == nil || attrs.Name == "" {
+			continue
+		}
+		artifacts = append(artifacts, gcsArtifact{
+			name:       attrs.Name,
+			updated:    attrs.Updated,
+			generation: attrs.Generation,
+			owned:      attrs.Metadata["shoal-write-id"] != "",
+		})
+	}
+}
+
+func (o sdkGCSArtifactOperations) remove(ctx context.Context, bucket string, artifact gcsArtifact) error {
+	return o.client.Bucket(bucket).Object(artifact.name).Generation(artifact.generation).Delete(ctx)
 }
 
 func (o storageObjectHandle) NewWriter(ctx context.Context) objectWriter {
