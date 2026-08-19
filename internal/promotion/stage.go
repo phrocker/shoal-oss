@@ -2,7 +2,11 @@ package promotion
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
 	"fmt"
+	"io"
 	"net/url"
 	"os"
 	"path"
@@ -71,7 +75,51 @@ var (
 // src and matches its recorded size/SHA256) before anything is copied, so a
 // truncated, corrupted, or stale export manifest fails fast here rather
 // than silently staging incomplete or mismatched data for Accumulo to bulk
-// import.
+// import. That whole-manifest verification happens once, before the copy
+// loop starts, and so cannot by itself catch a source file that changes
+// *during* the loop -- for example a later file mutated while an earlier
+// one is still being copied, or the same file mutated in the brief window
+// between this check reading it and storage.Copy separately opening it
+// moments later. Closing that window would require re-verifying every
+// file again immediately before its own copy, which is exactly as
+// expensive as just verifying after copying and additionally cannot
+// detect corruption introduced by the copy path itself (see the next
+// paragraph), so StageBulkDir instead verifies each file's *destination*
+// object right after it is written.
+//
+// Concretely: immediately after each file's storage.Copy returns,
+// StageBulkDir re-opens and re-hashes the object it just wrote at dst and
+// compares that against the manifest's recorded size/SHA256 for that
+// file, before continuing to the next file or writing loadmap.json. This
+// is deliberately a check of the object actually sitting at dst, not a
+// second read of src: it catches a source mutated after the up-front
+// VerifyRFileExport pass but before (or during) its own copy, and it
+// additionally catches corruption introduced by the copy/backend path
+// itself (storage.Copy's own doc comment notes that some WritableBackend
+// implementations buffer and upload on Close, so a copy can still fail or
+// corrupt data after every prior Write appeared to succeed). Like the
+// cancellation case below, a mismatch here is reported and staging stops,
+// but the offending file's already-written (incorrect) bytes are not
+// rolled back -- StageBulkDir is not atomic across a multi-file manifest
+// in either failure mode, and loadmap.json is only ever written after
+// every file has both copied and re-verified successfully, so a caller
+// that only trusts a bulkDir with a present, successfully-written
+// loadmap.json is never exposed to a manifest describing unverified
+// bytes.
+//
+// This means a full Promote call over a multi-tablet manifest reads and
+// hashes every RFile up to three times: once in stagingPreflight (before
+// AddTableSplits), once more in StageBulkDir's own preflight above (after
+// AddTableSplits/ListTableSplits, before any dst write), and once again
+// per file immediately after it is copied (reading dst, not src). Each
+// pass closes a different, non-overlapping window and none of the three
+// is redundant with the others: removing either upfront pass would allow
+// an already-corrupt manifest to still cause partial writes to dst
+// before being caught; removing the post-copy pass would leave the
+// per-file copy-time window this paragraph describes wide open. The
+// repeated hashing is a deliberate correctness-over-efficiency tradeoff
+// for a manager-authoritative promotion path, consistent with the same
+// tradeoff stagingPreflight's own doc comment already describes.
 //
 // Every write target is also preflighted before any copy starts: every
 // flattened RFile destination plus loadmap.json is compared against
@@ -151,11 +199,72 @@ func StageBulkDir(
 		if _, err := storage.Copy(ctx, src, rf.DestinationPath, dst, dstPath); err != nil {
 			return nil, fmt.Errorf("promotion: stage %s: %w", rf.DestinationPath, err)
 		}
+		// Re-verify what actually landed at dst, not what src reported
+		// before the copy: this closes the copy-time window described
+		// in StageBulkDir's own doc comment above, where a source file
+		// (or a later file, while an earlier one is still copying) can
+		// change after the whole-manifest VerifyRFileExport preflight
+		// above but before (or during) its own storage.Copy, and also
+		// catches corruption introduced by the copy/backend path
+		// itself. A mismatch fails closed here, before any further file
+		// is copied and before loadmap.json is written, but -- like the
+		// cancellation case -- does not roll back this file's own
+		// already-written (incorrect) bytes.
+		if err := verifyStagedRFile(ctx, dst, dstPath, rf.Size, rf.SHA256); err != nil {
+			return nil, fmt.Errorf("promotion: stage %s: verify staged copy: %w", rf.DestinationPath, err)
+		}
 	}
 	if err := WriteLoadMapping(ctx, dst, bulkDir, mapping); err != nil {
 		return nil, err
 	}
 	return mapping, nil
+}
+
+// verifyStagedRFile re-opens and re-hashes the object just written at
+// dstPath on dst and compares it against the manifest's recorded size and
+// SHA256 for that RFile. It intentionally checks the destination object
+// that will actually be bulk-imported, not a second read of the source,
+// so it also catches corruption introduced by the copy/backend path
+// itself (for example a WritableBackend that buffers and uploads on
+// Close, per storage.Copy's own doc comment, failing or corrupting data
+// after every prior Write appeared to succeed). The read-and-hash loop
+// mirrors engine's own unexported hashObject helper; it is duplicated
+// here in small form rather than exported from engine or added to
+// storage's public surface, since this is its only call site.
+func verifyStagedRFile(ctx context.Context, dst storage.Backend, dstPath string, wantSize int64, wantSHA256 string) error {
+	f, err := dst.Open(ctx, dstPath)
+	if err != nil {
+		return fmt.Errorf("open staged copy %s: %w", dstPath, err)
+	}
+	defer f.Close()
+	h := sha256.New()
+	buf := make([]byte, 256*1024)
+	var off int64
+	for off < f.Size() {
+		want := int64(len(buf))
+		if off+want > f.Size() {
+			want = f.Size() - off
+		}
+		n, rerr := f.ReadAt(buf[:want], off)
+		if n > 0 {
+			_, _ = h.Write(buf[:n])
+			off += int64(n)
+		}
+		if rerr != nil {
+			if errors.Is(rerr, io.EOF) {
+				break
+			}
+			return fmt.Errorf("read staged copy %s: %w", dstPath, rerr)
+		}
+	}
+	if off != wantSize {
+		return fmt.Errorf("staged copy %s: size %d, want %d (source may have changed after the pre-copy manifest verification, or the copy path may have corrupted it)", dstPath, off, wantSize)
+	}
+	sum := hex.EncodeToString(h.Sum(nil))
+	if sum != wantSHA256 {
+		return fmt.Errorf("staged copy %s: sha256 %s, want %s (source may have changed after the pre-copy manifest verification, or the copy path may have corrupted it)", dstPath, sum, wantSHA256)
+	}
+	return nil
 }
 
 // checkNoStagingAliases rejects the whole stage before any copy starts

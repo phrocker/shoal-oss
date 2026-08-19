@@ -753,6 +753,86 @@ func TestStageBulkDirCancellationLeavesNoPartialObjectAndRetrySucceeds(t *testin
 	}
 }
 
+// mutatingSourceBackend wraps a *memory.Backend and, the instant its Nth
+// Open call (1-indexed) for one specific tracked path is issued,
+// overwrites that path's content in the underlying backend with
+// newContent before delegating to the real Open. Used to simulate a
+// source object being replaced in the window between StageBulkDir's own
+// pre-copy-loop VerifyRFileExport (an earlier Open of the same path) and
+// storage.Copy's later, separate Open of that same path inside the copy
+// loop, without needing a real concurrent writer or a race-prone timer.
+type mutatingSourceBackend struct {
+	*memory.Backend
+	path       string
+	mutateAt   int32
+	newContent []byte
+	opens      int32
+}
+
+func (b *mutatingSourceBackend) Open(ctx context.Context, path string) (shstorage.File, error) {
+	if path == b.path {
+		if n := atomic.AddInt32(&b.opens, 1); n == b.mutateAt {
+			b.Backend.Put(path, b.newContent)
+		}
+	}
+	return b.Backend.Open(ctx, path)
+}
+
+// TestStageBulkDirRejectsSourceMutatedBetweenPreflightVerifyAndItsOwnCopy
+// covers the copy-time window described in StageBulkDir's own doc
+// comment: engine.VerifyRFileExport verifies every RFile once, in a
+// single pass, before the copy loop starts; storage.Copy then separately
+// re-opens and re-reads each source file when it is actually copied.
+// TestPromoteRejectsSourceMutatedDuringAddTableSplits already covers a
+// source mutated during the AddTableSplits/ListTableSplits round-trip,
+// strictly before this preflight verify even runs; this test instead
+// mutates F0001.rf's content on its second Open call -- the first Open
+// is the preflight VerifyRFileExport call (which sees and approves the
+// original, correct bytes), the second is storage.Copy's own read
+// inside the loop (which now sees different bytes than were just
+// verified). Without a post-copy verification of the staged destination
+// object, this mismatch would go completely undetected and loadmap.json
+// would be written describing corrupted data as trustworthy.
+func TestStageBulkDirRejectsSourceMutatedBetweenPreflightVerifyAndItsOwnCopy(t *testing.T) {
+	const srcPath = "events/t-0000/F0001.rf"
+	original := []byte("original-bytes")
+	mutated := []byte("mutated-bytes!")
+	if len(original) != len(mutated) {
+		t.Fatalf("test fixture bug: original (%d) and mutated (%d) must be equal length so storage.Copy's own length bookkeeping cannot itself detect the swap, isolating the destination-verification behavior under test", len(original), len(mutated))
+	}
+
+	realSrc := memory.New()
+	realSrc.Put(srcPath, original)
+	realSrc.Put("events/t-0001/F0002.rf", []byte("b"))
+
+	originalSum := sha256.Sum256(original)
+	bSum := sha256.Sum256([]byte("b"))
+	manifest := twoTabletManifest()
+	manifest.RFiles[0].DestinationPath = srcPath
+	manifest.RFiles[0].Size = int64(len(original))
+	manifest.RFiles[0].SHA256 = hex.EncodeToString(originalSum[:])
+	manifest.RFiles[1].DestinationPath = "events/t-0001/F0002.rf"
+	manifest.RFiles[1].Size = 1
+	manifest.RFiles[1].SHA256 = hex.EncodeToString(bSum[:])
+
+	src := &mutatingSourceBackend{Backend: realSrc, path: srcPath, mutateAt: 2, newContent: mutated}
+	dst := memory.New()
+	ctx := context.Background()
+
+	if _, err := StageBulkDir(ctx, src, manifest, dst, "hdfs://nn/bulk/events-1"); err == nil {
+		t.Fatal("StageBulkDir with source mutated between preflight verify and its own copy = nil error, want error")
+	}
+	if got := atomic.LoadInt32(&src.opens); got < 2 {
+		t.Fatalf("source Open calls for %s = %d, want >= 2 (preflight verify + storage.Copy); test fixture did not exercise the intended window", srcPath, got)
+	}
+	if _, err := dst.Open(ctx, "hdfs://nn/bulk/events-1/loadmap.json"); err == nil {
+		t.Fatal("loadmap.json present after rejecting a file mutated during copy, want absent")
+	}
+	if _, err := dst.Open(ctx, "hdfs://nn/bulk/events-1/F0002.rf"); err == nil {
+		t.Fatal("F0002.rf present after F0001.rf failed its post-copy verification, want absent (fails closed before copying later files)")
+	}
+}
+
 // TestStageBulkDirRejectsInPlaceBulkDirBeforeCopying uses the real local
 // filesystem backend (not memory.Backend, which publishes writes
 // atomically on Close and so cannot reproduce this hazard) to prove

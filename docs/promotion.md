@@ -287,8 +287,11 @@ promotion.Promote(src, manifest, dst, bulkDir, conn, tableName, opts)
                  AddTableSplits/ListTableSplits TOCTOU window above,
                  see §6 -- then calls BuildLoadMapping again, for the
                  real widened per-tablet KeyExtents from §3.1, flattens
-                 nested export files into bulkDir, and writes
-                 bulkDir/loadmap.json)
+                 nested export files into bulkDir, re-verifying each
+                 file's *destination* bytes against the manifest
+                 immediately after its own copy -- closes the separate
+                 per-file copy-loop TOCTOU window, see §6 -- and only
+                 then writes bulkDir/loadmap.json)
                                           │
                                           ▼
           mapping empty (nothing to import)? return here --
@@ -518,6 +521,34 @@ destination splits itself, or the eventual `BulkImport` fails closed (see
   directory literally named e.g. `hdfs:/bulk` is then still recognized
   and preflighted as local rather than mistaken for a remote HDFS root
   purely because of its spelling.
+  All of the above are preflight checks: every one of them runs, and
+  either passes or fails closed, before any file is copied. They cannot,
+  by construction, protect the copy loop itself -- `engine.VerifyRFileExport`
+  reads and hashes every RFile once, in a single pass, before the loop
+  starts, and `storage.Copy` then separately re-opens and re-reads each
+  source file when it is actually copied, an arbitrary (if normally
+  short) amount of time later. A source file replaced in that window --
+  the same file changing between being verified and being copied, or a
+  later file in the manifest changing while an earlier one is still
+  being copied -- would be silently staged with the wrong bytes and
+  written into `loadmap.json` as trustworthy, with nothing above ever
+  re-checking it. `StageBulkDir` closes this by verifying each file's
+  *destination* object immediately after its own `storage.Copy` call
+  returns: it re-opens and re-hashes the object just written at `dst`
+  and compares that against the manifest's recorded size/SHA256 for
+  that file, before continuing to the next file or writing
+  `loadmap.json`. Checking the destination (not a second read of the
+  source) also catches corruption introduced by the copy/backend path
+  itself, not only source mutation -- `storage.Copy`'s own doc comment
+  notes that some `WritableBackend` implementations buffer and upload
+  on `Close`, so a copy can still fail or corrupt data after every prior
+  `Write` appeared to succeed. A mismatch fails the whole call closed
+  immediately, but -- consistent with the cancellation behavior in §5 --
+  does not roll back that one file's already-written (incorrect) bytes;
+  `loadmap.json` is only ever written after every file has both copied
+  and re-verified successfully, so its presence remains a reliable
+  signal that every listed file's bytes were confirmed at `dst`, not
+  merely assumed from an earlier check.
 - `internal/promotion.Promote` — orchestrates the full sequence: calls
   `RequiredDestinationSplits`, conditionally submits `AddTableSplits` for
   a multi-tablet manifest, then calls `StageBulkDir`, then submits the
@@ -671,9 +702,12 @@ Mapped against #70's five acceptance criteria:
 RFile's actual content.** Every check in §3/§4 confirms that a
 manifest's tablet chain is well-formed (§3.1/§3.2) and that each
 `RFileExportFile` genuinely exists and matches its own declared
-`Size`/`SHA256` (`engine.VerifyRFileExport`, run twice — see §3.3 and
-§4's `stagingPreflight`/`StageBulkDir` description — specifically to
-close the window a manager round-trip opens). None of that checks
+`Size`/`SHA256` (`engine.VerifyRFileExport` against the *source*, run
+twice — see §3.3 and §4's `stagingPreflight`/`StageBulkDir` description
+— specifically to close the window a manager round-trip opens — plus a
+third, per-file check of the freshly staged *destination* immediately
+after each copy, closing the separate copy-loop window described
+there). None of that checks
 whether an RFile's *actual* embedded key range genuinely falls inside
 the boundaries `Tablets[TabletIndex]` declares. A manifest that
 correctly hashes a byte-for-byte real RFile, but assigns it to the
@@ -811,6 +845,26 @@ existing single-tablet suite:
   not hidden); `loadmap.json` is never written on the failed attempt; and
   retrying with a fresh context against the same destination converges to
   the full, correct staged set.
+- **Copy-loop TOCTOU (destination re-verification)** —
+  `TestStageBulkDirRejectsSourceMutatedBetweenPreflightVerifyAndItsOwnCopy`
+  covers the window `TestPromoteRejectsSourceMutatedDuringAddTableSplits`
+  does not: a source file changing *after* `StageBulkDir`'s own
+  whole-manifest `engine.VerifyRFileExport` preflight has already
+  approved it, but *before* `storage.Copy` performs its own, separate
+  read of that same file inside the copy loop. A wrapper backend
+  mutates the tracked file's content on its second `Open` call
+  specifically (the first is the preflight verify; the second is
+  `storage.Copy`'s own read), to equal-length-but-different bytes, so
+  neither the preflight nor `storage.Copy`'s own length bookkeeping can
+  incidentally catch the swap — isolating the new per-file, post-copy
+  destination verification as the only mechanism that can. Asserts
+  `StageBulkDir` returns an error, that the second (later, unrelated)
+  file was never copied (fails closed before continuing the loop), and
+  that `loadmap.json` is absent. Verified this test against a temporary
+  revert of the new post-copy check (with every other check left
+  intact): only this test fails, confirming it isolates the specific
+  window the new check closes rather than incidentally passing for an
+  unrelated reason.
 
 No test in this slice submits a real FATE operation or talks to a live
 Accumulo manager; `AddTableSplits`/`BulkImport` are exercised only through
