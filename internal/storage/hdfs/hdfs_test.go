@@ -424,6 +424,76 @@ func TestNewContextKeepsCleanupClientAliveUntilBackendClose(t *testing.T) {
 	}
 }
 
+func TestDialContextSourceStoresMixedContextTypes(t *testing.T) {
+	source := newDialContextSource(nil)
+	if got := source.Context(); got == nil {
+		t.Fatal("Context returned nil for default background context")
+	}
+
+	backgroundCtx := context.Background()
+	source.Store(backgroundCtx)
+	if got := source.Context(); got == nil || got.Err() != nil {
+		t.Fatalf("background Context = %v, want non-nil uncanceled context", got)
+	}
+
+	cancelCtx, cancel := context.WithCancel(context.Background())
+	source.Store(cancelCtx)
+	cancel()
+	if !errors.Is(source.Context().Err(), context.Canceled) {
+		t.Fatalf("cancel Context err = %v, want context.Canceled", source.Context().Err())
+	}
+
+	timeoutCtx, timeoutCancel := context.WithTimeout(context.Background(), time.Minute)
+	defer timeoutCancel()
+	source.Store(timeoutCtx)
+	if deadline, ok := source.Context().Deadline(); !ok || deadline.IsZero() {
+		t.Fatalf("timeout Context deadline = %v, %v; want non-zero deadline", deadline, ok)
+	}
+
+	source.Store(nil)
+	if got := source.Context(); got == nil || got.Err() != nil {
+		t.Fatalf("nil Store Context = %v, want background context", got)
+	}
+}
+
+func TestDialContextSourceConcurrentLoadStore(t *testing.T) {
+	source := newDialContextSource(context.Background())
+	cancelCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	timeoutCtx, timeoutCancel := context.WithTimeout(context.Background(), time.Minute)
+	defer timeoutCancel()
+
+	contexts := []context.Context{context.Background(), cancelCtx, timeoutCtx, nil}
+
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for i := range 4 {
+		wg.Add(1)
+		go func(offset int) {
+			defer wg.Done()
+			<-start
+			for j := range 1000 {
+				source.Store(contexts[(offset+j)%len(contexts)])
+			}
+		}(i)
+	}
+	for range 4 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			for range 1000 {
+				if source.Context() == nil {
+					t.Error("Context returned nil during concurrent load/store")
+					return
+				}
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+}
+
 func TestNewContextCancelsStalledInitialCleanupDial(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

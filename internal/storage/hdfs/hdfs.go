@@ -420,21 +420,29 @@ func contextOrBackground(ctx context.Context) context.Context {
 }
 
 type dialContextSource struct {
-	current atomic.Value
+	current atomic.Pointer[dialContextHolder]
+}
+
+type dialContextHolder struct {
+	ctx context.Context
 }
 
 func newDialContextSource(ctx context.Context) *dialContextSource {
 	source := &dialContextSource{}
-	source.current.Store(contextOrBackground(ctx))
+	source.Store(ctx)
 	return source
 }
 
 func (s *dialContextSource) Context() context.Context {
-	return s.current.Load().(context.Context)
+	holder := s.current.Load()
+	if holder == nil || holder.ctx == nil {
+		return context.Background()
+	}
+	return holder.ctx
 }
 
 func (s *dialContextSource) Store(ctx context.Context) {
-	s.current.Store(contextOrBackground(ctx))
+	s.current.Store(&dialContextHolder{ctx: contextOrBackground(ctx)})
 }
 
 func newBackendClientContext(ctx context.Context) (context.Context, context.CancelFunc) {
