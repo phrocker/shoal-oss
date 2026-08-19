@@ -865,11 +865,27 @@ func unwrapBackend(backend storage.Backend) storage.Backend {
 // DestinationPath -> flat basename mapping. Two manifest entries sharing
 // the same DestinationPath (the same file listed twice) are not a
 // collision; distinct source paths that happen to share a basename are.
+//
+// filepath.Base is also rejected when it yields a non-leaf name: "." or
+// ".." (from a DestinationPath that is empty, ".", "..", or ends in a
+// "." or ".." segment) collapse away rather than naming a real file, and
+// joinBulkPath would then resolve the write target to bulkDir itself or
+// to bulkDir's parent directory instead of a new file inside it. A bare
+// separator (from a DestinationPath consisting only of separators) is
+// rejected for the same reason. Left unchecked, staging such a manifest
+// entry can truncate or create a file outside the requested bulk
+// directory on a local destination before WriteLoadMapping ever runs.
 func flattenNames(rfiles []engine.RFileExportFile) (map[string]string, error) {
 	names := make(map[string]string, len(rfiles))
 	byName := make(map[string]string, len(rfiles))
 	for _, rf := range rfiles {
 		name := filepath.Base(rf.DestinationPath)
+		if name == "" || name == "." || name == ".." || strings.ContainsAny(name, `/\`) {
+			return nil, fmt.Errorf(
+				"promotion: rfile %q flattens to invalid bulk-dir basename %q; refusing to stage",
+				rf.DestinationPath, name,
+			)
+		}
 		if prior, ok := byName[name]; ok && prior != rf.DestinationPath {
 			return nil, fmt.Errorf(
 				"promotion: bulk dir flatten collision: %q and %q both flatten to %q",
