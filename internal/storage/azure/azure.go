@@ -40,20 +40,28 @@ package azure
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"strings"
 	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
+	azblob "github.com/Azure/azure-sdk-for-go/sdk/storage/azblob"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blob"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/bloberror"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blockblob"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/container"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/sas"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/service"
 	"github.com/google/uuid"
 
@@ -63,8 +71,9 @@ import (
 // Backend opens Azure blobs via a shared *service.Client. Safe for concurrent
 // Open and concurrent ReadAt across many Files.
 type Backend struct {
-	svc *service.Client
-	ops azureWriteOperations
+	svc            *service.Client
+	ops            azureWriteOperations
+	sourceProvider azureCopySourceProvider
 }
 
 // Option customizes Backend construction.
@@ -111,7 +120,11 @@ func New(_ context.Context, opts ...Option) (*Backend, error) {
 		o(c)
 	}
 	if c.svc != nil {
-		return &Backend{svc: c.svc, ops: sdkAzureWriteOperations{svc: c.svc}}, nil
+		return &Backend{
+			svc:            c.svc,
+			ops:            sdkAzureWriteOperations{svc: c.svc},
+			sourceProvider: rawAzureCopySourceProvider{svc: c.svc},
+		}, nil
 	}
 
 	connString := c.connString
@@ -123,7 +136,11 @@ func New(_ context.Context, opts ...Option) (*Backend, error) {
 		if err != nil {
 			return nil, fmt.Errorf("azure: NewClientFromConnectionString: %w", err)
 		}
-		return &Backend{svc: svc, ops: sdkAzureWriteOperations{svc: svc}}, nil
+		return &Backend{
+			svc:            svc,
+			ops:            sdkAzureWriteOperations{svc: svc},
+			sourceProvider: sourceProviderFromConnectionString(svc, connString),
+		}, nil
 	}
 
 	serviceURL := c.serviceURL
@@ -145,7 +162,14 @@ func New(_ context.Context, opts ...Option) (*Backend, error) {
 	if err != nil {
 		return nil, fmt.Errorf("azure: NewClient: %w", err)
 	}
-	return &Backend{svc: svc, ops: sdkAzureWriteOperations{svc: svc}}, nil
+	return &Backend{
+		svc: svc,
+		ops: sdkAzureWriteOperations{svc: svc},
+		sourceProvider: tokenAzureCopySourceProvider{
+			rawAzureCopySourceProvider: rawAzureCopySourceProvider{svc: svc},
+			cred:                       cred,
+		},
+	}, nil
 }
 
 // Close is a no-op: the service client holds no persistent connection.
@@ -180,8 +204,9 @@ func (b *Backend) Open(ctx context.Context, path string) (shstorage.File, error)
 	}, nil
 }
 
-// Create opens a block-blob writer. Close first stages the bytes under an
-// internal blob name, then conditionally publishes them to the destination.
+// Create opens a block-blob writer. Close first stages the bytes under a
+// hidden sibling blob name, then conditionally promotes that exact blob into
+// the destination.
 func (b *Backend) Create(ctx context.Context, path string) (shstorage.Writer, error) {
 	cont, name, err := ParsePath(path)
 	if err != nil {
@@ -196,15 +221,20 @@ func (b *Backend) Create(ctx context.Context, path string) (shstorage.Writer, er
 	if err == nil && target.etag == nil {
 		return nil, fmt.Errorf("azure: inspect destination az://%s/%s: missing ETag", cont, name)
 	}
+	stageName, err := nextTemporaryStageName(name)
+	if err != nil {
+		return nil, fmt.Errorf("azure: stage temporary blob for az://%s/%s: %w", cont, name, err)
+	}
 	return &writer{
 		ops:            ops,
 		container:      cont,
 		name:           name,
-		stageName:      ".shoal-tmp/" + uuid.NewString(),
+		stageName:      stageName,
 		writeID:        uuid.NewString(),
 		ctx:            ctx,
 		targetExists:   err == nil,
 		target:         target,
+		sourceProvider: b.sourceProvider,
 		cleanupTimeout: azureCleanupTimeout,
 	}, nil
 }
@@ -233,7 +263,7 @@ func (b *Backend) List(ctx context.Context, prefix string) ([]string, error) {
 		}
 		for _, item := range page.Segment.BlobItems {
 			if item == nil || item.Name == nil || strings.HasSuffix(*item.Name, "/") ||
-				strings.HasPrefix(*item.Name, ".shoal-tmp/") {
+				strings.HasPrefix(*item.Name, legacyStageDirPrefix) || isTemporaryStageName(*item.Name) {
 				continue
 			}
 			out = append(out, "az://"+cont+"/"+*item.Name)
@@ -261,6 +291,171 @@ func ParsePath(path string) (containerName, blobName string, err error) {
 		return "", "", fmt.Errorf("azure: empty container in %q", path)
 	}
 	return containerName, blobName, nil
+}
+
+const (
+	maxBlobNameBytes      = 1024
+	tempStageNamePrefix   = ".shl-"
+	tempStageHashHexLen   = 4
+	tempStageRandomHexLen = 10
+	tempStageComponentLen = len(tempStageNamePrefix) + tempStageHashHexLen + tempStageRandomHexLen
+	legacyStageDirPrefix  = ".shoal-tmp/"
+	azureCopyBlockSize    = 100 << 20
+	azureSourceSASExpiry  = 5 * time.Minute
+)
+
+var randomStageNameToken = func() (string, error) {
+	buf := make([]byte, tempStageRandomHexLen/2)
+	if _, err := rand.Read(buf); err != nil {
+		return "", fmt.Errorf("generate random staging token: %w", err)
+	}
+	return hex.EncodeToString(buf), nil
+}
+
+func nextTemporaryStageName(name string) (string, error) {
+	prefix := temporaryStageNamePrefixFor(name)
+	hash := sha256.Sum256([]byte(name))
+	token, err := randomStageNameToken()
+	if err != nil {
+		return "", err
+	}
+	hashHex := hex.EncodeToString(hash[:tempStageHashHexLen/2])
+	if len(hashHex) < tempStageHashHexLen || len(token) < tempStageRandomHexLen {
+		return "", fmt.Errorf("temporary blob token material too short")
+	}
+	component := tempStageNamePrefix + hashHex[:tempStageHashHexLen] + token[:tempStageRandomHexLen]
+	if len(prefix)+len(component) > maxBlobNameBytes {
+		return "", fmt.Errorf("temporary blob name exceeds %d-byte limit", maxBlobNameBytes)
+	}
+	return prefix + component, nil
+}
+
+func temporaryStageNamePrefixFor(name string) string {
+	prefix := stageNameParentPrefix(name)
+	for prefix != "" && maxBlobNameBytes-len(prefix) < tempStageComponentLen {
+		trimmed := strings.TrimSuffix(prefix, "/")
+		prefix = stageNameParentPrefix(trimmed)
+	}
+	return prefix
+}
+
+func stageNameParentPrefix(name string) string {
+	if idx := strings.LastIndexByte(name, '/'); idx >= 0 {
+		return name[:idx+1]
+	}
+	return ""
+}
+
+func isTemporaryStageName(name string) bool {
+	base := name
+	if idx := strings.LastIndexByte(base, '/'); idx >= 0 {
+		base = base[idx+1:]
+	}
+	return strings.HasPrefix(name, legacyStageDirPrefix) ||
+		(len(base) == tempStageComponentLen && strings.HasPrefix(base, tempStageNamePrefix))
+}
+
+type azureCopySource struct {
+	url           string
+	authorization *string
+}
+
+type azureCopySourceProvider interface {
+	source(context.Context, string, string) (azureCopySource, error)
+}
+
+type rawAzureCopySourceProvider struct {
+	svc *service.Client
+}
+
+func (p rawAzureCopySourceProvider) source(_ context.Context, containerName, blobName string) (azureCopySource, error) {
+	return azureCopySource{url: p.blobURL(containerName, blobName)}, nil
+}
+
+func (p rawAzureCopySourceProvider) blobURL(containerName, blobName string) string {
+	return p.svc.NewContainerClient(containerName).NewBlobClient(blobName).URL()
+}
+
+type sasAzureCopySourceProvider struct {
+	rawAzureCopySourceProvider
+	sasQuery string
+}
+
+func (p sasAzureCopySourceProvider) source(_ context.Context, containerName, blobName string) (azureCopySource, error) {
+	sourceURL, err := url.Parse(p.blobURL(containerName, blobName))
+	if err != nil {
+		return azureCopySource{}, fmt.Errorf("azure: parse source blob URL: %w", err)
+	}
+	sourceURL.RawQuery = strings.TrimPrefix(p.sasQuery, "?")
+	return azureCopySource{url: sourceURL.String()}, nil
+}
+
+type sharedKeyAzureCopySourceProvider struct {
+	rawAzureCopySourceProvider
+	cred *azblob.SharedKeyCredential
+}
+
+func (p sharedKeyAzureCopySourceProvider) source(_ context.Context, containerName, blobName string) (azureCopySource, error) {
+	blobURL := p.blobURL(containerName, blobName)
+	client, err := blob.NewClientWithSharedKeyCredential(blobURL, p.cred, nil)
+	if err != nil {
+		return azureCopySource{}, fmt.Errorf("azure: build shared-key source blob client: %w", err)
+	}
+	sourceURL, err := client.GetSASURL(sas.BlobPermissions{Read: true}, time.Now().Add(azureSourceSASExpiry), nil)
+	if err != nil {
+		return azureCopySource{}, fmt.Errorf("azure: sign source blob URL: %w", err)
+	}
+	return azureCopySource{url: sourceURL}, nil
+}
+
+type tokenAzureCopySourceProvider struct {
+	rawAzureCopySourceProvider
+	cred azcore.TokenCredential
+}
+
+func (p tokenAzureCopySourceProvider) source(ctx context.Context, containerName, blobName string) (azureCopySource, error) {
+	token, err := p.cred.GetToken(ctx, policy.TokenRequestOptions{Scopes: []string{"https://storage.azure.com/.default"}})
+	if err != nil {
+		return azureCopySource{}, fmt.Errorf("azure: acquire source copy token: %w", err)
+	}
+	authorization := "Bearer " + token.Token
+	return azureCopySource{
+		url:           p.blobURL(containerName, blobName),
+		authorization: &authorization,
+	}, nil
+}
+
+func sourceProviderFromConnectionString(svc *service.Client, connString string) azureCopySourceProvider {
+	values := parseConnectionString(connString)
+	base := rawAzureCopySourceProvider{svc: svc}
+	if sasQuery := values["SharedAccessSignature"]; sasQuery != "" {
+		return sasAzureCopySourceProvider{rawAzureCopySourceProvider: base, sasQuery: sasQuery}
+	}
+	accountName := values["AccountName"]
+	accountKey := values["AccountKey"]
+	if accountName == "" || accountKey == "" {
+		return base
+	}
+	cred, err := azblob.NewSharedKeyCredential(accountName, accountKey)
+	if err != nil {
+		return base
+	}
+	return sharedKeyAzureCopySourceProvider{rawAzureCopySourceProvider: base, cred: cred}
+}
+
+func parseConnectionString(connString string) map[string]string {
+	values := make(map[string]string)
+	for _, part := range strings.Split(connString, ";") {
+		if part == "" {
+			continue
+		}
+		key, value, ok := strings.Cut(part, "=")
+		if !ok {
+			continue
+		}
+		values[key] = value
+	}
+	return values
 }
 
 // file is the Azure File implementation. Each ReadAt issues a fresh ranged
@@ -329,7 +524,8 @@ type azureObjectState struct {
 
 type azureWriteOperations interface {
 	head(context.Context, string, string) (azureObjectState, error)
-	upload(context.Context, string, string, []byte, string, bool, azureObjectState) (azureObjectState, error)
+	uploadStage(context.Context, string, string, []byte, string) (azureObjectState, error)
+	promote(context.Context, string, string, string, azureCopySource, azureObjectState, bool, azureObjectState) error
 	deleteStage(context.Context, string, string, azureObjectState) error
 }
 
@@ -351,27 +547,19 @@ func (o sdkAzureWriteOperations) head(
 	return state, nil
 }
 
-func (o sdkAzureWriteOperations) upload(
+func (o sdkAzureWriteOperations) uploadStage(
 	ctx context.Context,
 	containerName, name string,
 	data []byte,
 	writeID string,
-	targetExists bool,
-	target azureObjectState,
 ) (azureObjectState, error) {
-	conditions := &blob.ModifiedAccessConditions{}
-	if targetExists {
-		conditions.IfMatch = target.etag
-	} else {
-		conditions.IfNoneMatch = to.Ptr(azcore.ETagAny)
-	}
 	out, err := o.svc.NewContainerClient(containerName).NewBlockBlobClient(name).UploadBuffer(
 		ctx,
 		data,
 		&blockblob.UploadBufferOptions{
 			Metadata: map[string]*string{"shoal-write-id": to.Ptr(writeID)},
 			AccessConditions: &blob.AccessConditions{
-				ModifiedAccessConditions: conditions,
+				ModifiedAccessConditions: &blob.ModifiedAccessConditions{IfNoneMatch: to.Ptr(azcore.ETagAny)},
 			},
 		},
 	)
@@ -383,6 +571,50 @@ func (o sdkAzureWriteOperations) upload(
 		size:     int64(len(data)),
 		metadata: map[string]*string{"shoal-write-id": to.Ptr(writeID)},
 	}, nil
+}
+
+func (o sdkAzureWriteOperations) promote(
+	ctx context.Context,
+	containerName, stageName, name string,
+	source azureCopySource,
+	stage azureObjectState,
+	targetExists bool,
+	target azureObjectState,
+) error {
+	bb := o.svc.NewContainerClient(containerName).NewBlockBlobClient(name)
+	conditions := &blob.ModifiedAccessConditions{}
+	if targetExists {
+		conditions.IfMatch = target.etag
+	} else {
+		conditions.IfNoneMatch = to.Ptr(azcore.ETagAny)
+	}
+
+	blockIDs := make([]string, 0, max(1, int((stage.size+azureCopyBlockSize-1)/azureCopyBlockSize)))
+	for offset, index := int64(0), 0; offset < stage.size; offset, index = offset+azureCopyBlockSize, index+1 {
+		count := min(stage.size-offset, int64(azureCopyBlockSize))
+		blockID := base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("%08d", index)))
+		options := &blockblob.StageBlockFromURLOptions{
+			CopySourceAuthorization: source.authorization,
+			SourceModifiedAccessConditions: &blob.SourceModifiedAccessConditions{
+				SourceIfMatch: stage.etag,
+			},
+			Range: blob.HTTPRange{Offset: offset, Count: count},
+		}
+		if _, err := bb.StageBlockFromURL(ctx, blockID, source.url, options); err != nil {
+			return err
+		}
+		blockIDs = append(blockIDs, blockID)
+	}
+
+	if _, err := bb.CommitBlockList(ctx, blockIDs, &blockblob.CommitBlockListOptions{
+		Metadata: stage.metadata,
+		AccessConditions: &blob.AccessConditions{
+			ModifiedAccessConditions: conditions,
+		},
+	}); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (o sdkAzureWriteOperations) deleteStage(
@@ -419,6 +651,7 @@ type writer struct {
 	ctx            context.Context //nolint:containedctx
 	targetExists   bool
 	target         azureObjectState
+	sourceProvider azureCopySourceProvider
 	stage          azureObjectState
 	stageCreated   bool
 	cleanupTimeout time.Duration
@@ -446,9 +679,7 @@ func (w *writer) Close() error {
 		return nil
 	}
 	if !w.stageCreated {
-		stage, err := w.ops.upload(
-			w.ctx, w.container, w.stageName, w.buf.Bytes(), w.writeID, false, azureObjectState{},
-		)
+		stage, err := w.ops.uploadStage(w.ctx, w.container, w.stageName, w.buf.Bytes(), w.writeID)
 		if err != nil {
 			if verified, verifyErr := w.verifyStage(); verifyErr != nil || !verified {
 				return errors.Join(
@@ -471,12 +702,12 @@ func (w *writer) Close() error {
 			)
 		}
 	}
-	// Publish from the verified buffer instead of a source URL. Private
-	// copy-from-URL requires a second source authorization token for some AAD
-	// configurations; a conditional upload works for every supported credential
-	// mode and still commits atomically against the destination ETag.
-	if _, err := w.ops.upload(
-		w.ctx, w.container, w.name, w.buf.Bytes(), w.writeID, w.targetExists, w.target,
+	source, err := w.promotionSource()
+	if err != nil {
+		return errors.Join(err, w.cleanupStage())
+	}
+	if err := w.ops.promote(
+		w.ctx, w.container, w.stageName, w.name, source, w.stage, w.targetExists, w.target,
 	); err != nil {
 		if verified, verifyErr := w.verifyDestination(); verifyErr != nil || !verified {
 			return errors.Join(
@@ -553,6 +784,17 @@ func (w *writer) cleanupStage() error {
 	}
 	w.stageCreated = false
 	return nil
+}
+
+func (w *writer) promotionSource() (azureCopySource, error) {
+	if w.sourceProvider == nil {
+		return azureCopySource{}, fmt.Errorf("azure: no source authorization configured for az://%s/%s", w.container, w.stageName)
+	}
+	source, err := w.sourceProvider.source(w.ctx, w.container, w.stageName)
+	if err != nil {
+		return azureCopySource{}, fmt.Errorf("azure: authorize staged source az://%s/%s: %w", w.container, w.stageName, err)
+	}
+	return source, nil
 }
 
 func metadataValue(metadata map[string]*string, key string) string {

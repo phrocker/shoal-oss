@@ -266,6 +266,50 @@ func TestWriter_WriteAfterCloseReportsClosedState(t *testing.T) {
 	}
 }
 
+func TestNextTemporaryStageKeyPreservesPrefixAndBoundsUTF8Bytes(t *testing.T) {
+	original := randomStageKeyToken
+	randomStageKeyToken = func() (string, error) {
+		return strings.Repeat("a", tempStageRandomHexLen), nil
+	}
+	t.Cleanup(func() {
+		randomStageKeyToken = original
+	})
+
+	key := "tenant/path/" + strings.Repeat("界", 338)
+	stageKey, err := nextTemporaryStageKey(key)
+	if err != nil {
+		t.Fatalf("nextTemporaryStageKey: %v", err)
+	}
+	if got, want := stageKeyParentPrefix(stageKey), stageKeyParentPrefix(key); got != want {
+		t.Fatalf("stage prefix = %q, want %q", got, want)
+	}
+	if len(stageKey) > maxObjectKeyBytes {
+		t.Fatalf("stage key length = %d bytes, want <= %d", len(stageKey), maxObjectKeyBytes)
+	}
+}
+
+func TestNextTemporaryStageKeyRetainsDeepPrefixNearMaxBytes(t *testing.T) {
+	original := randomStageKeyToken
+	randomStageKeyToken = func() (string, error) {
+		return strings.Repeat("b", tempStageRandomHexLen), nil
+	}
+	t.Cleanup(func() {
+		randomStageKeyToken = original
+	})
+
+	key := strings.Repeat("a", 1004) + "/x"
+	stageKey, err := nextTemporaryStageKey(key)
+	if err != nil {
+		t.Fatalf("nextTemporaryStageKey: %v", err)
+	}
+	if got, want := stageKeyParentPrefix(stageKey), stageKeyParentPrefix(key); got != want {
+		t.Fatalf("stage prefix = %q, want deep prefix %q", got, want)
+	}
+	if len(stageKey) > maxObjectKeyBytes {
+		t.Fatalf("stage key length = %d bytes, want <= %d", len(stageKey), maxObjectKeyBytes)
+	}
+}
+
 func TestWriter_StagedCreateAndReplace(t *testing.T) {
 	for _, existing := range []bool{false, true} {
 		t.Run(fmt.Sprintf("existing=%v", existing), func(t *testing.T) {

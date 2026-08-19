@@ -67,37 +67,17 @@ func (f *fakeAzureWriteOperations) head(
 	return obj.state, nil
 }
 
-func (f *fakeAzureWriteOperations) upload(
+func (f *fakeAzureWriteOperations) uploadStage(
 	ctx context.Context,
 	_, name string,
 	data []byte,
 	writeID string,
-	targetExists bool,
-	target azureObjectState,
 ) (azureObjectState, error) {
-	isStage := strings.HasPrefix(name, ".shoal-tmp/")
-	if isStage && f.stageFailure {
+	if f.stageFailure {
 		return azureObjectState{}, errors.New("stage checksum failed")
 	}
-	if !isStage {
-		f.promoteCalls++
-		if f.mutateBeforePromote {
-			f.mutateBeforePromote = false
-			f.nextETag++
-			etag := azcore.ETag(fmt.Sprintf("\"etag-%d\"", f.nextETag))
-			f.objects[name] = fakeAzureObject{
-				state: azureObjectState{etag: &etag, size: int64(len("concurrent"))},
-				data:  "concurrent",
-			}
-		}
-		current, exists := f.objects[name]
-		if exists != targetExists ||
-			(exists && !equalETags(current.state.etag, target.etag)) {
-			return azureObjectState{}, errors.New("destination precondition failed")
-		}
-		if err := ctx.Err(); err != nil {
-			return azureObjectState{}, err
-		}
+	if err := ctx.Err(); err != nil {
+		return azureObjectState{}, err
 	}
 	f.nextETag++
 	etag := azcore.ETag(fmt.Sprintf("\"etag-%d\"", f.nextETag))
@@ -108,18 +88,55 @@ func (f *fakeAzureWriteOperations) upload(
 		metadata: map[string]*string{"shoal-write-id": &id},
 	}
 	f.objects[name] = fakeAzureObject{state: state, data: string(data)}
-	if isStage && f.stageResponseLost {
+	if f.stageResponseLost {
 		f.stageResponseLost = false
 		return azureObjectState{}, errors.New("stage response lost")
 	}
-	if !isStage && f.promoteResponseLost {
-		f.promoteResponseLost = false
-		return azureObjectState{}, errors.New("upload response lost")
+	return state, nil
+}
+
+func (f *fakeAzureWriteOperations) promote(
+	ctx context.Context,
+	_, stageName, name string,
+	_ azureCopySource,
+	stage azureObjectState,
+	targetExists bool,
+	target azureObjectState,
+) error {
+	f.promoteCalls++
+	if f.mutateBeforePromote {
+		f.mutateBeforePromote = false
+		f.nextETag++
+		etag := azcore.ETag(fmt.Sprintf("\"etag-%d\"", f.nextETag))
+		f.objects[name] = fakeAzureObject{
+			state: azureObjectState{etag: &etag, size: int64(len("concurrent"))},
+			data:  "concurrent",
+		}
+	}
+	current, exists := f.objects[name]
+	if exists != targetExists ||
+		(exists && !equalETags(current.state.etag, target.etag)) {
+		return errors.New("destination precondition failed")
 	}
 	if err := ctx.Err(); err != nil {
-		return azureObjectState{}, err
+		return err
 	}
-	return state, nil
+	stageObject, ok := f.objects[stageName]
+	if !ok {
+		return azureNotFoundError()
+	}
+	if !equalETags(stageObject.state.etag, stage.etag) {
+		return errors.New("source precondition failed")
+	}
+	f.nextETag++
+	etag := azcore.ETag(fmt.Sprintf("\"etag-%d\"", f.nextETag))
+	stageObject.state.etag = &etag
+	f.objects[name] = stageObject
+	if f.promoteResponseLost {
+		f.promoteResponseLost = false
+		return errors.New("upload response lost")
+	}
+	return nil
 }
 
 func (f *fakeAzureWriteOperations) deleteStage(
@@ -146,13 +163,20 @@ func newFakeAzureWriter(f *fakeAzureWriteOperations, target string) *writer {
 		ops:            f,
 		container:      "container",
 		name:           target,
-		stageName:      ".shoal-tmp/stage",
+		stageName:      ".shl-stage0000",
 		writeID:        "write-id",
 		ctx:            context.Background(),
 		targetExists:   err == nil,
 		target:         targetState,
+		sourceProvider: staticAzureCopySourceProvider{},
 		cleanupTimeout: azureCleanupTimeout,
 	}
+}
+
+type staticAzureCopySourceProvider struct{}
+
+func (staticAzureCopySourceProvider) source(context.Context, string, string) (azureCopySource, error) {
+	return azureCopySource{url: "https://example.invalid/stage"}, nil
 }
 
 func TestParsePath(t *testing.T) {
@@ -273,6 +297,50 @@ func TestWriter_WriteAfterCloseReportsClosedState(t *testing.T) {
 	w := &writer{closed: true}
 	if _, err := w.Write([]byte("late")); err == nil || !strings.Contains(err.Error(), "closed") {
 		t.Fatalf("Write after Close error = %v, want closed state", err)
+	}
+}
+
+func TestNextTemporaryStageNamePreservesPrefixAndBoundsUTF8Bytes(t *testing.T) {
+	original := randomStageNameToken
+	randomStageNameToken = func() (string, error) {
+		return strings.Repeat("a", tempStageRandomHexLen), nil
+	}
+	t.Cleanup(func() {
+		randomStageNameToken = original
+	})
+
+	name := "tenant/path/" + strings.Repeat("界", 338)
+	stageName, err := nextTemporaryStageName(name)
+	if err != nil {
+		t.Fatalf("nextTemporaryStageName: %v", err)
+	}
+	if got, want := stageNameParentPrefix(stageName), stageNameParentPrefix(name); got != want {
+		t.Fatalf("stage prefix = %q, want %q", got, want)
+	}
+	if len(stageName) > maxBlobNameBytes {
+		t.Fatalf("stage name length = %d bytes, want <= %d", len(stageName), maxBlobNameBytes)
+	}
+}
+
+func TestNextTemporaryStageNameRetainsDeepPrefixNearMaxBytes(t *testing.T) {
+	original := randomStageNameToken
+	randomStageNameToken = func() (string, error) {
+		return strings.Repeat("b", tempStageRandomHexLen), nil
+	}
+	t.Cleanup(func() {
+		randomStageNameToken = original
+	})
+
+	name := strings.Repeat("a", 1004) + "/x"
+	stageName, err := nextTemporaryStageName(name)
+	if err != nil {
+		t.Fatalf("nextTemporaryStageName: %v", err)
+	}
+	if got, want := stageNameParentPrefix(stageName), stageNameParentPrefix(name); got != want {
+		t.Fatalf("stage prefix = %q, want deep prefix %q", got, want)
+	}
+	if len(stageName) > maxBlobNameBytes {
+		t.Fatalf("stage name length = %d bytes, want <= %d", len(stageName), maxBlobNameBytes)
 	}
 }
 

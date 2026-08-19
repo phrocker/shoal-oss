@@ -610,6 +610,25 @@ func TestLocal_CloseErrorCleansUpTempViaReplacementOps(t *testing.T) {
 	}
 }
 
+func TestCleanupTemporaryCreateFileJoinsCloseAndRemoveFailures(t *testing.T) {
+	file := fakeNamedCloser{name: "temp", closeErr: errors.New("close failed")}
+	ops := cleanupFailureOps{removeErr: errors.New("remove failed")}
+
+	err := cleanupTemporaryCreateFile(file, ops)
+	if err == nil || !strings.Contains(err.Error(), "close temporary file temp") || !strings.Contains(err.Error(), "remove temporary file temp") {
+		t.Fatalf("cleanupTemporaryCreateFile error = %v, want joined close/remove failures", err)
+	}
+}
+
+func TestCleanupTemporaryCreateFileIgnoresNotFoundRemoval(t *testing.T) {
+	file := fakeNamedCloser{name: "temp"}
+	ops := cleanupFailureOps{removeErr: fs.ErrNotExist}
+
+	if err := cleanupTemporaryCreateFile(file, ops); err != nil {
+		t.Fatalf("cleanupTemporaryCreateFile: %v", err)
+	}
+}
+
 func TestLocal_WriterSyncForwardsToTemporaryFile(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "out.bin")
@@ -723,6 +742,24 @@ type blockingAtomicReplaceOps struct {
 	entered chan struct{}
 	release chan struct{}
 }
+
+type fakeNamedCloser struct {
+	name     string
+	closeErr error
+}
+
+func (f fakeNamedCloser) Name() string { return f.name }
+func (f fakeNamedCloser) Close() error { return f.closeErr }
+
+type cleanupFailureOps struct {
+	removeErr error
+}
+
+func (cleanupFailureOps) Lstat(string) (os.FileInfo, error)                { return nil, fs.ErrNotExist }
+func (cleanupFailureOps) Chmod(string, os.FileMode) error                  { return nil }
+func (o cleanupFailureOps) Remove(string) error                            { return o.removeErr }
+func (cleanupFailureOps) AtomicReplace(string, string, string, bool) error { return nil }
+func (cleanupFailureOps) AtomicRestore(string, string) error               { return nil }
 
 func (o *blockingAtomicReplaceOps) AtomicReplace(temp, target, backup string, hadOld bool) error {
 	close(o.entered)

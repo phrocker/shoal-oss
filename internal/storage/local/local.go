@@ -65,9 +65,7 @@ func (b *Backend) Create(_ context.Context, path string) (storage.Writer, error)
 		return nil, fmt.Errorf("local: create temporary file for %s: %w", path, err)
 	}
 	if _, err := preserveExistingMetadata(ops, f.Name(), path); err != nil {
-		_ = f.Close()
-		_ = ops.Remove(f.Name())
-		return nil, err
+		return nil, errors.Join(err, cleanupTemporaryCreateFile(f, ops))
 	}
 	return &writer{
 		file:   f,
@@ -96,6 +94,11 @@ func (b *Backend) List(_ context.Context, prefix string) ([]string, error) {
 		}
 	}
 	return out, nil
+}
+
+type namedCloser interface {
+	Name() string
+	Close() error
 }
 
 // Remove deletes path. A missing path is not an error.
@@ -226,6 +229,20 @@ func openReplacementSiblingFile(dir string) (*os.File, error) {
 		lastErr = fs.ErrExist
 	}
 	return nil, fmt.Errorf("local: exhausted unique temporary sibling names: %w", lastErr)
+}
+
+func cleanupTemporaryCreateFile(file namedCloser, ops replacementOps) error {
+	if file == nil {
+		return nil
+	}
+	var cleanupErr error
+	if err := file.Close(); err != nil {
+		cleanupErr = errors.Join(cleanupErr, fmt.Errorf("local: close temporary file %s: %w", file.Name(), err))
+	}
+	if err := ops.Remove(file.Name()); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		cleanupErr = errors.Join(cleanupErr, fmt.Errorf("local: remove temporary file %s: %w", file.Name(), err))
+	}
+	return cleanupErr
 }
 
 func nextReplacementSiblingPath(dir, prefix string) (string, error) {

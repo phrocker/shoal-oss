@@ -182,6 +182,45 @@ func TestNextTemporaryObjectNameFallsBackToAncestorPrefixWhenParentIsTooLong(t *
 	}
 }
 
+func TestNextTemporaryObjectNameRetainsDeepPrefixNearMaxBytes(t *testing.T) {
+	originalToken := randomTempObjectToken
+	randomTempObjectToken = func() (string, error) {
+		return strings.Repeat("e", tempObjectRandomHexLen), nil
+	}
+	t.Cleanup(func() {
+		randomTempObjectToken = originalToken
+	})
+
+	object := strings.Repeat("a", 1004) + "/x"
+	tempName, err := nextTemporaryObjectName(object)
+	if err != nil {
+		t.Fatalf("nextTemporaryObjectName: %v", err)
+	}
+	if got, want := tempObjectParentPrefix(tempName), tempObjectParentPrefix(object); got != want {
+		t.Fatalf("temp prefix = %q, want deep prefix %q", got, want)
+	}
+}
+
+func TestNextTemporaryObjectNameSupportsHierarchicalSegmentLimit(t *testing.T) {
+	originalToken := randomTempObjectToken
+	randomTempObjectToken = func() (string, error) {
+		return strings.Repeat("f", tempObjectRandomHexLen), nil
+	}
+	t.Cleanup(func() {
+		randomTempObjectToken = originalToken
+	})
+
+	object := strings.Repeat("a", 511) + "/" + strings.Repeat("b", 511)
+	tempName, err := nextTemporaryObjectName(object)
+	if err != nil {
+		t.Fatalf("nextTemporaryObjectName: %v", err)
+	}
+	component := tempName[len(tempObjectParentPrefix(tempName)):]
+	if len(component) > maxObjectSegmentBytes {
+		t.Fatalf("temp component length = %d bytes, want <= %d", len(component), maxObjectSegmentBytes)
+	}
+}
+
 func TestWriter_CloseStagesAndPromotesObject(t *testing.T) {
 	backend, bucket := newFakeBackend()
 	bucket.putObject("path/to/object.rf", []byte("old"))
@@ -221,7 +260,7 @@ func TestWriter_CloseErrorPreservesExistingObjectAndCleansTemp(t *testing.T) {
 
 	closeErr := errors.New("checksum mismatch")
 	bucket.writerPlan = func(name string) fakeWriterPlan {
-		if strings.Contains(name, ".shoal-tmp-") {
+		if isTemporaryObjectName(name) {
 			return fakeWriterPlan{closeErr: closeErr, publishOnClose: true}
 		}
 		return fakeWriterPlan{}
@@ -375,7 +414,7 @@ func TestWriter_AbortSkipsDeletingUncommittedTempObject(t *testing.T) {
 	attempts := 0
 	deleteErr := errors.New("delete failed")
 	bucket.deleteHook = func(_ context.Context, object *fakeObject) error {
-		if strings.Contains(object.name, ".shoal-tmp-") && attempts == 0 {
+		if isTemporaryObjectName(object.name) && attempts == 0 {
 			attempts++
 			return deleteErr
 		}
@@ -421,7 +460,7 @@ func TestWriter_CloseSuccessIgnoresTempCleanupFailure(t *testing.T) {
 	backend, bucket := newFakeBackend()
 	cleanupErr := errors.New("cleanup failed")
 	bucket.deleteHook = func(_ context.Context, object *fakeObject) error {
-		if strings.Contains(object.name, ".shoal-tmp-") {
+		if isTemporaryObjectName(object.name) {
 			return cleanupErr
 		}
 		return nil

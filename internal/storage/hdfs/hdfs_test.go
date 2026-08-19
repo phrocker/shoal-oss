@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io/fs"
 	"net"
 	"os"
@@ -216,6 +217,84 @@ func TestBackendBackupRemovalFailureRollsBackPublishedReplacement(t *testing.T) 
 	}
 	if !slices.Equal(client.renameCalls, wantRenames) {
 		t.Fatalf("Rename calls = %v, want %v", client.renameCalls, wantRenames)
+	}
+}
+
+func TestBackendAmbiguousBackupRenameRestoresTargetBeforeReturning(t *testing.T) {
+	client := newFakeClient()
+	client.files["/tables/1.rf"] = []byte("old")
+	client.renameContextHook = func(_ context.Context, oldpath, newpath string) error {
+		if oldpath == "/tables/1.rf" && strings.Contains(newpath, ".shoal-backup-") {
+			client.files[newpath] = append([]byte(nil), client.files[oldpath]...)
+			delete(client.files, oldpath)
+			return context.DeadlineExceeded
+		}
+		return nil
+	}
+	backend, err := New("nn:8020", WithClient(client))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	w, err := backend.Create(context.Background(), "/tables/1.rf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write([]byte("new")); err != nil {
+		t.Fatal(err)
+	}
+
+	err = w.Close()
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Close error = %v, want context deadline exceeded", err)
+	}
+	if got := string(client.files["/tables/1.rf"]); got != "old" {
+		t.Fatalf("target contents = %q, want old", got)
+	}
+	for name := range client.files {
+		if strings.Contains(name, ".shoal-backup-") {
+			t.Fatalf("backup %s remains after failed preserve rename", name)
+		}
+	}
+	if _, ok := client.files[client.lastCreatePath]; !ok {
+		t.Fatalf("temporary file %s missing after unsuccessful Close", client.lastCreatePath)
+	}
+	if err := w.(storage.Aborter).Abort(); err != nil {
+		t.Fatalf("Abort after unsuccessful Close: %v", err)
+	}
+	if _, ok := client.files[client.lastCreatePath]; ok {
+		t.Fatalf("temporary file %s remains after Abort", client.lastCreatePath)
+	}
+}
+
+func TestBackendCommittedBackupDeleteDoesNotRollbackReplacement(t *testing.T) {
+	client := newFakeClient()
+	client.files["/tables/1.rf"] = []byte("old")
+	client.removeContextHook = func(_ context.Context, name string) error {
+		if strings.Contains(name, ".shoal-backup-") {
+			delete(client.files, name)
+			return context.DeadlineExceeded
+		}
+		return nil
+	}
+	backend, err := New("nn:8020", WithClient(client))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := storage.WriteAll(context.Background(), backend, "/tables/1.rf", []byte("new")); err != nil {
+		t.Fatalf("WriteAll: %v", err)
+	}
+	if got := string(client.files["/tables/1.rf"]); got != "new" {
+		t.Fatalf("target contents = %q, want new", got)
+	}
+	for name := range client.files {
+		if strings.Contains(name, ".shoal-backup-") {
+			t.Fatalf("backup %s remains after committed delete", name)
+		}
+	}
+	if len(client.renameCalls) != 2 {
+		t.Fatalf("Rename calls = %v, want preserve and publish only", client.renameCalls)
 	}
 }
 
@@ -1056,6 +1135,42 @@ func TestCloseAfterReplicationUsesContextAwareClose(t *testing.T) {
 	}
 	if writer.closeCalls != 0 {
 		t.Fatalf("Close calls = %d, want 0", writer.closeCalls)
+	}
+}
+
+func TestCleanupWriterAfterDeadlineFailureJoinsCleanupErrors(t *testing.T) {
+	removeErr := errors.New("remove failed")
+	err := cleanupWriterAfterDeadlineFailure(
+		"/tables/1.rf",
+		&cleanupFailureWriter{closeErr: errInjectedClose},
+		func(context.Context) error {
+			return fmt.Errorf("hdfs: remove temporary file /tables/1.rf: %w", removeErr)
+		},
+		func() error { return errInjectedRelease },
+	)
+	if !errors.Is(err, errInjectedClose) {
+		t.Fatalf("cleanupWriterAfterDeadlineFailure missing close error: %v", err)
+	}
+	if !errors.Is(err, removeErr) {
+		t.Fatalf("cleanupWriterAfterDeadlineFailure missing remove error: %v", err)
+	}
+	if !errors.Is(err, errInjectedRelease) {
+		t.Fatalf("cleanupWriterAfterDeadlineFailure missing release error: %v", err)
+	}
+}
+
+func TestCleanupReaderAfterDeadlineFailureJoinsCleanupErrors(t *testing.T) {
+	closeErr := errors.New("reader close failed")
+	err := cleanupReaderAfterDeadlineFailure(
+		"/tables/1.rf",
+		&cleanupFailureReader{closeErr: closeErr},
+		func() error { return errInjectedRelease },
+	)
+	if !errors.Is(err, closeErr) {
+		t.Fatalf("cleanupReaderAfterDeadlineFailure missing close error: %v", err)
+	}
+	if !errors.Is(err, errInjectedRelease) {
+		t.Fatalf("cleanupReaderAfterDeadlineFailure missing release error: %v", err)
 	}
 }
 
@@ -2078,6 +2193,14 @@ type contextCloseWriter struct {
 	contextCloseCalls int
 }
 
+type cleanupFailureWriter struct {
+	closeErr error
+}
+
+type cleanupFailureReader struct {
+	closeErr error
+}
+
 func (w *contextCloseWriter) Write(p []byte) (int, error) { return len(p), nil }
 func (w *contextCloseWriter) Close() error {
 	w.closeCalls++
@@ -2096,6 +2219,13 @@ func (w *immediateErrorDeadlineWriter) SetDeadline(deadline time.Time) error {
 	w.deadlines = append(w.deadlines, deadline)
 	return nil
 }
+
+func (w *cleanupFailureWriter) Write(p []byte) (int, error) { return len(p), nil }
+func (w *cleanupFailureWriter) Close() error                { return w.closeErr }
+
+func (*cleanupFailureReader) ReadAt([]byte, int64) (int, error) { return 0, nil }
+func (r *cleanupFailureReader) Close() error                    { return r.closeErr }
+func (*cleanupFailureReader) Stat() os.FileInfo                 { return fakeInfo{name: "reader"} }
 
 func (w *fakeWriter) Close() error {
 	w.client.writerCloseCalls++

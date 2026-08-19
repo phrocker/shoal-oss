@@ -39,6 +39,9 @@ package s3
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -159,11 +162,15 @@ func (b *Backend) Create(ctx context.Context, path string) (shstorage.Writer, er
 	if err == nil && target.etag == nil {
 		return nil, fmt.Errorf("s3: inspect destination s3://%s/%s: missing ETag", bucket, key)
 	}
+	stageKey, err := nextTemporaryStageKey(key)
+	if err != nil {
+		return nil, fmt.Errorf("s3: stage temporary object for s3://%s/%s: %w", bucket, key, err)
+	}
 	return &writer{
 		ops:            ops,
 		bucket:         bucket,
 		key:            key,
-		stageKey:       ".shoal-tmp/" + uuid.NewString(),
+		stageKey:       stageKey,
 		writeID:        uuid.NewString(),
 		ctx:            ctx,
 		targetExists:   err == nil,
@@ -195,7 +202,7 @@ func (b *Backend) List(ctx context.Context, prefix string) ([]string, error) {
 		}
 		for _, obj := range page.Contents {
 			if obj.Key == nil || strings.HasSuffix(*obj.Key, "/") ||
-				strings.HasPrefix(*obj.Key, ".shoal-tmp/") {
+				strings.HasPrefix(*obj.Key, ".shoal-tmp/") || isTemporaryStageKey(*obj.Key) {
 				continue
 			}
 			out = append(out, "s3://"+bucket+"/"+*obj.Key)
@@ -223,6 +230,66 @@ func ParsePath(path string) (bucket, key string, err error) {
 		return "", "", fmt.Errorf("s3: empty bucket in %q", path)
 	}
 	return bucket, key, nil
+}
+
+const (
+	maxObjectKeyBytes     = 1024
+	tempStageKeyPrefix    = ".shl-"
+	tempStageHashHexLen   = 4
+	tempStageRandomHexLen = 10
+	tempStageComponentLen = len(tempStageKeyPrefix) + tempStageHashHexLen + tempStageRandomHexLen
+	legacyStageDirPrefix  = ".shoal-tmp/"
+)
+
+var randomStageKeyToken = func() (string, error) {
+	buf := make([]byte, tempStageRandomHexLen/2)
+	if _, err := rand.Read(buf); err != nil {
+		return "", fmt.Errorf("generate random staging token: %w", err)
+	}
+	return hex.EncodeToString(buf), nil
+}
+
+func nextTemporaryStageKey(key string) (string, error) {
+	prefix := temporaryStageKeyPrefixFor(key)
+	hash := sha256.Sum256([]byte(key))
+	token, err := randomStageKeyToken()
+	if err != nil {
+		return "", err
+	}
+	hashHex := hex.EncodeToString(hash[:tempStageHashHexLen/2])
+	if len(hashHex) < tempStageHashHexLen || len(token) < tempStageRandomHexLen {
+		return "", fmt.Errorf("temporary key token material too short")
+	}
+	component := tempStageKeyPrefix + hashHex[:tempStageHashHexLen] + token[:tempStageRandomHexLen]
+	if len(prefix)+len(component) > maxObjectKeyBytes {
+		return "", fmt.Errorf("temporary key exceeds %d-byte S3 object-key limit", maxObjectKeyBytes)
+	}
+	return prefix + component, nil
+}
+
+func temporaryStageKeyPrefixFor(key string) string {
+	prefix := stageKeyParentPrefix(key)
+	for prefix != "" && maxObjectKeyBytes-len(prefix) < tempStageComponentLen {
+		trimmed := strings.TrimSuffix(prefix, "/")
+		prefix = stageKeyParentPrefix(trimmed)
+	}
+	return prefix
+}
+
+func stageKeyParentPrefix(key string) string {
+	if idx := strings.LastIndexByte(key, '/'); idx >= 0 {
+		return key[:idx+1]
+	}
+	return ""
+}
+
+func isTemporaryStageKey(key string) bool {
+	name := key
+	if idx := strings.LastIndexByte(name, '/'); idx >= 0 {
+		name = name[idx+1:]
+	}
+	return strings.HasPrefix(key, legacyStageDirPrefix) ||
+		(len(name) == tempStageComponentLen && strings.HasPrefix(name, tempStageKeyPrefix))
 }
 
 // file is the S3 File implementation. Each ReadAt issues a fresh Range GET —

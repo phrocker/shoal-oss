@@ -183,7 +183,7 @@ func (b *Backend) List(ctx context.Context, prefix string) ([]string, error) {
 		if err != nil {
 			return nil, fmt.Errorf("gcs: list gs://%s/%s: %w", bucket, objectPrefix, err)
 		}
-		if attrs == nil || attrs.Name == "" || strings.HasSuffix(attrs.Name, "/") {
+		if attrs == nil || attrs.Name == "" || strings.HasSuffix(attrs.Name, "/") || isTemporaryObjectName(attrs.Name) {
 			continue
 		}
 		out = append(out, "gs://"+bucket+"/"+attrs.Name)
@@ -208,13 +208,13 @@ func ParsePath(path string) (bucket, object string, err error) {
 }
 
 const (
-	maxObjectNameBytes         = 1024
-	tempObjectPrefix           = ".shoal-tmp-"
-	tempObjectHashHexLen       = 8
-	tempObjectRandomHexLen     = 16
-	minTempObjectHashHexLen    = 4
-	minTempObjectRandomHexLen  = 4
-	minTempObjectComponentSize = len(tempObjectPrefix) + minTempObjectHashHexLen + 1 + minTempObjectRandomHexLen
+	maxObjectNameBytes     = 1024
+	maxObjectSegmentBytes  = 512
+	tempObjectPrefix       = ".shl-"
+	tempObjectHashHexLen   = 4
+	tempObjectRandomHexLen = 10
+	tempObjectComponentLen = len(tempObjectPrefix) + tempObjectHashHexLen + tempObjectRandomHexLen
+	legacyTempObjectPrefix = ".shoal-tmp-"
 )
 
 var randomTempObjectToken = func() (string, error) {
@@ -232,9 +232,16 @@ func nextTemporaryObjectName(object string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	component, err := buildTemporaryObjectComponent(prefix, hex.EncodeToString(hash[:tempObjectHashHexLen/2]), token)
-	if err != nil {
-		return "", err
+	hashHex := hex.EncodeToString(hash[:tempObjectHashHexLen/2])
+	if len(hashHex) < tempObjectHashHexLen || len(token) < tempObjectRandomHexLen {
+		return "", fmt.Errorf("temporary object token material too short")
+	}
+	component := temporaryObjectComponent(hashHex, token)
+	if len(component) > maxObjectSegmentBytes {
+		return "", fmt.Errorf("temporary object segment exceeds %d-byte hierarchical limit", maxObjectSegmentBytes)
+	}
+	if len(prefix)+len(component) > maxObjectNameBytes {
+		return "", fmt.Errorf("temporary object name exceeds %d-byte GCS object limit", maxObjectNameBytes)
 	}
 	return prefix + component, nil
 }
@@ -248,41 +255,24 @@ func tempObjectParentPrefix(object string) string {
 
 func temporaryObjectPrefixFor(object string) string {
 	prefix := tempObjectParentPrefix(object)
-	for prefix != "" && maxObjectNameBytes-len(prefix) < minTempObjectComponentSize {
+	for prefix != "" && maxObjectNameBytes-len(prefix) < tempObjectComponentLen {
 		trimmed := strings.TrimSuffix(prefix, "/")
 		prefix = tempObjectParentPrefix(trimmed)
 	}
 	return prefix
 }
 
-func buildTemporaryObjectComponent(prefix, hash, token string) (string, error) {
-	available := maxObjectNameBytes - len(prefix)
-	if available < minTempObjectComponentSize {
-		return "", fmt.Errorf("object prefix %q leaves only %d bytes for a temporary object (need at least %d of %d total)", prefix, available, minTempObjectComponentSize, maxObjectNameBytes)
-	}
+func temporaryObjectComponent(hash, token string) string {
+	return tempObjectPrefix + hash[:tempObjectHashHexLen] + token[:tempObjectRandomHexLen]
+}
 
-	hashLen := min(len(hash), tempObjectHashHexLen)
-	randomLen := min(len(token), tempObjectRandomHexLen)
-	component := func(hashLen, randomLen int) string {
-		return tempObjectPrefix + hash[:hashLen] + "-" + token[:randomLen]
+func isTemporaryObjectName(object string) bool {
+	name := object
+	if idx := strings.LastIndexByte(name, '/'); idx >= 0 {
+		name = name[idx+1:]
 	}
-	for len(component(hashLen, randomLen)) > available {
-		if randomLen > minTempObjectRandomHexLen {
-			randomLen--
-			continue
-		}
-		if hashLen > minTempObjectHashHexLen {
-			hashLen--
-			continue
-		}
-		break
-	}
-
-	value := component(hashLen, randomLen)
-	if len(value) > available {
-		return "", fmt.Errorf("temporary object name exceeds %d-byte GCS object limit", maxObjectNameBytes)
-	}
-	return value, nil
+	return strings.HasPrefix(name, legacyTempObjectPrefix) ||
+		(len(name) == tempObjectComponentLen && strings.HasPrefix(name, tempObjectPrefix))
 }
 
 // file is the GCS File implementation. Each ReadAt opens a fresh

@@ -270,9 +270,10 @@ func (b *Backend) Open(ctx context.Context, objectPath string) (storage.File, er
 		return nil, fmt.Errorf("hdfs: open %s: %w", objectPath, err)
 	}
 	if err := applyDeadline(ctx, reader); err != nil {
-		_ = reader.Close()
-		_ = lease.release()
-		return nil, fmt.Errorf("hdfs: open %s: %w", objectPath, err)
+		return nil, errors.Join(
+			fmt.Errorf("hdfs: open %s: %w", objectPath, err),
+			cleanupReaderAfterDeadlineFailure(objectPath, reader, lease.release),
+		)
 	}
 	f := &file{
 		reader:  reader,
@@ -315,21 +316,25 @@ func (b *Backend) Create(ctx context.Context, objectPath string) (storage.Writer
 		return nil, fmt.Errorf("hdfs: create temporary file %s: %w", tempPath, err)
 	}
 	if err := applyDeadline(ctx, writer); err != nil {
-		cleanupCtx, cancel := context.WithTimeout(context.Background(), cleanupTimeout)
-		_ = closeAfterReplication(cleanupCtx, writer)
-		_ = b.cleanupRemove(cleanupCtx, tempPath)
-		cancel()
-		_ = lease.release()
-		return nil, fmt.Errorf("hdfs: create temporary file %s: %w", tempPath, err)
+		return nil, errors.Join(
+			fmt.Errorf("hdfs: create temporary file %s: %w", tempPath, err),
+			cleanupWriterAfterDeadlineFailure(
+				tempPath,
+				writer,
+				func(cleanupCtx context.Context) error { return b.cleanupRemove(cleanupCtx, tempPath) },
+				lease.release,
+			),
+		)
 	}
 	w := &replaceWriter{
-		client:        lease.client,
-		cleanupClient: b.client,
-		release:       lease.release,
-		writer:        writer,
-		ctx:           ctx,
-		temp:          tempPath,
-		target:        resolved,
+		client:              lease.client,
+		cleanupClient:       b.client,
+		cleanupLeaseFactory: b.newOperation,
+		release:             lease.release,
+		writer:              writer,
+		ctx:                 ctx,
+		temp:                tempPath,
+		target:              resolved,
 	}
 	if err := b.registerHandle(w.shutdown, func(done func()) { w.complete = done }); err != nil {
 		_ = w.shutdown()
@@ -863,6 +868,55 @@ func applyDeadline(ctx context.Context, target any) error {
 	return setter.SetDeadline(deadline)
 }
 
+func cleanupReaderAfterDeadlineFailure(path string, reader Reader, release func() error) error {
+	var cleanupErr error
+	if reader != nil {
+		if err := reader.Close(); err != nil {
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("hdfs: close reader for %s: %w", path, err))
+		}
+	}
+	if release != nil {
+		if err := release(); err != nil {
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("hdfs: close operation client: %w", err))
+		}
+	}
+	return cleanupErr
+}
+
+func cleanupWriterAfterDeadlineFailure(
+	path string,
+	writer storage.Writer,
+	removeTemp func(context.Context) error,
+	release func() error,
+) error {
+	cleanupCtx, cancel := context.WithTimeout(context.Background(), cleanupTimeout)
+	defer cancel()
+
+	var cleanupErr error
+	if writer != nil {
+		var closeErr error
+		if closer, ok := writer.(contextCloser); ok {
+			closeErr = closer.CloseContext(cleanupCtx)
+		} else {
+			closeErr = writer.Close()
+		}
+		if closeErr != nil {
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("hdfs: close temporary file %s: %w", path, closeErr))
+		}
+	}
+	if removeTemp != nil {
+		if err := removeTemp(cleanupCtx); err != nil {
+			cleanupErr = errors.Join(cleanupErr, err)
+		}
+	}
+	if release != nil {
+		if err := release(); err != nil {
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("hdfs: close operation client: %w", err))
+		}
+	}
+	return cleanupErr
+}
+
 type file struct {
 	mu       sync.Mutex
 	reader   Reader
@@ -900,20 +954,21 @@ func (f *file) Close() error {
 func (f *file) Size() int64 { return f.size }
 
 type replaceWriter struct {
-	mu             sync.Mutex
-	client         Client
-	cleanupClient  Client
-	release        func() error
-	writer         storage.Writer
-	ctx            context.Context
-	temp           string
-	target         string
-	closed         bool
-	abortRequested bool
-	aborted        bool
-	writerClosed   bool
-	state          replacementState
-	complete       func()
+	mu                  sync.Mutex
+	client              Client
+	cleanupClient       Client
+	cleanupLeaseFactory func(context.Context) (*leasedClient, error)
+	release             func() error
+	writer              storage.Writer
+	ctx                 context.Context
+	temp                string
+	target              string
+	closed              bool
+	abortRequested      bool
+	aborted             bool
+	writerClosed        bool
+	state               replacementState
+	complete            func()
 }
 
 type replacementState uint8
@@ -967,7 +1022,14 @@ func (w *replaceWriter) commitReplacement() error {
 	hadOld := true
 	if err := renameWithContext(w.ctx, w.client, w.target, backup); err != nil {
 		if !isNotFound(err) {
-			return fmt.Errorf("hdfs: preserve existing file %s: %w", w.target, err)
+			preserveErr := fmt.Errorf("hdfs: preserve existing file %s: %w", w.target, err)
+			if resolveErr := withCleanupContext(func(cleanupCtx context.Context) error {
+				return w.resolveBackupRenameAmbiguity(cleanupCtx, backup)
+			}); resolveErr != nil {
+				w.state = replacementUnabortable
+				return errors.Join(preserveErr, resolveErr)
+			}
+			return preserveErr
 		}
 		hadOld = false
 	}
@@ -988,8 +1050,16 @@ func (w *replaceWriter) commitReplacement() error {
 	if hadOld {
 		if err := removeWithContext(w.ctx, w.client, backup); err != nil && !isNotFound(err) {
 			cleanupErr := fmt.Errorf("hdfs: remove replacement backup %s: %w", backup, err)
+			backupPresent, inspectErr := w.backupExistsWithCleanupContext(backup)
+			if inspectErr != nil {
+				return errors.Join(cleanupErr, inspectErr)
+			}
+			if !backupPresent {
+				w.state = replacementCommitted
+				return nil
+			}
 			if rollbackErr := withCleanupContext(func(cleanupCtx context.Context) error {
-				return w.withCleanupClient(func(client Client) error {
+				return w.withCleanupClientContext(cleanupCtx, func(client Client) error {
 					return w.rollbackPublishedReplacement(cleanupCtx, client, backup)
 				})
 			}); rollbackErr != nil {
@@ -1387,7 +1457,7 @@ func (w *replaceWriter) removeTemp(ctx context.Context) error {
 }
 
 func (w *replaceWriter) restoreBackup(ctx context.Context, backup string) error {
-	return w.withCleanupClient(func(client Client) error {
+	return w.withCleanupClientContext(ctx, func(client Client) error {
 		if err := renameWithContext(ctx, client, backup, w.target); err != nil {
 			return fmt.Errorf("hdfs: restore existing file %s from %s: %w", w.target, backup, err)
 		}
@@ -1395,11 +1465,82 @@ func (w *replaceWriter) restoreBackup(ctx context.Context, backup string) error 
 	})
 }
 
+func (w *replaceWriter) resolveBackupRenameAmbiguity(ctx context.Context, backup string) error {
+	return w.withCleanupClientContext(ctx, func(client Client) error {
+		targetExists, err := pathExists(client, w.target)
+		if err != nil {
+			return fmt.Errorf("hdfs: inspect existing file %s after backup rename failure: %w", w.target, err)
+		}
+		backupExists, err := pathExists(client, backup)
+		if err != nil {
+			return fmt.Errorf("hdfs: inspect replacement backup %s after backup rename failure: %w", backup, err)
+		}
+		if targetExists || !backupExists {
+			return nil
+		}
+		if err := renameWithContext(ctx, client, backup, w.target); err != nil {
+			return fmt.Errorf("hdfs: restore existing file %s from %s after backup rename failure: %w", w.target, backup, err)
+		}
+		return nil
+	})
+}
+
+func (w *replaceWriter) backupExistsWithCleanupContext(backup string) (bool, error) {
+	var exists bool
+	err := withCleanupContext(func(ctx context.Context) error {
+		return w.withCleanupClientContext(ctx, func(client Client) error {
+			var err error
+			exists, err = pathExists(client, backup)
+			if err != nil {
+				return fmt.Errorf("hdfs: inspect replacement backup %s after delete failure: %w", backup, err)
+			}
+			return nil
+		})
+	})
+	return exists, err
+}
+
+func (w *replaceWriter) withCleanupClientContext(ctx context.Context, fn func(Client) error) (retErr error) {
+	if fn == nil {
+		return nil
+	}
+	if w.cleanupLeaseFactory == nil {
+		return w.withCleanupClient(fn)
+	}
+	lease, err := w.cleanupLeaseFactory(ctx)
+	if err != nil {
+		return fmt.Errorf("hdfs: acquire bounded cleanup client: %w", err)
+	}
+	defer func() {
+		if releaseErr := lease.release(); releaseErr != nil && retErr != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("hdfs: close bounded cleanup client: %w", releaseErr))
+		}
+	}()
+	return fn(lease.client)
+}
+
 func (w *replaceWriter) withCleanupClient(fn func(Client) error) error {
 	if w.cleanupClient == nil {
 		return errors.New("hdfs: cleanup client is not configured")
 	}
 	return fn(w.cleanupClient)
+}
+
+func pathExists(client Client, name string) (bool, error) {
+	if client == nil {
+		return false, errors.New("hdfs: nil client")
+	}
+	reader, err := client.Open(name)
+	if err != nil {
+		if isNotFound(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	if closeErr := reader.Close(); closeErr != nil {
+		return true, fmt.Errorf("hdfs: close inspection reader for %s: %w", name, closeErr)
+	}
+	return true, nil
 }
 
 var (
