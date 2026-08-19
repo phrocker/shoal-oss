@@ -136,6 +136,7 @@ void shoal_bridge_batch_writer_free(shoal_batch_writer *writer);
 
 char *shoal_bridge_string_alloc(const char *value, size_t length);
 void shoal_bridge_string_free(char *value);
+#ifdef SHOAL_CAPI_TEST
 void shoal_bridge_test_string_alloc_fail_after(size_t successful_allocations);
 void shoal_bridge_test_string_alloc_reset(void);
 void shoal_bridge_test_result_alloc_fail_after(size_t successful_allocations);
@@ -145,6 +146,7 @@ void shoal_bridge_test_error_alloc_reset(void);
 void shoal_bridge_test_error_message_alloc_fail_after(
     size_t successful_allocations);
 void shoal_bridge_test_error_message_alloc_reset(void);
+#endif
 
 shoal_scan_result *shoal_bridge_scan_result_alloc(size_t count);
 int shoal_bridge_scan_result_set(

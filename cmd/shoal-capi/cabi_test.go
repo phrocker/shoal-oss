@@ -107,7 +107,7 @@ func TestSharedLibraryCABI(t *testing.T) {
 	}
 	bridgeArgs := append(
 		append([]string{}, cc.args...),
-		"-std=c11", "-Wall", "-Wextra", "-Werror",
+		"-std=c11", "-Wall", "-Wextra", "-Werror", "-DSHOAL_CAPI_TEST",
 		"-I", include,
 		"-I", filepath.Join(root, "cmd", "shoal-capi"),
 		filepath.Join(root, "capi", "tests", "result_bridge.c"),

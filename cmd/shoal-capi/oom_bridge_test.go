@@ -1,3 +1,5 @@
+//go:build shoal_capi_test
+
 package main
 
 import (
