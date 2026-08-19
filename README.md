@@ -299,8 +299,10 @@ opt-in.
   artifacts that cannot be mapped back to one safe target are reported in
   `ArtifactCleanupResult.Recoverable` for manual recovery instead of being
   deleted automatically. Cloud cleanup verifies Shoal ownership metadata and
-  uses generation/ETag/version-conditional deletes; S3 cleanup therefore
-  requires object-version listing, inspection, and deletion permissions.
+  uses generation/ETag/version-conditional deletes. Cloud bucket/container
+  roots are valid cleanup prefixes so root-level artifacts are reachable. S3
+  cleanup requires `GetBucketVersioning` plus object-version listing,
+  inspection, and deletion permissions.
 
 ## License
 

@@ -383,11 +383,13 @@ func (b *Backend) CleanupStaleArtifacts(ctx context.Context, prefix string, cuto
 	if err := shstorage.ValidateArtifactCleanupCutoff(time.Now(), cutoff); err != nil {
 		return result, fmt.Errorf("azure: %w", err)
 	}
-	cont, blobPrefix, err := ParsePath(prefix)
+	cont, blobPrefix, err := parseArtifactCleanupPrefix(prefix)
 	if err != nil {
 		return result, err
 	}
-	blobPrefix = strings.TrimRight(blobPrefix, "/\\") + "/"
+	if blobPrefix != "" {
+		blobPrefix = strings.TrimRight(blobPrefix, "/\\") + "/"
+	}
 	artifacts, err := b.artifactOps.list(ctx, cont, blobPrefix)
 	if err != nil {
 		return result, fmt.Errorf("azure: list stale artifacts az://%s/%s: %w", cont, blobPrefix, err)
@@ -451,6 +453,15 @@ func ParsePath(path string) (containerName, blobName string, err error) {
 		return "", "", fmt.Errorf("azure: empty container in %q", path)
 	}
 	return containerName, blobName, nil
+}
+
+func parseArtifactCleanupPrefix(path string) (container, prefix string, err error) {
+	trimmed := strings.TrimPrefix(path, "az://")
+	container, prefix, _ = strings.Cut(trimmed, "/")
+	if container == "" {
+		return "", "", fmt.Errorf("azure: empty container in %q", path)
+	}
+	return container, strings.TrimLeft(prefix, "/"), nil
 }
 
 const (
@@ -529,6 +540,9 @@ func isLegacyTemporaryStageName(name string) bool {
 	}
 	remainder := name[len(legacyStageDirPrefix):]
 	if remainder == "" || strings.ContainsRune(remainder, '/') {
+		return false
+	}
+	if remainder != strings.ToLower(remainder) {
 		return false
 	}
 	_, err := uuid.Parse(remainder)
@@ -673,6 +687,9 @@ func configuredOrAutomaticSourceProvider(
 
 func isLowerHex(value string) bool {
 	if value == "" {
+		return false
+	}
+	if value != strings.ToLower(value) {
 		return false
 	}
 	decoded, err := hex.DecodeString(value)

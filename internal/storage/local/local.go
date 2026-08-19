@@ -373,6 +373,9 @@ func isGeneratedReplacementName(name, prefix string) bool {
 	if len(token) != replacementNameTokenBytes*2 {
 		return false
 	}
+	if token != strings.ToLower(token) {
+		return false
+	}
 	decoded, err := hex.DecodeString(token)
 	return err == nil && len(decoded) == replacementNameTokenBytes
 }
@@ -498,17 +501,18 @@ func (w *writer) commitReplacement() error {
 	return nil
 }
 
-// discardUnusedBackup removes the replacement backup after a failed publish,
-// but only once the destination is known to be intact. The rename fallback in
-// platformAtomicReplace can leave the backup holding the only copy of the
-// previous contents, so a missing destination is restored from the backup, and
-// the backup is retained for manual recovery when that restore fails.
+// discardUnusedBackup restores a missing destination after a failed publish.
+// If the destination exists, the publish outcome is ambiguous: it may be the
+// original, the staged replacement, or a concurrent writer's file. Retain the
+// backup for explicit recovery rather than risking deletion of the old bytes.
 func (w *writer) discardUnusedBackup(backup string) error {
-	targetPresent, err := replacementPathExists(w.ops, w.target)
+	_, err := w.ops.Lstat(w.target)
 	if err != nil {
-		return fmt.Errorf("local: inspect destination %s after publish failure: %w", w.target, err)
+		if !errors.Is(err, fs.ErrNotExist) {
+			return fmt.Errorf("local: inspect destination %s after publish failure: %w", w.target, err)
+		}
 	}
-	if !targetPresent {
+	if errors.Is(err, fs.ErrNotExist) {
 		backupPresent, err := replacementPathExists(w.ops, backup)
 		if err != nil {
 			return fmt.Errorf("local: inspect replacement backup %s after publish failure: %w", backup, err)
@@ -524,10 +528,10 @@ func (w *writer) discardUnusedBackup(backup string) error {
 		}
 		return nil
 	}
-	if err := w.ops.Remove(backup); err != nil && !errors.Is(err, fs.ErrNotExist) {
-		return fmt.Errorf("local: remove unused replacement backup %s: %w", backup, err)
-	}
-	return nil
+	return fmt.Errorf(
+		"local: publish outcome for %s is ambiguous; backup %s retained for recovery",
+		w.target, backup,
+	)
 }
 
 func replacementPathExists(ops replacementOps, path string) (bool, error) {

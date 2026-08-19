@@ -232,11 +232,13 @@ func (b *Backend) CleanupStaleArtifacts(ctx context.Context, prefix string, cuto
 	if err := shstorage.ValidateArtifactCleanupCutoff(time.Now(), cutoff); err != nil {
 		return result, fmt.Errorf("gcs: %w", err)
 	}
-	bucket, objectPrefix, err := ParsePath(prefix)
+	bucket, objectPrefix, err := parseArtifactCleanupPrefix(prefix)
 	if err != nil {
 		return result, err
 	}
-	objectPrefix = strings.TrimRight(objectPrefix, "/\\") + "/"
+	if objectPrefix != "" {
+		objectPrefix = strings.TrimRight(objectPrefix, "/\\") + "/"
+	}
 	artifacts, err := b.artifactOps.list(ctx, bucket, objectPrefix)
 	if err != nil {
 		return result, fmt.Errorf("gcs: list stale artifacts gs://%s/%s: %w", bucket, objectPrefix, err)
@@ -287,6 +289,15 @@ func ParsePath(path string) (bucket, object string, err error) {
 		return "", "", fmt.Errorf("gcs: empty bucket in %q", path)
 	}
 	return bucket, object, nil
+}
+
+func parseArtifactCleanupPrefix(path string) (bucket, prefix string, err error) {
+	trimmed := strings.TrimPrefix(path, "gs://")
+	bucket, prefix, _ = strings.Cut(trimmed, "/")
+	if bucket == "" {
+		return "", "", fmt.Errorf("gcs: empty bucket in %q", path)
+	}
+	return bucket, strings.TrimLeft(prefix, "/"), nil
 }
 
 const (
@@ -368,7 +379,11 @@ func isLegacyTemporaryObjectName(name string) bool {
 	if idx <= 0 {
 		return false
 	}
-	_, err := uuid.Parse(name[idx+len(legacyTempObjectPrefix):])
+	token := name[idx+len(legacyTempObjectPrefix):]
+	if token != strings.ToLower(token) {
+		return false
+	}
+	_, err := uuid.Parse(token)
 	return err == nil
 }
 
@@ -383,6 +398,9 @@ func isGeneratedTemporaryObjectComponent(name string) bool {
 
 func isLowerHex(value string) bool {
 	if value == "" {
+		return false
+	}
+	if value != strings.ToLower(value) {
 		return false
 	}
 	decoded, err := hex.DecodeString(value)

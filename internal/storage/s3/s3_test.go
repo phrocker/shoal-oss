@@ -80,12 +80,14 @@ type fakeS3ArtifactOperations struct {
 	artifacts    []s3Artifact
 	removeErrors map[string]error
 	removed      []s3Artifact
+	listedPrefix string
 }
 
-func (o *fakeS3ArtifactOperations) list(ctx context.Context, _, _ string) ([]s3Artifact, error) {
+func (o *fakeS3ArtifactOperations) list(ctx context.Context, _, prefix string) ([]s3Artifact, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	o.listedPrefix = prefix
 	return append([]s3Artifact(nil), o.artifacts...), nil
 }
 
@@ -259,6 +261,7 @@ func TestParsePath(t *testing.T) {
 		{"/leading-slash/o", "", "", true}, // leading slash → empty bucket → error
 		{"", "", "", true},
 	}
+
 	for _, c := range cases {
 		t.Run(c.in, func(t *testing.T) {
 			b, k, err := ParsePath(c.in)
@@ -276,6 +279,26 @@ func TestParsePath(t *testing.T) {
 				t.Errorf("got (%q, %q), want (%q, %q)", b, k, c.bucket, c.key)
 			}
 		})
+	}
+}
+
+func TestParseArtifactCleanupPrefixAcceptsBucketRoot(t *testing.T) {
+	for _, path := range []string{"s3://bucket", "s3://bucket/", "bucket"} {
+		bucket, prefix, err := parseArtifactCleanupPrefix(path)
+		if err != nil || bucket != "bucket" || prefix != "" {
+			t.Fatalf("parseArtifactCleanupPrefix(%q) = %q, %q, %v", path, bucket, prefix, err)
+		}
+	}
+}
+
+func TestCleanupStaleArtifactsListsBucketRoot(t *testing.T) {
+	ops := &fakeS3ArtifactOperations{}
+	backend := &Backend{artifactOps: ops}
+	if _, err := backend.CleanupStaleArtifacts(context.Background(), "s3://bucket/", time.Now().Add(-time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if ops.listedPrefix != "" {
+		t.Fatalf("listed prefix = %q, want bucket root", ops.listedPrefix)
 	}
 }
 
@@ -454,8 +477,14 @@ func TestIsTemporaryStageKeyMatchesOnlyReservedFormats(t *testing.T) {
 	if !isTemporaryStageKey(".shoal-tmp/" + legacyUUID) {
 		t.Fatal("legacy temporary stage key was not detected")
 	}
+	if isTemporaryStageKey(".shoal-tmp/" + strings.ToUpper(legacyUUID)) {
+		t.Fatal("uppercase legacy user key should remain visible")
+	}
 	if !isTemporaryStageKey("tenant/.shoal-tmp-aaaaaaaaaa1234") {
 		t.Fatal("generated temporary stage key was not detected")
+	}
+	if isTemporaryStageKey("tenant/.shoal-tmp-AAAAAAAAAA1234") {
+		t.Fatal("uppercase user key should remain visible")
 	}
 	if isTemporaryStageKey("tenant/.shoal-tmp-aaaaaaaaaa") {
 		t.Fatal("partial generated temporary stage key should remain visible")

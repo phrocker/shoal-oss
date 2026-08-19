@@ -1063,13 +1063,48 @@ func TestLocal_PublishFailureRetainsBackupWhenRestoreFails(t *testing.T) {
 	}
 }
 
+func TestLocal_PublishFailureRetainsBackupWhenDestinationChanged(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "target")
+	if err := os.WriteFile(path, []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	w, err := New().Create(context.Background(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	localWriter := w.(*writer)
+	publishErr := errors.New("injected ambiguous publish failure")
+	ops := &strandedBackupOps{
+		replacementOps:  localWriter.ops,
+		err:             publishErr,
+		concurrentBytes: []byte("concurrent"),
+	}
+	localWriter.ops = ops
+	if _, err := w.Write([]byte("new")); err != nil {
+		t.Fatal(err)
+	}
+	err = w.Close()
+	if !errors.Is(err, publishErr) || !strings.Contains(err.Error(), "retained for recovery") {
+		t.Fatalf("Close error = %v, want publish failure and retained-backup notice", err)
+	}
+	if got, err := os.ReadFile(path); err != nil || string(got) != "concurrent" {
+		t.Fatalf("destination = %q, %v; want concurrent", got, err)
+	}
+	if got, err := os.ReadFile(ops.backup); err != nil || string(got) != "old" {
+		t.Fatalf("backup = %q, %v; want old", got, err)
+	}
+}
+
 // strandedBackupOps mimics the rename fallback failing after the old target has
 // already been moved aside, leaving the backup as the only copy.
 type strandedBackupOps struct {
 	replacementOps
-	err        error
-	restoreErr error
-	backup     string
+	err             error
+	restoreErr      error
+	backup          string
+	concurrentBytes []byte
 }
 
 func (o *strandedBackupOps) AtomicReplace(temp, target, backup string, hadOld bool) error {
@@ -1080,6 +1115,11 @@ func (o *strandedBackupOps) AtomicReplace(temp, target, backup string, hadOld bo
 		return err
 	}
 	o.backup = backup
+	if o.concurrentBytes != nil {
+		if err := os.WriteFile(target, o.concurrentBytes, 0o600); err != nil {
+			return err
+		}
+	}
 	return o.err
 }
 

@@ -1194,6 +1194,9 @@ func isGeneratedReplacementName(name, prefix string) bool {
 	if len(token) != replacementNameTokenBytes*2 {
 		return false
 	}
+	if token != strings.ToLower(token) {
+		return false
+	}
 	decoded, err := hex.DecodeString(token)
 	return err == nil && len(decoded) == replacementNameTokenBytes
 }

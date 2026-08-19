@@ -718,6 +718,7 @@ func TestBackendListHidesGeneratedReplacementArtifacts(t *testing.T) {
 	client.files["/tables/"+replacementBackupPrefix+"visible"] = []byte("visible")
 	client.files["/tables/"+replacementTempPrefix+strings.Repeat("c", replacementNameTokenBytes*2+1)] = []byte("visible")
 	client.files["/tables/"+replacementBackupPrefix+strings.Repeat("d", replacementNameTokenBytes*2+1)] = []byte("visible")
+	client.files["/tables/"+replacementTempPrefix+strings.Repeat("A", replacementNameTokenBytes*2)] = []byte("visible")
 	client.files["/tables/"+replacementTempPrefix+strings.Repeat("a", replacementNameTokenBytes*2)] = []byte("temp")
 	client.files["/tables/"+replacementBackupPrefix+strings.Repeat("b", replacementNameTokenBytes*2)] = []byte("backup")
 	backend, err := New("nn:8020", WithClient(client))
@@ -737,6 +738,7 @@ func TestBackendListHidesGeneratedReplacementArtifacts(t *testing.T) {
 		"hdfs://nn:8020/tables/" + replacementBackupPrefix + "visible",
 		"hdfs://nn:8020/tables/" + replacementTempPrefix + strings.Repeat("c", replacementNameTokenBytes*2+1),
 		"hdfs://nn:8020/tables/" + replacementBackupPrefix + strings.Repeat("d", replacementNameTokenBytes*2+1),
+		"hdfs://nn:8020/tables/" + replacementTempPrefix + strings.Repeat("A", replacementNameTokenBytes*2),
 	}
 	slices.Sort(got)
 	slices.Sort(want)

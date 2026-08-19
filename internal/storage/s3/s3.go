@@ -247,11 +247,13 @@ func (b *Backend) CleanupStaleArtifacts(ctx context.Context, prefix string, cuto
 	if err := shstorage.ValidateArtifactCleanupCutoff(time.Now(), cutoff); err != nil {
 		return result, fmt.Errorf("s3: %w", err)
 	}
-	bucket, objectPrefix, err := ParsePath(prefix)
+	bucket, objectPrefix, err := parseArtifactCleanupPrefix(prefix)
 	if err != nil {
 		return result, err
 	}
-	objectPrefix = strings.TrimRight(objectPrefix, "/\\") + "/"
+	if objectPrefix != "" {
+		objectPrefix = strings.TrimRight(objectPrefix, "/\\") + "/"
+	}
 	artifacts, err := b.artifactOps.list(ctx, bucket, objectPrefix)
 	if err != nil {
 		return result, fmt.Errorf("s3: list stale artifacts s3://%s/%s: %w", bucket, objectPrefix, err)
@@ -345,6 +347,15 @@ func ParsePath(path string) (bucket, key string, err error) {
 	return bucket, key, nil
 }
 
+func parseArtifactCleanupPrefix(path string) (bucket, prefix string, err error) {
+	trimmed := strings.TrimPrefix(path, "s3://")
+	bucket, prefix, _ = strings.Cut(trimmed, "/")
+	if bucket == "" {
+		return "", "", fmt.Errorf("s3: empty bucket in %q", path)
+	}
+	return bucket, strings.TrimLeft(prefix, "/"), nil
+}
+
 const (
 	maxObjectKeyBytes     = 1024
 	tempStageKeyPrefix    = ".shoal-tmp-"
@@ -422,6 +433,9 @@ func isLegacyTemporaryStageKey(key string) bool {
 	if remainder == "" || strings.ContainsRune(remainder, '/') {
 		return false
 	}
+	if remainder != strings.ToLower(remainder) {
+		return false
+	}
 	_, err := uuid.Parse(remainder)
 	return err == nil
 }
@@ -437,6 +451,9 @@ func isGeneratedTemporaryStageComponent(name string) bool {
 
 func isLowerHex(value string) bool {
 	if value == "" {
+		return false
+	}
+	if value != strings.ToLower(value) {
 		return false
 	}
 	decoded, err := hex.DecodeString(value)

@@ -47,6 +47,7 @@ func TestParsePath(t *testing.T) {
 		{"/leading-slash/o", "", "", true}, // leading slash → empty bucket → error
 		{"", "", "", true},
 	}
+
 	for _, c := range cases {
 		t.Run(c.in, func(t *testing.T) {
 			b, o, err := ParsePath(c.in)
@@ -64,6 +65,26 @@ func TestParsePath(t *testing.T) {
 				t.Errorf("got (%q, %q), want (%q, %q)", b, o, c.bucket, c.object)
 			}
 		})
+	}
+}
+
+func TestParseArtifactCleanupPrefixAcceptsBucketRoot(t *testing.T) {
+	for _, path := range []string{"gs://bucket", "gs://bucket/", "bucket"} {
+		bucket, prefix, err := parseArtifactCleanupPrefix(path)
+		if err != nil || bucket != "bucket" || prefix != "" {
+			t.Fatalf("parseArtifactCleanupPrefix(%q) = %q, %q, %v", path, bucket, prefix, err)
+		}
+	}
+}
+
+func TestCleanupStaleArtifactsListsBucketRoot(t *testing.T) {
+	ops := &fakeGCSArtifactOperations{}
+	backend := &Backend{artifactOps: ops}
+	if _, err := backend.CleanupStaleArtifacts(context.Background(), "gs://bucket/", time.Now().Add(-time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if ops.listedPrefix != "" {
+		t.Fatalf("listed prefix = %q, want bucket root", ops.listedPrefix)
 	}
 }
 
@@ -501,11 +522,17 @@ func TestIsTemporaryObjectNameMatchesOnlyReservedFormats(t *testing.T) {
 	if !isTemporaryObjectName("tenant/.shoal-tmp-aaaaaaaaaa1234") {
 		t.Fatal("generated temporary object was not detected")
 	}
+	if isTemporaryObjectName("tenant/.shoal-tmp-AAAAAAAAAA1234") {
+		t.Fatal("uppercase user object should remain visible")
+	}
 	if isTemporaryObjectName("tenant/.shoal-tmp-aaaaaaaaaa") {
 		t.Fatal("partial generated temporary object should remain visible")
 	}
 	if !isTemporaryObjectName("tenant/object.rf" + legacyTempObjectPrefix + legacyUUID) {
 		t.Fatal("legacy temporary object was not detected")
+	}
+	if isTemporaryObjectName("tenant/object.rf" + legacyTempObjectPrefix + strings.ToUpper(legacyUUID)) {
+		t.Fatal("uppercase legacy user object should remain visible")
 	}
 	if isTemporaryObjectName("tenant/.shl-visible-data") {
 		t.Fatal("user-visible .shl- object should not be hidden")
@@ -1606,12 +1633,14 @@ type fakeGCSArtifactOperations struct {
 	artifacts    []gcsArtifact
 	removeErrors map[string]error
 	removed      []gcsArtifact
+	listedPrefix string
 }
 
-func (o *fakeGCSArtifactOperations) list(ctx context.Context, _, _ string) ([]gcsArtifact, error) {
+func (o *fakeGCSArtifactOperations) list(ctx context.Context, _, prefix string) ([]gcsArtifact, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	o.listedPrefix = prefix
 	return append([]gcsArtifact(nil), o.artifacts...), nil
 }
 

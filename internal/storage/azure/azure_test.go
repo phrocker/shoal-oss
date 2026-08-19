@@ -53,12 +53,14 @@ type fakeAzureArtifactOperations struct {
 	artifacts    []azureArtifact
 	removeErrors map[string]error
 	removed      []azureArtifact
+	listedPrefix string
 }
 
-func (o *fakeAzureArtifactOperations) list(ctx context.Context, _, _ string) ([]azureArtifact, error) {
+func (o *fakeAzureArtifactOperations) list(ctx context.Context, _, prefix string) ([]azureArtifact, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	o.listedPrefix = prefix
 	return append([]azureArtifact(nil), o.artifacts...), nil
 }
 
@@ -308,6 +310,7 @@ func TestParsePath(t *testing.T) {
 		{"/leading-slash/o", "", "", true}, // leading slash → empty container → error
 		{"", "", "", true},
 	}
+
 	for _, c := range cases {
 		t.Run(c.in, func(t *testing.T) {
 			cont, blob, err := ParsePath(c.in)
@@ -325,6 +328,26 @@ func TestParsePath(t *testing.T) {
 				t.Errorf("got (%q, %q), want (%q, %q)", cont, blob, c.container, c.blob)
 			}
 		})
+	}
+}
+
+func TestParseArtifactCleanupPrefixAcceptsContainerRoot(t *testing.T) {
+	for _, path := range []string{"az://container", "az://container/", "container"} {
+		container, prefix, err := parseArtifactCleanupPrefix(path)
+		if err != nil || container != "container" || prefix != "" {
+			t.Fatalf("parseArtifactCleanupPrefix(%q) = %q, %q, %v", path, container, prefix, err)
+		}
+	}
+}
+
+func TestCleanupStaleArtifactsListsContainerRoot(t *testing.T) {
+	ops := &fakeAzureArtifactOperations{}
+	backend := &Backend{artifactOps: ops}
+	if _, err := backend.CleanupStaleArtifacts(context.Background(), "az://container/", time.Now().Add(-time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if ops.listedPrefix != "" {
+		t.Fatalf("listed prefix = %q, want container root", ops.listedPrefix)
 	}
 }
 
@@ -553,8 +576,14 @@ func TestIsTemporaryStageNameMatchesOnlyReservedFormats(t *testing.T) {
 	if !isTemporaryStageName(".shoal-tmp/" + legacyUUID) {
 		t.Fatal("legacy temporary stage blob was not detected")
 	}
+	if isTemporaryStageName(".shoal-tmp/" + strings.ToUpper(legacyUUID)) {
+		t.Fatal("uppercase legacy user blob should remain visible")
+	}
 	if !isTemporaryStageName("tenant/.shoal-tmp-aaaaaaaaaa1234") {
 		t.Fatal("generated temporary stage blob was not detected")
+	}
+	if isTemporaryStageName("tenant/.shoal-tmp-AAAAAAAAAA1234") {
+		t.Fatal("uppercase user blob should remain visible")
 	}
 	if isTemporaryStageName("tenant/.shoal-tmp-aaaaaaaaaa") {
 		t.Fatal("partial generated temporary stage blob should remain visible")
