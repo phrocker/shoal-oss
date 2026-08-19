@@ -29,14 +29,14 @@ Shoal separates **ABI compatibility** from **feature availability**:
   stable allocation-free version tuple that works before connector creation.
   `SHOAL_ABI_VERSION_PACKED` uses
   `SHOAL_ABI_PACK_VERSION(major, minor, patch)` with a hexadecimal
-  `0x00MMmmpp` layout, so ABI `1.5.0` is `0x00010500`.
+  `0x00MMmmpp` layout, so ABI `1.6.0` is `0x00010600`.
 - Capability identifiers are append-only. Existing IDs and bits never change
   meaning. `shoal_abi_capability_word_count()` reports how many 64-bit words
   the current library uses, `shoal_abi_capability_word(i)` returns `0` for
   `i >= word_count`, and `shoal_abi_has_capability(id)` returns `0` for both
   unsupported and unknown IDs.
 
-Current capability assignments (`word 0 == 0x000000000001ffff`):
+Current capability assignments (`word 0 == 0x000000000003ffff`):
 
 | ID | Mask | Surface |
 | --- | --- | --- |
@@ -57,6 +57,7 @@ Current capability assignments (`word 0 == 0x000000000001ffff`):
 | `SHOAL_ABI_CAPABILITY_DATA_DESCRIPTORS` | `0x4000` | owned range and iterator-setting descriptors with versioned borrowed views |
 | `SHOAL_ABI_CAPABILITY_CONFIGURATION_TOPOLOGY` | `0x8000` | binary-safe configuration handles and owned instance-topology snapshots |
 | `SHOAL_ABI_CAPABILITY_RFILE` | `0x10000` | owned standalone RFile readers, writers, seekable relocations, and copied results |
+| `SHOAL_ABI_CAPABILITY_DATA_VALUES` | `0x20000` | copied key/range/authorization operations and owned key/value results |
 
 Shoal does **not** advertise instance status, compaction/import/export,
 Python/wheel, or any other unimplemented surface until the API exists and has
@@ -140,6 +141,10 @@ Version numbers change only when the public ABI contract changes:
   ranges, and family accessors return owned results. Operations accept
   per-call deadlines, close cancels and joins active work, and every free is
   NULL-safe, idempotent, and clears the caller's handle.
+- Key and range formatting/predicates are local copied-value operations.
+  Key/value results own every nested byte slice. Authorization handles copy,
+  sort, and deduplicate labels at construction and are immutable, making
+  concurrent getters safe while free remains externally serialized.
 - Scanner and batch-scanner handles support concurrent scan calls. Close
   cancels and joins in-flight calls and is idempotent while the handle remains
   alive; free performs best-effort close and sets the handle variable to

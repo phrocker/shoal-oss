@@ -144,6 +144,7 @@ void shoal_bridge_configuration_free(shoal_configuration *configuration) {
 SHOAL_BRIDGE_DEFINE_HANDLE(rfile_reader, shoal_rfile_reader)
 SHOAL_BRIDGE_DEFINE_HANDLE(rfile_writer, shoal_rfile_writer)
 SHOAL_BRIDGE_DEFINE_HANDLE(rfile_seekable, shoal_rfile_seekable)
+SHOAL_BRIDGE_DEFINE_HANDLE(authorizations, shoal_authorizations)
 
 #undef SHOAL_BRIDGE_DEFINE_HANDLE
 
@@ -657,6 +658,61 @@ void shoal_bridge_rfile_entry_free(shoal_rfile_entry_result *result) {
   shoal_bridge_scan_entry_clear(&result->entry);
   result->deleted = 0;
   free(result);
+}
+
+shoal_key_value_result *shoal_bridge_key_value_alloc(
+    const uint8_t *row, size_t row_length, const uint8_t *column_family,
+    size_t column_family_length, const uint8_t *column_qualifier,
+    size_t column_qualifier_length, const uint8_t *column_visibility,
+    size_t column_visibility_length, int64_t timestamp, const uint8_t *value,
+    size_t value_length) {
+  shoal_key_value_result *result =
+      (shoal_key_value_result *)shoal_bridge_result_calloc(1, sizeof(*result));
+  if (result == NULL) {
+    return NULL;
+  }
+  if (!shoal_bridge_key_entry_set(
+          &result->entry, row, row_length, column_family, column_family_length,
+          column_qualifier, column_qualifier_length, column_visibility,
+          column_visibility_length, timestamp, 1)) {
+    free(result);
+    return NULL;
+  }
+  result->entry.value = shoal_bridge_result_copy_bytes(value, value_length);
+  if (value_length != 0 && result->entry.value == NULL) {
+    shoal_bridge_scan_entry_clear(&result->entry);
+    free(result);
+    return NULL;
+  }
+  result->entry.value_length = value_length;
+  return result;
+}
+
+int shoal_bridge_key_value_get(const shoal_key_value_result *result,
+                               shoal_key_value_view *out_value) {
+  if (result == NULL || out_value == NULL) {
+    return 0;
+  }
+  memset(out_value, 0, sizeof(*out_value));
+  out_value->row.data = result->entry.row;
+  out_value->row.length = result->entry.row_length;
+  out_value->column_family.data = result->entry.column_family;
+  out_value->column_family.length = result->entry.column_family_length;
+  out_value->column_qualifier.data = result->entry.column_qualifier;
+  out_value->column_qualifier.length = result->entry.column_qualifier_length;
+  out_value->column_visibility.data = result->entry.column_visibility;
+  out_value->column_visibility.length = result->entry.column_visibility_length;
+  out_value->timestamp = result->entry.timestamp;
+  out_value->value.data = result->entry.value;
+  out_value->value.length = result->entry.value_length;
+  return 1;
+}
+
+void shoal_bridge_key_value_free(shoal_key_value_result *result) {
+  if (result != NULL) {
+    shoal_bridge_scan_entry_clear(&result->entry);
+    free(result);
+  }
 }
 
 shoal_scan_result *shoal_bridge_scan_result_alloc(size_t count) {

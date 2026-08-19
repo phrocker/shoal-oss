@@ -38,6 +38,62 @@ shoal_abi_capability_word(uint32_t word_index);
 SHOAL_API uint8_t SHOAL_CALL
 shoal_abi_has_capability(shoal_abi_capability_id capability_id);
 
+/*
+ * Data-value operations are local and do not take deadlines. Every byte input
+ * is copied before return. Authorizations handles are immutable after
+ * construction, so concurrent getters are safe; free must be externally
+ * serialized and clears the caller's handle. All result frees are NULL-safe
+ * and idempotent.
+ */
+SHOAL_API void SHOAL_CALL
+shoal_key_value_init(shoal_key_value *value);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_key_to_string(const shoal_key *key, shoal_bytes_result **out_result,
+                    shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_range_after_end_key(const shoal_range *range, const shoal_key *key,
+                          uint8_t *out_value, shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_range_before_start_key(const shoal_range *range, const shoal_key *key,
+                             uint8_t *out_value, shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_range_to_string(const shoal_range *range,
+                      shoal_bytes_result **out_result,
+                      shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_key_value_create(const shoal_key_value *value,
+                       shoal_key_value_result **out_result,
+                       shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_key_value_result_get(const shoal_key_value_result *result,
+                           shoal_key_value_view *out_value,
+                           shoal_error **out_error);
+SHOAL_API void SHOAL_CALL
+shoal_key_value_result_free(shoal_key_value_result **result);
+
+SHOAL_API shoal_status SHOAL_CALL
+shoal_authorizations_create(const shoal_bytes *labels, size_t label_count,
+                            shoal_authorizations **out_authorizations,
+                            shoal_error **out_error);
+SHOAL_API uint8_t SHOAL_CALL
+shoal_authorizations_contains(const shoal_authorizations *authorizations,
+                              shoal_bytes label);
+SHOAL_API size_t SHOAL_CALL
+shoal_authorizations_count(const shoal_authorizations *authorizations);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_authorizations_list(const shoal_authorizations *authorizations,
+                          shoal_bytes_list_result **out_result,
+                          shoal_error **out_error);
+SHOAL_API uint8_t SHOAL_CALL
+shoal_authorizations_empty(const shoal_authorizations *authorizations);
+SHOAL_API uint8_t SHOAL_CALL
+shoal_authorizations_equal(const shoal_authorizations *left,
+                           const shoal_authorizations *right);
+SHOAL_API uint8_t SHOAL_CALL
+shoal_authorization_character_is_valid(uint8_t character);
+SHOAL_API void SHOAL_CALL
+shoal_authorizations_free(shoal_authorizations **authorizations);
+
 SHOAL_API void SHOAL_CALL
 shoal_rfile_writer_config_init(shoal_rfile_writer_config *config);
 SHOAL_API void SHOAL_CALL
