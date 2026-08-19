@@ -61,13 +61,13 @@ type fakeZK struct {
 	sequence map[string]int32
 	watches  map[string][]chan gozk.Event
 
-	// armed reports the path of every established existence watch, so a test
-	// can act at the moment the code under test is listening.
+	// armed reports the path of every established watch, so a test can act at
+	// the moment the code under test is listening.
 	armed chan string
 
 	createErr map[string]error
 	childErr  map[string]error
-	existsErr map[string]error
+	getErr    map[string]error
 	deleteErr map[string]error
 
 	// duplicates makes the next sequential create leave that many extra nodes
@@ -86,10 +86,10 @@ type fakeZK struct {
 	// window between deciding to register and having registered.
 	beforeCreate func(path string)
 
-	// beforeExists runs before an existence watch is established, so a test
-	// can make a node vanish in the window between listing a directory and
-	// watching what it found.
-	beforeExists func(path string)
+	// beforeGet runs before a node is read and watched, so a test can make it
+	// vanish in the window between listing a directory and watching what it
+	// found.
+	beforeGet func(path string)
 
 	// beforeChildren runs before a directory is listed, so a test can change
 	// the tree in the window between creating a node and reading the queue.
@@ -104,7 +104,7 @@ func newFakeZK(seeded ...string) *fakeZK {
 		armed:     make(chan string, 64),
 		createErr: make(map[string]error),
 		childErr:  make(map[string]error),
-		existsErr: make(map[string]error),
+		getErr:    make(map[string]error),
 		deleteErr: make(map[string]error),
 	}
 	for _, znode := range seeded {
@@ -235,25 +235,35 @@ func (f *fakeZK) Children(znodePath string) ([]string, *gozk.Stat, error) {
 	return children, &gozk.Stat{}, nil
 }
 
-func (f *fakeZK) ExistsW(znodePath string) (bool, *gozk.Stat, <-chan gozk.Event, error) {
-	if f.beforeExists != nil {
-		f.beforeExists(znodePath)
+// GetW models go-zookeeper's read-with-watch, whose watch is registered only
+// when the read succeeds: a missing node is ErrNoNode and leaves nothing
+// behind. That is the difference the protocol depends on — an existence watch
+// would be registered either way, and on a sequential node that is never
+// created twice it would never fire.
+func (f *fakeZK) GetW(znodePath string) ([]byte, *gozk.Stat, <-chan gozk.Event, error) {
+	if f.beforeGet != nil {
+		f.beforeGet(znodePath)
 	}
 	f.mu.Lock()
-	if err := f.existsErr[znodePath]; err != nil {
+	if err := f.getErr[znodePath]; err != nil {
 		f.mu.Unlock()
-		return false, nil, nil, err
+		return nil, nil, nil, err
 	}
+	node, exists := f.nodes[znodePath]
+	if !exists {
+		f.mu.Unlock()
+		return nil, nil, nil, gozk.ErrNoNode
+	}
+	data := append([]byte(nil), node.data...)
 	events := make(chan gozk.Event, 1)
 	f.watches[znodePath] = append(f.watches[znodePath], events)
-	_, exists := f.nodes[znodePath]
 	f.mu.Unlock()
 
 	select {
 	case f.armed <- znodePath:
 	default:
 	}
-	return exists, &gozk.Stat{}, events, nil
+	return data, &gozk.Stat{}, events, nil
 }
 
 func (f *fakeZK) Delete(znodePath string, _ int32) error {
@@ -386,10 +396,10 @@ func (f *fakeZK) failChildren(znodePath string, err error) {
 	f.childErr[znodePath] = err
 }
 
-func (f *fakeZK) failExists(znodePath string, err error) {
+func (f *fakeZK) failGet(znodePath string, err error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.existsErr[znodePath] = err
+	f.getErr[znodePath] = err
 }
 
 func (f *fakeZK) failCreate(znodePath string, err error) {

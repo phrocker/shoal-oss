@@ -367,7 +367,7 @@ func TestAcquireRereadsWhenThePredecessorVanishesBeforeTheWatch(t *testing.T) {
 	holderPath := path.Join(testLockPath(), holder)
 
 	var once sync.Once
-	f.beforeExists = func(watched string) {
+	f.beforeGet = func(watched string) {
 		if watched != holderPath {
 			return
 		}
@@ -381,6 +381,38 @@ func TestAcquireRereadsWhenThePredecessorVanishesBeforeTheWatch(t *testing.T) {
 	}
 	if id.Sequence != 1 {
 		t.Fatalf("acquired sequence %d, want 1", id.Sequence)
+	}
+	// And nothing was left watching it. A node that vanished this way is a
+	// sequence ZooKeeper will not hand out again, so a watch registered on it
+	// could only be released by the session ending.
+	if watches := f.watchCount(holderPath); watches != 0 {
+		t.Fatalf("%d watches left on a node that is gone for good", watches)
+	}
+}
+
+// TestQueueLeavesNoWatchOnItsOwnNodeOnceItIsGone is the same requirement on
+// the other watch a queued candidate arms. Both are sequential names, and the
+// one this process created is not coming back either.
+func TestQueueLeavesNoWatchOnItsOwnNodeOnceItIsGone(t *testing.T) {
+	f := newFakeZK()
+	f.seedForeignLock(testLockPath(), otherUUID, 0)
+	lock := newTestLock(t, f, serverUUID)
+
+	var once sync.Once
+	f.beforeGet = func(watched string) {
+		if !strings.HasPrefix(path.Base(watched), lock.nodePrefix()) {
+			return
+		}
+		once.Do(func() { _ = f.Delete(watched, -1) })
+	}
+
+	_, err := lock.Acquire(context.Background(), testLockData(t))
+	if !errors.Is(err, ErrLockNodeMissing) {
+		t.Fatalf("Acquire = %v, want ErrLockNodeMissing", err)
+	}
+	own := path.Join(testLockPath(), fmt.Sprintf("%s%010d", lock.nodePrefix(), 1))
+	if watches := f.watchCount(own); watches != 0 {
+		t.Fatalf("%d watches left on %s, which cannot be created again", watches, own)
 	}
 }
 
@@ -517,6 +549,38 @@ func TestMaintainReportsSessionExpiry(t *testing.T) {
 	}
 }
 
+// TestMaintainLeavesNoWatchOnANodeThatIsAlreadyGone covers the same
+// registration question at the holder's end. A generation whose node vanished
+// before the watch was armed ends, and it must end without leaving a watch on
+// a sequential name ZooKeeper will not issue twice.
+func TestMaintainLeavesNoWatchOnANodeThatIsAlreadyGone(t *testing.T) {
+	f := newFakeZK()
+	lock := newTestLock(t, f, serverUUID)
+	if _, err := lock.Acquire(context.Background(), testLockData(t)); err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	nodePath := path.Join(testLockPath(), lock.Node())
+
+	var once sync.Once
+	f.beforeGet = func(watched string) {
+		if watched != nodePath {
+			return
+		}
+		once.Do(func() { _ = f.Delete(nodePath, -1) })
+	}
+
+	err := lock.Maintain(context.Background())
+	if !errors.Is(err, ErrLockLost) {
+		t.Fatalf("Maintain: want ErrLockLost, got %v", err)
+	}
+	if lock.LossReason() != LossNodeDeleted {
+		t.Fatalf("loss reason %s, want NODE_DELETED", lock.LossReason())
+	}
+	if watches := f.watchCount(nodePath); watches != 0 {
+		t.Fatalf("%d watches left on %s, which cannot be created again", watches, nodePath)
+	}
+}
+
 // TestAcquireRefusesDescriptorsThatDoNotMatchTheDirectory covers the other
 // half of the identity a lock publishes. The directory is how a server is
 // enumerated and the descriptor is what a client dials, and Accumulo builds
@@ -629,7 +693,7 @@ func TestMaintainFailsClosedWhenTheLockCannotBeWatched(t *testing.T) {
 	if _, err := lock.Acquire(context.Background(), testLockData(t)); err != nil {
 		t.Fatalf("Acquire: %v", err)
 	}
-	f.failExists(path.Join(testLockPath(), lock.Node()), gozk.ErrConnectionClosed)
+	f.failGet(path.Join(testLockPath(), lock.Node()), gozk.ErrConnectionClosed)
 
 	err := lock.Maintain(context.Background())
 	if !errors.Is(err, ErrLockLost) {
@@ -1042,6 +1106,46 @@ func TestVerifyRequiresAHeldLock(t *testing.T) {
 	lock := newTestLock(t, newFakeZK(), serverUUID)
 	if err := lock.Verify(); !errors.Is(err, ErrNotHeld) {
 		t.Fatalf("Verify: want ErrNotHeld, got %v", err)
+	}
+}
+
+// TestVerifyReportsAGenerationThatEndedWhileItWasReading is the honesty
+// requirement on a verification's timing. The directory can be read before a
+// release lands and the answer given after it, and a release whose delete
+// fails leaves the node exactly where the checks look for it — so a reading
+// alone would confirm a generation that is over, to a caller asking whether it
+// may still act on the lock.
+func TestVerifyReportsAGenerationThatEndedWhileItWasReading(t *testing.T) {
+	f := newFakeZK()
+	lock := newTestLock(t, f, serverUUID)
+	if _, err := lock.Acquire(context.Background(), testLockData(t)); err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	nodePath := path.Join(testLockPath(), lock.Node())
+	// The release cannot take the node away, so the directory still reads as
+	// this process holding the lock.
+	f.failDelete(nodePath, gozk.ErrConnectionClosed)
+
+	var once sync.Once
+	f.beforeChildren = func(listed string) {
+		if listed != testLockPath() {
+			return
+		}
+		once.Do(func() {
+			f.beforeChildren = nil
+			_ = lock.Release()
+		})
+	}
+
+	err := lock.Verify()
+	if !errors.Is(err, ErrLockLost) {
+		t.Fatalf("Verify = %v, want ErrLockLost for a generation that ended mid-read", err)
+	}
+	if lock.LossReason() != LossReleased {
+		t.Fatalf("loss reason %s, want RELEASED", lock.LossReason())
+	}
+	if !f.exists(nodePath) {
+		t.Fatal("the node must survive for this test to mean anything")
 	}
 }
 
@@ -2019,11 +2123,11 @@ func TestAcquireFailsWhenItsNodeVanishesBeforeTheWatch(t *testing.T) {
 	f.seedForeignLock(testLockPath(), otherUUID, 0)
 	lock := newTestLock(t, f, serverUUID)
 
-	f.beforeExists = func(znodePath string) {
+	f.beforeGet = func(znodePath string) {
 		if !strings.HasPrefix(path.Base(znodePath), lock.nodePrefix()) {
 			return
 		}
-		f.beforeExists = nil
+		f.beforeGet = nil
 		if err := f.Delete(znodePath, -1); err != nil {
 			panic(err)
 		}
@@ -2180,7 +2284,7 @@ func TestMaintainReusesTheWatchACancelledOneLeftBehind(t *testing.T) {
 	}
 
 	var rearmed atomic.Bool
-	f.beforeExists = func(znodePath string) {
+	f.beforeGet = func(znodePath string) {
 		if znodePath == nodePath {
 			rearmed.Store(true)
 		}

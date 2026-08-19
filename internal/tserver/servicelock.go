@@ -75,10 +75,19 @@ const (
 // *github.com/go-zookeeper/zk.Conn satisfies it directly, so a caller passes
 // the session it already authenticated with the instance secret; this package
 // does not open or own ZooKeeper connections.
+//
+// Nodes are watched by reading them, not by asking whether they exist.
+// ZooKeeper sets an existence watch even when the node is missing — that is
+// what makes it a creation watch — and every path watched here is a sequential
+// node whose name is never handed out twice, so such a watch could only ever
+// fire on a node that will never come back. It would sit on the client and the
+// server until the session ended. A read sets its watch only when it succeeds,
+// so a missing node costs nothing, and on a node that is there it fires on the
+// delete this protocol is waiting for.
 type LockConn interface {
 	Create(path string, data []byte, flags int32, acl []gozk.ACL) (string, error)
 	Children(path string) ([]string, *gozk.Stat, error)
-	ExistsW(path string) (bool, *gozk.Stat, <-chan gozk.Event, error)
+	GetW(path string) ([]byte, *gozk.Stat, <-chan gozk.Event, error)
 	Delete(path string, version int32) error
 }
 
@@ -663,7 +672,7 @@ func (l *ServiceLock) queueForOwnership(ctx context.Context) (LockID, error) {
 		// session dropping just that node — asleep on an event about a queue
 		// it is no longer in, until an unrelated holder happens to leave.
 		if mineEvents == nil {
-			mineExists, _, armed, err := l.conn.ExistsW(path.Join(l.dir, node))
+			armed, mineExists, err := l.watchNode(path.Join(l.dir, node))
 			if err != nil {
 				return LockID{}, fmt.Errorf("watch lock node %s: %w", node, err)
 			}
@@ -673,15 +682,17 @@ func (l *ServiceLock) queueForOwnership(ctx context.Context) (LockID, error) {
 			mineEvents = armed
 		}
 		ahead := findLowestPrevPrefix(sorted, index)
-		exists, _, aheadEvents, err := l.conn.ExistsW(path.Join(l.dir, ahead))
+		aheadEvents, exists, err := l.watchNode(path.Join(l.dir, ahead))
 		if err != nil {
 			return LockID{}, fmt.Errorf("watch lock node %s: %w", ahead, err)
 		}
 		if !exists {
 			// It left between the listing and the watch; re-read rather than
-			// wait for an event that will never come. The watch already armed
-			// on this process's own node is kept and reused by the next pass,
-			// so re-reading does not cost another registration.
+			// wait for an event that will never come. Nothing was registered
+			// on it — a read only sets a watch when it succeeds — and the
+			// watch already armed on this process's own node is kept and
+			// reused by the next pass, so re-reading costs no registrations at
+			// all.
 			continue
 		}
 		select {
@@ -830,7 +841,7 @@ func (l *ServiceLock) armWatch(nodePath string) (<-chan gozk.Event, error) {
 	if l.watch != nil {
 		return l.watch, nil
 	}
-	exists, _, armed, err := l.conn.ExistsW(nodePath)
+	armed, exists, err := l.watchNode(nodePath)
 	if err != nil {
 		return nil, l.lose(LossUnmonitorable, fmt.Errorf("watch %s: %w", nodePath, err))
 	}
@@ -839,6 +850,27 @@ func (l *ServiceLock) armWatch(nodePath string) (<-chan gozk.Event, error) {
 	}
 	l.watch = armed
 	return armed, nil
+}
+
+// watchNode arms a watch that fires when a node goes away, reporting a node
+// that is already gone without leaving a registration behind.
+//
+// Reading the node is what makes that possible: ZooKeeper sets a data watch
+// only when the read succeeds, while an existence watch is set either way,
+// because its purpose is to report a creation. Every path watched here is a
+// sequential lock node, and ZooKeeper never hands out the same sequence twice,
+// so an existence watch left on one could not fire before the session ended —
+// and a process that keeps retrying an acquisition would leave one per
+// attempt, on the client and on the server.
+func (l *ServiceLock) watchNode(nodePath string) (<-chan gozk.Event, bool, error) {
+	_, _, events, err := l.conn.GetW(nodePath)
+	switch {
+	case errors.Is(err, gozk.ErrNoNode):
+		return nil, false, nil
+	case err != nil:
+		return nil, false, err
+	}
+	return events, true, nil
 }
 
 // spendWatch drops a watch that has fired, so the next pass arms another. A
@@ -861,13 +893,24 @@ func (l *ServiceLock) spendWatch(spent <-chan gozk.Event) {
 // the lock was never held would drop a generation's ending on the floor for no
 // reason other than scheduling.
 func (l *ServiceLock) nothingToWatch() error {
+	if err := l.stillHeld(); err != nil {
+		return err
+	}
+	return fmt.Errorf("%w: %s", ErrNotHeld, l.dir)
+}
+
+// stillHeld reports the ending of a generation that has ended, and nil while
+// one is live. It is what keeps an answer from outliving the thing it is about:
+// a check that read ZooKeeper before a release or a loss landed would otherwise
+// return that reading afterwards, confirming a generation that is over.
+func (l *ServiceLock) stillHeld() error {
 	l.mu.Lock()
 	ended := l.reason != LossNone
 	l.mu.Unlock()
 	if ended {
 		return l.ended()
 	}
-	return fmt.Errorf("%w: %s", ErrNotHeld, l.dir)
+	return nil
 }
 
 // classifyEvent turns a watch event into a loss, or nil to keep watching.
@@ -882,6 +925,9 @@ func (l *ServiceLock) classifyEvent(event gozk.Event) error {
 	case event.State == gozk.StateExpired:
 		return l.lose(LossUnmonitorable, nil)
 	default:
+		// Anything else — a data change written to the node by something
+		// outside this process, say — is not a loss. The watch is spent, and
+		// the pass that re-arms it re-reads the directory.
 		return nil
 	}
 }
@@ -896,6 +942,12 @@ func (l *ServiceLock) classifyEvent(event gozk.Event) error {
 //
 // A verification made after the generation ended reports how it ended, the
 // same as Maintain, rather than that there is no lock to verify.
+//
+// That includes an ending that lands while the directory is being read. The
+// reading can be entirely before a release and the answer entirely after it,
+// and a release whose delete fails leaves the node in place for the checks
+// below to find, so the recorded ending is consulted again before this reports
+// a lock still held.
 func (l *ServiceLock) Verify() error {
 	l.mu.Lock()
 	held, node := l.held, l.node
@@ -914,7 +966,7 @@ func (l *ServiceLock) Verify() error {
 	if sorted[0] != node {
 		return l.lose(LossSuperseded, fmt.Errorf("%s now holds %s", sorted[0], l.dir))
 	}
-	return nil
+	return l.stillHeld()
 }
 
 // Release gives the lock up by deleting its node.

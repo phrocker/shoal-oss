@@ -235,7 +235,12 @@ not leave a tablet multiply hosted" hold.
 A `LockID` is only usable as fencing authority if it could name a real
 `zlock#<uuid>#<sequence>` node: the UUID must parse and the sequence must
 fit the signed 32-bit counter Accumulo reads with `Integer.parseInt`.
-The same checks live in `internal/zk`'s node parser.
+`internal/zk`'s node parser applies the same selection rule but not the
+same checks: it takes any spelling `uuid.Parse` accepts, while this one
+requires the canonical 36-character form Java's `UUID.fromString` takes,
+which is the only form Accumulo ever writes. The stricter side is the
+right one for fencing, and the divergence is described where it is
+observable, under "Reading the manager's lock".
 
 ## 6. Registering with ZooKeeper
 
@@ -403,6 +408,16 @@ consumed. Arming per pass would make a healthy tablet server accumulate
 a registration per verify interval for the life of its lock, and deliver
 all of them at once when the node finally changed.
 
+A node is watched by reading it, not by asking whether it exists. An
+existence watch is set even when the node is missing — reporting a
+creation is what it is for — and every path watched here is a sequential
+lock node, a name ZooKeeper never hands out twice. A watch left on one
+of those could not fire before the session ended, and the paths where
+that happens are the ordinary ones: a predecessor that left between the
+listing and the watch, an own node an operator removed, a held node a
+release took away. A read sets its watch only when it succeeds, so a
+node that is already gone costs nothing and says so.
+
 The outstanding watch belongs to the lock, not to the call that armed
 it. `Maintain` takes the caller's context and cancelling it does not
 release the lock, so a watch scoped to the call would be left registered
@@ -438,6 +453,14 @@ what a watch cannot: a watch dropped without an event, and a lock
 directory deleted and recreated, which restarts ZooKeeper's sequence
 counter and lets a later arrival take a lower number than the one held
 here. The node is still there; it is simply no longer the holder.
+
+A verification is about the moment it answers, not the moment it read.
+The directory can be read before a release lands and the answer given
+after it, and a release whose delete failed leaves the node exactly where
+the checks look for it — so a reading that finds this process holding the
+lock is confirmed against the recorded ending before it is reported. The
+question a caller asks is whether it may still act, and by then it may
+not.
 
 `Participate` is the only place ZooKeeper reality meets the fence. It
 acquires, hands the acquired generation to `AdoptLock`, watches it, and
