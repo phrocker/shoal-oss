@@ -178,19 +178,25 @@ func TestRFileExportTabletJSONRoundTripsNonUTF8Rows(t *testing.T) {
 		t.Fatalf("Marshal: %v", err)
 	}
 
-	// The wire form must carry start_row as base64, not as a JSON string
-	// literal holding the raw bytes (which would corrupt them).
+	// The wire form must carry the row under start_row_b64 as base64,
+	// not as a JSON string literal holding the raw bytes (which would
+	// corrupt them), and must not fall back to writing the legacy
+	// start_row key (which is now read-only, for old manifests).
 	var wire struct {
-		StartRow *string `json:"start_row"`
+		StartRow    *string `json:"start_row"`
+		StartRowB64 *string `json:"start_row_b64"`
 	}
 	if err := json.Unmarshal(data, &wire); err != nil {
 		t.Fatalf("Unmarshal wire probe: %v", err)
 	}
-	if wire.StartRow == nil {
-		t.Fatal("start_row missing from wire form")
+	if wire.StartRow != nil {
+		t.Fatalf("legacy start_row = %q, want absent (new manifests must only carry start_row_b64)", *wire.StartRow)
 	}
-	if _, err := base64.URLEncoding.DecodeString(*wire.StartRow); err != nil {
-		t.Fatalf("start_row %q is not valid base64: %v", *wire.StartRow, err)
+	if wire.StartRowB64 == nil {
+		t.Fatal("start_row_b64 missing from wire form")
+	}
+	if _, err := base64.URLEncoding.DecodeString(*wire.StartRowB64); err != nil {
+		t.Fatalf("start_row_b64 %q is not valid base64: %v", *wire.StartRowB64, err)
 	}
 
 	var round RFileExportTablet
@@ -232,13 +238,60 @@ func TestRFileExportTabletJSONOmitsNilBoundaries(t *testing.T) {
 }
 
 // TestRFileExportTabletJSONRejectsMalformedBase64 confirms a corrupted
-// or hand-edited manifest fails closed at decode time with a clear
-// error, rather than silently misinterpreting garbage as row bytes.
+// or hand-edited manifest's start_row_b64 field fails closed at decode
+// time with a clear error, rather than silently misinterpreting
+// garbage as row bytes. (The legacy start_row key is intentionally NOT
+// base64-validated -- see TestRFileExportTabletJSONDecodesLegacyPlainStringRows
+// -- so this test exercises start_row_b64, the only field this
+// validation now applies to.)
 func TestRFileExportTabletJSONRejectsMalformedBase64(t *testing.T) {
-	data := []byte(`{"index":0,"start_row":"not valid base64!!"}`)
+	data := []byte(`{"index":0,"start_row_b64":"not valid base64!!"}`)
 	var tablet RFileExportTablet
 	if err := json.Unmarshal(data, &tablet); err == nil {
 		t.Fatal("Unmarshal with malformed base64 start_row = nil error, want error")
+	}
+}
+
+// TestRFileExportTabletJSONDecodesLegacyPlainStringRows proves the
+// backward-compatibility guarantee in RFileExportTablet's doc comment:
+// a manifest already persisted by a build that predates the
+// start_row_b64/end_row_b64 encoding -- using the plain start_row/
+// end_row string keys exportTablets has always been able to populate,
+// for example one sitting on a storage backend waiting for
+// `shoal-embed import`, and not yet touched by this fix -- must still
+// decode successfully and losslessly for the UTF-8-safe rows that
+// format could ever correctly express, exactly as it always did before
+// this change.
+func TestRFileExportTabletJSONDecodesLegacyPlainStringRows(t *testing.T) {
+	data := []byte(`{"index":2,"start_row":"g","end_row":"m"}`)
+	var tablet RFileExportTablet
+	if err := json.Unmarshal(data, &tablet); err != nil {
+		t.Fatalf("Unmarshal legacy plain-string manifest: %v", err)
+	}
+	if tablet.Index != 2 {
+		t.Fatalf("Index = %d, want 2", tablet.Index)
+	}
+	if tablet.StartRow == nil || *tablet.StartRow != "g" {
+		t.Fatalf("StartRow = %v, want \"g\"", tablet.StartRow)
+	}
+	if tablet.EndRow == nil || *tablet.EndRow != "m" {
+		t.Fatalf("EndRow = %v, want \"m\"", tablet.EndRow)
+	}
+}
+
+// TestRFileExportTabletJSONPrefersB64OverLegacyWhenBothPresent documents
+// the (never produced by this package, but still deterministic) case of
+// a tablet object carrying both wire forms at once: the current,
+// byte-safe start_row_b64 representation must win.
+func TestRFileExportTabletJSONPrefersB64OverLegacyWhenBothPresent(t *testing.T) {
+	b64 := base64.URLEncoding.EncodeToString([]byte("b64-row"))
+	data := []byte(`{"index":0,"start_row_b64":"` + b64 + `","start_row":"legacy-row"}`)
+	var tablet RFileExportTablet
+	if err := json.Unmarshal(data, &tablet); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if tablet.StartRow == nil || *tablet.StartRow != "b64-row" {
+		t.Fatalf("StartRow = %v, want \"b64-row\" (start_row_b64 must take priority over legacy start_row)", tablet.StartRow)
 	}
 }
 
@@ -290,6 +343,54 @@ func TestRFileExportManifestJSONRoundTripsMultiTabletNonUTF8Splits(t *testing.T)
 	}
 	if round.Tablets[2].EndRow != nil {
 		t.Fatalf("tablet 2 EndRow = %v, want nil", round.Tablets[2].EndRow)
+	}
+}
+
+// TestRFileExportManifestJSONDecodesLegacyMultiTabletManifest proves a
+// whole multi-tablet manifest already persisted in the pre-fix wire
+// shape -- every start_row/end_row a plain JSON string, exactly what
+// exportTablets combined with the original json.Marshal-based encoding
+// produced for any multi-tablet table before start_row_b64/end_row_b64
+// existed -- still decodes successfully via cmd/shoal-embed import's
+// exact code path (json.Unmarshal into *RFileExportManifest), for the
+// UTF-8-safe split rows that pre-fix format could ever correctly
+// express. This is the manifest-level counterpart of
+// TestRFileExportTabletJSONDecodesLegacyPlainStringRows.
+func TestRFileExportManifestJSONDecodesLegacyMultiTabletManifest(t *testing.T) {
+	legacy := []byte(`{
+		"version": 1,
+		"source_table": "events",
+		"tablets": [
+			{"index": 0, "end_row": "g"},
+			{"index": 1, "start_row": "g", "end_row": "m"},
+			{"index": 2, "start_row": "m"}
+		],
+		"rfiles": []
+	}`)
+	var manifest RFileExportManifest
+	if err := json.Unmarshal(legacy, &manifest); err != nil {
+		t.Fatalf("Unmarshal legacy manifest: %v", err)
+	}
+	if len(manifest.Tablets) != 3 {
+		t.Fatalf("tablets = %d, want 3", len(manifest.Tablets))
+	}
+	if manifest.Tablets[0].StartRow != nil {
+		t.Fatalf("tablet 0 StartRow = %v, want nil", manifest.Tablets[0].StartRow)
+	}
+	if manifest.Tablets[0].EndRow == nil || *manifest.Tablets[0].EndRow != "g" {
+		t.Fatalf("tablet 0 EndRow = %v, want \"g\"", manifest.Tablets[0].EndRow)
+	}
+	if manifest.Tablets[1].StartRow == nil || *manifest.Tablets[1].StartRow != "g" {
+		t.Fatalf("tablet 1 StartRow = %v, want \"g\"", manifest.Tablets[1].StartRow)
+	}
+	if manifest.Tablets[1].EndRow == nil || *manifest.Tablets[1].EndRow != "m" {
+		t.Fatalf("tablet 1 EndRow = %v, want \"m\"", manifest.Tablets[1].EndRow)
+	}
+	if manifest.Tablets[2].StartRow == nil || *manifest.Tablets[2].StartRow != "m" {
+		t.Fatalf("tablet 2 StartRow = %v, want \"m\"", manifest.Tablets[2].StartRow)
+	}
+	if manifest.Tablets[2].EndRow != nil {
+		t.Fatalf("tablet 2 EndRow = %v, want nil", manifest.Tablets[2].EndRow)
 	}
 }
 

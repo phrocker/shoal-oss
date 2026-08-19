@@ -65,8 +65,9 @@ type RFileExportManifest struct {
 // used purely as byte containers -- Accumulo row keys are arbitrary
 // bytes, not necessarily valid UTF-8 text.
 //
-// MarshalJSON/UnmarshalJSON base64-encode StartRow/EndRow on the wire
-// instead of emitting them as ordinary JSON string literals: encoding/
+// MarshalJSON always writes StartRow/EndRow base64-encoded, under the
+// dedicated start_row_b64/end_row_b64 JSON keys, instead of emitting them
+// as ordinary JSON string literals under start_row/end_row: encoding/
 // json's default string handling treats a Go string as UTF-8 text and
 // silently replaces any invalid byte sequence with U+FFFD, which would
 // irrecoverably corrupt a split row that is not valid UTF-8 the moment
@@ -76,14 +77,26 @@ type RFileExportManifest struct {
 // byte-for-byte fidelity). This mirrors the same
 // ByteArrayToBase64TypeAdapter-equivalent convention this repo already
 // uses for Accumulo's own Bulk Import V2 loadmap.json wire format (see
-// promotion.base64RowPtr/base64RowValue). The "index"/"start_row"/
-// "end_row" JSON field names are unchanged; only the encoding of a
-// non-nil start_row/end_row value's contents changes, from a raw string
-// to a base64 one. No exported manifest with a non-nil StartRow/EndRow
-// was ever consumed by anything before multi-tablet promotion
-// (resolveManifestTablets in internal/promotion) started reading these
-// values, so this is not a breaking change for any manifest that could
-// previously round-trip successfully.
+// promotion.base64RowPtr/base64RowValue).
+//
+// UnmarshalJSON also still accepts the legacy plain start_row/end_row
+// string keys, decoding them exactly as a raw string always was before
+// this fix (unchanged, including its lossy-for-non-UTF-8-bytes
+// behavior). exportTablets has, since long before this type gained
+// custom JSON methods, been able to populate a non-nil StartRow/EndRow
+// for any table with more than one tablet -- and cmd/shoal-embed's
+// export/import commands persist and later re-read exactly this
+// manifest shape through a storage backend, so a manifest already
+// written to disk (or object storage) by an older build, and not yet
+// imported, is a real artifact this package must still be able to read
+// correctly, not merely a theoretical concern. Using a distinct JSON key
+// for the base64 form (rather than sniffing whether a single field's
+// contents happen to look like base64) is deliberate: a legacy raw
+// string that happens to already be valid base64 would otherwise
+// silently decode to different row bytes instead of failing loudly, the
+// exact failure mode this package must not introduce. New manifests
+// never round-trip through the legacy keys: MarshalJSON always emits
+// only the *_b64 keys.
 type RFileExportTablet struct {
 	Index    int
 	StartRow *string
@@ -91,34 +104,42 @@ type RFileExportTablet struct {
 }
 
 // rfileExportTabletJSON is RFileExportTablet's on-the-wire JSON shape.
+// StartRowB64/EndRowB64 is the only form MarshalJSON ever writes;
+// StartRow/EndRow (the pre-fix, plain-string keys) are accepted by
+// UnmarshalJSON only, purely for reading an already-persisted legacy
+// manifest -- see RFileExportTablet's doc comment.
 type rfileExportTabletJSON struct {
-	Index    int     `json:"index"`
-	StartRow *string `json:"start_row,omitempty"`
-	EndRow   *string `json:"end_row,omitempty"`
+	Index       int     `json:"index"`
+	StartRowB64 *string `json:"start_row_b64,omitempty"`
+	EndRowB64   *string `json:"end_row_b64,omitempty"`
+	StartRow    *string `json:"start_row,omitempty"`
+	EndRow      *string `json:"end_row,omitempty"`
 }
 
 // MarshalJSON implements json.Marshaler; see RFileExportTablet's doc
-// comment for why StartRow/EndRow are base64-encoded.
+// comment for why StartRow/EndRow are base64-encoded under dedicated
+// *_b64 keys.
 func (t RFileExportTablet) MarshalJSON() ([]byte, error) {
 	return json.Marshal(rfileExportTabletJSON{
-		Index:    t.Index,
-		StartRow: base64RowStringPtr(t.StartRow),
-		EndRow:   base64RowStringPtr(t.EndRow),
+		Index:       t.Index,
+		StartRowB64: base64RowStringPtr(t.StartRow),
+		EndRowB64:   base64RowStringPtr(t.EndRow),
 	})
 }
 
 // UnmarshalJSON implements json.Unmarshaler; see RFileExportTablet's doc
-// comment for why StartRow/EndRow are base64-decoded.
+// comment for the *_b64-preferred, legacy-plain-string-fallback decoding
+// this performs.
 func (t *RFileExportTablet) UnmarshalJSON(data []byte) error {
 	var raw rfileExportTabletJSON
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return err
 	}
-	startRow, err := base64RowStringValue(raw.StartRow)
+	startRow, err := decodeExportRow(raw.StartRowB64, raw.StartRow)
 	if err != nil {
 		return fmt.Errorf("engine: decode tablet %d start_row: %w", raw.Index, err)
 	}
-	endRow, err := base64RowStringValue(raw.EndRow)
+	endRow, err := decodeExportRow(raw.EndRowB64, raw.EndRow)
 	if err != nil {
 		return fmt.Errorf("engine: decode tablet %d end_row: %w", raw.Index, err)
 	}
@@ -126,6 +147,26 @@ func (t *RFileExportTablet) UnmarshalJSON(data []byte) error {
 	t.StartRow = startRow
 	t.EndRow = endRow
 	return nil
+}
+
+// decodeExportRow resolves one row boundary from its two possible wire
+// forms: b64 (the current, byte-safe representation this package always
+// writes) takes priority when present; legacy (the pre-fix plain-string
+// representation) is used as-is, unchanged from how every manifest ever
+// written before this fix was already read, only when b64 is absent.
+// Both being nil means an unbounded boundary; both being non-nil should
+// never happen from any manifest this package itself writes, but is
+// resolved deterministically (preferring b64) rather than rejected,
+// since it is not itself unsafe -- merely redundant.
+func decodeExportRow(b64, legacy *string) (*string, error) {
+	if b64 != nil {
+		return base64RowStringValue(b64)
+	}
+	if legacy != nil {
+		v := *legacy
+		return &v, nil
+	}
+	return nil, nil
 }
 
 // base64RowStringPtr base64-encodes row's raw bytes for the JSON wire

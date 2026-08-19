@@ -102,11 +102,25 @@ type Options struct {
 // empty, so a caller inspecting the destination afterwards sees the same
 // tablet boundaries regardless of which tablets happened to carry files.
 //
-// Promote validates tableName and bulkDir, and the manifest's tablet
-// chain (via RequiredDestinationSplits), before making any Accumulo call
-// or writing anything to dst, so a malformed manifest or invalid
-// destination never adds a split, stages a file, or submits a bulk
-// import before the call fails.
+// Promote validates tableName and bulkDir, and the whole manifest --
+// both its tablet chain shape (via RequiredDestinationSplits) and its
+// RFiles' own references into that chain (via a BuildLoadMapping
+// preflight: every RFile.TabletIndex must be declared, and a repeated
+// DestinationPath must not disagree about which index it belongs to) --
+// before making any Accumulo call or writing anything to dst. Without
+// that second, RFile-level check, a manifest whose tablet chain is
+// well-formed but whose RFiles reference an undeclared index, or
+// declare one DestinationPath under two conflicting indexes, would only
+// be rejected later, inside StageBulkDir's own BuildLoadMapping call --
+// by which point AddTableSplits below would already have mutated the
+// destination's real splits. Running BuildLoadMapping here first, and
+// discarding its result (StageBulkDir recomputes it over the
+// deduplicated RFile list further on; both calls are pure, network-free
+// functions of the manifest alone, so recomputing is cheap and never
+// observes a different destination state), closes that gap: a
+// malformed manifest of either kind, or an invalid destination, never
+// adds a split, stages a file, or submits a bulk import before the call
+// fails.
 //
 // Promote does not itself retry on failure, and retry safety differs by
 // which step failed. A failure in validation, AddTableSplits, or
@@ -135,6 +149,9 @@ func Promote(
 	opts Options,
 ) (LoadMapping, error) {
 	if err := validatePromotionDestination(dst, tableName, bulkDir); err != nil {
+		return nil, err
+	}
+	if _, err := BuildLoadMapping(manifest); err != nil {
 		return nil, err
 	}
 	splits, err := RequiredDestinationSplits(manifest)

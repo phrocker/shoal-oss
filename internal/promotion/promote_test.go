@@ -240,6 +240,78 @@ func TestPromoteRejectsMalformedManifestBeforeStagingOrSubmitting(t *testing.T) 
 	}
 }
 
+// TestPromoteRejectsUndeclaredTabletIndexBeforeAddTableSplitsForMultiTabletManifest
+// proves the gap this package's preflight BuildLoadMapping call in
+// Promote closes: a manifest whose tablet *chain* is entirely
+// well-formed (so RequiredDestinationSplits succeeds and would
+// otherwise let AddTableSplits proceed) but whose RFiles reference an
+// undeclared tablet index is rejected before AddTableSplits is ever
+// called, not merely before BulkImport. Unlike
+// TestPromoteRejectsMalformedManifestBeforeStagingOrSubmitting's
+// single-tablet manifest (which requires zero splits and so never
+// exercises this ordering at all), this manifest is a valid two-tablet
+// chain that does require AddTableSplits, making the ordering gap
+// observable.
+func TestPromoteRejectsUndeclaredTabletIndexBeforeAddTableSplitsForMultiTabletManifest(t *testing.T) {
+	src := memory.New()
+	src.Put("events/t-0000/F0001.rf", []byte("a"))
+	manifest := twoTabletManifest()
+	manifest.RFiles[0].DestinationPath = "events/t-0000/F0001.rf"
+	manifest.RFiles[0].Size = 1
+	manifest.RFiles[0].SHA256 = "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb"
+	// Tablet index 2 is not declared anywhere in manifest.Tablets (only
+	// 0 and 1 exist), even though the chain those two tablets form is
+	// itself perfectly valid.
+	manifest.RFiles[1].TabletIndex = 2
+	manifest.RFiles[1].DestinationPath = "events/t-0002/F0002.rf"
+
+	dst := memory.New()
+	importer := &fakePromoter{}
+	if _, err := Promote(context.Background(), src, manifest, dst, "/bulk/events-1", importer, "events", Options{}); err == nil {
+		t.Fatal("Promote with an RFile referencing an undeclared tablet index = nil error, want error")
+	}
+	if importer.splitCalls != 0 {
+		t.Fatalf("AddTableSplits calls = %d, want 0 (an RFile-level manifest error must fail before any split reconciliation)", importer.splitCalls)
+	}
+	if importer.calls != 0 {
+		t.Fatalf("BulkImport calls = %d, want 0", importer.calls)
+	}
+	if got := dst.Keys(); len(got) != 0 {
+		t.Fatalf("dst.Keys() = %v, want no staged files when manifest validation fails first", got)
+	}
+}
+
+// TestPromoteRejectsDestinationPathDeclaredUnderConflictingTabletIndexes
+// covers the other RFile-level error BuildLoadMapping's preflight now
+// catches before AddTableSplits: the same DestinationPath appearing
+// twice under two different TabletIndex values, which is ambiguous
+// about which destination tablet the physical file actually belongs to.
+func TestPromoteRejectsDestinationPathDeclaredUnderConflictingTabletIndexes(t *testing.T) {
+	src := memory.New()
+	src.Put("events/t-0000/F0001.rf", []byte("a"))
+	manifest := twoTabletManifest()
+	manifest.RFiles[0].DestinationPath = "events/t-0000/F0001.rf"
+	manifest.RFiles[0].Size = 1
+	manifest.RFiles[0].SHA256 = "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb"
+	// The same DestinationPath as RFiles[0], but declared under tablet
+	// index 1 instead of 0 -- an unresolvable conflict about which
+	// tablet the file belongs to, not a legitimate duplicate.
+	manifest.RFiles[1].TabletIndex = 1
+	manifest.RFiles[1].DestinationPath = "events/t-0000/F0001.rf"
+
+	dst := memory.New()
+	importer := &fakePromoter{}
+	if _, err := Promote(context.Background(), src, manifest, dst, "/bulk/events-1", importer, "events", Options{}); err == nil {
+		t.Fatal("Promote with a DestinationPath declared under conflicting tablet indexes = nil error, want error")
+	}
+	if importer.splitCalls != 0 {
+		t.Fatalf("AddTableSplits calls = %d, want 0 (an RFile-level manifest error must fail before any split reconciliation)", importer.splitCalls)
+	}
+	if importer.calls != 0 {
+		t.Fatalf("BulkImport calls = %d, want 0", importer.calls)
+	}
+}
+
 func TestPromoteReconcilesSplitsThenStagesThenSubmitsForMultiTabletManifest(t *testing.T) {
 	src := memory.New()
 	src.Put("events/t-0000/F0001.rf", []byte("a"))
