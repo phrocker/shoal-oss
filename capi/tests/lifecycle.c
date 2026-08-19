@@ -428,6 +428,10 @@ int main(void) {
                                                 &error),
                SHOAL_STATUS_NAMESPACE_NOT_EMPTY, &error,
                "namespace not empty");
+  expect_error(shoal_connector_delete_namespace(admin_connector, "analytics",
+                                                0, &error),
+               SHOAL_STATUS_NAMESPACE_NOT_EMPTY, &error,
+               "namespace not empty");
   expect_error(shoal_connector_rename_namespace(admin_connector, NULL, "work",
                                                 0, &error),
                SHOAL_STATUS_INVALID_ARGUMENT, &error, "namespace_name");
@@ -648,6 +652,17 @@ int main(void) {
   assert(strcmp(shoal_error_security_code(error), "USER_DOESNT_EXIST") == 0);
   shoal_error_free(&error);
   shoal_error_free(&error);
+  assert(shoal_connector_grant_table_permission(
+             admin_connector, "alice", "events", SHOAL_TABLE_PERMISSION_READ,
+             0, &error) == SHOAL_STATUS_OK);
+  assert(shoal_connector_drop_user(admin_connector, "alice", 0, &error) ==
+         SHOAL_STATUS_OK);
+  assert(shoal_connector_create_user(admin_connector, "alice", &empty_password,
+                                     0, &error) == SHOAL_STATUS_OK);
+  assert(shoal_connector_has_table_permission(
+             admin_connector, "alice", "events", SHOAL_TABLE_PERMISSION_READ,
+             0, &has_permission, &error) == SHOAL_STATUS_OK);
+  assert(has_permission == 0);
   assert(shoal_connector_drop_user(admin_connector, "alice", 0, &error) ==
          SHOAL_STATUS_OK);
 
@@ -667,6 +682,30 @@ int main(void) {
          SHOAL_STATUS_OK);
   assert(shoal_bytes_list_count(bytes_list) == 3);
   shoal_bytes_list_free(&bytes_list);
+  assert(shoal_connector_create_table(admin_connector, "split-source", 0,
+                                      &error) == SHOAL_STATUS_OK);
+  assert(shoal_connector_add_table_splits(admin_connector, "split-source",
+                                          splits, 2, 0, &error) ==
+         SHOAL_STATUS_OK);
+  assert(shoal_connector_rename_table(admin_connector, "split-source",
+                                      "split-target", 0, &error) ==
+         SHOAL_STATUS_OK);
+  assert(shoal_connector_list_table_splits(admin_connector, "split-target", 0,
+                                           &bytes_list, &error) ==
+         SHOAL_STATUS_OK);
+  assert(shoal_bytes_list_count(bytes_list) == 2);
+  shoal_bytes_list_free(&bytes_list);
+  assert(shoal_connector_delete_table(admin_connector, "split-target", 0,
+                                      &error) == SHOAL_STATUS_OK);
+  assert(shoal_connector_create_table(admin_connector, "split-target", 0,
+                                      &error) == SHOAL_STATUS_OK);
+  assert(shoal_connector_list_table_splits(admin_connector, "split-target", 0,
+                                           &bytes_list, &error) ==
+         SHOAL_STATUS_OK);
+  assert(shoal_bytes_list_count(bytes_list) == 0);
+  shoal_bytes_list_free(&bytes_list);
+  assert(shoal_connector_delete_table(admin_connector, "split-target", 0,
+                                      &error) == SHOAL_STATUS_OK);
   expect_error(shoal_connector_add_table_splits(admin_connector, "events",
                                                 NULL, 0, 0, &error),
                SHOAL_STATUS_INVALID_ARGUMENT, &error, "table split");

@@ -14,6 +14,7 @@ import (
 	"context"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/phrocker/shoal/accumulo"
@@ -136,6 +137,7 @@ func (c *testAdminConnector) DeleteTable(ctx context.Context, name string) error
 	}
 	delete(c.tables, name)
 	delete(c.properties, name)
+	delete(c.splits, name)
 	return nil
 }
 
@@ -160,6 +162,10 @@ func (c *testAdminConnector) RenameTable(ctx context.Context, oldName, newName s
 	if props, ok := c.properties[oldName]; ok {
 		c.properties[newName] = cloneProperties(props)
 		delete(c.properties, oldName)
+	}
+	if splits, ok := c.splits[oldName]; ok {
+		c.splits[newName] = cloneRows(splits)
+		delete(c.splits, oldName)
 	}
 	return nil
 }
@@ -320,13 +326,19 @@ func (c *testAdminConnector) DeleteNamespace(ctx context.Context, name string) e
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if name == "" {
-		return accumulo.ErrNamespaceNotEmpty
-	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if _, ok := c.namespaces[name]; !ok {
 		return accumulo.ErrNamespaceNotFound
+	}
+	for table := range c.tables {
+		namespace := ""
+		if separator := strings.IndexByte(table, '.'); separator >= 0 {
+			namespace = table[:separator]
+		}
+		if namespace == name {
+			return accumulo.ErrNamespaceNotEmpty
+		}
 	}
 	delete(c.namespaces, name)
 	delete(c.nsProps, name)
@@ -428,6 +440,12 @@ func (c *testAdminConnector) DropUser(ctx context.Context, user string) error {
 	}
 	delete(c.users, user)
 	delete(c.auths, user)
+	for key := range c.permissions {
+		parts := strings.Split(key, "\x00")
+		if len(parts) == 4 && parts[1] == user {
+			delete(c.permissions, key)
+		}
+	}
 	return nil
 }
 
