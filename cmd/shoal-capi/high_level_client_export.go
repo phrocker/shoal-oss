@@ -245,6 +245,7 @@ func shoal_client_create_scanner(
 		accumulo.Table{Name: snapshot.table},
 		accumulo.ScannerOptions{
 			Authorizations: snapshot.authorizations,
+			Columns:        snapshot.columns,
 			Parallelism:    int(snapshot.threadCount),
 		},
 	)

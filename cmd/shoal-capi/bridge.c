@@ -783,13 +783,14 @@ shoal_scan_result *shoal_bridge_scan_result_alloc(size_t count) {
     return NULL;
   }
   shoal_scan_result *result =
-      (shoal_scan_result *)calloc(1, sizeof(*result));
+      (shoal_scan_result *)shoal_bridge_result_calloc(1, sizeof(*result));
   if (result == NULL) {
     return NULL;
   }
   if (count != 0) {
     result->entries =
-        (shoal_bridge_scan_entry *)calloc(count, sizeof(*result->entries));
+        (shoal_bridge_scan_entry *)shoal_bridge_result_calloc(
+            count, sizeof(*result->entries));
     if (result->entries == NULL) {
       free(result);
       return NULL;

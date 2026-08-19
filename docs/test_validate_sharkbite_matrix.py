@@ -728,16 +728,16 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
         self.assertEqual(
             validator.EXPECTED_STATUS_COUNTS,
             {
-                "Covered": 79,
-                "Missing Go": 2357,
-                "Missing C ABI": 69,
-                "Behavior mismatch": 219,
+                "Covered": 84,
+                "Missing Go": 2361,
+                "Missing C ABI": 58,
+                "Behavior mismatch": 221,
                 validator.INTENTIONAL_DIVERGENCE_STATUS: 87,
                 validator.NOT_REQUIRED_STATUS: 392,
             },
         )
-        self.assertEqual(validator.EXPECTED_C_ABI_DECLARED_EXPORTS, 218)
-        self.assertEqual(validator.EXPECTED_C_ABI_REFERENCED_EXPORTS, 213)
+        self.assertEqual(validator.EXPECTED_C_ABI_DECLARED_EXPORTS, 223)
+        self.assertEqual(validator.EXPECTED_C_ABI_REFERENCED_EXPORTS, 218)
         self.assertEqual(
             validator.EXPECTED_C_ABI_UNREFERENCED_EXPORTS,
             (
@@ -764,6 +764,9 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
         self.assertIn("shoal_rfile_entry_result_get", referenced)
         self.assertIn("shoal_client_create", referenced)
         self.assertIn("shoal_client_create_batch_writer", referenced)
+        self.assertIn("shoal_client_select_column", referenced)
+        self.assertIn("shoal_client_scan_range_with_cancellation", referenced)
+        self.assertIn("shoal_client_scan_ranges_with_cancellation", referenced)
 
     def test_collect_c_abi_free_function_inventory_matches_header(self) -> None:
         free_functions = validator.collect_c_abi_free_function_inventory()
@@ -878,23 +881,23 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
             lambda: validator.validate_revision_inventory(
                 row_ids, reclassified, prefix_counts
             ),
-            f"revision {validator.EXPECTED_REVISION} inventory expects 79 rows for Covered, found 80",
+            f"revision {validator.EXPECTED_REVISION} inventory expects 84 rows for Covered, found 85",
         )
 
     def test_declared_count_edit_still_fails_internal_cross_check(self) -> None:
         text = load_document_text()
         mutated = replace_pattern_once(
-            text, re.escape("| Missing Go | 2357 |"), "| Missing Go | 2356 |"
+            text, re.escape("| Missing Go | 2361 |"), "| Missing Go | 2360 |"
         )
         self.assert_validation_fails(
             lambda: validator.validate_counts(mutated.splitlines(), mutated),
-            "status summary says 2356 rows for Missing Go, but parsed 2357",
+            "status summary says 2360 rows for Missing Go, but parsed 2361",
         )
 
     def test_stale_c_abi_symbol_inventory_narrative_is_rejected(self) -> None:
         text = load_document_text()
         mutated = text.replace(
-            "applied to 218 declared exports in `capi/include/shoal.h`",
+            "applied to 223 declared exports in `capi/include/shoal.h`",
             "applied to 44 declared exports in `capi/include/shoal.h`",
             1,
         )
@@ -907,7 +910,7 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
     def test_revision_bump_requires_validator_constant_update(self) -> None:
         text = load_document_text()
         mutated = text.replace(
-            f"Revision {validator.EXPECTED_REVISION} — records the public streaming scan cursor",
+            f"Revision {validator.EXPECTED_REVISION} — completes the five-row high-level scanner facade",
             f"Revision {validator.EXPECTED_REVISION + 1} — adds the next audited ABI slice",
         ).replace(
             f"As of revision {validator.EXPECTED_REVISION} that is",
@@ -916,7 +919,7 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
         self.assertNotEqual(mutated, text)
         self.assert_validation_fails(
             lambda: validator.validate_counts(mutated.splitlines(), mutated),
-            f"document status is missing expected detail: Revision {validator.EXPECTED_REVISION} — records the public streaming scan cursor",
+            f"document status is missing expected detail: Revision {validator.EXPECTED_REVISION} — completes the five-row high-level scanner facade",
         )
 
     # ---- matrix table separators -------------------------------------------

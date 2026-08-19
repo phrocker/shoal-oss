@@ -29,14 +29,14 @@ Shoal separates **ABI compatibility** from **feature availability**:
   stable allocation-free version tuple that works before connector creation.
   `SHOAL_ABI_VERSION_PACKED` uses
   `SHOAL_ABI_PACK_VERSION(major, minor, patch)` with a hexadecimal
-  `0x00MMmmpp` layout, so ABI `1.10.0` is `0x00010a00`.
+  `0x00MMmmpp` layout, so ABI `1.11.0` is `0x00010b00`.
 - Capability identifiers are append-only. Existing IDs and bits never change
   meaning. `shoal_abi_capability_word_count()` reports how many 64-bit words
   the current library uses, `shoal_abi_capability_word(i)` returns `0` for
   `i >= word_count`, and `shoal_abi_has_capability(id)` returns `0` for both
   unsupported and unknown IDs.
 
-Current capability assignments (`word 0 == 0x00000000003fffff`):
+Current capability assignments (`word 0 == 0x00000000007fffff`):
 
 | ID | Mask | Surface |
 | --- | --- | --- |
@@ -62,6 +62,7 @@ Current capability assignments (`word 0 == 0x00000000003fffff`):
 | `SHOAL_ABI_CAPABILITY_TABLE_MAINTENANCE` | `0x80000` | row-bounded table flush and owned constraint administration |
 | `SHOAL_ABI_CAPABILITY_CONNECTOR_CONTROL` | `0x100000` | one-shot scan cancellation and connector cache invalidation |
 | `SHOAL_ABI_CAPABILITY_HIGH_LEVEL_CLIENT` | `0x200000` | owned mutable high-level client facade and scanner/writer construction |
+| `SHOAL_ABI_CAPABILITY_HIGH_LEVEL_SCANNER` | `0x400000` | copied column selection and direct owned-result client scans |
 
 Shoal does **not** advertise instance status, compaction/import/export,
 Python/wheel, or any other unimplemented surface until the API exists and has
@@ -117,6 +118,11 @@ Version numbers change only when the public ABI contract changes:
   `shoal_accumulo_writer`. Client close cancels and joins active facade calls;
   child operations coordinate with the same connector lifecycle and reject
   work once client close begins.
+- `shoal_client_select_column` copies binary family/qualifier selections into
+  the client. Direct single/multi-range client scans take an atomic snapshot of
+  table, authorizations, columns, and thread count, return owned scan results,
+  support per-call deadlines and one-shot cancellation, and are canceled and
+  joined by client close.
   Freeing also performs best-effort close and sets the variable to `NULL`.
 - A connector owns the bootstrap instance created for it. Callers do not
   separately close ZooKeeper resources.
