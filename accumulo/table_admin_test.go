@@ -114,11 +114,17 @@ type fakeManagerAdapter struct {
 	configurationRPC []string
 	err              error
 	closed           int
+	propertyVersion  int64
+	modifyRequests   []managerclient.VersionedProperties
+	rejectedModifies int
+	beforeModify     func()
 }
 
 type fakeFlushRequest struct {
-	tableID string
-	wait    bool
+	tableID  string
+	startRow []byte
+	endRow   []byte
+	wait     bool
 }
 
 type fakePropertyRequest struct {
@@ -139,14 +145,17 @@ func (m *fakeManagerAdapter) Execute(_ context.Context, address string, req mana
 func (m *fakeManagerAdapter) FlushTable(
 	_ context.Context,
 	address, tableID string,
+	startRow, endRow []byte,
 	wait bool,
 ) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.address = address
 	m.flushRequests = append(m.flushRequests, fakeFlushRequest{
-		tableID: tableID,
-		wait:    wait,
+		tableID:  tableID,
+		startRow: append([]byte(nil), startRow...),
+		endRow:   append([]byte(nil), endRow...),
+		wait:     wait,
 	})
 	return m.err
 }
@@ -165,7 +174,13 @@ func (m *fakeManagerAdapter) GetTableConfiguration(
 	if fn != nil {
 		return fn(ctx, address, tableName)
 	}
-	return configuration, err
+	// The real adapter clones what it returns, so a caller can never read a
+	// map another writer is mutating.
+	copied := make(map[string]string, len(configuration))
+	for key, value := range configuration {
+		copied[key] = value
+	}
+	return copied, err
 }
 
 func (m *fakeManagerAdapter) GetNamespaceConfiguration(
@@ -190,6 +205,61 @@ func (m *fakeManagerAdapter) GetVersionedNamespaceProperties(
 	return managerclient.VersionedProperties{Version: 7, Properties: properties}, err
 }
 
+// GetVersionedTableProperties and ModifyTableProperties model the
+// compare-and-set the manager performs: the version advances on every accepted
+// write, and a write presenting a stale version is rejected the way Accumulo
+// rejects one.
+func (m *fakeManagerAdapter) GetVersionedTableProperties(
+	_ context.Context,
+	address, tableName string,
+) (managerclient.VersionedProperties, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.address = address
+	if m.err != nil {
+		return managerclient.VersionedProperties{}, m.err
+	}
+	copied := make(map[string]string, len(m.configuration))
+	for key, value := range m.configuration {
+		copied[key] = value
+	}
+	return managerclient.VersionedProperties{Version: m.propertyVersion, Properties: copied}, nil
+}
+
+func (m *fakeManagerAdapter) ModifyTableProperties(
+	_ context.Context,
+	address, tableName string,
+	properties managerclient.VersionedProperties,
+) error {
+	m.mu.Lock()
+	hook := m.beforeModify
+	m.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.address = address
+	if m.err != nil {
+		return m.err
+	}
+	if properties.Version != m.propertyVersion {
+		m.rejectedModifies++
+		return &managerclient.Error{
+			Kind:        managerclient.ErrorConcurrentModification,
+			TableName:   tableName,
+			Description: "stale version",
+		}
+	}
+	m.modifyRequests = append(m.modifyRequests, properties)
+	m.configuration = make(map[string]string, len(properties.Properties))
+	for key, value := range properties.Properties {
+		m.configuration[key] = value
+	}
+	m.propertyVersion++
+	return nil
+}
+
 func (m *fakeManagerAdapter) SetTableProperty(
 	_ context.Context,
 	address, tableName, property, value string,
@@ -202,6 +272,9 @@ func (m *fakeManagerAdapter) SetTableProperty(
 		property:  property,
 		value:     value,
 	})
+	if m.err == nil && m.configuration != nil {
+		m.configuration[property] = value
+	}
 	return m.err
 }
 
@@ -217,6 +290,9 @@ func (m *fakeManagerAdapter) RemoveTableProperty(
 		tableName: tableName,
 		property:  property,
 	})
+	if m.err == nil && m.configuration != nil {
+		delete(m.configuration, property)
+	}
 	return m.err
 }
 

@@ -1,6 +1,7 @@
 package accumulo
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -13,8 +14,36 @@ import (
 // FlushTable requests a full-table flush. When wait is true, the call waits
 // until Accumulo reports the flush complete or ctx is canceled.
 func (c *Connector) FlushTable(ctx context.Context, tableName string, wait bool) error {
+	return c.FlushTableRange(ctx, tableName, nil, nil, wait)
+}
+
+// FlushTableRange requests a flush bounded to the tablets that hold rows
+// between startRow and endRow, mirroring Sharkbite's
+// tableOperations.flush(startRow, endRow, wait). A nil bound is unbounded on
+// that side, so FlushTableRange(ctx, name, nil, nil, wait) is the whole-table
+// flush FlushTable performs.
+//
+// The bounds select whole tablets: Accumulo flushes every tablet whose extent
+// overlaps the range, so a bound inside a tablet still flushes that tablet.
+// When wait is false the call returns as soon as the flush is initiated; when
+// it is true the call waits for completion, and a canceled ctx stops the wait
+// without canceling the flush Accumulo already started.
+//
+// The row bounds are copied, so the caller may reuse its slices.
+func (c *Connector) FlushTableRange(
+	ctx context.Context,
+	tableName string,
+	startRow, endRow []byte,
+	wait bool,
+) error {
 	if tableName == "" {
 		return fmt.Errorf("%w: empty table name", ErrInvalidTableName)
+	}
+	if startRow != nil && endRow != nil && bytes.Compare(startRow, endRow) > 0 {
+		return fmt.Errorf(
+			"%w: flush end row %q precedes start row %q",
+			ErrInvalidTableRange, endRow, startRow,
+		)
 	}
 	if err := ctx.Err(); err != nil {
 		return err
@@ -47,7 +76,7 @@ func (c *Connector) FlushTable(ctx context.Context, tableName string, wait bool)
 	if err != nil {
 		return fmt.Errorf("accumulo: discover manager: %w", err)
 	}
-	if err := manager.FlushTable(ctx, address, tableID, wait); err != nil {
+	if err := manager.FlushTable(ctx, address, tableID, startRow, endRow, wait); err != nil {
 		var managerErr *managerclient.Error
 		if errors.As(err, &managerErr) {
 			switch managerErr.Kind {

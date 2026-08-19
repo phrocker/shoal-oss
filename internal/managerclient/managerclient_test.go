@@ -454,10 +454,10 @@ func TestPooledFlushTableLifecycleAndWaitModes(t *testing.T) {
 	}
 	pooled.newManagerClient = managerFromFakeTransport
 
-	if err := pooled.FlushTable(context.Background(), "manager:9997", "1", false); err != nil {
+	if err := pooled.FlushTable(context.Background(), "manager:9997", "1", nil, nil, false); err != nil {
 		t.Fatal(err)
 	}
-	if err := pooled.FlushTable(context.Background(), "manager:9997", "1", true); err != nil {
+	if err := pooled.FlushTable(context.Background(), "manager:9997", "1", nil, nil, true); err != nil {
 		t.Fatal(err)
 	}
 	if dials.Load() != 1 {
@@ -493,7 +493,7 @@ func TestPooledFlushTableStopsAfterInitiateFailure(t *testing.T) {
 	}
 	pooled.newManagerClient = managerFromFakeTransport
 
-	err := pooled.FlushTable(context.Background(), "manager:9997", "1", true)
+	err := pooled.FlushTable(context.Background(), "manager:9997", "1", nil, nil, true)
 	var managerErr *Error
 	if !errors.As(err, &managerErr) ||
 		managerErr.Kind != ErrorTableNotFound ||
@@ -529,7 +529,7 @@ func TestPooledFlushCancellationEvictsTransport(t *testing.T) {
 	}
 	pooled.newManagerClient = managerFromFakeTransport
 
-	if err := pooled.FlushTable(ctx, "manager:9997", "1", true); !errors.Is(err, context.Canceled) {
+	if err := pooled.FlushTable(ctx, "manager:9997", "1", nil, nil, true); !errors.Is(err, context.Canceled) {
 		t.Fatalf("flush error = %v, want context canceled", err)
 	}
 	if first.closes.Load() != 1 {
@@ -1262,6 +1262,11 @@ func (noopClientRPC) GetVersionedNamespaceProperties(
 ) (VersionedProperties, error) {
 	return VersionedProperties{}, nil
 }
+func (noopClientRPC) GetVersionedTableProperties(
+	context.Context, *security.TCredentials, string,
+) (VersionedProperties, error) {
+	return VersionedProperties{}, nil
+}
 func (noopClientRPC) CreateLocalUser(
 	context.Context, *security.TCredentials, string, []byte,
 ) error {
@@ -1539,6 +1544,14 @@ func (r *fakeClientRPC) GetNamespaceProperties(
 	return r.GetTableConfiguration(ctx, credentials, namespace)
 }
 
+func (r *fakeClientRPC) GetVersionedTableProperties(
+	ctx context.Context,
+	credentials *security.TCredentials,
+	tableName string,
+) (VersionedProperties, error) {
+	return r.GetVersionedNamespaceProperties(ctx, credentials, tableName)
+}
+
 func (r *fakeClientRPC) GetVersionedNamespaceProperties(
 	ctx context.Context,
 	_ *security.TCredentials,
@@ -1555,22 +1568,27 @@ func (r *fakeClientRPC) GetVersionedNamespaceProperties(
 }
 
 type fakeManagerRPC struct {
-	initiateErr    error
-	waitFlushErr   error
-	setErr         error
-	removeErr      error
-	waitFlush      func(context.Context) error
-	tableName      string
-	property       string
-	value          string
-	flushTableID   string
-	flushID        int64
-	waitFlushID    int64
-	maxLoops       []int64
-	initiateCalls  atomic.Int32
-	flushWaitCalls atomic.Int32
-	setCalls       atomic.Int32
-	removeCalls    atomic.Int32
+	initiateErr        error
+	waitFlushErr       error
+	setErr             error
+	removeErr          error
+	waitFlush          func(context.Context) error
+	tableName          string
+	property           string
+	value              string
+	flushTableID       string
+	modifiedTable      string
+	modifiedProperties VersionedProperties
+	modifyErr          error
+	flushStartRow      []byte
+	flushEndRow        []byte
+	flushID            int64
+	waitFlushID        int64
+	maxLoops           []int64
+	initiateCalls      atomic.Int32
+	flushWaitCalls     atomic.Int32
+	setCalls           atomic.Int32
+	removeCalls        atomic.Int32
 }
 
 func (r *fakeManagerRPC) InitiateFlush(
@@ -1587,16 +1605,30 @@ func (r *fakeManagerRPC) WaitForFlush(
 	ctx context.Context,
 	_ *security.TCredentials,
 	tableID string,
+	startRow, endRow []byte,
 	flushID, maxLoops int64,
 ) error {
 	r.flushWaitCalls.Add(1)
 	r.flushTableID = tableID
+	r.flushStartRow = append([]byte(nil), startRow...)
+	r.flushEndRow = append([]byte(nil), endRow...)
 	r.waitFlushID = flushID
 	r.maxLoops = append(r.maxLoops, maxLoops)
 	if r.waitFlush != nil {
 		return r.waitFlush(ctx)
 	}
 	return r.waitFlushErr
+}
+
+func (r *fakeManagerRPC) ModifyTableProperties(
+	_ context.Context,
+	_ *security.TCredentials,
+	tableName string,
+	properties VersionedProperties,
+) error {
+	r.modifiedTable = tableName
+	r.modifiedProperties = properties
+	return r.modifyErr
 }
 
 func (r *fakeManagerRPC) SetTableProperty(
