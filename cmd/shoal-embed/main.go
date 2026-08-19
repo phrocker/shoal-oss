@@ -361,6 +361,16 @@ func cmdStatus(args []string) {
 // unsafely out from under the still-running call. This does not migrate
 // tablet ownership — mixed-fleet tablet reassignment on drain remains
 // owned by the Accumulo manager/coordinator and is out of scope here.
+//
+// TLS is opt-in and off by default (both listeners stay plaintext,
+// matching every release before this flag existed). Set --tls-cert and
+// --tls-key (or SHOAL_EMBED_TLS_CERT / SHOAL_EMBED_TLS_KEY) to enable TLS
+// for both the gRPC and HTTP listeners together; add --tls-client-ca (or
+// SHOAL_EMBED_TLS_CLIENT_CA) to additionally require and verify a client
+// certificate (mutual TLS) on both. A flag value always wins over its
+// environment-variable fallback; see flagOrEnv. Certificate/key rotation
+// is out of scope: rotating either file requires a process restart today
+// (see deploy/README.md's "Current platform gaps" list).
 func cmdServe(args []string) {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	dataDir := fs.String("data", defaultDataDir(), "data directory")
@@ -370,6 +380,9 @@ func cmdServe(args []string) {
 	metricsAddress := fs.String("metrics-address", "", "enable the observability HTTP surface and override its bind host:port verbatim (e.g. 0.0.0.0:9877); when set, --metrics-port is ignored")
 	drainTimeout := fs.Duration("drain-timeout", 30*time.Second, "max time to wait for in-flight RPCs to finish during graceful shutdown")
 	quiesceDelay := fs.Duration("quiesce-delay", 5*time.Second, "when the HTTP readiness surface is enabled, how long to wait after flipping /readyz to not-ready before draining connections")
+	tlsCertFlag := fs.String("tls-cert", "", "PEM server certificate file; enables TLS for both gRPC and HTTP listeners when set together with --tls-key (falls back to SHOAL_EMBED_TLS_CERT if unset)")
+	tlsKeyFlag := fs.String("tls-key", "", "PEM server private key file; required together with --tls-cert to enable TLS (falls back to SHOAL_EMBED_TLS_KEY if unset)")
+	tlsClientCAFlag := fs.String("tls-client-ca", "", "PEM CA bundle; when set, requires and verifies a client certificate on both listeners (mutual TLS; falls back to SHOAL_EMBED_TLS_CLIENT_CA if unset)")
 	fs.Parse(args)
 
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
@@ -379,11 +392,17 @@ func cmdServe(args []string) {
 		grpcAddr = *address
 	}
 	metricsAddr := metricsAddrFromFlags(fs, *metricsPort, *metricsAddress)
+	tlsCfg := tlsFilesConfig{
+		CertFile:     flagOrEnv(*tlsCertFlag, "SHOAL_EMBED_TLS_CERT"),
+		KeyFile:      flagOrEnv(*tlsKeyFlag, "SHOAL_EMBED_TLS_KEY"),
+		ClientCAFile: flagOrEnv(*tlsClientCAFlag, "SHOAL_EMBED_TLS_CLIENT_CA"),
+	}
 
 	h, err := startServe(serveConfig{
 		DataDir:        *dataDir,
 		GRPCAddress:    grpcAddr,
 		MetricsAddress: metricsAddr,
+		TLS:            tlsCfg,
 		Logger:         logger,
 	})
 	if err != nil {
@@ -394,10 +413,15 @@ func cmdServe(args []string) {
 	if h.MetricsAddr != "" {
 		logAttrs = append(logAttrs, slog.String("metrics", h.MetricsAddr), slog.Duration("quiesce_delay", *quiesceDelay))
 	}
+	logAttrs = append(logAttrs, slog.Bool("tls", h.TLSEnabled))
 	logger.Info("shoal-embed gRPC serve starting", logAttrs...)
-	fmt.Fprintf(os.Stderr, "shoal-embed serve: grpc://%s\n", h.GRPCAddr)
+	grpcScheme, httpScheme := "grpc", "http"
+	if h.TLSEnabled {
+		grpcScheme, httpScheme = "grpcs", "https"
+	}
+	fmt.Fprintf(os.Stderr, "shoal-embed serve: %s://%s\n", grpcScheme, h.GRPCAddr)
 	if h.MetricsAddr != "" {
-		fmt.Fprintf(os.Stderr, "  health/metrics: http://%s/{healthz,readyz,stats,metrics}\n", h.MetricsAddr)
+		fmt.Fprintf(os.Stderr, "  health/metrics: %s://%s/{healthz,readyz,stats,metrics}\n", httpScheme, h.MetricsAddr)
 	} else {
 		fmt.Fprintf(os.Stderr, "  health/metrics: disabled (pass --metrics-port or --metrics-address to enable)\n")
 	}
@@ -445,6 +469,20 @@ func defaultDataDir() string {
 		return ".shoal-data"
 	}
 	return home + "/.shoal/data"
+}
+
+// flagOrEnv resolves a string flag against a same-purpose environment
+// variable fallback: an explicitly-set flag value always wins; otherwise
+// the environment variable is used (which may itself be unset/empty).
+// This mirrors the flag-then-env precedence cmd/shoal's -password /
+// SHOAL_PASSWORD handling already uses, applied here to TLS material so
+// certificate/key paths can come from either a mounted Secret's
+// environment projection or an explicit flag in non-Kubernetes use.
+func flagOrEnv(flagVal, envKey string) string {
+	if flagVal != "" {
+		return flagVal
+	}
+	return os.Getenv(envKey)
 }
 
 func die(format string, args ...any) {

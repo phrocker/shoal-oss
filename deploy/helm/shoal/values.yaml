@@ -29,6 +29,30 @@ writeTier:
     limits:
       cpu: "2"
       memory: 2Gi
+  # Explicit rollout contract instead of relying on the apps/v1 default
+  # (which happens to already be these values today).
+  updateStrategy:
+    partition: 0
+  podDisruptionBudget:
+    enabled: true
+    # This shard's StatefulSet runs a single replica by default (see
+    # replicas, above), and there is no live tablet-migration/handoff path
+    # yet. maxUnavailable: 0 means the Eviction API (kubectl drain,
+    # cluster-autoscaler consolidation, etc.) refuses to evict this pod
+    # rather than silently taking the shard's only writer offline; it does
+    # NOT block an operator-initiated rolling update, since the
+    # StatefulSet controller replaces pods directly and isn't subject to
+    # PDBs. See deploy/README.md's rolling-upgrade/rollback runbook before
+    # raising writeTier.replicas or draining write-tier nodes.
+    maxUnavailable: 0
+  # TLS is opt-in and off by default: both the gRPC and HTTP listeners
+  # stay plaintext unless enabled=true. When enabled, secretName must name
+  # a Secret containing tls.crt/tls.key (and, when requireClientCert is
+  # true, ca.crt) — see deploy/README.md's TLS section.
+  tls:
+    enabled: false
+    secretName: ""
+    requireClientCert: false
 
 readFleet:
   replicas: 3
@@ -50,3 +74,16 @@ readFleet:
     limits:
       cpu: "2"
       memory: 2Gi
+  # Explicit rollout contract instead of relying on the apps/v1 default
+  # (which happens to already be these values today). Keeps at least
+  # replicas-1 pods serving during a rollout while proving out a new
+  # revision's readiness before removing an old one.
+  strategy:
+    maxUnavailable: 1
+    maxSurge: 1
+  podDisruptionBudget:
+    enabled: true
+    # Stateless read replicas spread across nodes (see the pod
+    # anti-affinity in read-deployment.yaml): allow one voluntary
+    # disruption at a time.
+    maxUnavailable: 1

@@ -8,6 +8,11 @@ metadata:
 spec:
   replicas: {{ .Values.writeTier.replicas }}
   serviceName: {{ include "shoal.fullname" . }}-embed-headless
+  # Explicit rollout contract instead of relying on the apps/v1 default.
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      partition: {{ .Values.writeTier.updateStrategy.partition }}
   selector:
     matchLabels:
       app.kubernetes.io/name: shoal-embed
@@ -42,6 +47,13 @@ spec:
             - --address=0.0.0.0:$(SHOAL_EMBED_GRPC_PORT)
             - --metrics-address=0.0.0.0:$(SHOAL_EMBED_METRICS_PORT)
             - --quiesce-delay={{ .Values.writeTier.quiesceDelay }}
+            {{- if .Values.writeTier.tls.enabled }}
+            - --tls-cert=/var/run/secrets/shoal/tls/tls.crt
+            - --tls-key=/var/run/secrets/shoal/tls/tls.key
+            {{- if .Values.writeTier.tls.requireClientCert }}
+            - --tls-client-ca=/var/run/secrets/shoal/tls/ca.crt
+            {{- end }}
+            {{- end }}
           envFrom:
             - configMapRef:
                 name: {{ include "shoal.fullname" . }}-config
@@ -56,6 +68,11 @@ spec:
             - name: object-storage-credentials
               mountPath: /var/run/secrets/shoal/gcs
               readOnly: true
+            {{- if .Values.writeTier.tls.enabled }}
+            - name: tls-credentials
+              mountPath: /var/run/secrets/shoal/tls
+              readOnly: true
+            {{- end }}
           readinessProbe:
             httpGet:
               path: /readyz
@@ -80,6 +97,11 @@ spec:
           secret:
             secretName: {{ .Values.objectStorage.credentialsSecretName }}
             optional: true
+        {{- if .Values.writeTier.tls.enabled }}
+        - name: tls-credentials
+          secret:
+            secretName: {{ required "writeTier.tls.secretName is required when writeTier.tls.enabled is true" .Values.writeTier.tls.secretName }}
+        {{- end }}
   volumeClaimTemplates:
     - metadata:
         name: data
