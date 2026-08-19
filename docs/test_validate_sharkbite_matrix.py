@@ -137,16 +137,14 @@ def pinned_constants_for_deleted_not_required_row(prefix: str, row_id: str) -> d
         name: dict(counts) for name, counts in validator.EXPECTED_PREFIX_COUNTS.items()
     }
     prefix_counts[prefix][validator.NOT_REQUIRED_STATUS] -= 1
-    manifest = tuple(
-        entry for entry in validator.load_expected_revision_17_rows() if entry[0] != row_id
-    )
+    manifest = tuple(entry for entry in validator.load_expected_rows() if entry[0] != row_id)
     return {
         "EXPECTED_TOTAL_ROWS": validator.EXPECTED_TOTAL_ROWS - 1,
         "EXPECTED_REQUIRED_ROWS": validator.EXPECTED_REQUIRED_ROWS,
         "EXPECTED_STATUS_COUNTS": status_counts,
         "EXPECTED_PREFIX_TOTALS": prefix_totals,
         "EXPECTED_PREFIX_COUNTS": prefix_counts,
-        "load_expected_revision_17_rows": lambda: manifest,
+        "load_expected_rows": lambda: manifest,
     }
 
 
@@ -298,7 +296,7 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
     def test_parse_status_summary_reads_declared_totals(self) -> None:
         declared_counts, total = validator.parse_status_summary(load_fixture_lines("status_summary_valid.md"))
         self.assertEqual(total, 3203)
-        self.assertEqual(declared_counts["Covered"], 0)
+        self.assertEqual(declared_counts["Covered"], 1)
         self.assertEqual(declared_counts["Missing Go"], 2420)
         self.assertEqual(declared_counts["Not required (rationale required)"], 392)
 
@@ -375,7 +373,7 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
                 load_row_manifest_fixture("row_sequence_swap.txt"),
                 load_row_manifest_fixture("row_sequence_expected.txt"),
             ),
-            "revision 17 inventory rows changed",
+            "revision 18 inventory rows changed",
             "missing [none]",
             "unexpected [none]",
             "moved [SB-FIXTURE-102 expected 2 found 3, SB-FIXTURE-103 expected 3 found 2]",
@@ -387,7 +385,7 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
                 load_row_manifest_fixture("row_sequence_reordered.txt"),
                 load_row_manifest_fixture("row_sequence_expected.txt"),
             ),
-            "revision 17 inventory rows changed",
+            "revision 18 inventory rows changed",
             "missing [none]",
             "unexpected [none]",
             "moved [SB-FIXTURE-101 expected 1 found 2",
@@ -399,7 +397,7 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
                 load_row_manifest_fixture("row_sequence_missing.txt"),
                 load_row_manifest_fixture("row_sequence_expected.txt"),
             ),
-            "revision 17 inventory rows changed",
+            "revision 18 inventory rows changed",
             "missing [SB-FIXTURE-103 (Behavior mismatch)]",
         )
 
@@ -409,7 +407,7 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
                 load_row_manifest_fixture("row_sequence_added.txt"),
                 load_row_manifest_fixture("row_sequence_expected.txt"),
             ),
-            "revision 17 inventory rows changed",
+            "revision 18 inventory rows changed",
             "unexpected [SB-FIXTURE-999 (Missing Go)]",
         )
 
@@ -419,7 +417,7 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
                 load_row_manifest_fixture("row_sequence_reclassified.txt"),
                 load_row_manifest_fixture("row_sequence_expected.txt"),
             ),
-            "revision 17 inventory rows changed",
+            "revision 18 inventory rows changed",
             "missing [none]",
             "unexpected [none]",
             "moved [none]",
@@ -442,13 +440,27 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
         )
 
     def test_row_manifest_pins_the_status_of_every_audited_row(self) -> None:
-        rows = validator.load_expected_revision_17_rows()
+        rows = validator.load_expected_rows()
         self.assertEqual(len(rows), validator.EXPECTED_TOTAL_ROWS)
         self.assertEqual(len({row_id for row_id, _status in rows}), validator.EXPECTED_TOTAL_ROWS)
         for _row_id, status in rows:
             self.assertIn(status, validator.STATUSES)
         document_rows = validator.parse_rows(load_document_text().splitlines())[2]
         self.assertEqual(rows, document_rows)
+
+    def test_gap_completion_consistency_accepts_complete_pairs(self) -> None:
+        lines = load_fixture_lines("gap_completion_valid.md")
+        rows = validator.parse_rows(lines)[2]
+        validator.validate_gap_completion_consistency(lines, rows)
+
+    def test_gap_completion_consistency_rejects_completion_drift(self) -> None:
+        lines = load_fixture_lines("gap_completion_drift.md")
+        rows = validator.parse_rows(lines)[2]
+        self.assert_validation_fails(
+            lambda: validator.validate_gap_completion_consistency(lines, rows),
+            "SB-GAP-C-001 claims completion, but referenced rows remain Missing C ABI",
+            "SB-CPP-016 (Missing C ABI)",
+        )
 
     def test_pinned_inventory_rejects_status_swap_between_rows_in_one_section(self) -> None:
         text = load_document_text()
@@ -467,13 +479,13 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
 
         self.assert_validation_fails(
             lambda: validator.validate_counts(mutated.splitlines(), mutated),
-            "revision 17 inventory rows changed",
+            "revision 18 inventory rows changed",
             "reclassified [SB-PKG-001 pinned Missing C ABI found Intentional divergence "
             "(approval required), SB-PKG-014 pinned Intentional divergence (approval required) "
             "found Missing C ABI]",
         )
 
-    def test_validate_revision_17_inventory_rejects_same_prefix_row_id_substitution(self) -> None:
+    def test_validate_revision_inventory_rejects_same_prefix_row_id_substitution(self) -> None:
         rewritten_text = replace_pattern_once(
             load_document_text(),
             r"^\| SB-PKG-001 \|",
@@ -481,20 +493,20 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
         )
         self.assert_validation_fails(
             lambda: validator.validate_counts(rewritten_text.splitlines(), rewritten_text),
-            "revision 17 inventory rows changed",
+            "revision 18 inventory rows changed",
             "missing [SB-PKG-001 (Missing C ABI)]",
             "unexpected [SB-PKG-999 (Missing C ABI)]",
         )
 
-    def test_validate_revision_17_inventory_rejects_row_deletion(self) -> None:
+    def test_validate_revision_inventory_rejects_row_deletion(self) -> None:
         rewritten_text = "\n".join(remove_line_starting_once(load_document_text().splitlines(), "| SB-PKG-001 |"))
         self.assert_validation_fails(
             lambda: validator.validate_counts(rewritten_text.splitlines(), rewritten_text),
-            "revision 17 inventory rows changed",
+            "revision 18 inventory rows changed",
             "missing [SB-PKG-001 (Missing C ABI)]",
         )
 
-    def test_validate_revision_17_inventory_rejects_row_addition(self) -> None:
+    def test_validate_revision_inventory_rejects_row_addition(self) -> None:
         original_line = (
             "| SB-PKG-001 | Distribution `sharkbite`, version `1.2.0.3` (`setup.py:34-35`) | — | — | — | Missing C ABI | "
             "No Python packaging exists in Shoal. `Makefile` has `build`, `capi`, `test`, `test-hdfs`, `vet`, `clean` only — no wheel/sdist target. |"
@@ -505,7 +517,7 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
         )
         self.assert_validation_fails(
             lambda: validator.validate_counts(rewritten_text.splitlines(), rewritten_text),
-            "revision 17 inventory rows changed",
+            "revision 18 inventory rows changed",
             "unexpected [SB-PKG-999 (Missing C ABI)]",
         )
 
@@ -624,16 +636,16 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
 
     def test_pinned_inventory_constants_are_internally_consistent(self) -> None:
         validator.validate_pinned_inventory_constants()
-        self.assertEqual(validator.EXPECTED_REVISION, 17)
+        self.assertEqual(validator.EXPECTED_REVISION, 18)
         self.assertEqual(validator.EXPECTED_TOTAL_ROWS, 3203)
         self.assertEqual(validator.EXPECTED_REQUIRED_ROWS, 2811)
         self.assertEqual(
             validator.EXPECTED_STATUS_COUNTS,
             {
-                "Covered": 0,
+                "Covered": 1,
                 "Missing Go": 2420,
-                "Missing C ABI": 102,
-                "Behavior mismatch": 202,
+                "Missing C ABI": 99,
+                "Behavior mismatch": 204,
                 validator.INTENTIONAL_DIVERGENCE_STATUS: 87,
                 validator.NOT_REQUIRED_STATUS: 392,
             },
@@ -663,7 +675,7 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
         mutated = delete_matrix_row_consistently(load_document_text(), "SB-EMB-035", "SB-EMB")
         message = self.assert_validation_fails(
             lambda: validator.validate_counts(mutated.splitlines(), mutated),
-            "revision 17 inventory rows changed: missing [SB-EMB-035 (Not required (rationale required))]",
+            "revision 18 inventory rows changed: missing [SB-EMB-035 (Not required (rationale required))]",
         )
         self.assertIn("must update EXPECTED_REVISION", message)
         self.assertIn("row manifest", message)
@@ -672,15 +684,15 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
         mutated = delete_matrix_row_consistently(load_document_text(), "SB-EMB-035", "SB-EMB")
         manifest = tuple(
             entry
-            for entry in validator.load_expected_revision_17_rows()
+            for entry in validator.load_expected_rows()
             if entry[0] != "SB-EMB-035"
         )
         with mock.patch.object(
-            validator, "load_expected_revision_17_rows", lambda: manifest
+            validator, "load_expected_rows", lambda: manifest
         ):
             self.assert_validation_fails(
                 lambda: validator.validate_counts(mutated.splitlines(), mutated),
-                "revision 17 inventory expects 3203 rows, found 3202",
+                "revision 18 inventory expects 3203 rows, found 3202",
             )
 
     def test_row_deletion_with_consistent_prose_satisfies_only_internal_cross_checks(self) -> None:
@@ -699,8 +711,8 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
         shifted["SB-EMB"]["Missing Go"] += 1
         shifted["SB-XCUT"]["Missing Go"] -= 1
         self.assert_validation_fails(
-            lambda: validator.validate_revision_17_inventory(row_ids, status_counts, shifted),
-            "revision 17 inventory expects 35 rows for SB-EMB, found 36",
+            lambda: validator.validate_revision_inventory(row_ids, status_counts, shifted),
+            "revision 18 inventory expects 35 rows for SB-EMB, found 36",
         )
 
     def test_pinned_inventory_rejects_status_reclassification(self) -> None:
@@ -711,10 +723,10 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
         reclassified["Missing Go"] -= 1
         reclassified["Covered"] += 1
         self.assert_validation_fails(
-            lambda: validator.validate_revision_17_inventory(
+            lambda: validator.validate_revision_inventory(
                 row_ids, reclassified, prefix_counts
             ),
-            "revision 17 inventory expects 0 rows for Covered, found 1",
+            "revision 18 inventory expects 1 rows for Covered, found 2",
         )
 
     def test_declared_count_edit_still_fails_internal_cross_check(self) -> None:
@@ -730,8 +742,8 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
     def test_revision_bump_requires_validator_constant_update(self) -> None:
         text = load_document_text()
         mutated = text.replace(
-            f"Revision {validator.EXPECTED_REVISION} — applies the sixteenth independent audit",
-            f"Revision {validator.EXPECTED_REVISION + 1} — applies the seventeenth independent audit",
+            f"Revision {validator.EXPECTED_REVISION} — applies the seventeenth independent audit",
+            f"Revision {validator.EXPECTED_REVISION + 1} — applies the eighteenth independent audit",
         ).replace(
             f"As of revision {validator.EXPECTED_REVISION} that is",
             f"As of revision {validator.EXPECTED_REVISION + 1} that is",
@@ -739,7 +751,7 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
         self.assertNotEqual(mutated, text)
         self.assert_validation_fails(
             lambda: validator.validate_counts(mutated.splitlines(), mutated),
-            "document status is missing expected detail: Revision 17 — applies the sixteenth",
+            "document status is missing expected detail: Revision 18 — applies the seventeenth",
         )
 
     # ---- matrix table separators -------------------------------------------

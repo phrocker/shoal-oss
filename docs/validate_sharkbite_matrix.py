@@ -9,9 +9,12 @@ import sys
 
 
 DOC_PATH = Path(__file__).with_name("sharkbite-compatibility.md")
-# Update this manifest only when the independently audited revision-17 inventory
-# itself changes; review every added/removed ID in code review.
-REVISION17_ROW_MANIFEST = DOC_PATH.with_name("sharkbite-compatibility-revision17-rows.txt")
+EXPECTED_REVISION = 18
+# Update this manifest only when the independently audited inventory itself
+# changes; review every added/removed or reclassified ID in code review.
+EXPECTED_ROW_MANIFEST = DOC_PATH.with_name(
+    f"sharkbite-compatibility-revision{EXPECTED_REVISION}-rows.txt"
+)
 
 STATUSES = {
     "Covered",
@@ -24,11 +27,6 @@ STATUSES = {
 
 NOT_REQUIRED_STATUS = "Not required (rationale required)"
 INTENTIONAL_DIVERGENCE_STATUS = "Intentional divergence (approval required)"
-# Revision of the independently audited inventory pinned below. A document
-# revision bump cannot land without updating this constant, because the
-# expected document-status snippet and the narrative phrasing are derived from
-# it.
-EXPECTED_REVISION = 17
 EXPECTED_TOTAL_ROWS = 3203
 EXPECTED_REQUIRED_ROWS = 2811
 
@@ -53,10 +51,10 @@ def status_count_map(
 
 
 EXPECTED_STATUS_COUNTS = {
-    "Covered": 0,
+    "Covered": 1,
     "Missing Go": 2420,
-    "Missing C ABI": 102,
-    "Behavior mismatch": 202,
+    "Missing C ABI": 99,
+    "Behavior mismatch": 204,
     "Intentional divergence (approval required)": 87,
     "Not required (rationale required)": 392,
 }
@@ -72,14 +70,14 @@ EXPECTED_PREFIX_COUNTS = {
     ),
     "SB-CONN": status_count_map(
         missing_go=1,
-        missing_c_abi=2,
-        behavior_mismatch=9,
+        missing_c_abi=1,
+        behavior_mismatch=10,
         intentional_divergence=1,
     ),
     "SB-CPP": status_count_map(
         missing_go=11,
-        missing_c_abi=3,
-        behavior_mismatch=48,
+        missing_c_abi=1,
+        behavior_mismatch=50,
         not_required=8,
     ),
     "SB-CXX": status_count_map(
@@ -141,9 +139,10 @@ EXPECTED_PREFIX_COUNTS = {
         not_required=9,
     ),
     "SB-XCUT": status_count_map(
+        covered=1,
         missing_go=1,
         missing_c_abi=3,
-        behavior_mismatch=15,
+        behavior_mismatch=14,
     ),
 }
 
@@ -184,7 +183,7 @@ EXPECTED_METADATA_FIELDS = {
     ),
     "Sharkbite release line": "`sharkbite` 1.2.0.3 on PyPI (`setup.py:34-35`)",
     "Shoal reference": (
-        "`phrocker/shoal-oss` exact audited baseline for revision 17 "
+        "`phrocker/shoal-oss` exact audited baseline for revision 18 "
         "`ce9d36d814fcc7984a3aa009fe58246fcdb1588b` "
         "(\"test(capi): exercise versioned property getter\")"
     ),
@@ -193,8 +192,8 @@ EXPECTED_METADATA_FIELDS = {
 
 EXPECTED_DOCUMENT_STATUS_SNIPPETS = (
     "Normative gate. Binding on all Sharkbite-compatibility work.",
-    f"Revision {EXPECTED_REVISION} — applies the sixteenth independent audit",
-    "Revision 16 applied the fifteenth audit",
+    f"Revision {EXPECTED_REVISION} — applies the seventeenth independent audit",
+    "Revision 17 applied the sixteenth audit",
     "Revision 9 applied the eighth audit",
 )
 
@@ -207,10 +206,18 @@ INVENTORY_CHANGE_HINT = (
     "inventory revision must update EXPECTED_REVISION, EXPECTED_TOTAL_ROWS, "
     "EXPECTED_REQUIRED_ROWS, EXPECTED_STATUS_COUNTS, EXPECTED_PREFIX_TOTALS, "
     "EXPECTED_PREFIX_COUNTS and the row manifest "
-    "docs/sharkbite-compatibility-revision17-rows.txt (row ids, order and pinned statuses) "
+    f"docs/{EXPECTED_ROW_MANIFEST.name} (row ids, order and pinned statuses) "
     "in the same commit, together with the "
     "audit evidence that justifies the new inventory"
 )
+
+GAP_COMPLETION_RULES: dict[str, str] = {
+    "SB-GAP-GO-001": "Missing Go",
+    "SB-GAP-GO-002": "Missing Go",
+    "SB-GAP-C-001": "Missing C ABI",
+    "SB-GAP-C-002": "Missing C ABI",
+    "SB-GAP-C-004": "Missing C ABI",
+}
 
 CATEGORY_STATUS_COLUMNS = {
     "Covered": "Covered",
@@ -668,10 +675,10 @@ def parse_row_manifest_lines(
 
 
 @lru_cache(maxsize=1)
-def load_expected_revision_17_rows() -> tuple[tuple[str, str], ...]:
+def load_expected_rows() -> tuple[tuple[str, str], ...]:
     rows = parse_row_manifest_lines(
-        REVISION17_ROW_MANIFEST.read_text(encoding="utf-8").splitlines(),
-        source=str(REVISION17_ROW_MANIFEST.name),
+        EXPECTED_ROW_MANIFEST.read_text(encoding="utf-8").splitlines(),
+        source=str(EXPECTED_ROW_MANIFEST.name),
     )
     require(
         len(rows) == EXPECTED_TOTAL_ROWS,
@@ -822,13 +829,13 @@ def validate_expected_row_sequence(
     )
 
 
-def validate_revision_17_inventory(
+def validate_revision_inventory(
     rows: Sequence[tuple[str, str]],
     status_counts: Counter[str],
     prefix_counts: dict[str, Counter[str]],
 ) -> None:
     validate_pinned_inventory_constants()
-    expected_rows = load_expected_revision_17_rows()
+    expected_rows = load_expected_rows()
     validate_expected_row_sequence(rows, expected_rows)
 
     total_rows = sum(status_counts.values())
@@ -886,6 +893,90 @@ def validate_revision_17_inventory(
             )
 
 
+def parse_gap_completion_tables(lines: list[str]) -> dict[str, tuple[str, str]]:
+    gap_rows: dict[str, tuple[str, str]] = {}
+    for heading in (
+        "### 23.1 Stage 1 — Go parity (blocks everything)",
+        "### 23.2 Stage 2 — C ABI parity (blocked by Stage 1 per row)",
+    ):
+        headers, rows = parse_markdown_table(lines, heading)
+        require(
+            headers == ["ID", "Gap", "Matrix rows", "Existing issue/PR", "Notes"],
+            f"unexpected headers under {heading}: {headers}",
+        )
+        for row in rows:
+            row_id, _gap, matrix_rows, _existing, notes = row
+            if row_id.startswith("SB-GAP-"):
+                gap_rows[row_id] = (matrix_rows, notes)
+    return gap_rows
+
+
+def expand_gap_row_references(
+    matrix_rows_cell: str, row_statuses: dict[str, str], *, gap_id: str
+) -> tuple[str, ...]:
+    expanded: list[str] = []
+    seen: set[str] = set()
+    for token in matrix_rows_cell.split(","):
+        entry = token.strip()
+        if not entry:
+            continue
+        if entry.endswith("-*"):
+            prefix = entry[:-1]
+            matches = sorted(row_id for row_id in row_statuses if row_id.startswith(prefix))
+            require(matches, f"{gap_id} references no audited rows for wildcard {entry}")
+            candidates = matches
+        elif "…" in entry:
+            start, end = [part.strip() for part in entry.split("…", 1)]
+            start_prefix, start_number = start.rsplit("-", 1)
+            end_prefix, end_number = end.rsplit("-", 1)
+            require(
+                start_prefix == end_prefix,
+                f"{gap_id} mixes prefixes in range {entry}",
+            )
+            width = max(len(start_number), len(end_number))
+            candidates = [
+                f"{start_prefix}-{value:0{width}d}"
+                for value in range(int(start_number), int(end_number) + 1)
+            ]
+        else:
+            candidates = [entry]
+        for row_id in candidates:
+            require(row_id in row_statuses, f"{gap_id} references unknown row {row_id}")
+            if row_id not in seen:
+                seen.add(row_id)
+                expanded.append(row_id)
+    return tuple(expanded)
+
+
+def validate_gap_completion_consistency(
+    lines: list[str],
+    rows: Sequence[tuple[str, str]],
+    *,
+    rules: dict[str, str] | None = None,
+) -> None:
+    active_rules = GAP_COMPLETION_RULES if rules is None else rules
+    gap_rows = parse_gap_completion_tables(lines)
+    row_statuses = dict(rows)
+    for gap_id, forbidden_status in active_rules.items():
+        require(gap_id in gap_rows, f"missing audited gap row {gap_id}")
+        matrix_rows_cell, _notes = gap_rows[gap_id]
+        referenced_rows = expand_gap_row_references(
+            matrix_rows_cell, row_statuses, gap_id=gap_id
+        )
+        contradicting = [
+            (row_id, row_statuses[row_id])
+            for row_id in referenced_rows
+            if row_statuses[row_id] == forbidden_status
+        ]
+        require(
+            not contradicting,
+            (
+                f"{gap_id} claims completion, but referenced rows remain {forbidden_status}: "
+                f"{preview_row_ids(contradicting)}"
+            ),
+        )
+
+
 def validate_counts(lines: list[str], full_text: str) -> None:
     metadata = parse_metadata(lines)
     for field, expected_value in EXPECTED_METADATA_FIELDS.items():
@@ -901,7 +992,8 @@ def validate_counts(lines: list[str], full_text: str) -> None:
     status_counts, prefix_counts, rows = parse_rows(lines)
     total_rows = len(rows)
     require(sum(status_counts.values()) == total_rows, f"expected {total_rows} rows, found {sum(status_counts.values())}")
-    validate_revision_17_inventory(rows, status_counts, prefix_counts)
+    validate_revision_inventory(rows, status_counts, prefix_counts)
+    validate_gap_completion_consistency(lines, rows)
 
     metadata_total_rows, metadata_required_rows = parse_rows_metadata(metadata.get("Rows", ""))
     require(
@@ -984,9 +1076,9 @@ def validate_status_narratives(
     python_visible_behavior = status_counts["Behavior mismatch"] - prefix_counts["SB-CXX"]["Behavior mismatch"]
 
     expected_phrases = [
-        f"As of revision {EXPECTED_REVISION} that is {required_rows} of {total_rows} rows, and **none of them is satisfied**",
+        f"As of revision {EXPECTED_REVISION} that is {required_rows} of {total_rows} rows, and **only {status_counts['Covered']} is satisfied** ([SB-XCUT-012](#sec-20))",
         f"{required_rows} rows are **required** by the final release gate ([§2.2](#sec-2)); the {status_counts[NOT_REQUIRED_STATUS]} `Not required` rows are excluded by construction, and {prefix_counts['SB-CXX'][NOT_REQUIRED_STATUS]} of those are the evidence-proved duplicates described in [§19.1](#sec-19-1).",
-        "No row is `Covered`.",
+        "**Exactly 1 row is `Covered`: [SB-XCUT-012](#sec-20).**",
         f"The shape of the work is visible in the {status_counts['Missing Go']} `Missing Go` rows, of which {prefix_counts['SB-CXX']['Missing Go']} are the C++ members in [§19.2](#sec-19-2) that no Shoal layer exports.",
         f"`Behavior mismatch` ({status_counts['Behavior mismatch']}) is the bucket that sets the schedule: {python_visible_behavior} rows on the Python-visible and curated C++ surface each need a differential test against a live cluster or the exported ABI, and {prefix_counts['SB-CXX']['Behavior mismatch']} are destructors of classes bound into Python, where the destruction point is user-observable and the model differs from Go finalisation ([§19.1](#sec-19-1)).",
         f"`Intentional divergence` ({status_counts[INTENTIONAL_DIVERGENCE_STATUS]}) is dominated by one upstream fact: {prefix_counts['SB-STAT'][INTENTIONAL_DIVERGENCE_STATUS]} rows are cluster-status accessors Accumulo itself deleted ([§14](#sec-14), [SB-DIV-016](#sec-26)).",

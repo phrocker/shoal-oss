@@ -2,10 +2,10 @@
 
 | Status | Rows |
 | --- | --- |
-| Covered | 0 |
+| Covered | 1 |
 | Missing Go | 2,420 |
-| Missing C ABI | **102** |
-| Behavior mismatch | 202 |
+| Missing C ABI | **99** |
+| Behavior mismatch | 204 |
 | Intentional divergence (approval required) | 87 |
 | Not required (rationale required) | 392 |
 | **Total** | **3,203** |
