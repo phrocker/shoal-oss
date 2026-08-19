@@ -181,6 +181,125 @@ func TestBackendCreateRetriesReplicationInProgress(t *testing.T) {
 	}
 }
 
+func TestBackendLongNameTargetsUseFixedLengthSiblingArtifacts(t *testing.T) {
+	t.Run("create", func(t *testing.T) {
+		setReplacementNameTokens(
+			t,
+			strings.Repeat("c", replacementNameTokenBytes*2),
+			strings.Repeat("1", replacementNameTokenBytes*2),
+		)
+
+		client := newFakeClient()
+		backend, err := New("nn:8020", WithClient(client))
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		target := "/tables/" + strings.Repeat("c", 255)
+		w, err := backend.Create(context.Background(), target)
+		if err != nil {
+			t.Fatal(err)
+		}
+		checkReplacementSiblingPath(t, client.lastCreatePath, "/tables", replacementTempPrefix)
+		if _, err := w.Write([]byte("create")); err != nil {
+			t.Fatal(err)
+		}
+		if err := w.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if got := string(client.files[target]); got != "create" {
+			t.Fatalf("created contents = %q, want create", got)
+		}
+	})
+
+	t.Run("replace", func(t *testing.T) {
+		setReplacementNameTokens(
+			t,
+			strings.Repeat("d", replacementNameTokenBytes*2),
+			strings.Repeat("e", replacementNameTokenBytes*2),
+		)
+
+		client := newFakeClient()
+		target := "/tables/" + strings.Repeat("r", 255)
+		client.files[target] = []byte("old")
+		backend, err := New("nn:8020", WithClient(client))
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		w, err := backend.Create(context.Background(), target)
+		if err != nil {
+			t.Fatal(err)
+		}
+		checkReplacementSiblingPath(t, client.lastCreatePath, "/tables", replacementTempPrefix)
+		if _, err := w.Write([]byte("replace")); err != nil {
+			t.Fatal(err)
+		}
+		if err := w.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if got := string(client.files[target]); got != "replace" {
+			t.Fatalf("replaced contents = %q, want replace", got)
+		}
+		if len(client.renameCalls) == 0 {
+			t.Fatal("missing backup rename call")
+		}
+		checkReplacementSiblingPath(t, client.renameCalls[0].newpath, "/tables", replacementBackupPrefix)
+	})
+
+	t.Run("rollback", func(t *testing.T) {
+		setReplacementNameTokens(
+			t,
+			strings.Repeat("f", replacementNameTokenBytes*2),
+			strings.Repeat("0", replacementNameTokenBytes*2),
+		)
+
+		client := newFakeClient()
+		target := "/tables/" + strings.Repeat("a", 255)
+		client.files[target] = []byte("old")
+		client.failBackupRemove = true
+		backend, err := New("nn:8020", WithClient(client))
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		err = storage.WriteAll(context.Background(), backend, target, []byte("rollback"))
+		if err == nil || !strings.Contains(err.Error(), "remove replacement backup") {
+			t.Fatalf("WriteAll error = %v, want backup cleanup failure", err)
+		}
+		checkReplacementSiblingPath(t, client.lastCreatePath, "/tables", replacementTempPrefix)
+		if len(client.renameCalls) == 0 {
+			t.Fatal("missing backup rename call")
+		}
+		checkReplacementSiblingPath(t, client.renameCalls[0].newpath, "/tables", replacementBackupPrefix)
+		if got := string(client.files[target]); got != "old" {
+			t.Fatalf("rolled back contents = %q, want old", got)
+		}
+	})
+}
+
+func TestBackendTemporarySiblingNameCollisionRetries(t *testing.T) {
+	setReplacementNameTokens(t, "collision", "allocated")
+
+	client := newFakeClient()
+	client.files["/tables/"+replacementTempPrefix+"collision"] = []byte("sentinel")
+	backend, err := New("nn:8020", WithClient(client))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	w, err := backend.Create(context.Background(), "/tables/target.rf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := client.lastCreatePath; got != "/tables/"+replacementTempPrefix+"allocated" {
+		t.Fatalf("temporary path = %q, want allocated retry", got)
+	}
+	if err := w.(storage.Aborter).Abort(); err != nil {
+		t.Fatalf("Abort: %v", err)
+	}
+}
+
 func TestBackendBackupRemovalFailureRollsBackPublishedReplacement(t *testing.T) {
 	client := newFakeClient()
 	client.files["/tables/1.rf"] = []byte("old")
@@ -2075,6 +2194,9 @@ func (c *fakeClient) Open(name string) (Reader, error) {
 }
 
 func (c *fakeClient) Create(name string) (storage.Writer, error) {
+	if _, exists := c.files[name]; exists {
+		return nil, &os.PathError{Op: "create", Path: name, Err: fs.ErrExist}
+	}
 	writer := &fakeWriter{close: func(data []byte) {
 		c.files[name] = append([]byte(nil), data...)
 	}, client: c, failClose: c.failWriterClose, closeHook: c.writerCloseHook}
@@ -2447,6 +2569,42 @@ func countCalls(values []string, want string) int {
 		}
 	}
 	return count
+}
+
+func setReplacementNameTokens(t *testing.T, tokens ...string) {
+	t.Helper()
+
+	original := randomReplacementNameToken
+	index := 0
+	randomReplacementNameToken = func() (string, error) {
+		if index >= len(tokens) {
+			return "", fmt.Errorf("replacement token call %d exceeded test inputs", index+1)
+		}
+		token := tokens[index]
+		index++
+		return token, nil
+	}
+	t.Cleanup(func() {
+		randomReplacementNameToken = original
+	})
+}
+
+func checkReplacementSiblingPath(t *testing.T, sibling, wantDir, wantPrefix string) {
+	t.Helper()
+
+	if got := path.Dir(sibling); got != wantDir {
+		t.Fatalf("sibling directory = %q, want %q", got, wantDir)
+	}
+	base := path.Base(sibling)
+	if !strings.HasPrefix(base, wantPrefix) {
+		t.Fatalf("sibling base = %q, want prefix %q", base, wantPrefix)
+	}
+	if got, want := len(base), len(wantPrefix)+replacementNameTokenBytes*2; got != want {
+		t.Fatalf("sibling base length = %d, want %d", got, want)
+	}
+	if len(base) > 255 {
+		t.Fatalf("sibling base length = %d, want <= 255", len(base))
+	}
 }
 
 type immediateErrorDeadlineWriter struct {

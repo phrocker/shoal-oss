@@ -54,7 +54,7 @@ func shoal_connector_create_scanner(
 	if err != nil {
 		return failForError(outError, err)
 	}
-	owned := newOwnedScanner(scanner, nil)
+	owned := newOwnedScanner(scanner, nil, connector)
 	id, ok := scanners.add(owned)
 	if !ok {
 		return fail(outError, C.SHOAL_STATUS_INTERNAL, errors.New("shoal: scanner handle space exhausted"))
@@ -96,7 +96,7 @@ func shoal_connector_create_batch_scanner(
 	if err != nil {
 		return failForError(outError, err)
 	}
-	owned := newOwnedScanner(nil, scanner)
+	owned := newOwnedScanner(nil, scanner, connector)
 	id, ok := batchScanners.add(owned)
 	if !ok {
 		return fail(outError, C.SHOAL_STATUS_INTERNAL, errors.New("shoal: batch scanner handle space exhausted"))
@@ -751,10 +751,20 @@ func statusForError(err error) C.shoal_status {
 		return C.SHOAL_STATUS_MUTATION_REJECTED
 	case errors.Is(err, accumulo.ErrTableNotFound):
 		return C.SHOAL_STATUS_NOT_FOUND
+	case errors.Is(err, accumulo.ErrTableExists):
+		return C.SHOAL_STATUS_ALREADY_EXISTS
+	case errors.Is(err, accumulo.ErrInvalidTableName),
+		errors.Is(err, accumulo.ErrInvalidProperty):
+		return C.SHOAL_STATUS_INVALID_ARGUMENT
+	case errors.Is(err, accumulo.ErrNamespaceNotFound):
+		return C.SHOAL_STATUS_NOT_FOUND
 	case errors.Is(err, accumulo.ErrPermissionDenied):
 		return C.SHOAL_STATUS_PERMISSION_DENIED
 	case errors.Is(err, accumulo.ErrDiscoveryUnavailable):
 		return C.SHOAL_STATUS_DISCOVERY_UNAVAILABLE
+	case errors.Is(err, accumulo.ErrManagerUnavailable),
+		errors.Is(err, accumulo.ErrClientServiceUnavailable):
+		return C.SHOAL_STATUS_UNAVAILABLE
 	case errors.Is(err, accumulo.ErrTabletNotLocated),
 		errors.Is(err, accumulo.ErrNoTabletCoversRow):
 		return C.SHOAL_STATUS_TABLET_UNAVAILABLE

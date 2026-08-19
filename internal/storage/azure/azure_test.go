@@ -18,16 +18,20 @@
 package azure
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"strings"
 	"testing"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/bloberror"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blockblob"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/service"
 
 	shstorage "github.com/phrocker/shoal/internal/storage"
 )
@@ -47,6 +51,8 @@ type fakeAzureWriteOperations struct {
 	promoteCalls        int
 	cleanupCanceled     bool
 	nextETag            int
+	lastPromoteSource   azureCopySource
+	lastPromoteWriteID  string
 }
 
 func newFakeAzureWriteOperations() *fakeAzureWriteOperations {
@@ -98,12 +104,15 @@ func (f *fakeAzureWriteOperations) uploadStage(
 func (f *fakeAzureWriteOperations) promote(
 	ctx context.Context,
 	_, stageName, name string,
-	_ azureCopySource,
+	source azureCopySource,
 	stage azureObjectState,
+	writeID string,
 	targetExists bool,
 	target azureObjectState,
 ) error {
 	f.promoteCalls++
+	f.lastPromoteSource = source
+	f.lastPromoteWriteID = writeID
 	if f.mutateBeforePromote {
 		f.mutateBeforePromote = false
 		f.nextETag++
@@ -171,6 +180,22 @@ func newFakeAzureWriter(f *fakeAzureWriteOperations, target string) *writer {
 		sourceProvider: staticAzureCopySourceProvider{},
 		cleanupTimeout: azureCleanupTimeout,
 	}
+}
+
+func newCustomServiceBackend(t *testing.T, opts ...Option) (*Backend, *fakeAzureWriteOperations) {
+	t.Helper()
+
+	svc, err := service.NewClientWithNoCredential("https://example.blob.core.windows.net/", nil)
+	if err != nil {
+		t.Fatalf("NewClientWithNoCredential: %v", err)
+	}
+	backend, err := New(context.Background(), append([]Option{WithServiceClient(svc)}, opts...)...)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	ops := newFakeAzureWriteOperations()
+	backend.ops = ops
+	return backend, ops
 }
 
 type staticAzureCopySourceProvider struct{}
@@ -344,6 +369,149 @@ func TestNextTemporaryStageNameRetainsDeepPrefixNearMaxBytes(t *testing.T) {
 	}
 }
 
+func TestBackendCreateWithCustomServiceClientRequiresSourceAuthorization(t *testing.T) {
+	backend, ops := newCustomServiceBackend(t)
+	etag := azcore.ETag("\"old\"")
+	ops.objects["target"] = fakeAzureObject{
+		state: azureObjectState{etag: &etag, size: 3},
+		data:  "old",
+	}
+
+	w, err := backend.Create(context.Background(), "az://container/target")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	writer := w.(*writer)
+	if _, err := w.Write([]byte("new")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	err = w.Close()
+	if err == nil || !strings.Contains(err.Error(), "no source authorization configured") {
+		t.Fatalf("Close error = %v, want explicit source authorization failure", err)
+	}
+	if got := ops.objects["target"].data; got != "old" {
+		t.Fatalf("target data = %q, want old", got)
+	}
+	if _, ok := ops.objects[writer.stageName]; ok {
+		t.Fatal("temporary blob was not removed after authorization failure")
+	}
+}
+
+func TestBackendCreateWithCustomServiceClientSourceSASPromotesStage(t *testing.T) {
+	backend, ops := newCustomServiceBackend(t, WithSourceSASQuery("sig=shared-key"))
+
+	w, err := backend.Create(context.Background(), "az://container/target")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if _, err := w.Write([]byte("new")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	sourceURL, err := url.Parse(ops.lastPromoteSource.url)
+	if err != nil {
+		t.Fatalf("Parse source URL: %v", err)
+	}
+	if got := sourceURL.Query().Get("sig"); got != "shared-key" {
+		t.Fatalf("source SAS signature = %q, want shared-key", got)
+	}
+	if ops.lastPromoteSource.authorization != nil {
+		t.Fatalf("source authorization header = %v, want nil", *ops.lastPromoteSource.authorization)
+	}
+	if got := ops.lastPromoteWriteID; got == "" {
+		t.Fatal("promote write ID was not recorded")
+	}
+}
+
+func TestBackendCreateWithCustomServiceClientAuthorizationProviderPromotesStage(t *testing.T) {
+	var authCalls int
+	backend, ops := newCustomServiceBackend(t, WithSourceAuthorizationProvider(
+		SourceAuthorizationProviderFunc(func(_ context.Context, containerName, blobName string) (SourceAuthorization, error) {
+			authCalls++
+			if containerName != "container" {
+				t.Fatalf("container = %q, want container", containerName)
+			}
+			if !strings.HasPrefix(blobName, tempStageNamePrefix) {
+				t.Fatalf("blob name = %q, want %q prefix", blobName, tempStageNamePrefix)
+			}
+			return SourceAuthorization{Authorization: "Bearer test-token"}, nil
+		}),
+	))
+
+	w, err := backend.Create(context.Background(), "az://container/target")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if _, err := w.Write([]byte("new")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	if authCalls != 1 {
+		t.Fatalf("authorization provider calls = %d, want 1", authCalls)
+	}
+	if ops.lastPromoteSource.authorization == nil || *ops.lastPromoteSource.authorization != "Bearer test-token" {
+		t.Fatalf("source authorization = %v, want Bearer test-token", ops.lastPromoteSource.authorization)
+	}
+	sourceURL, err := url.Parse(ops.lastPromoteSource.url)
+	if err != nil {
+		t.Fatalf("Parse source URL: %v", err)
+	}
+	if sourceURL.RawQuery != "" {
+		t.Fatalf("source query = %q, want empty", sourceURL.RawQuery)
+	}
+}
+
+func TestPromoteStagedBlobWriteScopedBlockIDsPreventCrossCommitBytes(t *testing.T) {
+	promoter := &fakeAzureBlockPromoter{
+		sources: map[string]string{
+			"https://example.invalid/stage-a": "alpha",
+			"https://example.invalid/stage-b": "bravo",
+		},
+	}
+	promoter.stageHook = func() {
+		if _, err := stagePromotionBlocks(
+			context.Background(),
+			promoter,
+			azureCopySource{url: "https://example.invalid/stage-b"},
+			azureObjectState{size: int64(len("bravo"))},
+			"write-b",
+		); err != nil {
+			t.Fatalf("stage competing writer: %v", err)
+		}
+	}
+
+	err := promoteStagedBlob(
+		context.Background(),
+		promoter,
+		azureCopySource{url: "https://example.invalid/stage-a"},
+		azureObjectState{size: int64(len("alpha"))},
+		"write-a",
+		false,
+		azureObjectState{},
+	)
+	if err != nil {
+		t.Fatalf("promoteStagedBlob: %v", err)
+	}
+	if got := promoter.committedData; got != "alpha" {
+		t.Fatalf("committed data = %q, want alpha", got)
+	}
+	if len(promoter.stageCalls) != 2 {
+		t.Fatalf("stage calls = %d, want 2", len(promoter.stageCalls))
+	}
+	if promoter.stageCalls[0].blockID == promoter.stageCalls[1].blockID {
+		t.Fatalf("block IDs collided across writers: %q", promoter.stageCalls[0].blockID)
+	}
+	if len(promoter.stageCalls[0].blockID) != len(promoter.stageCalls[1].blockID) {
+		t.Fatalf("block ID lengths = %d and %d, want equal length", len(promoter.stageCalls[0].blockID), len(promoter.stageCalls[1].blockID))
+	}
+}
+
 func TestWriter_StagedCreateAndReplace(t *testing.T) {
 	for _, existing := range []bool{false, true} {
 		t.Run(fmt.Sprintf("existing=%v", existing), func(t *testing.T) {
@@ -464,6 +632,64 @@ func TestWriter_CleanupUsesIndependentContextAndCanRetryAfterCommit(t *testing.T
 			t.Fatal("second Close did not retry temporary cleanup")
 		}
 	})
+}
+
+type fakeAzureBlockStageCall struct {
+	blockID string
+}
+
+type fakeAzureBlockPromoter struct {
+	sources       map[string]string
+	uncommitted   map[string][]byte
+	committedData string
+	stageCalls    []fakeAzureBlockStageCall
+	stageHook     func()
+}
+
+func (p *fakeAzureBlockPromoter) StageBlockFromURL(
+	ctx context.Context,
+	blockID, source string,
+	options *blockblob.StageBlockFromURLOptions,
+) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if p.uncommitted == nil {
+		p.uncommitted = make(map[string][]byte)
+	}
+	data, ok := p.sources[source]
+	if !ok {
+		return fmt.Errorf("unknown source %s", source)
+	}
+	start := int(options.Range.Offset)
+	end := start + int(options.Range.Count)
+	if start < 0 || end < start || end > len(data) {
+		return fmt.Errorf("range %d:%d out of bounds for %s", start, end, source)
+	}
+	p.uncommitted[blockID] = append([]byte(nil), data[start:end]...)
+	p.stageCalls = append(p.stageCalls, fakeAzureBlockStageCall{blockID: blockID})
+	if p.stageHook != nil {
+		hook := p.stageHook
+		p.stageHook = nil
+		hook()
+	}
+	return nil
+}
+
+func (p *fakeAzureBlockPromoter) CommitBlockList(
+	ctx context.Context,
+	blockIDs []string,
+	_ *blockblob.CommitBlockListOptions,
+) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	var committed bytes.Buffer
+	for _, blockID := range blockIDs {
+		committed.Write(p.uncommitted[blockID])
+	}
+	p.committedData = committed.String()
+	return nil
 }
 
 // TestFile_ReadAt_EdgeCases exercises the code paths in file.ReadAt that do not

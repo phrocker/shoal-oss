@@ -2,7 +2,6 @@ package main
 
 /*
 #cgo CFLAGS: -I${SRCDIR}/../../capi/include
-#include <stdlib.h>
 #include "bridge.h"
 */
 import "C"
@@ -20,6 +19,13 @@ import (
 
 const defaultBootstrapTimeout = 30 * time.Second
 
+// Mutable only so lifecycle tests can shorten the exported free bound.
+var connectorFreeTimeout = 5 * time.Second
+
+var abiCapabilityWords = [...]uint64{
+	uint64(C.SHOAL_ABI_CAPABILITY_WORD0),
+}
+
 type connectorConfig struct {
 	bootstrap        int32
 	instanceName     string
@@ -34,9 +40,93 @@ type connectorConfig struct {
 	dialTimeout      time.Duration
 }
 
+func abiVersionCompatibility() uint32 {
+	return uint32(C.SHOAL_ABI_VERSION)
+}
+
+func abiVersionMajor() uint32 {
+	return uint32(C.SHOAL_ABI_VERSION_MAJOR)
+}
+
+func abiVersionMinor() uint32 {
+	return uint32(C.SHOAL_ABI_VERSION_MINOR)
+}
+
+func abiVersionPatch() uint32 {
+	return uint32(C.SHOAL_ABI_VERSION_PATCH)
+}
+
+func abiVersionPacked() uint32 {
+	return uint32(C.SHOAL_ABI_VERSION_PACKED)
+}
+
+func abiCapabilityCount() uint32 {
+	return uint32(C.SHOAL_ABI_CAPABILITY_COUNT)
+}
+
+func abiCapabilityWordCount() uint32 {
+	return uint32(len(abiCapabilityWords))
+}
+
+func abiCapabilityWord(wordIndex uint32) uint64 {
+	if wordIndex >= abiCapabilityWordCount() {
+		return 0
+	}
+	return abiCapabilityWords[wordIndex]
+}
+
+func abiHasCapability(capabilityID uint32) bool {
+	wordIndex := capabilityID / 64
+	bitIndex := capabilityID % 64
+	return abiCapabilityWord(wordIndex)&(uint64(1)<<bitIndex) != 0
+}
+
 //export shoal_abi_version
 func shoal_abi_version() C.uint32_t {
-	return C.uint32_t(C.SHOAL_ABI_VERSION)
+	return C.uint32_t(abiVersionCompatibility())
+}
+
+//export shoal_abi_version_major
+func shoal_abi_version_major() C.uint32_t {
+	return C.uint32_t(abiVersionMajor())
+}
+
+//export shoal_abi_version_minor
+func shoal_abi_version_minor() C.uint32_t {
+	return C.uint32_t(abiVersionMinor())
+}
+
+//export shoal_abi_version_patch
+func shoal_abi_version_patch() C.uint32_t {
+	return C.uint32_t(abiVersionPatch())
+}
+
+//export shoal_abi_version_packed
+func shoal_abi_version_packed() C.uint32_t {
+	return C.uint32_t(abiVersionPacked())
+}
+
+//export shoal_abi_capability_count
+func shoal_abi_capability_count() C.uint32_t {
+	return C.uint32_t(abiCapabilityCount())
+}
+
+//export shoal_abi_capability_word_count
+func shoal_abi_capability_word_count() C.uint32_t {
+	return C.uint32_t(abiCapabilityWordCount())
+}
+
+//export shoal_abi_capability_word
+func shoal_abi_capability_word(wordIndex C.uint32_t) C.uint64_t {
+	return C.uint64_t(abiCapabilityWord(uint32(wordIndex)))
+}
+
+//export shoal_abi_has_capability
+func shoal_abi_has_capability(capabilityID C.uint32_t) C.uint8_t {
+	if abiHasCapability(uint32(capabilityID)) {
+		return 1
+	}
+	return 0
 }
 
 //export shoal_connector_config_init
@@ -124,7 +214,7 @@ func shoal_connector_free(handle **C.shoal_connector) {
 	*handle = nil
 	id := uint64(C.shoal_bridge_connector_id(value))
 	if owned, ok := connectors.remove(id); ok {
-		_ = owned.close()
+		_ = owned.closeBounded(connectorFreeTimeout)
 	}
 	C.shoal_bridge_connector_free(value)
 }
@@ -258,7 +348,7 @@ func openConnector(config connectorConfig) (*ownedConnector, C.shoal_status, err
 		}
 		return nil, C.SHOAL_STATUS_INTERNAL, err
 	}
-	return &ownedConnector{connector: connector, instance: instance}, C.SHOAL_STATUS_OK, nil
+	return newOwnedConnector(connector, instance), C.SHOAL_STATUS_OK, nil
 }
 
 func lookupConnector(handle *C.shoal_connector) (*ownedConnector, error) {
@@ -285,6 +375,13 @@ func requiredString(value *C.char, name string) (string, error) {
 		return "", fmt.Errorf("shoal: %s is required", name)
 	}
 	return converted, nil
+}
+
+func requiredStringAllowEmpty(value *C.char, name string) (string, error) {
+	if value == nil {
+		return "", fmt.Errorf("shoal: %s is required", name)
+	}
+	return C.GoString(value), nil
 }
 
 func optionalString(value *C.char) string {
@@ -346,14 +443,29 @@ func clearError(outError **C.shoal_error) {
 	}
 }
 
+func cStringData(value string) *C.char {
+	if len(value) == 0 {
+		return nil
+	}
+	return (*C.char)(unsafe.Pointer(unsafe.StringData(value)))
+}
+
+func bridgeErrorAlloc(code C.shoal_status, message string) *C.shoal_error {
+	return C.shoal_bridge_error_alloc(code, cStringData(message), C.size_t(len(message)))
+}
+
 func fail(outError **C.shoal_error, code C.shoal_status, err error) C.shoal_status {
-	if outError != nil {
-		message := err.Error()
-		cMessage := C.CString(message)
-		if cMessage != nil {
-			*outError = C.shoal_bridge_error_alloc(code, cMessage, C.size_t(len(message)))
-			C.free(unsafe.Pointer(cMessage))
-		}
+	if outError == nil {
+		return code
+	}
+	*outError = nil
+	message := ""
+	if err != nil {
+		message = err.Error()
+	}
+	*outError = bridgeErrorAlloc(code, message)
+	if *outError == nil {
+		return C.SHOAL_STATUS_OUT_OF_MEMORY
 	}
 	return code
 }

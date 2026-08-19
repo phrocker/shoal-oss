@@ -27,7 +27,9 @@
 //	container/path/to/object.rf      → first segment = container, rest = blob
 //
 // Auth (in precedence order):
-//  1. WithServiceClient — a pre-built *service.Client.
+//  1. WithServiceClient — a pre-built *service.Client. Reads always work;
+//     writes that promote private staged blobs also require
+//     WithSourceSASQuery or WithSourceAuthorizationProvider.
 //  2. WithConnectionString / AZURE_STORAGE_CONNECTION_STRING — shared-key or SAS.
 //  3. AZURE_STORAGE_ACCOUNT (or WithAccount / WithServiceURL) + the default
 //     Azure credential chain (env vars, managed identity, workload identity,
@@ -43,6 +45,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -80,22 +83,65 @@ type Backend struct {
 type Option func(*config)
 
 type config struct {
-	svc        *service.Client
-	connString string
-	account    string
-	serviceURL string
+	svc                         *service.Client
+	connString                  string
+	account                     string
+	serviceURL                  string
+	sourceAuthorizationProvider SourceAuthorizationProvider
 }
 
 // WithServiceClient supplies a pre-built service client. If set, New ignores
-// all other credential options.
+// all other credential options. Reads always work; writes also need
+// WithSourceSASQuery or WithSourceAuthorizationProvider so Azure can authorize
+// reads from staged private source blobs during promotion.
 func WithServiceClient(svc *service.Client) Option {
 	return func(c *config) { c.svc = svc }
+}
+
+// SourceAuthorization configures how Azure authorizes reads from a staged
+// source blob during promotion. SASQuery may include or omit the leading "?";
+// Authorization should be a full header value such as "Bearer <token>".
+type SourceAuthorization struct {
+	SASQuery      string
+	Authorization string
+}
+
+// SourceAuthorizationProvider supplies per-promotion source authorization for
+// staged private blobs, primarily when using WithServiceClient.
+type SourceAuthorizationProvider interface {
+	SourceAuthorization(context.Context, string, string) (SourceAuthorization, error)
+}
+
+// SourceAuthorizationProviderFunc adapts a function into a
+// SourceAuthorizationProvider.
+type SourceAuthorizationProviderFunc func(context.Context, string, string) (SourceAuthorization, error)
+
+// SourceAuthorization implements SourceAuthorizationProvider.
+func (f SourceAuthorizationProviderFunc) SourceAuthorization(ctx context.Context, containerName, blobName string) (SourceAuthorization, error) {
+	return f(ctx, containerName, blobName)
 }
 
 // WithConnectionString authenticates with an Azure Storage connection string
 // (shared-key or SAS). Also honored via AZURE_STORAGE_CONNECTION_STRING.
 func WithConnectionString(cs string) Option {
 	return func(c *config) { c.connString = cs }
+}
+
+// WithSourceSASQuery supplies an explicit SAS query string for reads from
+// staged source blobs during promotion, primarily for WithServiceClient.
+func WithSourceSASQuery(sasQuery string) Option {
+	return WithSourceAuthorizationProvider(SourceAuthorizationProviderFunc(
+		func(context.Context, string, string) (SourceAuthorization, error) {
+			return SourceAuthorization{SASQuery: sasQuery}, nil
+		},
+	))
+}
+
+// WithSourceAuthorizationProvider supplies explicit staged-source
+// authorization for promotion, primarily when WithServiceClient hides the
+// underlying credential type.
+func WithSourceAuthorizationProvider(provider SourceAuthorizationProvider) Option {
+	return func(c *config) { c.sourceAuthorizationProvider = provider }
 }
 
 // WithAccount sets the storage account name; the service URL is derived as
@@ -120,10 +166,11 @@ func New(_ context.Context, opts ...Option) (*Backend, error) {
 		o(c)
 	}
 	if c.svc != nil {
+		base := rawAzureCopySourceProvider{svc: c.svc}
 		return &Backend{
 			svc:            c.svc,
 			ops:            sdkAzureWriteOperations{svc: c.svc},
-			sourceProvider: rawAzureCopySourceProvider{svc: c.svc},
+			sourceProvider: configuredOrAutomaticSourceProvider(base, nil, c.sourceAuthorizationProvider, false),
 		}, nil
 	}
 
@@ -137,9 +184,14 @@ func New(_ context.Context, opts ...Option) (*Backend, error) {
 			return nil, fmt.Errorf("azure: NewClientFromConnectionString: %w", err)
 		}
 		return &Backend{
-			svc:            svc,
-			ops:            sdkAzureWriteOperations{svc: svc},
-			sourceProvider: sourceProviderFromConnectionString(svc, connString),
+			svc: svc,
+			ops: sdkAzureWriteOperations{svc: svc},
+			sourceProvider: configuredOrAutomaticSourceProvider(
+				rawAzureCopySourceProvider{svc: svc},
+				sourceProviderFromConnectionString(svc, connString),
+				c.sourceAuthorizationProvider,
+				true,
+			),
 		}, nil
 	}
 
@@ -165,10 +217,15 @@ func New(_ context.Context, opts ...Option) (*Backend, error) {
 	return &Backend{
 		svc: svc,
 		ops: sdkAzureWriteOperations{svc: svc},
-		sourceProvider: tokenAzureCopySourceProvider{
-			rawAzureCopySourceProvider: rawAzureCopySourceProvider{svc: svc},
-			cred:                       cred,
-		},
+		sourceProvider: configuredOrAutomaticSourceProvider(
+			rawAzureCopySourceProvider{svc: svc},
+			tokenAzureCopySourceProvider{
+				rawAzureCopySourceProvider: rawAzureCopySourceProvider{svc: svc},
+				cred:                       cred,
+			},
+			c.sourceAuthorizationProvider,
+			true,
+		),
 	}, nil
 }
 
@@ -218,7 +275,8 @@ func (b *Backend) Create(ctx context.Context, path string) (shstorage.Writer, er
 	if err != nil && !isBlobNotFound(err) {
 		return nil, fmt.Errorf("azure: inspect destination az://%s/%s: %w", cont, name, err)
 	}
-	if err == nil && target.etag == nil {
+	targetExists := err == nil
+	if targetExists && target.etag == nil {
 		return nil, fmt.Errorf("azure: inspect destination az://%s/%s: missing ETag", cont, name)
 	}
 	stageName, err := nextTemporaryStageName(name)
@@ -232,7 +290,7 @@ func (b *Backend) Create(ctx context.Context, path string) (shstorage.Writer, er
 		stageName:      stageName,
 		writeID:        uuid.NewString(),
 		ctx:            ctx,
-		targetExists:   err == nil,
+		targetExists:   targetExists,
 		target:         target,
 		sourceProvider: b.sourceProvider,
 		cleanupTimeout: azureCleanupTimeout,
@@ -302,6 +360,7 @@ const (
 	legacyStageDirPrefix  = ".shoal-tmp/"
 	azureCopyBlockSize    = 100 << 20
 	azureSourceSASExpiry  = 5 * time.Minute
+	azureBlockIDHashBytes = 16
 )
 
 var randomStageNameToken = func() (string, error) {
@@ -363,6 +422,36 @@ type azureCopySourceProvider interface {
 	source(context.Context, string, string) (azureCopySource, error)
 }
 
+type configuredAzureCopySourceProvider struct {
+	rawAzureCopySourceProvider
+	provider SourceAuthorizationProvider
+}
+
+func (p configuredAzureCopySourceProvider) source(ctx context.Context, containerName, blobName string) (azureCopySource, error) {
+	if p.provider == nil {
+		return azureCopySource{}, fmt.Errorf("azure: no source authorization configured")
+	}
+	auth, err := p.provider.SourceAuthorization(ctx, containerName, blobName)
+	if err != nil {
+		return azureCopySource{}, err
+	}
+	if auth.Authorization == "" && auth.SASQuery == "" {
+		return azureCopySource{}, fmt.Errorf("azure: no source authorization configured")
+	}
+	sourceURL, err := url.Parse(p.blobURL(containerName, blobName))
+	if err != nil {
+		return azureCopySource{}, fmt.Errorf("azure: parse source blob URL: %w", err)
+	}
+	if auth.SASQuery != "" {
+		sourceURL.RawQuery = strings.TrimPrefix(auth.SASQuery, "?")
+	}
+	source := azureCopySource{url: sourceURL.String()}
+	if auth.Authorization != "" {
+		source.authorization = &auth.Authorization
+	}
+	return source, nil
+}
+
 type rawAzureCopySourceProvider struct {
 	svc *service.Client
 }
@@ -422,6 +511,24 @@ func (p tokenAzureCopySourceProvider) source(ctx context.Context, containerName,
 		url:           p.blobURL(containerName, blobName),
 		authorization: &authorization,
 	}, nil
+}
+
+func configuredOrAutomaticSourceProvider(
+	base rawAzureCopySourceProvider,
+	automatic azureCopySourceProvider,
+	explicit SourceAuthorizationProvider,
+	allowAutomatic bool,
+) azureCopySourceProvider {
+	if explicit != nil {
+		return configuredAzureCopySourceProvider{
+			rawAzureCopySourceProvider: base,
+			provider:                   explicit,
+		}
+	}
+	if allowAutomatic {
+		return automatic
+	}
+	return nil
 }
 
 func sourceProviderFromConnectionString(svc *service.Client, connString string) azureCopySourceProvider {
@@ -524,7 +631,7 @@ type azureObjectState struct {
 type azureWriteOperations interface {
 	head(context.Context, string, string) (azureObjectState, error)
 	uploadStage(context.Context, string, string, []byte, string) (azureObjectState, error)
-	promote(context.Context, string, string, string, azureCopySource, azureObjectState, bool, azureObjectState) error
+	promote(context.Context, string, string, string, azureCopySource, azureObjectState, string, bool, azureObjectState) error
 	deleteStage(context.Context, string, string, azureObjectState) error
 }
 
@@ -577,21 +684,76 @@ func (o sdkAzureWriteOperations) promote(
 	containerName, stageName, name string,
 	source azureCopySource,
 	stage azureObjectState,
+	writeID string,
 	targetExists bool,
 	target azureObjectState,
 ) error {
 	bb := o.svc.NewContainerClient(containerName).NewBlockBlobClient(name)
-	conditions := &blob.ModifiedAccessConditions{}
-	if targetExists {
-		conditions.IfMatch = target.etag
-	} else {
-		conditions.IfNoneMatch = to.Ptr(azcore.ETagAny)
-	}
+	return promoteStagedBlob(
+		ctx,
+		sdkAzureBlockPromoter{client: bb},
+		source,
+		stage,
+		writeID,
+		targetExists,
+		target,
+	)
+}
 
+type azureBlockPromoter interface {
+	StageBlockFromURL(context.Context, string, string, *blockblob.StageBlockFromURLOptions) error
+	CommitBlockList(context.Context, []string, *blockblob.CommitBlockListOptions) error
+}
+
+type sdkAzureBlockPromoter struct {
+	client *blockblob.Client
+}
+
+func (p sdkAzureBlockPromoter) StageBlockFromURL(
+	ctx context.Context,
+	blockID, source string,
+	options *blockblob.StageBlockFromURLOptions,
+) error {
+	_, err := p.client.StageBlockFromURL(ctx, blockID, source, options)
+	return err
+}
+
+func (p sdkAzureBlockPromoter) CommitBlockList(
+	ctx context.Context,
+	blockIDs []string,
+	options *blockblob.CommitBlockListOptions,
+) error {
+	_, err := p.client.CommitBlockList(ctx, blockIDs, options)
+	return err
+}
+
+func promoteStagedBlob(
+	ctx context.Context,
+	promoter azureBlockPromoter,
+	source azureCopySource,
+	stage azureObjectState,
+	writeID string,
+	targetExists bool,
+	target azureObjectState,
+) error {
+	blockIDs, err := stagePromotionBlocks(ctx, promoter, source, stage, writeID)
+	if err != nil {
+		return err
+	}
+	return commitPromotionBlocks(ctx, promoter, blockIDs, stage, targetExists, target)
+}
+
+func stagePromotionBlocks(
+	ctx context.Context,
+	promoter azureBlockPromoter,
+	source azureCopySource,
+	stage azureObjectState,
+	writeID string,
+) ([]string, error) {
 	blockIDs := make([]string, 0, max(1, int((stage.size+azureCopyBlockSize-1)/azureCopyBlockSize)))
 	for offset, index := int64(0), 0; offset < stage.size; offset, index = offset+azureCopyBlockSize, index+1 {
 		count := min(stage.size-offset, int64(azureCopyBlockSize))
-		blockID := base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("%08d", index)))
+		blockID := temporaryBlockID(writeID, index)
 		options := &blockblob.StageBlockFromURLOptions{
 			CopySourceAuthorization: source.authorization,
 			SourceModifiedAccessConditions: &blob.SourceModifiedAccessConditions{
@@ -599,13 +761,29 @@ func (o sdkAzureWriteOperations) promote(
 			},
 			Range: blob.HTTPRange{Offset: offset, Count: count},
 		}
-		if _, err := bb.StageBlockFromURL(ctx, blockID, source.url, options); err != nil {
-			return err
+		if err := promoter.StageBlockFromURL(ctx, blockID, source.url, options); err != nil {
+			return nil, err
 		}
 		blockIDs = append(blockIDs, blockID)
 	}
+	return blockIDs, nil
+}
 
-	if _, err := bb.CommitBlockList(ctx, blockIDs, &blockblob.CommitBlockListOptions{
+func commitPromotionBlocks(
+	ctx context.Context,
+	promoter azureBlockPromoter,
+	blockIDs []string,
+	stage azureObjectState,
+	targetExists bool,
+	target azureObjectState,
+) error {
+	conditions := &blob.ModifiedAccessConditions{}
+	if targetExists {
+		conditions.IfMatch = target.etag
+	} else {
+		conditions.IfNoneMatch = to.Ptr(azcore.ETagAny)
+	}
+	if err := promoter.CommitBlockList(ctx, blockIDs, &blockblob.CommitBlockListOptions{
 		Metadata: stage.metadata,
 		AccessConditions: &blob.AccessConditions{
 			ModifiedAccessConditions: conditions,
@@ -614,6 +792,14 @@ func (o sdkAzureWriteOperations) promote(
 		return err
 	}
 	return nil
+}
+
+func temporaryBlockID(writeID string, index int) string {
+	identity := sha256.Sum256([]byte(writeID))
+	raw := make([]byte, 0, azureBlockIDHashBytes+4)
+	raw = append(raw, identity[:azureBlockIDHashBytes]...)
+	raw = binary.BigEndian.AppendUint32(raw, uint32(index))
+	return base64.StdEncoding.EncodeToString(raw)
 }
 
 func (o sdkAzureWriteOperations) deleteStage(
@@ -706,7 +892,7 @@ func (w *writer) Close() error {
 		return errors.Join(err, w.cleanupStage())
 	}
 	if err := w.ops.promote(
-		w.ctx, w.container, w.stageName, w.name, source, w.stage, w.targetExists, w.target,
+		w.ctx, w.container, w.stageName, w.name, source, w.stage, w.writeID, w.targetExists, w.target,
 	); err != nil {
 		if verified, verifyErr := w.verifyDestination(); verifyErr != nil || !verified {
 			return errors.Join(

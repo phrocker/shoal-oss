@@ -4,9 +4,13 @@ package hdfs
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	hdfsclient "github.com/colinmarc/hdfs/v2"
+	"github.com/colinmarc/hdfs/v2/hadoopconf"
 	"hash"
 	"io"
 	"io/fs"
@@ -19,10 +23,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-
-	hdfsclient "github.com/colinmarc/hdfs/v2"
-	"github.com/colinmarc/hdfs/v2/hadoopconf"
-	"github.com/google/uuid"
 
 	"github.com/phrocker/shoal/internal/storage"
 )
@@ -315,11 +315,10 @@ func (b *Backend) Create(ctx context.Context, objectPath string) (storage.Writer
 		}
 	}
 
-	tempPath := resolved + ".shoal-tmp-" + uuid.NewString()
-	writer, err := lease.client.Create(tempPath)
+	tempPath, writer, err := createTemporaryFile(lease.client, resolved)
 	if err != nil {
 		_ = lease.release()
-		return nil, fmt.Errorf("hdfs: create temporary file %s: %w", tempPath, err)
+		return nil, err
 	}
 	if err := applyDeadline(ctx, writer); err != nil {
 		return nil, errors.Join(
@@ -835,6 +834,10 @@ func isNotFound(err error) bool {
 	return errors.Is(err, fs.ErrNotExist) || os.IsNotExist(err)
 }
 
+func isAlreadyExists(err error) bool {
+	return errors.Is(err, fs.ErrExist) || os.IsExist(err)
+}
+
 type deadlineSetter interface {
 	SetDeadline(time.Time) error
 }
@@ -1028,6 +1031,52 @@ const (
 	replacementUnabortable
 )
 
+const (
+	replacementTempPrefix     = ".shoal-tmp-"
+	replacementBackupPrefix   = ".shoal-backup-"
+	replacementNameTokenBytes = 16
+	replacementNameAttempts   = 32
+)
+
+var randomReplacementNameToken = func() (string, error) {
+	buf := make([]byte, replacementNameTokenBytes)
+	if _, err := rand.Read(buf); err != nil {
+		return "", fmt.Errorf("hdfs: generate replacement name token: %w", err)
+	}
+	return hex.EncodeToString(buf), nil
+}
+
+func nextReplacementSiblingPath(target, prefix string) (string, error) {
+	token, err := randomReplacementNameToken()
+	if err != nil {
+		return "", err
+	}
+	return path.Join(path.Dir(target), prefix+token), nil
+}
+
+func createTemporaryFile(client Client, target string) (string, storage.Writer, error) {
+	var lastErr error
+	for attempts := 0; attempts < replacementNameAttempts; attempts++ {
+		tempPath, err := nextReplacementSiblingPath(target, replacementTempPrefix)
+		if err != nil {
+			return "", nil, err
+		}
+		writer, err := client.Create(tempPath)
+		if err == nil {
+			return tempPath, writer, nil
+		}
+		if isAlreadyExists(err) {
+			lastErr = err
+			continue
+		}
+		return "", nil, fmt.Errorf("hdfs: create temporary file %s: %w", tempPath, err)
+	}
+	if lastErr == nil {
+		lastErr = fs.ErrExist
+	}
+	return "", nil, fmt.Errorf("hdfs: exhausted unique temporary file names for %s: %w", target, lastErr)
+}
+
 func (w *replaceWriter) Write(p []byte) (int, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -1071,20 +1120,9 @@ func (w *replaceWriter) Close() (retErr error) {
 }
 
 func (w *replaceWriter) commitReplacement() error {
-	backup := w.target + ".shoal-backup-" + uuid.NewString()
-	hadOld := true
-	if err := renameWithContext(w.ctx, w.client, w.target, backup); err != nil {
-		if !isNotFound(err) {
-			preserveErr := fmt.Errorf("hdfs: preserve existing file %s: %w", w.target, err)
-			if resolveErr := withCleanupContext(func(cleanupCtx context.Context) error {
-				return w.resolveBackupRenameAmbiguity(cleanupCtx, backup)
-			}); resolveErr != nil {
-				w.state = replacementUnabortable
-				return errors.Join(preserveErr, resolveErr)
-			}
-			return preserveErr
-		}
-		hadOld = false
+	backup, hadOld, err := w.preserveExistingTarget()
+	if err != nil {
+		return err
 	}
 
 	if err := renameWithContext(w.ctx, w.client, w.temp, w.target); err != nil {
@@ -1135,6 +1173,38 @@ func (w *replaceWriter) commitReplacement() error {
 	}
 	w.state = replacementCommitted
 	return nil
+}
+
+func (w *replaceWriter) preserveExistingTarget() (backup string, hadOld bool, retErr error) {
+	var lastErr error
+	for attempts := 0; attempts < replacementNameAttempts; attempts++ {
+		backup, retErr = nextReplacementSiblingPath(w.target, replacementBackupPrefix)
+		if retErr != nil {
+			return "", true, retErr
+		}
+		if retErr = renameWithContext(w.ctx, w.client, w.target, backup); retErr == nil {
+			return backup, true, nil
+		}
+		if isNotFound(retErr) {
+			return "", false, nil
+		}
+		if isAlreadyExists(retErr) {
+			lastErr = retErr
+			continue
+		}
+		preserveErr := fmt.Errorf("hdfs: preserve existing file %s: %w", w.target, retErr)
+		if resolveErr := withCleanupContext(func(cleanupCtx context.Context) error {
+			return w.resolveBackupRenameAmbiguity(cleanupCtx, backup)
+		}); resolveErr != nil {
+			w.state = replacementUnabortable
+			return "", true, errors.Join(preserveErr, resolveErr)
+		}
+		return backup, true, preserveErr
+	}
+	if lastErr == nil {
+		lastErr = fs.ErrExist
+	}
+	return "", true, fmt.Errorf("hdfs: exhausted unique replacement backup names for %s: %w", w.target, lastErr)
 }
 
 func (w *replaceWriter) rollbackPublishedReplacement(ctx context.Context, client Client, backup string) error {

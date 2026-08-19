@@ -5,6 +5,18 @@
 #include <string.h>
 
 int main(void) {
+  assert(shoal_bridge_string_alloc(NULL, 1) == NULL);
+  char *string_copy = shoal_bridge_string_alloc("value", 5);
+  assert(string_copy != NULL);
+  assert(strcmp(string_copy, "value") == 0);
+  shoal_bridge_string_free(string_copy);
+  shoal_bridge_test_string_alloc_fail_after(1);
+  string_copy = shoal_bridge_string_alloc("first", 5);
+  assert(string_copy != NULL);
+  shoal_bridge_string_free(string_copy);
+  assert(shoal_bridge_string_alloc("second", 6) == NULL);
+  shoal_bridge_test_string_alloc_reset();
+
   static const uint8_t row[] = {'r', '\0', 'w'};
   static const uint8_t family[] = {'c', 'f'};
   static const uint8_t qualifier[] = {'c', 'q'};
@@ -50,6 +62,25 @@ int main(void) {
   shoal_bridge_scan_result_free(result);
   shoal_bridge_scan_result_free(NULL);
   assert(shoal_bridge_scan_result_alloc(SIZE_MAX) == NULL);
+
+  shoal_table_list_result *table_list = shoal_bridge_table_list_alloc(2);
+  assert(table_list != NULL);
+  assert(shoal_bridge_table_list_count(table_list) == 2);
+  assert(shoal_bridge_table_list_set(table_list, 0, "analytics.orders", "2"));
+  assert(shoal_bridge_table_list_set(table_list, 1, "events", "1"));
+  shoal_table_view table_view;
+  assert(shoal_bridge_table_list_get(table_list, 0, &table_view));
+  assert(strcmp(table_view.name, "analytics.orders") == 0);
+  assert(strcmp(table_view.id, "2") == 0);
+  assert(shoal_bridge_table_list_get(table_list, 1, &table_view));
+  assert(strcmp(table_view.name, "events") == 0);
+  assert(strcmp(table_view.id, "1") == 0);
+  assert(!shoal_bridge_table_list_get(table_list, 2, &table_view));
+  assert(!shoal_bridge_table_list_set(table_list, 2, "missing", "3"));
+  assert(!shoal_bridge_table_list_set(table_list, 0, NULL, "1"));
+  shoal_bridge_table_list_free(table_list);
+  shoal_bridge_table_list_free(NULL);
+  assert(shoal_bridge_table_list_alloc(SIZE_MAX) == NULL);
 
   static const uint8_t prev_row[] = {'a', '\0'};
   static const uint8_t end_row[] = {'z'};
@@ -101,5 +132,26 @@ int main(void) {
   assert(strcmp(cleanup.message, "cancel failed") == 0);
   assert(!shoal_bridge_write_failure_get_cleanup(failure, 1, &cleanup));
   shoal_bridge_write_failure_free(failure);
+
+  shoal_table_properties_result *properties =
+      shoal_bridge_table_properties_alloc(2);
+  assert(properties != NULL);
+  assert(shoal_bridge_table_properties_count(properties) == 2);
+  assert(shoal_bridge_table_properties_set(properties, 0, "table.empty", ""));
+  assert(shoal_bridge_table_properties_set(properties, 1, "table.mode",
+                                           "stream"));
+  shoal_table_property_view property_view;
+  assert(shoal_bridge_table_properties_get(properties, 0, &property_view));
+  assert(strcmp(property_view.key, "table.empty") == 0);
+  assert(strcmp(property_view.value, "") == 0);
+  assert(shoal_bridge_table_properties_get(properties, 1, &property_view));
+  assert(strcmp(property_view.key, "table.mode") == 0);
+  assert(strcmp(property_view.value, "stream") == 0);
+  assert(!shoal_bridge_table_properties_get(properties, 2, &property_view));
+  assert(!shoal_bridge_table_properties_set(properties, 2, "missing", "x"));
+  assert(!shoal_bridge_table_properties_set(properties, 0, NULL, "x"));
+  shoal_bridge_table_properties_free(properties);
+  shoal_bridge_table_properties_free(NULL);
+  assert(shoal_bridge_table_properties_alloc(SIZE_MAX) == NULL);
   return 0;
 }
