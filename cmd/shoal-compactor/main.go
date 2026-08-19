@@ -492,7 +492,18 @@ func drainCoordinator(ctx context.Context, logger *slog.Logger, cc coordinatorCo
 			return false
 		}
 
-		if !executeJob(ctx, logger, cc, cfg, job) {
+		usable, released := executeJob(ctx, logger, cc, cfg, job)
+		if !released {
+			// The assignment is still active on the coordinator: either
+			// the hand-back was one it could not process (see
+			// unreleasableReason) or the release budget ran out. Asking
+			// for another job now would spend a second slot the same way
+			// and keep doing so for as long as the coordinator has work,
+			// so end the drain and let the outer loop's backoff apply.
+			// The connection is closed there either way.
+			return true
+		}
+		if !usable {
 			// The connection did not survive the hand-back (or shutdown
 			// closed it). Reconnecting is cheaper than discovering that
 			// with another doomed getCompactionJob.
@@ -530,7 +541,17 @@ func drainCoordinator(ctx context.Context, logger *slog.Logger, cc coordinatorCo
 //
 // What never happens here is a metadata or ZooKeeper write. The manager
 // remains the only process that decides a compaction happened.
-func executeJob(ctx context.Context, logger *slog.Logger, cc coordinatorConn, cfg pollConfig, job *tabletserver.TExternalCompactionJob) bool {
+//
+// It reports both whether cc survived and whether the slot actually went
+// back, because a job left assigned is the one condition under which
+// asking for more work makes things worse.
+func executeJob(
+	ctx context.Context,
+	logger *slog.Logger,
+	cc coordinatorConn,
+	cfg pollConfig,
+	job *tabletserver.TExternalCompactionJob,
+) (connUsable, released bool) {
 	ecid := job.GetExternalCompactionId()
 
 	plan, err := compactjob.Translate(job, cfg.jobOptions)
@@ -604,7 +625,7 @@ func unreleasableReason(job *tabletserver.TExternalCompactionJob) string {
 
 // releaseJob hands one accepted job back to the coordinator so the slot
 // is freed and a Java compactor can run it. It reports whether cc is
-// still usable afterwards.
+// still usable afterwards, and whether the slot actually went back.
 //
 // This is the one RPC this binary owes the manager, so it is the one
 // that retries. A job the coordinator handed out stays assigned until it
@@ -635,7 +656,7 @@ func releaseJob(
 	cfg pollConfig,
 	job *tabletserver.TExternalCompactionJob,
 	class string,
-) (connUsable bool) {
+) (connUsable, released bool) {
 	ecid := job.GetExternalCompactionId()
 	shuttingDown := ctx.Err() != nil
 	if shuttingDown {
@@ -654,7 +675,7 @@ func releaseJob(
 			slog.String("ecid", ecid),
 			slog.String("class", class),
 			slog.String("reason", why))
-		return true
+		return true, false
 	}
 
 	// context.WithoutCancel keeps the RPC's deadline ours alone: a
@@ -782,7 +803,7 @@ func releaseJob(
 				slog.String("ecid", ecid),
 				slog.String("class", class),
 				slog.Int("attempt", attempt))
-			return connUsable
+			return connUsable, true
 		}
 
 		logger.Warn("release: compactionFailed rpc failed",
@@ -813,7 +834,7 @@ func releaseJob(
 		slog.String("class", class),
 		slog.String("extent", compactjob.ExtentString(job.GetExtent())),
 		slog.Duration("budget", cfg.releaseTimeout))
-	return connUsable
+	return connUsable, false
 }
 
 // redialCoordinator re-resolves the coordinator and opens a connection

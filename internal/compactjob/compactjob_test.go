@@ -180,8 +180,10 @@ func TestTranslateMapsEveryJobField(t *testing.T) {
 	if plan.TableID != "2" {
 		t.Errorf("TableID = %q, want 2", plan.TableID)
 	}
-	if plan.Extent != job.Extent {
-		t.Errorf("Extent = %+v, want the job's extent verbatim", plan.Extent)
+	if !bytes.Equal(plan.Extent.GetTable(), job.Extent.GetTable()) ||
+		!bytes.Equal(plan.Extent.GetPrevEndRow(), job.Extent.GetPrevEndRow()) ||
+		!bytes.Equal(plan.Extent.GetEndRow(), job.Extent.GetEndRow()) {
+		t.Errorf("Extent = %+v, want the job's extent %+v", plan.Extent, job.Extent)
 	}
 	if plan.Kind != tabletserver.TCompactionKind_USER {
 		t.Errorf("Kind = %v, want USER", plan.Kind)
@@ -599,12 +601,12 @@ func TestTranslateRefusesAnEarlierTmpMarker(t *testing.T) {
 // and does not care what it is, so a job from a second configured volume
 // must still translate.
 func TestTranslateAcceptsAnUnauthoritativeVolume(t *testing.T) {
+	const path = "hdfs://other-nn:8020/srv/vol2/accumulo/tables/2/t-0001/F0002.rf"
 	job := validJob()
-	job.Files[1].MetadataFileEntry =
-		storedFile("file:/srv/vol2/accumulo/tables/2/t-0001/F0002.rf")
+	job.Files[1].MetadataFileEntry = storedFile(path)
 
 	plan := mustTranslate(t, job, Options{})
-	if got := plan.Inputs[1].Path; got != "file:/srv/vol2/accumulo/tables/2/t-0001/F0002.rf" {
+	if got := plan.Inputs[1].Path; got != path {
 		t.Fatalf("input path = %q, want the second volume's path", got)
 	}
 }
@@ -1013,15 +1015,20 @@ func TestTranslateRefusesAnOutputAliasingAnInputByUserinfo(t *testing.T) {
 // forged by moving a byte across a delimiter. Every row
 // KeyExtent.toDataRange stores is a followingKey(ROW) result and so ends
 // in a zero byte, which is exactly the byte a delimited key would use to
-// separate the bounds: ("a", "\x00b") and ("a\x00", "b") are different
-// ranges, and a delimited key would call the second a duplicate of the
-// first and refuse a job Accumulo built.
+// separate the bounds: ("\x00a", "\x00b") and ("\x00a\x00", "b") spell
+// the same delimited key, are different ranges, and a delimited key
+// would call the second a duplicate of the first and refuse a job
+// Accumulo built.
+//
+// Both bounds start with the zero byte because Range rejects a start key
+// past its end, and taking a leading zero byte off the end row is what
+// would invert the pair — so this is the shape a legal collision has.
 func TestTranslateKeepsBinaryRowsApart(t *testing.T) {
 	const path = "hdfs://nn/accumulo/tables/2/t-0001/F0002.rf"
 	job := validJob()
 	job.Files = append(job.Files,
-		&tabletserver.InputFile{MetadataFileEntry: fencedFile(path, "a", "\x00b"), Size: 8, Entries: 1},
-		&tabletserver.InputFile{MetadataFileEntry: fencedFile(path, "a\x00", "b"), Size: 8, Entries: 1},
+		&tabletserver.InputFile{MetadataFileEntry: fencedFile(path, "\x00a", "\x00b"), Size: 8, Entries: 1},
+		&tabletserver.InputFile{MetadataFileEntry: fencedFile(path, "\x00a\x00", "b"), Size: 8, Entries: 1},
 	)
 
 	// Both are fenced, so the job is refused for the fence — the point
@@ -1030,6 +1037,125 @@ func TestTranslateKeepsBinaryRowsApart(t *testing.T) {
 	if strings.Contains(r.Detail, "duplicates") {
 		t.Fatalf("detail = %q, want the fence refusal rather than a duplicate", r.Detail)
 	}
+}
+
+// TestTranslateRefusesAnInvertedFence: deserialize builds
+// Range(startRow, true, endRow, false), whose Key constructor throws
+// IllegalArgumentException when the end key sorts first. An entry
+// spelled that way is not an input shoal has yet to port — it is one no
+// Java compactor could deserialize either, so it has to read as
+// malformed rather than as a capability shoal is missing, or an operator
+// is told to wait for a feature that would never help.
+func TestTranslateRefusesAnInvertedFence(t *testing.T) {
+	const path = "hdfs://nn/accumulo/tables/2/t-0001/F0002.rf"
+	job := validJob()
+	job.Files = append(job.Files,
+		&tabletserver.InputFile{MetadataFileEntry: fencedFile(path, "m", "c"), Size: 8, Entries: 1},
+	)
+
+	r := assertRefused(t, job, Options{}, ClassMalformedJob, "files[2]")
+	if !strings.Contains(r.Detail, "sorts after") {
+		t.Fatalf("detail = %q, want it to name the inversion", r.Detail)
+	}
+}
+
+// TestTranslateAcceptsAnEmptyFenceRange is the boundary the inversion
+// check must not cross. Key(row) is not before Key(row), so Java builds
+// Range(row, true, row, false) without complaint — it simply selects
+// nothing. That is a fence, so the job is still refused, but as an
+// unsupported one rather than a malformed one.
+func TestTranslateAcceptsAnEmptyFenceRange(t *testing.T) {
+	const path = "hdfs://nn/accumulo/tables/2/t-0001/F0002.rf"
+	job := validJob()
+	job.Files = append(job.Files,
+		&tabletserver.InputFile{MetadataFileEntry: fencedFile(path, "m", "m"), Size: 8, Entries: 1},
+	)
+
+	assertRefused(t, job, Options{}, ClassRangedInputFile, "files[2]")
+}
+
+// TestTranslateCopiesTheExtentOutOfTheJob: a Plan outlives the RPC that
+// produced it, and the extent is the transport's struct. parseIterators
+// already copies each option map for this reason; an aliased extent
+// would let a recycled job change a plan that was already logged and is
+// about to be executed.
+func TestTranslateCopiesTheExtentOutOfTheJob(t *testing.T) {
+	job := validJob()
+	plan := mustTranslate(t, job, Options{})
+
+	if plan.Extent == job.Extent {
+		t.Fatal("Plan.Extent is the job's own struct; a recycled job would rewrite the plan")
+	}
+
+	// Both spellings of reuse: a new struct in the job, and a mutation
+	// through the byte slices the old one handed out.
+	table := job.Extent.Table
+	job.Extent = &data.TKeyExtent{Table: []byte("99"), PrevEndRow: []byte("x"), EndRow: []byte("z")}
+	table[0] = 'Z'
+
+	if got := string(plan.Extent.GetTable()); got != "2" {
+		t.Fatalf("Extent.Table = %q after the job was reused, want the translated %q", got, "2")
+	}
+	if got := string(plan.Extent.GetPrevEndRow()); got != "c" {
+		t.Fatalf("Extent.PrevEndRow = %q after the job was reused, want %q", got, "c")
+	}
+	if got := string(plan.Extent.GetEndRow()); got != "m" {
+		t.Fatalf("Extent.EndRow = %q after the job was reused, want %q", got, "m")
+	}
+}
+
+// TestTranslateKeepsInfiniteExtentBoundsInfinite: an extent spells an
+// infinite bound as a missing row, and bytes.Clone keeps nil nil. A copy
+// that turned them into empty rows would silently rename the first or
+// last tablet of a table to a bounded one.
+func TestTranslateKeepsInfiniteExtentBoundsInfinite(t *testing.T) {
+	job := validJob()
+	job.Extent = &data.TKeyExtent{Table: []byte("2")}
+
+	plan := mustTranslate(t, job, Options{})
+	if plan.Extent.GetPrevEndRow() != nil {
+		t.Errorf("PrevEndRow = %q, want nil so the tablet keeps an infinite start", plan.Extent.GetPrevEndRow())
+	}
+	if plan.Extent.GetEndRow() != nil {
+		t.Errorf("EndRow = %q, want nil so the tablet keeps an infinite end", plan.Extent.GetEndRow())
+	}
+}
+
+// TestTranslateRefusesAVolumeNoBackendCanOpen: parsing proves the
+// spelling, not that shoal has a reader. hdfs's Backend.resolve is the
+// only shoal resolver that interprets a scheme and isHDFSScheme accepts
+// exactly one; local's Open hands the string to os.Open verbatim (it
+// declares local path semantics, so nothing strips the scheme) and the
+// object stores take keys. So a job on any other volume would be
+// declared executable and then die on its first read, with the slot
+// already spent and no capability reported.
+func TestTranslateRefusesAVolumeNoBackendCanOpen(t *testing.T) {
+	for _, path := range []string{
+		"file:/srv/vol2/accumulo/tables/2/t-0001/F0002.rf",
+		"file:///srv/vol2/accumulo/tables/2/t-0001/F0002.rf",
+		"s3a://bucket/accumulo/tables/2/t-0001/F0002.rf",
+		"ftp://nn/accumulo/tables/2/t-0001/F0002.rf",
+	} {
+		t.Run(path, func(t *testing.T) {
+			job := validJob()
+			job.Files[1].MetadataFileEntry = storedFile(path)
+
+			r := assertRefused(t, job, Options{}, ClassUnsupportedVolume, "files[1]")
+			if !strings.Contains(r.Detail, "has no shoal backend") {
+				t.Fatalf("detail = %q, want it to name the missing backend", r.Detail)
+			}
+		})
+	}
+}
+
+// TestTranslateRefusesAnOutputVolumeNoBackendCanOpen is the same gate on
+// the write side: an output shoal cannot create is not a compaction it
+// can run, however well the path parses.
+func TestTranslateRefusesAnOutputVolumeNoBackendCanOpen(t *testing.T) {
+	job := validJob()
+	job.OutputFile = "file:/srv/vol2/accumulo/tables/2/t-0001/C0003.rf" + tmpSuffix(testECID)
+
+	assertRefused(t, job, Options{}, ClassUnsupportedVolume, "outputFile")
 }
 
 // TestTranslateRefusesAnOutputUnderAnotherTable pins that the output

@@ -742,6 +742,46 @@ func TestDrainCoordinatorSurfacesJobsItCannotHandBack(t *testing.T) {
 	}
 }
 
+// TestDrainCoordinatorStopsAfterASlotItCouldNotRelease: an assignment
+// left active is the one outcome under which asking for more work makes
+// things worse. Every further getCompactionJob can hand out another slot
+// that will leak the same way, and each leaked slot costs a tablet a
+// compaction cycle until the coordinator's own sweep notices. So the
+// drain ends and reports idle, which is what puts the outer loop on its
+// backoff instead of straight back on the wire.
+func TestDrainCoordinatorStopsAfterASlotItCouldNotRelease(t *testing.T) {
+	svc := &fakeCoordinator{}
+	handedOut := 0
+	svc.getJob = func(ecid string) (*compactioncoordinator.TNextCompactionJob, error) {
+		handedOut++
+		job := translatableJob(ecid)
+		// Unreleasable: compactionFailed cannot convert a missing extent.
+		job.Extent = nil
+		return jobReply(job), nil
+	}
+
+	cfg := testPollConfig(&scriptedResolver{results: []resolveResult{{addr: "manager-a:9999"}}}, nil)
+	logger, logs := testLogger()
+	if idle := drainCoordinator(context.Background(), logger, &fakeConn{svc: svc}, cfg); !idle {
+		t.Fatal("drain = busy, want idle so the outer loop backs off")
+	}
+
+	if handedOut != 1 {
+		t.Fatalf("getCompactionJob calls = %d, want 1: the drain kept asking for slots it cannot release",
+			handedOut)
+	}
+	if releases := svc.releases(); len(releases) != 0 {
+		t.Fatalf("compactionFailed calls = %d, want none: the coordinator cannot process them",
+			len(releases))
+	}
+	if n := svc.completedCount(); n != 0 {
+		t.Fatalf("compactionCompleted calls = %d, want 0", n)
+	}
+	if out := logs.String(); !strings.Contains(out, "compaction slot cannot be released") {
+		t.Fatalf("the unreleasable slot was not surfaced:\n%s", out)
+	}
+}
+
 // TestDrainCoordinatorStillReleasesWhenOnlyTheRowsAreMissing keeps the
 // guard from swallowing releasable jobs: KeyExtent.fromThrift maps a
 // null endRow or prevEndRow to a null Text, so an extent with only a
@@ -851,8 +891,12 @@ func TestReleaseJobSurvivesShutdown(t *testing.T) {
 
 	logger, logs := testLogger()
 	job := translatableJob(ecidPrefix + "0d1a4b0e-0000-0000-0000-000000000001")
-	if usable := releaseJob(ctx, logger, stale, cfg, job, compactjob.ClassCommitUnavailable); !usable {
+	usable, released := releaseJob(ctx, logger, stale, cfg, job, compactjob.ClassCommitUnavailable)
+	if !usable {
 		t.Error("releaseJob reported the caller's connection spent; it was never used")
+	}
+	if !released {
+		t.Error("releaseJob reported the slot still assigned; the coordinator accepted the hand-back")
 	}
 
 	releases := svc.releases()
@@ -893,8 +937,12 @@ func TestReleaseJobGivesUpWithinItsBudget(t *testing.T) {
 	job := translatableJob(ecidPrefix + "0d1a4b0e-0000-0000-0000-000000000002")
 
 	start := time.Now()
-	releaseJob(ctx, logger, &fakeConn{svc: &fakeCoordinator{}}, cfg, job, compactjob.ClassCommitUnavailable)
+	_, released := releaseJob(ctx, logger, &fakeConn{svc: &fakeCoordinator{}}, cfg, job, compactjob.ClassCommitUnavailable)
 	elapsed := time.Since(start)
+
+	if released {
+		t.Error("releaseJob reported the slot released; no hand-back ever reached a coordinator")
+	}
 
 	if elapsed > time.Second {
 		t.Fatalf("release took %s, want it bounded by the %s budget", elapsed, cfg.releaseTimeout)
@@ -945,15 +993,17 @@ func TestReleaseJobBoundsASilentCoordinator(t *testing.T) {
 	logger, logs := testLogger()
 	job := translatableJob(ecidPrefix + "0d1a4b0e-0000-0000-0000-000000000003")
 
-	done := make(chan bool, 1)
+	type releaseOutcome struct{ usable, released bool }
+	done := make(chan releaseOutcome, 1)
 	start := time.Now()
 	go func() {
-		done <- releaseJob(context.Background(), logger, cc, cfg, job, compactjob.ClassCommitUnavailable)
+		usable, released := releaseJob(context.Background(), logger, cc, cfg, job, compactjob.ClassCommitUnavailable)
+		done <- releaseOutcome{usable: usable, released: released}
 	}()
 
-	var usable bool
+	var outcome releaseOutcome
 	select {
-	case usable = <-done:
+	case outcome = <-done:
 	case <-time.After(10 * time.Second):
 		t.Fatal("releaseJob never returned; the budget is not enforced on in-flight RPCs")
 	}
@@ -962,8 +1012,11 @@ func TestReleaseJobBoundsASilentCoordinator(t *testing.T) {
 	if elapsed > 5*time.Second {
 		t.Fatalf("release took %s, want it bounded by the %s budget", elapsed, cfg.releaseTimeout)
 	}
-	if usable {
+	if outcome.usable {
 		t.Error("releaseJob reported the connection usable after the watcher closed it")
+	}
+	if outcome.released {
+		t.Error("releaseJob reported the slot released; the coordinator never answered")
 	}
 	if cc.closeCount() == 0 {
 		t.Error("the wedged connection was never closed")
@@ -1014,7 +1067,7 @@ func TestReleaseJobClosesAConnectionDialedAfterTheBudget(t *testing.T) {
 	job := translatableJob(ecidPrefix + "0d1a4b0e-0000-0000-0000-000000000004")
 	caller := &fakeConn{svc: svc}
 
-	usable := releaseJob(ctx, logger, caller, cfg, job, compactjob.ClassCommitUnavailable)
+	usable, released := releaseJob(ctx, logger, caller, cfg, job, compactjob.ClassCommitUnavailable)
 
 	select {
 	case <-dialed:
@@ -1026,6 +1079,9 @@ func TestReleaseJobClosesAConnectionDialedAfterTheBudget(t *testing.T) {
 	}
 	if !usable {
 		t.Error("the caller's connection was reported spent; releaseJob never touched it")
+	}
+	if released {
+		t.Error("releaseJob reported the slot released; the budget was gone before any RPC started")
 	}
 	if n := len(svc.releases()); n != 0 {
 		t.Errorf("releases = %d, want none; the budget was already gone", n)
@@ -1064,8 +1120,12 @@ func TestReleaseJobReportsShutdownThatStartsMidRelease(t *testing.T) {
 	logger, _ := testLogger()
 	job := translatableJob(ecidPrefix + "0d1a4b0e-0000-0000-0000-000000000005")
 
-	if usable := releaseJob(ctx, logger, &fakeConn{svc: svc}, cfg, job, compactjob.ClassCommitUnavailable); usable {
+	usable, released := releaseJob(ctx, logger, &fakeConn{svc: svc}, cfg, job, compactjob.ClassCommitUnavailable)
+	if usable {
 		t.Error("the caller's connection failed an RPC but was still reported usable")
+	}
+	if !released {
+		t.Error("the retry handed the slot back; releaseJob reported it still assigned")
 	}
 
 	rel := svc.releases()

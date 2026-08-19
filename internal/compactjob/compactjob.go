@@ -494,7 +494,7 @@ func Translate(job *tabletserver.TExternalCompactionJob, opts Options) (*Plan, e
 	return &Plan{
 		ECID:                ecid,
 		TableID:             tableID,
-		Extent:              extent,
+		Extent:              cloneExtent(extent),
 		Kind:                kind,
 		FateID:              fateID,
 		Inputs:              inputFiles(inputs),
@@ -509,6 +509,27 @@ func Translate(job *tabletserver.TExternalCompactionJob, opts Options) (*Plan, e
 		Codec:               codec,
 		BlockSize:           blockSize,
 	}, nil
+}
+
+// cloneExtent copies the extent out of the job.
+//
+// A Plan outlives the RPC that produced it: cmd/shoal-compactor logs it
+// and the execution slice will act on it, both after control has gone
+// back to the Thrift layer that owns the job struct. Handing out the
+// generated struct — and the byte slices inside it — would make the
+// plan's identity depend on whether the transport recycles that struct,
+// which is exactly why parseIterators copies each iterator's option map
+// rather than aliasing it. The extent was the one part still shared.
+//
+// bytes.Clone keeps nil nil, so the infinite bounds an extent spells as
+// a missing endRow or prevEndRow survive the copy as themselves rather
+// than becoming empty rows.
+func cloneExtent(ex *data.TKeyExtent) *data.TKeyExtent {
+	return &data.TKeyExtent{
+		Table:      bytes.Clone(ex.GetTable()),
+		EndRow:     bytes.Clone(ex.GetEndRow()),
+		PrevEndRow: bytes.Clone(ex.GetPrevEndRow()),
+	}
 }
 
 // checkECID mirrors ExternalCompactionId.of: the prefix, then the
@@ -1291,6 +1312,23 @@ func checkEntryFields(entry, field string) (startRaw, endRaw []byte, err error) 
 		}
 		decoded[i] = raw
 	}
+	// deserialize builds Range(startRow, true, endRow, false), which
+	// becomes Range(new Key(startRow), true, new Key(endRow), false) and
+	// throws IllegalArgumentException("Start key must be less than end
+	// key in range ...") when the end key sorts first. An inverted fence
+	// is therefore not an input shoal has yet to port — it is one no Java
+	// compactor could deserialize either, so it is malformed rather than
+	// unsupported, and saying so is what tells an operator to look at
+	// whoever wrote the metadata.
+	//
+	// Equal rows are left alone: Key(row) is not before Key(row), so Java
+	// builds that range happily. It selects nothing, but it deserializes,
+	// and pass 2 refuses every fence anyway.
+	if decoded[0] != nil && decoded[1] != nil && bytes.Compare(decoded[0], decoded[1]) > 0 {
+		return nil, nil, refuse(ClassMalformedJob, field,
+			"StoredTabletFile startRow %q sorts after endRow %q; Range rejects a start key past its end",
+			decoded[0], decoded[1])
+	}
 	return decoded[0], decoded[1], nil
 }
 
@@ -1594,13 +1632,34 @@ func checkOutputCapability(out, ecid string) error {
 // — so a model written against one toolchain would refuse work the
 // running binary can do, or promise work it cannot. url.Parse always
 // answers for the binary actually doing the opening.
+//
+// Parsing only proves the spelling, though, and a well-formed path can
+// still name a volume shoal has no reader for. hdfs's Backend.resolve is
+// the only shoal path resolver that interprets a URI scheme at all, and
+// isHDFSScheme accepts exactly one; the object-store and local backends
+// take keys, so handing them "ftp://nn/accumulo/tables/2/t/F.rf" makes
+// them look for a file whose name is that whole string rather than the
+// file Accumulo wrote. Neither outcome is a compaction, so the scheme is
+// checked here too — otherwise the job is declared executable and dies
+// on its first read with the slot already spent.
 func checkVolumeCapability(raw, field string) error {
-	if _, err := url.Parse(raw); err != nil {
+	u, err := url.Parse(raw)
+	if err != nil {
 		return refuse(ClassUnsupportedVolume, field,
 			"shoal's storage backend cannot parse this path: %v", err)
 	}
+	if !strings.EqualFold(u.Scheme, hdfsVolumeScheme) {
+		return refuse(ClassUnsupportedVolume, field,
+			"volume scheme %q has no shoal backend; only %q volumes can be read",
+			u.Scheme, hdfsVolumeScheme)
+	}
 	return nil
 }
+
+// hdfsVolumeScheme is the scheme internal/storage/hdfs's isHDFSScheme
+// accepts, and so the only one a tablet file path can carry and still be
+// openable by shoal.
+const hdfsVolumeScheme = "hdfs"
 
 // rfileExtension is RFile.EXTENSION, the only file type shoal's reader
 // and writer implement.
