@@ -722,15 +722,15 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
 
     def test_pinned_inventory_constants_are_internally_consistent(self) -> None:
         validator.validate_pinned_inventory_constants()
-        self.assertEqual(validator.EXPECTED_REVISION, 38)
+        self.assertEqual(validator.EXPECTED_REVISION, 39)
         self.assertEqual(validator.EXPECTED_TOTAL_ROWS, 3203)
         self.assertEqual(validator.EXPECTED_REQUIRED_ROWS, 2811)
         self.assertEqual(
             validator.EXPECTED_STATUS_COUNTS,
             {
                 "Covered": 131,
-                "Missing Go": 2290,
-                "Missing C ABI": 84,
+                "Missing Go": 2274,
+                "Missing C ABI": 100,
                 "Behavior mismatch": 219,
                 validator.INTENTIONAL_DIVERGENCE_STATUS: 87,
                 validator.NOT_REQUIRED_STATUS: 392,
@@ -899,11 +899,11 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
     def test_declared_count_edit_still_fails_internal_cross_check(self) -> None:
         text = load_document_text()
         mutated = replace_pattern_once(
-            text, re.escape("| Missing Go | 2290 |"), "| Missing Go | 2289 |"
+            text, re.escape("| Missing Go | 2274 |"), "| Missing Go | 2273 |"
         )
         self.assert_validation_fails(
             lambda: validator.validate_counts(mutated.splitlines(), mutated),
-            "status summary says 2289 rows for Missing Go, but parsed 2290",
+            "status summary says 2273 rows for Missing Go, but parsed 2274",
         )
 
     def test_stale_c_abi_symbol_inventory_narrative_is_rejected(self) -> None:
@@ -922,7 +922,7 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
     def test_revision_bump_requires_validator_constant_update(self) -> None:
         text = load_document_text()
         mutated = text.replace(
-            f"Revision {validator.EXPECTED_REVISION} — completes the 31-row column-visibility expression tranche",
+            f"Revision {validator.EXPECTED_REVISION} — records the public tablet extent API",
             f"Revision {validator.EXPECTED_REVISION + 1} — adds the next audited ABI slice",
         ).replace(
             f"As of revision {validator.EXPECTED_REVISION} that is",
@@ -931,7 +931,7 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
         self.assertNotEqual(mutated, text)
         self.assert_validation_fails(
             lambda: validator.validate_counts(mutated.splitlines(), mutated),
-            f"document status is missing expected detail: Revision {validator.EXPECTED_REVISION} — completes the 31-row column-visibility expression tranche",
+            f"document status is missing expected detail: Revision {validator.EXPECTED_REVISION} — records the public tablet extent API",
         )
 
     # ---- matrix table separators -------------------------------------------
