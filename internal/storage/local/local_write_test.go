@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -1022,65 +1023,6 @@ func TestLocal_PublishFailureRestoresStrandedBackup(t *testing.T) {
 	}
 }
 
-func TestLocal_CreateThroughSymlinkReplacesReferent(t *testing.T) {
-	dir := t.TempDir()
-	target := filepath.Join(dir, "target")
-	link := filepath.Join(dir, "link")
-	if err := os.WriteFile(target, []byte("old"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Symlink(target, link); err != nil {
-		t.Skipf("symlink unavailable: %v", err)
-	}
-
-	w, err := New().Create(context.Background(), link)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := w.Write([]byte("new")); err != nil {
-		t.Fatal(err)
-	}
-	if err := w.Close(); err != nil {
-		t.Fatal(err)
-	}
-	info, err := os.Lstat(link)
-	if err != nil {
-		t.Fatalf("Lstat symlink: %v", err)
-	}
-	if info.Mode()&os.ModeSymlink == 0 {
-		t.Fatalf("destination symlink was replaced: mode=%v", info.Mode())
-	}
-	if got, err := os.ReadFile(target); err != nil || string(got) != "new" {
-		t.Fatalf("referent = %q, %v; want new", got, err)
-	}
-}
-
-func TestLocal_CreateThroughDanglingSymlinkCreatesReferent(t *testing.T) {
-	dir := t.TempDir()
-	target := filepath.Join(dir, "created")
-	link := filepath.Join(dir, "link")
-	if err := os.Symlink(filepath.Base(target), link); err != nil {
-		t.Skipf("symlink unavailable: %v", err)
-	}
-
-	w, err := New().Create(context.Background(), link)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := w.Write([]byte("new")); err != nil {
-		t.Fatal(err)
-	}
-	if err := w.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if got, err := os.ReadFile(target); err != nil || string(got) != "new" {
-		t.Fatalf("referent = %q, %v; want new", got, err)
-	}
-	if info, err := os.Lstat(link); err != nil || info.Mode()&os.ModeSymlink == 0 {
-		t.Fatalf("destination symlink not preserved: info=%v err=%v", info, err)
-	}
-}
-
 func TestLocal_PublishFailureRetainsBackupWhenRestoreFails(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "target")
@@ -1274,6 +1216,320 @@ func TestLocal_PublishFailureUsesContentFallbackWhenPhysicalIdentityUnavailable(
 	}
 }
 
+func TestLocal_CreateReplacesSymlinkReferentsAndRetainsLinks(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name  string
+		setup func(*testing.T, string) (string, string, map[string]string)
+	}{
+		{
+			name: "absolute",
+			setup: func(t *testing.T, dir string) (string, string, map[string]string) {
+				dataDir := filepath.Join(dir, "data")
+				linkDir := filepath.Join(dir, "links")
+				if err := os.MkdirAll(dataDir, 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.MkdirAll(linkDir, 0o755); err != nil {
+					t.Fatal(err)
+				}
+				target := filepath.Join(dataDir, "target.rf")
+				link := filepath.Join(linkDir, "absolute.rf")
+				if err := os.WriteFile(target, []byte("old"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				createFileSymlinkOrSkip(t, target, link)
+				return link, target, map[string]string{link: target}
+			},
+		},
+		{
+			name: "relative",
+			setup: func(t *testing.T, dir string) (string, string, map[string]string) {
+				target := filepath.Join(dir, "target.rf")
+				link := filepath.Join(dir, "relative.rf")
+				if err := os.WriteFile(target, []byte("old"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				createFileSymlinkOrSkip(t, filepath.Base(target), link)
+				return link, target, map[string]string{link: filepath.Base(target)}
+			},
+		},
+		{
+			name: "chained",
+			setup: func(t *testing.T, dir string) (string, string, map[string]string) {
+				target := filepath.Join(dir, "target.rf")
+				mid := filepath.Join(dir, "mid.rf")
+				link := filepath.Join(dir, "top.rf")
+				if err := os.WriteFile(target, []byte("old"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				createFileSymlinkOrSkip(t, filepath.Base(target), mid)
+				createFileSymlinkOrSkip(t, filepath.Base(mid), link)
+				return link, target, map[string]string{
+					mid:  filepath.Base(target),
+					link: filepath.Base(mid),
+				}
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			link, target, links := tc.setup(t, dir)
+			originalInfo, err := os.Stat(target)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			w, err := New().Create(context.Background(), link)
+			if err != nil {
+				t.Fatal(err)
+			}
+			localWriter := w.(*writer)
+			if got, want := filepath.Dir(localWriter.temp), filepath.Dir(target); got != want {
+				t.Fatalf("temporary file dir = %q, want referent dir %q", got, want)
+			}
+			if got, want := localWriter.target, target; got != want {
+				t.Fatalf("resolved target = %q, want %q", got, want)
+			}
+			if _, err := w.Write([]byte("new")); err != nil {
+				t.Fatal(err)
+			}
+			if err := w.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			got, err := os.ReadFile(target)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(got) != "new" {
+				t.Fatalf("referent contents = %q, want new", got)
+			}
+			replacedInfo, err := os.Stat(target)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got, want := replacedInfo.Mode().Perm(), originalInfo.Mode().Perm(); got != want {
+				t.Fatalf("referent mode = %04o, want %04o", got, want)
+			}
+			for linkPath, wantTarget := range links {
+				assertSymlinkTarget(t, linkPath, wantTarget)
+			}
+			assertLocalOpenBytes(t, link, []byte("new"))
+			listed, err := New().List(context.Background(), filepath.Dir(link))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !slices.Contains(listed, link) {
+				t.Fatalf("List(%q) missing symlink path %q from %v", filepath.Dir(link), link, listed)
+			}
+			assertNoReplacementArtifacts(t, filepath.Dir(target))
+		})
+	}
+}
+
+func TestLocal_CreateRejectsInvalidSymlinkReferents(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name    string
+		setup   func(*testing.T, string) string
+		wantErr string
+	}{
+		{
+			name: "dangling",
+			setup: func(t *testing.T, dir string) string {
+				link := filepath.Join(dir, "dangling.rf")
+				createFileSymlinkOrSkip(t, "missing.rf", link)
+				return link
+			},
+			wantErr: "dangling symlink referent",
+		},
+		{
+			name: "loop",
+			setup: func(t *testing.T, dir string) string {
+				first := filepath.Join(dir, "first.rf")
+				second := filepath.Join(dir, "second.rf")
+				createFileSymlinkOrSkip(t, filepath.Base(second), first)
+				createFileSymlinkOrSkip(t, filepath.Base(first), second)
+				return first
+			},
+			wantErr: "symlink loop",
+		},
+		{
+			name: "nonregular",
+			setup: func(t *testing.T, dir string) string {
+				targetDir := filepath.Join(dir, "target-dir")
+				link := filepath.Join(dir, "dir-link")
+				if err := os.Mkdir(targetDir, 0o755); err != nil {
+					t.Fatal(err)
+				}
+				createFileSymlinkOrSkip(t, filepath.Base(targetDir), link)
+				return link
+			},
+			wantErr: "not a regular file",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			link := tc.setup(t, dir)
+			w, err := New().Create(context.Background(), link)
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				if w != nil {
+					_ = w.(storage.Aborter).Abort()
+				}
+				t.Fatalf("Create(%q) error = %v, want substring %q", link, err, tc.wantErr)
+			}
+			info, statErr := os.Lstat(link)
+			if statErr != nil || info.Mode()&os.ModeSymlink == 0 {
+				t.Fatalf("symlink changed after rejection: info=%v err=%v", info, statErr)
+			}
+		})
+	}
+}
+
+func TestLocal_CreateAbortsWhenSymlinkRetargetedBeforeClose(t *testing.T) {
+	dir := t.TempDir()
+	dataDir := filepath.Join(dir, "data")
+	linkDir := filepath.Join(dir, "links")
+	if err := os.MkdirAll(dataDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(linkDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	oldTarget := filepath.Join(dataDir, "old.rf")
+	newTarget := filepath.Join(dataDir, "new.rf")
+	link := filepath.Join(linkDir, "current.rf")
+	if err := os.WriteFile(oldTarget, []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(newTarget, []byte("other"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	createFileSymlinkOrSkip(t, oldTarget, link)
+
+	w, err := New().Create(context.Background(), link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	localWriter := w.(*writer)
+	if _, err := w.Write([]byte("new")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(link); err != nil {
+		t.Fatal(err)
+	}
+	createFileSymlinkOrSkip(t, newTarget, link)
+
+	err = w.Close()
+	if err == nil || !strings.Contains(err.Error(), "changed before publish") {
+		t.Fatalf("Close error = %v, want symlink-retarget rejection", err)
+	}
+	if got, readErr := os.ReadFile(oldTarget); readErr != nil || string(got) != "old" {
+		t.Fatalf("old referent = %q, %v; want old", got, readErr)
+	}
+	if got, readErr := os.ReadFile(newTarget); readErr != nil || string(got) != "other" {
+		t.Fatalf("new referent = %q, %v; want other", got, readErr)
+	}
+	assertSymlinkTarget(t, link, newTarget)
+	if err := w.(storage.Aborter).Abort(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(localWriter.temp); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("temporary file %s still exists: %v", localWriter.temp, err)
+	}
+	assertNoReplacementArtifacts(t, filepath.Dir(oldTarget))
+}
+
+func TestLocal_CreateAbortsWhenSymlinkReferentChangesBeforeClose(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "target.rf")
+	previous := filepath.Join(dir, "previous.rf")
+	link := filepath.Join(dir, "current.rf")
+	if err := os.WriteFile(target, []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	createFileSymlinkOrSkip(t, filepath.Base(target), link)
+
+	w, err := New().Create(context.Background(), link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	localWriter := w.(*writer)
+	if _, err := w.Write([]byte("new")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(target, previous); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, []byte("concurrent"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	err = w.Close()
+	if err == nil || !strings.Contains(err.Error(), "referent") {
+		t.Fatalf("Close error = %v, want referent-change rejection", err)
+	}
+	if got, readErr := os.ReadFile(target); readErr != nil || string(got) != "concurrent" {
+		t.Fatalf("current referent = %q, %v; want concurrent", got, readErr)
+	}
+	if got, readErr := os.ReadFile(previous); readErr != nil || string(got) != "old" {
+		t.Fatalf("previous referent = %q, %v; want old", got, readErr)
+	}
+	assertSymlinkTarget(t, link, filepath.Base(target))
+	if err := w.(storage.Aborter).Abort(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(localWriter.temp); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("temporary file %s still exists: %v", localWriter.temp, err)
+	}
+	assertNoReplacementArtifacts(t, dir)
+}
+
+func TestLocal_AbortRemovesSymlinkArtifactsFromReferentDir(t *testing.T) {
+	dir := t.TempDir()
+	dataDir := filepath.Join(dir, "data")
+	linkDir := filepath.Join(dir, "links")
+	if err := os.MkdirAll(dataDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(linkDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(dataDir, "target.rf")
+	link := filepath.Join(linkDir, "target.rf")
+	if err := os.WriteFile(target, []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	createFileSymlinkOrSkip(t, target, link)
+
+	w, err := New().Create(context.Background(), link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	localWriter := w.(*writer)
+	if got, want := filepath.Dir(localWriter.temp), dataDir; got != want {
+		t.Fatalf("temporary dir = %q, want referent dir %q", got, want)
+	}
+	if _, err := w.Write([]byte("new")); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.(storage.Aborter).Abort(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(localWriter.temp); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("temporary file %s still exists: %v", localWriter.temp, err)
+	}
+	assertSymlinkTarget(t, link, target)
+	assertNoReplacementArtifacts(t, dataDir)
+}
+
 // strandedBackupOps mimics the rename fallback failing after the old target has
 // already been moved aside, leaving the backup as the only copy.
 type strandedBackupOps struct {
@@ -1383,3 +1639,61 @@ func (o *fallbackIdentityPublishFailureOps) Lstat(name string) (os.FileInfo, err
 type noSysFileInfo struct{ os.FileInfo }
 
 func (i noSysFileInfo) Sys() any { return nil }
+
+func createFileSymlinkOrSkip(t *testing.T, target, link string) {
+	t.Helper()
+	if err := os.Symlink(target, link); err != nil {
+		if runtime.GOOS == "windows" {
+			t.Skipf("symlink creation unavailable: %v", err)
+		}
+		t.Fatalf("Symlink(%q, %q): %v", target, link, err)
+	}
+}
+
+func assertSymlinkTarget(t *testing.T, link, want string) {
+	t.Helper()
+	info, err := os.Lstat(link)
+	if err != nil {
+		t.Fatalf("Lstat(%q): %v", link, err)
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("%q mode = %v, want symlink", link, info.Mode())
+	}
+	got, err := os.Readlink(link)
+	if err != nil {
+		t.Fatalf("Readlink(%q): %v", link, err)
+	}
+	if got != want {
+		t.Fatalf("Readlink(%q) = %q, want %q", link, got, want)
+	}
+}
+
+func assertLocalOpenBytes(t *testing.T, path string, want []byte) {
+	t.Helper()
+	f, err := New().Open(context.Background(), path)
+	if err != nil {
+		t.Fatalf("Open(%q): %v", path, err)
+	}
+	defer f.Close()
+	got := make([]byte, f.Size())
+	if _, err := f.ReadAt(got, 0); err != nil {
+		t.Fatalf("ReadAt(%q): %v", path, err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("Open(%q) = %q, want %q", path, got, want)
+	}
+}
+
+func assertNoReplacementArtifacts(t *testing.T, dir string) {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("ReadDir(%q): %v", dir, err)
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		if strings.HasPrefix(name, replacementTempPrefix) || strings.HasPrefix(name, replacementBackupPrefix) {
+			t.Fatalf("unexpected replacement artifact %q in %s", name, dir)
+		}
+	}
+}

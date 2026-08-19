@@ -58,21 +58,21 @@ func (b *Backend) Open(_ context.Context, path string) (storage.File, error) {
 // stripping of truncating an existing file in place. On Unix we also preserve
 // owner/group, and on Linux and Darwin we preserve extended attributes
 // (including xattr-backed ACLs such as Linux POSIX ACLs) when the platform
-// exposes them. A final-component symlink is resolved once at Create time and
-// the replacement is staged beside its referent, preserving the prior
-// truncating-write behavior without replacing the symlink itself. On platforms
-// without hard-link snapshots (Plan 9, js, wasip1),
+// exposes them. If path names an existing final-component symlink, Create
+// resolves the current symlink chain to one existing regular-file referent,
+// stages and publishes beside that referent, and revalidates the symlink
+// chain and referent identity immediately before publish so a retarget race
+// aborts without modifying either referent. On platforms without hard-link
+// snapshots (Plan 9, js, wasip1),
 // and on Unix filesystems that reject hard-link snapshots for same-directory
 // siblings, replacement falls back to a best-effort rename-based sequence that
 // restores the old file on failure but cannot keep the target continuously
 // visible. A crash or ambiguous publish failure in that fallback can leave the
 // hidden backup as the only surviving copy until an operator or
-// CleanupStaleArtifacts restores it. Open continues to follow symlinks like
-// os.Open, but Create intentionally rejects symlink destinations so replacement
-// never retargets a link unexpectedly; resolve the symlink yourself first. New
-// files use 0644 subject to the process umask. Parent directories are created
-// with 0755 if they don't already exist — matches "mkdir -p" behavior so
-// callers don't have to pre-create the path tree.
+// CleanupStaleArtifacts restores it. New files use 0644 subject to the process
+// umask. Parent directories are created with 0755 if they don't already exist
+// — matches "mkdir -p" behavior so callers don't have to pre-create the path
+// tree.
 func (b *Backend) Create(_ context.Context, path string) (storage.Writer, error) {
 	if isReplacementArtifactName(filepath.Base(path)) {
 		return nil, fmt.Errorf("local: destination %s uses a reserved internal namespace", path)
@@ -83,53 +83,28 @@ func (b *Backend) Create(_ context.Context, path string) (storage.Writer, error)
 			return nil, fmt.Errorf("local: mkdir %s: %w", dir, err)
 		}
 	}
-	target, err := resolveReplacementTarget(path)
+	target, symlinkTarget, err := resolveCreateTarget(path)
 	if err != nil {
 		return nil, err
 	}
 	if isReplacementArtifactName(filepath.Base(target)) {
 		return nil, fmt.Errorf("local: symlink destination %s resolves into a reserved internal namespace", path)
 	}
-	dir = filepath.Dir(target)
 	ops := osReplacementOps{}
-	f, err := openReplacementSiblingFile(dir)
+	f, err := openReplacementSiblingFile(filepath.Dir(target))
 	if err != nil {
-		return nil, fmt.Errorf("local: create temporary file for %s: %w", path, err)
+		return nil, fmt.Errorf("local: create temporary file for %s: %w", target, err)
 	}
 	if _, err := preserveExistingMetadata(ops, f.Name(), target); err != nil {
 		return nil, errors.Join(err, cleanupTemporaryCreateFile(f, ops))
 	}
 	return &writer{
-		file:   f,
-		temp:   f.Name(),
-		target: target,
-		ops:    ops,
+		file:          f,
+		temp:          f.Name(),
+		target:        target,
+		ops:           ops,
+		symlinkTarget: symlinkTarget,
 	}, nil
-}
-
-func resolveReplacementTarget(path string) (string, error) {
-	target := path
-	for links := 0; links < 255; links++ {
-		info, err := os.Lstat(target)
-		if errors.Is(err, fs.ErrNotExist) {
-			return target, nil
-		}
-		if err != nil {
-			return "", fmt.Errorf("local: inspect destination %s: %w", path, err)
-		}
-		if info.Mode()&os.ModeSymlink == 0 {
-			return target, nil
-		}
-		next, err := os.Readlink(target)
-		if err != nil {
-			return "", fmt.Errorf("local: read destination symlink %s: %w", path, err)
-		}
-		if !filepath.IsAbs(next) {
-			next = filepath.Join(filepath.Dir(target), next)
-		}
-		target = filepath.Clean(next)
-	}
-	return "", fmt.Errorf("local: resolve destination symlink %s: too many links", path)
 }
 
 // List enumerates the regular files directly under prefix (a directory
@@ -269,11 +244,26 @@ type writer struct {
 	temp           string
 	target         string
 	ops            replacementOps
+	symlinkTarget  *symlinkTargetState
 	closed         bool
 	abortRequested bool
 	aborted        bool
 	fileClosed     bool
 	state          replacementState
+}
+
+type symlinkTargetState struct {
+	displayPath  string
+	requestedAbs string
+	referentPath string
+	referentInfo os.FileInfo
+	chain        []symlinkPathState
+}
+
+type symlinkPathState struct {
+	path   string
+	target string
+	info   os.FileInfo
 }
 
 type replacementState uint8
@@ -302,6 +292,8 @@ type osReplacementOps struct{}
 var preservePlatformMetadataFn = preservePlatformMetadata
 var sameReplacementFile = os.SameFile
 var readReplacementFile = os.ReadFile
+
+const maxSymlinkResolutionDepth = 255
 
 func (osReplacementOps) Lstat(name string) (os.FileInfo, error) { return os.Lstat(name) }
 func (osReplacementOps) Chmod(name string, mode os.FileMode) error {
@@ -427,6 +419,101 @@ func isLowerHexReplacementToken(token string) bool {
 	return err == nil && len(decoded) == replacementNameTokenBytes
 }
 
+func resolveCreateTarget(path string) (string, *symlinkTargetState, error) {
+	info, err := os.Lstat(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return path, nil, nil
+	}
+	if err != nil {
+		return "", nil, fmt.Errorf("local: inspect existing file %s: %w", path, err)
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		return path, nil, nil
+	}
+	requestedAbs, err := filepath.Abs(path)
+	if err != nil {
+		return "", nil, fmt.Errorf("local: resolve symlink destination %s: absolute path: %w", path, err)
+	}
+	target, err := captureSymlinkTargetState(path, requestedAbs)
+	if err != nil {
+		return "", nil, err
+	}
+	return target.referentPath, target, nil
+}
+
+func captureSymlinkTargetState(displayPath, requestedAbs string) (*symlinkTargetState, error) {
+	state := &symlinkTargetState{
+		displayPath:  displayPath,
+		requestedAbs: requestedAbs,
+	}
+	current := requestedAbs
+	visited := make(map[string]struct{})
+	for depth := 0; depth < maxSymlinkResolutionDepth; depth++ {
+		info, err := os.Lstat(current)
+		if err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				return nil, fmt.Errorf("local: resolve symlink destination %s: dangling symlink referent %s", displayPath, current)
+			}
+			return nil, fmt.Errorf("local: resolve symlink destination %s: inspect %s: %w", displayPath, current, err)
+		}
+		if info.Mode()&os.ModeSymlink == 0 {
+			if depth == 0 {
+				return nil, fmt.Errorf("local: resolve symlink destination %s: symlink changed during resolution", displayPath)
+			}
+			if !info.Mode().IsRegular() {
+				return nil, fmt.Errorf("local: resolve symlink destination %s: referent %s is not a regular file", displayPath, current)
+			}
+			state.referentPath = current
+			state.referentInfo = info
+			return state, nil
+		}
+		linkTarget, err := os.Readlink(current)
+		if err != nil {
+			return nil, fmt.Errorf("local: resolve symlink destination %s: readlink %s: %w", displayPath, current, err)
+		}
+		state.chain = append(state.chain, symlinkPathState{
+			path:   current,
+			target: linkTarget,
+			info:   info,
+		})
+		visited[current] = struct{}{}
+		next := linkTarget
+		if !filepath.IsAbs(next) {
+			next = filepath.Join(filepath.Dir(current), next)
+		}
+		next = filepath.Clean(next)
+		if _, ok := visited[next]; ok {
+			return nil, fmt.Errorf("local: resolve symlink destination %s: symlink loop through %s", displayPath, next)
+		}
+		current = next
+	}
+	return nil, fmt.Errorf("local: resolve symlink destination %s: exceeded %d symlink hops", displayPath, maxSymlinkResolutionDepth)
+}
+
+func (s *symlinkTargetState) revalidate() error {
+	if s == nil {
+		return nil
+	}
+	current, err := captureSymlinkTargetState(s.displayPath, s.requestedAbs)
+	if err != nil {
+		return fmt.Errorf("local: revalidate symlink destination %s: %w", s.displayPath, err)
+	}
+	if len(current.chain) != len(s.chain) {
+		return fmt.Errorf("local: symlink destination %s changed before publish", s.displayPath)
+	}
+	for i := range s.chain {
+		if current.chain[i].path != s.chain[i].path ||
+			current.chain[i].target != s.chain[i].target ||
+			!sameReplacementFile(current.chain[i].info, s.chain[i].info) {
+			return fmt.Errorf("local: symlink destination %s changed before publish", s.displayPath)
+		}
+	}
+	if current.referentPath != s.referentPath || !sameReplacementFile(current.referentInfo, s.referentInfo) {
+		return fmt.Errorf("local: symlink referent for %s changed before publish", s.displayPath)
+	}
+	return nil
+}
+
 func (w *writer) publishReplacement(hadOld bool) (string, error) {
 	if !hadOld {
 		return "", w.ops.AtomicReplace(w.temp, w.target, "", false)
@@ -504,6 +591,9 @@ func (w *writer) commitReplacement() error {
 	}
 	if err := syncReplacementPath(w.ops, w.temp); err != nil {
 		return fmt.Errorf("local: sync replacement file %s: %w", w.temp, err)
+	}
+	if err := w.symlinkTarget.revalidate(); err != nil {
+		return err
 	}
 
 	backup, err := w.publishReplacement(hadOld)
