@@ -164,9 +164,20 @@ type LoadMapping []Mapping
 // mirroring RFileExportManifest.tabletCount()'s documented default.
 // Manifests that omit Tablets but use any other TabletIndex are rejected as
 // ambiguous legacy input.
+//
+// manifest.Version is checked first, against engine.RFileExportManifestVersion,
+// before any chain or RFile validation: a manifest from an unsupported
+// export format is rejected here, in Promote's own preflight call to this
+// function, rather than only later inside StageBulkDir's call to
+// engine.VerifyRFileExport -- which, unlike this one, runs after
+// AddTableSplits has already reconciled the destination's splits (see
+// Promote's doc comment).
 func BuildLoadMapping(manifest *engine.RFileExportManifest) (LoadMapping, error) {
 	if manifest == nil {
 		return nil, fmt.Errorf("promotion: nil export manifest")
+	}
+	if manifest.Version != engine.RFileExportManifestVersion {
+		return nil, fmt.Errorf("promotion: unsupported manifest version %d", manifest.Version)
 	}
 	tablets, declared, err := resolveManifestTablets(manifest)
 	if err != nil {

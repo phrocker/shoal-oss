@@ -124,6 +124,7 @@ func TestBuildLoadMappingSingleTabletUsesUnboundedExtent(t *testing.T) {
 
 func TestBuildLoadMappingDefaultsSingleTabletForLegacyManifest(t *testing.T) {
 	manifest := &engine.RFileExportManifest{
+		Version:     engine.RFileExportManifestVersion,
 		SourceTable: "events",
 		RFiles: []engine.RFileExportFile{
 			{TabletIndex: 0, DestinationPath: "events/t-0000/F0001.rf", Size: 10},
@@ -153,6 +154,7 @@ func TestBuildLoadMappingRejectsNilManifest(t *testing.T) {
 
 func TestBuildLoadMappingDedupesRepeatedDestinationPath(t *testing.T) {
 	manifest := &engine.RFileExportManifest{
+		Version:     engine.RFileExportManifestVersion,
 		SourceTable: "events",
 		Tablets:     []engine.RFileExportTablet{{Index: 0}},
 		RFiles: []engine.RFileExportFile{

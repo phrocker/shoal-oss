@@ -81,9 +81,21 @@ type Options struct {
 // than letting BuildLoadMapping construct a mapping that Accumulo's own
 // validation would reject for reasons the failure would not explain. A
 // trailing extra split strictly after the last required row is left
-// alone: it falls entirely inside the final, always-unbounded entry's
-// own span, which can legitimately absorb any number of additional real
-// tablets.
+// alone by this specific check: it falls entirely inside the final,
+// always-unbounded entry's own span, so it can never reproduce the
+// prevEndRow mismatch described above. That is not the same as
+// harmless in every sense a bulk import can fail, though: Accumulo's
+// own PrepBulkImport.validateLoadMapping separately enforces
+// table.bulk.max.tablets (default 100, admin-configurable per table,
+// since Accumulo 2.1.0) by counting how many real destination tablets
+// the final mapping entry's files overlap — a count trailing splits
+// inflate directly. Enough of them can still make BulkImport reject
+// the load mapping for a reason this package neither detects nor
+// explains up front; Promote does not enforce that limit itself,
+// since doing so accurately needs a way to read the destination
+// table's actual (possibly non-default) property value, which the
+// Promoter interface does not expose today — see docs/promotion.md §5
+// item 3 for the full reasoning.
 //
 // This check narrows, but cannot close, the window for a concurrent
 // structural change on the destination: a split or merge racing between

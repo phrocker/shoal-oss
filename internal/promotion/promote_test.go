@@ -312,6 +312,39 @@ func TestPromoteRejectsDestinationPathDeclaredUnderConflictingTabletIndexes(t *t
 	}
 }
 
+// TestPromoteRejectsUnsupportedManifestVersionBeforeAddTableSplits covers
+// the third RFile-level check BuildLoadMapping's preflight now catches
+// before AddTableSplits: a manifest whose Version does not match
+// engine.RFileExportManifestVersion, even when the declared Tablets chain
+// and every RFile are otherwise perfectly valid. Without this check,
+// engine.VerifyRFileExport (called only later, from inside StageBulkDir)
+// would have been the sole place a version mismatch was ever caught --
+// after AddTableSplits had already reconciled the destination's splits.
+func TestPromoteRejectsUnsupportedManifestVersionBeforeAddTableSplits(t *testing.T) {
+	src := memory.New()
+	src.Put("events/t-0000/F0001.rf", []byte("a"))
+	manifest := twoTabletManifest()
+	manifest.RFiles[0].DestinationPath = "events/t-0000/F0001.rf"
+	manifest.RFiles[0].Size = 1
+	manifest.RFiles[0].SHA256 = "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb"
+	manifest.Version = engine.RFileExportManifestVersion + 1
+
+	dst := memory.New()
+	importer := &fakePromoter{}
+	if _, err := Promote(context.Background(), src, manifest, dst, "/bulk/events-1", importer, "events", Options{}); err == nil {
+		t.Fatal("Promote with an unsupported manifest version = nil error, want error")
+	}
+	if importer.splitCalls != 0 {
+		t.Fatalf("AddTableSplits calls = %d, want 0 (an unsupported manifest version must fail before any split reconciliation)", importer.splitCalls)
+	}
+	if importer.calls != 0 {
+		t.Fatalf("BulkImport calls = %d, want 0", importer.calls)
+	}
+	if got := dst.Keys(); len(got) != 0 {
+		t.Fatalf("dst.Keys() = %v, want no staged files when manifest validation fails first", got)
+	}
+}
+
 func TestPromoteReconcilesSplitsThenStagesThenSubmitsForMultiTabletManifest(t *testing.T) {
 	src := memory.New()
 	src.Put("events/t-0000/F0001.rf", []byte("a"))

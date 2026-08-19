@@ -97,6 +97,27 @@ type RFileExportManifest struct {
 // exact failure mode this package must not introduce. New manifests
 // never round-trip through the legacy keys: MarshalJSON always emits
 // only the *_b64 keys.
+//
+// The reverse direction -- an old reader (compiled before this fix)
+// decoding a new manifest that only carries the *_b64 keys -- was also
+// considered: such a reader has no start_row/end_row keys to find, so
+// StartRow/EndRow silently decode to nil instead of the manifest's
+// actual boundary rows, rather than an explicit rejection. That is a
+// real gap in principle (RFileExportManifestVersion was not bumped, so
+// nothing forces an old reader to notice), but it is not currently
+// exploitable: the only two existing consumers of RFileExportManifest
+// are ImportRFileManifest below, which reads Tablets purely for each
+// entry's Index (to create a t-%04d directory) and for
+// tabletCount()'s divergent-splits guard (a count, not boundary
+// values) -- never StartRow/EndRow -- and internal/promotion, the only
+// consumer that reads tablet boundary values at all, which is new in
+// this same change and therefore has no pre-existing "old" build to
+// misread anything. If a future consumer starts depending on
+// StartRow/EndRow's actual values without also handling the *_b64
+// keys, this silent-nil gap would become real, at which point bumping
+// RFileExportManifestVersion (and widening VerifyRFileExport's
+// version check accordingly) is the fix; it was not done as part of
+// this change because there was nothing for it to protect yet.
 type RFileExportTablet struct {
 	Index    int
 	StartRow *string

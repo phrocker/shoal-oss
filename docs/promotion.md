@@ -162,9 +162,13 @@ spurious `BULK_CONCURRENT_MERGE` ("Concurrent merge happened") even
 though nothing actually merged. The same failure occurs for an extra
 split anywhere else before the last required boundary row, not only
 before the first one. An extra split strictly *after* the last required
-boundary row is genuinely harmless: it falls entirely inside the final,
-always-unbounded entry's own `endRow` search, which the iterator simply
-walks past on its way to matching `nil`.
+boundary row is harmless with respect to *this specific* validation
+walk: it falls entirely inside the final, always-unbounded entry's own
+`endRow` search, which the iterator simply walks past on its way to
+matching `nil`, so it can never reproduce the `prevEndRow` mismatch
+described above. That is not the same as harmless in every sense a
+bulk import can fail, though — see the `table.bulk.max.tablets` caveat
+in [§5](#5-whats-deferred) item 3.
 
 Neither `BuildLoadMapping` nor `RequiredDestinationSplits` can detect an
 unsafe pre-existing split on their own: both are pure functions over the
@@ -559,6 +563,31 @@ Mapped against #70's five acceptance criteria:
    but Shoal does not automatically detect that later rejection and
    re-reconcile/retry on the caller's behalf. That would need the same
    promotion-state machinery as item 4.
+
+   Separately, this reconciliation deliberately tolerates any number of
+   *trailing* splits strictly after the manifest's last required
+   boundary row (§3.2), since they cannot reproduce the `prevEndRow`
+   mismatch `verifyNoUnexpectedDestinationSplits` exists to catch. But
+   Accumulo's own `PrepBulkImport.validateLoadMapping` separately
+   enforces `table.bulk.max.tablets` (`Property.TABLE_BULK_MAX_TABLETS`,
+   default `100`, admin-configurable per table, since Accumulo 2.1.0):
+   for the load mapping's final, always-unbounded entry, it counts how
+   many real destination tablets that entry's files overlap — a count
+   that trailing splits inflate directly. Enough of them (past the
+   configured limit) can make `BulkImport` reject the load mapping for
+   a reason this package neither detects nor explains up front. Promote
+   does not enforce that limit itself: doing so accurately would
+   require reading the destination table's actual (possibly
+   non-default) property value, a capability the `Promoter` interface
+   does not expose today, and guessing the compiled-in default here
+   risks rejecting imports a differently-configured table would
+   legitimately accept. Accumulo's manager-side validation is the safe
+   backstop either way — a rejection here is data-safe, only less
+   informative than the errors this package already raises for the
+   cases it does check — but closing it client-side (checking before
+   `AddTableSplits`/`BulkImport`, with an accurate, table-specific
+   error) is deferred to a future slice that gives `Promoter` a way to
+   read destination table properties.
 4. **"a documented cutover protocol"** — not implemented. No
    promotion-state or cutover API surface is exposed yet; this slice is
    promotion of one point-in-time export, not the ongoing fan-in/cutover
