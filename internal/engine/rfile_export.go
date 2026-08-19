@@ -385,10 +385,16 @@ func copyWithSHA256(ctx context.Context, src storage.Backend, srcPath string, ds
 		}
 		if rerr != nil {
 			if errors.Is(rerr, io.EOF) {
+				if written < in.Size() {
+					return written, "", "", fmt.Errorf("engine: read export %s: %w", srcPath, io.ErrUnexpectedEOF)
+				}
 				break
 			}
 			return written, "", "", fmt.Errorf("engine: read export %s: %w", srcPath, rerr)
 		}
+	}
+	if written != in.Size() {
+		return written, "", "", fmt.Errorf("engine: read export %s: %w", srcPath, io.ErrUnexpectedEOF)
 	}
 	sum = hex.EncodeToString(h.Sum(nil))
 	if err = out.Close(); err != nil {

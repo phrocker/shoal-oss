@@ -871,11 +871,12 @@ type writer struct {
 	cleanupTimeout         time.Duration
 	buf                    bytes.Buffer
 	closed                 bool
+	abortRequested         bool
 	aborted                bool
 }
 
 func (w *writer) Write(p []byte) (int, error) {
-	if w.aborted {
+	if w.aborted || w.abortRequested {
 		return 0, fmt.Errorf("azure: writer already aborted")
 	}
 	if w.closed || w.promotionIndeterminate {
@@ -885,7 +886,7 @@ func (w *writer) Write(p []byte) (int, error) {
 }
 
 func (w *writer) Close() error {
-	if w.aborted {
+	if w.aborted || w.abortRequested {
 		return fmt.Errorf("azure: writer already aborted")
 	}
 	if w.closed {
@@ -981,6 +982,7 @@ func (w *writer) Abort() error {
 			w.promotionIndeterminate = false
 		}
 	}
+	w.abortRequested = true
 	if err := w.cleanupStage(); err != nil {
 		return err
 	}

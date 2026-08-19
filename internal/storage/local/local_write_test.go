@@ -742,7 +742,7 @@ func TestLocal_AbortRetriesTempRemovalAfterFailure(t *testing.T) {
 	}
 }
 
-func TestPreserveExistingMetadataPreservesSpecialModeBitsAfterPlatformMetadata(t *testing.T) {
+func TestPreserveExistingMetadataStripsPrivilegeBitsButPreservesStickyAfterPlatformMetadata(t *testing.T) {
 	originalPreservePlatformMetadata := preservePlatformMetadataFn
 	t.Cleanup(func() {
 		preservePlatformMetadataFn = originalPreservePlatformMetadata
@@ -773,7 +773,7 @@ func TestPreserveExistingMetadataPreservesSpecialModeBitsAfterPlatformMetadata(t
 	if len(ops.chmodModes) != 1 {
 		t.Fatalf("Chmod calls = %d, want 1", len(ops.chmodModes))
 	}
-	wantMode := os.ModeSetuid | os.ModeSetgid | os.ModeSticky | 0o640
+	wantMode := os.ModeSticky | 0o640
 	if ops.chmodModes[0] != wantMode {
 		t.Fatalf("Chmod mode = %v, want %v", ops.chmodModes[0], wantMode)
 	}

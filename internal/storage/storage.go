@@ -183,7 +183,11 @@ func Copy(ctx context.Context, src Backend, srcPath string, dst Backend, dstPath
 			want = in.Size() - written
 		}
 		n, err := in.ReadAt(buf[:want], readOff)
+		prematureEOF := errors.Is(err, io.EOF) && readOff+int64(n) < in.Size()
 		if ctxErr := ctx.Err(); ctxErr != nil {
+			if prematureEOF {
+				return written, fmt.Errorf("copy: read off=%d: %w", readOff, joinContextCallError(io.ErrUnexpectedEOF, ctxErr))
+			}
 			return written, fmt.Errorf("copy: read off=%d: %w", readOff, joinContextCallError(err, ctxErr))
 		}
 		if err != nil && !errors.Is(err, io.EOF) {
@@ -209,9 +213,15 @@ func Copy(ctx context.Context, src Backend, srcPath string, dst Backend, dstPath
 				return written, fmt.Errorf("copy: write off=%d: %w", writeOff, io.ErrShortWrite)
 			}
 		}
+		if prematureEOF {
+			return written, fmt.Errorf("copy: read off=%d: %w", readOff, io.ErrUnexpectedEOF)
+		}
 		if errors.Is(err, io.EOF) {
 			break
 		}
+	}
+	if written != in.Size() {
+		return written, fmt.Errorf("copy: read src %s: %w", srcPath, io.ErrUnexpectedEOF)
 	}
 	if err := ctx.Err(); err != nil {
 		return written, err

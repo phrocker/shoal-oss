@@ -70,11 +70,12 @@ func WithClientOptions(options hdfsclient.ClientOptions) Option {
 
 // Backend opens and manages files in one HDFS cluster.
 type Backend struct {
-	client       Client
-	newOperation func(context.Context) (*leasedClient, error)
-	authority    string
-	closeClient  func() error
-	operations   *operationRegistry
+	client              Client
+	newOperation        func(context.Context) (*leasedClient, error)
+	cleanupLeaseFactory func(context.Context) (*leasedClient, error)
+	authority           string
+	closeClient         func() error
+	operations          *operationRegistry
 
 	mu              sync.Mutex
 	closed          bool
@@ -132,25 +133,30 @@ func NewContext(ctx context.Context, address string, opts ...Option) (*Backend, 
 		return newManagedBackend(
 			lease.client,
 			cfg.clientLeaseFactory,
+			bindOperationLeaseFactory(cleanupClientCtx, cfg.clientLeaseFactory),
 			backgroundCtx,
 			authority,
 			newBackendCloser(stopCleanupClient, closeFn),
 		), nil
 	}
 	if cfg.client != nil {
-		stopCleanupClient()
 		opFactory := cfg.clientLeaseFactory
 		if opFactory == nil {
 			opFactory = func(context.Context) (*leasedClient, error) {
 				return newSharedLease(cfg.client), nil
 			}
 		}
+		var cleanupFactory func(context.Context) (*leasedClient, error)
+		if cfg.clientLeaseFactory != nil {
+			cleanupFactory = bindOperationLeaseFactory(cleanupClientCtx, cfg.clientLeaseFactory)
+		}
 		return newManagedBackend(
 			cfg.client,
 			opFactory,
+			cleanupFactory,
 			backgroundCtx,
 			authority,
-			onceCloser(cfg.client.Close),
+			newBackendCloser(stopCleanupClient, onceCloser(cfg.client.Close)),
 		), nil
 	}
 
@@ -171,6 +177,9 @@ func NewContext(ctx context.Context, address string, opts ...Option) (*Backend, 
 		func(opCtx context.Context) (*leasedClient, error) {
 			return newHDFSClient(opCtx, clientAddress, options)
 		},
+		bindOperationLeaseFactory(cleanupClientCtx, func(cleanupCtx context.Context) (*leasedClient, error) {
+			return newHDFSClient(cleanupCtx, clientAddress, options)
+		}),
 		backgroundCtx,
 		authority,
 		newBackendCloser(stopCleanupClient, baseClient.release),
@@ -341,7 +350,7 @@ func (b *Backend) Create(ctx context.Context, objectPath string) (storage.Writer
 	w := &replaceWriter{
 		client:              lease.client,
 		cleanupClient:       b.client,
-		cleanupLeaseFactory: b.newOperation,
+		cleanupLeaseFactory: b.cleanupLeaseFactory,
 		release:             lease.release,
 		writer:              writer,
 		ctx:                 ctx,
@@ -647,6 +656,7 @@ func newBackendCloser(cancel context.CancelFunc, closeFn func() error) func() er
 func newManagedBackend(
 	client Client,
 	factory func(context.Context) (*leasedClient, error),
+	cleanupFactory func(context.Context) (*leasedClient, error),
 	factoryCtx context.Context,
 	authority string,
 	closeClient func() error,
@@ -658,10 +668,11 @@ func newManagedBackend(
 		newOperation: operations.Bind(
 			bindOperationLeaseFactory(operationCtx, factory),
 		),
-		authority:     authority,
-		closeClient:   closeClient,
-		operations:    operations,
-		activeHandles: make(map[uint64]activeHandle),
+		cleanupLeaseFactory: cleanupFactory,
+		authority:           authority,
+		closeClient:         closeClient,
+		operations:          operations,
+		activeHandles:       make(map[uint64]activeHandle),
 	}
 }
 
@@ -1178,6 +1189,9 @@ func (w *replaceWriter) Close() (retErr error) {
 	w.writerClosed = true
 
 	if err := w.commitReplacement(); err != nil {
+		if storage.IsCommittedWriteError(err) {
+			w.closed = true
+		}
 		return err
 	}
 	w.closed = true
@@ -1192,13 +1206,20 @@ func (w *replaceWriter) commitReplacement() error {
 
 	if err := renameWithContext(w.ctx, w.client, w.temp, w.target); err != nil {
 		publishErr := fmt.Errorf("hdfs: publish %s: %w", w.target, err)
-		if hadOld {
-			if restoreErr := withCleanupContext(func(cleanupCtx context.Context) error {
-				return w.restoreBackup(cleanupCtx, backup)
-			}); restoreErr != nil {
-				w.state = replacementUnabortable
-				publishErr = errors.Join(publishErr, restoreErr)
+		committed := false
+		resolveErr := withCleanupContext(func(cleanupCtx context.Context) error {
+			var err error
+			committed, err = w.resolvePublishRenameAmbiguity(cleanupCtx, backup, hadOld)
+			return err
+		})
+		if committed {
+			if resolveErr == nil {
+				return nil
 			}
+			return storage.MarkCommittedWrite(errors.Join(publishErr, resolveErr))
+		}
+		if resolveErr != nil {
+			publishErr = errors.Join(publishErr, resolveErr)
 		}
 		return publishErr
 	}
@@ -1270,6 +1291,98 @@ func (w *replaceWriter) preserveExistingTarget() (backup string, hadOld bool, re
 		lastErr = fs.ErrExist
 	}
 	return "", true, fmt.Errorf("hdfs: exhausted unique replacement backup names for %s: %w", w.target, lastErr)
+}
+
+func (w *replaceWriter) resolvePublishRenameAmbiguity(ctx context.Context, backup string, hadOld bool) (committed bool, retErr error) {
+	err := w.withCleanupClientContext(ctx, func(client Client) error {
+		targetPresent, targetMatches, err := w.inspectReplacementTarget(ctx, client, w.target)
+		if err != nil {
+			return err
+		}
+		tempPresent, err := pathExists(client, w.temp)
+		if err != nil {
+			return fmt.Errorf("hdfs: inspect temporary file %s after publish failure: %w", w.temp, err)
+		}
+		backupPresent := false
+		if hadOld {
+			backupPresent, err = pathExists(client, backup)
+			if err != nil {
+				return fmt.Errorf("hdfs: inspect replacement backup %s after publish failure: %w", backup, err)
+			}
+		}
+
+		if targetPresent && targetMatches {
+			committed = true
+			if tempPresent {
+				if err := removeWithContext(ctx, client, w.temp); err != nil && !isNotFound(err) {
+					w.state = replacementCommitted
+					return fmt.Errorf("hdfs: remove temporary file %s after committed publish: %w", w.temp, err)
+				}
+			}
+			if backupPresent {
+				if err := removeWithContext(ctx, client, backup); err != nil && !isNotFound(err) {
+					w.state = replacementCommitted
+					return fmt.Errorf("hdfs: remove replacement backup %s after committed publish: %w", backup, err)
+				}
+			}
+			w.state = replacementCommitted
+			return nil
+		}
+
+		if hadOld {
+			if targetPresent {
+				if tempPresent {
+					if err := removeWithContext(ctx, client, w.target); err != nil && !isNotFound(err) {
+						w.state = replacementUnabortable
+						return fmt.Errorf("hdfs: remove partial destination %s after publish failure: %w", w.target, err)
+					}
+					targetPresent = false
+				} else {
+					w.state = replacementUnabortable
+					return fmt.Errorf("hdfs: destination %s changed concurrently; refusing to roll it back", w.target)
+				}
+			}
+			if backupPresent {
+				if err := renameWithContext(ctx, client, backup, w.target); err != nil {
+					w.state = replacementUnabortable
+					return fmt.Errorf("hdfs: restore existing file %s from %s after publish failure: %w", w.target, backup, err)
+				}
+			}
+			w.state = replacementStaged
+			return nil
+		}
+
+		if targetPresent {
+			if tempPresent {
+				if err := removeWithContext(ctx, client, w.target); err != nil && !isNotFound(err) {
+					w.state = replacementUnabortable
+					return fmt.Errorf("hdfs: remove partial destination %s after publish failure: %w", w.target, err)
+				}
+				w.state = replacementStaged
+				return nil
+			}
+			w.state = replacementUnabortable
+			return fmt.Errorf("hdfs: destination %s changed concurrently; refusing to remove it", w.target)
+		}
+		w.state = replacementStaged
+		return nil
+	})
+	return committed, err
+}
+
+func (w *replaceWriter) inspectReplacementTarget(ctx context.Context, client Client, target string) (present, matches bool, retErr error) {
+	present, err := pathExists(client, target)
+	if err != nil {
+		return false, false, fmt.Errorf("hdfs: inspect destination %s after publish failure: %w", target, err)
+	}
+	if !present {
+		return false, false, nil
+	}
+	matches, err = fileMatches(ctx, client, target, w.written, w.digest.Sum(nil))
+	if err != nil {
+		return true, false, fmt.Errorf("hdfs: verify destination %s after publish failure: %w", target, err)
+	}
+	return true, matches, nil
 }
 
 func (w *replaceWriter) rollbackPublishedReplacement(ctx context.Context, client Client, backup string) error {

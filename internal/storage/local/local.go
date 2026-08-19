@@ -50,16 +50,17 @@ func (b *Backend) Open(_ context.Context, path string) (storage.File, error) {
 
 // Create opens a temporary sibling file for writing and commits it into path
 // on Close without first removing or moving an existing target. Existing
-// regular-file mode bits (including setuid/setgid/sticky) are preserved
-// everywhere; on Unix we also preserve owner/group, and on Linux and Darwin we
-// preserve extended attributes (including xattr-backed ACLs such as Linux
-// POSIX ACLs) when the platform exposes them. On Plan 9, the platform lacks
-// hard-link snapshots, so replacement falls back to a best-effort rename-based
-// sequence that restores the old file on failure but cannot keep the target
-// continuously visible. New files use 0644 subject to the process umask.
-// Parent directories are created with 0755 if they don't already exist —
-// matches "mkdir -p" behavior so callers don't have to pre-create the path
-// tree.
+// ordinary permission bits and sticky are preserved everywhere, but setuid and
+// setgid are intentionally not restored so rewritten bytes mirror the privilege
+// stripping of truncating an existing file in place. On Unix we also preserve
+// owner/group, and on Linux and Darwin we preserve extended attributes
+// (including xattr-backed ACLs such as Linux POSIX ACLs) when the platform
+// exposes them. On platforms without hard-link snapshots (Plan 9, js, wasip1),
+// replacement falls back to a best-effort rename-based sequence that restores
+// the old file on failure but cannot keep the target continuously visible. New
+// files use 0644 subject to the process umask. Parent directories are created
+// with 0755 if they don't already exist — matches "mkdir -p" behavior so
+// callers don't have to pre-create the path tree.
 func (b *Backend) Create(_ context.Context, path string) (storage.Writer, error) {
 	if isReplacementArtifactName(filepath.Base(path)) {
 		return nil, fmt.Errorf("local: destination %s uses a reserved internal namespace", path)
@@ -184,7 +185,7 @@ func (osReplacementOps) AtomicRestore(target, backup string) error {
 }
 
 const (
-	replacementModeMask       = os.ModePerm | os.ModeSetuid | os.ModeSetgid | os.ModeSticky
+	replacementModeMask       = os.ModePerm | os.ModeSticky
 	replacementTempPrefix     = ".shoal-tmp-"
 	replacementBackupPrefix   = ".shoal-backup-"
 	replacementNameTokenBytes = 16

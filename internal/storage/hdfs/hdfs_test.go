@@ -388,6 +388,96 @@ func TestBackendAmbiguousBackupRenameRestoresTargetBeforeReturning(t *testing.T)
 	}
 }
 
+func TestBackendAmbiguousPublishRenameClassifiesCommittedTarget(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		existing bool
+	}{
+		{name: "replace-existing-target", existing: true},
+		{name: "publish-absent-target", existing: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client := newFakeClient()
+			if tc.existing {
+				client.files["/tables/1.rf"] = []byte("old")
+			}
+			client.renameContextHook = func(_ context.Context, oldpath, newpath string) error {
+				if strings.Contains(oldpath, replacementTempPrefix) && newpath == "/tables/1.rf" {
+					client.files[newpath] = append([]byte(nil), client.files[oldpath]...)
+					delete(client.files, oldpath)
+					return context.DeadlineExceeded
+				}
+				return nil
+			}
+			backend, err := New("nn:8020", WithClient(client))
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if err := storage.WriteAll(context.Background(), backend, "/tables/1.rf", []byte("new")); err != nil {
+				t.Fatalf("WriteAll: %v", err)
+			}
+			if got := string(client.files["/tables/1.rf"]); got != "new" {
+				t.Fatalf("target contents = %q, want new", got)
+			}
+			if _, ok := client.files[client.lastCreatePath]; ok {
+				t.Fatalf("temporary file %s remains after committed publish", client.lastCreatePath)
+			}
+			for name := range client.files {
+				if strings.Contains(name, replacementBackupPrefix) {
+					t.Fatalf("backup %s remains after committed publish", name)
+				}
+			}
+		})
+	}
+}
+
+func TestBackendAmbiguousPublishRenameRestoresBackupAndRetainsTempForAbort(t *testing.T) {
+	client := newFakeClient()
+	client.files["/tables/1.rf"] = []byte("old")
+	client.renameContextHook = func(_ context.Context, oldpath, newpath string) error {
+		if strings.Contains(oldpath, replacementTempPrefix) && newpath == "/tables/1.rf" {
+			client.files[newpath] = []byte("partial")
+			return context.DeadlineExceeded
+		}
+		return nil
+	}
+	backend, err := New("nn:8020", WithClient(client))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	w, err := backend.Create(context.Background(), "/tables/1.rf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write([]byte("new")); err != nil {
+		t.Fatal(err)
+	}
+
+	err = w.Close()
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Close error = %v, want context deadline exceeded", err)
+	}
+	if got := string(client.files["/tables/1.rf"]); got != "old" {
+		t.Fatalf("target contents = %q, want restored old data", got)
+	}
+	if _, ok := client.files[client.lastCreatePath]; !ok {
+		t.Fatalf("temporary file %s missing after unsuccessful Close", client.lastCreatePath)
+	}
+	for name := range client.files {
+		if strings.Contains(name, replacementBackupPrefix) {
+			t.Fatalf("backup %s remains after restore", name)
+		}
+	}
+	if err := w.(storage.Aborter).Abort(); err != nil {
+		t.Fatalf("Abort after unsuccessful Close: %v", err)
+	}
+	if _, ok := client.files[client.lastCreatePath]; ok {
+		t.Fatalf("temporary file %s remains after Abort", client.lastCreatePath)
+	}
+}
+
 func TestBackendCommittedBackupDeleteDoesNotRollbackReplacement(t *testing.T) {
 	client := newFakeClient()
 	client.files["/tables/1.rf"] = []byte("old")
@@ -2130,6 +2220,67 @@ func TestBackendCloseAbortsActiveWriterWithoutLeakingTemp(t *testing.T) {
 	}
 }
 
+func TestBackendCloseRestoresBackupAfterShutdownCancelsPublish(t *testing.T) {
+	client := newFakeClient()
+	client.files["/tables/1.rf"] = []byte("old")
+	publishStarted := make(chan struct{})
+	backend, err := NewContext(context.Background(), "nn:8020",
+		WithClient(client),
+		func(c *config) {
+			c.clientLeaseFactory = func(ctx context.Context) (*leasedClient, error) {
+				return &leasedClient{
+					client: &shutdownPublishClient{
+						fakeClient:     client,
+						ctx:            ctx,
+						publishStarted: publishStarted,
+					},
+					release: func() error { return nil },
+				}, nil
+			}
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	w, err := backend.Create(context.Background(), "/tables/1.rf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write([]byte("new")); err != nil {
+		t.Fatal(err)
+	}
+
+	closeErr := make(chan error, 1)
+	go func() {
+		closeErr <- w.Close()
+	}()
+	<-publishStarted
+
+	backendErr := make(chan error, 1)
+	go func() {
+		backendErr <- backend.Close()
+	}()
+
+	if err := <-closeErr; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Close error = %v, want context.Canceled", err)
+	}
+	if err := <-backendErr; err != nil {
+		t.Fatalf("Backend.Close error = %v, want nil", err)
+	}
+	if got := string(client.files["/tables/1.rf"]); got != "old" {
+		t.Fatalf("target contents = %q, want restored old data", got)
+	}
+	if _, ok := client.files[client.lastCreatePath]; ok {
+		t.Fatalf("temporary file %s remains after Backend.Close", client.lastCreatePath)
+	}
+	for name := range client.files {
+		if strings.Contains(name, replacementBackupPrefix) {
+			t.Fatalf("backup %s remains after shutdown cleanup", name)
+		}
+	}
+}
+
 func TestBackendCloseIgnoresOperationClientReleaseErrorAfterCommit(t *testing.T) {
 	client := newFakeClient()
 	backend := newReleaseErrorBackend(t, client)
@@ -2624,6 +2775,22 @@ func (c *fakeClient) Rename(oldpath, newpath string) error {
 }
 
 func (c *fakeClient) Close() error { return nil }
+
+type shutdownPublishClient struct {
+	*fakeClient
+	ctx            context.Context
+	publishStarted chan struct{}
+	publishOnce    sync.Once
+}
+
+func (c *shutdownPublishClient) RenameContext(ctx context.Context, oldpath, newpath string) error {
+	if strings.Contains(oldpath, replacementTempPrefix) {
+		c.publishOnce.Do(func() { close(c.publishStarted) })
+		<-c.ctx.Done()
+		return c.ctx.Err()
+	}
+	return c.fakeClient.RenameContext(ctx, oldpath, newpath)
+}
 
 type stalledCompleteState struct {
 	cleanup          *fakeClient

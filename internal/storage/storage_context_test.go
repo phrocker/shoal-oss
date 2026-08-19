@@ -315,6 +315,27 @@ func TestCopy_CanceledEOFReadDoesNotWriteAndJoinsEOF(t *testing.T) {
 	}
 }
 
+func TestCopy_PrematureEOFBeforeAdvertisedSizeAbortsDestination(t *testing.T) {
+	dst := memory.New()
+
+	n, err := storage.Copy(context.Background(), fileBackend{file: &readFuncFile{
+		size: 2,
+		read: func(p []byte, _ int64) (int, error) {
+			p[0] = 'x'
+			return 1, io.EOF
+		},
+	}}, "/src", dst, "/dst")
+	if !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("Copy error = %v, want %v", err, io.ErrUnexpectedEOF)
+	}
+	if n != 1 {
+		t.Fatalf("Copy wrote %d bytes, want 1", n)
+	}
+	if _, openErr := dst.Open(context.Background(), "/dst"); !errors.Is(openErr, storage.ErrNotFound) {
+		t.Fatalf("destination open error = %v, want storage.ErrNotFound after abort", openErr)
+	}
+}
+
 func TestCopy_CanceledShortWriteJoinsContextError(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	src := memory.New()

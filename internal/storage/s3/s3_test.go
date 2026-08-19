@@ -917,6 +917,12 @@ func TestWriter_AbortRetriesOwnedCleanupAfterAmbiguousStageUpload(t *testing.T) 
 	if _, ok := f.objects[w.stageKey]; !ok {
 		t.Fatal("failed Abort removed staged object unexpectedly")
 	}
+	if _, err := w.Write([]byte("late")); err == nil || !strings.Contains(err.Error(), "aborted") {
+		t.Fatalf("Write after failed Abort error = %v, want aborted state", err)
+	}
+	if err := w.Close(); err == nil || !strings.Contains(err.Error(), "aborted") {
+		t.Fatalf("Close after failed Abort error = %v, want aborted state", err)
+	}
 	if err := w.Abort(); err != nil {
 		t.Fatalf("second Abort: %v", err)
 	}

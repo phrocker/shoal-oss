@@ -1,4 +1,4 @@
-//go:build plan9
+//go:build plan9 || js || wasip1
 
 package local
 
@@ -8,9 +8,10 @@ import (
 	"os"
 )
 
-// Plan 9 lacks hard-link snapshots, so replacement cannot keep the destination
-// continuously visible. We instead move the old file aside, rename the new file
-// into place, and restore the old file if the second rename fails.
+// These platforms lack hard-link snapshots, so replacement cannot keep the
+// destination continuously visible. We instead move the old file aside, rename
+// the new file into place, and restore the old file if the second rename
+// fails.
 func platformAtomicReplace(temp, target, backup string, hadOld bool) error {
 	if !hadOld {
 		return os.Rename(temp, target)

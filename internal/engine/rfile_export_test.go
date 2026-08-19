@@ -240,6 +240,49 @@ func TestCopyWithSHA256AbortsDestinationOnShortWrite(t *testing.T) {
 	}
 }
 
+func TestCopyWithSHA256AbortsDestinationOnPrematureEOF(t *testing.T) {
+	src := exportFileBackend{file: &exportReadFuncFile{
+		size: 2,
+		read: func(p []byte, off int64) (int, error) {
+			switch off {
+			case 0:
+				p[0] = 'x'
+				return 1, io.EOF
+			default:
+				return 0, io.EOF
+			}
+		},
+	}}
+	dst := newExportTrackingBackend()
+	dst.files["/dst.rf"] = []byte("old")
+
+	written, sum, bcVersion, err := copyWithSHA256(context.Background(), src, "/src.rf", dst, "/dst.rf")
+	if !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("copyWithSHA256 error = %v, want %v", err, io.ErrUnexpectedEOF)
+	}
+	if written != 1 {
+		t.Fatalf("written = %d, want 1", written)
+	}
+	if sum != "" {
+		t.Fatalf("sum = %q, want empty on failure", sum)
+	}
+	if bcVersion != "" {
+		t.Fatalf("bcVersion = %q, want empty on failure", bcVersion)
+	}
+	if got := string(dst.files["/dst.rf"]); got != "old" {
+		t.Fatalf("destination contents = %q, want old", got)
+	}
+	if dst.lastWriter == nil || dst.lastWriter.abortCalls != 1 {
+		t.Fatalf("Abort calls = %d, want 1", dst.lastWriter.abortCalls)
+	}
+	if dst.lastWriter.closed {
+		t.Fatal("premature EOF closed and could have committed destination")
+	}
+	if dst.lastWriter.stagePresent {
+		t.Fatal("premature EOF left staged bytes behind")
+	}
+}
+
 func TestCopyWithSHA256CountsPartialWriteProgressBeforeError(t *testing.T) {
 	src := exportFileBackend{file: &exportReadFuncFile{
 		size: 3,
