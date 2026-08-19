@@ -10,10 +10,12 @@ func TestMetadataEntryEncodesBothTabletShapes(t *testing.T) {
 	if got := MetadataEntry("1", []byte("k")); got != "1;k" {
 		t.Fatalf("MetadataEntry with an end row = %q", got)
 	}
-	for _, absent := range [][]byte{nil, {}} {
-		if got := MetadataEntry("1", absent); got != "1<" {
-			t.Fatalf("MetadataEntry with no end row = %q", got)
-		}
+	if got := MetadataEntry("1", nil); got != "1<" {
+		t.Fatalf("MetadataEntry with no end row = %q", got)
+	}
+	// A non-nil empty slice is the empty row, not an absent bound.
+	if got := MetadataEntry("1", []byte{}); got != "1;" {
+		t.Fatalf("MetadataEntry with an empty end row = %q", got)
 	}
 	extent, err := NewTabletExtent("1", []byte("k"), nil)
 	if err != nil {
@@ -45,11 +47,25 @@ func TestNewTabletExtentValidatesAndCopies(t *testing.T) {
 	if _, err := NewTabletExtent("1", []byte("a"), []byte("a")); !errors.Is(err, ErrInvalidTabletExtent) {
 		t.Fatalf("prev row equal to end row = %v", err)
 	}
-	// An absent bound is always legal, in either position.
+	// An absent bound is always legal, in either position, and nil is the only
+	// spelling of absent: an empty slice is the empty row.
 	for _, pair := range [][2][]byte{{nil, nil}, {[]byte("a"), nil}, {nil, []byte("z")}} {
 		if _, err := NewTabletExtent("1", pair[0], pair[1]); err != nil {
 			t.Fatalf("NewTabletExtent(1, %q, %q) = %v", pair[0], pair[1], err)
 		}
+	}
+	empty, err := NewTabletExtent("1", []byte{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if empty.EndRow == nil {
+		t.Fatal("an empty end row collapsed into an absent one")
+	}
+	if got := empty.MetadataEntry(); got != "1;" {
+		t.Fatalf("empty end row metadata entry = %q", got)
+	}
+	if _, err := NewTabletExtent("1", []byte{}, []byte{}); !errors.Is(err, ErrInvalidTabletExtent) {
+		t.Fatalf("equal empty bounds = %v", err)
 	}
 }
 
@@ -63,6 +79,7 @@ func TestParseTabletExtentDecodesMetadataRows(t *testing.T) {
 		{"1<", "1", ""},
 		{"!0<", "!0", ""},
 		{"1;k;with;semicolons", "1", "k;with;semicolons"},
+		{"1;k<", "1", "k<"},
 	}
 	for _, tc := range cases {
 		extent, err := ParseTabletExtent(tc.row, []byte("a"))
@@ -75,6 +92,30 @@ func TestParseTabletExtentDecodesMetadataRows(t *testing.T) {
 		if string(extent.PrevRow) != "a" {
 			t.Fatalf("ParseTabletExtent(%q) prev row = %q", tc.row, extent.PrevRow)
 		}
+	}
+	// A trailing separator names the empty end row, which is a bound and so
+	// cannot sit at or before a previous end row.
+	emptyEnd, err := ParseTabletExtent("1;", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if emptyEnd.EndRow == nil || len(emptyEnd.EndRow) != 0 {
+		t.Fatalf("trailing separator decoded to %+v", emptyEnd)
+	}
+	if _, err := ParseTabletExtent("1;", []byte("a")); !errors.Is(err, ErrInvalidTabletExtent) {
+		t.Fatalf("empty end row after a previous end row = %v", err)
+	}
+
+	// The bounded form wins, so an end row that ends in '<' round trips.
+	roundTrip, err := ParseTabletExtent(MetadataEntry("1", []byte("k<")), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if roundTrip.TableID != "1" || string(roundTrip.EndRow) != "k<" {
+		t.Fatalf("round trip = %+v", roundTrip)
+	}
+	if roundTrip.EndRow == nil {
+		t.Fatal("an end row ending in '<' decoded as an absent bound")
 	}
 	for _, bad := range []string{"", "no-separator", "<", ";k"} {
 		if _, err := ParseTabletExtent(bad, nil); !errors.Is(err, ErrInvalidTabletExtent) {

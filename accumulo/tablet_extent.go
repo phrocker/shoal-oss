@@ -21,24 +21,24 @@ var RootTabletExtent = TabletExtent{
 }
 
 // MetadataEntry renders the metadata row that names a tablet: "<table>;<row>"
-// for a bounded tablet and "<table><" for the last tablet of the table, which
-// has no end row.
+// for a bounded tablet and "<table><" for the last tablet of the table, whose
+// end row is nil.
 func MetadataEntry(tableID string, endRow []byte) string {
-	if len(endRow) == 0 {
+	if endRow == nil {
 		return tableID + "<"
 	}
 	return tableID + ";" + string(endRow)
 }
 
-// NewTabletExtent builds an extent. A nil or empty endRow means the tablet has
-// no upper bound and a nil or empty prevRow means it has no lower bound, which
-// is how the discovery layer already reads the two fields. Both slices are
-// copied.
+// NewTabletExtent builds an extent. A nil endRow means the tablet has no upper
+// bound and a nil prevRow means it has no lower bound, which is how the
+// discovery layer already reads the two fields; a non-nil empty slice is the
+// empty row, a bound like any other. Both slices are copied.
 func NewTabletExtent(tableID string, endRow, prevRow []byte) (TabletExtent, error) {
 	if tableID == "" {
 		return TabletExtent{}, fmt.Errorf("%w: table id is empty", ErrInvalidTabletExtent)
 	}
-	if len(endRow) > 0 && len(prevRow) > 0 && bytes.Compare(prevRow, endRow) >= 0 {
+	if endRow != nil && prevRow != nil && bytes.Compare(prevRow, endRow) >= 0 {
 		return TabletExtent{}, fmt.Errorf(
 			"%w: previous end row %q is not before end row %q",
 			ErrInvalidTabletExtent,
@@ -60,21 +60,22 @@ func ParseTabletExtent(metadataRow string, prevRow []byte) (TabletExtent, error)
 	if metadataRow == "" {
 		return TabletExtent{}, fmt.Errorf("%w: metadata row is empty", ErrInvalidTabletExtent)
 	}
+	// The bounded form wins: an end row may itself end in '<', and only a row
+	// with no separator at all names the tablet with no upper bound.
+	if separator := strings.IndexByte(metadataRow, ';'); separator >= 0 {
+		return NewTabletExtent(
+			metadataRow[:separator],
+			[]byte(metadataRow[separator+1:]),
+			prevRow,
+		)
+	}
 	if strings.HasSuffix(metadataRow, "<") {
 		return NewTabletExtent(metadataRow[:len(metadataRow)-1], nil, prevRow)
 	}
-	separator := strings.IndexByte(metadataRow, ';')
-	if separator < 0 {
-		return TabletExtent{}, fmt.Errorf(
-			"%w: metadata row %q contains neither ';' nor '<'",
-			ErrInvalidTabletExtent,
-			metadataRow,
-		)
-	}
-	return NewTabletExtent(
-		metadataRow[:separator],
-		[]byte(metadataRow[separator+1:]),
-		prevRow,
+	return TabletExtent{}, fmt.Errorf(
+		"%w: metadata row %q contains neither ';' nor a trailing '<'",
+		ErrInvalidTabletExtent,
+		metadataRow,
 	)
 }
 
@@ -104,16 +105,17 @@ func (e TabletExtent) Range() (*Range, error) {
 
 // Contains reports whether row falls inside the tablet.
 func (e TabletExtent) Contains(row []byte) bool {
-	if len(e.PrevRow) > 0 && bytes.Compare(row, e.PrevRow) <= 0 {
+	if e.PrevRow != nil && bytes.Compare(row, e.PrevRow) <= 0 {
 		return false
 	}
-	return len(e.EndRow) == 0 || bytes.Compare(row, e.EndRow) <= 0
+	return e.EndRow == nil || bytes.Compare(row, e.EndRow) <= 0
 }
 
 // Compare orders two extents by table id, then by end row, then by previous
-// end row. An absent end row is the tablet with no upper bound, so it sorts
-// last; an absent previous end row is the tablet with no lower bound, so it
-// sorts first. It returns a negative number, zero, or a positive number.
+// end row. A nil end row is the tablet with no upper bound, so it sorts last;
+// a nil previous end row is the tablet with no lower bound, so it sorts first.
+// A non-nil empty slice is the empty row and orders like any other bound. It
+// returns a negative number, zero, or a positive number.
 func (e TabletExtent) Compare(other TabletExtent) int {
 	if order := strings.Compare(e.TableID, other.TableID); order != 0 {
 		return order
@@ -127,11 +129,11 @@ func (e TabletExtent) Compare(other TabletExtent) int {
 // compareUpperBound orders end rows, treating an absent bound as the largest.
 func compareUpperBound(left, right []byte) int {
 	switch {
-	case len(left) == 0 && len(right) == 0:
+	case left == nil && right == nil:
 		return 0
-	case len(left) == 0:
+	case left == nil:
 		return 1
-	case len(right) == 0:
+	case right == nil:
 		return -1
 	default:
 		return bytes.Compare(left, right)
@@ -142,11 +144,11 @@ func compareUpperBound(left, right []byte) int {
 // smallest.
 func compareLowerBound(left, right []byte) int {
 	switch {
-	case len(left) == 0 && len(right) == 0:
+	case left == nil && right == nil:
 		return 0
-	case len(left) == 0:
+	case left == nil:
 		return -1
-	case len(right) == 0:
+	case right == nil:
 		return 1
 	default:
 		return bytes.Compare(left, right)
@@ -172,7 +174,7 @@ func (e TabletExtent) String() string {
 }
 
 func boundText(bound []byte) string {
-	if len(bound) == 0 {
+	if bound == nil {
 		return "<"
 	}
 	return string(bound)
