@@ -77,6 +77,12 @@ int main() {
   shoal_namespace_properties_result *namespace_properties = nullptr;
   shoal_versioned_properties_result *versioned_properties = nullptr;
   shoal_bytes_list_result *bytes = nullptr;
+  shoal_scanner *scanner = nullptr;
+  shoal_batch_scanner *batch_scanner = nullptr;
+  shoal_scan_result *scan_result = nullptr;
+  shoal_mutation *mutation = nullptr;
+  shoal_batch_writer *writer = nullptr;
+  shoal_write_failure *write_failure = nullptr;
   assert(shoal_abi_version() == SHOAL_ABI_VERSION);
   assert(shoal_abi_version_major() == SHOAL_ABI_VERSION_MAJOR);
   assert(shoal_abi_version_minor() == SHOAL_ABI_VERSION_MINOR);
@@ -109,6 +115,12 @@ int main() {
   shoal_namespace_properties_free(&namespace_properties);
   shoal_versioned_properties_free(&versioned_properties);
   shoal_bytes_list_free(&bytes);
+  shoal_scanner_free(&scanner);
+  shoal_batch_scanner_free(&batch_scanner);
+  shoal_scan_result_free(&scan_result);
+  shoal_mutation_free(&mutation);
+  shoal_batch_writer_free(&writer);
+  shoal_write_failure_free(&write_failure);
   shoal_error_free(&error);
   return 0;
 }

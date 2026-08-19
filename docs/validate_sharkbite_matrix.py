@@ -3,9 +3,14 @@ from __future__ import annotations
 from collections.abc import Iterator, Sequence
 from collections import Counter, defaultdict
 from functools import lru_cache
+import os
 from pathlib import Path
 import re
+import shlex
+import shutil
+import subprocess
 import sys
+import tempfile
 
 
 DOC_PATH = Path(__file__).with_name("sharkbite-compatibility.md")
@@ -14,6 +19,9 @@ EXPECTED_REVISION = 18
 # changes; review every added/removed or reclassified ID in code review.
 EXPECTED_ROW_MANIFEST = DOC_PATH.with_name(
     f"sharkbite-compatibility-revision{EXPECTED_REVISION}-rows.txt"
+)
+EXPECTED_C_ABI_SYMBOL_MANIFEST = DOC_PATH.with_name(
+    f"sharkbite-compatibility-revision{EXPECTED_REVISION}-cabi-symbols.txt"
 )
 
 STATUSES = {
@@ -235,6 +243,10 @@ C_ABI_REFERENCE_PATHS = (
     Path("capi/tests/shared_library_query.c"),
     Path("capi/tests/header_cpp_test.cpp"),
 )
+DEFAULT_C_ABI_INCLUDE_PATHS = (
+    Path("capi/include"),
+    Path("capi/tests"),
+)
 EXPECTED_C_ABI_DECLARED_EXPORTS = 108
 EXPECTED_C_ABI_REFERENCED_EXPORTS = 102
 EXPECTED_C_ABI_UNREFERENCED_EXPORTS = (
@@ -244,6 +256,12 @@ EXPECTED_C_ABI_UNREFERENCED_EXPORTS = (
     "shoal_write_failure_get_constraint",
     "shoal_write_failure_get_authorization",
     "shoal_write_failure_get_cleanup",
+)
+EXPECTED_C_ABI_SYMBOL_MANIFEST_HEADER = (
+    f"# Revision-{EXPECTED_REVISION} compiled C ABI symbol inventory for docs/sharkbite-compatibility.md.",
+    "# Generated from the undefined/imported shoal_* references emitted by compiling the exact C/C++",
+    "# sources that cmd/shoal-capi/cabi_test.go links in TestSharedLibraryCABI.",
+    f"# Update only when the independently audited revision-{EXPECTED_REVISION} compiled inventory changes.",
 )
 
 CATEGORY_STATUS_COLUMNS = {
@@ -299,6 +317,10 @@ FILE_CITATION_SUFFIXES = {
 }
 EXPORT_SYMBOL_RE = re.compile(
     r"SHOAL_API\s+[^;]*?\b(?:SHOAL_CALL\s+)?(?P<name>shoal_[A-Za-z0-9_]+)\s*\(",
+    re.S,
+)
+FREE_SYMBOL_RE = re.compile(
+    r"SHOAL_API\s+void\s+SHOAL_CALL\s+(?P<name>shoal_[A-Za-z0-9_]+_free)\s*\(",
     re.S,
 )
 FILE_CITATION_BASENAMES = {"ARCHITECTURE.md", "CMakeLists.txt", "Dockerfile", "Makefile", "README.md"}
@@ -838,9 +860,151 @@ def validate_pinned_inventory_constants() -> None:
     )
 
 
-def collect_c_abi_symbol_inventory(
-    repo_root: Path | None = None,
-) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+def parse_command_text(command_text: str) -> list[str]:
+    return shlex.split(command_text, posix=os.name != "nt")
+
+
+@lru_cache(maxsize=None)
+def go_env(name: str) -> str:
+    output = subprocess.run(
+        ["go", "env", name],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return output.stdout.strip()
+
+
+def compiler_command(name: str) -> list[str] | None:
+    command_text = go_env(name)
+    if not command_text:
+        return None
+    fields = parse_command_text(command_text)
+    return fields if fields else None
+
+
+def symbol_tool_command() -> list[str] | None:
+    for candidate in ("nm", "llvm-nm"):
+        path = shutil.which(candidate)
+        if path is not None:
+            return [path]
+    cc = compiler_command("CC")
+    if cc:
+        compiler_name = Path(cc[0]).name.lower()
+        for suffix in ("gcc", "cc", "clang"):
+            if compiler_name.endswith(suffix):
+                stem = Path(cc[0]).name[: -len(suffix)]
+                candidate = stem + "nm"
+                path = shutil.which(candidate)
+                if path is not None:
+                    return [path]
+    return None
+
+
+def load_c_abi_symbol_manifest_lines(path: Path | None = None) -> list[str]:
+    manifest_path = EXPECTED_C_ABI_SYMBOL_MANIFEST if path is None else path
+    return manifest_path.read_text(encoding="utf-8").splitlines()
+
+
+def parse_named_symbol_sections(
+    lines: Sequence[str], *, source: str
+) -> dict[str, tuple[str, ...]]:
+    sections: dict[str, list[str]] = {}
+    current_section: str | None = None
+    for line_number, raw_line in enumerate(lines, start=1):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        section_match = re.fullmatch(r"\[(?P<section>[a-z_]+)\]", line)
+        if section_match is not None:
+            current_section = section_match.group("section")
+            require(
+                current_section not in sections,
+                f"duplicate symbol section [{current_section}] in {source}",
+            )
+            sections[current_section] = []
+            continue
+        require(
+            current_section is not None,
+            f"unexpected symbol entry before a section header in {source} on line {line_number}: {raw_line!r}",
+        )
+        require(
+            re.fullmatch(r"shoal_[A-Za-z0-9_]+", line) is not None,
+            f"invalid symbol entry in {source} on line {line_number}: {raw_line!r}",
+        )
+        sections[current_section].append(line)
+    return {section: tuple(entries) for section, entries in sections.items()}
+
+
+def validate_expected_c_abi_symbol_manifest_provenance(
+    lines: Sequence[str], *, source: str
+) -> None:
+    filename_match = re.fullmatch(
+        r"sharkbite-compatibility-revision(?P<revision>\d+)-cabi-symbols\.txt",
+        source,
+    )
+    require(filename_match is not None, f"unexpected C ABI symbol manifest filename {source!r}")
+    assert filename_match is not None
+    require(
+        int(filename_match.group("revision")) == EXPECTED_REVISION,
+        (
+            f"C ABI symbol manifest filename {source!r} does not match EXPECTED_REVISION "
+            f"{EXPECTED_REVISION}"
+        ),
+    )
+    comment_lines = tuple(raw_line.rstrip() for raw_line in lines if raw_line.startswith("#"))
+    require(
+        comment_lines[: len(EXPECTED_C_ABI_SYMBOL_MANIFEST_HEADER)]
+        == EXPECTED_C_ABI_SYMBOL_MANIFEST_HEADER,
+        (
+            f"C ABI symbol manifest header in {source} does not match revision "
+            f"{EXPECTED_REVISION}: expected {EXPECTED_C_ABI_SYMBOL_MANIFEST_HEADER[0]!r}"
+        ),
+    )
+
+
+@lru_cache(maxsize=1)
+def load_expected_c_abi_symbol_manifest() -> dict[str, tuple[str, ...]]:
+    lines = load_c_abi_symbol_manifest_lines()
+    validate_expected_c_abi_symbol_manifest_provenance(
+        lines, source=EXPECTED_C_ABI_SYMBOL_MANIFEST.name
+    )
+    sections = parse_named_symbol_sections(lines, source=EXPECTED_C_ABI_SYMBOL_MANIFEST.name)
+    require(
+        set(sections) == {"declared", "referenced", "unreferenced"},
+        (
+            "C ABI symbol manifest sections do not match the audited inventory: "
+            f"{sorted(sections)}"
+        ),
+    )
+    declared = sections["declared"]
+    referenced = sections["referenced"]
+    unreferenced = sections["unreferenced"]
+    require(
+        len(declared) == EXPECTED_C_ABI_DECLARED_EXPORTS,
+        (
+            f"C ABI symbol manifest pins {len(declared)} declared exports, but "
+            f"EXPECTED_C_ABI_DECLARED_EXPORTS pins {EXPECTED_C_ABI_DECLARED_EXPORTS}"
+        ),
+    )
+    require(
+        len(referenced) == EXPECTED_C_ABI_REFERENCED_EXPORTS,
+        (
+            f"C ABI symbol manifest pins {len(referenced)} referenced exports, but "
+            f"EXPECTED_C_ABI_REFERENCED_EXPORTS pins {EXPECTED_C_ABI_REFERENCED_EXPORTS}"
+        ),
+    )
+    require(
+        unreferenced == EXPECTED_C_ABI_UNREFERENCED_EXPORTS,
+        (
+            "C ABI symbol manifest pins a different unreferenced export inventory: "
+            f"{unreferenced}"
+        ),
+    )
+    return sections
+
+
+def collect_c_abi_declared_exports(repo_root: Path | None = None) -> tuple[str, ...]:
     root = repo_root or DOC_PATH.parent.parent
     exports = tuple(
         match.group("name")
@@ -853,93 +1017,154 @@ def collect_c_abi_symbol_inventory(
         len(exports) == len(set(exports)),
         f"duplicate SHOAL_API export declarations found in {C_ABI_EXPORT_HEADER_PATH}",
     )
-    combined_reference_text = "\n".join(
-        strip_c_non_code((root / path).read_text(encoding="utf-8"))
-        for path in C_ABI_REFERENCE_PATHS
-    )
-    referenced = tuple(
-        symbol
-        for symbol in exports
-        if re.search(rf"\b{re.escape(symbol)}\b", combined_reference_text) is not None
-    )
+    return exports
+
+
+def compiler_for_source(source_path: Path) -> list[str] | None:
+    suffix = source_path.suffix.lower()
+    if suffix in {".cpp", ".cc", ".cxx"}:
+        return compiler_command("CXX")
+    return compiler_command("CC")
+
+
+def compile_source_to_object(
+    source_path: Path,
+    object_path: Path,
+    *,
+    include_paths: Sequence[Path],
+    repo_root: Path,
+) -> None:
+    compiler = compiler_for_source(source_path)
+    require(compiler is not None, f"no compiler configured for {source_path}")
+    args = list(compiler)
+    suffix = source_path.suffix.lower()
+    if suffix in {".cpp", ".cc", ".cxx"}:
+        args.extend(["-std=c++11", "-Wall", "-Wextra", "-Werror"])
+    else:
+        args.extend(["-std=c11", "-Wall", "-Wextra", "-Werror"])
+    for include_path in include_paths:
+        args.extend(["-I", str(repo_root / include_path)])
+    args.extend(["-c", str(repo_root / source_path), "-o", str(object_path)])
+    subprocess.run(args, cwd=repo_root, check=True, capture_output=True, text=True)
+
+
+def extract_undefined_shoal_symbols(
+    object_path: Path, *, symbol_tool: Sequence[str]
+) -> tuple[str, ...]:
+    output = subprocess.run(
+        [*symbol_tool, "-u", str(object_path)],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    symbols: set[str] = set()
+    for raw_line in output.splitlines():
+        for token in re.findall(r"(?:__imp__?|_)?shoal_[A-Za-z0-9_]+", raw_line):
+            normalized = token
+            while normalized.startswith("_"):
+                normalized = normalized[1:]
+            if normalized.startswith("imp_"):
+                normalized = normalized[len("imp_") :]
+            if normalized.startswith("_"):
+                normalized = normalized[1:]
+            if normalized.startswith("shoal_"):
+                symbols.add(normalized)
+    return tuple(sorted(symbols))
+
+
+def compiled_c_abi_reference_inventory(
+    source_paths: Sequence[Path] = C_ABI_REFERENCE_PATHS,
+    *,
+    include_paths: Sequence[Path] = DEFAULT_C_ABI_INCLUDE_PATHS,
+    repo_root: Path | None = None,
+) -> tuple[str, ...] | None:
+    root = repo_root or DOC_PATH.parent.parent
+    symbol_tool = symbol_tool_command()
+    if symbol_tool is None:
+        return None
+    if any(compiler_for_source(path) is None for path in source_paths):
+        return None
+    with tempfile.TemporaryDirectory(dir=root) as temp_dir_name:
+        temp_dir = Path(temp_dir_name)
+        collected: set[str] = set()
+        for index, source_path in enumerate(source_paths):
+            object_path = temp_dir / f"symbol_inventory_{index}{source_path.suffix}.o"
+            compile_source_to_object(
+                source_path,
+                object_path,
+                include_paths=include_paths,
+                repo_root=root,
+            )
+            collected.update(
+                extract_undefined_shoal_symbols(object_path, symbol_tool=symbol_tool)
+            )
+    return tuple(sorted(collected))
+
+
+def collect_c_abi_symbol_inventory(
+    repo_root: Path | None = None,
+) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+    exports = collect_c_abi_declared_exports(repo_root)
+    manifest = load_expected_c_abi_symbol_manifest()
+    compiled_references = compiled_c_abi_reference_inventory(repo_root=repo_root)
+    if compiled_references is None:
+        referenced = manifest["referenced"]
+    else:
+        export_set = set(exports)
+        referenced = tuple(symbol for symbol in compiled_references if symbol in export_set)
     unreferenced = tuple(symbol for symbol in exports if symbol not in referenced)
     return exports, referenced, unreferenced
 
 
-def strip_c_non_code(text: str) -> str:
-    enabled_lines: list[str] = []
-    disabled_depth = 0
-    for line in text.splitlines(keepends=True):
-        directive = re.match(r"^\s*#\s*(\w+)(.*)$", line)
-        if directive:
-            keyword, argument = directive.groups()
-            if keyword == "if" and re.fullmatch(r"\s*0\s*(?://.*)?", argument):
-                disabled_depth += 1
-            elif disabled_depth and keyword in {"if", "ifdef", "ifndef"}:
-                disabled_depth += 1
-            elif disabled_depth and keyword == "endif":
-                disabled_depth -= 1
-            continue
-        if not disabled_depth:
-            enabled_lines.append(line)
+def collect_c_abi_free_function_inventory(repo_root: Path | None = None) -> tuple[str, ...]:
+    root = repo_root or DOC_PATH.parent.parent
+    header_text = (root / C_ABI_EXPORT_HEADER_PATH).read_text(encoding="utf-8")
+    free_functions = tuple(match.group("name") for match in FREE_SYMBOL_RE.finditer(header_text))
+    require(free_functions, f"no free functions found in {C_ABI_EXPORT_HEADER_PATH}")
+    require(
+        len(free_functions) == len(set(free_functions)),
+        f"duplicate free function declarations found in {C_ABI_EXPORT_HEADER_PATH}",
+    )
+    return free_functions
 
-    code = "".join(enabled_lines)
-    result: list[str] = []
-    index = 0
-    state = "code"
-    while index < len(code):
-        current = code[index]
-        following = code[index + 1] if index + 1 < len(code) else ""
-        if state == "code":
-            if current == "/" and following == "/":
-                result.extend((" ", " "))
-                index += 2
-                state = "line_comment"
-                continue
-            if current == "/" and following == "*":
-                result.extend((" ", " "))
-                index += 2
-                state = "block_comment"
-                continue
-            if current == '"':
-                result.append(" ")
-                index += 1
-                state = "string"
-                continue
-            if current == "'":
-                result.append(" ")
-                index += 1
-                state = "character"
-                continue
-            result.append(current)
-        elif state == "line_comment":
-            if current == "\n":
-                result.append(current)
-                state = "code"
-            else:
-                result.append(" ")
-        elif state == "block_comment":
-            if current == "*" and following == "/":
-                result.extend((" ", " "))
-                index += 2
-                state = "code"
-                continue
-            result.append("\n" if current == "\n" else " ")
-        else:
-            if current == "\\" and following:
-                result.extend((" ", "\n" if following == "\n" else " "))
-                index += 2
-                continue
-            terminator = '"' if state == "string" else "'"
-            result.append("\n" if current == "\n" else " ")
-            if current == terminator:
-                state = "code"
-        index += 1
-    return "".join(result)
+
+def format_named_symbol_manifest(
+    sections: dict[str, Sequence[str]], *, header: Sequence[str]
+) -> str:
+    lines = [*header, ""]
+    for section_name in ("declared", "referenced", "unreferenced"):
+        lines.append(f"[{section_name}]")
+        lines.extend(sections[section_name])
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def write_c_abi_symbol_manifest(repo_root: Path | None = None) -> str:
+    exports = collect_c_abi_declared_exports(repo_root)
+    compiled_references = compiled_c_abi_reference_inventory(repo_root=repo_root)
+    require(
+        compiled_references is not None,
+        "standard C/C++ toolchain with nm/llvm-nm is required to regenerate the C ABI symbol manifest",
+    )
+    export_set = set(exports)
+    referenced = tuple(symbol for symbol in compiled_references if symbol in export_set)
+    unreferenced = tuple(symbol for symbol in exports if symbol not in referenced)
+    manifest_text = format_named_symbol_manifest(
+        {
+            "declared": exports,
+            "referenced": referenced,
+            "unreferenced": unreferenced,
+        },
+        header=EXPECTED_C_ABI_SYMBOL_MANIFEST_HEADER,
+    )
+    EXPECTED_C_ABI_SYMBOL_MANIFEST.write_text(manifest_text, encoding="utf-8")
+    load_expected_c_abi_symbol_manifest.cache_clear()
+    return manifest_text
 
 
 def validate_c_abi_symbol_inventory(full_text: str, repo_root: Path | None = None) -> None:
     exports, referenced, unreferenced = collect_c_abi_symbol_inventory(repo_root)
+    manifest = load_expected_c_abi_symbol_manifest()
     require(
         len(exports) == EXPECTED_C_ABI_DECLARED_EXPORTS,
         (
@@ -953,6 +1178,21 @@ def validate_c_abi_symbol_inventory(full_text: str, repo_root: Path | None = Non
             f"expected {EXPECTED_C_ABI_REFERENCED_EXPORTS} C/C++ test-referenced exports, "
             f"found {len(referenced)}"
         ),
+    )
+    require(
+        tuple(exports) == manifest["declared"],
+        (
+            "stale declared C ABI export manifest inventory: "
+            f"expected {manifest['declared'][:3]}..., found {tuple(exports)[:3]}..."
+        ),
+    )
+    require(
+        tuple(referenced) == manifest["referenced"],
+        "stale compiled C ABI referenced-export manifest inventory",
+    )
+    require(
+        tuple(unreferenced) == manifest["unreferenced"],
+        "stale compiled C ABI unreferenced-export manifest inventory",
     )
     require(
         unreferenced == EXPECTED_C_ABI_UNREFERENCED_EXPORTS,
@@ -977,6 +1217,29 @@ def validate_c_abi_symbol_inventory(full_text: str, repo_root: Path | None = Non
     require(
         missing_list in normalized,
         "missing or stale C ABI unreferenced-export list for SB-XCUT-013",
+    )
+
+
+def validate_c_abi_free_inventory(full_text: str, repo_root: Path | None = None) -> None:
+    free_functions = collect_c_abi_free_function_inventory(repo_root)
+    exports, referenced, _unreferenced = collect_c_abi_symbol_inventory(repo_root)
+    require(
+        all(symbol in exports for symbol in free_functions),
+        "C ABI free-function inventory contains symbols not declared in shoal.h",
+    )
+    missing_references = [symbol for symbol in free_functions if symbol not in referenced]
+    require(
+        not missing_references,
+        (
+            "typed C ABI free functions are missing from the compiled reference inventory: "
+            f"{', '.join(missing_references)}"
+        ),
+    )
+    normalized = normalize_whitespace(full_text)
+    free_list = ", ".join(f"`{symbol}`" for symbol in free_functions)
+    require(
+        f"{len(free_functions)} typed free functions — {free_list}" in normalized,
+        "missing or stale typed free-function inventory for SB-XCUT-002",
     )
 
 
@@ -1143,11 +1406,21 @@ def expand_gap_row_references(
             candidates = matches
         elif "…" in entry:
             start, end = [part.strip() for part in entry.split("…", 1)]
+            require(start and end, f"{gap_id} contains an empty range boundary in {entry!r}")
+            require("-" in start and "-" in end, f"{gap_id} contains a malformed range {entry}")
             start_prefix, start_number = start.rsplit("-", 1)
             end_prefix, end_number = end.rsplit("-", 1)
             require(
                 start_prefix == end_prefix,
                 f"{gap_id} mixes prefixes in range {entry}",
+            )
+            require(
+                start_number.isdigit() and end_number.isdigit(),
+                f"{gap_id} contains a non-numeric range {entry}",
+            )
+            require(
+                int(start_number) <= int(end_number),
+                f"{gap_id} contains a descending range {entry}",
             )
             width = max(len(start_number), len(end_number))
             candidates = [
@@ -1161,6 +1434,7 @@ def expand_gap_row_references(
             if row_id not in seen:
                 seen.add(row_id)
                 expanded.append(row_id)
+    require(expanded, f"{gap_id} claims completion without referencing any matrix rows")
     return tuple(expanded)
 
 
@@ -1168,7 +1442,7 @@ def validate_gap_completion_consistency(
     lines: list[str],
     rows: Sequence[tuple[str, str]],
     *,
-    rules: dict[str, str] | None = None,
+    rules: dict[str, tuple[str, ...]] | None = None,
 ) -> None:
     active_rules = GAP_COMPLETION_RULES if rules is None else rules
     gap_rows = parse_gap_completion_tables(lines)
@@ -1285,6 +1559,7 @@ def validate_counts(lines: list[str], full_text: str) -> None:
 
     validate_status_narratives(full_text, status_counts, prefix_counts)
     validate_c_abi_symbol_inventory(full_text)
+    validate_c_abi_free_inventory(full_text)
 
 
 def validate_status_narratives(
@@ -1555,7 +1830,13 @@ def validate_targeted_symbol_anchors(
                 )
 
 
-def main() -> None:
+def main(argv: Sequence[str] | None = None) -> None:
+    args = list(sys.argv[1:] if argv is None else argv)
+    if args == ["--rewrite-cabi-symbol-manifest"]:
+        write_c_abi_symbol_manifest()
+        print("matrix-cabi-symbol-manifest-ok")
+        return
+    require(not args, f"unexpected arguments: {args}")
     full_text = DOC_PATH.read_text(encoding="utf-8")
     lines = full_text.splitlines()
     validate_counts(lines, full_text)

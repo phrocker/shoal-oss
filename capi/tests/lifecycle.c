@@ -647,6 +647,7 @@ int main(void) {
   assert(strcmp(shoal_error_security_user(error), "missing") == 0);
   assert(strcmp(shoal_error_security_code(error), "USER_DOESNT_EXIST") == 0);
   shoal_error_free(&error);
+  shoal_error_free(&error);
   assert(shoal_connector_drop_user(admin_connector, "alice", 0, &error) ==
          SHOAL_STATUS_OK);
 
@@ -716,6 +717,7 @@ int main(void) {
                SHOAL_STATUS_INVALID_ARGUMENT, &error, "result");
   shoal_scan_result_free(&result);
   assert(result == NULL);
+  shoal_scan_result_free(&result);
 
   expect_error(shoal_scanner_close(NULL, &error), SHOAL_STATUS_INVALID_HANDLE,
                &error, "NULL");

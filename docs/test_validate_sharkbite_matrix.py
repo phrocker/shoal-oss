@@ -522,6 +522,30 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
             "SB-GAP-C-001 claims completion without referencing any matrix rows",
         )
 
+    def test_gap_completion_consistency_rejects_descending_ranges(self) -> None:
+        text = "\n".join(load_fixture_lines("gap_completion_valid.md")).replace(
+            "SB-SEC-001…SB-SEC-002",
+            "SB-SEC-002…SB-SEC-001",
+            1,
+        )
+        rows = validator.parse_rows(text.splitlines())[2]
+        self.assert_validation_fails(
+            lambda: validator.validate_gap_completion_consistency(text.splitlines(), rows),
+            "SB-GAP-GO-001 contains a descending range SB-SEC-002…SB-SEC-001",
+        )
+
+    def test_gap_completion_consistency_rejects_empty_range_boundaries(self) -> None:
+        text = "\n".join(load_fixture_lines("gap_completion_valid.md")).replace(
+            "SB-TABLE-001, SB-CPP-016, SB-CPP-017",
+            "SB-TABLE-001…",
+            1,
+        )
+        rows = validator.parse_rows(text.splitlines())[2]
+        self.assert_validation_fails(
+            lambda: validator.validate_gap_completion_consistency(text.splitlines(), rows),
+            "SB-GAP-C-001 contains an empty range boundary in 'SB-TABLE-001…'",
+        )
+
     def test_pinned_inventory_rejects_status_swap_between_rows_in_one_section(self) -> None:
         text = load_document_text()
         first = "| SB-PKG-001 |"
@@ -731,20 +755,34 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
         self.assertEqual(unreferenced, validator.EXPECTED_C_ABI_UNREFERENCED_EXPORTS)
         self.assertIn("shoal_versioned_properties_get", referenced)
 
-    def test_c_symbol_inventory_ignores_non_linking_mentions(self) -> None:
-        text = """
-// shoal_comment_only();
-const char *name = "shoal_string_only";
-#if 0
-shoal_disabled_only();
-#endif
-shoal_live_reference();
-"""
-        stripped = validator.strip_c_non_code(text)
-        self.assertNotIn("shoal_comment_only", stripped)
-        self.assertNotIn("shoal_string_only", stripped)
-        self.assertNotIn("shoal_disabled_only", stripped)
-        self.assertIn("shoal_live_reference", stripped)
+    def test_collect_c_abi_free_function_inventory_matches_header(self) -> None:
+        free_functions = validator.collect_c_abi_free_function_inventory()
+        self.assertEqual(len(free_functions), 14)
+        self.assertIn("shoal_versioned_properties_free", free_functions)
+        self.assertIn("shoal_bytes_list_free", free_functions)
+
+    def test_compiled_c_abi_reference_inventory_ignores_non_linking_mentions(self) -> None:
+        references = validator.compiled_c_abi_reference_inventory(
+            source_paths=(Path("docs/testdata/validate_sharkbite_matrix/cabi_symbol_fixture.c"),),
+            include_paths=(Path("docs/testdata/validate_sharkbite_matrix"),),
+            repo_root=DOCS_DIR.parent,
+        )
+        self.assertIsNotNone(references)
+        assert references is not None
+        self.assertIn("shoal_live_call", references)
+        self.assertIn("shoal_live_address", references)
+        self.assertNotIn("shoal_comment_only", references)
+        self.assertNotIn("shoal_string_only", references)
+        self.assertNotIn("shoal_disabled_only", references)
+
+    def test_stale_typed_free_inventory_narrative_is_rejected(self) -> None:
+        text = load_document_text()
+        mutated = text.replace("14 typed free functions", "8 typed free functions", 1)
+        self.assertNotEqual(mutated, text)
+        self.assert_validation_fails(
+            lambda: validator.validate_counts(mutated.splitlines(), mutated),
+            "missing or stale typed free-function inventory for SB-XCUT-002",
+        )
 
     def test_pinned_inventory_constants_reject_incoherent_edit(self) -> None:
         with mock.patch.object(validator, "EXPECTED_TOTAL_ROWS", 3202):
