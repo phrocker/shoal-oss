@@ -16,6 +16,11 @@ import (
 // use: reads report nothing set, and the first Set allocates the map under the
 // lock. NewConfiguration exists so that a Configuration can be built and
 // populated in one expression.
+//
+// A Configuration must not be copied after first use: it holds a mutex, and
+// its map is reference-backed, so a copy would guard the same entries with a
+// different lock. Pass it by pointer and use Clone when an independent copy is
+// wanted. `go vet`'s copylocks check enforces this.
 type Configuration struct {
 	mu     sync.RWMutex
 	values map[string]string

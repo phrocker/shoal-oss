@@ -220,6 +220,12 @@ func (i *staticInstance) Configuration() *Configuration { return i.configuration
 // live-state accessor reports ErrDiscoveryUnavailable instead of pretending
 // to resolve anything. Embed it to satisfy Instance and override the methods
 // that a particular implementation can answer.
+//
+// Embed it by value, as `struct { accumulo.NoTopology }`, and use the
+// embedding type through a pointer. A nil embedded *NoTopology cannot own
+// state, so Configuration would hand back a different empty Configuration on
+// every call instead of the stable one this type promises; that case is
+// reported rather than silently tolerated.
 type NoTopology struct {
 	configurationOnce sync.Once
 	configuration     *Configuration
@@ -255,11 +261,17 @@ func (*NoTopology) ZooKeepers() []string { return nil }
 // Root returns the empty string, because no instance root is known.
 func (*NoTopology) Root() string { return "" }
 
-// Configuration returns a stable empty Configuration for this stub instance.
-// Embedders that carry client configuration should override it.
+// Configuration returns this stub's own empty Configuration, stable across
+// calls, so writes through it are observed by later calls exactly as they are
+// for a real instance. Embedders that carry client configuration should
+// override it.
+//
+// A nil *NoTopology has nowhere to keep that configuration, so it panics
+// instead of silently returning a fresh Configuration whose writes would be
+// lost. Embed NoTopology by value; see the type documentation.
 func (i *NoTopology) Configuration() *Configuration {
 	if i == nil {
-		return NewConfiguration()
+		panic("accumulo: Configuration called on a nil *NoTopology; embed NoTopology by value")
 	}
 	i.configurationOnce.Do(func() {
 		i.configuration = NewConfiguration()
