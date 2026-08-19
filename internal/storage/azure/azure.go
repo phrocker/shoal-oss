@@ -368,6 +368,7 @@ const (
 	tempStageNamePrefix   = ".shl-"
 	tempStageHashHexLen   = 4
 	tempStageRandomHexLen = 10
+	tempStageMinimumLen   = len(tempStageNamePrefix) + tempStageRandomHexLen
 	tempStageComponentLen = len(tempStageNamePrefix) + tempStageHashHexLen + tempStageRandomHexLen
 	legacyStageDirPrefix  = ".shoal-tmp/"
 	azureCopyBlockSize    = 100 << 20
@@ -384,7 +385,10 @@ var randomStageNameToken = func() (string, error) {
 }
 
 func nextTemporaryStageName(name string) (string, error) {
-	prefix := temporaryStageNamePrefixFor(name)
+	prefix, err := temporaryStageNamePrefixFor(name)
+	if err != nil {
+		return "", err
+	}
 	hash := sha256.Sum256([]byte(name))
 	token, err := randomStageNameToken()
 	if err != nil {
@@ -395,19 +399,34 @@ func nextTemporaryStageName(name string) (string, error) {
 		return "", fmt.Errorf("temporary blob token material too short")
 	}
 	component := tempStageNamePrefix + token[:tempStageRandomHexLen] + hashHex[:tempStageHashHexLen]
-	if utf8.RuneCountInString(prefix)+len(component) > maxBlobNameChars {
-		return "", fmt.Errorf("blob prefix %q leaves no room for a temporary blob", prefix)
+	available := maxBlobNameChars - utf8.RuneCountInString(prefix)
+	if available < tempStageMinimumLen {
+		return "", fmt.Errorf(
+			"blob prefix %q leaves %d characters for a temporary blob; need at least %d",
+			prefix, available, tempStageMinimumLen,
+		)
+	}
+	if len(component) > available {
+		component = component[:available]
 	}
 	return prefix + component, nil
 }
 
-func temporaryStageNamePrefixFor(name string) string {
+func temporaryStageNamePrefixFor(name string) (string, error) {
 	prefix := stageNameParentPrefix(name)
-	for prefix != "" && maxBlobNameChars-utf8.RuneCountInString(prefix) < tempStageComponentLen {
+	for prefix != "" && maxBlobNameChars-utf8.RuneCountInString(prefix) < tempStageMinimumLen {
 		trimmed := strings.TrimSuffix(prefix, "/")
-		prefix = stageNameParentPrefix(trimmed)
+		next := stageNameParentPrefix(trimmed)
+		if next == "" {
+			available := maxBlobNameChars - utf8.RuneCountInString(prefix)
+			return "", fmt.Errorf(
+				"blob prefix %q leaves %d characters for a temporary blob; need at least %d",
+				prefix, available, tempStageMinimumLen,
+			)
+		}
+		prefix = next
 	}
-	return prefix
+	return prefix, nil
 }
 
 func stageNameParentPrefix(name string) string {
@@ -438,12 +457,16 @@ func isLegacyTemporaryStageName(name string) bool {
 }
 
 func isGeneratedTemporaryStageComponent(name string) bool {
-	if len(name) != tempStageComponentLen || !strings.HasPrefix(name, tempStageNamePrefix) {
+	if !strings.HasPrefix(name, tempStageNamePrefix) {
 		return false
 	}
-	token := name[len(tempStageNamePrefix) : len(tempStageNamePrefix)+tempStageRandomHexLen]
-	hash := name[len(tempStageNamePrefix)+tempStageRandomHexLen:]
-	return isLowerHex(token) && isLowerHex(hash)
+	suffix := name[len(tempStageNamePrefix):]
+	if len(suffix) < tempStageRandomHexLen || len(suffix) > tempStageRandomHexLen+tempStageHashHexLen {
+		return false
+	}
+	token := suffix[:tempStageRandomHexLen]
+	hash := suffix[tempStageRandomHexLen:]
+	return isLowerHex(token) && (hash == "" || isLowerHex(hash))
 }
 
 type azureCopySource struct {

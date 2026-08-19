@@ -314,6 +314,60 @@ func TestNextTemporaryStageKeyTrimsToDeepestAncestorPrefixWhenSpaceIsTight(t *te
 	}
 }
 
+func TestNextTemporaryStageKeyRejectsPrefixWithoutFullRandomToken(t *testing.T) {
+	original := randomStageKeyToken
+	randomStageKeyToken = func() (string, error) {
+		return strings.Repeat("b", tempStageRandomHexLen), nil
+	}
+	t.Cleanup(func() {
+		randomStageKeyToken = original
+	})
+
+	key := strings.Repeat("a", 1015) + "/x"
+	if _, err := nextTemporaryStageKey(key); err == nil {
+		t.Fatal("nextTemporaryStageKey succeeded without room for the full random token")
+	}
+}
+
+func TestNextTemporaryStageKeyKeepsFullRandomTokenAtMinimumSpace(t *testing.T) {
+	original := randomStageKeyToken
+	tokens := []string{
+		strings.Repeat("c", tempStageRandomHexLen),
+		strings.Repeat("d", tempStageRandomHexLen),
+	}
+	randomStageKeyToken = func() (string, error) {
+		token := tokens[0]
+		tokens = tokens[1:]
+		return token, nil
+	}
+	t.Cleanup(func() {
+		randomStageKeyToken = original
+	})
+
+	key := strings.Repeat("a", 1008) + "/x"
+	stageKey, err := nextTemporaryStageKey(key)
+	if err != nil {
+		t.Fatalf("nextTemporaryStageKey: %v", err)
+	}
+	if got, want := stageKeyParentPrefix(stageKey), stageKeyParentPrefix(key); got != want {
+		t.Fatalf("stage prefix = %q, want %q", got, want)
+	}
+	component := stageKey[len(stageKeyParentPrefix(stageKey)):]
+	if got, want := component, tempStageKeyPrefix+strings.Repeat("c", tempStageRandomHexLen); got != want {
+		t.Fatalf("temporary component = %q, want %q", got, want)
+	}
+	if !isTemporaryStageKey(stageKey) {
+		t.Fatalf("temporary key %q is visible to List", stageKey)
+	}
+	other, err := nextTemporaryStageKey(key)
+	if err != nil {
+		t.Fatalf("second nextTemporaryStageKey: %v", err)
+	}
+	if other == stageKey {
+		t.Fatalf("distinct random tokens produced the same temporary key %q", stageKey)
+	}
+}
+
 func TestNextTemporaryStageKeyPreservesFullEntropyWhenPrefixTrims(t *testing.T) {
 	original := randomStageKeyToken
 	randomStageKeyToken = func() (string, error) {
@@ -351,6 +405,9 @@ func TestIsTemporaryStageKeyMatchesOnlyReservedFormats(t *testing.T) {
 	}
 	if !isTemporaryStageKey("tenant/.shl-aaaaaaaaaa1234") {
 		t.Fatal("generated temporary stage key was not detected")
+	}
+	if !isTemporaryStageKey("tenant/.shl-aaaaaaaaaa") {
+		t.Fatal("minimum generated temporary stage key was not detected")
 	}
 	if isTemporaryStageKey(".shoal-tmp/user-visible") {
 		t.Fatal("arbitrary .shoal-tmp/ key should remain visible")

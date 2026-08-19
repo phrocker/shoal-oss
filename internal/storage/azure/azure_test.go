@@ -386,6 +386,60 @@ func TestNextTemporaryStageNameUsesCharacterLimitInsteadOfUTF8Bytes(t *testing.T
 	}
 }
 
+func TestNextTemporaryStageNameRejectsPrefixWithoutFullRandomToken(t *testing.T) {
+	original := randomStageNameToken
+	randomStageNameToken = func() (string, error) {
+		return strings.Repeat("b", tempStageRandomHexLen), nil
+	}
+	t.Cleanup(func() {
+		randomStageNameToken = original
+	})
+
+	name := strings.Repeat("界", 1015) + "/x"
+	if _, err := nextTemporaryStageName(name); err == nil {
+		t.Fatal("nextTemporaryStageName succeeded without room for the full random token")
+	}
+}
+
+func TestNextTemporaryStageNameKeepsFullRandomTokenAtMinimumSpace(t *testing.T) {
+	original := randomStageNameToken
+	tokens := []string{
+		strings.Repeat("c", tempStageRandomHexLen),
+		strings.Repeat("d", tempStageRandomHexLen),
+	}
+	randomStageNameToken = func() (string, error) {
+		token := tokens[0]
+		tokens = tokens[1:]
+		return token, nil
+	}
+	t.Cleanup(func() {
+		randomStageNameToken = original
+	})
+
+	name := strings.Repeat("界", 1008) + "/x"
+	stageName, err := nextTemporaryStageName(name)
+	if err != nil {
+		t.Fatalf("nextTemporaryStageName: %v", err)
+	}
+	if got, want := stageNameParentPrefix(stageName), stageNameParentPrefix(name); got != want {
+		t.Fatalf("stage prefix = %q, want %q", got, want)
+	}
+	component := stageName[len(stageNameParentPrefix(stageName)):]
+	if got, want := component, tempStageNamePrefix+strings.Repeat("c", tempStageRandomHexLen); got != want {
+		t.Fatalf("temporary component = %q, want %q", got, want)
+	}
+	if !isTemporaryStageName(stageName) {
+		t.Fatalf("temporary blob %q is visible to List", stageName)
+	}
+	other, err := nextTemporaryStageName(name)
+	if err != nil {
+		t.Fatalf("second nextTemporaryStageName: %v", err)
+	}
+	if other == stageName {
+		t.Fatalf("distinct random tokens produced the same temporary blob %q", stageName)
+	}
+}
+
 func TestNextTemporaryStageNameTrimsToDeepestAncestorPrefixWhenSpaceIsTight(t *testing.T) {
 	original := randomStageNameToken
 	randomStageNameToken = func() (string, error) {
@@ -440,6 +494,9 @@ func TestIsTemporaryStageNameMatchesOnlyReservedFormats(t *testing.T) {
 	}
 	if !isTemporaryStageName("tenant/.shl-aaaaaaaaaa1234") {
 		t.Fatal("generated temporary stage blob was not detected")
+	}
+	if !isTemporaryStageName("tenant/.shl-aaaaaaaaaa") {
+		t.Fatal("minimum generated temporary stage blob was not detected")
 	}
 	if isTemporaryStageName(".shoal-tmp/user-visible") {
 		t.Fatal("arbitrary .shoal-tmp/ blob should remain visible")

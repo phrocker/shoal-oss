@@ -218,6 +218,7 @@ const (
 	tempObjectPrefix       = ".shl-"
 	tempObjectHashHexLen   = 4
 	tempObjectRandomHexLen = 10
+	tempObjectMinimumLen   = len(tempObjectPrefix) + tempObjectRandomHexLen
 	tempObjectComponentLen = len(tempObjectPrefix) + tempObjectHashHexLen + tempObjectRandomHexLen
 	legacyTempObjectPrefix = ".shoal-tmp-"
 )
@@ -231,7 +232,10 @@ var randomTempObjectToken = func() (string, error) {
 }
 
 func nextTemporaryObjectName(object string) (string, error) {
-	prefix := temporaryObjectPrefixFor(object)
+	prefix, err := temporaryObjectPrefixFor(object)
+	if err != nil {
+		return "", err
+	}
 	hash := sha256.Sum256([]byte(object))
 	token, err := randomTempObjectToken()
 	if err != nil {
@@ -242,11 +246,15 @@ func nextTemporaryObjectName(object string) (string, error) {
 		return "", fmt.Errorf("temporary object token material too short")
 	}
 	component := temporaryObjectComponent(hashHex, token)
-	if len(component) > maxObjectSegmentBytes {
-		return "", fmt.Errorf("temporary object component exceeds segment limit")
+	available := min(maxObjectNameBytes-len(prefix), maxObjectSegmentBytes)
+	if available < tempObjectMinimumLen {
+		return "", fmt.Errorf(
+			"object prefix %q leaves %d bytes for a temporary object; need at least %d",
+			prefix, available, tempObjectMinimumLen,
+		)
 	}
-	if len(prefix)+len(component) > maxObjectNameBytes {
-		return "", fmt.Errorf("object prefix %q leaves no room for a temporary object", prefix)
+	if len(component) > available {
+		component = component[:available]
 	}
 	return prefix + component, nil
 }
@@ -258,13 +266,21 @@ func tempObjectParentPrefix(object string) string {
 	return ""
 }
 
-func temporaryObjectPrefixFor(object string) string {
+func temporaryObjectPrefixFor(object string) (string, error) {
 	prefix := tempObjectParentPrefix(object)
-	for prefix != "" && maxObjectNameBytes-len(prefix) < tempObjectComponentLen {
+	for prefix != "" && min(maxObjectNameBytes-len(prefix), maxObjectSegmentBytes) < tempObjectMinimumLen {
 		trimmed := strings.TrimSuffix(prefix, "/")
-		prefix = tempObjectParentPrefix(trimmed)
+		next := tempObjectParentPrefix(trimmed)
+		if next == "" {
+			available := min(maxObjectNameBytes-len(prefix), maxObjectSegmentBytes)
+			return "", fmt.Errorf(
+				"object prefix %q leaves %d bytes for a temporary object; need at least %d",
+				prefix, available, tempObjectMinimumLen,
+			)
+		}
+		prefix = next
 	}
-	return prefix
+	return prefix, nil
 }
 
 func temporaryObjectComponent(hash, token string) string {
@@ -289,12 +305,16 @@ func isLegacyTemporaryObjectName(name string) bool {
 }
 
 func isGeneratedTemporaryObjectComponent(name string) bool {
-	if len(name) != tempObjectComponentLen || !strings.HasPrefix(name, tempObjectPrefix) {
+	if !strings.HasPrefix(name, tempObjectPrefix) {
 		return false
 	}
-	token := name[len(tempObjectPrefix) : len(tempObjectPrefix)+tempObjectRandomHexLen]
-	hash := name[len(tempObjectPrefix)+tempObjectRandomHexLen:]
-	return isLowerHex(token) && isLowerHex(hash)
+	suffix := name[len(tempObjectPrefix):]
+	if len(suffix) < tempObjectRandomHexLen || len(suffix) > tempObjectRandomHexLen+tempObjectHashHexLen {
+		return false
+	}
+	token := suffix[:tempObjectRandomHexLen]
+	hash := suffix[tempObjectRandomHexLen:]
+	return isLowerHex(token) && (hash == "" || isLowerHex(hash))
 }
 
 func isLowerHex(value string) bool {
