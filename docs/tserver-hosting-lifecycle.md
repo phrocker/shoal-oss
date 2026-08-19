@@ -399,10 +399,16 @@ dereferences it. A lock without that descriptor produces a null address
 and a `NullPointerException` inside the scan — not a server the manager
 skips, but a scan that stops, taking every other tablet server in that
 pass with it. One Shoal registration would be enough, and it would repeat
-on every scan for as long as the lock was held. So the check is at the
-publication gate rather than in the constructor, which a caller building
-`ServiceLockData` directly does not go through: a lock that registers a
-server and does not advertise `TSERV` is refused before it is created.
+on every scan for as long as the lock was held.
+
+So it is refused in both places. `TabletServerLockData` will not build a
+payload without it, which is where a caller finds out — at the call that
+names the subset, rather than at an acquisition that fails much later
+with a value it can no longer change. The publication gate refuses it
+again, because `ServiceLockData` is an ordinary struct and a caller that
+builds one directly never goes through the constructor: a lock that
+registers a server and does not advertise `TSERV` is refused before it is
+created.
 
 That is the reason a process which cannot serve `TSERV` yet belongs
 outside the tree rather than in it with a smaller advertisement.
@@ -601,6 +607,21 @@ where it was. Ending it there would let a recreated directory
 interleaved with transient ZooKeeper failures refuse every reading and
 never be reported.
 
+The reader is expected to hold one session across polls, and the watch
+is written to make that cheap: it reads the directory exactly once per
+interval, so the only cost per interval is one `getChildren`. A reader
+that connects per read turns each of those into a handshake, an
+authentication and a close instead — per server, forever, against an
+ensemble that is also serving every other client in the cluster.
+`internal/zk.Locator` is that reader today on the cancellable path, and
+reuses its session only on the path that cannot be cancelled, which is
+not a poll a process can shut down. Wiring the watch into a running
+server therefore waits on a cancellable reader that reuses its session,
+or on one backed by a ZooKeeper watch instead of a poll; that is a
+prerequisite of the process-wiring slice, recorded in
+[§7](#7-what-is-not-here-yet), not something this package can fix from
+behind the interface.
+
 ## 7. What is not here yet
 
 This is the lifecycle core only. Still to land for #67:
@@ -617,7 +638,11 @@ This is the lifecycle core only. Still to land for #67:
   this into a cluster yet
 - the process wiring that owns the ZooKeeper session, chooses the
   advertised address and resource group, and restarts participation after
-  a lock loss
+  a lock loss. It also needs a manager-lock reader that holds one session
+  across polls — `WatchManagerLock` reads once per interval, but
+  `internal/zk.Locator` opens and closes a connection per read whenever
+  the context can be cancelled, which is one session per interval per
+  tablet server. That belongs in `internal/zk`, not here
 - publishing the `Metrics()` counters through the observability endpoints
 - end-to-end tests against a live manager, including migration to and
   from a Java tserver and rolling mixed-fleet replacement

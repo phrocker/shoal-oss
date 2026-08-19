@@ -418,7 +418,9 @@ func TestQueueLeavesNoWatchOnItsOwnNodeOnceItIsGone(t *testing.T) {
 
 // TestAcquireStopsWhenItsOwnNodeIsRemovedWhileQueued covers an operator or a
 // session hiccup taking this process out of the queue. Waiting on a place in
-// line that no longer exists would hang forever.
+// line that no longer exists would hang forever. Only this process's own node
+// is deleted: the holder stays where it is, so nothing but the watch on the
+// node that went can end the wait.
 func TestAcquireStopsWhenItsOwnNodeIsRemovedWhileQueued(t *testing.T) {
 	f := newFakeZK()
 	holder := f.seedForeignLock(testLockPath(), otherUUID, 0)
@@ -431,17 +433,19 @@ func TestAcquireStopsWhenItsOwnNodeIsRemovedWhileQueued(t *testing.T) {
 		done <- err
 	}()
 
+	// The predecessor watch is armed last, so the queue is fully parked: the
+	// own-node watch is already outstanding and no listing is in flight.
 	waitArmed(t, f, holderPath)
 	if err := f.Delete(path.Join(testLockPath(), "zlock#"+serverUUID+"#0000000001"), -1); err != nil {
 		t.Fatalf("delete our queued node: %v", err)
 	}
-	// Wake the wait so it re-reads and finds itself gone.
-	if err := f.Delete(holderPath, -1); err != nil {
-		t.Fatalf("delete the holder's node: %v", err)
-	}
 
 	if err := <-done; !errors.Is(err, ErrLockNodeMissing) {
 		t.Fatalf("Acquire: want ErrLockNodeMissing, got %v", err)
+	}
+	// The holder never moved, so the wait ended on the own-node watch.
+	if !f.exists(holderPath) {
+		t.Fatalf("%s went away; the wait may have ended on the predecessor instead", holderPath)
 	}
 }
 

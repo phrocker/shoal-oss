@@ -42,6 +42,21 @@ var ErrNoManagerLock = errors.New("tserver: no manager lock held")
 // holds the manager lock. *internal/zk.Locator satisfies it, so the component
 // that resolves tablet locations is the one that observes manager authority.
 //
+// An implementation is read once per poll interval for as long as the process
+// runs, so it has to serve those reads from a session it keeps. One that
+// connects per read turns a steady observation into steady session churn:
+// every tablet server in the fleet would open, authenticate and close a
+// ZooKeeper session on every interval, which is a connect-and-auth round trip
+// per server per interval and counts against the ensemble's per-client
+// connection limit.
+//
+// internal/zk.Locator does that today when the context can be cancelled — it
+// takes a scoped connection per read and closes it — and reuses its own
+// session only when the context cannot be. Neither half is usable here as it
+// stands: a poll that cannot be cancelled cannot be shut down. Wiring this
+// into a process therefore needs a reader that serves cancellable reads from
+// one session; see the note in docs/tserver-hosting-lifecycle.md.
+//
 // Reads are not assumed to be monotonic across calls. ZooKeeper promises a
 // client its own reads never go backwards within a session, but that is a
 // promise about a session, and an implementation is free to use more than one:
@@ -105,6 +120,11 @@ func ReadManagerLock(ctx context.Context, reader ManagerLockReader) (LockID, err
 
 // WatchManagerLock keeps a Host's view of live manager authority in step with
 // ZooKeeper until ctx ends, polling every interval.
+//
+// It reads exactly once per interval, so the load a fleet puts on ZooKeeper is
+// one read per server per interval and nothing hidden behind it. What that
+// read costs is the reader's: see ManagerLockReader on why it has to be one
+// that keeps a session.
 //
 // This is what makes manager-directed transitions possible at all: Host
 // refuses every one of them until it has been told which manager is live, and

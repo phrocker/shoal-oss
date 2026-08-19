@@ -137,7 +137,7 @@ func TestTabletServerLockDataRefusesAGroupAccumuloWouldReject(t *testing.T) {
 		}
 		t.Run(group, func(t *testing.T) {
 			if _, err := TabletServerLockData(serverUUID, testAddress, group,
-				ServiceClient); !errors.Is(err, ErrInvalidLockData) {
+				ServiceTabletServer); !errors.Is(err, ErrInvalidLockData) {
 				t.Fatalf("want ErrInvalidLockData, got %v", err)
 			}
 		})
@@ -145,7 +145,7 @@ func TestTabletServerLockDataRefusesAGroupAccumuloWouldReject(t *testing.T) {
 	for _, group := range validResourceGroups() {
 		t.Run("accepts "+group, func(t *testing.T) {
 			if _, err := TabletServerLockData(serverUUID, testAddress, group,
-				ServiceClient); err != nil {
+				ServiceTabletServer); err != nil {
 				t.Fatalf("TabletServerLockData(%q): %v", group, err)
 			}
 		})
@@ -238,7 +238,7 @@ func TestServiceDescriptorRefusesNonCanonicalUUID(t *testing.T) {
 func TestTabletServerLockDataRefusesNonCanonicalUUID(t *testing.T) {
 	for name, value := range nonCanonicalUUIDs() {
 		t.Run(name, func(t *testing.T) {
-			_, err := TabletServerLockData(value, testAddress, testGroup, ServiceClient)
+			_, err := TabletServerLockData(value, testAddress, testGroup, ServiceTabletServer)
 			if !errors.Is(err, ErrInvalidLockData) {
 				t.Fatalf("TabletServerLockData(%q) = %v, want ErrInvalidLockData", value, err)
 			}
@@ -305,7 +305,8 @@ func TestTabletServerLockDataMatchesTheAccumuloWireForm(t *testing.T) {
 // reader is how a Shoal process becomes visible to Shoal's own clients, so it
 // has to be able to read what this package writes.
 func TestEncodedLockDataIsReadableByTheLiveServerReader(t *testing.T) {
-	data, err := TabletServerLockData(serverUUID, testAddress, "ingest", ServiceClient, ServiceTabletScan)
+	data, err := TabletServerLockData(serverUUID, testAddress, "ingest",
+		ServiceClient, ServiceTabletScan, ServiceTabletServer)
 	if err != nil {
 		t.Fatalf("TabletServerLockData: %v", err)
 	}
@@ -429,7 +430,7 @@ func TestWildcardListenAddressIsRefused(t *testing.T) {
 		"[0:0:0:0:0:0:0:0]:9997",
 	} {
 		t.Run(address, func(t *testing.T) {
-			_, err := TabletServerLockData(serverUUID, address, testGroup, ServiceClient)
+			_, err := TabletServerLockData(serverUUID, address, testGroup, ServiceTabletServer)
 			if !errors.Is(err, ErrInvalidLockData) {
 				t.Fatalf("TabletServerLockData(%q): want ErrInvalidLockData, got %v", address, err)
 			}
@@ -442,7 +443,7 @@ func TestWildcardListenAddressIsRefused(t *testing.T) {
 		"10.0.0.7:9997",
 	} {
 		t.Run(address, func(t *testing.T) {
-			if _, err := TabletServerLockData(serverUUID, address, testGroup, ServiceClient); err != nil {
+			if _, err := TabletServerLockData(serverUUID, address, testGroup, ServiceTabletServer); err != nil {
 				t.Fatalf("TabletServerLockData(%q): %v", address, err)
 			}
 		})
@@ -477,7 +478,7 @@ func TestTabletServerLockDataRefusesAnEmptyServiceSet(t *testing.T) {
 // TestTabletServerLockDataDefaultsTheResourceGroup mirrors Accumulo, where a
 // server with no configured group belongs to "default".
 func TestTabletServerLockDataDefaultsTheResourceGroup(t *testing.T) {
-	data, err := TabletServerLockData(serverUUID, testAddress, "", ServiceClient)
+	data, err := TabletServerLockData(serverUUID, testAddress, "", ServiceTabletServer)
 	if err != nil {
 		t.Fatalf("TabletServerLockData: %v", err)
 	}
@@ -536,9 +537,11 @@ func TestTabletServerServicesIsTheJavaSet(t *testing.T) {
 
 // TestAdvertisingASubsetIsAllowed is the capability story: a process that has
 // scans but not the write path advertises exactly that, so the manager routes
-// it what it can serve rather than what it aspires to.
+// it what it can serve rather than what it aspires to. TSERV is not part of
+// the choice — see below.
 func TestAdvertisingASubsetIsAllowed(t *testing.T) {
-	data, err := TabletServerLockData(serverUUID, testAddress, testGroup, ServiceClient, ServiceTabletScan)
+	data, err := TabletServerLockData(serverUUID, testAddress, testGroup,
+		ServiceClient, ServiceTabletScan, ServiceTabletServer)
 	if err != nil {
 		t.Fatalf("TabletServerLockData: %v", err)
 	}
@@ -547,6 +550,30 @@ func TestAdvertisingASubsetIsAllowed(t *testing.T) {
 	}
 	if _, ok := data.Address(ServiceTabletIngest); ok {
 		t.Fatal("a service that was not advertised must not resolve")
+	}
+}
+
+// TestTabletServerLockDataRequiresTSERV is the one service the subset cannot
+// leave out. The manager reads TSERV off every lock in the tablet-server tree
+// and dereferences the address it finds there, so a payload without it cannot
+// be published on the lock this constructor is named for. Acquire refuses it
+// too; refusing it here reports the mistake where it was made.
+func TestTabletServerLockDataRequiresTSERV(t *testing.T) {
+	for _, services := range [][]ThriftService{
+		{ServiceClient},
+		{ServiceClient, ServiceTabletScan},
+		{ServiceClient, ServiceTabletIngest, ServiceTabletManagement, ServiceTabletScan},
+	} {
+		_, err := TabletServerLockData(serverUUID, testAddress, testGroup, services...)
+		if !errors.Is(err, ErrInvalidLockData) {
+			t.Fatalf("TabletServerLockData(%v) = %v, want ErrInvalidLockData", services, err)
+		}
+		if !strings.Contains(err.Error(), string(ServiceTabletServer)) {
+			t.Fatalf("TabletServerLockData(%v) = %v, want the missing service named", services, err)
+		}
+	}
+	if _, err := TabletServerLockData(serverUUID, testAddress, testGroup, ServiceTabletServer); err != nil {
+		t.Fatalf("TabletServerLockData with only TSERV: %v", err)
 	}
 }
 

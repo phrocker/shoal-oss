@@ -468,6 +468,31 @@ func TestWatchManagerLockReportsNowhereWithoutACallback(t *testing.T) {
 	}
 }
 
+// TestWatchManagerLockReadsOncePerInterval bounds what a fleet costs the
+// ensemble. Every tablet server runs one of these, and a reader may pay for a
+// connection and an authentication per read, so the interval has to be the
+// whole story: a second read per pass, or a wait that spins, multiplies that
+// cost by the size of the fleet.
+func TestWatchManagerLockReadsOncePerInterval(t *testing.T) {
+	const interval = 25 * time.Millisecond
+	host := NewHost()
+	reader := &fakeManagerReader{children: []string{managerNode(managerUUID, 2)}}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = WatchManagerLock(ctx, reader, host, interval, nil) }()
+	waitFor(t, "the watch to start polling", func() bool { return reader.readCount() >= 2 })
+
+	start, before := time.Now(), reader.readCount()
+	time.Sleep(20 * interval)
+	elapsed, reads := time.Since(start), reader.readCount()-before
+	// Measured against the time that actually passed, so a machine too busy to
+	// keep the interval reads fewer rather than failing. Two are allowed on
+	// top: one in flight at each end of the window.
+	if most := int(elapsed/interval) + 2; reads > most {
+		t.Fatalf("%d reads in %s at a %s interval, want at most %d", reads, elapsed, interval, most)
+	}
+}
+
 // TestWatchManagerLockRidesOutAReadingThatWentBackwards is the other side of
 // the test above. Readings are not monotonic across calls — a reader that
 // opens a session per read can land on a ZooKeeper server that has not caught

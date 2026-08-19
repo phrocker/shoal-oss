@@ -284,6 +284,12 @@ type serviceLockDataJSON struct {
 // compactors, which advertise on their own locks; a tablet server publishing
 // one of them would be claiming an endpoint another role owns and pointing it
 // at a process that does not implement it.
+//
+// TSERV has to be one of them. The manager reads that descriptor off every
+// lock in the tablet-server tree and dereferences the address it finds, so a
+// payload without it cannot be published on the lock this constructor names —
+// ServiceLock.Acquire refuses it, and refusing it here means the caller learns
+// so where the mistake is rather than at acquisition time.
 func TabletServerLockData(serverUUID, address, group string, services ...ThriftService) (ServiceLockData, error) {
 	if group == "" {
 		group = DefaultResourceGroup
@@ -291,11 +297,15 @@ func TabletServerLockData(serverUUID, address, group string, services ...ThriftS
 	if len(services) == 0 {
 		return ServiceLockData{}, fmt.Errorf("%w: no services to advertise", ErrInvalidLockData)
 	}
+	advertisesTabletServer := false
 	data := ServiceLockData{Descriptors: make([]ServiceDescriptor, 0, len(services))}
 	for _, service := range services {
 		if _, ours := tabletServerServiceSet[service]; !ours {
 			return ServiceLockData{}, fmt.Errorf("%w: %q is not a tablet-server service",
 				ErrInvalidLockData, service)
+		}
+		if service == ServiceTabletServer {
+			advertisesTabletServer = true
 		}
 		data.Descriptors = append(data.Descriptors, ServiceDescriptor{
 			UUID:    serverUUID,
@@ -303,6 +313,10 @@ func TabletServerLockData(serverUUID, address, group string, services ...ThriftS
 			Address: address,
 			Group:   group,
 		})
+	}
+	if !advertisesTabletServer {
+		return ServiceLockData{}, fmt.Errorf("%w: a tablet server must advertise %s, which the manager reads off every lock in the tree",
+			ErrInvalidLockData, ServiceTabletServer)
 	}
 	if err := data.Validate(); err != nil {
 		return ServiceLockData{}, err
