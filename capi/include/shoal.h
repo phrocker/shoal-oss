@@ -175,6 +175,172 @@ shoal_table_properties_get(const shoal_table_properties_result *result,
 SHOAL_API void SHOAL_CALL
 shoal_table_properties_free(shoal_table_properties_result **result);
 
+/* Namespace names and IDs are owned by the result and sorted by name. */
+SHOAL_API shoal_status SHOAL_CALL
+shoal_connector_list_namespaces(shoal_connector *connector, int64_t timeout_ms,
+                                shoal_namespace_list_result **out_result,
+                                shoal_error **out_error);
+SHOAL_API size_t SHOAL_CALL
+shoal_namespace_list_count(const shoal_namespace_list_result *result);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_namespace_list_get(const shoal_namespace_list_result *result,
+                         size_t index, shoal_namespace_view *out_namespace,
+                         shoal_error **out_error);
+SHOAL_API void SHOAL_CALL
+shoal_namespace_list_free(shoal_namespace_list_result **result);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_connector_namespace_exists(shoal_connector *connector,
+                                 const char *namespace_name,
+                                 int64_t timeout_ms, uint8_t *out_exists,
+                                 shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_connector_create_namespace(shoal_connector *connector,
+                                 const char *namespace_name,
+                                 int64_t timeout_ms, shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_connector_delete_namespace(shoal_connector *connector,
+                                 const char *namespace_name,
+                                 int64_t timeout_ms, shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_connector_rename_namespace(shoal_connector *connector,
+                                 const char *namespace_name,
+                                 const char *new_namespace_name,
+                                 int64_t timeout_ms, shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_connector_set_namespace_property(
+    shoal_connector *connector, const char *namespace_name,
+    const char *property_name, const char *property_value, int64_t timeout_ms,
+    shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_connector_remove_namespace_property(
+    shoal_connector *connector, const char *namespace_name,
+    const char *property_name, int64_t timeout_ms, shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_connector_effective_namespace_properties(
+    shoal_connector *connector, const char *namespace_name,
+    int64_t timeout_ms, shoal_namespace_properties_result **out_result,
+    shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_connector_namespace_properties(
+    shoal_connector *connector, const char *namespace_name,
+    int64_t timeout_ms, shoal_namespace_properties_result **out_result,
+    shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_connector_versioned_namespace_properties(
+    shoal_connector *connector, const char *namespace_name,
+    int64_t timeout_ms, shoal_versioned_properties_result **out_result,
+    shoal_error **out_error);
+SHOAL_API size_t SHOAL_CALL
+shoal_namespace_properties_count(
+    const shoal_namespace_properties_result *result);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_namespace_properties_get(
+    const shoal_namespace_properties_result *result, size_t index,
+    shoal_table_property_view *out_entry, shoal_error **out_error);
+SHOAL_API void SHOAL_CALL
+shoal_namespace_properties_free(shoal_namespace_properties_result **result);
+SHOAL_API int64_t SHOAL_CALL
+shoal_versioned_properties_version(
+    const shoal_versioned_properties_result *result);
+SHOAL_API size_t SHOAL_CALL
+shoal_versioned_properties_count(
+    const shoal_versioned_properties_result *result);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_versioned_properties_get(
+    const shoal_versioned_properties_result *result, size_t index,
+    shoal_table_property_view *out_entry, shoal_error **out_error);
+SHOAL_API void SHOAL_CALL
+shoal_versioned_properties_free(shoal_versioned_properties_result **result);
+
+/*
+ * Password, authorization, and split inputs are copied before return.
+ * A non-NULL password struct with {NULL, 0} represents an empty password.
+ */
+SHOAL_API shoal_status SHOAL_CALL
+shoal_connector_create_user(shoal_connector *connector, const char *user,
+                            const shoal_bytes *password, int64_t timeout_ms,
+                            shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_connector_drop_user(shoal_connector *connector, const char *user,
+                          int64_t timeout_ms, shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_connector_change_password(shoal_connector *connector, const char *user,
+                                const shoal_bytes *password,
+                                int64_t timeout_ms, shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_connector_change_user_authorizations(
+    shoal_connector *connector, const char *user,
+    const shoal_bytes *authorizations, size_t authorization_count,
+    int64_t timeout_ms, shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_connector_get_user_authorizations(
+    shoal_connector *connector, const char *user, int64_t timeout_ms,
+    shoal_bytes_list_result **out_result, shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_connector_has_system_permission(
+    shoal_connector *connector, const char *user,
+    shoal_system_permission permission, int64_t timeout_ms,
+    uint8_t *out_has_permission, shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_connector_has_table_permission(
+    shoal_connector *connector, const char *user, const char *table_name,
+    shoal_table_permission permission, int64_t timeout_ms,
+    uint8_t *out_has_permission, shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_connector_has_namespace_permission(
+    shoal_connector *connector, const char *user, const char *namespace_name,
+    shoal_namespace_permission permission, int64_t timeout_ms,
+    uint8_t *out_has_permission, shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_connector_grant_system_permission(
+    shoal_connector *connector, const char *user,
+    shoal_system_permission permission, int64_t timeout_ms,
+    shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_connector_revoke_system_permission(
+    shoal_connector *connector, const char *user,
+    shoal_system_permission permission, int64_t timeout_ms,
+    shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_connector_grant_table_permission(
+    shoal_connector *connector, const char *user, const char *table_name,
+    shoal_table_permission permission, int64_t timeout_ms,
+    shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_connector_revoke_table_permission(
+    shoal_connector *connector, const char *user, const char *table_name,
+    shoal_table_permission permission, int64_t timeout_ms,
+    shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_connector_grant_namespace_permission(
+    shoal_connector *connector, const char *user, const char *namespace_name,
+    shoal_namespace_permission permission, int64_t timeout_ms,
+    shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_connector_revoke_namespace_permission(
+    shoal_connector *connector, const char *user, const char *namespace_name,
+    shoal_namespace_permission permission, int64_t timeout_ms,
+    shoal_error **out_error);
+
+SHOAL_API shoal_status SHOAL_CALL
+shoal_connector_list_table_splits(shoal_connector *connector,
+                                  const char *table_name, int64_t timeout_ms,
+                                  shoal_bytes_list_result **out_result,
+                                  shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_connector_add_table_splits(shoal_connector *connector,
+                                 const char *table_name,
+                                 const shoal_bytes *splits,
+                                 size_t split_count, int64_t timeout_ms,
+                                 shoal_error **out_error);
+SHOAL_API size_t SHOAL_CALL
+shoal_bytes_list_count(const shoal_bytes_list_result *result);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_bytes_list_get(const shoal_bytes_list_result *result, size_t index,
+                     shoal_bytes *out_value, shoal_error **out_error);
+SHOAL_API void SHOAL_CALL
+shoal_bytes_list_free(shoal_bytes_list_result **result);
+
 /*
  * Creates a scanner. The configuration and all nested values are copied.
  * Scanner handles remain valid after connector free, but once connector close
@@ -359,6 +525,12 @@ SHOAL_API shoal_status SHOAL_CALL shoal_error_code(const shoal_error *error);
  */
 SHOAL_API const char *SHOAL_CALL
 shoal_error_message(const shoal_error *error);
+
+/* Borrowed structured Accumulo security details, or NULL when not applicable. */
+SHOAL_API const char *SHOAL_CALL
+shoal_error_security_user(const shoal_error *error);
+SHOAL_API const char *SHOAL_CALL
+shoal_error_security_code(const shoal_error *error);
 
 /*
  * Releases an owned error and sets *error to NULL. Passing NULL or a pointer

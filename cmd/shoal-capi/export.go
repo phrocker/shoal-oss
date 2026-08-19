@@ -229,6 +229,16 @@ func shoal_error_message(err *C.shoal_error) *C.char {
 	return C.shoal_bridge_error_message(err)
 }
 
+//export shoal_error_security_user
+func shoal_error_security_user(err *C.shoal_error) *C.char {
+	return C.shoal_bridge_error_security_user(err)
+}
+
+//export shoal_error_security_code
+func shoal_error_security_code(err *C.shoal_error) *C.char {
+	return C.shoal_bridge_error_security_code(err)
+}
+
 //export shoal_error_free
 func shoal_error_free(err **C.shoal_error) {
 	if err == nil || *err == nil {
@@ -450,8 +460,27 @@ func cStringData(value string) *C.char {
 	return (*C.char)(unsafe.Pointer(unsafe.StringData(value)))
 }
 
-func bridgeErrorAlloc(code C.shoal_status, message string) *C.shoal_error {
-	return C.shoal_bridge_error_alloc(code, cStringData(message), C.size_t(len(message)))
+func bridgeErrorAlloc(code C.shoal_status, err error) *C.shoal_error {
+	message := ""
+	user := ""
+	securityCode := ""
+	if err != nil {
+		message = err.Error()
+		var securityErr *accumulo.SecurityError
+		if errors.As(err, &securityErr) {
+			user = securityErr.User
+			securityCode = securityErr.Code
+		}
+	}
+	return C.shoal_bridge_error_alloc(
+		code,
+		cStringData(message),
+		C.size_t(len(message)),
+		cStringData(user),
+		C.size_t(len(user)),
+		cStringData(securityCode),
+		C.size_t(len(securityCode)),
+	)
 }
 
 func fail(outError **C.shoal_error, code C.shoal_status, err error) C.shoal_status {
@@ -459,11 +488,7 @@ func fail(outError **C.shoal_error, code C.shoal_status, err error) C.shoal_stat
 		return code
 	}
 	*outError = nil
-	message := ""
-	if err != nil {
-		message = err.Error()
-	}
-	*outError = bridgeErrorAlloc(code, message)
+	*outError = bridgeErrorAlloc(code, err)
 	if *outError == nil {
 		return C.SHOAL_STATUS_OUT_OF_MEMORY
 	}

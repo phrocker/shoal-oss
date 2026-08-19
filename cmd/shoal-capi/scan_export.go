@@ -753,13 +753,36 @@ func statusForError(err error) C.shoal_status {
 		return C.SHOAL_STATUS_NOT_FOUND
 	case errors.Is(err, accumulo.ErrTableExists):
 		return C.SHOAL_STATUS_ALREADY_EXISTS
+	case errors.Is(err, accumulo.ErrNamespaceExists),
+		errors.Is(err, accumulo.ErrUserExists):
+		return C.SHOAL_STATUS_ALREADY_EXISTS
 	case errors.Is(err, accumulo.ErrInvalidTableName),
-		errors.Is(err, accumulo.ErrInvalidProperty):
+		errors.Is(err, accumulo.ErrInvalidProperty),
+		errors.Is(err, accumulo.ErrInvalidNamespaceName),
+		errors.Is(err, accumulo.ErrInvalidTableSplit),
+		errors.Is(err, accumulo.ErrInvalidUser),
+		errors.Is(err, accumulo.ErrInvalidPassword),
+		errors.Is(err, accumulo.ErrInvalidAuthorizations),
+		errors.Is(err, accumulo.ErrInvalidPermission):
 		return C.SHOAL_STATUS_INVALID_ARGUMENT
 	case errors.Is(err, accumulo.ErrNamespaceNotFound):
 		return C.SHOAL_STATUS_NOT_FOUND
+	case errors.Is(err, accumulo.ErrNamespaceNotEmpty):
+		return C.SHOAL_STATUS_NAMESPACE_NOT_EMPTY
+	case errors.Is(err, accumulo.ErrUserNotFound):
+		return C.SHOAL_STATUS_USER_NOT_FOUND
+	case errors.Is(err, accumulo.ErrBadCredentials):
+		return C.SHOAL_STATUS_BAD_CREDENTIALS
 	case errors.Is(err, accumulo.ErrPermissionDenied):
 		return C.SHOAL_STATUS_PERMISSION_DENIED
+	case errors.Is(err, accumulo.ErrUnsupportedOperation):
+		return C.SHOAL_STATUS_UNSUPPORTED
+	case errors.Is(err, accumulo.ErrSecurityUnavailable):
+		return C.SHOAL_STATUS_SECURITY_UNAVAILABLE
+	case errors.Is(err, accumulo.ErrTableOffline):
+		return C.SHOAL_STATUS_TABLE_OFFLINE
+	case errors.Is(err, accumulo.ErrTableSplitsIncomplete):
+		return C.SHOAL_STATUS_INCOMPLETE
 	case errors.Is(err, accumulo.ErrDiscoveryUnavailable):
 		return C.SHOAL_STATUS_DISCOVERY_UNAVAILABLE
 	case errors.Is(err, accumulo.ErrManagerUnavailable),
