@@ -15,6 +15,8 @@ func TestStatusForTableAdministrationErrors(t *testing.T) {
 	}{
 		{"table exists", accumulo.ErrTableExists, 19},
 		{"invalid table name", accumulo.ErrInvalidTableName, 1},
+		{"invalid table range", accumulo.ErrInvalidTableRange, 1},
+		{"constraint number unavailable", accumulo.ErrConstraintNumberUnavailable, 16},
 		{"invalid property", accumulo.ErrInvalidProperty, 1},
 		{"namespace missing", accumulo.ErrNamespaceNotFound, 9},
 		{"manager unavailable", accumulo.ErrManagerUnavailable, 20},

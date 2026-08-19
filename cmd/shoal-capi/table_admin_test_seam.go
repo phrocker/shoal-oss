@@ -22,19 +22,26 @@ import (
 )
 
 type testAdminConnector struct {
-	mu            sync.Mutex
-	nextID        int
-	tables        map[string]string
-	properties    map[string]map[string]string
-	namespaces    map[string]string
-	nsProps       map[string]map[string]string
-	users         map[string][]byte
-	auths         map[string][][]byte
-	permissions   map[string]bool
-	splits        map[string][][]byte
-	flushFalse    int
-	flushTrue     int
-	identityBlock atomic.Bool
+	mu               sync.Mutex
+	nextID           int
+	tables           map[string]string
+	properties       map[string]map[string]string
+	namespaces       map[string]string
+	nsProps          map[string]map[string]string
+	users            map[string][]byte
+	auths            map[string][][]byte
+	permissions      map[string]bool
+	splits           map[string][][]byte
+	constraints      map[string]map[int32]string
+	flushFalse       int
+	flushTrue        int
+	flushStart       []byte
+	flushEnd         []byte
+	flushStartSet    bool
+	flushEndSet      bool
+	flushRangeWait   bool
+	identityBlock    atomic.Bool
+	maintenanceBlock atomic.Bool
 }
 
 func newTestAdminConnector() *testAdminConnector {
@@ -58,6 +65,12 @@ func newTestAdminConnector() *testAdminConnector {
 		auths:       map[string][][]byte{"root": {[]byte("A")}},
 		permissions: make(map[string]bool),
 		splits:      map[string][][]byte{"events": {[]byte("m")}},
+		constraints: map[string]map[int32]string{
+			"events": {
+				1: "org.example.First",
+				3: "org.example.Third",
+			},
+		},
 	}
 }
 
@@ -202,6 +215,112 @@ func (c *testAdminConnector) FlushTable(
 	} else {
 		c.flushFalse++
 	}
+	return nil
+}
+
+func (c *testAdminConnector) FlushTableRange(
+	ctx context.Context,
+	name string,
+	startRow, endRow []byte,
+	wait bool,
+) error {
+	if c.maintenanceBlock.Load() {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	if err := c.maybeTableError(ctx, name, accumulo.ErrManagerUnavailable); err != nil {
+		return err
+	}
+	if startRow != nil && endRow != nil && bytes.Compare(startRow, endRow) > 0 {
+		return accumulo.ErrInvalidTableRange
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if _, exists := c.tables[name]; !exists {
+		return accumulo.ErrTableNotFound
+	}
+	c.flushStartSet = startRow != nil
+	c.flushEndSet = endRow != nil
+	c.flushStart = append([]byte(nil), startRow...)
+	c.flushEnd = append([]byte(nil), endRow...)
+	c.flushRangeWait = wait
+	return nil
+}
+
+func (c *testAdminConnector) AddConstraint(
+	ctx context.Context,
+	tableName, className string,
+) (int32, error) {
+	if c.maintenanceBlock.Load() {
+		<-ctx.Done()
+		return 0, ctx.Err()
+	}
+	if className == "" {
+		return 0, accumulo.ErrInvalidProperty
+	}
+	if err := c.maybeTableError(ctx, tableName, accumulo.ErrClientServiceUnavailable); err != nil {
+		return 0, err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	installed := c.constraints[tableName]
+	if installed == nil {
+		installed = make(map[int32]string)
+		c.constraints[tableName] = installed
+	}
+	for number, class := range installed {
+		if class == className {
+			return number, nil
+		}
+	}
+	for number := int32(1); number > 0; number++ {
+		if _, exists := installed[number]; !exists {
+			installed[number] = className
+			return number, nil
+		}
+	}
+	return 0, accumulo.ErrConstraintNumberUnavailable
+}
+
+func (c *testAdminConnector) ListConstraints(
+	ctx context.Context,
+	tableName string,
+) ([]accumulo.Constraint, error) {
+	if c.maintenanceBlock.Load() {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	if err := c.maybeTableError(ctx, tableName, accumulo.ErrClientServiceUnavailable); err != nil {
+		return nil, err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	result := make([]accumulo.Constraint, 0, len(c.constraints[tableName]))
+	for number, className := range c.constraints[tableName] {
+		result = append(result, accumulo.Constraint{Number: number, ClassName: className})
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].Number < result[j].Number })
+	return result, nil
+}
+
+func (c *testAdminConnector) RemoveConstraint(
+	ctx context.Context,
+	tableName string,
+	number int32,
+) error {
+	if c.maintenanceBlock.Load() {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	if number <= 0 {
+		return accumulo.ErrInvalidProperty
+	}
+	if err := c.maybeTableError(ctx, tableName, accumulo.ErrClientServiceUnavailable); err != nil {
+		return err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.constraints[tableName], number)
 	return nil
 }
 
@@ -741,6 +860,66 @@ func shoal_test_connector_identity_block(
 		return 0
 	}
 	admin.identityBlock.Store(value)
+	return 1
+}
+
+//export shoal_test_connector_table_maintenance_block
+func shoal_test_connector_table_maintenance_block(
+	handle *C.shoal_connector,
+	block C.uint8_t,
+) C.int {
+	connector, err := lookupConnector(handle)
+	if err != nil {
+		return 0
+	}
+	admin, ok := connector.connector.(*testAdminConnector)
+	if !ok {
+		return 0
+	}
+	value, err := boolFlag(block, "block")
+	if err != nil {
+		return 0
+	}
+	admin.maintenanceBlock.Store(value)
+	return 1
+}
+
+//export shoal_test_connector_last_flush_range_matches
+func shoal_test_connector_last_flush_range_matches(
+	handle *C.shoal_connector,
+	start *C.shoal_bytes,
+	end *C.shoal_bytes,
+	wait C.uint8_t,
+) C.int {
+	connector, err := lookupConnector(handle)
+	if err != nil {
+		return 0
+	}
+	admin, ok := connector.connector.(*testAdminConnector)
+	if !ok {
+		return 0
+	}
+	expectedStart, err := optionalRowBound(start, "start")
+	if err != nil {
+		return 0
+	}
+	expectedEnd, err := optionalRowBound(end, "end")
+	if err != nil {
+		return 0
+	}
+	expectedWait, err := boolFlag(wait, "wait")
+	if err != nil {
+		return 0
+	}
+	admin.mu.Lock()
+	defer admin.mu.Unlock()
+	if admin.flushStartSet != (start != nil) ||
+		admin.flushEndSet != (end != nil) ||
+		admin.flushRangeWait != expectedWait ||
+		!bytes.Equal(admin.flushStart, expectedStart) ||
+		!bytes.Equal(admin.flushEnd, expectedEnd) {
+		return 0
+	}
 	return 1
 }
 

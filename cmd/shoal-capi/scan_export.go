@@ -778,6 +778,7 @@ func statusForError(err error) C.shoal_status {
 		return C.SHOAL_STATUS_ALREADY_EXISTS
 	case errors.Is(err, accumulo.ErrInvalidTableName),
 		errors.Is(err, accumulo.ErrInvalidProperty),
+		errors.Is(err, accumulo.ErrInvalidTableRange),
 		errors.Is(err, accumulo.ErrInvalidNamespaceName),
 		errors.Is(err, accumulo.ErrInvalidTableSplit),
 		errors.Is(err, accumulo.ErrInvalidUser),
@@ -785,6 +786,8 @@ func statusForError(err error) C.shoal_status {
 		errors.Is(err, accumulo.ErrInvalidAuthorizations),
 		errors.Is(err, accumulo.ErrInvalidPermission):
 		return C.SHOAL_STATUS_INVALID_ARGUMENT
+	case errors.Is(err, accumulo.ErrConstraintNumberUnavailable):
+		return C.SHOAL_STATUS_RETRY_EXHAUSTED
 	case errors.Is(err, accumulo.ErrNamespaceNotFound):
 		return C.SHOAL_STATUS_NOT_FOUND
 	case errors.Is(err, accumulo.ErrNamespaceNotEmpty):

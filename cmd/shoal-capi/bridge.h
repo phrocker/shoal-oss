@@ -83,6 +83,16 @@ struct shoal_table_list_result {
   shoal_bridge_table_entry *entries;
 };
 
+typedef struct shoal_bridge_table_constraint_entry {
+  int32_t number;
+  char *class_name;
+} shoal_bridge_table_constraint_entry;
+
+struct shoal_table_constraint_list_result {
+  size_t count;
+  shoal_bridge_table_constraint_entry *entries;
+};
+
 typedef struct shoal_bridge_extent {
   char *server;
   char *table_id;
@@ -382,6 +392,19 @@ size_t shoal_bridge_table_list_count(const shoal_table_list_result *result);
 int shoal_bridge_table_list_get(const shoal_table_list_result *result,
                                 size_t index, shoal_table_view *out_table);
 void shoal_bridge_table_list_free(shoal_table_list_result *result);
+
+shoal_table_constraint_list_result *
+shoal_bridge_table_constraint_list_alloc(size_t count);
+int shoal_bridge_table_constraint_list_set(
+    shoal_table_constraint_list_result *result, size_t index, int32_t number,
+    const char *class_name);
+size_t shoal_bridge_table_constraint_list_count(
+    const shoal_table_constraint_list_result *result);
+int shoal_bridge_table_constraint_list_get(
+    const shoal_table_constraint_list_result *result, size_t index,
+    shoal_table_constraint_view *out_constraint);
+void shoal_bridge_table_constraint_list_free(
+    shoal_table_constraint_list_result *result);
 
 shoal_write_failure *shoal_bridge_write_failure_alloc(
     shoal_write_failure_flags flags, size_t failed_extent_count,
