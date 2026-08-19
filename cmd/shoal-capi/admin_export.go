@@ -644,7 +644,10 @@ func copyBytesArray(values *C.shoal_bytes, count C.size_t, name string) ([][]byt
 		return nil, fmt.Errorf("shoal: %s is NULL with non-zero count", name)
 	}
 	maxInt := uint64(^uint(0) >> 1)
-	if uint64(count) > maxInt {
+	inputElementSize := uint64(unsafe.Sizeof(*values))
+	resultElementSize := uint64(unsafe.Sizeof([]byte(nil)))
+	maxCount := min(maxInt/inputElementSize, maxInt/resultElementSize)
+	if uint64(count) > maxCount {
 		return nil, fmt.Errorf("shoal: %s count is too large", name)
 	}
 	input := unsafe.Slice(values, int(count))

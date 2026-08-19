@@ -1119,6 +1119,10 @@ def parse_gap_completion_tables(lines: list[str]) -> dict[str, tuple[str, str]]:
         for row in rows:
             row_id, _gap, matrix_rows, _existing, notes = row
             if row_id.startswith("SB-GAP-"):
+                require(
+                    row_id not in gap_rows,
+                    f"duplicate audited gap row {row_id}",
+                )
                 gap_rows[row_id] = (matrix_rows, notes)
     return gap_rows
 

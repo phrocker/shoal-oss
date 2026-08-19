@@ -471,6 +471,19 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
         rows = validator.parse_rows(lines)[2]
         validator.validate_gap_completion_consistency(lines, rows)
 
+    def test_gap_completion_tables_reject_duplicate_gap_ids(self) -> None:
+        text = "\n".join(load_fixture_lines("gap_completion_valid.md"))
+        row = (
+            "| SB-GAP-C-001 | Table administration on the ABI | "
+            "SB-TABLE-001, SB-CPP-016, SB-CPP-017 | merged | "
+            "**Complete on the ABI for the listed connector-scoped entry points.** |"
+        )
+        text = text.replace(row, f"{row}\n{row}")
+        self.assert_validation_fails(
+            lambda: validator.parse_gap_completion_tables(text.splitlines()),
+            "duplicate audited gap row SB-GAP-C-001",
+        )
+
     def test_gap_completion_consistency_rejects_c_stage_missing_c_abi_drift(self) -> None:
         lines = load_fixture_lines("gap_completion_drift.md")
         rows = validator.parse_rows(lines)[2]

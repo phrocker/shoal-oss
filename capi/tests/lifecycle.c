@@ -543,6 +543,9 @@ int main(void) {
                SHOAL_STATUS_INVALID_ARGUMENT, &error, "authorizations");
   const uint8_t auth_a[] = {'A', 0, 'B'};
   shoal_bytes auths[] = {{auth_a, sizeof(auth_a)}};
+  expect_error(shoal_connector_change_user_authorizations(
+                   admin_connector, "alice", auths, SIZE_MAX / 2, 0, &error),
+               SHOAL_STATUS_INVALID_ARGUMENT, &error, "count is too large");
   assert(shoal_connector_change_user_authorizations(
              admin_connector, "alice", auths, 1, 0, &error) ==
          SHOAL_STATUS_OK);
