@@ -460,11 +460,8 @@ func (w *writer) commitReplacement() error {
 	if err != nil {
 		publishErr := fmt.Errorf("local: publish %s: %w", w.target, err)
 		if hadOld && backup != "" {
-			if cleanupErr := w.ops.Remove(backup); cleanupErr != nil && !errors.Is(cleanupErr, fs.ErrNotExist) {
-				publishErr = errors.Join(
-					publishErr,
-					fmt.Errorf("local: remove unused replacement backup %s: %w", backup, cleanupErr),
-				)
+			if cleanupErr := w.discardUnusedBackup(backup); cleanupErr != nil {
+				publishErr = errors.Join(publishErr, cleanupErr)
 			}
 		}
 		return publishErr
@@ -499,6 +496,48 @@ func (w *writer) commitReplacement() error {
 	}
 	w.state = replacementCommitted
 	return nil
+}
+
+// discardUnusedBackup removes the replacement backup after a failed publish,
+// but only once the destination is known to be intact. The rename fallback in
+// platformAtomicReplace can leave the backup holding the only copy of the
+// previous contents, so a missing destination is restored from the backup, and
+// the backup is retained for manual recovery when that restore fails.
+func (w *writer) discardUnusedBackup(backup string) error {
+	targetPresent, err := replacementPathExists(w.ops, w.target)
+	if err != nil {
+		return fmt.Errorf("local: inspect destination %s after publish failure: %w", w.target, err)
+	}
+	if !targetPresent {
+		backupPresent, err := replacementPathExists(w.ops, backup)
+		if err != nil {
+			return fmt.Errorf("local: inspect replacement backup %s after publish failure: %w", backup, err)
+		}
+		if !backupPresent {
+			return nil
+		}
+		if err := w.ops.AtomicRestore(w.target, backup); err != nil {
+			return fmt.Errorf(
+				"local: restore %s from %s after publish failure; backup retained for recovery: %w",
+				w.target, backup, err,
+			)
+		}
+		return nil
+	}
+	if err := w.ops.Remove(backup); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("local: remove unused replacement backup %s: %w", backup, err)
+	}
+	return nil
+}
+
+func replacementPathExists(ops replacementOps, path string) (bool, error) {
+	if _, err := ops.Lstat(path); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
 }
 
 func (w *writer) Abort() error {

@@ -989,3 +989,103 @@ func equalStringSlices(got, want []string) bool {
 	}
 	return true
 }
+
+func TestLocal_PublishFailureRestoresStrandedBackup(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "target")
+	if err := os.WriteFile(path, []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	w, err := New().Create(context.Background(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	localWriter := w.(*writer)
+	publishErr := errors.New("injected publish failure")
+	localWriter.ops = &strandedBackupOps{replacementOps: localWriter.ops, err: publishErr}
+	if _, err := w.Write([]byte("new")); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); !errors.Is(err, publishErr) {
+		t.Fatalf("Close error = %v, want %v", err, publishErr)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("destination missing after failed publish: %v", err)
+	}
+	if string(got) != "old" {
+		t.Fatalf("target contents = %q, want old", got)
+	}
+	if err := w.(storage.Aborter).Abort(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLocal_PublishFailureRetainsBackupWhenRestoreFails(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "target")
+	if err := os.WriteFile(path, []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	w, err := New().Create(context.Background(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	localWriter := w.(*writer)
+	publishErr := errors.New("injected publish failure")
+	restoreErr := errors.New("injected restore failure")
+	ops := &strandedBackupOps{replacementOps: localWriter.ops, err: publishErr, restoreErr: restoreErr}
+	localWriter.ops = ops
+	if _, err := w.Write([]byte("new")); err != nil {
+		t.Fatal(err)
+	}
+	err = w.Close()
+	if !errors.Is(err, publishErr) || !errors.Is(err, restoreErr) {
+		t.Fatalf("Close error = %v, want join of %v and %v", err, publishErr, restoreErr)
+	}
+	if ops.backup == "" {
+		t.Fatal("no replacement backup recorded")
+	}
+	got, err := os.ReadFile(ops.backup)
+	if err != nil {
+		t.Fatalf("replacement backup not retained for recovery: %v", err)
+	}
+	if string(got) != "old" {
+		t.Fatalf("retained backup contents = %q, want old", got)
+	}
+	if err := w.(storage.Aborter).Abort(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(ops.backup); err != nil {
+		t.Fatalf("abort must not discard the retained backup: %v", err)
+	}
+}
+
+// strandedBackupOps mimics the rename fallback failing after the old target has
+// already been moved aside, leaving the backup as the only copy.
+type strandedBackupOps struct {
+	replacementOps
+	err        error
+	restoreErr error
+	backup     string
+}
+
+func (o *strandedBackupOps) AtomicReplace(temp, target, backup string, hadOld bool) error {
+	if !hadOld {
+		return o.replacementOps.AtomicReplace(temp, target, backup, hadOld)
+	}
+	if err := os.Rename(target, backup); err != nil {
+		return err
+	}
+	o.backup = backup
+	return o.err
+}
+
+func (o *strandedBackupOps) AtomicRestore(target, backup string) error {
+	if o.restoreErr != nil {
+		return o.restoreErr
+	}
+	return o.replacementOps.AtomicRestore(target, backup)
+}
