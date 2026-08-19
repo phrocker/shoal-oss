@@ -83,7 +83,7 @@ The write-tier `terminationGracePeriodSeconds` (`50s`) covers the manifest's `--
 
 `shoal-embed serve` can terminate TLS on both its listeners — the gRPC write port and the HTTP `/healthz`/`/readyz`/`/stats`/`/metrics` surface — but it is **off by default**: existing plaintext deployments keep working unchanged.
 
-Enable it by supplying a PEM certificate and private key, via flag or environment variable. A flag always wins over its same-purpose environment variable (see `flagOrEnv` in `cmd/shoal-embed/main.go`); there is no other precedence and no implicit fallback (for example, TLS is never auto-enabled, and a partially-specified configuration is a startup error, not a silent switch to plaintext):
+Enable it by supplying a PEM certificate and private key, via flag or environment variable. A flag always wins over its same-purpose environment variable — including an explicitly-set empty flag (e.g. `--tls-cert=""`), which clears the setting rather than falling back to the environment variable (see `flagOrEnv`/`flagWasSet` in `cmd/shoal-embed/main.go`). There is no other precedence and no implicit fallback (for example, TLS is never auto-enabled, and a partially-specified configuration is a startup error, not a silent switch to plaintext):
 
 | Setting | Flag | Environment variable |
 | --- | --- | --- |
