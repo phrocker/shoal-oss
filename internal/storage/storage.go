@@ -148,7 +148,7 @@ func Copy(ctx context.Context, src Backend, srcPath string, dst Backend, dstPath
 	needsCleanup := true
 	defer func() {
 		if needsCleanup {
-			err = cleanupUnsuccessfulWrite(err, out)
+			err = CleanupUnsuccessfulWrite(err, out)
 		}
 	}()
 
@@ -241,7 +241,7 @@ func ReadAll(ctx context.Context, b Backend, path string) ([]byte, error) {
 		end := min(off+transferChunkSize, size)
 		n, err := f.ReadAt(buf[off:end], off)
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			return nil, ctxErr
+			return nil, joinContextCallError(err, ctxErr)
 		}
 		off += int64(n)
 		if err != nil {
@@ -277,7 +277,7 @@ func WriteAll(ctx context.Context, b Backend, path string, data []byte) (err err
 	needsCleanup := true
 	defer func() {
 		if needsCleanup {
-			err = cleanupUnsuccessfulWrite(err, w)
+			err = CleanupUnsuccessfulWrite(err, w)
 		}
 	}()
 	for off := 0; off < len(data); {
@@ -324,7 +324,10 @@ func joinContextCallError(callErr, ctxErr error) error {
 	return errors.Join(callErr, ctxErr)
 }
 
-func cleanupUnsuccessfulWrite(primaryErr error, w Writer) error {
+// CleanupUnsuccessfulWrite abandons a writer after a failed write operation
+// and joins any cleanup failure with primaryErr. Abort-capable transactional
+// writers are never closed (and therefore never committed) on this path.
+func CleanupUnsuccessfulWrite(primaryErr error, w Writer) error {
 	if primaryErr == nil {
 		return nil
 	}

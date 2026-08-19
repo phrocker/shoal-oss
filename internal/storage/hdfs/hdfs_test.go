@@ -3,6 +3,7 @@ package hdfs
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -607,6 +608,27 @@ func TestBackendCreateAllowsUserNamesOutsideReservedNamespace(t *testing.T) {
 				t.Fatalf("stored data for %q = %q, want data", name, got)
 			}
 		})
+	}
+}
+
+func TestFileMatchesAppliesCleanupDeadlineBeforeRead(t *testing.T) {
+	client := newFakeClient()
+	data := []byte("published")
+	client.files["/tables/target.rf"] = data
+	deadline := time.Now().Add(time.Minute).Round(0)
+	ctx, cancel := context.WithDeadline(context.Background(), deadline)
+	defer cancel()
+	digest := sha256.Sum256(data)
+
+	matches, err := fileMatches(ctx, client, "/tables/target.rf", int64(len(data)), digest[:])
+	if err != nil {
+		t.Fatalf("fileMatches: %v", err)
+	}
+	if !matches {
+		t.Fatal("fileMatches = false, want true")
+	}
+	if got := client.lastReader.deadline; !got.Equal(deadline) {
+		t.Fatalf("reader deadline = %v, want %v", got, deadline)
 	}
 }
 

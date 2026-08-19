@@ -342,7 +342,7 @@ func stampRFileObject(ctx context.Context, src storage.Backend, srcPath string, 
 	return int64(len(res.Output)), hex.EncodeToString(sum[:]), bcVersion, nil
 }
 
-func copyWithSHA256(ctx context.Context, src storage.Backend, srcPath string, dst storage.Backend, dstPath string) (int64, string, string, error) {
+func copyWithSHA256(ctx context.Context, src storage.Backend, srcPath string, dst storage.Backend, dstPath string) (written int64, checksum, bcVersion string, err error) {
 	wb, ok := dst.(storage.WritableBackend)
 	if !ok {
 		return 0, "", "", storage.ErrReadOnly
@@ -353,7 +353,7 @@ func copyWithSHA256(ctx context.Context, src storage.Backend, srcPath string, ds
 	}
 	defer in.Close()
 	footer, ferr := bcfile.ReadFooter(in, in.Size())
-	bcVersion := ""
+	bcVersion = ""
 	if ferr == nil {
 		bcVersion = footer.Version.String()
 	}
@@ -361,32 +361,40 @@ func copyWithSHA256(ctx context.Context, src storage.Backend, srcPath string, ds
 	if err != nil {
 		return 0, "", "", fmt.Errorf("engine: create export destination %s: %w", dstPath, err)
 	}
-	defer out.Close()
+	needsCleanup := true
+	defer func() {
+		if needsCleanup {
+			err = storage.CleanupUnsuccessfulWrite(err, out)
+		}
+	}()
 	h := sha256.New()
 	buf := make([]byte, 256*1024)
-	var off int64
-	for off < in.Size() {
+	for written < in.Size() {
 		want := int64(len(buf))
-		if off+want > in.Size() {
-			want = in.Size() - off
+		if written+want > in.Size() {
+			want = in.Size() - written
 		}
-		n, rerr := in.ReadAt(buf[:want], off)
+		n, rerr := in.ReadAt(buf[:want], written)
 		if n > 0 {
 			chunk := buf[:n]
 			if _, err := out.Write(chunk); err != nil {
-				return off, "", "", fmt.Errorf("engine: write export %s: %w", dstPath, err)
+				return written, "", "", fmt.Errorf("engine: write export %s: %w", dstPath, err)
 			}
 			_, _ = h.Write(chunk)
-			off += int64(n)
+			written += int64(n)
 		}
 		if rerr != nil {
 			if errors.Is(rerr, io.EOF) {
 				break
 			}
-			return off, "", "", fmt.Errorf("engine: read export %s: %w", srcPath, rerr)
+			return written, "", "", fmt.Errorf("engine: read export %s: %w", srcPath, rerr)
 		}
 	}
-	return off, hex.EncodeToString(h.Sum(nil)), bcVersion, nil
+	if err := out.Close(); err != nil {
+		return written, "", "", fmt.Errorf("engine: close export destination %s: %w", dstPath, err)
+	}
+	needsCleanup = false
+	return written, hex.EncodeToString(h.Sum(nil)), bcVersion, nil
 }
 
 func hashObject(ctx context.Context, b storage.Backend, path string) (int64, string, error) {

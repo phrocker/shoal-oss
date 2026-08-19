@@ -62,3 +62,81 @@ func TestBackendStore_ReadMissing(t *testing.T) {
 		t.Fatal("expected not-found error")
 	}
 }
+
+type abortingBackend struct {
+	writer *abortingWriter
+}
+
+func (*abortingBackend) Open(context.Context, string) (storage.File, error) {
+	return nil, storage.ErrNotFound
+}
+
+func (b *abortingBackend) Create(context.Context, string) (storage.Writer, error) {
+	return b.writer, nil
+}
+
+type abortingWriter struct {
+	aborted bool
+	closed  bool
+}
+
+func (*abortingWriter) Write([]byte) (int, error) { return 0, errors.New("write failed") }
+func (w *abortingWriter) Close() error {
+	w.closed = true
+	return nil
+}
+func (w *abortingWriter) Abort() error {
+	w.aborted = true
+	return nil
+}
+
+func TestBackendStore_WriteAbortsInsteadOfClosingOnFailure(t *testing.T) {
+	writer := &abortingWriter{}
+	s := NewBackendStore(&abortingBackend{writer: writer})
+	if err := s.Write(context.Background(), "target.rf", []byte("data")); err == nil {
+		t.Fatal("Write succeeded despite writer failure")
+	}
+	if !writer.aborted {
+		t.Fatal("failed Write did not abort transactional writer")
+	}
+	if writer.closed {
+		t.Fatal("failed Write closed and could have committed transactional writer")
+	}
+}
+
+type syncFailWriter struct {
+	abortingWriter
+	synced bool
+}
+
+func (*syncFailWriter) Write(p []byte) (int, error) { return len(p), nil }
+func (w *syncFailWriter) Sync() error {
+	w.synced = true
+	return errors.New("sync failed")
+}
+
+func TestBackendStore_WriteSyncFailureAborts(t *testing.T) {
+	writer := &syncFailWriter{}
+	s := NewBackendStore(writableBackendFunc(func(context.Context, string) (storage.Writer, error) {
+		return writer, nil
+	}))
+	if err := s.Write(context.Background(), "target.rf", []byte("data")); err == nil {
+		t.Fatal("Write succeeded despite sync failure")
+	}
+	if !writer.synced || !writer.aborted {
+		t.Fatalf("sync/abort state = %v/%v, want true/true", writer.synced, writer.aborted)
+	}
+	if writer.closed {
+		t.Fatal("sync failure closed and could have committed transactional writer")
+	}
+}
+
+type writableBackendFunc func(context.Context, string) (storage.Writer, error)
+
+func (writableBackendFunc) Open(context.Context, string) (storage.File, error) {
+	return nil, storage.ErrNotFound
+}
+
+func (f writableBackendFunc) Create(ctx context.Context, path string) (storage.Writer, error) {
+	return f(ctx, path)
+}

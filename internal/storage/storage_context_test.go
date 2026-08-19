@@ -97,6 +97,8 @@ func TestCopy_SuccessfulAbortableWriterClosesWithoutAbort(t *testing.T) {
 func TestReadAll_CanceledReadWaitsForBlockedCall(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	file := newBlockingFile()
+	readErr := errors.New("backend read failed")
+	file.readErr = readErr
 	done := make(chan error, 1)
 
 	go func() {
@@ -114,8 +116,8 @@ func TestReadAll_CanceledReadWaitsForBlockedCall(t *testing.T) {
 	}
 
 	close(file.release)
-	if err := <-done; !errors.Is(err, context.Canceled) {
-		t.Fatalf("ReadAll error = %v, want context.Canceled", err)
+	if err := <-done; !errors.Is(err, context.Canceled) || !errors.Is(err, readErr) {
+		t.Fatalf("ReadAll error = %v, want joined cancellation and backend error", err)
 	}
 }
 
@@ -410,6 +412,7 @@ type blockingFile struct {
 	entered chan struct{}
 	release chan struct{}
 	once    sync.Once
+	readErr error
 }
 
 func newBlockingFile() *blockingFile {
@@ -427,7 +430,7 @@ func (f *blockingFile) ReadAt(p []byte, off int64) (int, error) {
 	f.once.Do(func() { close(f.entered) })
 	<-f.release
 	p[0] = 'x'
-	return 1, nil
+	return 1, f.readErr
 }
 
 func (f *blockingFile) Close() error { return nil }

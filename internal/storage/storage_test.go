@@ -49,6 +49,28 @@ var errFaultyClose = errors.New("faultyCloseWriter: simulated commit failure")
 
 func (faultyCloseWriter) Close() error { return errFaultyClose }
 
+type abortTrackingWriter struct {
+	aborted bool
+}
+
+func (*abortTrackingWriter) Write(p []byte) (int, error) { return len(p), nil }
+func (*abortTrackingWriter) Close() error                { return errors.New("unexpected commit") }
+func (w *abortTrackingWriter) Abort() error {
+	w.aborted = true
+	return nil
+}
+
+func TestCleanupUnsuccessfulWriteUsesAbort(t *testing.T) {
+	primary := errors.New("write failed")
+	w := &abortTrackingWriter{}
+	if err := storage.CleanupUnsuccessfulWrite(primary, w); !errors.Is(err, primary) {
+		t.Fatalf("CleanupUnsuccessfulWrite error = %v, want primary error", err)
+	}
+	if !w.aborted {
+		t.Fatal("CleanupUnsuccessfulWrite did not abort transactional writer")
+	}
+}
+
 func TestCopy_MemoryToMemory(t *testing.T) {
 	src := memory.New()
 	src.Put("/src/x", []byte("the contents of x"))

@@ -1730,6 +1730,9 @@ func fileMatches(ctx context.Context, client Client, name string, size int64, di
 		return false, err
 	}
 	defer reader.Close()
+	if err := applyDeadline(ctx, reader); err != nil {
+		return false, fmt.Errorf("hdfs: apply verification deadline for %s: %w", name, err)
+	}
 	if reader.Stat().Size() != size {
 		return false, nil
 	}
@@ -1742,6 +1745,9 @@ func fileMatches(ctx context.Context, client Client, name string, size int64, di
 		want := int64(len(buf))
 		if remaining := size - off; remaining < want {
 			want = remaining
+		}
+		if err := applyDeadline(ctx, reader); err != nil {
+			return false, fmt.Errorf("hdfs: refresh verification deadline for %s: %w", name, err)
 		}
 		n, readErr := reader.ReadAt(buf[:want], off)
 		if n > 0 {

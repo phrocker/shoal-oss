@@ -2,7 +2,9 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -10,8 +12,68 @@ import (
 
 	"github.com/phrocker/shoal/internal/cclient"
 	"github.com/phrocker/shoal/internal/iterrt"
+	"github.com/phrocker/shoal/internal/storage"
 	"github.com/phrocker/shoal/internal/storage/memory"
 )
+
+type exportSourceBackend struct{}
+
+func (exportSourceBackend) Open(context.Context, string) (storage.File, error) {
+	return exportFailingFile{}, nil
+}
+
+type exportFailingFile struct{}
+
+func (exportFailingFile) ReadAt([]byte, int64) (int, error) { return 0, io.ErrUnexpectedEOF }
+func (exportFailingFile) Close() error                      { return nil }
+func (exportFailingFile) Size() int64                       { return 1 }
+
+type exportDestinationBackend struct {
+	writer *exportAbortWriter
+}
+
+func (*exportDestinationBackend) Open(context.Context, string) (storage.File, error) {
+	return nil, storage.ErrNotFound
+}
+
+func (b *exportDestinationBackend) Create(context.Context, string) (storage.Writer, error) {
+	return b.writer, nil
+}
+
+type exportAbortWriter struct {
+	aborted bool
+	closed  bool
+}
+
+func (*exportAbortWriter) Write(p []byte) (int, error) { return len(p), nil }
+func (w *exportAbortWriter) Close() error {
+	w.closed = true
+	return nil
+}
+func (w *exportAbortWriter) Abort() error {
+	w.aborted = true
+	return nil
+}
+
+func TestCopyWithSHA256AbortsDestinationOnReadFailure(t *testing.T) {
+	writer := &exportAbortWriter{}
+	_, _, _, err := copyWithSHA256(
+		context.Background(),
+		exportSourceBackend{},
+		"source.rf",
+		&exportDestinationBackend{writer: writer},
+		"destination.rf",
+	)
+	if !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("copyWithSHA256 error = %v, want read failure", err)
+	}
+	if !writer.aborted {
+		t.Fatal("failed export did not abort destination")
+	}
+	if writer.closed {
+		t.Fatal("failed export closed and could have committed destination")
+	}
+}
 
 func TestRFileExportImportMemoryRoundTrip(t *testing.T) {
 	ctx := context.Background()
