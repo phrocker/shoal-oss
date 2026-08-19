@@ -8,9 +8,9 @@
 
 _Static_assert(SHOAL_ABI_VERSION == 1u, "unexpected compatibility ABI version");
 _Static_assert(SHOAL_ABI_VERSION_MAJOR == 1u, "unexpected ABI major");
-_Static_assert(SHOAL_ABI_VERSION_MINOR == 8u, "unexpected ABI minor");
+_Static_assert(SHOAL_ABI_VERSION_MINOR == 9u, "unexpected ABI minor");
 _Static_assert(SHOAL_ABI_VERSION_PATCH == 0u, "unexpected ABI patch");
-_Static_assert(SHOAL_ABI_VERSION_PACKED == 0x00010800u,
+_Static_assert(SHOAL_ABI_VERSION_PACKED == 0x00010900u,
                "unexpected packed ABI version");
 _Static_assert(SHOAL_ABI_CAPABILITY_CONNECTOR == 0u,
                "unexpected connector capability id");
@@ -50,11 +50,13 @@ _Static_assert(SHOAL_ABI_CAPABILITY_DATA_VALUES == 17u,
                "unexpected data values capability id");
 _Static_assert(SHOAL_ABI_CAPABILITY_TABLE_MAINTENANCE == 19u,
                "unexpected table maintenance capability id");
-_Static_assert(SHOAL_ABI_CAPABILITY_COUNT == 20u,
+_Static_assert(SHOAL_ABI_CAPABILITY_CONNECTOR_CONTROL == 20u,
+               "unexpected connector control capability id");
+_Static_assert(SHOAL_ABI_CAPABILITY_COUNT == 21u,
                "unexpected capability count");
 _Static_assert(SHOAL_ABI_CAPABILITY_WORD_COUNT == 1u,
                "unexpected capability word count");
-_Static_assert(SHOAL_ABI_CAPABILITY_WORD0 == UINT64_C(0xfffff),
+_Static_assert(SHOAL_ABI_CAPABILITY_WORD0 == UINT64_C(0x1fffff),
                "unexpected capability word 0");
 
 #define ASSERT_PERMISSION_VALUE(name, value)                                  \
@@ -565,6 +567,7 @@ static void test_buffered_writer_abi(shoal_connector *connector) {
 int main(void) {
   shoal_connector *connector = NULL;
   shoal_connector *admin_connector = NULL;
+  shoal_cancellation *cancellation = NULL;
   shoal_scanner *scanner = NULL;
   shoal_batch_scanner *batch_scanner = NULL;
   shoal_scan_result *result = NULL;
@@ -616,6 +619,7 @@ int main(void) {
   assert(shoal_abi_has_capability(SHOAL_ABI_CAPABILITY_RFILE) == 1);
   assert(shoal_abi_has_capability(SHOAL_ABI_CAPABILITY_DATA_VALUES) == 1);
   assert(shoal_abi_has_capability(SHOAL_ABI_CAPABILITY_BUFFERED_WRITER) == 1);
+  assert(shoal_abi_has_capability(SHOAL_ABI_CAPABILITY_CONNECTOR_CONTROL) == 1);
   assert(shoal_abi_has_capability(SHOAL_ABI_CAPABILITY_COUNT) == 0);
   assert(shoal_abi_has_capability(63u) == 0);
   assert(shoal_abi_has_capability(64u) == 0);
@@ -651,6 +655,61 @@ int main(void) {
 
   assert(shoal_test_connector_create(&admin_connector));
   assert(admin_connector != NULL);
+
+  expect_error(shoal_cancellation_create(NULL, &error),
+               SHOAL_STATUS_INVALID_ARGUMENT, &error,
+               "out_cancellation is required");
+  expect_error(shoal_cancellation_cancel(NULL, &error),
+               SHOAL_STATUS_INVALID_HANDLE, &error,
+               "cancellation handle is NULL");
+  shoal_test_result_alloc_fail_after(0);
+  assert(shoal_cancellation_create(&cancellation, &error) ==
+         SHOAL_STATUS_OUT_OF_MEMORY);
+  assert(cancellation == NULL);
+  assert(error != NULL);
+  shoal_error_free(&error);
+  shoal_test_result_alloc_reset();
+  assert(shoal_cancellation_create(&cancellation, &error) == SHOAL_STATUS_OK);
+  assert(cancellation != NULL && error == NULL);
+  uint8_t cancelled = 2;
+  assert(shoal_cancellation_is_cancelled(cancellation, &cancelled, &error) ==
+         SHOAL_STATUS_OK);
+  assert(cancelled == 0 && error == NULL);
+  expect_error(shoal_cancellation_is_cancelled(cancellation, NULL, &error),
+               SHOAL_STATUS_INVALID_ARGUMENT, &error,
+               "out_cancelled is required");
+  expect_error(shoal_scanner_scan_with_cancellation(
+                   NULL, NULL, 0, cancellation, &result, &error),
+               SHOAL_STATUS_INVALID_HANDLE, &error, "scanner handle is NULL");
+  assert(result == NULL);
+  expect_error(shoal_batch_scanner_scan_with_cancellation(
+                   NULL, NULL, 0, 0, cancellation, &result, &error),
+               SHOAL_STATUS_INVALID_HANDLE, &error,
+               "batch scanner handle is NULL");
+  assert(result == NULL);
+  assert(shoal_cancellation_cancel(cancellation, &error) == SHOAL_STATUS_OK);
+  assert(shoal_cancellation_cancel(cancellation, &error) == SHOAL_STATUS_OK);
+  assert(shoal_cancellation_is_cancelled(cancellation, &cancelled, &error) ==
+         SHOAL_STATUS_OK);
+  assert(cancelled == 1 && error == NULL);
+  shoal_cancellation_free(&cancellation);
+  assert(cancellation == NULL);
+  shoal_cancellation_free(&cancellation);
+
+  expect_error(shoal_connector_invalidate_table(
+                   admin_connector, NULL, &error),
+               SHOAL_STATUS_INVALID_ARGUMENT, &error, "table_id is required");
+  expect_error(shoal_connector_invalidate_table(
+                   admin_connector, "", &error),
+               SHOAL_STATUS_INVALID_ARGUMENT, &error, "table_id is required");
+  char invalidated_table_id[] = {'5', '\0'};
+  assert(shoal_connector_invalidate_table(
+             admin_connector, invalidated_table_id, &error) ==
+         SHOAL_STATUS_OK);
+  invalidated_table_id[0] = '6';
+  assert(shoal_connector_invalidate_discovery(admin_connector, &error) ==
+         SHOAL_STATUS_OK);
+  assert(shoal_test_connector_invalidation_matches(admin_connector, "5", 1));
 
   assert(shoal_configuration_create(&configuration, &error) == SHOAL_STATUS_OK);
   assert(configuration != NULL && error == NULL);
@@ -1952,6 +2011,10 @@ int main(void) {
                SHOAL_STATUS_CLOSED, &error, "connector is closed");
   expect_error(shoal_connector_list_table_constraints(
                    admin_connector, "events", 0, &constraints, &error),
+               SHOAL_STATUS_CLOSED, &error, "connector is closed");
+  expect_error(shoal_connector_invalidate_table(admin_connector, "5", &error),
+               SHOAL_STATUS_CLOSED, &error, "connector is closed");
+  expect_error(shoal_connector_invalidate_discovery(admin_connector, &error),
                SHOAL_STATUS_CLOSED, &error, "connector is closed");
 
   shoal_connector_free(&connector);
