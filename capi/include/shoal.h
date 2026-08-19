@@ -350,6 +350,39 @@ SHOAL_API shoal_status SHOAL_CALL
 shoal_client_create_scanner(shoal_client *client,
                             shoal_scanner **out_scanner,
                             shoal_error **out_error);
+/*
+ * Appends one copied binary column selection to future client scanners and
+ * scans. A NULL qualifier selects the whole family; a non-NULL empty
+ * qualifier selects that exact empty qualifier.
+ */
+SHOAL_API shoal_status SHOAL_CALL
+shoal_client_select_column(shoal_client *client, shoal_bytes family,
+                           const shoal_bytes *qualifier,
+                           shoal_error **out_error);
+/*
+ * Executes an owned-result scan from one atomic client settings snapshot.
+ * timeout_ms is zero for no deadline and must not be negative. Cancellation
+ * variants require a live one-shot cancellation handle. Client close cancels
+ * and joins these calls. Inputs are copied before the call can outlive them.
+ */
+SHOAL_API shoal_status SHOAL_CALL
+shoal_client_scan_range(shoal_client *client, const shoal_range *range,
+                        int64_t timeout_ms,
+                        shoal_scan_result **out_result,
+                        shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL shoal_client_scan_range_with_cancellation(
+    shoal_client *client, const shoal_range *range, int64_t timeout_ms,
+    shoal_cancellation *cancellation, shoal_scan_result **out_result,
+    shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_client_scan_ranges(shoal_client *client, const shoal_range *ranges,
+                         size_t range_count, int64_t timeout_ms,
+                         shoal_scan_result **out_result,
+                         shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL shoal_client_scan_ranges_with_cancellation(
+    shoal_client *client, const shoal_range *ranges, size_t range_count,
+    int64_t timeout_ms, shoal_cancellation *cancellation,
+    shoal_scan_result **out_result, shoal_error **out_error);
 SHOAL_API shoal_status SHOAL_CALL
 shoal_client_create_batch_writer(shoal_client *client,
                                  shoal_accumulo_writer **out_writer,

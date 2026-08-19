@@ -11,15 +11,31 @@ import (
 type clientSnapshot struct {
 	table          string
 	authorizations [][]byte
+	columns        []accumulo.Column
 	threadCount    int32
 }
+
+type clientScanOneFunc func(
+	context.Context,
+	clientSnapshot,
+	*accumulo.Range,
+) ([]accumulo.KeyValue, error)
+
+type clientScanManyFunc func(
+	context.Context,
+	clientSnapshot,
+	[]*accumulo.Range,
+) ([]accumulo.KeyValue, error)
 
 type ownedClient struct {
 	mu             sync.Mutex
 	connector      *ownedConnector
 	table          string
 	authorizations [][]byte
+	columns        []accumulo.Column
 	threadCount    int32
+	scanOne        clientScanOneFunc
+	scanMany       clientScanManyFunc
 	closed         bool
 	closeOnce      sync.Once
 	closeErr       error
@@ -31,12 +47,48 @@ func newOwnedClient(
 	authorizations [][]byte,
 	threadCount int32,
 ) *ownedClient {
-	return &ownedClient{
+	client := &ownedClient{
 		connector:      connector,
 		table:          table,
 		authorizations: cloneClientAuthorizations(authorizations),
 		threadCount:    threadCount,
 	}
+	client.scanOne = func(
+		ctx context.Context,
+		snapshot clientSnapshot,
+		scanRange *accumulo.Range,
+	) ([]accumulo.KeyValue, error) {
+		scanner, err := connector.connector.NewScanner(
+			accumulo.Table{Name: snapshot.table},
+			accumulo.ScannerOptions{
+				Authorizations: snapshot.authorizations,
+				Columns:        snapshot.columns,
+			},
+		)
+		if err != nil {
+			return nil, err
+		}
+		return scanner.Scan(ctx, scanRange)
+	}
+	client.scanMany = func(
+		ctx context.Context,
+		snapshot clientSnapshot,
+		ranges []*accumulo.Range,
+	) ([]accumulo.KeyValue, error) {
+		scanner, err := connector.connector.NewBatchScanner(
+			accumulo.Table{Name: snapshot.table},
+			accumulo.ScannerOptions{
+				Authorizations: snapshot.authorizations,
+				Columns:        snapshot.columns,
+				Parallelism:    int(snapshot.threadCount),
+			},
+		)
+		if err != nil {
+			return nil, err
+		}
+		return scanner.Scan(ctx, ranges)
+	}
+	return client
 }
 
 func (c *ownedClient) setThreads(threadCount int32) error {
@@ -78,6 +130,16 @@ func (c *ownedClient) setAuthorizations(authorizations [][]byte) error {
 	return nil
 }
 
+func (c *ownedClient) addColumn(column accumulo.Column) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return accumulo.ErrConnectorClosed
+	}
+	c.columns = append(c.columns, cloneClientColumn(column))
+	return nil
+}
+
 func (c *ownedClient) snapshot(requireTable bool) (clientSnapshot, func(), error) {
 	c.mu.Lock()
 	if c.closed {
@@ -96,10 +158,39 @@ func (c *ownedClient) snapshot(requireTable bool) (clientSnapshot, func(), error
 	snapshot := clientSnapshot{
 		table:          c.table,
 		authorizations: cloneClientAuthorizations(c.authorizations),
+		columns:        cloneClientColumns(c.columns),
 		threadCount:    c.threadCount,
 	}
 	c.mu.Unlock()
 	return snapshot, done, nil
+}
+
+func (c *ownedClient) beginSnapshot(
+	requireTable bool,
+	timeout time.Duration,
+) (context.Context, clientSnapshot, func(), error) {
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return nil, clientSnapshot{}, nil, accumulo.ErrConnectorClosed
+	}
+	if requireTable && c.table == "" {
+		c.mu.Unlock()
+		return nil, clientSnapshot{}, nil, accumulo.ErrTableNotFound
+	}
+	ctx, done, err := c.connector.begin(timeout)
+	if err != nil {
+		c.mu.Unlock()
+		return nil, clientSnapshot{}, nil, err
+	}
+	snapshot := clientSnapshot{
+		table:          c.table,
+		authorizations: cloneClientAuthorizations(c.authorizations),
+		columns:        cloneClientColumns(c.columns),
+		threadCount:    c.threadCount,
+	}
+	c.mu.Unlock()
+	return ctx, snapshot, done, nil
 }
 
 func (c *ownedClient) begin(timeout time.Duration) (context.Context, func(), error) {
@@ -137,6 +228,23 @@ func cloneClientAuthorizations(authorizations [][]byte) [][]byte {
 	result := make([][]byte, len(authorizations))
 	for index := range authorizations {
 		result[index] = append([]byte(nil), authorizations[index]...)
+	}
+	return result
+}
+
+func cloneClientColumn(column accumulo.Column) accumulo.Column {
+	family := column.Family()
+	qualifier := column.Qualifier()
+	if qualifier == nil {
+		return accumulo.NewColumnFamily(family)
+	}
+	return accumulo.NewColumn(family, qualifier)
+}
+
+func cloneClientColumns(columns []accumulo.Column) []accumulo.Column {
+	result := make([]accumulo.Column, len(columns))
+	for index := range columns {
+		result[index] = cloneClientColumn(columns[index])
 	}
 	return result
 }

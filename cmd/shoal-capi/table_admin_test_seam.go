@@ -830,6 +830,41 @@ func shoal_test_client_create(outClient **C.shoal_client) C.int {
 		configuration: accumulo.NewConfiguration(),
 	})
 	client := newOwnedClient(owner, "events", [][]byte{[]byte("A")}, 10)
+	client.scanOne = func(
+		ctx context.Context,
+		_ clientSnapshot,
+		_ *accumulo.Range,
+	) ([]accumulo.KeyValue, error) {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		return []accumulo.KeyValue{{
+			Key: accumulo.Key{
+				Row:             []byte("single"),
+				ColumnFamily:    []byte("cf"),
+				ColumnQualifier: []byte("cq"),
+				Timestamp:       7,
+			},
+			Value: []byte("value"),
+		}}, nil
+	}
+	client.scanMany = func(
+		ctx context.Context,
+		_ clientSnapshot,
+		ranges []*accumulo.Range,
+	) ([]accumulo.KeyValue, error) {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		values := make([]accumulo.KeyValue, len(ranges))
+		for index := range ranges {
+			values[index] = accumulo.KeyValue{
+				Key:   accumulo.Key{Row: []byte("many"), Timestamp: int64(index)},
+				Value: []byte{byte(index)},
+			}
+		}
+		return values, nil
+	}
 	id, ok := clients.add(client)
 	if !ok {
 		_ = client.close()
@@ -842,6 +877,46 @@ func shoal_test_client_create(outClient **C.shoal_client) C.int {
 		return 0
 	}
 	*outClient = handle
+	return 1
+}
+
+//export shoal_test_client_columns_match
+func shoal_test_client_columns_match(
+	handle *C.shoal_client,
+	familyValue C.shoal_bytes,
+	qualifierValue C.shoal_bytes,
+	hasQualifier C.uint8_t,
+	columnCount C.size_t,
+) C.int {
+	client, err := lookupClient(handle)
+	if err != nil {
+		return 0
+	}
+	family, err := copyByteValue(familyValue, "column family")
+	if err != nil {
+		return 0
+	}
+	qualifier, err := copyByteValue(qualifierValue, "column qualifier")
+	if err != nil {
+		return 0
+	}
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	if len(client.columns) != int(columnCount) || len(client.columns) == 0 {
+		return 0
+	}
+	column := client.columns[len(client.columns)-1]
+	if !bytes.Equal(column.Family(), family) {
+		return 0
+	}
+	actualQualifier := column.Qualifier()
+	if hasQualifier == 0 {
+		if actualQualifier != nil {
+			return 0
+		}
+	} else if !bytes.Equal(actualQualifier, qualifier) {
+		return 0
+	}
 	return 1
 }
 
