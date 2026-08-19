@@ -271,6 +271,20 @@ is not the holder queues behind the holder's **lowest** node rather than
 its immediate predecessor, so it wakes when that process leaves rather
 than when it tidies up a duplicate of its own.
 
+That scan stops where the prefix changes, which finds the holder's
+lowest node only while that holder's nodes are contiguous. They need not
+be — a create whose response was lost is retried against whatever the
+sequence counter has reached by then, so a directory can read A, B, A —
+and in that shape a candidate below parks on A's second node instead of
+its first. `ServiceLock.findLowestPrevPrefix` stops in the same place,
+and matching it is deliberate: which node a candidate waits on is a
+private choice ZooKeeper does not arbitrate, so answering differently
+from the implementation this one is read against buys nothing. The
+error is always in the safe direction. Every node the scan can return
+is ahead of the caller, and a node ahead of the caller has to go before
+the caller can be lowest, so an off answer costs a pass over the
+directory rather than a missed turn.
+
 A queued candidate watches its own node as well. The node ahead says
 when its turn arrives; its own node says when the turn will never
 arrive. Watching only the node ahead leaves a candidate whose node was
@@ -437,6 +451,27 @@ manager reading one out of this lock would have to substitute some host
 of its own to dial, landing the work on whichever server it substituted.
 What a server binds and what it advertises are different questions, and
 only the second belongs in the lock.
+
+A `+` anywhere in the address is refused too, and that one is about the
+reader rather than the address. Everything on the Java side that turns a
+descriptor into something dialable goes through
+`AddressUtil.parseAddress`, which begins by replacing every `+` with `:`
+— the encoding older Accumulo used to spell `host+port` inside a path
+segment — before handing the result to `HostAndPort.fromString`. So an
+address that Go reads as a perfectly good `host:port` can arrive as a
+different string, and usually not an address at all:
+`shoal-1.example:+9997` is read as `shoal-1.example::9997` and throws.
+The throw surfaces in the manager's scan over the live servers, where it
+ends the pass over all of them rather than the reading of this one — the
+blast radius a missing `TSERV` descriptor has. Nothing that belongs in a
+hostname, an IP literal or a port contains a `+`, so refusing it costs a
+deployment nothing.
+
+The port is read as its own grammar rather than as whatever the nearest
+conversion function will accept. `strconv.Atoi` takes a sign, so `+9997`
+and `-9997` are numbers to Go; Guava's `HostAndPort` refuses a port that
+is not all digits. Checking the digits before the value is what keeps
+the two ends agreeing on what was published.
 
 That cuts both ways: a process should advertise what it can serve, not
 what it intends to serve. `TabletServerServices()` names the full Java

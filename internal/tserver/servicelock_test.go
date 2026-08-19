@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"path"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1503,7 +1504,59 @@ func TestFindLowestPrevPrefix(t *testing.T) {
 			if got := findLowestPrevPrefix(tt.sorted, tt.index); got != tt.want {
 				t.Fatalf("findLowestPrevPrefix = %q, want %q", got, tt.want)
 			}
+			// Whatever it picks, it picks something below us. That is the
+			// property the wait depends on: a node below us has to go before
+			// we can be lowest, so watching any of them cannot leave us
+			// asleep past our turn.
+			if !slices.Contains(tt.sorted[:tt.index], findLowestPrevPrefix(tt.sorted, tt.index)) {
+				t.Fatalf("findLowestPrevPrefix returned %q, which is not one of the nodes ahead of us %v",
+					findLowestPrevPrefix(tt.sorted, tt.index), tt.sorted[:tt.index])
+			}
 		})
+	}
+}
+
+// TestFindLowestPrevPrefixStopsAtTheFirstOtherHolder is about the one shape
+// where "lowest node of the holder ahead of us" and "what this returns" come
+// apart: a holder whose nodes are not contiguous.
+//
+// A create whose response was lost leaves a node behind, and the retry lands
+// wherever the sequence counter has got to by then — so a directory can read
+// A, B, A, C. Scanning back from C, this stops at A's *second* node rather
+// than reaching past B to A's first, because the scan ends at the first
+// different prefix. ServiceLock.findLowestPrevPrefix does exactly the same,
+// and matching it is deliberate: the node a candidate parks on is a private
+// choice that ZooKeeper does not arbitrate, so there is nothing to gain by
+// answering differently from the implementation this one is read against.
+//
+// What it costs is one spurious wakeup, in the window before A collapses its
+// own duplicate: C wakes when A#2 goes, re-reads the directory, finds B still
+// ahead of it and parks again. What it cannot cost is a missed wakeup — A#2
+// is below C, so C cannot reach the front without it going first.
+func TestFindLowestPrevPrefixStopsAtTheFirstOtherHolder(t *testing.T) {
+	aFirst := "zlock#" + otherUUID + "#0000000000"
+	b := "zlock#" + managerUUID + "#0000000001"
+	aSecond := "zlock#" + otherUUID + "#0000000002"
+	ours := "zlock#" + serverUUID + "#0000000003"
+	interleaved := []string{aFirst, b, aSecond, ours}
+
+	got := findLowestPrevPrefix(interleaved, 3)
+	if got != aSecond {
+		t.Fatalf("findLowestPrevPrefix = %q, want %q — the scan stops where the prefix changes", got, aSecond)
+	}
+	if got == aFirst {
+		t.Fatal("reaching past an intervening holder would diverge from ServiceLock.findLowestPrevPrefix")
+	}
+	if !slices.Contains(interleaved[:3], got) {
+		t.Fatalf("findLowestPrevPrefix returned %q, which is not ahead of us", got)
+	}
+
+	// The wakeup that this arrangement produces is an extra pass, not a
+	// missed one: once the duplicate is gone the directory is contiguous
+	// again and the next pass parks on the holder actually ahead of us.
+	collapsed := []string{aFirst, b, ours}
+	if got := findLowestPrevPrefix(collapsed, 2); got != b {
+		t.Fatalf("after the duplicate is collapsed: findLowestPrevPrefix = %q, want %q", got, b)
 	}
 }
 

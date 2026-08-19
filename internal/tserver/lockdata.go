@@ -226,6 +226,18 @@ func validateAdvertiseAddress(address string) error {
 	if address == placeholderAddress {
 		return fmt.Errorf("address %q is the unbound placeholder", address)
 	}
+	if strings.ContainsRune(address, '+') {
+		// Every Accumulo reader of this address goes through
+		// AddressUtil.parseAddress, which replaces each '+' with ':' before
+		// parsing — the encoding older Accumulo used to spell host+port in a
+		// path segment. A '+' anywhere therefore names one endpoint here and
+		// a different string there, and usually not a host:port at all:
+		// "shoal-1.example:+9997" is read as "shoal-1.example::9997", which
+		// throws out of the manager's scan over every live server rather than
+		// out of the reading of this one. Nothing that belongs in a hostname,
+		// an IP literal or a port contains '+', so refusing it costs nothing.
+		return fmt.Errorf("address %q contains '+', which Accumulo rewrites to ':' before parsing", address)
+	}
 	host, port, err := net.SplitHostPort(address)
 	if err != nil {
 		return fmt.Errorf("address %q is not host:port: %w", address, err)
@@ -248,9 +260,18 @@ func validateAdvertiseAddress(address string) error {
 		// whichever server the reader guessed rather than this one.
 		return fmt.Errorf("address %q is a wildcard listen address, not a reachable one", address)
 	}
+	// A port is a bare decimal, and that is what reads it on the other side:
+	// Guava's HostAndPort refuses a port string that is not all digits.
+	// strconv.Atoi is more permissive than the grammar — it accepts a sign —
+	// so the digits are checked before the value is.
+	for _, r := range port {
+		if r < '0' || r > '9' {
+			return fmt.Errorf("address %q port %q is not a decimal number", address, port)
+		}
+	}
 	number, err := strconv.Atoi(port)
 	if err != nil {
-		return fmt.Errorf("address %q has a non-numeric port: %w", address, err)
+		return fmt.Errorf("address %q has an unreadable port: %w", address, err)
 	}
 	if number < 1 || number > 65535 {
 		return fmt.Errorf("address %q port %d is out of range", address, number)

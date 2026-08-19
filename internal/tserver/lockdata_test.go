@@ -399,6 +399,8 @@ func TestEncodeRefusesUnusableAdvertisements(t *testing.T) {
 		{"non-numeric port", with(func(d *ServiceDescriptor) { d.Address = "shoal-1.example:thrift" })},
 		{"port zero", with(func(d *ServiceDescriptor) { d.Address = "shoal-1.example:0" })},
 		{"port past the range", with(func(d *ServiceDescriptor) { d.Address = "shoal-1.example:70000" })},
+		{"signed port", with(func(d *ServiceDescriptor) { d.Address = "shoal-1.example:+9997" })},
+		{"host Accumulo would rewrite", with(func(d *ServiceDescriptor) { d.Address = "shoal+1.example:9997" })},
 		{"duplicate service", ServiceLockData{Descriptors: []ServiceDescriptor{good, good}}},
 	}
 	for _, tt := range tests {
@@ -447,6 +449,65 @@ func TestWildcardListenAddressIsRefused(t *testing.T) {
 				t.Fatalf("TabletServerLockData(%q): %v", address, err)
 			}
 		})
+	}
+}
+
+// TestAddressAccumuloWouldRewriteIsRefused pins the one character that does
+// not survive the trip. Every reader of a descriptor goes through
+// AddressUtil.parseAddress, which begins by replacing every '+' with ':'
+// before handing the result to HostAndPort.fromString. An address that Go
+// reads as a perfectly good host:port therefore becomes a different string on
+// the other side, and one with two colons in it is not a host:port at all:
+// "shoal-1.example:+9997" arrives as "shoal-1.example::9997" and throws.
+//
+// The throw lands in the manager's live-server scan, where it ends the pass
+// over every server rather than the reading of this one — the same blast
+// radius as the missing TSERV descriptor. Refusing the character here means a
+// server that would be unreadable never publishes.
+//
+// A '+' cannot appear in a hostname, an IP literal or a port, so nothing that
+// belongs in an advertise address is lost by refusing it outright.
+func TestAddressAccumuloWouldRewriteIsRefused(t *testing.T) {
+	for _, address := range []string{
+		"shoal-1.example:+9997", // becomes shoal-1.example::9997
+		"shoal+1.example:9997",  // becomes shoal:1.example:9997
+		"+shoal-1.example:9997", // becomes :shoal-1.example:9997
+		"[::1]:+9997",           // becomes [::1]::9997
+		"shoal-1.example+9997",  // the host+port form; not what we advertise
+	} {
+		t.Run(address, func(t *testing.T) {
+			_, err := TabletServerLockData(serverUUID, address, testGroup, ServiceTabletServer)
+			if !errors.Is(err, ErrInvalidLockData) {
+				t.Fatalf("TabletServerLockData(%q): want ErrInvalidLockData, got %v", address, err)
+			}
+		})
+	}
+}
+
+// TestPortIsDigitsRatherThanASignedNumber closes the gap the '+' arrived
+// through. strconv.Atoi reads a sign, so "+9997" and "-9997" are numbers to
+// Go; a port is a bare decimal to everyone else, and Guava's HostAndPort
+// refuses anything that is not all digits. Reading the port the way its
+// grammar defines it — rather than the way the nearest conversion function
+// happens to — is what keeps the two ends agreeing.
+func TestPortIsDigitsRatherThanASignedNumber(t *testing.T) {
+	for _, address := range []string{
+		"shoal-1.example:+9997",
+		"shoal-1.example:-9997",
+		"shoal-1.example: 9997",
+		"shoal-1.example:9997 ",
+	} {
+		t.Run(address, func(t *testing.T) {
+			_, err := TabletServerLockData(serverUUID, address, testGroup, ServiceTabletServer)
+			if !errors.Is(err, ErrInvalidLockData) {
+				t.Fatalf("TabletServerLockData(%q): want ErrInvalidLockData, got %v", address, err)
+			}
+		})
+	}
+	// The ordinary form still passes: this is a narrowing of the port
+	// grammar, not of the addresses a deployment may use.
+	if _, err := TabletServerLockData(serverUUID, "shoal-1.example:9997", testGroup, ServiceTabletServer); err != nil {
+		t.Fatalf("TabletServerLockData: %v", err)
 	}
 }
 

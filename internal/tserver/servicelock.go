@@ -255,14 +255,31 @@ func sortLockNodes(children []string) []string {
 	return names
 }
 
-// findLowestPrevPrefix returns the node a queued candidate at index must watch:
-// the lowest-sequence node of the holder immediately ahead of it.
+// findLowestPrevPrefix returns the node a queued candidate at index waits on:
+// scanning back from the node immediately ahead of it, the lowest node that
+// still carries that node's prefix.
 //
 // Watching the immediate predecessor alone is not enough. A single process may
 // leave several nodes behind — a create whose response was lost still created
 // one — and they all carry that process's prefix. Watching its highest node
 // would wake this one when a duplicate is cleaned up rather than when the
-// holder actually leaves. Mirrors ServiceLock.findLowestPrevPrefix.
+// holder actually leaves.
+//
+// The scan stops at the first node with a different prefix, so it finds the
+// holder's lowest node only where that holder's nodes are contiguous. They
+// need not be: a lost create response is retried against whatever the sequence
+// counter has reached, so a directory can read A, B, A. Scanning back from a
+// candidate below that, this answers with A's second node rather than reaching
+// past B to its first. ServiceLock.findLowestPrevPrefix stops in the same
+// place, and matching it is deliberate — which node a candidate parks on is a
+// private choice ZooKeeper does not arbitrate, so answering differently from
+// the implementation this one is read against buys nothing.
+//
+// The cost of stopping early is a wakeup too many, never one too few: every
+// node this can return is ahead of the caller, and a node ahead of the caller
+// has to go before the caller can be lowest. Waking on A's duplicate rather
+// than on A's departure costs one more pass over a directory that has, by
+// then, been collapsed back to one node per holder.
 func findLowestPrevPrefix(sorted []string, index int) string {
 	previous := sorted[index-1]
 	prefixEnd := strings.LastIndex(previous, "#")
