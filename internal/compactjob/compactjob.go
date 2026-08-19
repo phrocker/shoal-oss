@@ -455,6 +455,18 @@ func Translate(job *tabletserver.TExternalCompactionJob, opts Options) (*Plan, e
 		return nil, err
 	}
 
+	if job.GetOverrides() == nil {
+		// Compactor.initialize opens with job.getOverrides().isEmpty();
+		// a missing map is a null there, not an empty one, so the
+		// reference implementation throws before it reads a single file.
+		// Reading it as "no overrides" would have shoal call a job
+		// translatable that the compactor it is standing in for cannot
+		// start. Thrift decodes a present empty map into a non-nil one,
+		// so the two really are distinguishable on the wire.
+		return nil, refuse(ClassMalformedJob, "overrides",
+			"missing; Compactor.initialize dereferences it before reading any file")
+	}
+
 	overrideKeys, blockSizeOverride, err := parseOverrides(job.GetOverrides())
 	if err != nil {
 		return nil, err
@@ -718,6 +730,11 @@ func (p parsedInput) key() string {
 // The path itself stays case-sensitive, as it is on every filesystem
 // Accumulo runs on, and the port stays because resolve compares it as
 // part of the authority.
+//
+// An authority that folds away to nothing is rendered without the "//",
+// so every spelling of "no host" is one identity: resolve keeps u.Host,
+// which is empty for hdfs:/p, hdfs:///p and hdfs://alice@/p alike, and
+// opens the same file for all three.
 func pathIdentity(raw string) string {
 	colon := strings.Index(raw, ":")
 	if colon <= 0 {
@@ -725,8 +742,13 @@ func pathIdentity(raw string) string {
 	}
 	id := strings.ToLower(raw[:colon]) + raw[colon:]
 	start, end := authoritySpan(id)
-	if start >= end {
+	if start == 0 && end == 0 {
+		// No "//": there is no authority to fold, and the spelling is
+		// already the one an empty authority collapses to.
 		return decodeEscapes(id)
+	}
+	if start >= end {
+		return decodeEscapes(id[:colon+1] + id[end:])
 	}
 	authority := id[start:end]
 	// Drop the userinfo and fold the host: for an IPv6 literal that runs
@@ -742,6 +764,10 @@ func pathIdentity(raw string) string {
 		rest = host + port
 	}
 	folded := strings.ToLower(authority[host:rest]) + authority[rest:]
+	if folded == "" {
+		// Userinfo only: resolve drops it, leaving no host at all.
+		return decodeEscapes(id[:colon+1] + id[end:])
+	}
 	return decodeEscapes(id[:start] + folded + id[end:])
 }
 
@@ -1915,10 +1941,22 @@ type rawIterator struct {
 // byte order, because the names come from user configuration
 // (IteratorSetting) rather than from a fixed set.
 func parseIterators(job *tabletserver.TExternalCompactionJob) ([]rawIterator, error) {
-	if !job.IsSetIteratorSettings() || job.GetIteratorSettings() == nil {
-		return nil, nil
+	// Compactor.initialize runs
+	// job.getIteratorSettings().getIterators().forEach(...) with no
+	// guard, so both containers are dereferenced before any file is
+	// read: a job missing either is one the reference implementation
+	// throws on, not one with an empty stack. Only a present, empty list
+	// means "no iterators". Thrift decodes a present empty list into a
+	// non-nil slice, so the shapes are distinguishable on the wire.
+	if job.GetIteratorSettings() == nil {
+		return nil, refuse(ClassMalformedJob, "iteratorSettings",
+			"missing; Compactor.initialize dereferences it before reading any file")
 	}
 	settings := job.GetIteratorSettings().GetIterators()
+	if settings == nil {
+		return nil, refuse(ClassMalformedJob, "iteratorSettings.iterators",
+			"missing; Compactor.initialize iterates it before reading any file")
+	}
 	if len(settings) == 0 {
 		return nil, nil
 	}

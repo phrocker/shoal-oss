@@ -238,6 +238,11 @@ func translatableJob(ecid string) *tabletserver.TExternalCompactionJob {
 			Properties:    map[string]string{"maxVersions": "1"},
 		}},
 	}
+	// Present and empty, the way a coordinator sends a job with no
+	// property overrides. Compactor.initialize dereferences the map
+	// before it reads a file, so a missing one is a job Java throws on
+	// rather than one with nothing to override.
+	job.Overrides = map[string]string{}
 	return job
 }
 

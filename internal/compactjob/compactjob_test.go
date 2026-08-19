@@ -94,6 +94,14 @@ func validJob() *tabletserver.TExternalCompactionJob {
 	job.OutputFile = tmpOutput(testECID)
 	job.PropagateDeletes = true
 	job.Kind = tabletserver.TCompactionKind_SYSTEM
+	// Both containers are present and empty, which is what a coordinator
+	// sends for a job with no overrides and no iterators — and what
+	// Compactor.initialize requires, since it dereferences both before
+	// reading a file. Thrift decodes a present empty map or list into a
+	// non-nil one, so this is a different wire shape than leaving them
+	// unset.
+	job.Overrides = map[string]string{}
+	job.IteratorSettings = iterConfig()
 	return job
 }
 
@@ -105,7 +113,14 @@ func tmpOutput(ecid string) string {
 	return "hdfs://nn/accumulo/tables/2/t-0001/C0003.rf_tmp_" + ecid
 }
 
+// iterConfig builds the iterator container a coordinator sends. The list
+// is always present — Compactor.initialize iterates it unguarded — so a
+// call with no settings still yields an empty, non-nil list rather than
+// the nil a bare variadic would leave.
 func iterConfig(settings ...*tabletserver.TIteratorSetting) *tabletserver.IteratorConfig {
+	if settings == nil {
+		settings = []*tabletserver.TIteratorSetting{}
+	}
 	return &tabletserver.IteratorConfig{Iterators: settings}
 }
 
@@ -922,6 +937,11 @@ func TestPathIdentityFoldsWhatOpensOneFile(t *testing.T) {
 		{"ipv6 literal", "HDFS://[2001:DB8::1]:9000/A/B.rf", "hdfs://[2001:db8::1]:9000/A/B.rf"},
 		{"userinfo before an ipv6 literal", "hdfs://u@[2001:DB8::1]/A/B.rf", "hdfs://[2001:db8::1]/A/B.rf"},
 		{"no authority", "FILE:/A/B.rf", "file:/A/B.rf"},
+		// Backend.resolve keeps u.Host, which is empty for all three of
+		// these, so they name one file and get one identity.
+		{"empty authority", "HDFS:///A/B.rf", "hdfs:/A/B.rf"},
+		{"userinfo and nothing else", "hdfs://alice@/A/B.rf", "hdfs:/A/B.rf"},
+		{"empty authority and no path", "HDFS://", "hdfs:"},
 		{"authority runs to the end", "HDFS://NN", "hdfs://nn"},
 		{"no scheme at all", "/A/B.rf", "/A/B.rf"},
 		// Escapes are decoded because that is the path shoal's HDFS
@@ -1004,6 +1024,39 @@ func TestTranslateRefusesAnOutputAliasingAnInputByUserinfo(t *testing.T) {
 		{MetadataFileEntry: storedFile("hdfs://alice@nn/accumulo/tables/2/t-0001/F0001.rf"), Size: 8, Entries: 1},
 	}
 	job.OutputFile = "hdfs://nn/accumulo/tables/2/t-0001/F0001.rf" + tmpSuffix(testECID)
+
+	r := assertRefused(t, job, Options{}, ClassMalformedJob, "outputFile")
+	if !strings.Contains(r.Detail, "which is also files[0]") {
+		t.Fatalf("detail = %q, want it to name the input it commits over", r.Detail)
+	}
+}
+
+// TestTranslateRefusesOnePathSpelledWithAnEmptyAuthority: hdfs:/p and
+// hdfs:///p both parse to an empty host and the same path, so
+// Backend.resolve opens one file for both. Two inputs spelled that way
+// would have every cell in the file merged twice.
+func TestTranslateRefusesOnePathSpelledWithAnEmptyAuthority(t *testing.T) {
+	job := validJob()
+	job.Files = []*tabletserver.InputFile{
+		{MetadataFileEntry: storedFile("hdfs:/accumulo/tables/2/t-0001/F0001.rf"), Size: 8, Entries: 1},
+		{MetadataFileEntry: storedFile("hdfs:///accumulo/tables/2/t-0001/F0001.rf"), Size: 8, Entries: 1},
+	}
+
+	r := assertRefused(t, job, Options{}, ClassMalformedJob, "files[1]")
+	if !strings.Contains(r.Detail, "duplicates files[0]") {
+		t.Fatalf("detail = %q, want it to name the entry it duplicates", r.Detail)
+	}
+}
+
+// TestTranslateRefusesAnOutputAliasingAnInputByEmptyAuthority is the
+// same spelling on the output side, where the manager's rename would
+// land on a file the tablet still references.
+func TestTranslateRefusesAnOutputAliasingAnInputByEmptyAuthority(t *testing.T) {
+	job := validJob()
+	job.Files = []*tabletserver.InputFile{
+		{MetadataFileEntry: storedFile("hdfs:///accumulo/tables/2/t-0001/F0001.rf"), Size: 8, Entries: 1},
+	}
+	job.OutputFile = "hdfs:/accumulo/tables/2/t-0001/F0001.rf" + tmpSuffix(testECID)
 
 	r := assertRefused(t, job, Options{}, ClassMalformedJob, "outputFile")
 	if !strings.Contains(r.Detail, "which is also files[0]") {
@@ -1969,19 +2022,55 @@ func TestTranslateRefusesTheFirstIteratorInExecutionOrder(t *testing.T) {
 // TestTranslateAcceptsEmptyIteratorStack: no majc iterators configured is
 // an identity compaction, not an error.
 func TestTranslateAcceptsEmptyIteratorStack(t *testing.T) {
+	job := validJob()
+	job.IteratorSettings = iterConfig()
+
+	plan := mustTranslate(t, job, Options{})
+	if len(plan.Stack) != 0 {
+		t.Fatalf("Stack = %+v, want empty", plan.Stack)
+	}
+}
+
+// TestTranslateRefusesMissingRequiredContainers: Compactor.initialize
+// opens with job.getOverrides().isEmpty() and then runs
+// job.getIteratorSettings().getIterators().forEach(...), all unguarded,
+// so a job missing any of those three containers is one the reference
+// implementation throws on before it reads a single file. Reading a
+// missing container as an empty one would have shoal call such a job
+// translatable. Thrift decodes a present empty map or list into a
+// non-nil one, so "absent" and "present and empty" really are different
+// wire shapes and only the second means "nothing configured".
+func TestTranslateRefusesMissingRequiredContainers(t *testing.T) {
 	for _, tt := range []struct {
-		name     string
-		settings *tabletserver.IteratorConfig
+		name   string
+		mutate func(*tabletserver.TExternalCompactionJob)
+		field  string
 	}{
-		{"unset", nil},
-		{"empty list", iterConfig()},
+		{
+			name:   "overrides",
+			mutate: func(j *tabletserver.TExternalCompactionJob) { j.Overrides = nil },
+			field:  "overrides",
+		},
+		{
+			name:   "iteratorSettings",
+			mutate: func(j *tabletserver.TExternalCompactionJob) { j.IteratorSettings = nil },
+			field:  "iteratorSettings",
+		},
+		{
+			name: "iterator list inside a present config",
+			mutate: func(j *tabletserver.TExternalCompactionJob) {
+				j.IteratorSettings = &tabletserver.IteratorConfig{}
+			},
+			field: "iteratorSettings.iterators",
+		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			job := validJob()
-			job.IteratorSettings = tt.settings
-			plan := mustTranslate(t, job, Options{})
-			if len(plan.Stack) != 0 {
-				t.Fatalf("Stack = %+v, want empty", plan.Stack)
+			tt.mutate(job)
+
+			r := assertRefused(t, job, Options{}, ClassMalformedJob, tt.field)
+			if !strings.Contains(r.Detail, "Compactor.initialize") {
+				t.Fatalf("detail = %q, want it to name what dereferences the container", r.Detail)
 			}
 		})
 	}
@@ -1999,11 +2088,13 @@ func TestTranslateOverridesResolveOutputEncoding(t *testing.T) {
 	}{
 		{
 			name:      "no overrides falls back to the caller's table defaults",
+			overrides: map[string]string{},
 			opts:      Options{DefaultCodec: block.CodecSnappy, DefaultBlockSize: 64 * 1024},
 			wantCodec: block.CodecSnappy, wantBlockSize: 64 * 1024,
 		},
 		{
 			name:      "no overrides and no defaults defers to the composer",
+			overrides: map[string]string{},
 			wantCodec: "", wantBlockSize: 0,
 		},
 		{
