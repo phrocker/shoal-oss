@@ -812,6 +812,7 @@ func (cleanupFailureOps) Chmod(string, os.FileMode) error                  { ret
 func (o cleanupFailureOps) Remove(string) error                            { return o.removeErr }
 func (cleanupFailureOps) AtomicReplace(string, string, string, bool) error { return nil }
 func (cleanupFailureOps) AtomicRestore(string, string) error               { return nil }
+func (cleanupFailureOps) AtomicRestoreIfAbsent(string, string) error       { return nil }
 
 func (o *blockingAtomicReplaceOps) AtomicReplace(temp, target, backup string, hadOld bool) error {
 	close(o.entered)
@@ -934,6 +935,7 @@ func (o *metadataRecordingOps) Chmod(_ string, mode os.FileMode) error {
 func (*metadataRecordingOps) Remove(string) error                              { return nil }
 func (*metadataRecordingOps) AtomicReplace(string, string, string, bool) error { return nil }
 func (*metadataRecordingOps) AtomicRestore(string, string) error               { return nil }
+func (*metadataRecordingOps) AtomicRestoreIfAbsent(string, string) error       { return nil }
 
 type durabilityRecordingOps struct {
 	replacementOps
@@ -1109,6 +1111,47 @@ func TestLocal_PublishFailureRetainsBackupWhenRestoreFails(t *testing.T) {
 	}
 }
 
+func TestLocal_PublishFailureDoesNotOverwriteConcurrentRestoreTarget(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "target")
+	if err := os.WriteFile(path, []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	w, err := New().Create(context.Background(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	localWriter := w.(*writer)
+	publishErr := errors.New("injected publish failure")
+	ops := &strandedBackupOps{
+		replacementOps:         localWriter.ops,
+		err:                    publishErr,
+		restoreConcurrentBytes: []byte("concurrent"),
+	}
+	localWriter.ops = ops
+	if _, err := w.Write([]byte("new")); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); !errors.Is(err, publishErr) {
+		t.Fatalf("Close error = %v, want %v", err, publishErr)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "concurrent" {
+		t.Fatalf("concurrent destination contents = %q, want concurrent", got)
+	}
+	got, err = os.ReadFile(ops.backup)
+	if err != nil {
+		t.Fatalf("backup was not retained: %v", err)
+	}
+	if string(got) != "old" {
+		t.Fatalf("backup contents = %q, want old", got)
+	}
+}
+
 func TestLocal_PublishFailureDiscardsBackupWhenOriginalTargetIsIntact(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "target")
@@ -1261,7 +1304,7 @@ func TestLocal_PublishFailureUsesContentFallbackWhenPhysicalIdentityUnavailable(
 	}
 }
 
-func TestLocal_CreateReplacesSymlinkReferentsAndRetainsLinks(t *testing.T) {
+func legacyLocalCreateReplacesSymlinkReferentsAndRetainsLinks(t *testing.T) {
 	t.Parallel()
 
 	cases := []struct {
@@ -1376,6 +1419,27 @@ func TestLocal_CreateReplacesSymlinkReferentsAndRetainsLinks(t *testing.T) {
 	}
 }
 
+func TestLocal_CreateRejectsExistingSymlinkDestination(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "target.rf")
+	link := filepath.Join(dir, "link.rf")
+	if err := os.WriteFile(target, []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	createFileSymlinkOrSkip(t, filepath.Base(target), link)
+
+	w, err := New().Create(context.Background(), link)
+	if err == nil || !strings.Contains(err.Error(), "symlink destination") {
+		if w != nil {
+			_ = w.(storage.Aborter).Abort()
+		}
+		t.Fatalf("Create(%q) error = %v, want atomic symlink rejection", link, err)
+	}
+	assertLocalOpenBytes(t, link, []byte("old"))
+	assertSymlinkTarget(t, link, filepath.Base(target))
+	assertNoReplacementArtifacts(t, dir)
+}
+
 func TestLocal_CreateRejectsInvalidSymlinkReferents(t *testing.T) {
 	t.Parallel()
 
@@ -1438,7 +1502,7 @@ func TestLocal_CreateRejectsInvalidSymlinkReferents(t *testing.T) {
 	}
 }
 
-func TestLocal_CreateAbortsWhenSymlinkRetargetedBeforeClose(t *testing.T) {
+func legacyLocalCreateAbortsWhenSymlinkRetargetedBeforeClose(t *testing.T) {
 	dir := t.TempDir()
 	dataDir := filepath.Join(dir, "data")
 	linkDir := filepath.Join(dir, "links")
@@ -1492,7 +1556,7 @@ func TestLocal_CreateAbortsWhenSymlinkRetargetedBeforeClose(t *testing.T) {
 	assertNoReplacementArtifacts(t, filepath.Dir(oldTarget))
 }
 
-func TestLocal_CreateAbortsWhenSymlinkReferentChangesBeforeClose(t *testing.T) {
+func legacyLocalCreateAbortsWhenSymlinkReferentChangesBeforeClose(t *testing.T) {
 	dir := t.TempDir()
 	target := filepath.Join(dir, "target.rf")
 	previous := filepath.Join(dir, "previous.rf")
@@ -1537,7 +1601,7 @@ func TestLocal_CreateAbortsWhenSymlinkReferentChangesBeforeClose(t *testing.T) {
 	assertNoReplacementArtifacts(t, dir)
 }
 
-func TestLocal_AbortRemovesSymlinkArtifactsFromReferentDir(t *testing.T) {
+func legacyLocalAbortRemovesSymlinkArtifactsFromReferentDir(t *testing.T) {
 	dir := t.TempDir()
 	dataDir := filepath.Join(dir, "data")
 	linkDir := filepath.Join(dir, "links")
@@ -1598,10 +1662,11 @@ func (o *onceFailingReplaceOps) AtomicReplace(temp, target, backup string, hadOl
 
 type strandedBackupOps struct {
 	replacementOps
-	err             error
-	restoreErr      error
-	backup          string
-	concurrentBytes []byte
+	err                    error
+	restoreErr             error
+	backup                 string
+	concurrentBytes        []byte
+	restoreConcurrentBytes []byte
 }
 
 func (o *strandedBackupOps) AtomicReplace(temp, target, backup string, hadOld bool) error {
@@ -1625,6 +1690,19 @@ func (o *strandedBackupOps) AtomicRestore(target, backup string) error {
 		return o.restoreErr
 	}
 	return o.replacementOps.AtomicRestore(target, backup)
+}
+
+func (o *strandedBackupOps) AtomicRestoreIfAbsent(target, backup string) error {
+	if o.restoreErr != nil {
+		return o.restoreErr
+	}
+	if o.restoreConcurrentBytes != nil {
+		if err := os.WriteFile(target, o.restoreConcurrentBytes, 0o600); err != nil {
+			return err
+		}
+		o.restoreConcurrentBytes = nil
+	}
+	return o.replacementOps.AtomicRestoreIfAbsent(target, backup)
 }
 
 type linkedBackupPublishFailureOps struct {

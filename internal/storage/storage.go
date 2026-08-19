@@ -341,7 +341,7 @@ func Copy(ctx context.Context, src Backend, srcPath string, dst Backend, dstPath
 
 // ReadAll opens path on b and reads the whole object into a single byte
 // slice via ReadAt. This is the "pull-through" read used when an RFile is
-// faulted into the local byte cache: one object fetch, fully resident.
+// faulted into the local byte cache: fully resident after bounded range reads.
 // For large objects where only a few blocks are needed, prefer wiring the
 // File's ReadAt directly into the reader instead of ReadAll. Reads are bounded
 // to 64KB, and ctx is polled before and immediately after each backend read.

@@ -21,7 +21,7 @@ func TestLocal_ReplacementPreservesExtendedAttributes(t *testing.T) {
 
 	const attr = "user.shoal-preserve"
 	want := []byte("value")
-	if err := unix.Setxattr(path, attr, want, 0); err != nil {
+	if err := setXattr(path, attr, want, 0); err != nil {
 		if errors.Is(err, unix.ENOTSUP) || errors.Is(err, unix.EOPNOTSUPP) || errors.Is(err, unix.EPERM) {
 			t.Skipf("extended attributes unavailable: %v", err)
 		}
@@ -63,16 +63,16 @@ func TestPreservePlatformXattrsRemovesAttributesAbsentFromTarget(t *testing.T) {
 		keepAttr  = "user.shoal-keep"
 		extraAttr = "user.shoal-inherited"
 	)
-	if err := unix.Setxattr(target, keepAttr, []byte("target"), 0); err != nil {
+	if err := setXattr(target, keepAttr, []byte("target"), 0); err != nil {
 		if errors.Is(err, unix.ENOTSUP) || errors.Is(err, unix.EOPNOTSUPP) || errors.Is(err, unix.EPERM) {
 			t.Skipf("extended attributes unavailable: %v", err)
 		}
 		t.Fatal(err)
 	}
-	if err := unix.Setxattr(temp, keepAttr, []byte("inherited"), 0); err != nil {
+	if err := setXattr(temp, keepAttr, []byte("inherited"), 0); err != nil {
 		t.Fatal(err)
 	}
-	if err := unix.Setxattr(temp, extraAttr, []byte("remove"), 0); err != nil {
+	if err := setXattr(temp, extraAttr, []byte("remove"), 0); err != nil {
 		t.Fatal(err)
 	}
 

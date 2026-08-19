@@ -58,11 +58,9 @@ func (b *Backend) Open(_ context.Context, path string) (storage.File, error) {
 // stripping of truncating an existing file in place. On Unix we also preserve
 // owner/group, and on Linux and Darwin we preserve extended attributes
 // (including xattr-backed ACLs such as Linux POSIX ACLs) when the platform
-// exposes them. If path names an existing final-component symlink, Create
-// resolves the current symlink chain to one existing regular-file referent,
-// stages and publishes beside that referent, and revalidates the symlink
-// chain and referent identity immediately before publish so a retarget race
-// aborts without modifying either referent. On platforms without hard-link
+// exposes them. Create rejects final-component symlinks because a portable
+// path-based replacement cannot atomically verify the link and publish to its
+// referent without risking a concurrent retarget. On platforms without hard-link
 // snapshots (Plan 9, js, wasip1),
 // and on Unix filesystems that reject hard-link snapshots for same-directory
 // siblings, replacement falls back to a best-effort rename-based sequence that
@@ -86,6 +84,9 @@ func (b *Backend) Create(_ context.Context, path string) (storage.Writer, error)
 	target, symlinkTarget, err := resolveCreateTarget(path)
 	if err != nil {
 		return nil, err
+	}
+	if symlinkTarget != nil {
+		return nil, fmt.Errorf("local: symlink destination %s is not supported for atomic replacement", path)
 	}
 	if isReplacementArtifactName(filepath.Base(target)) {
 		return nil, fmt.Errorf("local: symlink destination %s resolves into a reserved internal namespace", path)
@@ -281,6 +282,7 @@ type replacementOps interface {
 	Remove(string) error
 	AtomicReplace(temp, target, backup string, hadOld bool) error
 	AtomicRestore(target, backup string) error
+	AtomicRestoreIfAbsent(target, backup string) error
 }
 
 type durableReplacementOps interface {
@@ -306,6 +308,13 @@ func (osReplacementOps) AtomicReplace(temp, target, backup string, hadOld bool) 
 }
 func (osReplacementOps) AtomicRestore(target, backup string) error {
 	return platformAtomicRestore(target, backup)
+}
+
+func (osReplacementOps) AtomicRestoreIfAbsent(target, backup string) error {
+	if err := os.Link(backup, target); err != nil {
+		return err
+	}
+	return os.Remove(backup)
 }
 
 const (
@@ -664,7 +673,7 @@ func (w *writer) discardUnusedBackup(backup string) error {
 		if !backupPresent {
 			return nil
 		}
-		if err := w.ops.AtomicRestore(w.target, backup); err != nil {
+		if err := w.ops.AtomicRestoreIfAbsent(w.target, backup); err != nil {
 			return fmt.Errorf(
 				"local: restore %s from %s after publish failure; backup retained for recovery: %w",
 				w.target, backup, err,
