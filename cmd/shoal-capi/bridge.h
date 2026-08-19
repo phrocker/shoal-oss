@@ -39,6 +39,10 @@ struct shoal_rfile_seekable {
   uint64_t id;
 };
 
+struct shoal_authorizations {
+  uint64_t id;
+};
+
 struct shoal_error {
   shoal_status code;
   char *message;
@@ -213,6 +217,10 @@ struct shoal_rfile_entry_result {
   uint8_t deleted;
 };
 
+struct shoal_key_value_result {
+  shoal_bridge_scan_entry entry;
+};
+
 shoal_connector *shoal_bridge_connector_alloc(uint64_t id);
 uint64_t shoal_bridge_connector_id(const shoal_connector *connector);
 void shoal_bridge_connector_free(shoal_connector *connector);
@@ -245,6 +253,10 @@ void shoal_bridge_rfile_writer_free(shoal_rfile_writer *writer);
 shoal_rfile_seekable *shoal_bridge_rfile_seekable_alloc(uint64_t id);
 uint64_t shoal_bridge_rfile_seekable_id(const shoal_rfile_seekable *seekable);
 void shoal_bridge_rfile_seekable_free(shoal_rfile_seekable *seekable);
+shoal_authorizations *shoal_bridge_authorizations_alloc(uint64_t id);
+uint64_t
+shoal_bridge_authorizations_id(const shoal_authorizations *authorizations);
+void shoal_bridge_authorizations_free(shoal_authorizations *authorizations);
 
 char *shoal_bridge_string_alloc(const char *value, size_t length);
 void shoal_bridge_string_free(char *value);
@@ -278,6 +290,15 @@ shoal_rfile_entry_result *shoal_bridge_rfile_entry_alloc(
 int shoal_bridge_rfile_entry_get(const shoal_rfile_entry_result *result,
                                  shoal_rfile_entry_view *out_entry);
 void shoal_bridge_rfile_entry_free(shoal_rfile_entry_result *result);
+shoal_key_value_result *shoal_bridge_key_value_alloc(
+    const uint8_t *row, size_t row_length, const uint8_t *column_family,
+    size_t column_family_length, const uint8_t *column_qualifier,
+    size_t column_qualifier_length, const uint8_t *column_visibility,
+    size_t column_visibility_length, int64_t timestamp, const uint8_t *value,
+    size_t value_length);
+int shoal_bridge_key_value_get(const shoal_key_value_result *result,
+                               shoal_key_value_view *out_value);
+void shoal_bridge_key_value_free(shoal_key_value_result *result);
 #ifdef SHOAL_CAPI_TEST
 void shoal_bridge_test_string_alloc_fail_after(size_t successful_allocations);
 void shoal_bridge_test_string_alloc_reset(void);

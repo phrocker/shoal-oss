@@ -10,7 +10,7 @@ static_assert(std::is_same<shoal_abi_capability_bits, std::uint64_t>::value,
               "capability bitset words must remain 64-bit");
 static_assert(SHOAL_ABI_VERSION == 1u, "unexpected ABI version");
 static_assert(SHOAL_ABI_VERSION_MAJOR == 1u, "unexpected ABI major");
-static_assert(SHOAL_ABI_VERSION_MINOR == 5u, "unexpected ABI minor");
+static_assert(SHOAL_ABI_VERSION_MINOR == 6u, "unexpected ABI minor");
 static_assert(SHOAL_ABI_VERSION_PATCH == 0u, "unexpected ABI patch");
 static_assert(SHOAL_ABI_VERSION_PACKED ==
                   SHOAL_ABI_PACK_VERSION(SHOAL_ABI_VERSION_MAJOR,
@@ -35,9 +35,11 @@ static_assert(SHOAL_ABI_CAPABILITY_CONFIGURATION_TOPOLOGY == 15u,
               "unexpected configuration topology capability id");
 static_assert(SHOAL_ABI_CAPABILITY_RFILE == 16u,
               "unexpected RFile capability id");
-static_assert(SHOAL_ABI_CAPABILITY_COUNT == 17u,
+static_assert(SHOAL_ABI_CAPABILITY_DATA_VALUES == 17u,
+              "unexpected data values capability id");
+static_assert(SHOAL_ABI_CAPABILITY_COUNT == 18u,
               "unexpected capability count");
-static_assert(SHOAL_ABI_CAPABILITY_WORD0 == 0x000000000001ffffull,
+static_assert(SHOAL_ABI_CAPABILITY_WORD0 == 0x000000000003ffffull,
               "unexpected capability word 0");
 static_assert(std::is_standard_layout<shoal_connector_identity_view>::value,
               "identity view must remain standard-layout");
@@ -53,6 +55,8 @@ static_assert(std::is_standard_layout<shoal_rfile_merge_config>::value,
               "RFile merge config must remain standard-layout");
 static_assert(std::is_standard_layout<shoal_rfile_entry_view>::value,
               "RFile entry view must remain standard-layout");
+static_assert(std::is_standard_layout<shoal_key_value>::value,
+              "key/value input must remain standard-layout");
 
 #define ASSERT_PERMISSION_VALUE(name, value)                                 \
   static_assert(name == value, "unexpected permission ordinal: " #name)
@@ -121,6 +125,9 @@ int main() {
   shoal_rfile_seekable *rfile_seekable = nullptr;
   shoal_rfile_entry_result *rfile_entry = nullptr;
   shoal_rfile_entry_view rfile_entry_view{};
+  shoal_authorizations *authorizations = nullptr;
+  shoal_key_value_result *key_value_result = nullptr;
+  shoal_key_value key_value{};
   assert(shoal_abi_version() == SHOAL_ABI_VERSION);
   assert(shoal_abi_version_major() == SHOAL_ABI_VERSION_MAJOR);
   assert(shoal_abi_version_minor() == SHOAL_ABI_VERSION_MINOR);
@@ -141,6 +148,7 @@ int main() {
   assert(shoal_abi_has_capability(
              SHOAL_ABI_CAPABILITY_CONFIGURATION_TOPOLOGY) == 1);
   assert(shoal_abi_has_capability(SHOAL_ABI_CAPABILITY_RFILE) == 1);
+  assert(shoal_abi_has_capability(SHOAL_ABI_CAPABILITY_DATA_VALUES) == 1);
   assert(shoal_abi_has_capability(SHOAL_ABI_CAPABILITY_COUNT) == 0);
   assert(shoal_versioned_properties_version(versioned_properties) == 0);
   assert(shoal_versioned_properties_count(versioned_properties) == 0);
@@ -164,6 +172,8 @@ int main() {
   assert(server_view.struct_size == SHOAL_SERVER_VIEW_V1_SIZE);
   shoal_rfile_entry_view_init(&rfile_entry_view);
   assert(rfile_entry_view.struct_size == SHOAL_RFILE_ENTRY_VIEW_V1_SIZE);
+  shoal_key_value_init(&key_value);
+  assert(key_value.struct_size == SHOAL_KEY_VALUE_V1_SIZE);
   assert(error == nullptr);
   shoal_connector_identity_view_init(&identity_view);
   assert(identity_view.struct_size == SHOAL_CONNECTOR_IDENTITY_VIEW_V1_SIZE);
@@ -207,6 +217,8 @@ int main() {
   shoal_rfile_reader_free(&rfile_reader);
   shoal_rfile_seekable_free(&rfile_seekable);
   shoal_rfile_entry_result_free(&rfile_entry);
+  shoal_authorizations_free(&authorizations);
+  shoal_key_value_result_free(&key_value_result);
   shoal_error_free(&error);
   return 0;
 }
