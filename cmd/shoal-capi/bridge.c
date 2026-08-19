@@ -854,19 +854,49 @@ void shoal_bridge_table_properties_free(shoal_table_properties_result *result) {
 }
 
 shoal_namespace_list_result *shoal_bridge_namespace_list_alloc(size_t count) {
-  return (shoal_namespace_list_result *)shoal_bridge_table_list_alloc(count);
+  if (count > SIZE_MAX / sizeof(shoal_bridge_table_entry)) {
+    return NULL;
+  }
+  SHOAL_BRIDGE_TEST_ALLOC_GUARD(shoal_bridge_result_alloc_fail_after);
+  shoal_namespace_list_result *result =
+      (shoal_namespace_list_result *)calloc(1, sizeof(*result));
+  if (result == NULL) {
+    return NULL;
+  }
+  if (count != 0) {
+    result->entries =
+        (shoal_bridge_table_entry *)calloc(count, sizeof(*result->entries));
+    if (result->entries == NULL) {
+      free(result);
+      return NULL;
+    }
+  }
+  result->count = count;
+  return result;
 }
 
 int shoal_bridge_namespace_list_set(shoal_namespace_list_result *result,
                                     size_t index, const char *name,
                                     const char *id) {
-  return shoal_bridge_table_list_set((shoal_table_list_result *)result, index,
-                                     name, id);
+  if (result == NULL || index >= result->count || name == NULL || id == NULL) {
+    return 0;
+  }
+  shoal_bridge_table_entry next;
+  memset(&next, 0, sizeof(next));
+  next.name = shoal_bridge_copy_string(name);
+  next.id = shoal_bridge_copy_string(id);
+  if (next.name == NULL || next.id == NULL) {
+    shoal_bridge_table_entry_clear(&next);
+    return 0;
+  }
+  shoal_bridge_table_entry_clear(&result->entries[index]);
+  result->entries[index] = next;
+  return 1;
 }
 
 size_t shoal_bridge_namespace_list_count(
     const shoal_namespace_list_result *result) {
-  return shoal_bridge_table_list_count((const shoal_table_list_result *)result);
+  return result == NULL ? 0 : result->count;
 }
 
 int shoal_bridge_namespace_list_get(const shoal_namespace_list_result *result,
@@ -883,38 +913,89 @@ int shoal_bridge_namespace_list_get(const shoal_namespace_list_result *result,
 }
 
 void shoal_bridge_namespace_list_free(shoal_namespace_list_result *result) {
-  shoal_bridge_table_list_free((shoal_table_list_result *)result);
+  if (result == NULL) {
+    return;
+  }
+  for (size_t index = 0; index < result->count; index++) {
+    shoal_bridge_table_entry_clear(&result->entries[index]);
+  }
+  free(result->entries);
+  memset(result, 0, sizeof(*result));
+  free(result);
 }
 
 shoal_namespace_properties_result *
 shoal_bridge_namespace_properties_alloc(size_t count) {
-  return (shoal_namespace_properties_result *)
-      shoal_bridge_table_properties_alloc(count);
+  if (count > SIZE_MAX / sizeof(shoal_bridge_table_property_entry)) {
+    return NULL;
+  }
+  SHOAL_BRIDGE_TEST_ALLOC_GUARD(shoal_bridge_result_alloc_fail_after);
+  shoal_namespace_properties_result *result =
+      (shoal_namespace_properties_result *)calloc(1, sizeof(*result));
+  if (result == NULL) {
+    return NULL;
+  }
+  if (count != 0) {
+    result->entries = (shoal_bridge_table_property_entry *)calloc(
+        count, sizeof(*result->entries));
+    if (result->entries == NULL) {
+      free(result);
+      return NULL;
+    }
+  }
+  result->count = count;
+  return result;
 }
 
 int shoal_bridge_namespace_properties_set(
     shoal_namespace_properties_result *result, size_t index, const char *key,
     const char *value) {
-  return shoal_bridge_table_properties_set(
-      (shoal_table_properties_result *)result, index, key, value);
+  if (result == NULL || index >= result->count || key == NULL ||
+      value == NULL) {
+    return 0;
+  }
+  shoal_bridge_table_property_entry next;
+  memset(&next, 0, sizeof(next));
+  next.key = shoal_bridge_copy_string(key);
+  next.value = shoal_bridge_copy_string(value);
+  if (next.key == NULL || next.value == NULL) {
+    shoal_bridge_table_property_entry_clear(&next);
+    return 0;
+  }
+  shoal_bridge_table_property_entry_clear(&result->entries[index]);
+  result->entries[index] = next;
+  return 1;
 }
 
 size_t shoal_bridge_namespace_properties_count(
     const shoal_namespace_properties_result *result) {
-  return shoal_bridge_table_properties_count(
-      (const shoal_table_properties_result *)result);
+  return result == NULL ? 0 : result->count;
 }
 
 int shoal_bridge_namespace_properties_get(
     const shoal_namespace_properties_result *result, size_t index,
     shoal_table_property_view *out_property) {
-  return shoal_bridge_table_properties_get(
-      (const shoal_table_properties_result *)result, index, out_property);
+  if (result == NULL || index >= result->count || out_property == NULL) {
+    return 0;
+  }
+  const shoal_bridge_table_property_entry *entry = &result->entries[index];
+  memset(out_property, 0, sizeof(*out_property));
+  out_property->key = entry->key;
+  out_property->value = entry->value;
+  return 1;
 }
 
 void shoal_bridge_namespace_properties_free(
     shoal_namespace_properties_result *result) {
-  shoal_bridge_table_properties_free((shoal_table_properties_result *)result);
+  if (result == NULL) {
+    return;
+  }
+  for (size_t index = 0; index < result->count; index++) {
+    shoal_bridge_table_property_entry_clear(&result->entries[index]);
+  }
+  free(result->entries);
+  memset(result, 0, sizeof(*result));
+  free(result);
 }
 
 shoal_versioned_properties_result *

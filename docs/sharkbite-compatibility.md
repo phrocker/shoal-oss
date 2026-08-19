@@ -12,11 +12,11 @@ Shoal issue [#81](https://github.com/phrocker/shoal-oss/issues/81) (umbrella
 
 | Field | Value |
 | --- | --- |
-| Document status | Normative gate. Binding on all Sharkbite-compatibility work. Revision 16 — applies the fifteenth independent audit: every registration row now cites its full multi-line span and preserves the exact keyword-argument defaults. Revision 15 applied the fourteenth audit: the dead `sharkbite_iterator` embedded module is enumerated registration by registration in [§19.4](#sec-19-4) instead of being dropped as declaration-free, and [SB-SCAN-016](#sec-9) no longer claims a functioning server-side Python iterator capability. Revision 14 applied the thirteenth audit: the 363-header partition is stated as arithmetic that sums (204 live + 152 vendored + 7 declaration-free) and every namespace-variable figure in prose is re-derived from the headers, with checks 24 and 34 rewritten to scan every occurrence. Revision 13 applied the twelfth audit: forward declarations and using-declarations are type and name contracts rather than variables, and the namespace-variable population is derived independently (8 variables, 5 of them `static`). Revision 12 applied the eleventh audit: public bit-fields enumerated, function-pointer typedefs classified as aliases, macro invocations excluded as non-declarations, and namespace-scope `static` variables described as internal-linkage per-translation-unit state. Revision 11 applied the tenth audit: friend operators enumerated as namespace-scope obligations, out-of-class definitions merged into their in-class declarations, and protected/private members excluded with recorded access. Revision 10 applied the ninth audit: templated members no longer mask memberless types, conversion operators are parsed, template-dependent enum values are never presented as evaluated ordinals, and every narrative count is reconciled mechanically. Revision 9 applied the eighth audit: anonymous-namespace scope leaks repaired, vendoring decided by path and own license, namespace-scope and `extern "C"` declarations enumerated, typedef enums parsed, include-guard artifacts removed, and a twenty-check verifier that compares the inventory against the headers ([§19.1](#sec-19-1), [§19.2](#sec-19-2), [§19.3](#sec-19-3)). |
+| Document status | Normative gate. Binding on all Sharkbite-compatibility work. Revision 17 — applies the sixteenth independent audit: merged table, namespace, security, and split administration are repinned to their exact Go and stable C ABI evidence, while Python semantic differences remain `Behavior mismatch`. Revision 16 applied the fifteenth audit: every registration row cites its full multi-line span and preserves the exact keyword-argument defaults. Revision 15 applied the fourteenth audit: the dead `sharkbite_iterator` embedded module is enumerated registration by registration in [§19.4](#sec-19-4) instead of being dropped as declaration-free, and [SB-SCAN-016](#sec-9) no longer claims a functioning server-side Python iterator capability. Revision 14 applied the thirteenth audit: the 363-header partition is stated as arithmetic that sums (204 live + 152 vendored + 7 declaration-free) and every namespace-variable figure in prose is re-derived from the headers, with checks 24 and 34 rewritten to scan every occurrence. Revision 13 applied the twelfth audit: forward declarations and using-declarations are type and name contracts rather than variables, and the namespace-variable population is derived independently (8 variables, 5 of them `static`). Revision 12 applied the eleventh audit: public bit-fields enumerated, function-pointer typedefs classified as aliases, macro invocations excluded as non-declarations, and namespace-scope `static` variables described as internal-linkage per-translation-unit state. Revision 11 applied the tenth audit: friend operators enumerated as namespace-scope obligations, out-of-class definitions merged into their in-class declarations, and protected/private members excluded with recorded access. Revision 10 applied the ninth audit: templated members no longer mask memberless types, conversion operators are parsed, template-dependent enum values are never presented as evaluated ordinals, and every narrative count is reconciled mechanically. Revision 9 applied the eighth audit: anonymous-namespace scope leaks repaired, vendoring decided by path and own license, namespace-scope and `extern "C"` declarations enumerated, typedef enums parsed, include-guard artifacts removed, and a twenty-check verifier that compares the inventory against the headers ([§19.1](#sec-19-1), [§19.2](#sec-19-2), [§19.3](#sec-19-3)). |
 | Tracking issue | Shoal [#81](https://github.com/phrocker/shoal-oss/issues/81) — "docs: define and audit complete Sharkbite compatibility matrix" (parent [#59](https://github.com/phrocker/shoal-oss/issues/59); upstream target [phrocker/sharkbite#108](https://github.com/phrocker/sharkbite/issues/108)) |
 | Sharkbite reference | `phrocker/sharkbite` @ `7f2625f74331b0cd4a75dc0484949c40f1409686` ("Bump accumulo-core from 2.0.0 to 2.0.1 in /native-iterators-jni (#100)", 2022-07-22) |
 | Sharkbite release line | `sharkbite` 1.2.0.3 on PyPI (`setup.py:34-35`) |
-| Shoal reference | `phrocker/shoal-oss` exact audited baseline for revision 16 `1c2944798faf5a5deb659065dfea0bee23593df0` ("platform: make shoal-embed serve reachable, observable, and safely drainable (#79)") |
+| Shoal reference | `phrocker/shoal-oss` exact audited baseline for revision 17 `b953ce45362ffba26106c751fe52df924485aaa1` ("capi: harden administration review findings") |
 | Shoal C ABI version | `SHOAL_ABI_VERSION 1u` (`capi/include/shoal_types.h`) |
 | Rows | 3203 (2811 required by the [§2.2](#sec-2) release gate) |
 | Covered rows | **0** — 42 of 333 in revision 1, 14 of 368 in revision 2, 3 of 385 in revision 3, 1 of 473 in revision 4, 0 of 542 in revision 5, 0 of 2358 in revision 6, 0 of 2938 in revision 7, 0 of 3029 in revision 8, 0 of 3175 in revision 9, 0 of 3177 in revision 10, 0 of 3171 in revision 11, 0 of 3174 in revision 12, 0 of 3168 in revision 13; see [§25.4](#sec-25) |
@@ -65,7 +65,7 @@ publishing, naming, or describing anything as Sharkbite-compatible.
 > approval in [§26](#sec-26).
 
 **Required rows** are every matrix row whose status is not
-`Not required (rationale required)`. As of revision 16 that is 2811 of 3203 rows,
+`Not required (rationale required)`. As of revision 17 that is 2811 of 3203 rows,
 and **none of them is satisfied**: the gate is nowhere near open, and no part
 of this document should be read as authorising a release. `Not required` rows are excluded from the
 gate by construction — that status exists precisely to record, with a stated
@@ -634,17 +634,17 @@ one table at construction, so no method takes a table name.
 
 | ID | Sharkbite | Shoal Go | Shoal C ABI | Evidence | Status | Notes |
 | --- | --- | --- | --- | --- | --- | --- |
-| SB-TABLE-001 | `create(recreate=False) -> bool` (`pysharkbite.cpp:250`, `PythonStructures.h:74`) | `Connector.CreateTable(ctx, name) error` (`accumulo/table_admin.go:76`) | — | `TestTableAdministrationLifecycleAndCancellation` (`accumulo/table_admin_test.go:62`); `TestTableMutationsUseAccumulo4FATEArguments` (`accumulo/table_admin_test.go:207`) | Missing C ABI | `recreate=True` means "drop then create"; Shoal has no recreate. Return type differs (`bool` vs error). Blocked on issue [#82](https://github.com/phrocker/shoal-oss/issues/82) / PR [#84](https://github.com/phrocker/shoal-oss/pull/84). |
-| SB-TABLE-002 | `exists(createIfNot=False) -> bool` (`pysharkbite.cpp:240`, `PythonStructures.h:87`) | `Connector.TableExists(ctx, name) (bool, error)` (`accumulo/table_admin.go:53`) | — | `TestTableAdministrationListingAndExistence` (`accumulo/table_admin_test.go:13`) | Missing C ABI | The `createIfNot` side effect must be reproduced; every pinned Python test calls `exists(False)` first (`test/python/TestWrites.py:15`). |
-| SB-TABLE-003 | `remove() -> bool` (`pysharkbite.cpp:239`, `PythonStructures.h:80`) | `Connector.DeleteTable(ctx, name) error` (`accumulo/table_admin.go:96`) | — | `TestTableAdministrationLifecycleAndCancellation` (`accumulo/table_admin_test.go:62`) | Missing C ABI | Every pinned Python test ends with `tableOperations.remove()`. |
-| SB-TABLE-004 | Table rename (not bound in Python) | `Connector.RenameTable(ctx, old, new) error` (`accumulo/table_admin.go:110`) | — | `TestTableMutationsUseAccumulo4FATEArguments` (`accumulo/table_admin_test.go:207`) | Not required (rationale required) | Rationale: Shoal superset; `AccumuloTableOperations` has no rename binding. |
-| SB-TABLE-005 | `flush(startRow, endRow, wait) -> int8` (`pysharkbite.cpp:242`, `PythonStructures.h:111`) | `Connector.FlushTable(ctx, tableName string, wait bool) error` (`accumulo/table_flush.go:15`) | — | `TestFlushTableUsesStableIDAndAccumulo4WaitModes` (`accumulo/table_flush_test.go:12`) | Behavior mismatch | Shoal flushes the **whole table**; Sharkbite flushes a row range. Row-bounded flush is missing. Also `int8` status vs error. |
+| SB-TABLE-001 | `create(recreate=False) -> bool` (`pysharkbite.cpp:250`, `PythonStructures.h:74`) | `Connector.CreateTable(ctx, name) error` (`accumulo/table_admin.go:76`) | `shoal_connector_create_table` | `TestTableAdministrationLifecycleAndCancellation` (`accumulo/table_admin_test.go:62`); `main()` in `capi/tests/lifecycle.c` | Behavior mismatch | `recreate=True` means "drop then create"; Shoal has no recreate. Return type differs (`bool` vs error), so the Python shim must compose delete/create and translate duplicate-table status. |
+| SB-TABLE-002 | `exists(createIfNot=False) -> bool` (`pysharkbite.cpp:240`, `PythonStructures.h:87`) | `Connector.TableExists(ctx, name) (bool, error)` (`accumulo/table_admin.go:53`) | `shoal_connector_table_exists` | `TestTableAdministrationListingAndExistence` (`accumulo/table_admin_test.go:13`); `main()` in `capi/tests/lifecycle.c` | Behavior mismatch | The `createIfNot` side effect must be reproduced; every pinned Python test calls `exists(False)` first (`test/python/TestWrites.py:15`). |
+| SB-TABLE-003 | `remove() -> bool` (`pysharkbite.cpp:239`, `PythonStructures.h:80`) | `Connector.DeleteTable(ctx, name) error` (`accumulo/table_admin.go:96`) | `shoal_connector_delete_table` | `TestTableAdministrationLifecycleAndCancellation` (`accumulo/table_admin_test.go:62`); `main()` in `capi/tests/lifecycle.c` | Behavior mismatch | Every pinned Python test ends with `tableOperations.remove()`; the shim must translate success/status to `bool`. |
+| SB-TABLE-004 | Table rename (not bound in Python) | `Connector.RenameTable(ctx, old, new) error` (`accumulo/table_admin.go:110`) | `shoal_connector_rename_table` | `TestTableMutationsUseAccumulo4FATEArguments` (`accumulo/table_admin_test.go:207`); `main()` in `capi/tests/lifecycle.c` | Not required (rationale required) | Rationale: Shoal superset; `AccumuloTableOperations` has no rename binding. |
+| SB-TABLE-005 | `flush(startRow, endRow, wait) -> int8` (`pysharkbite.cpp:242`, `PythonStructures.h:111`) | `Connector.FlushTable(ctx, tableName string, wait bool) error` (`accumulo/table_flush.go:15`) | `shoal_connector_flush_table` | `TestFlushTableUsesStableIDAndAccumulo4WaitModes` (`accumulo/table_flush_test.go:12`); `main()` in `capi/tests/lifecycle.c` | Behavior mismatch | Shoal flushes the **whole table**; Sharkbite flushes a row range. Row-bounded flush is missing. Also `int8` status vs error. |
 | SB-TABLE-006 | `compact(startRow, endRow, wait) -> int8` (`pysharkbite.cpp:243`, `PythonStructures.h:124`) | — | — | — | Missing Go | No online compaction trigger. `internal/offlinecompact` is an out-of-band OFFLINE-fenced tool and is not reachable from `Connector`; issue [#65](https://github.com/phrocker/shoal-oss/issues/65) tracks online compaction. |
-| SB-TABLE-007 | `setProperty(property, value) -> int8` (`pysharkbite.cpp:244`, `PythonStructures.h:135`) | `Connector.SetTableProperty(ctx, tableName, property, value) error` (`accumulo/table_properties.go:14`) | — | `TestTablePropertyMutationsUseAccumulo4ManagerRPCs` (`accumulo/table_properties_test.go:12`) | Missing C ABI | |
-| SB-TABLE-008 | `removeProperty(property) -> int8` (`pysharkbite.cpp:245`, `PythonStructures.h:145`) | `Connector.RemoveTableProperty(ctx, tableName, property) error` (`accumulo/table_properties.go:30`) | — | `TestTablePropertyMutationsUseAccumulo4ManagerRPCs` (`accumulo/table_properties_test.go:12`) | Missing C ABI | |
-| SB-TABLE-009 | Property reads (not bound in Python) | `Connector.EffectiveTableProperties(ctx, tableName)` (`accumulo/table_property_reads.go:31`) | — | `TestEffectiveTablePropertiesPreservesValuesAndCopyIsolation` (`accumulo/table_property_reads_test.go:29`) | Not required (rationale required) | Rationale: Shoal superset (issue [#54](https://github.com/phrocker/shoal-oss/issues/54) / PR [#56](https://github.com/phrocker/shoal-oss/pull/56)). |
-| SB-TABLE-010 | `addSplits(set[str])` (`pysharkbite.cpp:246`, `PythonStructures.h:153`) | `Connector.AddTableSplits` (`accumulo/table_add_splits.go`) | `shoal_connector_add_table_splits` (`capi/include/shoal.h`) | `TestAddTableSplitsSortsDeduplicatesAndPreservesBinaryRows`; `main()` in `capi/tests/lifecycle.c` | Behavior mismatch | Go and C preserve arbitrary binary rows, sort/deduplicate copied inputs, and add without replacing existing splits. The Python shim must accept Sharkbite's `set[str]` shape and return convention. |
-| SB-TABLE-011 | Split listing (not bound in Python) | `Connector.ListTableSplits` (`accumulo/table_splits.go`) | `shoal_connector_list_table_splits` + owned `shoal_bytes_list_result` | `TestListTableSplitsReturnsOrderedCopiedRows` (`accumulo/table_splits_test.go`); `main()` in `capi/tests/lifecycle.c` | Not required (rationale required) | Rationale: no Sharkbite equivalent; Shoal exposes the binary-safe sibling operation as a documented superset. |
+| SB-TABLE-007 | `setProperty(property, value) -> int8` (`pysharkbite.cpp:244`, `PythonStructures.h:135`) | `Connector.SetTableProperty(ctx, tableName, property, value) error` (`accumulo/table_properties.go:14`) | `shoal_connector_set_table_property` | `TestTablePropertyMutationsUseAccumulo4ManagerRPCs` (`accumulo/table_properties_test.go:12`); `main()` in `capi/tests/lifecycle.c` | Behavior mismatch | The shim must translate stable status/error semantics to Sharkbite's `int8` result. |
+| SB-TABLE-008 | `removeProperty(property) -> int8` (`pysharkbite.cpp:245`, `PythonStructures.h:145`) | `Connector.RemoveTableProperty(ctx, tableName, property) error` (`accumulo/table_properties.go:30`) | `shoal_connector_remove_table_property` | `TestTablePropertyMutationsUseAccumulo4ManagerRPCs` (`accumulo/table_properties_test.go:12`); `main()` in `capi/tests/lifecycle.c` | Behavior mismatch | The shim must translate stable status/error semantics to Sharkbite's `int8` result. |
+| SB-TABLE-009 | Property reads (not bound in Python) | `Connector.EffectiveTableProperties(ctx, tableName)` (`accumulo/table_property_reads.go:31`) | `shoal_connector_effective_table_properties` + owned `shoal_table_properties_result` | `TestEffectiveTablePropertiesPreservesValuesAndCopyIsolation` (`accumulo/table_property_reads_test.go:29`); `main()` in `capi/tests/lifecycle.c` | Not required (rationale required) | Rationale: Shoal superset (issue [#54](https://github.com/phrocker/shoal-oss/issues/54) / PR [#56](https://github.com/phrocker/shoal-oss/pull/56)). |
+| SB-TABLE-010 | `addSplits(set[str])` (`pysharkbite.cpp:246`, `PythonStructures.h:153`) | `Connector.AddTableSplits` (`accumulo/table_add_splits.go`) | `shoal_connector_add_table_splits` (`capi/include/shoal.h`) | `TestAddTableSplitsSortsDeduplicatesAndPreservesBinaryRows` (`accumulo/table_add_splits_test.go`); `main()` in `capi/tests/lifecycle.c` | Behavior mismatch | Go and C preserve arbitrary binary rows, sort/deduplicate copied inputs, and add without replacing existing splits. The Python shim must accept Sharkbite's `set[str]` shape and return convention. |
+| SB-TABLE-011 | Split listing (not bound in Python) | `Connector.ListTableSplits` (`accumulo/table_splits.go`) | `shoal_connector_list_table_splits` + owned `shoal_bytes_list_result` | `TestListTableSplitsOrdersAndCopiesRows` (`accumulo/table_splits_test.go`); `main()` in `capi/tests/lifecycle.c` | Not required (rationale required) | Rationale: no Sharkbite equivalent; Shoal exposes the binary-safe sibling operation as a documented superset. |
 | SB-TABLE-012 | `addConstraint(className) -> int` (`pysharkbite.cpp:247`, `PythonStructures.h:162`) | — | — | — | Missing Go | Constraint violations are surfaced on write (`accumulo/batch_writer.go:101`) but constraints cannot be installed. |
 | SB-TABLE-013 | `import(dir, fail_path, setTime=False) -> bool` (`pysharkbite.cpp:241`, `PythonStructures.h:98`) | `Connector.BulkImport(ctx, tableName, bulkDir, BulkImportOptions{SetTime})` (`accumulo/table_bulk_import.go`); `TestBulkImportUsesTableIDAndFateArguments`, `TestBulkImportResolvesTableNameNotFound`, `TestBulkImportMapsManagerErrors`, `TestBulkImportValidationCancellationAndLifecycle` | — | — | Behavior mismatch | Shoal exposes Accumulo 4 Bulk Import V2 on `Connector`, but requires a pre-staged `loadmap.json` and has no Sharkbite `fail_path` behavior or compatibility adapter. Reachable only via `getattr(tableOps, "import")(...)` because `import` is a Python keyword; the shim must expose both `import` and a usable alias such as `import_directory`. |
 | SB-TABLE-014 | Table export | — (no Sharkbite Python binding either) | — | — | Not required (rationale required) | Rationale: not in the Sharkbite Python surface. Listed so future readers do not re-derive it. |
@@ -671,13 +671,13 @@ types.
 | ID | Sharkbite | Shoal Go | Shoal C ABI | Evidence | Status | Notes |
 | --- | --- | --- | --- | --- | --- | --- |
 | SB-NS-001 | `list() -> list[str]` (`pysharkbite.cpp:230`, `PythonStructures.h:196`) | `Connector.Namespaces` (`accumulo/namespace_discovery.go`) | `shoal_connector_list_namespaces` + owned `shoal_namespace_list_result` (`capi/include/shoal.h`) | `TestNamespaceDiscoveryListingAndLookup` (`accumulo/namespace_discovery_test.go`); `main()` in `capi/tests/lifecycle.c` | Behavior mismatch | |
-| SB-NS-002 | `create(name="")` (`pysharkbite.cpp:236`, `PythonStructures.h:215`) | `Connector.CreateNamespace` (`accumulo/namespace_admin.go`) | `shoal_connector_create_namespace` | `TestNamespaceMutationsUseAccumulo4FATEArgumentsAndInvalidate`; `main()` in `capi/tests/lifecycle.c` | Behavior mismatch | Empty name means "the namespace this handle was constructed with". |
-| SB-NS-003 | `remove(name="") -> bool` (`pysharkbite.cpp:231`, `PythonStructures.h:202`) | `Connector.DeleteNamespace` (`accumulo/namespace_admin.go`) | `shoal_connector_delete_namespace` | `TestDeleteNamespaceEmptyNamespaceSubmitsFATE`; `main()` in `capi/tests/lifecycle.c` | Behavior mismatch | |
-| SB-NS-004 | `exists(name="") -> bool` (`pysharkbite.cpp:232`, `PythonStructures.h:209`) | `Connector.NamespaceExists` (`accumulo/namespace_discovery.go`) | `shoal_connector_namespace_exists` | `TestNamespaceDiscoveryListingAndLookup`; `main()` in `capi/tests/lifecycle.c` | Behavior mismatch | |
-| SB-NS-005 | `rename(newName, oldName="")` (`pysharkbite.cpp:233`, `PythonStructures.h:222`) | `Connector.RenameNamespace` (`accumulo/namespace_admin.go`) | `shoal_connector_rename_namespace` | `TestNamespaceMutationsUseAccumulo4FATEArgumentsAndInvalidate`; `main()` in `capi/tests/lifecycle.c` | Behavior mismatch | Argument order is (new, old) — unusual and must be preserved. |
-| SB-NS-006 | `setProperty(property, value, nm="")` (`pysharkbite.cpp:234`, `PythonStructures.h:231`) | `Connector.SetNamespaceProperty` (`accumulo/namespace_properties.go`) | `shoal_connector_set_namespace_property` | `TestNamespacePropertyMutationsUseManagerRPCsAndDefaultNamespace`; `main()` in `capi/tests/lifecycle.c` | Behavior mismatch | |
-| SB-NS-007 | `removeProperty(property, nm="")` (`pysharkbite.cpp:235`, `PythonStructures.h:240`) | `Connector.RemoveNamespaceProperty` (`accumulo/namespace_properties.go`) | `shoal_connector_remove_namespace_property` | `TestNamespacePropertyMutationsUseManagerRPCsAndDefaultNamespace`; `main()` in `capi/tests/lifecycle.c` | Behavior mismatch | |
-| SB-NS-008 | Qualified `namespace.table` name resolution | `internal/tablenames.Resolver.ResolveID` handles qualified names | — | `TestDiscoveryTableLookupAndRouting` (`accumulo/discovery_test.go:108`) | Behavior mismatch | Reading qualified names works; managing namespaces does not. |
+| SB-NS-002 | `create(name="")` (`pysharkbite.cpp:236`, `PythonStructures.h:215`) | `Connector.CreateNamespace` (`accumulo/namespace_admin.go`) | `shoal_connector_create_namespace` | `TestNamespaceMutationsUseAccumulo4FATEArgumentsAndInvalidate` (`accumulo/namespace_admin_test.go`); `main()` in `capi/tests/lifecycle.c` | Behavior mismatch | Empty name means "the namespace this handle was constructed with". |
+| SB-NS-003 | `remove(name="") -> bool` (`pysharkbite.cpp:231`, `PythonStructures.h:202`) | `Connector.DeleteNamespace` (`accumulo/namespace_admin.go`) | `shoal_connector_delete_namespace` | `TestDeleteNamespaceEmptyNamespaceSubmitsFATE` (`accumulo/namespace_admin_test.go`); `main()` in `capi/tests/lifecycle.c` | Behavior mismatch | |
+| SB-NS-004 | `exists(name="") -> bool` (`pysharkbite.cpp:232`, `PythonStructures.h:209`) | `Connector.NamespaceExists` (`accumulo/namespace_discovery.go`) | `shoal_connector_namespace_exists` | `TestNamespaceDiscoveryListingAndLookup` (`accumulo/namespace_discovery_test.go`); `main()` in `capi/tests/lifecycle.c` | Behavior mismatch | |
+| SB-NS-005 | `rename(newName, oldName="")` (`pysharkbite.cpp:233`, `PythonStructures.h:222`) | `Connector.RenameNamespace` (`accumulo/namespace_admin.go`) | `shoal_connector_rename_namespace` | `TestNamespaceMutationsUseAccumulo4FATEArgumentsAndInvalidate` (`accumulo/namespace_admin_test.go`); `main()` in `capi/tests/lifecycle.c` | Behavior mismatch | Argument order is (new, old) — unusual and must be preserved. |
+| SB-NS-006 | `setProperty(property, value, nm="")` (`pysharkbite.cpp:234`, `PythonStructures.h:231`) | `Connector.SetNamespaceProperty` (`accumulo/namespace_properties.go`) | `shoal_connector_set_namespace_property` | `TestNamespacePropertyMutationsUseManagerRPCsAndDefaultNamespace` (`accumulo/namespace_properties_test.go`); `main()` in `capi/tests/lifecycle.c` | Behavior mismatch | |
+| SB-NS-007 | `removeProperty(property, nm="")` (`pysharkbite.cpp:235`, `PythonStructures.h:240`) | `Connector.RemoveNamespaceProperty` (`accumulo/namespace_properties.go`) | `shoal_connector_remove_namespace_property` | `TestNamespacePropertyMutationsUseManagerRPCsAndDefaultNamespace` (`accumulo/namespace_properties_test.go`); `main()` in `capi/tests/lifecycle.c` | Behavior mismatch | |
+| SB-NS-008 | Qualified `namespace.table` name resolution | `internal/tablenames.Resolver.ResolveID` handles qualified names; public namespace administration is in `accumulo/namespace_*.go` | Table/scanner/writer calls accept qualified names; namespace calls use explicit namespace names | `TestConnectorSharesNamespaceResolverAcrossNamespaceAndTableAPIs` (`accumulo/namespace_discovery_test.go`); `main()` in `capi/tests/lifecycle.c` | Behavior mismatch | Go and C support qualified table resolution plus namespace management; the Python handle composition remains to be implemented. |
 
 <a id="sec-13"></a>
 
@@ -4249,7 +4249,7 @@ entry is either closed or reclassified in [§26](#sec-26).
 | SB-GAP-GO-001 | Security operations: users, permissions, authorizations | SB-SEC-001…SB-SEC-017, SB-CONN-004 | [#95](https://github.com/phrocker/shoal-oss/issues/95) / merged PR [#99](https://github.com/phrocker/shoal-oss/pull/99) | **Complete in Go.** The remaining row differences are Python object/return semantics and live-cluster visibility enforcement. |
 | SB-GAP-GO-002 | Namespace operations | SB-NS-001…SB-NS-007, SB-CONN-005 | [#94](https://github.com/phrocker/shoal-oss/issues/94) / merged PR [#97](https://github.com/phrocker/shoal-oss/pull/97), on merged PR [#91](https://github.com/phrocker/shoal-oss/pull/91) | **Complete in Go.** Namespace discovery, lifecycle, and effective/local/versioned property reads are public. |
 | SB-GAP-GO-003 | Cluster status / `getStatistics` | SB-STAT-001…SB-STAT-038, SB-CONN-007 | [#96](https://github.com/phrocker/shoal-oss/issues/96); PR [#98](https://github.com/phrocker/shoal-oss/pull/98) **withdrawn** | **Not buildable — removed upstream.** Accumulo commit `f0841e4` deleted `getManagerStats`, `ManagerMonitorInfo`, `DeadServer`, and the legacy monitor resources 113 commits before the pinned Accumulo 4 target `317c288`; the surviving REST-v2/metrics/server APIs cannot reconstruct SB-STAT-001…SB-STAT-037. PR #98 was withdrawn for exactly this reason. This is no longer a Go work item: it is an approval decision, [SB-DIV-016](#sec-26). Only SB-STAT-038 (a Python `dynamic_attr` property) remains a Python-layer gap, and it is moot unless the divergence is rejected. |
-| SB-GAP-GO-004 | Table splits (add), constraints, online compaction, row-bounded flush, and a Sharkbite-compatible bulk-import adapter | SB-TABLE-006, SB-TABLE-010, SB-TABLE-012, SB-TABLE-013, SB-TABLE-005 | [#80](https://github.com/phrocker/shoal-oss/issues/80)/PR [#83](https://github.com/phrocker/shoal-oss/pull/83) (listing only), [#88](https://github.com/phrocker/shoal-oss/issues/88)/PR [#93](https://github.com/phrocker/shoal-oss/pull/93) (split creation), [#65](https://github.com/phrocker/shoal-oss/issues/65) (online compaction), merged PR [#78](https://github.com/phrocker/shoal-oss/pull/78) (Bulk Import V2) | Split **listing** lands first and does not close SB-TABLE-010. Bulk Import V2 is public, but its staged-load-map contract does not close Sharkbite's `dir`/`fail_path` row. |
+| SB-GAP-GO-004 | Constraints, online compaction, row-bounded flush, and a Sharkbite-compatible bulk-import adapter | SB-TABLE-006, SB-TABLE-012, SB-TABLE-013, SB-TABLE-005 | merged [#80](https://github.com/phrocker/shoal-oss/issues/80)/PR [#83](https://github.com/phrocker/shoal-oss/pull/83) (split listing), merged [#88](https://github.com/phrocker/shoal-oss/issues/88)/PR [#93](https://github.com/phrocker/shoal-oss/pull/93) (split creation), [#65](https://github.com/phrocker/shoal-oss/issues/65) (online compaction), merged PR [#78](https://github.com/phrocker/shoal-oss/pull/78) (Bulk Import V2) | Table split listing and creation are complete in Go and C. Bulk Import V2 is public, but its staged-load-map contract does not close Sharkbite's `dir`/`fail_path` row. |
 | SB-GAP-GO-005 | Public RFile API (read, sequential read, write, locality groups, iterators, seekables) | SB-RFILE-001…SB-RFILE-021 | none | Implementation exists in `internal/rfile` + `internal/iterrt`; the work is export and API design, not new logic. |
 | SB-GAP-GO-006 | Public HDFS API (typed streams, dir entries, rename/move/chown/mkdir) | SB-HDFS-001…SB-HDFS-014 | [#10](https://github.com/phrocker/shoal-oss/issues/10)/PR [#85](https://github.com/phrocker/shoal-oss/pull/85) (cancellation), [#9](https://github.com/phrocker/shoal-oss/issues/9) (live coverage, merged) | Land cancellation before exposing HDFS to Python. |
 | SB-GAP-GO-007 | Streaming scan results (cursor, not slice) | SB-SCAN-004, SB-XCUT-010, SB-CPP-005 | none | Prerequisite for 250k-row workloads; must be designed at the Go layer first because the ABI shape follows it. |
@@ -4406,9 +4406,9 @@ Sharkbite's `test/19x/st` SMAC project played), driven from CI, with the ported
 | Status | Rows |
 | --- | --- |
 | Covered | 0 |
-| Missing Go | 2447 |
-| Missing C ABI | 116 |
-| Behavior mismatch | 161 |
+| Missing Go | 2422 |
+| Missing C ABI | 111 |
+| Behavior mismatch | 191 |
 | Intentional divergence (approval required) | 87 |
 | Not required (rationale required) | 392 |
 | **Total** | **3203** |
@@ -4435,9 +4435,9 @@ every non-vendored header maps to exactly one row, proved arithmetically in
 | [§9.3](#sec-9-3) pandas surface | `SB-PANDA` | 21 | 0 | 0 | 20 | 0 | 0 | 1 |
 | [§10](#sec-10) Writers | `SB-WRITE` | 23 | 0 | 1 | 6 | 7 | 0 | 9 |
 | [§10.1](#sec-10-1) High-level helpers | `SB-BASE` | 20 | 0 | 0 | 18 | 0 | 0 | 2 |
-| [§11](#sec-11) Table operations | `SB-TABLE` | 22 | 0 | 3 | 11 | 2 | 0 | 6 |
-| [§12](#sec-12) Namespaces | `SB-NS` | 8 | 0 | 7 | 0 | 1 | 0 | 0 |
-| [§13](#sec-13) Security | `SB-SEC` | 19 | 0 | 17 | 0 | 1 | 0 | 1 |
+| [§11](#sec-11) Table operations | `SB-TABLE` | 22 | 0 | 2 | 6 | 8 | 0 | 6 |
+| [§12](#sec-12) Namespaces | `SB-NS` | 8 | 0 | 0 | 0 | 8 | 0 | 0 |
+| [§13](#sec-13) Security | `SB-SEC` | 19 | 0 | 0 | 0 | 18 | 0 | 1 |
 | [§14](#sec-14) Cluster status | `SB-STAT` | 84 | 0 | 1 | 0 | 0 | 82 | 1 |
 | [§15](#sec-15) RFile and streams | `SB-RFILE` | 36 | 0 | 32 | 0 | 1 | 0 | 3 |
 | [§16](#sec-16) HDFS | `SB-HDFS` | 26 | 0 | 26 | 0 | 0 | 0 | 0 |
@@ -4447,16 +4447,16 @@ every non-vendored header maps to exactly one row, proved arithmetically in
 | [§19.2](#sec-19-2) C++ complete member enumeration | `SB-CXX` | 2626 | 0 | 2307 | 0 | 15 | 0 | 304 |
 | [§19.4](#sec-19-4) Dead embedded-module surface | `SB-EMB` | 35 | 0 | 0 | 0 | 0 | 0 | 35 |
 | [§20](#sec-20) Cross-cutting | `SB-XCUT` | 19 | 0 | 1 | 4 | 14 | 0 | 0 |
-| **Total** | | **3203** | **0** | **2447** | **116** | **161** | **87** | **392** |
+| **Total** | | **3203** | **0** | **2422** | **111** | **191** | **87** | **392** |
 
 ### 25.3 Reading the counts
 
-**No row is `Covered`.** Fifteen independent audits have examined every coverage
+**No row is `Covered`.** Sixteen independent audits have examined every coverage
 claim this document made and none survived. The last to fall,
 [SB-XCUT-013](#sec-20), asserted Linux/gcc symbol visibility while the only
 linked test references 38 of the 44 declared exports.
 
-The shape of the work is visible in the 2447 `Missing Go` rows, of which 2307
+The shape of the work is visible in the 2422 `Missing Go` rows, of which 2307
 are the C++ members in [§19.2](#sec-19-2) that no Shoal layer exports. That
 number is large because Sharkbite publishes its entire client implementation in
 public headers — 2603 live public members plus 16 enums across 204 non-vendored
@@ -4466,27 +4466,34 @@ on. The Python-visible subset is far smaller, which is why [§5](#sec-5)–
 [§19.2](#sec-19-2) rows carry a per-area rationale rather than an implied
 promise to port all of it.
 
-`Behavior mismatch` (161) is the bucket that sets the schedule: 146 rows on the
+`Behavior mismatch` (191) is the bucket that sets the schedule: 176 rows on the
 Python-visible and curated C++ surface each need a differential test against a
 live cluster or the exported ABI, and 15 are destructors of classes bound into
 Python, where the destruction point is user-observable and the model differs
 from Go finalisation ([§19.1](#sec-19-1)). `Intentional divergence` (87) is
 dominated by one upstream fact: 82 rows are cluster-status accessors Accumulo
-itself deleted ([§14](#sec-14), [SB-DIV-016](#sec-26)). `Missing C ABI` (116)
+itself deleted ([§14](#sec-14), [SB-DIV-016](#sec-26)). `Missing C ABI` (111)
 is concentrated in the Python layers — pandas (20), high-level helpers (18),
-PyTorch (9).
+PyTorch (9). Revision 17 moved the implemented administration rows out of this
+bucket without claiming Python equivalence.
 
 ### 25.4 Revision history
 
-| Bucket | Rev 10 | Rev 11 | Rev 12 | Rev 13 | Rev 14 | Rev 15 | Rev 16 | Rev 15 → 16 |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Covered | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
-| Missing Go | 2455 | 2451 | 2454 | 2448 | 2448 | 2447 | 2447 | 0 |
-| Missing C ABI | 116 | 116 | 116 | 116 | 116 | 116 | 116 | 0 |
-| Behavior mismatch | 161 | 161 | 161 | 161 | 161 | 161 | 161 | 0 |
-| Intentional divergence | 87 | 87 | 87 | 87 | 87 | 87 | 87 | 0 |
-| Not required | 358 | 356 | 356 | 356 | 356 | 392 | 392 | 0 |
-| **Total** | **3177** | **3171** | **3174** | **3168** | **3168** | **3203** | **3203** | **0** |
+| Bucket | Rev 10 | Rev 11 | Rev 12 | Rev 13 | Rev 14 | Rev 15 | Rev 16 | Rev 17 | Rev 16 → 17 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Covered | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| Missing Go | 2455 | 2451 | 2454 | 2448 | 2448 | 2447 | 2447 | 2422 | -25 |
+| Missing C ABI | 116 | 116 | 116 | 116 | 116 | 116 | 116 | 111 | -5 |
+| Behavior mismatch | 161 | 161 | 161 | 161 | 161 | 161 | 161 | 191 | +30 |
+| Intentional divergence | 87 | 87 | 87 | 87 | 87 | 87 | 87 | 87 | 0 |
+| Not required | 358 | 356 | 356 | 356 | 356 | 392 | 392 | 392 | 0 |
+| **Total** | **3177** | **3171** | **3174** | **3168** | **3168** | **3203** | **3203** | **3203** | **0** |
+
+Revision 17 changes 30 statuses without changing the inventory: 25 merged Go
+namespace/security/split rows move from `Missing Go` to `Behavior mismatch`,
+and five merged table-administration rows move from `Missing C ABI` to
+`Behavior mismatch`. Exact Go and C evidence now exists, while Python-visible
+defaults, return values, and object composition still differ.
 
 Revision 16 changes no count: the fifteenth audit found a truncated registration
 contract, not a missing or misclassified obligation. Fourteen of the 35

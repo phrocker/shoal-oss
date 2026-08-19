@@ -63,10 +63,10 @@ shoal_connector_create(const shoal_connector_config *config,
 
 /*
  * Closes connector-owned transports and bootstrap resources. Close is
- * idempotent while the handle remains alive, cancels active
- * table-administration calls, and waits for those plus any in-flight scanner
- * or batch-scanner calls to finish before tearing down connector-owned
- * resources.
+ * idempotent while the handle remains alive, cancels active table, namespace,
+ * security, and split-administration calls, and waits for those plus any
+ * in-flight scanner or batch-scanner calls to finish before tearing down
+ * connector-owned resources.
  */
 SHOAL_API shoal_status SHOAL_CALL
 shoal_connector_close(shoal_connector *connector, shoal_error **out_error);
