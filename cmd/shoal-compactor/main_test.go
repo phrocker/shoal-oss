@@ -692,6 +692,17 @@ func TestDrainCoordinatorSurfacesJobsItCannotHandBack(t *testing.T) {
 			},
 			wantLog: "carries no table id",
 		},
+		{
+			// A decoded Thrift binary can be a non-nil empty slice. It
+			// converts, so the RPC would succeed — naming TableId.of("")
+			// rather than the assigned tablet, leaving the assignment in
+			// place while shoal logged the slot as released.
+			name: "extent with an empty table id",
+			mutate: func(j *tabletserver.TExternalCompactionJob) {
+				j.Extent = &data.TKeyExtent{Table: []byte{}, PrevEndRow: []byte("c"), EndRow: []byte("m")}
+			},
+			wantLog: "carries no table id",
+		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			svc := &fakeCoordinator{}

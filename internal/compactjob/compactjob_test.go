@@ -511,6 +511,77 @@ func TestTranslateAcceptsAnUnauthoritativeVolume(t *testing.T) {
 	}
 }
 
+// TestTranslateRefusesNonRFileInputs pins the input side of the format
+// gate. compaction.Compact opens every input through bcfile/rfile with
+// no dispatch on type, so a tablet holding anything else would hand the
+// composer a file it cannot open — and an .rf output does not rule that
+// out, since the two are configured separately.
+func TestTranslateRefusesNonRFileInputs(t *testing.T) {
+	job := validJob()
+	job.Files[1].MetadataFileEntry =
+		storedFile("hdfs://nn/accumulo/tables/2/t-0001/F0002.parquet")
+
+	r := assertRefused(t, job, Options{}, ClassUnsupportedProperty, "files[1]")
+	if !strings.Contains(r.Detail, "parquet") {
+		t.Fatalf("detail = %q, want it to name the format", r.Detail)
+	}
+}
+
+// TestTranslateReportsFencesBeforeInputFormat keeps the pass-2 ordering
+// stable when an input has both problems: neither is fixable by the
+// operator, but the fence is the one Accumulo can be asked about.
+func TestTranslateReportsFencesBeforeInputFormat(t *testing.T) {
+	job := validJob()
+	job.Files[1].MetadataFileEntry =
+		fencedFile("hdfs://nn/accumulo/tables/2/t-0001/F0002.parquet", "d", "k")
+
+	assertRefused(t, job, Options{}, ClassRangedInputFile, "files[1]")
+}
+
+// TestTranslateAllowsOnePathUnderDistinctFences is the counterpart to
+// the duplicate check. A StoredTabletFile is its path *and* its range,
+// and Accumulo deliberately references one file under several disjoint
+// ranges, so such a job is a legitimate ranged job: it has to reach the
+// capability pass and come back as RangedInputFileUnsupported, not as a
+// malformed duplicate.
+func TestTranslateAllowsOnePathUnderDistinctFences(t *testing.T) {
+	const path = "hdfs://nn/accumulo/tables/2/t-0001/F0002.rf"
+	job := validJob()
+	job.Files = append(job.Files,
+		&tabletserver.InputFile{MetadataFileEntry: fencedFile(path, "a", "f"), Size: 8, Entries: 1},
+		&tabletserver.InputFile{MetadataFileEntry: fencedFile(path, "f", "m"), Size: 8, Entries: 1},
+	)
+
+	assertRefused(t, job, Options{}, ClassRangedInputFile, "files[2]")
+}
+
+// TestTranslateRefusesOnePathUnderTheSameFence closes the other half:
+// the same reference twice is still a duplicate, and equivalent
+// spellings of one range must not defeat the check — Base64.getUrlDecoder
+// accepts padded and unpadded input alike.
+func TestTranslateRefusesOnePathUnderTheSameFence(t *testing.T) {
+	const path = "hdfs://nn/accumulo/tables/2/t-0001/F0002.rf"
+	padded := base64.URLEncoding.EncodeToString([]byte{0x01, 'd'})
+	unpadded := strings.TrimRight(padded, "=")
+	if padded == unpadded {
+		t.Fatalf("fixture error: %q needs padding for this test to mean anything", padded)
+	}
+	job := validJob()
+	job.Files = append(job.Files,
+		&tabletserver.InputFile{
+			MetadataFileEntry: fmt.Sprintf(`{"path":"%s","startRow":"%s","endRow":""}`, path, padded),
+		},
+		&tabletserver.InputFile{
+			MetadataFileEntry: fmt.Sprintf(`{"path":"%s","startRow":"%s","endRow":""}`, path, unpadded),
+		},
+	)
+
+	r := assertRefused(t, job, Options{}, ClassMalformedJob, "files[3]")
+	if !strings.Contains(r.Detail, "duplicates files[2]") {
+		t.Fatalf("detail = %q, want it to name the entry it duplicates", r.Detail)
+	}
+}
+
 // TestEmptyInputGuards covers the two preconditions the callers already
 // satisfy — parseInputs rejects an empty entry and parseOutput an empty
 // output before either helper runs, and checkFenceRow returns early on a

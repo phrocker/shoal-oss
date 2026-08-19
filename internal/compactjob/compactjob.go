@@ -624,9 +624,24 @@ type parsedInput struct {
 	file             InputFile
 	field            string
 	startRow, endRow string
+	// startRaw and endRaw are the rows after base64 decoding. They are
+	// what identifies the reference, because a StoredTabletFile is its
+	// path *and* its range, and two spellings of one range have to
+	// compare equal.
+	startRaw, endRaw []byte
 }
 
 func (p parsedInput) fenced() bool { return p.startRow != "" || p.endRow != "" }
+
+// key identifies the tablet-file reference this entry names. Accumulo
+// deliberately allows several StoredTabletFiles over one path with
+// different ranges — that is how a fenced file is referenced after a
+// split or merge — so the range belongs in the identity. Comparing the
+// decoded rows rather than the JSON collapses equivalent spellings, such
+// as padded and unpadded base64.
+func (p parsedInput) key() string {
+	return p.file.Path + "\x00" + string(p.startRaw) + "\x00" + string(p.endRaw)
+}
 
 func inputFiles(inputs []parsedInput) []InputFile {
 	out := make([]InputFile, 0, len(inputs))
@@ -647,8 +662,9 @@ func parseInputs(job *tabletserver.TExternalCompactionJob) ([]parsedInput, int64
 	}
 
 	out := make([]parsedInput, 0, len(files))
-	// Duplicates are detected by decoded path, not by the raw entry: the
-	// same RFile can arrive as JSON with different field order or as a
+	// Duplicates are detected by the decoded reference — path plus range
+	// — not by the raw entry: the same reference can arrive as JSON with
+	// different field order, with padded or unpadded rows, or as a
 	// legacy bare path, and merging it twice would double its cells.
 	seen := make(map[string]int, len(files))
 	var totalBytes, totalEntries int64
@@ -677,12 +693,12 @@ func parseInputs(job *tabletserver.TExternalCompactionJob) ([]parsedInput, int64
 		in.file.Entries = f.GetEntries()
 		in.file.Timestamp = f.GetTimestamp()
 
-		if prev, dup := seen[in.file.Path]; dup {
+		if prev, dup := seen[in.key()]; dup {
 			return nil, 0, 0, refuse(ClassMalformedJob, field,
 				"duplicates files[%d] (%s); compacting a file twice would double its cells",
 				prev, in.file.Path)
 		}
-		seen[in.file.Path] = i
+		seen[in.key()] = i
 
 		// The declared sizes are attacker- or bug-supplied. Summing them
 		// blindly can wrap negative, which would slip past the budget
@@ -701,15 +717,29 @@ func parseInputs(job *tabletserver.TExternalCompactionJob) ([]parsedInput, int64
 }
 
 // checkInputCapability refuses inputs shoal cannot read and jobs beyond
-// this compactor's configured budget. Fences are reported first: raising
-// a limit could never make a fenced job runnable, so it is the more
-// useful answer when a job has both problems.
+// this compactor's configured budget. The two file-shape refusals come
+// first: raising a limit could never make a fenced or non-RFile input
+// runnable, so they are the more useful answer when a job has both
+// problems.
 func checkInputCapability(inputs []parsedInput, totalBytes int64, limits Limits) error {
 	for _, in := range inputs {
 		if in.fenced() {
 			return refuse(ClassRangedInputFile, in.field,
 				"input %s is fenced to (%q,%q]; shoal reads whole RFiles, so the fence cannot be honored",
 				in.file.Path, in.startRow, in.endRow)
+		}
+	}
+	// compaction.Compact opens every input through bcfile.NewReader and
+	// rfile.Open, with no dispatch on the file's type. Accumulo picks a
+	// reader by extension (FileOperations), so a tablet holding anything
+	// but RFiles would hand shoal a file its composer cannot open — and
+	// discovering that after the slot looks runnable is exactly the
+	// failure this pass exists to prevent.
+	for _, in := range inputs {
+		if !strings.HasSuffix(in.file.Path, rfileExtension) {
+			return refuse(ClassUnsupportedProperty, in.field,
+				"input %s is a %s file; shoal's reader opens RFiles only",
+				in.file.Path, outputExtension(in.file.Path))
 		}
 	}
 	if limits.MaxInputFiles > 0 && len(inputs) > limits.MaxInputFiles {
@@ -740,7 +770,8 @@ func decodeFileEntry(entry, field string) (parsedInput, error) {
 	// and be indistinguishable from a whole-file entry, which is the
 	// one misreading that silently widens a compaction's input beyond
 	// the range the manager authorized.
-	if err := checkFenceFields(entry, field); err != nil {
+	startRaw, endRaw, err := checkFenceFields(entry, field)
+	if err != nil {
 		return parsedInput{}, err
 	}
 	decoded, err := metadata.DecodeStoredTabletFile([]byte(entry))
@@ -750,6 +781,7 @@ func decodeFileEntry(entry, field string) (parsedInput, error) {
 	}
 	in.file.Path = decoded.Path
 	in.startRow, in.endRow = decoded.StartRow, decoded.EndRow
+	in.startRaw, in.endRaw = startRaw, endRaw
 	return in, nil
 }
 
@@ -856,30 +888,36 @@ func checkTabletFilePath(raw, field string) error {
 // (Base64.getUrlEncoder), so a value outside that alphabet is equally
 // unparseable. Only a present, well-encoded, zero-length row means
 // "unbounded on this side" (decodeRow returns null for an empty array).
-func checkFenceFields(entry, field string) error {
+//
+// The decoded rows come back so the caller can identify the reference by
+// path and range without decoding them a second time.
+func checkFenceFields(entry, field string) (startRaw, endRaw []byte, err error) {
 	var probe struct {
 		StartRow *string `json:"startRow"`
 		EndRow   *string `json:"endRow"`
 	}
 	if err := json.Unmarshal([]byte(entry), &probe); err != nil {
-		return refuse(ClassMalformedJob, field,
+		return nil, nil, refuse(ClassMalformedJob, field,
 			"undecodable StoredTabletFile entry: %v", err)
 	}
-	for _, row := range []struct {
+	decoded := make([][]byte, 2)
+	for i, row := range []struct {
 		name  string
 		value *string
 	}{{"startRow", probe.StartRow}, {"endRow", probe.EndRow}} {
 		if row.value == nil {
-			return refuse(ClassMalformedJob, field,
+			return nil, nil, refuse(ClassMalformedJob, field,
 				"StoredTabletFile is missing %s; a fence is absent only when the field is present and empty",
 				row.name)
 		}
-		if err := checkFenceRow(*row.value); err != nil {
-			return refuse(ClassMalformedJob, field,
+		raw, err := checkFenceRow(*row.value)
+		if err != nil {
+			return nil, nil, refuse(ClassMalformedJob, field,
 				"StoredTabletFile %s %q: %v", row.name, *row.value, err)
 		}
+		decoded[i] = raw
 	}
-	return nil
+	return decoded[0], decoded[1], nil
 }
 
 // checkFenceRow accepts exactly the row encodings
@@ -897,17 +935,20 @@ func checkFenceFields(entry, field string) error {
 // row like "AQ==" — a length of one with nothing after it — is not an
 // unsupported fence, it is an entry Java throws on, and reporting it as
 // a fence would blame the wrong thing and hide a corrupt job.
-func checkFenceRow(value string) error {
+func checkFenceRow(value string) ([]byte, error) {
 	raw, err := decodeURLBase64(value)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if len(raw) == 0 {
 		// decodeRow: an empty array is how "unbounded on this side" is
 		// spelled, and it never reaches Text.readFields.
-		return nil
+		return nil, nil
 	}
-	return checkTextFraming(raw)
+	if err := checkTextFraming(raw); err != nil {
+		return nil, err
+	}
+	return raw, nil
 }
 
 // decodeURLBase64 accepts the encodings Base64.getUrlDecoder accepts:
@@ -1074,12 +1115,16 @@ func committedName(out string) (name string, ok bool) {
 // the tablet a file it cannot read.
 func checkOutputCapability(out, ecid string) error {
 	base := strings.TrimSuffix(out, tmpSuffix(ecid))
-	if !strings.HasSuffix(base, ".rf") {
+	if !strings.HasSuffix(base, rfileExtension) {
 		return refuse(ClassUnsupportedProperty, "outputFile",
 			"%q names a %s file; shoal's writer emits RFiles only", out, outputExtension(base))
 	}
 	return nil
 }
+
+// rfileExtension is RFile.EXTENSION, the only file type shoal's reader
+// and writer implement.
+const rfileExtension = ".rf"
 
 // outputExtension renders the extension in a refusal message, so an
 // operator sees the format that was asked for rather than the whole path.

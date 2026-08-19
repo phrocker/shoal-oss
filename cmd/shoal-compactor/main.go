@@ -566,10 +566,17 @@ func executeJob(ctx context.Context, logger *slog.Logger, cc coordinatorConn, cf
 // CompactionCoordinator.compactionFailed converts the extent before it
 // records anything — KeyExtent.fromThrift(extent) — and fromThrift
 // starts with TableId.of(new String(tke.getTable(), UTF_8)). A null
-// extent, or an extent whose table is unset, therefore throws inside the
-// handler; the call comes back as an application error no matter how
-// often it is retried. The generated writer omits a nil struct field
-// entirely, so the coordinator does see exactly that null.
+// extent therefore throws inside the handler, and the call comes back as
+// an application error no matter how often it is retried. The generated
+// writer omits a nil struct field entirely, so the coordinator does see
+// exactly that null.
+//
+// An extent carrying no table id is the quieter version of the same
+// problem: it converts, so the RPC succeeds, but TableId.of("") names no
+// tablet — the real assignment is never cleared while shoal logs the
+// slot as released. Translate already treats every zero-length table id
+// as missing, and a decoded Thrift binary can be a non-nil empty slice,
+// so this uses the same length test rather than a nil check.
 //
 // The pinned protocol has no hand-back that takes the ECID alone, and
 // substituting an extent shoal invented would tell the manager a
@@ -581,8 +588,8 @@ func unreleasableReason(job *tabletserver.TExternalCompactionJob) string {
 	switch {
 	case extent == nil:
 		return "the assignment carries no extent, and compactionFailed cannot convert a missing one"
-	case extent.Table == nil:
-		return "the assignment's extent carries no table id, and compactionFailed cannot convert it"
+	case len(extent.GetTable()) == 0:
+		return "the assignment's extent carries no table id, so compactionFailed would name no tablet"
 	}
 	return ""
 }
