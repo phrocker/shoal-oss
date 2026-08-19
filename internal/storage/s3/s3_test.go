@@ -50,6 +50,7 @@ type fakeS3WriteOperations struct {
 	stageResponseLost   bool
 	promoteResponseLost bool
 	mutateBeforePromote bool
+	headErrs            map[string][]error
 	deleteFailures      int
 	promoteCalls        int
 	cleanupCanceled     bool
@@ -58,7 +59,10 @@ type fakeS3WriteOperations struct {
 }
 
 func newFakeS3WriteOperations() *fakeS3WriteOperations {
-	return &fakeS3WriteOperations{objects: make(map[string]fakeS3Object)}
+	return &fakeS3WriteOperations{
+		objects:  make(map[string]fakeS3Object),
+		headErrs: make(map[string][]error),
+	}
 }
 
 func (f *fakeS3WriteOperations) head(
@@ -67,6 +71,13 @@ func (f *fakeS3WriteOperations) head(
 	if f.headFailures > 0 {
 		f.headFailures--
 		return s3ObjectState{}, context.DeadlineExceeded
+	}
+	if errs := f.headErrs[key]; len(errs) > 0 {
+		err := errs[0]
+		f.headErrs[key] = errs[1:]
+		if err != nil {
+			return s3ObjectState{}, err
+		}
 	}
 	obj, ok := f.objects[key]
 	if !ok {
@@ -644,6 +655,80 @@ func TestWriter_CleanupUsesIndependentContextAndCanRetryAfterCommit(t *testing.T
 			t.Fatal("Abort did not discover and remove temporary object")
 		}
 	})
+}
+
+func TestWriter_AbortRetriesOwnedCleanupAfterAmbiguousStageUpload(t *testing.T) {
+	f := newFakeS3WriteOperations()
+	f.stageResponseLost = true
+	w := newFakeS3Writer(f, "target")
+	f.headErrs[w.stageKey] = []error{context.DeadlineExceeded, context.DeadlineExceeded}
+
+	if _, err := w.Write([]byte("new")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if err := w.Close(); err == nil || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Close error = %v, want transient stage verification failure", err)
+	}
+	if _, ok := f.objects[w.stageKey]; !ok {
+		t.Fatal("ambiguous stage upload lost staged object before retry")
+	}
+
+	f.deleteFailures = 1
+	if err := w.Abort(); err == nil || !strings.Contains(err.Error(), "remove temporary object") {
+		t.Fatalf("first Abort error = %v, want cleanup retryable delete failure", err)
+	}
+	if _, ok := f.objects[w.stageKey]; !ok {
+		t.Fatal("failed Abort removed staged object unexpectedly")
+	}
+	if err := w.Abort(); err != nil {
+		t.Fatalf("second Abort: %v", err)
+	}
+	if _, ok := f.objects[w.stageKey]; ok {
+		t.Fatal("second Abort did not remove staged object")
+	}
+	if err := w.Abort(); err != nil {
+		t.Fatalf("third Abort: %v", err)
+	}
+	if err := w.Close(); err == nil || !strings.Contains(err.Error(), "aborted") {
+		t.Fatalf("Close after Abort error = %v, want aborted state", err)
+	}
+}
+
+func TestWriter_AbortTreatsUnownedStageAsAlreadyCleanAfterAmbiguousUpload(t *testing.T) {
+	f := newFakeS3WriteOperations()
+	f.stageResponseLost = true
+	w := newFakeS3Writer(f, "target")
+	f.headErrs[w.stageKey] = []error{context.DeadlineExceeded, context.DeadlineExceeded}
+
+	if _, err := w.Write([]byte("new")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if err := w.Close(); err == nil || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Close error = %v, want transient stage verification failure", err)
+	}
+
+	etag := "\"intruder\""
+	f.objects[w.stageKey] = fakeS3Object{
+		state: s3ObjectState{
+			etag:     &etag,
+			size:     int64(len("intruder")),
+			metadata: map[string]string{"shoal-write-id": "intruder"},
+		},
+		data: "intruder",
+	}
+
+	if err := w.Abort(); err != nil {
+		t.Fatalf("Abort: %v", err)
+	}
+	if got := f.objects[w.stageKey].data; got != "intruder" {
+		t.Fatalf("Abort removed or replaced unowned staged object: %q", got)
+	}
+	if err := w.Abort(); err != nil {
+		t.Fatalf("second Abort: %v", err)
+	}
+	if err := w.Close(); err == nil || !strings.Contains(err.Error(), "aborted") {
+		t.Fatalf("Close after Abort error = %v, want aborted state", err)
+	}
 }
 
 // TestFile_ReadAt_EdgeCases exercises the code paths in file.ReadAt that do

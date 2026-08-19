@@ -50,6 +50,7 @@ type fakeAzureWriteOperations struct {
 	stageResponseLost   bool
 	promoteResponseLost bool
 	mutateBeforePromote bool
+	headErrs            map[string][]error
 	deleteFailures      int
 	promoteCalls        int
 	cleanupCanceled     bool
@@ -60,7 +61,10 @@ type fakeAzureWriteOperations struct {
 }
 
 func newFakeAzureWriteOperations() *fakeAzureWriteOperations {
-	return &fakeAzureWriteOperations{objects: make(map[string]fakeAzureObject)}
+	return &fakeAzureWriteOperations{
+		objects:  make(map[string]fakeAzureObject),
+		headErrs: make(map[string][]error),
+	}
 }
 
 func azureNotFoundError() error {
@@ -73,6 +77,13 @@ func (f *fakeAzureWriteOperations) head(
 	if f.headFailures > 0 {
 		f.headFailures--
 		return azureObjectState{}, context.DeadlineExceeded
+	}
+	if errs := f.headErrs[name]; len(errs) > 0 {
+		err := errs[0]
+		f.headErrs[name] = errs[1:]
+		if err != nil {
+			return azureObjectState{}, err
+		}
 	}
 	obj, ok := f.objects[name]
 	if !ok {
@@ -927,6 +938,81 @@ func TestWriter_CleanupUsesIndependentContextAndCanRetryAfterCommit(t *testing.T
 			t.Fatal("Abort did not discover and remove temporary blob")
 		}
 	})
+}
+
+func TestWriter_AbortRetriesOwnedCleanupAfterAmbiguousStageUpload(t *testing.T) {
+	f := newFakeAzureWriteOperations()
+	f.stageResponseLost = true
+	w := newFakeAzureWriter(f, "target")
+	f.headErrs[w.stageName] = []error{context.DeadlineExceeded, context.DeadlineExceeded}
+
+	if _, err := w.Write([]byte("new")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if err := w.Close(); err == nil || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Close error = %v, want transient stage verification failure", err)
+	}
+	if _, ok := f.objects[w.stageName]; !ok {
+		t.Fatal("ambiguous stage upload lost staged blob before retry")
+	}
+
+	f.deleteFailures = 1
+	if err := w.Abort(); err == nil || !strings.Contains(err.Error(), "remove temporary blob") {
+		t.Fatalf("first Abort error = %v, want cleanup retryable delete failure", err)
+	}
+	if _, ok := f.objects[w.stageName]; !ok {
+		t.Fatal("failed Abort removed staged blob unexpectedly")
+	}
+	if err := w.Abort(); err != nil {
+		t.Fatalf("second Abort: %v", err)
+	}
+	if _, ok := f.objects[w.stageName]; ok {
+		t.Fatal("second Abort did not remove staged blob")
+	}
+	if err := w.Abort(); err != nil {
+		t.Fatalf("third Abort: %v", err)
+	}
+	if err := w.Close(); err == nil || !strings.Contains(err.Error(), "aborted") {
+		t.Fatalf("Close after Abort error = %v, want aborted state", err)
+	}
+}
+
+func TestWriter_AbortTreatsUnownedStageAsAlreadyCleanAfterAmbiguousUpload(t *testing.T) {
+	f := newFakeAzureWriteOperations()
+	f.stageResponseLost = true
+	w := newFakeAzureWriter(f, "target")
+	f.headErrs[w.stageName] = []error{context.DeadlineExceeded, context.DeadlineExceeded}
+
+	if _, err := w.Write([]byte("new")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if err := w.Close(); err == nil || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Close error = %v, want transient stage verification failure", err)
+	}
+
+	etag := azcore.ETag("\"intruder\"")
+	id := "intruder"
+	f.objects[w.stageName] = fakeAzureObject{
+		state: azureObjectState{
+			etag:     &etag,
+			size:     int64(len("intruder")),
+			metadata: map[string]*string{"shoal-write-id": &id},
+		},
+		data: "intruder",
+	}
+
+	if err := w.Abort(); err != nil {
+		t.Fatalf("Abort: %v", err)
+	}
+	if got := f.objects[w.stageName].data; got != "intruder" {
+		t.Fatalf("Abort removed or replaced unowned staged blob: %q", got)
+	}
+	if err := w.Abort(); err != nil {
+		t.Fatalf("second Abort: %v", err)
+	}
+	if err := w.Close(); err == nil || !strings.Contains(err.Error(), "aborted") {
+		t.Fatalf("Close after Abort error = %v, want aborted state", err)
+	}
 }
 
 type fakeAzureBlockStageCall struct {

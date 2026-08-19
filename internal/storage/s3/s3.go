@@ -512,6 +512,7 @@ type writer struct {
 	stage          s3ObjectState
 	stageCreated   bool
 	stageUnknown   bool
+	stageOwned     bool
 	cleanupTimeout time.Duration
 	buf            bytes.Buffer
 	closed         bool
@@ -549,8 +550,7 @@ func (w *writer) Close() error {
 			}
 			stage = w.stage
 		}
-		w.stage = stage
-		w.stageCreated = true
+		w.rememberStage(stage)
 		w.stageUnknown = false
 	}
 	if w.stage.etag == nil {
@@ -595,23 +595,13 @@ func (w *writer) Abort() error {
 }
 
 func (w *writer) verifyStage() (bool, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), w.cleanupTimeout)
-	defer cancel()
-	state, err := w.ops.head(ctx, w.bucket, w.stageKey)
+	_, found, err := w.lookupStage()
 	if err != nil {
-		if isNotFound(err) {
-			w.stageUnknown = false
-			return false, nil
-		}
-		return false, fmt.Errorf("s3: verify temporary object s3://%s/%s: %w", w.bucket, w.stageKey, err)
+		return false, err
 	}
-	if state.size != int64(w.buf.Len()) || state.metadata["shoal-write-id"] != w.writeID {
-		w.stageUnknown = false
+	if !found || !w.stageCreated {
 		return false, nil
 	}
-	w.stage = state
-	w.stageCreated = true
-	w.stageUnknown = false
 	return true, nil
 }
 
@@ -633,15 +623,20 @@ func (w *writer) verifyDestination() (bool, error) {
 }
 
 func (w *writer) cleanupStage() error {
-	if !w.stageCreated {
+	if w.ops == nil || w.bucket == "" || w.stageKey == "" {
+		w.clearStage()
+		return nil
+	}
+	if !w.stageOwned {
 		if !w.stageUnknown {
 			return nil
 		}
-		verified, err := w.verifyStage()
+		owned, err := w.lookupOwnedStageForCleanup()
 		if err != nil {
 			return err
 		}
-		if !verified {
+		if !owned {
+			w.clearStage()
 			return nil
 		}
 	}
@@ -650,9 +645,45 @@ func (w *writer) cleanupStage() error {
 	if err := w.ops.deleteStage(ctx, w.bucket, w.stageKey, w.stage); err != nil && !isNotFound(err) {
 		return fmt.Errorf("s3: remove temporary object s3://%s/%s: %w", w.bucket, w.stageKey, err)
 	}
+	w.clearStage()
+	return nil
+}
+
+func (w *writer) lookupStage() (s3ObjectState, bool, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), w.cleanupTimeout)
+	defer cancel()
+	state, err := w.ops.head(ctx, w.bucket, w.stageKey)
+	if err != nil {
+		if isNotFound(err) {
+			w.clearStage()
+			return s3ObjectState{}, false, nil
+		}
+		return s3ObjectState{}, false, fmt.Errorf("s3: verify temporary object s3://%s/%s: %w", w.bucket, w.stageKey, err)
+	}
+	w.rememberStage(state)
+	w.stageUnknown = false
+	return state, true, nil
+}
+
+func (w *writer) lookupOwnedStageForCleanup() (bool, error) {
+	_, found, err := w.lookupStage()
+	if err != nil {
+		return false, err
+	}
+	return found && w.stageOwned, nil
+}
+
+func (w *writer) rememberStage(state s3ObjectState) {
+	w.stage = state
+	w.stageOwned = state.metadata["shoal-write-id"] == w.writeID
+	w.stageCreated = w.stageOwned && state.size == int64(w.buf.Len())
+}
+
+func (w *writer) clearStage() {
+	w.stage = s3ObjectState{}
 	w.stageCreated = false
 	w.stageUnknown = false
-	return nil
+	w.stageOwned = false
 }
 
 func equalStringPointers(a, b *string) bool {

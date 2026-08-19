@@ -918,6 +918,7 @@ type writer struct {
 	stage          azureObjectState
 	stageCreated   bool
 	stageUnknown   bool
+	stageOwned     bool
 	cleanupTimeout time.Duration
 	buf            bytes.Buffer
 	closed         bool
@@ -955,8 +956,7 @@ func (w *writer) Close() error {
 			}
 			stage = w.stage
 		}
-		w.stage = stage
-		w.stageCreated = true
+		w.rememberStage(stage)
 		w.stageUnknown = false
 	}
 	if w.stage.etag == nil {
@@ -1005,23 +1005,13 @@ func (w *writer) Abort() error {
 }
 
 func (w *writer) verifyStage() (bool, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), w.cleanupTimeout)
-	defer cancel()
-	state, err := w.ops.head(ctx, w.container, w.stageName)
+	_, found, err := w.lookupStage()
 	if err != nil {
-		if isBlobNotFound(err) {
-			w.stageUnknown = false
-			return false, nil
-		}
-		return false, fmt.Errorf("azure: verify temporary blob az://%s/%s: %w", w.container, w.stageName, err)
+		return false, err
 	}
-	if state.size != int64(w.buf.Len()) || metadataValue(state.metadata, "shoal-write-id") != w.writeID {
-		w.stageUnknown = false
+	if !found || !w.stageCreated {
 		return false, nil
 	}
-	w.stage = state
-	w.stageCreated = true
-	w.stageUnknown = false
 	return true, nil
 }
 
@@ -1043,15 +1033,20 @@ func (w *writer) verifyDestination() (bool, error) {
 }
 
 func (w *writer) cleanupStage() error {
-	if !w.stageCreated {
+	if w.ops == nil || w.container == "" || w.stageName == "" {
+		w.clearStage()
+		return nil
+	}
+	if !w.stageOwned {
 		if !w.stageUnknown {
 			return nil
 		}
-		verified, err := w.verifyStage()
+		owned, err := w.lookupOwnedStageForCleanup()
 		if err != nil {
 			return err
 		}
-		if !verified {
+		if !owned {
+			w.clearStage()
 			return nil
 		}
 	}
@@ -1060,9 +1055,45 @@ func (w *writer) cleanupStage() error {
 	if err := w.ops.deleteStage(ctx, w.container, w.stageName, w.stage); err != nil && !isBlobNotFound(err) {
 		return fmt.Errorf("azure: remove temporary blob az://%s/%s: %w", w.container, w.stageName, err)
 	}
+	w.clearStage()
+	return nil
+}
+
+func (w *writer) lookupStage() (azureObjectState, bool, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), w.cleanupTimeout)
+	defer cancel()
+	state, err := w.ops.head(ctx, w.container, w.stageName)
+	if err != nil {
+		if isBlobNotFound(err) {
+			w.clearStage()
+			return azureObjectState{}, false, nil
+		}
+		return azureObjectState{}, false, fmt.Errorf("azure: verify temporary blob az://%s/%s: %w", w.container, w.stageName, err)
+	}
+	w.rememberStage(state)
+	w.stageUnknown = false
+	return state, true, nil
+}
+
+func (w *writer) lookupOwnedStageForCleanup() (bool, error) {
+	_, found, err := w.lookupStage()
+	if err != nil {
+		return false, err
+	}
+	return found && w.stageOwned, nil
+}
+
+func (w *writer) rememberStage(state azureObjectState) {
+	w.stage = state
+	w.stageOwned = metadataValue(state.metadata, "shoal-write-id") == w.writeID
+	w.stageCreated = w.stageOwned && state.size == int64(w.buf.Len())
+}
+
+func (w *writer) clearStage() {
+	w.stage = azureObjectState{}
 	w.stageCreated = false
 	w.stageUnknown = false
-	return nil
+	w.stageOwned = false
 }
 
 func (w *writer) promotionSource() (azureCopySource, error) {

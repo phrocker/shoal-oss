@@ -401,6 +401,7 @@ type writer struct {
 	tempAttrs          *storage.ObjectAttrs
 	tempUnknown        bool
 	tempClosed         bool
+	tempPromotable     bool
 	tempCleanupTimeout time.Duration
 	closed             bool
 	abortRequested     bool
@@ -429,6 +430,7 @@ func (w *writer) Close() error {
 		w.tempClosed = true
 		w.tempUnknown = true
 		err := w.inner.Close()
+		w.tempPromotable = err == nil
 		verifyErr := w.verifyTempObject()
 		if err != nil {
 			w.stopWriter()
@@ -446,8 +448,19 @@ func (w *writer) Close() error {
 				w.cleanupTempObject(),
 			)
 		}
+	} else if w.tempPromotable && w.tempGeneration == 0 {
+		if err := w.verifyTempObject(); err != nil {
+			return errors.Join(
+				fmt.Errorf("gcs: close temporary object %s: missing verified staged object", w.tempPath),
+				err,
+				w.cleanupTempObject(),
+			)
+		}
 	}
 
+	if !w.tempPromotable {
+		return fmt.Errorf("gcs: temporary object %s is not promotable", w.tempPath)
+	}
 	if w.tempGeneration == 0 {
 		return fmt.Errorf("gcs: temporary object %s is not promotable", w.tempPath)
 	}
@@ -608,27 +621,39 @@ func (w *writer) stopWriter() {
 }
 
 func (w *writer) verifyTempObject() error {
+	found, err := w.lookupOwnedTemp()
+	if err != nil {
+		return err
+	}
+	if !found {
+		return fmt.Errorf("gcs: verify temporary object %s: missing owned staged object", w.tempPath)
+	}
+	return nil
+}
+
+func (w *writer) lookupOwnedTemp() (bool, error) {
 	verifyCtx, cancel := context.WithTimeout(context.Background(), w.tempCleanupTimeout)
 	defer cancel()
 
 	attrs, err := w.temp.Attrs(verifyCtx)
 	if err != nil {
 		if errors.Is(err, storage.ErrObjectNotExist) {
-			w.tempUnknown = false
+			w.clearTemp()
+			return false, nil
 		}
-		return fmt.Errorf("gcs: verify temporary object %s: %w", w.tempPath, err)
+		return false, fmt.Errorf("gcs: verify temporary object %s: %w", w.tempPath, err)
 	}
 	if attrs.Generation == 0 {
-		return fmt.Errorf("gcs: verify temporary object %s: missing generation", w.tempPath)
+		return false, fmt.Errorf("gcs: verify temporary object %s: missing generation", w.tempPath)
 	}
 	if attrs.Metadata["shoal-write-id"] != w.writeID {
-		w.tempUnknown = false
-		return fmt.Errorf("gcs: verify temporary object %s: mismatched shoal-write-id", w.tempPath)
+		w.clearTemp()
+		return false, nil
 	}
 	w.tempGeneration = attrs.Generation
 	w.tempAttrs = attrs
 	w.tempUnknown = false
-	return nil
+	return true, nil
 }
 
 func (w *writer) promoteTempObject() error {
@@ -670,11 +695,13 @@ func (w *writer) cleanupTempObject() error {
 		if !w.tempUnknown {
 			return nil
 		}
-		if err := w.verifyTempObject(); err != nil {
-			if !w.tempUnknown {
-				return nil
-			}
+		found, err := w.lookupOwnedTemp()
+		if err != nil {
 			return err
+		}
+		if !found {
+			w.clearTemp()
+			return nil
 		}
 	}
 	cleanupCtx, cancel := context.WithTimeout(context.Background(), w.tempCleanupTimeout)
@@ -682,9 +709,7 @@ func (w *writer) cleanupTempObject() error {
 	if err := w.tempForCleanup().Delete(cleanupCtx); err != nil && !errors.Is(err, storage.ErrObjectNotExist) {
 		return fmt.Errorf("gcs: remove temporary object %s: %w", w.tempPath, err)
 	}
-	w.tempGeneration = 0
-	w.tempAttrs = nil
-	w.tempUnknown = false
+	w.clearTemp()
 	return nil
 }
 
@@ -697,4 +722,10 @@ func (w *writer) tempForCleanup() objectHandle {
 		return w.temp.Generation(w.tempGeneration)
 	}
 	return w.temp
+}
+
+func (w *writer) clearTemp() {
+	w.tempGeneration = 0
+	w.tempAttrs = nil
+	w.tempUnknown = false
 }
