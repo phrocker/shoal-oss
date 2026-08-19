@@ -9,6 +9,9 @@ import sys
 
 
 DOC_PATH = Path(__file__).with_name("sharkbite-compatibility.md")
+# Update this manifest only when the independently audited revision-16 inventory
+# itself changes; review every added/removed ID in code review.
+REVISION16_ROW_ID_MANIFEST = DOC_PATH.with_name("sharkbite-compatibility-revision16-row-ids.txt")
 
 STATUSES = {
     "Covered",
@@ -218,8 +221,6 @@ OPTIONAL_ANCHOR_CITATIONS = {
     "capi/include/shoal.h",
     "capi/include/shoal_types.h",
 }
-STRICT_ANCHOR_CITATIONS = TARGETED_LOCAL_CITATIONS - OPTIONAL_ANCHOR_CITATIONS
-
 COUNT_RE = re.compile(
     r"^(?P<bold>\*\*)?(?P<number>0|[1-9]\d*|[1-9]\d{0,2}(?:,\d{3})+)(?(bold)\*\*|)$"
 )
@@ -422,6 +423,7 @@ def parse_status_summary(lines: list[str]) -> tuple[dict[str, int], int]:
     total_rows: int | None = None
     for status, count_cell in rows:
         if status == "**Total**":
+            require(total_rows is None, "duplicate total row in status summary table")
             total_rows = parse_count(count_cell)
             continue
         require(status in STATUSES, f"unknown status in summary table: {status}")
@@ -467,6 +469,10 @@ def parse_category_summary(
         }
 
         if section == "**Total**":
+            require(
+                declared_total_rows is None and declared_total_status_counts is None,
+                "duplicate total row in category summary table",
+            )
             declared_total_rows = parse_count(row_total_cell)
             declared_total_status_counts = row_status_counts
             continue
@@ -548,10 +554,57 @@ def parse_rows(lines: list[str]) -> tuple[Counter[str], dict[str, Counter[str]],
     return status_counts, prefix_counts, set(accepted_row_ids)
 
 
+@lru_cache(maxsize=1)
+def load_expected_revision_16_row_ids() -> tuple[str, ...]:
+    row_ids: list[str] = []
+    seen: set[str] = set()
+    for line_number, raw_line in enumerate(
+        REVISION16_ROW_ID_MANIFEST.read_text(encoding="utf-8").splitlines(),
+        start=1,
+    ):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        require(
+            re.fullmatch(r"SB-[A-Z0-9-]+", line) is not None,
+            f"invalid revision 16 row id manifest entry on line {line_number}: {raw_line!r}",
+        )
+        require(line not in seen, f"duplicate revision 16 row id manifest entry: {line}")
+        seen.add(line)
+        row_ids.append(line)
+    require(
+        len(row_ids) == EXPECTED_TOTAL_ROWS,
+        (
+            f"revision 16 row id manifest expects {EXPECTED_TOTAL_ROWS} entries, "
+            f"found {len(row_ids)}"
+        ),
+    )
+    return tuple(row_ids)
+
+
+def preview_row_ids(row_ids: list[str], *, limit: int = 5) -> str:
+    preview = row_ids[:limit]
+    suffix = " ..." if len(row_ids) > limit else ""
+    return ", ".join(preview) + suffix
+
+
 def validate_revision_16_inventory(
+    row_ids: set[str],
     status_counts: Counter[str],
     prefix_counts: dict[str, Counter[str]],
 ) -> None:
+    expected_row_ids = set(load_expected_revision_16_row_ids())
+    missing_row_ids = sorted(expected_row_ids - row_ids)
+    unexpected_row_ids = sorted(row_ids - expected_row_ids)
+    require(
+        not missing_row_ids and not unexpected_row_ids,
+        (
+            "revision 16 inventory row ids changed: "
+            f"missing [{preview_row_ids(missing_row_ids)}]; "
+            f"unexpected [{preview_row_ids(unexpected_row_ids)}]"
+        ),
+    )
+
     total_rows = sum(status_counts.values())
     require(
         total_rows == EXPECTED_TOTAL_ROWS,
@@ -612,7 +665,7 @@ def validate_counts(lines: list[str], full_text: str) -> None:
     status_counts, prefix_counts, row_ids = parse_rows(lines)
     total_rows = len(row_ids)
     require(sum(status_counts.values()) == total_rows, f"expected {total_rows} rows, found {sum(status_counts.values())}")
-    validate_revision_16_inventory(status_counts, prefix_counts)
+    validate_revision_16_inventory(row_ids, status_counts, prefix_counts)
 
     metadata_total_rows, metadata_required_rows = parse_rows_metadata(metadata.get("Rows", ""))
     require(
@@ -933,7 +986,7 @@ def validate_targeted_symbol_anchors(
                 continue
             for ref, anchors in path_anchor_bindings.items():
                 anchors = filtered_local_anchors(ref, anchors)
-                if ref in STRICT_ANCHOR_CITATIONS:
+                if ref not in OPTIONAL_ANCHOR_CITATIONS:
                     require(
                         anchors,
                         f"{row_id} cites {ref} without an adjacent local symbol/test anchor",

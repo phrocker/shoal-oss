@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import redirect_stderr
 from io import StringIO
 from pathlib import Path
+import re
 import sys
 import unittest
 
@@ -37,17 +38,45 @@ def load_document_text() -> str:
     return validator.DOC_PATH.read_text(encoding="utf-8")
 
 
-def replace_once(text: str, old: str, new: str) -> str:
-    if text.count(old) != 1:
-        raise AssertionError(f"expected exactly one occurrence of {old!r}")
-    return text.replace(old, new, 1)
+def replace_pattern_once(text: str, pattern: str, replacement: str) -> str:
+    rewritten, count = re.subn(pattern, replacement, text, count=1, flags=re.MULTILINE)
+    if count != 1:
+        raise AssertionError(f"expected exactly one match for pattern {pattern!r}")
+    return rewritten
 
 
-def replace_line(lines: list[str], old: str, new: str) -> None:
-    matches = [index for index, line in enumerate(lines) if line == old]
-    if len(matches) != 1:
-        raise AssertionError(f"expected exactly one matching line for {old!r}")
-    lines[matches[0]] = new
+def remove_line_starting_once(lines: list[str], prefix: str) -> list[str]:
+    removed = False
+    rewritten: list[str] = []
+    for line in lines:
+        if not removed and line.startswith(prefix):
+            removed = True
+            continue
+        rewritten.append(line)
+    if not removed:
+        raise AssertionError(f"expected to remove a line starting with {prefix!r}")
+    return rewritten
+
+
+def insert_after_line_starting_once(lines: list[str], prefix: str, new_line: str) -> list[str]:
+    inserted = False
+    rewritten: list[str] = []
+    for line in lines:
+        rewritten.append(line)
+        if not inserted and line.startswith(prefix):
+            rewritten.append(new_line)
+            inserted = True
+    if not inserted:
+        raise AssertionError(f"expected to insert after a line starting with {prefix!r}")
+    return rewritten
+
+
+def make_anchor_fixture_lines(evidence: str) -> list[str]:
+    return [
+        "| ID | Sharkbite | Shoal Go | Shoal C ABI | Evidence | Status | Notes |",
+        "| --- | --- | --- | --- | --- | --- | --- |",
+        f"| SB-FIXTURE-401 | Example | — | — | {evidence} | Missing Go | |",
+    ]
 
 
 def fixture_evidence_cell(name: str) -> str:
@@ -217,6 +246,17 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
                     expected_cell,
                 )
 
+    def test_parse_status_summary_rejects_duplicate_total_rows(self) -> None:
+        for fixture_name in (
+            "status_summary_duplicate_total_same.md",
+            "status_summary_duplicate_total_conflict.md",
+        ):
+            with self.subTest(fixture_name=fixture_name):
+                self.assert_validation_fails(
+                    lambda name=fixture_name: validator.parse_status_summary(load_fixture_lines(name)),
+                    "duplicate total row in status summary table",
+                )
+
     def test_parse_category_summary_reads_prefix_rows_and_totals(self) -> None:
         (
             declared_prefix_counts,
@@ -241,63 +281,51 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
             1,
         )
 
-    def test_validate_revision_16_inventory_rejects_row_deletion_even_if_counts_are_rewritten(self) -> None:
-        full_text = load_document_text()
-        lines = full_text.splitlines()
-        removed = False
-        rewritten_lines: list[str] = []
-        for line in lines:
-            if not removed and line.startswith("| SB-PKG-001 |"):
-                removed = True
-                continue
-            rewritten_lines.append(line)
-        self.assertTrue(removed, "expected to remove SB-PKG-001 from the audited document")
+    def test_parse_category_summary_rejects_duplicate_total_rows(self) -> None:
+        for fixture_name in (
+            "category_summary_duplicate_total_same.md",
+            "category_summary_duplicate_total_conflict.md",
+        ):
+            with self.subTest(fixture_name=fixture_name):
+                self.assert_validation_fails(
+                    lambda name=fixture_name: validator.parse_category_summary(load_fixture_lines(name)),
+                    "duplicate total row in category summary table",
+                )
 
-        replace_line(
-            rewritten_lines,
-            "| Rows | 3203 (2811 required by the [§2.2](#sec-2) release gate) |",
-            "| Rows | 3202 (2810 required by the [§2.2](#sec-2) release gate) |",
+    def test_validate_revision_16_inventory_rejects_same_prefix_row_id_substitution(self) -> None:
+        rewritten_text = replace_pattern_once(
+            load_document_text(),
+            r"^\| SB-PKG-001 \|",
+            "| SB-PKG-999 |",
         )
-        replace_line(
-            rewritten_lines,
-            "| Missing C ABI | 116 |",
-            "| Missing C ABI | 115 |",
-        )
-        replace_line(
-            rewritten_lines,
-            "| **Total** | **3203** |",
-            "| **Total** | **3202** |",
-        )
-        replace_line(
-            rewritten_lines,
-            "| [§5](#sec-5) Packaging and imports | `SB-PKG` | 14 | 0 | 0 | 10 | 1 | 1 | 2 |",
-            "| [§5](#sec-5) Packaging and imports | `SB-PKG` | 13 | 0 | 0 | 9 | 1 | 1 | 2 |",
-        )
-        replace_line(
-            rewritten_lines,
-            "| **Total** | | **3203** | **0** | **2447** | **116** | **161** | **87** | **392** |",
-            "| **Total** | | **3202** | **0** | **2447** | **115** | **161** | **87** | **392** |",
-        )
-        rewritten_text = "\n".join(rewritten_lines)
-        rewritten_text = replace_once(
-            rewritten_text,
-            "2811 of 3203 rows,",
-            "2810 of 3202 rows,",
-        )
-        rewritten_text = replace_once(
-            rewritten_text,
-            "2811 rows are **required** by the final release gate ([§2.2](#sec-2));",
-            "2810 rows are **required** by the final release gate ([§2.2](#sec-2));",
-        )
-        rewritten_text = replace_once(
-            rewritten_text,
-            "`Missing C ABI` (116)",
-            "`Missing C ABI` (115)",
-        )
-
         self.assert_validation_fails(
             lambda: validator.validate_counts(rewritten_text.splitlines(), rewritten_text),
-            "revision 16 inventory expects 3203 rows, found 3202",
+            "revision 16 inventory row ids changed",
+            "missing [SB-PKG-001]",
+            "unexpected [SB-PKG-999]",
+        )
+
+    def test_validate_revision_16_inventory_rejects_row_deletion(self) -> None:
+        rewritten_text = "\n".join(remove_line_starting_once(load_document_text().splitlines(), "| SB-PKG-001 |"))
+        self.assert_validation_fails(
+            lambda: validator.validate_counts(rewritten_text.splitlines(), rewritten_text),
+            "revision 16 inventory row ids changed",
+            "missing [SB-PKG-001]",
+        )
+
+    def test_validate_revision_16_inventory_rejects_row_addition(self) -> None:
+        original_line = (
+            "| SB-PKG-001 | Distribution `sharkbite`, version `1.2.0.3` (`setup.py:34-35`) | — | — | — | Missing C ABI | "
+            "No Python packaging exists in Shoal. `Makefile` has `build`, `capi`, `test`, `test-hdfs`, `vet`, `clean` only — no wheel/sdist target. |"
+        )
+        added_line = original_line.replace("| SB-PKG-001 |", "| SB-PKG-999 |", 1)
+        rewritten_text = "\n".join(
+            insert_after_line_starting_once(load_document_text().splitlines(), "| SB-PKG-001 |", added_line)
+        )
+        self.assert_validation_fails(
+            lambda: validator.validate_counts(rewritten_text.splitlines(), rewritten_text),
+            "revision 16 inventory row ids changed",
+            "unexpected [SB-PKG-999]",
         )
 
     def test_validate_targeted_symbol_anchors_rejects_cross_file_anchor_leakage(self) -> None:
@@ -386,6 +414,29 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
         validator.validate_targeted_symbol_anchors(
             load_fixture_lines("non_target_separator.md"),
             targeted_paths=CROSS_FILE_FIXTURE_PATHS,
+        )
+
+    def test_validate_targeted_symbol_anchors_explicit_optional_path_allows_bare_citation(self) -> None:
+        validator.validate_targeted_symbol_anchors(
+            make_anchor_fixture_lines("`capi/include/shoal.h`"),
+            targeted_paths={"capi/include/shoal.h"},
+        )
+
+    def test_validate_targeted_symbol_anchors_custom_target_path_requires_anchor(self) -> None:
+        self.assert_validation_fails(
+            lambda: validator.validate_targeted_symbol_anchors(
+                make_anchor_fixture_lines("`docs/testdata/validate_sharkbite_matrix/fixture_a.go`"),
+                targeted_paths={"docs/testdata/validate_sharkbite_matrix/fixture_a.go"},
+            ),
+            "SB-FIXTURE-401 cites docs/testdata/validate_sharkbite_matrix/fixture_a.go without an adjacent local symbol/test anchor",
+        )
+
+    def test_validate_targeted_symbol_anchors_custom_target_path_accepts_anchor(self) -> None:
+        validator.validate_targeted_symbol_anchors(
+            make_anchor_fixture_lines(
+                "`TestAlpha` (`docs/testdata/validate_sharkbite_matrix/fixture_a.go`)"
+            ),
+            targeted_paths={"docs/testdata/validate_sharkbite_matrix/fixture_a.go"},
         )
 
 
