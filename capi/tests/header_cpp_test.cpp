@@ -92,6 +92,14 @@ int main() {
   assert(shoal_abi_has_capability(SHOAL_ABI_CAPABILITY_SECURITY_ADMIN) == 1);
   assert(shoal_abi_has_capability(SHOAL_ABI_CAPABILITY_TABLE_SPLITS) == 1);
   assert(shoal_abi_has_capability(SHOAL_ABI_CAPABILITY_COUNT) == 0);
+  assert(shoal_versioned_properties_version(versioned_properties) == 0);
+  assert(shoal_versioned_properties_count(versioned_properties) == 0);
+  assert(shoal_versioned_properties_get(versioned_properties, 0, &property,
+                                        &error) ==
+         SHOAL_STATUS_INVALID_ARGUMENT);
+  assert(error != nullptr);
+  shoal_error_free(&error);
+  assert(error == nullptr);
   (void)table;
   (void)property;
   shoal_connector_free(&connector);

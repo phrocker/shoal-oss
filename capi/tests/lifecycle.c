@@ -343,15 +343,23 @@ int main(void) {
   assert(shoal_table_properties_count(properties) == 2);
   assert(shoal_table_properties_get(properties, 0, &property_view, &error) ==
          SHOAL_STATUS_OK);
+  const char *table_property_key = property_view.key;
+  const char *table_property_value = property_view.value;
+  assert(table_property_key != NULL);
+  assert(table_property_value != NULL);
   assert(strcmp(property_view.key, "table.custom.empty") == 0);
   assert(strcmp(property_view.value, "") == 0);
   assert(shoal_table_properties_get(properties, 1, &property_view, &error) ==
          SHOAL_STATUS_OK);
+  assert(strcmp(table_property_key, "table.custom.empty") == 0);
+  assert(strcmp(table_property_value, "") == 0);
   assert(strcmp(property_view.key, "table.custom.mode") == 0);
   assert(strcmp(property_view.value, "stream") == 0);
   expect_error(shoal_table_properties_get(properties, 2, &property_view,
                                           &error),
                SHOAL_STATUS_INVALID_ARGUMENT, &error, "out of bounds");
+  assert(strcmp(table_property_key, "table.custom.empty") == 0);
+  assert(strcmp(table_property_value, "") == 0);
   shoal_table_properties_free(&properties);
   assert(properties == NULL);
   shoal_test_result_alloc_fail_after(0);
@@ -492,9 +500,20 @@ int main(void) {
   assert(shoal_versioned_properties_get(versioned_properties, 0,
                                         &property_view, &error) ==
          SHOAL_STATUS_OK);
+  const char *versioned_property_key = property_view.key;
+  const char *versioned_property_value = property_view.value;
+  assert(versioned_property_key != NULL);
+  assert(versioned_property_value != NULL);
   assert(strcmp(property_view.key, "table.custom.namespace") == 0);
   assert(strcmp(property_view.value, "enabled") == 0);
+  expect_error(shoal_versioned_properties_get(versioned_properties, 1,
+                                              &property_view, &error),
+               SHOAL_STATUS_INVALID_ARGUMENT, &error,
+               "invalid versioned property result access");
+  assert(strcmp(versioned_property_key, "table.custom.namespace") == 0);
+  assert(strcmp(versioned_property_value, "enabled") == 0);
   shoal_versioned_properties_free(&versioned_properties);
+  assert(versioned_properties == NULL);
   shoal_versioned_properties_free(&versioned_properties);
   expect_error(shoal_connector_versioned_namespace_properties(
                    admin_connector, NULL, 0, &versioned_properties, &error),
