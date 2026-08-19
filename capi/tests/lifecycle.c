@@ -489,6 +489,11 @@ int main(void) {
          SHOAL_STATUS_OK);
   assert(shoal_versioned_properties_version(versioned_properties) == 7);
   assert(shoal_versioned_properties_count(versioned_properties) == 1);
+  assert(shoal_versioned_properties_get(versioned_properties, 0,
+                                        &property_view, &error) ==
+         SHOAL_STATUS_OK);
+  assert(strcmp(property_view.key, "table.custom.namespace") == 0);
+  assert(strcmp(property_view.value, "enabled") == 0);
   shoal_versioned_properties_free(&versioned_properties);
   shoal_versioned_properties_free(&versioned_properties);
   expect_error(shoal_connector_versioned_namespace_properties(
