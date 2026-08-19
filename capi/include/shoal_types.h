@@ -22,7 +22,7 @@
  */
 #define SHOAL_ABI_VERSION 1u
 #define SHOAL_ABI_VERSION_MAJOR 1u
-#define SHOAL_ABI_VERSION_MINOR 13u
+#define SHOAL_ABI_VERSION_MINOR 14u
 #define SHOAL_ABI_VERSION_PATCH 0u
 #define SHOAL_ABI_PACK_VERSION(major, minor, patch)                           \
   ((((uint32_t)(major) & 0xffu) << 16) |                                     \
@@ -64,10 +64,11 @@ enum {
   SHOAL_ABI_CAPABILITY_HIGH_LEVEL_CLIENT = 21,
   SHOAL_ABI_CAPABILITY_HIGH_LEVEL_SCANNER = 22,
   SHOAL_ABI_CAPABILITY_COMPATIBILITY_ERRORS = 23,
-  SHOAL_ABI_CAPABILITY_STREAMING_SCAN_CURSOR = 24
+  SHOAL_ABI_CAPABILITY_STREAMING_SCAN_CURSOR = 24,
+  SHOAL_ABI_CAPABILITY_COLUMN_VISIBILITY = 25
 };
 
-#define SHOAL_ABI_CAPABILITY_COUNT 25u
+#define SHOAL_ABI_CAPABILITY_COUNT 26u
 #define SHOAL_ABI_CAPABILITY_WORD_BITS 64u
 #define SHOAL_ABI_CAPABILITY_WORD_INDEX(capability_id)                       \
   ((uint32_t)(capability_id) / SHOAL_ABI_CAPABILITY_WORD_BITS)
@@ -127,6 +128,8 @@ enum {
   SHOAL_ABI_CAPABILITY_MASK(SHOAL_ABI_CAPABILITY_COMPATIBILITY_ERRORS)
 #define SHOAL_ABI_CAPABILITY_STREAMING_SCAN_CURSOR_MASK                      \
   SHOAL_ABI_CAPABILITY_MASK(SHOAL_ABI_CAPABILITY_STREAMING_SCAN_CURSOR)
+#define SHOAL_ABI_CAPABILITY_COLUMN_VISIBILITY_MASK                          \
+  SHOAL_ABI_CAPABILITY_MASK(SHOAL_ABI_CAPABILITY_COLUMN_VISIBILITY)
 #define SHOAL_ABI_CAPABILITY_WORD0                                           \
   (SHOAL_ABI_CAPABILITY_CONNECTOR_MASK | SHOAL_ABI_CAPABILITY_BOOTSTRAP_MASK | \
    SHOAL_ABI_CAPABILITY_ERROR_MASK | SHOAL_ABI_CAPABILITY_SCANNER_MASK |     \
@@ -150,7 +153,8 @@ enum {
    SHOAL_ABI_CAPABILITY_HIGH_LEVEL_CLIENT_MASK |                             \
    SHOAL_ABI_CAPABILITY_HIGH_LEVEL_SCANNER_MASK |                            \
    SHOAL_ABI_CAPABILITY_COMPATIBILITY_ERRORS_MASK |                          \
-   SHOAL_ABI_CAPABILITY_STREAMING_SCAN_CURSOR_MASK)
+   SHOAL_ABI_CAPABILITY_STREAMING_SCAN_CURSOR_MASK |                         \
+   SHOAL_ABI_CAPABILITY_COLUMN_VISIBILITY_MASK)
 
 typedef int32_t shoal_status;
 
@@ -191,7 +195,8 @@ enum {
   SHOAL_ERROR_SOURCE_RUNTIME = 0,
   SHOAL_ERROR_SOURCE_CLIENT_EXCEPTION = 1,
   SHOAL_ERROR_SOURCE_ILLEGAL_STATE_EXCEPTION = 2,
-  SHOAL_ERROR_SOURCE_ITERATION_INTERRUPTED_EXCEPTION = 3
+  SHOAL_ERROR_SOURCE_ITERATION_INTERRUPTED_EXCEPTION = 3,
+  SHOAL_ERROR_SOURCE_VISIBILITY_PARSE_EXCEPTION = 4
 };
 
 typedef int32_t shoal_error_compatibility_class;
@@ -237,6 +242,10 @@ typedef struct shoal_rfile_writer shoal_rfile_writer;
 typedef struct shoal_rfile_seekable shoal_rfile_seekable;
 typedef struct shoal_rfile_entry_result shoal_rfile_entry_result;
 typedef struct shoal_authorizations shoal_authorizations;
+typedef struct shoal_column_visibility shoal_column_visibility;
+typedef struct shoal_visibility_node shoal_visibility_node;
+typedef struct shoal_node_expression shoal_node_expression;
+typedef struct shoal_visibility_evaluator shoal_visibility_evaluator;
 typedef struct shoal_key_value_result shoal_key_value_result;
 typedef struct shoal_accumulo_writer shoal_accumulo_writer;
 typedef struct shoal_table_constraint_list_result
@@ -258,6 +267,40 @@ typedef struct shoal_bytes {
   const uint8_t *data;
   size_t length;
 } shoal_bytes;
+
+typedef int32_t shoal_visibility_node_type;
+
+enum {
+  SHOAL_VISIBILITY_EMPTY = 0,
+  SHOAL_VISIBILITY_TERM = 1,
+  SHOAL_VISIBILITY_OR = 2,
+  SHOAL_VISIBILITY_AND = 3
+};
+
+typedef struct shoal_visibility_node_view {
+  uint32_t struct_size;
+  shoal_visibility_node_type node_type;
+  size_t child_count;
+  size_t span_length;
+  size_t term_start;
+  size_t term_end;
+  uint8_t empty;
+} shoal_visibility_node_view;
+
+#define SHOAL_VISIBILITY_NODE_VIEW_V1_SIZE                                   \
+  ((uint32_t)(offsetof(shoal_visibility_node_view, empty) +                  \
+              sizeof(((shoal_visibility_node_view *)0)->empty)))
+
+typedef struct shoal_visibility_parse_error_view {
+  uint32_t struct_size;
+  shoal_bytes terms;
+  const char *reason;
+  size_t offset;
+} shoal_visibility_parse_error_view;
+
+#define SHOAL_VISIBILITY_PARSE_ERROR_VIEW_V1_SIZE                            \
+  ((uint32_t)(offsetof(shoal_visibility_parse_error_view, offset) +          \
+              sizeof(((shoal_visibility_parse_error_view *)0)->offset)))
 
 typedef struct shoal_server_view {
   uint32_t struct_size;
