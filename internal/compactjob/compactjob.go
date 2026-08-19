@@ -188,14 +188,27 @@ func refuse(class, field, format string, args ...any) *Refusal {
 	return &Refusal{Class: class, Field: field, Detail: fmt.Sprintf(format, args...)}
 }
 
-// Default input budget for a single compaction. The composer reads every
-// input RFile fully into memory and buffers the output image, so peak RSS
-// is roughly (sum of input sizes + output size). These defaults keep one
-// job inside a few GiB; operators raise them for compactor pools with
-// more headroom, or lower them to push big merges at Java.
+// Default per-job budget. The composer reads every input RFile fully
+// into memory and retains the whole output image, so its footprint is
+// roughly (sum of input sizes + output size), plus whatever the iterator
+// stack buffers.
+//
+// The two halves are budgeted separately because neither bounds the
+// other. The input half is knowable before the job runs — the
+// coordinator declares each file's size — so it is an admission check.
+// The output half is not: an output can exceed its inputs when
+// compressed blocks are rewritten with codec "none", or when a stack
+// emits cells that were in no input. So it is enforced during
+// composition instead, by compaction.Compact, which abandons the
+// compaction rather than growing past the cap.
+//
+// These defaults keep one job inside a few GiB; operators raise them for
+// compactor pools with more headroom, or lower them to push big merges
+// at Java.
 const (
 	DefaultMaxInputFiles      = 64
 	DefaultMaxTotalInputBytes = int64(2) << 30 // 2 GiB
+	DefaultMaxOutputBytes     = int64(2) << 30 // 2 GiB
 )
 
 // Limits bounds what a single job may consume. A zero field means
@@ -206,6 +219,10 @@ type Limits struct {
 	MaxInputFiles int
 	// MaxTotalInputBytes caps the summed size of the input files.
 	MaxTotalInputBytes int64
+	// MaxOutputBytes caps the output image the composer may retain. It
+	// is carried on the Plan into compaction.Spec rather than checked
+	// here: no translation-time figure predicts an output's size.
+	MaxOutputBytes int64
 }
 
 // DefaultLimits returns the standard per-job input budget.
@@ -213,6 +230,7 @@ func DefaultLimits() Limits {
 	return Limits{
 		MaxInputFiles:      DefaultMaxInputFiles,
 		MaxTotalInputBytes: DefaultMaxTotalInputBytes,
+		MaxOutputBytes:     DefaultMaxOutputBytes,
 	}
 }
 
@@ -328,6 +346,10 @@ type Plan struct {
 	// BlockSize is the resolved output data-block threshold (0 = writer
 	// default).
 	BlockSize int
+	// MaxOutputBytes is the caller's Limits.MaxOutputBytes, carried here
+	// so the executor enforces it without having to be handed the
+	// Limits separately. Zero means unlimited.
+	MaxOutputBytes int64
 }
 
 // Spec assembles the compaction.Spec for this plan. inputs must be the
@@ -341,6 +363,7 @@ func (p *Plan) Spec(inputs []compaction.Input) compaction.Spec {
 		FullMajorCompaction: p.FullMajorCompaction,
 		Codec:               p.Codec,
 		BlockSize:           p.BlockSize,
+		MaxOutputBytes:      p.MaxOutputBytes,
 	}
 }
 
@@ -365,6 +388,7 @@ func (p *Plan) LogValue() slog.Value {
 		slog.Bool("full_major", p.FullMajorCompaction),
 		slog.String("codec", p.Codec),
 		slog.Int("block_size", p.BlockSize),
+		slog.Int64("max_output_bytes", p.MaxOutputBytes),
 		slog.Any("stack", names),
 	)
 }
@@ -520,6 +544,7 @@ func Translate(job *tabletserver.TExternalCompactionJob, opts Options) (*Plan, e
 		FullMajorCompaction: fullMajor,
 		Codec:               codec,
 		BlockSize:           blockSize,
+		MaxOutputBytes:      opts.Limits.MaxOutputBytes,
 	}, nil
 }
 

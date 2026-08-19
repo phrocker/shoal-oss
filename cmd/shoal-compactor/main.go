@@ -155,7 +155,8 @@ func main() {
 	maxWait := flag.Duration("max-wait", 30*time.Second, "maximum sleep when idle (backoff cap)")
 	releaseTimeout := flag.Duration("release-timeout", 15*time.Second, "total budget for handing an accepted job back to the coordinator, including retries. Applied even during shutdown: a job shoal has accepted must never stay assigned to a compactor that is going away.")
 	maxInputFiles := flag.Int("max-input-files", compactjob.DefaultMaxInputFiles, "refuse jobs with more input files than this (0 = no limit); the composer merges every input in one pass")
-	maxInputBytes := flag.Int64("max-input-bytes", compactjob.DefaultMaxTotalInputBytes, "refuse jobs whose inputs total more than this many bytes (0 = no limit); the composer reads whole RFile images into memory, so this bounds peak RSS")
+	maxInputBytes := flag.Int64("max-input-bytes", compactjob.DefaultMaxTotalInputBytes, "refuse jobs whose declared inputs total more than this many bytes (0 = no limit); the composer reads whole RFile images into memory, so this bounds the read side only — see -max-output-bytes for the write side")
+	maxOutputBytes := flag.Int64("max-output-bytes", compactjob.DefaultMaxOutputBytes, "abandon a compaction whose output image grows past this many bytes (0 = no limit); the output is retained in memory and is not bounded by the input total, since compressed inputs rewritten with codec \"none\" and stacks that emit extra cells both expand")
 	logLevel := flag.String("log-level", "info", "slog level: debug, info, warn, error")
 	flag.Parse()
 
@@ -253,6 +254,7 @@ func main() {
 			Limits: compactjob.Limits{
 				MaxInputFiles:      *maxInputFiles,
 				MaxTotalInputBytes: *maxInputBytes,
+				MaxOutputBytes:     *maxOutputBytes,
 			},
 		},
 	})

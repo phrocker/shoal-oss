@@ -2898,6 +2898,64 @@ func TestPlanIsExecutable(t *testing.T) {
 	}
 }
 
+// TestPlanCarriesTheOutputBudgetIntoTheComposer is the end of the same
+// loop for the resource gate. The input limits are an admission check
+// Translate can make on its own, because the coordinator declares each
+// file's size. Nothing declares the *output* size — an output can be
+// larger than its inputs — so the only place that budget can be enforced
+// is inside the composition, and the plan has to carry it there.
+func TestPlanCarriesTheOutputBudgetIntoTheComposer(t *testing.T) {
+	fileA := buildRFile(t, []testCell{
+		{key: mkKey("row1", "cf", "cq", 10), value: "a"},
+		{key: mkKey("row2", "cf", "cq", 10), value: "b"},
+	})
+
+	job := validJob()
+	job.Files = job.Files[:1]
+	plan := mustTranslate(t, job, Options{Limits: Limits{MaxOutputBytes: 16}})
+	if plan.MaxOutputBytes != 16 {
+		t.Fatalf("plan.MaxOutputBytes = %d, want 16", plan.MaxOutputBytes)
+	}
+
+	spec := plan.Spec([]compaction.Input{{Name: plan.Inputs[0].Path, Bytes: fileA}})
+	if spec.MaxOutputBytes != 16 {
+		t.Fatalf("spec.MaxOutputBytes = %d, want 16", spec.MaxOutputBytes)
+	}
+	if _, err := compaction.Compact(spec); !errors.Is(err, compaction.ErrOutputTooLarge) {
+		t.Fatalf("Compact err = %v, want ErrOutputTooLarge", err)
+	}
+}
+
+// TestDefaultLimitsBudgetBothSides pins the defaults an operator gets
+// when they set no flags: a job is admitted on its declared inputs and
+// abandoned if its output runs away.
+func TestDefaultLimitsBudgetBothSides(t *testing.T) {
+	limits := DefaultLimits()
+	if limits.MaxInputFiles != DefaultMaxInputFiles {
+		t.Errorf("MaxInputFiles = %d, want %d", limits.MaxInputFiles, DefaultMaxInputFiles)
+	}
+	if limits.MaxTotalInputBytes != DefaultMaxTotalInputBytes {
+		t.Errorf("MaxTotalInputBytes = %d, want %d", limits.MaxTotalInputBytes, DefaultMaxTotalInputBytes)
+	}
+	if limits.MaxOutputBytes != DefaultMaxOutputBytes {
+		t.Errorf("MaxOutputBytes = %d, want %d", limits.MaxOutputBytes, DefaultMaxOutputBytes)
+	}
+
+	job := validJob()
+	plan := mustTranslate(t, job, Options{Limits: limits})
+	if plan.MaxOutputBytes != DefaultMaxOutputBytes {
+		t.Fatalf("plan.MaxOutputBytes = %d, want the configured default %d",
+			plan.MaxOutputBytes, DefaultMaxOutputBytes)
+	}
+
+	// Zero has to keep meaning "unlimited" all the way through, since
+	// that is how a caller opts out.
+	unlimited := mustTranslate(t, validJob(), Options{})
+	if got := unlimited.Spec(nil).MaxOutputBytes; got != 0 {
+		t.Fatalf("unset budget reached the spec as %d, want 0 (unlimited)", got)
+	}
+}
+
 // TestPlanLogValueCarriesTheJobIdentity: the refusal/acceptance log line
 // is the only operator-visible record of what shoal decided, so the
 // fields an operator correlates on must be present.

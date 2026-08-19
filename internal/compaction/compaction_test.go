@@ -20,7 +20,9 @@ package compaction
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"io"
+	"strings"
 	"testing"
 
 	"github.com/phrocker/shoal/internal/iterrt"
@@ -322,5 +324,114 @@ func TestCompact_UnknownIterator(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("expected error for unknown iterator")
+	}
+}
+
+// wideRFile builds an input big enough to flush several data blocks
+// (DefaultBlockSize is 100 KiB), so a compaction over it exercises the
+// budget check inside the append loop rather than only the one after
+// Close.
+func wideRFile(t *testing.T, cells int) []byte {
+	t.Helper()
+	// Values that do not compress well, so "none" and "snappy" outputs
+	// stay the same order of magnitude and the test is not measuring the
+	// codec.
+	val := make([]byte, 1024)
+	for i := range val {
+		val[i] = byte(i * 31)
+	}
+	kvs := make([]kv, 0, cells)
+	for i := range cells {
+		kvs = append(kvs, kv{mk(fmt.Sprintf("row%08d", i), "cf", "q", 10), string(val)})
+	}
+	return buildRFile(t, kvs)
+}
+
+// TestCompact_OutputBudgetStopsALongCompaction: the cap is enforced
+// while cells are being appended, not only at the end — a compaction
+// that would retain far more than the budget must abandon early rather
+// than build the whole image first.
+func TestCompact_OutputBudgetStopsALongCompaction(t *testing.T) {
+	const cells = 400
+	_, err := Compact(Spec{
+		Inputs:         []Input{{Name: "wide", Bytes: wideRFile(t, cells)}},
+		Scope:          iterrt.ScopeMajc,
+		Codec:          block.CodecNone,
+		MaxOutputBytes: 64 * 1024,
+	})
+	if !errors.Is(err, ErrOutputTooLarge) {
+		t.Fatalf("Compact err = %v, want ErrOutputTooLarge", err)
+	}
+
+	var size, written int64
+	if _, e := fmt.Sscanf(err.Error(), "compaction: output reached %d bytes after %d cells", &size, &written); e != nil {
+		t.Fatalf("error %q does not report size and cell count: %v", err, e)
+	}
+	if written >= cells {
+		t.Errorf("gave up after %d of %d cells; the budget should stop the append loop, not just the final image", written, cells)
+	}
+	if size <= 64*1024 {
+		t.Errorf("reported size %d is within the 65536-byte budget", size)
+	}
+}
+
+// TestCompact_OutputBudgetCatchesTheClosingFlush: a small compaction
+// never flushes a block while appending, so its whole image appears when
+// the writer closes. The budget has to be rechecked there or a job that
+// looked free cell-by-cell escapes it entirely.
+func TestCompact_OutputBudgetCatchesTheClosingFlush(t *testing.T) {
+	in := []kv{
+		{mk("a", "cf", "q", 10), "va"},
+		{mk("b", "cf", "q", 10), "vb"},
+		{mk("c", "cf", "q", 10), "vc"},
+	}
+	_, err := Compact(Spec{
+		Inputs:         []Input{{Name: "f1", Bytes: buildRFile(t, in)}},
+		Scope:          iterrt.ScopeMajc,
+		MaxOutputBytes: 16,
+	})
+	if !errors.Is(err, ErrOutputTooLarge) {
+		t.Fatalf("Compact err = %v, want ErrOutputTooLarge", err)
+	}
+	if !strings.Contains(err.Error(), "after 3 cells") {
+		t.Errorf("error %q should report all 3 cells appended before the close-time check", err)
+	}
+}
+
+// TestCompact_OutputBudgetAllowsWhatFits: the same shape under a budget
+// the output fits inside still produces every cell, so the check cannot
+// be truncating good compactions.
+func TestCompact_OutputBudgetAllowsWhatFits(t *testing.T) {
+	in := []kv{
+		{mk("a", "cf", "q", 10), "va"},
+		{mk("b", "cf", "q", 10), "vb"},
+	}
+	res, err := Compact(Spec{
+		Inputs:         []Input{{Name: "f1", Bytes: buildRFile(t, in)}},
+		Scope:          iterrt.ScopeMajc,
+		MaxOutputBytes: 1 << 20,
+	})
+	if err != nil {
+		t.Fatalf("Compact: %v", err)
+	}
+	assertCells(t, drainRFile(t, res.Output), in)
+}
+
+// TestCompact_ZeroOutputBudgetIsUnlimited: zero keeps the pre-existing
+// behaviour, which every other caller of this package relies on.
+func TestCompact_ZeroOutputBudgetIsUnlimited(t *testing.T) {
+	res, err := Compact(Spec{
+		Inputs: []Input{{Name: "wide", Bytes: wideRFile(t, 200)}},
+		Scope:  iterrt.ScopeMajc,
+		Codec:  block.CodecNone,
+	})
+	if err != nil {
+		t.Fatalf("Compact: %v", err)
+	}
+	if res.EntriesWritten != 200 {
+		t.Errorf("EntriesWritten = %d, want 200", res.EntriesWritten)
+	}
+	if len(res.Output) <= 64*1024 {
+		t.Fatalf("output is %d bytes; the fixture must exceed the budget the other tests set", len(res.Output))
 	}
 }
