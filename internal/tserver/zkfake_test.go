@@ -77,6 +77,10 @@ type fakeZK struct {
 	// order of operations against other state.
 	beforeDelete func(path string)
 
+	// beforeCreate runs before a create is applied, so a test can act in the
+	// window between deciding to register and having registered.
+	beforeCreate func(path string)
+
 	// beforeExists runs before an existence watch is established, so a test
 	// can make a node vanish in the window between listing a directory and
 	// watching what it found.
@@ -138,6 +142,9 @@ func (f *fakeZK) seedForeignLock(dir, holder string, sequence int32) string {
 }
 
 func (f *fakeZK) Create(znodePath string, data []byte, flags int32, acl []gozk.ACL) (string, error) {
+	if f.beforeCreate != nil {
+		f.beforeCreate(znodePath)
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err := f.createErr[znodePath]; err != nil {

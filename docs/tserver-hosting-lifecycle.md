@@ -256,14 +256,30 @@ is not the holder queues behind the holder's **lowest** node rather than
 its immediate predecessor, so it wakes when that process leaves rather
 than when it tidies up a duplicate of its own.
 
+A queued candidate watches its own node as well. The node ahead says
+when its turn arrives; its own node says when the turn will never
+arrive. Watching only the node ahead leaves a candidate whose node was
+deleted asleep on a queue it is no longer in until some unrelated holder
+happens to leave.
+
+Every UUID this process reads or writes must be the 36-character dashed
+form. Go's `uuid.Parse` also accepts bare hex, `urn:uuid:`, and braced
+forms; Java's `UUID.fromString` accepts none of them. Publishing one
+would put a node name in the directory that `validateAndSort` throws on
+and a payload the manager cannot deserialize — this process would queue
+invisibly while Accumulo handed the lock to somebody else.
+
 Duplicates are real: a create whose response was lost still created a
 node, and a retry creates another. Both carry this process's UUID, so
 the first is kept and the rest are deleted — otherwise one process would
 hold several places in line and leave a node behind when it released.
 
-A cancelled acquisition deletes whatever it created. An abandoned
-ephemeral node keeps its place in the queue until the session ends, which
-is a range nobody hosts for no reason.
+A cancelled acquisition deletes whatever it created, and says so when it
+cannot: the error also wraps `ErrLockNodeOrphaned`. An abandoned
+ephemeral node keeps its place in the queue until the session ends —
+it can become the holder of a lock nobody is waiting on — and only the
+session's owner can close the session, so the owner has to be told
+rather than left to discover a range nobody hosts for no reason.
 
 ### What the node says
 
@@ -308,6 +324,13 @@ manager these tablets may be placed elsewhere while this process still
 claimed them. If the host refuses the generation — one that is not newer
 than a generation it already used — the lock is given back rather than
 held, so the manager can place the work on a server that will take it.
+
+`Release` sweeps every node this process created, not just the one it
+holds, and it is safe against an acquisition that has not finished:
+the wait is woken and refused with `ErrLockReleased`. Releasing only the
+held node would leave a caller that was told the lock was gone going on
+to hold it, and would promote a surviving duplicate to holder of a lock
+nobody is waiting on.
 
 ### Reading the manager's lock
 

@@ -25,6 +25,96 @@ import (
 	"testing"
 )
 
+// canonicalTestUUID is a UUID in the only form Java's UUID.fromString accepts.
+const canonicalTestUUID = "6f1b2c8e-6a4d-4c2e-9f3b-1d5e7a9c0b21"
+
+// nonCanonicalUUIDs are the forms Go's uuid.Parse accepts and Java's
+// UUID.fromString does not, plus the near-misses either would reject. Every
+// one of them is a UUID this process could otherwise publish and the manager
+// could not read.
+func nonCanonicalUUIDs() map[string]string {
+	return map[string]string{
+		"bare hex":    strings.ReplaceAll(canonicalTestUUID, "-", ""),
+		"urn":         "urn:uuid:" + canonicalTestUUID,
+		"braced":      "{" + canonicalTestUUID + "}",
+		"truncated":   canonicalTestUUID[:len(canonicalTestUUID)-1],
+		"padded":      canonicalTestUUID + "0",
+		"empty":       "",
+		"not a uuid":  "shoal-tablet-server-one-two-three-four",
+		"right shape": "6f1b2c8e-6a4d-4c2e-9f3b-1d5e7a9c0bZZ",
+	}
+}
+
+// TestServiceDescriptorRefusesNonCanonicalUUID pins the UUID shape at the
+// write side.
+//
+// Go's uuid.Parse is not a shape check: it also accepts a bare 32-character
+// hex form, a "urn:uuid:" form, and a braced form. Java's UUID.fromString
+// accepts none of them, and ServiceLockData is deserialized with it, so
+// publishing one would not make the descriptor merely odd — it would make the
+// whole lock znode unparseable and the server it names invisible to the
+// manager. Refusing to encode is the only outcome that keeps the promise that
+// validated payloads are manager-readable.
+func TestServiceDescriptorRefusesNonCanonicalUUID(t *testing.T) {
+	for name, value := range nonCanonicalUUIDs() {
+		t.Run(name, func(t *testing.T) {
+			descriptor := ServiceDescriptor{
+				UUID:    value,
+				Service: ServiceClient,
+				Address: testAddress,
+				Group:   testGroup,
+			}
+			err := descriptor.Validate()
+			if !errors.Is(err, ErrInvalidLockData) {
+				t.Fatalf("Validate(%q) = %v, want ErrInvalidLockData", value, err)
+			}
+			if !strings.Contains(err.Error(), "36-character dashed form") {
+				t.Fatalf("Validate(%q) = %q, want it to name the shape it wants", value, err)
+			}
+		})
+	}
+	descriptor := ServiceDescriptor{
+		UUID:    canonicalTestUUID,
+		Service: ServiceClient,
+		Address: testAddress,
+		Group:   testGroup,
+	}
+	if err := descriptor.Validate(); err != nil {
+		t.Fatalf("the canonical form must still validate: %v", err)
+	}
+}
+
+// TestTabletServerLockDataRefusesNonCanonicalUUID checks the constructor, not
+// just the descriptor it builds: a caller that never touches ServiceDescriptor
+// still must not be able to publish a UUID the manager cannot read.
+func TestTabletServerLockDataRefusesNonCanonicalUUID(t *testing.T) {
+	for name, value := range nonCanonicalUUIDs() {
+		t.Run(name, func(t *testing.T) {
+			_, err := TabletServerLockData(value, testAddress, testGroup, ServiceClient)
+			if !errors.Is(err, ErrInvalidLockData) {
+				t.Fatalf("TabletServerLockData(%q) = %v, want ErrInvalidLockData", value, err)
+			}
+		})
+	}
+}
+
+// TestLockIDValidRequiresTheCanonicalUUID pins the same shape on the fencing
+// identity. LockID.Valid is what decides whether an identity could name a real
+// lock node; a UUID Accumulo cannot parse could never appear in one, so
+// treating it as fencing authority would be fencing against nothing.
+func TestLockIDValidRequiresTheCanonicalUUID(t *testing.T) {
+	for name, value := range nonCanonicalUUIDs() {
+		t.Run(name, func(t *testing.T) {
+			if (LockID{UUID: value, Sequence: 1}).Valid() {
+				t.Fatalf("LockID{UUID: %q} must not be usable for fencing", value)
+			}
+		})
+	}
+	if !(LockID{UUID: canonicalTestUUID, Sequence: 1}).Valid() {
+		t.Fatal("the canonical form must still be usable for fencing")
+	}
+}
+
 // TestTabletServerLockDataMatchesTheAccumuloWireForm pins the exact bytes a
 // Shoal tablet server writes to its lock znode.
 //

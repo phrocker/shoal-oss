@@ -46,6 +46,16 @@ var (
 	// ErrLockNodeMissing means the ephemeral node this process created is not
 	// in the lock directory, so its claim cannot be established or proven.
 	ErrLockNodeMissing = errors.New("tserver: lock node missing")
+	// ErrLockReleased means an acquisition ended because Release was called
+	// while it was still queued, so the lock was never held.
+	ErrLockReleased = errors.New("tserver: service lock released before it was acquired")
+	// ErrLockNodeOrphaned means a node this process created could not be
+	// removed after an acquisition failed. The node keeps its sequence, and
+	// so its place in line, for as long as the ZooKeeper session lives, and
+	// can become the holder of a lock nobody is waiting on. Only closing the
+	// session is guaranteed to remove it, and only the session's owner can do
+	// that, which is why this is reported rather than swallowed.
+	ErrLockNodeOrphaned = errors.New("tserver: lock node orphaned")
 	// ErrInvalidLockPath means the configured lock directory cannot name a
 	// ZooKeeper znode.
 	ErrInvalidLockPath = errors.New("tserver: invalid lock path")
@@ -140,10 +150,11 @@ func TabletServerLockPath(instancePath, group, address string) string {
 // ParseLockNode maps a ZooKeeper lock child name onto the identity it names.
 //
 // The rules are ServiceLock.validateAndSort's: the name is
-// "zlock#<uuid>#<10-digit sequence>", the UUID must parse, and the sequence
-// must fit the signed 32-bit counter Java reads with Integer.parseInt. The
-// same rules are applied by internal/zk when it resolves a lock holder, so a
-// node either package accepts is a node the other accepts.
+// "zlock#<uuid>#<10-digit sequence>", the UUID must be the dashed form
+// Java's UUID.fromString accepts, and the sequence must fit the signed 32-bit
+// counter Java reads with Integer.parseInt. The same rules are applied by
+// internal/zk when it resolves a lock holder, so a node either package
+// accepts is a node the other accepts.
 func ParseLockNode(name string) (LockID, bool) {
 	if !strings.HasPrefix(name, zLockPrefix) {
 		return LockID{}, false
@@ -157,7 +168,7 @@ func ParseLockNode(name string) (LockID, bool) {
 	if len(digits) != lockSequenceDigits {
 		return LockID{}, false
 	}
-	if _, err := uuid.Parse(holder); err != nil {
+	if !validAccumuloUUID(holder) {
 		return LockID{}, false
 	}
 	sequence, err := strconv.ParseInt(digits, 10, 32)
@@ -260,6 +271,15 @@ type ServiceLock struct {
 	id      LockID
 	held    bool
 	reason  LossReason
+	// released records that Release has been called, so an acquisition still
+	// in flight cannot go on to hold a lock the caller has already given up.
+	released bool
+
+	// release is closed by Release to wake a queued acquisition. Waiting on
+	// the lock directory alone would leave that acquisition asleep until an
+	// unrelated holder happened to leave.
+	release     chan struct{}
+	releaseOnce sync.Once
 }
 
 // NewServiceLock returns a lock participant for one generation.
@@ -278,8 +298,9 @@ func NewServiceLock(conn LockConn, opts ServiceLockOptions) (*ServiceLock, error
 		}
 		holder = generated.String()
 	}
-	if _, err := uuid.Parse(holder); err != nil {
-		return nil, fmt.Errorf("%w: lock uuid %q: %w", ErrInvalidLock, holder, err)
+	if !validAccumuloUUID(holder) {
+		return nil, fmt.Errorf("%w: lock uuid %q is not the 36-character dashed form Accumulo reads",
+			ErrInvalidLock, holder)
 	}
 	acl := opts.ACL
 	if len(acl) == 0 {
@@ -294,6 +315,7 @@ func NewServiceLock(conn LockConn, opts ServiceLockOptions) (*ServiceLock, error
 		uuid:           holder,
 		acl:            append([]gozk.ACL(nil), acl...),
 		verifyInterval: opts.VerifyInterval,
+		release:        make(chan struct{}),
 	}, nil
 }
 
@@ -359,6 +381,10 @@ func (l *ServiceLock) Node() string {
 // is deleted before returning, so a cancelled acquisition leaves nothing queued
 // behind. That matters because an abandoned ephemeral node would keep its place
 // in line and block every candidate behind it until the session ended.
+//
+// When that cleanup itself fails, the returned error also wraps
+// ErrLockNodeOrphaned: a node survived, and only closing the ZooKeeper session
+// will remove it.
 func (l *ServiceLock) Acquire(ctx context.Context, data ServiceLockData) (LockID, error) {
 	payload, err := data.Encode()
 	if err != nil {
@@ -378,24 +404,61 @@ func (l *ServiceLock) Acquire(ctx context.Context, data ServiceLockData) (LockID
 	if err := l.ensureLockDirectory(); err != nil {
 		return LockID{}, err
 	}
+	if l.isReleased() {
+		// Released before anything was created: there is nothing to clean up
+		// and nothing to wait for.
+		return LockID{}, fmt.Errorf("%w: %s", ErrLockReleased, l.dir)
+	}
 	if _, err := l.conn.Create(l.dir+"/"+l.nodePrefix(), payload,
 		gozk.FlagEphemeral|gozk.FlagSequence, l.acl); err != nil {
 		// The create may have taken effect even though the answer was lost,
 		// so sweep before giving up rather than leaving a node in the queue.
-		l.deleteOwnNodes()
-		return LockID{}, fmt.Errorf("create lock node in %s: %w", l.dir, err)
+		return LockID{}, l.withCleanup(fmt.Errorf("create lock node in %s: %w", l.dir, err))
 	}
 	id, err := l.waitForOwnership(ctx)
 	if err != nil {
-		l.deleteOwnNodes()
-		return LockID{}, err
+		return LockID{}, l.withCleanup(err)
 	}
 	return id, nil
 }
 
+// withCleanup sweeps the nodes of an acquisition that did not finish and
+// returns the failure that ended it, joined with an ErrLockNodeOrphaned when a
+// node survived the sweep. The failure is returned unwrapped in the ordinary
+// case so a caller can still compare a cancellation against context.Canceled.
+func (l *ServiceLock) withCleanup(failure error) error {
+	orphan := l.deleteOwnNodes()
+	if orphan == nil {
+		return failure
+	}
+	return errors.Join(failure, fmt.Errorf("%w in %s: %w", ErrLockNodeOrphaned, l.dir, orphan))
+}
+
+// isReleased reports whether Release has already been called.
+func (l *ServiceLock) isReleased() bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.released
+}
+
 // waitForOwnership collapses any duplicate nodes this process created, then
 // waits until its node is the lowest in the directory.
+//
+// A release that lands mid-wait is reported as one however the wait actually
+// ended. Release deletes this process's nodes, so the wait can just as easily
+// trip over the missing node as be woken by the release itself; reporting the
+// release is both deterministic and the more useful of the two facts, because
+// it names the cause rather than the symptom.
 func (l *ServiceLock) waitForOwnership(ctx context.Context) (LockID, error) {
+	id, err := l.queueForOwnership(ctx)
+	if err != nil && l.isReleased() {
+		return LockID{}, fmt.Errorf("%w: %s", ErrLockReleased, l.dir)
+	}
+	return id, err
+}
+
+// queueForOwnership is waitForOwnership without the release reporting.
+func (l *ServiceLock) queueForOwnership(ctx context.Context) (LockID, error) {
 	node := ""
 	for {
 		children, _, err := l.conn.Children(l.dir)
@@ -426,20 +489,39 @@ func (l *ServiceLock) waitForOwnership(ctx context.Context) (LockID, error) {
 		if index == 0 {
 			return l.acquired(node)
 		}
+		// Watch this process's own node as well as the one ahead of it. The
+		// node ahead says when the turn arrives; the own node says when the
+		// turn will never arrive. Watching only the node ahead leaves an
+		// acquisition whose node was deleted — by an operator, or by the
+		// session dropping just that node — asleep on an event about a queue
+		// it is no longer in, until an unrelated holder happens to leave.
+		mineExists, _, mineEvents, err := l.conn.ExistsW(path.Join(l.dir, node))
+		if err != nil {
+			return LockID{}, fmt.Errorf("watch lock node %s: %w", node, err)
+		}
+		if !mineExists {
+			return LockID{}, fmt.Errorf("%w: %s is gone from %s", ErrLockNodeMissing, node, l.dir)
+		}
 		ahead := findLowestPrevPrefix(sorted, index)
-		exists, _, events, err := l.conn.ExistsW(path.Join(l.dir, ahead))
+		exists, _, aheadEvents, err := l.conn.ExistsW(path.Join(l.dir, ahead))
 		if err != nil {
 			return LockID{}, fmt.Errorf("watch lock node %s: %w", ahead, err)
 		}
 		if !exists {
 			// It left between the listing and the watch; re-read rather than
-			// wait for an event that will never come.
+			// wait for an event that will never come. The watch already left
+			// on this process's own node costs one extra pass at worst,
+			// because every pass re-reads the directory and decides again
+			// from what it finds there.
 			continue
 		}
 		select {
 		case <-ctx.Done():
 			return LockID{}, ctx.Err()
-		case <-events:
+		case <-l.release:
+			return LockID{}, fmt.Errorf("%w: %s", ErrLockReleased, l.dir)
+		case <-mineEvents:
+		case <-aheadEvents:
 		}
 	}
 }
@@ -457,6 +539,12 @@ func (l *ServiceLock) acquired(node string) (LockID, error) {
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	if l.released {
+		// Release won the race with the last step of acquisition. Report a
+		// lock that was never held rather than hold one the caller has
+		// already been told is gone.
+		return LockID{}, fmt.Errorf("%w: %s", ErrLockReleased, l.dir)
+	}
 	l.node = node
 	l.id = id
 	l.held = true
@@ -569,17 +657,22 @@ func (l *ServiceLock) Verify() error {
 // It is safe to call after a loss and safe to call twice: the lock ends once,
 // and the first ending is the one reported. A delete that finds nothing is
 // success, because the node being gone is the outcome asked for.
+//
+// It is also safe to call against an acquisition that is still queued. Every
+// node this process created is swept, not just the one it holds, so a release
+// cannot leave a place in line for a process that is no longer waiting — and
+// the acquisition is woken and refused, so it cannot go on to hold a lock the
+// caller has already given up.
 func (l *ServiceLock) Release() error {
 	l.mu.Lock()
-	node, started := l.node, l.started
-	l.mu.Unlock()
-	if !started {
+	if !l.started {
+		l.mu.Unlock()
 		return fmt.Errorf("%w: %s", ErrNotHeld, l.dir)
 	}
-	var err error
-	if node != "" {
-		err = l.deleteNode(node)
-	}
+	l.released = true
+	l.mu.Unlock()
+	l.releaseOnce.Do(func() { close(l.release) })
+	err := l.deleteOwnNodes()
 	l.lose(LossReleased, nil)
 	return err
 }
@@ -595,6 +688,11 @@ func (l *ServiceLock) lose(reason LossReason, cause error) error {
 	} else if l.reason != LossNone {
 		reason = l.reason
 		cause = nil
+	} else {
+		// The generation ended before it began — a release that arrived while
+		// the acquisition was still queued. Record how it ended, so a caller
+		// asking is not told it never did.
+		l.reason = reason
 	}
 	id := l.id
 	l.mu.Unlock()
@@ -638,16 +736,31 @@ func (l *ServiceLock) ownNodes(sorted []string) []string {
 // deleteOwnNodes removes every node this process created in the lock
 // directory. It is the cleanup for an acquisition that did not finish, so a
 // node cannot be left holding a place in the queue for a process that is no
-// longer waiting. Errors are not actionable — the session dropping is itself
-// the fallback that removes them.
-func (l *ServiceLock) deleteOwnNodes() {
+// longer waiting.
+//
+// A failure is reported rather than swallowed. An abandoned ephemeral node
+// keeps its sequence, and so its place in line, for as long as the session
+// lives: it can become the holder of a lock nobody is waiting on, blocking
+// every candidate behind it. The session dropping is the fallback that
+// removes it, but only the session's owner can drop it, so the owner has to
+// be told.
+func (l *ServiceLock) deleteOwnNodes() error {
 	children, _, err := l.conn.Children(l.dir)
 	if err != nil {
-		return
+		if errors.Is(err, gozk.ErrNoNode) {
+			// There is no directory, so no node of this process is holding a
+			// place in one. Nothing to clean up and nothing to report.
+			return nil
+		}
+		return fmt.Errorf("list lock nodes in %s: %w", l.dir, err)
 	}
+	var failures []error
 	for _, child := range l.ownNodes(sortLockNodes(children)) {
-		_ = l.deleteNode(child)
+		if err := l.deleteNode(child); err != nil {
+			failures = append(failures, err)
+		}
 	}
+	return errors.Join(failures...)
 }
 
 // deleteNode removes one node from the lock directory, treating an already

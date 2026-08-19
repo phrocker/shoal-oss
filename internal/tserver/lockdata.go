@@ -42,6 +42,27 @@ const DefaultResourceGroup = "default"
 // bound its port. It names no endpoint, so it can never be advertised as one.
 const placeholderAddress = "0.0.0.0:0"
 
+// canonicalUUIDLength is the length of the 36-character dashed UUID form.
+const canonicalUUIDLength = 36
+
+// validAccumuloUUID reports whether value is a UUID Accumulo can read back.
+//
+// Go's uuid.Parse is not a shape check: it also accepts a 32-character bare
+// hex form, a "urn:uuid:" form, and a braced form. Java's UUID.fromString
+// accepts none of those, so they are exactly the forms a Go writer could
+// publish and a Java reader could not parse — in a lock node name that makes
+// this process invisible to Accumulo's ServiceLock.validateAndSort, and in a
+// lock payload it makes the whole znode unreadable to the manager. Only the
+// length has to be tested, because 36 is the one length at which uuid.Parse
+// requires the dashed form.
+func validAccumuloUUID(value string) bool {
+	if len(value) != canonicalUUIDLength {
+		return false
+	}
+	_, err := uuid.Parse(value)
+	return err == nil
+}
+
 // ThriftService names one service advertised on a ServiceLock znode. The
 // values mirror ServiceLockData.ThriftService, which is what the manager and
 // Accumulo clients match against when they read the lock.
@@ -131,8 +152,9 @@ type ServiceDescriptor struct {
 
 // Validate reports whether the descriptor names a reachable service.
 func (d ServiceDescriptor) Validate() error {
-	if _, err := uuid.Parse(d.UUID); err != nil {
-		return fmt.Errorf("%w: server uuid %q: %w", ErrInvalidLockData, d.UUID, err)
+	if !validAccumuloUUID(d.UUID) {
+		return fmt.Errorf("%w: server uuid %q is not the 36-character dashed form Accumulo reads",
+			ErrInvalidLockData, d.UUID)
 	}
 	if !d.Service.Known() {
 		return fmt.Errorf("%w: unknown service %q", ErrInvalidLockData, d.Service)

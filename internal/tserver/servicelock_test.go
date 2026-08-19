@@ -179,6 +179,9 @@ func TestAcquireWaitsForTheHolderToLeave(t *testing.T) {
 // immediate predecessor would wake this process when that holder tidies up a
 // duplicate rather than when it actually leaves, and it would then find the
 // lock still taken.
+//
+// It also pins the order: a queued candidate watches its own node first, so a
+// node that disappears from under it is noticed without waiting on the holder.
 func TestAcquireWatchesTheHoldersLowestNode(t *testing.T) {
 	f := newFakeZK()
 	lowest := f.seedForeignLock(testLockPath(), otherUUID, 0)
@@ -189,6 +192,11 @@ func TestAcquireWatchesTheHoldersLowestNode(t *testing.T) {
 		_, _ = lock.Acquire(context.Background(), testLockData(t))
 	}()
 
+	own := nextArmed(t, f)
+	if !strings.HasPrefix(path.Base(own), lock.nodePrefix()) {
+		t.Fatalf("first watch is on %s, want a node of this process (prefix %s)",
+			own, lock.nodePrefix())
+	}
 	armed := nextArmed(t, f)
 	if armed != path.Join(testLockPath(), lowest) {
 		t.Fatalf("watching %s, want the holder's lowest node %s (its highest is %s)",
@@ -1068,5 +1076,444 @@ func TestLossReasonString(t *testing.T) {
 		if got := reason.String(); got != want {
 			t.Fatalf("LossReason(%d).String() = %q, want %q", int(reason), got, want)
 		}
+	}
+}
+
+// TestParseLockNodeRefusesNonCanonicalUUID keeps the reader in step with
+// Accumulo. Go's uuid.Parse accepts bare-hex, URN, and braced forms that
+// ServiceLock.validateAndSort throws on, so accepting them here would make
+// this package disagree with Accumulo about who is in the queue and who holds
+// the lock.
+func TestParseLockNodeRefusesNonCanonicalUUID(t *testing.T) {
+	for name, value := range nonCanonicalUUIDs() {
+		t.Run(name, func(t *testing.T) {
+			node := fmt.Sprintf("%s%s#%010d", zLockPrefix, value, 3)
+			if id, ok := ParseLockNode(node); ok {
+				t.Fatalf("ParseLockNode(%q) = %s, true; Accumulo refuses that node", node, id)
+			}
+		})
+	}
+	node := fmt.Sprintf("%s%s#%010d", zLockPrefix, canonicalTestUUID, 3)
+	id, ok := ParseLockNode(node)
+	if !ok || id.UUID != canonicalTestUUID || id.Sequence != 3 {
+		t.Fatalf("ParseLockNode(%q) = %s, %t; want the canonical form to parse", node, id, ok)
+	}
+}
+
+// TestSortLockNodesDropsNonCanonicalUUIDs is the consequence that matters: a
+// stray child whose UUID Accumulo cannot parse must not be able to sit at the
+// head of the queue, because Accumulo would not see it there either.
+func TestSortLockNodesDropsNonCanonicalUUIDs(t *testing.T) {
+	bare := strings.ReplaceAll(canonicalTestUUID, "-", "")
+	real := fmt.Sprintf("%s%s#%010d", zLockPrefix, serverUUID, 1)
+	sorted := sortLockNodes([]string{
+		fmt.Sprintf("%s%s#%010d", zLockPrefix, bare, 0),
+		real,
+	})
+	if len(sorted) != 1 || sorted[0] != real {
+		t.Fatalf("sortLockNodes = %v, want only %s", sorted, real)
+	}
+}
+
+// TestNewServiceLockRefusesNonCanonicalUUID refuses the identity at
+// construction. A lock node named with a UUID Accumulo cannot parse is a node
+// validateAndSort drops, so this process would queue invisibly: it would wait
+// its turn while Accumulo handed the lock to somebody else.
+func TestNewServiceLockRefusesNonCanonicalUUID(t *testing.T) {
+	for name, value := range nonCanonicalUUIDs() {
+		if value == "" {
+			// An empty UUID means "mint one", which is a different contract
+			// and is covered by TestNewServiceLockMintsAUUID.
+			continue
+		}
+		t.Run(name, func(t *testing.T) {
+			_, err := NewServiceLock(newFakeZK(), ServiceLockOptions{Path: testLockPath(), UUID: value})
+			if !errors.Is(err, ErrInvalidLock) {
+				t.Fatalf("NewServiceLock(%q) = %v, want ErrInvalidLock", value, err)
+			}
+		})
+	}
+}
+
+// TestAcquireFailsWhenItsOwnQueuedNodeDisappears covers the wait that would
+// otherwise never end. A queued candidate that watches only the node ahead of
+// it has no way to learn that its own node is gone: the holder stays put, no
+// event about it ever fires, and the acquisition sleeps through a queue it is
+// no longer in until an unrelated process happens to leave.
+func TestAcquireFailsWhenItsOwnQueuedNodeDisappears(t *testing.T) {
+	f := newFakeZK()
+	holder := f.seedForeignLock(testLockPath(), otherUUID, 0)
+	lock := newTestLock(t, f, serverUUID)
+
+	errs := make(chan error, 1)
+	go func() {
+		_, err := lock.Acquire(context.Background(), testLockData(t))
+		errs <- err
+	}()
+
+	own := nextArmed(t, f)
+	if !strings.HasPrefix(path.Base(own), lock.nodePrefix()) {
+		t.Fatalf("first watch is on %s, want this process's own node", own)
+	}
+	// Wait for the second watch too, so the acquisition is provably asleep on
+	// both before its node is taken away.
+	waitArmed(t, f, path.Join(testLockPath(), holder))
+
+	if err := f.Delete(own, -1); err != nil {
+		t.Fatalf("delete the queued node: %v", err)
+	}
+
+	select {
+	case err := <-errs:
+		if !errors.Is(err, ErrLockNodeMissing) {
+			t.Fatalf("Acquire = %v, want ErrLockNodeMissing", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Acquire is still waiting on a queue it is no longer in")
+	}
+	if _, held := lock.LockID(); held {
+		t.Fatal("the lock must not be held after its node disappeared")
+	}
+	if !f.exists(path.Join(testLockPath(), holder)) {
+		t.Fatal("the holder's node must be untouched")
+	}
+}
+
+// TestReleaseWhileQueuedRefusesTheAcquisition closes the window between a
+// release and an acquisition that has not finished. Release used to look only
+// at the node this process holds, which is empty while it is still queued, so
+// it reported success and left the acquisition running: the caller was told
+// the lock was gone and then went on to hold it.
+func TestReleaseWhileQueuedRefusesTheAcquisition(t *testing.T) {
+	f := newFakeZK()
+	holder := f.seedForeignLock(testLockPath(), otherUUID, 0)
+	lock := newTestLock(t, f, serverUUID)
+
+	errs := make(chan error, 1)
+	go func() {
+		_, err := lock.Acquire(context.Background(), testLockData(t))
+		errs <- err
+	}()
+	nextArmed(t, f)
+	waitArmed(t, f, path.Join(testLockPath(), holder))
+
+	if err := lock.Release(); err != nil {
+		t.Fatalf("Release while queued: %v", err)
+	}
+
+	select {
+	case err := <-errs:
+		if !errors.Is(err, ErrLockReleased) {
+			t.Fatalf("Acquire = %v, want ErrLockReleased", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Release did not wake the queued acquisition")
+	}
+	if _, held := lock.LockID(); held {
+		t.Fatal("a lock released before it was acquired must never be held")
+	}
+	if reason := lock.LossReason(); reason != LossReleased {
+		t.Fatalf("LossReason = %s, want RELEASED", reason)
+	}
+	for _, child := range f.lockNodes(testLockPath()) {
+		if strings.HasPrefix(child, lock.nodePrefix()) {
+			t.Fatalf("%s still holds a place in the queue after Release", child)
+		}
+	}
+}
+
+// TestReleaseBeforeTheTurnArrivesRefusesToTakeIt is the same race decided the
+// other way: the release lands while the holder is leaving, so acquisition
+// reaches the front of the queue. It must still refuse, because the caller has
+// already been told the lock is gone.
+func TestReleaseBeforeTheTurnArrivesRefusesToTakeIt(t *testing.T) {
+	f := newFakeZK()
+	holder := f.seedForeignLock(testLockPath(), otherUUID, 0)
+	lock := newTestLock(t, f, serverUUID)
+
+	// Release the moment the queue is re-read, which is after the holder has
+	// gone and before ownership is recorded.
+	//
+	// Release lists the directory too, so the hook has to disarm itself before
+	// it calls back into the fake rather than guard with a sync.Once, which
+	// would deadlock on the re-entrant call.
+	f.beforeChildren = func(string) {
+		f.beforeChildren = nil
+		if err := f.Delete(path.Join(testLockPath(), holder), -1); err != nil {
+			panic(err)
+		}
+		_ = lock.Release()
+	}
+
+	_, err := lock.Acquire(context.Background(), testLockData(t))
+	if !errors.Is(err, ErrLockReleased) {
+		t.Fatalf("Acquire = %v, want ErrLockReleased", err)
+	}
+	if _, held := lock.LockID(); held {
+		t.Fatal("acquisition must not take a lock that was already released")
+	}
+	for _, child := range f.lockNodes(testLockPath()) {
+		if strings.HasPrefix(child, lock.nodePrefix()) {
+			t.Fatalf("%s survived a released acquisition", child)
+		}
+	}
+}
+
+// TestReleaseSweepsEveryNodeThisProcessCreated covers the duplicate a lost
+// create response left behind. Releasing only the held node would promote that
+// duplicate to holder of a lock nobody is waiting on, blocking every candidate
+// behind it until the session ended.
+func TestReleaseSweepsEveryNodeThisProcessCreated(t *testing.T) {
+	f := newFakeZK()
+	f.duplicates = 2
+	lock := newTestLock(t, f, serverUUID)
+
+	// Make the duplicate cleanup during acquisition fail, so a node of this
+	// process survives to be swept by Release.
+	duplicate := path.Join(testLockPath(), fmt.Sprintf("%s%s#%010d", zLockPrefix, serverUUID, 1))
+	f.failDelete(duplicate, gozk.ErrConnectionClosed)
+
+	if _, err := lock.Acquire(context.Background(), testLockData(t)); err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	if !f.exists(duplicate) {
+		t.Fatal("the duplicate must survive acquisition for this test to mean anything")
+	}
+
+	f.failDelete(duplicate, nil)
+	if err := lock.Release(); err != nil {
+		t.Fatalf("Release: %v", err)
+	}
+	for _, child := range f.lockNodes(testLockPath()) {
+		if strings.HasPrefix(child, lock.nodePrefix()) {
+			t.Fatalf("%s survived Release and can become a holder nobody is waiting on", child)
+		}
+	}
+}
+
+// TestAcquireReportsANodeItCouldNotRemove is the honesty requirement on
+// cleanup. A cancelled acquisition whose node survives keeps its sequence, and
+// so its place in line, for as long as the session lives; only the session's
+// owner can close the session, so the owner has to be told rather than left to
+// discover a lock held by nobody.
+func TestAcquireReportsANodeItCouldNotRemove(t *testing.T) {
+	f := newFakeZK()
+	holder := f.seedForeignLock(testLockPath(), otherUUID, 0)
+	lock := newTestLock(t, f, serverUUID)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	errs := make(chan error, 1)
+	go func() {
+		_, err := lock.Acquire(ctx, testLockData(t))
+		errs <- err
+	}()
+
+	own := nextArmed(t, f)
+	waitArmed(t, f, path.Join(testLockPath(), holder))
+	f.failDelete(own, gozk.ErrConnectionClosed)
+	cancel()
+
+	err := <-errs
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Acquire = %v, want it to still report the cancellation it was given", err)
+	}
+	if !errors.Is(err, ErrLockNodeOrphaned) {
+		t.Fatalf("Acquire = %v, want it to also report the node it could not remove", err)
+	}
+	if !f.exists(own) {
+		t.Fatal("the orphaned node must still be there; otherwise the report is wrong")
+	}
+}
+
+// TestAcquireDoesNotReportAnOrphanItCleanedUp keeps the ordinary cancellation
+// exactly comparable to context.Canceled. Joining an error onto every
+// cancellation would make callers that compare against it stop working, so the
+// orphan report has to be the exception rather than the rule.
+func TestAcquireDoesNotReportAnOrphanItCleanedUp(t *testing.T) {
+	f := newFakeZK()
+	holder := f.seedForeignLock(testLockPath(), otherUUID, 0)
+	lock := newTestLock(t, f, serverUUID)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	errs := make(chan error, 1)
+	go func() {
+		_, err := lock.Acquire(ctx, testLockData(t))
+		errs <- err
+	}()
+	nextArmed(t, f)
+	waitArmed(t, f, path.Join(testLockPath(), holder))
+	cancel()
+
+	err := <-errs
+	if err != context.Canceled { //nolint:errorlint // the identity is the point
+		t.Fatalf("Acquire = %v (%T), want exactly context.Canceled", err, err)
+	}
+	if errors.Is(err, ErrLockNodeOrphaned) {
+		t.Fatal("a node that was cleaned up must not be reported as orphaned")
+	}
+}
+
+// TestReleaseReportsANodeItCouldNotRemove applies the same honesty to the
+// shutdown path: a release that cannot prove the node is gone must not report
+// success, because the manager reads that node to decide this server is alive.
+func TestReleaseReportsANodeItCouldNotRemove(t *testing.T) {
+	f := newFakeZK()
+	lock := newTestLock(t, f, serverUUID)
+	id, err := lock.Acquire(context.Background(), testLockData(t))
+	if err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	f.failDelete(path.Join(testLockPath(), lock.Node()), gozk.ErrConnectionClosed)
+
+	if err := lock.Release(); !errors.Is(err, gozk.ErrConnectionClosed) {
+		t.Fatalf("Release = %v, want the delete failure", err)
+	}
+	if _, held := lock.LockID(); held {
+		t.Fatalf("%s must not be reported as held after Release", id)
+	}
+}
+
+// TestReleaseReportsADirectoryItCouldNotList is the same refusal one step
+// earlier: a release that cannot even list the directory cannot know whether
+// it left a node behind, so it must not claim it did not.
+func TestReleaseReportsADirectoryItCouldNotList(t *testing.T) {
+	f := newFakeZK()
+	lock := newTestLock(t, f, serverUUID)
+	if _, err := lock.Acquire(context.Background(), testLockData(t)); err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	f.failChildren(testLockPath(), gozk.ErrConnectionClosed)
+
+	if err := lock.Release(); !errors.Is(err, gozk.ErrConnectionClosed) {
+		t.Fatalf("Release = %v, want the listing failure", err)
+	}
+}
+
+// TestReleaseBeforeTheNodeExistsCreatesNothing covers the earliest release
+// there is: the caller gives up between starting the acquisition and the node
+// being created. Nothing may be left in the lock directory afterwards, because
+// a node created after the caller has been told the lock is gone is a node
+// nobody will ever come back for.
+func TestReleaseBeforeTheNodeExistsCreatesNothing(t *testing.T) {
+	f := newFakeZK()
+	lock := newTestLock(t, f, serverUUID)
+
+	f.beforeCreate = func(string) {
+		f.beforeCreate = nil
+		_ = lock.Release()
+	}
+
+	_, err := lock.Acquire(context.Background(), testLockData(t))
+	if !errors.Is(err, ErrLockReleased) {
+		t.Fatalf("Acquire = %v, want ErrLockReleased", err)
+	}
+	for _, child := range f.lockNodes(testLockPath()) {
+		if strings.HasPrefix(child, lock.nodePrefix()) {
+			t.Fatalf("%s was created after the lock was released", child)
+		}
+	}
+	if _, held := lock.LockID(); held {
+		t.Fatal("a lock released before it was created must never be held")
+	}
+}
+
+// TestReleaseWakesAWaitNothingElseWould isolates the wake-up itself. The
+// release cannot delete this process's node here, so no watch fires: if the
+// wait is not woken by the release directly it is not woken at all.
+func TestReleaseWakesAWaitNothingElseWould(t *testing.T) {
+	f := newFakeZK()
+	holder := f.seedForeignLock(testLockPath(), otherUUID, 0)
+	lock := newTestLock(t, f, serverUUID)
+
+	errs := make(chan error, 1)
+	go func() {
+		_, err := lock.Acquire(context.Background(), testLockData(t))
+		errs <- err
+	}()
+	own := nextArmed(t, f)
+	waitArmed(t, f, path.Join(testLockPath(), holder))
+	f.failDelete(own, gozk.ErrConnectionClosed)
+
+	if err := lock.Release(); !errors.Is(err, gozk.ErrConnectionClosed) {
+		t.Fatalf("Release = %v, want the delete failure", err)
+	}
+	select {
+	case err := <-errs:
+		if !errors.Is(err, ErrLockReleased) {
+			t.Fatalf("Acquire = %v, want ErrLockReleased", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("nothing woke the wait, so only the release could have")
+	}
+}
+
+// TestAcquireRefusesToTakeALockAlreadyReleased drives the release into the
+// last gap there is: after the queue has been read and this process is at the
+// front of it, but before ownership is recorded. Taking the lock there would
+// leave a caller that was told the lock was gone holding it.
+func TestAcquireRefusesToTakeALockAlreadyReleased(t *testing.T) {
+	f := newFakeZK()
+	holder := f.seedForeignLock(testLockPath(), otherUUID, 0)
+	lock := newTestLock(t, f, serverUUID)
+
+	errs := make(chan error, 1)
+	go func() {
+		_, err := lock.Acquire(context.Background(), testLockData(t))
+		errs <- err
+	}()
+	own := nextArmed(t, f)
+	waitArmed(t, f, path.Join(testLockPath(), holder))
+
+	// The release must not remove the node, or the wait would trip over the
+	// missing node instead of reaching the front of the queue.
+	f.failDelete(own, gozk.ErrConnectionClosed)
+	f.beforeChildren = func(string) {
+		f.beforeChildren = nil
+		_ = lock.Release()
+	}
+	if err := f.Delete(path.Join(testLockPath(), holder), -1); err != nil {
+		t.Fatalf("delete the holder's node: %v", err)
+	}
+
+	select {
+	case err := <-errs:
+		if !errors.Is(err, ErrLockReleased) {
+			t.Fatalf("Acquire = %v, want ErrLockReleased", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Acquire never finished")
+	}
+	if _, held := lock.LockID(); held {
+		t.Fatal("acquisition must not record a lock the caller already released")
+	}
+}
+
+// TestAcquireFailsWhenItsNodeVanishesBeforeTheWatch covers the window between
+// reading the queue and watching this process's own place in it. Establishing
+// a watch on a node that is already gone proves nothing, so the acquisition
+// has to fail rather than wait on an event that will never come.
+func TestAcquireFailsWhenItsNodeVanishesBeforeTheWatch(t *testing.T) {
+	f := newFakeZK()
+	f.seedForeignLock(testLockPath(), otherUUID, 0)
+	lock := newTestLock(t, f, serverUUID)
+
+	f.beforeExists = func(znodePath string) {
+		if !strings.HasPrefix(path.Base(znodePath), lock.nodePrefix()) {
+			return
+		}
+		f.beforeExists = nil
+		if err := f.Delete(znodePath, -1); err != nil {
+			panic(err)
+		}
+	}
+
+	_, err := lock.Acquire(context.Background(), testLockData(t))
+	if !errors.Is(err, ErrLockNodeMissing) {
+		t.Fatalf("Acquire = %v, want ErrLockNodeMissing", err)
+	}
+	if _, held := lock.LockID(); held {
+		t.Fatal("a lock whose node vanished must not be held")
 	}
 }
