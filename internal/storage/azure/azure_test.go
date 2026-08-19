@@ -783,6 +783,44 @@ func TestCleanupStaleArtifactsIsBoundedETagConditionalAndExplicit(t *testing.T) 
 	}
 }
 
+func TestCleanupStaleArtifactsSortsVersionedArtifactsDeterministically(t *testing.T) {
+	now := time.Now()
+	etag := azcore.ETag(`"old"`)
+	versionA := "2026-08-19T00:00:00.0000000Z"
+	versionB := "2026-08-19T01:00:00.0000000Z"
+	stage := "dir/" + expectedTemporaryStageComponent("dir/target", strings.Repeat("0", 64))
+	ops := &fakeAzureArtifactOperations{
+		artifacts: []azureArtifact{
+			{name: stage, versionID: &versionB, lastModified: now.Add(-2 * time.Hour), etag: &etag, owned: true},
+			{name: stage, versionID: &versionA, lastModified: now.Add(-2 * time.Hour), etag: &etag, owned: true},
+		},
+	}
+	backend := &Backend{artifactOps: ops}
+
+	result, err := backend.CleanupStaleArtifacts(context.Background(), "az://container/dir", now.Add(-time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := len(result.Removed), 2; got != want {
+		t.Fatalf("len(Removed) = %d, want %d", got, want)
+	}
+	if got, want := result.Removed[0], "az://container/"+stage+"?versionId="+url.QueryEscape(versionA); got != want {
+		t.Fatalf("Removed[0] = %q, want %q", got, want)
+	}
+	if got, want := result.Removed[1], "az://container/"+stage+"?versionId="+url.QueryEscape(versionB); got != want {
+		t.Fatalf("Removed[1] = %q, want %q", got, want)
+	}
+	if got, want := len(ops.removed), 2; got != want {
+		t.Fatalf("len(removed) = %d, want %d", got, want)
+	}
+	if got, want := *ops.removed[0].versionID, versionA; got != want {
+		t.Fatalf("removed[0].versionID = %q, want %q", got, want)
+	}
+	if got, want := *ops.removed[1].versionID, versionB; got != want {
+		t.Fatalf("removed[1].versionID = %q, want %q", got, want)
+	}
+}
+
 func TestCleanupStaleArtifactsSupportsRootPrefix(t *testing.T) {
 	now := time.Now()
 	oldETag := azcore.ETag(`"old"`)
