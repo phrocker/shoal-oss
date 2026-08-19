@@ -515,12 +515,14 @@ func TestCleanupStaleArtifactsIsBoundedConditionalAndExplicit(t *testing.T) {
 	recentVersion := "recent-version"
 	userVersion := "user-version"
 	markerVersion := "marker-version"
+	recentMarkerVersion := "recent-marker-version"
 	removeErr := errors.New("delete failed")
 	old := "dir/" + expectedTemporaryStageKeyComponent("dir/target", strings.Repeat("0", 64))
 	failing := "dir/" + expectedTemporaryStageKeyComponent("dir/target", strings.Repeat("1", 64))
 	recent := "dir/" + expectedTemporaryStageKeyComponent("dir/target", strings.Repeat("2", 64))
 	lookalike := "dir/" + expectedTemporaryStageKeyComponent("dir/user", strings.Repeat("3", 64))
 	marker := lookalike
+	recentMarker := "dir/" + expectedTemporaryStageKeyComponent("dir/recent-marker", strings.Repeat("4", 64))
 	uppercase := "dir/" + tempStageKeyPrefix + strings.Repeat("A", tempStageRandomHexLen+tempStageHashHexLen)
 	ops := &fakeS3ArtifactOperations{
 		artifacts: []s3Artifact{
@@ -530,6 +532,7 @@ func TestCleanupStaleArtifactsIsBoundedConditionalAndExplicit(t *testing.T) {
 			{key: failing, lastModified: now.Add(-2 * time.Hour), etag: &oldETag, versionID: &failingVersion, owned: true},
 			{key: old, lastModified: now.Add(-2 * time.Hour), etag: &oldETag, versionID: &oldVersion, owned: true},
 			{key: marker, lastModified: now.Add(-2 * time.Hour), versionID: &markerVersion, deleteMarker: true},
+			{key: recentMarker, lastModified: now, versionID: &recentMarkerVersion, deleteMarker: true},
 		},
 		removeErrors: map[string]error{failing: removeErr},
 	}
@@ -539,8 +542,8 @@ func TestCleanupStaleArtifactsIsBoundedConditionalAndExplicit(t *testing.T) {
 	if !errors.Is(err, removeErr) {
 		t.Fatalf("error = %v, want delete failure", err)
 	}
-	if result.Examined != 5 {
-		t.Fatalf("Examined = %d, want 5", result.Examined)
+	if result.Examined != 6 {
+		t.Fatalf("Examined = %d, want 6", result.Examined)
 	}
 	wantRemoved := []string{"s3://bucket/" + old + "?versionId=" + oldVersion}
 	if fmt.Sprint(result.Removed) != fmt.Sprint(wantRemoved) {

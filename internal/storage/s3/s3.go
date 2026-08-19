@@ -274,6 +274,9 @@ func (b *Backend) CleanupStaleArtifacts(ctx context.Context, prefix string, cuto
 		}
 		result.Examined++
 		if artifact.deleteMarker {
+			if artifact.lastModified.IsZero() || !artifact.lastModified.Before(cutoff) {
+				continue
+			}
 			// Delete markers have no object metadata, so their ownership cannot
 			// be proven. Removing one can resurrect an older user-owned version.
 			result.Recoverable = append(result.Recoverable, s3ArtifactPath(bucket, artifact))
