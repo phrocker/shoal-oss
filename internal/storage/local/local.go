@@ -249,6 +249,7 @@ type writer struct {
 	abortRequested bool
 	aborted        bool
 	fileClosed     bool
+	tempDiscarded  bool
 	state          replacementState
 }
 
@@ -570,10 +571,14 @@ func (w *writer) Close() error {
 	if !w.fileClosed {
 		if err := w.file.Close(); err != nil {
 			w.fileClosed = true
+			w.tempDiscarded = true
 			_ = w.ops.Remove(w.temp)
 			return fmt.Errorf("local: close temporary file %s: %w", w.temp, err)
 		}
 		w.fileClosed = true
+	}
+	if w.tempDiscarded {
+		return fmt.Errorf("local: temporary file %s was discarded after a failed close", w.temp)
 	}
 	if err := w.commitReplacement(); err != nil {
 		if storage.IsCommittedWriteError(err) {

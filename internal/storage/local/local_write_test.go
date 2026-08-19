@@ -654,6 +654,12 @@ func TestLocal_CloseErrorCleansUpTempViaReplacementOps(t *testing.T) {
 	if _, err := os.Stat(temp); !os.IsNotExist(err) {
 		t.Fatalf("temporary file still exists after Close cleanup: %v", err)
 	}
+	if err := w.Close(); err == nil || !strings.Contains(err.Error(), "discarded") {
+		t.Fatalf("retried Close error = %v, want the discarded temporary file reported", err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("destination published after a failed close: %v", err)
+	}
 }
 
 func TestCleanupTemporaryCreateFileJoinsCloseAndRemoveFailures(t *testing.T) {
@@ -1052,6 +1058,13 @@ func TestLocal_RetriedCloseAfterPublishFailureRepublishesStagedData(t *testing.T
 	}
 	if string(got) != "new" {
 		t.Fatalf("target contents = %q, want new", got)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != filepath.Base(path) {
+		t.Fatalf("directory entries = %v, want only the published target", entries)
 	}
 }
 
