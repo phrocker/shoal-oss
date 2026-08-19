@@ -16,7 +16,7 @@ Shoal issue [#81](https://github.com/phrocker/shoal-oss/issues/81) (umbrella
 | Tracking issue | Shoal [#81](https://github.com/phrocker/shoal-oss/issues/81) — "docs: define and audit complete Sharkbite compatibility matrix" (parent [#59](https://github.com/phrocker/shoal-oss/issues/59); upstream target [phrocker/sharkbite#108](https://github.com/phrocker/sharkbite/issues/108)) |
 | Sharkbite reference | `phrocker/sharkbite` @ `7f2625f74331b0cd4a75dc0484949c40f1409686` ("Bump accumulo-core from 2.0.0 to 2.0.1 in /native-iterators-jni (#100)", 2022-07-22) |
 | Sharkbite release line | `sharkbite` 1.2.0.3 on PyPI (`setup.py:34-35`) |
-| Shoal reference | `phrocker/shoal-oss` exact audited baseline for revision 18 `dc19413604a72a9303b61e380ea84cb5a0bcb405` ("test(capi): strengthen property getter coverage") |
+| Shoal reference | `phrocker/shoal-oss` exact audited baseline for revision 18 `9a320f9228a72297c5da4be80e90dcf8931fbf79` ("docs: compile C ABI audit inventory") |
 | Shoal C ABI version | `SHOAL_ABI_VERSION 1u` (`capi/include/shoal_types.h`) |
 | Rows | 3203 (2811 required by the [§2.2](#sec-2) release gate) |
 | Covered rows | **1** — 42 of 333 in revision 1, 14 of 368 in revision 2, 3 of 385 in revision 3, 1 of 473 in revision 4, 0 of 542 in revision 5, 0 of 2358 in revision 6, 0 of 2938 in revision 7, 0 of 3029 in revision 8, 0 of 3175 in revision 9, 0 of 3177 in revision 10, 0 of 3171 in revision 11, 0 of 3174 in revision 12, 0 of 3168 in revision 13, 0 of 3203 in revision 17, and 1 of 3203 in revision 18; see [§25.4](#sec-25) |

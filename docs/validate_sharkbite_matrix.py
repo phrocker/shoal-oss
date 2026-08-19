@@ -192,8 +192,8 @@ EXPECTED_METADATA_FIELDS = {
     "Sharkbite release line": "`sharkbite` 1.2.0.3 on PyPI (`setup.py:34-35`)",
     "Shoal reference": (
         "`phrocker/shoal-oss` exact audited baseline for revision 18 "
-        "`dc19413604a72a9303b61e380ea84cb5a0bcb405` "
-        "(\"test(capi): strengthen property getter coverage\")"
+        "`9a320f9228a72297c5da4be80e90dcf8931fbf79` "
+        "(\"docs: compile C ABI audit inventory\")"
     ),
     "Shoal C ABI version": "`SHOAL_ABI_VERSION 1u` (`capi/include/shoal_types.h`)",
 }
