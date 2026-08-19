@@ -57,10 +57,8 @@ func shoal_connector_get_identity(handle *C.shoal_connector, timeout C.int64_t, 
 	if err != nil {
 		return fail(outError, code, err)
 	}
-	identity, principal, err := func() (accumulo.InstanceInfo, string, error) {
-		defer done()
-		return readConnectorIdentity(ctx, connector)
-	}()
+	defer done()
+	identity, principal, err := readConnectorIdentity(ctx, connector)
 	if err != nil {
 		return failForError(outError, err)
 	}
