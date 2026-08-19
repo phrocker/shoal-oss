@@ -473,7 +473,8 @@ func TestTranslateRefusesUnparsableFilePaths(t *testing.T) {
 		// parsePath: deserialize throws while building the Path.
 		{"unescaped space", "hdfs://nn/accumulo/tables/2/t 0001/F0002.rf", `" " at offset 29 must be percent-escaped`},
 		{"control byte", "hdfs://nn/accumulo/tables/2/t-0001/\x7fF0002.rf", "must be percent-escaped"},
-		{"non-ascii byte", "hdfs://nn/accumulo/tables/2/t\u00e9/F0002.rf", "must be percent-escaped"},
+		{"non-ascii space", "hdfs://nn/accumulo/tables/2/t\u00a0/F0002.rf", "must be percent-escaped"},
+		{"non-ascii control", "hdfs://nn/accumulo/tables/2/t\u0085/F0002.rf", "must be percent-escaped"},
 		{"truncated escape", "hdfs://nn/accumulo/tables/2/t-0001%/F0002.rf", "truncated or non-hex escape at offset 34"},
 		{"non-hex escape", "hdfs://nn/accumulo/tables/2/t-%ZZ01/F0002.rf", "truncated or non-hex escape at offset 30"},
 		{"escape at end", "hdfs://nn/accumulo/tables/2/t-0001/F0002.rf%2", "truncated or non-hex escape at offset 43"},
@@ -510,6 +511,20 @@ func TestTranslateRefusesUnparsableOutputPath(t *testing.T) {
 	r := assertRefused(t, job, Options{}, ClassMalformedJob, "outputFile")
 	if !strings.Contains(r.Detail, "no URI scheme") {
 		t.Fatalf("detail = %q, want it to name the missing scheme", r.Detail)
+	}
+}
+
+// TestTranslateRefusesAnOutputThatIsNotUTF8 reaches the one path a
+// StoredTabletFile entry cannot: the output comes off the wire as a
+// Thrift string, which is a Go string of arbitrary bytes, while a JSON
+// decode has already replaced anything invalid with U+FFFD.
+func TestTranslateRefusesAnOutputThatIsNotUTF8(t *testing.T) {
+	job := validJob()
+	job.OutputFile = "hdfs://nn/accumulo/tables/2/t-0001/\xffC0003.rf" + tmpSuffix(testECID)
+
+	r := assertRefused(t, job, Options{}, ClassMalformedJob, "outputFile")
+	if !strings.Contains(r.Detail, "is not valid UTF-8") {
+		t.Fatalf("detail = %q, want it to name the invalid encoding", r.Detail)
 	}
 }
 
@@ -575,6 +590,22 @@ func TestTranslateAcceptsAnUnauthoritativeVolume(t *testing.T) {
 // the four segments it rebuilds from the decoded path cannot carry one.
 func TestTranslateAcceptsAnEscapeInTheVolume(t *testing.T) {
 	const path = "hdfs://nn/vol%20two/accumulo/tables/2/t-0001/F0002.rf"
+	job := validJob()
+	job.Files[1].MetadataFileEntry = storedFile(path)
+
+	plan := mustTranslate(t, job, Options{})
+	if got := plan.Inputs[1].Path; got != path {
+		t.Fatalf("input path = %q, want %q", got, path)
+	}
+}
+
+// TestTranslateAcceptsAVisibleNonASCIIPath keeps the character check
+// from refusing a volume named in a non-Latin script.
+// URI$Parser.scanEscape lets an unescaped character above U+0080
+// through as long as it is neither a space character nor an ISO
+// control, so java.net.URI accepts these and so must shoal.
+func TestTranslateAcceptsAVisibleNonASCIIPath(t *testing.T) {
+	const path = "hdfs://nn/données/accumulo/tables/2/t-0001/F0002.rf"
 	job := validJob()
 	job.Files[1].MetadataFileEntry = storedFile(path)
 
@@ -666,6 +697,119 @@ func TestTranslateRefusesOnePathUnderTheSameFence(t *testing.T) {
 	r := assertRefused(t, job, Options{}, ClassMalformedJob, "files[3]")
 	if !strings.Contains(r.Detail, "duplicates files[2]") {
 		t.Fatalf("detail = %q, want it to name the entry it duplicates", r.Detail)
+	}
+}
+
+// TestTranslateRefusesOnePathSpelledWithADifferentCase pins that the
+// duplicate check folds what Hadoop folds. java.net.URI.equals compares
+// the scheme and host case-insensitively, and so does this repository's
+// HDFS client, so HDFS://NN/x and hdfs://nn/x open one file — while
+// Accumulo's own ReferencedTabletFile compares normalized strings and
+// would not notice. Reading it twice would merge every cell in it twice.
+func TestTranslateRefusesOnePathSpelledWithADifferentCase(t *testing.T) {
+	job := validJob()
+	job.Files = append(job.Files, &tabletserver.InputFile{
+		MetadataFileEntry: storedFile("HDFS://NN/accumulo/tables/2/t-0001/F0001.rf"),
+		Size:              8, Entries: 1,
+	})
+
+	r := assertRefused(t, job, Options{}, ClassMalformedJob, "files[2]")
+	if !strings.Contains(r.Detail, "duplicates files[0]") {
+		t.Fatalf("detail = %q, want it to name the entry it duplicates", r.Detail)
+	}
+}
+
+// TestTranslateRefusesAnOutputAliasingAnInputByCase closes the same hole
+// on the output side, where the consequence is worse: the manager
+// renames the temp file at commit, so an output whose committed name
+// folds onto an input would overwrite a file the tablet still
+// references.
+func TestTranslateRefusesAnOutputAliasingAnInputByCase(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		out  string
+		want string
+	}{
+		{
+			"temp name aliases an input",
+			"HDFS://NN/accumulo/tables/2/t-0001/F0001.rf",
+			"is also files[0]",
+		},
+		{
+			"committed name aliases an input",
+			"HDFS://NN/accumulo/tables/2/t-0001/F0001.rf" + tmpSuffix(testECID),
+			"which is also files[0]",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			job := validJob()
+			job.OutputFile = tt.out
+
+			r := assertRefused(t, job, Options{}, ClassMalformedJob, "outputFile")
+			if !strings.Contains(r.Detail, tt.want) {
+				t.Fatalf("detail = %q, want it to contain %q", r.Detail, tt.want)
+			}
+		})
+	}
+}
+
+// TestPathIdentityFoldsOnlyWhatURIFolds pins the folding rule directly,
+// including the parts java.net.URI leaves alone. Userinfo and the path
+// are case-sensitive, a port is not a host, and an IPv6 literal folds
+// through its closing bracket.
+func TestPathIdentityFoldsOnlyWhatURIFolds(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"scheme and host", "HDFS://NN/A/B.rf", "hdfs://nn/A/B.rf"},
+		{"host with a port", "HDFS://NN:9000/A/B.rf", "hdfs://nn:9000/A/B.rf"},
+		{"userinfo is not folded", "hdfs://User@NN/A/B.rf", "hdfs://User@nn/A/B.rf"},
+		{"ipv6 literal", "HDFS://[2001:DB8::1]:9000/A/B.rf", "hdfs://[2001:db8::1]:9000/A/B.rf"},
+		{"no authority", "FILE:/A/B.rf", "file:/A/B.rf"},
+		{"authority runs to the end", "HDFS://NN", "hdfs://nn"},
+		{"no scheme at all", "/A/B.rf", "/A/B.rf"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := pathIdentity(tt.in); got != tt.want {
+				t.Fatalf("pathIdentity(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestTranslateRefusesEntriesGsonWouldLeaveNull pins that field names
+// are matched the way Gson matches them. encoding/json falls back to a
+// case-insensitive match, so a capitalised spelling decodes cleanly here
+// while StoredTabletFile.deserialize leaves the field null and
+// requireNonNull rejects the entry. A null literal is the same case:
+// present on the wire, absent to Gson.
+func TestTranslateRefusesEntriesGsonWouldLeaveNull(t *testing.T) {
+	const path = "hdfs://nn/accumulo/tables/2/t-0001/F0002.rf"
+	for _, tt := range []struct {
+		name  string
+		entry string
+		want  string
+	}{
+		{"capitalised path", `{"Path":"` + path + `","startRow":"","endRow":""}`, "missing path"},
+		{"capitalised startRow", `{"path":"` + path + `","StartRow":"","endRow":""}`, "missing startRow"},
+		{"capitalised endRow", `{"path":"` + path + `","startRow":"","EndRow":""}`, "missing endRow"},
+		{"null path", `{"path":null,"startRow":"","endRow":""}`, "missing path"},
+		{"row is not a string", `{"path":"` + path + `","startRow":7,"endRow":""}`, "startRow is not a string"},
+		// Present and non-null, so the exact-name check passes and the
+		// shared decoder is the one that rejects it.
+		{"path is not a string", `{"path":7,"startRow":"","endRow":""}`, "undecodable StoredTabletFile entry"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			job := validJob()
+			job.Files[1].MetadataFileEntry = tt.entry
+
+			r := assertRefused(t, job, Options{}, ClassMalformedJob, "files[1]")
+			if !strings.Contains(r.Detail, tt.want) {
+				t.Fatalf("detail = %q, want it to contain %q", r.Detail, tt.want)
+			}
+		})
 	}
 }
 
@@ -778,6 +922,32 @@ func TestTranslateRefusesMalformedJobs(t *testing.T) {
 			name: "ecid suffix is a truncated uuid",
 			mutate: func(j *tabletserver.TExternalCompactionJob) {
 				j.ExternalCompactionId = ECIDPrefix + testUUID[:len(testUUID)-1]
+			},
+			wantField: "externalCompactionId",
+		},
+		// UUID.fromString takes only the hyphenated spelling: it looks
+		// for four dashes and no fifth. Every one of these parses in Go,
+		// so accepting them would build a plan whose compactionFailed
+		// throws in the coordinator's handler and leaves the slot
+		// assigned until it times out.
+		{
+			name: "ecid suffix is bare hex",
+			mutate: func(j *tabletserver.TExternalCompactionJob) {
+				j.ExternalCompactionId = ECIDPrefix + strings.ReplaceAll(testUUID, "-", "")
+			},
+			wantField: "externalCompactionId",
+		},
+		{
+			name: "ecid suffix is braced",
+			mutate: func(j *tabletserver.TExternalCompactionJob) {
+				j.ExternalCompactionId = ECIDPrefix + "{" + testUUID + "}"
+			},
+			wantField: "externalCompactionId",
+		},
+		{
+			name: "ecid suffix is a urn",
+			mutate: func(j *tabletserver.TExternalCompactionJob) {
+				j.ExternalCompactionId = ECIDPrefix + "urn:uuid:" + testUUID
 			},
 			wantField: "externalCompactionId",
 		},

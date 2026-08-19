@@ -578,6 +578,14 @@ func executeJob(ctx context.Context, logger *slog.Logger, cc coordinatorConn, cf
 // as missing, and a decoded Thrift binary can be a non-nil empty slice,
 // so this uses the same length test rather than a nil check.
 //
+// The ECID could be a third way the same call is unanswerable —
+// compactionFailed resolves the assignment through
+// ExternalCompactionId.of, which throws on anything outside the
+// "ECID-<uuid>" grammar — but it cannot be one here. drainCoordinator
+// aborts on any job whose id differs from the one it generated, and
+// newECID only ever emits the canonical spelling, so every id that
+// reaches this point is one Java parses.
+//
 // The pinned protocol has no hand-back that takes the ECID alone, and
 // substituting an extent shoal invented would tell the manager a
 // compaction failed on a tablet it was never assigned to. So the slot is

@@ -64,9 +64,9 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"unicode"
 	"unicode/utf16"
-
-	"github.com/google/uuid"
+	"unicode/utf8"
 
 	"github.com/phrocker/shoal/internal/compaction"
 	"github.com/phrocker/shoal/internal/iterrt"
@@ -504,19 +504,23 @@ func Translate(job *tabletserver.TExternalCompactionJob, opts Options) (*Plan, e
 // compaction the manager is able to track — building a plan for one
 // would mean doing work no coordinator will ever accept a result for.
 //
-// uuid.Parse also accepts the urn: and braced spellings Java's
-// UUID.fromString does not; that only matters for an id no coordinator
-// generates, and the canonical form both agree on is the one on the
-// wire.
+// The spelling has to be the canonical hyphenated one. uuid.Parse also
+// takes the 32-hex, braced and urn: forms, all of which UUID.fromString
+// rejects — and this id is the one every compactionFailed carries, so
+// accepting a spelling the coordinator cannot parse would leave the
+// slot assigned until it times out rather than released. Going the
+// other way costs nothing: UUID.fromString also takes short forms like
+// 1-1-1-1-1, but ExternalCompactionId.generate only ever emits the
+// canonical one, and refusing a job is still a release.
 func checkECID(ecid string) error {
 	suffix, ok := strings.CutPrefix(ecid, ECIDPrefix)
 	if !ok {
 		return refuse(ClassMalformedJob, "externalCompactionId",
 			"%q is not in Accumulo's %s<uuid> form", ecid, ECIDPrefix)
 	}
-	if _, err := uuid.Parse(suffix); err != nil {
+	if !isCanonicalUUID(suffix) {
 		return refuse(ClassMalformedJob, "externalCompactionId",
-			"%q does not carry a UUID after %q: %v", ecid, ECIDPrefix, err)
+			"%q does not carry a canonical UUID after %q", ecid, ECIDPrefix)
 	}
 	return nil
 }
@@ -645,7 +649,49 @@ func (p parsedInput) fenced() bool { return p.startRow != "" || p.endRow != "" }
 // unpadded base64, or bytes past the declared length, which readFully
 // never looks at — and a file would be merged twice.
 func (p parsedInput) key() string {
-	return p.file.Path + "\x00" + string(p.startRaw) + "\x00" + string(p.endRaw)
+	return pathIdentity(p.file.Path) + "\x00" + string(p.startRaw) + "\x00" + string(p.endRaw)
+}
+
+// pathIdentity folds the parts of a path URI that name one file under
+// more than one spelling.
+//
+// A tablet file is opened through Hadoop, and both java.net.URI.equals
+// and this repository's own HDFS client compare the scheme and the host
+// without regard to case — HDFS://NN/x and hdfs://nn/x are one file.
+// Accumulo's ReferencedTabletFile compares normalized path strings, so
+// it would not notice, which is exactly why shoal has to: two entries
+// spelled that way would have every cell in the file merged twice, and
+// an output that collides with an input that way would overwrite it at
+// commit.
+//
+// Only the scheme and the host fold. The path is case-sensitive on
+// every filesystem Accumulo runs on, and userinfo and port are left
+// alone because URI does not fold them either.
+func pathIdentity(raw string) string {
+	colon := strings.Index(raw, ":")
+	if colon <= 0 {
+		return raw
+	}
+	id := strings.ToLower(raw[:colon]) + raw[colon:]
+	start, end := authoritySpan(id)
+	if start >= end {
+		return id
+	}
+	authority := id[start:end]
+	// Fold only the host: everything after an "@" and, for an IPv6
+	// literal, everything through the "]".
+	host := 0
+	if at := strings.LastIndexByte(authority, '@'); at >= 0 {
+		host = at + 1
+	}
+	rest := len(authority)
+	if close := strings.IndexByte(authority[host:], ']'); close >= 0 {
+		rest = host + close + 1
+	} else if port := strings.IndexByte(authority[host:], ':'); port >= 0 {
+		rest = host + port
+	}
+	folded := authority[:host] + strings.ToLower(authority[host:rest]) + authority[rest:]
+	return id[:start] + folded + id[end:]
 }
 
 func inputFiles(inputs []parsedInput) []InputFile {
@@ -775,7 +821,7 @@ func decodeFileEntry(entry, field string) (parsedInput, error) {
 	// and be indistinguishable from a whole-file entry, which is the
 	// one misreading that silently widens a compaction's input beyond
 	// the range the manager authorized.
-	startRaw, endRaw, err := checkFenceFields(entry, field)
+	startRaw, endRaw, err := checkEntryFields(entry, field)
 	if err != nil {
 		return parsedInput{}, err
 	}
@@ -933,11 +979,30 @@ func checkURISyntax(raw string) error {
 			if i < authStart || i >= authEnd {
 				return fmt.Errorf("character %q at offset %d is only legal in an authority", string(rune(c)), i)
 			}
+		case c >= utf8.RuneSelf:
+			// URI$Parser.scanEscape lets an unescaped character above
+			// U+0080 through as long as it is visible, so a volume named
+			// in a non-Latin script is legal and must not be refused.
+			r, size := utf8.DecodeRuneInString(raw[i:])
+			if r == utf8.RuneError && size == 1 {
+				return fmt.Errorf("byte %#x at offset %d is not valid UTF-8", c, i)
+			}
+			if unicode.IsSpace(r) || isISOControl(r) {
+				return fmt.Errorf("character %q at offset %d must be percent-escaped", string(r), i)
+			}
+			i += size - 1
 		default:
 			return fmt.Errorf("character %q at offset %d must be percent-escaped", string(rune(c)), i)
 		}
 	}
 	return nil
+}
+
+// isISOControl matches Character.isISOControl, which URI's parser uses
+// to decide whether a non-ASCII character is visible enough to pass
+// unescaped.
+func isISOControl(r rune) bool {
+	return r <= 0x1f || (r >= 0x7f && r <= 0x9f)
 }
 
 // authoritySpan locates the authority component, if the URI has one, as
@@ -959,8 +1024,8 @@ func isHexDigit(c byte) bool {
 	return c >= '0' && c <= '9' || c >= 'a' && c <= 'f' || c >= 'A' && c <= 'F'
 }
 
-// checkFenceFields enforces the two StoredTabletFile invariants a Go
-// struct decode cannot express.
+// checkEntryFields enforces the StoredTabletFile invariants a Go struct
+// decode cannot express.
 //
 // StoredTabletFile.deserialize calls Objects.requireNonNull on path,
 // startRow and endRow, so an entry missing either row field is not a
@@ -970,35 +1035,67 @@ func isHexDigit(c byte) bool {
 // unparseable. Only a present, well-encoded, zero-length row means
 // "unbounded on this side" (decodeRow returns null for an empty array).
 //
+// All three names are matched exactly, because Gson matches them
+// exactly. encoding/json would otherwise accept {"Path":...} and
+// {"StartRow":...} and hand back a plausible entry for JSON that leaves
+// every one of those fields null on the Java side.
+//
 // The decoded rows come back so the caller can identify the reference by
 // path and range without decoding them a second time.
-func checkFenceFields(entry, field string) (startRaw, endRaw []byte, err error) {
-	var probe struct {
-		StartRow *string `json:"startRow"`
-		EndRow   *string `json:"endRow"`
-	}
-	if err := json.Unmarshal([]byte(entry), &probe); err != nil {
+func checkEntryFields(entry, field string) (startRaw, endRaw []byte, err error) {
+	members, err := jsonMembers(entry)
+	if err != nil {
 		return nil, nil, refuse(ClassMalformedJob, field,
 			"undecodable StoredTabletFile entry: %v", err)
 	}
+	if member, ok := members["path"]; !ok || isJSONNull(member) {
+		return nil, nil, refuse(ClassMalformedJob, field,
+			"StoredTabletFile is missing path")
+	}
 	decoded := make([][]byte, 2)
-	for i, row := range []struct {
-		name  string
-		value *string
-	}{{"startRow", probe.StartRow}, {"endRow", probe.EndRow}} {
-		if row.value == nil {
+	for i, name := range []string{"startRow", "endRow"} {
+		member, ok := members[name]
+		if !ok || isJSONNull(member) {
 			return nil, nil, refuse(ClassMalformedJob, field,
 				"StoredTabletFile is missing %s; a fence is absent only when the field is present and empty",
-				row.name)
+				name)
 		}
-		raw, err := checkFenceRow(*row.value)
+		var value string
+		if err := json.Unmarshal(member, &value); err != nil {
+			return nil, nil, refuse(ClassMalformedJob, field,
+				"StoredTabletFile %s is not a string: %v", name, err)
+		}
+		raw, err := checkFenceRow(value)
 		if err != nil {
 			return nil, nil, refuse(ClassMalformedJob, field,
-				"StoredTabletFile %s %q: %v", row.name, *row.value, err)
+				"StoredTabletFile %s %q: %v", name, value, err)
 		}
 		decoded[i] = raw
 	}
 	return decoded[0], decoded[1], nil
+}
+
+// jsonMembers reads an entry as its literal members.
+//
+// Gson binds field names exactly; encoding/json falls back to a
+// case-insensitive match, so a decode into a tagged struct accepts
+// {"Path":...,"StartRow":...} — an entry whose fields Gson would leave
+// null and whose deserialize would then fail on requireNonNull. Reading
+// the members and looking them up by exact name is what keeps the two
+// sides agreeing on which entries exist.
+func jsonMembers(entry string) (map[string]json.RawMessage, error) {
+	var members map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(entry), &members); err != nil {
+		return nil, err
+	}
+	return members, nil
+}
+
+// isJSONNull reports whether a member is present but null, which Gson
+// leaves as a null field and requireNonNull then rejects — the same
+// outcome as omitting it.
+func isJSONNull(member json.RawMessage) bool {
+	return string(bytes.TrimSpace(member)) == "null"
 }
 
 // checkFenceRow accepts exactly the row encodings
@@ -1159,12 +1256,15 @@ func parseOutput(job *tabletserver.TExternalCompactionJob, inputs []parsedInput,
 			"expected a plain path, got a StoredTabletFile entry: %s", out)
 	}
 	committed, hasTmp := committedName(out)
+	outID := pathIdentity(out)
+	committedID := pathIdentity(committed)
 	for i, in := range inputs {
-		if in.file.Path == out {
+		inID := pathIdentity(in.file.Path)
+		if inID == outID {
 			return "", refuse(ClassMalformedJob, "outputFile",
 				"output %s is also files[%d]", out, i)
 		}
-		if hasTmp && in.file.Path == committed {
+		if hasTmp && inID == committedID {
 			return "", refuse(ClassMalformedJob, "outputFile",
 				"output %s commits as %s, which is also files[%d]", out, committed, i)
 		}
