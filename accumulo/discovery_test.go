@@ -349,6 +349,163 @@ func TestDiscoveryTableLookupAndRouting(t *testing.T) {
 	}
 }
 
+// staleCachingTableNames models the staleness internal/tablenames.Resolver
+// exhibits in production: ResolveID answers from a snapshot that only
+// refreshes when Invalidate is called, never on its own. The plain
+// fakeTableNames double used elsewhere in this file has no such cache
+// -- it always reads its live map directly -- so it cannot exercise the
+// property ResolveTableID exists to guarantee (see
+// TestResolveTableIDForcesFreshLookupUnlikeTableByName). This type
+// exists specifically to do so.
+type staleCachingTableNames struct {
+	mu       sync.Mutex
+	live     map[string]string
+	snapshot map[string]string
+}
+
+func newStaleCachingTableNames(initial map[string]string) *staleCachingTableNames {
+	live := make(map[string]string, len(initial))
+	for k, v := range initial {
+		live[k] = v
+	}
+	snapshot := make(map[string]string, len(live))
+	for k, v := range live {
+		snapshot[k] = v
+	}
+	return &staleCachingTableNames{live: live, snapshot: snapshot}
+}
+
+// setLive changes the "real" underlying mapping, as an external actor's
+// delete-and-recreate would, without touching the cached snapshot
+// ResolveID answers from until the next Invalidate.
+func (s *staleCachingTableNames) setLive(name, id string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.live[name] = id
+}
+
+func (s *staleCachingTableNames) ResolveID(ctx context.Context, name string) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	id, ok := s.snapshot[name]
+	if !ok {
+		return "", fmt.Errorf("%w: missing fake table", tablenames.ErrTableNotFound)
+	}
+	return id, nil
+}
+
+func (s *staleCachingTableNames) ResolveName(ctx context.Context, id string) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for name, tableID := range s.snapshot {
+		if tableID == id {
+			return name, nil
+		}
+	}
+	return "", fmt.Errorf("%w: missing fake table", tablenames.ErrTableNotFound)
+}
+
+func (s *staleCachingTableNames) List(ctx context.Context) (map[string]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tables := make(map[string]string, len(s.snapshot))
+	for name, id := range s.snapshot {
+		tables[name] = id
+	}
+	return tables, nil
+}
+
+func (s *staleCachingTableNames) ListNamespace(ctx context.Context, namespace string) (map[string]string, error) {
+	return s.List(ctx)
+}
+
+func (s *staleCachingTableNames) Invalidate() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.snapshot = make(map[string]string, len(s.live))
+	for k, v := range s.live {
+		s.snapshot[k] = v
+	}
+}
+
+// TestResolveTableIDForcesFreshLookupUnlikeTableByName proves the
+// exact property internal/promotion.Promote's destination table
+// identity pin depends on: TableByName is content to return an
+// already-cached table ID with no enforced TTL, so calling it twice
+// around an external actor's delete-and-recreate of the same table
+// name observes the same stale ID both times. ResolveTableID must not
+// have that blind spot: it invalidates before every resolve, so it
+// always observes the table name's current mapping.
+func TestResolveTableIDForcesFreshLookupUnlikeTableByName(t *testing.T) {
+	names := newStaleCachingTableNames(map[string]string{"events": "1"})
+	instance, err := NewStaticInstance("accumulo", "uuid-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	credentials, err := PasswordCredentials("root", []byte("secret"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	connector, err := NewConnector(instance, credentials, ConnectorOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	namespaces := &fakeNamespaces{
+		byName: map[string]string{"": "+default"},
+		byID:   map[string]string{"+default": ""},
+	}
+	connector.discovery = newConnectorDiscovery(&fakeTabletWalker{}, namespaces, names, nil)
+	t.Cleanup(func() { _ = connector.Close() })
+
+	table, err := connector.TableByName(context.Background(), "events")
+	if err != nil || table.ID != "1" {
+		t.Fatalf("TableByName = %+v, %v, want ID %q", table, err, "1")
+	}
+
+	// Simulate an external actor deleting and recreating "events" under
+	// a new table ID without this connector being told.
+	names.setLive("events", "2")
+
+	stale, err := connector.TableByName(context.Background(), "events")
+	if err != nil || stale.ID != "1" {
+		t.Fatalf("TableByName after external change = %+v, %v, want stale cached ID %q", stale, err, "1")
+	}
+
+	fresh, err := connector.ResolveTableID(context.Background(), "events")
+	if err != nil || fresh != "2" {
+		t.Fatalf("ResolveTableID = %q, %v, want fresh ID %q", fresh, err, "2")
+	}
+
+	// A subsequent TableByName now also observes "2": ResolveTableID's
+	// invalidation is connection-wide, not a private snapshot.
+	again, err := connector.TableByName(context.Background(), "events")
+	if err != nil || again.ID != "2" {
+		t.Fatalf("TableByName after ResolveTableID = %+v, %v, want %q", again, err, "2")
+	}
+}
+
+func TestResolveTableIDMissingTableAndEmptyName(t *testing.T) {
+	connector := testConnectorWithDiscovery(t, &fakeTabletWalker{}, &fakeTableNames{
+		byName: map[string]string{},
+		byID:   map[string]string{},
+	})
+	if _, err := connector.ResolveTableID(context.Background(), "missing"); !errors.Is(err, ErrTableNotFound) {
+		t.Fatalf("ResolveTableID(missing) error = %v, want ErrTableNotFound", err)
+	}
+	if _, err := connector.ResolveTableID(context.Background(), ""); !errors.Is(err, ErrTableNotFound) {
+		t.Fatalf("ResolveTableID(\"\") error = %v, want ErrTableNotFound", err)
+	}
+}
+
 func TestDiscoveryInvalidationAndDefensiveCopies(t *testing.T) {
 	walker := &fakeTabletWalker{tablets: map[string][]metadata.TabletInfo{"1": discoveryTablets()}}
 	connector := testConnectorWithDiscovery(t, walker, &fakeTableNames{

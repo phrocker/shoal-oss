@@ -245,6 +245,77 @@ re-validates immediately before submission or an Accumulo-side
 split-then-import atomicity guarantee this package does not control; see
 [§5](#5-whats-deferred).
 
+### 3.4 Guarding against destination table identity drift
+
+A table name is not a stable handle across the same staging window §3.3
+discusses: Accumulo lets a table be deleted and a different, unrelated
+table created under the identical name, and `AddTableSplits`,
+`ListTableSplits`, and `BulkImport` each independently resolve
+`tableName` to a table ID on their own, through
+`internal/tablenames.Resolver`'s cache — which has no enforced TTL and
+is only refreshed by an explicit `Invalidate()` call. Without a check
+for this, a destination table deleted and recreated under the same name
+partway through `StageBulkDir`'s wall-clock copying could pass
+`verifyNoUnexpectedDestinationSplits` by coincidence — an empty
+replacement table has no splits to conflict with, for instance, if the
+manifest only required one — and still receive `tableName`'s bulk
+import despite being a different table than the one `Promote`
+reconciled splits against moments earlier.
+
+`accumulo.Connector.ResolveTableID` (new alongside this check) forces
+exactly that: it invalidates the discovery cache before resolving, so
+it always observes `tableName`'s real, current table ID rather than a
+cached one from before a delete-and-recreate. `Promote` calls it once,
+before `AddTableSplits`, to pin the destination's identity as
+`pinnedTableID` — but only for a multi-tablet manifest (`len(splits) >
+0`); a single-tablet or legacy manifest has no split-reconciliation step
+to pin against in the first place. It calls `ResolveTableID` again,
+through `verifyDestinationTableIdentity`, immediately before
+`BulkImport`, and fails closed if `tableName` now resolves to a
+different ID than the one it pinned — naming both the expected and the
+actual table ID in the error.
+
+This is a narrower, independent check from
+`verifyNoUnexpectedDestinationSplits`: it does not inspect splits at
+all, so it catches an identity change even in the case where the
+replacement table happens to end up with the same splits, and it
+covers the *entire* staging window end to end, not only the
+`AddTableSplits`/`ListTableSplits` round-trip §3.3 already guards. The
+two checks are complementary, not redundant: one confirms the
+destination's *shape*, the other confirms it is still the same
+*table*.
+
+**What this trusts, and cannot verify for itself:** the check relies on
+one guarantee only Accumulo's manager can actually provide — that a
+table ID, once assigned, is never reused for a different table. Real
+table IDs are assigned from a ZooKeeper sequential counter as a side
+effect of a real `CreateTable`/`DeleteTable` FATE operation (verified
+against `accumulo/table_admin.go`, not assumed), never fabricated
+client-side, so an ID mismatch observed here can only mean the table
+actually changed identity — never a false positive from ID reuse. But
+that is the manager's guarantee, not something `ResolveTableID` proves
+on its own; this package has no way to independently audit it.
+
+**Residual race, stated plainly (same shape as §3.3's):** pinning
+narrows, but cannot close, the very last sliver of the window: a
+delete-and-recreate landing strictly between this final
+`ResolveTableID` call and `BulkImport`'s own separate internal
+resolution remains possible in principle. Closing that sliver fully
+would need the same promotion-state or idempotency-token API
+[§5](#5-whats-deferred) already identifies as missing for the
+`BulkImport` step itself — a single check immediately beforehand cannot
+be made atomic with the FATE submission that follows it using only the
+`Promoter` interface this slice has today.
+
+**Deliberately out of scope:** single-tablet ("safe single-tablet
+staging") promotion is not covered by this check at all, even though
+the same wall-clock staging window exists for it too — it has no
+`AddTableSplits` reconciliation step, and so nothing to pin a table ID
+across. That gap predates this slice and is not silently ignored; it is
+named here as a known, deliberately out-of-scope boundary rather than
+folded into a multi-tablet-specific fix this late in this PR's review
+cycle.
+
 ## 4. What's implemented
 
 ```
@@ -252,6 +323,9 @@ promotion.Promote(src, manifest, dst, bulkDir, conn, tableName, opts)
                                           │
                                           ▼
               validatePromotionDestination(dst, tableName, bulkDir)
+                (tableName/bulkDir shape, plus a writability preflight --
+                 dst must implement storage.WritableBackend before
+                 anything below can mutate it -- see §4's Promote bullet)
                                           │
                                           ▼
                             promotion.BuildLoadMapping
@@ -269,6 +343,12 @@ promotion.Promote(src, manifest, dst, bulkDir, conn, tableName, opts)
                                           ▼
                      promotion.RequiredDestinationSplits
                        (nil unless manifest is multi-tablet)
+                                          │
+                                          ▼
+                  accumulo.Connector.ResolveTableID(tableName)
+                     pins pinnedTableID              [only if splits != nil]
+                (forces a fresh, uncached resolve of the destination's
+                 table ID -- see §3.4)
                                           │
                                           ▼
                      accumulo.Connector.AddTableSplits(tableName, splits)
@@ -295,9 +375,15 @@ promotion.Promote(src, manifest, dst, bulkDir, conn, tableName, opts)
                                           │
                                           ▼
           mapping empty (nothing to import)? return here --
-                  BulkImport is never called
+          BulkImport and the identity re-check below are never called
                                           │
                                           ▼ mapping non-empty
+                  accumulo.Connector.ResolveTableID(tableName) again
+                     via verifyDestinationTableIdentity [only if pinnedTableID != ""]
+                (fails closed if tableName no longer resolves to
+                 pinnedTableID -- see §3.4)
+                                          │
+                                          ▼
                         accumulo.Connector.BulkImport(tableName, bulkDir)
                                           │
                                           ▼
@@ -553,7 +639,9 @@ destination splits itself, or the eventual `BulkImport` fails closed (see
   `RequiredDestinationSplits`, conditionally submits `AddTableSplits` for
   a multi-tablet manifest, then calls `StageBulkDir`, then submits the
   bulk import through a `Promoter` (satisfied by `*accumulo.Connector`).
-  Validates `tableName`/`bulkDir`/the tablet chain (via a
+  Validates `tableName`/`bulkDir`, that `dst` implements
+  `storage.WritableBackend` (via `validatePromotionDestination`'s
+  `validateDestinationWritable` check), the tablet chain (via a
   `RequiredDestinationSplits` preflight), every RFile's own reference
   into that chain (via a `BuildLoadMapping` preflight), and everything
   `StageBulkDir` itself would reject before writing a single byte (via a
@@ -562,8 +650,9 @@ destination splits itself, or the eventual `BulkImport` fails closed (see
   `engine.VerifyRFileExport` content check — every RFile's declared
   size/SHA256 against its actual source bytes) — all before any
   Accumulo call or destination write — so a malformed manifest, a
-  corrupt or mismatched export, or an invalid destination never adds a
-  split, stages a file, or submits a bulk import. The dedup/flatten/alias
+  corrupt or mismatched export, a read-only destination, or an invalid
+  bulk directory never adds a split, stages a file, or submits a bulk
+  import. The dedup/flatten/alias
   checks inside `stagingPreflight` are redundant with validation
   `StageBulkDir` performs again further on, and cheaply so: each is a
   pure or local-probe-only function of the manifest and the backends
@@ -592,6 +681,19 @@ destination splits itself, or the eventual `BulkImport` fails closed (see
   a multi-tablet chain, even when every tablet in it ends up empty, so
   the destination's tablet boundaries don't depend on which tablets
   happened to carry files.
+
+  For a multi-tablet manifest, also pins the destination's real table
+  ID via `conn.ResolveTableID` before `AddTableSplits`, and re-checks it
+  via `verifyDestinationTableIdentity` immediately before `BulkImport`
+  — see §3.4 for the full mechanism, its trust assumption, and its
+  residual race. Neither call happens for a single-tablet/legacy
+  manifest, which has no split-reconciliation step to pin against.
+- `accumulo.Connector.ResolveTableID` — invalidates the discovery cache
+  and re-resolves `tableName` to its current table ID, unlike
+  `AddTableSplits`/`ListTableSplits`/`BulkImport` below, each of which
+  may resolve `tableName` from a cache with no enforced TTL. New in this
+  slice specifically so `Promote` can pin and re-check the destination's
+  identity across the staging window — see §3.4.
 - `accumulo.Connector.AddTableSplits` — resolves the destination table
   name to its stable ID, then submits the split rows through the manager
   `TABLE_SPLIT` FATE operation, the same protocol
@@ -619,6 +721,15 @@ Mapped against #70's five acceptance criteria:
    succeeding and `BulkImport`'s own server-side validation running is
    not fully closed by this slice, only turned into a clean, safe
    FATE-level rejection instead of a silent correctness problem.
+   A related but independent gap — the destination table being deleted
+   and recreated under the same name during that same window — is
+   narrowed by §3.4's identity pinning, which fails closed on a
+   resolvable identity change but, by the same reasoning, cannot close
+   the very last sliver of that race either (a delete-and-recreate
+   landing strictly between its own final check and `BulkImport`'s
+   internal resolution), and does not cover single-tablet/legacy
+   manifests at all, which have no split-reconciliation step to pin
+   against in the first place.
 2. **"rerunning any interrupted transfer is safe"** — true up through
    staging, not true across the whole `Promote` call once `BulkImport` has
    been invoked. `StageBulkDir` is deterministic and copy-based, so
@@ -865,6 +976,50 @@ existing single-tablet suite:
   intact): only this test fails, confirming it isolates the specific
   window the new check closes rather than incidentally passing for an
   unrelated reason.
+- **Destination writability preflight** —
+  `TestStageBulkDirRejectsReadOnlyDestinationBeforeAnyRead` proves
+  `validateDestinationWritable` runs before any read: it wraps a
+  writable in-memory backend in a `readOnlyBackend` (implementing only
+  `Open`, mirroring `internal/storage/storage_test.go`'s own same-named
+  type — test doubles aren't shared cross-package) and points the
+  manifest at nonexistent `src` files, so observing `storage.ErrReadOnly`
+  — rather than a "not found" error from the first RFile lookup — proves
+  the writability check runs first.
+  `TestPromoteRejectsReadOnlyDestinationBeforeAddTableSplits` proves the
+  same ordering one level up, through `Promote` itself, for a
+  multi-tablet manifest: it asserts `splitCalls == 0` and
+  `resolveTableIDCalls == 0`, so a regression that let `AddTableSplits`
+  or the identity pin run against a read-only destination before the
+  writability check would fail it even if `Promote` still ultimately
+  returned an error.
+- **Destination table identity drift (§3.4)** —
+  `TestResolveTableIDForcesFreshLookupUnlikeTableByName`
+  (`accumulo/discovery_test.go`) proves `ResolveTableID` actually forces
+  a fresh lookup where `TableByName` would not: it introduces a new
+  `staleCachingTableNames` fake with a genuine snapshot/live-map split,
+  only synced on `Invalidate()` — unlike the package's existing
+  `fakeTableNames`, which proxies its map live on every call and so has
+  no caching to be stale in the first place, and could not have caught a
+  regression here. It mutates the live map without invalidating and
+  asserts `TableByName` still returns the stale ID while `ResolveTableID`
+  observes the change; `TestResolveTableIDMissingTableAndEmptyName`
+  covers the same not-found/empty-name error mapping `TableByName`
+  already has.
+  `TestPromoteRejectsWhenDestinationTableChangesIdentityDuringStaging`
+  proves `verifyDestinationTableIdentity`'s regression case end to end:
+  a fake `Promoter`'s `onResolveTableID` hook changes the destination's
+  reported table ID on its second call (simulating a delete-and-recreate
+  that happened during `StageBulkDir`'s staging), and the test asserts
+  the resulting error names both the pinned and the current table ID,
+  `resolveTableIDCalls == 2` (one pin before `AddTableSplits`, one
+  re-check before `BulkImport`), that `BulkImport` was never called, and
+  that the files `StageBulkDir` already staged are left in place
+  (consistent with the non-atomic, no-rollback staging behavior the
+  cancellation bullet above documents).
+  `TestPromoteAbortsBeforeAddTableSplitsWhenResolveTableIDFails` proves
+  the simpler propagation case: a `ResolveTableID` failure aborts before
+  `AddTableSplits` ever runs rather than being swallowed or retried
+  silently.
 
 No test in this slice submits a real FATE operation or talks to a live
 Accumulo manager; `AddTableSplits`/`BulkImport` are exercised only through

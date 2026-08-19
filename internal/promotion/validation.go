@@ -15,7 +15,10 @@ func validatePromotionDestination(dst storage.Backend, tableName, bulkDir string
 	if err := validateTableName(tableName); err != nil {
 		return err
 	}
-	return validateBulkDirOnBackend(dst, bulkDir)
+	if err := validateBulkDirOnBackend(dst, bulkDir); err != nil {
+		return err
+	}
+	return validateDestinationWritable(dst)
 }
 
 func validateTableName(tableName string) error {
@@ -43,6 +46,31 @@ func validateBulkDirOnBackend(dst storage.Backend, bulkDir string) error {
 	}
 	if isBackendRootOnBackend(dst, trimmed) {
 		return fmt.Errorf("%w: backend root %q", accumulo.ErrInvalidBulkDir, bulkDir)
+	}
+	return nil
+}
+
+// validateDestinationWritable confirms dst implements
+// storage.WritableBackend before any Accumulo-facing step runs. dst may
+// be nil (validateBulkDir's own nil-dst call path), in which case there
+// is nothing to check and this returns nil.
+//
+// Without this, a multi-tablet manifest against a read-only dst would
+// let Promote's conn.AddTableSplits mutate the real destination
+// table's splits before the first storage.Copy call inside
+// StageBulkDir ever discovers storage.ErrReadOnly -- an Accumulo-facing
+// mutation this package otherwise takes care never to make before
+// every check that can be made without one has already passed (see
+// Promote's own doc comment). StageBulkDir also calls this directly, so
+// a caller invoking it without going through Promote gets the same
+// early, clear failure instead of one buried inside its first
+// storage.Copy call.
+func validateDestinationWritable(dst storage.Backend) error {
+	if dst == nil {
+		return nil
+	}
+	if _, ok := dst.(storage.WritableBackend); !ok {
+		return fmt.Errorf("%w: destination backend cannot be written to", storage.ErrReadOnly)
 	}
 	return nil
 }

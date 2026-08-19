@@ -30,6 +30,15 @@ type Promoter interface {
 	// range BuildLoadMapping's widened mapping depends on — see
 	// verifyNoUnexpectedDestinationSplits.
 	ListTableSplits(ctx context.Context, tableName string) ([][]byte, error)
+	// ResolveTableID forces a fresh resolution of tableName's current
+	// table ID, invalidating any cached mapping this connection already
+	// holds before resolving (*accumulo.Connector.ResolveTableID) --
+	// unlike AddTableSplits, ListTableSplits, and BulkImport, each of
+	// which may independently resolve tableName from a cache with no
+	// enforced TTL. Promote uses it to pin the destination table's real
+	// identity across the wall-clock time StageBulkDir's copying takes;
+	// see verifyDestinationTableIdentity.
+	ResolveTableID(ctx context.Context, tableName string) (string, error)
 	// BulkImport submits bulkDir as a Bulk Import V2 (TABLE_BULK_IMPORT2)
 	// FATE operation against tableName.
 	BulkImport(ctx context.Context, tableName, bulkDir string, opts accumulo.BulkImportOptions) error
@@ -106,6 +115,30 @@ type Options struct {
 // corrupt data, so this residual race is a safe-failure gap, not a
 // correctness one — see docs/promotion.md §5.
 //
+// A table name is not a stable handle across that same window: Accumulo
+// lets a table be deleted and a differently-scoped table created under
+// the identical name, and AddTableSplits, ListTableSplits, and
+// BulkImport each independently resolve tableName to a table ID on
+// their own, through a cache with no enforced TTL (see
+// internal/tablenames.Resolver). To guard against that, whenever splits
+// are reconciled Promote pins the destination's real table ID via
+// conn.ResolveTableID once before AddTableSplits, and checks it again,
+// via verifyDestinationTableIdentity, immediately before BulkImport --
+// failing closed if tableName now resolves to a different table than
+// the one splits were just reconciled against. This is a narrower,
+// independent check from verifyNoUnexpectedDestinationSplits above: it
+// catches an identity change even when the replacement table happens to
+// end up with the same splits, and it covers the entire staging window,
+// not just the AddTableSplits/ListTableSplits round-trip. See
+// verifyDestinationTableIdentity's own doc comment for exactly what it
+// can and cannot prove. A single-tablet (or legacy) manifest -- the
+// "safe single-tablet staging" case this package already handled before
+// destination split reconciliation existed -- has no reconciliation
+// step to pin against and is deliberately left out of this check's
+// scope: closing that pre-existing gap is unrelated to the multi-tablet
+// slice this check exists for, and is tracked separately rather than
+// folded in here.
+//
 // An empty load mapping (manifest.RFiles has nothing to import) stages an
 // empty bulk directory but skips the BulkImport FATE call entirely:
 // submitting a zero-file bulk import is a needless round trip to the
@@ -168,8 +201,9 @@ type Options struct {
 //
 // Promote does not itself retry on failure, and retry safety differs by
 // which step failed. A failure in validation, AddTableSplits, or
-// verifyNoUnexpectedDestinationSplits, or StageBulkDir (before
-// BulkImport is ever called) is always safe to retry: split
+// verifyNoUnexpectedDestinationSplits, verifyDestinationTableIdentity,
+// or StageBulkDir (before BulkImport is ever called) is always safe to
+// retry: split
 // reconciliation is idempotent (AddTableSplits treats a row that
 // already is a tablet's end row as already satisfied, refreshing only
 // its mergeability metadata), the split-verification check is a
@@ -205,7 +239,12 @@ func Promote(
 	if err != nil {
 		return nil, err
 	}
+	var pinnedTableID string
 	if len(splits) > 0 {
+		pinnedTableID, err = conn.ResolveTableID(ctx, tableName)
+		if err != nil {
+			return nil, err
+		}
 		if err := conn.AddTableSplits(ctx, tableName, splits); err != nil {
 			return nil, err
 		}
@@ -223,6 +262,11 @@ func Promote(
 	}
 	if len(mapping) == 0 {
 		return mapping, nil
+	}
+	if pinnedTableID != "" {
+		if err := verifyDestinationTableIdentity(ctx, conn, tableName, pinnedTableID); err != nil {
+			return nil, err
+		}
 	}
 	if err := conn.BulkImport(ctx, tableName, bulkDir, accumulo.BulkImportOptions{SetTime: opts.SetTime}); err != nil {
 		return nil, err
@@ -286,6 +330,62 @@ func verifyNoUnexpectedDestinationSplits(ctx context.Context, conn Promoter, tab
 			"resolve the destination's splits and retry",
 		tableName, formatSplitRow(lastRequired), formatSplitRows(inRange), formatSplitRows(required),
 	)
+}
+
+// verifyDestinationTableIdentity confirms that tableName still resolves
+// to the same table incarnation as when Promote captured pinnedTableID,
+// immediately before conn.BulkImport submits the staged bulk directory
+// against it.
+//
+// This exists because tableName is a mutable label, not a stable
+// handle: Accumulo lets a table be deleted and a new, unrelated table
+// created under the identical name, and each of AddTableSplits,
+// ListTableSplits, and BulkImport independently resolves tableName to
+// a table ID on its own, through a cache with no enforced TTL (see
+// internal/tablenames.Resolver) that is only refreshed by an explicit
+// invalidation. Without this check, a destination table deleted and
+// recreated under the same name partway through StageBulkDir's
+// wall-clock copying could pass verifyNoUnexpectedDestinationSplits by
+// coincidence -- an empty replacement table has no splits to conflict
+// with a single-required-split manifest, for instance -- and still
+// receive tableName's bulk import despite being a different table than
+// the one Promote reconciled splits against.
+//
+// conn.ResolveTableID forces a fresh resolve, invalidating any cached
+// mapping first, so this check observes a delete-and-recreate that
+// happened at any point since Promote's own first ResolveTableID call
+// -- including one that raced entirely inside the AddTableSplits/
+// ListTableSplits round-trip, a window verifyNoUnexpectedDestinationSplits
+// alone cannot fully cover on its own. It still trusts one guarantee
+// this client cannot independently verify: that Accumulo's manager
+// never reuses a table ID for a different table (accumulo's
+// CreateTable/DeleteTable submit real FATE operations and never
+// fabricate IDs client-side; real table IDs are assigned from a
+// ZooKeeper sequential counter). Given that server-side guarantee, an
+// ID mismatch here can only mean the table changed identity, never a
+// false positive from ID reuse -- but it is the manager's guarantee,
+// not something this check proves for itself.
+//
+// This still cannot close the very last sliver of the race: a
+// delete-and-recreate landing strictly between this call's own resolve
+// and BulkImport's separate internal resolution remains possible in
+// principle, exactly as verifyNoUnexpectedDestinationSplits's own doc
+// comment already acknowledges for its narrower window. This check
+// narrows that exposure to the same irreducible size; it does not
+// claim to eliminate it.
+func verifyDestinationTableIdentity(ctx context.Context, conn Promoter, tableName, pinnedTableID string) error {
+	currentID, err := conn.ResolveTableID(ctx, tableName)
+	if err != nil {
+		return fmt.Errorf("promotion: re-resolve destination table %q before bulk import: %w", tableName, err)
+	}
+	if currentID != pinnedTableID {
+		return fmt.Errorf(
+			"promotion: destination table %q changed identity during staging (was table ID %q, is now %q); "+
+				"another actor likely deleted and recreated it — resolve the destination and retry",
+			tableName, pinnedTableID, currentID,
+		)
+	}
+	return nil
 }
 
 // formatSplitRow renders a single split row for an error message: a

@@ -11,6 +11,7 @@ import (
 
 	"github.com/phrocker/shoal/accumulo"
 	"github.com/phrocker/shoal/internal/engine"
+	"github.com/phrocker/shoal/internal/storage"
 	"github.com/phrocker/shoal/internal/storage/local"
 	"github.com/phrocker/shoal/internal/storage/memory"
 )
@@ -36,6 +37,24 @@ type fakePromoter struct {
 	listSplitsSet      bool
 	listSplitsErr      error
 
+	// tableID is the table ID ResolveTableID returns; defaults to a
+	// fixed sentinel when empty, so existing tests that never set it
+	// see one stable identity across every call, exactly as a real,
+	// unchanged destination table would.
+	tableID             string
+	resolveTableIDCalls int
+	resolveTableIDTable string
+	resolveTableIDErr   error
+	// onResolveTableID, when set, runs as a side effect of
+	// ResolveTableID after it has already captured this call's return
+	// value but before returning it, receiving the 1-based call number.
+	// A hook that mutates tableID here therefore only changes what a
+	// later call returns, not this one -- used to simulate an external
+	// actor deleting and recreating the destination table under the
+	// same name in between Promote's pre-AddTableSplits and
+	// pre-BulkImport identity checks.
+	onResolveTableID func(callNum int)
+
 	// onAddTableSplits, when set, runs as a side effect of
 	// AddTableSplits before it returns. Used to simulate an external
 	// actor mutating src while a real AddTableSplits round-trip to the
@@ -43,6 +62,26 @@ type fakePromoter struct {
 	// re-verification (not just stagingPreflight's, which already ran
 	// before this call) catches a source that changed in between.
 	onAddTableSplits func()
+}
+
+// ResolveTableID defaults to "stable-table-id" when tableID is unset,
+// so tests that never set either field see one consistent identity
+// across every call -- matching a real, unchanged destination table.
+func (f *fakePromoter) ResolveTableID(_ context.Context, tableName string) (string, error) {
+	f.resolveTableIDCalls++
+	f.resolveTableIDTable = tableName
+	id := f.tableID
+	if id == "" {
+		id = "stable-table-id"
+	}
+	callNum := f.resolveTableIDCalls
+	if f.onResolveTableID != nil {
+		f.onResolveTableID(callNum)
+	}
+	if f.resolveTableIDErr != nil {
+		return "", f.resolveTableIDErr
+	}
+	return id, nil
 }
 
 func (f *fakePromoter) AddTableSplits(_ context.Context, tableName string, splits [][]byte) error {
@@ -766,6 +805,132 @@ func TestPromoteRejectsExtraDestinationSplitBeforeLastRequiredRow(t *testing.T) 
 	}
 	if got := dst.Keys(); len(got) != 0 {
 		t.Fatalf("dst.Keys() = %v, want no staged files when the extra-split check fails before staging", got)
+	}
+}
+
+// TestPromoteRejectsWhenDestinationTableChangesIdentityDuringStaging is
+// the regression test for round 10's table-identity finding: tableName
+// resolves to a different real table by the time Promote is about to
+// call BulkImport than it did when Promote pinned it before
+// AddTableSplits, simulating an external actor deleting and recreating
+// the destination under the same name while StageBulkDir's copying was
+// in flight. Promote must fail closed and never submit the bulk import
+// against what is now a different table than the one splits were
+// reconciled against.
+func TestPromoteRejectsWhenDestinationTableChangesIdentityDuringStaging(t *testing.T) {
+	src := memory.New()
+	src.Put("events/t-0000/F0001.rf", []byte("a"))
+	src.Put("events/t-0001/F0002.rf", []byte("b"))
+	manifest := twoTabletManifest()
+	manifest.RFiles[0].DestinationPath = "events/t-0000/F0001.rf"
+	manifest.RFiles[0].Size = 1
+	manifest.RFiles[0].SHA256 = "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb"
+	manifest.RFiles[1].DestinationPath = "events/t-0001/F0002.rf"
+	manifest.RFiles[1].Size = 1
+	manifest.RFiles[1].SHA256 = "3e23e8160039594a33894f6564e1b1348bbd7a0088d42c4acb73eeaed59c009d"
+
+	dst := memory.New()
+	importer := &fakePromoter{tableID: "original-id"}
+	importer.onResolveTableID = func(callNum int) {
+		if callNum == 1 {
+			// Runs as a side effect of the first ResolveTableID call
+			// (Promote's pre-AddTableSplits pin); only the *second*
+			// call, immediately before BulkImport, observes this.
+			importer.tableID = "recreated-id"
+		}
+	}
+	_, err := Promote(context.Background(), src, manifest, dst, "hdfs://nn/bulk/events-1", importer, "events", Options{})
+	if err == nil {
+		t.Fatal("Promote with destination table identity changed during staging = nil error, want error")
+	}
+	if !strings.Contains(err.Error(), "original-id") || !strings.Contains(err.Error(), "recreated-id") {
+		t.Fatalf("error %q does not name both the pinned and current table IDs", err.Error())
+	}
+	if importer.resolveTableIDCalls != 2 {
+		t.Fatalf("ResolveTableID calls = %d, want 2 (pre-AddTableSplits pin + pre-BulkImport check)", importer.resolveTableIDCalls)
+	}
+	if importer.calls != 0 {
+		t.Fatalf("BulkImport calls = %d, want 0 (identity check must fail closed before submission)", importer.calls)
+	}
+	// Staging itself must have already succeeded: the mismatch is only
+	// detected after StageBulkDir completes, so the staged files remain
+	// on dst even though the promotion as a whole failed.
+	for _, name := range []string{"F0001.rf", "F0002.rf"} {
+		if _, err := dst.Open(context.Background(), "hdfs://nn/bulk/events-1/"+name); err != nil {
+			t.Fatalf("expected staged file %s despite the later identity-check failure: %v", name, err)
+		}
+	}
+}
+
+// TestPromoteAbortsBeforeAddTableSplitsWhenResolveTableIDFails proves
+// the pre-AddTableSplits identity pin itself fails closed: if Promote
+// cannot even resolve the destination table's current ID, it must not
+// go on to reconcile splits against a table it never confirmed still
+// exists as expected.
+func TestPromoteAbortsBeforeAddTableSplitsWhenResolveTableIDFails(t *testing.T) {
+	src := memory.New()
+	src.Put("events/t-0000/F0001.rf", []byte("a"))
+	src.Put("events/t-0001/F0002.rf", []byte("b"))
+	manifest := twoTabletManifest()
+	manifest.RFiles[0].DestinationPath = "events/t-0000/F0001.rf"
+	manifest.RFiles[0].Size = 1
+	manifest.RFiles[0].SHA256 = "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb"
+	manifest.RFiles[1].DestinationPath = "events/t-0001/F0002.rf"
+	manifest.RFiles[1].Size = 1
+	manifest.RFiles[1].SHA256 = "3e23e8160039594a33894f6564e1b1348bbd7a0088d42c4acb73eeaed59c009d"
+
+	dst := memory.New()
+	importer := &fakePromoter{resolveTableIDErr: accumulo.ErrTableOffline}
+	_, err := Promote(context.Background(), src, manifest, dst, "/bulk/events-1", importer, "events", Options{})
+	if !errors.Is(err, accumulo.ErrTableOffline) {
+		t.Fatalf("Promote error = %v, want %v", err, accumulo.ErrTableOffline)
+	}
+	if importer.resolveTableIDCalls != 1 {
+		t.Fatalf("ResolveTableID calls = %d, want 1", importer.resolveTableIDCalls)
+	}
+	if importer.splitCalls != 0 {
+		t.Fatalf("AddTableSplits calls = %d, want 0 (ResolveTableID failure must abort before reconciliation)", importer.splitCalls)
+	}
+	if importer.calls != 0 {
+		t.Fatalf("BulkImport calls = %d, want 0", importer.calls)
+	}
+	if got := dst.Keys(); len(got) != 0 {
+		t.Fatalf("dst.Keys() = %v, want no staged files when ResolveTableID fails before AddTableSplits", got)
+	}
+}
+
+// TestPromoteRejectsReadOnlyDestinationBeforeAddTableSplits is the
+// regression test for round 10's writability finding: a multi-tablet
+// manifest against a read-only dst must be rejected by
+// validatePromotionDestination before AddTableSplits ever mutates the
+// real destination table's splits, not left to fail later, deep inside
+// StageBulkDir's first storage.Copy call.
+func TestPromoteRejectsReadOnlyDestinationBeforeAddTableSplits(t *testing.T) {
+	src := memory.New()
+	src.Put("events/t-0000/F0001.rf", []byte("a"))
+	src.Put("events/t-0001/F0002.rf", []byte("b"))
+	manifest := twoTabletManifest()
+	manifest.RFiles[0].DestinationPath = "events/t-0000/F0001.rf"
+	manifest.RFiles[0].Size = 1
+	manifest.RFiles[0].SHA256 = "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb"
+	manifest.RFiles[1].DestinationPath = "events/t-0001/F0002.rf"
+	manifest.RFiles[1].Size = 1
+	manifest.RFiles[1].SHA256 = "3e23e8160039594a33894f6564e1b1348bbd7a0088d42c4acb73eeaed59c009d"
+
+	dst := readOnlyBackend{inner: memory.New()}
+	importer := &fakePromoter{}
+	_, err := Promote(context.Background(), src, manifest, dst, "/bulk/events-1", importer, "events", Options{})
+	if !errors.Is(err, storage.ErrReadOnly) {
+		t.Fatalf("Promote error = %v, want %v", err, storage.ErrReadOnly)
+	}
+	if importer.splitCalls != 0 {
+		t.Fatalf("AddTableSplits calls = %d, want 0 (read-only destination must be rejected before reconciliation)", importer.splitCalls)
+	}
+	if importer.resolveTableIDCalls != 0 {
+		t.Fatalf("ResolveTableID calls = %d, want 0 (destination validation runs first)", importer.resolveTableIDCalls)
+	}
+	if importer.calls != 0 {
+		t.Fatalf("BulkImport calls = %d, want 0", importer.calls)
 	}
 }
 

@@ -34,6 +34,41 @@ func (b schemeAwareBackend) BackendPathSchemes() []string {
 	return b.schemes
 }
 
+// readOnlyBackend wraps a storage.Backend but implements only Open,
+// deliberately not Create, so it satisfies storage.Backend but fails a
+// storage.WritableBackend type-assertion -- mirroring
+// internal/storage/storage_test.go's own type of the same name (kept
+// separate here since test doubles are unexported and this package
+// cannot import that one's).
+type readOnlyBackend struct{ inner shstorage.Backend }
+
+func (r readOnlyBackend) Open(ctx context.Context, path string) (shstorage.File, error) {
+	return r.inner.Open(ctx, path)
+}
+
+// TestStageBulkDirRejectsReadOnlyDestinationBeforeAnyRead proves
+// validateDestinationWritable runs before StageBulkDir ever opens a
+// single source file: the manifest here references src paths that do
+// not exist at all, so if the writability check ran after (or was
+// skipped and the read-only failure only surfaced later, inside
+// storage.Copy) this test would instead observe a "source not found"
+// style error from engine.VerifyRFileExport, not shstorage.ErrReadOnly.
+func TestStageBulkDirRejectsReadOnlyDestinationBeforeAnyRead(t *testing.T) {
+	src := memory.New() // deliberately empty: no RFile referenced below exists.
+	manifest := &engine.RFileExportManifest{
+		Version:     engine.RFileExportManifestVersion,
+		SourceTable: "events",
+		Tablets:     []engine.RFileExportTablet{{Index: 0}},
+		RFiles: []engine.RFileExportFile{
+			{TabletIndex: 0, DestinationPath: "export/events/t-0000/F0001.rf", Size: 4, SHA256: "3a6eb0790f39ac87c94f3856b2dd2c5d110e6811602261a9a923d3bb23adc8b7"},
+		},
+	}
+	dst := readOnlyBackend{inner: memory.New()}
+	if _, err := StageBulkDir(context.Background(), src, manifest, dst, "hdfs://nn/bulk/events-1"); !errors.Is(err, shstorage.ErrReadOnly) {
+		t.Fatalf("StageBulkDir with a read-only destination = %v, want %v", err, shstorage.ErrReadOnly)
+	}
+}
+
 func TestStageBulkDirFlattensCopiesAndWritesLoadMapping(t *testing.T) {
 	src := memory.New()
 	src.Put("export/events/t-0000/F0001.rf", []byte("tablet0-file1"))

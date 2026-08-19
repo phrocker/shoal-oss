@@ -55,7 +55,10 @@ var (
 //
 // bulkDir itself is preflight-validated before any read or write: empty,
 // whitespace-padded, or backend-root destinations fail before staging can
-// mutate dst. BuildLoadMapping likewise rejects any manifest whose
+// mutate dst, and dst itself must implement storage.WritableBackend (see
+// validateDestinationWritable) or StageBulkDir fails before its first
+// storage.Copy call, rather than deep inside it. BuildLoadMapping likewise
+// rejects any manifest whose
 // declared tablet chain is malformed (gaps, overlaps, duplicate or
 // out-of-range indexes, missing or misplaced boundaries) before staging
 // starts.
@@ -156,6 +159,9 @@ func StageBulkDir(
 		return nil, fmt.Errorf("promotion: nil export manifest")
 	}
 	if err := validateBulkDirOnBackend(dst, bulkDir); err != nil {
+		return nil, err
+	}
+	if err := validateDestinationWritable(dst); err != nil {
 		return nil, err
 	}
 	if _, _, err := resolveManifestTablets(manifest); err != nil {
