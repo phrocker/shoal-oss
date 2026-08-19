@@ -102,6 +102,7 @@ func TestLocalPathsLexicallyAliasWindowsDOS83ShortNameAmbiguity(t *testing.T) {
 		want bool
 	}{
 		{name: "long name aliases literal dos short name", src: `C:\bulk\LongFilename.rf`, dst: `C:\bulk\LONGFI~1.RF`, want: true},
+		{name: "long name with legal windows punctuation aliases literal dos short name", src: `C:\bulk\Long$Filename.rf`, dst: `C:\bulk\LONG$F~1.RF`, want: true},
 		{name: "different ordinal still rejected conservatively", src: `C:\bulk\LongFilename.rf`, dst: `C:\bulk\LONGFI~9.RF`, want: true},
 		{name: "8dot3-compatible long name does not gain a dos alias family", src: `C:\bulk\PLAIN.RF`, dst: `C:\bulk\PLAIN~1.RF`, want: false},
 		{name: "different short-name prefix is distinct", src: `C:\bulk\LongFilename.rf`, dst: `C:\bulk\LONGFJ~1.RF`, want: false},

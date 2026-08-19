@@ -716,6 +716,7 @@ func TestParseDOS83LiteralComponent(t *testing.T) {
 		wantOK     bool
 	}{
 		{name: "literal short name with an extension", raw: "LONGFI~1.RF", wantPrefix: "longfi", wantExt: "rf", wantOK: true},
+		{name: "literal short name with legal windows punctuation", raw: "LONG$F~1.RF", wantPrefix: "long$f", wantExt: "rf", wantOK: true},
 		{name: "literal short name without an extension", raw: "LONGFI~1", wantPrefix: "longfi", wantExt: "", wantOK: true},
 		{name: "a plain long name has no tilde and never parses", raw: "Plain.rf", wantOK: false},
 		{name: "a leading-zero ordinal is not a valid NTFS short name", raw: "LONGFI~01.RF", wantOK: false},
@@ -741,7 +742,8 @@ func TestDOS83AliasFamilyComponent(t *testing.T) {
 		wantOK     bool
 	}{
 		{name: "long name derives the six-character alias prefix NTFS would generate", raw: "LongFilename.rf", wantPrefix: "longfi", wantExt: "rf", wantOK: true},
-		{name: "illegal characters are stripped before truncating the prefix", raw: "My File (v2).rf", wantPrefix: "myfile", wantExt: "rf", wantOK: true},
+		{name: "windows-valid short-name punctuation is preserved in the alias family", raw: "Long$Filename.rf", wantPrefix: "long$f", wantExt: "rf", wantOK: true},
+		{name: "characters outside the conservative 8dot3 set are stripped before truncating the prefix", raw: "My File [v2].rf", wantPrefix: "myfile", wantExt: "rf", wantOK: true},
 		{
 			// NTFS never generates a distinct short name for a
 			// component that already fits 8.3 using only the
@@ -772,6 +774,27 @@ func TestDOS83AliasFamilyComponent(t *testing.T) {
 			if ok != tt.wantOK || (ok && (prefix != tt.wantPrefix || ext != tt.wantExt)) {
 				t.Fatalf("dos83AliasFamilyComponent(%q) = (%q, %q, %v), want (%q, %q, %v)",
 					tt.raw, prefix, ext, ok, tt.wantPrefix, tt.wantExt, tt.wantOK)
+			}
+		})
+	}
+}
+
+func TestDOS83HelpersSupportNamedWindowsPunctuation(t *testing.T) {
+	for _, punct := range []string{"$", "%", "'", "-", "@"} {
+		t.Run("literal-"+punct, func(t *testing.T) {
+			raw := "LONG" + punct + "F~1.RF"
+			want := "long" + punct + "f"
+			prefix, ext, ok := parseDOS83LiteralComponent(normalizeLocalPublicationComponent(raw))
+			if !ok || prefix != want || ext != "rf" {
+				t.Fatalf("parseDOS83LiteralComponent(%q) = (%q, %q, %v), want (%q, %q, true)", raw, prefix, ext, ok, want, "rf")
+			}
+		})
+		t.Run("family-"+punct, func(t *testing.T) {
+			raw := "Long" + punct + "Filename.rf"
+			want := "long" + punct + "f"
+			prefix, ext, ok := dos83AliasFamilyComponent(normalizeLocalPublicationComponent(raw))
+			if !ok || prefix != want || ext != "rf" {
+				t.Fatalf("dos83AliasFamilyComponent(%q) = (%q, %q, %v), want (%q, %q, true)", raw, prefix, ext, ok, want, "rf")
 			}
 		})
 	}

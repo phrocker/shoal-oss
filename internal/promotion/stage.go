@@ -183,7 +183,7 @@ func checkNoStagingAliases(src, dst storage.Backend, flatNames map[string]string
 	cache := newPathIdentityCache(len(srcPaths) + len(targets))
 	for i := range srcPaths {
 		for j := i + 1; j < len(srcPaths); j++ {
-			if pathsAlias(srcPaths[i], srcPaths[j], cache) {
+			if sourceRefsAlias(srcPaths[i], srcPaths[j], cache) {
 				return fmt.Errorf(
 					"promotion: stage: manifest sources %s and %s resolve to the same physical file; refusing to stage duplicate copies",
 					srcPaths[i].path, srcPaths[j].path,

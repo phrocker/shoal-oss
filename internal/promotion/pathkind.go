@@ -15,6 +15,16 @@ import (
 var windowsDrivePathRe = regexp.MustCompile(`^[A-Za-z]:(?:[\\/].*)?$`)
 var publicationCaseFold = cases.Fold()
 
+// Win32 short names permit a wider ASCII punctuation set than the original
+// [A-Za-z0-9_] matcher used here. Accepting this conservative superset avoids
+// false negatives for literal short-name spellings such as LONG$F~1.RF. "~" is
+// intentionally excluded from the body-character set below because this matcher
+// reserves it for the generated-short-name ordinal separator; components
+// containing "~" are conservatively still treated as alias-family candidates by
+// parseDOS83LiteralComponent / dos83AliasFamilyComponent rather than as
+// definitely-plain 8.3 names.
+const dos83BodyPunctuation = "!#$%&'()-@^_`{}"
+
 type localPublicationIdentity struct {
 	normalizedKey string
 	prefix        string
@@ -273,7 +283,10 @@ func sanitizeDOS83Token(token string) string {
 }
 
 func isDOS83Char(b byte) bool {
-	return (b >= 'a' && b <= 'z') || (b >= '0' && b <= '9') || b == '_'
+	if (b >= 'a' && b <= 'z') || (b >= '0' && b <= '9') {
+		return true
+	}
+	return strings.ContainsRune(dos83BodyPunctuation, rune(b))
 }
 
 func isASCIIUnsignedInteger(value string) bool {
