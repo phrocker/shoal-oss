@@ -78,6 +78,14 @@ var (
 	// or contained a nil or zero-length row.
 	ErrInvalidTableSplit = errors.New("accumulo: invalid table split")
 
+	// ErrInvalidTableRange indicates that a row range is malformed, such as an
+	// end row that sorts before its start row.
+	ErrInvalidTableRange = errors.New("accumulo: invalid table range")
+
+	// ErrConstraintNumberUnavailable indicates that a constraint number could
+	// not be allocated because concurrent writers kept taking the free ones.
+	ErrConstraintNumberUnavailable = errors.New("accumulo: constraint number unavailable")
+
 	// ErrTableOffline indicates that Accumulo rejected an operation because
 	// the table is not online.
 	ErrTableOffline = errors.New("accumulo: table offline")

@@ -170,7 +170,13 @@ func (m *fakeManagerAdapter) GetTableConfiguration(
 	if fn != nil {
 		return fn(ctx, address, tableName)
 	}
-	return configuration, err
+	// The real adapter clones what it returns, so a caller can never read a
+	// map another writer is mutating.
+	copied := make(map[string]string, len(configuration))
+	for key, value := range configuration {
+		copied[key] = value
+	}
+	return copied, err
 }
 
 func (m *fakeManagerAdapter) GetNamespaceConfiguration(
@@ -207,6 +213,9 @@ func (m *fakeManagerAdapter) SetTableProperty(
 		property:  property,
 		value:     value,
 	})
+	if m.err == nil && m.configuration != nil {
+		m.configuration[property] = value
+	}
 	return m.err
 }
 
@@ -222,6 +231,9 @@ func (m *fakeManagerAdapter) RemoveTableProperty(
 		tableName: tableName,
 		property:  property,
 	})
+	if m.err == nil && m.configuration != nil {
+		delete(m.configuration, property)
+	}
 	return m.err
 }
 

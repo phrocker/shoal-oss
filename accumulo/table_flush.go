@@ -42,7 +42,7 @@ func (c *Connector) FlushTableRange(
 	if startRow != nil && endRow != nil && bytes.Compare(startRow, endRow) > 0 {
 		return fmt.Errorf(
 			"%w: flush end row %q precedes start row %q",
-			ErrInvalidTableSplit, endRow, startRow,
+			ErrInvalidTableRange, endRow, startRow,
 		)
 	}
 	if err := ctx.Err(); err != nil {

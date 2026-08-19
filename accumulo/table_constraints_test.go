@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -264,8 +265,11 @@ func TestFlushTableRangeRejectsReversedAndInvalidBounds(t *testing.T) {
 	connector.managerAddr = fakeManagerAddress{address: "manager:9997"}
 
 	err := connector.FlushTableRange(context.Background(), "events", []byte("row8"), []byte("row2"), false)
-	if !errors.Is(err, ErrInvalidTableSplit) {
-		t.Fatalf("reversed bounds = %v, want ErrInvalidTableSplit", err)
+	if !errors.Is(err, ErrInvalidTableRange) {
+		t.Fatalf("reversed bounds = %v, want ErrInvalidTableRange", err)
+	}
+	if errors.Is(err, ErrInvalidTableSplit) {
+		t.Fatal("a reversed flush range must not report a split error")
 	}
 	if err := connector.FlushTableRange(context.Background(), "", nil, nil, false); !errors.Is(err, ErrInvalidTableName) {
 		t.Fatalf("empty table = %v, want ErrInvalidTableName", err)
@@ -308,5 +312,66 @@ func TestConstraintPropertyPrefixMatchesAccumulo(t *testing.T) {
 	}
 	if ConstraintPropertyPrefix != "table.constraint." {
 		t.Fatalf("prefix = %q", ConstraintPropertyPrefix)
+	}
+}
+
+// TestConcurrentAddConstraintAllocatesDistinctNumbers pins that the
+// check-then-write sequence is serialized: two classes added at the same time
+// must land on different numbers and both must survive.
+func TestConcurrentAddConstraintAllocatesDistinctNumbers(t *testing.T) {
+	connector, manager := constraintConnector(t, map[string]string{})
+
+	const writers = 8
+	numbers := make([]int32, writers)
+	errs := make([]error, writers)
+	var start sync.WaitGroup
+	var done sync.WaitGroup
+	start.Add(1)
+	for i := 0; i < writers; i++ {
+		done.Add(1)
+		go func(index int) {
+			defer done.Done()
+			start.Wait()
+			numbers[index], errs[index] = connector.AddConstraint(
+				context.Background(),
+				"events",
+				fmt.Sprintf("org.example.Constraint%d", index),
+			)
+		}(i)
+	}
+	start.Done()
+	done.Wait()
+
+	seen := make(map[int32]bool, writers)
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("writer %d: %v", i, err)
+		}
+		if numbers[i] < 1 {
+			t.Fatalf("writer %d got number %d", i, numbers[i])
+		}
+		if seen[numbers[i]] {
+			t.Fatalf("number %d was assigned twice", numbers[i])
+		}
+		seen[numbers[i]] = true
+	}
+
+	installed, err := connector.ListConstraints(context.Background(), "events")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(installed) != writers {
+		t.Fatalf("installed = %d, want %d: a concurrent add overwrote another", len(installed), writers)
+	}
+	for i := 0; i < writers; i++ {
+		want := fmt.Sprintf("org.example.Constraint%d", i)
+		if _, found := constraintNumberOf(installed, want); !found {
+			t.Fatalf("%s is not installed: %#v", want, installed)
+		}
+	}
+	manager.mu.Lock()
+	defer manager.mu.Unlock()
+	if len(manager.propertyRequests) != writers {
+		t.Fatalf("property writes = %d, want exactly one per class", len(manager.propertyRequests))
 	}
 }

@@ -18,20 +18,23 @@ import (
 // A Connector does not own the Instance passed to NewConnector. Callers may
 // share an Instance across connectors and must close it separately.
 type Connector struct {
-	mu          sync.RWMutex
-	passwordMu  sync.Mutex
-	instance    InstanceInfo
-	credentials Credentials
-	options     normalizedConnectorOptions
-	pool        *transportpool.Pool
-	scan        scanclient.Adapter
-	ingest      ingestclient.Adapter
-	manager     managerclient.Adapter
-	security    managerclient.SecurityAdapter
-	managerAddr managerAddressResolver
-	clientAddr  clientServiceAddressResolver
-	discovery   *connectorDiscovery
-	closed      bool
+	mu         sync.RWMutex
+	passwordMu sync.Mutex
+	// constraintMu serializes constraint allocation, whose check-then-write
+	// sequence two callers must not interleave.
+	constraintMu sync.Mutex
+	instance     InstanceInfo
+	credentials  Credentials
+	options      normalizedConnectorOptions
+	pool         *transportpool.Pool
+	scan         scanclient.Adapter
+	ingest       ingestclient.Adapter
+	manager      managerclient.Adapter
+	security     managerclient.SecurityAdapter
+	managerAddr  managerAddressResolver
+	clientAddr   clientServiceAddressResolver
+	discovery    *connectorDiscovery
+	closed       bool
 }
 
 // NewConnector validates and captures the instance and credentials used by
