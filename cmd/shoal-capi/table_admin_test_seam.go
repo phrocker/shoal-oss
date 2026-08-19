@@ -96,7 +96,7 @@ func (c *testAdminConnector) NewScanner(
 	accumulo.Table,
 	accumulo.ScannerOptions,
 ) (*accumulo.Scanner, error) {
-	return nil, accumulo.ErrDiscoveryUnavailable
+	return &accumulo.Scanner{}, nil
 }
 
 func (c *testAdminConnector) NewBatchScanner(
@@ -817,6 +817,61 @@ func shoal_test_connector_create(outConnector **C.shoal_connector) C.int {
 		return 0
 	}
 	*outConnector = handle
+	return 1
+}
+
+//export shoal_test_client_create
+func shoal_test_client_create(outClient **C.shoal_client) C.int {
+	if outClient == nil {
+		return 0
+	}
+	*outClient = nil
+	owner := newOwnedConnector(newTestAdminConnector(), &testAdminInstance{
+		configuration: accumulo.NewConfiguration(),
+	})
+	client := newOwnedClient(owner, "events", [][]byte{[]byte("A")}, 10)
+	id, ok := clients.add(client)
+	if !ok {
+		_ = client.close()
+		return 0
+	}
+	handle := C.shoal_bridge_client_alloc(C.uint64_t(id))
+	if handle == nil {
+		clients.remove(id)
+		_ = client.close()
+		return 0
+	}
+	*outClient = handle
+	return 1
+}
+
+//export shoal_test_client_settings_match
+func shoal_test_client_settings_match(
+	handle *C.shoal_client,
+	tableName *C.char,
+	authorization C.shoal_bytes,
+	threadCount C.int32_t,
+) C.int {
+	client, err := lookupClient(handle)
+	if err != nil {
+		return 0
+	}
+	table, err := requiredString(tableName, "table_name")
+	if err != nil {
+		return 0
+	}
+	expectedAuthorization, err := copyByteValue(authorization, "authorization")
+	if err != nil {
+		return 0
+	}
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	if client.table != table ||
+		client.threadCount != int32(threadCount) ||
+		len(client.authorizations) != 1 ||
+		!bytes.Equal(client.authorizations[0], expectedAuthorization) {
+		return 0
+	}
 	return 1
 }
 

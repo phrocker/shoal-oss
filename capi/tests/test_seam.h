@@ -17,6 +17,12 @@ enum {
 };
 
 int shoal_test_connector_create(shoal_connector **out_connector);
+int shoal_test_client_create(shoal_client **out_client);
+int shoal_test_client_settings_match(
+    shoal_client *client,
+    char *table_name,
+    shoal_bytes authorization,
+    int32_t thread_count);
 size_t shoal_test_connector_flush_wait_count(shoal_connector *connector,
                                              uint8_t wait);
 int shoal_test_connector_identity_block(                                        shoal_connector *connector,

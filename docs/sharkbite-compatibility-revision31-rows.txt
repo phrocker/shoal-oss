@@ -147,7 +147,7 @@ SB-DATA-068 Missing Go
 SB-SCAN-001 Behavior mismatch
 SB-SCAN-002 Behavior mismatch
 SB-SCAN-003 Missing C ABI
-SB-SCAN-004 Missing C ABI
+SB-SCAN-004 Behavior mismatch
 SB-SCAN-005 Behavior mismatch
 SB-SCAN-006 Behavior mismatch
 SB-SCAN-007 Missing Go
@@ -163,9 +163,9 @@ SB-SCAN-015 Missing Go
 SB-SCAN-016 Not required (rationale required)
 SB-SCAN-017 Behavior mismatch
 SB-SCAN-018 Behavior mismatch
-SB-SCAN-019 Missing C ABI
-SB-SCAN-020 Missing C ABI
-SB-SCAN-021 Missing C ABI
+SB-SCAN-019 Missing Go
+SB-SCAN-020 Missing Go
+SB-SCAN-021 Missing Go
 SB-SCAN-022 Behavior mismatch
 SB-SCAN-023 Not required (rationale required)
 SB-SCAN-024 Missing C ABI
@@ -225,14 +225,14 @@ SB-WRITE-019 Covered
 SB-WRITE-020 Not required (rationale required)
 SB-WRITE-021 Not required (rationale required)
 SB-WRITE-022 Not required (rationale required)
-SB-BASE-001 Missing C ABI
-SB-BASE-002 Missing C ABI
-SB-BASE-003 Missing C ABI
-SB-BASE-004 Missing C ABI
-SB-BASE-005 Missing C ABI
-SB-BASE-006 Missing C ABI
-SB-BASE-007 Missing C ABI
-SB-BASE-008 Missing C ABI
+SB-BASE-001 Covered
+SB-BASE-002 Covered
+SB-BASE-003 Covered
+SB-BASE-004 Covered
+SB-BASE-005 Covered
+SB-BASE-006 Covered
+SB-BASE-007 Covered
+SB-BASE-008 Covered
 SB-BASE-009 Missing C ABI
 SB-BASE-010 Not required (rationale required)
 SB-BASE-011 Missing C ABI
@@ -2942,7 +2942,7 @@ SB-CXX-2410 Missing Go
 SB-CXX-2411 Missing Go
 SB-CXX-2412 Missing Go
 SB-CXX-2413 Missing Go
-SB-CXX-2414 Missing C ABI
+SB-CXX-2414 Missing Go
 SB-CXX-2415 Missing Go
 SB-CXX-2416 Missing Go
 SB-CXX-2417 Missing Go
@@ -3199,7 +3199,7 @@ SB-XCUT-006 Behavior mismatch
 SB-XCUT-007 Behavior mismatch
 SB-XCUT-008 Covered
 SB-XCUT-009 Behavior mismatch
-SB-XCUT-010 Missing C ABI
+SB-XCUT-010 Behavior mismatch
 SB-XCUT-011 Behavior mismatch
 SB-XCUT-012 Covered
 SB-XCUT-013 Behavior mismatch

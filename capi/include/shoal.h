@@ -246,6 +246,8 @@ shoal_server_list_free(shoal_server_list_result **result);
 
 SHOAL_API void SHOAL_CALL
 shoal_connector_config_init(shoal_connector_config *config);
+SHOAL_API void SHOAL_CALL
+shoal_client_config_init(shoal_client_config *config);
 
 SHOAL_API void SHOAL_CALL
 shoal_scanner_config_init(shoal_scanner_config *config);
@@ -318,6 +320,43 @@ shoal_connector_close(shoal_connector *connector, shoal_error **out_error);
  * teardown.
  */
 SHOAL_API void SHOAL_CALL shoal_connector_free(shoal_connector **connector);
+
+/*
+ * The high-level client owns its connector and copies configuration, table,
+ * and authorization inputs. Setters are synchronized with concurrent
+ * list/create calls. Scanner and writer creation snapshot the current state.
+ * Close is idempotent, prevents new calls, and coordinates with active work.
+ * Free performs bounded close, clears the caller's handle, and is NULL-safe.
+ */
+SHOAL_API shoal_status SHOAL_CALL
+shoal_client_create(const shoal_client_config *config,
+                    shoal_client **out_client, shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_client_set_threads(shoal_client *client, int32_t thread_count,
+                         shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_client_set_table(shoal_client *client, const char *table_name,
+                       shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_client_set_authorizations(shoal_client *client,
+                                const shoal_bytes *authorizations,
+                                size_t authorization_count,
+                                shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_client_list_tables(shoal_client *client, int64_t timeout_ms,
+                         shoal_table_list_result **out_result,
+                         shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_client_create_scanner(shoal_client *client,
+                            shoal_scanner **out_scanner,
+                            shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_client_create_batch_writer(shoal_client *client,
+                                 shoal_accumulo_writer **out_writer,
+                                 shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_client_close(shoal_client *client, shoal_error **out_error);
+SHOAL_API void SHOAL_CALL shoal_client_free(shoal_client **client);
 
 /*
  * Returns the immutable instance name, instance ID, and authenticated
