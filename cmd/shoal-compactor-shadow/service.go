@@ -420,19 +420,7 @@ func uploadReport(
 	if closer != nil {
 		defer closer()
 	}
-	wb, ok := be.(storage.WritableBackend)
-	if !ok {
-		return fmt.Errorf("backend for %s is read-only", dst)
-	}
-	w, err := wb.Create(ctx, dstPath)
-	if err != nil {
-		return err
-	}
-	if _, err := io.Copy(w, strings.NewReader(string(b))); err != nil {
-		_ = w.Close()
-		return err
-	}
-	return w.Close()
+	return storage.WriteAll(ctx, be, dstPath, b)
 }
 
 // joinPrefix concatenates a gs:// or local prefix with subdir + leaf.

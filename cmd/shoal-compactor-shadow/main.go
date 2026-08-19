@@ -60,7 +60,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -335,7 +334,7 @@ func backendFor(ctx context.Context, path string) (storage.Backend, string, func
 				return nil, "", nil, err
 			}
 		}
-		be, err := hdfs.New(address)
+		be, err := hdfs.NewContext(ctx, address)
 		if err != nil {
 			return nil, "", nil, fmt.Errorf("hdfs.New: %w", err)
 		}
@@ -369,19 +368,7 @@ func writeShoalOutput(ctx context.Context, spec shadow.CompareSpec, dstPath stri
 	if closer != nil {
 		defer closer()
 	}
-	wb, ok := be.(storage.WritableBackend)
-	if !ok {
-		return fmt.Errorf("backend for %s is read-only", dstPath)
-	}
-	w, err := wb.Create(ctx, dst)
-	if err != nil {
-		return err
-	}
-	if _, err := w.Write(res.Output); err != nil {
-		_ = w.Close()
-		return err
-	}
-	return w.Close()
+	return storage.WriteAll(ctx, be, dst, res.Output)
 }
 
 func emitReport(ctx context.Context, report *shadow.Report, dstPath string, inputs []string, javaOutput string) error {
@@ -414,19 +401,7 @@ func emitReport(ctx context.Context, report *shadow.Report, dstPath string, inpu
 	if closer != nil {
 		defer closer()
 	}
-	wb, ok := be.(storage.WritableBackend)
-	if !ok {
-		return fmt.Errorf("backend for %s is read-only", dstPath)
-	}
-	w, err := wb.Create(ctx, dst)
-	if err != nil {
-		return err
-	}
-	if _, err := io.Copy(w, bytes.NewReader(b)); err != nil {
-		_ = w.Close()
-		return err
-	}
-	return w.Close()
+	return storage.WriteAll(ctx, be, dst, b)
 }
 
 // runServiceMain is the --service-mode entry point. Wraps runService

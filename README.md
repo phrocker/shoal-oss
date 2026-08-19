@@ -289,6 +289,32 @@ opt-in.
 - One Server instance per pod; goroutine-safe across concurrent scans.
 - Default file cache 1 GB, decompressed-block cache configurable.
 - Pre-warm walks user-table tablets at startup; first scan is warm-fast.
+- Storage backends intentionally hide exact reserved staging/backup
+  artifacts from normal `List` results. Operators or background maintenance
+  code that need to reap stale internals should call
+  `storage.CleanupStaleArtifacts(ctx, backend, prefix, cutoff)` against one
+  managed subtree/object prefix at a time, with `cutoff <= time.Now().Add(-
+  storage.RecommendedArtifactCleanupAge)` (15 minutes by default). Cleanup
+  deletes only exact reserved artifacts older than that cutoff; any backup
+  artifacts that cannot be mapped back to one safe target are reported in
+  `ArtifactCleanupResult.Recoverable` for manual recovery instead of being
+  deleted automatically. Cloud cleanup verifies Shoal ownership metadata and
+  uses generation/ETag/version-conditional deletes. Cloud bucket/container
+  roots are valid cleanup prefixes so root-level artifacts are reachable. S3
+  cleanup requires `s3:GetBucketVersioning`, `s3:ListBucketVersions` for
+  versioned or suspended buckets, `s3:ListBucket` for never-versioned buckets,
+  `s3:GetObject`/HeadObject inspection, and conditional `s3:DeleteObject` or
+  `s3:DeleteObjectVersion` permissions. Azure cleanup enumerates blob versions
+  and deletes the exact owned stage version so versioned containers do not
+  retain hidden staging data. Azure writes larger than the 5,000 MiB
+  `Put Blob From URL` promotion limit are rejected before staging. Local
+  replacement on portable
+  rename-fallback paths can leave a reserved backup as the only surviving copy
+  after a crash or ambiguous publish failure, so janitor cleanup preserves such
+  backups for explicit recovery instead of deleting them automatically. Local
+  `Open` follows symlinks. Local `Create` rejects a final-component symlink
+  because portable path-based replacement cannot atomically verify its
+  referent and publish without risking a concurrent retarget.
 
 ## License
 

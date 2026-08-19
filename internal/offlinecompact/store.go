@@ -58,7 +58,7 @@ func (s *BackendStore) Read(ctx context.Context, path string) ([]byte, error) {
 // the backend's Writer supports it) + closes. Any error leaves no
 // committed metadata ref pointing at path, so a failed write is a safe
 // no-op (the partial file, if any, is unreferenced and GC-reclaimable).
-func (s *BackendStore) Write(ctx context.Context, path string, data []byte) error {
+func (s *BackendStore) Write(ctx context.Context, path string, data []byte) (err error) {
 	wb, ok := s.Backend.(storage.WritableBackend)
 	if !ok {
 		return storage.ErrReadOnly
@@ -67,17 +67,18 @@ func (s *BackendStore) Write(ctx context.Context, path string, data []byte) erro
 	if err != nil {
 		return fmt.Errorf("offlinecompact: create %s: %w", path, err)
 	}
-	if err := writeAll(w, data); err != nil {
-		w.Close()
+	var cleanupState storage.WriteCleanupState
+	defer func() { storage.AbortOnError(&err, w, &cleanupState) }()
+	if err = writeAll(w, data); err != nil {
 		return fmt.Errorf("offlinecompact: write %s: %w", path, err)
 	}
 	if sy, ok := w.(syncer); ok {
-		if err := sy.Sync(); err != nil {
-			w.Close()
+		if err = sy.Sync(); err != nil {
 			return fmt.Errorf("offlinecompact: fsync %s: %w", path, err)
 		}
 	}
-	if err := w.Close(); err != nil {
+	cleanupState.MarkCloseAttempted()
+	if err = w.Close(); err != nil {
 		return fmt.Errorf("offlinecompact: close %s: %w", path, err)
 	}
 	return nil

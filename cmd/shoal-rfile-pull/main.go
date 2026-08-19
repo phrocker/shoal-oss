@@ -50,7 +50,7 @@ func main() {
 				fail("HDFS source: %v", err)
 			}
 		}
-		be, err := hdfs.New(address)
+		be, err := hdfs.NewContext(ctx, address)
 		if err != nil {
 			fail("hdfs.New: %v", err)
 		}

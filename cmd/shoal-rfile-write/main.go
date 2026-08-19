@@ -8,8 +8,8 @@
 //     cd $ACCUMULO_SRC
 //     mvn -pl core -am compile
 //     mvn -pl core exec:java \
-//         -Dexec.mainClass=org.apache.accumulo.core.file.rfile.PrintInfo \
-//         -Dexec.args=/tmp/shoal-test.rf
+//     -Dexec.mainClass=org.apache.accumulo.core.file.rfile.PrintInfo \
+//     -Dexec.args=/tmp/shoal-test.rf
 //
 //  2. Test-suite validation: see internal/rfile/java_validate_test.go.
 //     The test invokes this binary and a configured PrintInfo command,
@@ -24,10 +24,17 @@ import (
 
 	"github.com/phrocker/shoal/internal/rfile"
 	"github.com/phrocker/shoal/internal/rfile/bcfile/block"
+	"github.com/phrocker/shoal/internal/storage"
 	"github.com/phrocker/shoal/internal/storage/local"
 )
 
 func main() {
+	if err := run(); err != nil {
+		fail("%v", err)
+	}
+}
+
+func run() (err error) {
 	out := flag.String("out", "", "output path (local filesystem)")
 	codec := flag.String("codec", "gz", "data-block codec: none | gz")
 	rows := flag.Int("rows", 100, "number of cells to write")
@@ -38,35 +45,36 @@ func main() {
 	flag.Parse()
 
 	if *out == "" {
-		fail("-out is required")
+		return fmt.Errorf("-out is required")
 	}
 	if *rows < 1 {
-		fail("-rows must be >= 1")
+		return fmt.Errorf("-rows must be >= 1")
 	}
 	if !strings.Contains(*rowFmt, "%") {
-		fail("-row-format must contain a %% placeholder for the row index")
+		return fmt.Errorf("-row-format must contain a %% placeholder for the row index")
 	}
 
 	be := local.New()
 	w, err := be.Create(nil, *out)
 	if err != nil {
-		fail("create %s: %v", *out, err)
+		return fmt.Errorf("create %s: %w", *out, err)
 	}
-	defer w.Close()
+	var cleanupState storage.WriteCleanupState
+	defer func() { storage.AbortOnError(&err, w, &cleanupState) }()
 
 	rw, err := rfile.NewWriter(w, rfile.WriterOptions{
 		Codec:     *codec,
 		BlockSize: *blockSize,
 	})
 	if err != nil {
-		fail("rfile.NewWriter: %v", err)
+		return fmt.Errorf("rfile.NewWriter: %w", err)
 	}
 
 	// Codecs we don't support yet — re-check here because NewWriter only
 	// catches the case where the codec isn't registered, and the caller
 	// might have built a non-default Compressor.
 	if !block.DefaultCompressor().Has(*codec) {
-		fail("codec %q is not registered in the default compressor", *codec)
+		return fmt.Errorf("codec %q is not registered in the default compressor", *codec)
 	}
 
 	for i := 0; i < *rows; i++ {
@@ -78,15 +86,20 @@ func main() {
 			Timestamp:        int64(i + 1),
 		}
 		val := []byte(fmt.Sprintf("value-%d-%s", i, strings.Repeat("x", 20)))
-		if err := rw.Append(k, val); err != nil {
-			fail("Append %d: %v", i, err)
+		if err = rw.Append(k, val); err != nil {
+			return fmt.Errorf("Append %d: %w", i, err)
 		}
 	}
-	if err := rw.Close(); err != nil {
-		fail("rfile close: %v", err)
+	if err = rw.Close(); err != nil {
+		return fmt.Errorf("rfile close: %w", err)
+	}
+	cleanupState.MarkCloseAttempted()
+	if err = w.Close(); err != nil {
+		return fmt.Errorf("storage close %s: %w", *out, err)
 	}
 	fmt.Fprintf(os.Stderr, "wrote %d cells to %s (codec=%s, block-size=%d)\n",
 		*rows, *out, *codec, *blockSize)
+	return nil
 }
 
 func fail(format string, args ...any) {

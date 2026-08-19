@@ -6,6 +6,7 @@ import (
 	"errors"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/phrocker/shoal/internal/storage"
 	"github.com/phrocker/shoal/internal/storage/local"
@@ -48,6 +49,50 @@ type faultyCloseWriter struct{ storage.Writer }
 var errFaultyClose = errors.New("faultyCloseWriter: simulated commit failure")
 
 func (faultyCloseWriter) Close() error { return errFaultyClose }
+
+type abortTrackingWriter struct {
+	aborted bool
+}
+
+func (*abortTrackingWriter) Write(p []byte) (int, error) { return len(p), nil }
+func (*abortTrackingWriter) Close() error                { return errors.New("unexpected commit") }
+func (w *abortTrackingWriter) Abort() error {
+	w.aborted = true
+	return nil
+}
+
+type janitorBackend struct {
+	result storage.ArtifactCleanupResult
+}
+
+func (janitorBackend) Open(context.Context, string) (storage.File, error) {
+	return nil, storage.ErrNotFound
+}
+func (b janitorBackend) CleanupStaleArtifacts(context.Context, string, time.Time) (storage.ArtifactCleanupResult, error) {
+	return b.result, nil
+}
+
+func TestCleanupUnsuccessfulWriteUsesAbort(t *testing.T) {
+	primary := errors.New("write failed")
+	w := &abortTrackingWriter{}
+	if err := storage.CleanupUnsuccessfulWrite(primary, w); !errors.Is(err, primary) {
+		t.Fatalf("CleanupUnsuccessfulWrite error = %v, want primary error", err)
+	}
+	if !w.aborted {
+		t.Fatal("CleanupUnsuccessfulWrite did not abort transactional writer")
+	}
+}
+
+func TestCleanupUnsuccessfulWriteSkipsAbortAfterCommittedWrite(t *testing.T) {
+	primary := storage.MarkCommittedWrite(errors.New("write committed but cleanup failed"))
+	w := &abortTrackingWriter{}
+	if err := storage.CleanupUnsuccessfulWrite(primary, w); !errors.Is(err, primary) {
+		t.Fatalf("CleanupUnsuccessfulWrite error = %v, want committed primary error", err)
+	}
+	if w.aborted {
+		t.Fatal("CleanupUnsuccessfulWrite aborted a committed writer")
+	}
+}
 
 func TestCopy_MemoryToMemory(t *testing.T) {
 	src := memory.New()
@@ -182,5 +227,46 @@ func TestCopy_PropagatesDestinationCloseError(t *testing.T) {
 	_, err := storage.Copy(context.Background(), src, "/x", dst, "/dst")
 	if !errors.Is(err, errFaultyClose) {
 		t.Fatalf("err = %v, want chain to errFaultyClose", err)
+	}
+}
+
+func TestValidateArtifactCleanupCutoffRejectsRecentCutoffs(t *testing.T) {
+	err := storage.ValidateArtifactCleanupCutoff(time.Now(), time.Now().Add(-time.Second))
+	if !errors.Is(err, storage.ErrArtifactCleanupCutoffTooRecent) {
+		t.Fatalf("ValidateArtifactCleanupCutoff error = %v, want ErrArtifactCleanupCutoffTooRecent", err)
+	}
+}
+
+func TestCleanupStaleArtifactsRejectsUnsupportedBackend(t *testing.T) {
+	_, err := storage.CleanupStaleArtifacts(
+		context.Background(),
+		memory.New(),
+		"/root",
+		time.Now().Add(-storage.RecommendedArtifactCleanupAge),
+	)
+	if !errors.Is(err, storage.ErrArtifactCleanerUnsupported) {
+		t.Fatalf("CleanupStaleArtifacts error = %v, want ErrArtifactCleanerUnsupported", err)
+	}
+}
+
+func TestCleanupStaleArtifactsUsesCleanerCapability(t *testing.T) {
+	want := storage.ArtifactCleanupResult{
+		Examined:    2,
+		Removed:     []string{"/root/.tmp"},
+		Recoverable: []string{"/root/.bak"},
+	}
+	got, err := storage.CleanupStaleArtifacts(
+		context.Background(),
+		janitorBackend{result: want},
+		"/root",
+		time.Now().Add(-storage.RecommendedArtifactCleanupAge),
+	)
+	if err != nil {
+		t.Fatalf("CleanupStaleArtifacts: %v", err)
+	}
+	if got.Examined != want.Examined ||
+		len(got.Removed) != 1 || got.Removed[0] != want.Removed[0] ||
+		len(got.Recoverable) != 1 || got.Recoverable[0] != want.Recoverable[0] {
+		t.Fatalf("CleanupStaleArtifacts = %+v, want %+v", got, want)
 	}
 }

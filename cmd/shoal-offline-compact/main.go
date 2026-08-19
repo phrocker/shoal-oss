@@ -303,7 +303,7 @@ func openBackend(ctx context.Context, scheme string) (storage.Backend, func(), e
 		}
 		return be, func() { _ = be.Close() }, nil
 	case "hdfs":
-		be, err := hdfs.New(os.Getenv("SHOAL_HDFS_NAMENODE"))
+		be, err := hdfs.NewContext(ctx, os.Getenv("SHOAL_HDFS_NAMENODE"))
 		if err != nil {
 			return nil, nil, err
 		}
