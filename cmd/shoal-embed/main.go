@@ -393,9 +393,9 @@ func cmdServe(args []string) {
 	}
 	metricsAddr := metricsAddrFromFlags(fs, *metricsPort, *metricsAddress)
 	tlsCfg := tlsFilesConfig{
-		CertFile:     flagOrEnv(*tlsCertFlag, "SHOAL_EMBED_TLS_CERT"),
-		KeyFile:      flagOrEnv(*tlsKeyFlag, "SHOAL_EMBED_TLS_KEY"),
-		ClientCAFile: flagOrEnv(*tlsClientCAFlag, "SHOAL_EMBED_TLS_CLIENT_CA"),
+		CertFile:     flagOrEnv(*tlsCertFlag, flagWasSet(fs, "tls-cert"), "SHOAL_EMBED_TLS_CERT"),
+		KeyFile:      flagOrEnv(*tlsKeyFlag, flagWasSet(fs, "tls-key"), "SHOAL_EMBED_TLS_KEY"),
+		ClientCAFile: flagOrEnv(*tlsClientCAFlag, flagWasSet(fs, "tls-client-ca"), "SHOAL_EMBED_TLS_CLIENT_CA"),
 	}
 
 	h, err := startServe(serveConfig{
@@ -451,16 +451,21 @@ func metricsAddrFromFlags(fs *flag.FlagSet, metricsPort int, metricsAddress stri
 	if metricsAddress != "" {
 		return metricsAddress
 	}
-	explicit := false
-	fs.Visit(func(f *flag.Flag) {
-		if f.Name == "metrics-port" || f.Name == "metrics-address" {
-			explicit = true
-		}
-	})
+	explicit := flagWasSet(fs, "metrics-port") || flagWasSet(fs, "metrics-address")
 	if !explicit {
 		return ""
 	}
 	return "127.0.0.1:" + strconv.Itoa(metricsPort)
+}
+
+func flagWasSet(fs *flag.FlagSet, name string) bool {
+	set := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == name {
+			set = true
+		}
+	})
+	return set
 }
 
 func defaultDataDir() string {
@@ -472,14 +477,15 @@ func defaultDataDir() string {
 }
 
 // flagOrEnv resolves a string flag against a same-purpose environment
-// variable fallback: an explicitly-set flag value always wins; otherwise
-// the environment variable is used (which may itself be unset/empty).
+// variable fallback: an explicitly-set flag value, even the empty string,
+// always wins; otherwise the environment variable is used (which may itself
+// be unset/empty).
 // This mirrors the flag-then-env precedence cmd/shoal's -password /
 // SHOAL_PASSWORD handling already uses, applied here to TLS material so
 // certificate/key paths can come from either a mounted Secret's
 // environment projection or an explicit flag in non-Kubernetes use.
-func flagOrEnv(flagVal, envKey string) string {
-	if flagVal != "" {
+func flagOrEnv(flagVal string, explicit bool, envKey string) string {
+	if explicit {
 		return flagVal
 	}
 	return os.Getenv(envKey)

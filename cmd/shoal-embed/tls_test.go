@@ -298,15 +298,17 @@ func TestTLSFilesConfigEmptyAndValidate(t *testing.T) {
 
 func TestFlagOrEnv(t *testing.T) {
 	tests := []struct {
-		name    string
-		flagVal string
-		envVal  string
-		envSet  bool
-		want    string
+		name     string
+		flagVal  string
+		explicit bool
+		envVal   string
+		envSet   bool
+		want     string
 	}{
-		{name: "flag wins over env", flagVal: "from-flag", envVal: "from-env", envSet: true, want: "from-flag"},
-		{name: "env fallback when flag empty", flagVal: "", envVal: "from-env", envSet: true, want: "from-env"},
-		{name: "both empty", flagVal: "", envVal: "", envSet: false, want: ""},
+		{name: "flag wins over env", flagVal: "from-flag", explicit: true, envVal: "from-env", envSet: true, want: "from-flag"},
+		{name: "explicit empty flag wins over env", flagVal: "", explicit: true, envVal: "from-env", envSet: true, want: ""},
+		{name: "env fallback when flag unset", flagVal: "", explicit: false, envVal: "from-env", envSet: true, want: "from-env"},
+		{name: "both empty", flagVal: "", explicit: false, envVal: "", envSet: false, want: ""},
 	}
 	const envKey = "SHOAL_EMBED_TEST_FLAG_OR_ENV"
 	for _, tt := range tests {
@@ -316,8 +318,8 @@ func TestFlagOrEnv(t *testing.T) {
 			} else {
 				os.Unsetenv(envKey)
 			}
-			if got := flagOrEnv(tt.flagVal, envKey); got != tt.want {
-				t.Errorf("flagOrEnv(%q, %q) = %q, want %q", tt.flagVal, envKey, got, tt.want)
+			if got := flagOrEnv(tt.flagVal, tt.explicit, envKey); got != tt.want {
+				t.Errorf("flagOrEnv(%q, %v, %q) = %q, want %q", tt.flagVal, tt.explicit, envKey, got, tt.want)
 			}
 		})
 	}
