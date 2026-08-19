@@ -2697,6 +2697,76 @@ func TestBackendCloseUsesOperationContextForBackupRemovalRollback(t *testing.T) 
 	}
 }
 
+func TestWriterCloseFailureKeepsOperationClientForRetryableAbort(t *testing.T) {
+	baseClient := newFakeClient()
+	opClient := newFakeClient()
+	var released atomic.Bool
+	var releaseCalls atomic.Int32
+	closeAttempts := 0
+	opClient.writerCloseHook = func() error {
+		closeAttempts++
+		if released.Load() {
+			return errors.New("operation client already closed")
+		}
+		if closeAttempts == 1 {
+			return errors.New("injected close failure")
+		}
+		return nil
+	}
+	backend, err := New("nn:8020",
+		WithClient(baseClient),
+		func(c *config) {
+			c.clientLeaseFactory = func(context.Context) (*leasedClient, error) {
+				return &leasedClient{
+					client: opClient,
+					release: func() error {
+						releaseCalls.Add(1)
+						released.Store(true)
+						return nil
+					},
+				}, nil
+			}
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer backend.Close()
+
+	w, err := backend.Create(context.Background(), "/tables/1.rf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write([]byte("data")); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err == nil {
+		t.Fatal("Close succeeded, want injected temporary-file close failure")
+	}
+	if got := releaseCalls.Load(); got != 0 {
+		t.Fatalf("operation release calls after failed Close = %d, want 0 so Abort can retry", got)
+	}
+
+	if err := w.(storage.Aborter).Abort(); err != nil {
+		t.Fatalf("Abort after failed Close: %v", err)
+	}
+	if closeAttempts != 2 {
+		t.Fatalf("temporary writer close attempts = %d, want 2", closeAttempts)
+	}
+	if got := releaseCalls.Load(); got != 1 {
+		t.Fatalf("operation release calls after Abort = %d, want 1", got)
+	}
+	if err := w.(storage.Aborter).Abort(); err != nil {
+		t.Fatalf("second Abort: %v", err)
+	}
+	if got := releaseCalls.Load(); got != 1 {
+		t.Fatalf("operation release calls after repeated Abort = %d, want 1", got)
+	}
+	if _, exists := opClient.files["/tables/1.rf"]; exists {
+		t.Fatal("aborted write published the destination")
+	}
+}
+
 func TestBackendCloseReleasesActiveOperationClientsAndRejectsNewOperations(t *testing.T) {
 	baseClient := newFakeClient()
 	var factoryCalls atomic.Int32

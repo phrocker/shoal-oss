@@ -1840,7 +1840,15 @@ func (w *replaceWriter) releaseOperationClient() error {
 	return w.release()
 }
 
+// joinReleaseError releases the per-operation client once the writer can no
+// longer act on it. A writer that is still staged after an unsuccessful Close
+// keeps its lease: Abort must be able to close the temporary writer and stay
+// retryable, which is impossible once the client backing that writer is gone.
+// Backend.Close still releases such leases through the operation registry.
 func (w *replaceWriter) joinReleaseError(retErr *error) {
+	if !w.closed && !w.aborted && w.state == replacementStaged {
+		return
+	}
 	releaseErr := w.releaseOperationClient()
 	if releaseErr == nil || w.closed || w.aborted {
 		return
