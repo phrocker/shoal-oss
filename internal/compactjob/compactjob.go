@@ -582,14 +582,33 @@ func translateExtent(job *tabletserver.TExternalCompactionJob) (*data.TKeyExtent
 	if len(ex.GetTable()) == 0 {
 		return nil, "", refuse(ClassMalformedJob, "extent.table", "missing table id")
 	}
-	// prevEndRow is exclusive and endRow inclusive, so prev must sort
-	// strictly before end whenever both bounds are finite.
-	if prev, end := ex.GetPrevEndRow(), ex.GetEndRow(); prev != nil && end != nil &&
-		bytes.Compare(prev, end) >= 0 {
+	if ExtentBoundsInverted(ex) {
+		prev, end := ex.GetPrevEndRow(), ex.GetEndRow()
 		return nil, "", refuse(ClassMalformedJob, "extent",
 			"prevEndRow %q is not before endRow %q", prev, end)
 	}
 	return ex, string(ex.GetTable()), nil
+}
+
+// ExtentBoundsInverted reports whether an extent is one KeyExtent's
+// constructor throws on: prevEndRow is exclusive and endRow inclusive,
+// so prev must sort strictly before end whenever both bounds are finite.
+//
+// It is exported because the answer decides more than whether a job can
+// run. KeyExtent.fromThrift builds the same extent on the manager side,
+// and compactionFailed calls it before it clears the assignment, so an
+// extent that fails this test cannot be handed back either — see
+// unreleasableReason in cmd/shoal-compactor.
+//
+// A missing bound is infinite rather than inverted, matching
+// fromThrift's null mapping, and Text.compareTo compares bytes unsigned,
+// which is what bytes.Compare does.
+func ExtentBoundsInverted(ex *data.TKeyExtent) bool {
+	if ex == nil {
+		return false
+	}
+	prev, end := ex.GetPrevEndRow(), ex.GetEndRow()
+	return prev != nil && end != nil && bytes.Compare(prev, end) >= 0
 }
 
 // translateKind checks the compaction kind and its FATE binding. A USER
@@ -715,11 +734,22 @@ func (p parsedInput) key() string {
 // that two spellings of one file compare equal.
 //
 // The measure is shoal's own storage backend, because that is what
-// opens these paths. hdfs.Backend.resolve parses the URI and keeps only
-// u.Host — compared with EqualFold — and u.Path, which url.Parse has
-// already decoded. So the scheme and host fold by case, percent escapes
-// decode, and userinfo drops out entirely: hdfs://alice@NN/v%6Fl/x and
-// HDFS://nn/vol/x are one file on the namenode.
+// opens these paths, and it is used here rather than modelled:
+// hdfs.Backend.resolve runs url.Parse and then keeps only u.Host —
+// compared with strings.EqualFold — and u.Path, so this runs the same
+// url.Parse and folds the same two fields. Deriving the identity from
+// the parse rather than from the spelling is what keeps the two from
+// drifting apart; url.Parse decodes both fields, so percent escapes,
+// userinfo and host case all fall out of it: hdfs://alice@NN/v%6Fl/x
+// and HDFS://nn/vol/x are one file on the namenode.
+//
+// The host folds by simple-fold class, not by ToLower, because EqualFold
+// is what resolve compares with and the two disagree: EqualFold calls
+// the Greek "Σ" and final "ς" equal while ToLower maps them apart, and
+// it calls ASCII "k" and the Kelvin sign equal likewise. Mapping every
+// rune to the lowest member of its fold orbit is a canonical key for
+// exactly EqualFold's classes, including its treatment of invalid UTF-8,
+// which it decodes to U+FFFD before comparing.
 //
 // Accumulo's ReferencedTabletFile compares normalized path strings and
 // would call all of those distinct, which is exactly why shoal has to
@@ -731,44 +761,42 @@ func (p parsedInput) key() string {
 // Accumulo runs on, and the port stays because resolve compares it as
 // part of the authority.
 //
-// An authority that folds away to nothing is rendered without the "//",
-// so every spelling of "no host" is one identity: resolve keeps u.Host,
-// which is empty for hdfs:/p, hdfs:///p and hdfs://alice@/p alike, and
-// opens the same file for all three.
+// A URI resolve cannot open at all — one url.Parse rejects, an opaque
+// one, or one carrying a query or fragment — is identified by its exact
+// spelling. Folding those would report a duplicate for a job whose real
+// defect is the URI itself, which checkVolumeCapability names precisely
+// in pass 2. A scheme-less path is identified the same way, because
+// resolve hands those to the backend verbatim without decoding.
 func pathIdentity(raw string) string {
-	colon := strings.Index(raw, ":")
-	if colon <= 0 {
-		return decodeEscapes(raw)
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme == "" || u.Opaque != "" || u.RawQuery != "" || u.Fragment != "" {
+		return "raw\x00" + raw
 	}
-	id := strings.ToLower(raw[:colon]) + raw[colon:]
-	start, end := authoritySpan(id)
-	if start == 0 && end == 0 {
-		// No "//": there is no authority to fold, and the spelling is
-		// already the one an empty authority collapses to.
-		return decodeEscapes(id)
+	host := foldHost(u.Host)
+	// Length-prefixed so that no host and path can trade characters:
+	// url.Parse keeps "/" out of a host, but a fold key is not the
+	// spelling it came from.
+	return "uri\x00" + strconv.Itoa(len(host)) + "\x00" + host + u.Scheme + "\x00" + u.Path
+}
+
+// foldHost maps a host to one spelling per strings.EqualFold class, so
+// that two hosts resolve calls equal have one identity here. Each rune
+// becomes the lowest member of its simple-fold orbit, which is the
+// relation EqualFold compares by; ranging over the string decodes
+// invalid bytes to U+FFFD, which is what EqualFold compares them as.
+func foldHost(host string) string {
+	var b strings.Builder
+	b.Grow(len(host))
+	for _, r := range host {
+		lowest := r
+		for f := unicode.SimpleFold(r); f != r; f = unicode.SimpleFold(f) {
+			if f < lowest {
+				lowest = f
+			}
+		}
+		b.WriteRune(lowest)
 	}
-	if start >= end {
-		return decodeEscapes(id[:colon+1] + id[end:])
-	}
-	authority := id[start:end]
-	// Drop the userinfo and fold the host: for an IPv6 literal that runs
-	// through the "]", otherwise up to a port.
-	host := 0
-	if at := strings.LastIndexByte(authority, '@'); at >= 0 {
-		host = at + 1
-	}
-	rest := len(authority)
-	if close := strings.IndexByte(authority[host:], ']'); close >= 0 {
-		rest = host + close + 1
-	} else if port := strings.IndexByte(authority[host:], ':'); port >= 0 {
-		rest = host + port
-	}
-	folded := strings.ToLower(authority[host:rest]) + authority[rest:]
-	if folded == "" {
-		// Userinfo only: resolve drops it, leaving no host at all.
-		return decodeEscapes(id[:colon+1] + id[end:])
-	}
-	return decodeEscapes(id[:start] + folded + id[end:])
+	return b.String()
 }
 
 // decodeEscapes replaces every well-formed percent escape with the byte
@@ -1982,6 +2010,17 @@ func parseIterators(job *tabletserver.TExternalCompactionJob) ([]rawIterator, er
 		}
 		seen[name] = i
 
+		if s.GetProperties() == nil {
+			// SystemIteratorUtil.toIteratorSetting passes this map
+			// straight to IteratorSetting's four-argument constructor,
+			// which calls addOptions, which opens with
+			// checkArgument(properties != null). Compactor.initialize
+			// builds the whole stack that way before it reads a file, so
+			// a job missing this map is one the reference implementation
+			// throws on rather than one with an option-less iterator.
+			return nil, refuse(ClassMalformedJob, field+".properties",
+				"missing; IteratorSetting rejects a null option map")
+		}
 		// Copied, not aliased: the plan must not change if the transport
 		// reuses or recycles the job struct.
 		options := make(map[string]string, len(s.GetProperties()))

@@ -708,6 +708,26 @@ func TestDrainCoordinatorSurfacesJobsItCannotHandBack(t *testing.T) {
 			},
 			wantLog: "carries no table id",
 		},
+		{
+			// KeyExtent's constructor rejects prevEndRow >= endRow, and
+			// compactionFailed runs KeyExtent.fromThrift before it
+			// resolves the id, so the RPC throws on the manager every
+			// time. Retrying it would spend the whole release budget on
+			// a call that cannot succeed.
+			name: "extent whose bounds are inverted",
+			mutate: func(j *tabletserver.TExternalCompactionJob) {
+				j.Extent = &data.TKeyExtent{Table: []byte("2"), PrevEndRow: []byte("m"), EndRow: []byte("c")}
+			},
+			wantLog: "KeyExtent.fromThrift rejects",
+		},
+		{
+			// The constructor's test is ">=", so equal bounds throw too.
+			name: "extent whose bounds are equal",
+			mutate: func(j *tabletserver.TExternalCompactionJob) {
+				j.Extent = &data.TKeyExtent{Table: []byte("2"), PrevEndRow: []byte("m"), EndRow: []byte("m")}
+			},
+			wantLog: "KeyExtent.fromThrift rejects",
+		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			svc := &fakeCoordinator{}

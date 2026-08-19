@@ -619,6 +619,13 @@ func unreleasableReason(job *tabletserver.TExternalCompactionJob) string {
 		return "the assignment carries no extent, and compactionFailed cannot convert a missing one"
 	case len(extent.GetTable()) == 0:
 		return "the assignment's extent carries no table id, so compactionFailed would name no tablet"
+	case compactjob.ExtentBoundsInverted(extent):
+		// KeyExtent.fromThrift runs the constructor's
+		// "prevEndRow >= endRow" check, and compactionFailed converts the
+		// extent before it resolves the id, so the RPC throws every time
+		// and the assignment is never cleared. Retrying would spend the
+		// whole release budget on a call that cannot succeed.
+		return "the assignment's extent has prevEndRow at or after endRow, which KeyExtent.fromThrift rejects before compactionFailed clears the assignment"
 	}
 	return ""
 }

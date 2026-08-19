@@ -117,9 +117,20 @@ func tmpOutput(ecid string) string {
 // is always present — Compactor.initialize iterates it unguarded — so a
 // call with no settings still yields an empty, non-nil list rather than
 // the nil a bare variadic would leave.
+//
+// Each setting's option map is filled in for the same reason:
+// SystemIteratorUtil.toTIteratorSetting builds every wire setting from
+// IteratorSetting.getOptions, which wraps a HashMap and is never null,
+// so a real job always carries a present map. Tests that mean to send a
+// missing one build the setting without this helper.
 func iterConfig(settings ...*tabletserver.TIteratorSetting) *tabletserver.IteratorConfig {
 	if settings == nil {
 		settings = []*tabletserver.TIteratorSetting{}
+	}
+	for _, s := range settings {
+		if s != nil && s.Properties == nil {
+			s.Properties = map[string]string{}
+		}
 	}
 	return &tabletserver.IteratorConfig{Iterators: settings}
 }
@@ -922,11 +933,16 @@ func TestTranslateRefusesAnOutputAliasingAnInputByCase(t *testing.T) {
 // It keeps u.Host, compared with EqualFold, and url.Parse's decoded
 // u.Path — so the path stays case-sensitive, the port stays, and
 // userinfo drops out.
+//
+// Each row is a pair of spellings that must share one identity. The
+// assertion is on that equality rather than on the identity string
+// itself, because the string is a key: pinning its shape would freeze
+// an encoding the rule does not depend on.
 func TestPathIdentityFoldsWhatOpensOneFile(t *testing.T) {
 	for _, tt := range []struct {
 		name string
 		in   string
-		want string
+		same string
 	}{
 		{"scheme and host", "HDFS://NN/A/B.rf", "hdfs://nn/A/B.rf"},
 		{"host with a port", "HDFS://NN:9000/A/B.rf", "hdfs://nn:9000/A/B.rf"},
@@ -950,18 +966,92 @@ func TestPathIdentityFoldsWhatOpensOneFile(t *testing.T) {
 		{"escape in the volume", "hdfs://nn/v%6Fl/A/B.rf", "hdfs://nn/vol/A/B.rf"},
 		{"escape hex case", "hdfs://nn/v%6fl/A/B.rf", "hdfs://nn/vol/A/B.rf"},
 		{"escaped separator", "hdfs://nn/a%2Fb/B.rf", "hdfs://nn/a/b/B.rf"},
-		{"escape with no scheme", "/v%6Fl/B.rf", "/vol/B.rf"},
-		// A malformed escape is checkTabletFilePath's refusal to report,
-		// so identity leaves it exactly as it found it.
+		// url.Parse decodes the host as well, so an escaped non-ASCII
+		// host byte and the byte itself are one authority to resolve.
+		// (Escaping an ASCII byte there is a URI RFC 3986 forbids and
+		// url.Parse rejects; see the keeps-apart test.)
+		{"escape in the host", "hdfs://%C3%89/A/B.rf", "hdfs://\u00c9/A/B.rf"},
+		// EqualFold's classes are wider than ToLower's, and EqualFold is
+		// what resolve compares hosts with.
+		{"kelvin sign", "hdfs://%E2%84%AA/A/B.rf", "hdfs://k/A/B.rf"},
+		{"greek final sigma", "hdfs://%CF%82/A/B.rf", "hdfs://%CE%A3/A/B.rf"},
+		{"greek small sigma", "hdfs://%CF%83/A/B.rf", "hdfs://%CE%A3/A/B.rf"},
+		// A scheme-less path is one Backend.resolve returns verbatim,
+		// without decoding, so its identity is its exact spelling.
+		{"escape with no scheme", "/v%6Fl/B.rf", "/v%6Fl/B.rf"},
+		// A URI url.Parse rejects is one resolve cannot open either, so
+		// its exact spelling is its identity and checkVolumeCapability
+		// gets to name the real defect in pass 2.
 		{"truncated escape", "hdfs://nn/vol%2/B.rf", "hdfs://nn/vol%2/B.rf"},
 		{"non-hex escape", "hdfs://nn/vol%zz/B.rf", "hdfs://nn/vol%zz/B.rf"},
 		{"escape at the very end", "hdfs://nn/vol/B.rf%", "hdfs://nn/vol/B.rf%"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := pathIdentity(tt.in); got != tt.want {
-				t.Fatalf("pathIdentity(%q) = %q, want %q", tt.in, got, tt.want)
+			if pathIdentity(tt.in) != pathIdentity(tt.same) {
+				t.Fatalf("pathIdentity(%q) and pathIdentity(%q) differ, want one identity",
+					tt.in, tt.same)
 			}
 		})
+	}
+}
+
+// TestPathIdentityKeepsApartWhatOpensDifferentFiles is the other half of
+// the rule: everything Backend.resolve distinguishes must stay
+// distinct, or a job would be refused as a duplicate over two real
+// files.
+func TestPathIdentityKeepsApartWhatOpensDifferentFiles(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		a, b string
+	}{
+		{"path case", "hdfs://nn/A/B.rf", "hdfs://nn/a/b.rf"},
+		{"port", "hdfs://nn:9000/A/B.rf", "hdfs://nn/A/B.rf"},
+		{"host", "hdfs://nn/A/B.rf", "hdfs://other/A/B.rf"},
+		{"scheme", "hdfs://nn/A/B.rf", "file://nn/A/B.rf"},
+		// Percent-escaping an ASCII byte in a host is invalid per RFC
+		// 3986, and url.Parse rejects it, so resolve cannot open it
+		// either and it does not fold into the host it spells.
+		{"ascii escape in the host", "hdfs://%6Ee/A/B.rf", "hdfs://ne/A/B.rf"},
+		// The escape stays in a scheme-less path, so it is not the file
+		// the decoded spelling names.
+		{"no scheme keeps its escapes", "/v%6Fl/B.rf", "/vol/B.rf"},
+		// A URI resolve cannot open does not fold into one it can.
+		{"truncated escape", "hdfs://nn/vol%2/B.rf", "hdfs://nn/vol/B.rf"},
+		{"opaque", "hdfs:accumulo/tables/2/t/F.rf", "hdfs:/accumulo/tables/2/t/F.rf"},
+		{"query", "hdfs://nn/A/B.rf?v=1", "hdfs://nn/A/B.rf"},
+		{"fragment", "hdfs://nn/A/B.rf#f", "hdfs://nn/A/B.rf"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if pathIdentity(tt.a) == pathIdentity(tt.b) {
+				t.Fatalf("pathIdentity(%q) and pathIdentity(%q) are one identity, want two",
+					tt.a, tt.b)
+			}
+		})
+	}
+}
+
+// TestPathIdentityFoldsHostsExactlyLikeEqualFold checks the host rule
+// against strings.EqualFold itself, which is the comparison
+// hdfs.Backend.resolve makes against its configured namenode. Every
+// pair EqualFold calls equal must share an identity and every pair it
+// does not must not; ToLower fails the sigma and Kelvin rows.
+func TestPathIdentityFoldsHostsExactlyLikeEqualFold(t *testing.T) {
+	hosts := []string{
+		"nn", "NN", "Nn", "nn:9000", "NN:9000", "other", "",
+		"\u03a3", "\u03c3", "\u03c2", // capital, small and final sigma
+		"k", "K", "\u212a", // ASCII k and the Kelvin sign
+		"stra\u00dfe", "STRASSE",
+		"[2001:db8::1]", "[2001:DB8::1]",
+	}
+	for _, a := range hosts {
+		for _, b := range hosts {
+			want := strings.EqualFold(a, b)
+			got := pathIdentity("hdfs://"+a+"/A/B.rf") == pathIdentity("hdfs://"+b+"/A/B.rf")
+			if got != want {
+				t.Fatalf("identity(%q) == identity(%q) is %v, but EqualFold says %v",
+					a, b, got, want)
+			}
+		}
 	}
 }
 
@@ -2073,6 +2163,106 @@ func TestTranslateRefusesMissingRequiredContainers(t *testing.T) {
 				t.Fatalf("detail = %q, want it to name what dereferences the container", r.Detail)
 			}
 		})
+	}
+}
+
+// TestExtentBoundsInverted pins the predicate cmd/shoal-compactor asks
+// before it tries to hand a job back, because KeyExtent.fromThrift runs
+// the same test inside compactionFailed: a missing bound is infinite
+// rather than inverted, and equal bounds are rejected because the
+// constructor's test is ">=", not ">".
+func TestExtentBoundsInverted(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		ex   *data.TKeyExtent
+		want bool
+	}{
+		{"nil extent", nil, false},
+		{"both bounds infinite", &data.TKeyExtent{Table: []byte("2")}, false},
+		{"infinite start", &data.TKeyExtent{Table: []byte("2"), EndRow: []byte("m")}, false},
+		{"infinite end", &data.TKeyExtent{Table: []byte("2"), PrevEndRow: []byte("c")}, false},
+		{
+			"ordered",
+			&data.TKeyExtent{Table: []byte("2"), PrevEndRow: []byte("c"), EndRow: []byte("m")},
+			false,
+		},
+		{
+			"equal",
+			&data.TKeyExtent{Table: []byte("2"), PrevEndRow: []byte("m"), EndRow: []byte("m")},
+			true,
+		},
+		{
+			"inverted",
+			&data.TKeyExtent{Table: []byte("2"), PrevEndRow: []byte("m"), EndRow: []byte("c")},
+			true,
+		},
+		{
+			// Text.compareTo compares bytes unsigned, so a high byte
+			// sorts after a low one rather than before it.
+			"high byte",
+			&data.TKeyExtent{Table: []byte("2"), PrevEndRow: []byte("\xff"), EndRow: []byte("\x01")},
+			true,
+		},
+		{
+			// A present but empty bound is an empty Text, not a missing
+			// one, and every row sorts at or after it.
+			"empty end row",
+			&data.TKeyExtent{Table: []byte("2"), PrevEndRow: []byte("c"), EndRow: []byte{}},
+			true,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := ExtentBoundsInverted(tt.ex); got != tt.want {
+				t.Fatalf("ExtentBoundsInverted = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestTranslateRefusesAnIteratorWithNoOptionMap covers the third
+// container Compactor.initialize dereferences, one level further in.
+// SystemIteratorUtil.toIteratorSetting hands the map to IteratorSetting's
+// four-argument constructor, which calls addOptions, which opens with
+// checkArgument(properties != null) — so a missing map is a job the
+// reference implementation throws on, not an iterator with no options.
+// The setting is built without iterConfig, which fills the map in the
+// way a real coordinator does.
+func TestTranslateRefusesAnIteratorWithNoOptionMap(t *testing.T) {
+	job := validJob()
+	job.IteratorSettings = &tabletserver.IteratorConfig{
+		Iterators: []*tabletserver.TIteratorSetting{{
+			Priority:      20,
+			Name:          "vers",
+			IteratorClass: versClass,
+		}},
+	}
+
+	r := assertRefused(t, job, Options{}, ClassMalformedJob, "iteratorSettings.vers.properties")
+	if !strings.Contains(r.Detail, "null option map") {
+		t.Fatalf("detail = %q, want it to name what rejects the map", r.Detail)
+	}
+}
+
+// TestTranslateAcceptsAnIteratorWithAnEmptyOptionMap is the other half:
+// a present, empty map is what a coordinator sends for an iterator
+// configured with no options, and it must translate.
+func TestTranslateAcceptsAnIteratorWithAnEmptyOptionMap(t *testing.T) {
+	job := validJob()
+	job.IteratorSettings = &tabletserver.IteratorConfig{
+		Iterators: []*tabletserver.TIteratorSetting{{
+			Priority:      20,
+			Name:          "vers",
+			IteratorClass: versClass,
+			Properties:    map[string]string{},
+		}},
+	}
+
+	plan := mustTranslate(t, job, Options{})
+	if len(plan.Iterators) != 1 {
+		t.Fatalf("Iterators = %d, want 1", len(plan.Iterators))
+	}
+	if got := len(plan.Iterators[0].Spec.Options); got != 0 {
+		t.Fatalf("Options = %d, want none", got)
 	}
 }
 
