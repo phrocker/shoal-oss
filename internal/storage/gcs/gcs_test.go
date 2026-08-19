@@ -522,6 +522,45 @@ func TestWriter_CloseIndeterminateCommittedPromotionRetriesVerification(t *testi
 	}
 }
 
+func TestWriter_CloseIndeterminateCommittedCancellationRetriesVerification(t *testing.T) {
+	backend, bucket := newFakeBackend()
+	bucket.putObject("path/to/object.rf", []byte("old"))
+	bucket.copyAfterCommitErr = context.Canceled
+
+	w, err := backend.Create(context.Background(), "bucket/path/to/object.rf")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	gcsWriter := w.(*writer)
+	bucket.attrsErrs["path/to/object.rf"] = []error{context.DeadlineExceeded}
+	tempName := gcsWriter.temp.(*fakeObject).name
+	if _, err := w.Write([]byte("new")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if err := w.Close(); err == nil || !errors.Is(err, context.Canceled) || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("first Close error = %v, want cancellation joined with transient verification failure", err)
+	}
+	if !gcsWriter.promotionIndeterminate {
+		t.Fatal("first Close did not retain indeterminate promotion state")
+	}
+	if _, ok := bucket.objects[tempName]; !ok {
+		t.Fatalf("indeterminate Close removed temp object %q", tempName)
+	}
+
+	if err := w.Close(); err != nil {
+		t.Fatalf("second Close: %v", err)
+	}
+	if len(bucket.copyCalls) != 1 {
+		t.Fatalf("copy calls = %d, want exactly 1", len(bucket.copyCalls))
+	}
+	if got := string(bucket.objects["path/to/object.rf"].body); got != "new" {
+		t.Fatalf("destination contents = %q, want new", got)
+	}
+	if _, ok := bucket.objects[tempName]; ok {
+		t.Fatalf("second Close did not clean temp object %q", tempName)
+	}
+}
+
 func TestWriter_CloseIndeterminateUncommittedPromotionRetriesCopy(t *testing.T) {
 	backend, bucket := newFakeBackend()
 	bucket.putObject("path/to/object.rf", []byte("old"))
@@ -565,6 +604,48 @@ func TestWriter_CloseIndeterminateUncommittedPromotionRetriesCopy(t *testing.T) 
 	}
 	if _, ok := bucket.objects[tempName]; ok {
 		t.Fatalf("retry success did not clean temp object %q", tempName)
+	}
+}
+
+func TestWriter_CloseCanceledUncommittedPromotionCanAbort(t *testing.T) {
+	backend, bucket := newFakeBackend()
+	bucket.putObject("path/to/object.rf", []byte("old"))
+	bucket.copyHook = func(_ context.Context, _, _ *fakeObject) error {
+		return context.Canceled
+	}
+
+	w, err := backend.Create(context.Background(), "bucket/path/to/object.rf")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	gcsWriter := w.(*writer)
+	tempName := gcsWriter.temp.(*fakeObject).name
+	if _, err := w.Write([]byte("new")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if err := w.Close(); err == nil || !errors.Is(err, context.Canceled) {
+		t.Fatalf("first Close error = %v, want cancellation", err)
+	}
+	if !gcsWriter.promotionIndeterminate {
+		t.Fatal("first Close did not retain indeterminate promotion state")
+	}
+	if got := string(bucket.objects["path/to/object.rf"].body); got != "old" {
+		t.Fatalf("destination contents after canceled copy = %q, want old", got)
+	}
+	if err := gcsWriter.Abort(); err != nil {
+		t.Fatalf("Abort: %v", err)
+	}
+	if !gcsWriter.aborted {
+		t.Fatal("Abort did not mark the writer aborted")
+	}
+	if gcsWriter.promotionIndeterminate {
+		t.Fatal("Abort left the promotion state indeterminate")
+	}
+	if _, ok := bucket.objects[tempName]; ok {
+		t.Fatalf("Abort did not clean temp object %q", tempName)
+	}
+	if got := string(bucket.objects["path/to/object.rf"].body); got != "old" {
+		t.Fatalf("destination contents after Abort = %q, want old", got)
 	}
 }
 
@@ -783,11 +864,20 @@ func TestWriter_CanceledPromotionUsesIndependentCleanupContext(t *testing.T) {
 	if got := string(bucket.objects["path/to/object.rf"].body); got != "old" {
 		t.Fatalf("destination contents = %q, want preserved old object", got)
 	}
-	if _, ok := bucket.objects[tempName]; ok {
-		t.Fatalf("canceled promotion left temp object %q behind", tempName)
+	if _, ok := bucket.objects[tempName]; !ok {
+		t.Fatalf("canceled promotion did not retain temp object %q for retry", tempName)
 	}
 	if cleanupSawCanceledContext {
 		t.Fatal("temporary cleanup reused the canceled operation context")
+	}
+	if err := w.(shstorage.Aborter).Abort(); err != nil {
+		t.Fatalf("Abort: %v", err)
+	}
+	if cleanupSawCanceledContext {
+		t.Fatal("Abort cleanup reused the canceled operation context")
+	}
+	if _, ok := bucket.objects[tempName]; ok {
+		t.Fatalf("Abort did not remove temp object %q", tempName)
 	}
 }
 

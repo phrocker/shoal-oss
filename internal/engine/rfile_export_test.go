@@ -240,6 +240,51 @@ func TestCopyWithSHA256AbortsDestinationOnShortWrite(t *testing.T) {
 	}
 }
 
+func TestCopyWithSHA256CountsPartialWriteProgressBeforeError(t *testing.T) {
+	src := exportFileBackend{file: &exportReadFuncFile{
+		size: 3,
+		read: func(p []byte, off int64) (int, error) {
+			switch off {
+			case 0:
+				copy(p, []byte("xyz"))
+				return 3, io.EOF
+			default:
+				return 0, io.EOF
+			}
+		},
+	}}
+	dst := newExportTrackingBackend()
+	dst.files["/dst.rf"] = []byte("old")
+	dst.partialErrBytes = 2
+	dst.writeErr = errors.New("write failed")
+
+	written, sum, bcVersion, err := copyWithSHA256(context.Background(), src, "/src.rf", dst, "/dst.rf")
+	if !errors.Is(err, dst.writeErr) {
+		t.Fatalf("copyWithSHA256 error = %v, want %v", err, dst.writeErr)
+	}
+	if written != 2 {
+		t.Fatalf("written = %d, want 2", written)
+	}
+	if sum != "" {
+		t.Fatalf("sum = %q, want empty on failure", sum)
+	}
+	if bcVersion != "" {
+		t.Fatalf("bcVersion = %q, want empty on failure", bcVersion)
+	}
+	if got := string(dst.files["/dst.rf"]); got != "old" {
+		t.Fatalf("destination contents = %q, want old", got)
+	}
+	if dst.lastWriter == nil || dst.lastWriter.abortCalls != 1 {
+		t.Fatalf("Abort calls = %d, want 1", dst.lastWriter.abortCalls)
+	}
+	if dst.lastWriter.closed {
+		t.Fatal("partial error write closed and could have committed destination")
+	}
+	if dst.lastWriter.stagePresent {
+		t.Fatal("partial error write left staged bytes behind")
+	}
+}
+
 func scanAll(t *testing.T, eng *Engine, table string) []string {
 	t.Helper()
 	sc, err := eng.Scan(table, iterrt.InfiniteRange(), ScanOptions{})
@@ -283,9 +328,11 @@ func (f *exportReadFuncFile) Size() int64 {
 }
 
 type exportTrackingBackend struct {
-	files      map[string][]byte
-	lastWriter *exportTrackingWriter
-	shortWrite int
+	files           map[string][]byte
+	lastWriter      *exportTrackingWriter
+	shortWrite      int
+	partialErrBytes int
+	writeErr        error
 }
 
 func newExportTrackingBackend() *exportTrackingBackend {
@@ -297,23 +344,38 @@ func (b *exportTrackingBackend) Open(context.Context, string) (storage.File, err
 }
 
 func (b *exportTrackingBackend) Create(_ context.Context, path string) (storage.Writer, error) {
-	writer := &exportTrackingWriter{backend: b, path: path, shortWrite: b.shortWrite}
+	writer := &exportTrackingWriter{
+		backend:         b,
+		path:            path,
+		shortWrite:      b.shortWrite,
+		partialErrBytes: b.partialErrBytes,
+		writeErr:        b.writeErr,
+	}
 	b.lastWriter = writer
 	return writer, nil
 }
 
 type exportTrackingWriter struct {
-	backend      *exportTrackingBackend
-	path         string
-	stage        strings.Builder
-	stagePresent bool
-	abortCalls   int
-	closed       bool
-	shortWrite   int
+	backend         *exportTrackingBackend
+	path            string
+	stage           strings.Builder
+	stagePresent    bool
+	abortCalls      int
+	closed          bool
+	shortWrite      int
+	partialErrBytes int
+	writeErr        error
 }
 
 func (w *exportTrackingWriter) Write(p []byte) (int, error) {
 	w.stagePresent = true
+	if w.writeErr != nil {
+		if w.partialErrBytes > 0 && len(p) > w.partialErrBytes {
+			n, _ := w.stage.WriteString(string(p[:w.partialErrBytes]))
+			return n, w.writeErr
+		}
+		return 0, w.writeErr
+	}
 	if w.shortWrite > 0 && len(p) > w.shortWrite {
 		n, _ := w.stage.WriteString(string(p[:w.shortWrite]))
 		return n, nil

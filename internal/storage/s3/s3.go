@@ -810,9 +810,6 @@ func isAmbiguousPromotionError(err error) bool {
 	if err == nil || isNotFound(err) {
 		return false
 	}
-	if errors.Is(err, context.Canceled) {
-		return false
-	}
 	text := strings.ToLower(err.Error())
 	return !strings.Contains(text, "precondition")
 }

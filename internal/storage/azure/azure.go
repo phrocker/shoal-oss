@@ -1164,9 +1164,6 @@ func isAmbiguousPromotionError(err error) bool {
 	if err == nil || isBlobNotFound(err) {
 		return false
 	}
-	if errors.Is(err, context.Canceled) {
-		return false
-	}
 	if bloberror.HasCode(err, bloberror.ConditionNotMet, bloberror.BlobAlreadyExists) {
 		return false
 	}

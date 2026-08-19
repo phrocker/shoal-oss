@@ -47,18 +47,19 @@ type fakeS3Object struct {
 }
 
 type fakeS3WriteOperations struct {
-	objects             map[string]fakeS3Object
-	stageFailure        bool
-	stageResponseLost   bool
-	promoteFailure      error
-	promoteResponseLost bool
-	mutateBeforePromote bool
-	headErrs            map[string][]error
-	deleteFailures      int
-	promoteCalls        int
-	cleanupCanceled     bool
-	headFailures        int
-	nextETag            int
+	objects               map[string]fakeS3Object
+	stageFailure          bool
+	stageResponseLost     bool
+	promoteFailure        error
+	promoteResponseLost   bool
+	promoteAfterCommitErr error
+	mutateBeforePromote   bool
+	headErrs              map[string][]error
+	deleteFailures        int
+	promoteCalls          int
+	cleanupCanceled       bool
+	headFailures          int
+	nextETag              int
 }
 
 func newFakeS3WriteOperations() *fakeS3WriteOperations {
@@ -148,6 +149,11 @@ func (f *fakeS3WriteOperations) promote(
 	etag := fmt.Sprintf("\"etag-%d\"", f.nextETag)
 	stage.state.etag = &etag
 	f.objects[key] = stage
+	if f.promoteAfterCommitErr != nil {
+		err := f.promoteAfterCommitErr
+		f.promoteAfterCommitErr = nil
+		return err
+	}
 	if f.promoteResponseLost {
 		f.promoteResponseLost = false
 		return errors.New("copy response lost")
@@ -564,6 +570,39 @@ func TestWriter_IndeterminatePromotionCommittedRetrySucceeds(t *testing.T) {
 	}
 }
 
+func TestWriter_IndeterminatePromotionCanceledAfterCommitRetriesVerification(t *testing.T) {
+	f := newFakeS3WriteOperations()
+	f.promoteAfterCommitErr = context.Canceled
+	w := newFakeS3Writer(f, "target")
+	f.headErrs["target"] = []error{context.DeadlineExceeded}
+
+	if _, err := w.Write([]byte("new")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if err := w.Close(); err == nil || !errors.Is(err, context.Canceled) || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("first Close error = %v, want cancellation joined with transient verification failure", err)
+	}
+	if !w.promotionIndeterminate {
+		t.Fatal("first Close did not retain indeterminate promotion state")
+	}
+	if _, ok := f.objects[w.stageKey]; !ok {
+		t.Fatal("canceled promotion removed the staged object")
+	}
+
+	if err := w.Close(); err != nil {
+		t.Fatalf("second Close: %v", err)
+	}
+	if f.promoteCalls != 1 {
+		t.Fatalf("promote calls = %d, want 1", f.promoteCalls)
+	}
+	if got := f.objects["target"].data; got != "new" {
+		t.Fatalf("target data = %q, want new", got)
+	}
+	if _, ok := f.objects[w.stageKey]; ok {
+		t.Fatal("second Close did not clean up the staged object")
+	}
+}
+
 func TestWriter_IndeterminatePromotionUncommittedRetriesSafely(t *testing.T) {
 	f := newFakeS3WriteOperations()
 	oldETag := "\"old\""
@@ -599,6 +638,45 @@ func TestWriter_IndeterminatePromotionUncommittedRetriesSafely(t *testing.T) {
 	}
 	if _, ok := f.objects[w.stageKey]; ok {
 		t.Fatal("retry success did not clean up the staged object")
+	}
+}
+
+func TestWriter_IndeterminateCanceledPromotionCanAbortWhenNotCommitted(t *testing.T) {
+	f := newFakeS3WriteOperations()
+	oldETag := "\"old\""
+	f.objects["target"] = fakeS3Object{
+		state: s3ObjectState{etag: &oldETag, size: 3},
+		data:  "old",
+	}
+	f.promoteFailure = context.Canceled
+	w := newFakeS3Writer(f, "target")
+
+	if _, err := w.Write([]byte("new")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if err := w.Close(); err == nil || !errors.Is(err, context.Canceled) {
+		t.Fatalf("first Close error = %v, want cancellation", err)
+	}
+	if !w.promotionIndeterminate {
+		t.Fatal("first Close did not retain indeterminate promotion state")
+	}
+	if got := f.objects["target"].data; got != "old" {
+		t.Fatalf("target data after canceled promote = %q, want old", got)
+	}
+	if err := w.Abort(); err != nil {
+		t.Fatalf("Abort: %v", err)
+	}
+	if !w.aborted {
+		t.Fatal("Abort did not mark the writer aborted")
+	}
+	if w.promotionIndeterminate {
+		t.Fatal("Abort left the promotion state indeterminate")
+	}
+	if _, ok := f.objects[w.stageKey]; ok {
+		t.Fatal("Abort did not remove the staged object")
+	}
+	if got := f.objects["target"].data; got != "old" {
+		t.Fatalf("target data after Abort = %q, want old", got)
 	}
 }
 
@@ -741,8 +819,17 @@ func TestWriter_CleanupUsesIndependentContextAndCanRetryAfterCommit(t *testing.T
 		if f.cleanupCanceled {
 			t.Fatal("cleanup inherited canceled request context")
 		}
+		if _, ok := f.objects[w.stageKey]; !ok {
+			t.Fatal("canceled promotion did not retain the staged object for retry")
+		}
+		if err := w.Abort(); err != nil {
+			t.Fatalf("Abort: %v", err)
+		}
+		if f.cleanupCanceled {
+			t.Fatal("abort cleanup inherited canceled request context")
+		}
 		if _, ok := f.objects[w.stageKey]; ok {
-			t.Fatal("temporary object was not removed")
+			t.Fatal("Abort did not remove the temporary object")
 		}
 	})
 

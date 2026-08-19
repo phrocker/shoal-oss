@@ -836,9 +836,6 @@ func isAmbiguousPromotionError(err error) bool {
 	if err == nil || errors.Is(err, storage.ErrObjectNotExist) {
 		return false
 	}
-	if errors.Is(err, context.Canceled) {
-		return false
-	}
 	text := strings.ToLower(err.Error())
 	return !strings.Contains(text, "precondition")
 }
