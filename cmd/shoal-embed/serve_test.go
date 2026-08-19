@@ -680,8 +680,9 @@ func TestServeHandleStopReturnsTimeoutErrorWithStuckUnary(t *testing.T) {
 	for time.Now().Before(transportDeadline) {
 		probeCtx, probeCancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 		_, probeErr := client.Status(probeCtx, &embedpb.StatusRequest{})
+		probeContextErr := probeCtx.Err()
 		probeCancel()
-		if probeErr != nil {
+		if probeErr != nil && probeContextErr == nil {
 			transportStopped = true
 			break
 		}
