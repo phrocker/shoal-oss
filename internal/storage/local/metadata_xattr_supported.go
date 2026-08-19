@@ -4,20 +4,12 @@ package local
 
 import (
 	"bytes"
-	"errors"
 	"fmt"
 	"strings"
-
-	"golang.org/x/sys/unix"
 )
 
 func preservePlatformXattrs(temp, target string) error {
-	return reconcilePlatformXattrs(temp, target, xattrOperations{
-		list:   listXattrs,
-		get:    getXattr,
-		set:    unix.Setxattr,
-		remove: removeXattr,
-	})
+	return reconcilePlatformXattrs(temp, target, platformXattrOperations())
 }
 
 type xattrOperations struct {
@@ -90,51 +82,6 @@ func preserveContentXattr(name string) bool {
 	default:
 		return true
 	}
-}
-
-func listXattrs(path string) ([]string, error) {
-	size, err := unix.Listxattr(path, nil)
-	if err != nil {
-		if errors.Is(err, unix.ENOTSUP) || errors.Is(err, unix.EOPNOTSUPP) {
-			return nil, nil
-		}
-		return nil, err
-	}
-	if size == 0 {
-		return nil, nil
-	}
-	buf := make([]byte, size)
-	n, err := unix.Listxattr(path, buf)
-	if err != nil {
-		return nil, err
-	}
-	return splitXattrNames(buf[:n]), nil
-}
-
-func getXattr(path, name string) ([]byte, error) {
-	size, err := unix.Getxattr(path, name, nil)
-	if err != nil {
-		return nil, err
-	}
-	if size == 0 {
-		return []byte{}, nil
-	}
-	buf := make([]byte, size)
-	n, err := unix.Getxattr(path, name, buf)
-	if err != nil {
-		return nil, err
-	}
-	return buf[:n], nil
-}
-
-func removeXattr(path, name string) error {
-	if err := unix.Removexattr(path, name); err != nil {
-		if isMissingXattr(err) {
-			return nil
-		}
-		return err
-	}
-	return nil
 }
 
 func splitXattrNames(raw []byte) []string {
