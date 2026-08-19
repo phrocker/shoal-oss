@@ -297,6 +297,33 @@ int main(void) {
   assert(shoal_connector_table_exists(admin_connector, "renamed", 0, &exists,
                                       &error) == SHOAL_STATUS_OK);
   assert(exists == 0);
+  const uint8_t rename_split_one[] = {0, 'x'};
+  const uint8_t rename_split_two[] = {'z'};
+  shoal_bytes rename_splits[] = {{rename_split_one, sizeof(rename_split_one)},
+                                 {rename_split_two,
+                                  sizeof(rename_split_two)}};
+  assert(shoal_connector_create_table(admin_connector, "split_source", 0,
+                                      &error) == SHOAL_STATUS_OK);
+  assert(shoal_connector_add_table_splits(admin_connector, "split_source",
+                                          rename_splits, 2, 0, &error) ==
+         SHOAL_STATUS_OK);
+  assert(shoal_connector_rename_table(admin_connector, "split_source",
+                                      "split_target", 0, &error) ==
+         SHOAL_STATUS_OK);
+  assert(shoal_connector_list_table_splits(admin_connector, "split_target", 0,
+                                           &bytes_list, &error) ==
+         SHOAL_STATUS_OK);
+  assert(shoal_bytes_list_count(bytes_list) == 2);
+  shoal_bytes_list_free(&bytes_list);
+  assert(shoal_connector_delete_table(admin_connector, "split_target", 0,
+                                      &error) == SHOAL_STATUS_OK);
+  assert(shoal_connector_create_table(admin_connector, "split_target", 0,
+                                      &error) == SHOAL_STATUS_OK);
+  assert(shoal_connector_list_table_splits(admin_connector, "split_target", 0,
+                                           &bytes_list, &error) ==
+         SHOAL_STATUS_OK);
+  assert(shoal_bytes_list_count(bytes_list) == 0);
+  shoal_bytes_list_free(&bytes_list);
 
   expect_error(shoal_connector_flush_table(admin_connector, "events", 2, 0,
                                            &error),
@@ -428,8 +455,8 @@ int main(void) {
                                                 &error),
                SHOAL_STATUS_NAMESPACE_NOT_EMPTY, &error,
                "namespace not empty");
-  expect_error(shoal_connector_delete_namespace(admin_connector, "analytics",
-                                                0, &error),
+  expect_error(shoal_connector_delete_namespace(admin_connector, "analytics", 0,
+                                                &error),
                SHOAL_STATUS_NAMESPACE_NOT_EMPTY, &error,
                "namespace not empty");
   expect_error(shoal_connector_rename_namespace(admin_connector, NULL, "work",
@@ -662,6 +689,28 @@ int main(void) {
   assert(shoal_connector_has_table_permission(
              admin_connector, "alice", "events", SHOAL_TABLE_PERMISSION_READ,
              0, &has_permission, &error) == SHOAL_STATUS_OK);
+  assert(has_permission == 0);
+  assert(shoal_connector_drop_user(admin_connector, "alice", 0, &error) ==
+         SHOAL_STATUS_OK);
+  assert(shoal_connector_create_user(admin_connector, "alice", &empty_password,
+                                     0, &error) == SHOAL_STATUS_OK);
+  assert(shoal_connector_get_user_authorizations(
+             admin_connector, "alice", 0, &bytes_list, &error) ==
+         SHOAL_STATUS_OK);
+  assert(shoal_bytes_list_count(bytes_list) == 0);
+  shoal_bytes_list_free(&bytes_list);
+  assert(shoal_connector_has_table_permission(
+             admin_connector, "alice", "events", SHOAL_TABLE_PERMISSION_READ,
+             0, &has_permission, &error) == SHOAL_STATUS_OK);
+  assert(has_permission == 0);
+  assert(shoal_connector_has_system_permission(
+             admin_connector, "alice", SHOAL_SYSTEM_PERMISSION_CREATE_TABLE, 0,
+             &has_permission, &error) == SHOAL_STATUS_OK);
+  assert(has_permission == 0);
+  assert(shoal_connector_has_namespace_permission(
+             admin_connector, "alice", "analytics",
+             SHOAL_NAMESPACE_PERMISSION_READ, 0, &has_permission, &error) ==
+         SHOAL_STATUS_OK);
   assert(has_permission == 0);
   assert(shoal_connector_drop_user(admin_connector, "alice", 0, &error) ==
          SHOAL_STATUS_OK);

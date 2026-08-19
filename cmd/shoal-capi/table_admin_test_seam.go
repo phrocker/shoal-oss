@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"unicode"
 
 	"github.com/phrocker/shoal/accumulo"
 )
@@ -331,12 +332,8 @@ func (c *testAdminConnector) DeleteNamespace(ctx context.Context, name string) e
 	if _, ok := c.namespaces[name]; !ok {
 		return accumulo.ErrNamespaceNotFound
 	}
-	for table := range c.tables {
-		namespace := ""
-		if separator := strings.IndexByte(table, '.'); separator >= 0 {
-			namespace = table[:separator]
-		}
-		if namespace == name {
+	for tableName := range c.tables {
+		if namespace, ok := existingTableNamespace(tableName); ok && namespace == name {
 			return accumulo.ErrNamespaceNotEmpty
 		}
 	}
@@ -440,12 +437,7 @@ func (c *testAdminConnector) DropUser(ctx context.Context, user string) error {
 	}
 	delete(c.users, user)
 	delete(c.auths, user)
-	for key := range c.permissions {
-		parts := strings.Split(key, "\x00")
-		if len(parts) == 4 && parts[1] == user {
-			delete(c.permissions, key)
-		}
-	}
+	clearPermissionsForUser(c.permissions, user)
 	return nil
 }
 
@@ -489,6 +481,55 @@ func (c *testAdminConnector) GetUserAuthorizations(ctx context.Context, user str
 
 func permissionKey(kind, user, target string, permission int8) string {
 	return kind + "\x00" + user + "\x00" + target + "\x00" + strconv.Itoa(int(permission))
+}
+
+func existingTableNamespace(tableName string) (string, bool) {
+	if tableName == "" {
+		return "", false
+	}
+	dot := strings.IndexByte(tableName, '.')
+	if dot == 0 {
+		return "", false
+	}
+	if dot > 0 {
+		namespace := tableName[:dot]
+		tablePart := tableName[dot+1:]
+		if !isTestAccumuloNameSegment(namespace) || !isTestAccumuloNameSegment(tablePart) {
+			return "", false
+		}
+		return namespace, true
+	}
+	if !isTestAccumuloNameSegment(tableName) {
+		return "", false
+	}
+	return "", true
+}
+
+func isTestAccumuloNameSegment(value string) bool {
+	if value == "" {
+		return false
+	}
+	for _, r := range value {
+		if r > unicode.MaxASCII || !(unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_') {
+			return false
+		}
+	}
+	return true
+}
+
+func clearPermissionsForUser(permissions map[string]bool, user string) {
+	if len(permissions) == 0 {
+		return
+	}
+	prefixes := [...]string{"system", "table", "namespace"}
+	for _, kind := range prefixes {
+		prefix := kind + "\x00" + user + "\x00"
+		for key := range permissions {
+			if strings.HasPrefix(key, prefix) {
+				delete(permissions, key)
+			}
+		}
+	}
 }
 
 func (c *testAdminConnector) permission(ctx context.Context, key string, set *bool) (bool, error) {
