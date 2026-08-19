@@ -2,6 +2,7 @@ package accumulo
 
 import (
 	"bytes"
+	"math"
 	"testing"
 )
 
@@ -103,6 +104,9 @@ func TestKeyBoundsResolvesRowBoundsToAbsoluteKeys(t *testing.T) {
 	if start == nil || !bytes.Equal(start.Row, []byte("row2\x00")) || !startInclusive {
 		t.Fatalf("exclusive row start = %+v inclusive=%t, want row2+NUL inclusive", start, startInclusive)
 	}
+	if start.Timestamp != math.MaxInt64 {
+		t.Fatalf("start timestamp = %d, want the maximum: timestamps sort descending, so the first key of a row carries it", start.Timestamp)
+	}
 	if end != nil {
 		t.Fatalf("unbounded end = %+v, want nil", end)
 	}
@@ -112,8 +116,8 @@ func TestKeyBoundsResolvesRowBoundsToAbsoluteKeys(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, _, end, endInclusive := inclusiveEnd.KeyBounds()
-	if end == nil || !bytes.Equal(end.Row, []byte("row2\x00")) || endInclusive {
-		t.Fatalf("inclusive row end = %+v inclusive=%t, want row2+NUL exclusive", end, endInclusive)
+	if end == nil || !bytes.Equal(end.Row, []byte("row2\x00")) || endInclusive || end.Timestamp != math.MaxInt64 {
+		t.Fatalf("inclusive row end = %+v inclusive=%t, want row2+NUL exclusive at the maximum timestamp", end, endInclusive)
 	}
 
 	exclusiveEnd, err := NewRange(nil, true, []byte("row2"), false)
@@ -121,8 +125,8 @@ func TestKeyBoundsResolvesRowBoundsToAbsoluteKeys(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, _, end, endInclusive = exclusiveEnd.KeyBounds()
-	if end == nil || !bytes.Equal(end.Row, []byte("row2")) || endInclusive {
-		t.Fatalf("exclusive row end = %+v inclusive=%t, want row2 exclusive", end, endInclusive)
+	if end == nil || !bytes.Equal(end.Row, []byte("row2")) || endInclusive || end.Timestamp != math.MaxInt64 {
+		t.Fatalf("exclusive row end = %+v inclusive=%t, want row2 exclusive at the maximum timestamp", end, endInclusive)
 	}
 
 	inclusiveStart, err := NewRange([]byte("row2"), true, nil, true)
@@ -130,8 +134,8 @@ func TestKeyBoundsResolvesRowBoundsToAbsoluteKeys(t *testing.T) {
 		t.Fatal(err)
 	}
 	start, startInclusive, _, _ = inclusiveStart.KeyBounds()
-	if start == nil || !bytes.Equal(start.Row, []byte("row2")) || !startInclusive {
-		t.Fatalf("inclusive row start = %+v inclusive=%t, want row2 inclusive", start, startInclusive)
+	if start == nil || !bytes.Equal(start.Row, []byte("row2")) || !startInclusive || start.Timestamp != math.MaxInt64 {
+		t.Fatalf("inclusive row start = %+v inclusive=%t, want row2 inclusive at the maximum timestamp", start, startInclusive)
 	}
 }
 

@@ -602,6 +602,60 @@ func TestSeekHonorsRowBoundsForKeysWithFamilies(t *testing.T) {
 	requireRows(t, seek(t, "row1", false, "row2", true), "row2")
 }
 
+// TestSeekHonorsRowBoundsForEmptyFamiliesAndTimestamps pins the harder half of
+// the same contract: a cell with an empty column family and a positive
+// timestamp sorts before Key{Row: R, Timestamp: 0}, because timestamps sort
+// descending, so only a true first-key-of-row boundary keeps it inside an
+// inclusive row start and outside an exclusive one.
+func TestSeekHonorsRowBoundsForEmptyFamiliesAndTimestamps(t *testing.T) {
+	bare := func(row string, timestamp int64, value string) rfile.Entry {
+		return rfile.Entry{
+			Key:   accumulo.Key{Row: []byte(row), Timestamp: timestamp},
+			Value: []byte(value),
+		}
+	}
+	path := writeFile(t, "emptyfamily.rf",
+		bare("row1", 100, "a"),
+		bare("row2", 100, "b"),
+		entry("row2", "cf", "cq", 10, "c"),
+		bare("row3", 100, "d"),
+	)
+	reader, err := rfile.Open(context.Background(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+
+	seek := func(t *testing.T, start any, startInclusive bool, end any, endInclusive bool) string {
+		t.Helper()
+		seekable, err := rfile.NewSeekable(mustRange(t, start, startInclusive, end, endInclusive))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := reader.Seek(context.Background(), seekable); err != nil {
+			t.Fatal(err)
+		}
+		out := ""
+		for _, e := range drain(t, reader) {
+			out += string(e.Value)
+		}
+		return out
+	}
+
+	if got := seek(t, "row2", true, nil, true); got != "bcd" {
+		t.Fatalf("inclusive start at row2 = %q, want bcd: the empty-family cell of row2 must be included", got)
+	}
+	if got := seek(t, "row2", false, nil, true); got != "d" {
+		t.Fatalf("exclusive start at row2 = %q, want d: every cell of row2 must be skipped", got)
+	}
+	if got := seek(t, nil, true, "row2", true); got != "abc" {
+		t.Fatalf("inclusive end at row2 = %q, want abc", got)
+	}
+	if got := seek(t, nil, true, "row2", false); got != "a" {
+		t.Fatalf("exclusive end at row2 = %q, want a: no cell of row2 may survive", got)
+	}
+}
+
 func TestOperationsHonorCancelledContext(t *testing.T) {
 	path := writeFile(t, "cancel.rf", entry("row1", "cf", "cq", 10, "v"))
 	reader, err := rfile.OpenSequential(context.Background(), path)

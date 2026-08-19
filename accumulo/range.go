@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"math"
 
 	"github.com/phrocker/shoal/internal/thrift/gen/data"
 )
@@ -118,16 +119,24 @@ func (r *Range) EndInclusive() bool {
 // key-ordered reader needs.
 //
 // NewRange builds a row-bounded range, and a row bound is not the key that
-// spells the row: every key in row R with a non-empty column family sorts
-// after Key{Row: R}. Resolving the two forms therefore differs:
+// spells the row. Every cell of row R sorts at or after the *first possible
+// key* of R, which is Key{Row: R} with the maximum timestamp, because Accumulo
+// sorts timestamps descending: a cell at (R, empty family, timestamp 100)
+// sorts before Key{Row: R, Timestamp: 0}. Resolving the two forms therefore
+// differs:
 //
-//   - an exclusive row start becomes the following row boundary (R+NUL),
-//     inclusive, so the whole row is skipped;
-//   - an inclusive row end becomes the following row boundary (R+NUL),
-//     exclusive, so the whole row is kept — the same conversion toThrift
-//     performs on the wire;
+//   - an inclusive row start becomes the first possible key of the row;
+//   - an exclusive row start becomes the first possible key of the following
+//     row boundary (R+NUL), so the whole row is skipped;
+//   - an inclusive row end becomes that same following-row boundary, exclusive,
+//     so the whole row is kept;
+//   - an exclusive row end becomes the first possible key of the row,
+//     exclusive, so the whole row is dropped;
 //   - a range built by NewKeyRange already carries absolute keys and is
 //     returned with its own inclusivity.
+//
+// The boundary key carries no delete flag, exactly like Accumulo's own
+// Key(Text row) row boundary, because accumulo.Key cannot express one.
 //
 // The returned keys are copies, and a nil key means that side is unbounded.
 func (r *Range) KeyBounds() (start *Key, startInclusive bool, end *Key, endInclusive bool) {
@@ -135,16 +144,26 @@ func (r *Range) KeyBounds() (start *Key, startInclusive bool, end *Key, endInclu
 		return nil, true, nil, false
 	}
 	start, startInclusive = r.StartKey(), r.startInclusive
-	if start != nil && r.startRowOnly && !r.startInclusive {
-		start.Row = append(cloneRow(start.Row), 0)
+	if start != nil && r.startRowOnly {
+		start = firstKeyOfRow(start.Row, !r.startInclusive)
 		startInclusive = true
 	}
 	end, endInclusive = r.EndKey(), r.endInclusive
-	if end != nil && r.endRowOnly && r.endInclusive {
-		end.Row = append(cloneRow(end.Row), 0)
+	if end != nil && r.endRowOnly {
+		end = firstKeyOfRow(end.Row, r.endInclusive)
 		endInclusive = false
 	}
 	return start, startInclusive, end, endInclusive
+}
+
+// firstKeyOfRow returns the smallest key Accumulo can hold in row, or in the
+// row that immediately follows it when following is true.
+func firstKeyOfRow(row []byte, following bool) *Key {
+	bound := cloneRow(row)
+	if following {
+		bound = append(bound, 0)
+	}
+	return &Key{Row: bound, Timestamp: math.MaxInt64}
 }
 
 func (r *Range) routingRow() []byte {
