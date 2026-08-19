@@ -3,19 +3,26 @@ from __future__ import annotations
 from collections.abc import Iterator, Sequence
 from collections import Counter, defaultdict
 from functools import lru_cache
+import os
 from pathlib import Path
 import re
+import shlex
+import shutil
+import subprocess
 import sys
+import tempfile
 
 
 DOC_PATH = Path(__file__).with_name("sharkbite-compatibility.md")
-# The manifest pins the current inventory: one "ROW-ID STATUS" entry per row, in
-# document order. Update it whenever that inventory legitimately changes — an
-# audit that reclassifies rows, or an implementation change that moves rows
-# between statuses under the decision procedure in section 4.2 — together with
-# EXPECTED_REVISION and the pinned counts below, and review every added,
-# removed, or reclassified row in code review.
-ROW_MANIFEST = DOC_PATH.with_name("sharkbite-compatibility-rows.txt")
+EXPECTED_REVISION = 19
+# Update this manifest only when the independently audited inventory itself
+# changes; review every added/removed or reclassified ID in code review.
+EXPECTED_ROW_MANIFEST = DOC_PATH.with_name(
+    f"sharkbite-compatibility-revision{EXPECTED_REVISION}-rows.txt"
+)
+EXPECTED_C_ABI_SYMBOL_MANIFEST = DOC_PATH.with_name(
+    f"sharkbite-compatibility-revision{EXPECTED_REVISION}-cabi-symbols.txt"
+)
 
 STATUSES = {
     "Covered",
@@ -28,11 +35,6 @@ STATUSES = {
 
 NOT_REQUIRED_STATUS = "Not required (rationale required)"
 INTENTIONAL_DIVERGENCE_STATUS = "Intentional divergence (approval required)"
-# Revision of the independently audited inventory pinned below. A document
-# revision bump cannot land without updating this constant, because the
-# expected document-status snippet and the narrative phrasing are derived from
-# it.
-EXPECTED_REVISION = 17
 EXPECTED_TOTAL_ROWS = 3203
 EXPECTED_REQUIRED_ROWS = 2811
 
@@ -57,10 +59,10 @@ def status_count_map(
 
 
 EXPECTED_STATUS_COUNTS = {
-    "Covered": 0,
-    "Missing Go": 2436,
-    "Missing C ABI": 128,
-    "Behavior mismatch": 160,
+    "Covered": 1,
+    "Missing Go": 2420,
+    "Missing C ABI": 91,
+    "Behavior mismatch": 212,
     "Intentional divergence (approval required)": 87,
     "Not required (rationale required)": 392,
 }
@@ -68,21 +70,21 @@ EXPECTED_STATUS_COUNTS = {
 EXPECTED_PREFIX_COUNTS = {
     "SB-BASE": status_count_map(missing_c_abi=18, not_required=2),
     "SB-CFG": status_count_map(
-        missing_c_abi=20,
-        behavior_mismatch=8,
+        missing_go=11,
+        behavior_mismatch=17,
         intentional_divergence=2,
         not_required=6,
     ),
     "SB-CONN": status_count_map(
-        missing_go=3,
-        missing_c_abi=2,
-        behavior_mismatch=7,
+        missing_go=1,
+        missing_c_abi=1,
+        behavior_mismatch=10,
         intentional_divergence=1,
     ),
     "SB-CPP": status_count_map(
         missing_go=11,
-        missing_c_abi=4,
-        behavior_mismatch=47,
+        missing_c_abi=1,
+        behavior_mismatch=50,
         not_required=8,
     ),
     "SB-CXX": status_count_map(
@@ -99,14 +101,14 @@ EXPECTED_PREFIX_COUNTS = {
     "SB-EMB": status_count_map(not_required=35),
     "SB-ERR": status_count_map(
         missing_go=2,
-        missing_c_abi=5,
-        behavior_mismatch=5,
+        missing_c_abi=4,
+        behavior_mismatch=6,
         intentional_divergence=1,
         not_required=3,
     ),
     "SB-HDFS": status_count_map(missing_go=26),
     "SB-LOG": status_count_map(missing_go=2, behavior_mismatch=1),
-    "SB-NS": status_count_map(missing_go=7, behavior_mismatch=1),
+    "SB-NS": status_count_map(behavior_mismatch=8),
     "SB-PANDA": status_count_map(missing_c_abi=20, not_required=1),
     "SB-PKG": status_count_map(
         missing_c_abi=10,
@@ -125,16 +127,15 @@ EXPECTED_PREFIX_COUNTS = {
         behavior_mismatch=11,
         not_required=5,
     ),
-    "SB-SEC": status_count_map(missing_go=17, behavior_mismatch=1, not_required=1),
+    "SB-SEC": status_count_map(behavior_mismatch=18, not_required=1),
     "SB-STAT": status_count_map(
         missing_go=1,
         intentional_divergence=82,
         not_required=1,
     ),
     "SB-TABLE": status_count_map(
-        missing_go=3,
-        missing_c_abi=11,
-        behavior_mismatch=2,
+        missing_go=2,
+        behavior_mismatch=14,
         not_required=6,
     ),
     "SB-TORCH": status_count_map(missing_c_abi=9),
@@ -145,8 +146,9 @@ EXPECTED_PREFIX_COUNTS = {
         not_required=9,
     ),
     "SB-XCUT": status_count_map(
+        covered=1,
         missing_go=1,
-        missing_c_abi=4,
+        missing_c_abi=3,
         behavior_mismatch=14,
     ),
 }
@@ -188,20 +190,18 @@ EXPECTED_METADATA_FIELDS = {
     ),
     "Sharkbite release line": "`sharkbite` 1.2.0.3 on PyPI (`setup.py:34-35`)",
     "Shoal reference": (
-        "`phrocker/shoal-oss` exact audited baseline for revision 17 "
-        "`298a036d32247a85941724798c85033cb939cde7` "
-        "(\"Merge pull request #101 from phrocker/rewrite/108-compatibility-matrix-followup\"), "
-        "plus the `accumulo` client-configuration and instance-topology additions "
-        "introduced in the same change as this revision"
+        "`phrocker/shoal-oss` exact audited baseline for revision 19 "
+        "`04ff6ff072fdad78bc3104035feae64e9722bc5d` "
+        "(\"Merge pull request #103 from phrocker/rewrite/108-capi-admin-parity\") "
+        "plus this connector-identity ABI change"
     ),
     "Shoal C ABI version": "`SHOAL_ABI_VERSION 1u` (`capi/include/shoal_types.h`)",
 }
 
 EXPECTED_DOCUMENT_STATUS_SNIPPETS = (
     "Normative gate. Binding on all Sharkbite-compatibility work.",
-    f"Revision {EXPECTED_REVISION} — the first implementation-driven revision",
-    "Revision 16 applied the fifteenth independent audit",
-    "Revision 15 applied the fourteenth audit",
+    f"Revision {EXPECTED_REVISION} — adds the merged connector-identity C ABI",
+    "Revision 18 applied the seventeenth independent audit",
     "Revision 9 applied the eighth audit",
 )
 
@@ -214,9 +214,55 @@ INVENTORY_CHANGE_HINT = (
     "inventory revision must update EXPECTED_REVISION, EXPECTED_TOTAL_ROWS, "
     "EXPECTED_REQUIRED_ROWS, EXPECTED_STATUS_COUNTS, EXPECTED_PREFIX_TOTALS, "
     "EXPECTED_PREFIX_COUNTS and the row manifest "
-    "docs/sharkbite-compatibility-rows.txt (row ids, order and pinned statuses) "
+    f"docs/{EXPECTED_ROW_MANIFEST.name} (row ids, order and pinned statuses) "
     "in the same commit, together with the "
     "audit evidence that justifies the new inventory"
+)
+
+GAP_COMPLETION_RULES: dict[str, tuple[str, ...]] = {
+    "SB-GAP-GO-001": ("Missing Go",),
+    "SB-GAP-GO-002": ("Missing Go",),
+    "SB-GAP-C-001": ("Missing Go", "Missing C ABI"),
+    "SB-GAP-C-002": ("Missing Go", "Missing C ABI"),
+    "SB-GAP-C-004": ("Missing Go", "Missing C ABI"),
+    "SB-GAP-C-011": ("Missing Go", "Missing C ABI"),
+}
+
+EXPECTED_ROW_MANIFEST_HEADER = (
+    f"# Revision-{EXPECTED_REVISION} accepted matrix rows for docs/sharkbite-compatibility.md.",
+    "# One entry per row: ROW-ID followed by the audited status, in document order.",
+    "# Pinning the status next to the id means a swap of two rows' statuses inside one",
+    "# section cannot pass the aggregate count checks undetected.",
+    f"# Update only when the independently audited revision-{EXPECTED_REVISION} inventory itself changes.",
+    "# Regenerate from the audited document, review every added/removed/reclassified row",
+    "# in code review, and keep the list in document order for human auditability.",
+)
+
+C_ABI_EXPORT_HEADER_PATH = Path("capi/include/shoal.h")
+C_ABI_REFERENCE_PATHS = (
+    Path("capi/tests/lifecycle.c"),
+    Path("capi/tests/shared_library_query.c"),
+    Path("capi/tests/header_cpp_test.cpp"),
+)
+DEFAULT_C_ABI_INCLUDE_PATHS = (
+    Path("capi/include"),
+    Path("capi/tests"),
+)
+EXPECTED_C_ABI_DECLARED_EXPORTS = 112
+EXPECTED_C_ABI_REFERENCED_EXPORTS = 106
+EXPECTED_C_ABI_UNREFERENCED_EXPORTS = (
+    "shoal_scanner_scan",
+    "shoal_batch_scanner_scan",
+    "shoal_mutation_delete",
+    "shoal_write_failure_get_constraint",
+    "shoal_write_failure_get_authorization",
+    "shoal_write_failure_get_cleanup",
+)
+EXPECTED_C_ABI_SYMBOL_MANIFEST_HEADER = (
+    f"# Revision-{EXPECTED_REVISION} compiled C ABI symbol inventory for docs/sharkbite-compatibility.md.",
+    "# Generated from the undefined/imported shoal_* references emitted by compiling the exact C/C++",
+    "# sources that cmd/shoal-capi/cabi_test.go links in TestSharedLibraryCABI.",
+    f"# Update only when the independently audited revision-{EXPECTED_REVISION} compiled inventory changes.",
 )
 
 CATEGORY_STATUS_COLUMNS = {
@@ -241,15 +287,6 @@ TARGETED_LOCAL_CITATIONS = {
     "cmd/shoal-capi/cabi_test.go",
     "cmd/shoal-capi/state_test.go",
     "cmd/shoal-capi/writer_export_test.go",
-}
-TARGETED_SB_CFG_CITATIONS = {
-    "accumulo/configuration.go",
-    "accumulo/configuration_test.go",
-    "accumulo/instance.go",
-    "accumulo/topology.go",
-    "accumulo/topology_test.go",
-    "internal/zk/manager.go",
-    "internal/zk/topology_test.go",
 }
 OPTIONAL_ANCHOR_CITATIONS = {
     "capi/include/shoal.h",
@@ -279,6 +316,14 @@ FILE_CITATION_SUFFIXES = {
     ".yaml",
     ".yml",
 }
+EXPORT_SYMBOL_RE = re.compile(
+    r"SHOAL_API\s+[^;]*?\b(?:SHOAL_CALL\s+)?(?P<name>shoal_[A-Za-z0-9_]+)\s*\(",
+    re.S,
+)
+FREE_SYMBOL_RE = re.compile(
+    r"SHOAL_API\s+void\s+SHOAL_CALL\s+(?P<name>shoal_[A-Za-z0-9_]+_free)\s*\(",
+    re.S,
+)
 FILE_CITATION_BASENAMES = {"ARCHITECTURE.md", "CMakeLists.txt", "Dockerfile", "Makefile", "README.md"}
 IDENTIFIER_BOUNDARY_CLASS = r"A-Za-z0-9_"
 IGNORED_ANCHOR_TOKENS = {
@@ -286,7 +331,6 @@ IGNORED_ANCHOR_TOKENS = {
     "C",
     "Go",
     "and",
-    "accumulo",
     "by",
     "char",
     "const",
@@ -297,7 +341,6 @@ IGNORED_ANCHOR_TOKENS = {
     "full",
     "in",
     "inline",
-    "internal",
     "int",
     "interface",
     "long",
@@ -317,7 +360,6 @@ IGNORED_ANCHOR_TOKENS = {
     "void",
     "volatile",
     "with",
-    "zk",
 }
 WHITESPACE_TOLERANT_PUNCTUATION = frozenset("(),*&[]")
 DECLARATION_PATTERNS = (
@@ -686,11 +728,41 @@ def parse_row_manifest_lines(
     return tuple(entries)
 
 
+def validate_expected_row_manifest_provenance(lines: Sequence[str], *, source: str) -> None:
+    filename_match = re.fullmatch(
+        r"sharkbite-compatibility-revision(?P<revision>\d+)-rows\.txt", source
+    )
+    require(
+        filename_match is not None,
+        f"unexpected row manifest filename {source!r}",
+    )
+    assert filename_match is not None
+    require(
+        int(filename_match.group("revision")) == EXPECTED_REVISION,
+        (
+            f"row manifest filename {source!r} does not match EXPECTED_REVISION "
+            f"{EXPECTED_REVISION}"
+        ),
+    )
+    comment_lines = tuple(raw_line.rstrip() for raw_line in lines if raw_line.startswith("#"))
+    require(
+        comment_lines[: len(EXPECTED_ROW_MANIFEST_HEADER)] == EXPECTED_ROW_MANIFEST_HEADER,
+        (
+            f"row manifest header in {source} does not match revision {EXPECTED_REVISION}: "
+            f"expected {EXPECTED_ROW_MANIFEST_HEADER[0]!r}"
+        ),
+    )
+
+
 @lru_cache(maxsize=1)
 def load_expected_rows() -> tuple[tuple[str, str], ...]:
+    manifest_lines = EXPECTED_ROW_MANIFEST.read_text(encoding="utf-8").splitlines()
+    validate_expected_row_manifest_provenance(
+        manifest_lines, source=str(EXPECTED_ROW_MANIFEST.name)
+    )
     rows = parse_row_manifest_lines(
-        ROW_MANIFEST.read_text(encoding="utf-8").splitlines(),
-        source=str(ROW_MANIFEST.name),
+        manifest_lines,
+        source=str(EXPECTED_ROW_MANIFEST.name),
     )
     require(
         len(rows) == EXPECTED_TOTAL_ROWS,
@@ -778,6 +850,398 @@ def validate_pinned_inventory_constants() -> None:
                 f"EXPECTED_STATUS_COUNTS pins {EXPECTED_STATUS_COUNTS[status]}"
             ),
         )
+    require(
+        len(EXPECTED_C_ABI_UNREFERENCED_EXPORTS)
+        == EXPECTED_C_ABI_DECLARED_EXPORTS - EXPECTED_C_ABI_REFERENCED_EXPORTS,
+        (
+            "pinned C ABI symbol counts drifted: "
+            f"{len(EXPECTED_C_ABI_UNREFERENCED_EXPORTS)} missing symbols vs "
+            f"{EXPECTED_C_ABI_DECLARED_EXPORTS} declared and {EXPECTED_C_ABI_REFERENCED_EXPORTS} referenced"
+        ),
+    )
+
+
+def parse_command_text(command_text: str) -> list[str]:
+    return shlex.split(command_text, posix=os.name != "nt")
+
+
+@lru_cache(maxsize=None)
+def go_env(name: str) -> str:
+    output = subprocess.run(
+        ["go", "env", name],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return output.stdout.strip()
+
+
+def compiler_command(name: str) -> list[str] | None:
+    command_text = go_env(name)
+    if not command_text:
+        return None
+    fields = parse_command_text(command_text)
+    return fields if fields else None
+
+
+def symbol_tool_command() -> list[str] | None:
+    for candidate in ("nm", "llvm-nm"):
+        path = shutil.which(candidate)
+        if path is not None:
+            return [path]
+    cc = compiler_command("CC")
+    if cc:
+        compiler_name = Path(cc[0]).name.lower()
+        for suffix in ("gcc", "cc", "clang"):
+            if compiler_name.endswith(suffix):
+                stem = Path(cc[0]).name[: -len(suffix)]
+                candidate = stem + "nm"
+                path = shutil.which(candidate)
+                if path is not None:
+                    return [path]
+    return None
+
+
+def load_c_abi_symbol_manifest_lines(path: Path | None = None) -> list[str]:
+    manifest_path = EXPECTED_C_ABI_SYMBOL_MANIFEST if path is None else path
+    return manifest_path.read_text(encoding="utf-8").splitlines()
+
+
+def parse_named_symbol_sections(
+    lines: Sequence[str], *, source: str
+) -> dict[str, tuple[str, ...]]:
+    sections: dict[str, list[str]] = {}
+    current_section: str | None = None
+    for line_number, raw_line in enumerate(lines, start=1):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        section_match = re.fullmatch(r"\[(?P<section>[a-z_]+)\]", line)
+        if section_match is not None:
+            current_section = section_match.group("section")
+            require(
+                current_section not in sections,
+                f"duplicate symbol section [{current_section}] in {source}",
+            )
+            sections[current_section] = []
+            continue
+        require(
+            current_section is not None,
+            f"unexpected symbol entry before a section header in {source} on line {line_number}: {raw_line!r}",
+        )
+        require(
+            re.fullmatch(r"shoal_[A-Za-z0-9_]+", line) is not None,
+            f"invalid symbol entry in {source} on line {line_number}: {raw_line!r}",
+        )
+        sections[current_section].append(line)
+    return {section: tuple(entries) for section, entries in sections.items()}
+
+
+def validate_expected_c_abi_symbol_manifest_provenance(
+    lines: Sequence[str], *, source: str
+) -> None:
+    filename_match = re.fullmatch(
+        r"sharkbite-compatibility-revision(?P<revision>\d+)-cabi-symbols\.txt",
+        source,
+    )
+    require(filename_match is not None, f"unexpected C ABI symbol manifest filename {source!r}")
+    assert filename_match is not None
+    require(
+        int(filename_match.group("revision")) == EXPECTED_REVISION,
+        (
+            f"C ABI symbol manifest filename {source!r} does not match EXPECTED_REVISION "
+            f"{EXPECTED_REVISION}"
+        ),
+    )
+    comment_lines = tuple(raw_line.rstrip() for raw_line in lines if raw_line.startswith("#"))
+    require(
+        comment_lines[: len(EXPECTED_C_ABI_SYMBOL_MANIFEST_HEADER)]
+        == EXPECTED_C_ABI_SYMBOL_MANIFEST_HEADER,
+        (
+            f"C ABI symbol manifest header in {source} does not match revision "
+            f"{EXPECTED_REVISION}: expected {EXPECTED_C_ABI_SYMBOL_MANIFEST_HEADER[0]!r}"
+        ),
+    )
+
+
+@lru_cache(maxsize=1)
+def load_expected_c_abi_symbol_manifest() -> dict[str, tuple[str, ...]]:
+    lines = load_c_abi_symbol_manifest_lines()
+    validate_expected_c_abi_symbol_manifest_provenance(
+        lines, source=EXPECTED_C_ABI_SYMBOL_MANIFEST.name
+    )
+    sections = parse_named_symbol_sections(lines, source=EXPECTED_C_ABI_SYMBOL_MANIFEST.name)
+    require(
+        set(sections) == {"declared", "referenced", "unreferenced"},
+        (
+            "C ABI symbol manifest sections do not match the audited inventory: "
+            f"{sorted(sections)}"
+        ),
+    )
+    declared = sections["declared"]
+    referenced = sections["referenced"]
+    unreferenced = sections["unreferenced"]
+    require(
+        len(declared) == EXPECTED_C_ABI_DECLARED_EXPORTS,
+        (
+            f"C ABI symbol manifest pins {len(declared)} declared exports, but "
+            f"EXPECTED_C_ABI_DECLARED_EXPORTS pins {EXPECTED_C_ABI_DECLARED_EXPORTS}"
+        ),
+    )
+    require(
+        len(referenced) == EXPECTED_C_ABI_REFERENCED_EXPORTS,
+        (
+            f"C ABI symbol manifest pins {len(referenced)} referenced exports, but "
+            f"EXPECTED_C_ABI_REFERENCED_EXPORTS pins {EXPECTED_C_ABI_REFERENCED_EXPORTS}"
+        ),
+    )
+    require(
+        unreferenced == EXPECTED_C_ABI_UNREFERENCED_EXPORTS,
+        (
+            "C ABI symbol manifest pins a different unreferenced export inventory: "
+            f"{unreferenced}"
+        ),
+    )
+    return sections
+
+
+def collect_c_abi_declared_exports(repo_root: Path | None = None) -> tuple[str, ...]:
+    root = repo_root or DOC_PATH.parent.parent
+    exports = tuple(
+        match.group("name")
+        for match in EXPORT_SYMBOL_RE.finditer(
+            (root / C_ABI_EXPORT_HEADER_PATH).read_text(encoding="utf-8")
+        )
+    )
+    require(exports, f"no SHOAL_API exports found in {C_ABI_EXPORT_HEADER_PATH}")
+    require(
+        len(exports) == len(set(exports)),
+        f"duplicate SHOAL_API export declarations found in {C_ABI_EXPORT_HEADER_PATH}",
+    )
+    return exports
+
+
+def compiler_for_source(source_path: Path) -> list[str] | None:
+    suffix = source_path.suffix.lower()
+    if suffix in {".cpp", ".cc", ".cxx"}:
+        return compiler_command("CXX")
+    return compiler_command("CC")
+
+
+def compile_source_to_object(
+    source_path: Path,
+    object_path: Path,
+    *,
+    include_paths: Sequence[Path],
+    repo_root: Path,
+) -> None:
+    compiler = compiler_for_source(source_path)
+    require(compiler is not None, f"no compiler configured for {source_path}")
+    args = list(compiler)
+    suffix = source_path.suffix.lower()
+    if suffix in {".cpp", ".cc", ".cxx"}:
+        args.extend(["-std=c++11", "-Wall", "-Wextra", "-Werror"])
+    else:
+        args.extend(["-std=c11", "-Wall", "-Wextra", "-Werror"])
+    for include_path in include_paths:
+        args.extend(["-I", str(repo_root / include_path)])
+    args.extend(["-c", str(repo_root / source_path), "-o", str(object_path)])
+    subprocess.run(args, cwd=repo_root, check=True, capture_output=True, text=True)
+
+
+def extract_undefined_shoal_symbols(
+    object_path: Path, *, symbol_tool: Sequence[str]
+) -> tuple[str, ...]:
+    output = subprocess.run(
+        [*symbol_tool, "-u", str(object_path)],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    symbols: set[str] = set()
+    for raw_line in output.splitlines():
+        for token in re.findall(r"(?:__imp__?|_)?shoal_[A-Za-z0-9_]+", raw_line):
+            normalized = token
+            while normalized.startswith("_"):
+                normalized = normalized[1:]
+            if normalized.startswith("imp_"):
+                normalized = normalized[len("imp_") :]
+            if normalized.startswith("_"):
+                normalized = normalized[1:]
+            if normalized.startswith("shoal_"):
+                symbols.add(normalized)
+    return tuple(sorted(symbols))
+
+
+def compiled_c_abi_reference_inventory(
+    source_paths: Sequence[Path] = C_ABI_REFERENCE_PATHS,
+    *,
+    include_paths: Sequence[Path] = DEFAULT_C_ABI_INCLUDE_PATHS,
+    repo_root: Path | None = None,
+) -> tuple[str, ...] | None:
+    root = repo_root or DOC_PATH.parent.parent
+    symbol_tool = symbol_tool_command()
+    if symbol_tool is None:
+        return None
+    if any(compiler_for_source(path) is None for path in source_paths):
+        return None
+    with tempfile.TemporaryDirectory(dir=root) as temp_dir_name:
+        temp_dir = Path(temp_dir_name)
+        collected: set[str] = set()
+        for index, source_path in enumerate(source_paths):
+            object_path = temp_dir / f"symbol_inventory_{index}{source_path.suffix}.o"
+            compile_source_to_object(
+                source_path,
+                object_path,
+                include_paths=include_paths,
+                repo_root=root,
+            )
+            collected.update(
+                extract_undefined_shoal_symbols(object_path, symbol_tool=symbol_tool)
+            )
+    return tuple(sorted(collected))
+
+
+def collect_c_abi_symbol_inventory(
+    repo_root: Path | None = None,
+) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+    exports = collect_c_abi_declared_exports(repo_root)
+    manifest = load_expected_c_abi_symbol_manifest()
+    compiled_references = compiled_c_abi_reference_inventory(repo_root=repo_root)
+    if compiled_references is None:
+        referenced = manifest["referenced"]
+    else:
+        export_set = set(exports)
+        referenced = tuple(symbol for symbol in compiled_references if symbol in export_set)
+    unreferenced = tuple(symbol for symbol in exports if symbol not in referenced)
+    return exports, referenced, unreferenced
+
+
+def collect_c_abi_free_function_inventory(repo_root: Path | None = None) -> tuple[str, ...]:
+    root = repo_root or DOC_PATH.parent.parent
+    header_text = (root / C_ABI_EXPORT_HEADER_PATH).read_text(encoding="utf-8")
+    free_functions = tuple(match.group("name") for match in FREE_SYMBOL_RE.finditer(header_text))
+    require(free_functions, f"no free functions found in {C_ABI_EXPORT_HEADER_PATH}")
+    require(
+        len(free_functions) == len(set(free_functions)),
+        f"duplicate free function declarations found in {C_ABI_EXPORT_HEADER_PATH}",
+    )
+    return free_functions
+
+
+def format_named_symbol_manifest(
+    sections: dict[str, Sequence[str]], *, header: Sequence[str]
+) -> str:
+    lines = [*header, ""]
+    for section_name in ("declared", "referenced", "unreferenced"):
+        lines.append(f"[{section_name}]")
+        lines.extend(sections[section_name])
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def write_c_abi_symbol_manifest(repo_root: Path | None = None) -> str:
+    exports = collect_c_abi_declared_exports(repo_root)
+    compiled_references = compiled_c_abi_reference_inventory(repo_root=repo_root)
+    require(
+        compiled_references is not None,
+        "standard C/C++ toolchain with nm/llvm-nm is required to regenerate the C ABI symbol manifest",
+    )
+    export_set = set(exports)
+    referenced = tuple(symbol for symbol in compiled_references if symbol in export_set)
+    unreferenced = tuple(symbol for symbol in exports if symbol not in referenced)
+    manifest_text = format_named_symbol_manifest(
+        {
+            "declared": exports,
+            "referenced": referenced,
+            "unreferenced": unreferenced,
+        },
+        header=EXPECTED_C_ABI_SYMBOL_MANIFEST_HEADER,
+    )
+    EXPECTED_C_ABI_SYMBOL_MANIFEST.write_text(manifest_text, encoding="utf-8")
+    load_expected_c_abi_symbol_manifest.cache_clear()
+    return manifest_text
+
+
+def validate_c_abi_symbol_inventory(full_text: str, repo_root: Path | None = None) -> None:
+    exports, referenced, unreferenced = collect_c_abi_symbol_inventory(repo_root)
+    manifest = load_expected_c_abi_symbol_manifest()
+    require(
+        len(exports) == EXPECTED_C_ABI_DECLARED_EXPORTS,
+        (
+            f"expected {EXPECTED_C_ABI_DECLARED_EXPORTS} SHOAL_API exports in "
+            f"{C_ABI_EXPORT_HEADER_PATH}, found {len(exports)}"
+        ),
+    )
+    require(
+        len(referenced) == EXPECTED_C_ABI_REFERENCED_EXPORTS,
+        (
+            f"expected {EXPECTED_C_ABI_REFERENCED_EXPORTS} C/C++ test-referenced exports, "
+            f"found {len(referenced)}"
+        ),
+    )
+    require(
+        tuple(exports) == manifest["declared"],
+        (
+            "stale declared C ABI export manifest inventory: "
+            f"expected {manifest['declared'][:3]}..., found {tuple(exports)[:3]}..."
+        ),
+    )
+    require(
+        tuple(referenced) == manifest["referenced"],
+        "stale compiled C ABI referenced-export manifest inventory",
+    )
+    require(
+        tuple(unreferenced) == manifest["unreferenced"],
+        "stale compiled C ABI unreferenced-export manifest inventory",
+    )
+    require(
+        unreferenced == EXPECTED_C_ABI_UNREFERENCED_EXPORTS,
+        (
+            "stale unreferenced C ABI export inventory: "
+            f"expected {EXPECTED_C_ABI_UNREFERENCED_EXPORTS}, found {unreferenced}"
+        ),
+    )
+    normalized = normalize_whitespace(full_text)
+    require(
+        (
+            f"applied to {len(exports)} declared exports in `{C_ABI_EXPORT_HEADER_PATH.as_posix()}`"
+            in normalized
+        ),
+        "missing or stale C ABI export-total narrative for SB-XCUT-013",
+    )
+    require(
+        f"reference **{len(referenced)} of the {len(exports)}** exports" in normalized,
+        "missing or stale C ABI export-reference narrative for SB-XCUT-013",
+    )
+    missing_list = ", ".join(f"`{symbol}`" for symbol in unreferenced)
+    require(
+        missing_list in normalized,
+        "missing or stale C ABI unreferenced-export list for SB-XCUT-013",
+    )
+
+
+def validate_c_abi_free_inventory(full_text: str, repo_root: Path | None = None) -> None:
+    free_functions = collect_c_abi_free_function_inventory(repo_root)
+    exports, referenced, _unreferenced = collect_c_abi_symbol_inventory(repo_root)
+    require(
+        all(symbol in exports for symbol in free_functions),
+        "C ABI free-function inventory contains symbols not declared in shoal.h",
+    )
+    missing_references = [symbol for symbol in free_functions if symbol not in referenced]
+    require(
+        not missing_references,
+        (
+            "typed C ABI free functions are missing from the compiled reference inventory: "
+            f"{', '.join(missing_references)}"
+        ),
+    )
+    normalized = normalize_whitespace(full_text)
+    free_list = ", ".join(f"`{symbol}`" for symbol in free_functions)
+    require(
+        f"{len(free_functions)} typed free functions — {free_list}" in normalized,
+        "missing or stale typed free-function inventory for SB-XCUT-002",
+    )
 
 
 def moved_row_diagnostics(
@@ -841,7 +1305,7 @@ def validate_expected_row_sequence(
     )
 
 
-def validate_pinned_inventory(
+def validate_revision_inventory(
     rows: Sequence[tuple[str, str]],
     status_counts: Counter[str],
     prefix_counts: dict[str, Counter[str]],
@@ -905,6 +1369,110 @@ def validate_pinned_inventory(
             )
 
 
+def parse_gap_completion_tables(lines: list[str]) -> dict[str, tuple[str, str]]:
+    gap_rows: dict[str, tuple[str, str]] = {}
+    for heading in (
+        "### 23.1 Stage 1 — Go parity (blocks everything)",
+        "### 23.2 Stage 2 — C ABI parity (blocked by Stage 1 per row)",
+    ):
+        headers, rows = parse_markdown_table(lines, heading)
+        require(
+            headers == ["ID", "Gap", "Matrix rows", "Existing issue/PR", "Notes"],
+            f"unexpected headers under {heading}: {headers}",
+        )
+        for row in rows:
+            row_id, _gap, matrix_rows, _existing, notes = row
+            if row_id.startswith("SB-GAP-"):
+                require(
+                    row_id not in gap_rows,
+                    f"duplicate audited gap row {row_id}",
+                )
+                gap_rows[row_id] = (matrix_rows, notes)
+    return gap_rows
+
+
+def expand_gap_row_references(
+    matrix_rows_cell: str, row_statuses: dict[str, str], *, gap_id: str
+) -> tuple[str, ...]:
+    expanded: list[str] = []
+    seen: set[str] = set()
+    for token in matrix_rows_cell.split(","):
+        entry = token.strip()
+        if not entry:
+            continue
+        if entry.endswith("-*"):
+            prefix = entry[:-1]
+            matches = sorted(row_id for row_id in row_statuses if row_id.startswith(prefix))
+            require(matches, f"{gap_id} references no audited rows for wildcard {entry}")
+            candidates = matches
+        elif "…" in entry:
+            start, end = [part.strip() for part in entry.split("…", 1)]
+            require(start and end, f"{gap_id} contains an empty range boundary in {entry!r}")
+            require("-" in start and "-" in end, f"{gap_id} contains a malformed range {entry}")
+            start_prefix, start_number = start.rsplit("-", 1)
+            end_prefix, end_number = end.rsplit("-", 1)
+            require(
+                start_prefix == end_prefix,
+                f"{gap_id} mixes prefixes in range {entry}",
+            )
+            require(
+                start_number.isdigit() and end_number.isdigit(),
+                f"{gap_id} contains a non-numeric range {entry}",
+            )
+            require(
+                int(start_number) <= int(end_number),
+                f"{gap_id} contains a descending range {entry}",
+            )
+            width = max(len(start_number), len(end_number))
+            candidates = [
+                f"{start_prefix}-{value:0{width}d}"
+                for value in range(int(start_number), int(end_number) + 1)
+            ]
+        else:
+            candidates = [entry]
+        for row_id in candidates:
+            require(row_id in row_statuses, f"{gap_id} references unknown row {row_id}")
+            if row_id not in seen:
+                seen.add(row_id)
+                expanded.append(row_id)
+    require(expanded, f"{gap_id} claims completion without referencing any matrix rows")
+    return tuple(expanded)
+
+
+def validate_gap_completion_consistency(
+    lines: list[str],
+    rows: Sequence[tuple[str, str]],
+    *,
+    rules: dict[str, tuple[str, ...]] | None = None,
+) -> None:
+    active_rules = GAP_COMPLETION_RULES if rules is None else rules
+    gap_rows = parse_gap_completion_tables(lines)
+    row_statuses = dict(rows)
+    for gap_id, forbidden_statuses in active_rules.items():
+        require(gap_id in gap_rows, f"missing audited gap row {gap_id}")
+        matrix_rows_cell, _notes = gap_rows[gap_id]
+        referenced_rows = expand_gap_row_references(
+            matrix_rows_cell, row_statuses, gap_id=gap_id
+        )
+        require(
+            referenced_rows,
+            f"{gap_id} claims completion without referencing any matrix rows",
+        )
+        contradicting = [
+            (row_id, row_statuses[row_id])
+            for row_id in referenced_rows
+            if row_statuses[row_id] in forbidden_statuses
+        ]
+        require(
+            not contradicting,
+            (
+                f"{gap_id} claims completion, but referenced rows remain one of "
+                f"{', '.join(forbidden_statuses)}: "
+                f"{preview_row_ids(contradicting)}"
+            ),
+        )
+
+
 def validate_counts(lines: list[str], full_text: str) -> None:
     metadata = parse_metadata(lines)
     for field, expected_value in EXPECTED_METADATA_FIELDS.items():
@@ -920,7 +1488,8 @@ def validate_counts(lines: list[str], full_text: str) -> None:
     status_counts, prefix_counts, rows = parse_rows(lines)
     total_rows = len(rows)
     require(sum(status_counts.values()) == total_rows, f"expected {total_rows} rows, found {sum(status_counts.values())}")
-    validate_pinned_inventory(rows, status_counts, prefix_counts)
+    validate_revision_inventory(rows, status_counts, prefix_counts)
+    validate_gap_completion_consistency(lines, rows)
 
     metadata_total_rows, metadata_required_rows = parse_rows_metadata(metadata.get("Rows", ""))
     require(
@@ -990,6 +1559,8 @@ def validate_counts(lines: list[str], full_text: str) -> None:
         )
 
     validate_status_narratives(full_text, status_counts, prefix_counts)
+    validate_c_abi_symbol_inventory(full_text)
+    validate_c_abi_free_inventory(full_text)
 
 
 def validate_status_narratives(
@@ -1003,13 +1574,13 @@ def validate_status_narratives(
     python_visible_behavior = status_counts["Behavior mismatch"] - prefix_counts["SB-CXX"]["Behavior mismatch"]
 
     expected_phrases = [
-        f"As of revision {EXPECTED_REVISION} that is {required_rows} of {total_rows} rows, and **none of them is satisfied**",
+        f"As of revision {EXPECTED_REVISION} that is {required_rows} of {total_rows} rows, and **only {status_counts['Covered']} is satisfied** ([SB-XCUT-012](#sec-20))",
         f"{required_rows} rows are **required** by the final release gate ([§2.2](#sec-2)); the {status_counts[NOT_REQUIRED_STATUS]} `Not required` rows are excluded by construction, and {prefix_counts['SB-CXX'][NOT_REQUIRED_STATUS]} of those are the evidence-proved duplicates described in [§19.1](#sec-19-1).",
-        "No row is `Covered`.",
+        "**Exactly 1 row is `Covered`: [SB-XCUT-012](#sec-20).**",
         f"The shape of the work is visible in the {status_counts['Missing Go']} `Missing Go` rows, of which {prefix_counts['SB-CXX']['Missing Go']} are the C++ members in [§19.2](#sec-19-2) that no Shoal layer exports.",
         f"`Behavior mismatch` ({status_counts['Behavior mismatch']}) is the bucket that sets the schedule: {python_visible_behavior} rows on the Python-visible and curated C++ surface each need a differential test against a live cluster or the exported ABI, and {prefix_counts['SB-CXX']['Behavior mismatch']} are destructors of classes bound into Python, where the destruction point is user-observable and the model differs from Go finalisation ([§19.1](#sec-19-1)).",
         f"`Intentional divergence` ({status_counts[INTENTIONAL_DIVERGENCE_STATUS]}) is dominated by one upstream fact: {prefix_counts['SB-STAT'][INTENTIONAL_DIVERGENCE_STATUS]} rows are cluster-status accessors Accumulo itself deleted ([§14](#sec-14), [SB-DIV-016](#sec-26)).",
-        f"`Missing C ABI` ({status_counts['Missing C ABI']}) is concentrated in the Python layers — pandas ({prefix_counts['SB-PANDA']['Missing C ABI']}), high-level helpers ({prefix_counts['SB-BASE']['Missing C ABI']}), PyTorch ({prefix_counts['SB-TORCH']['Missing C ABI']}).",
+        f"`Missing C ABI` ({status_counts['Missing C ABI']}) is now concentrated in the packaging and Python helper layers — pandas ({prefix_counts['SB-PANDA']['Missing C ABI']}), high-level helpers ({prefix_counts['SB-BASE']['Missing C ABI']}), packaging/import scaffolding ({prefix_counts['SB-PKG']['Missing C ABI']}), and PyTorch ({prefix_counts['SB-TORCH']['Missing C ABI']}).",
     ]
     for phrase in expected_phrases:
         require(phrase in normalized, f"missing or stale status narrative: {phrase}")
@@ -1260,13 +1831,18 @@ def validate_targeted_symbol_anchors(
                 )
 
 
-def main() -> None:
+def main(argv: Sequence[str] | None = None) -> None:
+    args = list(sys.argv[1:] if argv is None else argv)
+    if args == ["--rewrite-cabi-symbol-manifest"]:
+        write_c_abi_symbol_manifest()
+        print("matrix-cabi-symbol-manifest-ok")
+        return
+    require(not args, f"unexpected arguments: {args}")
     full_text = DOC_PATH.read_text(encoding="utf-8")
     lines = full_text.splitlines()
     validate_counts(lines, full_text)
     validate_local_line_number_removal(full_text)
     validate_targeted_symbol_anchors(lines)
-    validate_targeted_symbol_anchors(lines, targeted_paths=TARGETED_SB_CFG_CITATIONS)
     print("matrix-counts-ok")
     print("matrix-citations-ok")
 

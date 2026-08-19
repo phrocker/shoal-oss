@@ -17,6 +17,26 @@ int main(void) {
   assert(shoal_bridge_string_alloc("second", 6) == NULL);
   shoal_bridge_test_string_alloc_reset();
 
+  char *identity_name = shoal_bridge_string_alloc("instance", 8);
+  char *identity_id = shoal_bridge_string_alloc("id", 2);
+  char *identity_principal = shoal_bridge_string_alloc("root", 4);
+  assert(identity_name != NULL && identity_id != NULL &&
+         identity_principal != NULL);
+  shoal_connector_identity_result *identity =
+      shoal_bridge_connector_identity_alloc(identity_name, identity_id,
+                                             identity_principal);
+  assert(identity != NULL);
+  shoal_connector_identity_view identity_view = {
+      SHOAL_CONNECTOR_IDENTITY_VIEW_V1_SIZE, NULL, NULL, NULL};
+  assert(shoal_bridge_connector_identity_get(identity, &identity_view));
+  assert(strcmp(identity_view.instance_name, "instance") == 0);
+  assert(strcmp(identity_view.instance_id, "id") == 0);
+  assert(strcmp(identity_view.principal, "root") == 0);
+  assert(!shoal_bridge_connector_identity_get(NULL, &identity_view));
+  assert(!shoal_bridge_connector_identity_get(identity, NULL));
+  shoal_bridge_connector_identity_free(identity);
+  shoal_bridge_connector_identity_free(NULL);
+
   static const uint8_t row[] = {'r', '\0', 'w'};
   static const uint8_t family[] = {'c', 'f'};
   static const uint8_t qualifier[] = {'c', 'q'};

@@ -30,6 +30,8 @@ type connectorAPI interface {
 type ownedConnector struct {
 	connector connectorAPI
 	instance  accumulo.Instance
+	identity  accumulo.InstanceInfo
+	principal string
 	closed    atomic.Bool
 
 	mu      sync.Mutex
@@ -45,9 +47,19 @@ type ownedConnector struct {
 func newOwnedConnector(connector connectorAPI, instance accumulo.Instance) *ownedConnector {
 	idle := make(chan struct{})
 	close(idle)
+	var identity accumulo.InstanceInfo
+	if instance != nil {
+		identity = instance.Info()
+	}
+	principal := ""
+	if source, ok := connector.(interface{ Principal() string }); ok {
+		principal = source.Principal()
+	}
 	return &ownedConnector{
 		connector: connector,
 		instance:  instance,
+		identity:  identity,
+		principal: principal,
 		nextID:    1,
 		cancels:   make(map[uint64]context.CancelFunc),
 		idle:      idle,

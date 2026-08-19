@@ -22,7 +22,7 @@
  */
 #define SHOAL_ABI_VERSION 1u
 #define SHOAL_ABI_VERSION_MAJOR 1u
-#define SHOAL_ABI_VERSION_MINOR 1u
+#define SHOAL_ABI_VERSION_MINOR 2u
 #define SHOAL_ABI_VERSION_PATCH 0u
 #define SHOAL_ABI_PACK_VERSION(major, minor, patch)                           \
   ((((uint32_t)(major) & 0xffu) << 16) |                                     \
@@ -52,10 +52,11 @@ enum {
   SHOAL_ABI_CAPABILITY_TABLE_ADMIN = 9,
   SHOAL_ABI_CAPABILITY_NAMESPACE_ADMIN = 10,
   SHOAL_ABI_CAPABILITY_SECURITY_ADMIN = 11,
-  SHOAL_ABI_CAPABILITY_TABLE_SPLITS = 12
+  SHOAL_ABI_CAPABILITY_TABLE_SPLITS = 12,
+  SHOAL_ABI_CAPABILITY_CONNECTOR_IDENTITY = 13
 };
 
-#define SHOAL_ABI_CAPABILITY_COUNT 13u
+#define SHOAL_ABI_CAPABILITY_COUNT 14u
 #define SHOAL_ABI_CAPABILITY_WORD_BITS 64u
 #define SHOAL_ABI_CAPABILITY_WORD_INDEX(capability_id)                       \
   ((uint32_t)(capability_id) / SHOAL_ABI_CAPABILITY_WORD_BITS)
@@ -91,6 +92,8 @@ enum {
   SHOAL_ABI_CAPABILITY_MASK(SHOAL_ABI_CAPABILITY_SECURITY_ADMIN)
 #define SHOAL_ABI_CAPABILITY_TABLE_SPLITS_MASK                               \
   SHOAL_ABI_CAPABILITY_MASK(SHOAL_ABI_CAPABILITY_TABLE_SPLITS)
+#define SHOAL_ABI_CAPABILITY_CONNECTOR_IDENTITY_MASK                         \
+  SHOAL_ABI_CAPABILITY_MASK(SHOAL_ABI_CAPABILITY_CONNECTOR_IDENTITY)
 #define SHOAL_ABI_CAPABILITY_WORD0                                           \
   (SHOAL_ABI_CAPABILITY_CONNECTOR_MASK | SHOAL_ABI_CAPABILITY_BOOTSTRAP_MASK | \
    SHOAL_ABI_CAPABILITY_ERROR_MASK | SHOAL_ABI_CAPABILITY_SCANNER_MASK |     \
@@ -102,7 +105,8 @@ enum {
    SHOAL_ABI_CAPABILITY_TABLE_ADMIN_MASK |                                   \
    SHOAL_ABI_CAPABILITY_NAMESPACE_ADMIN_MASK |                               \
    SHOAL_ABI_CAPABILITY_SECURITY_ADMIN_MASK |                                \
-   SHOAL_ABI_CAPABILITY_TABLE_SPLITS_MASK)
+   SHOAL_ABI_CAPABILITY_TABLE_SPLITS_MASK |                                  \
+   SHOAL_ABI_CAPABILITY_CONNECTOR_IDENTITY_MASK)
 
 typedef int32_t shoal_status;
 
@@ -158,7 +162,19 @@ typedef struct shoal_namespace_list_result shoal_namespace_list_result;
 typedef struct shoal_namespace_properties_result shoal_namespace_properties_result;
 typedef struct shoal_versioned_properties_result shoal_versioned_properties_result;
 typedef struct shoal_bytes_list_result shoal_bytes_list_result;
+typedef struct shoal_connector_identity_result shoal_connector_identity_result;
 typedef struct shoal_error shoal_error;
+
+typedef struct shoal_connector_identity_view {
+  uint32_t struct_size;
+  const char *instance_name;
+  const char *instance_id;
+  const char *principal;
+} shoal_connector_identity_view;
+
+#define SHOAL_CONNECTOR_IDENTITY_VIEW_V1_SIZE                                \
+  ((uint32_t)(offsetof(shoal_connector_identity_view, principal) +           \
+              sizeof(((shoal_connector_identity_view *)0)->principal)))
 
 typedef struct shoal_bytes {
   const uint8_t *data;

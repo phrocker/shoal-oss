@@ -142,6 +142,12 @@ struct shoal_bytes_list_result {
   shoal_bridge_bytes_entry *entries;
 };
 
+struct shoal_connector_identity_result {
+  char *instance_name;
+  char *instance_id;
+  char *principal;
+};
+
 shoal_connector *shoal_bridge_connector_alloc(uint64_t id);
 uint64_t shoal_bridge_connector_id(const shoal_connector *connector);
 void shoal_bridge_connector_free(shoal_connector *connector);
@@ -188,6 +194,14 @@ size_t shoal_bridge_scan_result_count(const shoal_scan_result *result);
 int shoal_bridge_scan_result_get(const shoal_scan_result *result, size_t index,
                                  shoal_key_value_view *out_value);
 void shoal_bridge_scan_result_free(shoal_scan_result *result);
+
+shoal_connector_identity_result *shoal_bridge_connector_identity_alloc(
+    char *instance_name, char *instance_id, char *principal);
+int shoal_bridge_connector_identity_get(
+    const shoal_connector_identity_result *result,
+    shoal_connector_identity_view *out_identity);
+void shoal_bridge_connector_identity_free(
+    shoal_connector_identity_result *result);
 
 shoal_table_list_result *shoal_bridge_table_list_alloc(size_t count);
 int shoal_bridge_table_list_set(shoal_table_list_result *result, size_t index,

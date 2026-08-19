@@ -37,7 +37,9 @@ func TestConnectorRegistryLifecycle(t *testing.T) {
 }
 
 type fakeConnectorAPI struct {
-	close func() error
+	close     func() error
+	identity  func(context.Context) (accumulo.InstanceInfo, string, error)
+	principal string
 }
 
 func (c *fakeConnectorAPI) Close() error {
@@ -45,6 +47,17 @@ func (c *fakeConnectorAPI) Close() error {
 		return nil
 	}
 	return c.close()
+}
+
+func (c *fakeConnectorAPI) Principal() string {
+	return c.principal
+}
+
+func (c *fakeConnectorAPI) capiConnectorIdentity(ctx context.Context) (accumulo.InstanceInfo, string, error) {
+	if c.identity != nil {
+		return c.identity(ctx)
+	}
+	return accumulo.InstanceInfo{Name: "test", ID: "test-id"}, c.principal, nil
 }
 
 func (c *fakeConnectorAPI) NewScanner(
