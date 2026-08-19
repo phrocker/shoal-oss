@@ -212,7 +212,7 @@ func scannerStream(
 			return fail(outError, C.SHOAL_STATUS_INVALID_HANDLE, err)
 		}
 	}
-	ctx, done, err := scanner.beginCancelable(timeout, cancellation)
+	ctx, done, err := scanner.beginStream(timeout, cancellation)
 	if err != nil {
 		return failForError(outError, err)
 	}
@@ -283,7 +283,7 @@ func batchScannerStream(
 			return fail(outError, C.SHOAL_STATUS_INVALID_HANDLE, err)
 		}
 	}
-	ctx, done, err := scanner.beginCancelable(timeout, cancellation)
+	ctx, done, err := scanner.beginStream(timeout, cancellation)
 	if err != nil {
 		return failForError(outError, err)
 	}

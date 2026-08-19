@@ -193,3 +193,26 @@ func TestClientCloseCancelsAndJoinsOwnedCursor(t *testing.T) {
 		t.Fatalf("next error = %v, want context.Canceled", err)
 	}
 }
+
+func TestConnectorCloseCancelsAndJoinsOwnedScannerCursor(t *testing.T) {
+	owner := newOwnedConnector(&fakeConnectorAPI{}, &fakeConnectorInstance{})
+	scanner := newOwnedScanner(nil, nil, owner)
+	ctx, done, err := scanner.beginStream(0, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := newFakeScanCursor(nil)
+	cursor := newOwnedScanCursor(ctx, source, done)
+
+	closeDone := make(chan error, 1)
+	go func() {
+		closeDone <- owner.close()
+	}()
+	if err := <-closeDone; err != nil {
+		t.Fatal(err)
+	}
+	<-cursor.stopped
+	if _, _, err := cursor.next(1); !errors.Is(err, context.Canceled) {
+		t.Fatalf("next error = %v, want context.Canceled", err)
+	}
+}

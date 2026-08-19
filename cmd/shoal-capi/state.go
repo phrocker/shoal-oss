@@ -628,6 +628,61 @@ func (s *ownedScanner) beginCancelable(
 	}, nil
 }
 
+func (s *ownedScanner) beginStream(
+	timeout time.Duration,
+	cancellation *ownedCancellation,
+) (context.Context, func(), error) {
+	ctx, scannerDone, err := s.begin(timeout)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	var (
+		ownerDone func()
+		stopOwner func() bool
+		cancel    context.CancelFunc
+	)
+	if s.owner != nil {
+		ownerCtx, done, ownerErr := s.owner.begin(timeout)
+		if ownerErr != nil {
+			scannerDone()
+			return nil, nil, ownerErr
+		}
+		ownerDone = done
+		ctx, cancel = context.WithCancel(ctx)
+		stopOwner = context.AfterFunc(ownerCtx, cancel)
+	}
+
+	var cancellationDone func()
+	if cancellation != nil {
+		ctx, cancellationDone, err = cancellation.attach(ctx)
+		if err != nil {
+			if stopOwner != nil {
+				stopOwner()
+				cancel()
+				ownerDone()
+			}
+			scannerDone()
+			return nil, nil, err
+		}
+	}
+
+	var once sync.Once
+	return ctx, func() {
+		once.Do(func() {
+			if cancellationDone != nil {
+				cancellationDone()
+			}
+			if stopOwner != nil {
+				stopOwner()
+				cancel()
+				ownerDone()
+			}
+			scannerDone()
+		})
+	}, nil
+}
+
 func (s *ownedScanner) close() {
 	s.mu.Lock()
 	if !s.closed {
