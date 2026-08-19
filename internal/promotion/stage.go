@@ -179,6 +179,11 @@ func checkNoStagingAliases(src, dst storage.Backend, flatNames map[string]string
 	for i, target := range targets {
 		targetRefs[i] = newStagePathRef(dst, target.path)
 	}
+	for _, target := range targets {
+		if err := validateStagingWriteTarget(dst, target); err != nil {
+			return err
+		}
+	}
 
 	cache := newPathIdentityCache(len(srcPaths) + len(targets))
 	for i := range srcPaths {
@@ -213,6 +218,16 @@ func checkNoStagingAliases(src, dst storage.Backend, flatNames map[string]string
 				)
 			}
 		}
+	}
+	return nil
+}
+
+func validateStagingWriteTarget(dst storage.Backend, target stageWriteTarget) error {
+	if runtime.GOOS == "windows" && localTargetUsesWindowsADSOnBackend(dst, target.path) {
+		return fmt.Errorf(
+			"promotion: stage: write target %s (%s) uses Windows alternate-data-stream syntax on a local destination; refusing ambiguous staging output",
+			target.name, target.path,
+		)
 	}
 	return nil
 }

@@ -768,6 +768,34 @@ func TestLocalBackendPathsOverrideBackendSchemeHeuristics(t *testing.T) {
 	}
 }
 
+func TestLocalTargetUsesWindowsADSOnBackend(t *testing.T) {
+	tests := []struct {
+		name    string
+		backend shstorage.Backend
+		path    string
+		want    bool
+	}{
+		{name: "drive rooted local path is allowed", backend: local.New(), path: `C:\bulk\A.rf`, want: false},
+		{name: "drive relative local path is allowed", backend: local.New(), path: `C:bulk\A.rf`, want: false},
+		{name: "double-slash drive path is allowed", backend: local.New(), path: `C://bulk/A.rf`, want: false},
+		{name: "default stream short form is rejected", backend: local.New(), path: `C:\bulk\A.rf:$DATA`, want: true},
+		{name: "default stream long form is rejected", backend: local.New(), path: `C:\bulk\A.rf::$dAtA`, want: true},
+		{name: "named stream is rejected", backend: local.New(), path: `C:\bulk\A.rf:Meta:$DATA`, want: true},
+		{name: "intermediate directory stream is rejected", backend: local.New(), path: `C:\bulk:meta\A.rf`, want: true},
+		{name: "trailing-dot interaction is rejected", backend: local.New(), path: `C:\bulk\A.rf.::$Data`, want: true},
+		{name: "remote uri path on s3 backend is not treated as local ads", backend: &s3.Backend{}, path: `s3://bucket/A.rf:$DATA`, want: false},
+		{name: "custom uri path on nonlocal backend is not treated as local ads", backend: schemeAwareBackend{Backend: memory.New(), schemes: []string{"custom"}}, path: `custom://bucket/A.rf:meta`, want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := localTargetUsesWindowsADSOnBackend(tt.backend, tt.path); got != tt.want {
+				t.Fatalf("localTargetUsesWindowsADSOnBackend(%T, %q) = %v, want %v", tt.backend, tt.path, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestJoinBulkPathPreservesDeclaredSingleCharacterSchemeRoot(t *testing.T) {
 	backend := schemeAwareBackend{Backend: memory.New(), schemes: []string{"x"}}
 	got := joinBulkPath(backend, "x://bucket/prefix", "F0001.rf")

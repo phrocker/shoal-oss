@@ -72,6 +72,43 @@ func pathLooksURLLikeOnBackend(backend storage.Backend, path string) bool {
 	return storage.ExplicitPathScheme(backend, path) != ""
 }
 
+// localTargetUsesWindowsADSOnBackend reports whether path would be an unsafe
+// NTFS alternate-data-stream write target when interpreted as a local Windows
+// destination on backend. It is intentionally lexical and conservative: any
+// additional ":" inside a path component is rejected, regardless of whether it
+// spells the unnamed stream (`:$DATA`, `::$DATA`) or a named stream
+// (`:stream[:$DATA]`). Only the drive-letter separator is exempt.
+func localTargetUsesWindowsADSOnBackend(backend storage.Backend, path string) bool {
+	return storage.UsesLocalPathSemantics(backend) && windowsLocalPathContainsADS(path)
+}
+
+func windowsLocalPathContainsADS(path string) bool {
+	for _, component := range splitWindowsLocalPathComponents(path) {
+		if strings.Contains(component, ":") {
+			return true
+		}
+	}
+	return false
+}
+
+func splitWindowsLocalPathComponents(path string) []string {
+	if hasWindowsDriveLetterPrefix(path) {
+		path = path[2:]
+	}
+	path = strings.TrimLeft(path, `/\`)
+	if path == "" {
+		return nil
+	}
+	return strings.FieldsFunc(path, func(r rune) bool { return r == '/' || r == '\\' })
+}
+
+func hasWindowsDriveLetterPrefix(path string) bool {
+	if len(path) < 2 || path[1] != ':' {
+		return false
+	}
+	return (path[0] >= 'A' && path[0] <= 'Z') || (path[0] >= 'a' && path[0] <= 'z')
+}
+
 func normalizeLocalPathForAlias(path string) string {
 	if normalized, ok := normalizeWindowsDrivePath(path); ok {
 		return normalized

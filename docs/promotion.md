@@ -241,7 +241,12 @@ RFileExportManifest (existing)  →  promotion.BuildLoadMapping
   process's own OS for the local backend) — unconditionally stripping
   trailing dots/spaces would misreport genuinely distinct filenames as
   aliases on Linux/macOS, where a trailing dot or space is ordinary,
-  significant content.
+  significant content. On local Windows destinations, `StageBulkDir`
+  also rejects any additional `:` inside a target path component (for
+  example `A.rf:$DATA`, `A.rf::$DATA`, or named streams such as
+  `A.rf:meta:$DATA`) instead of trying to canonicalize NTFS alternate
+  data stream aliases; the only allowed colon is the drive-letter
+  separator itself.
   `joinBulkPath` and the `bulkDir` root-validation preflight both
   recognize a non-local write target the same, deliberately generic
   way `internal/engine`'s own backend-path joining does: any

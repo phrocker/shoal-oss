@@ -251,6 +251,88 @@ func TestStageBulkDirRejectsTrailingDotOrSpaceWriteTargetsBeforeCopying(t *testi
 	}
 }
 
+func TestStageBulkDirRejectsWindowsADSAbsentWriteTargetsBeforeCopying(t *testing.T) {
+	tests := []struct {
+		name       string
+		targetName string
+		baseName   string
+	}{
+		{name: "default stream short form", targetName: "A.rf:$DATA", baseName: "A.rf"},
+		{name: "default stream long form", targetName: "A.rf::$DATA", baseName: "A.rf"},
+		{name: "case varied trailing-dot default stream", targetName: "A.rf.::$dAtA", baseName: "A.rf"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			src, manifest := memoryManifestFromBlobs(map[string][]byte{
+				filepath.Join("export", "events", "t-0000", tt.targetName): []byte("stream bytes"),
+			})
+			bulkDir := filepath.Join(t.TempDir(), "bulk")
+			if err := os.MkdirAll(bulkDir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+
+			if _, err := StageBulkDir(context.Background(), src, manifest, local.New(), bulkDir); err == nil {
+				t.Fatalf("StageBulkDir with ADS target %q = nil error, want error", tt.targetName)
+			}
+			if _, err := os.Stat(filepath.Join(bulkDir, tt.baseName)); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("base target %q exists after rejected ADS stage: err=%v", tt.baseName, err)
+			}
+			if _, err := os.Stat(filepath.Join(bulkDir, "loadmap.json")); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("loadmap.json exists after rejected ADS stage: err=%v", err)
+			}
+		})
+	}
+}
+
+func TestStageBulkDirRejectsWindowsADSWriteTargetsWithoutMutatingExistingFiles(t *testing.T) {
+	tests := []struct {
+		name         string
+		targetName   string
+		checkNoNamed bool
+	}{
+		{name: "unnamed stream alias keeps existing base file intact", targetName: "A.rf::$dAtA"},
+		{name: "named stream keeps existing base file intact", targetName: "A.rf:Meta:$DATA", checkNoNamed: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			bulkDir := filepath.Join(t.TempDir(), "bulk")
+			if err := os.MkdirAll(bulkDir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			baseTarget := filepath.Join(bulkDir, "A.rf")
+			original := []byte("existing target bytes that must survive a rejected ADS stage")
+			if err := os.WriteFile(baseTarget, original, 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			src, manifest := memoryManifestFromBlobs(map[string][]byte{
+				filepath.Join("export", "events", "t-0000", tt.targetName): []byte("replacement bytes"),
+			})
+			if _, err := StageBulkDir(context.Background(), src, manifest, local.New(), bulkDir); err == nil {
+				t.Fatalf("StageBulkDir with ADS target %q = nil error, want error", tt.targetName)
+			}
+
+			got, err := os.ReadFile(baseTarget)
+			if err != nil {
+				t.Fatalf("existing base target missing after rejected ADS stage: %v", err)
+			}
+			if string(got) != string(original) {
+				t.Fatalf("existing base target corrupted by rejected ADS stage: got %q, want %q", got, original)
+			}
+			if tt.checkNoNamed {
+				if _, err := os.ReadFile(filepath.Join(bulkDir, tt.targetName)); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("named stream target %q became readable after rejected ADS stage: err=%v", tt.targetName, err)
+				}
+			}
+			if _, err := os.Stat(filepath.Join(bulkDir, "loadmap.json")); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("loadmap.json exists after rejected ADS stage: err=%v", err)
+			}
+		})
+	}
+}
+
 func TestStageBulkDirRejectsWindowsDOS83AliasedAbsentWriteTargetsBeforeCopying(t *testing.T) {
 	src, manifest := memoryManifestFromBlobs(map[string][]byte{
 		"export/events/t-0000/LongFilename.rf": []byte("first"),
