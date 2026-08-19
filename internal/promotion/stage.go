@@ -104,6 +104,31 @@ func StageBulkDir(
 	dst storage.Backend,
 	bulkDir string,
 ) (LoadMapping, error) {
+	return stageBulkDir(ctx, src, manifest, dst, bulkDir, true)
+}
+
+// stageBulkDir is StageBulkDir's real implementation. verify controls
+// whether engine.VerifyRFileExport runs here: Promote's stagingPreflight
+// already calls it once, before AddTableSplits, so Promote's own call
+// into this function passes verify=false to avoid reading and hashing
+// every RFile's full content a second time. Unlike stagingPreflight's
+// other checks (dedupeStageSources/flattenNames/checkNoStagingAliases),
+// which are cheap enough that recomputing them here is not worth
+// avoiding (see stagingPreflight's own doc comment), VerifyRFileExport
+// streams and hashes every RFile's actual bytes, so duplicating it would
+// double the I/O cost of every promotion in proportion to the export's
+// total size. StageBulkDir, the exported entry point every other caller
+// and every existing test uses, always passes verify=true, so it keeps
+// exactly the verify-before-copy behavior described in StageBulkDir's
+// own doc comment above.
+func stageBulkDir(
+	ctx context.Context,
+	src storage.Backend,
+	manifest *engine.RFileExportManifest,
+	dst storage.Backend,
+	bulkDir string,
+	verify bool,
+) (LoadMapping, error) {
 	if manifest == nil {
 		return nil, fmt.Errorf("promotion: nil export manifest")
 	}
@@ -113,8 +138,10 @@ func StageBulkDir(
 	if _, _, err := resolveManifestTablets(manifest); err != nil {
 		return nil, err
 	}
-	if err := engine.VerifyRFileExport(ctx, src, manifest); err != nil {
-		return nil, fmt.Errorf("promotion: stage: %w", err)
+	if verify {
+		if err := engine.VerifyRFileExport(ctx, src, manifest); err != nil {
+			return nil, fmt.Errorf("promotion: stage: %w", err)
+		}
 	}
 	stageRFiles, err := dedupeStageSources(src, manifest.RFiles)
 	if err != nil {
@@ -236,7 +263,9 @@ func checkNoStagingAliases(src, dst storage.Backend, flatNames map[string]string
 
 // stagingPreflight runs the same non-mutating, storage-probing
 // validation StageBulkDir itself performs before it copies a single
-// byte or writes loadmap.json: deduping source aliases
+// byte or writes loadmap.json, in the same order StageBulkDir runs it:
+// verifying every RFile against its recorded size/SHA256
+// (engine.VerifyRFileExport), deduping source aliases
 // (dedupeStageSources), flattening every RFile to its bulk-directory
 // basename (flattenNames), and checking the flattened write targets
 // against src and dst for path aliases (checkNoStagingAliases).
@@ -244,23 +273,38 @@ func checkNoStagingAliases(src, dst storage.Backend, flatNames map[string]string
 // Promote calls this, and discards the result, immediately after its
 // own BuildLoadMapping preflight and before AddTableSplits ever runs.
 // Without it, a manifest that is only invalid at this specific layer —
-// a cross-tablet basename collision, an invalid/non-leaf flattened
+// a missing file, a size/hash mismatch against the manifest, a
+// cross-tablet basename collision, an invalid/non-leaf flattened
 // basename, or a source/destination path alias — would only be caught
-// later, inside StageBulkDir's own call to these same three functions,
+// later, inside StageBulkDir's own call to these same four functions,
 // by which point AddTableSplits would already have reconciled the
 // destination's splits (see Promote's own doc comment, which explains
 // why the BuildLoadMapping preflight exists for the identical reason).
 //
-// Recomputing this inside StageBulkDir is cheap and never observes a
-// different destination state: dedupeStageSources and
-// checkNoStagingAliases only probe src/dst path identity (in-memory
-// comparisons for remote/object-store backends, cached local os.Stat
-// calls for local ones — see their own doc comments), and flattenNames
-// is a pure function of the RFile list alone. This mirrors
-// BuildLoadMapping's own preflight, which Promote also calls once early
-// and StageBulkDir recomputes again further on, for the same reason.
-func stagingPreflight(src storage.Backend, rfiles []engine.RFileExportFile, dst storage.Backend, bulkDir string) error {
-	stageRFiles, err := dedupeStageSources(src, rfiles)
+// dedupeStageSources, flattenNames, and checkNoStagingAliases are cheap
+// to recompute inside StageBulkDir and never observe a different
+// destination state: dedupeStageSources and checkNoStagingAliases only
+// probe src/dst path identity (in-memory comparisons for remote/
+// object-store backends, cached local os.Stat calls for local ones —
+// see their own doc comments), and flattenNames is a pure function of
+// the RFile list alone. This mirrors BuildLoadMapping's own preflight,
+// which Promote also calls once early and StageBulkDir recomputes
+// again further on, for the same reason.
+//
+// engine.VerifyRFileExport is different: it streams and hashes every
+// RFile's actual bytes, so it is not cheap to recompute, and
+// stagingPreflight does NOT let StageBulkDir redo it. Promote instead
+// calls the unexported stageBulkDir helper directly with verify=false
+// after this preflight succeeds, so the manifest's content is verified
+// exactly once per Promote call, not twice — see stageBulkDir's own doc
+// comment. A caller invoking StageBulkDir directly (bypassing Promote)
+// still gets the usual verify-before-copy behavior from StageBulkDir
+// itself, unaffected by this.
+func stagingPreflight(ctx context.Context, src storage.Backend, manifest *engine.RFileExportManifest, dst storage.Backend, bulkDir string) error {
+	if err := engine.VerifyRFileExport(ctx, src, manifest); err != nil {
+		return fmt.Errorf("promotion: stage: %w", err)
+	}
+	stageRFiles, err := dedupeStageSources(src, manifest.RFiles)
 	if err != nil {
 		return err
 	}

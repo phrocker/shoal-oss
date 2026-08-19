@@ -484,6 +484,42 @@ func TestPromoteRejectsLoadMapAliasBeforeAddTableSplits(t *testing.T) {
 	}
 }
 
+// TestPromoteRejectsCorruptExportBeforeAddTableSplits is the fourth
+// stagingPreflight-side counterpart: engine.VerifyRFileExport's own
+// rejection (mismatched size/SHA256, or a missing source object; see
+// TestStageBulkDirRejectsCorruptSourceBeforeCopying for that check's own
+// direct coverage) must also fire before AddTableSplits for a
+// multi-tablet manifest, not just inside StageBulkDir's later call to
+// the same function.
+func TestPromoteRejectsCorruptExportBeforeAddTableSplits(t *testing.T) {
+	src := memory.New()
+	src.Put("events/t-0000/F0001.rf", []byte("a"))
+	src.Put("events/t-0001/F0002.rf", []byte("b"))
+	manifest := twoTabletManifest()
+	manifest.RFiles[0].DestinationPath = "events/t-0000/F0001.rf"
+	manifest.RFiles[0].Size = 1
+	manifest.RFiles[0].SHA256 = "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb"
+	manifest.RFiles[1].DestinationPath = "events/t-0001/F0002.rf"
+	manifest.RFiles[1].Size = 1
+	// Deliberately wrong: sha256("b") is 3e23e816...9d, not this value.
+	manifest.RFiles[1].SHA256 = "0000000000000000000000000000000000000000000000000000000000000000"
+
+	dst := memory.New()
+	importer := &fakePromoter{}
+	if _, err := Promote(context.Background(), src, manifest, dst, "/bulk/events-1", importer, "events", Options{}); err == nil {
+		t.Fatal("Promote with a SHA256 mismatch against the manifest = nil error, want error")
+	}
+	if importer.splitCalls != 0 {
+		t.Fatalf("AddTableSplits calls = %d, want 0 (a corrupt/mismatched export must fail before any split reconciliation)", importer.splitCalls)
+	}
+	if importer.calls != 0 {
+		t.Fatalf("BulkImport calls = %d, want 0", importer.calls)
+	}
+	if got := dst.Keys(); len(got) != 0 {
+		t.Fatalf("dst.Keys() = %v, want no staged files when export verification fails first", got)
+	}
+}
+
 func TestPromoteReconcilesSplitsThenStagesThenSubmitsForMultiTabletManifest(t *testing.T) {
 	src := memory.New()
 	src.Put("events/t-0000/F0001.rf", []byte("a"))
@@ -558,7 +594,11 @@ func TestPromoteAbortsBeforeStagingWhenAddTableSplitsFails(t *testing.T) {
 	src.Put("events/t-0001/F0002.rf", []byte("b"))
 	manifest := twoTabletManifest()
 	manifest.RFiles[0].DestinationPath = "events/t-0000/F0001.rf"
+	manifest.RFiles[0].Size = 1
+	manifest.RFiles[0].SHA256 = "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb"
 	manifest.RFiles[1].DestinationPath = "events/t-0001/F0002.rf"
+	manifest.RFiles[1].Size = 1
+	manifest.RFiles[1].SHA256 = "3e23e8160039594a33894f6564e1b1348bbd7a0088d42c4acb73eeaed59c009d"
 
 	dst := memory.New()
 	importer := &fakePromoter{splitErr: accumulo.ErrTableOffline}

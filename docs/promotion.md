@@ -51,9 +51,17 @@ That invariant drives every design choice here:
   metadata query, `accumulo.Connector.ListTableSplits`, immediately
   after `AddTableSplits`, to positively verify the destination's
   resulting splits rather than merely assume them (see §3.3) — this
-  reads tablet metadata through the manager's own client-facing API,
-  the same way any Accumulo client (including the shell's `getsplits`)
-  would, not a direct ZooKeeper/metadata table access.
+  resolves tablet locations by walking the `accumulo.root`/
+  `accumulo.metadata` system tables through this connector's normal
+  scan-based metadata path (`ListTableSplits` → `Connector.Tablets` →
+  `internal/cache.LocatorCache` → `internal/metadata.Walker`), the same
+  mechanism this connector already uses to locate tablets for every
+  scan or write, and the same one any Accumulo client (including the
+  shell's `getsplits`) relies on. It is not a manager RPC/FATE
+  operation, but it is a metadata-table read — through the standard
+  client scan protocol against whichever tablet server hosts the
+  relevant metadata range, not a raw or unmediated ZooKeeper/file
+  access.
 - Shoal's promotion code is a **producer of a staged bulk directory plus
   load mapping**, not a participant in tablet assignment or metadata
   mutation. If Accumulo's FATE operation fails or rejects the request,
@@ -492,19 +500,27 @@ destination splits itself, or the eventual `BulkImport` fails closed (see
   into that chain (via a `BuildLoadMapping` preflight), and everything
   `StageBulkDir` itself would reject before writing a single byte (via a
   `stagingPreflight` call covering source-alias dedup, flattened-basename
-  validity/uniqueness, and staging write-target aliasing) — all before
-  any Accumulo call or destination write — so a malformed manifest or
-  invalid destination never adds a split, stages a file, or submits a
-  bulk import. Each of these three preflights is redundant with
-  validation `StageBulkDir` (and, for the chain shape, `AddTableSplits`
-  reconciliation) performs again further on; every one of them is a pure
-  or local-probe-only function of the manifest and the backends alone,
-  so recomputing is cheap and never observes a different destination
-  state. Submits nothing when the derived mapping is empty (nothing to
-  import) — but still reconciles splits first if the manifest declares a
-  multi-tablet chain, even when every tablet in it ends up empty, so the
-  destination's tablet boundaries don't depend on which tablets happened
-  to carry files.
+  validity/uniqueness, staging write-target aliasing, *and* a full
+  `engine.VerifyRFileExport` content check — every RFile's declared
+  size/SHA256 against its actual source bytes) — all before any
+  Accumulo call or destination write — so a malformed manifest, a
+  corrupt or mismatched export, or an invalid destination never adds a
+  split, stages a file, or submits a bulk import. The dedup/flatten/alias
+  checks inside `stagingPreflight` are redundant with validation
+  `StageBulkDir` performs again further on, and cheaply so: each is a
+  pure or local-probe-only function of the manifest and the backends
+  alone, so recomputing costs nothing and never observes a different
+  destination state. `VerifyRFileExport` is not cheap the same way — it
+  streams and hashes every RFile's full content — so `Promote` does not
+  let `StageBulkDir` redo it: internally it calls the same unexported
+  staging implementation with verification already satisfied, so every
+  RFile's bytes are only read and hashed once per promotion, not twice.
+  `StageBulkDir` itself, the entry point every other caller uses, is
+  unchanged and always verifies before copying. Submits nothing when the
+  derived mapping is empty (nothing to import) — but still reconciles
+  splits first if the manifest declares a multi-tablet chain, even when
+  every tablet in it ends up empty, so the destination's tablet
+  boundaries don't depend on which tablets happened to carry files.
 - `accumulo.Connector.AddTableSplits` — resolves the destination table
   name to its stable ID, then submits the split rows through the manager
   `TABLE_SPLIT` FATE operation, the same protocol
@@ -660,7 +676,7 @@ existing single-tablet suite:
   zero staged writes and zero `BulkImport` calls when `AddTableSplits`
   fails (proving the fail-before-any-write ordering); and a full
   three-tablet success path exercising every step end to end. The
-  `stagingPreflight` ordering guarantee itself is proved by three
+  `stagingPreflight` ordering guarantee itself is proved by four
   `Promote`-level tests, each a multi-tablet manifest that reaches
   `AddTableSplits` unless the fix holds:
   `TestPromoteRejectsCrossTabletBasenameCollisionBeforeAddTableSplits`
@@ -676,6 +692,16 @@ existing single-tablet suite:
   `BulkImport` calls, not just a non-nil error, so a regression that
   moved the check back to only firing inside `StageBulkDir` would fail
   them even if `Promote` still ultimately returned an error.
+  `TestPromoteRejectsCorruptExportBeforeAddTableSplits` covers
+  `engine.VerifyRFileExport` itself — a manifest RFile whose declared
+  SHA256 does not match its real source bytes — and doubles as the
+  regression test for the `verify=false` optimization described above:
+  because `Promote`'s own call into staging skips re-verification, a
+  `stagingPreflight` that stopped checking content would leave nothing
+  in the whole `Promote` call path to catch the corruption, so this
+  test failed with no error at all (not merely a wrong error) against a
+  build with the check removed, which was confirmed directly before
+  this test was added.
 - **Cross-tablet alias/path safety** —
   `TestStageBulkDirRejectsCrossTabletBasenameCollisionBeforeCopying` proves
   the flatten-collision check (previously only exercised within a single
