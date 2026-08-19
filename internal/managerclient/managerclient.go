@@ -141,7 +141,7 @@ type Adapter interface {
 		string,
 		[]MergeabilityUpdate,
 	) ([]TabletExtent, error)
-	FlushTable(context.Context, string, string, bool) error
+	FlushTable(context.Context, string, string, []byte, []byte, bool) error
 	GetTableConfiguration(context.Context, string, string) (map[string]string, error)
 	GetNamespaceConfiguration(context.Context, string, string) (map[string]string, error)
 	GetNamespaceProperties(context.Context, string, string) (map[string]string, error)
@@ -185,7 +185,7 @@ type fateRPC interface {
 
 type managerRPC interface {
 	InitiateFlush(context.Context, *security.TCredentials, string) (int64, error)
-	WaitForFlush(context.Context, *security.TCredentials, string, int64, int64) error
+	WaitForFlush(context.Context, *security.TCredentials, string, []byte, []byte, int64, int64) error
 	SetTableProperty(context.Context, *security.TCredentials, string, string, string) error
 	RemoveTableProperty(context.Context, *security.TCredentials, string, string) error
 	UpdateTabletMergeability(
@@ -370,9 +370,14 @@ func (p *Pooled) SetTableProperty(
 	return mapRPCError(err)
 }
 
+// FlushTable initiates a flush and then waits for it. startRow and endRow
+// bound the flush to the tablets that hold rows between them; nil on either
+// side is unbounded, which is the whole-table flush Accumulo performs when the
+// row fields are absent.
 func (p *Pooled) FlushTable(
 	ctx context.Context,
 	address, tableID string,
+	startRow, endRow []byte,
 	wait bool,
 ) error {
 	if tableID == "" {
@@ -392,8 +397,9 @@ func (p *Pooled) FlushTable(
 	if wait {
 		maxLoops = waitForFlushMaxLoops
 	}
+	start, end := cloneRow(startRow), cloneRow(endRow)
 	_, err = withManagerClient(p, ctx, address, func(rpc managerRPC) (struct{}, error) {
-		return struct{}{}, rpc.WaitForFlush(ctx, credentials, tableID, flushID, maxLoops)
+		return struct{}{}, rpc.WaitForFlush(ctx, credentials, tableID, start, end, flushID, maxLoops)
 	})
 	return mapRPCError(err)
 }
@@ -1112,16 +1118,18 @@ func (r thriftManagerRPC) WaitForFlush(
 	ctx context.Context,
 	credentials *security.TCredentials,
 	tableID string,
+	startRow, endRow []byte,
 	flushID, maxLoops int64,
 ) error {
-	// Accumulo uses absent row fields for an unbounded full-table flush.
+	// Accumulo uses absent row fields for an unbounded full-table flush, and
+	// bounds the flush to the tablets covering [startRow, endRow] otherwise.
 	return r.raw.WaitForFlush(
 		ctx,
 		&clientgen.TInfo{},
 		credentials,
 		tableID,
-		nil,
-		nil,
+		startRow,
+		endRow,
 		flushID,
 		maxLoops,
 	)

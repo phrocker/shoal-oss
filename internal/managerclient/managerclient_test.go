@@ -454,10 +454,10 @@ func TestPooledFlushTableLifecycleAndWaitModes(t *testing.T) {
 	}
 	pooled.newManagerClient = managerFromFakeTransport
 
-	if err := pooled.FlushTable(context.Background(), "manager:9997", "1", false); err != nil {
+	if err := pooled.FlushTable(context.Background(), "manager:9997", "1", nil, nil, false); err != nil {
 		t.Fatal(err)
 	}
-	if err := pooled.FlushTable(context.Background(), "manager:9997", "1", true); err != nil {
+	if err := pooled.FlushTable(context.Background(), "manager:9997", "1", nil, nil, true); err != nil {
 		t.Fatal(err)
 	}
 	if dials.Load() != 1 {
@@ -493,7 +493,7 @@ func TestPooledFlushTableStopsAfterInitiateFailure(t *testing.T) {
 	}
 	pooled.newManagerClient = managerFromFakeTransport
 
-	err := pooled.FlushTable(context.Background(), "manager:9997", "1", true)
+	err := pooled.FlushTable(context.Background(), "manager:9997", "1", nil, nil, true)
 	var managerErr *Error
 	if !errors.As(err, &managerErr) ||
 		managerErr.Kind != ErrorTableNotFound ||
@@ -529,7 +529,7 @@ func TestPooledFlushCancellationEvictsTransport(t *testing.T) {
 	}
 	pooled.newManagerClient = managerFromFakeTransport
 
-	if err := pooled.FlushTable(ctx, "manager:9997", "1", true); !errors.Is(err, context.Canceled) {
+	if err := pooled.FlushTable(ctx, "manager:9997", "1", nil, nil, true); !errors.Is(err, context.Canceled) {
 		t.Fatalf("flush error = %v, want context canceled", err)
 	}
 	if first.closes.Load() != 1 {
@@ -1564,6 +1564,8 @@ type fakeManagerRPC struct {
 	property       string
 	value          string
 	flushTableID   string
+	flushStartRow  []byte
+	flushEndRow    []byte
 	flushID        int64
 	waitFlushID    int64
 	maxLoops       []int64
@@ -1587,10 +1589,13 @@ func (r *fakeManagerRPC) WaitForFlush(
 	ctx context.Context,
 	_ *security.TCredentials,
 	tableID string,
+	startRow, endRow []byte,
 	flushID, maxLoops int64,
 ) error {
 	r.flushWaitCalls.Add(1)
 	r.flushTableID = tableID
+	r.flushStartRow = append([]byte(nil), startRow...)
+	r.flushEndRow = append([]byte(nil), endRow...)
 	r.waitFlushID = flushID
 	r.maxLoops = append(r.maxLoops, maxLoops)
 	if r.waitFlush != nil {

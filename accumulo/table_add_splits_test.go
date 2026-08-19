@@ -114,7 +114,14 @@ func (m *fakeSplitManager) UpdateTabletMergeability(
 	return fn(index, updates)
 }
 
-func (m *fakeSplitManager) FlushTable(context.Context, string, string, bool) error {
+func (m *fakeSplitManager) FlushTable(
+	context.Context,
+	string,
+	string,
+	[]byte,
+	[]byte,
+	bool,
+) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.flushes++
