@@ -322,6 +322,7 @@ OPTIONAL_ANCHOR_CITATIONS = {
 TARGETED_SB_RFILE_CITATIONS = {
     "rfile/close_internal_test.go",
     "rfile/entry.go",
+    "rfile/multigroup_internal_test.go",
     "rfile/errors.go",
     "rfile/reader.go",
     "rfile/rfile_test.go",

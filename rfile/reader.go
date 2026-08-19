@@ -212,7 +212,10 @@ func readEnvironment() iterrt.IteratorEnvironment {
 	return iterrt.IteratorEnvironment{Scope: iterrt.ScopeScan}
 }
 
-// openSource opens one RFile and wraps it as a leaf iterator.
+// openSource opens one RFile and wraps it as a leaf iterator. An RFile may
+// hold several locality groups, each sorted within itself, so every group is
+// opened and merged: a reader that walked the default group alone would
+// silently omit the cells a named group holds.
 func openSource(ctx context.Context, path string) (iterrt.SortedKeyValueIterator, []func() error, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, nil, err
@@ -224,31 +227,52 @@ func openSource(ctx context.Context, path string) (iterrt.SortedKeyValueIterator
 	if err != nil {
 		return nil, nil, fmt.Errorf("rfile: open %s: %w", path, err)
 	}
+	fail := func(err error) (iterrt.SortedKeyValueIterator, []func() error, error) {
+		_ = file.Close()
+		return nil, nil, err
+	}
 	info, err := file.Stat()
 	if err != nil {
-		_ = file.Close()
-		return nil, nil, fmt.Errorf("rfile: stat %s: %w", path, err)
+		return fail(fmt.Errorf("rfile: stat %s: %w", path, err))
 	}
 	bc, err := bcfile.NewReader(file, info.Size())
 	if err != nil {
-		_ = file.Close()
-		return nil, nil, fmt.Errorf("rfile: read %s: %w", path, err)
+		return fail(fmt.Errorf("rfile: read %s: %w", path, err))
 	}
-	inner, err := rfile.Open(bc, block.Default())
+	groups, err := rfile.OpenAll(bc, block.Default())
 	if err != nil {
-		_ = file.Close()
-		return nil, nil, fmt.Errorf("rfile: read %s: %w", path, err)
+		return fail(fmt.Errorf("rfile: read %s: %w", path, err))
 	}
-	source := iterrt.NewRFileSource(inner, nil)
-	if err := source.Init(nil, nil, readEnvironment()); err != nil {
-		_ = file.Close()
-		return nil, nil, fmt.Errorf("rfile: read %s: %w", path, err)
+	if len(groups) == 0 {
+		return fail(fmt.Errorf("rfile: read %s: file has no locality groups", path))
 	}
-	closers := []func() error{
-		func() error { return inner.Close() },
-		file.Close,
+
+	closers := make([]func() error, 0, len(groups)+1)
+	sources := make([]iterrt.SortedKeyValueIterator, 0, len(groups))
+	for _, group := range groups {
+		closers = append(closers, group.Close)
+		source := iterrt.NewRFileSource(group, nil)
+		if err := source.Init(nil, nil, readEnvironment()); err != nil {
+			for _, closer := range closers {
+				_ = closer()
+			}
+			return fail(fmt.Errorf("rfile: read %s: %w", path, err))
+		}
+		sources = append(sources, source)
 	}
-	return source, closers, nil
+	closers = append(closers, file.Close)
+
+	if len(sources) == 1 {
+		return sources[0], closers, nil
+	}
+	merged := iterrt.NewMergingIterator(sources...)
+	if err := merged.Init(nil, nil, readEnvironment()); err != nil {
+		for _, closer := range closers {
+			_ = closer()
+		}
+		return nil, nil, fmt.Errorf("rfile: read %s: merge %d locality groups: %w", path, len(sources), err)
+	}
+	return merged, closers, nil
 }
 
 // Seek positions the reader, mirroring Sharkbite's RFile.seek,
