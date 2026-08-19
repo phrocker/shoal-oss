@@ -512,6 +512,12 @@ func TestIsTemporaryStageNameMatchesOnlyReservedFormats(t *testing.T) {
 	if isTemporaryStageName("tenant/.shl-visible-blob") {
 		t.Fatal("arbitrary .shl- blob should remain visible")
 	}
+	if isTemporaryStageName("tenant/.shl-aaaaaaaaa") {
+		t.Fatal("short .shl- blob should remain visible")
+	}
+	if isTemporaryStageName("tenant/.shoal-tmp-aaaaaaaaaa12345") {
+		t.Fatal("longer .shoal-tmp- blob should remain visible")
+	}
 }
 
 func TestBackendCreateWithCustomServiceClientRejectsMissingSourceAuthorizationBeforeStaging(t *testing.T) {
@@ -545,6 +551,54 @@ func TestBackendCreateWithCustomServiceClientRejectsEmptySourceAuthorizationProv
 	}
 	if len(ops.objects) != 0 {
 		t.Fatalf("objects after failed Create = %d, want no staged blobs", len(ops.objects))
+	}
+}
+
+func TestBackendCreateRejectsReservedInternalBlobNames(t *testing.T) {
+	backend := &Backend{
+		ops:            newFakeAzureWriteOperations(),
+		sourceProvider: staticAzureCopySourceProvider{},
+	}
+	for _, name := range []string{
+		".shoal-tmp-aaaaaaaaaa1234",
+		"nested/.shoal-tmp-aaaaaaaaaa1234",
+		".shoal-tmp/123e4567-e89b-12d3-a456-426614174000",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := backend.Create(context.Background(), "az://container/"+name); err == nil || !strings.Contains(err.Error(), "reserved internal namespace") {
+				t.Fatalf("Create(%q) error = %v, want reserved internal namespace rejection", name, err)
+			}
+		})
+	}
+}
+
+func TestBackendCreateAllowsUserBlobNamesOutsideReservedNamespace(t *testing.T) {
+	for _, name := range []string{
+		".shl-final.rf",
+		".shl-aaaaaaaaa",
+		".shoal-tmp-aaaaaaaaaa12345",
+		"nested/.shl-final.rf",
+	} {
+		t.Run(name, func(t *testing.T) {
+			ops := newFakeAzureWriteOperations()
+			backend := &Backend{
+				ops:            ops,
+				sourceProvider: staticAzureCopySourceProvider{},
+			}
+			w, err := backend.Create(context.Background(), "az://container/"+name)
+			if err != nil {
+				t.Fatalf("Create(%q): %v", name, err)
+			}
+			if _, err := w.Write([]byte("data")); err != nil {
+				t.Fatalf("Write(%q): %v", name, err)
+			}
+			if err := w.Close(); err != nil {
+				t.Fatalf("Close(%q): %v", name, err)
+			}
+			if got := ops.objects[name].data; got != "data" {
+				t.Fatalf("stored data for %q = %q, want data", name, got)
+			}
+		})
 	}
 }
 

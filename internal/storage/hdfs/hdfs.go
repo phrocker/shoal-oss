@@ -308,6 +308,10 @@ func (b *Backend) Create(ctx context.Context, objectPath string) (storage.Writer
 		_ = lease.release()
 		return nil, err
 	}
+	if isReplacementArtifactName(path.Base(resolved)) {
+		_ = lease.release()
+		return nil, fmt.Errorf("hdfs: destination %s uses a reserved internal namespace", objectPath)
+	}
 	if parent := path.Dir(resolved); parent != "." && parent != "/" {
 		if err := lease.client.MkdirAll(parent, 0o755); err != nil {
 			_ = lease.release()

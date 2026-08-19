@@ -285,6 +285,9 @@ func (b *Backend) Create(ctx context.Context, path string) (shstorage.Writer, er
 	if err != nil {
 		return nil, err
 	}
+	if isTemporaryStageName(name) {
+		return nil, fmt.Errorf("azure: destination blob %q uses a reserved internal namespace", name)
+	}
 	ctx = contextOrBackground(ctx)
 	stageName, err := nextTemporaryStageName(name)
 	if err != nil {

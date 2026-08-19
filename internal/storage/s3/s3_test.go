@@ -423,6 +423,54 @@ func TestIsTemporaryStageKeyMatchesOnlyReservedFormats(t *testing.T) {
 	if isTemporaryStageKey("tenant/.shl-visible-object") {
 		t.Fatal("arbitrary .shl- key should remain visible")
 	}
+	if isTemporaryStageKey("tenant/.shl-aaaaaaaaa") {
+		t.Fatal("short .shl- key should remain visible")
+	}
+	if isTemporaryStageKey("tenant/.shoal-tmp-aaaaaaaaaa12345") {
+		t.Fatal("longer .shoal-tmp- key should remain visible")
+	}
+}
+
+func TestBackendCreateRejectsReservedInternalStageKeys(t *testing.T) {
+	backend := &Backend{ops: newFakeS3WriteOperations()}
+	for _, key := range []string{
+		".shoal-tmp-aaaaaaaaaa1234",
+		"nested/.shoal-tmp-aaaaaaaaaa1234",
+		".shoal-tmp/123e4567-e89b-12d3-a456-426614174000",
+	} {
+		t.Run(key, func(t *testing.T) {
+			if _, err := backend.Create(context.Background(), "s3://bucket/"+key); err == nil || !strings.Contains(err.Error(), "reserved internal namespace") {
+				t.Fatalf("Create(%q) error = %v, want reserved internal namespace rejection", key, err)
+			}
+		})
+	}
+}
+
+func TestBackendCreateAllowsUserKeysOutsideReservedNamespace(t *testing.T) {
+	for _, key := range []string{
+		".shl-final.rf",
+		".shl-aaaaaaaaa",
+		".shoal-tmp-aaaaaaaaaa12345",
+		"nested/.shl-final.rf",
+	} {
+		t.Run(key, func(t *testing.T) {
+			f := newFakeS3WriteOperations()
+			backend := &Backend{ops: f}
+			w, err := backend.Create(context.Background(), "s3://bucket/"+key)
+			if err != nil {
+				t.Fatalf("Create(%q): %v", key, err)
+			}
+			if _, err := w.Write([]byte("data")); err != nil {
+				t.Fatalf("Write(%q): %v", key, err)
+			}
+			if err := w.Close(); err != nil {
+				t.Fatalf("Close(%q): %v", key, err)
+			}
+			if got := f.objects[key].data; got != "data" {
+				t.Fatalf("stored data for %q = %q, want data", key, got)
+			}
+		})
+	}
 }
 
 func TestWriter_StagedCreateAndReplace(t *testing.T) {

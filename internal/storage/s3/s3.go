@@ -153,6 +153,9 @@ func (b *Backend) Create(ctx context.Context, path string) (shstorage.Writer, er
 	if err != nil {
 		return nil, err
 	}
+	if isTemporaryStageKey(key) {
+		return nil, fmt.Errorf("s3: destination key %q uses a reserved internal namespace", key)
+	}
 	ctx = contextOrBackground(ctx)
 	ops := b.writeOperations()
 	target, err := ops.head(ctx, bucket, key)

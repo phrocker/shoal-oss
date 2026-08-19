@@ -58,6 +58,9 @@ func (b *Backend) Open(_ context.Context, path string) (storage.File, error) {
 // already exist — matches "mkdir -p" behavior so callers don't have to pre-
 // create the path tree.
 func (b *Backend) Create(_ context.Context, path string) (storage.Writer, error) {
+	if isReplacementArtifactName(filepath.Base(path)) {
+		return nil, fmt.Errorf("local: destination %s uses a reserved internal namespace", path)
+	}
 	dir := filepath.Dir(path)
 	if dir != "" && dir != "." {
 		if err := os.MkdirAll(dir, 0o755); err != nil {

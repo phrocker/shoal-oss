@@ -136,6 +136,9 @@ func (b *Backend) Create(ctx context.Context, path string) (shstorage.Writer, er
 	if err != nil {
 		return nil, err
 	}
+	if isTemporaryObjectName(object) {
+		return nil, fmt.Errorf("gcs: destination object %q uses a reserved internal namespace", object)
+	}
 	ctx = contextOrBackground(ctx)
 	bucketHandle := b.bucket(bucket)
 	target := bucketHandle.Object(object)

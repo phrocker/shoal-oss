@@ -524,8 +524,11 @@ func TestBackendListHidesGeneratedReplacementArtifacts(t *testing.T) {
 	client := newFakeClient()
 	client.files["/tables/1.rf"] = []byte("one")
 	client.files["/tables/.shl-user-visible"] = []byte("user")
+	client.files["/tables/.shl-aaaaaaaaa"] = []byte("user")
 	client.files["/tables/"+replacementTempPrefix+"visible"] = []byte("visible")
 	client.files["/tables/"+replacementBackupPrefix+"visible"] = []byte("visible")
+	client.files["/tables/"+replacementTempPrefix+strings.Repeat("c", replacementNameTokenBytes*2+1)] = []byte("visible")
+	client.files["/tables/"+replacementBackupPrefix+strings.Repeat("d", replacementNameTokenBytes*2+1)] = []byte("visible")
 	client.files["/tables/"+replacementTempPrefix+strings.Repeat("a", replacementNameTokenBytes*2)] = []byte("temp")
 	client.files["/tables/"+replacementBackupPrefix+strings.Repeat("b", replacementNameTokenBytes*2)] = []byte("backup")
 	backend, err := New("nn:8020", WithClient(client))
@@ -540,13 +543,70 @@ func TestBackendListHidesGeneratedReplacementArtifacts(t *testing.T) {
 	want := []string{
 		"hdfs://nn:8020/tables/1.rf",
 		"hdfs://nn:8020/tables/.shl-user-visible",
+		"hdfs://nn:8020/tables/.shl-aaaaaaaaa",
 		"hdfs://nn:8020/tables/" + replacementTempPrefix + "visible",
 		"hdfs://nn:8020/tables/" + replacementBackupPrefix + "visible",
+		"hdfs://nn:8020/tables/" + replacementTempPrefix + strings.Repeat("c", replacementNameTokenBytes*2+1),
+		"hdfs://nn:8020/tables/" + replacementBackupPrefix + strings.Repeat("d", replacementNameTokenBytes*2+1),
 	}
 	slices.Sort(got)
 	slices.Sort(want)
 	if !slices.Equal(got, want) {
 		t.Fatalf("List returned %v, want %v", got, want)
+	}
+}
+
+func TestBackendCreateRejectsReservedReplacementArtifactNames(t *testing.T) {
+	client := newFakeClient()
+	backend, err := New("nn:8020", WithClient(client))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, name := range []string{
+		replacementTempPrefix + strings.Repeat("a", replacementNameTokenBytes*2),
+		replacementBackupPrefix + strings.Repeat("b", replacementNameTokenBytes*2),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := backend.Create(context.Background(), "hdfs://nn:8020/tables/"+name); err == nil || !strings.Contains(err.Error(), "reserved internal namespace") {
+				t.Fatalf("Create(%q) error = %v, want reserved internal namespace rejection", name, err)
+			}
+		})
+	}
+	if got := len(client.files); got != 0 {
+		t.Fatalf("rejected Create should not stage files, got %d", got)
+	}
+}
+
+func TestBackendCreateAllowsUserNamesOutsideReservedNamespace(t *testing.T) {
+	names := []string{
+		".shl-final.rf",
+		".shl-aaaaaaaaa",
+		replacementTempPrefix + strings.Repeat("e", replacementNameTokenBytes*2+1),
+		replacementBackupPrefix + strings.Repeat("f", replacementNameTokenBytes*2+1),
+		"nested/.shl-final.rf",
+	}
+	for _, name := range names {
+		t.Run(name, func(t *testing.T) {
+			client := newFakeClient()
+			backend, err := New("nn:8020", WithClient(client))
+			if err != nil {
+				t.Fatal(err)
+			}
+			w, err := backend.Create(context.Background(), "hdfs://nn:8020/tables/"+name)
+			if err != nil {
+				t.Fatalf("Create(%q): %v", name, err)
+			}
+			if _, err := w.Write([]byte("data")); err != nil {
+				t.Fatalf("Write(%q): %v", name, err)
+			}
+			if err := w.Close(); err != nil {
+				t.Fatalf("Close(%q): %v", name, err)
+			}
+			if got := string(client.files["/tables/"+name]); got != "data" {
+				t.Fatalf("stored data for %q = %q, want data", name, got)
+			}
+		})
 	}
 }
 

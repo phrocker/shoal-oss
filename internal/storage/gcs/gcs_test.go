@@ -313,8 +313,56 @@ func TestIsTemporaryObjectNameMatchesOnlyReservedFormats(t *testing.T) {
 	if isTemporaryObjectName("tenant/.shl-visible-data") {
 		t.Fatal("user-visible .shl- object should not be hidden")
 	}
+	if isTemporaryObjectName("tenant/.shl-aaaaaaaaa") {
+		t.Fatal("short .shl- object should remain visible")
+	}
+	if isTemporaryObjectName("tenant/.shoal-tmp-aaaaaaaaaa12345") {
+		t.Fatal("longer .shoal-tmp- object should remain visible")
+	}
 	if isTemporaryObjectName("tenant/object.rf" + legacyTempObjectPrefix + "visible") {
 		t.Fatal("non-generated legacy-looking object should not be hidden")
+	}
+}
+
+func TestBackendCreateRejectsReservedInternalObjectNames(t *testing.T) {
+	backend, _ := newFakeBackend()
+	for _, object := range []string{
+		"tenant/.shoal-tmp-aaaaaaaaaa1234",
+		"tenant/nested/.shoal-tmp-aaaaaaaaaa1234",
+		"tenant/object.rf" + legacyTempObjectPrefix + "123e4567-e89b-12d3-a456-426614174000",
+	} {
+		t.Run(object, func(t *testing.T) {
+			if _, err := backend.Create(context.Background(), "bucket/"+object); err == nil || !strings.Contains(err.Error(), "reserved internal namespace") {
+				t.Fatalf("Create(%q) error = %v, want reserved internal namespace rejection", object, err)
+			}
+		})
+	}
+}
+
+func TestBackendCreateAllowsUserObjectsOutsideReservedNamespace(t *testing.T) {
+	for _, object := range []string{
+		"tenant/.shl-final.rf",
+		"tenant/.shl-aaaaaaaaa",
+		"tenant/.shoal-tmp-aaaaaaaaaa12345",
+		"tenant/nested/.shl-final.rf",
+	} {
+		t.Run(object, func(t *testing.T) {
+			backend, bucket := newFakeBackend()
+			w, err := backend.Create(context.Background(), "bucket/"+object)
+			if err != nil {
+				t.Fatalf("Create(%q): %v", object, err)
+			}
+			if _, err := w.Write([]byte("data")); err != nil {
+				t.Fatalf("Write(%q): %v", object, err)
+			}
+			if err := w.Close(); err != nil {
+				t.Fatalf("Close(%q): %v", object, err)
+			}
+			got, ok := bucket.objects[object]
+			if !ok || string(got.body) != "data" {
+				t.Fatalf("destination object %q = %q, present=%v; want data", object, got.body, ok)
+			}
+		})
 	}
 }
 
