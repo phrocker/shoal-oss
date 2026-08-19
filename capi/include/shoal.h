@@ -401,6 +401,28 @@ SHOAL_API shoal_status SHOAL_CALL shoal_client_scan_ranges_with_cancellation(
     shoal_client *client, const shoal_range *ranges, size_t range_count,
     int64_t timeout_ms, shoal_cancellation *cancellation,
     shoal_scan_result **out_result, shoal_error **out_error);
+
+/*
+ * High-level streaming scans hold one copied client-settings snapshot until
+ * cursor close or exhaustion. Client close cancels and joins every cursor.
+ */
+SHOAL_API shoal_status SHOAL_CALL
+shoal_client_stream_range(shoal_client *client, const shoal_range *range,
+                          int64_t timeout_ms, shoal_scan_cursor **out_cursor,
+                          shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL shoal_client_stream_range_with_cancellation(
+    shoal_client *client, const shoal_range *range, int64_t timeout_ms,
+    shoal_cancellation *cancellation, shoal_scan_cursor **out_cursor,
+    shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_client_stream_ranges(shoal_client *client, const shoal_range *ranges,
+                           size_t range_count, int64_t timeout_ms,
+                           shoal_scan_cursor **out_cursor,
+                           shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL shoal_client_stream_ranges_with_cancellation(
+    shoal_client *client, const shoal_range *ranges, size_t range_count,
+    int64_t timeout_ms, shoal_cancellation *cancellation,
+    shoal_scan_cursor **out_cursor, shoal_error **out_error);
 SHOAL_API shoal_status SHOAL_CALL
 shoal_client_create_batch_writer(shoal_client *client,
                                  shoal_accumulo_writer **out_writer,
@@ -852,6 +874,43 @@ shoal_batch_scanner_scan_with_cancellation(
     shoal_batch_scanner *scanner, const shoal_range *ranges,
     size_t range_count, int64_t timeout_ms, shoal_cancellation *cancellation,
     shoal_scan_result **out_result, shoal_error **out_error);
+
+/*
+ * Streaming cursors keep at most one Go scan batch resident. Every returned
+ * shoal_scan_result is independently owned and may outlive the cursor. A
+ * successful next call returns up to max_entries and sets out_exhausted when
+ * no further entries exist; exact chunk boundaries may require one final call
+ * that returns NULL plus out_exhausted=1. Cursor iteration is serialized.
+ * Close is concurrent-safe, cancels an in-flight next call, joins cleanup, and
+ * is idempotent. Free clears the caller's handle and is NULL-safe.
+ */
+SHOAL_API shoal_status SHOAL_CALL
+shoal_scanner_stream(shoal_scanner *scanner, const shoal_range *range,
+                     int64_t timeout_ms, shoal_scan_cursor **out_cursor,
+                     shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL shoal_scanner_stream_with_cancellation(
+    shoal_scanner *scanner, const shoal_range *range, int64_t timeout_ms,
+    shoal_cancellation *cancellation, shoal_scan_cursor **out_cursor,
+    shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_batch_scanner_stream(shoal_batch_scanner *scanner,
+                           const shoal_range *ranges, size_t range_count,
+                           int64_t timeout_ms,
+                           shoal_scan_cursor **out_cursor,
+                           shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL shoal_batch_scanner_stream_with_cancellation(
+    shoal_batch_scanner *scanner, const shoal_range *ranges,
+    size_t range_count, int64_t timeout_ms,
+    shoal_cancellation *cancellation, shoal_scan_cursor **out_cursor,
+    shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_scan_cursor_next(shoal_scan_cursor *cursor, size_t max_entries,
+                       shoal_scan_result **out_result, uint8_t *out_exhausted,
+                       shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_scan_cursor_close(shoal_scan_cursor *cursor, shoal_error **out_error);
+SHOAL_API void SHOAL_CALL
+shoal_scan_cursor_free(shoal_scan_cursor **cursor);
 
 /*
  * Connector invalidation is local and performs no network I/O. Inputs are

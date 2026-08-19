@@ -1940,6 +1940,27 @@ void shoal_bridge_bytes_list_free(shoal_bytes_list_result *result) {
   free(result);
 }
 
+shoal_scan_cursor *shoal_bridge_scan_cursor_alloc(uint64_t id) {
+  SHOAL_BRIDGE_TEST_ALLOC_GUARD(shoal_bridge_result_alloc_fail_after);
+  shoal_scan_cursor *cursor =
+      (shoal_scan_cursor *)calloc(1, sizeof(*cursor));
+  if (cursor != NULL) {
+    cursor->id = id;
+  }
+  return cursor;
+}
+
+uint64_t shoal_bridge_scan_cursor_id(const shoal_scan_cursor *cursor) {
+  return cursor == NULL ? 0 : cursor->id;
+}
+
+void shoal_bridge_scan_cursor_free(shoal_scan_cursor *cursor) {
+  if (cursor != NULL) {
+    cursor->id = 0;
+    free(cursor);
+  }
+}
+
 shoal_error *shoal_bridge_error_alloc(
     shoal_status code, shoal_error_source_class source,
     shoal_error_compatibility_class compatibility, const char *message,

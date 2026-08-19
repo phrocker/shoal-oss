@@ -83,6 +83,10 @@ struct shoal_scan_result {
   shoal_bridge_scan_entry *entries;
 };
 
+struct shoal_scan_cursor {
+  uint64_t id;
+};
+
 typedef struct shoal_bridge_table_entry {
   char *name;
   char *id;
@@ -358,6 +362,10 @@ size_t shoal_bridge_scan_result_count(const shoal_scan_result *result);
 int shoal_bridge_scan_result_get(const shoal_scan_result *result, size_t index,
                                  shoal_key_value_view *out_value);
 void shoal_bridge_scan_result_free(shoal_scan_result *result);
+
+shoal_scan_cursor *shoal_bridge_scan_cursor_alloc(uint64_t id);
+uint64_t shoal_bridge_scan_cursor_id(const shoal_scan_cursor *cursor);
+void shoal_bridge_scan_cursor_free(shoal_scan_cursor *cursor);
 
 shoal_connector_identity_result *shoal_bridge_connector_identity_alloc(
     char *instance_name, char *instance_id, char *principal);
