@@ -33,7 +33,6 @@ type localPublicationIdentity struct {
 
 type localPublicationComponentIdentity struct {
 	normalized          string
-	dos83Prefix         string
 	dos83Ext            string
 	isDOS83Literal      bool
 	hasDOS83AliasFamily bool
@@ -303,14 +302,12 @@ func buildLocalPublicationComponentIdentity(component string) localPublicationCo
 	if runtime.GOOS != "windows" {
 		return identity
 	}
-	if prefix, ext, ok := parseDOS83LiteralComponent(normalized); ok {
-		identity.dos83Prefix = prefix
+	if _, ext, ok := parseDOS83LiteralComponent(normalized); ok {
 		identity.dos83Ext = ext
 		identity.isDOS83Literal = true
 		return identity
 	}
-	if prefix, ext, ok := dos83AliasFamilyComponent(normalized); ok {
-		identity.dos83Prefix = prefix
+	if _, ext, ok := dos83AliasFamilyComponent(normalized); ok {
 		identity.dos83Ext = ext
 		identity.hasDOS83AliasFamily = true
 	}
@@ -320,10 +317,15 @@ func buildLocalPublicationComponentIdentity(component string) localPublicationCo
 // dos83PathAliases conservatively rejects Windows DOS 8.3 short-name
 // ambiguities for not-yet-created local paths. It intentionally catches
 // only literal short-name spellings (for example LONGFI~1.RF) against a
-// longer component that could generate that short-name family; two long
-// components sharing a six-character prefix are not treated as aliases
-// because NTFS assigns them distinct ~n ordinals rather than one path
-// truncating the other.
+// longer component that could generate a short name with the same
+// extension; two long components sharing a six-character prefix are not
+// treated as aliases because NTFS assigns them distinct ~n ordinals
+// rather than one path truncating the other. The literal-vs-family
+// comparison itself does not require the stem prefixes to match, because
+// NTFS can assign a hash-based short-name stem (instead of the simple
+// six-character truncation) once a directory has enough short-name
+// collisions, and that hashed stem cannot be predicted from the long
+// name's own characters.
 func dos83PathAliases(left, right localPublicationIdentity) bool {
 	if runtime.GOOS != "windows" {
 		return false
@@ -349,9 +351,21 @@ func dos83ComponentsAlias(left, right localPublicationComponentIdentity) bool {
 }
 
 func dos83LiteralMatchesFamily(literal, family localPublicationComponentIdentity) bool {
+	// literal.dos83Prefix reflects only NTFS's simple "first six
+	// characters plus a numeric ~n ordinal" short-name scheme. Once a
+	// directory has enough same-prefix collisions, NTFS switches that
+	// long component to a hashed stem that bears no predictable
+	// relationship to its own leading characters, so requiring an exact
+	// stem-prefix match here would silently miss that hash-based alias.
+	// This check only ever runs while both candidate paths are still
+	// absent (os.Stat can't disambiguate them yet) and the caller has
+	// already confirmed both components share the same parent directory
+	// and path depth, so conservatively treat any literal short-name
+	// spelling as a possible alias of any same-extension long name that
+	// still needs a short name, rather than trying to predict which of
+	// NTFS's two undocumented stem-generation algorithms would apply.
 	return literal.isDOS83Literal &&
 		family.hasDOS83AliasFamily &&
-		literal.dos83Prefix == family.dos83Prefix &&
 		literal.dos83Ext == family.dos83Ext
 }
 

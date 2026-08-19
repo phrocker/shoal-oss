@@ -276,6 +276,23 @@ RFileExportManifest (existing)  →  promotion.BuildLoadMapping
   chosen specifically to bypass `MAX_PATH` for a long staging path --
   isn't rejected merely for the drive letter's own colon surviving as
   a separate path component under the naive `\\?\` split.
+  `StageBulkDir` also conservatively treats a literal Windows DOS 8.3
+  short-name spelling (for example `LONGFI~1.RF`) as a possible alias of
+  any not-yet-created long-name write target sharing the same extension
+  in the same directory, even when the two stems don't lexically match.
+  NTFS only derives a short name's stem from the long name's own leading
+  characters under its simple, non-colliding scheme; once a directory
+  accumulates enough short-name collisions, NTFS instead assigns a
+  hashed stem with no predictable relationship to the long name's
+  characters. Because both write targets are still absent at this point
+  (`os.Stat` can't disambiguate them), and NTFS's own hashing scheme
+  can't be reliably replicated here, requiring an exact stem match would
+  risk silently missing that hash-based alias. The extension isn't
+  subject to this hash substitution, so it remains a reliable narrowing
+  signal instead: only same-extension pairs are treated as ambiguous. A
+  long-name component that already fits within 8.3 using its
+  definitely-safe character set is exempt, since NTFS never generates a
+  distinct short name for it.
   `joinBulkPath` and the `bulkDir` root-validation preflight both
   recognize a non-local write target the same, deliberately generic
   way `internal/engine`'s own backend-path joining does: any

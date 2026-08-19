@@ -105,7 +105,19 @@ func TestLocalPathsLexicallyAliasWindowsDOS83ShortNameAmbiguity(t *testing.T) {
 		{name: "long name with legal windows punctuation aliases literal dos short name", src: `C:\bulk\Long$Filename.rf`, dst: `C:\bulk\LONG$F~1.RF`, want: true},
 		{name: "different ordinal still rejected conservatively", src: `C:\bulk\LongFilename.rf`, dst: `C:\bulk\LONGFI~9.RF`, want: true},
 		{name: "8dot3-compatible long name does not gain a dos alias family", src: `C:\bulk\PLAIN.RF`, dst: `C:\bulk\PLAIN~1.RF`, want: false},
-		{name: "different short-name prefix is distinct", src: `C:\bulk\LongFilename.rf`, dst: `C:\bulk\LONGFJ~1.RF`, want: false},
+		// NTFS only derives a literal short name's stem from the long
+		// name's leading characters under its simple, non-colliding
+		// scheme. Once enough files in one directory reduce to the
+		// same six-character prefix, NTFS instead assigns a hashed
+		// stem that this package cannot predict, so a differing
+		// stem prefix no longer proves the two paths are unrelated;
+		// this case is now conservatively treated as ambiguous too.
+		{name: "different short-name prefix is still conservatively ambiguous (possible NTFS hash-based short name)", src: `C:\bulk\LongFilename.rf`, dst: `C:\bulk\LONGFJ~1.RF`, want: true},
+		// The extension is not subject to NTFS's hash-based stem
+		// substitution, so it remains a reliable, deterministic
+		// narrowing signal: a literal short name for a different
+		// extension can never be this long name's short-name alias.
+		{name: "different extension is still distinct", src: `C:\bulk\LongFilename.txt`, dst: `C:\bulk\LONGFI~1.RF`, want: false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -397,6 +409,36 @@ func TestStageBulkDirRejectsWindowsDOS83AliasedAbsentWriteTargetsBeforeCopying(t
 	for _, target := range []string{"LongFilename.rf", "LONGFI~1.RF", "loadmap.json"} {
 		if _, err := os.Stat(filepath.Join(bulkDir, target)); !errors.Is(err, os.ErrNotExist) {
 			t.Fatalf("target %q exists after rejected DOS 8.3 absent-target stage: err=%v", target, err)
+		}
+	}
+}
+
+// TestStageBulkDirRejectsWindowsDOS83HashBasedShortNameAliasBeforeCopying
+// covers the case where the literal short-name spelling's stem prefix
+// does not lexically match the long name's naively-truncated
+// six-character prefix. NTFS falls back to a hashed stem (instead of
+// the plain truncation) once a directory has enough short-name
+// collisions, so "LONGFJ~1.RF" is still a plausible real short name for
+// "LongFilename.rf" even though its prefix differs from the naive
+// "LONGFI" truncation. With both write targets still absent, os.Stat
+// cannot disambiguate them, so this must be rejected just like the
+// matching-prefix case above.
+func TestStageBulkDirRejectsWindowsDOS83HashBasedShortNameAliasBeforeCopying(t *testing.T) {
+	src, manifest := memoryManifestFromBlobs(map[string][]byte{
+		"export/events/t-0000/LongFilename.rf": []byte("first"),
+		"export/events/t-0000/LONGFJ~1.RF":     []byte("second"),
+	})
+	bulkDir := filepath.Join(t.TempDir(), "bulk")
+	if err := os.MkdirAll(bulkDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := StageBulkDir(context.Background(), src, manifest, local.New(), bulkDir); err == nil {
+		t.Fatal("StageBulkDir with an absent hash-based DOS 8.3 short-name alias = nil error, want error")
+	}
+	for _, target := range []string{"LongFilename.rf", "LONGFJ~1.RF", "loadmap.json"} {
+		if _, err := os.Stat(filepath.Join(bulkDir, target)); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("target %q exists after rejected hash-based DOS 8.3 absent-target stage: err=%v", target, err)
 		}
 	}
 }
