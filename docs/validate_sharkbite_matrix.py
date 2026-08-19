@@ -11,7 +11,7 @@ import sys
 DOC_PATH = Path(__file__).with_name("sharkbite-compatibility.md")
 # Update this manifest only when the independently audited revision-16 inventory
 # itself changes; review every added/removed ID in code review.
-REVISION16_ROW_ID_MANIFEST = DOC_PATH.with_name("sharkbite-compatibility-revision16-row-ids.txt")
+REVISION16_ROW_MANIFEST = DOC_PATH.with_name("sharkbite-compatibility-revision16-rows.txt")
 
 STATUSES = {
     "Covered",
@@ -207,8 +207,9 @@ INVENTORY_CHANGE_HINT = (
     "the audited inventory is pinned in docs/validate_sharkbite_matrix.py; an intentional "
     "inventory revision must update EXPECTED_REVISION, EXPECTED_TOTAL_ROWS, "
     "EXPECTED_REQUIRED_ROWS, EXPECTED_STATUS_COUNTS, EXPECTED_PREFIX_TOTALS, "
-    "EXPECTED_PREFIX_COUNTS and the row-id manifest "
-    "docs/sharkbite-compatibility-revision16-row-ids.txt in the same commit, together with the "
+    "EXPECTED_PREFIX_COUNTS and the row manifest "
+    "docs/sharkbite-compatibility-revision16-rows.txt (row ids, order and pinned statuses) "
+    "in the same commit, together with the "
     "audit evidence that justifies the new inventory"
 )
 
@@ -606,11 +607,13 @@ def iter_matrix_rows(lines: list[str]) -> Iterator[tuple[int, str, list[str]]]:
         require_matrix_separator(None, pending_separator[1], pending_separator[0])
 
 
-def parse_rows(lines: list[str]) -> tuple[Counter[str], dict[str, Counter[str]], tuple[str, ...]]:
+def parse_rows(
+    lines: list[str],
+) -> tuple[Counter[str], dict[str, Counter[str]], tuple[tuple[str, str], ...]]:
     status_counts: Counter[str] = Counter()
     prefix_counts: dict[str, Counter[str]] = defaultdict(Counter)
     accepted_row_ids: dict[str, tuple[int, str]] = {}
-    row_id_sequence: list[str] = []
+    row_sequence: list[tuple[str, str]] = []
     for line_number, row_id, cells in iter_matrix_rows(lines):
         status = cells[-2]
         require(
@@ -624,48 +627,81 @@ def parse_rows(lines: list[str]) -> tuple[Counter[str], dict[str, Counter[str]],
                 f"({previous[1]} vs {status})"
             )
         accepted_row_ids[row_id] = (line_number, status)
-        row_id_sequence.append(row_id)
+        row_sequence.append((row_id, status))
         prefix = "-".join(row_id.split("-")[:2])
         status_counts[status] += 1
         prefix_counts[prefix][status] += 1
-    return status_counts, prefix_counts, tuple(row_id_sequence)
+    return status_counts, prefix_counts, tuple(row_sequence)
 
 
-def parse_row_id_manifest_lines(lines: Sequence[str], *, source: str) -> tuple[str, ...]:
-    row_ids: list[str] = []
+def parse_row_manifest_lines(
+    lines: Sequence[str], *, source: str
+) -> tuple[tuple[str, str], ...]:
+    """Parse a manifest of audited rows: one `ROW-ID STATUS` entry per line."""
+    entries: list[tuple[str, str]] = []
     seen: set[str] = set()
     for line_number, raw_line in enumerate(lines, start=1):
         line = raw_line.strip()
         if not line or line.startswith("#"):
             continue
+        match = re.fullmatch(r"(?P<row_id>SB-[A-Z0-9-]+)[ \t]+(?P<status>\S.*)", line)
         require(
-            re.fullmatch(r"SB-[A-Z0-9-]+", line) is not None,
-            f"invalid row id manifest entry in {source} on line {line_number}: {raw_line!r}",
+            match is not None,
+            (
+                f"invalid row manifest entry in {source} on line {line_number}: {raw_line!r} "
+                "(expected 'ROW-ID STATUS')"
+            ),
         )
-        require(line not in seen, f"duplicate row id manifest entry in {source}: {line}")
-        seen.add(line)
-        row_ids.append(line)
-    return tuple(row_ids)
+        assert match is not None
+        row_id = match.group("row_id")
+        status = match.group("status").strip()
+        require(
+            status in STATUSES,
+            (
+                f"invalid status in row manifest entry in {source} on line {line_number}: "
+                f"{status!r}"
+            ),
+        )
+        require(row_id not in seen, f"duplicate row manifest entry in {source}: {row_id}")
+        seen.add(row_id)
+        entries.append((row_id, status))
+    return tuple(entries)
 
 
 @lru_cache(maxsize=1)
-def load_expected_revision_16_row_ids() -> tuple[str, ...]:
-    row_ids = parse_row_id_manifest_lines(
-        REVISION16_ROW_ID_MANIFEST.read_text(encoding="utf-8").splitlines(),
-        source=str(REVISION16_ROW_ID_MANIFEST.name),
+def load_expected_revision_16_rows() -> tuple[tuple[str, str], ...]:
+    rows = parse_row_manifest_lines(
+        REVISION16_ROW_MANIFEST.read_text(encoding="utf-8").splitlines(),
+        source=str(REVISION16_ROW_MANIFEST.name),
     )
     require(
-        len(row_ids) == EXPECTED_TOTAL_ROWS,
+        len(rows) == EXPECTED_TOTAL_ROWS,
         (
-            f"revision 16 row id manifest expects {EXPECTED_TOTAL_ROWS} entries, "
-            f"found {len(row_ids)}"
+            f"revision {EXPECTED_REVISION} row manifest expects {EXPECTED_TOTAL_ROWS} entries, "
+            f"found {len(rows)}"
         ),
     )
-    return tuple(row_ids)
+    manifest_status_counts = Counter(status for _row_id, status in rows)
+    for status, expected in EXPECTED_STATUS_COUNTS.items():
+        require(
+            manifest_status_counts[status] == expected,
+            (
+                f"revision {EXPECTED_REVISION} row manifest pins {manifest_status_counts[status]} "
+                f"rows for {status}, but EXPECTED_STATUS_COUNTS pins {expected}"
+            ),
+        )
+    return rows
 
 
-def preview_row_ids(row_ids: list[str], *, limit: int = 5) -> str:
-    preview = row_ids[:limit]
+def format_row_entry(entry: tuple[str, str] | str) -> str:
+    if isinstance(entry, tuple):
+        row_id, status = entry
+        return f"{row_id} ({status})"
+    return entry
+
+
+def preview_row_ids(row_ids: Sequence[tuple[str, str] | str], *, limit: int = 5) -> str:
+    preview = [format_row_entry(entry) for entry in row_ids[:limit]]
     suffix = " ..." if len(row_ids) > limit else ""
     return (", ".join(preview) + suffix) if preview else "none"
 
@@ -725,16 +761,17 @@ def validate_pinned_inventory_constants() -> None:
             ),
         )
 
+
 def moved_row_diagnostics(
-    current_row_ids: Sequence[str],
-    expected_row_ids: Sequence[str],
+    current_rows: Sequence[tuple[str, str]],
+    expected_rows: Sequence[tuple[str, str]],
     *,
     limit: int = 5,
 ) -> list[str]:
-    expected_positions = {row_id: index + 1 for index, row_id in enumerate(expected_row_ids)}
-    current_positions = {row_id: index + 1 for index, row_id in enumerate(current_row_ids)}
+    expected_positions = {row_id: index + 1 for index, (row_id, _status) in enumerate(expected_rows)}
+    current_positions = {row_id: index + 1 for index, (row_id, _status) in enumerate(current_rows)}
     moved: list[str] = []
-    for row_id in expected_row_ids:
+    for row_id, _status in expected_rows:
         expected_position = expected_positions[row_id]
         current_position = current_positions.get(row_id)
         if current_position is None or current_position == expected_position:
@@ -745,35 +782,55 @@ def moved_row_diagnostics(
     return moved
 
 
-def validate_expected_row_id_sequence(
-    current_row_ids: Sequence[str],
-    expected_row_ids: Sequence[str],
+def reclassified_row_diagnostics(
+    current_rows: Sequence[tuple[str, str]],
+    expected_rows: Sequence[tuple[str, str]],
+    *,
+    limit: int = 5,
+) -> list[str]:
+    current_statuses = dict(current_rows)
+    reclassified: list[str] = []
+    for row_id, expected_status in expected_rows:
+        current_status = current_statuses.get(row_id)
+        if current_status is None or current_status == expected_status:
+            continue
+        reclassified.append(f"{row_id} pinned {expected_status} found {current_status}")
+        if len(reclassified) >= limit:
+            break
+    return reclassified
+
+
+def validate_expected_row_sequence(
+    current_rows: Sequence[tuple[str, str]],
+    expected_rows: Sequence[tuple[str, str]],
 ) -> None:
-    current_row_id_set = set(current_row_ids)
-    expected_row_id_set = set(expected_row_ids)
-    missing_row_ids = [row_id for row_id in expected_row_ids if row_id not in current_row_id_set]
-    unexpected_row_ids = [row_id for row_id in current_row_ids if row_id not in expected_row_id_set]
-    moved_row_ids = moved_row_diagnostics(current_row_ids, expected_row_ids)
+    current_row_ids = {row_id for row_id, _status in current_rows}
+    expected_row_ids = {row_id for row_id, _status in expected_rows}
+    missing_rows = [entry for entry in expected_rows if entry[0] not in current_row_ids]
+    unexpected_rows = [entry for entry in current_rows if entry[0] not in expected_row_ids]
+    moved_rows = moved_row_diagnostics(current_rows, expected_rows)
+    reclassified_rows = reclassified_row_diagnostics(current_rows, expected_rows)
     require(
-        tuple(current_row_ids) == tuple(expected_row_ids),
+        tuple(current_rows) == tuple(expected_rows),
         (
-            "revision 16 inventory row ids changed: "
-            f"missing [{preview_row_ids(missing_row_ids)}]; "
-            f"unexpected [{preview_row_ids(unexpected_row_ids)}]; "
-            f"moved [{preview_row_ids(moved_row_ids)}]; "
+            f"revision {EXPECTED_REVISION} inventory rows changed: "
+            f"missing [{preview_row_ids(missing_rows)}]; "
+            f"unexpected [{preview_row_ids(unexpected_rows)}]; "
+            f"moved [{preview_row_ids(moved_rows)}]; "
+            f"reclassified [{preview_row_ids(reclassified_rows)}]; "
             f"{INVENTORY_CHANGE_HINT}"
         ),
     )
 
 
 def validate_revision_16_inventory(
-    row_ids: Sequence[str],
+    rows: Sequence[tuple[str, str]],
     status_counts: Counter[str],
     prefix_counts: dict[str, Counter[str]],
 ) -> None:
     validate_pinned_inventory_constants()
-    expected_row_ids = load_expected_revision_16_row_ids()
-    validate_expected_row_id_sequence(row_ids, expected_row_ids)
+    expected_rows = load_expected_revision_16_rows()
+    validate_expected_row_sequence(rows, expected_rows)
 
     total_rows = sum(status_counts.values())
     require(
@@ -842,10 +899,10 @@ def validate_counts(lines: list[str], full_text: str) -> None:
             f"document status is missing expected detail: {snippet}",
         )
 
-    status_counts, prefix_counts, row_ids = parse_rows(lines)
-    total_rows = len(row_ids)
+    status_counts, prefix_counts, rows = parse_rows(lines)
+    total_rows = len(rows)
     require(sum(status_counts.values()) == total_rows, f"expected {total_rows} rows, found {sum(status_counts.values())}")
-    validate_revision_16_inventory(row_ids, status_counts, prefix_counts)
+    validate_revision_16_inventory(rows, status_counts, prefix_counts)
 
     metadata_total_rows, metadata_required_rows = parse_rows_metadata(metadata.get("Rows", ""))
     require(

@@ -39,8 +39,8 @@ def load_document_text() -> str:
     return validator.DOC_PATH.read_text(encoding="utf-8")
 
 
-def load_row_id_fixture(name: str) -> tuple[str, ...]:
-    return validator.parse_row_id_manifest_lines(load_fixture_lines(name), source=name)
+def load_row_manifest_fixture(name: str) -> tuple[tuple[str, str], ...]:
+    return validator.parse_row_manifest_lines(load_fixture_lines(name), source=name)
 
 
 def replace_pattern_once(text: str, pattern: str, replacement: str) -> str:
@@ -138,7 +138,7 @@ def pinned_constants_for_deleted_not_required_row(prefix: str, row_id: str) -> d
     }
     prefix_counts[prefix][validator.NOT_REQUIRED_STATUS] -= 1
     manifest = tuple(
-        entry for entry in validator.load_expected_revision_16_row_ids() if entry != row_id
+        entry for entry in validator.load_expected_revision_16_rows() if entry[0] != row_id
     )
     return {
         "EXPECTED_TOTAL_ROWS": validator.EXPECTED_TOTAL_ROWS - 1,
@@ -146,7 +146,7 @@ def pinned_constants_for_deleted_not_required_row(prefix: str, row_id: str) -> d
         "EXPECTED_STATUS_COUNTS": status_counts,
         "EXPECTED_PREFIX_TOTALS": prefix_totals,
         "EXPECTED_PREFIX_COUNTS": prefix_counts,
-        "load_expected_revision_16_row_ids": lambda: manifest,
+        "load_expected_revision_16_rows": lambda: manifest,
     }
 
 
@@ -200,7 +200,7 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
 
     def test_parse_rows_accepts_unique_row_ids(self) -> None:
         status_counts, prefix_counts, row_ids = validator.parse_rows(load_fixture_lines("unique_rows.md"))
-        self.assertEqual(row_ids, ("SB-FIXTURE-101", "SB-FIXTURE-102"))
+        self.assertEqual(row_ids, (("SB-FIXTURE-101", "Covered"), ("SB-FIXTURE-102", "Missing Go")))
         self.assertEqual(status_counts["Covered"], 1)
         self.assertEqual(status_counts["Missing Go"], 1)
         self.assertEqual(prefix_counts["SB-FIXTURE"]["Covered"], 1)
@@ -363,54 +363,114 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
                     "duplicate total row in category summary table",
                 )
 
-    def test_validate_expected_row_id_sequence_accepts_valid_fixture_sequence(self) -> None:
-        validator.validate_expected_row_id_sequence(
-            load_row_id_fixture("row_sequence_valid.txt"),
-            load_row_id_fixture("row_sequence_expected.txt"),
+    def test_validate_expected_row_sequence_accepts_valid_fixture_sequence(self) -> None:
+        validator.validate_expected_row_sequence(
+            load_row_manifest_fixture("row_sequence_valid.txt"),
+            load_row_manifest_fixture("row_sequence_expected.txt"),
         )
 
-    def test_validate_expected_row_id_sequence_rejects_swapped_fixture_sequence(self) -> None:
+    def test_validate_expected_row_sequence_rejects_swapped_fixture_sequence(self) -> None:
         self.assert_validation_fails(
-            lambda: validator.validate_expected_row_id_sequence(
-                load_row_id_fixture("row_sequence_swap.txt"),
-                load_row_id_fixture("row_sequence_expected.txt"),
+            lambda: validator.validate_expected_row_sequence(
+                load_row_manifest_fixture("row_sequence_swap.txt"),
+                load_row_manifest_fixture("row_sequence_expected.txt"),
             ),
-            "revision 16 inventory row ids changed",
+            "revision 16 inventory rows changed",
             "missing [none]",
             "unexpected [none]",
             "moved [SB-FIXTURE-102 expected 2 found 3, SB-FIXTURE-103 expected 3 found 2]",
         )
 
-    def test_validate_expected_row_id_sequence_rejects_reordered_fixture_sequence(self) -> None:
+    def test_validate_expected_row_sequence_rejects_reordered_fixture_sequence(self) -> None:
         self.assert_validation_fails(
-            lambda: validator.validate_expected_row_id_sequence(
-                load_row_id_fixture("row_sequence_reordered.txt"),
-                load_row_id_fixture("row_sequence_expected.txt"),
+            lambda: validator.validate_expected_row_sequence(
+                load_row_manifest_fixture("row_sequence_reordered.txt"),
+                load_row_manifest_fixture("row_sequence_expected.txt"),
             ),
-            "revision 16 inventory row ids changed",
+            "revision 16 inventory rows changed",
             "missing [none]",
             "unexpected [none]",
             "moved [SB-FIXTURE-101 expected 1 found 2",
         )
 
-    def test_validate_expected_row_id_sequence_rejects_missing_fixture_row(self) -> None:
+    def test_validate_expected_row_sequence_rejects_missing_fixture_row(self) -> None:
         self.assert_validation_fails(
-            lambda: validator.validate_expected_row_id_sequence(
-                load_row_id_fixture("row_sequence_missing.txt"),
-                load_row_id_fixture("row_sequence_expected.txt"),
+            lambda: validator.validate_expected_row_sequence(
+                load_row_manifest_fixture("row_sequence_missing.txt"),
+                load_row_manifest_fixture("row_sequence_expected.txt"),
             ),
-            "revision 16 inventory row ids changed",
-            "missing [SB-FIXTURE-103]",
+            "revision 16 inventory rows changed",
+            "missing [SB-FIXTURE-103 (Behavior mismatch)]",
         )
 
-    def test_validate_expected_row_id_sequence_rejects_added_fixture_row(self) -> None:
+    def test_validate_expected_row_sequence_rejects_added_fixture_row(self) -> None:
         self.assert_validation_fails(
-            lambda: validator.validate_expected_row_id_sequence(
-                load_row_id_fixture("row_sequence_added.txt"),
-                load_row_id_fixture("row_sequence_expected.txt"),
+            lambda: validator.validate_expected_row_sequence(
+                load_row_manifest_fixture("row_sequence_added.txt"),
+                load_row_manifest_fixture("row_sequence_expected.txt"),
             ),
-            "revision 16 inventory row ids changed",
-            "unexpected [SB-FIXTURE-999]",
+            "revision 16 inventory rows changed",
+            "unexpected [SB-FIXTURE-999 (Missing Go)]",
+        )
+
+    def test_validate_expected_row_sequence_rejects_status_swap_within_a_section(self) -> None:
+        self.assert_validation_fails(
+            lambda: validator.validate_expected_row_sequence(
+                load_row_manifest_fixture("row_sequence_reclassified.txt"),
+                load_row_manifest_fixture("row_sequence_expected.txt"),
+            ),
+            "revision 16 inventory rows changed",
+            "missing [none]",
+            "unexpected [none]",
+            "moved [none]",
+            "reclassified [SB-FIXTURE-101 pinned Missing C ABI found Missing Go, "
+            "SB-FIXTURE-102 pinned Missing Go found Missing C ABI]",
+        )
+
+    def test_parse_row_manifest_lines_requires_a_pinned_status(self) -> None:
+        self.assert_validation_fails(
+            lambda: load_row_manifest_fixture("row_sequence_missing_status.txt"),
+            "invalid row manifest entry",
+            "expected 'ROW-ID STATUS'",
+        )
+
+    def test_parse_row_manifest_lines_rejects_unknown_status(self) -> None:
+        self.assert_validation_fails(
+            lambda: load_row_manifest_fixture("row_sequence_invalid_status.txt"),
+            "invalid status in row manifest entry",
+            "'Totally Covered'",
+        )
+
+    def test_row_manifest_pins_the_status_of_every_audited_row(self) -> None:
+        rows = validator.load_expected_revision_16_rows()
+        self.assertEqual(len(rows), validator.EXPECTED_TOTAL_ROWS)
+        self.assertEqual(len({row_id for row_id, _status in rows}), validator.EXPECTED_TOTAL_ROWS)
+        for _row_id, status in rows:
+            self.assertIn(status, validator.STATUSES)
+        document_rows = validator.parse_rows(load_document_text().splitlines())[2]
+        self.assertEqual(rows, document_rows)
+
+    def test_pinned_inventory_rejects_status_swap_between_rows_in_one_section(self) -> None:
+        text = load_document_text()
+        first = "| SB-PKG-001 |"
+        second = "| SB-PKG-014 |"
+        lines = text.splitlines()
+        first_index = next(i for i, line in enumerate(lines) if line.startswith(first))
+        second_index = next(i for i, line in enumerate(lines) if line.startswith(second))
+        first_cells = lines[first_index].split("|")
+        second_cells = lines[second_index].split("|")
+        self.assertNotEqual(first_cells[-3].strip(), second_cells[-3].strip())
+        first_cells[-3], second_cells[-3] = second_cells[-3], first_cells[-3]
+        lines[first_index] = "|".join(first_cells)
+        lines[second_index] = "|".join(second_cells)
+        mutated = "\n".join(lines) + "\n"
+
+        self.assert_validation_fails(
+            lambda: validator.validate_counts(mutated.splitlines(), mutated),
+            "revision 16 inventory rows changed",
+            "reclassified [SB-PKG-001 pinned Missing C ABI found Intentional divergence "
+            "(approval required), SB-PKG-014 pinned Intentional divergence (approval required) "
+            "found Missing C ABI]",
         )
 
     def test_validate_revision_16_inventory_rejects_same_prefix_row_id_substitution(self) -> None:
@@ -421,17 +481,17 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
         )
         self.assert_validation_fails(
             lambda: validator.validate_counts(rewritten_text.splitlines(), rewritten_text),
-            "revision 16 inventory row ids changed",
-            "missing [SB-PKG-001]",
-            "unexpected [SB-PKG-999]",
+            "revision 16 inventory rows changed",
+            "missing [SB-PKG-001 (Missing C ABI)]",
+            "unexpected [SB-PKG-999 (Missing C ABI)]",
         )
 
     def test_validate_revision_16_inventory_rejects_row_deletion(self) -> None:
         rewritten_text = "\n".join(remove_line_starting_once(load_document_text().splitlines(), "| SB-PKG-001 |"))
         self.assert_validation_fails(
             lambda: validator.validate_counts(rewritten_text.splitlines(), rewritten_text),
-            "revision 16 inventory row ids changed",
-            "missing [SB-PKG-001]",
+            "revision 16 inventory rows changed",
+            "missing [SB-PKG-001 (Missing C ABI)]",
         )
 
     def test_validate_revision_16_inventory_rejects_row_addition(self) -> None:
@@ -445,8 +505,8 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
         )
         self.assert_validation_fails(
             lambda: validator.validate_counts(rewritten_text.splitlines(), rewritten_text),
-            "revision 16 inventory row ids changed",
-            "unexpected [SB-PKG-999]",
+            "revision 16 inventory rows changed",
+            "unexpected [SB-PKG-999 (Missing C ABI)]",
         )
 
     def test_validate_targeted_symbol_anchors_rejects_cross_file_anchor_leakage(self) -> None:
@@ -603,20 +663,20 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
         mutated = delete_matrix_row_consistently(load_document_text(), "SB-EMB-035", "SB-EMB")
         message = self.assert_validation_fails(
             lambda: validator.validate_counts(mutated.splitlines(), mutated),
-            "revision 16 inventory row ids changed: missing [SB-EMB-035]",
+            "revision 16 inventory rows changed: missing [SB-EMB-035 (Not required (rationale required))]",
         )
         self.assertIn("must update EXPECTED_REVISION", message)
-        self.assertIn("row-id manifest", message)
+        self.assertIn("row manifest", message)
 
     def test_pinned_counts_reject_row_deletion_when_the_manifest_is_relaxed(self) -> None:
         mutated = delete_matrix_row_consistently(load_document_text(), "SB-EMB-035", "SB-EMB")
         manifest = tuple(
             entry
-            for entry in validator.load_expected_revision_16_row_ids()
-            if entry != "SB-EMB-035"
+            for entry in validator.load_expected_revision_16_rows()
+            if entry[0] != "SB-EMB-035"
         )
         with mock.patch.object(
-            validator, "load_expected_revision_16_row_ids", lambda: manifest
+            validator, "load_expected_revision_16_rows", lambda: manifest
         ):
             self.assert_validation_fails(
                 lambda: validator.validate_counts(mutated.splitlines(), mutated),
@@ -688,7 +748,7 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
         status_counts, prefix_counts, row_ids = validator.parse_rows(
             matrix_table(MATRIX_HEADER, MATRIX_SEPARATOR, MATRIX_ROW)
         )
-        self.assertEqual(row_ids, ("SB-FIXTURE-101",))
+        self.assertEqual(row_ids, (("SB-FIXTURE-101", "Covered"),))
         self.assertEqual(status_counts["Covered"], 1)
         self.assertEqual(prefix_counts["SB-FIXTURE"]["Covered"], 1)
 
@@ -746,7 +806,7 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
                 "| value | value |",
             ]
         )
-        self.assertEqual(row_ids, ("SB-FIXTURE-101",))
+        self.assertEqual(row_ids, (("SB-FIXTURE-101", "Covered"),))
 
     def test_parse_markdown_table_accepts_alignment_separators(self) -> None:
         headers, rows = validator.parse_markdown_table(
