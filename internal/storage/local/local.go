@@ -114,8 +114,10 @@ func (b *Backend) List(_ context.Context, prefix string) ([]string, error) {
 	return out, nil
 }
 
-// CleanupStaleArtifacts removes reserved temporary and backup files directly
-// under prefix whose modification time is strictly before cutoff.
+// CleanupStaleArtifacts removes reserved temporary files directly under prefix
+// whose modification time is strictly before cutoff. Reserved backup files are
+// reported as recoverable and left in place because their randomized names do
+// not identify one safe restore/delete target.
 func (b *Backend) CleanupStaleArtifacts(ctx context.Context, prefix string, cutoff time.Time) (storage.ArtifactCleanupResult, error) {
 	return cleanupStaleArtifacts(ctx, prefix, cutoff, os.ReadDir, os.Remove)
 }
@@ -128,11 +130,11 @@ func cleanupStaleArtifacts(
 	remove func(string) error,
 ) (storage.ArtifactCleanupResult, error) {
 	var result storage.ArtifactCleanupResult
-	if cutoff.IsZero() {
-		return result, fmt.Errorf("local: stale artifact cutoff must be non-zero")
-	}
 	if err := contextOrBackground(ctx).Err(); err != nil {
 		return result, err
+	}
+	if err := storage.ValidateArtifactCleanupCutoff(time.Now(), cutoff); err != nil {
+		return result, fmt.Errorf("local: %w", err)
 	}
 	entries, err := readDir(prefix)
 	if err != nil {
@@ -165,14 +167,6 @@ func cleanupStaleArtifacts(
 		}
 		candidates = append(candidates, candidate{entry: entry, info: info})
 	}
-	hasRecentTemp := false
-	for _, candidate := range candidates {
-		if isGeneratedReplacementName(candidate.entry.Name(), replacementTempPrefix) &&
-			!candidate.info.ModTime().Before(cutoff) {
-			hasRecentTemp = true
-			break
-		}
-	}
 	for _, candidate := range candidates {
 		if err := contextOrBackground(ctx).Err(); err != nil {
 			return result, errors.Join(cleanupErr, err)
@@ -180,7 +174,8 @@ func cleanupStaleArtifacts(
 		if !candidate.info.ModTime().Before(cutoff) {
 			continue
 		}
-		if hasRecentTemp && isGeneratedReplacementName(candidate.entry.Name(), replacementBackupPrefix) {
+		if isGeneratedReplacementName(candidate.entry.Name(), replacementBackupPrefix) {
+			result.Recoverable = append(result.Recoverable, filepath.Join(prefix, candidate.entry.Name()))
 			continue
 		}
 		artifact := filepath.Join(prefix, candidate.entry.Name())

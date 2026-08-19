@@ -289,6 +289,16 @@ opt-in.
 - One Server instance per pod; goroutine-safe across concurrent scans.
 - Default file cache 1 GB, decompressed-block cache configurable.
 - Pre-warm walks user-table tablets at startup; first scan is warm-fast.
+- Storage backends intentionally hide exact reserved staging/backup
+  artifacts from normal `List` results. Operators or background maintenance
+  code that need to reap stale internals should call
+  `storage.CleanupStaleArtifacts(ctx, backend, prefix, cutoff)` against one
+  managed subtree/object prefix at a time, with `cutoff <= time.Now().Add(-
+  storage.RecommendedArtifactCleanupAge)` (15 minutes by default). Cleanup
+  deletes only exact reserved artifacts older than that cutoff; any backup
+  artifacts that cannot be mapped back to one safe target are reported in
+  `ArtifactCleanupResult.Recoverable` for manual recovery instead of being
+  deleted automatically.
 
 ## License
 

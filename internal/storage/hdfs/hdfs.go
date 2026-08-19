@@ -404,15 +404,17 @@ func (b *Backend) List(ctx context.Context, prefix string) ([]string, error) {
 	return out, nil
 }
 
-// CleanupStaleArtifacts removes reserved temporary and backup files directly
-// under prefix whose HDFS modification time is strictly before cutoff.
+// CleanupStaleArtifacts removes reserved temporary files directly under prefix
+// whose HDFS modification time is strictly before cutoff. Reserved backup
+// files are reported as recoverable and left in place because their randomized
+// names do not identify one safe restore/delete target.
 func (b *Backend) CleanupStaleArtifacts(ctx context.Context, prefix string, cutoff time.Time) (storage.ArtifactCleanupResult, error) {
 	var result storage.ArtifactCleanupResult
-	if cutoff.IsZero() {
-		return result, fmt.Errorf("hdfs: stale artifact cutoff must be non-zero")
-	}
 	if err := contextOrBackground(ctx).Err(); err != nil {
 		return result, err
+	}
+	if err := storage.ValidateArtifactCleanupCutoff(time.Now(), cutoff); err != nil {
+		return result, fmt.Errorf("hdfs: %w", err)
 	}
 	lease, err := b.newOperation(ctx)
 	if err != nil {
@@ -433,15 +435,6 @@ func (b *Backend) CleanupStaleArtifacts(ctx context.Context, prefix string, cuto
 	slices.SortFunc(entries, func(a, b os.FileInfo) int {
 		return strings.Compare(a.Name(), b.Name())
 	})
-	hasRecentTemp := false
-	for _, entry := range entries {
-		if !entry.IsDir() &&
-			isGeneratedReplacementName(entry.Name(), replacementTempPrefix) &&
-			!entry.ModTime().Before(cutoff) {
-			hasRecentTemp = true
-			break
-		}
-	}
 	var cleanupErr error
 	for _, entry := range entries {
 		if err := contextOrBackground(ctx).Err(); err != nil {
@@ -454,7 +447,12 @@ func (b *Backend) CleanupStaleArtifacts(ctx context.Context, prefix string, cuto
 		if !entry.ModTime().Before(cutoff) {
 			continue
 		}
-		if hasRecentTemp && isGeneratedReplacementName(entry.Name(), replacementBackupPrefix) {
+		if isGeneratedReplacementName(entry.Name(), replacementBackupPrefix) {
+			artifact := path.Join(resolved, entry.Name())
+			if qualifier != "" {
+				artifact = qualifier + ensureLeadingSlash(artifact)
+			}
+			result.Recoverable = append(result.Recoverable, artifact)
 			continue
 		}
 		artifact := path.Join(resolved, entry.Name())

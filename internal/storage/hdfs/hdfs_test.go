@@ -774,6 +774,9 @@ func TestBackendCleanupStaleArtifacts(t *testing.T) {
 	if fmt.Sprint(result.Removed) != fmt.Sprint(want) {
 		t.Fatalf("Removed = %v, want %v", result.Removed, want)
 	}
+	if len(result.Recoverable) != 1 || result.Recoverable[0] != oldBackup {
+		t.Fatalf("Recoverable = %v, want [%s]", result.Recoverable, oldBackup)
+	}
 	for _, name := range []string{oldBackup, recent, lookalike} {
 		if _, ok := client.files[name]; !ok {
 			t.Fatalf("%s was removed", name)
@@ -786,8 +789,11 @@ func TestBackendCleanupStaleArtifacts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(result.Removed) != 1 || result.Removed[0] != oldBackup {
-		t.Fatalf("second Removed = %v, want [%s]", result.Removed, oldBackup)
+	if len(result.Removed) != 0 {
+		t.Fatalf("second Removed = %v, want none", result.Removed)
+	}
+	if len(result.Recoverable) != 1 || result.Recoverable[0] != oldBackup {
+		t.Fatalf("second Recoverable = %v, want [%s]", result.Recoverable, oldBackup)
 	}
 }
 
@@ -802,23 +808,29 @@ func TestBackendCleanupStaleArtifactsPreservesActiveAndReportsFailures(t *testin
 		t.Fatal(err)
 	}
 	w := out.(*replaceWriter)
+	oldTemp := "/tables/" + replacementTempPrefix + "11112222333344445555666677778888"
 	oldBackup := "/tables/" + replacementBackupPrefix + "00112233445566778899aabbccddeeff"
+	client.files[oldTemp] = []byte("temp")
+	client.modTimes[oldTemp] = time.Now().Add(-2 * time.Hour)
 	client.files[oldBackup] = []byte("old")
 	client.modTimes[oldBackup] = time.Now().Add(-2 * time.Hour)
 	removeErr := errors.New("janitor remove failed")
 	client.removeContextHook = func(_ context.Context, name string) error {
-		if name == oldBackup {
+		if name == oldTemp {
 			return removeErr
 		}
 		return nil
 	}
 
 	result, err := backend.CleanupStaleArtifacts(context.Background(), "/tables", time.Now().Add(-time.Hour))
-	if err != nil {
-		t.Fatalf("cleanup with active writer: %v", err)
+	if !errors.Is(err, removeErr) {
+		t.Fatalf("cleanup with active writer error = %v, want remove failure", err)
 	}
 	if len(result.Removed) != 0 {
 		t.Fatalf("Removed = %v, want none", result.Removed)
+	}
+	if len(result.Recoverable) != 1 || result.Recoverable[0] != oldBackup {
+		t.Fatalf("Recoverable = %v, want [%s]", result.Recoverable, oldBackup)
 	}
 	if _, ok := client.files[w.temp]; !ok {
 		t.Fatal("active temporary file was removed")
@@ -832,6 +844,9 @@ func TestBackendCleanupStaleArtifactsPreservesActiveAndReportsFailures(t *testin
 	}
 	if len(result.Removed) != 0 {
 		t.Fatalf("Removed after failure = %v, want none", result.Removed)
+	}
+	if len(result.Recoverable) != 1 || result.Recoverable[0] != oldBackup {
+		t.Fatalf("Recoverable after failure = %v, want [%s]", result.Recoverable, oldBackup)
 	}
 	client.removeContextHook = nil
 

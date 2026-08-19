@@ -226,8 +226,11 @@ func (b *Backend) List(ctx context.Context, prefix string) ([]string, error) {
 // object replaced after enumeration is never removed.
 func (b *Backend) CleanupStaleArtifacts(ctx context.Context, prefix string, cutoff time.Time) (shstorage.ArtifactCleanupResult, error) {
 	var result shstorage.ArtifactCleanupResult
-	if cutoff.IsZero() {
-		return result, fmt.Errorf("gcs: stale artifact cutoff must be non-zero")
+	if err := contextOrBackground(ctx).Err(); err != nil {
+		return result, err
+	}
+	if err := shstorage.ValidateArtifactCleanupCutoff(time.Now(), cutoff); err != nil {
+		return result, fmt.Errorf("gcs: %w", err)
 	}
 	bucket, objectPrefix, err := ParsePath(prefix)
 	if err != nil {

@@ -99,24 +99,79 @@ type Lister interface {
 }
 
 // ArtifactCleanupResult reports completed internal-artifact cleanup. Removed
-// contains backend-qualified paths in deterministic discovery order. If cleanup
-// returns an error, Removed still reports every deletion that completed before
-// or alongside the partial failure.
+// contains backend-qualified paths in deterministic discovery order.
+// Recoverable contains reserved backup artifacts that were intentionally left
+// in place because automatic deletion or restoration would be unsafe. If
+// cleanup returns an error, Removed still reports every deletion that
+// completed before or alongside the partial failure.
 type ArtifactCleanupResult struct {
-	Examined int
-	Removed  []string
+	Examined    int
+	Removed     []string
+	Recoverable []string
 }
 
 // ArtifactCleaner is an optional backend lifecycle capability for explicitly
 // removing crash-leftover staging and replacement artifacts. Cleanup only
 // considers names in the backend's reserved internal namespace whose backend
 // modification time is strictly before cutoff. Callers must choose a cutoff
-// older than their maximum write duration. Implementations preserve recent
-// artifacts, never return artifacts as user data, honor ctx, and report partial
-// deletion failures.
+// at least MinArtifactCleanupAge older than the current time, and should
+// normally use RecommendedArtifactCleanupAge or larger. Implementations
+// preserve recent artifacts, never return artifacts as user data, honor ctx,
+// report partial deletion failures, and surface any backup artifacts that need
+// manual recovery through ArtifactCleanupResult.Recoverable.
 type ArtifactCleaner interface {
 	Backend
 	CleanupStaleArtifacts(ctx context.Context, prefix string, cutoff time.Time) (ArtifactCleanupResult, error)
+}
+
+const (
+	// MinArtifactCleanupAge is the smallest safety window accepted by artifact
+	// cleanup helpers. Smaller cutoffs risk racing still-active writers.
+	MinArtifactCleanupAge = time.Minute
+	// RecommendedArtifactCleanupAge is the documented default floor callers
+	// should use when scheduling periodic artifact cleanup.
+	RecommendedArtifactCleanupAge = 15 * time.Minute
+)
+
+// ErrArtifactCleanerUnsupported reports that a backend does not expose stale
+// artifact cleanup.
+var ErrArtifactCleanerUnsupported = errors.New("storage: backend does not support stale artifact cleanup")
+
+// ErrArtifactCleanupCutoffTooRecent reports that a cleanup cutoff is not old
+// enough to safely avoid active writers.
+var ErrArtifactCleanupCutoffTooRecent = errors.New("storage: stale artifact cutoff is too recent")
+
+// ValidateArtifactCleanupCutoff rejects zero or overly recent cutoffs.
+func ValidateArtifactCleanupCutoff(now, cutoff time.Time) error {
+	if cutoff.IsZero() {
+		return fmt.Errorf("%w: cutoff must be non-zero", ErrArtifactCleanupCutoffTooRecent)
+	}
+	if now.Sub(cutoff) < MinArtifactCleanupAge {
+		return fmt.Errorf(
+			"%w: cutoff must be at least %v before now",
+			ErrArtifactCleanupCutoffTooRecent,
+			MinArtifactCleanupAge,
+		)
+	}
+	return nil
+}
+
+// CleanupStaleArtifacts invokes the optional ArtifactCleaner capability through
+// a shared helper so callers can use one public janitor entry point.
+func CleanupStaleArtifacts(
+	ctx context.Context,
+	b Backend,
+	prefix string,
+	cutoff time.Time,
+) (ArtifactCleanupResult, error) {
+	if err := ctx.Err(); err != nil {
+		return ArtifactCleanupResult{}, err
+	}
+	cleaner, ok := b.(ArtifactCleaner)
+	if !ok {
+		return ArtifactCleanupResult{}, ErrArtifactCleanerUnsupported
+	}
+	return cleaner.CleanupStaleArtifacts(ctx, prefix, cutoff)
 }
 
 // Remover is a Backend that can delete an object by path. Used to drop a
