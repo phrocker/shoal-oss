@@ -360,7 +360,8 @@ func copyWithSHA256(ctx context.Context, src storage.Backend, srcPath string, ds
 	if err != nil {
 		return 0, "", "", fmt.Errorf("engine: create export destination %s: %w", dstPath, err)
 	}
-	defer func() { storage.AbortOnError(&err, out) }()
+	var cleanupState storage.WriteCleanupState
+	defer func() { storage.AbortOnError(&err, out, &cleanupState) }()
 	h := sha256.New()
 	buf := make([]byte, 256*1024)
 	for written < in.Size() {
@@ -397,6 +398,7 @@ func copyWithSHA256(ctx context.Context, src storage.Backend, srcPath string, ds
 		return written, "", "", fmt.Errorf("engine: read export %s: %w", srcPath, io.ErrUnexpectedEOF)
 	}
 	sum = hex.EncodeToString(h.Sum(nil))
+	cleanupState.MarkCloseAttempted()
 	if err = out.Close(); err != nil {
 		return written, "", "", fmt.Errorf("engine: close export destination %s: %w", dstPath, err)
 	}

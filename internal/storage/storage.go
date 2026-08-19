@@ -76,6 +76,23 @@ type Aborter interface {
 	Abort() error
 }
 
+// WriteCleanupState tracks whether a caller already attempted Close on a
+// Writer before deferred cleanup runs. Call MarkCloseAttempted immediately
+// before any explicit Close call when also deferring AbortOnError.
+type WriteCleanupState struct {
+	closeAttempted bool
+}
+
+// MarkCloseAttempted records that the caller is about to invoke Close on the
+// writer. Cleanup helpers will not retry Close on legacy non-Aborter writers
+// once this has been set.
+func (s *WriteCleanupState) MarkCloseAttempted() {
+	if s == nil {
+		return
+	}
+	s.closeAttempted = true
+}
+
 // WritableBackend is a Backend that also supports creating + replacing
 // objects. Returned Writers commit on Close; if they also implement Aborter,
 // callers can abandon an unsuccessful write without publishing partial data.
@@ -247,7 +264,8 @@ func Copy(ctx context.Context, src Backend, srcPath string, dst Backend, dstPath
 	if err != nil {
 		return 0, fmt.Errorf("copy: create dst %s: %w", dstPath, err)
 	}
-	defer AbortOnError(&err, out)
+	var cleanupState WriteCleanupState
+	defer AbortOnError(&err, out, &cleanupState)
 
 	buf := make([]byte, transferChunkSize)
 	for written < in.Size() {
@@ -308,6 +326,7 @@ func Copy(ctx context.Context, src Backend, srcPath string, dst Backend, dstPath
 	// WritableBackend implementations (e.g. object-storage backends that
 	// buffer and upload on Close) can fail here even though every prior
 	// Write succeeded.
+	cleanupState.MarkCloseAttempted()
 	if err := out.Close(); err != nil {
 		return written, fmt.Errorf("copy: close dst %s: %w", dstPath, err)
 	}
@@ -381,7 +400,8 @@ func WriteAll(ctx context.Context, b Backend, path string, data []byte) (err err
 	if err != nil {
 		return fmt.Errorf("writeall: create %s: %w", path, err)
 	}
-	defer AbortOnError(&err, w)
+	var cleanupState WriteCleanupState
+	defer AbortOnError(&err, w, &cleanupState)
 	for off := 0; off < len(data); {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -409,6 +429,7 @@ func WriteAll(ctx context.Context, b Backend, path string, data []byte) (err err
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	cleanupState.MarkCloseAttempted()
 	if err := w.Close(); err != nil {
 		return fmt.Errorf("writeall: close %s: %w", path, err)
 	}
@@ -428,17 +449,23 @@ func joinContextCallError(callErr, ctxErr error) error {
 // CleanupUnsuccessfulWrite abandons a writer after a failed write operation
 // and joins any cleanup failure with primaryErr. Abort-capable transactional
 // writers are never closed (and therefore never committed) on this path.
-func CleanupUnsuccessfulWrite(primaryErr error, w Writer) error {
+// When state reports that Close was already attempted, legacy non-Aborter
+// writers are not closed again.
+func CleanupUnsuccessfulWrite(primaryErr error, w Writer, states ...*WriteCleanupState) error {
 	if primaryErr == nil {
 		return nil
 	}
 	if IsCommittedWriteError(primaryErr) {
 		return primaryErr
 	}
+	var state *WriteCleanupState
+	if len(states) > 0 {
+		state = states[0]
+	}
 	var cleanupErr error
 	if aborter, ok := w.(Aborter); ok {
 		cleanupErr = aborter.Abort()
-	} else {
+	} else if state == nil || !state.closeAttempted {
 		cleanupErr = w.Close()
 	}
 	if cleanupErr == nil {
@@ -450,12 +477,14 @@ func CleanupUnsuccessfulWrite(primaryErr error, w Writer) error {
 // AbortOnError abandons w when errp points at a non-nil error. It is intended
 // for use in deferred cleanup by direct Writer users:
 //
-//	defer func() { storage.AbortOnError(&err, w) }()
+//	var cleanupState storage.WriteCleanupState
+//	defer func() { storage.AbortOnError(&err, w, &cleanupState) }()
 //
-// Writers that do not implement Aborter fall back to Close during cleanup.
-func AbortOnError(errp *error, w Writer) {
+// Writers that do not implement Aborter fall back to Close during cleanup
+// unless Close was already attempted.
+func AbortOnError(errp *error, w Writer, states ...*WriteCleanupState) {
 	if errp == nil || *errp == nil || w == nil {
 		return
 	}
-	*errp = CleanupUnsuccessfulWrite(*errp, w)
+	*errp = CleanupUnsuccessfulWrite(*errp, w, states...)
 }

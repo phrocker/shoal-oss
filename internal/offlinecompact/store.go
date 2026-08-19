@@ -67,7 +67,8 @@ func (s *BackendStore) Write(ctx context.Context, path string, data []byte) (err
 	if err != nil {
 		return fmt.Errorf("offlinecompact: create %s: %w", path, err)
 	}
-	defer func() { storage.AbortOnError(&err, w) }()
+	var cleanupState storage.WriteCleanupState
+	defer func() { storage.AbortOnError(&err, w, &cleanupState) }()
 	if err = writeAll(w, data); err != nil {
 		return fmt.Errorf("offlinecompact: write %s: %w", path, err)
 	}
@@ -76,6 +77,7 @@ func (s *BackendStore) Write(ctx context.Context, path string, data []byte) (err
 			return fmt.Errorf("offlinecompact: fsync %s: %w", path, err)
 		}
 	}
+	cleanupState.MarkCloseAttempted()
 	if err = w.Close(); err != nil {
 		return fmt.Errorf("offlinecompact: close %s: %w", path, err)
 	}

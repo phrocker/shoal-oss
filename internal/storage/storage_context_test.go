@@ -57,13 +57,32 @@ func TestCopy_PropagatesCloseError(t *testing.T) {
 	}
 }
 
+func TestCopy_CloseErrorDoesNotRetryCloseForLegacyWriter(t *testing.T) {
+	src := memory.New()
+	src.Put("/src", []byte("hello"))
+
+	closeErr := errors.New("close failed")
+	writer := &closeErrWriter{closeErr: closeErr, commitOnSecondClose: true}
+
+	_, err := storage.Copy(context.Background(), src, "/src", writerBackend{writer: writer}, "/dst")
+	if !errors.Is(err, closeErr) {
+		t.Fatalf("Copy error = %v, want %v", err, closeErr)
+	}
+	if writer.closeCalls != 1 {
+		t.Fatalf("Close calls = %d, want 1", writer.closeCalls)
+	}
+	if writer.committed {
+		t.Fatal("Copy retried Close and committed a legacy writer after the first close failure")
+	}
+}
+
 func TestCopy_CloseErrorAbortsAndJoinsCleanupError(t *testing.T) {
 	src := memory.New()
 	src.Put("/src", []byte("hello"))
 
 	closeErr := errors.New("close failed")
 	abortErr := errors.New("abort failed")
-	writer := &recordingAbortWriter{closeErr: closeErr, abortErr: abortErr}
+	writer := &recordingAbortWriter{closeErr: closeErr, abortErr: abortErr, commitOnSecondClose: true}
 
 	_, err := storage.Copy(context.Background(), src, "/src", writerBackend{writer: writer}, "/dst")
 	if !errors.Is(err, closeErr) || !errors.Is(err, abortErr) {
@@ -71,6 +90,9 @@ func TestCopy_CloseErrorAbortsAndJoinsCleanupError(t *testing.T) {
 	}
 	if writer.closeCalls != 1 || writer.abortCalls != 1 {
 		t.Fatalf("Close calls = %d, Abort calls = %d; want 1 each", writer.closeCalls, writer.abortCalls)
+	}
+	if writer.committed {
+		t.Fatal("Copy retried Close and committed after the first close failure")
 	}
 }
 
@@ -214,7 +236,7 @@ func TestWriteAll_AbortErrorJoinsPrimaryError(t *testing.T) {
 func TestWriteAll_CloseErrorAbortsAndJoinsCleanupError(t *testing.T) {
 	closeErr := errors.New("close failed")
 	abortErr := errors.New("abort failed")
-	writer := &recordingAbortWriter{closeErr: closeErr, abortErr: abortErr}
+	writer := &recordingAbortWriter{closeErr: closeErr, abortErr: abortErr, commitOnSecondClose: true}
 
 	err := storage.WriteAll(context.Background(), writerBackend{writer: writer}, "/dst", []byte("hello"))
 	if !errors.Is(err, closeErr) || !errors.Is(err, abortErr) {
@@ -222,6 +244,25 @@ func TestWriteAll_CloseErrorAbortsAndJoinsCleanupError(t *testing.T) {
 	}
 	if writer.closeCalls != 1 || writer.abortCalls != 1 {
 		t.Fatalf("Close calls = %d, Abort calls = %d; want 1 each", writer.closeCalls, writer.abortCalls)
+	}
+	if writer.committed {
+		t.Fatal("WriteAll retried Close and committed after the first close failure")
+	}
+}
+
+func TestWriteAll_CloseErrorDoesNotRetryCloseForLegacyWriter(t *testing.T) {
+	closeErr := errors.New("close failed")
+	writer := &closeErrWriter{closeErr: closeErr, commitOnSecondClose: true}
+
+	err := storage.WriteAll(context.Background(), writerBackend{writer: writer}, "/dst", []byte("hello"))
+	if !errors.Is(err, closeErr) {
+		t.Fatalf("WriteAll error = %v, want %v", err, closeErr)
+	}
+	if writer.closeCalls != 1 {
+		t.Fatalf("Close calls = %d, want 1", writer.closeCalls)
+	}
+	if writer.committed {
+		t.Fatal("WriteAll retried Close and committed a legacy writer after the first close failure")
 	}
 }
 
@@ -289,6 +330,29 @@ func TestCopy_CanceledReadJoinsBackendError(t *testing.T) {
 	}
 	if writer.abortCalls != 1 {
 		t.Fatalf("Abort calls = %d, want 1", writer.abortCalls)
+	}
+}
+
+func TestCopy_ReadErrorClosesLegacyWriterOnce(t *testing.T) {
+	readErr := errors.New("read failed")
+	writer := &legacyWriteFuncWriter{
+		write: func([]byte) (int, error) {
+			t.Fatal("Copy wrote data after a read failure")
+			return 0, nil
+		},
+	}
+
+	_, err := storage.Copy(context.Background(), fileBackend{file: &readFuncFile{
+		size: 1,
+		read: func([]byte, int64) (int, error) {
+			return 0, readErr
+		},
+	}}, "/src", writerBackend{writer: writer}, "/dst")
+	if !errors.Is(err, readErr) {
+		t.Fatalf("Copy error = %v, want %v", err, readErr)
+	}
+	if writer.closeCalls != 1 {
+		t.Fatalf("Close calls = %d, want 1", writer.closeCalls)
 	}
 }
 
@@ -378,6 +442,23 @@ func TestWriteAll_CanceledWriteJoinsBackendError(t *testing.T) {
 	}
 }
 
+func TestWriteAll_WriteErrorClosesLegacyWriterOnce(t *testing.T) {
+	writeErr := errors.New("write failed")
+	writer := &legacyWriteFuncWriter{
+		write: func([]byte) (int, error) {
+			return 0, writeErr
+		},
+	}
+
+	err := storage.WriteAll(context.Background(), writerBackend{writer: writer}, "/dst", []byte("hello"))
+	if !errors.Is(err, writeErr) {
+		t.Fatalf("WriteAll error = %v, want %v", err, writeErr)
+	}
+	if writer.closeCalls != 1 {
+		t.Fatalf("Close calls = %d, want 1", writer.closeCalls)
+	}
+}
+
 type writerBackend struct {
 	writer storage.Writer
 }
@@ -405,14 +486,16 @@ func (f openFuncBackend) Open(ctx context.Context, path string) (storage.File, e
 }
 
 type recordingAbortWriter struct {
-	buf               bytes.Buffer
-	cancel            context.CancelFunc
-	writes            int
-	cancelAfterWrites int
-	closeErr          error
-	abortErr          error
-	closeCalls        int
-	abortCalls        int
+	buf                 bytes.Buffer
+	cancel              context.CancelFunc
+	writes              int
+	cancelAfterWrites   int
+	closeErr            error
+	abortErr            error
+	commitOnSecondClose bool
+	committed           bool
+	closeCalls          int
+	abortCalls          int
 }
 
 func (w *recordingAbortWriter) Write(p []byte) (int, error) {
@@ -425,6 +508,10 @@ func (w *recordingAbortWriter) Write(p []byte) (int, error) {
 
 func (w *recordingAbortWriter) Close() error {
 	w.closeCalls++
+	if w.commitOnSecondClose && w.closeCalls > 1 {
+		w.committed = true
+		return nil
+	}
 	return w.closeErr
 }
 
@@ -434,8 +521,11 @@ func (w *recordingAbortWriter) Abort() error {
 }
 
 type closeErrWriter struct {
-	buf      bytes.Buffer
-	closeErr error
+	buf                 bytes.Buffer
+	closeErr            error
+	commitOnSecondClose bool
+	committed           bool
+	closeCalls          int
 }
 
 func (w *closeErrWriter) Write(p []byte) (int, error) {
@@ -443,6 +533,31 @@ func (w *closeErrWriter) Write(p []byte) (int, error) {
 }
 
 func (w *closeErrWriter) Close() error {
+	w.closeCalls++
+	if w.commitOnSecondClose && w.closeCalls > 1 {
+		w.committed = true
+		return nil
+	}
+	return w.closeErr
+}
+
+type legacyWriteFuncWriter struct {
+	write      func([]byte) (int, error)
+	closeErr   error
+	writeCalls int
+	closeCalls int
+}
+
+func (w *legacyWriteFuncWriter) Write(p []byte) (int, error) {
+	w.writeCalls++
+	if w.write != nil {
+		return w.write(p)
+	}
+	return len(p), nil
+}
+
+func (w *legacyWriteFuncWriter) Close() error {
+	w.closeCalls++
 	return w.closeErr
 }
 

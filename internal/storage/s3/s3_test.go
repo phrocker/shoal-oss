@@ -26,11 +26,16 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+	s3sdk "github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 
 	shstorage "github.com/phrocker/shoal/internal/storage"
@@ -508,6 +513,121 @@ func TestCleanupStaleArtifactsIsBoundedConditionalAndExplicit(t *testing.T) {
 	cancel()
 	if _, err := backend.CleanupStaleArtifacts(ctx, "s3://bucket/dir", now); !errors.Is(err, context.Canceled) {
 		t.Fatalf("canceled cleanup error = %v, want context.Canceled", err)
+	}
+}
+
+func TestSDKS3ArtifactOperationsListPaginatesVersionsAndDeleteMarkers(t *testing.T) {
+	stageA := "dir/" + expectedTemporaryStageKeyComponent("dir/target-a", strings.Repeat("5", 64))
+	stageB := "dir/" + expectedTemporaryStageKeyComponent("dir/target-b", strings.Repeat("6", 64))
+	var calls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if r.Method != http.MethodGet {
+			t.Errorf("method = %s, want GET", r.Method)
+		}
+		if r.URL.Path != "/bucket" {
+			t.Errorf("path = %s, want /bucket", r.URL.Path)
+		}
+		if got := r.URL.Query().Get("prefix"); got != "dir/" {
+			t.Errorf("prefix = %q, want dir/", got)
+		}
+		if _, ok := r.URL.Query()["versions"]; !ok {
+			t.Errorf("query = %q, want versions listing", r.URL.RawQuery)
+		}
+		w.Header().Set("Content-Type", "application/xml")
+		switch calls {
+		case 1:
+			if got := r.URL.Query().Get("key-marker"); got != "" {
+				t.Errorf("first key-marker = %q, want empty", got)
+			}
+			if got := r.URL.Query().Get("version-id-marker"); got != "" {
+				t.Errorf("first version-id-marker = %q, want empty", got)
+			}
+			fmt.Fprintf(w, `<?xml version="1.0" encoding="UTF-8"?>
+<ListVersionsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Name>bucket</Name>
+  <Prefix>dir/</Prefix>
+  <IsTruncated>true</IsTruncated>
+  <NextKeyMarker>%s</NextKeyMarker>
+  <NextVersionIdMarker>v-old</NextVersionIdMarker>
+  <Version>
+    <Key>%s</Key>
+    <VersionId>v-old</VersionId>
+    <IsLatest>false</IsLatest>
+    <LastModified>2026-08-19T00:00:00.000Z</LastModified>
+    <ETag>&quot;etag-old&quot;</ETag>
+    <Size>1</Size>
+    <StorageClass>STANDARD</StorageClass>
+  </Version>
+</ListVersionsResult>`, stageA, stageA)
+		case 2:
+			if got := r.URL.Query().Get("key-marker"); got != stageA {
+				t.Errorf("second key-marker = %q, want %q", got, stageA)
+			}
+			if got := r.URL.Query().Get("version-id-marker"); got != "v-old" {
+				t.Errorf("second version-id-marker = %q, want v-old", got)
+			}
+			fmt.Fprintf(w, `<?xml version="1.0" encoding="UTF-8"?>
+<ListVersionsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Name>bucket</Name>
+  <Prefix>dir/</Prefix>
+  <IsTruncated>false</IsTruncated>
+  <DeleteMarker>
+    <Key>%s</Key>
+    <VersionId>m-old</VersionId>
+    <IsLatest>true</IsLatest>
+    <LastModified>2026-08-19T01:00:00.000Z</LastModified>
+  </DeleteMarker>
+  <Version>
+    <Key>%s</Key>
+    <VersionId>null</VersionId>
+    <IsLatest>true</IsLatest>
+    <LastModified>2026-08-19T02:00:00.000Z</LastModified>
+    <ETag>&quot;etag-null&quot;</ETag>
+    <Size>1</Size>
+    <StorageClass>STANDARD</StorageClass>
+  </Version>
+</ListVersionsResult>`, stageA, stageB)
+		default:
+			t.Fatalf("unexpected extra paginator call %d", calls)
+		}
+	}))
+	defer server.Close()
+
+	client := s3sdk.NewFromConfig(
+		aws.Config{
+			Region:      "us-east-1",
+			Credentials: aws.NewCredentialsCache(credentials.NewStaticCredentialsProvider("AKID", "SECRET", "")),
+			HTTPClient:  server.Client(),
+		},
+		func(o *s3sdk.Options) {
+			o.BaseEndpoint = aws.String(server.URL)
+			o.UsePathStyle = true
+		},
+	)
+
+	artifacts, err := (sdkS3ArtifactOperations{client: client}).list(context.Background(), "bucket", "dir/")
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if calls != 2 {
+		t.Fatalf("pagination calls = %d, want 2", calls)
+	}
+	if len(artifacts) != 3 {
+		t.Fatalf("artifacts = %#v, want 3 entries", artifacts)
+	}
+	got := make(map[string]s3Artifact, len(artifacts))
+	for _, artifact := range artifacts {
+		got[artifact.key+"#"+aws.ToString(artifact.versionID)] = artifact
+	}
+	if artifact, ok := got[stageA+"#v-old"]; !ok || artifact.deleteMarker || artifact.etag == nil {
+		t.Fatalf("old stage version = %#v, want version with ETag", artifact)
+	}
+	if artifact, ok := got[stageA+"#m-old"]; !ok || !artifact.deleteMarker {
+		t.Fatalf("stale delete marker = %#v, want delete marker entry", artifact)
+	}
+	if artifact, ok := got[stageB+"#null"]; !ok || artifact.deleteMarker || artifact.etag == nil {
+		t.Fatalf("null-version stage = %#v, want current version with ETag", artifact)
 	}
 }
 

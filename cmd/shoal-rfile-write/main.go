@@ -59,7 +59,8 @@ func run() (err error) {
 	if err != nil {
 		return fmt.Errorf("create %s: %w", *out, err)
 	}
-	defer func() { storage.AbortOnError(&err, w) }()
+	var cleanupState storage.WriteCleanupState
+	defer func() { storage.AbortOnError(&err, w, &cleanupState) }()
 
 	rw, err := rfile.NewWriter(w, rfile.WriterOptions{
 		Codec:     *codec,
@@ -92,6 +93,7 @@ func run() (err error) {
 	if err = rw.Close(); err != nil {
 		return fmt.Errorf("rfile close: %w", err)
 	}
+	cleanupState.MarkCloseAttempted()
 	if err = w.Close(); err != nil {
 		return fmt.Errorf("storage close %s: %w", *out, err)
 	}
