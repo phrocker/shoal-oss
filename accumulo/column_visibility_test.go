@@ -2,6 +2,7 @@ package accumulo
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -418,6 +419,56 @@ func TestVisibilityEvaluatorDoesNotCacheAcrossAnAuthorizationChange(t *testing.T
 	}
 	if visible {
 		t.Fatal("evaluator served a decision made against the previous authorizations")
+	}
+}
+
+func TestVisibilityEvaluatorCacheIsBounded(t *testing.T) {
+	evaluator := NewVisibilityEvaluator(NewAuthorizationStrings("a"))
+	for index := 0; index < visibilityCacheCapacity*2; index++ {
+		expression := fmt.Sprintf("label%d", index)
+		if _, err := evaluator.Evaluate([]byte(expression)); err != nil {
+			t.Fatalf("Evaluate(%q) = %v", expression, err)
+		}
+	}
+	evaluator.mu.Lock()
+	size := evaluator.cache.len()
+	evaluator.mu.Unlock()
+	if size != visibilityCacheCapacity {
+		t.Fatalf("cache holds %d entries, want %d", size, visibilityCacheCapacity)
+	}
+	// The most recent expression is still cached and the oldest is not.
+	evaluator.mu.Lock()
+	_, newest := evaluator.cache.get(fmt.Sprintf("label%d", visibilityCacheCapacity*2-1))
+	_, oldest := evaluator.cache.get("label0")
+	evaluator.mu.Unlock()
+	if !newest {
+		t.Fatal("the most recent decision was evicted")
+	}
+	if oldest {
+		t.Fatal("the least recently used decision survived")
+	}
+}
+
+func TestVisibilityCacheEvictsLeastRecentlyUsed(t *testing.T) {
+	cache := newVisibilityCache(2)
+	cache.put("a", true)
+	cache.put("b", false)
+	if value, ok := cache.get("a"); !ok || !value {
+		t.Fatalf("get(a) = %v, %v", value, ok)
+	}
+	cache.put("c", true)
+	if _, ok := cache.get("b"); ok {
+		t.Fatal("b was not evicted")
+	}
+	if value, ok := cache.get("a"); !ok || !value {
+		t.Fatal("a was evicted despite being used most recently")
+	}
+	cache.put("a", false)
+	if value, ok := cache.get("a"); !ok || value {
+		t.Fatal("put did not overwrite an existing entry")
+	}
+	if cache.len() != 2 {
+		t.Fatalf("cache holds %d entries", cache.len())
 	}
 }
 

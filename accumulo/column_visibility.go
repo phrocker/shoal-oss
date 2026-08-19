@@ -2,6 +2,7 @@ package accumulo
 
 import (
 	"bytes"
+	"container/list"
 	"errors"
 	"fmt"
 	"sort"
@@ -552,22 +553,77 @@ func (p *visibilityParser) consumeQuotedTerm(start int) error {
 	return nil
 }
 
+// visibilityCacheCapacity bounds the number of decisions one evaluator keeps.
+// Cell visibilities repeat heavily within a scan, so a small cache pays for
+// itself, but a high-cardinality workload must not grow it without bound.
+const visibilityCacheCapacity = 1024
+
+// visibilityCache is a bounded least-recently-used map of decisions.
+type visibilityCache struct {
+	capacity int
+	entries  map[string]*list.Element
+	order    *list.List
+}
+
+type visibilityCacheEntry struct {
+	key   string
+	value bool
+}
+
+func newVisibilityCache(capacity int) *visibilityCache {
+	return &visibilityCache{
+		capacity: capacity,
+		entries:  make(map[string]*list.Element),
+		order:    list.New(),
+	}
+}
+
+// get returns a cached decision and marks it most recently used.
+func (c *visibilityCache) get(key string) (bool, bool) {
+	element, ok := c.entries[key]
+	if !ok {
+		return false, false
+	}
+	c.order.MoveToFront(element)
+	return element.Value.(*visibilityCacheEntry).value, true
+}
+
+// put stores a decision, evicting the least recently used one when full.
+func (c *visibilityCache) put(key string, value bool) {
+	if element, ok := c.entries[key]; ok {
+		element.Value.(*visibilityCacheEntry).value = value
+		c.order.MoveToFront(element)
+		return
+	}
+	for c.order.Len() >= c.capacity {
+		oldest := c.order.Back()
+		if oldest == nil {
+			break
+		}
+		c.order.Remove(oldest)
+		delete(c.entries, oldest.Value.(*visibilityCacheEntry).key)
+	}
+	c.entries[key] = c.order.PushFront(&visibilityCacheEntry{key: key, value: value})
+}
+
+func (c *visibilityCache) len() int { return c.order.Len() }
+
 // VisibilityEvaluator decides whether a set of authorizations satisfies a
-// visibility expression. It is safe for concurrent use, and replacing its
-// authorizations discards every cached decision.
+// visibility expression. It is safe for concurrent use, replacing its
+// authorizations discards every cached decision, and the cache is bounded.
 type VisibilityEvaluator struct {
 	mu    sync.Mutex
 	auths *Authorizations
 	// generation changes with every authorization replacement so a decision
 	// computed against an older set is never written into the newer cache.
 	generation uint64
-	cache      map[string]bool
+	cache      *visibilityCache
 }
 
 // NewVisibilityEvaluator builds an evaluator for auths. A nil or empty set
 // satisfies only expressions that impose no requirement.
 func NewVisibilityEvaluator(auths *Authorizations) *VisibilityEvaluator {
-	evaluator := &VisibilityEvaluator{cache: make(map[string]bool)}
+	evaluator := &VisibilityEvaluator{cache: newVisibilityCache(visibilityCacheCapacity)}
 	evaluator.SetAuthorizations(auths)
 	return evaluator
 }
@@ -593,7 +649,7 @@ func (e *VisibilityEvaluator) SetAuthorizations(auths *Authorizations) {
 		e.auths = auths.Clone()
 	}
 	e.generation++
-	e.cache = make(map[string]bool)
+	e.cache = newVisibilityCache(visibilityCacheCapacity)
 }
 
 // Evaluate reports whether the authorizations satisfy expression. An empty
@@ -603,7 +659,7 @@ func (e *VisibilityEvaluator) Evaluate(expression []byte) (bool, error) {
 		return true, nil
 	}
 	e.mu.Lock()
-	cached, ok := e.cache[string(expression)]
+	cached, ok := e.cache.get(string(expression))
 	auths, generation := e.auths, e.generation
 	e.mu.Unlock()
 	if ok {
@@ -619,7 +675,7 @@ func (e *VisibilityEvaluator) Evaluate(expression []byte) (bool, error) {
 	}
 	e.mu.Lock()
 	if e.generation == generation {
-		e.cache[string(expression)] = result
+		e.cache.put(string(expression), result)
 	}
 	e.mu.Unlock()
 	return result, nil
