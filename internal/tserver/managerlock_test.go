@@ -379,6 +379,55 @@ func TestWatchManagerLockRidesOutAReadingThatWentBackwards(t *testing.T) {
 	}
 }
 
+// TestWatchManagerLockKeepsARefusalAcrossAnUnreadablePoll pins what clears the
+// count of refusals. A poll that could not be read is not evidence of
+// anything: the previous observation stands and the host is told nothing. If
+// it cleared the count, a recreated lock directory interleaved with transient
+// ZooKeeper failures would refuse every reading and never be reported, leaving
+// the host fenced to a dead manager — exactly the case ending the watch exists
+// for.
+func TestWatchManagerLockKeepsARefusalAcrossAnUnreadablePoll(t *testing.T) {
+	host := NewHost()
+	// Every reading after the first is the recreated directory, and every
+	// other poll fails to read it at all, so no two refusals are ever
+	// adjacent. A count an unreadable poll cleared would never reach two.
+	var alternate func(*fakeManagerReader)
+	alternate = func(r *fakeManagerReader) {
+		if r.err == nil {
+			r.err = gozk.ErrConnectionClosed
+		} else {
+			r.err = nil
+		}
+		r.script = append(r.script, alternate)
+	}
+	reader := &fakeManagerReader{
+		children: []string{managerNode(otherUUID, 9)},
+		script: []func(*fakeManagerReader){
+			func(r *fakeManagerReader) {
+				r.children = []string{managerNode(managerUUID, 2)}
+				r.script = append(r.script, alternate)
+			},
+		},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	watch := make(chan error, 1)
+	go func() { watch <- WatchManagerLock(ctx, reader, host, time.Millisecond) }()
+
+	select {
+	case err := <-watch:
+		if !errors.Is(err, ErrLockNotNewer) {
+			t.Fatalf("WatchManagerLock: want ErrLockNotNewer, got %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("an unreadable poll cleared a refusal that no reading resolved")
+	}
+	observed, ok := host.ManagerLock()
+	if !ok || observed != (LockID{UUID: otherUUID, Sequence: 9}) {
+		t.Fatalf("manager authority = %s, %v; want the epoch already observed", observed, ok)
+	}
+}
+
 // TestWatchManagerLockObservesBeforeItWaits matters at startup: a tablet
 // server that waited a poll interval before its first reading would refuse the
 // manager's first assignments after every restart.

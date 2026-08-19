@@ -565,11 +565,36 @@ func TestAcquireRefusesDescriptorsThatDoNotMatchTheDirectory(t *testing.T) {
 	}
 }
 
-// TestAcquireLeavesALockThatNamesNoServerAlone keeps that check where it
-// belongs. The manager's lock lives at <instance>/managers/lock, where nothing
+// TestAcquireRefusesAnotherRolesServiceOnATabletServerPath applies the same
+// rule to what a descriptor claims to speak. TabletServerLockData refuses the
+// services other roles own, but ServiceLockData is an ordinary struct and can
+// be built without it, and a MANAGER endpoint advertised from a tablet
+// server's lock points every client that looks it up at a process which does
+// not implement it.
+func TestAcquireRefusesAnotherRolesServiceOnATabletServerPath(t *testing.T) {
+	f := newFakeZK()
+	lock := newTestLock(t, f, serverUUID)
+	data := ServiceLockData{Descriptors: []ServiceDescriptor{{
+		UUID:    serverUUID,
+		Service: ThriftService("MANAGER"),
+		Address: testAddress,
+		Group:   testGroup,
+	}}}
+	_, err := lock.Acquire(context.Background(), data)
+	if !errors.Is(err, ErrInvalidLockData) {
+		t.Fatalf("Acquire = %v, want ErrInvalidLockData", err)
+	}
+	if nodes := f.lockNodes(testLockPath()); len(nodes) != 0 {
+		t.Fatalf("a refused advertisement still left %v in %s", nodes, testLockPath())
+	}
+}
+
+// TestAcquireLeavesALockThatNamesNoServerAlone keeps both checks where they
+// belong. The manager's lock lives at <instance>/managers/lock, where nothing
 // in the path identifies a process, so there is no address to hold a
 // descriptor to — and inventing one from the last two segments would refuse
-// every lock that is not a tablet server's.
+// every lock that is not a tablet server's, along with the services that role
+// owns.
 func TestAcquireLeavesALockThatNamesNoServerAlone(t *testing.T) {
 	f := newFakeZK()
 	managerPath := testInstancePath + "/managers/lock"
@@ -1717,27 +1742,25 @@ func TestReleaseBeforeTheTurnArrivesRefusesToTakeIt(t *testing.T) {
 }
 
 // TestReleaseSweepsEveryNodeThisProcessCreated covers the duplicate a lost
-// create response left behind. Releasing only the held node would promote that
-// duplicate to holder of a lock nobody is waiting on, blocking every candidate
-// behind it until the session ended.
+// create response left behind. Acquisition collapses the duplicates it can
+// see, but a retry whose first attempt was already in flight can land after
+// that, so a held lock can still have a second node of this process behind it.
+// Releasing only the held node would promote that duplicate to holder of a
+// lock nobody is waiting on, blocking every candidate behind it until the
+// session ended.
 func TestReleaseSweepsEveryNodeThisProcessCreated(t *testing.T) {
 	f := newFakeZK()
-	f.duplicates = 2
 	lock := newTestLock(t, f, serverUUID)
-
-	// Make the duplicate cleanup during acquisition fail, so a node of this
-	// process survives to be swept by Release.
-	duplicate := path.Join(testLockPath(), fmt.Sprintf("%s%s#%010d", zLockPrefix, serverUUID, 1))
-	f.failDelete(duplicate, gozk.ErrConnectionClosed)
-
 	if _, err := lock.Acquire(context.Background(), testLockData(t)); err != nil {
 		t.Fatalf("Acquire: %v", err)
 	}
-	if !f.exists(duplicate) {
-		t.Fatal("the duplicate must survive acquisition for this test to mean anything")
+
+	// The late retry, landing behind the node this process adopted.
+	duplicate := f.seedForeignLock(testLockPath(), serverUUID, 7)
+	if !f.exists(path.Join(testLockPath(), duplicate)) {
+		t.Fatal("the duplicate must exist for this test to mean anything")
 	}
 
-	f.failDelete(duplicate, nil)
 	if err := lock.Release(); err != nil {
 		t.Fatalf("Release: %v", err)
 	}
@@ -1745,6 +1768,46 @@ func TestReleaseSweepsEveryNodeThisProcessCreated(t *testing.T) {
 		if strings.HasPrefix(child, lock.nodePrefix()) {
 			t.Fatalf("%s survived Release and can become a holder nobody is waiting on", child)
 		}
+	}
+}
+
+// TestAcquireFailsWhenADuplicateCannotBeDropped is the other half of that
+// story, at the moment acquisition finds the duplicates. Reporting success
+// with one still standing would leave this session holding two places in line
+// and maintaining one of them: when the adopted node goes, the survivor
+// becomes the lowest in the directory and so the holder the manager sees, a
+// server that looks alive and refuses every request because the generation
+// this process was fenced to has ended. Failing hands it to the cleanup that
+// says only closing the session will clear it.
+func TestAcquireFailsWhenADuplicateCannotBeDropped(t *testing.T) {
+	f := newFakeZK()
+	f.duplicates = 2
+	lock := newTestLock(t, f, serverUUID)
+
+	duplicate := path.Join(testLockPath(), fmt.Sprintf("%s%s#%010d", zLockPrefix, serverUUID, 1))
+	f.failDelete(duplicate, gozk.ErrConnectionClosed)
+
+	_, err := lock.Acquire(context.Background(), testLockData(t))
+	if err == nil {
+		t.Fatal("Acquire reported success while a duplicate of this session was still queued")
+	}
+	if !errors.Is(err, ErrLockNodeOrphaned) {
+		t.Fatalf("Acquire = %v, want the surviving node reported as ErrLockNodeOrphaned", err)
+	}
+	if !errors.Is(err, gozk.ErrConnectionClosed) {
+		t.Fatalf("Acquire = %v, want the delete failure that caused it", err)
+	}
+	if _, held := lock.LockID(); held {
+		t.Fatal("no generation may be adopted while a duplicate of it is queued")
+	}
+	if !f.exists(duplicate) {
+		t.Fatal("the duplicate must survive for this test to mean anything")
+	}
+	// The node this process would have held is gone: the cleanup took back
+	// everything it could, so the only thing left is the one it reported.
+	adopted := path.Join(testLockPath(), fmt.Sprintf("%s%s#%010d", zLockPrefix, serverUUID, 0))
+	if f.exists(adopted) {
+		t.Fatalf("%s outlived a failed acquisition", adopted)
 	}
 }
 

@@ -464,6 +464,14 @@ func (l *ServiceLock) Node() string {
 // is what a client dials, and a lock that registers under one address while
 // advertising another is a server the manager can see but nothing can reach.
 // A lock path of another shape names no server and is not checked this way.
+//
+// On such a path the services are checked too: only the five a tablet server
+// publishes are accepted. TabletServerLockData refuses the rest already, but
+// ServiceLockData is an ordinary struct and can be built without it, and a
+// descriptor for another role's service under a tablet server's path claims an
+// endpoint that role owns while pointing at a process that does not implement
+// it. Locks that name no server carry their own roles' services and are left
+// alone.
 func (l *ServiceLock) Acquire(ctx context.Context, data ServiceLockData) (LockID, error) {
 	payload, err := data.Encode()
 	if err != nil {
@@ -477,6 +485,10 @@ func (l *ServiceLock) Acquire(ctx context.Context, data ServiceLockData) (LockID
 		}
 		if !registersAServer {
 			continue
+		}
+		if _, ours := tabletServerServiceSet[descriptor.Service]; !ours {
+			return LockID{}, fmt.Errorf("%w: %q is not a tablet-server service, but this lock registers a tablet server",
+				ErrInvalidLockData, descriptor.Service)
 		}
 		if descriptor.Address != address {
 			return LockID{}, fmt.Errorf("%w: %s descriptor advertises %s, but this lock registers %s",
@@ -604,10 +616,28 @@ func (l *ServiceLock) queueForOwnership(ctx context.Context) (LockID, error) {
 					ErrLockNodeMissing, l.nodePrefix(), l.dir)
 			}
 			node = ours[0]
-			for _, duplicate := range ours[1:] {
-				l.deleteNode(duplicate)
+			duplicates := ours[1:]
+			// A duplicate that cannot be dropped fails the acquisition. It is
+			// this session's node, so it lives as long as the session, holding
+			// a second place in line that no ServiceLock maintains: once the
+			// node this process does adopt goes away, the duplicate becomes
+			// the lowest in the directory and therefore the holder the manager
+			// sees — a server that looks live and refuses everything, because
+			// the generation this process was fenced to has ended. Failing
+			// here hands it to Acquire's cleanup, which sweeps the prefix and
+			// reports ErrLockNodeOrphaned when a node still survives, so the
+			// session's owner is told that only closing the session clears it.
+			var failures []error
+			for _, duplicate := range duplicates {
+				if err := l.deleteNode(duplicate); err != nil {
+					failures = append(failures, err)
+				}
 			}
-			sorted = removeNodes(sorted, ours[1:])
+			if len(failures) > 0 {
+				return LockID{}, fmt.Errorf("collapse duplicate lock nodes in %s: %w",
+					l.dir, errors.Join(failures...))
+			}
+			sorted = removeNodes(sorted, duplicates)
 		}
 		index := indexOfNode(sorted, node)
 		if index < 0 {

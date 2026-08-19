@@ -301,10 +301,28 @@ directory is refused before the node is created. A lock path that names
 no server, like the manager's `<instance>/managers/lock`, has no address
 to be held to and is not checked this way.
 
+The services are held to the path in the same way. `TabletServerLockData`
+refuses the services other roles own, but `ServiceLockData` is an
+ordinary struct that can be built without it, and a `MANAGER` descriptor
+published from a tablet server's lock is an endpoint that role owns
+pointing at a process which does not implement it. Under a
+`.../tservers/...` path only the five a tablet server announces are
+accepted; a lock that names no server carries its own role's services and
+is left alone.
+
 Duplicates are real: a create whose response was lost still created a
 node, and a retry creates another. Both carry this process's UUID, so
 the first is kept and the rest are deleted — otherwise one process would
 hold several places in line and leave a node behind when it released.
+
+A duplicate that cannot be deleted fails the acquisition. It is this
+session's node, so it lives as long as the session does, holding a
+second place in line that nothing maintains: when the node this process
+adopted goes away, the survivor becomes the lowest in the directory and
+therefore the holder the manager sees — a server that looks alive and
+refuses every request, because the generation this process was fenced to
+has ended. Failing instead hands it to the cleanup below, which sweeps
+what it can and reports what it cannot.
 
 A cancelled acquisition deletes whatever it created, and says so when it
 cannot: the error also wraps `ErrLockNodeOrphaned`. An abandoned
@@ -526,6 +544,13 @@ went backwards. A recreated directory reads that way on every poll after
 it, so requiring the refusal to survive one more reading tells the two
 apart. Neither reading is believed in the meantime: both are refused,
 and authority stays where it was.
+
+Only a reading the host accepts clears a pending refusal. A poll that
+could not be read is not evidence of anything — it leaves the previous
+observation standing and tells the host nothing — so it leaves the count
+where it was. Clearing it there would let a recreated directory
+interleaved with transient ZooKeeper failures refuse every reading and
+never be reported, which is the case ending the watch exists for.
 
 ## 7. What is not here yet
 

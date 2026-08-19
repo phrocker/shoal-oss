@@ -141,6 +141,12 @@ func ReadManagerLock(ctx context.Context, reader ManagerLockReader) (LockID, err
 // refusal to survive one more reading tells the two apart without giving a
 // stale reading any authority — it is refused both times. Ending the watch on
 // the first would hand the supervisor a Host restart for a lagging replica.
+//
+// Only a reading the host accepts clears a pending refusal. A poll that could
+// not be read leaves the count where it was, because it is not evidence of
+// anything: treating it as a clean reading would let a recreated directory
+// interleaved with unreadable polls refuse forever without ever being
+// reported, which is the case ending the watch exists for.
 func WatchManagerLock(
 	ctx context.Context,
 	reader ManagerLockReader,
@@ -158,16 +164,19 @@ func WatchManagerLock(
 	}
 	timer := time.NewTimer(interval)
 	defer timer.Stop()
-	// Consecutive refusals. Reset by any reading the host accepts, so this
-	// counts a condition that persists rather than refusals in total.
+	// Consecutive refusals, counted across polls that read nothing. Reset by
+	// any reading the host accepts, so this counts a condition that persists
+	// rather than refusals in total.
 	refused := 0
 	for {
-		if err := observeManagerLockOnce(ctx, reader, host); err != nil {
+		observed, err := observeManagerLockOnce(ctx, reader, host)
+		switch {
+		case err != nil:
 			refused++
 			if refused > 1 {
 				return err
 			}
-		} else {
+		case observed:
 			refused = 0
 		}
 		if err := ctx.Err(); err != nil {
@@ -182,15 +191,18 @@ func WatchManagerLock(
 	}
 }
 
-// observeManagerLockOnce applies one reading of the manager lock to the host,
-// returning an error only when the host refuses the reading — the one outcome
+// observeManagerLockOnce applies one reading of the manager lock to the host.
+//
+// It reports whether the host was given a reading at all — false when the
+// directory could not be read, which leaves the previous observation standing
+// — and returns an error only when the host refuses one, the single outcome
 // another poll cannot change.
-func observeManagerLockOnce(ctx context.Context, reader ManagerLockReader, host *Host) error {
+func observeManagerLockOnce(ctx context.Context, reader ManagerLockReader, host *Host) (bool, error) {
 	id, err := ReadManagerLock(ctx, reader)
 	switch {
 	case err == nil:
 		if err := host.ObserveManagerLock(id); err != nil {
-			return fmt.Errorf("observe manager lock %s: %w",
+			return false, fmt.Errorf("observe manager lock %s: %w",
 				path.Join(reader.InstancePath(), zManagerLock), err)
 		}
 	case errors.Is(err, ErrNoManagerLock):
@@ -198,6 +210,7 @@ func observeManagerLockOnce(ctx context.Context, reader ManagerLockReader, host 
 		_ = host.ObserveManagerLock(LockID{})
 	default:
 		// Unreadable is not the same as absent: hold the last observation.
+		return false, nil
 	}
-	return nil
+	return true, nil
 }
