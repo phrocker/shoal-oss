@@ -19,8 +19,16 @@ enum {
 int shoal_test_connector_create(shoal_connector **out_connector);
 size_t shoal_test_connector_flush_wait_count(shoal_connector *connector,
                                              uint8_t wait);
-int shoal_test_connector_identity_block(shoal_connector *connector,
+int shoal_test_connector_identity_block(                                        shoal_connector *connector,
                                         uint8_t block);
+int shoal_test_connector_table_maintenance_block(
+                                        shoal_connector *connector,
+                                        uint8_t block);
+int shoal_test_connector_last_flush_range_matches(
+                                        shoal_connector *connector,
+                                        shoal_bytes *start,
+                                        shoal_bytes *end,
+                                        uint8_t wait);
 int shoal_test_connector_topology_block(shoal_connector *connector,
                                         uint8_t block);
 int shoal_test_batch_writer_create(int mode, shoal_batch_writer **out_writer);

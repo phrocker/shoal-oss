@@ -29,14 +29,14 @@ Shoal separates **ABI compatibility** from **feature availability**:
   stable allocation-free version tuple that works before connector creation.
   `SHOAL_ABI_VERSION_PACKED` uses
   `SHOAL_ABI_PACK_VERSION(major, minor, patch)` with a hexadecimal
-  `0x00MMmmpp` layout, so ABI `1.7.0` is `0x00010700`.
+  `0x00MMmmpp` layout, so ABI `1.8.0` is `0x00010800`.
 - Capability identifiers are append-only. Existing IDs and bits never change
   meaning. `shoal_abi_capability_word_count()` reports how many 64-bit words
   the current library uses, `shoal_abi_capability_word(i)` returns `0` for
   `i >= word_count`, and `shoal_abi_has_capability(id)` returns `0` for both
   unsupported and unknown IDs.
 
-Current capability assignments (`word 0 == 0x000000000003ffff`):
+Current capability assignments (`word 0 == 0x00000000000fffff`):
 
 | ID | Mask | Surface |
 | --- | --- | --- |
@@ -59,6 +59,7 @@ Current capability assignments (`word 0 == 0x000000000003ffff`):
 | `SHOAL_ABI_CAPABILITY_RFILE` | `0x10000` | owned standalone RFile readers, writers, seekable relocations, and copied results |
 | `SHOAL_ABI_CAPABILITY_DATA_VALUES` | `0x20000` | copied key/range/authorization operations and owned key/value results |
 | `SHOAL_ABI_CAPABILITY_BUFFERED_WRITER` | `0x40000` | owned lazy row-buffered high-level writer with close coordination |
+| `SHOAL_ABI_CAPABILITY_TABLE_MAINTENANCE` | `0x80000` | row-bounded table flush and owned constraint administration |
 
 Shoal does **not** advertise instance status, compaction/import/export,
 Python/wheel, or any other unimplemented surface until the API exists and has
@@ -156,6 +157,12 @@ Version numbers change only when the public ABI contract changes:
   from `shoal_table_list_get` and `shoal_table_properties_get` remain valid
   until the matching result is freed. Effective properties preserve explicit
   empty string values.
+- Row-bounded flush distinguishes a `NULL` bound pointer (unbounded) from a
+  non-NULL zero-length bound (the empty row) and copies binary bounds before
+  invoking Go. Constraint listing returns an owned, stably ordered snapshot;
+  its caller-sized views borrow class names until list free. All live
+  maintenance calls accept deadlines and participate in connector-close
+  cancellation and active-call joining.
 - Namespace lists and property results own all returned strings. Versioned
   property results additionally preserve the Accumulo property-store version.
 - Authorization and split results own binary-safe byte arrays. Their borrowed
