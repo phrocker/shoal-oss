@@ -168,6 +168,14 @@ shoal_batch_scanner_close
 shoal_batch_scanner_free
 shoal_scanner_scan
 shoal_batch_scanner_scan
+shoal_cancellation_create
+shoal_cancellation_cancel
+shoal_cancellation_is_cancelled
+shoal_cancellation_free
+shoal_scanner_scan_with_cancellation
+shoal_batch_scanner_scan_with_cancellation
+shoal_connector_invalidate_table
+shoal_connector_invalidate_discovery
 shoal_scan_result_count
 shoal_scan_result_get
 shoal_scan_result_free
@@ -230,6 +238,7 @@ shoal_authorizations_free
 shoal_authorizations_list
 shoal_batch_scanner_close
 shoal_batch_scanner_free
+shoal_batch_scanner_scan_with_cancellation
 shoal_batch_writer_add
 shoal_batch_writer_close
 shoal_batch_writer_config_init
@@ -240,6 +249,10 @@ shoal_bytes_list_free
 shoal_bytes_list_get
 shoal_bytes_result_free
 shoal_bytes_result_get
+shoal_cancellation_cancel
+shoal_cancellation_create
+shoal_cancellation_free
+shoal_cancellation_is_cancelled
 shoal_configuration_create
 shoal_configuration_free
 shoal_configuration_get
@@ -286,6 +299,8 @@ shoal_connector_has_table_permission
 shoal_connector_identity_free
 shoal_connector_identity_get
 shoal_connector_identity_view_init
+shoal_connector_invalidate_discovery
+shoal_connector_invalidate_table
 shoal_connector_list_namespaces
 shoal_connector_list_table_constraints
 shoal_connector_list_table_splits
@@ -373,6 +388,7 @@ shoal_scan_result_get
 shoal_scanner_close
 shoal_scanner_config_init
 shoal_scanner_free
+shoal_scanner_scan_with_cancellation
 shoal_server_list_count
 shoal_server_list_free
 shoal_server_list_get
