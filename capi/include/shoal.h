@@ -428,6 +428,49 @@ shoal_connector_flush_table(shoal_connector *connector,
                             int64_t timeout_ms, shoal_error **out_error);
 
 /*
+ * A NULL bound pointer is unbounded; a non-NULL shoal_bytes with length zero
+ * is a bounded empty row. Bounds are copied before return. Reversed bounds and
+ * malformed byte views are invalid arguments.
+ */
+SHOAL_API shoal_status SHOAL_CALL
+shoal_connector_flush_table_range(
+    shoal_connector *connector, const char *table_name,
+    const shoal_bytes *start_row, const shoal_bytes *end_row, uint8_t wait,
+    int64_t timeout_ms, shoal_error **out_error);
+
+/*
+ * Constraint class/table strings are copied before use. List results own every
+ * class name; initialized views borrow result memory until list free. All live
+ * operations accept deadlines and are canceled and joined by connector close.
+ */
+SHOAL_API void SHOAL_CALL
+shoal_table_constraint_view_init(shoal_table_constraint_view *view);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_connector_add_table_constraint(
+    shoal_connector *connector, const char *table_name,
+    const char *class_name, int64_t timeout_ms, int32_t *out_number,
+    shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_connector_list_table_constraints(
+    shoal_connector *connector, const char *table_name, int64_t timeout_ms,
+    shoal_table_constraint_list_result **out_result,
+    shoal_error **out_error);
+SHOAL_API size_t SHOAL_CALL
+shoal_table_constraint_list_count(
+    const shoal_table_constraint_list_result *result);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_table_constraint_list_get(
+    const shoal_table_constraint_list_result *result, size_t index,
+    shoal_table_constraint_view *out_constraint, shoal_error **out_error);
+SHOAL_API void SHOAL_CALL
+shoal_table_constraint_list_free(
+    shoal_table_constraint_list_result **result);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_connector_remove_table_constraint(
+    shoal_connector *connector, const char *table_name, int32_t number,
+    int64_t timeout_ms, shoal_error **out_error);
+
+/*
  * property_value is required but may be the empty string; use
  * shoal_connector_remove_table_property to remove a property entirely.
  */

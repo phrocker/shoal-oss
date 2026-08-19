@@ -147,7 +147,7 @@ SB-DATA-068 Missing Go
 SB-SCAN-001 Behavior mismatch
 SB-SCAN-002 Behavior mismatch
 SB-SCAN-003 Missing C ABI
-SB-SCAN-004 Missing C ABI
+SB-SCAN-004 Behavior mismatch
 SB-SCAN-005 Behavior mismatch
 SB-SCAN-006 Behavior mismatch
 SB-SCAN-007 Missing Go
@@ -163,9 +163,9 @@ SB-SCAN-015 Missing Go
 SB-SCAN-016 Not required (rationale required)
 SB-SCAN-017 Behavior mismatch
 SB-SCAN-018 Behavior mismatch
-SB-SCAN-019 Missing C ABI
-SB-SCAN-020 Missing C ABI
-SB-SCAN-021 Missing C ABI
+SB-SCAN-019 Missing Go
+SB-SCAN-020 Missing Go
+SB-SCAN-021 Missing Go
 SB-SCAN-022 Behavior mismatch
 SB-SCAN-023 Not required (rationale required)
 SB-SCAN-024 Missing C ABI
@@ -249,14 +249,14 @@ SB-TABLE-001 Behavior mismatch
 SB-TABLE-002 Behavior mismatch
 SB-TABLE-003 Behavior mismatch
 SB-TABLE-004 Not required (rationale required)
-SB-TABLE-005 Missing C ABI
+SB-TABLE-005 Covered
 SB-TABLE-006 Missing Go
 SB-TABLE-007 Behavior mismatch
 SB-TABLE-008 Behavior mismatch
 SB-TABLE-009 Not required (rationale required)
 SB-TABLE-010 Behavior mismatch
 SB-TABLE-011 Not required (rationale required)
-SB-TABLE-012 Missing C ABI
+SB-TABLE-012 Covered
 SB-TABLE-013 Behavior mismatch
 SB-TABLE-014 Not required (rationale required)
 SB-TABLE-015 Not required (rationale required)
@@ -2517,7 +2517,7 @@ SB-CXX-1985 Missing Go
 SB-CXX-1986 Missing Go
 SB-CXX-1987 Missing Go
 SB-CXX-1988 Missing Go
-SB-CXX-1989 Missing C ABI
+SB-CXX-1989 Covered
 SB-CXX-1990 Missing Go
 SB-CXX-1991 Missing Go
 SB-CXX-1992 Missing Go
@@ -2525,7 +2525,7 @@ SB-CXX-1993 Missing Go
 SB-CXX-1994 Missing Go
 SB-CXX-1995 Missing Go
 SB-CXX-1996 Missing Go
-SB-CXX-1997 Missing C ABI
+SB-CXX-1997 Covered
 SB-CXX-1998 Missing Go
 SB-CXX-1999 Missing Go
 SB-CXX-2000 Missing Go
@@ -2942,7 +2942,7 @@ SB-CXX-2410 Missing Go
 SB-CXX-2411 Missing Go
 SB-CXX-2412 Missing Go
 SB-CXX-2413 Missing Go
-SB-CXX-2414 Missing C ABI
+SB-CXX-2414 Missing Go
 SB-CXX-2415 Missing Go
 SB-CXX-2416 Missing Go
 SB-CXX-2417 Missing Go
@@ -3199,7 +3199,7 @@ SB-XCUT-006 Behavior mismatch
 SB-XCUT-007 Behavior mismatch
 SB-XCUT-008 Missing C ABI
 SB-XCUT-009 Behavior mismatch
-SB-XCUT-010 Missing C ABI
+SB-XCUT-010 Behavior mismatch
 SB-XCUT-011 Behavior mismatch
 SB-XCUT-012 Covered
 SB-XCUT-013 Behavior mismatch

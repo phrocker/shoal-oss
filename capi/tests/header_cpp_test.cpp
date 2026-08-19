@@ -10,7 +10,7 @@ static_assert(std::is_same<shoal_abi_capability_bits, std::uint64_t>::value,
               "capability bitset words must remain 64-bit");
 static_assert(SHOAL_ABI_VERSION == 1u, "unexpected ABI version");
 static_assert(SHOAL_ABI_VERSION_MAJOR == 1u, "unexpected ABI major");
-static_assert(SHOAL_ABI_VERSION_MINOR == 7u, "unexpected ABI minor");
+static_assert(SHOAL_ABI_VERSION_MINOR == 8u, "unexpected ABI minor");
 static_assert(SHOAL_ABI_VERSION_PATCH == 0u, "unexpected ABI patch");
 static_assert(SHOAL_ABI_VERSION_PACKED ==
                   SHOAL_ABI_PACK_VERSION(SHOAL_ABI_VERSION_MAJOR,
@@ -39,9 +39,11 @@ static_assert(SHOAL_ABI_CAPABILITY_DATA_VALUES == 17u,
               "unexpected data values capability id");
 static_assert(SHOAL_ABI_CAPABILITY_BUFFERED_WRITER == 18u,
               "unexpected buffered writer capability id");
-static_assert(SHOAL_ABI_CAPABILITY_COUNT == 19u,
+static_assert(SHOAL_ABI_CAPABILITY_TABLE_MAINTENANCE == 19u,
+              "unexpected table maintenance capability id");
+static_assert(SHOAL_ABI_CAPABILITY_COUNT == 20u,
               "unexpected capability count");
-static_assert(SHOAL_ABI_CAPABILITY_WORD0 == 0x000000000007ffffull,
+static_assert(SHOAL_ABI_CAPABILITY_WORD0 == 0x00000000000fffffull,
               "unexpected capability word 0");
 static_assert(std::is_standard_layout<shoal_connector_identity_view>::value,
               "identity view must remain standard-layout");
@@ -59,6 +61,8 @@ static_assert(std::is_standard_layout<shoal_rfile_entry_view>::value,
               "RFile entry view must remain standard-layout");
 static_assert(std::is_standard_layout<shoal_key_value>::value,
               "key/value input must remain standard-layout");
+static_assert(std::is_standard_layout<shoal_table_constraint_view>::value,
+              "table constraint view must remain standard-layout");
 
 #define ASSERT_PERMISSION_VALUE(name, value)                                 \
   static_assert(name == value, "unexpected permission ordinal: " #name)
@@ -130,6 +134,8 @@ int main() {
   shoal_authorizations *authorizations = nullptr;
   shoal_key_value_result *key_value_result = nullptr;
   shoal_accumulo_writer *accumulo_writer = nullptr;
+  shoal_table_constraint_list_result *constraints = nullptr;
+  shoal_table_constraint_view constraint_view{};
   shoal_key_value key_value{};
   assert(shoal_abi_version() == SHOAL_ABI_VERSION);
   assert(shoal_abi_version_major() == SHOAL_ABI_VERSION_MAJOR);
@@ -153,6 +159,7 @@ int main() {
   assert(shoal_abi_has_capability(SHOAL_ABI_CAPABILITY_RFILE) == 1);
   assert(shoal_abi_has_capability(SHOAL_ABI_CAPABILITY_DATA_VALUES) == 1);
   assert(shoal_abi_has_capability(SHOAL_ABI_CAPABILITY_BUFFERED_WRITER) == 1);
+  assert(shoal_abi_has_capability(SHOAL_ABI_CAPABILITY_TABLE_MAINTENANCE) == 1);
   assert(shoal_abi_has_capability(SHOAL_ABI_CAPABILITY_COUNT) == 0);
   assert(shoal_versioned_properties_version(versioned_properties) == 0);
   assert(shoal_versioned_properties_count(versioned_properties) == 0);
@@ -178,6 +185,16 @@ int main() {
   assert(rfile_entry_view.struct_size == SHOAL_RFILE_ENTRY_VIEW_V1_SIZE);
   shoal_key_value_init(&key_value);
   assert(key_value.struct_size == SHOAL_KEY_VALUE_V1_SIZE);
+  shoal_table_constraint_view_init(&constraint_view);
+  assert(constraint_view.struct_size == SHOAL_TABLE_CONSTRAINT_VIEW_V1_SIZE);
+  assert(shoal_connector_list_table_constraints(
+             connector, "events", 0, &constraints, &error) ==
+         SHOAL_STATUS_INVALID_HANDLE);
+  shoal_error_free(&error);
+  assert(shoal_table_constraint_list_get(constraints, 0, &constraint_view,
+                                         &error) ==
+         SHOAL_STATUS_INVALID_ARGUMENT);
+  shoal_error_free(&error);
   assert(error == nullptr);
   shoal_connector_identity_view_init(&identity_view);
   assert(identity_view.struct_size == SHOAL_CONNECTOR_IDENTITY_VIEW_V1_SIZE);
@@ -224,6 +241,7 @@ int main() {
   shoal_authorizations_free(&authorizations);
   shoal_key_value_result_free(&key_value_result);
   shoal_accumulo_writer_free(&accumulo_writer);
+  shoal_table_constraint_list_free(&constraints);
   shoal_error_free(&error);
   return 0;
 }

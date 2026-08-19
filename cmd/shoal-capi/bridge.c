@@ -310,6 +310,7 @@ static char *shoal_bridge_copy_string(const char *value) {
   if (length == SIZE_MAX) {
     return NULL;
   }
+  SHOAL_BRIDGE_TEST_ALLOC_GUARD(shoal_bridge_result_alloc_fail_after);
   char *copy = (char *)malloc(length + 1);
   if (copy != NULL) {
     memcpy(copy, value, length + 1);
@@ -1099,6 +1100,79 @@ void shoal_bridge_table_list_free(shoal_table_list_result *result) {
   }
   for (size_t index = 0; index < result->count; index++) {
     shoal_bridge_table_entry_clear(&result->entries[index]);
+  }
+  free(result->entries);
+  result->entries = NULL;
+  result->count = 0;
+  free(result);
+}
+
+shoal_table_constraint_list_result *
+shoal_bridge_table_constraint_list_alloc(size_t count) {
+  if (count > SIZE_MAX / sizeof(shoal_bridge_table_constraint_entry)) {
+    return NULL;
+  }
+  shoal_table_constraint_list_result *result =
+      (shoal_table_constraint_list_result *)shoal_bridge_result_calloc(
+          1, sizeof(*result));
+  if (result == NULL) {
+    return NULL;
+  }
+  if (count != 0) {
+    result->entries =
+        (shoal_bridge_table_constraint_entry *)shoal_bridge_result_calloc(
+            count, sizeof(*result->entries));
+    if (result->entries == NULL) {
+      free(result);
+      return NULL;
+    }
+  }
+  result->count = count;
+  return result;
+}
+
+int shoal_bridge_table_constraint_list_set(
+    shoal_table_constraint_list_result *result, size_t index, int32_t number,
+    const char *class_name) {
+  if (result == NULL || index >= result->count || number <= 0 ||
+      class_name == NULL) {
+    return 0;
+  }
+  char *copy = shoal_bridge_copy_string(class_name);
+  if (copy == NULL) {
+    return 0;
+  }
+  free(result->entries[index].class_name);
+  result->entries[index].number = number;
+  result->entries[index].class_name = copy;
+  return 1;
+}
+
+size_t shoal_bridge_table_constraint_list_count(
+    const shoal_table_constraint_list_result *result) {
+  return result == NULL ? 0 : result->count;
+}
+
+int shoal_bridge_table_constraint_list_get(
+    const shoal_table_constraint_list_result *result, size_t index,
+    shoal_table_constraint_view *out_constraint) {
+  if (result == NULL || index >= result->count || out_constraint == NULL) {
+    return 0;
+  }
+  out_constraint->number = result->entries[index].number;
+  out_constraint->class_name = result->entries[index].class_name;
+  return 1;
+}
+
+void shoal_bridge_table_constraint_list_free(
+    shoal_table_constraint_list_result *result) {
+  if (result == NULL) {
+    return;
+  }
+  for (size_t index = 0; index < result->count; ++index) {
+    free(result->entries[index].class_name);
+    result->entries[index].class_name = NULL;
+    result->entries[index].number = 0;
   }
   free(result->entries);
   result->entries = NULL;

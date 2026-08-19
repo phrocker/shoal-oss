@@ -8,9 +8,9 @@
 
 _Static_assert(SHOAL_ABI_VERSION == 1u, "unexpected compatibility ABI version");
 _Static_assert(SHOAL_ABI_VERSION_MAJOR == 1u, "unexpected ABI major");
-_Static_assert(SHOAL_ABI_VERSION_MINOR == 7u, "unexpected ABI minor");
+_Static_assert(SHOAL_ABI_VERSION_MINOR == 8u, "unexpected ABI minor");
 _Static_assert(SHOAL_ABI_VERSION_PATCH == 0u, "unexpected ABI patch");
-_Static_assert(SHOAL_ABI_VERSION_PACKED == 0x00010700u,
+_Static_assert(SHOAL_ABI_VERSION_PACKED == 0x00010800u,
                "unexpected packed ABI version");
 _Static_assert(SHOAL_ABI_CAPABILITY_CONNECTOR == 0u,
                "unexpected connector capability id");
@@ -48,11 +48,13 @@ _Static_assert(SHOAL_ABI_CAPABILITY_RFILE == 16u,
                "unexpected RFile capability id");
 _Static_assert(SHOAL_ABI_CAPABILITY_DATA_VALUES == 17u,
                "unexpected data values capability id");
-_Static_assert(SHOAL_ABI_CAPABILITY_COUNT == 19u,
+_Static_assert(SHOAL_ABI_CAPABILITY_TABLE_MAINTENANCE == 19u,
+               "unexpected table maintenance capability id");
+_Static_assert(SHOAL_ABI_CAPABILITY_COUNT == 20u,
                "unexpected capability count");
 _Static_assert(SHOAL_ABI_CAPABILITY_WORD_COUNT == 1u,
                "unexpected capability word count");
-_Static_assert(SHOAL_ABI_CAPABILITY_WORD0 == UINT64_C(0x7ffff),
+_Static_assert(SHOAL_ABI_CAPABILITY_WORD0 == UINT64_C(0xfffff),
                "unexpected capability word 0");
 
 #define ASSERT_PERMISSION_VALUE(name, value)                                  \
@@ -1173,6 +1175,139 @@ int main(void) {
                                            &error),
                SHOAL_STATUS_UNAVAILABLE, &error, "manager unavailable");
 
+  uint8_t range_start_data[] = {'a', 0, 'b'};
+  uint8_t range_end_data[] = {'z', 0, 'y'};
+  const uint8_t expected_start_data[] = {'a', 0, 'b'};
+  const uint8_t expected_end_data[] = {'z', 0, 'y'};
+  shoal_bytes range_start = {range_start_data, sizeof(range_start_data)};
+  shoal_bytes range_end = {range_end_data, sizeof(range_end_data)};
+  shoal_bytes expected_start = {expected_start_data,
+                                sizeof(expected_start_data)};
+  shoal_bytes expected_end = {expected_end_data, sizeof(expected_end_data)};
+  shoal_bytes empty_bound = {NULL, 0};
+  expect_error(shoal_connector_flush_table_range(
+                   NULL, "events", NULL, NULL, 0, 0, &error),
+               SHOAL_STATUS_INVALID_HANDLE, &error, "connector handle is NULL");
+  expect_error(shoal_connector_flush_table_range(
+                   admin_connector, NULL, NULL, NULL, 0, 0, &error),
+               SHOAL_STATUS_INVALID_ARGUMENT, &error, "table_name is required");
+  expect_error(shoal_connector_flush_table_range(
+                   admin_connector, "events", &range_start, &range_end, 2, 0,
+                   &error),
+               SHOAL_STATUS_INVALID_ARGUMENT, &error, "wait must be 0 or 1");
+  expect_error(shoal_connector_flush_table_range(
+                   admin_connector, "events", &range_start, &range_end, 0, -1,
+                   &error),
+               SHOAL_STATUS_INVALID_ARGUMENT, &error,
+               "timeout_ms must not be negative");
+  shoal_bytes invalid_bound = {NULL, 1};
+  expect_error(shoal_connector_flush_table_range(
+                   admin_connector, "events", &invalid_bound, NULL, 0, 0,
+                   &error),
+               SHOAL_STATUS_INVALID_ARGUMENT, &error,
+               "start_row is NULL with non-zero length");
+  expect_error(shoal_connector_flush_table_range(
+                   admin_connector, "events", &range_end, &range_start, 0, 0,
+                   &error),
+               SHOAL_STATUS_INVALID_ARGUMENT, &error, "invalid table range");
+  assert(shoal_connector_flush_table_range(
+             admin_connector, "events", &range_start, &range_end, 1, 0,
+             &error) == SHOAL_STATUS_OK);
+  range_start_data[0] = 'q';
+  range_end_data[0] = 'q';
+  assert(shoal_test_connector_last_flush_range_matches(
+      admin_connector, &expected_start, &expected_end, 1));
+  assert(shoal_connector_flush_table_range(
+             admin_connector, "events", NULL, &empty_bound, 0, 0, &error) ==
+         SHOAL_STATUS_OK);
+  assert(shoal_test_connector_last_flush_range_matches(
+      admin_connector, NULL, &empty_bound, 0));
+  assert(shoal_test_connector_table_maintenance_block(admin_connector, 1));
+  expect_error(shoal_connector_flush_table_range(
+                   admin_connector, "events", NULL, NULL, 0, 1, &error),
+               SHOAL_STATUS_DEADLINE_EXCEEDED, &error, "deadline exceeded");
+  assert(shoal_test_connector_table_maintenance_block(admin_connector, 0));
+
+  int32_t constraint_number = 0;
+  expect_error(shoal_connector_add_table_constraint(
+                   admin_connector, "events", NULL, 0, &constraint_number,
+                   &error),
+               SHOAL_STATUS_INVALID_ARGUMENT, &error, "class_name is required");
+  expect_error(shoal_connector_add_table_constraint(
+                   admin_connector, "events", "org.example.New", -1,
+                   &constraint_number, &error),
+               SHOAL_STATUS_INVALID_ARGUMENT, &error,
+               "timeout_ms must not be negative");
+  assert(shoal_connector_add_table_constraint(
+             admin_connector, "events", "org.example.New", 0,
+             &constraint_number, &error) == SHOAL_STATUS_OK);
+  assert(constraint_number == 2);
+  assert(shoal_connector_add_table_constraint(
+             admin_connector, "events", "org.example.New", 0,
+             &constraint_number, &error) == SHOAL_STATUS_OK);
+  assert(constraint_number == 2);
+
+  shoal_table_constraint_list_result *constraints = NULL;
+  shoal_table_constraint_view constraint_view;
+  shoal_table_constraint_view_init(&constraint_view);
+  assert(constraint_view.struct_size == SHOAL_TABLE_CONSTRAINT_VIEW_V1_SIZE);
+  assert(shoal_connector_list_table_constraints(
+             admin_connector, "events", 0, &constraints, &error) ==
+         SHOAL_STATUS_OK);
+  assert(constraints != NULL && error == NULL);
+  assert(shoal_table_constraint_list_count(constraints) == 3);
+  assert(shoal_table_constraint_list_get(
+             constraints, 0, &constraint_view, &error) == SHOAL_STATUS_OK);
+  assert(constraint_view.number == 1);
+  assert(strcmp(constraint_view.class_name, "org.example.First") == 0);
+  const char *first_constraint_class = constraint_view.class_name;
+  assert(shoal_table_constraint_list_get(
+             constraints, 1, &constraint_view, &error) == SHOAL_STATUS_OK);
+  assert(constraint_view.number == 2);
+  assert(strcmp(constraint_view.class_name, "org.example.New") == 0);
+  assert(strcmp(first_constraint_class, "org.example.First") == 0);
+  constraint_view.struct_size = 0;
+  expect_error(shoal_table_constraint_list_get(
+                   constraints, 0, &constraint_view, &error),
+               SHOAL_STATUS_INVALID_ARGUMENT, &error,
+               "constraint view is missing or too small");
+  shoal_table_constraint_view_init(&constraint_view);
+  expect_error(shoal_table_constraint_list_get(
+                   constraints, 3, &constraint_view, &error),
+               SHOAL_STATUS_INVALID_ARGUMENT, &error,
+               "invalid constraint list access");
+  shoal_table_constraint_list_free(&constraints);
+  assert(constraints == NULL);
+  shoal_table_constraint_list_free(&constraints);
+
+  shoal_test_result_alloc_fail_after(0);
+  assert(shoal_connector_list_table_constraints(
+             admin_connector, "events", 0, &constraints, &error) ==
+         SHOAL_STATUS_OUT_OF_MEMORY);
+  assert(constraints == NULL && error != NULL);
+  assert(shoal_error_code(error) == SHOAL_STATUS_OUT_OF_MEMORY);
+  shoal_error_free(&error);
+  shoal_test_result_alloc_reset();
+  shoal_test_result_alloc_fail_after(2);
+  assert(shoal_connector_list_table_constraints(
+             admin_connector, "events", 0, &constraints, &error) ==
+         SHOAL_STATUS_OUT_OF_MEMORY);
+  assert(constraints == NULL && error != NULL);
+  assert(shoal_error_code(error) == SHOAL_STATUS_OUT_OF_MEMORY);
+  shoal_error_free(&error);
+  shoal_test_result_alloc_reset();
+  assert(shoal_connector_remove_table_constraint(
+             admin_connector, "events", 2, 0, &error) == SHOAL_STATUS_OK);
+  expect_error(shoal_connector_remove_table_constraint(
+                   admin_connector, "events", 0, 0, &error),
+               SHOAL_STATUS_INVALID_ARGUMENT, &error,
+               "constraint number must be positive");
+  assert(shoal_connector_list_table_constraints(
+             admin_connector, "events", 0, &constraints, &error) ==
+         SHOAL_STATUS_OK);
+  assert(shoal_table_constraint_list_count(constraints) == 2);
+  shoal_table_constraint_list_free(&constraints);
+
   assert(shoal_connector_set_table_property(
              admin_connector, "events", "table.custom.alpha", "alpha", 0,
              &error) == SHOAL_STATUS_OK);
@@ -1811,6 +1946,12 @@ int main(void) {
                SHOAL_STATUS_CLOSED, &error, "connector is closed");
   expect_error(shoal_connector_get_identity(admin_connector, 0, &identity,
                                             &error),
+               SHOAL_STATUS_CLOSED, &error, "connector is closed");
+  expect_error(shoal_connector_flush_table_range(
+                   admin_connector, "events", NULL, NULL, 0, 0, &error),
+               SHOAL_STATUS_CLOSED, &error, "connector is closed");
+  expect_error(shoal_connector_list_table_constraints(
+                   admin_connector, "events", 0, &constraints, &error),
                SHOAL_STATUS_CLOSED, &error, "connector is closed");
 
   shoal_connector_free(&connector);
