@@ -35,6 +35,16 @@ func TestOwnedDataDescriptorConstructionIsConcurrent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	sharedRangeResult, err := buildRangeResult(scanRange, rangeBoundKey, rangeBoundKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer freeBuiltRangeResult(sharedRangeResult)
+	sharedIteratorResult, err := buildIteratorSettingResult(setting)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer freeBuiltIteratorSettingResult(sharedIteratorResult)
 
 	var wg sync.WaitGroup
 	errors := make(chan error, 64)
@@ -42,6 +52,27 @@ func TestOwnedDataDescriptorConstructionIsConcurrent(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			for read := 0; read < 16; read++ {
+				rangeSnapshot, err := snapshotRangeResult(sharedRangeResult)
+				if err != nil {
+					errors <- err
+					return
+				}
+				if err := validateRangeSnapshot(rangeSnapshot, start, end); err != nil {
+					errors <- err
+					return
+				}
+				iteratorSnapshot, err := snapshotIteratorSettingResult(sharedIteratorResult)
+				if err != nil {
+					errors <- err
+					return
+				}
+				if err := validateIteratorSnapshot(iteratorSnapshot); err != nil {
+					errors <- err
+					return
+				}
+			}
+
 			rangeResult, err := buildRangeResult(scanRange, rangeBoundKey, rangeBoundKey)
 			if err != nil {
 				errors <- err
@@ -53,21 +84,8 @@ func TestOwnedDataDescriptorConstructionIsConcurrent(t *testing.T) {
 				errors <- err
 				return
 			}
-			if rangeSnapshot.startKind != rangeBoundKey ||
-				rangeSnapshot.endKind != rangeBoundKey ||
-				!rangeSnapshot.hasStart || !rangeSnapshot.hasEnd ||
-				!rangeSnapshot.startInclusive || rangeSnapshot.endInclusive ||
-				!bytes.Equal(rangeSnapshot.start.Row, start.Row) ||
-				!bytes.Equal(rangeSnapshot.start.ColumnFamily, start.ColumnFamily) ||
-				!bytes.Equal(rangeSnapshot.start.ColumnQualifier, start.ColumnQualifier) ||
-				!bytes.Equal(rangeSnapshot.start.ColumnVisibility, start.ColumnVisibility) ||
-				rangeSnapshot.start.Timestamp != start.Timestamp ||
-				!bytes.Equal(rangeSnapshot.end.Row, end.Row) ||
-				!bytes.Equal(rangeSnapshot.end.ColumnFamily, end.ColumnFamily) ||
-				!bytes.Equal(rangeSnapshot.end.ColumnQualifier, end.ColumnQualifier) ||
-				!bytes.Equal(rangeSnapshot.end.ColumnVisibility, end.ColumnVisibility) ||
-				rangeSnapshot.end.Timestamp != end.Timestamp {
-				errors <- fmt.Errorf("unexpected range snapshot: %#v", rangeSnapshot)
+			if err := validateRangeSnapshot(rangeSnapshot, start, end); err != nil {
+				errors <- err
 				return
 			}
 
@@ -82,12 +100,8 @@ func TestOwnedDataDescriptorConstructionIsConcurrent(t *testing.T) {
 				errors <- err
 				return
 			}
-			if iteratorSnapshot.name != "age" ||
-				iteratorSnapshot.className != "com.example.Age" ||
-				iteratorSnapshot.priority != 19 ||
-				iteratorSnapshot.options["alpha"] != "first" ||
-				iteratorSnapshot.options["zeta"] != "last" {
-				errors <- fmt.Errorf("unexpected iterator snapshot: %#v", iteratorSnapshot)
+			if err := validateIteratorSnapshot(iteratorSnapshot); err != nil {
+				errors <- err
 			}
 		}()
 	}
@@ -96,4 +110,35 @@ func TestOwnedDataDescriptorConstructionIsConcurrent(t *testing.T) {
 	for err := range errors {
 		t.Error(err)
 	}
+}
+
+func validateRangeSnapshot(snapshot rangeResultSnapshot, start, end *accumulo.Key) error {
+	if snapshot.startKind != rangeBoundKey ||
+		snapshot.endKind != rangeBoundKey ||
+		!snapshot.hasStart || !snapshot.hasEnd ||
+		!snapshot.startInclusive || snapshot.endInclusive ||
+		!bytes.Equal(snapshot.start.Row, start.Row) ||
+		!bytes.Equal(snapshot.start.ColumnFamily, start.ColumnFamily) ||
+		!bytes.Equal(snapshot.start.ColumnQualifier, start.ColumnQualifier) ||
+		!bytes.Equal(snapshot.start.ColumnVisibility, start.ColumnVisibility) ||
+		snapshot.start.Timestamp != start.Timestamp ||
+		!bytes.Equal(snapshot.end.Row, end.Row) ||
+		!bytes.Equal(snapshot.end.ColumnFamily, end.ColumnFamily) ||
+		!bytes.Equal(snapshot.end.ColumnQualifier, end.ColumnQualifier) ||
+		!bytes.Equal(snapshot.end.ColumnVisibility, end.ColumnVisibility) ||
+		snapshot.end.Timestamp != end.Timestamp {
+		return fmt.Errorf("unexpected range snapshot: %#v", snapshot)
+	}
+	return nil
+}
+
+func validateIteratorSnapshot(snapshot iteratorSettingResultSnapshot) error {
+	if snapshot.name != "age" ||
+		snapshot.className != "com.example.Age" ||
+		snapshot.priority != 19 ||
+		snapshot.options["alpha"] != "first" ||
+		snapshot.options["zeta"] != "last" {
+		return fmt.Errorf("unexpected iterator snapshot: %#v", snapshot)
+	}
+	return nil
 }
