@@ -37,6 +37,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	s3sdk "github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/smithy-go"
 
 	shstorage "github.com/phrocker/shoal/internal/storage"
 )
@@ -94,6 +95,20 @@ func (o *fakeS3ArtifactOperations) remove(ctx context.Context, _ string, artifac
 	}
 	o.removed = append(o.removed, artifact)
 	return o.removeErrors[artifact.key]
+}
+
+func newTestS3Client(server *httptest.Server) *s3sdk.Client {
+	return s3sdk.NewFromConfig(
+		aws.Config{
+			Region:      "us-east-1",
+			Credentials: aws.NewCredentialsCache(credentials.NewStaticCredentialsProvider("AKID", "SECRET", "")),
+			HTTPClient:  server.Client(),
+		},
+		func(o *s3sdk.Options) {
+			o.BaseEndpoint = aws.String(server.URL)
+			o.UsePathStyle = true
+		},
+	)
 }
 
 func newFakeS3WriteOperations() *fakeS3WriteOperations {
@@ -516,6 +531,44 @@ func TestCleanupStaleArtifactsIsBoundedConditionalAndExplicit(t *testing.T) {
 	}
 }
 
+func TestCleanupStaleArtifactsDeletesUnversionedStagesAndSkipsETagRaces(t *testing.T) {
+	now := time.Now()
+	oldETag := `"old"`
+	freshETag := `"fresh"`
+	raceETag := `"race"`
+	old := "dir/" + expectedTemporaryStageKeyComponent("dir/target", strings.Repeat("a", 64))
+	fresh := "dir/" + expectedTemporaryStageKeyComponent("dir/target", strings.Repeat("b", 64))
+	race := "dir/" + expectedTemporaryStageKeyComponent("dir/target", strings.Repeat("c", 64))
+	ops := &fakeS3ArtifactOperations{
+		artifacts: []s3Artifact{
+			{key: old, lastModified: now.Add(-2 * time.Hour), etag: &oldETag, owned: true},
+			{key: fresh, lastModified: now, etag: &freshETag, owned: true},
+			{key: race, lastModified: now.Add(-2 * time.Hour), etag: &raceETag, owned: true},
+		},
+		removeErrors: map[string]error{
+			race: &smithy.GenericAPIError{Code: "PreconditionFailed", Message: "etag changed"},
+		},
+	}
+	backend := &Backend{artifactOps: ops}
+
+	result, err := backend.CleanupStaleArtifacts(context.Background(), "s3://bucket/dir", now.Add(-time.Hour))
+	if err != nil {
+		t.Fatalf("CleanupStaleArtifacts: %v", err)
+	}
+	if result.Examined != 3 {
+		t.Fatalf("Examined = %d, want 3", result.Examined)
+	}
+	if len(result.Removed) != 1 || result.Removed[0] != "s3://bucket/"+old {
+		t.Fatalf("Removed = %v, want [%s]", result.Removed, "s3://bucket/"+old)
+	}
+	if len(ops.removed) != 2 {
+		t.Fatalf("removal attempts = %#v, want stale delete plus skipped race", ops.removed)
+	}
+	if ops.removed[0].versionID != nil || ops.removed[1].versionID != nil {
+		t.Fatalf("unversioned removal attempts should not include version IDs: %#v", ops.removed)
+	}
+}
+
 func TestSDKS3ArtifactOperationsListPaginatesVersionsAndDeleteMarkers(t *testing.T) {
 	stageA := "dir/" + expectedTemporaryStageKeyComponent("dir/target-a", strings.Repeat("5", 64))
 	stageB := "dir/" + expectedTemporaryStageKeyComponent("dir/target-b", strings.Repeat("6", 64))
@@ -528,15 +581,23 @@ func TestSDKS3ArtifactOperationsListPaginatesVersionsAndDeleteMarkers(t *testing
 		if r.URL.Path != "/bucket" {
 			t.Errorf("path = %s, want /bucket", r.URL.Path)
 		}
-		if got := r.URL.Query().Get("prefix"); got != "dir/" {
-			t.Errorf("prefix = %q, want dir/", got)
-		}
-		if _, ok := r.URL.Query()["versions"]; !ok {
-			t.Errorf("query = %q, want versions listing", r.URL.RawQuery)
-		}
 		w.Header().Set("Content-Type", "application/xml")
 		switch calls {
 		case 1:
+			if _, ok := r.URL.Query()["versioning"]; !ok {
+				t.Errorf("query = %q, want versioning status request", r.URL.RawQuery)
+			}
+			fmt.Fprint(w, `<?xml version="1.0" encoding="UTF-8"?>
+<VersioningConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Status>Suspended</Status>
+</VersioningConfiguration>`)
+		case 2:
+			if got := r.URL.Query().Get("prefix"); got != "dir/" {
+				t.Errorf("prefix = %q, want dir/", got)
+			}
+			if _, ok := r.URL.Query()["versions"]; !ok {
+				t.Errorf("query = %q, want versions listing", r.URL.RawQuery)
+			}
 			if got := r.URL.Query().Get("key-marker"); got != "" {
 				t.Errorf("first key-marker = %q, want empty", got)
 			}
@@ -560,7 +621,13 @@ func TestSDKS3ArtifactOperationsListPaginatesVersionsAndDeleteMarkers(t *testing
     <StorageClass>STANDARD</StorageClass>
   </Version>
 </ListVersionsResult>`, stageA, stageA)
-		case 2:
+		case 3:
+			if got := r.URL.Query().Get("prefix"); got != "dir/" {
+				t.Errorf("prefix = %q, want dir/", got)
+			}
+			if _, ok := r.URL.Query()["versions"]; !ok {
+				t.Errorf("query = %q, want versions listing", r.URL.RawQuery)
+			}
 			if got := r.URL.Query().Get("key-marker"); got != stageA {
 				t.Errorf("second key-marker = %q, want %q", got, stageA)
 			}
@@ -594,24 +661,14 @@ func TestSDKS3ArtifactOperationsListPaginatesVersionsAndDeleteMarkers(t *testing
 	}))
 	defer server.Close()
 
-	client := s3sdk.NewFromConfig(
-		aws.Config{
-			Region:      "us-east-1",
-			Credentials: aws.NewCredentialsCache(credentials.NewStaticCredentialsProvider("AKID", "SECRET", "")),
-			HTTPClient:  server.Client(),
-		},
-		func(o *s3sdk.Options) {
-			o.BaseEndpoint = aws.String(server.URL)
-			o.UsePathStyle = true
-		},
-	)
+	client := newTestS3Client(server)
 
 	artifacts, err := (sdkS3ArtifactOperations{client: client}).list(context.Background(), "bucket", "dir/")
 	if err != nil {
 		t.Fatalf("list: %v", err)
 	}
-	if calls != 2 {
-		t.Fatalf("pagination calls = %d, want 2", calls)
+	if calls != 3 {
+		t.Fatalf("pagination calls = %d, want 3", calls)
 	}
 	if len(artifacts) != 3 {
 		t.Fatalf("artifacts = %#v, want 3 entries", artifacts)
@@ -629,6 +686,180 @@ func TestSDKS3ArtifactOperationsListPaginatesVersionsAndDeleteMarkers(t *testing
 	if artifact, ok := got[stageB+"#null"]; !ok || artifact.deleteMarker || artifact.etag == nil {
 		t.Fatalf("null-version stage = %#v, want current version with ETag", artifact)
 	}
+}
+
+func TestSDKS3ArtifactOperationsListUsesObjectVersionsWhenEnabled(t *testing.T) {
+	stage := "dir/" + expectedTemporaryStageKeyComponent("dir/target-enabled", strings.Repeat("9", 64))
+	var calls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if r.Method != http.MethodGet {
+			t.Errorf("method = %s, want GET", r.Method)
+		}
+		if r.URL.Path != "/bucket" {
+			t.Errorf("path = %s, want /bucket", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/xml")
+		switch calls {
+		case 1:
+			if _, ok := r.URL.Query()["versioning"]; !ok {
+				t.Errorf("query = %q, want versioning status request", r.URL.RawQuery)
+			}
+			fmt.Fprint(w, `<?xml version="1.0" encoding="UTF-8"?>
+<VersioningConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Status>Enabled</Status>
+</VersioningConfiguration>`)
+		case 2:
+			if _, ok := r.URL.Query()["versions"]; !ok {
+				t.Errorf("query = %q, want versions listing", r.URL.RawQuery)
+			}
+			fmt.Fprintf(w, `<?xml version="1.0" encoding="UTF-8"?>
+<ListVersionsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Name>bucket</Name>
+  <Prefix>dir/</Prefix>
+  <IsTruncated>false</IsTruncated>
+  <Version>
+    <Key>%s</Key>
+    <VersionId>v-enabled</VersionId>
+    <IsLatest>true</IsLatest>
+    <LastModified>2026-08-19T03:00:00.000Z</LastModified>
+    <ETag>&quot;etag-enabled&quot;</ETag>
+    <Size>1</Size>
+    <StorageClass>STANDARD</StorageClass>
+  </Version>
+</ListVersionsResult>`, stage)
+		default:
+			t.Fatalf("unexpected extra call %d", calls)
+		}
+	}))
+	defer server.Close()
+
+	artifacts, err := (sdkS3ArtifactOperations{client: newTestS3Client(server)}).list(context.Background(), "bucket", "dir/")
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if calls != 2 {
+		t.Fatalf("calls = %d, want 2", calls)
+	}
+	if len(artifacts) != 1 || artifacts[0].key != stage || aws.ToString(artifacts[0].versionID) != "v-enabled" {
+		t.Fatalf("artifacts = %#v, want one versioned stage", artifacts)
+	}
+}
+
+func TestSDKS3ArtifactOperationsListUsesObjectsV2ForNeverVersionedBuckets(t *testing.T) {
+	old := "dir/" + expectedTemporaryStageKeyComponent("dir/target-old", strings.Repeat("7", 64))
+	fresh := "dir/" + expectedTemporaryStageKeyComponent("dir/target-fresh", strings.Repeat("8", 64))
+	var calls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if r.Method != http.MethodGet {
+			t.Errorf("method = %s, want GET", r.Method)
+		}
+		if r.URL.Path != "/bucket" {
+			t.Errorf("path = %s, want /bucket", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/xml")
+		switch calls {
+		case 1:
+			if _, ok := r.URL.Query()["versioning"]; !ok {
+				t.Errorf("query = %q, want versioning status request", r.URL.RawQuery)
+			}
+			fmt.Fprint(w, `<?xml version="1.0" encoding="UTF-8"?>
+<VersioningConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"></VersioningConfiguration>`)
+		case 2:
+			if got := r.URL.Query().Get("list-type"); got != "2" {
+				t.Errorf("list-type = %q, want 2", got)
+			}
+			if got := r.URL.Query().Get("prefix"); got != "dir/" {
+				t.Errorf("prefix = %q, want dir/", got)
+			}
+			if got := r.URL.Query().Get("continuation-token"); got != "" {
+				t.Errorf("first continuation-token = %q, want empty", got)
+			}
+			fmt.Fprintf(w, `<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Name>bucket</Name>
+  <Prefix>dir/</Prefix>
+  <IsTruncated>true</IsTruncated>
+  <NextContinuationToken>next-page</NextContinuationToken>
+  <Contents>
+    <Key>%s</Key>
+    <LastModified>2026-08-19T00:00:00.000Z</LastModified>
+    <ETag>&quot;etag-old&quot;</ETag>
+    <Size>1</Size>
+    <StorageClass>STANDARD</StorageClass>
+  </Contents>
+</ListBucketResult>`, old)
+		case 3:
+			if got := r.URL.Query().Get("list-type"); got != "2" {
+				t.Errorf("list-type = %q, want 2", got)
+			}
+			if got := r.URL.Query().Get("continuation-token"); got != "next-page" {
+				t.Errorf("second continuation-token = %q, want next-page", got)
+			}
+			fmt.Fprintf(w, `<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Name>bucket</Name>
+  <Prefix>dir/</Prefix>
+  <IsTruncated>false</IsTruncated>
+  <Contents>
+    <Key>%s</Key>
+    <LastModified>2026-08-19T01:00:00.000Z</LastModified>
+    <ETag>&quot;etag-fresh&quot;</ETag>
+    <Size>1</Size>
+    <StorageClass>STANDARD</StorageClass>
+  </Contents>
+</ListBucketResult>`, fresh)
+		default:
+			t.Fatalf("unexpected extra paginator call %d", calls)
+		}
+	}))
+	defer server.Close()
+
+	artifacts, err := (sdkS3ArtifactOperations{client: newTestS3Client(server)}).list(context.Background(), "bucket", "dir/")
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if calls != 3 {
+		t.Fatalf("calls = %d, want 3", calls)
+	}
+	if len(artifacts) != 2 {
+		t.Fatalf("artifacts = %#v, want 2 entries", artifacts)
+	}
+	if artifacts[0].key != old || artifacts[0].versionID != nil || artifacts[0].etag == nil {
+		t.Fatalf("first artifact = %#v, want unversioned object with ETag", artifacts[0])
+	}
+	if artifacts[1].key != fresh || artifacts[1].versionID != nil || artifacts[1].etag == nil {
+		t.Fatalf("second artifact = %#v, want unversioned object with ETag", artifacts[1])
+	}
+}
+
+func TestSDKS3ArtifactOperationsListPropagatesVersioningStatusFailures(t *testing.T) {
+	t.Run("status error", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusInternalServerError)
+			fmt.Fprint(w, `<?xml version="1.0" encoding="UTF-8"?>
+<Error><Code>InternalError</Code><Message>boom</Message></Error>`)
+		}))
+		defer server.Close()
+
+		if _, err := (sdkS3ArtifactOperations{client: newTestS3Client(server)}).list(context.Background(), "bucket", "dir/"); err == nil {
+			t.Fatal("list unexpectedly succeeded on GetBucketVersioning failure")
+		}
+	})
+
+	t.Run("canceled context", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			t.Fatal("GetBucketVersioning should not complete after context cancellation")
+		}))
+		defer server.Close()
+
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		if _, err := (sdkS3ArtifactOperations{client: newTestS3Client(server)}).list(ctx, "bucket", "dir/"); !errors.Is(err, context.Canceled) {
+			t.Fatalf("list error = %v, want context.Canceled", err)
+		}
+	})
 }
 
 func TestBackendCreateRejectsReservedInternalStageKeys(t *testing.T) {

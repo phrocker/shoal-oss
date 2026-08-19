@@ -55,6 +55,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	s3sdk "github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/smithy-go"
 	"github.com/google/uuid"
 
 	shstorage "github.com/phrocker/shoal/internal/storage"
@@ -288,16 +289,18 @@ func (b *Backend) CleanupStaleArtifacts(ctx context.Context, prefix string, cuto
 		if artifact.lastModified.IsZero() || !artifact.lastModified.Before(cutoff) {
 			continue
 		}
-		if artifact.versionID == nil {
-			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("s3: stale artifact s3://%s/%s has no version ID", bucket, artifact.key))
-			continue
+		if artifact.versionID != nil || artifact.deleteMarker {
+			if artifact.versionID == nil {
+				cleanupErr = errors.Join(cleanupErr, fmt.Errorf("s3: stale artifact s3://%s/%s has no version ID", bucket, artifact.key))
+				continue
+			}
 		}
 		if !artifact.deleteMarker && artifact.etag == nil {
 			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("s3: stale artifact s3://%s/%s has no ETag", bucket, artifact.key))
 			continue
 		}
 		if err := b.artifactOps.remove(ctx, bucket, artifact); err != nil {
-			if isNotFound(err) {
+			if isNotFound(err) || isPreconditionFailed(err) {
 				continue
 			}
 			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("s3: remove stale artifact s3://%s/%s: %w", bucket, artifact.key, err))
@@ -309,7 +312,16 @@ func (b *Backend) CleanupStaleArtifacts(ctx context.Context, prefix string, cuto
 }
 
 func s3ArtifactPath(bucket string, artifact s3Artifact) string {
-	return "s3://" + bucket + "/" + artifact.key + "?versionId=" + url.QueryEscape(aws.ToString(artifact.versionID))
+	path := "s3://" + bucket + "/" + artifact.key
+	if artifact.versionID == nil {
+		return path
+	}
+	return path + "?versionId=" + url.QueryEscape(aws.ToString(artifact.versionID))
+}
+
+func isPreconditionFailed(err error) bool {
+	var apiErr smithy.APIError
+	return errors.As(err, &apiErr) && apiErr.ErrorCode() == "PreconditionFailed"
 }
 
 // ParsePath splits a path string into (bucket, key). Exposed so callers
@@ -513,7 +525,40 @@ type sdkS3ArtifactOperations struct {
 	client *s3sdk.Client
 }
 
+type s3BucketVersioningMode int
+
+const (
+	s3BucketUnversioned s3BucketVersioningMode = iota
+	s3BucketVersioned
+)
+
 func (o sdkS3ArtifactOperations) list(ctx context.Context, bucket, prefix string) ([]s3Artifact, error) {
+	mode, err := o.versioningMode(ctx, bucket)
+	if err != nil {
+		return nil, err
+	}
+	if mode == s3BucketVersioned {
+		return o.listVersioned(ctx, bucket, prefix)
+	}
+	return o.listUnversioned(ctx, bucket, prefix)
+}
+
+func (o sdkS3ArtifactOperations) versioningMode(ctx context.Context, bucket string) (s3BucketVersioningMode, error) {
+	out, err := o.client.GetBucketVersioning(ctx, &s3sdk.GetBucketVersioningInput{
+		Bucket: aws.String(bucket),
+	})
+	if err != nil {
+		return s3BucketUnversioned, err
+	}
+	switch out.Status {
+	case types.BucketVersioningStatusEnabled, types.BucketVersioningStatusSuspended:
+		return s3BucketVersioned, nil
+	default:
+		return s3BucketUnversioned, nil
+	}
+}
+
+func (o sdkS3ArtifactOperations) listVersioned(ctx context.Context, bucket, prefix string) ([]s3Artifact, error) {
 	var artifacts []s3Artifact
 	paginator := s3sdk.NewListObjectVersionsPaginator(o.client, &s3sdk.ListObjectVersionsInput{
 		Bucket: aws.String(bucket),
@@ -550,22 +595,53 @@ func (o sdkS3ArtifactOperations) list(ctx context.Context, bucket, prefix string
 	return artifacts, nil
 }
 
-func (o sdkS3ArtifactOperations) remove(ctx context.Context, bucket string, artifact s3Artifact) error {
-	_, err := o.client.DeleteObject(ctx, &s3sdk.DeleteObjectInput{
-		Bucket:    aws.String(bucket),
-		Key:       aws.String(artifact.key),
-		IfMatch:   artifact.etag,
-		VersionId: artifact.versionID,
+func (o sdkS3ArtifactOperations) listUnversioned(ctx context.Context, bucket, prefix string) ([]s3Artifact, error) {
+	var artifacts []s3Artifact
+	paginator := s3sdk.NewListObjectsV2Paginator(o.client, &s3sdk.ListObjectsV2Input{
+		Bucket: aws.String(bucket),
+		Prefix: aws.String(prefix),
 	})
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return nil, err
+		}
+		for _, object := range page.Contents {
+			if object.Key == nil {
+				continue
+			}
+			artifacts = append(artifacts, s3Artifact{
+				key:          *object.Key,
+				lastModified: aws.ToTime(object.LastModified),
+				etag:         object.ETag,
+			})
+		}
+	}
+	return artifacts, nil
+}
+
+func (o sdkS3ArtifactOperations) remove(ctx context.Context, bucket string, artifact s3Artifact) error {
+	input := &s3sdk.DeleteObjectInput{
+		Bucket:  aws.String(bucket),
+		Key:     aws.String(artifact.key),
+		IfMatch: artifact.etag,
+	}
+	if artifact.versionID != nil {
+		input.VersionId = artifact.versionID
+	}
+	_, err := o.client.DeleteObject(ctx, input)
 	return err
 }
 
 func (o sdkS3ArtifactOperations) inspect(ctx context.Context, bucket string, artifact s3Artifact) (s3Artifact, error) {
-	out, err := o.client.HeadObject(ctx, &s3sdk.HeadObjectInput{
-		Bucket:    aws.String(bucket),
-		Key:       aws.String(artifact.key),
-		VersionId: artifact.versionID,
-	})
+	input := &s3sdk.HeadObjectInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String(artifact.key),
+	}
+	if artifact.versionID != nil {
+		input.VersionId = artifact.versionID
+	}
+	out, err := o.client.HeadObject(ctx, input)
 	if err != nil {
 		return artifact, err
 	}
