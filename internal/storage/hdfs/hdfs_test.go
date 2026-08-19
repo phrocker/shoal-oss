@@ -717,6 +717,50 @@ func TestBindDialContextReconnectUsesRequestDeadline(t *testing.T) {
 	}
 }
 
+func TestDialContextSourceRebindsEstablishedConnection(t *testing.T) {
+	constructorCtx, cancelConstructor := context.WithCancel(context.Background())
+	cleanupCtx, cancelCleanup := context.WithCancel(context.Background())
+	defer cancelConstructor()
+	defer cancelCleanup()
+
+	source := newDialContextSource(constructorCtx)
+	local, remote := net.Pipe()
+	defer remote.Close()
+
+	dial := bindDialContextWithDialContextSource(source, func(context.Context, string, string) (net.Conn, error) {
+		return local, nil
+	})
+	conn, err := dial(context.Background(), "tcp", "nn:8020")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	source.Store(cleanupCtx)
+	done := make(chan error, 1)
+	go func() {
+		_, err := conn.Read(make([]byte, 1))
+		done <- err
+	}()
+
+	cancelConstructor()
+	select {
+	case err := <-done:
+		t.Fatalf("constructor cancellation closed the rebound connection: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	cancelCleanup()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("cleanup cancellation left the rebound connection readable")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("cleanup cancellation did not close the rebound connection")
+	}
+}
+
 func TestBackendOpenAppliesContextDeadline(t *testing.T) {
 	client := newFakeClient()
 	client.files["/tables/1.rf"] = []byte("rfile")

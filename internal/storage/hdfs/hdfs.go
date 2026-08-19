@@ -137,7 +137,7 @@ func NewContext(ctx context.Context, address string, opts ...Option) (*Backend, 
 		return nil, err
 	}
 	dialSource := newDialContextSource(backgroundCtx)
-	baseClient, err := newHDFSClientWithContextSource(dialSource.Context, clientAddress, options)
+	baseClient, err := newHDFSClientWithDialContextSource(dialSource, clientAddress, options)
 	if err != nil {
 		stopCleanupClient()
 		return nil, err
@@ -378,6 +378,12 @@ func bindClientOptions(ctx context.Context, options hdfsclient.ClientOptions) hd
 	}, options)
 }
 
+func bindClientOptionsWithDialContextSource(source *dialContextSource, options hdfsclient.ClientOptions) hdfsclient.ClientOptions {
+	options.NamenodeDialFunc = bindDialContextWithDialContextSource(source, options.NamenodeDialFunc)
+	options.DatanodeDialFunc = bindDialContextWithDialContextSource(source, options.DatanodeDialFunc)
+	return options
+}
+
 func bindClientOptionsWithContextSource(ctxSource func() context.Context, options hdfsclient.ClientOptions) hdfsclient.ClientOptions {
 	options.NamenodeDialFunc = bindDialContextWithSource(ctxSource, options.NamenodeDialFunc)
 	options.DatanodeDialFunc = bindDialContextWithSource(ctxSource, options.DatanodeDialFunc)
@@ -413,6 +419,31 @@ func bindDialContextWithSource(ctxSource func() context.Context, dial func(conte
 	}
 }
 
+func bindDialContextWithDialContextSource(source *dialContextSource, dial func(context.Context, string, string) (net.Conn, error)) func(context.Context, string, string) (net.Conn, error) {
+	if source == nil {
+		return bindDialContext(context.Background(), dial)
+	}
+	if dial == nil {
+		dial = (&net.Dialer{}).DialContext
+	}
+	return func(requestCtx context.Context, network, addr string) (net.Conn, error) {
+		effectiveCtx, release := combineDialContexts(requestCtx, source.Context())
+		conn, err := dial(effectiveCtx, network, addr)
+		if err != nil {
+			release()
+			return nil, err
+		}
+		if deadline, ok := effectiveCtx.Deadline(); ok {
+			if err := conn.SetDeadline(deadline); err != nil {
+				release()
+				_ = conn.Close()
+				return nil, err
+			}
+		}
+		return bindConnContextWithSource(requestCtx, conn, source, release), nil
+	}
+}
+
 func contextOrBackground(ctx context.Context) context.Context {
 	if ctx == nil {
 		return context.Background()
@@ -421,7 +452,10 @@ func contextOrBackground(ctx context.Context) context.Context {
 }
 
 type dialContextSource struct {
-	current atomic.Pointer[dialContextHolder]
+	current  atomic.Pointer[dialContextHolder]
+	mu       sync.Mutex
+	nextID   uint64
+	watchers map[uint64]func(context.Context)
 }
 
 type dialContextHolder struct {
@@ -443,7 +477,38 @@ func (s *dialContextSource) Context() context.Context {
 }
 
 func (s *dialContextSource) Store(ctx context.Context) {
-	s.current.Store(&dialContextHolder{ctx: contextOrBackground(ctx)})
+	ctx = contextOrBackground(ctx)
+	s.current.Store(&dialContextHolder{ctx: ctx})
+	s.mu.Lock()
+	watchers := make([]func(context.Context), 0, len(s.watchers))
+	for _, watcher := range s.watchers {
+		watchers = append(watchers, watcher)
+	}
+	s.mu.Unlock()
+	for _, watcher := range watchers {
+		watcher(ctx)
+	}
+}
+
+func (s *dialContextSource) Subscribe(watcher func(context.Context)) func() {
+	if watcher == nil {
+		return func() {}
+	}
+	s.mu.Lock()
+	if s.watchers == nil {
+		s.watchers = make(map[uint64]func(context.Context))
+	}
+	s.nextID++
+	id := s.nextID
+	s.watchers[id] = watcher
+	ctx := s.Context()
+	s.mu.Unlock()
+	watcher(ctx)
+	return func() {
+		s.mu.Lock()
+		delete(s.watchers, id)
+		s.mu.Unlock()
+	}
 }
 
 func newBackendClientContext(ctx context.Context) (context.Context, context.CancelFunc) {
@@ -906,6 +971,19 @@ func newHDFSClient(ctx context.Context, clientAddress string, options hdfsclient
 	}, clientAddress, options)
 }
 
+func newHDFSClientWithDialContextSource(source *dialContextSource, clientAddress string, options hdfsclient.ClientOptions) (*leasedClient, error) {
+	client, err := hdfsclient.NewClient(bindClientOptionsWithDialContextSource(source, options))
+	if err != nil {
+		if source != nil {
+			if ctxErr := source.Context().Err(); ctxErr != nil {
+				return nil, ctxErr
+			}
+		}
+		return nil, fmt.Errorf("hdfs: connect %s: %w", clientAddress, err)
+	}
+	return newOwnedLease(clientAdapter{client}, client.Close), nil
+}
+
 func newHDFSClientWithContextSource(ctxSource func() context.Context, clientAddress string, options hdfsclient.ClientOptions) (*leasedClient, error) {
 	client, err := hdfsclient.NewClient(bindClientOptionsWithContextSource(ctxSource, options))
 	if err != nil {
@@ -950,6 +1028,82 @@ func bindConnContext(ctx context.Context, conn net.Conn, release func()) net.Con
 			}
 		},
 	}
+}
+
+type sourceBoundConn struct {
+	net.Conn
+	mu          sync.Mutex
+	stopRequest func() bool
+	stopSource  func() bool
+	unsubscribe func()
+	release     func()
+	cleanupOnce sync.Once
+}
+
+func bindConnContextWithSource(requestCtx context.Context, conn net.Conn, source *dialContextSource, release func()) net.Conn {
+	if (requestCtx == nil || requestCtx.Done() == nil) && source == nil && release == nil {
+		return conn
+	}
+	bound := &sourceBoundConn{
+		Conn:    conn,
+		release: release,
+	}
+	if requestCtx != nil && requestCtx.Done() != nil {
+		bound.stopRequest = context.AfterFunc(requestCtx, func() {
+			_ = conn.Close()
+		})
+	}
+	if source != nil {
+		bound.unsubscribe = source.Subscribe(bound.bindSourceContext)
+	}
+	return bound
+}
+
+func (c *sourceBoundConn) bindSourceContext(ctx context.Context) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.stopSource != nil {
+		c.stopSource()
+		c.stopSource = nil
+	}
+	if ctx != nil && ctx.Done() != nil {
+		conn := c.Conn
+		c.stopSource = context.AfterFunc(ctx, func() {
+			_ = conn.Close()
+		})
+	}
+}
+
+func (c *sourceBoundConn) Close() error {
+	c.cleanup()
+	return c.Conn.Close()
+}
+
+func (c *sourceBoundConn) cleanup() {
+	c.cleanupOnce.Do(func() {
+		c.mu.Lock()
+		stopRequest := c.stopRequest
+		stopSource := c.stopSource
+		unsubscribe := c.unsubscribe
+		release := c.release
+		c.stopRequest = nil
+		c.stopSource = nil
+		c.unsubscribe = nil
+		c.release = nil
+		c.mu.Unlock()
+		if stopRequest != nil {
+			stopRequest()
+		}
+		if stopSource != nil {
+			stopSource()
+		}
+		if unsubscribe != nil {
+			unsubscribe()
+		}
+		if release != nil {
+			release()
+		}
+	})
 }
 
 func (w *replaceWriter) releaseOperationClient() error {
