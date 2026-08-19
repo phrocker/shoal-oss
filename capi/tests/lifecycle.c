@@ -435,10 +435,13 @@ int main(void) {
   expect_error(shoal_range_create(&descriptor_range, &range_result, &error),
                SHOAL_STATUS_INVALID_ARGUMENT, &error, "flags");
   descriptor_range.start_inclusive = 1;
-  shoal_test_result_alloc_fail_after(0);
-  expect_error(shoal_range_create(&infinite_range, &range_result, &error),
-               SHOAL_STATUS_OUT_OF_MEMORY, &error, "allocate range result");
-  shoal_test_result_alloc_reset();
+  for (size_t allocation = 0; allocation < 9; ++allocation) {
+    shoal_test_result_alloc_fail_after(allocation);
+    expect_error(shoal_range_create(&descriptor_range, &range_result, &error),
+                 SHOAL_STATUS_OUT_OF_MEMORY, &error, "allocate range");
+    assert(range_result == NULL);
+    shoal_test_result_alloc_reset();
+  }
 
   char iterator_name[] = "age";
   char iterator_class[] = "com.example.Age";
@@ -500,12 +503,14 @@ int main(void) {
   expect_error(shoal_iterator_setting_create(&invalid_iterator,
                                              &iterator_result, &error),
                SHOAL_STATUS_INVALID_ARGUMENT, &error, "name");
-  shoal_test_result_alloc_fail_after(0);
-  expect_error(shoal_iterator_setting_create(&iterator_setting,
-                                             &iterator_result, &error),
-               SHOAL_STATUS_OUT_OF_MEMORY, &error,
-               "allocate iterator setting result");
-  shoal_test_result_alloc_reset();
+  for (size_t allocation = 0; allocation < 8; ++allocation) {
+    shoal_test_result_alloc_fail_after(allocation);
+    expect_error(shoal_iterator_setting_create(&iterator_setting,
+                                               &iterator_result, &error),
+                 SHOAL_STATUS_OUT_OF_MEMORY, &error, "allocate iterator");
+    assert(iterator_result == NULL);
+    shoal_test_result_alloc_reset();
+  }
   shoal_test_string_alloc_fail_after(0);
   expect_error(shoal_iterator_setting_create(&iterator_setting,
                                              &iterator_result, &error),
