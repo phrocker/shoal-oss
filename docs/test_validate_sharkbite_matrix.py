@@ -722,22 +722,22 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
 
     def test_pinned_inventory_constants_are_internally_consistent(self) -> None:
         validator.validate_pinned_inventory_constants()
-        self.assertEqual(validator.EXPECTED_REVISION, 30)
+        self.assertEqual(validator.EXPECTED_REVISION, 31)
         self.assertEqual(validator.EXPECTED_TOTAL_ROWS, 3203)
         self.assertEqual(validator.EXPECTED_REQUIRED_ROWS, 2811)
         self.assertEqual(
             validator.EXPECTED_STATUS_COUNTS,
             {
-                "Covered": 71,
+                "Covered": 79,
                 "Missing Go": 2361,
-                "Missing C ABI": 71,
+                "Missing C ABI": 63,
                 "Behavior mismatch": 221,
                 validator.INTENTIONAL_DIVERGENCE_STATUS: 87,
                 validator.NOT_REQUIRED_STATUS: 392,
             },
         )
-        self.assertEqual(validator.EXPECTED_C_ABI_DECLARED_EXPORTS, 208)
-        self.assertEqual(validator.EXPECTED_C_ABI_REFERENCED_EXPORTS, 203)
+        self.assertEqual(validator.EXPECTED_C_ABI_DECLARED_EXPORTS, 218)
+        self.assertEqual(validator.EXPECTED_C_ABI_REFERENCED_EXPORTS, 213)
         self.assertEqual(
             validator.EXPECTED_C_ABI_UNREFERENCED_EXPORTS,
             (
@@ -762,10 +762,12 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
         self.assertIn("shoal_mutation_delete", referenced)
         self.assertIn("shoal_rfile_reader_open_many", referenced)
         self.assertIn("shoal_rfile_entry_result_get", referenced)
+        self.assertIn("shoal_client_create", referenced)
+        self.assertIn("shoal_client_create_batch_writer", referenced)
 
     def test_collect_c_abi_free_function_inventory_matches_header(self) -> None:
         free_functions = validator.collect_c_abi_free_function_inventory()
-        self.assertEqual(len(free_functions), 30)
+        self.assertEqual(len(free_functions), 31)
         self.assertIn("shoal_key_value_result_free", free_functions)
         self.assertIn("shoal_authorizations_free", free_functions)
         self.assertIn("shoal_accumulo_writer_free", free_functions)
@@ -776,6 +778,7 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
         self.assertIn("shoal_iterator_setting_free", free_functions)
         self.assertIn("shoal_rfile_writer_free", free_functions)
         self.assertIn("shoal_rfile_entry_result_free", free_functions)
+        self.assertIn("shoal_client_free", free_functions)
 
     def test_compiled_c_abi_reference_inventory_ignores_non_linking_mentions(self) -> None:
         references = validator.compiled_c_abi_reference_inventory(
@@ -793,7 +796,7 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
 
     def test_stale_typed_free_inventory_narrative_is_rejected(self) -> None:
         text = load_document_text()
-        mutated = text.replace("30 typed free functions", "8 typed free functions", 1)
+        mutated = text.replace("31 typed free functions", "8 typed free functions", 1)
         self.assertNotEqual(mutated, text)
         self.assert_validation_fails(
             lambda: validator.validate_counts(mutated.splitlines(), mutated),
@@ -875,7 +878,7 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
             lambda: validator.validate_revision_inventory(
                 row_ids, reclassified, prefix_counts
             ),
-            f"revision {validator.EXPECTED_REVISION} inventory expects 71 rows for Covered, found 72",
+            f"revision {validator.EXPECTED_REVISION} inventory expects 79 rows for Covered, found 80",
         )
 
     def test_declared_count_edit_still_fails_internal_cross_check(self) -> None:
@@ -891,7 +894,7 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
     def test_stale_c_abi_symbol_inventory_narrative_is_rejected(self) -> None:
         text = load_document_text()
         mutated = text.replace(
-            "applied to 208 declared exports in `capi/include/shoal.h`",
+            "applied to 218 declared exports in `capi/include/shoal.h`",
             "applied to 44 declared exports in `capi/include/shoal.h`",
             1,
         )
@@ -904,7 +907,7 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
     def test_revision_bump_requires_validator_constant_update(self) -> None:
         text = load_document_text()
         mutated = text.replace(
-            f"Revision {validator.EXPECTED_REVISION} — completes one-shot scan cancellation and connector cache invalidation",
+            f"Revision {validator.EXPECTED_REVISION} — completes the eight-row high-level client facade",
             f"Revision {validator.EXPECTED_REVISION + 1} — adds the next audited ABI slice",
         ).replace(
             f"As of revision {validator.EXPECTED_REVISION} that is",
@@ -913,7 +916,7 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
         self.assertNotEqual(mutated, text)
         self.assert_validation_fails(
             lambda: validator.validate_counts(mutated.splitlines(), mutated),
-            f"document status is missing expected detail: Revision {validator.EXPECTED_REVISION} — completes one-shot scan cancellation and connector cache invalidation",
+            f"document status is missing expected detail: Revision {validator.EXPECTED_REVISION} — completes the eight-row high-level client facade",
         )
 
     # ---- matrix table separators -------------------------------------------
