@@ -110,19 +110,55 @@ func (c *Connector) AddConstraint(
 
 // versionedTableProperties reads the table's own properties and the version a
 // compare-and-set write must present.
+//
+// getVersionedTableProperties is a ClientService RPC, not a manager one, so it
+// resolves client-service endpoints and retries them the way every other
+// property read does; only the write goes to the manager.
 func (c *Connector) versionedTableProperties(
 	ctx context.Context,
 	tableName string,
 ) (managerclient.VersionedProperties, error) {
-	manager, address, err := c.managerEndpoint(ctx)
-	if err != nil {
-		return managerclient.VersionedProperties{}, err
+	c.mu.RLock()
+	if c.closed {
+		c.mu.RUnlock()
+		return managerclient.VersionedProperties{}, ErrConnectorClosed
 	}
-	properties, err := manager.GetVersionedTableProperties(ctx, address, tableName)
-	if err != nil {
-		return managerclient.VersionedProperties{}, mapManagerPropertyError(tableName, "", err)
+	resolver := c.clientAddr
+	manager := c.manager
+	c.mu.RUnlock()
+	if resolver == nil || manager == nil {
+		return managerclient.VersionedProperties{}, ErrDiscoveryUnavailable
 	}
-	return properties, nil
+	addresses, err := resolver.Addresses(ctx)
+	if errors.Is(err, zk.ErrClientServiceUnavailable) {
+		return managerclient.VersionedProperties{}, ErrClientServiceUnavailable
+	}
+	if err != nil {
+		return managerclient.VersionedProperties{}, fmt.Errorf(
+			"accumulo: discover client service: %w", err,
+		)
+	}
+
+	var endpointErr error
+	for _, address := range addresses {
+		properties, err := manager.GetVersionedTableProperties(ctx, address, tableName)
+		if err == nil {
+			return properties, nil
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return managerclient.VersionedProperties{}, ctxErr
+		}
+		if !managerclient.IsRetryableEndpointError(err) {
+			return managerclient.VersionedProperties{}, mapTablePropertyReadError(tableName, err)
+		}
+		endpointErr = errors.Join(endpointErr, fmt.Errorf("%s: %w", address, err))
+	}
+	if endpointErr == nil {
+		return managerclient.VersionedProperties{}, ErrClientServiceUnavailable
+	}
+	return managerclient.VersionedProperties{}, fmt.Errorf(
+		"%w: %w", ErrClientServiceUnavailable, endpointErr,
+	)
 }
 
 // modifyTableProperties replaces the table's own properties at a version.

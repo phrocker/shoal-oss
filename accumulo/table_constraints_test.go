@@ -8,6 +8,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/phrocker/shoal/internal/zk"
 )
 
 // constraintConnector wires a connector whose table properties and property
@@ -462,5 +464,53 @@ func TestAddConstraintRetriesWhenAnotherConnectorWinsTheVersion(t *testing.T) {
 		if _, found := constraintNumberOf(installed, want); !found {
 			t.Fatalf("%s was overwritten: %#v", want, installed)
 		}
+	}
+}
+
+// TestAddConstraintReadsThroughClientServiceEndpoints pins that the versioned
+// read is a ClientService call: it resolves client-service addresses, retries a
+// dead endpoint, and only the write goes to the manager.
+func TestAddConstraintReadsThroughClientServiceEndpoints(t *testing.T) {
+	names := &fakeTableNames{byName: map[string]string{"events": "1"}}
+	connector := testConnectorWithDiscovery(t, &fakeTabletWalker{}, names)
+	manager := &fakeManagerAdapter{configuration: map[string]string{}}
+	connector.manager = manager
+	connector.managerAddr = fakeManagerAddress{address: "manager:9997"}
+	connector.clientAddr = fakeClientServiceAddresses{addresses: []string{"tserver-a:9997", "tserver-b:9997"}}
+
+	number, err := connector.AddConstraint(context.Background(), "events", "org.example.C")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if number != 1 {
+		t.Fatalf("number = %d, want 1", number)
+	}
+
+	manager.mu.Lock()
+	defer manager.mu.Unlock()
+	if len(manager.configurationRPC) == 0 {
+		t.Fatal("no client-service endpoint was contacted for the property reads")
+	}
+	for _, address := range manager.configurationRPC {
+		if address == "manager:9997" {
+			t.Fatalf("a property read went to the manager: %v", manager.configurationRPC)
+		}
+	}
+	if len(manager.modifyRequests) != 1 {
+		t.Fatalf("versioned writes = %d, want 1", len(manager.modifyRequests))
+	}
+}
+
+// TestAddConstraintFailsWhenClientServiceIsUnavailable pins that a missing
+// client service is reported as such rather than as a manager failure.
+func TestAddConstraintFailsWhenClientServiceIsUnavailable(t *testing.T) {
+	names := &fakeTableNames{byName: map[string]string{"events": "1"}}
+	connector := testConnectorWithDiscovery(t, &fakeTabletWalker{}, names)
+	connector.manager = &fakeManagerAdapter{configuration: map[string]string{}}
+	connector.managerAddr = fakeManagerAddress{address: "manager:9997"}
+	connector.clientAddr = fakeClientServiceAddresses{err: zk.ErrClientServiceUnavailable}
+
+	if _, err := connector.AddConstraint(context.Background(), "events", "org.example.C"); !errors.Is(err, ErrClientServiceUnavailable) {
+		t.Fatalf("AddConstraint = %v, want ErrClientServiceUnavailable", err)
 	}
 }
