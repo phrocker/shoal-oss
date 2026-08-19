@@ -625,14 +625,11 @@ func TestTranslateAcceptsAnEscapeInTheVolume(t *testing.T) {
 }
 
 // TestTranslateAcceptsEveryIPv6HostURIDoes keeps the literal check as
-// permissive as parseIPv6Reference: a scope id of alpha, digit, "_" or
-// ".", an IPv4 tail, and the all-zeros compression are all in the
-// grammar, and refusing any of them would strand a real namenode.
+// permissive as parseIPv6Reference: an IPv4 tail, the all-zeros
+// compression, a fully expanded address and an empty port are all in
+// the grammar, and refusing any of them would strand a real namenode.
 func TestTranslateAcceptsEveryIPv6HostURIDoes(t *testing.T) {
 	for _, host := range []string{
-		"[fe80::1%eth0]",
-		"[fe80::1%25]:9000",
-		"[fe80::1%en_0.1]",
 		"[::ffff:10.0.0.1]",
 		"[::]",
 		"[2001:0db8:0000:0000:0000:0000:0000:0001]",
@@ -649,6 +646,101 @@ func TestTranslateAcceptsEveryIPv6HostURIDoes(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestTranslateRefusesAnIPv6ScopeIDShoalCannotOpen covers the gap
+// between the two parsers. URI$Parser.parseServer reads "%" inside the
+// brackets as the scope-id introducer, so java.net.URI takes every one
+// of these hosts and Accumulo can name the file. net/url.Parse, which
+// is what internal/storage/hdfs's Backend.resolve calls, has no such
+// rule: it reads the "%" as an escape and fails, or unescapes it and
+// finds an empty zone. Every scope-id spelling Java accepts therefore
+// fails on shoal, so the job is refused as a capability gap rather than
+// declared executable and left to die on its first read.
+func TestTranslateRefusesAnIPv6ScopeIDShoalCannotOpen(t *testing.T) {
+	for _, host := range []string{
+		"[fe80::1%eth0]",
+		"[fe80::1%25]:9000",
+		"[fe80::1%en_0.1]",
+	} {
+		t.Run(host, func(t *testing.T) {
+			path := "hdfs://" + host + "/accumulo/tables/2/t-0001/F0002.rf"
+			job := validJob()
+			job.Files[1].MetadataFileEntry = storedFile(path)
+
+			r := assertRefused(t, job, Options{}, ClassUnsupportedVolume, "files[1]")
+			if !strings.Contains(r.Detail, "cannot parse this path") {
+				t.Fatalf("detail = %q, want it to name the parse failure", r.Detail)
+			}
+		})
+	}
+}
+
+// TestTranslateRefusesAnOutputVolumeShoalCannotOpen holds the same gate
+// on the output. An unopenable output is worse than an unopenable
+// input: the compaction would run to completion and only fail on the
+// write, after every input had been read.
+func TestTranslateRefusesAnOutputVolumeShoalCannotOpen(t *testing.T) {
+	job := validJob()
+	job.OutputFile = "hdfs://[fe80::1%eth0]/accumulo/tables/2/t-0001/C0003.rf_tmp_" + testECID
+
+	r := assertRefused(t, job, Options{}, ClassUnsupportedVolume, "outputFile")
+	if !strings.Contains(r.Detail, "cannot parse this path") {
+		t.Fatalf("detail = %q, want it to name the parse failure", r.Detail)
+	}
+}
+
+// TestTranslateRefusesEscapesThatNormalizeAway is the alias the raw
+// segment scan cannot see. new Path(URI) is URI.normalize(), which
+// resolves segments in the *decoded* path, so "%2e%2e" is a ".." that
+// disappears and "%2f%2f" collapses to one separator: the paths below
+// are the same Hadoop Path as the plain spelling of the same file.
+// pathIdentity decodes escapes but does not resolve segments, so
+// without this refusal a job could name one file twice and merge every
+// cell in it twice, or aim its output at a file it was still reading.
+func TestTranslateRefusesEscapesThatNormalizeAway(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		path string
+		want string
+	}{
+		{
+			"parent segment",
+			"hdfs://nn/vol/x/%2e%2e/accumulo/tables/2/t-0001/F0002.rf",
+			`decodes to a ".." segment`,
+		},
+		{
+			"current segment",
+			"hdfs://nn/vol/%2E/accumulo/tables/2/t-0001/F0002.rf",
+			`decodes to a "." segment`,
+		},
+		{
+			"doubled separator",
+			"hdfs://nn/vol%2f%2faccumulo/tables/2/t-0001/F0002.rf",
+			"empty segment",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			job := validJob()
+			job.Files[1].MetadataFileEntry = storedFile(tt.path)
+
+			r := assertRefused(t, job, Options{}, ClassMalformedJob, "files[1]")
+			if !strings.Contains(r.Detail, tt.want) {
+				t.Fatalf("detail = %q, want it to contain %q", r.Detail, tt.want)
+			}
+		})
+	}
+}
+
+// TestTranslateRefusesAnOutputAliasingAnInputByNormalization is why the
+// escape refusal above is not merely tidiness. The output names the
+// same Hadoop Path as input 1 once URI.normalize resolves the "%2e%2e",
+// so running this job would have overwritten a file it was reading.
+func TestTranslateRefusesAnOutputAliasingAnInputByNormalization(t *testing.T) {
+	job := validJob()
+	job.OutputFile = "hdfs://nn/accumulo/x/%2e%2e/tables/2/t-0001/F0002.rf_tmp_" + testECID
+
+	assertRefused(t, job, Options{}, ClassMalformedJob, "outputFile")
 }
 
 // TestTranslateAcceptsAVisibleNonASCIIPath keeps the character check

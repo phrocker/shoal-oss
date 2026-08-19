@@ -61,6 +61,7 @@ import (
 	"log/slog"
 	"math"
 	"net/netip"
+	"net/url"
 	"regexp"
 	"sort"
 	"strconv"
@@ -142,6 +143,13 @@ const (
 	// this assignment. Reported so the coordinator can reschedule
 	// immediately instead of waiting for the assignment to age out.
 	ClassShuttingDown = "org.apache.accumulo.shoal.CompactorShuttingDown"
+
+	// ClassUnsupportedVolume: the path is a spelling java.net.URI
+	// accepts but shoal's storage backend cannot resolve, so the file
+	// could be named in metadata yet never opened here. Distinct from
+	// ClassMalformedJob because the job is not broken — a Java compactor
+	// would run it.
+	ClassUnsupportedVolume = "org.apache.accumulo.shoal.UnsupportedVolumeURI"
 )
 
 // Refusal is the structured reason a job cannot be executed by shoal.
@@ -846,6 +854,11 @@ func checkInputCapability(inputs []parsedInput, totalBytes int64, limits Limits)
 				in.file.Path, outputExtension(in.file.Path))
 		}
 	}
+	for _, in := range inputs {
+		if err := checkVolumeCapability(in.file.Path, in.field); err != nil {
+			return err
+		}
+	}
 	if limits.MaxInputFiles > 0 && len(inputs) > limits.MaxInputFiles {
 		return refuse(ClassResourceLimitExceeded, "files",
 			"%d input files exceeds the configured limit of %d", len(inputs), limits.MaxInputFiles)
@@ -968,6 +981,28 @@ func checkTabletFilePath(raw, field string) error {
 		case ".", "..":
 			return refuse(ClassMalformedJob, field,
 				"%q is not a normalized path (%q segment)", raw, segment)
+		}
+	}
+	// The loop above reads the path as written, but Hadoop reads it
+	// decoded: new Path(URI) is URI.normalize(), which resolves segments
+	// in uri.path — the decoded component. So "%2e%2e" is a ".." that
+	// normalizes away and "%2f" is a separator, and
+	// .../vol/x/%2e%2e/accumulo/tables/2/t-0001/A0000001.rf is the same
+	// Path as .../vol/accumulo/tables/2/t-0001/A0000001.rf. pathIdentity
+	// decodes escapes without resolving segments, so it would call those
+	// two files distinct: as two inputs every cell would be merged
+	// twice, and as output-and-input the output would land on a file
+	// still being read.
+	if decoded := decodeEscapes(rest[1:]); decoded != rest[1:] {
+		for _, segment := range strings.Split(decoded, "/") {
+			switch segment {
+			case "":
+				return refuse(ClassMalformedJob, field,
+					"%q decodes to a path with an empty segment; Path.normalize would fold it onto another spelling", raw)
+			case ".", "..":
+				return refuse(ClassMalformedJob, field,
+					"%q decodes to a %q segment; Path.normalize would fold it onto another spelling", raw, segment)
+			}
 		}
 	}
 	if len(segments) < 4 {
@@ -1534,6 +1569,31 @@ func checkOutputCapability(out, ecid string) error {
 	if !strings.HasSuffix(base, rfileExtension) {
 		return refuse(ClassUnsupportedProperty, "outputFile",
 			"%q names a %s file; shoal's writer emits RFiles only", out, outputExtension(base))
+	}
+	return checkVolumeCapability(out, "outputFile")
+}
+
+// checkVolumeCapability refuses a path java.net.URI accepts but shoal's
+// storage backend cannot resolve.
+//
+// checkTabletFilePath models Java's parser, because that is what decides
+// whether Accumulo could name the file at all. Opening it is a separate
+// question, and a different parser answers it: internal/storage/hdfs's
+// Backend.resolve hands the path to net/url.Parse, whose grammar is not
+// java.net.URI's. A raw IPv6 scope id is the spelling that reaches here
+// — URI.parseServer takes hdfs://[fe80::1%eth0]/... verbatim, because
+// inside the brackets "%" introduces a scope id, while net/url reads
+// "%et" as a truncated escape and fails. Without this the job would be
+// declared executable and then die on its first read, with the slot
+// already spent and no capability reported.
+//
+// Probing with the parser rather than modelling it keeps the two in
+// step: any future divergence is reported as a refusal instead of
+// becoming a late failure.
+func checkVolumeCapability(raw, field string) error {
+	if _, err := url.Parse(raw); err != nil {
+		return refuse(ClassUnsupportedVolume, field,
+			"shoal's storage backend cannot parse this path: %v", err)
 	}
 	return nil
 }
