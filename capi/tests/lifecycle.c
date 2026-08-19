@@ -402,20 +402,50 @@ int main(void) {
   shoal_test_result_alloc_reset();
 
   exists = 0;
+  assert(shoal_connector_namespace_exists(admin_connector, "", 0, &exists,
+                                          &error) == SHOAL_STATUS_OK);
+  assert(exists == 1);
   assert(shoal_connector_namespace_exists(admin_connector, "analytics", 0,
                                           &exists, &error) == SHOAL_STATUS_OK);
   assert(exists == 1);
   expect_error(shoal_connector_namespace_exists(admin_connector, NULL, 0,
                                                 &exists, &error),
                SHOAL_STATUS_INVALID_ARGUMENT, &error, "namespace_name");
+  expect_error(shoal_connector_delete_namespace(admin_connector, NULL, 0,
+                                                &error),
+               SHOAL_STATUS_INVALID_ARGUMENT, &error, "namespace_name");
   expect_error(shoal_connector_delete_namespace(admin_connector, "", 0,
                                                 &error),
                SHOAL_STATUS_NAMESPACE_NOT_EMPTY, &error,
                "namespace not empty");
+  expect_error(shoal_connector_rename_namespace(admin_connector, NULL, "work",
+                                                0, &error),
+               SHOAL_STATUS_INVALID_ARGUMENT, &error, "namespace_name");
+  expect_error(shoal_connector_rename_namespace(admin_connector, "analytics",
+                                                "", 0, &error),
+               SHOAL_STATUS_INVALID_ARGUMENT, &error, "new_namespace_name");
+  expect_error(shoal_connector_rename_namespace(admin_connector, "", "analytics",
+                                                0, &error),
+               SHOAL_STATUS_ALREADY_EXISTS, &error, "namespace exists");
   assert(shoal_connector_create_namespace(admin_connector, "scratch", 0,
                                           &error) == SHOAL_STATUS_OK);
   assert(shoal_connector_rename_namespace(admin_connector, "scratch", "work",
                                           0, &error) == SHOAL_STATUS_OK);
+  assert(shoal_connector_set_namespace_property(
+             admin_connector, "", "table.custom.default", "enabled", 0,
+             &error) == SHOAL_STATUS_OK);
+  assert(shoal_connector_namespace_properties(
+             admin_connector, "", 0, &namespace_properties, &error) ==
+         SHOAL_STATUS_OK);
+  assert(shoal_namespace_properties_count(namespace_properties) == 1);
+  assert(shoal_namespace_properties_get(namespace_properties, 0, &property_view,
+                                        &error) == SHOAL_STATUS_OK);
+  assert(strcmp(property_view.key, "table.custom.default") == 0);
+  assert(strcmp(property_view.value, "enabled") == 0);
+  shoal_namespace_properties_free(&namespace_properties);
+  assert(shoal_connector_remove_namespace_property(
+             admin_connector, "", "table.custom.default", 0, &error) ==
+         SHOAL_STATUS_OK);
   assert(shoal_connector_set_namespace_property(
              admin_connector, "work", "table.custom.mode", "", 0, &error) ==
          SHOAL_STATUS_OK);
