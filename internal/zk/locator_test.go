@@ -83,6 +83,7 @@ type blockingAuthConn struct {
 	done    chan struct{}
 	once    sync.Once
 	authErr error
+	closes  atomic.Int32
 }
 
 func (c *blockingAuthConn) AddAuth(string, []byte) error {
@@ -101,7 +102,10 @@ func (c *blockingAuthConn) Children(string) ([]string, *gozk.Stat, error) {
 }
 
 func (c *blockingAuthConn) Close() {
-	c.once.Do(func() { close(c.closed) })
+	c.once.Do(func() {
+		c.closes.Add(1)
+		close(c.closed)
+	})
 }
 
 func TestGetRawWithContextCancelsInFlightReadAndJoinsWorker(t *testing.T) {
@@ -216,6 +220,54 @@ func TestTopologyReadScopeReturnsAddAuthError(t *testing.T) {
 	}
 	if !errors.Is(err, want) {
 		t.Fatalf("topologyReadScope error = %v, want %v", err, want)
+	}
+}
+
+func TestTopologyReadScopeCloseInterruptsBlockingAddAuth(t *testing.T) {
+	conn := &blockingAuthConn{
+		started: make(chan struct{}),
+		closed:  make(chan struct{}),
+		done:    make(chan struct{}),
+	}
+	loc := &Locator{
+		instanceID:     "uuid-1",
+		instanceSecret: "secret",
+		rawConnFactory: func() (rawZKConn, error) {
+			return conn, nil
+		},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	result := make(chan error, 1)
+	go func() {
+		_, closeScope, err := loc.topologyReadScope(ctx)
+		if closeScope != nil {
+			defer closeScope()
+		}
+		result <- err
+	}()
+
+	<-conn.started
+	loc.Close()
+
+	if err := <-result; !errors.Is(err, ErrClosed) {
+		t.Fatalf("topologyReadScope error = %v, want ErrClosed", err)
+	}
+	select {
+	case <-conn.done:
+	default:
+		t.Fatal("topologyReadScope returned before AddAuth worker exited")
+	}
+	if conn.closes.Load() != 1 {
+		t.Fatalf("close calls = %d, want 1", conn.closes.Load())
+	}
+	loc.mu.Lock()
+	closed := loc.closed
+	tracked := len(loc.scopes)
+	loc.mu.Unlock()
+	if !closed || tracked != 0 {
+		t.Fatalf("closed/tracked = %t/%d, want true/0", closed, tracked)
 	}
 }
 

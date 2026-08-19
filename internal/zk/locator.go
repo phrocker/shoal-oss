@@ -52,10 +52,9 @@ type Locator struct {
 	instanceSecret string
 	rawConnFactory func() (rawZKConn, error)
 
-	mu                    sync.Mutex
-	closed                bool
-	scopes                map[*scopedTopologyReader]struct{}
-	pendingScopedConnects int
+	mu     sync.Mutex
+	closed bool
+	scopes map[*scopedTopologyReader]struct{}
 }
 
 // ErrClosed reports a read attempted after the locator was closed. Close
@@ -110,7 +109,6 @@ func NewWithAuth(servers []string, instanceName string, sessionTimeout time.Dura
 // InstanceID returns the resolved Accumulo instance UUID.
 func (l *Locator) InstanceID() string { return l.instanceID }
 
-// Close terminates the ZK session.
 // Close terminates the ZK session and permanently disables further reads.
 // Scoped connections handed out for cancellable reads are closed too, so an
 // in-flight topology read is released rather than outliving the locator.
@@ -123,7 +121,9 @@ func (l *Locator) Close() {
 	l.mu.Unlock()
 
 	l.closeScopes()
-	l.conn.Close()
+	if l.conn != nil {
+		l.conn.Close()
+	}
 }
 
 // closeScopes marks the locator closed and closes every scoped connection it
@@ -152,9 +152,6 @@ func (l *Locator) isClosed() bool {
 func (l *Locator) trackScope(scope *scopedTopologyReader) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if l.pendingScopedConnects > 0 {
-		l.pendingScopedConnects--
-	}
 	if l.closed {
 		return ErrClosed
 	}
@@ -172,24 +169,6 @@ func (l *Locator) releaseScope(scope *scopedTopologyReader) {
 	}
 	l.mu.Unlock()
 	scope.Close()
-}
-
-func (l *Locator) beginScopedConnect() error {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if l.closed {
-		return ErrClosed
-	}
-	l.pendingScopedConnects++
-	return nil
-}
-
-func (l *Locator) cancelScopedConnect() {
-	l.mu.Lock()
-	if l.pendingScopedConnects > 0 {
-		l.pendingScopedConnects--
-	}
-	l.mu.Unlock()
 }
 
 func (l *Locator) lookupInstanceID() (string, error) {
@@ -457,17 +436,9 @@ func (l *Locator) topologyReadScope(ctx context.Context) (LockReader, func(), er
 }
 
 func (l *Locator) newScopedTopologyReader(ctx context.Context) (*scopedTopologyReader, error) {
-	if err := l.beginScopedConnect(); err != nil {
-		return nil, err
-	}
 	conn, err := l.rawConnFactoryOrDefault()()
 	if err != nil {
-		l.cancelScopedConnect()
 		return nil, fmt.Errorf("zk connect: %w", err)
-	}
-	if err := addAuthWithContext(ctx, conn, l.instanceSecret); err != nil {
-		l.cancelScopedConnect()
-		return nil, err
 	}
 	scope := &scopedTopologyReader{
 		instancePath: l.InstancePath(),
@@ -478,6 +449,17 @@ func (l *Locator) newScopedTopologyReader(ctx context.Context) (*scopedTopologyR
 	if err := l.trackScope(scope); err != nil {
 		scope.Close()
 		return nil, err
+	}
+	if err := addAuthWithContext(ctx, conn, l.instanceSecret); err != nil {
+		l.releaseScope(scope)
+		if l.isClosed() {
+			return nil, ErrClosed
+		}
+		return nil, err
+	}
+	if l.isClosed() {
+		l.releaseScope(scope)
+		return nil, ErrClosed
 	}
 	return scope, nil
 }

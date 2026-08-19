@@ -1058,12 +1058,11 @@ func TestLocatorCloseRejectsPendingCancellableReconnect(t *testing.T) {
 				t.Fatalf("connection closed %d times, want 1", conn.closes)
 			}
 			locator.mu.Lock()
-			pending := locator.pendingScopedConnects
 			tracked := len(locator.scopes)
 			closed := locator.closed
 			locator.mu.Unlock()
-			if !closed || pending != 0 || tracked != 0 {
-				t.Fatalf("closed/pending/tracked = %t/%d/%d, want true/0/0", closed, pending, tracked)
+			if !closed || tracked != 0 {
+				t.Fatalf("closed/tracked = %t/%d, want true/0", closed, tracked)
 			}
 		})
 	}
