@@ -1270,12 +1270,25 @@ func (w *writer) promotionSource() (azureCopySource, error) {
 	return source, nil
 }
 
+// metadataValue looks up blob metadata case-insensitively because the service
+// returns metadata through response headers, which arrive canonicalized (for
+// example "Shoal-Write-Id" rather than "shoal-write-id").
 func metadataValue(metadata map[string]*string, key string) string {
-	value := metadata[key]
-	if value == nil {
-		return ""
+	if value, ok := metadata[key]; ok {
+		if value == nil {
+			return ""
+		}
+		return *value
 	}
-	return *value
+	for name, value := range metadata {
+		if strings.EqualFold(name, key) {
+			if value == nil {
+				return ""
+			}
+			return *value
+		}
+	}
+	return ""
 }
 
 func equalETags(a, b *azcore.ETag) bool {

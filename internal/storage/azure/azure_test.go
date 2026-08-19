@@ -1586,3 +1586,59 @@ func TestRoundtripAgainstRealAccount(t *testing.T) {
 	}
 	t.Log("live Azure test skipped in offline mode")
 }
+
+// TestMetadataValueMatchesCanonicalHeaderKeys guards against exact-key lookups:
+// the SDK derives blob metadata from response headers, which arrive with
+// canonicalized names such as "Shoal-Write-Id".
+func TestMetadataValueMatchesCanonicalHeaderKeys(t *testing.T) {
+	id := "write-id"
+	canonical := map[string]*string{"Shoal-Write-Id": &id}
+	if got := metadataValue(canonical, "shoal-write-id"); got != id {
+		t.Fatalf("metadataValue(canonical) = %q, want %q", got, id)
+	}
+	lower := map[string]*string{"shoal-write-id": &id}
+	if got := metadataValue(lower, "shoal-write-id"); got != id {
+		t.Fatalf("metadataValue(lower) = %q, want %q", got, id)
+	}
+	if got := metadataValue(map[string]*string{"other": &id}, "shoal-write-id"); got != "" {
+		t.Fatalf("metadataValue(missing) = %q, want empty", got)
+	}
+	if got := metadataValue(map[string]*string{"Shoal-Write-Id": nil}, "shoal-write-id"); got != "" {
+		t.Fatalf("metadataValue(nil value) = %q, want empty", got)
+	}
+}
+
+// TestWriter_AbortRemovesOwnedStageWithCanonicalMetadataKey verifies stage
+// ownership is recovered from the service when metadata keys come back
+// canonicalized, so cleanup does not leak the staged blob.
+func TestWriter_AbortRemovesOwnedStageWithCanonicalMetadataKey(t *testing.T) {
+	f := newFakeAzureWriteOperations()
+	f.stageResponseLost = true
+	w := newFakeAzureWriter(f, "target")
+	f.headErrs[w.stageName] = []error{context.DeadlineExceeded, context.DeadlineExceeded}
+
+	if _, err := w.Write([]byte("new")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if err := w.Close(); err == nil || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Close error = %v, want transient stage verification failure", err)
+	}
+
+	etag := azcore.ETag("\"staged\"")
+	id := w.writeID
+	f.objects[w.stageName] = fakeAzureObject{
+		state: azureObjectState{
+			etag:     &etag,
+			size:     int64(len("new")),
+			metadata: map[string]*string{"Shoal-Write-Id": &id},
+		},
+		data: "new",
+	}
+
+	if err := w.Abort(); err != nil {
+		t.Fatalf("Abort: %v", err)
+	}
+	if _, ok := f.objects[w.stageName]; ok {
+		t.Fatal("Abort did not remove staged blob owned by this writer")
+	}
+}
