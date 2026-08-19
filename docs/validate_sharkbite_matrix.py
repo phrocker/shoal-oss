@@ -14,7 +14,7 @@ import tempfile
 
 
 DOC_PATH = Path(__file__).with_name("sharkbite-compatibility.md")
-EXPECTED_REVISION = 35
+EXPECTED_REVISION = 36
 # Update this manifest only when the independently audited inventory itself
 # changes; review every added/removed or reclassified ID in code review.
 EXPECTED_ROW_MANIFEST = DOC_PATH.with_name(
@@ -59,16 +59,16 @@ def status_count_map(
 
 
 EXPECTED_STATUS_COUNTS = {
-    "Covered": 88,
+    "Covered": 100,
     "Missing Go": 2326,
-    "Missing C ABI": 91,
+    "Missing C ABI": 79,
     "Behavior mismatch": 219,
     "Intentional divergence (approval required)": 87,
     "Not required (rationale required)": 392,
 }
 
 EXPECTED_PREFIX_COUNTS = {
-    "SB-BASE": status_count_map(covered=13, missing_c_abi=5, not_required=2),
+    "SB-BASE": status_count_map(covered=18, not_required=2),
     "SB-CFG": status_count_map(
         covered=12,
         behavior_mismatch=16,
@@ -89,10 +89,10 @@ EXPECTED_PREFIX_COUNTS = {
     ),
     "SB-CXX": status_count_map(
         missing_go=2266,
-        covered=10,
+        covered=11,
         behavior_mismatch=15,
         not_required=304,
-        missing_c_abi=31,
+        missing_c_abi=30,
     ),
     "SB-DATA": status_count_map(
         covered=9,
@@ -127,8 +127,9 @@ EXPECTED_PREFIX_COUNTS = {
         not_required=3,
     ),
     "SB-SCAN": status_count_map(
+        covered=5,
         missing_go=5,
-        missing_c_abi=8,
+        missing_c_abi=3,
         behavior_mismatch=10,
         not_required=5,
     ),
@@ -153,9 +154,9 @@ EXPECTED_PREFIX_COUNTS = {
         not_required=9,
     ),
     "SB-XCUT": status_count_map(
-        covered=2,
+        covered=3,
         missing_go=1,
-        missing_c_abi=3,
+        missing_c_abi=2,
         behavior_mismatch=13,
     ),
 }
@@ -197,17 +198,17 @@ EXPECTED_METADATA_FIELDS = {
     ),
     "Sharkbite release line": "`sharkbite` 1.2.0.3 on PyPI (`setup.py:34-35`)",
     "Shoal reference": (
-        "`phrocker/shoal-oss` exact audited baseline for revision 35 "
-        "`edb7e4afaddc65d35119dfb5dc2a35e52c5df4a4` "
-        "(\"Add compatibility error C ABI (#145)\") "
-        "plus the column-visibility surface introduced in this revision"
+        "`phrocker/shoal-oss` exact audited baseline for revision 36 "
+        "`1ff5663f97879f45589c58d172e6526cb71d3e4b` "
+        "(\"Merge PR #147: publish the column-visibility expression surface\") "
+        "plus the streaming cursor C ABI introduced in this revision"
     ),
     "Shoal C ABI version": "`SHOAL_ABI_VERSION 1u` (`capi/include/shoal_types.h`)",
 }
 
 EXPECTED_DOCUMENT_STATUS_SNIPPETS = (
     "Normative gate. Binding on all Sharkbite-compatibility work.",
-    f"Revision {EXPECTED_REVISION} — records the public column-visibility surface",
+    f"Revision {EXPECTED_REVISION} — completes the twelve-row streaming cursor tranche",
     "Revision 34 — completes the four-row compatibility-error tranche",
     "Revision 32 — completes the five-row high-level scanner facade",
     "Revision 26 — completes the 17-row data-model value C ABI",
@@ -267,8 +268,8 @@ DEFAULT_C_ABI_INCLUDE_PATHS = (
     Path("capi/include"),
     Path("capi/tests"),
 )
-EXPECTED_C_ABI_DECLARED_EXPORTS = 227
-EXPECTED_C_ABI_REFERENCED_EXPORTS = 222
+EXPECTED_C_ABI_DECLARED_EXPORTS = 238
+EXPECTED_C_ABI_REFERENCED_EXPORTS = 233
 EXPECTED_C_ABI_UNREFERENCED_EXPORTS = (
     "shoal_scanner_scan",
     "shoal_batch_scanner_scan",
@@ -1660,13 +1661,13 @@ def validate_status_narratives(
     python_visible_behavior = status_counts["Behavior mismatch"] - prefix_counts["SB-CXX"]["Behavior mismatch"]
 
     expected_phrases = [
-        f"As of revision {EXPECTED_REVISION} that is {required_rows} of {total_rows} rows, and **only {status_counts['Covered']} are satisfied** ([SB-XCUT-012](#sec-20), the twelve configuration/topology rows in [§6](#sec-6), the 31 RFile/stream rows in [§15](#sec-15), the 17 data-model value rows in [§8](#sec-8) and [§19.2](#sec-19-2), the four buffered-writer rows in [§10](#sec-10), the four row-bounded flush/constraint rows in [§11](#sec-11) and [§19.2](#sec-19-2), the connector invalidation/cancellation rows in [§7](#sec-7) and [§20](#sec-20), the eight high-level client rows in [§10.1](#sec-10-1), the five high-level scanner rows in [§10.1](#sec-10-1), and the four compatibility-error rows in [§18](#sec-18))",
+        f"As of revision {EXPECTED_REVISION} that is {required_rows} of {total_rows} rows, and **only {status_counts['Covered']} are satisfied** ([SB-XCUT-012](#sec-20), the twelve configuration/topology rows in [§6](#sec-6), the 31 RFile/stream rows in [§15](#sec-15), the 17 data-model value rows in [§8](#sec-8) and [§19.2](#sec-19-2), the four buffered-writer rows in [§10](#sec-10), the four row-bounded flush/constraint rows in [§11](#sec-11) and [§19.2](#sec-19-2), the connector invalidation/cancellation rows in [§7](#sec-7) and [§20](#sec-20), the eight high-level client rows in [§10.1](#sec-10-1), the five high-level scanner rows in [§10.1](#sec-10-1), the four compatibility-error rows in [§18](#sec-18), and the twelve streaming cursor rows in [§9](#sec-9), [§10.1](#sec-10-1), [§19.2](#sec-19-2), and [§20](#sec-20))",
         f"{required_rows} rows are **required** by the final release gate ([§2.2](#sec-2)); the {status_counts[NOT_REQUIRED_STATUS]} `Not required` rows are excluded by construction, and {prefix_counts['SB-CXX'][NOT_REQUIRED_STATUS]} of those are the evidence-proved duplicates described in [§19.1](#sec-19-1).",
-        "**Exactly 88 rows are `Covered`: [SB-XCUT-012](#sec-20), the twelve configuration/topology rows completed in revision 24, the 31 RFile/stream rows completed in revision 25, the 17 data-model value rows completed in revision 26, the four buffered-writer rows completed in revision 28, the four row-bounded flush/constraint rows completed in revision 29, the connector invalidation/cancellation rows completed in revision 30, the eight high-level client rows completed in revision 31, the five high-level scanner rows completed in revision 32, and the four compatibility-error rows completed in revision 34.**",
+        "**Exactly 100 rows are `Covered`: [SB-XCUT-012](#sec-20), the twelve configuration/topology rows completed in revision 24, the 31 RFile/stream rows completed in revision 25, the 17 data-model value rows completed in revision 26, the four buffered-writer rows completed in revision 28, the four row-bounded flush/constraint rows completed in revision 29, the connector invalidation/cancellation rows completed in revision 30, the eight high-level client rows completed in revision 31, the five high-level scanner rows completed in revision 32, the four compatibility-error rows completed in revision 34, and the twelve streaming cursor rows completed in revision 36.**",
         f"The shape of the work is visible in the {status_counts['Missing Go']} `Missing Go` rows, of which {prefix_counts['SB-CXX']['Missing Go']} are the C++ members in [§19.2](#sec-19-2) that no Shoal layer exports.",
         f"`Behavior mismatch` ({status_counts['Behavior mismatch']}) is the bucket that sets the schedule: {python_visible_behavior} rows on the Python-visible and curated C++ surface each need a differential test against a live cluster or the exported ABI, and {prefix_counts['SB-CXX']['Behavior mismatch']} are destructors of classes bound into Python, where the destruction point is user-observable and the model differs from Go finalisation ([§19.1](#sec-19-1)).",
         f"`Intentional divergence` ({status_counts[INTENTIONAL_DIVERGENCE_STATUS]}) is dominated by one upstream fact: {prefix_counts['SB-STAT'][INTENTIONAL_DIVERGENCE_STATUS]} rows are cluster-status accessors Accumulo itself deleted ([§14](#sec-14), [SB-DIV-016](#sec-26)).",
-        f"`Missing C ABI` ({status_counts['Missing C ABI']}) is now led by pandas ({prefix_counts['SB-PANDA']['Missing C ABI']}), high-level helpers ({prefix_counts['SB-BASE']['Missing C ABI']}), packaging/import scaffolding ({prefix_counts['SB-PKG']['Missing C ABI']}), PyTorch ({prefix_counts['SB-TORCH']['Missing C ABI']}), the scanner cursor ({prefix_counts['SB-SCAN']['Missing C ABI']}), the visibility expression surface (30), and the remaining data-model row ({prefix_counts['SB-DATA']['Missing C ABI']}).",
+        f"`Missing C ABI` ({status_counts['Missing C ABI']}) is now led by the visibility expression surface (30), pandas ({prefix_counts['SB-PANDA']['Missing C ABI']}), packaging/import scaffolding ({prefix_counts['SB-PKG']['Missing C ABI']}), PyTorch ({prefix_counts['SB-TORCH']['Missing C ABI']}), the remaining scanner rows ({prefix_counts['SB-SCAN']['Missing C ABI']}), and the remaining data-model row ({prefix_counts['SB-DATA']['Missing C ABI']}).",
     ]
     for phrase in expected_phrases:
         require(phrase in normalized, f"missing or stale status narrative: {phrase}")
