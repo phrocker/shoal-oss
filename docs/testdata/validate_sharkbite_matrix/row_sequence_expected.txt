@@ -1,0 +1,5 @@
+# Expected row sequence fixture
+SB-FIXTURE-101
+SB-FIXTURE-102
+SB-FIXTURE-103
+SB-FIXTURE-104

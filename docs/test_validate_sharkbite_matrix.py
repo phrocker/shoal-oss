@@ -39,6 +39,10 @@ def load_document_text() -> str:
     return validator.DOC_PATH.read_text(encoding="utf-8")
 
 
+def load_row_id_fixture(name: str) -> tuple[str, ...]:
+    return validator.parse_row_id_manifest_lines(load_fixture_lines(name), source=name)
+
+
 def replace_pattern_once(text: str, pattern: str, replacement: str) -> str:
     rewritten, count = re.subn(pattern, replacement, text, count=1, flags=re.MULTILINE)
     if count != 1:
@@ -196,7 +200,7 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
 
     def test_parse_rows_accepts_unique_row_ids(self) -> None:
         status_counts, prefix_counts, row_ids = validator.parse_rows(load_fixture_lines("unique_rows.md"))
-        self.assertEqual(row_ids, {"SB-FIXTURE-101", "SB-FIXTURE-102"})
+        self.assertEqual(row_ids, ("SB-FIXTURE-101", "SB-FIXTURE-102"))
         self.assertEqual(status_counts["Covered"], 1)
         self.assertEqual(status_counts["Missing Go"], 1)
         self.assertEqual(prefix_counts["SB-FIXTURE"]["Covered"], 1)
@@ -358,6 +362,56 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
                     lambda name=fixture_name: validator.parse_category_summary(load_fixture_lines(name)),
                     "duplicate total row in category summary table",
                 )
+
+    def test_validate_expected_row_id_sequence_accepts_valid_fixture_sequence(self) -> None:
+        validator.validate_expected_row_id_sequence(
+            load_row_id_fixture("row_sequence_valid.txt"),
+            load_row_id_fixture("row_sequence_expected.txt"),
+        )
+
+    def test_validate_expected_row_id_sequence_rejects_swapped_fixture_sequence(self) -> None:
+        self.assert_validation_fails(
+            lambda: validator.validate_expected_row_id_sequence(
+                load_row_id_fixture("row_sequence_swap.txt"),
+                load_row_id_fixture("row_sequence_expected.txt"),
+            ),
+            "revision 16 inventory row ids changed",
+            "missing [none]",
+            "unexpected [none]",
+            "moved [SB-FIXTURE-102 expected 2 found 3, SB-FIXTURE-103 expected 3 found 2]",
+        )
+
+    def test_validate_expected_row_id_sequence_rejects_reordered_fixture_sequence(self) -> None:
+        self.assert_validation_fails(
+            lambda: validator.validate_expected_row_id_sequence(
+                load_row_id_fixture("row_sequence_reordered.txt"),
+                load_row_id_fixture("row_sequence_expected.txt"),
+            ),
+            "revision 16 inventory row ids changed",
+            "missing [none]",
+            "unexpected [none]",
+            "moved [SB-FIXTURE-101 expected 1 found 2",
+        )
+
+    def test_validate_expected_row_id_sequence_rejects_missing_fixture_row(self) -> None:
+        self.assert_validation_fails(
+            lambda: validator.validate_expected_row_id_sequence(
+                load_row_id_fixture("row_sequence_missing.txt"),
+                load_row_id_fixture("row_sequence_expected.txt"),
+            ),
+            "revision 16 inventory row ids changed",
+            "missing [SB-FIXTURE-103]",
+        )
+
+    def test_validate_expected_row_id_sequence_rejects_added_fixture_row(self) -> None:
+        self.assert_validation_fails(
+            lambda: validator.validate_expected_row_id_sequence(
+                load_row_id_fixture("row_sequence_added.txt"),
+                load_row_id_fixture("row_sequence_expected.txt"),
+            ),
+            "revision 16 inventory row ids changed",
+            "unexpected [SB-FIXTURE-999]",
+        )
 
     def test_validate_revision_16_inventory_rejects_same_prefix_row_id_substitution(self) -> None:
         rewritten_text = replace_pattern_once(
@@ -634,7 +688,7 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
         status_counts, prefix_counts, row_ids = validator.parse_rows(
             matrix_table(MATRIX_HEADER, MATRIX_SEPARATOR, MATRIX_ROW)
         )
-        self.assertEqual(row_ids, {"SB-FIXTURE-101"})
+        self.assertEqual(row_ids, ("SB-FIXTURE-101",))
         self.assertEqual(status_counts["Covered"], 1)
         self.assertEqual(prefix_counts["SB-FIXTURE"]["Covered"], 1)
 
@@ -692,7 +746,7 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
                 "| value | value |",
             ]
         )
-        self.assertEqual(row_ids, {"SB-FIXTURE-101"})
+        self.assertEqual(row_ids, ("SB-FIXTURE-101",))
 
     def test_parse_markdown_table_accepts_alignment_separators(self) -> None:
         headers, rows = validator.parse_markdown_table(
