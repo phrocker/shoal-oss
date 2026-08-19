@@ -192,6 +192,18 @@ RFileExportManifest (existing)  →  promotion.BuildLoadMapping
   basenames that differ only by case, Unicode normalization (e.g. NFC vs
   NFD `é`), or a trailing `.`/space are rejected before either write can
   silently overwrite the other.
+  That same case/Unicode fold applies to a Windows volume prefix, not
+  only to the path components after it: both the standard UNC form
+  (`\\server\share\...`) and the Win32 extended-length form
+  (`\\?\UNC\server\share\...`, which bypasses ordinary path processing
+  and would otherwise keep its own distinct literal spelling) have
+  their server and share segments case-folded and NFC-normalized
+  identically to ordinary components, so `\\SERVER\Share\B.rf` and
+  `\\server\share\B.rf` (or their `\\?\UNC\...` equivalents) collapse
+  to the same publication key instead of aliasing past this check. A
+  drive-letter prefix (`C:\...`) needs no separate folding here --
+  it's already uppercased upstream before the path is split into a
+  prefix and components.
   Every unique manifest source path is additionally checked against
   every *other* unique source path, not only against write targets: two
   different `DestinationPath` values that are physically the same file
