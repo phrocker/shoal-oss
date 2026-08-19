@@ -299,7 +299,7 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
         declared_counts, total = validator.parse_status_summary(load_fixture_lines("status_summary_valid.md"))
         self.assertEqual(total, 3203)
         self.assertEqual(declared_counts["Covered"], 0)
-        self.assertEqual(declared_counts["Missing Go"], 2422)
+        self.assertEqual(declared_counts["Missing Go"], 2420)
         self.assertEqual(declared_counts["Not required (rationale required)"], 392)
 
     def test_parse_status_summary_rejects_unsupported_count_cells(self) -> None:
@@ -631,9 +631,9 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
             validator.EXPECTED_STATUS_COUNTS,
             {
                 "Covered": 0,
-                "Missing Go": 2422,
-                "Missing C ABI": 105,
-                "Behavior mismatch": 197,
+                "Missing Go": 2420,
+                "Missing C ABI": 102,
+                "Behavior mismatch": 202,
                 validator.INTENTIONAL_DIVERGENCE_STATUS: 87,
                 validator.NOT_REQUIRED_STATUS: 392,
             },
@@ -720,11 +720,11 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
     def test_declared_count_edit_still_fails_internal_cross_check(self) -> None:
         text = load_document_text()
         mutated = replace_pattern_once(
-            text, re.escape("| Missing Go | 2422 |"), "| Missing Go | 2421 |"
+            text, re.escape("| Missing Go | 2420 |"), "| Missing Go | 2419 |"
         )
         self.assert_validation_fails(
             lambda: validator.validate_counts(mutated.splitlines(), mutated),
-            "status summary says 2421 rows for Missing Go, but parsed 2422",
+            "status summary says 2419 rows for Missing Go, but parsed 2420",
         )
 
     def test_revision_bump_requires_validator_constant_update(self) -> None:

@@ -54,9 +54,9 @@ def status_count_map(
 
 EXPECTED_STATUS_COUNTS = {
     "Covered": 0,
-    "Missing Go": 2422,
-    "Missing C ABI": 105,
-    "Behavior mismatch": 197,
+    "Missing Go": 2420,
+    "Missing C ABI": 102,
+    "Behavior mismatch": 202,
     "Intentional divergence (approval required)": 87,
     "Not required (rationale required)": 392,
 }
@@ -71,15 +71,15 @@ EXPECTED_PREFIX_COUNTS = {
         not_required=6,
     ),
     "SB-CONN": status_count_map(
-        missing_go=3,
+        missing_go=1,
         missing_c_abi=2,
-        behavior_mismatch=7,
+        behavior_mismatch=9,
         intentional_divergence=1,
     ),
     "SB-CPP": status_count_map(
         missing_go=11,
-        missing_c_abi=4,
-        behavior_mismatch=47,
+        missing_c_abi=3,
+        behavior_mismatch=48,
         not_required=8,
     ),
     "SB-CXX": status_count_map(
@@ -96,8 +96,8 @@ EXPECTED_PREFIX_COUNTS = {
     "SB-EMB": status_count_map(not_required=35),
     "SB-ERR": status_count_map(
         missing_go=2,
-        missing_c_abi=5,
-        behavior_mismatch=5,
+        missing_c_abi=4,
+        behavior_mismatch=6,
         intentional_divergence=1,
         not_required=3,
     ),
@@ -142,8 +142,8 @@ EXPECTED_PREFIX_COUNTS = {
     ),
     "SB-XCUT": status_count_map(
         missing_go=1,
-        missing_c_abi=4,
-        behavior_mismatch=14,
+        missing_c_abi=3,
+        behavior_mismatch=15,
     ),
 }
 

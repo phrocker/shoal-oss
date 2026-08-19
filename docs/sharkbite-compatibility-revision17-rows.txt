@@ -59,8 +59,8 @@ SB-CFG-018 Not required (rationale required)
 SB-CONN-001 Behavior mismatch
 SB-CONN-002 Behavior mismatch
 SB-CONN-003 Behavior mismatch
-SB-CONN-004 Missing Go
-SB-CONN-005 Missing Go
+SB-CONN-004 Behavior mismatch
+SB-CONN-005 Behavior mismatch
 SB-CONN-006 Missing C ABI
 SB-CONN-007 Missing Go
 SB-CONN-008 Behavior mismatch
@@ -446,7 +446,7 @@ SB-LOG-003 Behavior mismatch
 SB-ERR-001 Missing C ABI
 SB-ERR-002 Behavior mismatch
 SB-ERR-003 Intentional divergence (approval required)
-SB-ERR-004 Missing C ABI
+SB-ERR-004 Behavior mismatch
 SB-ERR-005 Behavior mismatch
 SB-ERR-006 Behavior mismatch
 SB-ERR-007 Behavior mismatch
@@ -461,7 +461,7 @@ SB-ERR-015 Not required (rationale required)
 SB-ERR-016 Behavior mismatch
 SB-CPP-001 Behavior mismatch
 SB-CPP-015 Behavior mismatch
-SB-CPP-002 Missing C ABI
+SB-CPP-002 Behavior mismatch
 SB-CPP-016 Missing C ABI
 SB-CPP-017 Missing C ABI
 SB-CPP-018 Missing C ABI
@@ -3201,7 +3201,7 @@ SB-XCUT-008 Missing C ABI
 SB-XCUT-009 Behavior mismatch
 SB-XCUT-010 Behavior mismatch
 SB-XCUT-011 Behavior mismatch
-SB-XCUT-012 Missing C ABI
+SB-XCUT-012 Behavior mismatch
 SB-XCUT-013 Behavior mismatch
 SB-XCUT-014 Behavior mismatch
 SB-XCUT-015 Missing Go
