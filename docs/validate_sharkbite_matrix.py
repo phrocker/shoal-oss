@@ -854,7 +854,8 @@ def collect_c_abi_symbol_inventory(
         f"duplicate SHOAL_API export declarations found in {C_ABI_EXPORT_HEADER_PATH}",
     )
     combined_reference_text = "\n".join(
-        (root / path).read_text(encoding="utf-8") for path in C_ABI_REFERENCE_PATHS
+        strip_c_non_code((root / path).read_text(encoding="utf-8"))
+        for path in C_ABI_REFERENCE_PATHS
     )
     referenced = tuple(
         symbol
@@ -863,6 +864,78 @@ def collect_c_abi_symbol_inventory(
     )
     unreferenced = tuple(symbol for symbol in exports if symbol not in referenced)
     return exports, referenced, unreferenced
+
+
+def strip_c_non_code(text: str) -> str:
+    enabled_lines: list[str] = []
+    disabled_depth = 0
+    for line in text.splitlines(keepends=True):
+        directive = re.match(r"^\s*#\s*(\w+)(.*)$", line)
+        if directive:
+            keyword, argument = directive.groups()
+            if keyword == "if" and re.fullmatch(r"\s*0\s*(?://.*)?", argument):
+                disabled_depth += 1
+            elif disabled_depth and keyword in {"if", "ifdef", "ifndef"}:
+                disabled_depth += 1
+            elif disabled_depth and keyword == "endif":
+                disabled_depth -= 1
+            continue
+        if not disabled_depth:
+            enabled_lines.append(line)
+
+    code = "".join(enabled_lines)
+    result: list[str] = []
+    index = 0
+    state = "code"
+    while index < len(code):
+        current = code[index]
+        following = code[index + 1] if index + 1 < len(code) else ""
+        if state == "code":
+            if current == "/" and following == "/":
+                result.extend((" ", " "))
+                index += 2
+                state = "line_comment"
+                continue
+            if current == "/" and following == "*":
+                result.extend((" ", " "))
+                index += 2
+                state = "block_comment"
+                continue
+            if current == '"':
+                result.append(" ")
+                index += 1
+                state = "string"
+                continue
+            if current == "'":
+                result.append(" ")
+                index += 1
+                state = "character"
+                continue
+            result.append(current)
+        elif state == "line_comment":
+            if current == "\n":
+                result.append(current)
+                state = "code"
+            else:
+                result.append(" ")
+        elif state == "block_comment":
+            if current == "*" and following == "/":
+                result.extend((" ", " "))
+                index += 2
+                state = "code"
+                continue
+            result.append("\n" if current == "\n" else " ")
+        else:
+            if current == "\\" and following:
+                result.extend((" ", "\n" if following == "\n" else " "))
+                index += 2
+                continue
+            terminator = '"' if state == "string" else "'"
+            result.append("\n" if current == "\n" else " ")
+            if current == terminator:
+                state = "code"
+        index += 1
+    return "".join(result)
 
 
 def validate_c_abi_symbol_inventory(full_text: str, repo_root: Path | None = None) -> None:
@@ -1101,6 +1174,10 @@ def validate_gap_completion_consistency(
         matrix_rows_cell, _notes = gap_rows[gap_id]
         referenced_rows = expand_gap_row_references(
             matrix_rows_cell, row_statuses, gap_id=gap_id
+        )
+        require(
+            referenced_rows,
+            f"{gap_id} claims completion without referencing any matrix rows",
         )
         contradicting = [
             (row_id, row_statuses[row_id])

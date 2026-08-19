@@ -498,6 +498,17 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
             "SB-TABLE-010 (Missing Go)",
         )
 
+    def test_gap_completion_consistency_rejects_empty_row_scope(self) -> None:
+        text = "\n".join(load_fixture_lines("gap_completion_valid.md")).replace(
+            "| SB-GAP-C-001 | Table administration on the ABI | SB-TABLE-001, SB-CPP-016, SB-CPP-017 |",
+            "| SB-GAP-C-001 | Table administration on the ABI | |",
+        )
+        rows = validator.parse_rows(text.splitlines())[2]
+        self.assert_validation_fails(
+            lambda: validator.validate_gap_completion_consistency(text.splitlines(), rows),
+            "SB-GAP-C-001 claims completion without referencing any matrix rows",
+        )
+
     def test_pinned_inventory_rejects_status_swap_between_rows_in_one_section(self) -> None:
         text = load_document_text()
         first = "| SB-PKG-001 |"
@@ -706,6 +717,21 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
         self.assertEqual(len(referenced), validator.EXPECTED_C_ABI_REFERENCED_EXPORTS)
         self.assertEqual(unreferenced, validator.EXPECTED_C_ABI_UNREFERENCED_EXPORTS)
         self.assertIn("shoal_versioned_properties_get", referenced)
+
+    def test_c_symbol_inventory_ignores_non_linking_mentions(self) -> None:
+        text = """
+// shoal_comment_only();
+const char *name = "shoal_string_only";
+#if 0
+shoal_disabled_only();
+#endif
+shoal_live_reference();
+"""
+        stripped = validator.strip_c_non_code(text)
+        self.assertNotIn("shoal_comment_only", stripped)
+        self.assertNotIn("shoal_string_only", stripped)
+        self.assertNotIn("shoal_disabled_only", stripped)
+        self.assertIn("shoal_live_reference", stripped)
 
     def test_pinned_inventory_constants_reject_incoherent_edit(self) -> None:
         with mock.patch.object(validator, "EXPECTED_TOTAL_ROWS", 3202):

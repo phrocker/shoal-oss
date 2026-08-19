@@ -222,6 +222,7 @@ int main(void) {
                SHOAL_STATUS_INVALID_ARGUMENT, &error, "out of bounds");
   shoal_table_list_free(&table_list);
   assert(table_list == NULL);
+  shoal_table_list_free(&table_list);
 
   shoal_test_result_alloc_fail_after(0);
   expect_error(shoal_connector_list_tables(admin_connector, 0, &table_list,
@@ -362,6 +363,7 @@ int main(void) {
   assert(strcmp(table_property_value, "") == 0);
   shoal_table_properties_free(&properties);
   assert(properties == NULL);
+  shoal_table_properties_free(&properties);
   shoal_test_result_alloc_fail_after(0);
   shoal_test_error_alloc_fail_after(1);
   shoal_test_error_message_alloc_fail_after(0);
