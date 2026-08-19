@@ -93,6 +93,25 @@ EXPECTED_METADATA_LINES = [
 
 CODE_SPAN_RE = re.compile(r"`([^`]+)`")
 IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+FILE_CITATION_SUFFIXES = {
+    ".c",
+    ".cc",
+    ".cpp",
+    ".go",
+    ".h",
+    ".hpp",
+    ".java",
+    ".json",
+    ".md",
+    ".proto",
+    ".py",
+    ".sh",
+    ".txt",
+    ".xml",
+    ".yaml",
+    ".yml",
+}
+FILE_CITATION_BASENAMES = {"ARCHITECTURE.md", "CMakeLists.txt", "Dockerfile", "Makefile", "README.md"}
 
 
 def fail(message: str) -> None:
@@ -152,11 +171,140 @@ def validate_local_line_number_removal(full_text: str) -> None:
         )
 
 
-def validate_targeted_symbol_anchors(lines: list[str]) -> None:
-    contents = {
-        path: (DOC_PATH.parent.parent / path).read_text(encoding="utf-8", errors="ignore")
-        for path in TARGETED_LOCAL_CITATIONS
+def normalize_file_citation(span: str) -> str:
+    return span.split(":", 1)[0]
+
+
+def is_file_citation(span: str) -> bool:
+    path = normalize_file_citation(span)
+    if path in FILE_CITATION_BASENAMES:
+        return True
+    if path.endswith("/**") or any(marker in path for marker in ("{", "}", "*", "?")):
+        return "/" in path
+    suffix = Path(path).suffix.lower()
+    return suffix in FILE_CITATION_SUFFIXES
+
+
+def load_targeted_contents(
+    targeted_paths: set[str],
+    repo_root: Path | None = None,
+) -> dict[str, str]:
+    root = repo_root or DOC_PATH.parent.parent
+    return {
+        path: (root / path).read_text(encoding="utf-8", errors="ignore")
+        for path in targeted_paths
     }
+
+
+def is_anchor_glue(text: str) -> bool:
+    words = re.findall(r"[A-Za-z]+", text)
+    if any(word not in {"and", "or", "s"} for word in words):
+        return False
+    remainder = re.sub(r"[A-Za-z]+", "", text)
+    return all(character in " \t`,;/+&()-" for character in remainder)
+
+
+def is_file_group_glue(text: str) -> bool:
+    return all(character in " \t`,;()" for character in text)
+
+
+def preceding_anchor_groups(
+    spans: list[tuple[str, int, int]],
+    start_index: int,
+    cell: str,
+) -> list[list[str]]:
+    candidate_indices: list[int] = []
+    previous_index = start_index - 1
+    while previous_index >= 0:
+        previous_span, _previous_start, _previous_end = spans[previous_index]
+        if previous_span.startswith("SB-") or previous_span in {"n/a", "—"}:
+            break
+        if is_file_citation(previous_span):
+            break
+        candidate_indices.insert(0, previous_index)
+        previous_index -= 1
+
+    if not candidate_indices:
+        return []
+
+    groups: list[list[str]] = []
+    current_group = [spans[candidate_indices[0]][0]]
+    for earlier_index, later_index in zip(candidate_indices, candidate_indices[1:]):
+        glue = cell[spans[earlier_index][2]:spans[later_index][1]]
+        if is_anchor_glue(glue):
+            current_group.append(spans[later_index][0])
+            continue
+        groups.append(current_group)
+        current_group = [spans[later_index][0]]
+    groups.append(current_group)
+    return groups
+
+
+def extract_path_anchor_bindings(cell: str, targeted_paths: set[str]) -> dict[str, list[str]]:
+    bindings: dict[str, list[str]] = defaultdict(list)
+    spans = [
+        (match.group(1), match.start(1), match.end(1))
+        for match in CODE_SPAN_RE.finditer(cell)
+    ]
+
+    index = 0
+    while index < len(spans):
+        span, _start, _end = spans[index]
+        if not is_file_citation(span):
+            index += 1
+            continue
+
+        group_indices = [index]
+        lookahead = index + 1
+        while (
+            lookahead < len(spans)
+            and is_file_citation(spans[lookahead][0])
+            and is_file_group_glue(cell[spans[lookahead - 1][2]:spans[lookahead][1]])
+        ):
+            group_indices.append(lookahead)
+            lookahead += 1
+
+        anchor_groups = preceding_anchor_groups(spans, group_indices[0], cell)
+        assignments: list[list[str]]
+        if not anchor_groups:
+            assignments = [[] for _ in group_indices]
+        elif len(group_indices) == 1:
+            assignments = [anchor_groups[-1]]
+        elif len(anchor_groups) == 1:
+            assignments = anchor_groups * len(group_indices)
+        elif len(anchor_groups) >= len(group_indices):
+            assignments = anchor_groups[-len(group_indices):]
+        else:
+            assignments = [[] for _ in group_indices]
+
+        for group_index, anchors in zip(group_indices, assignments):
+            path = normalize_file_citation(spans[group_index][0])
+            if path in targeted_paths:
+                bindings[path].extend(anchors)
+
+        index = lookahead
+
+    return dict(bindings)
+
+
+def anchor_matches_content(anchor: str, content: str, ignored_tokens: set[str]) -> bool:
+    if anchor in content:
+        return True
+    for token in IDENT_RE.findall(anchor):
+        if token in ignored_tokens or len(token) < 3:
+            continue
+        if token in content:
+            return True
+    return False
+
+
+def validate_targeted_symbol_anchors(
+    lines: list[str],
+    *,
+    targeted_paths: set[str] = TARGETED_LOCAL_CITATIONS,
+    repo_root: Path | None = None,
+) -> None:
+    contents = load_targeted_contents(targeted_paths, repo_root=repo_root)
     ignored_tokens = {
         "ABI",
         "C",
@@ -179,38 +327,21 @@ def validate_targeted_symbol_anchors(lines: list[str]) -> None:
         cells = [cell.strip() for cell in line.split("|")[1:-1]]
         row_id = cells[0]
         for cell in cells[1:]:
-            spans = [match.group(1) for match in CODE_SPAN_RE.finditer(cell)]
-            target_refs = [span for span in spans if span in TARGETED_LOCAL_CITATIONS]
-            if not target_refs:
+            path_anchor_bindings = extract_path_anchor_bindings(cell, targeted_paths)
+            if not path_anchor_bindings:
                 continue
-            anchors = [
-                span
-                for span in spans
-                if span not in TARGETED_LOCAL_CITATIONS and not span.startswith("SB-") and span not in {"n/a", "—"}
-            ]
-            if "main()" in cell and "main()" not in anchors:
-                anchors.append("main()")
-            if "test_v1_initializers()" in cell and "test_v1_initializers()" not in anchors:
-                anchors.append("test_v1_initializers()")
-            if "static_assert" in cell and "static_assert" not in anchors:
-                anchors.append("static_assert")
-
-            for ref in target_refs:
+            for ref, anchors in path_anchor_bindings.items():
+                require(anchors, f"{row_id} cites {ref} without an adjacent local symbol/test anchor")
                 content = contents[ref]
-                found = False
-                for anchor in anchors:
-                    if anchor in content:
-                        found = True
-                        break
-                    for token in IDENT_RE.findall(anchor):
-                        if token in ignored_tokens or len(token) < 3:
-                            continue
-                        if token in content:
-                            found = True
-                            break
-                    if found:
-                        break
-                require(found, f"{row_id} cites {ref} without a matching local symbol/test anchor")
+                missing = [
+                    anchor
+                    for anchor in anchors
+                    if not anchor_matches_content(anchor, content, ignored_tokens)
+                ]
+                require(
+                    not missing,
+                    f"{row_id} cites {ref} with stale adjacent anchors: {', '.join(missing)}",
+                )
 
 
 def main() -> None:
