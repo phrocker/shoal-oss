@@ -185,8 +185,8 @@ EXPECTED_METADATA_FIELDS = {
     "Sharkbite release line": "`sharkbite` 1.2.0.3 on PyPI (`setup.py:34-35`)",
     "Shoal reference": (
         "`phrocker/shoal-oss` exact audited baseline for revision 17 "
-        "`d14542487e7a74338afdee4b981d60b75e0d3b6f` "
-        "(\"capi: preserve default namespace identity\")"
+        "`43db8ec229f829e7480168c4ed158532205031e7` "
+        "(\"capi: reject missing namespace targets\")"
     ),
     "Shoal C ABI version": "`SHOAL_ABI_VERSION 1u` (`capi/include/shoal_types.h`)",
 }
