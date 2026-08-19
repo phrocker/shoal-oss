@@ -502,14 +502,14 @@ type multiSession struct {
 
 func (m *multiSession) fetch(ctx context.Context) ([]KeyValue, bool, error) {
 	var result *data.MultiScanResult_
+	startErr := m.startErr
 	if !m.started {
 		m.started = true
 		result = m.initial
 		m.initial = nil
-		if m.startErr != nil {
-			return nil, false, m.startErr
-		}
+		m.startErr = nil
 	} else {
+		startErr = nil
 		var err error
 		result, err = m.multi.ContinueMulti(ctx, m.address, m.scanID, 0)
 		if err != nil {
@@ -517,11 +517,11 @@ func (m *multiSession) fetch(ctx context.Context) ([]KeyValue, bool, error) {
 		}
 	}
 	if result == nil {
-		return nil, false, nil
+		return nil, false, startErr
 	}
 	entries, appendErr := appendKeyValues(nil, result.Results)
-	if appendErr != nil {
-		return entries, false, appendErr
+	if err := errors.Join(startErr, appendErr); err != nil {
+		return entries, false, err
 	}
 	m.failures = appendScanBatch(m.failures, result.Failures)
 	if !result.More && result.PartScan != nil {

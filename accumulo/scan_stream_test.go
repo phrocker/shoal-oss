@@ -663,6 +663,73 @@ func TestStreamConcurrentCloseAndIterationIsRaceFree(t *testing.T) {
 	}
 }
 
+func TestStreamDeliversInitialEntriesBeforeAStartFailure(t *testing.T) {
+	connector := streamTestConnector(t)
+	failure := errors.New("partial start")
+	adapter := &fakeScannerAdapter{
+		startResults: []*data.InitialScan{{
+			ScanID:  81,
+			Result_: &data.ScanResult_{Results: []*data.TKeyValue{testEntry("a", "one")}, More: true},
+		}},
+		startErrors: []error{failure},
+	}
+	connector.scan = adapter
+	scanner, err := connector.NewScanner(Table{Name: "events"}, ScannerOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	scanRange, _ := NewRange([]byte("a"), true, []byte("c"), true)
+	stream, err := scanner.Stream(context.Background(), scanRange)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = stream.Close() }()
+	if got := rowsOf(drainStream(t, stream)); got != "a" {
+		t.Fatalf("rows = %q", got)
+	}
+	if !errors.Is(stream.Err(), failure) {
+		t.Fatalf("Err = %v", stream.Err())
+	}
+	if adapter.closeCalls != 1 {
+		t.Fatalf("close called %d times", adapter.closeCalls)
+	}
+}
+
+func TestBatchScannerStreamDeliversMultiScanEntriesBeforeAStartFailure(t *testing.T) {
+	connector := streamTestConnector(t)
+	failure := errors.New("partial multi start")
+	adapter := &fakeScannerAdapter{
+		multiStartResults: []*data.InitialMultiScan{{
+			ScanID: 91,
+			Result_: &data.MultiScanResult_{
+				Results: []*data.TKeyValue{testEntry("a", "one")},
+				More:    true,
+			},
+		}},
+		multiStartErrors: []error{failure},
+	}
+	connector.scan = adapter
+	batch, err := connector.NewBatchScanner(Table{Name: "events"}, ScannerOptions{UseMultiScan: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	scanRange, _ := NewRange([]byte("a"), true, []byte("c"), true)
+	stream, err := batch.Stream(context.Background(), []*Range{scanRange})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = stream.Close() }()
+	if got := rowsOf(drainStream(t, stream)); got != "a" {
+		t.Fatalf("rows = %q", got)
+	}
+	if !errors.Is(stream.Err(), failure) {
+		t.Fatalf("Err = %v", stream.Err())
+	}
+	if adapter.multiCloseCalls != 1 {
+		t.Fatalf("multi close called %d times", adapter.multiCloseCalls)
+	}
+}
+
 type singleOnlyScanAdapter struct{}
 
 func (singleOnlyScanAdapter) Start(
