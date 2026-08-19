@@ -2066,6 +2066,81 @@ func TestStaleReleaseStillTakesBackItsOwnNode(t *testing.T) {
 	}
 }
 
+// TestReleaseAfterACancelledAcquisitionLeavesTheGenerationThatReplacedItAlone
+// closes the same fence on an acquisition that never reached the directory. A
+// cancelled Acquire returns before it creates anything, and a caller that
+// treats Release as its shutdown path calls it anyway; if that release still
+// counted as the live participant it would sweep the prefix, and a rejoin is
+// free to be using it.
+func TestReleaseAfterACancelledAcquisitionLeavesTheGenerationThatReplacedItAlone(t *testing.T) {
+	f := newFakeZK()
+	old := newTestLock(t, f, serverUUID)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := old.Acquire(ctx, testLockData(t)); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Acquire: want context.Canceled, got %v", err)
+	}
+	if nodes := f.lockNodes(testLockPath()); len(nodes) != 0 {
+		t.Fatalf("the cancelled acquisition created %v, so it is not the path this test means to cover", nodes)
+	}
+
+	rejoined := newTestLock(t, f, serverUUID)
+	id, err := rejoined.Acquire(context.Background(), testLockData(t))
+	if err != nil {
+		t.Fatalf("rejoin: %v", err)
+	}
+	newPath := path.Join(testLockPath(), rejoined.Node())
+
+	if err := old.Release(); err != nil {
+		t.Fatalf("Release of the cancelled acquisition: %v", err)
+	}
+
+	if !f.exists(newPath) {
+		t.Fatalf("%s was swept by the release of an acquisition that never created a node", newPath)
+	}
+	held, ok := rejoined.LockID()
+	if !ok || held != id {
+		t.Fatalf("LockID() = %s, %t, want the generation that rejoined (%s)", held, ok, id)
+	}
+}
+
+// TestReleaseAfterAFailedDirectorySetupLeavesTheGenerationThatReplacedItAlone
+// is the same fence on the other pre-node exit. A directory this process
+// cannot create is the ordinary shape of a session that has not been given the
+// instance secret yet, and retrying it is what a server does; the attempt that
+// failed must not be able to sweep the one that succeeded.
+func TestReleaseAfterAFailedDirectorySetupLeavesTheGenerationThatReplacedItAlone(t *testing.T) {
+	f := newFakeZK()
+	old := newTestLock(t, f, serverUUID)
+	f.failCreate(path.Join(testInstancePath, "tservers"), gozk.ErrNoAuth)
+	if _, err := old.Acquire(context.Background(), testLockData(t)); !errors.Is(err, gozk.ErrNoAuth) {
+		t.Fatalf("Acquire: want the ZooKeeper error, got %v", err)
+	}
+	f.failCreate(path.Join(testInstancePath, "tservers"), nil)
+
+	rejoined := newTestLock(t, f, serverUUID)
+	id, err := rejoined.Acquire(context.Background(), testLockData(t))
+	if err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+	newPath := path.Join(testLockPath(), rejoined.Node())
+
+	if err := old.Release(); err != nil {
+		t.Fatalf("Release of the failed attempt: %v", err)
+	}
+
+	if !f.exists(newPath) {
+		t.Fatalf("%s was swept by the release of an attempt that never reached the lock directory", newPath)
+	}
+	if err := rejoined.Verify(); err != nil {
+		t.Fatalf("Verify after the failed attempt was released: %v", err)
+	}
+	held, ok := rejoined.LockID()
+	if !ok || held != id {
+		t.Fatalf("LockID() = %s, %t, want the generation that retried (%s)", held, ok, id)
+	}
+}
+
 // TestAcquireFailsWhenADuplicateCannotBeDropped is the other half of that
 // story, at the moment acquisition finds the duplicates. Reporting success
 // with one still standing would leave this session holding two places in line

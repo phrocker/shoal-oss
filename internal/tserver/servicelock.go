@@ -549,15 +549,25 @@ func (l *ServiceLock) Acquire(ctx context.Context, data ServiceLockData) (LockID
 	l.mu.Unlock()
 
 	if err := ctx.Err(); err != nil {
+		// Nothing was created, so there is nothing to sweep — but this
+		// ServiceLock has to stop looking live, or a Release that follows
+		// would sweep the prefix, and by then the caller may have rejoined
+		// under it. See sweep.
+		l.notLive()
 		return LockID{}, err
 	}
 	if err := l.ensureLockDirectory(); err != nil {
+		l.notLive()
 		return LockID{}, err
 	}
 	if err := l.createNode(payload); err != nil {
 		if errors.Is(err, ErrLockReleased) {
 			// Released before anything was created: there is nothing to clean
-			// up and nothing to wait for.
+			// up and nothing to wait for. Release already recorded that this
+			// ServiceLock is no longer live; saying so again keeps that true
+			// of every failing return here rather than of another method's
+			// field order.
+			l.notLive()
 			return LockID{}, err
 		}
 		// The create may have taken effect even though the answer was lost,
@@ -630,13 +640,25 @@ func (l *ServiceLock) claimedNodes() []string {
 // a later ServiceLock is built only after this call returns.
 func (l *ServiceLock) withCleanup(failure error) error {
 	orphan := l.sweep(true)
-	l.mu.Lock()
-	l.live = false
-	l.mu.Unlock()
+	l.notLive()
 	if orphan == nil {
 		return failure
 	}
 	return errors.Join(failure, fmt.Errorf("%w in %s: %w", ErrLockNodeOrphaned, l.dir, orphan))
+}
+
+// notLive records that this ServiceLock is no longer the process's
+// participant in the lock directory, without ending a generation.
+//
+// Every path that leaves Acquire without a held lock goes through here, so
+// what a later Release is allowed to sweep does not depend on how far the
+// acquisition got. An acquisition that failed before creating anything has
+// nothing to sweep, but one still looking live would have its prefix swept —
+// and the prefix is shared with whatever the caller rejoined as. See sweep.
+func (l *ServiceLock) notLive() {
+	l.mu.Lock()
+	l.live = false
+	l.mu.Unlock()
 }
 
 // isReleased reports whether Release has already been called.

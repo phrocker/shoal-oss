@@ -371,6 +371,14 @@ directory can find it. Afterwards the sweep takes back what the lock
 recorded as its own, which is every node it created or adopted, and
 cannot include one it never made.
 
+Every way out of acquisition without a lock closes that window, not
+only the ones that created something. A cancellation caught before the
+first create, and a lock directory this session is not yet allowed to
+make, both leave nothing to sweep — but a caller whose shutdown path is
+`Release` calls it regardless, and a server that could not create the
+directory is a server that will retry. The attempt that failed must not
+be able to sweep the one that worked.
+
 ### What the node says
 
 The payload is `ServiceLockData` in the exact Gson wire form the manager
