@@ -701,24 +701,24 @@ func (l *ServiceLock) queueForOwnership(ctx context.Context) (LockID, error) {
 			return LockID{}, fmt.Errorf("list lock nodes in %s: %w", l.dir, err)
 		}
 		sorted := sortLockNodes(children)
+		// Every node carrying this prefix right now is this acquisition's: it
+		// is in flight, so no later ServiceLock can have created anything yet.
+		// Recorded on every pass, not only the first, so a node that appears
+		// under the prefix while this one waits is swept with the rest rather
+		// than left behind by a cleanup that only knows what it created.
+		ours := l.ownNodes(sorted)
+		l.claim(ours...)
 		if node == "" {
 			// First pass: a create whose response was lost may have been
 			// retried, leaving several nodes with this process's prefix. Keep
 			// the one that entered the queue first and drop the rest, so this
 			// process occupies one place in line. Mirrors ServiceLock.lock.
-			ours := l.ownNodes(sorted)
 			if len(ours) == 0 {
 				return LockID{}, fmt.Errorf("%w: nothing with prefix %s in %s",
 					ErrLockNodeMissing, l.nodePrefix(), l.dir)
 			}
 			node = ours[0]
 			duplicates := ours[1:]
-			// Everything carrying this prefix now is this acquisition's: it is
-			// in flight, so no later ServiceLock can have created anything yet.
-			// Claiming them here is what lets the cleanup sweep a node this
-			// process created under a name it never learned, and what stops it
-			// from sweeping a node it never made.
-			l.claim(ours...)
 			// A duplicate that cannot be dropped fails the acquisition. It is
 			// this session's node, so it lives as long as the session, holding
 			// a second place in line that no ServiceLock maintains: once the
@@ -1053,6 +1053,12 @@ func (l *ServiceLock) Verify() error {
 		return l.lose(LossUnmonitorable, fmt.Errorf("list lock nodes in %s: %w", l.dir, err))
 	}
 	sorted := sortLockNodes(children)
+	// This lock is still the live participant for its prefix, so every node
+	// carrying it is this one's. Recording them here keeps the cleanup's list
+	// complete for the whole life of the generation rather than only as it was
+	// at acquisition: a node that turns up under the prefix afterwards would
+	// otherwise outlive the release and become the holder the manager reads.
+	l.claim(l.ownNodes(sorted)...)
 	if indexOfNode(sorted, node) < 0 {
 		return l.lose(LossNodeDeleted, nil)
 	}
@@ -1202,6 +1208,22 @@ func (l *ServiceLock) ownNodes(sorted []string) []string {
 // the generation that replaced it, revoking a lock the manager had just seen
 // taken. So a finished ServiceLock sweeps only the nodes it recorded as its
 // own, which cannot include one it never made.
+//
+// That list is kept complete rather than assumed complete. Every listing this
+// lock makes while it is the live participant — each pass of the queue, and
+// each Verify — records what carries the prefix, so a node this lock never
+// created but is nonetheless responsible for is swept with the rest. It has to
+// be: an ephemeral left under the prefix outlives the generation, and once the
+// adopted node goes it becomes the lowest in the directory and so the holder
+// the manager reads, a server that looks live and maintains nothing.
+//
+// go-zookeeper cannot produce one behind those listings. It does not replay
+// requests across a reconnect — flushRequests fails every pending one and only
+// auth is resent — so a create either returns the node it made or an error,
+// and the error aborts the acquisition into a sweep taken while this lock is
+// still live. One that arrives by some other means is collapsed by the next
+// acquisition under the same prefix, which drops every duplicate it finds, and
+// removed outright when the session ends.
 //
 // A failure is reported rather than swallowed. An abandoned ephemeral node
 // keeps its sequence, and so its place in line, for as long as the session

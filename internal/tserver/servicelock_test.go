@@ -1929,7 +1929,10 @@ func TestReleaseSweepsEveryNodeThisProcessCreated(t *testing.T) {
 		t.Fatalf("Acquire: %v", err)
 	}
 
-	// The late retry, landing behind the node this process adopted.
+	// A node under this process's prefix that it did not adopt. go-zookeeper
+	// cannot produce one this late — it fails pending requests on a reconnect
+	// rather than replaying them — but the sweep must be complete whatever
+	// left it there, because the session keeps it and its place in line.
 	duplicate := f.seedForeignLock(testLockPath(), serverUUID, 7)
 	if !f.exists(path.Join(testLockPath(), duplicate)) {
 		t.Fatal("the duplicate must exist for this test to mean anything")
@@ -2063,6 +2066,70 @@ func TestStaleReleaseStillTakesBackItsOwnNode(t *testing.T) {
 	}
 	if f.exists(oldPath) {
 		t.Fatalf("%s outlived the release of the generation that created it", oldPath)
+	}
+}
+
+// TestReleaseAfterALossSweepsANodeItDidNotCreate is the completeness the
+// scoped sweep has to keep. A generation can end with the session still alive
+// — a transient read that fails closed, a node an operator removed — and
+// anything left under this prefix survives with it. Once the adopted node goes
+// that leftover is the lowest in the directory, so the manager reads it as the
+// server's lock while no ServiceLock maintains it. The cleanup therefore
+// tracks what carries the prefix for as long as it is the live participant,
+// rather than only what it created.
+func TestReleaseAfterALossSweepsANodeItDidNotCreate(t *testing.T) {
+	f := newFakeZK()
+	lock := newTestLock(t, f, serverUUID)
+	if _, err := lock.Acquire(context.Background(), testLockData(t)); err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	held := path.Join(testLockPath(), lock.Node())
+	stray := f.seedForeignLock(testLockPath(), serverUUID, 9)
+	strayPath := path.Join(testLockPath(), stray)
+	if err := lock.Verify(); err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+
+	// The generation ends while the session, and so the stray node, lives on.
+	lost := make(chan error, 1)
+	go func() { lost <- lock.Maintain(context.Background()) }()
+	waitArmed(t, f, held)
+	if err := f.Delete(held, -1); err != nil {
+		t.Fatalf("delete the lock node: %v", err)
+	}
+	if err := <-lost; !errors.Is(err, ErrLockLost) {
+		t.Fatalf("Maintain: want ErrLockLost, got %v", err)
+	}
+	if !f.exists(strayPath) {
+		t.Fatal("the stray node has to survive the loss for this test to mean anything")
+	}
+
+	if err := lock.Release(); err != nil {
+		t.Fatalf("Release: %v", err)
+	}
+	if f.exists(strayPath) {
+		t.Fatalf("%s outlived the release and is now the holder the manager reads", strayPath)
+	}
+}
+
+// TestAcquireCollapsesANodeLeftUnderItsPrefix is the recovery for one that got
+// past every listing anyway. The next acquisition under the same prefix drops
+// what it does not adopt, so a leftover cannot go on being the holder once
+// something tries to take the lock again.
+func TestAcquireCollapsesANodeLeftUnderItsPrefix(t *testing.T) {
+	f := newFakeZK()
+	stray := f.seedForeignLock(testLockPath(), serverUUID, 3)
+	strayPath := path.Join(testLockPath(), stray)
+
+	lock := newTestLock(t, f, serverUUID)
+	if _, err := lock.Acquire(context.Background(), testLockData(t)); err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	if f.exists(strayPath) && path.Join(testLockPath(), lock.Node()) != strayPath {
+		t.Fatalf("%s survived an acquisition under its own prefix", strayPath)
+	}
+	if err := lock.Verify(); err != nil {
+		t.Fatalf("Verify: %v", err)
 	}
 }
 

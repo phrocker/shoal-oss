@@ -379,6 +379,24 @@ make, both leave nothing to sweep — but a caller whose shutdown path is
 directory is a server that will retry. The attempt that failed must not
 be able to sweep the one that worked.
 
+The recorded list is kept complete rather than assumed complete. Every
+listing the lock makes while it is the live participant — each pass of
+the queue, and each `Verify` — records what carries the prefix, so a
+node it never created but is nonetheless responsible for is swept with
+the rest. It has to be. A generation can end with the session still
+alive: a read that fails closed, or a node an operator removed. Whatever
+is left under the prefix survives that, and once the adopted node goes
+it is the lowest in the directory and so the holder the manager reads —
+the same server-that-maintains-nothing this file refuses everywhere else.
+
+The client cannot leave one behind those listings. go-zookeeper does not
+replay requests across a reconnect; it fails every pending one and
+resends only auth. So a create either returns the node it made or an
+error, and the error ends the acquisition through a sweep taken while
+the lock is still live. One that arrives some other way is collapsed by
+the next acquisition under the same prefix, which drops every duplicate
+it finds, and goes with the session.
+
 ### What the node says
 
 The payload is `ServiceLockData` in the exact Gson wire form the manager
