@@ -33,6 +33,23 @@ def load_fixture_lines(name: str) -> list[str]:
     return (FIXTURE_DIR / name).read_text(encoding="utf-8").splitlines()
 
 
+def load_document_text() -> str:
+    return validator.DOC_PATH.read_text(encoding="utf-8")
+
+
+def replace_once(text: str, old: str, new: str) -> str:
+    if text.count(old) != 1:
+        raise AssertionError(f"expected exactly one occurrence of {old!r}")
+    return text.replace(old, new, 1)
+
+
+def replace_line(lines: list[str], old: str, new: str) -> None:
+    matches = [index for index, line in enumerate(lines) if line == old]
+    if len(matches) != 1:
+        raise AssertionError(f"expected exactly one matching line for {old!r}")
+    lines[matches[0]] = new
+
+
 def fixture_evidence_cell(name: str) -> str:
     for line in load_fixture_lines(name):
         if line.startswith("| SB-"):
@@ -125,21 +142,38 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
         )
 
     def test_parse_markdown_table_reads_rows_after_heading(self) -> None:
-        headers, rows = validator.parse_markdown_table(
-            [
-                "## Example heading",
-                "",
-                "| Field | Value |",
-                "| --- | --- |",
-                "| Alpha | Beta |",
-                "| Gamma | Delta |",
-                "",
-                "after",
-            ],
-            "## Example heading",
-        )
+        headers, rows = validator.parse_markdown_table(load_fixture_lines("table_separator_ok.md"), "## Example heading")
         self.assertEqual(headers, ["Field", "Value"])
         self.assertEqual(rows, [["Alpha", "Beta"], ["Gamma", "Delta"]])
+
+    def test_parse_markdown_table_requires_immediate_separator(self) -> None:
+        self.assert_validation_fails(
+            lambda: validator.parse_markdown_table(
+                load_fixture_lines("table_separator_missing.md"),
+                "## Example heading",
+            ),
+            "missing separator row after header under ## Example heading",
+        )
+
+    def test_parse_markdown_table_rejects_malformed_separator(self) -> None:
+        self.assert_validation_fails(
+            lambda: validator.parse_markdown_table(
+                load_fixture_lines("table_separator_malformed.md"),
+                "## Example heading",
+            ),
+            "malformed separator row under ## Example heading",
+            "| nope | --- |",
+        )
+
+    def test_parse_markdown_table_rejects_wrong_width_separator(self) -> None:
+        self.assert_validation_fails(
+            lambda: validator.parse_markdown_table(
+                load_fixture_lines("table_separator_wrong_width.md"),
+                "## Example heading",
+            ),
+            "malformed separator row under ## Example heading",
+            "expected 2 cells, found 3",
+        )
 
     def test_parse_rows_metadata_extracts_total_and_required_counts(self) -> None:
         self.assertEqual(
@@ -147,26 +181,41 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
             (3203, 2811),
         )
 
+    def test_parse_count_accepts_supported_plain_and_bold_integer_formats(self) -> None:
+        self.assertEqual(validator.parse_count("0"), 0)
+        self.assertEqual(validator.parse_count("3203"), 3203)
+        self.assertEqual(validator.parse_count("3,203"), 3203)
+        self.assertEqual(validator.parse_count("**3,203**"), 3203)
+
+    def test_parse_count_rejects_unsupported_integer_formats(self) -> None:
+        for cell in ("24x47", "-1", "2,44,7", "161.0", "392 rows"):
+            with self.subTest(cell=cell):
+                self.assert_validation_fails(
+                    lambda value=cell: validator.parse_count(value),
+                    f"unsupported count format: {cell!r}",
+                )
+
     def test_parse_status_summary_reads_declared_totals(self) -> None:
-        declared_counts, total = validator.parse_status_summary(
-            [
-                "### 25.1 By status",
-                "",
-                "| Status | Rows |",
-                "| --- | --- |",
-                "| Covered | 0 |",
-                "| Missing Go | 2447 |",
-                "| Missing C ABI | 116 |",
-                "| Behavior mismatch | 161 |",
-                "| Intentional divergence (approval required) | 87 |",
-                "| Not required (rationale required) | 392 |",
-                "| **Total** | **3203** |",
-            ]
-        )
+        declared_counts, total = validator.parse_status_summary(load_fixture_lines("status_summary_valid.md"))
         self.assertEqual(total, 3203)
         self.assertEqual(declared_counts["Covered"], 0)
         self.assertEqual(declared_counts["Missing Go"], 2447)
         self.assertEqual(declared_counts["Not required (rationale required)"], 392)
+
+    def test_parse_status_summary_rejects_unsupported_count_cells(self) -> None:
+        for fixture_name, expected_cell in (
+            ("status_summary_invalid_alphanumeric.md", "'24x47'"),
+            ("status_summary_invalid_negative.md", "'-1'"),
+            ("status_summary_invalid_bad_commas.md", "'2,44,7'"),
+            ("status_summary_invalid_decimal.md", "'161.0'"),
+            ("status_summary_invalid_extra_text.md", "'392 rows'"),
+        ):
+            with self.subTest(fixture_name=fixture_name):
+                self.assert_validation_fails(
+                    lambda name=fixture_name: validator.parse_status_summary(load_fixture_lines(name)),
+                    "unsupported count format",
+                    expected_cell,
+                )
 
     def test_parse_category_summary_reads_prefix_rows_and_totals(self) -> None:
         (
@@ -190,6 +239,65 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
         self.assertEqual(
             declared_total_status_counts["Intentional divergence (approval required)"],
             1,
+        )
+
+    def test_validate_revision_16_inventory_rejects_row_deletion_even_if_counts_are_rewritten(self) -> None:
+        full_text = load_document_text()
+        lines = full_text.splitlines()
+        removed = False
+        rewritten_lines: list[str] = []
+        for line in lines:
+            if not removed and line.startswith("| SB-PKG-001 |"):
+                removed = True
+                continue
+            rewritten_lines.append(line)
+        self.assertTrue(removed, "expected to remove SB-PKG-001 from the audited document")
+
+        replace_line(
+            rewritten_lines,
+            "| Rows | 3203 (2811 required by the [§2.2](#sec-2) release gate) |",
+            "| Rows | 3202 (2810 required by the [§2.2](#sec-2) release gate) |",
+        )
+        replace_line(
+            rewritten_lines,
+            "| Missing C ABI | 116 |",
+            "| Missing C ABI | 115 |",
+        )
+        replace_line(
+            rewritten_lines,
+            "| **Total** | **3203** |",
+            "| **Total** | **3202** |",
+        )
+        replace_line(
+            rewritten_lines,
+            "| [§5](#sec-5) Packaging and imports | `SB-PKG` | 14 | 0 | 0 | 10 | 1 | 1 | 2 |",
+            "| [§5](#sec-5) Packaging and imports | `SB-PKG` | 13 | 0 | 0 | 9 | 1 | 1 | 2 |",
+        )
+        replace_line(
+            rewritten_lines,
+            "| **Total** | | **3203** | **0** | **2447** | **116** | **161** | **87** | **392** |",
+            "| **Total** | | **3202** | **0** | **2447** | **115** | **161** | **87** | **392** |",
+        )
+        rewritten_text = "\n".join(rewritten_lines)
+        rewritten_text = replace_once(
+            rewritten_text,
+            "2811 of 3203 rows,",
+            "2810 of 3202 rows,",
+        )
+        rewritten_text = replace_once(
+            rewritten_text,
+            "2811 rows are **required** by the final release gate ([§2.2](#sec-2));",
+            "2810 rows are **required** by the final release gate ([§2.2](#sec-2));",
+        )
+        rewritten_text = replace_once(
+            rewritten_text,
+            "`Missing C ABI` (116)",
+            "`Missing C ABI` (115)",
+        )
+
+        self.assert_validation_fails(
+            lambda: validator.validate_counts(rewritten_text.splitlines(), rewritten_text),
+            "revision 16 inventory expects 3203 rows, found 3202",
         )
 
     def test_validate_targeted_symbol_anchors_rejects_cross_file_anchor_leakage(self) -> None:

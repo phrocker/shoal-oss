@@ -21,6 +21,148 @@ STATUSES = {
 
 NOT_REQUIRED_STATUS = "Not required (rationale required)"
 INTENTIONAL_DIVERGENCE_STATUS = "Intentional divergence (approval required)"
+EXPECTED_TOTAL_ROWS = 3203
+EXPECTED_REQUIRED_ROWS = 2811
+
+
+def status_count_map(
+    *,
+    covered: int = 0,
+    missing_go: int = 0,
+    missing_c_abi: int = 0,
+    behavior_mismatch: int = 0,
+    intentional_divergence: int = 0,
+    not_required: int = 0,
+) -> dict[str, int]:
+    return {
+        "Covered": covered,
+        "Missing Go": missing_go,
+        "Missing C ABI": missing_c_abi,
+        "Behavior mismatch": behavior_mismatch,
+        "Intentional divergence (approval required)": intentional_divergence,
+        "Not required (rationale required)": not_required,
+    }
+
+
+EXPECTED_STATUS_COUNTS = {
+    "Covered": 0,
+    "Missing Go": 2447,
+    "Missing C ABI": 116,
+    "Behavior mismatch": 161,
+    "Intentional divergence (approval required)": 87,
+    "Not required (rationale required)": 392,
+}
+
+EXPECTED_PREFIX_COUNTS = {
+    "SB-BASE": status_count_map(missing_c_abi=18, not_required=2),
+    "SB-CFG": status_count_map(
+        missing_go=11,
+        missing_c_abi=8,
+        behavior_mismatch=9,
+        intentional_divergence=2,
+        not_required=6,
+    ),
+    "SB-CONN": status_count_map(
+        missing_go=3,
+        missing_c_abi=2,
+        behavior_mismatch=7,
+        intentional_divergence=1,
+    ),
+    "SB-CPP": status_count_map(
+        missing_go=11,
+        missing_c_abi=4,
+        behavior_mismatch=47,
+        not_required=8,
+    ),
+    "SB-CXX": status_count_map(
+        missing_go=2307,
+        behavior_mismatch=15,
+        not_required=304,
+    ),
+    "SB-DATA": status_count_map(
+        missing_go=15,
+        missing_c_abi=15,
+        behavior_mismatch=39,
+        not_required=6,
+    ),
+    "SB-EMB": status_count_map(not_required=35),
+    "SB-ERR": status_count_map(
+        missing_go=2,
+        missing_c_abi=5,
+        behavior_mismatch=5,
+        intentional_divergence=1,
+        not_required=3,
+    ),
+    "SB-HDFS": status_count_map(missing_go=26),
+    "SB-LOG": status_count_map(missing_go=2, behavior_mismatch=1),
+    "SB-NS": status_count_map(missing_go=7, behavior_mismatch=1),
+    "SB-PANDA": status_count_map(missing_c_abi=20, not_required=1),
+    "SB-PKG": status_count_map(
+        missing_c_abi=10,
+        behavior_mismatch=1,
+        intentional_divergence=1,
+        not_required=2,
+    ),
+    "SB-RFILE": status_count_map(
+        missing_go=32,
+        behavior_mismatch=1,
+        not_required=3,
+    ),
+    "SB-SCAN": status_count_map(
+        missing_go=8,
+        missing_c_abi=4,
+        behavior_mismatch=11,
+        not_required=5,
+    ),
+    "SB-SEC": status_count_map(missing_go=17, behavior_mismatch=1, not_required=1),
+    "SB-STAT": status_count_map(
+        missing_go=1,
+        intentional_divergence=82,
+        not_required=1,
+    ),
+    "SB-TABLE": status_count_map(
+        missing_go=3,
+        missing_c_abi=11,
+        behavior_mismatch=2,
+        not_required=6,
+    ),
+    "SB-TORCH": status_count_map(missing_c_abi=9),
+    "SB-WRITE": status_count_map(
+        missing_go=1,
+        missing_c_abi=6,
+        behavior_mismatch=7,
+        not_required=9,
+    ),
+    "SB-XCUT": status_count_map(
+        missing_go=1,
+        missing_c_abi=4,
+        behavior_mismatch=14,
+    ),
+}
+
+EXPECTED_PREFIX_TOTALS = {
+    "SB-BASE": 20,
+    "SB-CFG": 36,
+    "SB-CONN": 13,
+    "SB-CPP": 70,
+    "SB-CXX": 2626,
+    "SB-DATA": 75,
+    "SB-EMB": 35,
+    "SB-ERR": 16,
+    "SB-HDFS": 26,
+    "SB-LOG": 3,
+    "SB-NS": 8,
+    "SB-PANDA": 21,
+    "SB-PKG": 14,
+    "SB-RFILE": 36,
+    "SB-SCAN": 28,
+    "SB-SEC": 19,
+    "SB-STAT": 84,
+    "SB-TABLE": 22,
+    "SB-TORCH": 9,
+    "SB-WRITE": 23,
+    "SB-XCUT": 19,
+}
 
 EXPECTED_METADATA_FIELDS = {
     "Tracking issue": (
@@ -78,6 +220,9 @@ OPTIONAL_ANCHOR_CITATIONS = {
 }
 STRICT_ANCHOR_CITATIONS = TARGETED_LOCAL_CITATIONS - OPTIONAL_ANCHOR_CITATIONS
 
+COUNT_RE = re.compile(
+    r"^(?P<bold>\*\*)?(?P<number>0|[1-9]\d*|[1-9]\d{0,2}(?:,\d{3})+)(?(bold)\*\*|)$"
+)
 CODE_SPAN_RE = re.compile(r"`([^`]+)`")
 IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 ANCHOR_PART_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*|\.{3}|\s+|.")
@@ -196,8 +341,26 @@ def parse_markdown_table(lines: list[str], heading: str) -> tuple[list[str], lis
     require(line_index < len(lines), f"missing markdown table after {heading}")
 
     header_cells = split_matrix_cells(lines[line_index])
+    separator_index = line_index + 1
+    require(
+        separator_index < len(lines) and lines[separator_index].startswith("|"),
+        f"missing separator row after header under {heading}",
+    )
+    separator_cells = split_matrix_cells(lines[separator_index])
+    require(
+        len(separator_cells) == len(header_cells),
+        (
+            f"malformed separator row under {heading}: expected {len(header_cells)} cells, "
+            f"found {len(separator_cells)}"
+        ),
+    )
+    require(
+        is_markdown_separator_row(separator_cells),
+        f"malformed separator row under {heading}: {lines[separator_index]}",
+    )
+
     rows: list[list[str]] = []
-    line_index += 1
+    line_index = separator_index + 1
     while line_index < len(lines) and lines[line_index].startswith("|"):
         cells = split_matrix_cells(lines[line_index])
         if is_markdown_separator_row(cells):
@@ -226,9 +389,10 @@ def parse_metadata(lines: list[str]) -> dict[str, str]:
 
 
 def parse_count(cell: str) -> int:
-    digits = re.sub(r"[^0-9]", "", cell)
-    require(bool(digits), f"expected integer count cell, found {cell!r}")
-    return int(digits)
+    value = cell.strip()
+    match = COUNT_RE.fullmatch(value)
+    require(match is not None, f"unsupported count format: {cell!r}")
+    return int(match.group("number").replace(",", ""))
 
 
 def strip_backticks(cell: str) -> str:
@@ -384,6 +548,55 @@ def parse_rows(lines: list[str]) -> tuple[Counter[str], dict[str, Counter[str]],
     return status_counts, prefix_counts, set(accepted_row_ids)
 
 
+def validate_revision_16_inventory(
+    status_counts: Counter[str],
+    prefix_counts: dict[str, Counter[str]],
+) -> None:
+    total_rows = sum(status_counts.values())
+    require(
+        total_rows == EXPECTED_TOTAL_ROWS,
+        f"revision 16 inventory expects {EXPECTED_TOTAL_ROWS} rows, found {total_rows}",
+    )
+    required_rows = total_rows - status_counts[NOT_REQUIRED_STATUS]
+    require(
+        required_rows == EXPECTED_REQUIRED_ROWS,
+        (
+            f"revision 16 inventory expects {EXPECTED_REQUIRED_ROWS} required rows, "
+            f"found {required_rows}"
+        ),
+    )
+
+    for status, expected in EXPECTED_STATUS_COUNTS.items():
+        actual = status_counts[status]
+        require(
+            actual == expected,
+            f"revision 16 inventory expects {expected} rows for {status}, found {actual}",
+        )
+
+    require(
+        set(prefix_counts) == set(EXPECTED_PREFIX_COUNTS),
+        (
+            "revision 16 inventory prefixes do not match: "
+            f"{sorted(prefix_counts)} vs {sorted(EXPECTED_PREFIX_COUNTS)}"
+        ),
+    )
+    for prefix, expected_counts in EXPECTED_PREFIX_COUNTS.items():
+        actual_total = sum(prefix_counts[prefix].values())
+        require(
+            actual_total == EXPECTED_PREFIX_TOTALS[prefix],
+            (
+                f"revision 16 inventory expects {EXPECTED_PREFIX_TOTALS[prefix]} rows for {prefix}, "
+                f"found {actual_total}"
+            ),
+        )
+        for status, expected in expected_counts.items():
+            actual = prefix_counts[prefix][status]
+            require(
+                actual == expected,
+                f"revision 16 inventory expects {expected} rows for {prefix} / {status}, found {actual}",
+            )
+
+
 def validate_counts(lines: list[str], full_text: str) -> None:
     metadata = parse_metadata(lines)
     for field, expected_value in EXPECTED_METADATA_FIELDS.items():
@@ -399,6 +612,7 @@ def validate_counts(lines: list[str], full_text: str) -> None:
     status_counts, prefix_counts, row_ids = parse_rows(lines)
     total_rows = len(row_ids)
     require(sum(status_counts.values()) == total_rows, f"expected {total_rows} rows, found {sum(status_counts.values())}")
+    validate_revision_16_inventory(status_counts, prefix_counts)
 
     metadata_total_rows, metadata_required_rows = parse_rows_metadata(metadata.get("Rows", ""))
     require(
