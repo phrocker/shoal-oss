@@ -25,7 +25,13 @@ func singleTabletManifest() *engine.RFileExportManifest {
 	}
 }
 
-func splitManifest() *engine.RFileExportManifest {
+// twoTabletManifest is the smallest possible split-bearing manifest: two
+// tablets sharing the boundary row "g". Widening always collapses a
+// 2-tablet chain's second entry to fully unbounded (there is no tablet
+// before index 0 to anchor PrevEndRow against), so this fixture doubles as
+// the "collapse" edge case; see threeTabletManifest/fourTabletManifest for
+// chains long enough to exercise a genuinely bounded PrevEndRow.
+func twoTabletManifest() *engine.RFileExportManifest {
 	return &engine.RFileExportManifest{
 		Version:     engine.RFileExportManifestVersion,
 		SourceTable: "events",
@@ -38,6 +44,60 @@ func splitManifest() *engine.RFileExportManifest {
 			{TabletIndex: 1, DestinationPath: "events/t-0001/F0002.rf", Size: 50},
 		},
 	}
+}
+
+// threeTabletManifest declares tablets at boundaries "d" and "m". Its
+// middle tablet (index 1) still widens to fully unbounded (PrevEndRow
+// always anchors to index 0's own StartRow, which is always nil), but
+// index 2 gets a genuinely bounded PrevEndRow of "d" — the first index in
+// any chain where widening is not indistinguishable from "no bound at
+// all".
+func threeTabletManifest() *engine.RFileExportManifest {
+	return &engine.RFileExportManifest{
+		Version:     engine.RFileExportManifestVersion,
+		SourceTable: "events",
+		Tablets: []engine.RFileExportTablet{
+			{Index: 0, EndRow: strPtr("d")},
+			{Index: 1, StartRow: strPtr("d"), EndRow: strPtr("m")},
+			{Index: 2, StartRow: strPtr("m")},
+		},
+		RFiles: []engine.RFileExportFile{
+			{TabletIndex: 0, DestinationPath: "events/t-0000/F0001.rf", Size: 100},
+			{TabletIndex: 1, DestinationPath: "events/t-0001/F0002.rf", Size: 50},
+			{TabletIndex: 2, DestinationPath: "events/t-0002/F0003.rf", Size: 25},
+		},
+	}
+}
+
+// fourTabletManifest declares tablets at boundaries "b", "k", and "r",
+// giving every resolved extent a distinct, hand-checkable shape: index 0
+// bounded on the right only, index 1 collapsed (always unbounded), index 2
+// genuinely bounded on both sides, index 3 bounded on the left only.
+func fourTabletManifest() *engine.RFileExportManifest {
+	return &engine.RFileExportManifest{
+		Version:     engine.RFileExportManifestVersion,
+		SourceTable: "events",
+		Tablets: []engine.RFileExportTablet{
+			{Index: 0, EndRow: strPtr("b")},
+			{Index: 1, StartRow: strPtr("b"), EndRow: strPtr("k")},
+			{Index: 2, StartRow: strPtr("k"), EndRow: strPtr("r")},
+			{Index: 3, StartRow: strPtr("r")},
+		},
+		RFiles: []engine.RFileExportFile{
+			{TabletIndex: 0, DestinationPath: "events/t-0000/F0001.rf", Size: 10},
+			{TabletIndex: 1, DestinationPath: "events/t-0001/F0002.rf", Size: 20},
+			{TabletIndex: 2, DestinationPath: "events/t-0002/F0003.rf", Size: 30},
+			{TabletIndex: 3, DestinationPath: "events/t-0003/F0004.rf", Size: 40},
+		},
+	}
+}
+
+// extentEqual reports whether two KeyExtents describe the same
+// (PrevEndRow, EndRow] range, comparing nil against nil (not against an
+// empty-but-non-nil slice) so widened-to-unbounded assertions are exact.
+func extentEqual(t *testing.T, got, want KeyExtent) bool {
+	t.Helper()
+	return reflect.DeepEqual(got.PrevEndRow, want.PrevEndRow) && reflect.DeepEqual(got.EndRow, want.EndRow)
 }
 
 func TestBuildLoadMappingSingleTabletUsesUnboundedExtent(t *testing.T) {
@@ -113,9 +173,358 @@ func TestBuildLoadMappingDedupesRepeatedDestinationPath(t *testing.T) {
 	}
 }
 
-func TestBuildLoadMappingRejectsSplitManifest(t *testing.T) {
-	if _, err := BuildLoadMapping(splitManifest()); err == nil {
-		t.Fatal("BuildLoadMapping(split manifest) = nil error, want error")
+func TestBuildLoadMappingAcceptsTwoTabletManifestWithWidenedExtents(t *testing.T) {
+	mapping, err := BuildLoadMapping(twoTabletManifest())
+	if err != nil {
+		t.Fatalf("BuildLoadMapping(two-tablet manifest) = %v, want success", err)
+	}
+	if len(mapping) != 2 {
+		t.Fatalf("mapping entries = %d, want 2: %#v", len(mapping), mapping)
+	}
+	// Index 0 keeps its own EndRow and is unbounded on the left (nothing
+	// precedes the first tablet).
+	if !extentEqual(t, mapping[0].Tablet, KeyExtent{EndRow: []byte("g")}) {
+		t.Fatalf("mapping[0].Tablet = %#v, want (nil, %q]", mapping[0].Tablet, "g")
+	}
+	// Index 1 widens PrevEndRow to index 0's own StartRow, which is
+	// always nil: a 2-tablet chain's second entry always collapses to
+	// fully unbounded. This is the documented, unavoidable "2-tablet
+	// collapse" edge case, not a bug.
+	if !extentEqual(t, mapping[1].Tablet, KeyExtent{}) {
+		t.Fatalf("mapping[1].Tablet = %#v, want fully unbounded", mapping[1].Tablet)
+	}
+	if len(mapping[0].Files) != 1 || mapping[0].Files[0].Name != "F0001.rf" {
+		t.Fatalf("mapping[0].Files = %#v, want [F0001.rf]", mapping[0].Files)
+	}
+	if len(mapping[1].Files) != 1 || mapping[1].Files[0].Name != "F0002.rf" {
+		t.Fatalf("mapping[1].Files = %#v, want [F0002.rf]", mapping[1].Files)
+	}
+}
+
+func TestBuildLoadMappingAcceptsThreeTabletManifestWithWidenedExtents(t *testing.T) {
+	mapping, err := BuildLoadMapping(threeTabletManifest())
+	if err != nil {
+		t.Fatalf("BuildLoadMapping(three-tablet manifest) = %v, want success", err)
+	}
+	if len(mapping) != 3 {
+		t.Fatalf("mapping entries = %d, want 3: %#v", len(mapping), mapping)
+	}
+	wantExtents := []KeyExtent{
+		{EndRow: []byte("d")},     // index 0: (nil, "d"]
+		{EndRow: []byte("m")},     // index 1: (nil, "m"] -- always collapses
+		{PrevEndRow: []byte("d")}, // index 2: ("d", nil] -- genuinely bounded
+	}
+	for i, want := range wantExtents {
+		if !extentEqual(t, mapping[i].Tablet, want) {
+			t.Fatalf("mapping[%d].Tablet = %#v, want %#v", i, mapping[i].Tablet, want)
+		}
+	}
+}
+
+func TestBuildLoadMappingAcceptsFourTabletManifestWithWidenedExtents(t *testing.T) {
+	mapping, err := BuildLoadMapping(fourTabletManifest())
+	if err != nil {
+		t.Fatalf("BuildLoadMapping(four-tablet manifest) = %v, want success", err)
+	}
+	if len(mapping) != 4 {
+		t.Fatalf("mapping entries = %d, want 4: %#v", len(mapping), mapping)
+	}
+	wantExtents := []KeyExtent{
+		{EndRow: []byte("b")},                          // index 0: (nil, "b"]
+		{EndRow: []byte("k")},                          // index 1: (nil, "k"] -- always collapses
+		{PrevEndRow: []byte("b"), EndRow: []byte("r")}, // index 2: ("b", "r"]
+		{PrevEndRow: []byte("k")},                      // index 3: ("k", nil]
+	}
+	for i, want := range wantExtents {
+		if !extentEqual(t, mapping[i].Tablet, want) {
+			t.Fatalf("mapping[%d].Tablet = %#v, want %#v", i, mapping[i].Tablet, want)
+		}
+	}
+}
+
+func TestBuildLoadMappingToleratesOutOfOrderTabletSlice(t *testing.T) {
+	manifest := threeTabletManifest()
+	// Reverse the physical slice order; .Index still identifies each
+	// tablet, so resolution must be robust to slice order, not dependent
+	// on it.
+	manifest.Tablets = []engine.RFileExportTablet{
+		manifest.Tablets[2], manifest.Tablets[0], manifest.Tablets[1],
+	}
+	mapping, err := BuildLoadMapping(manifest)
+	if err != nil {
+		t.Fatalf("BuildLoadMapping(out-of-order tablets) = %v, want success", err)
+	}
+	ordered, err := BuildLoadMapping(threeTabletManifest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(mapping, ordered) {
+		t.Fatalf("out-of-order mapping = %#v, want identical to in-order mapping %#v", mapping, ordered)
+	}
+}
+
+func TestBuildLoadMappingSkipsEmptyTabletsInMultiTabletChain(t *testing.T) {
+	manifest := threeTabletManifest()
+	// Drop every RFile for index 1: that tablet contributed no files, and
+	// should be silently omitted from the returned LoadMapping, while
+	// RequiredDestinationSplits (checked separately) still reports both
+	// chain boundaries regardless.
+	var kept []engine.RFileExportFile
+	for _, rf := range manifest.RFiles {
+		if rf.TabletIndex == 1 {
+			continue
+		}
+		kept = append(kept, rf)
+	}
+	manifest.RFiles = kept
+
+	mapping, err := BuildLoadMapping(manifest)
+	if err != nil {
+		t.Fatalf("BuildLoadMapping(manifest with empty middle tablet) = %v, want success", err)
+	}
+	if len(mapping) != 2 {
+		t.Fatalf("mapping entries = %d, want 2 (index 1 skipped): %#v", len(mapping), mapping)
+	}
+	if !extentEqual(t, mapping[0].Tablet, KeyExtent{EndRow: []byte("d")}) {
+		t.Fatalf("mapping[0].Tablet = %#v, want (nil, %q]", mapping[0].Tablet, "d")
+	}
+	if !extentEqual(t, mapping[1].Tablet, KeyExtent{PrevEndRow: []byte("d")}) {
+		t.Fatalf("mapping[1].Tablet = %#v, want (%q, nil]", mapping[1].Tablet, "d")
+	}
+}
+
+// TestRequiredDestinationSplitsIgnoresWhichTabletsHaveFiles proves the
+// claim TestBuildLoadMappingSkipsEmptyTabletsInMultiTabletChain's comment
+// makes but does not itself check: RequiredDestinationSplits operates on
+// the manifest's declared Tablets chain only, not on which tablets ended
+// up with RFiles, so dropping index 1's only file does not change the
+// required split set at all. This is what lets Promote reconcile the
+// destination's splits the same way regardless of which tablets in a
+// multi-tablet manifest happen to be empty.
+func TestRequiredDestinationSplitsIgnoresWhichTabletsHaveFiles(t *testing.T) {
+	full := threeTabletManifest()
+	fullSplits, err := RequiredDestinationSplits(full)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	emptyMiddle := threeTabletManifest()
+	var kept []engine.RFileExportFile
+	for _, rf := range emptyMiddle.RFiles {
+		if rf.TabletIndex == 1 {
+			continue
+		}
+		kept = append(kept, rf)
+	}
+	emptyMiddle.RFiles = kept
+
+	gotSplits, err := RequiredDestinationSplits(emptyMiddle)
+	if err != nil {
+		t.Fatalf("RequiredDestinationSplits(manifest with empty middle tablet) = %v, want success", err)
+	}
+	if !reflect.DeepEqual(gotSplits, fullSplits) {
+		t.Fatalf("RequiredDestinationSplits = %#v, want unchanged %#v regardless of which tablet is empty", gotSplits, fullSplits)
+	}
+	wantSplits := [][]byte{[]byte("d"), []byte("m")}
+	if !reflect.DeepEqual(gotSplits, wantSplits) {
+		t.Fatalf("RequiredDestinationSplits = %#v, want %#v", gotSplits, wantSplits)
+	}
+}
+
+func TestBuildLoadMappingRejectsDuplicateTabletIndex(t *testing.T) {
+	manifest := twoTabletManifest()
+	manifest.Tablets[1].Index = 0 // duplicate of tablet 0's index
+	if _, err := BuildLoadMapping(manifest); err == nil {
+		t.Fatal("BuildLoadMapping with duplicate tablet index = nil error, want error")
+	}
+}
+
+func TestBuildLoadMappingRejectsOutOfRangeTabletIndex(t *testing.T) {
+	manifest := twoTabletManifest()
+	manifest.Tablets[1].Index = 5 // out of range for a 2-tablet manifest
+	if _, err := BuildLoadMapping(manifest); err == nil {
+		t.Fatal("BuildLoadMapping with out-of-range tablet index = nil error, want error")
+	}
+}
+
+func TestBuildLoadMappingRejectsNonNilFirstStartRow(t *testing.T) {
+	manifest := twoTabletManifest()
+	manifest.Tablets[0].StartRow = strPtr("a") // first tablet must start at negative infinity
+	if _, err := BuildLoadMapping(manifest); err == nil {
+		t.Fatal("BuildLoadMapping with non-nil first StartRow = nil error, want error")
+	}
+}
+
+func TestBuildLoadMappingRejectsNonNilLastEndRow(t *testing.T) {
+	manifest := twoTabletManifest()
+	manifest.Tablets[1].EndRow = strPtr("z") // last tablet must end at positive infinity
+	if _, err := BuildLoadMapping(manifest); err == nil {
+		t.Fatal("BuildLoadMapping with non-nil last EndRow = nil error, want error")
+	}
+}
+
+func TestBuildLoadMappingRejectsMissingMiddleStartRow(t *testing.T) {
+	manifest := threeTabletManifest()
+	manifest.Tablets[1].StartRow = nil // middle tablet must declare both boundaries
+	if _, err := BuildLoadMapping(manifest); err == nil {
+		t.Fatal("BuildLoadMapping with missing middle StartRow = nil error, want error")
+	}
+}
+
+func TestBuildLoadMappingRejectsMissingMiddleEndRow(t *testing.T) {
+	manifest := threeTabletManifest()
+	manifest.Tablets[1].EndRow = nil // middle tablet must declare both boundaries
+	if _, err := BuildLoadMapping(manifest); err == nil {
+		t.Fatal("BuildLoadMapping with missing middle EndRow = nil error, want error")
+	}
+}
+
+func TestBuildLoadMappingRejectsChainGap(t *testing.T) {
+	manifest := threeTabletManifest()
+	// Widen tablet 1 so it no longer starts exactly where tablet 0 ends:
+	// a gap between "d" and "e" that no tablet covers.
+	manifest.Tablets[1].StartRow = strPtr("e")
+	if _, err := BuildLoadMapping(manifest); err == nil {
+		t.Fatal("BuildLoadMapping with a chain gap = nil error, want error")
+	}
+}
+
+func TestBuildLoadMappingRejectsChainOverlap(t *testing.T) {
+	manifest := threeTabletManifest()
+	// Move tablet 1's start before tablet 0's own end: an overlap between
+	// "c" and "d" that both tablet 0 and tablet 1 would claim.
+	manifest.Tablets[1].StartRow = strPtr("c")
+	if _, err := BuildLoadMapping(manifest); err == nil {
+		t.Fatal("BuildLoadMapping with a chain overlap = nil error, want error")
+	}
+}
+
+func TestBuildLoadMappingRejectsDegenerateTabletRange(t *testing.T) {
+	manifest := threeTabletManifest()
+	// Tablet 1's StartRow >= EndRow: an inverted/degenerate range.
+	manifest.Tablets[1].StartRow = strPtr("m")
+	manifest.Tablets[1].EndRow = strPtr("d")
+	if _, err := BuildLoadMapping(manifest); err == nil {
+		t.Fatal("BuildLoadMapping with a degenerate tablet range = nil error, want error")
+	}
+}
+
+func TestBuildLoadMappingRejectsUndeclaredTabletIndexMultiTablet(t *testing.T) {
+	manifest := threeTabletManifest()
+	manifest.RFiles = append(manifest.RFiles, engine.RFileExportFile{
+		TabletIndex:     7,
+		DestinationPath: "events/t-0007/F0099.rf",
+		Size:            5,
+	})
+	if _, err := BuildLoadMapping(manifest); err == nil {
+		t.Fatal("BuildLoadMapping with undeclared multi-tablet index = nil error, want error")
+	}
+}
+
+func TestBuildLoadMappingRejectsDuplicateDestinationPathAcrossTabletsMultiTablet(t *testing.T) {
+	manifest := threeTabletManifest()
+	manifest.RFiles = append(manifest.RFiles, engine.RFileExportFile{
+		TabletIndex:     2,
+		DestinationPath: manifest.RFiles[0].DestinationPath, // already declared under index 0
+		Size:            manifest.RFiles[0].Size,
+	})
+	if _, err := BuildLoadMapping(manifest); err == nil {
+		t.Fatal("BuildLoadMapping with a DestinationPath repeated under a different tablet index = nil error, want error")
+	}
+}
+
+func TestRequiredDestinationSplitsNilForSingleTabletManifest(t *testing.T) {
+	splits, err := RequiredDestinationSplits(singleTabletManifest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if splits != nil {
+		t.Fatalf("RequiredDestinationSplits(single-tablet) = %#v, want nil", splits)
+	}
+}
+
+func TestRequiredDestinationSplitsNilForLegacyManifest(t *testing.T) {
+	manifest := &engine.RFileExportManifest{
+		SourceTable: "events",
+		RFiles: []engine.RFileExportFile{
+			{TabletIndex: 0, DestinationPath: "events/t-0000/F0001.rf", Size: 10},
+		},
+	}
+	splits, err := RequiredDestinationSplits(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if splits != nil {
+		t.Fatalf("RequiredDestinationSplits(legacy manifest) = %#v, want nil", splits)
+	}
+}
+
+func TestRequiredDestinationSplitsForTwoTabletManifest(t *testing.T) {
+	splits, err := RequiredDestinationSplits(twoTabletManifest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := [][]byte{[]byte("g")}
+	if !reflect.DeepEqual(splits, want) {
+		t.Fatalf("RequiredDestinationSplits(two-tablet) = %#v, want %#v", splits, want)
+	}
+}
+
+func TestRequiredDestinationSplitsForThreeTabletManifest(t *testing.T) {
+	splits, err := RequiredDestinationSplits(threeTabletManifest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := [][]byte{[]byte("d"), []byte("m")}
+	if !reflect.DeepEqual(splits, want) {
+		t.Fatalf("RequiredDestinationSplits(three-tablet) = %#v, want %#v", splits, want)
+	}
+}
+
+func TestRequiredDestinationSplitsForFourTabletManifest(t *testing.T) {
+	splits, err := RequiredDestinationSplits(fourTabletManifest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := [][]byte{[]byte("b"), []byte("k"), []byte("r")}
+	if !reflect.DeepEqual(splits, want) {
+		t.Fatalf("RequiredDestinationSplits(four-tablet) = %#v, want %#v", splits, want)
+	}
+}
+
+func TestRequiredDestinationSplitsPropagatesChainValidationError(t *testing.T) {
+	manifest := threeTabletManifest()
+	manifest.Tablets[1].StartRow = strPtr("e") // chain gap, same as BuildLoadMapping rejects
+	if _, err := RequiredDestinationSplits(manifest); err == nil {
+		t.Fatal("RequiredDestinationSplits with a malformed chain = nil error, want error")
+	}
+}
+
+func TestRequiredDestinationSplitsRejectsNilManifest(t *testing.T) {
+	if _, err := RequiredDestinationSplits(nil); err == nil {
+		t.Fatal("RequiredDestinationSplits(nil) = nil error, want error")
+	}
+}
+
+func TestReadLoadMappingRoundTripsMultiTabletWriteLoadMapping(t *testing.T) {
+	mapping, err := BuildLoadMapping(threeTabletManifest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(mapping) != 3 {
+		t.Fatalf("mapping entries = %d, want 3", len(mapping))
+	}
+	dst := memory.New()
+	ctx := context.Background()
+	if err := WriteLoadMapping(ctx, dst, "/bulk/events-1", mapping); err != nil {
+		t.Fatal(err)
+	}
+	got, err := ReadLoadMapping(ctx, dst, "/bulk/events-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, mapping) {
+		t.Fatalf("round-tripped multi-tablet mapping = %#v, want %#v", got, mapping)
 	}
 }
 

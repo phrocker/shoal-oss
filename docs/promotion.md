@@ -23,10 +23,13 @@
 Status: **partial**. This document covers the current safe slice of #70:
 client-side staging plus submission of Accumulo Bulk Import V2
 (`internal/promotion`, `accumulo.Connector.BulkImport`,
-`managerclient.TableBulkImport`) for **unambiguous single-tablet exports
-only**. Split-bearing exports, cutover/fan-in semantics, promotion-state
-APIs, and live-cluster verification are not yet implemented — see
-[§5](#5-whats-deferred).
+`managerclient.TableBulkImport`) for both single-tablet exports and
+**multi-tablet/split-bearing exports**, the latter via destination split
+reconciliation (`accumulo.Connector.AddTableSplits`,
+`RequiredDestinationSplits`) ahead of staging. Durable/resumable
+promotion-state tracking, duplicate-safe FATE resubmission, an explicit
+cutover/fan-in state machine, and live-cluster verification are not yet
+implemented — see [§5](#5-whats-deferred).
 
 ## 1. Goal and authority invariant
 
@@ -37,10 +40,14 @@ That invariant drives every design choice here:
 
 - Promotion **never writes to `accumulo.metadata` or ZooKeeper**, and never
   invents its own notion of a tablet, split, or load state.
-- The only Accumulo-facing call this package makes is submitting the
-  standard `TABLE_BULK_IMPORT2` **FATE** operation through the table's
-  **manager**, the same operation Accumulo's own
-  `TableOperations.importDirectory()` submits.
+- The only Accumulo-facing calls this package makes are two standard
+  **FATE** operations submitted through the table's **manager**: a
+  `TABLE_SPLIT` operation (`accumulo.Connector.AddTableSplits`, submitted
+  only when a multi-tablet manifest's widened load mapping requires
+  destination splits that don't already exist — see §3) and the
+  `TABLE_BULK_IMPORT2` operation itself — the same two operations
+  Accumulo's own `TableOperations.addSplits()` and
+  `.importDirectory()` submit.
 - Shoal's promotion code is a **producer of a staged bulk directory plus
   load mapping**, not a participant in tablet assignment or metadata
   mutation. If Accumulo's FATE operation fails or rejects the request,
@@ -70,49 +77,128 @@ written at the bulk directory root — `Constants.BULK_LOAD_MAPPING`) is:
   `managerclient.TableBulkImport`'s 3-argument contract:
   `[tableID, bulkDir, setTime]`.
 
-## 3. Why this slice only supports unambiguous single-tablet exports
+## 3. Multi-tablet exports: destination split reconciliation
 
 Shoal's local tablets are `[StartRow, EndRow)` (inclusive start,
 exclusive end — see `internal/engine/table.go`'s `routeTablet`), while
 Accumulo's `KeyExtent` is `(PrevEndRow, EndRow]` (exclusive start,
 inclusive end). Copying split boundaries from a multi-tablet Shoal
-manifest into Accumulo extents therefore makes rows whose value exactly
-equals a split point land on opposite sides of the boundary in the two
-systems:
+manifest into Accumulo extents verbatim would make rows whose value
+exactly equals a split point land on opposite sides of the boundary in
+the two systems:
 
 - in Shoal, a row equal to split `S` belongs to the tablet that **starts**
   at `S`;
 - in Accumulo, the same row belongs to the tablet that **ends** at `S`.
 
-That mismatch means a multi-tablet manifest cannot safely be promoted by
-simply reusing its tablet boundaries. An exact split-point row can become
-invisible unless the export is rewritten/materialized differently around
-the boundary or a more destination-aware mapping strategy is designed.
-This slice does **not** attempt either of those.
+A naive "reuse the source boundaries verbatim" mapping is therefore never
+safe: an exact split-point row would silently land in the wrong tablet
+relative to the tablet its RFile actually belongs to.
 
-So the implementation now fails closed:
+### 3.1 The widening rule
 
-- legacy manifests with no `Tablets` entries are accepted only when every
-  `RFiles[*].TabletIndex == 0`;
-- explicit manifests are accepted only when they declare **exactly one**
-  tablet and that tablet has `StartRow == nil` and `EndRow == nil`;
-- anything else — multiple tablets, any non-nil boundary, undeclared
-  tablet references, or one `DestinationPath` assigned to multiple tablet
-  indexes — is rejected locally before staging writes or FATE submission.
+Instead of reusing a tablet's own `[StartRow, EndRow)`, `BuildLoadMapping`
+widens each destination `KeyExtent` so it can never exclude a row that
+genuinely belongs to that tablet: for chain entry `i`, the resolved
+extent's `PrevEndRow` is set to the **previous** tablet's own `StartRow`
+(one tablet further back in the source chain), not tablet `i`'s own
+`StartRow`. Concretely, for an `N`-tablet chain (0-indexed):
 
-For the supported case, `BuildLoadMapping` always produces a **single
-fully unbounded** mapping entry: one `KeyExtent{PrevEndRow:nil,
-EndRow:nil}` containing every exported file. This still avoids RFile-index
-reading, and it avoids claiming any split carryover at all. Accumulo can
-load a file that spans many destination tablets under one unbounded
-mapping entry, so the destination split layout does not need to mirror the
-source for this safe slice. That behavior is still not verified against a
-live cluster here.
+| index `i`   | `PrevEndRow`             | `EndRow`          |
+|-------------|--------------------------|-------------------|
+| `0`         | `nil` (always)           | `chain[0].EndRow` |
+| `1`         | `nil` (always — `chain[0].StartRow` is always nil) | `chain[1].EndRow` |
+| `i >= 2`    | `chain[i-2].EndRow`      | `chain[i].EndRow` |
+
+Every resolved extent therefore spans **at most two** of the manifest's
+own source tablets, regardless of overall chain length, and the last
+entry's `EndRow` is always `nil` (unbounded) by chain-validation. A
+2-tablet manifest is the smallest possible case and its second (last)
+entry always collapses to fully unbounded, since there is no tablet
+before index 0 to widen against — see `twoTabletManifest` in
+`loadmapping_test.go`.
+
+### 3.2 Why widening is provably correct against Accumulo's real validation
+
+This is not a design choice taken on faith: it was checked line-by-line
+against the actual upstream `PrepBulkImport.validateLoadMapping` (see
+REFERENCES.md for the exact source URL). That method walks a
+`PeekingIterator` over the destination's real tablets, sorted ascending,
+whose "current tablet" position is created **once** and **persists across
+every load-mapping entry** — it only ever advances forward via
+`pi.next()`, and a tablet the iterator is currently resting on is not
+force-advanced past before the next entry is checked. For each entry, the
+algorithm advances the current tablet forward only while it does not
+match the entry's declared `prevEndRow`, checks the match, then repeats
+for `endRow`, leaving the iterator resting exactly on the tablet matching
+that entry's `endRow` once both checks succeed.
+
+By induction over the chain: after entry `k` is validated, the iterator
+is resting on the real destination tablet ending at `chain[k].EndRow`,
+whose own `prevEndRow` is exactly `chain[k-1].EndRow` (or `nil` for
+`k=0`) — which is *exactly* what this package's widening rule sets
+`resolved[k+1].PrevEndRow` to. So every entry's declared `PrevEndRow`
+is always matched by the real tablet the validation iterator is already
+resting on, and the widened, seemingly-overlapping extents (e.g.
+`(nil,"d"]` immediately followed by `(nil,"m"]`) validate correctly
+precisely because the iterator is never forced past a tablet it can
+still legitimately re-match against a later entry's `prevEndRow`.
+
+This also confirms two secondary properties, both verified by tracing
+the same algorithm: extra, unrelated pre-existing destination splits
+beyond the required boundary rows are harmless (the iterator just takes
+more `pi.next()` steps to reach the target `endRow`), and — critically
+for fail-closed safety — if the destination is **not** reconciled first
+(still only its original single unbounded tablet) a multi-tablet
+promotion attempt is rejected outright via `validateLoadMapping`'s
+`!pi.hasNext()` special-case branch, the same "concurrent merge"-style
+rejection Accumulo itself uses; it does not corrupt data or silently
+drop rows.
+
+### 3.3 Reconciling the destination before staging
+
+`RequiredDestinationSplits(manifest)` returns exactly the `N-1` boundary
+rows an `N`-tablet manifest's widened load mapping references (`nil` for
+a single-tablet/legacy manifest, which needs no destination splits at
+all). It is a pure, network-free function — it performs the same chain
+validation `BuildLoadMapping` does, but never touches storage or
+Accumulo.
+
+`Promote` calls it before doing anything else, and — only when it
+reports at least one row — submits those rows through
+`accumulo.Connector.AddTableSplits` (a manager `TABLE_SPLIT` FATE
+operation, never a direct metadata/ZooKeeper edit) before staging or
+submitting the bulk import. `BuildLoadMapping` and `StageBulkDir`
+themselves never call Accumulo: a caller invoking them directly for a
+multi-tablet manifest outside of `Promote` is responsible for ensuring
+the destination already has matching splits, or the subsequent
+`BulkImport` call will fail closed (not silently) as described above.
+
+**Residual race, stated plainly:** reconciling splits ahead of staging
+narrows, but does not close, the window for a concurrent structural
+change on the destination. A merge racing between `AddTableSplits`
+succeeding and the later `BulkImport` FATE call's own server-side
+validation running could still remove a split `Promote` just added.
+Accumulo's own defense against that is to reject the bulk import cleanly
+(the same `!pi.hasNext()`/concurrent-merge-style failure from §3.2), not
+to corrupt data — so this is a safe-failure gap, not a correctness one.
+Closing it fully would require either a promotion-state API that
+re-validates immediately before submission or an Accumulo-side
+split-then-import atomicity guarantee this package does not control; see
+[§5](#5-whats-deferred).
 
 ## 4. What's implemented
 
 ```
-RFileExportManifest (existing)  →  promotion.BuildLoadMapping
+RFileExportManifest (existing)  →  promotion.RequiredDestinationSplits
+                                          │  (nil unless manifest is multi-tablet)
+                                          ▼
+                     accumulo.Connector.AddTableSplits(tableName, splits)
+                        managerclient: FATE TABLE_SPLIT  [only if splits != nil]
+                                          │
+                                          ▼
+                                  promotion.BuildLoadMapping
+                       (widened per-tablet KeyExtents; see §3.1)
                                           │
                                           ▼
                                   promotion.StageBulkDir
@@ -121,6 +207,7 @@ RFileExportManifest (existing)  →  promotion.BuildLoadMapping
                                           │
                                           ▼
                                   promotion.Promote
+                       (orchestrates every step above, in order)
                                           │
                                           ▼
                         accumulo.Connector.BulkImport(tableName, bulkDir)
@@ -133,19 +220,43 @@ RFileExportManifest (existing)  →  promotion.BuildLoadMapping
                 (sole authority over destination tablets/file set from here)
 ```
 
+`Promote` is the only entry point that performs the full sequence above.
+Calling `BuildLoadMapping`/`StageBulkDir` directly for a multi-tablet
+manifest skips the `AddTableSplits` step — the caller must reconcile
+destination splits itself, or the eventual `BulkImport` fails closed (see
+§3.3).
+
+```
+(single-tablet / legacy manifest: RequiredDestinationSplits reports nil,
+ AddTableSplits is never called, and BuildLoadMapping always returns one
+ fully unbounded KeyExtent — unchanged from the original single-tablet
+ slice.)
+```
+
 - `internal/promotion.BuildLoadMapping` — pure function, manifest → load
-  mapping. Accepts only unambiguous single-tablet exports and returns one
-  fully unbounded mapping entry. Rejects split/multi-tablet manifests,
-  ambiguous legacy manifests, undeclared tablet references, and conflicting
-  duplicate `DestinationPath` assignments.
+  mapping. Accepts a legacy single-implicit-tablet manifest, an explicit
+  single-tablet manifest, or any number of explicitly declared tablets
+  forming one gapless, non-overlapping chain (validated by
+  `resolveManifestTablets`/`resolveTabletChain`). Produces one `Mapping`
+  per non-empty tablet, using the widened `KeyExtent`s from §3.1 for a
+  multi-tablet chain, or a single fully unbounded `KeyExtent` for the
+  single-tablet/legacy case. Rejects ambiguous legacy manifests,
+  undeclared or duplicate tablet indexes, gaps/overlaps in a declared
+  chain, degenerate/inverted tablet ranges, and conflicting duplicate
+  `DestinationPath` assignments across tablets.
+- `internal/promotion.RequiredDestinationSplits` — pure function, manifest
+  → the destination split rows `AddTableSplits` must reconcile before a
+  multi-tablet load mapping can pass Accumulo's own validation; `nil` for
+  single-tablet/legacy manifests. See §3.3.
 - `internal/promotion.WriteLoadMapping` / `ReadLoadMapping` — the exact
   JSON shape from §2.
 - `internal/promotion.StageBulkDir` — flattens an export manifest's nested
   `t-NNNN/` files into a flat bulk directory via `storage.Copy` (copies,
   never moves) and writes `loadmap.json`. Preflight-validates `bulkDir`
-  plus the manifest's single-tablet shape before copying anything, so
-  invalid destinations and rejected split manifests never leave a
-  half-staged directory. It also verifies every referenced RFile against
+  plus the manifest's tablet chain (single-tablet or multi-tablet alike)
+  before copying anything, so invalid destinations and malformed chains
+  never leave a half-staged directory. It also verifies every referenced
+  RFile against
   the manifest's recorded size/SHA256 (`engine.VerifyRFileExport`) before
   copying, and preflights every RFile's computed destination path
   against **every unique source path in the manifest** — not just its
@@ -322,10 +433,23 @@ RFileExportManifest (existing)  →  promotion.BuildLoadMapping
   directory literally named e.g. `hdfs:/bulk` is then still recognized
   and preflighted as local rather than mistaken for a remote HDFS root
   purely because of its spelling.
-- `internal/promotion.Promote` — composes `StageBulkDir` with a
-  `BulkImporter` (satisfied by `*accumulo.Connector`) to submit the FATE
-  call. Submits nothing when the derived mapping is empty (nothing to
-  import).
+- `internal/promotion.Promote` — orchestrates the full sequence: calls
+  `RequiredDestinationSplits`, conditionally submits `AddTableSplits` for
+  a multi-tablet manifest, then calls `StageBulkDir`, then submits the
+  bulk import through a `Promoter` (satisfied by `*accumulo.Connector`).
+  Validates `tableName`/`bulkDir`/the tablet chain before any Accumulo
+  call or destination write, so a malformed manifest or invalid
+  destination never adds a split, stages a file, or submits a bulk
+  import. Submits nothing when the derived mapping is empty (nothing to
+  import) — but still reconciles splits first if the manifest declares a
+  multi-tablet chain, even when every tablet in it ends up empty, so the
+  destination's tablet boundaries don't depend on which tablets happened
+  to carry files.
+- `accumulo.Connector.AddTableSplits` — resolves the destination table
+  name to its stable ID, then submits the split rows through the manager
+  `TABLE_SPLIT` FATE operation, the same protocol
+  `TableOperations.addSplits` uses. Pre-existing, this slice's new code
+  only adds a caller (`Promote`), not the primitive itself.
 - `accumulo.Connector.BulkImport` — resolves the destination table name to
   its stable ID, then submits `TABLE_BULK_IMPORT2` through the same
   `executeTableMutation` path used by `FlushTable`/`CreateTable`/etc.
@@ -339,30 +463,58 @@ Mapped against #70's five acceptance criteria:
 
 1. **"a local table can be promoted into an existing Accumulo instance and
    queried with cell-equivalent results"** — only the safe
-   single-tablet-export case is supported. Split-bearing exports are
-   explicitly rejected until a rewrite/materialization strategy exists for
-   the boundary mismatch in §3, and none of this has been verified against
-   a live Accumulo cluster in this environment.
-2. **"rerunning any interrupted transfer is safe"** — `StageBulkDir` is
-   deterministic and copy-based, so rerunning it with the same manifest
-   and `bulkDir` safely reproduces the same bytes. A persistent I/O failure
-   partway through copying *multiple* files can still leave a partially
-   staged bulk directory, but retrying the same call completes it without
-   manual repair. That guarantee covers staging only: once
-   `Promote` has called `BulkImporter.BulkImport`, retry safety ends,
-   because `TABLE_BULK_IMPORT2` FATE submission has no dedup/idempotency
-   of its own. An ambiguous failure at or after that call (e.g. a
-   timeout after the manager received the request but before the client
-   observed a response) leaves the caller unable to tell whether the
-   import already happened, so blindly calling `Promote` again in that
-   window risks a duplicate bulk import. Closing that gap needs a
-   promotion-state or idempotency-token API this slice does not yet
-   have (see item 4 below).
+   single-tablet **and** multi-tablet/split-bearing exports are now
+   supported client-side (§3), but none of this has been verified against
+   a live Accumulo cluster in this environment — no cell-equivalent-results
+   check has ever actually run. The multi-tablet path also carries the
+   residual concurrent-merge race from §3.3: a merge landing on the
+   destination between `AddTableSplits` succeeding and `BulkImport`'s own
+   server-side validation running is not fully closed by this slice, only
+   turned into a clean, safe FATE-level rejection instead of a silent
+   correctness problem.
+2. **"rerunning any interrupted transfer is safe"** — true up through
+   staging, not true across the whole `Promote` call once `BulkImport` has
+   been invoked. `StageBulkDir` is deterministic and copy-based, so
+   rerunning it with the same manifest and `bulkDir` safely reproduces the
+   same bytes; a persistent I/O failure partway through copying *multiple*
+   files can still leave a partially staged bulk directory, but retrying
+   the same call completes it without manual repair (see
+   `TestStageBulkDirCancellationLeavesNoPartialObjectAndRetrySucceeds` in
+   §6). `AddTableSplits` is also safe to retry, but that safety comes from
+   Shoal's own client-side logic, not from any inherent idempotency
+   `TABLE_SPLIT` FATE submission guarantees: each retry round re-queries
+   the destination's *real* current tablet metadata before deciding what
+   to submit, and a requested split row that already matches an existing
+   tablet's end row is treated as already satisfied (only its
+   mergeability metadata is refreshed) rather than resubmitted as a new
+   split. That re-observation step is what makes a retry converge safely
+   after an ambiguous `AddTableSplits` failure — it is not a property of
+   the FATE protocol itself.
+
+   `BulkImport` has no equivalent re-observation step: there is no
+   client-visible way to ask "was this exact bulk import directory
+   already loaded into this table," so `TABLE_BULK_IMPORT2` FATE
+   submission has no dedup/idempotency of its own. An ambiguous failure
+   at or after that call (e.g. a timeout after the manager received the
+   request but before the client observed a response) leaves the caller
+   unable to tell whether the import already happened, and blindly
+   calling `Promote` again in that window risks a duplicate bulk import.
+   This slice deliberately does **not** claim idempotency for the whole
+   `Promote` call — only for its pre-`BulkImport` steps (split
+   reconciliation and staging). Closing the `BulkImport` gap needs a
+   promotion-state or idempotency-token API this slice does not yet have
+   (see item 4 below).
 3. **"split changes and partial uploads recover without manual metadata
-   repair"** — not implemented for split-bearing exports, because those
-   manifests are rejected before submission. A future rewrite or
-   destination-aware materialization strategy would be needed before this
-   criterion can be met.
+   repair"** — partial-upload recovery (retrying an interrupted
+   `StageBulkDir`/pre-`BulkImport` `Promote` call) is implemented and
+   tested, per item 2. "Split changes" recovery is only partial: this
+   slice reconciles the destination's splits to match a multi-tablet
+   manifest *before* staging, and Accumulo itself safely rejects (rather
+   than corrupts) a bulk import if a concurrent merge removes a
+   reconciled split before `BulkImport`'s own validation runs — but Shoal
+   does not automatically detect that rejection and re-reconcile/retry on
+   the caller's behalf. That would need the same promotion-state
+   machinery as item 4.
 4. **"a documented cutover protocol"** — not implemented. No
    promotion-state or cutover API surface is exposed yet; this slice is
    promotion of one point-in-time export, not the ongoing fan-in/cutover
@@ -370,11 +522,16 @@ Mapped against #70's five acceptance criteria:
 5. **"graph, document, and vector fixtures pass before and after
    promotion"** — not exercised; requires a live cluster.
 
-Also explicitly out of scope for this slice: RFile-index-based mapping or
-rewrite logic for split-bearing exports, automatic basename-collision
-resolution (collisions are reported as errors), and
-encryption/authentication of the transfer itself (inherited from whatever
-`storage.Backend`/`accumulo.Connector` are already configured with).
+Also explicitly out of scope for this slice: an RFile-index-based
+per-key-range rewrite/materialization strategy for split-bearing exports
+(a different approach from the destination-split-widening one
+implemented here — see §3 — and not needed now that widening covers the
+same case), automatic basename-collision resolution (collisions,
+including cross-tablet ones, are reported as errors — see
+`TestStageBulkDirRejectsCrossTabletBasenameCollisionBeforeCopying` in
+§6), and encryption/authentication of the transfer itself (inherited
+from whatever `storage.Backend`/`accumulo.Connector` are already
+configured with).
 
 ## 6. Testing
 
@@ -383,3 +540,55 @@ All tests use in-memory storage backends and fake FATE/manager RPC layers
 `internal/managerclient/managerclient_test.go`) — there is no live
 Accumulo cluster or Java toolchain in this environment. See the pull
 request for the exact commands and pass/fail output.
+
+Coverage added for multi-tablet split reconciliation, on top of the
+existing single-tablet suite:
+
+- **Widened-extent correctness** — `twoTabletManifest`/`threeTabletManifest`/
+  `fourTabletManifest` fixtures with hand-computed boundary rows, asserting
+  `BuildLoadMapping`'s exact `KeyExtent` for every chain position (including
+  the always-collapses-to-unbounded index-1 case and a genuinely bounded
+  `PrevEndRow` at index ≥2), plus a JSON round-trip test for a multi-tablet
+  mapping and an exact `RequiredDestinationSplits` split-row assertion for
+  each fixture.
+- **Malformed-chain rejection, before any write** — duplicate/out-of-range
+  tablet index, non-nil first `StartRow`/last `EndRow`, missing middle
+  boundaries, chain gaps, chain overlaps, degenerate/inverted ranges,
+  undeclared tablet references, and duplicate `DestinationPath` across
+  tablets — every case covered for both `BuildLoadMapping` and (via
+  `StageBulkDir`'s early validation call) the staging path, so a malformed
+  multi-tablet manifest never reaches a partial copy.
+- **Robustness** — an out-of-order tablet slice (chain validity does not
+  depend on `Tablets` appearing in index order) and empty-tablet skipping
+  (a declared tablet with zero files contributes no mapping entry, but
+  still contributes to `RequiredDestinationSplits` — proved directly by
+  `TestRequiredDestinationSplitsIgnoresWhichTabletsHaveFiles`, not just
+  inferred from `BuildLoadMapping`'s behavior — matching `Promote`'s doc'd
+  "reconcile splits even when a tablet ends up empty" behavior).
+- **`Promote` orchestration** — `AddTableSplits` called with the exact
+  expected split rows before `StageBulkDir`/`BulkImport` for a multi-tablet
+  manifest; `AddTableSplits` skipped entirely for a single-tablet manifest;
+  zero staged writes and zero `BulkImport` calls when `AddTableSplits`
+  fails (proving the fail-before-any-write ordering); and a full
+  three-tablet success path exercising every step end to end.
+- **Cross-tablet alias/path safety** —
+  `TestStageBulkDirRejectsCrossTabletBasenameCollisionBeforeCopying` proves
+  the flatten-collision check (previously only exercised within a single
+  tablet) rejects two different tablets' files sharing a basename, before
+  any copy starts.
+- **Cancellation, partial uploads, and resumable retry** —
+  `TestStageBulkDirCancellationLeavesNoPartialObjectAndRetrySucceeds` uses
+  a wrapper backend that cancels the call's own context the instant a
+  later file's `Create` is issued, proving: the file whose `Create` raced
+  the cancellation is aborted (no partial/corrupt object left behind); an
+  earlier file that had already finished copying is **not** rolled back
+  (staging is not atomic across a multi-file manifest — stated honestly,
+  not hidden); `loadmap.json` is never written on the failed attempt; and
+  retrying with a fresh context against the same destination converges to
+  the full, correct staged set.
+
+No test in this slice submits a real FATE operation or talks to a live
+Accumulo manager; `AddTableSplits`/`BulkImport` are exercised only through
+the package's own fake (`fakePromoter`), so the concurrent-merge race and
+FATE-submission ambiguity described in §3.3/§5 are documented and
+reasoned about, not reproduced end to end here.

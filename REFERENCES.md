@@ -330,9 +330,25 @@ mirroring Accumulo's per-round retry schedule.
     individually match some real tablet boundary (a file may span several
     destination tablets), rejecting the whole FATE operation with
     `BULK_CONCURRENT_MERGE` ("Concurrent merge happened") if that walk
-    fails. Shoal's current safe promotion slice avoids that split-bearing
-    path entirely by rejecting multi-tablet/split manifests before
-    staging (`docs/promotion.md` §3).
+    fails. `validateLoadMapping` walks a `PeekingIterator` over the
+    destination's tablets whose position only ever advances forward
+    (`pi.next()`), never re-winds, and is shared across load-mapping
+    entries — so an entry's `prevEndRow` must equal the *previous* entry's
+    `endRow` for the walk to succeed, and a single entry may legally span
+    more than one real destination tablet. Shoal's promotion slice
+    exploits exactly this by widening each multi-tablet manifest chain's
+    per-tablet extents so every entry after the first has
+    `prevEndRow == previous chain entry's endRow` by construction (proved
+    by induction against this iterator's forward-only invariant in
+    `docs/promotion.md` §3.2), then calls
+    `accumulo.Connector.AddTableSplits` (the `TABLE_SPLIT` FATE op) to
+    reconcile the destination's real splits to match the manifest's chain
+    boundaries *before* staging/submitting `TABLE_BULK_IMPORT2` — it does
+    not create or reconcile splits itself, and does not use
+    `computeMappingFromFiles`'s RFile-index-based rewrite path. A
+    concurrent merge between reconciliation and bulk-import submission can
+    still legitimately trigger `BULK_CONCURRENT_MERGE`, unhandled by this
+    slice (`docs/promotion.md` §3.3, §5).
 
 ## Sharkbite
 

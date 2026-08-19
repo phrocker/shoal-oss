@@ -51,9 +51,21 @@ var (
 //
 // bulkDir itself is preflight-validated before any read or write: empty,
 // whitespace-padded, or backend-root destinations fail before staging can
-// mutate dst. BuildLoadMapping likewise rejects any split-bearing or
-// multi-tablet manifest before staging starts: this slice stages only
-// unambiguous single-tablet exports.
+// mutate dst. BuildLoadMapping likewise rejects any manifest whose
+// declared tablet chain is malformed (gaps, overlaps, duplicate or
+// out-of-range indexes, missing or misplaced boundaries) before staging
+// starts.
+//
+// StageBulkDir accepts multi-tablet manifests, but — unlike Promote — it
+// never talks to Accumulo and cannot reconcile the destination's actual
+// tablet splits. The widened KeyExtents BuildLoadMapping computes for a
+// multi-tablet manifest are only guaranteed to pass Accumulo's own
+// server-side load-mapping validation if the destination already has
+// splits at RequiredDestinationSplits' reported rows; a caller invoking
+// StageBulkDir directly for a multi-tablet manifest, bypassing Promote's
+// orchestration, is responsible for ensuring that beforehand, or the
+// eventual BulkImport call will fail closed (not silently) rather than
+// stage or import anything incorrectly.
 //
 // The manifest is verified (engine.VerifyRFileExport: every RFile exists at
 // src and matches its recorded size/SHA256) before anything is copied, so a
@@ -98,7 +110,7 @@ func StageBulkDir(
 	if err := validateBulkDirOnBackend(dst, bulkDir); err != nil {
 		return nil, err
 	}
-	if _, _, err := resolveManifestTablet(manifest); err != nil {
+	if _, _, err := resolveManifestTablets(manifest); err != nil {
 		return nil, err
 	}
 	if err := engine.VerifyRFileExport(ctx, src, manifest); err != nil {

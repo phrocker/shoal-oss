@@ -6,20 +6,27 @@
 // never edits accumulo.metadata or ZooKeeper directly. Instead this
 // package:
 //
-//  1. Validates that a manifest is an unambiguous single-tablet export and
-//     derives one fully unbounded destination KeyExtent from it.
+//  1. Validates a manifest's declared tablet chain (one implicit tablet
+//     for legacy manifests with no Tablets entries, or any number of
+//     explicitly declared tablets forming a single gapless chain) and
+//     derives a destination KeyExtent for each.
 //
 //     Shoal's local tablets use [StartRow, EndRow) (inclusive start,
 //     exclusive end — see engine/table.go's routeTablet), while
 //     Accumulo's KeyExtent is (PrevEndRow, EndRow] (exclusive start,
-//     inclusive end — see KeyExtent.java's contains()). Simply copying
-//     split boundaries from a multi-tablet Shoal manifest into Accumulo
-//     extents therefore makes rows whose value exactly equals a split
-//     point invisible. Until a rewrite/materialization strategy exists for
-//     split-bearing exports, BuildLoadMapping fails closed on any manifest
-//     that declares multiple tablets or any non-nil tablet boundary.
-//     Legacy manifests with no Tablets entries remain supported only when
-//     every RFile uses TabletIndex 0.
+//     inclusive end — see KeyExtent.java's contains()). Copying split
+//     boundaries verbatim would make rows whose value exactly equals a
+//     split point land on opposite sides of the boundary in the two
+//     systems, so each tablet's destination KeyExtent is deliberately
+//     widened instead: PrevEndRow is set to the *previous* tablet's own
+//     StartRow (one tablet further back), not to the tablet's own
+//     StartRow, which provably never excludes a row that genuinely
+//     belongs to that tablet. See RequiredDestinationSplits and
+//     docs/promotion.md §3 for the full derivation and its safety
+//     argument.
+//
+//     A single-tablet (or legacy) manifest still yields exactly one fully
+//     unbounded KeyExtent, unchanged from before.
 //
 //  2. Stages those RFiles flat into a bulk directory — Accumulo's bulk
 //     import lists the bulk directory non-recursively, so files must sit
@@ -28,8 +35,23 @@
 //     Gson-compatible JSON shape Accumulo's BulkSerialize /
 //     LoadMappingIterator expect.
 //
-//  3. Submits the TABLE_BULK_IMPORT2 FATE operation via
-//     accumulo.Connector.BulkImport — the only step that talks to
+//  3. For a multi-tablet manifest, the widened KeyExtents this package
+//     computes only pass Accumulo's own server-side
+//     PrepBulkImport.validateLoadMapping check if the destination table
+//     already has splits at the exact boundary rows RequiredDestinationSplits
+//     reports. Promote reconciles that by submitting those rows through
+//     the existing accumulo.Connector.AddTableSplits — itself a manager
+//     TABLE_SPLIT FATE operation, the same protocol
+//     TableOperations.addSplits uses — before staging or submitting the
+//     bulk import. BuildLoadMapping and StageBulkDir themselves never call
+//     Accumulo: a caller invoking them directly for a multi-tablet
+//     manifest, outside of Promote, is responsible for ensuring the
+//     destination already has matching splits, or the subsequent
+//     BulkImport call will fail closed (not silently) with a concurrent-
+//     merge-style rejection.
+//
+//  4. Submits the TABLE_BULK_IMPORT2 FATE operation via
+//     accumulo.Connector.BulkImport — the only other step that talks to
 //     Accumulo, and it does so exclusively through the manager's FATE
 //     machinery, preserving the manager as the sole authority over the
 //     promoted table's resulting tablet layout and file set.
@@ -91,21 +113,37 @@ type Mapping struct {
 type LoadMapping []Mapping
 
 // BuildLoadMapping derives a Bulk Import V2 load mapping from an
-// RFileExportManifest, but this safe first slice supports only
-// unambiguous single-tablet exports. A manifest is accepted only when it
-// either omits Tablets entirely and every RFile uses TabletIndex 0, or it
-// declares exactly one tablet whose StartRow and EndRow are both nil.
+// RFileExportManifest. A manifest is accepted when it either omits
+// Tablets entirely and every RFile uses TabletIndex 0 (the legacy default
+// tablet), or its declared Tablets form a single gapless chain: indexes
+// exactly {0, ..., N-1} in any slice order, the first tablet's StartRow
+// and the last tablet's EndRow both nil, every other boundary present,
+// each tablet's own StartRow strictly less than its own EndRow, and
+// tablet i's EndRow exactly equal to tablet i+1's StartRow for every
+// adjacent pair. Anything else — an out-of-range or duplicate index, a
+// missing or misplaced nil boundary, a degenerate/inverted range, or a
+// chain mismatch (a gap or an overlap) — is rejected before staging or
+// submission.
 //
-// Any split-bearing or multi-tablet manifest is rejected before staging or
-// submission: Shoal's [StartRow, EndRow) tablet boundaries cannot be
-// copied safely into Accumulo's (PrevEndRow, EndRow] extents without a
-// rewrite/materialization strategy for exact split-point rows.
-//
-// Accepted manifests yield a single, fully unbounded KeyExtent containing
-// every exported file. Accumulo can legitimately load a file that spans
-// many destination tablets under that one unbounded mapping entry, so the
-// destination split layout does not have to mirror the source for this
-// slice.
+// A single-tablet (or legacy) manifest yields one fully unbounded
+// KeyExtent{PrevEndRow: nil, EndRow: nil}, unchanged from before. A
+// multi-tablet manifest yields one Mapping per tablet index that has at
+// least one file (an index with zero files is silently omitted — there is
+// nothing to place there), each keyed by a deliberately widened KeyExtent:
+// EndRow is the tablet's own EndRow (always safe — the tablet's own
+// exported data never reaches that row, by construction of Shoal's
+// exclusive-end routing), but PrevEndRow is the *previous* tablet's own
+// StartRow rather than this tablet's own StartRow, so that a row exactly
+// equal to this tablet's inclusive start is never excluded by Accumulo's
+// exclusive-start convention. See RequiredDestinationSplits and
+// docs/promotion.md §3 for the full derivation. That widening means each
+// returned Mapping's KeyExtent generally spans up to two adjacent source
+// tablets' worth of destination range (index 1 widens all the way to
+// unbounded, since there is no tablet before index 0 to anchor to — an
+// acknowledged limitation, not a bug), so Accumulo may legitimately load
+// a file against more destination tablets than the source tablet it came
+// from; that is always safe, never a correctness issue, only a modest
+// over-registration.
 //
 // RFiles sharing the same DestinationPath (e.g. a manifest listing one
 // physical file more than once under the same tablet) contribute a single
@@ -123,12 +161,12 @@ func BuildLoadMapping(manifest *engine.RFileExportManifest) (LoadMapping, error)
 	if manifest == nil {
 		return nil, fmt.Errorf("promotion: nil export manifest")
 	}
-	tablet, declared, err := resolveManifestTablet(manifest)
+	tablets, declared, err := resolveManifestTablets(manifest)
 	if err != nil {
 		return nil, err
 	}
 
-	files := make([]FileEntry, 0, len(manifest.RFiles))
+	filesByTablet := make(map[int][]FileEntry, len(tablets))
 	seen := make(map[string]int, len(manifest.RFiles))
 	for _, rf := range manifest.RFiles {
 		if _, ok := declared[rf.TabletIndex]; !ok {
@@ -144,50 +182,206 @@ func BuildLoadMapping(manifest *engine.RFileExportManifest) (LoadMapping, error)
 			continue
 		}
 		seen[rf.DestinationPath] = rf.TabletIndex
-		files = append(files, FileEntry{
+		filesByTablet[rf.TabletIndex] = append(filesByTablet[rf.TabletIndex], FileEntry{
 			Name:    filepath.Base(rf.DestinationPath),
 			EstSize: rf.Size,
 		})
 	}
-	if len(files) == 0 {
+
+	mapping := make(LoadMapping, 0, len(tablets))
+	for _, tablet := range tablets {
+		files := filesByTablet[tablet.index]
+		if len(files) == 0 {
+			continue
+		}
+		sort.Slice(files, func(i, j int) bool { return files[i].Name < files[j].Name })
+		mapping = append(mapping, Mapping{Tablet: tablet.extent, Files: files})
+	}
+	if len(mapping) == 0 {
 		return nil, nil
 	}
-	sort.Slice(files, func(i, j int) bool { return files[i].Name < files[j].Name })
-	return LoadMapping{{
-		Tablet: KeyExtent{
-			EndRow:     rowBytes(tablet.EndRow),
-			PrevEndRow: rowBytes(tablet.StartRow),
-		},
-		Files: files,
-	}}, nil
+	return mapping, nil
 }
 
-func resolveManifestTablet(manifest *engine.RFileExportManifest) (engine.RFileExportTablet, map[int]struct{}, error) {
+// resolvedTablet is one manifest tablet index after full chain validation,
+// paired with the widened Accumulo KeyExtent BuildLoadMapping should use
+// for any RFiles declared under it.
+type resolvedTablet struct {
+	index  int
+	extent KeyExtent
+}
+
+// resolveManifestTablets validates manifest's declared tablet chain and
+// returns one resolvedTablet per index, in ascending index order
+// (0..N-1), plus the set of indexes BuildLoadMapping may accept RFiles
+// under. See resolveTabletChain for the exact chain-shape requirements and
+// BuildLoadMapping's doc comment for the widening rule.
+func resolveManifestTablets(manifest *engine.RFileExportManifest) ([]resolvedTablet, map[int]struct{}, error) {
 	if len(manifest.Tablets) == 0 {
 		for _, rf := range manifest.RFiles {
 			if rf.TabletIndex != 0 {
-				return engine.RFileExportTablet{}, nil, fmt.Errorf(
+				return nil, nil, fmt.Errorf(
 					"promotion: legacy manifest without tablets is ambiguous: rfile %q references tablet index %d",
 					rf.DestinationPath, rf.TabletIndex,
 				)
 			}
 		}
-		return engine.RFileExportTablet{Index: 0}, map[int]struct{}{0: {}}, nil
+		return []resolvedTablet{{index: 0}}, map[int]struct{}{0: {}}, nil
 	}
-	if len(manifest.Tablets) != 1 {
-		return engine.RFileExportTablet{}, nil, fmt.Errorf(
-			"promotion: split manifests unsupported in this slice: %d tablets declared",
-			len(manifest.Tablets),
-		)
+
+	chain, err := resolveTabletChain(manifest.Tablets)
+	if err != nil {
+		return nil, nil, err
 	}
-	tablet := manifest.Tablets[0]
-	if tablet.StartRow != nil || tablet.EndRow != nil {
-		return engine.RFileExportTablet{}, nil, fmt.Errorf(
-			"promotion: split manifests unsupported in this slice: tablet index %d declares start/end boundaries",
-			tablet.Index,
-		)
+
+	declared := make(map[int]struct{}, len(chain))
+	resolved := make([]resolvedTablet, len(chain))
+	for i, tablet := range chain {
+		declared[tablet.Index] = struct{}{}
+		var prevEndRow []byte
+		if i >= 1 {
+			// Widen to the *previous* tablet's own StartRow, not this
+			// tablet's own StartRow: Shoal's inclusive tablet start would
+			// otherwise fall outside Accumulo's exclusive-start extent.
+			prevEndRow = rowBytes(chain[i-1].StartRow)
+		}
+		resolved[i] = resolvedTablet{
+			index: tablet.Index,
+			extent: KeyExtent{
+				EndRow:     rowBytes(tablet.EndRow),
+				PrevEndRow: prevEndRow,
+			},
+		}
 	}
-	return tablet, map[int]struct{}{tablet.Index: {}}, nil
+	return resolved, declared, nil
+}
+
+// resolveTabletChain validates that tablets describes a single table's
+// entire keyspace as one unambiguous, gapless chain, independent of the
+// slice's own physical order, and returns it reordered so chain[i].Index
+// == i.
+//
+// Required shape: indexes are exactly {0, ..., N-1} with no duplicates,
+// gaps, or out-of-range values; tablet 0's StartRow is nil (negative
+// infinity); tablet N-1's EndRow is nil (positive infinity); every other
+// tablet declares both boundaries; every tablet's own StartRow is
+// strictly less than its own EndRow whenever both are set (rejecting
+// degenerate/inverted ranges); and tablet i's EndRow exactly equals
+// tablet i+1's StartRow for every adjacent pair (rejecting both gaps and
+// overlaps — anything short of exact equality is one or the other).
+func resolveTabletChain(tablets []engine.RFileExportTablet) ([]engine.RFileExportTablet, error) {
+	n := len(tablets)
+	byIndex := make(map[int]engine.RFileExportTablet, n)
+	for _, tablet := range tablets {
+		if tablet.Index < 0 || tablet.Index >= n {
+			return nil, fmt.Errorf(
+				"promotion: tablet index %d is out of range for a %d-tablet manifest",
+				tablet.Index, n,
+			)
+		}
+		if _, ok := byIndex[tablet.Index]; ok {
+			return nil, fmt.Errorf("promotion: tablet index %d is declared more than once", tablet.Index)
+		}
+		byIndex[tablet.Index] = tablet
+	}
+	// Every tablet.Index is distinct and inside [0, n), and there are
+	// exactly n of them, so byIndex necessarily holds one entry per index
+	// in [0, n): a full 0..n-1 cover, regardless of tablets' own order.
+	chain := make([]engine.RFileExportTablet, n)
+	for i := 0; i < n; i++ {
+		chain[i] = byIndex[i]
+	}
+
+	if chain[0].StartRow != nil {
+		return nil, fmt.Errorf("promotion: first tablet (index %d) must have a nil StartRow", chain[0].Index)
+	}
+	if chain[n-1].EndRow != nil {
+		return nil, fmt.Errorf("promotion: last tablet (index %d) must have a nil EndRow", chain[n-1].Index)
+	}
+	for i, tablet := range chain {
+		if i > 0 && tablet.StartRow == nil {
+			return nil, fmt.Errorf("promotion: tablet index %d is missing its StartRow", tablet.Index)
+		}
+		if i < n-1 && tablet.EndRow == nil {
+			return nil, fmt.Errorf("promotion: tablet index %d is missing its EndRow", tablet.Index)
+		}
+		if tablet.StartRow != nil && tablet.EndRow != nil && !(*tablet.StartRow < *tablet.EndRow) {
+			return nil, fmt.Errorf(
+				"promotion: tablet index %d has a degenerate or inverted range [%s, %s)",
+				tablet.Index, formatRow(tablet.StartRow), formatRow(tablet.EndRow),
+			)
+		}
+		if i > 0 {
+			prev := chain[i-1]
+			if prev.EndRow == nil || tablet.StartRow == nil || *prev.EndRow != *tablet.StartRow {
+				return nil, fmt.Errorf(
+					"promotion: tablet chain mismatch: tablet index %d ends at %s but tablet index %d starts at %s",
+					prev.Index, formatRow(prev.EndRow), tablet.Index, formatRow(tablet.StartRow),
+				)
+			}
+		}
+	}
+	return chain, nil
+}
+
+func formatRow(row *string) string {
+	if row == nil {
+		return "<nil>"
+	}
+	return fmt.Sprintf("%q", *row)
+}
+
+// RequiredDestinationSplits returns the destination table's split rows, in
+// ascending order, that must already exist before a Bulk Import V2
+// submission built from manifest's load mapping (BuildLoadMapping) can
+// pass Accumulo's own server-side PrepBulkImport.validateLoadMapping
+// check. It performs the same tablet-chain validation BuildLoadMapping
+// does, and fails the same way on a malformed manifest, but never touches
+// storage or Accumulo itself: it is a pure function, safe to call
+// standalone — for example to pre-create splits through
+// accumulo.Connector.AddTableSplits before staging, which is exactly what
+// Promote does.
+//
+// A single-tablet (or legacy) manifest requires no destination splits at
+// all: BuildLoadMapping's fully unbounded KeyExtent matches Accumulo's
+// outermost tablet boundaries (both nil) regardless of how many splits
+// the destination already has, so this returns (nil, nil) for that case.
+//
+// For an N-tablet manifest (N>1), the required splits are exactly the N-1
+// boundary rows shared by adjacent tablets (tablet i's EndRow, equivalently
+// tablet i+1's StartRow, for i in 0..N-2): those are the only rows any
+// widened KeyExtent BuildLoadMapping computes can ever reference.
+// Reconciling splits at coarser or finer points than these is unnecessary:
+// Accumulo's validateLoadMapping accepts a load-mapping entry whose
+// declared PrevEndRow/EndRow are each matched by some existing tablet
+// boundary and happily lets a single entry span several destination
+// tablets, so any additional pre-existing destination splits between
+// these points are harmless, not required.
+//
+// This says nothing about whether the destination will still have these
+// splits by the time a subsequent BulkImport call is validated server
+// side: a concurrent merge on the destination between split creation and
+// bulk-import submission is a real, acknowledged race this package cannot
+// close on its own (see docs/promotion.md §5) — Accumulo's own FATE
+// validation rejects that case outright rather than corrupting data, and
+// this function's contribution is only to make that rejection avoidable
+// in the common case, not to eliminate the race.
+func RequiredDestinationSplits(manifest *engine.RFileExportManifest) ([][]byte, error) {
+	if manifest == nil {
+		return nil, fmt.Errorf("promotion: nil export manifest")
+	}
+	resolved, _, err := resolveManifestTablets(manifest)
+	if err != nil {
+		return nil, err
+	}
+	if len(resolved) <= 1 {
+		return nil, nil
+	}
+	splits := make([][]byte, 0, len(resolved)-1)
+	for i := 0; i < len(resolved)-1; i++ {
+		splits = append(splits, resolved[i].extent.EndRow)
+	}
+	return splits, nil
 }
 
 func rowBytes(s *string) []byte {

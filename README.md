@@ -56,7 +56,7 @@ V1 + IVF-PQ iterator port shipped. Embedded standalone engine shipped.
 | Startup pre-warm (`-prewarm-tables=auto`) | shipped — distributed-serving mode |
 | Client-side hedge coordinator | shipped — `scanRow*` + `scanBatch*` overloads |
 | Offline compaction (`shoal-offline-compact`, `internal/offlinecompact`) | shipped — OFFLINE-fenced full major compaction off-cluster ([design](docs/offline-compaction-design.md) · [runbook](docs/offline-compaction.md)) |
-| Local→Accumulo promotion (`internal/promotion`, Bulk Import V2) | partial — load-mapping/staging + FATE `TABLE_BULK_IMPORT2` submission through the manager for unambiguous single-tablet exports only; split/multi-tablet manifests are rejected locally pending a rewrite/materialization strategy, and live-cluster verification, cutover protocol, and ongoing fan-in remain open ([design](docs/promotion.md)) |
+| Local→Accumulo promotion (`internal/promotion`, Bulk Import V2) | partial — load-mapping/staging + FATE `TABLE_BULK_IMPORT2` submission through the manager for both single-tablet and multi-tablet/split-bearing exports (destination splits are reconciled via `AddTableSplits`/`TABLE_SPLIT` before staging); live-cluster verification, a residual concurrent-merge race around split reconciliation, an ambiguous-FATE-retry gap on `BulkImport` itself, cutover protocol, and ongoing fan-in remain open ([design](docs/promotion.md)) |
 
 ## Embedded engine (standalone, no ZooKeeper)
 

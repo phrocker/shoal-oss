@@ -578,18 +578,178 @@ func TestStageBulkDirRejectsUndeclaredTabletIndexBeforeCopying(t *testing.T) {
 	}
 }
 
-func TestStageBulkDirRejectsSplitManifestBeforeCopying(t *testing.T) {
+func TestStageBulkDirAcceptsMultiTabletManifest(t *testing.T) {
 	src := memory.New()
 	src.Put("events/t-0000/F0001.rf", []byte("a"))
 	src.Put("events/t-0001/F0002.rf", []byte("b"))
+	manifest := twoTabletManifest()
+	manifest.RFiles[0].DestinationPath = "events/t-0000/F0001.rf"
+	manifest.RFiles[0].Size = 1
+	manifest.RFiles[0].SHA256 = "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb"
+	manifest.RFiles[1].DestinationPath = "events/t-0001/F0002.rf"
+	manifest.RFiles[1].Size = 1
+	manifest.RFiles[1].SHA256 = "3e23e8160039594a33894f6564e1b1348bbd7a0088d42c4acb73eeaed59c009d"
 
 	dst := memory.New()
 	ctx := context.Background()
-	if _, err := StageBulkDir(ctx, src, splitManifest(), dst, "/bulk/events-1"); err == nil {
-		t.Fatal("StageBulkDir(split manifest) = nil error, want error")
+	mapping, err := StageBulkDir(ctx, src, manifest, dst, "hdfs://nn/bulk/events-1")
+	if err != nil {
+		t.Fatalf("StageBulkDir(multi-tablet manifest) = %v, want success", err)
+	}
+	if len(mapping) != 2 {
+		t.Fatalf("mapping entries = %d, want 2", len(mapping))
+	}
+	if mapping[0].Tablet.EndRow == nil || string(mapping[0].Tablet.EndRow) != "g" || mapping[0].Tablet.PrevEndRow != nil {
+		t.Fatalf("mapping[0].Tablet = %#v, want (nil, %q]", mapping[0].Tablet, "g")
+	}
+	if mapping[1].Tablet.EndRow != nil || mapping[1].Tablet.PrevEndRow != nil {
+		t.Fatalf("mapping[1].Tablet = %#v, want fully unbounded (2-tablet collapse)", mapping[1].Tablet)
+	}
+	for _, want := range []string{
+		"hdfs://nn/bulk/events-1/F0001.rf",
+		"hdfs://nn/bulk/events-1/F0002.rf",
+		"hdfs://nn/bulk/events-1/loadmap.json",
+	} {
+		f, err := dst.Open(ctx, want)
+		if err != nil {
+			t.Fatalf("expected staged path %s: %v", want, err)
+		}
+		f.Close()
+	}
+}
+
+// TestStageBulkDirRejectsCrossTabletBasenameCollisionBeforeCopying proves
+// the flatten-collision check operates across the whole manifest, not
+// per-tablet: two RFiles that belong to *different* tablets but share a
+// basename once flattened into the single bulk directory must still be
+// rejected before any bytes are copied. flattenNames operates on
+// stageManifest.RFiles as a whole (every tablet's files together), so
+// this is the same code path as the existing single-tablet collision
+// test; this test exists to pin that cross-tablet behavior explicitly
+// now that multi-tablet manifests are accepted.
+func TestStageBulkDirRejectsCrossTabletBasenameCollisionBeforeCopying(t *testing.T) {
+	src := memory.New()
+	src.Put("events/t-0000/F0001.rf", []byte("a"))
+	src.Put("events/t-0001/F0001.rf", []byte("b"))
+
+	manifest := twoTabletManifest()
+	manifest.RFiles[0].DestinationPath = "events/t-0000/F0001.rf"
+	manifest.RFiles[1].DestinationPath = "events/t-0001/F0001.rf" // same basename as tablet 0's file
+
+	dst := memory.New()
+	ctx := context.Background()
+	if _, err := StageBulkDir(ctx, src, manifest, dst, "hdfs://nn/bulk/events-1"); err == nil {
+		t.Fatal("StageBulkDir with cross-tablet basename collision = nil error, want error")
 	}
 	if got := dst.Keys(); len(got) != 0 {
-		t.Fatalf("StageBulkDir wrote %v on split-manifest rejection, want no partial writes", got)
+		t.Fatalf("StageBulkDir wrote %v on cross-tablet collision error, want no partial writes", got)
+	}
+}
+
+// cancelingBackend wraps a *memory.Backend and, the instant its Nth Create
+// call (1-indexed, counted across the wrapper's whole lifetime) is
+// issued, invokes cancel before delegating to the real Create. storage.Copy
+// checks ctx.Err() again immediately after Create returns and before any
+// bytes are transferred, so this reproduces "cancellation observed
+// mid-operation, after the destination writer was already opened" without
+// needing a real slow backend or a race-prone timer.
+type cancelingBackend struct {
+	*memory.Backend
+	cancel   context.CancelFunc
+	cancelAt int32
+	creates  int32
+}
+
+func (b *cancelingBackend) Create(ctx context.Context, path string) (shstorage.Writer, error) {
+	n := atomic.AddInt32(&b.creates, 1)
+	if n == b.cancelAt {
+		b.cancel()
+	}
+	return b.Backend.Create(ctx, path)
+}
+
+// TestStageBulkDirCancellationLeavesNoPartialObjectAndRetrySucceeds covers
+// three of the honesty-critical properties for multi-tablet staging under
+// interruption: (1) a file whose Create races a mid-copy cancellation is
+// aborted rather than left as a partial/corrupt object; (2) StageBulkDir
+// is NOT atomic across a multi-file manifest -- an earlier file that had
+// already finished copying before the cancellation was observed remains
+// staged even though the overall call fails, and no loadmap.json is
+// written; (3) retrying the identical call with a fresh, non-cancelled
+// context against the SAME destination directory converges to the full,
+// correct staged set, because Create replaces any existing object at each
+// path and loadmap.json is only written after every file copy succeeds.
+// This is deliberately not a claim that StageBulkDir is atomic or
+// idempotent in the FATE sense -- only that a caller who retries after an
+// interrupted attempt ends up with a complete, correct bulk directory,
+// and that a reader who inspects the destination mid-window between the
+// failed attempt and the retry can observe a partial (but never
+// corrupt-content) set of files.
+func TestStageBulkDirCancellationLeavesNoPartialObjectAndRetrySucceeds(t *testing.T) {
+	src := memory.New()
+	src.Put("events/t-0000/F0001.rf", []byte("a"))
+	src.Put("events/t-0001/F0002.rf", []byte("b"))
+	src.Put("events/t-0002/F0003.rf", []byte("c"))
+
+	manifest := threeTabletManifest()
+	manifest.RFiles[0].DestinationPath = "events/t-0000/F0001.rf"
+	manifest.RFiles[0].Size = 1
+	manifest.RFiles[0].SHA256 = "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb"
+	manifest.RFiles[1].DestinationPath = "events/t-0001/F0002.rf"
+	manifest.RFiles[1].Size = 1
+	manifest.RFiles[1].SHA256 = "3e23e8160039594a33894f6564e1b1348bbd7a0088d42c4acb73eeaed59c009d"
+	manifest.RFiles[2].DestinationPath = "events/t-0002/F0003.rf"
+	manifest.RFiles[2].Size = 1
+	manifest.RFiles[2].SHA256 = "2e7d2c03a9507ae265ecf5b5356885a53393a2029d241394997265a1a25aefc6"
+
+	realDst := memory.New()
+	cancelCtx, cancel := context.WithCancel(context.Background())
+	canceling := &cancelingBackend{Backend: realDst, cancel: cancel, cancelAt: 2}
+
+	const bulkDir = "hdfs://nn/bulk/events-1"
+	if _, err := StageBulkDir(cancelCtx, src, manifest, canceling, bulkDir); err == nil {
+		t.Fatal("StageBulkDir under mid-copy cancellation = nil error, want error")
+	} else if !errors.Is(err, context.Canceled) {
+		t.Fatalf("StageBulkDir error = %v, want context.Canceled in the chain", err)
+	}
+
+	bg := context.Background()
+	if f, err := realDst.Open(bg, bulkDir+"/F0001.rf"); err != nil {
+		t.Fatalf("F0001.rf (fully copied before cancellation was observed) = %v, want present", err)
+	} else {
+		f.Close()
+	}
+	for _, missing := range []string{"/F0002.rf", "/F0003.rf", "/loadmap.json"} {
+		if _, err := realDst.Open(bg, bulkDir+missing); err == nil {
+			t.Fatalf("%s present after cancelled stage, want absent (no partial/unreached writes)", missing)
+		}
+	}
+
+	// Retry with a fresh, non-cancelled context against the same
+	// destination. The wrapper's cancelAt has already been consumed by
+	// the first attempt's second Create call, so this retry's Creates
+	// (calls 3-5, or however many the failed attempt reached) never
+	// trigger cancel again.
+	mapping, err := StageBulkDir(bg, src, manifest, canceling, bulkDir)
+	if err != nil {
+		t.Fatalf("StageBulkDir retry after cancellation = %v, want success", err)
+	}
+	if len(mapping) != 3 {
+		t.Fatalf("retry mapping entries = %d, want 3", len(mapping))
+	}
+	for _, name := range []string{"F0001.rf", "F0002.rf", "F0003.rf", "loadmap.json"} {
+		f, err := realDst.Open(bg, bulkDir+"/"+name)
+		if err != nil {
+			t.Fatalf("expected staged path %s after retry: %v", name, err)
+		}
+		f.Close()
+	}
+	onDisk, err := ReadLoadMapping(bg, realDst, bulkDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(onDisk) != len(mapping) {
+		t.Fatalf("on-disk mapping entries = %d, want %d", len(onDisk), len(mapping))
 	}
 }
 
