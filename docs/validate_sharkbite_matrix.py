@@ -185,8 +185,8 @@ EXPECTED_METADATA_FIELDS = {
     "Sharkbite release line": "`sharkbite` 1.2.0.3 on PyPI (`setup.py:34-35`)",
     "Shoal reference": (
         "`phrocker/shoal-oss` exact audited baseline for revision 17 "
-        "`34f03068c6b3dafc2991770bebb76251b76788c5` "
-        "(\"test(capi): cover all administration permission families\")"
+        "`f8ee1453512004e2ade07245c502be0d63a302bd` "
+        "(\"test(capi): cover invalid authorization input\")"
     ),
     "Shoal C ABI version": "`SHOAL_ABI_VERSION 1u` (`capi/include/shoal_types.h`)",
 }
