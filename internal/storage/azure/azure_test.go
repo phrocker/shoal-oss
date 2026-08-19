@@ -331,7 +331,7 @@ func TestNextTemporaryStageNameRetainsDeepPrefixNearMaxBytes(t *testing.T) {
 		randomStageNameToken = original
 	})
 
-	name := strings.Repeat("a", 1004) + "/x"
+	name := strings.Repeat("a", 1015) + "/x"
 	stageName, err := nextTemporaryStageName(name)
 	if err != nil {
 		t.Fatalf("nextTemporaryStageName: %v", err)

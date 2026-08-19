@@ -323,20 +323,19 @@ func nextTemporaryStageName(name string) (string, error) {
 	if len(hashHex) < tempStageHashHexLen || len(token) < tempStageRandomHexLen {
 		return "", fmt.Errorf("temporary blob token material too short")
 	}
-	component := tempStageNamePrefix + hashHex[:tempStageHashHexLen] + token[:tempStageRandomHexLen]
-	if len(prefix)+len(component) > maxBlobNameBytes {
-		return "", fmt.Errorf("temporary blob name exceeds %d-byte limit", maxBlobNameBytes)
+	component := tempStageNamePrefix + token[:tempStageRandomHexLen] + hashHex[:tempStageHashHexLen]
+	available := maxBlobNameBytes - len(prefix)
+	if available < 1 {
+		return "", fmt.Errorf("blob prefix %q leaves no room for a temporary blob", prefix)
+	}
+	if len(component) > available {
+		component = component[:available]
 	}
 	return prefix + component, nil
 }
 
 func temporaryStageNamePrefixFor(name string) string {
-	prefix := stageNameParentPrefix(name)
-	for prefix != "" && maxBlobNameBytes-len(prefix) < tempStageComponentLen {
-		trimmed := strings.TrimSuffix(prefix, "/")
-		prefix = stageNameParentPrefix(trimmed)
-	}
-	return prefix
+	return stageNameParentPrefix(name)
 }
 
 func stageNameParentPrefix(name string) string {
@@ -352,7 +351,7 @@ func isTemporaryStageName(name string) bool {
 		base = base[idx+1:]
 	}
 	return strings.HasPrefix(name, legacyStageDirPrefix) ||
-		(len(base) == tempStageComponentLen && strings.HasPrefix(base, tempStageNamePrefix))
+		strings.HasPrefix(base, tempStageNamePrefix)
 }
 
 type azureCopySource struct {

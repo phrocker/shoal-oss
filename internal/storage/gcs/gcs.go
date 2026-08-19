@@ -237,11 +237,12 @@ func nextTemporaryObjectName(object string) (string, error) {
 		return "", fmt.Errorf("temporary object token material too short")
 	}
 	component := temporaryObjectComponent(hashHex, token)
-	if len(component) > maxObjectSegmentBytes {
-		return "", fmt.Errorf("temporary object segment exceeds %d-byte hierarchical limit", maxObjectSegmentBytes)
+	available := min(maxObjectNameBytes-len(prefix), maxObjectSegmentBytes)
+	if available < 1 {
+		return "", fmt.Errorf("object prefix %q leaves no room for a temporary object", prefix)
 	}
-	if len(prefix)+len(component) > maxObjectNameBytes {
-		return "", fmt.Errorf("temporary object name exceeds %d-byte GCS object limit", maxObjectNameBytes)
+	if len(component) > available {
+		component = component[:available]
 	}
 	return prefix + component, nil
 }
@@ -254,16 +255,11 @@ func tempObjectParentPrefix(object string) string {
 }
 
 func temporaryObjectPrefixFor(object string) string {
-	prefix := tempObjectParentPrefix(object)
-	for prefix != "" && maxObjectNameBytes-len(prefix) < tempObjectComponentLen {
-		trimmed := strings.TrimSuffix(prefix, "/")
-		prefix = tempObjectParentPrefix(trimmed)
-	}
-	return prefix
+	return tempObjectParentPrefix(object)
 }
 
 func temporaryObjectComponent(hash, token string) string {
-	return tempObjectPrefix + hash[:tempObjectHashHexLen] + token[:tempObjectRandomHexLen]
+	return tempObjectPrefix + token[:tempObjectRandomHexLen] + hash[:tempObjectHashHexLen]
 }
 
 func isTemporaryObjectName(object string) bool {
@@ -272,7 +268,7 @@ func isTemporaryObjectName(object string) bool {
 		name = name[idx+1:]
 	}
 	return strings.HasPrefix(name, legacyTempObjectPrefix) ||
-		(len(name) == tempObjectComponentLen && strings.HasPrefix(name, tempObjectPrefix))
+		strings.HasPrefix(name, tempObjectPrefix)
 }
 
 // file is the GCS File implementation. Each ReadAt opens a fresh

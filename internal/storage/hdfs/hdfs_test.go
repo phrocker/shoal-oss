@@ -298,6 +298,79 @@ func TestBackendCommittedBackupDeleteDoesNotRollbackReplacement(t *testing.T) {
 	}
 }
 
+func TestBackendBackupDeleteFailureRestoresOldTargetWhenPublishedTargetDisappeared(t *testing.T) {
+	client := newFakeClient()
+	client.files["/tables/1.rf"] = []byte("old")
+	client.removeContextHook = func(_ context.Context, name string) error {
+		if strings.Contains(name, ".shoal-backup-") {
+			delete(client.files, "/tables/1.rf")
+			return context.DeadlineExceeded
+		}
+		return nil
+	}
+	backend, err := New("nn:8020", WithClient(client))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = storage.WriteAll(context.Background(), backend, "/tables/1.rf", []byte("new"))
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("WriteAll error = %v, want context deadline exceeded", err)
+	}
+	if got := string(client.files["/tables/1.rf"]); got != "old" {
+		t.Fatalf("target contents = %q, want restored old data", got)
+	}
+}
+
+func TestBackendBackupDeleteFailureDoesNotRollbackConcurrentTarget(t *testing.T) {
+	client := newFakeClient()
+	client.files["/tables/1.rf"] = []byte("old")
+	client.removeContextHook = func(_ context.Context, name string) error {
+		if strings.Contains(name, ".shoal-backup-") {
+			client.files["/tables/1.rf"] = []byte("concurrent")
+			return context.DeadlineExceeded
+		}
+		return nil
+	}
+	backend, err := New("nn:8020", WithClient(client))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = storage.WriteAll(context.Background(), backend, "/tables/1.rf", []byte("new"))
+	if err == nil || !strings.Contains(err.Error(), "changed concurrently") {
+		t.Fatalf("WriteAll error = %v, want concurrent mutation safeguard", err)
+	}
+	if got := string(client.files["/tables/1.rf"]); got != "concurrent" {
+		t.Fatalf("target contents = %q, want concurrent data", got)
+	}
+}
+
+func TestBackendAmbiguousBackupRenameDoesNotOverwriteConcurrentTarget(t *testing.T) {
+	client := newFakeClient()
+	client.files["/tables/1.rf"] = []byte("old")
+	client.renameContextHook = func(_ context.Context, oldpath, newpath string) error {
+		if oldpath == "/tables/1.rf" && strings.Contains(newpath, ".shoal-backup-") {
+			client.files[newpath] = append([]byte(nil), client.files[oldpath]...)
+			client.files[oldpath] = []byte("concurrent")
+			return context.DeadlineExceeded
+		}
+		return nil
+	}
+	backend, err := New("nn:8020", WithClient(client))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = storage.WriteAll(context.Background(), backend, "/tables/1.rf", []byte("new"))
+	if err == nil || !strings.Contains(err.Error(), "concurrently recreated") {
+		t.Fatalf("WriteAll error = %v, want concurrent recreation safeguard", err)
+	}
+	if got := string(client.files["/tables/1.rf"]); got != "concurrent" {
+		t.Fatalf("target contents = %q, want concurrent data", got)
+	}
+}
+
 func TestBackendListPreservesPathForm(t *testing.T) {
 	client := newFakeClient()
 	client.files["/tables/1.rf"] = []byte("one")
