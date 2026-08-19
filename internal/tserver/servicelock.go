@@ -140,11 +140,21 @@ func PublicACL() []gozk.ACL {
 // under: <instancePath>/tservers/<group>/<address>, the Accumulo 4 layout
 // internal/zk walks when it enumerates live servers. An empty group means
 // DefaultResourceGroup.
-func TabletServerLockPath(instancePath, group, address string) string {
+//
+// A group outside Accumulo's resource-group grammar is refused rather than
+// joined into a path. Segments are cleaned when they are joined, so a name
+// like "../managers" would not register this server under tservers at all —
+// it would put it in another role's subtree, where nothing looking for a
+// tablet server would find it and something looking for a manager might.
+func TabletServerLockPath(instancePath, group, address string) (string, error) {
 	if group == "" {
 		group = DefaultResourceGroup
 	}
-	return path.Join(instancePath, zTabletServers, group, address)
+	if !validResourceGroup(group) {
+		return "", fmt.Errorf("%w: resource group %q is not a name Accumulo reads (must match %s)",
+			ErrInvalidLockData, group, resourceGroupPattern)
+	}
+	return path.Join(instancePath, zTabletServers, group, address), nil
 }
 
 // ParseLockNode maps a ZooKeeper lock child name onto the identity it names.
@@ -280,6 +290,12 @@ type ServiceLock struct {
 	// unrelated holder happened to leave.
 	release     chan struct{}
 	releaseOnce sync.Once
+
+	// createMu makes creating this process's node and sweeping it away
+	// mutually exclusive. Without it a release can read an empty directory,
+	// report success, and be followed by a create it never saw, leaving a
+	// node in the queue that the caller was told did not exist.
+	createMu sync.Mutex
 }
 
 // NewServiceLock returns a lock participant for one generation.
@@ -404,22 +420,44 @@ func (l *ServiceLock) Acquire(ctx context.Context, data ServiceLockData) (LockID
 	if err := l.ensureLockDirectory(); err != nil {
 		return LockID{}, err
 	}
-	if l.isReleased() {
-		// Released before anything was created: there is nothing to clean up
-		// and nothing to wait for.
-		return LockID{}, fmt.Errorf("%w: %s", ErrLockReleased, l.dir)
-	}
-	if _, err := l.conn.Create(l.dir+"/"+l.nodePrefix(), payload,
-		gozk.FlagEphemeral|gozk.FlagSequence, l.acl); err != nil {
+	if err := l.createNode(payload); err != nil {
+		if errors.Is(err, ErrLockReleased) {
+			// Released before anything was created: there is nothing to clean
+			// up and nothing to wait for.
+			return LockID{}, err
+		}
 		// The create may have taken effect even though the answer was lost,
 		// so sweep before giving up rather than leaving a node in the queue.
-		return LockID{}, l.withCleanup(fmt.Errorf("create lock node in %s: %w", l.dir, err))
+		return LockID{}, l.withCleanup(err)
 	}
 	id, err := l.waitForOwnership(ctx)
 	if err != nil {
 		return LockID{}, l.withCleanup(err)
 	}
 	return id, nil
+}
+
+// createNode creates this process's queued lock node, refusing once Release
+// has been called.
+//
+// The refusal and the create are held under createMu, which Release takes
+// around its sweep. That is what makes a successful release mean what it
+// says: either the create runs first and the sweep that follows finds its
+// node, or the release runs first and there is no create at all. Checking a
+// flag without the lock would leave the window between the check and the
+// create, in which a release can look at an empty directory, report success,
+// and leave the node that lands a moment later holding a place in the queue.
+func (l *ServiceLock) createNode(payload []byte) error {
+	l.createMu.Lock()
+	defer l.createMu.Unlock()
+	if l.isReleased() {
+		return fmt.Errorf("%w: %s", ErrLockReleased, l.dir)
+	}
+	if _, err := l.conn.Create(l.dir+"/"+l.nodePrefix(), payload,
+		gozk.FlagEphemeral|gozk.FlagSequence, l.acl); err != nil {
+		return fmt.Errorf("create lock node in %s: %w", l.dir, err)
+	}
+	return nil
 }
 
 // withCleanup sweeps the nodes of an acquisition that did not finish and
@@ -580,30 +618,44 @@ func (l *ServiceLock) Maintain(ctx context.Context) error {
 		defer ticker.Stop()
 		ticks = ticker.C
 	}
+	// One watch is outstanding at a time. A ZooKeeper watch is one-shot but
+	// stays registered on both client and server until it fires, so arming a
+	// new one on every pass would leave the old one behind: on a healthy
+	// cluster the verify timer alone would accumulate a registration per
+	// interval for the life of the lock, and they would all fire at once the
+	// moment the node finally changed.
+	var events <-chan gozk.Event
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		exists, _, events, err := l.conn.ExistsW(nodePath)
-		if err != nil {
-			return l.lose(LossUnmonitorable, fmt.Errorf("watch %s: %w", nodePath, err))
-		}
-		if !exists {
-			return l.lose(LossNodeDeleted, nil)
+		if events == nil {
+			exists, _, armed, err := l.conn.ExistsW(nodePath)
+			if err != nil {
+				return l.lose(LossUnmonitorable, fmt.Errorf("watch %s: %w", nodePath, err))
+			}
+			if !exists {
+				return l.lose(LossNodeDeleted, nil)
+			}
+			events = armed
 		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-ticks:
+			// The watch armed above is still live and still the only one, so
+			// it is left in place. Verify re-reads the directory itself, which
+			// covers the node being gone without an event.
 			if err := l.Verify(); err != nil {
 				return err
 			}
 		case event := <-events:
+			// The watch fired, so it is spent. Dropping it re-arms on the next
+			// pass, which re-checks that the node is still there.
+			events = nil
 			if err := l.classifyEvent(event); err != nil {
 				return err
 			}
-			// Anything else re-arms the watch on the next pass, which
-			// re-checks that the node is still there.
 		}
 	}
 }
@@ -663,6 +715,9 @@ func (l *ServiceLock) Verify() error {
 // cannot leave a place in line for a process that is no longer waiting — and
 // the acquisition is woken and refused, so it cannot go on to hold a lock the
 // caller has already given up.
+//
+// A create that was already in flight is waited out before the sweep, so the
+// success this reports covers that node too rather than racing past it.
 func (l *ServiceLock) Release() error {
 	l.mu.Lock()
 	if !l.started {
@@ -672,7 +727,12 @@ func (l *ServiceLock) Release() error {
 	l.released = true
 	l.mu.Unlock()
 	l.releaseOnce.Do(func() { close(l.release) })
+	// released is set above, so a create that has not started yet is already
+	// refused; taking createMu here waits out one that has. Between them the
+	// sweep below cannot miss a node this process made.
+	l.createMu.Lock()
 	err := l.deleteOwnNodes()
+	l.createMu.Unlock()
 	l.lose(LossReleased, nil)
 	return err
 }

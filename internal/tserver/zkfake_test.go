@@ -36,8 +36,13 @@ const (
 )
 
 // testLockPath is the tablet-server lock directory the fakes register under.
+// testGroup is a constant this package controls, so the path always resolves.
 func testLockPath() string {
-	return TabletServerLockPath(testInstancePath, testGroup, testAddress)
+	dir, err := TabletServerLockPath(testInstancePath, testGroup, testAddress)
+	if err != nil {
+		panic(err)
+	}
+	return dir
 }
 
 type fakeNode struct {
@@ -139,6 +144,23 @@ func (f *fakeZK) seedForeignLock(dir, holder string, sequence int32) string {
 	}
 	f.mu.Unlock()
 	return name
+}
+
+// recreate removes a directory and its children and puts the directory back
+// empty. It is how ZooKeeper's sequential counter restarts: the counter lives
+// on the parent, so a directory that is deleted and remade hands out numbers
+// from zero again.
+func (f *fakeZK) recreate(dir string) {
+	f.mu.Lock()
+	prefix := strings.TrimSuffix(dir, "/") + "/"
+	for candidate := range f.nodes {
+		if candidate == dir || strings.HasPrefix(candidate, prefix) {
+			delete(f.nodes, candidate)
+		}
+	}
+	delete(f.sequence, dir)
+	f.mu.Unlock()
+	f.seed(dir, nil, false)
 }
 
 func (f *fakeZK) Create(znodePath string, data []byte, flags int32, acl []gozk.ACL) (string, error) {
@@ -301,6 +323,15 @@ func (f *fakeZK) exists(znodePath string) bool {
 	defer f.mu.Unlock()
 	_, ok := f.nodes[znodePath]
 	return ok
+}
+
+// watchCount returns how many existence watches are outstanding on a path. A
+// one-shot watch stays registered until it fires, so this is what grows when a
+// caller arms a watch it never consumes.
+func (f *fakeZK) watchCount(znodePath string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.watches[znodePath])
 }
 
 func (f *fakeZK) node(znodePath string) (fakeNode, bool) {

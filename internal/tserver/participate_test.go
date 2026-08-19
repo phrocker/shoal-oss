@@ -387,3 +387,73 @@ func TestParticipateRefusesUnusableLockData(t *testing.T) {
 		t.Fatal("the host adopted a lock that was never published")
 	}
 }
+
+// TestRejoinIntoARecreatedLockDirectoryNeedsAFreshHost pins the one case where
+// a rejoin is not simply a matter of building another ServiceLock, which is
+// what Participate documents.
+//
+// ZooKeeper's sequential counter lives on the parent, so a lock directory that
+// is deleted and recreated hands out numbers from zero again — the same reset
+// ServiceLock.Verify reports as LossSuperseded, seen from the other side. The
+// rejoining process is then offered a generation its host has already used,
+// and AdoptLock refuses it, correctly: from the host's side a sequence at or
+// below the high-water mark is indistinguishable from a replay of a lock it no
+// longer holds. Retrying against the same host fails the same way every time,
+// so the recovery is a host that has used nothing.
+func TestRejoinIntoARecreatedLockDirectoryNeedsAFreshHost(t *testing.T) {
+	f := newFakeZK()
+	host := NewHost()
+
+	// Push the counter up, so the first generation is plainly above the number
+	// a recreated directory would hand out.
+	stale := f.seedForeignLock(testLockPath(), otherUUID, 4)
+	if err := f.Delete(path.Join(testLockPath(), stale), -1); err != nil {
+		t.Fatalf("delete the seeded node: %v", err)
+	}
+	first := newTestLock(t, f, serverUUID)
+	firstID, err := first.Acquire(context.Background(), testLockData(t))
+	if err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	if firstID.Sequence == 0 {
+		t.Fatalf("expected the first generation above zero, got %s", firstID)
+	}
+	if err := host.AdoptLock(firstID); err != nil {
+		t.Fatalf("AdoptLock: %v", err)
+	}
+	if err := first.Release(); err != nil {
+		t.Fatalf("Release: %v", err)
+	}
+	host.LoseLock(firstID)
+
+	f.recreate(testLockPath())
+
+	second := newTestLock(t, f, serverUUID)
+	err = Participate(context.Background(), second, host, testLockData(t), nil)
+	if !errors.Is(err, ErrLockNotNewer) {
+		t.Fatalf("Participate: want ErrLockNotNewer, got %v", err)
+	}
+	if _, ok := host.Lock(); ok {
+		t.Fatal("the host adopted a generation it had already used")
+	}
+	// Refusing is not enough on its own: a process that will not host under
+	// the lock must not sit in ZooKeeper looking like one that will.
+	if nodes := f.lockNodes(testLockPath()); len(nodes) != 0 {
+		t.Fatalf("the refused rejoin left %v registered", nodes)
+	}
+
+	// The documented recovery. The high-water mark is per-host state, so a
+	// host that has used nothing accepts the very generation the old one
+	// refused.
+	third := newTestLock(t, f, serverUUID)
+	thirdID, err := third.Acquire(context.Background(), testLockData(t))
+	if err != nil {
+		t.Fatalf("Acquire after the recreation: %v", err)
+	}
+	if err := host.AdoptLock(thirdID); !errors.Is(err, ErrLockNotNewer) {
+		t.Fatalf("the used host must keep refusing: got %v", err)
+	}
+	if err := NewHost().AdoptLock(thirdID); err != nil {
+		t.Fatalf("a fresh host refused %s: %v", thirdID, err)
+	}
+}

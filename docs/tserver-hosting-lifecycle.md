@@ -269,6 +269,17 @@ would put a node name in the directory that `validateAndSort` throws on
 and a payload the manager cannot deserialize — this process would queue
 invisibly while Accumulo handed the lock to somebody else.
 
+The resource group is held to Accumulo's grammar for the same reason,
+`ResourceGroupId.GROUP_NAME_PATTERN` — `^[a-zA-Z]+(_?[a-zA-Z0-9])*$`.
+`ServiceLockData.parse` builds a `ResourceGroupId` from every descriptor
+it reads, and that constructor throws on anything outside the grammar,
+so a group this process accepts and Accumulo does not makes the whole
+znode unreadable. It also keeps the group out of a path it has no
+business in: path segments are cleaned when the lock directory is built,
+so a group like `../managers` would not be rejected by the join — it
+would quietly register this server in another role's subtree, where
+nothing looking for a tablet server would find it.
+
 Duplicates are real: a create whose response was lost still created a
 node, and a retry creates another. Both carry this process's UUID, so
 the first is kept and the rest are deleted — otherwise one process would
@@ -300,6 +311,13 @@ what it intends to serve. `TabletServerServices()` names the full Java
 set, but the caller chooses the subset, and until the Thrift endpoints
 behind a service exist, advertising it routes work into a black hole.
 
+The subset is a subset of those five and nothing else. `MANAGER`,
+`COORDINATOR`, `GC`, `COMPACTOR` and the `FATE_*` services are defined
+by the same enum and advertised on their own locks by the processes that
+implement them; a tablet-server lock claiming one would point a client
+at an endpoint this process does not serve, in a combination Accumulo
+itself never writes and so has no reason to guard against.
+
 ### Holding it, and letting go
 
 `Maintain` watches the node and returns when the generation ends.
@@ -309,6 +327,13 @@ mirrors `LockWatcher.unableToMonitorLockNode`, where the Java tablet
 server halts — a lock this process cannot monitor is one it cannot prove
 it still holds, and hosting on an unprovable lock is exactly what
 [§4](#4-the-fence) exists to stop.
+
+Exactly one watch is outstanding at a time. A ZooKeeper watch is
+one-shot, but it stays registered on the client and the server until it
+fires, so a new one is armed only after the previous one has been
+consumed. Arming per pass would make a healthy tablet server accumulate
+a registration per verify interval for the life of its lock, and deliver
+all of them at once when the node finally changed.
 
 An optional verify interval re-reads the directory on a timer. It catches
 what a watch cannot: a watch dropped without an event, and a lock
@@ -331,6 +356,22 @@ the wait is woken and refused with `ErrLockReleased`. Releasing only the
 held node would leave a caller that was told the lock was gone going on
 to hold it, and would promote a surviving duplicate to holder of a lock
 nobody is waiting on.
+
+A create that was already in flight is waited out before the sweep. The
+two are mutually exclusive, so either the create happens and the sweep
+that follows finds its node, or the release wins and there is no create
+at all. Checking a flag alone leaves the window between the check and
+the create, in which a release can read an empty directory, report
+success, and be followed by the node it was supposed to remove.
+
+Rejoining is ordinarily just another `ServiceLock`, whose node carries a
+higher sequence than the one that ended. The exception is the recreated
+directory above: the counter restarts, so a rejoining process can be
+handed a generation its `Host` has already used, and `AdoptLock` refuses
+it with `ErrLockNotNewer` — from the host's side that is
+indistinguishable from a replay of a lock it no longer holds. The
+high-water mark is per-host state, so recovery is a fresh `Host`, not a
+retry; retrying against the same one fails identically every time.
 
 ### Reading the manager's lock
 

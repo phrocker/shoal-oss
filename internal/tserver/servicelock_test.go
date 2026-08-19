@@ -25,6 +25,7 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -699,6 +700,201 @@ func TestVerifyDetectsASupersedingHolder(t *testing.T) {
 	}
 }
 
+// TestMaintainKeepsExactlyOneWatchOutstanding covers the ordinary case: a lock
+// held across many verify intervals with nothing going wrong.
+//
+// A ZooKeeper existence watch is one-shot, but it stays registered on the
+// client and on the server until it fires. Arming a fresh one on every pass
+// through the maintain loop would leave the previous one behind, so a healthy
+// tablet server would accumulate a registration per verify interval for the
+// life of its lock — and every one of them would fire at once the moment the
+// node finally changed.
+func TestMaintainKeepsExactlyOneWatchOutstanding(t *testing.T) {
+	f := newFakeZK()
+	lock, err := NewServiceLock(f, ServiceLockOptions{
+		Path:           testLockPath(),
+		UUID:           serverUUID,
+		VerifyInterval: time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("NewServiceLock: %v", err)
+	}
+	if _, err := lock.Acquire(context.Background(), testLockData(t)); err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	nodePath := path.Join(testLockPath(), lock.Node())
+
+	// Verify is the only thing that lists the directory once maintaining has
+	// started, so counting listings counts the intervals that have elapsed.
+	// Set before the goroutine starts, and never touched again.
+	var verifies atomic.Int64
+	f.beforeChildren = func(listed string) {
+		if listed == testLockPath() {
+			verifies.Add(1)
+		}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- lock.Maintain(ctx) }()
+
+	const intervals = 20
+	deadline := time.After(5 * time.Second)
+	for verifies.Load() < intervals {
+		select {
+		case err := <-done:
+			t.Fatalf("Maintain returned before the intervals elapsed: %v", err)
+		case <-deadline:
+			t.Fatalf("only %d verify intervals elapsed, wanted %d", verifies.Load(), intervals)
+		case <-time.After(time.Millisecond):
+		}
+	}
+	if got := f.watchCount(nodePath); got != 1 {
+		t.Fatalf("%d watches outstanding on %s after %d verify intervals, want exactly 1",
+			got, nodePath, verifies.Load())
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Maintain: want context.Canceled, got %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Maintain did not return after cancellation")
+	}
+	if _, held := lock.LockID(); !held {
+		t.Fatal("a cancelled maintain must leave the lock held")
+	}
+}
+
+// TestMaintainRearmsTheWatchAfterItFires is the other half of the accounting:
+// one watch is the ceiling, not the total. A watch that has fired is spent, so
+// a lock that survives an unrelated event has to arm another or it would stop
+// hearing about its own node.
+func TestMaintainRearmsTheWatchAfterItFires(t *testing.T) {
+	f := newFakeZK()
+	lock := newTestLock(t, f, serverUUID)
+	if _, err := lock.Acquire(context.Background(), testLockData(t)); err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	nodePath := path.Join(testLockPath(), lock.Node())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- lock.Maintain(ctx) }()
+
+	waitArmed(t, f, nodePath)
+	// A change that is not a deletion: the holder keeps the lock and has to
+	// keep watching it.
+	f.fire(nodePath, gozk.Event{
+		Type:  gozk.EventNodeDataChanged,
+		State: gozk.StateHasSession,
+		Path:  nodePath,
+	})
+	waitArmed(t, f, nodePath)
+	if got := f.watchCount(nodePath); got != 1 {
+		t.Fatalf("%d watches outstanding on %s, want exactly 1", got, nodePath)
+	}
+
+	// The re-armed watch is the one that reports the loss.
+	if err := f.Delete(nodePath, -1); err != nil {
+		t.Fatalf("delete the lock node: %v", err)
+	}
+	select {
+	case err := <-done:
+		if !errors.Is(err, ErrLockLost) {
+			t.Fatalf("Maintain: want ErrLockLost, got %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the re-armed watch never reported the deleted node")
+	}
+	if lock.LossReason() != LossNodeDeleted {
+		t.Fatalf("loss reason %s, want NODE_DELETED", lock.LossReason())
+	}
+}
+
+// TestReleaseWaitsOutACreateAlreadyInFlight covers a release that arrives
+// while this process is in the middle of registering.
+//
+// Release reports success by sweeping every node this process made. A create
+// that started before the release and landed after its sweep is exactly the
+// node that sweep existed to remove, so a release that does not wait for it
+// reports success over a node still holding a place in the queue — one no host
+// adopted, that nothing is waiting on, and that nothing will clean up until
+// the session ends.
+//
+// The abandoned acquisition does sweep its own node on the way out, so the
+// directory ends empty either way. What differs is what a successful Release
+// means at the moment it returns, which is what this asserts: no node of this
+// process's may be created behind a release that has already reported success.
+func TestReleaseWaitsOutACreateAlreadyInFlight(t *testing.T) {
+	f := newFakeZK()
+	lock := newTestLock(t, f, serverUUID)
+
+	var (
+		wg           sync.WaitGroup
+		releaseErr   error
+		atReleaseEnd []string
+		released     = make(chan struct{})
+	)
+	f.beforeCreate = func(creating string) {
+		if !strings.Contains(creating, zLockPrefix) {
+			// An ancestor directory, not the lock node.
+			return
+		}
+		f.beforeCreate = nil
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			releaseErr = lock.Release()
+			// Everything this process had created by the time the release
+			// reported success. Anything outside it that turns up later is a
+			// node the release promised was gone and was not.
+			atReleaseEnd = f.createdPaths()
+			close(released)
+		}()
+		// Give the release every chance to run to completion before the node
+		// it has to sweep exists. Proving it did not is what needs a bound:
+		// coordinated, it is parked here until this create is done; without
+		// that, it lists an empty directory, reports success, and this create
+		// lands behind it.
+		select {
+		case <-released:
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+
+	_, err := lock.Acquire(context.Background(), testLockData(t))
+	if !errors.Is(err, ErrLockReleased) {
+		t.Fatalf("Acquire: want ErrLockReleased, got %v", err)
+	}
+	wg.Wait()
+	if releaseErr != nil {
+		t.Fatalf("Release: %v", releaseErr)
+	}
+	seen := make(map[string]struct{}, len(atReleaseEnd))
+	for _, created := range atReleaseEnd {
+		seen[created] = struct{}{}
+	}
+	for _, created := range f.createdPaths() {
+		if !strings.Contains(created, zLockPrefix) {
+			continue
+		}
+		if _, known := seen[created]; !known {
+			t.Fatalf("Release reported success and %s was registered behind it", created)
+		}
+	}
+	if nodes := f.lockNodes(testLockPath()); len(nodes) != 0 {
+		t.Fatalf("Release reported success and left %v in the queue", nodes)
+	}
+	if lock.LossReason() != LossReleased {
+		t.Fatalf("loss reason %s, want RELEASED", lock.LossReason())
+	}
+}
+
 func TestVerifyDetectsAMissingNode(t *testing.T) {
 	f := newFakeZK()
 	lock := newTestLock(t, f, serverUUID)
@@ -1013,13 +1209,57 @@ func TestFindLowestPrevPrefix(t *testing.T) {
 }
 
 func TestTabletServerLockPath(t *testing.T) {
-	if got, want := TabletServerLockPath(testInstancePath, "ingest", testAddress),
-		testInstancePath+"/tservers/ingest/"+testAddress; got != want {
+	got, err := TabletServerLockPath(testInstancePath, "ingest", testAddress)
+	if err != nil {
+		t.Fatalf("TabletServerLockPath: %v", err)
+	}
+	if want := testInstancePath + "/tservers/ingest/" + testAddress; got != want {
 		t.Fatalf("TabletServerLockPath = %q, want %q", got, want)
 	}
-	if got, want := TabletServerLockPath(testInstancePath, "", testAddress),
-		testInstancePath+"/tservers/default/"+testAddress; got != want {
+	got, err = TabletServerLockPath(testInstancePath, "", testAddress)
+	if err != nil {
+		t.Fatalf("TabletServerLockPath with an unset group: %v", err)
+	}
+	if want := testInstancePath + "/tservers/default/" + testAddress; got != want {
 		t.Fatalf("an unset group must mean %q: got %q, want %q", DefaultResourceGroup, got, want)
+	}
+}
+
+// TestTabletServerLockPathRefusesAGroupAccumuloWouldReject covers the group
+// arriving from configuration. The path segments are cleaned when they are
+// joined, so a name with a traversal in it does not produce a rejected path —
+// it produces a valid path in somebody else's subtree, which is worse: this
+// server would register where nothing looks for a tablet server.
+func TestTabletServerLockPathRefusesAGroupAccumuloWouldReject(t *testing.T) {
+	for _, group := range invalidResourceGroups() {
+		if group == "" {
+			// An unset group means DefaultResourceGroup, covered above.
+			continue
+		}
+		t.Run(group, func(t *testing.T) {
+			got, err := TabletServerLockPath(testInstancePath, group, testAddress)
+			if err == nil {
+				t.Fatalf("TabletServerLockPath accepted group %q and returned %q", group, got)
+			}
+			if !errors.Is(err, ErrInvalidLockData) {
+				t.Fatalf("error for group %q = %v, want ErrInvalidLockData", group, err)
+			}
+			if got != "" {
+				t.Fatalf("a refused group must yield no path, got %q", got)
+			}
+		})
+	}
+}
+
+// TestTabletServerLockPathTraversalWouldHaveEscaped pins why the check above
+// matters, by showing what the unchecked join produced.
+func TestTabletServerLockPathTraversalWouldHaveEscaped(t *testing.T) {
+	escaped := path.Join(testInstancePath, zTabletServers, "../managers", testAddress)
+	if strings.Contains(escaped, "/"+zTabletServers+"/") {
+		t.Fatalf("expected the traversal to leave the tservers subtree, got %q", escaped)
+	}
+	if want := testInstancePath + "/managers/" + testAddress; escaped != want {
+		t.Fatalf("traversal landed at %q, want %q", escaped, want)
 	}
 }
 

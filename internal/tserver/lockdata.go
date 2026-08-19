@@ -22,6 +22,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"regexp"
 	"sort"
 	"strconv"
 
@@ -61,6 +62,32 @@ func validAccumuloUUID(value string) bool {
 	}
 	_, err := uuid.Parse(value)
 	return err == nil
+}
+
+// resourceGroupPattern is Accumulo's ResourceGroupId.GROUP_NAME_PATTERN.
+//
+// ResourceGroupId.of applies it to every name it is handed and throws when it
+// does not match, and ServiceLockData.parse runs every descriptor's group
+// through ResourceGroupId.of. A group outside this grammar therefore does not
+// merely read back oddly: it throws on the manager's side and makes the whole
+// lock znode unreadable, which is the same failure a non-canonical UUID
+// causes and is refused here for the same reason.
+//
+// It also keeps a group out of a lock path it has no business in. Path
+// segments are cleaned when the lock directory is built, so a name like
+// "../managers" would not land under the tablet-server subtree at all.
+//
+// Java writes it as "^[a-zA-Z]+(_?[a-zA-Z0-9])*$" and applies it with
+// Pattern.matches, which anchors to the whole input. It is spelled with \A and
+// \z here so the Go form is anchored the same way beyond argument: ^ and $ are
+// line anchors under the m flag, and spelling out the text anchors keeps the
+// grammar from depending on which flags a later edit adds.
+var resourceGroupPattern = regexp.MustCompile(`\A[a-zA-Z]+(_?[a-zA-Z0-9])*\z`)
+
+// validResourceGroup reports whether name is a resource group Accumulo reads
+// back without throwing.
+func validResourceGroup(name string) bool {
+	return resourceGroupPattern.MatchString(name)
 }
 
 // ThriftService names one service advertised on a ServiceLock znode. The
@@ -117,6 +144,16 @@ var tabletServerServices = []ThriftService{
 	ServiceTabletServer,
 }
 
+// tabletServerServiceSet is tabletServerServices as a set, for refusing a
+// service that belongs to another role.
+var tabletServerServiceSet = func() map[ThriftService]struct{} {
+	set := make(map[ThriftService]struct{}, len(tabletServerServices))
+	for _, service := range tabletServerServices {
+		set[service] = struct{}{}
+	}
+	return set
+}()
+
 // Known reports whether the service is one Accumulo defines. An unknown name
 // is refused rather than published: Accumulo's reader parses the field as an
 // enum, so a name it does not know makes the whole lock znode unreadable and
@@ -161,6 +198,10 @@ func (d ServiceDescriptor) Validate() error {
 	}
 	if d.Group == "" {
 		return fmt.Errorf("%w: %s descriptor has no resource group", ErrInvalidLockData, d.Service)
+	}
+	if !validResourceGroup(d.Group) {
+		return fmt.Errorf("%w: %s descriptor resource group %q is not a name Accumulo reads (must match %s)",
+			ErrInvalidLockData, d.Service, d.Group, resourceGroupPattern)
 	}
 	if err := validateAdvertiseAddress(d.Address); err != nil {
 		return fmt.Errorf("%w: %s descriptor: %w", ErrInvalidLockData, d.Service, err)
@@ -214,6 +255,12 @@ type serviceLockDataJSON struct {
 // An empty group means DefaultResourceGroup. Passing no services is refused:
 // a lock that advertises nothing tells the manager a server is alive without
 // telling it how to reach anything.
+//
+// Only the five tablet-server services are accepted. The rest of the enum
+// belongs to the manager, the coordinator, the garbage collector and the
+// compactors, which advertise on their own locks; a tablet server publishing
+// one of them would be claiming an endpoint another role owns and pointing it
+// at a process that does not implement it.
 func TabletServerLockData(serverUUID, address, group string, services ...ThriftService) (ServiceLockData, error) {
 	if group == "" {
 		group = DefaultResourceGroup
@@ -223,6 +270,10 @@ func TabletServerLockData(serverUUID, address, group string, services ...ThriftS
 	}
 	data := ServiceLockData{Descriptors: make([]ServiceDescriptor, 0, len(services))}
 	for _, service := range services {
+		if _, ours := tabletServerServiceSet[service]; !ours {
+			return ServiceLockData{}, fmt.Errorf("%w: %q is not a tablet-server service",
+				ErrInvalidLockData, service)
+		}
 		data.Descriptors = append(data.Descriptors, ServiceDescriptor{
 			UUID:    serverUUID,
 			Service: service,

@@ -45,6 +45,154 @@ func nonCanonicalUUIDs() map[string]string {
 	}
 }
 
+// invalidResourceGroups are names Accumulo's ResourceGroupId.of throws on.
+// Publishing one is not a cosmetic problem: ServiceLockData.parse builds a
+// ResourceGroupId from every descriptor's group, so the throw takes the whole
+// znode with it.
+func invalidResourceGroups() []string {
+	return []string{
+		"",            // no name at all
+		"../managers", // a traversal that would clean out of the tservers tree
+		"1ingest",     // must open with a letter
+		"_ingest",     // must open with a letter
+		"ingest_",     // a separator must be followed by something
+		"ing__est",    // separators do not double
+		"ing-est",     // only underscore separates
+		"ing est",     // no spaces
+		"ing.est",     // no dots
+		"ing/est",     // no path separators
+		"ingest\n",    // no trailing newline, which Go's $ would otherwise let by
+		"INGEST-EAST", // still only underscore separates
+	}
+}
+
+// validResourceGroups are names Accumulo accepts, kept alongside the refusals
+// so the grammar is not tightened past what a real deployment configures.
+func validResourceGroups() []string {
+	return []string{
+		DefaultResourceGroup,
+		"ingest",
+		"i",
+		"Ingest",
+		"ingest_east",
+		"ingest2",
+		"i_1",
+		"INGEST",
+	}
+}
+
+// TestResourceGroupGrammarMatchesAccumulo pins the grammar itself against
+// ResourceGroupId.GROUP_NAME_PATTERN, so a later relaxation has to be
+// deliberate.
+func TestResourceGroupGrammarMatchesAccumulo(t *testing.T) {
+	for _, group := range validResourceGroups() {
+		if !validResourceGroup(group) {
+			t.Errorf("validResourceGroup(%q) = false, want true", group)
+		}
+	}
+	for _, group := range invalidResourceGroups() {
+		if validResourceGroup(group) {
+			t.Errorf("validResourceGroup(%q) = true, want false", group)
+		}
+	}
+}
+
+// TestServiceDescriptorRefusesAGroupAccumuloWouldReject covers a resource
+// group arriving from configuration.
+//
+// The read side runs every group through ResourceGroupId.of, which throws on
+// anything outside its grammar, so a group this process accepts and Accumulo
+// does not is another way to publish a znode the manager cannot parse — the
+// same failure a non-canonical UUID causes, reached through a different field.
+func TestServiceDescriptorRefusesAGroupAccumuloWouldReject(t *testing.T) {
+	for _, group := range invalidResourceGroups() {
+		t.Run(group, func(t *testing.T) {
+			data := ServiceLockData{Descriptors: []ServiceDescriptor{{
+				UUID:    serverUUID,
+				Service: ServiceClient,
+				Address: testAddress,
+				Group:   group,
+			}}}
+			if err := data.Validate(); !errors.Is(err, ErrInvalidLockData) {
+				t.Fatalf("Validate: want ErrInvalidLockData, got %v", err)
+			}
+			encoded, err := data.Encode()
+			if !errors.Is(err, ErrInvalidLockData) {
+				t.Fatalf("Encode: want ErrInvalidLockData, got %v", err)
+			}
+			if encoded != nil {
+				t.Fatalf("Encode returned %q alongside its refusal", encoded)
+			}
+		})
+	}
+}
+
+// TestTabletServerLockDataRefusesAGroupAccumuloWouldReject covers the same
+// group arriving through the constructor a tablet server actually calls.
+func TestTabletServerLockDataRefusesAGroupAccumuloWouldReject(t *testing.T) {
+	for _, group := range invalidResourceGroups() {
+		if group == "" {
+			// An empty group means DefaultResourceGroup here, which is valid.
+			continue
+		}
+		t.Run(group, func(t *testing.T) {
+			if _, err := TabletServerLockData(serverUUID, testAddress, group,
+				ServiceClient); !errors.Is(err, ErrInvalidLockData) {
+				t.Fatalf("want ErrInvalidLockData, got %v", err)
+			}
+		})
+	}
+	for _, group := range validResourceGroups() {
+		t.Run("accepts "+group, func(t *testing.T) {
+			if _, err := TabletServerLockData(serverUUID, testAddress, group,
+				ServiceClient); err != nil {
+				t.Fatalf("TabletServerLockData(%q): %v", group, err)
+			}
+		})
+	}
+}
+
+// TestTabletServerLockDataRefusesAnotherRolesService keeps this constructor
+// honest about what it is for.
+//
+// The enum covers the manager, the coordinator, the garbage collector and the
+// compactors as well, and every one of them is a service Known() accepts. A
+// tablet-server lock advertising MANAGER would tell a client that the manager
+// endpoint lives on this process, which does not implement it — a lie the
+// manager itself has no reason to look for, since a tablet server publishing
+// a manager service is not a case Accumulo produces.
+func TestTabletServerLockDataRefusesAnotherRolesService(t *testing.T) {
+	foreign := []ThriftService{"MANAGER", "COORDINATOR", "COMPACTOR", "GC",
+		"FATE_CLIENT", "FATE_WORKER", "NONE"}
+	for _, service := range foreign {
+		t.Run(string(service), func(t *testing.T) {
+			if !service.Known() {
+				t.Fatalf("%s is meant to be a service Accumulo defines", service)
+			}
+			_, err := TabletServerLockData(serverUUID, testAddress, testGroup, service)
+			if !errors.Is(err, ErrInvalidLockData) {
+				t.Fatalf("want ErrInvalidLockData, got %v", err)
+			}
+			if got := err.Error(); !strings.Contains(got, string(service)) {
+				t.Fatalf("error %q does not name the refused service", got)
+			}
+		})
+	}
+	t.Run("alongside real ones", func(t *testing.T) {
+		services := append(TabletServerServices(), "MANAGER")
+		if _, err := TabletServerLockData(serverUUID, testAddress, testGroup,
+			services...); !errors.Is(err, ErrInvalidLockData) {
+			t.Fatalf("want ErrInvalidLockData, got %v", err)
+		}
+	})
+	t.Run("unknown service", func(t *testing.T) {
+		if _, err := TabletServerLockData(serverUUID, testAddress, testGroup,
+			"SHOAL_SCAN"); !errors.Is(err, ErrInvalidLockData) {
+			t.Fatalf("want ErrInvalidLockData, got %v", err)
+		}
+	})
+}
+
 // TestServiceDescriptorRefusesNonCanonicalUUID pins the UUID shape at the
 // write side.
 //

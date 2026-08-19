@@ -37,10 +37,23 @@ import (
 // claimed them.
 //
 // It covers one generation and returns when that generation is over. A process
-// that means to rejoin builds a new ServiceLock and calls Participate again;
-// the new node necessarily carries a higher sequence, which is what
-// Host.AdoptLock requires and what makes a rejoin distinguishable from a
-// replay of the generation that just ended.
+// that means to rejoin builds a new ServiceLock and calls Participate again.
+// Host.AdoptLock takes the new generation only when its sequence is above
+// every generation that host has already used, which is what makes a rejoin
+// distinguishable from a replay of the generation that just ended.
+//
+// That ordering is ZooKeeper's for as long as the lock directory survives, but
+// it does not hold across one being deleted and recreated: the sequential
+// counter lives on the parent, so a recreated directory hands out numbers from
+// zero again. It is the same case ServiceLock.Verify reports as
+// LossSuperseded, seen from the other side — a rejoin into a recreated
+// directory can be handed a sequence the host has already used, and AdoptLock
+// refuses it with ErrLockNotNewer. Recovering means building a fresh Host: the
+// high-water mark it compares against is per-host state, so only a host that
+// has used nothing can accept a generation numbered below the one it lost. A
+// caller that rebuilds the lock without rebuilding the host has to read
+// ErrLockNotNewer as that instruction rather than as a transient failure to
+// retry, because retrying against the same host will refuse it every time.
 //
 // Returns an error wrapping ErrLockLost when the lock ended on its own, or
 // ctx.Err() when the caller ended it. Both mean the same thing to the host:
