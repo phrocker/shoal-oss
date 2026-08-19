@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -57,10 +58,98 @@ type RFileExportManifest struct {
 	RFiles              []RFileExportFile   `json:"rfiles"`
 }
 
+// RFileExportTablet describes one destination tablet's key-range
+// boundaries in an RFile export manifest. StartRow/EndRow are nil for an
+// unbounded side (matching Shoal's own [StartRow, EndRow) tablet
+// convention; see engine/table.go's routeTablet), and are Go strings
+// used purely as byte containers -- Accumulo row keys are arbitrary
+// bytes, not necessarily valid UTF-8 text.
+//
+// MarshalJSON/UnmarshalJSON base64-encode StartRow/EndRow on the wire
+// instead of emitting them as ordinary JSON string literals: encoding/
+// json's default string handling treats a Go string as UTF-8 text and
+// silently replaces any invalid byte sequence with U+FFFD, which would
+// irrecoverably corrupt a split row that is not valid UTF-8 the moment
+// the manifest round-trips through JSON (see rfile_export_test.go's
+// TestRFileExportTabletJSONRoundTripsNonUTF8Rows for a worked example,
+// and REFERENCES.md/docs/promotion.md for why promotion depends on this
+// byte-for-byte fidelity). This mirrors the same
+// ByteArrayToBase64TypeAdapter-equivalent convention this repo already
+// uses for Accumulo's own Bulk Import V2 loadmap.json wire format (see
+// promotion.base64RowPtr/base64RowValue). The "index"/"start_row"/
+// "end_row" JSON field names are unchanged; only the encoding of a
+// non-nil start_row/end_row value's contents changes, from a raw string
+// to a base64 one. No exported manifest with a non-nil StartRow/EndRow
+// was ever consumed by anything before multi-tablet promotion
+// (resolveManifestTablets in internal/promotion) started reading these
+// values, so this is not a breaking change for any manifest that could
+// previously round-trip successfully.
 type RFileExportTablet struct {
+	Index    int
+	StartRow *string
+	EndRow   *string
+}
+
+// rfileExportTabletJSON is RFileExportTablet's on-the-wire JSON shape.
+type rfileExportTabletJSON struct {
 	Index    int     `json:"index"`
 	StartRow *string `json:"start_row,omitempty"`
 	EndRow   *string `json:"end_row,omitempty"`
+}
+
+// MarshalJSON implements json.Marshaler; see RFileExportTablet's doc
+// comment for why StartRow/EndRow are base64-encoded.
+func (t RFileExportTablet) MarshalJSON() ([]byte, error) {
+	return json.Marshal(rfileExportTabletJSON{
+		Index:    t.Index,
+		StartRow: base64RowStringPtr(t.StartRow),
+		EndRow:   base64RowStringPtr(t.EndRow),
+	})
+}
+
+// UnmarshalJSON implements json.Unmarshaler; see RFileExportTablet's doc
+// comment for why StartRow/EndRow are base64-decoded.
+func (t *RFileExportTablet) UnmarshalJSON(data []byte) error {
+	var raw rfileExportTabletJSON
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	startRow, err := base64RowStringValue(raw.StartRow)
+	if err != nil {
+		return fmt.Errorf("engine: decode tablet %d start_row: %w", raw.Index, err)
+	}
+	endRow, err := base64RowStringValue(raw.EndRow)
+	if err != nil {
+		return fmt.Errorf("engine: decode tablet %d end_row: %w", raw.Index, err)
+	}
+	t.Index = raw.Index
+	t.StartRow = startRow
+	t.EndRow = endRow
+	return nil
+}
+
+// base64RowStringPtr base64-encodes row's raw bytes for the JSON wire
+// form, or returns nil unchanged (an unbounded side stays absent from
+// the JSON object via omitempty).
+func base64RowStringPtr(row *string) *string {
+	if row == nil {
+		return nil
+	}
+	s := base64.URLEncoding.EncodeToString([]byte(*row))
+	return &s
+}
+
+// base64RowStringValue reverses base64RowStringPtr.
+func base64RowStringValue(encoded *string) (*string, error) {
+	if encoded == nil {
+		return nil, nil
+	}
+	decoded, err := base64.URLEncoding.DecodeString(*encoded)
+	if err != nil {
+		return nil, err
+	}
+	s := string(decoded)
+	return &s, nil
 }
 
 type RFileExportFile struct {

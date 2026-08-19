@@ -118,7 +118,7 @@ entry always collapses to fully unbounded, since there is no tablet
 before index 0 to widen against — see `twoTabletManifest` in
 `loadmapping_test.go`.
 
-### 3.2 Why widening is provably correct against Accumulo's real validation
+### 3.2 Why widening is provably correct — and where that proof's limits are
 
 This is not a design choice taken on faith: it was checked line-by-line
 against the actual upstream `PrepBulkImport.validateLoadMapping` (see
@@ -130,30 +130,53 @@ every load-mapping entry** — it only ever advances forward via
 force-advanced past before the next entry is checked. For each entry, the
 algorithm advances the current tablet forward only while it does not
 match the entry's declared `prevEndRow`, checks the match, then repeats
-for `endRow`, leaving the iterator resting exactly on the tablet matching
-that entry's `endRow` once both checks succeed.
+for `endRow`, leaving the iterator resting exactly on the real tablet
+matching that entry's `endRow` once both checks succeed.
 
-By induction over the chain: after entry `k` is validated, the iterator
-is resting on the real destination tablet ending at `chain[k].EndRow`,
-whose own `prevEndRow` is exactly `chain[k-1].EndRow` (or `nil` for
-`k=0`) — which is *exactly* what this package's widening rule sets
+**When the destination's real splits, at or before the mapping's last
+boundary row, are exactly the manifest's own chain boundaries** — no
+fewer and no more — induction over the chain shows this always
+validates: after entry `k` is validated, the iterator is resting on the
+real destination tablet ending at `chain[k].EndRow`; because the
+destination has no *other* split before that point, that real tablet's
+own `prevEndRow` is exactly `chain[k-1].EndRow` (or `nil` for `k=0`) —
+which is *exactly* what this package's widening rule sets
 `resolved[k+1].PrevEndRow` to. So every entry's declared `PrevEndRow`
-is always matched by the real tablet the validation iterator is already
+is matched by the real tablet the validation iterator is already
 resting on, and the widened, seemingly-overlapping extents (e.g.
-`(nil,"d"]` immediately followed by `(nil,"m"]`) validate correctly
-precisely because the iterator is never forced past a tablet it can
-still legitimately re-match against a later entry's `prevEndRow`.
+`(nil,"d"]` immediately followed by `(nil,"m"]`) validate correctly.
 
-This also confirms two secondary properties, both verified by tracing
-the same algorithm: extra, unrelated pre-existing destination splits
-beyond the required boundary rows are harmless (the iterator just takes
-more `pi.next()` steps to reach the target `endRow`), and — critically
-for fail-closed safety — if the destination is **not** reconciled first
-(still only its original single unbounded tablet) a multi-tablet
-promotion attempt is rejected outright via `validateLoadMapping`'s
-`!pi.hasNext()` special-case branch, the same "concurrent merge"-style
-rejection Accumulo itself uses; it does not corrupt data or silently
-drop rows.
+**That induction's premise — no extra splits before the last required
+boundary — is doing real work, and does not hold for free.** An earlier
+version of this document (and of `RequiredDestinationSplits`'s doc
+comment) claimed the opposite: that "extra, unrelated pre-existing
+destination splits beyond the required boundary rows are harmless." That
+claim is false, and was corrected after Copilot's automated review of
+this PR caught it. Concretely: if the destination already has a split at
+row `c` with `c < d` (`d` being the first required boundary), validating
+entry 0 `(nil,d]` leaves the iterator resting on the real tablet
+`(c,d]`, not `(nil,d]` — its own `prevEndRow` is `c`, not `nil` — so
+entry 1's widened `prevEndRow=nil` can never match, the iterator cannot
+rewind to look further back, and the whole submission is rejected with a
+spurious `BULK_CONCURRENT_MERGE` ("Concurrent merge happened") even
+though nothing actually merged. The same failure occurs for an extra
+split anywhere else before the last required boundary row, not only
+before the first one. An extra split strictly *after* the last required
+boundary row is genuinely harmless: it falls entirely inside the final,
+always-unbounded entry's own `endRow` search, which the iterator simply
+walks past on its way to matching `nil`.
+
+Neither `BuildLoadMapping` nor `RequiredDestinationSplits` can detect an
+unsafe pre-existing split on their own: both are pure functions over the
+manifest alone, with no view of the destination's actual state. §3.3
+describes how `Promote` positively verifies the "no more" half of the
+destination's splits instead of merely assuming it.
+
+Separately, if the destination is **not** reconciled at all (still only
+its original single unbounded tablet), a multi-tablet promotion attempt
+is rejected outright via `validateLoadMapping`'s `!pi.hasNext()`
+special-case branch — the same "concurrent merge"-style rejection
+Accumulo itself uses; it does not corrupt data or silently drop rows.
 
 ### 3.3 Reconciling the destination before staging
 
@@ -168,20 +191,37 @@ Accumulo.
 reports at least one row — submits those rows through
 `accumulo.Connector.AddTableSplits` (a manager `TABLE_SPLIT` FATE
 operation, never a direct metadata/ZooKeeper edit) before staging or
-submitting the bulk import. `BuildLoadMapping` and `StageBulkDir`
-themselves never call Accumulo: a caller invoking them directly for a
-multi-tablet manifest outside of `Promote` is responsible for ensuring
-the destination already has matching splits, or the subsequent
-`BulkImport` call will fail closed (not silently) as described above.
+submitting the bulk import. That guarantees the destination has *at
+least* the required rows, but — as §3.2 explains — the widening rule
+also requires the destination to have *no other* split at or before the
+last required row, and `AddTableSplits` cannot itself remove a
+pre-existing or concurrently-added split that doesn't belong to this
+promotion (it is, correctly, additive-only). So immediately after
+`AddTableSplits` succeeds, `Promote` also calls
+`accumulo.Connector.ListTableSplits` and runs
+`verifyNoUnexpectedDestinationSplits`: if the destination's splits at or
+before the last required row are not exactly the required set, `Promote`
+fails closed with a specific, actionable error naming the offending
+row(s), before `StageBulkDir` or `BulkImport` ever run — turning what
+would otherwise be a confusing, unexplained `BULK_CONCURRENT_MERGE` deep
+inside Accumulo into an explicit, Shoal-side failure.
 
-**Residual race, stated plainly:** reconciling splits ahead of staging
-narrows, but does not close, the window for a concurrent structural
-change on the destination. A merge racing between `AddTableSplits`
-succeeding and the later `BulkImport` FATE call's own server-side
-validation running could still remove a split `Promote` just added.
-Accumulo's own defense against that is to reject the bulk import cleanly
-(the same `!pi.hasNext()`/concurrent-merge-style failure from §3.2), not
-to corrupt data — so this is a safe-failure gap, not a correctness one.
+`BuildLoadMapping` and `StageBulkDir` themselves never call Accumulo: a
+caller invoking them directly for a multi-tablet manifest outside of
+`Promote` is responsible for that same two-part reconciliation itself —
+both adding the required splits and confirming no unrelated one exists
+in range — or the subsequent `BulkImport` call may fail closed (not
+silently) as described above.
+
+**Residual race, stated plainly:** this verification narrows, but does
+not close, the window for a concurrent structural change on the
+destination. A split or merge racing between
+`verifyNoUnexpectedDestinationSplits` succeeding and the later
+`BulkImport` FATE call's own server-side validation running could still
+invalidate the mapping `Promote` just staged. Accumulo's own defense
+against that is to reject the bulk import cleanly (the same
+`!pi.hasNext()`/concurrent-merge-style failure from §3.2), not to
+corrupt data — so this is a safe-failure gap, not a correctness one.
 Closing it fully would require either a promotion-state API that
 re-validates immediately before submission or an Accumulo-side
 split-then-import atomicity guarantee this package does not control; see
@@ -467,11 +507,11 @@ Mapped against #70's five acceptance criteria:
    supported client-side (§3), but none of this has been verified against
    a live Accumulo cluster in this environment — no cell-equivalent-results
    check has ever actually run. The multi-tablet path also carries the
-   residual concurrent-merge race from §3.3: a merge landing on the
-   destination between `AddTableSplits` succeeding and `BulkImport`'s own
-   server-side validation running is not fully closed by this slice, only
-   turned into a clean, safe FATE-level rejection instead of a silent
-   correctness problem.
+   residual concurrent-merge race from §3.3: a split or merge landing on
+   the destination between `verifyNoUnexpectedDestinationSplits`
+   succeeding and `BulkImport`'s own server-side validation running is
+   not fully closed by this slice, only turned into a clean, safe
+   FATE-level rejection instead of a silent correctness problem.
 2. **"rerunning any interrupted transfer is safe"** — true up through
    staging, not true across the whole `Promote` call once `BulkImport` has
    been invoked. `StageBulkDir` is deterministic and copy-based, so
@@ -509,12 +549,16 @@ Mapped against #70's five acceptance criteria:
    `StageBulkDir`/pre-`BulkImport` `Promote` call) is implemented and
    tested, per item 2. "Split changes" recovery is only partial: this
    slice reconciles the destination's splits to match a multi-tablet
-   manifest *before* staging, and Accumulo itself safely rejects (rather
-   than corrupts) a bulk import if a concurrent merge removes a
-   reconciled split before `BulkImport`'s own validation runs — but Shoal
-   does not automatically detect that rejection and re-reconcile/retry on
-   the caller's behalf. That would need the same promotion-state
-   machinery as item 4.
+   manifest *before* staging, actively verifying (not merely assuming)
+   that no unrelated extra split exists in the range the widened mapping
+   depends on (§3.2/§3.3) — so an already-wrong destination layout is
+   caught and reported before any file is staged. Accumulo itself
+   separately, safely rejects (rather than corrupts) a bulk import if a
+   concurrent split or merge invalidates a reconciled destination
+   *after* that check but before `BulkImport`'s own validation runs —
+   but Shoal does not automatically detect that later rejection and
+   re-reconcile/retry on the caller's behalf. That would need the same
+   promotion-state machinery as item 4.
 4. **"a documented cutover protocol"** — not implemented. No
    promotion-state or cutover API surface is exposed yet; this slice is
    promotion of one point-in-time export, not the ongoing fan-in/cutover

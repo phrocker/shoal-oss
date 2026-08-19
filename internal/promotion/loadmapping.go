@@ -37,18 +37,23 @@
 //
 //  3. For a multi-tablet manifest, the widened KeyExtents this package
 //     computes only pass Accumulo's own server-side
-//     PrepBulkImport.validateLoadMapping check if the destination table
-//     already has splits at the exact boundary rows RequiredDestinationSplits
-//     reports. Promote reconciles that by submitting those rows through
+//     PrepBulkImport.validateLoadMapping check if the destination
+//     table's splits, at or before the last boundary row
+//     RequiredDestinationSplits reports, are exactly those rows — no
+//     fewer and, just as importantly, no more (an extra pre-existing
+//     split in that range is not harmless here; see
+//     RequiredDestinationSplits's own doc comment for why). Promote
+//     reconciles the "no fewer" half by submitting those rows through
 //     the existing accumulo.Connector.AddTableSplits — itself a manager
 //     TABLE_SPLIT FATE operation, the same protocol
-//     TableOperations.addSplits uses — before staging or submitting the
-//     bulk import. BuildLoadMapping and StageBulkDir themselves never call
-//     Accumulo: a caller invoking them directly for a multi-tablet
-//     manifest, outside of Promote, is responsible for ensuring the
-//     destination already has matching splits, or the subsequent
-//     BulkImport call will fail closed (not silently) with a concurrent-
-//     merge-style rejection.
+//     TableOperations.addSplits uses — and the "no more" half by then
+//     confirming accumulo.Connector.ListTableSplits reports nothing else
+//     in that range, both before staging or submitting the bulk import.
+//     BuildLoadMapping and StageBulkDir themselves never call Accumulo: a
+//     caller invoking them directly for a multi-tablet manifest, outside
+//     of Promote, is responsible for that same reconciliation, or the
+//     subsequent BulkImport call will fail closed (not silently) with a
+//     concurrent-merge-style rejection.
 //
 //  4. Submits the TABLE_BULK_IMPORT2 FATE operation via
 //     accumulo.Connector.BulkImport — the only other step that talks to
@@ -135,8 +140,10 @@ type LoadMapping []Mapping
 // exclusive-end routing), but PrevEndRow is the *previous* tablet's own
 // StartRow rather than this tablet's own StartRow, so that a row exactly
 // equal to this tablet's inclusive start is never excluded by Accumulo's
-// exclusive-start convention. See RequiredDestinationSplits and
-// docs/promotion.md §3 for the full derivation. That widening means each
+// exclusive-start convention. See RequiredDestinationSplits — including
+// why the destination must not have any *extra* split in the range that
+// widening covers — and docs/promotion.md §3 for the full derivation.
+// That widening means each
 // returned Mapping's KeyExtent generally spans up to two adjacent source
 // tablets' worth of destination range (index 1 widens all the way to
 // unbounded, since there is no tablet before index 0 to anchor to — an
@@ -265,10 +272,13 @@ func resolveManifestTablets(manifest *engine.RFileExportManifest) ([]resolvedTab
 // gaps, or out-of-range values; tablet 0's StartRow is nil (negative
 // infinity); tablet N-1's EndRow is nil (positive infinity); every other
 // tablet declares both boundaries; every tablet's own StartRow is
-// strictly less than its own EndRow whenever both are set (rejecting
-// degenerate/inverted ranges); and tablet i's EndRow exactly equals
-// tablet i+1's StartRow for every adjacent pair (rejecting both gaps and
-// overlaps — anything short of exact equality is one or the other).
+// strictly less than its own EndRow whenever both are set (a plain Go
+// string comparison, rejecting degenerate/inverted ranges — safe even
+// for non-UTF-8 row values, since RFileExportTablet's *string fields are
+// guaranteed to hold their exact original bytes; see rowBytes); and
+// tablet i's EndRow exactly equals tablet i+1's StartRow for every
+// adjacent pair (rejecting both gaps and overlaps — anything short of
+// exact equality is one or the other).
 func resolveTabletChain(tablets []engine.RFileExportTablet) ([]engine.RFileExportTablet, error) {
 	n := len(tablets)
 	byIndex := make(map[int]engine.RFileExportTablet, n)
@@ -332,15 +342,17 @@ func formatRow(row *string) string {
 }
 
 // RequiredDestinationSplits returns the destination table's split rows, in
-// ascending order, that must already exist before a Bulk Import V2
-// submission built from manifest's load mapping (BuildLoadMapping) can
-// pass Accumulo's own server-side PrepBulkImport.validateLoadMapping
-// check. It performs the same tablet-chain validation BuildLoadMapping
-// does, and fails the same way on a malformed manifest, but never touches
-// storage or Accumulo itself: it is a pure function, safe to call
-// standalone — for example to pre-create splits through
-// accumulo.Connector.AddTableSplits before staging, which is exactly what
-// Promote does.
+// ascending order, that a Bulk Import V2 submission built from
+// manifest's load mapping (BuildLoadMapping) requires to already exist
+// — and, for a multi-tablet manifest, requires the destination to have
+// no *other* splits at or before the last of these rows — before
+// Accumulo's own server-side PrepBulkImport.validateLoadMapping check
+// will pass. It performs the same tablet-chain validation
+// BuildLoadMapping does, and fails the same way on a malformed
+// manifest, but never touches storage or Accumulo itself: it is a pure
+// function, safe to call standalone — for example to pre-create splits
+// through accumulo.Connector.AddTableSplits before staging, which is
+// exactly what Promote does.
 //
 // A single-tablet (or legacy) manifest requires no destination splits at
 // all: BuildLoadMapping's fully unbounded KeyExtent matches Accumulo's
@@ -350,22 +362,50 @@ func formatRow(row *string) string {
 // For an N-tablet manifest (N>1), the required splits are exactly the N-1
 // boundary rows shared by adjacent tablets (tablet i's EndRow, equivalently
 // tablet i+1's StartRow, for i in 0..N-2): those are the only rows any
-// widened KeyExtent BuildLoadMapping computes can ever reference.
-// Reconciling splits at coarser or finer points than these is unnecessary:
-// Accumulo's validateLoadMapping accepts a load-mapping entry whose
-// declared PrevEndRow/EndRow are each matched by some existing tablet
-// boundary and happily lets a single entry span several destination
-// tablets, so any additional pre-existing destination splits between
-// these points are harmless, not required.
+// widened KeyExtent BuildLoadMapping computes can ever reference. It is
+// tempting to conclude from this that any *additional* pre-existing
+// destination splits between these points are therefore harmless, since
+// Accumulo's validateLoadMapping does let a single load-mapping entry
+// span several destination tablets when that entry's declared
+// PrevEndRow/EndRow are each matched by some existing tablet boundary.
+// That conclusion is false for the overlapping, widened extents this
+// package builds, and callers must not rely on it: validateLoadMapping
+// walks the destination's tablets with a single, shared, forward-only
+// iterator across every load-mapping entry in submission order, so a
+// destination split strictly *before* the last required row leaves
+// that iterator stopped one real tablet further forward than the next
+// entry's widened PrevEndRow — always the row two boundaries back, by
+// construction; see BuildLoadMapping — can match. The iterator can
+// never rewind, so the whole submission is rejected with a spurious
+// BULK_CONCURRENT_MERGE-style error even though nothing actually
+// merged. A split strictly *after* the last required row is genuinely
+// harmless: the final Mapping entry is always fully unbounded (nil
+// EndRow) and absorbs it regardless of how many further splits exist
+// beyond it.
 //
-// This says nothing about whether the destination will still have these
-// splits by the time a subsequent BulkImport call is validated server
-// side: a concurrent merge on the destination between split creation and
-// bulk-import submission is a real, acknowledged race this package cannot
-// close on its own (see docs/promotion.md §5) — Accumulo's own FATE
-// validation rejects that case outright rather than corrupting data, and
-// this function's contribution is only to make that rejection avoidable
-// in the common case, not to eliminate the race.
+// This function only reports what rows are required; it cannot detect
+// an unsafe pre-existing split on its own, since it is a pure function
+// over the manifest alone with no view of the destination's actual
+// state. Promote separately verifies, via
+// accumulo.Connector.ListTableSplits immediately after AddTableSplits,
+// that the destination's splits at or before the last required row are
+// exactly these rows — no more, no fewer — failing closed with a
+// specific, actionable error before any staging or BulkImport call
+// otherwise (see verifyNoUnexpectedDestinationSplits and Promote's own
+// doc comment for the full mechanism). A caller invoking
+// RequiredDestinationSplits or BuildLoadMapping directly, outside of
+// Promote, is responsible for that same reconciliation itself, or for
+// accepting that the subsequent BulkImport call may fail.
+//
+// Even with that verification in place, this says nothing about
+// whether the destination will still have exactly these splits by the
+// time a subsequent BulkImport call is validated server side: a
+// concurrent split or merge on the destination between verification
+// and bulk-import submission is a real, acknowledged race this package
+// cannot close on its own (see docs/promotion.md §5) — Accumulo's own
+// FATE validation rejects that case outright rather than corrupting
+// data, so this residual window is a safe-failure gap, not a
+// correctness one.
 func RequiredDestinationSplits(manifest *engine.RFileExportManifest) ([][]byte, error) {
 	if manifest == nil {
 		return nil, fmt.Errorf("promotion: nil export manifest")
@@ -384,6 +424,17 @@ func RequiredDestinationSplits(manifest *engine.RFileExportManifest) ([][]byte, 
 	return splits, nil
 }
 
+// rowBytes returns row's raw bytes, or nil if row is nil.
+//
+// This is safe even for row values that are not valid UTF-8:
+// RFileExportTablet.StartRow/EndRow are declared as *string purely as a
+// byte-container convention, not as text (see rfile_export.go's
+// RFileExportTablet doc comment). Their JSON wire encoding is
+// base64url, not encoding/json's default UTF-8 string handling, so —
+// unlike a plain Go string field marshaled the ordinary way, which
+// would silently replace an invalid byte sequence with U+FFFD on the
+// way to disk — a manifest's declared row boundaries round-trip
+// through JSON with their exact original bytes intact.
 func rowBytes(s *string) []byte {
 	if s == nil {
 		return nil

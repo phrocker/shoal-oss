@@ -1,7 +1,11 @@
 package promotion
 
 import (
+	"bytes"
 	"context"
+	"fmt"
+	"strings"
+	"unicode/utf8"
 
 	"github.com/phrocker/shoal/accumulo"
 	"github.com/phrocker/shoal/internal/engine"
@@ -19,6 +23,13 @@ type Promoter interface {
 	// widened multi-tablet load mapping (see RequiredDestinationSplits)
 	// can pass Accumulo's own server-side load-mapping validation.
 	AddTableSplits(ctx context.Context, tableName string, splits [][]byte) error
+	// ListTableSplits reports tableName's real, current bounded split
+	// rows in ascending order (accumulo.Connector.ListTableSplits).
+	// Promote uses it, immediately after AddTableSplits, to confirm the
+	// destination has exactly the required rows and nothing else in the
+	// range BuildLoadMapping's widened mapping depends on — see
+	// verifyNoUnexpectedDestinationSplits.
+	ListTableSplits(ctx context.Context, tableName string) ([][]byte, error)
 	// BulkImport submits bulkDir as a Bulk Import V2 (TABLE_BULK_IMPORT2)
 	// FATE operation against tableName.
 	BulkImport(ctx context.Context, tableName, bulkDir string, opts accumulo.BulkImportOptions) error
@@ -53,14 +64,35 @@ type Options struct {
 // manager remains the sole authority over the promoted table's resulting
 // tablet layout and file set.
 //
-// Reconciling splits ahead of staging narrows, but does not close, the
-// window for a concurrent structural change on the destination: a merge
-// racing between AddTableSplits succeeding and BulkImport's own
-// server-side validation running could still remove a split Promote just
-// added. Accumulo's own defense against that is to reject the bulk
-// import cleanly (a "concurrent merge" style failure), not to corrupt
-// data, so this residual race is a safe-failure gap, not a correctness
-// one — see docs/promotion.md §5.
+// BuildLoadMapping's widening rule is only provably correct against
+// Accumulo's own PrepBulkImport.validateLoadMapping walk when the
+// destination's real splits, at or before the last required row, are
+// exactly the required rows — no fewer (AddTableSplits already
+// guarantees that) and, just as importantly, no more. An extra,
+// unrelated split anywhere in that range — pre-existing or added by
+// another actor between reconciliation attempts — silently changes the
+// real predecessor row an earlier mapping entry leaves Accumulo's
+// validation walk resting on, which the next entry's widened
+// prevEndRow can then never re-match (see docs/promotion.md §3.2/§5 for
+// the full trace). So immediately after AddTableSplits, Promote calls
+// conn.ListTableSplits and runs verifyNoUnexpectedDestinationSplits: if
+// the destination has any such extra split, Promote fails closed with a
+// clear, actionable error before staging or submitting anything, rather
+// than letting BuildLoadMapping construct a mapping that Accumulo's own
+// validation would reject for reasons the failure would not explain. A
+// trailing extra split strictly after the last required row is left
+// alone: it falls entirely inside the final, always-unbounded entry's
+// own span, which can legitimately absorb any number of additional real
+// tablets.
+//
+// This check narrows, but cannot close, the window for a concurrent
+// structural change on the destination: a split or merge racing between
+// verifyNoUnexpectedDestinationSplits succeeding and BulkImport's own
+// server-side validation running could still invalidate the mapping
+// Promote just staged. Accumulo's own defense against that is to reject
+// the bulk import cleanly (a "concurrent merge" style failure), not to
+// corrupt data, so this residual race is a safe-failure gap, not a
+// correctness one — see docs/promotion.md §5.
 //
 // An empty load mapping (manifest.RFiles has nothing to import) stages an
 // empty bulk directory but skips the BulkImport FATE call entirely:
@@ -78,19 +110,20 @@ type Options struct {
 //
 // Promote does not itself retry on failure, and retry safety differs by
 // which step failed. A failure in validation, AddTableSplits, or
-// StageBulkDir (before BulkImport is ever called) is always safe to
-// retry: split reconciliation is idempotent (AddTableSplits treats a row
-// that already is a tablet's end row as already satisfied, refreshing
-// only its mergeability metadata) and staging is deterministic and
-// copy-based, so calling Promote again with the same arguments
-// reproduces the same destination splits, staged bytes, and
-// loadmap.json. Once BulkImport has been invoked, a blind retry is not
-// always safe: FATE submission has no built-in dedup/idempotency (see
-// docs/promotion.md §5), so an ambiguous failure there — for example a
-// timeout after the manager received the request but before the caller
-// observed a response — leaves the caller unable to tell whether the
-// bulk import already happened, and resubmitting risks a duplicate
-// import.
+// verifyNoUnexpectedDestinationSplits, or StageBulkDir (before
+// BulkImport is ever called) is always safe to retry: split
+// reconciliation is idempotent (AddTableSplits treats a row that
+// already is a tablet's end row as already satisfied, refreshing only
+// its mergeability metadata), the split-verification check is a
+// read-only comparison, and staging is deterministic and copy-based, so
+// calling Promote again with the same arguments reproduces the same
+// destination splits, staged bytes, and loadmap.json. Once BulkImport
+// has been invoked, a blind retry is not always safe: FATE submission
+// has no built-in dedup/idempotency (see docs/promotion.md §5), so an
+// ambiguous failure there — for example a timeout after the manager
+// received the request but before the caller observed a response —
+// leaves the caller unable to tell whether the bulk import already
+// happened, and resubmitting risks a duplicate import.
 func Promote(
 	ctx context.Context,
 	src storage.Backend,
@@ -112,6 +145,9 @@ func Promote(
 		if err := conn.AddTableSplits(ctx, tableName, splits); err != nil {
 			return nil, err
 		}
+		if err := verifyNoUnexpectedDestinationSplits(ctx, conn, tableName, splits); err != nil {
+			return nil, err
+		}
 	}
 	mapping, err := StageBulkDir(ctx, src, manifest, dst, bulkDir)
 	if err != nil {
@@ -124,4 +160,81 @@ func Promote(
 		return nil, err
 	}
 	return mapping, nil
+}
+
+// verifyNoUnexpectedDestinationSplits confirms that tableName's real,
+// current split rows at or before the last entry of required are
+// exactly required — no more, no fewer — and fails closed with a clear
+// error otherwise.
+//
+// This exists because of a real, non-obvious gap in
+// BuildLoadMapping's widening rule (see the trace in
+// docs/promotion.md §3.2 and Promote's own doc comment above): the
+// rule only produces a mapping Accumulo's own
+// PrepBulkImport.validateLoadMapping walk can validate when the
+// destination's splits in that range are exactly the required ones.
+// AddTableSplits guarantees the required rows are present once it
+// succeeds, but it does not — and, submitting through Accumulo's
+// manager-owned TABLE_SPLIT FATE operation as it does, safely cannot —
+// remove a pre-existing or concurrently-added split that doesn't
+// belong to this promotion. Detecting that here, before StageBulkDir
+// or BulkImport ever run, turns what would otherwise be a confusing
+// "concurrent merge" style rejection deep inside Accumulo (or, worse,
+// silence if a caller weren't watching for it) into an explicit,
+// Shoal-side failure that names the offending row.
+//
+// required must be sorted ascending, non-empty, and free of
+// duplicates, matching RequiredDestinationSplits's own contract; this
+// is only ever called with that function's own output.
+func verifyNoUnexpectedDestinationSplits(ctx context.Context, conn Promoter, tableName string, required [][]byte) error {
+	actual, err := conn.ListTableSplits(ctx, tableName)
+	if err != nil {
+		return fmt.Errorf("promotion: list destination splits for %q: %w", tableName, err)
+	}
+	lastRequired := required[len(required)-1]
+	inRange := actual
+	for i, row := range actual {
+		if bytes.Compare(row, lastRequired) > 0 {
+			inRange = actual[:i]
+			break
+		}
+	}
+	matches := len(inRange) == len(required)
+	if matches {
+		for i, row := range required {
+			if !bytes.Equal(inRange[i], row) {
+				matches = false
+				break
+			}
+		}
+	}
+	if matches {
+		return nil
+	}
+	return fmt.Errorf(
+		"promotion: destination table %q has unexpected splits at or before %q: found %s, required exactly %s; "+
+			"another actor may have split or merged the destination since this promotion reconciled its splits, "+
+			"which would break the widened load mapping's prevEndRow handoff (see docs/promotion.md §3.2/§5) — "+
+			"resolve the destination's splits and retry",
+		tableName, formatSplitRow(lastRequired), formatSplitRows(inRange), formatSplitRows(required),
+	)
+}
+
+// formatSplitRow renders a single split row for an error message: a
+// quoted string when row is valid UTF-8, otherwise its hex encoding.
+func formatSplitRow(row []byte) string {
+	if utf8.Valid(row) {
+		return fmt.Sprintf("%q", row)
+	}
+	return fmt.Sprintf("hex:%x", row)
+}
+
+// formatSplitRows renders an ordered list of split rows for an error
+// message.
+func formatSplitRows(rows [][]byte) string {
+	parts := make([]string, len(rows))
+	for i, row := range rows {
+		parts[i] = formatSplitRow(row)
+	}
+	return "[" + strings.Join(parts, ", ") + "]"
 }

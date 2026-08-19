@@ -333,22 +333,43 @@ mirroring Accumulo's per-round retry schedule.
     fails. `validateLoadMapping` walks a `PeekingIterator` over the
     destination's tablets whose position only ever advances forward
     (`pi.next()`), never re-winds, and is shared across load-mapping
-    entries — so an entry's `prevEndRow` must equal the *previous* entry's
-    `endRow` for the walk to succeed, and a single entry may legally span
-    more than one real destination tablet. Shoal's promotion slice
-    exploits exactly this by widening each multi-tablet manifest chain's
-    per-tablet extents so every entry after the first has
-    `prevEndRow == previous chain entry's endRow` by construction (proved
-    by induction against this iterator's forward-only invariant in
-    `docs/promotion.md` §3.2), then calls
-    `accumulo.Connector.AddTableSplits` (the `TABLE_SPLIT` FATE op) to
-    reconcile the destination's real splits to match the manifest's chain
-    boundaries *before* staging/submitting `TABLE_BULK_IMPORT2` — it does
-    not create or reconcile splits itself, and does not use
-    `computeMappingFromFiles`'s RFile-index-based rewrite path. A
-    concurrent merge between reconciliation and bulk-import submission can
-    still legitimately trigger `BULK_CONCURRENT_MERGE`, unhandled by this
-    slice (`docs/promotion.md` §3.3, §5).
+    entries — so, for entry `i` (i>=1) to validate, the real tablet the
+    iterator is left resting on after entry `i-1` succeeds must itself
+    have a `prevEndRow` equal to entry `i`'s own declared `prevEndRow`.
+    That is **not**, in general, the same thing as "entry `i`'s
+    `prevEndRow` equals entry `i-1`'s own `endRow`": the iterator's
+    left-over tablet's own `prevEndRow` is one boundary further back than
+    that. A single entry may still legally span more than one real
+    destination tablet. Shoal's promotion slice exploits exactly this by
+    widening each multi-tablet manifest chain's per-tablet extents so
+    every entry after the first declares `prevEndRow` as the *previous*
+    chain tablet's own `StartRow` — one boundary further back than that
+    chain tablet's own `endRow` (see
+    `internal/promotion/loadmapping.go`'s `resolveManifestTablets` and
+    `docs/promotion.md` §3.2 for the derivation). That widened
+    `prevEndRow` matches the iterator's left-over position only when the
+    destination's real splits, at or before the mapping's last boundary,
+    are **exactly** the manifest's own chain boundaries — no fewer (a
+    missing split leaves the iterator one or more real tablets short of
+    where an entry's `endRow` search expects it to stop) and, just as
+    importantly, no more: an extra split anywhere before the last
+    boundary permanently displaces the iterator one real tablet further
+    forward than a later entry's `prevEndRow` search can recover from,
+    since the iterator never rewinds, and validation is rejected with
+    `BULK_CONCURRENT_MERGE` even though nothing actually merged. Shoal
+    calls `accumulo.Connector.AddTableSplits` (the `TABLE_SPLIT` FATE op)
+    to reconcile the destination's real splits to match the manifest's
+    chain boundaries — guaranteeing the "no fewer" half — and then, since
+    `AddTableSplits` cannot itself remove an unrelated pre-existing split,
+    calls `accumulo.Connector.ListTableSplits` to confirm the "no more"
+    half directly (see `internal/promotion/promote.go`'s
+    `verifyNoUnexpectedDestinationSplits`), both *before*
+    staging/submitting `TABLE_BULK_IMPORT2` — it does not create or
+    reconcile splits itself, and does not use `computeMappingFromFiles`'s
+    RFile-index-based rewrite path. A concurrent split or merge between
+    that verification and bulk-import submission can still legitimately
+    trigger `BULK_CONCURRENT_MERGE`; this slice narrows that race but does
+    not eliminate it (`docs/promotion.md` §3.3, §5).
 
 ## Sharkbite
 

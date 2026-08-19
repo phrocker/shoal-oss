@@ -2,6 +2,8 @@ package engine
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -152,6 +154,142 @@ func TestRFileExportImportMemoryRoundTrip(t *testing.T) {
 	gotCells := scanAll(t, dst, "graph")
 	if fmt.Sprint(gotCells) != fmt.Sprint(wantCells) {
 		t.Fatalf("imported scan mismatch\ngot  %v\nwant %v", gotCells, wantCells)
+	}
+}
+
+// TestRFileExportTabletJSONRoundTripsNonUTF8Rows proves the fix for a
+// real, previously-latent bug: RFileExportTablet.StartRow/EndRow hold
+// arbitrary Accumulo row bytes, not necessarily valid UTF-8, but
+// encoding/json's default string handling silently replaces any invalid
+// UTF-8 byte sequence with U+FFFD. That was harmless while nothing read
+// a non-nil StartRow/EndRow's value (the original single-tablet-only
+// promotion code rejected any manifest that declared one), but
+// multi-tablet promotion's resolveManifestTablets now depends on these
+// bytes being exact. MarshalJSON/UnmarshalJSON must round-trip
+// non-UTF-8-safe rows byte-for-byte via base64, not silently corrupt
+// them.
+func TestRFileExportTabletJSONRoundTripsNonUTF8Rows(t *testing.T) {
+	nonUTF8 := string([]byte{0x80, 0xff, 0xc0, 0x00, 0x01})
+	ascii := "valid-ascii-row"
+	original := RFileExportTablet{Index: 1, StartRow: &nonUTF8, EndRow: &ascii}
+
+	data, err := json.Marshal(original)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+
+	// The wire form must carry start_row as base64, not as a JSON string
+	// literal holding the raw bytes (which would corrupt them).
+	var wire struct {
+		StartRow *string `json:"start_row"`
+	}
+	if err := json.Unmarshal(data, &wire); err != nil {
+		t.Fatalf("Unmarshal wire probe: %v", err)
+	}
+	if wire.StartRow == nil {
+		t.Fatal("start_row missing from wire form")
+	}
+	if _, err := base64.URLEncoding.DecodeString(*wire.StartRow); err != nil {
+		t.Fatalf("start_row %q is not valid base64: %v", *wire.StartRow, err)
+	}
+
+	var round RFileExportTablet
+	if err := json.Unmarshal(data, &round); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if round.Index != original.Index {
+		t.Fatalf("Index = %d, want %d", round.Index, original.Index)
+	}
+	if round.StartRow == nil || *round.StartRow != nonUTF8 {
+		t.Fatalf("StartRow round-trip mismatch: got %v, want exact byte match with the original non-UTF-8 row", round.StartRow)
+	}
+	if round.EndRow == nil || *round.EndRow != ascii {
+		t.Fatalf("EndRow = %v, want %q", round.EndRow, ascii)
+	}
+}
+
+// TestRFileExportTabletJSONOmitsNilBoundaries confirms the encoding
+// change is fully backward compatible with every manifest that could
+// ever round-trip successfully before it: a single-tablet manifest's
+// StartRow/EndRow are always nil, and must stay entirely absent from
+// the wire form (as before), not merely encoded as an empty value.
+func TestRFileExportTabletJSONOmitsNilBoundaries(t *testing.T) {
+	original := RFileExportTablet{Index: 0}
+	data, err := json.Marshal(original)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if strings.Contains(string(data), "start_row") || strings.Contains(string(data), "end_row") {
+		t.Fatalf("nil boundaries must be omitted from the wire form, got %s", data)
+	}
+	var round RFileExportTablet
+	if err := json.Unmarshal(data, &round); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if round.StartRow != nil || round.EndRow != nil {
+		t.Fatalf("round-tripped nil boundaries = (%v, %v), want (nil, nil)", round.StartRow, round.EndRow)
+	}
+}
+
+// TestRFileExportTabletJSONRejectsMalformedBase64 confirms a corrupted
+// or hand-edited manifest fails closed at decode time with a clear
+// error, rather than silently misinterpreting garbage as row bytes.
+func TestRFileExportTabletJSONRejectsMalformedBase64(t *testing.T) {
+	data := []byte(`{"index":0,"start_row":"not valid base64!!"}`)
+	var tablet RFileExportTablet
+	if err := json.Unmarshal(data, &tablet); err == nil {
+		t.Fatal("Unmarshal with malformed base64 start_row = nil error, want error")
+	}
+}
+
+// TestRFileExportManifestJSONRoundTripsMultiTabletNonUTF8Splits
+// exercises the exact path production tooling uses (cmd/shoal-embed's
+// `export`/`import` subcommands: json.Marshal/json.Unmarshal on a whole
+// *RFileExportManifest, not just one tablet in isolation) with a
+// realistic multi-tablet chain whose split rows are not valid UTF-8, to
+// confirm the manifest-level round trip -- not just the tablet type in
+// isolation -- preserves every boundary byte-for-byte.
+func TestRFileExportManifestJSONRoundTripsMultiTabletNonUTF8Splits(t *testing.T) {
+	rowA := string([]byte{0x00, 0x80, 0xff})
+	rowB := string([]byte{0xff, 0xff})
+	manifest := &RFileExportManifest{
+		Version:     RFileExportManifestVersion,
+		SourceTable: "events",
+		Tablets: []RFileExportTablet{
+			{Index: 0, EndRow: &rowA},
+			{Index: 1, StartRow: &rowA, EndRow: &rowB},
+			{Index: 2, StartRow: &rowB},
+		},
+	}
+
+	data, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	var round RFileExportManifest
+	if err := json.Unmarshal(data, &round); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if len(round.Tablets) != 3 {
+		t.Fatalf("tablets = %d, want 3", len(round.Tablets))
+	}
+	if round.Tablets[0].StartRow != nil {
+		t.Fatalf("tablet 0 StartRow = %v, want nil", round.Tablets[0].StartRow)
+	}
+	if round.Tablets[0].EndRow == nil || *round.Tablets[0].EndRow != rowA {
+		t.Fatalf("tablet 0 EndRow round-trip mismatch: got %v", round.Tablets[0].EndRow)
+	}
+	if round.Tablets[1].StartRow == nil || *round.Tablets[1].StartRow != rowA {
+		t.Fatalf("tablet 1 StartRow round-trip mismatch: got %v", round.Tablets[1].StartRow)
+	}
+	if round.Tablets[1].EndRow == nil || *round.Tablets[1].EndRow != rowB {
+		t.Fatalf("tablet 1 EndRow round-trip mismatch: got %v", round.Tablets[1].EndRow)
+	}
+	if round.Tablets[2].StartRow == nil || *round.Tablets[2].StartRow != rowB {
+		t.Fatalf("tablet 2 StartRow round-trip mismatch: got %v", round.Tablets[2].StartRow)
+	}
+	if round.Tablets[2].EndRow != nil {
+		t.Fatalf("tablet 2 EndRow = %v, want nil", round.Tablets[2].EndRow)
 	}
 }
 

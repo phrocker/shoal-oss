@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/phrocker/shoal/accumulo"
@@ -25,6 +26,12 @@ type fakePromoter struct {
 	splitTable string
 	splitRows  [][]byte
 	splitErr   error
+
+	listSplitsCalls    int
+	listSplitsTable    string
+	listSplitsOverride [][]byte
+	listSplitsSet      bool
+	listSplitsErr      error
 }
 
 func (f *fakePromoter) AddTableSplits(_ context.Context, tableName string, splits [][]byte) error {
@@ -32,6 +39,25 @@ func (f *fakePromoter) AddTableSplits(_ context.Context, tableName string, split
 	f.splitTable = tableName
 	f.splitRows = splits
 	return f.splitErr
+}
+
+// ListTableSplits defaults to echoing back whatever AddTableSplits was
+// last asked to add, i.e. it simulates a destination that now has
+// exactly the required splits and nothing else -- the happy path every
+// existing test other than the ones exercising this check explicitly
+// relies on. Tests exercising verifyNoUnexpectedDestinationSplits set
+// listSplitsOverride to simulate a destination with extra, unrelated
+// splits.
+func (f *fakePromoter) ListTableSplits(_ context.Context, tableName string) ([][]byte, error) {
+	f.listSplitsCalls++
+	f.listSplitsTable = tableName
+	if f.listSplitsErr != nil {
+		return nil, f.listSplitsErr
+	}
+	if f.listSplitsSet {
+		return f.listSplitsOverride, nil
+	}
+	return f.splitRows, nil
 }
 
 func (f *fakePromoter) BulkImport(_ context.Context, tableName, bulkDir string, opts accumulo.BulkImportOptions) error {
@@ -245,6 +271,9 @@ func TestPromoteReconcilesSplitsThenStagesThenSubmitsForMultiTabletManifest(t *t
 	if !reflect.DeepEqual(importer.splitRows, wantSplits) {
 		t.Fatalf("AddTableSplits rows = %#v, want %#v", importer.splitRows, wantSplits)
 	}
+	if importer.listSplitsCalls != 1 {
+		t.Fatalf("ListTableSplits calls = %d, want 1 (Promote must verify reconciled splits before staging)", importer.listSplitsCalls)
+	}
 	if importer.calls != 1 {
 		t.Fatalf("BulkImport calls = %d, want 1", importer.calls)
 	}
@@ -273,6 +302,9 @@ func TestPromoteSkipsAddTableSplitsForSingleTabletManifest(t *testing.T) {
 	}
 	if importer.splitCalls != 0 {
 		t.Fatalf("AddTableSplits calls = %d, want 0 for a single-tablet manifest", importer.splitCalls)
+	}
+	if importer.listSplitsCalls != 0 {
+		t.Fatalf("ListTableSplits calls = %d, want 0 for a single-tablet manifest (no splits required, nothing to verify)", importer.listSplitsCalls)
 	}
 }
 
@@ -334,5 +366,119 @@ func TestPromoteEndToEndThreeTabletSuccess(t *testing.T) {
 		if _, err := dst.Open(context.Background(), "hdfs://nn/bulk/events-1/"+name); err != nil {
 			t.Fatalf("expected staged file %s: %v", name, err)
 		}
+	}
+}
+
+// populatedThreeTabletManifest returns threeTabletManifest with every
+// RFile's size/hash filled in and staged into src, so a test can call
+// Promote against it directly without repeating the fixture setup
+// TestPromoteEndToEndThreeTabletSuccess already establishes.
+func populatedThreeTabletManifest(src *memory.Backend) *engine.RFileExportManifest {
+	manifest := threeTabletManifest()
+	wantHashes := []string{
+		"ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb", // sha256("a")
+		"3e23e8160039594a33894f6564e1b1348bbd7a0088d42c4acb73eeaed59c009d", // sha256("b")
+		"2e7d2c03a9507ae265ecf5b5356885a53393a2029d241394997265a1a25aefc6", // sha256("c")
+	}
+	for i := range manifest.RFiles {
+		src.Put(manifest.RFiles[i].DestinationPath, []byte{byte('a' + i)})
+		manifest.RFiles[i].Size = 1
+		manifest.RFiles[i].SHA256 = wantHashes[i]
+	}
+	return manifest
+}
+
+// TestPromoteRejectsExtraDestinationSplitBeforeLastRequiredRow is the
+// regression test for the exact counter-example that broke
+// BuildLoadMapping's widening rule (see docs/promotion.md §3.2/§5): a
+// destination that already has an extra, unrelated split strictly
+// before the manifest's required splits. threeTabletManifest requires
+// splits at "d" and "m"; a pre-existing split at "c" (< "d") forces
+// Accumulo's real PrepBulkImport.validateLoadMapping walk past the one
+// tablet in the whole table whose real prevEndRow is nil after
+// resolving the first entry, so the second entry's widened
+// prevEndRow=nil can never re-match — a spurious "concurrent merge"
+// rejection that has nothing to do with an actual concurrent merge.
+// Promote must catch this itself and fail closed before ever staging or
+// submitting anything.
+func TestPromoteRejectsExtraDestinationSplitBeforeLastRequiredRow(t *testing.T) {
+	src := memory.New()
+	manifest := populatedThreeTabletManifest(src)
+	dst := memory.New()
+	importer := &fakePromoter{
+		listSplitsSet:      true,
+		listSplitsOverride: [][]byte{[]byte("c"), []byte("d"), []byte("m")},
+	}
+	_, err := Promote(context.Background(), src, manifest, dst, "hdfs://nn/bulk/events-1", importer, "events", Options{})
+	if err == nil {
+		t.Fatal("Promote with an unexpected extra destination split before the last required row = nil error, want error")
+	}
+	if !strings.Contains(err.Error(), `"c"`) {
+		t.Fatalf("error %q does not name the offending split row", err.Error())
+	}
+	if importer.splitCalls != 1 {
+		t.Fatalf("AddTableSplits calls = %d, want 1 (reconciliation still runs before verification)", importer.splitCalls)
+	}
+	if importer.listSplitsCalls != 1 {
+		t.Fatalf("ListTableSplits calls = %d, want 1", importer.listSplitsCalls)
+	}
+	if importer.calls != 0 {
+		t.Fatalf("BulkImport calls = %d, want 0 (must fail closed before submission)", importer.calls)
+	}
+	if got := dst.Keys(); len(got) != 0 {
+		t.Fatalf("dst.Keys() = %v, want no staged files when the extra-split check fails before staging", got)
+	}
+}
+
+// TestPromoteAllowsTrailingDestinationSplitAfterLastRequiredRow proves
+// the check above is not over-conservative: a trailing extra split
+// strictly after the last required row falls entirely inside the
+// manifest's final, always-unbounded entry, which can legitimately
+// absorb any number of additional real trailing tablets, so it must not
+// be rejected.
+func TestPromoteAllowsTrailingDestinationSplitAfterLastRequiredRow(t *testing.T) {
+	src := memory.New()
+	manifest := populatedThreeTabletManifest(src)
+	dst := memory.New()
+	importer := &fakePromoter{
+		listSplitsSet:      true,
+		listSplitsOverride: [][]byte{[]byte("d"), []byte("m"), []byte("z")},
+	}
+	mapping, err := Promote(context.Background(), src, manifest, dst, "hdfs://nn/bulk/events-1", importer, "events", Options{})
+	if err != nil {
+		t.Fatalf("Promote with a trailing extra split after the last required row = %v, want success", err)
+	}
+	if len(mapping) != 3 {
+		t.Fatalf("mapping entries = %d, want 3", len(mapping))
+	}
+	if importer.calls != 1 {
+		t.Fatalf("BulkImport calls = %d, want 1", importer.calls)
+	}
+}
+
+// TestPromoteRejectsWhenDestinationIsMissingARequiredSplit exercises the
+// defensive "too few" side of the same check: it should never happen in
+// practice (a successful AddTableSplits is supposed to guarantee the
+// required rows exist), but if a concurrent merge removes a
+// just-reconciled split in the narrow window before ListTableSplits
+// observes it, Promote must fail closed rather than proceed with a
+// mapping that no longer matches the destination's real splits.
+func TestPromoteRejectsWhenDestinationIsMissingARequiredSplit(t *testing.T) {
+	src := memory.New()
+	manifest := populatedThreeTabletManifest(src)
+	dst := memory.New()
+	importer := &fakePromoter{
+		listSplitsSet:      true,
+		listSplitsOverride: [][]byte{[]byte("d")},
+	}
+	_, err := Promote(context.Background(), src, manifest, dst, "hdfs://nn/bulk/events-1", importer, "events", Options{})
+	if err == nil {
+		t.Fatal("Promote with a destination missing a required split = nil error, want error")
+	}
+	if importer.calls != 0 {
+		t.Fatalf("BulkImport calls = %d, want 0 (must fail closed before submission)", importer.calls)
+	}
+	if got := dst.Keys(); len(got) != 0 {
+		t.Fatalf("dst.Keys() = %v, want no staged files when the extra-split check fails before staging", got)
 	}
 }
