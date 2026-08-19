@@ -1249,7 +1249,11 @@ func (w *replaceWriter) Close() (retErr error) {
 	if w.closed {
 		return nil
 	}
-	if err := closeAfterReplication(w.ctx, w.writer); err != nil {
+	writerClosed, err := closeAfterReplication(w.ctx, w.writer)
+	if writerClosed {
+		w.writerClosed = true
+	}
+	if err != nil {
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), cleanupTimeout)
 		defer cancel()
 		return errors.Join(
@@ -1257,7 +1261,6 @@ func (w *replaceWriter) Close() (retErr error) {
 			w.removeTemp(cleanupCtx),
 		)
 	}
-	w.writerClosed = true
 
 	if err := w.commitReplacement(); err != nil {
 		if storage.IsCommittedWriteError(err) {
@@ -1508,10 +1511,12 @@ func (w *replaceWriter) Abort() (retErr error) {
 	cleanupCtx, cancel := context.WithTimeout(context.Background(), cleanupTimeout)
 	defer cancel()
 	if !w.writerClosed {
-		if err := closeAfterReplication(cleanupCtx, w.writer); err != nil {
-			abortErr = fmt.Errorf("hdfs: close temporary file %s: %w", w.temp, err)
-		} else {
+		writerClosed, err := closeAfterReplication(cleanupCtx, w.writer)
+		if writerClosed {
 			w.writerClosed = true
+		}
+		if err != nil {
+			abortErr = fmt.Errorf("hdfs: close temporary file %s: %w", w.temp, err)
 		}
 	}
 	if cleanupErr := w.removeTemp(cleanupCtx); cleanupErr != nil {
@@ -1556,7 +1561,7 @@ func withCleanupContext(fn func(context.Context) error) error {
 	return fn(cleanupCtx)
 }
 
-func closeAfterReplication(ctx context.Context, writer storage.Writer) (retErr error) {
+func closeAfterReplication(ctx context.Context, writer storage.Writer) (writerClosed bool, retErr error) {
 	const (
 		initialDelay = 100 * time.Millisecond
 		maxDelay     = time.Second
@@ -1566,7 +1571,7 @@ func closeAfterReplication(ctx context.Context, writer storage.Writer) (retErr e
 	retryCtx, cancel := context.WithTimeout(ctx, cleanupTimeout)
 	defer cancel()
 	if err := applyDeadline(retryCtx, writer); err != nil {
-		return err
+		return false, err
 	}
 	defer func() {
 		if retErr == nil {
@@ -1590,20 +1595,22 @@ func closeAfterReplication(ctx context.Context, writer storage.Writer) (retErr e
 		} else {
 			closeErr = writer.Close()
 		}
+		writerClosed = closeErr == nil
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			return errors.Join(closeErr, ctxErr)
+			return writerClosed, errors.Join(closeErr, ctxErr)
 		}
 		if ctxErr := retryCtx.Err(); ctxErr != nil {
-			return errors.Join(closeErr, ctxErr)
+			return writerClosed, errors.Join(closeErr, ctxErr)
 		}
 		if !errors.Is(closeErr, hdfsclient.ErrReplicating) {
-			return closeErr
+			return writerClosed, closeErr
 		}
+		writerClosed = false
 		timer := time.NewTimer(delay)
 		select {
 		case <-retryCtx.Done():
 			timer.Stop()
-			return retryCtx.Err()
+			return false, retryCtx.Err()
 		case <-timer.C:
 		}
 		delay = min(delay*2, maxDelay)

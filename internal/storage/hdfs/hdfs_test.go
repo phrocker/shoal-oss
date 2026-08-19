@@ -1702,19 +1702,40 @@ func TestBackendCloseJoinsCustomErrorAfterContextDeadlineWithoutPublish(t *testi
 func TestBackendCloseReturningNilAfterCancellationDoesNotPublish(t *testing.T) {
 	client := newFakeClient()
 	client.files["/tables/1.rf"] = []byte("old")
+	var releaseCalls atomic.Int32
 	ctx, cancel := context.WithCancel(context.Background())
 	client.writerCloseHook = func() error {
 		cancel()
 		return nil
 	}
-	backend, err := New("nn:8020", WithClient(client))
+	backend, err := NewContext(context.Background(), "nn:8020",
+		WithClient(client),
+		func(c *config) {
+			c.clientLeaseFactory = func(context.Context) (*leasedClient, error) {
+				return &leasedClient{
+					client: client,
+					release: func() error {
+						releaseCalls.Add(1)
+						return nil
+					},
+				}, nil
+			}
+		},
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer backend.Close()
 
 	err = storage.WriteAll(ctx, backend, "/tables/1.rf", []byte("new"))
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("WriteAll error = %v, want context.Canceled", err)
+	}
+	if client.writerCloseCalls != 1 {
+		t.Fatalf("writer Close calls = %d, want 1", client.writerCloseCalls)
+	}
+	if got := releaseCalls.Load(); got != 1 {
+		t.Fatalf("operation lease release calls = %d, want 1", got)
 	}
 	if got := string(client.files["/tables/1.rf"]); got != "old" {
 		t.Fatalf("target contents = %q, want old", got)
@@ -1824,8 +1845,35 @@ func TestBackendAbortBoundsStalledCompleteAndCleansUpTemp(t *testing.T) {
 func TestCloseAfterReplicationSuccessfulCloseUnaffected(t *testing.T) {
 	client := newFakeClient()
 	writer := &fakeWriter{client: client}
-	if err := closeAfterReplication(context.Background(), writer); err != nil {
+	closed, err := closeAfterReplication(context.Background(), writer)
+	if err != nil {
 		t.Fatal(err)
+	}
+	if !closed {
+		t.Fatal("closeAfterReplication reported writer open after successful close")
+	}
+	if client.writerCloseCalls != 1 {
+		t.Fatalf("Close calls = %d, want 1", client.writerCloseCalls)
+	}
+}
+
+func TestCloseAfterReplicationReportsClosedWhenContextCanceledAfterClose(t *testing.T) {
+	client := newFakeClient()
+	ctx, cancel := context.WithCancel(context.Background())
+	writer := &fakeWriter{
+		client: client,
+		closeHook: func() error {
+			cancel()
+			return nil
+		},
+	}
+
+	closed, err := closeAfterReplication(ctx, writer)
+	if !closed {
+		t.Fatal("closeAfterReplication did not report successful underlying close")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("closeAfterReplication error = %v, want context.Canceled", err)
 	}
 	if client.writerCloseCalls != 1 {
 		t.Fatalf("Close calls = %d, want 1", client.writerCloseCalls)
@@ -1838,7 +1886,10 @@ func TestCloseAfterReplicationAppliesAndRestoresRetryDeadline(t *testing.T) {
 	defer cancel()
 
 	start := time.Now()
-	err := closeAfterReplication(ctx, writer)
+	closed, err := closeAfterReplication(ctx, writer)
+	if closed {
+		t.Fatal("closeAfterReplication reported writer closed on deadline failure")
+	}
 	if !errors.Is(err, os.ErrDeadlineExceeded) {
 		t.Fatalf("closeAfterReplication error = %v, want deadline exceeded", err)
 	}
@@ -1858,7 +1909,11 @@ func TestCloseAfterReplicationAppliesAndRestoresRetryDeadline(t *testing.T) {
 
 func TestCloseAfterReplicationClearsDeadlineForBackgroundContext(t *testing.T) {
 	writer := &immediateErrorDeadlineWriter{}
-	if err := closeAfterReplication(context.Background(), writer); !errors.Is(err, errInjectedClose) {
+	closed, err := closeAfterReplication(context.Background(), writer)
+	if closed {
+		t.Fatal("closeAfterReplication reported writer closed on injected close failure")
+	}
+	if !errors.Is(err, errInjectedClose) {
 		t.Fatalf("closeAfterReplication error = %v, want %v", err, errInjectedClose)
 	}
 	if len(writer.deadlines) != 2 {
@@ -1875,7 +1930,10 @@ func TestCloseAfterReplicationUsesContextAwareClose(t *testing.T) {
 	defer cancel()
 
 	start := time.Now()
-	err := closeAfterReplication(ctx, writer)
+	closed, err := closeAfterReplication(ctx, writer)
+	if closed {
+		t.Fatal("closeAfterReplication reported writer closed after context-aware failure")
+	}
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("closeAfterReplication error = %v, want context deadline exceeded", err)
 	}
