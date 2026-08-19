@@ -27,6 +27,11 @@ type fakeScannerAdapter struct {
 
 	continueEntered chan<- struct{}
 	continueRelease <-chan struct{}
+	// continueErrWithResult returns the queued batch alongside continueErr,
+	// which is what the pooled client does when the RPC succeeds but releasing
+	// its transport lease fails.
+	continueErrWithResult      bool
+	multiContinueErrWithResult bool
 
 	multiStartResults []*data.InitialMultiScan
 	multiStartErrors  []error
@@ -115,6 +120,7 @@ func (f *fakeScannerAdapter) Continue(
 	continueEntered := f.continueEntered
 	continueRelease := f.continueRelease
 	continueErr := f.continueErr
+	withResult := f.continueErrWithResult
 	var result *data.ScanResult_
 	if index < len(f.continues) {
 		result = f.continues[index]
@@ -137,6 +143,9 @@ func (f *fakeScannerAdapter) Continue(
 		return nil, err
 	}
 	if continueErr != nil {
+		if withResult {
+			return result, continueErr
+		}
 		return nil, continueErr
 	}
 	return result, nil
@@ -189,13 +198,19 @@ func (f *fakeScannerAdapter) ContinueMulti(
 	defer f.mu.Unlock()
 	index := f.multiContinueCalls
 	f.multiContinueCalls++
+	var result *data.MultiScanResult_
+	if index < len(f.multiContinues) {
+		result = f.multiContinues[index]
+	} else {
+		result = &data.MultiScanResult_{}
+	}
 	if f.multiContinueErr != nil {
+		if f.multiContinueErrWithResult {
+			return result, f.multiContinueErr
+		}
 		return nil, f.multiContinueErr
 	}
-	if index >= len(f.multiContinues) {
-		return &data.MultiScanResult_{}, nil
-	}
-	return f.multiContinues[index], nil
+	return result, nil
 }
 
 func (f *fakeScannerAdapter) CloseMultiScan(

@@ -172,7 +172,8 @@ func (r *ResultStream) Next() bool {
 	r.pending = nil
 	r.consumed = 0
 	if r.pendingFatal != nil {
-		r.fatal = errors.Join(r.pendingFatal, r.closeSession())
+		r.recordClose()
+		r.fatal = r.pendingFatal
 		r.pendingFatal = nil
 		return false
 	}
@@ -187,7 +188,8 @@ func (r *ResultStream) Next() bool {
 	}
 	for {
 		if err := r.ctx.Err(); err != nil {
-			r.fatal = errors.Join(err, r.closeSession())
+			r.recordClose()
+			r.fatal = err
 			return false
 		}
 		if r.session == nil && !r.openNextSession() {
@@ -210,7 +212,8 @@ func (r *ResultStream) Next() bool {
 			return true
 		}
 		if err != nil {
-			r.fatal = errors.Join(err, r.closeSession())
+			r.recordClose()
+			r.fatal = err
 			return false
 		}
 		if more {
@@ -248,13 +251,10 @@ func (r *ResultStream) finishSession() bool {
 		return true
 	}
 	followers, err := session.followers(r.ctx)
-	closeErr := r.closeSession()
+	r.recordClose()
 	if err != nil {
-		r.fatal = errors.Join(err, closeErr)
+		r.fatal = err
 		return false
-	}
-	if closeErr != nil {
-		r.cleanup = errors.Join(r.cleanup, closeErr)
 	}
 	if len(followers) > 0 {
 		remaining := make([]streamSource, 0, len(followers)+len(r.sources)-r.next)
@@ -264,6 +264,15 @@ func (r *ResultStream) finishSession() bool {
 		r.next = 0
 	}
 	return true
+}
+
+// recordClose releases the current session and accumulates any close failure in
+// cleanup, which both Err and Close report. Iteration failures stay in fatal so
+// the two are never confused.
+func (r *ResultStream) recordClose() {
+	if closeErr := r.closeSession(); closeErr != nil {
+		r.cleanup = errors.Join(r.cleanup, closeErr)
+	}
 }
 
 // closeSession releases the current server session and clears it. The close
@@ -300,8 +309,8 @@ func (r *ResultStream) Err() error {
 
 // Close releases the server-side scan session. It is idempotent and safe to
 // call while Next is blocked: the in-flight RPC is cancelled first. Close
-// returns the accumulated cleanup failures; a stream closed before it drained
-// reports ErrStreamClosed from Err on the next call to Next.
+// returns the accumulated cleanup failures, and a stream closed before it
+// drained reports ErrStreamClosed from Err.
 func (r *ResultStream) Close() error {
 	r.cancel()
 	r.mu.Lock()
@@ -310,12 +319,16 @@ func (r *ResultStream) Close() error {
 		return r.cleanup
 	}
 	r.closed = true
-	if closeErr := r.closeSession(); closeErr != nil {
-		r.cleanup = errors.Join(r.cleanup, closeErr)
-	}
+	r.recordClose()
 	r.pending = nil
 	r.consumed = 0
-	r.pendingFatal = nil
+	if r.pendingFatal != nil {
+		r.fatal = r.pendingFatal
+		r.pendingFatal = nil
+	}
+	if r.fatal == nil && !r.done {
+		r.fatal = ErrStreamClosed
+	}
 	return r.cleanup
 }
 
@@ -413,29 +426,28 @@ type tabletSession struct {
 }
 
 func (t *tabletSession) fetch(ctx context.Context) ([]KeyValue, bool, error) {
+	var result *data.ScanResult_
+	var rpcErr error
 	if !t.started {
 		t.started = true
-		result := t.initial
-		t.initial = nil
-		entries, appendErr := appendScanResult(nil, result)
-		if err := errors.Join(t.startErr, appendErr); err != nil {
-			return entries, false, err
-		}
-		more := result != nil && result.More
-		if more && t.scanID == 0 {
-			return entries, false, errors.New("accumulo: continuing scan has zero scan ID")
-		}
-		return entries, more, nil
-	}
-	result, err := t.scanner.connector.scan.Continue(ctx, t.address, t.scanID, 0)
-	if err != nil {
-		return nil, false, err
+		result, rpcErr = t.initial, t.startErr
+		t.initial, t.startErr = nil, nil
+	} else {
+		// Continue may return a usable batch together with an error, for
+		// example when the pooled client fails to release its transport lease
+		// after a successful RPC. Decode the batch either way so the entries
+		// reach the caller before the failure does.
+		result, rpcErr = t.scanner.connector.scan.Continue(ctx, t.address, t.scanID, 0)
 	}
 	entries, appendErr := appendScanResult(nil, result)
-	if appendErr != nil {
-		return entries, false, appendErr
+	if err := errors.Join(rpcErr, appendErr); err != nil {
+		return entries, false, err
 	}
-	return entries, result != nil && result.More, nil
+	more := result != nil && result.More
+	if more && t.scanID == 0 {
+		return entries, false, errors.New("accumulo: continuing scan has zero scan ID")
+	}
+	return entries, more, nil
 }
 
 func (t *tabletSession) followers(context.Context) ([]streamSource, error) { return nil, nil }
@@ -502,28 +514,30 @@ type multiSession struct {
 
 func (m *multiSession) fetch(ctx context.Context) ([]KeyValue, bool, error) {
 	var result *data.MultiScanResult_
-	startErr := m.startErr
+	var rpcErr error
 	if !m.started {
 		m.started = true
-		result = m.initial
-		m.initial = nil
-		m.startErr = nil
+		result, rpcErr = m.initial, m.startErr
+		m.initial, m.startErr = nil, nil
 	} else {
-		startErr = nil
-		var err error
-		result, err = m.multi.ContinueMulti(ctx, m.address, m.scanID, 0)
-		if err != nil {
-			return nil, false, err
-		}
+		// ContinueMulti has the same partial-success shape as Continue.
+		result, rpcErr = m.multi.ContinueMulti(ctx, m.address, m.scanID, 0)
 	}
-	if result == nil {
-		return nil, false, startErr
+	var entries []KeyValue
+	var appendErr error
+	if result != nil {
+		entries, appendErr = appendKeyValues(nil, result.Results)
 	}
-	entries, appendErr := appendKeyValues(nil, result.Results)
-	if err := errors.Join(startErr, appendErr); err != nil {
+	if err := errors.Join(rpcErr, appendErr); err != nil {
 		return entries, false, err
 	}
+	if result == nil {
+		return nil, false, nil
+	}
 	m.failures = appendScanBatch(m.failures, result.Failures)
+	if result.More && m.scanID == 0 {
+		return entries, false, errors.New("accumulo: continuing multi-scan has zero scan ID")
+	}
 	if !result.More && result.PartScan != nil {
 		return entries, false, errors.New(
 			"accumulo: multi-scan ended with an incomplete tablet range",

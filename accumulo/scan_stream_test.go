@@ -730,6 +730,207 @@ func TestBatchScannerStreamDeliversMultiScanEntriesBeforeAStartFailure(t *testin
 	}
 }
 
+func TestStreamDeliversContinueEntriesThatArriveWithAFailure(t *testing.T) {
+	connector := streamTestConnector(t)
+	failure := errors.New("lease release failed")
+	adapter := &fakeScannerAdapter{
+		startResults: []*data.InitialScan{{
+			ScanID:  101,
+			Result_: &data.ScanResult_{Results: []*data.TKeyValue{testEntry("a", "one")}, More: true},
+		}},
+		continues: []*data.ScanResult_{
+			{Results: []*data.TKeyValue{testEntry("b", "two")}, More: true},
+		},
+		continueErr:           failure,
+		continueErrWithResult: true,
+	}
+	connector.scan = adapter
+	scanner, err := connector.NewScanner(Table{Name: "events"}, ScannerOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	scanRange, _ := NewRange([]byte("a"), true, []byte("c"), true)
+	stream, err := scanner.Stream(context.Background(), scanRange)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = stream.Close() }()
+	if got := rowsOf(drainStream(t, stream)); got != "a,b" {
+		t.Fatalf("rows = %q", got)
+	}
+	if !errors.Is(stream.Err(), failure) {
+		t.Fatalf("Err = %v", stream.Err())
+	}
+}
+
+func TestBatchScannerStreamDeliversMultiContinueEntriesThatArriveWithAFailure(t *testing.T) {
+	connector := streamTestConnector(t)
+	failure := errors.New("multi lease release failed")
+	adapter := &fakeScannerAdapter{
+		multiStartResults: []*data.InitialMultiScan{{
+			ScanID: 111,
+			Result_: &data.MultiScanResult_{
+				Results: []*data.TKeyValue{testEntry("a", "one")},
+				More:    true,
+			},
+		}},
+		multiContinues: []*data.MultiScanResult_{
+			{Results: []*data.TKeyValue{testEntry("b", "two")}, More: true},
+		},
+		multiContinueErr:           failure,
+		multiContinueErrWithResult: true,
+	}
+	connector.scan = adapter
+	batch, err := connector.NewBatchScanner(Table{Name: "events"}, ScannerOptions{UseMultiScan: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	scanRange, _ := NewRange([]byte("a"), true, []byte("c"), true)
+	stream, err := batch.Stream(context.Background(), []*Range{scanRange})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = stream.Close() }()
+	if got := rowsOf(drainStream(t, stream)); got != "a,b" {
+		t.Fatalf("rows = %q", got)
+	}
+	if !errors.Is(stream.Err(), failure) {
+		t.Fatalf("Err = %v", stream.Err())
+	}
+}
+
+func TestBatchScannerStreamRejectsMultiScanContinuationWithoutAScanID(t *testing.T) {
+	connector := streamTestConnector(t)
+	adapter := &fakeScannerAdapter{
+		multiStartResults: []*data.InitialMultiScan{{
+			ScanID: 0,
+			Result_: &data.MultiScanResult_{
+				Results: []*data.TKeyValue{testEntry("a", "one")},
+				More:    true,
+			},
+		}},
+	}
+	connector.scan = adapter
+	batch, err := connector.NewBatchScanner(Table{Name: "events"}, ScannerOptions{UseMultiScan: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	scanRange, _ := NewRange([]byte("a"), true, []byte("c"), true)
+	stream, err := batch.Stream(context.Background(), []*Range{scanRange})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = stream.Close() }()
+	if got := rowsOf(drainStream(t, stream)); got != "a" {
+		t.Fatalf("rows = %q", got)
+	}
+	err = stream.Err()
+	if err == nil || !strings.Contains(err.Error(), "multi-scan has zero scan ID") {
+		t.Fatalf("Err = %v", err)
+	}
+	if adapter.multiContinueCalls != 0 {
+		t.Fatalf("continued a multi-scan without a scan ID %d times", adapter.multiContinueCalls)
+	}
+}
+
+func TestStreamCloseReportsCleanupFailuresAfterAFatalError(t *testing.T) {
+	connector := streamTestConnector(t)
+	failure := errors.New("continue boom")
+	adapter := &fakeScannerAdapter{
+		startResults: []*data.InitialScan{{
+			ScanID:  121,
+			Result_: &data.ScanResult_{Results: []*data.TKeyValue{testEntry("a", "one")}, More: true},
+		}},
+		continueErr: failure,
+		closeErr:    errors.New("close boom"),
+	}
+	connector.scan = adapter
+	scanner, err := connector.NewScanner(Table{Name: "events"}, ScannerOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	scanRange, _ := NewRange([]byte("a"), true, []byte("c"), true)
+	stream, err := scanner.Stream(context.Background(), scanRange)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := rowsOf(drainStream(t, stream)); got != "a" {
+		t.Fatalf("rows = %q", got)
+	}
+	var cleanup *CleanupError
+	if !errors.Is(stream.Err(), failure) || !errors.As(stream.Err(), &cleanup) {
+		t.Fatalf("Err = %v", stream.Err())
+	}
+	closeErr := stream.Close()
+	if !errors.As(closeErr, &cleanup) || cleanup.ScanID != 121 {
+		t.Fatalf("Close = %v", closeErr)
+	}
+	if errors.Is(closeErr, failure) {
+		t.Fatalf("Close reported the iteration failure: %v", closeErr)
+	}
+}
+
+func TestStreamCloseRecordsErrStreamClosedImmediately(t *testing.T) {
+	connector := streamTestConnector(t)
+	adapter := &fakeScannerAdapter{
+		startResults: []*data.InitialScan{{
+			ScanID:  131,
+			Result_: &data.ScanResult_{Results: []*data.TKeyValue{testEntry("a", "one")}, More: true},
+		}},
+	}
+	connector.scan = adapter
+	scanner, err := connector.NewScanner(Table{Name: "events"}, ScannerOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	scanRange, _ := NewRange([]byte("a"), true, []byte("c"), true)
+	stream, err := scanner.Stream(context.Background(), scanRange)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !stream.Next() {
+		t.Fatalf("Next = false, err = %v", stream.Err())
+	}
+	if err := stream.Close(); err != nil {
+		t.Fatalf("Close = %v", err)
+	}
+	if !errors.Is(stream.Err(), ErrStreamClosed) {
+		t.Fatalf("Err right after Close = %v", stream.Err())
+	}
+	if stream.Next() {
+		t.Fatal("Next after Close returned true")
+	}
+}
+
+func TestStreamCloseAfterDrainingReportsNoError(t *testing.T) {
+	connector := streamTestConnector(t)
+	adapter := &fakeScannerAdapter{
+		startResults: []*data.InitialScan{{
+			ScanID:  141,
+			Result_: &data.ScanResult_{Results: []*data.TKeyValue{testEntry("a", "one")}},
+		}},
+	}
+	connector.scan = adapter
+	scanner, err := connector.NewScanner(Table{Name: "events"}, ScannerOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	scanRange, _ := NewRange([]byte("a"), true, []byte("c"), true)
+	stream, err := scanner.Stream(context.Background(), scanRange)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := rowsOf(drainStream(t, stream)); got != "a" {
+		t.Fatalf("rows = %q", got)
+	}
+	if err := stream.Close(); err != nil {
+		t.Fatalf("Close = %v", err)
+	}
+	if err := stream.Err(); err != nil {
+		t.Fatalf("Err after a clean drain = %v", err)
+	}
+}
+
 type singleOnlyScanAdapter struct{}
 
 func (singleOnlyScanAdapter) Start(
