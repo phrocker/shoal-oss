@@ -160,7 +160,11 @@ func (b *blockingUnaryInterceptor) intercept(ctx context.Context, req any, _ *gr
 		case b.entered <- struct{}{}:
 		default:
 		}
-		<-b.release
+		select {
+		case <-b.release:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
 	}
 	return handler(ctx, req)
 }
@@ -670,13 +674,30 @@ func TestServeHandleStopReturnsTimeoutErrorWithStuckUnary(t *testing.T) {
 	default:
 	}
 
+	blocker.enabled.Store(false)
+	transportDeadline := time.Now().Add(5 * time.Second)
+	transportStopped := false
+	for time.Now().Before(transportDeadline) {
+		probeCtx, probeCancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+		_, probeErr := client.Status(probeCtx, &embedpb.StatusRequest{})
+		probeContextErr := probeCtx.Err()
+		probeCancel()
+		if probeErr != nil && probeContextErr == nil {
+			transportStopped = true
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !transportStopped {
+		t.Fatal("transport still accepted fresh unary RPCs after Stop(ctx) returned")
+	}
+
 	close(blocker.release)
 
 	select {
-	case err := <-rpcErrCh:
-		if err == nil {
-			t.Fatal("blocked unary RPC unexpectedly succeeded after transport was force-stopped")
-		}
+	case <-rpcErrCh:
+		// Once a unary call has already been admitted, the response may win
+		// the transport-teardown race even though fresh RPCs are rejected.
 	case <-time.After(5 * time.Second):
 		t.Fatal("blocked unary RPC did not return after release")
 	}

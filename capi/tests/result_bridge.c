@@ -82,6 +82,27 @@ int main(void) {
   shoal_bridge_table_list_free(NULL);
   assert(shoal_bridge_table_list_alloc(SIZE_MAX) == NULL);
 
+  shoal_namespace_list_result *namespace_list =
+      shoal_bridge_namespace_list_alloc(2);
+  assert(namespace_list != NULL);
+  assert(shoal_bridge_namespace_list_count(namespace_list) == 2);
+  assert(shoal_bridge_namespace_list_set(namespace_list, 0, "", "+default"));
+  assert(
+      shoal_bridge_namespace_list_set(namespace_list, 1, "analytics", "12"));
+  shoal_namespace_view namespace_view;
+  assert(shoal_bridge_namespace_list_get(namespace_list, 0, &namespace_view));
+  assert(strcmp(namespace_view.name, "") == 0);
+  assert(strcmp(namespace_view.id, "+default") == 0);
+  assert(shoal_bridge_namespace_list_get(namespace_list, 1, &namespace_view));
+  assert(strcmp(namespace_view.name, "analytics") == 0);
+  assert(strcmp(namespace_view.id, "12") == 0);
+  assert(!shoal_bridge_namespace_list_get(namespace_list, 2, &namespace_view));
+  assert(!shoal_bridge_namespace_list_set(namespace_list, 2, "missing", "3"));
+  assert(!shoal_bridge_namespace_list_set(namespace_list, 0, NULL, "1"));
+  shoal_bridge_namespace_list_free(namespace_list);
+  shoal_bridge_namespace_list_free(NULL);
+  assert(shoal_bridge_namespace_list_alloc(SIZE_MAX) == NULL);
+
   static const uint8_t prev_row[] = {'a', '\0'};
   static const uint8_t end_row[] = {'z'};
   shoal_write_failure *failure = shoal_bridge_write_failure_alloc(
@@ -153,5 +174,31 @@ int main(void) {
   shoal_bridge_table_properties_free(properties);
   shoal_bridge_table_properties_free(NULL);
   assert(shoal_bridge_table_properties_alloc(SIZE_MAX) == NULL);
+
+  shoal_namespace_properties_result *namespace_properties =
+      shoal_bridge_namespace_properties_alloc(2);
+  assert(namespace_properties != NULL);
+  assert(shoal_bridge_namespace_properties_count(namespace_properties) == 2);
+  assert(shoal_bridge_namespace_properties_set(namespace_properties, 0,
+                                               "table.empty", ""));
+  assert(shoal_bridge_namespace_properties_set(namespace_properties, 1,
+                                               "table.mode", "stream"));
+  assert(shoal_bridge_namespace_properties_get(namespace_properties, 0,
+                                               &property_view));
+  assert(strcmp(property_view.key, "table.empty") == 0);
+  assert(strcmp(property_view.value, "") == 0);
+  assert(shoal_bridge_namespace_properties_get(namespace_properties, 1,
+                                               &property_view));
+  assert(strcmp(property_view.key, "table.mode") == 0);
+  assert(strcmp(property_view.value, "stream") == 0);
+  assert(!shoal_bridge_namespace_properties_get(namespace_properties, 2,
+                                                &property_view));
+  assert(!shoal_bridge_namespace_properties_set(namespace_properties, 2,
+                                                "missing", "x"));
+  assert(!shoal_bridge_namespace_properties_set(namespace_properties, 0, NULL,
+                                                "x"));
+  shoal_bridge_namespace_properties_free(namespace_properties);
+  shoal_bridge_namespace_properties_free(NULL);
+  assert(shoal_bridge_namespace_properties_alloc(SIZE_MAX) == NULL);
   return 0;
 }

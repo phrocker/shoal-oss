@@ -1,8 +1,8 @@
-# Revision-16 accepted matrix rows for docs/sharkbite-compatibility.md.
+# Revision-18 accepted matrix rows for docs/sharkbite-compatibility.md.
 # One entry per row: ROW-ID followed by the audited status, in document order.
 # Pinning the status next to the id means a swap of two rows' statuses inside one
 # section cannot pass the aggregate count checks undetected.
-# Update only when the independently audited revision-16 inventory itself changes.
+# Update only when the independently audited revision-18 inventory itself changes.
 # Regenerate from the audited document, review every added/removed/reclassified row
 # in code review, and keep the list in document order for human auditability.
 
@@ -59,9 +59,9 @@ SB-CFG-018 Not required (rationale required)
 SB-CONN-001 Behavior mismatch
 SB-CONN-002 Behavior mismatch
 SB-CONN-003 Behavior mismatch
-SB-CONN-004 Missing Go
-SB-CONN-005 Missing Go
-SB-CONN-006 Missing C ABI
+SB-CONN-004 Behavior mismatch
+SB-CONN-005 Behavior mismatch
+SB-CONN-006 Behavior mismatch
 SB-CONN-007 Missing Go
 SB-CONN-008 Behavior mismatch
 SB-CONN-009 Behavior mismatch
@@ -245,53 +245,53 @@ SB-BASE-017 Missing C ABI
 SB-BASE-018 Missing C ABI
 SB-BASE-019 Missing C ABI
 SB-BASE-020 Missing C ABI
-SB-TABLE-001 Missing C ABI
-SB-TABLE-002 Missing C ABI
-SB-TABLE-003 Missing C ABI
+SB-TABLE-001 Behavior mismatch
+SB-TABLE-002 Behavior mismatch
+SB-TABLE-003 Behavior mismatch
 SB-TABLE-004 Not required (rationale required)
 SB-TABLE-005 Behavior mismatch
 SB-TABLE-006 Missing Go
-SB-TABLE-007 Missing C ABI
-SB-TABLE-008 Missing C ABI
+SB-TABLE-007 Behavior mismatch
+SB-TABLE-008 Behavior mismatch
 SB-TABLE-009 Not required (rationale required)
-SB-TABLE-010 Missing Go
+SB-TABLE-010 Behavior mismatch
 SB-TABLE-011 Not required (rationale required)
 SB-TABLE-012 Missing Go
 SB-TABLE-013 Behavior mismatch
 SB-TABLE-014 Not required (rationale required)
 SB-TABLE-015 Not required (rationale required)
-SB-TABLE-016 Missing C ABI
-SB-TABLE-017 Missing C ABI
-SB-TABLE-018 Missing C ABI
-SB-TABLE-019 Missing C ABI
+SB-TABLE-016 Behavior mismatch
+SB-TABLE-017 Behavior mismatch
+SB-TABLE-018 Behavior mismatch
+SB-TABLE-019 Behavior mismatch
 SB-TABLE-020 Not required (rationale required)
-SB-TABLE-021 Missing C ABI
-SB-TABLE-022 Missing C ABI
-SB-NS-001 Missing Go
-SB-NS-002 Missing Go
-SB-NS-003 Missing Go
-SB-NS-004 Missing Go
-SB-NS-005 Missing Go
-SB-NS-006 Missing Go
-SB-NS-007 Missing Go
+SB-TABLE-021 Behavior mismatch
+SB-TABLE-022 Behavior mismatch
+SB-NS-001 Behavior mismatch
+SB-NS-002 Behavior mismatch
+SB-NS-003 Behavior mismatch
+SB-NS-004 Behavior mismatch
+SB-NS-005 Behavior mismatch
+SB-NS-006 Behavior mismatch
+SB-NS-007 Behavior mismatch
 SB-NS-008 Behavior mismatch
-SB-SEC-001 Missing Go
-SB-SEC-002 Missing Go
-SB-SEC-003 Missing Go
-SB-SEC-004 Missing Go
-SB-SEC-005 Missing Go
-SB-SEC-006 Missing Go
-SB-SEC-007 Missing Go
-SB-SEC-008 Missing Go
-SB-SEC-009 Missing Go
-SB-SEC-010 Missing Go
-SB-SEC-011 Missing Go
-SB-SEC-012 Missing Go
-SB-SEC-013 Missing Go
-SB-SEC-014 Missing Go
-SB-SEC-015 Missing Go
-SB-SEC-016 Missing Go
-SB-SEC-017 Missing Go
+SB-SEC-001 Behavior mismatch
+SB-SEC-002 Behavior mismatch
+SB-SEC-003 Behavior mismatch
+SB-SEC-004 Behavior mismatch
+SB-SEC-005 Behavior mismatch
+SB-SEC-006 Behavior mismatch
+SB-SEC-007 Behavior mismatch
+SB-SEC-008 Behavior mismatch
+SB-SEC-009 Behavior mismatch
+SB-SEC-010 Behavior mismatch
+SB-SEC-011 Behavior mismatch
+SB-SEC-012 Behavior mismatch
+SB-SEC-013 Behavior mismatch
+SB-SEC-014 Behavior mismatch
+SB-SEC-015 Behavior mismatch
+SB-SEC-016 Behavior mismatch
+SB-SEC-017 Behavior mismatch
 SB-SEC-018 Behavior mismatch
 SB-SEC-019 Not required (rationale required)
 SB-STAT-001 Intentional divergence (approval required)
@@ -446,7 +446,7 @@ SB-LOG-003 Behavior mismatch
 SB-ERR-001 Missing C ABI
 SB-ERR-002 Behavior mismatch
 SB-ERR-003 Intentional divergence (approval required)
-SB-ERR-004 Missing C ABI
+SB-ERR-004 Behavior mismatch
 SB-ERR-005 Behavior mismatch
 SB-ERR-006 Behavior mismatch
 SB-ERR-007 Behavior mismatch
@@ -461,9 +461,9 @@ SB-ERR-015 Not required (rationale required)
 SB-ERR-016 Behavior mismatch
 SB-CPP-001 Behavior mismatch
 SB-CPP-015 Behavior mismatch
-SB-CPP-002 Missing C ABI
-SB-CPP-016 Missing C ABI
-SB-CPP-017 Missing C ABI
+SB-CPP-002 Behavior mismatch
+SB-CPP-016 Behavior mismatch
+SB-CPP-017 Behavior mismatch
 SB-CPP-018 Missing C ABI
 SB-CPP-003 Behavior mismatch
 SB-CPP-019 Behavior mismatch
@@ -3201,7 +3201,7 @@ SB-XCUT-008 Missing C ABI
 SB-XCUT-009 Behavior mismatch
 SB-XCUT-010 Behavior mismatch
 SB-XCUT-011 Behavior mismatch
-SB-XCUT-012 Missing C ABI
+SB-XCUT-012 Covered
 SB-XCUT-013 Behavior mismatch
 SB-XCUT-014 Behavior mismatch
 SB-XCUT-015 Missing Go
