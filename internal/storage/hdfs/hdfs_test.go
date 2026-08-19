@@ -1195,6 +1195,107 @@ func TestBackendCleanupClientOutlivesConstructorContext(t *testing.T) {
 	}
 }
 
+func TestBackendCloseCancelsActiveReadAndRejectsNewOperations(t *testing.T) {
+	cleanupClient := newFakeClient()
+	leaseCalls := 0
+	backend, err := NewContext(context.Background(), "nn:8020", func(c *config) {
+		c.clientLeaseFactory = func(ctx context.Context) (*leasedClient, error) {
+			leaseCalls++
+			if leaseCalls == 1 {
+				return &leasedClient{client: cleanupClient, release: func() error { return nil }}, nil
+			}
+			return &leasedClient{client: &contextReadClient{ctx: ctx}, release: func() error { return nil }}, nil
+		}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	f, err := backend.Open(context.Background(), "/tables/1.rf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	readDone := make(chan error, 1)
+	go func() {
+		_, err := f.ReadAt(make([]byte, 1), 0)
+		readDone <- err
+	}()
+
+	closeDone := make(chan error, 1)
+	go func() {
+		closeDone <- backend.Close()
+	}()
+
+	select {
+	case err := <-readDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("ReadAt error = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("ReadAt did not unblock after Backend.Close")
+	}
+
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Fatalf("Backend.Close error = %v, want nil", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Backend.Close did not return after canceling the active read")
+	}
+
+	if err := f.Close(); err != nil {
+		t.Fatalf("file Close after Backend.Close: %v", err)
+	}
+	if _, err := backend.Open(context.Background(), "/tables/1.rf"); !errors.Is(err, errBackendClosed) {
+		t.Fatalf("Open after Backend.Close error = %v, want errBackendClosed", err)
+	}
+	if _, err := backend.Create(context.Background(), "/tables/1.rf"); !errors.Is(err, errBackendClosed) {
+		t.Fatalf("Create after Backend.Close error = %v, want errBackendClosed", err)
+	}
+	if _, err := backend.List(context.Background(), "/tables"); !errors.Is(err, errBackendClosed) {
+		t.Fatalf("List after Backend.Close error = %v, want errBackendClosed", err)
+	}
+	if err := backend.Remove(context.Background(), "/tables/1.rf"); !errors.Is(err, errBackendClosed) {
+		t.Fatalf("Remove after Backend.Close error = %v, want errBackendClosed", err)
+	}
+}
+
+func TestBackendCloseAbortsActiveWriterWithoutLeakingTemp(t *testing.T) {
+	client := newFakeClient()
+	backend, err := New("nn:8020", WithClient(client))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	w, err := backend.Create(context.Background(), "/tables/1.rf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write([]byte("new")); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := backend.Close(); err != nil {
+		t.Fatalf("Backend.Close error = %v, want nil", err)
+	}
+	if client.lastCreatePath == "" {
+		t.Fatal("Create did not record the temporary path")
+	}
+	if _, ok := client.files[client.lastCreatePath]; ok {
+		t.Fatalf("temporary file %s remains after Backend.Close", client.lastCreatePath)
+	}
+	if len(client.renameCalls) != 0 {
+		t.Fatalf("Backend.Close should abort the active writer without publishing, got rename calls %v", client.renameCalls)
+	}
+	if err := w.(storage.Aborter).Abort(); err != nil {
+		t.Fatalf("Abort after Backend.Close: %v", err)
+	}
+	if err := w.Close(); err == nil || !strings.Contains(err.Error(), "writer already aborted") {
+		t.Fatalf("Close after Backend.Close error = %v, want writer already aborted", err)
+	}
+}
+
 func TestBackendCloseIgnoresOperationClientReleaseErrorAfterCommit(t *testing.T) {
 	client := newFakeClient()
 	backend := newReleaseErrorBackend(t, client)

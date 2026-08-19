@@ -1,4 +1,4 @@
-//go:build !windows && !linux && !darwin
+//go:build unix && !plan9 && !linux && !darwin
 
 package local
 

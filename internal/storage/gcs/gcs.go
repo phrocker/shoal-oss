@@ -20,6 +20,9 @@ package gcs
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -27,7 +30,6 @@ import (
 	"time"
 
 	"cloud.google.com/go/storage"
-	"github.com/google/uuid"
 	"google.golang.org/api/iterator"
 	"google.golang.org/api/option"
 
@@ -141,8 +143,11 @@ func (b *Backend) Create(ctx context.Context, path string) (shstorage.Writer, er
 		return nil, fmt.Errorf("gcs: inspect destination gs://%s/%s: %w", bucket, object, err)
 	}
 
+	tempObject, err := nextTemporaryObjectName(object)
+	if err != nil {
+		return nil, fmt.Errorf("gcs: stage temporary object for gs://%s/%s: %w", bucket, object, err)
+	}
 	writeCtx, cancel := context.WithCancel(ctx)
-	tempObject := object + ".shoal-tmp-" + uuid.NewString()
 	temp := bucketHandle.Object(tempObject)
 	return &writer{
 		ctx:                ctx,
@@ -200,6 +205,84 @@ func ParsePath(path string) (bucket, object string, err error) {
 		return "", "", fmt.Errorf("gcs: empty bucket in %q", path)
 	}
 	return bucket, object, nil
+}
+
+const (
+	maxObjectNameBytes         = 1024
+	tempObjectPrefix           = ".shoal-tmp-"
+	tempObjectHashHexLen       = 8
+	tempObjectRandomHexLen     = 16
+	minTempObjectHashHexLen    = 4
+	minTempObjectRandomHexLen  = 4
+	minTempObjectComponentSize = len(tempObjectPrefix) + minTempObjectHashHexLen + 1 + minTempObjectRandomHexLen
+)
+
+var randomTempObjectToken = func() (string, error) {
+	buf := make([]byte, tempObjectRandomHexLen/2)
+	if _, err := rand.Read(buf); err != nil {
+		return "", fmt.Errorf("generate random token: %w", err)
+	}
+	return hex.EncodeToString(buf), nil
+}
+
+func nextTemporaryObjectName(object string) (string, error) {
+	prefix := temporaryObjectPrefixFor(object)
+	hash := sha256.Sum256([]byte(object))
+	token, err := randomTempObjectToken()
+	if err != nil {
+		return "", err
+	}
+	component, err := buildTemporaryObjectComponent(prefix, hex.EncodeToString(hash[:tempObjectHashHexLen/2]), token)
+	if err != nil {
+		return "", err
+	}
+	return prefix + component, nil
+}
+
+func tempObjectParentPrefix(object string) string {
+	if idx := strings.LastIndexByte(object, '/'); idx >= 0 {
+		return object[:idx+1]
+	}
+	return ""
+}
+
+func temporaryObjectPrefixFor(object string) string {
+	prefix := tempObjectParentPrefix(object)
+	for prefix != "" && maxObjectNameBytes-len(prefix) < minTempObjectComponentSize {
+		trimmed := strings.TrimSuffix(prefix, "/")
+		prefix = tempObjectParentPrefix(trimmed)
+	}
+	return prefix
+}
+
+func buildTemporaryObjectComponent(prefix, hash, token string) (string, error) {
+	available := maxObjectNameBytes - len(prefix)
+	if available < minTempObjectComponentSize {
+		return "", fmt.Errorf("object prefix %q leaves only %d bytes for a temporary object (need at least %d of %d total)", prefix, available, minTempObjectComponentSize, maxObjectNameBytes)
+	}
+
+	hashLen := min(len(hash), tempObjectHashHexLen)
+	randomLen := min(len(token), tempObjectRandomHexLen)
+	component := func(hashLen, randomLen int) string {
+		return tempObjectPrefix + hash[:hashLen] + "-" + token[:randomLen]
+	}
+	for len(component(hashLen, randomLen)) > available {
+		if randomLen > minTempObjectRandomHexLen {
+			randomLen--
+			continue
+		}
+		if hashLen > minTempObjectHashHexLen {
+			hashLen--
+			continue
+		}
+		break
+	}
+
+	value := component(hashLen, randomLen)
+	if len(value) > available {
+		return "", fmt.Errorf("temporary object name exceeds %d-byte GCS object limit", maxObjectNameBytes)
+	}
+	return value, nil
 }
 
 // file is the GCS File implementation. Each ReadAt opens a fresh
@@ -300,23 +383,25 @@ func (w *writer) Close() error {
 	}
 	if !w.tempClosed {
 		w.tempClosed = true
-		if err := w.inner.Close(); err != nil {
+		err := w.inner.Close()
+		if attrs := w.inner.Attrs(); attrs != nil && attrs.Generation != 0 {
+			w.tempGeneration = attrs.Generation
+			w.tempAttrs = attrs
+		}
+		if err != nil {
 			w.stopWriter()
 			return errors.Join(
 				fmt.Errorf("gcs: close temporary object %s: %w", w.tempPath, err),
 				w.cleanupTempObject(),
 			)
 		}
-		attrs := w.inner.Attrs()
-		if attrs == nil || attrs.Generation == 0 {
+		if w.tempAttrs == nil || w.tempGeneration == 0 {
 			w.stopWriter()
 			return errors.Join(
 				fmt.Errorf("gcs: close temporary object %s: missing generation after successful close", w.tempPath),
 				w.cleanupTempObject(),
 			)
 		}
-		w.tempGeneration = attrs.Generation
-		w.tempAttrs = attrs
 	}
 
 	if w.tempGeneration == 0 {
@@ -495,6 +580,9 @@ func (w *writer) destinationMatchesTemp() bool {
 }
 
 func (w *writer) cleanupTempObject() error {
+	if w.tempGeneration == 0 {
+		return nil
+	}
 	cleanupCtx, cancel := context.WithTimeout(context.Background(), w.tempCleanupTimeout)
 	defer cancel()
 	if err := w.tempForCleanup().Delete(cleanupCtx); err != nil && !errors.Is(err, storage.ErrObjectNotExist) {

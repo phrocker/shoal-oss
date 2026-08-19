@@ -72,8 +72,19 @@ type Backend struct {
 	authority    string
 	closeClient  func() error
 	operations   *operationRegistry
-	closeOnce    sync.Once
-	closeErr     error
+
+	mu              sync.Mutex
+	closed          bool
+	nextHandleID    uint64
+	activeHandles   map[uint64]activeHandle
+	activeHandlesWG sync.WaitGroup
+	closeOnce       sync.Once
+	closeErr        error
+}
+
+type activeHandle struct {
+	shutdown func() error
+	complete func()
 }
 
 var errBackendClosed = errors.New("hdfs: backend closed")
@@ -101,7 +112,6 @@ func NewContext(ctx context.Context, address string, opts ...Option) (*Backend, 
 		return nil, err
 	}
 	cleanupClientCtx, stopCleanupClient := newBackendClientContext(backgroundCtx)
-	opFactoryCtx := backgroundCtx
 	cfg := &config{}
 	for _, opt := range opts {
 		opt(cfg)
@@ -116,7 +126,7 @@ func NewContext(ctx context.Context, address string, opts ...Option) (*Backend, 
 		return newManagedBackend(
 			lease.client,
 			cfg.clientLeaseFactory,
-			opFactoryCtx,
+			backgroundCtx,
 			authority,
 			newBackendCloser(stopCleanupClient, closeFn),
 		), nil
@@ -132,7 +142,7 @@ func NewContext(ctx context.Context, address string, opts ...Option) (*Backend, 
 		return newManagedBackend(
 			cfg.client,
 			opFactory,
-			opFactoryCtx,
+			backgroundCtx,
 			authority,
 			onceCloser(cfg.client.Close),
 		), nil
@@ -155,7 +165,7 @@ func NewContext(ctx context.Context, address string, opts ...Option) (*Backend, 
 		func(opCtx context.Context) (*leasedClient, error) {
 			return newHDFSClient(opCtx, clientAddress, options)
 		},
-		opFactoryCtx,
+		backgroundCtx,
 		authority,
 		newBackendCloser(stopCleanupClient, baseClient.release),
 	), nil
@@ -164,23 +174,77 @@ func NewContext(ctx context.Context, address string, opts ...Option) (*Backend, 
 // Close releases the underlying HDFS client and its open leases.
 func (b *Backend) Close() error {
 	b.closeOnce.Do(func() {
+		b.mu.Lock()
+		b.closed = true
+		handles := make([]activeHandle, 0, len(b.activeHandles))
+		for _, handle := range b.activeHandles {
+			handles = append(handles, handle)
+		}
+		b.mu.Unlock()
+
+		if b.operations != nil {
+			b.operations.Cancel()
+		}
+		var handleErr error
+		for _, handle := range handles {
+			if handle.shutdown != nil {
+				handleErr = errors.Join(handleErr, handle.shutdown())
+			}
+			if handle.complete != nil {
+				handle.complete()
+			}
+		}
+
 		var operationErr error
 		if b.operations != nil {
 			operationErr = b.operations.Close()
 		}
+		b.activeHandlesWG.Wait()
 		var clientErr error
 		if b.closeClient != nil {
 			clientErr = b.closeClient()
 		}
+
 		if operationErr != nil {
 			operationErr = fmt.Errorf("hdfs: close operation clients: %w", operationErr)
+		}
+		if handleErr != nil {
+			handleErr = fmt.Errorf("hdfs: close active handles: %w", handleErr)
 		}
 		if clientErr != nil {
 			clientErr = fmt.Errorf("hdfs: close client: %w", clientErr)
 		}
-		b.closeErr = errors.Join(operationErr, clientErr)
+		b.closeErr = errors.Join(operationErr, handleErr, clientErr)
 	})
 	return b.closeErr
+}
+
+func (b *Backend) registerHandle(shutdown func() error, setComplete func(func())) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.closed {
+		return errBackendClosed
+	}
+	b.nextHandleID++
+	id := b.nextHandleID
+	b.activeHandlesWG.Add(1)
+	var once sync.Once
+	trackedComplete := func() {
+		once.Do(func() {
+			b.mu.Lock()
+			delete(b.activeHandles, id)
+			b.mu.Unlock()
+			b.activeHandlesWG.Done()
+		})
+	}
+	if setComplete != nil {
+		setComplete(trackedComplete)
+	}
+	b.activeHandles[id] = activeHandle{
+		shutdown: shutdown,
+		complete: trackedComplete,
+	}
+	return nil
 }
 
 // Open opens path read-only.
@@ -210,7 +274,17 @@ func (b *Backend) Open(ctx context.Context, objectPath string) (storage.File, er
 		_ = lease.release()
 		return nil, fmt.Errorf("hdfs: open %s: %w", objectPath, err)
 	}
-	return &file{reader: reader, size: reader.Stat().Size(), release: lease.release}, nil
+	f := &file{
+		reader:  reader,
+		size:    reader.Stat().Size(),
+		release: lease.release,
+	}
+	if err := b.registerHandle(f.Close, func(done func()) { f.complete = done }); err != nil {
+		_ = reader.Close()
+		_ = lease.release()
+		return nil, err
+	}
+	return f, nil
 }
 
 // Create creates or replaces path. Parent directories are created as needed.
@@ -248,7 +322,7 @@ func (b *Backend) Create(ctx context.Context, objectPath string) (storage.Writer
 		_ = lease.release()
 		return nil, fmt.Errorf("hdfs: create temporary file %s: %w", tempPath, err)
 	}
-	return &replaceWriter{
+	w := &replaceWriter{
 		client:        lease.client,
 		cleanupClient: b.client,
 		release:       lease.release,
@@ -256,7 +330,12 @@ func (b *Backend) Create(ctx context.Context, objectPath string) (storage.Writer
 		ctx:           ctx,
 		temp:          tempPath,
 		target:        resolved,
-	}, nil
+	}
+	if err := b.registerHandle(w.shutdown, func(done func()) { w.complete = done }); err != nil {
+		_ = w.shutdown()
+		return nil, err
+	}
+	return w, nil
 }
 
 // List returns regular files directly under prefix.
@@ -563,9 +642,10 @@ func newManagedBackend(
 		newOperation: operations.Bind(
 			bindOperationLeaseFactory(operationCtx, factory),
 		),
-		authority:   authority,
-		closeClient: closeClient,
-		operations:  operations,
+		authority:     authority,
+		closeClient:   closeClient,
+		operations:    operations,
+		activeHandles: make(map[uint64]activeHandle),
 	}
 }
 
@@ -624,17 +704,27 @@ func (r *operationRegistry) Bind(factory func(context.Context) (*leasedClient, e
 	}
 }
 
-func (r *operationRegistry) Close() error {
+func (r *operationRegistry) Cancel() {
 	r.mu.Lock()
+	defer r.mu.Unlock()
 	if r.closed {
-		err := r.closeErr
-		r.mu.Unlock()
-		return err
+		return
 	}
 	r.closed = true
 	if r.cancel != nil {
 		r.cancel()
 		r.cancel = nil
+	}
+}
+
+func (r *operationRegistry) Close() error {
+	r.mu.Lock()
+	if !r.closed {
+		r.closed = true
+		if r.cancel != nil {
+			r.cancel()
+			r.cancel = nil
+		}
 	}
 	leases := make([]*leasedClient, 0, len(r.active))
 	for _, lease := range r.active {
@@ -650,9 +740,10 @@ func (r *operationRegistry) Close() error {
 	}
 
 	r.mu.Lock()
-	r.closeErr = closeErr
+	r.closeErr = errors.Join(r.closeErr, closeErr)
+	err := r.closeErr
 	r.mu.Unlock()
-	return closeErr
+	return err
 }
 
 func bindOperationLeaseFactory(boundCtx context.Context, factory func(context.Context) (*leasedClient, error)) func(context.Context) (*leasedClient, error) {
@@ -773,11 +864,12 @@ func applyDeadline(ctx context.Context, target any) error {
 }
 
 type file struct {
-	mu      sync.Mutex
-	reader  Reader
-	release func() error
-	size    int64
-	closed  bool
+	mu       sync.Mutex
+	reader   Reader
+	release  func() error
+	size     int64
+	closed   bool
+	complete func()
 }
 
 func (f *file) ReadAt(p []byte, off int64) (int, error) {
@@ -798,12 +890,17 @@ func (f *file) Close() error {
 	if f.release != nil {
 		err = errors.Join(err, f.release())
 	}
+	if f.complete != nil {
+		f.complete()
+		f.complete = nil
+	}
 	return err
 }
 
 func (f *file) Size() int64 { return f.size }
 
 type replaceWriter struct {
+	mu             sync.Mutex
 	client         Client
 	cleanupClient  Client
 	release        func() error
@@ -816,6 +913,7 @@ type replaceWriter struct {
 	aborted        bool
 	writerClosed   bool
 	state          replacementState
+	complete       func()
 }
 
 type replacementState uint8
@@ -828,6 +926,8 @@ const (
 )
 
 func (w *replaceWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	if w.closed || w.abortRequested {
 		return 0, errors.New("hdfs: write after close")
 	}
@@ -835,6 +935,9 @@ func (w *replaceWriter) Write(p []byte) (int, error) {
 }
 
 func (w *replaceWriter) Close() (retErr error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	defer w.completeIfTerminal()
 	defer w.joinReleaseError(&retErr)
 	if w.abortRequested {
 		return errors.New("hdfs: writer already aborted")
@@ -920,6 +1023,9 @@ func (w *replaceWriter) rollbackPublishedReplacement(ctx context.Context, client
 }
 
 func (w *replaceWriter) Abort() (retErr error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	defer w.completeIfTerminal()
 	defer w.joinReleaseError(&retErr)
 	if w.aborted {
 		return nil
@@ -950,6 +1056,30 @@ func (w *replaceWriter) Abort() (retErr error) {
 	}
 	w.aborted = true
 	return nil
+}
+
+func (w *replaceWriter) shutdown() error {
+	w.mu.Lock()
+	terminal := w.closed || w.aborted
+	w.mu.Unlock()
+	if terminal {
+		return nil
+	}
+	err := w.Abort()
+	if err != nil && (err.Error() == "hdfs: writer already closed" || err.Error() == "hdfs: writer already aborted") {
+		return nil
+	}
+	return err
+}
+
+func (w *replaceWriter) completeIfTerminal() {
+	if !w.closed && !w.aborted {
+		return
+	}
+	if w.complete != nil {
+		w.complete()
+		w.complete = nil
+	}
 }
 
 var cleanupTimeout = 10 * time.Second

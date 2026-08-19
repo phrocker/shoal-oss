@@ -110,6 +110,78 @@ func TestWriter_WriteAfterCloseReportsClosedState(t *testing.T) {
 	}
 }
 
+func TestNextTemporaryObjectNamePreservesPrefixAndBoundsUTF8Bytes(t *testing.T) {
+	originalToken := randomTempObjectToken
+	randomTempObjectToken = func() (string, error) {
+		return strings.Repeat("a", tempObjectRandomHexLen), nil
+	}
+	t.Cleanup(func() {
+		randomTempObjectToken = originalToken
+	})
+
+	object := "tenant/path/" + strings.Repeat("界", 338)
+	tempName, err := nextTemporaryObjectName(object)
+	if err != nil {
+		t.Fatalf("nextTemporaryObjectName: %v", err)
+	}
+	if got, want := tempObjectParentPrefix(tempName), tempObjectParentPrefix(object); got != want {
+		t.Fatalf("temp prefix = %q, want %q", got, want)
+	}
+	if len(tempName) > maxObjectNameBytes {
+		t.Fatalf("temp object length = %d bytes, want <= %d", len(tempName), maxObjectNameBytes)
+	}
+	if strings.Contains(tempName, object) {
+		t.Fatalf("temp object %q embeds the full target name %q", tempName, object)
+	}
+}
+
+func TestNextTemporaryObjectNameSupportsMaxUTF8ByteName(t *testing.T) {
+	originalToken := randomTempObjectToken
+	randomTempObjectToken = func() (string, error) {
+		return strings.Repeat("b", tempObjectRandomHexLen), nil
+	}
+	t.Cleanup(func() {
+		randomTempObjectToken = originalToken
+	})
+
+	object := strings.Repeat("界", 341) + "a"
+	if got := len(object); got != maxObjectNameBytes {
+		t.Fatalf("target length = %d bytes, want %d", got, maxObjectNameBytes)
+	}
+	tempName, err := nextTemporaryObjectName(object)
+	if err != nil {
+		t.Fatalf("nextTemporaryObjectName: %v", err)
+	}
+	if len(tempName) > maxObjectNameBytes {
+		t.Fatalf("temp object length = %d bytes, want <= %d", len(tempName), maxObjectNameBytes)
+	}
+	if !strings.HasPrefix(tempName, tempObjectPrefix) {
+		t.Fatalf("temp object = %q, want prefix %q", tempName, tempObjectPrefix)
+	}
+}
+
+func TestNextTemporaryObjectNameFallsBackToAncestorPrefixWhenParentIsTooLong(t *testing.T) {
+	originalToken := randomTempObjectToken
+	randomTempObjectToken = func() (string, error) {
+		return strings.Repeat("d", tempObjectRandomHexLen), nil
+	}
+	t.Cleanup(func() {
+		randomTempObjectToken = originalToken
+	})
+
+	object := strings.Repeat("a", 1005) + "/b"
+	tempName, err := nextTemporaryObjectName(object)
+	if err != nil {
+		t.Fatalf("nextTemporaryObjectName: %v", err)
+	}
+	if got := tempObjectParentPrefix(tempName); got != "" {
+		t.Fatalf("temp prefix = %q, want root fallback for a too-long parent prefix", got)
+	}
+	if len(tempName) > maxObjectNameBytes {
+		t.Fatalf("temp object length = %d bytes, want <= %d", len(tempName), maxObjectNameBytes)
+	}
+}
+
 func TestWriter_CloseStagesAndPromotesObject(t *testing.T) {
 	backend, bucket := newFakeBackend()
 	bucket.putObject("path/to/object.rf", []byte("old"))
@@ -204,6 +276,42 @@ func TestWriter_ClosePreconditionFailurePreservesNewerTarget(t *testing.T) {
 	}
 }
 
+func TestWriter_TemporaryObjectCollisionPreservesExistingTargetAndTemp(t *testing.T) {
+	originalToken := randomTempObjectToken
+	randomTempObjectToken = func() (string, error) {
+		return strings.Repeat("c", tempObjectRandomHexLen), nil
+	}
+	t.Cleanup(func() {
+		randomTempObjectToken = originalToken
+	})
+
+	backend, bucket := newFakeBackend()
+	bucket.putObject("path/to/object.rf", []byte("old"))
+	tempName, err := nextTemporaryObjectName("path/to/object.rf")
+	if err != nil {
+		t.Fatalf("nextTemporaryObjectName: %v", err)
+	}
+	bucket.putObject(tempName, []byte("other-temp"))
+
+	w, err := backend.Create(context.Background(), "bucket/path/to/object.rf")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if _, err := w.Write([]byte("new")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	err = w.Close()
+	if !errors.Is(err, errFakePrecondition) {
+		t.Fatalf("Close error = %v, want temporary-object precondition failure", err)
+	}
+	if got := string(bucket.objects["path/to/object.rf"].body); got != "old" {
+		t.Fatalf("destination contents = %q, want preserved old object", got)
+	}
+	if got := string(bucket.objects[tempName].body); got != "other-temp" {
+		t.Fatalf("colliding temp contents = %q, want preserved existing temp object", got)
+	}
+}
+
 func TestWriter_CloseAmbiguousPromotionErrorDoesNotReplayMutation(t *testing.T) {
 	backend, bucket := newFakeBackend()
 	bucket.putObject("path/to/object.rf", []byte("old"))
@@ -261,7 +369,7 @@ func TestWriter_CanceledPromotionUsesIndependentCleanupContext(t *testing.T) {
 	}
 }
 
-func TestWriter_AbortDeleteFailureAllowsRetry(t *testing.T) {
+func TestWriter_AbortSkipsDeletingUncommittedTempObject(t *testing.T) {
 	backend, bucket := newFakeBackend()
 
 	attempts := 0
@@ -285,8 +393,8 @@ func TestWriter_AbortDeleteFailureAllowsRetry(t *testing.T) {
 		t.Fatalf("Write: %v", err)
 	}
 	err = w.(shstorage.Aborter).Abort()
-	if !errors.Is(err, deleteErr) {
-		t.Fatalf("Abort error = %v, want delete failure", err)
+	if err != nil {
+		t.Fatalf("Abort error = %v, want nil for an uncommitted temporary object", err)
 	}
 	if _, err := w.Write([]byte("late")); err == nil || !strings.Contains(err.Error(), "aborted") {
 		t.Fatalf("Write after failed Abort error = %v, want aborted state", err)
@@ -295,7 +403,10 @@ func TestWriter_AbortDeleteFailureAllowsRetry(t *testing.T) {
 		t.Fatalf("Close after failed Abort error = %v, want aborted state", err)
 	}
 	if _, ok := bucket.objects[tempName]; ok {
-		t.Fatal("failed Abort should not publish or retain a committed temp object")
+		t.Fatal("Abort should not publish or retain an uncommitted temp object")
+	}
+	if attempts != 0 {
+		t.Fatalf("temporary delete attempts = %d, want 0 for an uncommitted temp object", attempts)
 	}
 
 	if err := w.(shstorage.Aborter).Abort(); err != nil {
@@ -534,9 +645,10 @@ func (o *fakeObject) NewWriter(context.Context) objectWriter {
 		plan = o.bucket.writerPlan(o.name)
 	}
 	writer := &fakeObjectWriter{
-		bucket: o.bucket,
-		name:   o.name,
-		plan:   plan,
+		bucket:     o.bucket,
+		name:       o.name,
+		conditions: o.conditions,
+		plan:       plan,
 	}
 	o.bucket.lastWriter = writer
 	return writer
@@ -646,25 +758,13 @@ func (c *fakeObjectCopier) Run(ctx context.Context) (*cloudstorage.ObjectAttrs, 
 }
 
 func (o *fakeObject) checkConditions() error {
-	current, exists := o.bucket.currentObject(o.name)
-	switch {
-	case o.conditions.DoesNotExist:
-		if exists {
-			return errFakePrecondition
-		}
-	case o.conditions.GenerationMatch != 0:
-		if !exists ||
-			current.generation != o.conditions.GenerationMatch ||
-			current.metageneration != o.conditions.MetagenerationMatch {
-			return errFakePrecondition
-		}
-	}
-	return nil
+	return checkObjectConditions(o.bucket, o.name, o.conditions)
 }
 
 type fakeObjectWriter struct {
 	bucket              *fakeBucket
 	name                string
+	conditions          cloudstorage.Conditions
 	plan                fakeWriterPlan
 	buf                 bytes.Buffer
 	attrs               *cloudstorage.ObjectAttrs
@@ -679,6 +779,9 @@ func (w *fakeObjectWriter) Write(p []byte) (int, error) {
 
 func (w *fakeObjectWriter) Close() error {
 	w.closeCalls++
+	if err := checkObjectConditions(w.bucket, w.name, w.conditions); err != nil {
+		return err
+	}
 	if w.plan.publishOnClose || w.plan.closeErr == nil {
 		w.attrs = w.bucket.putObject(w.name, w.buf.Bytes())
 	}
@@ -693,6 +796,27 @@ func (w *fakeObjectWriter) CloseWithError(err error) error {
 
 func (w *fakeObjectWriter) Attrs() *cloudstorage.ObjectAttrs {
 	return w.attrs
+}
+
+func checkObjectConditions(bucket *fakeBucket, name string, conditions cloudstorage.Conditions) error {
+	current, exists := bucket.currentObject(name)
+	switch {
+	case conditions.DoesNotExist:
+		if exists {
+			return errFakePrecondition
+		}
+	case conditions.GenerationMatch != 0:
+		if !exists ||
+			current.generation != conditions.GenerationMatch ||
+			current.metageneration != conditions.MetagenerationMatch {
+			return errFakePrecondition
+		}
+	case conditions.MetagenerationMatch != 0:
+		if !exists || current.metageneration != conditions.MetagenerationMatch {
+			return errFakePrecondition
+		}
+	}
+	return nil
 }
 
 func md5Bytes(data []byte) []byte {
