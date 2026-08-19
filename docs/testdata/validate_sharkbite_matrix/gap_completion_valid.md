@@ -4,6 +4,7 @@
 | --- | --- | --- | --- | --- | --- | --- |
 | SB-CONN-004 | — | — | — | — | Behavior mismatch | |
 | SB-CONN-005 | — | — | — | — | Behavior mismatch | |
+| SB-CFG-009 | — | — | — | — | Behavior mismatch | |
 | SB-SEC-001 | — | — | — | — | Behavior mismatch | |
 | SB-SEC-002 | — | — | — | — | Behavior mismatch | |
 | SB-NS-001 | — | — | — | — | Behavior mismatch | |
@@ -27,3 +28,4 @@
 | SB-GAP-C-001 | Table administration on the ABI | SB-TABLE-001, SB-CPP-016, SB-CPP-017 | merged | **Complete on the ABI for the listed connector-scoped entry points.** |
 | SB-GAP-C-002 | Capability discovery | SB-XCUT-012 | merged | **Complete on the ABI.** |
 | SB-GAP-C-004 | Security, namespace, and table-split ABI | SB-SEC-*, SB-NS-001, SB-TABLE-010 | merged | **Complete on the ABI.** |
+| SB-GAP-C-011 | Connector identity discovery | SB-CFG-009 | merged | **Complete on the ABI.** |

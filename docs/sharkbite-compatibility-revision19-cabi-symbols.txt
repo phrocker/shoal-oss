@@ -1,7 +1,7 @@
-# Revision-18 compiled C ABI symbol inventory for docs/sharkbite-compatibility.md.
+# Revision-19 compiled C ABI symbol inventory for docs/sharkbite-compatibility.md.
 # Generated from the undefined/imported shoal_* references emitted by compiling the exact C/C++
 # sources that cmd/shoal-capi/cabi_test.go links in TestSharedLibraryCABI.
-# Update only when the independently audited revision-18 compiled inventory changes.
+# Update only when the independently audited revision-19 compiled inventory changes.
 
 [declared]
 shoal_abi_version
@@ -20,6 +20,10 @@ shoal_batch_writer_config_init
 shoal_connector_create
 shoal_connector_close
 shoal_connector_free
+shoal_connector_identity_view_init
+shoal_connector_get_identity
+shoal_connector_identity_get
+shoal_connector_identity_free
 shoal_connector_list_tables
 shoal_table_list_count
 shoal_table_list_get
@@ -152,6 +156,7 @@ shoal_connector_effective_namespace_properties
 shoal_connector_effective_table_properties
 shoal_connector_flush_table
 shoal_connector_free
+shoal_connector_get_identity
 shoal_connector_get_user_authorizations
 shoal_connector_grant_namespace_permission
 shoal_connector_grant_system_permission
@@ -159,6 +164,9 @@ shoal_connector_grant_table_permission
 shoal_connector_has_namespace_permission
 shoal_connector_has_system_permission
 shoal_connector_has_table_permission
+shoal_connector_identity_free
+shoal_connector_identity_get
+shoal_connector_identity_view_init
 shoal_connector_list_namespaces
 shoal_connector_list_table_splits
 shoal_connector_list_tables

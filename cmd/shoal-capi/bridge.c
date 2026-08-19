@@ -154,6 +154,49 @@ void shoal_bridge_string_free(char *value) {
   free(value);
 }
 
+shoal_connector_identity_result *shoal_bridge_connector_identity_alloc(
+    char *instance_name, char *instance_id, char *principal) {
+  if (instance_name == NULL || instance_id == NULL || principal == NULL) {
+    return NULL;
+  }
+  SHOAL_BRIDGE_TEST_ALLOC_GUARD(shoal_bridge_result_alloc_fail_after);
+  shoal_connector_identity_result *result =
+      (shoal_connector_identity_result *)malloc(sizeof(*result));
+  if (result == NULL) {
+    return NULL;
+  }
+  result->instance_name = instance_name;
+  result->instance_id = instance_id;
+  result->principal = principal;
+  return result;
+}
+
+int shoal_bridge_connector_identity_get(
+    const shoal_connector_identity_result *result,
+    shoal_connector_identity_view *out_identity) {
+  if (result == NULL || out_identity == NULL) {
+    return 0;
+  }
+  out_identity->instance_name = result->instance_name;
+  out_identity->instance_id = result->instance_id;
+  out_identity->principal = result->principal;
+  return 1;
+}
+
+void shoal_bridge_connector_identity_free(
+    shoal_connector_identity_result *result) {
+  if (result == NULL) {
+    return;
+  }
+  free(result->instance_name);
+  free(result->instance_id);
+  free(result->principal);
+  result->instance_name = NULL;
+  result->instance_id = NULL;
+  result->principal = NULL;
+  free(result);
+}
+
 #ifdef SHOAL_CAPI_TEST
 void shoal_bridge_test_string_alloc_fail_after(size_t successful_allocations) {
   atomic_store_explicit(&shoal_bridge_string_alloc_fail_after,

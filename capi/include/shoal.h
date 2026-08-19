@@ -63,10 +63,10 @@ shoal_connector_create(const shoal_connector_config *config,
 
 /*
  * Closes connector-owned transports and bootstrap resources. Close is
- * idempotent while the handle remains alive, cancels active table, namespace,
- * security, and split-administration calls, and waits for those plus any
- * in-flight scanner or batch-scanner calls to finish before tearing down
- * connector-owned resources.
+ * idempotent while the handle remains alive, cancels active identity, table,
+ * namespace, security, and split-administration calls, and waits for those
+ * plus any in-flight scanner or batch-scanner calls to finish before tearing
+ * down connector-owned resources.
  */
 SHOAL_API shoal_status SHOAL_CALL
 shoal_connector_close(shoal_connector *connector, shoal_error **out_error);
@@ -80,6 +80,30 @@ shoal_connector_close(shoal_connector *connector, shoal_error **out_error);
  * teardown.
  */
 SHOAL_API void SHOAL_CALL shoal_connector_free(shoal_connector **connector);
+
+/*
+ * Returns the immutable instance name, instance ID, and authenticated
+ * principal captured when the connector was created. timeout_ms is zero for
+ * no deadline and must not be negative. The result owns all three strings.
+ * Initialize out_identity with shoal_connector_identity_view_init before
+ * calling shoal_connector_identity_get. Pointers in the view are borrowed
+ * from the result and remain valid until the result is freed.
+ */
+SHOAL_API void SHOAL_CALL
+shoal_connector_identity_view_init(shoal_connector_identity_view *view);
+
+SHOAL_API shoal_status SHOAL_CALL
+shoal_connector_get_identity(shoal_connector *connector, int64_t timeout_ms,
+                             shoal_connector_identity_result **out_result,
+                             shoal_error **out_error);
+
+SHOAL_API shoal_status SHOAL_CALL
+shoal_connector_identity_get(const shoal_connector_identity_result *result,
+                             shoal_connector_identity_view *out_identity,
+                             shoal_error **out_error);
+
+SHOAL_API void SHOAL_CALL
+shoal_connector_identity_free(shoal_connector_identity_result **result);
 
 /*
  * timeout_ms is zero for no deadline and must not be negative. The returned
