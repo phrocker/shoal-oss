@@ -18,10 +18,14 @@ CROSS_FILE_FIXTURE_PATHS = {
     "docs/testdata/validate_sharkbite_matrix/fixture_a.go",
     "docs/testdata/validate_sharkbite_matrix/fixture_b.go",
 }
-BOUNDARY_FIXTURE_PATHS = {
+ANCHOR_FIXTURE_PATHS = {
     "docs/testdata/validate_sharkbite_matrix/fixture_a.go",
+    "docs/testdata/validate_sharkbite_matrix/fixture_go_signature.go",
     "docs/testdata/validate_sharkbite_matrix/fixture_identifier_old.go",
+    "docs/testdata/validate_sharkbite_matrix/fixture_main.c",
+    "docs/testdata/validate_sharkbite_matrix/fixture_python_signature.py",
     "docs/testdata/validate_sharkbite_matrix/fixture_signature.h",
+    "docs/testdata/validate_sharkbite_matrix/fixture_signature_elsewhere.h",
 }
 
 
@@ -99,6 +103,27 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
             "Covered vs Missing Go",
         )
 
+    def test_parse_rows_rejects_truncated_rows(self) -> None:
+        self.assert_validation_fails(
+            lambda: validator.parse_rows(load_fixture_lines("schema_truncated.md")),
+            "malformed SB row SB-FIXTURE-301",
+            "expected 7 cells, found 6",
+        )
+
+    def test_parse_rows_rejects_extra_cell_rows(self) -> None:
+        self.assert_validation_fails(
+            lambda: validator.parse_rows(load_fixture_lines("schema_extra_cell.md")),
+            "malformed SB row SB-FIXTURE-302",
+            "expected 7 cells, found 8",
+        )
+
+    def test_parse_rows_rejects_malformed_delimiter_rows(self) -> None:
+        self.assert_validation_fails(
+            lambda: validator.parse_rows(load_fixture_lines("schema_malformed.md")),
+            "malformed SB row SB-FIXTURE-303",
+            "expected 7 cells, found 5",
+        )
+
     def test_validate_targeted_symbol_anchors_rejects_cross_file_anchor_leakage(self) -> None:
         self.assert_validation_fails(
             lambda: validator.validate_targeted_symbol_anchors(
@@ -118,14 +143,14 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
     def test_validate_targeted_symbol_anchors_accepts_exact_identifier_boundaries(self) -> None:
         validator.validate_targeted_symbol_anchors(
             load_fixture_lines("identifier_boundary_ok.md"),
-            targeted_paths=BOUNDARY_FIXTURE_PATHS,
+            targeted_paths=ANCHOR_FIXTURE_PATHS,
         )
 
     def test_validate_targeted_symbol_anchors_rejects_identifier_substrings(self) -> None:
         self.assert_validation_fails(
             lambda: validator.validate_targeted_symbol_anchors(
                 load_fixture_lines("identifier_boundary_stale.md"),
-                targeted_paths=BOUNDARY_FIXTURE_PATHS,
+                targeted_paths=ANCHOR_FIXTURE_PATHS,
             ),
             "TestAlpha",
             "fixture_identifier_old.go",
@@ -134,23 +159,51 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
     def test_validate_targeted_symbol_anchors_accepts_multiline_signature_anchor(self) -> None:
         validator.validate_targeted_symbol_anchors(
             load_fixture_lines("signature_anchor_ok.md"),
-            targeted_paths=BOUNDARY_FIXTURE_PATHS,
+            targeted_paths=ANCHOR_FIXTURE_PATHS,
         )
 
     def test_validate_targeted_symbol_anchors_accepts_full_multiline_signature_anchor(self) -> None:
         validator.validate_targeted_symbol_anchors(
             load_fixture_lines("signature_full_multiline_ok.md"),
-            targeted_paths=BOUNDARY_FIXTURE_PATHS,
+            targeted_paths=ANCHOR_FIXTURE_PATHS,
         )
 
     def test_validate_targeted_symbol_anchors_rejects_partial_signature_with_stale_type(self) -> None:
         self.assert_validation_fails(
             lambda: validator.validate_targeted_symbol_anchors(
                 load_fixture_lines("signature_anchor_partial_stale.md"),
-                targeted_paths=BOUNDARY_FIXTURE_PATHS,
+                targeted_paths=ANCHOR_FIXTURE_PATHS,
             ),
             "fixture_signature(stale_type row, ...)",
             "fixture_signature.h",
+        )
+
+    def test_validate_targeted_symbol_anchors_rejects_stale_type_from_other_construct(self) -> None:
+        self.assert_validation_fails(
+            lambda: validator.validate_targeted_symbol_anchors(
+                load_fixture_lines("signature_anchor_stale_elsewhere.md"),
+                targeted_paths=ANCHOR_FIXTURE_PATHS,
+            ),
+            "fixture_signature(stale_type row, ...)",
+            "fixture_signature_elsewhere.h",
+        )
+
+    def test_validate_targeted_symbol_anchors_accepts_go_signature_shorthand(self) -> None:
+        validator.validate_targeted_symbol_anchors(
+            load_fixture_lines("go_signature_anchor_ok.md"),
+            targeted_paths=ANCHOR_FIXTURE_PATHS,
+        )
+
+    def test_validate_targeted_symbol_anchors_accepts_python_signature_shorthand(self) -> None:
+        validator.validate_targeted_symbol_anchors(
+            load_fixture_lines("python_signature_anchor_ok.md"),
+            targeted_paths=ANCHOR_FIXTURE_PATHS,
+        )
+
+    def test_validate_targeted_symbol_anchors_accepts_main_void_shorthand(self) -> None:
+        validator.validate_targeted_symbol_anchors(
+            load_fixture_lines("main_anchor_ok.md"),
+            targeted_paths=ANCHOR_FIXTURE_PATHS,
         )
 
     def test_validate_targeted_symbol_anchors_resets_after_non_target_file_citation(self) -> None:

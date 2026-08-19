@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Iterator
 from collections import Counter, defaultdict
 from functools import lru_cache
 from pathlib import Path
@@ -151,6 +152,33 @@ IGNORED_ANCHOR_TOKENS = {
     "with",
 }
 WHITESPACE_TOLERANT_PUNCTUATION = frozenset("(),*&[]")
+DECLARATION_PATTERNS = (
+    re.compile(
+        r"(?ms)^[ \t]*(?:typedef\s+)?(?:struct|union|enum|class|interface)\b[\s\S]*?"
+        r"^[ \t]*\}[ \t]*[A-Za-z_][A-Za-z0-9_]*[ \t]*;"
+    ),
+    re.compile(
+        r"(?ms)^[ \t]*(?:struct|union|enum|class|interface)\s+[A-Za-z_][A-Za-z0-9_]*"
+        r"\s*\{[\s\S]*?^[ \t]*\}[ \t]*;?"
+    ),
+    re.compile(
+        r"(?ms)^[ \t]*type\s+[A-Za-z_][A-Za-z0-9_]*\s+(?:struct|interface)\s*\{"
+        r"[\s\S]*?^[ \t]*\}[ \t]*"
+    ),
+    re.compile(
+        r"(?ms)^[ \t]*(?:async\s+def|def)\s+[A-Za-z_][A-Za-z0-9_]*\s*\([^)]*?\)"
+        r"(?:\s*->\s*[^:]+)?\s*:"
+    ),
+    re.compile(r"(?m)^[ \t]*class\s+[A-Za-z_][A-Za-z0-9_]*(?:\s*\([^)]*?\))?\s*:"),
+    re.compile(
+        r"(?ms)^[ \t]*func\s+(?:\([^)]+\)\s*)?[A-Za-z_][A-Za-z0-9_]*\s*\([^)]*?\)"
+        r"(?:\s*\([^)]*?\)|\s+[^{\n]+)?\s*\{"
+    ),
+    re.compile(
+        r"(?ms)^[ \t]*(?:[A-Za-z_][A-Za-z0-9_\s\*]*?\s+)?[A-Za-z_][A-Za-z0-9_]*"
+        r"\s*\([^;{}]*?\)\s*(?:;|\{)"
+    ),
+)
 
 
 def fail(message: str) -> None:
@@ -163,20 +191,51 @@ def require(condition: bool, message: str) -> None:
         fail(message)
 
 
+def split_matrix_cells(line: str) -> list[str]:
+    return [part.strip() for part in line.split("|")[1:-1]]
+
+
+def row_identifier(cells: list[str], line: str) -> str:
+    if cells:
+        return cells[0]
+    match = re.match(r"\|\s*(SB-[^|`\s]+)", line)
+    return match.group(1) if match else "<unknown-row>"
+
+
+def iter_matrix_rows(lines: list[str]) -> Iterator[tuple[int, str, list[str]]]:
+    current_header_cells: int | None = None
+    for line_number, line in enumerate(lines, start=1):
+        if line.startswith("| ID |"):
+            header_cells = split_matrix_cells(line)
+            current_header_cells = len(header_cells) if "Status" in header_cells else None
+            continue
+        if not line.startswith("| SB-"):
+            continue
+        cells = split_matrix_cells(line)
+        row_id = row_identifier(cells, line)
+        if current_header_cells is None or row_id.startswith("SB-GAP"):
+            continue
+        expected_cells = current_header_cells or len(cells)
+        require(
+            len(cells) == expected_cells,
+            (
+                f"malformed SB row {row_id} on line {line_number}: expected "
+                f"{expected_cells} cells, found {len(cells)}"
+            ),
+        )
+        yield line_number, row_id, cells
+
+
 def parse_rows(lines: list[str]) -> tuple[Counter[str], dict[str, Counter[str]], set[str]]:
     status_counts: Counter[str] = Counter()
     prefix_counts: dict[str, Counter[str]] = defaultdict(Counter)
     accepted_row_ids: dict[str, tuple[int, str]] = {}
-    for line_number, line in enumerate(lines, start=1):
-        if not line.startswith("| SB-") or line.startswith("| SB-GAP"):
-            continue
-        parts = [part.strip() for part in line.split("|")[1:-1]]
-        if len(parts) < 3:
-            continue
-        row_id = parts[0]
-        status = parts[-2]
-        if status not in STATUSES:
-            continue
+    for line_number, row_id, cells in iter_matrix_rows(lines):
+        status = cells[-2]
+        require(
+            status in STATUSES,
+            f"unknown status for row {row_id} on line {line_number}: {status}",
+        )
         previous = accepted_row_ids.get(row_id)
         if previous is not None:
             fail(
@@ -373,11 +432,47 @@ def significant_anchor_identifiers(anchor: str, ignored_tokens: set[str]) -> lis
     return significant
 
 
+@lru_cache(maxsize=None)
+def declaration_constructs(content: str) -> tuple[str, ...]:
+    constructs: list[str] = []
+    seen: set[str] = set()
+    for pattern in DECLARATION_PATTERNS:
+        for match in pattern.finditer(content):
+            construct = match.group(0).strip()
+            if construct and construct not in seen:
+                constructs.append(construct)
+                seen.add(construct)
+    if not constructs:
+        constructs = [line.strip() for line in content.splitlines() if line.strip()]
+    return tuple(constructs)
+
+
+@lru_cache(maxsize=None)
+def ordered_identifier_pattern(tokens: tuple[str, ...]) -> re.Pattern[str]:
+    pieces = [identifier_boundary_pattern(tokens[0]).pattern]
+    for token in tokens[1:]:
+        pieces.append(r"[\s\S]*?")
+        pieces.append(identifier_boundary_pattern(token).pattern)
+    return re.compile("".join(pieces), re.DOTALL)
+
+
+def compound_anchor_matches_construct(anchor: str, content: str, ignored_tokens: set[str]) -> bool:
+    tokens = significant_anchor_identifiers(anchor, ignored_tokens)
+    if len(tokens) <= 1:
+        return False
+    pattern = ordered_identifier_pattern(tuple(tokens))
+    return any(pattern.search(construct) for construct in declaration_constructs(content))
+
+
 def anchor_matches_content(anchor: str, content: str, ignored_tokens: set[str]) -> bool:
     if anchor_boundary_pattern(anchor).search(content):
         return True
     tokens = significant_anchor_identifiers(anchor, ignored_tokens)
-    return bool(tokens) and all(identifier_boundary_pattern(token).search(content) for token in tokens)
+    if not tokens:
+        return False
+    if len(tokens) == 1:
+        return identifier_boundary_pattern(tokens[0]).search(content) is not None
+    return compound_anchor_matches_construct(anchor, content, ignored_tokens)
 
 
 def validate_targeted_symbol_anchors(
@@ -388,11 +483,7 @@ def validate_targeted_symbol_anchors(
 ) -> None:
     contents = load_targeted_contents(targeted_paths, repo_root=repo_root)
 
-    for line in lines:
-        if not line.startswith("| SB-"):
-            continue
-        cells = [cell.strip() for cell in line.split("|")[1:-1]]
-        row_id = cells[0]
+    for _line_number, row_id, cells in iter_matrix_rows(lines):
         for cell in cells[1:]:
             path_anchor_bindings = extract_path_anchor_bindings(cell, targeted_paths)
             if not path_anchor_bindings:
