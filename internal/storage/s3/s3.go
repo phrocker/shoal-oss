@@ -159,7 +159,8 @@ func (b *Backend) Create(ctx context.Context, path string) (shstorage.Writer, er
 	if err != nil && !isNotFound(err) {
 		return nil, fmt.Errorf("s3: inspect destination s3://%s/%s: %w", bucket, key, err)
 	}
-	if err == nil && target.etag == nil {
+	targetExists := err == nil
+	if targetExists && target.etag == nil {
 		return nil, fmt.Errorf("s3: inspect destination s3://%s/%s: missing ETag", bucket, key)
 	}
 	stageKey, err := nextTemporaryStageKey(key)
@@ -173,7 +174,7 @@ func (b *Backend) Create(ctx context.Context, path string) (shstorage.Writer, er
 		stageKey:       stageKey,
 		writeID:        uuid.NewString(),
 		ctx:            ctx,
-		targetExists:   err == nil,
+		targetExists:   targetExists,
 		target:         target,
 		cleanupTimeout: s3CleanupTimeout,
 	}, nil

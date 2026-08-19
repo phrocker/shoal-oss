@@ -443,6 +443,32 @@ func TestWriter_StagedCreateAndReplace(t *testing.T) {
 	}
 }
 
+func TestBackendCreateProtectsConcurrentlyCreatedDestination(t *testing.T) {
+	f := newFakeS3WriteOperations()
+	backend := &Backend{ops: f}
+	created, err := backend.Create(context.Background(), "s3://bucket/target")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	w := created.(*writer)
+	if w.targetExists {
+		t.Fatal("missing destination was recorded as existing")
+	}
+	_, _ = w.Write([]byte("new"))
+
+	etag := "\"concurrent\""
+	f.objects["target"] = fakeS3Object{
+		state: s3ObjectState{etag: &etag, size: int64(len("concurrent"))},
+		data:  "concurrent",
+	}
+	if err := w.Close(); err == nil {
+		t.Fatal("Close overwrote a concurrently created destination")
+	}
+	if got := f.objects["target"].data; got != "concurrent" {
+		t.Fatalf("destination data = %q, want concurrent", got)
+	}
+}
+
 func TestWriter_VerifiesCommittedResponsesWithoutReplayingPromotion(t *testing.T) {
 	f := newFakeS3WriteOperations()
 	f.stageResponseLost = true

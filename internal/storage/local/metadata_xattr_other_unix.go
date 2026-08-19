@@ -1,4 +1,4 @@
-//go:build unix && !plan9 && !linux && !darwin
+//go:build aix || dragonfly || freebsd || netbsd || openbsd || solaris
 
 package local
 

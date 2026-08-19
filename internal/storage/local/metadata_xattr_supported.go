@@ -38,6 +38,9 @@ func reconcilePlatformXattrs(temp, target string, ops xattrOperations) error {
 
 	targetSet := make(map[string]struct{}, len(targetNames))
 	for _, name := range targetNames {
+		if !preserveContentXattr(name) {
+			continue
+		}
 		targetSet[name] = struct{}{}
 	}
 	for _, name := range tempNames {
@@ -49,6 +52,9 @@ func reconcilePlatformXattrs(temp, target string, ops xattrOperations) error {
 		}
 	}
 	for _, name := range targetNames {
+		if !preserveContentXattr(name) {
+			continue
+		}
 		value, err := ops.get(target, name)
 		if err != nil {
 			return fmt.Errorf("local: read extended attribute %s for %s: %w", name, target, err)
@@ -58,6 +64,15 @@ func reconcilePlatformXattrs(temp, target string, ops xattrOperations) error {
 		}
 	}
 	return nil
+}
+
+func preserveContentXattr(name string) bool {
+	switch name {
+	case "security.capability", "security.ima", "security.evm":
+		return false
+	default:
+		return true
+	}
 }
 
 func listXattrs(path string) ([]string, error) {

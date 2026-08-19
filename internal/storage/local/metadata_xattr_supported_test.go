@@ -47,6 +47,28 @@ func TestReconcilePlatformXattrsReportsRemovalFailure(t *testing.T) {
 	}
 }
 
+func TestReconcilePlatformXattrsDoesNotRestoreContentSecurityLabels(t *testing.T) {
+	attrs := map[string]map[string][]byte{
+		"target": {
+			"user.keep":           []byte("target"),
+			"security.capability": []byte("old-capability"),
+			"security.ima":        []byte("old-signature"),
+			"security.evm":        []byte("old-integrity"),
+		},
+		"temp": {
+			"security.capability": []byte("inherited-capability"),
+		},
+	}
+
+	if err := reconcilePlatformXattrs("temp", "target", mapXattrOperations(attrs)); err != nil {
+		t.Fatal(err)
+	}
+	want := map[string][]byte{"user.keep": []byte("target")}
+	if !reflect.DeepEqual(attrs["temp"], want) {
+		t.Fatalf("temporary xattrs = %v, want content-safe set %v", attrs["temp"], want)
+	}
+}
+
 func mapXattrOperations(attrs map[string]map[string][]byte) xattrOperations {
 	return xattrOperations{
 		list: func(path string) ([]string, error) {
