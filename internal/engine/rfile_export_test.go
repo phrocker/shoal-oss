@@ -196,6 +196,45 @@ func TestCopyWithSHA256PreservesDestinationOnReadFailure(t *testing.T) {
 	}
 }
 
+func TestCopyWithSHA256AbortsDestinationOnShortWrite(t *testing.T) {
+	src := exportFileBackend{file: &exportReadFuncFile{
+		size: 2,
+		read: func(p []byte, off int64) (int, error) {
+			copy(p, "xy")
+			return 2, nil
+		},
+	}}
+	dst := newExportTrackingBackend()
+	dst.shortWrite = true
+	dst.files["/dst.rf"] = []byte("old")
+
+	written, sum, bcVersion, err := copyWithSHA256(context.Background(), src, "/src.rf", dst, "/dst.rf")
+	if !errors.Is(err, io.ErrShortWrite) {
+		t.Fatalf("copyWithSHA256 error = %v, want %v", err, io.ErrShortWrite)
+	}
+	if written != 1 {
+		t.Fatalf("written = %d, want 1", written)
+	}
+	if sum != "" {
+		t.Fatalf("sum = %q, want empty on failure", sum)
+	}
+	if bcVersion != "" {
+		t.Fatalf("bcVersion = %q, want empty on failure", bcVersion)
+	}
+	if got := string(dst.files["/dst.rf"]); got != "old" {
+		t.Fatalf("destination contents = %q, want old", got)
+	}
+	if dst.lastWriter == nil || dst.lastWriter.abortCalls != 1 {
+		t.Fatalf("Abort calls = %d, want 1", dst.lastWriter.abortCalls)
+	}
+	if dst.lastWriter.closed {
+		t.Fatal("short export write closed and could have committed destination")
+	}
+	if dst.lastWriter.stagePresent {
+		t.Fatal("short export write left staged bytes behind")
+	}
+}
+
 func scanAll(t *testing.T, eng *Engine, table string) []string {
 	t.Helper()
 	sc, err := eng.Scan(table, iterrt.InfiniteRange(), ScanOptions{})
@@ -241,6 +280,7 @@ func (f *exportReadFuncFile) Size() int64 {
 type exportTrackingBackend struct {
 	files      map[string][]byte
 	lastWriter *exportTrackingWriter
+	shortWrite bool
 }
 
 func newExportTrackingBackend() *exportTrackingBackend {
@@ -252,7 +292,7 @@ func (b *exportTrackingBackend) Open(context.Context, string) (storage.File, err
 }
 
 func (b *exportTrackingBackend) Create(_ context.Context, path string) (storage.Writer, error) {
-	writer := &exportTrackingWriter{backend: b, path: path}
+	writer := &exportTrackingWriter{backend: b, path: path, shortWrite: b.shortWrite}
 	b.lastWriter = writer
 	return writer, nil
 }
@@ -264,11 +304,17 @@ type exportTrackingWriter struct {
 	stagePresent bool
 	abortCalls   int
 	closed       bool
+	shortWrite   bool
 }
 
 func (w *exportTrackingWriter) Write(p []byte) (int, error) {
 	w.stagePresent = true
-	return w.stage.WriteString(string(p))
+	if w.shortWrite && len(p) > 0 {
+		n := len(p) - 1
+		_, _ = w.stage.Write(p[:n])
+		return n, nil
+	}
+	return w.stage.Write(p)
 }
 
 func (w *exportTrackingWriter) Close() error {
