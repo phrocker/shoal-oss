@@ -706,6 +706,22 @@ func usesLocalFilesystemSemantics(ref stagePathRef) bool {
 	return false
 }
 
+// canonicalBackendPath returns a backend-aware canonical identity for
+// ref, or ok=false when no such identity can be safely established.
+// Canonicalization is only ever applied when the unwrapped backend is a
+// concrete, recognized backend type (*s3.Backend, *gcs.Backend,
+// *azure.Backend, *hdfs.Backend): only then do we actually know the
+// path-normalization rules the backend enforces (for example HDFS's
+// dot-segment resolution). There is deliberately no fallback that
+// canonicalizes based on the path's scheme spelling alone: a path that
+// merely *looks* like "hdfs:/..." on a backend that is not really HDFS
+// (a memory.Backend in tests, or any other backend without HDFS
+// semantics) has no guarantee its keys are dot-segment-normalized --
+// memory.Backend, for instance, treats "hdfs:/dir/../A.rf" and
+// "hdfs:/A.rf" as two entirely distinct, literal map keys. Assuming
+// HDFS semantics from spelling alone would make sourceRefsAlias treat
+// those two distinct stored objects as the same source and silently
+// drop one in canonicalStageSource.
 func canonicalBackendPath(ref stagePathRef) (string, bool) {
 	backend := unwrapBackend(ref.backend)
 	if storage.UsesLocalPathSemantics(backend) {
@@ -735,18 +751,10 @@ func canonicalBackendPath(ref stagePathRef) (string, bool) {
 		return canonicalHDFSPath(ref.path, b.Authority())
 	}
 
-	switch scheme {
-	case "s3":
-		return canonicalS3Path(ref.path)
-	case "gs":
-		return canonicalGCSPath(ref.path)
-	case "az":
-		return canonicalAzurePath(ref.path)
-	case "hdfs":
-		return canonicalHDFSPath(ref.path, "")
-	default:
-		return "", false
-	}
+	// No concrete recognized backend type matched (including a nil
+	// backend): fall through without canonicalizing, regardless of
+	// what scheme the path string happens to spell.
+	return "", false
 }
 
 func canonicalS3Path(path string) (string, bool) {

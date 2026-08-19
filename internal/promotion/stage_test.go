@@ -340,6 +340,94 @@ func TestStageBulkDirDoesNotSilentlyDedupeDistinctSourcesOnUnrecognizedBackendSc
 	}
 }
 
+// TestCanonicalBackendPathRequiresMatchingBackendType covers a second,
+// distinct gap in the same silent-dedupe bug class as
+// TestSourceRefsAliasRequiresExactMatchOnUnrecognizedBackendScheme:
+// canonicalBackendPath's scheme-string fallback (reached whenever the
+// unwrapped backend isn't a recognized *s3/*gcs/*azure/*hdfs.Backend
+// type) applied HDFS's dot-segment path.Clean canonicalization based
+// purely on a path *looking* like "hdfs:/..."), with no check that the
+// backend actually implements HDFS semantics. On a memory.Backend --
+// whose Put/Open/Create/Delete use the literal path string as an
+// uninterpreted map key -- "hdfs:/dir/../A.rf" and "hdfs:/A.rf" are two
+// genuinely distinct stored objects, but both canonicalized to the
+// same "hdfs://A.rf" string, so sourceRefsAlias treated them as the
+// same source. The same pair on a *real* hdfs.Backend legitimately does
+// alias (HDFS itself resolves the dot segment), so the fix must keep
+// that case working while refusing to canonicalize on any backend type
+// that isn't actually the corresponding concrete backend.
+func TestCanonicalBackendPathRequiresMatchingBackendType(t *testing.T) {
+	dotSegmentPath := "hdfs:/dir/../A.rf"
+	cleanPath := "hdfs:/A.rf"
+
+	t.Run("unrecognized backend type is not canonicalized from scheme alone", func(t *testing.T) {
+		backend := memory.New()
+		if _, ok := canonicalBackendPath(newStagePathRef(backend, dotSegmentPath)); ok {
+			t.Fatalf("canonicalBackendPath(memory.Backend, %q) ok = true, want false: memory.Backend has no HDFS dot-segment semantics", dotSegmentPath)
+		}
+		cache := newPathIdentityCache(0)
+		left := newStagePathRef(backend, dotSegmentPath)
+		right := newStagePathRef(backend, cleanPath)
+		if sourceRefsAlias(left, right, cache) {
+			t.Fatalf("sourceRefsAlias(%q, %q) on memory.Backend = true, want false: an hdfs-looking scheme on a non-HDFS backend must not be canonicalized", dotSegmentPath, cleanPath)
+		}
+	})
+
+	t.Run("real hdfs backend still canonicalizes the dot segment", func(t *testing.T) {
+		backend := newTestHDFSBackend(t, "hdfs://nn:8020")
+		dotSegmentValue, dotSegmentOK := canonicalBackendPath(newStagePathRef(backend, dotSegmentPath))
+		cleanValue, cleanOK := canonicalBackendPath(newStagePathRef(backend, cleanPath))
+		if !dotSegmentOK || !cleanOK || dotSegmentValue != cleanValue {
+			t.Fatalf("canonicalBackendPath on a real hdfs.Backend: (%q, %v) and (%q, %v), want equal canonical values with ok=true", dotSegmentValue, dotSegmentOK, cleanValue, cleanOK)
+		}
+	})
+}
+
+// TestStageBulkDirDoesNotSilentlyDedupeDotSegmentSourcesOnUnrecognizedBackendType
+// is the end-to-end counterpart of
+// TestCanonicalBackendPathRequiresMatchingBackendType: two manifest
+// entries with genuinely different, independently verified content on a
+// memory.Backend, spelled "hdfs:/dir/../A.rf" and "hdfs:/A.rf". Before
+// the fix, canonicalBackendPath's scheme-only fallback canonicalized
+// both to the same HDFS-style string purely because the paths looked
+// like HDFS URIs, so dedupeStageSources merged them and
+// canonicalStageSource silently kept only one, and StageBulkDir would
+// have "succeeded" having staged one fewer file than the export
+// actually produced. Both paths flatten to the same basename ("A.rf"),
+// so once the two sources are correctly kept distinct, StageBulkDir
+// must fail closed at the flatten-collision check instead of silently
+// dropping either one.
+func TestStageBulkDirDoesNotSilentlyDedupeDotSegmentSourcesOnUnrecognizedBackendType(t *testing.T) {
+	aPath := "hdfs:/dir/../A.rf"
+	bPath := "hdfs:/A.rf"
+	aContent := []byte("distinct dot-segment source A bytes")
+	bContent := []byte("distinct dot-segment source B bytes, must not be lost")
+
+	src := memory.New()
+	src.Put(aPath, aContent)
+	src.Put(bPath, bContent)
+
+	aSum := sha256.Sum256(aContent)
+	bSum := sha256.Sum256(bContent)
+	manifest := &engine.RFileExportManifest{
+		Version:     engine.RFileExportManifestVersion,
+		SourceTable: "events",
+		Tablets:     []engine.RFileExportTablet{{Index: 0}},
+		RFiles: []engine.RFileExportFile{
+			{TabletIndex: 0, DestinationPath: aPath, Size: int64(len(aContent)), SHA256: hex.EncodeToString(aSum[:])},
+			{TabletIndex: 0, DestinationPath: bPath, Size: int64(len(bContent)), SHA256: hex.EncodeToString(bSum[:])},
+		},
+	}
+
+	dst := memory.New()
+	if _, err := StageBulkDir(context.Background(), src, manifest, dst, "/bulk/events-1"); err == nil {
+		t.Fatal("StageBulkDir with two dot-segment-distinct sources on a memory.Backend = nil error, want error")
+	}
+	if got := dst.Keys(); len(got) != 0 {
+		t.Fatalf("StageBulkDir wrote %v before rejecting the ambiguous flatten, want no writes", got)
+	}
+}
+
 func TestStageBulkDirRejectsInvalidBulkDirBeforeCopying(t *testing.T) {
 	src := memory.New()
 	src.Put("export/events/t-0000/F0001.rf", []byte("data"))
