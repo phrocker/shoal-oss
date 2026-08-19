@@ -29,6 +29,10 @@ int shoal_test_connector_last_flush_range_matches(
                                         shoal_bytes *start,
                                         shoal_bytes *end,
                                         uint8_t wait);
+int shoal_test_connector_invalidation_matches(
+                                        shoal_connector *connector,
+                                        char *table_id,
+                                        size_t discovery_count);
 int shoal_test_connector_topology_block(shoal_connector *connector,
                                         uint8_t block);
 int shoal_test_batch_writer_create(int mode, shoal_batch_writer **out_writer);

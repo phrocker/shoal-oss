@@ -722,22 +722,22 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
 
     def test_pinned_inventory_constants_are_internally_consistent(self) -> None:
         validator.validate_pinned_inventory_constants()
-        self.assertEqual(validator.EXPECTED_REVISION, 29)
+        self.assertEqual(validator.EXPECTED_REVISION, 30)
         self.assertEqual(validator.EXPECTED_TOTAL_ROWS, 3203)
         self.assertEqual(validator.EXPECTED_REQUIRED_ROWS, 2811)
         self.assertEqual(
             validator.EXPECTED_STATUS_COUNTS,
             {
-                "Covered": 69,
+                "Covered": 71,
                 "Missing Go": 2361,
-                "Missing C ABI": 73,
+                "Missing C ABI": 71,
                 "Behavior mismatch": 221,
                 validator.INTENTIONAL_DIVERGENCE_STATUS: 87,
                 validator.NOT_REQUIRED_STATUS: 392,
             },
         )
-        self.assertEqual(validator.EXPECTED_C_ABI_DECLARED_EXPORTS, 200)
-        self.assertEqual(validator.EXPECTED_C_ABI_REFERENCED_EXPORTS, 195)
+        self.assertEqual(validator.EXPECTED_C_ABI_DECLARED_EXPORTS, 208)
+        self.assertEqual(validator.EXPECTED_C_ABI_REFERENCED_EXPORTS, 203)
         self.assertEqual(
             validator.EXPECTED_C_ABI_UNREFERENCED_EXPORTS,
             (
@@ -765,7 +765,7 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
 
     def test_collect_c_abi_free_function_inventory_matches_header(self) -> None:
         free_functions = validator.collect_c_abi_free_function_inventory()
-        self.assertEqual(len(free_functions), 29)
+        self.assertEqual(len(free_functions), 30)
         self.assertIn("shoal_key_value_result_free", free_functions)
         self.assertIn("shoal_authorizations_free", free_functions)
         self.assertIn("shoal_accumulo_writer_free", free_functions)
@@ -793,7 +793,7 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
 
     def test_stale_typed_free_inventory_narrative_is_rejected(self) -> None:
         text = load_document_text()
-        mutated = text.replace("29 typed free functions", "8 typed free functions", 1)
+        mutated = text.replace("30 typed free functions", "8 typed free functions", 1)
         self.assertNotEqual(mutated, text)
         self.assert_validation_fails(
             lambda: validator.validate_counts(mutated.splitlines(), mutated),
@@ -875,7 +875,7 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
             lambda: validator.validate_revision_inventory(
                 row_ids, reclassified, prefix_counts
             ),
-            f"revision {validator.EXPECTED_REVISION} inventory expects 69 rows for Covered, found 70",
+            f"revision {validator.EXPECTED_REVISION} inventory expects 71 rows for Covered, found 72",
         )
 
     def test_declared_count_edit_still_fails_internal_cross_check(self) -> None:
@@ -891,7 +891,7 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
     def test_stale_c_abi_symbol_inventory_narrative_is_rejected(self) -> None:
         text = load_document_text()
         mutated = text.replace(
-            "applied to 200 declared exports in `capi/include/shoal.h`",
+            "applied to 208 declared exports in `capi/include/shoal.h`",
             "applied to 44 declared exports in `capi/include/shoal.h`",
             1,
         )
@@ -904,7 +904,7 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
     def test_revision_bump_requires_validator_constant_update(self) -> None:
         text = load_document_text()
         mutated = text.replace(
-            f"Revision {validator.EXPECTED_REVISION} — completes row-bounded table flush and constraint administration",
+            f"Revision {validator.EXPECTED_REVISION} — completes one-shot scan cancellation and connector cache invalidation",
             f"Revision {validator.EXPECTED_REVISION + 1} — adds the next audited ABI slice",
         ).replace(
             f"As of revision {validator.EXPECTED_REVISION} that is",
@@ -913,7 +913,7 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
         self.assertNotEqual(mutated, text)
         self.assert_validation_fails(
             lambda: validator.validate_counts(mutated.splitlines(), mutated),
-            f"document status is missing expected detail: Revision {validator.EXPECTED_REVISION} — completes row-bounded table flush and constraint administration",
+            f"document status is missing expected detail: Revision {validator.EXPECTED_REVISION} — completes one-shot scan cancellation and connector cache invalidation",
         )
 
     # ---- matrix table separators -------------------------------------------

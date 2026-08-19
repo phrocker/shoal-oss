@@ -29,14 +29,14 @@ Shoal separates **ABI compatibility** from **feature availability**:
   stable allocation-free version tuple that works before connector creation.
   `SHOAL_ABI_VERSION_PACKED` uses
   `SHOAL_ABI_PACK_VERSION(major, minor, patch)` with a hexadecimal
-  `0x00MMmmpp` layout, so ABI `1.8.0` is `0x00010800`.
+  `0x00MMmmpp` layout, so ABI `1.9.0` is `0x00010900`.
 - Capability identifiers are append-only. Existing IDs and bits never change
   meaning. `shoal_abi_capability_word_count()` reports how many 64-bit words
   the current library uses, `shoal_abi_capability_word(i)` returns `0` for
   `i >= word_count`, and `shoal_abi_has_capability(id)` returns `0` for both
   unsupported and unknown IDs.
 
-Current capability assignments (`word 0 == 0x00000000000fffff`):
+Current capability assignments (`word 0 == 0x00000000001fffff`):
 
 | ID | Mask | Surface |
 | --- | --- | --- |
@@ -60,6 +60,7 @@ Current capability assignments (`word 0 == 0x00000000000fffff`):
 | `SHOAL_ABI_CAPABILITY_DATA_VALUES` | `0x20000` | copied key/range/authorization operations and owned key/value results |
 | `SHOAL_ABI_CAPABILITY_BUFFERED_WRITER` | `0x40000` | owned lazy row-buffered high-level writer with close coordination |
 | `SHOAL_ABI_CAPABILITY_TABLE_MAINTENANCE` | `0x80000` | row-bounded table flush and owned constraint administration |
+| `SHOAL_ABI_CAPABILITY_CONNECTOR_CONTROL` | `0x100000` | one-shot scan cancellation and connector cache invalidation |
 
 Shoal does **not** advertise instance status, compaction/import/export,
 Python/wheel, or any other unimplemented surface until the API exists and has
@@ -153,6 +154,13 @@ Version numbers change only when the public ABI contract changes:
   `NULL`. Once connector close/free starts, new scan calls fail with
   `SHOAL_STATUS_CLOSED`, but already-started scans are allowed to finish
   before connector teardown.
+- One-shot cancellation handles can interrupt single or batch scans without
+  closing the scanner or connector. Cancel is thread-safe and idempotent;
+  free cancels and joins registered scans and clears the caller's handle.
+  Already-canceled handles immediately cancel later scans.
+- Table-cache and full-discovery invalidation are connector-scoped local
+  operations. Table IDs are copied before return, calls coordinate with
+  connector close, and successful invalidation does not perform network I/O.
 - Table list and effective-property results own all returned strings. Views
   from `shoal_table_list_get` and `shoal_table_properties_get` remain valid
   until the matching result is freed. Effective properties preserve explicit

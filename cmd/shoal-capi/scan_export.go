@@ -181,6 +181,33 @@ func shoal_scanner_scan(
 	outResult **C.shoal_scan_result,
 	outError **C.shoal_error,
 ) (status C.shoal_status) {
+	return scannerScan(handle, cRange, timeoutMilliseconds, nil, false, outResult, outError)
+}
+
+//export shoal_scanner_scan_with_cancellation
+func shoal_scanner_scan_with_cancellation(
+	handle *C.shoal_scanner,
+	cRange *C.shoal_range,
+	timeoutMilliseconds C.int64_t,
+	cancellationHandle *C.shoal_cancellation,
+	outResult **C.shoal_scan_result,
+	outError **C.shoal_error,
+) (status C.shoal_status) {
+	return scannerScan(
+		handle, cRange, timeoutMilliseconds, cancellationHandle, true,
+		outResult, outError,
+	)
+}
+
+func scannerScan(
+	handle *C.shoal_scanner,
+	cRange *C.shoal_range,
+	timeoutMilliseconds C.int64_t,
+	cancellationHandle *C.shoal_cancellation,
+	requireCancellation bool,
+	outResult **C.shoal_scan_result,
+	outError **C.shoal_error,
+) (status C.shoal_status) {
 	clearScanOutputs(outResult, outError)
 	defer recoverScanStatus(&status, outResult, outError)
 	if outResult == nil {
@@ -198,7 +225,14 @@ func shoal_scanner_scan(
 	if err != nil {
 		return fail(outError, C.SHOAL_STATUS_INVALID_ARGUMENT, err)
 	}
-	ctx, done, err := scanner.begin(timeout)
+	var cancellation *ownedCancellation
+	if requireCancellation {
+		cancellation, err = lookupCancellation(cancellationHandle)
+		if err != nil {
+			return fail(outError, C.SHOAL_STATUS_INVALID_HANDLE, err)
+		}
+	}
+	ctx, done, err := scanner.beginCancelable(timeout, cancellation)
 	if err != nil {
 		return failForError(outError, err)
 	}
@@ -215,6 +249,38 @@ func shoal_batch_scanner_scan(
 	cRanges *C.shoal_range,
 	rangeCount C.size_t,
 	timeoutMilliseconds C.int64_t,
+	outResult **C.shoal_scan_result,
+	outError **C.shoal_error,
+) (status C.shoal_status) {
+	return batchScannerScan(
+		handle, cRanges, rangeCount, timeoutMilliseconds, nil, false,
+		outResult, outError,
+	)
+}
+
+//export shoal_batch_scanner_scan_with_cancellation
+func shoal_batch_scanner_scan_with_cancellation(
+	handle *C.shoal_batch_scanner,
+	cRanges *C.shoal_range,
+	rangeCount C.size_t,
+	timeoutMilliseconds C.int64_t,
+	cancellationHandle *C.shoal_cancellation,
+	outResult **C.shoal_scan_result,
+	outError **C.shoal_error,
+) (status C.shoal_status) {
+	return batchScannerScan(
+		handle, cRanges, rangeCount, timeoutMilliseconds, cancellationHandle,
+		true, outResult, outError,
+	)
+}
+
+func batchScannerScan(
+	handle *C.shoal_batch_scanner,
+	cRanges *C.shoal_range,
+	rangeCount C.size_t,
+	timeoutMilliseconds C.int64_t,
+	cancellationHandle *C.shoal_cancellation,
+	requireCancellation bool,
 	outResult **C.shoal_scan_result,
 	outError **C.shoal_error,
 ) (status C.shoal_status) {
@@ -250,7 +316,14 @@ func shoal_batch_scanner_scan(
 	if err != nil {
 		return fail(outError, C.SHOAL_STATUS_INVALID_ARGUMENT, err)
 	}
-	ctx, done, err := scanner.begin(timeout)
+	var cancellation *ownedCancellation
+	if requireCancellation {
+		cancellation, err = lookupCancellation(cancellationHandle)
+		if err != nil {
+			return fail(outError, C.SHOAL_STATUS_INVALID_HANDLE, err)
+		}
+	}
+	ctx, done, err := scanner.beginCancelable(timeout, cancellation)
 	if err != nil {
 		return failForError(outError, err)
 	}

@@ -22,7 +22,7 @@
  */
 #define SHOAL_ABI_VERSION 1u
 #define SHOAL_ABI_VERSION_MAJOR 1u
-#define SHOAL_ABI_VERSION_MINOR 8u
+#define SHOAL_ABI_VERSION_MINOR 9u
 #define SHOAL_ABI_VERSION_PATCH 0u
 #define SHOAL_ABI_PACK_VERSION(major, minor, patch)                           \
   ((((uint32_t)(major) & 0xffu) << 16) |                                     \
@@ -59,10 +59,11 @@ enum {
   SHOAL_ABI_CAPABILITY_RFILE = 16,
   SHOAL_ABI_CAPABILITY_DATA_VALUES = 17,
   SHOAL_ABI_CAPABILITY_BUFFERED_WRITER = 18,
-  SHOAL_ABI_CAPABILITY_TABLE_MAINTENANCE = 19
+  SHOAL_ABI_CAPABILITY_TABLE_MAINTENANCE = 19,
+  SHOAL_ABI_CAPABILITY_CONNECTOR_CONTROL = 20
 };
 
-#define SHOAL_ABI_CAPABILITY_COUNT 20u
+#define SHOAL_ABI_CAPABILITY_COUNT 21u
 #define SHOAL_ABI_CAPABILITY_WORD_BITS 64u
 #define SHOAL_ABI_CAPABILITY_WORD_INDEX(capability_id)                       \
   ((uint32_t)(capability_id) / SHOAL_ABI_CAPABILITY_WORD_BITS)
@@ -112,6 +113,8 @@ enum {
   SHOAL_ABI_CAPABILITY_MASK(SHOAL_ABI_CAPABILITY_BUFFERED_WRITER)
 #define SHOAL_ABI_CAPABILITY_TABLE_MAINTENANCE_MASK                          \
   SHOAL_ABI_CAPABILITY_MASK(SHOAL_ABI_CAPABILITY_TABLE_MAINTENANCE)
+#define SHOAL_ABI_CAPABILITY_CONNECTOR_CONTROL_MASK                          \
+  SHOAL_ABI_CAPABILITY_MASK(SHOAL_ABI_CAPABILITY_CONNECTOR_CONTROL)
 #define SHOAL_ABI_CAPABILITY_WORD0                                           \
   (SHOAL_ABI_CAPABILITY_CONNECTOR_MASK | SHOAL_ABI_CAPABILITY_BOOTSTRAP_MASK | \
    SHOAL_ABI_CAPABILITY_ERROR_MASK | SHOAL_ABI_CAPABILITY_SCANNER_MASK |     \
@@ -130,7 +133,8 @@ enum {
    SHOAL_ABI_CAPABILITY_RFILE_MASK |                                         \
    SHOAL_ABI_CAPABILITY_DATA_VALUES_MASK |                                  \
    SHOAL_ABI_CAPABILITY_BUFFERED_WRITER_MASK |                              \
-   SHOAL_ABI_CAPABILITY_TABLE_MAINTENANCE_MASK)
+   SHOAL_ABI_CAPABILITY_TABLE_MAINTENANCE_MASK |                             \
+   SHOAL_ABI_CAPABILITY_CONNECTOR_CONTROL_MASK)
 
 typedef int32_t shoal_status;
 
@@ -174,6 +178,7 @@ enum {
 };
 
 typedef struct shoal_connector shoal_connector;
+typedef struct shoal_cancellation shoal_cancellation;
 typedef struct shoal_scanner shoal_scanner;
 typedef struct shoal_batch_scanner shoal_batch_scanner;
 typedef struct shoal_scan_result shoal_scan_result;

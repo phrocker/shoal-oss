@@ -355,6 +355,148 @@ func (r *configurationRegistry) remove(id uint64) {
 
 var configurations = newConfigurationRegistry()
 
+type ownedCancellation struct {
+	mu        sync.Mutex
+	cancelled bool
+	closed    bool
+	nextID    uint64
+	cancels   map[uint64]context.CancelFunc
+	active    sync.WaitGroup
+}
+
+func newOwnedCancellation() *ownedCancellation {
+	return &ownedCancellation{
+		nextID:  1,
+		cancels: make(map[uint64]context.CancelFunc),
+	}
+}
+
+func (c *ownedCancellation) attach(parent context.Context) (context.Context, func(), error) {
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return nil, nil, accumulo.ErrConnectorClosed
+	}
+	ctx, cancel := context.WithCancel(parent)
+	if c.cancelled {
+		c.mu.Unlock()
+		cancel()
+		return ctx, func() {}, nil
+	}
+	var id uint64
+	for attempts := uint64(0); attempts < ^uint64(0); attempts++ {
+		id = c.nextID
+		c.nextID++
+		if c.nextID == 0 {
+			c.nextID = 1
+		}
+		if id != 0 {
+			if _, exists := c.cancels[id]; !exists {
+				break
+			}
+		}
+		id = 0
+	}
+	if id == 0 {
+		c.mu.Unlock()
+		cancel()
+		return nil, nil, errors.New("shoal: cancellation operation space exhausted")
+	}
+	c.cancels[id] = cancel
+	c.active.Add(1)
+	c.mu.Unlock()
+
+	var once sync.Once
+	return ctx, func() {
+		once.Do(func() {
+			c.mu.Lock()
+			delete(c.cancels, id)
+			c.mu.Unlock()
+			cancel()
+			c.active.Done()
+		})
+	}, nil
+}
+
+func (c *ownedCancellation) cancel() {
+	c.mu.Lock()
+	if !c.cancelled {
+		c.cancelled = true
+		for _, cancel := range c.cancels {
+			cancel()
+		}
+	}
+	c.mu.Unlock()
+}
+
+func (c *ownedCancellation) isCancelled() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.cancelled
+}
+
+func (c *ownedCancellation) close() {
+	c.mu.Lock()
+	if !c.closed {
+		c.closed = true
+		c.cancelled = true
+		for _, cancel := range c.cancels {
+			cancel()
+		}
+	}
+	c.mu.Unlock()
+	c.active.Wait()
+}
+
+type cancellationRegistry struct {
+	mu     sync.RWMutex
+	nextID uint64
+	items  map[uint64]*ownedCancellation
+}
+
+func newCancellationRegistry() *cancellationRegistry {
+	return &cancellationRegistry{
+		nextID: 1,
+		items:  make(map[uint64]*ownedCancellation),
+	}
+}
+
+func (r *cancellationRegistry) add(cancellation *ownedCancellation) (uint64, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for attempts := uint64(0); attempts < ^uint64(0); attempts++ {
+		id := r.nextID
+		r.nextID++
+		if r.nextID == 0 {
+			r.nextID = 1
+		}
+		if id != 0 {
+			if _, exists := r.items[id]; !exists {
+				r.items[id] = cancellation
+				return id, true
+			}
+		}
+	}
+	return 0, false
+}
+
+func (r *cancellationRegistry) get(id uint64) (*ownedCancellation, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	cancellation, ok := r.items[id]
+	return cancellation, ok
+}
+
+func (r *cancellationRegistry) remove(id uint64) (*ownedCancellation, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	cancellation, ok := r.items[id]
+	delete(r.items, id)
+	return cancellation, ok
+}
+
+var cancellations = newCancellationRegistry()
+
 type ownedScanner struct {
 	single *accumulo.Scanner
 	batch  *accumulo.BatchScanner
@@ -387,6 +529,7 @@ func (s *ownedScanner) begin(timeout time.Duration) (context.Context, func(), er
 		s.mu.Unlock()
 		return nil, nil, accumulo.ErrConnectorClosed
 	}
+
 	var ownerDone func()
 	if s.owner != nil {
 		var err error
@@ -448,6 +591,31 @@ func (s *ownedScanner) begin(timeout time.Duration) (context.Context, func(), er
 		})
 	}
 	return ctx, done, nil
+}
+
+func (s *ownedScanner) beginCancelable(
+	timeout time.Duration,
+	cancellation *ownedCancellation,
+) (context.Context, func(), error) {
+	ctx, scannerDone, err := s.begin(timeout)
+	if err != nil {
+		return nil, nil, err
+	}
+	if cancellation == nil {
+		return ctx, scannerDone, nil
+	}
+	ctx, cancellationDone, err := cancellation.attach(ctx)
+	if err != nil {
+		scannerDone()
+		return nil, nil, err
+	}
+	var once sync.Once
+	return ctx, func() {
+		once.Do(func() {
+			cancellationDone()
+			scannerDone()
+		})
+	}, nil
 }
 
 func (s *ownedScanner) close() {

@@ -10,7 +10,7 @@ static_assert(std::is_same<shoal_abi_capability_bits, std::uint64_t>::value,
               "capability bitset words must remain 64-bit");
 static_assert(SHOAL_ABI_VERSION == 1u, "unexpected ABI version");
 static_assert(SHOAL_ABI_VERSION_MAJOR == 1u, "unexpected ABI major");
-static_assert(SHOAL_ABI_VERSION_MINOR == 8u, "unexpected ABI minor");
+static_assert(SHOAL_ABI_VERSION_MINOR == 9u, "unexpected ABI minor");
 static_assert(SHOAL_ABI_VERSION_PATCH == 0u, "unexpected ABI patch");
 static_assert(SHOAL_ABI_VERSION_PACKED ==
                   SHOAL_ABI_PACK_VERSION(SHOAL_ABI_VERSION_MAJOR,
@@ -41,9 +41,11 @@ static_assert(SHOAL_ABI_CAPABILITY_BUFFERED_WRITER == 18u,
               "unexpected buffered writer capability id");
 static_assert(SHOAL_ABI_CAPABILITY_TABLE_MAINTENANCE == 19u,
               "unexpected table maintenance capability id");
-static_assert(SHOAL_ABI_CAPABILITY_COUNT == 20u,
+static_assert(SHOAL_ABI_CAPABILITY_CONNECTOR_CONTROL == 20u,
+              "unexpected connector control capability id");
+static_assert(SHOAL_ABI_CAPABILITY_COUNT == 21u,
               "unexpected capability count");
-static_assert(SHOAL_ABI_CAPABILITY_WORD0 == 0x00000000000fffffull,
+static_assert(SHOAL_ABI_CAPABILITY_WORD0 == 0x00000000001fffffull,
               "unexpected capability word 0");
 static_assert(std::is_standard_layout<shoal_connector_identity_view>::value,
               "identity view must remain standard-layout");
@@ -134,6 +136,7 @@ int main() {
   shoal_authorizations *authorizations = nullptr;
   shoal_key_value_result *key_value_result = nullptr;
   shoal_accumulo_writer *accumulo_writer = nullptr;
+  shoal_cancellation *cancellation = nullptr;
   shoal_table_constraint_list_result *constraints = nullptr;
   shoal_table_constraint_view constraint_view{};
   shoal_key_value key_value{};
@@ -160,6 +163,7 @@ int main() {
   assert(shoal_abi_has_capability(SHOAL_ABI_CAPABILITY_DATA_VALUES) == 1);
   assert(shoal_abi_has_capability(SHOAL_ABI_CAPABILITY_BUFFERED_WRITER) == 1);
   assert(shoal_abi_has_capability(SHOAL_ABI_CAPABILITY_TABLE_MAINTENANCE) == 1);
+  assert(shoal_abi_has_capability(SHOAL_ABI_CAPABILITY_CONNECTOR_CONTROL) == 1);
   assert(shoal_abi_has_capability(SHOAL_ABI_CAPABILITY_COUNT) == 0);
   assert(shoal_versioned_properties_version(versioned_properties) == 0);
   assert(shoal_versioned_properties_count(versioned_properties) == 0);
@@ -168,6 +172,22 @@ int main() {
          SHOAL_STATUS_INVALID_ARGUMENT);
   assert(error != nullptr);
   shoal_error_free(&error);
+  assert(shoal_cancellation_create(&cancellation, &error) == SHOAL_STATUS_OK);
+  assert(shoal_scanner_scan_with_cancellation(
+             scanner, nullptr, 0, cancellation, &scan_result, &error) ==
+         SHOAL_STATUS_INVALID_HANDLE);
+  shoal_error_free(&error);
+  assert(shoal_batch_scanner_scan_with_cancellation(
+             batch_scanner, nullptr, 0, 0, cancellation, &scan_result,
+             &error) == SHOAL_STATUS_INVALID_HANDLE);
+  shoal_error_free(&error);
+  assert(shoal_connector_invalidate_table(connector, "5", &error) ==
+         SHOAL_STATUS_INVALID_HANDLE);
+  shoal_error_free(&error);
+  assert(shoal_connector_invalidate_discovery(connector, &error) ==
+         SHOAL_STATUS_INVALID_HANDLE);
+  shoal_error_free(&error);
+  assert(shoal_cancellation_cancel(cancellation, &error) == SHOAL_STATUS_OK);
   assert(shoal_configuration_create(&configuration, &error) == SHOAL_STATUS_OK);
   const std::uint8_t key_data[] = {'k', '\0'};
   const std::uint8_t value_data[] = {'v', '\0'};
@@ -241,6 +261,7 @@ int main() {
   shoal_authorizations_free(&authorizations);
   shoal_key_value_result_free(&key_value_result);
   shoal_accumulo_writer_free(&accumulo_writer);
+  shoal_cancellation_free(&cancellation);
   shoal_table_constraint_list_free(&constraints);
   shoal_error_free(&error);
   return 0;

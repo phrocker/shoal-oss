@@ -22,26 +22,28 @@ import (
 )
 
 type testAdminConnector struct {
-	mu               sync.Mutex
-	nextID           int
-	tables           map[string]string
-	properties       map[string]map[string]string
-	namespaces       map[string]string
-	nsProps          map[string]map[string]string
-	users            map[string][]byte
-	auths            map[string][][]byte
-	permissions      map[string]bool
-	splits           map[string][][]byte
-	constraints      map[string]map[int32]string
-	flushFalse       int
-	flushTrue        int
-	flushStart       []byte
-	flushEnd         []byte
-	flushStartSet    bool
-	flushEndSet      bool
-	flushRangeWait   bool
-	identityBlock    atomic.Bool
-	maintenanceBlock atomic.Bool
+	mu                     sync.Mutex
+	nextID                 int
+	tables                 map[string]string
+	properties             map[string]map[string]string
+	namespaces             map[string]string
+	nsProps                map[string]map[string]string
+	users                  map[string][]byte
+	auths                  map[string][][]byte
+	permissions            map[string]bool
+	splits                 map[string][][]byte
+	constraints            map[string]map[int32]string
+	flushFalse             int
+	flushTrue              int
+	flushStart             []byte
+	flushEnd               []byte
+	flushStartSet          bool
+	flushEndSet            bool
+	flushRangeWait         bool
+	invalidatedTable       string
+	discoveryInvalidations int
+	identityBlock          atomic.Bool
+	maintenanceBlock       atomic.Bool
 }
 
 func newTestAdminConnector() *testAdminConnector {
@@ -109,6 +111,23 @@ func (c *testAdminConnector) NewBatchWriter(
 	accumulo.BatchWriterOptions,
 ) (*accumulo.BatchWriter, error) {
 	return nil, accumulo.ErrDiscoveryUnavailable
+}
+
+func (c *testAdminConnector) InvalidateTable(table accumulo.Table) error {
+	if table.ID == "" {
+		return accumulo.ErrTableNotFound
+	}
+	c.mu.Lock()
+	c.invalidatedTable = table.ID
+	c.mu.Unlock()
+	return nil
+}
+
+func (c *testAdminConnector) InvalidateDiscovery() error {
+	c.mu.Lock()
+	c.discoveryInvalidations++
+	c.mu.Unlock()
+	return nil
 }
 
 func (c *testAdminConnector) Tables(ctx context.Context) ([]accumulo.Table, error) {
@@ -918,6 +937,33 @@ func shoal_test_connector_last_flush_range_matches(
 		admin.flushRangeWait != expectedWait ||
 		!bytes.Equal(admin.flushStart, expectedStart) ||
 		!bytes.Equal(admin.flushEnd, expectedEnd) {
+		return 0
+	}
+	return 1
+}
+
+//export shoal_test_connector_invalidation_matches
+func shoal_test_connector_invalidation_matches(
+	handle *C.shoal_connector,
+	tableID *C.char,
+	discoveryCount C.size_t,
+) C.int {
+	connector, err := lookupConnector(handle)
+	if err != nil {
+		return 0
+	}
+	admin, ok := connector.connector.(*testAdminConnector)
+	if !ok {
+		return 0
+	}
+	expected, err := requiredString(tableID, "table_id")
+	if err != nil {
+		return 0
+	}
+	admin.mu.Lock()
+	defer admin.mu.Unlock()
+	if admin.invalidatedTable != expected ||
+		admin.discoveryInvalidations != int(discoveryCount) {
 		return 0
 	}
 	return 1

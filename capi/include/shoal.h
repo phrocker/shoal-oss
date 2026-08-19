@@ -734,6 +734,48 @@ shoal_batch_scanner_scan(shoal_batch_scanner *scanner,
                          int64_t timeout_ms, shoal_scan_result **out_result,
                          shoal_error **out_error);
 
+/*
+ * Cancellation handles are one-shot and thread-safe. Cancel is idempotent.
+ * Cancelable scans register only for the duration of that call. Free cancels
+ * and joins registered calls, clears the caller's handle, and is NULL-safe and
+ * idempotent. A canceled handle remains canceled and may be queried or freed.
+ */
+SHOAL_API shoal_status SHOAL_CALL
+shoal_cancellation_create(shoal_cancellation **out_cancellation,
+                         shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_cancellation_cancel(shoal_cancellation *cancellation,
+                         shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_cancellation_is_cancelled(const shoal_cancellation *cancellation,
+                               uint8_t *out_cancelled,
+                               shoal_error **out_error);
+SHOAL_API void SHOAL_CALL
+shoal_cancellation_free(shoal_cancellation **cancellation);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_scanner_scan_with_cancellation(
+    shoal_scanner *scanner, const shoal_range *range, int64_t timeout_ms,
+    shoal_cancellation *cancellation, shoal_scan_result **out_result,
+    shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_batch_scanner_scan_with_cancellation(
+    shoal_batch_scanner *scanner, const shoal_range *ranges,
+    size_t range_count, int64_t timeout_ms, shoal_cancellation *cancellation,
+    shoal_scan_result **out_result, shoal_error **out_error);
+
+/*
+ * Connector invalidation is local and performs no network I/O. Inputs are
+ * copied before return. Calls coordinate with connector close and fail with
+ * SHOAL_STATUS_CLOSED after close begins.
+ */
+SHOAL_API shoal_status SHOAL_CALL
+shoal_connector_invalidate_table(shoal_connector *connector,
+                                const char *table_id,
+                                shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_connector_invalidate_discovery(shoal_connector *connector,
+                                    shoal_error **out_error);
+
 SHOAL_API size_t SHOAL_CALL
 shoal_scan_result_count(const shoal_scan_result *result);
 

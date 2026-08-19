@@ -323,6 +323,27 @@ static void *shoal_bridge_result_calloc(size_t count, size_t size) {
   return calloc(count, size);
 }
 
+shoal_cancellation *shoal_bridge_cancellation_alloc(uint64_t id) {
+  shoal_cancellation *cancellation =
+      (shoal_cancellation *)shoal_bridge_result_calloc(1, sizeof(*cancellation));
+  if (cancellation != NULL) {
+    cancellation->id = id;
+  }
+  return cancellation;
+}
+
+uint64_t
+shoal_bridge_cancellation_id(const shoal_cancellation *cancellation) {
+  return cancellation == NULL ? 0 : cancellation->id;
+}
+
+void shoal_bridge_cancellation_free(shoal_cancellation *cancellation) {
+  if (cancellation != NULL) {
+    cancellation->id = 0;
+    free(cancellation);
+  }
+}
+
 shoal_accumulo_writer *shoal_bridge_accumulo_writer_alloc(uint64_t id) {
   shoal_accumulo_writer *writer =
       (shoal_accumulo_writer *)shoal_bridge_result_calloc(1, sizeof(*writer));

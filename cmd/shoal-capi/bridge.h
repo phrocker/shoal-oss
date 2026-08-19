@@ -7,6 +7,10 @@ struct shoal_connector {
   uint64_t id;
 };
 
+struct shoal_cancellation {
+  uint64_t id;
+};
+
 struct shoal_scanner {
   uint64_t id;
 };
@@ -238,6 +242,10 @@ struct shoal_key_value_result {
 shoal_connector *shoal_bridge_connector_alloc(uint64_t id);
 uint64_t shoal_bridge_connector_id(const shoal_connector *connector);
 void shoal_bridge_connector_free(shoal_connector *connector);
+shoal_cancellation *shoal_bridge_cancellation_alloc(uint64_t id);
+uint64_t
+shoal_bridge_cancellation_id(const shoal_cancellation *cancellation);
+void shoal_bridge_cancellation_free(shoal_cancellation *cancellation);
 
 shoal_scanner *shoal_bridge_scanner_alloc(uint64_t id);
 uint64_t shoal_bridge_scanner_id(const shoal_scanner *scanner);
