@@ -722,22 +722,22 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
 
     def test_pinned_inventory_constants_are_internally_consistent(self) -> None:
         validator.validate_pinned_inventory_constants()
-        self.assertEqual(validator.EXPECTED_REVISION, 33)
+        self.assertEqual(validator.EXPECTED_REVISION, 34)
         self.assertEqual(validator.EXPECTED_TOTAL_ROWS, 3203)
         self.assertEqual(validator.EXPECTED_REQUIRED_ROWS, 2811)
         self.assertEqual(
             validator.EXPECTED_STATUS_COUNTS,
             {
-                "Covered": 84,
+                "Covered": 88,
                 "Missing Go": 2357,
-                "Missing C ABI": 64,
+                "Missing C ABI": 60,
                 "Behavior mismatch": 219,
                 validator.INTENTIONAL_DIVERGENCE_STATUS: 87,
                 validator.NOT_REQUIRED_STATUS: 392,
             },
         )
-        self.assertEqual(validator.EXPECTED_C_ABI_DECLARED_EXPORTS, 223)
-        self.assertEqual(validator.EXPECTED_C_ABI_REFERENCED_EXPORTS, 218)
+        self.assertEqual(validator.EXPECTED_C_ABI_DECLARED_EXPORTS, 227)
+        self.assertEqual(validator.EXPECTED_C_ABI_REFERENCED_EXPORTS, 222)
         self.assertEqual(
             validator.EXPECTED_C_ABI_UNREFERENCED_EXPORTS,
             (
@@ -881,7 +881,7 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
             lambda: validator.validate_revision_inventory(
                 row_ids, reclassified, prefix_counts
             ),
-            f"revision {validator.EXPECTED_REVISION} inventory expects 84 rows for Covered, found 85",
+            f"revision {validator.EXPECTED_REVISION} inventory expects 88 rows for Covered, found 89",
         )
 
     def test_declared_count_edit_still_fails_internal_cross_check(self) -> None:
@@ -897,7 +897,7 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
     def test_stale_c_abi_symbol_inventory_narrative_is_rejected(self) -> None:
         text = load_document_text()
         mutated = text.replace(
-            "applied to 223 declared exports in `capi/include/shoal.h`",
+            "applied to 227 declared exports in `capi/include/shoal.h`",
             "applied to 44 declared exports in `capi/include/shoal.h`",
             1,
         )
@@ -910,7 +910,7 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
     def test_revision_bump_requires_validator_constant_update(self) -> None:
         text = load_document_text()
         mutated = text.replace(
-            f"Revision {validator.EXPECTED_REVISION} — records the public streaming scan cursor",
+            f"Revision {validator.EXPECTED_REVISION} — completes the four-row compatibility-error tranche",
             f"Revision {validator.EXPECTED_REVISION + 1} — adds the next audited ABI slice",
         ).replace(
             f"As of revision {validator.EXPECTED_REVISION} that is",
@@ -919,7 +919,7 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
         self.assertNotEqual(mutated, text)
         self.assert_validation_fails(
             lambda: validator.validate_counts(mutated.splitlines(), mutated),
-            f"document status is missing expected detail: Revision {validator.EXPECTED_REVISION} — records the public streaming scan cursor",
+            f"document status is missing expected detail: Revision {validator.EXPECTED_REVISION} — completes the four-row compatibility-error tranche",
         )
 
     # ---- matrix table separators -------------------------------------------

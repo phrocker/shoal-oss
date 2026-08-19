@@ -8,9 +8,9 @@
 
 _Static_assert(SHOAL_ABI_VERSION == 1u, "unexpected compatibility ABI version");
 _Static_assert(SHOAL_ABI_VERSION_MAJOR == 1u, "unexpected ABI major");
-_Static_assert(SHOAL_ABI_VERSION_MINOR == 11u, "unexpected ABI minor");
+_Static_assert(SHOAL_ABI_VERSION_MINOR == 12u, "unexpected ABI minor");
 _Static_assert(SHOAL_ABI_VERSION_PATCH == 0u, "unexpected ABI patch");
-_Static_assert(SHOAL_ABI_VERSION_PACKED == 0x00010b00u,
+_Static_assert(SHOAL_ABI_VERSION_PACKED == 0x00010c00u,
                "unexpected packed ABI version");
 _Static_assert(SHOAL_ABI_CAPABILITY_CONNECTOR == 0u,
                "unexpected connector capability id");
@@ -56,11 +56,13 @@ _Static_assert(SHOAL_ABI_CAPABILITY_HIGH_LEVEL_CLIENT == 21u,
                "unexpected high-level client capability id");
 _Static_assert(SHOAL_ABI_CAPABILITY_HIGH_LEVEL_SCANNER == 22u,
                "unexpected high-level scanner capability id");
-_Static_assert(SHOAL_ABI_CAPABILITY_COUNT == 23u,
+_Static_assert(SHOAL_ABI_CAPABILITY_COMPATIBILITY_ERRORS == 23u,
+               "unexpected compatibility errors capability id");
+_Static_assert(SHOAL_ABI_CAPABILITY_COUNT == 24u,
                "unexpected capability count");
 _Static_assert(SHOAL_ABI_CAPABILITY_WORD_COUNT == 1u,
                "unexpected capability word count");
-_Static_assert(SHOAL_ABI_CAPABILITY_WORD0 == UINT64_C(0x7fffff),
+_Static_assert(SHOAL_ABI_CAPABILITY_WORD0 == UINT64_C(0xffffff),
                "unexpected capability word 0");
 
 #define ASSERT_PERMISSION_VALUE(name, value)                                  \
@@ -108,6 +110,34 @@ static void expect_error(shoal_status status, shoal_status expected,
   assert(*error != NULL);
   assert(shoal_error_code(*error) == expected);
   assert(strstr(shoal_error_message(*error), message_part) != NULL);
+  if (expected == SHOAL_STATUS_CLOSED) {
+    assert(shoal_error_source(*error) ==
+           SHOAL_ERROR_SOURCE_ILLEGAL_STATE_EXCEPTION);
+    assert(strcmp(shoal_error_source_name(*error),
+                  "IllegalStateException") == 0);
+    assert(shoal_error_compatibility(*error) ==
+           SHOAL_ERROR_COMPATIBILITY_RUNTIME_ERROR);
+  } else if (expected == SHOAL_STATUS_CANCELLED) {
+    assert(shoal_error_source(*error) ==
+           SHOAL_ERROR_SOURCE_ITERATION_INTERRUPTED_EXCEPTION);
+    assert(strcmp(shoal_error_source_name(*error),
+                  "IterationInterruptedException") == 0);
+    assert(shoal_error_compatibility(*error) ==
+           SHOAL_ERROR_COMPATIBILITY_RUNTIME_ERROR);
+  } else if (shoal_error_source(*error) ==
+             SHOAL_ERROR_SOURCE_CLIENT_EXCEPTION) {
+    assert(shoal_error_source(*error) ==
+           SHOAL_ERROR_SOURCE_CLIENT_EXCEPTION);
+    assert(shoal_error_compatibility(*error) ==
+           SHOAL_ERROR_COMPATIBILITY_CLIENT_EXCEPTION);
+    assert(strcmp(shoal_error_compatibility_name(*error),
+                  "ClientException") == 0);
+  } else {
+    assert(shoal_error_compatibility(*error) ==
+           SHOAL_ERROR_COMPATIBILITY_RUNTIME_ERROR);
+    assert(strcmp(shoal_error_compatibility_name(*error), "RuntimeError") ==
+           0);
+  }
   shoal_error_free(error);
   assert(*error == NULL);
 }
