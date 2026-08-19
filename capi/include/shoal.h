@@ -38,6 +38,105 @@ shoal_abi_capability_word(uint32_t word_index);
 SHOAL_API uint8_t SHOAL_CALL
 shoal_abi_has_capability(shoal_abi_capability_id capability_id);
 
+SHOAL_API void SHOAL_CALL
+shoal_rfile_writer_config_init(shoal_rfile_writer_config *config);
+SHOAL_API void SHOAL_CALL
+shoal_rfile_merge_config_init(shoal_rfile_merge_config *config);
+SHOAL_API void SHOAL_CALL shoal_rfile_entry_init(shoal_rfile_entry *entry);
+SHOAL_API void SHOAL_CALL
+shoal_rfile_entry_view_init(shoal_rfile_entry_view *view);
+
+/*
+ * Standalone RFile operations copy all caller inputs. timeout_ms is zero for
+ * no deadline and must not be negative. Handles own their files; close is
+ * idempotent, cancels active operations, and free performs bounded best-effort
+ * close before setting the caller's handle to NULL.
+ */
+SHOAL_API shoal_status SHOAL_CALL
+shoal_rfile_writer_create(const char *path,
+                          const shoal_rfile_writer_config *config,
+                          int64_t timeout_ms, shoal_rfile_writer **out_writer,
+                          shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_rfile_writer_append(shoal_rfile_writer *writer,
+                          const shoal_rfile_entry *entry, int64_t timeout_ms,
+                          shoal_error **out_error);
+SHOAL_API int64_t SHOAL_CALL
+shoal_rfile_writer_entries(shoal_rfile_writer *writer);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_rfile_writer_close(shoal_rfile_writer *writer, shoal_error **out_error);
+SHOAL_API void SHOAL_CALL
+shoal_rfile_writer_free(shoal_rfile_writer **writer);
+
+SHOAL_API shoal_status SHOAL_CALL
+shoal_rfile_reader_open(const char *path, int64_t timeout_ms,
+                        shoal_rfile_reader **out_reader,
+                        shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_rfile_reader_open_sequential(const char *path, int64_t timeout_ms,
+                                   shoal_rfile_reader **out_reader,
+                                   shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_rfile_reader_open_many(const char *const *paths, size_t path_count,
+                             const shoal_rfile_merge_config *config,
+                             int64_t timeout_ms,
+                             shoal_rfile_reader **out_reader,
+                             shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_rfile_reader_seek(shoal_rfile_reader *reader,
+                        const shoal_rfile_seekable *seekable,
+                        int64_t timeout_ms, shoal_error **out_error);
+SHOAL_API uint8_t SHOAL_CALL
+shoal_rfile_reader_has_top(shoal_rfile_reader *reader);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_rfile_reader_top(shoal_rfile_reader *reader,
+                       shoal_rfile_entry_result **out_result,
+                       shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_rfile_reader_top_key(shoal_rfile_reader *reader,
+                           shoal_rfile_entry_result **out_result,
+                           shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_rfile_reader_top_value(shoal_rfile_reader *reader,
+                             shoal_bytes_result **out_result,
+                             shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_rfile_reader_next(shoal_rfile_reader *reader, int64_t timeout_ms,
+                        shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_rfile_reader_close(shoal_rfile_reader *reader, shoal_error **out_error);
+SHOAL_API void SHOAL_CALL
+shoal_rfile_reader_free(shoal_rfile_reader **reader);
+
+SHOAL_API shoal_status SHOAL_CALL
+shoal_rfile_seekable_create(const shoal_range *range,
+                            const shoal_bytes *column_families,
+                            size_t column_family_count, uint8_t inclusive,
+                            shoal_rfile_seekable **out_seekable,
+                            shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_rfile_seekable_get_range(const shoal_rfile_seekable *seekable,
+                               shoal_range_result **out_result,
+                               shoal_error **out_error);
+SHOAL_API size_t SHOAL_CALL
+shoal_rfile_seekable_column_family_count(
+    const shoal_rfile_seekable *seekable);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_rfile_seekable_get_column_family(
+    const shoal_rfile_seekable *seekable, size_t index,
+    shoal_bytes_result **out_result, shoal_error **out_error);
+SHOAL_API uint8_t SHOAL_CALL
+shoal_rfile_seekable_is_inclusive(const shoal_rfile_seekable *seekable);
+SHOAL_API void SHOAL_CALL
+shoal_rfile_seekable_free(shoal_rfile_seekable **seekable);
+
+SHOAL_API shoal_status SHOAL_CALL
+shoal_rfile_entry_result_get(const shoal_rfile_entry_result *result,
+                             shoal_rfile_entry_view *out_entry,
+                             shoal_error **out_error);
+SHOAL_API void SHOAL_CALL
+shoal_rfile_entry_result_free(shoal_rfile_entry_result **result);
+
 /*
  * Configuration inputs are binary-safe and copied before return. Handles are
  * owned, safe for concurrent getters/setters, and released idempotently by

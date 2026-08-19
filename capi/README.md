@@ -29,14 +29,14 @@ Shoal separates **ABI compatibility** from **feature availability**:
   stable allocation-free version tuple that works before connector creation.
   `SHOAL_ABI_VERSION_PACKED` uses
   `SHOAL_ABI_PACK_VERSION(major, minor, patch)` with a hexadecimal
-  `0x00MMmmpp` layout, so ABI `1.4.0` is `0x00010400`.
+  `0x00MMmmpp` layout, so ABI `1.5.0` is `0x00010500`.
 - Capability identifiers are append-only. Existing IDs and bits never change
   meaning. `shoal_abi_capability_word_count()` reports how many 64-bit words
   the current library uses, `shoal_abi_capability_word(i)` returns `0` for
   `i >= word_count`, and `shoal_abi_has_capability(id)` returns `0` for both
   unsupported and unknown IDs.
 
-Current capability assignments (`word 0 == 0x000000000000ffff`):
+Current capability assignments (`word 0 == 0x000000000001ffff`):
 
 | ID | Mask | Surface |
 | --- | --- | --- |
@@ -56,6 +56,7 @@ Current capability assignments (`word 0 == 0x000000000000ffff`):
 | `SHOAL_ABI_CAPABILITY_CONNECTOR_IDENTITY` | `0x2000` | owned connector instance-name, instance-ID, and principal discovery |
 | `SHOAL_ABI_CAPABILITY_DATA_DESCRIPTORS` | `0x4000` | owned range and iterator-setting descriptors with versioned borrowed views |
 | `SHOAL_ABI_CAPABILITY_CONFIGURATION_TOPOLOGY` | `0x8000` | binary-safe configuration handles and owned instance-topology snapshots |
+| `SHOAL_ABI_CAPABILITY_RFILE` | `0x10000` | owned standalone RFile readers, writers, seekable relocations, and copied results |
 
 Shoal does **not** advertise instance status, compaction/import/export,
 Python/wheel, or any other unimplemented surface until the API exists and has
@@ -134,6 +135,11 @@ Version numbers change only when the public ABI contract changes:
 - Root-tablet, manager, and server discovery use per-call deadlines and are
   cancelled by connector close. Root, ZooKeeper, and configuration getters
   are coordinated with close and return owned handles or snapshots.
+- RFile readers, writers, and seekable relocations are owned opaque handles.
+  Path, key, value, and column-family inputs are copied; top entries, values,
+  ranges, and family accessors return owned results. Operations accept
+  per-call deadlines, close cancels and joins active work, and every free is
+  NULL-safe, idempotent, and clears the caller's handle.
 - Scanner and batch-scanner handles support concurrent scan calls. Close
   cancels and joins in-flight calls and is idempotent while the handle remains
   alive; free performs best-effort close and sets the handle variable to

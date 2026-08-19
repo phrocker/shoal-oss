@@ -11,10 +11,12 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"os"
 	"time"
 	"unsafe"
 
 	"github.com/phrocker/shoal/accumulo"
+	publicrfile "github.com/phrocker/shoal/rfile"
 )
 
 //export shoal_scanner_config_init
@@ -746,6 +748,21 @@ func statusForError(err error) C.shoal_status {
 		return C.SHOAL_STATUS_CANCELLED
 	case errors.Is(err, accumulo.ErrConnectorClosed):
 		return C.SHOAL_STATUS_CLOSED
+	case errors.Is(err, publicrfile.ErrClosed):
+		return C.SHOAL_STATUS_CLOSED
+	case errors.Is(err, publicrfile.ErrNoTop):
+		return C.SHOAL_STATUS_NOT_FOUND
+	case errors.Is(err, publicrfile.ErrInvalidSeekable),
+		errors.Is(err, publicrfile.ErrInvalidPath),
+		errors.Is(err, publicrfile.ErrOutOfOrder):
+		return C.SHOAL_STATUS_INVALID_ARGUMENT
+	case errors.Is(err, publicrfile.ErrUnsupportedCodec),
+		errors.Is(err, publicrfile.ErrLocalityGroupUnsupported):
+		return C.SHOAL_STATUS_UNSUPPORTED
+	case errors.Is(err, os.ErrNotExist):
+		return C.SHOAL_STATUS_NOT_FOUND
+	case errors.Is(err, os.ErrPermission):
+		return C.SHOAL_STATUS_PERMISSION_DENIED
 	case errors.Is(err, accumulo.ErrBatchWriterClosed):
 		return C.SHOAL_STATUS_CLOSED
 	case errors.Is(err, accumulo.ErrBatchWriterRetryExhausted):

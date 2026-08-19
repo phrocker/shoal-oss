@@ -27,6 +27,18 @@ struct shoal_configuration {
   uint64_t id;
 };
 
+struct shoal_rfile_reader {
+  uint64_t id;
+};
+
+struct shoal_rfile_writer {
+  uint64_t id;
+};
+
+struct shoal_rfile_seekable {
+  uint64_t id;
+};
+
 struct shoal_error {
   shoal_status code;
   char *message;
@@ -196,6 +208,11 @@ struct shoal_server_list_result {
   shoal_bridge_server_entry *entries;
 };
 
+struct shoal_rfile_entry_result {
+  shoal_bridge_scan_entry entry;
+  uint8_t deleted;
+};
+
 shoal_connector *shoal_bridge_connector_alloc(uint64_t id);
 uint64_t shoal_bridge_connector_id(const shoal_connector *connector);
 void shoal_bridge_connector_free(shoal_connector *connector);
@@ -219,6 +236,15 @@ void shoal_bridge_batch_writer_free(shoal_batch_writer *writer);
 shoal_configuration *shoal_bridge_configuration_alloc(uint64_t id);
 uint64_t shoal_bridge_configuration_id(const shoal_configuration *configuration);
 void shoal_bridge_configuration_free(shoal_configuration *configuration);
+shoal_rfile_reader *shoal_bridge_rfile_reader_alloc(uint64_t id);
+uint64_t shoal_bridge_rfile_reader_id(const shoal_rfile_reader *reader);
+void shoal_bridge_rfile_reader_free(shoal_rfile_reader *reader);
+shoal_rfile_writer *shoal_bridge_rfile_writer_alloc(uint64_t id);
+uint64_t shoal_bridge_rfile_writer_id(const shoal_rfile_writer *writer);
+void shoal_bridge_rfile_writer_free(shoal_rfile_writer *writer);
+shoal_rfile_seekable *shoal_bridge_rfile_seekable_alloc(uint64_t id);
+uint64_t shoal_bridge_rfile_seekable_id(const shoal_rfile_seekable *seekable);
+void shoal_bridge_rfile_seekable_free(shoal_rfile_seekable *seekable);
 
 char *shoal_bridge_string_alloc(const char *value, size_t length);
 void shoal_bridge_string_free(char *value);
@@ -243,6 +269,15 @@ size_t shoal_bridge_server_list_count(const shoal_server_list_result *result);
 int shoal_bridge_server_list_get(const shoal_server_list_result *result,
                                  size_t index, shoal_server_view *out_server);
 void shoal_bridge_server_list_free(shoal_server_list_result *result);
+shoal_rfile_entry_result *shoal_bridge_rfile_entry_alloc(
+    const uint8_t *row, size_t row_length, const uint8_t *column_family,
+    size_t column_family_length, const uint8_t *column_qualifier,
+    size_t column_qualifier_length, const uint8_t *column_visibility,
+    size_t column_visibility_length, int64_t timestamp, const uint8_t *value,
+    size_t value_length, uint8_t deleted);
+int shoal_bridge_rfile_entry_get(const shoal_rfile_entry_result *result,
+                                 shoal_rfile_entry_view *out_entry);
+void shoal_bridge_rfile_entry_free(shoal_rfile_entry_result *result);
 #ifdef SHOAL_CAPI_TEST
 void shoal_bridge_test_string_alloc_fail_after(size_t successful_allocations);
 void shoal_bridge_test_string_alloc_reset(void);
