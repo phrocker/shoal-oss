@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -10,20 +11,236 @@ import (
 	"github.com/phrocker/shoal/accumulo"
 )
 
+type connectorAPI interface {
+	Close() error
+	NewScanner(accumulo.Table, accumulo.ScannerOptions) (*accumulo.Scanner, error)
+	NewBatchScanner(accumulo.Table, accumulo.ScannerOptions) (*accumulo.BatchScanner, error)
+	NewBatchWriter(accumulo.Table, accumulo.BatchWriterOptions) (*accumulo.BatchWriter, error)
+	Tables(context.Context) ([]accumulo.Table, error)
+	TableExists(context.Context, string) (bool, error)
+	CreateTable(context.Context, string) error
+	DeleteTable(context.Context, string) error
+	RenameTable(context.Context, string, string) error
+	FlushTable(context.Context, string, bool) error
+	SetTableProperty(context.Context, string, string, string) error
+	RemoveTableProperty(context.Context, string, string) error
+	EffectiveTableProperties(context.Context, string) (map[string]string, error)
+}
+
 type ownedConnector struct {
-	connector *accumulo.Connector
+	connector connectorAPI
 	instance  accumulo.Instance
-	once      sync.Once
-	closeErr  error
 	closed    atomic.Bool
+
+	mu      sync.Mutex
+	nextID  uint64
+	cancels map[uint64]context.CancelFunc
+	active  int
+	idle    chan struct{}
+
+	closeOnce sync.Once
+	closeErr  error
+}
+
+func newOwnedConnector(connector connectorAPI, instance accumulo.Instance) *ownedConnector {
+	idle := make(chan struct{})
+	close(idle)
+	return &ownedConnector{
+		connector: connector,
+		instance:  instance,
+		nextID:    1,
+		cancels:   make(map[uint64]context.CancelFunc),
+		idle:      idle,
+	}
+}
+
+func (c *ownedConnector) retain() (func(), error) {
+	c.mu.Lock()
+	c.ensureStateLocked()
+	if c.closed.Load() {
+		c.mu.Unlock()
+		return nil, accumulo.ErrConnectorClosed
+	}
+	if c.active == 0 {
+		c.idle = make(chan struct{})
+	}
+	c.active++
+	c.mu.Unlock()
+
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			c.mu.Lock()
+			c.releaseActiveLocked()
+			c.mu.Unlock()
+		})
+	}, nil
+}
+
+func (c *ownedConnector) begin(timeout time.Duration) (context.Context, func(), error) {
+	c.mu.Lock()
+	c.ensureStateLocked()
+	if c.closed.Load() {
+		c.mu.Unlock()
+		return nil, nil, accumulo.ErrConnectorClosed
+	}
+	var id uint64
+	for attempts := uint64(0); attempts < ^uint64(0); attempts++ {
+		id = c.nextID
+		c.nextID++
+		if c.nextID == 0 {
+			c.nextID = 1
+		}
+		if id != 0 {
+			if _, exists := c.cancels[id]; !exists {
+				break
+			}
+		}
+		id = 0
+	}
+	if id == 0 {
+		c.mu.Unlock()
+		return nil, nil, errors.New("shoal: connector operation space exhausted")
+	}
+	var ctx context.Context
+	var cancel context.CancelFunc
+	if timeout == 0 {
+		ctx, cancel = context.WithCancel(context.Background())
+	} else {
+		ctx, cancel = context.WithTimeout(context.Background(), timeout)
+	}
+	if c.active == 0 {
+		c.idle = make(chan struct{})
+	}
+	c.cancels[id] = cancel
+	c.active++
+	c.mu.Unlock()
+
+	var once sync.Once
+	done := func() {
+		once.Do(func() {
+			c.mu.Lock()
+			delete(c.cancels, id)
+			c.releaseActiveLocked()
+			c.mu.Unlock()
+			cancel()
+		})
+	}
+	return ctx, done, nil
 }
 
 func (c *ownedConnector) close() error {
-	c.closed.Store(true)
-	c.once.Do(func() {
-		c.closeErr = errors.Join(c.connector.Close(), c.instance.Close())
+	c.closeOnce.Do(func() {
+		c.closeErr = c.closeFirst()
 	})
 	return c.closeErr
+}
+
+func (c *ownedConnector) closeBounded(timeout time.Duration) error {
+	c.closeOnce.Do(func() {
+		c.closeErr = c.closeBoundedFirst(timeout)
+	})
+	return c.closeErr
+}
+
+func (c *ownedConnector) closeFirst() error {
+	c.mu.Lock()
+	c.ensureStateLocked()
+	if !c.closed.Load() {
+		c.closed.Store(true)
+		for _, cancel := range c.cancels {
+			cancel()
+		}
+	}
+	idle := c.idle
+	c.mu.Unlock()
+	<-idle
+	return c.finishClose()
+}
+
+func (c *ownedConnector) closeBoundedFirst(timeout time.Duration) error {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	c.mu.Lock()
+	c.ensureStateLocked()
+	if !c.closed.Load() {
+		c.closed.Store(true)
+		for _, cancel := range c.cancels {
+			cancel()
+		}
+	}
+	idle := c.idle
+	c.mu.Unlock()
+	select {
+	case <-idle:
+		closeResult := make(chan error, 1)
+		go func() {
+			closeResult <- c.finishClose()
+		}()
+		select {
+		case err := <-closeResult:
+			return err
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	case <-ctx.Done():
+		started := make(chan struct{})
+		go c.finishCloseAfterTimeout(idle, started)
+		<-started
+		return ctx.Err()
+	}
+}
+
+func (c *ownedConnector) finishCloseAfterTimeout(
+	idle <-chan struct{},
+	started chan<- struct{},
+) {
+	if started != nil {
+		close(started)
+	}
+	<-idle
+	_ = c.finishClose()
+}
+
+func (c *ownedConnector) finishClose() error {
+	var err error
+	if c.connector != nil {
+		err = errors.Join(err, closeResource("connector", c.connector.Close))
+	}
+	if c.instance != nil {
+		err = errors.Join(err, closeResource("instance", c.instance.Close))
+	}
+	return err
+}
+
+func closeResource(name string, close func() error) (err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("shoal: internal panic closing %s: %v", name, recovered)
+		}
+	}()
+	return close()
+}
+
+func (c *ownedConnector) ensureStateLocked() {
+	if c.nextID == 0 {
+		c.nextID = 1
+	}
+	if c.cancels == nil {
+		c.cancels = make(map[uint64]context.CancelFunc)
+	}
+	if c.idle == nil {
+		c.idle = make(chan struct{})
+		close(c.idle)
+	}
+}
+
+func (c *ownedConnector) releaseActiveLocked() {
+	c.active--
+	if c.active == 0 {
+		close(c.idle)
+	}
 }
 
 func (c *ownedConnector) isClosed() bool {
@@ -85,6 +302,7 @@ var connectors = newConnectorRegistry()
 type ownedScanner struct {
 	single *accumulo.Scanner
 	batch  *accumulo.BatchScanner
+	owner  *ownedConnector
 
 	mu      sync.Mutex
 	closed  bool
@@ -93,10 +311,15 @@ type ownedScanner struct {
 	active  sync.WaitGroup
 }
 
-func newOwnedScanner(single *accumulo.Scanner, batch *accumulo.BatchScanner) *ownedScanner {
+func newOwnedScanner(
+	single *accumulo.Scanner,
+	batch *accumulo.BatchScanner,
+	owner *ownedConnector,
+) *ownedScanner {
 	return &ownedScanner{
 		single:  single,
 		batch:   batch,
+		owner:   owner,
 		nextID:  1,
 		cancels: make(map[uint64]context.CancelFunc),
 	}
@@ -108,7 +331,26 @@ func (s *ownedScanner) begin(timeout time.Duration) (context.Context, func(), er
 		s.mu.Unlock()
 		return nil, nil, accumulo.ErrConnectorClosed
 	}
-	var id uint64
+	var ownerDone func()
+	if s.owner != nil {
+		var err error
+		ownerDone, err = s.owner.retain()
+		if err != nil {
+			s.mu.Unlock()
+			return nil, nil, err
+		}
+	}
+	var (
+		id     uint64
+		ctx    context.Context
+		cancel context.CancelFunc
+	)
+	var err error
+	defer func() {
+		if err != nil && ownerDone != nil {
+			ownerDone()
+		}
+	}()
 	for attempts := uint64(0); attempts < ^uint64(0); attempts++ {
 		id = s.nextID
 		s.nextID++
@@ -124,10 +366,9 @@ func (s *ownedScanner) begin(timeout time.Duration) (context.Context, func(), er
 	}
 	if id == 0 {
 		s.mu.Unlock()
-		return nil, nil, errors.New("shoal: scanner operation space exhausted")
+		err = errors.New("shoal: scanner operation space exhausted")
+		return nil, nil, err
 	}
-	var ctx context.Context
-	var cancel context.CancelFunc
 	if timeout == 0 {
 		ctx, cancel = context.WithCancel(context.Background())
 	} else {
@@ -145,6 +386,9 @@ func (s *ownedScanner) begin(timeout time.Duration) (context.Context, func(), er
 			s.mu.Unlock()
 			cancel()
 			s.active.Done()
+			if ownerDone != nil {
+				ownerDone()
+			}
 		})
 	}
 	return ctx, done, nil
