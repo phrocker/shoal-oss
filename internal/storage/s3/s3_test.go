@@ -297,7 +297,7 @@ func TestNextTemporaryStageKeyRetainsDeepPrefixNearMaxBytes(t *testing.T) {
 		randomStageKeyToken = original
 	})
 
-	key := strings.Repeat("a", 1004) + "/x"
+	key := strings.Repeat("a", 1015) + "/x"
 	stageKey, err := nextTemporaryStageKey(key)
 	if err != nil {
 		t.Fatalf("nextTemporaryStageKey: %v", err)

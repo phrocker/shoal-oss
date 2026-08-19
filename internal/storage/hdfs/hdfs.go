@@ -2,9 +2,12 @@
 package hdfs
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"io/fs"
 	"net"
@@ -338,6 +341,7 @@ func (b *Backend) Create(ctx context.Context, objectPath string) (storage.Writer
 		ctx:                 ctx,
 		temp:                tempPath,
 		target:              resolved,
+		digest:              sha256.New(),
 	}
 	if err := b.registerHandle(w.shutdown, func(done func()) { w.complete = done }); err != nil {
 		_ = w.shutdown()
@@ -1010,6 +1014,8 @@ type replaceWriter struct {
 	aborted             bool
 	writerClosed        bool
 	state               replacementState
+	digest              hash.Hash
+	written             int64
 	complete            func()
 }
 
@@ -1028,7 +1034,12 @@ func (w *replaceWriter) Write(p []byte) (int, error) {
 	if w.closed || w.abortRequested {
 		return 0, errors.New("hdfs: write after close")
 	}
-	return w.writer.Write(p)
+	n, err := w.writer.Write(p)
+	if n > 0 {
+		_, _ = w.digest.Write(p[:n])
+		w.written += int64(n)
+	}
+	return n, err
 }
 
 func (w *replaceWriter) Close() (retErr error) {
@@ -1100,6 +1111,18 @@ func (w *replaceWriter) commitReplacement() error {
 				w.state = replacementCommitted
 				return nil
 			}
+			targetPresent, targetMatches, inspectErr := w.inspectPublishedTargetAfterBackupDelete()
+			if inspectErr != nil {
+				w.state = replacementUnabortable
+				return errors.Join(cleanupErr, inspectErr)
+			}
+			if targetPresent && !targetMatches {
+				w.state = replacementUnabortable
+				return errors.Join(
+					cleanupErr,
+					fmt.Errorf("hdfs: destination %s changed concurrently; refusing to roll it back", w.target),
+				)
+			}
 			if rollbackErr := withCleanupContext(func(cleanupCtx context.Context) error {
 				return w.withCleanupClientContext(cleanupCtx, func(client Client) error {
 					return w.rollbackPublishedReplacement(cleanupCtx, client, backup)
@@ -1116,6 +1139,13 @@ func (w *replaceWriter) commitReplacement() error {
 
 func (w *replaceWriter) rollbackPublishedReplacement(ctx context.Context, client Client, backup string) error {
 	if err := renameWithContext(ctx, client, w.target, w.temp); err != nil {
+		if isNotFound(err) {
+			if restoreErr := renameWithContext(ctx, client, backup, w.target); restoreErr != nil {
+				return fmt.Errorf("hdfs: restore existing file %s after published file disappeared: %w", w.target, restoreErr)
+			}
+			w.state = replacementStaged
+			return nil
+		}
 		return fmt.Errorf("hdfs: roll back published file %s: %w", w.target, err)
 	}
 	if err := renameWithContext(ctx, client, backup, w.target); err != nil {
@@ -1517,8 +1547,14 @@ func (w *replaceWriter) resolveBackupRenameAmbiguity(ctx context.Context, backup
 		if err != nil {
 			return fmt.Errorf("hdfs: inspect replacement backup %s after backup rename failure: %w", backup, err)
 		}
-		if targetExists || !backupExists {
+		if targetExists && backupExists {
+			return fmt.Errorf("hdfs: destination %s was concurrently recreated while backup %s exists", w.target, backup)
+		}
+		if targetExists {
 			return nil
+		}
+		if !backupExists {
+			return fmt.Errorf("hdfs: destination and backup are both absent after ambiguous preserve rename")
 		}
 		if err := renameWithContext(ctx, client, backup, w.target); err != nil {
 			return fmt.Errorf("hdfs: restore existing file %s from %s after backup rename failure: %w", w.target, backup, err)
@@ -1540,6 +1576,61 @@ func (w *replaceWriter) backupExistsWithCleanupContext(backup string) (bool, err
 		})
 	})
 	return exists, err
+}
+
+func (w *replaceWriter) inspectPublishedTargetAfterBackupDelete() (present, matches bool, retErr error) {
+	err := withCleanupContext(func(ctx context.Context) error {
+		return w.withCleanupClientContext(ctx, func(client Client) error {
+			var err error
+			present, err = pathExists(client, w.target)
+			if err != nil {
+				return fmt.Errorf("hdfs: inspect destination %s after backup delete failure: %w", w.target, err)
+			}
+			if !present {
+				return nil
+			}
+			matches, err = fileMatches(ctx, client, w.target, w.written, w.digest.Sum(nil))
+			if err != nil {
+				return fmt.Errorf("hdfs: verify destination %s after backup delete failure: %w", w.target, err)
+			}
+			return nil
+		})
+	})
+	return present, matches, err
+}
+
+func fileMatches(ctx context.Context, client Client, name string, size int64, digest []byte) (bool, error) {
+	reader, err := client.Open(name)
+	if err != nil {
+		return false, err
+	}
+	defer reader.Close()
+	if reader.Stat().Size() != size {
+		return false, nil
+	}
+	h := sha256.New()
+	buf := make([]byte, 64*1024)
+	for off := int64(0); off < size; {
+		if err := contextOrBackground(ctx).Err(); err != nil {
+			return false, err
+		}
+		want := int64(len(buf))
+		if remaining := size - off; remaining < want {
+			want = remaining
+		}
+		n, readErr := reader.ReadAt(buf[:want], off)
+		if n > 0 {
+			_, _ = h.Write(buf[:n])
+			off += int64(n)
+		}
+		if readErr != nil && !errors.Is(readErr, io.EOF) {
+			return false, readErr
+		}
+		if n == 0 {
+			break
+		}
+	}
+	return bytes.Equal(h.Sum(nil), digest), nil
 }
 
 func (w *replaceWriter) withCleanupClientContext(ctx context.Context, fn func(Client) error) (retErr error) {

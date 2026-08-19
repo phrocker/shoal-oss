@@ -160,7 +160,7 @@ func TestNextTemporaryObjectNameSupportsMaxUTF8ByteName(t *testing.T) {
 	}
 }
 
-func TestNextTemporaryObjectNameFallsBackToAncestorPrefixWhenParentIsTooLong(t *testing.T) {
+func TestNextTemporaryObjectNameRetainsParentPrefixWhenSpaceIsTight(t *testing.T) {
 	originalToken := randomTempObjectToken
 	randomTempObjectToken = func() (string, error) {
 		return strings.Repeat("d", tempObjectRandomHexLen), nil
@@ -174,8 +174,8 @@ func TestNextTemporaryObjectNameFallsBackToAncestorPrefixWhenParentIsTooLong(t *
 	if err != nil {
 		t.Fatalf("nextTemporaryObjectName: %v", err)
 	}
-	if got := tempObjectParentPrefix(tempName); got != "" {
-		t.Fatalf("temp prefix = %q, want root fallback for a too-long parent prefix", got)
+	if got, want := tempObjectParentPrefix(tempName), tempObjectParentPrefix(object); got != want {
+		t.Fatalf("temp prefix = %q, want permission-compatible prefix %q", got, want)
 	}
 	if len(tempName) > maxObjectNameBytes {
 		t.Fatalf("temp object length = %d bytes, want <= %d", len(tempName), maxObjectNameBytes)

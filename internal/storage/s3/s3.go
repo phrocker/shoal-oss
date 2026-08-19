@@ -260,20 +260,19 @@ func nextTemporaryStageKey(key string) (string, error) {
 	if len(hashHex) < tempStageHashHexLen || len(token) < tempStageRandomHexLen {
 		return "", fmt.Errorf("temporary key token material too short")
 	}
-	component := tempStageKeyPrefix + hashHex[:tempStageHashHexLen] + token[:tempStageRandomHexLen]
-	if len(prefix)+len(component) > maxObjectKeyBytes {
-		return "", fmt.Errorf("temporary key exceeds %d-byte S3 object-key limit", maxObjectKeyBytes)
+	component := tempStageKeyPrefix + token[:tempStageRandomHexLen] + hashHex[:tempStageHashHexLen]
+	available := maxObjectKeyBytes - len(prefix)
+	if available < 1 {
+		return "", fmt.Errorf("key prefix %q leaves no room for a temporary object", prefix)
+	}
+	if len(component) > available {
+		component = component[:available]
 	}
 	return prefix + component, nil
 }
 
 func temporaryStageKeyPrefixFor(key string) string {
-	prefix := stageKeyParentPrefix(key)
-	for prefix != "" && maxObjectKeyBytes-len(prefix) < tempStageComponentLen {
-		trimmed := strings.TrimSuffix(prefix, "/")
-		prefix = stageKeyParentPrefix(trimmed)
-	}
-	return prefix
+	return stageKeyParentPrefix(key)
 }
 
 func stageKeyParentPrefix(key string) string {
@@ -289,7 +288,7 @@ func isTemporaryStageKey(key string) bool {
 		name = name[idx+1:]
 	}
 	return strings.HasPrefix(key, legacyStageDirPrefix) ||
-		(len(name) == tempStageComponentLen && strings.HasPrefix(name, tempStageKeyPrefix))
+		strings.HasPrefix(name, tempStageKeyPrefix)
 }
 
 // file is the S3 File implementation. Each ReadAt issues a fresh Range GET —
