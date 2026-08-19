@@ -1941,7 +1941,9 @@ void shoal_bridge_bytes_list_free(shoal_bytes_list_result *result) {
 }
 
 shoal_error *shoal_bridge_error_alloc(
-    shoal_status code, const char *message, size_t message_length,
+    shoal_status code, shoal_error_source_class source,
+    shoal_error_compatibility_class compatibility, const char *message,
+    size_t message_length,
     const char *security_user, size_t security_user_length,
     const char *security_code, size_t security_code_length) {
   if ((message == NULL && message_length != 0) || message_length == SIZE_MAX ||
@@ -1988,6 +1990,8 @@ shoal_error *shoal_bridge_error_alloc(
   error->security_user[security_user_length] = '\0';
   error->security_code[security_code_length] = '\0';
   error->code = code;
+  error->source = source;
+  error->compatibility = compatibility;
   return error;
 }
 
@@ -2010,6 +2014,36 @@ char *shoal_bridge_error_security_code(const shoal_error *error) {
   return error == NULL || error->security_code[0] == '\0'
              ? NULL
              : error->security_code;
+}
+
+shoal_error_source_class shoal_bridge_error_source(const shoal_error *error) {
+  return error == NULL ? SHOAL_ERROR_SOURCE_RUNTIME : error->source;
+}
+
+const char *shoal_bridge_error_source_name(const shoal_error *error) {
+  switch (shoal_bridge_error_source(error)) {
+  case SHOAL_ERROR_SOURCE_CLIENT_EXCEPTION:
+    return "ClientException";
+  case SHOAL_ERROR_SOURCE_ILLEGAL_STATE_EXCEPTION:
+    return "IllegalStateException";
+  case SHOAL_ERROR_SOURCE_ITERATION_INTERRUPTED_EXCEPTION:
+    return "IterationInterruptedException";
+  default:
+    return "RuntimeError";
+  }
+}
+
+shoal_error_compatibility_class
+shoal_bridge_error_compatibility(const shoal_error *error) {
+  return error == NULL ? SHOAL_ERROR_COMPATIBILITY_RUNTIME_ERROR
+                       : error->compatibility;
+}
+
+const char *shoal_bridge_error_compatibility_name(const shoal_error *error) {
+  return shoal_bridge_error_compatibility(error) ==
+                 SHOAL_ERROR_COMPATIBILITY_CLIENT_EXCEPTION
+             ? "ClientException"
+             : "RuntimeError";
 }
 
 void shoal_bridge_error_free(shoal_error *error) {

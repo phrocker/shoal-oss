@@ -57,6 +57,8 @@ struct shoal_accumulo_writer {
 
 struct shoal_error {
   shoal_status code;
+  shoal_error_source_class source;
+  shoal_error_compatibility_class compatibility;
   char *message;
   char *security_user;
   char *security_code;
@@ -524,13 +526,20 @@ int shoal_bridge_bytes_list_get(const shoal_bytes_list_result *result,
 void shoal_bridge_bytes_list_free(shoal_bytes_list_result *result);
 
 shoal_error *shoal_bridge_error_alloc(
-    shoal_status code, const char *message, size_t message_length,
+    shoal_status code, shoal_error_source_class source,
+    shoal_error_compatibility_class compatibility, const char *message,
+    size_t message_length,
     const char *security_user, size_t security_user_length,
     const char *security_code, size_t security_code_length);
 shoal_status shoal_bridge_error_code(const shoal_error *error);
 char *shoal_bridge_error_message(const shoal_error *error);
 char *shoal_bridge_error_security_user(const shoal_error *error);
 char *shoal_bridge_error_security_code(const shoal_error *error);
+shoal_error_source_class shoal_bridge_error_source(const shoal_error *error);
+const char *shoal_bridge_error_source_name(const shoal_error *error);
+shoal_error_compatibility_class
+shoal_bridge_error_compatibility(const shoal_error *error);
+const char *shoal_bridge_error_compatibility_name(const shoal_error *error);
 void shoal_bridge_error_free(shoal_error *error);
 
 void shoal_bridge_connector_config_init(shoal_connector_config *config);

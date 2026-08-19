@@ -10,7 +10,7 @@ static_assert(std::is_same<shoal_abi_capability_bits, std::uint64_t>::value,
               "capability bitset words must remain 64-bit");
 static_assert(SHOAL_ABI_VERSION == 1u, "unexpected ABI version");
 static_assert(SHOAL_ABI_VERSION_MAJOR == 1u, "unexpected ABI major");
-static_assert(SHOAL_ABI_VERSION_MINOR == 11u, "unexpected ABI minor");
+static_assert(SHOAL_ABI_VERSION_MINOR == 12u, "unexpected ABI minor");
 static_assert(SHOAL_ABI_VERSION_PATCH == 0u, "unexpected ABI patch");
 static_assert(SHOAL_ABI_VERSION_PACKED ==
                   SHOAL_ABI_PACK_VERSION(SHOAL_ABI_VERSION_MAJOR,
@@ -47,9 +47,11 @@ static_assert(SHOAL_ABI_CAPABILITY_HIGH_LEVEL_CLIENT == 21u,
               "unexpected high-level client capability id");
 static_assert(SHOAL_ABI_CAPABILITY_HIGH_LEVEL_SCANNER == 22u,
               "unexpected high-level scanner capability id");
-static_assert(SHOAL_ABI_CAPABILITY_COUNT == 23u,
+static_assert(SHOAL_ABI_CAPABILITY_COMPATIBILITY_ERRORS == 23u,
+              "unexpected compatibility errors capability id");
+static_assert(SHOAL_ABI_CAPABILITY_COUNT == 24u,
               "unexpected capability count");
-static_assert(SHOAL_ABI_CAPABILITY_WORD0 == 0x00000000007fffffull,
+static_assert(SHOAL_ABI_CAPABILITY_WORD0 == 0x0000000000ffffffull,
               "unexpected capability word 0");
 static_assert(std::is_standard_layout<shoal_connector_identity_view>::value,
               "identity view must remain standard-layout");
@@ -110,6 +112,11 @@ int main() {
   shoal_connector *connector = nullptr;
   shoal_client *client = nullptr;
   shoal_error *error = nullptr;
+  assert(shoal_error_source(nullptr) == SHOAL_ERROR_SOURCE_RUNTIME);
+  assert(shoal_error_compatibility(nullptr) ==
+         SHOAL_ERROR_COMPATIBILITY_RUNTIME_ERROR);
+  assert(shoal_error_source_name(nullptr) != nullptr);
+  assert(shoal_error_compatibility_name(nullptr) != nullptr);
   shoal_table_list_result *tables = nullptr;
   shoal_table_properties_result *properties = nullptr;
   shoal_table_view table{};
