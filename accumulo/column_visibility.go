@@ -682,11 +682,20 @@ func (e *VisibilityEvaluator) Evaluate(expression []byte) (bool, error) {
 }
 
 // EvaluateTree reports whether the authorizations satisfy an already parsed
-// tree read out of expression.
+// tree read out of expression. The tree must be the one this expression
+// produced: a mismatch is rejected rather than decided, because a tree paired
+// with the wrong expression reads its terms out of the wrong bytes.
 func (e *VisibilityEvaluator) EvaluateTree(
 	expression []byte,
 	root VisibilityNode,
 ) (bool, error) {
+	if !bytes.Equal(expression, root.expression) {
+		return false, visibilityError(
+			"tree was parsed from a different expression",
+			expression,
+			0,
+		)
+	}
 	if len(expression) == 0 {
 		return true, nil
 	}

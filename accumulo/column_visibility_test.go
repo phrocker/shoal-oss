@@ -524,8 +524,31 @@ func TestVisibilityEvaluatorUsesTheParsedTree(t *testing.T) {
 	if err != nil || !visible {
 		t.Fatalf("EvaluateTree = %v, %v", visible, err)
 	}
-	if visible, err := evaluator.EvaluateTree(nil, visibility.Tree()); err != nil || !visible {
-		t.Fatalf("EvaluateTree with an empty expression = %v, %v", visible, err)
+	var emptyRoot VisibilityNode
+	if visible, err := evaluator.EvaluateTree(nil, emptyRoot); err != nil || !visible {
+		t.Fatalf("EvaluateTree with an empty expression and root = %v, %v", visible, err)
+	}
+}
+
+func TestVisibilityEvaluatorRejectsATreeFromAnotherExpression(t *testing.T) {
+	evaluator := NewVisibilityEvaluator(NewAuthorizations())
+	secret := mustVisibility(t, "secret")
+	for _, expression := range [][]byte{nil, []byte{}, []byte("secre"), []byte("public")} {
+		visible, err := evaluator.EvaluateTree(expression, secret.Tree())
+		if err == nil {
+			t.Fatalf("EvaluateTree(%q, secret) = %v with no error", expression, visible)
+		}
+		if visible {
+			t.Fatalf("EvaluateTree(%q, secret) = true", expression)
+		}
+		if !errors.Is(err, ErrVisibilityParse) {
+			t.Fatalf("EvaluateTree(%q, secret) error = %v", expression, err)
+		}
+	}
+	// A truncated expression must not let AND short-circuiting decide.
+	both := mustVisibility(t, "a&b")
+	if _, err := evaluator.EvaluateTree([]byte("a&"), both.Tree()); err == nil {
+		t.Fatal("a truncated expression was accepted")
 	}
 }
 
