@@ -254,7 +254,10 @@ func Copy(ctx context.Context, src Backend, srcPath string, dst Backend, dstPath
 	}
 	in, err := src.Open(ctx, srcPath)
 	if err != nil {
-		return 0, fmt.Errorf("copy: open src %s: %w", srcPath, joinContextCallError(err, ctx.Err()))
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return 0, fmt.Errorf("copy: open src %s: %w", srcPath, joinContextCallError(err, ctxErr))
+		}
+		return 0, fmt.Errorf("copy: open src %s: %w", srcPath, err)
 	}
 	defer in.Close()
 	if err := ctx.Err(); err != nil {
@@ -262,7 +265,10 @@ func Copy(ctx context.Context, src Backend, srcPath string, dst Backend, dstPath
 	}
 	out, err := wb.Create(ctx, dstPath)
 	if err != nil {
-		return 0, fmt.Errorf("copy: create dst %s: %w", dstPath, joinContextCallError(err, ctx.Err()))
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return 0, fmt.Errorf("copy: create dst %s: %w", dstPath, joinContextCallError(err, ctxErr))
+		}
+		return 0, fmt.Errorf("copy: create dst %s: %w", dstPath, err)
 	}
 	var cleanupState WriteCleanupState
 	defer AbortOnError(&err, out, &cleanupState)
@@ -347,7 +353,10 @@ func ReadAll(ctx context.Context, b Backend, path string) ([]byte, error) {
 	}
 	f, err := b.Open(ctx, path)
 	if err != nil {
-		return nil, joinContextCallError(err, ctx.Err())
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, joinContextCallError(err, ctxErr)
+		}
+		return nil, err
 	}
 	defer f.Close()
 	if err := ctx.Err(); err != nil {
@@ -398,7 +407,10 @@ func WriteAll(ctx context.Context, b Backend, path string, data []byte) (err err
 	}
 	w, err := wb.Create(ctx, path)
 	if err != nil {
-		return fmt.Errorf("writeall: create %s: %w", path, joinContextCallError(err, ctx.Err()))
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return fmt.Errorf("writeall: create %s: %w", path, joinContextCallError(err, ctxErr))
+		}
+		return fmt.Errorf("writeall: create %s: %w", path, err)
 	}
 	var cleanupState WriteCleanupState
 	defer AbortOnError(&err, w, &cleanupState)

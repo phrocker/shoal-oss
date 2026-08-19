@@ -175,58 +175,28 @@ func TestReadAll_CanceledDuringOpenDoesNotReturnEmptySuccess(t *testing.T) {
 	}
 }
 
-func TestHelpersJoinCancellationWithOpenAndCreateErrors(t *testing.T) {
-	callErr := errors.New("backend call failed")
+func TestReadAll_CanceledOpenJoinsBackendError(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	openErr := errors.New("open failed")
+	entered := make(chan struct{})
+	backend := openFuncBackend(func(ctx context.Context, _ string) (storage.File, error) {
+		close(entered)
+		<-ctx.Done()
+		return nil, openErr
+	})
+	done := make(chan error, 1)
 
-	t.Run("readall open", func(t *testing.T) {
-		ctx, cancel := context.WithCancel(context.Background())
-		backend := openFuncBackend(func(context.Context, string) (storage.File, error) {
-			cancel()
-			return nil, callErr
-		})
+	go func() {
 		_, err := storage.ReadAll(ctx, backend, "/src")
-		if !errors.Is(err, context.Canceled) || !errors.Is(err, callErr) {
-			t.Fatalf("ReadAll error = %v, want joined cancellation and backend error", err)
-		}
-	})
+		done <- err
+	}()
 
-	t.Run("copy open", func(t *testing.T) {
-		ctx, cancel := context.WithCancel(context.Background())
-		src := openFuncBackend(func(context.Context, string) (storage.File, error) {
-			cancel()
-			return nil, callErr
-		})
-		_, err := storage.Copy(ctx, src, "/src", writerBackend{writer: &recordingAbortWriter{}}, "/dst")
-		if !errors.Is(err, context.Canceled) || !errors.Is(err, callErr) {
-			t.Fatalf("Copy open error = %v, want joined cancellation and backend error", err)
-		}
-	})
+	<-entered
+	cancel()
 
-	t.Run("copy create", func(t *testing.T) {
-		ctx, cancel := context.WithCancel(context.Background())
-		src := memory.New()
-		src.Put("/src", []byte("data"))
-		dst := createFuncBackend(func(context.Context, string) (storage.Writer, error) {
-			cancel()
-			return nil, callErr
-		})
-		_, err := storage.Copy(ctx, src, "/src", dst, "/dst")
-		if !errors.Is(err, context.Canceled) || !errors.Is(err, callErr) {
-			t.Fatalf("Copy create error = %v, want joined cancellation and backend error", err)
-		}
-	})
-
-	t.Run("writeall create", func(t *testing.T) {
-		ctx, cancel := context.WithCancel(context.Background())
-		backend := createFuncBackend(func(context.Context, string) (storage.Writer, error) {
-			cancel()
-			return nil, callErr
-		})
-		err := storage.WriteAll(ctx, backend, "/dst", []byte("data"))
-		if !errors.Is(err, context.Canceled) || !errors.Is(err, callErr) {
-			t.Fatalf("WriteAll error = %v, want joined cancellation and backend error", err)
-		}
-	})
+	if err := <-done; !errors.Is(err, openErr) || !errors.Is(err, context.Canceled) {
+		t.Fatalf("ReadAll error = %v, want joined open error and context.Canceled", err)
+	}
 }
 
 func TestReadAll_CanceledReadJoinsBackendError(t *testing.T) {
@@ -387,6 +357,29 @@ func TestCopy_CanceledReadJoinsBackendError(t *testing.T) {
 	}
 }
 
+func TestWriteAll_CanceledCreateJoinsBackendError(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	createErr := errors.New("create failed")
+	entered := make(chan struct{})
+	backend := createFuncBackend(func(ctx context.Context, _ string) (storage.Writer, error) {
+		close(entered)
+		<-ctx.Done()
+		return nil, createErr
+	})
+	done := make(chan error, 1)
+
+	go func() {
+		done <- storage.WriteAll(ctx, backend, "/dst", []byte("hello"))
+	}()
+
+	<-entered
+	cancel()
+
+	if err := <-done; !errors.Is(err, createErr) || !errors.Is(err, context.Canceled) {
+		t.Fatalf("WriteAll error = %v, want joined create error and context.Canceled", err)
+	}
+}
+
 func TestCopy_ReadErrorClosesLegacyWriterOnce(t *testing.T) {
 	readErr := errors.New("read failed")
 	writer := &legacyWriteFuncWriter{
@@ -477,6 +470,74 @@ func TestCopy_CanceledShortWriteJoinsContextError(t *testing.T) {
 	}
 }
 
+func TestCopy_CanceledOpenJoinsBackendError(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	openErr := errors.New("open failed")
+	entered := make(chan struct{})
+	src := openFuncBackend(func(ctx context.Context, _ string) (storage.File, error) {
+		close(entered)
+		<-ctx.Done()
+		return nil, openErr
+	})
+	done := make(chan struct {
+		n   int64
+		err error
+	}, 1)
+
+	go func() {
+		n, err := storage.Copy(ctx, src, "/src", writerBackend{writer: &writeFuncWriter{}}, "/dst")
+		done <- struct {
+			n   int64
+			err error
+		}{n: n, err: err}
+	}()
+
+	<-entered
+	cancel()
+
+	result := <-done
+	if result.n != 0 {
+		t.Fatalf("Copy wrote %d bytes, want 0", result.n)
+	}
+	if !errors.Is(result.err, openErr) || !errors.Is(result.err, context.Canceled) {
+		t.Fatalf("Copy error = %v, want joined open error and context.Canceled", result.err)
+	}
+}
+
+func TestCopy_CanceledCreateJoinsBackendError(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	createErr := errors.New("create failed")
+	entered := make(chan struct{})
+	dst := createFuncBackend(func(ctx context.Context, _ string) (storage.Writer, error) {
+		close(entered)
+		<-ctx.Done()
+		return nil, createErr
+	})
+	done := make(chan struct {
+		n   int64
+		err error
+	}, 1)
+
+	go func() {
+		n, err := storage.Copy(ctx, fileBackend{file: &recordingReadFile{}}, "/src", dst, "/dst")
+		done <- struct {
+			n   int64
+			err error
+		}{n: n, err: err}
+	}()
+
+	<-entered
+	cancel()
+
+	result := <-done
+	if result.n != 0 {
+		t.Fatalf("Copy wrote %d bytes, want 0", result.n)
+	}
+	if !errors.Is(result.err, createErr) || !errors.Is(result.err, context.Canceled) {
+		t.Fatalf("Copy error = %v, want joined create error and context.Canceled", result.err)
+	}
+}
+
 func TestWriteAll_CanceledWriteJoinsBackendError(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	writeErr := errors.New("write failed")
@@ -541,7 +602,7 @@ func (f openFuncBackend) Open(ctx context.Context, path string) (storage.File, e
 
 type createFuncBackend func(context.Context, string) (storage.Writer, error)
 
-func (f createFuncBackend) Open(context.Context, string) (storage.File, error) {
+func (createFuncBackend) Open(context.Context, string) (storage.File, error) {
 	return nil, errors.New("not implemented")
 }
 
