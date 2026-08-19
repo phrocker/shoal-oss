@@ -73,6 +73,36 @@ func TestReconcilePlatformXattrsDoesNotRestoreContentSecurityLabels(t *testing.T
 	}
 }
 
+func TestReconcilePlatformXattrsSkipsSettingMatchingValue(t *testing.T) {
+	setCalls := 0
+	ops := xattrOperations{
+		list: func(path string) ([]string, error) {
+			if path == "target" || path == "temp" {
+				return []string{"security.selinux"}, nil
+			}
+			return nil, nil
+		},
+		get: func(path, name string) ([]byte, error) {
+			if name != "security.selinux" {
+				t.Fatalf("unexpected xattr lookup %s for %s", name, path)
+			}
+			return []byte("system_u:object_r:tmp_t:s0"), nil
+		},
+		set: func(string, string, []byte, int) error {
+			setCalls++
+			return errors.New("unexpected relabel")
+		},
+		remove: func(string, string) error { return nil },
+	}
+
+	if err := reconcilePlatformXattrs("temp", "target", ops); err != nil {
+		t.Fatal(err)
+	}
+	if setCalls != 0 {
+		t.Fatalf("Setxattr calls = %d, want 0 when value already matches", setCalls)
+	}
+}
+
 func mapXattrOperations(attrs map[string]map[string][]byte) xattrOperations {
 	return xattrOperations{
 		list: func(path string) ([]string, error) {

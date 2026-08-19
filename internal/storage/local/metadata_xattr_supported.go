@@ -3,6 +3,7 @@
 package local
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"strings"
@@ -37,11 +38,15 @@ func reconcilePlatformXattrs(temp, target string, ops xattrOperations) error {
 	}
 
 	targetSet := make(map[string]struct{}, len(targetNames))
+	tempSet := make(map[string]struct{}, len(tempNames))
 	for _, name := range targetNames {
 		if !preserveContentXattr(name) {
 			continue
 		}
 		targetSet[name] = struct{}{}
+	}
+	for _, name := range tempNames {
+		tempSet[name] = struct{}{}
 	}
 	for _, name := range tempNames {
 		if _, ok := targetSet[name]; ok {
@@ -58,6 +63,15 @@ func reconcilePlatformXattrs(temp, target string, ops xattrOperations) error {
 		value, err := ops.get(target, name)
 		if err != nil {
 			return fmt.Errorf("local: read extended attribute %s for %s: %w", name, target, err)
+		}
+		if _, ok := tempSet[name]; ok {
+			tempValue, err := ops.get(temp, name)
+			if err != nil {
+				return fmt.Errorf("local: read extended attribute %s for %s: %w", name, temp, err)
+			}
+			if bytes.Equal(tempValue, value) {
+				continue
+			}
 		}
 		if err := ops.set(temp, name, value, 0); err != nil {
 			return fmt.Errorf("local: preserve extended attribute %s for %s: %w", name, target, err)
