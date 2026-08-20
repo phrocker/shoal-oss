@@ -1,7 +1,7 @@
 # Revision-51 Sharkbite client-scope disposition manifest.
 # Matrix: docs/sharkbite-compatibility.md revision 51.
 # Sharkbite source: phrocker/sharkbite@7f2625f74331b0cd4a75dc0484949c40f1409686.
-# Shoal source: phrocker/shoal-oss@9444ce5169b3445ea2370d383ec3dfd8f47f706c.
+# Shoal source: phrocker/shoal-oss@833e9fcb20e500412abed3496b4f967f3ef99a9e.
 # Policy: docs/sharkbite-client-scope.md.
 # Columns: ROW-ID<TAB>DISPOSITION<TAB>RULE<TAB>PINNED-MATRIX-STATUS.
 # Entries are in matrix order; validator rules, not aggregate counts, authorize dispositions.
