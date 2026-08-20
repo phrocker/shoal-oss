@@ -2692,6 +2692,9 @@ int main(void) {
   assert(owned_timestamp == 42);
   assert(shoal_owned_key_set_timestamp(owned_key, 41, &error) ==
          SHOAL_STATUS_OK);
+  assert(shoal_owned_key_timestamp(owned_key, &owned_timestamp, &error) ==
+         SHOAL_STATUS_OK);
+  assert(owned_timestamp == 41);
   expect_error(shoal_owned_key_set_deleted(owned_key, 2, &error),
                SHOAL_STATUS_INVALID_ARGUMENT, &error, "0 or 1");
   assert(shoal_owned_key_set_deleted(owned_key, 1, &error) == SHOAL_STATUS_OK);
