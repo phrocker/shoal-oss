@@ -2114,7 +2114,8 @@ void shoal_bridge_scan_cursor_free(shoal_scan_cursor *cursor) {
 
 shoal_error *shoal_bridge_error_alloc(
     shoal_status code, shoal_error_source_class source,
-    shoal_error_compatibility_class compatibility, const char *message,
+    shoal_error_compatibility_class compatibility, int16_t compatibility_code,
+    const char *message,
     size_t message_length,
     const char *security_user, size_t security_user_length,
     const char *security_code, size_t security_code_length,
@@ -2189,6 +2190,7 @@ shoal_error *shoal_bridge_error_alloc(
   error->code = code;
   error->source = source;
   error->compatibility = compatibility;
+  error->compatibility_code = compatibility_code;
   return error;
 }
 
@@ -2227,6 +2229,10 @@ const char *shoal_bridge_error_source_name(const shoal_error *error) {
     return "IterationInterruptedException";
   case SHOAL_ERROR_SOURCE_VISIBILITY_PARSE_EXCEPTION:
     return "VisibilityParseException";
+  case SHOAL_ERROR_SOURCE_HDFS_EXCEPTION:
+    return "HDFSException";
+  case SHOAL_ERROR_SOURCE_ILLEGAL_ARGUMENT_EXCEPTION:
+    return "IllegalArgumentException";
   default:
     return "RuntimeError";
   }
@@ -2243,6 +2249,10 @@ const char *shoal_bridge_error_compatibility_name(const shoal_error *error) {
                  SHOAL_ERROR_COMPATIBILITY_CLIENT_EXCEPTION
              ? "ClientException"
              : "RuntimeError";
+}
+
+int16_t shoal_bridge_error_compatibility_code(const shoal_error *error) {
+  return error == NULL ? -1 : error->compatibility_code;
 }
 
 int shoal_bridge_error_visibility_parse(
@@ -2274,6 +2284,17 @@ void shoal_bridge_error_free(shoal_error *error) {
     error->visibility_terms = NULL;
     error->visibility_reason = NULL;
     free(error);
+  }
+
+}
+
+void shoal_bridge_log_callback_invoke(shoal_log_callback callback,
+                                      shoal_log_level level,
+                                      const char *event_name,
+                                      const char *attributes_json,
+                                      void *context) {
+  if (callback != NULL) {
+    callback(level, event_name, attributes_json, context);
   }
 }
 

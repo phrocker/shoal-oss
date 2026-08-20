@@ -17,6 +17,7 @@ from sharkbite._native import (
     Range,
 )
 from sharkbite.errors import (
+    CLIENT_ERROR_CODES,
     ClientException,
     InvalidArgumentError,
     InvalidHandleError,
@@ -108,7 +109,7 @@ class FakeLibrary:
 class FakeAPI:
     def __init__(self):
         self.lib = FakeLibrary()
-        self.capabilities = frozenset(range(30))
+        self.capabilities = frozenset(range(31))
 
     def require(self, *capabilities):
         missing = set(capabilities) - self.capabilities
@@ -215,6 +216,35 @@ class FoundationTests(unittest.TestCase):
             exception_for_status(15, "client", compatibility_class=1),
             ClientException,
         )
+        table = exception_for_status(
+            9,
+            "table missing",
+            compatibility_class=1,
+            compatibility_code=9,
+            source_class=1,
+            source_name="ClientException",
+        )
+        self.assertIsInstance(table, ClientException)
+        self.assertEqual(table.getErrorCode(), 9)
+        self.assertEqual(CLIENT_ERROR_CODES[table.getErrorCode()], "Table not found in instance")
+        illegal = exception_for_status(
+            1,
+            "bad argument",
+            compatibility_class=0,
+            source_class=6,
+            source_name="IllegalArgumentException",
+        )
+        self.assertIs(type(illegal), RuntimeError)
+        self.assertEqual(illegal.source_name, "IllegalArgumentException")
+        hdfs = exception_for_status(
+            9,
+            "missing path",
+            compatibility_class=0,
+            source_class=5,
+            source_name="HDFSException",
+        )
+        self.assertIs(type(hdfs), RuntimeError)
+        self.assertEqual(hdfs.source_name, "HDFSException")
 
     def test_capability_negotiation_also_requires_dynamic_symbols(self):
         api = object.__new__(NativeAPI)

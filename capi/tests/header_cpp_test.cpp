@@ -10,7 +10,7 @@ static_assert(std::is_same<shoal_abi_capability_bits, std::uint64_t>::value,
               "capability bitset words must remain 64-bit");
 static_assert(SHOAL_ABI_VERSION == 1u, "unexpected ABI version");
 static_assert(SHOAL_ABI_VERSION_MAJOR == 1u, "unexpected ABI major");
-static_assert(SHOAL_ABI_VERSION_MINOR == 17u, "unexpected ABI minor");
+static_assert(SHOAL_ABI_VERSION_MINOR == 18u, "unexpected ABI minor");
 static_assert(SHOAL_ABI_VERSION_PATCH == 0u, "unexpected ABI patch");
 static_assert(SHOAL_ABI_VERSION_PACKED ==
                   SHOAL_ABI_PACK_VERSION(SHOAL_ABI_VERSION_MAJOR,
@@ -59,9 +59,9 @@ static_assert(SHOAL_ABI_CAPABILITY_HDFS == 27u,
               "unexpected HDFS capability id");
 static_assert(SHOAL_ABI_CAPABILITY_RFILE_LOCALITY_GROUPS == 28u,
               "unexpected RFile locality capability id");
-static_assert(SHOAL_ABI_CAPABILITY_COUNT == 30u,
+static_assert(SHOAL_ABI_CAPABILITY_COUNT == 31u,
               "unexpected capability count");
-static_assert(SHOAL_ABI_CAPABILITY_WORD0 == 0x000000003fffffffull,
+static_assert(SHOAL_ABI_CAPABILITY_WORD0 == 0x000000007fffffffull,
               "unexpected capability word 0");
 static_assert(std::is_standard_layout<shoal_connector_identity_view>::value,
               "identity view must remain standard-layout");

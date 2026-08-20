@@ -1,9 +1,16 @@
 from __future__ import annotations
 
 import ctypes as C
+import json
+import logging
 from enum import IntFlag
 
-from ._native import CAP_CLIENT_PARITY_CONTROLS, NativeAPI
+from ._native import (
+    CAP_CLIENT_PARITY_CONTROLS,
+    CAP_STORAGE_ERROR_PARITY,
+    LogCallback,
+    NativeAPI,
+)
 
 
 class ScannerOptions(IntFlag):
@@ -156,6 +163,9 @@ def unsupported_python_iterator() -> NotImplementedError:
 
 
 class LoggingConfiguration:
+    _callback: LogCallback | None = None
+    _api: NativeAPI | None = None
+
     @staticmethod
     def _set(level: int, api: NativeAPI | None = None) -> None:
         native = api or NativeAPI()
@@ -175,3 +185,40 @@ class LoggingConfiguration:
     @staticmethod
     def disableLogger() -> None:
         LoggingConfiguration._set(0)
+
+    @staticmethod
+    def configure(logger: logging.Logger | None, *, api: NativeAPI | None = None) -> None:
+        native = api or NativeAPI()
+        native.require(CAP_STORAGE_ERROR_PARITY)
+        error = C.c_void_p()
+        if logger is None:
+            callback = LogCallback()
+            status = native.lib.shoal_logging_set_callback(
+                callback, None, C.byref(error)
+            )
+            native.check(status, error)
+            LoggingConfiguration._callback = None
+            LoggingConfiguration._api = None
+            return
+
+        def emit(
+            level: int, event_name: bytes, attributes_json: bytes, _: object
+        ) -> None:
+            try:
+                attributes = json.loads((attributes_json or b"{}").decode())
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                attributes = {}
+            python_level = logging.DEBUG if level >= 1 else logging.INFO
+            logger.log(
+                python_level,
+                (event_name or b"shoal").decode("utf-8", "replace"),
+                extra={"shoal": attributes},
+            )
+
+        callback = LogCallback(emit)
+        status = native.lib.shoal_logging_set_callback(
+            callback, None, C.byref(error)
+        )
+        native.check(status, error)
+        LoggingConfiguration._callback = callback
+        LoggingConfiguration._api = native

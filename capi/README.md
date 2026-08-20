@@ -45,7 +45,7 @@ Shoal separates **ABI compatibility** from **feature availability**:
   stable allocation-free version tuple that works before connector creation.
   `SHOAL_ABI_VERSION_PACKED` uses
   `SHOAL_ABI_PACK_VERSION(major, minor, patch)` with a hexadecimal
-  `0x00MMmmpp` layout, so ABI `1.17.0` is `0x00011100`.
+  `0x00MMmmpp` layout, so ABI `1.18.0` is `0x00011200`.
 - Capability identifiers are append-only. Existing IDs and bits never change
   meaning. `shoal_abi_capability_word_count()` reports how many 64-bit words
   the current library uses, `shoal_abi_capability_word(i)` returns `0` for
@@ -86,6 +86,7 @@ Current capability assignments (`word 0 == 0x000000003fffffff`):
 | `SHOAL_ABI_CAPABILITY_HDFS` | `0x8000000` | Hadoop-configured HDFS client, owned streams, metadata, list/stat/remove/rename, cancellation, and deadlines |
 | `SHOAL_ABI_CAPABILITY_RFILE_LOCALITY_GROUPS` | `0x10000000` | named locality-group transitions on owned RFile writers |
 | `SHOAL_ABI_CAPABILITY_CLIENT_PARITY_CONTROLS` | `0x20000000` | exact batch-writer buffered-mutation size and process-wide logging level control |
+| `SHOAL_ABI_CAPABILITY_STORAGE_ERROR_PARITY` | `0x40000000` | HDFS mkdir/chown, synchronized structured-log callbacks, and explicit Sharkbite compatibility error codes |
 
 Shoal does **not** advertise instance status, compaction/import/export,
 Python/wheel, or any other unimplemented surface until the API exists and has
