@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes as C
+import time
 from dataclasses import dataclass
 from typing import Iterator, Sequence
 
@@ -116,6 +117,32 @@ class Connector:
     def __enter__(self) -> Connector:
         return self
 
+    def mutation(self, row: str | bytes) -> object:
+        from .writer import Mutation
+        return Mutation(row, _api=self._api)
+
+    def create_batch_writer(
+        self, table: str, *, options: object | None = None
+    ) -> object:
+        from .writer import BatchWriter
+        return BatchWriter(self, table, options=options)
+
+    def tableOps(self, table: str) -> object:
+        from .admin import TableOperations
+        return TableOperations(self, table)
+
+    def namespaceOps(self) -> object:
+        from .admin import NamespaceOperations
+        return NamespaceOperations(self)
+
+    def securityOps(self) -> object:
+        from .admin import SecurityOperations
+        return SecurityOperations(self)
+
+    def tableInfo(self) -> object:
+        from .admin import TableInfo
+        return TableInfo(self)
+
     def __exit__(self, *_: object) -> None:
         self.close()
 
@@ -208,6 +235,28 @@ class Client:
 
     def scanner(self) -> Scanner:
         return Scanner(self)
+
+    def list_tables(self, *, timeout_ms: int = 0) -> dict[str, str]:
+        from ._native import TableView
+        result = C.c_void_p()
+        error = C.c_void_p()
+        status = self._api.lib.shoal_client_list_tables(
+            self._handle, timeout_ms, C.byref(result), C.byref(error)
+        )
+        self._api.check(status, error)
+        tables: dict[str, str] = {}
+        try:
+            for index in range(self._api.lib.shoal_table_list_count(result)):
+                view = TableView()
+                item_error = C.c_void_p()
+                item_status = self._api.lib.shoal_table_list_get(
+                    result, index, C.byref(view), C.byref(item_error)
+                )
+                self._api.check(item_status, item_error)
+                tables[view.name.decode()] = view.id.decode()
+        finally:
+            self._api.lib.shoal_table_list_free(C.byref(result))
+        return tables
 
     def scan(
         self,
@@ -322,10 +371,8 @@ class Scanner:
 
 
 class AccumuloBase(Client):
-    def list_tables(self) -> None:
-        raise NotImplementedError(
-            "legacy list_tables is not part of the first Python delivery slice"
-        )
+    def list_tables(self, *, timeout_ms: int = 0) -> list[str]:
+        return list(super().list_tables(timeout_ms=timeout_ms))
 
 
 class AccumuloScanner(AccumuloBase):
@@ -347,10 +394,117 @@ class AccumuloScanner(AccumuloBase):
 
 
 class AccumuloWriter:
-    def __init__(self, *_: object, **__: object) -> None:
-        raise NotImplementedError(
-            "AccumuloWriter is not part of the first Python delivery slice"
+    def __init__(
+        self,
+        instance: str,
+        zookeepers: str,
+        username: str,
+        password: str | bytes,
+        table: str | None = None,
+        auths: Sequence[str | bytes] | None = None,
+        *,
+        threads: int = 10,
+        accumulo_version: str = "4.0.0-SNAPSHOT",
+        library: str | None = None,
+        _api: NativeAPI | None = None,
+    ) -> None:
+        del auths
+        if not table:
+            raise ValueError("table is required")
+        from .writer import BatchWriter, BatchWriterOptions
+        self._connector = Connector(
+            instance,
+            zookeepers,
+            username,
+            password,
+            accumulo_version=accumulo_version,
+            library=library,
+            _api=_api,
         )
+        try:
+            self._writer = BatchWriter(
+                self._connector,
+                table,
+                options=BatchWriterOptions(max_write_threads=threads),
+            )
+        except BaseException:
+            self._connector.close()
+            raise
+        self._closed = False
+
+    def put(
+        self,
+        row: str | bytes,
+        cf: str | bytes,
+        cq: str | bytes,
+        cv: str | bytes | None = None,
+        timestamp: int = 0,
+        value: str | bytes | None = None,
+        *,
+        timeout_ms: int = 0,
+    ) -> None:
+        if timestamp == 0:
+            timestamp = int(time.time() * 1000)
+        with self._writer.mutation(row) as mutation:
+            mutation.put(cf, cq, cv or b"", timestamp, value or b"")
+            self._writer.add_mutation(mutation, timeout_ms=timeout_ms)
+
+    def putDelete(
+        self,
+        row: str | bytes,
+        cf: str | bytes,
+        cq: str | bytes,
+        cv: str | bytes = b"",
+        timestamp: int = 0,
+        *,
+        timeout_ms: int = 0,
+    ) -> None:
+        with self._writer.mutation(row) as mutation:
+            mutation.delete(cf, cq, cv, timestamp)
+            self._writer.add_mutation(mutation, timeout_ms=timeout_ms)
+
+    def delete(self, key: Key, *, timeout_ms: int = 0) -> None:
+        self.putDelete(
+            key.row,
+            key.column_family,
+            key.column_qualifier,
+            key.column_visibility,
+            key.timestamp,
+            timeout_ms=timeout_ms,
+        )
+
+    def flush(self, *, timeout_ms: int = 0) -> bool:
+        return self._writer.flush(timeout_ms=timeout_ms)
+
+    def close(self, *, timeout_ms: int = 0) -> None:
+        if self._closed:
+            return
+        writer_error: BaseException | None = None
+        try:
+            self._writer.close(timeout_ms=timeout_ms)
+        except BaseException as exc:
+            writer_error = exc
+        try:
+            self._connector.close()
+        except BaseException:
+            if writer_error is None:
+                raise
+        finally:
+            self._closed = True
+        if writer_error is not None:
+            raise writer_error
+
+    def __enter__(self) -> AccumuloWriter:
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
 
 
 class AccumuloIterator(Iterator[tuple[Key, bytes]]):

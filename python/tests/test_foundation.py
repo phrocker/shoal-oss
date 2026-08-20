@@ -14,7 +14,12 @@ from sharkbite._native import (
     NativeAPI,
     Range,
 )
-from sharkbite.errors import ClientException, InvalidArgumentError, exception_for_status
+from sharkbite.errors import (
+    ClientException,
+    InvalidArgumentError,
+    InvalidHandleError,
+    exception_for_status,
+)
 
 
 class Function:
@@ -154,15 +159,14 @@ class FoundationTests(unittest.TestCase):
         with self.assertRaisesRegex(NotImplementedError, "SB-DIV-016"):
             client.getStatistics()
 
-    def test_unsupported_writer_is_explicit(self):
-        with self.assertRaisesRegex(NotImplementedError, "first Python delivery"):
-            sharkbite.AccumuloWriter()
+    def test_unsupported_scanner_iterator_is_explicit(self):
         scanner = object.__new__(sharkbite.AccumuloScanner)
         with self.assertRaisesRegex(NotImplementedError, "use scan"):
             scanner.get(b"a")
 
     def test_status_and_compatibility_exception_mapping(self):
         self.assertIsInstance(exception_for_status(1, "bad"), InvalidArgumentError)
+        self.assertIsInstance(exception_for_status(2, "handle"), InvalidHandleError)
         self.assertIsInstance(
             exception_for_status(15, "client", compatibility_class=1),
             ClientException,
