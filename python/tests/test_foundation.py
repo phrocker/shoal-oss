@@ -11,6 +11,7 @@ from sharkbite._native import (
     CAP_HIGH_LEVEL_CLIENT,
     CAPABILITY_SYMBOLS,
     Bytes,
+    ClientConfig,
     KeyValueView,
     NativeAPI,
     Range,
@@ -38,6 +39,7 @@ class FakeLibrary:
         self.closed = []
         self.freed = []
         self.result_freed = 0
+        self.authorizations = []
         self._buffers = []
         self.shoal_connector_config_init = Function(self._init)
         self.shoal_client_config_init = Function(self._init)
@@ -62,8 +64,13 @@ class FakeLibrary:
             pointer._obj
         )
 
-    @staticmethod
-    def _create(config, out_handle, error):
+    def _create(self, config, out_handle, error):
+        if isinstance(config._obj, ClientConfig):
+            native = C.cast(config, C.POINTER(ClientConfig)).contents
+            self.authorizations = [
+                C.string_at(native.authorizations[index].data, native.authorizations[index].length)
+                for index in range(native.authorization_count)
+            ]
         C.cast(out_handle, C.POINTER(C.c_void_p)).contents.value = 123
         return 0
 
@@ -162,6 +169,13 @@ class FoundationTests(unittest.TestCase):
         self.assertEqual(api.lib.result_freed, 1)
         self.assertEqual(api.lib.closed, ["client"])
         self.assertEqual(api.lib.freed, ["client"])
+
+    def test_scan_authorizations_are_copied_to_native_enforcement(self):
+        api = FakeAPI()
+        auths = [bytearray(b"blah1")]
+        with Client("i", "zk", "u", "p", table="t", auths=auths, _api=api):
+            auths[0][:] = b"other"
+            self.assertEqual(api.lib.authorizations, [b"blah1"])
 
     def test_approved_divergence_is_explicit(self):
         client = object.__new__(Client)
