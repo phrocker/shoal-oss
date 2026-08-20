@@ -184,8 +184,8 @@ func main() {
 	if *releaseTimeout <= 0 {
 		die("shoal-compactor: -release-timeout must be positive (a job shoal accepted has to be released)")
 	}
-	if *maxInputFiles < 0 || *maxInputBytes < 0 {
-		die("shoal-compactor: -max-input-files and -max-input-bytes must not be negative (use 0 for no limit)")
+	if err := validateLimits(*maxInputFiles, *maxInputBytes, *maxOutputBytes); err != nil {
+		die("shoal-compactor: %v", err)
 	}
 
 	coordinatorSource := *coordinatorAddr
@@ -886,6 +886,25 @@ func parseLogLevel(s string) slog.Level {
 func die(format string, args ...any) {
 	fmt.Fprintf(os.Stderr, format+"\n", args...)
 	os.Exit(1)
+}
+
+// validateLimits rejects negative resource budgets at startup.
+//
+// Zero already means "no limit" on every one of these, so a negative
+// value can only be a typo — and it is the dangerous kind: both the
+// admission check and compaction.Compact treat a non-positive budget as
+// unlimited, so `-max-output-bytes -1` would quietly remove the guard
+// the operator was trying to tighten.
+func validateLimits(maxInputFiles int, maxInputBytes, maxOutputBytes int64) error {
+	switch {
+	case maxInputFiles < 0:
+		return fmt.Errorf("-max-input-files must not be negative (use 0 for no limit), got %d", maxInputFiles)
+	case maxInputBytes < 0:
+		return fmt.Errorf("-max-input-bytes must not be negative (use 0 for no limit), got %d", maxInputBytes)
+	case maxOutputBytes < 0:
+		return fmt.Errorf("-max-output-bytes must not be negative (use 0 for no limit), got %d", maxOutputBytes)
+	}
+	return nil
 }
 
 // sleepCtx sleeps for d, returning true if it slept to completion or

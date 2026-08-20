@@ -1345,3 +1345,41 @@ func TestNewECIDMatchesAccumuloFormat(t *testing.T) {
 		t.Fatalf("Translate(%q) = %v; the id this compactor generates must be one Accumulo accepts", first, err)
 	}
 }
+
+// TestValidateLimitsRejectsNegativeBudgets: a negative budget is not a
+// tighter limit, it is no limit — both the admission check and
+// compaction.Compact read "not positive" as unlimited. A typo that
+// silently removes a memory guard has to fail at startup instead.
+func TestValidateLimitsRejectsNegativeBudgets(t *testing.T) {
+	for _, tt := range []struct {
+		name       string
+		files      int
+		inBytes    int64
+		outBytes   int64
+		wantErrFor string
+	}{
+		{name: "defaults are accepted",
+			files: compactjob.DefaultMaxInputFiles, inBytes: compactjob.DefaultMaxTotalInputBytes,
+			outBytes: compactjob.DefaultMaxOutputBytes},
+		{name: "zero means unlimited everywhere"},
+		{name: "negative input files", files: -1, wantErrFor: "-max-input-files"},
+		{name: "negative input bytes", inBytes: -1, wantErrFor: "-max-input-bytes"},
+		{name: "negative output bytes", outBytes: -1, wantErrFor: "-max-output-bytes"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateLimits(tt.files, tt.inBytes, tt.outBytes)
+			if tt.wantErrFor == "" {
+				if err != nil {
+					t.Fatalf("validateLimits = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("validateLimits accepted a negative %s", tt.wantErrFor)
+			}
+			if !strings.Contains(err.Error(), tt.wantErrFor) {
+				t.Fatalf("error %q does not name %s", err, tt.wantErrFor)
+			}
+		})
+	}
+}

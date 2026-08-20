@@ -112,11 +112,16 @@ type Spec struct {
 	//     LatentEdgeDiscoveryIterator is the in-tree example: it buffers
 	//     vertices and emits link cells that were in no input.
 	//
-	// Enforcement is on the flushed image, checked after every appended
-	// cell and once more after the writer closes. The writer holds at
-	// most one pending data block plus its indexes above that figure, so
-	// a compaction can exceed the cap by roughly BlockSize before the
-	// next check fires; size the budget with that headroom in mind.
+	// Enforcement is at the write boundary: a write that would take the
+	// image over the cap is refused before the buffer grows, so the
+	// image itself never exceeds it. Checking after the fact would not
+	// be equivalent — one cell can be arbitrarily larger than BlockSize,
+	// so a single flush can carry an unbounded amount of data.
+	//
+	// What this does not cover is memory the writer holds outside the
+	// image: the pending, uncompressed data block (BlockSize, or one
+	// oversized cell) and the in-memory index levels. Size the budget
+	// with that headroom in mind.
 	MaxOutputBytes int64
 }
 
@@ -134,6 +139,29 @@ type Result struct {
 // Spec.MaxOutputBytes allows. The compaction is abandoned: callers get
 // no partial Result, because a truncated RFile is not a compaction.
 var ErrOutputTooLarge = errors.New("compaction: output exceeds the configured budget")
+
+// budgetedWriter passes writes through to w until they would take the
+// total past max, then refuses. Refusing before the write lands is the
+// point: it is what keeps the output image inside the budget no matter
+// how large a single block or metadata section is.
+//
+// A max of zero (or less) disables the budget entirely.
+type budgetedWriter struct {
+	w       io.Writer
+	max     int64
+	written int64
+}
+
+func (b *budgetedWriter) Write(p []byte) (int, error) {
+	if b.max > 0 && b.written+int64(len(p)) > b.max {
+		return 0, fmt.Errorf(
+			"compaction: writing %d bytes would take the output to %d bytes, over the %d-byte budget: %w",
+			len(p), b.written+int64(len(p)), b.max, ErrOutputTooLarge)
+	}
+	n, err := b.w.Write(p)
+	b.written += int64(n)
+	return n, err
+}
 
 // Compact runs one compaction described by spec and returns the output
 // RFile bytes. It is the offline-testable core; it performs no I/O
@@ -165,7 +193,7 @@ func Compact(spec Spec) (*Result, error) {
 	}
 
 	var buf bytes.Buffer
-	w, err := rfile.NewWriter(&buf, rfile.WriterOptions{
+	w, err := rfile.NewWriter(&budgetedWriter{w: &buf, max: spec.MaxOutputBytes}, rfile.WriterOptions{
 		Codec:           codec,
 		BlockSize:       spec.BlockSize,
 		AdjacencyEdgeCF: spec.AdjacencyEdgeCF,
@@ -180,9 +208,6 @@ func Compact(spec Spec) (*Result, error) {
 			return nil, fmt.Errorf("compaction: append cell %d: %w", written, err)
 		}
 		written++
-		if err := checkOutputBudget(buf.Len(), written, spec.MaxOutputBytes); err != nil {
-			return nil, err
-		}
 		if err := top.Next(); err != nil {
 			return nil, fmt.Errorf("compaction: advance after cell %d: %w", written-1, err)
 		}
@@ -190,24 +215,8 @@ func Compact(spec Spec) (*Result, error) {
 	if err := w.Close(); err != nil {
 		return nil, fmt.Errorf("compaction: close writer: %w", err)
 	}
-	// Close flushes the pending block and appends the indexes, so the
-	// image only reaches its final size here. A compaction that stayed
-	// under budget cell-by-cell can still land over it.
-	if err := checkOutputBudget(buf.Len(), written, spec.MaxOutputBytes); err != nil {
-		return nil, err
-	}
 
 	return &Result{Output: buf.Bytes(), EntriesWritten: written}, nil
-}
-
-// checkOutputBudget reports ErrOutputTooLarge when the flushed output
-// image has outgrown max. A max of zero disables the check.
-func checkOutputBudget(size int, written, max int64) error {
-	if max <= 0 || int64(size) <= max {
-		return nil
-	}
-	return fmt.Errorf("compaction: output reached %d bytes after %d cells, over the %d-byte budget: %w",
-		size, written, max, ErrOutputTooLarge)
 }
 
 // StreamCells drains the compaction source for spec — the merged,

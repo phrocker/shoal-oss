@@ -363,22 +363,19 @@ func TestCompact_OutputBudgetStopsALongCompaction(t *testing.T) {
 		t.Fatalf("Compact err = %v, want ErrOutputTooLarge", err)
 	}
 
-	var size, written int64
-	if _, e := fmt.Sscanf(err.Error(), "compaction: output reached %d bytes after %d cells", &size, &written); e != nil {
-		t.Fatalf("error %q does not report size and cell count: %v", err, e)
+	var appended int64
+	if _, e := fmt.Sscanf(err.Error(), "compaction: append cell %d:", &appended); e != nil {
+		t.Fatalf("error %q did not surface from the append loop: %v", err, e)
 	}
-	if written >= cells {
-		t.Errorf("gave up after %d of %d cells; the budget should stop the append loop, not just the final image", written, cells)
-	}
-	if size <= 64*1024 {
-		t.Errorf("reported size %d is within the 65536-byte budget", size)
+	if appended >= cells {
+		t.Errorf("gave up after %d of %d cells; the budget should stop the append loop, not just the final image", appended, cells)
 	}
 }
 
 // TestCompact_OutputBudgetCatchesTheClosingFlush: a small compaction
-// never flushes a block while appending, so its whole image appears when
-// the writer closes. The budget has to be rechecked there or a job that
-// looked free cell-by-cell escapes it entirely.
+// never flushes a block while appending, so its whole image is written
+// when the writer closes. The budget has to cover those writes too, or
+// a job that looked free cell-by-cell escapes it entirely.
 func TestCompact_OutputBudgetCatchesTheClosingFlush(t *testing.T) {
 	in := []kv{
 		{mk("a", "cf", "q", 10), "va"},
@@ -393,8 +390,87 @@ func TestCompact_OutputBudgetCatchesTheClosingFlush(t *testing.T) {
 	if !errors.Is(err, ErrOutputTooLarge) {
 		t.Fatalf("Compact err = %v, want ErrOutputTooLarge", err)
 	}
-	if !strings.Contains(err.Error(), "after 3 cells") {
-		t.Errorf("error %q should report all 3 cells appended before the close-time check", err)
+	if !strings.Contains(err.Error(), "close writer") {
+		t.Errorf("error %q should surface from Close: nothing is written before it for a 3-cell file", err)
+	}
+}
+
+// TestCompact_OutputBudgetRefusesTheWriteRatherThanNoticingAfterwards:
+// a cell can be arbitrarily larger than BlockSize, so a single flush can
+// carry an unbounded amount of data. The budget has to refuse that write
+// instead of measuring the buffer once it has already grown — otherwise
+// one oversized value defeats it exactly when it matters most.
+func TestCompact_OutputBudgetRefusesTheWriteRatherThanNoticingAfterwards(t *testing.T) {
+	const budget = 4096
+	huge := make([]byte, 8*1024*1024)
+	for i := range huge {
+		huge[i] = byte(i * 7)
+	}
+
+	_, err := Compact(Spec{
+		Inputs: []Input{{Name: "one-huge-cell", Bytes: buildRFile(t, []kv{
+			{mk("a", "cf", "q", 10), string(huge)},
+		})}},
+		Scope:          iterrt.ScopeMajc,
+		Codec:          block.CodecNone,
+		MaxOutputBytes: budget,
+	})
+	if !errors.Is(err, ErrOutputTooLarge) {
+		t.Fatalf("Compact err = %v, want ErrOutputTooLarge", err)
+	}
+
+	var attempted, would int64
+	if _, e := fmt.Sscanf(errText(err, "compaction: writing "),
+		"compaction: writing %d bytes would take the output to %d bytes", &attempted, &would); e != nil {
+		t.Fatalf("error %q does not report a refused write: %v", err, e)
+	}
+	if attempted <= budget {
+		t.Errorf("refused write was %d bytes, which fits in the %d-byte budget", attempted, budget)
+	}
+	if would <= budget {
+		t.Errorf("refused write would have reached %d bytes, within the %d-byte budget", would, budget)
+	}
+}
+
+// errText returns the suffix of err's message starting at prefix, so a
+// test can Sscanf a wrapped error's inner sentence.
+func errText(err error, prefix string) string {
+	msg := err.Error()
+	if i := strings.Index(msg, prefix); i >= 0 {
+		return msg[i:]
+	}
+	return msg
+}
+
+// TestCompact_OutputBudgetCountsTheRunningTotal: with a small block
+// size no single write comes close to the budget, so the compaction can
+// only be stopped by accounting for everything written so far. A
+// per-write check alone would let an unbounded number of small blocks
+// through — which is the ordinary shape of a large compaction.
+func TestCompact_OutputBudgetCountsTheRunningTotal(t *testing.T) {
+	const budget = 32 * 1024
+	_, err := Compact(Spec{
+		Inputs:         []Input{{Name: "wide", Bytes: wideRFile(t, 200)}},
+		Scope:          iterrt.ScopeMajc,
+		Codec:          block.CodecNone,
+		BlockSize:      4096,
+		MaxOutputBytes: budget,
+	})
+	if !errors.Is(err, ErrOutputTooLarge) {
+		t.Fatalf("Compact err = %v, want ErrOutputTooLarge", err)
+	}
+
+	var attempted, would int64
+	if _, e := fmt.Sscanf(errText(err, "compaction: writing "),
+		"compaction: writing %d bytes would take the output to %d bytes", &attempted, &would); e != nil {
+		t.Fatalf("error %q does not report a refused write: %v", err, e)
+	}
+	if attempted >= budget {
+		t.Fatalf("refused write was %d bytes, which is over the budget on its own; "+
+			"this fixture must exercise the running total, not a single oversized write", attempted)
+	}
+	if would <= budget {
+		t.Errorf("refused write would have reached %d bytes, within the %d-byte budget", would, budget)
 	}
 }
 
