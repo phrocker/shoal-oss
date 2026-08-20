@@ -912,6 +912,20 @@ int main(void) {
     config.password = password;
     config.password_length = sizeof(password);
   }
+  struct {
+    shoal_connector_config value;
+    uint8_t future[16];
+  } future_connector_config;
+  memset(&future_connector_config, 0xa5, sizeof(future_connector_config));
+  future_connector_config.value = config;
+  future_connector_config.value.struct_size =
+      (uint32_t)sizeof(future_connector_config);
+  shoal_connector *future_connector = NULL;
+  assert(shoal_connector_create(&future_connector_config.value,
+                                &future_connector, &error) == SHOAL_STATUS_OK);
+  assert(future_connector != NULL && error == NULL);
+  assert(shoal_connector_close(future_connector, &error) == SHOAL_STATUS_OK);
+  shoal_connector_free(&future_connector);
 
   config.accumulo_version = "2.1.6";
   expect_error(shoal_connector_create(&config, &connector, &error),
@@ -1517,6 +1531,22 @@ int main(void) {
                SHOAL_STATUS_INVALID_ARGUMENT, &error, "range is required");
   expect_error(shoal_range_create(&descriptor_range, NULL, &error),
                SHOAL_STATUS_INVALID_ARGUMENT, &error, "out_result");
+  uint32_t descriptor_range_size = descriptor_range.struct_size;
+  descriptor_range.struct_size = SHOAL_RANGE_V1_SIZE - 1;
+  expect_error(shoal_range_create(&descriptor_range, &range_result, &error),
+               SHOAL_STATUS_INVALID_ARGUMENT, &error, "struct_size");
+  descriptor_range.struct_size = descriptor_range_size;
+  struct {
+    shoal_range value;
+    uint8_t future[16];
+  } future_descriptor_range;
+  memset(&future_descriptor_range, 0xa5, sizeof(future_descriptor_range));
+  future_descriptor_range.value = descriptor_range;
+  future_descriptor_range.value.struct_size =
+      (uint32_t)sizeof(future_descriptor_range);
+  assert(shoal_range_create(&future_descriptor_range.value, &range_result,
+                            &error) == SHOAL_STATUS_OK);
+  shoal_range_free(&range_result);
   assert(shoal_range_create(&descriptor_range, &range_result, &error) ==
          SHOAL_STATUS_OK);
   assert(range_result != NULL && error == NULL);
@@ -2355,6 +2385,28 @@ int main(void) {
   shoal_scanner_config_init(&scanner_config);
   assert(scanner_config.struct_size == SHOAL_SCANNER_CONFIG_V1_SIZE);
   scanner_config.table_name = "events";
+  uint32_t scanner_config_size = scanner_config.struct_size;
+  scanner_config.struct_size = SHOAL_SCANNER_CONFIG_V1_SIZE - 1;
+  expect_error(
+      shoal_connector_create_scanner(connector, &scanner_config, &scanner,
+                                     &error),
+      SHOAL_STATUS_INVALID_ARGUMENT, &error, "struct_size");
+  scanner_config.struct_size = scanner_config_size;
+  struct {
+    shoal_scanner_config value;
+    uint8_t future[16];
+  } future_scanner_config;
+  memset(&future_scanner_config, 0xa5, sizeof(future_scanner_config));
+  future_scanner_config.value = scanner_config;
+  future_scanner_config.value.struct_size =
+      (uint32_t)sizeof(future_scanner_config);
+  expect_error(
+      shoal_connector_create_scanner(connector, &future_scanner_config.value,
+                                     &scanner, &error),
+      SHOAL_STATUS_DISCOVERY_UNAVAILABLE, &error, "discovery unavailable");
+  for (size_t i = 0; i < sizeof(future_scanner_config.future); ++i) {
+    assert(future_scanner_config.future[i] == UINT8_C(0xa5));
+  }
 
   expect_error(
       shoal_connector_create_scanner(connector, &scanner_config, &scanner,
@@ -2416,6 +2468,21 @@ int main(void) {
                    connector, &writer_config, &writer, &error),
                SHOAL_STATUS_INVALID_ARGUMENT, &error, "struct_size");
   writer_config.struct_size = writer_config_size;
+  struct {
+    shoal_batch_writer_config value;
+    uint8_t future[16];
+  } future_writer_config;
+  memset(&future_writer_config, 0xa5, sizeof(future_writer_config));
+  future_writer_config.value = writer_config;
+  future_writer_config.value.struct_size =
+      (uint32_t)sizeof(future_writer_config);
+  expect_error(shoal_connector_create_batch_writer(
+                   connector, &future_writer_config.value, &writer, &error),
+               SHOAL_STATUS_DISCOVERY_UNAVAILABLE, &error,
+               "discovery unavailable");
+  for (size_t i = 0; i < sizeof(future_writer_config.future); ++i) {
+    assert(future_writer_config.future[i] == UINT8_C(0xa5));
+  }
   expect_error(shoal_connector_create_batch_writer(
                    connector, &writer_config, &writer, &error),
                SHOAL_STATUS_DISCOVERY_UNAVAILABLE, &error,
