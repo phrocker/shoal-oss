@@ -1,7 +1,9 @@
 package ingestservice
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"sync"
 	"testing"
@@ -327,13 +329,53 @@ func TestConditionalUpdateAcceptsRejectsAndCachesResults(t *testing.T) {
 }
 
 func TestConditionsMatchActiveTombstone(t *testing.T) {
-	condition := &data.TCondition{Cf: []byte("cf"), Cq: []byte("cq"), Val: nil}
+	condition := &data.TCondition{
+		Cf: []byte("cf"), Cq: []byte("cq"), Val: nil, Iterators: []byte{0},
+	}
 	cells := []ingestrouter.Cell{
 		{Row: []byte("r"), ColumnFamily: []byte("cf"), ColumnQualifier: []byte("cq"), Timestamp: 1, Value: []byte("v")},
 		{Row: []byte("r"), ColumnFamily: []byte("cf"), ColumnQualifier: []byte("cq"), Timestamp: 2, Deleted: true},
 	}
-	if !conditionsMatch([]byte("r"), []*data.TCondition{condition}, cells) {
+	matched, err := conditionsMatch([]byte("r"), []*data.TCondition{condition}, cells, nil)
+	if err != nil || !matched {
 		t.Fatal("latest tombstone did not satisfy absent-value condition")
+	}
+}
+
+func TestConditionsMatchSetEncodingIterator(t *testing.T) {
+	symbols := []string{"set", setEncodingIteratorClass, "concat.value", "true"}
+	iterators := []byte{1, 0, 1, 10, 1, 2, 3}
+	var expected bytes.Buffer
+	entry := []byte("session\x00tserver:9997")
+	if err := binary.Write(&expected, binary.BigEndian, int32(len(entry))); err != nil {
+		t.Fatal(err)
+	}
+	expected.Write(entry)
+	if err := binary.Write(&expected, binary.BigEndian, int32(1)); err != nil {
+		t.Fatal(err)
+	}
+	condition := &data.TCondition{
+		Cf: []byte("future"), Val: expected.Bytes(), Iterators: iterators,
+	}
+	cells := []ingestrouter.Cell{{
+		Row: []byte("r"), ColumnFamily: []byte("future"),
+		ColumnQualifier: []byte("session"), Value: []byte("tserver:9997"), Timestamp: 1,
+	}}
+	matched, err := conditionsMatch([]byte("r"), []*data.TCondition{condition}, cells, symbols)
+	if err != nil || !matched {
+		t.Fatalf("set condition matched=%v err=%v", matched, err)
+	}
+}
+
+func TestConditionsMatchSetEncodingIteratorEmptyFamily(t *testing.T) {
+	symbols := []string{"set", setEncodingIteratorClass, "concat.value", "false"}
+	condition := &data.TCondition{
+		Cf: []byte("future"), Val: []byte{0, 0, 0, 0},
+		Iterators: []byte{1, 0, 1, 10, 1, 2, 3},
+	}
+	matched, err := conditionsMatch([]byte("r"), []*data.TCondition{condition}, nil, symbols)
+	if err != nil || !matched {
+		t.Fatalf("empty set condition matched=%v err=%v", matched, err)
 	}
 }
 

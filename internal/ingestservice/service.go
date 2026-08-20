@@ -400,7 +400,7 @@ func (s *Service) ConditionalUpdate(
 	_ *clientgen.TInfo,
 	updateID data.UpdateID,
 	batches data.CMBatch,
-	_ []string,
+	symbols []string,
 ) ([]*data.TCMResult_, error) {
 	session := s.conditionalSession(updateID)
 	if session == nil {
@@ -433,7 +433,7 @@ func (s *Service) ConditionalUpdate(
 				results = append(results, &data.TCMResult_{Cmid: mutation.ID, Status: status})
 				continue
 			}
-			status := s.applyConditional(ctx, updateID, session, extent, mutation)
+			status := s.applyConditional(ctx, updateID, session, extent, mutation, symbols)
 			if status != data.TCMStatus_IGNORED {
 				session.results[mutation.ID] = status
 			}
@@ -449,9 +449,13 @@ func (s *Service) applyConditional(
 	session *conditionalSession,
 	extent ingestrouter.Extent,
 	wireMutation *data.TConditionalMutation,
+	symbols []string,
 ) data.TCMStatus {
 	for _, condition := range wireMutation.Conditions {
-		if condition == nil || len(condition.Iterators) != 0 {
+		if condition == nil {
+			return data.TCMStatus_VIOLATED
+		}
+		if _, err := validateConditionIterators(condition.Iterators, symbols); err != nil {
 			return data.TCMStatus_VIOLATED
 		}
 	}
@@ -475,7 +479,10 @@ func (s *Service) applyConditional(
 			if err != nil {
 				return false, err
 			}
-			return conditionsMatch(mutation.Row, wireMutation.Conditions, append(base, active...)), nil
+			matched, err := conditionsMatch(
+				mutation.Row, wireMutation.Conditions, append(base, active...), symbols,
+			)
+			return matched, err
 		},
 	)
 	if err != nil {
@@ -491,8 +498,24 @@ func (s *Service) applyConditional(
 	return data.TCMStatus_ACCEPTED
 }
 
-func conditionsMatch(row []byte, conditions []*data.TCondition, cells []ingestrouter.Cell) bool {
+func conditionsMatch(
+	row []byte,
+	conditions []*data.TCondition,
+	cells []ingestrouter.Cell,
+	symbols []string,
+) (bool, error) {
 	for _, condition := range conditions {
+		hasIterators, err := validateConditionIterators(condition.Iterators, symbols)
+		if err != nil {
+			return false, err
+		}
+		if hasIterators {
+			matches, err := iteratorConditionMatches(row, condition, cells, symbols)
+			if err != nil || !matches {
+				return matches, err
+			}
+			continue
+		}
 		var current *ingestrouter.Cell
 		for i := range cells {
 			cell := &cells[i]
@@ -514,15 +537,15 @@ func conditionsMatch(row []byte, conditions []*data.TCondition, cells []ingestro
 		}
 		if condition.Val == nil {
 			if current != nil {
-				return false
+				return false, nil
 			}
 			continue
 		}
 		if current == nil || !bytes.Equal(current.Value, condition.Val) {
-			return false
+			return false, nil
 		}
 	}
-	return true
+	return true, nil
 }
 
 func (s *Service) InvalidateConditionalUpdate(

@@ -11,11 +11,16 @@ import (
 	"strings"
 
 	"github.com/phrocker/shoal/internal/ivfpq"
+	"github.com/phrocker/shoal/internal/metadata"
 	"github.com/phrocker/shoal/internal/rfile/wire"
 	"github.com/phrocker/shoal/internal/thrift/gen/data"
 )
 
 const wholeRowIteratorClassName = "org.apache.accumulo.core.iterators.user.WholeRowIterator"
+const tabletManagementIteratorClassName = "org.apache.accumulo.server.manager.state.TabletManagementIterator"
+const hasMigrationFilterClassName = "org.apache.accumulo.core.metadata.schema.filters.HasMigrationFilter"
+const hasExternalCompactionsFilterClassName = "org.apache.accumulo.core.metadata.schema.filters.HasExternalCompactionsFilter"
+const hasCurrentFilterClassName = "org.apache.accumulo.core.metadata.schema.filters.HasCurrentFilter"
 
 // cellPostProcessor consumes cells from the heap-merge in the order
 // they would have been emitted, then produces the final result list.
@@ -92,6 +97,33 @@ func buildPostProcessor(ssiList []*data.IterInfo, ssio map[string]map[string]str
 				maxBufferSize = parsed
 			}
 			picked = &wholeRowProcessor{maxBufferSize: maxBufferSize}
+		case tabletManagementIteratorClassName:
+			if picked != nil {
+				return nil, fmt.Errorf("scanserver: multiple shoal-recognized iterators not supported in V1")
+			}
+			processor, err := newTabletManagementProcessor(ssio[info.IterName])
+			if err != nil {
+				return nil, fmt.Errorf(
+					"scanserver: build tablet-management iterator (%s): %w",
+					info.IterName, err,
+				)
+			}
+			picked = processor
+		case hasMigrationFilterClassName:
+			if picked != nil {
+				return nil, fmt.Errorf("scanserver: multiple shoal-recognized iterators not supported in V1")
+			}
+			picked = newMetadataColumnFilter(metadata.CFServer, "migration")
+		case hasExternalCompactionsFilterClassName:
+			if picked != nil {
+				return nil, fmt.Errorf("scanserver: multiple shoal-recognized iterators not supported in V1")
+			}
+			picked = newMetadataColumnFilter("ecomp", "")
+		case hasCurrentFilterClassName:
+			if picked != nil {
+				return nil, fmt.Errorf("scanserver: multiple shoal-recognized iterators not supported in V1")
+			}
+			picked = newMetadataColumnFilter(metadata.CFCurrentLocation, "")
 		default:
 			// Unknown iterator. Java would error if a class wasn't on
 			// the classpath; shoal mirrors this rather than silently
@@ -207,22 +239,7 @@ func (p *wholeRowProcessor) flush() {
 	if len(p.current) == 0 {
 		return
 	}
-	var encoded bytes.Buffer
-	_ = binary.Write(&encoded, binary.BigEndian, int32(len(p.current)))
-	for _, cell := range p.current {
-		writeWholeRowField(&encoded, cell.key.ColumnFamily)
-		writeWholeRowField(&encoded, cell.key.ColumnQualifier)
-		writeWholeRowField(&encoded, cell.key.ColumnVisibility)
-		_ = binary.Write(&encoded, binary.BigEndian, cell.key.Timestamp)
-		writeWholeRowField(&encoded, cell.value)
-	}
-	p.results = append(p.results, &data.TKeyValue{
-		Key: &data.TKey{
-			Row:       p.currentRow,
-			Timestamp: math.MaxInt64,
-		},
-		Value: encoded.Bytes(),
-	})
+	p.results = append(p.results, encodeWholeRow(p.currentRow, p.current))
 	p.currentRow = nil
 	p.current = nil
 	p.bufferSize = 0
