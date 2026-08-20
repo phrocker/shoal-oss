@@ -20,7 +20,7 @@
 -->
 # Tablet hosting lifecycle and fencing
 
-Status: **partial**. The fenced lifecycle state machine
+Status: **read-only process wired**. The fenced lifecycle state machine
 (`internal/tserver`) has landed, and so has the ZooKeeper registration
 that makes it visible to a manager: the tablet-server ServiceLock, the
 service descriptors the manager reads, and the manager-lock observation
@@ -28,9 +28,11 @@ that supplies live manager authority — see [§6](#6-registering-with-zookeeper
 The manager RPC adapter (`internal/tserverrpc`) now maps Accumulo 4
 assignment, unload, flush, status, and halt calls onto that fence and
 reports asynchronous lifecycle outcomes. Tablet metadata loading and the
-hosted-tablet specification loader are now present; the process that owns
-and connects all required dependencies is not wired yet — see
-[§9](#9-what-is-not-here-yet). Tracking issue: #67.
+hosted-tablet specification loader are now present. `cmd/shoal-tserver`
+connects them to hosted-only stateful scans, one reusable authenticated
+ZooKeeper session, manager failover discovery/reporting, and bounded drain.
+Tablet ingest remains unavailable until the WAL authority dependency lands —
+see [§9](#9-what-is-not-here-yet). Tracking issue: #67.
 
 ## 1. Goal
 
@@ -810,13 +812,10 @@ halt/fast-halt control. Operations owned by data planes not present in
 this slice return `ErrUnsupported`; the adapter does not advertise the
 corresponding `TABLET_INGEST`, `TABLET_SCAN`, or `CLIENT` services.
 
-No command is wired by this slice. None currently owns all of the
-dependencies that `New` deliberately requires: a metadata-validating
-tablet backend, Accumulo system-credential validation, a failover-aware
-manager report connector, a reusable-session manager-lock reader, and
-the same ZooKeeper session used by `ServiceLock`. Constructing an adapter
-without any one of those dependencies fails with an explicit unsupported
-boundary rather than registering a server that cannot perform the work.
+`cmd/shoal-tserver` now owns all dependencies that `New` deliberately
+requires: exact system-credential comparison, metadata/configuration loading,
+failover-aware manager reporting, a reusable manager-lock reader, and the same
+authenticated ZooKeeper session used by `ServiceLock`.
 
 ## 8. Hosted-tablet specification loader
 
@@ -853,23 +852,26 @@ presence, directory/time values, and Accumulo 4 `log:` qualifiers. WAL
 qualifiers are decoded using Java `LogEntry.fromMetaWalEntry`'s
 `-/<path ending in host+port/UUID>` format.
 
-## 9. What is not here yet
+## 9. Remaining ingest dependency
 
-Still to land for #67:
+`cmd/shoal-tserver` is a real read-only tablet-server participant. It advertises
+only `TABLET_MANAGEMENT`, `TABLET_SCAN`, and `TSERV`, and registers only their
+processors. The `TabletIngest` processor and `TABLET_INGEST` descriptor are
+absent, so a caller receives an explicit unknown/unsupported multiplexed
+service response instead of a false write capability.
 
-- wiring the manager adapter's `StateLoading` backend to
-  `tabletloader.Loader`, a concrete exact-row metadata scanner, storage/WAL
-  openers, constraints, and iterator configuration
-- the process wiring that owns the ZooKeeper session, chooses the
-  advertised address and resource group, and restarts participation after
-  a lock loss. It also needs a manager-lock reader that holds one session
-  across polls — `WatchManagerLock` reads once per interval, but
-  `internal/zk.Locator` opens and closes a connection per read whenever
-  the context can be cancelled, which is one session per interval per
-  tablet server. That belongs in `internal/zk`, not here
-- publishing the `Metrics()` counters through the observability endpoints
-- end-to-end tests against a live manager, including migration to and
-  from a Java tserver and rolling mixed-fleet replacement
+The process refuses to publish a loaded tablet that still references WAL
+segments. Serving that tablet without owning recovery/commit authority would
+silently omit unflushed mutations. The exact remaining dependency is #69's WAL
+authority and ingest data plane: mutation sessions, timestamp allocation,
+durable quorum WAL append/recovery, metadata log-reference updates, memtable
+flush, and manager-coordinated commit fencing. Constraints become executable
+only on that ingest path; the read-only process has no mutation surface on
+which to claim them.
+
+Live mixed Java/Shoal migration and rolling-replacement acceptance still need
+an Accumulo cluster CI environment. Until those tests and the ingest/WAL
+authority land, #67's full write-capable acceptance criteria are not met.
 
 ## 10. Metrics
 

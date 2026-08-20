@@ -1,9 +1,12 @@
 # Shoal platform deployment
 
-This directory contains platform artifacts for running Shoal as two Kubernetes tiers:
+This directory contains platform artifacts for running Shoal as three Kubernetes roles:
 
 - **Write tier**: one `shoal-embed` StatefulSet per shard. Each pod has stable identity and a persistent local data directory for WAL/tablet state. The deployment manifests explicitly opt into the HTTP observability listener with `shoal-embed serve --data <dir> --address 0.0.0.0:<port> --metrics-address 0.0.0.0:<port> --quiesce-delay 10s`.
 - **Read fleet**: stateless `shoal` pods behind a Service. They serve the Accumulo-compatible Thrift scan surface and open immutable RFiles through the configured storage backend.
+- **Accumulo tablet server**: `shoal-tserver` StatefulSet members acquire
+  Accumulo ServiceLocks, accept manager assignments, and serve scans only for
+  tablets they successfully loaded. They do not advertise `TABLET_INGEST`.
 
 For local development these collapse into a single `shoal-embed` process. The intended platform shape is: writes land in a shard-local `shoal-embed`, flush/compaction emits RFiles to a shared object-store prefix, and read-fleet pods open those same RFiles for hedged scans.
 
@@ -18,7 +21,7 @@ work is ordered under #128 rather than implied by the StatefulSet alone.
 
 ## Artifacts
 
-- `../Dockerfile`: multi-stage Linux/amd64 image. It builds the two platform runtime binaries, `/shoal-embed` and `/shoal`, into a distroless static image. The image has no fixed entrypoint; choose a binary with Kubernetes `command`.
+- `../Dockerfile`: multi-stage image containing `/shoal-embed`, `/shoal`, and `/shoal-tserver`.
 - `k8s/`: plain Kubernetes YAML for the write tier, read fleet, shared ConfigMap, and placeholder Secret.
 - `helm/shoal/`: minimal Helm chart wrapping the same resources.
 
@@ -44,9 +47,12 @@ kubectl apply -f deploy/k8s/configmap.yaml
 kubectl apply -f deploy/k8s/secret.yaml
 kubectl apply -f deploy/k8s/write-tier.yaml
 kubectl apply -f deploy/k8s/read-fleet.yaml
+kubectl apply -f deploy/k8s/tserver.yaml
 ```
 
 The Secret is a template only. Replace `key.json` with a real GCS service-account key if not using Workload Identity / node Application Default Credentials, and replace `accumulo-password` with the metadata-walk password used by `cmd/shoal`.
+For `shoal-tserver`, also replace `accumulo-instance-secret` and
+`accumulo-system-token-base64`; never store production values in Git.
 
 ## Deploy with Helm
 
@@ -66,6 +72,11 @@ Confirmed from source:
 
 - `cmd/shoal-embed/main.go`: `serve` supports `--data`, `--address` (gRPC bind address, e.g. `0.0.0.0:9876`; defaults to `127.0.0.1:<port>` when only the legacy `--port` is set), `--metrics-port` / `--metrics-address` (HTTP health/readiness/metrics bind; **opt-in** — the HTTP surface only starts if one of these is explicitly passed, so a bare `shoal-embed serve --port N` keeps behaving as a single-port process; when enabled, defaults to `127.0.0.1:9877`), `--quiesce-delay` (default `5s`, but only applied when the HTTP readiness surface is enabled; the manifests override it to `10s`), `--drain-timeout` (default `30s`, bounds graceful shutdown; see below), and `--tls-cert` / `--tls-key` / `--tls-client-ca` (optional TLS material for both listeners together, each with a `SHOAL_EMBED_TLS_*` environment fallback; see the TLS section below).
 - `cmd/shoal/main.go`: read fleet additionally supports `-metrics-address`, `-readiness-interval`, `-quiesce-delay`, `-drain-timeout`, and shared-listener `-tls-cert` / `-tls-key` / `-tls-client-ca` settings (`SHOAL_TLS_*` fallbacks).
+- `cmd/shoal-tserver/main.go`: requires `-advertise`, an authenticated
+  ZooKeeper instance secret, metadata/configuration credentials, and the
+  manager system token. `/readyz` becomes healthy only while a ServiceLock is
+  held and scan admission is open; `/metrics` exports `shoal_tserver_*`
+  lifecycle/fencing counters.
 - `internal/storage/gcs/gcs.go`: the GCS backend uses Application Default Credentials and accepts paths like `gs://bucket/object` or `bucket/object`.
 
 The manifests pass only supported process flags to the containers. `GOOGLE_APPLICATION_CREDENTIALS` is set for the GCS client when a key Secret is mounted.

@@ -437,6 +437,7 @@ func parseStack(tableID string, scope iterrt.IteratorScope, prefix string, props
 		RegistryVersion: iterrt.CapabilityRegistryVersion,
 		LoadedAt:        time.Now(),
 	}
+
 	var issues []error
 
 	type rawEntry struct {
@@ -572,6 +573,14 @@ func parseStack(tableID string, scope iterrt.IteratorScope, prefix string, props
 		return out, &StackConfigError{TableID: tableID, Scope: scope, Issues: issues}
 	}
 	return out, nil
+}
+
+// ResolveProperties validates an already-merged effective table configuration.
+// It is the process-wiring counterpart to Resolver.Resolve: callers that read
+// configuration through Accumulo's ClientService can apply the same fail-closed
+// iterator gate without reading ZooKeeper configuration independently.
+func ResolveProperties(tableID string, scope iterrt.IteratorScope, props map[string]string) (*ResolvedStack, error) {
+	return parseStack(tableID, scope, "table.iterator."+scopeString(scope)+".", props)
 }
 
 func compareUTF16(left, right string) int {
