@@ -37,10 +37,12 @@ type KeyValue struct {
 	Value []byte
 }
 
-// Column selects a column family, optionally restricted to one qualifier.
+// Column selects a column family, optionally restricted to one qualifier and
+// one visibility.
 type Column struct {
-	family    []byte
-	qualifier []byte
+	family     []byte
+	qualifier  []byte
+	visibility []byte
 }
 
 // NewColumnFamily selects every qualifier in family.
@@ -376,7 +378,7 @@ func cloneColumns(columns []Column) []Column {
 	}
 	cloned := make([]Column, len(columns))
 	for i, column := range columns {
-		cloned[i] = NewColumn(column.family, column.qualifier)
+		cloned[i] = NewColumnWithVisibility(column.family, column.qualifier, column.visibility)
 	}
 	return cloned
 }
@@ -388,8 +390,9 @@ func columnsToThrift(columns []Column) []*data.TColumn {
 	wire := make([]*data.TColumn, len(columns))
 	for i, column := range columns {
 		wire[i] = &data.TColumn{
-			ColumnFamily:    cloneRow(column.family),
-			ColumnQualifier: cloneRow(column.qualifier),
+			ColumnFamily:     cloneRow(column.family),
+			ColumnQualifier:  cloneRow(column.qualifier),
+			ColumnVisibility: cloneRow(column.visibility),
 		}
 	}
 	return wire
