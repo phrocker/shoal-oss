@@ -58,14 +58,18 @@ passing result.
 ## Machine-readable replacement verdicts
 
 `cmd/shoal-conformance` emits schema-versioned JSON for the `tserver`,
-`scanserver`, `compactor`, `promotion`, and `client` gates. Output order is
-stable and includes the Shoal commit, exact Accumulo version and revision,
-GOOS/GOARCH, execution mode, every evidence selector and replay command, the
-checked-in fixture path, and its SHA-256 digest.
+`scanserver`, `compactor`, `promotion`, and `client` gates. Output order is stable and includes the Shoal commit, exact Accumulo version
+and revision, GOOS/GOARCH, execution mode, adapter identity, every evidence
+gate, selector, source-file SHA-256, and replay command, the checked-in fixture
+path and digest, and any missing required production gates.
 
 Replay mode executes the commands in
-`test/conformance/fixtures/<gate>.json`. Those fixtures bind each verdict to
-named tests instead of treating a package-wide success as evidence. Run:
+`test/conformance/fixtures/<gate>.json`. The concrete adapters cover client
+CRUD/visibility/range contracts, promotion artifact before/after equivalence,
+stateful scan continuation, tserver lock/assignment lifecycle, and compactor
+publication/completion. Fixtures bind every result to a named test and the
+exact digest of its source file instead of treating package-wide success or a
+stale selector as evidence. Run:
 
 ```bash
 go build -o bin/shoal-conformance ./cmd/shoal-conformance
@@ -73,25 +77,29 @@ bin/shoal-conformance -mode replay -output verdict.json
 ```
 
 Live mode reuses `python test/accumulo/harness.py test` for the client gate.
-The current Docker harness does not yet install Shoal processes as live
-tserver, scanserver, or compactor replacements, so those live role gates are
-reported as `unsupported`, never `pass`. Promotion is likewise unsupported
-until a live destination adapter exists.
+Passing replay evidence is reported separately as `evidence_state: pass`.
+Because the repository does not yet install Shoal processes into the pinned
+cluster, each role also lists its missing live process gate and remains
+`unsupported`, never a production replacement pass. Live mode can satisfy the
+client adapter's pinned Java lifecycle gate when Docker is available.
+Tserver, scanserver, compactor, and promotion remain unsupported until their
+process/destination wiring exists.
 
 ### Release-gate semantics
 
 Each selected gate is `required` and has exactly one state:
 
-- `pass`: every referenced replay command passed, or the live command ran
-  successfully against the pinned Accumulo build;
+- `pass`: every adapter requirement, including required live process wiring,
+  ran successfully;
 - `fail`: evidence was malformed or a required command ran and failed;
 - `unsupported`: the environment or live adapter cannot execute the gate;
 - `skipped`: the gate was omitted with `-required`.
 
 Exit status is `0` only when every required gate passes, `1` when any required
-gate fails, and `2` when no required gate failed but at least one is
-unsupported or skipped. Consequently Docker absence and unwired live roles
-cannot authorize a release. To evaluate a slice independently, pass a
+gate or its exact evidence fails, and `2` when no required gate failed but at
+least one is unsupported or skipped. Consequently a successful replay,
+Docker absence, and unwired live roles cannot authorize a release. To
+evaluate a slice independently, pass a
 comma-separated list such as `-required scanserver,client`; all gates remain
 present in the JSON so consumers do not confuse omission with success.
 
