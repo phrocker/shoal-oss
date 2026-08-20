@@ -58,5 +58,6 @@ void shoal_test_error_alloc_fail_after(size_t successful_allocations);
 void shoal_test_error_alloc_reset(void);
 void shoal_test_error_message_alloc_fail_after(size_t successful_allocations);
 void shoal_test_error_message_alloc_reset(void);
+void shoal_test_sleep_ms(int64_t milliseconds);
 
 #endif
