@@ -17,7 +17,7 @@ import unicodedata
 
 
 DOC_PATH = Path(__file__).with_name("sharkbite-compatibility.md")
-EXPECTED_REVISION = 54
+EXPECTED_REVISION = 55
 CLUSTER_STATUS_APPROVAL_REVISION = 40
 # Update this manifest only when the independently audited inventory itself
 # changes; review every added/removed or reclassified ID in code review.
@@ -43,7 +43,7 @@ STATUSES = {
 NOT_REQUIRED_STATUS = "Not required (rationale required)"
 INTENTIONAL_DIVERGENCE_STATUS = "Intentional divergence (approval required)"
 EXPECTED_TOTAL_ROWS = 3203
-EXPECTED_REQUIRED_ROWS = 397
+EXPECTED_REQUIRED_ROWS = 394
 
 SCOPE_DISPOSITIONS = {
     "Covered",
@@ -55,8 +55,8 @@ SCOPE_DISPOSITIONS = {
 EXPECTED_SCOPE_COUNTS = {
     "Covered": 291,
     "Approved divergence": 98,
-    "Required gap": 8,
-    "Optional": 2763,
+    "Required gap": 5,
+    "Optional": 2766,
     "Not required": 43,
 }
 OPTIONAL_SCOPE_PREFIXES = {
@@ -67,12 +67,14 @@ OPTIONAL_SCOPE_PREFIXES = {
     "SB-TORCH",
 }
 OPTIONAL_SCOPE_ROWS = {"SB-PKG-012", "SB-PKG-013"}
+DEFERRED_MACOS_SCOPE_ROWS = {"SB-PKG-008", "SB-XCUT-014", "SB-XCUT-019"}
 SCOPE_RULES = {
     "core-covered",
     "core-approved-divergence",
     "core-required-gap",
     "optional-legacy-cxx",
     "optional-python-extra",
+    "optional-deferred-macos-native",
     "not-required-rationale",
 }
 
@@ -215,14 +217,15 @@ EXPECTED_METADATA_FIELDS = {
     ),
     "Sharkbite release line": "`sharkbite` 1.2.0.3 on PyPI (`setup.py:34-35`)",
     "Shoal reference": (
-        "`phrocker/shoal-oss` revision 54 is pinned to latest-main merge "
-        "`3ce95cd3bf6b9bbef5a9c21c653286bf8f43c41d` immediately before matrix serialization"
+        "`phrocker/shoal-oss` revision 55 is pinned to latest-main merge "
+        "`bd230a7a15b230089fa73fc43436d95c067b87d7` immediately before matrix serialization"
     ),
     "Shoal C ABI version": "`SHOAL_ABI_VERSION 1u` (`capi/include/shoal_types.h`)",
 }
 
 EXPECTED_DOCUMENT_STATUS_SNIPPETS = (
     "Normative gate. Binding on all Sharkbite-compatibility work.",
+    "Revision 55 — records @phrocker's 2026-08-20 native macOS deferral",
     "Revision 54 — closes the exact 28 configuration, credential, connector/session",
     "Revision 53 — completes the Python-visible BatchScanner/Results and BatchWriter compatibility slice",
     "Revision 52 — closes the eleven required storage, logging, and error-contract gaps",
@@ -776,7 +779,7 @@ EXPECTED_SCOPE_MANIFEST_HEADER = (
     f"# Revision-{EXPECTED_REVISION} Sharkbite client-scope disposition manifest.",
     f"# Matrix: docs/sharkbite-compatibility.md revision {EXPECTED_REVISION}.",
     "# Sharkbite source: phrocker/sharkbite@7f2625f74331b0cd4a75dc0484949c40f1409686.",
-    "# Shoal source: phrocker/shoal-oss@3ce95cd3bf6b9bbef5a9c21c653286bf8f43c41d.",
+    "# Shoal source: phrocker/shoal-oss@bd230a7a15b230089fa73fc43436d95c067b87d7.",
     "# Policy: docs/sharkbite-client-scope.md.",
     "# Columns: ROW-ID<TAB>DISPOSITION<TAB>RULE<TAB>PINNED-MATRIX-STATUS.",
     "# Entries are in matrix order; validator rules, not aggregate counts, authorize dispositions.",
@@ -1678,6 +1681,8 @@ def load_expected_rows() -> tuple[tuple[str, str], ...]:
 
 def expected_scope_entry(row_id: str, status: str) -> tuple[str, str]:
     prefix = "-".join(row_id.split("-")[:2])
+    if row_id in DEFERRED_MACOS_SCOPE_ROWS:
+        return "Optional", "optional-deferred-macos-native"
     if prefix in OPTIONAL_SCOPE_PREFIXES:
         rule = (
             "optional-python-extra"
@@ -3357,9 +3362,9 @@ def validate_status_narratives(
     expected_phrases = [
         (RELEASE_GATE_SECTION_HEADING, f"As of revision {EXPECTED_REVISION}, **{required_rows} rows are required, {satisfied} are satisfied, and {scope_counts['Required gap']} remain**."),
         (COUNTS_SECTION_HEADING, f"The normative scope manifest classifies {required_rows} rows as required, {scope_counts['Optional']} as optional, and {scope_counts['Not required']} as not required."),
-        (COUNTS_SECTION_HEADING, f"**Exactly {status_counts['Covered']} rows are `Covered`: [SB-XCUT-012](#sec-20), the twelve configuration/topology rows completed in revision 24, the 31 RFile/stream rows completed in revision 25, the 17 data-model value rows completed in revision 26, the five buffered-writer rows completed in revisions 28 and 45, the four row-bounded flush/constraint rows completed in revision 29, the connector invalidation/cancellation rows completed in revision 30, the eight high-level client rows completed in revision 31, the five high-level scanner rows completed in revision 32, the four compatibility-error rows completed in revision 34, the twelve streaming cursor rows completed in revision 36, the 31 column-visibility rows completed in revision 38, the 22 equivalent owned-key rows completed in revision 42, the named-locality-group RFile row plus 24 HDFS rows completed in revision 44, the two logging rows completed in revision 45, the 38 table/namespace/security rows completed in revision 48, the twelve issue-196 cross-cutting rows completed in revision 49, the 60 required Python data-model and iterator-descriptor rows completed in revision 50, the five package/import rows completed in revision 51, the eleven RFile/HDFS/logging/error rows completed in revision 52, nineteen Python-visible scanner/writer rows completed in revision 53, and the 28 configuration/credential/connector/session/dynamic-attribute rows completed in revision 54; SB-WRITE-010 is the separately approved SB-DIV-005 divergence.**"),
+        (COUNTS_SECTION_HEADING, f"**Exactly {status_counts['Covered']} rows are `Covered`: [SB-XCUT-012](#sec-20), the twelve configuration/topology rows completed in revision 24, the 31 RFile/stream rows completed in revision 25, the 17 data-model value rows completed in revision 26, the five buffered-writer rows completed in revisions 28 and 45, the four row-bounded flush/constraint rows completed in revision 29, the connector invalidation/cancellation rows completed in revision 30, the eight high-level client rows completed in revision 31, the five high-level scanner rows completed in revision 32, the four compatibility-error rows completed in revision 34, the twelve streaming cursor rows completed in revision 36, the 31 column-visibility rows completed in revision 38, the 22 equivalent owned-key rows completed in revision 42, the named-locality-group RFile row plus 24 HDFS rows completed in revision 44, the two logging rows completed in revision 45, the 38 table/namespace/security rows completed in revision 48, the twelve issue-196 cross-cutting rows completed in revision 49, the 60 required Python data-model and iterator-descriptor rows completed in revision 50, the five package/import rows completed in revision 51, the eleven RFile/HDFS/logging/error rows completed in revision 52, nineteen Python-visible scanner/writer rows completed in revision 53, and the 28 configuration/credential/connector/session/dynamic-attribute rows completed in revision 54; revision 55 changes scope only; SB-WRITE-010 is the separately approved SB-DIV-005 divergence.**"),
         (COUNTS_SECTION_HEADING, f"`Intentional divergence` ({status_counts[INTENTIONAL_DIVERGENCE_STATUS]}) is dominated by one upstream fact: {prefix_counts['SB-STAT'][INTENTIONAL_DIVERGENCE_STATUS]} rows are cluster-status accessors Accumulo itself deleted ([§14](#sec-14), [SB-DIV-016](#sec-26))."),
-        (COUNTS_SECTION_HEADING, "`SB-XCUT-014`, `SB-XCUT-019`, and `SB-PKG-008` remain explicit required"),
+        (COUNTS_SECTION_HEADING, "`SB-XCUT-014`, `SB-XCUT-019`, and `SB-PKG-008` remain explicit optional/deferred"),
     ]
     section_text: dict[str, str] = {}
     for heading, phrase in expected_phrases:
