@@ -4,6 +4,7 @@ import ctypes as C
 from enum import IntEnum
 from typing import Iterable
 
+from .errors import AlreadyExistsError, ClientException, NotFoundError
 from ._native import (
     CAP_NAMESPACE_ADMIN,
     CAP_SECURITY_ADMIN,
@@ -181,15 +182,23 @@ class TableOperations(_Operations):
     def create(self, recreate: bool = False, *, timeout_ms: int = 0) -> bool:
         if recreate and self.exists(timeout_ms=timeout_ms):
             self.remove(timeout_ms=timeout_ms)
-        self._call(
-            "shoal_connector_create_table", self.table.encode(), timeout_ms
-        )
+        try:
+            self._call(
+                "shoal_connector_create_table", self.table.encode(), timeout_ms
+            )
+        except (AlreadyExistsError, ClientException) as exc:
+            if exc.status == 19:
+                return False
+            raise
         return True
 
     def remove(self, *, timeout_ms: int = 0) -> bool:
-        self._call(
-            "shoal_connector_delete_table", self.table.encode(), timeout_ms
-        )
+        try:
+            self._call(
+                "shoal_connector_delete_table", self.table.encode(), timeout_ms
+            )
+        except NotFoundError as exc:
+            raise ClientException(str(exc), status=exc.status) from exc
         return True
 
     def rename(self, new_name: str, *, timeout_ms: int = 0) -> bool:
@@ -232,6 +241,8 @@ class TableOperations(_Operations):
         return 0
 
     def setProperty(self, key: str, value: str, *, timeout_ms: int = 0) -> int:
+        if not key:
+            return -1
         self._call(
             "shoal_connector_set_table_property",
             self.table.encode(),
@@ -242,6 +253,8 @@ class TableOperations(_Operations):
         return 0
 
     def removeProperty(self, key: str, *, timeout_ms: int = 0) -> int:
+        if not key:
+            return -1
         self._call(
             "shoal_connector_remove_table_property",
             self.table.encode(),
@@ -358,16 +371,36 @@ class TableOperations(_Operations):
 
         return BatchScanner(self._connector, self.table, auths, threads)
 
-    def compact(self, *_: object, **__: object) -> None:
+    def import_directory(
+        self,
+        directory: str,
+        fail_path: str,
+        setTime: bool = False,
+    ) -> bool:
+        del directory, fail_path, setTime
         raise NotImplementedError(
-            "online compaction is not supported by Shoal's Accumulo 4 client"
+            "legacy Sharkbite bulk import is an approved compatibility divergence "
+            "(SB-DIV-019): Shoal Bulk Import V2 requires a staged load map"
+        )
+
+    def compact(
+        self, startRow: str, endRow: str, wait: bool
+    ) -> int:
+        del startRow, endRow, wait
+        raise NotImplementedError(
+            "online compaction is an approved compatibility divergence "
+            "(SB-DIV-018): Accumulo 4 exposes no compatible RPC or IDL payload"
         )
 
 
 class NamespaceOperations(_Operations):
-    def __init__(self, connector: object) -> None:
+    def __init__(self, connector: object, namespace: str = "") -> None:
         super().__init__(connector)
         self._api.require(CAP_NAMESPACE_ADMIN)
+        self.namespace = namespace
+
+    def _name(self, name: str) -> str:
+        return name or self.namespace
 
     def list_with_ids(self, *, timeout_ms: int = 0) -> dict[str, str]:
         return dict(
@@ -386,50 +419,53 @@ class NamespaceOperations(_Operations):
 
     def exists(self, nm: str = "", *, timeout_ms: int = 0) -> bool:
         return self._bool(
-            "shoal_connector_namespace_exists", nm.encode(), timeout_ms
+            "shoal_connector_namespace_exists", self._name(nm).encode(), timeout_ms
         )
 
-    def create(self, nm: str = "", *, timeout_ms: int = 0) -> int:
-        self._call("shoal_connector_create_namespace", nm.encode(), timeout_ms)
-        return 0
+    def create(self, nm: str = "", *, timeout_ms: int = 0) -> None:
+        self._call(
+            "shoal_connector_create_namespace", self._name(nm).encode(), timeout_ms
+        )
 
-    def remove(self, nm: str = "", *, timeout_ms: int = 0) -> int:
-        self._call("shoal_connector_delete_namespace", nm.encode(), timeout_ms)
-        return 0
+    def remove(self, nm: str = "", *, timeout_ms: int = 0) -> bool:
+        self._call(
+            "shoal_connector_delete_namespace", self._name(nm).encode(), timeout_ms
+        )
+        return True
 
     def rename(
         self, newName: str, oldName: str = "", *, timeout_ms: int = 0
-    ) -> int:
+    ) -> None:
+        old_name = self._name(oldName)
         self._call(
             "shoal_connector_rename_namespace",
-            oldName.encode(),
+            old_name.encode(),
             newName.encode(),
             timeout_ms,
         )
-        return 0
+        if old_name == self.namespace:
+            self.namespace = newName
 
     def setProperty(
         self, property: str, value: str, nm: str = "", *, timeout_ms: int = 0
-    ) -> int:
+    ) -> None:
         self._call(
             "shoal_connector_set_namespace_property",
-            nm.encode(),
+            self._name(nm).encode(),
             property.encode(),
             value.encode(),
             timeout_ms,
         )
-        return 0
 
     def removeProperty(
         self, property: str, nm: str = "", *, timeout_ms: int = 0
-    ) -> int:
+    ) -> None:
         self._call(
             "shoal_connector_remove_namespace_property",
-            nm.encode(),
+            self._name(nm).encode(),
             property.encode(),
             timeout_ms,
         )
-        return 0
 
     def getProperties(
         self, nm: str = "", *, timeout_ms: int = 0
@@ -441,7 +477,7 @@ class NamespaceOperations(_Operations):
                 "shoal_namespace_properties_get",
                 "shoal_namespace_properties_free",
                 PropertyView,
-                nm.encode(),
+                self._name(nm).encode(),
                 timeout_ms,
             )
         )
@@ -456,7 +492,7 @@ class NamespaceOperations(_Operations):
                 "shoal_namespace_properties_get",
                 "shoal_namespace_properties_free",
                 PropertyView,
-                nm.encode(),
+                self._name(nm).encode(),
                 timeout_ms,
             )
         )
@@ -468,7 +504,7 @@ class NamespaceOperations(_Operations):
         error = C.c_void_p()
         status = self._api.lib.shoal_connector_versioned_namespace_properties(
             self._connector._handle,
-            nm.encode(),
+            self._name(nm).encode(),
             timeout_ms,
             C.byref(result),
             C.byref(error),
@@ -508,20 +544,34 @@ class SecurityOperations(_Operations):
         return 0
 
     def create_user(self, user: str, password: str | bytes, *, timeout_ms: int = 0) -> int:
-        return self._password_call(
-            "shoal_connector_create_user", user, password, timeout_ms
-        )
+        if not user:
+            return -1
+        try:
+            self._password_call(
+                "shoal_connector_create_user", user, password, timeout_ms
+            )
+        except (AlreadyExistsError, ClientException) as exc:
+            if exc.status == 19:
+                return 0
+            raise
+        return 1
 
     def change_password(self, user: str, password: str | bytes, *, timeout_ms: int = 0) -> int:
+        if not user:
+            return -1
         return self._password_call(
             "shoal_connector_change_password", user, password, timeout_ms
         )
 
     def remove_user(self, user: str, *, timeout_ms: int = 0) -> int:
+        if not user:
+            return -1
         self._call("shoal_connector_drop_user", user.encode(), timeout_ms)
         return 0
 
     def get_auths(self, user: str, *, timeout_ms: int = 0) -> Authorizations:
+        if not user:
+            raise ClientException("argument cannot be empty")
         return Authorizations(
             self._bytes_list(
                 "shoal_connector_get_user_authorizations", user.encode(), timeout_ms
@@ -529,8 +579,12 @@ class SecurityOperations(_Operations):
         )
 
     def grantAuthorizations(
-        self, auths: Iterable[str | bytes], user: str, *, timeout_ms: int = 0
+        self, auths: Iterable[str | bytes] | None, user: str, *, timeout_ms: int = 0
     ) -> int:
+        if auths is None:
+            return -2
+        if not user:
+            return -1
         values = [c_bytes(as_bytes(value)) for value in auths]
         array = (Bytes * len(values))(*(value[0] for value in values))
         self._call(
@@ -540,12 +594,23 @@ class SecurityOperations(_Operations):
             len(values),
             timeout_ms,
         )
-        return 0
+        return 1
+
+    @staticmethod
+    def _validate_permission(permission: IntEnum, expected: type[IntEnum]) -> None:
+        if not isinstance(permission, expected):
+            raise TypeError(
+                f"permission must be {expected.__name__}, not "
+                f"{type(permission).__name__}"
+            )
 
     def _permission_bool(
         self, scope: str, user: str, target: str | None, permission: IntEnum,
-        timeout_ms: int
+        permission_type: type[IntEnum], timeout_ms: int
     ) -> bool:
+        if not user:
+            raise ClientException("argument cannot be empty")
+        self._validate_permission(permission, permission_type)
         args = [user.encode()]
         if target is not None:
             args.append(target.encode())
@@ -554,41 +619,44 @@ class SecurityOperations(_Operations):
 
     def _permission_call(
         self, action: str, scope: str, user: str, target: str | None,
-        permission: IntEnum, timeout_ms: int
+        permission: IntEnum, permission_type: type[IntEnum], timeout_ms: int
     ) -> int:
+        if not user:
+            return -1
+        self._validate_permission(permission, permission_type)
         args = [user.encode()]
         if target is not None:
             args.append(target.encode())
         args.extend([int(permission), timeout_ms])
         self._call(f"shoal_connector_{action}_{scope}_permission", *args)
-        return 0
+        return 1
 
     def has_system_permission(self, user: str, permission: SystemPermissions, *, timeout_ms: int = 0) -> bool:
-        return self._permission_bool("system", user, None, permission, timeout_ms)
+        return self._permission_bool("system", user, None, permission, SystemPermissions, timeout_ms)
 
     def has_table_permission(self, user: str, table: str, permission: TablePermissions, *, timeout_ms: int = 0) -> bool:
-        return self._permission_bool("table", user, table, permission, timeout_ms)
+        return self._permission_bool("table", user, table, permission, TablePermissions, timeout_ms)
 
     def has_namespace_permission(self, user: str, namespace: str, permission: NamespacePermissions, *, timeout_ms: int = 0) -> bool:
-        return self._permission_bool("namespace", user, namespace, permission, timeout_ms)
+        return self._permission_bool("namespace", user, namespace, permission, NamespacePermissions, timeout_ms)
 
     def grant_system_permission(self, user: str, permission: SystemPermissions, *, timeout_ms: int = 0) -> int:
-        return self._permission_call("grant", "system", user, None, permission, timeout_ms)
+        return self._permission_call("grant", "system", user, None, permission, SystemPermissions, timeout_ms)
 
     def revoke_system_permission(self, user: str, permission: SystemPermissions, *, timeout_ms: int = 0) -> int:
-        return self._permission_call("revoke", "system", user, None, permission, timeout_ms)
+        return self._permission_call("revoke", "system", user, None, permission, SystemPermissions, timeout_ms)
 
     def grant_table_permission(self, user: str, table: str, permission: TablePermissions, *, timeout_ms: int = 0) -> int:
-        return self._permission_call("grant", "table", user, table, permission, timeout_ms)
+        return self._permission_call("grant", "table", user, table, permission, TablePermissions, timeout_ms)
 
     def revoke_table_permission(self, user: str, table: str, permission: TablePermissions, *, timeout_ms: int = 0) -> int:
-        return self._permission_call("revoke", "table", user, table, permission, timeout_ms)
+        return self._permission_call("revoke", "table", user, table, permission, TablePermissions, timeout_ms)
 
     def grant_namespace_permission(self, user: str, namespace: str, permission: NamespacePermissions, *, timeout_ms: int = 0) -> int:
-        return self._permission_call("grant", "namespace", user, namespace, permission, timeout_ms)
+        return self._permission_call("grant", "namespace", user, namespace, permission, NamespacePermissions, timeout_ms)
 
     def revoke_namespace_permission(self, user: str, namespace: str, permission: NamespacePermissions, *, timeout_ms: int = 0) -> int:
-        return self._permission_call("revoke", "namespace", user, namespace, permission, timeout_ms)
+        return self._permission_call("revoke", "namespace", user, namespace, permission, NamespacePermissions, timeout_ms)
 
 
 class TableInfo(_Operations):
@@ -626,3 +694,6 @@ class TableInfo(_Operations):
         return self._bool(
             "shoal_connector_table_exists", table.encode(), timeout_ms
         )
+
+
+setattr(TableOperations, "import", TableOperations.import_directory)
