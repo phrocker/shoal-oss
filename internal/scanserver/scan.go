@@ -58,8 +58,13 @@ func (s *Server) StartScan(
 	classLoaderContext string,
 	executionHints map[string]string,
 	busyTimeout int64,
-) (*data.InitialScan, error) {
+) (result *data.InitialScan, retErr error) {
 	t0 := time.Now()
+	if !s.admitStart() {
+		return nil, &tabletscan.ScanServerBusyException{}
+	}
+	defer s.endCall()
+	defer func() { s.observeStart(t0, false, retErr) }()
 	if extent == nil {
 		return nil, fmt.Errorf("scanserver: nil extent")
 	}
@@ -92,6 +97,9 @@ func (s *Server) StartScan(
 		page := splitScanResults(results, s.pages)
 		scanID := data.ScanID(0)
 		if page.more {
+			if !s.Accepting() {
+				return nil, s.rejectDraining()
+			}
 			scanID, err = s.scans.create(time.Now(), page.remaining)
 			if err != nil {
 				return nil, err
@@ -129,6 +137,9 @@ func (s *Server) StartScan(
 	page := splitScanResults(results, s.pages)
 	scanID := data.ScanID(0)
 	if page.more {
+		if !s.Accepting() {
+			return nil, s.rejectDraining()
+		}
 		scanID, err = s.scans.create(time.Now(), page.remaining)
 		if err != nil {
 			return nil, err

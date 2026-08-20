@@ -16,6 +16,10 @@ data:
   SHOAL_OBJECT_BUCKET: {{ .Values.objectStorage.bucket | quote }}
   SHOAL_OBJECT_PREFIX: {{ .Values.objectStorage.prefix | quote }}
   SHOAL_THRIFT_LISTEN: {{ .Values.readFleet.listen | quote }}
+  SHOAL_READ_METRICS_LISTEN: {{ printf ":%v" .Values.readFleet.metricsPort | quote }}
+  SHOAL_READ_READINESS_INTERVAL: {{ .Values.readFleet.readinessInterval | quote }}
+  SHOAL_READ_QUIESCE_DELAY: {{ .Values.readFleet.quiesceDelay | quote }}
+  SHOAL_READ_DRAIN_TIMEOUT: {{ .Values.readFleet.drainTimeout | quote }}
   SHOAL_ZK: {{ .Values.readFleet.zk | quote }}
   SHOAL_INSTANCE: {{ .Values.readFleet.instance | quote }}
   SHOAL_ACCUMULO_VERSION: {{ .Values.readFleet.accumuloVersion | quote }}
