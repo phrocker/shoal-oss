@@ -20,16 +20,18 @@
 -->
 # Promoting a local Shoal table into Accumulo — design
 
-Status: **partial**. This document covers the current safe slice of #70:
+Status: **partial**. This document covers the current safe slices of #70:
 client-side staging plus submission of Accumulo Bulk Import V2
 (`internal/promotion`, `accumulo.Connector.BulkImport`,
 `managerclient.TableBulkImport`) for both single-tablet exports and
 **multi-tablet/split-bearing exports**, the latter via destination split
 reconciliation (`accumulo.Connector.AddTableSplitsForTable`,
-`RequiredDestinationSplits`) ahead of staging. Durable/resumable
-promotion-state tracking, duplicate-safe FATE resubmission, an explicit
-cutover/fan-in state machine, and live-cluster verification are not yet
-implemented — see [§5](#5-whats-deferred).
+`RequiredDestinationSplits`) ahead of staging, plus the durable
+`promotion.Machine` handoff described in §4.1. The durable path persists the
+immutable lineage and authority fence, records the allocated FATE ID before
+submission, resumes the same transaction after ambiguous responses, and
+separates terminal-result persistence from FATE cleanup. Live-cluster
+verification and concrete engine/manager authority adapters remain deferred.
 
 ## 1. Goal and authority invariant
 
@@ -42,7 +44,9 @@ That invariant drives every design choice here:
   [coordination authority model](./coordination-authority.md): local and
   Accumulo write authority are mutually exclusive, and cutover is a durable,
   fenced state transition rather than simultaneous ownership. The current
-  staging-and-submit slice does not implement that cutover protocol.
+  one-shot `Promote` API does not implement that cutover protocol;
+  `promotion.Machine` is the durable protocol boundary and requires an
+  authority adapter that enforces these transitions.
 
 - Promotion **never writes to `accumulo.metadata` or ZooKeeper**, and never
   invents its own notion of a tablet, split, or load state.
@@ -846,6 +850,48 @@ destination splits itself, or the eventual `BulkImport` fails closed (see
   `manager.TFateOperation_TABLE_BULK_IMPORT2`, 3 arguments
   (`tableID`, `bulkDir`, `setTime`).
 
+### 4.1 Durable intent, FATE recovery, and cutover
+
+`promotion.Machine` is the crash-recoverable alternative to the legacy
+one-shot `Promote` helper. Its append-only `LocalIntentStore` uses an OS file
+lock, revision compare-and-swap, and `fsync`; callers may provide another
+store with the same locking/CAS contract. One immutable identity covers the
+source manifest hash, source generation and authority token, producer,
+destination, and mode. A caller-supplied identity must equal that
+deterministic value, so changing inputs cannot reuse an old transaction.
+
+The persisted states follow the coordination ADR:
+
+```
+HANDOFF_INTENT -> DESTINATION_FENCED -> LOCAL_FROZEN
+    -> FATE_ALLOCATED -> IMPORT_SUBMITTED -> IMPORT_VERIFIED
+    -> LOCAL_RETIRED -> ACCUMULO_WRITABLE
+```
+
+The allocated FATE ID is durable before `executeFateOperation`. Every submit
+attempt reuses that exact ID; an ambiguous response leaves the record at
+`FATE_ALLOCATED`, so recovery never allocates a replacement transaction.
+`finishFateOperation` runs only after `IMPORT_VERIFIED` is durable. The
+authority adapter must make fence/freeze/retire/activate calls idempotent and
+must reject stale `{domain, epoch, generation, attempt}` tokens.
+
+Fan-in uses the same immutable-generation and FATE-dedup path, requires a
+parent cutover identity, and finishes through `CompleteFanIn`; it never
+retires local authority or re-activates destination authority. Cutover alone
+performs `LOCAL_RETIRED -> ACCUMULO_WRITABLE`.
+
+Promotion preflight accepts only artifacts explicitly or legacy-implicitly
+marked `rfile/authoritative`, with a `.rf` destination. Parquet, derived
+RFiles, and mixed manifests fail before split staging or FATE allocation.
+This restriction applies only to Accumulo promotion; local Parquet storage
+and query behavior are unchanged.
+
+Each durable bulk directory must end in the deterministic promotion identity.
+Cleanup considers only the exact staged paths recorded by that intent and
+deletes a path only while its size and SHA-256 still match. Missing or
+concurrently replaced objects are left untouched; cleanup never recursively
+deletes a shared directory.
+
 ## 5. What's deferred
 
 Mapped against #70's five acceptance criteria:
@@ -874,9 +920,9 @@ Mapped against #70's five acceptance criteria:
     whether or not the resulting mapping turns out to be empty) — and does not cover
     single-tablet/legacy manifests at all, which have no
     split-reconciliation step to pin against in the first place.
-2. **"rerunning any interrupted transfer is safe"** — true up through
-   staging, not true across the whole `Promote` call once `BulkImport` has
-   been invoked. `StageBulkDir` is deterministic and copy-based, so
+2. **"rerunning any interrupted transfer is safe"** — implemented by
+   `promotion.Machine`; the legacy one-shot `Promote` call remains safe only
+   before `BulkImport`. `StageBulkDir` is deterministic and copy-based, so
    rerunning it with the same manifest and `bulkDir` safely reproduces the
    same bytes; a persistent I/O failure partway through copying *multiple*
    files can still leave a partially staged bulk directory, but retrying
@@ -899,19 +945,12 @@ Mapped against #70's five acceptance criteria:
    after an ambiguous `AddTableSplitsForTable` failure — it is not a property of
    the FATE protocol itself.
 
-   `BulkImport` has no equivalent re-observation step: there is no
-   client-visible way to ask "was this exact bulk import directory
-   already loaded into this table," so `TABLE_BULK_IMPORT2` FATE
-   submission has no dedup/idempotency of its own. An ambiguous failure
-   at or after that call (e.g. a timeout after the manager received the
-   request but before the client observed a response) leaves the caller
-   unable to tell whether the import already happened, and blindly
-   calling `Promote` again in that window risks a duplicate bulk import.
-   This slice deliberately does **not** claim idempotency for the whole
-   `Promote` call — only for its pre-`BulkImport` steps (split
-   reconciliation and staging). Closing the `BulkImport` gap needs a
-   promotion-state or idempotency-token API this slice does not yet have
-   (see item 4 below).
+   Bulk Import V2 itself has no directory-level idempotency token. The durable
+   path closes that gap at the FATE boundary instead: it allocates once,
+   persists the exact FATE ID, and retries execution/wait using that same
+   transaction. It never creates a replacement transaction after an
+   ambiguous response. This guarantee requires using `promotion.Machine`,
+   not blindly retrying `Promote`.
 3. **"split changes and partial uploads recover without manual metadata
    repair"** — partial-upload recovery (retrying an interrupted
    `StageBulkDir`/pre-`BulkImport` `Promote` call) is implemented and
@@ -952,10 +991,11 @@ Mapped against #70's five acceptance criteria:
    `AddTableSplitsForTable`/`BulkImport`, with an accurate, table-specific
    error) is deferred to a future slice that gives `Promoter` a way to
    read destination table properties.
-4. **"a documented cutover protocol"** — not implemented. No
-   promotion-state or cutover API surface is exposed yet; this slice is
-   promotion of one point-in-time export, not the ongoing fan-in/cutover
-   semantics #70 also asks for.
+4. **"a documented cutover protocol"** — the durable state machine and
+   cutover/fan-in API boundary are implemented in §4.1. Concrete adapters that
+   freeze the embedded engine, maintain the manager-owned destination
+   authority record/table offline gate, and expose the terminal cutover
+   through public engine/API surfaces remain to be implemented and verified.
 5. **"graph, document, and vector fixtures pass before and after
    promotion"** — not exercised; requires a live cluster.
 
@@ -1030,6 +1070,12 @@ request for the exact commands and pass/fail output.
 Coverage added for multi-tablet split reconciliation, on top of the
 existing single-tablet suite:
 
+- **Durable state/race/fault recovery** — deterministic tests cover an
+  ambiguous execute response followed by restart, proving the second run uses
+  the same persisted FATE ID and allocates only once; concurrent retries,
+  proving one authority/FATE lifecycle; persisted local-store CAS/reopen;
+  fan-in versus cutover authority calls; terminal-before-finish ordering; and
+  strict Parquet/derived/mixed-manifest rejection before any side effect.
 - **Widened-extent correctness** — `twoTabletManifest`/`threeTabletManifest`/
   `fourTabletManifest` fixtures with hand-computed boundary rows, asserting
   `BuildLoadMapping`'s exact `KeyExtent` for every chain position (including
