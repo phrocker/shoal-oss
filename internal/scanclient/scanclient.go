@@ -200,8 +200,8 @@ func (e *CleanupError) Error() string {
 
 func (e *CleanupError) Unwrap() error { return e.Err }
 
-// SimpleScan starts a metadata-style scan and closes its server-side session.
-// A close failure is returned with the successful initial result.
+// SimpleScan drains a metadata-style scan and closes its server-side session.
+// A close failure is returned with the successful complete result.
 func (c *Client) SimpleScan(ctx context.Context, req SimpleScanRequest) (*data.InitialScan, error) {
 	batchSize := req.BatchSize
 	if batchSize == 0 {
@@ -219,11 +219,27 @@ func (c *Client) SimpleScan(ctx context.Context, req SimpleScanRequest) (*data.I
 	if err != nil {
 		return nil, err
 	}
-	if scan != nil && scan.ScanID != 0 {
-		if closeErr := c.CloseScan(ctx, scan.ScanID); closeErr != nil {
-			return scan, &CleanupError{ScanID: scan.ScanID, Err: closeErr}
-		}
+	if scan == nil || scan.ScanID == 0 {
+		return scan, nil
 	}
+	id := scan.ScanID
+	for scan.Result_ != nil && scan.Result_.More {
+		next, continueErr := c.Continue(ctx, id, 0)
+		if continueErr != nil {
+			_ = c.CloseScan(context.WithoutCancel(ctx), id)
+			return nil, continueErr
+		}
+		if next == nil {
+			_ = c.CloseScan(context.WithoutCancel(ctx), id)
+			return nil, errors.New("scanclient: nil continuation result")
+		}
+		scan.Result_.Results = append(scan.Result_.Results, next.Results...)
+		scan.Result_.More = next.More
+	}
+	if closeErr := c.CloseScan(ctx, id); closeErr != nil {
+		return scan, &CleanupError{ScanID: id, Err: closeErr}
+	}
+	scan.ScanID = 0
 	return scan, nil
 }
 

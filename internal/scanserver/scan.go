@@ -68,6 +68,9 @@ func (s *Server) StartScan(
 	if extent == nil {
 		return nil, fmt.Errorf("scanserver: nil extent")
 	}
+	if err := s.validateCredentials(ctx, credentials, authorizations, []string{string(extent.Table)}); err != nil {
+		return nil, err
+	}
 	if rangeArg == nil {
 		return nil, fmt.Errorf("scanserver: nil range")
 	}
