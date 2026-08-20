@@ -186,8 +186,10 @@ class TableOperations(_Operations):
             self._call(
                 "shoal_connector_create_table", self.table.encode(), timeout_ms
             )
-        except AlreadyExistsError:
-            return False
+        except (AlreadyExistsError, ClientException) as exc:
+            if exc.status == 19:
+                return False
+            raise
         return True
 
     def remove(self, *, timeout_ms: int = 0) -> bool:
@@ -537,8 +539,10 @@ class SecurityOperations(_Operations):
             self._password_call(
                 "shoal_connector_create_user", user, password, timeout_ms
             )
-        except AlreadyExistsError:
-            return 0
+        except (AlreadyExistsError, ClientException) as exc:
+            if exc.status == 19:
+                return 0
+            raise
         return 1
 
     def change_password(self, user: str, password: str | bytes, *, timeout_ms: int = 0) -> int:
@@ -593,6 +597,8 @@ class SecurityOperations(_Operations):
         self, scope: str, user: str, target: str | None, permission: IntEnum,
         permission_type: type[IntEnum], timeout_ms: int
     ) -> bool:
+        if not user:
+            raise ClientException("argument cannot be empty")
         self._validate_permission(permission, permission_type)
         args = [user.encode()]
         if target is not None:

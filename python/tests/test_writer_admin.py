@@ -309,6 +309,8 @@ class WriterAdminTests(unittest.TestCase):
         table = self.connector.tableOps("t")
         with patch.object(table, "_call", side_effect=AlreadyExistsError("exists", status=19)):
             self.assertFalse(table.create())
+        with patch.object(table, "_call", side_effect=ClientException("exists", status=19)):
+            self.assertFalse(table.create())
         with patch.object(table, "_call", side_effect=NotFoundError("missing", status=9)):
             with self.assertRaises(ClientException) as raised:
                 table.remove()
@@ -380,6 +382,8 @@ class WriterAdminTests(unittest.TestCase):
             security.has_table_permission("u", "t", NamespacePermissions.READ)
         with self.assertRaisesRegex(TypeError, "SystemPermissions"):
             security.grant_system_permission("u", TablePermissions.READ)
+        with self.assertRaises(ClientException):
+            security.has_system_permission("", SystemPermissions.GRANT)
 
     def test_approved_table_divergences_are_stable(self):
         table = self.connector.tableOps("t")
