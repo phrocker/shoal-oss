@@ -127,6 +127,8 @@ static void expect_error(shoal_status status, shoal_status expected,
   assert(error != NULL);
   assert(*error != NULL);
   assert(shoal_error_code(*error) == expected);
+  assert(shoal_error_compatibility_code(*error) >= -1);
+  assert(shoal_error_compatibility_code(*error) <= 13);
   assert(strstr(shoal_error_message(*error), message_part) != NULL);
   if (expected == SHOAL_STATUS_CLOSED) {
     assert(shoal_error_source(*error) ==
@@ -2526,6 +2528,11 @@ int main(void) {
   assert(shoal_logging_set_level(SHOAL_LOG_LEVEL_OFF, &error) ==
          SHOAL_STATUS_OK);
   assert(shoal_logging_set_callback(NULL, NULL, &error) == SHOAL_STATUS_OK);
+  expect_error(shoal_hdfs_client_mkdir(NULL, "/warehouse", 0, &error),
+               SHOAL_STATUS_INVALID_HANDLE, &error, "handle");
+  expect_error(shoal_hdfs_client_chown(NULL, "/warehouse", "alice",
+                                       "analytics", 0, &error),
+               SHOAL_STATUS_INVALID_HANDLE, &error, "handle");
 
   assert(shoal_test_batch_writer_create(
       SHOAL_TEST_WRITER_STRUCTURED_FAILURE, &writer));

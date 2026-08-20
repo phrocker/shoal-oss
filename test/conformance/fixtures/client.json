@@ -24,7 +24,7 @@
       "gate": "range",
       "kind": "go-test",
       "reference": "accumulo/scanner_test.go#TestRangeWireBoundaries",
-      "source_sha256": "1389a49cefc4faf127594bb54c03a7af64cc53f0d960925043cbc4b0fc5f9266",
+      "source_sha256": "e75d813a6517ff51e19b317fee6e01817335ba603b81f1deedb2def6974c1d7b",
       "replay_command": ["go", "test", "./accumulo", "-run", "^TestRangeWireBoundaries$", "-count=1"]
     }
   ]

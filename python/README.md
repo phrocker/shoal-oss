@@ -5,13 +5,14 @@ Sharkbite replacement and not a release under the reserved `sharkbite`
 distribution name. The distribution is named `shoal-sharkbite`; it installs
 the import-compatible modules `sharkbite` and `pysharkbite`.
 The [normative scope ADR](../docs/sharkbite-client-scope.md) currently records
-397 required rows, 208 satisfied rows, and 189 explicit core gaps; optional
+397 required rows, 219 satisfied rows, and 178 explicit core gaps; optional
 Torch, pandas, embedded, and historical C++ surfaces do not block this package.
 
 Supported now:
 
 - deterministic Shoal shared-library discovery and ABI/capability negotiation;
-- stable status-to-exception mapping, including Sharkbite `ClientException`;
+- exact status/source-to-exception mapping, including Sharkbite
+  `ClientException.getErrorCode()` and chained native context;
 - owned handle/result cleanup and idempotent context-manager close;
 - `Connector`, `Client`, `Scanner`, `Key`, and streaming-free bounded scans
   through the high-level C ABI;
@@ -24,6 +25,7 @@ Supported now:
   configuration rather than accepting credentials in Python;
 - context-managed RFile sequential readers/writers, including named locality
   groups.
+- injectable structured logging through `LoggingConfiguration.configure()`.
 
 Unsupported legacy entry points are present only where useful for discovery and
 raise `NotImplementedError` with a stable message. They never fabricate data.
@@ -55,6 +57,8 @@ The library must expose ABI major 1. APIs check their exact capability set:
 Storage uses capabilities 16 (RFile), 27 (HDFS), and 28 (named locality
 groups). Capability 29 adds the exact buffered-writer queue accessor and
 process-wide logging control.
+Capability 30 adds HDFS mkdir/chown, structured logging callbacks, and explicit
+Sharkbite error-code mapping.
 
 `ScannerOptions.HedgedReads`, `ScannerOptions.RFileScanOnly`, and
 `PythonIterator` remain import-compatible but raise stable `NotImplementedError`
@@ -67,6 +71,7 @@ or generated Thrift exceptions, and scopes transport pools per connector.
 from sharkbite import Hdfs, Key, KeyValue, RFileOperations
 
 with Hdfs("namenode", 8020) as hdfs:
+    hdfs.mkdir("/tmp/shoal")
     with hdfs.write("/tmp/value") as out:
         out.writeString("hello")
     with hdfs.read("/tmp/value") as source:
