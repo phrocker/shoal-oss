@@ -17,8 +17,8 @@ import unicodedata
 
 
 DOC_PATH = Path(__file__).with_name("sharkbite-compatibility.md")
-EXPECTED_REVISION = 41
-APPROVAL_REVISION = 40
+EXPECTED_REVISION = 42
+CLUSTER_STATUS_APPROVAL_REVISION = 40
 # Update this manifest only when the independently audited inventory itself
 # changes; review every added/removed or reclassified ID in code review.
 EXPECTED_ROW_MANIFEST = DOC_PATH.with_name(
@@ -64,8 +64,8 @@ def status_count_map(
 
 EXPECTED_STATUS_COUNTS = {
     "Covered": 153,
-    "Missing Go": 2274,
-    "Missing C ABI": 64,
+    "Missing Go": 2249,
+    "Missing C ABI": 89,
     "Behavior mismatch": 233,
     "Intentional divergence (approval required)": 87,
     "Not required (rationale required)": 392,
@@ -92,11 +92,11 @@ EXPECTED_PREFIX_COUNTS = {
         not_required=8,
     ),
     "SB-CXX": status_count_map(
-        missing_go=2214,
+        missing_go=2189,
         covered=63,
         behavior_mismatch=29,
         not_required=304,
-        missing_c_abi=16,
+        missing_c_abi=41,
     ),
     "SB-DATA": status_count_map(
         covered=9,
@@ -201,9 +201,9 @@ EXPECTED_METADATA_FIELDS = {
     ),
     "Sharkbite release line": "`sharkbite` 1.2.0.3 on PyPI (`setup.py:34-35`)",
     "Shoal reference": (
-        "`phrocker/shoal-oss` exact audited baseline for revision 41 "
-        "`5770a8e868628eb914408ae21ddc8dd09f7f5ad1` "
-        "(\"Merge pull request #120 from phrocker/agent/issue-67-manager-servicelock-integration\") "
+        "`phrocker/shoal-oss` exact audited baseline for revision 42 "
+        "`46a50bd46a8ea4a33902703dc3f6c3eca97f8dcc` "
+        "(\"Merge pull request #159 from phrocker/rewrite/108-data-model\") "
         "plus the owned-key C ABI introduced in this revision"
     ),
     "Shoal C ABI version": "`SHOAL_ABI_VERSION 1u` (`capi/include/shoal_types.h`)",
@@ -212,7 +212,9 @@ EXPECTED_METADATA_FIELDS = {
 EXPECTED_DOCUMENT_STATUS_SNIPPETS = (
     "Normative gate. Binding on all Sharkbite-compatibility work.",
     f"Revision {EXPECTED_REVISION} — completes the 36-row owned mutable key ABI tranche",
-    "Revision 40 — mirrors the first approved divergence into the matrix: @phrocker approved [SB-DIV-016](#sec-26) on 2026-08-19",
+    "Revision 41 — records the public column and entry value APIs",
+    "Revision 40 — mirrors the first approved divergence into the "
+    f"matrix: @phrocker approved [SB-DIV-016](#sec-26) on 2026-08-19",
     "Revision 39 — records the public tablet extent API",
     "Revision 38 — completes the 31-row column-visibility expression tranche",
     "Revision 37 — records the public key value API",
@@ -811,6 +813,24 @@ OPTIONAL_ANCHOR_CITATIONS = {
 # same reason: the matrix claims an exact public Go surface, so a rename or a
 # deleted method must fail the document, not just the build.
 # Implementation files behind the section 11 table-maintenance rows.
+TARGETED_SB_DM_CITATIONS = {
+    "accumulo/column.go",
+    "accumulo/key_value.go",
+    "accumulo/scanner.go",
+    "accumulo/data_model_test.go",
+}
+
+TARGETED_SYMBOL_ANCHORS_BY_ROW_CITATION = {
+    ("SB-SCAN-005", "accumulo/scanner.go"): {"NewColumnFamily", "NewColumn"},
+    ("SB-BASE-020", "accumulo/scanner.go"): {"NewColumnFamily", "NewColumn"},
+    ("SB-CPP-070", "accumulo/scanner.go"): {"NewColumnFamily", "NewColumn"},
+    ("SB-CXX-0208", "accumulo/scanner.go"): {"NewColumnFamily"},
+    ("SB-CXX-0209", "accumulo/scanner.go"): {"NewColumn"},
+    ("SB-CXX-0217", "accumulo/scanner.go"): {"Column.Family"},
+    ("SB-CXX-0219", "accumulo/scanner.go"): {"Column.Qualifier"},
+    ("SB-XCUT-003", "accumulo/scanner.go"): {"Column.Family"},
+}
+
 TARGETED_SB_EXTENT_CITATIONS = {
     "accumulo/tablet_extent.go",
     "accumulo/tablet_extent_test.go",
@@ -868,6 +888,7 @@ ANCHOR_CHECKED_CITATIONS = (
     | TARGETED_SB_VIS_CITATIONS
     | TARGETED_SB_KEY_CITATIONS
     | TARGETED_SB_EXTENT_CITATIONS
+    | TARGETED_SB_DM_CITATIONS
 )
 COUNT_RE = re.compile(
     r"^(?P<bold>\*\*)?(?P<number>0|[1-9]\d*|[1-9]\d{0,2}(?:,\d{3})+)(?(bold)\*\*|)$"
@@ -2869,7 +2890,9 @@ def validate_divergence_approvals(
     # §14 is explicitly normative, so its approval block is pinned whole. The pin
     # is checked against the fragments first, so narrowing the pin is reported as
     # a pin defect rather than as a document mismatch.
-    expected_behavior_preamble = APPROVAL_BEHAVIOR_PREAMBLE.format(revision=APPROVAL_REVISION)
+    expected_behavior_preamble = APPROVAL_BEHAVIOR_PREAMBLE.format(
+        revision=CLUSTER_STATUS_APPROVAL_REVISION
+    )
     for fragment in behavior_fragments:
         require(
             fragment in expected_behavior_preamble,
@@ -3190,11 +3213,11 @@ def validate_status_narratives(
     expected_phrases = [
         (RELEASE_GATE_SECTION_HEADING, f"As of revision {EXPECTED_REVISION} that is {required_rows} of {total_rows} rows, and **{satisfied} are satisfied**: {status_counts['Covered']} are `Covered` ([SB-XCUT-012](#sec-20), the twelve configuration/topology rows in [§6](#sec-6), the 31 RFile/stream rows in [§15](#sec-15), the 17 data-model value rows in [§8](#sec-8) and [§19.2](#sec-19-2), the four buffered-writer rows in [§10](#sec-10), the four row-bounded flush/constraint rows in [§11](#sec-11) and [§19.2](#sec-19-2), the connector invalidation/cancellation rows in [§7](#sec-7) and [§20](#sec-20), the eight high-level client rows in [§10.1](#sec-10-1), the five high-level scanner rows in [§10.1](#sec-10-1), the four compatibility-error rows in [§18](#sec-18), the twelve streaming cursor rows in [§9](#sec-9), [§10.1](#sec-10-1), [§19.2](#sec-19-2), and [§20](#sec-20), the 31 column-visibility rows in [§18](#sec-18) and [§19.2](#sec-19-2), and the 22 equivalent owned-key rows in [§19.2](#sec-19-2)) and {approved_divergences} are approved intentional divergences ([SB-DIV-016](#sec-26)), which record a permanent capability loss rather than delivered compatibility."),
         (COUNTS_SECTION_HEADING, f"{required_rows} rows are **required** by the final release gate ([§2.2](#sec-2)); the {status_counts[NOT_REQUIRED_STATUS]} `Not required` rows are excluded by construction, and {prefix_counts['SB-CXX'][NOT_REQUIRED_STATUS]} of those are the evidence-proved duplicates described in [§19.1](#sec-19-1)."),
-        (COUNTS_SECTION_HEADING, "**Exactly 153 rows are `Covered`: [SB-XCUT-012](#sec-20), the twelve configuration/topology rows completed in revision 24, the 31 RFile/stream rows completed in revision 25, the 17 data-model value rows completed in revision 26, the four buffered-writer rows completed in revision 28, the four row-bounded flush/constraint rows completed in revision 29, the connector invalidation/cancellation rows completed in revision 30, the eight high-level client rows completed in revision 31, the five high-level scanner rows completed in revision 32, the four compatibility-error rows completed in revision 34, the twelve streaming cursor rows completed in revision 36, the 31 column-visibility rows completed in revision 38, and the 22 equivalent owned-key rows completed in revision 41.**"),
+        (COUNTS_SECTION_HEADING, "**Exactly 153 rows are `Covered`: [SB-XCUT-012](#sec-20), the twelve configuration/topology rows completed in revision 24, the 31 RFile/stream rows completed in revision 25, the 17 data-model value rows completed in revision 26, the four buffered-writer rows completed in revision 28, the four row-bounded flush/constraint rows completed in revision 29, the connector invalidation/cancellation rows completed in revision 30, the eight high-level client rows completed in revision 31, the five high-level scanner rows completed in revision 32, the four compatibility-error rows completed in revision 34, the twelve streaming cursor rows completed in revision 36, the 31 column-visibility rows completed in revision 38, and the 22 equivalent owned-key rows completed in revision 42.**"),
         (COUNTS_SECTION_HEADING, f"The shape of the work is visible in the {status_counts['Missing Go']} `Missing Go` rows, of which {prefix_counts['SB-CXX']['Missing Go']} are the C++ members in [§19.2](#sec-19-2) that no Shoal layer exports."),
         (COUNTS_SECTION_HEADING, f"`Behavior mismatch` ({status_counts['Behavior mismatch']}) is the bucket that sets the schedule: {python_visible_behavior} rows on the Python-visible and curated C++ surface each need a differential test against a live cluster or the exported ABI, and {prefix_counts['SB-CXX']['Behavior mismatch']} are C++ rows: 15 destructors of classes bound into Python, where the destruction point is user-observable and the model differs from Go finalisation ([§19.1](#sec-19-1)), plus the 14 owned-key comparison and capacity-reporting rows whose safe Shoal behavior deliberately does not reproduce [SB-UNSAFE-046](#sec-21) or [SB-UNSAFE-048](#sec-21)."),
         (COUNTS_SECTION_HEADING, f"`Intentional divergence` ({status_counts[INTENTIONAL_DIVERGENCE_STATUS]}) is dominated by one upstream fact: {prefix_counts['SB-STAT'][INTENTIONAL_DIVERGENCE_STATUS]} rows are cluster-status accessors Accumulo itself deleted ([§14](#sec-14), [SB-DIV-016](#sec-26))."),
-        (COUNTS_SECTION_HEADING, f"`Missing C ABI` ({status_counts['Missing C ABI']}) is now led by pandas ({prefix_counts['SB-PANDA']['Missing C ABI']}), the tablet extent API ({prefix_counts['SB-CXX']['Missing C ABI']}), packaging/import scaffolding ({prefix_counts['SB-PKG']['Missing C ABI']}), PyTorch ({prefix_counts['SB-TORCH']['Missing C ABI']}), the remaining scanner rows ({prefix_counts['SB-SCAN']['Missing C ABI']}), writer rows ({prefix_counts['SB-WRITE']['Missing C ABI']}), cross-cutting rows ({prefix_counts['SB-XCUT']['Missing C ABI']}), the remaining curated-C++ row ({prefix_counts['SB-CPP']['Missing C ABI']}), and the remaining data-model row ({prefix_counts['SB-DATA']['Missing C ABI']})."),
+        (COUNTS_SECTION_HEADING, f"`Missing C ABI` ({status_counts['Missing C ABI']}) is now led by the column and entry value APIs (25), pandas ({prefix_counts['SB-PANDA']['Missing C ABI']}), the tablet extent API (16), packaging/import scaffolding ({prefix_counts['SB-PKG']['Missing C ABI']}), PyTorch ({prefix_counts['SB-TORCH']['Missing C ABI']}), the remaining scanner rows ({prefix_counts['SB-SCAN']['Missing C ABI']}), writer rows ({prefix_counts['SB-WRITE']['Missing C ABI']}), cross-cutting rows ({prefix_counts['SB-XCUT']['Missing C ABI']}), the remaining curated-C++ row ({prefix_counts['SB-CPP']['Missing C ABI']}), and the remaining data-model row ({prefix_counts['SB-DATA']['Missing C ABI']})."),
     ]
     section_text: dict[str, str] = {}
     for heading, phrase in expected_phrases:
@@ -3432,11 +3455,35 @@ def validate_targeted_symbol_anchors(
     contents = load_targeted_contents(targeted_paths, repo_root=repo_root)
 
     for _line_number, row_id, cells in iter_matrix_rows(lines):
+        row_targeted_paths = targeted_paths
+        if (
+            "accumulo/scanner.go" in targeted_paths
+            and not any(
+                mapped_row == row_id and mapped_ref == "accumulo/scanner.go"
+                for mapped_row, mapped_ref in TARGETED_SYMBOL_ANCHORS_BY_ROW_CITATION
+            )
+        ):
+            row_targeted_paths = targeted_paths - {"accumulo/scanner.go"}
         for cell in cells[1:]:
-            path_anchor_bindings = extract_path_anchor_bindings(cell, targeted_paths)
+            path_anchor_bindings = extract_path_anchor_bindings(cell, row_targeted_paths)
             if not path_anchor_bindings:
                 continue
             for ref, anchors in path_anchor_bindings.items():
+                scanner_key = (row_id, ref)
+                if ref == "accumulo/scanner.go":
+                    expected_symbols = TARGETED_SYMBOL_ANCHORS_BY_ROW_CITATION[scanner_key]
+                    cited_symbols = {anchor.split("(", 1)[0] for anchor in anchors}
+                    missing_symbols = sorted(expected_symbols - cited_symbols)
+                    require(
+                        not missing_symbols,
+                        f"{row_id} cites {ref} without required targeted anchors: "
+                        f"{', '.join(missing_symbols)}",
+                    )
+                    anchors = [
+                        anchor
+                        for anchor in anchors
+                        if anchor.split("(", 1)[0] in expected_symbols
+                    ]
                 anchors = filtered_local_anchors(ref, anchors)
                 if ref not in OPTIONAL_ANCHOR_CITATIONS:
                     require(
