@@ -7,6 +7,7 @@ from sharkbite import (
     Authorizations,
     BatchWriter,
     Connector,
+    LoggingConfiguration,
     Mutation,
     NamespacePermissions,
     SystemPermissions,
@@ -40,6 +41,7 @@ class FakeLibrary:
         self.shoal_connector_create_batch_writer = Function(self._writer_create)
         self.shoal_batch_writer_add = Function(self._writer_add)
         self.shoal_batch_writer_flush = Function(lambda *args: self._record("flush", *args))
+        self.shoal_batch_writer_size = Function(self._writer_size)
         self.shoal_batch_writer_close = Function(lambda *args: self._record("writer_close", *args))
         self.shoal_batch_writer_free = Function(lambda *_: self.frees.append("writer"))
         self.shoal_mutation_create = Function(self._mutation_create)
@@ -51,6 +53,9 @@ class FakeLibrary:
         self.shoal_mutation_free = Function(lambda *_: self.frees.append("mutation"))
         self.shoal_write_failure_get_flags = Function(lambda *_: 0)
         self.shoal_write_failure_free = Function(lambda *_: self.frees.append("failure"))
+        self.shoal_logging_set_level = Function(self._logging_set)
+        self.shoal_logging_get_level = Function(lambda: self.log_level)
+        self.log_level = 0
         self._bind_admin()
 
     @staticmethod
@@ -86,6 +91,15 @@ class FakeLibrary:
 
     def _writer_add(self, *args):
         self.calls.append(("add", args[2]))
+        return 0
+
+    @staticmethod
+    def _writer_size(handle, timeout, out_size, error):
+        C.cast(out_size, C.POINTER(C.c_size_t)).contents.value = 3
+        return 0
+
+    def _logging_set(self, level, error):
+        self.log_level = level
         return 0
 
     def _bind_admin(self):
@@ -191,7 +205,7 @@ class FakeLibrary:
 class FakeAPI:
     def __init__(self):
         self.lib = FakeLibrary()
-        self.capabilities = frozenset(range(27))
+        self.capabilities = frozenset(range(30))
 
     def require(self, *capabilities):
         if set(capabilities) - self.capabilities:
@@ -222,12 +236,19 @@ class WriterAdminTests(unittest.TestCase):
             self.assertEqual(mutation.size(), 7)
             with BatchWriter(self.connector, "t") as writer:
                 self.assertTrue(writer.addMutation(mutation))
+                self.assertEqual(writer.size(), 3)
                 self.assertTrue(writer.flush())
                 writer.close()
         self.assertIn(("mutation_create", b"row"), self.api.lib.calls)
         self.assertIn(("put", b"cf", b"cq", b"A", 7, b"value"), self.api.lib.calls)
         self.assertEqual(self.api.lib.frees.count("writer"), 1)
         self.assertEqual(self.api.lib.frees.count("mutation"), 1)
+
+    def test_process_wide_logging_control_uses_stable_abi(self):
+        LoggingConfiguration._set(1, self.api)
+        self.assertEqual(self.api.lib.log_level, 1)
+        LoggingConfiguration._set(2, self.api)
+        self.assertEqual(self.api.lib.log_level, 2)
 
     def test_table_namespace_security_legacy_shapes(self):
         table = self.connector.tableOps("t")

@@ -152,8 +152,8 @@ assert shutil.which("go") is None
 assert pysharkbite.Client is sharkbite.Client
 assert pysharkbite.__version__ == sharkbite.__version__
 api = NativeAPI()
-assert api.info.version >= (1, 16, 0)
-api.require(6, 7, 8, 9, 10, 11, 12, 16, 19, 21, 22, 27, 28)
+assert api.info.version >= (1, 17, 0)
+api.require(6, 7, 8, 9, 10, 11, 12, 16, 19, 21, 22, 27, 28, 29)
 with Mutation(b"release-smoke", _api=api) as mutation:
     mutation.put(b"cf", b"cq", b"A", 1, b"value")
     assert mutation.size() > 0

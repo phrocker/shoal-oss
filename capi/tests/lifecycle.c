@@ -8,9 +8,9 @@
 
 _Static_assert(SHOAL_ABI_VERSION == 1u, "unexpected compatibility ABI version");
 _Static_assert(SHOAL_ABI_VERSION_MAJOR == 1u, "unexpected ABI major");
-_Static_assert(SHOAL_ABI_VERSION_MINOR == 16u, "unexpected ABI minor");
+_Static_assert(SHOAL_ABI_VERSION_MINOR == 17u, "unexpected ABI minor");
 _Static_assert(SHOAL_ABI_VERSION_PATCH == 0u, "unexpected ABI patch");
-_Static_assert(SHOAL_ABI_VERSION_PACKED == 0x00011000u,
+_Static_assert(SHOAL_ABI_VERSION_PACKED == 0x00011100u,
                "unexpected packed ABI version");
 _Static_assert(SHOAL_ABI_CAPABILITY_CONNECTOR == 0u,
                "unexpected connector capability id");
@@ -64,11 +64,11 @@ _Static_assert(SHOAL_ABI_CAPABILITY_COLUMN_VISIBILITY == 25u,
                "unexpected column visibility capability id");
 _Static_assert(SHOAL_ABI_CAPABILITY_OWNED_KEY == 26u,
                "unexpected owned key capability id");
-_Static_assert(SHOAL_ABI_CAPABILITY_COUNT == 29u,
+_Static_assert(SHOAL_ABI_CAPABILITY_COUNT == 30u,
                "unexpected capability count");
 _Static_assert(SHOAL_ABI_CAPABILITY_WORD_COUNT == 1u,
                "unexpected capability word count");
-_Static_assert(SHOAL_ABI_CAPABILITY_WORD0 == UINT64_C(0x1fffffff),
+_Static_assert(SHOAL_ABI_CAPABILITY_WORD0 == UINT64_C(0x3fffffff),
                "unexpected capability word 0");
 
 #define ASSERT_PERMISSION_VALUE(name, value)                                  \
@@ -2486,14 +2486,29 @@ int main(void) {
   assert(shoal_batch_writer_add(writer, mutation, 0, &write_failure, &error) ==
          SHOAL_STATUS_OK);
   assert(write_failure == NULL && error == NULL);
+  size_t writer_size = SIZE_MAX;
+  assert(shoal_batch_writer_size(writer, 0, &writer_size, &error) ==
+         SHOAL_STATUS_OK);
+  assert(writer_size == 1 && error == NULL);
   assert(shoal_batch_writer_flush(writer, 0, &write_failure, &error) ==
          SHOAL_STATUS_OK);
+  assert(shoal_batch_writer_size(writer, 0, &writer_size, &error) ==
+         SHOAL_STATUS_OK);
+  assert(writer_size == 0 && error == NULL);
   assert(shoal_batch_writer_close(writer, 0, &write_failure, &error) ==
          SHOAL_STATUS_OK);
   assert(shoal_batch_writer_close(writer, 0, &write_failure, &error) ==
          SHOAL_STATUS_OK);
   shoal_batch_writer_free(&writer);
   assert(writer == NULL);
+
+  assert(shoal_logging_set_level(SHOAL_LOG_LEVEL_DEBUG, &error) ==
+         SHOAL_STATUS_OK);
+  assert(shoal_logging_get_level() == SHOAL_LOG_LEVEL_DEBUG);
+  expect_error(shoal_logging_set_level(99, &error),
+               SHOAL_STATUS_INVALID_ARGUMENT, &error, "log level");
+  assert(shoal_logging_set_level(SHOAL_LOG_LEVEL_OFF, &error) ==
+         SHOAL_STATUS_OK);
 
   assert(shoal_test_batch_writer_create(
       SHOAL_TEST_WRITER_STRUCTURED_FAILURE, &writer));

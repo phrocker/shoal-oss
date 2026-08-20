@@ -24,6 +24,7 @@ from .client import (
     Key,
     Scanner,
 )
+from .compatibility import LoggingConfiguration, PythonIterator, ScannerOptions
 from .errors import (
     AmbiguousWriteError,
     AlreadyExistsError,
@@ -75,6 +76,7 @@ __all__ = [
     "HdfsOutputStream",
     "Key",
     "KeyValue",
+    "LoggingConfiguration",
     "NativeAPI",
     "NamespaceOperations",
     "NamespacePermissions",
@@ -82,7 +84,9 @@ __all__ = [
     "PermissionDeniedError",
     "RuntimeInfo",
     "RFileOperations",
+    "PythonIterator",
     "Scanner",
+    "ScannerOptions",
     "SecurityOperations",
     "ShoalSystemPermissions",
     "ShoalTablePermissions",

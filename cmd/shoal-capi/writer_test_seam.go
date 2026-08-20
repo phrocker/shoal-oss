@@ -22,17 +22,30 @@ type testBatchWriter struct {
 
 	mu       sync.Mutex
 	closeErr error
+	pending  int
+}
+
+func (w *testBatchWriter) Size(context.Context) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.pending, nil
 }
 
 func (w *testBatchWriter) Add(_ context.Context, mutation *accumulo.Mutation) error {
 	if mutation == nil || mutation.Size() == 0 {
 		return errors.New("accumulo: mutation must contain at least one update")
 	}
+	w.mu.Lock()
+	w.pending++
+	w.mu.Unlock()
 	return nil
 }
 
 func (w *testBatchWriter) Flush(context.Context) error {
 	if w.mode != int(C.SHOAL_TEST_WRITER_STRUCTURED_FAILURE) {
+		w.mu.Lock()
+		w.pending = 0
+		w.mu.Unlock()
 		return nil
 	}
 	return testStructuredWriterError()

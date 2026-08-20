@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import ctypes as C
+import copy
 import unittest
 
 import pysharkbite
 import sharkbite
-from sharkbite import Client, Connector, Key
+from sharkbite import Client, Connector, Key, PythonIterator, ScannerOptions
 from sharkbite._native import (
     CAP_HIGH_LEVEL_CLIENT,
     CAPABILITY_SYMBOLS,
@@ -100,7 +101,7 @@ class FakeLibrary:
 class FakeAPI:
     def __init__(self):
         self.lib = FakeLibrary()
-        self.capabilities = frozenset(range(27))
+        self.capabilities = frozenset(range(30))
 
     def require(self, *capabilities):
         missing = set(capabilities) - self.capabilities
@@ -142,6 +143,14 @@ class FoundationTests(unittest.TestCase):
         self.assertEqual(api.lib.closed, ["connector"])
         self.assertEqual(api.lib.freed, ["connector"])
 
+    def test_connector_copy_is_explicitly_rejected(self):
+        api = FakeAPI()
+        with Connector("i", "zk", "u", "p", _api=api) as connector:
+            with self.assertRaisesRegex(TypeError, "cannot be copied"):
+                copy.copy(connector)
+            with self.assertRaisesRegex(TypeError, "cannot be copied"):
+                copy.deepcopy(connector)
+
     def test_client_scan_copies_and_frees_owned_result(self):
         api = FakeAPI()
         with Client("i", "zk", "u", "p", table="t", _api=api) as client:
@@ -158,6 +167,27 @@ class FoundationTests(unittest.TestCase):
         client = object.__new__(Client)
         with self.assertRaisesRegex(NotImplementedError, "SB-DIV-016"):
             client.getStatistics()
+
+    def test_accumulo_version_scope_is_explicit(self):
+        with self.assertRaisesRegex(NotImplementedError, "SB-DIV-001"):
+            Connector("i", "zk", "u", "p", accumulo_version="2.1.0", _api=FakeAPI())
+
+    def test_scanner_options_and_python_iterator_are_importable_but_unsupported(self):
+        self.assertEqual(int(ScannerOptions.HedgedReads), 1)
+        self.assertEqual(int(ScannerOptions.RFileScanOnly), 2)
+        iterator = PythonIterator("iter", 7).onNext("lambda key, value: True")
+        self.assertEqual(iterator.getName(), "iter")
+        self.assertEqual(iterator.priority(), 7)
+        self.assertEqual(iterator.getClass(), "org.poma.accumulo.JythonIterator")
+        with self.assertRaisesRegex(RuntimeError, "python script"):
+            PythonIterator("iter", "class iter: pass", 7).onNext("lambda value: value")
+        scanner = object.__new__(sharkbite.AccumuloScanner)
+        with self.assertRaisesRegex(NotImplementedError, "SB-DIV-008"):
+            scanner.setOption(ScannerOptions.HedgedReads)
+        with self.assertRaisesRegex(NotImplementedError, "SB-DIV-008"):
+            scanner.setOption(ScannerOptions.RFileScanOnly)
+        with self.assertRaisesRegex(NotImplementedError, "SB-DIV-007"):
+            scanner.addIterator(iterator)
 
     def test_unsupported_scanner_iterator_is_explicit(self):
         scanner = object.__new__(sharkbite.AccumuloScanner)
