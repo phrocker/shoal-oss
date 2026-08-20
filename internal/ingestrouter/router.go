@@ -221,6 +221,8 @@ func (s *Session) route(ctx context.Context, requestID string, batch Batch) Outc
 	operationID := operationID(s.id, requestID, batch.Extent.Key())
 	err = tablet.Commit(ctx, CommitRequest{
 		OperationID: operationID,
+		SessionID:   s.id,
+		RequestID:   requestID,
 		Extent:      batch.Extent.clone(),
 		Fence:       fence,
 		Mutations:   cloneMutations(batch.Mutations),

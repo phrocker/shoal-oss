@@ -193,9 +193,11 @@ func TestConcurrentDuplicateIsCommittedOnce(t *testing.T) {
 	extent := Extent{TableID: "5"}
 	entered := make(chan struct{})
 	release := make(chan struct{})
+	var got CommitRequest
 	tablet := &fakeTablet{
 		extent: extent, fence: testFence(), authority: AuthorityAccumuloWAL,
-		commit: func(context.Context, CommitRequest) error {
+		commit: func(_ context.Context, request CommitRequest) error {
+			got = request
 			close(entered)
 			<-release
 			return nil
@@ -235,6 +237,9 @@ func TestConcurrentDuplicateIsCommittedOnce(t *testing.T) {
 	}
 	if tablet.calls.Load() != 1 {
 		t.Fatalf("Commit calls = %d, want 1", tablet.calls.Load())
+	}
+	if got.SessionID != "session-1" || got.RequestID != "same" {
+		t.Fatalf("commit identity = session %q request %q", got.SessionID, got.RequestID)
 	}
 }
 
