@@ -352,6 +352,17 @@ class TableOperations(_Operations):
             options=BatchWriterOptions(max_write_threads=threads),
         )
 
+    def createScanner(
+        self, auths: object = (), threads: int = 10
+    ) -> object:
+        if auths is None:
+            from .errors import ClientException
+
+            raise ClientException("authorizations must not be None")
+        from .client import BatchScanner
+
+        return BatchScanner(self._connector, self.table, auths, threads)
+
     def import_directory(
         self,
         directory: str,

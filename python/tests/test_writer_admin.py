@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ctypes as C
 import inspect
+import threading
 import logging
 import unittest
 from concurrent.futures import ThreadPoolExecutor
@@ -62,6 +63,7 @@ class FakeLibrary:
         self.shoal_logging_get_level = Function(lambda: self.log_level)
         self.shoal_logging_set_callback = Function(self._logging_callback)
         self.log_level = 0
+        self.mutation_size = 7
         self.log_callback = None
         self._bind_admin()
 
@@ -97,7 +99,7 @@ class FakeLibrary:
         return 0
 
     def _mutation_size(self, handle, out_size, error):
-        C.cast(out_size, C.POINTER(C.c_size_t)).contents.value = 7
+        C.cast(out_size, C.POINTER(C.c_size_t)).contents.value = self.mutation_size
         return 0
 
     def _writer_add(self, *args):
@@ -266,6 +268,73 @@ class WriterAdminTests(unittest.TestCase):
         self.assertEqual(self.api.lib.log_level, 1)
         LoggingConfiguration._set(2, self.api)
         self.assertEqual(self.api.lib.log_level, 2)
+
+    def test_writer_accepts_empty_mutation_without_native_rejection(self):
+        self.api.lib.mutation_size = 0
+        with Mutation(b"row", _api=self.api) as mutation:
+            with BatchWriter(self.connector, "t") as writer:
+                self.assertTrue(writer.addMutation(mutation))
+        self.assertFalse(any(name == "add" for name, _ in self.api.lib.calls))
+
+    def test_writer_context_propagates_body_exception(self):
+        with self.assertRaisesRegex(RuntimeError, "body"):
+            with BatchWriter(self.connector, "t"):
+                raise RuntimeError("body")
+
+    def test_writer_concurrent_adds_are_python_thread_safe(self):
+        with Mutation(b"row", _api=self.api) as mutation:
+            mutation.put()
+            with BatchWriter(self.connector, "t") as writer:
+                errors = []
+
+                def add():
+                    try:
+                        writer.addMutation(mutation)
+                    except BaseException as exc:
+                        errors.append(exc)
+
+                threads = [threading.Thread(target=add) for _ in range(32)]
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join()
+                self.assertFalse(errors)
+        self.assertEqual(
+            sum(call[0] == "add" for call in self.api.lib.calls),
+            32,
+        )
+
+    def test_writer_close_waits_for_an_active_add(self):
+        started = threading.Event()
+        release = threading.Event()
+        close_finished = threading.Event()
+        original_add = self.api.lib.shoal_batch_writer_add.callback
+
+        def blocked_add(*args):
+            started.set()
+            release.wait(2)
+            return original_add(*args)
+
+        self.api.lib.shoal_batch_writer_add.callback = blocked_add
+        with Mutation(b"row", _api=self.api) as mutation:
+            mutation.put()
+            writer = BatchWriter(self.connector, "t")
+            add_thread = threading.Thread(target=writer.addMutation, args=(mutation,))
+            close_thread = threading.Thread(
+                target=lambda: (writer.close(), close_finished.set())
+            )
+            add_thread.start()
+            self.assertTrue(started.wait(2))
+            close_thread.start()
+            self.assertFalse(close_finished.wait(0.05))
+            self.assertNotIn("writer", self.api.lib.frees)
+            release.set()
+            add_thread.join(2)
+            close_thread.join(2)
+            self.assertFalse(add_thread.is_alive())
+            self.assertFalse(close_thread.is_alive())
+            self.assertTrue(close_finished.is_set())
+        self.assertEqual(self.api.lib.frees.count("writer"), 1)
 
     def test_structured_logging_is_injectable_without_secret_fields(self):
         records = []

@@ -18,9 +18,11 @@ from .client import (
     AccumuloIterator,
     AccumuloScanner,
     AccumuloWriter,
+    BatchScanner,
     Client,
     Connector,
     Scanner,
+    Results,
 )
 from .data import Authorizations, Key, KeyValue, Range, Value
 from .compatibility import IterInfo, LoggingConfiguration, PythonIterator, ScannerOptions
@@ -61,6 +63,7 @@ __all__ = [
     "Authorizations",
     "BatchWriter",
     "BatchWriterOptions",
+    "BatchScanner",
     "CancelledError",
     "Client",
     "ClientException",
@@ -86,6 +89,7 @@ __all__ = [
     "RuntimeInfo",
     "RFileOperations",
     "PythonIterator",
+    "Results",
     "Scanner",
     "ScannerOptions",
     "SecurityOperations",

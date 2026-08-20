@@ -5,7 +5,7 @@ Sharkbite replacement and not a release under the reserved `sharkbite`
 distribution name. The distribution is named `shoal-sharkbite`; it installs
 the import-compatible modules `sharkbite` and `pysharkbite`.
 The [normative scope ADR](../docs/sharkbite-client-scope.md) currently records
-397 required rows, 338 satisfied rows, and 59 explicit core gaps; optional
+397 required rows, 361 satisfied rows, and 36 explicit core gaps; optional
 Torch, pandas, embedded, and historical C++ surfaces do not block this package.
 
 Supported now:
@@ -13,8 +13,8 @@ Supported now:
 - deterministic Shoal shared-library discovery and ABI/capability negotiation;
 - stable status-to-exception mapping, including Sharkbite `ClientException`;
 - owned handle/result cleanup and idempotent context-manager close;
-- `Connector`, `Client`, `Scanner`, `Key`, and streaming-free bounded scans
-  through the high-level C ABI;
+- `Connector`, `Client`, `Scanner`, `BatchScanner`, restartable sync/async
+  `Results`, `Key`, and bounded scans through the streaming C ABI;
 - binary-safe `Mutation` and `BatchWriter` APIs with deterministic
   flush/close and structured write-failure status mapping;
 - table, namespace, and security administration through both direct
@@ -76,6 +76,14 @@ messages when applied. These are approved divergences: use normal RPC scans,
 `RFileOperations` for explicit RFile access, and Shoal's Go iterator runtime.
 Shoal accepts Accumulo 4 configurations only, never exposes password read-back
 or generated Thrift exceptions, and scopes transport pools per connector.
+
+`tableOps(name).createScanner(auths=(), threads=10)` returns a deferred
+`BatchScanner`. Add copied ranges with `addRange`/`withRange`, then call
+`getResultSet()`; each synchronous or asynchronous iteration opens a fresh
+cursor, and scanner/result context managers close blocked work safely.
+Live-cluster server timeout/consistency and retry parity remain tracked by
+[issue #74](https://github.com/phrocker/shoal-oss/issues/74); unit and compiled
+ABI tests do not claim that external evidence.
 
 ```python
 from sharkbite import Hdfs, Key, KeyValue, RFileOperations
