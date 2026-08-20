@@ -8,6 +8,7 @@ package main
 import "C"
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"time"
@@ -306,6 +307,48 @@ func shoal_batch_writer_flush(
 		return writer.writer.Flush(ctx)
 	}()
 	return finishWrite(err, outFailure, outError)
+}
+
+//export shoal_batch_writer_size
+func shoal_batch_writer_size(
+	handle *C.shoal_batch_writer,
+	timeoutMilliseconds C.int64_t,
+	outSize *C.size_t,
+	outError **C.shoal_error,
+) (status C.shoal_status) {
+	clearError(outError)
+	if outSize != nil {
+		*outSize = 0
+	}
+	defer recoverStatus(&status, outError)
+	if outSize == nil {
+		return fail(outError, C.SHOAL_STATUS_INVALID_ARGUMENT, errors.New("shoal: out_size is required"))
+	}
+	writer, err := lookupBatchWriter(handle)
+	if err != nil {
+		return fail(outError, C.SHOAL_STATUS_INVALID_HANDLE, err)
+	}
+	timeout, err := operationTimeout(timeoutMilliseconds)
+	if err != nil {
+		return fail(outError, C.SHOAL_STATUS_INVALID_ARGUMENT, err)
+	}
+	ctx, done, err := writer.begin(timeout)
+	if err != nil {
+		return failForError(outError, err)
+	}
+	defer done()
+	sizer, ok := writer.writer.(interface {
+		Size(context.Context) (int, error)
+	})
+	if !ok {
+		return fail(outError, C.SHOAL_STATUS_UNSUPPORTED, errors.New("shoal: batch writer size is unsupported"))
+	}
+	size, err := sizer.Size(ctx)
+	if err != nil {
+		return failForError(outError, err)
+	}
+	*outSize = C.size_t(size)
+	return C.SHOAL_STATUS_OK
 }
 
 //export shoal_batch_writer_close

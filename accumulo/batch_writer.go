@@ -327,6 +327,23 @@ func (w *BatchWriter) Add(ctx context.Context, mutation *Mutation) error {
 	return nil
 }
 
+// Size returns the exact number of mutations currently buffered for submission.
+// The value may change immediately after the call when other goroutines use the
+// writer. It returns ErrBatchWriterClosed after Close begins.
+func (w *BatchWriter) Size(ctx context.Context) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	if err := w.lock(ctx); err != nil {
+		return 0, err
+	}
+	defer w.unlock()
+	if w.closed {
+		return 0, ErrBatchWriterClosed
+	}
+	return len(w.pending), nil
+}
+
 // Flush commits every mutation accepted before Flush acquired the writer.
 // Tablet routing, session-start, and explicit uncommitted-suffix failures are
 // retried within the configured bound. Ambiguous apply or close failures are

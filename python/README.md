@@ -50,7 +50,15 @@ with Client("accumulo", "zk1:2181", "root", "secret", table="events") as client:
 The library must expose ABI major 1. APIs check their exact capability set:
 5/21/22 for scans, 6/7/8 for writes, and 9/10/11/12/19 for administration.
 Storage uses capabilities 16 (RFile), 27 (HDFS), and 28 (named locality
-groups).
+groups). Capability 29 adds the exact buffered-writer queue accessor and
+process-wide logging control.
+
+`ScannerOptions.HedgedReads`, `ScannerOptions.RFileScanOnly`, and
+`PythonIterator` remain import-compatible but raise stable `NotImplementedError`
+messages when applied. These are approved divergences: use normal RPC scans,
+`RFileOperations` for explicit RFile access, and Shoal's Go iterator runtime.
+Shoal accepts Accumulo 4 configurations only, never exposes password read-back
+or generated Thrift exceptions, and scopes transport pools per connector.
 
 ```python
 from sharkbite import Hdfs, Key, KeyValue, RFileOperations

@@ -7,6 +7,7 @@ from ._native import (
     CAP_BATCH_WRITER,
     CAP_MUTATION,
     CAP_STRUCTURED_WRITE_FAILURE,
+    CAP_CLIENT_PARITY_CONTROLS,
     BatchWriterConfig,
     NativeAPI,
     as_bytes,
@@ -279,6 +280,17 @@ class BatchWriter:
         )
         self._api.check_write(status, failure, error)
         return True
+
+    def size(self, *, timeout_ms: int = 0) -> int:
+        self._ensure_open()
+        self._api.require(CAP_CLIENT_PARITY_CONTROLS)
+        result = C.c_size_t()
+        error = C.c_void_p()
+        status = self._api.lib.shoal_batch_writer_size(
+            self._handle, timeout_ms, C.byref(result), C.byref(error)
+        )
+        self._api.check(status, error)
+        return int(result.value)
 
     def close(self, *, timeout_ms: int = 0) -> None:
         if self._closed:

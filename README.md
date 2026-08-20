@@ -8,8 +8,9 @@ The `shoal-sharkbite` distribution is available under
 scanning, mutation/batch-writer, and table/namespace/security administration
 paths. It is not yet a complete Sharkbite-compatible distribution;
 unsupported legacy APIs fail explicitly. Linux manylinux_2_28 x86-64 is the
-first supported wheel target; macOS and Windows remain explicitly documented
-previews. See the [release and native-library policy](docs/python-release.md).
+first supported wheel target; Windows is host-verified and macOS remains a
+host-verification gap governed by the
+[release and native-library policy](docs/python-release.md).
 
 A Go sorted key-value store with graph and vector query pushdown.
 Independent project — inspired by [Apache Accumulo](https://accumulo.apache.org)'s

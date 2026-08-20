@@ -1281,6 +1281,15 @@ shoal_batch_writer_flush(shoal_batch_writer *writer, int64_t timeout_ms,
                          shoal_error **out_error);
 
 /*
+ * Returns the exact number of mutations currently buffered in the writer.
+ * The value is a point-in-time snapshot and may change immediately when other
+ * threads use the writer. timeout_ms is zero for no deadline.
+ */
+SHOAL_API shoal_status SHOAL_CALL
+shoal_batch_writer_size(shoal_batch_writer *writer, int64_t timeout_ms,
+                        size_t *out_size, shoal_error **out_error);
+
+/*
  * Close is idempotent, prevents new operations, cancels and joins in-flight
  * calls, then flushes remaining mutations. Repeated calls return the first
  * close result, including a deadline or cancellation failure.
@@ -1292,6 +1301,15 @@ shoal_batch_writer_close(shoal_batch_writer *writer, int64_t timeout_ms,
 
 SHOAL_API void SHOAL_CALL
 shoal_batch_writer_free(shoal_batch_writer **writer);
+
+/*
+ * Logging control is process-wide, matching Sharkbite's static configuration.
+ * Invalid levels are rejected. The current level is allocation-free and safe
+ * to query concurrently.
+ */
+SHOAL_API shoal_status SHOAL_CALL
+shoal_logging_set_level(shoal_log_level level, shoal_error **out_error);
+SHOAL_API shoal_log_level SHOAL_CALL shoal_logging_get_level(void);
 
 /*
  * The buffered writer is an owned, lazy high-level writer. It copies config
