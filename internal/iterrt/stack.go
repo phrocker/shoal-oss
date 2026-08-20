@@ -26,9 +26,9 @@ import "fmt"
 type IterSpec struct {
 	// Name is the iterator's registered identifier. See BuildStack for
 	// the C1 set.
-	Name string
+	Name string `json:"name"`
 	// Options is the per-iterator option map handed to Init.
-	Options map[string]string
+	Options map[string]string `json:"options,omitempty"`
 }
 
 // Stack identifiers recognized by BuildStack. The set grows as iterator
@@ -119,6 +119,9 @@ const (
 // An empty specs list returns leaf unchanged: "identity compaction"
 // (cells pass through untouched), which is the C0 harness behaviour.
 func BuildStack(leaf SortedKeyValueIterator, specs []IterSpec, env IteratorEnvironment) (SortedKeyValueIterator, error) {
+	if err := ValidateStack(specs, ContextFromScope(env.Scope)); err != nil {
+		return nil, err
+	}
 	cur := leaf
 	for i, spec := range specs {
 		next, err := newIterator(spec.Name)
@@ -135,36 +138,9 @@ func BuildStack(leaf SortedKeyValueIterator, specs []IterSpec, env IteratorEnvir
 
 // newIterator constructs an un-Init'd iterator by name.
 func newIterator(name string) (SortedKeyValueIterator, error) {
-	switch name {
-	case IterVersioning:
-		return NewVersioningIterator(), nil
-	case IterVisibility:
-		return NewVisibilityFilter(), nil
-	case IterDeleting:
-		return NewDeletingIterator(), nil
-	case IterLatentEdgeDiscovery:
-		return NewLatentEdgeDiscoveryIterator(), nil
-	case IterSemanticEdge:
-		return NewSemanticEdgeIterator(), nil
-	case IterTermIndex:
-		return NewTermIndexIterator(), nil
-	case IterVectorKNN:
-		return NewVectorKNNIterator(), nil
-	case IterEdgeExpand:
-		return NewEdgeExpandIterator(), nil
-	case IterScoreFilter:
-		return NewScoreFilterIterator(), nil
-	case IterGraphAggregation:
-		return NewGraphAggregationIterator(), nil
-	case IterAnomalyDetect:
-		return NewAnomalyDetectIterator(), nil
-	case IterVisibilityStamp:
-		return NewVisibilityStampIterator(), nil
-	case IterAsOf:
-		return NewAsOfIterator(), nil
-	case IterDocumentIndex:
-		return NewDocumentIndexIterator(), nil
-	default:
-		return nil, fmt.Errorf("unknown iterator %q", name)
+	reg, ok := registryByName[name]
+	if !ok {
+		return nil, &UnknownIteratorError{Name: name}
 	}
+	return reg.new(), nil
 }
