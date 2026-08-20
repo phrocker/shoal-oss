@@ -15,9 +15,10 @@
 // limitations under the License.
 
 // Package walauthority implements the durable WAL lifecycle for hosted
-// Accumulo tablets. It intentionally leaves the RFile/minor-compaction
-// metadata transaction to the caller: Retire may only be called after that
-// transaction has made every mutation in the referenced WAL durable elsewhere.
+// Accumulo tablets. SealForMinorCompaction exposes an atomic WAL/memtable
+// boundary to internal/mincauthority; Retire may only be called after that
+// coordinator's metadata transaction makes every referenced mutation durable
+// in its authoritative RFile.
 package walauthority
 
 import (
@@ -149,6 +150,17 @@ type RecoveryReport struct {
 	Truncated       []Reference
 	HighestSequence int64
 }
+
+// MinorCompactionBoundary is the WAL side of an atomic memtable snapshot.
+// Every listed reference contains only operations at or below Sequence.
+type MinorCompactionBoundary struct {
+	Sequence   int64
+	References []Reference
+}
+
+// SnapshotCallback swaps/freezes the corresponding memtable while the WAL
+// authority excludes Commit. It must not call back into Tablet.
+type SnapshotCallback func(MinorCompactionBoundary) error
 
 // Tablet implements ingestrouter.HostedTablet.
 type Tablet struct {
@@ -395,6 +407,47 @@ func (t *Tablet) Roll(ctx context.Context) (Reference, error) {
 	}
 	t.current = nil
 	return ref, nil
+}
+
+// SealForMinorCompaction syncs the active WAL, captures every authoritative
+// reference and highest applied sequence, invokes snapshot while Commit is
+// excluded, then rolls to a new WAL generation. This is the primitive a
+// mincauthority.Snapshotter adapter uses to make its memtable/WAL boundary
+// atomic. A failed callback leaves the active WAL in place.
+func (t *Tablet) SealForMinorCompaction(ctx context.Context, snapshot SnapshotCallback) (MinorCompactionBoundary, error) {
+	if snapshot == nil {
+		return MinorCompactionBoundary{}, fmt.Errorf("%w: nil snapshot callback", ErrInvalidConfig)
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.closed {
+		return MinorCompactionBoundary{}, ErrClosed
+	}
+	if err := t.verify(ctx); err != nil {
+		return MinorCompactionBoundary{}, err
+	}
+	if t.current != nil {
+		if err := t.cfg.Store.Sync(ctx, t.current.ref.Path); err != nil {
+			return MinorCompactionBoundary{}, err
+		}
+	}
+	refs, err := t.cfg.Metadata.References(ctx, t.cfg.Extent)
+	if err != nil {
+		return MinorCompactionBoundary{}, err
+	}
+	if err := t.verify(ctx); err != nil {
+		return MinorCompactionBoundary{}, err
+	}
+	sort.Slice(refs, func(i, j int) bool { return refs[i].Qualifier < refs[j].Qualifier })
+	boundary := MinorCompactionBoundary{
+		Sequence:   t.nextSeq - 1,
+		References: append([]Reference(nil), refs...),
+	}
+	if err := snapshot(boundary); err != nil {
+		return MinorCompactionBoundary{}, err
+	}
+	t.current = nil
+	return boundary, nil
 }
 
 // Retire removes an exact WAL reference and then deletes the WAL. Callers
