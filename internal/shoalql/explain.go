@@ -50,6 +50,11 @@ type BackendInfo struct {
 	Capabilities          []Capability `json:"capabilities"`
 	StorageFormats        []string     `json:"storage_formats,omitempty"`
 	SelectedStorageFormat string       `json:"selected_storage_format,omitempty"`
+	Pushdowns             []string     `json:"pushdowns,omitempty"`
+	LocalMaterialization  []string     `json:"local_materialization,omitempty"`
+	FallbackReasons       []string     `json:"fallback_reasons,omitempty"`
+	OrderingAssumptions   []string     `json:"ordering_top_k_assumptions,omitempty"`
+	FallbackIterators     []string     `json:"fallback_iterators,omitempty"`
 }
 
 // CapabilityProvider is optional so existing Backend implementations remain
@@ -125,6 +130,10 @@ func buildExplainDetails(be Backend, p *Plan) ExplainDetails {
 		d.CapabilityContract = true
 		d.Backend = normalizedBackendInfo(cp.BackendInfo())
 		d.UnsupportedCapabilities = unsupportedCapabilities(d.Backend.Capabilities)
+		d.Pushdowns = append(d.Pushdowns, d.Backend.Pushdowns...)
+		d.LocalMaterialization = append(d.LocalMaterialization, d.Backend.LocalMaterialization...)
+		d.FallbackReasons = append(d.FallbackReasons, d.Backend.FallbackReasons...)
+		d.OrderingAssumptions = append(d.OrderingAssumptions, d.Backend.OrderingAssumptions...)
 	} else {
 		d.Backend = BackendInfo{Name: "legacy", Mode: "unspecified", Capabilities: []Capability{}}
 		d.UnsupportedCapabilities = []Capability{}
@@ -137,14 +146,24 @@ func buildExplainDetails(be Backend, p *Plan) ExplainDetails {
 		d.Pushdowns = append(d.Pushdowns, "column families "+quotedBytes(p.ColumnFamilies))
 	}
 	for _, spec := range p.Stack {
-		d.Pushdowns = append(d.Pushdowns, explainIterator(spec))
+		if stringListed(d.Backend.FallbackIterators, spec.Name) {
+			d.LocalMaterialization = append(d.LocalMaterialization,
+				"local iterator fallback: "+explainIterator(spec))
+		} else {
+			d.Pushdowns = append(d.Pushdowns, explainIterator(spec))
+		}
 	}
 
 	switch p.Shape {
 	case ShapeVectorKNN:
-		d.OrderingAssumptions = append(d.OrderingAssumptions,
-			"single-backend exact top-k is score-descending with ascending-key tie-break",
-			"no distributed partial top-k merge is performed")
+		if hasCapability(d.Backend.Capabilities, CapabilityDistributedScan) {
+			d.OrderingAssumptions = append(d.OrderingAssumptions,
+				"distributed scan candidates are merged into one exact score-descending top-k with ascending-key tie-break")
+		} else {
+			d.OrderingAssumptions = append(d.OrderingAssumptions,
+				"single-backend exact top-k is score-descending with ascending-key tie-break",
+				"no distributed partial top-k merge is performed")
+		}
 		if p.NeedsHydration {
 			d.LocalMaterialization = append(d.LocalMaterialization,
 				"lookup winning row keys and hydrate projected cells")
@@ -157,7 +176,12 @@ func buildExplainDetails(be Backend, p *Plan) ExplainDetails {
 			d.Pushdowns = append(d.Pushdowns,
 				fmt.Sprintf("document index term %s=%q", term.Field, term.Value))
 		}
-		d.Pushdowns = append(d.Pushdowns, "document index iterator")
+		if stringListed(d.Backend.FallbackIterators, iterrt.IterDocumentIndex) {
+			d.LocalMaterialization = append(d.LocalMaterialization,
+				"local iterator fallback: document index iterator")
+		} else {
+			d.Pushdowns = append(d.Pushdowns, "document index iterator")
+		}
 		d.LocalMaterialization = append(d.LocalMaterialization,
 			"intersect candidate shard sets", "reconstruct and project documents")
 		if len(p.DocResidual) > 0 {
@@ -199,9 +223,32 @@ func normalizedBackendInfo(info BackendInfo) BackendInfo {
 	}
 	info.Capabilities = append([]Capability(nil), info.Capabilities...)
 	info.StorageFormats = append([]string(nil), info.StorageFormats...)
+	info.Pushdowns = append([]string(nil), info.Pushdowns...)
+	info.LocalMaterialization = append([]string(nil), info.LocalMaterialization...)
+	info.FallbackReasons = append([]string(nil), info.FallbackReasons...)
+	info.OrderingAssumptions = append([]string(nil), info.OrderingAssumptions...)
+	info.FallbackIterators = append([]string(nil), info.FallbackIterators...)
 	sort.Slice(info.Capabilities, func(i, j int) bool { return info.Capabilities[i] < info.Capabilities[j] })
 	sort.Strings(info.StorageFormats)
 	return info
+}
+
+func stringListed(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
+}
+
+func hasCapability(values []Capability, want Capability) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }
 
 func unsupportedCapabilities(supported []Capability) []Capability {

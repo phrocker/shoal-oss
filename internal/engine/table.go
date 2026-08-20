@@ -680,9 +680,22 @@ func (t *table) scanHosted(r iterrt.Range, opts ScanOptions, topStack []iterrt.I
 		return nil, err
 	}
 
-	stack := append([]iterrt.IterSpec{
-		{Name: iterrt.IterVersioning, Options: map[string]string{iterrt.VersioningOption: "1"}},
-	}, topStack...)
+	var beforeVersioning, afterVersioning []iterrt.IterSpec
+	for _, spec := range topStack {
+		if spec.Name == iterrt.IterAsOf {
+			beforeVersioning = append(beforeVersioning, spec)
+		} else {
+			afterVersioning = append(afterVersioning, spec)
+		}
+	}
+	stack := append([]iterrt.IterSpec(nil), beforeVersioning...)
+	stack = append(stack, iterrt.IterSpec{
+		Name: iterrt.IterVersioning,
+		Options: map[string]string{
+			iterrt.VersioningOption: "1",
+		},
+	})
+	stack = append(stack, afterVersioning...)
 
 	top, err := iterrt.BuildStack(merge, stack, env)
 	if err != nil {
