@@ -224,8 +224,18 @@ type RFileExportFile struct {
 	Size            int64  `json:"size"`
 	SHA256          string `json:"sha256"`
 	BCFileVersion   string `json:"bcfile_version,omitempty"`
-	Format          string `json:"format,omitempty"`
+	// Empty values are the legacy encoding of rfile/authoritative.
+	Format string `json:"format,omitempty"`
+	Role   string `json:"role,omitempty"`
 }
+
+const (
+	ExportFormatRFile   = "rfile"
+	ExportFormatParquet = "parquet"
+
+	ExportRoleAuthoritative = "authoritative"
+	ExportRoleDerived       = "derived"
+)
 
 type RFileExportOptions struct {
 	DestinationRoot     string
@@ -334,6 +344,7 @@ func (e *Engine) ExportRFiles(ctx context.Context, tableName string, dst storage
 			SHA256:          sum,
 			BCFileVersion:   bcVersion,
 			Format:          string(fileFormatForPath(f.Path)),
+			Role:            ExportRoleAuthoritative,
 		})
 	}
 	sort.SliceStable(manifest.RFiles, func(i, j int) bool {

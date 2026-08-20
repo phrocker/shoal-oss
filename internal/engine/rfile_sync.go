@@ -134,6 +134,7 @@ func (e *Engine) ExportRFilesIncremental(ctx context.Context, tableName string, 
 
 		if prev, ok := priorShipped[rel]; ok && prev.DestinationPath == dstPath {
 			prev.Format = string(fileFormatForPath(f.Path))
+			prev.Role = ExportRoleAuthoritative
 			manifest.RFiles = append(manifest.RFiles, prev)
 			state.Shipped[rel] = prev
 			skipped = append(skipped, rel)
@@ -153,6 +154,7 @@ func (e *Engine) ExportRFilesIncremental(ctx context.Context, tableName string, 
 			SHA256:          sum,
 			BCFileVersion:   bcVersion,
 			Format:          string(fileFormatForPath(f.Path)),
+			Role:            ExportRoleAuthoritative,
 		}
 		manifest.RFiles = append(manifest.RFiles, entry)
 		state.Shipped[rel] = entry

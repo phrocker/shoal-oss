@@ -61,6 +61,7 @@ V1 + IVF-PQ iterator port shipped. Embedded standalone engine shipped.
 | RFile reader (block-level CRC, prefetch, snappy/gz/zlib) | shipped |
 | `RFile.blockmeta` zone-map block-skip extension | shipped — forward-compatible with Java `RFile.Reader` |
 | VisibilityFilter pushdown | shipped — alloc-free warm cache |
+| Accumulo 4 iterator capability admission | shipped — versioned, fail-closed scan/minc/majc registry and [machine-readable inventory](docs/iterator-capability-registry.md) |
 | File / locator / block caches | shipped |
 | Startup pre-warm (`-prewarm-tables=auto`) | shipped — distributed-serving mode |
 | Client-side hedge coordinator | shipped — `scanRow*` + `scanBatch*` overloads |
@@ -200,6 +201,8 @@ format-compatible reader.
 make build       # go build ./... (builds shoal-embed and all binaries)
 make test        # full test suite (race-clean)
 make capi        # stable C connector ABI shared library + headers
+make test-accumulo-static  # validate the exact Accumulo 4 harness, no Docker
+make test-accumulo         # live ZooKeeper/HDFS/Accumulo 4 Java smoke + cleanup
 
 # only the distributed-serving mode needs generated Thrift bindings:
 make thrift-gen     # regenerate internal Go bindings from the vendored IDLs
@@ -222,6 +225,10 @@ compiler to **Apache Thrift exactly 0.17.0**. Install that compiler, verify
 `THRIFT=/path/to/thrift-0.17.0` when invoking make. Windows users can use the
 ASF binary whose SHA-256 is
 `e2406226921e8d2822ec20a199060342398084f130e85fbe1dba0cb1f060e592`.
+The matching local cluster harness is documented in
+[`test/accumulo/README.md`](test/accumulo/README.md). Its live target is
+intentionally opt-in and reports Docker absence as a skipped, unexecuted test
+with a nonzero status.
 Go 1.25+ (transitively from `cloud.google.com/go/storage`).
 
 Docker image (multi-stage, distroless static):
