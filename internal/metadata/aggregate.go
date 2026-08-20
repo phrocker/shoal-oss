@@ -186,6 +186,11 @@ func applyColumn(t *TabletInfo, kv *data.TKeyValue) error {
 				return fmt.Errorf("multiple srv:time entries")
 			}
 			t.Time = string(val)
+		case CQLock:
+			if t.ServerLock != "" {
+				return fmt.Errorf("multiple srv:lock entries")
+			}
+			t.ServerLock = string(val)
 		}
 	case CFTabletSection:
 		if string(cq) == CQPrevRow {

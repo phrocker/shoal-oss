@@ -17,4 +17,5 @@ const (
 	CQPrevRow         = "~pr"    // PrevRowColumn qualifier under ~tab
 	CQDirectory       = "dir"    // ServerColumnFamily.DIRECTORY_QUAL
 	CQTime            = "time"   // ServerColumnFamily.TIME_QUAL
+	CQLock            = "lock"   // ServerColumnFamily.LOCK_QUAL
 )

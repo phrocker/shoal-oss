@@ -9,6 +9,7 @@ import (
 
 	"github.com/apache/thrift/lib/go/thrift"
 
+	"github.com/phrocker/shoal/internal/ingestservice"
 	"github.com/phrocker/shoal/internal/protocol"
 	clientgen "github.com/phrocker/shoal/internal/thrift/gen/client"
 	"github.com/phrocker/shoal/internal/thrift/gen/data"
@@ -21,6 +22,7 @@ import (
 const managerServiceName = "mgr"
 const clientServiceName = "client"
 const tablePermissionRead int8 = 0
+const tablePermissionWrite int8 = 2
 
 type AddressResolver interface {
 	ManagerAddress(context.Context) (string, error)
@@ -74,6 +76,81 @@ type ManagerAuthenticator struct {
 	ConnectTimeout  time.Duration
 	RPCTimeout      time.Duration
 	TableNames      TableNameResolver
+}
+
+func (a ManagerAuthenticator) Authenticate(
+	ctx context.Context,
+	candidate *security.TCredentials,
+) error {
+	if candidate == nil || candidate.InstanceId != a.InstanceID {
+		return errors.New("tserverprocess: credentials name the wrong instance")
+	}
+	raw, closeTransport, err := a.securityClient(ctx)
+	if err != nil {
+		return err
+	}
+	defer closeTransport()
+	ok, err := raw.AuthenticateUser(ctx, nil, a.System, candidate)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return errors.New("tserverprocess: credentials rejected")
+	}
+	return nil
+}
+
+func (a ManagerAuthenticator) AuthorizeWrite(
+	ctx context.Context,
+	candidate *security.TCredentials,
+	tableID string,
+) error {
+	if err := a.Authenticate(ctx, candidate); err != nil {
+		return err
+	}
+	if a.TableNames == nil {
+		return errors.New("tserverprocess: table permission resolver is unavailable")
+	}
+	tableName, err := a.TableNames.ResolveName(ctx, tableID)
+	if err != nil {
+		return err
+	}
+	raw, closeTransport, err := a.securityClient(ctx)
+	if err != nil {
+		return err
+	}
+	defer closeTransport()
+	allowed, err := raw.HasTablePermission(
+		ctx, nil, a.System, candidate.Principal, tableName, tablePermissionWrite,
+	)
+	if err != nil {
+		return err
+	}
+	if !allowed {
+		return fmt.Errorf("%w: principal %q lacks write permission for table %q",
+			ingestservice.ErrPermissionDenied, candidate.Principal, tableName)
+	}
+	return nil
+}
+
+func (a ManagerAuthenticator) securityClient(
+	ctx context.Context,
+) (*clientgen.ClientServiceClient, func(), error) {
+	if a.Resolver == nil || a.System == nil || a.InstanceID == "" || a.AccumuloVersion == "" {
+		return nil, func() {}, errors.New("tserverprocess: incomplete manager authenticator")
+	}
+	address, err := a.Resolver.ManagerAddress(ctx)
+	if err != nil {
+		return nil, func() {}, err
+	}
+	transport, standard, err := dialManagerService(
+		ctx, address, a.InstanceID, a.AccumuloVersion, clientServiceName,
+		a.ConnectTimeout, a.RPCTimeout,
+	)
+	if err != nil {
+		return nil, func() {}, err
+	}
+	return clientgen.NewClientServiceClient(standard), func() { _ = transport.Close() }, nil
 }
 
 type TableNameResolver interface {

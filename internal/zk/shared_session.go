@@ -66,6 +66,27 @@ func (s *SharedSession) GetW(path string) ([]byte, *gozk.Stat, <-chan gozk.Event
 	return s.locator.conn.GetW(path)
 }
 
+func (s *SharedSession) Get(path string) ([]byte, *gozk.Stat, error) {
+	if err := s.valid(); err != nil {
+		return nil, nil, err
+	}
+	return s.locator.conn.Get(path)
+}
+
+func (s *SharedSession) Set(path string, data []byte, version int32) (*gozk.Stat, error) {
+	if err := s.valid(); err != nil {
+		return nil, err
+	}
+	return s.locator.conn.Set(path, data, version)
+}
+
+func (s *SharedSession) SessionID() int64 {
+	if s == nil || s.locator == nil || s.locator.conn == nil {
+		return 0
+	}
+	return s.locator.conn.SessionID()
+}
+
 func (s *SharedSession) Delete(path string, version int32) error {
 	if err := s.valid(); err != nil {
 		return err

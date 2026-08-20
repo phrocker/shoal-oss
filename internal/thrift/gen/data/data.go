@@ -3437,6 +3437,8 @@ func (p *TCondition) writeField5(ctx context.Context, oprot thrift.TProtocol) (e
 }
 
 func (p *TCondition) writeField6(ctx context.Context, oprot thrift.TProtocol) (err error) {
+  // PATCH (shoal): nil condition value = absent column.
+  if p.Val == nil { return nil }
   if err := oprot.WriteFieldBegin(ctx, "val", thrift.STRING, 6); err != nil {
     return thrift.PrependError(fmt.Sprintf("%T write field begin error 6:val: ", p), err) }
   if err := oprot.WriteBinary(ctx, p.Val); err != nil {
@@ -5016,4 +5018,3 @@ func (p *TSummaryRequest) String() string {
   }
   return fmt.Sprintf("TSummaryRequest(%+v)", *p)
 }
-

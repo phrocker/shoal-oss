@@ -15,8 +15,10 @@ import (
 	"sort"
 	"sync"
 
+	"github.com/phrocker/shoal/internal/ingestrouter"
 	"github.com/phrocker/shoal/internal/iterrt"
 	"github.com/phrocker/shoal/internal/metadata"
+	"github.com/phrocker/shoal/internal/mincauthority"
 	"github.com/phrocker/shoal/internal/shadow/itercfg"
 	"github.com/phrocker/shoal/internal/tabletloader"
 	"github.com/phrocker/shoal/internal/tserver"
@@ -38,11 +40,29 @@ type SpecificationLoader interface {
 // generation, file, WAL, and iterator check succeeds.
 type Store struct {
 	loader SpecificationLoader
+	opener TabletOpener
 
 	mu      sync.RWMutex
 	next    uint64
 	loading map[string]uint64
 	hosted  map[string]tabletloader.Specification
+	ingest  map[string]ingestrouter.HostedTablet
+}
+
+type TabletOpener interface {
+	Open(context.Context, tabletloader.Specification, tserver.Attempt) (ingestrouter.HostedTablet, error)
+}
+
+type tabletCloser interface {
+	Close(context.Context) error
+}
+
+type tabletFlusher interface {
+	Flush(context.Context) error
+}
+
+type tabletFiles interface {
+	DataFiles() []mincauthority.DataFile
 }
 
 func NewStore(loader SpecificationLoader) (*Store, error) {
@@ -54,10 +74,34 @@ func NewStore(loader SpecificationLoader) (*Store, error) {
 		next:    1,
 		loading: make(map[string]uint64),
 		hosted:  make(map[string]tabletloader.Specification),
+		ingest:  make(map[string]ingestrouter.HostedTablet),
 	}, nil
 }
 
 func (s *Store) Load(ctx context.Context, extent tserver.Extent) error {
+	return s.load(ctx, extent, tserver.Attempt{}, false)
+}
+
+func NewWritableStore(loader SpecificationLoader, opener TabletOpener) (*Store, error) {
+	if opener == nil {
+		return nil, errors.New("tserverprocess: nil tablet opener")
+	}
+	store, err := NewStore(loader)
+	if err != nil {
+		return nil, err
+	}
+	store.opener = opener
+	return store, nil
+}
+
+func (s *Store) LoadAssigned(ctx context.Context, extent tserver.Extent, attempt tserver.Attempt) error {
+	if s.opener == nil || !attempt.Valid() {
+		return ErrWALIntegrationMissing
+	}
+	return s.load(ctx, extent, attempt, true)
+}
+
+func (s *Store) load(ctx context.Context, extent tserver.Extent, attempt tserver.Attempt, writable bool) error {
 	key := extentKey(extent)
 	s.mu.Lock()
 	token := s.next
@@ -69,48 +113,117 @@ func (s *Store) Load(ctx context.Context, extent tserver.Extent) error {
 	if err == nil {
 		err = validateHostedScanStack(extent.TableID, propertiesMap(spec.Properties))
 	}
-	if err == nil && len(spec.Logs) > 0 {
+	if err == nil && len(spec.Logs) > 0 && !writable {
 		err = fmt.Errorf("%w: %s references %d WAL segment(s)",
 			ErrWALIntegrationMissing, extent, len(spec.Logs))
 	}
+	var ingestTablet ingestrouter.HostedTablet
+	if err == nil && writable {
+		ingestTablet, err = s.opener.Open(ctx, spec, attempt)
+	}
 
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if current, ok := s.loading[key]; !ok || current != token {
+		s.mu.Unlock()
+		closeTablet(ingestTablet)
 		return context.Canceled
 	}
 	delete(s.loading, key)
 	if err != nil {
+		s.mu.Unlock()
+		closeTablet(ingestTablet)
 		return err
 	}
 	if err := ctx.Err(); err != nil {
+		s.mu.Unlock()
+		closeTablet(ingestTablet)
 		return err
 	}
 	s.hosted[key] = cloneSpecification(spec)
+	if ingestTablet != nil {
+		s.ingest[key] = ingestTablet
+	}
+	s.mu.Unlock()
 	return nil
 }
 
-func (s *Store) Unload(_ context.Context, extent tserver.Extent, _ tserverrpc.UnloadGoal) error {
+func closeTablet(tablet ingestrouter.HostedTablet) {
+	if closer, ok := tablet.(tabletCloser); ok {
+		_ = closer.Close(context.Background())
+	}
+}
+
+func (s *Store) Unload(ctx context.Context, extent tserver.Extent, goal tserverrpc.UnloadGoal) error {
+	if goal != tserverrpc.UnloadUnassigned {
+		return tserverrpc.ErrUnsupported
+	}
+	return s.unload(ctx, extent)
+}
+
+func (s *Store) UnloadAssigned(
+	ctx context.Context,
+	extent tserver.Extent,
+	_ tserver.Attempt,
+	goal tserverrpc.UnloadGoal,
+) error {
+	if goal != tserverrpc.UnloadUnassigned {
+		return tserverrpc.ErrUnsupported
+	}
+	return s.unload(ctx, extent)
+}
+
+func (s *Store) unload(ctx context.Context, extent tserver.Extent) error {
 	key := extentKey(extent)
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	delete(s.loading, key)
 	if _, ok := s.hosted[key]; !ok {
+		s.mu.Unlock()
 		return tserverrpc.ErrNotServing
 	}
+	tablet := s.ingest[key]
+	s.mu.Unlock()
+	if closer, ok := tablet.(tabletCloser); ok {
+		if err := closer.Close(ctx); err != nil {
+			return err
+		}
+	}
+	s.mu.Lock()
 	delete(s.hosted, key)
+	delete(s.ingest, key)
+	s.mu.Unlock()
 	return nil
 }
 
 // Flush is a no-op for a read-only hosted tablet. No mutation, memtable, or
 // WAL is accepted by this process, so there is no local state to flush.
-func (s *Store) Flush(_ context.Context, extent tserver.Extent) error {
+func (s *Store) Flush(ctx context.Context, extent tserver.Extent) error {
 	s.mu.RLock()
-	defer s.mu.RUnlock()
 	if _, ok := s.hosted[extentKey(extent)]; !ok {
+		s.mu.RUnlock()
 		return tserverrpc.ErrNotServing
 	}
+	tablet := s.ingest[extentKey(extent)]
+	s.mu.RUnlock()
+	if flusher, ok := tablet.(tabletFlusher); ok {
+		return flusher.Flush(ctx)
+	}
 	return nil
+}
+
+func (s *Store) Lookup(ctx context.Context, extent ingestrouter.Extent) (ingestrouter.HostedTablet, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	key := extentKey(tserver.Extent{
+		TableID: extent.TableID, PrevEndRow: extent.PrevEndRow, EndRow: extent.EndRow,
+	})
+	s.mu.RLock()
+	tablet := s.ingest[key]
+	s.mu.RUnlock()
+	if tablet == nil {
+		return nil, ingestrouter.ErrNotHosted
+	}
+	return tablet, nil
 }
 
 // LocateTable exposes only successfully hosted tablets. Stateful scan
@@ -122,8 +235,11 @@ func (s *Store) LocateTable(ctx context.Context, tableID string) ([]metadata.Tab
 	}
 	s.mu.RLock()
 	result := make([]metadata.TabletInfo, 0)
-	for _, spec := range s.hosted {
+	for key, spec := range s.hosted {
 		if spec.Extent.TableID == tableID {
+			if files, ok := s.ingest[key].(tabletFiles); ok {
+				spec = withRuntimeFiles(spec, files.DataFiles())
+			}
 			result = append(result, tabletInfo(spec))
 		}
 	}
@@ -243,4 +359,27 @@ func cloneSpecification(spec tabletloader.Specification) tabletloader.Specificat
 	return out
 }
 
+func withRuntimeFiles(
+	spec tabletloader.Specification,
+	runtimeFiles []mincauthority.DataFile,
+) tabletloader.Specification {
+	out := cloneSpecification(spec)
+	known := make(map[string]struct{}, len(out.Files))
+	for _, file := range out.Files {
+		known[file.Path] = struct{}{}
+	}
+	for _, file := range runtimeFiles {
+		if _, ok := known[file.Path]; ok {
+			continue
+		}
+		out.Files = append(out.Files, tabletloader.DataFile{
+			Path: file.Path, Size: file.Size, NumEntries: file.Entries,
+		})
+		known[file.Path] = struct{}{}
+	}
+	return out
+}
+
 var _ tserverrpc.Backend = (*Store)(nil)
+var _ tserverrpc.AttemptBackend = (*Store)(nil)
+var _ ingestrouter.Directory = (*Store)(nil)

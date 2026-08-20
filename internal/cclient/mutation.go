@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 
 	"github.com/phrocker/shoal/internal/rfile/wire"
@@ -22,6 +23,7 @@ type MutationEntry struct {
 	ColQualifier  []byte
 	ColVisibility []byte
 	Timestamp     int64
+	HasTimestamp  bool
 	Value         []byte
 	Deleted       bool
 }
@@ -55,6 +57,7 @@ func (m *Mutation) Put(cf, cq, cv []byte, timestamp int64, value []byte) {
 		ColQualifier:  cloneBytes(cq),
 		ColVisibility: cloneBytes(cv),
 		Timestamp:     timestamp,
+		HasTimestamp:  timestamp != MutationLatestTimestamp,
 		Value:         cloneBytes(value),
 		Deleted:       false,
 	})
@@ -72,6 +75,7 @@ func (m *Mutation) Delete(cf, cq, cv []byte, timestamp int64) {
 		ColQualifier:  cloneBytes(cq),
 		ColVisibility: cloneBytes(cv),
 		Timestamp:     timestamp,
+		HasTimestamp:  timestamp != MutationLatestTimestamp,
 		Value:         nil,
 		Deleted:       true,
 	})
@@ -151,6 +155,108 @@ func (m *Mutation) ToThrift() (*data.TMutation, error) {
 	}, nil
 }
 
+// FromThrift decodes the Accumulo 4 compact mutation representation.
+func FromThrift(in *data.TMutation) (*Mutation, error) {
+	if in == nil || len(in.Row) == 0 || in.Entries < 0 {
+		return nil, errors.New("cclient: invalid thrift Mutation")
+	}
+	reader := bytes.NewReader(in.Data)
+	mutation, err := NewMutation(in.Row)
+	if err != nil {
+		return nil, err
+	}
+	for index := int32(0); index < in.Entries; index++ {
+		cf, err := readMutationBytes(reader)
+		if err != nil {
+			return nil, fmt.Errorf("cclient: decode entry %d column family: %w", index, err)
+		}
+		cq, err := readMutationBytes(reader)
+		if err != nil {
+			return nil, fmt.Errorf("cclient: decode entry %d column qualifier: %w", index, err)
+		}
+		cv, err := readMutationBytes(reader)
+		if err != nil {
+			return nil, fmt.Errorf("cclient: decode entry %d visibility: %w", index, err)
+		}
+		hasTimestamp, err := readMutationBool(reader)
+		if err != nil {
+			return nil, fmt.Errorf("cclient: decode entry %d timestamp flag: %w", index, err)
+		}
+		timestamp := MutationLatestTimestamp
+		if hasTimestamp {
+			timestamp, _, err = wire.ReadVLong(reader)
+			if err != nil {
+				return nil, fmt.Errorf("cclient: decode entry %d timestamp: %w", index, err)
+			}
+		}
+		deleted, err := readMutationBool(reader)
+		if err != nil {
+			return nil, fmt.Errorf("cclient: decode entry %d delete flag: %w", index, err)
+		}
+		valueLength, _, err := wire.ReadVLong(reader)
+		if err != nil {
+			return nil, fmt.Errorf("cclient: decode entry %d value length: %w", index, err)
+		}
+		var value []byte
+		if valueLength < 0 {
+			valueIndex := -valueLength - 1
+			if valueIndex < 0 || valueIndex >= int64(len(in.Values)) {
+				return nil, fmt.Errorf("cclient: decode entry %d invalid large value reference %d", index, valueIndex)
+			}
+			value = cloneBytes(in.Values[valueIndex])
+		} else {
+			if valueLength > int64(reader.Len()) || valueLength > math.MaxInt {
+				return nil, fmt.Errorf("cclient: decode entry %d invalid value length %d", index, valueLength)
+			}
+			value = make([]byte, int(valueLength))
+			if _, err := io.ReadFull(reader, value); err != nil {
+				return nil, fmt.Errorf("cclient: decode entry %d value: %w", index, err)
+			}
+		}
+		if deleted && len(value) != 0 {
+			return nil, fmt.Errorf("cclient: decode entry %d delete carries a value", index)
+		}
+		if deleted {
+			mutation.Delete(cf, cq, cv, timestamp)
+		} else {
+			mutation.Put(cf, cq, cv, timestamp, value)
+		}
+		mutation.entries[len(mutation.entries)-1].HasTimestamp = hasTimestamp
+	}
+	if reader.Len() != 0 {
+		return nil, fmt.Errorf("cclient: mutation has %d trailing bytes", reader.Len())
+	}
+	return mutation, nil
+}
+
+func readMutationBytes(reader *bytes.Reader) ([]byte, error) {
+	length, _, err := wire.ReadVLong(reader)
+	if err != nil {
+		return nil, err
+	}
+	if length < 0 || length > int64(reader.Len()) || length > math.MaxInt {
+		return nil, fmt.Errorf("invalid length %d", length)
+	}
+	value := make([]byte, int(length))
+	_, err = io.ReadFull(reader, value)
+	return value, err
+}
+
+func readMutationBool(reader *bytes.Reader) (bool, error) {
+	value, err := reader.ReadByte()
+	if err != nil {
+		return false, err
+	}
+	switch value {
+	case 0:
+		return false, nil
+	case 1:
+		return true, nil
+	default:
+		return false, fmt.Errorf("invalid boolean %d", value)
+	}
+}
+
 type serializedMutation struct {
 	data   []byte
 	values [][]byte
@@ -181,7 +287,7 @@ func (m *Mutation) serialize() (serializedMutation, error) {
 			return serializedMutation{}, fmt.Errorf("cclient: encode column visibility: %w", err)
 		}
 
-		hasTimestamp := entry.Timestamp != MutationLatestTimestamp
+		hasTimestamp := entry.HasTimestamp || entry.Timestamp != MutationLatestTimestamp
 		if err := encoded.WriteByte(boolByte(hasTimestamp)); err != nil {
 			return serializedMutation{}, err
 		}

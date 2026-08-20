@@ -20,7 +20,7 @@
 -->
 # Tablet hosting lifecycle and fencing
 
-Status: **read-only process wired**. The fenced lifecycle state machine
+Status: **write-capable process wired**. The fenced lifecycle state machine
 (`internal/tserver`) has landed, and so has the ZooKeeper registration
 that makes it visible to a manager: the tablet-server ServiceLock, the
 service descriptors the manager reads, and the manager-lock observation
@@ -29,10 +29,11 @@ The manager RPC adapter (`internal/tserverrpc`) now maps Accumulo 4
 assignment, unload, flush, status, and halt calls onto that fence and
 reports asynchronous lifecycle outcomes. Tablet metadata loading and the
 hosted-tablet specification loader are now present. `cmd/shoal-tserver`
-connects them to hosted-only stateful scans, one reusable authenticated
-ZooKeeper session, manager failover discovery/reporting, and bounded drain.
-Tablet ingest remains unavailable until the WAL authority dependency lands —
-see [§9](#9-what-is-not-here-yet). Tracking issue: #67.
+connects them to hosted stateful scans and WAL-backed ingest, one reusable
+authenticated ZooKeeper session, manager failover discovery/reporting, and
+bounded drain. Production conditional metadata CAS fences ownership, WAL
+references, minor-compaction file installation, and unload. See
+[§9](#9-ingest-authority). Tracking issue: #67.
 
 ## 1. Goal
 
@@ -852,28 +853,31 @@ presence, directory/time values, and Accumulo 4 `log:` qualifiers. WAL
 qualifiers are decoded using Java `LogEntry.fromMetaWalEntry`'s
 `-/<path ending in host+port/UUID>` format.
 
-## 9. Remaining ingest dependency
+## 9. Ingest authority
 
-`cmd/shoal-tserver` is a real read-only tablet-server participant. It advertises
-only `TABLET_MANAGEMENT`, `TABLET_SCAN`, and `TSERV`, and registers only their
-processors. The `TabletIngest` processor and `TABLET_INGEST` descriptor are
-absent, so a caller receives an explicit unknown/unsupported multiplexed
-service response instead of a false write capability.
+`cmd/shoal-tserver` is a write-capable tablet-server participant. With the
+explicit `-enable-ingest` release gate, it registers the `TabletIngest`
+processor and advertises `TABLET_INGEST` only after the ServiceLock-dependent
+metadata CAS, WAL, loader, memtable, and minor-compaction authorities are
+initialized. The flag defaults off while #74 gathers live mixed-fleet evidence.
 
 The process refuses to publish a loaded tablet that still references WAL
 segments. Serving that tablet without opening and replaying those references
-would silently omit unflushed mutations. PR #175 has now landed the fenced WAL
-authority primitive. The exact remaining #69 dependency is its process/service
-integration: register `TabletIngestClientService`, route mutation sessions into
-`internal/walauthority`, recover referenced logs into a hosted memtable, enforce
-constraints and timestamp/durability semantics, produce minor-compaction
-RFiles, and commit/retire WAL and file metadata through the authoritative
-manager path. The read-only process has none of those mutation/commit surfaces,
-so it still does not advertise `TABLET_INGEST`.
+would silently omit unflushed mutations. The update-session Thrift adapter, mutation decoding, stale-extent/retry maps,
+WAL recovery, memtable application, timestamp assignment, minor-compaction
+coordination, assignment-attempt plumbing, drain serialization, and
+readiness/metrics composition now exist in `internal/ingestservice`,
+`internal/hostedingest`, and `tserverprocess.NewWritableStore`.
+
+`internal/metadatacas` implements the production authority. Root metadata uses
+ZooKeeper version CAS. Other metadata uses exact Accumulo conditional mutations
+covering current/future location, ServiceLock identity, previous row, WAL
+qualifiers, and installed files. Ambiguous transport results are reconciled by
+authoritative rereads, and durable minc checkpoints resume idempotently after
+restart.
 
 Live mixed Java/Shoal migration and rolling-replacement acceptance still need
-an Accumulo cluster CI environment. Until those tests and the ingest/WAL
-authority land, #67's full write-capable acceptance criteria are not met.
+an Accumulo cluster CI environment and remain tracked separately in #74.
 
 ## 10. Metrics
 

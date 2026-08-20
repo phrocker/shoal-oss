@@ -28,6 +28,7 @@ func TestMetadataSourceRequiresExactExtentAddressAndGeneration(t *testing.T) {
 			}}, nil
 		}),
 	}
+
 	got, err := source.ReadTablet(context.Background(), extent)
 	if err != nil || got.Generation != "zlock#g#0000000001" {
 		t.Fatalf("ReadTablet = %#v, %v", got, err)
@@ -38,6 +39,33 @@ func TestMetadataSourceRequiresExactExtentAddressAndGeneration(t *testing.T) {
 	}
 	if _, err := source.ReadTablet(context.Background(), tserver.Extent{TableID: "5"}); !errors.Is(err, tabletloader.ErrMissingMetadata) {
 		t.Fatalf("wrong extent error = %v", err)
+	}
+}
+
+func TestHostAuthorityUsesZooKeeperSessionGeneration(t *testing.T) {
+	host := tserver.NewHost()
+	server := tserver.LockID{UUID: "11111111-1111-4111-8111-111111111111", Sequence: 2}
+	manager := tserver.LockID{UUID: "22222222-2222-4222-8222-222222222222", Sequence: 3}
+	if err := host.AdoptLock(server); err != nil {
+		t.Fatal(err)
+	}
+	if err := host.ObserveManagerLock(manager); err != nil {
+		t.Fatal(err)
+	}
+	extent := tserver.Extent{TableID: "5"}
+	if _, err := host.Assign(tserver.Fence{Server: server, Manager: manager}, extent); err != nil {
+		t.Fatal(err)
+	}
+	authority := HostAuthority{Host: host, Generation: "abcdef"}
+	generation, err := authority.Capture(context.Background(), extent)
+	if err != nil || generation != "abcdef" {
+		t.Fatalf("Capture = %q, %v", generation, err)
+	}
+	if err := authority.Validate(context.Background(), extent, generation); err != nil {
+		t.Fatal(err)
+	}
+	if err := authority.Validate(context.Background(), extent, "old"); !errors.Is(err, tabletloader.ErrStaleGeneration) {
+		t.Fatalf("stale generation error = %v", err)
 	}
 }
 

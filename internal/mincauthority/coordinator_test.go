@@ -391,12 +391,16 @@ func TestCoordinatorRandomizedRFileRangeProperty(t *testing.T) {
 func TestFileStateStoreDetectsCorruptionAndPersists(t *testing.T) {
 	dir := t.TempDir()
 	store := &FileStateStore{Dir: dir}
-	state := State{OperationID: "stable", Extent: testExtent, Fence: testFence, Phase: PhaseValidated}
+	state := State{
+		OperationID: "stable", Extent: testExtent, Fence: testFence, Phase: PhaseValidated,
+		SnapshotCells: []Cell{{Key: rfile.Key{Row: []byte("row")}, Value: []byte("value")}},
+	}
 	if err := store.Save(context.Background(), state); err != nil {
 		t.Fatal(err)
 	}
 	loaded, err := (&FileStateStore{Dir: dir}).Load(context.Background(), "stable")
-	if err != nil || loaded == nil || loaded.Phase != PhaseValidated {
+	if err != nil || loaded == nil || loaded.Phase != PhaseValidated ||
+		len(loaded.SnapshotCells) != 1 || !bytes.Equal(loaded.SnapshotCells[0].Value, []byte("value")) {
 		t.Fatalf("load: state=%+v err=%v", loaded, err)
 	}
 	files, err := os.ReadDir(dir)
@@ -434,6 +438,36 @@ func TestFileStateStoreAdvancesWithoutReplacingCheckpoints(t *testing.T) {
 	files, err := os.ReadDir(dir)
 	if err != nil || len(files) != int(PhaseComplete) {
 		t.Fatalf("files=%d err=%v", len(files), err)
+	}
+}
+
+func TestFileStateStoreDiscoversPendingOperationsAfterRestart(t *testing.T) {
+	dir := t.TempDir()
+	store := &FileStateStore{Dir: dir}
+	for _, state := range []State{
+		{OperationID: "later", Extent: testExtent, Fence: testFence, Phase: PhaseCommitted},
+		{OperationID: "earlier", Extent: testExtent, Fence: testFence, Phase: PhasePublished},
+		{OperationID: "other-fence", Extent: testExtent, Fence: ingestrouter.Fence{ServerGeneration: "other"}, Phase: PhaseValidated},
+	} {
+		if err := store.Save(context.Background(), state); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for phase := PhaseSnapshotted; phase <= PhaseComplete; phase++ {
+		if err := store.Save(context.Background(), State{
+			OperationID: "complete", Extent: testExtent, Fence: testFence, Phase: phase,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pending, err := (&FileStateStore{Dir: dir}).Pending(context.Background(), testExtent, testFence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 2 ||
+		pending[0].OperationID != "earlier" || pending[0].Phase != PhasePublished ||
+		pending[1].OperationID != "later" || pending[1].Phase != PhaseCommitted {
+		t.Fatalf("pending = %+v", pending)
 	}
 }
 

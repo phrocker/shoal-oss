@@ -27,8 +27,11 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
+	"strings"
 	"sync"
 
+	"github.com/phrocker/shoal/internal/ingestrouter"
 	"github.com/phrocker/shoal/internal/storage"
 )
 
@@ -78,6 +81,66 @@ type FileStateStore struct {
 	mu  sync.Mutex
 }
 
+// Pending returns the latest durable checkpoint for every incomplete
+// operation matching one tablet generation.
+func (s *FileStateStore) Pending(
+	ctx context.Context,
+	extent ingestrouter.Extent,
+	fence ingestrouter.Fence,
+) ([]State, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if s == nil || s.Dir == "" {
+		return nil, ErrInvalidConfig
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	entries, err := os.ReadDir(s.Dir)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	latest := make(map[string]State)
+	completed := make(map[string]struct{})
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") ||
+			strings.Contains(entry.Name(), ".new-") {
+			continue
+		}
+		encoded, err := os.ReadFile(filepath.Join(s.Dir, entry.Name()))
+		if err != nil {
+			return nil, err
+		}
+		state, err := decodeAnyState(encoded)
+		if err != nil {
+			return nil, err
+		}
+		if !state.Extent.Equal(extent) || state.Fence != fence {
+			continue
+		}
+		if state.Phase == PhaseComplete {
+			completed[state.OperationID] = struct{}{}
+			delete(latest, state.OperationID)
+			continue
+		}
+		if _, ok := completed[state.OperationID]; ok {
+			continue
+		}
+		if prior, ok := latest[state.OperationID]; !ok || state.Phase > prior.Phase {
+			latest[state.OperationID] = *state
+		}
+	}
+	out := make([]State, 0, len(latest))
+	for _, state := range latest {
+		out = append(out, state)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].OperationID < out[j].OperationID })
+	return out, nil
+}
+
 type stateEnvelope struct {
 	Checksum string          `json:"checksum"`
 	State    json.RawMessage `json:"state"`
@@ -113,6 +176,17 @@ func (s *FileStateStore) Load(ctx context.Context, operationID string) (*State, 
 }
 
 func decodeState(data []byte, operationID string) (*State, error) {
+	state, err := decodeAnyState(data)
+	if err != nil {
+		return nil, err
+	}
+	if state.OperationID != operationID {
+		return nil, fmt.Errorf("%w: checkpoint operation mismatch", ErrInvalidSnapshot)
+	}
+	return state, nil
+}
+
+func decodeAnyState(data []byte) (*State, error) {
 	var envelope stateEnvelope
 	if err := json.Unmarshal(data, &envelope); err != nil {
 		return nil, fmt.Errorf("%w: decode checkpoint: %v", ErrInvalidSnapshot, err)
@@ -125,8 +199,8 @@ func decodeState(data []byte, operationID string) (*State, error) {
 	if err := json.Unmarshal(envelope.State, &state); err != nil {
 		return nil, fmt.Errorf("%w: decode state: %v", ErrInvalidSnapshot, err)
 	}
-	if state.OperationID != operationID {
-		return nil, fmt.Errorf("%w: checkpoint operation mismatch", ErrInvalidSnapshot)
+	if state.OperationID == "" {
+		return nil, fmt.Errorf("%w: empty checkpoint operation", ErrInvalidSnapshot)
 	}
 	return &state, nil
 }
