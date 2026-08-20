@@ -227,6 +227,19 @@ test-hdfs:
 test-accumulo-static:
 	python test/accumulo/harness.py validate
 	python -m unittest -v test/accumulo/test_harness.py
+	go test ./internal/conformance ./cmd/shoal-conformance
+
+.PHONY: conformance-replay
+conformance-replay:
+	mkdir -p bin
+	go build -o bin/shoal-conformance ./cmd/shoal-conformance
+	bin/shoal-conformance -mode replay
+
+.PHONY: conformance-live
+conformance-live:
+	mkdir -p bin
+	go build -o bin/shoal-conformance ./cmd/shoal-conformance
+	bin/shoal-conformance -mode live
 
 .PHONY: accumulo-up
 accumulo-up:

@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "role": "client",
+  "accumulo_version": "4.0.0-SNAPSHOT",
+  "accumulo_revision": "1a716b2c1bb5762ead4b46d2bc4f53e13873b314",
+  "summary": "client scan continuation and batch-writer retry avoid duplicate committed work",
+  "evidence": [
+    {
+      "kind": "go-test",
+      "reference": "accumulo/scanner_test.go#TestScannerContinuationAndCleanup",
+      "replay_command": ["go", "test", "./accumulo", "-run", "^TestScannerContinuationAndCleanup$", "-count=1"]
+    },
+    {
+      "kind": "go-test",
+      "reference": "accumulo/batch_writer_test.go#TestBatchWriterParallelRetryDoesNotReplaySuccessfulServer",
+      "replay_command": ["go", "test", "./accumulo", "-run", "^TestBatchWriterParallelRetryDoesNotReplaySuccessfulServer$", "-count=1"]
+    }
+  ]
+}
