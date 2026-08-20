@@ -21,33 +21,33 @@ import (
 	"bytes"
 	"compress/gzip"
 	"encoding/binary"
-	"io"
-	"log/slog"
+	"encoding/json"
+	"errors"
 	"testing"
 
 	"github.com/phrocker/shoal/internal/iterrt"
 )
 
-// silentLogger is a slog logger that discards everything; tests use it
-// to avoid noisy stderr output when exercising the warn paths.
-func silentLogger() *slog.Logger {
-	return slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{}))
-}
-
 // graphVidxStack mirrors a representative graph_vidx iterator config:
 // latentEdgeDiscovery at priority 10, vers at priority 20.
 func TestParseStack_GraphVidxMajc(t *testing.T) {
 	props := map[string]string{
-		"table.iterator.majc.latentEdgeDiscovery":                     "10,org.apache.accumulo.core.graph.LatentEdgeDiscoveryIterator",
-		"table.iterator.majc.latentEdgeDiscovery.opt.maxCellBuffer":   "200",
-		"table.iterator.majc.latentEdgeDiscovery.opt.maxPairsPerCell": "500",
+		"table.iterator.majc.latentEdgeDiscovery":                         "10,org.apache.accumulo.core.graph.LatentEdgeDiscoveryIterator",
+		"table.iterator.majc.latentEdgeDiscovery.opt.maxCellBuffer":       "200",
+		"table.iterator.majc.latentEdgeDiscovery.opt.maxPairsPerCell":     "500",
 		"table.iterator.majc.latentEdgeDiscovery.opt.similarityThreshold": "0.85",
-		"table.iterator.majc.vers":               "20,org.apache.accumulo.core.iterators.user.VersioningIterator",
-		"table.iterator.majc.vers.opt.maxVersions": "10",
+		"table.iterator.majc.vers":                                        "20,org.apache.accumulo.core.iterators.user.VersioningIterator",
+		"table.iterator.majc.vers.opt.maxVersions":                        "10",
 	}
-	got := parseStack("tbl-vidx", iterrt.ScopeMajc, "table.iterator.majc.", props, silentLogger())
+	got, err := parseStack("tbl-vidx", iterrt.ScopeMajc, "table.iterator.majc.", props)
+	if err != nil {
+		t.Fatalf("parseStack: %v", err)
+	}
 	if !got.HasShoalCoverage() {
 		t.Fatalf("expected full coverage, got skipped=%+v", got.Skipped)
+	}
+	if got.RegistryVersion != iterrt.CapabilityRegistryVersion {
+		t.Fatalf("RegistryVersion = %d, want %d", got.RegistryVersion, iterrt.CapabilityRegistryVersion)
 	}
 	if len(got.Stack) != 2 {
 		t.Fatalf("stack len = %d, want 2; stack=%+v", len(got.Stack), got.Stack)
@@ -67,17 +67,20 @@ func TestParseStack_GraphVidxMajc(t *testing.T) {
 	}
 }
 
-// Unknown classes get skipped and reported; the rest of the stack
-// resolves normally so partial-coverage tables can still shadow.
-func TestParseStack_SkipsUnknownClass(t *testing.T) {
+// Unknown classes fail closed and are reported in the returned diagnostics.
+func TestParseStack_RejectsUnknownClass(t *testing.T) {
 	props := map[string]string{
 		"table.iterator.majc.weird":               "5,com.example.NotPortedYet",
 		"table.iterator.majc.weird.opt.something": "1",
 		"table.iterator.majc.vers":                "20,org.apache.accumulo.core.iterators.user.VersioningIterator",
 	}
-	got := parseStack("tbl", iterrt.ScopeMajc, "table.iterator.majc.", props, silentLogger())
-	if got.HasShoalCoverage() {
-		t.Fatalf("expected NO shoal coverage; got %+v", got)
+	got, err := parseStack("tbl", iterrt.ScopeMajc, "table.iterator.majc.", props)
+	if err == nil {
+		t.Fatal("expected parseStack error")
+	}
+	var classErr *iterrt.UnsupportedIteratorClassError
+	if !errors.As(err, &classErr) {
+		t.Fatalf("expected UnsupportedIteratorClassError, got %T: %v", err, err)
 	}
 	if len(got.Stack) != 1 || got.Stack[0].Name != iterrt.IterVersioning {
 		t.Errorf("stack = %+v, want [versioning]", got.Stack)
@@ -87,39 +90,131 @@ func TestParseStack_SkipsUnknownClass(t *testing.T) {
 	}
 }
 
-// Malformed header (no comma) is reported as a skipped iterator with
-// empty class, not a hard error.
+// Malformed headers fail closed with an explicit config error.
 func TestParseStack_MalformedHeader(t *testing.T) {
 	props := map[string]string{
 		"table.iterator.majc.bad": "garbage-no-comma",
 	}
-	got := parseStack("tbl", iterrt.ScopeMajc, "table.iterator.majc.", props, silentLogger())
+	got, err := parseStack("tbl", iterrt.ScopeMajc, "table.iterator.majc.", props)
+	if err == nil {
+		t.Fatal("expected parseStack error")
+	}
+	var headerErr *MalformedIteratorConfigError
+	if !errors.As(err, &headerErr) {
+		t.Fatalf("expected MalformedIteratorConfigError, got %T: %v", err, err)
+	}
 	if len(got.Stack) != 0 {
 		t.Errorf("stack should be empty, got %+v", got.Stack)
 	}
-	// Two warns: parse failure (skipped), AND header missing (skipped).
-	// The empty-class path puts it into Skipped with Class=="" — we
-	// don't constrain to which warn fires, just that Skipped reflects it.
-	found := false
-	for _, s := range got.Skipped {
-		if s.Name == "bad" {
-			found = true
-		}
-	}
-	if !found {
-		t.Errorf("skipped should contain 'bad', got %+v", got.Skipped)
+	if len(got.Skipped) != 1 || got.Skipped[0].Name != "bad" {
+		t.Errorf("skipped should contain one 'bad' entry, got %+v", got.Skipped)
 	}
 }
 
 // Empty scope returns an empty stack and HasShoalCoverage()=true (no
 // iterators is a valid table state).
 func TestParseStack_NoIteratorsConfigured(t *testing.T) {
-	got := parseStack("tbl", iterrt.ScopeMajc, "table.iterator.majc.", nil, silentLogger())
+	got, err := parseStack("tbl", iterrt.ScopeMajc, "table.iterator.majc.", nil)
+	if err != nil {
+		t.Fatalf("parseStack: %v", err)
+	}
 	if !got.HasShoalCoverage() {
 		t.Errorf("empty stack should be 'covered': skipped=%+v", got.Skipped)
 	}
 	if len(got.Stack) != 0 {
 		t.Errorf("stack = %+v, want empty", got.Stack)
+	}
+}
+
+func TestParseStack_RejectsUnsupportedContext(t *testing.T) {
+	props := map[string]string{
+		"table.iterator.scan.latent": "10,org.apache.accumulo.core.graph.LatentEdgeDiscoveryIterator",
+	}
+	got, err := parseStack("tbl", iterrt.ScopeScan, "table.iterator.scan.", props)
+	if err == nil {
+		t.Fatal("expected parseStack error")
+	}
+	var ctxErr *iterrt.UnsupportedIteratorContextError
+	if !errors.As(err, &ctxErr) {
+		t.Fatalf("expected UnsupportedIteratorContextError, got %T: %v", err, err)
+	}
+	if len(got.Stack) != 0 {
+		t.Fatalf("stack = %+v, want empty", got.Stack)
+	}
+	if len(got.Skipped) != 1 || got.Skipped[0].Name != "latent" {
+		t.Fatalf("skipped = %+v, want one latent entry", got.Skipped)
+	}
+}
+
+func TestParseStack_RejectsUnsupportedOption(t *testing.T) {
+	props := map[string]string{
+		"table.iterator.majc.vers":         "20,org.apache.accumulo.core.iterators.user.VersioningIterator",
+		"table.iterator.majc.vers.opt.foo": "1",
+	}
+	got, err := parseStack("tbl", iterrt.ScopeMajc, "table.iterator.majc.", props)
+	if err == nil {
+		t.Fatal("expected parseStack error")
+	}
+	var optErr *iterrt.UnsupportedIteratorOptionError
+	if !errors.As(err, &optErr) {
+		t.Fatalf("expected UnsupportedIteratorOptionError, got %T: %v", err, err)
+	}
+	if len(got.Stack) != 0 {
+		t.Fatalf("stack = %+v, want empty", got.Stack)
+	}
+	if len(got.Skipped) != 1 || got.Skipped[0].Name != "vers" {
+		t.Fatalf("skipped = %+v, want one vers entry", got.Skipped)
+	}
+}
+
+func TestParseStack_DeletingIteratorsImplAlias(t *testing.T) {
+	props := map[string]string{
+		"table.iterator.majc.del": "5,org.apache.accumulo.core.iteratorsImpl.system.DeletingIterator",
+	}
+	got, err := parseStack("tbl", iterrt.ScopeMajc, "table.iterator.majc.", props)
+	if err != nil {
+		t.Fatalf("parseStack: %v", err)
+	}
+	if len(got.Stack) != 1 || got.Stack[0].Name != iterrt.IterDeleting {
+		t.Fatalf("stack = %+v, want deleting", got.Stack)
+	}
+}
+
+func TestParseStack_ReportIsMachineReadable(t *testing.T) {
+	props := map[string]string{
+		"table.iterator.scan.vers":                 "20,org.apache.accumulo.core.iterators.user.VersioningIterator",
+		"table.iterator.scan.vers.opt.maxVersions": "2",
+	}
+	got, err := parseStack("tbl", iterrt.ScopeScan, "table.iterator.scan.", props)
+	if err != nil {
+		t.Fatalf("parseStack: %v", err)
+	}
+	encoded, err := json.Marshal(got.Report)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal(encoded, &decoded); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if decoded["supported"] != true ||
+		decoded["accumuloVersion"] != iterrt.AccumuloCompatibilityVersion {
+		t.Fatalf("report JSON = %s", encoded)
+	}
+}
+
+func TestParseStack_UsesJavaUTF16TieBreakOrdering(t *testing.T) {
+	props := map[string]string{
+		"table.iterator.scan.\U00010000": "20,org.apache.accumulo.core.iterators.user.VersioningIterator",
+		"table.iterator.scan.\uE000":     "20,org.apache.accumulo.core.iterators.system.VisibilityFilter",
+	}
+	got, err := parseStack("tbl", iterrt.ScopeScan, "table.iterator.scan.", props)
+	if err != nil {
+		t.Fatalf("parseStack: %v", err)
+	}
+	if len(got.Stack) != 2 || got.Stack[0].Name != iterrt.IterVersioning ||
+		got.Stack[1].Name != iterrt.IterVisibility {
+		t.Fatalf("stack order = %+v, want versioning then visibility", got.Stack)
 	}
 }
 
@@ -130,13 +225,13 @@ func TestParseStack_NoIteratorsConfigured(t *testing.T) {
 // live cluster.
 func TestDecodePropBlob_GzipRoundtrip(t *testing.T) {
 	want := map[string]string{
-		"table.iterator.majc.vers":                                            "20,org.apache.accumulo.core.iterators.user.VersioningIterator",
-		"table.iterator.majc.vers.opt.maxVersions":                            "10",
-		"table.iterator.majc.latentEdgeDiscovery":                             "10,org.apache.accumulo.core.graph.LatentEdgeDiscoveryIterator",
-		"table.iterator.majc.latentEdgeDiscovery.opt.maxCellBuffer":           "200",
-		"table.iterator.majc.latentEdgeDiscovery.opt.maxPairsPerCell":         "500",
-		"table.iterator.majc.latentEdgeDiscovery.opt.similarityThreshold":     "0.85",
-		"table.unrelated.someprop":                                            "ignored",
+		"table.iterator.majc.vers":                                        "20,org.apache.accumulo.core.iterators.user.VersioningIterator",
+		"table.iterator.majc.vers.opt.maxVersions":                        "10",
+		"table.iterator.majc.latentEdgeDiscovery":                         "10,org.apache.accumulo.core.graph.LatentEdgeDiscoveryIterator",
+		"table.iterator.majc.latentEdgeDiscovery.opt.maxCellBuffer":       "200",
+		"table.iterator.majc.latentEdgeDiscovery.opt.maxPairsPerCell":     "500",
+		"table.iterator.majc.latentEdgeDiscovery.opt.similarityThreshold": "0.85",
+		"table.unrelated.someprop":                                        "ignored",
 	}
 	blob := buildSyntheticPropBlob(t, want, true /*gzip*/)
 
@@ -218,10 +313,10 @@ func buildSyntheticPropBlob(t *testing.T, props map[string]string, compressed bo
 
 func TestSplitPriorityClass(t *testing.T) {
 	cases := []struct {
-		in       string
-		wantPri  int
-		wantCls  string
-		wantErr  bool
+		in      string
+		wantPri int
+		wantCls string
+		wantErr bool
 	}{
 		{"10,foo.bar.Baz", 10, "foo.bar.Baz", false},
 		{" 20 , foo.Bar ", 20, "foo.Bar", false},

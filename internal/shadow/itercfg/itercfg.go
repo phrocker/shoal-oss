@@ -62,12 +62,9 @@
 // IteratorEnvironment build order), maps Java class names to shoal's
 // iterrt registry, and returns the resulting []iterrt.IterSpec.
 //
-// Iterators whose class names aren't in the allowlist are SKIPPED with a
-// WARN — operators see them flagged so they know the shadow comparison
-// would be unsound for that table until the iterator is ported. The
-// rest of the stack is still resolved so partial-coverage tables can
-// shadow on whatever IS in the allowlist (the report records what was
-// elided).
+// Every configured iterator is checked against the shared, versioned
+// capability registry. Unsupported classes, contexts, options, and malformed
+// headers fail closed before the stack can execute.
 package itercfg
 
 import (
@@ -85,36 +82,25 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf16"
 
 	"github.com/phrocker/shoal/internal/iterrt"
 	nslookup "github.com/phrocker/shoal/internal/namespaces"
 	"github.com/phrocker/shoal/internal/tablenames"
 )
 
-// ClassAllowlist maps fully-qualified Java iterator class names to the
-// iterrt registered identifier shoal will instantiate in their place.
-// Multiple aliases for the same class are deliberate — Accumulo ships
-// both o.a.a.core.iterators.user.VersioningIterator and the older
-// org.apache.accumulo.core.iterators.user.VersioningIterator alias.
-//
-// Tables whose stack references a class NOT in this map are reported
-// out of shadow coverage and the iterator is dropped from the
-// reconstructed stack with a WARN. See Resolve.
-var ClassAllowlist = map[string]string{
-	// VersioningIterator — newest-N per coordinate.
-	"org.apache.accumulo.core.iterators.user.VersioningIterator": iterrt.IterVersioning,
-	"org.apache.accumulo.core.iterators.VersioningIterator":      iterrt.IterVersioning,
+// ClassAllowlist is retained for API compatibility. It is generated from the
+// shared registry so compactor admission and table configuration cannot drift.
+var ClassAllowlist = classAllowlist()
 
-	// DeletingIterator — tombstone suppression.
-	"org.apache.accumulo.core.iterators.system.DeletingIterator": iterrt.IterDeleting,
-	"org.apache.accumulo.core.iterators.DeletingIterator":        iterrt.IterDeleting,
-
-	// VisibilityFilter — column-visibility check (scan-only in practice).
-	"org.apache.accumulo.core.iterators.system.VisibilityFilter": iterrt.IterVisibility,
-
-	// LatentEdgeDiscoveryIterator — the graph_vidx majc emitter.
-	// Lives in core/ under the `accumulo.core.graph` package.
-	"org.apache.accumulo.core.graph.LatentEdgeDiscoveryIterator": iterrt.IterLatentEdgeDiscovery,
+func classAllowlist() map[string]string {
+	out := map[string]string{}
+	for _, capability := range iterrt.RegistrySnapshot().Iterators {
+		for _, class := range capability.JavaClasses {
+			out[class] = capability.Name
+		}
+	}
+	return out
 }
 
 // ResolvedStack is the parsed table.iterator.<scope>.* config for one
@@ -123,20 +109,24 @@ var ClassAllowlist = map[string]string{
 // because their class isn't allowlisted.
 type ResolvedStack struct {
 	// TableID is the table the stack belongs to.
-	TableID string
+	TableID string `json:"tableId"`
 	// Scope is the compaction scope these specs apply to.
-	Scope iterrt.IteratorScope
+	Scope iterrt.IteratorScope `json:"scope"`
+	// RegistryVersion is the capability registry used for admission.
+	RegistryVersion int `json:"registryVersion"`
+	// Report is the machine-readable compatibility inventory for this stack.
+	Report iterrt.CompatibilityReport `json:"report"`
 	// Stack is the resolved iterator chain in priority order (low first).
 	// Empty stack is valid (no iterators configured at this scope).
-	Stack []iterrt.IterSpec
+	Stack []iterrt.IterSpec `json:"stack"`
 	// Skipped names each iterator that was dropped because its class
 	// isn't in ClassAllowlist. Operators read this list to know which
 	// tables need a new iterator port before shadow comparison is
 	// meaningful.
-	Skipped []SkippedIter
+	Skipped []SkippedIter `json:"rejected,omitempty"`
 	// LoadedAt records when the config snapshot was taken from ZK.
 	// Callers use this to gate cache freshness.
-	LoadedAt time.Time
+	LoadedAt time.Time `json:"loadedAt"`
 }
 
 // SkippedIter describes a table.iterator.<scope>.<name> entry that was
@@ -145,14 +135,56 @@ type ResolvedStack struct {
 type SkippedIter struct {
 	// Name is the entry's nickname (the third dotted component of the
 	// table.iterator property).
-	Name string
+	Name string `json:"name"`
 	// Class is the fully-qualified Java class name from the property
 	// value.
-	Class string
+	Class string `json:"javaClass,omitempty"`
 	// Priority is the integer priority parsed from the property value
 	// (or -1 if the value was malformed).
-	Priority int
+	Priority int `json:"priority"`
+	// Reason explains why admission rejected the iterator.
+	Reason string `json:"reason"`
 }
+
+// MalformedIteratorConfigError reports an invalid iterator header property.
+type MalformedIteratorConfigError struct {
+	Prop  string
+	Value string
+	Err   error
+}
+
+func (e *MalformedIteratorConfigError) Error() string {
+	return fmt.Sprintf("itercfg: malformed iterator header %q=%q: %v", e.Prop, e.Value, e.Err)
+}
+
+func (e *MalformedIteratorConfigError) Unwrap() error { return e.Err }
+
+// IncompleteIteratorConfigError reports options without a valid header.
+type IncompleteIteratorConfigError struct {
+	Name string
+}
+
+func (e *IncompleteIteratorConfigError) Error() string {
+	return fmt.Sprintf("itercfg: iterator %q is missing a valid header property", e.Name)
+}
+
+// StackConfigError aggregates all blockers in one table/scope stack.
+type StackConfigError struct {
+	TableID string
+	Scope   iterrt.IteratorScope
+	Issues  []error
+}
+
+func (e *StackConfigError) Error() string {
+	parts := make([]string, len(e.Issues))
+	for i, issue := range e.Issues {
+		parts[i] = issue.Error()
+	}
+	return fmt.Sprintf("itercfg: table %s %s stack rejected: %s",
+		e.TableID, scopeString(e.Scope), strings.Join(parts, "; "))
+}
+
+func (e *StackConfigError) Unwrap() []error { return e.Issues }
 
 // HasShoalCoverage is true when at least one iterator was successfully
 // resolved AND no iterators were skipped. Operators use this to decide
@@ -235,7 +267,7 @@ func (r *Resolver) Resolve(ctx context.Context, tableID string, scope iterrt.Ite
 
 	stack, err := r.loadStack(ctx, tableID, scope)
 	if err != nil {
-		return nil, err
+		return stack, err
 	}
 
 	r.cacheMu.Lock()
@@ -276,7 +308,7 @@ func (r *Resolver) loadStack(ctx context.Context, tableID string, scope iterrt.I
 			slog.String("table", tableID), slog.String("err", err.Error()))
 	}
 
-	return parseStack(tableID, scope, prefix, merged, r.logger), nil
+	return parseStack(tableID, scope, prefix, merged)
 }
 
 // mergePropsFrom reads the versioned-props blob at znodePath, decodes
@@ -398,18 +430,24 @@ func readJavaUTF(r io.Reader) (string, error) {
 // parseStack converts the prop map into an ordered ResolvedStack. Pure
 // over (tableID, scope, prefix, props); covered by unit tests that
 // bypass ZK entirely.
-func parseStack(tableID string, scope iterrt.IteratorScope, prefix string, props map[string]string, logger *slog.Logger) *ResolvedStack {
+func parseStack(tableID string, scope iterrt.IteratorScope, prefix string, props map[string]string) (*ResolvedStack, error) {
 	out := &ResolvedStack{
-		TableID:  tableID,
-		Scope:    scope,
-		LoadedAt: time.Now(),
+		TableID:         tableID,
+		Scope:           scope,
+		RegistryVersion: iterrt.CapabilityRegistryVersion,
+		LoadedAt:        time.Now(),
 	}
+	var issues []error
 
 	type rawEntry struct {
-		name     string
-		priority int
-		class    string
-		opts     map[string]string
+		name        string
+		priority    int
+		class       string
+		opts        map[string]string
+		prop        string
+		headerValue string
+		headerOK    bool
+		headerErr   error
 	}
 	entries := map[string]*rawEntry{} // by iterator nickname
 
@@ -428,16 +466,16 @@ func parseStack(tableID string, scope iterrt.IteratorScope, prefix string, props
 			// Header property: "<priority>,<class>".
 			pri, class, perr := splitPriorityClass(v)
 			if perr != nil {
-				logger.Warn("itercfg: malformed header",
-					slog.String("table", tableID),
-					slog.String("prop", k),
-					slog.String("value", v),
-					slog.String("err", perr.Error()),
-				)
+				entry.prop = k
+				entry.headerValue = v
+				entry.headerErr = perr
 				continue
 			}
 			entry.priority = pri
 			entry.class = class
+			entry.prop = k
+			entry.headerValue = v
+			entry.headerOK = true
 			continue
 		}
 		// Option property: "opt.<key>".
@@ -448,22 +486,6 @@ func parseStack(tableID string, scope iterrt.IteratorScope, prefix string, props
 		// — ignored; reserved for future Accumulo extensions.
 	}
 
-	// Drop entries with no header (incomplete config — Accumulo would
-	// reject this on write, but ZK can briefly land in this state during
-	// an operator's two-step add). Carry them in Skipped with class="".
-	for _, e := range entries {
-		if e.class == "" {
-			out.Skipped = append(out.Skipped, SkippedIter{
-				Name: e.name, Class: "", Priority: e.priority,
-			})
-		}
-	}
-	for name, e := range entries {
-		if e.class == "" {
-			delete(entries, name)
-		}
-	}
-
 	// Order by priority ascending (lowest priority runs LOWEST in the
 	// stack — Accumulo IteratorUtil.loadIterators convention). Java
 	// docs say "lowest priority first" matches "leaf side of the stack."
@@ -472,32 +494,97 @@ func parseStack(tableID string, scope iterrt.IteratorScope, prefix string, props
 		keys = append(keys, n)
 	}
 	sort.SliceStable(keys, func(i, j int) bool {
-		return entries[keys[i]].priority < entries[keys[j]].priority
+		left, right := entries[keys[i]], entries[keys[j]]
+		if left.priority == right.priority {
+			return compareUTF16(left.name, right.name) < 0
+		}
+		return left.priority < right.priority
 	})
 
+	configured := make([]iterrt.ConfiguredIterator, 0, len(keys))
 	for _, name := range keys {
 		e := entries[name]
-		alias, ok := ClassAllowlist[e.class]
-		if !ok {
+		if e.headerErr != nil {
+			err := &MalformedIteratorConfigError{Prop: e.prop, Value: e.headerValue, Err: e.headerErr}
+			issues = append(issues, err)
 			out.Skipped = append(out.Skipped, SkippedIter{
-				Name: e.name, Class: e.class, Priority: e.priority,
+				Name: e.name, Priority: e.priority, Reason: err.Error(),
 			})
-			logger.Warn("itercfg: class not in shoal allowlist (iterator skipped)",
-				slog.String("table", tableID),
-				slog.String("scope", scopeString(scope)),
-				slog.String("name", e.name),
-				slog.String("class", e.class),
-				slog.Int("priority", e.priority),
-			)
 			continue
 		}
-		out.Stack = append(out.Stack, iterrt.IterSpec{
-			Name:    alias,
-			Options: e.opts,
+		if !e.headerOK {
+			err := &IncompleteIteratorConfigError{Name: e.name}
+			issues = append(issues, err)
+			out.Skipped = append(out.Skipped, SkippedIter{
+				Name: e.name, Priority: e.priority, Reason: err.Error(),
+			})
+			continue
+		}
+		configured = append(configured, iterrt.ConfiguredIterator{
+			Name:      e.name,
+			JavaClass: e.class,
+			Priority:  e.priority,
+			Options:   e.opts,
 		})
 	}
 
-	return out
+	report, reportErr := iterrt.CheckCompatibility(iterrt.CompatibilityRequest{
+		RegistryVersion: iterrt.CapabilityRegistryVersion,
+		AccumuloVersion: iterrt.AccumuloCompatibilityVersion,
+		Context:         iterrt.ContextFromScope(scope),
+		Iterators:       configured,
+	})
+	out.Report = report
+	for _, item := range report.Iterators {
+		if item.Supported {
+			out.Stack = append(out.Stack, iterrt.IterSpec{
+				Name:    item.NativeName,
+				Options: item.Options,
+			})
+			continue
+		}
+		reason := "unsupported iterator capability"
+		for _, issue := range report.Issues {
+			if issue.Name == item.Name && issue.JavaClass == item.JavaClass {
+				reason = issue.Message
+				break
+			}
+		}
+		out.Skipped = append(out.Skipped, SkippedIter{
+			Name: item.Name, Class: item.JavaClass, Priority: item.Priority, Reason: reason,
+		})
+	}
+	if reportErr != nil {
+		issues = append(issues, reportErr)
+	}
+	if len(issues) > 0 {
+		out.Report.Supported = false
+		for _, issue := range issues {
+			if issue == reportErr {
+				continue
+			}
+			out.Report.Issues = append(out.Report.Issues, iterrt.CompatibilityIssue{
+				Code:    "malformed_iterator_config",
+				Message: issue.Error(),
+				Context: iterrt.ContextFromScope(scope),
+			})
+		}
+		return out, &StackConfigError{TableID: tableID, Scope: scope, Issues: issues}
+	}
+	return out, nil
+}
+
+func compareUTF16(left, right string) int {
+	if left == right {
+		return 0
+	}
+	leftUnits, rightUnits := utf16.Encode([]rune(left)), utf16.Encode([]rune(right))
+	for i := 0; i < len(leftUnits) && i < len(rightUnits); i++ {
+		if leftUnits[i] != rightUnits[i] {
+			return int(leftUnits[i]) - int(rightUnits[i])
+		}
+	}
+	return len(leftUnits) - len(rightUnits)
 }
 
 // scopeString renders an iterator scope as the lowercase token used in
