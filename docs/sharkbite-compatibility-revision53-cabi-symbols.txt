@@ -194,7 +194,6 @@ shoal_connector_identity_view_init
 shoal_connector_get_identity
 shoal_connector_identity_get
 shoal_connector_identity_free
-shoal_zookeeper_resolve_instance
 shoal_connector_get_root_tablet_location
 shoal_connector_get_manager_locations
 shoal_connector_get_zookeepers
@@ -651,6 +650,5 @@ shoal_write_failure_get_cleanup
 shoal_write_failure_get_constraint
 shoal_write_failure_get_failed_extent
 shoal_write_failure_get_flags
-shoal_zookeeper_resolve_instance
 
 [unreferenced]

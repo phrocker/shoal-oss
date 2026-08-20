@@ -15,7 +15,7 @@ class CompiledLibraryTests(unittest.TestCase):
     )
     def test_writer_and_administration_symbols_match_reported_capabilities(self):
         api = NativeAPI()
-        api.require(6, 7, 8, 9, 10, 11, 12, 19, 29, 30, 31)
+        api.require(4, 5, 6, 7, 8, 9, 10, 11, 12, 19, 24, 29, 30, 31)
         self.assertGreaterEqual(api.info.version, (1, 19, 0))
         with Mutation(b"row", _api=api) as mutation:
             mutation.put(b"cf", b"cq", b"A", 7, b"value")
@@ -59,4 +59,3 @@ class CompiledLibraryTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

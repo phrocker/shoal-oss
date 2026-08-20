@@ -18,9 +18,11 @@ from .client import (
     AccumuloIterator,
     AccumuloScanner,
     AccumuloWriter,
+    BatchScanner,
     Client,
     Connector,
     Scanner,
+    Results,
 )
 from .compatibility import (
     IterInfo,
@@ -81,6 +83,7 @@ __all__ = [
     "AuthInfo",
     "BatchWriter",
     "BatchWriterOptions",
+    "BatchScanner",
     "CancelledError",
     "Client",
     "ClientException",
@@ -111,6 +114,7 @@ __all__ = [
     "RFileOperations",
     "RecoveryStatus",
     "PythonIterator",
+    "Results",
     "Scanner",
     "ScannerOptions",
     "SecurityOperations",
