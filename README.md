@@ -66,6 +66,7 @@ V1 + IVF-PQ iterator port shipped. Embedded standalone engine shipped.
 | File / locator / block caches | shipped |
 | Startup pre-warm (`-prewarm-tables=auto`) | shipped — distributed-serving mode |
 | Client-side hedge coordinator | shipped — `scanRow*` + `scanBatch*` overloads |
+| Manager-facing tablet lifecycle RPC adapter (`internal/tserverrpc`) | partial — fenced assignment/unload/status/control, cancellation, failover-aware reporting, and exact service advertisement are implemented; metadata-backed tablet loading and process wiring remain open ([lifecycle](docs/tserver-hosting-lifecycle.md)) |
 | Offline compaction (`shoal-offline-compact`, `internal/offlinecompact`) | shipped — OFFLINE-fenced full major compaction off-cluster ([design](docs/offline-compaction-design.md) · [runbook](docs/offline-compaction.md)) |
 | Local→Accumulo promotion (`internal/promotion`, Bulk Import V2) | partial — load-mapping/staging + FATE `TABLE_BULK_IMPORT2` submission through the manager for both single-tablet and multi-tablet/split-bearing exports (destination splits are reconciled via `AddTableSplitsForTable`/`TABLE_SPLIT`, then verified via `ListTableSplits` to rule out any unrelated extra split, before staging); live-cluster verification, a residual concurrent-merge race around split reconciliation, an ambiguous-FATE-retry gap on `BulkImport` itself, cutover protocol, and ongoing fan-in remain open ([design](docs/promotion.md)) |
 

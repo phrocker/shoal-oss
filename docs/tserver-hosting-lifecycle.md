@@ -25,9 +25,12 @@ Status: **partial**. The fenced lifecycle state machine
 that makes it visible to a manager: the tablet-server ServiceLock, the
 service descriptors the manager reads, and the manager-lock observation
 that supplies live manager authority — see [§6](#6-registering-with-zookeeper).
-The hosted-tablet specification loader is also present; manager RPC and
-process wiring remain separate slices — see
-[§8](#8-what-is-not-here-yet). Tracking issue: #67.
+The manager RPC adapter (`internal/tserverrpc`) now maps Accumulo 4
+assignment, unload, flush, status, and halt calls onto that fence and
+reports asynchronous lifecycle outcomes. Tablet metadata loading and the
+hosted-tablet specification loader are now present; the process that owns
+and connects all required dependencies is not wired yet — see
+[§9](#9-what-is-not-here-yet). Tracking issue: #67.
 
 ## 1. Goal
 
@@ -426,9 +429,16 @@ under the prefix, and goes with the session.
 ### What the node says
 
 The payload is `ServiceLockData` in the exact Gson wire form the manager
-reads — a `descriptors` array of `{uuid, service, address, group}` — and a
-tablet server publishes the same five services a Java one does: `CLIENT`,
-`TABLET_INGEST`, `TABLET_MANAGEMENT`, `TABLET_SCAN`, `TSERV`.
+reads — a `descriptors` array of `{uuid, service, address, group}`. A Java
+tablet server publishes `CLIENT`, `TABLET_INGEST`, `TABLET_MANAGEMENT`,
+`TABLET_SCAN`, and `TSERV`; `TabletServerLockData` can represent that full
+set, but a Shoal process must pass only the services it actually serves.
+`tserverrpc.Adapter.LockData` therefore advertises only
+`TABLET_MANAGEMENT` and `TSERV`. Scan, ingest, and `ClientService` remain
+absent until their processors share the same process and endpoint. The
+adapter also refuses to build that lock data until both multiplexed
+processors have been registered, so startup cannot publish ahead of the
+RPC listener it describes.
 
 The advertisement is refused rather than published when it would mislead
 the manager: no descriptors, an address that is empty, unbound, or not
@@ -772,23 +782,56 @@ not a poll a process can shut down. Wiring the watch into a running
 server therefore waits on a cancellable reader that reuses its session,
 or on one backed by a ZooKeeper watch instead of a poll; that is a
 prerequisite of the process-wiring slice, recorded in
-[§8](#8-what-is-not-here-yet), not something this package can fix from
+[§9](#9-what-is-not-here-yet), not something this package can fix from
 behind the interface.
 
-## 7. Hosted-tablet specification loader
+## 7. Manager RPC adapter
+
+`internal/tserverrpc` vendors Accumulo 4's `tabletmgmt.thrift` and exposes
+the multiplexed `tablet` and `tserver` processors. It validates the
+credentials' instance ID through an injected system-credential verifier,
+parses the manager's serialized `ZooUtil.LockID` (path, lock node, and
+ZooKeeper session), requires that lock to match `Host.ManagerLock`, and
+uses the currently held tablet-server ServiceLock as the server half of
+the `Host` fence. A changed manager session for the same observed lock is
+rejected.
+
+Accepted loads and unloads run through an injected backend. Duplicate
+loads and unloads are idempotent, unload cancels an in-flight load, and
+`ReleaseDropped` is the callback passed to `Participate` so lock loss
+cancels work and closes backend resources before the lock node is
+released. Results are reported as `LOADED`, `LOAD_FAILURE`, `UNLOADED`,
+`UNLOAD_FAILURE_NOT_SERVING`, or `UNLOAD_ERROR`. `RetryingReporter`
+re-resolves and reconnects for every retry, so a status report follows a
+manager failover instead of pinning a dead transport.
+
+The `TSERV` processor provides status, tablet stats, flush, and fenced
+halt/fast-halt control. Operations owned by data planes not present in
+this slice return `ErrUnsupported`; the adapter does not advertise the
+corresponding `TABLET_INGEST`, `TABLET_SCAN`, or `CLIENT` services.
+
+No command is wired by this slice. None currently owns all of the
+dependencies that `New` deliberately requires: a metadata-validating
+tablet backend, Accumulo system-credential validation, a failover-aware
+manager report connector, a reusable-session manager-lock reader, and
+the same ZooKeeper session used by `ServiceLock`. Constructing an adapter
+without any one of those dependencies fails with an explicit unsupported
+boundary rather than registering a server that cannot perform the work.
+
+## 8. Hosted-tablet specification loader
 
 `internal/tabletloader` resolves the immutable input to a hosted tablet
 without owning manager RPCs or ingest. A load:
 
-1. captures an opaque assignment generation from `Authority`
+1. captures the exact metadata assignment generation from `Authority`
 2. reads exactly one metadata row and requires its table/range to equal the
    manager-assigned `tserver.Extent`
-3. requires the metadata future/current generation to equal the captured
-   generation, plus the mandatory `~tab:~pr`, `srv:dir`, and `srv:time`
-   columns
+3. requires exactly one complete future/current location whose session equals
+   the captured generation, plus the mandatory `~tab:~pr`, `srv:dir`, and
+   `srv:time` columns
 4. reads a stable effective table configuration; `ManagerConfigSource`
-   brackets the merged configuration read with versioned-property reads and
-   retries the whole transaction if the generation changes
+   brackets two merged-configuration reads with versioned-property reads and
+   retries the whole transaction if either view changes
 5. resolves and validates every StoredTabletFile and LogEntry reference
 6. rechecks the assignment fence between every external operation and before
    returning a deterministically ordered `Specification`
@@ -810,21 +853,13 @@ presence, directory/time values, and Accumulo 4 `log:` qualifiers. WAL
 qualifiers are decoded using Java `LogEntry.fromMetaWalEntry`'s
 `-/<path ending in host+port/UUID>` format.
 
-## 8. What is not here yet
+## 9. What is not here yet
 
 Still to land for #67:
 
-- the manager-facing Thrift surface that turns RPCs into `Assign` /
-  `Unassign` calls and reports `TabletServerStatus`
 - wiring the manager adapter's `StateLoading` backend to
   `tabletloader.Loader`, a concrete exact-row metadata scanner, storage/WAL
   openers, constraints, and iterator configuration
-- serving the `TSERV` and `TABLET_*` endpoints that are advertised. A
-  lock in the tablet-server tree must carry a `TSERV` descriptor or the
-  manager's scan throws on it, so the advertisement cannot wait for the
-  endpoint; a process that registers before serving it is an unreachable
-  server, which Accumulo dooms and retries, and that is why nothing wires
-  this into a cluster yet
 - the process wiring that owns the ZooKeeper session, chooses the
   advertised address and resource group, and restarts participation after
   a lock loss. It also needs a manager-lock reader that holds one session
@@ -836,7 +871,7 @@ Still to land for #67:
 - end-to-end tests against a live manager, including migration to and
   from a Java tserver and rolling mixed-fleet replacement
 
-## 9. Metrics
+## 10. Metrics
 
 `Host.Metrics()` snapshots the operational surface #67 asks for:
 `Loading` / `Hosted` / `Unloading` gauges, and counters for
