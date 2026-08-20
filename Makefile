@@ -225,6 +225,17 @@ python-dist:
 python-dist-verify:
 	python python/scripts/verify_release.py
 
+.PHONY: python-preview-macos
+python-preview-macos:
+	python python/scripts/build_preview.py --platform-tag macosx_11_0_x86_64 --dist build/cross-platform-artifacts/wheel-preview-darwin-amd64 --allow-dirty
+	python python/scripts/verify_preview.py --dist build/cross-platform-artifacts/wheel-preview-darwin-amd64
+	python python/scripts/build_preview.py --platform-tag macosx_11_0_arm64 --dist build/cross-platform-artifacts/wheel-preview-darwin-arm64 --allow-dirty
+	python python/scripts/verify_preview.py --dist build/cross-platform-artifacts/wheel-preview-darwin-arm64
+
+.PHONY: cross-platform-artifacts
+cross-platform-artifacts:
+	python scripts/cross_platform_artifacts.py
+
 .PHONY: python-release-validate
 python-release-validate: python-test python-dist python-dist-verify
 	go test -tags=shoal_capi_test ./cmd/shoal-capi

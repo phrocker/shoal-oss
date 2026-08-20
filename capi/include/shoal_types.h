@@ -6,7 +6,9 @@
 
 #if defined(_WIN32)
 #define SHOAL_CALL __cdecl
-#if defined(SHOAL_BUILDING_LIBRARY)
+#if defined(SHOAL_STATIC)
+#define SHOAL_API
+#elif defined(SHOAL_BUILDING_LIBRARY)
 #define SHOAL_API __declspec(dllexport)
 #else
 #define SHOAL_API __declspec(dllimport)

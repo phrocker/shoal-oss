@@ -19,11 +19,13 @@ cpw
 mp
 
 # build artifacts
+/build/
 *.exe
 shoal-offline-compact.exe
 python/.venv/
 python/build/
 python/dist/
+python/preview-dist/
 python/*.egg-info/
 python/src/*.egg-info/
 __pycache__/

@@ -14,10 +14,13 @@ class PlatformWheel(bdist_wheel):
         self._has_bundled_native = any(
             path.suffix.lower() in {".dll", ".dylib", ".so"} for path in bundled
         )
-        self.root_is_pure = not self._has_bundled_native
+        self._is_platform_preview = os.environ.get("SHOAL_WHEEL_PREVIEW") == "1"
+        if self._is_platform_preview and self._has_bundled_native:
+            raise RuntimeError("platform preview wheels must not bundle a native library")
+        self.root_is_pure = not (self._has_bundled_native or self._is_platform_preview)
 
     def get_tag(self) -> tuple[str, str, str]:
-        if not self._has_bundled_native:
+        if not (self._has_bundled_native or self._is_platform_preview):
             return "py3", "none", "any"
         _, _, default_platform = super().get_tag()
         platform_tag = os.environ.get("SHOAL_WHEEL_PLATFORM_TAG", default_platform)
