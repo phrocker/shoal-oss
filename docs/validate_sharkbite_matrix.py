@@ -3454,16 +3454,23 @@ def validate_targeted_symbol_anchors(
     contents = load_targeted_contents(targeted_paths, repo_root=repo_root)
 
     for _line_number, row_id, cells in iter_matrix_rows(lines):
+        row_targeted_paths = targeted_paths
+        if (
+            "accumulo/scanner.go" in targeted_paths
+            and not any(
+                mapped_row == row_id and mapped_ref == "accumulo/scanner.go"
+                for mapped_row, mapped_ref in TARGETED_SYMBOL_ANCHORS_BY_ROW_CITATION
+            )
+        ):
+            row_targeted_paths = targeted_paths - {"accumulo/scanner.go"}
         for cell in cells[1:]:
-            path_anchor_bindings = extract_path_anchor_bindings(cell, targeted_paths)
+            path_anchor_bindings = extract_path_anchor_bindings(cell, row_targeted_paths)
             if not path_anchor_bindings:
                 continue
             for ref, anchors in path_anchor_bindings.items():
                 scanner_key = (row_id, ref)
                 if ref == "accumulo/scanner.go":
-                    expected_symbols = TARGETED_SYMBOL_ANCHORS_BY_ROW_CITATION.get(scanner_key)
-                    if expected_symbols is None:
-                        continue
+                    expected_symbols = TARGETED_SYMBOL_ANCHORS_BY_ROW_CITATION[scanner_key]
                     cited_symbols = {anchor.split("(", 1)[0] for anchor in anchors}
                     missing_symbols = sorted(expected_symbols - cited_symbols)
                     require(
