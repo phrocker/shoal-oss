@@ -294,17 +294,18 @@ func stageBulkDirLocked(
 }
 
 func acquireStageBulkDir(ctx context.Context, dst storage.Backend, bulkDir string) (func(), error) {
-	key := canonicalPathBackendKey(dst) + "\x00" + bulkDir
+	lockTarget := joinBulkPath(dst, bulkDir, bulkLoadMappingFile)
+	key := canonicalPathBackendKey(dst) + "\x00" + lockTarget
 	unwrapped := unwrapBackend(dst)
 	if _, ok := unwrapped.(*local.Backend); ok {
 		cache := newPathIdentityCache(1)
-		key = fmt.Sprintf("%T", unwrapped) + "\x00" + cache.publicationKey(bulkDir)
+		key = fmt.Sprintf("%T", unwrapped) + "\x00" + cache.publicationKey(lockTarget)
 	} else {
-		ref := newStagePathRef(dst, bulkDir)
+		ref := newStagePathRef(dst, lockTarget)
 		if canonical, ok := canonicalBackendPath(ref); ok {
 			key = stageLockBackendKey(dst) + "\x00" + canonical
 		} else if _, ok := unwrapped.(*hdfs.Backend); ok {
-			key = fmt.Sprintf("%T", unwrapped) + "\x00" + path.Clean(strings.ReplaceAll(bulkDir, `\`, "/"))
+			key = fmt.Sprintf("%T", unwrapped) + "\x00" + path.Clean(strings.ReplaceAll(lockTarget, `\`, "/"))
 		}
 	}
 

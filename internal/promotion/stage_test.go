@@ -16,6 +16,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	s3sdk "github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/phrocker/shoal/accumulo"
 	"github.com/phrocker/shoal/internal/engine"
 	shstorage "github.com/phrocker/shoal/internal/storage"
@@ -305,6 +307,48 @@ func TestAcquireStageBulkDirSerializesRelativeHDFSPathsAcrossBackendInstances(t 
 		release()
 	case <-time.After(time.Second):
 		t.Fatal("second relative HDFS acquire did not proceed after release")
+	}
+}
+
+func TestAcquireStageBulkDirSerializesEquivalentS3DirectorySpellings(t *testing.T) {
+	newBackend := func() *s3.Backend {
+		backend, err := s3.New(
+			context.Background(),
+			s3.WithClient(s3sdk.NewFromConfig(aws.Config{Region: "us-east-1"})),
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return backend
+	}
+
+	firstBackend, secondBackend := newBackend(), newBackend()
+	releaseFirst, err := acquireStageBulkDir(context.Background(), firstBackend, "s3://bucket/bulk")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	secondAcquired := make(chan func(), 1)
+	go func() {
+		release, err := acquireStageBulkDir(context.Background(), secondBackend, "s3://bucket/bulk/")
+		if err != nil {
+			return
+		}
+		secondAcquired <- release
+	}()
+	select {
+	case release := <-secondAcquired:
+		release()
+		t.Fatal("equivalent S3 directory spelling acquired while first still owned destination")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	releaseFirst()
+	select {
+	case release := <-secondAcquired:
+		release()
+	case <-time.After(time.Second):
+		t.Fatal("equivalent S3 directory spelling did not acquire after release")
 	}
 }
 
