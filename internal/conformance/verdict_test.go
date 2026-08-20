@@ -24,6 +24,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -99,7 +100,7 @@ func TestReplayFailureMakesRequiredGateFail(t *testing.T) {
 }
 
 func TestUnavailableLiveEnvironmentIsUnsupportedNotPass(t *testing.T) {
-	command := []string{"python", "test/accumulo/harness.py", "test"}
+	command := []string{"python", "test/accumulo/harness.py", "role", "client"}
 	verdict, code, err := Run(context.Background(), Options{
 		Root:     repositoryRoot(t),
 		Mode:     "live",
@@ -119,6 +120,58 @@ func TestUnavailableLiveEnvironmentIsUnsupportedNotPass(t *testing.T) {
 		if gate.Role == "client" && gate.State != Unsupported {
 			t.Fatalf("client state = %q, want unsupported", gate.State)
 		}
+	}
+}
+
+func TestLiveRoleCommandsPromoteOnlyTheirCompletedProductionGate(t *testing.T) {
+	for _, role := range Roles {
+		t.Run(role, func(t *testing.T) {
+			command := []string{"python", "test/accumulo/harness.py", "role", role}
+			verdict, code, err := Run(context.Background(), Options{
+				Root:     repositoryRoot(t),
+				Mode:     "live",
+				Required: []string{role},
+				Commit:   strings.Repeat("f", 40),
+				Executor: fakeExecutor{results: map[string]CommandResult{
+					strings.Join(command, "\x00"): {
+						Output: "SHOAL_EVIDENCE role=" + role + " status=pass",
+					},
+				}},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			index := slices.Index(Roles, role)
+			gate := verdict.Gates[index]
+			if code != 0 || gate.State != Pass || gate.EvidenceState != Pass ||
+				len(gate.MissingRequiredGates) != 0 {
+				t.Fatalf("code=%d gate=%#v", code, gate)
+			}
+			live := gate.Evidence[len(gate.Evidence)-1]
+			if live.Kind != "live-command" || !slices.Equal(live.ReplayCommand, command) {
+				t.Fatalf("live evidence = %#v", live)
+			}
+		})
+	}
+}
+
+func TestLiveRoleZeroExitWithoutEvidenceMarkerFailsClosed(t *testing.T) {
+	command := []string{"python", "test/accumulo/harness.py", "role", "tserver"}
+	verdict, code, err := Run(context.Background(), Options{
+		Root:     repositoryRoot(t),
+		Mode:     "live",
+		Required: []string{"tserver"},
+		Commit:   strings.Repeat("0", 40),
+		Executor: fakeExecutor{results: map[string]CommandResult{
+			strings.Join(command, "\x00"): {Output: "commands completed"},
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if code != 1 || verdict.Gates[0].State != Fail ||
+		!strings.Contains(verdict.Gates[0].Summary, "without required evidence marker") {
+		t.Fatalf("code=%d gate=%#v", code, verdict.Gates[0])
 	}
 }
 

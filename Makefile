@@ -282,6 +282,18 @@ conformance-live:
 	go build -o bin/shoal-conformance ./cmd/shoal-conformance
 	bin/shoal-conformance -mode live
 
+.PHONY: conformance-live-tserver
+conformance-live-tserver:
+	mkdir -p bin
+	go build -o bin/shoal-conformance ./cmd/shoal-conformance
+	bin/shoal-conformance -mode live -required tserver,scanserver,client
+
+.PHONY: conformance-live-compactor
+conformance-live-compactor:
+	mkdir -p bin
+	go build -o bin/shoal-conformance ./cmd/shoal-conformance
+	bin/shoal-conformance -mode live -required compactor,promotion
+
 .PHONY: accumulo-up
 accumulo-up:
 	python test/accumulo/harness.py up

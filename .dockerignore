@@ -1,0 +1,5 @@
+.git
+.review-worktrees
+bin
+pr-review-results
+python/.venv

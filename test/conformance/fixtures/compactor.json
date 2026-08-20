@@ -1,7 +1,7 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "role": "compactor",
-  "adapter": "compactor-executor-v1",
+  "adapter": "compactor-production-v2",
   "accumulo_version": "4.0.0-SNAPSHOT",
   "accumulo_revision": "1a716b2c1bb5762ead4b46d2bc4f53e13873b314",
   "summary": "compactor adapter proves deterministic publication and coordinator completion",
@@ -19,6 +19,27 @@
       "reference": "internal/compactexec/executor_test.go#TestCompletionAdapterUsesExistingAccumuloContract",
       "source_sha256": "e69bb2790af7396a37eee7e6da71d5e1ef9fc7d067e4e547ed693be2a601c790",
       "replay_command": ["go", "test", "./internal/compactexec", "-run", "^TestCompletionAdapterUsesExistingAccumuloContract$", "-count=1"]
+    },
+    {
+      "gate": "cancellation",
+      "kind": "go-test",
+      "reference": "internal/compactexec/executor_test.go#TestCancellationNeverPublishes",
+      "source_sha256": "e69bb2790af7396a37eee7e6da71d5e1ef9fc7d067e4e547ed693be2a601c790",
+      "replay_command": ["go", "test", "./internal/compactexec", "-run", "^TestCancellationNeverPublishes$", "-count=1"]
+    },
+    {
+      "gate": "restart-reconciliation",
+      "kind": "go-test",
+      "reference": "cmd/shoal-compactor/worker_test.go#TestWorkerRestartCompletesUnattemptedIntentOnce",
+      "source_sha256": "c9fbe54360d5774a2220ef8d1e67b3ed4b976ff23d36d884b9b081222f07a66f",
+      "replay_command": ["go", "test", "./cmd/shoal-compactor", "-run", "^TestWorkerRestartCompletesUnattemptedIntentOnce$", "-count=1"]
+    },
+    {
+      "gate": "fenced-input",
+      "kind": "go-test",
+      "reference": "internal/compactjob/compactjob_test.go#TestTranslateRefusesFencedInput",
+      "source_sha256": "aa9eb7bb8eafb0746744740ad57e1568c80efb2d578921646877649745fe8173",
+      "replay_command": ["go", "test", "./internal/compactjob", "-run", "^TestTranslateRefusesFencedInput$", "-count=1"]
     }
   ]
 }

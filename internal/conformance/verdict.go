@@ -34,7 +34,7 @@ import (
 )
 
 const (
-	SchemaVersion    = 2
+	SchemaVersion    = 3
 	AccumuloVersion  = "4.0.0-SNAPSHOT"
 	AccumuloRevision = "1a716b2c1bb5762ead4b46d2bc4f53e13873b314"
 )
@@ -109,29 +109,35 @@ type adapterSpec struct {
 
 var adapters = map[string]adapterSpec{
 	"client": {
-		Name:          "client-contract-v1",
-		RequiredGates: []string{"crud", "visibility", "range", "pinned-java-client-lifecycle"},
-		LiveGate:      "pinned-java-client-lifecycle",
+		Name:          "client-contract-v2",
+		RequiredGates: []string{"crud", "visibility", "range", "shoal-java-write-flush-scan"},
+		LiveGate:      "shoal-java-write-flush-scan",
 	},
 	"promotion": {
-		Name:          "promotion-equivalence-v1",
-		RequiredGates: []string{"before-after-equivalence", "live-destination-equivalence"},
+		Name:          "promotion-equivalence-v2",
+		RequiredGates: []string{"before-after-equivalence", "java-readability", "live-destination-equivalence"},
 		LiveGate:      "live-destination-equivalence",
 	},
 	"scanserver": {
-		Name:          "stateful-scan-continuation-v1",
-		RequiredGates: []string{"stateful-continuation", "live-scanserver-process"},
-		LiveGate:      "live-scanserver-process",
+		Name:          "stateful-scan-continuation-v2",
+		RequiredGates: []string{"stateful-continuation", "cancel-resume", "live-shoal-continuation"},
+		LiveGate:      "live-shoal-continuation",
 	},
 	"tserver": {
-		Name:          "tserver-lifecycle-v1",
-		RequiredGates: []string{"service-lock-lifecycle", "assignment-lifecycle", "live-tserver-process"},
-		LiveGate:      "live-tserver-process",
+		Name: "tserver-production-v2",
+		RequiredGates: []string{
+			"service-lock-lifecycle", "assignment-lifecycle", "ingest-minor-compaction",
+			"wal-recovery", "restart-fencing", "live-shoal-tserver",
+		},
+		LiveGate: "live-shoal-tserver",
 	},
 	"compactor": {
-		Name:          "compactor-executor-v1",
-		RequiredGates: []string{"publication", "completion", "live-compactor-process"},
-		LiveGate:      "live-compactor-process",
+		Name: "compactor-production-v2",
+		RequiredGates: []string{
+			"publication", "completion", "cancellation", "restart-reconciliation",
+			"fenced-input", "live-shoal-compactor",
+		},
+		LiveGate: "live-shoal-compactor",
 	},
 }
 
@@ -369,12 +375,7 @@ func missingGates(required []string, covered map[string]bool) []string {
 }
 
 func runLive(ctx context.Context, opts Options, spec adapterSpec, verdict *Verdict, gate *Gate) {
-	if gate.Role != "client" {
-		gate.State = Unsupported
-		gate.Summary = "adapter evidence passed; the live Accumulo harness has no Shoal process wiring for this role"
-		return
-	}
-	command := []string{"python", "test/accumulo/harness.py", "test"}
+	command := []string{"python", "test/accumulo/harness.py", "role", gate.Role}
 	harnessSHA, err := sourceSHA256(opts.Root, "test/accumulo/harness.py")
 	if err != nil {
 		gate.State = Fail
@@ -384,15 +385,22 @@ func runLive(ctx context.Context, opts Options, spec adapterSpec, verdict *Verdi
 	result := opts.Executor.Run(ctx, opts.Root, command)
 	switch result.ExitCode {
 	case 0:
+		marker := "SHOAL_EVIDENCE role=" + gate.Role + " status=pass"
+		if !strings.Contains(result.Output, marker) {
+			gate.State = Fail
+			gate.Summary = "live role harness exited zero without required evidence marker " + marker
+			verdict.Metadata.Environment.Docker = "available"
+			break
+		}
 		gate.MissingRequiredGates = slices.DeleteFunc(gate.MissingRequiredGates, func(name string) bool {
 			return name == spec.LiveGate
 		})
 		if len(gate.MissingRequiredGates) == 0 {
 			gate.State = Pass
-			gate.Summary = "adapter evidence and pinned Java client lifecycle passed"
+			gate.Summary = "adapter evidence and pinned Shoal live role gate passed"
 		} else {
 			gate.State = Unsupported
-			gate.Summary = "live client lifecycle passed; required adapter gates remain unwired"
+			gate.Summary = "live role gate passed; required adapter gates remain unwired"
 		}
 		verdict.Metadata.Environment.Docker = "available"
 	case 2:
@@ -401,13 +409,13 @@ func runLive(ctx context.Context, opts Options, spec adapterSpec, verdict *Verdi
 		verdict.Metadata.Environment.Docker = "unavailable"
 	default:
 		gate.State = Fail
-		gate.Summary = fmt.Sprintf("live Accumulo client harness failed (exit %d): %s", result.ExitCode, strings.TrimSpace(result.Output))
+		gate.Summary = fmt.Sprintf("live Accumulo Shoal role harness failed (exit %d): %s", result.ExitCode, strings.TrimSpace(result.Output))
 		verdict.Metadata.Environment.Docker = "available"
 	}
 	gate.Evidence = append(gate.Evidence, Evidence{
 		Gate:          spec.LiveGate,
 		Kind:          "live-command",
-		Reference:     "test/accumulo/harness.py#full_run",
+		Reference:     "test/accumulo/harness.py#role_run",
 		SourceSHA256:  harnessSHA,
 		ReplayCommand: command,
 	})

@@ -42,6 +42,54 @@ class HarnessTest(unittest.TestCase):
             harness.client_command("smoke")[-6:],
         )
 
+    def test_role_commands_are_explicit_and_noninteractive(self):
+        self.assertEqual(
+            [
+                harness.sys.executable,
+                "test/accumulo/harness.py",
+                "role",
+                "tserver",
+            ],
+            harness.role_command("tserver"),
+        )
+        self.assertEqual(
+            harness.compose_command(
+                "--profile",
+                "shoal",
+                "up",
+                "--detach",
+                "--build",
+                "shoal-tserver",
+                "shoal-compactor",
+            ),
+            harness.compose_services("shoal-tserver", "shoal-compactor"),
+        )
+
+    def test_static_configuration_wires_production_role_scenarios(self):
+        compose = harness.COMPOSE_FILE.read_text(encoding="utf-8")
+        java = (harness.HARNESS / "smoke" / "AccumuloSmoke.java").read_text(
+            encoding="utf-8"
+        )
+        for required in (
+            "shoal-tserver:",
+            "shoal-compactor:",
+            "-enable-ingest",
+            "-storage hdfs",
+            "-group",
+            "shoal_default",
+            "-cancel-interval",
+        ):
+            self.assertIn(required, compose)
+        for required in (
+            "shoal-ready",
+            "recovery-prepare",
+            "recovery-verify",
+            "setBatchSize(1)",
+            "cancelCompaction",
+            "promotion-equivalent=true",
+        ):
+            self.assertIn(required, java)
+
     @mock.patch.object(harness, "down")
     @mock.patch.object(harness, "wait_ready", side_effect=RuntimeError("not ready"))
     @mock.patch.object(harness, "run")
