@@ -46,6 +46,16 @@ func TestPlan_TablePrefixRange(t *testing.T) {
 	}
 }
 
+func TestPlan_PreservesExplainRequest(t *testing.T) {
+	p := planFor(t, "EXPLAIN FORMAT JSON SELECT id FROM events WHERE id >= 'a'", PlanOptions{})
+	if !p.Explain || p.ExplainFormat != ExplainJSON {
+		t.Fatalf("explain=%v format=%q", p.Explain, p.ExplainFormat)
+	}
+	if p.Shape != ShapeScan || string(p.Range.Start.Row) != "evt:a" {
+		t.Fatalf("shape=%v range=%+v", p.Shape, p.Range)
+	}
+}
+
 func TestPlan_IdEquality(t *testing.T) {
 	p := planFor(t, "SELECT id FROM events WHERE id = 'abc'", PlanOptions{})
 	if string(p.Range.Start.Row) != "evt:abc" {

@@ -14,6 +14,7 @@
 //
 // Supported read dialect:
 //
+//	EXPLAIN [FORMAT <TEXT|JSON>]
 //	SELECT <*|cols|count(*)|expand(col,'edge')>
 //	FROM   <table> [AS OF <ts>]
 //	[WHERE <col op literal | MATCH(col,'terms')> [AND ...]]
@@ -64,6 +65,7 @@ var keywords = map[string]bool{
 	"ORDER": true, "BY": true, "GROUP": true, "LIMIT": true,
 	"AS": true, "OF": true, "MATCH": true, "LIKE": true,
 	"COUNT": true, "EXPAND": true,
+	"EXPLAIN": true, "FORMAT": true, "TEXT": true, "JSON": true,
 }
 
 type lexer struct {

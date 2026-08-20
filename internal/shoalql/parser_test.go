@@ -2,6 +2,28 @@ package shoalql
 
 import "testing"
 
+func TestParse_ExplainFormats(t *testing.T) {
+	for _, tc := range []struct {
+		sql    string
+		format ExplainFormat
+	}{
+		{"EXPLAIN SELECT id FROM events", ExplainText},
+		{"explain format text select id from events", ExplainText},
+		{"EXPLAIN FORMAT JSON SELECT id FROM events", ExplainJSON},
+	} {
+		st, err := Parse(tc.sql)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", tc.sql, err)
+		}
+		if !st.Explain || st.ExplainFormat != tc.format {
+			t.Errorf("Parse(%q): explain=%v format=%q", tc.sql, st.Explain, st.ExplainFormat)
+		}
+	}
+	if _, err := Parse("EXPLAIN FORMAT YAML SELECT id FROM events"); err == nil {
+		t.Fatal("expected unsupported EXPLAIN format error")
+	}
+}
+
 func TestParse_SelectStarBasic(t *testing.T) {
 	st, err := Parse("SELECT * FROM events")
 	if err != nil {
