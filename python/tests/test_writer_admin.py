@@ -17,7 +17,6 @@ from sharkbite import (
     SystemPermissions,
     TablePermissions,
 )
-from sharkbite.errors import ClientException
 from sharkbite._native import Bytes, NamespaceView, PropertyView, TableView
 from sharkbite.errors import AlreadyExistsError, ClientException, NotFoundError
 
