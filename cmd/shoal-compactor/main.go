@@ -93,12 +93,12 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
 	"net"
-	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -117,12 +117,14 @@ import (
 	"github.com/phrocker/shoal/internal/managerclient"
 	"github.com/phrocker/shoal/internal/namespaces"
 	"github.com/phrocker/shoal/internal/protocol"
+	"github.com/phrocker/shoal/internal/roleops"
 	"github.com/phrocker/shoal/internal/storage/hdfs"
 	"github.com/phrocker/shoal/internal/tablenames"
 	"github.com/phrocker/shoal/internal/thrift/gen/client"
 	"github.com/phrocker/shoal/internal/thrift/gen/compactioncoordinator"
 	"github.com/phrocker/shoal/internal/thrift/gen/security"
 	"github.com/phrocker/shoal/internal/thrift/gen/tabletserver"
+	"github.com/phrocker/shoal/internal/tlsserver"
 	"github.com/phrocker/shoal/internal/transportpool"
 	"github.com/phrocker/shoal/internal/zk"
 )
@@ -164,6 +166,10 @@ func main() {
 	reconcileGrace := flag.Duration("completion-reconcile-grace", 2*time.Minute, "minimum age before an ambiguous completion absent from both coordinator maps may be cleaned up")
 	metricsAddress := flag.String("metrics-address", "", "HTTP health/readiness/metrics listener; empty disables")
 	logLevel := flag.String("log-level", "info", "slog level: debug, info, warn, error")
+	shutdownTimeout := flag.Duration("shutdown-timeout", 30*time.Second, "bounded listener shutdown budget after job cancellation and hand-back")
+	tlsCert := flag.String("tls-cert", "", "server TLS certificate for CompactorService and operations")
+	tlsKey := flag.String("tls-key", "", "server TLS private key")
+	tlsClientCA := flag.String("tls-client-ca", "", "client CA enabling mutual TLS")
 	flag.Parse()
 
 	if *showVersion {
@@ -184,6 +190,15 @@ func main() {
 	if *password == "" {
 		*password = os.Getenv("SHOAL_PASSWORD")
 	}
+	if *tlsCert == "" {
+		*tlsCert = os.Getenv("SHOAL_TLS_CERT")
+	}
+	if *tlsKey == "" {
+		*tlsKey = os.Getenv("SHOAL_TLS_KEY")
+	}
+	if *tlsClientCA == "" {
+		*tlsClientCA = os.Getenv("SHOAL_TLS_CLIENT_CA")
+	}
 	if *password == "" {
 		die("shoal-compactor: password required (-password or SHOAL_PASSWORD env)")
 	}
@@ -198,6 +213,22 @@ func main() {
 	}
 	if *reconcileGrace <= 0 {
 		die("shoal-compactor: -completion-reconcile-grace must be positive")
+	}
+	if *shutdownTimeout <= 0 {
+		die("shoal-compactor: -shutdown-timeout must be positive")
+	}
+	var (
+		tlsConfig *tls.Config
+		err       error
+	)
+	if *tlsCert != "" || *tlsKey != "" || *tlsClientCA != "" {
+		if *tlsCert == "" || *tlsKey == "" {
+			die("shoal-compactor: -tls-cert and -tls-key must be set together")
+		}
+		tlsConfig, err = tlsserver.Build(*tlsCert, *tlsKey, *tlsClientCA)
+		if err != nil {
+			die("shoal-compactor: TLS configuration: %v", err)
+		}
 	}
 
 	coordinatorSource := *coordinatorAddr
@@ -249,6 +280,12 @@ func main() {
 		MaxOutputBytes:     *maxOutputBytes,
 	}
 	metrics := &workerMetrics{}
+	metrics.storageReady.Store(true)
+	metrics.accepting.Store(true)
+	if err := os.MkdirAll(filepath.Dir(*stateFile), 0o700); err != nil {
+		die("shoal-compactor: completion journal directory: %v", err)
+	}
+	metrics.journalReady.Store(true)
 	role := &compactorRole{}
 	jobWorker := &worker{
 		logger:         logger,
@@ -290,7 +327,12 @@ func main() {
 		thrift.NewTBufferedTransportFactory(8192),
 		&thrift.TConfiguration{},
 	)
-	serverSocket, err := thrift.NewTServerSocket(*listenAddr)
+	var serverSocket thrift.TServerTransport
+	if tlsConfig != nil {
+		serverSocket, err = thrift.NewTSSLServerSocket(*listenAddr, tlsConfig.Clone())
+	} else {
+		serverSocket, err = thrift.NewTServerSocket(*listenAddr)
+	}
 	if err != nil {
 		die("shoal-compactor: CompactorService socket %s: %v", *listenAddr, err)
 	}
@@ -300,27 +342,28 @@ func main() {
 		transportFactory,
 		protocol.NewServerFactory(loc.InstanceID(), *accVersion),
 	)
+	roleDone := make(chan error, 1)
 	go func() {
-		if err := roleServer.Serve(); err != nil && !errors.Is(err, net.ErrClosed) {
+		err := roleServer.Serve()
+		roleDone <- err
+		if err != nil && !errors.Is(err, net.ErrClosed) {
 			logger.Error("CompactorService failed", slog.String("err", err.Error()))
 			cancel()
 		}
 	}()
-	defer roleServer.Stop()
+	metrics.roleServiceReady.Store(true)
 
+	var operations *roleops.Server
 	if *metricsAddress != "" {
-		server := &http.Server{Addr: *metricsAddress, Handler: workerOperationsHandler(metrics), ReadHeaderTimeout: 5 * time.Second}
+		operations, err = roleops.Start(*metricsAddress, workerOperationsHandler(metrics), tlsConfig)
+		if err != nil {
+			die("shoal-compactor: operations listener: %v", err)
+		}
 		go func() {
-			if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			if err := <-operations.Done(); err != nil {
 				logger.Error("metrics server failed", slog.String("err", err.Error()))
 				cancel()
 			}
-		}()
-		defer func() {
-			metrics.ready.Store(false)
-			shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer shutdownCancel()
-			_ = server.Shutdown(shutdownCtx)
 		}()
 	}
 
@@ -329,6 +372,7 @@ func main() {
 	go func() {
 		sig := <-stopCh
 		logger.Info("shutdown signal", slog.String("sig", sig.String()))
+		metrics.accepting.Store(false)
 		cancel()
 	}()
 
@@ -372,6 +416,22 @@ func main() {
 		},
 	})
 
+	metrics.accepting.Store(false)
+	metrics.ready.Store(false)
+	metrics.roleServiceReady.Store(false)
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), *shutdownTimeout)
+	defer shutdownCancel()
+	_ = roleServer.Stop()
+	select {
+	case <-roleDone:
+	case <-shutdownCtx.Done():
+		logger.Warn("CompactorService shutdown deadline exceeded")
+	}
+	if operations != nil {
+		if err := operations.Shutdown(shutdownCtx); err != nil {
+			logger.Warn("operations shutdown", slog.String("err", err.Error()))
+		}
+	}
 	logger.Info("shoal-compactor exit clean")
 }
 

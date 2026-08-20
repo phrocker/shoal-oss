@@ -18,6 +18,7 @@ import (
 	"github.com/phrocker/shoal/internal/compactexec"
 	"github.com/phrocker/shoal/internal/compactjob"
 	"github.com/phrocker/shoal/internal/managerclient"
+	"github.com/phrocker/shoal/internal/roleops"
 	"github.com/phrocker/shoal/internal/storage/hdfs"
 	"github.com/phrocker/shoal/internal/tablenames"
 	"github.com/phrocker/shoal/internal/thrift/gen/client"
@@ -253,7 +254,7 @@ func (w *worker) process(
 		}
 	}
 
-	reporter := coordinatorReporter{svc: svc, creds: w.creds, ecid: plan.ECID}
+	reporter := coordinatorReporter{svc: svc, creds: w.creds, ecid: plan.ECID, metrics: w.metrics}
 	exec, err := w.newExecutor(reporter)
 	if err != nil {
 		return jobOutcome{class: compactjob.ClassExecutionFailed}
@@ -265,7 +266,9 @@ func (w *worker) process(
 	} else {
 		close(monitorDone)
 	}
+	w.metrics.activeJobs.Add(1)
 	result, err := exec.Execute(jobCtx, plan)
+	w.metrics.activeJobs.Add(-1)
 	stopMonitor()
 	<-monitorDone
 	if err != nil {
@@ -322,6 +325,7 @@ func (w *worker) process(
 	}
 
 	w.metrics.completionAmbiguous.Add(1)
+	w.metrics.retries.Add(1)
 	w.logger.Warn("compactionCompleted outcome is ambiguous; retaining output and reconciling",
 		slog.String("ecid", plan.ECID), slog.String("err", err.Error()))
 	resolved, pending, reconcileErr := w.reconcile(ctx, svc, exec, record)
@@ -460,12 +464,18 @@ func refusalClass(err error, fallback string) string {
 }
 
 type coordinatorReporter struct {
-	svc   compactioncoordinator.CompactionCoordinatorService
-	creds *security.TCredentials
-	ecid  string
+	svc     compactioncoordinator.CompactionCoordinatorService
+	creds   *security.TCredentials
+	ecid    string
+	metrics *workerMetrics
 }
 
 func (r coordinatorReporter) Report(ctx context.Context, p compactexec.Progress) error {
+	if r.metrics != nil {
+		r.metrics.progressReports.Add(1)
+		r.metrics.entriesRead.Store(uint64(max(p.EntriesRead, 0)))
+		r.metrics.entriesWritten.Store(uint64(max(p.EntriesWritten, 0)))
+	}
 	state := compactioncoordinator.TCompactionState_IN_PROGRESS
 	if p.Phase == compactexec.PhaseRecovering || p.Phase == compactexec.PhaseReading {
 		state = compactioncoordinator.TCompactionState_STARTED
@@ -567,11 +577,20 @@ func stableVersionedTableProperties(
 
 type workerMetrics struct {
 	ready               atomic.Bool
+	accepting           atomic.Bool
+	storageReady        atomic.Bool
+	roleServiceReady    atomic.Bool
+	journalReady        atomic.Bool
+	activeJobs          atomic.Int64
 	executed            atomic.Uint64
 	completed           atomic.Uint64
 	failed              atomic.Uint64
 	cancelled           atomic.Uint64
 	completionAmbiguous atomic.Uint64
+	progressReports     atomic.Uint64
+	entriesRead         atomic.Uint64
+	entriesWritten      atomic.Uint64
+	retries             atomic.Uint64
 }
 
 func hdfsPlanValidator(configuredAddress string) func(*compactjob.Plan) error {
@@ -605,28 +624,39 @@ func hdfsPlanValidator(configuredAddress string) func(*compactjob.Plan) error {
 }
 
 func workerOperationsHandler(metrics *workerMetrics) http.Handler {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("ok\n"))
-	})
-	mux.HandleFunc("/readyz", func(w http.ResponseWriter, _ *http.Request) {
-		if !metrics.ready.Load() {
-			http.Error(w, "not ready", http.StatusServiceUnavailable)
-			return
-		}
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("ready\n"))
-	})
-	mux.HandleFunc("/metrics", func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = fmt.Fprintf(w,
-			"# TYPE shoal_compactor_jobs_executed_total counter\nshoal_compactor_jobs_executed_total %d\n"+
+	dependencies := roleops.NewDependencies(
+		"coordinator_session", "storage", "completion_journal", "role_service", "job_admission",
+	)
+	dependencies.SetStarted(true)
+	handler := roleops.Handler(dependencies, func(b *strings.Builder) {
+		_, _ = fmt.Fprintf(b,
+			"# TYPE shoal_compactor_jobs_active gauge\nshoal_compactor_jobs_active %d\n"+
+				"# TYPE shoal_compactor_jobs_executed_total counter\nshoal_compactor_jobs_executed_total %d\n"+
 				"# TYPE shoal_compactor_jobs_completed_total counter\nshoal_compactor_jobs_completed_total %d\n"+
 				"# TYPE shoal_compactor_jobs_failed_total counter\nshoal_compactor_jobs_failed_total %d\n"+
 				"# TYPE shoal_compactor_jobs_cancelled_total counter\nshoal_compactor_jobs_cancelled_total %d\n"+
-				"# TYPE shoal_compactor_completion_ambiguous_total counter\nshoal_compactor_completion_ambiguous_total %d\n",
-			metrics.executed.Load(), metrics.completed.Load(), metrics.failed.Load(),
-			metrics.cancelled.Load(), metrics.completionAmbiguous.Load())
+				"# TYPE shoal_compactor_completion_ambiguous_total counter\nshoal_compactor_completion_ambiguous_total %d\n"+
+				"# TYPE shoal_compactor_progress_reports_total counter\nshoal_compactor_progress_reports_total %d\n"+
+				"# TYPE shoal_compactor_entries_read gauge\nshoal_compactor_entries_read %d\n"+
+				"# TYPE shoal_compactor_entries_written gauge\nshoal_compactor_entries_written %d\n"+
+				"# TYPE shoal_compactor_retries_total counter\nshoal_compactor_retries_total %d\n",
+			metrics.activeJobs.Load(), metrics.executed.Load(), metrics.completed.Load(), metrics.failed.Load(),
+			metrics.cancelled.Load(), metrics.completionAmbiguous.Load(), metrics.progressReports.Load(),
+			metrics.entriesRead.Load(), metrics.entriesWritten.Load(), metrics.retries.Load())
 	})
-	return mux
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		dependencies.Set("coordinator_session", metrics.ready.Load(), stateDetail(metrics.ready.Load(), "connected", "unavailable"))
+		dependencies.Set("storage", metrics.storageReady.Load(), stateDetail(metrics.storageReady.Load(), "validated", "unavailable"))
+		dependencies.Set("completion_journal", metrics.journalReady.Load(), stateDetail(metrics.journalReady.Load(), "writable", "unavailable"))
+		dependencies.Set("role_service", metrics.roleServiceReady.Load(), stateDetail(metrics.roleServiceReady.Load(), "serving", "unavailable"))
+		dependencies.Set("job_admission", metrics.accepting.Load(), stateDetail(metrics.accepting.Load(), "accepting", "draining"))
+		handler.ServeHTTP(w, r)
+	})
+}
+
+func stateDetail(ready bool, yes, no string) string {
+	if ready {
+		return yes
+	}
+	return no
 }

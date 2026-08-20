@@ -1,6 +1,6 @@
 # Shoal platform deployment
 
-This directory contains platform artifacts for running Shoal as three Kubernetes roles:
+This directory contains platform artifacts for running Shoal as four Kubernetes roles:
 
 - **Write tier**: one `shoal-embed` StatefulSet per shard. Each pod has stable identity and a persistent local data directory for WAL/tablet state. The deployment manifests explicitly opt into the HTTP observability listener with `shoal-embed serve --data <dir> --address 0.0.0.0:<port> --metrics-address 0.0.0.0:<port> --quiesce-delay 10s`.
 - **Read fleet**: stateless `shoal` pods behind a Service. They serve the Accumulo-compatible Thrift scan surface and open immutable RFiles through the configured storage backend.
@@ -12,6 +12,9 @@ This directory contains platform artifacts for running Shoal as three Kubernetes
   Each ordinal has a persistent `/var/lib/shoal`
   volume for referenced WALs and minc checkpoints; an assignment that cannot
   access a referenced WAL fails closed rather than publishing incomplete data.
+- **Accumulo compactor**: `shoal-compactor` StatefulSet members discover the
+  coordinator through manager ServiceLock data, execute external compactions,
+  persist ambiguous completion state on PVCs, and reconcile it after restart.
 
 For local development these collapse into a single `shoal-embed` process. The intended platform shape is: writes land in a shard-local `shoal-embed`, flush/compaction emits RFiles to a shared object-store prefix, and read-fleet pods open those same RFiles for hedged scans.
 
@@ -53,6 +56,7 @@ kubectl apply -f deploy/k8s/secret.yaml
 kubectl apply -f deploy/k8s/write-tier.yaml
 kubectl apply -f deploy/k8s/read-fleet.yaml
 kubectl apply -f deploy/k8s/tserver.yaml
+kubectl apply -f deploy/k8s/compactor.yaml
 ```
 
 The Secret is a template only. Replace `key.json` with a real GCS service-account key if not using Workload Identity / node Application Default Credentials, and replace `accumulo-password` with the metadata-walk password used by `cmd/shoal`.
@@ -80,8 +84,12 @@ Confirmed from source:
 - `cmd/shoal-tserver/main.go`: requires `-advertise`, an authenticated
   ZooKeeper instance secret, metadata/configuration credentials, and the
   manager system token. `/readyz` becomes healthy only while a ServiceLock is
-  held and scan admission is open; `/metrics` exports `shoal_tserver_*`
-  lifecycle/fencing counters.
+  held, manager authority is current, scan admission is open, and every
+  advertised write authority is initialized; `/metrics` exports tablet,
+  ingest, WAL, minc, fencing, and backpressure counters.
+- `cmd/shoal-compactor/main.go`: discovers the coordinator, persists completion
+  reconciliation, exposes semantic dependency readiness and job/progress/retry
+  metrics, and bounds shutdown with `-shutdown-timeout`.
 - `internal/storage/gcs/gcs.go`: the GCS backend uses Application Default Credentials and accepts paths like `gs://bucket/object` or `bucket/object`.
 
 The manifests pass only supported process flags to the containers. `GOOGLE_APPLICATION_CREDENTIALS` is set for the GCS client when a key Secret is mounted.
@@ -164,6 +172,13 @@ are used for server-only TLS; mutual TLS falls back to TCP probes because
 kubelet cannot present a client certificate. The plain manifest keeps TLS
 flags commented out so plaintext remains the default until an operator mounts
 the corresponding Secret.
+
+The tserver and compactor use that same `internal/tlsserver` policy for both
+their Thrift and operations listeners. Their Helm sections are `tserver.tls`
+and `compactor.tls`; mTLS automatically changes kubelet probes to TCP because
+kubelet cannot supply a client certificate. Operational upgrade and rollback
+steps are documented in
+[`docs/write-tier-operations.md`](../docs/write-tier-operations.md).
 
 ## Rolling upgrades, rollback, and voluntary disruption
 

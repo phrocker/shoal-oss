@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -87,7 +88,42 @@ type Config struct {
 	NewOperationID func() string
 }
 
-type Factory struct{ cfg Config }
+type Metrics struct {
+	HostedTablets int64
+	WALCommits    uint64
+	WALFailures   uint64
+	WALRecoveries uint64
+	MincStarted   uint64
+	MincCompleted uint64
+	MincFailures  uint64
+	MincResumed   uint64
+}
+
+type factoryMetrics struct {
+	hostedTablets atomic.Int64
+	walCommits    atomic.Uint64
+	walFailures   atomic.Uint64
+	walRecoveries atomic.Uint64
+	mincStarted   atomic.Uint64
+	mincCompleted atomic.Uint64
+	mincFailures  atomic.Uint64
+	mincResumed   atomic.Uint64
+}
+
+type Factory struct {
+	cfg     Config
+	metrics factoryMetrics
+}
+
+func (f *Factory) Metrics() Metrics {
+	return Metrics{
+		HostedTablets: f.metrics.hostedTablets.Load(),
+		WALCommits:    f.metrics.walCommits.Load(), WALFailures: f.metrics.walFailures.Load(),
+		WALRecoveries: f.metrics.walRecoveries.Load(), MincStarted: f.metrics.mincStarted.Load(),
+		MincCompleted: f.metrics.mincCompleted.Load(), MincFailures: f.metrics.mincFailures.Load(),
+		MincResumed: f.metrics.mincResumed.Load(),
+	}
+}
 
 func NewFactory(cfg Config) (*Factory, error) {
 	if cfg.Host == nil || cfg.ServerAddress == "" || cfg.WALRoot == "" ||
@@ -164,6 +200,7 @@ func (f *Factory) Open(
 		applied:   make(map[string]struct{}), assigned: make(map[string][]ingestrouter.Mutation),
 		timeType: timeType, tabletTime: tabletTime, nextTimestamp: nextTimestamp,
 		timestampExhausted: exhausted, newOperationID: f.cfg.NewOperationID,
+		metrics: &f.metrics,
 	}
 	wal, report, err := walauthority.Open(ctx, walauthority.Config{
 		Root: f.cfg.WALRoot, ServerAddress: f.cfg.ServerAddress,
@@ -175,6 +212,9 @@ func (f *Factory) Open(
 	}
 	tablet.wal = wal
 	tablet.recovery = report
+	if report.Applied > 0 {
+		f.metrics.walRecoveries.Add(1)
+	}
 	stateStore := &mincauthority.FileStateStore{Dir: filepath.Join(f.cfg.StateRoot, extentDigest(extent))}
 	coordinator, err := mincauthority.New(mincauthority.Config{
 		Root: f.cfg.MincRoot, Extent: extent, Fence: fence,
@@ -193,6 +233,7 @@ func (f *Factory) Open(
 		return nil, err
 	}
 	for _, state := range pending {
+		f.metrics.mincResumed.Add(1)
 		tablet.resume = append(tablet.resume, state.OperationID)
 		tablet.snapshots[state.OperationID] = mincauthority.Snapshot{
 			ID: state.SnapshotID, Extent: extent, Fence: fence,
@@ -221,6 +262,7 @@ func (f *Factory) Open(
 		}
 	}
 	opened = true
+	f.metrics.hostedTablets.Add(1)
 	return tablet, nil
 }
 
@@ -254,6 +296,7 @@ type Tablet struct {
 	wal      *walauthority.Tablet
 	minc     *mincauthority.Coordinator
 	recovery walauthority.RecoveryReport
+	metrics  *factoryMetrics
 
 	active             []mincauthority.Cell
 	activeSize         int
@@ -297,8 +340,10 @@ func (t *Tablet) Commit(ctx context.Context, request ingestrouter.CommitRequest)
 	}
 	request.Mutations = assigned
 	if err := t.wal.Commit(ctx, request); err != nil {
+		t.metrics.walFailures.Add(1)
 		return routeError(err)
 	}
+	t.metrics.walCommits.Add(1)
 	t.mu.Lock()
 	flush := !t.closed && len(t.active) >= t.flushCells
 	t.mu.Unlock()
@@ -478,8 +523,10 @@ func (t *Tablet) flush(ctx context.Context) error {
 		t.pendingFlush = operationID
 	}
 	t.mu.Unlock()
+	t.metrics.mincStarted.Add(1)
 	file, err := t.minc.Run(ctx, operationID)
 	if err == nil {
+		t.metrics.mincCompleted.Add(1)
 		t.mu.Lock()
 		if t.pendingFlush == operationID {
 			t.pendingFlush = ""
@@ -495,6 +542,8 @@ func (t *Tablet) flush(ctx context.Context) error {
 			t.files = append(t.files, file)
 		}
 		t.mu.Unlock()
+	} else {
+		t.metrics.mincFailures.Add(1)
 	}
 	return err
 }
@@ -527,6 +576,7 @@ func (t *Tablet) Close(ctx context.Context) error {
 	t.mu.Lock()
 	t.closed = true
 	t.mu.Unlock()
+	t.metrics.hostedTablets.Add(-1)
 	return nil
 }
 

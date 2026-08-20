@@ -67,6 +67,7 @@ V1 + IVF-PQ iterator port shipped. Embedded standalone engine shipped.
 | VisibilityFilter pushdown | shipped — alloc-free warm cache |
 | Accumulo 4 iterator capability admission | shipped — versioned, fail-closed scan/minc/majc registry and [machine-readable inventory](docs/iterator-capability-registry.md) |
 | Accumulo tablet-server lifecycle + ServiceLock | write path code-complete; `shoal-tserver -enable-ingest` advertises `TABLET_INGEST` only after ServiceLock, conditional metadata CAS, WAL, loader, memtable, and minc authorities initialize; release enablement remains gated by live evidence in #74 ([lifecycle](docs/tserver-hosting-lifecycle.md) · [ingest](docs/tablet-ingest-service.md)) |
+| Write-role production operations | semantic readiness/startup, TLS/mTLS, metrics/alerts, bounded drain, PVC-backed restart reconciliation, Kubernetes/Helm rollout and PDB policy shipped for tserver and compactor ([runbook](docs/write-tier-operations.md)); live rollout evidence remains #74 |
 | Hosted-tablet metadata/config/file/WAL loader | shipped — generation-fenced, retryable, deterministic specification builder (`internal/tabletloader`) |
 | File / locator / block caches | shipped |
 | Startup pre-warm (`-prewarm-tables=auto`) | shipped — distributed-serving mode |

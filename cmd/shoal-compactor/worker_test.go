@@ -333,6 +333,10 @@ func TestWorkerReadinessAndMetrics(t *testing.T) {
 		t.Fatalf("not-ready status = %d", resp.Code)
 	}
 	metrics.ready.Store(true)
+	metrics.accepting.Store(true)
+	metrics.storageReady.Store(true)
+	metrics.roleServiceReady.Store(true)
+	metrics.journalReady.Store(true)
 	metrics.completed.Add(2)
 	resp = httptest.NewRecorder()
 	handler.ServeHTTP(resp, req)

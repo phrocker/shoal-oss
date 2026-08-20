@@ -100,3 +100,34 @@ readFleet:
     # anti-affinity in read-deployment.yaml): allow one voluntary
     # disruption at a time.
     maxUnavailable: 1
+
+tserver:
+  enabled: false
+  replicas: 2
+  thriftPort: 9997
+  metricsPort: 9998
+  group: default
+  drainTimeout: 30s
+  terminationGracePeriodSeconds: 45
+  walStorageSize: 20Gi
+  enableIngest: true
+  # Pre-existing Secret containing accumulo-password,
+  # accumulo-instance-secret, and accumulo-system-token-base64.
+  credentialsSecretName: shoal-accumulo-write-credentials
+  updateStrategy: {partition: 0}
+  podDisruptionBudget: {enabled: true, maxUnavailable: 1}
+  tls: {enabled: false, secretName: "", requireClientCert: false}
+
+compactor:
+  enabled: false
+  replicas: 2
+  thriftPort: 9810
+  metricsPort: 9811
+  group: shoal_default
+  hdfsNamenode: ""
+  stateStorageSize: 5Gi
+  shutdownTimeout: 30s
+  terminationGracePeriodSeconds: 55
+  updateStrategy: {partition: 0}
+  podDisruptionBudget: {enabled: true, maxUnavailable: 1}
+  tls: {enabled: false, secretName: "", requireClientCert: false}

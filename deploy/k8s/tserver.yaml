@@ -22,6 +22,9 @@ spec:
   serviceName: shoal-tserver
   replicas: 2
   podManagementPolicy: Parallel
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate: {partition: 0}
   selector:
     matchLabels:
       app.kubernetes.io/name: shoal
@@ -54,6 +57,9 @@ spec:
             - -wal-root=/var/lib/shoal/wal
             - -state-root=/var/lib/shoal/minc-state
             - -drain-timeout=30s
+            - -enable-ingest
+            # Mount the shared TLS Secret and add -tls-cert/-tls-key and
+            # optionally -tls-client-ca to secure both listeners.
           envFrom:
             - configMapRef: {name: shoal-platform-config}
           env:
@@ -75,6 +81,10 @@ spec:
           readinessProbe:
             httpGet: {path: /readyz, port: metrics}
             periodSeconds: 3
+          startupProbe:
+            httpGet: {path: /startupz, port: metrics}
+            periodSeconds: 2
+            failureThreshold: 30
           livenessProbe:
             httpGet: {path: /healthz, port: metrics}
             initialDelaySeconds: 5
