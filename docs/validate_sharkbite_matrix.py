@@ -17,7 +17,7 @@ import unicodedata
 
 
 DOC_PATH = Path(__file__).with_name("sharkbite-compatibility.md")
-EXPECTED_REVISION = 45
+EXPECTED_REVISION = 46
 CLUSTER_STATUS_APPROVAL_REVISION = 40
 # Update this manifest only when the independently audited inventory itself
 # changes; review every added/removed or reclassified ID in code review.
@@ -200,17 +200,18 @@ EXPECTED_METADATA_FIELDS = {
     ),
     "Sharkbite release line": "`sharkbite` 1.2.0.3 on PyPI (`setup.py:34-35`)",
     "Shoal reference": (
-        "`phrocker/shoal-oss` revision 45 starts from main merge "
-        "`20045204685253bddd3175e04e4d4e89a1fe9763` "
-        "(\"Merge pull request #182 from phrocker/phrocker/issue-59-python-release\") "
-        "plus the final parity changes introduced in this revision"
+        "`phrocker/shoal-oss` revision 46 starts from main merge "
+        "`ec74ca85f516a34629faab329d81db67fd9ae158` "
+        "(\"Merge pull request #184 from phrocker/phrocker/issue-59-final-parity\") "
+        "plus the cross-platform artifact evidence introduced in this revision"
     ),
     "Shoal C ABI version": "`SHOAL_ABI_VERSION 1u` (`capi/include/shoal_types.h`)",
 }
 
 EXPECTED_DOCUMENT_STATUS_SNIPPETS = (
     "Normative gate. Binding on all Sharkbite-compatibility work.",
-    f"Revision {EXPECTED_REVISION} — completes the practical final client-parity slice",
+    f"Revision {EXPECTED_REVISION} — adds deterministic cross-platform artifact evidence",
+    "Revision 45 — completes the practical final client-parity slice",
     "Revision 44 — publishes the public HDFS client/stream contract",
     "Revision 42 — completes the 36-row owned mutable key ABI tranche",
     "Revision 41 — records the public column and entry value APIs",

@@ -17,6 +17,22 @@ go build -buildmode=c-shared -o bin\capi\shoal.dll .\cmd\shoal-capi
 Use the checked-in `capi/include/shoal.h`, not the implementation header that
 Go emits next to a `c-shared` library.
 
+For deterministic host and cross-platform artifact evidence, run:
+
+```text
+python scripts/cross_platform_artifacts.py
+```
+
+On a supported native host this builds both `c-shared` and `c-archive`
+artifacts, compiles/links/runs the public C11 and C++11 clients, executes the
+dynamic ABI query, and checks every declared `shoal_*` export in the native
+object format. Cross-built non-CGO commands and unbundled wheel previews are
+recorded separately and never counted as C ABI runtime evidence.
+
+Windows consumers linking the `c-archive` artifact must define
+`SHOAL_STATIC` before including `shoal.h`; shared-library consumers leave it
+unset and receive the normal `__declspec(dllimport)` declarations.
+
 ## ABI version and capability discovery
 
 Shoal separates **ABI compatibility** from **feature availability**:

@@ -21,8 +21,8 @@ uncovered rows in `sharkbite-compatibility.md` compatible.
 | --- | --- | --- |
 | Linux x86-64, glibc 2.28+ | First supported wheel target | Build as `manylinux_2_28_x86_64` in a glibc 2.28-or-older manylinux environment and require `auditwheel show` to pass. |
 | Linux aarch64, glibc 2.28+ | Build-capable, not yet release-validated | The scripts emit and verify `manylinux_2_28_aarch64`; publication waits for native aarch64 CI evidence. |
-| macOS x86-64/arm64 | Build-capable, host verification pending | The scripts select native tags and `libshoal.dylib`; publication requires linked C/C++ execution and clean installs on each published architecture. |
-| Windows amd64 | Host-verified artifact path | The C/C++ ABI tests, wheel/source-only sdist build, clean no-index installs, and reproducibility checks pass on Windows. |
+| macOS x86-64/arm64 | Go cross-build and unbundled package preview verified; native runtime unsupported | `scripts/cross_platform_artifacts.py` cross-builds the non-CGO Shoal command and reproducibly builds each platform-tagged preview. Preview wheels intentionally contain no `.dylib`, install into a target-platform layout, and prove imports plus the expected native-library discovery error. Publication still requires a native `c-shared` build, linked C/C++ execution, and clean native installs on each architecture. |
+| Windows amd64 | Host-verified shared/static and Python artifact path | The deterministic evidence script builds shared and static C ABI artifacts, links and executes C11/C++11 lifecycle clients, verifies all 318 `shoal_*` exports plus ABI 1.17.0/capability discovery, and repeats clean wheel/sdist builds to prove identical hashes. |
 
 The source distribution is platform-neutral Python source and intentionally
 contains no native binary. A platform wheel contains exactly one native Shoal
@@ -87,3 +87,23 @@ library, check ABI/capabilities, and execute a native mutation smoke test.
 The build and verification scripts are host-portable. Cross-compilation is not
 accepted as runtime evidence; macOS remains explicitly unverified until those
 same commands run on a macOS host.
+
+## Cross-platform evidence
+
+Run the complete local evidence pass with:
+
+```text
+python scripts/cross_platform_artifacts.py
+```
+
+On Windows, `scripts\cross-platform-artifacts.ps1` is an equivalent wrapper.
+The generated `build/cross-platform-artifacts/evidence.json` records host
+tool versions, artifact hashes, export counts, ABI/capability checks, Go
+cross-builds, and exact unsupported-runtime reasons. Generated binaries are
+not committed.
+
+The macOS previews are deliberately **unbundled**. They are packaging evidence,
+not releasable wheels: `_shoal_preview.json` marks runtime unsupported,
+`verify_preview.py` rejects any bundled native library, installs for the stated
+target tag with `pip --target`, verifies both imports, and requires `NativeAPI`
+to fail unless a trusted native library is explicitly supplied.
