@@ -165,12 +165,10 @@ manager/coordinator/FATE authority. Shoal ships no committer, and operators
 must not wire one. A replacement requires a supported Accumulo authority API
 carrying the logical-table epoch and operation attempt.
 
-The commit-plan JSON is written to `-out` whenever `Commit` returns a
-plan — including when Mode D fails with `ErrDirectCommitUnavailable` (the
-plan is still produced) — so you can inspect or resume from it. A
-pre-commit **fence trip** is different: it fails *before* a plan is built,
-returns no plan, and writes no artifact — because nothing was safe to
-commit (see §10).
+The shipped CLI rejects direct mode and `--dry-run=false` before connecting to
+ZooKeeper or writing outputs, so those requests produce no plan artifact.
+Package-level legacy tests may still exercise `Commit` directly, but their
+artifacts and errors do not describe an operator workflow.
 
 ---
 
@@ -270,8 +268,8 @@ After onlining the table:
 | `offline fence tripped: zk session changed …` | ZK connection dropped mid-run (watches lost). | Nothing was committed. Re-run. |
 | Run aborts naming an iterator class (e.g. `com.example.MyIterator`) | An iterator in the `majc` stack has no Go port. | Port it (iterator-forge track) or remove it from the table config; do not silently drop it. Nothing was written. |
 | `verification failed for tablet …` | Output diverged from the independent re-derivation. | Nothing was committed. File a bug with the pinned cell mismatch; do **not** force-commit. |
-| Mode D: `direct commit mode requires a MetadataCommitter` | Deprecated direct mode was requested. | Use `-commit-mode=plan`; do not wire a direct committer. The plan JSON was still written. |
-| Mode D partial failure naming a tablet | A legacy test-only direct committer was used. | Stop using direct mode and reconcile through Accumulo-authoritative tooling before retrying in plan mode. |
+| `--dry-run=false is disabled until a manager/coordinator/FATE commit API exists` | A release commit was requested before the authority API exists. | Re-run in the default dry-run inspection mode. The CLI exited before creating outputs or a plan. |
+| `--commit-mode=direct is deprecated and disabled` | Deprecated direct mode was requested. | Use the default plan mode for inspection only. The CLI exited before creating outputs or a plan. |
 
 In the deprecated legacy seams, the dangerous step is the metadata mutation
 gated behind the fence and `--dry-run=false`. A crash or abort before that step
