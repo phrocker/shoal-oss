@@ -31,6 +31,10 @@ func TestHostedOwnerVerifierRejectsUnhostedAndLostAssignments(t *testing.T) {
 	verify := HostedOwnerVerifier{
 		Host: host, Fence: tserver.Fence{Server: server, Manager: manager}, Attempt: attempt,
 	}
+	recoveryVerify := AssignedOwnerVerifier(verify)
+	if err := recoveryVerify.Verify(context.Background(), wireFence); err != nil {
+		t.Fatalf("loading recovery Verify: %v", err)
+	}
 	if err := verify.Verify(context.Background(), wireFence); !errors.Is(err, tserver.ErrWrongState) {
 		t.Fatalf("loading Verify = %v", err)
 	}

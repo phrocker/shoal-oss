@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -31,7 +32,12 @@ func (s *LocalStore) Create(ctx context.Context, path string, initial []byte) er
 	if err != nil {
 		return err
 	}
-	if _, err = f.Write(initial); err == nil {
+	if n, writeErr := f.Write(initial); writeErr != nil {
+		err = writeErr
+	} else if n != len(initial) {
+		err = io.ErrShortWrite
+	}
+	if err == nil {
 		err = f.Sync()
 	}
 	closeErr := f.Close()
@@ -55,7 +61,12 @@ func (s *LocalStore) Append(ctx context.Context, path string, data []byte) error
 	if err != nil {
 		return err
 	}
-	if _, err = f.Write(data); err == nil {
+	if n, writeErr := f.Write(data); writeErr != nil {
+		err = writeErr
+	} else if n != len(data) {
+		err = io.ErrShortWrite
+	}
+	if err == nil {
 		err = f.Sync()
 	}
 	closeErr := f.Close()

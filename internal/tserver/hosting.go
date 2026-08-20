@@ -566,6 +566,17 @@ func (h *Host) Hosted() []Extent {
 // Data-plane implementations call this immediately before durable work and
 // again before acknowledging it.
 func (h *Host) VerifyHosted(fence Fence, attempt Attempt) error {
+	return h.verifyAssignedState(fence, attempt, StateHosted)
+}
+
+// VerifyAssigned proves that attempt still names a tablet in either loading
+// or hosted state. It is used while recovery constructs a tablet before
+// LoadComplete publishes it to data-plane routing.
+func (h *Host) VerifyAssigned(fence Fence, attempt Attempt) error {
+	return h.verifyAssignedState(fence, attempt, StateLoading, StateHosted)
+}
+
+func (h *Host) verifyAssignedState(fence Fence, attempt Attempt, allowed ...HostingState) error {
 	if !attempt.Valid() {
 		return fmt.Errorf("%w: attempt was never assigned", ErrStaleAttempt)
 	}
@@ -579,9 +590,9 @@ func (h *Host) VerifyHosted(fence Fence, attempt Attempt) error {
 		h.metrics.RejectedStale++
 		return fmt.Errorf("%w: %s", ErrStaleAttempt, attempt.extent)
 	}
-	if entry.state != StateHosted {
-		return fmt.Errorf("%w: %s is %s, want %s",
-			ErrWrongState, entry.extent, entry.state, StateHosted)
+	if !slices.Contains(allowed, entry.state) {
+		return fmt.Errorf("%w: %s is %s, want one of %v",
+			ErrWrongState, entry.extent, entry.state, allowed)
 	}
 	return nil
 }

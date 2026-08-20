@@ -30,6 +30,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"path"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -107,6 +108,7 @@ type Config struct {
 	Metadata         MetadataAuthority
 	Store            Store
 	Verifier         FenceVerifier
+	RecoveryVerifier FenceVerifier
 	Sink             MutationSink
 	ReconcileTimeout time.Duration
 	NewID            func() string
@@ -182,11 +184,18 @@ func Open(ctx context.Context, cfg Config) (*Tablet, RecoveryReport, error) {
 		ops:     make(map[string]operation),
 		applied: make(map[string]struct{}),
 	}
-	if err := t.verify(ctx); err != nil {
+	recoveryVerifier := cfg.RecoveryVerifier
+	if recoveryVerifier == nil {
+		recoveryVerifier = cfg.Verifier
+	}
+	if err := verifyFence(ctx, recoveryVerifier, cfg.Fence); err != nil {
 		return nil, RecoveryReport{}, err
 	}
 	report, err := t.recover(ctx)
 	if err != nil {
+		return nil, report, err
+	}
+	if err := verifyFence(ctx, recoveryVerifier, cfg.Fence); err != nil {
 		return nil, report, err
 	}
 	t.recovery = report
@@ -321,12 +330,12 @@ func (t *Tablet) createWAL(ctx context.Context) error {
 		return fmt.Errorf("%w: WAL id is not a UUID: %q", ErrInvalidConfig, id)
 	}
 	hostPath := strings.ReplaceAll(t.cfg.ServerAddress, ":", "+")
-	path := filepath.ToSlash(filepath.Join(t.cfg.Root, hostPath, id))
-	ref := Reference{ID: id, Path: path, Qualifier: "-/" + path}
+	walPath := joinPath(t.cfg.Root, hostPath, id)
+	ref := Reference{ID: id, Path: walPath, Qualifier: "-/" + walPath}
 	h := header{
 		Version: formatVersion,
 		WALID:   id,
-		Path:    path,
+		Path:    walPath,
 		Extent:  cloneExtent(t.cfg.Extent),
 		Owner:   t.cfg.Fence,
 		Created: t.cfg.Now().UnixNano(),
@@ -335,8 +344,8 @@ func (t *Tablet) createWAL(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if err := t.cfg.Store.Create(ctx, path, frame); err != nil {
-		return fmt.Errorf("walauthority: create %s: %w", path, err)
+	if err := t.cfg.Store.Create(ctx, walPath, frame); err != nil {
+		return fmt.Errorf("walauthority: create %s: %w", walPath, err)
 	}
 	t.current = &wal{ref: ref}
 	return nil
@@ -417,15 +426,21 @@ func (t *Tablet) Close(ctx context.Context) error {
 	if t.closed {
 		return nil
 	}
-	t.closed = true
-	if t.current == nil {
-		return nil
+	if t.current != nil {
+		if err := t.cfg.Store.Sync(ctx, t.current.ref.Path); err != nil {
+			return err
+		}
 	}
-	return t.cfg.Store.Sync(ctx, t.current.ref.Path)
+	t.closed = true
+	return nil
 }
 
 func (t *Tablet) verify(ctx context.Context) error {
-	if err := t.cfg.Verifier.Verify(ctx, t.cfg.Fence); err != nil {
+	return verifyFence(ctx, t.cfg.Verifier, t.cfg.Fence)
+}
+
+func verifyFence(ctx context.Context, verifier FenceVerifier, fence ingestrouter.Fence) error {
+	if err := verifier.Verify(ctx, fence); err != nil {
 		return errors.Join(ErrStaleOwner, err)
 	}
 	return nil
@@ -534,9 +549,14 @@ func (t *Tablet) readWAL(ctx context.Context, ref Reference) ([]operation, int64
 }
 
 func (t *Tablet) findOperation(ctx context.Context, ref Reference, id string) (*operation, error) {
-	ops, _, _, err := t.readWAL(ctx, ref)
+	ops, valid, truncated, err := t.readWAL(ctx, ref)
 	if err != nil {
 		return nil, err
+	}
+	if truncated {
+		if err := t.cfg.Store.Truncate(ctx, ref.Path, valid); err != nil {
+			return nil, fmt.Errorf("repair partial append: %w", err)
+		}
 	}
 	for i := range ops {
 		if ops[i].OperationID == id {
@@ -544,6 +564,14 @@ func (t *Tablet) findOperation(ctx context.Context, ref Reference, id string) (*
 		}
 	}
 	return nil, nil
+}
+
+func joinPath(root string, elements ...string) string {
+	if strings.Contains(root, "://") {
+		return strings.TrimRight(root, "/") + "/" + path.Join(elements...)
+	}
+	all := append([]string{root}, elements...)
+	return filepath.ToSlash(filepath.Join(all...))
 }
 
 func operationDigest(op operation) string {

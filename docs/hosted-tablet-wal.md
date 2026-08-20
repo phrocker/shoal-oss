@@ -15,6 +15,10 @@ The commit order is:
    session, request, sequence, extent, and fence identities;
 5. re-verify the fence, install the batch in the memtable, and acknowledge.
 
+Recovery uses `AssignedOwnerVerifier` while the Host attempt is loading. Normal
+commits use `HostedOwnerVerifier`, so the tablet cannot accept routed writes
+until `LoadComplete` publishes the same assignment attempt.
+
 Lost metadata or append responses are reconciled by reading the authoritative
 state. Retries use the stable operation identity and cannot append a conflicting
 batch. Recovery reads only metadata-referenced WALs, validates every frame

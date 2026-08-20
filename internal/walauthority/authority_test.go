@@ -18,6 +18,7 @@ type memoryStore struct {
 	events          *[]string
 	appendErr       error
 	appendCommitted bool
+	syncErr         error
 }
 
 func newMemoryStore(events *[]string) *memoryStore {
@@ -60,7 +61,7 @@ func (s *memoryStore) Truncate(_ context.Context, path string, size int64) error
 	s.data[path] = s.data[path][:size]
 	return nil
 }
-func (s *memoryStore) Sync(context.Context, string) error { return nil }
+func (s *memoryStore) Sync(context.Context, string) error { return s.syncErr }
 func (s *memoryStore) Remove(_ context.Context, path string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -231,6 +232,45 @@ func TestCommitReconcilesAmbiguousReferenceAndAppend(t *testing.T) {
 	}
 }
 
+type partialAppendStore struct {
+	*memoryStore
+	once bool
+}
+
+func (s *partialAppendStore) Append(ctx context.Context, path string, data []byte) error {
+	if !s.once {
+		s.once = true
+		s.mu.Lock()
+		s.data[path] = append(s.data[path], data[:len(data)/2]...)
+		s.mu.Unlock()
+		return errors.New("short durable append")
+	}
+	return s.memoryStore.Append(ctx, path, data)
+}
+
+func TestPartialAppendIsTruncatedBeforeRetry(t *testing.T) {
+	base := newMemoryStore(nil)
+	store := &partialAppendStore{memoryStore: base}
+	metadata := newMemoryMetadata(nil)
+	sink := newSink(nil)
+	tablet, _, err := Open(context.Background(), testConfig(store, metadata, sink, &verifier{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := testRequest("partial", 10)
+	if err := tablet.Commit(context.Background(), req); err == nil {
+		t.Fatal("partial append unexpectedly succeeded")
+	}
+	if err := tablet.Commit(context.Background(), req); err != nil {
+		t.Fatalf("retry Commit: %v", err)
+	}
+	ref, _ := tablet.Roll(context.Background())
+	ops, _, truncated, err := tablet.readWAL(context.Background(), ref)
+	if err != nil || truncated || len(ops) != 1 {
+		t.Fatalf("readWAL = %d ops, truncated=%v, err=%v", len(ops), truncated, err)
+	}
+}
+
 type cancelAfterAppendStore struct {
 	*memoryStore
 	cancel context.CancelFunc
@@ -272,7 +312,7 @@ func TestFenceLossAfterAppendPreventsAcknowledgement(t *testing.T) {
 	store := newMemoryStore(nil)
 	metadata := newMemoryMetadata(nil)
 	sink := newSink(nil)
-	verify := &verifier{at: 3} // Open, pre-append, then post-append fails.
+	verify := &verifier{at: 4} // Open twice, pre-append, then post-append fails.
 	tablet := openTest(t, store, metadata, sink, verify)
 	err := tablet.Commit(context.Background(), testRequest("lost-after-append", 9))
 	if !errors.Is(err, ErrStaleOwner) {
@@ -500,7 +540,19 @@ func TestLocalStorePersistsAndTruncates(t *testing.T) {
 }
 
 func TestCloseIsIdempotent(t *testing.T) {
-	tablet := openTest(t, newMemoryStore(nil), newMemoryMetadata(nil), newSink(nil), &verifier{})
+	store := newMemoryStore(nil)
+	tablet := openTest(t, store, newMemoryMetadata(nil), newSink(nil), &verifier{})
+	if err := tablet.Commit(context.Background(), testRequest("before-close", 1)); err != nil {
+		t.Fatal(err)
+	}
+	store.syncErr = errors.New("sync unavailable")
+	if err := tablet.Close(context.Background()); err == nil {
+		t.Fatal("Close unexpectedly succeeded")
+	}
+	if tablet.closed {
+		t.Fatal("failed Close made tablet terminal")
+	}
+	store.syncErr = nil
 	if err := tablet.Close(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -509,6 +561,14 @@ func TestCloseIsIdempotent(t *testing.T) {
 	}
 	if err := tablet.Commit(context.Background(), testRequest("closed", 1)); !errors.Is(err, ErrClosed) {
 		t.Fatalf("Commit error = %v", err)
+	}
+}
+
+func TestJoinPathPreservesAccumuloVolumeURI(t *testing.T) {
+	got := joinPath("hdfs://namenode:8020/accumulo/wal", "host+9997", "id")
+	want := "hdfs://namenode:8020/accumulo/wal/host+9997/id"
+	if got != want {
+		t.Fatalf("joinPath = %q, want %q", got, want)
 	}
 }
 
