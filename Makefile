@@ -86,12 +86,19 @@ thrift-gen: thrift-check
 	  mv $(THRIFT_OUT)/compaction-coordinator $(THRIFT_OUT)/compactioncoordinator; \
 	fi
 	$(MAKE) patch-thrift-nil-binary
-	# The 0.17 Go generator and the generic patch pass leave trailing spaces
-	# and an extra blank line in tabletmgmt output. Normalize last so checked-in
-	# generated files pass diff checks and thrift-verify deterministically.
-	if test -d $(THRIFT_OUT)/tabletmgmt; then \
-	  find $(THRIFT_OUT)/tabletmgmt -name '*.go' -exec \
-	    sed -i -e 's/[[:space:]]\+$$//' -e '$${/^$$/d;}' {} +; \
+	$(MAKE) _normalize-tabletmgmt
+
+.PHONY: _normalize-tabletmgmt
+_normalize-tabletmgmt:
+	@if test -d $(THRIFT_OUT)/tabletmgmt; then \
+	  find $(THRIFT_OUT)/tabletmgmt -name '*.go' -print0 | \
+	    xargs -0 -I{} sh -c '\
+	      f="$$1"; \
+	      sed -i -e "s/[[:space:]]\\+$$//" "$$f"; \
+	      awk '"'"'{ lines[NR]=$$0; if ($$0 != "") last=NR } \
+	        END { for (i=1; i<=last; i++) print lines[i] }'"'"' \
+	        "$$f" > "$$f.tmp" && mv "$$f.tmp" "$$f"; \
+	    ' sh {}; \
 	fi
 
 .PHONY: thrift-verify
