@@ -437,6 +437,9 @@ func (m *Manager) Search(ctx context.Context, index string, query Query) ([]Hit,
 		Recall: active.Manifest.Recall, RecallClaimed: active.Manifest.Recall.Benchmarked(),
 		DeterministicMerge: "score descending, document id ascending",
 	}
+	if evidence.SourceWatermark == 0 {
+		evidence.SourceWatermark = active.Manifest.SourceWatermark
+	}
 	if reason := staleReason(active.Manifest, query.Freshness); reason != "" {
 		evidence.ExactFallback = query.ExactFallback
 		evidence.FallbackReason = reason

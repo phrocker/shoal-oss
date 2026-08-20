@@ -160,6 +160,13 @@ func buildExplainDetails(be Backend, p *Plan) ExplainDetails {
 		d.Pushdowns = append(d.Pushdowns, "column families "+quotedBytes(p.ColumnFamilies))
 	}
 	for _, spec := range p.Stack {
+		if spec.Name == iterrt.IterVectorKNN && p.VectorMode == VectorApproximate {
+			if p.VectorExactFallback {
+				d.LocalMaterialization = append(d.LocalMaterialization,
+					"conditional exact vector KNN fallback after an explicit freshness failure")
+			}
+			continue
+		}
 		if stringListed(d.Backend.FallbackIterators, spec.Name) {
 			d.LocalMaterialization = append(d.LocalMaterialization,
 				"local iterator fallback: "+explainIterator(spec))

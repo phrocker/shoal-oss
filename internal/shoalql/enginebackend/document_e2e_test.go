@@ -215,6 +215,9 @@ func TestDocE2E_SemanticIndexHydratesDocumentIdentity(t *testing.T) {
 			t.Fatalf("EXPLAIN missing %q: %s", want, explain)
 		}
 	}
+	if strings.Contains(explain, "exact vector KNN metric=") {
+		t.Fatalf("approximate EXPLAIN claimed unconditional exact pushdown: %s", explain)
+	}
 }
 
 // idsOf collects the "id" column of a result into a sorted slice.
