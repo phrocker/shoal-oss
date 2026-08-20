@@ -20,25 +20,29 @@
 -->
 # Offline compaction of Accumulo-hosted tablets — design
 
-Status: **implemented**. Orchestrator, OFFLINE fence + guarded commit,
-verification, and the `shoal-offline-compact` CLI have all landed (todos
-`oc-*`). Operators should start with the runbook:
+Status: **implemented with a deprecated direct-commit seam**. Orchestrator,
+OFFLINE fence, plan generation, verification, and the
+`shoal-offline-compact` CLI have landed (todos `oc-*`). The accepted
+[coordination authority contract](./coordination-authority.md) supersedes the
+earlier direct-metadata decision: release use is limited to Mode P until an
+Accumulo manager/FATE commit API exists. Operators should start with the runbook:
 [`offline-compaction.md`](./offline-compaction.md).
 
 ## 1. Goal
 
 Let shoal perform a **major compaction of a tablet whose table is
-offline**, end to end, from a standalone Go binary — no tserver, no
-manager, no compaction coordinator in the loop — and commit the result
-back into `accumulo.metadata` safely.
+offline** from a standalone Go binary — no tserver or compaction coordinator
+in the compaction work — and emit a guarded commit plan for
+Accumulo-authoritative tooling to apply.
 
 This is the offline counterpart to the online `shoal-compactor`
 (`cmd/shoal-compactor`), which today connects to the coordinator but
 **stops at the metadata-commit boundary** because a non-manager process
-has no write authority over `accumulo.metadata` / `accumulo.root` while
-a tablet is live.
+has no write authority over `accumulo.metadata` / `accumulo.root`.
+Taking a table offline removes concurrent tablet writers, not that authority
+boundary.
 
-## 2. Why offline is the safe path
+## 2. Why offline is required but not sufficient
 
 The online commit problem is a **concurrency + authority** problem: while
 a tablet is hosted, its tserver is the single writer of that tablet's
@@ -57,9 +61,10 @@ Taking the table **OFFLINE removes the concurrent writer entirely**:
   offline invariant, so we are reusing a well-understood safety envelope
   rather than inventing one.
 
-That single invariant — **table is OFFLINE for the whole operation** —
-is what makes a non-manager metadata commit defensible. Everything in
-this design exists to *establish, fence, and preserve* that invariant.
+That invariant makes off-cluster compaction and commit-plan generation safe,
+but it does **not** grant metadata-write authority to a non-manager process.
+The OFFLINE fence must be paired with the manager/coordinator/FATE commit
+boundary required by the coordination authority contract.
 
 ## 3. Safety model
 
@@ -194,29 +199,23 @@ Java-produced one: full major compaction outputs are named `A<base>.rf`
 in the tablet's directory (`<volume>/tables/<id>/<tabletDir>/`). We
 generate `<base>` from a UUID to avoid collisions.
 
-### 4.3 The metadata commit — decision required
-
-Two candidate mechanisms; **the CLI supports both, defaulting to the
-conservative one until we have soak time on direct mode.**
+### 4.3 The metadata commit
 
 **Mode P (plan, conservative, default):** emit a machine-readable commit
 plan (per tablet: extent, input refs to delete, output ref + size +
-entry count to insert). An operator applies it with Accumulo's own
-tooling (a small `accumulo shell` script or a supplied Java applier that
-uses Ample). Write authority never leaves Accumulo. Slower UX, zero new
-trust claim.
+entry count to insert). Plan generation is the only release-approved behavior
+today. Earlier suggestions to apply it with a shell script or standalone Ample
+writer are superseded: applying the plan must wait for a supported
+manager/coordinator/FATE operation that verifies the logical-table epoch and
+operation attempt.
 
-**Mode D (direct, faster, opt-in):** shoal writes the `accumulo.metadata`
-mutation itself as a **conditional mutation** — the batch is guarded by
-a condition on the tablet's current file set (the exact input refs we
-read), so if metadata changed underneath us the conditional write is
-rejected server-side. Combined with the OFFLINE fence this is safe, but
-it *is* a shoal-side metadata write, so it stays opt-in behind
-`--commit-mode=direct` and starts life gated in docs as "advanced".
-
-> Recommendation: ship Mode P first (unblocks the workflow with zero
-> authority risk), land Mode D behind the flag once `oc-e2e` has soak
-> coverage. This is the one open decision for `oc-commit`.
+**Mode D (direct, deprecated and prohibited for release):** the implementation
+seam can issue a conditional `accumulo.metadata` mutation, but that bypasses
+manager/coordinator/FATE authority and therefore conflicts with the accepted
+coordination contract. The seam remains only for existing tests and migration;
+operators must not wire or use `--commit-mode=direct`. Re-enabling a direct
+commit requires replacing it with a supported manager/FATE operation carrying
+the logical-table epoch and operation attempt.
 
 ## 5. Verification (`oc-verify`)
 
@@ -297,8 +296,10 @@ Against a Mini/real Accumulo instance:
 1. Ingest known data, flush + compact a few times to create multiple
    RFiles per tablet.
 2. Offline the table.
-3. Run `shoal-offline-compact --dry-run=false` (Mode P applied via the
-   test's Ample applier; Mode D exercised directly).
+3. Run `shoal-offline-compact --dry-run=false`. Existing tests exercise the
+   legacy Ample/direct seams as implementation coverage, not as a
+   release-approved authority path; replacement coverage must use the future
+   manager/coordinator/FATE commit operation.
 4. Online the table.
 5. Full scan; assert every original cell is present and correct, and the
    tablet now has a single `file:` entry.
@@ -307,11 +308,11 @@ Against a Mini/real Accumulo instance:
 
 ## 9. Decisions
 
-- **D-1 (commit mechanism):** **DECIDED — Mode P default + Mode D
-  opt-in.** shoal ships the conservative plan-emit path as the default
-  and keeps metadata-write authority inside Accumulo; the direct
-  `MetadataCommitter` seam is opt-in (`--commit-mode=direct`) and errors
-  clearly until a committer is wired. We do not go direct-only.
+- **D-1 (commit mechanism):** **SUPERSEDED — Mode P only for release.**
+  Shoal keeps metadata-write authority inside Accumulo. The legacy
+  `MetadataCommitter` seam and `--commit-mode=direct` path are deprecated and
+  must not be wired; a future direct commit must be a supported
+  manager/coordinator/FATE operation carrying current authority proof.
 - **D-2 (range compaction):** **DECIDED — range compaction is
   supported.** `--range` selects whole tablets that intersect the given
   row range (tablet granularity, never sub-tablet); an empty `--range`

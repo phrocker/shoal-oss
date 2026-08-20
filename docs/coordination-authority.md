@@ -59,9 +59,11 @@ These invariants are release gates, not implementation preferences:
 2. **Immutable proof.** Every assignment, mutation, compaction job, promotion
    step, and completion carries an authority token that can be rejected after
    lease or session loss.
-3. **Monotonic epochs.** Recovery cannot reuse an epoch previously allowed to
-   mutate state. Reconnection establishes a new epoch; it never revives work
-   issued under an expired one.
+3. **Monotonic epochs.** A domain activation or authority handoff cannot reuse
+   a logical-table epoch previously allowed to mutate state. Process
+   reconnection establishes new backend proof (lock generation and operation
+   attempt), not a new table-wide epoch, and never revives work issued under
+   expired proof.
 4. **Fail closed.** If a process cannot prove current authority, it withdraws
    readiness, rejects new mutations, and cannot publish asynchronous results.
 5. **Bounded quorum state.** Coordination stores contain membership, leases,
@@ -109,9 +111,9 @@ This is a design shape, not a committed public Go API. Backend-specific proof
 must remain available:
 
 - every token includes the logical table's durable `Epoch`, which is advanced
-  by compare-and-swap for every authority acquisition and handoff. It is
-  independent of backend-native generations and is the only value ordered
-  across coordination domains;
+  by compare-and-swap when activating a writer domain or handing authority to
+  another domain. It is independent of backend-native generations and is the
+  only value ordered across coordination domains;
 - an embedded token also includes the persisted manifest generation and
   lock-file identity;
 - a Kubernetes token includes the Lease UID/resource version observed during
@@ -252,10 +254,12 @@ promotion-specific API that separates allocation from submission; the current
 [`promotion.md`](./promotion.md#5-whats-deferred).
 
 Before import submission, a failed attempt may return to `LOCAL_WRITABLE` only
-under a successful CAS proving the same local authority still exists and only
-after the destination write fence has been released without admitting a
-destination write. After FATE allocation, local writes remain frozen and the
-destination remains fenced until the persisted transaction is reconciled.
+after durably marking the destination's reserved epoch `E+1` aborted while the
+destination remains `OFFLINE`, then using a successful source CAS to activate
+a new local epoch `E+2`. The destination fence is not released during rollback;
+it may be released only by a later handoff that retires local authority. After
+FATE allocation, local writes remain frozen and the destination remains fenced
+until the persisted transaction is reconciled.
 Bringing the destination online administratively during this interval is a
 protocol violation and must fail readiness/recovery rather than be accepted as
 a successful cutover. Guessing that the import failed could authorize both

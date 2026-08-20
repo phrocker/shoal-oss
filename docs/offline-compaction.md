@@ -112,25 +112,25 @@ the commit plan (§8) before proceeding.
 
 ### Step 3 — commit
 
-Pick a commit mode (§5). The default **Mode P** emits the plan for an
-Ample-based applier to apply inside Accumulo:
+The default **Mode P** emits the plan:
 
 ```bash
 shoal-offline-compact … -dry-run=false -commit-mode=plan -out ./plans
 ```
 
-The tool re-verifies the fence, then writes the final commit plan. Apply
-it with your Ample-based applier (the conditional mutation runs *inside*
-Accumulo, preserving metadata-write authority there).
+The tool re-verifies the fence, then writes the final commit plan. Do not apply
+it with a shell script, standalone Ample writer, or direct metadata mutation.
+Application is blocked until a supported manager/coordinator/FATE operation
+can verify the logical-table epoch and operation attempt.
 
-For **Mode D** (direct), the tool applies the metadata delta itself —
-opt-in and requires a wired `MetadataCommitter` (see §5):
-
-```bash
-shoal-offline-compact … -dry-run=false -commit-mode=direct
-```
+Do not use `-commit-mode=direct`. That legacy seam bypasses
+manager/coordinator/FATE authority and is deprecated by the accepted
+[coordination authority contract](./coordination-authority.md).
 
 ### Step 4 — bring the table back online
+
+Do not bring the table online unless the plan was applied by that
+Accumulo-authoritative operation and its terminal result was verified.
 
 ```
 # Accumulo shell
@@ -144,19 +144,19 @@ should now reference a single `file:` entry.
 
 ---
 
-## 5. Commit modes (decision D-1: **Mode P default, Mode D opt-in**)
+## 5. Commit modes (decision D-1: **Mode P only for release**)
 
 **Mode P (`plan`, default) — conservative.** The tool emits a
-machine-readable `CommitPlan` (§8) and makes **no** metadata writes. An
-operator or an Ample-based applier consumes it and performs the
-conditional mutation inside Accumulo. Metadata-write authority stays in
-Accumulo. This is the path shipped first and the recommended default.
+machine-readable `CommitPlan` (§8) and makes **no** metadata writes. Plan
+generation is release-approved; application remains blocked until a supported
+manager/coordinator/FATE operation exists. Standalone shell or Ample appliers
+are not authority-preserving substitutes.
 
-**Mode D (`direct`) — opt-in.** The tool writes `accumulo.metadata`
-itself via a supplied `MetadataCommitter`, as a conditional mutation
-guarded on the current file set. shoal ships **no** default committer (it
-is a read fleet), so Mode D errors with
-`direct commit mode requires a MetadataCommitter` until one is wired.
+**Mode D (`direct`) — deprecated and prohibited for release.** The retained
+`MetadataCommitter` seam writes `accumulo.metadata` outside
+manager/coordinator/FATE authority. Shoal ships no committer, and operators
+must not wire one. A replacement requires a supported Accumulo authority API
+carrying the logical-table epoch and operation attempt.
 
 The commit-plan JSON is written to `-out` whenever `Commit` returns a
 plan — including when Mode D fails with `ErrDirectCommitUnavailable` (the
@@ -262,8 +262,8 @@ After onlining the table:
 | `offline fence tripped: zk session changed …` | ZK connection dropped mid-run (watches lost). | Nothing was committed. Re-run. |
 | Run aborts naming an iterator class (e.g. `com.example.MyIterator`) | An iterator in the `majc` stack has no Go port. | Port it (iterator-forge track) or remove it from the table config; do not silently drop it. Nothing was written. |
 | `verification failed for tablet …` | Output diverged from the independent re-derivation. | Nothing was committed. File a bug with the pinned cell mismatch; do **not** force-commit. |
-| Mode D: `direct commit mode requires a MetadataCommitter` | Mode D requested with no committer wired. | Use `-commit-mode=plan` (default) and apply via Ample, or wire a committer. The plan JSON was still written. |
-| Mode D partial failure naming a tablet | A per-tablet conditional mutation was rejected mid-run. | Already-committed tablets are durable and independent; the error names the failed tablet so you can inspect and resume. Re-run for the remaining tablets. |
+| Mode D: `direct commit mode requires a MetadataCommitter` | Deprecated direct mode was requested. | Use `-commit-mode=plan`; do not wire a direct committer. The plan JSON was still written. |
+| Mode D partial failure naming a tablet | A legacy test-only direct committer was used. | Stop using direct mode and reconcile through Accumulo-authoritative tooling before retrying in plan mode. |
 
 Because the only dangerous step is the metadata mutation (gated behind the
 fence and `--dry-run=false`), a crash or abort before commit leaves only
