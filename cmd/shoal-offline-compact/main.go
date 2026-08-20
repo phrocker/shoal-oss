@@ -16,24 +16,22 @@
 // under the License.
 
 // shoal-offline-compact runs a standalone full-major compaction over the
-// tablets of an OFFLINE Accumulo table — no tserver, manager, or
-// compaction coordinator in the loop. It reads the tablet's input RFiles,
-// applies the resolved table.iterator.majc.* stack, writes one output
-// RFile per tablet, verifies each output, and hands off the metadata
-// delta as a commit plan (the default, conservative Mode P) or applies it
-// directly (Mode D, opt-in, requires a metadata committer).
+// tablets of an OFFLINE Accumulo table. It reads the tablet's input RFiles,
+// applies the resolved table.iterator.majc.* stack, writes one output RFile
+// per tablet, verifies each output, and emits an inspection-only plan.
 //
 // See docs/offline-compaction-design.md for the safety model. The OFFLINE
 // fence (§3.1) is established before any compaction and re-verified
-// immediately before the metadata hand-off: if the table is brought back
-// ONLINE in between, the run aborts without touching metadata.
+// before plan emission: if the table is brought back ONLINE in between, the
+// run aborts without touching metadata.
 //
-// Dry-run is the default and the ONLY commit gate: the binary plans +
-// verifies and prints what it would do. Pass --dry-run=false to commit.
+// Release workflows are dry-run/plan-only until a manager/coordinator/FATE
+// commit API exists. Legacy direct and non-dry-run paths are rejected.
 package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -68,8 +66,8 @@ func run() int {
 	instanceName := flag.String("instance", "accumulo", "Accumulo instance name")
 	table := flag.String("table", "", "table name or id to compact (REQUIRED)")
 	rangeSpec := flag.String("range", "", "restrict to tablets in startRow:endRow (inclusive; either side may be empty for unbounded)")
-	dryRun := flag.Bool("dry-run", true, "plan + verify only; pass --dry-run=false to actually commit (the ONLY commit gate)")
-	commitModeStr := flag.String("commit-mode", "plan", "plan|direct — how to commit; always validated, but only acted on when --dry-run=false")
+	dryRun := flag.Bool("dry-run", true, "plan + verify only; false is disabled until an authority-preserving commit API exists")
+	commitModeStr := flag.String("commit-mode", "plan", "plan only; direct is deprecated and disabled")
 	doVerify := flag.Bool("verify", true, "run the §5 verification on every compacted tablet")
 	outDir := flag.String("out", ".", "directory to write the commit plan into (Mode P)")
 	storageScheme := flag.String("storage", "gs", "RFile storage backend: gs, s3, azure, hdfs, local, memory")
@@ -104,6 +102,9 @@ func run() int {
 
 	commitMode, err := offlinecompact.ParseCommitMode(*commitModeStr)
 	if err != nil {
+		return fail(logger, "%v", err)
+	}
+	if err := validateReleaseCommitOptions(*dryRun, commitMode); err != nil {
 		return fail(logger, "%v", err)
 	}
 
@@ -175,8 +176,8 @@ func run() int {
 		slog.Int("no_op", len(plan.NoOp)),
 	)
 
-	// Fence-verified commit (plan-emit by default; direct writes only
-	// when --dry-run=false and --commit-mode=direct with a committer).
+	// Release workflows are validated as dry-run/plan-only above. Commit
+	// retains its legacy modes for package-level regression tests.
 	commitPlan, commitErr := offlinecompact.Commit(ctx, plan, fence, minted, commitMode, *dryRun, nil)
 
 	// Always emit the commit plan artifact when one was produced — even
@@ -202,16 +203,18 @@ func run() int {
 		logger.Info("DRY RUN — no metadata written",
 			slog.String("commit_plan", planPath),
 			slog.Int("tablets", len(commitPlan.Tablets)))
-	case commitMode == offlinecompact.ModePlan:
-		logger.Info("commit plan emitted (Mode P); apply it via the Ample-based applier",
-			slog.String("commit_plan", planPath),
-			slog.Int("tablets", len(commitPlan.Tablets)))
-	default:
-		logger.Info("metadata committed (Mode D)",
-			slog.String("commit_plan", planPath),
-			slog.Int("tablets", len(commitPlan.Tablets)))
 	}
 	return 0
+}
+
+func validateReleaseCommitOptions(dryRun bool, mode offlinecompact.CommitMode) error {
+	if !dryRun {
+		return errors.New("--dry-run=false is disabled until a manager/coordinator/FATE commit API exists")
+	}
+	if mode != offlinecompact.ModePlan {
+		return errors.New("--commit-mode=direct is deprecated and disabled")
+	}
+	return nil
 }
 
 // rangeEnumerator wraps the metadata walker to restrict enumeration to a

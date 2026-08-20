@@ -10,9 +10,10 @@ metadata delta.
 This is the operator guide. For the safety model and rationale see
 [`offline-compaction-design.md`](./offline-compaction-design.md).
 
-> **Golden rule:** the table must be **OFFLINE** for the entire run, and it
-> stays that way until you have applied the commit and re-onlined it. The
-> tool fails closed if the table is (or becomes) ONLINE.
+> **Golden rule:** the table must be **OFFLINE** for the entire inspection
+> run. Today, discard the dry-run artifacts and re-online the unchanged table.
+> A future commit workflow must keep it offline through authoritative apply
+> and verification. The tool fails closed if the table is (or becomes) ONLINE.
 
 ---
 
@@ -127,18 +128,24 @@ the logical-table epoch, operation attempt, and output-file protection.
 
 ### Step 4 — bring the table back online
 
-Do not bring the table online unless a freshly generated plan was applied by
-that Accumulo-authoritative operation and its terminal result was verified.
+For today's inspection-only workflow, discard the plan and allow GC to reclaim
+the unreferenced outputs, then re-online the unchanged table. Do not expect the
+tablet file set to have changed.
 
 ```
 # Accumulo shell
 online -t mytable -w
 ```
 
+For the future commit workflow, keep the table offline until a freshly
+generated plan is applied by the Accumulo-authoritative operation and its
+terminal result is verified; only then bring it online.
+
 ### Step 5 — validate (§9)
 
-Scan and confirm cell counts / spot-check content; each compacted tablet
-should now reference a single `file:` entry.
+In today's inspection workflow, scan and confirm the original table is
+unchanged. In the future commit workflow, also confirm each compacted tablet
+references a single `file:` entry.
 
 ---
 

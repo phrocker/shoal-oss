@@ -24,7 +24,29 @@ import (
 	"testing"
 
 	"github.com/phrocker/shoal/internal/metadata"
+	"github.com/phrocker/shoal/internal/offlinecompact"
 )
+
+func TestValidateReleaseCommitOptions(t *testing.T) {
+	tests := []struct {
+		name    string
+		dryRun  bool
+		mode    offlinecompact.CommitMode
+		wantErr bool
+	}{
+		{name: "plan dry run", dryRun: true, mode: offlinecompact.ModePlan},
+		{name: "plan commit disabled", dryRun: false, mode: offlinecompact.ModePlan, wantErr: true},
+		{name: "direct disabled", dryRun: true, mode: offlinecompact.ModeDirect, wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateReleaseCommitOptions(tt.dryRun, tt.mode)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("validateReleaseCommitOptions() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
 
 func TestParseRange(t *testing.T) {
 	tests := []struct {
