@@ -1,0 +1,316 @@
+from __future__ import annotations
+
+import ctypes as C
+from dataclasses import dataclass
+
+from ._native import (
+    CAP_BATCH_WRITER,
+    CAP_MUTATION,
+    CAP_STRUCTURED_WRITE_FAILURE,
+    BatchWriterConfig,
+    NativeAPI,
+    as_bytes,
+    c_bytes,
+)
+
+
+@dataclass(frozen=True)
+class BatchWriterOptions:
+    max_memory_bytes: int = 0
+    max_batch_bytes: int = 0
+    max_latency_ms: int = 0
+    max_write_threads: int = 0
+    max_retries: int = 0
+    retry_backoff_ms: int = 0
+    durability: int = 0
+
+
+class Mutation:
+    def __init__(
+        self,
+        row: str | bytes | bytearray | memoryview,
+        *,
+        library: str | None = None,
+        _api: NativeAPI | None = None,
+    ) -> None:
+        self._api = _api or NativeAPI(library)
+        self._api.require(CAP_MUTATION)
+        row_view, row_buffer = c_bytes(as_bytes(row))
+        self._handle = C.c_void_p()
+        error = C.c_void_p()
+        status = self._api.lib.shoal_mutation_create(
+            row_view, C.byref(self._handle), C.byref(error)
+        )
+        self._api.check(status, error)
+        self._closed = False
+        _ = row_buffer
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    def put(
+        self,
+        column_family: str | bytes = b"",
+        column_qualifier: str | bytes = b"",
+        column_visibility: str | bytes = b"",
+        timestamp: int = 0,
+        value: str | bytes = b"",
+    ) -> Mutation:
+        self._update(
+            "shoal_mutation_put",
+            column_family,
+            column_qualifier,
+            column_visibility,
+            timestamp,
+            value,
+        )
+        return self
+
+    def put_latest(
+        self,
+        column_family: str | bytes = b"",
+        column_qualifier: str | bytes = b"",
+        column_visibility: str | bytes = b"",
+        value: str | bytes = b"",
+    ) -> Mutation:
+        self._update_latest(
+            "shoal_mutation_put_latest",
+            column_family,
+            column_qualifier,
+            column_visibility,
+            value,
+        )
+        return self
+
+    def delete(
+        self,
+        column_family: str | bytes = b"",
+        column_qualifier: str | bytes = b"",
+        column_visibility: str | bytes = b"",
+        timestamp: int = 0,
+    ) -> Mutation:
+        self._ensure_open()
+        views = [
+            c_bytes(as_bytes(value))
+            for value in (column_family, column_qualifier, column_visibility)
+        ]
+        error = C.c_void_p()
+        status = self._api.lib.shoal_mutation_delete(
+            self._handle,
+            *(item[0] for item in views),
+            timestamp,
+            C.byref(error),
+        )
+        self._api.check(status, error)
+        return self
+
+    def delete_latest(
+        self,
+        column_family: str | bytes = b"",
+        column_qualifier: str | bytes = b"",
+        column_visibility: str | bytes = b"",
+    ) -> Mutation:
+        self._ensure_open()
+        views = [
+            c_bytes(as_bytes(value))
+            for value in (column_family, column_qualifier, column_visibility)
+        ]
+        error = C.c_void_p()
+        status = self._api.lib.shoal_mutation_delete_latest(
+            self._handle, *(item[0] for item in views), C.byref(error)
+        )
+        self._api.check(status, error)
+        return self
+
+    def size(self) -> int:
+        self._ensure_open()
+        result = C.c_size_t()
+        error = C.c_void_p()
+        status = self._api.lib.shoal_mutation_size(
+            self._handle, C.byref(result), C.byref(error)
+        )
+        self._api.check(status, error)
+        return int(result.value)
+
+    def _update(
+        self,
+        symbol: str,
+        column_family: str | bytes,
+        column_qualifier: str | bytes,
+        column_visibility: str | bytes,
+        timestamp: int,
+        value: str | bytes,
+    ) -> None:
+        self._ensure_open()
+        views = [
+            c_bytes(as_bytes(item))
+            for item in (
+                column_family,
+                column_qualifier,
+                column_visibility,
+                value,
+            )
+        ]
+        error = C.c_void_p()
+        status = getattr(self._api.lib, symbol)(
+            self._handle,
+            views[0][0],
+            views[1][0],
+            views[2][0],
+            timestamp,
+            views[3][0],
+            C.byref(error),
+        )
+        self._api.check(status, error)
+
+    def _update_latest(
+        self,
+        symbol: str,
+        column_family: str | bytes,
+        column_qualifier: str | bytes,
+        column_visibility: str | bytes,
+        value: str | bytes,
+    ) -> None:
+        self._ensure_open()
+        views = [
+            c_bytes(as_bytes(item))
+            for item in (
+                column_family,
+                column_qualifier,
+                column_visibility,
+                value,
+            )
+        ]
+        error = C.c_void_p()
+        status = getattr(self._api.lib, symbol)(
+            self._handle,
+            views[0][0],
+            views[1][0],
+            views[2][0],
+            views[3][0],
+            C.byref(error),
+        )
+        self._api.check(status, error)
+
+    def close(self) -> None:
+        if not self._closed:
+            self._api.lib.shoal_mutation_free(C.byref(self._handle))
+            self._closed = True
+
+    def _ensure_open(self) -> None:
+        if self._closed:
+            raise RuntimeError("mutation is closed")
+
+    def __enter__(self) -> Mutation:
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
+class BatchWriter:
+    def __init__(
+        self,
+        connector: object,
+        table: str,
+        *,
+        options: BatchWriterOptions | None = None,
+    ) -> None:
+        self._connector = connector
+        self._api: NativeAPI = connector._api
+        self._api.require(
+            CAP_MUTATION, CAP_BATCH_WRITER, CAP_STRUCTURED_WRITE_FAILURE
+        )
+        config = BatchWriterConfig()
+        self._api.lib.shoal_batch_writer_config_init(C.byref(config))
+        table_bytes = table.encode()
+        config.table_name = table_bytes
+        if options:
+            for name in options.__dataclass_fields__:
+                setattr(config, name, getattr(options, name))
+        self._handle = C.c_void_p()
+        error = C.c_void_p()
+        status = self._api.lib.shoal_connector_create_batch_writer(
+            connector._handle, C.byref(config), C.byref(self._handle), C.byref(error)
+        )
+        self._api.check(status, error)
+        self._closed = False
+        self._close_error: BaseException | None = None
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    def mutation(self, row: str | bytes) -> Mutation:
+        self._ensure_open()
+        return Mutation(row, _api=self._api)
+
+    def add_mutation(self, mutation: Mutation, *, timeout_ms: int = 0) -> bool:
+        self._ensure_open()
+        mutation._ensure_open()
+        failure = C.c_void_p()
+        error = C.c_void_p()
+        status = self._api.lib.shoal_batch_writer_add(
+            self._handle,
+            mutation._handle,
+            timeout_ms,
+            C.byref(failure),
+            C.byref(error),
+        )
+        self._api.check_write(status, failure, error)
+        return True
+
+    addMutation = add_mutation
+
+    def flush(self, override: bool = False, *, timeout_ms: int = 0) -> bool:
+        del override
+        self._ensure_open()
+        failure = C.c_void_p()
+        error = C.c_void_p()
+        status = self._api.lib.shoal_batch_writer_flush(
+            self._handle, timeout_ms, C.byref(failure), C.byref(error)
+        )
+        self._api.check_write(status, failure, error)
+        return True
+
+    def close(self, *, timeout_ms: int = 0) -> None:
+        if self._closed:
+            if self._close_error is not None:
+                raise self._close_error
+            return
+        failure = C.c_void_p()
+        error = C.c_void_p()
+        status = self._api.lib.shoal_batch_writer_close(
+            self._handle, timeout_ms, C.byref(failure), C.byref(error)
+        )
+        try:
+            self._api.check_write(status, failure, error)
+        except BaseException as exc:
+            self._close_error = exc
+            raise
+        finally:
+            self._api.lib.shoal_batch_writer_free(C.byref(self._handle))
+            self._closed = True
+
+    def _ensure_open(self) -> None:
+        if self._closed:
+            raise RuntimeError("batch writer is closed")
+
+    def __enter__(self) -> BatchWriter:
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
