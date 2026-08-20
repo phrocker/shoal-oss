@@ -116,9 +116,10 @@ must remain available:
   only value ordered across coordination domains;
 - an embedded token also includes the persisted manifest generation and
   lock-file identity;
-- a Kubernetes token includes the Lease UID/resource version observed during
-  acquisition and the CAS-protected manifest generation. Kubernetes resource
-  versions are opaque identities, not integers to compare;
+- a Kubernetes token includes a tenure identity formed from the Lease UID,
+  unique holder identity, and `leaseTransitions`, plus the CAS-protected
+  manifest generation. The changing `resourceVersion` is used only for
+  optimistic-concurrency updates and is not carried as immutable work proof;
 - an Accumulo token includes the exact ServiceLock identity and sequence plus
   the manager-issued assignment or coordinator-issued job attempt.
 
@@ -127,11 +128,12 @@ manifest. Accumulo mode keeps it in a manager-owned Shoal authority record in
 Accumulo authoritative metadata; changing that record requires a supported
 manager/FATE operation, never a direct metadata mutation. The Accumulo adapter
 must verify the record's epoch when issuing assignments or jobs. A handoff
-first fences the destination and reserves epoch `E+1` while the source may
-still be writable at epoch `E`; it then freezes and retires source epoch `E`
-before activating destination epoch `E+1`. Native manifest generations,
-Kubernetes resource versions, and ServiceLock sequences remain backend proof
-and are never compared with one another.
+first fences the destination and reserves epoch
+`N = max(source high-water mark, destination high-water mark) + 1` while the
+source may still be writable at epoch `E`; it then freezes and retires source
+epoch `E` before activating destination epoch `N`. Native manifest
+generations, Kubernetes tenure identities, and ServiceLock sequences remain
+backend proof and are never compared with one another.
 
 The `Attempt` component prevents a delayed completion from applying to a later
 operation that happens to run under the same process lease. This matches the
@@ -222,9 +224,11 @@ The handoff proceeds as follows:
    ordinary mutations for the rest of the handoff. It must either be newly
    created offline and never enabled, or have all prior writers retired and
    their lineage reconciled before this protocol begins. Persist the
-   destination table ID and gated state as `DESTINATION_FENCED`, then reserve
-   logical authority epoch `E+1` in the destination's manager-owned authority
-   record without making the table writable.
+   destination table ID and gated state as `DESTINATION_FENCED`, reconcile both
+   epoch histories, then reserve logical authority epoch
+   `N = max(source high-water mark, destination high-water mark) + 1` in the
+   destination's manager-owned authority record without making the table
+   writable.
 2. Fence the local writer with its current lease and manifest generation.
 3. Stop admitting local writes and durably record `LOCAL_FROZEN` at epoch `E`.
 4. Flush/checkpoint an immutable generation and verify its checksums.
@@ -238,10 +242,10 @@ The handoff proceeds as follows:
    durably recorded.
 7. Verify the imported files and tablet state through Accumulo while the
    destination write fence remains held.
-8. Revoke local authority and durably record `LOCAL_RETIRED`, linking epoch
-   `E` to the destination's reserved epoch `E+1`.
+8. Revoke local authority and durably record `LOCAL_RETIRED`, linking source
+   epoch `E` to the destination's reserved epoch `N`.
 9. Bring the destination online through the manager, verify the transition,
-   and durably record `ACCUMULO_WRITABLE` at epoch `E+1`. Only then may
+   and durably record `ACCUMULO_WRITABLE` at epoch `N`. Only then may
    distributed clients admit writes.
 10. Retain an auditable lineage record tying local generation, export
     checksums, destination table, FATE identity, and terminal authority epoch.
@@ -254,12 +258,13 @@ promotion-specific API that separates allocation from submission; the current
 [`promotion.md`](./promotion.md#5-whats-deferred).
 
 Before import submission, a failed attempt may return to `LOCAL_WRITABLE` only
-after durably marking the destination's reserved epoch `E+1` aborted while the
+after durably marking the destination's reserved epoch `N` aborted while the
 destination remains `OFFLINE`, then using a successful source CAS to activate
-a new local epoch `E+2`. The destination fence is not released during rollback;
-it may be released only by a later handoff that retires local authority. After
-FATE allocation, local writes remain frozen and the destination remains fenced
-until the persisted transaction is reconciled.
+epoch `M = max(source high-water mark, destination high-water mark) + 1`, where
+`M > N`. The destination fence is not released during rollback; it may be
+released only by a later handoff that retires local authority. After FATE
+allocation, local writes remain frozen and the destination remains fenced until
+the persisted transaction is reconciled.
 Bringing the destination online administratively during this interval is a
 protocol violation and must fail readiness/recovery rather than be accepted as
 a successful cutover. Guessing that the import failed could authorize both
