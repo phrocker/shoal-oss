@@ -66,8 +66,9 @@ path and digest, and any missing required production gates.
 Replay mode executes the commands in
 `test/conformance/fixtures/<gate>.json`. The concrete adapters cover client
 CRUD/visibility/range contracts, promotion artifact before/after equivalence,
-stateful scan continuation, tserver lock/assignment lifecycle, and compactor
-publication/completion. Fixtures bind every result to a named test and the
+stateful scan continuation/cancel-resume, tserver lock/assignment, ingest,
+minor-compaction, WAL recovery and fencing, and compactor
+publication/completion/cancellation/restart/fencing. Fixtures bind every result to a named test and the
 exact digest of its source file instead of treating package-wide success or a
 stale selector as evidence. Run:
 
@@ -76,14 +77,36 @@ go build -o bin/shoal-conformance ./cmd/shoal-conformance
 bin/shoal-conformance -mode replay -output verdict.json
 ```
 
-Live mode reuses `python test/accumulo/harness.py test` for the client gate.
-Passing replay evidence is reported separately as `evidence_state: pass`.
-Because the repository does not yet install Shoal processes into the pinned
-cluster, each role also lists its missing live process gate and remains
-`unsupported`, never a production replacement pass. Live mode can satisfy the
-client adapter's pinned Java lifecycle gate when Docker is available.
-Tserver, scanserver, compactor, and promotion remain unsupported until their
-process/destination wiring exists.
+Live mode builds the repository's `shoal-tserver` and `shoal-compactor`, starts
+them beside the exact pinned Accumulo manager, ZooKeeper, and HDFS services,
+and runs unmodified Accumulo Java API calls through the Shoal endpoints.
+The tserver path verifies ServiceLock registration/manager assignment,
+write/flush/scan, one-cell stateful continuation, minor-compaction visibility,
+WAL recovery after `SIGKILL`, and lock fencing/re-registration. The compactor
+path verifies coordinator publication/completion, Java readability and
+canonical before/after equivalence, cancellation, durable completion replay,
+and restart.
+
+On a Docker host, run the exact independent gates:
+
+```bash
+python test/accumulo/harness.py validate
+python -m unittest -v test/accumulo/test_harness.py
+go test ./internal/conformance ./cmd/shoal-conformance
+go build -o bin/shoal-conformance ./cmd/shoal-conformance
+bin/shoal-conformance -mode replay -output replay-verdict.json
+bin/shoal-conformance -mode live -required tserver,scanserver,client \
+  -output tserver-live-verdict.json
+bin/shoal-conformance -mode live -required compactor,promotion \
+  -output compactor-live-verdict.json
+```
+
+Keep the JSON verdicts and complete Compose logs. A live pass must contain
+`SHOAL_EVIDENCE` lines for ServiceLock/assignment, Java ingest, continuation,
+minor compaction, WAL recovery, fencing, external-compaction publication and
+completion, Java readability, promotion equivalence, cancellation, and
+restart. Any missing Docker daemon returns exit 2 and `unsupported`; it is
+never converted into a pass.
 
 ### Release-gate semantics
 

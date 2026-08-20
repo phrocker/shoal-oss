@@ -1,10 +1,10 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "role": "tserver",
-  "adapter": "tserver-lifecycle-v1",
+  "adapter": "tserver-production-v2",
   "accumulo_version": "4.0.0-SNAPSHOT",
   "accumulo_revision": "1a716b2c1bb5762ead4b46d2bc4f53e13873b314",
-  "summary": "tserver adapter proves Accumulo lock publication and assignment/unload lifecycle ordering",
+  "summary": "tserver adapter proves lock, assignment, ingest, minor compaction, WAL recovery, restart, and fencing contracts",
   "evidence": [
     {
       "gate": "service-lock-lifecycle",
@@ -19,6 +19,27 @@
       "reference": "internal/tserverrpc/adapter_test.go#TestLifecycleReportsRemainOrderedDuringReconnect",
       "source_sha256": "22f750514abe4ed0507b5f9d260e1c89a4194aaf19fb5650b4388caba3a61906",
       "replay_command": ["go", "test", "./internal/tserverrpc", "-run", "^TestLifecycleReportsRemainOrderedDuringReconnect$", "-count=1"]
+    },
+    {
+      "gate": "ingest-minor-compaction",
+      "kind": "go-test",
+      "reference": "internal/hostedingest/tablet_test.go#TestTabletDurableCommitMinorCompactionAndAmbiguousResponses",
+      "source_sha256": "a6be11f9e377e9cbc4b33155e8b41c29b270cebac4ed1df1f77f24532e222f0d",
+      "replay_command": ["go", "test", "./internal/hostedingest", "-run", "^TestTabletDurableCommitMinorCompactionAndAmbiguousResponses$", "-count=1"]
+    },
+    {
+      "gate": "wal-recovery",
+      "kind": "go-test",
+      "reference": "internal/hostedingest/tablet_test.go#TestTabletRestartReplaysReferencedWALExactlyOnce",
+      "source_sha256": "a6be11f9e377e9cbc4b33155e8b41c29b270cebac4ed1df1f77f24532e222f0d",
+      "replay_command": ["go", "test", "./internal/hostedingest", "-run", "^TestTabletRestartReplaysReferencedWALExactlyOnce$", "-count=1"]
+    },
+    {
+      "gate": "restart-fencing",
+      "kind": "go-test",
+      "reference": "internal/hostedingest/tablet_test.go#TestTabletFencesStaleOwnerDuringCommit",
+      "source_sha256": "a6be11f9e377e9cbc4b33155e8b41c29b270cebac4ed1df1f77f24532e222f0d",
+      "replay_command": ["go", "test", "./internal/hostedingest", "-run", "^TestTabletFencesStaleOwnerDuringCommit$", "-count=1"]
     }
   ]
 }

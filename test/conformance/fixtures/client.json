@@ -1,7 +1,7 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "role": "client",
-  "adapter": "client-contract-v1",
+  "adapter": "client-contract-v2",
   "accumulo_version": "4.0.0-SNAPSHOT",
   "accumulo_revision": "1a716b2c1bb5762ead4b46d2bc4f53e13873b314",
   "summary": "client adapter proves CRUD, visibility wire behavior, and exact range boundaries",

@@ -30,3 +30,5 @@ python/*.egg-info/
 python/src/*.egg-info/
 __pycache__/
 python/src/sharkbite/.libs/
+.review-worktrees/
+test/accumulo/.live/
