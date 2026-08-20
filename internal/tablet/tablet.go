@@ -39,6 +39,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -95,6 +96,32 @@ type Tablet struct {
 	opts     Options
 	backend  storage.Backend // object store for RFile bytes (default: local FS)
 	obsolete map[string]struct{}
+}
+
+// ConditionKind identifies the predicate evaluated by a conditional mutation.
+type ConditionKind int
+
+const (
+	ConditionAbsent ConditionKind = iota + 1
+	ConditionValueEquals
+)
+
+// Condition targets one cell coordinate in the mutation's row. Timestamp nil
+// selects the newest version; a non-nil timestamp selects that exact version.
+type Condition struct {
+	ColumnFamily     []byte
+	ColumnQualifier  []byte
+	ColumnVisibility []byte
+	Timestamp        *int64
+	Kind             ConditionKind
+	Value            []byte
+}
+
+// ConditionalMutation atomically evaluates Conditions and applies Mutation
+// under the tablet's writer lock.
+type ConditionalMutation struct {
+	Mutation   *cclient.Mutation
+	Conditions []Condition
 }
 
 // Options configures a Tablet.
@@ -230,7 +257,10 @@ func Open(dir string, opts Options) (*Tablet, error) {
 func (t *Tablet) Write(mutations []*cclient.Mutation) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	return t.writeLocked(mutations)
+}
 
+func (t *Tablet) writeLocked(mutations []*cclient.Mutation) error {
 	// WAL first — crash-safe
 	if _, err := t.wal.Append(mutations); err != nil {
 		return fmt.Errorf("tablet: wal append: %w", err)
@@ -246,6 +276,95 @@ func (t *Tablet) Write(mutations []*cclient.Mutation) error {
 		}
 	}
 	return nil
+}
+
+// ConditionalWrite evaluates and applies each mutation in request order. The
+// result slice aligns with mutations; false means its conditions did not match.
+func (t *Tablet) ConditionalWrite(mutations []ConditionalMutation) ([]bool, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	results := make([]bool, len(mutations))
+	for i, mutation := range mutations {
+		matched, err := t.conditionsMatchLocked(mutation.Mutation.Row(), mutation.Conditions)
+		if err != nil {
+			return nil, err
+		}
+		if !matched {
+			continue
+		}
+		if _, err := t.wal.Append([]*cclient.Mutation{mutation.Mutation}); err != nil {
+			return nil, fmt.Errorf("tablet: wal append: %w", err)
+		}
+		t.ingestMutation(mutation.Mutation)
+		results[i] = true
+	}
+
+	if t.active.Len() >= t.opts.FlushThreshold {
+		if err := t.flushLocked(); err != nil {
+			return nil, fmt.Errorf("tablet: auto-flush: %w", err)
+		}
+	}
+	return results, nil
+}
+
+func (t *Tablet) conditionsMatchLocked(row []byte, conditions []Condition) (bool, error) {
+	if len(conditions) == 0 {
+		return true, nil
+	}
+	source, closeAll, err := t.sourceLocked(iterrt.IteratorEnvironment{Scope: iterrt.ScopeScan})
+	if err != nil {
+		return false, err
+	}
+	defer closeAll()
+
+	for _, condition := range conditions {
+		start := &wire.Key{
+			Row:              row,
+			ColumnFamily:     condition.ColumnFamily,
+			ColumnQualifier:  condition.ColumnQualifier,
+			ColumnVisibility: condition.ColumnVisibility,
+			Timestamp:        math.MaxInt64,
+			Deleted:          true,
+		}
+		if condition.Timestamp != nil {
+			start.Timestamp = *condition.Timestamp
+		}
+		if err := source.Seek(iterrt.Range{
+			Start: start, StartInclusive: true, InfiniteEnd: true,
+		}, nil, false); err != nil {
+			return false, fmt.Errorf("tablet: condition seek: %w", err)
+		}
+
+		exists := false
+		var value []byte
+		if source.HasTop() {
+			key := source.GetTopKey()
+			sameCoordinate := bytes.Equal(key.Row, row) &&
+				bytes.Equal(key.ColumnFamily, condition.ColumnFamily) &&
+				bytes.Equal(key.ColumnQualifier, condition.ColumnQualifier) &&
+				bytes.Equal(key.ColumnVisibility, condition.ColumnVisibility)
+			sameTimestamp := condition.Timestamp == nil || key.Timestamp == *condition.Timestamp
+			if sameCoordinate && sameTimestamp && !key.Deleted {
+				exists = true
+				value = source.GetTopValue()
+			}
+		}
+
+		switch condition.Kind {
+		case ConditionAbsent:
+			if exists {
+				return false, nil
+			}
+		case ConditionValueEquals:
+			if !exists || !bytes.Equal(value, condition.Value) {
+				return false, nil
+			}
+		default:
+			return false, fmt.Errorf("tablet: unsupported condition kind %d", condition.Kind)
+		}
+	}
+	return true, nil
 }
 
 // Scan returns a Scanner over this tablet's data — the merge of the
@@ -503,11 +622,13 @@ func cloneBytes(b []byte) []byte {
 // stacking the iterator above that cross-tablet merge.
 func (t *Tablet) Source(env iterrt.IteratorEnvironment) (iterrt.SortedKeyValueIterator, func(), error) {
 	t.mu.RLock()
-	// Snapshot memtable iterator + file list under read lock
+	defer t.mu.RUnlock()
+	return t.sourceLocked(env)
+}
+
+func (t *Tablet) sourceLocked(env iterrt.IteratorEnvironment) (iterrt.SortedKeyValueIterator, func(), error) {
 	memIter := t.active.Iterator()
-	filesCopy := make([]string, len(t.files))
-	copy(filesCopy, t.files)
-	t.mu.RUnlock()
+	filesCopy := append([]string(nil), t.files...)
 
 	// Build leaf iterators: one from memtable + one per RFile
 	leaves := []iterrt.SortedKeyValueIterator{memIter}

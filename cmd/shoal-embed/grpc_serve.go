@@ -243,10 +243,20 @@ func (s *embedServer) Write(ctx context.Context, req *embedpb.WriteRequest) (*em
 	if req.Table == "" {
 		return nil, status.Error(codes.InvalidArgument, "table is required")
 	}
-	if err := s.store.Write(ctx, req.Table, req.Mutations); err != nil {
+	results, err := s.store.WriteWithResults(ctx, req.Table, req.Mutations)
+	if errors.Is(err, embedstore.ErrInvalidCondition) {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+	if err != nil {
 		return nil, status.Errorf(codes.Internal, "write: %v", err)
 	}
-	return &embedpb.WriteResponse{Written: int32(len(req.Mutations))}, nil
+	var written int32
+	for _, result := range results {
+		if result.Status == embedpb.MutationStatus_MUTATION_STATUS_ACCEPTED {
+			written++
+		}
+	}
+	return &embedpb.WriteResponse{Written: written, Results: results}, nil
 }
 
 // scanStatusError maps embedstore's validation sentinels onto gRPC codes,

@@ -84,6 +84,10 @@ message CreateTableResponse {
 message Mutation {
   bytes row = 1;
   repeated Entry entries = 2;
+  // Optional compare-and-set predicates evaluated against this row before
+  // any entry is written. All conditions must match for the mutation to be
+  // accepted. An empty list preserves unconditional write behavior.
+  repeated Condition conditions = 3;
 }
 
 message Entry {
@@ -95,13 +99,45 @@ message Entry {
   bool delete = 6;
 }
 
+message Condition {
+  bytes column_family = 1;
+  bytes column_qualifier = 2;
+  // Visibility is part of an Accumulo cell coordinate. Conditions only
+  // inspect versions with this exact visibility; empty means empty visibility.
+  bytes column_visibility = 3;
+  // When present, inspect the exact timestamp. When absent, inspect the newest
+  // version at the coordinate; a newest tombstone makes the coordinate absent.
+  optional int64 timestamp = 4;
+  oneof predicate {
+    // Set true to require that no live value exists at the selected
+    // coordinate/version.
+    bool absent = 5;
+    // Require that the selected live value exactly equals these bytes.
+    bytes value_equals = 6;
+  }
+}
+
 message WriteRequest {
   string table = 1;
   repeated Mutation mutations = 2;
 }
 
+enum MutationStatus {
+  MUTATION_STATUS_UNSPECIFIED = 0;
+  MUTATION_STATUS_ACCEPTED = 1;
+  MUTATION_STATUS_REJECTED = 2;
+}
+
+message MutationResult {
+  MutationStatus status = 1;
+}
+
 message WriteResponse {
+  // Number of accepted mutations. For requests without conditions this
+  // remains equal to len(mutations), preserving the original contract.
   int32 written = 1;
+  // One result per request mutation, in request order.
+  repeated MutationResult results = 2;
 }
 
 // ── Scan ────────────────────────────────────────────────────────
