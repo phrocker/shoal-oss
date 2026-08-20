@@ -50,6 +50,7 @@ func TestSimpleScanReturnsResultAndCloseFailure(t *testing.T) {
 	if got != want {
 		t.Fatalf("result = %p, want %p", got, want)
 	}
+
 	if !errors.Is(err, closeErr) {
 		t.Fatalf("error = %v, want close failure", err)
 	}
@@ -59,6 +60,35 @@ func TestSimpleScanReturnsResultAndCloseFailure(t *testing.T) {
 	}
 	if cleanupErr.ScanID != want.ScanID {
 		t.Fatalf("cleanup scan ID = %d, want %d", cleanupErr.ScanID, want.ScanID)
+	}
+}
+
+func TestSimpleScanDrainsStatefulContinuation(t *testing.T) {
+	rpc := &fakeScanRPC{
+		startResult: &data.InitialScan{
+			ScanID: 23,
+			Result_: &data.ScanResult_{
+				Results: []*data.TKeyValue{{Value: []byte("first")}},
+				More:    true,
+			},
+		},
+		continueResult: &data.ScanResult_{
+			Results: []*data.TKeyValue{{Value: []byte("second")}},
+		},
+	}
+	got, err := (&Client{rpc: rpc}).SimpleScan(context.Background(), SimpleScanRequest{
+		Credentials: &security.TCredentials{},
+		Extent:      &data.TKeyExtent{},
+		Range:       &data.TRange{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ScanID != 0 || got.Result_.More || len(got.Result_.Results) != 2 {
+		t.Fatalf("drained result = %#v", got)
+	}
+	if rpc.continueCalls.Load() != 1 || rpc.closeCalls.Load() != 1 {
+		t.Fatalf("continue/close calls = %d/%d", rpc.continueCalls.Load(), rpc.closeCalls.Load())
 	}
 }
 

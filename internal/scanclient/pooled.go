@@ -41,8 +41,8 @@ type MultiAdapter interface {
 	MultiLifecycle
 }
 
-// SimpleScanLifecycle starts a metadata-style scan through lifecycle and
-// closes its server-side session after the initial batch.
+// SimpleScanLifecycle drains a metadata-style scan through its stateful
+// continuation session, then closes the server-side session.
 func SimpleScanLifecycle(
 	ctx context.Context,
 	lifecycle Lifecycle,
@@ -67,11 +67,27 @@ func SimpleScanLifecycle(
 	if err != nil {
 		return nil, err
 	}
-	if scan != nil && scan.ScanID != 0 {
-		if closeErr := lifecycle.CloseScan(ctx, address, scan.ScanID); closeErr != nil {
-			return scan, &CleanupError{ScanID: scan.ScanID, Err: closeErr}
-		}
+	if scan == nil || scan.ScanID == 0 {
+		return scan, nil
 	}
+	id := scan.ScanID
+	for scan.Result_ != nil && scan.Result_.More {
+		next, continueErr := lifecycle.Continue(ctx, address, id, 0)
+		if continueErr != nil {
+			_ = lifecycle.CloseScan(context.WithoutCancel(ctx), address, id)
+			return nil, continueErr
+		}
+		if next == nil {
+			_ = lifecycle.CloseScan(context.WithoutCancel(ctx), address, id)
+			return nil, errors.New("scanclient: nil continuation result")
+		}
+		scan.Result_.Results = append(scan.Result_.Results, next.Results...)
+		scan.Result_.More = next.More
+	}
+	if closeErr := lifecycle.CloseScan(ctx, address, id); closeErr != nil {
+		return scan, &CleanupError{ScanID: id, Err: closeErr}
+	}
+	scan.ScanID = 0
 	return scan, nil
 }
 
