@@ -7,9 +7,9 @@ import (
 	"os"
 	"sync"
 
-	"github.com/phrocker/shoal/internal/rfile"
-	"github.com/phrocker/shoal/internal/rfile/bcfile/block"
-	"github.com/phrocker/shoal/internal/rfile/wire"
+	"github.com/phrocker/shoal-oss/internal/rfile"
+	"github.com/phrocker/shoal-oss/internal/rfile/bcfile/block"
+	"github.com/phrocker/shoal-oss/internal/rfile/wire"
 )
 
 // Writer appends entries to a new RFile in key order and finalizes it on

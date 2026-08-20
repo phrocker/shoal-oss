@@ -22,7 +22,7 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/phrocker/shoal/internal/engine"
+	"github.com/phrocker/shoal-oss/internal/engine"
 )
 
 // eventSyncConfig configures the in-process event-driven RFile syncer.

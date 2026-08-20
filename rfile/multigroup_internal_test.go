@@ -7,14 +7,14 @@ import (
 	"path/filepath"
 	"testing"
 
-	internalrfile "github.com/phrocker/shoal/internal/rfile"
-	"github.com/phrocker/shoal/internal/rfile/bcfile"
-	"github.com/phrocker/shoal/internal/rfile/bcfile/block"
-	"github.com/phrocker/shoal/internal/rfile/index"
-	"github.com/phrocker/shoal/internal/rfile/relkey"
-	"github.com/phrocker/shoal/internal/rfile/wire"
+	internalrfile "github.com/phrocker/shoal-oss/internal/rfile"
+	"github.com/phrocker/shoal-oss/internal/rfile/bcfile"
+	"github.com/phrocker/shoal-oss/internal/rfile/bcfile/block"
+	"github.com/phrocker/shoal-oss/internal/rfile/index"
+	"github.com/phrocker/shoal-oss/internal/rfile/relkey"
+	"github.com/phrocker/shoal-oss/internal/rfile/wire"
 
-	"github.com/phrocker/shoal/accumulo"
+	"github.com/phrocker/shoal-oss/accumulo"
 )
 
 // groupCell is one cell of a synthetic locality group.

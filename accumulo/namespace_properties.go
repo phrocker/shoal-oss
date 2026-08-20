@@ -5,8 +5,8 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/phrocker/shoal/internal/managerclient"
-	"github.com/phrocker/shoal/internal/zk"
+	"github.com/phrocker/shoal-oss/internal/managerclient"
+	"github.com/phrocker/shoal-oss/internal/zk"
 )
 
 // SetNamespaceProperty sets a namespace-local Accumulo property. An empty

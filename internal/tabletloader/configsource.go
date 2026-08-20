@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"maps"
 
-	"github.com/phrocker/shoal/internal/managerclient"
+	"github.com/phrocker/shoal-oss/internal/managerclient"
 )
 
 // ManagerConfigurationClient is the narrow ClientService surface needed to

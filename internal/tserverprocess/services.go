@@ -4,11 +4,11 @@ import (
 	"errors"
 
 	"github.com/apache/thrift/lib/go/thrift"
-	"github.com/phrocker/shoal/internal/ingestservice"
-	"github.com/phrocker/shoal/internal/thrift/gen/tabletingest"
-	"github.com/phrocker/shoal/internal/thrift/gen/tabletscan"
-	"github.com/phrocker/shoal/internal/tserver"
-	"github.com/phrocker/shoal/internal/tserverrpc"
+	"github.com/phrocker/shoal-oss/internal/ingestservice"
+	"github.com/phrocker/shoal-oss/internal/thrift/gen/tabletingest"
+	"github.com/phrocker/shoal-oss/internal/thrift/gen/tabletscan"
+	"github.com/phrocker/shoal-oss/internal/tserver"
+	"github.com/phrocker/shoal-oss/internal/tserverrpc"
 )
 
 // Services registers and advertises only fully initialized runtime

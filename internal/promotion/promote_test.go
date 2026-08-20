@@ -9,11 +9,11 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/phrocker/shoal/accumulo"
-	"github.com/phrocker/shoal/internal/engine"
-	"github.com/phrocker/shoal/internal/storage"
-	"github.com/phrocker/shoal/internal/storage/local"
-	"github.com/phrocker/shoal/internal/storage/memory"
+	"github.com/phrocker/shoal-oss/accumulo"
+	"github.com/phrocker/shoal-oss/internal/engine"
+	"github.com/phrocker/shoal-oss/internal/storage"
+	"github.com/phrocker/shoal-oss/internal/storage/local"
+	"github.com/phrocker/shoal-oss/internal/storage/memory"
 )
 
 // fakePromoter records AddTableSplitsForTable and BulkImport calls instead of

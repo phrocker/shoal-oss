@@ -25,7 +25,7 @@ import (
 	"sort"
 	"strconv"
 
-	"github.com/phrocker/shoal/internal/rfile/wire"
+	"github.com/phrocker/shoal-oss/internal/rfile/wire"
 )
 
 // GraphAggregationIterator is a deterministic read-path aggregation iterator.

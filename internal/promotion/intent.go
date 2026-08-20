@@ -13,9 +13,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/phrocker/shoal/accumulo"
-	"github.com/phrocker/shoal/internal/engine"
-	"github.com/phrocker/shoal/internal/storage"
+	"github.com/phrocker/shoal-oss/accumulo"
+	"github.com/phrocker/shoal-oss/internal/engine"
+	"github.com/phrocker/shoal-oss/internal/storage"
 )
 
 var (

@@ -14,7 +14,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/phrocker/shoal/accumulo"
+	"github.com/phrocker/shoal-oss/accumulo"
 )
 
 //export shoal_connector_list_tables

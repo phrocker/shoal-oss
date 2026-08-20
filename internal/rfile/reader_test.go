@@ -9,11 +9,11 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/phrocker/shoal/internal/rfile/bcfile"
-	"github.com/phrocker/shoal/internal/rfile/bcfile/block"
-	"github.com/phrocker/shoal/internal/rfile/index"
-	"github.com/phrocker/shoal/internal/rfile/relkey"
-	"github.com/phrocker/shoal/internal/rfile/wire"
+	"github.com/phrocker/shoal-oss/internal/rfile/bcfile"
+	"github.com/phrocker/shoal-oss/internal/rfile/bcfile/block"
+	"github.com/phrocker/shoal-oss/internal/rfile/index"
+	"github.com/phrocker/shoal-oss/internal/rfile/relkey"
+	"github.com/phrocker/shoal-oss/internal/rfile/wire"
 )
 
 // cell is a (Key, Value) pair for fixture building.
@@ -379,9 +379,9 @@ func TestReader_SeekRow_BeforeFirst(t *testing.T) {
 // first — exercises block-skip during seek.
 func TestReader_SeekIntoLaterBlock(t *testing.T) {
 	blocks := [][]cell{
-		{mkCell("a", "1"), mkCell("b", "2")},        // block 0: a..b
-		{mkCell("d", "3"), mkCell("e", "4")},        // block 1: d..e
-		{mkCell("g", "5"), mkCell("h", "6")},        // block 2: g..h
+		{mkCell("a", "1"), mkCell("b", "2")}, // block 0: a..b
+		{mkCell("d", "3"), mkCell("e", "4")}, // block 1: d..e
+		{mkCell("g", "5"), mkCell("h", "6")}, // block 2: g..h
 	}
 	r := openSynthetic(t, blocks)
 	defer r.Close()

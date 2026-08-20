@@ -24,8 +24,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/phrocker/shoal/internal/embedpb"
-	"github.com/phrocker/shoal/internal/engine"
+	"github.com/phrocker/shoal-oss/internal/embedpb"
+	"github.com/phrocker/shoal-oss/internal/engine"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )

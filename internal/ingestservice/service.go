@@ -17,13 +17,13 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/phrocker/shoal/internal/cclient"
-	"github.com/phrocker/shoal/internal/ingestrouter"
-	clientgen "github.com/phrocker/shoal/internal/thrift/gen/client"
-	"github.com/phrocker/shoal/internal/thrift/gen/data"
-	"github.com/phrocker/shoal/internal/thrift/gen/security"
-	"github.com/phrocker/shoal/internal/thrift/gen/tabletingest"
-	"github.com/phrocker/shoal/internal/thrift/gen/tabletserver"
+	"github.com/phrocker/shoal-oss/internal/cclient"
+	"github.com/phrocker/shoal-oss/internal/ingestrouter"
+	clientgen "github.com/phrocker/shoal-oss/internal/thrift/gen/client"
+	"github.com/phrocker/shoal-oss/internal/thrift/gen/data"
+	"github.com/phrocker/shoal-oss/internal/thrift/gen/security"
+	"github.com/phrocker/shoal-oss/internal/thrift/gen/tabletingest"
+	"github.com/phrocker/shoal-oss/internal/thrift/gen/tabletserver"
 )
 
 var (

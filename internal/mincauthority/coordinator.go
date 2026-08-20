@@ -34,11 +34,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/phrocker/shoal/internal/ingestrouter"
-	"github.com/phrocker/shoal/internal/rfile"
-	"github.com/phrocker/shoal/internal/rfile/bcfile"
-	"github.com/phrocker/shoal/internal/rfile/bcfile/block"
-	"github.com/phrocker/shoal/internal/walauthority"
+	"github.com/phrocker/shoal-oss/internal/ingestrouter"
+	"github.com/phrocker/shoal-oss/internal/rfile"
+	"github.com/phrocker/shoal-oss/internal/rfile/bcfile"
+	"github.com/phrocker/shoal-oss/internal/rfile/bcfile/block"
+	"github.com/phrocker/shoal-oss/internal/walauthority"
 )
 
 var (

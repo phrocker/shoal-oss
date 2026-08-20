@@ -5,10 +5,10 @@ import (
 	"errors"
 	"fmt"
 
-	clientgen "github.com/phrocker/shoal/internal/thrift/gen/client"
-	"github.com/phrocker/shoal/internal/thrift/gen/data"
-	"github.com/phrocker/shoal/internal/thrift/gen/manager"
-	"github.com/phrocker/shoal/internal/thrift/gen/security"
+	clientgen "github.com/phrocker/shoal-oss/internal/thrift/gen/client"
+	"github.com/phrocker/shoal-oss/internal/thrift/gen/data"
+	"github.com/phrocker/shoal-oss/internal/thrift/gen/manager"
+	"github.com/phrocker/shoal-oss/internal/thrift/gen/security"
 )
 
 // SplitSucceeded is the exact status string Accumulo 4's TABLE_SPLIT FATE

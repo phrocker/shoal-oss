@@ -12,7 +12,7 @@ import (
 	"errors"
 	"unsafe"
 
-	"github.com/phrocker/shoal/accumulo"
+	"github.com/phrocker/shoal-oss/accumulo"
 )
 
 //export shoal_logging_set_level

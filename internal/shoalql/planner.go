@@ -8,8 +8,8 @@ import (
 	"math"
 	"strings"
 
-	"github.com/phrocker/shoal/internal/iterrt"
-	"github.com/phrocker/shoal/internal/vectorindex"
+	"github.com/phrocker/shoal-oss/internal/iterrt"
+	"github.com/phrocker/shoal-oss/internal/vectorindex"
 )
 
 // planner.go lowers a parsed *SelectStmt against a TableBinding into a

@@ -5,9 +5,9 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/phrocker/shoal/accumulo"
-	publichdfs "github.com/phrocker/shoal/hdfs"
-	"github.com/phrocker/shoal/internal/storage"
+	"github.com/phrocker/shoal-oss/accumulo"
+	publichdfs "github.com/phrocker/shoal-oss/hdfs"
+	"github.com/phrocker/shoal-oss/internal/storage"
 )
 
 func TestCompatibilityErrorClasses(t *testing.T) {

@@ -5,8 +5,8 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/phrocker/shoal/internal/ingestrouter"
-	"github.com/phrocker/shoal/internal/tserver"
+	"github.com/phrocker/shoal-oss/internal/ingestrouter"
+	"github.com/phrocker/shoal-oss/internal/tserver"
 )
 
 func TestHostedOwnerVerifierRejectsUnhostedAndLostAssignments(t *testing.T) {

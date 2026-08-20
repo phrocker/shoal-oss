@@ -34,9 +34,9 @@ import (
 
 	"google.golang.org/grpc"
 
-	"github.com/phrocker/shoal/internal/embedpb"
-	"github.com/phrocker/shoal/internal/engine"
-	"github.com/phrocker/shoal/internal/obs"
+	"github.com/phrocker/shoal-oss/internal/embedpb"
+	"github.com/phrocker/shoal-oss/internal/engine"
+	"github.com/phrocker/shoal-oss/internal/obs"
 )
 
 // cmdUp is the one-command local profile: it opens the engine, auto-provisions

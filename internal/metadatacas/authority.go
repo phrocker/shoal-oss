@@ -14,17 +14,17 @@ import (
 
 	gozk "github.com/go-zookeeper/zk"
 
-	"github.com/phrocker/shoal/internal/cclient"
-	"github.com/phrocker/shoal/internal/hostedingest"
-	"github.com/phrocker/shoal/internal/ingestclient"
-	"github.com/phrocker/shoal/internal/ingestrouter"
-	"github.com/phrocker/shoal/internal/metadata"
-	"github.com/phrocker/shoal/internal/mincauthority"
-	"github.com/phrocker/shoal/internal/tabletloader"
-	"github.com/phrocker/shoal/internal/thrift/gen/data"
-	"github.com/phrocker/shoal/internal/tserver"
-	"github.com/phrocker/shoal/internal/walauthority"
-	"github.com/phrocker/shoal/internal/zk"
+	"github.com/phrocker/shoal-oss/internal/cclient"
+	"github.com/phrocker/shoal-oss/internal/hostedingest"
+	"github.com/phrocker/shoal-oss/internal/ingestclient"
+	"github.com/phrocker/shoal-oss/internal/ingestrouter"
+	"github.com/phrocker/shoal-oss/internal/metadata"
+	"github.com/phrocker/shoal-oss/internal/mincauthority"
+	"github.com/phrocker/shoal-oss/internal/tabletloader"
+	"github.com/phrocker/shoal-oss/internal/thrift/gen/data"
+	"github.com/phrocker/shoal-oss/internal/tserver"
+	"github.com/phrocker/shoal-oss/internal/walauthority"
+	"github.com/phrocker/shoal-oss/internal/zk"
 )
 
 var (

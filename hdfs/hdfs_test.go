@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/phrocker/shoal/internal/storage"
-	internalhdfs "github.com/phrocker/shoal/internal/storage/hdfs"
+	"github.com/phrocker/shoal-oss/internal/storage"
+	internalhdfs "github.com/phrocker/shoal-oss/internal/storage/hdfs"
 )
 
 func TestClientTypedRoundTripListRenameRemove(t *testing.T) {

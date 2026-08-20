@@ -10,8 +10,8 @@ import (
 	"sort"
 	"time"
 
-	"github.com/phrocker/shoal/internal/storage"
-	"github.com/phrocker/shoal/internal/tablet"
+	"github.com/phrocker/shoal-oss/internal/storage"
+	"github.com/phrocker/shoal-oss/internal/tablet"
 )
 
 // SyncStateVersion is the on-disk schema version of a SyncState file.

@@ -20,8 +20,8 @@ package tablet
 import (
 	"math/rand"
 
-	"github.com/phrocker/shoal/internal/iterrt"
-	"github.com/phrocker/shoal/internal/rfile/wire"
+	"github.com/phrocker/shoal-oss/internal/iterrt"
+	"github.com/phrocker/shoal-oss/internal/rfile/wire"
 )
 
 // skiplistMemtable is a direct-insert wrapper around a skiplist for the
@@ -165,7 +165,7 @@ func (it *slIter) checkEnd() {
 	}
 }
 
-func (it *slIter) HasTop() bool         { return it.cur != nil }
+func (it *slIter) HasTop() bool           { return it.cur != nil }
 func (it *slIter) GetTopKey() *iterrt.Key { return &it.cur.key }
 func (it *slIter) GetTopValue() []byte    { return it.cur.value }
 

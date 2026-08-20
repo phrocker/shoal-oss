@@ -12,7 +12,7 @@ import (
 	"fmt"
 	"unsafe"
 
-	"github.com/phrocker/shoal/accumulo"
+	"github.com/phrocker/shoal-oss/accumulo"
 )
 
 func bytesString(value C.shoal_bytes, name string) (string, error) {

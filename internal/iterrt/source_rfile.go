@@ -22,7 +22,7 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/phrocker/shoal/internal/rfile"
+	"github.com/phrocker/shoal-oss/internal/rfile"
 )
 
 // RFileOpener re-opens an independent *rfile.Reader over the same

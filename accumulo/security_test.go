@@ -10,9 +10,9 @@ import (
 
 	"github.com/apache/thrift/lib/go/thrift"
 
-	"github.com/phrocker/shoal/internal/cred"
-	"github.com/phrocker/shoal/internal/managerclient"
-	"github.com/phrocker/shoal/internal/thrift/gen/security"
+	"github.com/phrocker/shoal-oss/internal/cred"
+	"github.com/phrocker/shoal-oss/internal/managerclient"
+	"github.com/phrocker/shoal-oss/internal/thrift/gen/security"
 )
 
 func TestSecurityPermissionWireOrdinals(t *testing.T) {

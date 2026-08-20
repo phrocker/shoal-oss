@@ -7,8 +7,8 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/phrocker/shoal/internal/rfile/wire"
-	"github.com/phrocker/shoal/internal/rfile/bcfile"
+	"github.com/phrocker/shoal-oss/internal/rfile/bcfile"
+	"github.com/phrocker/shoal-oss/internal/rfile/wire"
 )
 
 // keyRow is a one-shot helper for IndexEntries — most tests only care
@@ -226,16 +226,16 @@ func TestSeek_TwoLevelDescent(t *testing.T) {
 	w := NewWalker(root, lr)
 
 	cases := []struct {
-		target  string
-		want    string // expected leaf entry's row
+		target   string
+		want     string // expected leaf entry's row
 		expCalls int64
 	}{
-		{"a", "a", 1},        // descend through "g" entry, find "a" in leafG
-		{"g", "g", 1},        // descend through "g" entry, find "g" exact
-		{"h", "m", 1},        // root's "p" entry, leafP's "m" (smallest >= "h")
-		{"p", "p", 1},        // root's "p" entry, leafP's "p" exact
-		{"q", "x", 1},        // root's "z" entry, leafZ's "x"
-		{"z", "z", 1},        // root's "z" entry, leafZ's "z"
+		{"a", "a", 1}, // descend through "g" entry, find "a" in leafG
+		{"g", "g", 1}, // descend through "g" entry, find "g" exact
+		{"h", "m", 1}, // root's "p" entry, leafP's "m" (smallest >= "h")
+		{"p", "p", 1}, // root's "p" entry, leafP's "p" exact
+		{"q", "x", 1}, // root's "z" entry, leafZ's "x"
+		{"z", "z", 1}, // root's "z" entry, leafZ's "z"
 	}
 	for _, c := range cases {
 		t.Run(c.target, func(t *testing.T) {

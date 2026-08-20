@@ -8,8 +8,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/phrocker/shoal/internal/thrift/gen/data"
-	"github.com/phrocker/shoal/internal/thrift/gen/security"
+	"github.com/phrocker/shoal-oss/internal/thrift/gen/data"
+	"github.com/phrocker/shoal-oss/internal/thrift/gen/security"
 )
 
 func TestDial_RejectsEmptyArgs(t *testing.T) {

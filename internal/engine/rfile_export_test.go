@@ -12,11 +12,11 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/phrocker/shoal/internal/cclient"
-	"github.com/phrocker/shoal/internal/iterrt"
-	"github.com/phrocker/shoal/internal/storage"
-	"github.com/phrocker/shoal/internal/storage/memory"
-	"github.com/phrocker/shoal/internal/tablet"
+	"github.com/phrocker/shoal-oss/internal/cclient"
+	"github.com/phrocker/shoal-oss/internal/iterrt"
+	"github.com/phrocker/shoal-oss/internal/storage"
+	"github.com/phrocker/shoal-oss/internal/storage/memory"
+	"github.com/phrocker/shoal-oss/internal/tablet"
 )
 
 type exportSourceBackend struct{}

@@ -13,14 +13,14 @@ import (
 	"testing"
 	"time"
 
-	"github.com/phrocker/shoal/internal/compactexec"
-	"github.com/phrocker/shoal/internal/compactjob"
-	"github.com/phrocker/shoal/internal/managerclient"
-	"github.com/phrocker/shoal/internal/thrift/gen/client"
-	"github.com/phrocker/shoal/internal/thrift/gen/compactioncoordinator"
-	"github.com/phrocker/shoal/internal/thrift/gen/data"
-	"github.com/phrocker/shoal/internal/thrift/gen/security"
-	"github.com/phrocker/shoal/internal/thrift/gen/tabletserver"
+	"github.com/phrocker/shoal-oss/internal/compactexec"
+	"github.com/phrocker/shoal-oss/internal/compactjob"
+	"github.com/phrocker/shoal-oss/internal/managerclient"
+	"github.com/phrocker/shoal-oss/internal/thrift/gen/client"
+	"github.com/phrocker/shoal-oss/internal/thrift/gen/compactioncoordinator"
+	"github.com/phrocker/shoal-oss/internal/thrift/gen/data"
+	"github.com/phrocker/shoal-oss/internal/thrift/gen/security"
+	"github.com/phrocker/shoal-oss/internal/thrift/gen/tabletserver"
 )
 
 type staticTableOptions struct {

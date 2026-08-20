@@ -35,8 +35,8 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/phrocker/shoal/internal/cclient"
-	"github.com/phrocker/shoal/internal/rfile/wire"
+	"github.com/phrocker/shoal-oss/internal/cclient"
+	"github.com/phrocker/shoal-oss/internal/rfile/wire"
 )
 
 // logFileHeaderV4 is the magic string DfsLogger writes at the head of every
@@ -153,8 +153,8 @@ func newDataInput(r io.Reader) *dataInput {
 	return &dataInput{r: bufio.NewReader(r)}
 }
 
-func (d *dataInput) Read(p []byte) (int, error)  { return d.r.Read(p) }
-func (d *dataInput) ReadByte() (byte, error)     { return d.r.ReadByte() }
+func (d *dataInput) Read(p []byte) (int, error) { return d.r.Read(p) }
+func (d *dataInput) ReadByte() (byte, error)    { return d.r.ReadByte() }
 
 func (d *dataInput) readFull(p []byte) error {
 	_, err := io.ReadFull(d.r, p)

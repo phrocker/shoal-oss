@@ -27,10 +27,10 @@ import (
 	"reflect"
 	"strings"
 
-	"github.com/phrocker/shoal/internal/embedpb"
-	"github.com/phrocker/shoal/internal/embedstore"
-	"github.com/phrocker/shoal/internal/engine"
-	"github.com/phrocker/shoal/internal/tablet"
+	"github.com/phrocker/shoal-oss/internal/embedpb"
+	"github.com/phrocker/shoal-oss/internal/embedstore"
+	"github.com/phrocker/shoal-oss/internal/engine"
+	"github.com/phrocker/shoal-oss/internal/tablet"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )

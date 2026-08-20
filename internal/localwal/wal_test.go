@@ -23,7 +23,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/phrocker/shoal/internal/cclient"
+	"github.com/phrocker/shoal-oss/internal/cclient"
 )
 
 func TestWAL_AppendReplay(t *testing.T) {

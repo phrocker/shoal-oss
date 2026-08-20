@@ -84,9 +84,9 @@ import (
 	"time"
 	"unicode/utf16"
 
-	"github.com/phrocker/shoal/internal/iterrt"
-	nslookup "github.com/phrocker/shoal/internal/namespaces"
-	"github.com/phrocker/shoal/internal/tablenames"
+	"github.com/phrocker/shoal-oss/internal/iterrt"
+	nslookup "github.com/phrocker/shoal-oss/internal/namespaces"
+	"github.com/phrocker/shoal-oss/internal/tablenames"
 )
 
 // ClassAllowlist is retained for API compatibility. It is generated from the

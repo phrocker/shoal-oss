@@ -28,8 +28,8 @@ import (
 
 	"github.com/apache/thrift/lib/go/thrift"
 
-	"github.com/phrocker/shoal/internal/protocol"
-	"github.com/phrocker/shoal/internal/thrift/gen/compactioncoordinator"
+	"github.com/phrocker/shoal-oss/internal/protocol"
+	"github.com/phrocker/shoal-oss/internal/thrift/gen/compactioncoordinator"
 )
 
 // coordinatorServiceName is the multiplex name the manager registers

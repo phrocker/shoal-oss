@@ -10,35 +10,35 @@
       "gate": "publication",
       "kind": "go-test",
       "reference": "internal/compactexec/executor_test.go#TestExecutePublishesDeterministicOutputAndStats",
-      "source_sha256": "e69bb2790af7396a37eee7e6da71d5e1ef9fc7d067e4e547ed693be2a601c790",
+      "source_sha256": "f0443ee8fff4028e30ff0c53504c2922515b24e4563b8650f962c3ff915c8e49",
       "replay_command": ["go", "test", "./internal/compactexec", "-run", "^TestExecutePublishesDeterministicOutputAndStats$", "-count=1"]
     },
     {
       "gate": "completion",
       "kind": "go-test",
       "reference": "internal/compactexec/executor_test.go#TestCompletionAdapterUsesExistingAccumuloContract",
-      "source_sha256": "e69bb2790af7396a37eee7e6da71d5e1ef9fc7d067e4e547ed693be2a601c790",
+      "source_sha256": "f0443ee8fff4028e30ff0c53504c2922515b24e4563b8650f962c3ff915c8e49",
       "replay_command": ["go", "test", "./internal/compactexec", "-run", "^TestCompletionAdapterUsesExistingAccumuloContract$", "-count=1"]
     },
     {
       "gate": "cancellation",
       "kind": "go-test",
       "reference": "internal/compactexec/executor_test.go#TestCancellationNeverPublishes",
-      "source_sha256": "e69bb2790af7396a37eee7e6da71d5e1ef9fc7d067e4e547ed693be2a601c790",
+      "source_sha256": "f0443ee8fff4028e30ff0c53504c2922515b24e4563b8650f962c3ff915c8e49",
       "replay_command": ["go", "test", "./internal/compactexec", "-run", "^TestCancellationNeverPublishes$", "-count=1"]
     },
     {
       "gate": "restart-reconciliation",
       "kind": "go-test",
       "reference": "cmd/shoal-compactor/worker_test.go#TestWorkerRestartCompletesUnattemptedIntentOnce",
-      "source_sha256": "a6bffa781da0108bc949cb13f0cacafcb754028249227582e98932276f996aaa",
+      "source_sha256": "d5ba932386b7e73230622f2d040d2fb2877475857777ca4444ed5df13b703fed",
       "replay_command": ["go", "test", "./cmd/shoal-compactor", "-run", "^TestWorkerRestartCompletesUnattemptedIntentOnce$", "-count=1"]
     },
     {
       "gate": "fenced-input",
       "kind": "go-test",
       "reference": "internal/compactjob/compactjob_test.go#TestTranslateRefusesFencedInput",
-      "source_sha256": "aa9eb7bb8eafb0746744740ad57e1568c80efb2d578921646877649745fe8173",
+      "source_sha256": "2f26bf15627daa9722f8d5d13c3c284dad7308cab227006f5e5c70f83fcfc039",
       "replay_command": ["go", "test", "./internal/compactjob", "-run", "^TestTranslateRefusesFencedInput$", "-count=1"]
     }
   ]

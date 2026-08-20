@@ -6,7 +6,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/phrocker/shoal/internal/embedpb"
+	"github.com/phrocker/shoal-oss/internal/embedpb"
 )
 
 type FakeStore struct {

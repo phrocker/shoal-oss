@@ -10,7 +10,7 @@
       "gate": "crud",
       "kind": "go-test",
       "reference": "accumulo/table_admin_test.go#TestTableMutationsUseAccumulo4FATEArguments",
-      "source_sha256": "8e3639763f27b17f8defe50686a47a2d38deb17072d1c03dce6170ccece85042",
+      "source_sha256": "a1fb85d77031a26517b3c595dc50b0e54f4232b36ab4d2666f5fe630fb2bf50f",
       "replay_command": ["go", "test", "./accumulo", "-run", "^TestTableMutationsUseAccumulo4FATEArguments$", "-count=1"]
     },
     {
@@ -24,7 +24,7 @@
       "gate": "range",
       "kind": "go-test",
       "reference": "accumulo/scanner_test.go#TestRangeWireBoundaries",
-      "source_sha256": "e75d813a6517ff51e19b317fee6e01817335ba603b81f1deedb2def6974c1d7b",
+      "source_sha256": "49a2b1f342f77cfba4f0121ec83be6e1e40ddfe37da3d1ebac470b80c2e2e8e9",
       "replay_command": ["go", "test", "./accumulo", "-run", "^TestRangeWireBoundaries$", "-count=1"]
     }
   ]

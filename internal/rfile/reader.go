@@ -7,13 +7,13 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/phrocker/shoal/internal/cache"
-	"github.com/phrocker/shoal/internal/rfile/adjacency"
-	"github.com/phrocker/shoal/internal/rfile/bcfile"
-	"github.com/phrocker/shoal/internal/rfile/bcfile/block"
-	"github.com/phrocker/shoal/internal/rfile/blockmeta"
-	"github.com/phrocker/shoal/internal/rfile/index"
-	"github.com/phrocker/shoal/internal/rfile/relkey"
+	"github.com/phrocker/shoal-oss/internal/cache"
+	"github.com/phrocker/shoal-oss/internal/rfile/adjacency"
+	"github.com/phrocker/shoal-oss/internal/rfile/bcfile"
+	"github.com/phrocker/shoal-oss/internal/rfile/bcfile/block"
+	"github.com/phrocker/shoal-oss/internal/rfile/blockmeta"
+	"github.com/phrocker/shoal-oss/internal/rfile/index"
+	"github.com/phrocker/shoal-oss/internal/rfile/relkey"
 )
 
 // IndexMetaBlockName is the BCFile meta-block name under which RFile

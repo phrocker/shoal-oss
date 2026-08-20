@@ -20,8 +20,8 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/phrocker/shoal/internal/ingestrouter"
-	"github.com/phrocker/shoal/internal/tserver"
+	"github.com/phrocker/shoal-oss/internal/ingestrouter"
+	"github.com/phrocker/shoal-oss/internal/tserver"
 )
 
 // HostedOwnerVerifier binds minor-compaction authority to the exact hosted

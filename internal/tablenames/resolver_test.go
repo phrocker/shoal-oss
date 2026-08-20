@@ -8,7 +8,7 @@ import (
 	"sync"
 	"testing"
 
-	nslookup "github.com/phrocker/shoal/internal/namespaces"
+	nslookup "github.com/phrocker/shoal-oss/internal/namespaces"
 )
 
 type fakeLocator struct {

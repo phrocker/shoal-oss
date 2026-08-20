@@ -5,7 +5,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/phrocker/shoal/accumulo"
+	"github.com/phrocker/shoal-oss/accumulo"
 )
 
 func TestOwnedKeyStateConcurrentGetSet(t *testing.T) {

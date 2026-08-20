@@ -8,11 +8,11 @@ import (
 	"math"
 	"testing"
 
-	"github.com/phrocker/shoal/internal/cache"
-	"github.com/phrocker/shoal/internal/ivfpq"
-	"github.com/phrocker/shoal/internal/metadata"
-	"github.com/phrocker/shoal/internal/storage/memory"
-	"github.com/phrocker/shoal/internal/thrift/gen/data"
+	"github.com/phrocker/shoal-oss/internal/cache"
+	"github.com/phrocker/shoal-oss/internal/ivfpq"
+	"github.com/phrocker/shoal-oss/internal/metadata"
+	"github.com/phrocker/shoal-oss/internal/storage/memory"
+	"github.com/phrocker/shoal-oss/internal/thrift/gen/data"
 )
 
 // TestStartScan_WithIvfPqIterator end-to-end checks the iterator hook:
@@ -79,10 +79,10 @@ func TestStartScan_WithIvfPqIterator(t *testing.T) {
 	}
 	ssio := map[string]map[string]string{
 		"ivfPqAdc": {
-			ivfpq.OptQuery:       base64.StdEncoding.EncodeToString(queryBuf),
-			ivfpq.OptPQCodebook:  base64.StdEncoding.EncodeToString(pqBuf.Bytes()),
-			ivfpq.OptTopK:        "2",
-			ivfpq.OptThreshold:   "-1e30",
+			ivfpq.OptQuery:      base64.StdEncoding.EncodeToString(queryBuf),
+			ivfpq.OptPQCodebook: base64.StdEncoding.EncodeToString(pqBuf.Bytes()),
+			ivfpq.OptTopK:       "2",
+			ivfpq.OptThreshold:  "-1e30",
 		},
 	}
 

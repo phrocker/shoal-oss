@@ -6,9 +6,9 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/phrocker/shoal/internal/scanclient"
-	"github.com/phrocker/shoal/internal/thrift/gen/data"
-	"github.com/phrocker/shoal/internal/thrift/gen/tabletserver"
+	"github.com/phrocker/shoal-oss/internal/scanclient"
+	"github.com/phrocker/shoal-oss/internal/thrift/gen/data"
+	"github.com/phrocker/shoal-oss/internal/thrift/gen/tabletserver"
 )
 
 const defaultScannerBatchSize int32 = 1024

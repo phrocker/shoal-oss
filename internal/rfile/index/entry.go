@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/phrocker/shoal/internal/rfile/wire"
-	"github.com/phrocker/shoal/internal/rfile/bcfile"
+	"github.com/phrocker/shoal-oss/internal/rfile/bcfile"
+	"github.com/phrocker/shoal-oss/internal/rfile/wire"
 )
 
 // IndexEntry points to one data block (or, at non-leaf levels of a

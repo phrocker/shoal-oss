@@ -23,7 +23,7 @@ THRIFT_VERSION        := 0.17.0
 THRIFT                ?= thrift
 THRIFT_IDL            := internal/thrift/idl
 THRIFT_OUT            := internal/thrift/gen
-THRIFT_PACKAGE_PREFIX := github.com/phrocker/shoal/internal/thrift/gen/
+THRIFT_PACKAGE_PREFIX := github.com/phrocker/shoal-oss/internal/thrift/gen/
 
 GOOS := $(shell go env GOOS)
 ifeq ($(GOOS),windows)
@@ -245,8 +245,20 @@ docs-validate:
 	python docs/test_validate_sharkbite_matrix.py
 	python docs/validate_sharkbite_matrix.py
 
+.PHONY: module-path-verify
+module-path-verify:
+	@test "$$(GOWORK=off go list -m -f '{{.Path}}')" = "github.com/phrocker/shoal-oss" || { \
+	  echo "go.mod must declare module github.com/phrocker/shoal-oss"; \
+	  exit 1; \
+	}
+	@if git grep -n -E 'github\.com/phrocker/shoal([^[:alnum:]_-]|$$)' -- .; then \
+	  echo "stale pre-OSS module references found"; \
+	  exit 1; \
+	fi
+	@echo "module path and repository references are canonical"
+
 .PHONY: validate
-validate: docs-validate
+validate: docs-validate module-path-verify
 
 .PHONY: test
 test:

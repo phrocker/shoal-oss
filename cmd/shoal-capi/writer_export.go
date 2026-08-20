@@ -13,7 +13,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/phrocker/shoal/accumulo"
+	"github.com/phrocker/shoal-oss/accumulo"
 )
 
 const batchWriterFreeTimeout = 5 * time.Second

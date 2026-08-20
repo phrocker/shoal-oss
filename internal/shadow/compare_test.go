@@ -22,9 +22,9 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/phrocker/shoal/internal/iterrt"
-	"github.com/phrocker/shoal/internal/rfile"
-	"github.com/phrocker/shoal/internal/rfile/wire"
+	"github.com/phrocker/shoal-oss/internal/iterrt"
+	"github.com/phrocker/shoal-oss/internal/rfile"
+	"github.com/phrocker/shoal-oss/internal/rfile/wire"
 )
 
 // mkKey builds a key with empty visibility, the common shape in

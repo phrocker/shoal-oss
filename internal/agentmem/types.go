@@ -11,7 +11,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/phrocker/shoal/internal/embedpb"
+	"github.com/phrocker/shoal-oss/internal/embedpb"
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/proto"
 )

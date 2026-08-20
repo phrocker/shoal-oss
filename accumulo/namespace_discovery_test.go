@@ -8,8 +8,8 @@ import (
 	"testing"
 
 	gozk "github.com/go-zookeeper/zk"
-	nslookup "github.com/phrocker/shoal/internal/namespaces"
-	"github.com/phrocker/shoal/internal/zk"
+	nslookup "github.com/phrocker/shoal-oss/internal/namespaces"
+	"github.com/phrocker/shoal-oss/internal/zk"
 )
 
 type namespaceDiscoveryLocator struct {

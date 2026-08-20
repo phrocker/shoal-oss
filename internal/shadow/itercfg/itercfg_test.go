@@ -25,7 +25,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/phrocker/shoal/internal/iterrt"
+	"github.com/phrocker/shoal-oss/internal/iterrt"
 )
 
 // graphVidxStack mirrors a representative graph_vidx iterator config:

@@ -5,10 +5,10 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/phrocker/shoal/internal/cache"
-	"github.com/phrocker/shoal/internal/metadata"
-	"github.com/phrocker/shoal/internal/tablenames"
-	"github.com/phrocker/shoal/internal/zk"
+	"github.com/phrocker/shoal-oss/internal/cache"
+	"github.com/phrocker/shoal-oss/internal/metadata"
+	"github.com/phrocker/shoal-oss/internal/tablenames"
+	"github.com/phrocker/shoal-oss/internal/zk"
 )
 
 // Namespace is an Accumulo namespace identity.

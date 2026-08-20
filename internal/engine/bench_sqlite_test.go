@@ -47,8 +47,8 @@ import (
 
 	_ "github.com/mattn/go-sqlite3"
 
-	"github.com/phrocker/shoal/internal/cclient"
-	"github.com/phrocker/shoal/internal/engine"
+	"github.com/phrocker/shoal-oss/internal/cclient"
+	"github.com/phrocker/shoal-oss/internal/engine"
 )
 
 // openSQLite creates a fresh on-disk WAL-mode database in a temp dir and
@@ -207,8 +207,6 @@ func traverseSQLite(b *testing.B, stmt *sql.Stmt, start, hops int) int {
 	}
 	return len(visited)
 }
-
-
 
 // BenchmarkSQLite_Write_SingleTablet commits one entity (3 cells) per op
 // in autocommit mode — the durable-write-per-call analogue of shoal's

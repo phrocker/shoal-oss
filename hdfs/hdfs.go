@@ -14,7 +14,7 @@ import (
 	"sync"
 	"time"
 
-	internalhdfs "github.com/phrocker/shoal/internal/storage/hdfs"
+	internalhdfs "github.com/phrocker/shoal-oss/internal/storage/hdfs"
 )
 
 var (

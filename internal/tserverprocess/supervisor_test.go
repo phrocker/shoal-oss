@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/phrocker/shoal/internal/tserver"
+	"github.com/phrocker/shoal-oss/internal/tserver"
 )
 
 func TestSupervisorReconnectsAfterLockLossAndStopsOnDrain(t *testing.T) {

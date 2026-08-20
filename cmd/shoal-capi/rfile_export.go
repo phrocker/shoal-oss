@@ -15,7 +15,7 @@ import (
 	"time"
 	"unsafe"
 
-	publicrfile "github.com/phrocker/shoal/rfile"
+	publicrfile "github.com/phrocker/shoal-oss/rfile"
 )
 
 var rfileFreeTimeout = 5 * time.Second

@@ -34,10 +34,10 @@ package memtable
 import (
 	"io"
 
-	"github.com/phrocker/shoal/internal/cclient"
-	"github.com/phrocker/shoal/internal/iterrt"
-	"github.com/phrocker/shoal/internal/qwal"
-	"github.com/phrocker/shoal/internal/rfile/wire"
+	"github.com/phrocker/shoal-oss/internal/cclient"
+	"github.com/phrocker/shoal-oss/internal/iterrt"
+	"github.com/phrocker/shoal-oss/internal/qwal"
+	"github.com/phrocker/shoal-oss/internal/rfile/wire"
 )
 
 // entrySource is the qwal stream shape the Memtable drains — satisfied by

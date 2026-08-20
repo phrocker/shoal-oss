@@ -12,11 +12,11 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
-	"github.com/phrocker/shoal/internal/rfile"
-	"github.com/phrocker/shoal/internal/rfile/bcfile"
-	"github.com/phrocker/shoal/internal/rfile/bcfile/block"
-	"github.com/phrocker/shoal/internal/storage"
-	hdfsstorage "github.com/phrocker/shoal/internal/storage/hdfs"
+	"github.com/phrocker/shoal-oss/internal/rfile"
+	"github.com/phrocker/shoal-oss/internal/rfile/bcfile"
+	"github.com/phrocker/shoal-oss/internal/rfile/bcfile/block"
+	"github.com/phrocker/shoal-oss/internal/storage"
+	hdfsstorage "github.com/phrocker/shoal-oss/internal/storage/hdfs"
 )
 
 func TestLiveBackendAndRFileRoundTrip(t *testing.T) {

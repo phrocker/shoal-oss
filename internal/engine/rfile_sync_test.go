@@ -8,9 +8,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/phrocker/shoal/internal/cclient"
-	"github.com/phrocker/shoal/internal/storage/memory"
-	"github.com/phrocker/shoal/internal/tablet"
+	"github.com/phrocker/shoal-oss/internal/cclient"
+	"github.com/phrocker/shoal-oss/internal/storage/memory"
+	"github.com/phrocker/shoal-oss/internal/tablet"
 )
 
 func writeRow(t *testing.T, eng *Engine, table, row string, i int) {

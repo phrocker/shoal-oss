@@ -7,12 +7,12 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/phrocker/shoal/internal/cclient"
-	"github.com/phrocker/shoal/internal/documentschema"
-	"github.com/phrocker/shoal/internal/engine"
-	"github.com/phrocker/shoal/internal/shoalql"
-	"github.com/phrocker/shoal/internal/tablet"
-	"github.com/phrocker/shoal/internal/vectorindex"
+	"github.com/phrocker/shoal-oss/internal/cclient"
+	"github.com/phrocker/shoal-oss/internal/documentschema"
+	"github.com/phrocker/shoal-oss/internal/engine"
+	"github.com/phrocker/shoal-oss/internal/shoalql"
+	"github.com/phrocker/shoal-oss/internal/tablet"
+	"github.com/phrocker/shoal-oss/internal/vectorindex"
 )
 
 // docSpec describes one document to write across the document and global-index

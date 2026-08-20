@@ -33,8 +33,8 @@ import (
 	"os"
 	"sort"
 
-	"github.com/phrocker/shoal/internal/rfile/bcfile"
-	"github.com/phrocker/shoal/internal/rfile/bcfile/block"
+	"github.com/phrocker/shoal-oss/internal/rfile/bcfile"
+	"github.com/phrocker/shoal-oss/internal/rfile/bcfile/block"
 )
 
 // cellStreamMagic / cellStreamVersion gate the shared cell-stream wire

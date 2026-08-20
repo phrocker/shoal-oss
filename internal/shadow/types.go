@@ -27,7 +27,7 @@
 // can race compactions in parallel without sharing state.
 package shadow
 
-import "github.com/phrocker/shoal/internal/iterrt"
+import "github.com/phrocker/shoal-oss/internal/iterrt"
 
 // CompareSpec describes one shadow-comparison unit. Fields mirror
 // compaction.Spec — the oracle runs the same iterator pipeline on the
@@ -132,9 +132,9 @@ type T1Result struct {
 // T2Result reports cell-sequence equivalence between shoal's and Java's
 // output. CellSeqDiff is the first divergence found, or "" on full match.
 type T2Result struct {
-	Attempted    bool
-	Passed       bool
-	CellSeqDiff  string
+	Attempted   bool
+	Passed      bool
+	CellSeqDiff string
 	// FirstDivergenceIndex is -1 on full match.
 	FirstDivergenceIndex int
 }
@@ -144,10 +144,10 @@ type T2Result struct {
 // divergence is when seek-at-probe-key returns different (key, value)
 // pairs.
 type T3Result struct {
-	Attempted     bool
-	LookupsTotal  int
+	Attempted      bool
+	LookupsTotal   int
 	LookupsMatched int
-	Divergences   []LookupDivergence
+	Divergences    []LookupDivergence
 }
 
 // LookupDivergence captures one (probe, shoal_result, java_result) tuple
@@ -155,8 +155,8 @@ type T3Result struct {
 // keep at most 32 divergences to bound memory; the count drives the
 // pass/fail decision.
 type LookupDivergence struct {
-	ProbeKey     string // hex-or-printable rendering
-	Diff         string // human-readable explanation
+	ProbeKey string // hex-or-printable rendering
+	Diff     string // human-readable explanation
 }
 
 // RFileSummary is the T4 informational shape — per-file statistics that

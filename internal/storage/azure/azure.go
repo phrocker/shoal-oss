@@ -70,7 +70,7 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/service"
 	"github.com/google/uuid"
 
-	shstorage "github.com/phrocker/shoal/internal/storage"
+	shstorage "github.com/phrocker/shoal-oss/internal/storage"
 )
 
 // Backend opens Azure blobs via a shared *service.Client. Safe for concurrent

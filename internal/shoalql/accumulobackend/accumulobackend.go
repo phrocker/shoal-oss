@@ -8,10 +8,10 @@ import (
 	"sort"
 	"time"
 
-	"github.com/phrocker/shoal/accumulo"
-	"github.com/phrocker/shoal/internal/iterrt"
-	"github.com/phrocker/shoal/internal/shoalql"
-	"github.com/phrocker/shoal/internal/vectorindex"
+	"github.com/phrocker/shoal-oss/accumulo"
+	"github.com/phrocker/shoal-oss/internal/iterrt"
+	"github.com/phrocker/shoal-oss/internal/shoalql"
+	"github.com/phrocker/shoal-oss/internal/vectorindex"
 )
 
 // ErrHistoricalVersionsUnavailable prevents a standard version-pruned

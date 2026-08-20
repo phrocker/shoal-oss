@@ -21,8 +21,8 @@ import (
 	"context"
 	"testing"
 
-	"github.com/phrocker/shoal/internal/embedpb"
-	"github.com/phrocker/shoal/internal/graphschema"
+	"github.com/phrocker/shoal-oss/internal/embedpb"
+	"github.com/phrocker/shoal-oss/internal/graphschema"
 )
 
 // seedBruteForceVectors writes one full-precision vec: cell per source row into

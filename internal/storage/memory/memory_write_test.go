@@ -5,7 +5,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/phrocker/shoal/internal/storage"
+	"github.com/phrocker/shoal-oss/internal/storage"
 )
 
 func TestMemory_CreateThenOpen(t *testing.T) {

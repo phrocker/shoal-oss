@@ -4,9 +4,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/phrocker/shoal/internal/cclient"
-	"github.com/phrocker/shoal/internal/engine"
-	"github.com/phrocker/shoal/internal/tablet"
+	"github.com/phrocker/shoal-oss/internal/cclient"
+	"github.com/phrocker/shoal-oss/internal/engine"
+	"github.com/phrocker/shoal-oss/internal/tablet"
 )
 
 // TestEngine_RFileEvents proves the event bus fires on every path that mints a

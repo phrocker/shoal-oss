@@ -6,8 +6,8 @@ import (
 	"sort"
 	"strconv"
 
-	"github.com/phrocker/shoal/internal/documentschema"
-	"github.com/phrocker/shoal/internal/iterrt"
+	"github.com/phrocker/shoal-oss/internal/documentschema"
+	"github.com/phrocker/shoal-oss/internal/iterrt"
 )
 
 // exec_document.go runs a ShapeDocument plan: the DataWave-style document path.

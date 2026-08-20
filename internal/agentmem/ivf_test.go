@@ -22,8 +22,8 @@ import (
 	"strconv"
 	"testing"
 
-	"github.com/phrocker/shoal/internal/embedpb"
-	"github.com/phrocker/shoal/internal/ivfpq"
+	"github.com/phrocker/shoal-oss/internal/embedpb"
+	"github.com/phrocker/shoal-oss/internal/ivfpq"
 )
 
 // seedIvfIndex trains an IVF-PQ index over vecs and writes the coded cells +

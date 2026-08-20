@@ -52,10 +52,10 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/phrocker/shoal/internal/compaction"
-	"github.com/phrocker/shoal/internal/iterrt"
-	"github.com/phrocker/shoal/internal/metadata"
-	"github.com/phrocker/shoal/internal/shadow/itercfg"
+	"github.com/phrocker/shoal-oss/internal/compaction"
+	"github.com/phrocker/shoal-oss/internal/iterrt"
+	"github.com/phrocker/shoal-oss/internal/metadata"
+	"github.com/phrocker/shoal-oss/internal/shadow/itercfg"
 )
 
 // TabletEnumerator yields the tablets of a table. *metadata.Walker

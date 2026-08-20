@@ -9,8 +9,8 @@ import (
 	"strings"
 	"unicode"
 
-	"github.com/phrocker/shoal/internal/iterrt"
-	"github.com/phrocker/shoal/internal/vectorindex"
+	"github.com/phrocker/shoal-oss/internal/iterrt"
+	"github.com/phrocker/shoal-oss/internal/vectorindex"
 )
 
 // Capability is a stable backend feature identifier used by planning

@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/phrocker/shoal/accumulo"
+	"github.com/phrocker/shoal-oss/accumulo"
 )
 
 func TestFailReturnsOutOfMemoryWhenErrorObjectAllocationFailsImmediately(t *testing.T) {

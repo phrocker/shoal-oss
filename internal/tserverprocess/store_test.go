@@ -7,11 +7,11 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
-	"github.com/phrocker/shoal/internal/ingestrouter"
-	"github.com/phrocker/shoal/internal/mincauthority"
-	"github.com/phrocker/shoal/internal/tabletloader"
-	"github.com/phrocker/shoal/internal/tserver"
-	"github.com/phrocker/shoal/internal/tserverrpc"
+	"github.com/phrocker/shoal-oss/internal/ingestrouter"
+	"github.com/phrocker/shoal-oss/internal/mincauthority"
+	"github.com/phrocker/shoal-oss/internal/tabletloader"
+	"github.com/phrocker/shoal-oss/internal/tserver"
+	"github.com/phrocker/shoal-oss/internal/tserverrpc"
 )
 
 type openerFunc func(context.Context, tabletloader.Specification, tserver.Attempt) (ingestrouter.HostedTablet, error)

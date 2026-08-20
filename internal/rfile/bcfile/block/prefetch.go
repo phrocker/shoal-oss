@@ -7,7 +7,7 @@ import (
 	"io"
 	"sync"
 
-	"github.com/phrocker/shoal/internal/rfile/bcfile"
+	"github.com/phrocker/shoal-oss/internal/rfile/bcfile"
 )
 
 // Sequence is a stream of block-decompression tasks. Each call to Next

@@ -24,8 +24,8 @@ import (
 	"io"
 	"time"
 
-	"github.com/phrocker/shoal/internal/thrift/gen/manager"
-	"github.com/phrocker/shoal/internal/tserver"
+	"github.com/phrocker/shoal-oss/internal/thrift/gen/manager"
+	"github.com/phrocker/shoal-oss/internal/tserver"
 )
 
 // ReportClient is one connection to the currently authoritative manager.

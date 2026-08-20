@@ -7,8 +7,8 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/phrocker/shoal/internal/managerclient"
-	"github.com/phrocker/shoal/internal/metadata"
+	"github.com/phrocker/shoal-oss/internal/managerclient"
+	"github.com/phrocker/shoal-oss/internal/metadata"
 )
 
 func TestTableAdministrationListingAndExistence(t *testing.T) {

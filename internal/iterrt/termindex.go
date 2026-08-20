@@ -24,7 +24,7 @@ import (
 	"sort"
 	"strconv"
 
-	"github.com/phrocker/shoal/internal/rfile/wire"
+	"github.com/phrocker/shoal-oss/internal/rfile/wire"
 )
 
 // TermIndexIterator is the term-index (keyword) pushdown iterator described

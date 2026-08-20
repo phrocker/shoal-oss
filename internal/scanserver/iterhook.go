@@ -4,9 +4,9 @@ import (
 	"fmt"
 	"sort"
 
-	"github.com/phrocker/shoal/internal/ivfpq"
-	"github.com/phrocker/shoal/internal/rfile/wire"
-	"github.com/phrocker/shoal/internal/thrift/gen/data"
+	"github.com/phrocker/shoal-oss/internal/ivfpq"
+	"github.com/phrocker/shoal-oss/internal/rfile/wire"
+	"github.com/phrocker/shoal-oss/internal/thrift/gen/data"
 )
 
 // cellPostProcessor consumes cells from the heap-merge in the order

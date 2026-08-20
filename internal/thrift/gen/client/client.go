@@ -10,7 +10,7 @@ import (
 	"fmt"
 	"time"
 	thrift "github.com/apache/thrift/lib/go/thrift"
-	"github.com/phrocker/shoal/internal/thrift/gen/security"
+	"github.com/phrocker/shoal-oss/internal/thrift/gen/security"
 
 )
 

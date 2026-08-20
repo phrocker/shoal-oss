@@ -39,7 +39,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/phrocker/shoal/internal/embedpb"
+	"github.com/phrocker/shoal-oss/internal/embedpb"
 )
 
 // CFName is the reserved column family that holds provenance property cells.

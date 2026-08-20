@@ -21,7 +21,7 @@ import (
 	"sort"
 	"testing"
 
-	"github.com/phrocker/shoal/internal/metadata"
+	"github.com/phrocker/shoal-oss/internal/metadata"
 )
 
 func TestDiffFileSets(t *testing.T) {
