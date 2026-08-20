@@ -25,7 +25,7 @@ import (
 
 var (
 	ErrNotHosted             = errors.New("tserverprocess: tablet is not hosted")
-	ErrWALAuthorityMissing   = errors.New("tserverprocess: WAL authority is unavailable")
+	ErrWALIntegrationMissing = errors.New("tserverprocess: hosted WAL integration is unavailable")
 	ErrUnsupportedConstraint = errors.New("tserverprocess: ingest constraints are unsupported")
 )
 
@@ -71,7 +71,7 @@ func (s *Store) Load(ctx context.Context, extent tserver.Extent) error {
 	}
 	if err == nil && len(spec.Logs) > 0 {
 		err = fmt.Errorf("%w: %s references %d WAL segment(s)",
-			ErrWALAuthorityMissing, extent, len(spec.Logs))
+			ErrWALIntegrationMissing, extent, len(spec.Logs))
 	}
 
 	s.mu.Lock()

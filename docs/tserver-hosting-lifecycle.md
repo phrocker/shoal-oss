@@ -861,13 +861,15 @@ absent, so a caller receives an explicit unknown/unsupported multiplexed
 service response instead of a false write capability.
 
 The process refuses to publish a loaded tablet that still references WAL
-segments. Serving that tablet without owning recovery/commit authority would
-silently omit unflushed mutations. The exact remaining dependency is #69's WAL
-authority and ingest data plane: mutation sessions, timestamp allocation,
-durable quorum WAL append/recovery, metadata log-reference updates, memtable
-flush, and manager-coordinated commit fencing. Constraints become executable
-only on that ingest path; the read-only process has no mutation surface on
-which to claim them.
+segments. Serving that tablet without opening and replaying those references
+would silently omit unflushed mutations. PR #175 has now landed the fenced WAL
+authority primitive. The exact remaining #69 dependency is its process/service
+integration: register `TabletIngestClientService`, route mutation sessions into
+`internal/walauthority`, recover referenced logs into a hosted memtable, enforce
+constraints and timestamp/durability semantics, produce minor-compaction
+RFiles, and commit/retire WAL and file metadata through the authoritative
+manager path. The read-only process has none of those mutation/commit surfaces,
+so it still does not advertise `TABLET_INGEST`.
 
 Live mixed Java/Shoal migration and rolling-replacement acceptance still need
 an Accumulo cluster CI environment. Until those tests and the ingest/WAL

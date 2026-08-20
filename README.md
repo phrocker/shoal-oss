@@ -63,7 +63,7 @@ V1 + IVF-PQ iterator port shipped. Embedded standalone engine shipped.
 | `RFile.blockmeta` zone-map block-skip extension | shipped — forward-compatible with Java `RFile.Reader` |
 | VisibilityFilter pushdown | shipped — alloc-free warm cache |
 | Accumulo 4 iterator capability admission | shipped — versioned, fail-closed scan/minc/majc registry and [machine-readable inventory](docs/iterator-capability-registry.md) |
-| Accumulo tablet-server lifecycle + ServiceLock | read-only process wired — `shoal-tserver` owns fenced hosting, manager RPCs, hosted-only scans, and ZooKeeper registration; ingest remains unsupported pending WAL authority ([design](docs/tserver-hosting-lifecycle.md)) |
+| Accumulo tablet-server lifecycle + ServiceLock | read-only process wired — `shoal-tserver` owns fenced hosting, manager RPCs, hosted-only scans, and ZooKeeper registration; ingest remains unsupported pending TabletIngest/minor-compaction integration with the landed WAL authority ([design](docs/tserver-hosting-lifecycle.md)) |
 | Hosted-tablet metadata/config/file/WAL loader | shipped — generation-fenced, retryable, deterministic specification builder (`internal/tabletloader`) |
 | File / locator / block caches | shipped |
 | Startup pre-warm (`-prewarm-tables=auto`) | shipped — distributed-serving mode |
