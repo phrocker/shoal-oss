@@ -17,9 +17,17 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/phrocker/shoal/accumulo"
 )
+
+//export shoal_test_sleep_ms
+func shoal_test_sleep_ms(milliseconds C.int64_t) {
+	if milliseconds > 0 {
+		time.Sleep(time.Duration(milliseconds) * time.Millisecond)
+	}
+}
 
 type testSeamScanCursor struct {
 	ctx     context.Context

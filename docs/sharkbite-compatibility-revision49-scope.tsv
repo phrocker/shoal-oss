@@ -381,7 +381,7 @@ SB-RFILE-001	Covered	core-covered	Covered
 SB-RFILE-002	Covered	core-covered	Covered
 SB-RFILE-003	Covered	core-covered	Covered
 SB-RFILE-004	Covered	core-covered	Covered
-SB-RFILE-005	Covered	core-covered	Covered
+SB-RFILE-005	Required gap	core-required-gap	Behavior mismatch
 SB-RFILE-006	Covered	core-covered	Covered
 SB-RFILE-007	Covered	core-covered	Covered
 SB-RFILE-008	Covered	core-covered	Covered
@@ -420,8 +420,8 @@ SB-HDFS-004	Covered	core-covered	Covered
 SB-HDFS-005	Covered	core-covered	Covered
 SB-HDFS-006	Covered	core-covered	Covered
 SB-HDFS-007	Covered	core-covered	Covered
-SB-HDFS-008	Covered	core-covered	Covered
-SB-HDFS-009	Covered	core-covered	Covered
+SB-HDFS-008	Required gap	core-required-gap	Missing Go
+SB-HDFS-009	Required gap	core-required-gap	Missing Go
 SB-HDFS-010	Covered	core-covered	Covered
 SB-HDFS-015	Covered	core-covered	Covered
 SB-HDFS-016	Covered	core-covered	Covered
@@ -441,23 +441,23 @@ SB-HDFS-013	Covered	core-covered	Covered
 SB-HDFS-014	Covered	core-covered	Covered
 SB-LOG-001	Covered	core-covered	Covered
 SB-LOG-002	Covered	core-covered	Covered
-SB-LOG-003	Covered	core-covered	Covered
+SB-LOG-003	Required gap	core-required-gap	Behavior mismatch
 SB-ERR-001	Covered	core-covered	Covered
-SB-ERR-002	Covered	core-covered	Covered
+SB-ERR-002	Required gap	core-required-gap	Behavior mismatch
 SB-ERR-003	Approved divergence	core-approved-divergence	Intentional divergence (approval required)
-SB-ERR-004	Covered	core-covered	Covered
-SB-ERR-005	Covered	core-covered	Covered
-SB-ERR-006	Covered	core-covered	Covered
-SB-ERR-007	Covered	core-covered	Covered
+SB-ERR-004	Required gap	core-required-gap	Behavior mismatch
+SB-ERR-005	Required gap	core-required-gap	Behavior mismatch
+SB-ERR-006	Required gap	core-required-gap	Behavior mismatch
+SB-ERR-007	Required gap	core-required-gap	Behavior mismatch
 SB-ERR-008	Covered	core-covered	Covered
-SB-ERR-009	Covered	core-covered	Covered
+SB-ERR-009	Required gap	core-required-gap	Missing Go
 SB-ERR-010	Covered	core-covered	Covered
 SB-ERR-011	Covered	core-covered	Covered
 SB-ERR-012	Not required	not-required-rationale	Not required (rationale required)
 SB-ERR-013	Not required	not-required-rationale	Not required (rationale required)
 SB-ERR-014	Covered	core-covered	Covered
 SB-ERR-015	Not required	not-required-rationale	Not required (rationale required)
-SB-ERR-016	Covered	core-covered	Covered
+SB-ERR-016	Required gap	core-required-gap	Behavior mismatch
 SB-CPP-001	Optional	optional-legacy-cxx	Behavior mismatch
 SB-CPP-015	Optional	optional-legacy-cxx	Behavior mismatch
 SB-CPP-002	Optional	optional-legacy-cxx	Behavior mismatch
@@ -3189,22 +3189,22 @@ SB-EMB-032	Optional	optional-legacy-cxx	Not required (rationale required)
 SB-EMB-033	Optional	optional-legacy-cxx	Not required (rationale required)
 SB-EMB-034	Optional	optional-legacy-cxx	Not required (rationale required)
 SB-EMB-035	Optional	optional-legacy-cxx	Not required (rationale required)
-SB-XCUT-001	Required gap	core-required-gap	Behavior mismatch
-SB-XCUT-002	Required gap	core-required-gap	Behavior mismatch
-SB-XCUT-003	Required gap	core-required-gap	Behavior mismatch
-SB-XCUT-004	Required gap	core-required-gap	Behavior mismatch
-SB-XCUT-005	Required gap	core-required-gap	Behavior mismatch
-SB-XCUT-006	Required gap	core-required-gap	Behavior mismatch
-SB-XCUT-007	Required gap	core-required-gap	Behavior mismatch
+SB-XCUT-001	Covered	core-covered	Covered
+SB-XCUT-002	Covered	core-covered	Covered
+SB-XCUT-003	Covered	core-covered	Covered
+SB-XCUT-004	Covered	core-covered	Covered
+SB-XCUT-005	Covered	core-covered	Covered
+SB-XCUT-006	Covered	core-covered	Covered
+SB-XCUT-007	Covered	core-covered	Covered
 SB-XCUT-008	Covered	core-covered	Covered
-SB-XCUT-009	Required gap	core-required-gap	Behavior mismatch
+SB-XCUT-009	Covered	core-covered	Covered
 SB-XCUT-010	Covered	core-covered	Covered
-SB-XCUT-011	Required gap	core-required-gap	Behavior mismatch
+SB-XCUT-011	Covered	core-covered	Covered
 SB-XCUT-012	Covered	core-covered	Covered
-SB-XCUT-013	Required gap	core-required-gap	Behavior mismatch
+SB-XCUT-013	Covered	core-covered	Covered
 SB-XCUT-014	Required gap	core-required-gap	Behavior mismatch
 SB-XCUT-015	Required gap	core-required-gap	Missing Go
 SB-XCUT-016	Required gap	core-required-gap	Behavior mismatch
-SB-XCUT-017	Required gap	core-required-gap	Missing C ABI
-SB-XCUT-018	Required gap	core-required-gap	Behavior mismatch
+SB-XCUT-017	Covered	core-covered	Covered
+SB-XCUT-018	Covered	core-covered	Covered
 SB-XCUT-019	Required gap	core-required-gap	Missing C ABI

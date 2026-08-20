@@ -35,6 +35,62 @@ LogCallback = C.CFUNCTYPE(
     None, C.c_int32, C.c_char_p, C.c_char_p, C.c_void_p
 )
 
+_IMPORT_PID = os.getpid()
+_FORKED_CHILD = False
+
+
+class ForkSafetyError(RuntimeError):
+    """Raised before an inherited native library or handle can be reused."""
+
+
+def _mark_forked_child() -> None:
+    global _FORKED_CHILD
+    _FORKED_CHILD = True
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_mark_forked_child)
+
+
+def _ensure_process_safe() -> None:
+    if _FORKED_CHILD or os.getpid() != _IMPORT_PID:
+        raise ForkSafetyError(
+            "Shoal native state cannot be reused after fork; exec a fresh "
+            "interpreter before creating or using Shoal objects"
+        )
+
+
+class _ProcessBoundFunction:
+    def __init__(self, function: object) -> None:
+        object.__setattr__(self, "_function", function)
+
+    def __call__(self, *args: object) -> object:
+        _ensure_process_safe()
+        return self._function(*args)
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._function, name)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        setattr(self._function, name, value)
+
+
+class _ProcessBoundLibrary:
+    def __init__(self, library: C.CDLL) -> None:
+        self._library = library
+        self._functions: dict[str, _ProcessBoundFunction] = {}
+
+    def __getattr__(self, name: str) -> object:
+        _ensure_process_safe()
+        value = getattr(self._library, name)
+        if not callable(value):
+            return value
+        function = self._functions.get(name)
+        if function is None:
+            function = _ProcessBoundFunction(value)
+            self._functions[name] = function
+        return function
+
 CAPABILITY_SYMBOLS = {
     CAP_OWNED_SCAN_RESULT: {
         "shoal_scan_result_count",
@@ -415,8 +471,9 @@ def _bytes(value: Bytes) -> bytes:
 
 class NativeAPI:
     def __init__(self, library: str | os.PathLike[str] | None = None) -> None:
+        _ensure_process_safe()
         failures: list[str] = []
-        self.lib: C.CDLL
+        raw_library: C.CDLL
         self.path = ""
         self._dll_directory = None
         for candidate in library_candidates(library):
@@ -428,7 +485,7 @@ class NativeAPI:
                         self._dll_directory = os.add_dll_directory(
                             str(candidate_path.parent)
                         )
-                self.lib = C.CDLL(candidate)
+                raw_library = C.CDLL(candidate)
                 self.path = candidate
                 break
             except (ImportError, OSError) as exc:
@@ -438,6 +495,7 @@ class NativeAPI:
                 "unable to load the Shoal shared library; set SHOAL_LIBRARY. "
                 + " | ".join(failures[-3:])
             )
+        self.lib = _ProcessBoundLibrary(raw_library)
         self._symbols: set[str] = set()
         self._bind_discovery()
         major = int(self.lib.shoal_abi_version_major())
