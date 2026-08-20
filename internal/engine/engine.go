@@ -252,6 +252,18 @@ func (e *Engine) Scan(tableName string, r iterrt.Range, opts ScanOptions) (*Scan
 	return tbl.scan(r, opts)
 }
 
+// SetTableFileFormat changes the immutable format used by future flushes and
+// compactions. Existing RFile and Parquet files remain readable together.
+func (e *Engine) SetTableFileFormat(tableName string, format tablet.FileFormat) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	tbl, ok := e.tables[tableName]
+	if !ok {
+		return fmt.Errorf("engine: table %q not found", tableName)
+	}
+	return tbl.setFileFormat(format)
+}
+
 // ScanHosted runs a scan whose top-of-stack iterators are hosted above a
 // re-seekable whole-table merge (rather than per-tablet). Use it for
 // iterators that must re-seek across the entire row space — e.g. the

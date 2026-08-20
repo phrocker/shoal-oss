@@ -8,15 +8,16 @@ no Accumulo cluster and no ZooKeeper required.
 Shoal stores arbitrary keys and values as cells
 (`row → (cf, cq, cv, ts) → value`) and runs a minimal in-process iterator
 stack that pushes graph traversal, keyword, and vector queries down next to
-the data. It is RFile-compatible end to end, so the same data and iterators
-work whether you run it embedded on a laptop or fan out across a fleet.
+the data. The embedded engine can persist immutable files as RFile or Parquet
+and can scan mixed-format tablets during migration. Distributed serving keeps
+RFile compatibility for Accumulo interoperability.
 
 Two ways to run it:
 
 - **Embedded / standalone** (`shoal-embed`, `internal/engine`) — a
   self-contained storage engine with its own write-ahead log, memtable,
   compaction, and split policy. No external coordinator: open a data
-  directory, create tables, write and scan. Durable RFiles land on the
+  directory, create tables, write and scan. Durable RFiles or Parquet files land on the
   local filesystem or any pluggable backend (in-memory, GCS, S3, Azure Blob,
   HDFS), so the
   same engine scales from a single machine to cloud-durable storage. Use it
@@ -68,8 +69,11 @@ the loop. Point it at a data directory and go:
 ```bash
 make build   # builds cmd/shoal-embed (and everything else) via go build ./...
 
-# create a table, optionally pre-split by row prefix
+# create an operational table (auto selects RFile), optionally pre-split
 shoal-embed init   --table graph --splits "entity:,event:,knowledge:" --data ~/.shoal/data
+
+# create a scan/aggregate-heavy SQL table (auto selects Parquet)
+shoal-embed init   --table events_analytics --workload analytical --data ~/.shoal/data
 
 # write mutations (JSON lines on stdin)
 shoal-embed write  --table graph --data ~/.shoal/data < mutations.jsonl
@@ -80,6 +84,10 @@ shoal-embed scan   --table graph --row-prefix "entity:" --data ~/.shoal/data
 # flush + compact, or print status
 shoal-embed compact --table graph --data ~/.shoal/data
 shoal-embed status  --data ~/.shoal/data
+
+# migrate an existing RFile table to Parquet (mixed files remain readable
+# until compaction replaces them)
+shoal-embed compact --table graph --format parquet --data ~/.shoal/data
 
 # or serve the ShoalEmbed gRPC API for external consumers
 shoal-embed serve  --data ~/.shoal/data --port 9876
@@ -99,12 +107,21 @@ sc.Close()
 eng.Close()
 ```
 
-**Local and at scale.** Durable RFiles flush through a pluggable
+**Local and at scale.** Durable RFile or Parquet files flush through a pluggable
 `storage.Backend`. The default is the local filesystem; an in-memory,
 GCS, or S3 backend keeps each tablet's WAL local while flushing immutable
-RFiles elsewhere — a locally-resident, cloud-durable store with the same
+files elsewhere — a locally-resident, cloud-durable store with the same
 engine and iterators in both cases. WAL durability is tunable
 (`SyncFull` / `SyncNormal` + group-commit interval).
+
+**Choosing a format.** Use the default operational profile (RFile) for
+point/range lookups, adjacency-index graph traversal, or Accumulo
+interoperability. Use `--workload analytical` (Parquet) for SQL scans,
+aggregations, and external analytics tools. ShoalQL runs above the engine and
+returns the same results for RFile, Parquet, and mixed migration tables.
+Parquet files are sorted into row groups with row statistics and bloom filters,
+so bounded SQL predicates prune unrelated groups instead of decoding the whole
+file.
 
 **HDFS.** Select the `hdfs` backend and use `hdfs:/path` or
 `hdfs://namenode:port/path` object paths. The native Go client loads
@@ -175,6 +192,12 @@ make capi        # stable C connector ABI shared library + headers
 make thrift-gen     # regenerate internal Go bindings from the vendored IDLs
 make thrift-verify  # regenerate and fail if the checked-in bindings drift
 ```
+
+The disposable Docker harness under `test/accumulo` is the integration oracle
+for client, scan, iterator, RFile, compaction, and replacement-role
+conformance. It uses a stable Accumulo image by default and accepts
+`SHOAL_ACCUMULO_IMAGE` for the exact 4.x snapshot targeted by the vendored
+IDLs. See [`test/accumulo/README.md`](test/accumulo/README.md).
 
 The embedded engine builds with a plain `go build ./...` and has no Thrift
 dependency. The required Accumulo 4 IDLs are vendored under

@@ -395,6 +395,19 @@ func TestCompact_OutputBudgetCatchesTheClosingFlush(t *testing.T) {
 	}
 }
 
+func TestCompact_OutputBudgetCatchesParquetOutput(t *testing.T) {
+	in := []kv{{K: mk("r", "cf", "cq", 1), V: strings.Repeat("x", 4096)}}
+	_, err := Compact(Spec{
+		Inputs:         []Input{{Name: "f1", Bytes: buildRFile(t, in)}},
+		Scope:          iterrt.ScopeMajc,
+		OutputFormat:   "parquet",
+		MaxOutputBytes: 64,
+	})
+	if !errors.Is(err, ErrOutputTooLarge) {
+		t.Fatalf("Compact err = %v, want ErrOutputTooLarge", err)
+	}
+}
+
 // TestCompact_OutputBudgetRefusesTheWriteRatherThanNoticingAfterwards:
 // a cell can be arbitrarily larger than BlockSize, so a single flush can
 // carry an unbounded amount of data. The budget has to refuse that write

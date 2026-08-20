@@ -1,5 +1,6 @@
 // Package enginebackend adapts a *engine.Engine to the shoalql.Backend seam,
-// so the SQL layer can run against real shoal tables. It is deliberately a
+// so the SQL layer can run identically over RFile, Parquet, or mixed tables.
+// It is deliberately a
 // separate package: the core shoalql parser/planner/executor never import the
 // engine, which keeps them unit-testable with in-memory fakes.
 package enginebackend

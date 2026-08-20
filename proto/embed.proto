@@ -43,16 +43,40 @@ service ShoalEmbed {
   rpc Status(StatusRequest) returns (StatusResponse);
 }
 
+// TableWorkload is the table's access-pattern profile. It controls the
+// default immutable persistence format when file_format is left unspecified.
+enum TableWorkload {
+  TABLE_WORKLOAD_UNSPECIFIED = 0;
+  TABLE_WORKLOAD_OPERATIONAL = 1;
+  TABLE_WORKLOAD_ANALYTICAL = 2;
+}
+
+// TableFileFormat is the immutable persistence format written by flushes and
+// compactions.
+enum TableFileFormat {
+  TABLE_FILE_FORMAT_UNSPECIFIED = 0;
+  TABLE_FILE_FORMAT_RFILE = 1;
+  TABLE_FILE_FORMAT_PARQUET = 2;
+}
+
 // ── CreateTable ─────────────────────────────────────────────────
 
 message CreateTableRequest {
   string table = 1;
   repeated string splits = 2;
+  // Optional workload profile. Unspecified preserves the existing default
+  // create-table behavior unless file_format implies a specific profile.
+  TableWorkload workload = 3;
+  // Optional immutable persistence format. Unspecified preserves the existing
+  // create-table behavior unless workload implies a specific format.
+  TableFileFormat file_format = 4;
 }
 
 message CreateTableResponse {
   string table = 1;
   int32 tablets = 2;
+  TableWorkload workload = 3;
+  TableFileFormat file_format = 4;
 }
 
 // ── Write ───────────────────────────────────────────────────────
@@ -322,14 +346,34 @@ message FlushResponse {}
 
 message CompactRequest {
   string table = 1;
+  // Optional target workload profile for compaction/migration. When set
+  // without file_format, compaction rewrites immutable files using that
+  // profile's default format.
+  TableWorkload workload = 2;
+  // Optional target immutable persistence format for compaction/migration.
+  // When set without workload, workload is inferred from the format.
+  TableFileFormat file_format = 3;
 }
 
-message CompactResponse {}
+message CompactResponse {
+  string table = 1;
+  TableWorkload workload = 2;
+  TableFileFormat file_format = 3;
+}
 
 // ── Status ──────────────────────────────────────────────────────
 
 message StatusRequest {}
 
+message TableStatus {
+  string table = 1;
+  int32 tablets = 2;
+  int32 immutable_files = 3;
+  TableWorkload workload = 4;
+  TableFileFormat file_format = 5;
+}
+
 message StatusResponse {
   repeated string tables = 1;
+  repeated TableStatus table_statuses = 2;
 }

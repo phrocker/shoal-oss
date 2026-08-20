@@ -16,6 +16,7 @@ import (
 	"github.com/phrocker/shoal/internal/iterrt"
 	"github.com/phrocker/shoal/internal/storage"
 	"github.com/phrocker/shoal/internal/storage/memory"
+	"github.com/phrocker/shoal/internal/tablet"
 )
 
 type exportSourceBackend struct{}
@@ -564,6 +565,55 @@ func TestCopyWithSHA256CountsPartialWriteProgressBeforeError(t *testing.T) {
 	}
 	if dst.lastWriter.stagePresent {
 		t.Fatal("partial error write left staged bytes behind")
+	}
+}
+
+func TestParquetExportImportWithVisibilityStamp(t *testing.T) {
+	ctx := context.Background()
+	srcDir := filepath.Join(t.TempDir(), "src")
+	dstDir := filepath.Join(t.TempDir(), "dst")
+	src, err := Open(srcDir, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer src.Close()
+	if err := src.CreateTable("graph", TableOptions{
+		TabletOptions: tablet.Options{FileFormat: tablet.FormatParquet},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	m, _ := cclient.NewMutation([]byte("row"))
+	m.Put([]byte("cf"), []byte("cq"), nil, 7, []byte("value"))
+	if err := src.Write("graph", []*cclient.Mutation{m}); err != nil {
+		t.Fatal(err)
+	}
+
+	backend := memory.New()
+	manifest, err := src.ExportRFiles(ctx, "graph", backend, RFileExportOptions{
+		DestinationRoot:      dstDir,
+		StampVisibilityLabel: "tenantA",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if manifest.FileFormat != tablet.FormatParquet || len(manifest.RFiles) != 1 {
+		t.Fatalf("unexpected manifest: %+v", manifest)
+	}
+	if manifest.RFiles[0].Format != string(tablet.FormatParquet) || manifest.RFiles[0].BCFileVersion != "" {
+		t.Fatalf("unexpected parquet file metadata: %+v", manifest.RFiles[0])
+	}
+
+	dst, err := Open(dstDir, Options{Backend: backend})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dst.Close()
+	if err := dst.ImportRFileManifest(ctx, manifest); err != nil {
+		t.Fatal(err)
+	}
+	got := scanAll(t, dst, "graph")
+	if fmt.Sprint(got) != "[row|cf|cq|tenantA|7|value]" {
+		t.Fatalf("imported parquet cells = %v", got)
 	}
 }
 

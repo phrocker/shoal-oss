@@ -22,6 +22,7 @@ import (
 	"github.com/phrocker/shoal/internal/rfile/bcfile"
 	"github.com/phrocker/shoal/internal/rfile/bcfile/block"
 	"github.com/phrocker/shoal/internal/storage"
+	"github.com/phrocker/shoal/internal/tablet"
 )
 
 const RFileExportManifestVersion = 1
@@ -51,6 +52,7 @@ type RFileExportManifest struct {
 	SourceTable         string              `json:"source_table"`
 	EngineVersion       string              `json:"engine_version,omitempty"`
 	RFileCompatibility  string              `json:"rfile_compatibility"`
+	FileFormat          tablet.FileFormat   `json:"file_format,omitempty"`
 	CFSchema            string              `json:"cf_schema,omitempty"`
 	VisibilityStamp     string              `json:"visibility_stamp,omitempty"`
 	AuthorizationsStamp string              `json:"authorizations_stamp,omitempty"`
@@ -222,6 +224,7 @@ type RFileExportFile struct {
 	Size            int64  `json:"size"`
 	SHA256          string `json:"sha256"`
 	BCFileVersion   string `json:"bcfile_version,omitempty"`
+	Format          string `json:"format,omitempty"`
 }
 
 type RFileExportOptions struct {
@@ -295,12 +298,17 @@ func (e *Engine) ExportRFiles(ctx context.Context, tableName string, dst storage
 	}
 
 	files := tbl.rfiles()
+	compatibility := "accumulo-rfile/shoal"
+	if tbl.format == tablet.FormatParquet {
+		compatibility = "parquet/shoal"
+	}
 	manifest := &RFileExportManifest{
 		Version:             RFileExportManifestVersion,
 		CreatedAt:           time.Now().UTC(),
 		SourceTable:         tableName,
 		EngineVersion:       opts.EngineVersion,
-		RFileCompatibility:  "accumulo-rfile/shoal",
+		RFileCompatibility:  compatibility,
+		FileFormat:          tbl.format,
 		CFSchema:            opts.CFSchema,
 		VisibilityStamp:     opts.VisibilityStamp,
 		AuthorizationsStamp: opts.AuthorizationsStamp,
@@ -324,6 +332,7 @@ func (e *Engine) ExportRFiles(ctx context.Context, tableName string, dst storage
 			Size:            size,
 			SHA256:          sum,
 			BCFileVersion:   bcVersion,
+			Format:          string(fileFormatForPath(f.Path)),
 		})
 	}
 	sort.SliceStable(manifest.RFiles, func(i, j int) bool {
@@ -437,6 +446,23 @@ func (e *Engine) ImportRFileManifest(ctx context.Context, manifest *RFileExportM
 		}
 		return nil
 	}
+	format, err := tablet.ParseFileFormat(string(manifest.FileFormat))
+	if err != nil {
+		return err
+	}
+	var splits [][]byte
+	for i := 0; i+1 < len(manifest.Tablets); i++ {
+		if manifest.Tablets[i].EndRow != nil {
+			splits = append(splits, []byte(*manifest.Tablets[i].EndRow))
+		}
+	}
+	if err := writeTableManifest(tableDir, tableManifest{
+		Version:    tableManifestVersion,
+		Splits:     splits,
+		FileFormat: format,
+	}); err != nil {
+		return err
+	}
 	tbl, err := openTable(tableDir, manifest.SourceTable, e.logger, e.cache, e.walSyncMode, e.walSyncInterval, e.backend, e.publishRFile)
 	if err != nil {
 		return err
@@ -474,10 +500,11 @@ func stampRFileObject(ctx context.Context, src storage.Backend, srcPath string, 
 		},
 	}}
 	res, err := compaction.Compact(compaction.Spec{
-		Inputs: []compaction.Input{{Name: srcPath, Bytes: data}},
-		Stack:  stack,
-		Scope:  iterrt.ScopeMajc,
-		Codec:  block.CodecSnappy,
+		Inputs:       []compaction.Input{{Name: srcPath, Bytes: data}},
+		Stack:        stack,
+		Scope:        iterrt.ScopeMajc,
+		Codec:        block.CodecSnappy,
+		OutputFormat: string(fileFormatForPath(srcPath)),
 	})
 	if err != nil {
 		return 0, "", "", fmt.Errorf("engine: stamp export source %s: %w", srcPath, err)
@@ -491,6 +518,13 @@ func stampRFileObject(ctx context.Context, src storage.Backend, srcPath string, 
 		bcVersion = footer.Version.String()
 	}
 	return int64(len(res.Output)), hex.EncodeToString(sum[:]), bcVersion, nil
+}
+
+func fileFormatForPath(path string) tablet.FileFormat {
+	if filepath.Ext(path) == ".parquet" {
+		return tablet.FormatParquet
+	}
+	return tablet.FormatRFile
 }
 
 func copyWithSHA256(ctx context.Context, src storage.Backend, srcPath string, dst storage.Backend, dstPath string) (written int64, sum string, bcVersion string, err error) {

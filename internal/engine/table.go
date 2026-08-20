@@ -19,6 +19,7 @@ package engine
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
@@ -50,7 +51,18 @@ type TableOptions struct {
 
 	// TabletOptions is passed to each tablet at creation time.
 	TabletOptions tablet.Options
+
+	// Workload selects the default immutable format when TabletOptions.FileFormat
+	// is unset. Operational uses RFile; analytical uses Parquet.
+	Workload WorkloadProfile
 }
+
+type WorkloadProfile string
+
+const (
+	WorkloadOperational WorkloadProfile = "operational"
+	WorkloadAnalytical  WorkloadProfile = "analytical"
+)
 
 // PrefixSplit is a convenience constructor for Splits based on row key
 // prefixes. Given ("event:", "knowledge:"), it returns split points
@@ -85,12 +97,36 @@ type table struct {
 	tablets []*tablet.Tablet
 	splits  [][]byte // sorted split points; len(tablets) == len(splits)+1
 	logger  *slog.Logger
+	format  tablet.FileFormat
+}
+
+const tableManifestVersion = 1
+
+type tableManifest struct {
+	Version    int               `json:"version"`
+	Splits     [][]byte          `json:"splits,omitempty"`
+	FileFormat tablet.FileFormat `json:"file_format"`
 }
 
 // createTable creates a new table on disk with the configured splits. notify,
 // when non-nil, is invoked (with this table's name) each time one of its
 // tablets writes a new RFile via flush or compaction.
 func createTable(dir, name string, opts TableOptions, logger *slog.Logger, rfCache *tablet.Cache, notify func(table, kind, file string)) (*table, error) {
+	if opts.TabletOptions.FileFormat == "" {
+		switch opts.Workload {
+		case "", WorkloadOperational:
+			opts.TabletOptions.FileFormat = tablet.FormatRFile
+		case WorkloadAnalytical:
+			opts.TabletOptions.FileFormat = tablet.FormatParquet
+		default:
+			return nil, fmt.Errorf("table: unsupported workload %q (want operational or analytical)", opts.Workload)
+		}
+	}
+	format, err := tablet.ParseFileFormat(string(opts.TabletOptions.FileFormat))
+	if err != nil {
+		return nil, err
+	}
+	opts.TabletOptions.FileFormat = format
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("table: mkdir %s: %w", dir, err)
 	}
@@ -103,6 +139,13 @@ func createTable(dir, name string, opts TableOptions, logger *slog.Logger, rfCac
 	sort.Slice(splits, func(i, j int) bool {
 		return bytes.Compare(splits[i], splits[j]) < 0
 	})
+	if err := writeTableManifest(dir, tableManifest{
+		Version:    tableManifestVersion,
+		Splits:     splits,
+		FileFormat: format,
+	}); err != nil {
+		return nil, err
+	}
 
 	tabletCount := len(splits) + 1
 	tablets := make([]*tablet.Tablet, tabletCount)
@@ -136,6 +179,7 @@ func createTable(dir, name string, opts TableOptions, logger *slog.Logger, rfCac
 		tablets: tablets,
 		splits:  splits,
 		logger:  logger,
+		format:  format,
 	}, nil
 }
 
@@ -168,8 +212,10 @@ func tabletNotify(name string, notify func(table, kind, file string)) func(kind,
 // by scanning subdirectories named t-NNNN. notify, when non-nil, is invoked
 // (with this table's name) each time one of its tablets writes a new RFile.
 func openTable(dir, name string, logger *slog.Logger, rfCache *tablet.Cache, walSyncMode localwal.SyncMode, walSyncInterval time.Duration, backend storage.Backend, notify func(table, kind, file string)) (*table, error) {
-	// TODO: persist and reload splits from a manifest file.
-	// For now, open all t-NNNN directories as tablets with no split routing.
+	manifest, err := readTableManifest(dir)
+	if err != nil {
+		return nil, err
+	}
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return nil, fmt.Errorf("table: readdir %s: %w", dir, err)
@@ -196,6 +242,7 @@ func openTable(dir, name string, logger *slog.Logger, rfCache *tablet.Cache, wal
 			WALSyncMode:     walSyncMode,
 			WALSyncInterval: walSyncInterval,
 			Backend:         backend,
+			FileFormat:      manifest.FileFormat,
 			OnRFile:         tabletNotify(name, notify),
 		})
 		if err != nil {
@@ -215,8 +262,68 @@ func openTable(dir, name string, logger *slog.Logger, rfCache *tablet.Cache, wal
 		name:    name,
 		dir:     dir,
 		tablets: tablets,
+		splits:  manifest.Splits,
 		logger:  logger,
+		format:  manifest.FileFormat,
 	}, nil
+}
+
+func readTableManifest(dir string) (tableManifest, error) {
+	path := filepath.Join(dir, "table.json")
+	data, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return tableManifest{Version: tableManifestVersion, FileFormat: tablet.FormatRFile}, nil
+	}
+	if err != nil {
+		return tableManifest{}, fmt.Errorf("table: read manifest %s: %w", path, err)
+	}
+	var manifest tableManifest
+	if err := json.Unmarshal(data, &manifest); err != nil {
+		return tableManifest{}, fmt.Errorf("table: decode manifest %s: %w", path, err)
+	}
+	if manifest.Version != tableManifestVersion {
+		return tableManifest{}, fmt.Errorf("table: unsupported manifest version %d", manifest.Version)
+	}
+	format, err := tablet.ParseFileFormat(string(manifest.FileFormat))
+	if err != nil {
+		return tableManifest{}, err
+	}
+	manifest.FileFormat = format
+	return manifest, nil
+}
+
+func writeTableManifest(dir string, manifest tableManifest) error {
+	data, err := json.MarshalIndent(manifest, "", "  ")
+	if err != nil {
+		return fmt.Errorf("table: encode manifest: %w", err)
+	}
+	data = append(data, '\n')
+	path := filepath.Join(dir, "table.json")
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		return fmt.Errorf("table: write manifest %s: %w", path, err)
+	}
+	return nil
+}
+
+func (t *table) setFileFormat(format tablet.FileFormat) error {
+	parsed, err := tablet.ParseFileFormat(string(format))
+	if err != nil {
+		return err
+	}
+	if err := writeTableManifest(t.dir, tableManifest{
+		Version:    tableManifestVersion,
+		Splits:     t.splits,
+		FileFormat: parsed,
+	}); err != nil {
+		return err
+	}
+	for _, tb := range t.tablets {
+		if err := tb.SetFileFormat(parsed); err != nil {
+			return err
+		}
+	}
+	t.format = parsed
+	return nil
 }
 
 // routeTablet returns the tablet index for a given row key based on

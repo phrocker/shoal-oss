@@ -19,11 +19,18 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"reflect"
+	"strings"
 
 	"github.com/phrocker/shoal/internal/embedpb"
 	"github.com/phrocker/shoal/internal/embedstore"
 	"github.com/phrocker/shoal/internal/engine"
+	"github.com/phrocker/shoal/internal/tablet"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -36,25 +43,199 @@ const defaultScanBatchSize = embedstore.DefaultScanBatchSize
 // stay byte-for-byte identical.
 type embedServer struct {
 	embedpb.UnimplementedShoalEmbedServer
-	eng   *engine.Engine
-	store *embedstore.EngineStore
+	eng     *engine.Engine
+	store   *embedstore.EngineStore
+	dataDir string
 }
 
 // newEmbedServer wires an embedServer over eng.
 func newEmbedServer(eng *engine.Engine) *embedServer {
-	return &embedServer{eng: eng, store: embedstore.New(eng)}
+	return &embedServer{eng: eng, store: embedstore.New(eng), dataDir: engineDataDir(eng)}
 }
 
-func (s *embedServer) CreateTable(ctx context.Context, req *embedpb.CreateTableRequest) (*embedpb.CreateTableResponse, error) {
+type tableSelection struct {
+	workload      engine.WorkloadProfile
+	fileFormat    tablet.FileFormat
+	workloadSet   bool
+	fileFormatSet bool
+}
+
+type persistedTableStatus struct {
+	workload   engine.WorkloadProfile
+	fileFormat tablet.FileFormat
+}
+
+type tableManifest struct {
+	Splits     [][]byte `json:"splits,omitempty"`
+	FileFormat string   `json:"file_format"`
+}
+
+func engineDataDir(eng *engine.Engine) string {
+	if eng == nil {
+		return ""
+	}
+	v := reflect.ValueOf(eng)
+	if v.Kind() != reflect.Pointer || v.IsNil() {
+		return ""
+	}
+	field := v.Elem().FieldByName("dir")
+	if !field.IsValid() || field.Kind() != reflect.String {
+		return ""
+	}
+	return field.String()
+}
+
+func adminStatusError(op string, err error) error {
+	switch {
+	case err == nil:
+		return nil
+	case strings.Contains(err.Error(), "already exists"):
+		return status.Error(codes.AlreadyExists, err.Error())
+	case strings.Contains(err.Error(), "not found"):
+		return status.Error(codes.NotFound, err.Error())
+	default:
+		return status.Errorf(codes.Internal, "%s: %v", op, err)
+	}
+}
+
+func workloadFromProto(value embedpb.TableWorkload) (engine.WorkloadProfile, bool, error) {
+	switch value {
+	case embedpb.TableWorkload_TABLE_WORKLOAD_UNSPECIFIED:
+		return "", false, nil
+	case embedpb.TableWorkload_TABLE_WORKLOAD_OPERATIONAL:
+		return engine.WorkloadOperational, true, nil
+	case embedpb.TableWorkload_TABLE_WORKLOAD_ANALYTICAL:
+		return engine.WorkloadAnalytical, true, nil
+	default:
+		return "", false, fmt.Errorf("unsupported workload %d", value)
+	}
+}
+
+func fileFormatFromProto(value embedpb.TableFileFormat) (tablet.FileFormat, bool, error) {
+	switch value {
+	case embedpb.TableFileFormat_TABLE_FILE_FORMAT_UNSPECIFIED:
+		return "", false, nil
+	case embedpb.TableFileFormat_TABLE_FILE_FORMAT_RFILE:
+		return tablet.FormatRFile, true, nil
+	case embedpb.TableFileFormat_TABLE_FILE_FORMAT_PARQUET:
+		return tablet.FormatParquet, true, nil
+	default:
+		return "", false, fmt.Errorf("unsupported file_format %d", value)
+	}
+}
+
+func fileFormatForWorkload(workload engine.WorkloadProfile) tablet.FileFormat {
+	if workload == engine.WorkloadAnalytical {
+		return tablet.FormatParquet
+	}
+	return tablet.FormatRFile
+}
+
+func workloadForFileFormat(format tablet.FileFormat) engine.WorkloadProfile {
+	if format == tablet.FormatParquet {
+		return engine.WorkloadAnalytical
+	}
+	return engine.WorkloadOperational
+}
+
+func protoWorkload(workload engine.WorkloadProfile) embedpb.TableWorkload {
+	if workload == engine.WorkloadAnalytical {
+		return embedpb.TableWorkload_TABLE_WORKLOAD_ANALYTICAL
+	}
+	return embedpb.TableWorkload_TABLE_WORKLOAD_OPERATIONAL
+}
+
+func protoFileFormat(format tablet.FileFormat) embedpb.TableFileFormat {
+	if format == tablet.FormatParquet {
+		return embedpb.TableFileFormat_TABLE_FILE_FORMAT_PARQUET
+	}
+	return embedpb.TableFileFormat_TABLE_FILE_FORMAT_RFILE
+}
+
+func resolveTableSelection(workload embedpb.TableWorkload, fileFormat embedpb.TableFileFormat) (tableSelection, error) {
+	resolved := tableSelection{}
+	var err error
+	if resolved.workload, resolved.workloadSet, err = workloadFromProto(workload); err != nil {
+		return tableSelection{}, err
+	}
+	if resolved.fileFormat, resolved.fileFormatSet, err = fileFormatFromProto(fileFormat); err != nil {
+		return tableSelection{}, err
+	}
+	if resolved.workloadSet && resolved.fileFormatSet && resolved.fileFormat != fileFormatForWorkload(resolved.workload) {
+		return tableSelection{}, fmt.Errorf("conflicting workload %q and file_format %q", resolved.workload, resolved.fileFormat)
+	}
+	if resolved.workloadSet && !resolved.fileFormatSet {
+		resolved.fileFormat = fileFormatForWorkload(resolved.workload)
+	}
+	if !resolved.workloadSet && resolved.fileFormatSet {
+		resolved.workload = workloadForFileFormat(resolved.fileFormat)
+	}
+	return resolved, nil
+}
+
+func (s tableSelection) requested() bool {
+	return s.workloadSet || s.fileFormatSet
+}
+
+func (s *embedServer) readPersistedTableStatus(table string) (persistedTableStatus, error) {
+	if s.dataDir == "" {
+		return persistedTableStatus{}, fmt.Errorf("engine data directory unavailable")
+	}
+	path := filepath.Join(s.dataDir, table, "table.json")
+	data, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return persistedTableStatus{
+			workload:   engine.WorkloadOperational,
+			fileFormat: tablet.FormatRFile,
+		}, nil
+	}
+	if err != nil {
+		return persistedTableStatus{}, fmt.Errorf("read manifest %s: %w", path, err)
+	}
+	var manifest tableManifest
+	if err := json.Unmarshal(data, &manifest); err != nil {
+		return persistedTableStatus{}, fmt.Errorf("decode manifest %s: %w", path, err)
+	}
+	format, err := tablet.ParseFileFormat(manifest.FileFormat)
+	if err != nil {
+		return persistedTableStatus{}, fmt.Errorf("parse manifest %s: %w", path, err)
+	}
+	return persistedTableStatus{
+		workload:   workloadForFileFormat(format),
+		fileFormat: format,
+	}, nil
+}
+
+func (s *embedServer) CreateTable(_ context.Context, req *embedpb.CreateTableRequest) (*embedpb.CreateTableResponse, error) {
 	if req.Table == "" {
 		return nil, status.Error(codes.InvalidArgument, "table is required")
 	}
-	if err := s.store.CreateTable(ctx, req.Table, req.Splits); err != nil {
-		return nil, status.Errorf(codes.AlreadyExists, "%v", err)
+	selection, err := resolveTableSelection(req.Workload, req.FileFormat)
+	if err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+	opts := engine.TableOptions{}
+	if len(req.Splits) > 0 {
+		opts.Splits = engine.PrefixSplit(req.Splits...)
+	}
+	if selection.workloadSet {
+		opts.Workload = selection.workload
+	}
+	if selection.fileFormatSet {
+		opts.TabletOptions.FileFormat = selection.fileFormat
+	}
+	if err := s.eng.CreateTable(req.Table, opts); err != nil {
+		return nil, adminStatusError("create table", err)
+	}
+	if !selection.requested() {
+		selection.workload = engine.WorkloadOperational
+		selection.fileFormat = tablet.FormatRFile
 	}
 	return &embedpb.CreateTableResponse{
-		Table:   req.Table,
-		Tablets: int32(len(req.Splits) + 1),
+		Table:      req.Table,
+		Tablets:    int32(len(req.Splits) + 1),
+		Workload:   protoWorkload(selection.workload),
+		FileFormat: protoFileFormat(selection.fileFormat),
 	}, nil
 }
 
@@ -146,7 +327,7 @@ func (s *embedServer) Flush(ctx context.Context, req *embedpb.FlushRequest) (*em
 		return nil, status.Error(codes.InvalidArgument, "table is required")
 	}
 	if err := s.store.Flush(ctx, req.Table); err != nil {
-		return nil, status.Errorf(codes.Internal, "flush: %v", err)
+		return nil, adminStatusError("flush", err)
 	}
 	return &embedpb.FlushResponse{}, nil
 }
@@ -155,15 +336,54 @@ func (s *embedServer) Compact(ctx context.Context, req *embedpb.CompactRequest) 
 	if req.Table == "" {
 		return nil, status.Error(codes.InvalidArgument, "table is required")
 	}
-	if err := s.store.Compact(ctx, req.Table); err != nil {
+	current, err := s.readPersistedTableStatus(req.Table)
+	if err != nil {
 		return nil, status.Errorf(codes.Internal, "compact: %v", err)
 	}
-	return &embedpb.CompactResponse{}, nil
+	selection, err := resolveTableSelection(req.Workload, req.FileFormat)
+	if err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+	workload := current.workload
+	fileFormat := current.fileFormat
+	if selection.requested() {
+		workload = selection.workload
+		fileFormat = selection.fileFormat
+		if err := s.eng.SetTableFileFormat(req.Table, fileFormat); err != nil {
+			return nil, adminStatusError("compact set format", err)
+		}
+	}
+	if err := s.store.Compact(ctx, req.Table); err != nil {
+		return nil, adminStatusError("compact", err)
+	}
+	return &embedpb.CompactResponse{
+		Table:      req.Table,
+		Workload:   protoWorkload(workload),
+		FileFormat: protoFileFormat(fileFormat),
+	}, nil
 }
 
 func (s *embedServer) Status(_ context.Context, _ *embedpb.StatusRequest) (*embedpb.StatusResponse, error) {
-	tables := s.eng.TableNames()
-	return &embedpb.StatusResponse{Tables: tables}, nil
+	stats := s.eng.Stats()
+	resp := &embedpb.StatusResponse{
+		Tables:        make([]string, 0, len(stats)),
+		TableStatuses: make([]*embedpb.TableStatus, 0, len(stats)),
+	}
+	for _, stat := range stats {
+		meta, err := s.readPersistedTableStatus(stat.Name)
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "status: %v", err)
+		}
+		resp.Tables = append(resp.Tables, stat.Name)
+		resp.TableStatuses = append(resp.TableStatuses, &embedpb.TableStatus{
+			Table:          stat.Name,
+			Tablets:        int32(stat.Tablets),
+			ImmutableFiles: int32(stat.RFiles),
+			Workload:       protoWorkload(meta.workload),
+			FileFormat:     protoFileFormat(meta.fileFormat),
+		})
+	}
+	return resp, nil
 }
 
 // Verify at compile time that embedServer implements the interface.
