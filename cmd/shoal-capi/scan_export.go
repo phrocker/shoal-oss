@@ -16,6 +16,8 @@ import (
 	"unsafe"
 
 	"github.com/phrocker/shoal/accumulo"
+	publichdfs "github.com/phrocker/shoal/hdfs"
+	"github.com/phrocker/shoal/internal/storage"
 	publicrfile "github.com/phrocker/shoal/rfile"
 )
 
@@ -825,16 +827,21 @@ func statusForError(err error) C.shoal_status {
 		return C.SHOAL_STATUS_CLOSED
 	case errors.Is(err, publicrfile.ErrClosed):
 		return C.SHOAL_STATUS_CLOSED
+	case errors.Is(err, publichdfs.ErrClosed):
+		return C.SHOAL_STATUS_CLOSED
 	case errors.Is(err, publicrfile.ErrNoTop):
 		return C.SHOAL_STATUS_NOT_FOUND
 	case errors.Is(err, publicrfile.ErrInvalidSeekable),
 		errors.Is(err, publicrfile.ErrInvalidPath),
 		errors.Is(err, publicrfile.ErrOutOfOrder),
+		errors.Is(err, publicrfile.ErrInvalidLocalityGroup),
+		errors.Is(err, publichdfs.ErrInvalidArgument),
 		errors.Is(err, accumulo.ErrVisibilityParse):
 		return C.SHOAL_STATUS_INVALID_ARGUMENT
-	case errors.Is(err, publicrfile.ErrUnsupportedCodec),
-		errors.Is(err, publicrfile.ErrLocalityGroupUnsupported):
+	case errors.Is(err, publicrfile.ErrUnsupportedCodec):
 		return C.SHOAL_STATUS_UNSUPPORTED
+	case errors.Is(err, storage.ErrNotFound):
+		return C.SHOAL_STATUS_NOT_FOUND
 	case errors.Is(err, os.ErrNotExist):
 		return C.SHOAL_STATUS_NOT_FOUND
 	case errors.Is(err, os.ErrPermission):

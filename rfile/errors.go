@@ -27,8 +27,7 @@ var (
 	// previously appended key. RFile entries must be strictly increasing.
 	ErrOutOfOrder = errors.New("rfile: keys must be appended in strictly increasing order")
 
-	// ErrLocalityGroupUnsupported reports an attempt to add a named locality
-	// group. Shoal's writer emits the default locality group only, which is
-	// what Accumulo 4 tablets and Shoal's own compactor read.
-	ErrLocalityGroupUnsupported = errors.New("rfile: named locality groups are not supported by this writer")
+	// ErrInvalidLocalityGroup reports an empty or duplicate locality-group
+	// name.
+	ErrInvalidLocalityGroup = errors.New("rfile: invalid locality group")
 )

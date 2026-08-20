@@ -94,6 +94,9 @@ type activeHandle struct {
 
 var errBackendClosed = errors.New("hdfs: backend closed")
 
+// ErrClosed reports use after a backend or stream has closed.
+var ErrClosed = errBackendClosed
+
 // Authority returns the configured namenode authority, if any.
 func (b *Backend) Authority() string { return b.authority }
 
@@ -296,6 +299,7 @@ func (b *Backend) Open(ctx context.Context, objectPath string) (storage.File, er
 	}
 	f := &file{
 		reader:  reader,
+		info:    reader.Stat(),
 		size:    reader.Stat().Size(),
 		release: lease.release,
 	}
@@ -404,6 +408,81 @@ func (b *Backend) List(ctx context.Context, prefix string) ([]string, error) {
 	return out, nil
 }
 
+// ReadDir returns every non-internal child of prefix with its HDFS metadata.
+// Unlike List, directories are included.
+func (b *Backend) ReadDir(ctx context.Context, prefix string) ([]os.FileInfo, error) {
+	if err := contextOrBackground(ctx).Err(); err != nil {
+		return nil, err
+	}
+	lease, err := b.newOperation(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer lease.release()
+	resolved, _, err := b.resolve(prefix)
+	if err != nil {
+		return nil, err
+	}
+	entries, err := lease.client.ReadDir(resolved)
+	if err != nil {
+		if isNotFound(err) {
+			return nil, fmt.Errorf("%w: %s", storage.ErrNotFound, prefix)
+		}
+		return nil, fmt.Errorf("hdfs: list %s: %w", prefix, err)
+	}
+	out := make([]os.FileInfo, 0, len(entries))
+	for _, entry := range entries {
+		if !isReplacementArtifactName(entry.Name()) {
+			out = append(out, entry)
+		}
+	}
+	slices.SortFunc(out, func(a, b os.FileInfo) int {
+		return strings.Compare(a.Name(), b.Name())
+	})
+	return out, nil
+}
+
+// Stat returns metadata for one path.
+func (b *Backend) Stat(ctx context.Context, objectPath string) (os.FileInfo, error) {
+	if err := contextOrBackground(ctx).Err(); err != nil {
+		return nil, err
+	}
+	lease, err := b.newOperation(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer lease.release()
+	resolved, _, err := b.resolve(objectPath)
+	if err != nil {
+		return nil, err
+	}
+	if info, supported, err := statWithContext(ctx, lease.client, resolved); supported {
+		if err != nil {
+			if isNotFound(err) {
+				return nil, fmt.Errorf("%w: %s", storage.ErrNotFound, objectPath)
+			}
+			return nil, fmt.Errorf("hdfs: stat %s: %w", objectPath, err)
+		}
+		return info, nil
+	}
+	reader, err := lease.client.Open(resolved)
+	if err != nil {
+		if isNotFound(err) {
+			return nil, fmt.Errorf("%w: %s", storage.ErrNotFound, objectPath)
+		}
+		return nil, fmt.Errorf("hdfs: stat %s: %w", objectPath, err)
+	}
+	if err := applyDeadline(ctx, reader); err != nil {
+		_ = reader.Close()
+		return nil, fmt.Errorf("hdfs: stat %s: %w", objectPath, err)
+	}
+	info := reader.Stat()
+	if err := reader.Close(); err != nil && !isExpectedOperationCloseError(err) {
+		return nil, fmt.Errorf("hdfs: stat close %s: %w", objectPath, err)
+	}
+	return info, nil
+}
+
 // CleanupStaleArtifacts removes reserved temporary files directly under prefix
 // whose HDFS modification time is strictly before cutoff. Reserved backup
 // files are reported as recoverable and left in place because their randomized
@@ -487,6 +566,61 @@ func (b *Backend) Remove(ctx context.Context, objectPath string) error {
 	}
 	if err := removeWithContext(ctx, lease.client, resolved); err != nil && !isNotFound(err) {
 		return fmt.Errorf("hdfs: remove %s: %w", objectPath, err)
+	}
+	return nil
+}
+
+type recursiveRemover interface {
+	RemoveAll(name string) error
+}
+
+// RemoveAll recursively removes path. Missing paths are not errors.
+func (b *Backend) RemoveAll(ctx context.Context, objectPath string) error {
+	if err := contextOrBackground(ctx).Err(); err != nil {
+		return err
+	}
+	lease, err := b.newOperation(ctx)
+	if err != nil {
+		return err
+	}
+	defer lease.release()
+	resolved, _, err := b.resolve(objectPath)
+	if err != nil {
+		return err
+	}
+	remover, ok := lease.client.(recursiveRemover)
+	if !ok {
+		return errors.New("hdfs: recursive remove is not supported by this client")
+	}
+	if err := remover.RemoveAll(resolved); err != nil && !isNotFound(err) {
+		return fmt.Errorf("hdfs: remove recursively %s: %w", objectPath, err)
+	}
+	return nil
+}
+
+// Rename atomically renames oldPath to newPath.
+func (b *Backend) Rename(ctx context.Context, oldPath, newPath string) error {
+	if err := contextOrBackground(ctx).Err(); err != nil {
+		return err
+	}
+	lease, err := b.newOperation(ctx)
+	if err != nil {
+		return err
+	}
+	defer lease.release()
+	oldResolved, _, err := b.resolve(oldPath)
+	if err != nil {
+		return err
+	}
+	newResolved, _, err := b.resolve(newPath)
+	if err != nil {
+		return err
+	}
+	if err := renameWithContext(ctx, lease.client, oldResolved, newResolved); err != nil {
+		if isNotFound(err) {
+			return fmt.Errorf("%w: %s", storage.ErrNotFound, oldPath)
+		}
+		return fmt.Errorf("hdfs: rename %s to %s: %w", oldPath, newPath, err)
 	}
 	return nil
 }
@@ -968,6 +1102,14 @@ type contextRenamer interface {
 	RenameContext(context.Context, string, string) error
 }
 
+type statter interface {
+	Stat(string) (os.FileInfo, error)
+}
+
+type contextStatter interface {
+	StatContext(context.Context, string) (os.FileInfo, error)
+}
+
 func removeWithContext(ctx context.Context, client Client, name string) error {
 	if remover, ok := client.(contextRemover); ok {
 		return remover.RemoveContext(contextOrBackground(ctx), name)
@@ -980,6 +1122,18 @@ func renameWithContext(ctx context.Context, client Client, oldpath, newpath stri
 		return renamer.RenameContext(contextOrBackground(ctx), oldpath, newpath)
 	}
 	return client.Rename(oldpath, newpath)
+}
+
+func statWithContext(ctx context.Context, client Client, name string) (os.FileInfo, bool, error) {
+	if client, ok := client.(contextStatter); ok {
+		info, err := client.StatContext(contextOrBackground(ctx), name)
+		return info, true, err
+	}
+	if client, ok := client.(statter); ok {
+		info, err := client.Stat(name)
+		return info, true, err
+	}
+	return nil, false, nil
 }
 
 func clearDeadline(target any) error {
@@ -1094,6 +1248,7 @@ type file struct {
 	mu       sync.Mutex
 	reader   Reader
 	release  func() error
+	info     os.FileInfo
 	size     int64
 	closed   bool
 	complete func()
@@ -1105,6 +1260,35 @@ func (f *file) ReadAt(p []byte, off int64) (int, error) {
 	defer f.mu.Unlock()
 	return f.reader.ReadAt(p, off)
 }
+
+// ReadAtContext applies ctx's current deadline for this read.
+func (f *file) ReadAtContext(ctx context.Context, p []byte, off int64) (int, error) {
+	if err := contextOrBackground(ctx).Err(); err != nil {
+		return 0, err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.closed {
+		return 0, errBackendClosed
+	}
+	if err := syncDeadline(ctx, f.reader); err != nil {
+		return 0, err
+	}
+	stopInterrupt := context.AfterFunc(contextOrBackground(ctx), func() {
+		if setter, ok := f.reader.(deadlineSetter); ok {
+			_ = setter.SetDeadline(time.Now())
+		}
+	})
+	defer stopInterrupt()
+	n, err := f.reader.ReadAt(p, off)
+	if ctxErr := contextOrBackground(ctx).Err(); ctxErr != nil {
+		return n, errors.Join(err, ctxErr)
+	}
+	return n, err
+}
+
+// Stat returns the metadata snapshot captured when the file was opened.
+func (f *file) Stat() os.FileInfo { return f.info }
 
 func (f *file) Close() error {
 	return f.close()
@@ -1238,12 +1422,42 @@ func (w *replaceWriter) Write(p []byte) (int, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.closed || w.abortRequested {
-		return 0, errors.New("hdfs: write after close")
+		return 0, ErrClosed
 	}
 	n, err := w.writer.Write(p)
 	if n > 0 {
 		_, _ = w.digest.Write(p[:n])
 		w.written += int64(n)
+	}
+	return n, err
+}
+
+// WriteContext applies ctx's current deadline for this write.
+func (w *replaceWriter) WriteContext(ctx context.Context, p []byte) (int, error) {
+	if err := contextOrBackground(ctx).Err(); err != nil {
+		return 0, err
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed || w.abortRequested {
+		return 0, ErrClosed
+	}
+	if err := syncDeadline(ctx, w.writer); err != nil {
+		return 0, err
+	}
+	stopInterrupt := context.AfterFunc(contextOrBackground(ctx), func() {
+		if setter, ok := w.writer.(deadlineSetter); ok {
+			_ = setter.SetDeadline(time.Now())
+		}
+	})
+	defer stopInterrupt()
+	n, err := w.writer.Write(p)
+	if n > 0 {
+		_, _ = w.digest.Write(p[:n])
+		w.written += int64(n)
+	}
+	if ctxErr := contextOrBackground(ctx).Err(); ctxErr != nil {
+		return n, errors.Join(err, ctxErr)
 	}
 	return n, err
 }

@@ -35,10 +35,8 @@ const DefaultIndexBlockSize = 128 * 1024
 //	for each cell: w.Append(key, value)
 //	w.Close()
 //
-// V0 limitations:
-//   - Single locality group (the default LG). No named LGs / sample
-//     groups / vector index. Java's RFile.Writer wraps every output in
-//     a default LG by default too, so this is the common case.
+// Limitations:
+//   - No sample groups or vector index.
 //   - Cell ordering: caller MUST Append cells in non-decreasing Key
 //     order. The writer doesn't sort or check; out-of-order keys would
 //     produce a malformed RFile.
@@ -77,8 +75,12 @@ type Writer struct {
 	pendingLeaf *index.IndexEntry
 
 	// Whole-file metadata.
-	firstKey *Key
-	cfCounts map[string]int64
+	firstKey       *Key
+	cfCounts       map[string]int64
+	localityGroups []*index.LocalityGroup
+	currentLGName  string
+	currentDefault bool
+	localityNames  map[string]struct{}
 
 	// blockmeta accumulators. Empty when no builders configured. Per-
 	// block snapshots are appended to blockOverlays at every data-block
@@ -157,12 +159,14 @@ func NewWriter(out io.Writer, opts WriterOptions) (*Writer, error) {
 		return nil, fmt.Errorf("rfile: codec %q not registered in compressor", opts.Codec)
 	}
 	return &Writer{
-		out:        bcfile.NewWriter(out, opts.Codec),
-		comp:       opts.Compressor,
-		opts:       opts,
-		cfCounts:   map[string]int64{},
-		bmBuilders: opts.BlockMetaBuilders,
-		adjBuilder: newAdjBuilder(opts.AdjacencyEdgeCF),
+		out:            bcfile.NewWriter(out, opts.Codec),
+		comp:           opts.Compressor,
+		opts:           opts,
+		cfCounts:       map[string]int64{},
+		currentDefault: true,
+		localityNames:  map[string]struct{}{},
+		bmBuilders:     opts.BlockMetaBuilders,
+		adjBuilder:     newAdjBuilder(opts.AdjacencyEdgeCF),
 	}, nil
 }
 
@@ -220,6 +224,28 @@ func (w *Writer) Append(key *Key, value []byte) error {
 			return err
 		}
 	}
+	return nil
+}
+
+// AddLocalityGroup finishes the current locality group and starts a named
+// group. Keys must remain sorted within each group, but groups are independent
+// streams and may restart at any key. Names are unique and non-empty.
+func (w *Writer) AddLocalityGroup(name string) error {
+	if w.closed {
+		return errors.New("rfile: writer closed")
+	}
+	if name == "" {
+		return errors.New("rfile: locality group name is empty")
+	}
+	if _, exists := w.localityNames[name]; exists {
+		return fmt.Errorf("rfile: duplicate locality group %q", name)
+	}
+	if err := w.finalizeCurrentLocalityGroup(); err != nil {
+		return err
+	}
+	w.currentDefault = false
+	w.currentLGName = name
+	w.localityNames[name] = struct{}{}
 	return nil
 }
 
@@ -298,31 +324,13 @@ func (w *Writer) Close() error {
 		return nil
 	}
 	w.closed = true
-	if err := w.flushDataBlock(); err != nil {
+	if err := w.finalizeCurrentLocalityGroup(); err != nil {
 		return err
-	}
-	if w.pendingLeaf != nil {
-		if err := w.indexAdd(w.pendingLeaf, true); err != nil {
-			return err
-		}
-		w.pendingLeaf = nil
-	}
-
-	root, err := w.buildRoot()
-	if err != nil {
-		return fmt.Errorf("rfile.Close: build root index: %w", err)
-	}
-	lg := &index.LocalityGroup{
-		IsDefault:       true,
-		ColumnFamilies:  w.cfCounts,
-		FirstKey:        w.firstKey,
-		NumTotalEntries: w.totalAdded,
-		RootIndex:       root,
 	}
 
 	// Serialize the RFile.index meta block.
 	var rfIdx bytes.Buffer
-	if err := writeRFileIndexMeta(&rfIdx, lg); err != nil {
+	if err := writeRFileIndexMeta(&rfIdx, w.localityGroups); err != nil {
 		return fmt.Errorf("rfile.Close: serialize RFile.index: %w", err)
 	}
 	rawSize := int64(rfIdx.Len())
@@ -371,6 +379,40 @@ func (w *Writer) Close() error {
 	if err := w.out.Close(); err != nil {
 		return fmt.Errorf("rfile.Close: BCFile close: %w", err)
 	}
+	return nil
+}
+
+func (w *Writer) finalizeCurrentLocalityGroup() error {
+	if err := w.flushDataBlock(); err != nil {
+		return err
+	}
+	if w.pendingLeaf != nil {
+		if err := w.indexAdd(w.pendingLeaf, true); err != nil {
+			return err
+		}
+		w.pendingLeaf = nil
+	}
+	root, err := w.buildRoot()
+	if err != nil {
+		return fmt.Errorf("rfile: build locality group %q root index: %w", w.currentLGName, err)
+	}
+	w.localityGroups = append(w.localityGroups, &index.LocalityGroup{
+		IsDefault:       w.currentDefault,
+		Name:            w.currentLGName,
+		ColumnFamilies:  w.cfCounts,
+		FirstKey:        w.firstKey,
+		NumTotalEntries: w.totalAdded,
+		RootIndex:       root,
+	})
+	w.blockBuf.Reset()
+	w.blockPrev = nil
+	w.blockLast = nil
+	w.blockEntries = 0
+	w.levels = nil
+	w.totalAdded = 0
+	w.pendingLeaf = nil
+	w.firstKey = nil
+	w.cfCounts = map[string]int64{}
 	return nil
 }
 
@@ -546,18 +588,20 @@ func (w *Writer) buildRoot() (*index.IndexBlock, error) {
 // false bytes, Java EOFs partway through. Confirmed via Java writer at
 // RFile.java:662-703 which emits a false-bool for samples and a false-
 // bool for vector index whenever those features aren't in use.
-func writeRFileIndexMeta(w io.Writer, lg *index.LocalityGroup) error {
+func writeRFileIndexMeta(w io.Writer, groups []*index.LocalityGroup) error {
 	if err := wire.WriteInt32(w, index.RIndexMagic); err != nil {
 		return err
 	}
 	if err := wire.WriteInt32(w, index.V8); err != nil {
 		return err
 	}
-	if err := wire.WriteInt32(w, 1); err != nil { // group count
+	if err := wire.WriteInt32(w, int32(len(groups))); err != nil {
 		return err
 	}
-	if err := index.WriteLocalityGroup(w, lg, index.V8); err != nil {
-		return err
+	for _, lg := range groups {
+		if err := index.WriteLocalityGroup(w, lg, index.V8); err != nil {
+			return err
+		}
 	}
 	// V8 trailer: two trailing booleans for sample-groups + vector-index.
 	// Both false (we don't produce either feature in V0).

@@ -22,7 +22,7 @@
  */
 #define SHOAL_ABI_VERSION 1u
 #define SHOAL_ABI_VERSION_MAJOR 1u
-#define SHOAL_ABI_VERSION_MINOR 15u
+#define SHOAL_ABI_VERSION_MINOR 16u
 #define SHOAL_ABI_VERSION_PATCH 0u
 #define SHOAL_ABI_PACK_VERSION(major, minor, patch)                           \
   ((((uint32_t)(major) & 0xffu) << 16) |                                     \
@@ -66,10 +66,12 @@ enum {
   SHOAL_ABI_CAPABILITY_COMPATIBILITY_ERRORS = 23,
   SHOAL_ABI_CAPABILITY_STREAMING_SCAN_CURSOR = 24,
   SHOAL_ABI_CAPABILITY_COLUMN_VISIBILITY = 25,
-  SHOAL_ABI_CAPABILITY_OWNED_KEY = 26
+  SHOAL_ABI_CAPABILITY_OWNED_KEY = 26,
+  SHOAL_ABI_CAPABILITY_HDFS = 27,
+  SHOAL_ABI_CAPABILITY_RFILE_LOCALITY_GROUPS = 28
 };
 
-#define SHOAL_ABI_CAPABILITY_COUNT 27u
+#define SHOAL_ABI_CAPABILITY_COUNT 29u
 #define SHOAL_ABI_CAPABILITY_WORD_BITS 64u
 #define SHOAL_ABI_CAPABILITY_WORD_INDEX(capability_id)                       \
   ((uint32_t)(capability_id) / SHOAL_ABI_CAPABILITY_WORD_BITS)
@@ -133,6 +135,10 @@ enum {
   SHOAL_ABI_CAPABILITY_MASK(SHOAL_ABI_CAPABILITY_COLUMN_VISIBILITY)
 #define SHOAL_ABI_CAPABILITY_OWNED_KEY_MASK                                  \
   SHOAL_ABI_CAPABILITY_MASK(SHOAL_ABI_CAPABILITY_OWNED_KEY)
+#define SHOAL_ABI_CAPABILITY_HDFS_MASK                                       \
+  SHOAL_ABI_CAPABILITY_MASK(SHOAL_ABI_CAPABILITY_HDFS)
+#define SHOAL_ABI_CAPABILITY_RFILE_LOCALITY_GROUPS_MASK                      \
+  SHOAL_ABI_CAPABILITY_MASK(SHOAL_ABI_CAPABILITY_RFILE_LOCALITY_GROUPS)
 #define SHOAL_ABI_CAPABILITY_WORD0                                           \
   (SHOAL_ABI_CAPABILITY_CONNECTOR_MASK | SHOAL_ABI_CAPABILITY_BOOTSTRAP_MASK | \
    SHOAL_ABI_CAPABILITY_ERROR_MASK | SHOAL_ABI_CAPABILITY_SCANNER_MASK |     \
@@ -158,7 +164,9 @@ enum {
    SHOAL_ABI_CAPABILITY_COMPATIBILITY_ERRORS_MASK |                          \
    SHOAL_ABI_CAPABILITY_STREAMING_SCAN_CURSOR_MASK |                         \
    SHOAL_ABI_CAPABILITY_COLUMN_VISIBILITY_MASK |                             \
-   SHOAL_ABI_CAPABILITY_OWNED_KEY_MASK)
+   SHOAL_ABI_CAPABILITY_OWNED_KEY_MASK |                                     \
+   SHOAL_ABI_CAPABILITY_HDFS_MASK |                                          \
+   SHOAL_ABI_CAPABILITY_RFILE_LOCALITY_GROUPS_MASK)
 
 typedef int32_t shoal_status;
 
@@ -245,6 +253,11 @@ typedef struct shoal_rfile_reader shoal_rfile_reader;
 typedef struct shoal_rfile_writer shoal_rfile_writer;
 typedef struct shoal_rfile_seekable shoal_rfile_seekable;
 typedef struct shoal_rfile_entry_result shoal_rfile_entry_result;
+typedef struct shoal_hdfs_client shoal_hdfs_client;
+typedef struct shoal_hdfs_input_stream shoal_hdfs_input_stream;
+typedef struct shoal_hdfs_output_stream shoal_hdfs_output_stream;
+typedef struct shoal_hdfs_dir_entry_result shoal_hdfs_dir_entry_result;
+typedef struct shoal_hdfs_dir_list_result shoal_hdfs_dir_list_result;
 typedef struct shoal_authorizations shoal_authorizations;
 typedef struct shoal_column_visibility shoal_column_visibility;
 typedef struct shoal_owned_key shoal_owned_key;
@@ -412,6 +425,21 @@ typedef struct shoal_rfile_entry_view {
 #define SHOAL_RFILE_ENTRY_VIEW_V1_SIZE                                       \
   ((uint32_t)(offsetof(shoal_rfile_entry_view, deleted) +                    \
               sizeof(((shoal_rfile_entry_view *)0)->deleted)))
+
+typedef struct shoal_hdfs_dir_entry_view {
+  uint32_t struct_size;
+  const char *name;
+  const char *owner;
+  const char *group;
+  int64_t size;
+  int64_t modification_time_ms;
+  uint32_t mode;
+  uint8_t is_directory;
+} shoal_hdfs_dir_entry_view;
+
+#define SHOAL_HDFS_DIR_ENTRY_VIEW_V1_SIZE                                    \
+  ((uint32_t)(offsetof(shoal_hdfs_dir_entry_view, is_directory) +            \
+              sizeof(((shoal_hdfs_dir_entry_view *)0)->is_directory)))
 
 typedef int32_t shoal_range_bound_kind;
 
