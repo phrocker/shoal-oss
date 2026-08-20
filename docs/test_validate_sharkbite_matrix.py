@@ -1062,13 +1062,8 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
 
     def test_proposed_entries_must_exclude_the_approved_and_subsumed_decisions(self) -> None:
         text = load_document_text().replace(
-            "The remaining 7 entries — every decision except the approved "
-            "[SB-DIV-001](#sec-26), [SB-DIV-002](#sec-26), [SB-DIV-003](#sec-26), "
-            "[SB-DIV-004](#sec-26), [SB-DIV-007](#sec-26), [SB-DIV-008](#sec-26), "
-            "[SB-DIV-009](#sec-26), [SB-DIV-016](#sec-26), [SB-DIV-017](#sec-26), "
-            "[SB-DIV-018](#sec-26), [SB-DIV-019](#sec-26) "
-            "and the subsumed [SB-DIV-013](#sec-26) — are **proposed**",
-            "The remaining entries are **proposed**",
+            "The remaining 7 entries — every decision except the approved",
+            "The remaining entries — every decision except the approved",
         )
         rows = validator.parse_rows(text.splitlines())[2]
         self.assert_validation_fails(
@@ -2226,7 +2221,7 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
     def test_pinned_inventory_rejects_status_swap_between_rows_in_one_section(self) -> None:
         text = load_document_text()
         first = "| SB-PKG-002 |"
-        second = "| SB-PKG-014 |"
+        second = "| SB-PKG-008 |"
         lines = text.splitlines()
         first_index = next(i for i, line in enumerate(lines) if line.startswith(first))
         second_index = next(i for i, line in enumerate(lines) if line.startswith(second))
@@ -2241,9 +2236,8 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
         self.assert_validation_fails(
             lambda: validator.validate_counts(mutated.splitlines(), mutated),
             f"revision {validator.EXPECTED_REVISION} inventory rows changed",
-            "reclassified [SB-PKG-002 pinned Covered found Intentional divergence "
-            "(approval required), SB-PKG-014 pinned Intentional divergence (approval required) "
-            "found Covered]",
+            "reclassified [SB-PKG-002 pinned Covered found Missing C ABI, "
+            "SB-PKG-008 pinned Missing C ABI found Covered]",
         )
 
     def test_validate_revision_inventory_rejects_same_prefix_row_id_substitution(self) -> None:
@@ -2477,15 +2471,15 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
 
     def test_pinned_inventory_constants_are_internally_consistent(self) -> None:
         validator.validate_pinned_inventory_constants()
-        self.assertEqual(validator.EXPECTED_REVISION, 49)
+        self.assertEqual(validator.EXPECTED_REVISION, 50)
         self.assertEqual(validator.EXPECTED_TOTAL_ROWS, 3203)
         self.assertEqual(validator.EXPECTED_REQUIRED_ROWS, 397)
         self.assertEqual(
             validator.EXPECTED_SCOPE_COUNTS,
             {
-                "Covered": 161,
+                "Covered": 173,
                 "Approved divergence": 94,
-                "Required gap": 142,
+                "Required gap": 130,
                 "Optional": 2763,
                 "Not required": 43,
             },
@@ -2493,26 +2487,17 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
         self.assertEqual(
             validator.EXPECTED_STATUS_COUNTS,
             {
-                "Covered": 224,
+                "Covered": 236,
                 "Missing Go": 2218,
-                "Missing C ABI": 83,
-                "Behavior mismatch": 193,
+                "Missing C ABI": 82,
+                "Behavior mismatch": 182,
                 validator.INTENTIONAL_DIVERGENCE_STATUS: 94,
                 validator.NOT_REQUIRED_STATUS: 391,
             },
         )
         self.assertEqual(validator.EXPECTED_C_ABI_DECLARED_EXPORTS, 318)
-        self.assertEqual(validator.EXPECTED_C_ABI_REFERENCED_EXPORTS, 313)
-        self.assertEqual(
-            validator.EXPECTED_C_ABI_UNREFERENCED_EXPORTS,
-            (
-                "shoal_scanner_scan",
-                "shoal_batch_scanner_scan",
-                "shoal_write_failure_get_constraint",
-                "shoal_write_failure_get_authorization",
-                "shoal_write_failure_get_cleanup",
-            ),
-        )
+        self.assertEqual(validator.EXPECTED_C_ABI_REFERENCED_EXPORTS, 318)
+        self.assertEqual(validator.EXPECTED_C_ABI_UNREFERENCED_EXPORTS, ())
 
     def test_collect_c_abi_symbol_inventory_matches_pinned_values(self) -> None:
         exports, referenced, unreferenced = validator.collect_c_abi_symbol_inventory()
@@ -2545,7 +2530,7 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
         counts = validator.validate_scope_manifest(rows)
         self.assertEqual(dict(counts), validator.EXPECTED_SCOPE_COUNTS)
         entries = {entry[0]: entry for entry in validator.load_expected_scope()}
-        for row_id in ("SB-XCUT-014", "SB-XCUT-019", "SB-PKG-008"):
+        for row_id in ("SB-XCUT-014", "SB-XCUT-019", "SB-PKG-008", "SB-PKG-011"):
             self.assertEqual(entries[row_id][1], "Required gap")
         for row_id in ("SB-PKG-012", "SB-PKG-013", "SB-TORCH-001", "SB-PANDA-001"):
             self.assertEqual(entries[row_id][1], "Optional")
@@ -2569,7 +2554,7 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
         lines[2] = "# Sharkbite source: unreviewed."
         self.assert_validation_fails(
             lambda: validator.validate_scope_manifest_provenance(lines),
-            "scope manifest provenance header does not match revision 49",
+            "scope manifest provenance header does not match revision 50",
         )
 
     def test_collect_c_abi_free_function_inventory_matches_header(self) -> None:
@@ -2696,7 +2681,7 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
             lambda: validator.validate_revision_inventory(
                 row_ids, reclassified, prefix_counts
             ),
-            f"revision {validator.EXPECTED_REVISION} inventory expects 224 rows for Covered, found 225",
+            f"revision {validator.EXPECTED_REVISION} inventory expects 236 rows for Covered, found 237",
         )
 
     def test_declared_count_edit_still_fails_internal_cross_check(self) -> None:
@@ -2724,8 +2709,9 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
 
     def test_revision_bump_requires_validator_constant_update(self) -> None:
         text = load_document_text()
+        status_snippet = validator.EXPECTED_DOCUMENT_STATUS_SNIPPETS[1]
         mutated = text.replace(
-            f"Revision {validator.EXPECTED_REVISION} — closes the semantic package/import/layout/preload rows",
+            status_snippet,
             f"Revision {validator.EXPECTED_REVISION + 1} — adds the next audited scope",
         ).replace(
             f"As of revision {validator.EXPECTED_REVISION},",
@@ -2734,7 +2720,7 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
         self.assertNotEqual(mutated, text)
         self.assert_validation_fails(
             lambda: validator.validate_counts(mutated.splitlines(), mutated),
-            f"document status is missing expected detail: Revision {validator.EXPECTED_REVISION} — closes the semantic package/import/layout/preload rows",
+            f"document status is missing expected detail: {status_snippet}",
         )
 
     # ---- matrix table separators -------------------------------------------

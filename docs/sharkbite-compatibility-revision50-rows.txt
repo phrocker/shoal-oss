@@ -1,20 +1,20 @@
-# Revision-49 accepted matrix rows for docs/sharkbite-compatibility.md.
+# Revision-50 accepted matrix rows for docs/sharkbite-compatibility.md.
 # One entry per row: ROW-ID followed by the audited status, in document order.
 # Pinning the status next to the id means a swap of two rows' statuses inside one
 # section cannot pass the aggregate count checks undetected.
-# Update only when the independently audited revision-49 inventory itself changes.
+# Update only when the independently audited revision-50 inventory itself changes.
 # Regenerate from the audited document, review every added/removed/reclassified row
 # in code review, and keep the list in document order for human auditability.
-SB-PKG-001	Missing C ABI
-SB-PKG-002	Missing C ABI
-SB-PKG-003	Missing C ABI
-SB-PKG-004	Missing C ABI
+SB-PKG-001	Intentional divergence (approval required)
+SB-PKG-002	Covered
+SB-PKG-003	Covered
+SB-PKG-004	Covered
 SB-PKG-005	Not required (rationale required)
 SB-PKG-006	Not required (rationale required)
-SB-PKG-007	Missing C ABI
+SB-PKG-007	Intentional divergence (approval required)
 SB-PKG-008	Missing C ABI
-SB-PKG-009	Missing C ABI
-SB-PKG-010	Behavior mismatch
+SB-PKG-009	Covered
+SB-PKG-010	Covered
 SB-PKG-011	Missing C ABI
 SB-PKG-012	Missing C ABI
 SB-PKG-013	Missing C ABI

@@ -1,20 +1,20 @@
-# Revision-49 Sharkbite client-scope disposition manifest.
-# Matrix: docs/sharkbite-compatibility.md revision 49.
+# Revision-50 Sharkbite client-scope disposition manifest.
+# Matrix: docs/sharkbite-compatibility.md revision 50.
 # Sharkbite source: phrocker/sharkbite@7f2625f74331b0cd4a75dc0484949c40f1409686.
-# Shoal source: phrocker/shoal-oss@900a6e9c6abebc1dec535e54f6c889cdf5791a79.
+# Shoal source: phrocker/shoal-oss@42cb379fb9cb0bf625adec477429b86bc0cd852b.
 # Policy: docs/sharkbite-client-scope.md.
 # Columns: ROW-ID<TAB>DISPOSITION<TAB>RULE<TAB>PINNED-MATRIX-STATUS.
 # Entries are in matrix order; validator rules, not aggregate counts, authorize dispositions.
-SB-PKG-001	Required gap	core-required-gap	Missing C ABI
-SB-PKG-002	Required gap	core-required-gap	Missing C ABI
-SB-PKG-003	Required gap	core-required-gap	Missing C ABI
-SB-PKG-004	Required gap	core-required-gap	Missing C ABI
+SB-PKG-001	Approved divergence	core-approved-divergence	Intentional divergence (approval required)
+SB-PKG-002	Covered	core-covered	Covered
+SB-PKG-003	Covered	core-covered	Covered
+SB-PKG-004	Covered	core-covered	Covered
 SB-PKG-005	Not required	not-required-rationale	Not required (rationale required)
 SB-PKG-006	Not required	not-required-rationale	Not required (rationale required)
-SB-PKG-007	Required gap	core-required-gap	Missing C ABI
+SB-PKG-007	Approved divergence	core-approved-divergence	Intentional divergence (approval required)
 SB-PKG-008	Required gap	core-required-gap	Missing C ABI
-SB-PKG-009	Required gap	core-required-gap	Missing C ABI
-SB-PKG-010	Required gap	core-required-gap	Behavior mismatch
+SB-PKG-009	Covered	core-covered	Covered
+SB-PKG-010	Covered	core-covered	Covered
 SB-PKG-011	Required gap	core-required-gap	Missing C ABI
 SB-PKG-012	Optional	optional-python-extra	Missing C ABI
 SB-PKG-013	Optional	optional-python-extra	Missing C ABI
