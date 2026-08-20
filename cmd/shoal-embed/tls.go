@@ -19,14 +19,14 @@ package main
 
 import (
 	"crypto/tls"
-	"crypto/x509"
 	"fmt"
 	"io"
 	"log"
 	"log/slog"
-	"os"
 	"regexp"
 	"strings"
+
+	"github.com/phrocker/shoal/internal/tlsserver"
 )
 
 // tlsFilesConfig is the resolved (flag-or-env) TLS file configuration for
@@ -81,32 +81,7 @@ func (c tlsFilesConfig) validate() error {
 // mutate the config they're given (e.g. ALPN NextProtos) as a side effect
 // of use.
 func buildServerTLSConfig(certFile, keyFile, clientCAFile string) (*tls.Config, error) {
-	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
-	if err != nil {
-		return nil, fmt.Errorf("load TLS key pair (cert=%q, key=%q): %w", certFile, keyFile, err)
-	}
-
-	cfg := &tls.Config{
-		Certificates: []tls.Certificate{cert},
-		MinVersion:   tls.VersionTLS12,
-	}
-
-	if clientCAFile == "" {
-		return cfg, nil
-	}
-
-	pemBytes, err := os.ReadFile(clientCAFile)
-	if err != nil {
-		return nil, fmt.Errorf("read TLS client CA file %q: %w", clientCAFile, err)
-	}
-	pool := x509.NewCertPool()
-	if !pool.AppendCertsFromPEM(pemBytes) {
-		return nil, fmt.Errorf("TLS client CA file %q contains no usable PEM certificates", clientCAFile)
-	}
-	cfg.ClientCAs = pool
-	cfg.ClientAuth = tls.RequireAndVerifyClientCert
-
-	return cfg, nil
+	return tlsserver.Build(certFile, keyFile, clientCAFile)
 }
 
 // tlsHandshakeEOFPattern matches exactly the message net/http's

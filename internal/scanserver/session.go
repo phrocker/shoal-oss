@@ -90,9 +90,10 @@ type scanSessionRegistry struct {
 	byteCap  int
 	bytes    int
 	sessions map[data.ScanID]*scanSession
+	metrics  *operationalMetrics
 }
 
-func newScanSessionRegistry(ttl time.Duration, capacity, byteCap int) *scanSessionRegistry {
+func newScanSessionRegistry(ttl time.Duration, capacity, byteCap int, metrics ...*operationalMetrics) *scanSessionRegistry {
 	if ttl <= 0 {
 		ttl = defaultScanSessionTTL
 	}
@@ -102,12 +103,16 @@ func newScanSessionRegistry(ttl time.Duration, capacity, byteCap int) *scanSessi
 	if byteCap <= 0 {
 		byteCap = defaultScanSessionBytes
 	}
-	return &scanSessionRegistry{
+	r := &scanSessionRegistry{
 		ttl:      ttl,
 		capacity: capacity,
 		byteCap:  byteCap,
 		sessions: make(map[data.ScanID]*scanSession),
 	}
+	if len(metrics) > 0 {
+		r.metrics = metrics[0]
+	}
+	return r
 }
 
 func (r *scanSessionRegistry) create(now time.Time, remaining []*data.TKeyValue) (data.ScanID, error) {
@@ -117,6 +122,9 @@ func (r *scanSessionRegistry) create(now time.Time, remaining []*data.TKeyValue)
 	r.expireLocked(now)
 	remainingBytes := sumApproxKVBytes(remaining)
 	if len(r.sessions) >= r.capacity || remainingBytes > r.byteCap-r.bytes {
+		if r.metrics != nil {
+			r.metrics.backpressureCapacity.Add(1)
+		}
 		return 0, &tabletscan.ScanServerBusyException{}
 	}
 
@@ -136,6 +144,9 @@ func (r *scanSessionRegistry) create(now time.Time, remaining []*data.TKeyValue)
 			expiresAt:      now.Add(r.ttl),
 		}
 		r.bytes += remainingBytes
+		if r.metrics != nil {
+			r.metrics.activeSingle.Add(1)
+		}
 		return id, nil
 	}
 	return 0, &tabletscan.ScanServerBusyException{}
@@ -171,6 +182,9 @@ func (r *scanSessionRegistry) continueScan(now time.Time, scanID data.ScanID, by
 	} else {
 		session.exhausted = true
 		session.release()
+		if r.metrics != nil {
+			r.metrics.activeSingle.Add(-1)
+		}
 	}
 	return &data.ScanResult_{Results: page.results, More: page.more}, nil
 }
@@ -189,6 +203,10 @@ func (r *scanSessionRegistry) closeScan(now time.Time, scanID data.ScanID) error
 		r.bytes = 0
 	}
 	session.release()
+	if r.metrics != nil && !session.exhausted {
+		r.metrics.activeSingle.Add(-1)
+		r.metrics.canceledSingle.Add(1)
+	}
 	delete(r.sessions, scanID)
 	return nil
 }
@@ -210,12 +228,37 @@ func (r *scanSessionRegistry) expireLocked(now time.Time) {
 		if !session.expiresAt.After(now) {
 			r.bytes -= session.remainingBytes
 			session.release()
+			if r.metrics != nil {
+				if !session.exhausted {
+					r.metrics.activeSingle.Add(-1)
+				}
+				r.metrics.expiredSingle.Add(1)
+			}
 			delete(r.sessions, id)
 		}
 	}
 	if r.bytes < 0 {
 		r.bytes = 0
 	}
+}
+
+func (r *scanSessionRegistry) closeAll() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	forced := 0
+	for id, session := range r.sessions {
+		if !session.exhausted {
+			forced++
+			if r.metrics != nil {
+				r.metrics.activeSingle.Add(-1)
+				r.metrics.canceledSingle.Add(1)
+			}
+		}
+		session.release()
+		delete(r.sessions, id)
+	}
+	r.bytes = 0
+	return forced
 }
 
 func newOpaqueScanID() (data.ScanID, error) {

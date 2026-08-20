@@ -43,8 +43,13 @@ func (s *Server) StartMultiScan(
 	classLoaderContext string,
 	executionHints map[string]string,
 	busyTimeout int64,
-) (*data.InitialMultiScan, error) {
+) (result *data.InitialMultiScan, retErr error) {
 	t0 := time.Now()
+	if !s.admitStart() {
+		return nil, &tabletscan.ScanServerBusyException{}
+	}
+	defer s.endCall()
+	defer func() { s.observeStart(t0, true, retErr) }()
 	if len(batch) == 0 {
 		return &data.InitialMultiScan{
 			ScanID:  0,
@@ -151,6 +156,9 @@ func (s *Server) StartMultiScan(
 	page := splitMultiScanResult(complete, s.pages)
 	scanID := data.ScanID(0)
 	if page.result.More {
+		if !s.Accepting() {
+			return nil, s.rejectDraining()
+		}
 		createdID, createErr := s.multiScans.create(
 			time.Now(),
 			page.remaining,
@@ -161,6 +169,7 @@ func (s *Server) StartMultiScan(
 		}
 		scanID = createdID
 	}
+	s.metrics.failuresTabletMulti.Add(uint64(len(failures)))
 
 	s.logger.LogAttrs(ctx, slog.LevelInfo, "multiscan complete",
 		slog.Int("tablets_in_batch", len(expanded)),

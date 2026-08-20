@@ -3,11 +3,18 @@ package metadata
 // TabletInfo is the resolved metadata for a single tablet: which tserver
 // hosts it, the row range it covers, and the RFiles backing it.
 type TabletInfo struct {
-	TableID  string
-	EndRow   []byte // nil for the last (default) tablet of a table
-	PrevRow  []byte // nil if first tablet
-	Location *Location
-	Files    []FileEntry
+	TableID string
+	EndRow  []byte // nil for the last (default) tablet of a table
+	PrevRow []byte // nil if first tablet
+	// PrevRowSet distinguishes a valid first tablet from a partial/corrupt
+	// metadata row that omitted the required ~tab:~pr column.
+	PrevRowSet bool
+	Location   *Location
+	// FutureLocation is the manager assignment not yet promoted to loc.
+	FutureLocation *Location
+	Directory      string
+	Time           string
+	Files          []FileEntry
 	// Logs are the tablet's unflushed WAL segments, parsed from the
 	// metadata "log:" column family. Empty for a fully flushed tablet.
 	// The WAL-merged read path (scanserver, Phase W2) drains these on
@@ -20,10 +27,12 @@ type TabletInfo struct {
 // sidecar: the segment UUID, its path, and the peer addresses that hold
 // replicas.
 type LogEntry struct {
-	UUID    string   // segment identifier (filename component)
-	Path    string   // raw "log:" value as recorded in metadata
-	WALPath string   // path passed to the sidecar opener
-	Peers   []string // peer host[:port] replicas holding the segment
+	UUID         string   // segment identifier (filename component)
+	Path         string   // WAL path encoded after the qualifier's "-/" prefix
+	WALPath      string   // path passed to the sidecar opener
+	Server       string   // host:port decoded from the path's host+port component
+	Peers        []string // optional replicas supplied by a later resolver
+	RawQualifier []byte   // exact metadata qualifier for mutations
 }
 
 // Location pairs a tserver host:port with the lock session it holds for a

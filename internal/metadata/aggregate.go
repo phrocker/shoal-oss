@@ -161,12 +161,39 @@ func applyColumn(t *TabletInfo, kv *data.TKeyValue) error {
 			Session:  string(cq),
 		}
 	case CFFutureLocation:
-		// V0: ignore. A pending move shows up as a future location with
-		// the current location absent; caller should retry once the move
-		// settles. (Same behavior as zk.parseRootTabletMetadata.)
+		if t.FutureLocation != nil {
+			return fmt.Errorf("multiple future: entries")
+		}
+		t.FutureLocation = &Location{
+			HostPort: string(val),
+			Session:  string(cq),
+		}
+	case CFLog:
+		log, err := DecodeLogEntry(cq)
+		if err != nil {
+			return fmt.Errorf("log qualifier: %w", err)
+		}
+		t.Logs = append(t.Logs, log)
+	case CFServer:
+		switch string(cq) {
+		case CQDirectory:
+			if t.Directory != "" {
+				return fmt.Errorf("multiple srv:dir entries")
+			}
+			t.Directory = string(val)
+		case CQTime:
+			if t.Time != "" {
+				return fmt.Errorf("multiple srv:time entries")
+			}
+			t.Time = string(val)
+		}
 	case CFTabletSection:
 		if string(cq) == CQPrevRow {
+			if t.PrevRowSet {
+				return fmt.Errorf("multiple ~tab:~pr entries")
+			}
 			t.PrevRow = decodePrevRow(val)
+			t.PrevRowSet = true
 		}
 		// Other ~tab qualifiers (split-ratio, dir, etc.) ignored in V0.
 	default:

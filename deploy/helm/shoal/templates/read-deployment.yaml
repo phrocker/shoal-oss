@@ -1,6 +1,10 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: {{ .Values.readFleet.metricsPort | quote }}
+    prometheus.io/path: /metrics
   name: {{ include "shoal.fullname" . }}-read
   labels:
     {{- include "shoal.labels" . | nindent 4 }}
@@ -26,7 +30,7 @@ spec:
         app.kubernetes.io/component: read-fleet
         app.kubernetes.io/part-of: shoal-platform
     spec:
-      terminationGracePeriodSeconds: 30
+      terminationGracePeriodSeconds: {{ .Values.readFleet.terminationGracePeriodSeconds }}
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532
@@ -60,6 +64,17 @@ spec:
             - -log-level=$(SHOAL_LOG_LEVEL)
             - -prewarm-tables=$(SHOAL_PREWARM_TABLES)
             - -prewarm-parallelism=$(SHOAL_PREWARM_PARALLELISM)
+            - -metrics-address=$(SHOAL_READ_METRICS_LISTEN)
+            - -readiness-interval=$(SHOAL_READ_READINESS_INTERVAL)
+            - -quiesce-delay=$(SHOAL_READ_QUIESCE_DELAY)
+            - -drain-timeout=$(SHOAL_READ_DRAIN_TIMEOUT)
+            {{- if .Values.readFleet.tls.enabled }}
+            - -tls-cert=/var/run/secrets/shoal/read-tls/tls.crt
+            - -tls-key=/var/run/secrets/shoal/read-tls/tls.key
+            {{- if .Values.readFleet.tls.requireClientCert }}
+            - -tls-client-ca=/var/run/secrets/shoal/read-tls/ca.crt
+            {{- end }}
+            {{- end }}
           envFrom:
             - configMapRef:
                 name: {{ include "shoal.fullname" . }}-config
@@ -74,24 +89,51 @@ spec:
           ports:
             - name: thrift
               containerPort: {{ .Values.readFleet.servicePort }}
+            - name: metrics
+              containerPort: {{ .Values.readFleet.metricsPort }}
           volumeMounts:
             - name: object-storage-credentials
               mountPath: /var/run/secrets/shoal/gcs
               readOnly: true
+            {{- if .Values.readFleet.tls.enabled }}
+            - name: read-tls
+              mountPath: /var/run/secrets/shoal/read-tls
+              readOnly: true
+            {{- end }}
           readinessProbe:
+            {{- if and .Values.readFleet.tls.enabled .Values.readFleet.tls.requireClientCert }}
             tcpSocket:
-              port: thrift
+              port: metrics
+            {{- else }}
+            httpGet:
+              path: /readyz
+              port: metrics
+              {{- if .Values.readFleet.tls.enabled }}
+              scheme: HTTPS
+              {{- end }}
+            {{- end }}
+            initialDelaySeconds: 1
+            periodSeconds: 5
+            failureThreshold: 1
+          livenessProbe:
+            {{- if and .Values.readFleet.tls.enabled .Values.readFleet.tls.requireClientCert }}
+            tcpSocket:
+              port: metrics
+            {{- else }}
+            httpGet:
+              path: /healthz
+              port: metrics
+              {{- if .Values.readFleet.tls.enabled }}
+              scheme: HTTPS
+              {{- end }}
+            {{- end }}
             initialDelaySeconds: 5
             periodSeconds: 10
-          livenessProbe:
-            tcpSocket:
-              port: thrift
-            initialDelaySeconds: 15
-            periodSeconds: 20
           resources:
             {{- toYaml .Values.readFleet.resources | nindent 12 }}
           securityContext:
             allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
             capabilities:
               drop: ["ALL"]
       volumes:
@@ -99,3 +141,8 @@ spec:
           secret:
             secretName: {{ .Values.objectStorage.credentialsSecretName }}
             optional: true
+        {{- if .Values.readFleet.tls.enabled }}
+        - name: read-tls
+          secret:
+            secretName: {{ required "readFleet.tls.secretName is required when readFleet.tls.enabled=true" .Values.readFleet.tls.secretName }}
+        {{- end }}

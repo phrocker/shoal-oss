@@ -140,11 +140,8 @@ func TestWriteTierManifestHasDisruptionAndRolloutHardening(t *testing.T) {
 
 // TestReadFleetManifestHasDisruptionAndRolloutHardening is
 // TestWriteTierManifestHasDisruptionAndRolloutHardening's read-fleet
-// counterpart. It deliberately does NOT assert an HTTP health surface for
-// this tier: cmd/shoal (the read-fleet binary) has no HTTP health/ready
-// endpoints today, so the manifest correctly still uses tcpSocket probes —
-// asserting otherwise here would overclaim a readiness contract this tier
-// doesn't have.
+// counterpart. The HTTP readiness probe is semantic: it covers ZooKeeper,
+// metadata, storage, listener state, and scan-session admission.
 func TestReadFleetManifestHasDisruptionAndRolloutHardening(t *testing.T) {
 	docs := splitYAMLDocuments(readManifest(t, "k8s/read-fleet.yaml"))
 	if len(docs) != 3 {
@@ -160,10 +157,12 @@ func TestReadFleetManifestHasDisruptionAndRolloutHardening(t *testing.T) {
 	requireContains(t, dep, "maxUnavailable: 0")
 	requireContains(t, dep, "maxSurge: 1")
 	requireContains(t, dep, "podAntiAffinity:")
-	requireContains(t, dep, "tcpSocket:")
-	if strings.Contains(dep.text, "httpGet:") {
-		t.Error("read-fleet Deployment now has an httpGet probe; if cmd/shoal gained an HTTP health surface, update this test (and deploy/README.md's readiness-contract section) to match — don't leave this assertion stale")
-	}
+	requireContains(t, dep, "path: /readyz")
+	requireContains(t, dep, "path: /healthz")
+	requireContains(t, dep, "-metrics-address=$(SHOAL_READ_METRICS_LISTEN)")
+	requireContains(t, dep, "-drain-timeout=$(SHOAL_READ_DRAIN_TIMEOUT)")
+	requireContains(t, dep, "readOnlyRootFilesystem: true")
+	requireContains(t, dep, "terminationGracePeriodSeconds: 45")
 
 	pdb := requireDoc(t, docs, "PodDisruptionBudget", "shoal-read")
 	// The PDB's own maxUnavailable is intentionally a separate, more
@@ -173,6 +172,20 @@ func TestReadFleetManifestHasDisruptionAndRolloutHardening(t *testing.T) {
 	// gated on a replacement pod being ready first the way a rollout is.
 	requireContains(t, pdb, "maxUnavailable: 1")
 	requireContains(t, pdb, "app.kubernetes.io/component: read-fleet")
+}
+
+func TestReadFleetMonitoringRulesUseExportedMetrics(t *testing.T) {
+	alerts := readManifest(t, "monitoring/read-fleet-alerts.yaml")
+	for _, metric := range []string{
+		"shoal_read_accepting_sessions",
+		"shoal_scan_backpressure_total",
+		"shoal_scan_failures_total",
+		"shoal_scan_sessions_expired_total",
+	} {
+		if !strings.Contains(alerts, metric) {
+			t.Errorf("read-fleet alerts missing metric %q", metric)
+		}
+	}
 }
 
 // TestPlainManifestsCarryNoUnconditionalTLS guards the plain-YAML
@@ -228,6 +241,9 @@ func TestHelmValuesDeclareDisruptionRolloutAndTLSDefaults(t *testing.T) {
 		"enabled: false",
 		"strategy:",
 		"maxSurge: 1",
+		"readinessInterval: 10s",
+		"drainTimeout: 30s",
+		"terminationGracePeriodSeconds: 45",
 	} {
 		if !strings.Contains(values, want) {
 			t.Errorf("helm/shoal/values.yaml: want to contain %q", want)
@@ -253,6 +269,22 @@ func TestHelmValuesDeclareDisruptionRolloutAndTLSDefaults(t *testing.T) {
 	}
 	if !strings.Contains(readFleetSection, "maxUnavailable: 1") {
 		t.Error("helm/shoal/values.yaml: readFleet.podDisruptionBudget.maxUnavailable must stay 1 (voluntary-disruption budget, deliberately separate from the rollout strategy above)")
+	}
+}
+
+func TestHelmReadFleetTLSProbeTemplates(t *testing.T) {
+	template := readManifest(t, "helm/shoal/templates/read-deployment.yaml")
+	for _, want := range []string{
+		"readFleet.tls.enabled",
+		"readFleet.tls.requireClientCert",
+		"scheme: HTTPS",
+		"path: /readyz",
+		"tcpSocket:",
+		"readOnlyRootFilesystem: true",
+	} {
+		if !strings.Contains(template, want) {
+			t.Errorf("helm read deployment: want to contain %q", want)
+		}
 	}
 }
 
@@ -329,6 +361,15 @@ func TestHelmChartLintsAndRenders(t *testing.T) {
 			wantContains:    []string{"tcpSocket:"},
 			wantNotContains: []string{"scheme: HTTPS"},
 		},
+		{name: "read fleet TLS enabled", args: []string{
+			"--set", "readFleet.tls.enabled=true",
+			"--set", "readFleet.tls.secretName=shoal-read-tls",
+		}},
+		{name: "read fleet mTLS enabled", args: []string{
+			"--set", "readFleet.tls.enabled=true",
+			"--set", "readFleet.tls.secretName=shoal-read-tls",
+			"--set", "readFleet.tls.requireClientCert=true",
+		}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

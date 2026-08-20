@@ -15,10 +15,17 @@ spec:
     - name: thrift
       port: 9800
       targetPort: thrift
+    - name: metrics
+      port: 9801
+      targetPort: metrics
 ---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "9801"
+    prometheus.io/path: /metrics
   name: shoal-read
   labels:
     app.kubernetes.io/name: shoal
@@ -50,7 +57,7 @@ spec:
         app.kubernetes.io/component: read-fleet
         app.kubernetes.io/part-of: shoal-platform
     spec:
-      terminationGracePeriodSeconds: 30
+      terminationGracePeriodSeconds: 45
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532
@@ -83,6 +90,14 @@ spec:
             - -log-level=$(SHOAL_LOG_LEVEL)
             - -prewarm-tables=$(SHOAL_PREWARM_TABLES)
             - -prewarm-parallelism=$(SHOAL_PREWARM_PARALLELISM)
+            - -metrics-address=$(SHOAL_READ_METRICS_LISTEN)
+            - -readiness-interval=$(SHOAL_READ_READINESS_INTERVAL)
+            - -quiesce-delay=$(SHOAL_READ_QUIESCE_DELAY)
+            - -drain-timeout=$(SHOAL_READ_DRAIN_TIMEOUT)
+            # TLS is opt-in. Mount a Secret as read-tls and uncomment:
+            # - -tls-cert=/var/run/secrets/shoal/read-tls/tls.crt
+            # - -tls-key=/var/run/secrets/shoal/read-tls/tls.key
+            # - -tls-client-ca=/var/run/secrets/shoal/read-tls/ca.crt
           envFrom:
             - configMapRef:
                 name: shoal-platform-config
@@ -97,20 +112,28 @@ spec:
           ports:
             - name: thrift
               containerPort: 9800
+            - name: metrics
+              containerPort: 9801
           volumeMounts:
             - name: object-storage-credentials
               mountPath: /var/run/secrets/shoal/gcs
               readOnly: true
           readinessProbe:
-            tcpSocket:
-              port: thrift
+            # If the commented TLS flags above are enabled, add
+            # scheme: HTTPS. For mutual TLS, use tcpSocket on metrics
+            # because kubelet cannot present a client certificate.
+            httpGet:
+              path: /readyz
+              port: metrics
+            initialDelaySeconds: 1
+            periodSeconds: 5
+            failureThreshold: 1
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
             initialDelaySeconds: 5
             periodSeconds: 10
-          livenessProbe:
-            tcpSocket:
-              port: thrift
-            initialDelaySeconds: 15
-            periodSeconds: 20
           resources:
             requests:
               cpu: 500m
@@ -120,6 +143,7 @@ spec:
               memory: 2Gi
           securityContext:
             allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
             capabilities:
               drop: ["ALL"]
       volumes:

@@ -5,9 +5,10 @@
 //  2. Wraps a metadata.Walker for tablet→file lookups, fronted by a
 //     LocatorCache so repeated scans on the same tablet hit memory.
 //  3. Maintains an LRU block cache of decompressed RFile blocks.
-//  4. Serves Thrift TabletScanClientService.startScan via
-//     internal/scanserver. ContinueScan/CloseScan are no-ops; each
-//     StartScan is single-shot.
+//  4. Serves the stateful Thrift TabletScanClientService via
+//     internal/scanserver, including bounded continuation sessions.
+//  5. Optionally serves semantic readiness and Prometheus metrics and
+//     performs bounded, admission-closing scan drain on termination.
 //
 // Per the V0 spec, this binary is the only artifact deployed —
 // fleet-mode is enabled by running N replicas behind a Kubernetes
@@ -16,6 +17,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"flag"
 	"fmt"
@@ -42,6 +44,7 @@ import (
 	"github.com/phrocker/shoal/internal/storage/local"
 	"github.com/phrocker/shoal/internal/storage/s3"
 	"github.com/phrocker/shoal/internal/thrift/gen/tabletscan"
+	"github.com/phrocker/shoal/internal/tlsserver"
 	"github.com/phrocker/shoal/internal/zk"
 )
 
@@ -67,6 +70,13 @@ func main() {
 	logLevel := flag.String("log-level", "info", "slog level: debug, info, warn, error")
 	prewarmTables := flag.String("prewarm-tables", "auto", "comma-separated table IDs to pre-warm into the file cache on startup. \"auto\" = walk metadata for all user tables. empty = disable prewarming.")
 	prewarmParallelism := flag.Int("prewarm-parallelism", 8, "parallel GCS fetches during prewarm")
+	metricsAddress := flag.String("metrics-address", "", "HTTP health/readiness/metrics listener; empty disables")
+	readinessInterval := flag.Duration("readiness-interval", 10*time.Second, "ZooKeeper/metadata/storage readiness recheck interval")
+	quiesceDelay := flag.Duration("quiesce-delay", 5*time.Second, "delay after readiness withdrawal before bounded scan drain")
+	drainTimeout := flag.Duration("drain-timeout", 30*time.Second, "maximum time for existing scan sessions to finish")
+	tlsCert := flag.String("tls-cert", "", "PEM server certificate for Thrift and operations listeners (or SHOAL_TLS_CERT)")
+	tlsKey := flag.String("tls-key", "", "PEM server key for Thrift and operations listeners (or SHOAL_TLS_KEY)")
+	tlsClientCA := flag.String("tls-client-ca", "", "PEM client CA requiring mutual TLS (or SHOAL_TLS_CLIENT_CA)")
 	flag.Parse()
 
 	if *showVersion {
@@ -87,6 +97,20 @@ func main() {
 	}
 	if *password == "" {
 		die("shoal: password required (-password or SHOAL_PASSWORD env)")
+	}
+	*tlsCert = valueOrEnv(*tlsCert, "SHOAL_TLS_CERT")
+	*tlsKey = valueOrEnv(*tlsKey, "SHOAL_TLS_KEY")
+	*tlsClientCA = valueOrEnv(*tlsClientCA, "SHOAL_TLS_CLIENT_CA")
+	var tlsConfig *tls.Config
+	var err error
+	if *tlsCert != "" || *tlsKey != "" || *tlsClientCA != "" {
+		if *tlsCert == "" || *tlsKey == "" {
+			die("shoal: TLS requires both -tls-cert and -tls-key")
+		}
+		tlsConfig, err = tlsserver.Build(*tlsCert, *tlsKey, *tlsClientCA)
+		if err != nil {
+			die("shoal: TLS: %v", err)
+		}
 	}
 
 	logger.Info("shoal startup",
@@ -196,9 +220,14 @@ func main() {
 	)
 	protocolFactory := protocol.NewServerFactory(loc.InstanceID(), *accVersion)
 
-	serverSocket, err := thrift.NewTServerSocket(*listenAddr)
+	var serverSocket thrift.TServerTransport
+	if tlsConfig == nil {
+		serverSocket, err = thrift.NewTServerSocket(*listenAddr)
+	} else {
+		serverSocket, err = thrift.NewTSSLServerSocket(*listenAddr, tlsConfig.Clone())
+	}
 	if err != nil {
-		die("shoal: TServerSocket %s: %v", *listenAddr, err)
+		die("shoal: server socket %s: %v", *listenAddr, err)
 	}
 	tserver := thrift.NewTSimpleServer4(
 		multiplexed,
@@ -207,7 +236,36 @@ func main() {
 		protocolFactory,
 	)
 
-	logger.Info("thrift listener up", slog.String("addr", *listenAddr))
+	ready := &readinessState{}
+	ready.setServing(true)
+	checks := readinessChecks{
+		zookeeper: func(ctx context.Context) error {
+			location, err := loc.RootTabletLocation(ctx)
+			if err != nil {
+				return err
+			}
+			if location == nil {
+				return errors.New("root tablet has no current location")
+			}
+			return nil
+		},
+		metadata: walker.BootstrapAll,
+		storage:  bk,
+	}
+	go runReadinessLoop(cmdCtx, ready, checks, *readinessInterval)
+
+	operationsServer, operationsListener, err := startOperationsServer(
+		*metricsAddress, newOperationsHandler(ready, srv), tlsConfig, logger,
+	)
+	if err != nil {
+		die("shoal: operations listener %s: %v", *metricsAddress, err)
+	}
+
+	logger.Info("thrift listener up",
+		slog.String("addr", *listenAddr),
+		slog.String("metrics", *metricsAddress),
+		slog.Bool("tls", tlsConfig != nil),
+	)
 	go func() {
 		if err := tserver.Serve(); err != nil && !errors.Is(err, net.ErrClosed) {
 			logger.Error("thrift server failed", slog.Any("err", err))
@@ -242,8 +300,46 @@ func main() {
 	}
 
 	// Graceful shutdown.
-	waitForShutdown(cmdCtx, stopCommand, logger, tserver)
+	<-cmdCtx.Done()
+	stopCommand()
+	ready.beginDrain()
+	srv.BeginDrain()
+	logger.Info("shutdown signal; scan admission disabled")
+	if *quiesceDelay > 0 {
+		timer := time.NewTimer(*quiesceDelay)
+		<-timer.C
+	}
+	drainCtx, cancelDrain := context.WithTimeout(context.Background(), *drainTimeout)
+	drainResult := srv.Drain(drainCtx)
+	cancelDrain()
+	if drainResult.Forced() > 0 {
+		logger.Warn("scan drain deadline forced session cancellation",
+			slog.Int("single", drainResult.ForcedSingle),
+			slog.Int("multi", drainResult.ForcedMulti),
+		)
+	}
+	if err := tserver.Stop(); err != nil {
+		logger.Error("thrift Stop", slog.Any("err", err))
+	}
+	ready.setServing(false)
+	if operationsServer != nil {
+		httpCtx, cancelHTTP := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := operationsServer.Shutdown(httpCtx); err != nil {
+			logger.Error("operations shutdown", slog.Any("err", err))
+		}
+		cancelHTTP()
+	}
+	if operationsListener != nil {
+		_ = operationsListener.Close()
+	}
 	logger.Info("shoal exit clean")
+}
+
+func valueOrEnv(value, env string) string {
+	if value != "" {
+		return value
+	}
+	return os.Getenv(env)
 }
 
 func waitForShutdown(ctx context.Context, releaseSignals func(), logger *slog.Logger, server serverStopper) {
