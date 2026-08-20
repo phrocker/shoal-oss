@@ -13,7 +13,7 @@ from typing import Iterable
 from .errors import exception_for_status
 
 ABI_MAJOR = 1
-MIN_ABI_VERSION = (1, 17, 0)
+MIN_ABI_VERSION = (1, 18, 0)
 CAP_OWNED_SCAN_RESULT = 5
 CAP_MUTATION = 6
 CAP_BATCH_WRITER = 7
@@ -30,6 +30,7 @@ CAP_RFILE = 16
 CAP_HDFS = 27
 CAP_RFILE_LOCALITY_GROUPS = 28
 CAP_CLIENT_PARITY_CONTROLS = 29
+CAP_ZOOKEEPER_INSTANCE = 30
 
 CAPABILITY_SYMBOLS = {
     CAP_OWNED_SCAN_RESULT: {
@@ -69,6 +70,12 @@ CAPABILITY_SYMBOLS = {
         "shoal_batch_writer_size",
         "shoal_logging_set_level",
         "shoal_logging_get_level",
+    },
+    CAP_ZOOKEEPER_INSTANCE: {
+        "shoal_zookeeper_resolve_instance",
+        "shoal_connector_identity_view_init",
+        "shoal_connector_identity_get",
+        "shoal_connector_identity_free",
     },
     CAP_STRUCTURED_WRITE_FAILURE: {
         "shoal_write_failure_get_flags",
@@ -248,6 +255,15 @@ class ConnectorConfig(C.Structure):
         ("bootstrap_timeout_ms", C.c_int64),
         ("instance_secret", C.c_char_p),
         ("dial_timeout_ms", C.c_int64),
+    ]
+
+
+class ConnectorIdentityView(C.Structure):
+    _fields_ = [
+        ("struct_size", C.c_uint32),
+        ("instance_name", C.c_char_p),
+        ("instance_id", C.c_char_p),
+        ("principal", C.c_char_p),
     ]
 
 
@@ -488,6 +504,33 @@ class NativeAPI:
         self._function("shoal_connector_close", C.c_int32, P, PP)
         self._function("shoal_connector_free", None, PP)
         optional = {"required": False}
+        self._function(
+            "shoal_zookeeper_resolve_instance",
+            C.c_int32,
+            C.c_char_p,
+            C.c_char_p,
+            C.c_int64,
+            C.c_int64,
+            C.c_char_p,
+            PP,
+            PP,
+            **optional,
+        )
+        self._function(
+            "shoal_connector_identity_view_init",
+            None,
+            C.POINTER(ConnectorIdentityView),
+            **optional,
+        )
+        self._function(
+            "shoal_connector_identity_get",
+            C.c_int32,
+            P,
+            C.POINTER(ConnectorIdentityView),
+            PP,
+            **optional,
+        )
+        self._function("shoal_connector_identity_free", None, PP, **optional)
         self._function(
             "shoal_batch_writer_config_init",
             None,

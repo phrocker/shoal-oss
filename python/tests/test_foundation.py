@@ -6,11 +6,24 @@ import unittest
 
 import pysharkbite
 import sharkbite
-from sharkbite import Client, Connector, Key, PythonIterator, ScannerOptions
+from sharkbite import (
+    AccumuloInfo,
+    AuthInfo,
+    Client,
+    Configuration,
+    Connector,
+    Key,
+    PythonIterator,
+    ScannerOptions,
+    TabletServerStatus,
+    ZookeeperInstance,
+)
 from sharkbite._native import (
     CAP_HIGH_LEVEL_CLIENT,
     CAPABILITY_SYMBOLS,
     Bytes,
+    ConnectorConfig,
+    ConnectorIdentityView,
     KeyValueView,
     NativeAPI,
     Range,
@@ -38,6 +51,10 @@ class FakeLibrary:
         self.closed = []
         self.freed = []
         self.result_freed = 0
+        self.identity_freed = 0
+        self.resolve_timeouts = []
+        self.connector_timeouts = []
+        self.connector_create_status = 0
         self._buffers = []
         self.shoal_connector_config_init = Function(self._init)
         self.shoal_client_config_init = Function(self._init)
@@ -55,6 +72,10 @@ class FakeLibrary:
         self.shoal_scan_result_count = Function(lambda result: 1)
         self.shoal_scan_result_get = Function(self._get)
         self.shoal_scan_result_free = Function(self._result_free)
+        self.shoal_zookeeper_resolve_instance = Function(self._resolve_instance)
+        self.shoal_connector_identity_view_init = Function(self._init)
+        self.shoal_connector_identity_get = Function(self._identity_get)
+        self.shoal_connector_identity_free = Function(self._identity_free)
 
     @staticmethod
     def _init(pointer):
@@ -62,10 +83,37 @@ class FakeLibrary:
             pointer._obj
         )
 
-    @staticmethod
-    def _create(config, out_handle, error):
+    def _create(self, config, out_handle, error):
+        if isinstance(config._obj, ConnectorConfig):
+            connector = C.cast(config, C.POINTER(ConnectorConfig)).contents
+            self.connector_timeouts.append(
+                connector.zookeeper_session_timeout_ms
+            )
         C.cast(out_handle, C.POINTER(C.c_void_p)).contents.value = 123
+        return self.connector_create_status
+
+    def _resolve_instance(
+        self, instance, zookeepers, session_timeout, bootstrap_timeout,
+        secret, out_result, error
+    ):
+        del zookeepers, bootstrap_timeout, secret, error
+        self.resolve_timeouts.append(session_timeout)
+        self._resolved_name = instance
+        self._resolved_id = b"uuid-1"
+        C.cast(out_result, C.POINTER(C.c_void_p)).contents.value = 789
         return 0
+
+    def _identity_get(self, result, out_view, error):
+        del result, error
+        view = C.cast(out_view, C.POINTER(ConnectorIdentityView)).contents
+        view.instance_name = self._resolved_name
+        view.instance_id = self._resolved_id
+        view.principal = b""
+        return 0
+
+    def _identity_free(self, result):
+        self.identity_freed += 1
+        C.cast(result, C.POINTER(C.c_void_p)).contents.value = None
 
     def _close(self, kind):
         self.closed.append(kind)
@@ -101,7 +149,7 @@ class FakeLibrary:
 class FakeAPI:
     def __init__(self):
         self.lib = FakeLibrary()
-        self.capabilities = frozenset(range(30))
+        self.capabilities = frozenset(range(31))
 
     def require(self, *capabilities):
         missing = set(capabilities) - self.capabilities
@@ -142,6 +190,92 @@ class FoundationTests(unittest.TestCase):
         connector.close()
         self.assertEqual(api.lib.closed, ["connector"])
         self.assertEqual(api.lib.freed, ["connector"])
+        self.assertEqual(api.lib.connector_timeouts, [1000])
+
+    def test_configuration_instance_credentials_and_explicit_connector(self):
+        api = FakeAPI()
+        configuration = Configuration()
+        configuration.set("client.key", "before")
+        with ZookeeperInstance(
+            "i", "zk1:2181,zk2:2181", 0, configuration, _api=api
+        ) as instance:
+            self.assertIsInstance(instance, sharkbite.Instance)
+            self.assertEqual(instance.getInstanceName(), "i")
+            self.assertEqual(instance.instance_name(), "i")
+            self.assertEqual(instance.getInstanceId(), "uuid-1")
+            self.assertEqual(instance.instance_id(retry=True), "uuid-1")
+            self.assertEqual(instance.session_timeout_ms, 30000)
+            configuration.set("client.key", "after")
+            self.assertEqual(
+                instance.getConfiguration().get("client.key"), "before"
+            )
+            clone = copy.copy(instance)
+            self.addCleanup(clone.close)
+            self.assertIsNot(clone.getConfiguration(), instance.getConfiguration())
+
+            auth = AuthInfo("alice", b"s\x00cret", "uuid-1")
+            self.assertEqual(auth.getUserName(), "alice")
+            self.assertEqual(auth.username(), "alice")
+            self.assertEqual(auth.getInstanceId(), "uuid-1")
+            self.assertNotIn("s", repr(auth).split("password=", 1)[1])
+            with self.assertRaisesRegex(AttributeError, "SB-DIV-002"):
+                auth.getPassword()
+            with self.assertRaisesRegex(AttributeError, "SB-DIV-002"):
+                auth.password()
+            with Connector(auth, instance, _api=api) as connector:
+                self.assertIsInstance(connector.tableOps("t"), object)
+                self.assertIsInstance(connector.securityOps(), object)
+                self.assertIsInstance(connector.namespaceOps(), object)
+                self.assertIsInstance(connector.tableInfo(), object)
+
+        self.assertEqual(api.lib.resolve_timeouts, [0, 0])
+        self.assertEqual(api.lib.identity_freed, 2)
+        self.assertEqual(api.lib.connector_timeouts, [30000])
+
+    def test_configuration_clone_and_numeric_defaults(self):
+        configuration = Configuration()
+        configuration.set("number", " 17tail")
+        clone = copy.deepcopy(configuration)
+        configuration.set("number", "99")
+        self.assertEqual(clone.get("missing"), "")
+        self.assertEqual(clone.get("missing", "fallback"), "fallback")
+        self.assertEqual(clone.getLong("number"), 17)
+        self.assertEqual(clone.getLong("missing", 23), 23)
+
+    def test_auth_info_instance_mismatch_is_rejected_before_connect(self):
+        api = FakeAPI()
+        instance = ZookeeperInstance("i", "zk", 1000, Configuration(), _api=api)
+        self.addCleanup(instance.close)
+        with self.assertRaisesRegex(ValueError, "does not match"):
+            Connector(AuthInfo("alice", "secret", "wrong"), instance, _api=api)
+        self.assertEqual(api.lib.connector_timeouts, [])
+
+    def test_bad_credentials_map_to_client_exception(self):
+        api = FakeAPI()
+        api.lib.connector_create_status = 8
+
+        def check(status, error):
+            del error
+            if status:
+                raise ClientException("bad credentials")
+
+        api.check = check
+        with self.assertRaisesRegex(ClientException, "bad credentials"):
+            Connector("i", "zk", "alice", "wrong", _api=api)
+
+    def test_connector_statistics_and_closed_lifecycle_are_stable(self):
+        api = FakeAPI()
+        connector = Connector("i", "zk", "u", "p", _api=api)
+        with self.assertRaisesRegex(NotImplementedError, "SB-DIV-016"):
+            connector.getStatistics()
+        connector.close()
+        with self.assertRaisesRegex(sharkbite.ClosedError, "closed"):
+            connector.tableOps("t")
+
+    def test_status_placeholders_preserve_dynamic_attributes(self):
+        for status in (AccumuloInfo(), TabletServerStatus()):
+            status.application_tag = "mine"
+            self.assertEqual(status.application_tag, "mine")
 
     def test_connector_copy_is_explicitly_rejected(self):
         api = FakeAPI()

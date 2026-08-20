@@ -23,6 +23,8 @@ from .compatibility import (
     unsupported_python_iterator,
     unsupported_scanner_option,
 )
+from .configuration import AuthInfo, Instance, ZookeeperInstance
+from .errors import ClosedError
 
 
 @dataclass(frozen=True)
@@ -58,6 +60,7 @@ class _Config:
         username: str,
         password: str | bytes,
         accumulo_version: str = "4.0.0-SNAPSHOT",
+        zookeeper_session_timeout_ms: int = 0,
     ) -> None:
         if not accumulo_version.startswith("4."):
             raise NotImplementedError(
@@ -77,6 +80,7 @@ class _Config:
         self.config.password_length = password_view.length
         self._keepalive.append(password_buffer)
         self.config.accumulo_version = self._string(accumulo_version)
+        self.config.zookeeper_session_timeout_ms = zookeeper_session_timeout_ms
 
     def _string(self, value: str) -> bytes:
         encoded = value.encode()
@@ -87,10 +91,10 @@ class _Config:
 class Connector:
     def __init__(
         self,
-        instance: str,
-        zookeepers: str,
-        username: str,
-        password: str | bytes,
+        instance: str | AuthInfo,
+        zookeepers: str | Instance,
+        username: str | None = None,
+        password: str | bytes | None = None,
         *,
         accumulo_version: str = "4.0.0-SNAPSHOT",
         library: str | None = None,
@@ -98,8 +102,39 @@ class Connector:
     ) -> None:
         self._api = _api or NativeAPI(library)
         self._api.require(0, 1, 2)
+        if isinstance(instance, AuthInfo):
+            if not isinstance(zookeepers, ZookeeperInstance):
+                raise TypeError("AuthInfo construction requires a ZookeeperInstance")
+            if username is not None or password is not None:
+                raise TypeError(
+                    "username and password are not accepted with AuthInfo"
+                )
+            auth = instance
+            zk_instance = zookeepers
+            if auth.getInstanceId() != zk_instance.getInstanceId():
+                raise ValueError("AuthInfo instance ID does not match Instance")
+            instance_name = zk_instance.getInstanceName()
+            zookeeper_servers = zk_instance.getZookeepers()
+            username = auth.getUserName()
+            password = auth._password_bytes()
+            session_timeout_ms = zk_instance.session_timeout_ms
+        else:
+            if not isinstance(zookeepers, str):
+                raise TypeError("zookeepers must be a comma-separated string")
+            if username is None or password is None:
+                raise TypeError("username and password are required")
+            instance_name = instance
+            zookeeper_servers = zookeepers
+            # Sharkbite's convenience constructor pins 1000 ms.
+            session_timeout_ms = 1000
         config = _Config(
-            self._api, instance, zookeepers, username, password, accumulo_version
+            self._api,
+            instance_name,
+            zookeeper_servers,
+            username,
+            password,
+            accumulo_version,
+            session_timeout_ms,
         )
         self._handle = C.c_void_p()
         error = C.c_void_p()
@@ -125,6 +160,7 @@ class Connector:
             self._closed = True
 
     def __enter__(self) -> Connector:
+        self._ensure_open()
         return self
 
     def __copy__(self) -> Connector:
@@ -134,30 +170,47 @@ class Connector:
         raise TypeError("Shoal connector handles cannot be copied")
 
     def mutation(self, row: str | bytes) -> object:
+        self._ensure_open()
         from .writer import Mutation
         return Mutation(row, _api=self._api)
 
     def create_batch_writer(
         self, table: str, *, options: object | None = None
     ) -> object:
+        self._ensure_open()
         from .writer import BatchWriter
         return BatchWriter(self, table, options=options)
 
     def tableOps(self, table: str) -> object:
+        self._ensure_open()
         from .admin import TableOperations
         return TableOperations(self, table)
 
     def namespaceOps(self) -> object:
+        self._ensure_open()
         from .admin import NamespaceOperations
         return NamespaceOperations(self)
 
     def securityOps(self) -> object:
+        self._ensure_open()
         from .admin import SecurityOperations
         return SecurityOperations(self)
 
     def tableInfo(self) -> object:
+        self._ensure_open()
         from .admin import TableInfo
         return TableInfo(self)
+
+    def getStatistics(self) -> None:
+        self._ensure_open()
+        raise NotImplementedError(
+            "Accumulo 4 removed the legacy manager-monitor statistics API; "
+            "cluster statistics are unavailable (approved divergence SB-DIV-016)"
+        )
+
+    def _ensure_open(self) -> None:
+        if self._closed:
+            raise ClosedError("connector is closed")
 
     def __exit__(self, *_: object) -> None:
         self.close()
@@ -285,7 +338,8 @@ class Client:
 
     def getStatistics(self) -> None:
         raise NotImplementedError(
-            "cluster statistics are an approved compatibility divergence (SB-DIV-016)"
+            "Accumulo 4 removed the legacy manager-monitor statistics API; "
+            "cluster statistics are unavailable (approved divergence SB-DIV-016)"
         )
 
     def close(self) -> None:
