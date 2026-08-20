@@ -1,5 +1,6 @@
 """Incremental Shoal Python binding; intentionally not full compatibility."""
 
+from ._version import __version__
 from ._native import NativeAPI, RuntimeInfo
 from .admin import (
     Authorizations,
@@ -50,6 +51,7 @@ from .storage import (
 AccumuloConnector = Connector
 
 __all__ = [
+    "__version__",
     "AccumuloBase",
     "AccumuloConnector",
     "AccumuloIterator",

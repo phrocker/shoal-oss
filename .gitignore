@@ -26,4 +26,5 @@ python/build/
 python/dist/
 python/*.egg-info/
 python/src/*.egg-info/
-python/**/__pycache__/
+__pycache__/
+python/src/sharkbite/.libs/
