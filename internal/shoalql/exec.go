@@ -112,6 +112,9 @@ func NewExecutor(be Backend) *Executor { return &Executor{be: be} }
 
 // Run executes plan p and returns its result set.
 func (e *Executor) Run(ctx context.Context, p *Plan) (*Result, error) {
+	if p.Explain {
+		return e.explain(p)
+	}
 	switch p.Shape {
 	case ShapeAggregate:
 		return e.runAggregate(ctx, p)
