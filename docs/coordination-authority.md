@@ -22,6 +22,9 @@
 
 Status: **accepted architecture direction**, 2026-08-19. Implementation is
 tracked by [#128](https://github.com/phrocker/shoal-oss/issues/128).
+This document is the release-gated target contract; it does not claim that the
+current binaries already implement the coordinator adapters, durable fencing,
+or cutover state machine.
 
 ## 1. Decision
 
@@ -182,31 +185,61 @@ guesswork. The durable state machine is:
 
 ```text
 LOCAL_WRITABLE
+    -> DESTINATION_FENCED
     -> LOCAL_FROZEN
+    -> FATE_ALLOCATED
     -> IMPORT_SUBMITTED
     -> IMPORT_VERIFIED
-    -> ACCUMULO_WRITABLE
     -> LOCAL_RETIRED
+    -> ACCUMULO_WRITABLE
 ```
 
 The handoff proceeds as follows:
 
-1. Fence the local writer with its current lease and manifest generation.
-2. Stop admitting local writes and durably record `LOCAL_FROZEN`.
-3. Flush/checkpoint an immutable generation and verify its checksums.
-4. Stage the export and submit the manager-authoritative FATE import.
-5. Persist the destination FATE identity before interpreting ambiguous client
-   results.
-6. Verify the destination through Accumulo's authoritative state.
-7. Durably record `ACCUMULO_WRITABLE`, revoke local authority, and only then
-   enable distributed writes.
-8. Retain an auditable lineage record tying local generation, export
-   checksums, destination table, FATE identity, and terminal authority epoch.
+1. Resolve the destination table through Accumulo and establish a
+   manager-authoritative write fence before touching source authority. The
+   normal gate is the table's `OFFLINE` state, changed through supported
+   Accumulo table operations; the destination must remain unable to accept
+   ordinary mutations for the rest of the handoff. It must either be newly
+   created offline and never enabled, or have all prior writers retired and
+   their lineage reconciled before this protocol begins. Persist the
+   destination table ID and gated state as `DESTINATION_FENCED`.
+2. Fence the local writer with its current lease and manifest generation.
+3. Stop admitting local writes and durably record `LOCAL_FROZEN`.
+4. Flush/checkpoint an immutable generation and verify its checksums.
+5. Stage the export, call `beginFateOperation`, and durably record the returned
+   FATE identity as `FATE_ALLOCATED` **before** calling
+   `executeFateOperation(TABLE_BULK_IMPORT2, ...)`.
+6. Submit that exact transaction and reconcile all timeout, restart, and
+   failover outcomes by its persisted FATE identity. Recovery must never begin
+   a replacement transaction merely because execution returned ambiguously,
+   and must not finish the FATE transaction until its terminal result is
+   durably recorded.
+7. Verify the imported files and tablet state through Accumulo while the
+   destination write fence remains held.
+8. Revoke local authority and durably record `LOCAL_RETIRED`.
+9. Bring the destination online through the manager, verify the transition,
+   and durably record `ACCUMULO_WRITABLE`. Only then may distributed clients
+   admit writes.
+10. Retain an auditable lineage record tying local generation, export
+    checksums, destination table, FATE identity, and terminal authority epoch.
+
+The current `managerclient.ExecuteStatus` helper performs
+begin/execute/wait/finish as one call and does not expose the allocated FATE
+identity for durable recording. The handoff phase therefore requires a
+promotion-specific API that separates allocation from submission; the current
+`Promote`/`BulkImport` slice is not this cutover protocol, as documented in
+[`promotion.md`](./promotion.md#5-whats-deferred).
 
 Before import submission, a failed attempt may return to `LOCAL_WRITABLE` only
-under a successful CAS proving the same local authority still exists. After an
-ambiguous submission, local writes remain frozen until the FATE result is
-reconciled. Guessing that the import failed could authorize both domains.
+under a successful CAS proving the same local authority still exists and only
+after the destination write fence has been released without admitting a
+destination write. After FATE allocation, local writes remain frozen and the
+destination remains fenced until the persisted transaction is reconciled.
+Bringing the destination online administratively during this interval is a
+protocol violation and must fail readiness/recovery rather than be accepted as
+a successful cutover. Guessing that the import failed could authorize both
+domains.
 
 No step grants Kubernetes and Accumulo concurrent write authority. Ongoing
 fan-in is a new immutable transfer from a new source generation; it is not a
