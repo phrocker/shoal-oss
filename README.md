@@ -144,6 +144,44 @@ sc.Close()
 eng.Close()
 ```
 
+### Conditional gRPC writes
+
+`ShoalEmbed.ConditionalWrite` supports compare-and-set conditions on each
+mutation. It is deliberately separate from unconditional `Write`: an older
+server returns `UNIMPLEMENTED` instead of ignoring unknown condition fields
+and applying entries unconditionally during a rolling upgrade. Conditions
+target the mutation row plus an exact
+`column_family` / `column_qualifier` / `column_visibility` coordinate and
+require either `absent` or `value_equals`. With no condition timestamp, the
+newest version is checked and a newest tombstone counts as absent. Setting the
+optional timestamp checks that exact version instead.
+
+All conditions on one mutation are evaluated atomically with its WAL-backed
+write under the owning tablet's writer lock. Concurrent ordinary and
+conditional writers therefore cannot interleave between comparison and write.
+`WriteResponse.results` contains one accepted/rejected status per mutation in
+request order; `written` remains the accepted count and is unchanged for
+legacy unconditional requests.
+
+```go
+resp, err := client.ConditionalWrite(ctx, &embedpb.WriteRequest{
+    Table: "leases",
+    Mutations: []*embedpb.Mutation{{
+        Row: []byte("service-a"),
+        Conditions: []*embedpb.Condition{{
+            ColumnFamily: []byte("lease"),
+            ColumnQualifier: []byte("owner"),
+            Predicate: &embedpb.Condition_Absent{Absent: true},
+        }},
+        Entries: []*embedpb.Entry{{
+            ColumnFamily: []byte("lease"),
+            ColumnQualifier: []byte("owner"),
+            Value: []byte("worker-7"),
+        }},
+    }},
+})
+```
+
 **Local and at scale.** Durable RFile or Parquet files flush through a pluggable
 `storage.Backend`. The default is the local filesystem; an in-memory,
 GCS, or S3 backend keeps each tablet's WAL local while flushing immutable

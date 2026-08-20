@@ -447,6 +447,45 @@ func (t *table) write(mutations []*cclient.Mutation) error {
 	return nil
 }
 
+func (t *table) conditionalWrite(mutations []ConditionalMutation) ([]bool, error) {
+	results := make([]bool, len(mutations))
+	buckets := make([][]ConditionalMutation, len(t.tablets))
+	indices := make([][]int, len(t.tablets))
+	for i, mutation := range mutations {
+		idx := t.routeTablet(mutation.Mutation.Row())
+		buckets[idx] = append(buckets[idx], mutation)
+		indices[idx] = append(indices[idx], i)
+	}
+
+	var wg sync.WaitGroup
+	errs := make([]error, len(t.tablets))
+	for i, batch := range buckets {
+		if len(batch) == 0 {
+			continue
+		}
+		wg.Add(1)
+		go func(tabletIndex int, conditional []ConditionalMutation) {
+			defer wg.Done()
+			accepted, err := t.tablets[tabletIndex].ConditionalWrite(conditional)
+			if err != nil {
+				errs[tabletIndex] = err
+				return
+			}
+			for j, ok := range accepted {
+				results[indices[tabletIndex][j]] = ok
+			}
+		}(i, batch)
+	}
+	wg.Wait()
+
+	for _, err := range errs {
+		if err != nil {
+			return nil, err
+		}
+	}
+	return results, nil
+}
+
 // lookupRows resolves many rows through the per-tablet LookupRows fast
 // path, bucketing rows to their owning tablet so each tablet's source
 // stack is opened once. Sequential across tablets; the parallel frontier

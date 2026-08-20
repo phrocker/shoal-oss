@@ -196,6 +196,58 @@ func TestEmbedServer_RejectsInvalidSelections(t *testing.T) {
 	}
 }
 
+func TestEmbedServer_WriteReturnsPerMutationConditionalResults(t *testing.T) {
+	eng, err := engine.Open(t.TempDir(), engine.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+	srv := newEmbedServer(eng)
+	if _, err := srv.CreateTable(context.Background(), &embedpb.CreateTableRequest{Table: "cas"}); err != nil {
+		t.Fatal(err)
+	}
+
+	conditional := func(value string) *embedpb.Mutation {
+		mutation := testMutation("row", value)
+		mutation.Conditions = []*embedpb.Condition{{
+			ColumnFamily: []byte("cf"), ColumnQualifier: []byte("cq"),
+			Predicate: &embedpb.Condition_Absent{Absent: true},
+		}}
+		return mutation
+	}
+	resp, err := srv.ConditionalWrite(context.Background(), &embedpb.WriteRequest{
+		Table: "cas", Mutations: []*embedpb.Mutation{conditional("first"), conditional("second")},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Written != 1 || len(resp.Results) != 2 {
+		t.Fatalf("response = %+v", resp)
+	}
+	if resp.Results[0].Status != embedpb.MutationStatus_MUTATION_STATUS_ACCEPTED ||
+		resp.Results[1].Status != embedpb.MutationStatus_MUTATION_STATUS_REJECTED {
+		t.Fatalf("results = %+v", resp.Results)
+	}
+
+	_, err = srv.ConditionalWrite(context.Background(), &embedpb.WriteRequest{
+		Table: "cas",
+		Mutations: []*embedpb.Mutation{{
+			Row: []byte("other"), Entries: testMutation("other", "value").Entries,
+			Conditions: []*embedpb.Condition{{ColumnFamily: []byte("cf"), ColumnQualifier: []byte("cq")}},
+		}},
+	})
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("missing predicate error = %v, want InvalidArgument", err)
+	}
+
+	_, err = srv.Write(context.Background(), &embedpb.WriteRequest{
+		Table: "cas", Mutations: []*embedpb.Mutation{conditional("unsafe")},
+	})
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("conditional Write error = %v, want InvalidArgument", err)
+	}
+}
+
 func testMutation(row, value string) *embedpb.Mutation {
 	return &embedpb.Mutation{
 		Row: []byte(row),
