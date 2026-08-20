@@ -105,6 +105,9 @@ type ResidualFilter struct {
 // Plan is the physical query plan.
 type Plan struct {
 	Shape PlanShape
+	// Explain causes the executor to describe this plan without reading data.
+	Explain       bool
+	ExplainFormat ExplainFormat
 
 	Table          string // physical engine table
 	RowPrefix      []byte // table row prefix (for stripping id output)
@@ -162,10 +165,12 @@ func PlanQuery(ctx context.Context, stmt *SelectStmt, binding TableBinding, opts
 		return nil, fmt.Errorf("shoalql: nil statement")
 	}
 	p := &Plan{
-		Table:     binding.PhysicalTable(),
-		RowPrefix: binding.RowPrefix(),
-		AsOf:      stmt.AsOf,
-		Limit:     stmt.Limit,
+		Explain:       stmt.Explain,
+		ExplainFormat: stmt.ExplainFormat,
+		Table:         binding.PhysicalTable(),
+		RowPrefix:     binding.RowPrefix(),
+		AsOf:          stmt.AsOf,
+		Limit:         stmt.Limit,
 	}
 
 	// AS OF -> AsOf iterator (shared by both the graph and document paths;

@@ -11,19 +11,43 @@ type parser struct {
 	i    int
 }
 
-// Parse parses a single read-only SELECT statement.
+// Parse parses a single read-only SELECT or EXPLAIN SELECT statement.
 func Parse(sql string) (*SelectStmt, error) {
 	toks, err := lex(sql)
 	if err != nil {
 		return nil, err
 	}
 	p := &parser{toks: toks}
-	stmt, err := p.parseSelect()
+	stmt, err := p.parseStatement()
 	if err != nil {
 		return nil, err
 	}
 	if p.peek().kind != tEOF {
 		return nil, p.errf("unexpected trailing input %q", p.peek().text)
+	}
+	return stmt, nil
+}
+
+func (p *parser) parseStatement() (*SelectStmt, error) {
+	explain := p.acceptKeyword("EXPLAIN")
+	format := ExplainText
+	if explain && p.acceptKeyword("FORMAT") {
+		switch {
+		case p.acceptKeyword("TEXT"):
+			format = ExplainText
+		case p.acceptKeyword("JSON"):
+			format = ExplainJSON
+		default:
+			return nil, p.errf("expected TEXT or JSON after EXPLAIN FORMAT")
+		}
+	}
+	stmt, err := p.parseSelect()
+	if err != nil {
+		return nil, err
+	}
+	stmt.Explain = explain
+	if explain {
+		stmt.ExplainFormat = format
 	}
 	return stmt, nil
 }

@@ -3,8 +3,10 @@ package shoalql
 import (
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"math"
 	"sort"
+	"strings"
 	"testing"
 
 	"github.com/phrocker/shoal/internal/graphschema"
@@ -30,14 +32,28 @@ type fakeBackend struct {
 	neighbors map[string][]Neighbor
 	lastReq   ScanRequest
 	lastRange iterrt.Range
+	scans     int
 }
 
 func (b *fakeBackend) Scan(_ context.Context, _ string, r iterrt.Range, req ScanRequest) (RowStream, error) {
+	b.scans++
 	b.lastReq = req
 	b.lastRange = r
 	cells := append([]Cell(nil), b.scanCells...)
 	sort.Slice(cells, func(i, j int) bool { return cells[i].Key.Compare(cells[j].Key) < 0 })
 	return &fakeStream{cells: cells}, nil
+}
+
+type declaredBackend struct{ *fakeBackend }
+
+func (b *declaredBackend) BackendInfo() BackendInfo {
+	return BackendInfo{
+		Name:                  "fixture-local",
+		Mode:                  "local",
+		Capabilities:          []Capability{CapabilityRangeScan, CapabilityExactVectorKNN},
+		StorageFormats:        []string{"fixture"},
+		SelectedStorageFormat: "fixture",
+	}
 }
 
 func (b *fakeBackend) LookupRows(_ context.Context, _ string, rows [][]byte, _ ScanRequest) ([]Cell, error) {
@@ -105,6 +121,76 @@ func TestExec_ScanProjectsRowAndContent(t *testing.T) {
 	if res.Rows[1][0].Str != "2" || res.Rows[1][1].Str != "world" {
 		t.Errorf("row1 = %v", res.Rows[1])
 	}
+}
+
+func TestExec_ExplainDoesNotReadData(t *testing.T) {
+	be := &declaredBackend{fakeBackend: &fakeBackend{}}
+	res := runSQL(t, be,
+		"EXPLAIN SELECT id FROM events WHERE id >= 'a' AND MATCH(content, 'retry timeout')",
+		PlanOptions{})
+	if be.scans != 0 {
+		t.Fatalf("EXPLAIN executed %d scans", be.scans)
+	}
+	if len(res.Rows) == 0 || res.Columns[0] != "property" {
+		t.Fatalf("unexpected text explain: %+v", res)
+	}
+	values := map[string]string{}
+	for _, row := range res.Rows {
+		values[row[0].Str] = row[1].Str
+	}
+	if values["backend"] != "fixture-local" || values["range"] != "[\"evt:a\",\"evt;\")" {
+		t.Fatalf("explain values = %+v", values)
+	}
+	if !strings.Contains(values["local_materialization"], "MATCH") ||
+		!strings.Contains(values["fallback_reasons"], "evaluated locally") {
+		t.Fatalf("missing residual diagnostics: %+v", values)
+	}
+}
+
+func TestExec_ExplainJSONVectorContract(t *testing.T) {
+	be := &declaredBackend{fakeBackend: &fakeBackend{}}
+	res := runSQL(t, be,
+		"EXPLAIN FORMAT JSON SELECT id, content FROM events ORDER BY embedding <-> [1,0] LIMIT 2",
+		PlanOptions{})
+	if be.scans != 0 || len(res.Rows) != 1 {
+		t.Fatalf("scans=%d result=%+v", be.scans, res)
+	}
+	var details ExplainDetails
+	if err := json.Unmarshal([]byte(res.Rows[0][0].Str), &details); err != nil {
+		t.Fatalf("unmarshal explain: %v", err)
+	}
+	if details.Version != 1 || details.Format != "json" || details.Shape != "vector_knn" {
+		t.Fatalf("details = %+v", details)
+	}
+	if !strings.Contains(strings.Join(details.Pushdowns, " "), "top_k=2") {
+		t.Fatalf("pushdowns = %v", details.Pushdowns)
+	}
+	if !strings.Contains(strings.Join(details.LocalMaterialization, " "), "hydrate") {
+		t.Fatalf("materialization = %v", details.LocalMaterialization)
+	}
+	if !containsCapability(details.UnsupportedCapabilities, CapabilityDistributedTopK) {
+		t.Fatalf("unsupported = %v", details.UnsupportedCapabilities)
+	}
+}
+
+func TestExec_LegacyBackendExplainCompatibility(t *testing.T) {
+	be := &fakeBackend{}
+	res := runSQL(t, be, "EXPLAIN SELECT id FROM events", PlanOptions{})
+	if be.scans != 0 {
+		t.Fatalf("legacy EXPLAIN executed %d scans", be.scans)
+	}
+	if !strings.Contains(res.Rows[14][1].Str, "legacy execution contract assumed") {
+		t.Fatalf("fallback row = %+v", res.Rows[14])
+	}
+}
+
+func containsCapability(values []Capability, want Capability) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }
 
 func TestExec_ResidualEquality(t *testing.T) {

@@ -6,6 +6,9 @@ package shoalql
 
 // SelectStmt is a parsed query.
 type SelectStmt struct {
+	Explain       bool
+	ExplainFormat ExplainFormat
+
 	Columns []SelectItem // projection; empty Columns with Star=true means *
 	Star    bool
 	Table   string
@@ -16,6 +19,14 @@ type SelectStmt struct {
 	Order   *OrderBy    // nil = no ordering
 	Limit   *int        // nil = no limit
 }
+
+// ExplainFormat controls the stable representation returned by EXPLAIN.
+type ExplainFormat string
+
+const (
+	ExplainText ExplainFormat = "text"
+	ExplainJSON ExplainFormat = "json"
+)
 
 // SelectItem is one projected output column.
 type SelectItem struct {

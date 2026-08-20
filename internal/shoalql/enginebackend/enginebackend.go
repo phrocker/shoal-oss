@@ -22,6 +22,28 @@ type Backend struct {
 func New(eng *engine.Engine) *Backend { return &Backend{eng: eng} }
 
 var _ shoalql.Backend = (*Backend)(nil)
+var _ shoalql.CapabilityProvider = (*Backend)(nil)
+
+// BackendInfo declares the embedded engine's stable ShoalQL execution
+// capabilities. Distributed scan and top-k merge are intentionally absent.
+func (b *Backend) BackendInfo() shoalql.BackendInfo {
+	return shoalql.BackendInfo{
+		Name: "embedded-engine",
+		Mode: "local",
+		Capabilities: []shoalql.Capability{
+			shoalql.CapabilityRangeScan,
+			shoalql.CapabilityColumnFamilyFilter,
+			shoalql.CapabilityAsOfPushdown,
+			shoalql.CapabilityAggregatePushdown,
+			shoalql.CapabilityExactVectorKNN,
+			shoalql.CapabilityRowLookup,
+			shoalql.CapabilityGraphNeighbors,
+			shoalql.CapabilityDocumentIndex,
+		},
+		StorageFormats:        []string{"rfile"},
+		SelectedStorageFormat: "rfile",
+	}
+}
 
 // Scan implements shoalql.Backend. The pushdown stack is hosted above a
 // whole-table merge (ScanHosted) so re-seeking iterators such as VectorKNN

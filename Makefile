@@ -42,6 +42,7 @@ endif
 THRIFT_FILES := \
 	$(THRIFT_IDL)/tabletscan.thrift \
 	$(THRIFT_IDL)/tabletingest.thrift \
+	$(THRIFT_IDL)/tabletmgmt.thrift \
 	$(THRIFT_IDL)/compaction-coordinator.thrift
 
 .PHONY: all
@@ -85,6 +86,20 @@ thrift-gen: thrift-check
 	  mv $(THRIFT_OUT)/compaction-coordinator $(THRIFT_OUT)/compactioncoordinator; \
 	fi
 	$(MAKE) patch-thrift-nil-binary
+	$(MAKE) _normalize-tabletmgmt
+
+.PHONY: _normalize-tabletmgmt
+_normalize-tabletmgmt:
+	@if test -d $(THRIFT_OUT)/tabletmgmt; then \
+	  find $(THRIFT_OUT)/tabletmgmt -name '*.go' -print0 | \
+	    xargs -0 -I{} sh -c '\
+	      f="$$1"; \
+	      sed -i -e "s/[[:space:]]\\+$$//" "$$f"; \
+	      awk '"'"'{ lines[NR]=$$0; if ($$0 != "") last=NR } \
+	        END { for (i=1; i<=last; i++) print lines[i] }'"'"' \
+	        "$$f" > "$$f.tmp" && mv "$$f.tmp" "$$f"; \
+	    ' sh {}; \
+	fi
 
 .PHONY: thrift-verify
 thrift-verify: validate thrift-check

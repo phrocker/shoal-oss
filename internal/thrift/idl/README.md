@@ -8,10 +8,11 @@ revision `1a716b2c1bb5762ead4b46d2bc4f53e13873b314`:
 That revision identifies itself as `4.0.0-SNAPSHOT` and pins
 `version.thrift` to `0.17.0`. Its IDLs match the Accumulo 4 RPC surface shoal
 currently implements. Shoal vendors only the transitive closure required by
-its tablet-scan and compaction-coordinator clients:
+its tablet scan/ingest/management and compaction coordinator surfaces:
 
 - `tabletscan.thrift`
 - `compaction-coordinator.thrift`
+- `tabletmgmt.thrift`
 - `tabletserver.thrift`
 - `manager.thrift`
 - `data.thrift`
