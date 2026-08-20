@@ -56,6 +56,10 @@ func TestStoreRejectsWALAndUnsupportedIteratorBeforePublishing(t *testing.T) {
 		{Extent: extent, Properties: []tabletloader.Property{{
 			Name: "table.iterator.scan.bad", Value: "10,example.Unknown",
 		}}},
+		{Extent: extent, Properties: []tabletloader.Property{
+			{Name: "table.iterator.scan.vers", Value: "20,org.apache.accumulo.core.iterators.user.VersioningIterator"},
+			{Name: "table.iterator.scan.vers.opt.maxVersions", Value: "2"},
+		}},
 	}
 	for _, spec := range tests {
 		store, _ := NewStore(loaderFunc(func(context.Context, tserver.Extent) (tabletloader.Specification, error) {

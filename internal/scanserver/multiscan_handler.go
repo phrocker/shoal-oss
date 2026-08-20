@@ -50,6 +50,21 @@ func (s *Server) StartMultiScan(
 	}
 	defer s.endCall()
 	defer func() { s.observeStart(t0, true, retErr) }()
+	tableIDs := make([]string, 0, len(batch))
+	seenTables := make(map[string]struct{}, len(batch))
+	for extent := range batch {
+		if extent == nil {
+			continue
+		}
+		tableID := string(extent.Table)
+		if _, seen := seenTables[tableID]; !seen {
+			seenTables[tableID] = struct{}{}
+			tableIDs = append(tableIDs, tableID)
+		}
+	}
+	if err := s.validateCredentials(ctx, credentials, authorizations, tableIDs); err != nil {
+		return nil, err
+	}
 	if len(batch) == 0 {
 		return &data.InitialMultiScan{
 			ScanID:  0,

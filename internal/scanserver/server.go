@@ -49,6 +49,7 @@ type Server struct {
 	accepting    atomic.Bool
 	inFlight     atomic.Int64
 	stateChanged chan struct{}
+	credentials  CredentialsValidator
 
 	// File-level byte cache: GCS path → full RFile bytes. Avoids
 	// re-pulling the same 30MB+ file on every scan against the same
@@ -87,6 +88,9 @@ type Options struct {
 	Storage      storage.Backend
 	Decompressor *block.Decompressor
 	Logger       *slog.Logger
+	// Credentials validates the caller before any scan data is read. Nil
+	// preserves the standalone read-fleet's existing trust boundary.
+	Credentials CredentialsValidator
 
 	// FileBytesCap is the byte budget for the file cache (full RFile
 	// bytes by GCS path). Zero defaults to 1GB. Negative disables.
@@ -152,6 +156,7 @@ func NewServer(opts Options) (*Server, error) {
 		pages:        pageCap,
 		metrics:      metrics,
 		stateChanged: make(chan struct{}, 1),
+		credentials:  opts.Credentials,
 		scans: newScanSessionRegistry(
 			opts.ScanSessionTTL,
 			opts.ScanSessionCapacity,
@@ -167,8 +172,31 @@ func NewServer(opts Options) (*Server, error) {
 		files:       fc,
 		walPeerPort: opts.WALPeerPort,
 	}
+
 	s.accepting.Store(true)
 	return s, nil
+}
+
+// CredentialsValidator authenticates an initial scan request. Continuations
+// use cryptographically random opaque scan IDs and carry no credentials in the
+// Accumulo Thrift contract.
+type CredentialsValidator interface {
+	Validate(context.Context, *security.TCredentials, [][]byte, []string) error
+}
+
+func (s *Server) validateCredentials(
+	ctx context.Context,
+	credentials *security.TCredentials,
+	authorizations [][]byte,
+	tableIDs []string,
+) error {
+	if s.credentials == nil {
+		return nil
+	}
+	if credentials == nil {
+		return errors.New("scanserver: missing credentials")
+	}
+	return s.credentials.Validate(ctx, credentials, authorizations, tableIDs)
 }
 
 func (s *Server) ContinueScan(ctx context.Context, tinfo *client.TInfo, scanID data.ScanID, busyTimeout int64) (*data.ScanResult_, error) {
@@ -221,6 +249,9 @@ func (s *Server) CloseMultiScan(ctx context.Context, tinfo *client.TInfo, scanID
 // GetActiveScans: V0 holds no per-scan state, so there are no active
 // scans to report. Java callers (e.g., monitoring) get an empty list.
 func (s *Server) GetActiveScans(ctx context.Context, tinfo *client.TInfo, credentials *security.TCredentials) ([]*tabletscan.ActiveScan, error) {
+	if err := s.validateCredentials(ctx, credentials, nil, nil); err != nil {
+		return nil, err
+	}
 	return nil, nil
 }
 

@@ -67,9 +67,7 @@ func (s *Store) Load(ctx context.Context, extent tserver.Extent) error {
 
 	spec, err := s.loader.Load(ctx, extent)
 	if err == nil {
-		_, err = itercfg.ResolveProperties(
-			extent.TableID, iterrt.ScopeScan, propertiesMap(spec.Properties),
-		)
+		err = validateHostedScanStack(extent.TableID, propertiesMap(spec.Properties))
 	}
 	if err == nil && len(spec.Logs) > 0 {
 		err = fmt.Errorf("%w: %s references %d WAL segment(s)",
@@ -163,7 +161,36 @@ func propertiesMap(properties []tabletloader.Property) map[string]string {
 	for _, property := range properties {
 		out[property.Name] = property.Value
 	}
+
 	return out
+}
+
+func validateHostedScanStack(tableID string, properties map[string]string) error {
+	resolved, err := itercfg.ResolveProperties(tableID, iterrt.ScopeScan, properties)
+	if err != nil {
+		return err
+	}
+	for _, iterator := range resolved.Stack {
+		switch iterator.Name {
+		case iterrt.IterVersioning:
+			if value := iterator.Options["maxVersions"]; value != "" && value != "1" {
+				return fmt.Errorf(
+					"tserverprocess: table %s versioning maxVersions=%s is not implemented by hosted scans",
+					tableID, value)
+			}
+		case iterrt.IterDeleting, iterrt.IterVisibility:
+			if len(iterator.Options) != 0 {
+				return fmt.Errorf(
+					"tserverprocess: table %s iterator %s options are not implemented by hosted scans",
+					tableID, iterator.Name)
+			}
+		default:
+			return fmt.Errorf(
+				"tserverprocess: table %s iterator %s is admitted by the registry but not installed in hosted scans",
+				tableID, iterator.Name)
+		}
+	}
+	return nil
 }
 
 func tabletInfo(spec tabletloader.Specification) metadata.TabletInfo {

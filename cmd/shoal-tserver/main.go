@@ -23,6 +23,7 @@ import (
 	"github.com/phrocker/shoal/internal/cred"
 	"github.com/phrocker/shoal/internal/managerclient"
 	"github.com/phrocker/shoal/internal/metadata"
+	"github.com/phrocker/shoal/internal/namespaces"
 	"github.com/phrocker/shoal/internal/protocol"
 	"github.com/phrocker/shoal/internal/scanserver"
 	"github.com/phrocker/shoal/internal/storage"
@@ -31,7 +32,9 @@ import (
 	"github.com/phrocker/shoal/internal/storage/hdfs"
 	"github.com/phrocker/shoal/internal/storage/local"
 	"github.com/phrocker/shoal/internal/storage/s3"
+	"github.com/phrocker/shoal/internal/tablenames"
 	"github.com/phrocker/shoal/internal/tabletloader"
+	"github.com/phrocker/shoal/internal/thrift/gen/security"
 	"github.com/phrocker/shoal/internal/thrift/gen/tabletscan"
 	"github.com/phrocker/shoal/internal/transportpool"
 	"github.com/phrocker/shoal/internal/tserver"
@@ -102,6 +105,10 @@ func main() {
 	}
 	resolver := managerResolver{locator: loc}
 	outbound := cred.NewPasswordCreds(*user, *password, loc.InstanceID())
+	systemCredentials := &security.TCredentials{
+		Principal: *systemPrincipal, TokenClassName: *systemTokenClass,
+		Token: append([]byte(nil), token...), InstanceId: loc.InstanceID(),
+	}
 
 	pool, err := transportpool.New(transportpool.Config{IdleTimeout: time.Minute, MaxIdlePerEndpoint: 4})
 	if err != nil {
@@ -115,6 +122,8 @@ func main() {
 	defer managerAPI.Close()
 
 	walker := metadata.NewWalker(loc, outbound, *accVersion).WithLogger(logger)
+	namespaceNames := namespaces.NewResolver(loc)
+	tableNames := tablenames.NewResolver(loc, namespaceNames)
 	host := tserver.NewHost()
 	loader, err := tabletloader.New(tabletloader.Config{
 		Authority: tserverprocess.HostAuthority{Host: host},
@@ -138,6 +147,10 @@ func main() {
 	defer closeStorage()
 	scans, err := scanserver.NewServer(scanserver.Options{
 		Locator: store, Storage: files, BlockCache: cache.NewBlockCache(256 << 20), Logger: logger,
+		Credentials: tserverprocess.ManagerAuthenticator{
+			Resolver: resolver, System: systemCredentials, InstanceID: loc.InstanceID(),
+			AccumuloVersion: *accVersion, TableNames: tableNames,
+		},
 	})
 	if err != nil {
 		die("scan server: %v", err)
@@ -145,7 +158,7 @@ func main() {
 
 	reporter := &tserverrpc.RetryingReporter{
 		Connector: tserverprocess.ReportConnector{
-			Resolver: resolver, Credentials: outbound, InstanceID: loc.InstanceID(),
+			Resolver: resolver, Credentials: systemCredentials, InstanceID: loc.InstanceID(),
 			AccumuloVersion: *accVersion,
 		},
 		Server: *advertise,
@@ -248,13 +261,16 @@ func main() {
 	}
 	logger.Info("shoal-tserver draining", "reason", reason)
 	scans.BeginDrain()
+	// Withdraw ownership before waiting on retained continuations. Existing
+	// sessions are already materialized by scanserver and can finish without
+	// keeping a ServiceLock that would invite new manager assignments.
+	cancelRun()
 	drainCtx, cancelDrain := context.WithTimeout(context.Background(), *drainTimeout)
 	result := scans.Drain(drainCtx)
 	cancelDrain()
 	if result.Forced() > 0 {
 		logger.Warn("forced scan session drain", "sessions", result.Forced())
 	}
-	cancelRun()
 	_ = server.Stop()
 	if operations != nil {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
