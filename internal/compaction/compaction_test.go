@@ -19,6 +19,7 @@ package compaction
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -31,6 +32,26 @@ import (
 	"github.com/phrocker/shoal/internal/rfile/bcfile/block"
 	"github.com/phrocker/shoal/internal/rfile/wire"
 )
+
+func TestCompactContextCancellation(t *testing.T) {
+	input := buildRFile(t, []kv{
+		{K: mk("a", "", "", 1), V: "a"},
+		{K: mk("b", "", "", 1), V: "b"},
+		{K: mk("c", "", "", 1), V: "c"},
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	_, err := CompactContext(ctx, Spec{
+		Inputs: []Input{{Name: "in.rf", Bytes: input}},
+		Scope:  iterrt.ScopeMajc,
+	}, func(p Progress) {
+		if p.EntriesWritten == 1 {
+			cancel()
+		}
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("CompactContext error = %v, want context.Canceled", err)
+	}
+}
 
 // kv is one cell in test input/expectation.
 type kv struct {
