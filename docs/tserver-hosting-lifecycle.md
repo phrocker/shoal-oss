@@ -25,8 +25,9 @@ Status: **partial**. The fenced lifecycle state machine
 that makes it visible to a manager: the tablet-server ServiceLock, the
 service descriptors the manager reads, and the manager-lock observation
 that supplies live manager authority — see [§6](#6-registering-with-zookeeper).
-The manager RPC surface and tablet data loading are not wired to it yet
-— see [§7](#7-what-is-not-here-yet). Tracking issue: #67.
+The hosted-tablet specification loader is also present; manager RPC and
+process wiring remain separate slices — see
+[§8](#8-what-is-not-here-yet). Tracking issue: #67.
 
 ## 1. Goal
 
@@ -771,17 +772,53 @@ not a poll a process can shut down. Wiring the watch into a running
 server therefore waits on a cancellable reader that reuses its session,
 or on one backed by a ZooKeeper watch instead of a poll; that is a
 prerequisite of the process-wiring slice, recorded in
-[§7](#7-what-is-not-here-yet), not something this package can fix from
+[§8](#8-what-is-not-here-yet), not something this package can fix from
 behind the interface.
 
-## 7. What is not here yet
+## 7. Hosted-tablet specification loader
 
-This is the lifecycle core only. Still to land for #67:
+`internal/tabletloader` resolves the immutable input to a hosted tablet
+without owning manager RPCs or ingest. A load:
+
+1. captures an opaque assignment generation from `Authority`
+2. reads exactly one metadata row and requires its table/range to equal the
+   manager-assigned `tserver.Extent`
+3. requires the metadata future/current generation to equal the captured
+   generation, plus the mandatory `~tab:~pr`, `srv:dir`, and `srv:time`
+   columns
+4. reads a stable effective table configuration; `ManagerConfigSource`
+   brackets the merged configuration read with versioned-property reads and
+   retries the whole transaction if the generation changes
+5. resolves and validates every StoredTabletFile and LogEntry reference
+6. rechecks the assignment fence between every external operation and before
+   returning a deterministically ordered `Specification`
+
+Missing rows/configuration and malformed metadata fail without retry.
+Infrastructure failures explicitly marked with `tabletloader.Retryable` retry
+the complete transaction with bounded, cancellable backoff. Unload, lock loss,
+or reassignment must make `Authority.Validate` fail (and normally also cancel
+the context), so a stale load can never return a publishable specification.
+
+The package exposes narrow `MetadataSource`, `ConfigSource`, `FileResolver`,
+`LogResolver`, and `Authority` interfaces. This keeps storage routing, exact
+metadata scanning, and the manager adapter independently replaceable. The
+default `StrictReferenceResolver` performs schema validation only; a production
+file resolver can additionally probe the chosen `storage.Backend`.
+
+Metadata aggregation now preserves future locations, mandatory-column
+presence, directory/time values, and Accumulo 4 `log:` qualifiers. WAL
+qualifiers are decoded using Java `LogEntry.fromMetaWalEntry`'s
+`-/<path ending in host+port/UUID>` format.
+
+## 8. What is not here yet
+
+Still to land for #67:
 
 - the manager-facing Thrift surface that turns RPCs into `Assign` /
   `Unassign` calls and reports `TabletServerStatus`
-- loading tablet metadata, file and log references, table properties,
-  constraints, and iterator configuration behind `StateLoading`
+- wiring the manager adapter's `StateLoading` backend to
+  `tabletloader.Loader`, a concrete exact-row metadata scanner, storage/WAL
+  openers, constraints, and iterator configuration
 - serving the `TSERV` and `TABLET_*` endpoints that are advertised. A
   lock in the tablet-server tree must carry a `TSERV` descriptor or the
   manager's scan throws on it, so the advertisement cannot wait for the
@@ -799,7 +836,7 @@ This is the lifecycle core only. Still to land for #67:
 - end-to-end tests against a live manager, including migration to and
   from a Java tserver and rolling mixed-fleet replacement
 
-## 8. Metrics
+## 9. Metrics
 
 `Host.Metrics()` snapshots the operational surface #67 asks for:
 `Loading` / `Hosted` / `Unloading` gauges, and counters for

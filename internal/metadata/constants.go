@@ -11,6 +11,10 @@ const (
 	CFFile            = "file"   // DataFileColumnFamily.STR_NAME
 	CFCurrentLocation = "loc"    // CurrentLocationColumnFamily.STR_NAME
 	CFFutureLocation  = "future" // FutureLocationColumnFamily.STR_NAME
+	CFLog             = "log"    // LogColumnFamily.STR_NAME
+	CFServer          = "srv"    // ServerColumnFamily.STR_NAME
 	CFTabletSection   = "~tab"   // TabletColumnFamily — holds prev-row etc.
 	CQPrevRow         = "~pr"    // PrevRowColumn qualifier under ~tab
+	CQDirectory       = "dir"    // ServerColumnFamily.DIRECTORY_QUAL
+	CQTime            = "time"   // ServerColumnFamily.TIME_QUAL
 )
