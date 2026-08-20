@@ -18,6 +18,18 @@ type ownedKeyState struct {
 	key accumulo.Key
 }
 
+func (state *ownedKeyState) snapshot() accumulo.Key {
+	state.mu.RLock()
+	defer state.mu.RUnlock()
+	return state.key.Clone()
+}
+
+func (state *ownedKeyState) mutate(mutate func(*accumulo.Key)) {
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	mutate(&state.key)
+}
+
 var ownedKeys = newRFileRegistry[ownedKeyState]()
 
 func addOwnedKey(key accumulo.Key, out **C.shoal_owned_key, outError **C.shoal_error) C.shoal_status {
@@ -52,9 +64,7 @@ func ownedKeySnapshot(handle *C.shoal_owned_key) (accumulo.Key, error) {
 	if err != nil {
 		return accumulo.Key{}, err
 	}
-	value.mu.RLock()
-	defer value.mu.RUnlock()
-	return value.key.Clone(), nil
+	return value.snapshot(), nil
 }
 
 //export shoal_owned_key_create
@@ -119,9 +129,7 @@ func mutateOwnedKey(handle *C.shoal_owned_key, outError **C.shoal_error, mutate 
 	if err != nil {
 		return fail(outError, C.SHOAL_STATUS_INVALID_HANDLE, err)
 	}
-	value.mu.Lock()
-	mutate(&value.key)
-	value.mu.Unlock()
+	value.mutate(mutate)
 	return C.SHOAL_STATUS_OK
 }
 
@@ -266,16 +274,24 @@ func shoal_owned_key_is_deleted(handle *C.shoal_owned_key, out *C.uint8_t, outEr
 	return ownedKeyBool(handle, out, outError, func(key accumulo.Key) bool { return key.Deleted })
 }
 
+func compareOwnedKeyStates(left, right *ownedKeyState, compare func(accumulo.Key, accumulo.Key) int) int {
+	leftKey := left.snapshot()
+	if left == right {
+		return compare(leftKey, leftKey)
+	}
+	return compare(leftKey, right.snapshot())
+}
+
 func compareOwnedKeys(leftHandle, rightHandle *C.shoal_owned_key, outError **C.shoal_error, compare func(accumulo.Key, accumulo.Key) int) (int, C.shoal_status) {
-	left, err := ownedKeySnapshot(leftHandle)
+	left, err := lookupOwnedKey(leftHandle)
 	if err != nil {
 		return 0, fail(outError, C.SHOAL_STATUS_INVALID_HANDLE, err)
 	}
-	right, err := ownedKeySnapshot(rightHandle)
+	right, err := lookupOwnedKey(rightHandle)
 	if err != nil {
 		return 0, fail(outError, C.SHOAL_STATUS_INVALID_HANDLE, err)
 	}
-	return compare(left, right), C.SHOAL_STATUS_OK
+	return compareOwnedKeyStates(left, right, compare), C.SHOAL_STATUS_OK
 }
 
 //export shoal_owned_key_compare

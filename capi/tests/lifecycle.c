@@ -2727,6 +2727,12 @@ int main(void) {
   assert(shoal_owned_key_column_visibility_size(owned_key, &owned_size,
                                                 &error) == SHOAL_STATUS_OK &&
          owned_size == 1);
+  assert(shoal_owned_key_row(owned_key_copy, &owned_bytes, &error) ==
+         SHOAL_STATUS_OK);
+  owned_value = shoal_bytes_result_get(owned_bytes);
+  assert(owned_value.length == 3 && owned_value.data[0] == 'r' &&
+         owned_value.data[1] == 0 && owned_value.data[2] == 'w');
+  shoal_bytes_result_free(&owned_bytes);
   shoal_owned_key_free(&owned_key_copy);
   shoal_test_result_alloc_fail_after(0);
   assert(shoal_owned_key_clone(owned_key, &owned_key_copy, &error) ==
