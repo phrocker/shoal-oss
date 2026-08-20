@@ -89,7 +89,7 @@ func (e *Engine) ExportRFilesIncremental(ctx context.Context, tableName string, 
 	tbl, ok := e.tables[tableName]
 	var configuredFormat tablet.FileFormat
 	if ok {
-		configuredFormat = tbl.format
+		configuredFormat = tbl.fileFormat()
 	}
 	e.mu.RUnlock()
 	if !ok {
@@ -174,6 +174,7 @@ func (e *Engine) ExportRFilesIncremental(ctx context.Context, tableName string, 
 		}
 		return manifest.RFiles[i].DestinationPath < manifest.RFiles[j].DestinationPath
 	})
+	manifest.Version = exportManifestVersion(manifest)
 	sort.Strings(uploaded)
 	sort.Strings(skipped)
 	sort.Strings(retired)

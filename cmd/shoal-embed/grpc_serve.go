@@ -349,11 +349,10 @@ func (s *embedServer) Compact(ctx context.Context, req *embedpb.CompactRequest) 
 	if selection.requested() {
 		workload = selection.workload
 		fileFormat = selection.fileFormat
-		if err := s.eng.SetTableFileFormat(req.Table, fileFormat); err != nil {
-			return nil, adminStatusError("compact set format", err)
+		if err := s.eng.MigrateTableStorageFormat(req.Table, engine.StorageFormat(fileFormat), nil); err != nil {
+			return nil, adminStatusError("compact migrate format", err)
 		}
-	}
-	if err := s.store.Compact(ctx, req.Table); err != nil {
+	} else if err := s.store.Compact(ctx, req.Table); err != nil {
 		return nil, adminStatusError("compact", err)
 	}
 	return &embedpb.CompactResponse{

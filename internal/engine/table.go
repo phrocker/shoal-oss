@@ -114,12 +114,13 @@ func PrefixSplit(prefixes ...string) [][]byte {
 // table is the internal representation of a named table. It owns N
 // tablets and routes mutations/scans based on split points.
 type table struct {
-	name    string
-	dir     string
-	tablets []*tablet.Tablet
-	splits  [][]byte // sorted split points; len(tablets) == len(splits)+1
-	logger  *slog.Logger
-	format  tablet.FileFormat
+	name     string
+	dir      string
+	tablets  []*tablet.Tablet
+	splits   [][]byte // sorted split points; len(tablets) == len(splits)+1
+	logger   *slog.Logger
+	format   tablet.FileFormat
+	formatMu sync.RWMutex
 }
 
 const tableManifestVersion = 1
@@ -364,6 +365,18 @@ func writeTableManifest(dir string, manifest tableManifest) error {
 }
 
 func (t *table) setFileFormat(format tablet.FileFormat) error {
+	t.formatMu.Lock()
+	defer t.formatMu.Unlock()
+	return t.setFileFormatLocked(format)
+}
+
+func (t *table) fileFormat() tablet.FileFormat {
+	t.formatMu.RLock()
+	defer t.formatMu.RUnlock()
+	return t.format
+}
+
+func (t *table) setFileFormatLocked(format tablet.FileFormat) error {
 	parsed, err := tablet.ParseFileFormat(string(format))
 	if err != nil {
 		return err
@@ -707,6 +720,12 @@ func (t *table) flush() error {
 
 // compact runs compaction on all tablets in parallel.
 func (t *table) compact(stack []iterrt.IterSpec) error {
+	t.formatMu.Lock()
+	defer t.formatMu.Unlock()
+	return t.compactLocked(stack)
+}
+
+func (t *table) compactLocked(stack []iterrt.IterSpec) error {
 	var wg sync.WaitGroup
 	errs := make([]error, len(t.tablets))
 	for i := range t.tablets {
@@ -723,6 +742,18 @@ func (t *table) compact(stack []iterrt.IterSpec) error {
 		}
 	}
 	return nil
+}
+
+func (t *table) migrate(format tablet.FileFormat, stack []iterrt.IterSpec) error {
+	t.formatMu.Lock()
+	defer t.formatMu.Unlock()
+	if err := t.setFileFormatLocked(format); err != nil {
+		return err
+	}
+	if err := t.flush(); err != nil {
+		return err
+	}
+	return t.compactLocked(stack)
 }
 
 func (t *table) close() error {

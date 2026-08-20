@@ -168,8 +168,8 @@ type LoadMapping []Mapping
 // ambiguous legacy input.
 //
 // manifest.Version is checked first (inside resolveManifestTablets,
-// shared with RequiredDestinationSplits below), against
-// engine.RFileExportManifestVersion, before any chain or RFile
+// shared with RequiredDestinationSplits below), against the supported legacy
+// and current export versions, before any chain or RFile
 // validation: a manifest from an unsupported export format is rejected
 // here, in Promote's own preflight call to this function, rather than
 // only later inside StageBulkDir's call to engine.VerifyRFileExport --
@@ -254,8 +254,8 @@ type resolvedTablet struct {
 // under. See resolveTabletChain for the exact chain-shape requirements and
 // BuildLoadMapping's doc comment for the widening rule.
 //
-// manifest.Version is checked first, against
-// engine.RFileExportManifestVersion: both of resolveManifestTablets's
+// manifest.Version is checked first against the supported legacy and current
+// export versions: both of resolveManifestTablets's
 // two callers (BuildLoadMapping and RequiredDestinationSplits) document
 // themselves as performing "the same" validation, so the version check
 // belongs here, once, rather than duplicated (or, worse, present in one
@@ -264,7 +264,8 @@ type resolvedTablet struct {
 // pre-create splits through AddTableSplitsForTable, so it must reject an
 // unsupported version just as eagerly as BuildLoadMapping does).
 func resolveManifestTablets(manifest *engine.RFileExportManifest) ([]resolvedTablet, map[int]struct{}, error) {
-	if manifest.Version != engine.RFileExportManifestVersion {
+	if manifest.Version != engine.RFileExportManifestLegacyVersion &&
+		manifest.Version != engine.RFileExportManifestVersion {
 		return nil, nil, fmt.Errorf("promotion: unsupported manifest version %d", manifest.Version)
 	}
 	if len(manifest.Tablets) == 0 {

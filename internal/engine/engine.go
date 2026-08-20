@@ -274,6 +274,28 @@ func (e *Engine) SetTableStorageFormat(tableName string, format StorageFormat) e
 	return tbl.setFileFormat(tablet.FileFormat(parsed))
 }
 
+// MigrateTableStorageFormat atomically selects the write format, flushes, and
+// compacts a table so concurrent migrations cannot report a format they did
+// not persist.
+func (e *Engine) MigrateTableStorageFormat(tableName string, format StorageFormat, stack []iterrt.IterSpec) error {
+	parsed, err := ParseStorageFormat(string(format))
+	if err != nil {
+		return err
+	}
+	e.mu.RLock()
+	tbl, ok := e.tables[tableName]
+	e.mu.RUnlock()
+	if !ok {
+		return fmt.Errorf("engine: table %q not found", tableName)
+	}
+	if err := tbl.migrate(tablet.FileFormat(parsed), stack); err != nil {
+		return err
+	}
+	e.metrics.flushes.Add(1)
+	e.metrics.compactions.Add(1)
+	return nil
+}
+
 // StoragePolicy describes the configured write format and the formats
 // currently read from the table's authoritative immutable generation.
 type StoragePolicy struct {
@@ -293,7 +315,7 @@ func (e *Engine) TableStoragePolicy(tableName string) (StoragePolicy, error) {
 		return StoragePolicy{}, fmt.Errorf("engine: table %q not found", tableName)
 	}
 	policy := StoragePolicy{
-		WriteFormat: StorageFormat(tbl.format),
+		WriteFormat: StorageFormat(tbl.fileFormat()),
 		Role:        "authoritative",
 	}
 	if policy.WriteFormat == StorageFormatParquet {
