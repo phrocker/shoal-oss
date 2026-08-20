@@ -39,6 +39,8 @@ type documentModel interface {
 	// "special" tag: "id" (the document uid), "type" (the datatype), or ""
 	// for an ordinary indexed field.
 	FieldColumn(col string) (field, special string)
+	// DocumentVector returns the logical semantic column and persisted index.
+	DocumentVector() (column, index string)
 }
 
 // NewDocumentBinding builds a binding for a logical document table. docTable
@@ -96,6 +98,10 @@ func (d *DocumentBinding) FieldColumn(col string) (field, special string) {
 		return f, ""
 	}
 	return col, ""
+}
+
+func (d *DocumentBinding) DocumentVector() (string, string) {
+	return ColEmbedding, d.docTable + "_ivf"
 }
 
 // NewDocumentCatalog returns a Catalog with a single document table backed by

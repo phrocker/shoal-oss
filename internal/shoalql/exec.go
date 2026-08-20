@@ -3,11 +3,14 @@ package shoalql
 import (
 	"context"
 	"encoding/binary"
+	"errors"
+	"fmt"
 	"math"
 	"strconv"
 	"strings"
 
 	"github.com/phrocker/shoal/internal/iterrt"
+	"github.com/phrocker/shoal/internal/vectorindex"
 )
 
 // exec.go runs a physical Plan. The executor depends only on the Backend/
@@ -55,6 +58,40 @@ type Backend interface {
 	LookupRows(ctx context.Context, table string, rows [][]byte, req ScanRequest) ([]Cell, error)
 	// Neighbors returns out-edges of each row over edgeCF, aligned to rows.
 	Neighbors(ctx context.Context, table string, rows [][]byte, edgeCF []byte) ([][]Neighbor, error)
+}
+
+// VectorSearcher is the optional distributed semantic-index seam. Backends
+// delegate to a format-neutral index manager while retaining ownership of
+// source-table hydration and exact fallback execution.
+type VectorSearcher interface {
+	SearchVector(context.Context, VectorSearchRequest) ([]VectorHit, vectorindex.Evidence, error)
+}
+
+type ApproximateVectorBackend interface {
+	VectorSearcher
+}
+
+type VectorExplainBackend interface {
+	DescribeVector(context.Context, string) (vectorindex.Manifest, error)
+}
+
+type VectorSearchRequest struct {
+	Index            string
+	Query            []float32
+	TopK             int
+	NProbe           int
+	AsOf             *int64
+	Authorizations   map[string]bool
+	Freshness        vectorindex.Freshness
+	ExactFallback    bool
+	AllowedDocuments map[string]bool
+}
+
+type VectorHit struct {
+	Row      []byte
+	ID       string
+	Score    float64
+	Document vectorindex.DocumentRef
 }
 
 // NeighborRequestBackend optionally accepts scan semantics such as AS OF for
@@ -161,6 +198,23 @@ func (e *Executor) runScan(ctx context.Context, p *Plan) (*Result, error) {
 }
 
 func (e *Executor) runVectorKNN(ctx context.Context, p *Plan) (*Result, error) {
+	if p.VectorMode == VectorApproximate {
+		if backend, ok := e.be.(ApproximateVectorBackend); ok {
+			result, err := e.runApproxVectorKNN(ctx, p, backend)
+			if err == nil {
+				return result, nil
+			}
+			if !errors.Is(err, vectorindex.ErrExactFallback) || !p.VectorExactFallback {
+				return nil, err
+			}
+		} else if !p.VectorExactFallback {
+			return nil, fmt.Errorf("shoalql: approximate vector backend unavailable")
+		}
+	}
+	return e.runExactVectorKNN(ctx, p)
+}
+
+func (e *Executor) runExactVectorKNN(ctx context.Context, p *Plan) (*Result, error) {
 	req := ScanRequest{Stack: p.Stack, ColumnFamilies: p.ColumnFamilies, CFInclusive: p.CFInclusive}
 	stream, err := e.be.Scan(ctx, p.Table, p.Range, req)
 	if err != nil {
@@ -212,6 +266,47 @@ func (e *Executor) runVectorKNN(ctx context.Context, p *Plan) (*Result, error) {
 			continue
 		}
 		row, err := e.projectRow(ctx, p, h.row, byRow[string(h.row)], &h.score)
+		if err != nil {
+			return nil, err
+		}
+		res.Rows = append(res.Rows, row)
+		if p.Limit != nil && len(res.Rows) >= *p.Limit {
+			break
+		}
+	}
+	return res, nil
+}
+
+func (e *Executor) runApproxVectorKNN(ctx context.Context, p *Plan, backend ApproximateVectorBackend) (*Result, error) {
+	hits, _, err := backend.SearchVector(ctx, VectorSearchRequest{
+		Index: p.VectorIndex, Query: append([]float32(nil), p.VectorQuery...),
+		TopK: p.VectorTopK, NProbe: p.VectorNProbe, AsOf: p.AsOf,
+		Freshness: p.VectorFreshness, ExactFallback: p.VectorExactFallback,
+	})
+	if err != nil {
+		return nil, err
+	}
+	byRow := map[string][]Cell{}
+	if p.NeedsHydration && len(hits) > 0 {
+		rows := make([][]byte, len(hits))
+		for i, hit := range hits {
+			rows[i] = hit.Row
+		}
+		cells, err := e.be.LookupRows(ctx, p.Table, rows, ScanRequest{Stack: stackBefore(p.Stack, iterrt.IterVectorKNN)})
+		if err != nil {
+			return nil, err
+		}
+		for _, cell := range cells {
+			byRow[string(cell.Key.Row)] = append(byRow[string(cell.Key.Row)], cell)
+		}
+	}
+	res := &Result{Columns: columnNames(p.Projection)}
+	for _, hit := range hits {
+		if !residualPass(byRow[string(hit.Row)], p.Residual) {
+			continue
+		}
+		score := hit.Score
+		row, err := e.projectRow(ctx, p, hit.Row, byRow[string(hit.Row)], &score)
 		if err != nil {
 			return nil, err
 		}

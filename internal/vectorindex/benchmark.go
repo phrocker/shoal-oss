@@ -1,0 +1,89 @@
+package vectorindex
+
+import (
+	"context"
+	"fmt"
+	"sort"
+)
+
+type BenchmarkQuery struct {
+	Name   string
+	Vector []float32
+}
+
+type BenchmarkResult struct {
+	Recall RecallContract
+	Passed bool
+}
+
+// BenchmarkRecall compares approximate results with exhaustive cosine search.
+// It is the only API that populates a measured recall claim.
+func BenchmarkRecall(ctx context.Context, manager *Manager, index string, corpus []VectorRecord, queries []BenchmarkQuery, topK, nprobe int, minimum float64, benchmarkRef string) (BenchmarkResult, error) {
+	if len(corpus) == 0 || len(queries) == 0 || benchmarkRef == "" {
+		return BenchmarkResult{}, fmt.Errorf("vectorindex: benchmark requires corpus, queries, and benchmark reference")
+	}
+	var total float64
+	for _, query := range queries {
+		if err := ctx.Err(); err != nil {
+			return BenchmarkResult{}, err
+		}
+		approx, _, err := manager.Search(ctx, index, Query{Vector: query.Vector, TopK: topK, NProbe: nprobe})
+		if err != nil {
+			return BenchmarkResult{}, err
+		}
+		exact := exactTopK(corpus, query.Vector, topK)
+		wanted := map[string]bool{}
+		for _, hit := range exact {
+			wanted[hit.ID] = true
+		}
+		matches := 0
+		for _, hit := range approx {
+			if wanted[hit.ID] {
+				matches++
+			}
+		}
+		denominator := len(exact)
+		if denominator > 0 {
+			total += float64(matches) / float64(denominator)
+		}
+	}
+	measured := total / float64(len(queries))
+	contract := RecallContract{
+		Corpus: "deterministic:" + index, TopK: topK, NProbe: nprobe,
+		Minimum: minimum, Measured: measured, Queries: len(queries), BenchmarkRef: benchmarkRef,
+	}
+	return BenchmarkResult{Recall: contract, Passed: measured >= minimum}, nil
+}
+
+func exactTopK(corpus []VectorRecord, query []float32, topK int) []Hit {
+	query = normalize(query)
+	hits := make([]Hit, 0, len(corpus))
+	for _, record := range corpus {
+		if record.Tombstone {
+			continue
+		}
+		hits = append(hits, Hit{ID: record.ID, Score: dot(normalize(record.Vector), query), Document: cloneDocument(record.Document)})
+	}
+	sort.SliceStable(hits, func(i, j int) bool {
+		if hits[i].Score != hits[j].Score {
+			return hits[i].Score > hits[j].Score
+		}
+		return hits[i].ID < hits[j].ID
+	})
+	if len(hits) > topK {
+		hits = hits[:topK]
+	}
+	return hits
+}
+
+func dot(a, b []float32) float32 {
+	n := len(a)
+	if len(b) < n {
+		n = len(b)
+	}
+	var out float32
+	for i := 0; i < n; i++ {
+		out += a[i] * b[i]
+	}
+	return out
+}

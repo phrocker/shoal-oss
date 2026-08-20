@@ -7,28 +7,38 @@ package enginebackend
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/phrocker/shoal/internal/engine"
 	"github.com/phrocker/shoal/internal/iterrt"
 	"github.com/phrocker/shoal/internal/shoalql"
+	"github.com/phrocker/shoal/internal/vectorindex"
 )
 
 // Backend wraps an *engine.Engine as a shoalql.Backend.
 type Backend struct {
-	eng *engine.Engine
+	eng    *engine.Engine
+	vector shoalql.VectorSearcher
 }
 
 // New builds a Backend over eng.
 func New(eng *engine.Engine) *Backend { return &Backend{eng: eng} }
 
+// NewWithVector builds a backend with the distributed semantic-index seam.
+func NewWithVector(eng *engine.Engine, vector shoalql.VectorSearcher) *Backend {
+	return &Backend{eng: eng, vector: vector}
+}
+
 var _ shoalql.Backend = (*Backend)(nil)
 var _ shoalql.CapabilityProvider = (*Backend)(nil)
 var _ shoalql.NeighborRequestBackend = (*Backend)(nil)
+var _ shoalql.ApproximateVectorBackend = (*Backend)(nil)
+var _ shoalql.VectorExplainBackend = (*Backend)(nil)
 
 // BackendInfo declares the embedded engine's stable ShoalQL execution
 // capabilities. Distributed scan and top-k merge are intentionally absent.
 func (b *Backend) BackendInfo() shoalql.BackendInfo {
-	return shoalql.BackendInfo{
+	info := shoalql.BackendInfo{
 		Name: "embedded-engine",
 		Mode: "local",
 		Capabilities: []shoalql.Capability{
@@ -44,6 +54,32 @@ func (b *Backend) BackendInfo() shoalql.BackendInfo {
 		StorageFormats:        []string{"rfile"},
 		SelectedStorageFormat: "rfile",
 	}
+	if b.vector != nil {
+		info.Capabilities = append(info.Capabilities,
+			shoalql.CapabilityApproximateVector, shoalql.CapabilityDistributedTopK)
+		info.Pushdowns = append(info.Pushdowns,
+			"IVF cluster routing and sharded partial top-k use the persisted vector generation")
+		info.OrderingAssumptions = append(info.OrderingAssumptions,
+			"partial top-k merges score-descending with document-id ascending tie-break")
+	}
+	return info
+}
+
+func (b *Backend) SearchVector(ctx context.Context, request shoalql.VectorSearchRequest) ([]shoalql.VectorHit, vectorindex.Evidence, error) {
+	if b.vector == nil {
+		return nil, vectorindex.Evidence{}, fmt.Errorf("enginebackend: vector searcher is not configured")
+	}
+	return b.vector.SearchVector(ctx, request)
+}
+
+func (b *Backend) DescribeVector(ctx context.Context, index string) (vectorindex.Manifest, error) {
+	provider, ok := b.vector.(interface {
+		DescribeVector(context.Context, string) (vectorindex.Manifest, error)
+	})
+	if !ok {
+		return vectorindex.Manifest{}, fmt.Errorf("enginebackend: vector index metadata unavailable")
+	}
+	return provider.DescribeVector(ctx, index)
 }
 
 // Scan implements shoalql.Backend. The pushdown stack is hosted above a

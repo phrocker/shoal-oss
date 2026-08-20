@@ -11,6 +11,7 @@ import (
 	"github.com/phrocker/shoal/accumulo"
 	"github.com/phrocker/shoal/internal/iterrt"
 	"github.com/phrocker/shoal/internal/shoalql"
+	"github.com/phrocker/shoal/internal/vectorindex"
 )
 
 // ErrHistoricalVersionsUnavailable prevents a standard version-pruned
@@ -82,6 +83,7 @@ type Options struct {
 	// local AS OF evaluation. Standard Accumulo scan-time versioning usually
 	// does not, so this must be enabled only by a compatible server/replay.
 	HistoricalVersions bool
+	VectorSearcher     shoalql.VectorSearcher
 }
 
 // Backend executes ShoalQL against Accumulo.
@@ -103,6 +105,8 @@ func New(client Client, opts Options) *Backend {
 var _ shoalql.Backend = (*Backend)(nil)
 var _ shoalql.CapabilityProvider = (*Backend)(nil)
 var _ shoalql.NeighborRequestBackend = (*Backend)(nil)
+var _ shoalql.ApproximateVectorBackend = (*Backend)(nil)
+var _ shoalql.VectorExplainBackend = (*Backend)(nil)
 
 // BackendInfo describes both native pushdowns and the deliberate exact
 // materialization fallback. Approximate vector support is not declared.
@@ -148,7 +152,50 @@ func (b *Backend) BackendInfo() shoalql.BackendInfo {
 		info.FallbackReasons = append(info.FallbackReasons,
 			"AS OF is rejected unless the scanner is configured to retain historical versions")
 	}
+	if b.opts.VectorSearcher != nil {
+		info.Capabilities = append(info.Capabilities,
+			shoalql.CapabilityApproximateVector, shoalql.CapabilityDistributedTopK)
+		info.Pushdowns = append(info.Pushdowns,
+			"IVF cluster prefixes fan out through the configured persisted vector generation")
+		info.OrderingAssumptions = append(info.OrderingAssumptions,
+			"tablet partial top-k results merge score-descending with document-id ascending tie-break")
+		info.FallbackReasons = removeFallback(info.FallbackReasons,
+			"distributed IVF-PQ build, freshness, and routing lifecycle is unavailable; approximate vector search is unsupported")
+	}
 	return info
+}
+
+func (b *Backend) SearchVector(ctx context.Context, request shoalql.VectorSearchRequest) ([]shoalql.VectorHit, vectorindex.Evidence, error) {
+	if b.opts.VectorSearcher == nil {
+		return nil, vectorindex.Evidence{}, errors.New("shoalql accumulo: vector searcher is not configured")
+	}
+	if len(request.Authorizations) == 0 {
+		request.Authorizations = make(map[string]bool, len(b.opts.Authorizations))
+		for _, authorization := range b.opts.Authorizations {
+			request.Authorizations[string(authorization)] = true
+		}
+	}
+	return b.opts.VectorSearcher.SearchVector(ctx, request)
+}
+
+func (b *Backend) DescribeVector(ctx context.Context, index string) (vectorindex.Manifest, error) {
+	provider, ok := b.opts.VectorSearcher.(interface {
+		DescribeVector(context.Context, string) (vectorindex.Manifest, error)
+	})
+	if !ok {
+		return vectorindex.Manifest{}, errors.New("shoalql accumulo: vector index metadata unavailable")
+	}
+	return provider.DescribeVector(ctx, index)
+}
+
+func removeFallback(values []string, remove string) []string {
+	out := values[:0]
+	for _, value := range values {
+		if value != remove {
+			out = append(out, value)
+		}
+	}
+	return out
 }
 
 // Scan pushes the physical range, columns, authorizations, cancellation, and
