@@ -295,6 +295,38 @@ class WriterAdminTests(unittest.TestCase):
             32,
         )
 
+    def test_writer_close_waits_for_an_active_add(self):
+        started = threading.Event()
+        release = threading.Event()
+        close_finished = threading.Event()
+        original_add = self.api.lib.shoal_batch_writer_add.callback
+
+        def blocked_add(*args):
+            started.set()
+            release.wait(2)
+            return original_add(*args)
+
+        self.api.lib.shoal_batch_writer_add.callback = blocked_add
+        with Mutation(b"row", _api=self.api) as mutation:
+            mutation.put()
+            writer = BatchWriter(self.connector, "t")
+            add_thread = threading.Thread(target=writer.addMutation, args=(mutation,))
+            close_thread = threading.Thread(
+                target=lambda: (writer.close(), close_finished.set())
+            )
+            add_thread.start()
+            self.assertTrue(started.wait(2))
+            close_thread.start()
+            self.assertFalse(close_finished.wait(0.05))
+            self.assertNotIn("writer", self.api.lib.frees)
+            release.set()
+            add_thread.join(2)
+            close_thread.join(2)
+            self.assertFalse(add_thread.is_alive())
+            self.assertFalse(close_thread.is_alive())
+            self.assertTrue(close_finished.is_set())
+        self.assertEqual(self.api.lib.frees.count("writer"), 1)
+
     def test_mutation_overloads_and_legacy_keyword_names_are_exact(self):
         with self.assertRaises(ClientException):
             Mutation(b"", _api=self.api)

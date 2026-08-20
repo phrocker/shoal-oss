@@ -285,6 +285,7 @@ class BatchWriter:
         self._api.check(status, error)
         self._closed = False
         self._closing = False
+        self._active_calls = 0
         self._close_error: BaseException | None = None
         self._condition = threading.Condition()
 
@@ -357,6 +358,8 @@ class BatchWriter:
                     raise self._close_error
                 return
             self._closing = True
+            while self._active_calls:
+                self._condition.wait()
         failure = C.c_void_p()
         error = C.c_void_p()
         status = self._api.lib.shoal_batch_writer_close(
@@ -381,9 +384,13 @@ class BatchWriter:
     def _begin_call(self) -> None:
         with self._condition:
             self._ensure_open()
+            self._active_calls += 1
 
     def _end_call(self) -> None:
-        pass
+        with self._condition:
+            self._active_calls -= 1
+            if not self._active_calls:
+                self._condition.notify_all()
 
     def __enter__(self) -> BatchWriter:
         return self
