@@ -58,6 +58,11 @@ readFleet:
   replicas: 3
   listen: :9800
   servicePort: 9800
+  metricsPort: 9801
+  readinessInterval: 10s
+  quiesceDelay: 5s
+  drainTimeout: 30s
+  terminationGracePeriodSeconds: 45
   zk: zk-0.zk:2181,zk-1.zk:2181,zk-2.zk:2181
   instance: accumulo
   accumuloVersion: 4.0.0-SNAPSHOT
@@ -67,6 +72,10 @@ readFleet:
   logLevel: info
   prewarmTables: auto
   prewarmParallelism: "8"
+  tls:
+    enabled: false
+    secretName: ""
+    requireClientCert: false
   resources:
     requests:
       cpu: 500m

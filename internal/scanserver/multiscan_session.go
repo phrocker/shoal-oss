@@ -96,9 +96,10 @@ type multiScanSessionRegistry struct {
 	byteCap  int
 	bytes    int
 	sessions map[data.ScanID]*multiScanSession
+	metrics  *operationalMetrics
 }
 
-func newMultiScanSessionRegistry(ttl time.Duration, capacity, byteCap int) *multiScanSessionRegistry {
+func newMultiScanSessionRegistry(ttl time.Duration, capacity, byteCap int, metrics ...*operationalMetrics) *multiScanSessionRegistry {
 	if ttl <= 0 {
 		ttl = defaultScanSessionTTL
 	}
@@ -108,12 +109,16 @@ func newMultiScanSessionRegistry(ttl time.Duration, capacity, byteCap int) *mult
 	if byteCap <= 0 {
 		byteCap = defaultScanSessionBytes
 	}
-	return &multiScanSessionRegistry{
+	r := &multiScanSessionRegistry{
 		ttl:      ttl,
 		capacity: capacity,
 		byteCap:  byteCap,
 		sessions: make(map[data.ScanID]*multiScanSession),
 	}
+	if len(metrics) > 0 {
+		r.metrics = metrics[0]
+	}
+	return r
 }
 
 func (r *multiScanSessionRegistry) create(now time.Time, remaining []*data.TKeyValue, tail multiScanResultTail) (data.ScanID, error) {
@@ -123,6 +128,9 @@ func (r *multiScanSessionRegistry) create(now time.Time, remaining []*data.TKeyV
 	r.expireLocked(now)
 	remainingBytes := sumApproxKVBytes(remaining)
 	if len(r.sessions) >= r.capacity || remainingBytes > r.byteCap-r.bytes {
+		if r.metrics != nil {
+			r.metrics.backpressureCapacity.Add(1)
+		}
 		return 0, &tabletscan.ScanServerBusyException{}
 	}
 
@@ -143,6 +151,9 @@ func (r *multiScanSessionRegistry) create(now time.Time, remaining []*data.TKeyV
 			expiresAt:      now.Add(r.ttl),
 		}
 		r.bytes += remainingBytes
+		if r.metrics != nil {
+			r.metrics.activeMulti.Add(1)
+		}
 		return id, nil
 	}
 	return 0, &tabletscan.ScanServerBusyException{}
@@ -182,6 +193,9 @@ func (r *multiScanSessionRegistry) continueMultiScan(now time.Time, scanID data.
 	session.tail.apply(result)
 	session.exhausted = true
 	session.release()
+	if r.metrics != nil {
+		r.metrics.activeMulti.Add(-1)
+	}
 	return result, nil
 }
 
@@ -199,6 +213,10 @@ func (r *multiScanSessionRegistry) closeScan(now time.Time, scanID data.ScanID) 
 		r.bytes = 0
 	}
 	session.release()
+	if r.metrics != nil && !session.exhausted {
+		r.metrics.activeMulti.Add(-1)
+		r.metrics.canceledMulti.Add(1)
+	}
 	delete(r.sessions, scanID)
 	return nil
 }
@@ -220,12 +238,37 @@ func (r *multiScanSessionRegistry) expireLocked(now time.Time) {
 		if !session.expiresAt.After(now) {
 			r.bytes -= session.remainingBytes
 			session.release()
+			if r.metrics != nil {
+				if !session.exhausted {
+					r.metrics.activeMulti.Add(-1)
+				}
+				r.metrics.expiredMulti.Add(1)
+			}
 			delete(r.sessions, id)
 		}
 	}
 	if r.bytes < 0 {
 		r.bytes = 0
 	}
+}
+
+func (r *multiScanSessionRegistry) closeAll() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	forced := 0
+	for id, session := range r.sessions {
+		if !session.exhausted {
+			forced++
+			if r.metrics != nil {
+				r.metrics.activeMulti.Add(-1)
+				r.metrics.canceledMulti.Add(1)
+			}
+		}
+		session.release()
+		delete(r.sessions, id)
+	}
+	r.bytes = 0
+	return forced
 }
 
 func cloneTKeyExtent(extent *data.TKeyExtent) *data.TKeyExtent {

@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sync/atomic"
 	"time"
 
 	"github.com/phrocker/shoal/internal/cache"
@@ -36,14 +37,18 @@ var _ tabletscan.TabletScanClientService = (*Server)(nil)
 
 // Server holds the long-lived state needed to serve scans.
 type Server struct {
-	locator    cache.TableLocator
-	blocks     *cache.BlockCache
-	storage    storage.Backend
-	dec        *block.Decompressor
-	logger     *slog.Logger
-	pages      int
-	scans      *scanSessionRegistry
-	multiScans *multiScanSessionRegistry
+	locator      cache.TableLocator
+	blocks       *cache.BlockCache
+	storage      storage.Backend
+	dec          *block.Decompressor
+	logger       *slog.Logger
+	pages        int
+	scans        *scanSessionRegistry
+	multiScans   *multiScanSessionRegistry
+	metrics      *operationalMetrics
+	accepting    atomic.Bool
+	inFlight     atomic.Int64
+	stateChanged chan struct{}
 
 	// File-level byte cache: GCS path → full RFile bytes. Avoids
 	// re-pulling the same 30MB+ file on every scan against the same
@@ -137,36 +142,52 @@ func NewServer(opts Options) (*Server, error) {
 	if fileCap > 0 {
 		fc = newFileCache(fileCap)
 	}
-	return &Server{
-		locator: opts.Locator,
-		blocks:  opts.BlockCache,
-		storage: opts.Storage,
-		dec:     dec,
-		logger:  logger,
-		pages:   pageCap,
+	metrics := &operationalMetrics{}
+	s := &Server{
+		locator:      opts.Locator,
+		blocks:       opts.BlockCache,
+		storage:      opts.Storage,
+		dec:          dec,
+		logger:       logger,
+		pages:        pageCap,
+		metrics:      metrics,
+		stateChanged: make(chan struct{}, 1),
 		scans: newScanSessionRegistry(
 			opts.ScanSessionTTL,
 			opts.ScanSessionCapacity,
 			opts.ScanSessionBytesCapacity,
+			metrics,
 		),
 		multiScans: newMultiScanSessionRegistry(
 			opts.ScanSessionTTL,
 			opts.ScanSessionCapacity,
 			opts.ScanSessionBytesCapacity,
+			metrics,
 		),
 		files:       fc,
 		walPeerPort: opts.WALPeerPort,
-	}, nil
+	}
+	s.accepting.Store(true)
+	return s, nil
 }
 
 func (s *Server) ContinueScan(ctx context.Context, tinfo *client.TInfo, scanID data.ScanID, busyTimeout int64) (*data.ScanResult_, error) {
+	start := time.Now()
+	s.beginExisting()
+	defer s.endCall()
 	if err := ctx.Err(); err != nil {
+		s.observeContinue(start, err)
 		return nil, err
 	}
-	return s.scans.continueScan(time.Now(), scanID, s.pages)
+	s.metrics.continuationsSingle.Add(1)
+	result, err := s.scans.continueScan(time.Now(), scanID, s.pages)
+	s.observeContinue(start, err)
+	return result, err
 }
 
 func (s *Server) CloseScan(ctx context.Context, tinfo *client.TInfo, scanID data.ScanID) error {
+	s.beginExisting()
+	defer s.endCall()
 	return s.scans.closeScan(time.Now(), scanID)
 }
 
@@ -178,13 +199,22 @@ func (s *Server) CloseScan(ctx context.Context, tinfo *client.TInfo, scanID data
 // Implementation: handled in multiscan_handler.go.
 
 func (s *Server) ContinueMultiScan(ctx context.Context, tinfo *client.TInfo, scanID data.ScanID, busyTimeout int64) (*data.MultiScanResult_, error) {
+	start := time.Now()
+	s.beginExisting()
+	defer s.endCall()
 	if err := ctx.Err(); err != nil {
+		s.observeContinue(start, err)
 		return nil, err
 	}
-	return s.multiScans.continueMultiScan(time.Now(), scanID, s.pages)
+	s.metrics.continuationsMulti.Add(1)
+	result, err := s.multiScans.continueMultiScan(time.Now(), scanID, s.pages)
+	s.observeContinue(start, err)
+	return result, err
 }
 
 func (s *Server) CloseMultiScan(ctx context.Context, tinfo *client.TInfo, scanID data.ScanID) error {
+	s.beginExisting()
+	defer s.endCall()
 	return s.multiScans.closeScan(time.Now(), scanID)
 }
 
