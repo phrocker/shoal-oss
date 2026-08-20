@@ -18,7 +18,7 @@ validation state, and the few remaining external platform gates.
 | Goal | Start here |
 |---|---|
 | Run a local database with RFile or Parquet | [Embedded engine](#embedded-engine-standalone-no-zookeeper) |
-| Use Sharkbite-compatible Python APIs | [`python/README.md`](python/README.md) |
+| Use Sharkbite import-compatible Python APIs | [`python/README.md`](python/README.md) |
 | Embed the Go client or stable C ABI | [`accumulo/`](accumulo/) · [`capi/README.md`](capi/README.md) |
 | Evaluate Shoal replacement roles with Accumulo | [`FEATURES.md`](FEATURES.md#accumulo-replacement-roles) · [`docs/tserver-hosting-lifecycle.md`](docs/tserver-hosting-lifecycle.md) |
 | Run graph, document, SQL, or vector search | [`FEATURES.md`](FEATURES.md#query-and-indexing) · [`docs/ai-knowledge-graph.md`](docs/ai-knowledge-graph.md) |
@@ -26,8 +26,10 @@ validation state, and the few remaining external platform gates.
 
 ## Quick start
 
-Prerequisites for local development are Go 1.25+, Python 3.9+, and `make`.
-Docker with Compose v2 is required only for live Accumulo conformance.
+Prerequisites for local development are Go 1.25+, Python 3.9+, `make`, and a
+native C toolchain when building the C ABI or Python bindings. Docker with
+Compose v2 is required for the live HDFS integration suite and live Accumulo
+conformance.
 
 ```bash
 git clone https://github.com/phrocker/shoal-oss.git
@@ -47,7 +49,7 @@ printf '%s\n' \
 go run ./cmd/shoal-embed scan --table events --data ~/.shoal/data
 ```
 
-Build and install the Sharkbite-compatible Python package:
+Build and install the Sharkbite import-compatible Python package:
 
 ```bash
 make capi
