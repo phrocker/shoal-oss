@@ -250,6 +250,15 @@ class FoundationTests(unittest.TestCase):
         self.assertEqual(clone.getLong("number"), 17)
         self.assertEqual(clone.getLong("missing", 23), 23)
 
+    def test_zookeeper_instance_validation_and_safe_three_argument_default(self):
+        api = FakeAPI()
+        with self.assertRaisesRegex(ClientException, "instance name"):
+            ZookeeperInstance(None, None, 1000, None, _api=api)
+        instance = ZookeeperInstance("i", "zk", 1000, _api=api)
+        self.addCleanup(instance.close)
+        self.assertIsInstance(instance.getConfiguration(), Configuration)
+        self.assertEqual(instance.session_timeout_ms, 1000)
+
     def test_auth_info_instance_mismatch_is_rejected_before_connect(self):
         api = FakeAPI()
         instance = ZookeeperInstance("i", "zk", 1000, Configuration(), _api=api)
