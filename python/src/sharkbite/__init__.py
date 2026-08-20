@@ -37,6 +37,15 @@ from .errors import (
     UnsupportedError,
 )
 from .writer import BatchWriter, BatchWriterOptions, Mutation
+from .storage import (
+    Hdfs,
+    HdfsDirEnt,
+    HdfsInputStream,
+    HdfsOutputStream,
+    KeyValue,
+    RFileOperations,
+    SequentialRFile,
+)
 
 AccumuloConnector = Connector
 
@@ -58,13 +67,19 @@ __all__ = [
     "Connector",
     "DeadlineExceededError",
     "InvalidArgumentError",
+    "Hdfs",
+    "HdfsDirEnt",
+    "HdfsInputStream",
+    "HdfsOutputStream",
     "Key",
+    "KeyValue",
     "NativeAPI",
     "NamespaceOperations",
     "NamespacePermissions",
     "NotFoundError",
     "PermissionDeniedError",
     "RuntimeInfo",
+    "RFileOperations",
     "Scanner",
     "SecurityOperations",
     "ShoalSystemPermissions",
@@ -76,4 +91,5 @@ __all__ = [
     "TableOperations",
     "TablePermissions",
     "Mutation",
+    "SequentialRFile",
 ]

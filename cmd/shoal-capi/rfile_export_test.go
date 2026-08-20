@@ -24,7 +24,7 @@ func TestStatusForRFileErrors(t *testing.T) {
 		{publicrfile.ErrInvalidPath, 1},
 		{publicrfile.ErrOutOfOrder, 1},
 		{publicrfile.ErrUnsupportedCodec, 4},
-		{publicrfile.ErrLocalityGroupUnsupported, 4},
+		{publicrfile.ErrInvalidLocalityGroup, 1},
 		{os.ErrNotExist, 9},
 		{os.ErrPermission, 10},
 	}

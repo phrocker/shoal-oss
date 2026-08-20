@@ -29,14 +29,14 @@ Shoal separates **ABI compatibility** from **feature availability**:
   stable allocation-free version tuple that works before connector creation.
   `SHOAL_ABI_VERSION_PACKED` uses
   `SHOAL_ABI_PACK_VERSION(major, minor, patch)` with a hexadecimal
-  `0x00MMmmpp` layout, so ABI `1.15.0` is `0x00010f00`.
+  `0x00MMmmpp` layout, so ABI `1.16.0` is `0x00011000`.
 - Capability identifiers are append-only. Existing IDs and bits never change
   meaning. `shoal_abi_capability_word_count()` reports how many 64-bit words
   the current library uses, `shoal_abi_capability_word(i)` returns `0` for
   `i >= word_count`, and `shoal_abi_has_capability(id)` returns `0` for both
   unsupported and unknown IDs.
 
-Current capability assignments (`word 0 == 0x0000000007ffffff`):
+Current capability assignments (`word 0 == 0x000000001fffffff`):
 
 | ID | Mask | Surface |
 | --- | --- | --- |
@@ -67,6 +67,8 @@ Current capability assignments (`word 0 == 0x0000000007ffffff`):
 | `SHOAL_ABI_CAPABILITY_STREAMING_SCAN_CURSOR` | `0x1000000` | owned bounded-memory scan cursors for scanner, batch-scanner, and high-level client streams |
 | `SHOAL_ABI_CAPABILITY_COLUMN_VISIBILITY` | `0x2000000` | copied binary visibility expressions, immutable owned trees/terms, synchronized evaluators, and structured parse errors |
 | `SHOAL_ABI_CAPABILITY_OWNED_KEY` | `0x4000000` | copied mutable key components, synchronized getters/setters/comparisons, and independently owned byte results |
+| `SHOAL_ABI_CAPABILITY_HDFS` | `0x8000000` | Hadoop-configured HDFS client, owned streams, metadata, list/stat/remove/rename, cancellation, and deadlines |
+| `SHOAL_ABI_CAPABILITY_RFILE_LOCALITY_GROUPS` | `0x10000000` | named locality-group transitions on owned RFile writers |
 
 Shoal does **not** advertise instance status, compaction/import/export,
 Python/wheel, or any other unimplemented surface until the API exists and has

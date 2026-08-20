@@ -23,6 +23,9 @@ CAP_TABLE_MAINTENANCE = 19
 CAP_HIGH_LEVEL_CLIENT = 21
 CAP_HIGH_LEVEL_SCANNER = 22
 CAP_COMPATIBILITY_ERRORS = 23
+CAP_RFILE = 16
+CAP_HDFS = 27
+CAP_RFILE_LOCALITY_GROUPS = 28
 
 CAPABILITY_SYMBOLS = {
     CAP_OWNED_SCAN_RESULT: {
@@ -159,6 +162,40 @@ class Key(C.Structure):
         ("column_qualifier", Bytes),
         ("column_visibility", Bytes),
         ("timestamp", C.c_int64),
+    ]
+
+
+class RFileWriterConfig(C.Structure):
+    _fields_ = [
+        ("struct_size", C.c_uint32),
+        ("codec", C.c_char_p),
+        ("block_size", C.c_int64),
+    ]
+
+
+class RFileEntry(C.Structure):
+    _fields_ = [
+        ("struct_size", C.c_uint32),
+        ("key", Key),
+        ("value", Bytes),
+        ("deleted", C.c_uint8),
+    ]
+
+
+class RFileEntryView(C.Structure):
+    _fields_ = RFileEntry._fields_
+
+
+class HDFSDirEntryView(C.Structure):
+    _fields_ = [
+        ("struct_size", C.c_uint32),
+        ("name", C.c_char_p),
+        ("owner", C.c_char_p),
+        ("group", C.c_char_p),
+        ("size", C.c_int64),
+        ("modification_time_ms", C.c_int64),
+        ("mode", C.c_uint32),
+        ("is_directory", C.c_uint8),
     ]
 
 
@@ -453,6 +490,202 @@ class NativeAPI:
             **optional,
         )
         self._function("shoal_scan_result_free", None, PP, **optional)
+        self._function("shoal_bytes_result_get", Bytes, P, **optional)
+        self._function("shoal_bytes_result_free", None, PP, **optional)
+        self._function(
+            "shoal_rfile_writer_config_init",
+            None,
+            C.POINTER(RFileWriterConfig),
+            **optional,
+        )
+        self._function("shoal_rfile_entry_init", None, C.POINTER(RFileEntry), **optional)
+        self._function(
+            "shoal_rfile_entry_view_init",
+            None,
+            C.POINTER(RFileEntryView),
+            **optional,
+        )
+        self._function(
+            "shoal_rfile_writer_create",
+            C.c_int32,
+            C.c_char_p,
+            C.POINTER(RFileWriterConfig),
+            C.c_int64,
+            PP,
+            PP,
+            **optional,
+        )
+        self._function(
+            "shoal_rfile_writer_append",
+            C.c_int32,
+            P,
+            C.POINTER(RFileEntry),
+            C.c_int64,
+            PP,
+            **optional,
+        )
+        self._function(
+            "shoal_rfile_writer_add_locality_group",
+            C.c_int32,
+            P,
+            C.c_char_p,
+            C.c_int64,
+            PP,
+            **optional,
+        )
+        self._function("shoal_rfile_writer_close", C.c_int32, P, PP, **optional)
+        self._function("shoal_rfile_writer_free", None, PP, **optional)
+        self._function(
+            "shoal_rfile_reader_open_sequential",
+            C.c_int32,
+            C.c_char_p,
+            C.c_int64,
+            PP,
+            PP,
+            **optional,
+        )
+        self._function("shoal_rfile_reader_has_top", C.c_uint8, P, **optional)
+        self._function("shoal_rfile_reader_top", C.c_int32, P, PP, PP, **optional)
+        self._function(
+            "shoal_rfile_entry_result_get",
+            C.c_int32,
+            P,
+            C.POINTER(RFileEntryView),
+            PP,
+            **optional,
+        )
+        self._function("shoal_rfile_entry_result_free", None, PP, **optional)
+        self._function(
+            "shoal_rfile_reader_next",
+            C.c_int32,
+            P,
+            C.c_int64,
+            PP,
+            **optional,
+        )
+        self._function("shoal_rfile_reader_close", C.c_int32, P, PP, **optional)
+        self._function("shoal_rfile_reader_free", None, PP, **optional)
+        self._function(
+            "shoal_hdfs_dir_entry_view_init",
+            None,
+            C.POINTER(HDFSDirEntryView),
+            **optional,
+        )
+        self._function(
+            "shoal_hdfs_client_create",
+            C.c_int32,
+            C.c_char_p,
+            C.c_int64,
+            PP,
+            PP,
+            **optional,
+        )
+        self._function("shoal_hdfs_client_close", C.c_int32, P, PP, **optional)
+        self._function("shoal_hdfs_client_free", None, PP, **optional)
+        self._function(
+            "shoal_hdfs_client_open",
+            C.c_int32,
+            P,
+            C.c_char_p,
+            C.c_int64,
+            PP,
+            PP,
+            **optional,
+        )
+        self._function(
+            "shoal_hdfs_client_create_file",
+            C.c_int32,
+            P,
+            C.c_char_p,
+            C.c_int64,
+            PP,
+            PP,
+            **optional,
+        )
+        self._function(
+            "shoal_hdfs_client_list",
+            C.c_int32,
+            P,
+            C.c_char_p,
+            C.c_int64,
+            PP,
+            PP,
+            **optional,
+        )
+        self._function(
+            "shoal_hdfs_client_stat",
+            C.c_int32,
+            P,
+            C.c_char_p,
+            C.c_int64,
+            PP,
+            PP,
+            **optional,
+        )
+        self._function(
+            "shoal_hdfs_client_remove",
+            C.c_int32,
+            P,
+            C.c_char_p,
+            C.c_uint8,
+            C.c_int64,
+            PP,
+            **optional,
+        )
+        self._function(
+            "shoal_hdfs_client_rename",
+            C.c_int32,
+            P,
+            C.c_char_p,
+            C.c_char_p,
+            C.c_int64,
+            PP,
+            **optional,
+        )
+        self._function(
+            "shoal_hdfs_input_stream_read",
+            C.c_int32,
+            P,
+            C.c_size_t,
+            C.c_int64,
+            PP,
+            PP,
+            **optional,
+        )
+        self._function("shoal_hdfs_input_stream_close", C.c_int32, P, PP, **optional)
+        self._function("shoal_hdfs_input_stream_free", None, PP, **optional)
+        self._function(
+            "shoal_hdfs_output_stream_write",
+            C.c_int32,
+            P,
+            Bytes,
+            C.c_int64,
+            C.POINTER(C.c_size_t),
+            PP,
+            **optional,
+        )
+        self._function("shoal_hdfs_output_stream_close", C.c_int32, P, PP, **optional)
+        self._function("shoal_hdfs_output_stream_free", None, PP, **optional)
+        self._function("shoal_hdfs_dir_list_count", C.c_size_t, P, **optional)
+        self._function(
+            "shoal_hdfs_dir_list_get",
+            C.c_int32,
+            P,
+            C.c_size_t,
+            C.POINTER(HDFSDirEntryView),
+            PP,
+            **optional,
+        )
+        self._function("shoal_hdfs_dir_list_free", None, PP, **optional)
+        self._function(
+            "shoal_hdfs_dir_entry_result_get",
+            C.c_int32,
+            P,
+            C.POINTER(HDFSDirEntryView),
+            PP,
+            **optional,
+        )
+        self._function("shoal_hdfs_dir_entry_result_free", None, PP, **optional)
         self._function("shoal_mutation_create", C.c_int32, Bytes, PP, PP, **optional)
         self._function(
             "shoal_mutation_put",

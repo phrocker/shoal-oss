@@ -428,6 +428,32 @@ func shoal_rfile_writer_append(handle *C.shoal_rfile_writer, input *C.shoal_rfil
 	return C.SHOAL_STATUS_OK
 }
 
+//export shoal_rfile_writer_add_locality_group
+func shoal_rfile_writer_add_locality_group(handle *C.shoal_rfile_writer, groupName *C.char, timeout C.int64_t, outError **C.shoal_error) (status C.shoal_status) {
+	clearError(outError)
+	defer recoverStatus(&status, outError)
+	writer, err := lookupRFileWriter(handle)
+	if err != nil {
+		return fail(outError, C.SHOAL_STATUS_INVALID_HANDLE, err)
+	}
+	name, err := requiredString(groupName, "name")
+	if err != nil {
+		return fail(outError, C.SHOAL_STATUS_INVALID_ARGUMENT, err)
+	}
+	ctx, done, code, err := writer.lifecycle.begin(timeout)
+	if err != nil {
+		return fail(outError, code, err)
+	}
+	defer done()
+	if err := ctx.Err(); err != nil {
+		return failForError(outError, err)
+	}
+	if err := writer.writer.AddLocalityGroup(name); err != nil {
+		return failForError(outError, err)
+	}
+	return C.SHOAL_STATUS_OK
+}
+
 //export shoal_rfile_writer_entries
 func shoal_rfile_writer_entries(handle *C.shoal_rfile_writer) C.int64_t {
 	writer, err := lookupRFileWriter(handle)

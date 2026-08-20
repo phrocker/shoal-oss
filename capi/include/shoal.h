@@ -337,6 +337,10 @@ SHOAL_API shoal_status SHOAL_CALL
 shoal_rfile_writer_append(shoal_rfile_writer *writer,
                           const shoal_rfile_entry *entry, int64_t timeout_ms,
                           shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_rfile_writer_add_locality_group(shoal_rfile_writer *writer,
+                                      const char *name, int64_t timeout_ms,
+                                      shoal_error **out_error);
 SHOAL_API int64_t SHOAL_CALL
 shoal_rfile_writer_entries(shoal_rfile_writer *writer);
 SHOAL_API shoal_status SHOAL_CALL
@@ -412,6 +416,84 @@ shoal_rfile_entry_result_get(const shoal_rfile_entry_result *result,
                              shoal_error **out_error);
 SHOAL_API void SHOAL_CALL
 shoal_rfile_entry_result_free(shoal_rfile_entry_result **result);
+
+/*
+ * HDFS clients use the process's Hadoop configuration and established
+ * authentication. No credential bytes cross this ABI. All paths and write
+ * bytes are copied before return. Handles are owned; close is idempotent,
+ * cancels active operations, and free clears the caller's handle.
+ */
+SHOAL_API void SHOAL_CALL
+shoal_hdfs_dir_entry_view_init(shoal_hdfs_dir_entry_view *view);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_hdfs_client_create(const char *namenode, int64_t timeout_ms,
+                         shoal_hdfs_client **out_client,
+                         shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_hdfs_client_close(shoal_hdfs_client *client, shoal_error **out_error);
+SHOAL_API void SHOAL_CALL
+shoal_hdfs_client_free(shoal_hdfs_client **client);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_hdfs_client_open(shoal_hdfs_client *client, const char *path,
+                       int64_t timeout_ms,
+                       shoal_hdfs_input_stream **out_stream,
+                       shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_hdfs_client_create_file(shoal_hdfs_client *client, const char *path,
+                              int64_t timeout_ms,
+                              shoal_hdfs_output_stream **out_stream,
+                              shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_hdfs_client_list(shoal_hdfs_client *client, const char *path,
+                       int64_t timeout_ms,
+                       shoal_hdfs_dir_list_result **out_result,
+                       shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_hdfs_client_stat(shoal_hdfs_client *client, const char *path,
+                       int64_t timeout_ms,
+                       shoal_hdfs_dir_entry_result **out_result,
+                       shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_hdfs_client_remove(shoal_hdfs_client *client, const char *path,
+                         uint8_t recursive, int64_t timeout_ms,
+                         shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_hdfs_client_rename(shoal_hdfs_client *client, const char *old_path,
+                         const char *new_path, int64_t timeout_ms,
+                         shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_hdfs_input_stream_read(shoal_hdfs_input_stream *stream, size_t length,
+                             int64_t timeout_ms,
+                             shoal_bytes_result **out_result,
+                             shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_hdfs_input_stream_close(shoal_hdfs_input_stream *stream,
+                              shoal_error **out_error);
+SHOAL_API void SHOAL_CALL
+shoal_hdfs_input_stream_free(shoal_hdfs_input_stream **stream);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_hdfs_output_stream_write(shoal_hdfs_output_stream *stream,
+                               shoal_bytes value, int64_t timeout_ms,
+                               size_t *out_written, shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_hdfs_output_stream_close(shoal_hdfs_output_stream *stream,
+                               shoal_error **out_error);
+SHOAL_API void SHOAL_CALL
+shoal_hdfs_output_stream_free(shoal_hdfs_output_stream **stream);
+SHOAL_API size_t SHOAL_CALL
+shoal_hdfs_dir_list_count(const shoal_hdfs_dir_list_result *result);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_hdfs_dir_list_get(const shoal_hdfs_dir_list_result *result, size_t index,
+                        shoal_hdfs_dir_entry_view *out_entry,
+                        shoal_error **out_error);
+SHOAL_API void SHOAL_CALL
+shoal_hdfs_dir_list_free(shoal_hdfs_dir_list_result **result);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_hdfs_dir_entry_result_get(const shoal_hdfs_dir_entry_result *result,
+                                shoal_hdfs_dir_entry_view *out_entry,
+                                shoal_error **out_error);
+SHOAL_API void SHOAL_CALL
+shoal_hdfs_dir_entry_result_free(shoal_hdfs_dir_entry_result **result);
 
 /*
  * Configuration inputs are binary-safe and copied before return. Handles are
