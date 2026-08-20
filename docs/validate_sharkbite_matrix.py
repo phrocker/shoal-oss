@@ -14,7 +14,7 @@ import tempfile
 
 
 DOC_PATH = Path(__file__).with_name("sharkbite-compatibility.md")
-EXPECTED_REVISION = 38
+EXPECTED_REVISION = 39
 # Update this manifest only when the independently audited inventory itself
 # changes; review every added/removed or reclassified ID in code review.
 EXPECTED_ROW_MANIFEST = DOC_PATH.with_name(
@@ -60,8 +60,8 @@ def status_count_map(
 
 EXPECTED_STATUS_COUNTS = {
     "Covered": 131,
-    "Missing Go": 2290,
-    "Missing C ABI": 84,
+    "Missing Go": 2274,
+    "Missing C ABI": 100,
     "Behavior mismatch": 219,
     "Intentional divergence (approval required)": 87,
     "Not required (rationale required)": 392,
@@ -88,11 +88,11 @@ EXPECTED_PREFIX_COUNTS = {
         not_required=8,
     ),
     "SB-CXX": status_count_map(
-        missing_go=2230,
+        missing_go=2214,
         covered=41,
         behavior_mismatch=15,
         not_required=304,
-        missing_c_abi=36,
+        missing_c_abi=52,
     ),
     "SB-DATA": status_count_map(
         covered=9,
@@ -197,17 +197,18 @@ EXPECTED_METADATA_FIELDS = {
     ),
     "Sharkbite release line": "`sharkbite` 1.2.0.3 on PyPI (`setup.py:34-35`)",
     "Shoal reference": (
-        "`phrocker/shoal-oss` exact audited baseline for revision 38 "
-        "`3b28b8ea4364cbafc0f357727a75413dd68995c2` "
-        "(\"Merge PR #151: complete the public key value API\") "
-        "plus the column-visibility C ABI introduced in this revision"
+        "`phrocker/shoal-oss` exact audited baseline for revision 39 "
+        "`d1f2500a052eec2ddf2cceb0ea76571a86ca01c8` "
+        "(\"Merge PR #155: expose owned column visibility expressions\") "
+        "plus the tablet extent API introduced in this revision"
     ),
     "Shoal C ABI version": "`SHOAL_ABI_VERSION 1u` (`capi/include/shoal_types.h`)",
 }
 
 EXPECTED_DOCUMENT_STATUS_SNIPPETS = (
     "Normative gate. Binding on all Sharkbite-compatibility work.",
-    f"Revision {EXPECTED_REVISION} — completes the 31-row column-visibility expression tranche",
+    f"Revision {EXPECTED_REVISION} — records the public tablet extent API",
+    "Revision 38 — completes the 31-row column-visibility expression tranche",
     "Revision 36 — completes the twelve-row streaming cursor tranche",
     "Revision 34 — completes the four-row compatibility-error tranche",
     "Revision 32 — completes the five-row high-level scanner facade",
@@ -333,6 +334,11 @@ OPTIONAL_ANCHOR_CITATIONS = {
 # same reason: the matrix claims an exact public Go surface, so a rename or a
 # deleted method must fail the document, not just the build.
 # Implementation files behind the section 11 table-maintenance rows.
+TARGETED_SB_EXTENT_CITATIONS = {
+    "accumulo/tablet_extent.go",
+    "accumulo/tablet_extent_test.go",
+}
+
 TARGETED_SB_KEY_CITATIONS = {
     "accumulo/key.go",
     "accumulo/key_test.go",
@@ -384,6 +390,7 @@ ANCHOR_CHECKED_CITATIONS = (
     | TARGETED_SB_SCAN_CITATIONS
     | TARGETED_SB_VIS_CITATIONS
     | TARGETED_SB_KEY_CITATIONS
+    | TARGETED_SB_EXTENT_CITATIONS
 )
 COUNT_RE = re.compile(
     r"^(?P<bold>\*\*)?(?P<number>0|[1-9]\d*|[1-9]\d{0,2}(?:,\d{3})+)(?(bold)\*\*|)$"
@@ -1677,7 +1684,7 @@ def validate_status_narratives(
         f"The shape of the work is visible in the {status_counts['Missing Go']} `Missing Go` rows, of which {prefix_counts['SB-CXX']['Missing Go']} are the C++ members in [§19.2](#sec-19-2) that no Shoal layer exports.",
         f"`Behavior mismatch` ({status_counts['Behavior mismatch']}) is the bucket that sets the schedule: {python_visible_behavior} rows on the Python-visible and curated C++ surface each need a differential test against a live cluster or the exported ABI, and {prefix_counts['SB-CXX']['Behavior mismatch']} are destructors of classes bound into Python, where the destruction point is user-observable and the model differs from Go finalisation ([§19.1](#sec-19-1)).",
         f"`Intentional divergence` ({status_counts[INTENTIONAL_DIVERGENCE_STATUS]}) is dominated by one upstream fact: {prefix_counts['SB-STAT'][INTENTIONAL_DIVERGENCE_STATUS]} rows are cluster-status accessors Accumulo itself deleted ([§14](#sec-14), [SB-DIV-016](#sec-26)).",
-        f"`Missing C ABI` ({status_counts['Missing C ABI']}) is now led by the key value API (36), pandas ({prefix_counts['SB-PANDA']['Missing C ABI']}), packaging/import scaffolding ({prefix_counts['SB-PKG']['Missing C ABI']}), PyTorch ({prefix_counts['SB-TORCH']['Missing C ABI']}), the remaining scanner rows ({prefix_counts['SB-SCAN']['Missing C ABI']}), and the remaining data-model row ({prefix_counts['SB-DATA']['Missing C ABI']}).",
+        f"`Missing C ABI` ({status_counts['Missing C ABI']}) is now led by the key value API (36), the tablet extent (16), pandas ({prefix_counts['SB-PANDA']['Missing C ABI']}), packaging/import scaffolding ({prefix_counts['SB-PKG']['Missing C ABI']}), PyTorch ({prefix_counts['SB-TORCH']['Missing C ABI']}), the remaining scanner rows ({prefix_counts['SB-SCAN']['Missing C ABI']}), and the remaining data-model row ({prefix_counts['SB-DATA']['Missing C ABI']}).",
     ]
     for phrase in expected_phrases:
         require(phrase in normalized, f"missing or stale status narrative: {phrase}")
