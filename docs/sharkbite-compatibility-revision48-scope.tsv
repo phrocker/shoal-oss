@@ -1,7 +1,7 @@
 # Revision-48 Sharkbite client-scope disposition manifest.
 # Matrix: docs/sharkbite-compatibility.md revision 48.
 # Sharkbite source: phrocker/sharkbite@7f2625f74331b0cd4a75dc0484949c40f1409686.
-# Shoal source: phrocker/shoal-oss@182a4cebfe43866339284f2481be6731175490f3.
+# Shoal source: phrocker/shoal-oss@c49169ca3e990b227c11f86527c86278413a3936.
 # Policy: docs/sharkbite-client-scope.md.
 # Columns: ROW-ID<TAB>DISPOSITION<TAB>RULE<TAB>PINNED-MATRIX-STATUS.
 # Entries are in matrix order; validator rules, not aggregate counts, authorize dispositions.
@@ -244,54 +244,54 @@ SB-BASE-017	Covered	core-covered	Covered
 SB-BASE-018	Covered	core-covered	Covered
 SB-BASE-019	Covered	core-covered	Covered
 SB-BASE-020	Covered	core-covered	Covered
-SB-TABLE-001	Required gap	core-required-gap	Behavior mismatch
-SB-TABLE-002	Required gap	core-required-gap	Behavior mismatch
-SB-TABLE-003	Required gap	core-required-gap	Behavior mismatch
+SB-TABLE-001	Covered	core-covered	Covered
+SB-TABLE-002	Covered	core-covered	Covered
+SB-TABLE-003	Covered	core-covered	Covered
 SB-TABLE-004	Not required	not-required-rationale	Not required (rationale required)
 SB-TABLE-005	Covered	core-covered	Covered
-SB-TABLE-006	Required gap	core-required-gap	Missing Go
-SB-TABLE-007	Required gap	core-required-gap	Behavior mismatch
-SB-TABLE-008	Required gap	core-required-gap	Behavior mismatch
+SB-TABLE-006	Approved divergence	core-approved-divergence	Intentional divergence (approval required)
+SB-TABLE-007	Covered	core-covered	Covered
+SB-TABLE-008	Covered	core-covered	Covered
 SB-TABLE-009	Not required	not-required-rationale	Not required (rationale required)
-SB-TABLE-010	Required gap	core-required-gap	Behavior mismatch
+SB-TABLE-010	Covered	core-covered	Covered
 SB-TABLE-011	Not required	not-required-rationale	Not required (rationale required)
 SB-TABLE-012	Covered	core-covered	Covered
-SB-TABLE-013	Required gap	core-required-gap	Behavior mismatch
+SB-TABLE-013	Approved divergence	core-approved-divergence	Intentional divergence (approval required)
 SB-TABLE-014	Not required	not-required-rationale	Not required (rationale required)
 SB-TABLE-015	Not required	not-required-rationale	Not required (rationale required)
-SB-TABLE-016	Required gap	core-required-gap	Behavior mismatch
-SB-TABLE-017	Required gap	core-required-gap	Behavior mismatch
-SB-TABLE-018	Required gap	core-required-gap	Behavior mismatch
-SB-TABLE-019	Required gap	core-required-gap	Behavior mismatch
+SB-TABLE-016	Covered	core-covered	Covered
+SB-TABLE-017	Covered	core-covered	Covered
+SB-TABLE-018	Covered	core-covered	Covered
+SB-TABLE-019	Covered	core-covered	Covered
 SB-TABLE-020	Not required	not-required-rationale	Not required (rationale required)
-SB-TABLE-021	Required gap	core-required-gap	Behavior mismatch
-SB-TABLE-022	Required gap	core-required-gap	Behavior mismatch
-SB-NS-001	Required gap	core-required-gap	Behavior mismatch
-SB-NS-002	Required gap	core-required-gap	Behavior mismatch
-SB-NS-003	Required gap	core-required-gap	Behavior mismatch
-SB-NS-004	Required gap	core-required-gap	Behavior mismatch
-SB-NS-005	Required gap	core-required-gap	Behavior mismatch
-SB-NS-006	Required gap	core-required-gap	Behavior mismatch
-SB-NS-007	Required gap	core-required-gap	Behavior mismatch
-SB-NS-008	Required gap	core-required-gap	Behavior mismatch
-SB-SEC-001	Required gap	core-required-gap	Behavior mismatch
-SB-SEC-002	Required gap	core-required-gap	Behavior mismatch
-SB-SEC-003	Required gap	core-required-gap	Behavior mismatch
-SB-SEC-004	Required gap	core-required-gap	Behavior mismatch
-SB-SEC-005	Required gap	core-required-gap	Behavior mismatch
-SB-SEC-006	Required gap	core-required-gap	Behavior mismatch
-SB-SEC-007	Required gap	core-required-gap	Behavior mismatch
-SB-SEC-008	Required gap	core-required-gap	Behavior mismatch
-SB-SEC-009	Required gap	core-required-gap	Behavior mismatch
-SB-SEC-010	Required gap	core-required-gap	Behavior mismatch
-SB-SEC-011	Required gap	core-required-gap	Behavior mismatch
-SB-SEC-012	Required gap	core-required-gap	Behavior mismatch
-SB-SEC-013	Required gap	core-required-gap	Behavior mismatch
-SB-SEC-014	Required gap	core-required-gap	Behavior mismatch
-SB-SEC-015	Required gap	core-required-gap	Behavior mismatch
-SB-SEC-016	Required gap	core-required-gap	Behavior mismatch
-SB-SEC-017	Required gap	core-required-gap	Behavior mismatch
-SB-SEC-018	Required gap	core-required-gap	Behavior mismatch
+SB-TABLE-021	Covered	core-covered	Covered
+SB-TABLE-022	Covered	core-covered	Covered
+SB-NS-001	Covered	core-covered	Covered
+SB-NS-002	Covered	core-covered	Covered
+SB-NS-003	Covered	core-covered	Covered
+SB-NS-004	Covered	core-covered	Covered
+SB-NS-005	Covered	core-covered	Covered
+SB-NS-006	Covered	core-covered	Covered
+SB-NS-007	Covered	core-covered	Covered
+SB-NS-008	Covered	core-covered	Covered
+SB-SEC-001	Covered	core-covered	Covered
+SB-SEC-002	Covered	core-covered	Covered
+SB-SEC-003	Covered	core-covered	Covered
+SB-SEC-004	Covered	core-covered	Covered
+SB-SEC-005	Covered	core-covered	Covered
+SB-SEC-006	Covered	core-covered	Covered
+SB-SEC-007	Covered	core-covered	Covered
+SB-SEC-008	Covered	core-covered	Covered
+SB-SEC-009	Covered	core-covered	Covered
+SB-SEC-010	Covered	core-covered	Covered
+SB-SEC-011	Covered	core-covered	Covered
+SB-SEC-012	Covered	core-covered	Covered
+SB-SEC-013	Covered	core-covered	Covered
+SB-SEC-014	Covered	core-covered	Covered
+SB-SEC-015	Covered	core-covered	Covered
+SB-SEC-016	Covered	core-covered	Covered
+SB-SEC-017	Covered	core-covered	Covered
+SB-SEC-018	Covered	core-covered	Covered
 SB-SEC-019	Not required	not-required-rationale	Not required (rationale required)
 SB-STAT-001	Approved divergence	core-approved-divergence	Intentional divergence (approval required)
 SB-STAT-054	Approved divergence	core-approved-divergence	Intentional divergence (approval required)
@@ -381,7 +381,7 @@ SB-RFILE-001	Covered	core-covered	Covered
 SB-RFILE-002	Covered	core-covered	Covered
 SB-RFILE-003	Covered	core-covered	Covered
 SB-RFILE-004	Covered	core-covered	Covered
-SB-RFILE-005	Covered	core-covered	Covered
+SB-RFILE-005	Required gap	core-required-gap	Behavior mismatch
 SB-RFILE-006	Covered	core-covered	Covered
 SB-RFILE-007	Covered	core-covered	Covered
 SB-RFILE-008	Covered	core-covered	Covered
@@ -420,8 +420,8 @@ SB-HDFS-004	Covered	core-covered	Covered
 SB-HDFS-005	Covered	core-covered	Covered
 SB-HDFS-006	Covered	core-covered	Covered
 SB-HDFS-007	Covered	core-covered	Covered
-SB-HDFS-008	Covered	core-covered	Covered
-SB-HDFS-009	Covered	core-covered	Covered
+SB-HDFS-008	Required gap	core-required-gap	Missing Go
+SB-HDFS-009	Required gap	core-required-gap	Missing Go
 SB-HDFS-010	Covered	core-covered	Covered
 SB-HDFS-015	Covered	core-covered	Covered
 SB-HDFS-016	Covered	core-covered	Covered
@@ -441,23 +441,23 @@ SB-HDFS-013	Covered	core-covered	Covered
 SB-HDFS-014	Covered	core-covered	Covered
 SB-LOG-001	Covered	core-covered	Covered
 SB-LOG-002	Covered	core-covered	Covered
-SB-LOG-003	Covered	core-covered	Covered
+SB-LOG-003	Required gap	core-required-gap	Behavior mismatch
 SB-ERR-001	Covered	core-covered	Covered
-SB-ERR-002	Covered	core-covered	Covered
+SB-ERR-002	Required gap	core-required-gap	Behavior mismatch
 SB-ERR-003	Approved divergence	core-approved-divergence	Intentional divergence (approval required)
-SB-ERR-004	Covered	core-covered	Covered
-SB-ERR-005	Covered	core-covered	Covered
-SB-ERR-006	Covered	core-covered	Covered
-SB-ERR-007	Covered	core-covered	Covered
+SB-ERR-004	Required gap	core-required-gap	Behavior mismatch
+SB-ERR-005	Required gap	core-required-gap	Behavior mismatch
+SB-ERR-006	Required gap	core-required-gap	Behavior mismatch
+SB-ERR-007	Required gap	core-required-gap	Behavior mismatch
 SB-ERR-008	Covered	core-covered	Covered
-SB-ERR-009	Covered	core-covered	Covered
+SB-ERR-009	Required gap	core-required-gap	Missing Go
 SB-ERR-010	Covered	core-covered	Covered
 SB-ERR-011	Covered	core-covered	Covered
 SB-ERR-012	Not required	not-required-rationale	Not required (rationale required)
 SB-ERR-013	Not required	not-required-rationale	Not required (rationale required)
 SB-ERR-014	Covered	core-covered	Covered
 SB-ERR-015	Not required	not-required-rationale	Not required (rationale required)
-SB-ERR-016	Covered	core-covered	Covered
+SB-ERR-016	Required gap	core-required-gap	Behavior mismatch
 SB-CPP-001	Optional	optional-legacy-cxx	Behavior mismatch
 SB-CPP-015	Optional	optional-legacy-cxx	Behavior mismatch
 SB-CPP-002	Optional	optional-legacy-cxx	Behavior mismatch

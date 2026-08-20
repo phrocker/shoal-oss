@@ -245,54 +245,54 @@ SB-BASE-017	Covered
 SB-BASE-018	Covered
 SB-BASE-019	Covered
 SB-BASE-020	Covered
-SB-TABLE-001	Behavior mismatch
-SB-TABLE-002	Behavior mismatch
-SB-TABLE-003	Behavior mismatch
+SB-TABLE-001	Covered
+SB-TABLE-002	Covered
+SB-TABLE-003	Covered
 SB-TABLE-004	Not required (rationale required)
 SB-TABLE-005	Covered
-SB-TABLE-006	Missing Go
-SB-TABLE-007	Behavior mismatch
-SB-TABLE-008	Behavior mismatch
+SB-TABLE-006	Intentional divergence (approval required)
+SB-TABLE-007	Covered
+SB-TABLE-008	Covered
 SB-TABLE-009	Not required (rationale required)
-SB-TABLE-010	Behavior mismatch
+SB-TABLE-010	Covered
 SB-TABLE-011	Not required (rationale required)
 SB-TABLE-012	Covered
-SB-TABLE-013	Behavior mismatch
+SB-TABLE-013	Intentional divergence (approval required)
 SB-TABLE-014	Not required (rationale required)
 SB-TABLE-015	Not required (rationale required)
-SB-TABLE-016	Behavior mismatch
-SB-TABLE-017	Behavior mismatch
-SB-TABLE-018	Behavior mismatch
-SB-TABLE-019	Behavior mismatch
+SB-TABLE-016	Covered
+SB-TABLE-017	Covered
+SB-TABLE-018	Covered
+SB-TABLE-019	Covered
 SB-TABLE-020	Not required (rationale required)
-SB-TABLE-021	Behavior mismatch
-SB-TABLE-022	Behavior mismatch
-SB-NS-001	Behavior mismatch
-SB-NS-002	Behavior mismatch
-SB-NS-003	Behavior mismatch
-SB-NS-004	Behavior mismatch
-SB-NS-005	Behavior mismatch
-SB-NS-006	Behavior mismatch
-SB-NS-007	Behavior mismatch
-SB-NS-008	Behavior mismatch
-SB-SEC-001	Behavior mismatch
-SB-SEC-002	Behavior mismatch
-SB-SEC-003	Behavior mismatch
-SB-SEC-004	Behavior mismatch
-SB-SEC-005	Behavior mismatch
-SB-SEC-006	Behavior mismatch
-SB-SEC-007	Behavior mismatch
-SB-SEC-008	Behavior mismatch
-SB-SEC-009	Behavior mismatch
-SB-SEC-010	Behavior mismatch
-SB-SEC-011	Behavior mismatch
-SB-SEC-012	Behavior mismatch
-SB-SEC-013	Behavior mismatch
-SB-SEC-014	Behavior mismatch
-SB-SEC-015	Behavior mismatch
-SB-SEC-016	Behavior mismatch
-SB-SEC-017	Behavior mismatch
-SB-SEC-018	Behavior mismatch
+SB-TABLE-021	Covered
+SB-TABLE-022	Covered
+SB-NS-001	Covered
+SB-NS-002	Covered
+SB-NS-003	Covered
+SB-NS-004	Covered
+SB-NS-005	Covered
+SB-NS-006	Covered
+SB-NS-007	Covered
+SB-NS-008	Covered
+SB-SEC-001	Covered
+SB-SEC-002	Covered
+SB-SEC-003	Covered
+SB-SEC-004	Covered
+SB-SEC-005	Covered
+SB-SEC-006	Covered
+SB-SEC-007	Covered
+SB-SEC-008	Covered
+SB-SEC-009	Covered
+SB-SEC-010	Covered
+SB-SEC-011	Covered
+SB-SEC-012	Covered
+SB-SEC-013	Covered
+SB-SEC-014	Covered
+SB-SEC-015	Covered
+SB-SEC-016	Covered
+SB-SEC-017	Covered
+SB-SEC-018	Covered
 SB-SEC-019	Not required (rationale required)
 SB-STAT-001	Intentional divergence (approval required)
 SB-STAT-054	Intentional divergence (approval required)
@@ -382,7 +382,7 @@ SB-RFILE-001	Covered
 SB-RFILE-002	Covered
 SB-RFILE-003	Covered
 SB-RFILE-004	Covered
-SB-RFILE-005	Covered
+SB-RFILE-005	Behavior mismatch
 SB-RFILE-006	Covered
 SB-RFILE-007	Covered
 SB-RFILE-008	Covered
@@ -421,8 +421,8 @@ SB-HDFS-004	Covered
 SB-HDFS-005	Covered
 SB-HDFS-006	Covered
 SB-HDFS-007	Covered
-SB-HDFS-008	Covered
-SB-HDFS-009	Covered
+SB-HDFS-008	Missing Go
+SB-HDFS-009	Missing Go
 SB-HDFS-010	Covered
 SB-HDFS-015	Covered
 SB-HDFS-016	Covered
@@ -442,23 +442,23 @@ SB-HDFS-013	Covered
 SB-HDFS-014	Covered
 SB-LOG-001	Covered
 SB-LOG-002	Covered
-SB-LOG-003	Covered
+SB-LOG-003	Behavior mismatch
 SB-ERR-001	Covered
-SB-ERR-002	Covered
+SB-ERR-002	Behavior mismatch
 SB-ERR-003	Intentional divergence (approval required)
-SB-ERR-004	Covered
-SB-ERR-005	Covered
-SB-ERR-006	Covered
-SB-ERR-007	Covered
+SB-ERR-004	Behavior mismatch
+SB-ERR-005	Behavior mismatch
+SB-ERR-006	Behavior mismatch
+SB-ERR-007	Behavior mismatch
 SB-ERR-008	Covered
-SB-ERR-009	Covered
+SB-ERR-009	Missing Go
 SB-ERR-010	Covered
 SB-ERR-011	Covered
 SB-ERR-012	Not required (rationale required)
 SB-ERR-013	Not required (rationale required)
 SB-ERR-014	Covered
 SB-ERR-015	Not required (rationale required)
-SB-ERR-016	Covered
+SB-ERR-016	Behavior mismatch
 SB-CPP-001	Behavior mismatch
 SB-CPP-015	Behavior mismatch
 SB-CPP-002	Behavior mismatch

@@ -147,9 +147,9 @@ class Connector:
         from .admin import TableOperations
         return TableOperations(self, table)
 
-    def namespaceOps(self) -> object:
+    def namespaceOps(self, nm: str = "") -> object:
         from .admin import NamespaceOperations
-        return NamespaceOperations(self)
+        return NamespaceOperations(self, nm)
 
     def securityOps(self) -> object:
         from .admin import SecurityOperations
