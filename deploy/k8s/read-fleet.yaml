@@ -26,6 +26,19 @@ metadata:
     app.kubernetes.io/part-of: shoal-platform
 spec:
   replicas: 3
+  # Explicit rollout contract instead of relying on the apps/v1 default
+  # (25% maxUnavailable/maxSurge, which round down/up to 0/1 for these 3
+  # replicas — spelling it out as maxUnavailable: 0 here pins that exact
+  # behavior explicitly rather than leaving it to rounding). Keeps all 3
+  # replicas serving throughout a rollout: an old replica is never
+  # removed until the one extra (maxSurge: 1) surge pod has passed
+  # readiness, since the controller isn't allowed any unavailable pods in
+  # between.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
   selector:
     matchLabels:
       app.kubernetes.io/name: shoal
@@ -114,3 +127,21 @@ spec:
           secret:
             secretName: shoal-object-storage-credentials
             optional: true
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: shoal-read
+  labels:
+    app.kubernetes.io/name: shoal
+    app.kubernetes.io/component: read-fleet
+    app.kubernetes.io/part-of: shoal-platform
+spec:
+  # Stateless read replicas spread across nodes (see the pod anti-affinity
+  # above): allow one voluntary disruption at a time so at least 2 of 3
+  # stay available to serve reads.
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: shoal
+      app.kubernetes.io/component: read-fleet

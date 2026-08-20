@@ -27,6 +27,18 @@ type clientScanManyFunc func(
 	[]*accumulo.Range,
 ) ([]accumulo.KeyValue, error)
 
+type clientStreamOneFunc func(
+	context.Context,
+	clientSnapshot,
+	*accumulo.Range,
+) (scanCursorSource, error)
+
+type clientStreamManyFunc func(
+	context.Context,
+	clientSnapshot,
+	[]*accumulo.Range,
+) (scanCursorSource, error)
+
 type ownedClient struct {
 	mu             sync.Mutex
 	connector      *ownedConnector
@@ -36,6 +48,8 @@ type ownedClient struct {
 	threadCount    int32
 	scanOne        clientScanOneFunc
 	scanMany       clientScanManyFunc
+	streamOne      clientStreamOneFunc
+	streamMany     clientStreamManyFunc
 	closed         bool
 	closeOnce      sync.Once
 	closeErr       error
@@ -87,6 +101,41 @@ func newOwnedClient(
 			return nil, err
 		}
 		return scanner.Scan(ctx, ranges)
+	}
+	client.streamOne = func(
+		ctx context.Context,
+		snapshot clientSnapshot,
+		scanRange *accumulo.Range,
+	) (scanCursorSource, error) {
+		scanner, err := connector.connector.NewScanner(
+			accumulo.Table{Name: snapshot.table},
+			accumulo.ScannerOptions{
+				Authorizations: snapshot.authorizations,
+				Columns:        snapshot.columns,
+			},
+		)
+		if err != nil {
+			return nil, err
+		}
+		return scanner.Stream(ctx, scanRange)
+	}
+	client.streamMany = func(
+		ctx context.Context,
+		snapshot clientSnapshot,
+		ranges []*accumulo.Range,
+	) (scanCursorSource, error) {
+		scanner, err := connector.connector.NewBatchScanner(
+			accumulo.Table{Name: snapshot.table},
+			accumulo.ScannerOptions{
+				Authorizations: snapshot.authorizations,
+				Columns:        snapshot.columns,
+				Parallelism:    int(snapshot.threadCount),
+			},
+		)
+		if err != nil {
+			return nil, err
+		}
+		return scanner.Stream(ctx, ranges)
 	}
 	return client
 }

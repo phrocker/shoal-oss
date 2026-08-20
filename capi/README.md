@@ -29,14 +29,14 @@ Shoal separates **ABI compatibility** from **feature availability**:
   stable allocation-free version tuple that works before connector creation.
   `SHOAL_ABI_VERSION_PACKED` uses
   `SHOAL_ABI_PACK_VERSION(major, minor, patch)` with a hexadecimal
-  `0x00MMmmpp` layout, so ABI `1.12.0` is `0x00010c00`.
+  `0x00MMmmpp` layout, so ABI `1.14.0` is `0x00010e00`.
 - Capability identifiers are append-only. Existing IDs and bits never change
   meaning. `shoal_abi_capability_word_count()` reports how many 64-bit words
   the current library uses, `shoal_abi_capability_word(i)` returns `0` for
   `i >= word_count`, and `shoal_abi_has_capability(id)` returns `0` for both
   unsupported and unknown IDs.
 
-Current capability assignments (`word 0 == 0x0000000000ffffff`):
+Current capability assignments (`word 0 == 0x0000000003ffffff`):
 
 | ID | Mask | Surface |
 | --- | --- | --- |
@@ -64,6 +64,8 @@ Current capability assignments (`word 0 == 0x0000000000ffffff`):
 | `SHOAL_ABI_CAPABILITY_HIGH_LEVEL_CLIENT` | `0x200000` | owned mutable high-level client facade and scanner/writer construction |
 | `SHOAL_ABI_CAPABILITY_HIGH_LEVEL_SCANNER` | `0x400000` | copied column selection and direct owned-result client scans |
 | `SHOAL_ABI_CAPABILITY_COMPATIBILITY_ERRORS` | `0x800000` | stable Sharkbite source and Python exception classification for owned errors |
+| `SHOAL_ABI_CAPABILITY_STREAMING_SCAN_CURSOR` | `0x1000000` | owned bounded-memory scan cursors for scanner, batch-scanner, and high-level client streams |
+| `SHOAL_ABI_CAPABILITY_COLUMN_VISIBILITY` | `0x2000000` | copied binary visibility expressions, immutable owned trees/terms, synchronized evaluators, and structured parse errors |
 
 Shoal does **not** advertise instance status, compaction/import/export,
 Python/wheel, or any other unimplemented surface until the API exists and has
@@ -170,6 +172,17 @@ Version numbers change only when the public ABI contract changes:
   `NULL`. Once connector close/free starts, new scan calls fail with
   `SHOAL_STATUS_CLOSED`, but already-started scans are allowed to finish
   before connector teardown.
+- Streaming calls return an owned `shoal_scan_cursor`. Each
+  `shoal_scan_cursor_next` call returns a separately owned scan result containing
+  at most `max_entries`; that result remains valid after cursor close/free.
+  Cursor close is idempotent, free is NULL-safe, and scanner, client, or
+  connector close cancels and joins live cursor operations. Deadline and
+  one-shot cancellation variants apply for the cursor's entire lifetime.
+- Column-visibility constructors copy binary expressions. Visibility, node,
+  and node-expression handles are immutable; tree, child, normalized, term,
+  expression, and flatten results are independently owned. Evaluators clone
+  authorizations and synchronize evaluation with replacement. Parse errors
+  expose C-owned reason/terms/offset through a versioned borrowed view.
 - One-shot cancellation handles can interrupt single or batch scans without
   closing the scanner or connector. Cancel is thread-safe and idempotent;
   free cancels and joins registered scans and clears the caller's handle.
@@ -241,8 +254,9 @@ Version numbers change only when the public ABI contract changes:
   `zookeeper_servers` list. A zero session or bootstrap timeout selects the
   30-second default. `instance_secret` is optional.
 
-The ABI currently exposes connector bootstrap/lifecycle, synchronous Scanner
-and BatchScanner reads, Mutation/BatchWriter writes with owned structured
+The ABI currently exposes connector bootstrap/lifecycle, synchronous and
+streaming Scanner/BatchScanner reads, chunked high-level client streams,
+Mutation/BatchWriter writes with owned structured
 failures, table and namespace administration, complete merged security
 administration, and binary-safe table split listing/creation. Instance status,
 compaction, bulk import/export, and Python wheel APIs remain deferred.

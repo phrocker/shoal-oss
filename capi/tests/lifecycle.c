@@ -8,9 +8,9 @@
 
 _Static_assert(SHOAL_ABI_VERSION == 1u, "unexpected compatibility ABI version");
 _Static_assert(SHOAL_ABI_VERSION_MAJOR == 1u, "unexpected ABI major");
-_Static_assert(SHOAL_ABI_VERSION_MINOR == 12u, "unexpected ABI minor");
+_Static_assert(SHOAL_ABI_VERSION_MINOR == 14u, "unexpected ABI minor");
 _Static_assert(SHOAL_ABI_VERSION_PATCH == 0u, "unexpected ABI patch");
-_Static_assert(SHOAL_ABI_VERSION_PACKED == 0x00010c00u,
+_Static_assert(SHOAL_ABI_VERSION_PACKED == 0x00010e00u,
                "unexpected packed ABI version");
 _Static_assert(SHOAL_ABI_CAPABILITY_CONNECTOR == 0u,
                "unexpected connector capability id");
@@ -58,11 +58,15 @@ _Static_assert(SHOAL_ABI_CAPABILITY_HIGH_LEVEL_SCANNER == 22u,
                "unexpected high-level scanner capability id");
 _Static_assert(SHOAL_ABI_CAPABILITY_COMPATIBILITY_ERRORS == 23u,
                "unexpected compatibility errors capability id");
-_Static_assert(SHOAL_ABI_CAPABILITY_COUNT == 24u,
+_Static_assert(SHOAL_ABI_CAPABILITY_STREAMING_SCAN_CURSOR == 24u,
+               "unexpected streaming scan cursor capability id");
+_Static_assert(SHOAL_ABI_CAPABILITY_COLUMN_VISIBILITY == 25u,
+               "unexpected column visibility capability id");
+_Static_assert(SHOAL_ABI_CAPABILITY_COUNT == 26u,
                "unexpected capability count");
 _Static_assert(SHOAL_ABI_CAPABILITY_WORD_COUNT == 1u,
                "unexpected capability word count");
-_Static_assert(SHOAL_ABI_CAPABILITY_WORD0 == UINT64_C(0xffffff),
+_Static_assert(SHOAL_ABI_CAPABILITY_WORD0 == UINT64_C(0x3ffffff),
                "unexpected capability word 0");
 
 #define ASSERT_PERMISSION_VALUE(name, value)                                  \
@@ -128,6 +132,12 @@ static void expect_error(shoal_status status, shoal_status expected,
              SHOAL_ERROR_SOURCE_CLIENT_EXCEPTION) {
     assert(shoal_error_source(*error) ==
            SHOAL_ERROR_SOURCE_CLIENT_EXCEPTION);
+    assert(shoal_error_compatibility(*error) ==
+           SHOAL_ERROR_COMPATIBILITY_CLIENT_EXCEPTION);
+    assert(strcmp(shoal_error_compatibility_name(*error),
+                  "ClientException") == 0);
+  } else if (shoal_error_source(*error) ==
+             SHOAL_ERROR_SOURCE_VISIBILITY_PARSE_EXCEPTION) {
     assert(shoal_error_compatibility(*error) ==
            SHOAL_ERROR_COMPATIBILITY_CLIENT_EXCEPTION);
     assert(strcmp(shoal_error_compatibility_name(*error),
@@ -615,7 +625,207 @@ static void test_buffered_writer_abi(shoal_connector *connector) {
   shoal_accumulo_writer_free(&writer);
 }
 
+static void test_column_visibility(void) {
+  uint8_t expression_data[] = "A&(B|C)";
+  shoal_bytes expression = {expression_data, sizeof(expression_data) - 1};
+  shoal_column_visibility *visibility = NULL;
+  shoal_column_visibility *bad_visibility = NULL;
+  shoal_visibility_node *tree = NULL;
+  shoal_visibility_node *child = NULL;
+  shoal_visibility_node *normalized = NULL;
+  shoal_node_expression *term = NULL;
+  shoal_visibility_evaluator *evaluator = NULL;
+  shoal_authorizations *auths = NULL;
+  shoal_authorizations *auths_copy = NULL;
+  shoal_bytes_result *bytes_result = NULL;
+  shoal_error *error = NULL;
+  uint8_t satisfied = 0;
+  int32_t comparison = 99;
+  shoal_visibility_node_view view;
+
+  assert(shoal_column_visibility_create(expression, &visibility, &error) ==
+         SHOAL_STATUS_OK);
+  expression_data[0] = 'Z';
+  assert(shoal_column_visibility_expression(visibility, &bytes_result, &error) ==
+         SHOAL_STATUS_OK);
+  shoal_bytes bytes = shoal_bytes_result_get(bytes_result);
+  assert(bytes.length == sizeof(expression_data) - 1);
+  assert(memcmp(bytes.data, "A&(B|C)", bytes.length) == 0);
+  shoal_bytes_result_free(&bytes_result);
+
+  assert(shoal_column_visibility_tree(visibility, &tree, &error) ==
+         SHOAL_STATUS_OK);
+  shoal_visibility_node_view_init(&view);
+  assert(shoal_visibility_node_get(tree, &view, &error) == SHOAL_STATUS_OK);
+  assert(view.node_type == SHOAL_VISIBILITY_AND);
+  assert(view.child_count == 2);
+  assert(view.span_length == sizeof(expression_data) - 1);
+  assert(!view.empty);
+  assert(shoal_visibility_node_term(
+             tree, (shoal_bytes){(const uint8_t *)"A&(B|C)", 7}, &term,
+             &error) == SHOAL_STATUS_INVALID_ARGUMENT);
+  shoal_visibility_parse_error_view nonterm_view;
+  shoal_visibility_parse_error_view_init(&nonterm_view);
+  assert(shoal_error_visibility_parse(error, &nonterm_view) ==
+         SHOAL_STATUS_OK);
+  assert(nonterm_view.offset == 0);
+  assert(nonterm_view.terms.length == 7);
+  assert(strstr(nonterm_view.reason, "AND node has no term") != NULL);
+  shoal_error_free(&error);
+  assert(shoal_visibility_node_child(tree, 0, &child, &error) ==
+         SHOAL_STATUS_OK);
+  shoal_visibility_node_view_init(&view);
+  assert(shoal_visibility_node_get(child, &view, &error) == SHOAL_STATUS_OK);
+  assert(view.node_type == SHOAL_VISIBILITY_TERM);
+  assert(shoal_visibility_node_term(
+             child, (shoal_bytes){(const uint8_t *)"A&(B|C)", 7}, &term,
+             &error) == SHOAL_STATUS_OK);
+  assert(shoal_node_expression_size(term) == 1);
+  assert(shoal_node_expression_buffer(term, &bytes_result, &error) ==
+         SHOAL_STATUS_OK);
+  bytes = shoal_bytes_result_get(bytes_result);
+  assert(bytes.length == 1 && bytes.data[0] == 'A');
+  shoal_bytes_result_free(&bytes_result);
+  shoal_node_expression_free(&term);
+  shoal_visibility_node_free(&child);
+
+  assert(shoal_column_visibility_normalized(visibility, &normalized, &error) ==
+         SHOAL_STATUS_OK);
+  assert(shoal_visibility_node_compare(tree, normalized, &comparison, &error) ==
+         SHOAL_STATUS_OK);
+  assert(comparison == 0);
+  assert(shoal_column_visibility_flatten(visibility, &bytes_result, &error) ==
+         SHOAL_STATUS_OK);
+  bytes = shoal_bytes_result_get(bytes_result);
+  assert(bytes.length == 7 && memcmp(bytes.data, "A&(B|C)", 7) == 0);
+  shoal_bytes_result_free(&bytes_result);
+
+  shoal_bytes labels[] = {
+      {(const uint8_t *)"A", 1},
+      {(const uint8_t *)"C", 1},
+  };
+  assert(shoal_authorizations_create(labels, 2, &auths, &error) ==
+         SHOAL_STATUS_OK);
+  assert(shoal_visibility_evaluator_create(auths, &evaluator, &error) ==
+         SHOAL_STATUS_OK);
+  assert(shoal_visibility_evaluator_evaluate(
+             evaluator, (shoal_bytes){(const uint8_t *)"A&(B|C)", 7},
+             &satisfied, &error) == SHOAL_STATUS_OK);
+  assert(satisfied);
+  assert(shoal_visibility_evaluator_evaluate_tree(
+             evaluator, (shoal_bytes){(const uint8_t *)"A&(B|C)", 7}, tree,
+             &satisfied, &error) == SHOAL_STATUS_OK);
+  assert(satisfied);
+  assert(shoal_visibility_evaluator_authorizations(evaluator, &auths_copy,
+                                                   &error) == SHOAL_STATUS_OK);
+  assert(shoal_authorizations_count(auths_copy) == 2);
+  shoal_authorizations_free(&auths_copy);
+  assert(shoal_visibility_evaluator_set_authorizations(evaluator, NULL,
+                                                       &error) ==
+         SHOAL_STATUS_OK);
+  assert(shoal_visibility_evaluator_evaluate(
+             evaluator, (shoal_bytes){(const uint8_t *)"A", 1}, &satisfied,
+             &error) == SHOAL_STATUS_OK);
+  assert(!satisfied);
+
+  assert(shoal_visibility_evaluator_evaluate_tree(
+             evaluator, (shoal_bytes){(const uint8_t *)"different", 9}, tree,
+             &satisfied, &error) == SHOAL_STATUS_INVALID_ARGUMENT);
+  assert(error != NULL);
+  assert(shoal_error_source(error) ==
+         SHOAL_ERROR_SOURCE_VISIBILITY_PARSE_EXCEPTION);
+  shoal_visibility_parse_error_view parse_view;
+  shoal_visibility_parse_error_view_init(&parse_view);
+  assert(shoal_error_visibility_parse(error, &parse_view) == SHOAL_STATUS_OK);
+  assert(parse_view.offset == 0);
+  assert(parse_view.terms.length == 9);
+  assert(strstr(parse_view.reason, "different expression") != NULL);
+  shoal_error_free(&error);
+
+  assert(shoal_column_visibility_create(
+             (shoal_bytes){(const uint8_t *)"A&", 2}, &bad_visibility,
+             &error) == SHOAL_STATUS_INVALID_ARGUMENT);
+  assert(error != NULL);
+  shoal_visibility_parse_error_view_init(&parse_view);
+  assert(shoal_error_visibility_parse(error, &parse_view) == SHOAL_STATUS_OK);
+  assert(parse_view.terms.length == 2);
+  assert(memcmp(parse_view.terms.data, "A&", 2) == 0);
+  shoal_error_free(&error);
+
+  assert(shoal_node_expression_create(
+             (shoal_bytes){(const uint8_t *)"wxyz", 4}, 1, 2, &term,
+             &error) == SHOAL_STATUS_OK);
+  assert(shoal_node_expression_term(term, &bytes_result, &error) ==
+         SHOAL_STATUS_OK);
+  bytes = shoal_bytes_result_get(bytes_result);
+  assert(bytes.length == 2 && memcmp(bytes.data, "xy", 2) == 0);
+  shoal_bytes_result_free(&bytes_result);
+  shoal_node_expression_free(&term);
+
+  shoal_test_result_alloc_fail_after(0);
+  expect_error(shoal_column_visibility_tree(visibility, &child, &error),
+               SHOAL_STATUS_OUT_OF_MEMORY, &error, "allocate visibility node");
+  shoal_test_result_alloc_reset();
+  shoal_test_result_alloc_fail_after(0);
+  expect_error(shoal_column_visibility_create(
+                   (shoal_bytes){(const uint8_t *)"A", 1}, &bad_visibility,
+                   &error),
+               SHOAL_STATUS_OUT_OF_MEMORY, &error,
+               "allocate column visibility handle");
+  shoal_test_result_alloc_reset();
+  shoal_test_result_alloc_fail_after(0);
+  expect_error(shoal_node_expression_create(
+                   (shoal_bytes){(const uint8_t *)"A", 1}, 0, 1, &term,
+                   &error),
+               SHOAL_STATUS_OUT_OF_MEMORY, &error,
+               "allocate node expression handle");
+  shoal_test_result_alloc_reset();
+  shoal_visibility_evaluator_free(&evaluator);
+  shoal_test_result_alloc_fail_after(0);
+  expect_error(shoal_visibility_evaluator_create(auths, &evaluator, &error),
+               SHOAL_STATUS_OUT_OF_MEMORY, &error,
+               "allocate visibility evaluator handle");
+  shoal_test_result_alloc_reset();
+  shoal_test_result_alloc_fail_after(0);
+  expect_error(shoal_column_visibility_flatten(visibility, &bytes_result,
+                                               &error),
+               SHOAL_STATUS_OUT_OF_MEMORY, &error, "allocate bytes result");
+  shoal_test_result_alloc_reset();
+
+  memset(&view, 0, sizeof(view));
+  expect_error(shoal_visibility_node_get(tree, &view, &error),
+               SHOAL_STATUS_INVALID_ARGUMENT, &error, "must be initialized");
+  memset(&parse_view, 0, sizeof(parse_view));
+  assert(shoal_error_visibility_parse(NULL, &parse_view) ==
+         SHOAL_STATUS_INVALID_ARGUMENT);
+  bytes_result = (shoal_bytes_result *)(uintptr_t)1;
+  expect_error(shoal_column_visibility_expression(NULL, &bytes_result, &error),
+               SHOAL_STATUS_INVALID_HANDLE, &error, "handle is NULL");
+  assert(bytes_result == NULL);
+  bytes_result = (shoal_bytes_result *)(uintptr_t)1;
+  expect_error(shoal_column_visibility_flatten(NULL, &bytes_result, &error),
+               SHOAL_STATUS_INVALID_HANDLE, &error, "handle is NULL");
+  assert(bytes_result == NULL);
+  bytes_result = (shoal_bytes_result *)(uintptr_t)1;
+  expect_error(shoal_node_expression_term(NULL, &bytes_result, &error),
+               SHOAL_STATUS_INVALID_HANDLE, &error, "handle is NULL");
+  assert(bytes_result == NULL);
+  bytes_result = (shoal_bytes_result *)(uintptr_t)1;
+  expect_error(shoal_visibility_node_expression(NULL, &bytes_result, &error),
+               SHOAL_STATUS_INVALID_HANDLE, &error, "handle is NULL");
+  assert(bytes_result == NULL);
+
+  shoal_visibility_evaluator_free(&evaluator);
+  shoal_visibility_evaluator_free(&evaluator);
+  shoal_authorizations_free(&auths);
+  shoal_visibility_node_free(&normalized);
+  shoal_visibility_node_free(&tree);
+  shoal_column_visibility_free(&visibility);
+  shoal_column_visibility_free(&visibility);
+}
+
 int main(void) {
+  test_column_visibility();
   shoal_connector *connector = NULL;
   shoal_connector *admin_connector = NULL;
   shoal_client *client = NULL;
@@ -624,6 +834,7 @@ int main(void) {
   shoal_scanner *scanner = NULL;
   shoal_batch_scanner *batch_scanner = NULL;
   shoal_scan_result *result = NULL;
+  shoal_scan_cursor *cursor = NULL;
   shoal_table_list_result *table_list = NULL;
   shoal_mutation *mutation = NULL;
   shoal_batch_writer *writer = NULL;
@@ -677,6 +888,8 @@ int main(void) {
   assert(shoal_abi_has_capability(SHOAL_ABI_CAPABILITY_HIGH_LEVEL_CLIENT) == 1);
   assert(shoal_abi_has_capability(SHOAL_ABI_CAPABILITY_HIGH_LEVEL_SCANNER) ==
          1);
+  assert(shoal_abi_has_capability(
+             SHOAL_ABI_CAPABILITY_STREAMING_SCAN_CURSOR) == 1);
   assert(shoal_abi_has_capability(SHOAL_ABI_CAPABILITY_COUNT) == 0);
   assert(shoal_abi_has_capability(63u) == 0);
   assert(shoal_abi_has_capability(64u) == 0);
@@ -929,6 +1142,114 @@ int main(void) {
          SHOAL_STATUS_OK);
   assert(result != NULL && shoal_scan_result_count(result) == 2);
   shoal_scan_result_free(&result);
+  uint8_t exhausted = 0;
+  expect_error(shoal_client_stream_range(
+                   admin_client, NULL, 0, &cursor, &error),
+               SHOAL_STATUS_INVALID_ARGUMENT, &error, "range is required");
+  assert(cursor == NULL);
+  assert(shoal_client_stream_range(
+             admin_client, &client_ranges[0], 0, &cursor, &error) ==
+         SHOAL_STATUS_OK);
+  assert(cursor != NULL && error == NULL);
+  expect_error(shoal_scan_cursor_next(
+                   cursor, 0, &result, &exhausted, &error),
+               SHOAL_STATUS_INVALID_ARGUMENT, &error, "max_entries");
+  assert(result == NULL && exhausted == 0);
+  assert(shoal_scan_cursor_next(
+             cursor, 2, &result, &exhausted, &error) == SHOAL_STATUS_OK);
+  assert(result != NULL && shoal_scan_result_count(result) == 2);
+  assert(exhausted == 0);
+  shoal_scan_result_free(&result);
+  assert(shoal_scan_cursor_next(
+             cursor, 2, &result, &exhausted, &error) == SHOAL_STATUS_OK);
+  assert(result != NULL && shoal_scan_result_count(result) == 1);
+  assert(exhausted == 1);
+  shoal_scan_result_free(&result);
+  assert(shoal_scan_cursor_next(
+             cursor, 2, &result, &exhausted, &error) == SHOAL_STATUS_OK);
+  assert(result == NULL && exhausted == 1);
+  assert(shoal_scan_cursor_close(cursor, &error) == SHOAL_STATUS_OK);
+  assert(shoal_scan_cursor_close(cursor, &error) == SHOAL_STATUS_OK);
+  shoal_scan_cursor_free(&cursor);
+  assert(cursor == NULL);
+  shoal_scan_cursor_free(&cursor);
+
+  assert(shoal_client_stream_ranges(
+             admin_client, client_ranges, 2, 0, &cursor, &error) ==
+         SHOAL_STATUS_OK);
+  assert(shoal_scan_cursor_next(
+             cursor, 8, &result, &exhausted, &error) == SHOAL_STATUS_OK);
+  assert(result != NULL && shoal_scan_result_count(result) == 2);
+  assert(exhausted == 1);
+  shoal_scan_cursor_free(&cursor);
+  shoal_key_value_view entry;
+  memset(&entry, 0, sizeof(entry));
+  assert(shoal_scan_result_get(result, 1, &entry, &error) == SHOAL_STATUS_OK);
+  assert(entry.value.length == 1 && entry.value.data[0] == 1);
+  shoal_scan_result_free(&result);
+
+  assert(shoal_test_scanners_create(&scanner, &batch_scanner) == 1);
+  assert(scanner != NULL && batch_scanner != NULL);
+  assert(shoal_scanner_stream(
+             scanner, &client_ranges[0], 0, &cursor, &error) ==
+         SHOAL_STATUS_OK);
+  assert(shoal_scan_cursor_next(
+             cursor, 8, &result, &exhausted, &error) == SHOAL_STATUS_OK);
+  assert(result != NULL && shoal_scan_result_count(result) == 1);
+  assert(exhausted == 1);
+  shoal_scan_result_free(&result);
+  shoal_scan_cursor_free(&cursor);
+
+  assert(shoal_cancellation_create(&cancellation, &error) == SHOAL_STATUS_OK);
+  assert(shoal_scanner_stream_with_cancellation(
+             scanner, &client_ranges[0], 0, cancellation, &cursor, &error) ==
+         SHOAL_STATUS_OK);
+  assert(shoal_scan_cursor_next(
+             cursor, 8, &result, &exhausted, &error) == SHOAL_STATUS_OK);
+  assert(result != NULL && shoal_scan_result_count(result) == 1);
+  shoal_scan_result_free(&result);
+  shoal_scan_cursor_free(&cursor);
+
+  assert(shoal_batch_scanner_stream(
+             batch_scanner, client_ranges, 2, 0, &cursor, &error) ==
+         SHOAL_STATUS_OK);
+  assert(shoal_scan_cursor_next(
+             cursor, 8, &result, &exhausted, &error) == SHOAL_STATUS_OK);
+  assert(result != NULL && shoal_scan_result_count(result) == 2);
+  assert(exhausted == 1);
+  shoal_scan_result_free(&result);
+  shoal_scan_cursor_free(&cursor);
+
+  assert(shoal_batch_scanner_stream_with_cancellation(
+             batch_scanner, client_ranges, 2, 0, cancellation, &cursor,
+             &error) == SHOAL_STATUS_OK);
+  assert(shoal_scan_cursor_next(
+             cursor, 8, &result, &exhausted, &error) == SHOAL_STATUS_OK);
+  assert(result != NULL && shoal_scan_result_count(result) == 2);
+  shoal_scan_result_free(&result);
+  shoal_scan_cursor_free(&cursor);
+  shoal_cancellation_free(&cancellation);
+  assert(shoal_scanner_close(scanner, &error) == SHOAL_STATUS_OK);
+  assert(shoal_batch_scanner_close(batch_scanner, &error) == SHOAL_STATUS_OK);
+  shoal_scanner_free(&scanner);
+  shoal_batch_scanner_free(&batch_scanner);
+
+  shoal_test_result_alloc_fail_after(0);
+  expect_error(shoal_client_stream_range(
+                   admin_client, &client_ranges[0], 0, &cursor, &error),
+               SHOAL_STATUS_OUT_OF_MEMORY, &error, "scan cursor handle");
+  assert(cursor == NULL);
+  shoal_test_result_alloc_reset();
+  assert(shoal_client_stream_range(
+             admin_client, &client_ranges[0], 0, &cursor, &error) ==
+         SHOAL_STATUS_OK);
+  shoal_test_result_alloc_fail_after(0);
+  expect_error(shoal_scan_cursor_next(
+                   cursor, 1, &result, &exhausted, &error),
+               SHOAL_STATUS_OUT_OF_MEMORY, &error, "scan result");
+  assert(result == NULL);
+  shoal_test_result_alloc_reset();
+  shoal_scan_cursor_free(&cursor);
   shoal_test_result_alloc_fail_after(0);
   expect_error(shoal_client_scan_range(
                    admin_client, &client_ranges[0], 0, &result, &error),
@@ -937,6 +1258,11 @@ int main(void) {
   shoal_test_result_alloc_reset();
   assert(shoal_cancellation_create(&cancellation, &error) == SHOAL_STATUS_OK);
   assert(shoal_cancellation_cancel(cancellation, &error) == SHOAL_STATUS_OK);
+  expect_error(shoal_client_stream_range_with_cancellation(
+                   admin_client, &client_ranges[0], 0, cancellation, &cursor,
+                   &error),
+               SHOAL_STATUS_CANCELLED, &error, "context canceled");
+  assert(cursor == NULL);
   expect_error(shoal_client_scan_range_with_cancellation(
                    admin_client, &client_ranges[0], 0, cancellation, &result,
                    &error),
@@ -962,7 +1288,14 @@ int main(void) {
   assert(table_list == NULL && error != NULL);
   shoal_error_free(&error);
   shoal_test_result_alloc_reset();
+  assert(shoal_client_stream_range(
+             admin_client, &client_ranges[0], 0, &cursor, &error) ==
+         SHOAL_STATUS_OK);
   assert(shoal_client_close(admin_client, &error) == SHOAL_STATUS_OK);
+  expect_error(shoal_scan_cursor_next(
+                   cursor, 1, &result, &exhausted, &error),
+               SHOAL_STATUS_CANCELLED, &error, "context canceled");
+  shoal_scan_cursor_free(&cursor);
   expect_error(shoal_client_scan_range(
                    admin_client, &client_ranges[0], 0, &result, &error),
                SHOAL_STATUS_CLOSED, &error, "connector is closed");

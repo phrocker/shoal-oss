@@ -51,6 +51,22 @@ struct shoal_authorizations {
   uint64_t id;
 };
 
+struct shoal_column_visibility {
+  uint64_t id;
+};
+
+struct shoal_visibility_node {
+  uint64_t id;
+};
+
+struct shoal_node_expression {
+  uint64_t id;
+};
+
+struct shoal_visibility_evaluator {
+  uint64_t id;
+};
+
 struct shoal_accumulo_writer {
   uint64_t id;
 };
@@ -62,6 +78,11 @@ struct shoal_error {
   char *message;
   char *security_user;
   char *security_code;
+  uint8_t *visibility_terms;
+  size_t visibility_terms_length;
+  char *visibility_reason;
+  size_t visibility_offset;
+  uint8_t has_visibility_parse;
 };
 
 typedef struct shoal_bridge_scan_entry {
@@ -81,6 +102,10 @@ typedef struct shoal_bridge_scan_entry {
 struct shoal_scan_result {
   size_t count;
   shoal_bridge_scan_entry *entries;
+};
+
+struct shoal_scan_cursor {
+  uint64_t id;
 };
 
 typedef struct shoal_bridge_table_entry {
@@ -288,6 +313,20 @@ shoal_authorizations *shoal_bridge_authorizations_alloc(uint64_t id);
 uint64_t
 shoal_bridge_authorizations_id(const shoal_authorizations *authorizations);
 void shoal_bridge_authorizations_free(shoal_authorizations *authorizations);
+shoal_column_visibility *shoal_bridge_column_visibility_alloc(uint64_t id);
+uint64_t shoal_bridge_column_visibility_id(const shoal_column_visibility *value);
+void shoal_bridge_column_visibility_free(shoal_column_visibility *value);
+shoal_visibility_node *shoal_bridge_visibility_node_alloc(uint64_t id);
+uint64_t shoal_bridge_visibility_node_id(const shoal_visibility_node *value);
+void shoal_bridge_visibility_node_free(shoal_visibility_node *value);
+shoal_node_expression *shoal_bridge_node_expression_alloc(uint64_t id);
+uint64_t shoal_bridge_node_expression_id(const shoal_node_expression *value);
+void shoal_bridge_node_expression_free(shoal_node_expression *value);
+shoal_visibility_evaluator *
+shoal_bridge_visibility_evaluator_alloc(uint64_t id);
+uint64_t
+shoal_bridge_visibility_evaluator_id(const shoal_visibility_evaluator *value);
+void shoal_bridge_visibility_evaluator_free(shoal_visibility_evaluator *value);
 shoal_accumulo_writer *shoal_bridge_accumulo_writer_alloc(uint64_t id);
 uint64_t
 shoal_bridge_accumulo_writer_id(const shoal_accumulo_writer *writer);
@@ -358,6 +397,10 @@ size_t shoal_bridge_scan_result_count(const shoal_scan_result *result);
 int shoal_bridge_scan_result_get(const shoal_scan_result *result, size_t index,
                                  shoal_key_value_view *out_value);
 void shoal_bridge_scan_result_free(shoal_scan_result *result);
+
+shoal_scan_cursor *shoal_bridge_scan_cursor_alloc(uint64_t id);
+uint64_t shoal_bridge_scan_cursor_id(const shoal_scan_cursor *cursor);
+void shoal_bridge_scan_cursor_free(shoal_scan_cursor *cursor);
 
 shoal_connector_identity_result *shoal_bridge_connector_identity_alloc(
     char *instance_name, char *instance_id, char *principal);
@@ -530,7 +573,10 @@ shoal_error *shoal_bridge_error_alloc(
     shoal_error_compatibility_class compatibility, const char *message,
     size_t message_length,
     const char *security_user, size_t security_user_length,
-    const char *security_code, size_t security_code_length);
+    const char *security_code, size_t security_code_length,
+    const uint8_t *visibility_terms, size_t visibility_terms_length,
+    const char *visibility_reason, size_t visibility_reason_length,
+    size_t visibility_offset, uint8_t has_visibility_parse);
 shoal_status shoal_bridge_error_code(const shoal_error *error);
 char *shoal_bridge_error_message(const shoal_error *error);
 char *shoal_bridge_error_security_user(const shoal_error *error);
@@ -540,6 +586,8 @@ const char *shoal_bridge_error_source_name(const shoal_error *error);
 shoal_error_compatibility_class
 shoal_bridge_error_compatibility(const shoal_error *error);
 const char *shoal_bridge_error_compatibility_name(const shoal_error *error);
+int shoal_bridge_error_visibility_parse(
+    const shoal_error *error, shoal_visibility_parse_error_view *out_details);
 void shoal_bridge_error_free(shoal_error *error);
 
 void shoal_bridge_connector_config_init(shoal_connector_config *config);

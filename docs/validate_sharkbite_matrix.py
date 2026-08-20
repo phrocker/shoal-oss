@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Iterator, Sequence
 from collections import Counter, defaultdict
 from functools import lru_cache
+import html
 import os
 from pathlib import Path
 import re
@@ -11,10 +12,12 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from typing import NamedTuple
+import unicodedata
 
 
 DOC_PATH = Path(__file__).with_name("sharkbite-compatibility.md")
-EXPECTED_REVISION = 35
+EXPECTED_REVISION = 40
 # Update this manifest only when the independently audited inventory itself
 # changes; review every added/removed or reclassified ID in code review.
 EXPECTED_ROW_MANIFEST = DOC_PATH.with_name(
@@ -59,16 +62,16 @@ def status_count_map(
 
 
 EXPECTED_STATUS_COUNTS = {
-    "Covered": 88,
-    "Missing Go": 2326,
-    "Missing C ABI": 91,
+    "Covered": 131,
+    "Missing Go": 2274,
+    "Missing C ABI": 100,
     "Behavior mismatch": 219,
     "Intentional divergence (approval required)": 87,
     "Not required (rationale required)": 392,
 }
 
 EXPECTED_PREFIX_COUNTS = {
-    "SB-BASE": status_count_map(covered=13, missing_c_abi=5, not_required=2),
+    "SB-BASE": status_count_map(covered=18, not_required=2),
     "SB-CFG": status_count_map(
         covered=12,
         behavior_mismatch=16,
@@ -88,11 +91,11 @@ EXPECTED_PREFIX_COUNTS = {
         not_required=8,
     ),
     "SB-CXX": status_count_map(
-        missing_go=2266,
-        covered=10,
+        missing_go=2214,
+        covered=41,
         behavior_mismatch=15,
         not_required=304,
-        missing_c_abi=31,
+        missing_c_abi=52,
     ),
     "SB-DATA": status_count_map(
         covered=9,
@@ -103,12 +106,11 @@ EXPECTED_PREFIX_COUNTS = {
     ),
     "SB-EMB": status_count_map(not_required=35),
     "SB-ERR": status_count_map(
-        covered=4,
+        covered=5,
         missing_go=1,
         behavior_mismatch=6,
         intentional_divergence=1,
         not_required=3,
-        missing_c_abi=1,
     ),
     "SB-HDFS": status_count_map(missing_go=26),
     "SB-LOG": status_count_map(missing_go=2, behavior_mismatch=1),
@@ -127,8 +129,9 @@ EXPECTED_PREFIX_COUNTS = {
         not_required=3,
     ),
     "SB-SCAN": status_count_map(
+        covered=5,
         missing_go=5,
-        missing_c_abi=8,
+        missing_c_abi=3,
         behavior_mismatch=10,
         not_required=5,
     ),
@@ -153,9 +156,9 @@ EXPECTED_PREFIX_COUNTS = {
         not_required=9,
     ),
     "SB-XCUT": status_count_map(
-        covered=2,
+        covered=3,
         missing_go=1,
-        missing_c_abi=3,
+        missing_c_abi=2,
         behavior_mismatch=13,
     ),
 }
@@ -197,20 +200,30 @@ EXPECTED_METADATA_FIELDS = {
     ),
     "Sharkbite release line": "`sharkbite` 1.2.0.3 on PyPI (`setup.py:34-35`)",
     "Shoal reference": (
-        "`phrocker/shoal-oss` exact audited baseline for revision 35 "
-        "`edb7e4afaddc65d35119dfb5dc2a35e52c5df4a4` "
-        "(\"Add compatibility error C ABI (#145)\") "
-        "plus the column-visibility surface introduced in this revision"
+        "`phrocker/shoal-oss` exact audited baseline for revision 40 "
+        "`d1f2500a052eec2ddf2cceb0ea76571a86ca01c8` "
+        "(\"Merge PR #155: expose owned column visibility expressions\") "
+        "plus the tablet extent API introduced in revision 39; "
+        "revision 40 records an approval, changes no classification, and adds no "
+        "Shoal code"
     ),
     "Shoal C ABI version": "`SHOAL_ABI_VERSION 1u` (`capi/include/shoal_types.h`)",
 }
 
 EXPECTED_DOCUMENT_STATUS_SNIPPETS = (
     "Normative gate. Binding on all Sharkbite-compatibility work.",
-    f"Revision {EXPECTED_REVISION} — records the public column-visibility surface",
+    f"Revision {EXPECTED_REVISION} — mirrors the first approved divergence into the "
+    f"matrix: @phrocker approved [SB-DIV-016](#sec-26) on 2026-08-19",
+    "Revision 39 — records the public tablet extent API",
+    "Revision 38 — completes the 31-row column-visibility expression tranche",
+    "Revision 37 — records the public key value API",
+    "Revision 36 — completes the twelve-row streaming cursor tranche",
+    "Revision 35 — records the public column-visibility surface",
     "Revision 34 — completes the four-row compatibility-error tranche",
     "Revision 32 — completes the five-row high-level scanner facade",
     "Revision 26 — completes the 17-row data-model value C ABI",
+    "Revision 25 — completes the 31-row RFile and stream C ABI",
+    "Revision 24 — completes the configuration and instance-topology C ABI",
     "Revision 23 — records the public data-model value types",
     "Revision 22 — reclassifies the thirty-one RFile and stream rows of [§15](#sec-15)",
     "Revision 21 — adds owned range and iterator-setting descriptor ABIs",
@@ -232,6 +245,473 @@ INVENTORY_CHANGE_HINT = (
     f"docs/{EXPECTED_ROW_MANIFEST.name} (row ids, order and pinned statuses) "
     "in the same commit, together with the "
     "audit evidence that justifies the new inventory"
+)
+
+DIVERGENCE_TABLE_HEADING = "## 26. Divergences requiring explicit approval"
+DIVERGENCE_TABLE_HEADERS = [
+    "ID",
+    "Divergence",
+    "Rows",
+    "Impact on existing Sharkbite programs",
+    "Approver",
+    "Date",
+]
+UNAPPROVED_DIVERGENCE_APPROVER = "_unapproved_"
+UNAPPROVED_DIVERGENCE_DATE = "—"
+
+
+class ApprovedDivergence(NamedTuple):
+    """A §26 decision a named maintainer approved on a dated issue comment.
+
+    `rows` and `rows_cell` record the scope the decision covers. Both are pinned
+    from the tracking issue rather than derived from the matrix: deriving the
+    approved set from the same status column the approval is supposed to
+    constrain would let any status edit redefine what was approved, and leaving
+    the normative Rows cell unpinned would let it claim a different set while
+    every other check still passed.
+
+    `impact_cell` and `behavior_clauses` pin what the decision approved, in the
+    decision table's own words. The behavior checks elsewhere are scoped to the
+    section the decision governs, so without them the table that records the
+    approval could drop or contradict every clause and still pass with an intact
+    evidence link. The cell is compared whole for the same reason the Rows cell
+    is: a clause kept as historical text and contradicted by an appended
+    sentence satisfies every containment test while reversing the decision.
+    """
+
+    approver: str
+    date: str
+    evidence: str
+    rows: tuple[str, ...]
+    rows_cell: str
+    impact_cell: str
+    behavior_clauses: tuple[str, ...]
+
+
+class SubsumedDivergence(NamedTuple):
+    """A §26 entry an approved decision made moot rather than decided.
+
+    `covering` is the approval that subsumes it. `rows` and `rows_cell` pin the
+    scope the same way an approval's are pinned, because dormancy is granted to
+    a specific concern: repointing the cell at an unrelated row would extend an
+    approval's effect to something the maintainer never saw. `impact_cell` pins
+    the subsumption rationale whole for the same reason the approved decision's
+    is pinned whole: naming the covering decision and then denying that it
+    subsumes this entry passes every containment check.
+    """
+
+    covering: str
+    rows_cell: str
+    rows: tuple[str, ...]
+    impact_cell: str
+
+
+# The 82 rows the #81 decision names, written out rather than generated: this is
+# the audited scope of the approval, so it must be reviewable as a list and must
+# not move when the matrix moves. SB-STAT-028 and SB-STAT-038 are deliberately
+# absent — see EXPECTED_DIVERGENCE_EXCLUDED_ROWS.
+CLUSTER_STATUS_APPROVED_ROWS: tuple[str, ...] = (
+    "SB-STAT-001", "SB-STAT-002", "SB-STAT-003", "SB-STAT-004", "SB-STAT-005",
+    "SB-STAT-006", "SB-STAT-007", "SB-STAT-008", "SB-STAT-009", "SB-STAT-010",
+    "SB-STAT-011", "SB-STAT-012", "SB-STAT-013", "SB-STAT-014", "SB-STAT-015",
+    "SB-STAT-016", "SB-STAT-017", "SB-STAT-018", "SB-STAT-019", "SB-STAT-020",
+    "SB-STAT-021", "SB-STAT-022", "SB-STAT-023", "SB-STAT-024", "SB-STAT-025",
+    "SB-STAT-026", "SB-STAT-027", "SB-STAT-029", "SB-STAT-030", "SB-STAT-031",
+    "SB-STAT-032", "SB-STAT-033", "SB-STAT-034", "SB-STAT-035", "SB-STAT-036",
+    "SB-STAT-037", "SB-STAT-039", "SB-STAT-040", "SB-STAT-041", "SB-STAT-042",
+    "SB-STAT-043", "SB-STAT-044", "SB-STAT-045", "SB-STAT-046", "SB-STAT-047",
+    "SB-STAT-048", "SB-STAT-049", "SB-STAT-050", "SB-STAT-051", "SB-STAT-052",
+    "SB-STAT-053", "SB-STAT-054", "SB-STAT-055", "SB-STAT-056", "SB-STAT-057",
+    "SB-STAT-058", "SB-STAT-059", "SB-STAT-060", "SB-STAT-061", "SB-STAT-062",
+    "SB-STAT-063", "SB-STAT-064", "SB-STAT-065", "SB-STAT-066", "SB-STAT-067",
+    "SB-STAT-068", "SB-STAT-069", "SB-STAT-070", "SB-STAT-071", "SB-STAT-072",
+    "SB-STAT-073", "SB-STAT-074", "SB-STAT-075", "SB-STAT-076", "SB-STAT-077",
+    "SB-STAT-078", "SB-STAT-079", "SB-STAT-080", "SB-STAT-081", "SB-STAT-082",
+    "SB-STAT-083", "SB-STAT-084",
+)
+
+# The exact §26 Rows cell for the approved decision. It is the normative English
+# statement of the same scope the tuple above pins mechanically; both are checked
+# so neither can drift without the other.
+CLUSTER_STATUS_APPROVED_ROWS_CELL = (
+    "The 82 approved rows are the capability rows of [§14](#sec-14) — every "
+    "`SB-STAT-*` row except SB-STAT-028 (a binding defect) and SB-STAT-038 (a "
+    "Python attribute property). The decision also governs "
+    "[SB-CONN-007](#sec-7), the `getStatistics()` entry point, and closes the "
+    "ledger entries SB-GAP-GO-003 and SB-GAP-C-006; SB-CONN-007 is **not** one "
+    "of the approved rows and keeps `Missing Go`, because the approval covers "
+    "the 82 rows above and the raising shim it owes is buildable Python work"
+)
+
+# An approval is real only when a named approver, a date, and the issue comment
+# that carries the decision are all mirrored into §26 in the same change that
+# records the decision against the rows it covers. Those rows may already carry
+# the divergence status, in which case the mirror lifts their gate without
+# reclassifying anything. Pinning approver, date and evidence here means an edit
+# to §26 alone cannot invent an approval, and a comment on the tracking issue
+# alone cannot lift the §2.2 gate. Approval never makes a row `Covered`: it
+# records a capability that will never exist.
+# The Impact cell of the approved decision is the normative record of what the
+# maintainer approved, so it is pinned whole rather than by keyword: a clause
+# left in place as historical text and reversed by an appended sentence passes
+# every containment check while inverting the decision.
+CLUSTER_STATUS_APPROVED_IMPACT_CELL = (
+    "Accumulo commit `f0841e4` removed `getManagerStats`, `ManagerMonitorInfo`, "
+    "`DeadServer`, and the legacy monitor resources 113 commits before the pinned target "
+    "`317c288`, and the surviving REST-v2/metrics/server APIs cannot reconstruct the "
+    "object graph. Shoal issue [#96](https://github.com/phrocker/shoal-oss/issues/96) "
+    "attempted it; PR [#98](https://github.com/phrocker/shoal-oss/pull/98) was withdrawn. "
+    "Every `getStatistics()` consumer — `examples/pythonstats.py` is the published one — "
+    "stops working, and there is no implementation that can change that. **Approved "
+    "behavior**, mirrored verbatim in scope from the [#81 "
+    "decision](https://github.com/phrocker/shoal-oss/issues/81#issuecomment-5343583850): "
+    "`connector.getStatistics()` raises `NotImplementedError` with a stable explanation "
+    "that Accumulo 4 removed the legacy manager-monitor API; it must not return a "
+    "fabricated or partially populated status object; the permanent capability absence "
+    "must not be surfaced as a retryable `ClientException`; and capability discovery must "
+    "not advertise cluster-status support. This is the largest capability loss in the "
+    "document after [SB-DIV-001](#sec-26). It creates two obligations rather than closing "
+    "the work silently: [SB-GAP-T-009](#sec-23) and [SB-GAP-P-006](#sec-23)."
+)
+
+APPROVED_DIVERGENCES: dict[str, ApprovedDivergence] = {
+    "SB-DIV-016": ApprovedDivergence(
+        approver="**@phrocker**",
+        date="**2026-08-19**",
+        evidence=(
+            "https://github.com/phrocker/shoal-oss/issues/81"
+            "#issuecomment-5343583850"
+        ),
+        rows=CLUSTER_STATUS_APPROVED_ROWS,
+        rows_cell=CLUSTER_STATUS_APPROVED_ROWS_CELL,
+        impact_cell=CLUSTER_STATUS_APPROVED_IMPACT_CELL,
+        behavior_clauses=(
+            "`connector.getStatistics()` raises `NotImplementedError` with a stable "
+            "explanation that Accumulo 4 removed the legacy manager-monitor API",
+            "it must not return a fabricated or partially populated status object",
+            "the permanent capability absence must not be surfaced as a retryable "
+            "`ClientException`",
+            "capability discovery must not advertise cluster-status support",
+        ),
+    ),
+}
+
+# Divergence entries left dormant because an approved decision removed the thing
+# they described. A subsumed entry is not an approval and must never carry one.
+# Its Rows cell is pinned for the same reason the approved decision's is: the
+# approval subsumes one narrow concern, and an unpinned cell could be repointed
+# at an unrelated row that would then inherit dormancy it was never granted.
+# `rows` is the matrix rows the cell names; every one of them must fall inside
+# the covering approval's own scope, so the subsumption cannot reach past it.
+# The Impact cell of the subsumed decision records why the approval left it
+# dormant. It is pinned whole rather than by identifier because the identifier
+# can be retained inside a sentence that reverses the subsumption.
+SUBSUMED_COMPACTION_IMPACT_CELL = (
+    "Accumulo 4 dropped major-compaction counts specifically, on top of the whole-section "
+    "removal in [SB-DIV-016](#sec-26). Sharkbite programs read "
+    "`.majors.running`/`.majors.queued`. The decision to record was *how* the shim surfaces "
+    "the absence: raise, return `None`, or return a zeroed `Compacting`. **Subsumed** by the "
+    "approved [SB-DIV-016](#sec-26): no `TableCompactions` object is ever returned — the "
+    "approval's own wording — so `.majors` is unreachable and there is no shape to choose. "
+    "This entry is dormant rather than decided — it revives if that approval is ever reversed "
+    "— and must never be resolved by marking SB-STAT-030 `Covered`."
+)
+SUBSUMED_DIVERGENCES: dict[str, SubsumedDivergence] = {
+    "SB-DIV-013": SubsumedDivergence(
+        covering="SB-DIV-016",
+        rows_cell="SB-STAT-030, SB-GAP-GO-003",
+        rows=("SB-STAT-030",),
+        impact_cell=SUBSUMED_COMPACTION_IMPACT_CELL,
+    ),
+}
+# The exact approver cell a subsumed entry must carry. Matching the whole cell,
+# not a substring, is what stops `_subsumed by X; not separately approved;
+# approved by @someone_` from passing as a non-approval.
+SUBSUMED_DIVERGENCE_APPROVER = "_subsumed by [{covering}](#sec-26); not separately approved_"
+SUBSUMED_DIVERGENCE_DATE = "{date} (subsumed)"
+# §26's preamble classifies every entry in the table. A subsumed entry is
+# neither approved nor blocking, so the preamble has to say so explicitly or it
+# contradicts the table it introduces.
+SUBSUMED_DIVERGENCE_GATE_PROSE = (
+    "[{divergence}](#sec-26) is **subsumed** by [{covering}](#sec-26): it is dormant rather "
+    "than blocking, carries no approver of its own, and revives only if that approval is "
+    "reversed."
+)
+
+# The audited Rows cell of every §26 decision that is still proposed. Pinning
+# the identifiers alone leaves the scope of a proposal editable: an audited
+# proposal could be repointed at unrelated rows under the same ID, and every
+# later check would still pass whenever the substituted rows happen not to
+# intersect EXPECTED_UNAPPROVED_DIVERGENCE_ROWS. A proposal is a request for a
+# decision about a specific scope, so the scope is pinned with the ID.
+EXPECTED_PROPOSED_DIVERGENCE_ROW_CELLS = {
+    "SB-DIV-001": "SB-PKG-014",
+    "SB-DIV-002": "SB-CFG-014, SB-CFG-022",
+    "SB-DIV-003": "SB-CONN-010, SB-CONN-011",
+    "SB-DIV-004": "SB-ERR-003",
+    "SB-DIV-005": "SB-WRITE-010, SB-UNSAFE-018",
+    "SB-DIV-006": (
+        "SB-SCAN-024, SB-BASE-016, SB-BASE-019, SB-PANDA-009, SB-PANDA-012, "
+        "SB-UNSAFE-008"
+    ),
+    "SB-DIV-007": "SB-SCAN-016 and [§19.4](#sec-19-4)",
+    "SB-DIV-008": "SB-SCAN-014, SB-SCAN-015",
+    "SB-DIV-009": "SB-PKG-007",
+    "SB-DIV-010": "SB-DATA-034",
+    "SB-DIV-011": "SB-TORCH-004, SB-UNSAFE-021",
+    "SB-DIV-012": "SB-PANDA-001, SB-UNSAFE-024",
+    "SB-DIV-014": "SB-PANDA-013, SB-PANDA-003, SB-UNSAFE-026",
+    "SB-DIV-015": "SB-BASE-004, SB-BASE-005, SB-BASE-009, SB-UNSAFE-027",
+}
+
+# Rows carrying INTENTIONAL_DIVERGENCE_STATUS that no approval covers. Each one
+# still blocks the §2.2 release gate exactly like an unimplemented row.
+EXPECTED_UNAPPROVED_DIVERGENCE_ROWS = (
+    "SB-CFG-014",
+    "SB-CFG-022",
+    "SB-CONN-010",
+    "SB-ERR-003",
+    "SB-PKG-014",
+)
+
+# The rows the approved SB-DIV-016 decision covers: the 82 §14 cluster-status
+# rows named by the approval, and nothing else.
+EXPECTED_APPROVED_DIVERGENCE_ROW_COUNT = 82
+
+# Decisions in the §26 table. Rows and decisions are different quantities: one
+# decision can cover many rows, so these are pinned separately from the row
+# count. The identifiers are pinned, not just how many there are: a count-only
+# pin accepts any same-size set, so an audited decision could be deleted and
+# replaced by an invented one without tripping a single check.
+EXPECTED_DIVERGENCE_DECISION_IDS = (
+    "SB-DIV-001",
+    "SB-DIV-002",
+    "SB-DIV-003",
+    "SB-DIV-004",
+    "SB-DIV-005",
+    "SB-DIV-006",
+    "SB-DIV-007",
+    "SB-DIV-008",
+    "SB-DIV-009",
+    "SB-DIV-010",
+    "SB-DIV-011",
+    "SB-DIV-012",
+    "SB-DIV-013",
+    "SB-DIV-014",
+    "SB-DIV-015",
+    "SB-DIV-016",
+)
+EXPECTED_DIVERGENCE_DECISION_COUNT = len(EXPECTED_DIVERGENCE_DECISION_IDS)
+
+# Rows the decision's own text names or neighbours but that stay outside the
+# approved set, with the status each must keep. The approval covers 82 rows; a
+# reclassification here would widen it past its evidence, so each status is
+# pinned. SB-CONN-007 is the §7 entry point that reaches §14: the approval fixes
+# what it must do, but it is not one of the 82 approved rows, and the raising
+# shim it now owes is buildable Python work.
+EXPECTED_DIVERGENCE_EXCLUDED_ROWS = {
+    "SB-CONN-007": "Missing Go",
+    "SB-STAT-028": NOT_REQUIRED_STATUS,
+    "SB-STAT-038": "Missing Go",
+}
+
+# The normative behavior the approval fixes. Dropping any of these sentences
+# would silently widen an approved divergence, so they are pinned like counts.
+EXPECTED_APPROVAL_BEHAVIOR_SNIPPETS = (
+    "**Approved — @phrocker, 2026-08-19.**",
+    "`connector.getStatistics()` **raises `NotImplementedError`** with a stable "
+    "explanation that Accumulo 4 removed the legacy manager-monitor API.",
+    "It **must not** return a fabricated or partially populated status object.",
+    "This permanent absence **must not** be surfaced as a retryable "
+    "`ClientException`",
+    "**Capability discovery must not advertise cluster-status support.**",
+)
+
+# §14 holds 84 rows and the approval covers 82 of them, so the section has to
+# state that scope in the approval's own terms. Prose that lets the decision
+# cover "the section" contradicts the two exclusions pinned above, so the
+# sentence is generated from the pinned count and the pinned excluded rows
+# rather than written out: widening it in the document, or dropping an
+# exclusion from the pin, makes the two disagree.
+# The same section must not promise permanence for rows the approval never
+# reached. Two of the 84 rows carry other statuses, so prose that binds "every
+# row below" to the divergence status is broader than the decision; this
+# sentence is generated from the same pinned count and decision so that widening
+# it in the document fails here.
+APPROVAL_PERMANENCE_PROSE = (
+    "**each of the {count} rows [{decision}](#sec-26) covers keeps `Intentional "
+    "divergence (approval required)` permanently**"
+)
+
+APPROVAL_SCOPE_PROSE = (
+    "The single approval decision governing them is [{decision}](#sec-26), and it covers "
+    "the {count} capability rows of this section — neither [{first}](#sec-14) nor "
+    "[{second}](#sec-14) is in it."
+)
+
+# Containment cannot detect a contradiction. Every required sentence can stay
+# in place while a later one reverses it, so the two normative preambles are
+# pinned whole and compared after normalization, exactly as the approved
+# decision's Impact cell is. The fragment checks above and below are kept for
+# their diagnostics, and each is also required to appear in the whole-text pin
+# so a pin can never silently drop what it is supposed to guarantee.
+APPROVAL_BEHAVIOR_PREAMBLE = (
+    'Reached through `AccumuloConnector.getStatistics()` (`pysharkbite.cpp:268`) and '
+    'demonstrated by `examples/pythonstats.py`. **All 82 capability rows in this section '
+    'are `Intentional divergence (approval required)` because the upstream capability no '
+    'longer exists.** Two rows are excluded and carry other statuses: '
+    '[SB-STAT-028](#sec-14) (`Not required` — a pybind11 registration defect in the '
+    '`TableRates` property table, not a capability) and [SB-STAT-038](#sec-14) (`Missing '
+    'Go` — a Python `dynamic_attr` property of the objects rather than a protocol '
+    'capability). Accumulo commit `f0841e4` removed `getManagerStats`, '
+    '`ManagerMonitorInfo`, and `DeadServer` together with the legacy monitor resources — '
+    '113 commits before the pinned Accumulo 4 target `317c288`. The surviving REST-v2, '
+    'metrics, and server APIs cannot reconstruct the `AccumuloInfo` / '
+    '`TabletServerStatus` / `TableInfo` / `TableRates` / `TableCompactions` / '
+    '`Compacting` / `RecoveryStatus` / `DeadServer` object graph these rows describe: the '
+    'data is either absent, aggregated differently, or exposed only as scrape-time '
+    'metrics without the per-table and per-server structure Sharkbite returns. The status '
+    'label keeps the words `approval required` because [§4.2](#sec-4) fixes the six '
+    'status names; whether a divergence *is* approved is recorded in [§26](#sec-26), '
+    'never in the status column. The approval covers exactly the 82 rows in this section, '
+    'which already carried this status, so it changed no classification and no count. The '
+    'entry point that reaches them, [SB-CONN-007](#sec-7), is named by the decision in '
+    '[§26](#sec-26) but is **not** one of the 82 approved rows: it keeps `Missing Go`, '
+    'because what it owes after the approval — a shim that raises — is buildable Python '
+    'work ([SB-GAP-P-006](#sec-23)). Moving it would require an approval that names it. '
+    'This is therefore **not** a Shoal implementation gap that effort can close, and it '
+    'must never be marked `Missing Go` (which implies it is buildable) or `Covered`. '
+    'Shoal issue [#96](https://github.com/phrocker/shoal-oss/issues/96) attempted it and '
+    'PR [#98](https://github.com/phrocker/shoal-oss/pull/98) was **withdrawn** for this '
+    'reason. The single approval decision governing them is [SB-DIV-016](#sec-26), and it '
+    'covers the 82 capability rows of this section — neither [SB-STAT-028](#sec-14) nor '
+    '[SB-STAT-038](#sec-14) is in it. **Approved — @phrocker, 2026-08-19.** The decision '
+    'is recorded on Shoal issue '
+    '[#81](https://github.com/phrocker/shoal-oss/issues/81#issuecomment-5343583850) and '
+    'mirrored here by revision {revision}, as [§26](#sec-26) requires. The approved '
+    'compatibility behavior is normative: 1. `connector.getStatistics()` **raises '
+    '`NotImplementedError`** with a stable explanation that Accumulo 4 removed the legacy '
+    'manager-monitor API. The explanation is part of the contract: it does not vary with '
+    'the cluster, the credentials, or the call. 2. It **must not** return a fabricated or '
+    'partially populated status object. No `AccumuloInfo`, `TabletServerStatus`, '
+    '`TableInfo`, `TableRates`, `TableCompactions`, `Compacting`, `RecoveryStatus`, or '
+    '`DeadServer` instance is ever returned, so none of the accessors below is ever '
+    'reachable and no metrics-scraped substitute may be presented as one. The approval '
+    'fixes the observable contract of the call, not how a shim is written internally: it '
+    'says nothing about what an implementation may construct or attempt on the way to '
+    'raising, and this document does not add such a rule. 3. This permanent absence '
+    '**must not** be surfaced as a retryable `ClientException` ([§18](#sec-18)). A caller '
+    'must be able to distinguish "the cluster is unavailable, retry" from "this API no '
+    'longer exists". 4. **Capability discovery must not advertise cluster-status '
+    'support.** No `shoal_capabilities` bit, no ABI export, and no Python feature flag '
+    'may claim it ([SB-XCUT-012](#sec-20), [SB-GAP-C-006](#sec-23)). The approval '
+    'satisfies the [§2.2](#sec-2) gate for these rows under corollary 5 of [§2](#sec-2). '
+    'It does **not** make any row `Covered`, and it does not erase the work it creates: '
+    'the Python shim owes the raising entry point, and the compatibility suite owes the '
+    'tests that pin it ([SB-GAP-T-009](#sec-23), [SB-GAP-P-006](#sec-23)) — that '
+    '`getStatistics()` raises `NotImplementedError` with the stable message and not '
+    '`ClientException`, that no status object is returned on any path, and that '
+    'capability discovery reports no cluster-status capability. Two separate facts, which '
+    'this document deliberately does not conflate. First, **each of the 82 rows '
+    '[SB-DIV-016](#sec-26) covers keeps `Intentional divergence (approval required)` '
+    'permanently**: [§4.2](#sec-4) fixes the six status names, approval state lives in '
+    '[§26](#sec-26) rather than in the status column, and an approved divergence records '
+    'a capability that will never exist. Landing the tests does not move those 82 rows, '
+    'and neither does anything else — only reversing the approval could. The claim is '
+    'about them and not about the section: [SB-STAT-028](#sec-14) is `Not required` and '
+    '[SB-STAT-038](#sec-14) is `Missing Go`, and neither is bound by this permanence. '
+    'Second, and independently, the divergence is **approved but unproven** until '
+    '[SB-GAP-T-009](#sec-23) lands: the decision is binding now, the evidence that an '
+    'implementation obeys it does not exist yet. Proof status is not a classification and '
+    'never becomes one.'
+)
+
+DIVERGENCE_DECISION_PREAMBLE = (
+    'One entry below is approved: [SB-DIV-016](#sec-26), signed by @phrocker on '
+    '**2026-08-19**. [SB-DIV-013](#sec-26) is **subsumed** by [SB-DIV-016](#sec-26): it '
+    'is dormant rather than blocking, carries no approver of its own, and revives only if '
+    'that approval is reversed. Every remaining entry blocks the gate until a named '
+    'approver signs it with a date. Approvals are recorded on Shoal issue '
+    '[#81](https://github.com/phrocker/shoal-oss/issues/81) and then mirrored into this '
+    'table in the same change; a comment on #81 alone does not lift the gate, and neither '
+    'does an edit here without the corresponding #81 decision. Adding a divergence to '
+    'this table is not approval. **87 matrix rows currently carry the `Intentional '
+    'divergence (approval required)` status: 82 are approved and 5 are not.** The '
+    'approved 82 are the cluster-status rows of [§14](#sec-14), all covered by the single '
+    'decision [SB-DIV-016](#sec-26), which @phrocker approved on **2026-08-19**; that '
+    'decision also governs [SB-CONN-007](#sec-7), the `getStatistics()` entry point, but '
+    'does not cover it as an approved row, so it stays `Missing Go` and is counted there. '
+    'The unapproved 5 are SB-PKG-014 (Accumulo 4 only), SB-CFG-014 and SB-CFG-022 (no '
+    'password read-back, both spellings), SB-CONN-010 (per-connector pools), and '
+    'SB-ERR-003 (no Thrift types); each of those still blocks the gate exactly like an '
+    'unimplemented row. The table below lists 16 decisions — 1 approved, 1 subsumed by '
+    'that approval, and 14 still proposed — because one decision can cover many rows; the '
+    'row count and the decision count are different quantities and must not be conflated. '
+    'The remaining 14 entries — every decision except the approved [SB-DIV-016](#sec-26) '
+    'and the subsumed [SB-DIV-013](#sec-26) — are **proposed** divergences. Approving one '
+    'has one of two effects on a row it names. The 5 rows that already carry `Intentional '
+    'divergence (approval required)` — the unapproved rows listed above, named by '
+    'SB-DIV-001, SB-DIV-002, SB-DIV-003, SB-DIV-004 — would simply have their gate '
+    'lifted, with no status and no count change, exactly as happened for the 82 rows of '
+    'SB-DIV-016, which already carried this status when it was approved. Every other row '
+    'a proposal names currently carries a different status and would move to `Intentional '
+    'divergence`. Rejecting a proposal leaves its rows as gaps that must be implemented. '
+    'Neither of the two non-proposed entries is a proposal: SB-DIV-016 is already '
+    'approved, and SB-DIV-013 describes a capability that same approval removed outright, '
+    'so it has nothing left to propose. SB-DIV-016 names [SB-CONN-007](#sec-7) as the '
+    'entry point that reaches its rows, but that row is outside the approved set and '
+    'keeps `Missing Go`; reclassifying it would require an approval that names it. An '
+    'approved divergence never becomes `Covered`: it records a capability that will never '
+    'exist rather than one that has been delivered, and its rows keep the `approval '
+    'required` label because [§4.2](#sec-4) fixes the six status names — approval state '
+    'lives in this table, not in the status column.'
+)
+
+# The approved behavior is normative because it sits in the section it governs.
+# Searching the whole document would accept a mirror that moved these sentences
+# into revision history and deleted them from §14, so the search is scoped to
+# that section's body.
+# The status narratives are normative to the sections that carry them: the
+# release-gate sentence is the gate's own statement of how many rows are
+# satisfied, and the count narratives explain the tables they sit above.
+# Searching the whole document would accept a mirror that deleted either from
+# its section and pasted it into revision history, so each phrase is searched
+# only in the section that owns it.
+RELEASE_GATE_SECTION_HEADING = "## 2. Release gate (normative)"
+COUNTS_SECTION_HEADING = "## 25. Counts by status and category"
+
+APPROVAL_BEHAVIOR_SECTION_HEADING = (
+    "## 14. Matrix: cluster status and monitoring (`SB-STAT`)"
+)
+APPROVAL_BEHAVIOR_SECTION_LABEL = "§14"
+
+# The §26 preamble is normative for the same reason: the decision split, the
+# carve-outs and the approved/unapproved reconciliation describe the table they
+# introduce, so they have to be found in the prose above that table rather than
+# anywhere in the document.
+DIVERGENCE_DECISION_SECTION_HEADING = "## 26. Divergences requiring explicit approval"
+DIVERGENCE_DECISION_SECTION_LABEL = "§26"
+
+# §26 states the decision/row split and which entries are still open. Both
+# sentences are generated from the parsed table so the prose cannot drift away
+# from it, and both name the approved and subsumed entries so neither is
+# silently folded back into the blocking population.
+DIVERGENCE_DECISION_SPLIT_PROSE = (
+    "The table below lists {total} decisions — {approved} approved, {subsumed} subsumed by "
+    "that approval, and {proposed} still proposed —"
+)
+PROPOSED_DIVERGENCE_CARVE_OUT_PROSE = (
+    "The remaining {proposed} entries — every decision except the approved {approved_ids} "
+    "and the subsumed {subsumed_ids} — are **proposed** divergences"
+)
+# Approving a proposal does not always reclassify a row: the rows that already
+# carry the divergence status only have their gate lifted. The preamble has to
+# say which rows those are, or it contradicts the unapproved population it just
+# listed, so the claim is generated from the parsed statuses.
+PROPOSED_DIVERGENCE_EFFECT_PROSE = (
+    "The {already} rows that already carry `{status}` — the unapproved rows listed above, "
+    "named by {already_ids} — would simply have their gate lifted, with no status and no "
+    "count change"
 )
 
 GAP_COMPLETION_RULES: dict[str, tuple[str, ...]] = {
@@ -267,8 +747,8 @@ DEFAULT_C_ABI_INCLUDE_PATHS = (
     Path("capi/include"),
     Path("capi/tests"),
 )
-EXPECTED_C_ABI_DECLARED_EXPORTS = 227
-EXPECTED_C_ABI_REFERENCED_EXPORTS = 222
+EXPECTED_C_ABI_DECLARED_EXPORTS = 264
+EXPECTED_C_ABI_REFERENCED_EXPORTS = 259
 EXPECTED_C_ABI_UNREFERENCED_EXPORTS = (
     "shoal_scanner_scan",
     "shoal_batch_scanner_scan",
@@ -332,6 +812,16 @@ OPTIONAL_ANCHOR_CITATIONS = {
 # same reason: the matrix claims an exact public Go surface, so a rename or a
 # deleted method must fail the document, not just the build.
 # Implementation files behind the section 11 table-maintenance rows.
+TARGETED_SB_EXTENT_CITATIONS = {
+    "accumulo/tablet_extent.go",
+    "accumulo/tablet_extent_test.go",
+}
+
+TARGETED_SB_KEY_CITATIONS = {
+    "accumulo/key.go",
+    "accumulo/key_test.go",
+}
+
 TARGETED_SB_VIS_CITATIONS = {
     "accumulo/column_visibility.go",
     "accumulo/column_visibility_test.go",
@@ -377,12 +867,109 @@ ANCHOR_CHECKED_CITATIONS = (
     | TARGETED_SB_TABLE_CITATIONS
     | TARGETED_SB_SCAN_CITATIONS
     | TARGETED_SB_VIS_CITATIONS
+    | TARGETED_SB_KEY_CITATIONS
+    | TARGETED_SB_EXTENT_CITATIONS
 )
 COUNT_RE = re.compile(
     r"^(?P<bold>\*\*)?(?P<number>0|[1-9]\d*|[1-9]\d{0,2}(?:,\d{3})+)(?(bold)\*\*|)$"
 )
 CODE_SPAN_RE = re.compile(r"`([^`]+)`")
 IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+ROW_ID_RE = re.compile(r"\bSB-[A-Z]+-\d{3}\b")
+ROW_ID_PARTS_RE = re.compile(r"(?P<prefix>SB-[A-Z]+)-(?P<number>\d{3})")
+# Link targets, so an evidence URL can be pinned as the whole destination of a
+# Markdown link. A substring test would accept a suffixed URL that resolves to a
+# different comment, which is exactly what an approval citation must not allow.
+# The whole `[label](target)` construct has to match: bare `](target)` text is not
+# a link, so a pattern that only anchors on the closing bracket would report a
+# citation the rendered document does not contain. Images are excluded, and the
+# label is captured so it can be checked for visibility separately.
+MARKDOWN_LINK_RE = re.compile(
+    r"(?<![!\\])\[(?P<label>[^\[\]]*)(?<!\\)\]\((?P<target>[^()\s]+)\)"
+)
+# Unicode categories that occupy no visible space: control, format (which is
+# where U+200B ZERO WIDTH SPACE and the bidi marks live), and the three
+# separator categories.
+# Categories whose members render nothing a reader can see or click. The
+# combining marks (`Mn`, `Me`) are here because a label made only of U+FE0F or
+# U+034F has no base character to attach to, so it renders as an empty anchor
+# exactly as a zero-width space does.
+INVISIBLE_LABEL_CATEGORIES = frozenset({"Cc", "Cf", "Mn", "Me", "Zl", "Zp", "Zs"})
+# Raw HTML tags contribute markup, not text: `[<span></span>](url)` renders an
+# anchor with nothing inside it. Tags are removed before entity decoding so
+# that `&lt;span&gt;`, which reaches the reader as visible characters, survives.
+MARKDOWN_HTML_TAG_RE = re.compile(r"</?[A-Za-z][^>]*>")
+
+# A code span renders as literal text, so `[label](url)` inside one is not a
+# link at all, and an HTML comment renders as nothing. Matching the raw cell
+# would let the evidence citation be backquoted into prose or commented out
+# while still satisfying the pin, so every construct the reader never sees as a
+# link is removed before link targets are read. Escaped brackets are rejected by
+# the pattern itself: `\[label](url)` renders as literal text too.
+MARKDOWN_HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.S)
+MARKDOWN_FENCE_OPENER_RE = re.compile(r"^ {0,3}(?:`{3,}|~{3,})")
+MARKDOWN_CODE_FENCE_RE = re.compile(r"```.*?```", re.S)
+MARKDOWN_CODE_SPAN_RE = re.compile(r"(?<!`)(`+)(?!`)(.+?)(?<!`)\1(?!`)", re.S)
+# Raw HTML `<code>`/`<pre>` render their contents as literal text just like a
+# backquoted span, so a citation written `<code>[label](target)</code>` links
+# nowhere. Markdown allows raw HTML, so this is not a hypothetical form.
+MARKDOWN_HTML_CODE_RE = re.compile(
+    r"<(?P<tag>code|pre)\b[^>]*>.*?</(?P=tag)\s*>", re.S | re.I
+)
+# The same construct seen one line at a time, for block scans that cannot use
+# the whole-document form above.
+MARKDOWN_HTML_CODE_TAG_RE = re.compile(
+    r"<(?P<closing>/?)(?P<tag>code|pre)\b[^>]*?(?P<selfclosing>/?)>", re.I
+)
+
+
+def strip_non_rendered_markup(text: str) -> str:
+    """Return `text` with every construct that renders as non-link blanked out."""
+
+    without_comments = MARKDOWN_HTML_COMMENT_RE.sub(" ", text)
+    without_html_code = MARKDOWN_HTML_CODE_RE.sub(" ", without_comments)
+    return MARKDOWN_CODE_SPAN_RE.sub(
+        " ", MARKDOWN_CODE_FENCE_RE.sub(" ", without_html_code)
+    )
+
+
+def has_visible_link_label(label: str) -> bool:
+    """Report whether a Markdown link label renders any character a reader can see.
+
+    `[](target)`, `[\u200b](target)` and `[<span></span>](target)` all render as
+    anchors with nothing to read or click, so a citation written any of those
+    ways is not one a reviewer can follow. Raw tags are dropped first because
+    they are markup rather than text, and entities are decoded afterwards
+    because `&nbsp;` reaches the reader as U+00A0, not as six visible
+    characters, while `&lt;span&gt;` reaches it as visible text.
+    """
+
+    for character in html.unescape(MARKDOWN_HTML_TAG_RE.sub("", label)):
+        if character.isspace():
+            continue
+        if unicodedata.category(character) in INVISIBLE_LABEL_CATEGORIES:
+            continue
+        return True
+    return False
+
+
+def extract_markdown_link_targets(text: str) -> set[str]:
+    """Return the targets of the links `text` actually renders as links."""
+
+    return {
+        match.group("target")
+        for match in MARKDOWN_LINK_RE.finditer(strip_non_rendered_markup(text))
+        if has_visible_link_label(match.group("label"))
+    }
+# "every `SB-STAT-*` row except SB-STAT-028 (...) and SB-STAT-038 (...)." — the
+# clause an approved Rows cell uses to state its scope in English.
+APPROVAL_ROWS_CELL_SCOPE_RE = re.compile(
+    r"every\s+`(?P<prefix>SB-[A-Z]+)-\*`\s+rows?\s+except\s+(?P<exclusions>.*?)\.\s",
+    re.S,
+)
+MANIFEST_CITATION_RE = re.compile(
+    r"docs/sharkbite-compatibility-revision(?P<revision>\d+)-(?P<kind>rows|cabi-symbols)\.txt"
+)
 ANCHOR_PART_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*|\.{3}|\s+|.")
 FILE_CITATION_SUFFIXES = {
     ".c",
@@ -705,6 +1292,163 @@ def normalize_whitespace(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+def extract_section_body(lines: Sequence[str], heading: str) -> list[str]:
+    """Return one level-2 section's lines, excluding its heading.
+
+    Empty when the heading is absent, which callers treat as a failure rather
+    than as a vacuously satisfied search.
+    """
+    try:
+        start = list(lines).index(heading)
+    except ValueError:
+        return []
+    body: list[str] = []
+    for line in lines[start + 1:]:
+        if line.startswith("## "):
+            break
+        body.append(line)
+    return body
+
+
+def extract_section_preamble(lines: Sequence[str], heading: str) -> list[str]:
+    """Return a section's prose above its first table row.
+
+    Prose that introduces a table has to sit above it; searching the whole
+    section would accept a sentence pushed below the table it describes.
+    """
+    preamble: list[str] = []
+    for line in extract_section_body(lines, heading):
+        if line.startswith("|"):
+            break
+        preamble.append(line)
+    return preamble
+
+
+# CommonMark renders a line indented four columns past the block that contains
+# it as an indented code block rather than as prose. `normalize_whitespace`
+# collapses that indentation, so a whole-block pin cannot see the difference:
+# indenting every line of a pinned preamble would leave the normalized text
+# byte-identical to its pin while the rendered document stopped carrying the
+# normative prose at all.
+INDENTED_CODE_INDENT = 4
+LIST_ITEM_MARKER_RE = re.compile(r"^(?P<indent> *)(?P<marker>[-*+]|\d{1,9}[.)])(?P<gap> +)")
+
+
+def leading_indent_columns(line: str) -> int:
+    """Return a line's indentation in columns, expanding tabs to four."""
+    columns = 0
+    for char in line:
+        if char == " ":
+            columns += 1
+        elif char == "\t":
+            columns += INDENTED_CODE_INDENT - (columns % INDENTED_CODE_INDENT)
+        else:
+            break
+    return columns
+
+
+def find_indented_code_lines(lines: Sequence[str]) -> list[str]:
+    """Return the lines Markdown would render as indented code, not as prose.
+
+    A line only opens an indented code block when a blank line precedes it and
+    it is indented four columns past the block containing it, so the scan tracks
+    the enclosing list item's content indent. A lazy continuation of the
+    paragraph above still renders as prose and is not reported.
+    """
+    offenders: list[str] = []
+    content_indent = 0
+    previous_blank = True
+    for line in lines:
+        if not line.strip():
+            previous_blank = True
+            continue
+        indent = leading_indent_columns(line)
+        if indent < content_indent:
+            content_indent = 0
+        marker = LIST_ITEM_MARKER_RE.match(line)
+        if marker and indent < content_indent + INDENTED_CODE_INDENT:
+            content_indent = indent + len(marker.group("marker")) + len(marker.group("gap"))
+        elif previous_blank and indent >= content_indent + INDENTED_CODE_INDENT:
+            offenders.append(line)
+        previous_blank = False
+    return offenders
+
+
+def find_hidden_markup_lines(lines: Sequence[str]) -> list[str]:
+    """Return the lines that hide prose behind a comment, a fence or raw HTML.
+
+    A raw `<code>`/`<pre>` wrapper renders its contents literally exactly as a
+    fence does, and `normalize_whitespace` cannot see the difference, so a
+    wrapper placed around a pinned block and around its pin would keep the
+    normative prose out of the rendered document while still comparing equal.
+    """
+    offenders: list[str] = []
+    open_tags: list[str] = []
+    for line in lines:
+        hidden = bool(open_tags) or "<!--" in line or "-->" in line
+        if MARKDOWN_FENCE_OPENER_RE.match(line):
+            hidden = True
+        for match in MARKDOWN_HTML_CODE_TAG_RE.finditer(line):
+            hidden = True
+            tag = match.group("tag").lower()
+            if match.group("closing"):
+                if tag in open_tags:
+                    del open_tags[open_tags.index(tag) :]
+            elif not match.group("selfclosing"):
+                open_tags.append(tag)
+        if hidden:
+            offenders.append(line)
+    return offenders
+
+
+def require_rendered_prose(lines: Sequence[str], label: str) -> None:
+    """Fail when a pinned block would not reach the reader as prose.
+
+    Four constructs hide prose without altering it once whitespace is
+    normalized: an HTML comment, a fenced code block, a raw `<code>`/`<pre>`
+    block, and an indented code block. A pin updated with the same construct
+    still compares equal, so a block is checked for all four before it is
+    compared.
+    """
+    hidden = find_hidden_markup_lines(lines)
+    first_hidden = hidden[0] if hidden else ""
+    require(
+        not hidden,
+        (
+            f"{label}'s prose is wrapped in markup that keeps it out of the rendered "
+            "document — an HTML comment, a code fence or a raw <code>/<pre> block "
+            "— which a pin carrying the same "
+            f"markup cannot detect: {first_hidden!r}"
+        ),
+    )
+    offenders = find_indented_code_lines(lines)
+    first = offenders[0] if offenders else ""
+    require(
+        not offenders,
+        (
+            f"{label}'s prose is indented far enough that Markdown renders it as an "
+            "indented code block rather than as normative prose, and whitespace "
+            f"normalization hides that from the pin comparison: {first!r}"
+        ),
+    )
+
+
+def require_rendered_cell(text: str, label: str) -> None:
+    """Fail when a normative table cell hides text behind an HTML comment.
+
+    A table cell is one line, so a comment is the only way to keep part of it
+    out of the rendered document. Applied to the pin as well as to the cell,
+    because a coordinated edit to both would otherwise still compare equal.
+    """
+    require(
+        "<!--" not in text and "-->" not in text,
+        (
+            f"{label} carries an HTML comment, so part of a normative cell never reaches "
+            f"the reader: {text!r}"
+        ),
+    )
+
+
 def row_identifier(cells: list[str], line: str) -> str:
     if cells:
         return cells[0]
@@ -736,6 +1480,10 @@ def iter_matrix_rows(lines: list[str]) -> Iterator[tuple[int, str, list[str]]]:
             fail(f"unexpected separator row inside a matrix table on line {line_number}")
         if not line.startswith("| SB-"):
             continue
+        require(
+            line.rstrip().endswith("|"),
+            f"malformed SB row {row_identifier([], line)} on line {line_number}: missing final table delimiter",
+        )
         cells = split_matrix_cells(line)
         row_id = row_identifier(cells, line)
         if current_header_cells is None or row_id.startswith("SB-GAP"):
@@ -883,6 +1631,16 @@ def preview_row_ids(row_ids: Sequence[tuple[str, str] | str], *, limit: int = 5)
 
 
 def validate_pinned_inventory_constants() -> None:
+    require(
+        EXPECTED_ROW_MANIFEST.name.endswith(f"revision{EXPECTED_REVISION}-rows.txt")
+        and EXPECTED_C_ABI_SYMBOL_MANIFEST.name.endswith(
+            f"revision{EXPECTED_REVISION}-cabi-symbols.txt"
+        ),
+        (
+            f"manifest filenames do not follow EXPECTED_REVISION {EXPECTED_REVISION}: "
+            f"{EXPECTED_ROW_MANIFEST.name}, {EXPECTED_C_ABI_SYMBOL_MANIFEST.name}"
+        ),
+    )
     require(
         set(EXPECTED_STATUS_COUNTS) == STATUSES,
         f"EXPECTED_STATUS_COUNTS does not cover the six statuses: {sorted(EXPECTED_STATUS_COUNTS)}",
@@ -1559,6 +2317,769 @@ def validate_gap_completion_consistency(
         )
 
 
+# The §23 ledger entry the cluster-status approval closes, and the §7 entry point
+# the decision names. The ledger entry's Matrix rows cell is the ledger's own
+# statement of scope: if it named fewer rows than the approval reaches, the rows
+# outside it would sit in no ledger item at all while §25.3 reported the gap as
+# closed by approval.
+CLUSTER_STATUS_LEDGER_ENTRY = "SB-GAP-GO-003"
+CLUSTER_STATUS_ENTRY_POINT_ROW = "SB-CONN-007"
+CLUSTER_STATUS_DIVERGENCE_ID = "SB-DIV-016"
+
+
+def validate_cluster_status_ledger_scope(
+    lines: list[str], rows: Sequence[tuple[str, str]]
+) -> None:
+    """Require the cluster-status ledger entry to cover every row the approval reaches.
+
+    The expected population is generated from the matrix rather than pinned as a
+    literal, so adding a cluster-status row to §14 without widening the ledger
+    entry is a failure rather than a silently narrower claim.
+    """
+    gap_rows = parse_gap_completion_tables(lines)
+    require(
+        CLUSTER_STATUS_LEDGER_ENTRY in gap_rows,
+        f"§23 is missing the ledger entry {CLUSTER_STATUS_LEDGER_ENTRY}",
+    )
+    matrix_rows_cell, _notes = gap_rows[CLUSTER_STATUS_LEDGER_ENTRY]
+    require_rendered_cell(
+        matrix_rows_cell, f"{CLUSTER_STATUS_LEDGER_ENTRY}'s Matrix rows cell"
+    )
+    referenced = set(
+        expand_gap_row_references(
+            matrix_rows_cell, dict(rows), gap_id=CLUSTER_STATUS_LEDGER_ENTRY
+        )
+    )
+    expected = {
+        row_id
+        for row_id, status in rows
+        if row_id.startswith("SB-STAT-") and status != NOT_REQUIRED_STATUS
+    } | {CLUSTER_STATUS_ENTRY_POINT_ROW}
+    missing = sorted(expected - referenced)
+    unexpected = sorted(referenced - expected)
+    require(
+        not missing and not unexpected,
+        (
+            f"{CLUSTER_STATUS_LEDGER_ENTRY} must scope itself to every cluster-status row the "
+            f"approval reaches plus {CLUSTER_STATUS_ENTRY_POINT_ROW}; missing "
+            f"{preview_row_ids(missing) or 'nothing'}, unexpected "
+            f"{preview_row_ids(unexpected) or 'nothing'}"
+        ),
+    )
+    approved = set(APPROVED_DIVERGENCES[CLUSTER_STATUS_DIVERGENCE_ID].rows)
+    outside = sorted(approved - referenced)
+    require(
+        not outside,
+        (
+            f"{CLUSTER_STATUS_LEDGER_ENTRY} is the ledger entry "
+            f"{CLUSTER_STATUS_DIVERGENCE_ID} closes, but approved rows are outside its "
+            f"scope: {preview_row_ids(outside)}"
+        ),
+    )
+
+
+def parse_divergence_table(lines: list[str]) -> dict[str, list[str]]:
+    headers, table_rows = parse_markdown_table(lines, DIVERGENCE_TABLE_HEADING)
+    require(
+        headers == DIVERGENCE_TABLE_HEADERS,
+        f"unexpected headers under {DIVERGENCE_TABLE_HEADING}: {headers}",
+    )
+    entries: dict[str, list[str]] = {}
+    for cells in table_rows:
+        entry_id = cells[0]
+        require(
+            entry_id.startswith("SB-DIV-"),
+            f"unexpected divergence entry id in §26: {entry_id!r}",
+        )
+        require(entry_id not in entries, f"duplicate divergence entry {entry_id} in §26")
+        entries[entry_id] = cells
+    require(entries, "§26 records no divergence entries")
+    return entries
+
+
+def parse_approval_scope_cell(rows_cell: str) -> tuple[str, set[str]]:
+    """Read the section prefix and the excluded rows out of a Rows cell.
+
+    An approved Rows cell states its scope as "every `SB-PREFIX-*` row except A
+    and B". Those two pieces are all the cell asserts; the population they apply
+    to belongs to the matrix, not to this sentence, so it is read from the row
+    inventory rather than guessed from the pin being checked.
+    """
+    match = APPROVAL_ROWS_CELL_SCOPE_RE.search(rows_cell)
+    require(
+        match is not None,
+        (
+            "an approved Rows cell must state its scope as \"every `SB-<PREFIX>-*` row "
+            f"except ...\", found {rows_cell!r}"
+        ),
+    )
+    assert match is not None
+    prefix = match.group("prefix")
+    excluded = set(ROW_ID_RE.findall(match.group("exclusions")))
+    require(
+        excluded,
+        f"the Rows cell names no excluded rows after 'except': {rows_cell!r}",
+    )
+    off_prefix = sorted(row for row in excluded if not row.startswith(f"{prefix}-"))
+    require(
+        not off_prefix,
+        (
+            f"the Rows cell excludes {', '.join(off_prefix)} from the {prefix} population, "
+            "but those rows are not part of it"
+        ),
+    )
+    return prefix, excluded
+
+
+def validate_approval_scope_cell(
+    divergence_id: str,
+    pins: "ApprovedDivergence",
+    rows: Sequence[tuple[str, str]],
+) -> None:
+    """Hold the pinned row ids to the set the Rows cell describes.
+
+    The cell says "every `SB-PREFIX-*` row except ...", so the set it names is
+    the matrix's own `SB-PREFIX-*` population minus those exclusions. That
+    population comes from the parsed row inventory, which
+    `validate_revision_inventory` already pins against the audited manifest, so
+    neither endpoint of the comparison is inferred from the pin under test:
+    shifting the pinned window, substituting a row from another section, or
+    claiming a row the cell excludes all fail here.
+    """
+    prefix, excluded = parse_approval_scope_cell(pins.rows_cell)
+    population = set()
+    for row_id, _status in rows:
+        parsed = ROW_ID_PARTS_RE.fullmatch(row_id)
+        if parsed is not None and parsed.group("prefix") == prefix:
+            population.add(row_id)
+    require(
+        population,
+        (
+            f"{divergence_id} claims every {prefix} row, but the matrix has no {prefix} rows"
+        ),
+    )
+    unknown_exclusions = sorted(excluded - population)
+    require(
+        not unknown_exclusions,
+        (
+            f"{divergence_id} excludes {', '.join(unknown_exclusions)}, which the matrix does "
+            f"not carry in the {prefix} population"
+        ),
+    )
+    collisions = sorted(set(pins.rows) & excluded)
+    require(
+        not collisions,
+        (
+            f"{divergence_id} pins {', '.join(collisions)} as approved, but its Rows cell "
+            "excludes those rows"
+        ),
+    )
+    described = population - excluded
+    require(
+        set(pins.rows) == described,
+        (
+            f"{divergence_id} pins a row set its Rows cell does not describe: the cell claims "
+            f"every {prefix} row except {', '.join(sorted(excluded))}, which is "
+            f"{len(described)} rows, but the pin differs at "
+            f"{preview_row_ids(sorted(set(pins.rows) ^ described))}"
+        ),
+    )
+
+
+def validate_divergence_approvals(
+    lines: list[str],
+    rows: Sequence[tuple[str, str]],
+) -> None:
+    entries = parse_divergence_table(lines)
+    require(
+        len(entries) == EXPECTED_DIVERGENCE_DECISION_COUNT,
+        (
+            f"§26 lists {len(entries)} decisions, but the audited table holds "
+            f"{EXPECTED_DIVERGENCE_DECISION_COUNT}"
+        ),
+    )
+    expected_decision_ids = set(EXPECTED_DIVERGENCE_DECISION_IDS)
+    listed_decision_ids = set(entries)
+    missing_decisions = sorted(expected_decision_ids - listed_decision_ids)
+    unexpected_decisions = sorted(listed_decision_ids - expected_decision_ids)
+    require(
+        not missing_decisions and not unexpected_decisions,
+        (
+            "§26 does not list the audited decision identifiers: missing "
+            f"{', '.join(missing_decisions) or 'nothing'}; unexpected "
+            f"{', '.join(unexpected_decisions) or 'nothing'}"
+        ),
+    )
+
+    for divergence_id, pins in APPROVED_DIVERGENCES.items():
+        require(divergence_id in entries, f"§26 is missing approved divergence {divergence_id}")
+        cells = entries[divergence_id]
+        # The approver and the date are the whole of the approval state §26
+        # exists to record. Commenting out either one on both sides still
+        # compares equal while the table renders blank, so both are checked for
+        # rendered text before they are compared.
+        require_rendered_cell(cells[4], f"{divergence_id}'s Approver cell")
+        require_rendered_cell(pins.approver, f"{divergence_id}'s pinned approver")
+        require_rendered_cell(cells[5], f"{divergence_id}'s Date cell")
+        require_rendered_cell(pins.date, f"{divergence_id}'s pinned approval date")
+        require(
+            cells[4] == pins.approver,
+            (
+                f"{divergence_id} approver is {cells[4]!r}, but the pinned approval names "
+                f"{pins.approver!r}"
+            ),
+        )
+        require(
+            cells[5] == pins.date,
+            (
+                f"{divergence_id} approval date is {cells[5]!r}, but the pinned approval is "
+                f"dated {pins.date!r}"
+            ),
+        )
+        # The evidence must be the whole destination of a link, not a substring of
+        # one: `…#issuecomment-5343583850-and-then-some` contains the pinned URL
+        # but resolves to a different anchor, so a substring test would let the
+        # dated approval cite something other than the comment that granted it.
+        # The link must also render, and render something visible: a code span,
+        # a raw `<code>` block or an invisible label all cite nothing a reader
+        # can follow.
+        evidence_targets = extract_markdown_link_targets(cells[3])
+        require(
+            pins.evidence in evidence_targets,
+            (
+                f"{divergence_id} does not cite its approval evidence {pins.evidence} as the "
+                f"target of a Markdown link; the cell links to {sorted(evidence_targets)}"
+            ),
+        )
+        # The Rows cell is the normative statement of what was approved. Left
+        # unpinned it could claim a different set while every other check here
+        # still passed, so it is compared whole against the audited scope.
+        require_rendered_cell(cells[2], f"{divergence_id}'s Rows cell")
+        require_rendered_cell(pins.rows_cell, f"{divergence_id}'s pinned Rows cell")
+        require(
+            cells[2] == pins.rows_cell,
+            (
+                f"{divergence_id} declares its approved rows as {cells[2]!r}, but the audited "
+                f"approval scope is {pins.rows_cell!r}; widening or narrowing an approval needs "
+                "a new decision on the tracking issue, not an edit here"
+            ),
+        )
+        require(
+            len(pins.rows) == len(set(pins.rows)),
+            f"{divergence_id} pins a duplicated approved row",
+        )
+        stated_count = f"The {len(pins.rows)} approved rows"
+        require(
+            pins.rows_cell.startswith(stated_count),
+            (
+                f"{divergence_id} pins {len(pins.rows)} approved rows, but its pinned Rows cell "
+                f"does not open with {stated_count!r}"
+            ),
+        )
+        validate_approval_scope_cell(divergence_id, pins, rows)
+        # The decision table is where approval state lives, so it must also carry
+        # what was approved. The behavior checks above are scoped to the section
+        # the decision governs; without this the row that records the approval
+        # could drop or reverse every clause and still pass.
+        require_rendered_cell(cells[3], f"{divergence_id}'s Impact cell")
+        require_rendered_cell(pins.impact_cell, f"{divergence_id}'s pinned Impact cell")
+        normalized_impact = normalize_whitespace(cells[3])
+        for clause in pins.behavior_clauses:
+            require(
+                normalize_whitespace(clause) in normalized_impact,
+                (
+                    f"{divergence_id} does not state the approved behavior it records, "
+                    f"in the decision's own terms: {clause}"
+                ),
+            )
+        normalized_pin = normalize_whitespace(pins.impact_cell)
+        # Guards the pins against each other, and runs before the whole-cell
+        # compare so that a narrowed pin is reported as a pin defect rather than
+        # as a document mismatch: dropping a clause from the pinned cell would
+        # otherwise silently narrow what the whole-cell compare enforces.
+        for clause in pins.behavior_clauses:
+            require(
+                normalize_whitespace(clause) in normalized_pin,
+                (
+                    f"{divergence_id}'s pinned decision text no longer states the pinned "
+                    f"approved behavior: {clause}"
+                ),
+            )
+        # Containment alone cannot detect a contradiction: the clause can stay as
+        # historical text with its opposite appended after it. The cell is the
+        # normative approval record, so it is compared whole.
+        require(
+            normalized_impact == normalized_pin,
+            (
+                f"{divergence_id} states its approved decision as {normalized_impact!r}, but "
+                f"the audited approval reads {normalized_pin!r}; changing what was approved "
+                "needs a new decision on the tracking issue, not an edit here"
+            ),
+        )
+
+    for divergence_id, subsumed in SUBSUMED_DIVERGENCES.items():
+        covering_id = subsumed.covering
+        require(divergence_id in entries, f"§26 is missing subsumed divergence {divergence_id}")
+        cells = entries[divergence_id]
+        # Dormancy is granted to the concern the entry described, not to the
+        # entry's identifier. An unpinned Rows cell could be repointed at a row
+        # the approval never covered, which would silently extend the approval.
+        require_rendered_cell(cells[2], f"{divergence_id}'s Rows cell")
+        require_rendered_cell(subsumed.rows_cell, f"{divergence_id}'s pinned Rows cell")
+        require(
+            cells[2] == subsumed.rows_cell,
+            (
+                f"{divergence_id} declares its subsumed rows as {cells[2]!r}, but the audited "
+                f"scope {covering_id} subsumes is {subsumed.rows_cell!r}; a subsumed entry "
+                "cannot be repointed at another row without a new decision"
+            ),
+        )
+        covering_rows = set(APPROVED_DIVERGENCES[covering_id].rows)
+        outside = sorted(set(subsumed.rows) - covering_rows)
+        require(
+            not outside,
+            (
+                f"{divergence_id} is subsumed by {covering_id} but names matrix rows outside "
+                f"that approval's scope: {preview_row_ids(outside)}"
+            ),
+        )
+        matrix_row_ids = {row_id for row_id, _ in rows}
+        named_matrix_rows = {
+            token
+            for token in ROW_ID_RE.findall(subsumed.rows_cell)
+            if token in matrix_row_ids
+        }
+        require(
+            named_matrix_rows == set(subsumed.rows),
+            (
+                f"{divergence_id} pins {sorted(subsumed.rows)} as the matrix rows it subsumes, "
+                f"but its Rows cell names {sorted(named_matrix_rows)}"
+            ),
+        )
+        require(
+            covering_id in cells[3],
+            f"{divergence_id} does not name the approved decision {covering_id} that subsumes it",
+        )
+        require_rendered_cell(cells[3], f"{divergence_id}'s Impact cell")
+        require_rendered_cell(
+            subsumed.impact_cell, f"{divergence_id}'s pinned Impact cell"
+        )
+        normalized_subsumed_pin = normalize_whitespace(subsumed.impact_cell)
+        # Runs before the whole-cell compare so that a narrowed pin is reported
+        # as a pin defect rather than as a document mismatch.
+        require(
+            covering_id in normalized_subsumed_pin,
+            (
+                f"{divergence_id}'s pinned decision text no longer names {covering_id} as the "
+                "approval that subsumes it, so the pin has been narrowed"
+            ),
+        )
+        normalized_subsumed_impact = normalize_whitespace(cells[3])
+        # Containment alone cannot detect a contradiction: the covering
+        # identifier can stay in place while an appended sentence revives the
+        # entry as blocking. The cell is the normative record, so it is compared
+        # whole.
+        require(
+            normalized_subsumed_impact == normalized_subsumed_pin,
+            (
+                f"{divergence_id}'s decision text no longer matches the audited subsumption "
+                "word for word; it is pinned whole because naming the covering decision and "
+                "then reversing the subsumption would satisfy every containment check. "
+                f"Expected:\n{normalized_subsumed_pin}\nFound:\n{normalized_subsumed_impact}"
+            ),
+        )
+        expected_approver = SUBSUMED_DIVERGENCE_APPROVER.format(covering=covering_id)
+        require_rendered_cell(cells[4], f"{divergence_id}'s Approver cell")
+        require_rendered_cell(expected_approver, f"{divergence_id}'s expected approver")
+        require(
+            cells[4] == expected_approver,
+            (
+                f"{divergence_id} is subsumed by {covering_id} and must record that it is not "
+                f"separately approved as exactly {expected_approver!r}, found {cells[4]!r}"
+            ),
+        )
+        expected_date = SUBSUMED_DIVERGENCE_DATE.format(
+            date=APPROVED_DIVERGENCES[covering_id].date.strip("*")
+        )
+        require_rendered_cell(cells[5], f"{divergence_id}'s Date cell")
+        require_rendered_cell(expected_date, f"{divergence_id}'s expected approval date")
+        require(
+            cells[5] == expected_date,
+            (
+                f"{divergence_id} is subsumed by {covering_id} and must carry the covering "
+                f"decision's date as exactly {expected_date!r}, found {cells[5]!r}"
+            ),
+        )
+
+    for divergence_id, cells in entries.items():
+        if divergence_id in APPROVED_DIVERGENCES or divergence_id in SUBSUMED_DIVERGENCES:
+            continue
+        # An unapproved entry renders "not approved" only if the marker reaches
+        # the reader; commenting the cell and the constant out together leaves
+        # the comparison equal while §26 shows a blank approval state.
+        require_rendered_cell(cells[4], f"{divergence_id}'s Approver cell")
+        require_rendered_cell(
+            UNAPPROVED_DIVERGENCE_APPROVER, "the unapproved-divergence approver marker"
+        )
+        require_rendered_cell(cells[5], f"{divergence_id}'s Date cell")
+        require_rendered_cell(
+            UNAPPROVED_DIVERGENCE_DATE, "the unapproved-divergence date marker"
+        )
+        require(
+            cells[4] == UNAPPROVED_DIVERGENCE_APPROVER,
+            (
+                f"{divergence_id} claims approver {cells[4]!r}; an approval must also be pinned "
+                "in APPROVED_DIVERGENCES in the same change"
+            ),
+        )
+        require(
+            cells[5] == UNAPPROVED_DIVERGENCE_DATE,
+            f"{divergence_id} is unapproved but carries the date {cells[5]!r}",
+        )
+
+    row_statuses = dict(rows)
+    for row_id, expected_status in EXPECTED_DIVERGENCE_EXCLUDED_ROWS.items():
+        actual = row_statuses.get(row_id)
+        require(
+            actual == expected_status,
+            (
+                f"{row_id} is excluded from the approved cluster-status divergence and must stay "
+                f"{expected_status!r}, found {actual!r}"
+            ),
+        )
+
+    pinned_approved_rows: set[str] = set()
+    for divergence_id, pins in APPROVED_DIVERGENCES.items():
+        collision = sorted(pinned_approved_rows & set(pins.rows))
+        require(
+            not collision,
+            f"{divergence_id} claims rows another approval already covers: "
+            f"{preview_row_ids(collision)}",
+        )
+        pinned_approved_rows.update(pins.rows)
+    contradiction = sorted(pinned_approved_rows & set(EXPECTED_DIVERGENCE_EXCLUDED_ROWS))
+    require(
+        not contradiction,
+        (
+            "rows are pinned as both approved and excluded from the approval: "
+            f"{preview_row_ids(contradiction)}"
+        ),
+    )
+
+    divergence_rows = {
+        row_id for row_id, status in rows if status == INTENTIONAL_DIVERGENCE_STATUS
+    }
+    unapproved_rows = set(EXPECTED_UNAPPROVED_DIVERGENCE_ROWS)
+    missing_unapproved = sorted(unapproved_rows - divergence_rows)
+    require(
+        not missing_unapproved,
+        (
+            "rows pinned as unapproved divergences no longer carry that status: "
+            f"{preview_row_ids(missing_unapproved)}"
+        ),
+    )
+
+    approved_rows = divergence_rows - unapproved_rows
+    require(
+        approved_rows == pinned_approved_rows,
+        (
+            "the approved cluster-status divergence row set drifted: "
+            f"{preview_row_ids(sorted(approved_rows ^ pinned_approved_rows))}"
+        ),
+    )
+    require(
+        len(pinned_approved_rows) == EXPECTED_APPROVED_DIVERGENCE_ROW_COUNT,
+        (
+            f"the pinned approvals cover {len(pinned_approved_rows)} rows, but the audited "
+            f"decision covers {EXPECTED_APPROVED_DIVERGENCE_ROW_COUNT}"
+        ),
+    )
+
+    behavior_section = extract_section_body(lines, APPROVAL_BEHAVIOR_SECTION_HEADING)
+    require(
+        bool(behavior_section),
+        (
+            "the section that must carry the approved divergence's normative behavior is "
+            f"missing: {APPROVAL_BEHAVIOR_SECTION_HEADING}"
+        ),
+    )
+    normalized_behavior_section = normalize_whitespace("\n".join(behavior_section))
+    behavior_fragments = list(EXPECTED_APPROVAL_BEHAVIOR_SNIPPETS)
+    for snippet in EXPECTED_APPROVAL_BEHAVIOR_SNIPPETS:
+        require(
+            snippet in normalized_behavior_section,
+            (
+                "the approved divergence no longer states its normative behavior in "
+                f"{APPROVAL_BEHAVIOR_SECTION_LABEL}: {snippet}"
+            ),
+        )
+    excluded_section_rows = sorted(
+        row_id
+        for row_id in EXPECTED_DIVERGENCE_EXCLUDED_ROWS
+        if row_id.startswith("SB-STAT-")
+    )
+    require(
+        len(excluded_section_rows) == 2,
+        (
+            "the approved divergence's scope sentence names exactly two excluded "
+            f"{APPROVAL_BEHAVIOR_SECTION_LABEL} rows, but "
+            f"{len(excluded_section_rows)} are pinned: {excluded_section_rows}"
+        ),
+    )
+    section_approvals = sorted(
+        divergence_id
+        for divergence_id, pins in APPROVED_DIVERGENCES.items()
+        if any(row_id.startswith("SB-STAT-") for row_id in pins.rows)
+    )
+    require(
+        len(section_approvals) == 1,
+        (
+            f"exactly one approved divergence may govern {APPROVAL_BEHAVIOR_SECTION_LABEL}, "
+            f"found {len(section_approvals)}: {section_approvals}"
+        ),
+    )
+    if len(excluded_section_rows) == 2 and len(section_approvals) == 1:
+        scope_prose = APPROVAL_SCOPE_PROSE.format(
+            decision=section_approvals[0],
+            count=EXPECTED_APPROVED_DIVERGENCE_ROW_COUNT,
+            first=excluded_section_rows[0],
+            second=excluded_section_rows[1],
+        )
+        require(
+            scope_prose in normalized_behavior_section,
+            (
+                f"{APPROVAL_BEHAVIOR_SECTION_LABEL} must state the approval's row scope in "
+                f"the approval's own terms, naming the excluded rows: {scope_prose}"
+            ),
+        )
+        permanence_prose = APPROVAL_PERMANENCE_PROSE.format(
+            count=EXPECTED_APPROVED_DIVERGENCE_ROW_COUNT,
+            decision=section_approvals[0],
+        )
+        require(
+            permanence_prose in normalized_behavior_section,
+            (
+                f"{APPROVAL_BEHAVIOR_SECTION_LABEL} must bind the permanent divergence "
+                f"status to the approved rows rather than to the whole section: "
+                f"{permanence_prose}"
+            ),
+        )
+        behavior_fragments += [scope_prose, permanence_prose]
+    # Every fragment above is a containment test, and containment cannot detect a
+    # contradiction: all of them can hold while a later sentence reverses them.
+    # §14 is explicitly normative, so its approval block is pinned whole. The pin
+    # is checked against the fragments first, so narrowing the pin is reported as
+    # a pin defect rather than as a document mismatch.
+    expected_behavior_preamble = APPROVAL_BEHAVIOR_PREAMBLE.format(revision=EXPECTED_REVISION)
+    for fragment in behavior_fragments:
+        require(
+            fragment in expected_behavior_preamble,
+            (
+                "APPROVAL_BEHAVIOR_PREAMBLE no longer states something "
+                f"{APPROVAL_BEHAVIOR_SECTION_LABEL} is required to say, so the pin has been "
+                f"narrowed: {fragment}"
+            ),
+        )
+    behavior_preamble = extract_section_preamble(lines, APPROVAL_BEHAVIOR_SECTION_HEADING)
+    require(
+        bool(behavior_preamble),
+        (
+            "the section that must carry the approved divergence's normative behavior has no "
+            f"prose above its table: {APPROVAL_BEHAVIOR_SECTION_HEADING}"
+        ),
+    )
+    require_rendered_prose(behavior_preamble, APPROVAL_BEHAVIOR_SECTION_LABEL)
+    normalized_behavior_preamble = normalize_whitespace("\n".join(behavior_preamble))
+    require(
+        normalized_behavior_preamble == expected_behavior_preamble,
+        (
+            f"{APPROVAL_BEHAVIOR_SECTION_LABEL}'s approval block no longer matches the "
+            "approved decision word for word; it is pinned whole because retaining every "
+            "required sentence and appending its opposite would satisfy every containment "
+            f"check. Expected:\n{expected_behavior_preamble}\n"
+            f"Found:\n{normalized_behavior_preamble}"
+        ),
+    )
+    decision_preamble = extract_section_preamble(lines, DIVERGENCE_DECISION_SECTION_HEADING)
+    require(
+        bool(decision_preamble),
+        (
+            "the section that must introduce the divergence decisions is missing or has no "
+            f"prose above its table: {DIVERGENCE_DECISION_SECTION_HEADING}"
+        ),
+    )
+    require_rendered_prose(decision_preamble, DIVERGENCE_DECISION_SECTION_LABEL)
+    normalized = normalize_whitespace("\n".join(decision_preamble))
+    decision_fragments: list[str] = []
+    for divergence_id, subsumed in SUBSUMED_DIVERGENCES.items():
+        dormant_prose = SUBSUMED_DIVERGENCE_GATE_PROSE.format(
+            divergence=divergence_id, covering=subsumed.covering
+        )
+        require(
+            dormant_prose in normalized,
+            (
+                f"§26's preamble does not carve {divergence_id} out of the blocking entries: "
+                f"{dormant_prose}"
+            ),
+        )
+        decision_fragments.append(dormant_prose)
+    proposed_count = len(entries) - len(APPROVED_DIVERGENCES) - len(SUBSUMED_DIVERGENCES)
+    split_prose = DIVERGENCE_DECISION_SPLIT_PROSE.format(
+        total=len(entries),
+        approved=len(APPROVED_DIVERGENCES),
+        subsumed=len(SUBSUMED_DIVERGENCES),
+        proposed=proposed_count,
+    )
+    require(
+        split_prose in normalized,
+        f"§26 does not state the decision split it lists: {split_prose}",
+    )
+    decision_fragments.append(split_prose)
+    carve_out_prose = PROPOSED_DIVERGENCE_CARVE_OUT_PROSE.format(
+        proposed=proposed_count,
+        approved_ids=", ".join(f"[{name}](#sec-26)" for name in sorted(APPROVED_DIVERGENCES)),
+        subsumed_ids=", ".join(f"[{name}](#sec-26)" for name in sorted(SUBSUMED_DIVERGENCES)),
+    )
+    require(
+        carve_out_prose in normalized,
+        (
+            "§26 describes entries as proposed without excluding the approved and subsumed "
+            f"decisions: {carve_out_prose}"
+        ),
+    )
+    decision_fragments.append(carve_out_prose)
+    # Collect the rows as well as the decisions. Listing only the decisions that
+    # intersect the unapproved rows would still pass if a decision stopped naming
+    # one of them while continuing to name another: SB-DIV-002 covers both
+    # SB-CFG-014 and SB-CFG-022, so dropping either leaves the decision matched.
+    # The prose claims all of these rows are already carried by a proposal, so
+    # the union of the rows the proposals name has to cover them.
+    proposals_over_unapproved_rows = []
+    rows_named_by_proposals: set[str] = set()
+    for divergence_id, cells in sorted(entries.items()):
+        if divergence_id in APPROVED_DIVERGENCES or divergence_id in SUBSUMED_DIVERGENCES:
+            continue
+        named = unapproved_rows & set(ROW_ID_RE.findall(cells[2]))
+        if not named:
+            continue
+        proposals_over_unapproved_rows.append(divergence_id)
+        rows_named_by_proposals |= named
+    unnamed_rows = unapproved_rows - rows_named_by_proposals
+    require(
+        not unnamed_rows,
+        (
+            f"§26 says the {len(unapproved_rows)} unapproved divergence rows are named by its "
+            f"proposals, but {', '.join(sorted(unnamed_rows))} is named by no proposed decision, "
+            "so there is nothing to approve that would lift the gate on it"
+        ),
+    )
+    # A proposal names the scope a maintainer is being asked to decide on. Left
+    # unpinned it could be repointed at unrelated rows under the same ID, and
+    # every later check would still pass whenever the substituted rows happen
+    # not to intersect the unapproved rows tracked above.
+    proposed_ids = set(entries) - set(APPROVED_DIVERGENCES) - set(SUBSUMED_DIVERGENCES)
+    for divergence_id in sorted(proposed_ids):
+        expected_cell = EXPECTED_PROPOSED_DIVERGENCE_ROW_CELLS.get(divergence_id)
+        require(
+            expected_cell is not None,
+            (
+                f"{divergence_id} is a proposed decision with no pinned Rows cell; add it to "
+                "EXPECTED_PROPOSED_DIVERGENCE_ROW_CELLS with the audited scope"
+            ),
+        )
+        if expected_cell is not None:
+            require_rendered_cell(
+                entries[divergence_id][2], f"{divergence_id}'s proposed Rows cell"
+            )
+            require_rendered_cell(
+                expected_cell, f"{divergence_id}'s pinned proposed Rows cell"
+            )
+            require(
+                entries[divergence_id][2] == expected_cell,
+                (
+                    f"{divergence_id} declares its rows as {entries[divergence_id][2]!r}, but "
+                    f"the audited proposal covers {expected_cell!r}; repointing a proposal "
+                    "needs a new entry, not an edit to an existing one"
+                ),
+            )
+    stale_proposal_pins = sorted(set(EXPECTED_PROPOSED_DIVERGENCE_ROW_CELLS) - proposed_ids)
+    require(
+        not stale_proposal_pins,
+        (
+            "proposed decisions are pinned that §26 no longer lists as proposed: "
+            f"{stale_proposal_pins}"
+        ),
+    )
+    effect_prose = PROPOSED_DIVERGENCE_EFFECT_PROSE.format(
+        already=len(unapproved_rows),
+        status=INTENTIONAL_DIVERGENCE_STATUS,
+        already_ids=", ".join(proposals_over_unapproved_rows),
+    )
+    require(
+        effect_prose in normalized,
+        (
+            "§26 claims every proposal reclassifies a row, but the unapproved rows already "
+            f"carry the status: {effect_prose}"
+        ),
+    )
+    decision_fragments.append(effect_prose)
+    approved_prose = (
+        f"**{len(divergence_rows)} matrix rows currently carry the "
+        f"`{INTENTIONAL_DIVERGENCE_STATUS}` status: {len(approved_rows)} are approved and "
+        f"{len(unapproved_rows)} are not.**"
+    )
+    require(
+        approved_prose in normalized,
+        f"§26 does not reconcile approved and unapproved divergences: {approved_prose}",
+    )
+    decision_fragments.append(approved_prose)
+    # Same reasoning as §14: the preamble is normative and generated from the
+    # parsed table, so retaining every generated sentence and appending a claim
+    # that contradicts the table would pass every check above. Pin it whole,
+    # after checking that the pin still contains everything it must guarantee.
+    for fragment in decision_fragments:
+        require(
+            fragment in DIVERGENCE_DECISION_PREAMBLE,
+            (
+                "DIVERGENCE_DECISION_PREAMBLE no longer states something "
+                f"{DIVERGENCE_DECISION_SECTION_LABEL} is required to say, so the pin has "
+                f"been narrowed: {fragment}"
+            ),
+        )
+    require(
+        normalized == DIVERGENCE_DECISION_PREAMBLE,
+        (
+            f"{DIVERGENCE_DECISION_SECTION_LABEL}'s preamble no longer matches the audited "
+            "text; it is pinned whole because retaining every generated sentence and "
+            "appending a contradiction would satisfy every containment check. Expected:\n"
+            f"{DIVERGENCE_DECISION_PREAMBLE}\nFound:\n{normalized}"
+        ),
+    )
+
+
+def validate_manifest_citations(full_text: str) -> None:
+    """Keep the document's manifest citations pointing at files that exist.
+
+    A revision bump renames both manifests, so any citation left on the previous
+    revision's filename becomes a dangling normative evidence link. The names are
+    derived from EXPECTED_REVISION, so this check moves with it automatically.
+    """
+    expected = {
+        "rows": EXPECTED_ROW_MANIFEST.name,
+        "cabi-symbols": EXPECTED_C_ABI_SYMBOL_MANIFEST.name,
+    }
+    for match in MANIFEST_CITATION_RE.finditer(full_text):
+        cited = match.group(0).removeprefix("docs/")
+        require(
+            cited == expected[match.group("kind")],
+            (
+                f"the document cites the manifest docs/{cited}, but revision "
+                f"{EXPECTED_REVISION} ships docs/{expected[match.group('kind')]}; a revision "
+                "bump renames the manifests, so every citation has to move with them"
+            ),
+        )
+
+
 def validate_counts(lines: list[str], full_text: str) -> None:
     metadata = parse_metadata(lines)
     for field, expected_value in EXPECTED_METADATA_FIELDS.items():
@@ -1570,12 +3091,15 @@ def validate_counts(lines: list[str], full_text: str) -> None:
             snippet in document_status,
             f"document status is missing expected detail: {snippet}",
         )
+    validate_manifest_citations(full_text)
 
     status_counts, prefix_counts, rows = parse_rows(lines)
     total_rows = len(rows)
     require(sum(status_counts.values()) == total_rows, f"expected {total_rows} rows, found {sum(status_counts.values())}")
     validate_revision_inventory(rows, status_counts, prefix_counts)
     validate_gap_completion_consistency(lines, rows)
+    validate_divergence_approvals(lines, rows)
+    validate_cluster_status_ledger_scope(lines, rows)
 
     metadata_total_rows, metadata_required_rows = parse_rows_metadata(metadata.get("Rows", ""))
     require(
@@ -1644,32 +3168,49 @@ def validate_counts(lines: list[str], full_text: str) -> None:
             f"category summary total says {declared} rows for {status}, but parsed {actual}",
         )
 
-    validate_status_narratives(full_text, status_counts, prefix_counts)
+    validate_status_narratives(lines, status_counts, prefix_counts)
     validate_c_abi_symbol_inventory(full_text)
     validate_c_abi_free_inventory(full_text)
 
 
 def validate_status_narratives(
-    full_text: str,
+    lines: Sequence[str],
     status_counts: Counter[str],
     prefix_counts: dict[str, Counter[str]],
 ) -> None:
-    normalized = normalize_whitespace(full_text)
     total_rows = sum(status_counts.values())
     required_rows = total_rows - status_counts[NOT_REQUIRED_STATUS]
     python_visible_behavior = status_counts["Behavior mismatch"] - prefix_counts["SB-CXX"]["Behavior mismatch"]
 
+    approved_divergences = (
+        status_counts[INTENTIONAL_DIVERGENCE_STATUS]
+        - len(EXPECTED_UNAPPROVED_DIVERGENCE_ROWS)
+    )
+    satisfied = status_counts["Covered"] + approved_divergences
+
     expected_phrases = [
-        f"As of revision {EXPECTED_REVISION} that is {required_rows} of {total_rows} rows, and **only {status_counts['Covered']} are satisfied** ([SB-XCUT-012](#sec-20), the twelve configuration/topology rows in [§6](#sec-6), the 31 RFile/stream rows in [§15](#sec-15), the 17 data-model value rows in [§8](#sec-8) and [§19.2](#sec-19-2), the four buffered-writer rows in [§10](#sec-10), the four row-bounded flush/constraint rows in [§11](#sec-11) and [§19.2](#sec-19-2), the connector invalidation/cancellation rows in [§7](#sec-7) and [§20](#sec-20), the eight high-level client rows in [§10.1](#sec-10-1), the five high-level scanner rows in [§10.1](#sec-10-1), and the four compatibility-error rows in [§18](#sec-18))",
-        f"{required_rows} rows are **required** by the final release gate ([§2.2](#sec-2)); the {status_counts[NOT_REQUIRED_STATUS]} `Not required` rows are excluded by construction, and {prefix_counts['SB-CXX'][NOT_REQUIRED_STATUS]} of those are the evidence-proved duplicates described in [§19.1](#sec-19-1).",
-        "**Exactly 88 rows are `Covered`: [SB-XCUT-012](#sec-20), the twelve configuration/topology rows completed in revision 24, the 31 RFile/stream rows completed in revision 25, the 17 data-model value rows completed in revision 26, the four buffered-writer rows completed in revision 28, the four row-bounded flush/constraint rows completed in revision 29, the connector invalidation/cancellation rows completed in revision 30, the eight high-level client rows completed in revision 31, the five high-level scanner rows completed in revision 32, and the four compatibility-error rows completed in revision 34.**",
-        f"The shape of the work is visible in the {status_counts['Missing Go']} `Missing Go` rows, of which {prefix_counts['SB-CXX']['Missing Go']} are the C++ members in [§19.2](#sec-19-2) that no Shoal layer exports.",
-        f"`Behavior mismatch` ({status_counts['Behavior mismatch']}) is the bucket that sets the schedule: {python_visible_behavior} rows on the Python-visible and curated C++ surface each need a differential test against a live cluster or the exported ABI, and {prefix_counts['SB-CXX']['Behavior mismatch']} are destructors of classes bound into Python, where the destruction point is user-observable and the model differs from Go finalisation ([§19.1](#sec-19-1)).",
-        f"`Intentional divergence` ({status_counts[INTENTIONAL_DIVERGENCE_STATUS]}) is dominated by one upstream fact: {prefix_counts['SB-STAT'][INTENTIONAL_DIVERGENCE_STATUS]} rows are cluster-status accessors Accumulo itself deleted ([§14](#sec-14), [SB-DIV-016](#sec-26)).",
-        f"`Missing C ABI` ({status_counts['Missing C ABI']}) is now led by pandas ({prefix_counts['SB-PANDA']['Missing C ABI']}), high-level helpers ({prefix_counts['SB-BASE']['Missing C ABI']}), packaging/import scaffolding ({prefix_counts['SB-PKG']['Missing C ABI']}), PyTorch ({prefix_counts['SB-TORCH']['Missing C ABI']}), the scanner cursor ({prefix_counts['SB-SCAN']['Missing C ABI']}), the visibility expression surface (30), and the remaining data-model row ({prefix_counts['SB-DATA']['Missing C ABI']}).",
+        (RELEASE_GATE_SECTION_HEADING, f"As of revision {EXPECTED_REVISION} that is {required_rows} of {total_rows} rows, and **{satisfied} are satisfied**: {status_counts['Covered']} are `Covered` ([SB-XCUT-012](#sec-20), the twelve configuration/topology rows in [§6](#sec-6), the 31 RFile/stream rows in [§15](#sec-15), the 17 data-model value rows in [§8](#sec-8) and [§19.2](#sec-19-2), the four buffered-writer rows in [§10](#sec-10), the four row-bounded flush/constraint rows in [§11](#sec-11) and [§19.2](#sec-19-2), the connector invalidation/cancellation rows in [§7](#sec-7) and [§20](#sec-20), the eight high-level client rows in [§10.1](#sec-10-1), the five high-level scanner rows in [§10.1](#sec-10-1), the four compatibility-error rows in [§18](#sec-18), the twelve streaming cursor rows in [§9](#sec-9), [§10.1](#sec-10-1), [§19.2](#sec-19-2), and [§20](#sec-20), and the 31 column-visibility rows in [§18](#sec-18) and [§19.2](#sec-19-2)) and {approved_divergences} are approved intentional divergences ([SB-DIV-016](#sec-26)), which record a permanent capability loss rather than delivered compatibility."),
+        (COUNTS_SECTION_HEADING, f"{required_rows} rows are **required** by the final release gate ([§2.2](#sec-2)); the {status_counts[NOT_REQUIRED_STATUS]} `Not required` rows are excluded by construction, and {prefix_counts['SB-CXX'][NOT_REQUIRED_STATUS]} of those are the evidence-proved duplicates described in [§19.1](#sec-19-1)."),
+        (COUNTS_SECTION_HEADING, "**Exactly 131 rows are `Covered`: [SB-XCUT-012](#sec-20), the twelve configuration/topology rows completed in revision 24, the 31 RFile/stream rows completed in revision 25, the 17 data-model value rows completed in revision 26, the four buffered-writer rows completed in revision 28, the four row-bounded flush/constraint rows completed in revision 29, the connector invalidation/cancellation rows completed in revision 30, the eight high-level client rows completed in revision 31, the five high-level scanner rows completed in revision 32, the four compatibility-error rows completed in revision 34, the twelve streaming cursor rows completed in revision 36, and the 31 column-visibility rows completed in revision 38.**"),
+        (COUNTS_SECTION_HEADING, f"The shape of the work is visible in the {status_counts['Missing Go']} `Missing Go` rows, of which {prefix_counts['SB-CXX']['Missing Go']} are the C++ members in [§19.2](#sec-19-2) that no Shoal layer exports."),
+        (COUNTS_SECTION_HEADING, f"`Behavior mismatch` ({status_counts['Behavior mismatch']}) is the bucket that sets the schedule: {python_visible_behavior} rows on the Python-visible and curated C++ surface each need a differential test against a live cluster or the exported ABI, and {prefix_counts['SB-CXX']['Behavior mismatch']} are destructors of classes bound into Python, where the destruction point is user-observable and the model differs from Go finalisation ([§19.1](#sec-19-1))."),
+        (COUNTS_SECTION_HEADING, f"`Intentional divergence` ({status_counts[INTENTIONAL_DIVERGENCE_STATUS]}) is dominated by one upstream fact: {prefix_counts['SB-STAT'][INTENTIONAL_DIVERGENCE_STATUS]} rows are cluster-status accessors Accumulo itself deleted ([§14](#sec-14), [SB-DIV-016](#sec-26))."),
+        (COUNTS_SECTION_HEADING, f"`Missing C ABI` ({status_counts['Missing C ABI']}) is now led by the key value API (36), the tablet extent (16), pandas ({prefix_counts['SB-PANDA']['Missing C ABI']}), packaging/import scaffolding ({prefix_counts['SB-PKG']['Missing C ABI']}), PyTorch ({prefix_counts['SB-TORCH']['Missing C ABI']}), the remaining scanner rows ({prefix_counts['SB-SCAN']['Missing C ABI']}), and the remaining data-model row ({prefix_counts['SB-DATA']['Missing C ABI']})."),
     ]
-    for phrase in expected_phrases:
-        require(phrase in normalized, f"missing or stale status narrative: {phrase}")
+    section_text: dict[str, str] = {}
+    for heading, phrase in expected_phrases:
+        if heading not in section_text:
+            body = extract_section_body(lines, heading)
+            require(
+                bool(body),
+                f"the section that must carry a normative status narrative is missing: {heading}",
+            )
+            require_rendered_prose(body, heading)
+            section_text[heading] = normalize_whitespace("\n".join(body))
+        require(
+            phrase in section_text[heading],
+            f"missing or stale status narrative in {heading}: {phrase}",
+        )
 
 
 def validate_local_line_number_removal(full_text: str) -> None:

@@ -239,6 +239,20 @@ func shoal_error_security_code(err *C.shoal_error) *C.char {
 	return C.shoal_bridge_error_security_code(err)
 }
 
+//export shoal_error_visibility_parse
+func shoal_error_visibility_parse(err *C.shoal_error, out *C.shoal_visibility_parse_error_view) C.shoal_status {
+	if err == nil || out == nil {
+		return C.SHOAL_STATUS_INVALID_ARGUMENT
+	}
+	if uint64(out.struct_size) < uint64(C.SHOAL_VISIBILITY_PARSE_ERROR_VIEW_V1_SIZE) {
+		return C.SHOAL_STATUS_INVALID_ARGUMENT
+	}
+	if C.shoal_bridge_error_visibility_parse(err, out) == 0 {
+		return C.SHOAL_STATUS_NOT_FOUND
+	}
+	return C.SHOAL_STATUS_OK
+}
+
 //export shoal_error_source
 func shoal_error_source(err *C.shoal_error) C.shoal_error_source_class {
 	return C.shoal_bridge_error_source(err)
@@ -484,6 +498,10 @@ func bridgeErrorAlloc(code C.shoal_status, err error) *C.shoal_error {
 	message := ""
 	user := ""
 	securityCode := ""
+	visibilityTerms := []byte(nil)
+	visibilityReason := ""
+	visibilityOffset := 0
+	hasVisibilityParse := false
 	if err != nil {
 		message = err.Error()
 		var securityErr *accumulo.SecurityError
@@ -491,8 +509,21 @@ func bridgeErrorAlloc(code C.shoal_status, err error) *C.shoal_error {
 			user = securityErr.User
 			securityCode = securityErr.Code
 		}
+		var visibilityErr *accumulo.VisibilityParseError
+		if errors.As(err, &visibilityErr) {
+			visibilityTerms = visibilityErr.Terms
+			visibilityReason = visibilityErr.Reason
+			if visibilityErr.Offset >= 0 {
+				visibilityOffset = visibilityErr.Offset
+			}
+			hasVisibilityParse = true
+		}
 	}
 	source, compatibility := compatibilityClassesForStatus(int32(code))
+	if errors.Is(err, accumulo.ErrVisibilityParse) {
+		source = errorSourceVisibilityParseException
+		compatibility = errorCompatibilityClientException
+	}
 	return C.shoal_bridge_error_alloc(
 		code,
 		C.shoal_error_source_class(source),
@@ -503,6 +534,12 @@ func bridgeErrorAlloc(code C.shoal_status, err error) *C.shoal_error {
 		C.size_t(len(user)),
 		cStringData(securityCode),
 		C.size_t(len(securityCode)),
+		(*C.uint8_t)(bytePointer(visibilityTerms)),
+		C.size_t(len(visibilityTerms)),
+		cStringData(visibilityReason),
+		C.size_t(len(visibilityReason)),
+		C.size_t(visibilityOffset),
+		boolToCUint8(hasVisibilityParse),
 	)
 }
 
@@ -511,6 +548,7 @@ const (
 	errorSourceClientException               int32 = 1
 	errorSourceIllegalStateException         int32 = 2
 	errorSourceIterationInterruptedException int32 = 3
+	errorSourceVisibilityParseException      int32 = 4
 
 	errorCompatibilityRuntimeError    int32 = 0
 	errorCompatibilityClientException int32 = 1

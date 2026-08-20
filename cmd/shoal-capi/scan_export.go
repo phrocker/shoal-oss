@@ -821,13 +821,16 @@ func statusForError(err error) C.shoal_status {
 		return C.SHOAL_STATUS_CANCELLED
 	case errors.Is(err, accumulo.ErrConnectorClosed):
 		return C.SHOAL_STATUS_CLOSED
+	case errors.Is(err, accumulo.ErrStreamClosed):
+		return C.SHOAL_STATUS_CLOSED
 	case errors.Is(err, publicrfile.ErrClosed):
 		return C.SHOAL_STATUS_CLOSED
 	case errors.Is(err, publicrfile.ErrNoTop):
 		return C.SHOAL_STATUS_NOT_FOUND
 	case errors.Is(err, publicrfile.ErrInvalidSeekable),
 		errors.Is(err, publicrfile.ErrInvalidPath),
-		errors.Is(err, publicrfile.ErrOutOfOrder):
+		errors.Is(err, publicrfile.ErrOutOfOrder),
+		errors.Is(err, accumulo.ErrVisibilityParse):
 		return C.SHOAL_STATUS_INVALID_ARGUMENT
 	case errors.Is(err, publicrfile.ErrUnsupportedCodec),
 		errors.Is(err, publicrfile.ErrLocalityGroupUnsupported):

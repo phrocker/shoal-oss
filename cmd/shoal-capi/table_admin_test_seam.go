@@ -21,6 +21,37 @@ import (
 	"github.com/phrocker/shoal/accumulo"
 )
 
+type testSeamScanCursor struct {
+	ctx     context.Context
+	entries []accumulo.KeyValue
+	index   int
+	current accumulo.KeyValue
+	err     error
+	block   bool
+}
+
+func (c *testSeamScanCursor) Next() bool {
+	if c.block {
+		<-c.ctx.Done()
+		c.err = c.ctx.Err()
+		return false
+	}
+	if err := c.ctx.Err(); err != nil {
+		c.err = err
+		return false
+	}
+	if c.index >= len(c.entries) {
+		return false
+	}
+	c.current = c.entries[c.index]
+	c.index++
+	return true
+}
+
+func (c *testSeamScanCursor) Entry() accumulo.KeyValue { return c.current }
+func (c *testSeamScanCursor) Err() error               { return c.err }
+func (c *testSeamScanCursor) Close() error             { return nil }
+
 type testAdminConnector struct {
 	mu                     sync.Mutex
 	nextID                 int
@@ -820,6 +851,66 @@ func shoal_test_connector_create(outConnector **C.shoal_connector) C.int {
 	return 1
 }
 
+//export shoal_test_scanners_create
+func shoal_test_scanners_create(
+	outScanner **C.shoal_scanner,
+	outBatchScanner **C.shoal_batch_scanner,
+) C.int {
+	if outScanner == nil || outBatchScanner == nil {
+		return 0
+	}
+	*outScanner = nil
+	*outBatchScanner = nil
+
+	single := newOwnedScanner(nil, nil, nil)
+	single.streamOne = func(ctx context.Context, _ *accumulo.Range) (scanCursorSource, error) {
+		return &testSeamScanCursor{
+			ctx: ctx,
+			entries: []accumulo.KeyValue{
+				{Key: accumulo.Key{Row: []byte("single")}, Value: []byte("1")},
+			},
+		}, nil
+	}
+	singleID, ok := scanners.add(single)
+	if !ok {
+		return 0
+	}
+	singleHandle := C.shoal_bridge_scanner_alloc(C.uint64_t(singleID))
+	if singleHandle == nil {
+		scanners.remove(singleID)
+		return 0
+	}
+
+	batch := newOwnedScanner(nil, nil, nil)
+	batch.streamMany = func(ctx context.Context, ranges []*accumulo.Range) (scanCursorSource, error) {
+		entries := make([]accumulo.KeyValue, len(ranges))
+		for index := range ranges {
+			entries[index] = accumulo.KeyValue{
+				Key:   accumulo.Key{Row: []byte("batch"), Timestamp: int64(index)},
+				Value: []byte{byte(index)},
+			}
+		}
+		return &testSeamScanCursor{ctx: ctx, entries: entries}, nil
+	}
+	batchID, ok := batchScanners.add(batch)
+	if !ok {
+		scanners.remove(singleID)
+		C.shoal_bridge_scanner_free(singleHandle)
+		return 0
+	}
+	batchHandle := C.shoal_bridge_batch_scanner_alloc(C.uint64_t(batchID))
+	if batchHandle == nil {
+		batchScanners.remove(batchID)
+		scanners.remove(singleID)
+		C.shoal_bridge_scanner_free(singleHandle)
+		return 0
+	}
+
+	*outScanner = singleHandle
+	*outBatchScanner = batchHandle
+	return 1
+}
+
 //export shoal_test_client_create
 func shoal_test_client_create(outClient **C.shoal_client) C.int {
 	if outClient == nil {
@@ -864,6 +955,42 @@ func shoal_test_client_create(outClient **C.shoal_client) C.int {
 			}
 		}
 		return values, nil
+	}
+	client.streamOne = func(
+		ctx context.Context,
+		_ clientSnapshot,
+		scanRange *accumulo.Range,
+	) (scanCursorSource, error) {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		block := string(scanRange.StartRow()) == "block"
+		return &testSeamScanCursor{
+			ctx:   ctx,
+			block: block,
+			entries: []accumulo.KeyValue{
+				{Key: accumulo.Key{Row: []byte("one"), Timestamp: 1}, Value: []byte("1")},
+				{Key: accumulo.Key{Row: []byte("two"), Timestamp: 2}, Value: []byte("2")},
+				{Key: accumulo.Key{Row: []byte("three"), Timestamp: 3}, Value: []byte("3")},
+			},
+		}, nil
+	}
+	client.streamMany = func(
+		ctx context.Context,
+		_ clientSnapshot,
+		ranges []*accumulo.Range,
+	) (scanCursorSource, error) {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		values := make([]accumulo.KeyValue, len(ranges))
+		for index := range ranges {
+			values[index] = accumulo.KeyValue{
+				Key:   accumulo.Key{Row: []byte("many"), Timestamp: int64(index)},
+				Value: []byte{byte(index)},
+			}
+		}
+		return &testSeamScanCursor{ctx: ctx, entries: values}, nil
 	}
 	id, ok := clients.add(client)
 	if !ok {

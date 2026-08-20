@@ -120,7 +120,7 @@ func TestDialCoordinator_BoundsRPCAgainstSilentCoordinator(t *testing.T) {
 			security.NewTCredentials(),
 			"shoal_default",
 			"compactor-1:9810",
-			"ECID:00000000-0000-0000-0000-000000000000",
+			"ECID-00000000-0000-0000-0000-000000000000",
 		)
 		rpcErr <- err
 	}()

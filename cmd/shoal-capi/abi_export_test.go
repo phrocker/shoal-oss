@@ -9,11 +9,11 @@ import (
 const (
 	testABIVersionCompatibility = 1
 	testABIVersionMajor         = 1
-	testABIVersionMinor         = 12
+	testABIVersionMinor         = 14
 	testABIVersionPatch         = 0
-	testABIVersionPacked        = 0x00010c00
-	testABICapabilityCount      = 24
-	testABICapabilityWord0      = 0x0000000000ffffff
+	testABIVersionPacked        = 0x00010e00
+	testABICapabilityCount      = 26
+	testABICapabilityWord0      = 0x0000000003ffffff
 )
 
 func TestABIDiscoveryValues(t *testing.T) {
@@ -109,7 +109,9 @@ func TestABIDiscoveryQueriesAreConcurrentAndStable(t *testing.T) {
 					!abiHasCapability(21) ||
 					!abiHasCapability(22) ||
 					!abiHasCapability(23) ||
-					abiHasCapability(24) ||
+					!abiHasCapability(24) ||
+					!abiHasCapability(25) ||
+					abiHasCapability(26) ||
 					abiHasCapability(64) {
 					report("capability support changed")
 					return

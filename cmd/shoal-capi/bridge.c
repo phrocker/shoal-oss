@@ -123,31 +123,6 @@ void shoal_bridge_configuration_free(shoal_configuration *configuration) {
   }
 }
 
-#define SHOAL_BRIDGE_DEFINE_HANDLE(name, type)                               \
-    type *shoal_bridge_##name##_alloc(uint64_t id) {                           \
-      type *value = (type *)malloc(sizeof(*value));                            \
-      if (value != NULL) {                                                     \
-        value->id = id;                                                        \
-      }                                                                        \
-      return value;                                                            \
-    }                                                                          \
-    uint64_t shoal_bridge_##name##_id(const type *value) {                     \
-      return value == NULL ? 0 : value->id;                                    \
-    }                                                                          \
-    void shoal_bridge_##name##_free(type *value) {                             \
-      if (value != NULL) {                                                     \
-        value->id = 0;                                                         \
-        free(value);                                                           \
-      }                                                                        \
-    }
-
-SHOAL_BRIDGE_DEFINE_HANDLE(rfile_reader, shoal_rfile_reader)
-SHOAL_BRIDGE_DEFINE_HANDLE(rfile_writer, shoal_rfile_writer)
-SHOAL_BRIDGE_DEFINE_HANDLE(rfile_seekable, shoal_rfile_seekable)
-SHOAL_BRIDGE_DEFINE_HANDLE(authorizations, shoal_authorizations)
-
-#undef SHOAL_BRIDGE_DEFINE_HANDLE
-
 #ifdef SHOAL_CAPI_TEST
 static _Atomic size_t shoal_bridge_string_alloc_fail_after = SIZE_MAX;
 static _Atomic size_t shoal_bridge_result_alloc_fail_after = SIZE_MAX;
@@ -179,6 +154,36 @@ static int shoal_bridge_allocation_allowed(_Atomic size_t *fail_after) {
 #else
 #define SHOAL_BRIDGE_TEST_ALLOC_GUARD(counter) do { } while (0)
 #endif
+
+#define SHOAL_BRIDGE_DEFINE_HANDLE(name, type)                                \
+  type *shoal_bridge_##name##_alloc(uint64_t id) {                            \
+    SHOAL_BRIDGE_TEST_ALLOC_GUARD(shoal_bridge_result_alloc_fail_after);      \
+    type *value = (type *)malloc(sizeof(*value));                             \
+    if (value != NULL) {                                                      \
+      value->id = id;                                                         \
+    }                                                                         \
+    return value;                                                             \
+  }                                                                           \
+  uint64_t shoal_bridge_##name##_id(const type *value) {                      \
+    return value == NULL ? 0 : value->id;                                     \
+  }                                                                           \
+  void shoal_bridge_##name##_free(type *value) {                              \
+    if (value != NULL) {                                                      \
+      value->id = 0;                                                          \
+      free(value);                                                            \
+    }                                                                         \
+  }
+
+SHOAL_BRIDGE_DEFINE_HANDLE(rfile_reader, shoal_rfile_reader)
+SHOAL_BRIDGE_DEFINE_HANDLE(rfile_writer, shoal_rfile_writer)
+SHOAL_BRIDGE_DEFINE_HANDLE(rfile_seekable, shoal_rfile_seekable)
+SHOAL_BRIDGE_DEFINE_HANDLE(authorizations, shoal_authorizations)
+SHOAL_BRIDGE_DEFINE_HANDLE(column_visibility, shoal_column_visibility)
+SHOAL_BRIDGE_DEFINE_HANDLE(visibility_node, shoal_visibility_node)
+SHOAL_BRIDGE_DEFINE_HANDLE(node_expression, shoal_node_expression)
+SHOAL_BRIDGE_DEFINE_HANDLE(visibility_evaluator, shoal_visibility_evaluator)
+
+#undef SHOAL_BRIDGE_DEFINE_HANDLE
 
 char *shoal_bridge_string_alloc(const char *value, size_t length) {
   if ((value == NULL && length != 0) || length == SIZE_MAX) {
@@ -1940,17 +1945,45 @@ void shoal_bridge_bytes_list_free(shoal_bytes_list_result *result) {
   free(result);
 }
 
+shoal_scan_cursor *shoal_bridge_scan_cursor_alloc(uint64_t id) {
+  SHOAL_BRIDGE_TEST_ALLOC_GUARD(shoal_bridge_result_alloc_fail_after);
+  shoal_scan_cursor *cursor =
+      (shoal_scan_cursor *)calloc(1, sizeof(*cursor));
+  if (cursor != NULL) {
+    cursor->id = id;
+  }
+  return cursor;
+}
+
+uint64_t shoal_bridge_scan_cursor_id(const shoal_scan_cursor *cursor) {
+  return cursor == NULL ? 0 : cursor->id;
+}
+
+void shoal_bridge_scan_cursor_free(shoal_scan_cursor *cursor) {
+  if (cursor != NULL) {
+    cursor->id = 0;
+    free(cursor);
+  }
+}
+
 shoal_error *shoal_bridge_error_alloc(
     shoal_status code, shoal_error_source_class source,
     shoal_error_compatibility_class compatibility, const char *message,
     size_t message_length,
     const char *security_user, size_t security_user_length,
-    const char *security_code, size_t security_code_length) {
+    const char *security_code, size_t security_code_length,
+    const uint8_t *visibility_terms, size_t visibility_terms_length,
+    const char *visibility_reason, size_t visibility_reason_length,
+    size_t visibility_offset, uint8_t has_visibility_parse) {
   if ((message == NULL && message_length != 0) || message_length == SIZE_MAX ||
       (security_user == NULL && security_user_length != 0) ||
       security_user_length == SIZE_MAX ||
       (security_code == NULL && security_code_length != 0) ||
-      security_code_length == SIZE_MAX) {
+      security_code_length == SIZE_MAX ||
+      (visibility_terms == NULL && visibility_terms_length != 0) ||
+      visibility_terms_length == SIZE_MAX ||
+      (visibility_reason == NULL && visibility_reason_length != 0) ||
+      visibility_reason_length == SIZE_MAX) {
     return NULL;
   }
   SHOAL_BRIDGE_TEST_ALLOC_GUARD(shoal_bridge_error_alloc_fail_after);
@@ -1969,11 +2002,18 @@ shoal_error *shoal_bridge_error_alloc(
   error->message = (char *)malloc(message_length + 1);
   error->security_user = (char *)malloc(security_user_length + 1);
   error->security_code = (char *)malloc(security_code_length + 1);
+  error->visibility_terms =
+      (uint8_t *)malloc(visibility_terms_length == 0 ? 1
+                                                     : visibility_terms_length);
+  error->visibility_reason = (char *)malloc(visibility_reason_length + 1);
   if (error->message == NULL || error->security_user == NULL ||
-      error->security_code == NULL) {
+      error->security_code == NULL || error->visibility_terms == NULL ||
+      error->visibility_reason == NULL) {
     free(error->message);
     free(error->security_user);
     free(error->security_code);
+    free(error->visibility_terms);
+    free(error->visibility_reason);
     free(error);
     return NULL;
   }
@@ -1986,9 +2026,20 @@ shoal_error *shoal_bridge_error_alloc(
   if (security_code_length != 0) {
     memcpy(error->security_code, security_code, security_code_length);
   }
+  if (visibility_terms_length != 0) {
+    memcpy(error->visibility_terms, visibility_terms, visibility_terms_length);
+  }
+  if (visibility_reason_length != 0) {
+    memcpy(error->visibility_reason, visibility_reason,
+           visibility_reason_length);
+  }
   error->message[message_length] = '\0';
   error->security_user[security_user_length] = '\0';
   error->security_code[security_code_length] = '\0';
+  error->visibility_reason[visibility_reason_length] = '\0';
+  error->visibility_terms_length = visibility_terms_length;
+  error->visibility_offset = visibility_offset;
+  error->has_visibility_parse = has_visibility_parse;
   error->code = code;
   error->source = source;
   error->compatibility = compatibility;
@@ -2028,6 +2079,8 @@ const char *shoal_bridge_error_source_name(const shoal_error *error) {
     return "IllegalStateException";
   case SHOAL_ERROR_SOURCE_ITERATION_INTERRUPTED_EXCEPTION:
     return "IterationInterruptedException";
+  case SHOAL_ERROR_SOURCE_VISIBILITY_PARSE_EXCEPTION:
+    return "VisibilityParseException";
   default:
     return "RuntimeError";
   }
@@ -2046,14 +2099,34 @@ const char *shoal_bridge_error_compatibility_name(const shoal_error *error) {
              : "RuntimeError";
 }
 
+int shoal_bridge_error_visibility_parse(
+    const shoal_error *error, shoal_visibility_parse_error_view *out_details) {
+  if (error == NULL || out_details == NULL ||
+      out_details->struct_size < SHOAL_VISIBILITY_PARSE_ERROR_VIEW_V1_SIZE ||
+      !error->has_visibility_parse) {
+    return 0;
+  }
+  out_details->terms.data = error->visibility_terms_length == 0
+                                ? NULL
+                                : error->visibility_terms;
+  out_details->terms.length = error->visibility_terms_length;
+  out_details->reason = error->visibility_reason;
+  out_details->offset = error->visibility_offset;
+  return 1;
+}
+
 void shoal_bridge_error_free(shoal_error *error) {
   if (error != NULL) {
     free(error->message);
     free(error->security_user);
     free(error->security_code);
+    free(error->visibility_terms);
+    free(error->visibility_reason);
     error->message = NULL;
     error->security_user = NULL;
     error->security_code = NULL;
+    error->visibility_terms = NULL;
+    error->visibility_reason = NULL;
     free(error);
   }
 }

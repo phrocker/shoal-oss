@@ -97,7 +97,7 @@ func (w *Writer) Append(ctx context.Context, entry Entry) error {
 		return w.appendErr
 	}
 	key := internalKey(entry.Key)
-	key.Deleted = entry.Deleted
+	key.Deleted = entry.Deleted || entry.Key.Deleted
 	if w.lastKey != nil && compareKeys(key, w.lastKey) <= 0 {
 		return fmt.Errorf(
 			"%w: %q after %q",

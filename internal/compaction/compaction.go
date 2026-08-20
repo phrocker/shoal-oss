@@ -97,6 +97,32 @@ type Spec struct {
 	// writer so the compacted RFile carries a shoal.adjacency out-edge
 	// index for cells in this column family. Empty disables it.
 	AdjacencyEdgeCF string
+
+	// MaxOutputBytes caps the output RFile image Compact will retain,
+	// in bytes. Zero means unlimited.
+	//
+	// This exists because an input-side budget cannot bound the
+	// composer's footprint. Compact holds the whole output in memory,
+	// and the output is not bounded by the inputs' on-disk size:
+	//
+	//   - inputs arrive with their blocks compressed, and Codec "none"
+	//     rewrites them uncompressed, so the image can grow by whatever
+	//     ratio the input codec achieved;
+	//   - a stack may emit more cells than it consumes.
+	//     LatentEdgeDiscoveryIterator is the in-tree example: it buffers
+	//     vertices and emits link cells that were in no input.
+	//
+	// Enforcement is at the write boundary: a write that would take the
+	// image over the cap is refused before the buffer grows, so the
+	// image itself never exceeds it. Checking after the fact would not
+	// be equivalent — one cell can be arbitrarily larger than BlockSize,
+	// so a single flush can carry an unbounded amount of data.
+	//
+	// What this does not cover is memory the writer holds outside the
+	// image: the pending, uncompressed data block (BlockSize, or one
+	// oversized cell) and the in-memory index levels. Size the budget
+	// with that headroom in mind.
+	MaxOutputBytes int64
 }
 
 // Result reports what a Compact call produced.
@@ -107,6 +133,34 @@ type Result struct {
 	// number of cells the iterator stack surfaced, which may be less
 	// than the sum of input entries (versioning/filtering drops cells).
 	EntriesWritten int64
+}
+
+// ErrOutputTooLarge reports that a compaction produced more output than
+// Spec.MaxOutputBytes allows. The compaction is abandoned: callers get
+// no partial Result, because a truncated RFile is not a compaction.
+var ErrOutputTooLarge = errors.New("compaction: output exceeds the configured budget")
+
+// budgetedWriter passes writes through to w until they would take the
+// total past max, then refuses. Refusing before the write lands is the
+// point: it is what keeps the output image inside the budget no matter
+// how large a single block or metadata section is.
+//
+// A max of zero (or less) disables the budget entirely.
+type budgetedWriter struct {
+	w       io.Writer
+	max     int64
+	written int64
+}
+
+func (b *budgetedWriter) Write(p []byte) (int, error) {
+	if b.max > 0 && b.written+int64(len(p)) > b.max {
+		return 0, fmt.Errorf(
+			"compaction: writing %d bytes would take the output to %d bytes, over the %d-byte budget: %w",
+			len(p), b.written+int64(len(p)), b.max, ErrOutputTooLarge)
+	}
+	n, err := b.w.Write(p)
+	b.written += int64(n)
+	return n, err
 }
 
 // Compact runs one compaction described by spec and returns the output
@@ -123,6 +177,9 @@ type Result struct {
 // Cells reach the writer already in non-decreasing Key order because the
 // MergingIterator emits them sorted and the stack above it is
 // order-preserving (versioning/visibility only drop cells, never reorder).
+//
+// Compact fails with ErrOutputTooLarge if the output grows past
+// spec.MaxOutputBytes.
 func Compact(spec Spec) (*Result, error) {
 	top, closer, err := buildSource(spec)
 	if err != nil {
@@ -136,7 +193,7 @@ func Compact(spec Spec) (*Result, error) {
 	}
 
 	var buf bytes.Buffer
-	w, err := rfile.NewWriter(&buf, rfile.WriterOptions{
+	w, err := rfile.NewWriter(&budgetedWriter{w: &buf, max: spec.MaxOutputBytes}, rfile.WriterOptions{
 		Codec:           codec,
 		BlockSize:       spec.BlockSize,
 		AdjacencyEdgeCF: spec.AdjacencyEdgeCF,
