@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/phrocker/shoal/internal/iterrt"
+	"github.com/phrocker/shoal/internal/vectorindex"
 )
 
 // planner.go lowers a parsed *SelectStmt against a TableBinding into a
@@ -29,6 +30,24 @@ type PlanOptions struct {
 	// Embedder resolves `ORDER BY col <-> 'text'`. May be nil if no query
 	// uses the text form.
 	Embedder Embedder
+	// Vector selects exact or approximate execution. The zero value remains
+	// exact for compatibility and to prevent silently choosing a derived index.
+	Vector VectorOptions
+}
+
+type VectorMode string
+
+const (
+	VectorExact       VectorMode = "exact"
+	VectorApproximate VectorMode = "approximate"
+)
+
+type VectorOptions struct {
+	Mode          VectorMode
+	Index         string
+	NProbe        int
+	Freshness     vectorindex.Freshness
+	ExactFallback bool
 }
 
 // OutColKind classifies how the executor materializes an output column.
@@ -144,6 +163,14 @@ type Plan struct {
 	// DocStar is true for `SELECT *` over documents: the executor emits id,
 	// type, and the union of all field names encountered.
 	DocStar bool
+
+	VectorMode          VectorMode
+	VectorIndex         string
+	VectorQuery         []float32
+	VectorTopK          int
+	VectorNProbe        int
+	VectorFreshness     vectorindex.Freshness
+	VectorExactFallback bool
 }
 
 // DocTerm is one indexed document predicate: FIELD = Value (exact).
@@ -186,7 +213,7 @@ func PlanQuery(ctx context.Context, stmt *SelectStmt, binding TableBinding, opts
 	// Document model (DataWave-style sharded documents) takes a dedicated
 	// lowering path: row=shard, dynamic fields, index-driven resolution.
 	if dm, ok := binding.(documentModel); ok {
-		return planDocument(stmt, dm, p)
+		return planDocument(ctx, stmt, dm, opts, p)
 	}
 
 	// Row range: start from the table's prefix, narrow by id predicates.
@@ -257,12 +284,9 @@ func planAggregate(stmt *SelectStmt, binding TableBinding, p *Plan) (*Plan, erro
 // (field=value and MATCH tokens) plus id/type residuals; the executor resolves
 // candidate shards from the global index, runs the DocumentIndexIterator, and
 // reconstructs matching documents.
-func planDocument(stmt *SelectStmt, dm documentModel, p *Plan) (*Plan, error) {
+func planDocument(ctx context.Context, stmt *SelectStmt, dm documentModel, opts PlanOptions, p *Plan) (*Plan, error) {
 	if stmt.GroupBy != "" {
 		return nil, fmt.Errorf("shoalql: GROUP BY not supported on document tables")
-	}
-	if stmt.Order != nil {
-		return nil, fmt.Errorf("shoalql: ORDER BY <-> not supported on document tables")
 	}
 	p.Shape = ShapeDocument
 	p.Table = dm.DocumentTable()
@@ -296,7 +320,7 @@ func planDocument(stmt *SelectStmt, dm documentModel, p *Plan) (*Plan, error) {
 			return nil, fmt.Errorf("shoalql: unsupported document predicate on %q", pr.Column)
 		}
 	}
-	if len(terms) == 0 {
+	if len(terms) == 0 && stmt.Order == nil {
 		return nil, fmt.Errorf("shoalql: document query requires an indexed predicate (field = value or MATCH)")
 	}
 	p.DocTerms = terms
@@ -308,6 +332,33 @@ func planDocument(stmt *SelectStmt, dm documentModel, p *Plan) (*Plan, error) {
 	}
 	p.Projection = proj
 	p.DocStar = star
+	if stmt.Order != nil {
+		vectorColumn, vectorIndex := dm.DocumentVector()
+		if stmt.Order.Column != vectorColumn {
+			return nil, fmt.Errorf("shoalql: ORDER BY <-> requires document vector column %q, got %q", vectorColumn, stmt.Order.Column)
+		}
+		if opts.Vector.Mode != VectorApproximate {
+			return nil, fmt.Errorf("shoalql: document semantic search requires explicit approximate vector mode")
+		}
+		vec, err := resolveVector(ctx, stmt.Order.Target, opts)
+		if err != nil {
+			return nil, err
+		}
+		topK := 10
+		if p.Limit != nil && *p.Limit > 0 {
+			topK = *p.Limit
+		}
+		p.VectorMode = VectorApproximate
+		p.VectorIndex = vectorIndex
+		if opts.Vector.Index != "" {
+			p.VectorIndex = opts.Vector.Index
+		}
+		p.VectorQuery = append([]float32(nil), vec...)
+		p.VectorTopK = topK
+		p.VectorNProbe = opts.Vector.NProbe
+		p.VectorFreshness = opts.Vector.Freshness
+		p.VectorExactFallback = opts.Vector.ExactFallback
+	}
 	return p, nil
 }
 
@@ -390,6 +441,19 @@ func planVectorKNN(ctx context.Context, stmt *SelectStmt, binding TableBinding, 
 	}
 	p.Stack = append(p.Stack, iterrt.IterSpec{Name: iterrt.IterVectorKNN, Options: opt})
 	p.Shape = ShapeVectorKNN
+	p.VectorMode = opts.Vector.Mode
+	if p.VectorMode == "" {
+		p.VectorMode = VectorExact
+	}
+	p.VectorIndex = opts.Vector.Index
+	if p.VectorIndex == "" {
+		p.VectorIndex = p.Table + "_ivf"
+	}
+	p.VectorQuery = append([]float32(nil), vec...)
+	p.VectorTopK = topK
+	p.VectorNProbe = opts.Vector.NProbe
+	p.VectorFreshness = opts.Vector.Freshness
+	p.VectorExactFallback = opts.Vector.ExactFallback
 	// KNN returns only embedding cells + scores; hydrate for the rest of the
 	// projection unless the projection is score-only.
 	p.NeedsHydration = projectionNeedsHydration(p.Projection)

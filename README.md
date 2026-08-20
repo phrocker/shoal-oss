@@ -1,13 +1,15 @@
 # shoal
 
-## Python foundation
+## Python distribution
 
-An incremental, explicitly partial Python binding is available under
+The `shoal-sharkbite` distribution is available under
 [`python/`](python/README.md). It supports both `import sharkbite` and
 `import pysharkbite`, negotiates the stable C ABI at runtime, and provides
 scanning, mutation/batch-writer, and table/namespace/security administration
 paths. It is not yet a complete Sharkbite-compatible distribution;
-unsupported legacy APIs fail explicitly.
+unsupported legacy APIs fail explicitly. Linux manylinux_2_28 x86-64 is the
+first supported wheel target; macOS and Windows remain explicitly documented
+previews. See the [release and native-library policy](docs/python-release.md).
 
 A Go sorted key-value store with graph and vector query pushdown.
 Independent project — inspired by [Apache Accumulo](https://accumulo.apache.org)'s
@@ -138,9 +140,13 @@ file.
 
 ShoalQL also has an Accumulo client backend with the same scalar, graph,
 document, and exact-vector semantics. It pushes native scan constraints and
-uses an explicit deterministic local fallback for Shoal-only iterators; it
-does not claim distributed approximate-vector support. See
-[`docs/shoalql-accumulo.md`](docs/shoalql-accumulo.md).
+uses an explicit deterministic local fallback for Shoal-only iterators.
+Both embedded and Accumulo backends can attach the format-neutral distributed
+IVF-PQ lifecycle for explicitly selected approximate graph or document
+semantic queries. Freshness failures never silently use a stale generation:
+the query fails or takes an explicitly enabled exact fallback. See
+[`docs/shoalql-accumulo.md`](docs/shoalql-accumulo.md) and
+[`docs/distributed-vector-index.md`](docs/distributed-vector-index.md).
 
 Use `shoal-sql --explain --query 'SELECT ...'` to print the physical plan and
 the table's configured write format, authoritative read formats, and mixed

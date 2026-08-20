@@ -2,6 +2,7 @@ package shoalql
 
 import (
 	"context"
+	"fmt"
 	"sort"
 	"strconv"
 
@@ -16,12 +17,16 @@ import (
 
 // docRow is a reconstructed document.
 type docRow struct {
+	shard    string
 	datatype string
 	uid      string
 	fields   map[string]string
 }
 
 func (e *Executor) runDocument(ctx context.Context, p *Plan) (*Result, error) {
+	if p.VectorMode == VectorApproximate {
+		return e.runSemanticDocument(ctx, p)
+	}
 	// Phase 1: resolve candidate shards from the global index.
 	shards, err := e.resolveDocShards(ctx, p)
 	if err != nil {
@@ -50,6 +55,87 @@ func (e *Executor) runDocument(ctx context.Context, p *Plan) (*Result, error) {
 		return e.projectDocumentStar(p, docs), nil
 	}
 	return e.projectDocuments(p, docs), nil
+}
+
+func (e *Executor) runSemanticDocument(ctx context.Context, p *Plan) (*Result, error) {
+	backend, ok := e.be.(ApproximateVectorBackend)
+	if !ok {
+		return nil, fmt.Errorf("shoalql: approximate vector backend unavailable")
+	}
+	var docs []*docRow
+	allowedDocuments := map[string]bool{}
+	if len(p.DocTerms) > 0 {
+		shards, err := e.resolveDocShards(ctx, p)
+		if err != nil {
+			return nil, err
+		}
+		if len(shards) == 0 {
+			return e.emptyDocResult(p), nil
+		}
+		stack := append(append([]iterrt.IterSpec(nil), p.Stack...), docIndexSpec(shards, p.DocTerms, p.DocBoolOr))
+		stream, err := e.be.Scan(ctx, p.Table, iterrt.InfiniteRange(), ScanRequest{Stack: stack})
+		if err != nil {
+			return nil, err
+		}
+		docs, err = groupDocuments(stream)
+		stream.Close()
+		if err != nil {
+			return nil, err
+		}
+		for _, doc := range docs {
+			if docPassesResidual(doc, p.DocResidual) {
+				allowedDocuments[doc.shard+"\x00"+doc.datatype+"\x00"+doc.uid] = true
+			}
+		}
+		if len(allowedDocuments) == 0 {
+			return e.emptyDocResult(p), nil
+		}
+	}
+	hits, _, err := backend.SearchVector(ctx, VectorSearchRequest{
+		Index: p.VectorIndex, Query: append([]float32(nil), p.VectorQuery...),
+		TopK: p.VectorTopK, NProbe: p.VectorNProbe, AsOf: p.AsOf,
+		Freshness: p.VectorFreshness, ExactFallback: p.VectorExactFallback,
+		AllowedDocuments: allowedDocuments,
+	})
+	if err != nil {
+		return nil, err
+	}
+	var rows [][]byte
+	seenShard := map[string]bool{}
+	for _, hit := range hits {
+		shard := hit.Document.Shard
+		if shard == "" || seenShard[shard] {
+			continue
+		}
+		seenShard[shard] = true
+		rows = append(rows, []byte(shard))
+	}
+	if len(rows) == 0 {
+		return e.emptyDocResult(p), nil
+	}
+
+	if len(p.DocTerms) == 0 {
+		cells, err := e.be.LookupRows(ctx, p.Table, rows, ScanRequest{Stack: p.Stack})
+		if err != nil {
+			return nil, err
+		}
+		docs = groupDocumentCells(cells)
+	}
+	byIdentity := map[string]*docRow{}
+	for _, doc := range docs {
+		byIdentity[doc.shard+"\x00"+doc.datatype+"\x00"+doc.uid] = doc
+	}
+	ranked := make([]*docRow, 0, len(hits))
+	for _, hit := range hits {
+		key := hit.Document.Shard + "\x00" + hit.Document.Datatype + "\x00" + hit.Document.UID
+		if doc := byIdentity[key]; doc != nil && docPassesResidual(doc, p.DocResidual) {
+			ranked = append(ranked, doc)
+		}
+	}
+	if p.DocStar {
+		return e.projectDocumentStar(p, ranked), nil
+	}
+	return e.projectDocuments(p, ranked), nil
 }
 
 // resolveDocShards intersects (AND) or unions (OR) the per-term candidate shard
@@ -135,10 +221,11 @@ func groupDocuments(stream RowStream) ([]*docRow, error) {
 		}
 		key := string(k.Row) + "\x01" + string(k.ColumnFamily)
 		if cur == nil || key != curKey {
-			cur = &docRow{datatype: datatype, uid: uid, fields: map[string]string{}}
+			cur = &docRow{shard: string(k.Row), datatype: datatype, uid: uid, fields: map[string]string{}}
 			curKey = key
 			out = append(out, cur)
 		}
+
 		if field, value, ok := documentschema.ParseEventCQ(k.ColumnQualifier); ok {
 			if _, exists := cur.fields[field]; !exists {
 				cur.fields[field] = value
@@ -149,6 +236,33 @@ func groupDocuments(stream RowStream) ([]*docRow, error) {
 		}
 	}
 	return out, nil
+}
+
+func groupDocumentCells(cells []Cell) []*docRow {
+	sort.SliceStable(cells, func(i, j int) bool {
+		return cells[i].Key.Compare(cells[j].Key) < 0
+	})
+	var out []*docRow
+	byKey := map[string]*docRow{}
+	for _, cell := range cells {
+		datatype, uid, ok := documentschema.ParseEventCF(cell.Key.ColumnFamily)
+		if !ok {
+			continue
+		}
+		key := string(cell.Key.Row) + "\x00" + datatype + "\x00" + uid
+		doc := byKey[key]
+		if doc == nil {
+			doc = &docRow{shard: string(cell.Key.Row), datatype: datatype, uid: uid, fields: map[string]string{}}
+			byKey[key] = doc
+			out = append(out, doc)
+		}
+		if field, value, ok := documentschema.ParseEventCQ(cell.Key.ColumnQualifier); ok {
+			if _, exists := doc.fields[field]; !exists {
+				doc.fields[field] = value
+			}
+		}
+	}
+	return out
 }
 
 // projectDocuments builds the result for an explicit projection.
