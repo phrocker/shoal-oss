@@ -819,13 +819,15 @@ TARGETED_SB_DM_CITATIONS = {
     "accumulo/data_model_test.go",
 }
 
-TARGETED_SYMBOL_ANCHORS_BY_CITATION = {
-    "accumulo/scanner.go": {
-        "NewColumnFamily",
-        "NewColumn",
-        "Column.Family",
-        "Column.Qualifier",
-    },
+TARGETED_SYMBOL_ANCHORS_BY_ROW_CITATION = {
+    ("SB-SCAN-005", "accumulo/scanner.go"): {"NewColumnFamily", "NewColumn"},
+    ("SB-BASE-020", "accumulo/scanner.go"): {"NewColumnFamily", "NewColumn"},
+    ("SB-CPP-070", "accumulo/scanner.go"): {"NewColumnFamily", "NewColumn"},
+    ("SB-CXX-0208", "accumulo/scanner.go"): {"NewColumnFamily"},
+    ("SB-CXX-0209", "accumulo/scanner.go"): {"NewColumn"},
+    ("SB-CXX-0217", "accumulo/scanner.go"): {"Column.Family"},
+    ("SB-CXX-0219", "accumulo/scanner.go"): {"Column.Qualifier"},
+    ("SB-XCUT-003", "accumulo/scanner.go"): {"Column.Family"},
 }
 
 TARGETED_SB_EXTENT_CITATIONS = {
@@ -3438,13 +3440,6 @@ def anchor_matches_content(anchor: str, content: str, ignored_tokens: set[str]) 
 
 
 def filtered_local_anchors(ref: str, anchors: list[str]) -> list[str]:
-    if ref in TARGETED_SYMBOL_ANCHORS_BY_CITATION:
-        symbols = TARGETED_SYMBOL_ANCHORS_BY_CITATION[ref]
-        return [
-            anchor
-            for anchor in anchors
-            if anchor.split("(", 1)[0] in symbols
-        ]
     if ref in OPTIONAL_ANCHOR_CITATIONS:
         return [anchor for anchor in anchors if "shoal_" in anchor or "SHOAL_" in anchor]
     return anchors
@@ -3464,11 +3459,25 @@ def validate_targeted_symbol_anchors(
             if not path_anchor_bindings:
                 continue
             for ref, anchors in path_anchor_bindings.items():
+                scanner_key = (row_id, ref)
+                if ref == "accumulo/scanner.go":
+                    expected_symbols = TARGETED_SYMBOL_ANCHORS_BY_ROW_CITATION.get(scanner_key)
+                    if expected_symbols is None:
+                        continue
+                    cited_symbols = {anchor.split("(", 1)[0] for anchor in anchors}
+                    missing_symbols = sorted(expected_symbols - cited_symbols)
+                    require(
+                        not missing_symbols,
+                        f"{row_id} cites {ref} without required targeted anchors: "
+                        f"{', '.join(missing_symbols)}",
+                    )
+                    anchors = [
+                        anchor
+                        for anchor in anchors
+                        if anchor.split("(", 1)[0] in expected_symbols
+                    ]
                 anchors = filtered_local_anchors(ref, anchors)
-                if (
-                    ref not in OPTIONAL_ANCHOR_CITATIONS
-                    and ref not in TARGETED_SYMBOL_ANCHORS_BY_CITATION
-                ):
+                if ref not in OPTIONAL_ANCHOR_CITATIONS:
                     require(
                         anchors,
                         f"{row_id} cites {ref} without an adjacent local symbol/test anchor",

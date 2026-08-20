@@ -2440,6 +2440,19 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
                 scanner_path,
             )
 
+    def test_scanner_symbol_anchor_typo_invalidates_matrix(self) -> None:
+        text = load_document_text()
+        mutated = text.replace(
+            "with `NewColumnFamily` / `NewColumn` (`accumulo/scanner.go:",
+            "with `TypoColumnFamily` / `NewColumn` (`accumulo/scanner.go:",
+            1,
+        )
+        self.assertNotEqual(mutated, text)
+        self.assert_validation_fails(
+            lambda: validator.validate_targeted_symbol_anchors(mutated.splitlines()),
+            "SB-SCAN-005 cites accumulo/scanner.go without required targeted anchors: NewColumnFamily",
+        )
+
     # ---- pinned audited inventory ------------------------------------------
 
     def test_pinned_inventory_constants_are_internally_consistent(self) -> None:
