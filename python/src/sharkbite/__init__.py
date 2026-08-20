@@ -1,6 +1,18 @@
-"""Early Shoal Python binding; intentionally not full Sharkbite compatibility."""
+"""Incremental Shoal Python binding; intentionally not full compatibility."""
 
 from ._native import NativeAPI, RuntimeInfo
+from .admin import (
+    Authorizations,
+    NamespaceOperations,
+    NamespacePermissions,
+    SecurityOperations,
+    ShoalSystemPermissions,
+    ShoalTablePermissions,
+    SystemPermissions,
+    TableInfo,
+    TableOperations,
+    TablePermissions,
+)
 from .client import (
     AccumuloBase,
     AccumuloIterator,
@@ -12,6 +24,7 @@ from .client import (
     Scanner,
 )
 from .errors import (
+    AmbiguousWriteError,
     AlreadyExistsError,
     CancelledError,
     ClientException,
@@ -23,13 +36,21 @@ from .errors import (
     ShoalError,
     UnsupportedError,
 )
+from .writer import BatchWriter, BatchWriterOptions, Mutation
+
+AccumuloConnector = Connector
 
 __all__ = [
     "AccumuloBase",
+    "AccumuloConnector",
     "AccumuloIterator",
     "AccumuloScanner",
     "AccumuloWriter",
+    "AmbiguousWriteError",
     "AlreadyExistsError",
+    "Authorizations",
+    "BatchWriter",
+    "BatchWriterOptions",
     "CancelledError",
     "Client",
     "ClientException",
@@ -39,10 +60,20 @@ __all__ = [
     "InvalidArgumentError",
     "Key",
     "NativeAPI",
+    "NamespaceOperations",
+    "NamespacePermissions",
     "NotFoundError",
     "PermissionDeniedError",
     "RuntimeInfo",
     "Scanner",
+    "SecurityOperations",
+    "ShoalSystemPermissions",
+    "ShoalTablePermissions",
     "ShoalError",
     "UnsupportedError",
+    "SystemPermissions",
+    "TableInfo",
+    "TableOperations",
+    "TablePermissions",
+    "Mutation",
 ]
