@@ -11,7 +11,9 @@ from sharkbite import (
     ClientException,
     Connector,
     Key,
+    PythonIterator,
     Results,
+    ScannerOptions,
 )
 from sharkbite._native import Bytes, KeyValueView, Range, ScannerConfig, c_bytes
 
@@ -238,6 +240,33 @@ class StreamingCompatibilityTests(unittest.TestCase):
             with BatchScanner(self.connector, "t", (), 1):
                 raise RuntimeError("body")
 
+    def test_iterator_and_scanner_option_call_shapes(self):
+        class IterInfo:
+            def getName(self):
+                return "iter"
+
+            def getClass(self):
+                return "example.Iterator"
+
+            def getPriority(self):
+                return 7
+
+        scanner = BatchScanner(self.connector, "t", (), 2)
+        scan_range, keepalive = row_range(b"a", b"z")
+        scanner.addRange(scan_range)
+        scanner.addIterator(IterInfo())
+        list(scanner.getResultSet())
+        self.assertEqual(self.api.lib.configs[-1][-1], 1)
+        python_iterator = PythonIterator("python", 7)
+        with self.assertRaisesRegex(NotImplementedError, "SB-DIV-007"):
+            scanner.addIterator(python_iterator)
+        for method in (scanner.setOption, scanner.removeOption):
+            with self.subTest(method=method.__name__):
+                with self.assertRaisesRegex(NotImplementedError, "SB-DIV-008"):
+                    method(ScannerOptions.HedgedReads)
+        scanner.close()
+        self.assertIsNotNone(keepalive)
+
     def test_range_snapshots_are_property_checked(self):
         scanner = BatchScanner(self.connector, "t", (), 3)
         expected = []
@@ -318,6 +347,23 @@ class StreamingCompatibilityTests(unittest.TestCase):
             return await asyncio.gather(*(read_one() for _ in range(4)))
 
         self.assertEqual(asyncio.run(read_all()), [b"a:z"] * 4)
+        scanner.close()
+        self.assertIsNotNone(keepalive)
+
+    def test_results_are_awaitable_and_return_the_restartable_iterator(self):
+        scanner = BatchScanner(self.connector, "t", (), 2)
+        scan_range, keepalive = row_range(b"a", b"z")
+        scanner.addRange(scan_range)
+        result = scanner.getResultSet()
+
+        async def await_result():
+            iterator = await result
+            return iterator, next(iterator).getValue()
+
+        iterator, value = asyncio.run(await_result())
+        self.assertIs(iterator, result)
+        self.assertEqual(value, b"a:z")
+        result.close()
         scanner.close()
         self.assertIsNotNone(keepalive)
 
