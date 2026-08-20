@@ -139,17 +139,41 @@ def install_smoke(wheel: Path, sdist: Path) -> None:
     shutil.rmtree(verification_root, ignore_errors=True)
     verification_root.mkdir(parents=True)
     try:
+        external_native = verification_root / "external-native"
+        external_native.mkdir()
+        with zipfile.ZipFile(wheel) as archive:
+            native_name = next(
+                name
+                for name in archive.namelist()
+                if "/sharkbite/.libs/" in f"/{name}"
+                and name.lower().endswith((".dll", ".dylib", ".so"))
+            )
+            native_path = external_native / Path(native_name).name
+            native_path.write_bytes(archive.read(native_name))
+
         environment = verification_root / "wheel-venv"
         venv.EnvBuilder(with_pip=True, clear=True).create(environment)
         python, restricted_path = safe_path(environment)
         pip_install(python, wheel)
         code = """
+import importlib.metadata
+import importlib.util
 import shutil
 import pysharkbite
 import sharkbite
 from sharkbite import Mutation, NativeAPI
 assert shutil.which("go") is None
-assert pysharkbite.Client is sharkbite.Client
+distribution = importlib.metadata.distribution("shoal-sharkbite")
+assert distribution.metadata["Name"] == "shoal-sharkbite"
+assert distribution.version == sharkbite.__version__
+owners = importlib.metadata.packages_distributions()
+assert "shoal-sharkbite" in owners["sharkbite"]
+assert "shoal-sharkbite" in owners["pysharkbite"]
+assert importlib.util.find_spec("sharkbite").origin == sharkbite.__file__
+assert importlib.util.find_spec("pysharkbite").origin == pysharkbite.__file__
+assert pysharkbite.__all__ == sharkbite.__all__
+for name in sharkbite.__all__:
+    assert getattr(pysharkbite, name) is getattr(sharkbite, name)
 assert pysharkbite.__version__ == sharkbite.__version__
 api = NativeAPI()
 assert api.info.version >= (1, 17, 0)
@@ -165,6 +189,26 @@ print(sharkbite.__version__, api.info.version, api.path)
         env.pop("SHOAL_ALLOW_SYSTEM_LIBRARY", None)
         env["PATH"] = restricted_path
         subprocess.run([str(python), "-I", "-c", code], env=env, check=True)
+
+        preload_code = """
+import ctypes
+import os
+native = ctypes.CDLL(os.environ["RELEASE_NATIVE_LIBRARY"])
+assert native.shoal_abi_version_major() == 1
+import pysharkbite
+import sharkbite
+from sharkbite import NativeAPI
+assert pysharkbite.Client is sharkbite.Client
+api = NativeAPI(os.environ["RELEASE_NATIVE_LIBRARY"])
+assert api.info.version >= (1, 17, 0)
+"""
+        preload_env = env.copy()
+        preload_env["RELEASE_NATIVE_LIBRARY"] = str(native_path.resolve())
+        subprocess.run(
+            [str(python), "-I", "-c", preload_code],
+            env=preload_env,
+            check=True,
+        )
 
         source_root = verification_root / "sdist"
         source_root.mkdir()
@@ -201,23 +245,12 @@ print(sharkbite.__version__, api.info.version, api.path)
         )
         source_wheel = next(source_wheels.glob("*-py3-none-any.whl"))
 
-        external_native = verification_root / "external-native"
-        external_native.mkdir()
-        with zipfile.ZipFile(wheel) as archive:
-            native_name = next(
-                name
-                for name in archive.namelist()
-                if "/sharkbite/.libs/" in f"/{name}"
-                and name.lower().endswith((".dll", ".dylib", ".so"))
-            )
-            native_path = external_native / Path(native_name).name
-            native_path.write_bytes(archive.read(native_name))
-
         source_environment = verification_root / "sdist-venv"
         venv.EnvBuilder(with_pip=True, clear=True).create(source_environment)
         source_python, source_path = safe_path(source_environment)
         pip_install(source_python, source_wheel)
         source_code = """
+import importlib.metadata
 import os
 import shutil
 from pathlib import Path
@@ -225,9 +258,15 @@ import pysharkbite
 import sharkbite
 from sharkbite import Mutation, NativeAPI
 assert shutil.which("go") is None
-assert pysharkbite.Client is sharkbite.Client
+distribution = importlib.metadata.distribution("shoal-sharkbite")
+assert distribution.metadata["Name"] == "shoal-sharkbite"
+assert distribution.version == sharkbite.__version__
+assert pysharkbite.__all__ == sharkbite.__all__
+for name in sharkbite.__all__:
+    assert getattr(pysharkbite, name) is getattr(sharkbite, name)
 assert not any((Path(sharkbite.__file__).parent / ".libs").glob("*"))
 api = NativeAPI(os.environ["RELEASE_NATIVE_LIBRARY"])
+assert api.info.version >= (1, 17, 0)
 with Mutation(b"sdist-smoke", _api=api) as mutation:
     mutation.put(b"cf", b"cq", b"", 1, b"value")
     assert mutation.size() > 0

@@ -5,17 +5,16 @@
 # Policy: docs/sharkbite-client-scope.md.
 # Columns: ROW-ID<TAB>DISPOSITION<TAB>RULE<TAB>PINNED-MATRIX-STATUS.
 # Entries are in matrix order; validator rules, not aggregate counts, authorize dispositions.
-
-SB-PKG-001	Required gap	core-required-gap	Missing C ABI
-SB-PKG-002	Required gap	core-required-gap	Missing C ABI
-SB-PKG-003	Required gap	core-required-gap	Missing C ABI
-SB-PKG-004	Required gap	core-required-gap	Missing C ABI
+SB-PKG-001	Approved divergence	core-approved-divergence	Intentional divergence (approval required)
+SB-PKG-002	Covered	core-covered	Covered
+SB-PKG-003	Covered	core-covered	Covered
+SB-PKG-004	Covered	core-covered	Covered
 SB-PKG-005	Not required	not-required-rationale	Not required (rationale required)
 SB-PKG-006	Not required	not-required-rationale	Not required (rationale required)
-SB-PKG-007	Required gap	core-required-gap	Missing C ABI
+SB-PKG-007	Approved divergence	core-approved-divergence	Intentional divergence (approval required)
 SB-PKG-008	Required gap	core-required-gap	Missing C ABI
-SB-PKG-009	Required gap	core-required-gap	Missing C ABI
-SB-PKG-010	Required gap	core-required-gap	Behavior mismatch
+SB-PKG-009	Covered	core-covered	Covered
+SB-PKG-010	Covered	core-covered	Covered
 SB-PKG-011	Required gap	core-required-gap	Missing C ABI
 SB-PKG-012	Optional	optional-python-extra	Missing C ABI
 SB-PKG-013	Optional	optional-python-extra	Missing C ABI
@@ -382,7 +381,7 @@ SB-RFILE-001	Covered	core-covered	Covered
 SB-RFILE-002	Covered	core-covered	Covered
 SB-RFILE-003	Covered	core-covered	Covered
 SB-RFILE-004	Covered	core-covered	Covered
-SB-RFILE-005	Covered	core-covered	Covered
+SB-RFILE-005	Required gap	core-required-gap	Behavior mismatch
 SB-RFILE-006	Covered	core-covered	Covered
 SB-RFILE-007	Covered	core-covered	Covered
 SB-RFILE-008	Covered	core-covered	Covered
@@ -421,8 +420,8 @@ SB-HDFS-004	Covered	core-covered	Covered
 SB-HDFS-005	Covered	core-covered	Covered
 SB-HDFS-006	Covered	core-covered	Covered
 SB-HDFS-007	Covered	core-covered	Covered
-SB-HDFS-008	Covered	core-covered	Covered
-SB-HDFS-009	Covered	core-covered	Covered
+SB-HDFS-008	Required gap	core-required-gap	Missing Go
+SB-HDFS-009	Required gap	core-required-gap	Missing Go
 SB-HDFS-010	Covered	core-covered	Covered
 SB-HDFS-015	Covered	core-covered	Covered
 SB-HDFS-016	Covered	core-covered	Covered
@@ -442,23 +441,23 @@ SB-HDFS-013	Covered	core-covered	Covered
 SB-HDFS-014	Covered	core-covered	Covered
 SB-LOG-001	Covered	core-covered	Covered
 SB-LOG-002	Covered	core-covered	Covered
-SB-LOG-003	Covered	core-covered	Covered
+SB-LOG-003	Required gap	core-required-gap	Behavior mismatch
 SB-ERR-001	Covered	core-covered	Covered
-SB-ERR-002	Covered	core-covered	Covered
+SB-ERR-002	Required gap	core-required-gap	Behavior mismatch
 SB-ERR-003	Approved divergence	core-approved-divergence	Intentional divergence (approval required)
-SB-ERR-004	Covered	core-covered	Covered
-SB-ERR-005	Covered	core-covered	Covered
-SB-ERR-006	Covered	core-covered	Covered
-SB-ERR-007	Covered	core-covered	Covered
+SB-ERR-004	Required gap	core-required-gap	Behavior mismatch
+SB-ERR-005	Required gap	core-required-gap	Behavior mismatch
+SB-ERR-006	Required gap	core-required-gap	Behavior mismatch
+SB-ERR-007	Required gap	core-required-gap	Behavior mismatch
 SB-ERR-008	Covered	core-covered	Covered
-SB-ERR-009	Covered	core-covered	Covered
+SB-ERR-009	Required gap	core-required-gap	Missing Go
 SB-ERR-010	Covered	core-covered	Covered
 SB-ERR-011	Covered	core-covered	Covered
 SB-ERR-012	Not required	not-required-rationale	Not required (rationale required)
 SB-ERR-013	Not required	not-required-rationale	Not required (rationale required)
 SB-ERR-014	Covered	core-covered	Covered
 SB-ERR-015	Not required	not-required-rationale	Not required (rationale required)
-SB-ERR-016	Covered	core-covered	Covered
+SB-ERR-016	Required gap	core-required-gap	Behavior mismatch
 SB-CPP-001	Optional	optional-legacy-cxx	Behavior mismatch
 SB-CPP-015	Optional	optional-legacy-cxx	Behavior mismatch
 SB-CPP-002	Optional	optional-legacy-cxx	Behavior mismatch

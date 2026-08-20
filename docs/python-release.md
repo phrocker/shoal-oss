@@ -83,8 +83,13 @@ place private keys or credentials in the repository or build environment.
 wheel into a fresh project-local virtual environment with `--no-index` and
 with the Go toolchain absent from `PATH`. It also builds the source-only sdist
 into an unbundled `py3-none-any` wheel and installs that in a second clean
-environment. Both paths import both module names, load a trusted native
-library, check ABI/capabilities, and execute a native mutation smoke test.
+environment. Both paths verify that the installed `shoal-sharkbite`
+distribution owns the `sharkbite` and `pysharkbite` import roots, that their
+complete implemented public exports have object identity, load a trusted
+native library, check ABI/capabilities, and execute a native mutation smoke
+test. A separate fresh interpreter preloads the library with `ctypes.CDLL`
+before either import; the normal path imports first and uses package discovery,
+so both legacy preload drivers and safe no-preload consumers are covered.
 
 The build and verification scripts are host-portable. Cross-compilation is not
 accepted as runtime evidence; macOS remains explicitly unverified until those
