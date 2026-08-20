@@ -162,7 +162,7 @@ func New(ctx context.Context, cfg Config) (*Adapter, error) {
 		return nil, fmt.Errorf("%w: manager status reporting is unavailable", ErrUnsupported)
 	case cfg.InstanceID == "":
 		return nil, fmt.Errorf("%w: empty instance ID", ErrInvalidRequest)
-	case path.Clean(cfg.ManagerLockPath) != path.Join("/accumulo", cfg.InstanceID, "managers/lock"):
+	case path.Clean(cfg.ManagerLockPath) != "/managers/lock":
 		return nil, fmt.Errorf("%w: invalid manager lock path %q", ErrInvalidRequest, cfg.ManagerLockPath)
 	case cfg.Name == "":
 		return nil, fmt.Errorf("%w: empty server name", ErrInvalidRequest)
@@ -171,6 +171,7 @@ func New(ctx context.Context, cfg Config) (*Adapter, error) {
 	case cfg.Stop == nil:
 		return nil, fmt.Errorf("%w: process stop callback is unavailable", ErrUnsupported)
 	}
+
 	child, cancel := context.WithCancel(ctx)
 	now := cfg.Now
 	if now == nil {
@@ -286,6 +287,7 @@ func (a *Adapter) LoadTablet(
 ) error {
 	extent, fence, err := a.validateManagerRequest(ctx, credentials, lock, textent, "loadTablet")
 	if err != nil {
+		a.emit(fmt.Errorf("loadTablet rejected: %w", err))
 		return err
 	}
 

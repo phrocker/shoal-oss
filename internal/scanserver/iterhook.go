@@ -1,13 +1,18 @@
 package scanserver
 
 import (
+	"bytes"
+	"encoding/binary"
 	"fmt"
+	"math"
 	"sort"
 
 	"github.com/phrocker/shoal/internal/ivfpq"
 	"github.com/phrocker/shoal/internal/rfile/wire"
 	"github.com/phrocker/shoal/internal/thrift/gen/data"
 )
+
+const wholeRowIteratorClassName = "org.apache.accumulo.core.iterators.user.WholeRowIterator"
 
 // cellPostProcessor consumes cells from the heap-merge in the order
 // they would have been emitted, then produces the final result list.
@@ -32,6 +37,7 @@ type cellPostProcessor interface {
 //
 // Currently recognized:
 //   - IvfPqDistanceIterator: replicated by internal/ivfpq.
+//   - WholeRowIterator: required by Accumulo's metadata-table scans.
 //
 // Multiple iterators in ssiList: V1 only supports a single recognized
 // iterator (the Java handler only wires one for /vector/search).
@@ -66,6 +72,11 @@ func buildPostProcessor(ssiList []*data.IterInfo, ssio map[string]map[string]str
 				return nil, fmt.Errorf("scanserver: build ivfpq iterator (%s): %w", info.IterName, err)
 			}
 			picked = &ivfpqProcessor{it: it}
+		case wholeRowIteratorClassName:
+			if picked != nil {
+				return nil, fmt.Errorf("scanserver: multiple shoal-recognized iterators not supported in V1")
+			}
+			picked = &wholeRowProcessor{}
 		default:
 			// Unknown iterator. Java would error if a class wasn't on
 			// the classpath; shoal mirrors this rather than silently
@@ -118,6 +129,66 @@ func (p *ivfpqProcessor) drain() []*data.TKeyValue {
 		})
 	}
 	return out
+}
+
+type wholeRowCell struct {
+	key   wire.Key
+	value []byte
+}
+
+type wholeRowProcessor struct {
+	currentRow []byte
+	current    []wholeRowCell
+	results    []*data.TKeyValue
+}
+
+func (p *wholeRowProcessor) offer(k *wire.Key, value []byte) {
+	if p.currentRow != nil && !bytes.Equal(p.currentRow, k.Row) {
+		p.flush()
+	}
+	if p.currentRow == nil {
+		p.currentRow = cloneBytes(k.Row)
+	}
+	p.current = append(p.current, wholeRowCell{
+		key:   *k.Clone(),
+		value: cloneBytes(value),
+	})
+}
+
+func (p *wholeRowProcessor) drain() []*data.TKeyValue {
+	p.flush()
+	results := p.results
+	p.results = nil
+	return results
+}
+
+func (p *wholeRowProcessor) flush() {
+	if len(p.current) == 0 {
+		return
+	}
+	var encoded bytes.Buffer
+	_ = binary.Write(&encoded, binary.BigEndian, int32(len(p.current)))
+	for _, cell := range p.current {
+		writeWholeRowField(&encoded, cell.key.ColumnFamily)
+		writeWholeRowField(&encoded, cell.key.ColumnQualifier)
+		writeWholeRowField(&encoded, cell.key.ColumnVisibility)
+		_ = binary.Write(&encoded, binary.BigEndian, cell.key.Timestamp)
+		writeWholeRowField(&encoded, cell.value)
+	}
+	p.results = append(p.results, &data.TKeyValue{
+		Key: &data.TKey{
+			Row:       p.currentRow,
+			Timestamp: math.MaxInt64,
+		},
+		Value: encoded.Bytes(),
+	})
+	p.currentRow = nil
+	p.current = nil
+}
+
+func writeWholeRowField(out *bytes.Buffer, value []byte) {
+	_ = binary.Write(out, binary.BigEndian, int32(len(value)))
+	_, _ = out.Write(value)
 }
 
 func cloneBytes(b []byte) []byte {

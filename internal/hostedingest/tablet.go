@@ -40,6 +40,10 @@ type MetadataFactory interface {
 	Open(context.Context, tabletloader.Specification, ingestrouter.Fence) (MetadataAuthority, error)
 }
 
+type systemTabletMetadataFactory interface {
+	SupportsSystemTablets() bool
+}
+
 func (t *Tablet) formattedTabletTimeLocked() string {
 	return string([]byte{t.timeType}) + strconv.FormatInt(t.tabletTime, 10)
 }
@@ -167,7 +171,10 @@ func (f *Factory) Open(
 		TableID: spec.Extent.TableID, PrevEndRow: spec.Extent.PrevEndRow, EndRow: spec.Extent.EndRow,
 	}
 	if extent.TableID == metadata.RootTableID || extent.TableID == metadata.MetadataTableID {
-		return nil, ErrSystemTabletConditionalUnsupported
+		conditional, ok := f.cfg.Metadata.(systemTabletMetadataFactory)
+		if !ok || !conditional.SupportsSystemTablets() {
+			return nil, ErrSystemTabletConditionalUnsupported
+		}
 	}
 	timeType, tabletTime, nextTimestamp, exhausted, err := initialTabletTime(spec.Time, f.cfg.Now())
 	if err != nil {

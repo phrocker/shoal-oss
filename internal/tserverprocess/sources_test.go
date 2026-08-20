@@ -17,6 +17,15 @@ func (f tableLocatorFunc) LocateTable(ctx context.Context, table string) ([]meta
 	return f(ctx, table)
 }
 
+type effectiveConfigurationFunc func(context.Context, string) (map[string]string, error)
+
+func (f effectiveConfigurationFunc) EffectiveProperties(
+	ctx context.Context,
+	tableID string,
+) (map[string]string, error) {
+	return f(ctx, tableID)
+}
+
 func TestMetadataSourceRequiresExactExtentAddressAndGeneration(t *testing.T) {
 	extent := tserver.Extent{TableID: "5", PrevEndRow: []byte("a"), EndRow: []byte("m")}
 	source := MetadataSource{
@@ -66,6 +75,33 @@ func TestHostAuthorityUsesZooKeeperSessionGeneration(t *testing.T) {
 	}
 	if err := authority.Validate(context.Background(), extent, "old"); !errors.Is(err, tabletloader.ErrStaleGeneration) {
 		t.Fatalf("stale generation error = %v", err)
+	}
+}
+
+func TestZKConfigSourceRequiresStableEffectiveConfiguration(t *testing.T) {
+	calls := 0
+	source := ZKConfigSource{
+		Resolver: effectiveConfigurationFunc(func(context.Context, string) (map[string]string, error) {
+			calls++
+			if calls == 1 {
+				return map[string]string{"table.file.max": "15"}, nil
+			}
+			return map[string]string{"table.file.max": "16"}, nil
+		}),
+	}
+	if _, err := source.ReadTableConfiguration(context.Background(), "5"); err == nil {
+		t.Fatal("expected changing configuration to be rejected")
+	}
+
+	source.Resolver = effectiveConfigurationFunc(func(context.Context, string) (map[string]string, error) {
+		return map[string]string{"table.file.max": "15"}, nil
+	})
+	got, err := source.ReadTableConfiguration(context.Background(), "5")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.TableID != "5" || got.Properties["table.file.max"] != "15" || got.Generation < 0 {
+		t.Fatalf("ReadTableConfiguration = %#v", got)
 	}
 }
 

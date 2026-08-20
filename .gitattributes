@@ -1,2 +1,4 @@
 internal/thrift/idl/** text eol=lf
 internal/thrift/gen/** text eol=lf
+test/accumulo/**/*.sh text eol=lf
+test/accumulo/conf/** text eol=lf

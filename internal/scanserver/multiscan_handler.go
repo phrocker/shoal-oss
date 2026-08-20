@@ -250,68 +250,34 @@ func cloneRanges(ranges []*data.TRange) []*data.TRange {
 	return cloned
 }
 
-// binRangesByTablet groups single-row-style ranges by the tablet that
-// contains the range start. Each output extent is a fully-resolved
+// binRangesByTablet fans ranges out across the table's tablets. Each output
+// extent is a fully-resolved
 // TKeyExtent (table + endRow + prevEndRow) so downstream lookupFiles
-// finds it directly.
-//
-// V0.5 limitation: a range whose start lands in tablet T is assigned
-// entirely to T, even if its stop crosses T's boundary. For the chat
-// path's exact-row lookups (Range.exact(vertexId)) this is always
-// correct. Multi-row ranges that span tablets would lose cells past
-// the boundary — explicitly rejected with an error in that case so
-// the Java SDK can fall back to tserver instead of silently truncating.
+// finds it directly. The original range is applied to each tablet's disjoint
+// files, which correctly handles unbounded and cross-tablet ranges without
+// synthesizing key-level clipping boundaries.
 func (s *Server) binRangesByTablet(ctx context.Context, extent *data.TKeyExtent, ranges []*data.TRange) (data.ScanBatch, error) {
 	tableID := string(extent.Table)
 	tablets, err := s.locator.LocateTable(ctx, tableID)
 	if err != nil {
 		return nil, fmt.Errorf("locate table %q: %w", tableID, err)
 	}
+	if len(tablets) == 0 {
+		return nil, fmt.Errorf("multiscan binner: no tablets found for table %q", tableID)
+	}
 
 	out := make(data.ScanBatch, len(tablets))
-	for _, r := range ranges {
-		if r == nil {
-			continue
+	for _, tablet := range tablets {
+		resolved := &data.TKeyExtent{
+			Table:      extent.Table,
+			EndRow:     tablet.EndRow,
+			PrevEndRow: tablet.PrevRow,
 		}
-		if r.InfiniteStartKey || r.Start == nil || len(r.Start.Row) == 0 {
-			return nil, fmt.Errorf("multiscan binner: range with no start row not supported in auto-bin mode")
-		}
-		startRow := r.Start.Row
-		// Check stop boundary: must NOT cross out of the start tablet.
-		// For Range.exact(row) the stop is row+0x00 — same tablet. For
-		// arbitrary multi-row ranges we error out and let the caller
-		// fan out via tserver.
-		var matched *data.TKeyExtent
-		for _, t := range tablets {
-			if rowInTablet(startRow, t) {
-				if !r.InfiniteStopKey && r.Stop != nil && len(r.Stop.Row) > 0 {
-					stopRow := r.Stop.Row
-					// Stop = row+0x00 lands inside tablet T iff startRow
-					// is inside T. For other shapes, validate that the
-					// stop row is also inside T (lexicographically <=
-					// EndRow when EndRow is non-nil).
-					if t.EndRow != nil && string(stopRow) > string(t.EndRow) &&
-						!(len(stopRow) == len(startRow)+1 && stopRow[len(stopRow)-1] == 0) {
-						return nil, fmt.Errorf("multiscan binner: range [%q, %q) crosses tablet boundary at %q — caller must pre-bin",
-							string(startRow), string(stopRow), string(t.EndRow))
-					}
-				}
-				matched = &data.TKeyExtent{
-					Table:      extent.Table,
-					EndRow:     t.EndRow,
-					PrevEndRow: t.PrevRow,
-				}
-				break
+		for _, r := range ranges {
+			if r != nil {
+				out = appendToScanBatch(out, resolved, r)
 			}
 		}
-		if matched == nil {
-			return nil, fmt.Errorf("multiscan binner: no tablet covers row %q in table %q",
-				string(startRow), tableID)
-		}
-		// Group by extent identity. data.ScanBatch's key is *TKeyExtent
-		// (pointer identity) — we want value-equality. Build a string
-		// key for grouping, dedupe, then assemble the final map.
-		out = appendToScanBatch(out, matched, r)
 	}
 	return out, nil
 }

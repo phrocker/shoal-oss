@@ -23,16 +23,27 @@ LIVE_DIR = HARNESS / ".live"
 SYSTEM_TOKEN_FILE = LIVE_DIR / "system-token"
 ACCUMULO_REVISION = "1a716b2c1bb5762ead4b46d2bc4f53e13873b314"
 ACCUMULO_VERSION = "4.0.0-SNAPSHOT"
+ACCUMULO_IMAGE = (
+    "ghcr.io/phrocker/shoal-accumulo-test@"
+    "sha256:bf9cbca5aaa8ada88d503e6cf178d41e72a6e0067cef47fe582f4b93c3d392db"
+)
 ACCUMULO_SOURCE_SHA512 = (
     "bf2cac6f7b5f759358ac306bba2342dc74c51bf63d70905da1004fc1eb0cfa66"
     "f6a73023ab250824a67f17d410e9b3351f097ddfd742bbc4b14f7a7feb6c4b2e"
 )
+ACCUMULO_ACCESS_REVISION = "5d7a94492832121f507029d9d7e7627fd88e95ba"
+ACCUMULO_ACCESS_SOURCE_SHA512 = (
+    "f519e992ff8f418f06a564c04313b93788460de6de7fee1dfd7503ad660149fd"
+    "b3794dae61474369be1c671115f2ecda4d5b73d745cbd73972ed3d171875f243"
+)
 HADOOP_VERSION = "3.4.2"
-HADOOP_SHA512 = (
-    "79a383e156022d6690da359120b25db8146452265d92a4e890d9ea78c2078a01"
-    "b661daf78163ee9b4acef7106b01fd5c8d1a55f7ad284f88b31ab3f402ae3acf"
+HADOOP_IMAGE_DIGEST = (
+    "sha256:0f79c18d27a2b15984868a41e245b09c98daa5638b573b4dbd848be650f05635"
 )
 ZOOKEEPER_VERSION = "3.9.5"
+ZOOKEEPER_IMAGE_DIGEST = (
+    "sha256:f5ce2c0274fd99c77bcb51505c748ac109fd5be36b4247b46c178ce59ea59e59"
+)
 
 
 class DockerUnavailable(RuntimeError):
@@ -62,7 +73,15 @@ def role_command(role: str) -> list[str]:
 
 
 def compose_services(*services: str) -> list[str]:
-    return compose_command("--profile", "shoal", "up", "--detach", "--build", *services)
+    return compose_command(
+        "--profile",
+        "shoal",
+        "up",
+        "--detach",
+        "--build",
+        "--no-deps",
+        *services,
+    )
 
 
 def _properties(path: Path) -> dict[str, str]:
@@ -90,7 +109,7 @@ def validate(root: Path = ROOT) -> list[str]:
     required_text = {
         "compose Accumulo image": (
             compose,
-            "shoal/accumulo:4.0.0-snapshot-1a716b2c",
+            ACCUMULO_IMAGE,
         ),
         "compose Hadoop image": (compose, f"apache/hadoop:{HADOOP_VERSION}"),
         "compose ZooKeeper image": (compose, f"zookeeper:{ZOOKEEPER_VERSION}"),
@@ -102,13 +121,21 @@ def validate(root: Path = ROOT) -> list[str]:
             dockerfile,
             f"ARG ACCUMULO_SOURCE_SHA512={ACCUMULO_SOURCE_SHA512}",
         ),
-        "Dockerfile Hadoop version": (
+        "Dockerfile Accumulo Access revision": (
             dockerfile,
-            f"ARG HADOOP_VERSION={HADOOP_VERSION}",
+            f"ARG ACCUMULO_ACCESS_REVISION={ACCUMULO_ACCESS_REVISION}",
         ),
-        "Dockerfile Hadoop checksum": (
+        "Dockerfile Accumulo Access checksum": (
             dockerfile,
-            f"ARG HADOOP_SHA512={HADOOP_SHA512}",
+            f"ARG ACCUMULO_ACCESS_SOURCE_SHA512={ACCUMULO_ACCESS_SOURCE_SHA512}",
+        ),
+        "Dockerfile Hadoop image": (
+            dockerfile,
+            f"FROM apache/hadoop@{HADOOP_IMAGE_DIGEST} AS hadoop",
+        ),
+        "Dockerfile ZooKeeper image": (
+            dockerfile,
+            f"FROM zookeeper@{ZOOKEEPER_IMAGE_DIGEST} AS zookeeper",
         ),
         "Java smoke mount": (compose, "./smoke:/opt/shoal-smoke:ro"),
         "Shoal Go toolchain": (shoal_dockerfile, "FROM golang:1.25-bookworm AS build"),
@@ -155,7 +182,6 @@ def validate(root: Path = ROOT) -> list[str]:
             "instance.zookeeper.host": "zookeeper:2181",
             "instance.secret": "shoal-test-instance-secret",
             "tserver.memory.maps.native.enabled": "false",
-            "table.durability": "flush",
             "compaction.service.shoal.planner": (
                 "org.apache.accumulo.core.spi.compaction.RatioBasedCompactionPlanner"
             ),
@@ -227,7 +253,12 @@ def wait_ready() -> None:
 
 
 def down() -> None:
-    run(compose_command("down", "--volumes", "--remove-orphans"), check=False)
+    run(
+        compose_command(
+            "--profile", "shoal", "down", "--volumes", "--remove-orphans"
+        ),
+        check=False,
+    )
     shutil.rmtree(LIVE_DIR, ignore_errors=True)
 
 
@@ -329,7 +360,16 @@ def _run_tserver_role() -> None:
     run(client_command("recovery-prepare"))
     run(compose_command("kill", "--signal", "KILL", SHOAL_TSERVER))
     _wait_mode("shoal-absent")
-    run(compose_command("--profile", "shoal", "up", "--detach", SHOAL_TSERVER))
+    run(
+        compose_command(
+            "--profile",
+            "shoal",
+            "up",
+            "--detach",
+            "--no-deps",
+            SHOAL_TSERVER,
+        )
+    )
     _wait_mode("shoal-ready")
     run(client_command("recovery-verify"))
     print(

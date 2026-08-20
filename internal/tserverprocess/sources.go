@@ -10,6 +10,10 @@ import (
 	"crypto/subtle"
 	"errors"
 	"fmt"
+	"hash/fnv"
+	"maps"
+	"math"
+	"sort"
 
 	"github.com/phrocker/shoal/internal/managerclient"
 	"github.com/phrocker/shoal/internal/metadata"
@@ -131,6 +135,58 @@ func (s ManagerConfigSource) ReadTableConfiguration(
 	}
 	return (tabletloader.ManagerConfigSource{Client: s.Client, Principal: address}).
 		ReadTableConfiguration(ctx, tableID)
+}
+
+type EffectiveConfigurationResolver interface {
+	EffectiveProperties(context.Context, string) (map[string]string, error)
+}
+
+// ZKConfigSource reads the effective table configuration directly from
+// ZooKeeper, which is available while the root and metadata tablets bootstrap.
+type ZKConfigSource struct {
+	Resolver EffectiveConfigurationResolver
+}
+
+func (s ZKConfigSource) ReadTableConfiguration(
+	ctx context.Context,
+	tableID string,
+) (tabletloader.ConfigurationSnapshot, error) {
+	if s.Resolver == nil {
+		return tabletloader.ConfigurationSnapshot{}, tabletloader.ErrInvalidDependency
+	}
+	first, err := s.Resolver.EffectiveProperties(ctx, tableID)
+	if err != nil {
+		return tabletloader.ConfigurationSnapshot{}, tabletloader.Retryable(err)
+	}
+	second, err := s.Resolver.EffectiveProperties(ctx, tableID)
+	if err != nil {
+		return tabletloader.ConfigurationSnapshot{}, tabletloader.Retryable(err)
+	}
+	if !maps.Equal(first, second) {
+		return tabletloader.ConfigurationSnapshot{}, tabletloader.Retryable(
+			errors.New("tserverprocess: table configuration changed during read"))
+	}
+	return tabletloader.ConfigurationSnapshot{
+		TableID:    tableID,
+		Properties: second,
+		Generation: configurationGeneration(second),
+	}, nil
+}
+
+func configurationGeneration(properties map[string]string) int64 {
+	keys := make([]string, 0, len(properties))
+	for key := range properties {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	hash := fnv.New64a()
+	for _, key := range keys {
+		_, _ = hash.Write([]byte(key))
+		_, _ = hash.Write([]byte{0})
+		_, _ = hash.Write([]byte(properties[key]))
+		_, _ = hash.Write([]byte{0})
+	}
+	return int64(hash.Sum64() & math.MaxInt64)
 }
 
 // ExactCredentials validates the configured Accumulo system identity without

@@ -70,6 +70,8 @@ type Factory struct {
 	next atomic.Int64
 }
 
+func (*Factory) SupportsSystemTablets() bool { return true }
+
 func NewFactory(cfg Config) (*Factory, error) {
 	if cfg.Reader == nil || cfg.RootLocator == nil || cfg.Conditional == nil ||
 		cfg.RootStore == nil || cfg.Host == nil || cfg.InstancePath == "" ||

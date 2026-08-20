@@ -17,6 +17,7 @@ services:
 
   namenode:
     image: apache/hadoop:3.4.2
+    user: "0:0"
     hostname: namenode
     command:
       - /bin/bash
@@ -41,6 +42,7 @@ services:
 
   datanode:
     image: apache/hadoop:3.4.2
+    user: "0:0"
     hostname: datanode
     command: ["hdfs", "datanode"]
     depends_on:
@@ -79,15 +81,13 @@ services:
       - ./conf/hdfs-client-site.xml:/opt/hadoop/etc/hadoop/hdfs-site.xml:ro
 
   accumulo-init:
-    image: shoal/accumulo:4.0.0-snapshot-1a716b2c
-    build:
-      context: ./image
+    image: ghcr.io/phrocker/shoal-accumulo-test@sha256:bf9cbca5aaa8ada88d503e6cf178d41e72a6e0067cef47fe582f4b93c3d392db
     hostname: accumulo-init
     entrypoint: ["/bin/bash", "-c"]
     command:
       - |
         set -euo pipefail
-        accumulo init \
+        accumulo inst init \
           --instance-name "shoal" \
           --password "secret" \
           --upload-accumulo-props
@@ -106,11 +106,9 @@ services:
       - ./smoke:/opt/shoal-smoke:ro
 
   manager:
-    image: shoal/accumulo:4.0.0-snapshot-1a716b2c
-    build:
-      context: ./image
+    image: ghcr.io/phrocker/shoal-accumulo-test@sha256:bf9cbca5aaa8ada88d503e6cf178d41e72a6e0067cef47fe582f4b93c3d392db
     hostname: manager
-    command: ["manager"]
+    command: ["proc", "manager"]
     depends_on:
       accumulo-init:
         condition: service_completed_successfully
@@ -127,11 +125,9 @@ services:
       - ./smoke:/opt/shoal-smoke:ro
 
   tserver:
-    image: shoal/accumulo:4.0.0-snapshot-1a716b2c
-    build:
-      context: ./image
+    image: ghcr.io/phrocker/shoal-accumulo-test@sha256:bf9cbca5aaa8ada88d503e6cf178d41e72a6e0067cef47fe582f4b93c3d392db
     hostname: tserver
-    command: ["tserver"]
+    command: ["proc", "tserver"]
     depends_on:
       accumulo-init:
         condition: service_completed_successfully
@@ -223,11 +219,9 @@ services:
       - shoal-compactor-state:/var/lib/shoal-compactor
 
   garbage-collector:
-    image: shoal/accumulo:4.0.0-snapshot-1a716b2c
-    build:
-      context: ./image
+    image: ghcr.io/phrocker/shoal-accumulo-test@sha256:bf9cbca5aaa8ada88d503e6cf178d41e72a6e0067cef47fe582f4b93c3d392db
     hostname: garbage-collector
-    command: ["gc"]
+    command: ["proc", "gc"]
     depends_on:
       accumulo-init:
         condition: service_completed_successfully
@@ -242,11 +236,9 @@ services:
       - ./smoke:/opt/shoal-smoke:ro
 
   monitor:
-    image: shoal/accumulo:4.0.0-snapshot-1a716b2c
-    build:
-      context: ./image
+    image: ghcr.io/phrocker/shoal-accumulo-test@sha256:bf9cbca5aaa8ada88d503e6cf178d41e72a6e0067cef47fe582f4b93c3d392db
     hostname: monitor
-    command: ["monitor"]
+    command: ["proc", "monitor"]
     depends_on:
       accumulo-init:
         condition: service_completed_successfully

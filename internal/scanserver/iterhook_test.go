@@ -11,6 +11,7 @@ import (
 	"github.com/phrocker/shoal/internal/cache"
 	"github.com/phrocker/shoal/internal/ivfpq"
 	"github.com/phrocker/shoal/internal/metadata"
+	"github.com/phrocker/shoal/internal/rfile/wire"
 	"github.com/phrocker/shoal/internal/storage/memory"
 	"github.com/phrocker/shoal/internal/thrift/gen/data"
 )
@@ -79,10 +80,10 @@ func TestStartScan_WithIvfPqIterator(t *testing.T) {
 	}
 	ssio := map[string]map[string]string{
 		"ivfPqAdc": {
-			ivfpq.OptQuery:       base64.StdEncoding.EncodeToString(queryBuf),
-			ivfpq.OptPQCodebook:  base64.StdEncoding.EncodeToString(pqBuf.Bytes()),
-			ivfpq.OptTopK:        "2",
-			ivfpq.OptThreshold:   "-1e30",
+			ivfpq.OptQuery:      base64.StdEncoding.EncodeToString(queryBuf),
+			ivfpq.OptPQCodebook: base64.StdEncoding.EncodeToString(pqBuf.Bytes()),
+			ivfpq.OptTopK:       "2",
+			ivfpq.OptThreshold:  "-1e30",
 		},
 	}
 
@@ -158,6 +159,51 @@ func TestStartScan_UnknownIteratorErrors(t *testing.T) {
 	)
 	if err == nil {
 		t.Errorf("expected error for unknown iterator class")
+	}
+}
+
+func TestWholeRowProcessorUsesAccumuloEncoding(t *testing.T) {
+	processor := &wholeRowProcessor{}
+	processor.offer(&wire.Key{
+		Row: []byte("r1"), ColumnFamily: []byte("cf"),
+		ColumnQualifier: []byte("cq1"), Timestamp: 7,
+	}, []byte("v1"))
+	processor.offer(&wire.Key{
+		Row: []byte("r1"), ColumnFamily: []byte("cf"),
+		ColumnQualifier: []byte("cq2"), ColumnVisibility: []byte("A"), Timestamp: 6,
+	}, []byte("v2"))
+	processor.offer(&wire.Key{Row: []byte("r2"), Timestamp: 5}, []byte("v3"))
+
+	got := processor.drain()
+	if len(got) != 2 || string(got[0].Key.Row) != "r1" ||
+		got[0].Key.Timestamp != math.MaxInt64 || string(got[1].Key.Row) != "r2" {
+		t.Fatalf("drain = %#v", got)
+	}
+	in := bytes.NewReader(got[0].Value)
+	var count int32
+	if err := binary.Read(in, binary.BigEndian, &count); err != nil || count != 2 {
+		t.Fatalf("encoded count = %d, %v", count, err)
+	}
+	readField := func() []byte {
+		t.Helper()
+		var length int32
+		if err := binary.Read(in, binary.BigEndian, &length); err != nil {
+			t.Fatal(err)
+		}
+		value := make([]byte, length)
+		if _, err := in.Read(value); err != nil {
+			t.Fatal(err)
+		}
+		return value
+	}
+	if string(readField()) != "cf" || string(readField()) != "cq1" ||
+		len(readField()) != 0 {
+		t.Fatal("first encoded key fields do not match")
+	}
+	var timestamp int64
+	if err := binary.Read(in, binary.BigEndian, &timestamp); err != nil ||
+		timestamp != 7 || string(readField()) != "v1" {
+		t.Fatal("first encoded timestamp/value do not match")
 	}
 }
 
