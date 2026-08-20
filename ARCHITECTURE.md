@@ -20,6 +20,19 @@
 -->
 # Shoal architecture
 
+## Coordination authority
+
+Shoal's accepted architecture assigns one coordination authority per logical
+table: local process/PVC fencing for embedded mode, Kubernetes Leases for
+Shoal-only pod groups, and Accumulo's ZooKeeper ServiceLocks plus
+manager/coordinator authority when attached to Accumulo. These authorities
+must never be active concurrently for the same table. The adapters and fencing
+are tracked implementation work, not behavior supplied by the current
+binaries. The quorum, fencing, failure, and local-to-Accumulo handoff model is
+documented in
+[`docs/coordination-authority.md`](docs/coordination-authority.md) and tracked
+by [#128](https://github.com/phrocker/shoal-oss/issues/128).
+
 ## Goal
 Lightweight read-only Accumulo replica. JVM-free pods that open RFiles
 directly from object storage, run a minimal iterator stack, and serve

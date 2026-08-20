@@ -38,6 +38,12 @@ existing Accumulo cluster "through supported Accumulo primitives (bulk
 import/manager authority), never direct uncoordinated metadata edits."
 That invariant drives every design choice here:
 
+- A complete promotion cutover follows the repository-wide
+  [coordination authority model](./coordination-authority.md): local and
+  Accumulo write authority are mutually exclusive, and cutover is a durable,
+  fenced state transition rather than simultaneous ownership. The current
+  staging-and-submit slice does not implement that cutover protocol.
+
 - Promotion **never writes to `accumulo.metadata` or ZooKeeper**, and never
   invents its own notion of a tablet, split, or load state.
 - The only *mutating* Accumulo-facing calls this package makes are two standard
