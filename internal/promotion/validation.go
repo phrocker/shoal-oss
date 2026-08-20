@@ -5,6 +5,7 @@ import (
 	"net/url"
 	pathpkg "path"
 	"path/filepath"
+	"reflect"
 	"strings"
 
 	"github.com/phrocker/shoal/accumulo"
@@ -53,9 +54,10 @@ func validateBulkDirOnBackend(dst storage.Backend, bulkDir string) error {
 // validateDestinationWritable confirms dst implements
 // storage.WritableBackend before any Accumulo-facing step runs. A nil
 // dst is rejected the same way as any other non-writable backend: a
-// nil storage.Backend interface value implements no methods at all, so
-// the type assertion below always fails for it and this returns
-// storage.ErrReadOnly rather than treating nil as "nothing to check."
+// nil storage.Backend interface value implements no methods at all, and a
+// typed-nil pointer can retain the WritableBackend method set while still
+// panicking on use. Both forms return storage.ErrReadOnly rather than being
+// treated as usable destinations.
 // (validateBulkDir's own nil dst argument is unrelated: it is a
 // deliberate placeholder passed only to validateBulkDirOnBackend/
 // isBackendRootOnBackend for callers that have no specific backend to
@@ -72,10 +74,23 @@ func validateBulkDirOnBackend(dst storage.Backend, bulkDir string) error {
 // early, clear failure instead of one buried inside its first
 // storage.Copy call.
 func validateDestinationWritable(dst storage.Backend) error {
-	if _, ok := dst.(storage.WritableBackend); !ok {
+	if _, ok := dst.(storage.WritableBackend); !ok || isNilBackend(dst) {
 		return fmt.Errorf("%w: destination backend cannot be written to", storage.ErrReadOnly)
 	}
 	return nil
+}
+
+func isNilBackend(dst storage.Backend) bool {
+	if dst == nil {
+		return true
+	}
+	value := reflect.ValueOf(dst)
+	switch value.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+		return value.IsNil()
+	default:
+		return false
+	}
 }
 
 func isBackendRoot(bulkDir string) bool {

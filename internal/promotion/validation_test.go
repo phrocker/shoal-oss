@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/phrocker/shoal/internal/storage"
+	"github.com/phrocker/shoal/internal/storage/memory"
 )
 
 // TestValidateDestinationWritableRejectsNilDestination proves a nil dst
@@ -20,8 +21,16 @@ import (
 // before StageBulkDir's first storage.Copy call ever got a chance to
 // discover the problem.
 func TestValidateDestinationWritableRejectsNilDestination(t *testing.T) {
-	if err := validateDestinationWritable(nil); !errors.Is(err, storage.ErrReadOnly) {
-		t.Fatalf("validateDestinationWritable(nil) = %v, want an error wrapping %v", err, storage.ErrReadOnly)
+	var typedNil *memory.Backend
+	for name, dst := range map[string]storage.Backend{
+		"untyped nil": nil,
+		"typed nil":   typedNil,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := validateDestinationWritable(dst); !errors.Is(err, storage.ErrReadOnly) {
+				t.Fatalf("validateDestinationWritable(%s) = %v, want an error wrapping %v", name, err, storage.ErrReadOnly)
+			}
+		})
 	}
 }
 
@@ -31,8 +40,16 @@ func TestValidateDestinationWritableRejectsNilDestination(t *testing.T) {
 // must fail closed on a nil dst in practice, not just the lower-level
 // helper in isolation.
 func TestValidatePromotionDestinationRejectsNilDestination(t *testing.T) {
-	err := validatePromotionDestination(nil, "events", "hdfs://nn/bulk/events-1")
-	if !errors.Is(err, storage.ErrReadOnly) {
-		t.Fatalf("validatePromotionDestination(nil, ...) = %v, want an error wrapping %v", err, storage.ErrReadOnly)
+	var typedNil *memory.Backend
+	for name, dst := range map[string]storage.Backend{
+		"untyped nil": nil,
+		"typed nil":   typedNil,
+	} {
+		t.Run(name, func(t *testing.T) {
+			err := validatePromotionDestination(dst, "events", "hdfs://nn/bulk/events-1")
+			if !errors.Is(err, storage.ErrReadOnly) {
+				t.Fatalf("validatePromotionDestination(%s, ...) = %v, want an error wrapping %v", name, err, storage.ErrReadOnly)
+			}
+		})
 	}
 }
