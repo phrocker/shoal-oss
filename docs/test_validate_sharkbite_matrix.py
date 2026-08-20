@@ -860,7 +860,7 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
         with mock.patch.object(validator, "EXPECTED_APPROVED_DIVERGENCE_ROW_COUNT", 83):
             self.assert_validation_fails(
                 lambda: validator.validate_divergence_approvals(text.splitlines(), rows),
-                "the pinned approvals cover 92 rows, but the audited decision covers 83",
+                "the pinned approvals cover 94 rows, but the audited decision covers 83",
             )
 
     def test_same_cardinality_substitution_from_another_section_is_rejected(self) -> None:
@@ -998,10 +998,10 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
     def test_decision_count_is_pinned(self) -> None:
         text = load_document_text()
         rows = validator.parse_rows(text.splitlines())[2]
-        with mock.patch.object(validator, "EXPECTED_DIVERGENCE_DECISION_COUNT", 19):
+        with mock.patch.object(validator, "EXPECTED_DIVERGENCE_DECISION_COUNT", 20):
             self.assert_validation_fails(
                 lambda: validator.validate_divergence_approvals(text.splitlines(), rows),
-                "§26 lists 18 decisions, but the audited table holds 19",
+                "§26 lists 19 decisions, but the audited table holds 20",
             )
 
     def test_decision_count_is_derived_from_the_pinned_identifiers(self) -> None:
@@ -1028,14 +1028,14 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
         )
 
     def test_dropping_an_audited_decision_is_rejected(self) -> None:
-        pinned = validator.EXPECTED_DIVERGENCE_DECISION_IDS + ("SB-DIV-017",)
+        pinned = validator.EXPECTED_DIVERGENCE_DECISION_IDS + ("SB-DIV-020",)
         text = load_document_text()
         rows = validator.parse_rows(text.splitlines())[2]
         with mock.patch.object(validator, "EXPECTED_DIVERGENCE_DECISION_IDS", pinned), \
                 mock.patch.object(validator, "EXPECTED_DIVERGENCE_DECISION_COUNT", len(pinned)):
             self.assert_validation_fails(
                 lambda: validator.validate_divergence_approvals(text.splitlines(), rows),
-                "§26 lists 18 decisions, but the audited table holds 19",
+                "§26 lists 19 decisions, but the audited table holds 20",
             )
 
     def test_subsumed_entry_must_be_carved_out_of_the_blocking_entries(self) -> None:
@@ -1051,8 +1051,8 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
 
     def test_decision_split_prose_must_match_the_table(self) -> None:
         text = load_document_text().replace(
-            "The table below lists 18 decisions — 9 approved, 1 subsumed by that approval,",
-            "The table below lists 18 decisions — 10 approved, 0 subsumed by that approval,",
+            "The table below lists 19 decisions — 11 approved, 1 subsumed by that approval,",
+            "The table below lists 19 decisions — 12 approved, 0 subsumed by that approval,",
         )
         rows = validator.parse_rows(text.splitlines())[2]
         self.assert_validation_fails(
@@ -1062,10 +1062,11 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
 
     def test_proposed_entries_must_exclude_the_approved_and_subsumed_decisions(self) -> None:
         text = load_document_text().replace(
-            "The remaining 8 entries — every decision except the approved "
+            "The remaining 7 entries — every decision except the approved "
             "[SB-DIV-001](#sec-26), [SB-DIV-002](#sec-26), [SB-DIV-003](#sec-26), "
             "[SB-DIV-004](#sec-26), [SB-DIV-007](#sec-26), [SB-DIV-008](#sec-26), "
-            "[SB-DIV-016](#sec-26), [SB-DIV-018](#sec-26), [SB-DIV-019](#sec-26) "
+            "[SB-DIV-009](#sec-26), [SB-DIV-016](#sec-26), [SB-DIV-017](#sec-26), "
+            "[SB-DIV-018](#sec-26), [SB-DIV-019](#sec-26) "
             "and the subsumed [SB-DIV-013](#sec-26) — are **proposed**",
             "The remaining entries are **proposed**",
         )
@@ -1403,7 +1404,7 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
 
     def test_pinned_section_26_preamble_must_state_every_generated_sentence(self) -> None:
         narrowed = validator.DIVERGENCE_DECISION_PREAMBLE.replace(
-            "The table below lists 18 decisions", "The table below lists 19 decisions"
+            "The table below lists 19 decisions", "The table below lists 20 decisions"
         )
         self.assertNotEqual(narrowed, validator.DIVERGENCE_DECISION_PREAMBLE)
         text = load_document_text()
@@ -2141,7 +2142,7 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
         text = load_document_text()
         relocated = self._relocate_paragraph(text, "The table below lists")
         split_prose = validator.DIVERGENCE_DECISION_SPLIT_PROSE.format(
-            total=18, approved=9, subsumed=1, proposed=8
+            total=19, approved=11, subsumed=1, proposed=7
         )
         self.assertIn(
             split_prose,
@@ -2167,8 +2168,8 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
     def test_reconciliation_prose_must_stay_above_the_table_it_introduces(self) -> None:
         text = load_document_text()
         sentence = (
-            "**92 matrix rows currently carry the `Intentional divergence (approval\n"
-            "required)` status: 92 are approved and 0 are not.** "
+            "**94 matrix rows currently carry the `Intentional divergence (approval\n"
+            "required)` status: 94 are approved and 0 are not.** "
         )
         self.assertEqual(text.count(sentence), 1)
         relocated = text.replace(sentence, "", 1) + "\n" + " ".join(sentence.split()) + "\n"
@@ -2213,8 +2214,8 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
 
     def test_divergence_prose_must_reconcile_approved_and_unapproved_rows(self) -> None:
         text = load_document_text().replace(
-            "status: 92 are approved and 0 are not.**",
-            "status: 89 are approved and 1 is not.**",
+            "status: 94 are approved and 0 are not.**",
+            "status: 93 are approved and 1 is not.**",
         )
         rows = validator.parse_rows(text.splitlines())[2]
         self.assert_validation_fails(
@@ -2224,7 +2225,7 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
 
     def test_pinned_inventory_rejects_status_swap_between_rows_in_one_section(self) -> None:
         text = load_document_text()
-        first = "| SB-PKG-001 |"
+        first = "| SB-PKG-002 |"
         second = "| SB-PKG-014 |"
         lines = text.splitlines()
         first_index = next(i for i, line in enumerate(lines) if line.startswith(first))
@@ -2240,9 +2241,9 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
         self.assert_validation_fails(
             lambda: validator.validate_counts(mutated.splitlines(), mutated),
             f"revision {validator.EXPECTED_REVISION} inventory rows changed",
-            "reclassified [SB-PKG-001 pinned Missing C ABI found Intentional divergence "
+            "reclassified [SB-PKG-002 pinned Covered found Intentional divergence "
             "(approval required), SB-PKG-014 pinned Intentional divergence (approval required) "
-            "found Missing C ABI]",
+            "found Covered]",
         )
 
     def test_validate_revision_inventory_rejects_same_prefix_row_id_substitution(self) -> None:
@@ -2254,8 +2255,8 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
         self.assert_validation_fails(
             lambda: validator.validate_counts(rewritten_text.splitlines(), rewritten_text),
             f"revision {validator.EXPECTED_REVISION} inventory rows changed",
-            "missing [SB-PKG-001 (Missing C ABI)]",
-            "unexpected [SB-PKG-999 (Missing C ABI)]",
+            "missing [SB-PKG-001 (Intentional divergence (approval required))]",
+            "unexpected [SB-PKG-999 (Intentional divergence (approval required))]",
         )
 
     def test_validate_revision_inventory_rejects_row_deletion(self) -> None:
@@ -2263,7 +2264,7 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
         self.assert_validation_fails(
             lambda: validator.validate_counts(rewritten_text.splitlines(), rewritten_text),
             f"revision {validator.EXPECTED_REVISION} inventory rows changed",
-            "missing [SB-PKG-001 (Missing C ABI)]",
+            "missing [SB-PKG-001 (Intentional divergence (approval required))]",
         )
 
     def test_validate_revision_inventory_rejects_row_addition(self) -> None:
@@ -2476,15 +2477,15 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
 
     def test_pinned_inventory_constants_are_internally_consistent(self) -> None:
         validator.validate_pinned_inventory_constants()
-        self.assertEqual(validator.EXPECTED_REVISION, 48)
+        self.assertEqual(validator.EXPECTED_REVISION, 49)
         self.assertEqual(validator.EXPECTED_TOTAL_ROWS, 3203)
         self.assertEqual(validator.EXPECTED_REQUIRED_ROWS, 397)
         self.assertEqual(
             validator.EXPECTED_SCOPE_COUNTS,
             {
-                "Covered": 156,
-                "Approved divergence": 92,
-                "Required gap": 149,
+                "Covered": 161,
+                "Approved divergence": 94,
+                "Required gap": 142,
                 "Optional": 2763,
                 "Not required": 43,
             },
@@ -2492,11 +2493,11 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
         self.assertEqual(
             validator.EXPECTED_STATUS_COUNTS,
             {
-                "Covered": 219,
+                "Covered": 224,
                 "Missing Go": 2218,
-                "Missing C ABI": 89,
-                "Behavior mismatch": 194,
-                validator.INTENTIONAL_DIVERGENCE_STATUS: 92,
+                "Missing C ABI": 83,
+                "Behavior mismatch": 193,
+                validator.INTENTIONAL_DIVERGENCE_STATUS: 94,
                 validator.NOT_REQUIRED_STATUS: 391,
             },
         )
@@ -2568,7 +2569,7 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
         lines[2] = "# Sharkbite source: unreviewed."
         self.assert_validation_fails(
             lambda: validator.validate_scope_manifest_provenance(lines),
-            "scope manifest provenance header does not match revision 48",
+            "scope manifest provenance header does not match revision 49",
         )
 
     def test_collect_c_abi_free_function_inventory_matches_header(self) -> None:
@@ -2695,7 +2696,7 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
             lambda: validator.validate_revision_inventory(
                 row_ids, reclassified, prefix_counts
             ),
-            f"revision {validator.EXPECTED_REVISION} inventory expects 219 rows for Covered, found 220",
+            f"revision {validator.EXPECTED_REVISION} inventory expects 224 rows for Covered, found 225",
         )
 
     def test_declared_count_edit_still_fails_internal_cross_check(self) -> None:
@@ -2724,7 +2725,7 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
     def test_revision_bump_requires_validator_constant_update(self) -> None:
         text = load_document_text()
         mutated = text.replace(
-            f"Revision {validator.EXPECTED_REVISION} — completes the 40 required table, namespace, and security rows",
+            f"Revision {validator.EXPECTED_REVISION} — closes the semantic package/import/layout/preload rows",
             f"Revision {validator.EXPECTED_REVISION + 1} — adds the next audited scope",
         ).replace(
             f"As of revision {validator.EXPECTED_REVISION},",
@@ -2733,7 +2734,7 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
         self.assertNotEqual(mutated, text)
         self.assert_validation_fails(
             lambda: validator.validate_counts(mutated.splitlines(), mutated),
-            f"document status is missing expected detail: Revision {validator.EXPECTED_REVISION} — completes the 40 required table, namespace, and security rows",
+            f"document status is missing expected detail: Revision {validator.EXPECTED_REVISION} — closes the semantic package/import/layout/preload rows",
         )
 
     # ---- matrix table separators -------------------------------------------

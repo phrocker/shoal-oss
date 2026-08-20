@@ -1,6 +1,6 @@
 # ADR: Sharkbite client compatibility scope
 
-Status: Accepted, normative for `docs/sharkbite-compatibility.md` revision 47.
+Status: Accepted, normative for `docs/sharkbite-compatibility.md` revision 49.
 
 ## Decision
 
@@ -12,7 +12,7 @@ semantics. It does not require a source-compatible recreation of Sharkbite's
 historical C++ implementation.
 
 Every matrix row has exactly one release-scope disposition in
-`docs/sharkbite-compatibility-revision47-scope.tsv`:
+`docs/sharkbite-compatibility-revision49-scope.tsv`:
 
 1. **Covered** — a required client row whose matrix status is `Covered`.
 2. **Approved divergence** — a required row with a named, dated decision in
@@ -48,5 +48,5 @@ missing implementation into `Covered`. Core rows with `Missing Go`,
 The core code/package gate is open only when every required row is `Covered` or
 an `Approved divergence`. Live Accumulo evidence tracked by #74 and native
 macOS evidence may remain external only when the affected rows stay explicit.
-Revision 47 therefore keeps `SB-XCUT-014`, `SB-XCUT-019`, and `SB-PKG-008` as
+Revision 49 therefore keeps `SB-XCUT-014`, `SB-XCUT-019`, and `SB-PKG-008` as
 required runtime/environment gaps.
