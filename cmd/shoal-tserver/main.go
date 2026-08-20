@@ -3,11 +3,11 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/base64"
 	"flag"
 	"fmt"
 	"log/slog"
-	"net/http"
 	"os"
 	"os/signal"
 	"path"
@@ -29,6 +29,7 @@ import (
 	"github.com/phrocker/shoal/internal/metadatacas"
 	"github.com/phrocker/shoal/internal/namespaces"
 	"github.com/phrocker/shoal/internal/protocol"
+	"github.com/phrocker/shoal/internal/roleops"
 	"github.com/phrocker/shoal/internal/scanserver"
 	"github.com/phrocker/shoal/internal/storage"
 	"github.com/phrocker/shoal/internal/storage/azure"
@@ -39,6 +40,7 @@ import (
 	"github.com/phrocker/shoal/internal/tablenames"
 	"github.com/phrocker/shoal/internal/tabletloader"
 	"github.com/phrocker/shoal/internal/thrift/gen/security"
+	"github.com/phrocker/shoal/internal/tlsserver"
 	"github.com/phrocker/shoal/internal/transportpool"
 	"github.com/phrocker/shoal/internal/tserver"
 	"github.com/phrocker/shoal/internal/tserverprocess"
@@ -80,6 +82,9 @@ func main() {
 	stateRoot := flag.String("state-root", "/var/lib/shoal/minc-state", "durable minor-compaction state directory")
 	flushCells := flag.Int("flush-cells", 1, "memtable cells that trigger minor compaction")
 	enableIngest := flag.Bool("enable-ingest", false, "advertise TABLET_INGEST after all write authorities initialize")
+	tlsCert := flag.String("tls-cert", "", "server TLS certificate for Thrift and operations listeners")
+	tlsKey := flag.String("tls-key", "", "server TLS private key")
+	tlsClientCA := flag.String("tls-client-ca", "", "client CA enabling mutual TLS")
 	flag.Parse()
 
 	if *showVersion {
@@ -89,12 +94,25 @@ func main() {
 	*instanceSecret = valueOrEnv(*instanceSecret, "ACCUMULO_INSTANCE_SECRET")
 	*password = valueOrEnv(*password, "SHOAL_PASSWORD")
 	*systemToken = valueOrEnv(*systemToken, "SHOAL_SYSTEM_TOKEN_BASE64")
+	*tlsCert = valueOrEnv(*tlsCert, "SHOAL_TLS_CERT")
+	*tlsKey = valueOrEnv(*tlsKey, "SHOAL_TLS_KEY")
+	*tlsClientCA = valueOrEnv(*tlsClientCA, "SHOAL_TLS_CLIENT_CA")
 	if *advertise == "" || *zkServers == "" || *instanceSecret == "" || *password == "" || *systemToken == "" {
 		die("-advertise, -zk, instance secret, password, and system token are required")
 	}
 	token, err := base64.StdEncoding.DecodeString(*systemToken)
 	if err != nil || len(token) == 0 {
 		die("invalid empty -system-token-base64: %v", err)
+	}
+	var tlsConfig *tls.Config
+	if *tlsCert != "" || *tlsKey != "" || *tlsClientCA != "" {
+		if *tlsCert == "" || *tlsKey == "" {
+			die("-tls-cert and -tls-key must be set together")
+		}
+		tlsConfig, err = tlsserver.Build(*tlsCert, *tlsKey, *tlsClientCA)
+		if err != nil {
+			die("TLS configuration: %v", err)
+		}
 	}
 
 	signalCtx, stopSignals := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -236,7 +254,12 @@ func main() {
 	if err := services.Register(mux); err != nil {
 		die("register processors: %v", err)
 	}
-	socket, err := thrift.NewTServerSocket(*listen)
+	var socket thrift.TServerTransport
+	if tlsConfig != nil {
+		socket, err = thrift.NewTSSLServerSocket(*listen, tlsConfig.Clone())
+	} else {
+		socket, err = thrift.NewTServerSocket(*listen)
+	}
 	if err != nil {
 		die("listen %s: %v", *listen, err)
 	}
@@ -247,16 +270,27 @@ func main() {
 	)
 
 	serverErr := make(chan error, 1)
-	go func() { serverErr <- server.Serve() }()
-	var operations *http.Server
+	thriftDone := make(chan error, 1)
+	go func() {
+		err := server.Serve()
+		thriftDone <- err
+		select {
+		case serverErr <- err:
+		default:
+		}
+	}()
+	var operations *roleops.Server
 	if *metricsAddress != "" {
-		operations = &http.Server{
-			Addr:              *metricsAddress,
-			Handler:           tserverprocess.OperationsHandlerWithIngest(host, scans, ingest),
-			ReadHeaderTimeout: 5 * time.Second,
+		operations, err = roleops.Start(
+			*metricsAddress,
+			tserverprocess.OperationsHandlerWithWriteTier(host, scans, ingest, tabletFactory, *enableIngest),
+			tlsConfig,
+		)
+		if err != nil {
+			die("operations listener: %v", err)
 		}
 		go func() {
-			if err := operations.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			if err := <-operations.Done(); err != nil {
 				select {
 				case serverErr <- err:
 				default:
@@ -317,15 +351,34 @@ func main() {
 	// keeping a ServiceLock that would invite new manager assignments.
 	cancelRun()
 	drainCtx, cancelDrain := context.WithTimeout(context.Background(), *drainTimeout)
-	result := scans.Drain(drainCtx)
+	var result scanserver.DrainResult
+	if err := roleops.RunBounded(
+		drainCtx,
+		ingest.Drain,
+		func(ctx context.Context) error {
+			result = scans.Drain(ctx)
+			return ctx.Err()
+		},
+	); err != nil {
+		logger.Warn("bounded write-tier drain ended", "error", err)
+	}
 	cancelDrain()
 	if result.Forced() > 0 {
 		logger.Warn("forced scan session drain", "sessions", result.Forced())
 	}
 	_ = server.Stop()
+	serverStopCtx, cancelServerStop := context.WithTimeout(context.Background(), 5*time.Second)
+	select {
+	case <-thriftDone:
+	case <-serverStopCtx.Done():
+		logger.Warn("Thrift serve loop did not stop before deadline")
+	}
+	cancelServerStop()
 	if operations != nil {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		_ = operations.Shutdown(shutdownCtx)
+		if err := operations.Shutdown(shutdownCtx); err != nil {
+			logger.Warn("operations shutdown", "error", err)
+		}
 		cancel()
 	}
 }

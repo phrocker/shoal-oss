@@ -296,6 +296,11 @@ func TestSessionExpiryBackpressureAndDrain(t *testing.T) {
 	if _, err := service.StartUpdate(context.Background(), nil, testCredentials(), tabletingest.TDurability_SYNC); err == nil {
 		t.Fatal("draining service accepted a session")
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := service.Drain(ctx); err != nil {
+		t.Fatalf("bounded drain: %v", err)
+	}
 }
 
 func TestConcurrentCancelAndApply(t *testing.T) {

@@ -63,6 +63,7 @@ type Service struct {
 	cfg Config
 
 	mu        sync.Mutex
+	drainDone chan struct{}
 	sessions  map[data.UpdateID]*updateSession
 	nextID    atomic.Int64
 	accepting atomic.Bool
@@ -123,7 +124,10 @@ func New(cfg Config) (*Service, error) {
 	if _, err := rand.Read(seed[:]); err != nil {
 		return nil, fmt.Errorf("ingestservice: session id seed: %w", err)
 	}
-	s := &Service{cfg: cfg, sessions: make(map[data.UpdateID]*updateSession)}
+	s := &Service{
+		cfg: cfg, sessions: make(map[data.UpdateID]*updateSession),
+		drainDone: make(chan struct{}),
+	}
 	s.nextID.Store(int64(binary.BigEndian.Uint64(seed[:]) & ((1 << 62) - 1)))
 	s.accepting.Store(true)
 	return s, nil
@@ -346,11 +350,30 @@ func (s *Service) BeginDrain() {
 	s.mu.Unlock()
 	for _, session := range sessions {
 		session.cancel()
-		go func(session *updateSession) {
-			session.mu.Lock()
-			session.close()
-			session.mu.Unlock()
-		}(session)
+	}
+	go func() {
+		var wg sync.WaitGroup
+		wg.Add(len(sessions))
+		for _, session := range sessions {
+			go func(session *updateSession) {
+				defer wg.Done()
+				session.mu.Lock()
+				session.close()
+				session.mu.Unlock()
+			}(session)
+		}
+		wg.Wait()
+		close(s.drainDone)
+	}()
+}
+
+func (s *Service) Drain(ctx context.Context) error {
+	s.BeginDrain()
+	select {
+	case <-s.drainDone:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 

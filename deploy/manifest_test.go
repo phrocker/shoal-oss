@@ -188,6 +188,68 @@ func TestReadFleetMonitoringRulesUseExportedMetrics(t *testing.T) {
 	}
 }
 
+func TestWriteRoleManifestsHaveSemanticProbesAndSafeRollouts(t *testing.T) {
+	tserverDocs := splitYAMLDocuments(readManifest(t, "k8s/tserver.yaml"))
+	tserver := requireDoc(t, tserverDocs, "StatefulSet", "shoal-tserver")
+	for _, want := range []string{
+		"updateStrategy:", "startupProbe:", "path: /startupz", "path: /readyz",
+		"-enable-ingest", "readOnlyRootFilesystem: true", "terminationGracePeriodSeconds: 45",
+	} {
+		requireContains(t, tserver, want)
+	}
+	requireContains(t, requireDoc(t, tserverDocs, "PodDisruptionBudget", "shoal-tserver"), "maxUnavailable: 1")
+
+	compactorDocs := splitYAMLDocuments(readManifest(t, "k8s/compactor.yaml"))
+	compactor := requireDoc(t, compactorDocs, "StatefulSet", "shoal-compactor")
+	for _, want := range []string{
+		"updateStrategy:", "startupProbe:", "path: /startupz", "path: /readyz",
+		"-shutdown-timeout=30s", "volumeClaimTemplates:", "readOnlyRootFilesystem: true",
+	} {
+		requireContains(t, compactor, want)
+	}
+	requireContains(t, requireDoc(t, compactorDocs, "PodDisruptionBudget", "shoal-compactor"), "maxUnavailable: 1")
+}
+
+func TestWriteTierMonitoringRulesUseExportedMetrics(t *testing.T) {
+	alerts := readManifest(t, "monitoring/write-tier-alerts.yaml")
+	for _, metric := range []string{
+		"shoal_dependency_ready",
+		"shoal_tserver_ingest_backpressure_total",
+		"shoal_tserver_wal_failures_total",
+		"shoal_tserver_minc_failures_total",
+		"shoal_compactor_jobs_failed_total",
+		"shoal_compactor_completion_ambiguous_total",
+		"shoal_compactor_retries_total",
+	} {
+		if !strings.Contains(alerts, metric) {
+			t.Errorf("write-tier alerts missing metric %q", metric)
+		}
+	}
+}
+
+func TestHelmWriteRolesDeclareTLSPDBAndPersistentRestartState(t *testing.T) {
+	values := readManifest(t, "helm/shoal/values.yaml")
+	for _, section := range []string{"tserver:", "compactor:", "shutdownTimeout:", "walStorageSize:", "stateStorageSize:"} {
+		if !strings.Contains(values, section) {
+			t.Errorf("values missing %q", section)
+		}
+	}
+	for _, template := range []string{
+		"helm/shoal/templates/tserver.yaml",
+		"helm/shoal/templates/compactor.yaml",
+	} {
+		content := readManifest(t, template)
+		for _, want := range []string{
+			"PodDisruptionBudget", "volumeClaimTemplates:", "startupProbe:",
+			"readinessProbe:", "tls.requireClientCert", "scheme: HTTPS", "tcpSocket:",
+		} {
+			if !strings.Contains(content, want) {
+				t.Errorf("%s missing %q", template, want)
+			}
+		}
+	}
+}
+
 // TestPlainManifestsCarryNoUnconditionalTLS guards the plain-YAML
 // documentation-only TLS example in write-tier.yaml: since plain
 // manifests have no templating/conditionals, the only safe way to
