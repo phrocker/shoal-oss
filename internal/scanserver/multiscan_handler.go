@@ -1,9 +1,11 @@
 package scanserver
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"log/slog"
+	"sort"
 	"time"
 
 	"github.com/phrocker/shoal/internal/thrift/gen/client"
@@ -14,27 +16,18 @@ import (
 )
 
 // StartMultiScan implements the BatchScanner-shaped server-side path.
-// Single-shot: every (tablet, ranges) pair in the ScanBatch is scanned
-// to completion (or until the global byte budget is hit), results are
-// concatenated into one MultiScanResult, and ContinueMultiScan signals
-// exhausted.
+// Each tablet is scanned independently. Successful results are paged
+// behind one stable scan ID while recoverable tablet failures are
+// returned in MultiScanResult.Failures for client retry.
 //
 // Compared to StartScan:
 //   - Caller hands in a ScanBatch (map TKeyExtent → []TRange) instead of
 //     a single (extent, range) pair.
 //   - Per-tablet range lists are normalized (sort + merge overlaps),
 //     then driven through scanTabletRanges.
-//   - The remaining budget shrinks across tablets — once we've used 4MB,
-//     we stop and report MultiScanResult.More=true so the caller knows
-//     it didn't get everything. (V0.5 doesn't issue continuation tokens
-//     for "resume from key X"; the Java SDK gets back what shoal could
-//     fit and falls back to tserver for the rest if needed.)
 //
-// Failures and partial-scan handling: V0.5 treats per-tablet failures as
-// fatal — we return an error to the Thrift call site rather than try to
-// fill MultiScanResult.Failures. Future hardening can downgrade to
-// per-tablet recoverable failures so a single tablet miss doesn't fail
-// the whole batch.
+// Result ordering is deterministic across map iteration so continuation
+// boundaries are reproducible.
 func (s *Server) StartMultiScan(
 	ctx context.Context,
 	tinfo *client.TInfo,
@@ -63,9 +56,10 @@ func (s *Server) StartMultiScan(
 	ev := visfilter.NewEvaluator(auths)
 
 	allResults := make([]*data.TKeyValue, 0, 64)
+	failures := make(data.ScanBatch)
+	fullScans := make([]*data.TKeyExtent, 0, len(batch))
 	totalBytes := 0
 	tabletsScanned := 0
-	truncated := false
 
 	// Iterator post-processor is built ONCE per multiscan but applied
 	// per-tablet. Each tablet gets its own (top-K) result; the Java
@@ -94,7 +88,23 @@ func (s *Server) StartMultiScan(
 		}
 	}
 
+	type extentWork struct {
+		extent *data.TKeyExtent
+		ranges []*data.TRange
+	}
+	work := make([]extentWork, 0, len(expanded))
 	for extent, ranges := range expanded {
+		work = append(work, extentWork{extent: extent, ranges: ranges})
+	}
+	sort.Slice(work, func(i, j int) bool {
+		return compareExtents(work[i].extent, work[j].extent) < 0
+	})
+
+	for _, item := range work {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		extent, ranges := item.extent, item.ranges
 		if extent == nil || len(ranges) == 0 {
 			continue
 		}
@@ -103,13 +113,8 @@ func (s *Server) StartMultiScan(
 		// when the caller didn't pre-resolve the extent.
 		files, err := s.lookupFiles(ctx, extent, ranges[0])
 		if err != nil {
-			return nil, fmt.Errorf("multiscan lookup files (table=%s): %w", string(extent.Table), err)
-		}
-
-		remaining := MaxResultBytes - totalBytes
-		if remaining <= 0 {
-			truncated = true
-			break
+			failures[cloneTKeyExtent(extent)] = cloneRanges(ranges)
+			continue
 		}
 		var perTabletProc cellPostProcessor
 		if hasIterator {
@@ -120,37 +125,105 @@ func (s *Server) StartMultiScan(
 			perTabletProc = pp
 		}
 		results, used, perTabletTrunc, err := s.scanTabletRanges(
-			ctx, files, ranges, columns, ev, remaining, perTabletProc,
+			ctx, files, ranges, columns, ev, int(^uint(0)>>1), perTabletProc,
 		)
 		if err != nil {
-			return nil, fmt.Errorf("multiscan tablet (table=%s): %w", string(extent.Table), err)
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			failures[cloneTKeyExtent(extent)] = cloneRanges(ranges)
+			continue
+		}
+		if perTabletTrunc {
+			return nil, fmt.Errorf("multiscan tablet (table=%s): unexpected internal truncation", string(extent.Table))
 		}
 		allResults = append(allResults, results...)
 		totalBytes += used
 		tabletsScanned++
-		if perTabletTrunc {
-			truncated = true
-			break
+		fullScans = append(fullScans, cloneTKeyExtent(extent))
+	}
+
+	complete := &data.MultiScanResult_{
+		Results:   allResults,
+		Failures:  failures,
+		FullScans: fullScans,
+	}
+	page := splitMultiScanResult(complete, s.pages)
+	scanID := data.ScanID(0)
+	if page.result.More {
+		createdID, createErr := s.multiScans.create(
+			time.Now(),
+			page.remaining,
+			page.tail,
+		)
+		if createErr != nil {
+			return nil, createErr
 		}
+		scanID = createdID
 	}
 
 	s.logger.LogAttrs(ctx, slog.LevelInfo, "multiscan complete",
-		slog.Int("tablets_in_batch", len(batch)),
+		slog.Int("tablets_in_batch", len(expanded)),
 		slog.Int("tablets_scanned", tabletsScanned),
-		slog.Int("cells_returned", len(allResults)),
-		slog.Int("approx_bytes", totalBytes),
-		slog.Bool("truncated", truncated),
+		slog.Int("tablets_failed", len(failures)),
+		slog.Int("cells_returned", len(page.result.Results)),
+		slog.Int("cells_total", len(allResults)),
+		slog.Int("approx_bytes_total", totalBytes),
+		slog.Bool("continued", page.result.More),
 		slog.Duration("dur", time.Since(t0)),
 		slog.Int("vis_cache", ev.CacheSize()),
 	)
 
 	return &data.InitialMultiScan{
-		ScanID: 0,
-		Result_: &data.MultiScanResult_{
-			Results: allResults,
-			More:    truncated,
-		},
+		ScanID:  scanID,
+		Result_: page.result,
 	}, nil
+}
+
+func compareExtents(a, b *data.TKeyExtent) int {
+	if a == nil {
+		if b == nil {
+			return 0
+		}
+		return -1
+	}
+	if b == nil {
+		return 1
+	}
+	if c := bytes.Compare(a.Table, b.Table); c != 0 {
+		return c
+	}
+	if c := compareOptionalRows(a.PrevEndRow, b.PrevEndRow, true); c != 0 {
+		return c
+	}
+	return compareOptionalRows(a.EndRow, b.EndRow, false)
+}
+
+func compareOptionalRows(a, b []byte, nilFirst bool) int {
+	if a == nil {
+		if b == nil {
+			return 0
+		}
+		if nilFirst {
+			return -1
+		}
+		return 1
+	}
+	if b == nil {
+		if nilFirst {
+			return 1
+		}
+		return -1
+	}
+	return bytes.Compare(a, b)
+}
+
+func cloneRanges(ranges []*data.TRange) []*data.TRange {
+	cloned := make([]*data.TRange, len(ranges))
+	for i, r := range ranges {
+		cloned[i] = cloneTRange(r)
+	}
+	return cloned
 }
 
 // binRangesByTablet groups single-row-style ranges by the tablet that

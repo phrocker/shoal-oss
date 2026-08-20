@@ -1,8 +1,6 @@
 // Package scanserver implements the Thrift TabletScanClientService
-// server surface — single-shot StartScan only. ContinueScan returns
-// empty results; CloseScan is a no-op; StartMultiScan returns an
-// "unsupported" error. Per the V0 spec, every scan() request is
-// self-contained — no scanID state is retained across calls.
+// server surface. Single-tablet and multi-tablet scans retain bounded
+// continuation state behind opaque scan IDs when a response is paged.
 //
 // One Server instance per shoal pod. Holds:
 //   - metadata.Walker — does the ZK + tablet-location lookups
@@ -20,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"github.com/phrocker/shoal/internal/cache"
 	"github.com/phrocker/shoal/internal/rfile/bcfile"
@@ -37,11 +36,14 @@ var _ tabletscan.TabletScanClientService = (*Server)(nil)
 
 // Server holds the long-lived state needed to serve scans.
 type Server struct {
-	locator cache.TableLocator
-	blocks  *cache.BlockCache
-	storage storage.Backend
-	dec     *block.Decompressor
-	logger  *slog.Logger
+	locator    cache.TableLocator
+	blocks     *cache.BlockCache
+	storage    storage.Backend
+	dec        *block.Decompressor
+	logger     *slog.Logger
+	pages      int
+	scans      *scanSessionRegistry
+	multiScans *multiScanSessionRegistry
 
 	// File-level byte cache: GCS path → full RFile bytes. Avoids
 	// re-pulling the same 30MB+ file on every scan against the same
@@ -91,6 +93,19 @@ type Options struct {
 	// segment replicas for the opt-in WAL-merged read path. Zero is fine
 	// when recorded peers already carry an explicit ":port".
 	WALPeerPort int
+
+	// ScanResultBytesCap is the per-response result budget. Zero uses
+	// MaxResultBytes.
+	ScanResultBytesCap int
+	// ScanSessionTTL bounds idle continuation lifetime. Zero uses five
+	// minutes.
+	ScanSessionTTL time.Duration
+	// ScanSessionCapacity bounds retained single-scan and multi-scan
+	// sessions independently. Zero uses 256.
+	ScanSessionCapacity int
+	// ScanSessionBytesCapacity bounds retained result bytes independently
+	// for single-scan and multi-scan sessions. Zero uses 1 GiB.
+	ScanSessionBytesCapacity int
 }
 
 // NewServer constructs a scan Server. Returns an error if any of the
@@ -114,31 +129,45 @@ func NewServer(opts Options) (*Server, error) {
 	if fileCap == 0 {
 		fileCap = 1 << 30 // 1 GB
 	}
+	pageCap := opts.ScanResultBytesCap
+	if pageCap <= 0 {
+		pageCap = MaxResultBytes
+	}
 	var fc *fileCache
 	if fileCap > 0 {
 		fc = newFileCache(fileCap)
 	}
 	return &Server{
-		locator:     opts.Locator,
-		blocks:      opts.BlockCache,
-		storage:     opts.Storage,
-		dec:         dec,
-		logger:      logger,
+		locator: opts.Locator,
+		blocks:  opts.BlockCache,
+		storage: opts.Storage,
+		dec:     dec,
+		logger:  logger,
+		pages:   pageCap,
+		scans: newScanSessionRegistry(
+			opts.ScanSessionTTL,
+			opts.ScanSessionCapacity,
+			opts.ScanSessionBytesCapacity,
+		),
+		multiScans: newMultiScanSessionRegistry(
+			opts.ScanSessionTTL,
+			opts.ScanSessionCapacity,
+			opts.ScanSessionBytesCapacity,
+		),
 		files:       fc,
 		walPeerPort: opts.WALPeerPort,
 	}, nil
 }
 
-// ContinueScan: V0 returns an empty result with More=false. shoal
-// completes every scan in StartScan; clients that follow up with
-// ContinueScan get an immediate "no more" signal.
 func (s *Server) ContinueScan(ctx context.Context, tinfo *client.TInfo, scanID data.ScanID, busyTimeout int64) (*data.ScanResult_, error) {
-	return &data.ScanResult_{Results: nil, More: false}, nil
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return s.scans.continueScan(time.Now(), scanID, s.pages)
 }
 
-// CloseScan: no-op. We hold no per-scan state.
 func (s *Server) CloseScan(ctx context.Context, tinfo *client.TInfo, scanID data.ScanID) error {
-	return nil
+	return s.scans.closeScan(time.Now(), scanID)
 }
 
 // StartMultiScan implements the BatchScanner-shaped server-side path.
@@ -148,15 +177,15 @@ func (s *Server) CloseScan(ctx context.Context, tinfo *client.TInfo, scanID data
 //
 // Implementation: handled in multiscan_handler.go.
 
-// ContinueMultiScan: shoal completes every multi-scan in one shot, so
-// any follow-up call gets an immediate "no more" signal.
 func (s *Server) ContinueMultiScan(ctx context.Context, tinfo *client.TInfo, scanID data.ScanID, busyTimeout int64) (*data.MultiScanResult_, error) {
-	return &data.MultiScanResult_{Results: nil, More: false}, nil
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return s.multiScans.continueMultiScan(time.Now(), scanID, s.pages)
 }
 
-// CloseMultiScan: no-op.
 func (s *Server) CloseMultiScan(ctx context.Context, tinfo *client.TInfo, scanID data.ScanID) error {
-	return nil
+	return s.multiScans.closeScan(time.Now(), scanID)
 }
 
 // GetActiveScans: V0 holds no per-scan state, so there are no active
