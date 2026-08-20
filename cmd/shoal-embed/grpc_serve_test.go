@@ -215,7 +215,7 @@ func TestEmbedServer_WriteReturnsPerMutationConditionalResults(t *testing.T) {
 		}}
 		return mutation
 	}
-	resp, err := srv.Write(context.Background(), &embedpb.WriteRequest{
+	resp, err := srv.ConditionalWrite(context.Background(), &embedpb.WriteRequest{
 		Table: "cas", Mutations: []*embedpb.Mutation{conditional("first"), conditional("second")},
 	})
 	if err != nil {
@@ -229,7 +229,7 @@ func TestEmbedServer_WriteReturnsPerMutationConditionalResults(t *testing.T) {
 		t.Fatalf("results = %+v", resp.Results)
 	}
 
-	_, err = srv.Write(context.Background(), &embedpb.WriteRequest{
+	_, err = srv.ConditionalWrite(context.Background(), &embedpb.WriteRequest{
 		Table: "cas",
 		Mutations: []*embedpb.Mutation{{
 			Row: []byte("other"), Entries: testMutation("other", "value").Entries,
@@ -238,6 +238,13 @@ func TestEmbedServer_WriteReturnsPerMutationConditionalResults(t *testing.T) {
 	})
 	if status.Code(err) != codes.InvalidArgument {
 		t.Fatalf("missing predicate error = %v, want InvalidArgument", err)
+	}
+
+	_, err = srv.Write(context.Background(), &embedpb.WriteRequest{
+		Table: "cas", Mutations: []*embedpb.Mutation{conditional("unsafe")},
+	})
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("conditional Write error = %v, want InvalidArgument", err)
 	}
 }
 

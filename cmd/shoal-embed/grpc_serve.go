@@ -243,6 +243,22 @@ func (s *embedServer) Write(ctx context.Context, req *embedpb.WriteRequest) (*em
 	if req.Table == "" {
 		return nil, status.Error(codes.InvalidArgument, "table is required")
 	}
+	for _, mutation := range req.Mutations {
+		if mutation != nil && len(mutation.Conditions) > 0 {
+			return nil, status.Error(codes.InvalidArgument, "conditional mutations require ConditionalWrite")
+		}
+	}
+	return s.writeWithResults(ctx, req)
+}
+
+func (s *embedServer) ConditionalWrite(ctx context.Context, req *embedpb.WriteRequest) (*embedpb.WriteResponse, error) {
+	if req.Table == "" {
+		return nil, status.Error(codes.InvalidArgument, "table is required")
+	}
+	return s.writeWithResults(ctx, req)
+}
+
+func (s *embedServer) writeWithResults(ctx context.Context, req *embedpb.WriteRequest) (*embedpb.WriteResponse, error) {
 	results, err := s.store.WriteWithResults(ctx, req.Table, req.Mutations)
 	if errors.Is(err, embedstore.ErrInvalidCondition) {
 		return nil, status.Error(codes.InvalidArgument, err.Error())

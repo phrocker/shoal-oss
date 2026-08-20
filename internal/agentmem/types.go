@@ -166,13 +166,22 @@ func (s GRPCStore) Write(ctx context.Context, table string, muts []*embedpb.Muta
 	return nil
 }
 func (s GRPCStore) WriteWithResults(ctx context.Context, table string, muts []*embedpb.Mutation) ([]*embedpb.MutationResult, error) {
-	resp, err := s.Client.Write(ctx, &embedpb.WriteRequest{Table: table, Mutations: muts})
-	if err != nil {
-		return nil, err
-	}
 	hasConditions := false
 	for _, mutation := range muts {
 		hasConditions = hasConditions || mutation != nil && len(mutation.Conditions) > 0
+	}
+	req := &embedpb.WriteRequest{Table: table, Mutations: muts}
+	var (
+		resp *embedpb.WriteResponse
+		err  error
+	)
+	if hasConditions {
+		resp, err = s.Client.ConditionalWrite(ctx, req)
+	} else {
+		resp, err = s.Client.Write(ctx, req)
+	}
+	if err != nil {
+		return nil, err
 	}
 	if hasConditions && len(resp.Results) != len(muts) {
 		return nil, errors.New("agentmem: server did not return conditional mutation results")

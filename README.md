@@ -146,8 +146,11 @@ eng.Close()
 
 ### Conditional gRPC writes
 
-`ShoalEmbed.Write` supports opt-in compare-and-set conditions on each
-mutation. Conditions target the mutation row plus an exact
+`ShoalEmbed.ConditionalWrite` supports compare-and-set conditions on each
+mutation. It is deliberately separate from unconditional `Write`: an older
+server returns `UNIMPLEMENTED` instead of ignoring unknown condition fields
+and applying entries unconditionally during a rolling upgrade. Conditions
+target the mutation row plus an exact
 `column_family` / `column_qualifier` / `column_visibility` coordinate and
 require either `absent` or `value_equals`. With no condition timestamp, the
 newest version is checked and a newest tombstone counts as absent. Setting the
@@ -161,7 +164,7 @@ request order; `written` remains the accepted count and is unchanged for
 legacy unconditional requests.
 
 ```go
-resp, err := client.Write(ctx, &embedpb.WriteRequest{
+resp, err := client.ConditionalWrite(ctx, &embedpb.WriteRequest{
     Table: "leases",
     Mutations: []*embedpb.Mutation{{
         Row: []byte("service-a"),
