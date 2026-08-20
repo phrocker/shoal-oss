@@ -706,6 +706,29 @@ destination splits itself, or the eventual `BulkImport` fails closed (see
   and re-verified successfully, so its presence remains a reliable
   signal that every listed file's bytes were confirmed at `dst`, not
   merely assumed from an earlier check.
+  That guarantee is about `loadmap.json` written by *this* call. A
+  `bulkDir` can also already hold a `loadmap.json` left behind by an
+  earlier, different `StageBulkDir` call -- a retry after a prior
+  attempt succeeded, or an operator re-running staging against the same
+  `bulkDir`. If this call's own copy loop then fails partway, `StageBulkDir`
+  returns before ever reaching a new `WriteLoadMapping` call -- but
+  without further handling, that OLD `loadmap.json` would be left
+  completely untouched, still claiming the directory is complete and
+  correct even though one of its RFiles was just overwritten with bytes
+  that failed verification. `StageBulkDir` closes that window with
+  `invalidateExistingLoadMapping`, called immediately before the copy
+  loop starts mutating any RFile: it deletes any pre-existing
+  `loadmap.json` outright when `dst` implements `storage.Remover`
+  (local, memory, hdfs), or -- for backends such as s3/gcs/azure that
+  expose no delete capability -- overwrites it in place with a payload
+  that is deliberately not valid JSON, so `ReadLoadMapping` (or a real
+  Accumulo bulk v2 client parsing `loadmap.json` directly) fails closed
+  on it instead of trusting a stale mapping. A `bulkDir` with no
+  pre-existing `loadmap.json` -- the common, fresh-destination case this
+  whole section is primarily describing -- is unaffected: there is
+  nothing to invalidate, and no extra write occurs. See §6's
+  "Stale `loadmap.json` after a failed retry" entry for the regression
+  tests.
   This destination re-verification (`verifyStagedRFile`) polls
   `ctx.Err()` at the same granularity `storage.Copy` does -- before
   opening the staged object and around each read chunk of its hash pass
@@ -845,7 +868,13 @@ Mapped against #70's five acceptance criteria:
    files can still leave a partially staged bulk directory, but retrying
    the same call completes it without manual repair (see
    `TestStageBulkDirCancellationLeavesNoPartialObjectAndRetrySucceeds` in
-   §6). `AddTableSplitsForTable` is also safe to retry, but that safety comes from
+   §6). A retry against a `bulkDir` that already succeeded on an earlier
+   attempt is also safe specifically because of
+   `invalidateExistingLoadMapping` (§4, §6): without it, a retry whose
+   copy loop failed partway would leave that earlier attempt's now-stale
+   `loadmap.json` in place next to at least one RFile whose bytes had
+   just been overwritten with unverified data, silently claiming the
+   directory complete when it was not. `AddTableSplitsForTable` is also safe to retry, but that safety comes from
    Shoal's own client-side logic, not from any inherent idempotency
    `TABLE_SPLIT` FATE submission guarantees: each retry round re-queries
    the destination's *real* current tablet metadata before deciding what
@@ -1101,6 +1130,32 @@ existing single-tablet suite:
   intact): only this test fails, confirming it isolates the specific
   window the new check closes rather than incidentally passing for an
   unrelated reason.
+- **Stale `loadmap.json` after a failed retry over an already-staged
+  `bulkDir`** — `TestStageBulkDirInvalidatesStaleLoadMappingOnFailedRetry`
+  covers a different retry hazard from the cancellation test above: a
+  `bulkDir` that already holds a *valid* `loadmap.json` from an earlier,
+  successful `StageBulkDir` call, retried with the same manifest, where
+  the retry's own copy loop fails partway (the same
+  mutated-on-its-Nth-`Open` technique as the TOCTOU test above, shifted
+  two opens later so the swap lands inside the *second* call's
+  `storage.Copy` instead of the first). Without
+  `invalidateExistingLoadMapping`, the OLD `loadmap.json` — untouched by
+  the failed retry — would still parse as a valid mapping even though one
+  RFile's on-disk bytes were just replaced with data that failed
+  `verifyStagedRFile`. The test asserts `loadmap.json` is entirely
+  **absent** afterwards (`memory.Backend` implements `storage.Remover`,
+  so the stale marker is deleted outright before the copy loop starts
+  mutating anything), and was verified to fail without the fix (a
+  temporary revert of the `invalidateExistingLoadMapping` call left the
+  stale marker in place, exactly as the finding described).
+  `TestStageBulkDirOverwritesStaleLoadMappingWithUnparseablePlaceholderWhenBackendCannotDelete`
+  covers the same scenario against a destination backend that cannot
+  delete objects (no `storage.Remover`, matching object-store backends
+  such as s3/gcs/azure): the stale `loadmap.json` is instead overwritten
+  in place with a payload that is deliberately not valid JSON, so
+  `ReadLoadMapping` — or a real Accumulo bulk v2 client parsing
+  `loadmap.json` directly off disk — fails closed on it rather than
+  trusting a mapping that no longer matches the directory's contents.
 - **Destination writability preflight** —
   `TestStageBulkDirRejectsReadOnlyDestinationBeforeAnyRead` proves
   `validateDestinationWritable` runs before any read: it wraps a

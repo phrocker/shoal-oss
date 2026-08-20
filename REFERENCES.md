@@ -357,10 +357,10 @@ mirroring Accumulo's per-round retry schedule.
     forward than a later entry's `prevEndRow` search can recover from,
     since the iterator never rewinds, and validation is rejected with
     `BULK_CONCURRENT_MERGE` even though nothing actually merged. Shoal
-    calls `accumulo.Connector.AddTableSplits` (the `TABLE_SPLIT` FATE op)
+    calls `accumulo.Connector.AddTableSplitsForTable` (the `TABLE_SPLIT` FATE op)
     to reconcile the destination's real splits to match the manifest's
     chain boundaries — guaranteeing the "no fewer" half — and then, since
-    `AddTableSplits` cannot itself remove an unrelated pre-existing split,
+    `AddTableSplitsForTable` cannot itself remove an unrelated pre-existing split,
     calls `accumulo.Connector.ListTableSplits` to confirm the "no more"
     half directly (see `internal/promotion/promote.go`'s
     `verifyNoUnexpectedDestinationSplits`), both *before*

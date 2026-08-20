@@ -869,6 +869,161 @@ func TestStageBulkDirRejectsSourceMutatedBetweenPreflightVerifyAndItsOwnCopy(t *
 	}
 }
 
+// TestStageBulkDirInvalidatesStaleLoadMappingOnFailedRetry proves the
+// round-12-review fix for a bulkDir that already holds a valid
+// loadmap.json from an earlier, successful StageBulkDir call. Retrying
+// StageBulkDir against that same bulkDir, when the retry's own copy loop
+// fails partway (here: F0002.rf's post-copy verifyStagedRFile check,
+// simulated the same way
+// TestStageBulkDirRejectsSourceMutatedBetweenPreflightVerifyAndItsOwnCopy
+// does, via mutatingSourceBackend, just shifted two Opens later to land
+// inside the SECOND StageBulkDir call instead of the first), must not
+// leave the OLD loadmap.json in place: it no longer reflects the
+// bulkDir's actual (now partially overwritten, unverified) contents.
+// Without invalidateExistingLoadMapping, this test's final loadmap.json
+// would still be present and would still parse as the FIRST, now-stale
+// mapping -- silently asserting the directory is complete and correct
+// even though F0002.rf's on-disk bytes were just replaced with data that
+// failed verification.
+func TestStageBulkDirInvalidatesStaleLoadMappingOnFailedRetry(t *testing.T) {
+	const srcPath = "events/t-0001/F0002.rf"
+	original := []byte("original-bytes")
+	mutated := []byte("mutated-bytes!")
+	if len(original) != len(mutated) {
+		t.Fatalf("test fixture bug: original (%d) and mutated (%d) must be equal length so storage.Copy's own length bookkeeping cannot itself detect the swap, isolating the destination-verification behavior under test", len(original), len(mutated))
+	}
+
+	realSrc := memory.New()
+	realSrc.Put("events/t-0000/F0001.rf", []byte("f0001-bytes"))
+	realSrc.Put(srcPath, original)
+
+	f1Sum := sha256.Sum256([]byte("f0001-bytes"))
+	originalSum := sha256.Sum256(original)
+	manifest := twoTabletManifest()
+	manifest.RFiles[0].DestinationPath = "events/t-0000/F0001.rf"
+	manifest.RFiles[0].Size = int64(len("f0001-bytes"))
+	manifest.RFiles[0].SHA256 = hex.EncodeToString(f1Sum[:])
+	manifest.RFiles[1].DestinationPath = srcPath
+	manifest.RFiles[1].Size = int64(len(original))
+	manifest.RFiles[1].SHA256 = hex.EncodeToString(originalSum[:])
+
+	// mutateAt=4: opens #1 (first call's preflight VerifyRFileExport) and
+	// #2 (first call's storage.Copy) both see the original bytes, so the
+	// first StageBulkDir call below succeeds cleanly. Open #3 (the
+	// retry's own preflight VerifyRFileExport) still sees the original
+	// bytes and passes; open #4 (the retry's own storage.Copy) is when
+	// the swap fires, so only the retry's post-copy verifyStagedRFile
+	// check -- not either call's preflight -- ever observes the mutated
+	// bytes.
+	src := &mutatingSourceBackend{Backend: realSrc, path: srcPath, mutateAt: 4, newContent: mutated}
+	dst := memory.New()
+	ctx := context.Background()
+	const bulkDir = "hdfs://nn/bulk/events-1"
+
+	firstMapping, err := StageBulkDir(ctx, src, manifest, dst, bulkDir)
+	if err != nil {
+		t.Fatalf("first StageBulkDir call = %v, want success", err)
+	}
+	if len(firstMapping) == 0 {
+		t.Fatal("first StageBulkDir call returned an empty mapping")
+	}
+	if _, err := ReadLoadMapping(ctx, dst, bulkDir); err != nil {
+		t.Fatalf("loadmap.json after first successful stage: ReadLoadMapping = %v, want success", err)
+	}
+
+	if _, err := StageBulkDir(ctx, src, manifest, dst, bulkDir); err == nil {
+		t.Fatal("retry StageBulkDir with source mutated during its own copy = nil error, want error")
+	}
+	if got := atomic.LoadInt32(&src.opens); got < 4 {
+		t.Fatalf("source Open calls for %s = %d, want >= 4 (two full preflight+copy passes); test fixture did not exercise the intended retry window", srcPath, got)
+	}
+
+	// The crux of the fix: the OLD loadmap.json from the first call must
+	// not survive as a stale, still-parseable "complete" marker next to
+	// F0002.rf's now-corrupted bytes. memory.Backend implements
+	// storage.Remover, so invalidateExistingLoadMapping deletes it
+	// outright; loadmap.json must therefore be entirely absent, not
+	// merely different.
+	if _, err := dst.Open(ctx, bulkDir+"/loadmap.json"); err == nil {
+		t.Fatal("loadmap.json present after a failed retry over a previously-staged bulkDir, want absent (stale marker must be invalidated before any RFile is overwritten)")
+	} else if !errors.Is(err, shstorage.ErrNotFound) {
+		t.Fatalf("loadmap.json open error = %v, want storage.ErrNotFound", err)
+	}
+}
+
+// nonRemovableBackend wraps a *memory.Backend, delegating Open and Create
+// but deliberately not implementing storage.Remover -- even though the
+// wrapped *memory.Backend itself does -- to simulate an object-store
+// backend (s3/gcs/azure) that exposes no delete capability. Used to
+// exercise invalidateExistingLoadMapping's overwrite-with-placeholder
+// fallback path.
+type nonRemovableBackend struct {
+	inner *memory.Backend
+}
+
+func (b *nonRemovableBackend) Open(ctx context.Context, path string) (shstorage.File, error) {
+	return b.inner.Open(ctx, path)
+}
+
+func (b *nonRemovableBackend) Create(ctx context.Context, path string) (shstorage.Writer, error) {
+	return b.inner.Create(ctx, path)
+}
+
+// TestStageBulkDirOverwritesStaleLoadMappingWithUnparseablePlaceholderWhenBackendCannotDelete
+// covers invalidateExistingLoadMapping's fallback for a destination
+// backend that cannot delete objects (no storage.Remover, matching
+// s3/gcs/azure): a stale loadmap.json from an earlier successful stage
+// cannot be removed outright, so it must instead be overwritten with a
+// payload that fails to parse as a valid LoadMapping, so no reader can
+// mistake it for a still-valid "staging complete" marker.
+func TestStageBulkDirOverwritesStaleLoadMappingWithUnparseablePlaceholderWhenBackendCannotDelete(t *testing.T) {
+	const srcPath = "events/t-0001/F0002.rf"
+	original := []byte("original-bytes")
+	mutated := []byte("mutated-bytes!")
+
+	realSrc := memory.New()
+	realSrc.Put("events/t-0000/F0001.rf", []byte("f0001-bytes"))
+	realSrc.Put(srcPath, original)
+
+	f1Sum := sha256.Sum256([]byte("f0001-bytes"))
+	originalSum := sha256.Sum256(original)
+	manifest := twoTabletManifest()
+	manifest.RFiles[0].DestinationPath = "events/t-0000/F0001.rf"
+	manifest.RFiles[0].Size = int64(len("f0001-bytes"))
+	manifest.RFiles[0].SHA256 = hex.EncodeToString(f1Sum[:])
+	manifest.RFiles[1].DestinationPath = srcPath
+	manifest.RFiles[1].Size = int64(len(original))
+	manifest.RFiles[1].SHA256 = hex.EncodeToString(originalSum[:])
+
+	src := &mutatingSourceBackend{Backend: realSrc, path: srcPath, mutateAt: 4, newContent: mutated}
+	dst := &nonRemovableBackend{inner: memory.New()}
+	ctx := context.Background()
+	const bulkDir = "hdfs://nn/bulk/events-1"
+
+	if _, err := StageBulkDir(ctx, src, manifest, dst, bulkDir); err != nil {
+		t.Fatalf("first StageBulkDir call = %v, want success", err)
+	}
+	if _, err := ReadLoadMapping(ctx, dst, bulkDir); err != nil {
+		t.Fatalf("loadmap.json after first successful stage: ReadLoadMapping = %v, want success", err)
+	}
+
+	if _, err := StageBulkDir(ctx, src, manifest, dst, bulkDir); err == nil {
+		t.Fatal("retry StageBulkDir with source mutated during its own copy = nil error, want error")
+	}
+
+	// dst cannot delete, so the stale loadmap.json must still be
+	// present -- but overwritten with an unparseable placeholder, never
+	// left as the OLD, now-stale-but-well-formed mapping.
+	f, err := dst.Open(ctx, bulkDir+"/loadmap.json")
+	if err != nil {
+		t.Fatalf("loadmap.json open error = %v, want present (overwritten in place, not removed)", err)
+	}
+	f.Close()
+	if _, err := ReadLoadMapping(ctx, dst, bulkDir); err == nil {
+		t.Fatal("ReadLoadMapping on invalidated placeholder = nil error, want a parse failure (placeholder must not be mistaken for a valid mapping)")
+	}
+}
+
 // cancelDuringReadFile is a storage.File whose ReadAt cancels ctx (via a
 // stored context.CancelFunc) the moment each call is made, before
 // returning its (otherwise normal) chunk of data. size is deliberately

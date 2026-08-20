@@ -110,6 +110,25 @@ var (
 // loadmap.json is never exposed to a manifest describing unverified
 // bytes.
 //
+// That guarantee is about loadmap.json written by *this* call. A bulkDir
+// can also already hold a loadmap.json left behind by an earlier,
+// different StageBulkDir call -- for example a retry after a prior
+// attempt succeeded, or an operator re-running staging against the same
+// bulkDir. If this call's own copy loop then fails partway (storage.Copy
+// itself failing, or the post-copy verifyStagedRFile check below
+// rejecting a mismatched destination object), StageBulkDir returns an
+// error without ever reaching WriteLoadMapping -- but without further
+// handling, that OLD loadmap.json would be left completely untouched,
+// still claiming the directory is complete and correct even though one
+// of its RFiles was just overwritten with bytes that failed
+// verification. StageBulkDir closes that window by invalidating any
+// pre-existing loadmap.json immediately before this loop starts
+// mutating any RFile; see invalidateExistingLoadMapping's own doc
+// comment for the exact mechanism. A bulkDir with no pre-existing
+// loadmap.json -- the common, fresh-destination case this whole
+// function is primarily documented for above -- is unaffected by this:
+// there is nothing to invalidate, and no extra write occurs.
+//
 // This means a full Promote call over a multi-tablet manifest reads and
 // hashes every RFile up to three times: once in stagingPreflight (before
 // AddTableSplits), once more in StageBulkDir's own preflight above (after
@@ -200,6 +219,21 @@ func StageBulkDir(
 	if err := checkNoStagingAliases(src, dst, flatNames, bulkDir); err != nil {
 		return nil, err
 	}
+	// Neutralize any loadmap.json already sitting in bulkDir from an
+	// earlier, unrelated StageBulkDir call before this loop starts
+	// mutating RFiles. Without this, a retry against a bulkDir that
+	// already holds a valid loadmap.json from a prior successful stage
+	// could fail partway through replacing one of its RFiles -- for
+	// example on the verifyStagedRFile mismatch below -- leaving that
+	// RFile's bytes unverified or wrong while the OLD loadmap.json,
+	// never touched by this failed attempt, still asserts the directory
+	// is complete and correct by the very marker rule the rest of this
+	// function relies on. See invalidateExistingLoadMapping's own doc
+	// comment for the mechanism and TestStageBulkDirInvalidatesStaleLoadMappingOnFailedRetry
+	// for the regression test.
+	if err := invalidateExistingLoadMapping(ctx, dst, bulkDir); err != nil {
+		return nil, err
+	}
 	for _, rf := range stageManifest.RFiles {
 		dstPath := joinBulkPath(dst, bulkDir, flatNames[rf.DestinationPath])
 		if _, err := storage.Copy(ctx, src, rf.DestinationPath, dst, dstPath); err != nil {
@@ -224,6 +258,68 @@ func StageBulkDir(
 		return nil, err
 	}
 	return mapping, nil
+}
+
+// invalidateExistingLoadMapping detects a loadmap.json already present at
+// bulkDir/loadmap.json on dst -- left behind by an earlier, unrelated
+// StageBulkDir call against the same bulkDir -- and neutralizes it before
+// StageBulkDir's copy loop starts overwriting any RFile.
+//
+// Without this, retrying StageBulkDir against a bulkDir that already
+// holds a valid loadmap.json from a prior successful stage is unsafe: if
+// this retry's copy loop fails partway (for example storage.Copy
+// succeeds but verifyStagedRFile then rejects a mismatched destination
+// object), StageBulkDir returns before ever reaching WriteLoadMapping,
+// but the OLD loadmap.json -- written by the earlier, different call --
+// is never touched by this failed one. The directory is left containing
+// at least one RFile whose bytes were just replaced with something that
+// failed verification, sitting next to a loadmap.json that still, by the
+// documented "present means complete" marker rule, claims the directory
+// is a valid, verified bulk mapping. A caller invoking StageBulkDir
+// standalone and trusting that rule without separately checking this
+// call's returned error, or a real Accumulo TABLE_BULK_IMPORT2 FATE
+// operation reading loadmap.json directly off disk, would have no way to
+// tell the directory is now inconsistent.
+//
+// A bulkDir with no pre-existing loadmap.json -- the common case: a
+// fresh destination, or a prior attempt that itself failed before ever
+// reaching WriteLoadMapping -- is left untouched; there is nothing to
+// invalidate, and this adds no write. When a pre-existing loadmap.json
+// is found, dst.Remove deletes it outright if dst implements
+// storage.Remover (local, memory, hdfs); otherwise -- object-store
+// backends such as s3/gcs/azure that expose no delete capability -- it
+// is overwritten in place with a payload that is deliberately not valid
+// JSON, so any reader (ReadLoadMapping, or a real Accumulo bulk v2
+// client parsing loadmap.json directly) fails closed on it instead of
+// silently trusting a mapping that may no longer match this directory's
+// in-flight contents. Either way, the directory only regains a loadmap.json
+// that can parse as a valid mapping once this call's own copy+verify loop
+// below succeeds end-to-end and reaches WriteLoadMapping, exactly as
+// WriteLoadMapping already guarantees for a fresh bulkDir.
+func invalidateExistingLoadMapping(ctx context.Context, dst storage.Backend, bulkDir string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	path := joinBulkPath(dst, bulkDir, bulkLoadMappingFile)
+	existing, err := dst.Open(ctx, path)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			return nil
+		}
+		return fmt.Errorf("promotion: check existing load mapping %s: %w", path, err)
+	}
+	existing.Close()
+	if remover, ok := dst.(storage.Remover); ok {
+		if err := remover.Remove(ctx, path); err != nil {
+			return fmt.Errorf("promotion: invalidate stale load mapping %s: %w", path, err)
+		}
+		return nil
+	}
+	placeholder := []byte("promotion: stage in progress; superseding a prior load mapping, not yet valid\n")
+	if err := storage.WriteAll(ctx, dst, path, placeholder); err != nil {
+		return fmt.Errorf("promotion: invalidate stale load mapping %s: %w", path, err)
+	}
+	return nil
 }
 
 // verifyStagedRFile re-opens and re-hashes the object just written at

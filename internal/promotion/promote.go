@@ -71,10 +71,17 @@ type Options struct {
 // BuildLoadMapping), and then submits the bulk import through conn — in
 // that order, each step failing closed before the next can run.
 //
-// For a multi-tablet manifest, Promote first calls
-// RequiredDestinationSplits (a pure, network-free check) and, if it
-// reports any rows, submits them through conn.AddTableSplitsForTable before doing
-// anything else. That reconciles the destination's real tablet
+// Before any of that, Promote validates tableName/bulkDir and the whole
+// manifest via validatePromotionDestination, a BuildLoadMapping
+// preflight, and stagingPreflight -- all pure or local-probe-only checks
+// that touch neither Accumulo nor dst; see the validation paragraph
+// further below for exactly what each one catches and why running them
+// first matters. Only once every one of those has passed does Promote
+// turn to splits: for a multi-tablet manifest, it calls
+// RequiredDestinationSplits (itself a pure, network-free check) and, if
+// it reports any rows, submits them through conn.AddTableSplitsForTable
+// -- the first call in a Promote run that can reach Accumulo or mutate
+// anything. That reconciles the destination's real tablet
 // boundaries to the exact rows BuildLoadMapping's widened KeyExtents
 // reference, which Accumulo's own server-side
 // PrepBulkImport.validateLoadMapping check otherwise requires to already

@@ -44,11 +44,12 @@
 //     split in that range is not harmless here; see
 //     RequiredDestinationSplits's own doc comment for why). Promote
 //     reconciles the "no fewer" half by submitting those rows through
-//     the existing accumulo.Connector.AddTableSplits — itself a manager
-//     TABLE_SPLIT FATE operation, the same protocol
-//     TableOperations.addSplits uses — and the "no more" half by then
-//     confirming accumulo.Connector.ListTableSplits reports nothing else
-//     in that range, both before staging or submitting the bulk import.
+//     the existing accumulo.Connector.AddTableSplitsForTable — itself a
+//     manager TABLE_SPLIT FATE operation, the same protocol
+//     TableOperations.addSplits uses, plus a pinned-table-identity check
+//     — and the "no more" half by then confirming
+//     accumulo.Connector.ListTableSplits reports nothing else in that
+//     range, both before staging or submitting the bulk import.
 //     BuildLoadMapping and StageBulkDir themselves never call Accumulo: a
 //     caller invoking them directly for a multi-tablet manifest, outside
 //     of Promote, is responsible for that same reconciliation, or the
@@ -171,7 +172,7 @@ type LoadMapping []Mapping
 // validation: a manifest from an unsupported export format is rejected
 // here, in Promote's own preflight call to this function, rather than
 // only later inside StageBulkDir's call to engine.VerifyRFileExport --
-// which, unlike this one, runs after AddTableSplits has already
+// which, unlike this one, runs after AddTableSplitsForTable has already
 // reconciled the destination's splits (see Promote's doc comment).
 func BuildLoadMapping(manifest *engine.RFileExportManifest) (LoadMapping, error) {
 	if manifest == nil {
@@ -240,7 +241,7 @@ type resolvedTablet struct {
 // belongs here, once, rather than duplicated (or, worse, present in one
 // and silently missing from the other -- RequiredDestinationSplits is
 // exported and documented as safe to call standalone specifically to
-// pre-create splits through AddTableSplits, so it must reject an
+// pre-create splits through AddTableSplitsForTable, so it must reject an
 // unsupported version just as eagerly as BuildLoadMapping does).
 func resolveManifestTablets(manifest *engine.RFileExportManifest) ([]resolvedTablet, map[int]struct{}, error) {
 	if manifest.Version != engine.RFileExportManifestVersion {
@@ -305,12 +306,13 @@ func resolveManifestTablets(manifest *engine.RFileExportManifest) ([]resolvedTab
 // A non-nil but empty (zero-length) StartRow or EndRow is rejected
 // outright, at any chain position: an empty row string is never a
 // meaningful Accumulo split point (there is nothing before it to bound),
-// and accumulo.Connector.AddTableSplits's own normalizeSplitRows rejects
-// a zero-length split unconditionally (table_add_splits.go), so a
-// manifest containing one would otherwise pass every check above only
-// to have AddTableSplits reject it later for a reason expressed in
-// terms of that lower layer's own row-normalization contract instead of
-// this package's own manifest-shape validation.
+// and accumulo.Connector.AddTableSplitsForTable's own normalizeSplitRows
+// (shared with AddTableSplits; see addTableSplits in
+// table_add_splits.go) rejects a zero-length split unconditionally, so
+// a manifest containing one would otherwise pass every check above
+// only to have AddTableSplitsForTable reject it later for a reason
+// expressed in terms of that lower layer's own row-normalization
+// contract instead of this package's own manifest-shape validation.
 func resolveTabletChain(tablets []engine.RFileExportTablet) ([]engine.RFileExportTablet, error) {
 	n := len(tablets)
 	byIndex := make(map[int]engine.RFileExportTablet, n)
@@ -389,7 +391,7 @@ func formatRow(row *string) string {
 // BuildLoadMapping does, and fails the same way on a malformed
 // manifest, but never touches storage or Accumulo itself: it is a pure
 // function, safe to call standalone — for example to pre-create splits
-// through accumulo.Connector.AddTableSplits before staging, which is
+// through accumulo.Connector.AddTableSplitsForTable before staging, which is
 // exactly what Promote does.
 //
 // A single-tablet (or legacy) manifest requires no destination splits at
@@ -434,7 +436,7 @@ func formatRow(row *string) string {
 // an unsafe pre-existing split on its own, since it is a pure function
 // over the manifest alone with no view of the destination's actual
 // state. Promote separately verifies, via
-// accumulo.Connector.ListTableSplits immediately after AddTableSplits,
+// accumulo.Connector.ListTableSplits immediately after AddTableSplitsForTable,
 // that the destination's splits at or before the last required row are
 // exactly these rows — no more, no fewer — failing closed with a
 // specific, actionable error before any staging or BulkImport call
