@@ -32,4 +32,13 @@
 // fails closed — a stale assignment is refused rather than applied, because a
 // wrongly accepted assignment means a multiply hosted tablet. See
 // docs/tserver-hosting-lifecycle.md for the state machine and fencing rules.
+//
+// The generation is not invented here either. ServiceLock implements
+// Accumulo's lock protocol against ZooKeeper — the ephemeral sequential
+// zlock node, the service descriptors the manager reads, and the loss
+// detection that ends a generation — and Participate is what binds a real
+// ZooKeeper generation to a Host, so the fence is stamped with a lock this
+// process demonstrably holds. WatchManagerLock supplies the other half by
+// reading the manager's own lock, which is how manager authority reaches a
+// Host without ever being asserted by a caller.
 package tserver
