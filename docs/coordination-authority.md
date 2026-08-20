@@ -56,9 +56,11 @@ These invariants are release gates, not implementation preferences:
 
 1. **One writer domain.** A logical table cannot be writable under local,
    Kubernetes, and Accumulo authority simultaneously.
-2. **Immutable proof.** Every assignment, mutation, compaction job, promotion
-   step, and completion carries an authority token that can be rejected after
-   lease or session loss.
+2. **Immutable proof.** Every authority-sensitive work unit is bound to an
+   authority token that can be rejected after lease or session loss.
+   Manager/coordinator work carries it explicitly; protocols such as Accumulo
+   ingest that have no token field bind the update session and hosted-tablet
+   instance to the current token server-side.
 3. **Monotonic epochs.** A domain activation or authority handoff cannot reuse
    a logical-table epoch previously allowed to mutate state. Process
    reconnection establishes new backend proof (lock generation and operation

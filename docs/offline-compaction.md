@@ -57,8 +57,8 @@ Do **not** use it on an ONLINE table — it will refuse at the fence.
 | `-instance` | `accumulo` | Accumulo instance name. |
 | `-table` | *(required)* | Table **name or id** to compact. |
 | `-range` | *(empty)* | Restrict to tablets intersecting `startRow:endRow` (inclusive; either side may be empty for unbounded). See §6. |
-| `-dry-run` | `true` | Plan + verify only. **Pass `--dry-run=false` to actually commit — this is the ONLY commit gate.** |
-| `-commit-mode` | `plan` | `plan` or `direct`. Always validated; only acted on when `--dry-run=false`. See §5. |
+| `-dry-run` | `true` | Plan + verify only. `false` enters deprecated legacy commit seams and is prohibited in release workflows. |
+| `-commit-mode` | `plan` | `plan` or deprecated `direct`; generated plans are inspection-only until the authority API exists. See §5. |
 | `-verify` | `true` | Run the design §5 verification on every compacted tablet; a failure aborts the run. |
 | `-out` | `.` | Directory to write the commit-plan JSON into. |
 | `-storage` | `gs` | RFile backend: `gs`, `s3`, `azure`, `local`, `memory`. |
@@ -110,27 +110,25 @@ that Accumulo GC reclaims — a dry run is always safe to abort.
 Review the log summary (`compacted` / `no_op` tablet counts) and inspect
 the commit plan (§8) before proceeding.
 
-### Step 3 — commit
+### Step 3 — no release commit path yet
 
-The default **Mode P** emits the plan:
-
-```bash
-shoal-offline-compact … -dry-run=false -commit-mode=plan -out ./plans
-```
-
-The tool re-verifies the fence, then writes the final commit plan. Do not apply
-it with a shell script, standalone Ample writer, or direct metadata mutation.
-Application is blocked until a supported manager/coordinator/FATE operation
-can verify the logical-table epoch and operation attempt.
+The dry-run plan is inspection-only. Its unreferenced output RFiles may be
+reclaimed by Accumulo GC, so do not retain it for future application. Do not
+pass `-dry-run=false`, apply the plan with a shell/Ample writer, or use direct
+mode in a release workflow.
 
 Do not use `-commit-mode=direct`. That legacy seam bypasses
 manager/coordinator/FATE authority and is deprecated by the accepted
 [coordination authority contract](./coordination-authority.md).
 
+Once the supported manager/coordinator/FATE operation exists, rerun the
+compaction and apply its freshly generated plan while that operation verifies
+the logical-table epoch, operation attempt, and output-file protection.
+
 ### Step 4 — bring the table back online
 
-Do not bring the table online unless the plan was applied by that
-Accumulo-authoritative operation and its terminal result was verified.
+Do not bring the table online unless a freshly generated plan was applied by
+that Accumulo-authoritative operation and its terminal result was verified.
 
 ```
 # Accumulo shell
@@ -148,9 +146,11 @@ should now reference a single `file:` entry.
 
 **Mode P (`plan`, default) — conservative.** The tool emits a
 machine-readable `CommitPlan` (§8) and makes **no** metadata writes. Plan
-generation is release-approved; application remains blocked until a supported
-manager/coordinator/FATE operation exists. Standalone shell or Ample appliers
-are not authority-preserving substitutes.
+generation is release-approved for inspection only; the artifact is not
+durable work because Accumulo GC may reclaim its unreferenced output.
+Application remains blocked until a supported manager/coordinator/FATE
+operation can protect and apply a freshly generated result. Standalone shell
+or Ample appliers are not authority-preserving substitutes.
 
 **Mode D (`direct`) — deprecated and prohibited for release.** The retained
 `MetadataCommitter` seam writes `accumulo.metadata` outside
@@ -231,11 +231,12 @@ Written to `-out/offline-compact-<table>-<UTC timestamp>.json`. Shape:
 - `add` is the single output file to reference (path + size + entry
   count).
 
-**GC-safe:** the plan never deletes input RFiles from storage — it only
-drops their metadata refs and lets Accumulo GC reclaim the bytes. An
-applier must run each tablet's mutation as a **conditional** mutation
-guarded on the current file set, so even a (fence-precluded) concurrent
-change cannot corrupt metadata.
+**Legacy schema, inspection only:** the plan describes the input references and
+proposed output reference used by existing tests. It must not be fed to a
+standalone conditional-mutation applier. The future
+manager/coordinator/FATE operation must validate this information together
+with the logical-table epoch and operation attempt, protect output files from
+GC, and apply the metadata change authoritatively.
 
 ---
 
@@ -265,9 +266,10 @@ After onlining the table:
 | Mode D: `direct commit mode requires a MetadataCommitter` | Deprecated direct mode was requested. | Use `-commit-mode=plan`; do not wire a direct committer. The plan JSON was still written. |
 | Mode D partial failure naming a tablet | A legacy test-only direct committer was used. | Stop using direct mode and reconcile through Accumulo-authoritative tooling before retrying in plan mode. |
 
-Because the only dangerous step is the metadata mutation (gated behind the
-fence and `--dry-run=false`), a crash or abort before commit leaves only
-unreferenced orphan RFiles, which Accumulo GC reclaims.
+In the deprecated legacy seams, the dangerous step is the metadata mutation
+gated behind the fence and `--dry-run=false`. A crash or abort before that step
+leaves only unreferenced orphan RFiles, which Accumulo GC reclaims. Release
+workflows remain dry-run-only until the authority-preserving operation exists.
 
 ---
 

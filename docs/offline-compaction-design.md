@@ -131,16 +131,17 @@ a shoal-side file-deletion authority claim.
 The CLI defaults to **dry-run**: it performs the full read + compaction +
 verification and prints the exact metadata mutation it *would* apply
 (input refs to delete, output ref to insert), then exits without
-touching metadata. A real commit requires passing `--dry-run=false`
-*and* a passing OFFLINE fence. (`--dry-run` is the single source of
-truth for the commit gate; see §7 for the flag list — there is no
-separate `--commit` flag.)
+touching metadata. Any output and plan are inspection-only because their
+unreferenced RFiles may be reclaimed by Accumulo GC. The current
+`--dry-run=false` path enters the legacy commit seams and is not
+release-approved. Once the manager/coordinator/FATE application path exists,
+the compaction must be rerun and applied while its outputs are still protected.
 
-### 3.5 Rollback
+### 3.5 Legacy rollback behavior and replacement
 
 The output RFile is written under a fresh, unique name (`A<uuid>.rf`
-convention) *before* the metadata mutation. The metadata mutation is the
-single linearization point:
+convention) before the legacy metadata mutation. Existing tests retain this
+behavior:
 
 - If we crash **before** the mutation: the orphan output file is
   unreferenced and GC reclaims it. Inputs are untouched. No-op.
@@ -149,6 +150,10 @@ single linearization point:
   not; on restart the orchestrator re-reads the tablet's file set and
   is idempotent (if it already sees the single output file, it treats
   the tablet as done).
+
+This describes the deprecated test seam, not a release commit contract. The
+replacement manager/coordinator/FATE operation must own the linearization,
+authority-token verification, output protection, and recovery record.
 
 ## 4. Architecture
 
@@ -205,9 +210,9 @@ generate `<base>` from a UUID to avoid collisions.
 plan (per tablet: extent, input refs to delete, output ref + size +
 entry count to insert). Plan generation is the only release-approved behavior
 today. Earlier suggestions to apply it with a shell script or standalone Ample
-writer are superseded: applying the plan must wait for a supported
-manager/coordinator/FATE operation that verifies the logical-table epoch and
-operation attempt.
+writer are superseded. When a supported manager/coordinator/FATE operation
+exists, rerun compaction so it can verify the logical-table epoch and operation
+attempt while protecting and applying fresh outputs.
 
 **Mode D (direct, deprecated and prohibited for release):** the implementation
 seam can issue a conditional `accumulo.metadata` mutation, but that bypasses
@@ -262,10 +267,10 @@ shoal-offline-compact \
   --zk <quorum> --instance <name> \
   --table <name|id> [--range <startRow>:<endRow>] \
   [--dry-run=true]              # default true: plan+verify, no commit.
-                               #   Pass --dry-run=false to actually commit
-                               #   (this is the ONLY commit gate flag).
-  [--commit-mode=plan|direct]  # default: plan. Only consulted when
-                               #   --dry-run=false.
+                               #   false enters deprecated legacy seams;
+                               #   prohibited in release workflows.
+  [--commit-mode=plan|direct]  # default: plan. direct is deprecated;
+                               #   plans are inspection-only today.
   [--verify=true]              # default: run §5 checks
   [--out <dir>]                # where to write the commit plan (Mode P)
 ```
@@ -277,9 +282,10 @@ iterator, verification fails, or the fence trips.
 
 Two layers:
 
-**Hermetic pipeline test (implemented, runs every build).**
-`internal/offlinecompact/e2e_test.go` wires the real
-Run → verify → Commit → apply → "online + full scan" cycle against an
+**Hermetic legacy-seam test (implemented, runs every build).**
+`internal/offlinecompact/e2e_test.go` wires the existing
+Run → verify → Commit → apply → "online + full scan" implementation cycle
+for regression coverage against an
 in-process model of the pieces a cluster provides (RFile store, tablet
 enumerator, majc-stack resolver, an `accumulo.metadata` model with a
 conditional applier, and the **real** fence continuity predicates
@@ -288,22 +294,23 @@ It covers: Mode D full cycle, the Mode P plan JSON hand-off to an
 out-of-band applier, the ONLINE-round-trip version-guard trip at commit,
 ONLINE-at-fence refusal, and an unported-iterator abort. This is the gate
 that a full-scan of the committed output equals the original data
-(post-versioning) and each tablet collapses to a single `file:` entry.
+(post-versioning) and each tablet collapses to a single `file:` entry; it does
+not make those legacy commit seams release-approved.
 
-**Cluster-backed test (follow-up, out of the unit suite).**
-Against a Mini/real Accumulo instance:
+**Cluster-backed test (blocked on the authority API).**
+Once the manager/coordinator/FATE commit operation exists, test against a
+Mini/real Accumulo instance:
 
 1. Ingest known data, flush + compact a few times to create multiple
    RFiles per tablet.
 2. Offline the table.
-3. Run `shoal-offline-compact --dry-run=false`. Existing tests exercise the
-   legacy Ample/direct seams as implementation coverage, not as a
-   release-approved authority path; replacement coverage must use the future
-   manager/coordinator/FATE commit operation.
-4. Online the table.
-5. Full scan; assert every original cell is present and correct, and the
+3. Run the compaction and generate its plan.
+4. Apply the plan through the manager/coordinator/FATE operation while
+   verifying current authority and protecting the output RFiles.
+5. Verify the operation's terminal result, then online the table.
+6. Full scan; assert every original cell is present and correct, and the
    tablet now has a single `file:` entry.
-6. Negative tests: table left ONLINE ⇒ abort; a table with an unported
+7. Negative tests: table left ONLINE ⇒ abort; a table with an unported
    iterator ⇒ abort with the Skipped class named.
 
 ## 9. Decisions
