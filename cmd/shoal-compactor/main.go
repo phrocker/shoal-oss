@@ -93,8 +93,16 @@
 // CompactionCommit RPC lands, the accepted plan is already the input to
 // compaction.Compact, and the refusals stay exactly where they are — so
 // the day shoal starts writing output files it can only ever write ones
-// it fully understands. Until then no job is ever left assigned to a
-// shoal compactor: every path out of executeJob releases the slot.
+// it fully understands. Until then every path out of executeJob tries to
+// hand the slot back, within the -release-timeout budget.
+//
+// That is a bounded attempt, not a guarantee, and it has exactly two
+// exceptions: a job whose own extent the coordinator could not act on
+// (see unreleasableReason), and a hand-back that exhausts the budget.
+// Both are logged at error level and left to the coordinator's
+// dead-compaction sweep, which is the mechanism Accumulo already relies
+// on for a compactor that dies mid-job. What shoal never does is keep an
+// assignment silently, or take work it cannot reproduce.
 package main
 
 import (
@@ -153,7 +161,7 @@ func main() {
 	rpcTimeout := flag.Duration("rpc-timeout", cclient.DefaultRPCTimeout, "cap on each coordinator read/write; bounds getCompactionJob against a manager that accepts the connection and then goes silent (Java's general.rpc.timeout)")
 	minWait := flag.Duration("min-wait", 1*time.Second, "minimum sleep when the coordinator has no job for this group")
 	maxWait := flag.Duration("max-wait", 30*time.Second, "maximum sleep when idle (backoff cap)")
-	releaseTimeout := flag.Duration("release-timeout", 15*time.Second, "total budget for handing an accepted job back to the coordinator, including retries. Applied even during shutdown: a job shoal has accepted must never stay assigned to a compactor that is going away.")
+	releaseTimeout := flag.Duration("release-timeout", 15*time.Second, "best-effort budget for handing an accepted job back to the coordinator, including retries. Applied even during shutdown, so a job shoal accepted is returned promptly instead of waiting out the coordinator's dead-compaction sweep. If the budget runs out the failure is logged and the slot is left to that sweep.")
 	maxInputFiles := flag.Int("max-input-files", compactjob.DefaultMaxInputFiles, "refuse jobs with more input files than this (0 = no limit); the composer merges every input in one pass")
 	maxInputBytes := flag.Int64("max-input-bytes", compactjob.DefaultMaxTotalInputBytes, "refuse jobs whose declared inputs total more than this many bytes (0 = no limit); the composer reads whole RFile images into memory, so this bounds the read side only — see -max-output-bytes for the write side")
 	maxOutputBytes := flag.Int64("max-output-bytes", compactjob.DefaultMaxOutputBytes, "abandon a compaction whose output image grows past this many bytes (0 = no limit); the output is retained in memory and is not bounded by the input total, since compressed inputs rewritten with codec \"none\" and stacks that emit extra cells both expand")
