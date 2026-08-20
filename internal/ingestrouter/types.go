@@ -141,6 +141,8 @@ const (
 // across retries and must be deduplicated by the authoritative commit layer.
 type CommitRequest struct {
 	OperationID string
+	SessionID   string
+	RequestID   string
 	Extent      Extent
 	Fence       Fence
 	Mutations   []Mutation

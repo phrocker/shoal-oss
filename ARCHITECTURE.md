@@ -33,6 +33,11 @@ documented in
 [`docs/coordination-authority.md`](docs/coordination-authority.md) and tracked
 by [#128](https://github.com/phrocker/shoal-oss/issues/128).
 
+Hosted Accumulo tablets use the separate, fenced WAL lifecycle described in
+[`docs/hosted-tablet-wal.md`](docs/hosted-tablet-wal.md). It is not the
+embedded `localwal` path, and WAL retirement remains gated on the subsequent
+minor-compaction metadata transaction.
+
 ## Goal
 Lightweight read-only Accumulo replica. JVM-free pods that open RFiles
 directly from object storage, run a minimal iterator stack, and serve
