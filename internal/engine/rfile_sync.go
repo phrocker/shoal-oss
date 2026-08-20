@@ -145,6 +145,8 @@ func (e *Engine) ExportRFilesIncremental(ctx context.Context, tableName string, 
 			Size:            size,
 			SHA256:          sum,
 			BCFileVersion:   bcVersion,
+			Format:          ExportFormatRFile,
+			Role:            ExportRoleAuthoritative,
 		}
 		manifest.RFiles = append(manifest.RFiles, entry)
 		state.Shipped[rel] = entry

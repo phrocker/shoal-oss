@@ -176,16 +176,29 @@ type SecurityAdapter interface {
 	RevokeNamespacePermission(context.Context, string, string, string, int8) error
 }
 
-type fateID struct {
+// FateID is the durable identity allocated by Accumulo for one FATE
+// transaction.
+type FateID struct {
 	Type int32
 	UUID string
 }
 
+type fateID = FateID
+
 type fateRPC interface {
-	Begin(context.Context, *security.TCredentials, FateInstance) (fateID, error)
-	Execute(context.Context, *security.TCredentials, fateID, Request) error
-	Wait(context.Context, *security.TCredentials, fateID) (string, error)
-	Finish(context.Context, *security.TCredentials, fateID) error
+	Begin(context.Context, *security.TCredentials, FateInstance) (FateID, error)
+	Execute(context.Context, *security.TCredentials, FateID, Request) error
+	Wait(context.Context, *security.TCredentials, FateID) (string, error)
+	Finish(context.Context, *security.TCredentials, FateID) error
+}
+
+// DurableFateAdapter exposes allocation separately from submission so a
+// workflow can persist the identity before executing the transaction.
+type DurableFateAdapter interface {
+	BeginFate(context.Context, string, FateInstance) (FateID, error)
+	ExecuteFate(context.Context, string, FateID, Request) error
+	WaitFate(context.Context, string, FateID) (string, error)
+	FinishFate(context.Context, string, FateID) error
 }
 
 type managerRPC interface {
@@ -304,6 +317,82 @@ func (p *Pooled) Execute(ctx context.Context, address string, req Request) error
 	return err
 }
 
+func (p *Pooled) BeginFate(ctx context.Context, address string, instance FateInstance) (FateID, error) {
+	if instance != FateUser && instance != FateMeta {
+		return FateID{}, fmt.Errorf("managerclient: unknown FATE instance %d", instance)
+	}
+	credentials, err := p.credentialsForRPC()
+	if err != nil {
+		return FateID{}, err
+	}
+	id, err := withClient(p, ctx, address, func(rpc fateRPC) (FateID, error) {
+		return rpc.Begin(ctx, credentials, instance)
+	})
+	if isPostResponseCleanup(err) {
+		err = nil
+	}
+	return id, mapRPCError(err)
+}
+
+func (p *Pooled) ExecuteFate(ctx context.Context, address string, id FateID, req Request) error {
+	if id.UUID == "" {
+		return errors.New("managerclient: empty FATE ID")
+	}
+	if err := validateRequest(req); err != nil {
+		return err
+	}
+	credentials, err := p.credentialsForRPC()
+	if err != nil {
+		return err
+	}
+	_, err = withClient(p, ctx, address, func(rpc fateRPC) (struct{}, error) {
+		return struct{}{}, rpc.Execute(ctx, credentials, id, req)
+	})
+	if isPostResponseCleanup(err) {
+		err = nil
+	}
+	return mapRPCError(err)
+}
+
+func (p *Pooled) WaitFate(ctx context.Context, address string, id FateID) (string, error) {
+	if id.UUID == "" {
+		return "", errors.New("managerclient: empty FATE ID")
+	}
+	credentials, err := p.credentialsForRPC()
+	if err != nil {
+		return "", err
+	}
+	status, err := withClient(p, ctx, address, func(rpc fateRPC) (string, error) {
+		return rpc.Wait(ctx, credentials, id)
+	})
+	if isPostResponseCleanup(err) {
+		err = nil
+	}
+	return status, mapRPCError(err)
+}
+
+func (p *Pooled) FinishFate(ctx context.Context, address string, id FateID) error {
+	if id.UUID == "" {
+		return errors.New("managerclient: empty FATE ID")
+	}
+	credentials, err := p.credentialsForRPC()
+	if err != nil {
+		return err
+	}
+	_, err = withClient(p, ctx, address, func(rpc fateRPC) (struct{}, error) {
+		return struct{}{}, rpc.Finish(ctx, credentials, id)
+	})
+	if isPostResponseCleanup(err) {
+		err = nil
+	}
+	return mapRPCError(err)
+}
+
+func isPostResponseCleanup(err error) bool {
+	var cleanupErr *PostResponseCleanupError
+	return errors.As(err, &cleanupErr)
+}
+
 // ExecuteStatus runs a FATE operation and returns the status string the
 // manager reported from waitForFateOperation. Accumulo uses that string to
 // distinguish "the operation ran" from "the operation exited without work"
@@ -323,7 +412,7 @@ func (p *Pooled) ExecuteStatus(
 	if err != nil {
 		return "", err
 	}
-	id, err := withClient(p, ctx, address, func(rpc fateRPC) (fateID, error) {
+	id, err := withClient(p, ctx, address, func(rpc fateRPC) (FateID, error) {
 		return rpc.Begin(ctx, credentials, req.Instance)
 	})
 	if id.UUID != "" {
@@ -923,7 +1012,7 @@ func (r thriftFateRPC) Begin(
 	ctx context.Context,
 	credentials *security.TCredentials,
 	instance FateInstance,
-) (fateID, error) {
+) (FateID, error) {
 	id, err := r.raw.BeginFateOperation(
 		ctx,
 		&clientgen.TInfo{},
@@ -931,12 +1020,12 @@ func (r thriftFateRPC) Begin(
 		thriftFateInstance(instance),
 	)
 	if err != nil {
-		return fateID{}, err
+		return FateID{}, err
 	}
 	if id == nil {
-		return fateID{}, errors.New("managerclient: begin returned nil FATE ID")
+		return FateID{}, errors.New("managerclient: begin returned nil FATE ID")
 	}
-	return fateID{Type: int32(id.Type), UUID: id.TxUUIDStr}, nil
+	return FateID{Type: int32(id.Type), UUID: id.TxUUIDStr}, nil
 }
 
 type thriftManagerRPC struct {
@@ -1287,7 +1376,7 @@ func thriftFateInstance(instance FateInstance) manager.TFateInstanceType {
 func (r thriftFateRPC) Execute(
 	ctx context.Context,
 	credentials *security.TCredentials,
-	id fateID,
+	id FateID,
 	req Request,
 ) error {
 	return r.raw.ExecuteFateOperation(
@@ -1305,7 +1394,7 @@ func (r thriftFateRPC) Execute(
 func (r thriftFateRPC) Wait(
 	ctx context.Context,
 	credentials *security.TCredentials,
-	id fateID,
+	id FateID,
 ) (string, error) {
 	return r.raw.WaitForFateOperation(ctx, &clientgen.TInfo{}, credentials, thriftFateID(id))
 }
@@ -1313,12 +1402,12 @@ func (r thriftFateRPC) Wait(
 func (r thriftFateRPC) Finish(
 	ctx context.Context,
 	credentials *security.TCredentials,
-	id fateID,
+	id FateID,
 ) error {
 	return r.raw.FinishFateOperation(ctx, &clientgen.TInfo{}, credentials, thriftFateID(id))
 }
 
-func thriftFateID(id fateID) *manager.TFateId {
+func thriftFateID(id FateID) *manager.TFateId {
 	return &manager.TFateId{
 		Type:      manager.TFateInstanceType(id.Type),
 		TxUUIDStr: id.UUID,
