@@ -19,6 +19,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -29,6 +30,7 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 
 	"github.com/phrocker/shoal/internal/embedpb"
 	"github.com/phrocker/shoal/internal/engine"
@@ -63,6 +65,13 @@ type serveConfig struct {
 	// emulate slow or non-cancellable unary RPC behavior.
 	UnaryInterceptor grpc.UnaryServerInterceptor
 
+	// TLS configures optional (mutual) TLS for both the gRPC and HTTP
+	// listeners. A zero-value TLS (all three fields empty) disables TLS
+	// entirely: both listeners stay plaintext, exactly as before this
+	// field existed. See tlsFilesConfig's doc comment for the precise
+	// enable/validation rules.
+	TLS tlsFilesConfig
+
 	Logger *slog.Logger
 }
 
@@ -87,6 +96,12 @@ type serveHandle struct {
 	// tests).
 	GRPCAddr    string
 	MetricsAddr string
+
+	// TLSEnabled reports whether cfg.TLS was configured (both listeners
+	// speak TLS) or left disabled (both stay plaintext) — set once, during
+	// startServe, from the same decision that built (or didn't build) the
+	// tls.Config below.
+	TLSEnabled bool
 
 	eng      *engine.Engine
 	obs      *obs.Server
@@ -153,6 +168,18 @@ func startServe(cfg serveConfig) (*serveHandle, error) {
 		logger = slog.Default()
 	}
 
+	if err := cfg.TLS.validate(); err != nil {
+		return nil, err
+	}
+	var tlsConfig *tls.Config
+	if !cfg.TLS.empty() {
+		var err error
+		tlsConfig, err = buildServerTLSConfig(cfg.TLS.CertFile, cfg.TLS.KeyFile, cfg.TLS.ClientCAFile)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	eng, err := engine.Open(cfg.DataDir, engine.Options{Logger: logger})
 	if err != nil {
 		return nil, fmt.Errorf("open engine: %w", err)
@@ -172,6 +199,9 @@ func startServe(cfg serveConfig) (*serveHandle, error) {
 			_ = eng.Close()
 			return nil, fmt.Errorf("metrics listen: %w", err)
 		}
+		if tlsConfig != nil {
+			httpLis = tls.NewListener(httpLis, tlsConfig.Clone())
+		}
 	}
 
 	inFlight := &unaryInFlight{}
@@ -179,7 +209,11 @@ func startServe(cfg serveConfig) (*serveHandle, error) {
 	if cfg.UnaryInterceptor != nil {
 		interceptors = append(interceptors, cfg.UnaryInterceptor)
 	}
-	grpcSrv := grpc.NewServer(grpc.ChainUnaryInterceptor(interceptors...))
+	grpcOpts := []grpc.ServerOption{grpc.ChainUnaryInterceptor(interceptors...)}
+	if tlsConfig != nil {
+		grpcOpts = append(grpcOpts, grpc.Creds(credentials.NewTLS(tlsConfig.Clone())))
+	}
+	grpcSrv := grpc.NewServer(grpcOpts...)
 	embedpb.RegisterShoalEmbedServer(grpcSrv, newEmbedServer(eng))
 
 	obsSrv := obs.NewServer(eng)
@@ -200,6 +234,17 @@ func startServe(cfg serveConfig) (*serveHandle, error) {
 			// metrics server already uses
 			// (cmd/shoal-compactor-shadow/service.go).
 			ReadHeaderTimeout: 5 * time.Second,
+			// Routes connection-level errors (malformed requests and,
+			// once TLS is enabled, handshake failures from plaintext or
+			// garbage traffic reaching the port) through the same
+			// structured logger as everything else here, instead of
+			// net/http's default behavior of writing them straight to
+			// os.Stderr via the global "log" package. newHTTPErrorLog
+			// additionally downgrades the specific, expected "TLS
+			// handshake error ...: EOF" line a bare tcpSocket probe
+			// produces against a TLS-wrapped listener — see its doc
+			// comment in tls.go.
+			ErrorLog: newHTTPErrorLog(logger),
 		}
 		httpServeDone = make(chan struct{})
 	}
@@ -217,6 +262,7 @@ func startServe(cfg serveConfig) (*serveHandle, error) {
 	return &serveHandle{
 		GRPCAddr:      grpcLis.Addr().String(),
 		MetricsAddr:   metricsAddr,
+		TLSEnabled:    tlsConfig != nil,
 		eng:           eng,
 		obs:           obsSrv,
 		grpcSrv:       grpcSrv,

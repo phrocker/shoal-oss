@@ -7,6 +7,12 @@ metadata:
     app.kubernetes.io/component: read-fleet
 spec:
   replicas: {{ .Values.readFleet.replicas }}
+  # Explicit rollout contract instead of relying on the apps/v1 default.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: {{ .Values.readFleet.strategy.maxUnavailable }}
+      maxSurge: {{ .Values.readFleet.strategy.maxSurge }}
   selector:
     matchLabels:
       app.kubernetes.io/name: shoal
