@@ -86,6 +86,7 @@ type AuthorityToken struct {
     Resource   string
     Owner      string
     LeaseID    string
+    Epoch      uint64
     Generation uint64
     Attempt    string
 }
@@ -107,13 +108,28 @@ type Lease interface {
 This is a design shape, not a committed public Go API. Backend-specific proof
 must remain available:
 
-- an embedded token includes the persisted manifest generation and lock-file
-  identity;
+- every token includes the logical table's durable `Epoch`, which is advanced
+  by compare-and-swap for every authority acquisition and handoff. It is
+  independent of backend-native generations and is the only value ordered
+  across coordination domains;
+- an embedded token also includes the persisted manifest generation and
+  lock-file identity;
 - a Kubernetes token includes the Lease UID/resource version observed during
   acquisition and the CAS-protected manifest generation. Kubernetes resource
   versions are opaque identities, not integers to compare;
 - an Accumulo token includes the exact ServiceLock identity and sequence plus
   the manager-issued assignment or coordinator-issued job attempt.
+
+Embedded and Kubernetes modes keep the epoch in the CAS-protected table
+manifest. Accumulo mode keeps it in a manager-owned Shoal authority record in
+Accumulo authoritative metadata; changing that record requires a supported
+manager/FATE operation, never a direct metadata mutation. The Accumulo adapter
+must verify the record's epoch when issuing assignments or jobs. A handoff
+prepares epoch `E+1` while both domains are non-writable, records `E+1` through
+the destination manager, retires source epoch `E`, and only then activates the
+destination. Native manifest generations, Kubernetes resource versions, and
+ServiceLock sequences remain backend proof and are never compared with one
+another.
 
 The `Attempt` component prevents a delayed completion from applying to a later
 operation that happens to run under the same process lease. This matches the
@@ -129,7 +145,8 @@ Shoal must not make a coordination service carry data-plane load.
 | --- | --- |
 | Process membership and endpoint descriptors | ZooKeeper ServiceLock or Kubernetes Lease-associated discovery |
 | Leader/active-writer lease | Current domain's coordinator |
-| Authority epoch and terminal handoff record | CAS-protected durable manifest, with the active lease identity |
+| Logical-table authority epoch | CAS-protected manifest in embedded/Kubernetes mode; manager-owned Shoal authority record in Accumulo metadata |
+| Terminal handoff record | Source and destination authority records, linked by epoch and immutable lineage |
 | Local mutations and recovery | WAL plus manifest/file generations |
 | Accumulo tablet placement and files | Accumulo manager, metadata, and FATE |
 | Online compaction lifecycle | Accumulo coordinator/manager protocol |
@@ -203,9 +220,11 @@ The handoff proceeds as follows:
    ordinary mutations for the rest of the handoff. It must either be newly
    created offline and never enabled, or have all prior writers retired and
    their lineage reconciled before this protocol begins. Persist the
-   destination table ID and gated state as `DESTINATION_FENCED`.
+   destination table ID and gated state as `DESTINATION_FENCED`, then reserve
+   logical authority epoch `E+1` in the destination's manager-owned authority
+   record without making the table writable.
 2. Fence the local writer with its current lease and manifest generation.
-3. Stop admitting local writes and durably record `LOCAL_FROZEN`.
+3. Stop admitting local writes and durably record `LOCAL_FROZEN` at epoch `E`.
 4. Flush/checkpoint an immutable generation and verify its checksums.
 5. Stage the export, call `beginFateOperation`, and durably record the returned
    FATE identity as `FATE_ALLOCATED` **before** calling
@@ -217,10 +236,11 @@ The handoff proceeds as follows:
    durably recorded.
 7. Verify the imported files and tablet state through Accumulo while the
    destination write fence remains held.
-8. Revoke local authority and durably record `LOCAL_RETIRED`.
+8. Revoke local authority and durably record `LOCAL_RETIRED`, linking epoch
+   `E` to the destination's reserved epoch `E+1`.
 9. Bring the destination online through the manager, verify the transition,
-   and durably record `ACCUMULO_WRITABLE`. Only then may distributed clients
-   admit writes.
+   and durably record `ACCUMULO_WRITABLE` at epoch `E+1`. Only then may
+   distributed clients admit writes.
 10. Retain an auditable lineage record tying local generation, export
     checksums, destination table, FATE identity, and terminal authority epoch.
 
