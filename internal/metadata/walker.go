@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"path"
 	"time"
 	"unicode"
 
@@ -132,6 +133,25 @@ func (w *Walker) BootstrapAll(ctx context.Context) (map[string][]TabletInfo, err
 // miss / post-invalidation. Replaceable later with narrow-range metadata
 // scans once we want to avoid full re-walks.
 func (w *Walker) LocateTable(ctx context.Context, tableID string) ([]TabletInfo, error) {
+	if tableID == RootTableID {
+		type rawRootLocator interface {
+			GetRaw(context.Context, string) ([]byte, error)
+			InstancePath() string
+		}
+		locator, ok := w.locator.(rawRootLocator)
+		if !ok {
+			return nil, errors.New("root tablet metadata reader is unavailable")
+		}
+		encoded, err := locator.GetRaw(ctx, path.Join(locator.InstancePath(), "root_tablet"))
+		if err != nil {
+			return nil, err
+		}
+		root, err := DecodeRootTabletMetadata(encoded)
+		if err != nil {
+			return nil, err
+		}
+		return []TabletInfo{root}, nil
+	}
 	all, err := w.BootstrapAll(ctx)
 	if err != nil {
 		return nil, err

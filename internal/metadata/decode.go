@@ -22,6 +22,30 @@ import (
 	"github.com/google/uuid"
 )
 
+// EncodeTabletRow returns the exact metadata row for a tablet extent.
+func EncodeTabletRow(tableID string, endRow []byte) ([]byte, error) {
+	if tableID == "" || strings.ContainsAny(tableID, ";<") {
+		return nil, errors.New("invalid tablet table ID")
+	}
+	row := append([]byte(nil), tableID...)
+	if endRow == nil {
+		return append(row, '<'), nil
+	}
+	if len(endRow) == 0 {
+		return nil, errors.New("empty non-default tablet end row")
+	}
+	row = append(row, ';')
+	return append(row, endRow...), nil
+}
+
+// EncodePrevEndRow returns MetadataSchema's value for ~tab:~pr.
+func EncodePrevEndRow(prevEndRow []byte) []byte {
+	if prevEndRow == nil {
+		return []byte{0}
+	}
+	return append([]byte{1}, prevEndRow...)
+}
+
 // DecodeTabletRow reverses the row-key encoding in
 // MetadataSchema.TabletsSection.encodeRow:
 //

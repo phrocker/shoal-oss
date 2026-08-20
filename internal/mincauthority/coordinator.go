@@ -349,11 +349,12 @@ func (c *Coordinator) reconcileMetadata(state *State) (bool, error) {
 	filePresent := false
 	for _, file := range current.Files {
 		if file.Path == state.File.Path {
-			if !equalFile(file, state.File) {
+			if !equalAuthoritativeFile(file, state.File) {
 				return false, fmt.Errorf("%w: output path has different metadata", ErrMetadataInconsistent)
 			}
 			filePresent = true
 		}
+
 	}
 	remaining := 0
 	for _, covered := range state.CoveredWALs {
@@ -373,6 +374,13 @@ func (c *Coordinator) reconcileMetadata(state *State) (bool, error) {
 		return false, fmt.Errorf("%w: filePresent=%t coveredWALsRemaining=%d/%d",
 			ErrMetadataInconsistent, filePresent, remaining, len(state.CoveredWALs))
 	}
+}
+
+// Accumulo persists the path in the StoredTabletFile qualifier and size/entry
+// count in DataFileValue. A newly flushed file is a whole-file reference, so
+// its first/last data rows are local validation facts, not metadata fences.
+func equalAuthoritativeFile(a, b DataFile) bool {
+	return a.Path == b.Path && a.Size == b.Size && a.Entries == b.Entries
 }
 
 func (c *Coordinator) validatePublished(ctx context.Context, expected DataFile) error {

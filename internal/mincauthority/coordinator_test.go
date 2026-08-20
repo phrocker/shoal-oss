@@ -437,6 +437,30 @@ func TestFileStateStoreAdvancesWithoutReplacingCheckpoints(t *testing.T) {
 	}
 }
 
+func TestFileStateStoreDiscoversPendingOperationsAfterRestart(t *testing.T) {
+	dir := t.TempDir()
+	store := &FileStateStore{Dir: dir}
+	for _, state := range []State{
+		{OperationID: "later", Extent: testExtent, Fence: testFence, Phase: PhaseCommitted},
+		{OperationID: "earlier", Extent: testExtent, Fence: testFence, Phase: PhasePublished},
+		{OperationID: "complete", Extent: testExtent, Fence: testFence, Phase: PhaseComplete},
+		{OperationID: "other-fence", Extent: testExtent, Fence: ingestrouter.Fence{ServerGeneration: "other"}, Phase: PhaseValidated},
+	} {
+		if err := store.Save(context.Background(), state); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pending, err := (&FileStateStore{Dir: dir}).Pending(context.Background(), testExtent, testFence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 2 ||
+		pending[0].OperationID != "earlier" || pending[0].Phase != PhasePublished ||
+		pending[1].OperationID != "later" || pending[1].Phase != PhaseCommitted {
+		t.Fatalf("pending = %+v", pending)
+	}
+}
+
 type fixture struct {
 	config      Config
 	coordinator *Coordinator

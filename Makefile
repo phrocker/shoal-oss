@@ -161,6 +161,17 @@ _patch-binary-fields:
 	       { print }' $$f > $$f.tmp && mv $$f.tmp $$f; \
 	  echo "_patch-binary-fields: waitForFlush applied"; \
 	fi
+	@f=$(THRIFT_OUT)/data/data.go; \
+	test -f $$f || { echo "$$f not found; run thrift-gen first"; exit 1; }; \
+	if grep -q 'PATCH (shoal): nil condition value = absent column' $$f; then \
+	  echo "_patch-binary-fields: TCondition already applied"; \
+	else \
+	  awk 'BEGIN { p=0 } \
+	       /^func \(p \*TCondition\) writeField6\(/ { p=1; print; next } \
+	       p==1 && /WriteFieldBegin\(ctx, "val"/ { print "  // PATCH (shoal): nil condition value = absent column."; print "  if p.Val == nil { return nil }"; p=0 } \
+	       { print }' $$f > $$f.tmp && mv $$f.tmp $$f; \
+	  echo "_patch-binary-fields: TCondition applied"; \
+	fi
 
 # Generic struct-pointer guard: any writeFieldN across all generated .go
 # files where the body contains `p.<Field>.Write(ctx, oprot)` gets the

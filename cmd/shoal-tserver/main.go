@@ -1,6 +1,4 @@
-// shoal-tserver is the manager-assigned Shoal tablet server. It remains
-// read-only until a production conditional metadata authority can initialize
-// the implemented TabletIngest/WAL/memtable/minor-compaction composition.
+// shoal-tserver is the manager-assigned Shoal tablet server.
 package main
 
 import (
@@ -13,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"path"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -21,8 +20,13 @@ import (
 
 	"github.com/phrocker/shoal/internal/cache"
 	"github.com/phrocker/shoal/internal/cred"
+	"github.com/phrocker/shoal/internal/hostedingest"
+	"github.com/phrocker/shoal/internal/ingestclient"
+	"github.com/phrocker/shoal/internal/ingestrouter"
+	"github.com/phrocker/shoal/internal/ingestservice"
 	"github.com/phrocker/shoal/internal/managerclient"
 	"github.com/phrocker/shoal/internal/metadata"
+	"github.com/phrocker/shoal/internal/metadatacas"
 	"github.com/phrocker/shoal/internal/namespaces"
 	"github.com/phrocker/shoal/internal/protocol"
 	"github.com/phrocker/shoal/internal/scanserver"
@@ -39,6 +43,7 @@ import (
 	"github.com/phrocker/shoal/internal/tserver"
 	"github.com/phrocker/shoal/internal/tserverprocess"
 	"github.com/phrocker/shoal/internal/tserverrpc"
+	"github.com/phrocker/shoal/internal/walauthority"
 	"github.com/phrocker/shoal/internal/zk"
 )
 
@@ -70,6 +75,10 @@ func main() {
 	lockVerify := flag.Duration("lock-verify", 5*time.Second, "ServiceLock verification interval")
 	drainTimeout := flag.Duration("drain-timeout", 30*time.Second, "scan drain deadline")
 	metricsAddress := flag.String("metrics-address", ":9998", "health/readiness/metrics address; empty disables")
+	walRoot := flag.String("wal-root", "var\\shoal\\wal", "durable local WAL directory")
+	mincRoot := flag.String("minc-root", "shoal/minc", "minor-compaction object prefix")
+	stateRoot := flag.String("state-root", "var\\shoal\\minc-state", "durable minor-compaction state directory")
+	flushCells := flag.Int("flush-cells", 1, "memtable cells that trigger minor compaction")
 	flag.Parse()
 
 	if *showVersion {
@@ -108,6 +117,10 @@ func main() {
 		Principal: *systemPrincipal, TokenClassName: *systemTokenClass,
 		Token: append([]byte(nil), token...), InstanceId: loc.InstanceID(),
 	}
+	sessionGeneration := strconv.FormatUint(uint64(session.SessionID()), 16)
+	if sessionGeneration == "0" {
+		die("ZooKeeper session has no identity")
+	}
 
 	pool, err := transportpool.New(transportpool.Config{IdleTimeout: time.Minute, MaxIdlePerEndpoint: 4})
 	if err != nil {
@@ -119,40 +132,77 @@ func main() {
 		die("manager client: %v", err)
 	}
 	defer managerAPI.Close()
+	conditionalAPI, err := ingestclient.NewPooled(
+		pool, loc.InstanceID(), *accVersion, systemCredentials, 10*time.Second,
+	)
+	if err != nil {
+		die("conditional metadata client: %v", err)
+	}
+	defer conditionalAPI.Close()
 
 	walker := metadata.NewWalker(loc, outbound, *accVersion).WithLogger(logger)
 	namespaceNames := namespaces.NewResolver(loc)
 	tableNames := tablenames.NewResolver(loc, namespaceNames)
 	host := tserver.NewHost()
-	loader, err := tabletloader.New(tabletloader.Config{
-		Authority: tserverprocess.HostAuthority{Host: host},
-		Metadata:  tserverprocess.MetadataSource{Locator: walker, Address: *advertise},
-		Config:    tserverprocess.ManagerConfigSource{Resolver: resolver, Client: managerAPI},
-		Files:     tabletloader.StrictReferenceResolver{},
-		Logs:      tabletloader.StrictReferenceResolver{},
-		Retry:     tabletloader.DefaultRetryPolicy(),
-	})
-	if err != nil {
-		die("tablet loader: %v", err)
-	}
-	store, err := tserverprocess.NewStore(loader)
-	if err != nil {
-		die("tablet store: %v", err)
-	}
 	files, closeStorage, err := openStorage(runCtx, *storageScheme)
 	if err != nil {
 		die("storage: %v", err)
 	}
 	defer closeStorage()
+	metadataFactory, err := metadatacas.NewFactory(metadatacas.Config{
+		Reader: walker, RootLocator: loc, Conditional: conditionalAPI,
+		RootStore: session, Host: host, InstancePath: loc.InstancePath(),
+		Address: *advertise, Group: *group, Session: sessionGeneration,
+	})
+	if err != nil {
+		die("metadata authority: %v", err)
+	}
+	loader, err := tabletloader.New(tabletloader.Config{
+		Authority: tserverprocess.HostAuthority{
+			Host: host, Generation: tabletloader.Generation(sessionGeneration),
+		},
+		Metadata: tserverprocess.MetadataSource{Locator: walker, Address: *advertise},
+		Config:   tserverprocess.ManagerConfigSource{Resolver: resolver, Client: managerAPI},
+		Files:    tabletloader.StrictReferenceResolver{},
+		Logs:     tabletloader.StrictReferenceResolver{},
+		Retry:    tabletloader.DefaultRetryPolicy(),
+	})
+	if err != nil {
+		die("tablet loader: %v", err)
+	}
+	tabletFactory, err := hostedingest.NewFactory(hostedingest.Config{
+		Host: host, ServerAddress: *advertise,
+		WALRoot: *walRoot, MincRoot: *mincRoot, StateRoot: *stateRoot,
+		WALStore: walauthority.NewLocalStore(), Outputs: files,
+		Metadata: metadataFactory, FlushCells: *flushCells,
+	})
+	if err != nil {
+		die("hosted ingest: %v", err)
+	}
+	store, err := tserverprocess.NewWritableStore(loader, tabletFactory)
+	if err != nil {
+		die("tablet store: %v", err)
+	}
+	authenticator := tserverprocess.ManagerAuthenticator{
+		Resolver: resolver, System: systemCredentials, InstanceID: loc.InstanceID(),
+		AccumuloVersion: *accVersion, TableNames: tableNames,
+	}
 	scans, err := scanserver.NewServer(scanserver.Options{
 		Locator: store, Storage: files, BlockCache: cache.NewBlockCache(256 << 20), Logger: logger,
-		Credentials: tserverprocess.ManagerAuthenticator{
-			Resolver: resolver, System: systemCredentials, InstanceID: loc.InstanceID(),
-			AccumuloVersion: *accVersion, TableNames: tableNames,
-		},
+		Credentials: authenticator,
 	})
 	if err != nil {
 		die("scan server: %v", err)
+	}
+	router, err := ingestrouter.New(store, ingestrouter.DefaultLimits())
+	if err != nil {
+		die("ingest router: %v", err)
+	}
+	ingest, err := ingestservice.New(ingestservice.Config{
+		Router: router, Authenticator: authenticator,
+	})
+	if err != nil {
+		die("ingest service: %v", err)
 	}
 
 	reporter := &tserverrpc.RetryingReporter{
@@ -178,7 +228,7 @@ func main() {
 	defer adapter.Close()
 
 	mux := thrift.NewTMultiplexedProcessor()
-	services := tserverprocess.Services{Manager: adapter, Scans: scans}
+	services := tserverprocess.Services{Manager: adapter, Scans: scans, Ingest: ingest}
 	if err := services.Register(mux); err != nil {
 		die("register processors: %v", err)
 	}
@@ -198,7 +248,7 @@ func main() {
 	if *metricsAddress != "" {
 		operations = &http.Server{
 			Addr:              *metricsAddress,
-			Handler:           tserverprocess.OperationsHandler(host, scans),
+			Handler:           tserverprocess.OperationsHandlerWithIngest(host, scans, ingest),
 			ReadHeaderTimeout: 5 * time.Second,
 		}
 		go func() {
@@ -243,7 +293,7 @@ func main() {
 
 	logger.Info("shoal-tserver serving",
 		"listen", *listen, "advertise", *advertise, "group", *group,
-		"tablet_ingest", "unsupported",
+		"tablet_ingest", "ready",
 	)
 	var reason error
 	select {
@@ -256,6 +306,7 @@ func main() {
 		reason = runCtx.Err()
 	}
 	logger.Info("shoal-tserver draining", "reason", reason)
+	ingest.BeginDrain()
 	scans.BeginDrain()
 	// Withdraw ownership before waiting on retained continuations. Existing
 	// sessions are already materialized by scanserver and can finish without

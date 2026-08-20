@@ -14,6 +14,7 @@ type TabletInfo struct {
 	FutureLocation *Location
 	Directory      string
 	Time           string
+	ServerLock     string
 	Files          []FileEntry
 	// Logs are the tablet's unflushed WAL segments, parsed from the
 	// metadata "log:" column family. Empty for a fully flushed tablet.

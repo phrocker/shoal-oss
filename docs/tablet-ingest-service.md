@@ -26,11 +26,18 @@ implement.
 `tserverprocess.NewWritableStore` publishes a tablet to scans and ingest only
 after that composition opens successfully. `tserverprocess.Services` registers
 and advertises `TABLET_INGEST` only when a live ingest service is supplied and
-accepting. The current `cmd/shoal-tserver` intentionally supplies no ingest
-service because a production Accumulo conditional metadata writer has not yet
-landed. Therefore the command remains fail-closed and does not advertise
-`TABLET_INGEST`; tests use a fenced fake metadata authority to exercise WAL,
-replay, ambiguous responses, compaction, stale ownership, and drain races.
+accepting. `cmd/shoal-tserver` now supplies a production metadata authority:
+root-tablet changes use ZooKeeper version CAS, while metadata and user-tablet
+rows use Accumulo conditional mutations over exact location, lock, previous-row,
+WAL, and file columns. Unknown transport outcomes are reconciled by rereading
+authoritative state and retries are idempotent. Durable checkpoints discover
+and resume incomplete minor compactions after restart; ownership release
+flushes, retires WAL references, and conditionally removes the exact owner.
+
+General client conditional-mutation sessions remain unsupported and fail
+explicitly. The internal metadata CAS path is supported when the backing root
+or metadata tablet is hosted by an Accumulo implementation that provides
+conditional updates.
 
 Live unmodified-Java-client evidence remains part of issue #74 and requires
 Docker or another Accumulo 4 cluster environment.

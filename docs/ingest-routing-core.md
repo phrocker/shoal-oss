@@ -25,6 +25,7 @@ authorization/error mapping now compose through `internal/ingestservice` and
 `HostedTablet.Authority()` must report `AuthorityAccumuloWAL` before the router
 will acknowledge a commit. The zero/default `AuthorityUnsupported` returns
 `ErrWALAuthorityUnsupported`; there is no local-WAL, in-memory, or
-success-shaped fallback. The production command still requires an Accumulo conditional metadata writer
-before it can construct that composition and advertise `TABLET_INGEST`; see
+success-shaped fallback. The production command constructs the Accumulo conditional metadata authority
+before the writable tablet store and advertises `TABLET_INGEST` only when that
+complete composition is initialized; see
 [tablet ingest service integration](tablet-ingest-service.md).

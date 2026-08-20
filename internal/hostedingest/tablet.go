@@ -81,8 +81,12 @@ func (f *Factory) Open(
 	if !serverOK || !managerOK || !attempt.Valid() {
 		return nil, ingestrouter.ErrStaleFence
 	}
+	serverGeneration := string(spec.Generation)
+	if serverGeneration == "" {
+		serverGeneration = serverLock.String()
+	}
 	fence := ingestrouter.Fence{
-		ServerGeneration: serverLock.String(), ManagerGeneration: managerLock.String(),
+		ServerGeneration: serverGeneration, ManagerGeneration: managerLock.String(),
 		Assignment: attempt.Assignment(),
 	}
 	extent := ingestrouter.Extent{
@@ -100,6 +104,7 @@ func (f *Factory) Open(
 	}
 	tablet := &Tablet{
 		extent: extent, fence: fence, verifier: verifier, flushCells: f.cfg.FlushCells,
+		metadata:  metadata,
 		snapshots: make(map[string]mincauthority.Snapshot),
 		applied:   make(map[string]struct{}), assigned: make(map[string][]ingestrouter.Mutation),
 		nextTimestamp: f.cfg.Now().UnixMilli(), newOperationID: f.cfg.NewOperationID,
@@ -114,17 +119,33 @@ func (f *Factory) Open(
 	}
 	tablet.wal = wal
 	tablet.recovery = report
+	stateStore := &mincauthority.FileStateStore{Dir: filepath.Join(f.cfg.StateRoot, extentDigest(extent))}
 	coordinator, err := mincauthority.New(mincauthority.Config{
 		Root: f.cfg.MincRoot, Extent: extent, Fence: fence,
 		Snapshots: tablet, Verifier: verifier, Metadata: metadata,
 		Outputs: mincauthority.BackendOutputStore{Backend: f.cfg.Outputs},
-		States:  &mincauthority.FileStateStore{Dir: filepath.Join(f.cfg.StateRoot, extentDigest(extent))},
+		States:  stateStore,
 	})
 	if err != nil {
 		_ = wal.Close(context.Background())
 		return nil, err
 	}
 	tablet.minc = coordinator
+	pending, err := stateStore.Pending(ctx, extent, fence)
+	if err != nil {
+		_ = wal.Close(context.Background())
+		return nil, err
+	}
+	for _, state := range pending {
+		tablet.resume = append(tablet.resume, state.OperationID)
+		if state.Phase >= mincauthority.PhaseCommitted {
+			tablet.snapshots[state.OperationID] = mincauthority.Snapshot{
+				ID: state.SnapshotID, Extent: extent, Fence: fence,
+				Boundary:    state.Boundary,
+				CoveredWALs: append([]walauthority.Reference(nil), state.CoveredWALs...),
+			}
+		}
+	}
 	return tablet, nil
 }
 
@@ -154,6 +175,7 @@ type Tablet struct {
 	extent   ingestrouter.Extent
 	fence    ingestrouter.Fence
 	verifier hostVerifier
+	metadata MetadataAuthority
 	wal      *walauthority.Tablet
 	minc     *mincauthority.Coordinator
 	recovery walauthority.RecoveryReport
@@ -167,6 +189,7 @@ type Tablet struct {
 	flushCells     int
 	newOperationID func() string
 	pendingFlush   string
+	resume         []string
 	files          []mincauthority.DataFile
 	closed         bool
 }
@@ -180,6 +203,9 @@ func (t *Tablet) Authority() ingestrouter.CommitAuthority {
 func (t *Tablet) Commit(ctx context.Context, request ingestrouter.CommitRequest) error {
 	t.opMu.Lock()
 	defer t.opMu.Unlock()
+	if err := t.resumePending(ctx); err != nil {
+		return err
+	}
 	t.mu.Lock()
 	closed := t.closed
 	t.mu.Unlock()
@@ -295,14 +321,16 @@ func (t *Tablet) Complete(ctx context.Context, snapshotID string, _ mincauthorit
 			break
 		}
 	}
-	if operationID != "" {
-		delete(t.snapshots, operationID)
-	}
 	t.mu.Unlock()
 	for _, ref := range snapshot.CoveredWALs {
 		if err := t.wal.Retire(ctx, ref); err != nil {
 			return err
 		}
+	}
+	if operationID != "" {
+		t.mu.Lock()
+		delete(t.snapshots, operationID)
+		t.mu.Unlock()
 	}
 	return nil
 }
@@ -310,7 +338,34 @@ func (t *Tablet) Complete(ctx context.Context, snapshotID string, _ mincauthorit
 func (t *Tablet) Flush(ctx context.Context) error {
 	t.opMu.Lock()
 	defer t.opMu.Unlock()
+	if err := t.resumePending(ctx); err != nil {
+		return err
+	}
 	return t.flush(ctx)
+}
+
+func (t *Tablet) resumePending(ctx context.Context) error {
+	for len(t.resume) > 0 {
+		operationID := t.resume[0]
+		file, err := t.minc.Run(ctx, operationID)
+		if err != nil {
+			return err
+		}
+		t.mu.Lock()
+		found := false
+		for _, existing := range t.files {
+			if existing.Path == file.Path {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.files = append(t.files, file)
+		}
+		t.resume = t.resume[1:]
+		t.mu.Unlock()
+	}
+	return nil
 }
 
 func (t *Tablet) flush(ctx context.Context) error {
@@ -361,13 +416,26 @@ func (t *Tablet) Close(ctx context.Context) error {
 		return nil
 	}
 	t.mu.Unlock()
+	if err := t.resumePending(ctx); err != nil {
+		return err
+	}
 	if err := t.flush(ctx); err != nil {
 		return err
+	}
+	if err := t.wal.Close(ctx); err != nil {
+		return err
+	}
+	if releaser, ok := t.metadata.(interface {
+		Release(context.Context, ingestrouter.Extent, ingestrouter.Fence) error
+	}); ok {
+		if err := releaser.Release(ctx, t.extent, t.fence); err != nil {
+			return err
+		}
 	}
 	t.mu.Lock()
 	t.closed = true
 	t.mu.Unlock()
-	return t.wal.Close(ctx)
+	return nil
 }
 
 func (t *Tablet) Recovery() walauthority.RecoveryReport { return t.recovery }

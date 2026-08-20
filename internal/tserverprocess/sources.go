@@ -68,7 +68,8 @@ func (s MetadataSource) ReadTablet(
 // HostAuthority fences a loader transaction to the currently held server lock
 // and to a still-assigned Host entry.
 type HostAuthority struct {
-	Host *tserver.Host
+	Host       *tserver.Host
+	Generation tabletloader.Generation
 }
 
 func (a HostAuthority) Capture(_ context.Context, extent tserver.Extent) (tabletloader.Generation, error) {
@@ -79,6 +80,9 @@ func (a HostAuthority) Capture(_ context.Context, extent tserver.Extent) (tablet
 	if !ok || a.Host.State(extent) == tserver.StateUnassigned {
 		return "", tabletloader.ErrStaleGeneration
 	}
+	if a.Generation != "" {
+		return a.Generation, nil
+	}
 	return tabletloader.Generation(lock.String()), nil
 }
 
@@ -87,7 +91,11 @@ func (a HostAuthority) Validate(_ context.Context, extent tserver.Extent, genera
 		return tabletloader.ErrInvalidDependency
 	}
 	lock, ok := a.Host.Lock()
-	if !ok || tabletloader.Generation(lock.String()) != generation ||
+	expected := tabletloader.Generation(lock.String())
+	if a.Generation != "" {
+		expected = a.Generation
+	}
+	if !ok || expected != generation ||
 		a.Host.State(extent) == tserver.StateUnassigned {
 		return tabletloader.ErrStaleGeneration
 	}

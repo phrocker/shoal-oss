@@ -5,8 +5,10 @@ This directory contains platform artifacts for running Shoal as three Kubernetes
 - **Write tier**: one `shoal-embed` StatefulSet per shard. Each pod has stable identity and a persistent local data directory for WAL/tablet state. The deployment manifests explicitly opt into the HTTP observability listener with `shoal-embed serve --data <dir> --address 0.0.0.0:<port> --metrics-address 0.0.0.0:<port> --quiesce-delay 10s`.
 - **Read fleet**: stateless `shoal` pods behind a Service. They serve the Accumulo-compatible Thrift scan surface and open immutable RFiles through the configured storage backend.
 - **Accumulo tablet server**: `shoal-tserver` StatefulSet members acquire
-  Accumulo ServiceLocks, accept manager assignments, and serve scans only for
-  tablets they successfully loaded. They do not advertise `TABLET_INGEST`.
+  Accumulo ServiceLocks, accept manager assignments, and serve scans and
+  WAL-backed ingest only for tablets whose metadata ownership they claimed by
+  conditional CAS. They advertise `TABLET_INGEST` only after all write
+  authorities initialize.
 
 For local development these collapse into a single `shoal-embed` process. The intended platform shape is: writes land in a shard-local `shoal-embed`, flush/compaction emits RFiles to a shared object-store prefix, and read-fleet pods open those same RFiles for hedged scans.
 
