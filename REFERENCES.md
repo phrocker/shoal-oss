@@ -95,6 +95,8 @@ cribs land.
     configured 120-second default
 - `core/.../rpc/clients/ThriftClientTypes.java`
   - `TabletIngestClientService` multiplex service name is `ingest`
+  - `TabletManagementClientService` multiplex service name is `tablet`
+  - `TabletServerClientService` multiplex service name is `tserver`
 
 ### Thrift IDL
 - Vendored snapshot: `internal/thrift/idl` (Accumulo source revision
@@ -102,6 +104,10 @@ cribs land.
 - `core/src/main/thrift/tabletscan.thrift:77-95` — `startScan` signature
 - `core/src/main/thrift/tabletingest.thrift` — `startUpdate`,
   `applyUpdates`, `closeUpdate`, and `cancelUpdate`
+- `core/src/main/thrift/tabletmgmt.thrift` — manager-directed `loadTablet`,
+  `unloadTablet`, and `flushTablet`
+- `core/src/main/thrift/tabletserver.thrift` — manager-visible status,
+  flush, and halt control
 - `core/src/main/thrift/data.thrift` — `TKeyExtent`, `TRange`, `TKey`,
   `TKeyValue`, `TColumn`, `IterInfo`, `TMutation`, and `UpdateErrors`
 - `core/src/main/thrift/security.thrift` — `TCredentials`
