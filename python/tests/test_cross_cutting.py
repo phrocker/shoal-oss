@@ -10,7 +10,6 @@ import unittest
 from sharkbite import ForkSafetyError, NativeAPI
 from sharkbite.errors import (
     ClientException,
-    DeadlineExceededError,
     OutOfMemoryError,
 )
 
@@ -81,8 +80,10 @@ class CrossCuttingCompiledTests(unittest.TestCase):
         status = self.api.lib.shoal_batch_writer_close(
             writer, 1, C.byref(failure), C.byref(error)
         )
-        with self.assertRaises(DeadlineExceededError):
+        with self.assertRaises(RuntimeError) as raised:
             self.api.check_write(status, failure, error)
+        self.assertIs(type(raised.exception), RuntimeError)
+        self.assertEqual(raised.exception.status, 8)
         self.api.lib.shoal_batch_writer_free(C.byref(writer))
 
         self.assertEqual(create_writer(1, C.byref(writer)), 1)

@@ -24,7 +24,7 @@
  */
 #define SHOAL_ABI_VERSION 1u
 #define SHOAL_ABI_VERSION_MAJOR 1u
-#define SHOAL_ABI_VERSION_MINOR 18u
+#define SHOAL_ABI_VERSION_MINOR 19u
 #define SHOAL_ABI_VERSION_PATCH 0u
 #define SHOAL_ABI_PACK_VERSION(major, minor, patch)                           \
   ((((uint32_t)(major) & 0xffu) << 16) |                                     \
@@ -72,10 +72,11 @@ enum {
   SHOAL_ABI_CAPABILITY_HDFS = 27,
   SHOAL_ABI_CAPABILITY_RFILE_LOCALITY_GROUPS = 28,
   SHOAL_ABI_CAPABILITY_CLIENT_PARITY_CONTROLS = 29,
-  SHOAL_ABI_CAPABILITY_ZOOKEEPER_INSTANCE = 30
+  SHOAL_ABI_CAPABILITY_STORAGE_ERROR_PARITY = 30,
+  SHOAL_ABI_CAPABILITY_ZOOKEEPER_INSTANCE = 31
 };
 
-#define SHOAL_ABI_CAPABILITY_COUNT 31u
+#define SHOAL_ABI_CAPABILITY_COUNT 32u
 #define SHOAL_ABI_CAPABILITY_WORD_BITS 64u
 #define SHOAL_ABI_CAPABILITY_WORD_INDEX(capability_id)                       \
   ((uint32_t)(capability_id) / SHOAL_ABI_CAPABILITY_WORD_BITS)
@@ -145,6 +146,8 @@ enum {
   SHOAL_ABI_CAPABILITY_MASK(SHOAL_ABI_CAPABILITY_RFILE_LOCALITY_GROUPS)
 #define SHOAL_ABI_CAPABILITY_CLIENT_PARITY_CONTROLS_MASK                     \
   SHOAL_ABI_CAPABILITY_MASK(SHOAL_ABI_CAPABILITY_CLIENT_PARITY_CONTROLS)
+#define SHOAL_ABI_CAPABILITY_STORAGE_ERROR_PARITY_MASK                       \
+  SHOAL_ABI_CAPABILITY_MASK(SHOAL_ABI_CAPABILITY_STORAGE_ERROR_PARITY)
 #define SHOAL_ABI_CAPABILITY_ZOOKEEPER_INSTANCE_MASK                         \
   SHOAL_ABI_CAPABILITY_MASK(SHOAL_ABI_CAPABILITY_ZOOKEEPER_INSTANCE)
 #define SHOAL_ABI_CAPABILITY_WORD0                                           \
@@ -176,6 +179,7 @@ enum {
    SHOAL_ABI_CAPABILITY_HDFS_MASK |                                          \
    SHOAL_ABI_CAPABILITY_RFILE_LOCALITY_GROUPS_MASK |                         \
    SHOAL_ABI_CAPABILITY_CLIENT_PARITY_CONTROLS_MASK |                        \
+   SHOAL_ABI_CAPABILITY_STORAGE_ERROR_PARITY_MASK |                         \
    SHOAL_ABI_CAPABILITY_ZOOKEEPER_INSTANCE_MASK)
 
 typedef int32_t shoal_log_level;
@@ -185,6 +189,10 @@ enum {
   SHOAL_LOG_LEVEL_DEBUG = 1,
   SHOAL_LOG_LEVEL_TRACE = 2
 };
+
+typedef void(SHOAL_CALL *shoal_log_callback)(
+    shoal_log_level level, const char *event_name,
+    const char *attributes_json, void *context);
 
 typedef int32_t shoal_status;
 
@@ -226,7 +234,9 @@ enum {
   SHOAL_ERROR_SOURCE_CLIENT_EXCEPTION = 1,
   SHOAL_ERROR_SOURCE_ILLEGAL_STATE_EXCEPTION = 2,
   SHOAL_ERROR_SOURCE_ITERATION_INTERRUPTED_EXCEPTION = 3,
-  SHOAL_ERROR_SOURCE_VISIBILITY_PARSE_EXCEPTION = 4
+  SHOAL_ERROR_SOURCE_VISIBILITY_PARSE_EXCEPTION = 4,
+  SHOAL_ERROR_SOURCE_HDFS_EXCEPTION = 5,
+  SHOAL_ERROR_SOURCE_ILLEGAL_ARGUMENT_EXCEPTION = 6
 };
 
 typedef int32_t shoal_error_compatibility_class;
@@ -744,3 +754,4 @@ typedef struct shoal_cleanup_failure_view {
 } shoal_cleanup_failure_view;
 
 #endif
+

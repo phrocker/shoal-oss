@@ -205,7 +205,7 @@ def build_native_evidence() -> dict[str, object]:
         "runtime": "verified",
         "c_cxx_shared_lifecycle": "compiled, linked, and executed",
         "c_static_lifecycle": "compiled, linked, and executed",
-        "abi": {"version": "1.18.0", "capability_count": 31},
+        "abi": {"version": "1.19.0", "capability_count": 32},
         "exports": {"declared": len(expected), "present": len(expected)},
         "artifacts": [artifact(shared), artifact(archive)],
         "python_distribution": build_native_distribution(goos, arch),

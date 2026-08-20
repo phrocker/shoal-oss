@@ -198,7 +198,10 @@ func (s *Scanner) scanLocated(
 	scanRange *Range,
 ) ([]KeyValue, error) {
 	var priorCleanup error
-	for attempt := 0; attempt < 2; attempt++ {
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, errors.Join(priorCleanup, err)
+		}
 		if !scanRange.fitsTablet(tablet) {
 			return nil, fmt.Errorf(
 				"%w: table=%s start=%q end=%q tabletEnd=%q",
@@ -211,7 +214,7 @@ func (s *Scanner) scanLocated(
 		}
 
 		values, scanErr := s.scanTablet(ctx, tablet, scanRange)
-		if scanErr == nil || attempt == 1 || !isStaleScanError(scanErr) {
+		if scanErr == nil || !isStaleScanError(scanErr) {
 			return values, errors.Join(priorCleanup, scanErr)
 		}
 		var cleanupErr *CleanupError
@@ -227,23 +230,24 @@ func (s *Scanner) scanLocated(
 			return nil, errors.Join(priorCleanup, scanErr)
 		}
 	}
-	return nil, priorCleanup
 }
 
 func (s *Scanner) locateTablet(ctx context.Context, table Table, routingRow []byte) (Tablet, error) {
-	for attempt := 0; attempt < 2; attempt++ {
+	for {
+		if err := ctx.Err(); err != nil {
+			return Tablet{}, err
+		}
 		tablet, err := s.connector.LocateTablet(ctx, table, routingRow)
 		if err == nil {
 			return tablet, nil
 		}
-		if attempt == 1 || !isStaleScanError(err) {
+		if !isStaleScanError(err) {
 			return Tablet{}, err
 		}
 		if invalidateErr := s.connector.InvalidateTablet(table, routingRow); invalidateErr != nil {
 			return Tablet{}, errors.Join(err, invalidateErr)
 		}
 	}
-	return Tablet{}, ErrTabletNotLocated
 }
 
 func (s *Scanner) resolveTable(ctx context.Context) (Table, error) {

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ctypes as C
 import inspect
+import logging
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
@@ -16,7 +17,6 @@ from sharkbite import (
     SystemPermissions,
     TablePermissions,
 )
-from sharkbite.errors import ClientException
 from sharkbite._native import Bytes, NamespaceView, PropertyView, TableView
 from sharkbite.errors import AlreadyExistsError, ClientException, NotFoundError
 
@@ -60,7 +60,9 @@ class FakeLibrary:
         self.shoal_write_failure_free = Function(lambda *_: self.frees.append("failure"))
         self.shoal_logging_set_level = Function(self._logging_set)
         self.shoal_logging_get_level = Function(lambda: self.log_level)
+        self.shoal_logging_set_callback = Function(self._logging_callback)
         self.log_level = 0
+        self.log_callback = None
         self._bind_admin()
 
     @staticmethod
@@ -109,6 +111,12 @@ class FakeLibrary:
 
     def _logging_set(self, level, error):
         self.log_level = level
+        if self.log_callback:
+            self.log_callback(level, b"shoal.logging.level_changed", b'{"level":"debug"}', None)
+        return 0
+
+    def _logging_callback(self, callback, context, error):
+        self.log_callback = callback if bool(callback) else None
         return 0
 
     def _bind_admin(self):
@@ -214,7 +222,7 @@ class FakeLibrary:
 class FakeAPI:
     def __init__(self):
         self.lib = FakeLibrary()
-        self.capabilities = frozenset(range(30))
+        self.capabilities = frozenset(range(32))
 
     def require(self, *capabilities):
         if set(capabilities) - self.capabilities:
@@ -258,6 +266,24 @@ class WriterAdminTests(unittest.TestCase):
         self.assertEqual(self.api.lib.log_level, 1)
         LoggingConfiguration._set(2, self.api)
         self.assertEqual(self.api.lib.log_level, 2)
+
+    def test_structured_logging_is_injectable_without_secret_fields(self):
+        records = []
+
+        class Handler(logging.Handler):
+            def emit(self, record):
+                records.append(record)
+
+        logger = logging.Logger("shoal-test")
+        logger.addHandler(Handler())
+        LoggingConfiguration.configure(logger, api=self.api)
+        try:
+            LoggingConfiguration._set(1, self.api)
+        finally:
+            LoggingConfiguration.configure(None, api=self.api)
+        self.assertEqual(records[0].msg, "shoal.logging.level_changed")
+        self.assertEqual(records[0].shoal, {"level": "debug"})
+        self.assertNotIn("password", records[0].shoal)
 
     def test_mutation_overloads_and_legacy_keyword_names_are_exact(self):
         with self.assertRaises(ClientException):

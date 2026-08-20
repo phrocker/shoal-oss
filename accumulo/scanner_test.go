@@ -326,7 +326,7 @@ func TestScannerContinuationAndCleanup(t *testing.T) {
 	}
 }
 
-func TestScannerRetriesNotServingAssignmentOnce(t *testing.T) {
+func TestScannerRelocatesUntilNotServingClears(t *testing.T) {
 	walker := &fakeTabletWalker{tablets: map[string][]metadata.TabletInfo{
 		"1": {{TableID: "1", EndRow: []byte("k"), Location: &metadata.Location{HostPort: "old:9997"}}},
 	}}
@@ -335,11 +335,16 @@ func TestScannerRetriesNotServingAssignmentOnce(t *testing.T) {
 		byID:   map[string]string{"1": "events"},
 	})
 	adapter := &fakeScannerAdapter{
-		startResults: []*data.InitialScan{nil, {
+		startResults: []*data.InitialScan{nil, nil, nil, {
 			ScanID:  8,
 			Result_: &data.ScanResult_{Results: []*data.TKeyValue{testEntry("a", "ok")}},
 		}},
-		startErrors: []error{tabletserver.NewNotServingTabletException(), nil},
+		startErrors: []error{
+			tabletserver.NewNotServingTabletException(),
+			tabletserver.NewNotServingTabletException(),
+			tabletserver.NewNotServingTabletException(),
+			nil,
+		},
 	}
 	adapter.onFirstStart = func() {
 		walker.mu.Lock()
@@ -356,10 +361,10 @@ func TestScannerRetriesNotServingAssignmentOnce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(values) != 1 || adapter.startCalls != 2 {
+	if len(values) != 1 || adapter.startCalls != 4 {
 		t.Fatalf("values=%+v startCalls=%d", values, adapter.startCalls)
 	}
-	if got := adapter.addresses; len(got) != 2 || got[0] != "old:9997" || got[1] != "new:9997" {
+	if got := adapter.addresses; len(got) != 4 || got[0] != "old:9997" || got[3] != "new:9997" {
 		t.Fatalf("addresses = %v", got)
 	}
 }

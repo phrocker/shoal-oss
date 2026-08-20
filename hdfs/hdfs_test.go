@@ -101,9 +101,38 @@ func TestOperationsRejectCancelledContext(t *testing.T) {
 	}
 }
 
+func TestMkdirAndChownPreserveOperationSemantics(t *testing.T) {
+	fake := newFakeClient()
+	backend, err := internalhdfs.New("", internalhdfs.WithClient(fake))
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := newWithBackend(backend)
+	defer client.Close()
+
+	if err := client.Mkdir(context.Background(), "/warehouse/table"); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Chown(context.Background(), "/warehouse/table", "alice", "analytics"); err != nil {
+		t.Fatal(err)
+	}
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if fake.mkdir != "/warehouse/table" {
+		t.Fatalf("mkdir path = %q", fake.mkdir)
+	}
+	if fake.chownPath != "/warehouse/table" || fake.owner != "alice" || fake.group != "analytics" {
+		t.Fatalf("chown = (%q, %q, %q)", fake.chownPath, fake.owner, fake.group)
+	}
+}
+
 type fakeClient struct {
-	mu    sync.Mutex
-	files map[string][]byte
+	mu        sync.Mutex
+	files     map[string][]byte
+	mkdir     string
+	chownPath string
+	owner     string
+	group     string
 }
 
 func newFakeClient() *fakeClient { return &fakeClient{files: map[string][]byte{}} }
@@ -127,7 +156,19 @@ func (c *fakeClient) Create(name string) (storage.Writer, error) {
 	}}, nil
 }
 
-func (c *fakeClient) MkdirAll(string, os.FileMode) error { return nil }
+func (c *fakeClient) MkdirAll(name string, _ os.FileMode) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.mkdir = name
+	return nil
+}
+
+func (c *fakeClient) Chown(name, owner, group string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.chownPath, c.owner, c.group = name, owner, group
+	return nil
+}
 
 func (c *fakeClient) ReadDir(dirname string) ([]os.FileInfo, error) {
 	c.mu.Lock()

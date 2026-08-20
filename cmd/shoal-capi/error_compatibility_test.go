@@ -1,8 +1,13 @@
 package main
 
 import (
+	"errors"
 	"sync"
 	"testing"
+
+	"github.com/phrocker/shoal/accumulo"
+	publichdfs "github.com/phrocker/shoal/hdfs"
+	"github.com/phrocker/shoal/internal/storage"
 )
 
 func TestCompatibilityErrorClasses(t *testing.T) {
@@ -17,6 +22,7 @@ func TestCompatibilityErrorClasses(t *testing.T) {
 		{"cancelled", 7, errorSourceIterationInterruptedException, errorCompatibilityRuntimeError},
 		{"runtime", 1, errorSourceRuntime, errorCompatibilityRuntimeError},
 	}
+
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			source, compat := compatibilityClassesForStatus(test.status)
@@ -27,6 +33,29 @@ func TestCompatibilityErrorClasses(t *testing.T) {
 				t.Fatalf("compatibility = %d, want %d", compat, test.compat)
 			}
 		})
+	}
+}
+
+func TestCompatibilityErrorContextAndCodes(t *testing.T) {
+	source, compat := compatibilityClassesForError(
+		9,
+		&publichdfs.Error{Op: "open", Path: "/missing", Err: storage.ErrNotFound},
+	)
+	if source != errorSourceHDFSException || compat != errorCompatibilityRuntimeError {
+		t.Fatalf("HDFS classification = (%d, %d)", source, compat)
+	}
+	source, compat = compatibilityClassesForError(
+		1,
+		errors.New("invalid"),
+	)
+	if source != errorSourceIllegalArgumentException || compat != errorCompatibilityRuntimeError {
+		t.Fatalf("argument classification = (%d, %d)", source, compat)
+	}
+	if got := compatibilityCodeForError(accumulo.ErrTableNotFound); got != 9 {
+		t.Fatalf("table code = %d", got)
+	}
+	if got := compatibilityCodeForError(accumulo.ErrBadCredentials); got != 5 {
+		t.Fatalf("credentials code = %d", got)
 	}
 }
 

@@ -10,10 +10,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
-from .errors import exception_for_status
+from .errors import NativeErrorContext, exception_for_status
 
 ABI_MAJOR = 1
-MIN_ABI_VERSION = (1, 18, 0)
+MIN_ABI_VERSION = (1, 19, 0)
 CAP_OWNED_SCAN_RESULT = 5
 CAP_MUTATION = 6
 CAP_BATCH_WRITER = 7
@@ -30,7 +30,11 @@ CAP_RFILE = 16
 CAP_HDFS = 27
 CAP_RFILE_LOCALITY_GROUPS = 28
 CAP_CLIENT_PARITY_CONTROLS = 29
-CAP_ZOOKEEPER_INSTANCE = 30
+CAP_STORAGE_ERROR_PARITY = 30
+CAP_ZOOKEEPER_INSTANCE = 31
+LogCallback = C.CFUNCTYPE(
+    None, C.c_int32, C.c_char_p, C.c_char_p, C.c_void_p
+)
 
 _IMPORT_PID = os.getpid()
 _FORKED_CHILD = False
@@ -126,6 +130,12 @@ CAPABILITY_SYMBOLS = {
         "shoal_batch_writer_size",
         "shoal_logging_set_level",
         "shoal_logging_get_level",
+    },
+    CAP_STORAGE_ERROR_PARITY: {
+        "shoal_hdfs_client_mkdir",
+        "shoal_hdfs_client_chown",
+        "shoal_error_compatibility_code",
+        "shoal_logging_set_callback",
     },
     CAP_ZOOKEEPER_INSTANCE: {
         "shoal_zookeeper_resolve_instance",
@@ -609,6 +619,14 @@ class NativeAPI:
         )
         self._function("shoal_logging_get_level", C.c_int32, **optional)
         self._function(
+            "shoal_logging_set_callback",
+            C.c_int32,
+            LogCallback,
+            P,
+            PP,
+            **optional,
+        )
+        self._function(
             "shoal_client_config_init", None, C.POINTER(ClientConfig), **optional
         )
         self._function("shoal_range_init", None, C.POINTER(Range), **optional)
@@ -814,6 +832,26 @@ class NativeAPI:
             **optional,
         )
         self._function(
+            "shoal_hdfs_client_mkdir",
+            C.c_int32,
+            P,
+            C.c_char_p,
+            C.c_int64,
+            PP,
+            **optional,
+        )
+        self._function(
+            "shoal_hdfs_client_chown",
+            C.c_int32,
+            P,
+            C.c_char_p,
+            C.c_char_p,
+            C.c_char_p,
+            C.c_int64,
+            PP,
+            **optional,
+        )
+        self._function(
             "shoal_hdfs_input_stream_read",
             C.c_int32,
             P,
@@ -942,8 +980,13 @@ class NativeAPI:
         self._function("shoal_error_code", C.c_int32, P)
         self._function("shoal_error_message", C.c_char_p, P)
         self._function("shoal_error_free", None, PP)
+        self._function("shoal_error_source", C.c_int32, P, **optional)
+        self._function("shoal_error_source_name", C.c_char_p, P, **optional)
         if hasattr(self.lib, "shoal_error_compatibility"):
             self._function("shoal_error_compatibility", C.c_int32, P)
+        self._function(
+            "shoal_error_compatibility_code", C.c_int16, P, **optional
+        )
 
     def _bind_admin(self, P: object, PP: object, optional: dict[str, bool]) -> None:
         i32, i64, u8, size = C.c_int32, C.c_int64, C.c_uint8, C.c_size_t
@@ -1059,7 +1102,10 @@ class NativeAPI:
         if status == 0:
             return
         message = f"Shoal operation failed with status {status}"
-        compatibility = 0
+        compatibility: int | None = None
+        compatibility_code = -1
+        source_class: int | None = None
+        source_name: str | None = None
         try:
             if error.value:
                 raw = self.lib.shoal_error_message(error)
@@ -1069,10 +1115,30 @@ class NativeAPI:
                     self.lib, "shoal_error_compatibility"
                 ):
                     compatibility = int(self.lib.shoal_error_compatibility(error))
+                if hasattr(self.lib, "shoal_error_compatibility_code"):
+                    compatibility_code = int(
+                        self.lib.shoal_error_compatibility_code(error)
+                    )
+                if hasattr(self.lib, "shoal_error_source"):
+                    source_class = int(self.lib.shoal_error_source(error))
+                if hasattr(self.lib, "shoal_error_source_name"):
+                    raw_source = self.lib.shoal_error_source_name(error)
+                    if raw_source:
+                        source_name = raw_source.decode("utf-8", "replace")
         finally:
             if error.value:
                 self.lib.shoal_error_free(C.byref(error))
-        raise exception_for_status(status, message, compatibility_class=compatibility)
+        exc = exception_for_status(
+            status,
+            message,
+            compatibility_class=compatibility,
+            compatibility_code=compatibility_code,
+            source_class=source_class,
+            source_name=source_name,
+        )
+        if source_class is not None and source_name is not None:
+            raise exc from NativeErrorContext(status, source_class, source_name)
+        raise exc
 
     def check_write(
         self, status: int, failure: C.c_void_p, error: C.c_void_p
@@ -1173,3 +1239,4 @@ def c_bytes(value: bytes) -> tuple[Bytes, object]:
         return Bytes(None, 0), None
     buffer = (C.c_uint8 * len(value)).from_buffer_copy(value)
     return Bytes(C.cast(buffer, C.POINTER(C.c_uint8)), len(value)), buffer
+

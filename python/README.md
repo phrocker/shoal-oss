@@ -5,7 +5,7 @@ Sharkbite replacement and not a release under the reserved `sharkbite`
 distribution name. The distribution is named `shoal-sharkbite`; it installs
 the import-compatible modules `sharkbite` and `pysharkbite`.
 The [normative scope ADR](../docs/sharkbite-client-scope.md) currently records
-397 required rows, 355 satisfied rows, and 42 explicit core gaps; optional
+397 required rows, 338 satisfied rows, and 59 explicit core gaps; optional
 Torch, pandas, embedded, and historical C++ surfaces do not block this package.
 
 Supported now:
@@ -13,9 +13,6 @@ Supported now:
 - deterministic Shoal shared-library discovery and ABI/capability negotiation;
 - stable status-to-exception mapping, including Sharkbite `ClientException`;
 - owned handle/result cleanup and idempotent context-manager close;
-- `Configuration`, `Instance`, `ZookeeperInstance`, and `AuthInfo`
-  compatibility objects with copied configuration, eager identity resolution,
-  the legacy 1000 ms connector default, and redacted credentials;
 - `Connector`, `Client`, `Scanner`, `Key`, and streaming-free bounded scans
   through the high-level C ABI;
 - binary-safe `Mutation` and `BatchWriter` APIs with deterministic
@@ -67,12 +64,11 @@ with Client("accumulo", "zk1:2181", "root", "secret", table="events") as client:
             print(key.row, value)
 ```
 
-The library must expose ABI 1.18.0 or newer within major 1. APIs check their exact capability set:
+The library must expose ABI major 1. APIs check their exact capability set:
 5/21/22 for scans, 6/7/8 for writes, and 9/10/11/12/19 for administration.
 Storage uses capabilities 16 (RFile), 27 (HDFS), and 28 (named locality
 groups). Capability 29 adds the exact buffered-writer queue accessor and
-process-wide logging control. Capability 30 adds credential-free ZooKeeper
-identity resolution for `ZookeeperInstance`.
+process-wide logging control.
 
 `ScannerOptions.HedgedReads`, `ScannerOptions.RFileScanOnly`, and
 `PythonIterator` remain import-compatible but raise stable `NotImplementedError`
@@ -80,19 +76,6 @@ messages when applied. These are approved divergences: use normal RPC scans,
 `RFileOperations` for explicit RFile access, and Shoal's Go iterator runtime.
 Shoal accepts Accumulo 4 configurations only, never exposes password read-back
 or generated Thrift exceptions, and scopes transport pools per connector.
-
-```python
-from sharkbite import AuthInfo, Configuration, Connector, ZookeeperInstance
-
-configuration = Configuration()
-configuration.set("client.example", "value")
-with ZookeeperInstance(
-    "accumulo", "zk1:2181,zk2:2181", 1000, configuration
-) as instance:
-    auth = AuthInfo("root", b"secret", instance.getInstanceId())
-    with Connector(auth, instance) as connector:
-        assert connector.tableInfo() is not None
-```
 
 ```python
 from sharkbite import Hdfs, Key, KeyValue, RFileOperations

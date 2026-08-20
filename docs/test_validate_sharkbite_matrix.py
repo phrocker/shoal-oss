@@ -796,7 +796,7 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
         rows[index] = ("SB-CONN-007", validator.INTENTIONAL_DIVERGENCE_STATUS)
         self.assert_validation_fails(
             lambda: validator.validate_divergence_approvals(text.splitlines(), rows),
-            "SB-CONN-007 is excluded from the approved cluster-status divergence and must stay 'Covered'",
+            "SB-CONN-007 is excluded from the approved cluster-status divergence and must stay 'Missing Go'",
         )
 
     def test_excluded_cluster_status_row_cannot_join_the_approval(self) -> None:
@@ -1123,7 +1123,7 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
         moved = "**Capability discovery must not advertise cluster-status support.**"
         text = load_document_text()
         self.assertEqual(text.count(moved), 1)
-        relocated = text.replace(moved, "", 1) + f"\n{moved}\n"
+        relocated = text.replace(moved + " No", "No", 1) + f"\n{moved}\n"
         self.assertIn(moved, relocated)
         self.assertIn(
             moved,
@@ -1207,8 +1207,8 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
         widened = replace_pattern_once(
             load_document_text(),
             re.escape(
-                "**each of the 82 rows [SB-DIV-016](#sec-26) covers keeps `Intentional divergence\n"
-                "(approval required)` permanently**"
+                "**each of the 82 rows [SB-DIV-016](#sec-26) covers keeps `Intentional\n"
+                "divergence (approval required)` permanently**"
             ),
             "**every row below keeps `Intentional divergence (approval required)` "
             "permanently**",
@@ -1354,8 +1354,9 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
     def test_section_14_approval_block_rejects_an_appended_contradiction(self) -> None:
         contradicted = replace_pattern_once(
             load_document_text(),
-            re.escape("No status object is returned, the exception"),
-            "A partially populated status object may nevertheless be returned. The exception",
+            re.escape("implementation obeys it does not exist yet. Proof status is not"),
+            "implementation obeys it does not exist yet. Current behavior may "
+            "nevertheless return a partially populated status object. Proof status is not",
         )
         self.assertIn(
             "It **must not** return a fabricated or partially populated status object",
@@ -1932,7 +1933,7 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
     def test_commented_release_gate_narrative_is_rejected(self) -> None:
         commented = self._comment_out_paragraph(load_document_text(), "As of revision")
         self.assertIn(
-            "The remaining required gaps are 7",
+            "The remaining required gaps are 9",
             validator.normalize_whitespace(commented),
             "the sentence must survive for this to test rendering, not deletion",
         )
@@ -1981,7 +1982,7 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
             load_document_text(), "As of revision", "pre"
         )
         self.assertIn(
-            "The remaining required gaps are 7",
+            "The remaining required gaps are 9",
             validator.normalize_whitespace(wrapped),
             "the sentence must survive for this to test rendering, not deletion",
         )
@@ -2076,7 +2077,7 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
         text = load_document_text()
         relocated = self._relocate_paragraph(text, "As of revision")
         self.assertIn(
-            "The remaining required gaps are 7",
+            "The remaining required gaps are 9",
             validator.normalize_whitespace(relocated),
             "the sentence must survive somewhere for this to test relocation, not deletion",
         )
@@ -2476,9 +2477,9 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
         self.assertEqual(
             validator.EXPECTED_SCOPE_COUNTS,
             {
-                "Covered": 261,
+                "Covered": 244,
                 "Approved divergence": 94,
-                "Required gap": 42,
+                "Required gap": 59,
                 "Optional": 2763,
                 "Not required": 43,
             },
@@ -2486,16 +2487,16 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
         self.assertEqual(
             validator.EXPECTED_STATUS_COUNTS,
             {
-                "Covered": 324,
-                "Missing Go": 2207,
+                "Covered": 307,
+                "Missing Go": 2206,
                 "Missing C ABI": 81,
-                "Behavior mismatch": 106,
+                "Behavior mismatch": 124,
                 validator.INTENTIONAL_DIVERGENCE_STATUS: 94,
                 validator.NOT_REQUIRED_STATUS: 391,
             },
         )
-        self.assertEqual(validator.EXPECTED_C_ABI_DECLARED_EXPORTS, 319)
-        self.assertEqual(validator.EXPECTED_C_ABI_REFERENCED_EXPORTS, 319)
+        self.assertEqual(validator.EXPECTED_C_ABI_DECLARED_EXPORTS, 322)
+        self.assertEqual(validator.EXPECTED_C_ABI_REFERENCED_EXPORTS, 322)
         self.assertEqual(validator.EXPECTED_C_ABI_UNREFERENCED_EXPORTS, ())
 
     def test_collect_c_abi_symbol_inventory_matches_pinned_values(self) -> None:
@@ -2523,6 +2524,10 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
         self.assertIn("shoal_column_visibility_create", referenced)
         self.assertIn("shoal_visibility_evaluator_evaluate_tree", referenced)
         self.assertIn("shoal_error_visibility_parse", referenced)
+        self.assertIn("shoal_error_compatibility_code", referenced)
+        self.assertIn("shoal_hdfs_client_mkdir", referenced)
+        self.assertIn("shoal_hdfs_client_chown", referenced)
+        self.assertIn("shoal_logging_set_callback", referenced)
 
     def test_scope_manifest_matches_normative_rules_and_counts(self) -> None:
         rows = validator.parse_rows(load_document_text().splitlines())[2]
@@ -2680,23 +2685,23 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
             lambda: validator.validate_revision_inventory(
                 row_ids, reclassified, prefix_counts
             ),
-            f"revision {validator.EXPECTED_REVISION} inventory expects 324 rows for Covered, found 325",
+            f"revision {validator.EXPECTED_REVISION} inventory expects 307 rows for Covered, found 308",
         )
 
     def test_declared_count_edit_still_fails_internal_cross_check(self) -> None:
         text = load_document_text()
         mutated = replace_pattern_once(
-            text, re.escape("| Missing Go | 2207 |"), "| Missing Go | 2206 |"
+            text, re.escape("| Missing Go | 2206 |"), "| Missing Go | 2205 |"
         )
         self.assert_validation_fails(
             lambda: validator.validate_counts(mutated.splitlines(), mutated),
-            "status summary says 2206 rows for Missing Go, but parsed 2207",
+            "status summary says 2205 rows for Missing Go, but parsed 2206",
         )
 
     def test_stale_c_abi_symbol_inventory_narrative_is_rejected(self) -> None:
         text = load_document_text()
         mutated = text.replace(
-            "applied to 319 declared exports in `capi/include/shoal.h`",
+            "applied to 322 declared exports in `capi/include/shoal.h`",
             "applied to 44 declared exports in `capi/include/shoal.h`",
             1,
         )
