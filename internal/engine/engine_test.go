@@ -18,14 +18,56 @@
 package engine_test
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/phrocker/shoal/internal/cclient"
 	"github.com/phrocker/shoal/internal/engine"
 	"github.com/phrocker/shoal/internal/iterrt"
+	"github.com/phrocker/shoal/internal/storage"
+	"github.com/phrocker/shoal/internal/storage/memory"
+	"github.com/phrocker/shoal/internal/tablet"
 )
+
+type removeFailBackend struct {
+	*memory.Backend
+}
+
+type committedManifestBackend struct {
+	*memory.Backend
+	fail bool
+}
+
+func (b *committedManifestBackend) Create(ctx context.Context, path string) (storage.Writer, error) {
+	writer, err := b.Backend.Create(ctx, path)
+	if err != nil {
+		return nil, err
+	}
+	if filepath.Base(path) != "files.json" || !b.fail {
+		return writer, nil
+	}
+	b.fail = false
+	return &committedErrorWriter{Writer: writer}, nil
+}
+
+type committedErrorWriter struct {
+	storage.Writer
+}
+
+func (w *committedErrorWriter) Close() error {
+	if err := w.Writer.Close(); err != nil {
+		return err
+	}
+	return storage.MarkCommittedWrite(errors.New("injected post-commit cleanup failure"))
+}
+
+func (b removeFailBackend) Remove(context.Context, string) error {
+	return errors.New("injected remove failure")
+}
 
 func TestEngine_CreateWriteScan(t *testing.T) {
 	dir := t.TempDir()
@@ -176,6 +218,132 @@ func TestEngine_FlushAndReopen(t *testing.T) {
 	if string(sc.Value()) != "test-node" {
 		t.Errorf("value = %q, want test-node", sc.Value())
 	}
+}
+
+func TestEngine_ParquetMixedFormatMigration(t *testing.T) {
+	dir := t.TempDir()
+	eng, err := engine.Open(dir, engine.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := eng.CreateTable("graph", engine.TableOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	write := func(row, value string) {
+		m, err := cclient.NewMutation([]byte(row))
+		if err != nil {
+			t.Fatal(err)
+		}
+		m.Put([]byte("cf"), []byte("cq"), nil, 10, []byte(value))
+		if err := eng.Write("graph", []*cclient.Mutation{m}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	write("rfile-row", "rfile-value")
+	if err := eng.Flush("graph"); err != nil {
+		t.Fatal(err)
+	}
+	if err := eng.SetTableFileFormat("graph", tablet.FormatParquet); err != nil {
+		t.Fatal(err)
+	}
+	write("parquet-row", "parquet-value")
+	if err := eng.Flush("graph"); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := countFilesWithExt(t, dir, ".rf"); got != 1 {
+		t.Fatalf("RFile count = %d, want 1", got)
+	}
+	if got := countFilesWithExt(t, dir, ".parquet"); got != 1 {
+		t.Fatalf("Parquet count = %d, want 1", got)
+	}
+	if got := scanRows(t, eng); fmt.Sprint(got) != "[parquet-row rfile-row]" {
+		t.Fatalf("mixed scan rows = %v", got)
+	}
+
+	if err := eng.Compact("graph", nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := countFilesWithExt(t, dir, ".rf"); got != 0 {
+		t.Fatalf("RFile count after migration = %d, want 0", got)
+	}
+	if got := countFilesWithExt(t, dir, ".parquet"); got != 1 {
+		t.Fatalf("Parquet count after compaction = %d, want 1", got)
+	}
+	if err := eng.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	eng, err = engine.Open(dir, engine.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+	if got := scanRows(t, eng); fmt.Sprint(got) != "[parquet-row rfile-row]" {
+		t.Fatalf("reopened parquet rows = %v", got)
+	}
+}
+
+func TestEngine_AnalyticalWorkloadDefaultsToParquet(t *testing.T) {
+	dir := t.TempDir()
+	eng, err := engine.Open(dir, engine.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	defer eng.Close()
+	if err := eng.CreateTable("analytics", engine.TableOptions{
+		Workload: engine.WorkloadAnalytical,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	m, _ := cclient.NewMutation([]byte("row"))
+	m.PutLatest([]byte("cf"), []byte("cq"), nil, []byte("value"))
+	if err := eng.Write("analytics", []*cclient.Mutation{m}); err != nil {
+		t.Fatal(err)
+	}
+	if err := eng.Flush("analytics"); err != nil {
+		t.Fatal(err)
+	}
+	if got := countFilesWithExt(t, dir, ".parquet"); got != 1 {
+		t.Fatalf("Parquet count = %d, want 1", got)
+	}
+}
+
+func countFilesWithExt(t *testing.T, root, ext string) int {
+	t.Helper()
+	count := 0
+	if err := filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !entry.IsDir() && filepath.Ext(path) == ext {
+			count++
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return count
+}
+
+func scanRows(t *testing.T, eng *engine.Engine) []string {
+	t.Helper()
+	sc, err := eng.Scan("graph", iterrt.InfiniteRange(), engine.ScanOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sc.Close()
+	var rows []string
+	for sc.Next() {
+		rows = append(rows, string(sc.Key().Row))
+		if err := sc.Advance(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return rows
 }
 
 func TestEngine_WALRecovery(t *testing.T) {
@@ -377,4 +545,79 @@ func indexOf(s string, b byte) int {
 		}
 	}
 	return -1
+}
+
+func TestEngine_ParquetMigrationReopenIgnoresRetiredFile(t *testing.T) {
+	dir := t.TempDir()
+	backend := removeFailBackend{Backend: memory.New()}
+	eng, err := engine.Open(dir, engine.Options{Backend: backend})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := eng.CreateTable("graph", engine.TableOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	m, _ := cclient.NewMutation([]byte("row"))
+	m.Put([]byte("cf"), []byte("cq"), nil, 1, []byte("value"))
+	if err := eng.Write("graph", []*cclient.Mutation{m}); err != nil {
+		t.Fatal(err)
+	}
+	if err := eng.Flush("graph"); err != nil {
+		t.Fatal(err)
+	}
+	if err := eng.SetTableFileFormat("graph", tablet.FormatParquet); err != nil {
+		t.Fatal(err)
+	}
+	if err := eng.Compact("graph", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := eng.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := engine.Open(dir, engine.Options{Backend: backend})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	stats := reopened.Stats()
+	if len(stats) != 1 || stats[0].RFiles != 1 {
+		t.Fatalf("reopened stats = %+v, want one authoritative immutable file", stats)
+	}
+	if got := scanRows(t, reopened); fmt.Sprint(got) != "[row]" {
+		t.Fatalf("reopened rows = %v", got)
+	}
+}
+
+func TestEngine_FlushCommittedManifestErrorKeepsPublishedFile(t *testing.T) {
+	dir := t.TempDir()
+	backend := &committedManifestBackend{Backend: memory.New(), fail: true}
+	eng, err := engine.Open(dir, engine.Options{Backend: backend})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := eng.CreateTable("graph", engine.TableOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	m, _ := cclient.NewMutation([]byte("row"))
+	m.Put([]byte("cf"), []byte("cq"), nil, 1, []byte("value"))
+	if err := eng.Write("graph", []*cclient.Mutation{m}); err != nil {
+		t.Fatal(err)
+	}
+	err = eng.Flush("graph")
+	if !storage.IsCommittedWriteError(err) {
+		t.Fatalf("Flush error = %v, want committed-write error", err)
+	}
+	if err := eng.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := engine.Open(dir, engine.Options{Backend: backend})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if got := scanRows(t, reopened); fmt.Sprint(got) != "[row]" {
+		t.Fatalf("reopened rows = %v", got)
+	}
 }

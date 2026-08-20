@@ -8,6 +8,7 @@ import (
 
 	"github.com/parquet-go/parquet-go"
 	"github.com/phrocker/shoal/internal/iterrt"
+	"github.com/phrocker/shoal/internal/parquetfile"
 )
 
 type scanCursor interface {
@@ -29,7 +30,7 @@ func newScanOutput(format string, output io.Writer) (scanOutput, error) {
 	case "json":
 		return &jsonScanOutput{encoder: json.NewEncoder(output)}, nil
 	case "parquet":
-		return &parquetScanOutput{writer: parquet.NewGenericWriter[parquetCell](
+		return &parquetScanOutput{writer: parquet.NewGenericWriter[parquetfile.Cell](
 			output,
 			parquet.MaxRowsPerRowGroup(parquetRowsPerRowGroup),
 		)}, nil
@@ -66,37 +67,30 @@ type jsonScanOutput struct {
 
 func (o *jsonScanOutput) Write(key *iterrt.Key, value []byte) error {
 	return o.encoder.Encode(CellJSON{
-		Row: string(key.Row),
-		CF:  string(key.ColumnFamily),
-		CQ:  string(key.ColumnQualifier),
-		CV:  string(key.ColumnVisibility),
-		TS:  key.Timestamp,
-		Val: string(value),
+		Row:     string(key.Row),
+		CF:      string(key.ColumnFamily),
+		CQ:      string(key.ColumnQualifier),
+		CV:      string(key.ColumnVisibility),
+		TS:      key.Timestamp,
+		Val:     string(value),
+		Deleted: key.Deleted,
 	})
 }
 
 func (*jsonScanOutput) Close() error { return nil }
 
-type parquetCell struct {
-	Row       []byte `parquet:"row"`
-	CF        []byte `parquet:"cf"`
-	CQ        []byte `parquet:"cq"`
-	CV        []byte `parquet:"cv"`
-	Timestamp int64  `parquet:"timestamp"`
-	Value     []byte `parquet:"value"`
-}
-
 type parquetScanOutput struct {
-	writer *parquet.GenericWriter[parquetCell]
+	writer *parquet.GenericWriter[parquetfile.Cell]
 }
 
 func (o *parquetScanOutput) Write(key *iterrt.Key, value []byte) error {
-	_, err := o.writer.Write([]parquetCell{{
+	_, err := o.writer.Write([]parquetfile.Cell{{
 		Row:       key.Row,
 		CF:        key.ColumnFamily,
 		CQ:        key.ColumnQualifier,
 		CV:        key.ColumnVisibility,
 		Timestamp: key.Timestamp,
+		Deleted:   key.Deleted,
 		Value:     value,
 	}})
 	return err

@@ -19,6 +19,7 @@ package conformance
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -47,7 +48,7 @@ func repositoryRoot(t *testing.T) string {
 	return filepath.Clean(filepath.Join(filepath.Dir(file), "..", ".."))
 }
 
-func TestReplayFixturesProduceDeterministicPassingVerdictWithoutDocker(t *testing.T) {
+func TestReplayFixturesProduceDeterministicEvidenceWithoutClaimingReplacement(t *testing.T) {
 	opts := Options{
 		Root:     repositoryRoot(t),
 		Mode:     "replay",
@@ -58,12 +59,14 @@ func TestReplayFixturesProduceDeterministicPassingVerdictWithoutDocker(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	if code != 0 {
-		t.Fatalf("exit code = %d, want 0: %#v", code, first.Gates)
+	if code != 2 {
+		t.Fatalf("exit code = %d, want 2: %#v", code, first.Gates)
 	}
 	for _, gate := range first.Gates {
-		if gate.State != Pass || !gate.Required || gate.ReplayFixture == "" || gate.FixtureSHA256 == "" {
-			t.Fatalf("incomplete passing gate: %#v", gate)
+		if gate.State != Unsupported || gate.EvidenceState != Pass || !gate.Required ||
+			gate.Adapter == "" || len(gate.MissingRequiredGates) != 1 ||
+			gate.ReplayFixture == "" || gate.FixtureSHA256 == "" {
+			t.Fatalf("dishonest or incomplete adapter gate: %#v", gate)
 		}
 	}
 	second, _, err := Run(context.Background(), opts)
@@ -78,7 +81,7 @@ func TestReplayFixturesProduceDeterministicPassingVerdictWithoutDocker(t *testin
 }
 
 func TestReplayFailureMakesRequiredGateFail(t *testing.T) {
-	command := []string{"go", "test", "./internal/tserver", "-run", "^TestLockLossDropsEverything$", "-count=1"}
+	command := []string{"go", "test", "./internal/tserver", "-run", "^TestAcquireCreatesAnAccumuloCompatibleLockNode$", "-count=1"}
 	verdict, code, err := Run(context.Background(), Options{
 		Root:   repositoryRoot(t),
 		Mode:   "replay",
@@ -90,7 +93,7 @@ func TestReplayFailureMakesRequiredGateFail(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if code != 1 || verdict.Gates[0].State != Fail {
+	if code != 1 || verdict.Gates[0].State != Fail || verdict.Gates[0].EvidenceState != Fail {
 		t.Fatalf("code=%d gate=%#v", code, verdict.Gates[0])
 	}
 }
@@ -129,12 +132,15 @@ func TestMalformedFixtureFailsClosed(t *testing.T) {
 		fixture := Fixture{
 			SchemaVersion:    SchemaVersion,
 			Role:             role,
+			Adapter:          adapters[role].Name,
 			AccumuloVersion:  AccumuloVersion,
 			AccumuloRevision: AccumuloRevision,
 			Summary:          "fixture",
 			Evidence: []Evidence{{
+				Gate:          adapters[role].RequiredGates[0],
 				Kind:          "go-test",
 				Reference:     "missing_test.go#TestMissing",
+				SourceSHA256:  strings.Repeat("0", 64),
 				ReplayCommand: []string{"go", "test"},
 			}},
 		}
@@ -154,5 +160,90 @@ func TestMalformedFixtureFailsClosed(t *testing.T) {
 	}
 	if code != 1 || verdict.Gates[0].State != Fail {
 		t.Fatalf("code=%d gate=%#v", code, verdict.Gates[0])
+	}
+}
+
+type goldenReplay struct {
+	Name              string `json:"name"`
+	SourceSHA256      string `json:"source_sha256"`
+	CommandExit       int    `json:"command_exit"`
+	WantEvidenceState State  `json:"want_evidence_state"`
+	WantState         State  `json:"want_state"`
+	WantExit          int    `json:"want_exit"`
+}
+
+func TestAdapterGoldenReplayContracts(t *testing.T) {
+	for _, name := range []string{"success", "failure", "stale"} {
+		t.Run(name, func(t *testing.T) {
+			data, err := os.ReadFile(filepath.Join(repositoryRoot(t), "test", "conformance", "golden", name+".json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			var golden goldenReplay
+			if err := json.Unmarshal(data, &golden); err != nil {
+				t.Fatal(err)
+			}
+			root := t.TempDir()
+			if err := os.WriteFile(filepath.Join(root, "evidence.go"), []byte("package fixture\nfunc TestEvidence() {}\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			fixtures := filepath.Join(root, "test", "conformance", "fixtures")
+			if err := os.MkdirAll(fixtures, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			command := []string{"go", "test", "./fixture"}
+			for _, role := range Roles {
+				spec := adapters[role]
+				fixture := Fixture{
+					SchemaVersion:    SchemaVersion,
+					Role:             role,
+					Adapter:          spec.Name,
+					AccumuloVersion:  AccumuloVersion,
+					AccumuloRevision: AccumuloRevision,
+					Summary:          "golden " + golden.Name,
+					Evidence: []Evidence{{
+						Gate:          spec.RequiredGates[0],
+						Kind:          "go-test",
+						Reference:     "evidence.go#TestEvidence",
+						SourceSHA256:  golden.SourceSHA256,
+						ReplayCommand: command,
+					}},
+				}
+				encoded, err := json.Marshal(fixture)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(fixtures, role+".json"), encoded, 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			verdict, code, err := Run(context.Background(), Options{
+				Root:     root,
+				Mode:     "replay",
+				Required: []string{"promotion"},
+				Commit:   strings.Repeat("e", 40),
+				Executor: fakeExecutor{results: map[string]CommandResult{
+					strings.Join(command, "\x00"): {ExitCode: golden.CommandExit, Output: golden.Name},
+				}},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			gate := verdict.Gates[3]
+			if code != golden.WantExit || gate.State != golden.WantState ||
+				gate.EvidenceState != golden.WantEvidenceState {
+				t.Fatalf("code=%d gate=%#v, want exit=%d state=%s evidence=%s",
+					code, gate, golden.WantExit, golden.WantState, golden.WantEvidenceState)
+			}
+		})
+	}
+}
+
+func TestEvidenceDigestIsStableAcrossLineEndings(t *testing.T) {
+	lf := sha256.Sum256(normalizeSource([]byte("one\ntwo\n")))
+	crlf := sha256.Sum256(normalizeSource([]byte("one\r\ntwo\r\n")))
+	if lf != crlf {
+		t.Fatalf("source digest differs across line endings: %x != %x", lf, crlf)
 	}
 }

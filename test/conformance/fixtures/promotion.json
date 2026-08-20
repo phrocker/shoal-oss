@@ -1,19 +1,17 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "role": "promotion",
+  "adapter": "promotion-equivalence-v1",
   "accumulo_version": "4.0.0-SNAPSHOT",
   "accumulo_revision": "1a716b2c1bb5762ead4b46d2bc4f53e13873b314",
-  "summary": "promotion recovers ambiguous submission with the same FATE ID and deduplicates concurrent retries",
+  "summary": "promotion adapter preserves every staged artifact across a three-tablet before/after replay",
   "evidence": [
     {
+      "gate": "before-after-equivalence",
       "kind": "go-test",
-      "reference": "internal/promotion/intent_test.go#TestDurablePromotionRecoversAmbiguousSubmitUsingSameFateID",
-      "replay_command": ["go", "test", "./internal/promotion", "-run", "^TestDurablePromotionRecoversAmbiguousSubmitUsingSameFateID$", "-count=1"]
-    },
-    {
-      "kind": "go-test",
-      "reference": "internal/promotion/intent_test.go#TestDurablePromotionConcurrentRetriesDeduplicateSideEffects",
-      "replay_command": ["go", "test", "./internal/promotion", "-run", "^TestDurablePromotionConcurrentRetriesDeduplicateSideEffects$", "-count=1"]
+      "reference": "internal/promotion/promote_test.go#TestPromoteEndToEndThreeTabletSuccess",
+      "source_sha256": "c9db460281f04cc10e83b271102c5c3adb7ba98cbf1001d9abd5574f3077914a",
+      "replay_command": ["go", "test", "./internal/promotion", "-run", "^TestPromoteEndToEndThreeTabletSuccess$", "-count=1"]
     }
   ]
 }

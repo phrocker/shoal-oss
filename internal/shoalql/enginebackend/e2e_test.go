@@ -3,6 +3,7 @@ package enginebackend
 import (
 	"context"
 	"encoding/binary"
+	"fmt"
 	"math"
 	"testing"
 
@@ -10,6 +11,7 @@ import (
 	"github.com/phrocker/shoal/internal/engine"
 	"github.com/phrocker/shoal/internal/graphschema"
 	"github.com/phrocker/shoal/internal/shoalql"
+	"github.com/phrocker/shoal/internal/tablet"
 )
 
 func packVec(v ...float32) []byte {
@@ -32,12 +34,18 @@ func writeEvent(t *testing.T, eng *engine.Engine, id, content string, vec []floa
 }
 
 func newEngineWithEvents(t *testing.T) (*engine.Engine, *shoalql.Executor, shoalql.Catalog) {
+	return newEngineWithEventsFormat(t, tablet.FormatRFile)
+}
+
+func newEngineWithEventsFormat(t *testing.T, format tablet.FileFormat) (*engine.Engine, *shoalql.Executor, shoalql.Catalog) {
 	t.Helper()
 	eng, err := engine.Open(t.TempDir(), engine.Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := eng.CreateTable("graph", engine.TableOptions{}); err != nil {
+	if err := eng.CreateTable("graph", engine.TableOptions{
+		TabletOptions: tablet.Options{FileFormat: format},
+	}); err != nil {
 		t.Fatal(err)
 	}
 	writeEvent(t, eng, "0001", "retry hit a timeout", []float32{1, 0})
@@ -48,6 +56,62 @@ func newEngineWithEvents(t *testing.T) (*engine.Engine, *shoalql.Executor, shoal
 	}
 	exec := shoalql.NewExecutor(New(eng))
 	return eng, exec, shoalql.NewGraphCatalog("graph")
+}
+
+func TestE2E_RFileParquetQueryParity(t *testing.T) {
+	queries := []string{
+		"SELECT id, content FROM events",
+		"SELECT id FROM events WHERE id >= '0002'",
+		"SELECT id FROM events WHERE MATCH(content, 'timeout retry')",
+		"SELECT id, content FROM events ORDER BY embedding <-> [1, 0] LIMIT 2",
+		"SELECT cf, count(*) AS n FROM events GROUP BY cf",
+	}
+	run := func(format tablet.FileFormat) []string {
+		eng, exec, cat := newEngineWithEventsFormat(t, format)
+		defer eng.Close()
+		results := make([]string, len(queries))
+		for i, query := range queries {
+			result := runE2E(t, cat, exec, query, shoalql.PlanOptions{})
+			results[i] = fmt.Sprint(result.Columns, result.Rows)
+		}
+		return results
+	}
+	rfileResults := run(tablet.FormatRFile)
+	parquetResults := run(tablet.FormatParquet)
+	if fmt.Sprint(parquetResults) != fmt.Sprint(rfileResults) {
+		t.Fatalf("Parquet SQL results differ\nrfile:  %v\nparquet: %v", rfileResults, parquetResults)
+	}
+
+	mixedEngine, err := engine.Open(t.TempDir(), engine.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mixedEngine.Close()
+	if err := mixedEngine.CreateTable("graph", engine.TableOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	writeEvent(t, mixedEngine, "0001", "retry hit a timeout", []float32{1, 0})
+	if err := mixedEngine.Flush("graph"); err != nil {
+		t.Fatal(err)
+	}
+	if err := mixedEngine.SetTableFileFormat("graph", tablet.FormatParquet); err != nil {
+		t.Fatal(err)
+	}
+	writeEvent(t, mixedEngine, "0002", "everything was fine", []float32{0, 1})
+	writeEvent(t, mixedEngine, "0003", "another timeout retry loop", []float32{0.9, 0.1})
+	if err := mixedEngine.Flush("graph"); err != nil {
+		t.Fatal(err)
+	}
+	mixedExec := shoalql.NewExecutor(New(mixedEngine))
+	mixedCatalog := shoalql.NewGraphCatalog("graph")
+	mixedResults := make([]string, len(queries))
+	for i, query := range queries {
+		result := runE2E(t, mixedCatalog, mixedExec, query, shoalql.PlanOptions{})
+		mixedResults[i] = fmt.Sprint(result.Columns, result.Rows)
+	}
+	if fmt.Sprint(mixedResults) != fmt.Sprint(rfileResults) {
+		t.Fatalf("mixed SQL results differ\nrfile: %v\nmixed: %v", rfileResults, mixedResults)
+	}
 }
 
 func runE2E(t *testing.T, cat shoalql.Catalog, exec *shoalql.Executor, sql string, opts shoalql.PlanOptions) *shoalql.Result {
