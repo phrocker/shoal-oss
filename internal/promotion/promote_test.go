@@ -753,9 +753,17 @@ func TestPromoteEndToEndThreeTabletSuccess(t *testing.T) {
 	if importer.calls != 1 {
 		t.Fatalf("BulkImport calls = %d, want 1", importer.calls)
 	}
-	for _, name := range []string{"F0001.rf", "F0002.rf", "F0003.rf"} {
-		if _, err := dst.Open(context.Background(), "hdfs://nn/bulk/events-1/"+name); err != nil {
+	for i, name := range []string{"F0001.rf", "F0002.rf", "F0003.rf"} {
+		staged, err := storage.ReadAll(context.Background(), dst, "hdfs://nn/bulk/events-1/"+name)
+		if err != nil {
 			t.Fatalf("expected staged file %s: %v", name, err)
+		}
+		before, err := storage.ReadAll(context.Background(), src, manifest.RFiles[i].DestinationPath)
+		if err != nil {
+			t.Fatalf("read source file %s: %v", name, err)
+		}
+		if !reflect.DeepEqual(staged, before) {
+			t.Fatalf("promoted file %s differs from source: got %x want %x", name, staged, before)
 		}
 	}
 }

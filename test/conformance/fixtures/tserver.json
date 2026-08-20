@@ -1,19 +1,24 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "role": "tserver",
+  "adapter": "tserver-lifecycle-v1",
   "accumulo_version": "4.0.0-SNAPSHOT",
   "accumulo_revision": "1a716b2c1bb5762ead4b46d2bc4f53e13873b314",
-  "summary": "tablet hosting rejects stale authority and drops hosted tablets on lock loss",
+  "summary": "tserver adapter proves Accumulo lock publication and assignment/unload lifecycle ordering",
   "evidence": [
     {
+      "gate": "service-lock-lifecycle",
       "kind": "go-test",
-      "reference": "internal/tserver/hosting_test.go#TestLockLossDropsEverything",
-      "replay_command": ["go", "test", "./internal/tserver", "-run", "^TestLockLossDropsEverything$", "-count=1"]
+      "reference": "internal/tserver/servicelock_test.go#TestAcquireCreatesAnAccumuloCompatibleLockNode",
+      "source_sha256": "68bb7d1c618652b02455d9bb0175643196c6e75e7e503f39a09eb8f5ef90d5b0",
+      "replay_command": ["go", "test", "./internal/tserver", "-run", "^TestAcquireCreatesAnAccumuloCompatibleLockNode$", "-count=1"]
     },
     {
+      "gate": "assignment-lifecycle",
       "kind": "go-test",
-      "reference": "internal/tserver/hosting_test.go#TestSupersededManagerCannotCountermandTheLiveOne",
-      "replay_command": ["go", "test", "./internal/tserver", "-run", "^TestSupersededManagerCannotCountermandTheLiveOne$", "-count=1"]
+      "reference": "internal/tserverrpc/adapter_test.go#TestLifecycleReportsRemainOrderedDuringReconnect",
+      "source_sha256": "22f750514abe4ed0507b5f9d260e1c89a4194aaf19fb5650b4388caba3a61906",
+      "replay_command": ["go", "test", "./internal/tserverrpc", "-run", "^TestLifecycleReportsRemainOrderedDuringReconnect$", "-count=1"]
     }
   ]
 }

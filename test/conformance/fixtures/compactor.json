@@ -1,19 +1,24 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "role": "compactor",
+  "adapter": "compactor-executor-v1",
   "accumulo_version": "4.0.0-SNAPSHOT",
   "accumulo_revision": "1a716b2c1bb5762ead4b46d2bc4f53e13873b314",
-  "summary": "compaction publishes deterministic output and cancellation never publishes partial output",
+  "summary": "compactor adapter proves deterministic publication and coordinator completion",
   "evidence": [
     {
+      "gate": "publication",
       "kind": "go-test",
       "reference": "internal/compactexec/executor_test.go#TestExecutePublishesDeterministicOutputAndStats",
+      "source_sha256": "e69bb2790af7396a37eee7e6da71d5e1ef9fc7d067e4e547ed693be2a601c790",
       "replay_command": ["go", "test", "./internal/compactexec", "-run", "^TestExecutePublishesDeterministicOutputAndStats$", "-count=1"]
     },
     {
+      "gate": "completion",
       "kind": "go-test",
-      "reference": "internal/compactexec/executor_test.go#TestCancellationNeverPublishes",
-      "replay_command": ["go", "test", "./internal/compactexec", "-run", "^TestCancellationNeverPublishes$", "-count=1"]
+      "reference": "internal/compactexec/executor_test.go#TestCompletionAdapterUsesExistingAccumuloContract",
+      "source_sha256": "e69bb2790af7396a37eee7e6da71d5e1ef9fc7d067e4e547ed693be2a601c790",
+      "replay_command": ["go", "test", "./internal/compactexec", "-run", "^TestCompletionAdapterUsesExistingAccumuloContract$", "-count=1"]
     }
   ]
 }
