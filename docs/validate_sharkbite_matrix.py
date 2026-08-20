@@ -218,9 +218,9 @@ EXPECTED_METADATA_FIELDS = {
     ),
     "Sharkbite release line": "`sharkbite` 1.2.0.3 on PyPI (`setup.py:34-35`)",
     "Shoal reference": (
-        "`phrocker/shoal-oss` revision 53 is temporarily pinned to latest main "
-        "`a4cbca10534c1c5b609621689b8c7726f4cfc462` "
-        "(\"Merge pull request #201 from phrocker/client-195\")"
+        "`phrocker/shoal-oss` revision 53 is pinned to main merge "
+        "`e1fe2628ff59c71fc776cca53e405a48dfcaa4a8` "
+        "(\"Merge latest main for compatibility revision 53\")"
     ),
     "Shoal C ABI version": "`SHOAL_ABI_VERSION 1u` (`capi/include/shoal_types.h`)",
 }
@@ -848,7 +848,7 @@ EXPECTED_SCOPE_MANIFEST_HEADER = (
     f"# Revision-{EXPECTED_REVISION} Sharkbite client-scope disposition manifest.",
     f"# Matrix: docs/sharkbite-compatibility.md revision {EXPECTED_REVISION}.",
     "# Sharkbite source: phrocker/sharkbite@7f2625f74331b0cd4a75dc0484949c40f1409686.",
-    "# Shoal source: phrocker/shoal-oss@a4cbca10534c1c5b609621689b8c7726f4cfc462.",
+    "# Shoal source: phrocker/shoal-oss@e1fe2628ff59c71fc776cca53e405a48dfcaa4a8.",
     "# Policy: docs/sharkbite-client-scope.md.",
     "# Columns: ROW-ID<TAB>DISPOSITION<TAB>RULE<TAB>PINNED-MATRIX-STATUS.",
     "# Entries are in matrix order; validator rules, not aggregate counts, authorize dispositions.",
