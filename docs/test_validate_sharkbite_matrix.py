@@ -1615,7 +1615,7 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
             self.assertEqual(
                 validator.normalize_whitespace("\n".join(preamble)),
                 validator.APPROVAL_BEHAVIOR_PREAMBLE.format(
-                    revision=validator.EXPECTED_REVISION
+                    revision=validator.CLUSTER_STATUS_APPROVAL_REVISION
                 ),
                 "the coordinated pin must still match for this to test rendering",
             )
@@ -2002,7 +2002,9 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
         )
         self.assertEqual(
             validator.normalize_whitespace("\n".join(preamble)),
-            validator.APPROVAL_BEHAVIOR_PREAMBLE.format(revision=validator.EXPECTED_REVISION),
+            validator.APPROVAL_BEHAVIOR_PREAMBLE.format(
+                revision=validator.CLUSTER_STATUS_APPROVAL_REVISION
+            ),
             "the pin must still match for this to test rendering, not wording",
         )
         rows = validator.parse_rows(indented.splitlines())[2]
@@ -2421,19 +2423,49 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
             targeted_paths={"docs/testdata/validate_sharkbite_matrix/fixture_a.go"},
         )
 
+    def test_scanner_symbol_rename_invalidates_matrix(self) -> None:
+        contents = validator.load_targeted_contents(validator.ANCHOR_CHECKED_CITATIONS)
+        scanner_path = "accumulo/scanner.go"
+        scanner = contents[scanner_path]
+        renamed = scanner.replace("func NewColumnFamily(", "func RenamedColumnFamily(", 1)
+        self.assertNotEqual(renamed, scanner)
+        contents[scanner_path] = renamed
+
+        with mock.patch.object(validator, "load_targeted_contents", return_value=contents):
+            self.assert_validation_fails(
+                lambda: validator.validate_targeted_symbol_anchors(
+                    load_document_text().splitlines()
+                ),
+                "NewColumnFamily",
+                scanner_path,
+            )
+
+    def test_scanner_symbol_anchor_typo_invalidates_matrix(self) -> None:
+        text = load_document_text()
+        mutated = text.replace(
+            "with `NewColumnFamily` / `NewColumn` (`accumulo/scanner.go:",
+            "with `TypoColumnFamily` / `NewColumn` (`accumulo/scanner.go:",
+            1,
+        )
+        self.assertNotEqual(mutated, text)
+        self.assert_validation_fails(
+            lambda: validator.validate_targeted_symbol_anchors(mutated.splitlines()),
+            "SB-SCAN-005 cites accumulo/scanner.go without required targeted anchors: NewColumnFamily",
+        )
+
     # ---- pinned audited inventory ------------------------------------------
 
     def test_pinned_inventory_constants_are_internally_consistent(self) -> None:
         validator.validate_pinned_inventory_constants()
-        self.assertEqual(validator.EXPECTED_REVISION, 40)
+        self.assertEqual(validator.EXPECTED_REVISION, 41)
         self.assertEqual(validator.EXPECTED_TOTAL_ROWS, 3203)
         self.assertEqual(validator.EXPECTED_REQUIRED_ROWS, 2811)
         self.assertEqual(
             validator.EXPECTED_STATUS_COUNTS,
             {
                 "Covered": 131,
-                "Missing Go": 2274,
-                "Missing C ABI": 100,
+                "Missing Go": 2249,
+                "Missing C ABI": 125,
                 "Behavior mismatch": 219,
                 validator.INTENTIONAL_DIVERGENCE_STATUS: 87,
                 validator.NOT_REQUIRED_STATUS: 392,
@@ -2602,11 +2634,11 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
     def test_declared_count_edit_still_fails_internal_cross_check(self) -> None:
         text = load_document_text()
         mutated = replace_pattern_once(
-            text, re.escape("| Missing Go | 2274 |"), "| Missing Go | 2273 |"
+            text, re.escape("| Missing Go | 2249 |"), "| Missing Go | 2248 |"
         )
         self.assert_validation_fails(
             lambda: validator.validate_counts(mutated.splitlines(), mutated),
-            "status summary says 2273 rows for Missing Go, but parsed 2274",
+            "status summary says 2248 rows for Missing Go, but parsed 2249",
         )
 
     def test_stale_c_abi_symbol_inventory_narrative_is_rejected(self) -> None:
@@ -2625,7 +2657,7 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
     def test_revision_bump_requires_validator_constant_update(self) -> None:
         text = load_document_text()
         mutated = text.replace(
-            f"Revision {validator.EXPECTED_REVISION} — mirrors the first approved divergence into the matrix",
+            f"Revision {validator.EXPECTED_REVISION} — records the public column and entry value APIs",
             f"Revision {validator.EXPECTED_REVISION + 1} — adds the next audited ABI slice",
         ).replace(
             f"As of revision {validator.EXPECTED_REVISION} that is",
@@ -2634,7 +2666,7 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
         self.assertNotEqual(mutated, text)
         self.assert_validation_fails(
             lambda: validator.validate_counts(mutated.splitlines(), mutated),
-            f"document status is missing expected detail: Revision {validator.EXPECTED_REVISION} — mirrors the first approved divergence",
+            f"document status is missing expected detail: Revision {validator.EXPECTED_REVISION} — records the public column and entry value APIs",
         )
 
     # ---- matrix table separators -------------------------------------------
