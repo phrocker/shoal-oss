@@ -130,12 +130,15 @@ manifest. Accumulo mode keeps it in a manager-owned Shoal authority record in
 Accumulo authoritative metadata; changing that record requires a supported
 manager/FATE operation, never a direct metadata mutation. The Accumulo adapter
 must verify the record's epoch when issuing assignments or jobs. A handoff
-first fences the destination and reserves epoch
-`N = max(source high-water mark, destination high-water mark) + 1` while the
-source may still be writable at epoch `E`; it then freezes and retires source
-epoch `E` before activating destination epoch `N`. Native manifest
-generations, Kubernetes tenure identities, and ServiceLock sequences remain
-backend proof and are never compared with one another.
+first CAS-records a source handoff intent that serializes epoch changes while
+source epoch `E` may remain writable. It then fences the destination and
+reserves epoch
+`N = max(source high-water mark, destination high-water mark) + 1`, freezes
+source epoch `E` under the same intent while verifying `N` is still greater
+than the source high-water mark, and retires `E` before activating destination
+epoch `N`. Native manifest generations, Kubernetes tenure identities, and
+ServiceLock sequences remain backend proof and are never compared with one
+another.
 
 The `Attempt` component prevents a delayed completion from applying to a later
 operation that happens to run under the same process lease. This matches the
@@ -208,6 +211,7 @@ guesswork. The durable state machine is:
 
 ```text
 LOCAL_WRITABLE
+    -> HANDOFF_INTENT
     -> DESTINATION_FENCED
     -> LOCAL_FROZEN
     -> FATE_ALLOCATED
@@ -219,8 +223,12 @@ LOCAL_WRITABLE
 
 The handoff proceeds as follows:
 
-1. Resolve the destination table through Accumulo and establish a
-   manager-authoritative write fence before touching source authority. The
+1. CAS-record `HANDOFF_INTENT` in the source authority record, capturing source
+   epoch `E` and its high-water mark while serializing other authority
+   activations and handoffs. Local mutations may continue under `E` until the
+   later freeze CAS.
+2. Resolve the destination table through Accumulo and establish a
+   manager-authoritative write fence before freezing source authority. The
    normal gate is the table's `OFFLINE` state, changed through supported
    Accumulo table operations; the destination must remain unable to accept
    ordinary mutations for the rest of the handoff. It must either be newly
@@ -231,25 +239,29 @@ The handoff proceeds as follows:
    `N = max(source high-water mark, destination high-water mark) + 1` in the
    destination's manager-owned authority record without making the table
    writable.
-2. Fence the local writer with its current lease and manifest generation.
-3. Stop admitting local writes and durably record `LOCAL_FROZEN` at epoch `E`.
-4. Flush/checkpoint an immutable generation and verify its checksums.
-5. Stage the export, call `beginFateOperation`, and durably record the returned
+3. Fence the local writer with its current lease and manifest generation.
+   The freeze CAS must match the source handoff intent and epoch `E`, and verify
+   `N` is still greater than the current source high-water mark. If any check
+   fails, keep the destination fenced, abort its reservation, and restart
+   reconciliation with a newly chosen epoch.
+4. Stop admitting local writes and durably record `LOCAL_FROZEN` at epoch `E`.
+5. Flush/checkpoint an immutable generation and verify its checksums.
+6. Stage the export, call `beginFateOperation`, and durably record the returned
    FATE identity as `FATE_ALLOCATED` **before** calling
    `executeFateOperation(TABLE_BULK_IMPORT2, ...)`.
-6. Submit that exact transaction and reconcile all timeout, restart, and
+7. Submit that exact transaction and reconcile all timeout, restart, and
    failover outcomes by its persisted FATE identity. Recovery must never begin
    a replacement transaction merely because execution returned ambiguously,
    and must not finish the FATE transaction until its terminal result is
    durably recorded.
-7. Verify the imported files and tablet state through Accumulo while the
+8. Verify the imported files and tablet state through Accumulo while the
    destination write fence remains held.
-8. Revoke local authority and durably record `LOCAL_RETIRED`, linking source
+9. Revoke local authority and durably record `LOCAL_RETIRED`, linking source
    epoch `E` to the destination's reserved epoch `N`.
-9. Bring the destination online through the manager, verify the transition,
+10. Bring the destination online through the manager, verify the transition,
    and durably record `ACCUMULO_WRITABLE` at epoch `N`. Only then may
    distributed clients admit writes.
-10. Retain an auditable lineage record tying local generation, export
+11. Retain an auditable lineage record tying local generation, export
     checksums, destination table, FATE identity, and terminal authority epoch.
 
 The current `managerclient.ExecuteStatus` helper performs
