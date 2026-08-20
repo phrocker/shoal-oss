@@ -31,8 +31,10 @@ reports asynchronous lifecycle outcomes. Tablet metadata loading and the
 hosted-tablet specification loader are now present. `cmd/shoal-tserver`
 connects them to hosted-only stateful scans, one reusable authenticated
 ZooKeeper session, manager failover discovery/reporting, and bounded drain.
-Tablet ingest remains unavailable until the WAL authority dependency lands —
-see [§9](#9-what-is-not-here-yet). Tracking issue: #67.
+Tablet ingest remains unavailable in the command until the production
+conditional metadata authority lands; the Thrift/session and hosted
+WAL/memtable/minc composition is implemented behind that boundary. See
+[§9](#9-remaining-ingest-dependency). Tracking issue: #67.
 
 ## 1. Goal
 
@@ -862,14 +864,18 @@ service response instead of a false write capability.
 
 The process refuses to publish a loaded tablet that still references WAL
 segments. Serving that tablet without opening and replaying those references
-would silently omit unflushed mutations. PR #175 has now landed the fenced WAL
-authority primitive. The exact remaining #69 dependency is its process/service
-integration: register `TabletIngestClientService`, route mutation sessions into
-`internal/walauthority`, recover referenced logs into a hosted memtable, enforce
-constraints and timestamp/durability semantics, produce minor-compaction
-RFiles, and commit/retire WAL and file metadata through the authoritative
-manager path. The read-only process has none of those mutation/commit surfaces,
-so it still does not advertise `TABLET_INGEST`.
+would silently omit unflushed mutations. The update-session Thrift adapter, mutation decoding, stale-extent/retry maps,
+WAL recovery, memtable application, timestamp assignment, minor-compaction
+coordination, assignment-attempt plumbing, drain serialization, and
+readiness/metrics composition now exist in `internal/ingestservice`,
+`internal/hostedingest`, and `tserverprocess.NewWritableStore`.
+
+The exact remaining #69 dependency is a production Accumulo conditional
+metadata writer implementing both WAL-reference and file/WAL swap authorities.
+Without that atomic remote CAS, a preflight owner check could race reassignment.
+`cmd/shoal-tserver` therefore does not construct the writable store or advertise
+`TABLET_INGEST`; `tserverprocess.Services` adds the processor and descriptor
+only when every authority is initialized and accepting.
 
 Live mixed Java/Shoal migration and rolling-replacement acceptance still need
 an Accumulo cluster CI environment. Until those tests and the ingest/WAL

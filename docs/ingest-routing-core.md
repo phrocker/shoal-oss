@@ -1,7 +1,7 @@
 # Ingest routing core
 
 `internal/ingestrouter` is the validation, session, idempotency, and routing
-core for a future Accumulo `TabletIngestClientService` implementation.
+core used by `internal/ingestservice`.
 
 The boundary accepts table-scoped mutation batches, validates every batch
 before contacting a tablet, enforces extent membership, visibility syntax,
@@ -15,17 +15,16 @@ retries only retryable extents. Results are per extent, so stale assignments,
 replacement extents, cancellation, unknown outcomes, and partial commits are
 never collapsed into a success-shaped response.
 
-## Deliberate boundary for issue #69
+## Service boundary
 
-This slice does **not** implement the Accumulo-authoritative WAL, metadata log
-references, recovery, minor-compaction commit, authorization/constraint RPC
-mapping, or the Thrift service. It does not adapt the manager host, tablet
-loader, embedded tablet, or scan server. Those components can implement the
-interfaces later.
+The Thrift update-session adapter, compact mutation decoder, hosted WAL,
+memtable, recovery, minor-compaction coordinator, writable store, and
+authorization/error mapping now compose through `internal/ingestservice` and
+`internal/hostedingest`.
 
 `HostedTablet.Authority()` must report `AuthorityAccumuloWAL` before the router
 will acknowledge a commit. The zero/default `AuthorityUnsupported` returns
 `ErrWALAuthorityUnsupported`; there is no local-WAL, in-memory, or
-success-shaped fallback. Consequently this package is independently usable for
-validation and routing integration, but it does not yet satisfy issue #69's
-end-to-end Java BatchWriter durability acceptance criteria.
+success-shaped fallback. The production command still requires an Accumulo conditional metadata writer
+before it can construct that composition and advertise `TABLET_INGEST`; see
+[tablet ingest service integration](tablet-ingest-service.md).

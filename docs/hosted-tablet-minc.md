@@ -42,7 +42,7 @@ forced-unloaded, lock-lost, and replacement attempts cannot start or reach a
 metadata commit as the old owner. A CAS that races an unload must still reject
 inside the metadata implementation.
 
-This slice intentionally exposes seams for a future hosted-tablet adapter and
-`TabletIngestClientService` wiring. It does not claim that service is wired,
-that the current embedded tablet's local WAL is Accumulo authority, or that a
-production Accumulo metadata writer is included.
+`internal/hostedingest` now implements the hosted-tablet snapshot adapter and
+connects it to the update-session service and writable store. A production
+Accumulo conditional metadata writer is still required before
+`cmd/shoal-tserver` can initialize and advertise this path.

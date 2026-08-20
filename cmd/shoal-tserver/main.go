@@ -1,6 +1,6 @@
-// shoal-tserver is the manager-assigned, read-only Shoal tablet server.
-// It deliberately does not register or advertise TabletIngest: ingest remains
-// unsupported until the WAL authority work lands.
+// shoal-tserver is the manager-assigned Shoal tablet server. It remains
+// read-only until a production conditional metadata authority can initialize
+// the implemented TabletIngest/WAL/memtable/minor-compaction composition.
 package main
 
 import (
@@ -35,7 +35,6 @@ import (
 	"github.com/phrocker/shoal/internal/tablenames"
 	"github.com/phrocker/shoal/internal/tabletloader"
 	"github.com/phrocker/shoal/internal/thrift/gen/security"
-	"github.com/phrocker/shoal/internal/thrift/gen/tabletscan"
 	"github.com/phrocker/shoal/internal/transportpool"
 	"github.com/phrocker/shoal/internal/tserver"
 	"github.com/phrocker/shoal/internal/tserverprocess"
@@ -179,10 +178,10 @@ func main() {
 	defer adapter.Close()
 
 	mux := thrift.NewTMultiplexedProcessor()
-	if err := adapter.RegisterProcessors(mux); err != nil {
-		die("register manager processors: %v", err)
+	services := tserverprocess.Services{Manager: adapter, Scans: scans}
+	if err := services.Register(mux); err != nil {
+		die("register processors: %v", err)
 	}
-	mux.RegisterProcessor("scan", tabletscan.NewTabletScanClientServiceProcessor(scans))
 	socket, err := thrift.NewTServerSocket(*listen)
 	if err != nil {
 		die("listen %s: %v", *listen, err)
@@ -236,10 +235,7 @@ func main() {
 			if _, err := adapter.LockData(lock, *advertise, *group); err != nil {
 				return nil, tserver.ServiceLockData{}, err
 			}
-			data, err := tserver.TabletServerLockData(
-				lock.UUID(), *advertise, *group,
-				tserver.ServiceTabletManagement, tserver.ServiceTabletScan, tserver.ServiceTabletServer,
-			)
+			data, err := tserver.TabletServerLockData(lock.UUID(), *advertise, *group, services.LockServices()...)
 			return lock, data, err
 		},
 	}

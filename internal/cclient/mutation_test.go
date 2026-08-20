@@ -3,6 +3,8 @@ package cclient
 import (
 	"bytes"
 	"testing"
+
+	"github.com/phrocker/shoal/internal/thrift/gen/data"
 )
 
 func TestNewMutation_RejectsEmptyRow(t *testing.T) {
@@ -107,6 +109,49 @@ func TestMutation_ToThriftSeparatesLargeValues(t *testing.T) {
 	large[0] = 0
 	if wireMutation.Values[0][0] != 0xab {
 		t.Fatal("large value was not defensively copied")
+	}
+}
+
+func TestMutation_FromThriftRoundTrip(t *testing.T) {
+	original, _ := NewMutation([]byte("row"))
+	original.PutLatest([]byte("cf"), []byte("cq"), []byte("A&B"), []byte("value"))
+	original.Delete([]byte("cf"), []byte("gone"), nil, 42)
+	original.Put([]byte("large"), nil, nil, -7, bytes.Repeat([]byte{0xab}, mutationValueCopyCutoff))
+	wireMutation, err := original.ToThrift()
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := FromThrift(wireMutation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(decoded.Row(), original.Row()) || len(decoded.Entries()) != len(original.Entries()) {
+		t.Fatalf("decoded mutation = %#v", decoded)
+	}
+	for i, want := range original.Entries() {
+		got := decoded.Entries()[i]
+		if !bytes.Equal(got.ColFamily, want.ColFamily) ||
+			!bytes.Equal(got.ColQualifier, want.ColQualifier) ||
+			!bytes.Equal(got.ColVisibility, want.ColVisibility) ||
+			got.Timestamp != want.Timestamp || got.Deleted != want.Deleted ||
+			!bytes.Equal(got.Value, want.Value) {
+			t.Fatalf("entry %d = %#v, want %#v", i, got, want)
+		}
+	}
+}
+
+func TestMutation_FromThriftRejectsMalformedEncoding(t *testing.T) {
+	tests := []*data.TMutation{
+		nil,
+		{Row: []byte("row"), Entries: -1},
+		{Row: []byte("row"), Entries: 1, Data: []byte{2, 'c'}},
+		{Row: []byte("row"), Entries: 0, Data: []byte{0}},
+		{Row: []byte("row"), Entries: 1, Data: []byte{0, 0, 0, 2}},
+	}
+	for i, mutation := range tests {
+		if _, err := FromThrift(mutation); err == nil {
+			t.Fatalf("case %d unexpectedly decoded", i)
+		}
 	}
 }
 

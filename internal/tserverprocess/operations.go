@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/http"
 
+	"github.com/phrocker/shoal/internal/ingestservice"
 	"github.com/phrocker/shoal/internal/tserver"
 )
 
@@ -12,6 +13,15 @@ type ScanAdmission interface {
 }
 
 func OperationsHandler(host *tserver.Host, scans ScanAdmission) http.Handler {
+	return OperationsHandlerWithIngest(host, scans, nil)
+}
+
+type IngestAdmission interface {
+	Accepting() bool
+	Metrics() ingestservice.Metrics
+}
+
+func OperationsHandlerWithIngest(host *tserver.Host, scans ScanAdmission, ingest IngestAdmission) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -19,7 +29,7 @@ func OperationsHandler(host *tserver.Host, scans ScanAdmission) http.Handler {
 	})
 	mux.HandleFunc("/readyz", func(w http.ResponseWriter, _ *http.Request) {
 		_, held := host.Lock()
-		if !held || scans == nil || !scans.Accepting() {
+		if !held || scans == nil || !scans.Accepting() || (ingest != nil && !ingest.Accepting()) {
 			http.Error(w, "not ready", http.StatusServiceUnavailable)
 			return
 		}
@@ -41,6 +51,17 @@ func OperationsHandler(host *tserver.Host, scans ScanAdmission) http.Handler {
 		writeCounter(w, "shoal_tserver_rejected_duplicate_total", metrics.RejectedDuplicate)
 		writeCounter(w, "shoal_tserver_lock_losses_total", metrics.LockLosses)
 		writeCounter(w, "shoal_tserver_dropped_on_lock_loss_total", metrics.DroppedOnLockLoss)
+		if ingest != nil {
+			im := ingest.Metrics()
+			_, _ = fmt.Fprintf(w, "shoal_tserver_ingest_sessions %d\n", im.ActiveSessions)
+			writeCounter(w, "shoal_tserver_ingest_started_total", im.Started)
+			writeCounter(w, "shoal_tserver_ingest_batches_total", im.AppliedBatches)
+			writeCounter(w, "shoal_tserver_ingest_mutations_total", im.AppliedMutations)
+			writeCounter(w, "shoal_tserver_ingest_rejected_batches_total", im.RejectedBatches)
+			writeCounter(w, "shoal_tserver_ingest_retried_batches_total", im.RetriedBatches)
+			writeCounter(w, "shoal_tserver_ingest_expired_sessions_total", im.ExpiredSessions)
+			writeCounter(w, "shoal_tserver_ingest_backpressure_total", im.Backpressure)
+		}
 	})
 	return mux
 }

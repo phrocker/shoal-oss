@@ -71,6 +71,13 @@ type Backend interface {
 	Flush(context.Context, tserver.Extent) error
 }
 
+// AttemptBackend receives the exact assignment attempt so a writable tablet
+// can stamp every WAL and metadata operation with the lifecycle fence.
+type AttemptBackend interface {
+	LoadAssigned(context.Context, tserver.Extent, tserver.Attempt) error
+	UnloadAssigned(context.Context, tserver.Extent, tserver.Attempt, UnloadGoal) error
+}
+
 // CredentialsValidator authenticates Accumulo system credentials. Instance ID
 // matching is enforced by Adapter before this hook is called.
 type CredentialsValidator interface {
@@ -311,7 +318,12 @@ func (a *Adapter) LoadTablet(
 }
 
 func (a *Adapter) runLoad(ctx context.Context, key string, extent tserver.Extent, attempt tserver.Attempt) {
-	loadErr := a.backend.Load(ctx, extent)
+	var loadErr error
+	if backend, ok := a.backend.(AttemptBackend); ok {
+		loadErr = backend.LoadAssigned(ctx, extent, attempt)
+	} else {
+		loadErr = a.backend.Load(ctx, extent)
+	}
 
 	a.mu.Lock()
 	op, current := a.operations[key]
@@ -404,7 +416,12 @@ func (a *Adapter) runUnload(
 	attempt tserver.Attempt,
 	goal UnloadGoal,
 ) {
-	unloadErr := a.backend.Unload(ctx, extent, goal)
+	var unloadErr error
+	if backend, ok := a.backend.(AttemptBackend); ok {
+		unloadErr = backend.UnloadAssigned(ctx, extent, attempt, goal)
+	} else {
+		unloadErr = a.backend.Unload(ctx, extent, goal)
+	}
 
 	a.mu.Lock()
 	op, current := a.operations[key]
