@@ -9,6 +9,7 @@ import (
 
 	"github.com/apache/thrift/lib/go/thrift"
 
+	"github.com/phrocker/shoal/internal/ingestservice"
 	"github.com/phrocker/shoal/internal/protocol"
 	clientgen "github.com/phrocker/shoal/internal/thrift/gen/client"
 	"github.com/phrocker/shoal/internal/thrift/gen/data"
@@ -126,9 +127,8 @@ func (a ManagerAuthenticator) AuthorizeWrite(
 		return err
 	}
 	if !allowed {
-		return fmt.Errorf(
-			"tserverprocess: principal %q lacks write permission for table %q",
-			candidate.Principal, tableName)
+		return fmt.Errorf("%w: principal %q lacks write permission for table %q",
+			ingestservice.ErrPermissionDenied, candidate.Principal, tableName)
 	}
 	return nil
 }

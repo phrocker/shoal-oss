@@ -33,11 +33,16 @@ WAL, and file columns. Unknown transport outcomes are reconciled by rereading
 authoritative state and retries are idempotent. Durable checkpoints discover
 and resume incomplete minor compactions after restart; ownership release
 flushes, retires WAL references, and conditionally removes the exact owner.
+Capability advertisement additionally requires the explicit `-enable-ingest`
+release gate; it defaults off until the live mixed-fleet evidence tracked by
+#74 is accepted.
 
 General client conditional-mutation sessions remain unsupported and fail
 explicitly. The internal metadata CAS path is supported when the backing root
 or metadata tablet is hosted by an Accumulo implementation that provides
-conditional updates.
+conditional updates. Shoal therefore refuses root and metadata-table tablet
+assignments instead of advertising unsupported self-hosted conditional
+semantics; production mixed fleets keep those system tablets on Java tservers.
 
 Live unmodified-Java-client evidence remains part of issue #74 and requires
 Docker or another Accumulo 4 cluster environment.

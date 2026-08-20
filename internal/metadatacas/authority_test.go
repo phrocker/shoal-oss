@@ -53,7 +53,8 @@ func (f *fakeCluster) LocateTable(_ context.Context, tableID string) ([]metadata
 		return nil, nil
 	}
 	info := metadata.TabletInfo{
-		TableID: "5", PrevRowSet: true, Directory: "t-1", Time: "M0",
+		TableID: "5", PrevRowSet: true, Directory: "t-1",
+		Time:       string(f.cells[cell(metadata.CFServer, metadata.CQTime)]),
 		ServerLock: string(f.cells[cell(metadata.CFServer, metadata.CQLock)]),
 	}
 	for key, value := range f.cells {
@@ -284,12 +285,13 @@ func TestAuthorityConcurrentReferencesAndAmbiguousMincCommit(t *testing.T) {
 	}
 	outcome, err := authority.Commit(context.Background(), mincauthority.MetadataCommit{
 		Extent: authority.extent, Fence: fence, File: file, RemoveWALs: refs,
+		TabletTime: "M42",
 	})
 	if outcome != mincauthority.CommitApplied {
 		t.Fatalf("Commit = %v, %v", outcome, err)
 	}
 	state, err := authority.Read(context.Background(), authority.extent)
-	if err != nil || len(state.Files) != 1 || len(state.WALs) != 0 {
+	if err != nil || len(state.Files) != 1 || len(state.WALs) != 0 || state.Time != "M42" {
 		t.Fatalf("state = %#v, %v", state, err)
 	}
 	if len(state.Files[0].StartRow) != 0 || len(state.Files[0].EndRow) != 0 {

@@ -8,7 +8,10 @@ This directory contains platform artifacts for running Shoal as three Kubernetes
   Accumulo ServiceLocks, accept manager assignments, and serve scans and
   WAL-backed ingest only for tablets whose metadata ownership they claimed by
   conditional CAS. They advertise `TABLET_INGEST` only after all write
-  authorities initialize.
+  authorities initialize and the release-gated `-enable-ingest` flag is set.
+  Each ordinal has a persistent `/var/lib/shoal`
+  volume for referenced WALs and minc checkpoints; an assignment that cannot
+  access a referenced WAL fails closed rather than publishing incomplete data.
 
 For local development these collapse into a single `shoal-embed` process. The intended platform shape is: writes land in a shard-local `shoal-embed`, flush/compaction emits RFiles to a shared object-store prefix, and read-fleet pods open those same RFiles for hedged scans.
 

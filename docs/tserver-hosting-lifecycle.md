@@ -855,10 +855,11 @@ qualifiers are decoded using Java `LogEntry.fromMetaWalEntry`'s
 
 ## 9. Ingest authority
 
-`cmd/shoal-tserver` is a write-capable tablet-server participant. It registers
-the `TabletIngest` processor and advertises `TABLET_INGEST` only after the
-ServiceLock-dependent metadata CAS, WAL, loader, memtable, and minor-compaction
-authorities are initialized.
+`cmd/shoal-tserver` is a write-capable tablet-server participant. With the
+explicit `-enable-ingest` release gate, it registers the `TabletIngest`
+processor and advertises `TABLET_INGEST` only after the ServiceLock-dependent
+metadata CAS, WAL, loader, memtable, and minor-compaction authorities are
+initialized. The flag defaults off while #74 gathers live mixed-fleet evidence.
 
 The process refuses to publish a loaded tablet that still references WAL
 segments. Serving that tablet without opening and replaying those references

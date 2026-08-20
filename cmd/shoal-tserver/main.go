@@ -75,10 +75,11 @@ func main() {
 	lockVerify := flag.Duration("lock-verify", 5*time.Second, "ServiceLock verification interval")
 	drainTimeout := flag.Duration("drain-timeout", 30*time.Second, "scan drain deadline")
 	metricsAddress := flag.String("metrics-address", ":9998", "health/readiness/metrics address; empty disables")
-	walRoot := flag.String("wal-root", "var\\shoal\\wal", "durable local WAL directory")
+	walRoot := flag.String("wal-root", "/var/lib/shoal/wal", "durable local WAL directory")
 	mincRoot := flag.String("minc-root", "shoal/minc", "minor-compaction object prefix")
-	stateRoot := flag.String("state-root", "var\\shoal\\minc-state", "durable minor-compaction state directory")
+	stateRoot := flag.String("state-root", "/var/lib/shoal/minc-state", "durable minor-compaction state directory")
 	flushCells := flag.Int("flush-cells", 1, "memtable cells that trigger minor compaction")
+	enableIngest := flag.Bool("enable-ingest", false, "advertise TABLET_INGEST after all write authorities initialize")
 	flag.Parse()
 
 	if *showVersion {
@@ -228,7 +229,10 @@ func main() {
 	defer adapter.Close()
 
 	mux := thrift.NewTMultiplexedProcessor()
-	services := tserverprocess.Services{Manager: adapter, Scans: scans, Ingest: ingest}
+	services := tserverprocess.Services{Manager: adapter, Scans: scans}
+	if *enableIngest {
+		services.Ingest = ingest
+	}
 	if err := services.Register(mux); err != nil {
 		die("register processors: %v", err)
 	}
@@ -293,7 +297,7 @@ func main() {
 
 	logger.Info("shoal-tserver serving",
 		"listen", *listen, "advertise", *advertise, "group", *group,
-		"tablet_ingest", "ready",
+		"tablet_ingest", *enableIngest,
 	)
 	var reason error
 	select {

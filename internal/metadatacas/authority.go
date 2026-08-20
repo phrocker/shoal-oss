@@ -267,6 +267,26 @@ func (a *Authority) Commit(
 	updates := []update{{
 		cf: []byte(metadata.CFFile), cq: fileQualifier, value: fileValue,
 	}}
+	if request.TabletTime != "" {
+		info, readErr := a.readOwned(ctx)
+		if readErr != nil {
+			return mincauthority.CommitUnknown, readErr
+		}
+		if err := validateTabletTimeAdvance(info.Time, request.TabletTime); err != nil {
+			return mincauthority.CommitRejected, err
+		}
+		var current []byte
+		if info.Time != "" {
+			current = []byte(info.Time)
+		}
+		conditions = append(conditions, condition{
+			cf: []byte(metadata.CFServer), cq: []byte(metadata.CQTime), value: current,
+		})
+		updates = append(updates, update{
+			cf: []byte(metadata.CFServer), cq: []byte(metadata.CQTime),
+			value: []byte(request.TabletTime),
+		})
+	}
 	for _, ref := range request.RemoveWALs {
 		if err := validateReference(ref); err != nil {
 			return mincauthority.CommitRejected, err
@@ -283,7 +303,7 @@ func (a *Authority) Commit(
 	case ingestclient.ConditionalAccepted:
 		return mincauthority.CommitApplied, commitErr
 	}
-	applied, readErr := a.commitApplied(context.Background(), request.File, request.RemoveWALs)
+	applied, readErr := a.commitApplied(context.Background(), request)
 	if readErr == nil && applied {
 		return mincauthority.CommitApplied, commitErr
 	}
@@ -295,8 +315,7 @@ func (a *Authority) Commit(
 
 func (a *Authority) commitApplied(
 	ctx context.Context,
-	file mincauthority.DataFile,
-	removed []walauthority.Reference,
+	request mincauthority.MetadataCommit,
 ) (bool, error) {
 	state, err := a.Read(ctx, a.extent)
 	if err != nil {
@@ -304,8 +323,8 @@ func (a *Authority) commitApplied(
 	}
 	found := false
 	for _, current := range state.Files {
-		if current.Path == file.Path {
-			if current.Size != file.Size || current.Entries != file.Entries {
+		if current.Path == request.File.Path {
+			if current.Size != request.File.Size || current.Entries != request.File.Entries {
 				return false, ErrInconsistent
 			}
 			found = true
@@ -314,7 +333,10 @@ func (a *Authority) commitApplied(
 	if !found {
 		return false, nil
 	}
-	for _, ref := range removed {
+	if request.TabletTime != "" && state.Time != request.TabletTime {
+		return false, nil
+	}
+	for _, ref := range request.RemoveWALs {
 		for _, current := range state.WALs {
 			if current == ref {
 				return false, nil
@@ -338,6 +360,7 @@ func (a *Authority) Read(
 	state := mincauthority.MetadataState{
 		Files: make([]mincauthority.DataFile, 0, len(info.Files)),
 		WALs:  make([]walauthority.Reference, 0, len(info.Logs)),
+		Time:  info.Time,
 	}
 	for _, file := range info.Files {
 		state.Files = append(state.Files, mincauthority.DataFile{
@@ -552,6 +575,34 @@ func ownerMatches(info metadata.TabletInfo, address, session, lock string) bool 
 func validateReference(ref walauthority.Reference) error {
 	if ref.ID == "" || ref.Path == "" || ref.Qualifier != "-/"+ref.Path {
 		return errors.New("metadatacas: invalid WAL reference")
+	}
+	return nil
+}
+
+func validateTabletTimeAdvance(current, next string) error {
+	parse := func(value string) (byte, int64, error) {
+		if len(value) < 2 || (value[0] != 'M' && value[0] != 'L') {
+			return 0, 0, ErrInconsistent
+		}
+		number, err := strconv.ParseInt(value[1:], 10, 64)
+		if err != nil || number < 0 {
+			return 0, 0, ErrInconsistent
+		}
+		return value[0], number, nil
+	}
+	nextType, nextValue, err := parse(next)
+	if err != nil {
+		return err
+	}
+	if current == "" {
+		return nil
+	}
+	currentType, currentValue, err := parse(current)
+	if err != nil {
+		return err
+	}
+	if currentType != nextType || nextValue < currentValue {
+		return ErrInconsistent
 	}
 	return nil
 }

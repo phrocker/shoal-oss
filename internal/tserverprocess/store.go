@@ -153,16 +153,22 @@ func closeTablet(tablet ingestrouter.HostedTablet) {
 	}
 }
 
-func (s *Store) Unload(_ context.Context, extent tserver.Extent, _ tserverrpc.UnloadGoal) error {
-	return s.unload(context.Background(), extent)
+func (s *Store) Unload(ctx context.Context, extent tserver.Extent, goal tserverrpc.UnloadGoal) error {
+	if goal != tserverrpc.UnloadUnassigned {
+		return tserverrpc.ErrUnsupported
+	}
+	return s.unload(ctx, extent)
 }
 
 func (s *Store) UnloadAssigned(
 	ctx context.Context,
 	extent tserver.Extent,
 	_ tserver.Attempt,
-	_ tserverrpc.UnloadGoal,
+	goal tserverrpc.UnloadGoal,
 ) error {
+	if goal != tserverrpc.UnloadUnassigned {
+		return tserverrpc.ErrUnsupported
+	}
 	return s.unload(ctx, extent)
 }
 
@@ -175,18 +181,22 @@ func (s *Store) unload(ctx context.Context, extent tserver.Extent) error {
 		return tserverrpc.ErrNotServing
 	}
 	tablet := s.ingest[key]
+	s.mu.Unlock()
+	if closer, ok := tablet.(tabletCloser); ok {
+		if err := closer.Close(ctx); err != nil {
+			return err
+		}
+	}
+	s.mu.Lock()
 	delete(s.hosted, key)
 	delete(s.ingest, key)
 	s.mu.Unlock()
-	if closer, ok := tablet.(tabletCloser); ok {
-		return closer.Close(ctx)
-	}
 	return nil
 }
 
 // Flush is a no-op for a read-only hosted tablet. No mutation, memtable, or
 // WAL is accepted by this process, so there is no local state to flush.
-func (s *Store) Flush(_ context.Context, extent tserver.Extent) error {
+func (s *Store) Flush(ctx context.Context, extent tserver.Extent) error {
 	s.mu.RLock()
 	if _, ok := s.hosted[extentKey(extent)]; !ok {
 		s.mu.RUnlock()
@@ -195,7 +205,7 @@ func (s *Store) Flush(_ context.Context, extent tserver.Extent) error {
 	tablet := s.ingest[extentKey(extent)]
 	s.mu.RUnlock()
 	if flusher, ok := tablet.(tabletFlusher); ok {
-		return flusher.Flush(context.Background())
+		return flusher.Flush(ctx)
 	}
 	return nil
 }

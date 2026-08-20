@@ -43,6 +43,7 @@ metadata commit as the old owner. A CAS that races an unload must still reject
 inside the metadata implementation.
 
 `internal/hostedingest` now implements the hosted-tablet snapshot adapter and
-connects it to the update-session service and writable store. A production
-Accumulo conditional metadata writer is still required before
-`cmd/shoal-tserver` can initialize and advertise this path.
+connects it to the update-session service and writable store.
+`cmd/shoal-tserver` initializes this path with `internal/metadatacas` and
+advertises it only after the conditional metadata, WAL, loader, and
+minor-compaction authorities are ready.

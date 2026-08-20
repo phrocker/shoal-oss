@@ -25,11 +25,12 @@ func (f openerFunc) Open(
 }
 
 type storeTestTablet struct {
-	extent  ingestrouter.Extent
-	fence   ingestrouter.Fence
-	closed  bool
-	flushed bool
-	files   []mincauthority.DataFile
+	extent   ingestrouter.Extent
+	fence    ingestrouter.Fence
+	closed   bool
+	flushed  bool
+	closeErr error
+	files    []mincauthority.DataFile
 }
 
 func (t *storeTestTablet) Extent() ingestrouter.Extent { return t.extent }
@@ -39,10 +40,16 @@ func (t *storeTestTablet) Authority() ingestrouter.CommitAuthority {
 }
 func (t *storeTestTablet) Commit(context.Context, ingestrouter.CommitRequest) error { return nil }
 func (t *storeTestTablet) Close(context.Context) error {
+	if t.closeErr != nil {
+		return t.closeErr
+	}
 	t.closed = true
 	return nil
 }
-func (t *storeTestTablet) Flush(context.Context) error {
+func (t *storeTestTablet) Flush(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	t.flushed = true
 	return nil
 }
@@ -209,12 +216,28 @@ func TestWritableStorePublishesOnlyOpenedFencedTablet(t *testing.T) {
 	if err := store.Flush(context.Background(), extent); err != nil || !tablet.flushed {
 		t.Fatalf("Flush = %v, flushed=%t", err, tablet.flushed)
 	}
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := store.Flush(cancelled, extent); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled Flush = %v", err)
+	}
 	tablet.files = []mincauthority.DataFile{{Path: "rfiles/new.rf", Size: 10, Entries: 1}}
 	tablets, err := store.LocateTable(context.Background(), "5")
 	if err != nil || len(tablets) != 1 || len(tablets[0].Files) != 1 ||
 		tablets[0].Files[0].Path != "rfiles/new.rf" {
 		t.Fatalf("runtime files = %#v, %v", tablets, err)
 	}
+	if err := store.UnloadAssigned(context.Background(), extent, attempt, tserverrpc.UnloadSuspended); !errors.Is(err, tserverrpc.ErrUnsupported) {
+		t.Fatalf("suspended unload = %v", err)
+	}
+	tablet.closeErr = errors.New("transient close")
+	if err := store.UnloadAssigned(context.Background(), extent, attempt, tserverrpc.UnloadUnassigned); !errors.Is(err, tablet.closeErr) {
+		t.Fatalf("failed unload = %v", err)
+	}
+	if _, err := store.Lookup(context.Background(), tablet.extent); err != nil {
+		t.Fatalf("tablet lost after failed unload: %v", err)
+	}
+	tablet.closeErr = nil
 	if err := store.UnloadAssigned(context.Background(), extent, attempt, tserverrpc.UnloadUnassigned); err != nil {
 		t.Fatal(err)
 	}

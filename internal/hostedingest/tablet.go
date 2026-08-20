@@ -8,16 +8,20 @@
 package hostedingest
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"math"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/phrocker/shoal/internal/ingestrouter"
+	"github.com/phrocker/shoal/internal/metadata"
 	"github.com/phrocker/shoal/internal/mincauthority"
 	"github.com/phrocker/shoal/internal/rfile"
 	"github.com/phrocker/shoal/internal/storage"
@@ -34,6 +38,40 @@ type MetadataAuthority interface {
 type MetadataFactory interface {
 	Open(context.Context, tabletloader.Specification, ingestrouter.Fence) (MetadataAuthority, error)
 }
+
+func (t *Tablet) formattedTabletTimeLocked() string {
+	return string([]byte{t.timeType}) + strconv.FormatInt(t.tabletTime, 10)
+}
+
+func initialTabletTime(value string, now time.Time) (byte, int64, int64, bool, error) {
+	if value == "" {
+		current := now.UnixMilli() - 1
+		return 'M', current, current + 1, false, nil
+	}
+	if len(value) < 2 || (value[0] != 'M' && value[0] != 'L') {
+		return 0, 0, 0, false, fmt.Errorf("hostedingest: invalid tablet time %q", value)
+	}
+	current, err := strconv.ParseInt(value[1:], 10, 64)
+	if err != nil || current < 0 {
+		return 0, 0, 0, false, fmt.Errorf("hostedingest: invalid tablet time %q", value)
+	}
+	if current == math.MaxInt64 {
+		return value[0], current, current, true, nil
+	}
+	next := current + 1
+	if value[0] == 'M' && now.UnixMilli() > next {
+		next = now.UnixMilli()
+	}
+	return value[0], current, next, false, nil
+}
+
+var (
+	ErrTimestampExhausted                 = errors.New("hostedingest: tablet timestamp exhausted")
+	ErrSystemTabletConditionalUnsupported = errors.New(
+		"hostedingest: system tablets require conditional-update hosting")
+)
+
+const maxDedupOperations = 1 << 16
 
 type Config struct {
 	Host           *tserver.Host
@@ -92,6 +130,13 @@ func (f *Factory) Open(
 	extent := ingestrouter.Extent{
 		TableID: spec.Extent.TableID, PrevEndRow: spec.Extent.PrevEndRow, EndRow: spec.Extent.EndRow,
 	}
+	if extent.TableID == metadata.RootTableID || extent.TableID == metadata.MetadataTableID {
+		return nil, ErrSystemTabletConditionalUnsupported
+	}
+	timeType, tabletTime, nextTimestamp, exhausted, err := initialTabletTime(spec.Time, f.cfg.Now())
+	if err != nil {
+		return nil, err
+	}
 	verifier := hostVerifier{
 		host: f.cfg.Host, attempt: attempt,
 		server: serverLock, manager: managerLock, fence: fence,
@@ -102,12 +147,23 @@ func (f *Factory) Open(
 	if err != nil {
 		return nil, err
 	}
+	opened := false
+	defer func() {
+		if !opened {
+			if releaser, ok := metadata.(interface {
+				Release(context.Context, ingestrouter.Extent, ingestrouter.Fence) error
+			}); ok {
+				_ = releaser.Release(context.Background(), extent, fence)
+			}
+		}
+	}()
 	tablet := &Tablet{
 		extent: extent, fence: fence, verifier: verifier, flushCells: f.cfg.FlushCells,
 		metadata:  metadata,
 		snapshots: make(map[string]mincauthority.Snapshot),
 		applied:   make(map[string]struct{}), assigned: make(map[string][]ingestrouter.Mutation),
-		nextTimestamp: f.cfg.Now().UnixMilli(), newOperationID: f.cfg.NewOperationID,
+		timeType: timeType, tabletTime: tabletTime, nextTimestamp: nextTimestamp,
+		timestampExhausted: exhausted, newOperationID: f.cfg.NewOperationID,
 	}
 	wal, report, err := walauthority.Open(ctx, walauthority.Config{
 		Root: f.cfg.WALRoot, ServerAddress: f.cfg.ServerAddress,
@@ -122,7 +178,7 @@ func (f *Factory) Open(
 	stateStore := &mincauthority.FileStateStore{Dir: filepath.Join(f.cfg.StateRoot, extentDigest(extent))}
 	coordinator, err := mincauthority.New(mincauthority.Config{
 		Root: f.cfg.MincRoot, Extent: extent, Fence: fence,
-		Snapshots: tablet, Verifier: verifier, Metadata: metadata,
+		Snapshots: tablet, Verifier: recoveryVerifier, Metadata: metadata,
 		Outputs: mincauthority.BackendOutputStore{Backend: f.cfg.Outputs},
 		States:  stateStore,
 	})
@@ -138,14 +194,33 @@ func (f *Factory) Open(
 	}
 	for _, state := range pending {
 		tablet.resume = append(tablet.resume, state.OperationID)
-		if state.Phase >= mincauthority.PhaseCommitted {
-			tablet.snapshots[state.OperationID] = mincauthority.Snapshot{
-				ID: state.SnapshotID, Extent: extent, Fence: fence,
-				Boundary:    state.Boundary,
-				CoveredWALs: append([]walauthority.Reference(nil), state.CoveredWALs...),
+		tablet.snapshots[state.OperationID] = mincauthority.Snapshot{
+			ID: state.SnapshotID, Extent: extent, Fence: fence,
+			Boundary: state.Boundary, TabletTime: state.TabletTime,
+			Cells:       cloneMincCells(state.SnapshotCells),
+			CoveredWALs: append([]walauthority.Reference(nil), state.CoveredWALs...),
+		}
+		if state.Phase < mincauthority.PhaseCommitted {
+			if err := tablet.removeRecoveredSnapshotCells(state.SnapshotCells); err != nil {
+				_ = wal.Close(context.Background())
+				return nil, err
 			}
 		}
 	}
+	if err := tablet.resumePending(ctx); err != nil {
+		_ = wal.Close(context.Background())
+		return nil, err
+	}
+	tablet.mu.Lock()
+	recovered := len(tablet.active) > 0
+	tablet.mu.Unlock()
+	if recovered {
+		if err := tablet.flush(ctx); err != nil {
+			_ = wal.Close(context.Background())
+			return nil, err
+		}
+	}
+	opened = true
 	return tablet, nil
 }
 
@@ -180,18 +255,22 @@ type Tablet struct {
 	minc     *mincauthority.Coordinator
 	recovery walauthority.RecoveryReport
 
-	active         []mincauthority.Cell
-	activeSize     int
-	snapshots      map[string]mincauthority.Snapshot
-	applied        map[string]struct{}
-	assigned       map[string][]ingestrouter.Mutation
-	nextTimestamp  int64
-	flushCells     int
-	newOperationID func() string
-	pendingFlush   string
-	resume         []string
-	files          []mincauthority.DataFile
-	closed         bool
+	active             []mincauthority.Cell
+	activeSize         int
+	snapshots          map[string]mincauthority.Snapshot
+	applied            map[string]struct{}
+	assigned           map[string][]ingestrouter.Mutation
+	operationOrder     []string
+	nextTimestamp      int64
+	timeType           byte
+	tabletTime         int64
+	timestampExhausted bool
+	flushCells         int
+	newOperationID     func() string
+	pendingFlush       string
+	resume             []string
+	files              []mincauthority.DataFile
+	closed             bool
 }
 
 func (t *Tablet) Extent() ingestrouter.Extent { return cloneExtent(t.extent) }
@@ -212,7 +291,11 @@ func (t *Tablet) Commit(ctx context.Context, request ingestrouter.CommitRequest)
 	if closed {
 		return walauthority.ErrClosed
 	}
-	request.Mutations = t.assignTimestamps(request.OperationID, request.Mutations)
+	assigned, err := t.assignTimestamps(request.OperationID, request.Mutations)
+	if err != nil {
+		return err
+	}
+	request.Mutations = assigned
 	if err := t.wal.Commit(ctx, request); err != nil {
 		return routeError(err)
 	}
@@ -221,10 +304,11 @@ func (t *Tablet) Commit(ctx context.Context, request ingestrouter.CommitRequest)
 	t.mu.Unlock()
 	if flush {
 		if err := t.flush(ctx); err != nil {
-			// WAL durability is already satisfied. Retain the exact compaction
-			// operation ID so explicit flush, unload, or a later threshold
-			// crossing resumes it instead of duplicating the snapshot.
-			return nil
+			// The WAL commit may already be durable, but scans cannot observe
+			// the batch until its immutable file is installed. Force the
+			// caller to retry the same idempotency key while retaining the
+			// exact compaction operation for reconciliation.
+			return errors.Join(ingestrouter.ErrUnknownCommit, err)
 		}
 	}
 	return nil
@@ -247,11 +331,18 @@ func (t *Tablet) Apply(
 	if _, ok := t.applied[operationID]; ok {
 		return nil
 	}
-	t.assigned[operationID] = cloneMutations(mutations)
+	t.rememberOperationLocked(operationID, mutations)
 	for _, mutation := range mutations {
 		for _, update := range mutation.Updates {
 			if update.Timestamp.Set && update.Timestamp.Value >= t.nextTimestamp {
-				t.nextTimestamp = update.Timestamp.Value + 1
+				if update.Timestamp.Value == math.MaxInt64 {
+					t.timestampExhausted = true
+				} else {
+					t.nextTimestamp = update.Timestamp.Value + 1
+				}
+			}
+			if update.Timestamp.Set && update.Timestamp.Value > t.tabletTime {
+				t.tabletTime = update.Timestamp.Value
 			}
 			t.active = append(t.active, mincauthority.Cell{
 				Key: rfile.Key{
@@ -294,6 +385,7 @@ func (t *Tablet) Prepare(
 		snapshot = mincauthority.Snapshot{
 			ID:     operationID + ":" + fmt.Sprint(boundary.Sequence),
 			Extent: cloneExtent(extent), Fence: fence, Boundary: boundary.Sequence,
+			TabletTime:  t.formattedTabletTimeLocked(),
 			Cells:       append([]mincauthority.Cell(nil), t.active...),
 			CoveredWALs: append([]walauthority.Reference(nil), boundary.References...),
 		}
@@ -452,11 +544,14 @@ func (t *Tablet) DataFiles() []mincauthority.DataFile {
 	return out
 }
 
-func (t *Tablet) assignTimestamps(operationID string, mutations []ingestrouter.Mutation) []ingestrouter.Mutation {
+func (t *Tablet) assignTimestamps(
+	operationID string,
+	mutations []ingestrouter.Mutation,
+) ([]ingestrouter.Mutation, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if prior, ok := t.assigned[operationID]; ok {
-		return cloneMutations(prior)
+		return cloneMutations(prior), nil
 	}
 	out := make([]ingestrouter.Mutation, len(mutations))
 	for i, mutation := range mutations {
@@ -469,17 +564,74 @@ func (t *Tablet) assignTimestamps(operationID string, mutations []ingestrouter.M
 			out[i].Updates[j].ColumnVisibility = append([]byte(nil), update.ColumnVisibility...)
 			out[i].Updates[j].Value = append([]byte(nil), update.Value...)
 			if !update.Timestamp.Set {
+				if t.timestampExhausted {
+					return nil, ErrTimestampExhausted
+				}
 				out[i].Updates[j].Timestamp = ingestrouter.Timestamp{
 					Set: true, Value: t.nextTimestamp,
 				}
-				t.nextTimestamp++
+				if t.nextTimestamp == math.MaxInt64 {
+					t.timestampExhausted = true
+				} else {
+					t.nextTimestamp++
+				}
+				if out[i].Updates[j].Timestamp.Value > t.tabletTime {
+					t.tabletTime = out[i].Updates[j].Timestamp.Value
+				}
 			} else if update.Timestamp.Value >= t.nextTimestamp {
-				t.nextTimestamp = update.Timestamp.Value + 1
+				if update.Timestamp.Value == math.MaxInt64 {
+					t.timestampExhausted = true
+				} else {
+					t.nextTimestamp = update.Timestamp.Value + 1
+				}
+			}
+			if update.Timestamp.Set && update.Timestamp.Value > t.tabletTime {
+				t.tabletTime = update.Timestamp.Value
 			}
 		}
 	}
-	t.assigned[operationID] = cloneMutations(out)
-	return out
+	t.rememberOperationLocked(operationID, out)
+	return out, nil
+}
+
+func (t *Tablet) rememberOperationLocked(
+	operationID string,
+	mutations []ingestrouter.Mutation,
+) {
+	if _, exists := t.assigned[operationID]; !exists {
+		t.operationOrder = append(t.operationOrder, operationID)
+	}
+	t.assigned[operationID] = cloneMutations(mutations)
+	for len(t.operationOrder) > maxDedupOperations {
+		oldest := t.operationOrder[0]
+		t.operationOrder = t.operationOrder[1:]
+		delete(t.assigned, oldest)
+		delete(t.applied, oldest)
+	}
+}
+
+func (t *Tablet) removeRecoveredSnapshotCells(snapshot []mincauthority.Cell) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for _, expected := range snapshot {
+		found := -1
+		for i, candidate := range t.active {
+			if candidate.Key.Compare(&expected.Key) == 0 && bytes.Equal(candidate.Value, expected.Value) {
+				found = i
+				break
+			}
+		}
+		if found < 0 {
+			return mincauthority.ErrInvalidSnapshot
+		}
+		t.active = append(t.active[:found], t.active[found+1:]...)
+	}
+	t.activeSize = 0
+	for _, cell := range t.active {
+		t.activeSize += len(cell.Key.Row) + len(cell.Key.ColumnFamily) +
+			len(cell.Key.ColumnQualifier) + len(cell.Key.ColumnVisibility) + len(cell.Value) + 24
+	}
+	return nil
 }
 
 func routeError(err error) error {
@@ -505,11 +657,16 @@ func cloneExtent(in ingestrouter.Extent) ingestrouter.Extent {
 func cloneSnapshot(in mincauthority.Snapshot) mincauthority.Snapshot {
 	out := in
 	out.Extent = cloneExtent(in.Extent)
-	out.Cells = make([]mincauthority.Cell, len(in.Cells))
-	for i, cell := range in.Cells {
-		out.Cells[i] = mincauthority.Cell{Key: *cell.Key.Clone(), Value: append([]byte(nil), cell.Value...)}
-	}
+	out.Cells = cloneMincCells(in.Cells)
 	out.CoveredWALs = append([]walauthority.Reference(nil), in.CoveredWALs...)
+	return out
+}
+
+func cloneMincCells(in []mincauthority.Cell) []mincauthority.Cell {
+	out := make([]mincauthority.Cell, len(in))
+	for i, cell := range in {
+		out[i] = mincauthority.Cell{Key: *cell.Key.Clone(), Value: append([]byte(nil), cell.Value...)}
+	}
 	return out
 }
 

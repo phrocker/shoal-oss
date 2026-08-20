@@ -32,7 +32,7 @@ func (a *fakeAuth) AuthorizeWrite(_ context.Context, _ *security.TCredentials, t
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if table == a.deniedTable {
-		return errors.New("denied")
+		return ErrPermissionDenied
 	}
 	return nil
 }
@@ -187,6 +187,34 @@ func TestUpdateSessionReportsRetryAndPartialFailure(t *testing.T) {
 	}
 	if metrics := service.Metrics(); metrics.AppliedBatches != 1 || metrics.RetriedBatches != 1 {
 		t.Fatalf("metrics = %#v", metrics)
+	}
+}
+
+func TestUpdateSessionReportsCommittedPrefixForLaterExtentFailure(t *testing.T) {
+	extent := ingestrouter.Extent{TableID: "1", EndRow: []byte("z")}
+	tablet := &fakeTablet{
+		extent: extent,
+		fence:  ingestrouter.Fence{ServerGeneration: "s", ManagerGeneration: "m", Assignment: 1},
+	}
+	service := newTestService(t, nil, &fakeDirectory{
+		tablets: map[string]*fakeTablet{extent.Key(): tablet},
+		errs:    map[string]error{},
+	})
+	id, _ := service.StartUpdate(context.Background(), nil, testCredentials(), tabletingest.TDurability_LOG)
+	wireExtent := testExtent("1", "z")
+	_ = service.ApplyUpdates(context.Background(), nil, id, wireExtent,
+		[]*data.TMutation{testMutation(t, "a"), testMutation(t, "b")})
+	tablet.err = ingestrouter.ErrRetryable
+	_ = service.ApplyUpdates(context.Background(), nil, id, wireExtent,
+		[]*data.TMutation{testMutation(t, "c")})
+	result, err := service.CloseUpdate(context.Background(), nil, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, committed := range result.FailedExtents {
+		if committed != 2 {
+			t.Fatalf("committed prefix = %d, want 2", committed)
+		}
 	}
 }
 

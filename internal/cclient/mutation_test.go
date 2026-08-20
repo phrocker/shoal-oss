@@ -63,6 +63,24 @@ func TestMutation_LatestTimestampIsLongMax(t *testing.T) {
 	}
 }
 
+func TestMutation_PreservesExplicitLongMaxTimestampOnWire(t *testing.T) {
+	m, _ := NewMutation([]byte("row"))
+	m.Put([]byte("cf"), []byte("cq"), nil, MutationLatestTimestamp, []byte("v"))
+	m.entries[0].HasTimestamp = true
+	wireMutation, err := m.ToThrift()
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := FromThrift(wireMutation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry := decoded.Entries()[0]
+	if !entry.HasTimestamp || entry.Timestamp != MutationLatestTimestamp {
+		t.Fatalf("decoded explicit timestamp = %+v", entry)
+	}
+}
+
 func TestMutation_SerializeAccumulo4Encoding(t *testing.T) {
 	m, _ := NewMutation([]byte("row"))
 	m.PutLatest([]byte("cf"), []byte("cq"), nil, []byte("v"))

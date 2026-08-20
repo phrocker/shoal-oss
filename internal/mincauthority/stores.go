@@ -104,6 +104,7 @@ func (s *FileStateStore) Pending(
 		return nil, err
 	}
 	latest := make(map[string]State)
+	completed := make(map[string]struct{})
 	for _, entry := range entries {
 		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") ||
 			strings.Contains(entry.Name(), ".new-") {
@@ -117,8 +118,15 @@ func (s *FileStateStore) Pending(
 		if err != nil {
 			return nil, err
 		}
-		if !state.Extent.Equal(extent) || state.Fence != fence ||
-			state.Phase == PhaseComplete {
+		if !state.Extent.Equal(extent) || state.Fence != fence {
+			continue
+		}
+		if state.Phase == PhaseComplete {
+			completed[state.OperationID] = struct{}{}
+			delete(latest, state.OperationID)
+			continue
+		}
+		if _, ok := completed[state.OperationID]; ok {
 			continue
 		}
 		if prior, ok := latest[state.OperationID]; !ok || state.Phase > prior.Phase {

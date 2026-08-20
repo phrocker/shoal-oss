@@ -3,11 +3,14 @@ package hostedingest
 import (
 	"context"
 	"errors"
+	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/phrocker/shoal/internal/ingestrouter"
+	"github.com/phrocker/shoal/internal/metadata"
 	"github.com/phrocker/shoal/internal/mincauthority"
 	"github.com/phrocker/shoal/internal/storage/memory"
 	"github.com/phrocker/shoal/internal/tabletloader"
@@ -25,12 +28,36 @@ func (f fakeMetadataFactory) Open(
 	return f.metadata, nil
 }
 
+func TestFactoryRefusesSystemTabletWithoutConditionalHosting(t *testing.T) {
+	host, attempt := hostAssignment(t)
+	factory := testFactory(t, host, &fakeMetadata{}, 1)
+	_, err := factory.Open(context.Background(), tabletloader.Specification{
+		Extent: tserver.Extent{TableID: metadata.MetadataTableID},
+	}, attempt)
+	if !errors.Is(err, ErrSystemTabletConditionalUnsupported) {
+		t.Fatalf("Open metadata tablet = %v", err)
+	}
+}
+
+func TestInitialTabletTimePreservesLogicalAndAdvancesMillis(t *testing.T) {
+	kind, current, next, exhausted, err := initialTabletTime("L17", time.UnixMilli(100))
+	if err != nil || kind != 'L' || current != 17 || next != 18 || exhausted {
+		t.Fatalf("logical time = %q,%d,%d,%t,%v", kind, current, next, exhausted, err)
+	}
+	kind, current, next, exhausted, err = initialTabletTime("M17", time.UnixMilli(100))
+	if err != nil || kind != 'M' || current != 17 || next != 100 || exhausted {
+		t.Fatalf("millis time = %q,%d,%d,%t,%v", kind, current, next, exhausted, err)
+	}
+}
+
 type fakeMetadata struct {
 	mu                 sync.Mutex
 	refs               []walauthority.Reference
 	files              []mincauthority.DataFile
+	tabletTime         string
 	ambiguousReference bool
 	ambiguousCommit    bool
+	releases           int
 }
 
 func (m *fakeMetadata) EnsureReference(
@@ -93,6 +120,17 @@ func (m *fakeMetadata) References(context.Context, ingestrouter.Extent) ([]walau
 	return append([]walauthority.Reference(nil), m.refs...), nil
 }
 
+func (m *fakeMetadata) Release(
+	context.Context,
+	ingestrouter.Extent,
+	ingestrouter.Fence,
+) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.releases++
+	return nil
+}
+
 func (m *fakeMetadata) Commit(
 	_ context.Context,
 	request mincauthority.MetadataCommit,
@@ -119,6 +157,7 @@ func (m *fakeMetadata) Commit(
 		}
 	}
 	m.files = append(m.files, request.File)
+	m.tabletTime = request.TabletTime
 	if m.ambiguousCommit {
 		m.ambiguousCommit = false
 		return mincauthority.CommitUnknown, errors.New("lost CAS response")
@@ -135,6 +174,7 @@ func (m *fakeMetadata) Read(
 	return mincauthority.MetadataState{
 		Files: append([]mincauthority.DataFile(nil), m.files...),
 		WALs:  append([]walauthority.Reference(nil), m.refs...),
+		Time:  m.tabletTime,
 	}, nil
 }
 
@@ -170,6 +210,26 @@ func testFactory(t *testing.T, host *tserver.Host, metadata *fakeMetadata, flush
 		t.Fatal(err)
 	}
 	return factory
+}
+
+func TestFactoryRollsBackMetadataClaimWhenPostClaimOpenFails(t *testing.T) {
+	host, attempt := hostAssignment(t)
+	missing := filepath.Join(t.TempDir(), "missing-wal")
+	metadataAuthority := &fakeMetadata{refs: []walauthority.Reference{{
+		ID: "missing", Path: missing, Qualifier: "-/" + missing,
+	}}}
+	factory := testFactory(t, host, metadataAuthority, 1)
+	_, err := factory.Open(context.Background(), tabletloader.Specification{
+		Extent: tserver.Extent{TableID: "1", EndRow: []byte("z")},
+	}, attempt)
+	if err == nil {
+		t.Fatal("Open unexpectedly succeeded")
+	}
+	metadataAuthority.mu.Lock()
+	defer metadataAuthority.mu.Unlock()
+	if metadataAuthority.releases != 1 {
+		t.Fatalf("metadata releases = %d, want 1", metadataAuthority.releases)
+	}
 }
 
 func testRequest(attempt tserver.Attempt) ingestrouter.CommitRequest {
@@ -244,8 +304,9 @@ func TestTabletRestartReplaysReferencedWALExactlyOnce(t *testing.T) {
 	}
 	second.mu.Lock()
 	defer second.mu.Unlock()
-	if len(second.active) != 1 {
-		t.Fatalf("replayed/retried active cells = %d, want exactly one", len(second.active))
+	if len(second.active) != 0 || len(second.files) != 1 {
+		t.Fatalf("recovery visibility: active=%d files=%d, want flushed exactly once",
+			len(second.active), len(second.files))
 	}
 }
 

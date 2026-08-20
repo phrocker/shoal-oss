@@ -51,6 +51,8 @@ spec:
             - -accumulo-version=$(SHOAL_ACCUMULO_VERSION)
             - -user=$(SHOAL_METADATA_USER)
             - -storage=$(SHOAL_STORAGE_SCHEME)
+            - -wal-root=/var/lib/shoal/wal
+            - -state-root=/var/lib/shoal/minc-state
             - -drain-timeout=30s
           envFrom:
             - configMapRef: {name: shoal-platform-config}
@@ -78,6 +80,7 @@ spec:
             initialDelaySeconds: 5
             periodSeconds: 10
           volumeMounts:
+            - {name: data, mountPath: /var/lib/shoal}
             - {name: object-storage-credentials, mountPath: /var/run/secrets/shoal/gcs, readOnly: true}
           securityContext:
             allowPrivilegeEscalation: false
@@ -86,6 +89,14 @@ spec:
       volumes:
         - name: object-storage-credentials
           secret: {secretName: shoal-object-storage-credentials, optional: true}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 20Gi
 ---
 apiVersion: policy/v1
 kind: PodDisruptionBudget

@@ -31,6 +31,7 @@ var (
 	ErrUnsupportedDurability  = errors.New("ingestservice: durability mode is unsupported")
 	ErrConditionalUnsupported = errors.New("ingestservice: conditional mutations are unsupported")
 	ErrBackpressure           = errors.New("ingestservice: backpressure limit exceeded")
+	ErrPermissionDenied       = errors.New("ingestservice: permission denied")
 )
 
 type Authenticator interface {
@@ -77,10 +78,13 @@ type Service struct {
 
 type updateSession struct {
 	mu           sync.Mutex
+	ctx          context.Context
+	cancel       context.CancelFunc
 	credentials  *security.TCredentials
 	durability   tabletingest.TDurability
 	tables       map[string]*ingestrouter.Session
 	failed       map[string]failedExtent
+	committed    map[string]int64
 	authFailures map[string]authFailure
 	violations   map[string]*data.TConstraintViolationSummary
 	bytes        int64
@@ -152,12 +156,15 @@ func (s *Service) StartUpdate(
 	if id <= 0 {
 		id = data.UpdateID(s.nextID.Add(1 << 30))
 	}
+	sessionCtx, cancelSession := context.WithCancel(context.Background())
 	s.sessions[id] = &updateSession{
+		ctx: sessionCtx, cancel: cancelSession,
 		credentials: cloneCredentials(credentials), durability: durability,
 		tables: make(map[string]*ingestrouter.Session),
-		failed: make(map[string]failedExtent), authFailures: make(map[string]authFailure),
-		violations: make(map[string]*data.TConstraintViolationSummary),
-		lastUsed:   now,
+		failed: make(map[string]failedExtent), committed: make(map[string]int64),
+		authFailures: make(map[string]authFailure),
+		violations:   make(map[string]*data.TConstraintViolationSummary),
+		lastUsed:     now,
 	}
 	s.mu.Unlock()
 	s.started.Add(1)
@@ -177,28 +184,33 @@ func (s *Service) ApplyUpdates(
 	}
 	session.mu.Lock()
 	defer session.mu.Unlock()
-	if session.closed {
+	if session.closed || session.ctx.Err() != nil {
 		return nil
 	}
 	session.lastUsed = s.cfg.Now()
 
 	extent, err := decodeExtent(keyExtent)
 	if err != nil || len(wireMutations) == 0 {
-		session.recordFailure(keyExtent, 0)
+		session.recordFailure(keyExtent, session.committedPrefix(keyExtent))
 		s.rejectedBatches.Add(1)
 		return nil
 	}
 	size := thriftBatchSize(keyExtent, wireMutations)
 	if size > s.cfg.MaxSessionBytes-session.bytes {
-		session.recordFailure(keyExtent, 0)
+		session.recordFailure(keyExtent, session.committedPrefix(keyExtent))
 		s.backpressure.Add(1)
 		s.rejectedBatches.Add(1)
 		return nil
 	}
 	session.bytes += size
 	if err := s.cfg.Authenticator.AuthorizeWrite(ctx, session.credentials, extent.TableID); err != nil {
-		session.recordAuthorizationFailure(keyExtent, clientgen.SecurityErrorCode_PERMISSION_DENIED)
-		s.rejectedBatches.Add(1)
+		if errors.Is(err, ErrPermissionDenied) {
+			session.recordAuthorizationFailure(keyExtent, clientgen.SecurityErrorCode_PERMISSION_DENIED)
+			s.rejectedBatches.Add(1)
+		} else {
+			session.recordFailure(keyExtent, session.committedPrefix(keyExtent))
+			s.retriedBatches.Add(1)
+		}
 		return nil
 	}
 	mutations := make([]ingestrouter.Mutation, len(wireMutations))
@@ -216,27 +228,34 @@ func (s *Service) ApplyUpdates(
 	if routerSession == nil {
 		routerSession, err = s.cfg.Router.Open(fmt.Sprintf("%d:%s", updateID, extent.TableID), extent.TableID)
 		if err != nil {
-			session.recordFailure(keyExtent, 0)
+			session.recordFailure(keyExtent, session.committedPrefix(keyExtent))
 			s.rejectedBatches.Add(1)
 			return nil
 		}
 		session.tables[extent.TableID] = routerSession
 	}
 	session.request++
-	result, applyErr := routerSession.Apply(ctx, ingestrouter.Request{
+	applyCtx, cancelApply := context.WithCancel(ctx)
+	stop := context.AfterFunc(session.ctx, cancelApply)
+	defer func() {
+		stop()
+		cancelApply()
+	}()
+	result, applyErr := routerSession.Apply(applyCtx, ingestrouter.Request{
 		ID:      fmt.Sprintf("%d", session.request),
 		Batches: []ingestrouter.Batch{{Extent: extent, Mutations: mutations}},
 	})
 	outcome := result.Outcomes[extent.Key()]
 	switch {
 	case applyErr == nil && outcome.Status == ingestrouter.OutcomeApplied:
+		session.committed[thriftExtentKey(keyExtent)] += int64(len(mutations))
 		s.appliedBatches.Add(1)
 		s.appliedMutations.Add(uint64(len(mutations)))
 	case outcome.Status == ingestrouter.OutcomeRetry:
-		session.recordFailure(keyExtent, 0)
+		session.recordFailure(keyExtent, session.committedPrefix(keyExtent))
 		s.retriedBatches.Add(1)
 	default:
-		session.recordFailure(keyExtent, 0)
+		session.recordFailure(keyExtent, session.committedPrefix(keyExtent))
 		s.rejectedBatches.Add(1)
 	}
 	return nil
@@ -326,9 +345,12 @@ func (s *Service) BeginDrain() {
 	s.sessions = make(map[data.UpdateID]*updateSession)
 	s.mu.Unlock()
 	for _, session := range sessions {
-		session.mu.Lock()
-		session.close()
-		session.mu.Unlock()
+		session.cancel()
+		go func(session *updateSession) {
+			session.mu.Lock()
+			session.close()
+			session.mu.Unlock()
+		}(session)
 	}
 }
 
@@ -381,6 +403,7 @@ func (s *updateSession) close() {
 		return
 	}
 	s.closed = true
+	s.cancel()
 	for _, session := range s.tables {
 		session.Close()
 	}
@@ -403,6 +426,10 @@ func (s *updateSession) recordFailure(extent *data.TKeyExtent, committed int64) 
 		failure.committed = committed
 	}
 	s.failed[key] = failure
+}
+
+func (s *updateSession) committedPrefix(extent *data.TKeyExtent) int64 {
+	return s.committed[thriftExtentKey(extent)]
 }
 
 func (s *updateSession) recordAuthorizationFailure(
@@ -456,7 +483,9 @@ func decodeExtent(in *data.TKeyExtent) (ingestrouter.Extent, error) {
 func routerMutation(in *cclient.Mutation) ingestrouter.Mutation {
 	out := ingestrouter.Mutation{Row: append([]byte(nil), in.Row()...)}
 	for _, entry := range in.Entries() {
-		timestamp := ingestrouter.Timestamp{Set: entry.Timestamp != cclient.MutationLatestTimestamp}
+		timestamp := ingestrouter.Timestamp{
+			Set: entry.HasTimestamp || entry.Timestamp != cclient.MutationLatestTimestamp,
+		}
 		if timestamp.Set {
 			timestamp.Value = entry.Timestamp
 		}

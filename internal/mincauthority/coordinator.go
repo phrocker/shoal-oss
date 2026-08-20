@@ -65,6 +65,7 @@ type Snapshot struct {
 	Extent      ingestrouter.Extent
 	Fence       ingestrouter.Fence
 	Boundary    int64
+	TabletTime  string
 	Cells       []Cell
 	CoveredWALs []walauthority.Reference
 }
@@ -107,6 +108,7 @@ type MetadataCommit struct {
 	Fence       ingestrouter.Fence
 	File        DataFile
 	RemoveWALs  []walauthority.Reference
+	TabletTime  string
 }
 
 type CommitOutcome uint8
@@ -121,6 +123,7 @@ const (
 type MetadataState struct {
 	Files []DataFile
 	WALs  []walauthority.Reference
+	Time  string
 }
 
 type MetadataAuthority interface {
@@ -153,6 +156,8 @@ type State struct {
 	Fence               ingestrouter.Fence
 	SnapshotID          string
 	Boundary            int64
+	TabletTime          string
+	SnapshotCells       []Cell
 	SnapshotFingerprint string
 	CoveredWALs         []walauthority.Reference
 	File                DataFile
@@ -246,6 +251,8 @@ func (c *Coordinator) Run(ctx context.Context, operationID string) (DataFile, er
 			state = &State{
 				OperationID: operationID, Extent: cloneExtent(c.cfg.Extent), Fence: c.cfg.Fence,
 				SnapshotID: snapshot.ID, Boundary: snapshot.Boundary,
+				TabletTime:          snapshot.TabletTime,
+				SnapshotCells:       cloneCells(snapshot.Cells),
 				SnapshotFingerprint: fingerprint, CoveredWALs: cloneRefs(snapshot.CoveredWALs),
 				File: file, Phase: PhaseSnapshotted,
 			}
@@ -253,6 +260,7 @@ func (c *Coordinator) Run(ctx context.Context, operationID string) (DataFile, er
 				return DataFile{}, err
 			}
 		} else if state.SnapshotID != snapshot.ID || state.Boundary != snapshot.Boundary ||
+			state.TabletTime != snapshot.TabletTime ||
 			state.SnapshotFingerprint != fingerprint || !equalFile(state.File, file) ||
 			!equalRefs(state.CoveredWALs, snapshot.CoveredWALs) {
 			return DataFile{}, fmt.Errorf("%w: resumed snapshot changed", ErrInvalidSnapshot)
@@ -290,6 +298,7 @@ func (c *Coordinator) Run(ctx context.Context, operationID string) (DataFile, er
 		outcome, commitErr := c.cfg.Metadata.Commit(ctx, MetadataCommit{
 			OperationID: operationID, Extent: cloneExtent(c.cfg.Extent), Fence: c.cfg.Fence,
 			File: cloneFile(state.File), RemoveWALs: cloneRefs(state.CoveredWALs),
+			TabletTime: state.TabletTime,
 		})
 		switch outcome {
 		case CommitApplied:
@@ -367,6 +376,10 @@ func (c *Coordinator) reconcileMetadata(state *State) (bool, error) {
 	}
 	switch {
 	case filePresent && remaining == 0:
+		if state.TabletTime != "" && current.Time != state.TabletTime {
+			return false, fmt.Errorf("%w: tablet time is %q, want %q",
+				ErrMetadataInconsistent, current.Time, state.TabletTime)
+		}
 		return true, nil
 	case !filePresent && remaining == len(state.CoveredWALs):
 		return false, nil
@@ -496,11 +509,12 @@ func snapshotFingerprint(snapshot Snapshot) string {
 	type digestSnapshot struct {
 		ID       string
 		Boundary int64
+		Time     string
 		Cells    []Cell
 		WALs     []walauthority.Reference
 	}
 	value := digestSnapshot{
-		ID: snapshot.ID, Boundary: snapshot.Boundary,
+		ID: snapshot.ID, Boundary: snapshot.Boundary, Time: snapshot.TabletTime,
 		Cells: cloneCells(snapshot.Cells), WALs: cloneRefs(snapshot.CoveredWALs),
 	}
 	sort.SliceStable(value.Cells, func(i, j int) bool { return value.Cells[i].Key.Compare(&value.Cells[j].Key) < 0 })

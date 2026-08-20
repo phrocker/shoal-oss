@@ -23,6 +23,7 @@ type MutationEntry struct {
 	ColQualifier  []byte
 	ColVisibility []byte
 	Timestamp     int64
+	HasTimestamp  bool
 	Value         []byte
 	Deleted       bool
 }
@@ -56,6 +57,7 @@ func (m *Mutation) Put(cf, cq, cv []byte, timestamp int64, value []byte) {
 		ColQualifier:  cloneBytes(cq),
 		ColVisibility: cloneBytes(cv),
 		Timestamp:     timestamp,
+		HasTimestamp:  timestamp != MutationLatestTimestamp,
 		Value:         cloneBytes(value),
 		Deleted:       false,
 	})
@@ -73,6 +75,7 @@ func (m *Mutation) Delete(cf, cq, cv []byte, timestamp int64) {
 		ColQualifier:  cloneBytes(cq),
 		ColVisibility: cloneBytes(cv),
 		Timestamp:     timestamp,
+		HasTimestamp:  timestamp != MutationLatestTimestamp,
 		Value:         nil,
 		Deleted:       true,
 	})
@@ -218,6 +221,7 @@ func FromThrift(in *data.TMutation) (*Mutation, error) {
 		} else {
 			mutation.Put(cf, cq, cv, timestamp, value)
 		}
+		mutation.entries[len(mutation.entries)-1].HasTimestamp = hasTimestamp
 	}
 	if reader.Len() != 0 {
 		return nil, fmt.Errorf("cclient: mutation has %d trailing bytes", reader.Len())
@@ -283,7 +287,7 @@ func (m *Mutation) serialize() (serializedMutation, error) {
 			return serializedMutation{}, fmt.Errorf("cclient: encode column visibility: %w", err)
 		}
 
-		hasTimestamp := entry.Timestamp != MutationLatestTimestamp
+		hasTimestamp := entry.HasTimestamp || entry.Timestamp != MutationLatestTimestamp
 		if err := encoded.WriteByte(boolByte(hasTimestamp)); err != nil {
 			return serializedMutation{}, err
 		}
