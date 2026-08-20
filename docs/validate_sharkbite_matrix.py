@@ -17,7 +17,7 @@ import unicodedata
 
 
 DOC_PATH = Path(__file__).with_name("sharkbite-compatibility.md")
-EXPECTED_REVISION = 49
+EXPECTED_REVISION = 50
 CLUSTER_STATUS_APPROVAL_REVISION = 40
 # Update this manifest only when the independently audited inventory itself
 # changes; review every added/removed or reclassified ID in code review.
@@ -53,9 +53,9 @@ SCOPE_DISPOSITIONS = {
     "Not required",
 }
 EXPECTED_SCOPE_COUNTS = {
-    "Covered": 168,
+    "Covered": 179,
     "Approved divergence": 92,
-    "Required gap": 137,
+    "Required gap": 126,
     "Optional": 2763,
     "Not required": 43,
 }
@@ -97,10 +97,10 @@ def status_count_map(
 
 
 EXPECTED_STATUS_COUNTS = {
-    "Covered": 231,
-    "Missing Go": 2218,
+    "Covered": 242,
+    "Missing Go": 2215,
     "Missing C ABI": 88,
-    "Behavior mismatch": 183,
+    "Behavior mismatch": 175,
     "Intentional divergence (approval required)": 92,
     "Not required (rationale required)": 391,
 }
@@ -141,14 +141,12 @@ EXPECTED_PREFIX_COUNTS = {
     ),
     "SB-EMB": status_count_map(not_required=35),
     "SB-ERR": status_count_map(
-        covered=5,
-        missing_go=1,
-        behavior_mismatch=6,
+        covered=12,
         intentional_divergence=1,
         not_required=3,
     ),
-    "SB-HDFS": status_count_map(covered=24, missing_go=2),
-    "SB-LOG": status_count_map(covered=2, behavior_mismatch=1),
+    "SB-HDFS": status_count_map(covered=26),
+    "SB-LOG": status_count_map(covered=3),
     "SB-NS": status_count_map(covered=8),
     "SB-PANDA": status_count_map(missing_c_abi=20, not_required=1),
     "SB-PKG": status_count_map(
@@ -157,11 +155,7 @@ EXPECTED_PREFIX_COUNTS = {
         intentional_divergence=1,
         not_required=2,
     ),
-    "SB-RFILE": status_count_map(
-        covered=32,
-        behavior_mismatch=1,
-        not_required=3,
-    ),
+    "SB-RFILE": status_count_map(covered=33, not_required=3),
     "SB-SCAN": status_count_map(
         covered=5,
         missing_go=3,
@@ -233,15 +227,16 @@ EXPECTED_METADATA_FIELDS = {
     ),
     "Sharkbite release line": "`sharkbite` 1.2.0.3 on PyPI (`setup.py:34-35`)",
     "Shoal reference": (
-        "`phrocker/shoal-oss` revision 49 is pinned to main merge "
-        "`900a6e9c6abebc1dec535e54f6c889cdf5791a79` "
-        "(\"Merge pull request #198 from phrocker/client-194\")"
+        "`phrocker/shoal-oss` revision 50 is pinned to main merge "
+        "`42cb379fb9cb0bf625adec477429b86bc0cd852b` "
+        "(\"client: close cross-cutting ABI lifecycle gaps (#199)\")"
     ),
     "Shoal C ABI version": "`SHOAL_ABI_VERSION 1u` (`capi/include/shoal_types.h`)",
 }
 
 EXPECTED_DOCUMENT_STATUS_SNIPPETS = (
     "Normative gate. Binding on all Sharkbite-compatibility work.",
+    "Revision 50 — closes the eleven required storage, logging, and error-contract gaps",
     "Revision 49 — closes the twelve issue-196 cross-cutting ownership",
     "Revision 48 — completes the 40 required table, namespace, and security rows",
     "Revision 47 — establishes the client-scope ADR",
@@ -815,10 +810,10 @@ EXPECTED_ROW_MANIFEST_HEADER = (
     "# in code review, and keep the list in document order for human auditability.",
 )
 EXPECTED_SCOPE_MANIFEST_HEADER = (
-    "# Revision-49 Sharkbite client-scope disposition manifest.",
-    "# Matrix: docs/sharkbite-compatibility.md revision 49.",
+    "# Revision-50 Sharkbite client-scope disposition manifest.",
+    "# Matrix: docs/sharkbite-compatibility.md revision 50.",
     "# Sharkbite source: phrocker/sharkbite@7f2625f74331b0cd4a75dc0484949c40f1409686.",
-    "# Shoal source: phrocker/shoal-oss@900a6e9c6abebc1dec535e54f6c889cdf5791a79.",
+    "# Shoal source: phrocker/shoal-oss@42cb379fb9cb0bf625adec477429b86bc0cd852b.",
     "# Policy: docs/sharkbite-client-scope.md.",
     "# Columns: ROW-ID<TAB>DISPOSITION<TAB>RULE<TAB>PINNED-MATRIX-STATUS.",
     "# Entries are in matrix order; validator rules, not aggregate counts, authorize dispositions.",
@@ -835,8 +830,8 @@ DEFAULT_C_ABI_INCLUDE_PATHS = (
     Path("capi/include"),
     Path("capi/tests"),
 )
-EXPECTED_C_ABI_DECLARED_EXPORTS = 318
-EXPECTED_C_ABI_REFERENCED_EXPORTS = 318
+EXPECTED_C_ABI_DECLARED_EXPORTS = 322
+EXPECTED_C_ABI_REFERENCED_EXPORTS = 322
 EXPECTED_C_ABI_UNREFERENCED_EXPORTS: tuple[str, ...] = ()
 EXPECTED_C_ABI_SYMBOL_MANIFEST_HEADER = (
     f"# Revision-{EXPECTED_REVISION} compiled C ABI symbol inventory for docs/sharkbite-compatibility.md.",
@@ -3399,7 +3394,7 @@ def validate_status_narratives(
     expected_phrases = [
         (RELEASE_GATE_SECTION_HEADING, f"As of revision {EXPECTED_REVISION}, **{required_rows} rows are required, {satisfied} are satisfied, and {scope_counts['Required gap']} remain**."),
         (COUNTS_SECTION_HEADING, f"The normative scope manifest classifies {required_rows} rows as required, {scope_counts['Optional']} as optional, and {scope_counts['Not required']} as not required."),
-        (COUNTS_SECTION_HEADING, f"**Exactly {status_counts['Covered']} rows are `Covered`: [SB-XCUT-012](#sec-20), the twelve configuration/topology rows completed in revision 24, the 31 RFile/stream rows completed in revision 25, the 17 data-model value rows completed in revision 26, the five buffered-writer rows completed in revisions 28 and 45, the four row-bounded flush/constraint rows completed in revision 29, the connector invalidation/cancellation rows completed in revision 30, the eight high-level client rows completed in revision 31, the five high-level scanner rows completed in revision 32, the four compatibility-error rows completed in revision 34, the twelve streaming cursor rows completed in revision 36, the 31 column-visibility rows completed in revision 38, the 22 equivalent owned-key rows completed in revision 42, the named-locality-group RFile row plus 24 HDFS rows completed in revision 44, the two logging rows completed in revision 45, the 38 table/namespace/security rows completed in revision 48, and the twelve issue-196 cross-cutting rows completed in revision 49.**"),
+        (COUNTS_SECTION_HEADING, f"**Exactly {status_counts['Covered']} rows are `Covered`: [SB-XCUT-012](#sec-20), the twelve configuration/topology rows completed in revision 24, the 31 RFile/stream rows completed in revision 25, the 17 data-model value rows completed in revision 26, the five buffered-writer rows completed in revisions 28 and 45, the four row-bounded flush/constraint rows completed in revision 29, the connector invalidation/cancellation rows completed in revision 30, the eight high-level client rows completed in revision 31, the five high-level scanner rows completed in revision 32, the four compatibility-error rows completed in revision 34, the twelve streaming cursor rows completed in revision 36, the 31 column-visibility rows completed in revision 38, the 22 equivalent owned-key rows completed in revision 42, the named-locality-group RFile row plus 24 HDFS rows completed in revision 44, the two logging rows completed in revision 45, the 38 table/namespace/security rows completed in revision 48, the twelve issue-196 cross-cutting rows completed in revision 49, and the eleven RFile/HDFS/logging/error rows completed in revision 50.**"),
         (COUNTS_SECTION_HEADING, f"`Intentional divergence` ({status_counts[INTENTIONAL_DIVERGENCE_STATUS]}) is dominated by one upstream fact: {prefix_counts['SB-STAT'][INTENTIONAL_DIVERGENCE_STATUS]} rows are cluster-status accessors Accumulo itself deleted ([§14](#sec-14), [SB-DIV-016](#sec-26))."),
         (COUNTS_SECTION_HEADING, "`SB-XCUT-014`, `SB-XCUT-019`, and `SB-PKG-008` remain explicit required"),
     ]
