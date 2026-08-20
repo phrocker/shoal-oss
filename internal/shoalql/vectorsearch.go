@@ -3,7 +3,7 @@ package shoalql
 import (
 	"context"
 
-	"github.com/phrocker/shoal/internal/vectorindex"
+	"github.com/phrocker/shoal-oss/internal/vectorindex"
 )
 
 // ManagedVectorSearcher adapts the shared IVF-PQ manager to ShoalQL.

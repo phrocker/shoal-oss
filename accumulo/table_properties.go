@@ -5,8 +5,8 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/phrocker/shoal/internal/managerclient"
-	"github.com/phrocker/shoal/internal/zk"
+	"github.com/phrocker/shoal-oss/internal/managerclient"
+	"github.com/phrocker/shoal-oss/internal/zk"
 )
 
 // SetTableProperty sets a table-local Accumulo property. An empty value is

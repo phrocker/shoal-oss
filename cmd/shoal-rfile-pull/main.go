@@ -19,10 +19,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/phrocker/shoal/internal/storage"
-	"github.com/phrocker/shoal/internal/storage/gcs"
-	"github.com/phrocker/shoal/internal/storage/hdfs"
-	"github.com/phrocker/shoal/internal/storage/local"
+	"github.com/phrocker/shoal-oss/internal/storage"
+	"github.com/phrocker/shoal-oss/internal/storage/gcs"
+	"github.com/phrocker/shoal-oss/internal/storage/hdfs"
+	"github.com/phrocker/shoal-oss/internal/storage/local"
 )
 
 func main() {

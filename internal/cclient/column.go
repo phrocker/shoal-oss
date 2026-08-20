@@ -5,7 +5,7 @@ package cclient
 import (
 	"bytes"
 
-	"github.com/phrocker/shoal/internal/thrift/gen/data"
+	"github.com/phrocker/shoal-oss/internal/thrift/gen/data"
 )
 
 // Column is the (cf, cq, cv) tuple used to scope a scan to particular

@@ -9,8 +9,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/phrocker/shoal/internal/graphschema"
-	"github.com/phrocker/shoal/internal/iterrt"
+	"github.com/phrocker/shoal-oss/internal/graphschema"
+	"github.com/phrocker/shoal-oss/internal/iterrt"
 )
 
 // --- fake backend ---

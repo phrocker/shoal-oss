@@ -7,11 +7,11 @@ import (
 	"math"
 	"testing"
 
-	"github.com/phrocker/shoal/internal/cclient"
-	"github.com/phrocker/shoal/internal/engine"
-	"github.com/phrocker/shoal/internal/graphschema"
-	"github.com/phrocker/shoal/internal/shoalql"
-	"github.com/phrocker/shoal/internal/tablet"
+	"github.com/phrocker/shoal-oss/internal/cclient"
+	"github.com/phrocker/shoal-oss/internal/engine"
+	"github.com/phrocker/shoal-oss/internal/graphschema"
+	"github.com/phrocker/shoal-oss/internal/shoalql"
+	"github.com/phrocker/shoal-oss/internal/tablet"
 )
 
 func packVec(v ...float32) []byte {

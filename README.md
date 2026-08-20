@@ -24,6 +24,12 @@ validation state, and the few remaining platform and infrastructure gates.
 | Run graph, document, SQL, or vector search | [`FEATURES.md`](FEATURES.md#query-and-indexing) · [`docs/graph-schema.md`](docs/graph-schema.md) · [`docs/shoalql-accumulo.md`](docs/shoalql-accumulo.md) |
 | Validate against an exact Accumulo 4 cluster | [`test/accumulo/README.md`](test/accumulo/README.md) |
 
+Go consumers should use the canonical repository-backed module path:
+
+```bash
+go get github.com/phrocker/shoal-oss/accumulo
+```
+
 ## Quick start
 
 Prerequisites for local development are Go 1.25+, Python 3.9+, `make`, and a

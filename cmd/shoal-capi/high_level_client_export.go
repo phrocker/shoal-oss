@@ -11,7 +11,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/phrocker/shoal/accumulo"
+	"github.com/phrocker/shoal-oss/accumulo"
 )
 
 //export shoal_client_config_init

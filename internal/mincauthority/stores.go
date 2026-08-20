@@ -31,8 +31,8 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/phrocker/shoal/internal/ingestrouter"
-	"github.com/phrocker/shoal/internal/storage"
+	"github.com/phrocker/shoal-oss/internal/ingestrouter"
+	"github.com/phrocker/shoal-oss/internal/storage"
 )
 
 // BackendOutputStore adapts native Shoal storage backends. RFile bytes become

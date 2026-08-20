@@ -18,7 +18,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/phrocker/shoal/internal/storage"
+	"github.com/phrocker/shoal-oss/internal/storage"
 )
 
 // Backend opens files from the OS filesystem. Stateless — share a

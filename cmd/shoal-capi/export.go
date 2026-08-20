@@ -14,8 +14,8 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/phrocker/shoal/accumulo"
-	publichdfs "github.com/phrocker/shoal/hdfs"
+	"github.com/phrocker/shoal-oss/accumulo"
+	publichdfs "github.com/phrocker/shoal-oss/hdfs"
 )
 
 const defaultBootstrapTimeout = 30 * time.Second

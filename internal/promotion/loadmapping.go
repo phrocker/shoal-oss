@@ -76,9 +76,9 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/phrocker/shoal/internal/engine"
-	"github.com/phrocker/shoal/internal/storage"
-	"github.com/phrocker/shoal/internal/tablet"
+	"github.com/phrocker/shoal-oss/internal/engine"
+	"github.com/phrocker/shoal-oss/internal/storage"
+	"github.com/phrocker/shoal-oss/internal/tablet"
 )
 
 // bulkLoadMappingFile is the fixed filename Accumulo's BulkSerialize reads

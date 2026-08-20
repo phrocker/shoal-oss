@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/phrocker/shoal/internal/rfile/wire"
+	"github.com/phrocker/shoal-oss/internal/rfile/wire"
 )
 
 // Reader is the parsed RFile.index meta block: the version stamp and
@@ -30,7 +30,7 @@ type Reader struct {
 
 	// VectorIndexRaw / TessellationFooterRaw — same opaque-preservation
 	// strategy for the v8 vector index extension.
-	VectorIndexRaw       []byte
+	VectorIndexRaw        []byte
 	TessellationFooterRaw []byte
 }
 

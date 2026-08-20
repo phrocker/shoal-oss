@@ -10,10 +10,10 @@ import (
 	"sort"
 	"time"
 
-	"github.com/phrocker/shoal/internal/managerclient"
-	"github.com/phrocker/shoal/internal/metadata"
-	"github.com/phrocker/shoal/internal/tablenames"
-	"github.com/phrocker/shoal/internal/zk"
+	"github.com/phrocker/shoal-oss/internal/managerclient"
+	"github.com/phrocker/shoal-oss/internal/metadata"
+	"github.com/phrocker/shoal-oss/internal/tablenames"
+	"github.com/phrocker/shoal-oss/internal/zk"
 )
 
 const (

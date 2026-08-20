@@ -9,7 +9,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/phrocker/shoal/internal/zk"
+	"github.com/phrocker/shoal-oss/internal/zk"
 )
 
 // constraintConnector wires a connector whose table properties and property

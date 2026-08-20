@@ -23,7 +23,7 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/phrocker/shoal/internal/metadata"
+	"github.com/phrocker/shoal-oss/internal/metadata"
 )
 
 // CommitMode selects how a finished Plan is turned into durable metadata.

@@ -7,7 +7,7 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/phrocker/shoal/internal/thrift/gen/data"
+	"github.com/phrocker/shoal-oss/internal/thrift/gen/data"
 )
 
 // Range represents an inclusive/exclusive scan range over rows.

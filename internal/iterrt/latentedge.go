@@ -26,7 +26,7 @@ import (
 	"sort"
 	"strconv"
 
-	"github.com/phrocker/shoal/internal/rfile/wire"
+	"github.com/phrocker/shoal-oss/internal/rfile/wire"
 )
 
 // LatentEdgeDiscoveryIterator is the majc iterator on the graph_vidx table -

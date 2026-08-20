@@ -7,8 +7,8 @@ import (
 	"strings"
 
 	"github.com/parquet-go/parquet-go"
-	"github.com/phrocker/shoal/internal/iterrt"
-	"github.com/phrocker/shoal/internal/parquetfile"
+	"github.com/phrocker/shoal-oss/internal/iterrt"
+	"github.com/phrocker/shoal-oss/internal/parquetfile"
 )
 
 type scanCursor interface {

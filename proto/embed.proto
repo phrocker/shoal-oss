@@ -19,7 +19,7 @@ syntax = "proto3";
 
 package shoal.embed.v1;
 
-option go_package = "github.com/phrocker/shoal/internal/embedpb";
+option go_package = "github.com/phrocker/shoal-oss/internal/embedpb";
 
 // ShoalEmbed is the gRPC service for the embedded storage engine.
 // It exposes table management, writes, scans, compaction, and status.

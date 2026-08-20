@@ -4,9 +4,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/phrocker/shoal/internal/thrift/gen/data"
-	"github.com/phrocker/shoal/internal/thrift/gen/tabletscan"
-	"github.com/phrocker/shoal/internal/thrift/gen/tabletserver"
+	"github.com/phrocker/shoal-oss/internal/thrift/gen/data"
+	"github.com/phrocker/shoal-oss/internal/thrift/gen/tabletscan"
+	"github.com/phrocker/shoal-oss/internal/thrift/gen/tabletserver"
 )
 
 type multiScanPage struct {

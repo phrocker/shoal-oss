@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/phrocker/shoal/internal/metadata"
+	"github.com/phrocker/shoal-oss/internal/metadata"
 )
 
 func TestListTableSplitsOrdersAndCopiesRows(t *testing.T) {

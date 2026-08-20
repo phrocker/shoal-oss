@@ -23,7 +23,7 @@ import (
 	"strconv"
 	"testing"
 
-	"github.com/phrocker/shoal/internal/rfile/wire"
+	"github.com/phrocker/shoal-oss/internal/rfile/wire"
 )
 
 // cell is a tiny constructor for a test cell.

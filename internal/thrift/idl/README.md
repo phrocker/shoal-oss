@@ -31,5 +31,5 @@ make thrift-verify
 ```
 
 The generator package prefix is
-`github.com/phrocker/shoal/internal/thrift/gen/`; generated types remain
+`github.com/phrocker/shoal-oss/internal/thrift/gen/`; generated types remain
 inside Go's `internal` boundary.

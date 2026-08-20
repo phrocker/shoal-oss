@@ -20,9 +20,9 @@ import (
 	"strings"
 	"text/tabwriter"
 
-	"github.com/phrocker/shoal/internal/engine"
-	"github.com/phrocker/shoal/internal/shoalql"
-	"github.com/phrocker/shoal/internal/shoalql/enginebackend"
+	"github.com/phrocker/shoal-oss/internal/engine"
+	"github.com/phrocker/shoal-oss/internal/shoalql"
+	"github.com/phrocker/shoal-oss/internal/shoalql/enginebackend"
 )
 
 func main() {

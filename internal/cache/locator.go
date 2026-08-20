@@ -22,7 +22,7 @@ import (
 	"sort"
 	"sync"
 
-	"github.com/phrocker/shoal/internal/metadata"
+	"github.com/phrocker/shoal-oss/internal/metadata"
 )
 
 // TableLocator pulls the live tablet list for a single table. The walker

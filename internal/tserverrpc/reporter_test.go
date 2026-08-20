@@ -25,8 +25,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/phrocker/shoal/internal/thrift/gen/manager"
-	"github.com/phrocker/shoal/internal/tserver"
+	"github.com/phrocker/shoal-oss/internal/thrift/gen/manager"
+	"github.com/phrocker/shoal-oss/internal/tserver"
 )
 
 type connectorResult struct {

@@ -14,7 +14,7 @@ package cred
 import (
 	"encoding/binary"
 
-	"github.com/phrocker/shoal/internal/thrift/gen/security"
+	"github.com/phrocker/shoal-oss/internal/thrift/gen/security"
 )
 
 // PasswordTokenClassName is what TCredentials.tokenClassName must contain

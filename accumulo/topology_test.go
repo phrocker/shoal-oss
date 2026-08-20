@@ -13,7 +13,7 @@ import (
 
 	gozk "github.com/go-zookeeper/zk"
 
-	"github.com/phrocker/shoal/internal/zk"
+	"github.com/phrocker/shoal-oss/internal/zk"
 )
 
 // topologyLocator is a locator backed by a fixed ZooKeeper tree.

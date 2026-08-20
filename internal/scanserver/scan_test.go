@@ -6,13 +6,13 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/phrocker/shoal/internal/cache"
-	"github.com/phrocker/shoal/internal/metadata"
-	"github.com/phrocker/shoal/internal/rfile"
-	"github.com/phrocker/shoal/internal/rfile/bcfile/block"
-	"github.com/phrocker/shoal/internal/rfile/wire"
-	"github.com/phrocker/shoal/internal/storage/memory"
-	"github.com/phrocker/shoal/internal/thrift/gen/data"
+	"github.com/phrocker/shoal-oss/internal/cache"
+	"github.com/phrocker/shoal-oss/internal/metadata"
+	"github.com/phrocker/shoal-oss/internal/rfile"
+	"github.com/phrocker/shoal-oss/internal/rfile/bcfile/block"
+	"github.com/phrocker/shoal-oss/internal/rfile/wire"
+	"github.com/phrocker/shoal-oss/internal/storage/memory"
+	"github.com/phrocker/shoal-oss/internal/thrift/gen/data"
 )
 
 // stubLocator returns a fixed tablet list for one table. Satisfies
@@ -231,8 +231,8 @@ func TestStartScan_BoundedRange(t *testing.T) {
 	resp, err := srv.StartScan(context.Background(), nil, nil,
 		&data.TKeyExtent{Table: []byte("1")},
 		&data.TRange{
-			Start: &data.TKey{Row: []byte("row05"), ColFamily: nil, ColQualifier: nil, ColVisibility: nil, Timestamp: 1<<63 - 1},
-			Stop:  &data.TKey{Row: []byte("row10"), ColFamily: nil, ColQualifier: nil, ColVisibility: nil, Timestamp: 1<<63 - 1},
+			Start:             &data.TKey{Row: []byte("row05"), ColFamily: nil, ColQualifier: nil, ColVisibility: nil, Timestamp: 1<<63 - 1},
+			Stop:              &data.TKey{Row: []byte("row10"), ColFamily: nil, ColQualifier: nil, ColVisibility: nil, Timestamp: 1<<63 - 1},
 			StartKeyInclusive: true,
 			StopKeyInclusive:  false,
 		},

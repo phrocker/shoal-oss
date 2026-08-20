@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/phrocker/shoal/internal/embedpb"
-	"github.com/phrocker/shoal/internal/graphschema"
+	"github.com/phrocker/shoal-oss/internal/embedpb"
+	"github.com/phrocker/shoal-oss/internal/graphschema"
 )
 
 func TestHeuristicEnricherEntities(t *testing.T) {

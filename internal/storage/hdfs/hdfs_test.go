@@ -19,7 +19,7 @@ import (
 	"time"
 
 	hdfsclient "github.com/colinmarc/hdfs/v2"
-	"github.com/phrocker/shoal/internal/storage"
+	"github.com/phrocker/shoal-oss/internal/storage"
 )
 
 func TestBackendOpenQualifiedPath(t *testing.T) {

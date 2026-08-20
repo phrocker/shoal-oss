@@ -8,8 +8,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/phrocker/shoal/internal/managerclient"
-	"github.com/phrocker/shoal/internal/zk"
+	"github.com/phrocker/shoal-oss/internal/managerclient"
+	"github.com/phrocker/shoal-oss/internal/zk"
 )
 
 // ConstraintPropertyPrefix is the table-property prefix Accumulo stores

@@ -18,16 +18,16 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	s3sdk "github.com/aws/aws-sdk-go-v2/service/s3"
-	"github.com/phrocker/shoal/accumulo"
-	"github.com/phrocker/shoal/internal/engine"
-	shstorage "github.com/phrocker/shoal/internal/storage"
-	"github.com/phrocker/shoal/internal/storage/azure"
-	"github.com/phrocker/shoal/internal/storage/diskcache"
-	"github.com/phrocker/shoal/internal/storage/gcs"
-	"github.com/phrocker/shoal/internal/storage/hdfs"
-	"github.com/phrocker/shoal/internal/storage/local"
-	"github.com/phrocker/shoal/internal/storage/memory"
-	"github.com/phrocker/shoal/internal/storage/s3"
+	"github.com/phrocker/shoal-oss/accumulo"
+	"github.com/phrocker/shoal-oss/internal/engine"
+	shstorage "github.com/phrocker/shoal-oss/internal/storage"
+	"github.com/phrocker/shoal-oss/internal/storage/azure"
+	"github.com/phrocker/shoal-oss/internal/storage/diskcache"
+	"github.com/phrocker/shoal-oss/internal/storage/gcs"
+	"github.com/phrocker/shoal-oss/internal/storage/hdfs"
+	"github.com/phrocker/shoal-oss/internal/storage/local"
+	"github.com/phrocker/shoal-oss/internal/storage/memory"
+	"github.com/phrocker/shoal-oss/internal/storage/s3"
 )
 
 type schemeAwareBackend struct {

@@ -20,7 +20,7 @@ package iterrt
 import (
 	"errors"
 
-	"github.com/phrocker/shoal/internal/visfilter"
+	"github.com/phrocker/shoal-oss/internal/visfilter"
 )
 
 // VisibilityFilter drops cells whose ColumnVisibility the environment's

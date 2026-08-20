@@ -23,7 +23,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/phrocker/shoal/internal/metadata"
+	"github.com/phrocker/shoal-oss/internal/metadata"
 )
 
 // --- fakes ------------------------------------------------------------

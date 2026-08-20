@@ -6,7 +6,7 @@ import (
 	"io"
 	"testing"
 
-	"github.com/phrocker/shoal/internal/rfile/wire"
+	"github.com/phrocker/shoal-oss/internal/rfile/wire"
 )
 
 func sampleKey(rowSuffix string) *wire.Key {
@@ -302,9 +302,9 @@ func TestParse_V8MinimalSingleGroup(t *testing.T) {
 		t.Fatal(err)
 	}
 	lg := &LocalityGroup{
-		IsDefault: true,
-		Name:      "",
-		ColumnFamilies: map[string]int64{}, // empty (not nil — we WANT cfCount=0)
+		IsDefault:       true,
+		Name:            "",
+		ColumnFamilies:  map[string]int64{}, // empty (not nil — we WANT cfCount=0)
 		FirstKey:        nil,
 		NumTotalEntries: 0,
 		RootIndex:       &IndexBlock{Level: 0, Offsets: []int32{}, Data: []byte{}},

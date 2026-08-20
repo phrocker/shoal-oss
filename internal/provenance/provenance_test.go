@@ -22,7 +22,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/phrocker/shoal/internal/embedpb"
+	"github.com/phrocker/shoal-oss/internal/embedpb"
 )
 
 func entriesToCells(es []*embedpb.Entry) []*embedpb.Cell {

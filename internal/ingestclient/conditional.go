@@ -6,10 +6,10 @@ import (
 	"fmt"
 
 	"github.com/apache/thrift/lib/go/thrift"
-	clientpkg "github.com/phrocker/shoal/internal/thrift/gen/client"
-	"github.com/phrocker/shoal/internal/thrift/gen/data"
-	"github.com/phrocker/shoal/internal/thrift/gen/tabletingest"
-	"github.com/phrocker/shoal/internal/transportpool"
+	clientpkg "github.com/phrocker/shoal-oss/internal/thrift/gen/client"
+	"github.com/phrocker/shoal-oss/internal/thrift/gen/data"
+	"github.com/phrocker/shoal-oss/internal/thrift/gen/tabletingest"
+	"github.com/phrocker/shoal-oss/internal/transportpool"
 )
 
 // ConditionalStatus is the authoritative result of one conditional mutation.

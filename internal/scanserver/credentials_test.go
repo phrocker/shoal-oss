@@ -5,7 +5,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/phrocker/shoal/internal/thrift/gen/security"
+	"github.com/phrocker/shoal-oss/internal/thrift/gen/security"
 )
 
 type credentialsValidatorFunc func(context.Context, *security.TCredentials, [][]byte, []string) error

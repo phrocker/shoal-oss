@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/phrocker/shoal/internal/storage/memory"
+	"github.com/phrocker/shoal-oss/internal/storage/memory"
 )
 
 // TestExportProducerNamespacing proves the fan-in name-collision fix: two

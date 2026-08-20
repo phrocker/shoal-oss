@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/phrocker/shoal/internal/zk"
+	"github.com/phrocker/shoal-oss/internal/zk"
 )
 
 func TestNewStaticInstance(t *testing.T) {

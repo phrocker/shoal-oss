@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"sort"
 
-	nslookup "github.com/phrocker/shoal/internal/namespaces"
+	nslookup "github.com/phrocker/shoal-oss/internal/namespaces"
 )
 
 // Namespaces lists every namespace visible through the Accumulo 4 ZooKeeper

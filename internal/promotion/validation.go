@@ -8,8 +8,8 @@ import (
 	"reflect"
 	"strings"
 
-	"github.com/phrocker/shoal/accumulo"
-	"github.com/phrocker/shoal/internal/storage"
+	"github.com/phrocker/shoal-oss/accumulo"
+	"github.com/phrocker/shoal-oss/internal/storage"
 )
 
 func validatePromotionDestination(dst storage.Backend, tableName, bulkDir string) error {

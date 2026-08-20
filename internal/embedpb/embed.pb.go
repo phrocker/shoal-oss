@@ -1972,7 +1972,7 @@ const file_embed_proto_rawDesc = "" +
 	"\x04Scan\x12\x1b.shoal.embed.v1.ScanRequest\x1a\x1c.shoal.embed.v1.ScanResponse0\x01\x12D\n" +
 	"\x05Flush\x12\x1c.shoal.embed.v1.FlushRequest\x1a\x1d.shoal.embed.v1.FlushResponse\x12J\n" +
 	"\aCompact\x12\x1e.shoal.embed.v1.CompactRequest\x1a\x1f.shoal.embed.v1.CompactResponse\x12G\n" +
-	"\x06Status\x12\x1d.shoal.embed.v1.StatusRequest\x1a\x1e.shoal.embed.v1.StatusResponseB,Z*github.com/phrocker/shoal/internal/embedpbb\x06proto3"
+	"\x06Status\x12\x1d.shoal.embed.v1.StatusRequest\x1a\x1e.shoal.embed.v1.StatusResponseB0Z.github.com/phrocker/shoal-oss/internal/embedpbb\x06proto3"
 
 var (
 	file_embed_proto_rawDescOnce sync.Once

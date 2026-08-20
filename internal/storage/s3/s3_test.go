@@ -39,7 +39,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
 
-	shstorage "github.com/phrocker/shoal/internal/storage"
+	shstorage "github.com/phrocker/shoal-oss/internal/storage"
 )
 
 func expectedTemporaryStageKeyComponent(key, token string) string {

@@ -5,10 +5,10 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/phrocker/shoal/internal/hostedingest"
-	"github.com/phrocker/shoal/internal/ingestservice"
-	"github.com/phrocker/shoal/internal/roleops"
-	"github.com/phrocker/shoal/internal/tserver"
+	"github.com/phrocker/shoal-oss/internal/hostedingest"
+	"github.com/phrocker/shoal-oss/internal/ingestservice"
+	"github.com/phrocker/shoal-oss/internal/roleops"
+	"github.com/phrocker/shoal-oss/internal/tserver"
 )
 
 type ScanAdmission interface {

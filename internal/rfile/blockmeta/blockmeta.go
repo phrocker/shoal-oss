@@ -46,7 +46,7 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/phrocker/shoal/internal/rfile/wire"
+	"github.com/phrocker/shoal-oss/internal/rfile/wire"
 )
 
 // MetaBlockName is the entry under which the BCFile MetaIndex stashes

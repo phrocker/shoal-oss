@@ -10,7 +10,7 @@ import (
 	"errors"
 	"sync"
 
-	"github.com/phrocker/shoal/accumulo"
+	"github.com/phrocker/shoal-oss/accumulo"
 )
 
 type ownedKeyState struct {

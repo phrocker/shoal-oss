@@ -26,7 +26,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/phrocker/shoal/internal/rfile/wire"
+	"github.com/phrocker/shoal-oss/internal/rfile/wire"
 )
 
 // This file pins down latentEdge's behavior at the cap-active regime

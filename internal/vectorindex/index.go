@@ -16,8 +16,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/phrocker/shoal/accumulo"
-	"github.com/phrocker/shoal/internal/ivfpq"
+	"github.com/phrocker/shoal-oss/accumulo"
+	"github.com/phrocker/shoal-oss/internal/ivfpq"
 )
 
 var (

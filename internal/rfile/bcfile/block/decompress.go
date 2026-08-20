@@ -21,7 +21,7 @@ import (
 	"io"
 	"sync"
 
-	"github.com/phrocker/shoal/internal/rfile/bcfile"
+	"github.com/phrocker/shoal-oss/internal/rfile/bcfile"
 )
 
 // CodecName values mirror the strings BCFile writes in MetaIndexEntry /

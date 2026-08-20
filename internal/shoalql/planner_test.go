@@ -7,8 +7,8 @@ import (
 	"math"
 	"testing"
 
-	"github.com/phrocker/shoal/internal/graphschema"
-	"github.com/phrocker/shoal/internal/iterrt"
+	"github.com/phrocker/shoal-oss/internal/graphschema"
+	"github.com/phrocker/shoal-oss/internal/iterrt"
 )
 
 func planFor(t *testing.T, sql string, opts PlanOptions) *Plan {

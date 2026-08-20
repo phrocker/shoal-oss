@@ -11,7 +11,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/phrocker/shoal/internal/engine"
+	"github.com/phrocker/shoal-oss/internal/engine"
 )
 
 // cmdSync continuously ships a table's newly flushed/compacted RFiles to an

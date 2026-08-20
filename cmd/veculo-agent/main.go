@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/phrocker/shoal/internal/agentmem"
+	"github.com/phrocker/shoal-oss/internal/agentmem"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )

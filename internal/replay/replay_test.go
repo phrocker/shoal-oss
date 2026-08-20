@@ -21,9 +21,9 @@ import (
 	"context"
 	"testing"
 
-	"github.com/phrocker/shoal/internal/embedstore"
-	"github.com/phrocker/shoal/internal/engine"
-	"github.com/phrocker/shoal/internal/replay"
+	"github.com/phrocker/shoal-oss/internal/embedstore"
+	"github.com/phrocker/shoal-oss/internal/engine"
+	"github.com/phrocker/shoal-oss/internal/replay"
 )
 
 func newLedger(t *testing.T) (*replay.Ledger, *embedstore.EngineStore, string) {

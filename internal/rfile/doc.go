@@ -18,7 +18,7 @@
 // targets.
 package rfile
 
-import "github.com/phrocker/shoal/internal/rfile/wire"
+import "github.com/phrocker/shoal-oss/internal/rfile/wire"
 
 // Key aliases wire.Key — the canonical RFile cell coordinate.
 type Key = wire.Key

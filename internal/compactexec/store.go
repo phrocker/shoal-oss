@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/phrocker/shoal/internal/storage"
+	"github.com/phrocker/shoal-oss/internal/storage"
 )
 
 // BackendStore adapts a writable/removable storage backend to Store.

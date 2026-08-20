@@ -9,10 +9,10 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/phrocker/shoal/internal/compaction"
-	"github.com/phrocker/shoal/internal/compactjob"
-	"github.com/phrocker/shoal/internal/storage"
-	"github.com/phrocker/shoal/internal/thrift/gen/data"
+	"github.com/phrocker/shoal-oss/internal/compaction"
+	"github.com/phrocker/shoal-oss/internal/compactjob"
+	"github.com/phrocker/shoal-oss/internal/storage"
+	"github.com/phrocker/shoal-oss/internal/thrift/gen/data"
 )
 
 // Store is the durable file boundary used by an external compaction.

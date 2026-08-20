@@ -9,10 +9,10 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/phrocker/shoal/internal/engine"
-	"github.com/phrocker/shoal/internal/iterrt"
-	"github.com/phrocker/shoal/internal/shoalql"
-	"github.com/phrocker/shoal/internal/vectorindex"
+	"github.com/phrocker/shoal-oss/internal/engine"
+	"github.com/phrocker/shoal-oss/internal/iterrt"
+	"github.com/phrocker/shoal-oss/internal/shoalql"
+	"github.com/phrocker/shoal-oss/internal/vectorindex"
 )
 
 // Backend wraps an *engine.Engine as a shoalql.Backend.

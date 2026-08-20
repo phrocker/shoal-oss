@@ -24,8 +24,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/phrocker/shoal/internal/engine"
-	"github.com/phrocker/shoal/internal/obs"
+	"github.com/phrocker/shoal-oss/internal/engine"
+	"github.com/phrocker/shoal-oss/internal/obs"
 )
 
 type fakeSource struct {

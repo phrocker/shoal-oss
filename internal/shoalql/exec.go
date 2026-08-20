@@ -9,8 +9,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/phrocker/shoal/internal/iterrt"
-	"github.com/phrocker/shoal/internal/vectorindex"
+	"github.com/phrocker/shoal-oss/internal/iterrt"
+	"github.com/phrocker/shoal-oss/internal/vectorindex"
 )
 
 // exec.go runs a physical Plan. The executor depends only on the Backend/

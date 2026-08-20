@@ -6,7 +6,7 @@ import (
 	"bytes"
 	"testing"
 
-	"github.com/phrocker/shoal/internal/thrift/gen/data"
+	"github.com/phrocker/shoal-oss/internal/thrift/gen/data"
 )
 
 func TestNewKeyExtent_Validation(t *testing.T) {
