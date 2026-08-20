@@ -14,9 +14,9 @@ import (
 	"fmt"
 	"path/filepath"
 	"sync"
-	"sync/atomic"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/phrocker/shoal/internal/ingestrouter"
 	"github.com/phrocker/shoal/internal/mincauthority"
 	"github.com/phrocker/shoal/internal/rfile"
@@ -36,16 +36,17 @@ type MetadataFactory interface {
 }
 
 type Config struct {
-	Host          *tserver.Host
-	ServerAddress string
-	WALRoot       string
-	MincRoot      string
-	StateRoot     string
-	WALStore      walauthority.Store
-	Outputs       storage.Backend
-	Metadata      MetadataFactory
-	FlushCells    int
-	Now           func() time.Time
+	Host           *tserver.Host
+	ServerAddress  string
+	WALRoot        string
+	MincRoot       string
+	StateRoot      string
+	WALStore       walauthority.Store
+	Outputs        storage.Backend
+	Metadata       MetadataFactory
+	FlushCells     int
+	Now            func() time.Time
+	NewOperationID func() string
 }
 
 type Factory struct{ cfg Config }
@@ -63,6 +64,9 @@ func NewFactory(cfg Config) (*Factory, error) {
 	}
 	if cfg.Now == nil {
 		cfg.Now = time.Now
+	}
+	if cfg.NewOperationID == nil {
+		cfg.NewOperationID = uuid.NewString
 	}
 	return &Factory{cfg: cfg}, nil
 }
@@ -98,7 +102,7 @@ func (f *Factory) Open(
 		extent: extent, fence: fence, verifier: verifier, flushCells: f.cfg.FlushCells,
 		snapshots: make(map[string]mincauthority.Snapshot),
 		applied:   make(map[string]struct{}), assigned: make(map[string][]ingestrouter.Mutation),
-		nextTimestamp: f.cfg.Now().UnixMilli(),
+		nextTimestamp: f.cfg.Now().UnixMilli(), newOperationID: f.cfg.NewOperationID,
 	}
 	wal, report, err := walauthority.Open(ctx, walauthority.Config{
 		Root: f.cfg.WALRoot, ServerAddress: f.cfg.ServerAddress,
@@ -154,17 +158,17 @@ type Tablet struct {
 	minc     *mincauthority.Coordinator
 	recovery walauthority.RecoveryReport
 
-	active        []mincauthority.Cell
-	activeSize    int
-	snapshots     map[string]mincauthority.Snapshot
-	applied       map[string]struct{}
-	assigned      map[string][]ingestrouter.Mutation
-	nextTimestamp int64
-	flushCells    int
-	flushID       atomic.Uint64
-	pendingFlush  string
-	files         []mincauthority.DataFile
-	closed        bool
+	active         []mincauthority.Cell
+	activeSize     int
+	snapshots      map[string]mincauthority.Snapshot
+	applied        map[string]struct{}
+	assigned       map[string][]ingestrouter.Mutation
+	nextTimestamp  int64
+	flushCells     int
+	newOperationID func() string
+	pendingFlush   string
+	files          []mincauthority.DataFile
+	closed         bool
 }
 
 func (t *Tablet) Extent() ingestrouter.Extent { return cloneExtent(t.extent) }
@@ -323,7 +327,7 @@ func (t *Tablet) flush(ctx context.Context) error {
 	t.mu.Lock()
 	operationID := t.pendingFlush
 	if operationID == "" {
-		operationID = fmt.Sprintf("minc-%d", t.flushID.Add(1))
+		operationID = "minc-" + t.newOperationID()
 		t.pendingFlush = operationID
 	}
 	t.mu.Unlock()
