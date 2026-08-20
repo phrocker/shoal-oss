@@ -61,7 +61,7 @@ func TestManagerConfigSourceReturnsStableEffectiveConfiguration(t *testing.T) {
 func TestManagerConfigSourceRetriesConcurrentPropertyUpdate(t *testing.T) {
 	client := &fakeManagerConfigClient{
 		versions: []int64{4, 5},
-		props:    []map[string]string{{}},
+		props:    []map[string]string{{}, {}},
 	}
 	_, err := (ManagerConfigSource{Client: client}).
 		ReadTableConfiguration(context.Background(), "5")

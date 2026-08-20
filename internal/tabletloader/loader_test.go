@@ -94,6 +94,7 @@ func validMetadata() MetadataSnapshot {
 		Tablet: metadata.TabletInfo{
 			TableID: "5", PrevRow: []byte("a"), PrevRowSet: true, EndRow: []byte("z"),
 			Directory: "t-00001", Time: "M17",
+			FutureLocation: &metadata.Location{HostPort: "host:9997", Session: string(testGeneration)},
 			Files: []metadata.FileEntry{
 				{Path: "hdfs://nn/tables/5/z.rf", Size: 20, NumEntries: 2, Time: -1, RawQualifier: []byte("z")},
 				{Path: "hdfs://nn/tables/5/a.rf", Size: 10, NumEntries: 1, Time: 4, RawQualifier: []byte("a")},
@@ -237,6 +238,10 @@ func TestLoadRejectsMissingAndCorruptMetadata(t *testing.T) {
 		{"missing prev row", func(s *MetadataSnapshot) { s.Tablet.PrevRowSet = false }, ErrCorruptMetadata},
 		{"missing directory", func(s *MetadataSnapshot) { s.Tablet.Directory = "" }, ErrCorruptMetadata},
 		{"wrong generation", func(s *MetadataSnapshot) { s.Generation = "old" }, ErrStaleGeneration},
+		{"wrong location generation", func(s *MetadataSnapshot) { s.Tablet.FutureLocation.Session = "old" }, ErrStaleGeneration},
+		{"current and future", func(s *MetadataSnapshot) {
+			s.Tablet.Location = &metadata.Location{HostPort: "old:9997", Session: "old"}
+		}, ErrCorruptMetadata},
 		{"duplicate file", func(s *MetadataSnapshot) { s.Tablet.Files = append(s.Tablet.Files, s.Tablet.Files[0]) }, ErrCorruptMetadata},
 	}
 	for _, tc := range tests {

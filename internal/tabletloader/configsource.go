@@ -38,6 +38,10 @@ func (s ManagerConfigSource) ReadTableConfiguration(
 	if err != nil {
 		return ConfigurationSnapshot{}, err
 	}
+	effectiveAfter, err := s.Client.GetTableConfiguration(ctx, s.Principal, tableID)
+	if err != nil {
+		return ConfigurationSnapshot{}, err
+	}
 	after, err := s.Client.GetVersionedTableProperties(ctx, s.Principal, tableID)
 	if err != nil {
 		return ConfigurationSnapshot{}, err
@@ -46,10 +50,6 @@ func (s ManagerConfigSource) ReadTableConfiguration(
 		return ConfigurationSnapshot{}, Retryable(fmt.Errorf(
 			"tabletloader: table %s properties changed from generation %d to %d",
 			tableID, before.Version, after.Version))
-	}
-	effectiveAfter, err := s.Client.GetTableConfiguration(ctx, s.Principal, tableID)
-	if err != nil {
-		return ConfigurationSnapshot{}, err
 	}
 	if !maps.Equal(effectiveBefore, effectiveAfter) {
 		return ConfigurationSnapshot{}, Retryable(fmt.Errorf(

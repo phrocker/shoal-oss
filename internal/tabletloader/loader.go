@@ -351,9 +351,23 @@ func validateMetadata(extent tserver.Extent, generation Generation, snapshot Met
 	if !validMetadataTime(info.Time) {
 		return fmt.Errorf("%w: invalid srv:time %q", ErrCorruptMetadata, info.Time)
 	}
+	if info.Location != nil && info.FutureLocation != nil {
+		return fmt.Errorf("%w: %s has both loc and future assignments", ErrCorruptMetadata, extent)
+	}
+	location := info.FutureLocation
+	if location == nil {
+		location = info.Location
+	}
+	if location == nil || location.HostPort == "" || location.Session == "" {
+		return fmt.Errorf("%w: %s has no complete loc/future assignment", ErrStaleGeneration, extent)
+	}
 	if snapshot.Generation == "" || snapshot.Generation != generation {
 		return fmt.Errorf("%w: metadata generation %q does not match captured generation %q",
 			ErrStaleGeneration, snapshot.Generation, generation)
+	}
+	if Generation(location.Session) != generation {
+		return fmt.Errorf("%w: metadata location session %q does not match captured generation %q",
+			ErrStaleGeneration, location.Session, generation)
 	}
 	return nil
 }
