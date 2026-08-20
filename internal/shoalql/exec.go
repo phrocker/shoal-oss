@@ -57,6 +57,18 @@ type Backend interface {
 	Neighbors(ctx context.Context, table string, rows [][]byte, edgeCF []byte) ([][]Neighbor, error)
 }
 
+// NeighborRequestBackend optionally accepts scan semantics such as AS OF for
+// graph traversal. The base Backend method remains source-compatible.
+type NeighborRequestBackend interface {
+	NeighborsWithRequest(
+		ctx context.Context,
+		table string,
+		rows [][]byte,
+		edgeCF []byte,
+		req ScanRequest,
+	) ([][]Neighbor, error)
+}
+
 // ValueKind tags a result cell's type.
 type ValueKind int
 
@@ -182,7 +194,9 @@ func (e *Executor) runVectorKNN(ctx context.Context, p *Plan) (*Result, error) {
 		for i, h := range hits {
 			rowKeys[i] = h.row
 		}
-		cells, err := e.be.LookupRows(ctx, p.Table, rowKeys, ScanRequest{})
+		cells, err := e.be.LookupRows(ctx, p.Table, rowKeys, ScanRequest{
+			Stack: stackBefore(p.Stack, iterrt.IterVectorKNN),
+		})
 		if err != nil {
 			return nil, err
 		}
@@ -312,7 +326,14 @@ func (e *Executor) projectRow(ctx context.Context, p *Plan, rowKey []byte, cells
 				row[i] = nullVal()
 			}
 		case OutExpand:
-			nbrs, err := e.be.Neighbors(ctx, p.Table, [][]byte{rowKey}, c.EdgeCF)
+			var nbrs [][]Neighbor
+			var err error
+			req := ScanRequest{Stack: stackBefore(p.Stack, iterrt.IterVectorKNN)}
+			if backend, ok := e.be.(NeighborRequestBackend); ok {
+				nbrs, err = backend.NeighborsWithRequest(ctx, p.Table, [][]byte{rowKey}, c.EdgeCF, req)
+			} else {
+				nbrs, err = e.be.Neighbors(ctx, p.Table, [][]byte{rowKey}, c.EdgeCF)
+			}
 			if err != nil {
 				return nil, err
 			}
@@ -328,6 +349,17 @@ func (e *Executor) projectRow(ctx context.Context, p *Plan, rowKey []byte, cells
 		}
 	}
 	return row, nil
+}
+
+func stackBefore(stack []iterrt.IterSpec, terminal string) []iterrt.IterSpec {
+	out := make([]iterrt.IterSpec, 0, len(stack))
+	for _, spec := range stack {
+		if spec.Name == terminal {
+			break
+		}
+		out = append(out, spec)
+	}
+	return out
 }
 
 // residualPass reports whether a row's cells satisfy every residual filter.

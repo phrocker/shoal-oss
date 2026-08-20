@@ -23,6 +23,7 @@ func New(eng *engine.Engine) *Backend { return &Backend{eng: eng} }
 
 var _ shoalql.Backend = (*Backend)(nil)
 var _ shoalql.CapabilityProvider = (*Backend)(nil)
+var _ shoalql.NeighborRequestBackend = (*Backend)(nil)
 
 // BackendInfo declares the embedded engine's stable ShoalQL execution
 // capabilities. Distributed scan and top-k merge are intentionally absent.
@@ -61,6 +62,7 @@ func (b *Backend) Scan(_ context.Context, table string, r iterrt.Range, req shoa
 // callback into copied cells (KNN hydration sets are small).
 func (b *Backend) LookupRows(_ context.Context, table string, rows [][]byte, req shoalql.ScanRequest) ([]shoalql.Cell, error) {
 	opts := engine.ScanOptions{
+		Stack:                   normalizedLookupStack(req.Stack),
 		ColumnFamilies:          req.ColumnFamilies,
 		ColumnFamiliesInclusive: req.CFInclusive,
 	}
@@ -83,6 +85,7 @@ func (b *Backend) Neighbors(_ context.Context, table string, rows [][]byte, edge
 	if err != nil {
 		return nil, err
 	}
+
 	out := make([][]shoalql.Neighbor, len(raw))
 	for i, ns := range raw {
 		if len(ns) == 0 {
@@ -95,4 +98,71 @@ func (b *Backend) Neighbors(_ context.Context, table string, rows [][]byte, edge
 		out[i] = conv
 	}
 	return out, nil
+}
+
+// NeighborsWithRequest preserves AS OF and other pre-projection scan
+// semantics. The ordinary adjacency fast path remains in use when no stack is
+// needed.
+func (b *Backend) NeighborsWithRequest(
+	ctx context.Context,
+	table string,
+	rows [][]byte,
+	edgeCF []byte,
+	req shoalql.ScanRequest,
+) ([][]shoalql.Neighbor, error) {
+	if len(req.Stack) == 0 {
+		return b.Neighbors(ctx, table, rows, edgeCF)
+	}
+	out := make([][]shoalql.Neighbor, len(rows))
+	for i, row := range rows {
+		r := iterrt.Range{
+			Start:          &iterrt.Key{Row: append([]byte(nil), row...)},
+			StartInclusive: true,
+			End:            &iterrt.Key{Row: append(append([]byte(nil), row...), 0)},
+			EndInclusive:   false,
+		}
+		stream, err := b.Scan(ctx, table, r, shoalql.ScanRequest{
+			Stack:          req.Stack,
+			ColumnFamilies: [][]byte{edgeCF},
+			CFInclusive:    true,
+		})
+		if err != nil {
+			return nil, err
+		}
+		for stream.Next() {
+			key := stream.Key()
+			out[i] = append(out[i], shoalql.Neighbor{
+				Target: append([]byte(nil), key.ColumnQualifier...),
+				Value:  append([]byte(nil), stream.Value()...),
+			})
+			if err := stream.Advance(); err != nil {
+				stream.Close()
+				return nil, err
+			}
+		}
+		stream.Close()
+	}
+	return out, nil
+}
+
+func normalizedLookupStack(query []iterrt.IterSpec) []iterrt.IterSpec {
+	var before, after []iterrt.IterSpec
+	for _, spec := range query {
+		if spec.Name == iterrt.IterAsOf {
+			before = append(before, spec)
+		} else {
+			after = append(after, spec)
+		}
+	}
+	out := append([]iterrt.IterSpec(nil), before...)
+	out = append(out,
+		iterrt.IterSpec{Name: iterrt.IterDeleting, Options: map[string]string{
+			iterrt.DeletingOptionPropagate: "false",
+		}},
+		iterrt.IterSpec{Name: iterrt.IterVisibility},
+		iterrt.IterSpec{Name: iterrt.IterVersioning, Options: map[string]string{
+			iterrt.VersioningOption: "1",
+		}},
+	)
+	return append(out, after...)
 }
