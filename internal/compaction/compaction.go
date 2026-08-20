@@ -35,6 +35,7 @@ package compaction
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -135,6 +136,12 @@ type Result struct {
 	EntriesWritten int64
 }
 
+// Progress is a monotonic snapshot emitted while CompactContext drains the
+// iterator stack.
+type Progress struct {
+	EntriesWritten int64
+}
+
 // ErrOutputTooLarge reports that a compaction produced more output than
 // Spec.MaxOutputBytes allows. The compaction is abandoned: callers get
 // no partial Result, because a truncated RFile is not a compaction.
@@ -181,6 +188,19 @@ func (b *budgetedWriter) Write(p []byte) (int, error) {
 // Compact fails with ErrOutputTooLarge if the output grows past
 // spec.MaxOutputBytes.
 func Compact(spec Spec) (*Result, error) {
+	return CompactContext(context.Background(), spec, nil)
+}
+
+// CompactContext is Compact with cooperative cancellation and progress
+// observation. Cancellation is checked before source construction, before
+// each cell is written, and before the final RFile close.
+func CompactContext(ctx context.Context, spec Spec, observe func(Progress)) (*Result, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	top, closer, err := buildSource(spec)
 	if err != nil {
 		return nil, err
@@ -204,13 +224,22 @@ func Compact(spec Spec) (*Result, error) {
 
 	var written int64
 	for top.HasTop() {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if err := w.Append(top.GetTopKey(), top.GetTopValue()); err != nil {
 			return nil, fmt.Errorf("compaction: append cell %d: %w", written, err)
 		}
 		written++
+		if observe != nil {
+			observe(Progress{EntriesWritten: written})
+		}
 		if err := top.Next(); err != nil {
 			return nil, fmt.Errorf("compaction: advance after cell %d: %w", written-1, err)
 		}
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	if err := w.Close(); err != nil {
 		return nil, fmt.Errorf("compaction: close writer: %w", err)

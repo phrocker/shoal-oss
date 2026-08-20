@@ -49,7 +49,7 @@
 // address the manager itself published, so the manager stays the sole
 // authority over which process coordinates compactions.
 //
-// Java-side boundary (the gap this binary intentionally stops at):
+// Java-side completion boundary:
 //
 // The Accumulo manager owns metadata commits. After a compaction
 // produces an output RFile, the new file must be inserted into
@@ -59,26 +59,18 @@
 // reaches this via coordinator.compactionCompleted(...) which the
 // manager wires to its Ample API.
 //
-// For shoal we want the same write-authority guarantees without
-// embedding Ample (and the metadata constraint stack) in Go. The
-// design (decision #1, locked 2026-05-13) is: add a manager-side
-// CompactionCommit Thrift RPC that:
+// Inspection of Accumulo 4's manager implementation proves that existing
+// coordinator.compactionCompleted(ecid, extent, stats) is sufficient. The
+// coordinator reloads the CompactionMetadata stored under the ECID, which
+// already contains the exact input references, temporary output path, kind,
+// and FateId, then seeds RenameCompactionFile/CommitCompaction. Resending
+// those authoritative fields would be redundant and weaker than using the
+// manager's stored assignment. Shoal never writes metadata or ZooKeeper.
 //
-//   - takes (ecid, extent, output_file_metadata_entry, output_file_size,
-//     output_file_entries, stats, FateId)
-//   - performs the same Ample commit the Java compactor's success path
-//     does today (delete input refs, insert output ref, clear running
-//     state), using the manager's existing privileged write path
-//   - returns success/failure synchronously, so shoal can either
-//     celebrate or trigger a compactionFailed
-//
-// We rejected "shoal writes accumulo.metadata directly" because it
-// would require porting the metadata-constraint iterators + duplicating
-// the accumulo.root write-authority lock (the 2026-05-13 wedge was
-// exactly such authority bleeding) — keeping commit in one process is
-// strictly safer.
-//
-// This binary therefore stops at the commit boundary. What it does do,
+// The isolated executor and completion adapter live in internal/compactexec.
+// This polling binary remains unwired until startup can construct the correct
+// storage backend and resolve the table's complete output configuration. What
+// it does do,
 // for every job it is handed, is decide up front whether shoal could
 // reproduce that compaction cell-for-cell: internal/compactjob
 // translates the assignment into an executable plan (inputs, iterator
@@ -88,12 +80,11 @@
 // with a class naming the exact reason, so a Java compactor picks it up
 // and the operator can see from the manager's log why shoal declined.
 //
-// Translating before releasing is not busywork: it is the gate that
-// keeps a future execution slice honest. When the manager-side
-// CompactionCommit RPC lands, the accepted plan is already the input to
-// compaction.Compact, and the refusals stay exactly where they are — so
-// the day shoal starts writing output files it can only ever write ones
-// it fully understands. Until then every path out of executeJob tries to
+// Translating before releasing is not busywork: it is the gate that keeps
+// execution honest. The accepted plan is already the input to
+// compactexec.Executor, and the refusals stay exactly where they are — so
+// wiring the worker cannot write files it does not fully understand. Until
+// then every path out of executeJob tries to
 // hand the slot back, within the -release-timeout budget.
 //
 // That is a bounded attempt, not a guarantee, and it has exactly two
@@ -538,9 +529,9 @@ func drainCoordinator(ctx context.Context, logger *slog.Logger, cc coordinatorCo
 //   - The job translates. shoal has verified it could reproduce this
 //     compaction exactly — inputs are whole files, every iterator is
 //     ported and its options parse, the output encoding is writable.
-//     It still cannot commit the result (no manager-side CompactionCommit
-//     RPC exists; see the file-level doc), so the job goes back with
-//     ClassCommitUnavailable. The plan is logged at info: that line is
+//     The polling worker is not yet wired to the isolated executor and a
+//     configured storage backend, so the job goes back with
+//     ClassExecutionUnavailable. The plan is logged at info: that line is
 //     the evidence that shoal's translation of a real production job is
 //     correct, and it is what the execution slice will act on.
 //
@@ -585,10 +576,10 @@ func executeJob(
 		return releaseJob(ctx, logger, cc, cfg, job, refusal.Class)
 	}
 
-	logger.Info("compaction job translated; releasing (shoal cannot commit: no manager-side CompactionCommit RPC)",
+	logger.Info("compaction job translated; releasing (isolated executor is not wired to this worker)",
 		slog.String("ecid", ecid),
 		slog.Any("plan", plan))
-	return releaseJob(ctx, logger, cc, cfg, job, compactjob.ClassCommitUnavailable)
+	return releaseJob(ctx, logger, cc, cfg, job, compactjob.ClassExecutionUnavailable)
 }
 
 // unreleasableReason reports why the coordinator could not act on a
