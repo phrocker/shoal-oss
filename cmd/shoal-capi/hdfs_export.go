@@ -385,6 +385,49 @@ func shoal_hdfs_client_rename(handle *C.shoal_hdfs_client, oldPath *C.char, newP
 	return C.SHOAL_STATUS_OK
 }
 
+//export shoal_hdfs_client_mkdir
+func shoal_hdfs_client_mkdir(handle *C.shoal_hdfs_client, path *C.char, timeout C.int64_t, outError **C.shoal_error) (status C.shoal_status) {
+	clearError(outError)
+	defer recoverStatus(&status, outError)
+	name, err := requiredString(path, "path")
+	if err != nil {
+		return fail(outError, C.SHOAL_STATUS_INVALID_ARGUMENT, err)
+	}
+	client, ctx, done, code, err := beginHDFSClient(handle, timeout)
+	if err != nil {
+		return fail(outError, code, err)
+	}
+	defer done()
+	if err := client.client.Mkdir(ctx, name); err != nil {
+		return failForError(outError, err)
+	}
+	return C.SHOAL_STATUS_OK
+}
+
+//export shoal_hdfs_client_chown
+func shoal_hdfs_client_chown(handle *C.shoal_hdfs_client, path *C.char, owner *C.char, group *C.char, timeout C.int64_t, outError **C.shoal_error) (status C.shoal_status) {
+	clearError(outError)
+	defer recoverStatus(&status, outError)
+	name, err := requiredString(path, "path")
+	if err != nil {
+		return fail(outError, C.SHOAL_STATUS_INVALID_ARGUMENT, err)
+	}
+	ownerName := optionalString(owner)
+	groupName := optionalString(group)
+	if ownerName == "" && groupName == "" {
+		return fail(outError, C.SHOAL_STATUS_INVALID_ARGUMENT, errors.New("shoal: owner or group is required"))
+	}
+	client, ctx, done, code, err := beginHDFSClient(handle, timeout)
+	if err != nil {
+		return fail(outError, code, err)
+	}
+	defer done()
+	if err := client.client.Chown(ctx, name, ownerName, groupName); err != nil {
+		return failForError(outError, err)
+	}
+	return C.SHOAL_STATUS_OK
+}
+
 //export shoal_hdfs_input_stream_read
 func shoal_hdfs_input_stream_read(handle *C.shoal_hdfs_input_stream, length C.size_t, timeout C.int64_t, out **C.shoal_bytes_result, outError **C.shoal_error) (status C.shoal_status) {
 	clearError(outError)

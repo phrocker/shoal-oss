@@ -6,11 +6,23 @@
 #include <stdio.h>
 #include <string.h>
 
+static void SHOAL_CALL capture_log(shoal_log_level level,
+                                   const char *event_name,
+                                   const char *attributes_json,
+                                   void *context) {
+  size_t *count = (size_t *)context;
+  assert(level == SHOAL_LOG_LEVEL_DEBUG);
+  assert(strcmp(event_name, "shoal.logging.level_changed") == 0);
+  assert(strstr(attributes_json, "\"level\":\"debug\"") != NULL);
+  assert(strstr(attributes_json, "password") == NULL);
+  (*count)++;
+}
+
 _Static_assert(SHOAL_ABI_VERSION == 1u, "unexpected compatibility ABI version");
 _Static_assert(SHOAL_ABI_VERSION_MAJOR == 1u, "unexpected ABI major");
-_Static_assert(SHOAL_ABI_VERSION_MINOR == 17u, "unexpected ABI minor");
+_Static_assert(SHOAL_ABI_VERSION_MINOR == 18u, "unexpected ABI minor");
 _Static_assert(SHOAL_ABI_VERSION_PATCH == 0u, "unexpected ABI patch");
-_Static_assert(SHOAL_ABI_VERSION_PACKED == 0x00011100u,
+_Static_assert(SHOAL_ABI_VERSION_PACKED == 0x00011200u,
                "unexpected packed ABI version");
 _Static_assert(SHOAL_ABI_CAPABILITY_CONNECTOR == 0u,
                "unexpected connector capability id");
@@ -64,11 +76,11 @@ _Static_assert(SHOAL_ABI_CAPABILITY_COLUMN_VISIBILITY == 25u,
                "unexpected column visibility capability id");
 _Static_assert(SHOAL_ABI_CAPABILITY_OWNED_KEY == 26u,
                "unexpected owned key capability id");
-_Static_assert(SHOAL_ABI_CAPABILITY_COUNT == 30u,
+_Static_assert(SHOAL_ABI_CAPABILITY_COUNT == 31u,
                "unexpected capability count");
 _Static_assert(SHOAL_ABI_CAPABILITY_WORD_COUNT == 1u,
                "unexpected capability word count");
-_Static_assert(SHOAL_ABI_CAPABILITY_WORD0 == UINT64_C(0x3fffffff),
+_Static_assert(SHOAL_ABI_CAPABILITY_WORD0 == UINT64_C(0x7fffffff),
                "unexpected capability word 0");
 
 #define ASSERT_PERMISSION_VALUE(name, value)                                  \
@@ -115,6 +127,8 @@ static void expect_error(shoal_status status, shoal_status expected,
   assert(error != NULL);
   assert(*error != NULL);
   assert(shoal_error_code(*error) == expected);
+  assert(shoal_error_compatibility_code(*error) >= -1);
+  assert(shoal_error_compatibility_code(*error) <= 13);
   assert(strstr(shoal_error_message(*error), message_part) != NULL);
   if (expected == SHOAL_STATUS_CLOSED) {
     assert(shoal_error_source(*error) ==
@@ -2572,13 +2586,23 @@ int main(void) {
   shoal_batch_writer_free(&writer);
   assert(writer == NULL);
 
+  size_t log_count = 0;
+  assert(shoal_logging_set_callback(capture_log, &log_count, &error) ==
+         SHOAL_STATUS_OK);
   assert(shoal_logging_set_level(SHOAL_LOG_LEVEL_DEBUG, &error) ==
          SHOAL_STATUS_OK);
+  assert(log_count == 1);
   assert(shoal_logging_get_level() == SHOAL_LOG_LEVEL_DEBUG);
   expect_error(shoal_logging_set_level(99, &error),
                SHOAL_STATUS_INVALID_ARGUMENT, &error, "log level");
   assert(shoal_logging_set_level(SHOAL_LOG_LEVEL_OFF, &error) ==
          SHOAL_STATUS_OK);
+  assert(shoal_logging_set_callback(NULL, NULL, &error) == SHOAL_STATUS_OK);
+  expect_error(shoal_hdfs_client_mkdir(NULL, "/warehouse", 0, &error),
+               SHOAL_STATUS_INVALID_HANDLE, &error, "handle");
+  expect_error(shoal_hdfs_client_chown(NULL, "/warehouse", "alice",
+                                       "analytics", 0, &error),
+               SHOAL_STATUS_INVALID_HANDLE, &error, "handle");
 
   assert(shoal_test_batch_writer_create(
       SHOAL_TEST_WRITER_STRUCTURED_FAILURE, &writer));

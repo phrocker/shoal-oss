@@ -191,6 +191,34 @@ class Hdfs:
 
     move = rename
 
+    def mkdir(self, path: str, *, timeout: float | None = None) -> int:
+        error = C.c_void_p()
+        status = self._api.lib.shoal_hdfs_client_mkdir(
+            self._handle, path.encode(), _timeout_ms(timeout), C.byref(error)
+        )
+        self._api.check(status, error)
+        return 0
+
+    def chown(
+        self,
+        path: str,
+        owner: str = "",
+        group: str = "",
+        *,
+        timeout: float | None = None,
+    ) -> int:
+        error = C.c_void_p()
+        status = self._api.lib.shoal_hdfs_client_chown(
+            self._handle,
+            path.encode(),
+            owner.encode() or None,
+            group.encode() or None,
+            _timeout_ms(timeout),
+            C.byref(error),
+        )
+        self._api.check(status, error)
+        return 0
+
     def close(self) -> None:
         if self._closed:
             return

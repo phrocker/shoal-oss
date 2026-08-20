@@ -55,6 +55,8 @@ SHOAL_API shoal_error_compatibility_class SHOAL_CALL
 shoal_error_compatibility(const shoal_error *error);
 SHOAL_API const char *SHOAL_CALL
 shoal_error_compatibility_name(const shoal_error *error);
+SHOAL_API int16_t SHOAL_CALL
+shoal_error_compatibility_code(const shoal_error *error);
 
 /*
  * Data-value operations are local and do not take deadlines. Every byte input
@@ -461,6 +463,13 @@ SHOAL_API shoal_status SHOAL_CALL
 shoal_hdfs_client_rename(shoal_hdfs_client *client, const char *old_path,
                          const char *new_path, int64_t timeout_ms,
                          shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_hdfs_client_mkdir(shoal_hdfs_client *client, const char *path,
+                        int64_t timeout_ms, shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_hdfs_client_chown(shoal_hdfs_client *client, const char *path,
+                        const char *owner, const char *group,
+                        int64_t timeout_ms, shoal_error **out_error);
 SHOAL_API shoal_status SHOAL_CALL
 shoal_hdfs_input_stream_read(shoal_hdfs_input_stream *stream, size_t length,
                              int64_t timeout_ms,
@@ -1310,6 +1319,16 @@ shoal_batch_writer_free(shoal_batch_writer **writer);
 SHOAL_API shoal_status SHOAL_CALL
 shoal_logging_set_level(shoal_log_level level, shoal_error **out_error);
 SHOAL_API shoal_log_level SHOAL_CALL shoal_logging_get_level(void);
+/*
+ * Installs a process-wide structured callback. callback == NULL restores the
+ * default slog sink. event_name and attributes_json are callback-lifetime
+ * UTF-8 strings; callbacks may run concurrently on client goroutines. A
+ * callback must not reconfigure logging. Clearing the callback waits for
+ * in-flight callback invocations before returning.
+ */
+SHOAL_API shoal_status SHOAL_CALL
+shoal_logging_set_callback(shoal_log_callback callback, void *context,
+                           shoal_error **out_error);
 
 /*
  * The buffered writer is an owned, lazy high-level writer. It copies config
