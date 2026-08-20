@@ -130,7 +130,83 @@ type splitPlan struct {
 // ErrPermissionDenied, ErrNamespaceNotFound, ErrInvalidTableName and
 // ErrManagerUnavailable. The legacy tablet-server splitTablet RPC removed in
 // Accumulo 4 is never used.
+//
+// AddTableSplits resolves tableName to a table ID itself and trusts that
+// resolution completely: it has no way to know whether a caller already
+// resolved the same name to a table ID earlier and expects this call to
+// still be acting against that same table. A caller that does have such an
+// expectation — internal/promotion.Promote, which pins the destination's
+// table ID before this call and must not let a delete-and-recreate race
+// silently redirect a split reconciliation onto the wrong table — should
+// call AddTableSplitsForTable instead.
 func (c *Connector) AddTableSplits(ctx context.Context, tableName string, splits [][]byte) error {
+	return c.addTableSplits(ctx, tableName, "", splits)
+}
+
+// AddTableSplitsForTable behaves exactly like AddTableSplits, except it
+// additionally requires that its own fresh resolution of table.Name still
+// names the table ID the caller already pinned as table.ID, failing
+// closed with ErrTableIdentityChanged before any split or mergeability
+// mutation is attempted if it does not.
+//
+// This exists because AddTableSplits's invalidate-then-resolve of
+// tableName, on its own, only protects against a *cached, stale* mapping —
+// it says nothing about whether the table it resolves to is the same one
+// an earlier, separate resolution (by the same or a different call)
+// observed. Without this check, a caller like Promote that pins a
+// destination table's ID before calling AddTableSplits could have that
+// call silently resolve tableName to a *different*, freshly created
+// table — deleted and recreated under the identical name in the window
+// between the caller's own pin and this call's internal resolve — and
+// proceed to add splits (or refresh mergeability) against that unrelated
+// replacement table. A later identity check before BulkImport (see
+// internal/promotion.verifyDestinationTableIdentity) can still detect
+// that the table changed and abort the import, but it cannot undo a
+// split or mergeability mutation this call already made against the
+// wrong table in the meantime; failing here, before any such mutation is
+// attempted, is the only way to avoid making it at all.
+//
+// table.ID must be non-empty (an empty expectation would defeat the
+// point of calling this instead of AddTableSplits and is rejected with
+// ErrInvalidTableName) and must have been obtained from a genuinely fresh
+// resolution (accumulo.Connector.ResolveTableID, not TableByName, which
+// may return an already-cached value) — otherwise this check could pass
+// by comparing two equally stale IDs instead of observing a real change.
+//
+// Like every other identity-pinning check in this package, this narrows
+// the vulnerable window rather than eliminating it: it only proves the
+// table has not changed identity between the caller's pin and this
+// call's own resolve. A delete-and-recreate landing after that resolve
+// but during this call's own subsequent tablet-locate, FATE submission,
+// or (for split rows that already are a tablet boundary)
+// updateTabletMergeability round trips remains possible in principle,
+// exactly as AddTableSplits's own doc comment already acknowledges for
+// tablets moving or splitting underneath a normal call. The
+// updateTabletMergeability path is a further, protocol-level limit on
+// how tight this can ever be made: Accumulo's manager RPC for it takes
+// the table's qualified *name*, not its ID (see
+// managerclient.Pooled.UpdateTabletMergeability's own doc comment), so
+// even a client that resolves and pins a table ID cannot make that one
+// specific sub-operation itself identity-safe at the wire level — the
+// manager re-resolves the name it is given, independent of any ID this
+// client already checked. The genuinely new-split path does not share
+// that limit: each TABLE_SPLIT FATE request already carries the
+// resolved table ID directly (see splitFateRequest), so Accumulo's own
+// manager, not just this client-side check, rejects it if the ID no
+// longer names a table by the time the operation runs.
+func (c *Connector) AddTableSplitsForTable(ctx context.Context, table Table, splits [][]byte) error {
+	if table.ID == "" {
+		return fmt.Errorf("%w: empty expected table ID for %q", ErrInvalidTableName, table.Name)
+	}
+	return c.addTableSplits(ctx, table.Name, table.ID, splits)
+}
+
+// addTableSplits is AddTableSplits and AddTableSplitsForTable's shared
+// core. expectedTableID is empty for the former (no pin to check) and
+// non-empty for the latter (see AddTableSplitsForTable's own doc comment
+// for exactly what checking it against a fresh resolve does and does not
+// prove).
+func (c *Connector) addTableSplits(ctx context.Context, tableName, expectedTableID string, splits [][]byte) error {
 	if err := validateExistingTableName(tableName); err != nil {
 		return err
 	}
@@ -154,13 +230,18 @@ func (c *Connector) AddTableSplits(ctx context.Context, tableName string, splits
 		return ErrDiscoveryUnavailable
 	}
 
-	discovery.tables.Invalidate()
-	tableID, err := discovery.tables.ResolveID(ctx, tableName)
+	tableID, err := resolveFreshTableID(ctx, discovery.tables, tableName)
 	if errors.Is(err, tablenames.ErrTableNotFound) {
 		return fmt.Errorf("%w: table name %q", ErrTableNotFound, tableName)
 	}
 	if err != nil {
 		return fmt.Errorf("accumulo: resolve table name %q: %w", tableName, err)
+	}
+	if expectedTableID != "" && tableID != expectedTableID {
+		return fmt.Errorf(
+			"%w: table %q (expected table ID %q, resolved %q); another actor likely deleted and recreated it — resolve the destination and retry",
+			ErrTableIdentityChanged, tableName, expectedTableID, tableID,
+		)
 	}
 	if err := requireTableNotOffline(ctx, discovery.states, tableID, tableName); err != nil {
 		return err

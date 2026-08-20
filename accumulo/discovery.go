@@ -70,6 +70,10 @@ type tableNameResolver interface {
 	Invalidate()
 }
 
+type freshTableNameResolver interface {
+	ResolveIDFresh(context.Context, string) (string, error)
+}
+
 type connectorDiscovery struct {
 	tablets    *cache.LocatorCache
 	namespaces namespaceResolver
@@ -126,6 +130,49 @@ func (c *Connector) TableByName(ctx context.Context, name string) (Table, error)
 		return Table{}, fmt.Errorf("accumulo: resolve table name %q: %w", name, err)
 	}
 	return Table{Name: name, ID: id}, nil
+}
+
+// ResolveTableID forces a fresh resolution of name's current table ID,
+// invalidating any table-name-to-ID mapping this connection has already
+// cached before resolving — unlike TableByName, which is happy to
+// return an already-cached value with no enforced TTL (see
+// internal/tablenames.Resolver: it only refreshes on an explicit
+// Invalidate call or a namespace-generation bump). AddTableSplits
+// already does this same invalidate-then-resolve internally, for the
+// same reason: to observe a concurrent delete-and-recreate of the
+// table under the same name rather than silently reusing a stale
+// mapping. Callers that need to detect such a change across a window
+// of their own — see internal/promotion.Promote's destination table
+// identity pin — should call this instead of TableByName at each
+// checkpoint; calling TableByName twice would risk observing the same
+// stale cached ID both times and never detecting the change.
+func (c *Connector) ResolveTableID(ctx context.Context, name string) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	if name == "" {
+		return "", fmt.Errorf("%w: empty table name", ErrTableNotFound)
+	}
+	discovery, err := c.discoveryState()
+	if err != nil {
+		return "", err
+	}
+	id, err := resolveFreshTableID(ctx, discovery.tables, name)
+	if err != nil {
+		if errors.Is(err, tablenames.ErrTableNotFound) {
+			return "", fmt.Errorf("%w: table name %q", ErrTableNotFound, name)
+		}
+		return "", fmt.Errorf("accumulo: resolve table name %q: %w", name, err)
+	}
+	return id, nil
+}
+
+func resolveFreshTableID(ctx context.Context, resolver tableNameResolver, name string) (string, error) {
+	if fresh, ok := resolver.(freshTableNameResolver); ok {
+		return fresh.ResolveIDFresh(ctx, name)
+	}
+	resolver.Invalidate()
+	return resolver.ResolveID(ctx, name)
 }
 
 // TableByID validates a table ID and resolves its qualified name.

@@ -2,7 +2,11 @@ package promotion
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
 	"fmt"
+	"io"
 	"net/url"
 	"os"
 	"path"
@@ -12,12 +16,14 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/phrocker/shoal/internal/engine"
 	"github.com/phrocker/shoal/internal/storage"
 	"github.com/phrocker/shoal/internal/storage/azure"
 	"github.com/phrocker/shoal/internal/storage/gcs"
 	"github.com/phrocker/shoal/internal/storage/hdfs"
+	"github.com/phrocker/shoal/internal/storage/local"
 	"github.com/phrocker/shoal/internal/storage/s3"
 )
 
@@ -27,7 +33,16 @@ var (
 	parseAzurePath         = azure.ParsePath
 	parseCanonicalHDFSPath = url.Parse
 	stagePathBackendKey    = canonicalPathBackendKey
+	stageBulkDirLocks      = struct {
+		sync.Mutex
+		entries map[string]*stageBulkDirLock
+	}{entries: make(map[string]*stageBulkDirLock)}
 )
+
+type stageBulkDirLock struct {
+	ready chan struct{}
+	refs  int
+}
 
 // StageBulkDir copies every RFile referenced by manifest from src (the
 // export destination backend, where Engine.ExportRFiles /
@@ -44,6 +59,13 @@ var (
 // bulkDir reproduces byte-identical files and an identical loadmap.json —
 // safe to retry.
 //
+// Calls in this process that target the same recognized backend location and
+// bulkDir are serialized. Promote holds that ownership through BulkImport, so another
+// local promotion cannot overwrite verified files between publication of
+// loadmap.json and submission of the import. Distributed callers still must
+// assign one immutable bulkDir per promotion; storage.Backend has no portable
+// conditional-create primitive from which to build a cross-process lease.
+//
 // Basenames must be unique across the whole manifest once flattened; a
 // collision is reported as an error before any copy happens, rather than
 // silently overwriting one file with another (see package docs for the
@@ -51,15 +73,93 @@ var (
 //
 // bulkDir itself is preflight-validated before any read or write: empty,
 // whitespace-padded, or backend-root destinations fail before staging can
-// mutate dst. BuildLoadMapping likewise rejects any split-bearing or
-// multi-tablet manifest before staging starts: this slice stages only
-// unambiguous single-tablet exports.
+// mutate dst, and dst itself must implement storage.WritableBackend (see
+// validateDestinationWritable) or StageBulkDir fails before its first
+// storage.Copy call, rather than deep inside it. BuildLoadMapping likewise
+// rejects any manifest whose
+// declared tablet chain is malformed (gaps, overlaps, duplicate or
+// out-of-range indexes, missing or misplaced boundaries) before staging
+// starts.
+//
+// StageBulkDir accepts multi-tablet manifests, but — unlike Promote — it
+// never talks to Accumulo and cannot reconcile the destination's actual
+// tablet splits. The widened KeyExtents BuildLoadMapping computes for a
+// multi-tablet manifest are only guaranteed to pass Accumulo's own
+// server-side load-mapping validation if the destination already has
+// splits at RequiredDestinationSplits' reported rows; a caller invoking
+// StageBulkDir directly for a multi-tablet manifest, bypassing Promote's
+// orchestration, is responsible for ensuring that beforehand, or the
+// eventual BulkImport call will fail closed (not silently) rather than
+// stage or import anything incorrectly.
 //
 // The manifest is verified (engine.VerifyRFileExport: every RFile exists at
 // src and matches its recorded size/SHA256) before anything is copied, so a
 // truncated, corrupted, or stale export manifest fails fast here rather
 // than silently staging incomplete or mismatched data for Accumulo to bulk
-// import.
+// import. That whole-manifest verification happens once, before the copy
+// loop starts, and so cannot by itself catch a source file that changes
+// *during* the loop -- for example a later file mutated while an earlier
+// one is still being copied, or the same file mutated in the brief window
+// between this check reading it and storage.Copy separately opening it
+// moments later. Closing that window would require re-verifying every
+// file again immediately before its own copy, which is exactly as
+// expensive as just verifying after copying and additionally cannot
+// detect corruption introduced by the copy path itself (see the next
+// paragraph), so StageBulkDir instead verifies each file's *destination*
+// object right after it is written.
+//
+// Concretely: immediately after each file's storage.Copy returns,
+// StageBulkDir re-opens and re-hashes the object it just wrote at dst and
+// compares that against the manifest's recorded size/SHA256 for that
+// file, before continuing to the next file or writing loadmap.json. This
+// is deliberately a check of the object actually sitting at dst, not a
+// second read of src: it catches a source mutated after the up-front
+// VerifyRFileExport pass but before (or during) its own copy, and it
+// additionally catches corruption introduced by the copy/backend path
+// itself (storage.Copy's own doc comment notes that some WritableBackend
+// implementations buffer and upload on Close, so a copy can still fail or
+// corrupt data after every prior Write appeared to succeed). Like the
+// cancellation case below, a mismatch here is reported and staging stops,
+// but the offending file's already-written (incorrect) bytes are not
+// rolled back -- StageBulkDir is not atomic across a multi-file manifest
+// in either failure mode, and loadmap.json is only ever written after
+// every file has both copied and re-verified successfully, so a caller
+// that only trusts a bulkDir with a present, successfully-written
+// loadmap.json is never exposed to a manifest describing unverified
+// bytes.
+//
+// That guarantee is about loadmap.json written by *this* call. A bulkDir
+// can also already hold a loadmap.json left behind by an earlier,
+// different StageBulkDir call -- for example a retry after a prior
+// attempt succeeded, or an operator re-running staging against the same
+// bulkDir. If this call's own copy loop then fails partway (storage.Copy
+// itself failing, or the post-copy verifyStagedRFile check below
+// rejecting a mismatched destination object), StageBulkDir returns an
+// error without ever reaching WriteLoadMapping -- but without further
+// handling, that OLD loadmap.json would be left completely untouched,
+// still claiming the directory is complete and correct even though one
+// of its RFiles was just overwritten with bytes that failed
+// verification. StageBulkDir closes that window by invalidating any
+// pre-existing loadmap.json immediately before this loop starts
+// mutating any RFile; see invalidateExistingLoadMapping's own doc
+// comment for the exact mechanism. A bulkDir with no pre-existing
+// loadmap.json -- the common, fresh-destination case this whole
+// function is primarily documented for above -- is unaffected by this:
+// there is nothing to invalidate, and no extra write occurs.
+//
+// This means a full Promote call over a multi-tablet manifest reads and
+// hashes every RFile up to three times: once in stagingPreflight (before
+// AddTableSplits), once more in StageBulkDir's own preflight above (after
+// AddTableSplits/ListTableSplits, before any dst write), and once again
+// per file immediately after it is copied (reading dst, not src). Each
+// pass closes a different, non-overlapping window and none of the three
+// is redundant with the others: removing either upfront pass would allow
+// an already-corrupt manifest to still cause partial writes to dst
+// before being caught; removing the post-copy pass would leave the
+// per-file copy-time window this paragraph describes wide open. The
+// repeated hashing is a deliberate correctness-over-efficiency tradeoff
+// for a manager-authoritative promotion path, consistent with the same
+// tradeoff stagingPreflight's own doc comment already describes.
 //
 // Every write target is also preflighted before any copy starts: every
 // flattened RFile destination plus loadmap.json is compared against
@@ -98,9 +198,39 @@ func StageBulkDir(
 	if err := validateBulkDirOnBackend(dst, bulkDir); err != nil {
 		return nil, err
 	}
-	if _, _, err := resolveManifestTablet(manifest); err != nil {
+	if err := validateDestinationWritable(dst); err != nil {
 		return nil, err
 	}
+	release, err := acquireStageBulkDir(ctx, dst, bulkDir)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	return stageBulkDirLocked(ctx, src, manifest, dst, bulkDir)
+}
+
+func stageBulkDirLocked(
+	ctx context.Context,
+	src storage.Backend,
+	manifest *engine.RFileExportManifest,
+	dst storage.Backend,
+	bulkDir string,
+) (LoadMapping, error) {
+	if _, _, err := resolveManifestTablets(manifest); err != nil {
+		return nil, err
+	}
+	// Verified again here even though Promote's stagingPreflight already
+	// verified this same manifest once, before AddTableSplits: an
+	// arbitrary amount of time, including a real manager round-trip for
+	// AddTableSplits/ListTableSplits, elapses between that preflight and
+	// this call, and src is not guaranteed immutable across it (a local
+	// path or an object-store key can be overwritten in place). Skipping
+	// this second check would let a source object replaced during that
+	// window be staged and bulk-imported without ever being checked
+	// against the manifest again -- see stagingPreflight's own doc
+	// comment for the corresponding pre-AddTableSplits half of this, and
+	// TestPromoteRejectsSourceMutatedDuringAddTableSplits for the
+	// regression test proving this specific window is closed.
 	if err := engine.VerifyRFileExport(ctx, src, manifest); err != nil {
 		return nil, fmt.Errorf("promotion: stage: %w", err)
 	}
@@ -122,16 +252,237 @@ func StageBulkDir(
 	if err := checkNoStagingAliases(src, dst, flatNames, bulkDir); err != nil {
 		return nil, err
 	}
+	// Neutralize any loadmap.json already sitting in bulkDir from an
+	// earlier, unrelated StageBulkDir call before this loop starts
+	// mutating RFiles. Without this, a retry against a bulkDir that
+	// already holds a valid loadmap.json from a prior successful stage
+	// could fail partway through replacing one of its RFiles -- for
+	// example on the verifyStagedRFile mismatch below -- leaving that
+	// RFile's bytes unverified or wrong while the OLD loadmap.json,
+	// never touched by this failed attempt, still asserts the directory
+	// is complete and correct by the very marker rule the rest of this
+	// function relies on. See invalidateExistingLoadMapping's own doc
+	// comment for the mechanism and TestStageBulkDirInvalidatesStaleLoadMappingOnFailedRetry
+	// for the regression test.
+	if err := invalidateExistingLoadMapping(ctx, dst, bulkDir); err != nil {
+		return nil, err
+	}
 	for _, rf := range stageManifest.RFiles {
 		dstPath := joinBulkPath(dst, bulkDir, flatNames[rf.DestinationPath])
 		if _, err := storage.Copy(ctx, src, rf.DestinationPath, dst, dstPath); err != nil {
 			return nil, fmt.Errorf("promotion: stage %s: %w", rf.DestinationPath, err)
+		}
+		// Re-verify what actually landed at dst, not what src reported
+		// before the copy: this closes the copy-time window described
+		// in StageBulkDir's own doc comment above, where a source file
+		// (or a later file, while an earlier one is still copying) can
+		// change after the whole-manifest VerifyRFileExport preflight
+		// above but before (or during) its own storage.Copy, and also
+		// catches corruption introduced by the copy/backend path
+		// itself. A mismatch fails closed here, before any further file
+		// is copied and before loadmap.json is written, but -- like the
+		// cancellation case -- does not roll back this file's own
+		// already-written (incorrect) bytes.
+		if err := verifyStagedRFile(ctx, dst, dstPath, rf.Size, rf.SHA256); err != nil {
+			return nil, fmt.Errorf("promotion: stage %s: verify staged copy: %w", rf.DestinationPath, err)
 		}
 	}
 	if err := WriteLoadMapping(ctx, dst, bulkDir, mapping); err != nil {
 		return nil, err
 	}
 	return mapping, nil
+}
+
+func acquireStageBulkDir(ctx context.Context, dst storage.Backend, bulkDir string) (func(), error) {
+	lockTarget := joinBulkPath(dst, bulkDir, bulkLoadMappingFile)
+	key := canonicalPathBackendKey(dst) + "\x00" + lockTarget
+	unwrapped := unwrapBackend(dst)
+	if _, ok := unwrapped.(*local.Backend); ok {
+		cache := newPathIdentityCache(1)
+		key = fmt.Sprintf("%T", unwrapped) + "\x00" + cache.publicationKey(lockTarget)
+	} else {
+		ref := newStagePathRef(dst, lockTarget)
+		if canonical, ok := canonicalBackendPath(ref); ok {
+			key = stageLockBackendKey(dst) + "\x00" + canonical
+		} else if _, ok := unwrapped.(*hdfs.Backend); ok {
+			key = fmt.Sprintf("%T", unwrapped) + "\x00" + path.Clean(strings.ReplaceAll(lockTarget, `\`, "/"))
+		}
+	}
+
+	stageBulkDirLocks.Lock()
+	entry := stageBulkDirLocks.entries[key]
+	if entry == nil {
+		entry = &stageBulkDirLock{ready: make(chan struct{}, 1)}
+		entry.ready <- struct{}{}
+		stageBulkDirLocks.entries[key] = entry
+	}
+
+	entry.refs++
+	stageBulkDirLocks.Unlock()
+
+	select {
+	case <-ctx.Done():
+		releaseStageBulkDirRef(key, entry, false)
+		return nil, ctx.Err()
+	case <-entry.ready:
+		return func() { releaseStageBulkDirRef(key, entry, true) }, nil
+	}
+}
+
+func stageLockBackendKey(backend storage.Backend) string {
+	unwrapped := unwrapBackend(backend)
+	switch unwrapped.(type) {
+	case *local.Backend, *hdfs.Backend, *s3.Backend, *gcs.Backend, *azure.Backend:
+		return fmt.Sprintf("%T", unwrapped)
+	default:
+		return canonicalPathBackendKey(unwrapped)
+	}
+}
+
+func releaseStageBulkDirRef(key string, entry *stageBulkDirLock, owned bool) {
+	if owned {
+		entry.ready <- struct{}{}
+	}
+	stageBulkDirLocks.Lock()
+	entry.refs--
+	if entry.refs == 0 {
+		delete(stageBulkDirLocks.entries, key)
+	}
+	stageBulkDirLocks.Unlock()
+}
+
+// invalidateExistingLoadMapping detects a loadmap.json already present at
+// bulkDir/loadmap.json on dst -- left behind by an earlier, unrelated
+// StageBulkDir call against the same bulkDir -- and neutralizes it before
+// StageBulkDir's copy loop starts overwriting any RFile.
+//
+// Without this, retrying StageBulkDir against a bulkDir that already
+// holds a valid loadmap.json from a prior successful stage is unsafe: if
+// this retry's copy loop fails partway (for example storage.Copy
+// succeeds but verifyStagedRFile then rejects a mismatched destination
+// object), StageBulkDir returns before ever reaching WriteLoadMapping,
+// but the OLD loadmap.json -- written by the earlier, different call --
+// is never touched by this failed one. The directory is left containing
+// at least one RFile whose bytes were just replaced with something that
+// failed verification, sitting next to a loadmap.json that still, by the
+// documented "present means complete" marker rule, claims the directory
+// is a valid, verified bulk mapping. A caller invoking StageBulkDir
+// standalone and trusting that rule without separately checking this
+// call's returned error, or a real Accumulo TABLE_BULK_IMPORT2 FATE
+// operation reading loadmap.json directly off disk, would have no way to
+// tell the directory is now inconsistent.
+//
+// A bulkDir with no pre-existing loadmap.json -- the common case: a
+// fresh destination, or a prior attempt that itself failed before ever
+// reaching WriteLoadMapping -- is left untouched; there is nothing to
+// invalidate, and this adds no write. When a pre-existing loadmap.json
+// is found, dst.Remove deletes it outright if dst implements
+// storage.Remover (local, memory, hdfs); otherwise -- object-store
+// backends such as s3/gcs/azure that expose no delete capability -- it
+// is overwritten in place with a payload that is deliberately not valid
+// JSON, so any reader (ReadLoadMapping, or a real Accumulo bulk v2
+// client parsing loadmap.json directly) fails closed on it instead of
+// silently trusting a mapping that may no longer match this directory's
+// in-flight contents. Either way, the directory only regains a loadmap.json
+// that can parse as a valid mapping once this call's own copy+verify loop
+// below succeeds end-to-end and reaches WriteLoadMapping, exactly as
+// WriteLoadMapping already guarantees for a fresh bulkDir.
+func invalidateExistingLoadMapping(ctx context.Context, dst storage.Backend, bulkDir string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	path := joinBulkPath(dst, bulkDir, bulkLoadMappingFile)
+	existing, err := dst.Open(ctx, path)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			return nil
+		}
+		return fmt.Errorf("promotion: check existing load mapping %s: %w", path, err)
+	}
+	existing.Close()
+	if remover, ok := dst.(storage.Remover); ok {
+		if err := remover.Remove(ctx, path); err != nil {
+			return fmt.Errorf("promotion: invalidate stale load mapping %s: %w", path, err)
+		}
+		return nil
+	}
+	placeholder := []byte("promotion: stage in progress; superseding a prior load mapping, not yet valid\n")
+	if err := storage.WriteAll(ctx, dst, path, placeholder); err != nil {
+		return fmt.Errorf("promotion: invalidate stale load mapping %s: %w", path, err)
+	}
+	return nil
+}
+
+// verifyStagedRFile re-opens and re-hashes the object just written at
+// dstPath on dst and compares it against the manifest's recorded size and
+// SHA256 for that RFile. It intentionally checks the destination object
+// that will actually be bulk-imported, not a second read of the source,
+// so it also catches corruption introduced by the copy/backend path
+// itself (for example a WritableBackend that buffers and uploads on
+// Close, per storage.Copy's own doc comment, failing or corrupting data
+// after every prior Write appeared to succeed). The read-and-hash loop
+// mirrors engine's own unexported hashObject helper; it is duplicated
+// here in small form rather than exported from engine or added to
+// storage's public surface, since this is its only call site.
+//
+// ctx is polled before Open and both before and immediately after every
+// ReadAt, mirroring storage.Copy's own polling pattern, so cancellation
+// during a large RFile's re-hash is observed within one 256KB chunk
+// rather than only after the whole file has been read. As with
+// storage.Copy, any ctx.Err() observed here still returns the
+// cancellation itself as the failure, even on the loop's last,
+// otherwise-successful read, rather than racing to decide whether the
+// read "finished in time" -- keeping this function's cancellation
+// semantics identical to Copy's.
+func verifyStagedRFile(ctx context.Context, dst storage.Backend, dstPath string, wantSize int64, wantSHA256 string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	f, err := dst.Open(ctx, dstPath)
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return fmt.Errorf("open staged copy %s: %w", dstPath, errors.Join(err, ctxErr))
+		}
+		return fmt.Errorf("open staged copy %s: %w", dstPath, err)
+	}
+	defer f.Close()
+	h := sha256.New()
+	buf := make([]byte, 256*1024)
+	var off int64
+	for off < f.Size() {
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("read staged copy %s: %w", dstPath, err)
+		}
+		want := int64(len(buf))
+		if off+want > f.Size() {
+			want = f.Size() - off
+		}
+		n, rerr := f.ReadAt(buf[:want], off)
+		if n > 0 {
+			_, _ = h.Write(buf[:n])
+			off += int64(n)
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			if rerr != nil && !errors.Is(rerr, io.EOF) {
+				return fmt.Errorf("read staged copy %s: %w", dstPath, errors.Join(rerr, ctxErr))
+			}
+			return fmt.Errorf("read staged copy %s: %w", dstPath, ctxErr)
+		}
+		if rerr != nil {
+			if errors.Is(rerr, io.EOF) {
+				break
+			}
+			return fmt.Errorf("read staged copy %s: %w", dstPath, rerr)
+		}
+	}
+	if off != wantSize {
+		return fmt.Errorf("staged copy %s: size %d, want %d (source may have changed after the pre-copy manifest verification, or the copy path may have corrupted it)", dstPath, off, wantSize)
+	}
+	sum := hex.EncodeToString(h.Sum(nil))
+	if sum != wantSHA256 {
+		return fmt.Errorf("staged copy %s: sha256 %s, want %s (source may have changed after the pre-copy manifest verification, or the copy path may have corrupted it)", dstPath, sum, wantSHA256)
+	}
+	return nil
 }
 
 // checkNoStagingAliases rejects the whole stage before any copy starts
@@ -220,6 +571,73 @@ func checkNoStagingAliases(src, dst storage.Backend, flatNames map[string]string
 		}
 	}
 	return nil
+}
+
+// stagingPreflight runs the same non-mutating, storage-probing
+// validation StageBulkDir itself performs before it copies a single
+// byte or writes loadmap.json, in the same order StageBulkDir runs it:
+// verifying every RFile against its recorded size/SHA256
+// (engine.VerifyRFileExport), deduping source aliases
+// (dedupeStageSources), flattening every RFile to its bulk-directory
+// basename (flattenNames), and checking the flattened write targets
+// against src and dst for path aliases (checkNoStagingAliases).
+//
+// Promote calls this, and discards the result, immediately after its
+// own BuildLoadMapping preflight and before AddTableSplits ever runs.
+// Without it, a manifest that is only invalid at this specific layer —
+// a missing file, a size/hash mismatch against the manifest, a
+// cross-tablet basename collision, an invalid/non-leaf flattened
+// basename, or a source/destination path alias — would only be caught
+// later, inside StageBulkDir's own call to these same four functions,
+// by which point AddTableSplits would already have reconciled the
+// destination's splits (see Promote's own doc comment, which explains
+// why the BuildLoadMapping preflight exists for the identical reason).
+//
+// dedupeStageSources, flattenNames, and checkNoStagingAliases are cheap
+// to recompute inside StageBulkDir and never observe a different
+// destination state: dedupeStageSources and checkNoStagingAliases only
+// probe src/dst path identity (in-memory comparisons for remote/
+// object-store backends, cached local os.Stat calls for local ones —
+// see their own doc comments), and flattenNames is a pure function of
+// the RFile list alone. This mirrors BuildLoadMapping's own preflight,
+// which Promote also calls once early and StageBulkDir recomputes
+// again further on, for the same reason.
+//
+// engine.VerifyRFileExport is different: it streams and hashes every
+// RFile's actual bytes, so it is not cheap to recompute the way the
+// other three checks are -- but unlike them, StageBulkDir is still
+// deliberately left to run it again on its own, rather than having
+// Promote skip it there. AddTableSplits and ListTableSplits, which run
+// between this preflight and StageBulkDir, are a real manager
+// round-trip taking arbitrary time, and src is not guaranteed
+// immutable across it: a local path or an object-store key can be
+// overwritten in place while that call is in flight. Verifying only
+// here and trusting it to still hold by the time StageBulkDir copies
+// would leave exactly that window unchecked -- a source object
+// replaced during AddTableSplits/ListTableSplits would be staged and
+// bulk-imported without ever being verified against the manifest it
+// actually matches at copy time. So this preflight's verification and
+// StageBulkDir's own are deliberately redundant in the common case and
+// each close a different, non-overlapping window: this one guards
+// AddTableSplits against ever mutating the destination's splits for an
+// export that was already corrupt before either call started;
+// StageBulkDir's guards the copy itself against one that became
+// corrupt (or was replaced) during the calls in between. See
+// TestPromoteRejectsSourceMutatedDuringAddTableSplits for the
+// regression test proving the latter window specifically.
+func stagingPreflight(ctx context.Context, src storage.Backend, manifest *engine.RFileExportManifest, dst storage.Backend, bulkDir string) error {
+	if err := engine.VerifyRFileExport(ctx, src, manifest); err != nil {
+		return fmt.Errorf("promotion: stage: %w", err)
+	}
+	stageRFiles, err := dedupeStageSources(src, manifest.RFiles)
+	if err != nil {
+		return err
+	}
+	flatNames, err := flattenNames(stageRFiles)
+	if err != nil {
+		return err
+	}
+	return checkNoStagingAliases(src, dst, flatNames, bulkDir)
 }
 
 func validateStagingWriteTarget(dst storage.Backend, target stageWriteTarget) error {

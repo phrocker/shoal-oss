@@ -5,6 +5,7 @@ import (
 	"net/url"
 	pathpkg "path"
 	"path/filepath"
+	"reflect"
 	"strings"
 
 	"github.com/phrocker/shoal/accumulo"
@@ -15,7 +16,10 @@ func validatePromotionDestination(dst storage.Backend, tableName, bulkDir string
 	if err := validateTableName(tableName); err != nil {
 		return err
 	}
-	return validateBulkDirOnBackend(dst, bulkDir)
+	if err := validateBulkDirOnBackend(dst, bulkDir); err != nil {
+		return err
+	}
+	return validateDestinationWritable(dst)
 }
 
 func validateTableName(tableName string) error {
@@ -45,6 +49,48 @@ func validateBulkDirOnBackend(dst storage.Backend, bulkDir string) error {
 		return fmt.Errorf("%w: backend root %q", accumulo.ErrInvalidBulkDir, bulkDir)
 	}
 	return nil
+}
+
+// validateDestinationWritable confirms dst implements
+// storage.WritableBackend before any Accumulo-facing step runs. A nil
+// dst is rejected the same way as any other non-writable backend: a
+// nil storage.Backend interface value implements no methods at all, and a
+// typed-nil pointer can retain the WritableBackend method set while still
+// panicking on use. Both forms return storage.ErrReadOnly rather than being
+// treated as usable destinations.
+// (validateBulkDir's own nil dst argument is unrelated: it is a
+// deliberate placeholder passed only to validateBulkDirOnBackend/
+// isBackendRootOnBackend for callers that have no specific backend to
+// scope path checks to, and never reaches this function.)
+//
+// Without this, a multi-tablet manifest against a read-only dst would
+// let Promote's conn.AddTableSplitsForTable mutate the real destination
+// table's splits before the first storage.Copy call inside
+// StageBulkDir ever discovers storage.ErrReadOnly -- an Accumulo-facing
+// mutation this package otherwise takes care never to make before
+// every check that can be made without one has already passed (see
+// Promote's own doc comment). StageBulkDir also calls this directly, so
+// a caller invoking it without going through Promote gets the same
+// early, clear failure instead of one buried inside its first
+// storage.Copy call.
+func validateDestinationWritable(dst storage.Backend) error {
+	if _, ok := dst.(storage.WritableBackend); !ok || isNilBackend(dst) {
+		return fmt.Errorf("%w: destination backend cannot be written to", storage.ErrReadOnly)
+	}
+	return nil
+}
+
+func isNilBackend(dst storage.Backend) bool {
+	if dst == nil {
+		return true
+	}
+	value := reflect.ValueOf(dst)
+	switch value.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+		return value.IsNil()
+	default:
+		return false
+	}
 }
 
 func isBackendRoot(bulkDir string) bool {

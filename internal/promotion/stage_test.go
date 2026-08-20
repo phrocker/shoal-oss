@@ -6,13 +6,18 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
 	"sort"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	s3sdk "github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/phrocker/shoal/accumulo"
 	"github.com/phrocker/shoal/internal/engine"
 	shstorage "github.com/phrocker/shoal/internal/storage"
@@ -32,6 +37,59 @@ type schemeAwareBackend struct {
 
 func (b schemeAwareBackend) BackendPathSchemes() []string {
 	return b.schemes
+}
+
+// readOnlyBackend wraps a storage.Backend but implements only Open,
+// deliberately not Create, so it satisfies storage.Backend but fails a
+// storage.WritableBackend type-assertion -- mirroring
+// internal/storage/storage_test.go's own type of the same name (kept
+// separate here since test doubles are unexported and this package
+// cannot import that one's).
+type readOnlyBackend struct{ inner shstorage.Backend }
+
+func (r readOnlyBackend) Open(ctx context.Context, path string) (shstorage.File, error) {
+	return r.inner.Open(ctx, path)
+}
+
+type blockingOpenBackend struct {
+	*memory.Backend
+	once    sync.Once
+	started chan struct{}
+	release chan struct{}
+}
+
+func (b *blockingOpenBackend) Open(ctx context.Context, path string) (shstorage.File, error) {
+	b.once.Do(func() {
+		close(b.started)
+		select {
+		case <-b.release:
+		case <-ctx.Done():
+		}
+	})
+	return b.Backend.Open(ctx, path)
+}
+
+// TestStageBulkDirRejectsReadOnlyDestinationBeforeAnyRead proves
+// validateDestinationWritable runs before StageBulkDir ever opens a
+// single source file: the manifest here references src paths that do
+// not exist at all, so if the writability check ran after (or was
+// skipped and the read-only failure only surfaced later, inside
+// storage.Copy) this test would instead observe a "source not found"
+// style error from engine.VerifyRFileExport, not shstorage.ErrReadOnly.
+func TestStageBulkDirRejectsReadOnlyDestinationBeforeAnyRead(t *testing.T) {
+	src := memory.New() // deliberately empty: no RFile referenced below exists.
+	manifest := &engine.RFileExportManifest{
+		Version:     engine.RFileExportManifestVersion,
+		SourceTable: "events",
+		Tablets:     []engine.RFileExportTablet{{Index: 0}},
+		RFiles: []engine.RFileExportFile{
+			{TabletIndex: 0, DestinationPath: "export/events/t-0000/F0001.rf", Size: 4, SHA256: "3a6eb0790f39ac87c94f3856b2dd2c5d110e6811602261a9a923d3bb23adc8b7"},
+		},
+	}
+	dst := readOnlyBackend{inner: memory.New()}
+	if _, err := StageBulkDir(context.Background(), src, manifest, dst, "hdfs://nn/bulk/events-1"); !errors.Is(err, shstorage.ErrReadOnly) {
+		t.Fatalf("StageBulkDir with a read-only destination = %v, want %v", err, shstorage.ErrReadOnly)
+	}
 }
 
 func TestStageBulkDirFlattensCopiesAndWritesLoadMapping(t *testing.T) {
@@ -93,6 +151,204 @@ func TestStageBulkDirFlattensCopiesAndWritesLoadMapping(t *testing.T) {
 	}
 	if len(onDisk) != len(mapping) {
 		t.Fatalf("on-disk mapping entries = %d, want %d", len(onDisk), len(mapping))
+	}
+}
+
+func TestStageBulkDirSerializesConcurrentWritersForSameDestination(t *testing.T) {
+	const (
+		srcPath = "export/events/t-0000/F0001.rf"
+		bulkDir = "/bulk/events-1"
+	)
+	makeManifest := func(data []byte) *engine.RFileExportManifest {
+		sum := sha256.Sum256(data)
+		return &engine.RFileExportManifest{
+			Version:     engine.RFileExportManifestVersion,
+			SourceTable: "events",
+			Tablets:     []engine.RFileExportTablet{{Index: 0}},
+			RFiles: []engine.RFileExportFile{{
+				TabletIndex:     0,
+				DestinationPath: srcPath,
+				Size:            int64(len(data)),
+				SHA256:          hex.EncodeToString(sum[:]),
+			}},
+		}
+	}
+
+	firstBytes, secondBytes := []byte("first-stage"), []byte("second-stage")
+	firstMemory := memory.New()
+	firstMemory.Put(srcPath, firstBytes)
+	first := &blockingOpenBackend{
+		Backend: firstMemory,
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	second := memory.New()
+	second.Put(srcPath, secondBytes)
+	dst := memory.New()
+
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := StageBulkDir(context.Background(), first, makeManifest(firstBytes), dst, bulkDir)
+		firstDone <- err
+	}()
+	<-first.started
+
+	secondDone := make(chan error, 1)
+	go func() {
+		_, err := StageBulkDir(context.Background(), second, makeManifest(secondBytes), dst, bulkDir)
+		secondDone <- err
+	}()
+	select {
+	case err := <-secondDone:
+		t.Fatalf("second StageBulkDir completed while first still owned bulkDir: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(first.release)
+	if err := <-firstDone; err != nil {
+		t.Fatalf("first StageBulkDir: %v", err)
+	}
+	if err := <-secondDone; err != nil {
+		t.Fatalf("second StageBulkDir: %v", err)
+	}
+}
+
+func TestStageBulkDirSerializesAliasedLocalDestinationsAcrossBackendInstances(t *testing.T) {
+	root := t.TempDir()
+	t.Chdir(root)
+	absoluteBulkDir := filepath.Join(root, "bulk")
+	relativeBulkDir := "bulk"
+	const srcPath = "export/events/t-0000/F0001.rf"
+	data := []byte("stage-data")
+	sum := sha256.Sum256(data)
+	manifest := &engine.RFileExportManifest{
+		Version:     engine.RFileExportManifestVersion,
+		SourceTable: "events",
+		Tablets:     []engine.RFileExportTablet{{Index: 0}},
+		RFiles: []engine.RFileExportFile{{
+			TabletIndex:     0,
+			DestinationPath: srcPath,
+			Size:            int64(len(data)),
+			SHA256:          hex.EncodeToString(sum[:]),
+		}},
+	}
+
+	firstMemory := memory.New()
+	firstMemory.Put(srcPath, data)
+	first := &blockingOpenBackend{
+		Backend: firstMemory,
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	second := memory.New()
+	second.Put(srcPath, data)
+
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := StageBulkDir(context.Background(), first, manifest, local.New(), absoluteBulkDir)
+		firstDone <- err
+	}()
+	<-first.started
+
+	secondDone := make(chan error, 1)
+	go func() {
+		_, err := StageBulkDir(context.Background(), second, manifest, local.New(), relativeBulkDir)
+		secondDone <- err
+	}()
+	select {
+	case err := <-secondDone:
+		t.Fatalf("aliased local StageBulkDir completed while first still owned destination: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(first.release)
+	if err := <-firstDone; err != nil {
+		t.Fatalf("first StageBulkDir: %v", err)
+	}
+	if err := <-secondDone; err != nil {
+		t.Fatalf("second StageBulkDir: %v", err)
+	}
+}
+
+func TestAcquireStageBulkDirSerializesRelativeHDFSPathsAcrossBackendInstances(t *testing.T) {
+	firstBackend := newTestHDFSBackend(t, "hdfs://nn:8020")
+	secondBackend := newTestHDFSBackend(t, "hdfs://nn:8020")
+
+	releaseFirst, err := acquireStageBulkDir(context.Background(), firstBackend, "bulk/events-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	secondAcquired := make(chan func(), 1)
+	secondErr := make(chan error, 1)
+	go func() {
+		release, err := acquireStageBulkDir(context.Background(), secondBackend, "./bulk/events-1")
+		if err != nil {
+			secondErr <- err
+			return
+		}
+		secondAcquired <- release
+	}()
+
+	select {
+	case err := <-secondErr:
+		t.Fatalf("second acquire failed: %v", err)
+	case release := <-secondAcquired:
+		release()
+		t.Fatal("relative HDFS alias acquired while first backend instance still owned destination")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	releaseFirst()
+	select {
+	case err := <-secondErr:
+		t.Fatalf("second acquire after release failed: %v", err)
+	case release := <-secondAcquired:
+		release()
+	case <-time.After(time.Second):
+		t.Fatal("second relative HDFS acquire did not proceed after release")
+	}
+}
+
+func TestAcquireStageBulkDirSerializesEquivalentS3DirectorySpellings(t *testing.T) {
+	newBackend := func() *s3.Backend {
+		backend, err := s3.New(
+			context.Background(),
+			s3.WithClient(s3sdk.NewFromConfig(aws.Config{Region: "us-east-1"})),
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return backend
+	}
+
+	firstBackend, secondBackend := newBackend(), newBackend()
+	releaseFirst, err := acquireStageBulkDir(context.Background(), firstBackend, "s3://bucket/bulk")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	secondAcquired := make(chan func(), 1)
+	go func() {
+		release, err := acquireStageBulkDir(context.Background(), secondBackend, "s3://bucket/bulk/")
+		if err != nil {
+			return
+		}
+		secondAcquired <- release
+	}()
+	select {
+	case release := <-secondAcquired:
+		release()
+		t.Fatal("equivalent S3 directory spelling acquired while first still owned destination")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	releaseFirst()
+	select {
+	case release := <-secondAcquired:
+		release()
+	case <-time.After(time.Second):
+		t.Fatal("equivalent S3 directory spelling did not acquire after release")
 	}
 }
 
@@ -578,18 +834,501 @@ func TestStageBulkDirRejectsUndeclaredTabletIndexBeforeCopying(t *testing.T) {
 	}
 }
 
-func TestStageBulkDirRejectsSplitManifestBeforeCopying(t *testing.T) {
+func TestStageBulkDirAcceptsMultiTabletManifest(t *testing.T) {
 	src := memory.New()
 	src.Put("events/t-0000/F0001.rf", []byte("a"))
 	src.Put("events/t-0001/F0002.rf", []byte("b"))
+	manifest := twoTabletManifest()
+	manifest.RFiles[0].DestinationPath = "events/t-0000/F0001.rf"
+	manifest.RFiles[0].Size = 1
+	manifest.RFiles[0].SHA256 = "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb"
+	manifest.RFiles[1].DestinationPath = "events/t-0001/F0002.rf"
+	manifest.RFiles[1].Size = 1
+	manifest.RFiles[1].SHA256 = "3e23e8160039594a33894f6564e1b1348bbd7a0088d42c4acb73eeaed59c009d"
 
 	dst := memory.New()
 	ctx := context.Background()
-	if _, err := StageBulkDir(ctx, src, splitManifest(), dst, "/bulk/events-1"); err == nil {
-		t.Fatal("StageBulkDir(split manifest) = nil error, want error")
+	mapping, err := StageBulkDir(ctx, src, manifest, dst, "hdfs://nn/bulk/events-1")
+	if err != nil {
+		t.Fatalf("StageBulkDir(multi-tablet manifest) = %v, want success", err)
+	}
+	if len(mapping) != 2 {
+		t.Fatalf("mapping entries = %d, want 2", len(mapping))
+	}
+	if mapping[0].Tablet.EndRow == nil || string(mapping[0].Tablet.EndRow) != "g" || mapping[0].Tablet.PrevEndRow != nil {
+		t.Fatalf("mapping[0].Tablet = %#v, want (nil, %q]", mapping[0].Tablet, "g")
+	}
+	if mapping[1].Tablet.EndRow != nil || mapping[1].Tablet.PrevEndRow != nil {
+		t.Fatalf("mapping[1].Tablet = %#v, want fully unbounded (2-tablet collapse)", mapping[1].Tablet)
+	}
+	for _, want := range []string{
+		"hdfs://nn/bulk/events-1/F0001.rf",
+		"hdfs://nn/bulk/events-1/F0002.rf",
+		"hdfs://nn/bulk/events-1/loadmap.json",
+	} {
+		f, err := dst.Open(ctx, want)
+		if err != nil {
+			t.Fatalf("expected staged path %s: %v", want, err)
+		}
+		f.Close()
+	}
+}
+
+// TestStageBulkDirRejectsCrossTabletBasenameCollisionBeforeCopying proves
+// the flatten-collision check operates across the whole manifest, not
+// per-tablet: two RFiles that belong to *different* tablets but share a
+// basename once flattened into the single bulk directory must still be
+// rejected before any bytes are copied. flattenNames operates on
+// stageManifest.RFiles as a whole (every tablet's files together), so
+// this is the same code path as the existing single-tablet collision
+// test; this test exists to pin that cross-tablet behavior explicitly
+// now that multi-tablet manifests are accepted.
+func TestStageBulkDirRejectsCrossTabletBasenameCollisionBeforeCopying(t *testing.T) {
+	src := memory.New()
+	src.Put("events/t-0000/F0001.rf", []byte("a"))
+	src.Put("events/t-0001/F0001.rf", []byte("b"))
+
+	manifest := twoTabletManifest()
+	manifest.RFiles[0].DestinationPath = "events/t-0000/F0001.rf"
+	manifest.RFiles[1].DestinationPath = "events/t-0001/F0001.rf" // same basename as tablet 0's file
+
+	dst := memory.New()
+	ctx := context.Background()
+	if _, err := StageBulkDir(ctx, src, manifest, dst, "hdfs://nn/bulk/events-1"); err == nil {
+		t.Fatal("StageBulkDir with cross-tablet basename collision = nil error, want error")
 	}
 	if got := dst.Keys(); len(got) != 0 {
-		t.Fatalf("StageBulkDir wrote %v on split-manifest rejection, want no partial writes", got)
+		t.Fatalf("StageBulkDir wrote %v on cross-tablet collision error, want no partial writes", got)
+	}
+}
+
+// cancelingBackend wraps a *memory.Backend and, the instant its Nth Create
+// call (1-indexed, counted across the wrapper's whole lifetime) is
+// issued, invokes cancel before delegating to the real Create. storage.Copy
+// checks ctx.Err() again immediately after Create returns and before any
+// bytes are transferred, so this reproduces "cancellation observed
+// mid-operation, after the destination writer was already opened" without
+// needing a real slow backend or a race-prone timer.
+type cancelingBackend struct {
+	*memory.Backend
+	cancel   context.CancelFunc
+	cancelAt int32
+	creates  int32
+}
+
+func (b *cancelingBackend) Create(ctx context.Context, path string) (shstorage.Writer, error) {
+	n := atomic.AddInt32(&b.creates, 1)
+	if n == b.cancelAt {
+		b.cancel()
+	}
+	return b.Backend.Create(ctx, path)
+}
+
+// TestStageBulkDirCancellationLeavesNoPartialObjectAndRetrySucceeds covers
+// three of the honesty-critical properties for multi-tablet staging under
+// interruption: (1) a file whose Create races a mid-copy cancellation is
+// aborted rather than left as a partial/corrupt object; (2) StageBulkDir
+// is NOT atomic across a multi-file manifest -- an earlier file that had
+// already finished copying before the cancellation was observed remains
+// staged even though the overall call fails, and no loadmap.json is
+// written; (3) retrying the identical call with a fresh, non-cancelled
+// context against the SAME destination directory converges to the full,
+// correct staged set, because Create replaces any existing object at each
+// path and loadmap.json is only written after every file copy succeeds.
+// This is deliberately not a claim that StageBulkDir is atomic or
+// idempotent in the FATE sense -- only that a caller who retries after an
+// interrupted attempt ends up with a complete, correct bulk directory,
+// and that a reader who inspects the destination mid-window between the
+// failed attempt and the retry can observe a partial (but never
+// corrupt-content) set of files.
+func TestStageBulkDirCancellationLeavesNoPartialObjectAndRetrySucceeds(t *testing.T) {
+	src := memory.New()
+	src.Put("events/t-0000/F0001.rf", []byte("a"))
+	src.Put("events/t-0001/F0002.rf", []byte("b"))
+	src.Put("events/t-0002/F0003.rf", []byte("c"))
+
+	manifest := threeTabletManifest()
+	manifest.RFiles[0].DestinationPath = "events/t-0000/F0001.rf"
+	manifest.RFiles[0].Size = 1
+	manifest.RFiles[0].SHA256 = "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb"
+	manifest.RFiles[1].DestinationPath = "events/t-0001/F0002.rf"
+	manifest.RFiles[1].Size = 1
+	manifest.RFiles[1].SHA256 = "3e23e8160039594a33894f6564e1b1348bbd7a0088d42c4acb73eeaed59c009d"
+	manifest.RFiles[2].DestinationPath = "events/t-0002/F0003.rf"
+	manifest.RFiles[2].Size = 1
+	manifest.RFiles[2].SHA256 = "2e7d2c03a9507ae265ecf5b5356885a53393a2029d241394997265a1a25aefc6"
+
+	realDst := memory.New()
+	cancelCtx, cancel := context.WithCancel(context.Background())
+	canceling := &cancelingBackend{Backend: realDst, cancel: cancel, cancelAt: 2}
+
+	const bulkDir = "hdfs://nn/bulk/events-1"
+	if _, err := StageBulkDir(cancelCtx, src, manifest, canceling, bulkDir); err == nil {
+		t.Fatal("StageBulkDir under mid-copy cancellation = nil error, want error")
+	} else if !errors.Is(err, context.Canceled) {
+		t.Fatalf("StageBulkDir error = %v, want context.Canceled in the chain", err)
+	}
+
+	bg := context.Background()
+	if f, err := realDst.Open(bg, bulkDir+"/F0001.rf"); err != nil {
+		t.Fatalf("F0001.rf (fully copied before cancellation was observed) = %v, want present", err)
+	} else {
+		f.Close()
+	}
+	for _, missing := range []string{"/F0002.rf", "/F0003.rf", "/loadmap.json"} {
+		if _, err := realDst.Open(bg, bulkDir+missing); err == nil {
+			t.Fatalf("%s present after cancelled stage, want absent (no partial/unreached writes)", missing)
+		}
+	}
+
+	// Retry with a fresh, non-cancelled context against the same
+	// destination. The wrapper's cancelAt has already been consumed by
+	// the first attempt's second Create call, so this retry's Creates
+	// (calls 3-5, or however many the failed attempt reached) never
+	// trigger cancel again.
+	mapping, err := StageBulkDir(bg, src, manifest, canceling, bulkDir)
+	if err != nil {
+		t.Fatalf("StageBulkDir retry after cancellation = %v, want success", err)
+	}
+	if len(mapping) != 3 {
+		t.Fatalf("retry mapping entries = %d, want 3", len(mapping))
+	}
+	for _, name := range []string{"F0001.rf", "F0002.rf", "F0003.rf", "loadmap.json"} {
+		f, err := realDst.Open(bg, bulkDir+"/"+name)
+		if err != nil {
+			t.Fatalf("expected staged path %s after retry: %v", name, err)
+		}
+		f.Close()
+	}
+	onDisk, err := ReadLoadMapping(bg, realDst, bulkDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(onDisk) != len(mapping) {
+		t.Fatalf("on-disk mapping entries = %d, want %d", len(onDisk), len(mapping))
+	}
+}
+
+// mutatingSourceBackend wraps a *memory.Backend and, the instant its Nth
+// Open call (1-indexed) for one specific tracked path is issued,
+// overwrites that path's content in the underlying backend with
+// newContent before delegating to the real Open. Used to simulate a
+// source object being replaced in the window between StageBulkDir's own
+// pre-copy-loop VerifyRFileExport (an earlier Open of the same path) and
+// storage.Copy's later, separate Open of that same path inside the copy
+// loop, without needing a real concurrent writer or a race-prone timer.
+type mutatingSourceBackend struct {
+	*memory.Backend
+	path       string
+	mutateAt   int32
+	newContent []byte
+	opens      int32
+}
+
+func (b *mutatingSourceBackend) Open(ctx context.Context, path string) (shstorage.File, error) {
+	if path == b.path {
+		if n := atomic.AddInt32(&b.opens, 1); n == b.mutateAt {
+			b.Backend.Put(path, b.newContent)
+		}
+	}
+	return b.Backend.Open(ctx, path)
+}
+
+// TestStageBulkDirRejectsSourceMutatedBetweenPreflightVerifyAndItsOwnCopy
+// covers the copy-time window described in StageBulkDir's own doc
+// comment: engine.VerifyRFileExport verifies every RFile once, in a
+// single pass, before the copy loop starts; storage.Copy then separately
+// re-opens and re-reads each source file when it is actually copied.
+// TestPromoteRejectsSourceMutatedDuringAddTableSplits already covers a
+// source mutated during the AddTableSplits/ListTableSplits round-trip,
+// strictly before this preflight verify even runs; this test instead
+// mutates F0001.rf's content on its second Open call -- the first Open
+// is the preflight VerifyRFileExport call (which sees and approves the
+// original, correct bytes), the second is storage.Copy's own read
+// inside the loop (which now sees different bytes than were just
+// verified). Without a post-copy verification of the staged destination
+// object, this mismatch would go completely undetected and loadmap.json
+// would be written describing corrupted data as trustworthy.
+func TestStageBulkDirRejectsSourceMutatedBetweenPreflightVerifyAndItsOwnCopy(t *testing.T) {
+	const srcPath = "events/t-0000/F0001.rf"
+	original := []byte("original-bytes")
+	mutated := []byte("mutated-bytes!")
+	if len(original) != len(mutated) {
+		t.Fatalf("test fixture bug: original (%d) and mutated (%d) must be equal length so storage.Copy's own length bookkeeping cannot itself detect the swap, isolating the destination-verification behavior under test", len(original), len(mutated))
+	}
+
+	realSrc := memory.New()
+	realSrc.Put(srcPath, original)
+	realSrc.Put("events/t-0001/F0002.rf", []byte("b"))
+
+	originalSum := sha256.Sum256(original)
+	bSum := sha256.Sum256([]byte("b"))
+	manifest := twoTabletManifest()
+	manifest.RFiles[0].DestinationPath = srcPath
+	manifest.RFiles[0].Size = int64(len(original))
+	manifest.RFiles[0].SHA256 = hex.EncodeToString(originalSum[:])
+	manifest.RFiles[1].DestinationPath = "events/t-0001/F0002.rf"
+	manifest.RFiles[1].Size = 1
+	manifest.RFiles[1].SHA256 = hex.EncodeToString(bSum[:])
+
+	src := &mutatingSourceBackend{Backend: realSrc, path: srcPath, mutateAt: 2, newContent: mutated}
+	dst := memory.New()
+	ctx := context.Background()
+
+	if _, err := StageBulkDir(ctx, src, manifest, dst, "hdfs://nn/bulk/events-1"); err == nil {
+		t.Fatal("StageBulkDir with source mutated between preflight verify and its own copy = nil error, want error")
+	}
+	if got := atomic.LoadInt32(&src.opens); got < 2 {
+		t.Fatalf("source Open calls for %s = %d, want >= 2 (preflight verify + storage.Copy); test fixture did not exercise the intended window", srcPath, got)
+	}
+	if _, err := dst.Open(ctx, "hdfs://nn/bulk/events-1/loadmap.json"); err == nil {
+		t.Fatal("loadmap.json present after rejecting a file mutated during copy, want absent")
+	}
+	if _, err := dst.Open(ctx, "hdfs://nn/bulk/events-1/F0002.rf"); err == nil {
+		t.Fatal("F0002.rf present after F0001.rf failed its post-copy verification, want absent (fails closed before copying later files)")
+	}
+}
+
+// TestStageBulkDirInvalidatesStaleLoadMappingOnFailedRetry proves the
+// round-12-review fix for a bulkDir that already holds a valid
+// loadmap.json from an earlier, successful StageBulkDir call. Retrying
+// StageBulkDir against that same bulkDir, when the retry's own copy loop
+// fails partway (here: F0002.rf's post-copy verifyStagedRFile check,
+// simulated the same way
+// TestStageBulkDirRejectsSourceMutatedBetweenPreflightVerifyAndItsOwnCopy
+// does, via mutatingSourceBackend, just shifted two Opens later to land
+// inside the SECOND StageBulkDir call instead of the first), must not
+// leave the OLD loadmap.json in place: it no longer reflects the
+// bulkDir's actual (now partially overwritten, unverified) contents.
+// Without invalidateExistingLoadMapping, this test's final loadmap.json
+// would still be present and would still parse as the FIRST, now-stale
+// mapping -- silently asserting the directory is complete and correct
+// even though F0002.rf's on-disk bytes were just replaced with data that
+// failed verification.
+func TestStageBulkDirInvalidatesStaleLoadMappingOnFailedRetry(t *testing.T) {
+	const srcPath = "events/t-0001/F0002.rf"
+	original := []byte("original-bytes")
+	mutated := []byte("mutated-bytes!")
+	if len(original) != len(mutated) {
+		t.Fatalf("test fixture bug: original (%d) and mutated (%d) must be equal length so storage.Copy's own length bookkeeping cannot itself detect the swap, isolating the destination-verification behavior under test", len(original), len(mutated))
+	}
+
+	realSrc := memory.New()
+	realSrc.Put("events/t-0000/F0001.rf", []byte("f0001-bytes"))
+	realSrc.Put(srcPath, original)
+
+	f1Sum := sha256.Sum256([]byte("f0001-bytes"))
+	originalSum := sha256.Sum256(original)
+	manifest := twoTabletManifest()
+	manifest.RFiles[0].DestinationPath = "events/t-0000/F0001.rf"
+	manifest.RFiles[0].Size = int64(len("f0001-bytes"))
+	manifest.RFiles[0].SHA256 = hex.EncodeToString(f1Sum[:])
+	manifest.RFiles[1].DestinationPath = srcPath
+	manifest.RFiles[1].Size = int64(len(original))
+	manifest.RFiles[1].SHA256 = hex.EncodeToString(originalSum[:])
+
+	// mutateAt=4: opens #1 (first call's preflight VerifyRFileExport) and
+	// #2 (first call's storage.Copy) both see the original bytes, so the
+	// first StageBulkDir call below succeeds cleanly. Open #3 (the
+	// retry's own preflight VerifyRFileExport) still sees the original
+	// bytes and passes; open #4 (the retry's own storage.Copy) is when
+	// the swap fires, so only the retry's post-copy verifyStagedRFile
+	// check -- not either call's preflight -- ever observes the mutated
+	// bytes.
+	src := &mutatingSourceBackend{Backend: realSrc, path: srcPath, mutateAt: 4, newContent: mutated}
+	dst := memory.New()
+	ctx := context.Background()
+	const bulkDir = "hdfs://nn/bulk/events-1"
+
+	firstMapping, err := StageBulkDir(ctx, src, manifest, dst, bulkDir)
+	if err != nil {
+		t.Fatalf("first StageBulkDir call = %v, want success", err)
+	}
+	if len(firstMapping) == 0 {
+		t.Fatal("first StageBulkDir call returned an empty mapping")
+	}
+	if _, err := ReadLoadMapping(ctx, dst, bulkDir); err != nil {
+		t.Fatalf("loadmap.json after first successful stage: ReadLoadMapping = %v, want success", err)
+	}
+
+	if _, err := StageBulkDir(ctx, src, manifest, dst, bulkDir); err == nil {
+		t.Fatal("retry StageBulkDir with source mutated during its own copy = nil error, want error")
+	}
+	if got := atomic.LoadInt32(&src.opens); got < 4 {
+		t.Fatalf("source Open calls for %s = %d, want >= 4 (two full preflight+copy passes); test fixture did not exercise the intended retry window", srcPath, got)
+	}
+
+	// The crux of the fix: the OLD loadmap.json from the first call must
+	// not survive as a stale, still-parseable "complete" marker next to
+	// F0002.rf's now-corrupted bytes. memory.Backend implements
+	// storage.Remover, so invalidateExistingLoadMapping deletes it
+	// outright; loadmap.json must therefore be entirely absent, not
+	// merely different.
+	if _, err := dst.Open(ctx, bulkDir+"/loadmap.json"); err == nil {
+		t.Fatal("loadmap.json present after a failed retry over a previously-staged bulkDir, want absent (stale marker must be invalidated before any RFile is overwritten)")
+	} else if !errors.Is(err, shstorage.ErrNotFound) {
+		t.Fatalf("loadmap.json open error = %v, want storage.ErrNotFound", err)
+	}
+}
+
+// nonRemovableBackend wraps a *memory.Backend, delegating Open and Create
+// but deliberately not implementing storage.Remover -- even though the
+// wrapped *memory.Backend itself does -- to simulate an object-store
+// backend (s3/gcs/azure) that exposes no delete capability. Used to
+// exercise invalidateExistingLoadMapping's overwrite-with-placeholder
+// fallback path.
+type nonRemovableBackend struct {
+	inner *memory.Backend
+}
+
+func (b *nonRemovableBackend) Open(ctx context.Context, path string) (shstorage.File, error) {
+	return b.inner.Open(ctx, path)
+}
+
+func (b *nonRemovableBackend) Create(ctx context.Context, path string) (shstorage.Writer, error) {
+	return b.inner.Create(ctx, path)
+}
+
+// TestStageBulkDirOverwritesStaleLoadMappingWithUnparseablePlaceholderWhenBackendCannotDelete
+// covers invalidateExistingLoadMapping's fallback for a destination
+// backend that cannot delete objects (no storage.Remover, matching
+// s3/gcs/azure): a stale loadmap.json from an earlier successful stage
+// cannot be removed outright, so it must instead be overwritten with a
+// payload that fails to parse as a valid LoadMapping, so no reader can
+// mistake it for a still-valid "staging complete" marker.
+func TestStageBulkDirOverwritesStaleLoadMappingWithUnparseablePlaceholderWhenBackendCannotDelete(t *testing.T) {
+	const srcPath = "events/t-0001/F0002.rf"
+	original := []byte("original-bytes")
+	mutated := []byte("mutated-bytes!")
+
+	realSrc := memory.New()
+	realSrc.Put("events/t-0000/F0001.rf", []byte("f0001-bytes"))
+	realSrc.Put(srcPath, original)
+
+	f1Sum := sha256.Sum256([]byte("f0001-bytes"))
+	originalSum := sha256.Sum256(original)
+	manifest := twoTabletManifest()
+	manifest.RFiles[0].DestinationPath = "events/t-0000/F0001.rf"
+	manifest.RFiles[0].Size = int64(len("f0001-bytes"))
+	manifest.RFiles[0].SHA256 = hex.EncodeToString(f1Sum[:])
+	manifest.RFiles[1].DestinationPath = srcPath
+	manifest.RFiles[1].Size = int64(len(original))
+	manifest.RFiles[1].SHA256 = hex.EncodeToString(originalSum[:])
+
+	src := &mutatingSourceBackend{Backend: realSrc, path: srcPath, mutateAt: 4, newContent: mutated}
+	dst := &nonRemovableBackend{inner: memory.New()}
+	ctx := context.Background()
+	const bulkDir = "hdfs://nn/bulk/events-1"
+
+	if _, err := StageBulkDir(ctx, src, manifest, dst, bulkDir); err != nil {
+		t.Fatalf("first StageBulkDir call = %v, want success", err)
+	}
+	if _, err := ReadLoadMapping(ctx, dst, bulkDir); err != nil {
+		t.Fatalf("loadmap.json after first successful stage: ReadLoadMapping = %v, want success", err)
+	}
+
+	if _, err := StageBulkDir(ctx, src, manifest, dst, bulkDir); err == nil {
+		t.Fatal("retry StageBulkDir with source mutated during its own copy = nil error, want error")
+	}
+
+	// dst cannot delete, so the stale loadmap.json must still be
+	// present -- but overwritten with an unparseable placeholder, never
+	// left as the OLD, now-stale-but-well-formed mapping.
+	f, err := dst.Open(ctx, bulkDir+"/loadmap.json")
+	if err != nil {
+		t.Fatalf("loadmap.json open error = %v, want present (overwritten in place, not removed)", err)
+	}
+	f.Close()
+	if _, err := ReadLoadMapping(ctx, dst, bulkDir); err == nil {
+		t.Fatal("ReadLoadMapping on invalidated placeholder = nil error, want a parse failure (placeholder must not be mistaken for a valid mapping)")
+	}
+}
+
+// cancelDuringReadFile is a storage.File whose ReadAt cancels ctx (via a
+// stored context.CancelFunc) the moment each call is made, before
+// returning its (otherwise normal) chunk of data. size is deliberately
+// several 256KB chunks large so a hashing loop that still fails to poll
+// ctx.Err() promptly would keep issuing ReadAt calls for every
+// remaining chunk instead of stopping after the first one.
+type cancelDuringReadFile struct {
+	size      int64
+	cancel    context.CancelFunc
+	readCalls int32
+}
+
+func (f *cancelDuringReadFile) ReadAt(p []byte, off int64) (int, error) {
+	atomic.AddInt32(&f.readCalls, 1)
+	f.cancel()
+	for i := range p {
+		p[i] = 'x'
+	}
+	if off+int64(len(p)) >= f.size {
+		return len(p), io.EOF
+	}
+	return len(p), nil
+}
+
+func (f *cancelDuringReadFile) Close() error { return nil }
+func (f *cancelDuringReadFile) Size() int64  { return f.size }
+
+type cancelDuringReadBackend struct{ file *cancelDuringReadFile }
+
+func (b cancelDuringReadBackend) Open(context.Context, string) (shstorage.File, error) {
+	return b.file, nil
+}
+
+// openFuncBackend is a storage.Backend whose Open delegates to an
+// arbitrary func, letting a test observe (or refuse) an Open call
+// without a full backend implementation.
+type openFuncBackend func(ctx context.Context, path string) (shstorage.File, error)
+
+func (f openFuncBackend) Open(ctx context.Context, path string) (shstorage.File, error) {
+	return f(ctx, path)
+}
+
+// TestVerifyStagedRFileStopsPromptlyOnCancellationDuringHash proves a
+// round-11 Copilot review fix: verifyStagedRFile's read-and-hash loop
+// now polls ctx.Err() before and immediately after every ReadAt, so
+// cancellation mid-hash is observed within a single 256KB chunk instead
+// of only after the whole (potentially very large) RFile has been read.
+// The fake file here is more than 3 chunks large and cancels ctx on its
+// very first ReadAt call; if the fix regressed to checking ctx.Err()
+// only once (or not polling the loop at all), this test would observe
+// readCalls > 1 -- the loop would keep reading every remaining chunk
+// before its next (or only) chance to notice cancellation.
+func TestVerifyStagedRFileStopsPromptlyOnCancellationDuringHash(t *testing.T) {
+	const chunkSize = 256 * 1024
+	ctx, cancel := context.WithCancel(context.Background())
+	file := &cancelDuringReadFile{size: chunkSize*3 + 100}
+	file.cancel = cancel
+	dst := cancelDuringReadBackend{file: file}
+
+	err := verifyStagedRFile(ctx, dst, "bulk/F0001.rf", file.size, "irrelevant-sha256")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("verifyStagedRFile error = %v, want context.Canceled in the chain", err)
+	}
+	if got := atomic.LoadInt32(&file.readCalls); got != 1 {
+		t.Fatalf("ReadAt calls = %d, want exactly 1 (cancellation observed after the first 256KB chunk of a %d-byte file, not after reading it all)", got, file.size)
+	}
+}
+
+// TestVerifyStagedRFileRejectsAlreadyCanceledContextBeforeOpen proves
+// verifyStagedRFile checks ctx.Err() before it ever calls dst.Open, so
+// an already-canceled context short-circuits before any backend I/O is
+// attempted at all, mirroring storage.Copy's own pre-Open poll.
+func TestVerifyStagedRFileRejectsAlreadyCanceledContextBeforeOpen(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	opened := false
+	dst := openFuncBackend(func(context.Context, string) (shstorage.File, error) {
+		opened = true
+		return nil, errors.New("dst.Open must not be called once ctx is already canceled")
+	})
+	if err := verifyStagedRFile(ctx, dst, "bulk/F0001.rf", 4, "irrelevant"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("verifyStagedRFile error = %v, want context.Canceled", err)
+	}
+	if opened {
+		t.Fatal("verifyStagedRFile called dst.Open with an already-canceled context, want it to fail before opening")
 	}
 }
 

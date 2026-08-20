@@ -974,6 +974,85 @@ func TestAddTableSplitsRefreshesTableIDBeforeResolve(t *testing.T) {
 	}
 }
 
+// TestAddTableSplitsForTableSucceedsWhenPinMatchesFreshResolve proves the
+// happy path: when table.ID already names the same table a fresh
+// resolve of table.Name returns, AddTableSplitsForTable behaves exactly
+// like AddTableSplits and reaches the manager normally.
+func TestAddTableSplitsForTableSucceedsWhenPinMatchesFreshResolve(t *testing.T) {
+	walker := &scriptedTabletWalker{rounds: [][]metadata.TabletInfo{splitTestTablets()}}
+	connector, manager := splitTestConnector(t, walker, splitTestNames())
+
+	err := connector.AddTableSplitsForTable(
+		context.Background(),
+		Table{Name: "events", ID: "1"},
+		[][]byte{[]byte("m")},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls := manager.splitCalls(); len(calls) != 1 {
+		t.Fatalf("split calls = %d, want 1", len(calls))
+	}
+}
+
+// TestAddTableSplitsForTableRejectsMismatchedPinBeforeAnyManagerCall is
+// the core regression test for round 11's suppressed finding: table.ID
+// pins a table identity that no longer matches what a fresh resolve of
+// table.Name returns (simulating a delete-and-recreate under the same
+// name in the window between an external caller's own pin and this
+// call). AddTableSplitsForTable must fail closed with
+// ErrTableIdentityChanged *before* any tablet locate, split, or
+// mergeability call -- proven here by asserting the tablet walker, the
+// split manager, and the mergeability manager were never invoked at
+// all, not just that the overall call failed.
+func TestAddTableSplitsForTableRejectsMismatchedPinBeforeAnyManagerCall(t *testing.T) {
+	walker := &scriptedTabletWalker{rounds: [][]metadata.TabletInfo{splitTestTablets()}}
+	connector, manager := splitTestConnector(t, walker, splitTestNames())
+
+	err := connector.AddTableSplitsForTable(
+		context.Background(),
+		Table{Name: "events", ID: "stale-id-from-before-a-delete-and-recreate"},
+		[][]byte{[]byte("m")},
+	)
+	if !errors.Is(err, ErrTableIdentityChanged) {
+		t.Fatalf("mismatched pin error = %v, want ErrTableIdentityChanged", err)
+	}
+	if calls := manager.splitCalls(); len(calls) != 0 {
+		t.Fatalf("split calls = %d, want 0 (must fail before any split FATE submission)", len(calls))
+	}
+	if calls := manager.mergeCalls(); len(calls) != 0 {
+		t.Fatalf("mergeability calls = %d, want 0 (must fail before any mergeability RPC)", len(calls))
+	}
+	if walker.callCount() != 0 {
+		t.Fatalf("tablet locate calls = %d, want 0 (must fail before planning touches tablets at all)", walker.callCount())
+	}
+}
+
+// TestAddTableSplitsForTableRejectsEmptyExpectedTableID proves an empty
+// table.ID -- which would silently defeat the whole point of calling
+// this instead of AddTableSplits -- is rejected outright, before even
+// reaching addTableSplits's shared core (so table name validation,
+// tablet discovery, etc. never run either).
+func TestAddTableSplitsForTableRejectsEmptyExpectedTableID(t *testing.T) {
+	walker := &scriptedTabletWalker{rounds: [][]metadata.TabletInfo{splitTestTablets()}}
+	connector, manager := splitTestConnector(t, walker, splitTestNames())
+
+	err := connector.AddTableSplitsForTable(
+		context.Background(),
+		Table{Name: "events", ID: ""},
+		[][]byte{[]byte("m")},
+	)
+	if !errors.Is(err, ErrInvalidTableName) {
+		t.Fatalf("empty table.ID error = %v, want ErrInvalidTableName", err)
+	}
+	if calls := manager.splitCalls(); len(calls) != 0 {
+		t.Fatalf("split calls = %d, want 0", len(calls))
+	}
+	if walker.callCount() != 0 {
+		t.Fatalf("tablet locate calls = %d, want 0", walker.callCount())
+	}
+}
+
 func TestAddTableSplitsValidatesInputs(t *testing.T) {
 	walker := &scriptedTabletWalker{rounds: [][]metadata.TabletInfo{splitTestTablets()}}
 	connector, manager := splitTestConnector(t, walker, splitTestNames())
