@@ -441,6 +441,10 @@ func (e *Engine) ImportRFileManifest(ctx context.Context, manifest *RFileExportM
 			return fmt.Errorf("engine: mkdir imported tablet: %w", err)
 		}
 	}
+	filesByTablet := make(map[int][]string)
+	for _, file := range manifest.RFiles {
+		filesByTablet[file.TabletIndex] = append(filesByTablet[file.TabletIndex], file.DestinationPath)
+	}
 
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -453,8 +457,10 @@ func (e *Engine) ImportRFileManifest(ctx context.Context, manifest *RFileExportM
 			return fmt.Errorf("engine: cannot merge import for table %q: manifest has %d tablet(s), open table has %d (divergent splits unsupported)",
 				manifest.SourceTable, manifest.tabletCount(), len(existing.tablets))
 		}
-		if _, err := existing.refreshFiles(); err != nil {
-			return fmt.Errorf("engine: merge import for table %q: %w", manifest.SourceTable, err)
+		for i := range existing.tablets {
+			if _, err := existing.tablets[i].RegisterImmutableFiles(filesByTablet[i]); err != nil {
+				return fmt.Errorf("engine: merge import for table %q tablet %d: %w", manifest.SourceTable, i, err)
+			}
 		}
 		return nil
 	}
@@ -474,10 +480,6 @@ func (e *Engine) ImportRFileManifest(ctx context.Context, manifest *RFileExportM
 		FileFormat: format,
 	}); err != nil {
 		return err
-	}
-	filesByTablet := make(map[int][]string)
-	for _, file := range manifest.RFiles {
-		filesByTablet[file.TabletIndex] = append(filesByTablet[file.TabletIndex], file.DestinationPath)
 	}
 	for i := 0; i < manifest.tabletCount(); i++ {
 		tabletDir := filepath.Join(tableDir, fmt.Sprintf("t-%04d", i))

@@ -47,6 +47,7 @@ func TestCompactContextCancellation(t *testing.T) {
 		if p.EntriesWritten == 1 {
 			cancel()
 		}
+
 	})
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("CompactContext error = %v, want context.Canceled", err)
@@ -543,5 +544,31 @@ func TestCompact_ZeroOutputBudgetIsUnlimited(t *testing.T) {
 	}
 	if len(res.Output) <= 64*1024 {
 		t.Fatalf("output is %d bytes; the fixture must exceed the budget the other tests set", len(res.Output))
+	}
+}
+
+func TestCompactContextParquetCancellationAndProgress(t *testing.T) {
+	input := buildRFile(t, []kv{
+		{K: mk("a", "", "", 1), V: "a"},
+		{K: mk("b", "", "", 1), V: "b"},
+		{K: mk("c", "", "", 1), V: "c"},
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	var observed int64
+	_, err := CompactContext(ctx, Spec{
+		Inputs:       []Input{{Name: "in.rf", Bytes: input}},
+		Scope:        iterrt.ScopeMajc,
+		OutputFormat: "parquet",
+	}, func(p Progress) {
+		observed = p.EntriesWritten
+		if observed == 1 {
+			cancel()
+		}
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("CompactContext parquet error = %v, want context.Canceled", err)
+	}
+	if observed != 1 {
+		t.Fatalf("observed entries = %d, want 1", observed)
 	}
 }

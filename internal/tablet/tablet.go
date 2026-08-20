@@ -651,21 +651,19 @@ func (t *Tablet) RFiles() []string {
 // times RefreshFiles runs, so re-importing an unchanged manifest is a no-op.
 // Returns the number of RFiles now tracked.
 func (t *Tablet) RefreshFiles() (int, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	keys, obsolete, err := discoverImmutableFiles(t.backend, t.dir, true)
 	if err != nil {
 		return 0, fmt.Errorf("tablet: refresh list %s: %w", t.dir, err)
 	}
 	sort.Strings(keys)
-	t.mu.Lock()
 	if err := persistImmutableManifest(t.backend, t.dir, keys, obsolete); err != nil {
-		t.mu.Unlock()
 		return 0, fmt.Errorf("tablet: refresh manifest %s: %w", t.dir, err)
 	}
 	t.files = keys
 	t.obsolete = obsolete
-	n := len(t.files)
-	t.mu.Unlock()
-	return n, nil
+	return len(t.files), nil
 }
 
 // MemtableSize returns the cell count in the active memtable.
@@ -999,6 +997,32 @@ func cloneObsolete(in map[string]struct{}) map[string]struct{} {
 // objects already present under the destination prefix are not rediscovered.
 func PublishImmutableFiles(b storage.Backend, dir string, active []string) error {
 	return persistImmutableManifest(b, dir, active, nil)
+}
+
+// RegisterImmutableFiles adds only checksum-verified import objects to the
+// authoritative generation. It never adopts unrelated objects from the prefix.
+func (t *Tablet) RegisterImmutableFiles(paths []string) (int, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	active := append([]string(nil), t.files...)
+	seen := make(map[string]struct{}, len(active)+len(paths))
+	for _, path := range active {
+		seen[path] = struct{}{}
+	}
+	for _, path := range paths {
+		if _, ok := seen[path]; ok {
+			continue
+		}
+		active = append(active, path)
+		seen[path] = struct{}{}
+		delete(t.obsolete, filepath.Base(path))
+	}
+	sort.Strings(active)
+	if err := persistImmutableManifest(t.backend, t.dir, active, t.obsolete); err != nil {
+		return 0, err
+	}
+	t.files = active
+	return len(t.files), nil
 }
 
 func removeObject(b storage.Backend, path string) error {

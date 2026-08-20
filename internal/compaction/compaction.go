@@ -217,7 +217,14 @@ func CompactContext(ctx context.Context, spec Spec, observe func(Progress)) (*Re
 		written, err := parquetfile.EncodeToWithOptions(
 			&budgetedWriter{w: &buf, max: spec.MaxOutputBytes},
 			top,
-			parquetfile.EncodeOptions{},
+			parquetfile.EncodeOptions{
+				Check: ctx.Err,
+				Observe: func(written int64) {
+					if observe != nil {
+						observe(Progress{EntriesWritten: written})
+					}
+				},
+			},
 		)
 		if err != nil {
 			return nil, fmt.Errorf("compaction: %w", err)

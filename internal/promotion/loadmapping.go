@@ -78,6 +78,7 @@ import (
 
 	"github.com/phrocker/shoal/internal/engine"
 	"github.com/phrocker/shoal/internal/storage"
+	"github.com/phrocker/shoal/internal/tablet"
 )
 
 // bulkLoadMappingFile is the fixed filename Accumulo's BulkSerialize reads
@@ -177,6 +178,25 @@ type LoadMapping []Mapping
 func BuildLoadMapping(manifest *engine.RFileExportManifest) (LoadMapping, error) {
 	if manifest == nil {
 		return nil, fmt.Errorf("promotion: nil export manifest")
+	}
+	if manifest.FileFormat == tablet.FormatParquet ||
+		(manifest.RFileCompatibility != "" && manifest.RFileCompatibility != "accumulo-rfile/shoal") {
+		return nil, fmt.Errorf("promotion: manifest compatibility %q with format %q cannot be registered as Accumulo tablet files",
+			manifest.RFileCompatibility, manifest.FileFormat)
+	}
+	for _, file := range manifest.RFiles {
+		format := file.Format
+		if format == "" {
+			format = engine.ExportFormatRFile
+		}
+		role := file.Role
+		if role == "" {
+			role = engine.ExportRoleAuthoritative
+		}
+		if format != engine.ExportFormatRFile || role != engine.ExportRoleAuthoritative {
+			return nil, fmt.Errorf("promotion: file %q has format %q and role %q; Accumulo bulk import requires authoritative RFiles",
+				file.DestinationPath, format, role)
+		}
 	}
 	tablets, declared, err := resolveManifestTablets(manifest)
 	if err != nil {

@@ -15,6 +15,8 @@ const DefaultRowsPerRowGroup = 8192
 type EncodeOptions struct {
 	RowsPerRowGroup int64
 	PageBufferSize  int
+	Check           func() error
+	Observe         func(int64)
 }
 
 // Cell is the Parquet representation of one Accumulo key/value entry.
@@ -82,6 +84,11 @@ func EncodeToWithOptions(w io.Writer, iter iterrt.SortedKeyValueIterator, opts E
 		return nil
 	}
 	for iter.HasTop() {
+		if opts.Check != nil {
+			if err := opts.Check(); err != nil {
+				return count, err
+			}
+		}
 		k := iter.GetTopKey()
 		batch = append(batch, Cell{
 			Row:       bytes.Clone(k.Row),
@@ -93,9 +100,17 @@ func EncodeToWithOptions(w io.Writer, iter iterrt.SortedKeyValueIterator, opts E
 			Value:     bytes.Clone(iter.GetTopValue()),
 		})
 		count++
+		if opts.Observe != nil {
+			opts.Observe(count)
+		}
 		if len(batch) == cap(batch) {
 			if err := writeBatch(); err != nil {
 				return count, err
+			}
+			if opts.Check != nil {
+				if err := opts.Check(); err != nil {
+					return count, err
+				}
 			}
 		}
 		if err := iter.Next(); err != nil {
