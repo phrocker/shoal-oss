@@ -17,10 +17,14 @@ the tie-break. Because a standard Accumulo scan may apply versioning before the
 client sees cells, `AS OF` is rejected unless `HistoricalVersions` explicitly
 confirms that the configured scanner/replay retains historical versions.
 
-Approximate vector search is intentionally **unsupported**. There is no
-distributed IVF-PQ owner, build/rebuild protocol, freshness fence, partition
-routing contract, or recall declaration. `EXPLAIN` reports that reason and the
-exact full-candidate fallback rather than claiming an approximate index.
+Approximate vector search is opt-in. Configure `Options.VectorSearcher` with a
+`shoalql.ManagedVectorSearcher` backed by `internal/vectorindex.Manager`.
+Without it, the backend continues to report approximate search as unsupported.
+With it, ShoalQL routes IVF cluster shards, merges deterministic partial top-k
+results, applies Accumulo visibility and timestamp/tombstone semantics, and
+exposes generation, codebook, lineage, watermark, fallback, and recall evidence
+in `EXPLAIN`. Recall is reported only after a reproducible corpus benchmark.
+See [`distributed-vector-index.md`](distributed-vector-index.md).
 
 The cross-backend corpus test covers RFile, Parquet, mixed local tables, and an
 Accumulo scanner replay. The optional live test is gated by

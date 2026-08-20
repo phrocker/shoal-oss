@@ -1,6 +1,7 @@
 package shoalql
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"sort"
@@ -9,6 +10,7 @@ import (
 	"unicode"
 
 	"github.com/phrocker/shoal/internal/iterrt"
+	"github.com/phrocker/shoal/internal/vectorindex"
 )
 
 // Capability is a stable backend feature identifier used by planning
@@ -66,18 +68,21 @@ type CapabilityProvider interface {
 
 // ExplainDetails is the versioned, machine-readable EXPLAIN contract.
 type ExplainDetails struct {
-	Version                 int          `json:"version"`
-	Format                  string       `json:"format"`
-	Backend                 BackendInfo  `json:"backend"`
-	CapabilityContract      bool         `json:"capability_contract"`
-	Shape                   string       `json:"shape"`
-	Table                   string       `json:"table"`
-	Range                   string       `json:"range"`
-	Pushdowns               []string     `json:"pushdowns"`
-	LocalMaterialization    []string     `json:"local_materialization"`
-	FallbackReasons         []string     `json:"fallback_reasons"`
-	UnsupportedCapabilities []Capability `json:"unsupported_capabilities"`
-	OrderingAssumptions     []string     `json:"ordering_top_k_assumptions"`
+	Version                 int                    `json:"version"`
+	Format                  string                 `json:"format"`
+	Backend                 BackendInfo            `json:"backend"`
+	CapabilityContract      bool                   `json:"capability_contract"`
+	Shape                   string                 `json:"shape"`
+	Table                   string                 `json:"table"`
+	Range                   string                 `json:"range"`
+	Pushdowns               []string               `json:"pushdowns"`
+	LocalMaterialization    []string               `json:"local_materialization"`
+	FallbackReasons         []string               `json:"fallback_reasons"`
+	UnsupportedCapabilities []Capability           `json:"unsupported_capabilities"`
+	OrderingAssumptions     []string               `json:"ordering_top_k_assumptions"`
+	VectorIndex             *vectorindex.Manifest  `json:"vector_index,omitempty"`
+	VectorFreshness         *vectorindex.Freshness `json:"vector_freshness,omitempty"`
+	RecallClaimed           bool                   `json:"recall_claimed"`
 }
 
 func (e *Executor) explain(p *Plan) (*Result, error) {
@@ -107,6 +112,15 @@ func (e *Executor) explain(p *Plan) (*Result, error) {
 		{strVal("local_materialization"), strVal(strings.Join(d.LocalMaterialization, "; "))},
 		{strVal("fallback_reasons"), strVal(strings.Join(d.FallbackReasons, "; "))},
 		{strVal("ordering_top_k_assumptions"), strVal(strings.Join(d.OrderingAssumptions, "; "))},
+	}
+	if d.VectorIndex != nil {
+		rows = append(rows,
+			Row{strVal("vector_generation"), strVal(strconv.FormatUint(d.VectorIndex.Generation, 10))},
+			Row{strVal("vector_codebook_version"), strVal(d.VectorIndex.CodebookVersion)},
+			Row{strVal("vector_lineage"), strVal(fmt.Sprint(d.VectorIndex.Lineage))},
+			Row{strVal("vector_indexed_watermark"), strVal(strconv.FormatInt(d.VectorIndex.IndexedWatermark, 10))},
+			Row{strVal("vector_recall_claimed"), strVal(strconv.FormatBool(d.RecallClaimed))},
+		)
 	}
 	return &Result{Columns: []string{"property", "value"}, Rows: rows}, nil
 }
@@ -156,6 +170,7 @@ func buildExplainDetails(be Backend, p *Plan) ExplainDetails {
 
 	switch p.Shape {
 	case ShapeVectorKNN:
+		addVectorExplain(be, p, &d)
 		if hasCapability(d.Backend.Capabilities, CapabilityDistributedScan) {
 			d.OrderingAssumptions = append(d.OrderingAssumptions,
 				"distributed scan candidates are merged into one exact score-descending top-k with ascending-key tie-break")
@@ -172,6 +187,9 @@ func buildExplainDetails(be Backend, p *Plan) ExplainDetails {
 		d.OrderingAssumptions = append(d.OrderingAssumptions,
 			"aggregation groups are emitted in backend iterator order")
 	case ShapeDocument:
+		if p.VectorMode == VectorApproximate {
+			addVectorExplain(be, p, &d)
+		}
 		for _, term := range p.DocTerms {
 			d.Pushdowns = append(d.Pushdowns,
 				fmt.Sprintf("document index term %s=%q", term.Field, term.Value))
@@ -212,6 +230,34 @@ func buildExplainDetails(be Backend, p *Plan) ExplainDetails {
 		}
 	}
 	return d
+}
+
+func addVectorExplain(be Backend, p *Plan, d *ExplainDetails) {
+	if p.VectorMode != VectorApproximate {
+		d.FallbackReasons = append(d.FallbackReasons, "exact vector mode selected explicitly")
+		return
+	}
+	freshness := p.VectorFreshness
+	d.VectorFreshness = &freshness
+	d.Pushdowns = append(d.Pushdowns,
+		fmt.Sprintf("IVF-PQ index=%s nprobe=%d", p.VectorIndex, p.VectorNProbe))
+	d.OrderingAssumptions = append(d.OrderingAssumptions,
+		"sharded partial top-k merge is score-descending with document-id ascending tie-break")
+	if p.VectorExactFallback {
+		d.FallbackReasons = append(d.FallbackReasons,
+			"exact fallback is enabled explicitly when generation/freshness requirements are not met")
+	}
+	if provider, ok := be.(VectorExplainBackend); ok {
+		manifest, err := provider.DescribeVector(context.Background(), p.VectorIndex)
+		if err == nil {
+			d.VectorIndex = &manifest
+			d.RecallClaimed = manifest.Recall.Benchmarked()
+			if !d.RecallClaimed {
+				d.FallbackReasons = append(d.FallbackReasons,
+					"index has no reproducible corpus benchmark; EXPLAIN makes no recall claim")
+			}
+		}
+	}
 }
 
 func normalizedBackendInfo(info BackendInfo) BackendInfo {

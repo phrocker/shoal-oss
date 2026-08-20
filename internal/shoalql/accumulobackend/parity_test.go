@@ -23,6 +23,7 @@ import (
 	"github.com/phrocker/shoal/internal/shoalql/accumulobackend"
 	"github.com/phrocker/shoal/internal/shoalql/enginebackend"
 	"github.com/phrocker/shoal/internal/tablet"
+	"github.com/phrocker/shoal/internal/vectorindex"
 )
 
 type corpusCell struct {
@@ -451,11 +452,13 @@ func TestExplainDeclaresExactFallbackAndApproximateUnsupported(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	binding, _ := shoalql.NewGraphCatalog("graph").Binding("events")
 	plan, err := shoalql.PlanQuery(context.Background(), stmt, binding, shoalql.PlanOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	result, err := executor.Run(context.Background(), plan)
 	if err != nil {
 		t.Fatal(err)
@@ -482,6 +485,7 @@ func TestAsOfRequiresHistoricalScannerContract(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	binding, _ := shoalql.NewGraphCatalog("graph").Binding("events")
 	plan, err := shoalql.PlanQuery(context.Background(), stmt, binding, shoalql.PlanOptions{})
 	if err != nil {
@@ -491,6 +495,50 @@ func TestAsOfRequiresHistoricalScannerContract(t *testing.T) {
 	if !errors.Is(err, accumulobackend.ErrHistoricalVersionsUnavailable) {
 		t.Fatalf("error = %v, want historical-version contract error", err)
 	}
+}
+
+func TestConfiguredVectorIndexDeclaresAndRunsDistributedApproximateSearch(t *testing.T) {
+	store := vectorindex.NewMemoryStore()
+	manager := vectorindex.New(store, vectorindex.Config{
+		NList: 2, Subspaces: 2, CentroidsPerSpace: 2, MaxIterations: 8,
+		Seed: 9, ShardCount: 2,
+	})
+	records := []vectorindex.VectorRecord{
+		{ID: "evt:a", Vector: []float32{1, 0, 0, 0}, Timestamp: 10, Visibility: "public",
+			Document: vectorindex.DocumentRef{Row: "evt:a"}},
+		{ID: "evt:b", Vector: []float32{0, 1, 0, 0}, Timestamp: 10, Visibility: "secret",
+			Document: vectorindex.DocumentRef{Row: "evt:b"}},
+	}
+	if _, err := manager.Build(context.Background(), "graph_ivf", records, 10); err != nil {
+		t.Fatal(err)
+	}
+	backend := accumulobackend.New(&replayClient{}, accumulobackend.Options{
+		Authorizations: [][]byte{[]byte("public")},
+		VectorSearcher: shoalql.ManagedVectorSearcher{Manager: manager},
+	})
+	info := backend.BackendInfo()
+	if !containsCapability(info.Capabilities, shoalql.CapabilityApproximateVector) ||
+		!containsCapability(info.Capabilities, shoalql.CapabilityDistributedTopK) {
+		t.Fatalf("vector capabilities missing: %v", info.Capabilities)
+	}
+	hits, evidence, err := backend.SearchVector(context.Background(), shoalql.VectorSearchRequest{
+		Index: "graph_ivf", Query: []float32{1, 0, 0, 0}, TopK: 2, NProbe: 2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) != 1 || hits[0].ID != "evt:a" || evidence.Generation != 1 {
+		t.Fatalf("hits=%+v evidence=%+v", hits, evidence)
+	}
+}
+
+func containsCapability(values []shoalql.Capability, want shoalql.Capability) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }
 
 // These tiny helpers avoid coupling this external test package to unexported

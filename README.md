@@ -138,9 +138,13 @@ file.
 
 ShoalQL also has an Accumulo client backend with the same scalar, graph,
 document, and exact-vector semantics. It pushes native scan constraints and
-uses an explicit deterministic local fallback for Shoal-only iterators; it
-does not claim distributed approximate-vector support. See
-[`docs/shoalql-accumulo.md`](docs/shoalql-accumulo.md).
+uses an explicit deterministic local fallback for Shoal-only iterators.
+Both embedded and Accumulo backends can attach the format-neutral distributed
+IVF-PQ lifecycle for explicitly selected approximate graph or document
+semantic queries. Freshness failures never silently use a stale generation:
+the query fails or takes an explicitly enabled exact fallback. See
+[`docs/shoalql-accumulo.md`](docs/shoalql-accumulo.md) and
+[`docs/distributed-vector-index.md`](docs/distributed-vector-index.md).
 
 Use `shoal-sql --explain --query 'SELECT ...'` to print the physical plan and
 the table's configured write format, authoritative read formats, and mixed

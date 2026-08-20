@@ -1,8 +1,10 @@
 package enginebackend
 
 import (
+	"context"
 	"fmt"
 	"sort"
+	"strings"
 	"testing"
 
 	"github.com/phrocker/shoal/internal/cclient"
@@ -10,6 +12,7 @@ import (
 	"github.com/phrocker/shoal/internal/engine"
 	"github.com/phrocker/shoal/internal/shoalql"
 	"github.com/phrocker/shoal/internal/tablet"
+	"github.com/phrocker/shoal/internal/vectorindex"
 )
 
 // docSpec describes one document to write across the document and global-index
@@ -150,10 +153,67 @@ func TestDocE2E_ParquetParity(t *testing.T) {
 		defer eng.Close()
 		return idsOf(t, runE2E(t, cat, exec, query, shoalql.PlanOptions{}))
 	}
+
 	rfileIDs := run(tablet.FormatRFile)
 	parquetIDs := run(tablet.FormatParquet)
 	if fmt.Sprint(parquetIDs) != fmt.Sprint(rfileIDs) {
 		t.Fatalf("document query differs: rfile=%v parquet=%v", rfileIDs, parquetIDs)
+	}
+}
+
+func TestDocE2E_SemanticIndexHydratesDocumentIdentity(t *testing.T) {
+	eng, _, cat := newEngineWithDocs(t)
+	defer eng.Close()
+	store := vectorindex.NewMemoryStore()
+	manager := vectorindex.New(store, vectorindex.Config{
+		NList: 2, Subspaces: 2, CentroidsPerSpace: 2, MaxIterations: 10,
+		Seed: 7, ShardCount: 2,
+	})
+	records := []vectorindex.VectorRecord{
+		{ID: "email/u1", Vector: []float32{1, 0, 0, 0}, Timestamp: 100,
+			Document: vectorindex.DocumentRef{Shard: "20240101_1", Datatype: "email", UID: "u1"}},
+		{ID: "email/u2", Vector: []float32{0, 1, 0, 0}, Timestamp: 100,
+			Document: vectorindex.DocumentRef{Shard: "20240101_2", Datatype: "email", UID: "u2"}},
+		{ID: "email/u3", Vector: []float32{0.9, 0.1, 0, 0}, Timestamp: 100,
+			Document: vectorindex.DocumentRef{Shard: "20240102_1", Datatype: "email", UID: "u3"}},
+	}
+	if _, err := manager.Build(context.Background(), "docs_ivf", records, 100); err != nil {
+		t.Fatal(err)
+	}
+	exec := shoalql.NewExecutor(NewWithVector(eng, shoalql.ManagedVectorSearcher{Manager: manager}))
+	res := runE2E(t, cat, exec,
+		"SELECT id, SUBJECT FROM emails ORDER BY embedding <-> [1,0,0,0] LIMIT 2",
+		shoalql.PlanOptions{Vector: shoalql.VectorOptions{
+			Mode: shoalql.VectorApproximate, Index: "docs_ivf", NProbe: 2,
+		}})
+	ids := idsOf(t, res)
+	if fmt.Sprint(ids) != "[u1 u3]" {
+		t.Fatalf("semantic document ids = %v, rows=%+v", ids, res.Rows)
+	}
+	filtered := runE2E(t, cat, exec,
+		"SELECT id FROM emails WHERE SENDER = 'alice' ORDER BY embedding <-> [0,1,0,0] LIMIT 2",
+		shoalql.PlanOptions{Vector: shoalql.VectorOptions{
+			Mode: shoalql.VectorApproximate, Index: "docs_ivf", NProbe: 2,
+		}})
+	if got := idsOf(t, filtered); fmt.Sprint(got) != "[u1 u3]" {
+		t.Fatalf("semantic predicate must filter before top-k: %v", got)
+	}
+	explain := runE2E(t, cat, exec,
+		"EXPLAIN FORMAT JSON SELECT id FROM emails ORDER BY embedding <-> [1,0,0,0] LIMIT 2",
+		shoalql.PlanOptions{Vector: shoalql.VectorOptions{
+			Mode: shoalql.VectorApproximate, Index: "docs_ivf", NProbe: 2,
+			Freshness:     vectorindex.Freshness{RequiredGeneration: 1, MinimumWatermark: 100},
+			ExactFallback: true,
+		}}).Rows[0][0].Str
+	for _, want := range []string{
+		`"generation":1`, `"codebook_version":`, `"indexed_watermark":100`,
+		`"vector_freshness":`, `"recall_claimed":false`,
+		`index has no reproducible corpus benchmark`,
+		`exact fallback is enabled explicitly`,
+	} {
+		if !strings.Contains(explain, want) {
+			t.Fatalf("EXPLAIN missing %q: %s", want, explain)
+		}
 	}
 }
 
