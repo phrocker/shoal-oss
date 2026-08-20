@@ -199,6 +199,22 @@ capi:
 	rm -f bin/capi/shoal-cgo.h
 	cp capi/include/shoal.h capi/include/shoal_types.h bin/capi/
 
+.PHONY: python-test
+python-test:
+	cd python && python -m unittest discover -s tests -v
+
+.PHONY: python-dist
+python-dist:
+	python python/scripts/build_release.py
+
+.PHONY: python-dist-verify
+python-dist-verify:
+	python python/scripts/verify_release.py
+
+.PHONY: python-release-validate
+python-release-validate: python-test python-dist python-dist-verify
+	go test -tags=shoal_capi_test ./cmd/shoal-capi
+
 .PHONY: docs-validate
 docs-validate:
 	python docs/test_validate_sharkbite_matrix.py
@@ -263,4 +279,5 @@ vet:
 
 .PHONY: clean
 clean:
-	rm -rf $(THRIFT_OUT) bin
+	rm -rf $(THRIFT_OUT) bin python/build python/dist \
+	  python/src/sharkbite/.libs python/src/*.egg-info

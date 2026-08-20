@@ -1,13 +1,15 @@
 # shoal
 
-## Python foundation
+## Python distribution
 
-An incremental, explicitly partial Python binding is available under
+The `shoal-sharkbite` distribution is available under
 [`python/`](python/README.md). It supports both `import sharkbite` and
 `import pysharkbite`, negotiates the stable C ABI at runtime, and provides
 scanning, mutation/batch-writer, and table/namespace/security administration
 paths. It is not yet a complete Sharkbite-compatible distribution;
-unsupported legacy APIs fail explicitly.
+unsupported legacy APIs fail explicitly. Linux manylinux_2_28 x86-64 is the
+first supported wheel target; macOS and Windows remain explicitly documented
+previews. See the [release and native-library policy](docs/python-release.md).
 
 A Go sorted key-value store with graph and vector query pushdown.
 Independent project — inspired by [Apache Accumulo](https://accumulo.apache.org)'s

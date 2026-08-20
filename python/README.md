@@ -1,8 +1,9 @@
 # Shoal Python binding
 
 This is an independently usable **incremental binding**, not a complete
-Sharkbite replacement and not a release of the `sharkbite` distribution.
-It installs the import-compatible modules `sharkbite` and `pysharkbite`.
+Sharkbite replacement and not a release under the reserved `sharkbite`
+distribution name. The distribution is named `shoal-sharkbite`; it installs
+the import-compatible modules `sharkbite` and `pysharkbite`.
 
 Supported now:
 
@@ -32,8 +33,10 @@ set SHOAL_LIBRARY=C:\path\to\shoal.dll
 ```
 
 On Linux/macOS set `SHOAL_LIBRARY` to `libshoal.so`/`libshoal.dylib`.
-Without it, the loader checks a packaged `.libs` directory, the platform
-loader search path, and common repository build locations.
+Platform wheels load their checksum-verified private `.libs` library. Source
+installs require an explicit absolute `SHOAL_LIBRARY` path. System loader
+search is disabled unless `SHOAL_ALLOW_SYSTEM_LIBRARY=1`; the current working
+directory and repository build paths are never searched implicitly.
 
 ```python
 from sharkbite import Client
@@ -81,3 +84,8 @@ with Connector("accumulo", "zk1:2181", "root", "secret") as connector:
 
 Online compaction, legacy chunked iterators, and other surfaces without an
 equivalent stable C ABI remain explicit `NotImplementedError` paths.
+
+See the repository's
+[release policy](https://github.com/phrocker/shoal-oss/blob/main/docs/python-release.md)
+for platform status, reproducible build commands, artifact verification,
+checksums, and signing.

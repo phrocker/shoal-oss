@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import ctypes as C
 import ctypes.util
+import hashlib
+import json
 import os
 import sys
 from dataclasses import dataclass
@@ -11,6 +13,7 @@ from typing import Iterable
 from .errors import exception_for_status
 
 ABI_MAJOR = 1
+MIN_ABI_VERSION = (1, 16, 0)
 CAP_OWNED_SCAN_RESULT = 5
 CAP_MUTATION = 6
 CAP_BATCH_WRITER = 7
@@ -346,21 +349,46 @@ def library_candidates(explicit: str | os.PathLike[str] | None = None) -> Iterab
     seen: set[str] = set()
     values: list[str] = []
     if explicit:
-        values.append(os.fspath(explicit))
-    if os.environ.get("SHOAL_LIBRARY"):
-        values.append(os.environ["SHOAL_LIBRARY"])
+        values.append(str(Path(explicit).expanduser().resolve()))
+    configured = os.environ.get("SHOAL_LIBRARY")
+    if configured:
+        configured_path = Path(configured).expanduser()
+        if not configured_path.is_absolute():
+            raise ImportError("SHOAL_LIBRARY must be an absolute path")
+        values.append(str(configured_path.resolve()))
     package_libs = Path(__file__).resolve().parent / ".libs"
-    roots = (Path.cwd(), Path.cwd() / "bin" / "capi", package_libs)
-    for root in roots:
+    for root in (package_libs,):
         values.extend(str(root / name) for name in _library_names())
-    found = ctypes.util.find_library("shoal")
-    if found:
-        values.append(found)
-    values.extend(_library_names())
+    if os.environ.get("SHOAL_ALLOW_SYSTEM_LIBRARY") == "1":
+        found = ctypes.util.find_library("shoal")
+        if found:
+            values.append(found)
+        values.extend(_library_names())
     for value in values:
         if value not in seen:
             seen.add(value)
             yield value
+
+
+def _verify_bundled_library(path: Path) -> None:
+    package_libs = Path(__file__).resolve().parent / ".libs"
+    try:
+        path.resolve().relative_to(package_libs.resolve())
+    except ValueError:
+        return
+    manifest_path = package_libs / "_shoal_bundle.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        entry = manifest["library"]
+        expected_name = entry["filename"]
+        expected_hash = entry["sha256"]
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ImportError("bundled Shoal library manifest is missing or invalid") from exc
+    if path.name != expected_name:
+        raise ImportError(f"bundled Shoal library {path.name!r} is not in its manifest")
+    actual_hash = hashlib.sha256(path.read_bytes()).hexdigest()
+    if actual_hash != expected_hash:
+        raise ImportError("bundled Shoal library checksum does not match its manifest")
 
 
 def _bytes(value: Bytes) -> bytes:
@@ -374,19 +402,28 @@ class NativeAPI:
         failures: list[str] = []
         self.lib: C.CDLL
         self.path = ""
+        self._dll_directory = None
         for candidate in library_candidates(library):
             try:
+                candidate_path = Path(candidate)
+                if candidate_path.is_absolute():
+                    _verify_bundled_library(candidate_path)
+                    if sys.platform == "win32" and candidate_path.parent.exists():
+                        self._dll_directory = os.add_dll_directory(
+                            str(candidate_path.parent)
+                        )
                 self.lib = C.CDLL(candidate)
                 self.path = candidate
                 break
-            except OSError as exc:
+            except (ImportError, OSError) as exc:
                 failures.append(f"{candidate}: {exc}")
         else:
             raise ImportError(
                 "unable to load the Shoal shared library; set SHOAL_LIBRARY. "
                 + " | ".join(failures[-3:])
             )
-        self._bind()
+        self._symbols: set[str] = set()
+        self._bind_discovery()
         major = int(self.lib.shoal_abi_version_major())
         if major != ABI_MAJOR:
             raise ImportError(f"unsupported Shoal ABI major {major}; expected {ABI_MAJOR}")
@@ -395,12 +432,24 @@ class NativeAPI:
             int(self.lib.shoal_abi_version_minor()),
             int(self.lib.shoal_abi_version_patch()),
         )
+        if self.version < MIN_ABI_VERSION:
+            raise ImportError(
+                "Shoal ABI "
+                + ".".join(map(str, self.version))
+                + " is older than required "
+                + ".".join(map(str, MIN_ABI_VERSION))
+            )
+        packed = int(self.lib.shoal_abi_version_packed())
+        expected_packed = (major << 16) | (self.version[1] << 8) | self.version[2]
+        if packed != expected_packed:
+            raise ImportError("Shoal ABI version queries are inconsistent")
         count = int(self.lib.shoal_abi_capability_count())
         self.capabilities = frozenset(
             capability
             for capability in range(count)
             if self.lib.shoal_abi_has_capability(capability)
         )
+        self._bind()
         self.info = RuntimeInfo(self.path, self.version, self.capabilities)
 
     def _function(
@@ -417,15 +466,17 @@ class NativeAPI:
         self._symbols.add(name)
         return True
 
-    def _bind(self) -> None:
-        P = C.c_void_p
-        PP = C.POINTER(P)
-        self._symbols: set[str] = set()
+    def _bind_discovery(self) -> None:
         self._function("shoal_abi_version_major", C.c_uint32)
         self._function("shoal_abi_version_minor", C.c_uint32)
         self._function("shoal_abi_version_patch", C.c_uint32)
+        self._function("shoal_abi_version_packed", C.c_uint32)
         self._function("shoal_abi_capability_count", C.c_uint32)
         self._function("shoal_abi_has_capability", C.c_uint8, C.c_uint32)
+
+    def _bind(self) -> None:
+        P = C.c_void_p
+        PP = C.POINTER(P)
         self._function("shoal_connector_config_init", None, C.POINTER(ConnectorConfig))
         self._function("shoal_connector_create", C.c_int32, C.POINTER(ConnectorConfig), PP, PP)
         self._function("shoal_connector_close", C.c_int32, P, PP)
