@@ -16,7 +16,7 @@ from ._native import (
     as_bytes,
     c_bytes,
 )
-from .client import Key
+from .data import Key, KeyValue
 
 
 def _timeout_ms(timeout: float | None) -> int:
@@ -388,19 +388,6 @@ def _encode_vlong(value: int) -> bytes:
     return struct.pack("b", head - count) + encoded.to_bytes(count, "big")
 
 
-@dataclass(frozen=True)
-class KeyValue:
-    key: Key
-    value: bytes
-    deleted: bool = False
-
-    def getKey(self) -> Key:
-        return self.key
-
-    def getValue(self) -> bytes:
-        return self.value
-
-
 class SequentialRFile:
     def __init__(
         self,
@@ -431,7 +418,7 @@ class SequentialRFile:
             native, buffer = c_bytes(data)
             setattr(entry.key, field, native)
             keepalive.append(buffer)
-        native_value, buffer = c_bytes(value.value)
+        native_value, buffer = c_bytes(bytes(value.value))
         entry.value = native_value
         keepalive.append(buffer)
         entry.key.timestamp = value.key.timestamp

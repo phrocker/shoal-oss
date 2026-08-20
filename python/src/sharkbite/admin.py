@@ -4,6 +4,7 @@ import ctypes as C
 from enum import IntEnum
 from typing import Iterable
 
+from .data import Authorizations
 from .errors import AlreadyExistsError, ClientException, NotFoundError
 from ._native import (
     CAP_NAMESPACE_ADMIN,
@@ -78,15 +79,6 @@ class NamespacePermissions(IntEnum):
     DROP_TABLE = 6
     BULK_IMPORT = 7
     DROP_NAMESPACE = 8
-
-
-class Authorizations(tuple[bytes, ...]):
-    def __new__(cls, values: Iterable[str | bytes] = ()) -> Authorizations:
-        return super().__new__(cls, (as_bytes(value) for value in values))
-
-    def getAuthorizations(self) -> list[bytes]:
-        return list(self)
-
 
 class _Operations:
     def __init__(self, connector: object) -> None:

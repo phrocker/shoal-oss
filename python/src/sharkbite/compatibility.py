@@ -20,15 +20,94 @@ class ScannerOptions(IntFlag):
     ENABLE_RFILE_SCANNER = RFileScanOnly
 
 
-class PythonIterator:
-    def __init__(self, name: str, script_or_priority: str | int, priority: int | None = None):
-        self._name = name
-        if priority is None:
-            self._script = ""
-            self._priority = int(script_or_priority)
-        else:
-            self._script = str(script_or_priority)
+class IterInfo:
+    def __init__(self, *args: object, **kwargs: object):
+        iterator_type = kwargs.pop("type", None)
+        if kwargs:
+            name = next(iter(kwargs))
+            raise TypeError(f"unexpected keyword argument {name!r}")
+        if len(args) == 3 and isinstance(args[2], int):
+            first, second, priority = args
+            script_like = (
+                iterator_type is not None
+                or "\n" in str(first)
+                or str(first).lstrip().startswith(("class ", "def ", "lambda "))
+            )
+            if iterator_type is not None and str(iterator_type) != "Python":
+                raise ValueError("script IterInfo type must be 'Python'")
+            if str(second) == "Python" or script_like:
+                self._script = str(first)
+                self._name = str(second) if str(second) != "Python" else str(first)
+                self._class_name = "org.poma.accumulo.JythonIterator"
+            else:
+                self._script = ""
+                self._name = str(first)
+                self._class_name = str(second)
             self._priority = int(priority)
+        elif len(args) == 4:
+            script, name, priority, positional_type = args
+            if iterator_type is not None:
+                raise TypeError("IterInfo type was provided twice")
+            if str(positional_type) != "Python":
+                raise ValueError("script IterInfo type must be 'Python'")
+            self._script = str(script)
+            self._name = str(name)
+            self._class_name = "org.poma.accumulo.JythonIterator"
+            self._priority = int(priority)
+        else:
+            raise TypeError(
+                "IterInfo expects (name, class_name, priority) or "
+                "(script, iterator_name, priority, type='Python')"
+            )
+
+    def getPriority(self) -> int:
+        return self._priority
+
+    def priority(self) -> int:
+        return self.getPriority()
+
+    def getName(self) -> str:
+        return self._name
+
+    def name(self) -> str:
+        return self.getName()
+
+    def getClass(self) -> str:
+        return self._class_name
+
+    def _class_alias(self) -> str:
+        return self.getClass()
+
+    def __eq__(self, other: object) -> bool:
+        return (
+            isinstance(other, IterInfo)
+            and self._name == other._name
+            and self._class_name == other._class_name
+            and self._priority == other._priority
+            and self._script == other._script
+        )
+
+    def __hash__(self) -> int:
+        return hash((self._name, self._class_name, self._priority, self._script))
+
+    def __repr__(self) -> str:
+        return (
+            f"IterInfo({self._name!r}, {self._class_name!r}, "
+            f"{self._priority!r})"
+        )
+
+
+setattr(IterInfo, "class", IterInfo._class_alias)
+
+
+class PythonIterator(IterInfo):
+    def __init__(self, name: str, script_or_priority: str | int, priority: int | None = None):
+        if priority is None:
+            super().__init__(name, "org.poma.accumulo.JythonIterator", int(script_or_priority))
+            self._script = ""
+        else:
+            super().__init__(name, "org.poma.accumulo.JythonIterator", int(priority))
+            self._script = str(script_or_priority)
 
     def onNext(self, source: str) -> PythonIterator:
         if self._script:
@@ -52,6 +131,10 @@ class PythonIterator:
 
     def getClass(self) -> str:
         return "org.poma.accumulo.JythonIterator"
+
+    @property
+    def script(self) -> str:
+        return self._script
 
 
 def unsupported_scanner_option(option: ScannerOptions | int) -> NotImplementedError:

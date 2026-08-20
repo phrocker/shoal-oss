@@ -17,7 +17,6 @@ shoal_error_source
 shoal_error_source_name
 shoal_error_compatibility
 shoal_error_compatibility_name
-shoal_error_compatibility_code
 shoal_key_value_init
 shoal_key_to_string
 shoal_owned_key_create
@@ -127,8 +126,6 @@ shoal_hdfs_client_list
 shoal_hdfs_client_stat
 shoal_hdfs_client_remove
 shoal_hdfs_client_rename
-shoal_hdfs_client_mkdir
-shoal_hdfs_client_chown
 shoal_hdfs_input_stream_read
 shoal_hdfs_input_stream_close
 shoal_hdfs_input_stream_free
@@ -303,7 +300,6 @@ shoal_batch_writer_close
 shoal_batch_writer_free
 shoal_logging_set_level
 shoal_logging_get_level
-shoal_logging_set_callback
 shoal_connector_create_accumulo_writer
 shoal_accumulo_writer_put
 shoal_accumulo_writer_put_delete
@@ -464,7 +460,6 @@ shoal_connector_table_exists
 shoal_connector_versioned_namespace_properties
 shoal_error_code
 shoal_error_compatibility
-shoal_error_compatibility_code
 shoal_error_compatibility_name
 shoal_error_free
 shoal_error_message
@@ -473,13 +468,11 @@ shoal_error_security_user
 shoal_error_source
 shoal_error_source_name
 shoal_error_visibility_parse
-shoal_hdfs_client_chown
 shoal_hdfs_client_close
 shoal_hdfs_client_create
 shoal_hdfs_client_create_file
 shoal_hdfs_client_free
 shoal_hdfs_client_list
-shoal_hdfs_client_mkdir
 shoal_hdfs_client_open
 shoal_hdfs_client_remove
 shoal_hdfs_client_rename
@@ -506,7 +499,6 @@ shoal_key_value_init
 shoal_key_value_result_free
 shoal_key_value_result_get
 shoal_logging_get_level
-shoal_logging_set_callback
 shoal_logging_set_level
 shoal_mutation_create
 shoal_mutation_delete

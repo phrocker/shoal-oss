@@ -1215,7 +1215,10 @@ int main(void) {
   shoal_key_value_view entry;
   memset(&entry, 0, sizeof(entry));
   assert(shoal_scan_result_get(result, 1, &entry, &error) == SHOAL_STATUS_OK);
-  assert(entry.value.length == 1 && entry.value.data[0] == 1);
+  assert(entry.timestamp == -7);
+  assert(entry.value.length == 3);
+  assert(entry.value.data[0] == 0 && entry.value.data[1] == 1 &&
+         entry.value.data[2] == 0);
   shoal_scan_result_free(&result);
 
   assert(shoal_test_scanners_create(&scanner, &batch_scanner) == 1);

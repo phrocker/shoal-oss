@@ -998,6 +998,10 @@ func shoal_test_client_create(outClient **C.shoal_client) C.int {
 				Value: []byte{byte(index)},
 			}
 		}
+		if len(values) > 1 {
+			values[1].Key.Timestamp = -7
+			values[1].Value = []byte{0, 1, 0}
+		}
 		return &testSeamScanCursor{ctx: ctx, entries: values}, nil
 	}
 	id, ok := clients.add(client)

@@ -52,7 +52,7 @@ class FakeLibrary:
         self.shoal_mutation_create = Function(self._mutation_create)
         self.shoal_mutation_put = Function(self._mutation_put)
         self.shoal_mutation_put_latest = Function(lambda *args: self._record("put_latest", *args))
-        self.shoal_mutation_delete = Function(lambda *args: self._record("delete", *args))
+        self.shoal_mutation_delete = Function(self._mutation_delete)
         self.shoal_mutation_delete_latest = Function(lambda *args: self._record("delete_latest", *args))
         self.shoal_mutation_size = Function(self._mutation_size)
         self.shoal_mutation_free = Function(lambda *_: self.frees.append("mutation"))
@@ -90,6 +90,10 @@ class FakeLibrary:
 
     def _mutation_put(self, handle, cf, cq, cv, timestamp, value, error):
         self.calls.append(("put", raw(cf), raw(cq), raw(cv), timestamp, raw(value)))
+        return 0
+
+    def _mutation_delete(self, handle, cf, cq, cv, timestamp, error):
+        self.calls.append(("delete", raw(cf), raw(cq), raw(cv), timestamp))
         return 0
 
     def _mutation_size(self, handle, out_size, error):
@@ -280,6 +284,28 @@ class WriterAdminTests(unittest.TestCase):
         self.assertEqual(records[0].msg, "shoal.logging.level_changed")
         self.assertEqual(records[0].shoal, {"level": "debug"})
         self.assertNotIn("password", records[0].shoal)
+
+    def test_mutation_overloads_and_legacy_keyword_names_are_exact(self):
+        with self.assertRaises(ClientException):
+            Mutation(b"", _api=self.api)
+        with Mutation(b"row", _api=self.api) as mutation:
+            mutation.put()
+            mutation.put(b"cf", b"cq")
+            mutation.put(cf=b"f", cq=b"q", cv=b"v", timestamp=11, value=b"x")
+            mutation.put(
+                column_family=b"family",
+                column_qualifier=b"qualifier",
+                column_visibility=b"visibility",
+            )
+            mutation.putDelete(b"df", b"dq", b"dv")
+        self.assertIn(("put", b"", b"", b"", 0, b""), self.api.lib.calls)
+        self.assertIn(("put", b"cf", b"cq", b"", 0, b""), self.api.lib.calls)
+        self.assertIn(("put", b"f", b"q", b"v", 11, b"x"), self.api.lib.calls)
+        self.assertIn(
+            ("put", b"family", b"qualifier", b"visibility", 0, b""),
+            self.api.lib.calls,
+        )
+        self.assertIn(("delete", b"df", b"dq", b"dv", 0), self.api.lib.calls)
 
     def test_table_namespace_security_legacy_shapes(self):
         table = self.connector.tableOps("t")
