@@ -14,6 +14,7 @@ from ._native import (
     as_bytes,
     c_bytes,
 )
+from .errors import ClientException
 
 
 @dataclass(frozen=True)
@@ -37,7 +38,10 @@ class Mutation:
     ) -> None:
         self._api = _api or NativeAPI(library)
         self._api.require(CAP_MUTATION)
-        row_view, row_buffer = c_bytes(as_bytes(row))
+        row_bytes = as_bytes(row)
+        if not row_bytes:
+            raise ClientException("mutation row must be non-empty")
+        row_view, row_buffer = c_bytes(row_bytes)
         self._handle = C.c_void_p()
         error = C.c_void_p()
         status = self._api.lib.shoal_mutation_create(
@@ -53,17 +57,19 @@ class Mutation:
 
     def put(
         self,
-        column_family: str | bytes = b"",
-        column_qualifier: str | bytes = b"",
-        column_visibility: str | bytes = b"",
+        cf: str | bytes = b"",
+        cq: str | bytes = b"",
+        cv: str | bytes = b"",
         timestamp: int = 0,
         value: str | bytes = b"",
+        **aliases: str | bytes,
     ) -> Mutation:
+        cf, cq, cv = self._column_aliases(cf, cq, cv, aliases)
         self._update(
             "shoal_mutation_put",
-            column_family,
-            column_qualifier,
-            column_visibility,
+            cf,
+            cq,
+            cv,
             timestamp,
             value,
         )
@@ -87,15 +93,17 @@ class Mutation:
 
     def delete(
         self,
-        column_family: str | bytes = b"",
-        column_qualifier: str | bytes = b"",
-        column_visibility: str | bytes = b"",
+        cf: str | bytes = b"",
+        cq: str | bytes = b"",
+        cv: str | bytes = b"",
         timestamp: int = 0,
+        **aliases: str | bytes,
     ) -> Mutation:
+        cf, cq, cv = self._column_aliases(cf, cq, cv, aliases)
         self._ensure_open()
         views = [
             c_bytes(as_bytes(value))
-            for value in (column_family, column_qualifier, column_visibility)
+            for value in (cf, cq, cv)
         ]
         error = C.c_void_p()
         status = self._api.lib.shoal_mutation_delete(
@@ -106,6 +114,16 @@ class Mutation:
         )
         self._api.check(status, error)
         return self
+
+    def putDelete(
+        self,
+        cf: str | bytes = b"",
+        cq: str | bytes = b"",
+        cv: str | bytes = b"",
+        timestamp: int = 0,
+        **aliases: str | bytes,
+    ) -> Mutation:
+        return self.delete(cf, cq, cv, timestamp, **aliases)
 
     def delete_latest(
         self,
@@ -165,6 +183,28 @@ class Mutation:
             C.byref(error),
         )
         self._api.check(status, error)
+
+    @staticmethod
+    def _column_aliases(
+        cf: str | bytes,
+        cq: str | bytes,
+        cv: str | bytes,
+        aliases: dict[str, str | bytes],
+    ) -> tuple[str | bytes, str | bytes, str | bytes]:
+        supported = {
+            "column_family": "cf",
+            "column_qualifier": "cq",
+            "column_visibility": "cv",
+        }
+        values = {"cf": cf, "cq": cq, "cv": cv}
+        for alias, value in aliases.items():
+            target = supported.get(alias)
+            if target is None:
+                raise TypeError(f"unexpected keyword argument {alias!r}")
+            if values[target] not in (b"", ""):
+                raise TypeError(f"{target!r} and {alias!r} are mutually exclusive")
+            values[target] = value
+        return values["cf"], values["cq"], values["cv"]
 
     def _update_latest(
         self,

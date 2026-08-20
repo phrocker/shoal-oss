@@ -27,36 +27,13 @@ from ._native import (
     as_bytes,
     c_bytes,
 )
+from .data import Key
 from .compatibility import (
     PythonIterator,
     ScannerOptions,
     unsupported_python_iterator,
     unsupported_scanner_option,
 )
-
-
-@dataclass(frozen=True)
-class Key:
-    row: bytes
-    column_family: bytes
-    column_qualifier: bytes
-    column_visibility: bytes
-    timestamp: int
-
-    def getRow(self) -> bytes:
-        return self.row
-
-    def getColumnFamily(self) -> bytes:
-        return self.column_family
-
-    def getColumnQualifier(self) -> bytes:
-        return self.column_qualifier
-
-    def getColumnVisibility(self) -> bytes:
-        return self.column_visibility
-
-    def getTimestamp(self) -> int:
-        return self.timestamp
 
 
 class _Config:

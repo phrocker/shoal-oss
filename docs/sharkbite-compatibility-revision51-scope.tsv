@@ -1,7 +1,7 @@
-# Revision-50 Sharkbite client-scope disposition manifest.
-# Matrix: docs/sharkbite-compatibility.md revision 50.
+# Revision-51 Sharkbite client-scope disposition manifest.
+# Matrix: docs/sharkbite-compatibility.md revision 51.
 # Sharkbite source: phrocker/sharkbite@7f2625f74331b0cd4a75dc0484949c40f1409686.
-# Shoal source: phrocker/shoal-oss@42cb379fb9cb0bf625adec477429b86bc0cd852b.
+# Shoal source: phrocker/shoal-oss@9444ce5169b3445ea2370d383ec3dfd8f47f706c.
 # Policy: docs/sharkbite-client-scope.md.
 # Columns: ROW-ID<TAB>DISPOSITION<TAB>RULE<TAB>PINNED-MATRIX-STATUS.
 # Entries are in matrix order; validator rules, not aggregate counts, authorize dispositions.
@@ -143,25 +143,25 @@ SB-DATA-065	Covered	core-covered	Covered
 SB-DATA-066	Covered	core-covered	Covered
 SB-DATA-067	Covered	core-covered	Covered
 SB-DATA-068	Covered	core-covered	Covered
-SB-SCAN-001	Required gap	core-required-gap	Behavior mismatch
-SB-SCAN-002	Required gap	core-required-gap	Behavior mismatch
-SB-SCAN-003	Required gap	core-required-gap	Missing C ABI
+SB-SCAN-001	Covered	core-covered	Covered
+SB-SCAN-002	Covered	core-covered	Covered
+SB-SCAN-003	Covered	core-covered	Covered
 SB-SCAN-004	Covered	core-covered	Covered
-SB-SCAN-005	Required gap	core-required-gap	Behavior mismatch
-SB-SCAN-006	Required gap	core-required-gap	Behavior mismatch
-SB-SCAN-007	Required gap	core-required-gap	Missing Go
-SB-SCAN-008	Required gap	core-required-gap	Missing Go
-SB-SCAN-009	Required gap	core-required-gap	Missing Go
-SB-SCAN-010	Required gap	core-required-gap	Behavior mismatch
-SB-SCAN-011	Required gap	core-required-gap	Missing C ABI
-SB-SCAN-028	Required gap	core-required-gap	Missing C ABI
-SB-SCAN-012	Required gap	core-required-gap	Behavior mismatch
+SB-SCAN-005	Covered	core-covered	Covered
+SB-SCAN-006	Covered	core-covered	Covered
+SB-SCAN-007	Approved divergence	core-approved-divergence	Intentional divergence (approval required)
+SB-SCAN-008	Approved divergence	core-approved-divergence	Intentional divergence (approval required)
+SB-SCAN-009	Approved divergence	core-approved-divergence	Intentional divergence (approval required)
+SB-SCAN-010	Covered	core-covered	Covered
+SB-SCAN-011	Covered	core-covered	Covered
+SB-SCAN-028	Covered	core-covered	Covered
+SB-SCAN-012	Covered	core-covered	Covered
 SB-SCAN-013	Not required	not-required-rationale	Not required (rationale required)
 SB-SCAN-014	Approved divergence	core-approved-divergence	Intentional divergence (approval required)
 SB-SCAN-015	Approved divergence	core-approved-divergence	Intentional divergence (approval required)
 SB-SCAN-016	Approved divergence	core-approved-divergence	Intentional divergence (approval required)
-SB-SCAN-017	Required gap	core-required-gap	Behavior mismatch
-SB-SCAN-018	Required gap	core-required-gap	Behavior mismatch
+SB-SCAN-017	Covered	core-covered	Covered
+SB-SCAN-018	Covered	core-covered	Covered
 SB-SCAN-019	Covered	core-covered	Covered
 SB-SCAN-020	Covered	core-covered	Covered
 SB-SCAN-021	Covered	core-covered	Covered
@@ -201,21 +201,21 @@ SB-PANDA-018	Optional	optional-python-extra	Missing C ABI
 SB-PANDA-019	Optional	optional-python-extra	Missing C ABI
 SB-PANDA-020	Optional	optional-python-extra	Missing C ABI
 SB-PANDA-021	Optional	optional-python-extra	Missing C ABI
-SB-WRITE-001	Required gap	core-required-gap	Behavior mismatch
-SB-WRITE-002	Required gap	core-required-gap	Behavior mismatch
-SB-WRITE-003	Required gap	core-required-gap	Behavior mismatch
-SB-WRITE-004	Required gap	core-required-gap	Behavior mismatch
-SB-WRITE-005	Required gap	core-required-gap	Missing C ABI
-SB-WRITE-023	Required gap	core-required-gap	Missing C ABI
+SB-WRITE-001	Covered	core-covered	Covered
+SB-WRITE-002	Covered	core-covered	Covered
+SB-WRITE-003	Covered	core-covered	Covered
+SB-WRITE-004	Covered	core-covered	Covered
+SB-WRITE-005	Covered	core-covered	Covered
+SB-WRITE-023	Covered	core-covered	Covered
 SB-WRITE-006	Covered	core-covered	Covered
 SB-WRITE-007	Not required	not-required-rationale	Not required (rationale required)
 SB-WRITE-008	Not required	not-required-rationale	Not required (rationale required)
 SB-WRITE-009	Not required	not-required-rationale	Not required (rationale required)
-SB-WRITE-010	Required gap	core-required-gap	Behavior mismatch
+SB-WRITE-010	Approved divergence	core-approved-divergence	Intentional divergence (approval required)
 SB-WRITE-011	Not required	not-required-rationale	Not required (rationale required)
-SB-WRITE-012	Required gap	core-required-gap	Behavior mismatch
+SB-WRITE-012	Covered	core-covered	Covered
 SB-WRITE-013	Not required	not-required-rationale	Not required (rationale required)
-SB-WRITE-014	Required gap	core-required-gap	Behavior mismatch
+SB-WRITE-014	Covered	core-covered	Covered
 SB-WRITE-015	Not required	not-required-rationale	Not required (rationale required)
 SB-WRITE-016	Covered	core-covered	Covered
 SB-WRITE-017	Covered	core-covered	Covered
