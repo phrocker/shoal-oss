@@ -4,6 +4,9 @@ This is an independently usable **incremental binding**, not a complete
 Sharkbite replacement and not a release under the reserved `sharkbite`
 distribution name. The distribution is named `shoal-sharkbite`; it installs
 the import-compatible modules `sharkbite` and `pysharkbite`.
+The [normative scope ADR](../docs/sharkbite-client-scope.md) currently records
+397 required rows, 208 satisfied rows, and 189 explicit core gaps; optional
+Torch, pandas, embedded, and historical C++ surfaces do not block this package.
 
 Supported now:
 

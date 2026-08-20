@@ -17,7 +17,7 @@ import unicodedata
 
 
 DOC_PATH = Path(__file__).with_name("sharkbite-compatibility.md")
-EXPECTED_REVISION = 46
+EXPECTED_REVISION = 47
 CLUSTER_STATUS_APPROVAL_REVISION = 40
 # Update this manifest only when the independently audited inventory itself
 # changes; review every added/removed or reclassified ID in code review.
@@ -26,6 +26,9 @@ EXPECTED_ROW_MANIFEST = DOC_PATH.with_name(
 )
 EXPECTED_C_ABI_SYMBOL_MANIFEST = DOC_PATH.with_name(
     f"sharkbite-compatibility-revision{EXPECTED_REVISION}-cabi-symbols.txt"
+)
+EXPECTED_SCOPE_MANIFEST = DOC_PATH.with_name(
+    f"sharkbite-compatibility-revision{EXPECTED_REVISION}-scope.tsv"
 )
 
 STATUSES = {
@@ -40,7 +43,38 @@ STATUSES = {
 NOT_REQUIRED_STATUS = "Not required (rationale required)"
 INTENTIONAL_DIVERGENCE_STATUS = "Intentional divergence (approval required)"
 EXPECTED_TOTAL_ROWS = 3203
-EXPECTED_REQUIRED_ROWS = 2812
+EXPECTED_REQUIRED_ROWS = 397
+
+SCOPE_DISPOSITIONS = {
+    "Covered",
+    "Approved divergence",
+    "Required gap",
+    "Optional",
+    "Not required",
+}
+EXPECTED_SCOPE_COUNTS = {
+    "Covered": 118,
+    "Approved divergence": 90,
+    "Required gap": 189,
+    "Optional": 2763,
+    "Not required": 43,
+}
+OPTIONAL_SCOPE_PREFIXES = {
+    "SB-CPP",
+    "SB-CXX",
+    "SB-EMB",
+    "SB-PANDA",
+    "SB-TORCH",
+}
+OPTIONAL_SCOPE_ROWS = {"SB-PKG-012", "SB-PKG-013"}
+SCOPE_RULES = {
+    "core-covered",
+    "core-approved-divergence",
+    "core-required-gap",
+    "optional-legacy-cxx",
+    "optional-python-extra",
+    "not-required-rationale",
+}
 
 
 def status_count_map(
@@ -200,17 +234,17 @@ EXPECTED_METADATA_FIELDS = {
     ),
     "Sharkbite release line": "`sharkbite` 1.2.0.3 on PyPI (`setup.py:34-35`)",
     "Shoal reference": (
-        "`phrocker/shoal-oss` revision 46 starts from main merge "
-        "`ec74ca85f516a34629faab329d81db67fd9ae158` "
-        "(\"Merge pull request #184 from phrocker/phrocker/issue-59-final-parity\") "
-        "plus the cross-platform artifact evidence introduced in this revision"
+        "`phrocker/shoal-oss` revision 47 is pinned to main merge "
+        "`282bbfb849f9c4d6e8c9d9f9f098ff904de6feea` "
+        "(\"Merge pull request #188 from phrocker/agent/issue-71-write-tier-ops\")"
     ),
     "Shoal C ABI version": "`SHOAL_ABI_VERSION 1u` (`capi/include/shoal_types.h`)",
 }
 
 EXPECTED_DOCUMENT_STATUS_SNIPPETS = (
     "Normative gate. Binding on all Sharkbite-compatibility work.",
-    f"Revision {EXPECTED_REVISION} — adds deterministic cross-platform artifact evidence",
+    "Revision 47 — establishes the client-scope ADR",
+    "Revision 46 — adds deterministic cross-platform artifact evidence",
     "Revision 45 — completes the practical final client-parity slice",
     "Revision 44 — publishes the public HDFS client/stream contract",
     "Revision 42 — completes the 36-row owned mutable key ABI tranche",
@@ -244,9 +278,9 @@ INVENTORY_CHANGE_HINT = (
     "the audited inventory is pinned in docs/validate_sharkbite_matrix.py; an intentional "
     "inventory revision must update EXPECTED_REVISION, EXPECTED_TOTAL_ROWS, "
     "EXPECTED_REQUIRED_ROWS, EXPECTED_STATUS_COUNTS, EXPECTED_PREFIX_TOTALS, "
-    "EXPECTED_PREFIX_COUNTS and the row manifest "
+    "EXPECTED_PREFIX_COUNTS, EXPECTED_SCOPE_COUNTS, the row manifest "
     f"docs/{EXPECTED_ROW_MANIFEST.name} (row ids, order and pinned statuses) "
-    "in the same commit, together with the "
+    f"and scope manifest docs/{EXPECTED_SCOPE_MANIFEST.name} in the same commit, together with the "
     "audit evidence that justifies the new inventory"
 )
 
@@ -746,6 +780,15 @@ EXPECTED_ROW_MANIFEST_HEADER = (
     f"# Update only when the independently audited revision-{EXPECTED_REVISION} inventory itself changes.",
     "# Regenerate from the audited document, review every added/removed/reclassified row",
     "# in code review, and keep the list in document order for human auditability.",
+)
+EXPECTED_SCOPE_MANIFEST_HEADER = (
+    "# Revision-47 Sharkbite client-scope disposition manifest.",
+    "# Matrix: docs/sharkbite-compatibility.md revision 47.",
+    "# Sharkbite source: phrocker/sharkbite@7f2625f74331b0cd4a75dc0484949c40f1409686.",
+    "# Shoal source: phrocker/shoal-oss@282bbfb849f9c4d6e8c9d9f9f098ff904de6feea.",
+    "# Policy: docs/sharkbite-client-scope.md.",
+    "# Columns: ROW-ID<TAB>DISPOSITION<TAB>RULE<TAB>PINNED-MATRIX-STATUS.",
+    "# Entries are in matrix order; validator rules, not aggregate counts, authorize dispositions.",
 )
 
 C_ABI_EXPORT_HEADER_PATH = Path("capi/include/shoal.h")
@@ -1647,6 +1690,101 @@ def load_expected_rows() -> tuple[tuple[str, str], ...]:
     return rows
 
 
+def expected_scope_entry(row_id: str, status: str) -> tuple[str, str]:
+    prefix = "-".join(row_id.split("-")[:2])
+    if prefix in OPTIONAL_SCOPE_PREFIXES:
+        rule = (
+            "optional-python-extra"
+            if prefix in {"SB-PANDA", "SB-TORCH"}
+            else "optional-legacy-cxx"
+        )
+        return "Optional", rule
+    if row_id in OPTIONAL_SCOPE_ROWS:
+        return "Optional", "optional-python-extra"
+    if status == "Covered":
+        return "Covered", "core-covered"
+    if status == INTENTIONAL_DIVERGENCE_STATUS:
+        return "Approved divergence", "core-approved-divergence"
+    if status == NOT_REQUIRED_STATUS:
+        return "Not required", "not-required-rationale"
+    return "Required gap", "core-required-gap"
+
+
+def parse_scope_manifest_lines(
+    lines: Sequence[str], *, source: str
+) -> tuple[tuple[str, str, str, str], ...]:
+    entries: list[tuple[str, str, str, str]] = []
+    seen: set[str] = set()
+    for line_number, raw_line in enumerate(lines, start=1):
+        if not raw_line.strip() or raw_line.startswith("#"):
+            continue
+        cells = raw_line.rstrip().split("\t")
+        require(
+            len(cells) == 4,
+            (
+                f"invalid scope manifest entry in {source} on line {line_number}: "
+                "expected four tab-separated columns"
+            ),
+        )
+        row_id, disposition, rule, status = cells
+        require(re.fullmatch(r"SB-[A-Z0-9-]+", row_id) is not None, f"invalid scope row id: {row_id}")
+        require(disposition in SCOPE_DISPOSITIONS, f"invalid scope disposition for {row_id}: {disposition}")
+        require(rule in SCOPE_RULES, f"invalid scope rule for {row_id}: {rule}")
+        require(status in STATUSES, f"invalid pinned matrix status for {row_id}: {status}")
+        require(row_id not in seen, f"duplicate scope manifest entry in {source}: {row_id}")
+        seen.add(row_id)
+        entries.append((row_id, disposition, rule, status))
+    return tuple(entries)
+
+
+def validate_scope_manifest_provenance(lines: Sequence[str]) -> None:
+    comments = tuple(line.rstrip() for line in lines if line.startswith("#"))
+    require(
+        comments[: len(EXPECTED_SCOPE_MANIFEST_HEADER)] == EXPECTED_SCOPE_MANIFEST_HEADER,
+        f"scope manifest provenance header does not match revision {EXPECTED_REVISION}",
+    )
+
+
+@lru_cache(maxsize=1)
+def load_expected_scope() -> tuple[tuple[str, str, str, str], ...]:
+    lines = EXPECTED_SCOPE_MANIFEST.read_text(encoding="utf-8").splitlines()
+    validate_scope_manifest_provenance(lines)
+    entries = parse_scope_manifest_lines(lines, source=EXPECTED_SCOPE_MANIFEST.name)
+    require(
+        len(entries) == EXPECTED_TOTAL_ROWS,
+        f"scope manifest expects {EXPECTED_TOTAL_ROWS} entries, found {len(entries)}",
+    )
+    return entries
+
+
+def validate_scope_manifest(
+    rows: Sequence[tuple[str, str]],
+) -> Counter[str]:
+    entries = load_expected_scope()
+    require(
+        tuple((row_id, status) for row_id, _disposition, _rule, status in entries)
+        == tuple(rows),
+        "scope manifest row order or pinned matrix statuses differ from the audited row manifest",
+    )
+    counts: Counter[str] = Counter()
+    for row_id, disposition, rule, status in entries:
+        expected_disposition, expected_rule = expected_scope_entry(row_id, status)
+        require(
+            (disposition, rule) == (expected_disposition, expected_rule),
+            (
+                f"unjustified scope classification for {row_id}: found "
+                f"{disposition}/{rule}, expected {expected_disposition}/{expected_rule}; "
+                "change the normative rule set and its tests rather than bulk-editing the manifest"
+            ),
+        )
+        counts[disposition] += 1
+    require(
+        dict(counts) == EXPECTED_SCOPE_COUNTS,
+        f"scope disposition counts differ from the pinned counts: {dict(counts)}",
+    )
+    return counts
+
+
 def format_row_entry(entry: tuple[str, str] | str) -> str:
     if isinstance(entry, tuple):
         row_id, status = entry
@@ -1672,6 +1810,10 @@ def validate_pinned_inventory_constants() -> None:
         ),
     )
     require(
+        EXPECTED_SCOPE_MANIFEST.name.endswith(f"revision{EXPECTED_REVISION}-scope.tsv"),
+        f"scope manifest filename does not follow EXPECTED_REVISION {EXPECTED_REVISION}",
+    )
+    require(
         set(EXPECTED_STATUS_COUNTS) == STATUSES,
         f"EXPECTED_STATUS_COUNTS does not cover the six statuses: {sorted(EXPECTED_STATUS_COUNTS)}",
     )
@@ -1683,7 +1825,19 @@ def validate_pinned_inventory_constants() -> None:
             f"{EXPECTED_TOTAL_ROWS}"
         ),
     )
-    pinned_required = EXPECTED_TOTAL_ROWS - EXPECTED_STATUS_COUNTS[NOT_REQUIRED_STATUS]
+    require(
+        set(EXPECTED_SCOPE_COUNTS) == SCOPE_DISPOSITIONS,
+        f"EXPECTED_SCOPE_COUNTS does not cover all dispositions: {sorted(EXPECTED_SCOPE_COUNTS)}",
+    )
+    require(
+        sum(EXPECTED_SCOPE_COUNTS.values()) == EXPECTED_TOTAL_ROWS,
+        "pinned scope disposition counts do not sum to EXPECTED_TOTAL_ROWS",
+    )
+    pinned_required = (
+        EXPECTED_SCOPE_COUNTS["Covered"]
+        + EXPECTED_SCOPE_COUNTS["Approved divergence"]
+        + EXPECTED_SCOPE_COUNTS["Required gap"]
+    )
     require(
         pinned_required == EXPECTED_REQUIRED_ROWS,
         (
@@ -2196,15 +2350,6 @@ def validate_revision_inventory(
             f"{total_rows}; {INVENTORY_CHANGE_HINT}"
         ),
     )
-    required_rows = total_rows - status_counts[NOT_REQUIRED_STATUS]
-    require(
-        required_rows == EXPECTED_REQUIRED_ROWS,
-        (
-            f"revision {EXPECTED_REVISION} inventory expects {EXPECTED_REQUIRED_ROWS} required "
-            f"rows, found {required_rows}; {INVENTORY_CHANGE_HINT}"
-        ),
-    )
-
     for status, expected in EXPECTED_STATUS_COUNTS.items():
         actual = status_counts[status]
         require(
@@ -3104,6 +3249,10 @@ def validate_manifest_citations(full_text: str) -> None:
                 "bump renames the manifests, so every citation has to move with them"
             ),
         )
+    require(
+        f"docs/{EXPECTED_SCOPE_MANIFEST.name}" in full_text,
+        f"the document does not cite the revision-{EXPECTED_REVISION} scope manifest",
+    )
 
 
 def validate_counts(lines: list[str], full_text: str) -> None:
@@ -3123,6 +3272,7 @@ def validate_counts(lines: list[str], full_text: str) -> None:
     total_rows = len(rows)
     require(sum(status_counts.values()) == total_rows, f"expected {total_rows} rows, found {sum(status_counts.values())}")
     validate_revision_inventory(rows, status_counts, prefix_counts)
+    scope_counts = validate_scope_manifest(rows)
     validate_gap_completion_consistency(lines, rows)
     validate_divergence_approvals(lines, rows)
     validate_cluster_status_ledger_scope(lines, rows)
@@ -3137,7 +3287,11 @@ def validate_counts(lines: list[str], full_text: str) -> None:
         covered_rows == status_counts["Covered"],
         f"Covered rows metadata says {covered_rows}, but parsed {status_counts['Covered']}",
     )
-    required_rows = total_rows - status_counts[NOT_REQUIRED_STATUS]
+    required_rows = (
+        scope_counts["Covered"]
+        + scope_counts["Approved divergence"]
+        + scope_counts["Required gap"]
+    )
     require(
         metadata_required_rows == required_rows,
         f"Rows metadata says {metadata_required_rows} required rows, but parsed {required_rows}",
@@ -3194,7 +3348,7 @@ def validate_counts(lines: list[str], full_text: str) -> None:
             f"category summary total says {declared} rows for {status}, but parsed {actual}",
         )
 
-    validate_status_narratives(lines, status_counts, prefix_counts)
+    validate_status_narratives(lines, status_counts, prefix_counts, scope_counts)
     validate_c_abi_symbol_inventory(full_text)
     validate_c_abi_free_inventory(full_text)
 
@@ -3203,25 +3357,23 @@ def validate_status_narratives(
     lines: Sequence[str],
     status_counts: Counter[str],
     prefix_counts: dict[str, Counter[str]],
+    scope_counts: Counter[str],
 ) -> None:
     total_rows = sum(status_counts.values())
-    required_rows = total_rows - status_counts[NOT_REQUIRED_STATUS]
-    python_visible_behavior = status_counts["Behavior mismatch"] - prefix_counts["SB-CXX"]["Behavior mismatch"]
-
-    approved_divergences = (
-        status_counts[INTENTIONAL_DIVERGENCE_STATUS]
-        - len(EXPECTED_UNAPPROVED_DIVERGENCE_ROWS)
+    required_rows = (
+        scope_counts["Covered"]
+        + scope_counts["Approved divergence"]
+        + scope_counts["Required gap"]
     )
-    satisfied = status_counts["Covered"] + approved_divergences
+    approved_divergences = scope_counts["Approved divergence"]
+    satisfied = scope_counts["Covered"] + approved_divergences
 
     expected_phrases = [
-        (RELEASE_GATE_SECTION_HEADING, f"As of revision {EXPECTED_REVISION} that is {required_rows} of {total_rows} rows, and **{satisfied} are satisfied**: {status_counts['Covered']} are `Covered` ([SB-XCUT-012](#sec-20), the twelve configuration/topology rows in [§6](#sec-6), the 32 RFile/stream rows in [§15](#sec-15), the 17 data-model value rows in [§8](#sec-8) and [§19.2](#sec-19-2), the five buffered-writer rows in [§10](#sec-10), the four row-bounded flush/constraint rows in [§11](#sec-11) and [§19.2](#sec-19-2), the connector invalidation/cancellation rows in [§7](#sec-7) and [§20](#sec-20), the eight high-level client rows in [§10.1](#sec-10-1), the five high-level scanner rows in [§10.1](#sec-10-1), the four compatibility-error rows in [§18](#sec-18), the twelve streaming cursor rows in [§9](#sec-9), [§10.1](#sec-10-1), [§19.2](#sec-19-2), and [§20](#sec-20), the 31 column-visibility rows in [§18](#sec-18) and [§19.2](#sec-19-2), the 22 equivalent owned-key rows in [§19.2](#sec-19-2), and the 24 HDFS rows in [§16](#sec-16)) and {approved_divergences} are approved intentional divergences ([SB-DIV-016](#sec-26)), which record a permanent capability loss rather than delivered compatibility."),
-        (COUNTS_SECTION_HEADING, f"{required_rows} rows are **required** by the final release gate ([§2.2](#sec-2)); the {status_counts[NOT_REQUIRED_STATUS]} `Not required` rows are excluded by construction, and {prefix_counts['SB-CXX'][NOT_REQUIRED_STATUS]} of those are the evidence-proved duplicates described in [§19.1](#sec-19-1)."),
+        (RELEASE_GATE_SECTION_HEADING, f"As of revision {EXPECTED_REVISION}, **{required_rows} rows are required, {satisfied} are satisfied, and {scope_counts['Required gap']} remain**."),
+        (COUNTS_SECTION_HEADING, f"The normative scope manifest classifies {required_rows} rows as required, {scope_counts['Optional']} as optional, and {scope_counts['Not required']} as not required."),
         (COUNTS_SECTION_HEADING, f"**Exactly {status_counts['Covered']} rows are `Covered`: [SB-XCUT-012](#sec-20), the twelve configuration/topology rows completed in revision 24, the 31 RFile/stream rows completed in revision 25, the 17 data-model value rows completed in revision 26, the five buffered-writer rows completed in revisions 28 and 45, the four row-bounded flush/constraint rows completed in revision 29, the connector invalidation/cancellation rows completed in revision 30, the eight high-level client rows completed in revision 31, the five high-level scanner rows completed in revision 32, the four compatibility-error rows completed in revision 34, the twelve streaming cursor rows completed in revision 36, the 31 column-visibility rows completed in revision 38, the 22 equivalent owned-key rows completed in revision 42, the named-locality-group RFile row plus 24 HDFS rows completed in revision 44, and the two logging rows completed in revision 45.**"),
-        (COUNTS_SECTION_HEADING, f"The shape of the work is visible in the {status_counts['Missing Go']} `Missing Go` rows, of which {prefix_counts['SB-CXX']['Missing Go']} are the C++ members in [§19.2](#sec-19-2) that no Shoal layer exports."),
-        (COUNTS_SECTION_HEADING, f"`Behavior mismatch` ({status_counts['Behavior mismatch']}) is the bucket that sets the schedule: {python_visible_behavior} rows on the Python-visible and curated C++ surface each need a differential test against a live cluster or the exported ABI, and {prefix_counts['SB-CXX']['Behavior mismatch']} are C++ rows: 15 destructors of classes bound into Python, where the destruction point is user-observable and the model differs from Go finalisation ([§19.1](#sec-19-1)), plus the 14 owned-key comparison and capacity-reporting rows whose safe Shoal behavior deliberately does not reproduce [SB-UNSAFE-046](#sec-21) or [SB-UNSAFE-048](#sec-21)."),
         (COUNTS_SECTION_HEADING, f"`Intentional divergence` ({status_counts[INTENTIONAL_DIVERGENCE_STATUS]}) is dominated by one upstream fact: {prefix_counts['SB-STAT'][INTENTIONAL_DIVERGENCE_STATUS]} rows are cluster-status accessors Accumulo itself deleted ([§14](#sec-14), [SB-DIV-016](#sec-26))."),
-        (COUNTS_SECTION_HEADING, f"`Missing C ABI` ({status_counts['Missing C ABI']}) is now led by the column and entry value APIs (25), pandas ({prefix_counts['SB-PANDA']['Missing C ABI']}), the tablet extent API (16), packaging/import scaffolding ({prefix_counts['SB-PKG']['Missing C ABI']}), PyTorch ({prefix_counts['SB-TORCH']['Missing C ABI']}), the remaining scanner rows ({prefix_counts['SB-SCAN']['Missing C ABI']}), writer rows ({prefix_counts['SB-WRITE']['Missing C ABI']}), cross-cutting rows ({prefix_counts['SB-XCUT']['Missing C ABI']}), the remaining curated-C++ row ({prefix_counts['SB-CPP']['Missing C ABI']}), and the remaining data-model row ({prefix_counts['SB-DATA']['Missing C ABI']})."),
+        (COUNTS_SECTION_HEADING, "`SB-XCUT-014`, `SB-XCUT-019`, and `SB-PKG-008` remain explicit required"),
     ]
     section_text: dict[str, str] = {}
     for heading, phrase in expected_phrases:

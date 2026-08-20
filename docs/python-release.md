@@ -13,7 +13,9 @@ assert pysharkbite.Client is sharkbite.Client
 The distribution version is independent of the native ABI version. Release
 `0.4.0` requires Shoal ABI `1.17.0` or newer within ABI major 1. The package is
 still an incremental compatibility layer: publishing it does not make the
-uncovered rows in `sharkbite-compatibility.md` compatible.
+uncovered required rows in `sharkbite-compatibility.md` compatible. Scope is
+defined by `sharkbite-client-scope.md`, not by the raw count of historical C++
+declarations.
 
 ## Platform status
 
