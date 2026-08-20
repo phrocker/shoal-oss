@@ -3,7 +3,6 @@
 from ._version import __version__
 from ._native import ForkSafetyError, NativeAPI, RuntimeInfo
 from .admin import (
-    Authorizations,
     NamespaceOperations,
     NamespacePermissions,
     SecurityOperations,
@@ -21,10 +20,10 @@ from .client import (
     AccumuloWriter,
     Client,
     Connector,
-    Key,
     Scanner,
 )
-from .compatibility import LoggingConfiguration, PythonIterator, ScannerOptions
+from .data import Authorizations, Key, KeyValue, Range, Value
+from .compatibility import IterInfo, LoggingConfiguration, PythonIterator, ScannerOptions
 from .errors import (
     AmbiguousWriteError,
     AlreadyExistsError,
@@ -44,7 +43,6 @@ from .storage import (
     HdfsDirEnt,
     HdfsInputStream,
     HdfsOutputStream,
-    KeyValue,
     RFileOperations,
     SequentialRFile,
 )
@@ -77,6 +75,8 @@ __all__ = [
     "ForkSafetyError",
     "Key",
     "KeyValue",
+    "IterInfo",
+    "Range",
     "LoggingConfiguration",
     "NativeAPI",
     "NamespaceOperations",
@@ -98,5 +98,6 @@ __all__ = [
     "TableOperations",
     "TablePermissions",
     "Mutation",
+    "Value",
     "SequentialRFile",
 ]
