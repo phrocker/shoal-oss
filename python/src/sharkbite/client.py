@@ -186,10 +186,10 @@ class Connector:
         from .admin import TableOperations
         return TableOperations(self, table)
 
-    def namespaceOps(self) -> object:
+    def namespaceOps(self, nm: str = "") -> object:
         self._ensure_open()
         from .admin import NamespaceOperations
-        return NamespaceOperations(self)
+        return NamespaceOperations(self, nm)
 
     def securityOps(self) -> object:
         self._ensure_open()

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import ctypes as C
+import inspect
 import unittest
+from concurrent.futures import ThreadPoolExecutor
+from unittest.mock import patch
 
 from sharkbite import (
     Authorizations,
@@ -14,6 +17,7 @@ from sharkbite import (
     TablePermissions,
 )
 from sharkbite._native import Bytes, NamespaceView, PropertyView, TableView
+from sharkbite.errors import AlreadyExistsError, ClientException, NotFoundError
 
 
 class Function:
@@ -259,11 +263,13 @@ class WriterAdminTests(unittest.TestCase):
         with self.assertRaisesRegex(NotImplementedError, "online compaction"):
             table.compact(b"", b"", True)
 
-        namespaces = self.connector.namespaceOps()
+        namespaces = self.connector.namespaceOps("bound")
         self.assertEqual(namespaces.list(), ["n"])
         self.assertEqual(namespaces.list_with_ids(), {"n": "2"})
         self.assertEqual(namespaces.getLocalProperties("n"), {"k": "v"})
         self.assertEqual(namespaces.getVersionedProperties("n"), (8, {"k": "v"}))
+        self.assertIsNone(namespaces.create())
+        self.assertTrue(namespaces.remove())
         namespaces.rename("new", "old")
         self.assertIn(
             b"old",
@@ -281,7 +287,118 @@ class WriterAdminTests(unittest.TestCase):
         self.assertTrue(
             security.has_namespace_permission("u", "n", NamespacePermissions.READ)
         )
-        security.grant_table_permission("u", "t", TablePermissions.WRITE)
+        self.assertEqual(
+            security.grant_table_permission("u", "t", TablePermissions.WRITE), 1
+        )
+
+    def test_documented_administration_signatures_and_defaults(self):
+        table = self.connector.tableOps("t")
+        namespaces = self.connector.namespaceOps("bound")
+        self.assertEqual(inspect.signature(table.create).parameters["recreate"].default, False)
+        self.assertEqual(inspect.signature(table.exists).parameters["createIfNot"].default, False)
+        self.assertEqual(inspect.signature(table.compact).parameters["wait"].default, inspect.Parameter.empty)
+        self.assertEqual(
+            inspect.signature(table.import_directory).parameters["setTime"].default,
+            False,
+        )
+        self.assertEqual(inspect.signature(namespaces.create).parameters["nm"].default, "")
+        self.assertEqual(inspect.signature(namespaces.rename).parameters["oldName"].default, "")
+        self.assertIs(getattr(table, "import").__func__, table.import_directory.__func__)
+
+    def test_table_lifecycle_returns_and_compatibility_errors(self):
+        table = self.connector.tableOps("t")
+        with patch.object(table, "_call", side_effect=AlreadyExistsError("exists", status=19)):
+            self.assertFalse(table.create())
+        with patch.object(table, "_call", side_effect=ClientException("exists", status=19)):
+            self.assertFalse(table.create())
+        with patch.object(table, "_call", side_effect=NotFoundError("missing", status=9)):
+            with self.assertRaises(ClientException) as raised:
+                table.remove()
+        self.assertEqual(raised.exception.status, 9)
+        with patch.object(table, "exists", return_value=True), patch.object(
+            table, "remove", return_value=True
+        ) as remove, patch.object(table, "_call") as call:
+            self.assertTrue(table.create(recreate=True))
+            remove.assert_called_once()
+            call.assert_called_once()
+
+    def test_property_and_invalid_input_return_contracts(self):
+        table = self.connector.tableOps("t")
+        before = len(self.api.lib.calls)
+        self.assertEqual(table.setProperty("", "value"), -1)
+        self.assertEqual(table.removeProperty(""), -1)
+        self.assertEqual(len(self.api.lib.calls), before)
+        self.assertEqual(table.setProperty("k", "v"), 0)
+        self.assertEqual(table.removeProperty("k"), 0)
+
+        security = self.connector.securityOps()
+        self.assertEqual(security.create_user("", "p"), -1)
+        self.assertEqual(security.change_password("", "p"), -1)
+        self.assertEqual(security.remove_user(""), -1)
+        self.assertEqual(security.grantAuthorizations(None, "u"), -2)
+        self.assertEqual(security.grantAuthorizations([], ""), -1)
+        with self.assertRaises(ClientException):
+            security.get_auths("")
+
+    def test_namespace_handle_defaults_and_property_order(self):
+        namespaces = self.connector.namespaceOps("bound")
+        self.assertTrue(namespaces.exists())
+        self.assertIsNone(namespaces.setProperty("k", "v"))
+        self.assertIsNone(namespaces.removeProperty("k"))
+        self.assertIsNone(namespaces.rename("renamed"))
+        calls = {name: args for name, args in self.api.lib.calls}
+        self.assertIn(b"bound", calls["set_namespace_property"])
+        self.assertIn(b"bound", calls["remove_namespace_property"])
+        self.assertEqual(calls["rename_namespace"][1:3], (b"bound", b"renamed"))
+        self.assertEqual(namespaces.namespace, "renamed")
+
+    def test_permission_enums_are_exact_and_scope_checked(self):
+        self.assertEqual(
+            {item.name: item.value for item in SystemPermissions},
+            {
+                "GRANT": 0, "CREATE_TABLE": 1, "DROP_TABLE": 2,
+                "ALTER_TABLE": 3, "CREATE_USER": 4, "ALTER_USER": 6,
+                "SYSTEM": 7, "CREATE_NAMESPACE": 8, "DROP_NAMESPACE": 9,
+                "ALTER_NAMESPACE": 10,
+            },
+        )
+        self.assertEqual(
+            {item.name: item.value for item in TablePermissions},
+            {
+                "READ": 2, "WRITE": 3, "BULK_IMPORT": 4,
+                "ALTER_TABLE": 5, "GRANT": 6, "DROP_TABLE": 7,
+            },
+        )
+        self.assertEqual(
+            {item.name: item.value for item in NamespacePermissions},
+            {
+                "READ": 0, "WRITE": 1, "ALTER_NAMESPACE": 2, "GRANT": 3,
+                "ALTER_TABLE": 4, "CREATE_TABLE": 5, "DROP_TABLE": 6,
+                "BULK_IMPORT": 7, "DROP_NAMESPACE": 8,
+            },
+        )
+        security = self.connector.securityOps()
+        with self.assertRaisesRegex(TypeError, "TablePermissions"):
+            security.has_table_permission("u", "t", NamespacePermissions.READ)
+        with self.assertRaisesRegex(TypeError, "SystemPermissions"):
+            security.grant_system_permission("u", TablePermissions.READ)
+        with self.assertRaises(ClientException):
+            security.has_system_permission("", SystemPermissions.GRANT)
+
+    def test_approved_table_divergences_are_stable(self):
+        table = self.connector.tableOps("t")
+        with self.assertRaisesRegex(NotImplementedError, "SB-DIV-018"):
+            table.compact("", "", True)
+        with self.assertRaisesRegex(NotImplementedError, "SB-DIV-019"):
+            getattr(table, "import")("in", "fail")
+
+    def test_fake_administration_calls_are_concurrent(self):
+        table = self.connector.tableOps("t")
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            results = list(pool.map(lambda i: table.setProperty(f"k{i}", f"v{i}"), range(64)))
+        self.assertEqual(results, [0] * 64)
+        property_calls = [call for call in self.api.lib.calls if call[0] == "set_table_property"]
+        self.assertEqual(len(property_calls), 64)
 
     def test_owned_admin_results_are_freed(self):
         table_info = self.connector.tableInfo()

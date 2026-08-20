@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 
 from sharkbite import LoggingConfiguration, Mutation, NativeAPI
 
@@ -21,6 +22,8 @@ class CompiledLibraryTests(unittest.TestCase):
         LoggingConfiguration._set(1, api)
         self.assertEqual(api.lib.shoal_logging_get_level(), 1)
         LoggingConfiguration._set(0, api)
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            list(pool.map(lambda _: api.require(9, 10, 11, 12, 19), range(128)))
 
 
 if __name__ == "__main__":

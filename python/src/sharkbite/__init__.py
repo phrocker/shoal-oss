@@ -1,7 +1,7 @@
 """Incremental Shoal Python binding; intentionally not full compatibility."""
 
 from ._version import __version__
-from ._native import NativeAPI, RuntimeInfo
+from ._native import ForkSafetyError, NativeAPI, RuntimeInfo
 from .admin import (
     Authorizations,
     NamespaceOperations,
@@ -93,6 +93,7 @@ __all__ = [
     "HdfsDirEnt",
     "HdfsInputStream",
     "HdfsOutputStream",
+    "ForkSafetyError",
     "Key",
     "KeyValue",
     "LoggingConfiguration",

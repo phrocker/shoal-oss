@@ -22,6 +22,7 @@ from sharkbite._native import (
     CAP_HIGH_LEVEL_CLIENT,
     CAPABILITY_SYMBOLS,
     Bytes,
+    ClientConfig,
     ConnectorConfig,
     ConnectorIdentityView,
     KeyValueView,
@@ -51,6 +52,7 @@ class FakeLibrary:
         self.closed = []
         self.freed = []
         self.result_freed = 0
+        self.authorizations = []
         self.identity_freed = 0
         self.resolve_timeouts = []
         self.connector_timeouts = []
@@ -89,6 +91,12 @@ class FakeLibrary:
             self.connector_timeouts.append(
                 connector.zookeeper_session_timeout_ms
             )
+        elif isinstance(config._obj, ClientConfig):
+            native = C.cast(config, C.POINTER(ClientConfig)).contents
+            self.authorizations = [
+                C.string_at(native.authorizations[index].data, native.authorizations[index].length)
+                for index in range(native.authorization_count)
+            ]
         C.cast(out_handle, C.POINTER(C.c_void_p)).contents.value = 123
         return self.connector_create_status
 
@@ -296,6 +304,13 @@ class FoundationTests(unittest.TestCase):
         self.assertEqual(api.lib.result_freed, 1)
         self.assertEqual(api.lib.closed, ["client"])
         self.assertEqual(api.lib.freed, ["client"])
+
+    def test_scan_authorizations_are_copied_to_native_enforcement(self):
+        api = FakeAPI()
+        auths = [bytearray(b"blah1")]
+        with Client("i", "zk", "u", "p", table="t", auths=auths, _api=api):
+            auths[0][:] = b"other"
+            self.assertEqual(api.lib.authorizations, [b"blah1"])
 
     def test_approved_divergence_is_explicit(self):
         client = object.__new__(Client)
