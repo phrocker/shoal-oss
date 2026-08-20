@@ -284,7 +284,12 @@ func Promote(
 	// stagingPreflight's own): AddTableSplitsForTable and
 	// verifyNoUnexpectedDestinationSplits/ListTableSplits just ran, and
 	// src is not guaranteed unchanged across that round-trip.
-	mapping, err := StageBulkDir(ctx, src, manifest, dst, bulkDir)
+	releaseStage, err := acquireStageBulkDir(ctx, dst, bulkDir)
+	if err != nil {
+		return nil, err
+	}
+	defer releaseStage()
+	mapping, err := stageBulkDirLocked(ctx, src, manifest, dst, bulkDir)
 	if err != nil {
 		return nil, err
 	}

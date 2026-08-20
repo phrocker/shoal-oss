@@ -16,12 +16,14 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/phrocker/shoal/internal/engine"
 	"github.com/phrocker/shoal/internal/storage"
 	"github.com/phrocker/shoal/internal/storage/azure"
 	"github.com/phrocker/shoal/internal/storage/gcs"
 	"github.com/phrocker/shoal/internal/storage/hdfs"
+	"github.com/phrocker/shoal/internal/storage/local"
 	"github.com/phrocker/shoal/internal/storage/s3"
 )
 
@@ -31,7 +33,16 @@ var (
 	parseAzurePath         = azure.ParsePath
 	parseCanonicalHDFSPath = url.Parse
 	stagePathBackendKey    = canonicalPathBackendKey
+	stageBulkDirLocks      = struct {
+		sync.Mutex
+		entries map[string]*stageBulkDirLock
+	}{entries: make(map[string]*stageBulkDirLock)}
 )
+
+type stageBulkDirLock struct {
+	ready chan struct{}
+	refs  int
+}
 
 // StageBulkDir copies every RFile referenced by manifest from src (the
 // export destination backend, where Engine.ExportRFiles /
@@ -47,6 +58,13 @@ var (
 // the source export, and re-running StageBulkDir with the same manifest and
 // bulkDir reproduces byte-identical files and an identical loadmap.json —
 // safe to retry.
+//
+// Calls in this process that target the same recognized backend location and
+// bulkDir are serialized. Promote holds that ownership through BulkImport, so another
+// local promotion cannot overwrite verified files between publication of
+// loadmap.json and submission of the import. Distributed callers still must
+// assign one immutable bulkDir per promotion; storage.Backend has no portable
+// conditional-create primitive from which to build a cross-process lease.
 //
 // Basenames must be unique across the whole manifest once flattened; a
 // collision is reported as an error before any copy happens, rather than
@@ -183,6 +201,21 @@ func StageBulkDir(
 	if err := validateDestinationWritable(dst); err != nil {
 		return nil, err
 	}
+	release, err := acquireStageBulkDir(ctx, dst, bulkDir)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	return stageBulkDirLocked(ctx, src, manifest, dst, bulkDir)
+}
+
+func stageBulkDirLocked(
+	ctx context.Context,
+	src storage.Backend,
+	manifest *engine.RFileExportManifest,
+	dst storage.Backend,
+	bulkDir string,
+) (LoadMapping, error) {
 	if _, _, err := resolveManifestTablets(manifest); err != nil {
 		return nil, err
 	}
@@ -258,6 +291,55 @@ func StageBulkDir(
 		return nil, err
 	}
 	return mapping, nil
+}
+
+func acquireStageBulkDir(ctx context.Context, dst storage.Backend, bulkDir string) (func(), error) {
+	key := canonicalPathBackendKey(dst) + "\x00" + bulkDir
+	ref := newStagePathRef(dst, bulkDir)
+	if canonical, ok := canonicalBackendPath(ref); ok {
+		key = stageLockBackendKey(dst) + "\x00" + canonical
+	}
+
+	stageBulkDirLocks.Lock()
+	entry := stageBulkDirLocks.entries[key]
+	if entry == nil {
+		entry = &stageBulkDirLock{ready: make(chan struct{}, 1)}
+		entry.ready <- struct{}{}
+		stageBulkDirLocks.entries[key] = entry
+	}
+
+	entry.refs++
+	stageBulkDirLocks.Unlock()
+
+	select {
+	case <-ctx.Done():
+		releaseStageBulkDirRef(key, entry, false)
+		return nil, ctx.Err()
+	case <-entry.ready:
+		return func() { releaseStageBulkDirRef(key, entry, true) }, nil
+	}
+}
+
+func stageLockBackendKey(backend storage.Backend) string {
+	unwrapped := unwrapBackend(backend)
+	switch unwrapped.(type) {
+	case *local.Backend, *hdfs.Backend, *s3.Backend, *gcs.Backend, *azure.Backend:
+		return fmt.Sprintf("%T", unwrapped)
+	default:
+		return canonicalPathBackendKey(unwrapped)
+	}
+}
+
+func releaseStageBulkDirRef(key string, entry *stageBulkDirLock, owned bool) {
+	if owned {
+		entry.ready <- struct{}{}
+	}
+	stageBulkDirLocks.Lock()
+	entry.refs--
+	if entry.refs == 0 {
+		delete(stageBulkDirLocks.entries, key)
+	}
+	stageBulkDirLocks.Unlock()
 }
 
 // invalidateExistingLoadMapping detects a loadmap.json already present at

@@ -706,6 +706,14 @@ destination splits itself, or the eventual `BulkImport` fails closed (see
   and re-verified successfully, so its presence remains a reliable
   signal that every listed file's bytes were confirmed at `dst`, not
   merely assumed from an earlier check.
+  Concurrent calls in the same process that target the same recognized
+  destination backend location and `bulkDir` are serialized across the complete staging
+  operation. `Promote` keeps that ownership until `BulkImport` returns, so a
+  second local promotion cannot replace a verified file after
+  `loadmap.json` is published but before the manager consumes it. This is not
+  a distributed lease: independent processes must allocate a unique,
+  immutable `bulkDir` per promotion because the portable `storage.Backend`
+  contract does not expose conditional creation.
   That guarantee is about `loadmap.json` written by *this* call. A
   `bulkDir` can also already hold a `loadmap.json` left behind by an
   earlier, different `StageBulkDir` call -- a retry after a prior

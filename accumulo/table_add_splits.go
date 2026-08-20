@@ -230,8 +230,7 @@ func (c *Connector) addTableSplits(ctx context.Context, tableName, expectedTable
 		return ErrDiscoveryUnavailable
 	}
 
-	discovery.tables.Invalidate()
-	tableID, err := discovery.tables.ResolveID(ctx, tableName)
+	tableID, err := resolveFreshTableID(ctx, discovery.tables, tableName)
 	if errors.Is(err, tablenames.ErrTableNotFound) {
 		return fmt.Errorf("%w: table name %q", ErrTableNotFound, tableName)
 	}

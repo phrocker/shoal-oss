@@ -76,6 +76,23 @@ func (r *Resolver) ResolveID(ctx context.Context, tableName string) (string, err
 	}
 	r.opMu.Lock()
 	defer r.opMu.Unlock()
+	return r.resolveIDLocked(ctx, tableName)
+}
+
+// ResolveIDFresh clears cached table mappings and resolves tableName while
+// holding the same operation lock, so another resolver operation cannot
+// repopulate stale data between invalidation and lookup.
+func (r *Resolver) ResolveIDFresh(ctx context.Context, tableName string) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	r.opMu.Lock()
+	defer r.opMu.Unlock()
+	r.invalidateLocked()
+	return r.resolveIDLocked(ctx, tableName)
+}
+
+func (r *Resolver) resolveIDLocked(ctx context.Context, tableName string) (string, error) {
 	for {
 		generation := r.syncNamespaceGeneration()
 		r.mu.RLock()
@@ -238,6 +255,10 @@ func (r *Resolver) ListNamespace(
 func (r *Resolver) Invalidate() {
 	r.opMu.Lock()
 	defer r.opMu.Unlock()
+	r.invalidateLocked()
+}
+
+func (r *Resolver) invalidateLocked() {
 	r.mu.Lock()
 	r.nameToID = map[string]string{}
 	r.idToName = map[string]string{}

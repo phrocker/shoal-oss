@@ -11,8 +11,10 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/phrocker/shoal/accumulo"
 	"github.com/phrocker/shoal/internal/engine"
@@ -45,6 +47,24 @@ type readOnlyBackend struct{ inner shstorage.Backend }
 
 func (r readOnlyBackend) Open(ctx context.Context, path string) (shstorage.File, error) {
 	return r.inner.Open(ctx, path)
+}
+
+type blockingOpenBackend struct {
+	*memory.Backend
+	once    sync.Once
+	started chan struct{}
+	release chan struct{}
+}
+
+func (b *blockingOpenBackend) Open(ctx context.Context, path string) (shstorage.File, error) {
+	b.once.Do(func() {
+		close(b.started)
+		select {
+		case <-b.release:
+		case <-ctx.Done():
+		}
+	})
+	return b.Backend.Open(ctx, path)
 }
 
 // TestStageBulkDirRejectsReadOnlyDestinationBeforeAnyRead proves
@@ -129,6 +149,65 @@ func TestStageBulkDirFlattensCopiesAndWritesLoadMapping(t *testing.T) {
 	}
 	if len(onDisk) != len(mapping) {
 		t.Fatalf("on-disk mapping entries = %d, want %d", len(onDisk), len(mapping))
+	}
+}
+
+func TestStageBulkDirSerializesConcurrentWritersForSameDestination(t *testing.T) {
+	const (
+		srcPath = "export/events/t-0000/F0001.rf"
+		bulkDir = "/bulk/events-1"
+	)
+	makeManifest := func(data []byte) *engine.RFileExportManifest {
+		sum := sha256.Sum256(data)
+		return &engine.RFileExportManifest{
+			Version:     engine.RFileExportManifestVersion,
+			SourceTable: "events",
+			Tablets:     []engine.RFileExportTablet{{Index: 0}},
+			RFiles: []engine.RFileExportFile{{
+				TabletIndex:     0,
+				DestinationPath: srcPath,
+				Size:            int64(len(data)),
+				SHA256:          hex.EncodeToString(sum[:]),
+			}},
+		}
+	}
+
+	firstBytes, secondBytes := []byte("first-stage"), []byte("second-stage")
+	firstMemory := memory.New()
+	firstMemory.Put(srcPath, firstBytes)
+	first := &blockingOpenBackend{
+		Backend: firstMemory,
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	second := memory.New()
+	second.Put(srcPath, secondBytes)
+	dst := memory.New()
+
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := StageBulkDir(context.Background(), first, makeManifest(firstBytes), dst, bulkDir)
+		firstDone <- err
+	}()
+	<-first.started
+
+	secondDone := make(chan error, 1)
+	go func() {
+		_, err := StageBulkDir(context.Background(), second, makeManifest(secondBytes), dst, bulkDir)
+		secondDone <- err
+	}()
+	select {
+	case err := <-secondDone:
+		t.Fatalf("second StageBulkDir completed while first still owned bulkDir: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(first.release)
+	if err := <-firstDone; err != nil {
+		t.Fatalf("first StageBulkDir: %v", err)
+	}
+	if err := <-secondDone; err != nil {
+		t.Fatalf("second StageBulkDir: %v", err)
 	}
 }
 

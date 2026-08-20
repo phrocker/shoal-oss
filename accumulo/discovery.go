@@ -70,6 +70,10 @@ type tableNameResolver interface {
 	Invalidate()
 }
 
+type freshTableNameResolver interface {
+	ResolveIDFresh(context.Context, string) (string, error)
+}
+
 type connectorDiscovery struct {
 	tablets    *cache.LocatorCache
 	namespaces namespaceResolver
@@ -153,8 +157,7 @@ func (c *Connector) ResolveTableID(ctx context.Context, name string) (string, er
 	if err != nil {
 		return "", err
 	}
-	discovery.tables.Invalidate()
-	id, err := discovery.tables.ResolveID(ctx, name)
+	id, err := resolveFreshTableID(ctx, discovery.tables, name)
 	if err != nil {
 		if errors.Is(err, tablenames.ErrTableNotFound) {
 			return "", fmt.Errorf("%w: table name %q", ErrTableNotFound, name)
@@ -162,6 +165,14 @@ func (c *Connector) ResolveTableID(ctx context.Context, name string) (string, er
 		return "", fmt.Errorf("accumulo: resolve table name %q: %w", name, err)
 	}
 	return id, nil
+}
+
+func resolveFreshTableID(ctx context.Context, resolver tableNameResolver, name string) (string, error) {
+	if fresh, ok := resolver.(freshTableNameResolver); ok {
+		return fresh.ResolveIDFresh(ctx, name)
+	}
+	resolver.Invalidate()
+	return resolver.ResolveID(ctx, name)
 }
 
 // TableByID validates a table ID and resolves its qualified name.

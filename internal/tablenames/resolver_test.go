@@ -38,6 +38,32 @@ func newSharedResolvers(locator *fakeLocator) (*nslookup.Resolver, *Resolver) {
 	return namespaceNames, NewResolver(locator, namespaceNames)
 }
 
+func TestResolveIDFreshInvalidatesAndReloadsAtomically(t *testing.T) {
+	const tablesPath = "/accumulo/uuid-1/namespaces/+default/tables"
+	locator := &fakeLocator{
+		data: map[string][]byte{
+			"/accumulo/uuid-1/namespaces": []byte(`{"+accumulo":"accumulo","+default":""}`),
+			tablesPath:                    []byte(`{"1":"events"}`),
+		},
+		reads: map[string]int{},
+	}
+	_, resolver := newSharedResolvers(locator)
+
+	if id, err := resolver.ResolveID(context.Background(), "events"); err != nil || id != "1" {
+		t.Fatalf("initial ResolveID = %q, %v, want 1", id, err)
+	}
+	locator.mu.Lock()
+	locator.data[tablesPath] = []byte(`{"2":"events"}`)
+	locator.mu.Unlock()
+
+	if id, err := resolver.ResolveID(context.Background(), "events"); err != nil || id != "1" {
+		t.Fatalf("cached ResolveID = %q, %v, want stale cached 1", id, err)
+	}
+	if id, err := resolver.ResolveIDFresh(context.Background(), "events"); err != nil || id != "2" {
+		t.Fatalf("ResolveIDFresh = %q, %v, want freshly loaded 2", id, err)
+	}
+}
+
 func TestResolverNamesAndSharedNamespaceCache(t *testing.T) {
 	locator := &fakeLocator{
 		data: map[string][]byte{
