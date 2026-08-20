@@ -5,7 +5,7 @@ Sharkbite replacement and not a release under the reserved `sharkbite`
 distribution name. The distribution is named `shoal-sharkbite`; it installs
 the import-compatible modules `sharkbite` and `pysharkbite`.
 The [normative scope ADR](../docs/sharkbite-client-scope.md) currently records
-397 required rows, 208 satisfied rows, and 189 explicit core gaps; optional
+397 required rows, 260 satisfied rows, and 137 explicit core gaps; optional
 Torch, pandas, embedded, and historical C++ surfaces do not block this package.
 
 Supported now:
@@ -27,6 +27,20 @@ Supported now:
 
 Unsupported legacy entry points are present only where useful for discovery and
 raise `NotImplementedError` with a stable message. They never fabricate data.
+
+Python loads Shoal with `ctypes.CDLL`, so blocking native calls release the GIL;
+Python result copying and exception construction run only after the GIL is
+reacquired. The native handle concurrency rules still apply: supported shared
+operations may run from multiple Python threads, while close/free must not race
+with arbitrary use of the same wrapper.
+
+On Unix, inherited native state is intentionally unusable after `fork()`.
+Every bound native function and `NativeAPI` construction checks the process
+before entering Go and raises `ForkSafetyError` in a fork child. Do not close,
+free, or otherwise reuse inherited objects there. Use `subprocess`, the
+`spawn`/`forkserver` multiprocessing start methods, or immediate `exec()` and
+construct fresh Shoal objects in the new interpreter. The parent process and
+fresh exec-created subprocesses remain supported.
 
 ## Install and load
 

@@ -2476,15 +2476,15 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
 
     def test_pinned_inventory_constants_are_internally_consistent(self) -> None:
         validator.validate_pinned_inventory_constants()
-        self.assertEqual(validator.EXPECTED_REVISION, 48)
+        self.assertEqual(validator.EXPECTED_REVISION, 49)
         self.assertEqual(validator.EXPECTED_TOTAL_ROWS, 3203)
         self.assertEqual(validator.EXPECTED_REQUIRED_ROWS, 397)
         self.assertEqual(
             validator.EXPECTED_SCOPE_COUNTS,
             {
-                "Covered": 156,
+                "Covered": 168,
                 "Approved divergence": 92,
-                "Required gap": 149,
+                "Required gap": 137,
                 "Optional": 2763,
                 "Not required": 43,
             },
@@ -2492,26 +2492,17 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
         self.assertEqual(
             validator.EXPECTED_STATUS_COUNTS,
             {
-                "Covered": 219,
+                "Covered": 231,
                 "Missing Go": 2218,
-                "Missing C ABI": 89,
-                "Behavior mismatch": 194,
+                "Missing C ABI": 88,
+                "Behavior mismatch": 183,
                 validator.INTENTIONAL_DIVERGENCE_STATUS: 92,
                 validator.NOT_REQUIRED_STATUS: 391,
             },
         )
         self.assertEqual(validator.EXPECTED_C_ABI_DECLARED_EXPORTS, 318)
-        self.assertEqual(validator.EXPECTED_C_ABI_REFERENCED_EXPORTS, 313)
-        self.assertEqual(
-            validator.EXPECTED_C_ABI_UNREFERENCED_EXPORTS,
-            (
-                "shoal_scanner_scan",
-                "shoal_batch_scanner_scan",
-                "shoal_write_failure_get_constraint",
-                "shoal_write_failure_get_authorization",
-                "shoal_write_failure_get_cleanup",
-            ),
-        )
+        self.assertEqual(validator.EXPECTED_C_ABI_REFERENCED_EXPORTS, 318)
+        self.assertEqual(validator.EXPECTED_C_ABI_UNREFERENCED_EXPORTS, ())
 
     def test_collect_c_abi_symbol_inventory_matches_pinned_values(self) -> None:
         exports, referenced, unreferenced = validator.collect_c_abi_symbol_inventory()
@@ -2568,7 +2559,7 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
         lines[2] = "# Sharkbite source: unreviewed."
         self.assert_validation_fails(
             lambda: validator.validate_scope_manifest_provenance(lines),
-            "scope manifest provenance header does not match revision 48",
+            "scope manifest provenance header does not match revision 49",
         )
 
     def test_collect_c_abi_free_function_inventory_matches_header(self) -> None:
@@ -2695,7 +2686,7 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
             lambda: validator.validate_revision_inventory(
                 row_ids, reclassified, prefix_counts
             ),
-            f"revision {validator.EXPECTED_REVISION} inventory expects 219 rows for Covered, found 220",
+            f"revision {validator.EXPECTED_REVISION} inventory expects 231 rows for Covered, found 232",
         )
 
     def test_declared_count_edit_still_fails_internal_cross_check(self) -> None:
@@ -2723,8 +2714,9 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
 
     def test_revision_bump_requires_validator_constant_update(self) -> None:
         text = load_document_text()
+        status_snippet = validator.EXPECTED_DOCUMENT_STATUS_SNIPPETS[1]
         mutated = text.replace(
-            f"Revision {validator.EXPECTED_REVISION} — completes the 40 required table, namespace, and security rows",
+            status_snippet,
             f"Revision {validator.EXPECTED_REVISION + 1} — adds the next audited scope",
         ).replace(
             f"As of revision {validator.EXPECTED_REVISION},",
@@ -2733,7 +2725,7 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
         self.assertNotEqual(mutated, text)
         self.assert_validation_fails(
             lambda: validator.validate_counts(mutated.splitlines(), mutated),
-            f"document status is missing expected detail: Revision {validator.EXPECTED_REVISION} — completes the 40 required table, namespace, and security rows",
+            f"document status is missing expected detail: {status_snippet}",
         )
 
     # ---- matrix table separators -------------------------------------------

@@ -265,6 +265,29 @@ Version numbers change only when the public ABI contract changes:
   handle concurrently. No Go pointer or Go-managed buffer is exposed through
   the ABI.
 
+## Concurrency, process, and failure contract
+
+- Native calls may run concurrently on distinct handles. The concurrency
+  guarantees listed above apply to shared scanner, connector, cancellation,
+  writer, and immutable-result handles. Freeing a handle must be externally
+  serialized with every use of that same handle.
+- A zero timeout means no per-call deadline. A positive timeout bounds the
+  operation and returns `SHOAL_STATUS_DEADLINE_EXCEEDED`; close cancels and
+  joins active work as documented for each handle. Retriable writes are
+  replayed only when non-acceptance is proved. Retry exhaustion and ambiguous
+  commit remain distinct, structured terminal outcomes.
+- Allocation failure returns `SHOAL_STATUS_OUT_OF_MEMORY`. Output handles stay
+  `NULL`, partially built owned results are destroyed, and existing input
+  handles remain valid unless the operation's normal close contract says
+  otherwise.
+- Unix `fork()` does not clone a reusable Shoal/Go runtime. After a process has
+  loaded the library, the child must not call any `shoal_*` function, create a
+  new Shoal handle, close/free an inherited handle, or run a finalizer before
+  `exec()`. Inherited handles remain valid only in the parent. The supported
+  child path is immediate `exec()` of a fresh process, which may then load the
+  library and create independent handles. This explicit unsupported contract
+  replaces undefined post-fork handle reuse.
+
 ## Bootstrap modes
 
 - `SHOAL_BOOTSTRAP_STATIC` uses `instance_name` and `instance_id`. It is useful

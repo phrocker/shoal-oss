@@ -101,6 +101,8 @@ func TestSharedLibraryCABI(t *testing.T) {
 	runCommand(t, root, nil, cc.name, queryArgs...)
 	runCommand(t, artifacts, env, queryExecutable, library)
 
+	linkEveryDeclaredSymbol(t, root, artifacts, env, cc, include, library)
+
 	bridgeExecutable := filepath.Join(artifacts, "result_bridge")
 	if runtime.GOOS == "windows" {
 		bridgeExecutable += ".exe"
@@ -116,6 +118,53 @@ func TestSharedLibraryCABI(t *testing.T) {
 	)
 	runCommand(t, root, nil, cc.name, bridgeArgs...)
 	runCommand(t, artifacts, nil, bridgeExecutable)
+
+	python, err := exec.LookPath("python")
+	if err != nil {
+		t.Skipf("python is unavailable: %v", err)
+	}
+	pythonEnv := append([]string{}, env...)
+	pythonEnv = prependEnvPath(
+		pythonEnv,
+		"PYTHONPATH",
+		filepath.Join(root, "python", "src"),
+	)
+	pythonEnv = append(pythonEnv, "SHOAL_LIBRARY="+library)
+	runCommand(
+		t,
+		root,
+		pythonEnv,
+		python,
+		"-m",
+		"unittest",
+		"python.tests.test_cross_cutting",
+	)
+}
+
+func linkEveryDeclaredSymbol(
+	t *testing.T,
+	root string,
+	artifacts string,
+	env []string,
+	cc command,
+	include string,
+	library string,
+) {
+	t.Helper()
+	executable := filepath.Join(artifacts, "all_symbols")
+	if runtime.GOOS == "windows" {
+		executable += ".exe"
+	}
+	args := append(
+		append([]string{}, cc.args...),
+		"-std=c11", "-Wall", "-Wextra", "-Werror",
+		"-I", include,
+		filepath.Join(root, "capi", "tests", "all_symbols.c"),
+		library,
+		"-o", executable,
+	)
+	runCommand(t, root, nil, cc.name, args...)
+	runCommand(t, artifacts, env, executable)
 }
 
 type command struct {
