@@ -56,7 +56,6 @@ import (
 	"github.com/phrocker/shoal/internal/cclient"
 	"github.com/phrocker/shoal/internal/engine"
 	"github.com/phrocker/shoal/internal/iterrt"
-	"github.com/phrocker/shoal/internal/tablet"
 )
 
 var version = "dev"
@@ -148,11 +147,11 @@ func cmdInit(args []string) {
 		die("init: unsupported workload %q (want operational or analytical)", *workload)
 	}
 	if *format != "auto" {
-		fileFormat, err := tablet.ParseFileFormat(*format)
+		fileFormat, err := engine.ParseStorageFormat(*format)
 		if err != nil {
 			die("init: %v", err)
 		}
-		opts.TabletOptions.FileFormat = fileFormat
+		opts.FileFormat = fileFormat
 	}
 	if *splits != "" {
 		parts := strings.Split(*splits, ",")
@@ -310,11 +309,11 @@ func cmdCompact(args []string) {
 	defer eng.Close()
 
 	if *format != "" {
-		fileFormat, err := tablet.ParseFileFormat(*format)
+		fileFormat, err := engine.ParseStorageFormat(*format)
 		if err != nil {
 			die("compact: %v", err)
 		}
-		if err := eng.SetTableFileFormat(*tableName, fileFormat); err != nil {
+		if err := eng.SetTableStorageFormat(*tableName, fileFormat); err != nil {
 			die("compact: set format: %v", err)
 		}
 	}

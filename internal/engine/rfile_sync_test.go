@@ -3,11 +3,14 @@ package engine
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/phrocker/shoal/internal/cclient"
 	"github.com/phrocker/shoal/internal/storage/memory"
+	"github.com/phrocker/shoal/internal/tablet"
 )
 
 func writeRow(t *testing.T, eng *Engine, table, row string, i int) {
@@ -31,6 +34,7 @@ func TestExportRFilesIncremental(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open source: %v", err)
 	}
+
 	defer src.Close()
 	if err := src.CreateTable("graph", TableOptions{}); err != nil {
 		t.Fatalf("CreateTable: %v", err)
@@ -137,5 +141,63 @@ func TestSyncStateRoundTrip(t *testing.T) {
 	}
 	if reloaded.Sequence != 7 || reloaded.Table != "graph" || len(reloaded.Shipped) != 1 {
 		t.Fatalf("reloaded state mismatch: %+v", reloaded)
+	}
+}
+
+func TestExportRFilesIncrementalParquetMetadataAndImport(t *testing.T) {
+	ctx := context.Background()
+	srcDir := filepath.Join(t.TempDir(), "src")
+	dstDir := filepath.Join(t.TempDir(), "dst")
+	src, err := Open(srcDir, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer src.Close()
+	if err := src.CreateTable("analytics", TableOptions{Workload: WorkloadAnalytical}); err != nil {
+		t.Fatal(err)
+	}
+	writeRow(t, src, "analytics", "evt:a", 0)
+	dst := memory.New()
+	result, err := src.ExportRFilesIncremental(ctx, "analytics", dst, RFileExportOptions{
+		DestinationRoot: dstDir,
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Manifest.FileFormat != tablet.FormatParquet ||
+		result.Manifest.RFileCompatibility != "parquet/shoal" ||
+		len(result.Manifest.RFiles) != 1 ||
+		result.Manifest.RFiles[0].Format != string(tablet.FormatParquet) {
+		t.Fatalf("incremental parquet manifest = %+v", result.Manifest)
+	}
+
+	imported, err := Open(dstDir, Options{Backend: dst})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer imported.Close()
+	if err := imported.ImportRFileManifest(ctx, result.Manifest); err != nil {
+		t.Fatal(err)
+	}
+	if got := scanAll(t, imported, "analytics"); fmt.Sprint(got) != fmt.Sprint(scanAll(t, src, "analytics")) {
+		t.Fatalf("incremental parquet import = %v", got)
+	}
+}
+
+func TestOpenRejectsIncompleteManifestLayout(t *testing.T) {
+	dir := t.TempDir()
+	tableDir := filepath.Join(dir, "broken")
+	if err := os.MkdirAll(filepath.Join(tableDir, "t-0000"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeTableManifest(tableDir, tableManifest{
+		Version:    tableManifestVersion,
+		Splits:     [][]byte{[]byte("m")},
+		FileFormat: tablet.FormatRFile,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(dir, Options{}); err == nil || !strings.Contains(err.Error(), "incomplete layout") {
+		t.Fatalf("Open error = %v, want incomplete layout", err)
 	}
 }

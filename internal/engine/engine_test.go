@@ -18,6 +18,8 @@
 package engine_test
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -26,8 +28,17 @@ import (
 	"github.com/phrocker/shoal/internal/cclient"
 	"github.com/phrocker/shoal/internal/engine"
 	"github.com/phrocker/shoal/internal/iterrt"
+	"github.com/phrocker/shoal/internal/storage/memory"
 	"github.com/phrocker/shoal/internal/tablet"
 )
+
+type removeFailBackend struct {
+	*memory.Backend
+}
+
+func (b removeFailBackend) Remove(context.Context, string) error {
+	return errors.New("injected remove failure")
+}
 
 func TestEngine_CreateWriteScan(t *testing.T) {
 	dir := t.TempDir()
@@ -252,6 +263,7 @@ func TestEngine_AnalyticalWorkloadDefaultsToParquet(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	defer eng.Close()
 	if err := eng.CreateTable("analytics", engine.TableOptions{
 		Workload: engine.WorkloadAnalytical,
@@ -504,4 +516,46 @@ func indexOf(s string, b byte) int {
 		}
 	}
 	return -1
+}
+
+func TestEngine_ParquetMigrationReopenIgnoresRetiredFile(t *testing.T) {
+	dir := t.TempDir()
+	backend := removeFailBackend{Backend: memory.New()}
+	eng, err := engine.Open(dir, engine.Options{Backend: backend})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := eng.CreateTable("graph", engine.TableOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	m, _ := cclient.NewMutation([]byte("row"))
+	m.Put([]byte("cf"), []byte("cq"), nil, 1, []byte("value"))
+	if err := eng.Write("graph", []*cclient.Mutation{m}); err != nil {
+		t.Fatal(err)
+	}
+	if err := eng.Flush("graph"); err != nil {
+		t.Fatal(err)
+	}
+	if err := eng.SetTableFileFormat("graph", tablet.FormatParquet); err != nil {
+		t.Fatal(err)
+	}
+	if err := eng.Compact("graph", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := eng.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := engine.Open(dir, engine.Options{Backend: backend})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	stats := reopened.Stats()
+	if len(stats) != 1 || stats[0].RFiles != 1 {
+		t.Fatalf("reopened stats = %+v, want one authoritative immutable file", stats)
+	}
+	if got := scanRows(t, reopened); fmt.Sprint(got) != "[row]" {
+		t.Fatalf("reopened rows = %v", got)
+	}
 }

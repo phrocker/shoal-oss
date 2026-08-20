@@ -88,6 +88,7 @@ func TestSourceUsesPageIndexWithinRowGroup(t *testing.T) {
 			Key:   &wire.Key{Row: row, ColumnFamily: []byte("cf"), Timestamp: 1},
 			Value: []byte("value"),
 		}
+
 	}
 	iter := iterrt.NewSliceSource(cells)
 	if err := iter.Init(nil, nil, iterrt.IteratorEnvironment{}); err != nil {
@@ -139,4 +140,77 @@ func TestSourceUsesPageIndexWithinRowGroup(t *testing.T) {
 	if stats.RowsDecoded >= 90 {
 		t.Fatalf("decoded too many rows after page seek: %+v", stats)
 	}
+}
+
+func BenchmarkSourcePruning(b *testing.B) {
+	cells := make([]iterrt.Cell, 8192)
+	for i := range cells {
+		row := []byte(fmt.Sprintf("row-%05d-%080d", i, i))
+		cells[i] = iterrt.Cell{
+			Key:   &wire.Key{Row: row, ColumnFamily: []byte("cf"), Timestamp: 1},
+			Value: []byte("value"),
+		}
+	}
+	iter := iterrt.NewSliceSource(cells)
+	if err := iter.Init(nil, nil, iterrt.IteratorEnvironment{}); err != nil {
+		b.Fatal(err)
+	}
+	if err := iter.Seek(iterrt.InfiniteRange(), nil, false); err != nil {
+		b.Fatal(err)
+	}
+	data, _, err := EncodeWithOptions(iter, EncodeOptions{
+		RowsPerRowGroup: 256,
+		PageBufferSize:  1024,
+	})
+	if err != nil {
+		b.Fatal(err)
+	}
+	backend := memory.New()
+	backend.Put("bench.parquet", data)
+	open := func() (storage.File, error) {
+		return backend.Open(context.Background(), "bench.parquet")
+	}
+	file, err := open()
+	if err != nil {
+		b.Fatal(err)
+	}
+	src, err := NewSource(file, open)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer src.Close()
+
+	b.Run("point-row-group-bloom-page-index", func(b *testing.B) {
+		row := cells[len(cells)-17].Key.Row
+		end := append(append([]byte(nil), row...), 0)
+		rng := iterrt.Range{
+			Start:          &wire.Key{Row: row},
+			StartInclusive: true,
+			End:            &wire.Key{Row: end},
+			EndInclusive:   false,
+		}
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			if err := src.Seek(rng, nil, false); err != nil {
+				b.Fatal(err)
+			}
+			for src.HasTop() {
+				if err := src.Next(); err != nil {
+					b.Fatal(err)
+				}
+			}
+		}
+	})
+	b.Run("full-scan", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			if err := src.Seek(iterrt.InfiniteRange(), nil, false); err != nil {
+				b.Fatal(err)
+			}
+			for src.HasTop() {
+				if err := src.Next(); err != nil {
+					b.Fatal(err)
+				}
+			}
+		}
+	})
 }

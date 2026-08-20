@@ -131,6 +131,11 @@ Parquet files are sorted into row groups with row statistics and bloom filters,
 so bounded SQL predicates prune unrelated groups instead of decoding the whole
 file.
 
+Use `shoal-sql --explain --query 'SELECT ...'` to print the physical plan and
+the table's configured write format, authoritative read formats, and mixed
+migration state without executing the query. Reproduce the pruning benchmark
+with `go test -run '^$' -bench BenchmarkSourcePruning ./internal/parquetfile`.
+
 **HDFS.** Select the `hdfs` backend and use `hdfs:/path` or
 `hdfs://namenode:port/path` object paths. The native Go client loads
 `core-site.xml` and `hdfs-site.xml` from `HADOOP_CONF_DIR` or

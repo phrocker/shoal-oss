@@ -35,6 +35,7 @@ package tablet
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
@@ -83,15 +84,16 @@ func ParseFileFormat(value string) (FileFormat, error) {
 
 // Tablet is one range of a table's key space.
 type Tablet struct {
-	mu      sync.RWMutex
-	dir     string
-	active  *skiplistMemtable
-	files   []string // sorted list of RFile paths/keys, oldest first
-	wal     *localwal.WAL
-	seq     atomic.Int64
-	logger  *slog.Logger
-	opts    Options
-	backend storage.Backend // object store for RFile bytes (default: local FS)
+	mu       sync.RWMutex
+	dir      string
+	active   *skiplistMemtable
+	files    []string // sorted list of RFile paths/keys, oldest first
+	wal      *localwal.WAL
+	seq      atomic.Int64
+	logger   *slog.Logger
+	opts     Options
+	backend  storage.Backend // object store for RFile bytes (default: local FS)
+	obsolete map[string]struct{}
 }
 
 // Options configures a Tablet.
@@ -184,11 +186,12 @@ func Open(dir string, opts Options) (*Tablet, error) {
 
 	// Discover existing RFiles via the backend manifest (a directory
 	// listing for the local FS; a prefix scan for memory/cloud stores).
-	keys, err := listImmutableFiles(backend, dir)
+	keys, obsolete, err := discoverImmutableFiles(backend, dir, false)
 	if err != nil {
 		return nil, fmt.Errorf("tablet: list %s: %w", dir, err)
 	}
 	t.files = keys
+	t.obsolete = obsolete
 	sort.Strings(t.files)
 
 	// Open WAL
@@ -585,12 +588,31 @@ func (t *Tablet) Compact(stack []iterrt.IterSpec) error {
 		return fmt.Errorf("tablet: write compacted: %w", err)
 	}
 
-	// Remove old files
 	oldFiles := t.files
-	t.files = []string{outPath}
+	obsolete := cloneObsolete(t.obsolete)
 	for _, old := range oldFiles {
-		t.opts.Cache.Drop(old)
-		removeObject(t.backend, old)
+		obsolete[filepath.Base(old)] = struct{}{}
+	}
+	if err := persistImmutableManifest(t.backend, t.dir, []string{outPath}, obsolete); err != nil {
+		_ = removeObject(t.backend, outPath)
+		return fmt.Errorf("tablet: publish compacted generation: %w", err)
+	}
+	t.files = []string{outPath}
+	t.obsolete = obsolete
+	for _, old := range oldFiles {
+		if t.opts.Cache != nil {
+			t.opts.Cache.Drop(old)
+		}
+		if err := removeObject(t.backend, old); err == nil {
+			delete(t.obsolete, filepath.Base(old))
+		} else {
+			t.logger.Warn("compaction cleanup deferred",
+				slog.String("file", old),
+				slog.String("err", err.Error()))
+		}
+	}
+	if err := persistImmutableManifest(t.backend, t.dir, t.files, t.obsolete); err != nil {
+		t.logger.Warn("compaction cleanup manifest update failed", slog.String("err", err.Error()))
 	}
 
 	t.logger.Info("compaction complete",
@@ -629,13 +651,18 @@ func (t *Tablet) RFiles() []string {
 // times RefreshFiles runs, so re-importing an unchanged manifest is a no-op.
 // Returns the number of RFiles now tracked.
 func (t *Tablet) RefreshFiles() (int, error) {
-	keys, err := listImmutableFiles(t.backend, t.dir)
+	keys, obsolete, err := discoverImmutableFiles(t.backend, t.dir, true)
 	if err != nil {
 		return 0, fmt.Errorf("tablet: refresh list %s: %w", t.dir, err)
 	}
 	sort.Strings(keys)
 	t.mu.Lock()
+	if err := persistImmutableManifest(t.backend, t.dir, keys, obsolete); err != nil {
+		t.mu.Unlock()
+		return 0, fmt.Errorf("tablet: refresh manifest %s: %w", t.dir, err)
+	}
 	t.files = keys
+	t.obsolete = obsolete
 	n := len(t.files)
 	t.mu.Unlock()
 	return n, nil
@@ -683,7 +710,12 @@ func (t *Tablet) flushLocked() error {
 		return fmt.Errorf("flush: write %s: %w", outPath, err)
 	}
 
-	t.files = append(t.files, outPath)
+	files := append(append([]string(nil), t.files...), outPath)
+	if err := persistImmutableManifest(t.backend, t.dir, files, t.obsolete); err != nil {
+		_ = removeObject(t.backend, outPath)
+		return fmt.Errorf("flush: publish generation: %w", err)
+	}
+	t.files = files
 	t.active = newSkiplistMemtable()
 
 	if err := t.wal.Truncate(); err != nil {
@@ -845,11 +877,77 @@ func (t *Tablet) openFileSource(path string, env iterrt.IteratorEnvironment) (it
 	return src, func() { rdr.Close() }, nil
 }
 
-// listImmutableFiles discovers a tablet's RFile and Parquet files through the backend's
-// Lister capability (a prefix scan for memory/cloud, a directory listing
-// for local). Falls back to an os.ReadDir for a backend without Lister.
-// Only ".rf" and ".parquet" objects are returned (the WAL and other files are ignored).
-func listImmutableFiles(b storage.Backend, dir string) ([]string, error) {
+const immutableManifestVersion = 1
+
+type immutableManifest struct {
+	Version  int      `json:"version"`
+	Active   []string `json:"active"`
+	Obsolete []string `json:"obsolete,omitempty"`
+}
+
+func discoverImmutableFiles(b storage.Backend, dir string, adoptUnknown bool) ([]string, map[string]struct{}, error) {
+	keys, err := listTabletObjects(b, dir)
+	if err != nil {
+		return nil, nil, err
+	}
+	available := make(map[string]string)
+	manifestPresent := false
+	for _, key := range keys {
+		switch filepath.Base(key) {
+		case "files.json":
+			manifestPresent = true
+		default:
+			if ext := filepath.Ext(key); ext == ".rf" || ext == ".parquet" {
+				available[filepath.Base(key)] = key
+			}
+		}
+	}
+	obsolete := make(map[string]struct{})
+	if !manifestPresent {
+		active := make([]string, 0, len(available))
+		for _, key := range available {
+			active = append(active, key)
+		}
+		return active, obsolete, nil
+	}
+	data, err := storage.ReadAll(context.Background(), b, filepath.Join(dir, "files.json"))
+	if err != nil {
+		return nil, nil, fmt.Errorf("read immutable manifest: %w", err)
+	}
+	var manifest immutableManifest
+	if err := json.Unmarshal(data, &manifest); err != nil {
+		return nil, nil, fmt.Errorf("decode immutable manifest: %w", err)
+	}
+	if manifest.Version != immutableManifestVersion {
+		return nil, nil, fmt.Errorf("unsupported immutable manifest version %d", manifest.Version)
+	}
+	for _, name := range manifest.Obsolete {
+		obsolete[name] = struct{}{}
+	}
+	active := make([]string, 0, len(manifest.Active))
+	known := make(map[string]struct{}, len(manifest.Active))
+	for _, name := range manifest.Active {
+		path, ok := available[name]
+		if !ok {
+			return nil, nil, fmt.Errorf("authoritative immutable file %q is missing", name)
+		}
+		active = append(active, path)
+		known[name] = struct{}{}
+	}
+	if adoptUnknown {
+		for name, path := range available {
+			if _, ok := known[name]; ok {
+				continue
+			}
+			if _, retired := obsolete[name]; !retired {
+				active = append(active, path)
+			}
+		}
+	}
+	return active, obsolete, nil
+}
+
+func listTabletObjects(b storage.Backend, dir string) ([]string, error) {
 	var keys []string
 	if lister, ok := b.(storage.Lister); ok {
 		ks, err := lister.List(context.Background(), dir)
@@ -868,24 +966,49 @@ func listImmutableFiles(b storage.Backend, dir string) ([]string, error) {
 			}
 		}
 	}
-	out := keys[:0]
-	for _, k := range keys {
-		if ext := filepath.Ext(k); ext == ".rf" || ext == ".parquet" {
-			out = append(out, k)
-		}
-	}
-	return out, nil
+	return keys, nil
 }
 
-// removeObject deletes an RFile through the backend's Remover capability,
-// falling back to os.Remove. Best-effort: a failed delete leaves an
-// orphan object but does not corrupt the live file set.
-func removeObject(b storage.Backend, path string) {
-	if r, ok := b.(storage.Remover); ok {
-		_ = r.Remove(context.Background(), path)
-		return
+func persistImmutableManifest(b storage.Backend, dir string, active []string, obsolete map[string]struct{}) error {
+	manifest := immutableManifest{Version: immutableManifestVersion}
+	for _, path := range active {
+		manifest.Active = append(manifest.Active, filepath.Base(path))
 	}
-	_ = os.Remove(path)
+	for name := range obsolete {
+		manifest.Obsolete = append(manifest.Obsolete, name)
+	}
+	sort.Strings(manifest.Active)
+	sort.Strings(manifest.Obsolete)
+	data, err := json.MarshalIndent(manifest, "", "  ")
+	if err != nil {
+		return fmt.Errorf("encode immutable manifest: %w", err)
+	}
+	return storage.WriteAll(context.Background(), b, filepath.Join(dir, "files.json"), append(data, '\n'))
+}
+
+func cloneObsolete(in map[string]struct{}) map[string]struct{} {
+	out := make(map[string]struct{}, len(in))
+	for name := range in {
+		out[name] = struct{}{}
+	}
+	return out
+}
+
+// PublishImmutableFiles records the authoritative immutable generation for a
+// tablet directory. Importers call it after checksum verification so stale
+// objects already present under the destination prefix are not rediscovered.
+func PublishImmutableFiles(b storage.Backend, dir string, active []string) error {
+	return persistImmutableManifest(b, dir, active, nil)
+}
+
+func removeObject(b storage.Backend, path string) error {
+	if r, ok := b.(storage.Remover); ok {
+		return r.Remove(context.Background(), path)
+	}
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
 }
 
 // Scanner is a pull-based iterator over scan results.

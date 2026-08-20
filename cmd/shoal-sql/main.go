@@ -29,6 +29,7 @@ func main() {
 	dir := flag.String("data", "", "shoal engine data directory (required)")
 	table := flag.String("table", "graph", "physical engine table backing the graph tables")
 	query := flag.String("query", "", "run a single query and exit; omit for an interactive REPL")
+	explain := flag.Bool("explain", false, "print the physical plan and storage policy without executing")
 	flag.Parse()
 
 	if *dir == "" {
@@ -47,7 +48,7 @@ func main() {
 	exec := shoalql.NewExecutor(enginebackend.New(eng))
 
 	run := func(sql string) {
-		if err := runQuery(context.Background(), cat, exec, sql); err != nil {
+		if err := runQuery(context.Background(), eng, cat, exec, sql, *explain); err != nil {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		}
 	}
@@ -72,7 +73,7 @@ func main() {
 	}
 }
 
-func runQuery(ctx context.Context, cat shoalql.Catalog, exec *shoalql.Executor, sql string) error {
+func runQuery(ctx context.Context, eng *engine.Engine, cat shoalql.Catalog, exec *shoalql.Executor, sql string, explain bool) error {
 	stmt, err := shoalql.Parse(sql)
 	if err != nil {
 		return err
@@ -85,10 +86,21 @@ func runQuery(ctx context.Context, cat shoalql.Catalog, exec *shoalql.Executor, 
 	if err != nil {
 		return err
 	}
+	if explain {
+		policy, err := eng.TableStoragePolicy(plan.Table)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("shape=%d table=%s workload=%s write_format=%s read_formats=%s mixed=%t role=%s\n",
+			plan.Shape, plan.Table, policy.Workload, policy.WriteFormat,
+			storageFormats(policy.ReadFormats), policy.Mixed, policy.Role)
+		return nil
+	}
 	res, err := exec.Run(ctx, plan)
 	if err != nil {
 		return err
 	}
+
 	printResult(res)
 	return nil
 }
@@ -105,4 +117,15 @@ func printResult(res *shoalql.Result) {
 	}
 	w.Flush()
 	fmt.Printf("(%d rows)\n", len(res.Rows))
+}
+
+func storageFormats(formats []engine.StorageFormat) string {
+	if len(formats) == 0 {
+		return "none"
+	}
+	values := make([]string, len(formats))
+	for i, format := range formats {
+		values[i] = string(format)
+	}
+	return strings.Join(values, ",")
 }

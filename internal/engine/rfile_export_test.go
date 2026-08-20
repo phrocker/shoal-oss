@@ -617,6 +617,60 @@ func TestParquetExportImportWithVisibilityStamp(t *testing.T) {
 	}
 }
 
+func TestMixedFormatExportManifestUsesActualFileFormats(t *testing.T) {
+	ctx := context.Background()
+	src, err := Open(t.TempDir(), Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer src.Close()
+	if err := src.CreateTable("graph", TableOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	write := func(row string) {
+		m, _ := cclient.NewMutation([]byte(row))
+		m.Put([]byte("cf"), []byte("cq"), nil, 1, []byte(row))
+		if err := src.Write("graph", []*cclient.Mutation{m}); err != nil {
+			t.Fatal(err)
+		}
+		if err := src.Flush("graph"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("rfile")
+	if err := src.SetTableFileFormat("graph", tablet.FormatParquet); err != nil {
+		t.Fatal(err)
+	}
+	write("parquet")
+	policy, err := src.TableStoragePolicy("graph")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if policy.WriteFormat != StorageFormatParquet || !policy.Mixed ||
+		fmt.Sprint(policy.ReadFormats) != "[parquet rfile]" || policy.Role != "authoritative" {
+		t.Fatalf("mixed storage policy = %+v", policy)
+	}
+
+	dst := memory.New()
+	manifest, err := src.ExportRFiles(ctx, "graph", dst, RFileExportOptions{
+		DestinationRoot: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if manifest.FileFormat != tablet.FormatParquet ||
+		manifest.RFileCompatibility != "mixed-rfile-parquet/shoal" {
+		t.Fatalf("mixed manifest metadata = %+v", manifest)
+	}
+	formats := map[string]bool{}
+	for _, file := range manifest.RFiles {
+		formats[file.Format] = true
+	}
+	if !formats[string(tablet.FormatRFile)] || !formats[string(tablet.FormatParquet)] {
+		t.Fatalf("mixed manifest file formats = %v", formats)
+	}
+}
+
 func scanAll(t *testing.T, eng *Engine, table string) []string {
 	t.Helper()
 	sc, err := eng.Scan(table, iterrt.InfiniteRange(), ScanOptions{})

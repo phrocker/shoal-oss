@@ -292,23 +292,24 @@ func (e *Engine) ExportRFiles(ctx context.Context, tableName string, dst storage
 
 	e.mu.RLock()
 	tbl, ok := e.tables[tableName]
+	var configuredFormat tablet.FileFormat
+	if ok {
+		configuredFormat = tbl.format
+	}
 	e.mu.RUnlock()
 	if !ok {
 		return nil, fmt.Errorf("engine: table %q not found", tableName)
 	}
 
 	files := tbl.rfiles()
-	compatibility := "accumulo-rfile/shoal"
-	if tbl.format == tablet.FormatParquet {
-		compatibility = "parquet/shoal"
-	}
+	compatibility := exportCompatibility(files)
 	manifest := &RFileExportManifest{
 		Version:             RFileExportManifestVersion,
 		CreatedAt:           time.Now().UTC(),
 		SourceTable:         tableName,
 		EngineVersion:       opts.EngineVersion,
 		RFileCompatibility:  compatibility,
-		FileFormat:          tbl.format,
+		FileFormat:          configuredFormat,
 		CFSchema:            opts.CFSchema,
 		VisibilityStamp:     opts.VisibilityStamp,
 		AuthorizationsStamp: opts.AuthorizationsStamp,
@@ -463,6 +464,16 @@ func (e *Engine) ImportRFileManifest(ctx context.Context, manifest *RFileExportM
 	}); err != nil {
 		return err
 	}
+	filesByTablet := make(map[int][]string)
+	for _, file := range manifest.RFiles {
+		filesByTablet[file.TabletIndex] = append(filesByTablet[file.TabletIndex], file.DestinationPath)
+	}
+	for i := 0; i < manifest.tabletCount(); i++ {
+		tabletDir := filepath.Join(tableDir, fmt.Sprintf("t-%04d", i))
+		if err := tablet.PublishImmutableFiles(e.backend, tabletDir, filesByTablet[i]); err != nil {
+			return fmt.Errorf("engine: publish imported tablet %d manifest: %w", i, err)
+		}
+	}
 	tbl, err := openTable(tableDir, manifest.SourceTable, e.logger, e.cache, e.walSyncMode, e.walSyncInterval, e.backend, e.publishRFile)
 	if err != nil {
 		return err
@@ -525,6 +536,26 @@ func fileFormatForPath(path string) tablet.FileFormat {
 		return tablet.FormatParquet
 	}
 	return tablet.FormatRFile
+}
+
+func exportCompatibility(files []tableRFile) string {
+	var rfile, parquet bool
+	for _, file := range files {
+		switch fileFormatForPath(file.Path) {
+		case tablet.FormatParquet:
+			parquet = true
+		default:
+			rfile = true
+		}
+	}
+	switch {
+	case rfile && parquet:
+		return "mixed-rfile-parquet/shoal"
+	case parquet:
+		return "parquet/shoal"
+	default:
+		return "accumulo-rfile/shoal"
+	}
 }
 
 func copyWithSHA256(ctx context.Context, src storage.Backend, srcPath string, dst storage.Backend, dstPath string) (written int64, sum string, bcVersion string, err error) {

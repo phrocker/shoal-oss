@@ -172,13 +172,16 @@ func (s *Source) advance() error {
 				Timestamp:        cell.Timestamp,
 				Deleted:          cell.Deleted,
 			}
-			if s.rng.BeforeStart(key) || !cfAllowed(key.ColumnFamily, s.cfs, s.inclusive) {
+			if s.rng.BeforeStart(key) {
 				continue
 			}
 			if s.rng.AfterEnd(key) {
 				s.clearTop()
 				s.closeReader()
 				return nil
+			}
+			if !cfAllowed(key.ColumnFamily, s.cfs, s.inclusive) {
+				continue
 			}
 			s.topKey = key
 			s.topValue = cell.Value

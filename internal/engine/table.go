@@ -55,6 +55,10 @@ type TableOptions struct {
 	// Workload selects the default immutable format when TabletOptions.FileFormat
 	// is unset. Operational uses RFile; analytical uses Parquet.
 	Workload WorkloadProfile
+
+	// FileFormat explicitly selects the immutable storage format without
+	// exposing tablet internals. Empty derives the format from Workload.
+	FileFormat StorageFormat
 }
 
 type WorkloadProfile string
@@ -63,6 +67,24 @@ const (
 	WorkloadOperational WorkloadProfile = "operational"
 	WorkloadAnalytical  WorkloadProfile = "analytical"
 )
+
+type StorageFormat string
+
+const (
+	StorageFormatRFile   StorageFormat = "rfile"
+	StorageFormatParquet StorageFormat = "parquet"
+)
+
+func ParseStorageFormat(value string) (StorageFormat, error) {
+	switch StorageFormat(value) {
+	case "", StorageFormatRFile:
+		return StorageFormatRFile, nil
+	case StorageFormatParquet:
+		return StorageFormatParquet, nil
+	default:
+		return "", fmt.Errorf("engine: unsupported storage format %q (want rfile or parquet)", value)
+	}
+}
 
 // PrefixSplit is a convenience constructor for Splits based on row key
 // prefixes. Given ("event:", "knowledge:"), it returns split points
@@ -112,6 +134,16 @@ type tableManifest struct {
 // when non-nil, is invoked (with this table's name) each time one of its
 // tablets writes a new RFile via flush or compaction.
 func createTable(dir, name string, opts TableOptions, logger *slog.Logger, rfCache *tablet.Cache, notify func(table, kind, file string)) (*table, error) {
+	if opts.FileFormat != "" {
+		format, err := ParseStorageFormat(string(opts.FileFormat))
+		if err != nil {
+			return nil, err
+		}
+		if opts.TabletOptions.FileFormat != "" && string(opts.TabletOptions.FileFormat) != string(format) {
+			return nil, fmt.Errorf("table: conflicting file formats %q and %q", opts.FileFormat, opts.TabletOptions.FileFormat)
+		}
+		opts.TabletOptions.FileFormat = tablet.FileFormat(format)
+	}
 	if opts.TabletOptions.FileFormat == "" {
 		switch opts.Workload {
 		case "", WorkloadOperational:
@@ -233,6 +265,11 @@ func openTable(dir, name string, logger *slog.Logger, rfCache *tablet.Cache, wal
 		// Legacy: single tablet without t-NNNN directory
 		tabletDirs = []string{dir}
 	}
+	if len(manifest.Splits) > 0 && len(tabletDirs) != len(manifest.Splits)+1 {
+		return nil, fmt.Errorf(
+			"table: incomplete layout for %s: manifest has %d split(s), found %d tablet directorie(s)",
+			name, len(manifest.Splits), len(tabletDirs))
+	}
 
 	tablets := make([]*tablet.Tablet, len(tabletDirs))
 	for i, td := range tabletDirs {
@@ -299,8 +336,29 @@ func writeTableManifest(dir string, manifest tableManifest) error {
 	}
 	data = append(data, '\n')
 	path := filepath.Join(dir, "table.json")
-	if err := os.WriteFile(path, data, 0o644); err != nil {
+	tmp, err := os.CreateTemp(dir, ".table.json-*")
+	if err != nil {
+		return fmt.Errorf("table: create manifest temp: %w", err)
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+	if err := tmp.Chmod(0o644); err != nil {
+		tmp.Close()
+		return fmt.Errorf("table: chmod manifest temp: %w", err)
+	}
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
 		return fmt.Errorf("table: write manifest %s: %w", path, err)
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return fmt.Errorf("table: sync manifest %s: %w", path, err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("table: close manifest %s: %w", path, err)
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		return fmt.Errorf("table: commit manifest %s: %w", path, err)
 	}
 	return nil
 }
