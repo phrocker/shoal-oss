@@ -17,6 +17,12 @@ from ._native import (
     as_bytes,
     c_bytes,
 )
+from .compatibility import (
+    PythonIterator,
+    ScannerOptions,
+    unsupported_python_iterator,
+    unsupported_scanner_option,
+)
 
 
 @dataclass(frozen=True)
@@ -53,6 +59,10 @@ class _Config:
         password: str | bytes,
         accumulo_version: str = "4.0.0-SNAPSHOT",
     ) -> None:
+        if not accumulo_version.startswith("4."):
+            raise NotImplementedError(
+                "Shoal compatibility targets Accumulo 4 only (SB-DIV-001)"
+            )
         self.api = api
         self.config = ConnectorConfig()
         api.lib.shoal_connector_config_init(C.byref(self.config))
@@ -116,6 +126,12 @@ class Connector:
 
     def __enter__(self) -> Connector:
         return self
+
+    def __copy__(self) -> Connector:
+        raise TypeError("Shoal connector handles cannot be copied")
+
+    def __deepcopy__(self, _: object) -> Connector:
+        raise TypeError("Shoal connector handles cannot be copied")
 
     def mutation(self, row: str | bytes) -> object:
         from .writer import Mutation
@@ -309,6 +325,20 @@ class Scanner:
         self._ensure_open()
         self._client.select_column(family, qualifier)
 
+    def setOption(self, option: ScannerOptions | int) -> None:
+        raise unsupported_scanner_option(option)
+
+    def removeOption(self, option: ScannerOptions | int) -> None:
+        raise unsupported_scanner_option(option)
+
+    def addIterator(self, iterator: object) -> None:
+        if isinstance(iterator, PythonIterator):
+            raise unsupported_python_iterator()
+        raise NotImplementedError(
+            "mutable legacy scanner iterator configuration is not supported; "
+            "configure Shoal scanner iterators at construction"
+        )
+
     def scan(
         self,
         begin_row: str | bytes,
@@ -376,6 +406,19 @@ class AccumuloBase(Client):
 
 
 class AccumuloScanner(AccumuloBase):
+    def setOption(self, option: ScannerOptions | int) -> None:
+        raise unsupported_scanner_option(option)
+
+    def removeOption(self, option: ScannerOptions | int) -> None:
+        raise unsupported_scanner_option(option)
+
+    def addIterator(self, iterator: object) -> None:
+        if isinstance(iterator, PythonIterator):
+            raise unsupported_python_iterator()
+        raise NotImplementedError(
+            "mutable legacy scanner iterator configuration is not supported"
+        )
+
     def get(self, *_: object, **__: object) -> None:
         raise NotImplementedError(
             "legacy chunked AccumuloIterator is not part of the first Python delivery slice; "

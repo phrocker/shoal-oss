@@ -13,7 +13,7 @@ from typing import Iterable
 from .errors import exception_for_status
 
 ABI_MAJOR = 1
-MIN_ABI_VERSION = (1, 16, 0)
+MIN_ABI_VERSION = (1, 17, 0)
 CAP_OWNED_SCAN_RESULT = 5
 CAP_MUTATION = 6
 CAP_BATCH_WRITER = 7
@@ -29,6 +29,7 @@ CAP_COMPATIBILITY_ERRORS = 23
 CAP_RFILE = 16
 CAP_HDFS = 27
 CAP_RFILE_LOCALITY_GROUPS = 28
+CAP_CLIENT_PARITY_CONTROLS = 29
 
 CAPABILITY_SYMBOLS = {
     CAP_OWNED_SCAN_RESULT: {
@@ -63,6 +64,11 @@ CAPABILITY_SYMBOLS = {
         "shoal_batch_writer_flush",
         "shoal_batch_writer_close",
         "shoal_batch_writer_free",
+    },
+    CAP_CLIENT_PARITY_CONTROLS: {
+        "shoal_batch_writer_size",
+        "shoal_logging_set_level",
+        "shoal_logging_get_level",
     },
     CAP_STRUCTURED_WRITE_FAILURE: {
         "shoal_write_failure_get_flags",
@@ -488,6 +494,19 @@ class NativeAPI:
             C.POINTER(BatchWriterConfig),
             **optional,
         )
+        self._function(
+            "shoal_batch_writer_size",
+            C.c_int32,
+            P,
+            C.c_int64,
+            C.POINTER(C.c_size_t),
+            PP,
+            **optional,
+        )
+        self._function(
+            "shoal_logging_set_level", C.c_int32, C.c_int32, PP, **optional
+        )
+        self._function("shoal_logging_get_level", C.c_int32, **optional)
         self._function(
             "shoal_client_config_init", None, C.POINTER(ClientConfig), **optional
         )

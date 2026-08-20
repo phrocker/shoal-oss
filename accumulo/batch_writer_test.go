@@ -253,6 +253,38 @@ func TestBatchWriterRoutesBatchesAndCopiesMutation(t *testing.T) {
 	}
 }
 
+func TestBatchWriterSizeTracksBufferedMutations(t *testing.T) {
+	writer := newBatchWriterTestWriter(t, discoveryTablets(), BatchWriterOptions{
+		MaxMemoryBytes: 1 << 20,
+	}, &fakeBatchWriterIngest{})
+	for index, row := range []string{"a", "b"} {
+		mutation, _ := NewMutation([]byte(row))
+		mutation.PutLatest([]byte("cf"), []byte("cq"), nil, []byte("value"))
+		if err := writer.Add(context.Background(), mutation); err != nil {
+			t.Fatal(err)
+		}
+		size, err := writer.Size(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if size != index+1 {
+			t.Fatalf("size = %d, want %d", size, index+1)
+		}
+	}
+	if err := writer.Flush(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if size, err := writer.Size(context.Background()); err != nil || size != 0 {
+		t.Fatalf("size after flush = %d, %v; want 0, nil", size, err)
+	}
+	if err := writer.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writer.Size(context.Background()); !errors.Is(err, ErrBatchWriterClosed) {
+		t.Fatalf("size after close error = %v, want ErrBatchWriterClosed", err)
+	}
+}
+
 func TestBatchWriterMemoryBoundFlushesSynchronously(t *testing.T) {
 	ingest := &fakeBatchWriterIngest{}
 	writer := newBatchWriterTestWriter(t, discoveryTablets(), BatchWriterOptions{

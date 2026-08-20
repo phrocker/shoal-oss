@@ -21,6 +21,7 @@ PACKAGE_DIR = PYTHON_DIR / "src" / "sharkbite"
 LIBS_DIR = PACKAGE_DIR / ".libs"
 DIST_DIR = PYTHON_DIR / "dist"
 BUILD_DIR = PYTHON_DIR / "build"
+EGG_INFO_DIR = PYTHON_DIR / "src" / "shoal_sharkbite.egg-info"
 ABI_HEADER = ROOT / "capi" / "include" / "shoal_types.h"
 
 
@@ -155,6 +156,7 @@ def main() -> None:
     shutil.rmtree(DIST_DIR, ignore_errors=True)
     shutil.rmtree(BUILD_DIR, ignore_errors=True)
     shutil.rmtree(LIBS_DIR, ignore_errors=True)
+    shutil.rmtree(EGG_INFO_DIR, ignore_errors=True)
     DIST_DIR.mkdir(parents=True)
 
     run(

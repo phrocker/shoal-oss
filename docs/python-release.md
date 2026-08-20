@@ -11,7 +11,7 @@ assert pysharkbite.Client is sharkbite.Client
 ```
 
 The distribution version is independent of the native ABI version. Release
-`0.3.0` requires Shoal ABI `1.16.0` or newer within ABI major 1. The package is
+`0.4.0` requires Shoal ABI `1.17.0` or newer within ABI major 1. The package is
 still an incremental compatibility layer: publishing it does not make the
 uncovered rows in `sharkbite-compatibility.md` compatible.
 
@@ -21,8 +21,8 @@ uncovered rows in `sharkbite-compatibility.md` compatible.
 | --- | --- | --- |
 | Linux x86-64, glibc 2.28+ | First supported wheel target | Build as `manylinux_2_28_x86_64` in a glibc 2.28-or-older manylinux environment and require `auditwheel show` to pass. |
 | Linux aarch64, glibc 2.28+ | Build-capable, not yet release-validated | The scripts emit and verify `manylinux_2_28_aarch64`; publication waits for native aarch64 CI evidence. |
-| macOS x86-64/arm64 | Build-capable preview | Native tags and artifact structure are supported; publication waits for clean-host runtime evidence on each architecture. |
-| Windows amd64 | Build-capable preview | Local clean-install/runtime verification is supported; publication waits for a maintained Windows release runner. |
+| macOS x86-64/arm64 | Build-capable, host verification pending | The scripts select native tags and `libshoal.dylib`; publication requires linked C/C++ execution and clean installs on each published architecture. |
+| Windows amd64 | Host-verified artifact path | The C/C++ ABI tests, wheel/source-only sdist build, clean no-index installs, and reproducibility checks pass on Windows. |
 
 The source distribution is platform-neutral Python source and intentionally
 contains no native binary. A platform wheel contains exactly one native Shoal
@@ -42,7 +42,7 @@ The loader uses this order:
 The current working directory and repository build directories are never
 searched implicitly. This prevents accidental or attacker-controlled library
 preloading. The loader resolves ABI discovery symbols first, rejects a major
-other than 1, rejects versions older than 1.16.0, checks the packed and tuple
+other than 1, rejects versions older than 1.17.0, checks the packed and tuple
 versions agree, and dynamically resolves capability symbols before use.
 
 ## Reproducible build
@@ -83,3 +83,7 @@ with the Go toolchain absent from `PATH`. It also builds the source-only sdist
 into an unbundled `py3-none-any` wheel and installs that in a second clean
 environment. Both paths import both module names, load a trusted native
 library, check ABI/capabilities, and execute a native mutation smoke test.
+
+The build and verification scripts are host-portable. Cross-compilation is not
+accepted as runtime evidence; macOS remains explicitly unverified until those
+same commands run on a macOS host.
