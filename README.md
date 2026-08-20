@@ -130,6 +130,13 @@ shoal-embed compact --table graph --format parquet --data ~/.shoal/data
 shoal-embed serve  --data ~/.shoal/data --port 9876
 ```
 
+The server is also published as a non-root, multi-architecture container at
+`ghcr.io/phrocker/shoal-oss/shoal-embed`. It starts the gRPC and observability
+listeners with container-safe defaults and includes `proto/embed.proto` for
+non-Go client generation. See
+[`docs/shoal-embed-container.md`](docs/shoal-embed-container.md) for runtime,
+versioning, proto extraction, and local smoke-test instructions.
+
 Programmatic use mirrors the CLI:
 
 ```go
@@ -316,9 +323,16 @@ intentionally opt-in and reports Docker absence as a skipped, unexecuted test
 with a nonzero status.
 Go 1.25+ (transitively from `cloud.google.com/go/storage`).
 
-Docker image (multi-stage, distroless static):
+Platform Docker image (multi-stage, distroless static):
 ```bash
 docker build -t shoal:dev .
+```
+
+Build and smoke-test the minimal standalone `shoal-embed` image:
+
+```bash
+make container-build
+make container-smoke
 ```
 
 ## Layout
