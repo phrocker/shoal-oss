@@ -1,83 +1,88 @@
 # shoal
 
-## Python distribution
+Shoal is an Accumulo-compatible sorted key-value engine and replacement
+runtime written in Go. It runs as a standalone embedded database, exposes Go,
+C, and Python client APIs, and can replace Accumulo scan, tablet-server, and
+compaction roles. RFile and Parquet are native storage formats; ShoalQL runs
+SQL, graph, document, exact-vector, and distributed IVF-PQ queries across
+local and Accumulo-backed data.
 
-The `shoal-sharkbite` distribution is available under
-[`python/`](python/README.md). It supports both `import sharkbite` and
-`import pysharkbite`, negotiates the stable C ABI at runtime, and provides
-scanning, mutation/batch-writer, and table/namespace/security administration
-paths. It is not yet a complete Sharkbite-compatible distribution;
-unsupported core APIs fail explicitly. The
-[normative client-scope ADR](docs/sharkbite-client-scope.md) separates those
-blockers from optional Torch, pandas, embedded, and historical C++ surfaces.
-Linux manylinux_2_28 x86-64 is the
-first supported wheel target; Windows is host-verified and macOS remains a
-host-verification gap governed by the
-[release and native-library policy](docs/python-release.md).
+See [`FEATURES.md`](FEATURES.md) for the complete capability matrix, current
+validation state, and the few remaining external platform gates.
 
-A Go sorted key-value store with graph and vector query pushdown.
-Independent project — inspired by [Apache Accumulo](https://accumulo.apache.org)'s
-data model and RFile format, but its own engine that runs **standalone** with
-no Accumulo cluster and no ZooKeeper required.
+## Choose a path
 
-Shoal stores arbitrary keys and values as cells
-(`row → (cf, cq, cv, ts) → value`) and runs a minimal in-process iterator
-stack that pushes graph traversal, keyword, and vector queries down next to
-the data. The embedded engine can persist immutable files as RFile or Parquet
-and can scan mixed-format tablets during migration. Distributed serving keeps
-RFile compatibility for Accumulo interoperability.
-
-Two ways to run it:
-
-- **Embedded / standalone** (`shoal-embed`, `internal/engine`) — a
-  self-contained storage engine with its own write-ahead log, memtable,
-  compaction, and split policy. No external coordinator: open a data
-  directory, create tables, write and scan. Durable RFiles or Parquet files land on the
-  local filesystem or any pluggable backend (in-memory, GCS, S3, Azure Blob,
-  HDFS), so the
-  same engine scales from a single machine to cloud-durable storage. Use it
-  via the CLI or the `ShoalEmbed` gRPC service.
-- **Distributed serving** (`cmd/shoal`) — a shoal pod opens RFiles directly
-  from object storage and serves single-shot Thrift `scan()` / `multiScan()`
-  calls, with a client-side hedge coordinator racing N pods in parallel and
-  taking the first response. Because shoal shares Accumulo's RFile and Thrift
-  formats, this mode can also read an existing Accumulo cluster's data for
-  interop — but it doesn't require one.
-
-The rest of this README covers both modes; the embedded engine needs none of
-the ZooKeeper machinery described in the distributed-serving sections.
-
-## Status
-
-V1 + IVF-PQ iterator port shipped. Embedded standalone engine shipped.
-
-| Capability | Status |
+| Goal | Start here |
 |---|---|
-| **Embedded engine** (`shoal-embed`, `internal/engine`) — no ZooKeeper | shipped — WAL + memtable + compaction + split policy |
-| Embedded CLI (`init` / `write` / `scan` / `compact` / `status` / `serve`) | shipped |
-| `ShoalEmbed` gRPC service (`proto/embed.proto`) | shipped |
-| Pluggable durable backend (local FS / in-memory / GCS / S3 / Azure Blob / HDFS) | shipped — local scale to cloud-durable |
-| Graph pushdown: `EdgeExpandIterator` (one-hop neighborhood) | shipped |
-| Graph pushdown: `LatentEdgeDiscoveryIterator` | shipped |
-| Keyword pushdown: `TermIndexIterator` | shipped |
-| Vector pushdown: `VectorKNNIterator` (brute-force k-NN) | shipped |
-| Vector pushdown: `IvfPqDistanceIterator` (ADC + top-K) | shipped — wire-compatible with Java `VectorPQ.toBytes()` |
-| `startScan` (single tablet, single range) | shipped |
-| `startMultiScan` (BatchScanner shape) | shipped — auto-bins ranges across tablets |
-| Multi-locality-group merge + CF pushdown (LG-skip) | shipped |
-| RFile reader (block-level CRC, prefetch, snappy/gz/zlib) | shipped |
-| `RFile.blockmeta` zone-map block-skip extension | shipped — forward-compatible with Java `RFile.Reader` |
-| VisibilityFilter pushdown | shipped — alloc-free warm cache |
-| Accumulo 4 iterator capability admission | shipped — versioned, fail-closed scan/minc/majc registry and [machine-readable inventory](docs/iterator-capability-registry.md) |
-| Accumulo tablet-server lifecycle + ServiceLock | write path code-complete; `shoal-tserver -enable-ingest` advertises `TABLET_INGEST` only after ServiceLock, conditional metadata CAS, WAL, loader, memtable, and minc authorities initialize; release enablement remains gated by live evidence in #74 ([lifecycle](docs/tserver-hosting-lifecycle.md) · [ingest](docs/tablet-ingest-service.md)) |
-| Write-role production operations | semantic readiness/startup, TLS/mTLS, metrics/alerts, bounded drain, PVC-backed restart reconciliation, Kubernetes/Helm rollout and PDB policy shipped for tserver and compactor ([runbook](docs/write-tier-operations.md)); live rollout evidence remains #74 |
-| Hosted-tablet metadata/config/file/WAL loader | shipped — generation-fenced, retryable, deterministic specification builder (`internal/tabletloader`) |
-| File / locator / block caches | shipped |
-| Startup pre-warm (`-prewarm-tables=auto`) | shipped — distributed-serving mode |
-| Client-side hedge coordinator | shipped — `scanRow*` + `scanBatch*` overloads |
-| Manager-facing tablet lifecycle RPC adapter (`internal/tserverrpc`) | wired — assignment attempts flow to writable backends with exact ServiceLock, manager-lock, assignment, and metadata-generation fencing ([lifecycle](docs/tserver-hosting-lifecycle.md)) |
-| Offline compaction (`shoal-offline-compact`, `internal/offlinecompact`) | shipped — OFFLINE-fenced full major compaction off-cluster ([design](docs/offline-compaction-design.md) · [runbook](docs/offline-compaction.md)) |
-| Local→Accumulo promotion (`internal/promotion`, Bulk Import V2) | partial — load-mapping/staging + FATE `TABLE_BULK_IMPORT2` submission through the manager for both single-tablet and multi-tablet/split-bearing exports (destination splits are reconciled via `AddTableSplitsForTable`/`TABLE_SPLIT`, then verified via `ListTableSplits` to rule out any unrelated extra split, before staging); live-cluster verification, a residual concurrent-merge race around split reconciliation, an ambiguous-FATE-retry gap on `BulkImport` itself, cutover protocol, and ongoing fan-in remain open ([design](docs/promotion.md)) |
+| Run a local database with RFile or Parquet | [Embedded engine](#embedded-engine-standalone-no-zookeeper) |
+| Use Sharkbite-compatible Python APIs | [`python/README.md`](python/README.md) |
+| Embed the Go client or stable C ABI | [`accumulo/`](accumulo/) · [`capi/README.md`](capi/README.md) |
+| Run Shoal replacement roles with Accumulo | [`FEATURES.md`](FEATURES.md#accumulo-replacement-roles) · [`docs/tserver-hosting-lifecycle.md`](docs/tserver-hosting-lifecycle.md) |
+| Run graph, document, SQL, or vector search | [`FEATURES.md`](FEATURES.md#query-and-indexing) · [`docs/ai-knowledge-graph.md`](docs/ai-knowledge-graph.md) |
+| Validate against an exact Accumulo 4 cluster | [`test/accumulo/README.md`](test/accumulo/README.md) |
+
+## Quick start
+
+Prerequisites for local development are Go 1.25+, Python 3, and `make`.
+Docker with Compose v2 is required only for live Accumulo conformance.
+
+```bash
+git clone https://github.com/phrocker/shoal-oss.git
+cd shoal-oss
+make build
+make test
+```
+
+Run the embedded engine without ZooKeeper or Accumulo:
+
+```bash
+go run ./cmd/shoal-embed init --table events --workload analytical \
+  --data ~/.shoal/data
+go run ./cmd/shoal-embed write --table events --data ~/.shoal/data \
+  < mutations.jsonl
+go run ./cmd/shoal-embed scan --table events --data ~/.shoal/data
+```
+
+Build and install the Sharkbite-compatible Python package:
+
+```bash
+make capi
+python -m pip install ./python
+export SHOAL_LIBRARY="$PWD/bin/capi/libshoal.so"
+```
+
+On Windows PowerShell, use
+`$env:SHOAL_LIBRARY = "$PWD\bin\capi\shoal.dll"` instead.
+
+On a Linux Docker host, validate the exact Accumulo 4 harness:
+
+```bash
+make test-accumulo-static
+make test-accumulo
+make conformance-live
+```
+
+The live harness is opt-in, cleans up containers and volumes, and emits
+machine-readable release verdicts. Docker absence returns exit status 2
+(`unsupported`), never a passing result.
+
+## Operating modes
+
+- **Embedded / standalone** (`shoal-embed`, `internal/engine`) owns its WAL,
+  memtable, splits, and compaction. It stores RFile, Parquet, or mixed-format
+  tablets on local, memory, GCS, S3, Azure Blob, or HDFS backends.
+- **Read fleet** (`cmd/shoal`) serves stateless and stateful Thrift scans over
+  RFiles with locator, file, and block caches.
+- **Tablet server** (`shoal-tserver`) acquires an Accumulo ServiceLock, hosts
+  tablets, serves scans and ingest, writes fenced WALs, and commits native
+  RFile minor compactions.
+- **Compactor** (`shoal-compactor`) executes coordinator jobs, publishes
+  outputs durably, reports progress, and completes jobs through Accumulo's
+  existing completion RPC.
+
+The standalone engine does not need ZooKeeper. Accumulo replacement roles use
+the exact Accumulo 4 wire and metadata contracts described in
+[`ARCHITECTURE.md`](ARCHITECTURE.md).
 
 ## Embedded engine (standalone, no ZooKeeper)
 
@@ -189,12 +194,12 @@ These are schema-agnostic mechanisms — the consumer supplies the
 vocabulary per request; no graph schema is baked into the engine. See
 `docs/ai-knowledge-graph.md` for the design direction.
 
-## Distributed serving mode
+## Distributed read fleet
 
-In serving mode a shoal pod exposes a Thrift scan surface (mirroring
-Accumulo's `TabletScanClientService` for interop) but is **not** a tablet
-server — it doesn't write, doesn't host tablets, doesn't coordinate with any
-manager. It's strictly a reader fanned out across pods:
+`cmd/shoal` is the read-optimized serving role. It exposes Accumulo-compatible
+scan RPCs without hosting or writing tablets and can be fanned out across
+pods. The separate `shoal-tserver` binary is the stateful replacement role
+that acquires ServiceLocks, hosts tablets, and serves scans and ingest.
 
 ```
        ┌──────────────────┐    Thrift scan()  ┌─────────────┐
@@ -240,9 +245,10 @@ make thrift-verify  # regenerate and fail if the checked-in bindings drift
 
 The disposable Docker harness under `test/accumulo` is the integration oracle
 for client, scan, iterator, RFile, compaction, and replacement-role
-conformance. It uses a stable Accumulo image by default and accepts
-`SHOAL_ACCUMULO_IMAGE` for the exact 4.x snapshot targeted by the vendored
-IDLs. See [`test/accumulo/README.md`](test/accumulo/README.md).
+conformance. It builds the exact pinned Accumulo 4 source revision; the image
+is deliberately not environment-overridable so a successful verdict always
+targets the vendored wire contract. See
+[`test/accumulo/README.md`](test/accumulo/README.md).
 
 The embedded engine builds with a plain `go build ./...` and has no Thrift
 dependency. The required Accumulo 4 IDLs are vendored under
