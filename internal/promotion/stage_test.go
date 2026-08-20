@@ -268,6 +268,46 @@ func TestStageBulkDirSerializesAliasedLocalDestinationsAcrossBackendInstances(t 
 	}
 }
 
+func TestAcquireStageBulkDirSerializesRelativeHDFSPathsAcrossBackendInstances(t *testing.T) {
+	firstBackend := newTestHDFSBackend(t, "hdfs://nn:8020")
+	secondBackend := newTestHDFSBackend(t, "hdfs://nn:8020")
+
+	releaseFirst, err := acquireStageBulkDir(context.Background(), firstBackend, "bulk/events-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	secondAcquired := make(chan func(), 1)
+	secondErr := make(chan error, 1)
+	go func() {
+		release, err := acquireStageBulkDir(context.Background(), secondBackend, "./bulk/events-1")
+		if err != nil {
+			secondErr <- err
+			return
+		}
+		secondAcquired <- release
+	}()
+
+	select {
+	case err := <-secondErr:
+		t.Fatalf("second acquire failed: %v", err)
+	case release := <-secondAcquired:
+		release()
+		t.Fatal("relative HDFS alias acquired while first backend instance still owned destination")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	releaseFirst()
+	select {
+	case err := <-secondErr:
+		t.Fatalf("second acquire after release failed: %v", err)
+	case release := <-secondAcquired:
+		release()
+	case <-time.After(time.Second):
+		t.Fatal("second relative HDFS acquire did not proceed after release")
+	}
+}
+
 func TestStageBulkDirRejectsBasenameCollisionBeforeCopying(t *testing.T) {
 	src := memory.New()
 	src.Put("export/events/t-0000/part-a/F0001.rf", []byte("a"))

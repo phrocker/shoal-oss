@@ -303,6 +303,8 @@ func acquireStageBulkDir(ctx context.Context, dst storage.Backend, bulkDir strin
 		ref := newStagePathRef(dst, bulkDir)
 		if canonical, ok := canonicalBackendPath(ref); ok {
 			key = stageLockBackendKey(dst) + "\x00" + canonical
+		} else if _, ok := unwrapped.(*hdfs.Backend); ok {
+			key = fmt.Sprintf("%T", unwrapped) + "\x00" + path.Clean(strings.ReplaceAll(bulkDir, `\`, "/"))
 		}
 	}
 
