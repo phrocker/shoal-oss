@@ -7,12 +7,17 @@ operational contracts remain in the linked runbooks and ADRs.
 ## Status legend
 
 - **Shipped**: implemented, tested, and available on `main`.
+- **Partial**: useful implementation exists, but a named production adapter or
+  contract remains unimplemented.
 - **Code complete; live validation pending**: the production path and
   fail-closed conformance gate are implemented, but the exact Accumulo 4
   Docker verdict still needs to run on a Docker-capable host.
 - **External validation pending**: implementation is complete, but native
   platform or release-infrastructure evidence is unavailable in the current
   environment.
+- **Infrastructure blocked**: repository code or scripts exist, but completing
+  the release path requires credentials or infrastructure unavailable to the
+  current maintainers.
 
 ## Core storage engine
 
@@ -50,7 +55,7 @@ operational contracts remain in the linked runbooks and ADRs.
 | `shoal-tserver` process, readiness, metrics, TLS, drain, and deployment | Code complete; live validation pending |
 | External compaction executor and `shoal-compactor` worker | Code complete; live validation pending |
 | Offline full major compaction | Shipped |
-| Durable local-to-Accumulo promotion, split reconciliation, and cutover state | Code complete; live validation pending |
+| Local-to-Accumulo promotion, split reconciliation, and cutover state | Partial — durable state and FATE integration are shipped; public engine/manager authority and cutover adapters remain |
 
 Replacement-role live evidence is tracked by
 [issue #74](https://github.com/phrocker/shoal-oss/issues/74). The checked-in
@@ -70,7 +75,7 @@ live adapter is unavailable.
 | Windows shared/static ABI and wheel artifacts | Shipped |
 | Linux manylinux distribution | Shipped |
 | Native macOS dylib/wheel runtime and Mach-O verification | External validation pending |
-| Controlled manylinux/macOS release workflow | External validation pending |
+| Controlled manylinux/macOS release workflow | Infrastructure blocked — local release tooling exists, but the repository workflow still requires workflow-authorized credentials |
 
 The normative matrix is
 [`docs/sharkbite-compatibility.md`](docs/sharkbite-compatibility.md), with

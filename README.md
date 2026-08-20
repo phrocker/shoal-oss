@@ -11,7 +11,7 @@ exact-vector, and distributed IVF-PQ queries across local and Accumulo-backed
 data.
 
 See [`FEATURES.md`](FEATURES.md) for the complete capability matrix, current
-validation state, and the few remaining external platform gates.
+validation state, and the few remaining platform and infrastructure gates.
 
 ## Choose a path
 
@@ -21,15 +21,14 @@ validation state, and the few remaining external platform gates.
 | Use Sharkbite import-compatible Python APIs | [`python/README.md`](python/README.md) |
 | Embed the Go client or stable C ABI | [`accumulo/`](accumulo/) · [`capi/README.md`](capi/README.md) |
 | Evaluate Shoal replacement roles with Accumulo | [`FEATURES.md`](FEATURES.md#accumulo-replacement-roles) · [`docs/tserver-hosting-lifecycle.md`](docs/tserver-hosting-lifecycle.md) |
-| Run graph, document, SQL, or vector search | [`FEATURES.md`](FEATURES.md#query-and-indexing) · [`docs/ai-knowledge-graph.md`](docs/ai-knowledge-graph.md) |
+| Run graph, document, SQL, or vector search | [`FEATURES.md`](FEATURES.md#query-and-indexing) · [`docs/graph-schema.md`](docs/graph-schema.md) · [`docs/shoalql-accumulo.md`](docs/shoalql-accumulo.md) |
 | Validate against an exact Accumulo 4 cluster | [`test/accumulo/README.md`](test/accumulo/README.md) |
 
 ## Quick start
 
 Prerequisites for local development are Go 1.25+, Python 3.9+, `make`, and a
-native C toolchain when building the C ABI or Python bindings. Docker with
-Compose v2 is required for the live HDFS integration suite and live Accumulo
-conformance.
+native C toolchain. Docker with Compose v2 is required for the live HDFS
+integration suite and live Accumulo conformance.
 
 ```bash
 git clone https://github.com/phrocker/shoal-oss.git
