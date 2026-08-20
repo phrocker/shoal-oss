@@ -2651,12 +2651,21 @@ int main(void) {
   shoal_bytes_result_free(&owned_bytes);
   assert(shoal_owned_key_column_family(owned_key, &owned_bytes, &error) ==
          SHOAL_STATUS_OK);
+  owned_value = shoal_bytes_result_get(owned_bytes);
+  assert(owned_value.length == 2 && owned_value.data[0] == 'c' &&
+         owned_value.data[1] == 'f');
   shoal_bytes_result_free(&owned_bytes);
   assert(shoal_owned_key_column_qualifier(owned_key, &owned_bytes, &error) ==
          SHOAL_STATUS_OK);
+  owned_value = shoal_bytes_result_get(owned_bytes);
+  assert(owned_value.length == 2 && owned_value.data[0] == 'c' &&
+         owned_value.data[1] == 'q');
   shoal_bytes_result_free(&owned_bytes);
   assert(shoal_owned_key_column_visibility(owned_key, &owned_bytes, &error) ==
          SHOAL_STATUS_OK);
+  owned_value = shoal_bytes_result_get(owned_bytes);
+  assert(owned_value.length == 3 && owned_value.data[0] == 'A' &&
+         owned_value.data[1] == '&' && owned_value.data[2] == 'B');
   shoal_bytes_result_free(&owned_bytes);
   assert(shoal_owned_key_clone(owned_key, &owned_key_copy, &error) ==
          SHOAL_STATUS_OK);
@@ -2683,6 +2692,49 @@ int main(void) {
              owned_key, owned_key_copy, &predicate_value, &error) ==
          SHOAL_STATUS_OK);
   assert(predicate_value == 1);
+  assert(shoal_owned_key_set_column_visibility(
+             owned_key_copy, (shoal_bytes){(const uint8_t *)"A&C", 3},
+             &error) == SHOAL_STATUS_OK);
+  assert(shoal_owned_key_compare(owned_key, owned_key_copy, &owned_order,
+                                 &error) == SHOAL_STATUS_OK);
+  assert(owned_order < 0);
+  assert(shoal_owned_key_compare(owned_key_copy, owned_key, &owned_order,
+                                 &error) == SHOAL_STATUS_OK);
+  assert(owned_order > 0);
+  assert(shoal_owned_key_compare_visibility(
+             owned_key, owned_key_copy, &owned_order, &error) ==
+         SHOAL_STATUS_OK);
+  assert(owned_order < 0);
+  assert(shoal_owned_key_less(owned_key, owned_key_copy, &predicate_value,
+                              &error) == SHOAL_STATUS_OK);
+  assert(predicate_value == 1);
+  assert(shoal_owned_key_equal(owned_key, owned_key_copy, &predicate_value,
+                               &error) == SHOAL_STATUS_OK);
+  assert(predicate_value == 0);
+  assert(shoal_owned_key_set_column_visibility(
+             owned_key_copy,
+             (shoal_bytes){owned_visibility_data,
+                           sizeof(owned_visibility_data)},
+             &error) == SHOAL_STATUS_OK);
+  assert(shoal_owned_key_set_timestamp(owned_key_copy, 41, &error) ==
+         SHOAL_STATUS_OK);
+  assert(shoal_owned_key_compare(owned_key, owned_key_copy, &owned_order,
+                                 &error) == SHOAL_STATUS_OK);
+  assert(owned_order < 0);
+  assert(shoal_owned_key_compare_visibility(
+             owned_key, owned_key_copy, &owned_order, &error) ==
+         SHOAL_STATUS_OK);
+  assert(owned_order == 0);
+  assert(shoal_owned_key_set_timestamp(owned_key_copy, 42, &error) ==
+         SHOAL_STATUS_OK);
+  assert(shoal_owned_key_set_deleted(owned_key_copy, 1, &error) ==
+         SHOAL_STATUS_OK);
+  assert(shoal_owned_key_compare(owned_key, owned_key_copy, &owned_order,
+                                 &error) == SHOAL_STATUS_OK);
+  assert(owned_order > 0);
+  assert(shoal_owned_key_compare(owned_key_copy, owned_key, &owned_order,
+                                 &error) == SHOAL_STATUS_OK);
+  assert(owned_order < 0);
   assert(shoal_owned_key_empty(owned_key, &predicate_value, &error) ==
          SHOAL_STATUS_OK);
   assert(predicate_value == 0);
@@ -2705,31 +2757,51 @@ int main(void) {
              owned_key, (shoal_bytes){(const uint8_t *)"a", 1}, &error) ==
          SHOAL_STATUS_OK);
   assert(shoal_owned_key_set_column_family(
-             owned_key, (shoal_bytes){(const uint8_t *)"b", 1}, &error) ==
+             owned_key, (shoal_bytes){(const uint8_t *)"bc", 2}, &error) ==
          SHOAL_STATUS_OK);
   assert(shoal_owned_key_set_column_qualifier(
-             owned_key, (shoal_bytes){(const uint8_t *)"c", 1}, &error) ==
+             owned_key, (shoal_bytes){(const uint8_t *)"def", 3}, &error) ==
          SHOAL_STATUS_OK);
   assert(shoal_owned_key_set_column_visibility(
-             owned_key, (shoal_bytes){(const uint8_t *)"d", 1}, &error) ==
+             owned_key, (shoal_bytes){(const uint8_t *)"G&H1", 4}, &error) ==
          SHOAL_STATUS_OK);
+  assert(shoal_owned_key_row(owned_key, &owned_bytes, &error) ==
+         SHOAL_STATUS_OK);
+  owned_value = shoal_bytes_result_get(owned_bytes);
+  assert(owned_value.length == 1 && owned_value.data[0] == 'a');
+  shoal_bytes_result_free(&owned_bytes);
+  assert(shoal_owned_key_column_family(owned_key, &owned_bytes, &error) ==
+         SHOAL_STATUS_OK);
+  owned_value = shoal_bytes_result_get(owned_bytes);
+  assert(owned_value.length == 2 && memcmp(owned_value.data, "bc", 2) == 0);
+  shoal_bytes_result_free(&owned_bytes);
+  assert(shoal_owned_key_column_qualifier(owned_key, &owned_bytes, &error) ==
+         SHOAL_STATUS_OK);
+  owned_value = shoal_bytes_result_get(owned_bytes);
+  assert(owned_value.length == 3 && memcmp(owned_value.data, "def", 3) == 0);
+  shoal_bytes_result_free(&owned_bytes);
+  assert(shoal_owned_key_column_visibility(owned_key, &owned_bytes, &error) ==
+         SHOAL_STATUS_OK);
+  owned_value = shoal_bytes_result_get(owned_bytes);
+  assert(owned_value.length == 4 && memcmp(owned_value.data, "G&H1", 4) == 0);
+  shoal_bytes_result_free(&owned_bytes);
   size_t owned_size = 0;
   assert(shoal_owned_key_size(owned_key, &owned_size, &error) ==
          SHOAL_STATUS_OK);
-  assert(owned_size == 12);
+  assert(owned_size == 18);
   assert(shoal_owned_key_length(owned_key, &owned_size, &error) ==
          SHOAL_STATUS_OK);
-  assert(owned_size == 12);
+  assert(owned_size == 18);
   assert(shoal_owned_key_row_size(owned_key, &owned_size, &error) ==
          SHOAL_STATUS_OK && owned_size == 1);
   assert(shoal_owned_key_column_family_size(owned_key, &owned_size, &error) ==
-         SHOAL_STATUS_OK && owned_size == 1);
+         SHOAL_STATUS_OK && owned_size == 2);
   assert(shoal_owned_key_column_qualifier_size(owned_key, &owned_size,
                                                &error) == SHOAL_STATUS_OK &&
-         owned_size == 1);
+         owned_size == 3);
   assert(shoal_owned_key_column_visibility_size(owned_key, &owned_size,
                                                 &error) == SHOAL_STATUS_OK &&
-         owned_size == 1);
+         owned_size == 4);
   assert(shoal_owned_key_row(owned_key_copy, &owned_bytes, &error) ==
          SHOAL_STATUS_OK);
   owned_value = shoal_bytes_result_get(owned_bytes);

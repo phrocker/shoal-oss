@@ -2431,10 +2431,10 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
         self.assertEqual(
             validator.EXPECTED_STATUS_COUNTS,
             {
-                "Covered": 167,
+                "Covered": 153,
                 "Missing Go": 2274,
                 "Missing C ABI": 64,
-                "Behavior mismatch": 219,
+                "Behavior mismatch": 233,
                 validator.INTENTIONAL_DIVERGENCE_STATUS: 87,
                 validator.NOT_REQUIRED_STATUS: 392,
             },
@@ -2597,7 +2597,7 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
             lambda: validator.validate_revision_inventory(
                 row_ids, reclassified, prefix_counts
             ),
-            f"revision {validator.EXPECTED_REVISION} inventory expects 167 rows for Covered, found 168",
+            f"revision {validator.EXPECTED_REVISION} inventory expects 153 rows for Covered, found 154",
         )
 
     def test_declared_count_edit_still_fails_internal_cross_check(self) -> None:
@@ -2626,7 +2626,7 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
     def test_revision_bump_requires_validator_constant_update(self) -> None:
         text = load_document_text()
         mutated = text.replace(
-            f"Revision {validator.EXPECTED_REVISION} — completes the 36-row owned mutable key tranche",
+            f"Revision {validator.EXPECTED_REVISION} — completes the 36-row owned mutable key ABI tranche",
             f"Revision {validator.EXPECTED_REVISION + 1} — adds the next audited ABI slice",
         ).replace(
             f"As of revision {validator.EXPECTED_REVISION} that is",
@@ -2635,7 +2635,7 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
         self.assertNotEqual(mutated, text)
         self.assert_validation_fails(
             lambda: validator.validate_counts(mutated.splitlines(), mutated),
-            f"document status is missing expected detail: Revision {validator.EXPECTED_REVISION} — completes the 36-row owned mutable key tranche",
+            f"document status is missing expected detail: Revision {validator.EXPECTED_REVISION} — completes the 36-row owned mutable key ABI tranche",
         )
 
     # ---- matrix table separators -------------------------------------------

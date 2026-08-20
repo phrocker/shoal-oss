@@ -1029,27 +1029,27 @@ SB-CXX-0497 Not required (rationale required)
 SB-CXX-0498 Not required (rationale required)
 SB-CXX-0499 Covered
 SB-CXX-0500 Missing Go
-SB-CXX-0501 Covered
-SB-CXX-0502 Covered
-SB-CXX-0503 Covered
+SB-CXX-0501 Behavior mismatch
+SB-CXX-0502 Behavior mismatch
+SB-CXX-0503 Behavior mismatch
 SB-CXX-0504 Covered
-SB-CXX-0505 Covered
-SB-CXX-0506 Covered
-SB-CXX-0507 Covered
-SB-CXX-0508 Covered
-SB-CXX-0509 Covered
-SB-CXX-0510 Covered
+SB-CXX-0505 Behavior mismatch
+SB-CXX-0506 Behavior mismatch
+SB-CXX-0507 Behavior mismatch
+SB-CXX-0508 Behavior mismatch
+SB-CXX-0509 Behavior mismatch
+SB-CXX-0510 Behavior mismatch
 SB-CXX-0511 Covered
 SB-CXX-0512 Covered
 SB-CXX-0513 Covered
 SB-CXX-0514 Missing Go
 SB-CXX-0515 Missing Go
-SB-CXX-0516 Covered
+SB-CXX-0516 Behavior mismatch
 SB-CXX-0517 Covered
-SB-CXX-0518 Covered
-SB-CXX-0519 Covered
-SB-CXX-0520 Covered
-SB-CXX-0521 Covered
+SB-CXX-0518 Behavior mismatch
+SB-CXX-0519 Behavior mismatch
+SB-CXX-0520 Behavior mismatch
+SB-CXX-0521 Behavior mismatch
 SB-CXX-0522 Missing Go
 SB-CXX-0523 Missing C ABI
 SB-CXX-0524 Missing C ABI
