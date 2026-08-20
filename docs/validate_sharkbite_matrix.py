@@ -17,7 +17,7 @@ import unicodedata
 
 
 DOC_PATH = Path(__file__).with_name("sharkbite-compatibility.md")
-EXPECTED_REVISION = 42
+EXPECTED_REVISION = 43
 CLUSTER_STATUS_APPROVAL_REVISION = 40
 # Update this manifest only when the independently audited inventory itself
 # changes; review every added/removed or reclassified ID in code review.
@@ -201,17 +201,18 @@ EXPECTED_METADATA_FIELDS = {
     ),
     "Sharkbite release line": "`sharkbite` 1.2.0.3 on PyPI (`setup.py:34-35`)",
     "Shoal reference": (
-        "`phrocker/shoal-oss` exact audited baseline for revision 42 "
-        "`46a50bd46a8ea4a33902703dc3f6c3eca97f8dcc` "
-        "(\"Merge pull request #159 from phrocker/rewrite/108-data-model\") "
-        "plus the owned-key C ABI introduced in this revision"
+        "`phrocker/shoal-oss` exact audited baseline for revision 43 "
+        "`03a5abfcb28797848904d97750d6aa13de106aa9` "
+        "(\"Merge pull request #170 from phrocker/phrocker/issue-74-role-verdicts\") "
+        "plus the Python writer/administration changes introduced in this revision"
     ),
     "Shoal C ABI version": "`SHOAL_ABI_VERSION 1u` (`capi/include/shoal_types.h`)",
 }
 
 EXPECTED_DOCUMENT_STATUS_SNIPPETS = (
     "Normative gate. Binding on all Sharkbite-compatibility work.",
-    f"Revision {EXPECTED_REVISION} — completes the 36-row owned mutable key ABI tranche",
+    f"Revision {EXPECTED_REVISION} — records the first Python write/administration evidence",
+    "Revision 42 — completes the 36-row owned mutable key ABI tranche",
     "Revision 41 — records the public column and entry value APIs",
     "Revision 40 — mirrors the first approved divergence into the "
     f"matrix: @phrocker approved [SB-DIV-016](#sec-26) on 2026-08-19",

@@ -26,6 +26,9 @@ func TestAggregateRows_ScanRootYieldsMetadataTablets(t *testing.T) {
 		kv(row, CFFile, `{"path":"gs://b/!0/A0001.rf","startRow":"","endRow":""}`, "10240,500"),
 		kv(row, CFFile, `{"path":"gs://b/!0/A0002.rf","startRow":"","endRow":""}`, "8192,400,1700000000000"),
 		kv(row, CFCurrentLocation, "/lock-path/n$abcd", "tserver-1:9997"),
+		kv(row, CFServer, CQDirectory, "default_tablet"),
+		kv(row, CFServer, CQTime, "M0"),
+		kv(row, CFLog, "-/file:///wal/tserver-1+9997/11111111-1111-1111-1111-111111111111", ""),
 		kv(row, CFTabletSection, CQPrevRow, "\x00"),
 	}
 	out, err := AggregateRows(kvs)
@@ -44,6 +47,12 @@ func TestAggregateRows_ScanRootYieldsMetadataTablets(t *testing.T) {
 	}
 	if got.PrevRow != nil {
 		t.Errorf("PrevRow = %v, want nil for first/only tablet", got.PrevRow)
+	}
+	if !got.PrevRowSet || got.Directory != "default_tablet" || got.Time != "M0" {
+		t.Errorf("required metadata = %+v", got)
+	}
+	if len(got.Logs) != 1 || got.Logs[0].Server != "tserver-1:9997" {
+		t.Errorf("Logs = %+v", got.Logs)
 	}
 	if got.Location == nil || got.Location.HostPort != "tserver-1:9997" {
 		t.Errorf("Location = %+v", got.Location)
@@ -97,9 +106,9 @@ func TestAggregateRows_ScanMetadataYieldsUserTabletsForOneTable(t *testing.T) {
 	}
 }
 
-func TestAggregateRows_FutureLocationIgnored(t *testing.T) {
-	// During tablet move: only "future" populated. Caller should see no
-	// location and retry.
+func TestAggregateRows_CapturesFutureLocation(t *testing.T) {
+	// During tablet assignment, future carries the generation the loader
+	// must fence against before the tablet is promoted to loc.
 	kvs := []*data.TKeyValue{
 		kv("2k;k", CFFile, `{"path":"gs://x/A.rf","startRow":"","endRow":""}`, "1,1"),
 		kv("2k;k", CFFutureLocation, "/p/n$1", "tserver-future:9997"),
@@ -117,6 +126,9 @@ func TestAggregateRows_FutureLocationIgnored(t *testing.T) {
 	}
 	if len(out[0].Files) != 1 {
 		t.Errorf("Files = %d, want 1", len(out[0].Files))
+	}
+	if out[0].FutureLocation == nil || out[0].FutureLocation.HostPort != "tserver-future:9997" {
+		t.Errorf("FutureLocation = %+v", out[0].FutureLocation)
 	}
 }
 

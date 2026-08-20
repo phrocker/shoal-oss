@@ -6,6 +6,33 @@ import (
 	"testing"
 )
 
+func TestDecodeLogEntry(t *testing.T) {
+	const qualifier = "-/file:///accumulo/wal/host.example+9997/11111111-1111-1111-1111-111111111111"
+	got, err := DecodeLogEntry([]byte(qualifier))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.UUID != "11111111-1111-1111-1111-111111111111" ||
+		got.Server != "host.example:9997" ||
+		got.Path != "file:///accumulo/wal/host.example+9997/11111111-1111-1111-1111-111111111111" {
+		t.Fatalf("decoded log = %+v", got)
+	}
+	got.RawQualifier[0] = 'x'
+	if qualifier[0] != '-' {
+		t.Fatal("test qualifier unexpectedly mutable")
+	}
+}
+
+func TestDecodeLogEntryRejectsMalformed(t *testing.T) {
+	for _, input := range []string{"", "no-slash", "-/short", "-/x/host:9/11111111-1111-1111-1111-111111111111", "-/x/host+9/not-a-uuid"} {
+		t.Run(input, func(t *testing.T) {
+			if _, err := DecodeLogEntry([]byte(input)); err == nil {
+				t.Fatalf("DecodeLogEntry(%q) succeeded", input)
+			}
+		})
+	}
+}
+
 func TestDecodeTabletRow_DefaultTablet(t *testing.T) {
 	tableID, endRow, err := DecodeTabletRow([]byte("+r<"))
 	if err != nil {

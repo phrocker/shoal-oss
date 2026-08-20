@@ -28,8 +28,9 @@ that supplies live manager authority — see [§6](#6-registering-with-zookeeper
 The manager RPC adapter (`internal/tserverrpc`) now maps Accumulo 4
 assignment, unload, flush, status, and halt calls onto that fence and
 reports asynchronous lifecycle outcomes. Tablet metadata loading and the
-process that owns all required dependencies are not wired yet — see
-[§7](#7-what-is-not-here-yet). Tracking issue: #67.
+hosted-tablet specification loader are now present; the process that owns
+and connects all required dependencies is not wired yet — see
+[§9](#9-what-is-not-here-yet). Tracking issue: #67.
 
 ## 1. Goal
 
@@ -781,10 +782,10 @@ not a poll a process can shut down. Wiring the watch into a running
 server therefore waits on a cancellable reader that reuses its session,
 or on one backed by a ZooKeeper watch instead of a poll; that is a
 prerequisite of the process-wiring slice, recorded in
-[§7](#7-what-is-not-here-yet), not something this package can fix from
+[§9](#9-what-is-not-here-yet), not something this package can fix from
 behind the interface.
 
-## 7. Manager RPC adapter and remaining wiring
+## 7. Manager RPC adapter
 
 `internal/tserverrpc` vendors Accumulo 4's `tabletmgmt.thrift` and exposes
 the multiplexed `tablet` and `tserver` processors. It validates the
@@ -817,10 +818,48 @@ the same ZooKeeper session used by `ServiceLock`. Constructing an adapter
 without any one of those dependencies fails with an explicit unsupported
 boundary rather than registering a server that cannot perform the work.
 
+## 8. Hosted-tablet specification loader
+
+`internal/tabletloader` resolves the immutable input to a hosted tablet
+without owning manager RPCs or ingest. A load:
+
+1. captures the exact metadata assignment generation from `Authority`
+2. reads exactly one metadata row and requires its table/range to equal the
+   manager-assigned `tserver.Extent`
+3. requires exactly one complete future/current location whose session equals
+   the captured generation, plus the mandatory `~tab:~pr`, `srv:dir`, and
+   `srv:time` columns
+4. reads a stable effective table configuration; `ManagerConfigSource`
+   brackets two merged-configuration reads with versioned-property reads and
+   retries the whole transaction if either view changes
+5. resolves and validates every StoredTabletFile and LogEntry reference
+6. rechecks the assignment fence between every external operation and before
+   returning a deterministically ordered `Specification`
+
+Missing rows/configuration and malformed metadata fail without retry.
+Infrastructure failures explicitly marked with `tabletloader.Retryable` retry
+the complete transaction with bounded, cancellable backoff. Unload, lock loss,
+or reassignment must make `Authority.Validate` fail (and normally also cancel
+the context), so a stale load can never return a publishable specification.
+
+The package exposes narrow `MetadataSource`, `ConfigSource`, `FileResolver`,
+`LogResolver`, and `Authority` interfaces. This keeps storage routing, exact
+metadata scanning, and the manager adapter independently replaceable. The
+default `StrictReferenceResolver` performs schema validation only; a production
+file resolver can additionally probe the chosen `storage.Backend`.
+
+Metadata aggregation now preserves future locations, mandatory-column
+presence, directory/time values, and Accumulo 4 `log:` qualifiers. WAL
+qualifiers are decoded using Java `LogEntry.fromMetaWalEntry`'s
+`-/<path ending in host+port/UUID>` format.
+
+## 9. What is not here yet
+
 Still to land for #67:
 
-- loading tablet metadata, file and log references, table properties,
-  constraints, and iterator configuration behind `StateLoading`
+- wiring the manager adapter's `StateLoading` backend to
+  `tabletloader.Loader`, a concrete exact-row metadata scanner, storage/WAL
+  openers, constraints, and iterator configuration
 - the process wiring that owns the ZooKeeper session, chooses the
   advertised address and resource group, and restarts participation after
   a lock loss. It also needs a manager-lock reader that holds one session
@@ -832,7 +871,7 @@ Still to land for #67:
 - end-to-end tests against a live manager, including migration to and
   from a Java tserver and rolling mixed-fleet replacement
 
-## 8. Metrics
+## 10. Metrics
 
 `Host.Metrics()` snapshots the operational surface #67 asks for:
 `Loading` / `Hosted` / `Unloading` gauges, and counters for

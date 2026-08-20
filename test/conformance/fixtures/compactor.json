@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "role": "compactor",
+  "accumulo_version": "4.0.0-SNAPSHOT",
+  "accumulo_revision": "1a716b2c1bb5762ead4b46d2bc4f53e13873b314",
+  "summary": "compaction publishes deterministic output and cancellation never publishes partial output",
+  "evidence": [
+    {
+      "kind": "go-test",
+      "reference": "internal/compactexec/executor_test.go#TestExecutePublishesDeterministicOutputAndStats",
+      "replay_command": ["go", "test", "./internal/compactexec", "-run", "^TestExecutePublishesDeterministicOutputAndStats$", "-count=1"]
+    },
+    {
+      "kind": "go-test",
+      "reference": "internal/compactexec/executor_test.go#TestCancellationNeverPublishes",
+      "replay_command": ["go", "test", "./internal/compactexec", "-run", "^TestCancellationNeverPublishes$", "-count=1"]
+    }
+  ]
+}

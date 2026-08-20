@@ -15,8 +15,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"strconv"
 	"strings"
+
+	"github.com/google/uuid"
 )
 
 // DecodeTabletRow reverses the row-key encoding in
@@ -32,6 +35,7 @@ func DecodeTabletRow(row []byte) (tableID string, endRow []byte, err error) {
 	if len(row) == 0 {
 		return "", nil, errors.New("empty tablet row")
 	}
+
 	for i, b := range row {
 		switch b {
 		case ';':
@@ -54,6 +58,43 @@ func DecodeTabletRow(row []byte) (tableID string, endRow []byte, err error) {
 		}
 	}
 	return "", nil, fmt.Errorf("malformed tablet row %q: missing ';' or '<'", row)
+}
+
+// DecodeLogEntry parses the LogEntry metadata qualifier. Accumulo writes
+// "-/<wal-path>", where wal-path ends in "<host>+<port>/<canonical UUID>".
+func DecodeLogEntry(qualifier []byte) (LogEntry, error) {
+	if len(qualifier) == 0 {
+		return LogEntry{}, errors.New("empty log qualifier")
+	}
+	parts := strings.SplitN(string(qualifier), "/", 2)
+	if len(parts) != 2 || parts[1] == "" {
+		return LogEntry{}, fmt.Errorf("malformed write-ahead log %q", qualifier)
+	}
+	walPath := parts[1]
+	pathParts := strings.Split(walPath, "/")
+	if len(pathParts) < 2 {
+		return LogEntry{}, fmt.Errorf("invalid WAL path %q: expected host+port/UUID suffix", walPath)
+	}
+	serverPart := pathParts[len(pathParts)-2]
+	uuidPart := pathParts[len(pathParts)-1]
+	if strings.Contains(serverPart, ":") || !strings.Contains(serverPart, "+") {
+		return LogEntry{}, fmt.Errorf("invalid WAL server %q: expected host+port", serverPart)
+	}
+	server := strings.Replace(serverPart, "+", ":", 1)
+	if _, _, err := net.SplitHostPort(server); err != nil {
+		return LogEntry{}, fmt.Errorf("invalid WAL server %q: %w", serverPart, err)
+	}
+	id, err := uuid.Parse(uuidPart)
+	if err != nil || id.String() != uuidPart {
+		return LogEntry{}, fmt.Errorf("invalid WAL UUID %q", uuidPart)
+	}
+	return LogEntry{
+		UUID:         uuidPart,
+		Path:         walPath,
+		WALPath:      walPath,
+		Server:       server,
+		RawQualifier: append([]byte(nil), qualifier...),
+	}, nil
 }
 
 // DecodeDataFileValue parses the comma-separated long format used as the

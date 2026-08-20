@@ -65,7 +65,7 @@ helm upgrade --install shoal deploy/helm/shoal \
 Confirmed from source:
 
 - `cmd/shoal-embed/main.go`: `serve` supports `--data`, `--address` (gRPC bind address, e.g. `0.0.0.0:9876`; defaults to `127.0.0.1:<port>` when only the legacy `--port` is set), `--metrics-port` / `--metrics-address` (HTTP health/readiness/metrics bind; **opt-in** — the HTTP surface only starts if one of these is explicitly passed, so a bare `shoal-embed serve --port N` keeps behaving as a single-port process; when enabled, defaults to `127.0.0.1:9877`), `--quiesce-delay` (default `5s`, but only applied when the HTTP readiness surface is enabled; the manifests override it to `10s`), `--drain-timeout` (default `30s`, bounds graceful shutdown; see below), and `--tls-cert` / `--tls-key` / `--tls-client-ca` (optional TLS material for both listeners together, each with a `SHOAL_EMBED_TLS_*` environment fallback; see the TLS section below).
-- `cmd/shoal/main.go`: read fleet supports `-listen`, `-zk`, `-instance`, `-accumulo-version`, `-user`, `-password` or `SHOAL_PASSWORD`, `-zk-timeout`, `-storage`, `-cache-bytes`, `-log-level`, `-prewarm-tables`, and `-prewarm-parallelism`.
+- `cmd/shoal/main.go`: read fleet additionally supports `-metrics-address`, `-readiness-interval`, `-quiesce-delay`, `-drain-timeout`, and shared-listener `-tls-cert` / `-tls-key` / `-tls-client-ca` settings (`SHOAL_TLS_*` fallbacks).
 - `internal/storage/gcs/gcs.go`: the GCS backend uses Application Default Credentials and accepts paths like `gs://bucket/object` or `bucket/object`.
 
 The manifests pass only supported process flags to the containers. `GOOGLE_APPLICATION_CREDENTIALS` is set for the GCS client when a key Secret is mounted.
@@ -78,7 +78,37 @@ The manifests pass only supported process flags to the containers. `GOOGLE_APPLI
 - `/readyz`: readiness — 200 once startup finishes, 503 during startup and during shutdown drain. Used for `readinessProbe`, so a draining pod can be removed from Service endpoints before its gRPC port stops accepting new work.
 - `/metrics`: Prometheus text-format metrics (via `internal/obs`). Not yet wired to a `ServiceMonitor`/scrape annotation in these manifests; add one for your Prometheus setup if needed.
 
-`cmd/shoal` (the read fleet) has no equivalent HTTP surface, so `deploy/k8s/read-fleet.yaml` and the Helm read-fleet template use `tcpSocket` liveness/readiness probes instead — they prove the Thrift port accepts TCP connections, not that the process is otherwise healthy. Do not assume readiness-contract parity between the two tiers; see the gaps list below.
+`cmd/shoal` exposes a separate read-role operations listener when
+`-metrics-address` is set. `/healthz` is process liveness. `/readyz` is
+semantic and returns 200 only when the Thrift listener is serving, new scan
+sessions are accepted, the most recent ZooKeeper root-tablet lookup succeeded,
+the metadata walk succeeded, and the configured storage backend could open and
+read a discovered RFile (an empty instance has no object to probe). During
+drain, session admission flips false immediately and readiness returns 503
+before the Thrift listener closes.
+
+The read role exports these stable Prometheus names:
+
+- `shoal_read_accepting_sessions`
+- `shoal_scan_sessions_active{kind}`
+- `shoal_scan_sessions_expired_total{kind}`
+- `shoal_scan_sessions_canceled_total{kind}`
+- `shoal_scan_continuations_total{kind}`
+- `shoal_scan_failures_total{operation,kind}`
+- `shoal_scan_rpc_latency_seconds_count{operation}`
+- `shoal_scan_rpc_latency_seconds_sum{operation}`
+- `shoal_scan_backpressure_total{reason}`
+
+The manifests add Prometheus scrape annotations and
+`deploy/monitoring/read-fleet-alerts.yaml` provides starter rules for lost
+admission, backpressure, failures, and expiry.
+
+On SIGTERM the read role rejects new `StartScan`/`StartMultiScan` calls with
+`ScanServerBusyException`, waits `-quiesce-delay`, then allows retained sessions
+to continue for at most `-drain-timeout`. A deadline force-cancels and releases
+the remaining bounded session state before the Thrift listener stops.
+`terminationGracePeriodSeconds: 45` covers the default 5s quiesce + 30s drain
+plus shutdown margin.
 
 The write-tier headless Service no longer sets `publishNotReadyAddresses: true`, so readiness now gates which pod IPs are published to clients.
 
@@ -109,6 +139,15 @@ With Helm TLS enabled, kubelet `httpGet` probes use `scheme: HTTPS` for `/readyz
 The plain write-tier manifest has no templating, so that probe switch isn't automatic there: if you uncomment the TLS example in `deploy/k8s/write-tier.yaml`, also add `scheme: HTTPS` to its `readinessProbe`/`livenessProbe` `httpGet` blocks, or replace them with a `tcpSocket: {port: metrics}` check if you additionally uncomment `--tls-client-ca` (mutual TLS). The manifest carries an inline comment with these exact steps next to the probes.
 
 Certificate/key rotation is out of scope for this slice: `shoal-embed` loads the key pair (and CA bundle) once at startup, so rotating any of them requires a pod restart today — see the gaps list below.
+
+The read role uses the same TLS policy and shared implementation: one
+certificate/key pair covers both Thrift and the HTTP operations listener,
+TLS 1.2 is the minimum, and a client CA enables mutual TLS on both. Helm values
+are `readFleet.tls.enabled`, `secretName`, and `requireClientCert`. HTTPS probes
+are used for server-only TLS; mutual TLS falls back to TCP probes because
+kubelet cannot present a client certificate. The plain manifest keeps TLS
+flags commented out so plaintext remains the default until an operator mounts
+the corresponding Secret.
 
 ## Rolling upgrades, rollback, and voluntary disruption
 
@@ -144,9 +183,8 @@ These are deliberately documented, not papered over with invented flags:
 1. `shoal-embed serve` has no CLI/env for `engine.Options.Backend`, storage backend, bucket, or prefix. The engine/tablet layers support a backend, but the CLI does not wire it yet; therefore the write-tier manifest keeps WAL/RFiles on the PVC today.
 2. `cmd/shoal` reads RFile paths from Accumulo/Shoal metadata and has `-storage=gs|local`, but no bucket/prefix override flag. The shared bucket/prefix ConfigMap values are operator intent/future wiring.
 3. S3 is mentioned in high-level docs, but this repository currently exposes local, memory, and GCS storage packages; no S3 backend package or binary flag is available.
-4. No dashboards or alerting rules are provided yet; `/metrics` is exposed but not wired to a scrape config or alert thresholds (a rolling-upgrade/rollback runbook is now above). Tablet migration and data-loss-safe coordination during drain remain the Accumulo manager/coordinator's responsibility; this platform layer only stops accepting new gRPC work and waits for in-flight calls to finish.
+4. Starter read-fleet alerts are provided, but no complete dashboard is included. Tablet migration and data-loss-safe write coordination remain the Accumulo manager/coordinator's responsibility.
 5. `Write`/`Flush`/`Compact`/`CreateTable` discard the request context in `internal/embedstore`, so an in-flight call cannot be cancelled once dispatched. Shutdown now stays bounded by force-stopping transport at `--drain-timeout`, but if one of those unary engine calls is still running at that point the process returns a timeout/in-flight error and intentionally skips engine close rather than closing the engine unsafely underneath it. Only the streaming `Scan` RPC observes transport cancellation today.
 6. TLS material has no rotation story: `shoal-embed serve` loads the certificate/key/client-CA once at startup, so rotating any of them requires a pod restart (a rolling one, using the mechanics above) rather than a live reload/SIGHUP-style refresh.
 7. The write-tier `PodDisruptionBudget` (`maxUnavailable: 0`) is a deliberate policy, not an oversight — see "Rolling upgrades, rollback, and voluntary disruption" above. It blocks voluntary eviction of the sole write-tier replica for a shard because there is no live tablet hand-off path yet; it does not block operator-driven rollouts.
-8. `cmd/shoal` (read fleet) has no HTTP health/readiness/metrics surface, unlike `shoal-embed`; its manifests therefore use `tcpSocket` liveness/readiness probes only (able to prove the Thrift port accepts connections, not that it is otherwise healthy), and there is no `/metrics` to scrape for the read fleet.
-9. Neither tier sets `readOnlyRootFilesystem: true` yet. Both already run as a non-root UID/GID with `seccompProfile: RuntimeDefault` and drop all Linux capabilities, but flipping the root filesystem read-only needs verification against a live cluster (to confirm no runtime writes land outside the mounted data/credential volumes) that isn't available in this environment, so it is left as a documented follow-up rather than an unverified change.
+8. The read fleet uses `readOnlyRootFilesystem: true`; the write tier still needs writable engine state and remains backed by its PVC.

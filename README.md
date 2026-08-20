@@ -2,11 +2,12 @@
 
 ## Python foundation
 
-An early, explicitly partial Python binding is available under
+An incremental, explicitly partial Python binding is available under
 [`python/`](python/README.md). It supports both `import sharkbite` and
-`import pysharkbite`, negotiates the stable C ABI at runtime, and provides a
-minimal high-level scan path. It is not yet a complete Sharkbite-compatible
-distribution; unsupported legacy APIs fail explicitly.
+`import pysharkbite`, negotiates the stable C ABI at runtime, and provides
+scanning, mutation/batch-writer, and table/namespace/security administration
+paths. It is not yet a complete Sharkbite-compatible distribution;
+unsupported legacy APIs fail explicitly.
 
 A Go sorted key-value store with graph and vector query pushdown.
 Independent project — inspired by [Apache Accumulo](https://accumulo.apache.org)'s
@@ -61,6 +62,8 @@ V1 + IVF-PQ iterator port shipped. Embedded standalone engine shipped.
 | `RFile.blockmeta` zone-map block-skip extension | shipped — forward-compatible with Java `RFile.Reader` |
 | VisibilityFilter pushdown | shipped — alloc-free warm cache |
 | Accumulo 4 iterator capability admission | shipped — versioned, fail-closed scan/minc/majc registry and [machine-readable inventory](docs/iterator-capability-registry.md) |
+| Accumulo tablet-server lifecycle + ServiceLock | partial — fenced host state, manager authority, and ZooKeeper registration ([design](docs/tserver-hosting-lifecycle.md)) |
+| Hosted-tablet metadata/config/file/WAL loader | shipped — generation-fenced, retryable, deterministic specification builder (`internal/tabletloader`) |
 | File / locator / block caches | shipped |
 | Startup pre-warm (`-prewarm-tables=auto`) | shipped — distributed-serving mode |
 | Client-side hedge coordinator | shipped — `scanRow*` + `scanBatch*` overloads |
