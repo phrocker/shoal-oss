@@ -22,7 +22,7 @@
  */
 #define SHOAL_ABI_VERSION 1u
 #define SHOAL_ABI_VERSION_MAJOR 1u
-#define SHOAL_ABI_VERSION_MINOR 14u
+#define SHOAL_ABI_VERSION_MINOR 15u
 #define SHOAL_ABI_VERSION_PATCH 0u
 #define SHOAL_ABI_PACK_VERSION(major, minor, patch)                           \
   ((((uint32_t)(major) & 0xffu) << 16) |                                     \
@@ -65,10 +65,11 @@ enum {
   SHOAL_ABI_CAPABILITY_HIGH_LEVEL_SCANNER = 22,
   SHOAL_ABI_CAPABILITY_COMPATIBILITY_ERRORS = 23,
   SHOAL_ABI_CAPABILITY_STREAMING_SCAN_CURSOR = 24,
-  SHOAL_ABI_CAPABILITY_COLUMN_VISIBILITY = 25
+  SHOAL_ABI_CAPABILITY_COLUMN_VISIBILITY = 25,
+  SHOAL_ABI_CAPABILITY_OWNED_KEY = 26
 };
 
-#define SHOAL_ABI_CAPABILITY_COUNT 26u
+#define SHOAL_ABI_CAPABILITY_COUNT 27u
 #define SHOAL_ABI_CAPABILITY_WORD_BITS 64u
 #define SHOAL_ABI_CAPABILITY_WORD_INDEX(capability_id)                       \
   ((uint32_t)(capability_id) / SHOAL_ABI_CAPABILITY_WORD_BITS)
@@ -130,6 +131,8 @@ enum {
   SHOAL_ABI_CAPABILITY_MASK(SHOAL_ABI_CAPABILITY_STREAMING_SCAN_CURSOR)
 #define SHOAL_ABI_CAPABILITY_COLUMN_VISIBILITY_MASK                          \
   SHOAL_ABI_CAPABILITY_MASK(SHOAL_ABI_CAPABILITY_COLUMN_VISIBILITY)
+#define SHOAL_ABI_CAPABILITY_OWNED_KEY_MASK                                  \
+  SHOAL_ABI_CAPABILITY_MASK(SHOAL_ABI_CAPABILITY_OWNED_KEY)
 #define SHOAL_ABI_CAPABILITY_WORD0                                           \
   (SHOAL_ABI_CAPABILITY_CONNECTOR_MASK | SHOAL_ABI_CAPABILITY_BOOTSTRAP_MASK | \
    SHOAL_ABI_CAPABILITY_ERROR_MASK | SHOAL_ABI_CAPABILITY_SCANNER_MASK |     \
@@ -154,7 +157,8 @@ enum {
    SHOAL_ABI_CAPABILITY_HIGH_LEVEL_SCANNER_MASK |                            \
    SHOAL_ABI_CAPABILITY_COMPATIBILITY_ERRORS_MASK |                          \
    SHOAL_ABI_CAPABILITY_STREAMING_SCAN_CURSOR_MASK |                         \
-   SHOAL_ABI_CAPABILITY_COLUMN_VISIBILITY_MASK)
+   SHOAL_ABI_CAPABILITY_COLUMN_VISIBILITY_MASK |                             \
+   SHOAL_ABI_CAPABILITY_OWNED_KEY_MASK)
 
 typedef int32_t shoal_status;
 
@@ -243,6 +247,7 @@ typedef struct shoal_rfile_seekable shoal_rfile_seekable;
 typedef struct shoal_rfile_entry_result shoal_rfile_entry_result;
 typedef struct shoal_authorizations shoal_authorizations;
 typedef struct shoal_column_visibility shoal_column_visibility;
+typedef struct shoal_owned_key shoal_owned_key;
 typedef struct shoal_visibility_node shoal_visibility_node;
 typedef struct shoal_node_expression shoal_node_expression;
 typedef struct shoal_visibility_evaluator shoal_visibility_evaluator;

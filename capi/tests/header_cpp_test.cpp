@@ -10,7 +10,7 @@ static_assert(std::is_same<shoal_abi_capability_bits, std::uint64_t>::value,
               "capability bitset words must remain 64-bit");
 static_assert(SHOAL_ABI_VERSION == 1u, "unexpected ABI version");
 static_assert(SHOAL_ABI_VERSION_MAJOR == 1u, "unexpected ABI major");
-static_assert(SHOAL_ABI_VERSION_MINOR == 14u, "unexpected ABI minor");
+static_assert(SHOAL_ABI_VERSION_MINOR == 15u, "unexpected ABI minor");
 static_assert(SHOAL_ABI_VERSION_PATCH == 0u, "unexpected ABI patch");
 static_assert(SHOAL_ABI_VERSION_PACKED ==
                   SHOAL_ABI_PACK_VERSION(SHOAL_ABI_VERSION_MAJOR,
@@ -53,9 +53,11 @@ static_assert(SHOAL_ABI_CAPABILITY_STREAMING_SCAN_CURSOR == 24u,
               "unexpected streaming scan cursor capability id");
 static_assert(SHOAL_ABI_CAPABILITY_COLUMN_VISIBILITY == 25u,
               "unexpected column visibility capability id");
-static_assert(SHOAL_ABI_CAPABILITY_COUNT == 26u,
+static_assert(SHOAL_ABI_CAPABILITY_OWNED_KEY == 26u,
+              "unexpected owned key capability id");
+static_assert(SHOAL_ABI_CAPABILITY_COUNT == 27u,
               "unexpected capability count");
-static_assert(SHOAL_ABI_CAPABILITY_WORD0 == 0x0000000003ffffffull,
+static_assert(SHOAL_ABI_CAPABILITY_WORD0 == 0x0000000007ffffffull,
               "unexpected capability word 0");
 static_assert(std::is_standard_layout<shoal_connector_identity_view>::value,
               "identity view must remain standard-layout");
@@ -170,6 +172,8 @@ int main() {
   shoal_visibility_evaluator *visibility_evaluator = nullptr;
   shoal_visibility_node_view visibility_view{};
   shoal_visibility_parse_error_view parse_error_view{};
+  shoal_owned_key *owned_key = nullptr;
+  shoal_owned_key *owned_key_copy = nullptr;
   uint8_t satisfied = 0;
   int32_t comparison = 0;
   assert(shoal_abi_version() == SHOAL_ABI_VERSION);
@@ -202,7 +206,18 @@ int main() {
   assert(shoal_abi_has_capability(
              SHOAL_ABI_CAPABILITY_STREAMING_SCAN_CURSOR) == 1);
   assert(shoal_abi_has_capability(SHOAL_ABI_CAPABILITY_COLUMN_VISIBILITY) == 1);
+  assert(shoal_abi_has_capability(SHOAL_ABI_CAPABILITY_OWNED_KEY) == 1);
   assert(shoal_abi_has_capability(SHOAL_ABI_CAPABILITY_COUNT) == 0);
+  assert(shoal_owned_key_create(
+             {reinterpret_cast<const uint8_t *>("row"), 3}, &owned_key,
+             &error) == SHOAL_STATUS_OK);
+  assert(shoal_owned_key_clone(owned_key, &owned_key_copy, &error) ==
+         SHOAL_STATUS_OK);
+  assert(shoal_owned_key_equal(owned_key, owned_key_copy, &satisfied,
+                               &error) == SHOAL_STATUS_OK);
+  assert(satisfied == 1);
+  shoal_owned_key_free(&owned_key_copy);
+  shoal_owned_key_free(&owned_key);
   shoal_visibility_node_view_init(&visibility_view);
   shoal_visibility_parse_error_view_init(&parse_error_view);
   assert(shoal_column_visibility_create(

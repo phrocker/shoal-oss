@@ -68,6 +68,107 @@ shoal_key_value_init(shoal_key_value *value);
 SHOAL_API shoal_status SHOAL_CALL
 shoal_key_to_string(const shoal_key *key, shoal_bytes_result **out_result,
                     shoal_error **out_error);
+
+/*
+ * Owned keys copy every byte input and never expose Go memory. Getters return
+ * independently owned byte results. Getters, setters, cloning, comparison and
+ * size queries may run concurrently on live handles. Free is NULL-safe,
+ * idempotent and must be externally serialized with calls on that handle.
+ */
+SHOAL_API shoal_status SHOAL_CALL
+shoal_owned_key_create(shoal_bytes row, shoal_owned_key **out_key,
+                       shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_owned_key_create_full(shoal_bytes row, shoal_bytes column_family,
+                            shoal_bytes column_qualifier,
+                            shoal_bytes column_visibility, int64_t timestamp,
+                            shoal_owned_key **out_key,
+                            shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_owned_key_clone(shoal_owned_key *key, shoal_owned_key **out_key,
+                      shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_owned_key_empty(shoal_owned_key *key, uint8_t *out_value,
+                      shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_owned_key_set_row(shoal_owned_key *key, shoal_bytes value,
+                        shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_owned_key_set_column_family(shoal_owned_key *key, shoal_bytes value,
+                                  shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_owned_key_set_column_qualifier(shoal_owned_key *key, shoal_bytes value,
+                                     shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_owned_key_set_column_visibility(shoal_owned_key *key, shoal_bytes value,
+                                      shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_owned_key_row(shoal_owned_key *key, shoal_bytes_result **out_result,
+                    shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_owned_key_column_family(shoal_owned_key *key,
+                              shoal_bytes_result **out_result,
+                              shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_owned_key_column_qualifier(shoal_owned_key *key,
+                                 shoal_bytes_result **out_result,
+                                 shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_owned_key_column_visibility(shoal_owned_key *key,
+                                  shoal_bytes_result **out_result,
+                                  shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_owned_key_set_timestamp(shoal_owned_key *key, int64_t timestamp,
+                              shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_owned_key_timestamp(shoal_owned_key *key, int64_t *out_timestamp,
+                          shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_owned_key_is_deleted(shoal_owned_key *key, uint8_t *out_value,
+                           shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_owned_key_set_deleted(shoal_owned_key *key, uint8_t deleted,
+                            shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_owned_key_compare(shoal_owned_key *left, shoal_owned_key *right,
+                        int32_t *out_order, shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_owned_key_compare_visibility(shoal_owned_key *left,
+                                   shoal_owned_key *right,
+                                   int32_t *out_order,
+                                   shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_owned_key_less(shoal_owned_key *left, shoal_owned_key *right,
+                     uint8_t *out_value, shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_owned_key_less_or_equal(shoal_owned_key *left, shoal_owned_key *right,
+                              uint8_t *out_value, shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_owned_key_equal(shoal_owned_key *left, shoal_owned_key *right,
+                      uint8_t *out_value, shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_owned_key_not_equal(shoal_owned_key *left, shoal_owned_key *right,
+                          uint8_t *out_value, shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_owned_key_size(shoal_owned_key *key, size_t *out_size,
+                     shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_owned_key_length(shoal_owned_key *key, size_t *out_size,
+                       shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_owned_key_row_size(shoal_owned_key *key, size_t *out_size,
+                         shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_owned_key_column_family_size(shoal_owned_key *key, size_t *out_size,
+                                   shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_owned_key_column_qualifier_size(shoal_owned_key *key, size_t *out_size,
+                                      shoal_error **out_error);
+SHOAL_API shoal_status SHOAL_CALL
+shoal_owned_key_column_visibility_size(shoal_owned_key *key, size_t *out_size,
+                                       shoal_error **out_error);
+SHOAL_API void SHOAL_CALL
+shoal_owned_key_free(shoal_owned_key **key);
 SHOAL_API shoal_status SHOAL_CALL
 shoal_range_after_end_key(const shoal_range *range, const shoal_key *key,
                           uint8_t *out_value, shoal_error **out_error);
