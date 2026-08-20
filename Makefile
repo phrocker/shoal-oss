@@ -216,6 +216,27 @@ test-hdfs:
 		SHOAL_HDFS_INTEGRATION=1 \
 		go test -tags=integration -count=1 -v ./internal/storage/hdfs
 
+.PHONY: test-accumulo-static
+test-accumulo-static:
+	python test/accumulo/harness.py validate
+	python -m unittest -v test/accumulo/test_harness.py
+
+.PHONY: accumulo-up
+accumulo-up:
+	python test/accumulo/harness.py up
+
+.PHONY: accumulo-smoke
+accumulo-smoke:
+	python test/accumulo/harness.py smoke
+
+.PHONY: accumulo-down
+accumulo-down:
+	python test/accumulo/harness.py down
+
+.PHONY: test-accumulo
+test-accumulo:
+	python test/accumulo/harness.py test
+
 .PHONY: vet
 vet:
 	go vet ./...
