@@ -92,3 +92,42 @@ func TestReadConnectorIdentityConcurrentCloseCancelsAndJoins(t *testing.T) {
 		t.Fatalf("begin after close = %v, %v; want connector closed", ctx, err)
 	}
 }
+
+func TestResolveZooKeeperIdentityPinsTimeoutAndCloses(t *testing.T) {
+	instance := &resolvableInstance{
+		Instance: &fakeConnectorInstance{},
+	}
+	got, err := resolveZooKeeperIdentity(
+		context.Background(),
+		accumulo.ZooKeeperConfig{
+			Servers:        []string{"zk:2181"},
+			InstanceName:   "test",
+			SessionTimeout: time.Second,
+		},
+		func(_ context.Context, cfg accumulo.ZooKeeperConfig) (accumulo.Instance, error) {
+			if cfg.SessionTimeout != time.Second {
+				t.Fatalf("SessionTimeout = %v", cfg.SessionTimeout)
+			}
+			return instance, nil
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != (accumulo.InstanceInfo{Name: "test", ID: "test-id"}) {
+		t.Fatalf("identity = %#v", got)
+	}
+	if instance.closes != 1 {
+		t.Fatalf("closes = %d, want 1", instance.closes)
+	}
+}
+
+type resolvableInstance struct {
+	accumulo.Instance
+	closes int
+}
+
+func (i *resolvableInstance) Close() error {
+	i.closes++
+	return nil
+}

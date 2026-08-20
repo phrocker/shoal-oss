@@ -176,7 +176,7 @@ for name in sharkbite.__all__:
     assert getattr(pysharkbite, name) is getattr(sharkbite, name)
 assert pysharkbite.__version__ == sharkbite.__version__
 api = NativeAPI()
-assert api.info.version >= (1, 17, 0)
+assert api.info.version >= (1, 19, 0)
 api.require(6, 7, 8, 9, 10, 11, 12, 16, 19, 21, 22, 27, 28, 29)
 with Mutation(b"release-smoke", _api=api) as mutation:
     mutation.put(b"cf", b"cq", b"A", 1, b"value")

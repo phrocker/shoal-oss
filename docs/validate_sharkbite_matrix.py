@@ -17,7 +17,7 @@ import unicodedata
 
 
 DOC_PATH = Path(__file__).with_name("sharkbite-compatibility.md")
-EXPECTED_REVISION = 53
+EXPECTED_REVISION = 54
 CLUSTER_STATUS_APPROVAL_REVISION = 40
 # Update this manifest only when the independently audited inventory itself
 # changes; review every added/removed or reclassified ID in code review.
@@ -53,9 +53,9 @@ SCOPE_DISPOSITIONS = {
     "Not required",
 }
 EXPECTED_SCOPE_COUNTS = {
-    "Covered": 263,
+    "Covered": 291,
     "Approved divergence": 98,
-    "Required gap": 36,
+    "Required gap": 8,
     "Optional": 2763,
     "Not required": 43,
 }
@@ -97,10 +97,10 @@ def status_count_map(
 
 
 EXPECTED_STATUS_COUNTS = {
-    "Covered": 326,
-    "Missing Go": 2203,
+    "Covered": 354,
+    "Missing Go": 2201,
     "Missing C ABI": 76,
-    "Behavior mismatch": 109,
+    "Behavior mismatch": 83,
     "Intentional divergence (approval required)": 98,
     "Not required (rationale required)": 391,
 }
@@ -108,15 +108,12 @@ EXPECTED_STATUS_COUNTS = {
 EXPECTED_PREFIX_COUNTS = {
     "SB-BASE": status_count_map(covered=18, not_required=2),
     "SB-CFG": status_count_map(
-        covered=12,
-        behavior_mismatch=16,
+        covered=28,
         intentional_divergence=2,
         not_required=6,
     ),
     "SB-CONN": status_count_map(
-        covered=1,
-        missing_go=1,
-        behavior_mismatch=10,
+        covered=12,
         intentional_divergence=1,
     ),
     "SB-CPP": status_count_map(
@@ -158,7 +155,7 @@ EXPECTED_PREFIX_COUNTS = {
     ),
     "SB-SEC": status_count_map(covered=18, not_required=1),
     "SB-STAT": status_count_map(
-        missing_go=1,
+        covered=1,
         intentional_divergence=82,
         not_required=1,
     ),
@@ -218,15 +215,15 @@ EXPECTED_METADATA_FIELDS = {
     ),
     "Sharkbite release line": "`sharkbite` 1.2.0.3 on PyPI (`setup.py:34-35`)",
     "Shoal reference": (
-        "`phrocker/shoal-oss` revision 53 is pinned to main merge "
-        "`e1fe2628ff59c71fc776cca53e405a48dfcaa4a8` "
-        "(\"Merge latest main for compatibility revision 53\")"
+        "`phrocker/shoal-oss` revision 54 is pinned to latest-main merge "
+        "`3ce95cd3bf6b9bbef5a9c21c653286bf8f43c41d` immediately before matrix serialization"
     ),
     "Shoal C ABI version": "`SHOAL_ABI_VERSION 1u` (`capi/include/shoal_types.h`)",
 }
 
 EXPECTED_DOCUMENT_STATUS_SNIPPETS = (
     "Normative gate. Binding on all Sharkbite-compatibility work.",
+    "Revision 54 — closes the exact 28 configuration, credential, connector/session",
     "Revision 53 — completes the Python-visible BatchScanner/Results and BatchWriter compatibility slice",
     "Revision 52 — closes the eleven required storage, logging, and error-contract gaps",
     "Revision 51 — closes the code/evidence-ready issue-190 packaging rows",
@@ -683,9 +680,9 @@ EXPECTED_DIVERGENCE_DECISION_COUNT = len(EXPECTED_DIVERGENCE_DECISION_IDS)
 # what it must do, but it is not one of the 82 approved rows, and the raising
 # shim it now owes is buildable Python work.
 EXPECTED_DIVERGENCE_EXCLUDED_ROWS = {
-    "SB-CONN-007": "Missing Go",
+    "SB-CONN-007": "Covered",
     "SB-STAT-028": NOT_REQUIRED_STATUS,
-    "SB-STAT-038": "Missing Go",
+    "SB-STAT-038": "Covered",
 }
 
 # The normative behavior the approval fixes. Dropping any of these sentences
@@ -728,78 +725,9 @@ APPROVAL_SCOPE_PROSE = (
 # decision's Impact cell is. The fragment checks above and below are kept for
 # their diagnostics, and each is also required to appear in the whole-text pin
 # so a pin can never silently drop what it is supposed to guarantee.
-APPROVAL_BEHAVIOR_PREAMBLE = (
-    'Reached through `AccumuloConnector.getStatistics()` (`pysharkbite.cpp:268`) and '
-    'demonstrated by `examples/pythonstats.py`. **All 82 capability rows in this section '
-    'are `Intentional divergence (approval required)` because the upstream capability no '
-    'longer exists.** Two rows are excluded and carry other statuses: '
-    '[SB-STAT-028](#sec-14) (`Not required` — a pybind11 registration defect in the '
-    '`TableRates` property table, not a capability) and [SB-STAT-038](#sec-14) (`Missing '
-    'Go` — a Python `dynamic_attr` property of the objects rather than a protocol '
-    'capability). Accumulo commit `f0841e4` removed `getManagerStats`, '
-    '`ManagerMonitorInfo`, and `DeadServer` together with the legacy monitor resources — '
-    '113 commits before the pinned Accumulo 4 target `317c288`. The surviving REST-v2, '
-    'metrics, and server APIs cannot reconstruct the `AccumuloInfo` / '
-    '`TabletServerStatus` / `TableInfo` / `TableRates` / `TableCompactions` / '
-    '`Compacting` / `RecoveryStatus` / `DeadServer` object graph these rows describe: the '
-    'data is either absent, aggregated differently, or exposed only as scrape-time '
-    'metrics without the per-table and per-server structure Sharkbite returns. The status '
-    'label keeps the words `approval required` because [§4.2](#sec-4) fixes the six '
-    'status names; whether a divergence *is* approved is recorded in [§26](#sec-26), '
-    'never in the status column. The approval covers exactly the 82 rows in this section, '
-    'which already carried this status, so it changed no classification and no count. The '
-    'entry point that reaches them, [SB-CONN-007](#sec-7), is named by the decision in '
-    '[§26](#sec-26) but is **not** one of the 82 approved rows: it keeps `Missing Go`, '
-    'because what it owes after the approval — a shim that raises — is buildable Python '
-    'work ([SB-GAP-P-006](#sec-23)). Moving it would require an approval that names it. '
-    'This is therefore **not** a Shoal implementation gap that effort can close, and it '
-    'must never be marked `Missing Go` (which implies it is buildable) or `Covered`. '
-    'Shoal issue [#96](https://github.com/phrocker/shoal-oss/issues/96) attempted it and '
-    'PR [#98](https://github.com/phrocker/shoal-oss/pull/98) was **withdrawn** for this '
-    'reason. The single approval decision governing them is [SB-DIV-016](#sec-26), and it '
-    'covers the 82 capability rows of this section — neither [SB-STAT-028](#sec-14) nor '
-    '[SB-STAT-038](#sec-14) is in it. **Approved — @phrocker, 2026-08-19.** The decision '
-    'is recorded on Shoal issue '
-    '[#81](https://github.com/phrocker/shoal-oss/issues/81#issuecomment-5343583850) and '
-    'mirrored here by revision {revision}, as [§26](#sec-26) requires. The approved '
-    'compatibility behavior is normative: 1. `connector.getStatistics()` **raises '
-    '`NotImplementedError`** with a stable explanation that Accumulo 4 removed the legacy '
-    'manager-monitor API. The explanation is part of the contract: it does not vary with '
-    'the cluster, the credentials, or the call. 2. It **must not** return a fabricated or '
-    'partially populated status object. No `AccumuloInfo`, `TabletServerStatus`, '
-    '`TableInfo`, `TableRates`, `TableCompactions`, `Compacting`, `RecoveryStatus`, or '
-    '`DeadServer` instance is ever returned, so none of the accessors below is ever '
-    'reachable and no metrics-scraped substitute may be presented as one. The approval '
-    'fixes the observable contract of the call, not how a shim is written internally: it '
-    'says nothing about what an implementation may construct or attempt on the way to '
-    'raising, and this document does not add such a rule. 3. This permanent absence '
-    '**must not** be surfaced as a retryable `ClientException` ([§18](#sec-18)). A caller '
-    'must be able to distinguish "the cluster is unavailable, retry" from "this API no '
-    'longer exists". 4. **Capability discovery must not advertise cluster-status '
-    'support.** No `shoal_capabilities` bit, no ABI export, and no Python feature flag '
-    'may claim it ([SB-XCUT-012](#sec-20), [SB-GAP-C-006](#sec-23)). The approval '
-    'satisfies the [§2.2](#sec-2) gate for these rows under corollary 5 of [§2](#sec-2). '
-    'It does **not** make any row `Covered`, and it does not erase the work it creates: '
-    'the Python shim owes the raising entry point, and the compatibility suite owes the '
-    'tests that pin it ([SB-GAP-T-009](#sec-23), [SB-GAP-P-006](#sec-23)) — that '
-    '`getStatistics()` raises `NotImplementedError` with the stable message and not '
-    '`ClientException`, that no status object is returned on any path, and that '
-    'capability discovery reports no cluster-status capability. Two separate facts, which '
-    'this document deliberately does not conflate. First, **each of the 82 rows '
-    '[SB-DIV-016](#sec-26) covers keeps `Intentional divergence (approval required)` '
-    'permanently**: [§4.2](#sec-4) fixes the six status names, approval state lives in '
-    '[§26](#sec-26) rather than in the status column, and an approved divergence records '
-    'a capability that will never exist. Landing the tests does not move those 82 rows, '
-    'and neither does anything else — only reversing the approval could. The claim is '
-    'about them and not about the section: [SB-STAT-028](#sec-14) is `Not required` and '
-    '[SB-STAT-038](#sec-14) is `Missing Go`, and neither is bound by this permanence. '
-    'Second, and independently, the divergence is **approved but unproven** until '
-    '[SB-GAP-T-009](#sec-23) lands: the decision is binding now, the evidence that an '
-    'implementation obeys it does not exist yet. Proof status is not a classification and '
-    'never becomes one.'
-)
+APPROVAL_BEHAVIOR_PREAMBLE = 'Reached through `AccumuloConnector.getStatistics()` (`pysharkbite.cpp:268`) and demonstrated by `examples/pythonstats.py`. **All 82 capability rows in this section are `Intentional divergence (approval required)` because the upstream capability no longer exists.** Two rows are excluded and carry other statuses: [SB-STAT-028](#sec-14) (`Not required` — a pybind11 registration defect in the `TableRates` property table, not a capability) and [SB-STAT-038](#sec-14) (`Covered` — the Python status placeholder types preserve `dynamic_attr` through normal instance dictionaries). Accumulo commit `f0841e4` removed `getManagerStats`, `ManagerMonitorInfo`, and `DeadServer` together with the legacy monitor resources — 113 commits before the pinned Accumulo 4 target `317c288`. The surviving REST-v2, metrics, and server APIs cannot reconstruct the legacy status object graph. The status label keeps the words `approval required` because [§4.2](#sec-4) fixes the six status names; approval state lives in [§26](#sec-26). The entry point [SB-CONN-007](#sec-7) is not one of the 82 approved rows, but is now `Covered`: the buildable Python shim required by the decision has landed and is tested. That classification proves the raising entry point, not cluster-status support. The single approval decision governing them is [SB-DIV-016](#sec-26), and it covers the 82 capability rows of this section — neither [SB-STAT-028](#sec-14) nor [SB-STAT-038](#sec-14) is in it. **Approved — @phrocker, 2026-08-19.** The decision is recorded on Shoal issue [#81](https://github.com/phrocker/shoal-oss/issues/81#issuecomment-5343583850) and mirrored here by revision 40. The approved compatibility behavior is normative: 1. `connector.getStatistics()` **raises `NotImplementedError`** with a stable explanation that Accumulo 4 removed the legacy manager-monitor API. 2. It **must not** return a fabricated or partially populated status object. 3. This permanent absence **must not** be surfaced as a retryable `ClientException`. 4. **Capability discovery must not advertise cluster-status support.** Revision 54 proves these obligations with `test_connector_statistics_and_closed_lifecycle_are_stable` and `test_status_placeholders_preserve_dynamic_attributes` (`python/tests/test_foundation.py`). No status object is returned, the exception is stable and non-retryable, no cluster-status capability is advertised, and all eight importable placeholder types accept arbitrary user attributes. **each of the 82 rows [SB-DIV-016](#sec-26) covers keeps `Intentional divergence (approval required)` permanently**; only the separately buildable entry point and dynamic-attribute row moved to `Covered`.'
 
-DIVERGENCE_DECISION_PREAMBLE = 'Twelve entries below are approved: [SB-DIV-001](#sec-26) through [SB-DIV-005](#sec-26), [SB-DIV-007](#sec-26) through [SB-DIV-009](#sec-26), [SB-DIV-016](#sec-26) through [SB-DIV-019](#sec-26), signed by @phrocker on **2026-08-20** or the earlier date shown in the table. [SB-DIV-013](#sec-26) is **subsumed** by [SB-DIV-016](#sec-26): it is dormant rather than blocking, carries no approver of its own, and revives only if that approval is reversed. Every remaining entry blocks the gate until a named approver signs it with a date. Approvals are recorded on Shoal issue [#81](https://github.com/phrocker/shoal-oss/issues/81) and then mirrored into this table in the same change; a comment on #81 alone does not lift the gate, and neither does an edit here without the corresponding #81 decision. Adding a divergence to this table is not approval. **98 matrix rows currently carry the `Intentional divergence (approval required)` status: 98 are approved and 0 are not.** The approved 82 are the cluster-status rows of [§14](#sec-14), all covered by the single decision [SB-DIV-016](#sec-26), which @phrocker approved on **2026-08-19**; that decision also governs [SB-CONN-007](#sec-7), the `getStatistics()` entry point, but does not cover it as an approved row, so it stays `Missing Go` and is counted there. The additional approved rows are SB-PKG-001 (independent distribution/version), SB-PKG-007 (Python 3.9+), SB-PKG-014 (Accumulo 4 only), SB-CFG-014 and SB-CFG-022 (no password read-back, both spellings), SB-CONN-010 (per-connector pools), SB-ERR-003 (no Thrift types), SB-SCAN-007/016 (stable rejection of non-functional Python iterators), and SB-SCAN-008/009/014/015 (no implicit hedged or RFile-only scans), SB-WRITE-010 (structured write failures rather than silent discard), plus SB-TABLE-006 (no compatible online-compaction contract) and SB-TABLE-013 (no compatible legacy bulk-import contract). The table below lists 19 decisions — 12 approved, 1 subsumed by that approval, and 6 still proposed — because one decision can cover many rows; the row count and the decision count are different quantities and must not be conflated. The remaining 6 entries — every decision except the approved [SB-DIV-001](#sec-26), [SB-DIV-002](#sec-26), [SB-DIV-003](#sec-26), [SB-DIV-004](#sec-26), [SB-DIV-005](#sec-26), [SB-DIV-007](#sec-26), [SB-DIV-008](#sec-26), [SB-DIV-009](#sec-26), [SB-DIV-016](#sec-26), [SB-DIV-017](#sec-26), [SB-DIV-018](#sec-26), [SB-DIV-019](#sec-26) and the subsumed [SB-DIV-013](#sec-26) — are **proposed** divergences. Every row named by those proposals currently carries a non-divergence gap status; approval would move it to `Intentional divergence`. Rejecting a proposal leaves its rows as gaps that must be implemented. Neither of the two non-proposed entries is a proposal: SB-DIV-016 is already approved, and SB-DIV-013 describes a capability that same approval removed outright, so it has nothing left to propose. SB-DIV-016 names [SB-CONN-007](#sec-7) as the entry point that reaches its rows, but that row is outside the approved set and keeps `Missing Go`; reclassifying it would require an approval that names it. An approved divergence never becomes `Covered`: it records a capability that will never exist rather than one that has been delivered, and its rows keep the `approval required` label because [§4.2](#sec-4) fixes the six status names — approval state lives in this table, not in the status column.'
+DIVERGENCE_DECISION_PREAMBLE = 'Twelve entries below are approved: [SB-DIV-001](#sec-26) through [SB-DIV-005](#sec-26), [SB-DIV-007](#sec-26) through [SB-DIV-009](#sec-26), [SB-DIV-016](#sec-26) through [SB-DIV-019](#sec-26), signed by @phrocker on **2026-08-20** or the earlier date shown in the table. [SB-DIV-013](#sec-26) is **subsumed** by [SB-DIV-016](#sec-26): it is dormant rather than blocking, carries no approver of its own, and revives only if that approval is reversed. Every remaining entry blocks the gate until a named approver signs it with a date. Approvals are recorded on Shoal issue [#81](https://github.com/phrocker/shoal-oss/issues/81) and then mirrored into this table in the same change; a comment on #81 alone does not lift the gate, and neither does an edit here without the corresponding #81 decision. Adding a divergence to this table is not approval. **98 matrix rows currently carry the `Intentional divergence (approval required)` status: 98 are approved and 0 are not.** The approved 82 are the cluster-status rows of [§14](#sec-14), all covered by the single decision [SB-DIV-016](#sec-26), which @phrocker approved on **2026-08-19**; that decision also governs [SB-CONN-007](#sec-7), the `getStatistics()` entry point, but does not cover it as an approved row, so it stays `Missing Go` and is counted there. The additional approved rows are SB-PKG-001 (independent distribution/version), SB-PKG-007 (Python 3.9+), SB-PKG-014 (Accumulo 4 only), SB-CFG-014 and SB-CFG-022 (no password read-back, both spellings), SB-CONN-010 (per-connector pools), SB-ERR-003 (no Thrift types), SB-SCAN-007/016 (stable rejection of non-functional Python iterators), and SB-SCAN-008/009/014/015 (no implicit hedged or RFile-only scans), SB-WRITE-010 (structured write failures rather than silent discard), plus SB-TABLE-006 (no compatible online-compaction contract) and SB-TABLE-013 (no compatible legacy bulk-import contract). The table below lists 19 decisions — 12 approved, 1 subsumed by that approval, and 6 still proposed — because one decision can cover many rows; the row count and the decision count are different quantities and must not be conflated. The remaining 6 entries — every decision except the approved [SB-DIV-001](#sec-26), [SB-DIV-002](#sec-26), [SB-DIV-003](#sec-26), [SB-DIV-004](#sec-26), [SB-DIV-005](#sec-26), [SB-DIV-007](#sec-26), [SB-DIV-008](#sec-26), [SB-DIV-009](#sec-26), [SB-DIV-016](#sec-26), [SB-DIV-017](#sec-26), [SB-DIV-018](#sec-26), [SB-DIV-019](#sec-26) and the subsumed [SB-DIV-013](#sec-26) — are **proposed** divergences. Every row named by those proposals currently carries a non-divergence gap status; approval would move it to `Intentional divergence`. Rejecting a proposal leaves its rows as gaps that must be implemented. Neither of the two non-proposed entries is a proposal: SB-DIV-016 is already approved, and SB-DIV-013 describes a capability that same approval removed outright, so it has nothing left to propose. SB-DIV-016 names [SB-CONN-007](#sec-7) as the entry point that reaches its rows, but that row is outside the approved set and is `Covered` because the required raising shim has landed; only the 82 unavailable capability rows retain divergence status. An approved divergence never becomes `Covered`: it records a capability that will never exist rather than one that has been delivered, and its rows keep the `approval required` label because [§4.2](#sec-4) fixes the six status names — approval state lives in this table, not in the status column.'
 RELEASE_GATE_SECTION_HEADING = "## 2. Release gate (normative)"
 COUNTS_SECTION_HEADING = "## 25. Counts by status and category"
 APPROVAL_BEHAVIOR_SECTION_HEADING = (
@@ -848,7 +776,7 @@ EXPECTED_SCOPE_MANIFEST_HEADER = (
     f"# Revision-{EXPECTED_REVISION} Sharkbite client-scope disposition manifest.",
     f"# Matrix: docs/sharkbite-compatibility.md revision {EXPECTED_REVISION}.",
     "# Sharkbite source: phrocker/sharkbite@7f2625f74331b0cd4a75dc0484949c40f1409686.",
-    "# Shoal source: phrocker/shoal-oss@e1fe2628ff59c71fc776cca53e405a48dfcaa4a8.",
+    "# Shoal source: phrocker/shoal-oss@3ce95cd3bf6b9bbef5a9c21c653286bf8f43c41d.",
     "# Policy: docs/sharkbite-client-scope.md.",
     "# Columns: ROW-ID<TAB>DISPOSITION<TAB>RULE<TAB>PINNED-MATRIX-STATUS.",
     "# Entries are in matrix order; validator rules, not aggregate counts, authorize dispositions.",
@@ -865,8 +793,8 @@ DEFAULT_C_ABI_INCLUDE_PATHS = (
     Path("capi/include"),
     Path("capi/tests"),
 )
-EXPECTED_C_ABI_DECLARED_EXPORTS = 322
-EXPECTED_C_ABI_REFERENCED_EXPORTS = 322
+EXPECTED_C_ABI_DECLARED_EXPORTS = 323
+EXPECTED_C_ABI_REFERENCED_EXPORTS = 323
 EXPECTED_C_ABI_UNREFERENCED_EXPORTS: tuple[str, ...] = ()
 EXPECTED_C_ABI_SYMBOL_MANIFEST_HEADER = (
     f"# Revision-{EXPECTED_REVISION} compiled C ABI symbol inventory for docs/sharkbite-compatibility.md.",
@@ -3429,7 +3357,7 @@ def validate_status_narratives(
     expected_phrases = [
         (RELEASE_GATE_SECTION_HEADING, f"As of revision {EXPECTED_REVISION}, **{required_rows} rows are required, {satisfied} are satisfied, and {scope_counts['Required gap']} remain**."),
         (COUNTS_SECTION_HEADING, f"The normative scope manifest classifies {required_rows} rows as required, {scope_counts['Optional']} as optional, and {scope_counts['Not required']} as not required."),
-        (COUNTS_SECTION_HEADING, f"**Exactly {status_counts['Covered']} rows are `Covered`: [SB-XCUT-012](#sec-20), the twelve configuration/topology rows completed in revision 24, the 31 RFile/stream rows completed in revision 25, the 17 data-model value rows completed in revision 26, the five buffered-writer rows completed in revisions 28 and 45, the four row-bounded flush/constraint rows completed in revision 29, the connector invalidation/cancellation rows completed in revision 30, the eight high-level client rows completed in revision 31, the five high-level scanner rows completed in revision 32, the four compatibility-error rows completed in revision 34, the twelve streaming cursor rows completed in revision 36, the 31 column-visibility rows completed in revision 38, the 22 equivalent owned-key rows completed in revision 42, the named-locality-group RFile row plus 24 HDFS rows completed in revision 44, the two logging rows completed in revision 45, the 38 table/namespace/security rows completed in revision 48, the twelve issue-196 cross-cutting rows completed in revision 49, the 60 required Python data-model and iterator-descriptor rows completed in revision 50, the five package/import rows completed in revision 51, the eleven RFile/HDFS/logging/error rows completed in revision 52, and nineteen Python-visible scanner/writer rows completed in revision 53; SB-WRITE-010 is the separately approved SB-DIV-005 divergence.**"),
+        (COUNTS_SECTION_HEADING, f"**Exactly {status_counts['Covered']} rows are `Covered`: [SB-XCUT-012](#sec-20), the twelve configuration/topology rows completed in revision 24, the 31 RFile/stream rows completed in revision 25, the 17 data-model value rows completed in revision 26, the five buffered-writer rows completed in revisions 28 and 45, the four row-bounded flush/constraint rows completed in revision 29, the connector invalidation/cancellation rows completed in revision 30, the eight high-level client rows completed in revision 31, the five high-level scanner rows completed in revision 32, the four compatibility-error rows completed in revision 34, the twelve streaming cursor rows completed in revision 36, the 31 column-visibility rows completed in revision 38, the 22 equivalent owned-key rows completed in revision 42, the named-locality-group RFile row plus 24 HDFS rows completed in revision 44, the two logging rows completed in revision 45, the 38 table/namespace/security rows completed in revision 48, the twelve issue-196 cross-cutting rows completed in revision 49, the 60 required Python data-model and iterator-descriptor rows completed in revision 50, the five package/import rows completed in revision 51, the eleven RFile/HDFS/logging/error rows completed in revision 52, nineteen Python-visible scanner/writer rows completed in revision 53, and the 28 configuration/credential/connector/session/dynamic-attribute rows completed in revision 54; SB-WRITE-010 is the separately approved SB-DIV-005 divergence.**"),
         (COUNTS_SECTION_HEADING, f"`Intentional divergence` ({status_counts[INTENTIONAL_DIVERGENCE_STATUS]}) is dominated by one upstream fact: {prefix_counts['SB-STAT'][INTENTIONAL_DIVERGENCE_STATUS]} rows are cluster-status accessors Accumulo itself deleted ([§14](#sec-14), [SB-DIV-016](#sec-26))."),
         (COUNTS_SECTION_HEADING, "`SB-XCUT-014`, `SB-XCUT-019`, and `SB-PKG-008` remain explicit required"),
     ]

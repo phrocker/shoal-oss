@@ -20,9 +20,9 @@ static void SHOAL_CALL capture_log(shoal_log_level level,
 
 _Static_assert(SHOAL_ABI_VERSION == 1u, "unexpected compatibility ABI version");
 _Static_assert(SHOAL_ABI_VERSION_MAJOR == 1u, "unexpected ABI major");
-_Static_assert(SHOAL_ABI_VERSION_MINOR == 18u, "unexpected ABI minor");
+_Static_assert(SHOAL_ABI_VERSION_MINOR == 19u, "unexpected ABI minor");
 _Static_assert(SHOAL_ABI_VERSION_PATCH == 0u, "unexpected ABI patch");
-_Static_assert(SHOAL_ABI_VERSION_PACKED == 0x00011200u,
+_Static_assert(SHOAL_ABI_VERSION_PACKED == 0x00011300u,
                "unexpected packed ABI version");
 _Static_assert(SHOAL_ABI_CAPABILITY_CONNECTOR == 0u,
                "unexpected connector capability id");
@@ -76,11 +76,15 @@ _Static_assert(SHOAL_ABI_CAPABILITY_COLUMN_VISIBILITY == 25u,
                "unexpected column visibility capability id");
 _Static_assert(SHOAL_ABI_CAPABILITY_OWNED_KEY == 26u,
                "unexpected owned key capability id");
-_Static_assert(SHOAL_ABI_CAPABILITY_COUNT == 31u,
+_Static_assert(SHOAL_ABI_CAPABILITY_STORAGE_ERROR_PARITY == 30u,
+               "unexpected storage/error parity capability id");
+_Static_assert(SHOAL_ABI_CAPABILITY_ZOOKEEPER_INSTANCE == 31u,
+               "unexpected ZooKeeper instance capability id");
+_Static_assert(SHOAL_ABI_CAPABILITY_COUNT == 32u,
                "unexpected capability count");
 _Static_assert(SHOAL_ABI_CAPABILITY_WORD_COUNT == 1u,
                "unexpected capability word count");
-_Static_assert(SHOAL_ABI_CAPABILITY_WORD0 == UINT64_C(0x7fffffff),
+_Static_assert(SHOAL_ABI_CAPABILITY_WORD0 == UINT64_C(0xffffffff),
                "unexpected capability word 0");
 
 #define ASSERT_PERMISSION_VALUE(name, value)                                  \
@@ -1445,6 +1449,21 @@ int main(void) {
   shoal_connector_identity_free(&identity);
   assert(identity == NULL);
   shoal_connector_identity_free(&identity);
+  expect_error(shoal_zookeeper_resolve_instance(
+                   NULL, "zk:2181", 1000, 1000, NULL, &identity, &error),
+               SHOAL_STATUS_INVALID_ARGUMENT, &error, "instance_name");
+  expect_error(shoal_zookeeper_resolve_instance(
+                   "accumulo", NULL, 1000, 1000, NULL, &identity, &error),
+               SHOAL_STATUS_INVALID_ARGUMENT, &error, "zookeeper_servers");
+  expect_error(shoal_zookeeper_resolve_instance(
+                   "accumulo", "zk:2181", -1, 1000, NULL, &identity, &error),
+               SHOAL_STATUS_INVALID_ARGUMENT, &error, "session_timeout_ms");
+  expect_error(shoal_zookeeper_resolve_instance(
+                   "accumulo", "zk:2181", 1000, -1, NULL, &identity, &error),
+               SHOAL_STATUS_INVALID_ARGUMENT, &error, "bootstrap_timeout_ms");
+  expect_error(shoal_zookeeper_resolve_instance(
+                   "accumulo", "zk:2181", 1000, 1000, NULL, NULL, &error),
+               SHOAL_STATUS_INVALID_ARGUMENT, &error, "out_result");
 
   for (size_t allocation = 0; allocation < 3; ++allocation) {
     shoal_test_string_alloc_fail_after(allocation);

@@ -11,7 +11,7 @@ import (
 	"github.com/phrocker/shoal/internal/zk"
 )
 
-const defaultZooKeeperSessionTimeout = 30 * time.Second
+const DefaultZooKeeperSessionTimeout = 30 * time.Second
 
 // InstanceInfo is the resolved identity of an Accumulo instance.
 type InstanceInfo struct {
@@ -86,6 +86,7 @@ type discoveryInstance interface {
 type zkLocator struct {
 	info          InstanceInfo
 	locator       locator
+	config        ZooKeeperConfig
 	zooKeepers    []string
 	configuration *Configuration
 	once          sync.Once
@@ -104,6 +105,47 @@ func NewZooKeeperInstance(ctx context.Context, cfg ZooKeeperConfig) (Instance, e
 	})
 }
 
+// CloneZooKeeperInstance creates an independent ZooKeeper-backed instance
+// using the source's immutable connection settings and a clone of its current
+// client Configuration. Resolution runs again and the returned instance owns
+// a separate ZooKeeper lifecycle.
+func CloneZooKeeperInstance(ctx context.Context, source Instance) (Instance, error) {
+	if source == nil {
+		return nil, errors.New("accumulo: source instance is required")
+	}
+	zkSource, ok := source.(*zkLocator)
+	if !ok {
+		return nil, errors.New("accumulo: source instance is not ZooKeeper-backed")
+	}
+	cfg := zkSource.config
+	cfg.Servers = append([]string(nil), cfg.Servers...)
+	cfg.Configuration = source.Configuration().Clone()
+	return NewZooKeeperInstance(ctx, cfg)
+}
+
+func normalizeZooKeeperConfig(cfg ZooKeeperConfig) (ZooKeeperConfig, error) {
+	if len(cfg.Servers) == 0 {
+		return ZooKeeperConfig{}, errors.New("accumulo: at least one ZooKeeper server is required")
+	}
+	for _, server := range cfg.Servers {
+		if server == "" {
+			return ZooKeeperConfig{}, errors.New("accumulo: ZooKeeper server must not be empty")
+		}
+	}
+	if cfg.InstanceName == "" {
+		return ZooKeeperConfig{}, errors.New("accumulo: instance name is required")
+	}
+	if cfg.SessionTimeout < 0 {
+		return ZooKeeperConfig{}, errors.New("accumulo: ZooKeeper session timeout must not be negative")
+	}
+	if cfg.SessionTimeout == 0 {
+		cfg.SessionTimeout = DefaultZooKeeperSessionTimeout
+	}
+	cfg.Servers = append([]string(nil), cfg.Servers...)
+	cfg.Configuration = cfg.Configuration.Clone()
+	return cfg, nil
+}
+
 func newZooKeeperInstance(
 	ctx context.Context,
 	cfg ZooKeeperConfig,
@@ -112,24 +154,11 @@ func newZooKeeperInstance(
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if len(cfg.Servers) == 0 {
-		return nil, errors.New("accumulo: at least one ZooKeeper server is required")
+	var err error
+	cfg, err = normalizeZooKeeperConfig(cfg)
+	if err != nil {
+		return nil, err
 	}
-	for _, server := range cfg.Servers {
-		if server == "" {
-			return nil, errors.New("accumulo: ZooKeeper server must not be empty")
-		}
-	}
-	if cfg.InstanceName == "" {
-		return nil, errors.New("accumulo: instance name is required")
-	}
-	if cfg.SessionTimeout < 0 {
-		return nil, errors.New("accumulo: ZooKeeper session timeout must not be negative")
-	}
-	if cfg.SessionTimeout == 0 {
-		cfg.SessionTimeout = defaultZooKeeperSessionTimeout
-	}
-	cfg.Servers = append([]string(nil), cfg.Servers...)
 
 	type result struct {
 		loc locator
@@ -176,8 +205,9 @@ func newZooKeeperInstance(
 			ID:   loc.InstanceID(),
 		},
 		locator:       loc,
+		config:        cfg,
 		zooKeepers:    cfg.Servers,
-		configuration: cfg.Configuration.Clone(),
+		configuration: cfg.Configuration,
 	}, nil
 }
 

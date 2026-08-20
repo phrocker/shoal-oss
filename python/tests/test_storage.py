@@ -20,7 +20,7 @@ class Function:
 
 class FakeHdfsAPI:
     def __init__(self):
-        self.capabilities = frozenset(range(31))
+        self.capabilities = frozenset(range(32))
         self.calls = []
         self.lib = type("FakeHdfsLibrary", (), {})()
         self.lib.shoal_hdfs_client_create = Function(self._create)

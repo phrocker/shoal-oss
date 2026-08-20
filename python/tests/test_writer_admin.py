@@ -224,7 +224,7 @@ class FakeLibrary:
 class FakeAPI:
     def __init__(self):
         self.lib = FakeLibrary()
-        self.capabilities = frozenset(range(31))
+        self.capabilities = frozenset(range(32))
 
     def require(self, *capabilities):
         if set(capabilities) - self.capabilities:

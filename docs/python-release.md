@@ -11,7 +11,7 @@ assert pysharkbite.Client is sharkbite.Client
 ```
 
 The distribution version is independent of the native ABI version. Release
-`0.4.0` requires Shoal ABI `1.18.0` or newer within ABI major 1. The package is
+`0.5.0` requires Shoal ABI `1.19.0` or newer within ABI major 1. The package is
 still an incremental compatibility layer: publishing it does not make the
 uncovered required rows in `sharkbite-compatibility.md` compatible. Scope is
 defined by `sharkbite-client-scope.md`, not by the raw count of historical C++
@@ -24,7 +24,7 @@ declarations.
 | Linux x86-64, glibc 2.28+ | First supported wheel target | Build as `manylinux_2_28_x86_64` in a glibc 2.28-or-older manylinux environment and require `auditwheel show` to pass. |
 | Linux aarch64, glibc 2.28+ | Build-capable, not yet release-validated | The scripts emit and verify `manylinux_2_28_aarch64`; publication waits for native aarch64 CI evidence. |
 | macOS x86-64/arm64 | Go cross-build and unbundled package preview verified; native runtime unsupported | `scripts/cross_platform_artifacts.py` cross-builds the non-CGO Shoal command and reproducibly builds each platform-tagged preview. Preview wheels intentionally contain no `.dylib`, install into a target-platform layout, and prove imports plus the expected native-library discovery error. Publication still requires a native `c-shared` build, linked C/C++ execution, and clean native installs on each architecture. |
-| Windows amd64 | Host-verified shared/static and Python artifact path | The deterministic evidence script builds shared and static C ABI artifacts, links and executes C11/C++11 lifecycle clients, verifies all 322 `shoal_*` exports plus ABI 1.18.0/capability discovery, and repeats clean wheel/sdist builds to prove identical hashes. |
+| Windows amd64 | Host-verified shared/static and Python artifact path | The deterministic evidence script builds shared and static C ABI artifacts, links and executes C11/C++11 lifecycle clients, verifies all 323 `shoal_*` exports plus ABI 1.19.0/capability discovery, and repeats clean wheel/sdist builds to prove identical hashes. |
 
 The source distribution is platform-neutral Python source and intentionally
 contains no native binary. A platform wheel contains exactly one native Shoal
@@ -44,7 +44,7 @@ The loader uses this order:
 The current working directory and repository build directories are never
 searched implicitly. This prevents accidental or attacker-controlled library
 preloading. The loader resolves ABI discovery symbols first, rejects a major
-other than 1, rejects versions older than 1.18.0, checks the packed and tuple
+other than 1, rejects versions older than 1.19.0, checks the packed and tuple
 versions agree, and dynamically resolves capability symbols before use.
 
 ## Reproducible build

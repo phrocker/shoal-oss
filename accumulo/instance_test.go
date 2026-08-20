@@ -28,7 +28,7 @@ func TestNewZooKeeperInstanceResolvesAndClosesOnce(t *testing.T) {
 			InstanceName: "accumulo",
 		},
 		func(cfg ZooKeeperConfig) (locator, error) {
-			if cfg.SessionTimeout != defaultZooKeeperSessionTimeout {
+			if cfg.SessionTimeout != DefaultZooKeeperSessionTimeout {
 				t.Fatalf("SessionTimeout = %v", cfg.SessionTimeout)
 			}
 			return fake, nil
@@ -48,6 +48,62 @@ func TestNewZooKeeperInstanceResolvesAndClosesOnce(t *testing.T) {
 	}
 	if fake.closes != 1 {
 		t.Fatalf("locator closed %d times, want 1", fake.closes)
+	}
+}
+
+func TestNewZooKeeperInstancePinsExplicitAndDefaultSessionTimeouts(t *testing.T) {
+	tests := []struct {
+		name string
+		in   time.Duration
+		want time.Duration
+	}{
+		{name: "explicit", in: time.Second, want: time.Second},
+		{name: "zero uses documented default", want: DefaultZooKeeperSessionTimeout},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fake := &fakeLocator{id: "uuid-1"}
+			instance, err := newZooKeeperInstance(
+				context.Background(),
+				ZooKeeperConfig{
+					Servers:        []string{"zk:2181"},
+					InstanceName:   "accumulo",
+					SessionTimeout: test.in,
+				},
+				func(cfg ZooKeeperConfig) (locator, error) {
+					if cfg.SessionTimeout != test.want {
+						t.Fatalf("SessionTimeout = %v, want %v", cfg.SessionTimeout, test.want)
+					}
+					return fake, nil
+				},
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = instance.Close() })
+		})
+	}
+}
+
+func TestNormalizeZooKeeperConfigClonesInputs(t *testing.T) {
+	configuration := NewConfiguration()
+	configuration.Set("key", "before")
+	servers := []string{"zk:2181"}
+	cfg, err := normalizeZooKeeperConfig(ZooKeeperConfig{
+		Servers:       servers,
+		InstanceName:  "accumulo",
+		Configuration: configuration,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	servers[0] = "changed"
+	configuration.Set("key", "after")
+	if cfg.Servers[0] != "zk:2181" {
+		t.Fatalf("Servers = %v", cfg.Servers)
+	}
+	if got := cfg.Configuration.Get("key"); got != "before" {
+		t.Fatalf("Configuration key = %q, want before", got)
 	}
 }
 

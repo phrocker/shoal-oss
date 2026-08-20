@@ -749,6 +749,21 @@ SHOAL_API void SHOAL_CALL
 shoal_connector_identity_free(shoal_connector_identity_result **result);
 
 /*
+ * Resolves a ZooKeeper-backed instance identity without retaining a native
+ * session. zookeeper_servers is a comma-separated list. A zero session timeout
+ * selects Shoal's documented 30-second default; a zero bootstrap timeout
+ * selects 30 seconds. The result owns the instance name and ID and has an
+ * empty principal. This operation is intended for compatibility Instance
+ * objects that must resolve identity before credentials are available.
+ */
+SHOAL_API shoal_status SHOAL_CALL
+shoal_zookeeper_resolve_instance(
+    const char *instance_name, const char *zookeeper_servers,
+    int64_t session_timeout_ms, int64_t bootstrap_timeout_ms,
+    const char *instance_secret, shoal_connector_identity_result **out_result,
+    shoal_error **out_error);
+
+/*
  * Live topology calls use timeout_ms (zero means no deadline), participate in
  * connector cancellation, and return fully owned snapshots. Immutable wiring
  * calls are also coordinated with concurrent connector close.

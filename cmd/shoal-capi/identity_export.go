@@ -16,6 +16,24 @@ import (
 	"github.com/phrocker/shoal/accumulo"
 )
 
+type zooKeeperInstanceResolver func(context.Context, accumulo.ZooKeeperConfig) (accumulo.Instance, error)
+
+func resolveZooKeeperIdentity(
+	ctx context.Context,
+	cfg accumulo.ZooKeeperConfig,
+	resolve zooKeeperInstanceResolver,
+) (accumulo.InstanceInfo, error) {
+	instance, err := resolve(ctx, cfg)
+	if err != nil {
+		return accumulo.InstanceInfo{}, err
+	}
+	if instance == nil {
+		return accumulo.InstanceInfo{}, errors.New("shoal: ZooKeeper resolver returned nil instance")
+	}
+	info := instance.Info()
+	return info, instance.Close()
+}
+
 type connectorIdentitySource interface {
 	capiConnectorIdentity(context.Context) (accumulo.InstanceInfo, string, error)
 }
@@ -104,6 +122,70 @@ func shoal_connector_identity_free(result **C.shoal_connector_identity_result) {
 	}
 	C.shoal_bridge_connector_identity_free(*result)
 	*result = nil
+}
+
+//export shoal_zookeeper_resolve_instance
+func shoal_zookeeper_resolve_instance(
+	instanceName *C.char,
+	zookeeperServers *C.char,
+	sessionTimeout C.int64_t,
+	bootstrapTimeout C.int64_t,
+	instanceSecret *C.char,
+	out **C.shoal_connector_identity_result,
+	outError **C.shoal_error,
+) (status C.shoal_status) {
+	clearError(outError)
+	if out != nil {
+		*out = nil
+	}
+	defer recoverStatus(&status, outError)
+	if out == nil {
+		return fail(outError, C.SHOAL_STATUS_INVALID_ARGUMENT, errors.New("shoal: out_result is required"))
+	}
+	name, err := requiredString(instanceName, "instance_name")
+	if err != nil {
+		return fail(outError, C.SHOAL_STATUS_INVALID_ARGUMENT, err)
+	}
+	servers, err := parseServers(zookeeperServers)
+	if err != nil {
+		return fail(outError, C.SHOAL_STATUS_INVALID_ARGUMENT, err)
+	}
+	session, err := durationMilliseconds(sessionTimeout, "session_timeout_ms", 0)
+	if err != nil {
+		return fail(outError, C.SHOAL_STATUS_INVALID_ARGUMENT, err)
+	}
+	bootstrap, err := durationMilliseconds(
+		bootstrapTimeout,
+		"bootstrap_timeout_ms",
+		defaultBootstrapTimeout,
+	)
+	if err != nil {
+		return fail(outError, C.SHOAL_STATUS_INVALID_ARGUMENT, err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), bootstrap)
+	defer cancel()
+	info, err := resolveZooKeeperIdentity(
+		ctx,
+		accumulo.ZooKeeperConfig{
+			Servers:        servers,
+			InstanceName:   name,
+			SessionTimeout: session,
+			InstanceSecret: optionalString(instanceSecret),
+		},
+		accumulo.NewZooKeeperInstance,
+	)
+	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			return fail(outError, C.SHOAL_STATUS_DEADLINE_EXCEEDED, err)
+		}
+		return failForError(outError, err)
+	}
+	result, code, err := buildConnectorIdentityResult(info, "")
+	if err != nil {
+		return fail(outError, code, err)
+	}
+	*out = result
+	return C.SHOAL_STATUS_OK
 }
 
 func buildConnectorIdentityResult(identity accumulo.InstanceInfo, principal string) (*C.shoal_connector_identity_result, C.shoal_status, error) {
