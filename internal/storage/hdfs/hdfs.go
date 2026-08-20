@@ -41,6 +41,10 @@ type Client interface {
 	Close() error
 }
 
+type chownClient interface {
+	Chown(name, user, group string) error
+}
+
 // Reader is the read-only HDFS file contract used by Backend.
 type Reader interface {
 	io.ReaderAt
@@ -414,6 +418,7 @@ func (b *Backend) ReadDir(ctx context.Context, prefix string) ([]os.FileInfo, er
 	if err := contextOrBackground(ctx).Err(); err != nil {
 		return nil, err
 	}
+
 	lease, err := b.newOperation(ctx)
 	if err != nil {
 		return nil, err
@@ -440,6 +445,50 @@ func (b *Backend) ReadDir(ctx context.Context, prefix string) ([]os.FileInfo, er
 		return strings.Compare(a.Name(), b.Name())
 	})
 	return out, nil
+}
+
+// Mkdir creates a directory and any missing parents.
+func (b *Backend) Mkdir(ctx context.Context, name string, perm os.FileMode) error {
+	if err := contextOrBackground(ctx).Err(); err != nil {
+		return err
+	}
+	lease, err := b.newOperation(ctx)
+	if err != nil {
+		return err
+	}
+	defer lease.release()
+	resolved, _, err := b.resolve(name)
+	if err != nil {
+		return err
+	}
+	if err := lease.client.MkdirAll(resolved, perm); err != nil {
+		return fmt.Errorf("hdfs: mkdir %s: %w", name, err)
+	}
+	return nil
+}
+
+// Chown changes owner and group without exposing Hadoop authentication data.
+func (b *Backend) Chown(ctx context.Context, name, owner, group string) error {
+	if err := contextOrBackground(ctx).Err(); err != nil {
+		return err
+	}
+	lease, err := b.newOperation(ctx)
+	if err != nil {
+		return err
+	}
+	defer lease.release()
+	resolved, _, err := b.resolve(name)
+	if err != nil {
+		return err
+	}
+	client, ok := lease.client.(chownClient)
+	if !ok {
+		return fmt.Errorf("hdfs: chown %s: %w", name, storage.ErrReadOnly)
+	}
+	if err := client.Chown(resolved, owner, group); err != nil {
+		return fmt.Errorf("hdfs: chown %s: %w", name, err)
+	}
+	return nil
 }
 
 // Stat returns metadata for one path.

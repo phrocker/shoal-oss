@@ -15,6 +15,7 @@ import (
 	"unsafe"
 
 	"github.com/phrocker/shoal/accumulo"
+	publichdfs "github.com/phrocker/shoal/hdfs"
 )
 
 const defaultBootstrapTimeout = 30 * time.Second
@@ -273,6 +274,11 @@ func shoal_error_compatibility_name(err *C.shoal_error) *C.char {
 	return (*C.char)(unsafe.Pointer(C.shoal_bridge_error_compatibility_name(err)))
 }
 
+//export shoal_error_compatibility_code
+func shoal_error_compatibility_code(err *C.shoal_error) C.int16_t {
+	return C.shoal_bridge_error_compatibility_code(err)
+}
+
 //export shoal_error_free
 func shoal_error_free(err **C.shoal_error) {
 	if err == nil || *err == nil {
@@ -519,7 +525,7 @@ func bridgeErrorAlloc(code C.shoal_status, err error) *C.shoal_error {
 			hasVisibilityParse = true
 		}
 	}
-	source, compatibility := compatibilityClassesForStatus(int32(code))
+	source, compatibility := compatibilityClassesForError(int32(code), err)
 	if errors.Is(err, accumulo.ErrVisibilityParse) {
 		source = errorSourceVisibilityParseException
 		compatibility = errorCompatibilityClientException
@@ -528,6 +534,7 @@ func bridgeErrorAlloc(code C.shoal_status, err error) *C.shoal_error {
 		code,
 		C.shoal_error_source_class(source),
 		C.shoal_error_compatibility_class(compatibility),
+		C.int16_t(compatibilityCodeForError(err)),
 		cStringData(message),
 		C.size_t(len(message)),
 		cStringData(user),
@@ -549,39 +556,99 @@ const (
 	errorSourceIllegalStateException         int32 = 2
 	errorSourceIterationInterruptedException int32 = 3
 	errorSourceVisibilityParseException      int32 = 4
+	errorSourceHDFSException                 int32 = 5
+	errorSourceIllegalArgumentException      int32 = 6
 
 	errorCompatibilityRuntimeError    int32 = 0
 	errorCompatibilityClientException int32 = 1
 )
 
-func compatibilityClassesForStatus(status int32) (int32, int32) {
+func compatibilityClassesForError(status int32, err error) (int32, int32) {
+	var hdfsErr *publichdfs.Error
+	if errors.As(err, &hdfsErr) {
+		return errorSourceHDFSException, errorCompatibilityRuntimeError
+	}
+	if status == int32(C.SHOAL_STATUS_INVALID_ARGUMENT) {
+		return errorSourceIllegalArgumentException, errorCompatibilityRuntimeError
+	}
+	if errors.Is(err, accumulo.ErrVisibilityParse) {
+		return errorSourceVisibilityParseException, errorCompatibilityClientException
+	}
 	switch status {
 	case int32(C.SHOAL_STATUS_CLOSED):
 		return errorSourceIllegalStateException, errorCompatibilityRuntimeError
 	case int32(C.SHOAL_STATUS_CANCELLED):
 		return errorSourceIterationInterruptedException, errorCompatibilityRuntimeError
-	case int32(C.SHOAL_STATUS_UNSUPPORTED),
-		int32(C.SHOAL_STATUS_BOOTSTRAP_FAILED),
-		int32(C.SHOAL_STATUS_NOT_FOUND),
-		int32(C.SHOAL_STATUS_PERMISSION_DENIED),
-		int32(C.SHOAL_STATUS_DISCOVERY_UNAVAILABLE),
-		int32(C.SHOAL_STATUS_TABLET_UNAVAILABLE),
-		int32(C.SHOAL_STATUS_RANGE_SPANS_TABLETS),
-		int32(C.SHOAL_STATUS_CLEANUP_FAILED),
-		int32(C.SHOAL_STATUS_RETRY_EXHAUSTED),
-		int32(C.SHOAL_STATUS_MUTATION_REJECTED),
-		int32(C.SHOAL_STATUS_AMBIGUOUS_WRITE),
-		int32(C.SHOAL_STATUS_ALREADY_EXISTS),
-		int32(C.SHOAL_STATUS_UNAVAILABLE),
-		int32(C.SHOAL_STATUS_NAMESPACE_NOT_EMPTY),
-		int32(C.SHOAL_STATUS_TABLE_OFFLINE),
-		int32(C.SHOAL_STATUS_USER_NOT_FOUND),
-		int32(C.SHOAL_STATUS_BAD_CREDENTIALS),
-		int32(C.SHOAL_STATUS_SECURITY_UNAVAILABLE),
-		int32(C.SHOAL_STATUS_INCOMPLETE):
+	}
+	if isClientCompatibilityError(err) {
+		return errorSourceClientException, errorCompatibilityClientException
+	}
+	return errorSourceRuntime, errorCompatibilityRuntimeError
+}
+
+func isClientCompatibilityError(err error) bool {
+	return errors.Is(err, accumulo.ErrUnsupportedVersion) ||
+		errors.Is(err, accumulo.ErrDiscoveryUnavailable) ||
+		errors.Is(err, accumulo.ErrTableNotFound) ||
+		errors.Is(err, accumulo.ErrTableExists) ||
+		errors.Is(err, accumulo.ErrNamespaceNotFound) ||
+		errors.Is(err, accumulo.ErrNamespaceExists) ||
+		errors.Is(err, accumulo.ErrNamespaceNotEmpty) ||
+		errors.Is(err, accumulo.ErrPermissionDenied) ||
+		errors.Is(err, accumulo.ErrManagerUnavailable) ||
+		errors.Is(err, accumulo.ErrClientServiceUnavailable) ||
+		errors.Is(err, accumulo.ErrNoTabletCoversRow) ||
+		errors.Is(err, accumulo.ErrTabletNotLocated) ||
+		errors.Is(err, accumulo.ErrTableOffline) ||
+		errors.Is(err, accumulo.ErrTableSplitsIncomplete) ||
+		errors.Is(err, accumulo.ErrUserNotFound) ||
+		errors.Is(err, accumulo.ErrBadCredentials) ||
+		errors.Is(err, accumulo.ErrSecurityUnavailable) ||
+		errors.Is(err, accumulo.ErrBatchWriterRetryExhausted) ||
+		errors.Is(err, accumulo.ErrBatchWriterFailed)
+}
+
+func compatibilityClassesForStatus(status int32) (int32, int32) {
+	if status == int32(C.SHOAL_STATUS_INVALID_ARGUMENT) {
+		return errorSourceRuntime, errorCompatibilityRuntimeError
+	}
+	switch status {
+	case int32(C.SHOAL_STATUS_CLOSED):
+		return errorSourceIllegalStateException, errorCompatibilityRuntimeError
+	case int32(C.SHOAL_STATUS_CANCELLED):
+		return errorSourceIterationInterruptedException, errorCompatibilityRuntimeError
+	case int32(C.SHOAL_STATUS_NOT_FOUND):
 		return errorSourceClientException, errorCompatibilityClientException
 	default:
 		return errorSourceRuntime, errorCompatibilityRuntimeError
+	}
+}
+
+func compatibilityCodeForError(err error) int16 {
+	switch {
+	case errors.Is(err, accumulo.ErrBadCredentials):
+		return 5
+	case errors.Is(err, accumulo.ErrDiscoveryUnavailable):
+		return 4
+	case errors.Is(err, accumulo.ErrTabletNotLocated),
+		errors.Is(err, accumulo.ErrNoTabletCoversRow):
+		return 8
+	case errors.Is(err, accumulo.ErrTableNotFound):
+		return 9
+	case errors.Is(err, accumulo.ErrInvalidTableRange):
+		return 10
+	case errors.Is(err, accumulo.ErrNamespaceNotEmpty):
+		return 11
+	case errors.Is(err, accumulo.ErrInvalidTableName),
+		errors.Is(err, accumulo.ErrInvalidNamespaceName),
+		errors.Is(err, accumulo.ErrInvalidUser),
+		errors.Is(err, accumulo.ErrInvalidPassword),
+		errors.Is(err, accumulo.ErrInvalidAuthorizations),
+		errors.Is(err, accumulo.ErrInvalidPermission),
+		errors.Is(err, publichdfs.ErrInvalidArgument):
+		return 12
+	default:
+		return -1
 	}
 }
 

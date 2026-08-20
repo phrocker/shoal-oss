@@ -91,6 +91,7 @@ struct shoal_error {
   shoal_status code;
   shoal_error_source_class source;
   shoal_error_compatibility_class compatibility;
+  int16_t compatibility_code;
   char *message;
   char *security_user;
   char *security_code;
@@ -638,7 +639,8 @@ void shoal_bridge_bytes_list_free(shoal_bytes_list_result *result);
 
 shoal_error *shoal_bridge_error_alloc(
     shoal_status code, shoal_error_source_class source,
-    shoal_error_compatibility_class compatibility, const char *message,
+    shoal_error_compatibility_class compatibility, int16_t compatibility_code,
+    const char *message,
     size_t message_length,
     const char *security_user, size_t security_user_length,
     const char *security_code, size_t security_code_length,
@@ -654,9 +656,15 @@ const char *shoal_bridge_error_source_name(const shoal_error *error);
 shoal_error_compatibility_class
 shoal_bridge_error_compatibility(const shoal_error *error);
 const char *shoal_bridge_error_compatibility_name(const shoal_error *error);
+int16_t shoal_bridge_error_compatibility_code(const shoal_error *error);
 int shoal_bridge_error_visibility_parse(
     const shoal_error *error, shoal_visibility_parse_error_view *out_details);
 void shoal_bridge_error_free(shoal_error *error);
+void shoal_bridge_log_callback_invoke(shoal_log_callback callback,
+                                      shoal_log_level level,
+                                      const char *event_name,
+                                      const char *attributes_json,
+                                      void *context);
 
 void shoal_bridge_connector_config_init(shoal_connector_config *config);
 void shoal_bridge_client_config_init(shoal_client_config *config);

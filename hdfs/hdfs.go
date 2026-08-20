@@ -22,6 +22,20 @@ var (
 	ErrInvalidArgument = errors.New("hdfs: invalid argument")
 )
 
+// Error preserves the HDFS operation and path while supporting errors.Is/As.
+// It intentionally excludes namenode configuration and credentials.
+type Error struct {
+	Op   string
+	Path string
+	Err  error
+}
+
+func (e *Error) Error() string {
+	return fmt.Sprintf("hdfs: %s %s: %v", e.Op, e.Path, e.Err)
+}
+
+func (e *Error) Unwrap() error { return e.Err }
+
 // DirEntry is an owned metadata snapshot.
 type DirEntry struct {
 	Name    string
@@ -64,11 +78,17 @@ func newWithBackend(backend *internalhdfs.Backend) *Client {
 	return &Client{backend: backend}
 }
 
-func publicError(err error) error {
+func publicError(op, name string, err error) error {
+	if err == nil {
+		return nil
+	}
 	if errors.Is(err, internalhdfs.ErrClosed) {
 		return ErrClosed
 	}
-	return err
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return err
+	}
+	return &Error{Op: op, Path: name, Err: err}
 }
 
 // Authority returns the configured namenode authority.
@@ -97,7 +117,7 @@ func (c *Client) Open(ctx context.Context, name string) (*InputStream, error) {
 	}
 	file, err := backend.Open(ctx, name)
 	if err != nil {
-		return nil, publicError(err)
+		return nil, publicError("open", name, err)
 	}
 	return &InputStream{file: file}, nil
 }
@@ -110,7 +130,7 @@ func (c *Client) Create(ctx context.Context, name string) (*OutputStream, error)
 	}
 	writer, err := backend.Create(ctx, name)
 	if err != nil {
-		return nil, publicError(err)
+		return nil, publicError("create", name, err)
 	}
 	return &OutputStream{writer: writer}, nil
 }
@@ -123,7 +143,7 @@ func (c *Client) List(ctx context.Context, name string) ([]DirEntry, error) {
 	}
 	infos, err := backend.ReadDir(ctx, name)
 	if err != nil {
-		return nil, publicError(err)
+		return nil, publicError("list", name, err)
 	}
 	out := make([]DirEntry, 0, len(infos))
 	for _, info := range infos {
@@ -140,7 +160,7 @@ func (c *Client) Stat(ctx context.Context, name string) (DirEntry, error) {
 	}
 	info, err := backend.Stat(ctx, name)
 	if err != nil {
-		return DirEntry{}, publicError(err)
+		return DirEntry{}, publicError("stat", name, err)
 	}
 	return entryFromInfo(name, info), nil
 }
@@ -152,9 +172,9 @@ func (c *Client) Remove(ctx context.Context, name string, recursive bool) error 
 		return ErrClosed
 	}
 	if recursive {
-		return publicError(backend.RemoveAll(ctx, name))
+		return publicError("remove", name, backend.RemoveAll(ctx, name))
 	}
-	return publicError(backend.Remove(ctx, name))
+	return publicError("remove", name, backend.Remove(ctx, name))
 }
 
 // Rename atomically moves oldName to newName in the same HDFS namespace.
@@ -166,7 +186,32 @@ func (c *Client) Rename(ctx context.Context, oldName, newName string) error {
 	if oldName == "" || newName == "" {
 		return fmt.Errorf("%w: both paths are required", ErrInvalidArgument)
 	}
-	return publicError(backend.Rename(ctx, oldName, newName))
+	return publicError("rename", oldName, backend.Rename(ctx, oldName, newName))
+}
+
+// Mkdir creates name and missing parents with standard HDFS directory mode.
+func (c *Client) Mkdir(ctx context.Context, name string) error {
+	backend := c.backendSnapshot()
+	if backend == nil {
+		return ErrClosed
+	}
+	if name == "" {
+		return fmt.Errorf("%w: path is required", ErrInvalidArgument)
+	}
+	return publicError("mkdir", name, backend.Mkdir(ctx, name, 0o755))
+}
+
+// Chown changes the HDFS owner and group. Empty owner or group leaves that
+// attribute unchanged, matching libhdfs.
+func (c *Client) Chown(ctx context.Context, name, owner, group string) error {
+	backend := c.backendSnapshot()
+	if backend == nil {
+		return ErrClosed
+	}
+	if name == "" || (owner == "" && group == "") {
+		return fmt.Errorf("%w: path and owner or group are required", ErrInvalidArgument)
+	}
+	return publicError("chown", name, backend.Chown(ctx, name, owner, group))
 }
 
 // Close cancels active operations, closes streams, and releases the client.
