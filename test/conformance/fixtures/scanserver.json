@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "role": "scanserver",
+  "accumulo_version": "4.0.0-SNAPSHOT",
+  "accumulo_revision": "1a716b2c1bb5762ead4b46d2bc4f53e13873b314",
+  "summary": "scan continuation preserves byte boundaries and multi-tablet failure retry state",
+  "evidence": [
+    {
+      "kind": "go-test",
+      "reference": "internal/scanserver/session_test.go#TestStartScan_ContinuationAtExactByteBoundary",
+      "replay_command": ["go", "test", "./internal/scanserver", "-run", "^TestStartScan_ContinuationAtExactByteBoundary$", "-count=1"]
+    },
+    {
+      "kind": "go-test",
+      "reference": "internal/scanserver/multiscan_session_test.go#TestStartMultiScan_MultiTabletContinuationAndFailureRetry",
+      "replay_command": ["go", "test", "./internal/scanserver", "-run", "^TestStartMultiScan_MultiTabletContinuationAndFailureRetry$", "-count=1"]
+    }
+  ]
+}
