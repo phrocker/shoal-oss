@@ -132,12 +132,16 @@ const (
 	// the process (and take every other compaction on it down).
 	ClassResourceLimitExceeded = "org.apache.accumulo.shoal.ResourceLimitExceeded"
 
-	// ClassCommitUnavailable: the job translated cleanly and shoal could
-	// execute it, but the manager-authoritative commit RPC this pool
-	// requires does not exist yet, so the compaction is handed back
-	// rather than executed and thrown away. Reported by the caller after
-	// a successful Translate — see cmd/shoal-compactor.
-	ClassCommitUnavailable = "org.apache.accumulo.shoal.CommitNotImplemented"
+	// ClassExecutionUnavailable: the job translated cleanly, but the
+	// polling worker has not yet been wired to the isolated executor and
+	// a configured storage backend. Accumulo's existing
+	// compactionCompleted RPC is sufficient for the manager-authoritative
+	// commit; this refusal is an integration gate, not a protocol gap.
+	ClassExecutionUnavailable = "org.apache.accumulo.shoal.ExecutorNotWired"
+
+	// ClassCommitUnavailable is retained as a source-compatible alias for
+	// callers built against the previous slice.
+	ClassCommitUnavailable = ClassExecutionUnavailable
 
 	// ClassShuttingDown: the compactor was asked to stop while it held
 	// this assignment. Reported so the coordinator can reschedule
