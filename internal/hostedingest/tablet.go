@@ -332,6 +332,44 @@ func (t *Tablet) Authority() ingestrouter.CommitAuthority {
 func (t *Tablet) Commit(ctx context.Context, request ingestrouter.CommitRequest) error {
 	t.opMu.Lock()
 	defer t.opMu.Unlock()
+	return t.commitLocked(ctx, request)
+}
+
+func (t *Tablet) ConditionalCommit(
+	ctx context.Context,
+	request ingestrouter.CommitRequest,
+	evaluate ingestrouter.ConditionalEvaluator,
+) (bool, error) {
+	t.opMu.Lock()
+	defer t.opMu.Unlock()
+	if err := t.resumePending(ctx); err != nil {
+		return false, err
+	}
+	t.mu.Lock()
+	active := make([]ingestrouter.Cell, len(t.active))
+	for i, cell := range t.active {
+		active[i] = ingestrouter.Cell{
+			Row:              append([]byte(nil), cell.Key.Row...),
+			ColumnFamily:     append([]byte(nil), cell.Key.ColumnFamily...),
+			ColumnQualifier:  append([]byte(nil), cell.Key.ColumnQualifier...),
+			ColumnVisibility: append([]byte(nil), cell.Key.ColumnVisibility...),
+			Timestamp:        cell.Key.Timestamp,
+			Value:            append([]byte(nil), cell.Value...),
+			Deleted:          cell.Key.Deleted,
+		}
+	}
+	t.mu.Unlock()
+	accepted, err := evaluate(ctx, active)
+	if err != nil || !accepted {
+		return accepted, err
+	}
+	if err := t.commitLocked(ctx, request); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (t *Tablet) commitLocked(ctx context.Context, request ingestrouter.CommitRequest) error {
 	if err := t.resumePending(ctx); err != nil {
 		return err
 	}

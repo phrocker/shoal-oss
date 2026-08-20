@@ -32,6 +32,58 @@ func New(directory Directory, limits Limits) (*Router, error) {
 	return &Router{directory: directory, limits: limits}, nil
 }
 
+// ConditionalCommit routes one conditional mutation to an exact hosted
+// tablet. The tablet owns the atomic evaluate-and-commit boundary.
+func (r *Router) ConditionalCommit(
+	ctx context.Context,
+	sessionID string,
+	requestID string,
+	batch Batch,
+	evaluate ConditionalEvaluator,
+) (bool, error) {
+	if evaluate == nil {
+		return false, errors.New("ingestrouter: nil conditional evaluator")
+	}
+	validated, err := validateRequest(batch.Extent.TableID, r.limits, Request{
+		ID: requestID, Batches: []Batch{batch},
+	})
+	if err != nil {
+		return false, err
+	}
+	batch = validated.request.Batches[0]
+	tablet, err := r.directory.Lookup(ctx, batch.Extent)
+	if err != nil {
+		return false, err
+	}
+	if tablet == nil {
+		return false, ErrNotHosted
+	}
+	if !tablet.Extent().Equal(batch.Extent) {
+		return false, &RouteError{
+			Cause: ErrStaleExtent, RetryExtents: []Extent{tablet.Extent().clone()},
+		}
+	}
+	fence := tablet.Fence()
+	if !fence.Valid() {
+		return false, ErrStaleFence
+	}
+	if tablet.Authority() != AuthorityAccumuloWAL {
+		return false, ErrWALAuthorityUnsupported
+	}
+	conditional, ok := tablet.(ConditionalTablet)
+	if !ok {
+		return false, ErrWALAuthorityUnsupported
+	}
+	return conditional.ConditionalCommit(ctx, CommitRequest{
+		OperationID: operationID(sessionID, requestID, batch.Extent.Key()),
+		SessionID:   sessionID,
+		RequestID:   requestID,
+		Extent:      batch.Extent.clone(),
+		Fence:       fence,
+		Mutations:   cloneMutations(batch.Mutations),
+	}, evaluate)
+}
+
 // Open starts a session scoped to exactly one table.
 func (r *Router) Open(sessionID, tableID string) (*Session, error) {
 	if sessionID == "" || len(sessionID) > r.limits.MaxRequestIDBytes {

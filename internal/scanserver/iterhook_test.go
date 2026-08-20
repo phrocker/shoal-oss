@@ -207,6 +207,40 @@ func TestWholeRowProcessorUsesAccumuloEncoding(t *testing.T) {
 	}
 }
 
+func TestWholeRowProcessorEnforcesMaxBufferSize(t *testing.T) {
+	processor, err := buildPostProcessor(
+		[]*data.IterInfo{{
+			Priority: 10, ClassName: wholeRowIteratorClassName, IterName: "whole",
+		}},
+		map[string]map[string]string{"whole": {"maxBufferSize": "128B"}},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	processor.offer(&wire.Key{
+		Row: []byte("row"), ColumnFamily: []byte("cf"), ColumnQualifier: []byte("cq"),
+	}, []byte("value"))
+	if processor.err() == nil {
+		t.Fatal("expected row buffer overflow")
+	}
+}
+
+func TestWholeRowProcessorParsesAccumuloMemory(t *testing.T) {
+	for input, want := range map[string]int64{
+		"1": 1, "2B": 2, "3k": 3 << 10, "4M": 4 << 20, "5g": 5 << 30,
+	} {
+		got, err := parseAccumuloMemory(input)
+		if err != nil || got != want {
+			t.Fatalf("parseAccumuloMemory(%q) = %d, %v; want %d", input, got, err, want)
+		}
+	}
+	for _, input := range []string{"", "-1", " 1K", "9223372036854775807G"} {
+		if _, err := parseAccumuloMemory(input); err == nil {
+			t.Fatalf("parseAccumuloMemory(%q) unexpectedly succeeded", input)
+		}
+	}
+}
+
 // mustPQ wraps a codebook into a VectorPQ via the package's exported
 // FromBytes round-trip so tests don't depend on private fields. (It
 // also confirms the WriteTo/FromBytes pair is internally consistent

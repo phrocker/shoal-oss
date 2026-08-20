@@ -95,6 +95,18 @@ import (
 // shared registry so compactor admission and table configuration cannot drift.
 var ClassAllowlist = classAllowlist()
 
+// accumulo40TableDefaults pins the table properties consumed by Shoal to the
+// defaults in Apache Accumulo revision 1a716b2c. ZooKeeper stores overrides,
+// not a complete effective configuration.
+var accumulo40TableDefaults = map[string]string{
+	"table.file.type":               "rf",
+	"table.file.compress.type":      "gz",
+	"table.file.compress.blocksize": "100k",
+	"table.bloom.enabled":           "false",
+	"table.groups.enabled":          "",
+	"table.sampler":                 "",
+}
+
 func classAllowlist() map[string]string {
 	out := map[string]string{}
 	for _, capability := range iterrt.RegistrySnapshot().Iterators {
@@ -261,7 +273,10 @@ func (r *Resolver) EffectiveProperties(ctx context.Context, tableID string) (map
 	if r == nil || r.locator == nil || tableID == "" {
 		return nil, errors.New("itercfg: invalid effective-configuration dependency")
 	}
-	merged := map[string]string{}
+	merged := make(map[string]string, len(accumulo40TableDefaults))
+	for key, value := range accumulo40TableDefaults {
+		merged[key] = value
+	}
 	systemPath := path.Join(r.locator.InstancePath(), "config")
 	if err := r.mergePropsFrom(ctx, systemPath, "", merged); err != nil {
 		return nil, fmt.Errorf("itercfg: read system configuration: %w", err)

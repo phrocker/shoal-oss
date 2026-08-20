@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"math"
 	"sort"
 	"time"
 
@@ -254,8 +255,8 @@ func cloneRanges(ranges []*data.TRange) []*data.TRange {
 // extent is a fully-resolved
 // TKeyExtent (table + endRow + prevEndRow) so downstream lookupFiles
 // finds it directly. The original range is applied to each tablet's disjoint
-// files, which correctly handles unbounded and cross-tablet ranges without
-// synthesizing key-level clipping boundaries.
+// files. Ranges are clipped to each tablet's (PrevRow, EndRow] extent because
+// split tablets may still reference the same immutable RFile.
 func (s *Server) binRangesByTablet(ctx context.Context, extent *data.TKeyExtent, ranges []*data.TRange) (data.ScanBatch, error) {
 	tableID := string(extent.Table)
 	tablets, err := s.locator.LocateTable(ctx, tableID)
@@ -274,12 +275,58 @@ func (s *Server) binRangesByTablet(ctx context.Context, extent *data.TKeyExtent,
 			PrevEndRow: tablet.PrevRow,
 		}
 		for _, r := range ranges {
-			if r != nil {
-				out = appendToScanBatch(out, resolved, r)
+			if clipped := clipRangeToExtent(r, resolved); clipped != nil {
+				out = appendToScanBatch(out, resolved, clipped)
 			}
 		}
 	}
 	return out, nil
+}
+
+func clipRangeToExtent(r *data.TRange, extent *data.TKeyExtent) *data.TRange {
+	if r == nil || extent == nil {
+		return nil
+	}
+	clipped := cloneTRange(r)
+	if extent.PrevEndRow != nil {
+		tabletStart := &data.TKey{
+			Row:       append(append([]byte(nil), extent.PrevEndRow...), 0),
+			Timestamp: math.MaxInt64,
+		}
+		start, inclusive, bounded := lowerBound(clipped)
+		if !bounded || start.Compare(tkeyToWireKey(tabletStart)) < 0 {
+			clipped.Start = tabletStart
+			clipped.StartKeyInclusive = true
+			clipped.InfiniteStartKey = false
+		} else {
+			clipped.StartKeyInclusive = inclusive
+		}
+	}
+	if extent.EndRow != nil {
+		tabletStop := &data.TKey{
+			Row:       append(append([]byte(nil), extent.EndRow...), 0),
+			Timestamp: math.MaxInt64,
+		}
+		stop, inclusive, bounded := upperBound(clipped)
+		if !bounded || stop.Compare(tkeyToWireKey(tabletStop)) > 0 {
+			clipped.Stop = tabletStop
+			clipped.StopKeyInclusive = false
+			clipped.InfiniteStopKey = false
+		} else {
+			clipped.StopKeyInclusive = inclusive
+		}
+	}
+	start, startInclusive, hasStart := lowerBound(clipped)
+	stop, stopInclusive, hasStop := upperBound(clipped)
+	if hasStart && hasStop {
+		switch comparison := start.Compare(stop); {
+		case comparison > 0:
+			return nil
+		case comparison == 0 && !(startInclusive && stopInclusive):
+			return nil
+		}
+	}
+	return clipped
 }
 
 // appendToScanBatch ensures we group ranges under one extent value

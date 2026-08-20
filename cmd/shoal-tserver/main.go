@@ -194,6 +194,7 @@ func main() {
 	}
 	authenticator := tserverprocess.ExactAuthenticator{
 		Identities: []*security.TCredentials{outbound, systemCredentials},
+		Writers:    []*security.TCredentials{systemCredentials},
 	}
 	scans, err := scanserver.NewServer(scanserver.Options{
 		Locator: store, Storage: files, BlockCache: cache.NewBlockCache(256 << 20), Logger: logger,
@@ -208,6 +209,14 @@ func main() {
 	}
 	ingest, err := ingestservice.New(ingestservice.Config{
 		Router: router, Authenticator: authenticator,
+		ConditionalReader: scans,
+		TserverLock: func() string {
+			lock, ok := host.Lock()
+			if !ok {
+				return ""
+			}
+			return lock.String()
+		},
 	})
 	if err != nil {
 		die("ingest service: %v", err)

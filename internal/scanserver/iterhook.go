@@ -3,9 +3,12 @@ package scanserver
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"math"
 	"sort"
+	"strconv"
+	"strings"
 
 	"github.com/phrocker/shoal/internal/ivfpq"
 	"github.com/phrocker/shoal/internal/rfile/wire"
@@ -28,6 +31,7 @@ type cellPostProcessor interface {
 	// in the order they should be wire-shipped. Calling this also
 	// resets the iterator's internal state.
 	drain() []*data.TKeyValue
+	err() error
 }
 
 // buildPostProcessor inspects the request's iterator settings and
@@ -76,7 +80,18 @@ func buildPostProcessor(ssiList []*data.IterInfo, ssio map[string]map[string]str
 			if picked != nil {
 				return nil, fmt.Errorf("scanserver: multiple shoal-recognized iterators not supported in V1")
 			}
-			picked = &wholeRowProcessor{}
+			maxBufferSize := int64(math.MaxInt64)
+			if raw := ssio[info.IterName]["maxBufferSize"]; raw != "" {
+				parsed, err := parseAccumuloMemory(raw)
+				if err != nil {
+					return nil, fmt.Errorf(
+						"scanserver: build whole-row iterator (%s): invalid maxBufferSize %q: %w",
+						info.IterName, raw, err,
+					)
+				}
+				maxBufferSize = parsed
+			}
+			picked = &wholeRowProcessor{maxBufferSize: maxBufferSize}
 		default:
 			// Unknown iterator. Java would error if a class wasn't on
 			// the classpath; shoal mirrors this rather than silently
@@ -131,23 +146,44 @@ func (p *ivfpqProcessor) drain() []*data.TKeyValue {
 	return out
 }
 
+func (p *ivfpqProcessor) err() error { return nil }
+
 type wholeRowCell struct {
 	key   wire.Key
 	value []byte
 }
 
 type wholeRowProcessor struct {
-	currentRow []byte
-	current    []wholeRowCell
-	results    []*data.TKeyValue
+	currentRow    []byte
+	current       []wholeRowCell
+	bufferSize    int64
+	maxBufferSize int64
+	results       []*data.TKeyValue
+	overflow      error
 }
 
 func (p *wholeRowProcessor) offer(k *wire.Key, value []byte) {
+	if p.overflow != nil {
+		return
+	}
 	if p.currentRow != nil && !bytes.Equal(p.currentRow, k.Row) {
 		p.flush()
 	}
 	if p.currentRow == nil {
 		p.currentRow = cloneBytes(k.Row)
+	}
+	p.bufferSize += int64(len(k.Row) + len(k.ColumnFamily) + len(k.ColumnQualifier) +
+		len(k.ColumnVisibility) + len(value) + 9 + 128)
+	limit := p.maxBufferSize
+	if limit == 0 {
+		limit = math.MaxInt64
+	}
+	if p.bufferSize > limit {
+		p.overflow = fmt.Errorf(
+			"scanserver: WholeRowIterator exceeded maxBufferSize %d for row %q",
+			limit, k.Row,
+		)
+		return
 	}
 	p.current = append(p.current, wholeRowCell{
 		key:   *k.Clone(),
@@ -156,11 +192,16 @@ func (p *wholeRowProcessor) offer(k *wire.Key, value []byte) {
 }
 
 func (p *wholeRowProcessor) drain() []*data.TKeyValue {
+	if p.overflow != nil {
+		return nil
+	}
 	p.flush()
 	results := p.results
 	p.results = nil
 	return results
 }
+
+func (p *wholeRowProcessor) err() error { return p.overflow }
 
 func (p *wholeRowProcessor) flush() {
 	if len(p.current) == 0 {
@@ -184,6 +225,7 @@ func (p *wholeRowProcessor) flush() {
 	})
 	p.currentRow = nil
 	p.current = nil
+	p.bufferSize = 0
 }
 
 func writeWholeRowField(out *bytes.Buffer, value []byte) {
@@ -198,4 +240,33 @@ func cloneBytes(b []byte) []byte {
 	out := make([]byte, len(b))
 	copy(out, b)
 	return out
+}
+
+func parseAccumuloMemory(raw string) (int64, error) {
+	if raw == "" {
+		return 0, errors.New("empty memory value")
+	}
+	multiplier := int64(1)
+	number := raw
+	switch strings.ToUpper(raw[len(raw)-1:]) {
+	case "B":
+		number = raw[:len(raw)-1]
+	case "K":
+		number = raw[:len(raw)-1]
+		multiplier = 1 << 10
+	case "M":
+		number = raw[:len(raw)-1]
+		multiplier = 1 << 20
+	case "G":
+		number = raw[:len(raw)-1]
+		multiplier = 1 << 30
+	}
+	value, err := strconv.ParseInt(number, 10, 64)
+	if err != nil || value < 0 {
+		return 0, fmt.Errorf("invalid memory value")
+	}
+	if value > math.MaxInt64/multiplier {
+		return 0, fmt.Errorf("memory value overflows int64")
+	}
+	return value * multiplier, nil
 }

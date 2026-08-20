@@ -31,6 +31,7 @@ const tablePermissionWrite int8 = 2
 // user.
 type ExactAuthenticator struct {
 	Identities []*security.TCredentials
+	Writers    []*security.TCredentials
 }
 
 func (a ExactAuthenticator) Authenticate(
@@ -50,7 +51,15 @@ func (a ExactAuthenticator) AuthorizeWrite(
 	candidate *security.TCredentials,
 	_ string,
 ) error {
-	return a.Authenticate(ctx, candidate)
+	for _, trusted := range a.Writers {
+		if credentialsEqual(candidate, trusted) {
+			return nil
+		}
+	}
+	if err := a.Authenticate(ctx, candidate); err != nil {
+		return err
+	}
+	return errors.New("tserverprocess: credentials are not authorized to write")
 }
 
 func (a ExactAuthenticator) Validate(

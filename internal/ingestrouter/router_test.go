@@ -46,6 +46,7 @@ type fakeTablet struct {
 	fence     Fence
 	authority CommitAuthority
 	commit    func(context.Context, CommitRequest) error
+	active    []Cell
 	calls     atomic.Int64
 }
 
@@ -58,6 +59,18 @@ func (t *fakeTablet) Commit(ctx context.Context, request CommitRequest) error {
 		return t.commit(ctx, request)
 	}
 	return nil
+}
+
+func (t *fakeTablet) ConditionalCommit(
+	ctx context.Context,
+	request CommitRequest,
+	evaluate ConditionalEvaluator,
+) (bool, error) {
+	accepted, err := evaluate(ctx, t.active)
+	if err != nil || !accepted {
+		return accepted, err
+	}
+	return true, t.Commit(ctx, request)
 }
 
 func testFence() Fence {
@@ -186,6 +199,30 @@ func TestUnsupportedAuthorityIsExplicit(t *testing.T) {
 	}
 	if tablet.calls.Load() != 0 {
 		t.Fatalf("unsupported tablet Commit called %d times", tablet.calls.Load())
+	}
+}
+
+func TestConditionalCommitEvaluatesBeforeCommit(t *testing.T) {
+	extent := Extent{TableID: "5"}
+	tablet := &fakeTablet{
+		extent: extent, fence: testFence(), authority: AuthorityAccumuloWAL,
+		active: []Cell{{Row: []byte("r"), Value: []byte("current")}},
+	}
+	router, err := New(&fakeDirectory{
+		tablets: map[string]HostedTablet{extent.Key(): tablet},
+	}, DefaultLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	accepted, err := router.ConditionalCommit(
+		context.Background(), "session", "request",
+		testBatch(extent, "r"),
+		func(_ context.Context, active []Cell) (bool, error) {
+			return string(active[0].Value) == "current", nil
+		},
+	)
+	if err != nil || !accepted || tablet.calls.Load() != 1 {
+		t.Fatalf("accepted=%t calls=%d err=%v", accepted, tablet.calls.Load(), err)
 	}
 }
 

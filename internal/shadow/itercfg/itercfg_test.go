@@ -71,6 +71,28 @@ func TestEffectivePropertiesMergesConfigurationHierarchy(t *testing.T) {
 	if got["general.custom.system"] != "system" || got["table.file.max"] != "15" {
 		t.Fatalf("EffectiveProperties = %#v", got)
 	}
+	if got["table.file.type"] != "rf" || got["table.file.compress.type"] != "gz" {
+		t.Fatalf("EffectiveProperties omitted pinned defaults: %#v", got)
+	}
+}
+
+func TestEffectivePropertiesOverridesPinnedDefaults(t *testing.T) {
+	locator := rawConfigLocator{
+		instancePath: "/accumulo/iid",
+		data: map[string][]byte{
+			"/accumulo/iid/config": buildSyntheticPropBlob(t, map[string]string{
+				"table.file.compress.type": "zstd",
+			}, false),
+			"/accumulo/iid/tables/5/namespace": []byte("+default"),
+		},
+	}
+	got, err := NewResolver(locator, 0, nil).EffectiveProperties(context.Background(), "5")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got["table.file.compress.type"] != "zstd" {
+		t.Fatalf("compression type = %q, want zstd", got["table.file.compress.type"])
+	}
 }
 
 func TestEffectivePropertiesAllowsMissingOptionalConfigurationNodes(t *testing.T) {

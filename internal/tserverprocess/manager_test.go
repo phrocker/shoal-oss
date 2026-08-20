@@ -16,17 +16,23 @@ func TestExactAuthenticatorAcceptsOnlyConfiguredCredentials(t *testing.T) {
 		Principal: "!SYSTEM", TokenClassName: "SystemToken",
 		Token: []byte{4, 5, 6}, InstanceId: "iid",
 	}
-	authenticator := ExactAuthenticator{Identities: []*security.TCredentials{root, system}}
+	authenticator := ExactAuthenticator{
+		Identities: []*security.TCredentials{root, system},
+		Writers:    []*security.TCredentials{system},
+	}
 	for _, credentials := range []*security.TCredentials{root, system} {
 		if err := authenticator.Authenticate(context.Background(), credentials); err != nil {
-			t.Fatal(err)
-		}
-		if err := authenticator.AuthorizeWrite(context.Background(), credentials, "5"); err != nil {
 			t.Fatal(err)
 		}
 		if err := authenticator.Validate(context.Background(), credentials, nil, []string{"5"}); err != nil {
 			t.Fatal(err)
 		}
+	}
+	if err := authenticator.AuthorizeWrite(context.Background(), system, "5"); err != nil {
+		t.Fatal(err)
+	}
+	if err := authenticator.AuthorizeWrite(context.Background(), root, "5"); err == nil {
+		t.Fatal("read-only bootstrap identity was authorized to write")
 	}
 	invalid := *root
 	invalid.Token = []byte{1, 2, 4}

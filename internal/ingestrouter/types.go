@@ -157,6 +157,28 @@ type HostedTablet interface {
 	Commit(context.Context, CommitRequest) error
 }
 
+// Cell is one tablet cell visible to conditional mutation evaluation.
+type Cell struct {
+	Row              []byte
+	ColumnFamily     []byte
+	ColumnQualifier  []byte
+	ColumnVisibility []byte
+	Timestamp        int64
+	Value            []byte
+	Deleted          bool
+}
+
+// ConditionalEvaluator reads immutable tablet state and evaluates conditions
+// after overlaying the supplied active, unflushed cells.
+type ConditionalEvaluator func(context.Context, []Cell) (bool, error)
+
+// ConditionalTablet serializes condition evaluation and its accepted commit
+// with all other tablet operations.
+type ConditionalTablet interface {
+	HostedTablet
+	ConditionalCommit(context.Context, CommitRequest, ConditionalEvaluator) (bool, error)
+}
+
 // Directory resolves only currently hosted tablets.
 type Directory interface {
 	Lookup(context.Context, Extent) (HostedTablet, error)

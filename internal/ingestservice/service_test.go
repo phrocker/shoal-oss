@@ -62,6 +62,34 @@ type fakeTablet struct {
 	fence   ingestrouter.Fence
 	commits []ingestrouter.CommitRequest
 	err     error
+	active  []ingestrouter.Cell
+}
+
+func (t *fakeTablet) ConditionalCommit(
+	ctx context.Context,
+	request ingestrouter.CommitRequest,
+	evaluate ingestrouter.ConditionalEvaluator,
+) (bool, error) {
+	accepted, err := evaluate(ctx, t.active)
+	if err != nil || !accepted {
+		return accepted, err
+	}
+	return true, t.Commit(ctx, request)
+}
+
+type fakeConditionalReader struct {
+	cells []ingestrouter.Cell
+	err   error
+}
+
+func (r fakeConditionalReader) ReadConditionalRow(
+	context.Context,
+	*security.TCredentials,
+	ingestrouter.Extent,
+	[]byte,
+	[][]byte,
+) ([]ingestrouter.Cell, error) {
+	return append([]ingestrouter.Cell(nil), r.cells...), r.err
 }
 
 func (t *fakeTablet) Extent() ingestrouter.Extent { return t.extent }
@@ -236,6 +264,76 @@ func TestUnsupportedModesAndConditionalFailExplicitly(t *testing.T) {
 	var noSession *tabletserver.NoSuchScanIDException
 	if !errors.As(err, &noSession) {
 		t.Fatalf("conditional update error = %v", err)
+	}
+}
+
+func TestConditionalUpdateAcceptsRejectsAndCachesResults(t *testing.T) {
+	extent := ingestrouter.Extent{TableID: "1", EndRow: []byte("z")}
+	tablet := &fakeTablet{
+		extent: extent,
+		fence:  ingestrouter.Fence{ServerGeneration: "s", ManagerGeneration: "m", Assignment: 1},
+	}
+	service := newTestService(t, func(cfg *Config) {
+		cfg.ConditionalReader = fakeConditionalReader{cells: []ingestrouter.Cell{{
+			Row: []byte("a"), ColumnFamily: []byte("cf"), ColumnQualifier: []byte("cq"),
+			Value: []byte("old"), Timestamp: 7,
+		}}}
+		cfg.TserverLock = func() string { return "lock" }
+	}, &fakeDirectory{
+		tablets: map[string]*fakeTablet{extent.Key(): tablet}, errs: map[string]error{},
+	})
+	session, err := service.StartConditionalUpdate(
+		context.Background(), nil, testCredentials(), nil, "1",
+		tabletingest.TDurability_SYNC, "",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	accepted := &data.TConditionalMutation{
+		ID: 11, Mutation: testMutation(t, "a"),
+		Conditions: []*data.TCondition{{
+			Cf: []byte("cf"), Cq: []byte("cq"), Val: []byte("old"),
+		}},
+	}
+	rejected := &data.TConditionalMutation{
+		ID: 12, Mutation: testMutation(t, "a"),
+		Conditions: []*data.TCondition{{
+			Cf: []byte("cf"), Cq: []byte("cq"), Val: []byte("wrong"),
+		}},
+	}
+	batch := data.CMBatch{testExtent("1", "z"): {accepted, rejected}}
+	results, err := service.ConditionalUpdate(
+		context.Background(), nil, data.UpdateID(session.SessionId), batch, nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 2 || results[0].Status != data.TCMStatus_ACCEPTED ||
+		results[1].Status != data.TCMStatus_REJECTED {
+		t.Fatalf("results = %#v", results)
+	}
+	results, err = service.ConditionalUpdate(
+		context.Background(), nil, data.UpdateID(session.SessionId),
+		data.CMBatch{testExtent("1", "z"): {accepted}}, nil,
+	)
+	if err != nil || len(results) != 1 || results[0].Status != data.TCMStatus_ACCEPTED {
+		t.Fatalf("cached result = %#v, %v", results, err)
+	}
+	tablet.mu.Lock()
+	defer tablet.mu.Unlock()
+	if len(tablet.commits) != 1 {
+		t.Fatalf("commits = %d, want 1", len(tablet.commits))
+	}
+}
+
+func TestConditionsMatchActiveTombstone(t *testing.T) {
+	condition := &data.TCondition{Cf: []byte("cf"), Cq: []byte("cq"), Val: nil}
+	cells := []ingestrouter.Cell{
+		{Row: []byte("r"), ColumnFamily: []byte("cf"), ColumnQualifier: []byte("cq"), Timestamp: 1, Value: []byte("v")},
+		{Row: []byte("r"), ColumnFamily: []byte("cf"), ColumnQualifier: []byte("cq"), Timestamp: 2, Deleted: true},
+	}
+	if !conditionsMatch([]byte("r"), []*data.TCondition{condition}, cells) {
+		t.Fatal("latest tombstone did not satisfy absent-value condition")
 	}
 }
 

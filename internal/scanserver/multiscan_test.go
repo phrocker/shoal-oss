@@ -56,8 +56,8 @@ func TestStartMultiScan_SingleTabletMultipleRanges(t *testing.T) {
 	cells := []cellSpec{}
 	for i := 0; i < 30; i++ {
 		cells = append(cells, cellSpec{
-			row:   fmt.Sprintf("row%02d", i),
-			cf:    "cf", cq: "cq",
+			row: fmt.Sprintf("row%02d", i),
+			cf:  "cf", cq: "cq",
 			value: fmt.Sprintf("v%02d", i),
 			ts:    int64(i + 1),
 		})
@@ -375,6 +375,24 @@ func TestNormalizeRanges_KeepsDisjoint(t *testing.T) {
 	want := []string{"row10", "row30", "row50"}
 	if !equalStrings(starts, want) {
 		t.Errorf("starts = %v, want %v", starts, want)
+	}
+}
+
+func TestClipRangeToExtentUsesExclusivePreviousAndInclusiveEndRows(t *testing.T) {
+	clipped := clipRangeToExtent(
+		&data.TRange{InfiniteStartKey: true, InfiniteStopKey: true},
+		&data.TKeyExtent{Table: []byte("1"), PrevEndRow: []byte("m"), EndRow: []byte("t")},
+	)
+	if clipped == nil || string(clipped.Start.Row) != "m\x00" ||
+		!clipped.StartKeyInclusive || string(clipped.Stop.Row) != "t\x00" ||
+		clipped.StopKeyInclusive {
+		t.Fatalf("clipped range = %#v", clipped)
+	}
+	if got := clipRangeToExtent(
+		exactRow("a"),
+		&data.TKeyExtent{Table: []byte("1"), PrevEndRow: []byte("m"), EndRow: []byte("t")},
+	); got != nil {
+		t.Fatalf("non-overlapping range = %#v, want nil", got)
 	}
 }
 
