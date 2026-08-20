@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "role": "tserver",
+  "accumulo_version": "4.0.0-SNAPSHOT",
+  "accumulo_revision": "1a716b2c1bb5762ead4b46d2bc4f53e13873b314",
+  "summary": "tablet hosting rejects stale authority and drops hosted tablets on lock loss",
+  "evidence": [
+    {
+      "kind": "go-test",
+      "reference": "internal/tserver/hosting_test.go#TestLockLossDropsEverything",
+      "replay_command": ["go", "test", "./internal/tserver", "-run", "^TestLockLossDropsEverything$", "-count=1"]
+    },
+    {
+      "kind": "go-test",
+      "reference": "internal/tserver/hosting_test.go#TestSupersededManagerCannotCountermandTheLiveOne",
+      "replay_command": ["go", "test", "./internal/tserver", "-run", "^TestSupersededManagerCannotCountermandTheLiveOne$", "-count=1"]
+    }
+  ]
+}

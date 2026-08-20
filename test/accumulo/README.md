@@ -22,6 +22,8 @@ make accumulo-up           # clean old state, build, start, and wait
 make accumulo-smoke        # run the Java client smoke against a running cluster
 make accumulo-down         # remove containers, orphans, and named volumes
 make test-accumulo         # full lifecycle with guaranteed cleanup
+make conformance-replay    # deterministic per-gate JSON from replay fixtures
+make conformance-live      # live JSON; invokes this Docker harness for client
 ```
 
 `make test-accumulo` first removes stale project resources, starts the exact
@@ -52,6 +54,46 @@ SKIP (needs-docker): ...; live Accumulo 4 test was not run
 
 and exits with status 2. This is an explicit unexecuted live test, not a
 passing result.
+
+## Machine-readable replacement verdicts
+
+`cmd/shoal-conformance` emits schema-versioned JSON for the `tserver`,
+`scanserver`, `compactor`, `promotion`, and `client` gates. Output order is
+stable and includes the Shoal commit, exact Accumulo version and revision,
+GOOS/GOARCH, execution mode, every evidence selector and replay command, the
+checked-in fixture path, and its SHA-256 digest.
+
+Replay mode executes the commands in
+`test/conformance/fixtures/<gate>.json`. Those fixtures bind each verdict to
+named tests instead of treating a package-wide success as evidence. Run:
+
+```bash
+go build -o bin/shoal-conformance ./cmd/shoal-conformance
+bin/shoal-conformance -mode replay -output verdict.json
+```
+
+Live mode reuses `python test/accumulo/harness.py test` for the client gate.
+The current Docker harness does not yet install Shoal processes as live
+tserver, scanserver, or compactor replacements, so those live role gates are
+reported as `unsupported`, never `pass`. Promotion is likewise unsupported
+until a live destination adapter exists.
+
+### Release-gate semantics
+
+Each selected gate is `required` and has exactly one state:
+
+- `pass`: every referenced replay command passed, or the live command ran
+  successfully against the pinned Accumulo build;
+- `fail`: evidence was malformed or a required command ran and failed;
+- `unsupported`: the environment or live adapter cannot execute the gate;
+- `skipped`: the gate was omitted with `-required`.
+
+Exit status is `0` only when every required gate passes, `1` when any required
+gate fails, and `2` when no required gate failed but at least one is
+unsupported or skipped. Consequently Docker absence and unwired live roles
+cannot authorize a release. To evaluate a slice independently, pass a
+comma-separated list such as `-required scanserver,client`; all gates remain
+present in the JSON so consumers do not confuse omission with success.
 
 ## Debugging and overrides
 
