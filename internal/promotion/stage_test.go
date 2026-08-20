@@ -211,6 +211,63 @@ func TestStageBulkDirSerializesConcurrentWritersForSameDestination(t *testing.T)
 	}
 }
 
+func TestStageBulkDirSerializesAliasedLocalDestinationsAcrossBackendInstances(t *testing.T) {
+	root := t.TempDir()
+	t.Chdir(root)
+	absoluteBulkDir := filepath.Join(root, "bulk")
+	relativeBulkDir := "bulk"
+	const srcPath = "export/events/t-0000/F0001.rf"
+	data := []byte("stage-data")
+	sum := sha256.Sum256(data)
+	manifest := &engine.RFileExportManifest{
+		Version:     engine.RFileExportManifestVersion,
+		SourceTable: "events",
+		Tablets:     []engine.RFileExportTablet{{Index: 0}},
+		RFiles: []engine.RFileExportFile{{
+			TabletIndex:     0,
+			DestinationPath: srcPath,
+			Size:            int64(len(data)),
+			SHA256:          hex.EncodeToString(sum[:]),
+		}},
+	}
+
+	firstMemory := memory.New()
+	firstMemory.Put(srcPath, data)
+	first := &blockingOpenBackend{
+		Backend: firstMemory,
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	second := memory.New()
+	second.Put(srcPath, data)
+
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := StageBulkDir(context.Background(), first, manifest, local.New(), absoluteBulkDir)
+		firstDone <- err
+	}()
+	<-first.started
+
+	secondDone := make(chan error, 1)
+	go func() {
+		_, err := StageBulkDir(context.Background(), second, manifest, local.New(), relativeBulkDir)
+		secondDone <- err
+	}()
+	select {
+	case err := <-secondDone:
+		t.Fatalf("aliased local StageBulkDir completed while first still owned destination: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(first.release)
+	if err := <-firstDone; err != nil {
+		t.Fatalf("first StageBulkDir: %v", err)
+	}
+	if err := <-secondDone; err != nil {
+		t.Fatalf("second StageBulkDir: %v", err)
+	}
+}
+
 func TestStageBulkDirRejectsBasenameCollisionBeforeCopying(t *testing.T) {
 	src := memory.New()
 	src.Put("export/events/t-0000/part-a/F0001.rf", []byte("a"))

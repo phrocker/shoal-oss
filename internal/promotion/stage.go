@@ -295,9 +295,15 @@ func stageBulkDirLocked(
 
 func acquireStageBulkDir(ctx context.Context, dst storage.Backend, bulkDir string) (func(), error) {
 	key := canonicalPathBackendKey(dst) + "\x00" + bulkDir
-	ref := newStagePathRef(dst, bulkDir)
-	if canonical, ok := canonicalBackendPath(ref); ok {
-		key = stageLockBackendKey(dst) + "\x00" + canonical
+	unwrapped := unwrapBackend(dst)
+	if _, ok := unwrapped.(*local.Backend); ok {
+		cache := newPathIdentityCache(1)
+		key = fmt.Sprintf("%T", unwrapped) + "\x00" + cache.publicationKey(bulkDir)
+	} else {
+		ref := newStagePathRef(dst, bulkDir)
+		if canonical, ok := canonicalBackendPath(ref); ok {
+			key = stageLockBackendKey(dst) + "\x00" + canonical
+		}
 	}
 
 	stageBulkDirLocks.Lock()
