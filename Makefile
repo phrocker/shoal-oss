@@ -171,7 +171,10 @@ _patch-binary-fields:
 	       p==1 && /WriteFieldBegin\(ctx, "val"/ { print "  // PATCH (shoal): nil condition value = absent column."; print "  if p.Val == nil { return nil }"; p=0 } \
 	       { print }' $$f > $$f.tmp && mv $$f.tmp $$f; \
 	  echo "_patch-binary-fields: TCondition applied"; \
-	fi
+	fi; \
+	awk '{ lines[NR]=$$0; if ($$0 != "") last=NR } \
+	     END { for (i=1; i<=last; i++) print lines[i] }' \
+	     $$f > $$f.tmp && mv $$f.tmp $$f
 
 # Generic struct-pointer guard: any writeFieldN across all generated .go
 # files where the body contains `p.<Field>.Write(ctx, oprot)` gets the
