@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import ctypes as C
+import gc
 import random
 import threading
 import unittest
+import weakref
 
 from sharkbite import (
     BatchScanner,
@@ -303,6 +305,19 @@ class StreamingCompatibilityTests(unittest.TestCase):
             thread.join()
         self.assertFalse(errors)
         self.assertEqual(results, [Key(b"a:z", b"cf", b"cq", b"", 7)] * 12)
+        scanner.close()
+        self.assertIsNotNone(keepalive)
+
+    def test_scanner_does_not_retain_abandoned_result_sets(self):
+        scanner = BatchScanner(self.connector, "t", (), 2)
+        scan_range, keepalive = row_range(b"a", b"z")
+        scanner.addRange(scan_range)
+        result = scanner.getResultSet()
+        self.assertEqual(next(result).getValue(), b"a:z")
+        retained = weakref.ref(result)
+        del result
+        gc.collect()
+        self.assertIsNone(retained())
         scanner.close()
         self.assertIsNotNone(keepalive)
 

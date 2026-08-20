@@ -212,7 +212,7 @@ SB-WRITE-006	Covered
 SB-WRITE-007	Not required (rationale required)
 SB-WRITE-008	Not required (rationale required)
 SB-WRITE-009	Not required (rationale required)
-SB-WRITE-010	Covered
+SB-WRITE-010	Intentional divergence (approval required)
 SB-WRITE-011	Not required (rationale required)
 SB-WRITE-012	Covered
 SB-WRITE-013	Not required (rationale required)

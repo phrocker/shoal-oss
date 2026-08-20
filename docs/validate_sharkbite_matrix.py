@@ -53,8 +53,8 @@ SCOPE_DISPOSITIONS = {
     "Not required",
 }
 EXPECTED_SCOPE_COUNTS = {
-    "Covered": 188,
-    "Approved divergence": 95,
+    "Covered": 187,
+    "Approved divergence": 96,
     "Required gap": 114,
     "Optional": 2763,
     "Not required": 43,
@@ -97,11 +97,11 @@ def status_count_map(
 
 
 EXPECTED_STATUS_COUNTS = {
-    "Covered": 251,
+    "Covered": 250,
     "Missing Go": 2215,
     "Missing C ABI": 83,
     "Behavior mismatch": 168,
-    "Intentional divergence (approval required)": 95,
+    "Intentional divergence (approval required)": 96,
     "Not required (rationale required)": 391,
 }
 
@@ -181,7 +181,8 @@ EXPECTED_PREFIX_COUNTS = {
     ),
     "SB-TORCH": status_count_map(missing_c_abi=9),
     "SB-WRITE": status_count_map(
-        covered=14,
+        covered=13,
+        intentional_divergence=1,
         not_required=9,
     ),
     "SB-XCUT": status_count_map(
@@ -465,6 +466,20 @@ APPROVED_DIVERGENCES: dict[str, ApprovedDivergence] = {
         ),
         behavior_clauses=(),
     ),
+    "SB-DIV-005": ApprovedDivergence(
+        approver="**@phrocker**",
+        date="**2026-08-20**",
+        evidence="https://github.com/phrocker/shoal-oss/issues/81#issuecomment-5353726986",
+        rows=("SB-WRITE-010",),
+        rows_cell="SB-WRITE-010, SB-UNSAFE-018",
+        impact_cell=(
+            "Programs that ignored rejected writes will now see exceptions. Python "
+            "preserves copied structured rejection details instead of reproducing "
+            "Sharkbite's unsafe silent-discard behavior. [Approval evidence]"
+            "(https://github.com/phrocker/shoal-oss/issues/81#issuecomment-5353726986)."
+        ),
+        behavior_clauses=(),
+    ),
     "SB-DIV-007": ApprovedDivergence(
         approver="**@phrocker**",
         date="**2026-08-20**",
@@ -595,7 +610,6 @@ SUBSUMED_DIVERGENCE_GATE_PROSE = (
 # intersect EXPECTED_UNAPPROVED_DIVERGENCE_ROWS. A proposal is a request for a
 # decision about a specific scope, so the scope is pinned with the ID.
 EXPECTED_PROPOSED_DIVERGENCE_ROW_CELLS = {
-    "SB-DIV-005": "SB-WRITE-010, SB-UNSAFE-018",
     "SB-DIV-006": (
         "SB-SCAN-024, SB-BASE-016, SB-BASE-019, SB-PANDA-009, SB-PANDA-012, "
         "SB-UNSAFE-008"
@@ -614,7 +628,7 @@ EXPECTED_UNAPPROVED_DIVERGENCE_ROWS: tuple[str, ...] = ()
 
 # The rows the approved SB-DIV-016 decision covers: the 82 §14 cluster-status
 # rows named by the approval, and nothing else.
-EXPECTED_APPROVED_DIVERGENCE_ROW_COUNT = 95
+EXPECTED_APPROVED_DIVERGENCE_ROW_COUNT = 96
 
 # Decisions in the §26 table. Rows and decisions are different quantities: one
 # decision can cover many rows, so these are pinned separately from the row
@@ -766,7 +780,7 @@ APPROVAL_BEHAVIOR_PREAMBLE = (
     'never becomes one.'
 )
 
-DIVERGENCE_DECISION_PREAMBLE = 'Nine entries below are approved: [SB-DIV-001](#sec-26) through [SB-DIV-004](#sec-26), [SB-DIV-007](#sec-26), [SB-DIV-008](#sec-26), and [SB-DIV-016](#sec-26), plus [SB-DIV-018](#sec-26) and [SB-DIV-019](#sec-26), signed by @phrocker on **2026-08-20** or the earlier date shown in the table. [SB-DIV-013](#sec-26) is **subsumed** by [SB-DIV-016](#sec-26): it is dormant rather than blocking, carries no approver of its own, and revives only if that approval is reversed. Every remaining entry blocks the gate until a named approver signs it with a date. Approvals are recorded on Shoal issue [#81](https://github.com/phrocker/shoal-oss/issues/81) and then mirrored into this table in the same change; a comment on #81 alone does not lift the gate, and neither does an edit here without the corresponding #81 decision. Adding a divergence to this table is not approval. **95 matrix rows currently carry the `Intentional divergence (approval required)` status: 95 are approved and 0 are not.** The approved 82 are the cluster-status rows of [§14](#sec-14), all covered by the single decision [SB-DIV-016](#sec-26), which @phrocker approved on **2026-08-19**; that decision also governs [SB-CONN-007](#sec-7), the `getStatistics()` entry point, but does not cover it as an approved row, so it stays `Missing Go` and is counted there. The additional approved rows are SB-PKG-014 (Accumulo 4 only), SB-CFG-014 and SB-CFG-022 (no password read-back, both spellings), SB-CONN-010 (per-connector pools), SB-ERR-003 (no Thrift types), SB-SCAN-007/016 (stable rejection of non-functional Python iterators), and SB-SCAN-008/009/014/015 (no implicit hedged or RFile-only scans), plus SB-TABLE-006 (no compatible online-compaction contract) and SB-TABLE-013 (no compatible legacy bulk-import contract). The table below lists 18 decisions — 9 approved, 1 subsumed by that approval, and 8 still proposed — because one decision can cover many rows; the row count and the decision count are different quantities and must not be conflated. The remaining 8 entries — every decision except the approved [SB-DIV-001](#sec-26), [SB-DIV-002](#sec-26), [SB-DIV-003](#sec-26), [SB-DIV-004](#sec-26), [SB-DIV-007](#sec-26), [SB-DIV-008](#sec-26), [SB-DIV-016](#sec-26), [SB-DIV-018](#sec-26), [SB-DIV-019](#sec-26) and the subsumed [SB-DIV-013](#sec-26) — are **proposed** divergences. Every row named by those proposals currently carries a non-divergence gap status; approval would move it to `Intentional divergence`. Rejecting a proposal leaves its rows as gaps that must be implemented. Neither of the two non-proposed entries is a proposal: SB-DIV-016 is already approved, and SB-DIV-013 describes a capability that same approval removed outright, so it has nothing left to propose. SB-DIV-016 names [SB-CONN-007](#sec-7) as the entry point that reaches its rows, but that row is outside the approved set and keeps `Missing Go`; reclassifying it would require an approval that names it. An approved divergence never becomes `Covered`: it records a capability that will never exist rather than one that has been delivered, and its rows keep the `approval required` label because [§4.2](#sec-4) fixes the six status names — approval state lives in this table, not in the status column.'
+DIVERGENCE_DECISION_PREAMBLE = 'Ten entries below are approved: [SB-DIV-001](#sec-26) through [SB-DIV-005](#sec-26), [SB-DIV-007](#sec-26), [SB-DIV-008](#sec-26), and [SB-DIV-016](#sec-26), plus [SB-DIV-018](#sec-26) and [SB-DIV-019](#sec-26), signed by @phrocker on **2026-08-20** or the earlier date shown in the table. [SB-DIV-013](#sec-26) is **subsumed** by [SB-DIV-016](#sec-26): it is dormant rather than blocking, carries no approver of its own, and revives only if that approval is reversed. Every remaining entry blocks the gate until a named approver signs it with a date. Approvals are recorded on Shoal issue [#81](https://github.com/phrocker/shoal-oss/issues/81) and then mirrored into this table in the same change; a comment on #81 alone does not lift the gate, and neither does an edit here without the corresponding #81 decision. Adding a divergence to this table is not approval. **96 matrix rows currently carry the `Intentional divergence (approval required)` status: 96 are approved and 0 are not.** The approved 82 are the cluster-status rows of [§14](#sec-14), all covered by the single decision [SB-DIV-016](#sec-26), which @phrocker approved on **2026-08-19**; that decision also governs [SB-CONN-007](#sec-7), the `getStatistics()` entry point, but does not cover it as an approved row, so it stays `Missing Go` and is counted there. The additional approved rows are SB-PKG-014 (Accumulo 4 only), SB-CFG-014 and SB-CFG-022 (no password read-back, both spellings), SB-CONN-010 (per-connector pools), SB-ERR-003 (no Thrift types), SB-SCAN-007/016 (stable rejection of non-functional Python iterators), and SB-SCAN-008/009/014/015 (no implicit hedged or RFile-only scans), SB-WRITE-010 (structured write failures rather than silent discard), plus SB-TABLE-006 (no compatible online-compaction contract) and SB-TABLE-013 (no compatible legacy bulk-import contract). The table below lists 18 decisions — 10 approved, 1 subsumed by that approval, and 7 still proposed — because one decision can cover many rows; the row count and the decision count are different quantities and must not be conflated. The remaining 7 entries — every decision except the approved [SB-DIV-001](#sec-26), [SB-DIV-002](#sec-26), [SB-DIV-003](#sec-26), [SB-DIV-004](#sec-26), [SB-DIV-005](#sec-26), [SB-DIV-007](#sec-26), [SB-DIV-008](#sec-26), [SB-DIV-016](#sec-26), [SB-DIV-018](#sec-26), [SB-DIV-019](#sec-26) and the subsumed [SB-DIV-013](#sec-26) — are **proposed** divergences. Every row named by those proposals currently carries a non-divergence gap status; approval would move it to `Intentional divergence`. Rejecting a proposal leaves its rows as gaps that must be implemented. Neither of the two non-proposed entries is a proposal: SB-DIV-016 is already approved, and SB-DIV-013 describes a capability that same approval removed outright, so it has nothing left to propose. SB-DIV-016 names [SB-CONN-007](#sec-7) as the entry point that reaches its rows, but that row is outside the approved set and keeps `Missing Go`; reclassifying it would require an approval that names it. An approved divergence never becomes `Covered`: it records a capability that will never exist rather than one that has been delivered, and its rows keep the `approval required` label because [§4.2](#sec-4) fixes the six status names — approval state lives in this table, not in the status column.'
 RELEASE_GATE_SECTION_HEADING = "## 2. Release gate (normative)"
 COUNTS_SECTION_HEADING = "## 25. Counts by status and category"
 APPROVAL_BEHAVIOR_SECTION_HEADING = (
@@ -3396,7 +3410,7 @@ def validate_status_narratives(
     expected_phrases = [
         (RELEASE_GATE_SECTION_HEADING, f"As of revision {EXPECTED_REVISION}, **{required_rows} rows are required, {satisfied} are satisfied, and {scope_counts['Required gap']} remain**."),
         (COUNTS_SECTION_HEADING, f"The normative scope manifest classifies {required_rows} rows as required, {scope_counts['Optional']} as optional, and {scope_counts['Not required']} as not required."),
-        (COUNTS_SECTION_HEADING, f"**Exactly {status_counts['Covered']} rows are `Covered`: [SB-XCUT-012](#sec-20), the twelve configuration/topology rows completed in revision 24, the 31 RFile/stream rows completed in revision 25, the 17 data-model value rows completed in revision 26, the five buffered-writer rows completed in revisions 28 and 45, the four row-bounded flush/constraint rows completed in revision 29, the connector invalidation/cancellation rows completed in revision 30, the eight high-level client rows completed in revision 31, the five high-level scanner rows completed in revision 32, the four compatibility-error rows completed in revision 34, the twelve streaming cursor rows completed in revision 36, the 31 column-visibility rows completed in revision 38, the 22 equivalent owned-key rows completed in revision 42, the named-locality-group RFile row plus 24 HDFS rows completed in revision 44, the two logging rows completed in revision 45, the 38 table/namespace/security rows completed in revision 48, the twelve issue-196 cross-cutting rows completed in revision 49, and the twenty Python-visible scanner/writer rows completed in revision 50.**"),
+        (COUNTS_SECTION_HEADING, f"**Exactly {status_counts['Covered']} rows are `Covered`: [SB-XCUT-012](#sec-20), the twelve configuration/topology rows completed in revision 24, the 31 RFile/stream rows completed in revision 25, the 17 data-model value rows completed in revision 26, the five buffered-writer rows completed in revisions 28 and 45, the four row-bounded flush/constraint rows completed in revision 29, the connector invalidation/cancellation rows completed in revision 30, the eight high-level client rows completed in revision 31, the five high-level scanner rows completed in revision 32, the four compatibility-error rows completed in revision 34, the twelve streaming cursor rows completed in revision 36, the 31 column-visibility rows completed in revision 38, the 22 equivalent owned-key rows completed in revision 42, the named-locality-group RFile row plus 24 HDFS rows completed in revision 44, the two logging rows completed in revision 45, the 38 table/namespace/security rows completed in revision 48, the twelve issue-196 cross-cutting rows completed in revision 49, and nineteen Python-visible scanner/writer rows completed in revision 50; SB-WRITE-010 is the separately approved SB-DIV-005 divergence.**"),
         (COUNTS_SECTION_HEADING, f"`Intentional divergence` ({status_counts[INTENTIONAL_DIVERGENCE_STATUS]}) is dominated by one upstream fact: {prefix_counts['SB-STAT'][INTENTIONAL_DIVERGENCE_STATUS]} rows are cluster-status accessors Accumulo itself deleted ([§14](#sec-14), [SB-DIV-016](#sec-26))."),
         (COUNTS_SECTION_HEADING, "`SB-XCUT-014`, `SB-XCUT-019`, and `SB-PKG-008` remain explicit required"),
     ]

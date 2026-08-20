@@ -211,7 +211,7 @@ SB-WRITE-006	Covered	core-covered	Covered
 SB-WRITE-007	Not required	not-required-rationale	Not required (rationale required)
 SB-WRITE-008	Not required	not-required-rationale	Not required (rationale required)
 SB-WRITE-009	Not required	not-required-rationale	Not required (rationale required)
-SB-WRITE-010	Covered	core-covered	Covered
+SB-WRITE-010	Approved divergence	core-approved-divergence	Intentional divergence (approval required)
 SB-WRITE-011	Not required	not-required-rationale	Not required (rationale required)
 SB-WRITE-012	Covered	core-covered	Covered
 SB-WRITE-013	Not required	not-required-rationale	Not required (rationale required)

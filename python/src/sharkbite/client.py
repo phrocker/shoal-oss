@@ -7,6 +7,7 @@ import time
 from dataclasses import dataclass
 import threading
 from typing import Callable, Iterator, Sequence
+import weakref
 
 from ._native import (
     CAP_HIGH_LEVEL_CLIENT,
@@ -690,7 +691,7 @@ class BatchScanner:
         self._ranges: list[_RangeSnapshot] = []
         self._columns: list[tuple[bytes, bytes | None]] = []
         self._iterators: list[tuple[str, str, int]] = []
-        self._results: set[Results] = set()
+        self._results: weakref.WeakSet[Results] = weakref.WeakSet()
         self._lock = threading.RLock()
         self._closed = False
 
