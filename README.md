@@ -1,5 +1,13 @@
 # shoal
 
+## Python foundation
+
+An early, explicitly partial Python binding is available under
+[`python/`](python/README.md). It supports both `import sharkbite` and
+`import pysharkbite`, negotiates the stable C ABI at runtime, and provides a
+minimal high-level scan path. It is not yet a complete Sharkbite-compatible
+distribution; unsupported legacy APIs fail explicitly.
+
 A Go sorted key-value store with graph and vector query pushdown.
 Independent project — inspired by [Apache Accumulo](https://accumulo.apache.org)'s
 data model and RFile format, but its own engine that runs **standalone** with
