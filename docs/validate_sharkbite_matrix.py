@@ -17,7 +17,7 @@ import unicodedata
 
 
 DOC_PATH = Path(__file__).with_name("sharkbite-compatibility.md")
-EXPECTED_REVISION = 43
+EXPECTED_REVISION = 44
 CLUSTER_STATUS_APPROVAL_REVISION = 40
 # Update this manifest only when the independently audited inventory itself
 # changes; review every added/removed or reclassified ID in code review.
@@ -63,8 +63,8 @@ def status_count_map(
 
 
 EXPECTED_STATUS_COUNTS = {
-    "Covered": 153,
-    "Missing Go": 2249,
+    "Covered": 178,
+    "Missing Go": 2224,
     "Missing C ABI": 89,
     "Behavior mismatch": 233,
     "Intentional divergence (approval required)": 87,
@@ -113,7 +113,7 @@ EXPECTED_PREFIX_COUNTS = {
         intentional_divergence=1,
         not_required=3,
     ),
-    "SB-HDFS": status_count_map(missing_go=26),
+    "SB-HDFS": status_count_map(covered=24, missing_go=2),
     "SB-LOG": status_count_map(missing_go=2, behavior_mismatch=1),
     "SB-NS": status_count_map(behavior_mismatch=8),
     "SB-PANDA": status_count_map(missing_c_abi=20, not_required=1),
@@ -124,8 +124,7 @@ EXPECTED_PREFIX_COUNTS = {
         not_required=2,
     ),
     "SB-RFILE": status_count_map(
-        missing_go=1,
-        covered=31,
+        covered=32,
         behavior_mismatch=1,
         not_required=3,
     ),
@@ -201,17 +200,17 @@ EXPECTED_METADATA_FIELDS = {
     ),
     "Sharkbite release line": "`sharkbite` 1.2.0.3 on PyPI (`setup.py:34-35`)",
     "Shoal reference": (
-        "`phrocker/shoal-oss` exact audited baseline for revision 43 "
-        "`03a5abfcb28797848904d97750d6aa13de106aa9` "
-        "(\"Merge pull request #170 from phrocker/phrocker/issue-74-role-verdicts\") "
-        "plus the Python writer/administration changes introduced in this revision"
+        "`phrocker/shoal-oss` exact audited baseline for revision 44 "
+        "`afc16c4f87ab71a50cd1f2a119bc7f23a6a07675` "
+        "(\"Merge pull request #171 from phrocker/agent/issue-59-python-writer-admin\") "
+        "plus the storage changes introduced in this revision"
     ),
     "Shoal C ABI version": "`SHOAL_ABI_VERSION 1u` (`capi/include/shoal_types.h`)",
 }
 
 EXPECTED_DOCUMENT_STATUS_SNIPPETS = (
     "Normative gate. Binding on all Sharkbite-compatibility work.",
-    f"Revision {EXPECTED_REVISION} — records the first Python write/administration evidence",
+    f"Revision {EXPECTED_REVISION} — publishes the public HDFS client/stream contract",
     "Revision 42 — completes the 36-row owned mutable key ABI tranche",
     "Revision 41 — records the public column and entry value APIs",
     "Revision 40 — mirrors the first approved divergence into the "
@@ -749,8 +748,8 @@ DEFAULT_C_ABI_INCLUDE_PATHS = (
     Path("capi/include"),
     Path("capi/tests"),
 )
-EXPECTED_C_ABI_DECLARED_EXPORTS = 293
-EXPECTED_C_ABI_REFERENCED_EXPORTS = 288
+EXPECTED_C_ABI_DECLARED_EXPORTS = 315
+EXPECTED_C_ABI_REFERENCED_EXPORTS = 310
 EXPECTED_C_ABI_UNREFERENCED_EXPORTS = (
     "shoal_scanner_scan",
     "shoal_batch_scanner_scan",
@@ -3212,9 +3211,9 @@ def validate_status_narratives(
     satisfied = status_counts["Covered"] + approved_divergences
 
     expected_phrases = [
-        (RELEASE_GATE_SECTION_HEADING, f"As of revision {EXPECTED_REVISION} that is {required_rows} of {total_rows} rows, and **{satisfied} are satisfied**: {status_counts['Covered']} are `Covered` ([SB-XCUT-012](#sec-20), the twelve configuration/topology rows in [§6](#sec-6), the 31 RFile/stream rows in [§15](#sec-15), the 17 data-model value rows in [§8](#sec-8) and [§19.2](#sec-19-2), the four buffered-writer rows in [§10](#sec-10), the four row-bounded flush/constraint rows in [§11](#sec-11) and [§19.2](#sec-19-2), the connector invalidation/cancellation rows in [§7](#sec-7) and [§20](#sec-20), the eight high-level client rows in [§10.1](#sec-10-1), the five high-level scanner rows in [§10.1](#sec-10-1), the four compatibility-error rows in [§18](#sec-18), the twelve streaming cursor rows in [§9](#sec-9), [§10.1](#sec-10-1), [§19.2](#sec-19-2), and [§20](#sec-20), the 31 column-visibility rows in [§18](#sec-18) and [§19.2](#sec-19-2), and the 22 equivalent owned-key rows in [§19.2](#sec-19-2)) and {approved_divergences} are approved intentional divergences ([SB-DIV-016](#sec-26)), which record a permanent capability loss rather than delivered compatibility."),
+        (RELEASE_GATE_SECTION_HEADING, f"As of revision {EXPECTED_REVISION} that is {required_rows} of {total_rows} rows, and **{satisfied} are satisfied**: {status_counts['Covered']} are `Covered` ([SB-XCUT-012](#sec-20), the twelve configuration/topology rows in [§6](#sec-6), the 32 RFile/stream rows in [§15](#sec-15), the 17 data-model value rows in [§8](#sec-8) and [§19.2](#sec-19-2), the four buffered-writer rows in [§10](#sec-10), the four row-bounded flush/constraint rows in [§11](#sec-11) and [§19.2](#sec-19-2), the connector invalidation/cancellation rows in [§7](#sec-7) and [§20](#sec-20), the eight high-level client rows in [§10.1](#sec-10-1), the five high-level scanner rows in [§10.1](#sec-10-1), the four compatibility-error rows in [§18](#sec-18), the twelve streaming cursor rows in [§9](#sec-9), [§10.1](#sec-10-1), [§19.2](#sec-19-2), and [§20](#sec-20), the 31 column-visibility rows in [§18](#sec-18) and [§19.2](#sec-19-2), the 22 equivalent owned-key rows in [§19.2](#sec-19-2), and the 24 HDFS rows in [§16](#sec-16)) and {approved_divergences} are approved intentional divergences ([SB-DIV-016](#sec-26)), which record a permanent capability loss rather than delivered compatibility."),
         (COUNTS_SECTION_HEADING, f"{required_rows} rows are **required** by the final release gate ([§2.2](#sec-2)); the {status_counts[NOT_REQUIRED_STATUS]} `Not required` rows are excluded by construction, and {prefix_counts['SB-CXX'][NOT_REQUIRED_STATUS]} of those are the evidence-proved duplicates described in [§19.1](#sec-19-1)."),
-        (COUNTS_SECTION_HEADING, "**Exactly 153 rows are `Covered`: [SB-XCUT-012](#sec-20), the twelve configuration/topology rows completed in revision 24, the 31 RFile/stream rows completed in revision 25, the 17 data-model value rows completed in revision 26, the four buffered-writer rows completed in revision 28, the four row-bounded flush/constraint rows completed in revision 29, the connector invalidation/cancellation rows completed in revision 30, the eight high-level client rows completed in revision 31, the five high-level scanner rows completed in revision 32, the four compatibility-error rows completed in revision 34, the twelve streaming cursor rows completed in revision 36, the 31 column-visibility rows completed in revision 38, and the 22 equivalent owned-key rows completed in revision 42.**"),
+        (COUNTS_SECTION_HEADING, "**Exactly 178 rows are `Covered`: [SB-XCUT-012](#sec-20), the twelve configuration/topology rows completed in revision 24, the 31 RFile/stream rows completed in revision 25, the 17 data-model value rows completed in revision 26, the four buffered-writer rows completed in revision 28, the four row-bounded flush/constraint rows completed in revision 29, the connector invalidation/cancellation rows completed in revision 30, the eight high-level client rows completed in revision 31, the five high-level scanner rows completed in revision 32, the four compatibility-error rows completed in revision 34, the twelve streaming cursor rows completed in revision 36, the 31 column-visibility rows completed in revision 38, the 22 equivalent owned-key rows completed in revision 42, and the named-locality-group RFile row plus 24 HDFS rows completed in revision 44.**"),
         (COUNTS_SECTION_HEADING, f"The shape of the work is visible in the {status_counts['Missing Go']} `Missing Go` rows, of which {prefix_counts['SB-CXX']['Missing Go']} are the C++ members in [§19.2](#sec-19-2) that no Shoal layer exports."),
         (COUNTS_SECTION_HEADING, f"`Behavior mismatch` ({status_counts['Behavior mismatch']}) is the bucket that sets the schedule: {python_visible_behavior} rows on the Python-visible and curated C++ surface each need a differential test against a live cluster or the exported ABI, and {prefix_counts['SB-CXX']['Behavior mismatch']} are C++ rows: 15 destructors of classes bound into Python, where the destruction point is user-observable and the model differs from Go finalisation ([§19.1](#sec-19-1)), plus the 14 owned-key comparison and capacity-reporting rows whose safe Shoal behavior deliberately does not reproduce [SB-UNSAFE-046](#sec-21) or [SB-UNSAFE-048](#sec-21)."),
         (COUNTS_SECTION_HEADING, f"`Intentional divergence` ({status_counts[INTENTIONAL_DIVERGENCE_STATUS]}) is dominated by one upstream fact: {prefix_counts['SB-STAT'][INTENTIONAL_DIVERGENCE_STATUS]} rows are cluster-status accessors Accumulo itself deleted ([§14](#sec-14), [SB-DIV-016](#sec-26))."),

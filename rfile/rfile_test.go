@@ -458,8 +458,8 @@ func TestWriterRejectsOutOfOrderAppendAndUseAfterClose(t *testing.T) {
 	if err := writer.Append(context.Background(), entry("row2", "cf", "cq", 10, "v")); !errors.Is(err, rfile.ErrOutOfOrder) {
 		t.Fatalf("duplicate append = %v, want ErrOutOfOrder", err)
 	}
-	if err := writer.AddLocalityGroup("families"); !errors.Is(err, rfile.ErrLocalityGroupUnsupported) {
-		t.Fatalf("AddLocalityGroup = %v, want ErrLocalityGroupUnsupported", err)
+	if err := writer.AddLocalityGroup("families"); err != nil {
+		t.Fatalf("AddLocalityGroup: %v", err)
 	}
 	if err := writer.Close(); err != nil {
 		t.Fatal(err)
@@ -473,6 +473,38 @@ func TestWriterRejectsOutOfOrderAppendAndUseAfterClose(t *testing.T) {
 	if err := writer.AddLocalityGroup("g"); !errors.Is(err, rfile.ErrClosed) {
 		t.Fatalf("AddLocalityGroup after Close = %v, want ErrClosed", err)
 	}
+}
+
+func TestWriterCreatesNamedLocalityGroups(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "groups.rf")
+	writer, err := rfile.Create(context.Background(), path, rfile.WriterOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Append(context.Background(), entry("z", "default", "", 1, "d")); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.AddLocalityGroup("named"); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Append(context.Background(), entry("a", "named", "", 1, "n")); err != nil {
+		t.Fatalf("append after ordering restart: %v", err)
+	}
+	if err := writer.AddLocalityGroup("named"); !errors.Is(err, rfile.ErrInvalidLocalityGroup) {
+		t.Fatalf("duplicate AddLocalityGroup = %v, want ErrInvalidLocalityGroup", err)
+	}
+	if err := writer.Append(context.Background(), entry("b", "named", "", 1, "n2")); err != nil {
+		t.Fatalf("append after rejected duplicate: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reader, err := rfile.OpenSequential(context.Background(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	requireRows(t, drain(t, reader), "a", "b", "z")
 }
 
 func TestReaderRejectsUseAfterClose(t *testing.T) {

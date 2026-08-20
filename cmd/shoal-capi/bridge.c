@@ -177,6 +177,9 @@ static int shoal_bridge_allocation_allowed(_Atomic size_t *fail_after) {
 SHOAL_BRIDGE_DEFINE_HANDLE(rfile_reader, shoal_rfile_reader)
 SHOAL_BRIDGE_DEFINE_HANDLE(rfile_writer, shoal_rfile_writer)
 SHOAL_BRIDGE_DEFINE_HANDLE(rfile_seekable, shoal_rfile_seekable)
+SHOAL_BRIDGE_DEFINE_HANDLE(hdfs_client, shoal_hdfs_client)
+SHOAL_BRIDGE_DEFINE_HANDLE(hdfs_input_stream, shoal_hdfs_input_stream)
+SHOAL_BRIDGE_DEFINE_HANDLE(hdfs_output_stream, shoal_hdfs_output_stream)
 SHOAL_BRIDGE_DEFINE_HANDLE(authorizations, shoal_authorizations)
 SHOAL_BRIDGE_DEFINE_HANDLE(column_visibility, shoal_column_visibility)
 SHOAL_BRIDGE_DEFINE_HANDLE(owned_key, shoal_owned_key)
@@ -516,6 +519,148 @@ shoal_bytes_result *shoal_bridge_bytes_result_alloc(const uint8_t *value,
     }
     free(result->entries);
     memset(result, 0, sizeof(*result));
+    free(result);
+  }
+
+  static void shoal_bridge_hdfs_dir_entry_clear(
+      shoal_bridge_hdfs_dir_entry *entry) {
+    if (entry == NULL) {
+      return;
+    }
+    free(entry->name);
+    free(entry->owner);
+    free(entry->group);
+    memset(entry, 0, sizeof(*entry));
+  }
+
+  static int shoal_bridge_hdfs_dir_entry_set(
+      shoal_bridge_hdfs_dir_entry *entry, const char *name, const char *owner,
+      const char *group, int64_t size, int64_t modification_time_ms,
+      uint32_t mode, uint8_t is_directory) {
+    if (entry == NULL || name == NULL || owner == NULL || group == NULL) {
+      return 0;
+    }
+    char *name_copy = shoal_bridge_result_copy_string(name);
+    char *owner_copy = shoal_bridge_result_copy_string(owner);
+    char *group_copy = shoal_bridge_result_copy_string(group);
+    if (name_copy == NULL || owner_copy == NULL || group_copy == NULL) {
+      free(name_copy);
+      free(owner_copy);
+      free(group_copy);
+      return 0;
+    }
+    shoal_bridge_hdfs_dir_entry_clear(entry);
+    entry->name = name_copy;
+    entry->owner = owner_copy;
+    entry->group = group_copy;
+    entry->size = size;
+    entry->modification_time_ms = modification_time_ms;
+    entry->mode = mode;
+    entry->is_directory = is_directory;
+    return 1;
+  }
+
+  static int shoal_bridge_hdfs_dir_entry_view(
+      const shoal_bridge_hdfs_dir_entry *entry,
+      shoal_hdfs_dir_entry_view *out_entry) {
+    if (entry == NULL || out_entry == NULL ||
+        out_entry->struct_size < SHOAL_HDFS_DIR_ENTRY_VIEW_V1_SIZE) {
+      return 0;
+    }
+    out_entry->name = entry->name;
+    out_entry->owner = entry->owner;
+    out_entry->group = entry->group;
+    out_entry->size = entry->size;
+    out_entry->modification_time_ms = entry->modification_time_ms;
+    out_entry->mode = entry->mode;
+    out_entry->is_directory = entry->is_directory;
+    return 1;
+  }
+
+  shoal_hdfs_dir_entry_result *shoal_bridge_hdfs_dir_entry_alloc(
+      const char *name, const char *owner, const char *group, int64_t size,
+      int64_t modification_time_ms, uint32_t mode, uint8_t is_directory) {
+    shoal_hdfs_dir_entry_result *result =
+        (shoal_hdfs_dir_entry_result *)shoal_bridge_result_calloc(
+            1, sizeof(*result));
+    if (result == NULL ||
+        !shoal_bridge_hdfs_dir_entry_set(&result->entry, name, owner, group,
+                                         size, modification_time_ms, mode,
+                                         is_directory)) {
+      shoal_bridge_hdfs_dir_entry_free(result);
+      return NULL;
+    }
+    return result;
+  }
+
+  int shoal_bridge_hdfs_dir_entry_get(
+      const shoal_hdfs_dir_entry_result *result,
+      shoal_hdfs_dir_entry_view *out_entry) {
+    return result != NULL &&
+           shoal_bridge_hdfs_dir_entry_view(&result->entry, out_entry);
+  }
+
+  void shoal_bridge_hdfs_dir_entry_free(shoal_hdfs_dir_entry_result *result) {
+    if (result != NULL) {
+      shoal_bridge_hdfs_dir_entry_clear(&result->entry);
+      free(result);
+    }
+  }
+
+  shoal_hdfs_dir_list_result *shoal_bridge_hdfs_dir_list_alloc(size_t count) {
+    if (count > SIZE_MAX / sizeof(shoal_bridge_hdfs_dir_entry)) {
+      return NULL;
+    }
+    shoal_hdfs_dir_list_result *result =
+        (shoal_hdfs_dir_list_result *)shoal_bridge_result_calloc(
+            1, sizeof(*result));
+    if (result == NULL) {
+      return NULL;
+    }
+    if (count != 0) {
+      result->entries =
+          (shoal_bridge_hdfs_dir_entry *)shoal_bridge_result_calloc(
+              count, sizeof(*result->entries));
+      if (result->entries == NULL) {
+        free(result);
+        return NULL;
+      }
+    }
+    result->count = count;
+    return result;
+  }
+
+  int shoal_bridge_hdfs_dir_list_set(
+      shoal_hdfs_dir_list_result *result, size_t index, const char *name,
+      const char *owner, const char *group, int64_t size,
+      int64_t modification_time_ms, uint32_t mode, uint8_t is_directory) {
+    return result != NULL && index < result->count &&
+           shoal_bridge_hdfs_dir_entry_set(
+               &result->entries[index], name, owner, group, size,
+               modification_time_ms, mode, is_directory);
+  }
+
+  size_t shoal_bridge_hdfs_dir_list_count(
+      const shoal_hdfs_dir_list_result *result) {
+    return result == NULL ? 0 : result->count;
+  }
+
+  int shoal_bridge_hdfs_dir_list_get(
+      const shoal_hdfs_dir_list_result *result, size_t index,
+      shoal_hdfs_dir_entry_view *out_entry) {
+    return result != NULL && index < result->count &&
+           shoal_bridge_hdfs_dir_entry_view(&result->entries[index],
+                                            out_entry);
+  }
+
+  void shoal_bridge_hdfs_dir_list_free(shoal_hdfs_dir_list_result *result) {
+    if (result == NULL) {
+      return;
+    }
+    for (size_t i = 0; i < result->count; ++i) {
+      shoal_bridge_hdfs_dir_entry_clear(&result->entries[i]);
+    }
+    free(result->entries);
     free(result);
   }
 

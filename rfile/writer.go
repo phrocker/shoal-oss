@@ -16,15 +16,16 @@ import (
 // Close. It is the Go equivalent of Sharkbite's SequentialRFile write side,
 // which RFileOperations.openForWrite returns.
 type Writer struct {
-	mu        sync.Mutex
-	inner     *rfile.Writer
-	file      *os.File
-	path      string
-	lastKey   *wire.Key
-	closed    bool
-	appendErr error
-	closeErr  error
-	entries   int64
+	mu             sync.Mutex
+	inner          *rfile.Writer
+	file           *os.File
+	path           string
+	lastKey        *wire.Key
+	closed         bool
+	appendErr      error
+	closeErr       error
+	entries        int64
+	localityGroups map[string]struct{}
 }
 
 // WriterOptions controls how Create lays out the file. The zero value uses
@@ -69,7 +70,12 @@ func Create(ctx context.Context, path string, opts WriterOptions) (*Writer, erro
 		_ = file.Close()
 		return nil, fmt.Errorf("rfile: create %s: %w", path, err)
 	}
-	return &Writer{inner: inner, file: file, path: path}, nil
+	return &Writer{
+		inner:          inner,
+		file:           file,
+		path:           path,
+		localityGroups: make(map[string]struct{}),
+	}, nil
 }
 
 // Append writes one entry, mirroring Sharkbite's SequentialRFile.append.
@@ -113,19 +119,31 @@ func (w *Writer) Append(ctx context.Context, entry Entry) error {
 	return nil
 }
 
-// AddLocalityGroup reports ErrLocalityGroupUnsupported. Sharkbite exposes
-// SequentialRFile.addLocalityGroup(name), which starts a new named group in
-// the file being written, but Shoal's writer emits only the default locality
-// group; a silent no-op would let a caller believe its families were separated
-// when they were not, and an RFile whose groups were mis-declared is unreadable
-// by Accumulo.
+// AddLocalityGroup finishes the current group and starts a named group.
+// Ordering restarts for the new group because each locality group is an
+// independently sorted stream. Names must be non-empty and unique.
 func (w *Writer) AddLocalityGroup(name string) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.closed {
 		return ErrClosed
 	}
-	return fmt.Errorf("%w: cannot start group %q", ErrLocalityGroupUnsupported, name)
+	if w.appendErr != nil {
+		return w.appendErr
+	}
+	if name == "" {
+		return fmt.Errorf("%w: name is required", ErrInvalidLocalityGroup)
+	}
+	if _, exists := w.localityGroups[name]; exists {
+		return fmt.Errorf("%w: duplicate name %q", ErrInvalidLocalityGroup, name)
+	}
+	if err := w.inner.AddLocalityGroup(name); err != nil {
+		w.appendErr = fmt.Errorf("rfile: add locality group to %s: %w", w.path, err)
+		return w.appendErr
+	}
+	w.localityGroups[name] = struct{}{}
+	w.lastKey = nil
+	return nil
 }
 
 // Entries reports how many entries have been appended so far.

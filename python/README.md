@@ -15,7 +15,11 @@ Supported now:
   flush/close and structured write-failure status mapping;
 - table, namespace, and security administration through both direct
   connector helpers and Sharkbite-shaped `tableOps`, `namespaceOps`, and
-  `securityOps` objects.
+  `securityOps` objects;
+- context-managed HDFS clients and typed/raw streams, using Hadoop
+  configuration rather than accepting credentials in Python;
+- context-managed RFile sequential readers/writers, including named locality
+  groups.
 
 Unsupported legacy entry points are present only where useful for discovery and
 raise `NotImplementedError` with a stable message. They never fabricate data.
@@ -42,6 +46,23 @@ with Client("accumulo", "zk1:2181", "root", "secret", table="events") as client:
 
 The library must expose ABI major 1. APIs check their exact capability set:
 5/21/22 for scans, 6/7/8 for writes, and 9/10/11/12/19 for administration.
+Storage uses capabilities 16 (RFile), 27 (HDFS), and 28 (named locality
+groups).
+
+```python
+from sharkbite import Hdfs, Key, KeyValue, RFileOperations
+
+with Hdfs("namenode", 8020) as hdfs:
+    with hdfs.write("/tmp/value") as out:
+        out.writeString("hello")
+    with hdfs.read("/tmp/value") as source:
+        assert source.readString() == "hello"
+
+with RFileOperations.openForWrite("example.rf") as writer:
+    writer.append(KeyValue(Key(b"z", b"default", b"", b"", 1), b"d"))
+    writer.addLocalityGroup("named")
+    writer.append(KeyValue(Key(b"a", b"named", b"", b"", 1), b"n"))
+```
 
 ```python
 from sharkbite import Connector, Mutation, TablePermissions

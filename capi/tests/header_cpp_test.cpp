@@ -10,7 +10,7 @@ static_assert(std::is_same<shoal_abi_capability_bits, std::uint64_t>::value,
               "capability bitset words must remain 64-bit");
 static_assert(SHOAL_ABI_VERSION == 1u, "unexpected ABI version");
 static_assert(SHOAL_ABI_VERSION_MAJOR == 1u, "unexpected ABI major");
-static_assert(SHOAL_ABI_VERSION_MINOR == 15u, "unexpected ABI minor");
+static_assert(SHOAL_ABI_VERSION_MINOR == 16u, "unexpected ABI minor");
 static_assert(SHOAL_ABI_VERSION_PATCH == 0u, "unexpected ABI patch");
 static_assert(SHOAL_ABI_VERSION_PACKED ==
                   SHOAL_ABI_PACK_VERSION(SHOAL_ABI_VERSION_MAJOR,
@@ -55,9 +55,13 @@ static_assert(SHOAL_ABI_CAPABILITY_COLUMN_VISIBILITY == 25u,
               "unexpected column visibility capability id");
 static_assert(SHOAL_ABI_CAPABILITY_OWNED_KEY == 26u,
               "unexpected owned key capability id");
-static_assert(SHOAL_ABI_CAPABILITY_COUNT == 27u,
+static_assert(SHOAL_ABI_CAPABILITY_HDFS == 27u,
+              "unexpected HDFS capability id");
+static_assert(SHOAL_ABI_CAPABILITY_RFILE_LOCALITY_GROUPS == 28u,
+              "unexpected RFile locality capability id");
+static_assert(SHOAL_ABI_CAPABILITY_COUNT == 29u,
               "unexpected capability count");
-static_assert(SHOAL_ABI_CAPABILITY_WORD0 == 0x0000000007ffffffull,
+static_assert(SHOAL_ABI_CAPABILITY_WORD0 == 0x000000001fffffffull,
               "unexpected capability word 0");
 static_assert(std::is_standard_layout<shoal_connector_identity_view>::value,
               "identity view must remain standard-layout");
@@ -73,6 +77,8 @@ static_assert(std::is_standard_layout<shoal_rfile_merge_config>::value,
               "RFile merge config must remain standard-layout");
 static_assert(std::is_standard_layout<shoal_rfile_entry_view>::value,
               "RFile entry view must remain standard-layout");
+static_assert(std::is_standard_layout<shoal_hdfs_dir_entry_view>::value,
+              "HDFS directory entry view must remain standard-layout");
 static_assert(std::is_standard_layout<shoal_key_value>::value,
               "key/value input must remain standard-layout");
 static_assert(std::is_standard_layout<shoal_client_config>::value,
@@ -120,6 +126,51 @@ ASSERT_PERMISSION_VALUE(SHOAL_NAMESPACE_PERMISSION_DROP_NAMESPACE, 8);
 #undef ASSERT_PERMISSION_VALUE
 
 int main() {
+  volatile auto rfile_locality_symbol =
+      &shoal_rfile_writer_add_locality_group;
+  volatile auto hdfs_view_init_symbol = &shoal_hdfs_dir_entry_view_init;
+  volatile auto hdfs_create_symbol = &shoal_hdfs_client_create;
+  volatile auto hdfs_close_symbol = &shoal_hdfs_client_close;
+  volatile auto hdfs_free_symbol = &shoal_hdfs_client_free;
+  volatile auto hdfs_open_symbol = &shoal_hdfs_client_open;
+  volatile auto hdfs_create_file_symbol = &shoal_hdfs_client_create_file;
+  volatile auto hdfs_list_symbol = &shoal_hdfs_client_list;
+  volatile auto hdfs_stat_symbol = &shoal_hdfs_client_stat;
+  volatile auto hdfs_remove_symbol = &shoal_hdfs_client_remove;
+  volatile auto hdfs_rename_symbol = &shoal_hdfs_client_rename;
+  volatile auto hdfs_input_read_symbol = &shoal_hdfs_input_stream_read;
+  volatile auto hdfs_input_close_symbol = &shoal_hdfs_input_stream_close;
+  volatile auto hdfs_input_free_symbol = &shoal_hdfs_input_stream_free;
+  volatile auto hdfs_output_write_symbol = &shoal_hdfs_output_stream_write;
+  volatile auto hdfs_output_close_symbol = &shoal_hdfs_output_stream_close;
+  volatile auto hdfs_output_free_symbol = &shoal_hdfs_output_stream_free;
+  volatile auto hdfs_list_count_symbol = &shoal_hdfs_dir_list_count;
+  volatile auto hdfs_list_get_symbol = &shoal_hdfs_dir_list_get;
+  volatile auto hdfs_list_free_symbol = &shoal_hdfs_dir_list_free;
+  volatile auto hdfs_entry_get_symbol = &shoal_hdfs_dir_entry_result_get;
+  volatile auto hdfs_entry_free_symbol = &shoal_hdfs_dir_entry_result_free;
+  (void)rfile_locality_symbol;
+  (void)hdfs_view_init_symbol;
+  (void)hdfs_create_symbol;
+  (void)hdfs_close_symbol;
+  (void)hdfs_free_symbol;
+  (void)hdfs_open_symbol;
+  (void)hdfs_create_file_symbol;
+  (void)hdfs_list_symbol;
+  (void)hdfs_stat_symbol;
+  (void)hdfs_remove_symbol;
+  (void)hdfs_rename_symbol;
+  (void)hdfs_input_read_symbol;
+  (void)hdfs_input_close_symbol;
+  (void)hdfs_input_free_symbol;
+  (void)hdfs_output_write_symbol;
+  (void)hdfs_output_close_symbol;
+  (void)hdfs_output_free_symbol;
+  (void)hdfs_list_count_symbol;
+  (void)hdfs_list_get_symbol;
+  (void)hdfs_list_free_symbol;
+  (void)hdfs_entry_get_symbol;
+  (void)hdfs_entry_free_symbol;
   shoal_connector *connector = nullptr;
   shoal_client *client = nullptr;
   shoal_error *error = nullptr;

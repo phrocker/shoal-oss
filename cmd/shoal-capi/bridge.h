@@ -47,6 +47,18 @@ struct shoal_rfile_seekable {
   uint64_t id;
 };
 
+struct shoal_hdfs_client {
+  uint64_t id;
+};
+
+struct shoal_hdfs_input_stream {
+  uint64_t id;
+};
+
+struct shoal_hdfs_output_stream {
+  uint64_t id;
+};
+
 struct shoal_authorizations {
   uint64_t id;
 };
@@ -274,6 +286,25 @@ struct shoal_key_value_result {
   shoal_bridge_scan_entry entry;
 };
 
+typedef struct shoal_bridge_hdfs_dir_entry {
+  char *name;
+  char *owner;
+  char *group;
+  int64_t size;
+  int64_t modification_time_ms;
+  uint32_t mode;
+  uint8_t is_directory;
+} shoal_bridge_hdfs_dir_entry;
+
+struct shoal_hdfs_dir_entry_result {
+  shoal_bridge_hdfs_dir_entry entry;
+};
+
+struct shoal_hdfs_dir_list_result {
+  size_t count;
+  shoal_bridge_hdfs_dir_entry *entries;
+};
+
 shoal_connector *shoal_bridge_connector_alloc(uint64_t id);
 uint64_t shoal_bridge_connector_id(const shoal_connector *connector);
 void shoal_bridge_connector_free(shoal_connector *connector);
@@ -313,6 +344,19 @@ void shoal_bridge_rfile_writer_free(shoal_rfile_writer *writer);
 shoal_rfile_seekable *shoal_bridge_rfile_seekable_alloc(uint64_t id);
 uint64_t shoal_bridge_rfile_seekable_id(const shoal_rfile_seekable *seekable);
 void shoal_bridge_rfile_seekable_free(shoal_rfile_seekable *seekable);
+shoal_hdfs_client *shoal_bridge_hdfs_client_alloc(uint64_t id);
+uint64_t shoal_bridge_hdfs_client_id(const shoal_hdfs_client *client);
+void shoal_bridge_hdfs_client_free(shoal_hdfs_client *client);
+shoal_hdfs_input_stream *
+shoal_bridge_hdfs_input_stream_alloc(uint64_t id);
+uint64_t
+shoal_bridge_hdfs_input_stream_id(const shoal_hdfs_input_stream *stream);
+void shoal_bridge_hdfs_input_stream_free(shoal_hdfs_input_stream *stream);
+shoal_hdfs_output_stream *
+shoal_bridge_hdfs_output_stream_alloc(uint64_t id);
+uint64_t
+shoal_bridge_hdfs_output_stream_id(const shoal_hdfs_output_stream *stream);
+void shoal_bridge_hdfs_output_stream_free(shoal_hdfs_output_stream *stream);
 shoal_authorizations *shoal_bridge_authorizations_alloc(uint64_t id);
 uint64_t
 shoal_bridge_authorizations_id(const shoal_authorizations *authorizations);
@@ -352,6 +396,23 @@ size_t shoal_bridge_string_list_count(const shoal_string_list_result *result);
 int shoal_bridge_string_list_get(const shoal_string_list_result *result,
                                  size_t index, shoal_bytes *out_value);
 void shoal_bridge_string_list_free(shoal_string_list_result *result);
+shoal_hdfs_dir_entry_result *shoal_bridge_hdfs_dir_entry_alloc(
+    const char *name, const char *owner, const char *group, int64_t size,
+    int64_t modification_time_ms, uint32_t mode, uint8_t is_directory);
+int shoal_bridge_hdfs_dir_entry_get(const shoal_hdfs_dir_entry_result *result,
+                                    shoal_hdfs_dir_entry_view *out_entry);
+void shoal_bridge_hdfs_dir_entry_free(shoal_hdfs_dir_entry_result *result);
+shoal_hdfs_dir_list_result *shoal_bridge_hdfs_dir_list_alloc(size_t count);
+int shoal_bridge_hdfs_dir_list_set(
+    shoal_hdfs_dir_list_result *result, size_t index, const char *name,
+    const char *owner, const char *group, int64_t size,
+    int64_t modification_time_ms, uint32_t mode, uint8_t is_directory);
+size_t
+shoal_bridge_hdfs_dir_list_count(const shoal_hdfs_dir_list_result *result);
+int shoal_bridge_hdfs_dir_list_get(const shoal_hdfs_dir_list_result *result,
+                                   size_t index,
+                                   shoal_hdfs_dir_entry_view *out_entry);
+void shoal_bridge_hdfs_dir_list_free(shoal_hdfs_dir_list_result *result);
 shoal_server_list_result *shoal_bridge_server_list_alloc(size_t count);
 int shoal_bridge_server_list_set(shoal_server_list_result *result, size_t index,
                                  const uint8_t *kind, size_t kind_length,
