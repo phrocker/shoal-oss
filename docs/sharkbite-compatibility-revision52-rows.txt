@@ -1,8 +1,8 @@
-# Revision-51 accepted matrix rows for docs/sharkbite-compatibility.md.
+# Revision-52 accepted matrix rows for docs/sharkbite-compatibility.md.
 # One entry per row: ROW-ID followed by the audited status, in document order.
 # Pinning the status next to the id means a swap of two rows' statuses inside one
 # section cannot pass the aggregate count checks undetected.
-# Update only when the independently audited revision-51 inventory itself changes.
+# Update only when the independently audited revision-52 inventory itself changes.
 # Regenerate from the audited document, review every added/removed/reclassified row
 # in code review, and keep the list in document order for human auditability.
 SB-PKG-001	Intentional divergence (approval required)
@@ -143,25 +143,25 @@ SB-DATA-065	Covered
 SB-DATA-066	Covered
 SB-DATA-067	Covered
 SB-DATA-068	Covered
-SB-SCAN-001	Behavior mismatch
-SB-SCAN-002	Behavior mismatch
-SB-SCAN-003	Missing C ABI
+SB-SCAN-001	Covered
+SB-SCAN-002	Covered
+SB-SCAN-003	Covered
 SB-SCAN-004	Covered
-SB-SCAN-005	Behavior mismatch
-SB-SCAN-006	Behavior mismatch
-SB-SCAN-007	Missing Go
-SB-SCAN-008	Missing Go
-SB-SCAN-009	Missing Go
-SB-SCAN-010	Behavior mismatch
-SB-SCAN-011	Missing C ABI
-SB-SCAN-028	Missing C ABI
-SB-SCAN-012	Behavior mismatch
+SB-SCAN-005	Covered
+SB-SCAN-006	Covered
+SB-SCAN-007	Intentional divergence (approval required)
+SB-SCAN-008	Intentional divergence (approval required)
+SB-SCAN-009	Intentional divergence (approval required)
+SB-SCAN-010	Covered
+SB-SCAN-011	Covered
+SB-SCAN-028	Covered
+SB-SCAN-012	Covered
 SB-SCAN-013	Not required (rationale required)
 SB-SCAN-014	Intentional divergence (approval required)
 SB-SCAN-015	Intentional divergence (approval required)
 SB-SCAN-016	Intentional divergence (approval required)
-SB-SCAN-017	Behavior mismatch
-SB-SCAN-018	Behavior mismatch
+SB-SCAN-017	Covered
+SB-SCAN-018	Covered
 SB-SCAN-019	Covered
 SB-SCAN-020	Covered
 SB-SCAN-021	Covered
@@ -201,21 +201,21 @@ SB-PANDA-018	Missing C ABI
 SB-PANDA-019	Missing C ABI
 SB-PANDA-020	Missing C ABI
 SB-PANDA-021	Missing C ABI
-SB-WRITE-001	Behavior mismatch
-SB-WRITE-002	Behavior mismatch
-SB-WRITE-003	Behavior mismatch
-SB-WRITE-004	Behavior mismatch
-SB-WRITE-005	Missing C ABI
-SB-WRITE-023	Missing C ABI
+SB-WRITE-001	Covered
+SB-WRITE-002	Covered
+SB-WRITE-003	Covered
+SB-WRITE-004	Covered
+SB-WRITE-005	Covered
+SB-WRITE-023	Covered
 SB-WRITE-006	Covered
 SB-WRITE-007	Not required (rationale required)
 SB-WRITE-008	Not required (rationale required)
 SB-WRITE-009	Not required (rationale required)
-SB-WRITE-010	Behavior mismatch
+SB-WRITE-010	Intentional divergence (approval required)
 SB-WRITE-011	Not required (rationale required)
-SB-WRITE-012	Behavior mismatch
+SB-WRITE-012	Covered
 SB-WRITE-013	Not required (rationale required)
-SB-WRITE-014	Behavior mismatch
+SB-WRITE-014	Covered
 SB-WRITE-015	Not required (rationale required)
 SB-WRITE-016	Covered
 SB-WRITE-017	Covered
