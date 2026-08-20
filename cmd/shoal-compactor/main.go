@@ -34,9 +34,9 @@
 //     a. Generate a fresh externalCompactionId (ECID).
 //     b. Call getCompactionJob(group, host:port, ecid).
 //     c. If the returned job has no ECID set, sleep and retry.
-//     d. Otherwise: translate the job into an executable plan
-//     (internal/compactjob) and release the slot back to the
-//     coordinator, because the commit RPC does not exist yet (below).
+//     d. Otherwise: capability-gate the job, resolve effective table and
+//     storage configuration, execute it, durably publish the temporary
+//     output, and call the manager-authoritative completion RPC.
 //
 // The coordinator address is re-resolved before every connection
 // attempt, so a manager failover is tolerated without a restart: while
@@ -67,25 +67,20 @@
 // those authoritative fields would be redundant and weaker than using the
 // manager's stored assignment. Shoal never writes metadata or ZooKeeper.
 //
-// The isolated executor and completion adapter live in internal/compactexec.
-// This polling binary remains unwired until startup can construct the correct
-// storage backend and resolve the table's complete output configuration. What
-// it does do,
-// for every job it is handed, is decide up front whether shoal could
+// The executor and completion adapter live in internal/compactexec. For every
+// job it is handed, the worker decides up front whether shoal could
 // reproduce that compaction cell-for-cell: internal/compactjob
 // translates the assignment into an executable plan (inputs, iterator
 // stack, output encoding) and refuses anything it cannot reproduce —
-// a row-fenced input file, an iterator shoal has not ported, an
-// encryption or codec setting it cannot write. The job is then released
-// with a class naming the exact reason, so a Java compactor picks it up
-// and the operator can see from the manager's log why shoal declined.
+// a row-fenced input file, an iterator shoal has not ported, or an output
+// feature/storage volume it cannot reproduce. Unsupported jobs are released
+// with a class naming the exact reason so a Java compactor can pick them up.
 //
-// Translating before releasing is not busywork: it is the gate that keeps
-// execution honest. The accepted plan is already the input to
-// compactexec.Executor, and the refusals stay exactly where they are — so
-// wiring the worker cannot write files it does not fully understand. Until
-// then every path out of executeJob tries to
-// hand the slot back, within the -release-timeout budget.
+// Translation is the gate that keeps execution honest. A durable local
+// journal fences the single compactionCompleted attempt. After a timeout or
+// restart, the worker reconciles the ECID through the coordinator's running
+// and completed maps, retaining the temporary output while manager acceptance
+// remains ambiguous.
 //
 // That is a bounded attempt, not a guarantee, and it has exactly two
 // exceptions: a job whose own extent the coordinator could not act on
@@ -102,22 +97,33 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
+	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 
+	"github.com/apache/thrift/lib/go/thrift"
 	"github.com/google/uuid"
 
 	"github.com/phrocker/shoal/internal/cclient"
+	"github.com/phrocker/shoal/internal/compactexec"
 	"github.com/phrocker/shoal/internal/compactjob"
 	"github.com/phrocker/shoal/internal/cred"
+	"github.com/phrocker/shoal/internal/managerclient"
+	"github.com/phrocker/shoal/internal/namespaces"
+	"github.com/phrocker/shoal/internal/protocol"
+	"github.com/phrocker/shoal/internal/storage/hdfs"
+	"github.com/phrocker/shoal/internal/tablenames"
 	"github.com/phrocker/shoal/internal/thrift/gen/client"
 	"github.com/phrocker/shoal/internal/thrift/gen/compactioncoordinator"
 	"github.com/phrocker/shoal/internal/thrift/gen/security"
 	"github.com/phrocker/shoal/internal/thrift/gen/tabletserver"
+	"github.com/phrocker/shoal/internal/transportpool"
 	"github.com/phrocker/shoal/internal/zk"
 )
 
@@ -128,18 +134,14 @@ var version = "dev"
 // metadata are interchangeable across the two compactor pools.
 const ecidPrefix = compactjob.ECIDPrefix
 
-// maxJobsPerDrain caps how many jobs one connection accepts before the
-// loop goes back to its idle backoff. Every job shoal takes today is
-// handed straight back, and the coordinator may hand the same one to
-// the same compactor again; without a cap the pair would spin as fast
-// as the network allows. Draining a few keeps a queue of jobs shoal
-// *could* later execute moving, while the outer loop's exponential
-// backoff damps a persistent refusal to one round trip per -max-wait.
+// maxJobsPerDrain caps how many jobs one connection accepts before the loop
+// returns to discovery/backoff, preventing a stream of refusals from spinning.
 const maxJobsPerDrain = 4
 
 func main() {
 	showVersion := flag.Bool("version", false, "print version and exit")
 	advertiseAddr := flag.String("advertise", "", "host:port the coordinator records as this compactor's address (e.g. POD_IP:9810). REQUIRED.")
+	listenAddr := flag.String("listen", "", "CompactorService listen address; defaults to -advertise")
 	groupName := flag.String("group", "shoal_default", "compactor resource-group name; coordinator routes jobs by group")
 	coordinatorAddr := flag.String("coordinator", "", "host:port override for the manager's CompactionCoordinator. Default (empty): discover it from the manager's ServiceLock data in /accumulo/<uuid>/managers/lock (ThriftService.COORDINATOR) and re-resolve it across manager failover.")
 	zkServers := flag.String("zk", "", "comma-separated ZK quorum")
@@ -156,6 +158,11 @@ func main() {
 	maxInputFiles := flag.Int("max-input-files", compactjob.DefaultMaxInputFiles, "refuse jobs with more input files than this (0 = no limit); the composer merges every input in one pass")
 	maxInputBytes := flag.Int64("max-input-bytes", compactjob.DefaultMaxTotalInputBytes, "refuse jobs whose declared inputs total more than this many bytes (0 = no limit); the composer reads whole RFile images into memory, so this bounds the read side only — see -max-output-bytes for the write side")
 	maxOutputBytes := flag.Int64("max-output-bytes", compactjob.DefaultMaxOutputBytes, "abandon a compaction whose output image grows past this many bytes (0 = no limit); the output is retained in memory and is not bounded by the input total, since compressed inputs rewritten with codec \"none\" and stacks that emit extra cells both expand")
+	hdfsNamenode := flag.String("hdfs-namenode", os.Getenv("SHOAL_HDFS_NAMENODE"), "HDFS namenode authority; defaults to SHOAL_HDFS_NAMENODE")
+	stateFile := flag.String("state-file", filepath.Join(".shoal-compactor", "completion.json"), "durable completion-reconciliation journal")
+	cancelInterval := flag.Duration("cancel-interval", time.Second, "interval for observing coordinator cancellation (0 disables)")
+	reconcileGrace := flag.Duration("completion-reconcile-grace", 2*time.Minute, "minimum age before an ambiguous completion absent from both coordinator maps may be cleaned up")
+	metricsAddress := flag.String("metrics-address", "", "HTTP health/readiness/metrics listener; empty disables")
 	logLevel := flag.String("log-level", "info", "slog level: debug, info, warn, error")
 	flag.Parse()
 
@@ -186,6 +193,12 @@ func main() {
 	if err := validateLimits(*maxInputFiles, *maxInputBytes, *maxOutputBytes); err != nil {
 		die("shoal-compactor: %v", err)
 	}
+	if *cancelInterval < 0 {
+		die("shoal-compactor: -cancel-interval must not be negative")
+	}
+	if *reconcileGrace <= 0 {
+		die("shoal-compactor: -completion-reconcile-grace must be positive")
+	}
 
 	coordinatorSource := *coordinatorAddr
 	if coordinatorSource == "" {
@@ -210,6 +223,51 @@ func main() {
 
 	creds := cred.NewPasswordCreds(*user, *password, loc.InstanceID())
 
+	storageCtx, storageCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	hdfsBackend, err := hdfs.NewContext(storageCtx, *hdfsNamenode)
+	storageCancel()
+	if err != nil {
+		die("shoal-compactor: hdfs.NewContext: %v", err)
+	}
+	defer hdfsBackend.Close()
+
+	pool, err := transportpool.New(transportpool.Config{IdleTimeout: 30 * time.Second, MaxIdlePerEndpoint: 2})
+	if err != nil {
+		die("shoal-compactor: transport pool: %v", err)
+	}
+	manager, err := managerclient.NewPooled(pool, loc.InstanceID(), *accVersion, creds, *connectTimeout)
+	if err != nil {
+		die("shoal-compactor: manager client: %v", err)
+	}
+	defer manager.Close()
+
+	namespaceNames := namespaces.NewResolver(loc)
+	tableNames := tablenames.NewResolver(loc, namespaceNames)
+	limits := compactjob.Limits{
+		MaxInputFiles:      *maxInputFiles,
+		MaxTotalInputBytes: *maxInputBytes,
+		MaxOutputBytes:     *maxOutputBytes,
+	}
+	metrics := &workerMetrics{}
+	role := &compactorRole{}
+	jobWorker := &worker{
+		logger:         logger,
+		creds:          creds,
+		config:         effectiveTableOptions{locator: loc, names: tableNames, manager: manager, limits: limits},
+		store:          compactexec.BackendStore{Backend: hdfsBackend},
+		journal:        &fileCompletionJournal{path: *stateFile},
+		cancelEvery:    *cancelInterval,
+		cleanupTimeout: *releaseTimeout,
+		reconcileGrace: *reconcileGrace,
+		limits:         limits,
+		metrics:        metrics,
+		validateStore:  hdfsPlanValidator(*hdfsNamenode),
+		role:           role,
+	}
+	jobWorker.newExecutor = func(reporter compactexec.Reporter) (executor, error) {
+		return compactexec.New(jobWorker.store, compactexec.Options{Reporter: reporter, Logger: logger})
+	}
+
 	// An explicit -coordinator pins the address (useful for debugging a
 	// specific manager); otherwise every dial attempt re-reads the
 	// manager's published COORDINATOR descriptor.
@@ -223,6 +281,49 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	if *listenAddr == "" {
+		*listenAddr = *advertiseAddr
+	}
+	multiplexed := thrift.NewTMultiplexedProcessor()
+	multiplexed.RegisterProcessor("compactor", compactioncoordinator.NewCompactorServiceProcessor(role))
+	transportFactory := thrift.NewTFramedTransportFactoryConf(
+		thrift.NewTBufferedTransportFactory(8192),
+		&thrift.TConfiguration{},
+	)
+	serverSocket, err := thrift.NewTServerSocket(*listenAddr)
+	if err != nil {
+		die("shoal-compactor: CompactorService socket %s: %v", *listenAddr, err)
+	}
+	roleServer := thrift.NewTSimpleServer4(
+		multiplexed,
+		serverSocket,
+		transportFactory,
+		protocol.NewServerFactory(loc.InstanceID(), *accVersion),
+	)
+	go func() {
+		if err := roleServer.Serve(); err != nil && !errors.Is(err, net.ErrClosed) {
+			logger.Error("CompactorService failed", slog.String("err", err.Error()))
+			cancel()
+		}
+	}()
+	defer roleServer.Stop()
+
+	if *metricsAddress != "" {
+		server := &http.Server{Addr: *metricsAddress, Handler: workerOperationsHandler(metrics), ReadHeaderTimeout: 5 * time.Second}
+		go func() {
+			if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				logger.Error("metrics server failed", slog.String("err", err.Error()))
+				cancel()
+			}
+		}()
+		defer func() {
+			metrics.ready.Store(false)
+			shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer shutdownCancel()
+			_ = server.Shutdown(shutdownCtx)
+		}()
+	}
+
 	stopCh := make(chan os.Signal, 1)
 	signal.Notify(stopCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
@@ -234,6 +335,21 @@ func main() {
 	dialOpts := cclient.DialOptions{
 		ConnectTimeout: *connectTimeout,
 		RPCTimeout:     *rpcTimeout,
+	}
+	jobWorker.isRunning = func(ctx context.Context, ecid string) (bool, error) {
+		conn, err := redialCoordinator(ctx, pollConfig{
+			resolver: resolver,
+			dial: func(ctx context.Context, addr, instanceID, accumuloVersion string) (coordinatorConn, error) {
+				return dialCoordinator(ctx, addr, instanceID, accumuloVersion, dialOpts)
+			},
+			instanceID: loc.InstanceID(), accumuloVersion: *accVersion,
+		})
+		if err != nil {
+			return false, err
+		}
+		defer conn.Close()
+		running, err := conn.Raw().GetRunningCompactions(ctx, client.NewTInfo(), creds)
+		return containsCompaction(running, ecid), err
 	}
 
 	runPollLoop(ctx, logger, pollConfig{
@@ -249,12 +365,10 @@ func main() {
 		minWait:         *minWait,
 		maxWait:         *maxWait,
 		releaseTimeout:  *releaseTimeout,
+		worker:          jobWorker,
+		metrics:         metrics,
 		jobOptions: compactjob.Options{
-			Limits: compactjob.Limits{
-				MaxInputFiles:      *maxInputFiles,
-				MaxTotalInputBytes: *maxInputBytes,
-				MaxOutputBytes:     *maxOutputBytes,
-			},
+			Limits: limits,
 		},
 	})
 
@@ -338,6 +452,8 @@ type pollConfig struct {
 	// jobOptions carries the translation defaults and resource limits
 	// applied to every job the coordinator assigns.
 	jobOptions compactjob.Options
+	worker     *worker
+	metrics    *workerMetrics
 }
 
 // runPollLoop is the main service loop. It re-dials the coordinator on
@@ -360,6 +476,9 @@ func runPollLoop(ctx context.Context, logger *slog.Logger, cfg pollConfig) {
 
 		addr, err := cfg.resolver.Address(ctx)
 		if err != nil {
+			if cfg.metrics != nil {
+				cfg.metrics.ready.Store(false)
+			}
 			if ctx.Err() != nil {
 				return
 			}
@@ -394,6 +513,9 @@ func runPollLoop(ctx context.Context, logger *slog.Logger, cfg pollConfig) {
 
 		cc, err := cfg.dial(ctx, addr, cfg.instanceID, cfg.accumuloVersion)
 		if err != nil {
+			if cfg.metrics != nil {
+				cfg.metrics.ready.Store(false)
+			}
 			recovering = true
 			logger.Warn("coordinator dial failed; backing off",
 				slog.String("addr", addr),
@@ -408,6 +530,37 @@ func runPollLoop(ctx context.Context, logger *slog.Logger, cfg pollConfig) {
 		if recovering {
 			wait = cfg.minWait
 			recovering = false
+		}
+		if cfg.worker != nil {
+			pending, reconcileErr := cfg.worker.reconcilePending(ctx, cc.Raw())
+			if reconcileErr != nil {
+				if cfg.metrics != nil {
+					cfg.metrics.ready.Store(false)
+				}
+				logger.Warn("pending completion reconciliation failed; will reconnect",
+					slog.String("err", reconcileErr.Error()))
+				_ = cc.Close()
+				if !sleepCtx(ctx, wait) {
+					return
+				}
+				wait = nextWait(wait, cfg.maxWait)
+				continue
+			}
+			if pending {
+				if cfg.metrics != nil {
+					cfg.metrics.ready.Store(false)
+				}
+				logger.Info("completion remains authoritative-manager pending; not accepting another job")
+				_ = cc.Close()
+				if !sleepCtx(ctx, wait) {
+					return
+				}
+				wait = nextWait(wait, cfg.maxWait)
+				continue
+			}
+		}
+		if cfg.metrics != nil {
+			cfg.metrics.ready.Store(true)
 		}
 
 		// One connection, drain jobs until the coordinator says "no work"
@@ -521,24 +674,15 @@ func drainCoordinator(ctx context.Context, logger *slog.Logger, cc coordinatorCo
 	}
 }
 
-// executeJob decides what shoal would do with one assignment and hands
-// the slot back. It reports whether cc is still usable for further RPCs.
+// executeJob capability-gates one assignment, then either runs it through the
+// worker or hands it back with a structured refusal. It reports whether cc is
+// still usable and whether the slot is no longer safe to poll against.
 //
-// Two outcomes, both ending in a release:
-//
-//   - The job translates. shoal has verified it could reproduce this
-//     compaction exactly — inputs are whole files, every iterator is
-//     ported and its options parse, the output encoding is writable.
-//     The polling worker is not yet wired to the isolated executor and a
-//     configured storage backend, so the job goes back with
-//     ClassExecutionUnavailable. The plan is logged at info: that line is
-//     the evidence that shoal's translation of a real production job is
-//     correct, and it is what the execution slice will act on.
-//
-//   - The job is refused. Something in it is malformed, or names a
-//     capability shoal has not ported. The refusal's class travels to the
-//     coordinator, so the manager log says *why* shoal declined instead
-//     of a generic failure.
+// Supported jobs resolve stable effective table configuration, validate the
+// configured HDFS authority, execute, publish, and call compactionCompleted.
+// Unsupported or failed jobs call compactionFailed. An ambiguous completion
+// is the sole retained-slot case: its durable journal is reconciled before the
+// process accepts more work.
 //
 // What never happens here is a metadata or ZooKeeper write. The manager
 // remains the only process that decides a compaction happened.
@@ -576,10 +720,28 @@ func executeJob(
 		return releaseJob(ctx, logger, cc, cfg, job, refusal.Class)
 	}
 
-	logger.Info("compaction job translated; releasing (isolated executor is not wired to this worker)",
-		slog.String("ecid", ecid),
-		slog.Any("plan", plan))
-	return releaseJob(ctx, logger, cc, cfg, job, compactjob.ClassExecutionUnavailable)
+	if cfg.worker == nil {
+		logger.Info("compaction job translated; releasing (isolated executor is not wired to this worker)",
+			slog.String("ecid", ecid),
+			slog.Any("plan", plan))
+		return releaseJob(ctx, logger, cc, cfg, job, compactjob.ClassExecutionUnavailable)
+	}
+
+	outcome := cfg.worker.process(ctx, cc.Raw(), job)
+	switch {
+	case outcome.completed:
+		logger.Info("compaction completed through manager authority", slog.String("ecid", ecid))
+		return true, true
+	case outcome.coordinatorReleased:
+		logger.Info("compaction cancelled and released by coordinator", slog.String("ecid", ecid))
+		return true, true
+	case outcome.ambiguous:
+		logger.Warn("compaction completion remains ambiguous; slot retained for reconciliation",
+			slog.String("ecid", ecid))
+		return false, false
+	default:
+		return releaseJob(ctx, logger, cc, cfg, job, outcome.class)
+	}
 }
 
 // unreleasableReason reports why the coordinator could not act on a
@@ -667,11 +829,15 @@ func releaseJob(
 ) (connUsable, released bool) {
 	ecid := job.GetExternalCompactionId()
 	shuttingDown := ctx.Err() != nil
+	failureState := compactioncoordinator.TCompactionState_FAILED
 	if shuttingDown {
 		// The job was accepted before the signal arrived; say so, so the
 		// manager log distinguishes "shoal cannot do this" from "shoal
 		// went away mid-assignment".
 		class = compactjob.ClassShuttingDown
+		failureState = compactioncoordinator.TCompactionState_CANCELLED
+	} else if class == compactjob.ClassShuttingDown {
+		failureState = compactioncoordinator.TCompactionState_CANCELLED
 	}
 
 	// A hand-back the coordinator cannot process is worse than no
@@ -803,7 +969,7 @@ func releaseJob(
 			ecid,
 			job.GetExtent(),
 			class,
-			compactioncoordinator.TCompactionState_FAILED,
+			failureState,
 		)
 		setActive(nil)
 		if err == nil {

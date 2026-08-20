@@ -149,6 +149,14 @@ qualified HDFS paths indirectly (for example, through Accumulo metadata);
 otherwise authority-less paths use the Hadoop default cluster. Simple
 authentication uses `HADOOP_USER_NAME` when set.
 
+**External compactor.** `shoal-compactor` discovers the active coordinator,
+serves Accumulo's multiplexed `CompactorService` on `-listen` (default:
+`-advertise`), and executes capability-gated HDFS jobs. Configure
+`-hdfs-namenode`/`SHOAL_HDFS_NAMENODE` and persist `-state-file` across
+restarts so an ambiguous `compactionCompleted` response can be reconciled
+without duplicate completion or premature output cleanup. Optional
+`-metrics-address` exposes `/healthz`, `/readyz`, and `/metrics`.
+
 **Complex graph & vector operations, pushed down.** Rather than streaming
 whole row ranges to the client, the engine runs server-side iterators next
 to the data and returns only what the query needs:

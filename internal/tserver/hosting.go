@@ -168,6 +168,11 @@ func (a Attempt) Valid() bool { return a.id != 0 }
 // Extent returns the tablet this attempt was minted for.
 func (a Attempt) Extent() Extent { return a.extent.clone() }
 
+// Assignment returns the process-local assignment generation carried by the
+// attempt. It is used when stamping data-plane requests with the same
+// assignment identity as the hosting lifecycle.
+func (a Attempt) Assignment() uint64 { return a.id }
+
 // Equal reports whether both handles name the same assignment. An Attempt
 // carries row bounds, so it is not comparable with ==; use this instead.
 func (a Attempt) Equal(other Attempt) bool {
@@ -555,6 +560,41 @@ func (h *Host) Hosted() []Extent {
 	}
 	sort.Slice(hosted, func(i, j int) bool { return compareExtents(hosted[i], hosted[j]) < 0 })
 	return hosted
+}
+
+// VerifyHosted proves that attempt still names a hosted tablet under fence.
+// Data-plane implementations call this immediately before durable work and
+// again before acknowledging it.
+func (h *Host) VerifyHosted(fence Fence, attempt Attempt) error {
+	return h.verifyAssignedState(fence, attempt, StateHosted)
+}
+
+// VerifyAssigned proves that attempt still names a tablet in either loading
+// or hosted state. It is used while recovery constructs a tablet before
+// LoadComplete publishes it to data-plane routing.
+func (h *Host) VerifyAssigned(fence Fence, attempt Attempt) error {
+	return h.verifyAssignedState(fence, attempt, StateLoading, StateHosted)
+}
+
+func (h *Host) verifyAssignedState(fence Fence, attempt Attempt, allowed ...HostingState) error {
+	if !attempt.Valid() {
+		return fmt.Errorf("%w: attempt was never assigned", ErrStaleAttempt)
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if err := h.checkFence(fence); err != nil {
+		return err
+	}
+	entry, ok := h.tablets[attempt.extent.key()]
+	if !ok || entry.attempt != attempt.id {
+		h.metrics.RejectedStale++
+		return fmt.Errorf("%w: %s", ErrStaleAttempt, attempt.extent)
+	}
+	if !slices.Contains(allowed, entry.state) {
+		return fmt.Errorf("%w: %s is %s, want one of %v",
+			ErrWrongState, entry.extent, entry.state, allowed)
+	}
+	return nil
 }
 
 // Tablets returns every tracked tablet with its state, in extent order —
