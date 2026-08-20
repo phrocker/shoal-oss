@@ -136,6 +136,12 @@ Parquet files are sorted into row groups with row statistics and bloom filters,
 so bounded SQL predicates prune unrelated groups instead of decoding the whole
 file.
 
+ShoalQL also has an Accumulo client backend with the same scalar, graph,
+document, and exact-vector semantics. It pushes native scan constraints and
+uses an explicit deterministic local fallback for Shoal-only iterators; it
+does not claim distributed approximate-vector support. See
+[`docs/shoalql-accumulo.md`](docs/shoalql-accumulo.md).
+
 Use `shoal-sql --explain --query 'SELECT ...'` to print the physical plan and
 the table's configured write format, authoritative read formats, and mixed
 migration state without executing the query. Reproduce the pruning benchmark

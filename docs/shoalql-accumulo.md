@@ -1,0 +1,28 @@
+# Accumulo-backed ShoalQL
+
+`internal/shoalql/accumulobackend` runs the existing ShoalQL plans through the
+public Accumulo client. It pushes row ranges, inclusive column-family
+restrictions, scan authorizations, cancellation/deadlines, and RPC page size to
+`BatchScanner`. Row hydration and graph traversal use batched row ranges.
+`WriteCells` preserves row, column, visibility, timestamp, value, and tombstone
+semantics through `BatchWriter`, independent of whether promoted data
+originated in RFile or Parquet.
+
+Shoal iterator implementations do not have compatible distributed Java class
+lifecycle in this slice. Scanner pages are therefore materialized, globally
+key-sorted, and replayed through the local iterator runtime for document
+reconstruction, aggregation, `AS OF`, and exact vector ranking. This fallback
+is deterministic: exact top-k uses score descending and full-key ascending as
+the tie-break. Because a standard Accumulo scan may apply versioning before the
+client sees cells, `AS OF` is rejected unless `HistoricalVersions` explicitly
+confirms that the configured scanner/replay retains historical versions.
+
+Approximate vector search is intentionally **unsupported**. There is no
+distributed IVF-PQ owner, build/rebuild protocol, freshness fence, partition
+routing contract, or recall declaration. `EXPLAIN` reports that reason and the
+exact full-candidate fallback rather than claiming an approximate index.
+
+The cross-backend corpus test covers RFile, Parquet, mixed local tables, and an
+Accumulo scanner replay. The optional live test is gated by
+`SHOAL_ACCUMULO_LIVE=1` and skips with an unsupported reason when Docker or an
+external Accumulo endpoint is unavailable.
