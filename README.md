@@ -264,14 +264,14 @@ tserver in that case.
 ## Offline compaction
 
 `shoal-offline-compact` runs a full major compaction of an **OFFLINE**
-Accumulo table's tablets from a standalone process — no tserver, manager,
-or compaction coordinator in the loop. It reads each tablet's input
-RFiles, applies the resolved `table.iterator.majc.*` stack, writes one
-compacted output RFile per tablet, verifies it byte-for-byte, and hands
-off the metadata delta under an OFFLINE continuity fence. The default
-commit mode emits a machine-readable plan for an Ample-based applier
-(keeping metadata-write authority in Accumulo); a direct-write mode is
-opt-in.
+Accumulo table's tablets from a standalone process — no tserver or compaction
+coordinator in the compaction work. It reads each tablet's input RFiles,
+applies the resolved `table.iterator.majc.*` stack, writes one compacted output
+RFile per tablet, verifies it byte-for-byte, and emits a machine-readable
+metadata commit plan under an OFFLINE continuity fence. Only plan generation
+is release-approved today: do not apply it with a standalone Ample/shell
+writer or use direct mode. Application awaits a supported
+manager/coordinator/FATE operation carrying current authority proof.
 
 - [Design & safety model](docs/offline-compaction-design.md)
 - [Operator runbook](docs/offline-compaction.md)

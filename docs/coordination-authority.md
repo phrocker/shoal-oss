@@ -127,11 +127,11 @@ manifest. Accumulo mode keeps it in a manager-owned Shoal authority record in
 Accumulo authoritative metadata; changing that record requires a supported
 manager/FATE operation, never a direct metadata mutation. The Accumulo adapter
 must verify the record's epoch when issuing assignments or jobs. A handoff
-prepares epoch `E+1` while both domains are non-writable, records `E+1` through
-the destination manager, retires source epoch `E`, and only then activates the
-destination. Native manifest generations, Kubernetes resource versions, and
-ServiceLock sequences remain backend proof and are never compared with one
-another.
+first fences the destination and reserves epoch `E+1` while the source may
+still be writable at epoch `E`; it then freezes and retires source epoch `E`
+before activating destination epoch `E+1`. Native manifest generations,
+Kubernetes resource versions, and ServiceLock sequences remain backend proof
+and are never compared with one another.
 
 The `Attempt` component prevents a delayed completion from applying to a later
 operation that happens to run under the same process lease. This matches the
