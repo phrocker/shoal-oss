@@ -45,6 +45,7 @@ func TestImportFanInMergesReimport(t *testing.T) {
 	}
 
 	manifestA := exportInto([]string{"a", "b"}, 100)
+	dstBackend.Put(filepath.Join(dstDir, "graph", "t-0000", "orphan.rf"), []byte("not an rfile"))
 
 	cluster, err := Open(dstDir, Options{Backend: dstBackend})
 	if err != nil {
@@ -60,7 +61,6 @@ func TestImportFanInMergesReimport(t *testing.T) {
 
 	// Producer B ships additional RFiles into the same destination.
 	manifestB := exportInto([]string{"c", "d"}, 200)
-	dstBackend.Put(filepath.Join(dstDir, "graph", "t-0000", "orphan.rf"), []byte("not an rfile"))
 
 	// Re-import registers only checksum-verified manifest entries. The
 	// unrelated orphan under the same prefix must never become queryable.

@@ -36,6 +36,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -594,6 +595,11 @@ func (t *Tablet) Compact(stack []iterrt.IterSpec) error {
 		obsolete[filepath.Base(old)] = struct{}{}
 	}
 	if err := persistImmutableManifest(t.backend, t.dir, []string{outPath}, obsolete); err != nil {
+		if storage.IsCommittedWriteError(err) {
+			t.files = []string{outPath}
+			t.obsolete = obsolete
+			return fmt.Errorf("tablet: publish compacted generation committed with cleanup error: %w", err)
+		}
 		_ = removeObject(t.backend, outPath)
 		return fmt.Errorf("tablet: publish compacted generation: %w", err)
 	}
@@ -710,6 +716,17 @@ func (t *Tablet) flushLocked() error {
 
 	files := append(append([]string(nil), t.files...), outPath)
 	if err := persistImmutableManifest(t.backend, t.dir, files, t.obsolete); err != nil {
+		if storage.IsCommittedWriteError(err) {
+			t.files = files
+			t.active = newSkiplistMemtable()
+			if truncateErr := t.wal.Truncate(); truncateErr != nil {
+				return errors.Join(
+					fmt.Errorf("flush: generation committed with cleanup error: %w", err),
+					fmt.Errorf("flush: truncate wal after committed generation: %w", truncateErr),
+				)
+			}
+			return fmt.Errorf("flush: generation committed with cleanup error: %w", err)
+		}
 		_ = removeObject(t.backend, outPath)
 		return fmt.Errorf("flush: publish generation: %w", err)
 	}
@@ -996,7 +1013,24 @@ func cloneObsolete(in map[string]struct{}) map[string]struct{} {
 // tablet directory. Importers call it after checksum verification so stale
 // objects already present under the destination prefix are not rediscovered.
 func PublishImmutableFiles(b storage.Backend, dir string, active []string) error {
-	return persistImmutableManifest(b, dir, active, nil)
+	keys, err := listTabletObjects(b, dir)
+	if err != nil {
+		return err
+	}
+	activeNames := make(map[string]struct{}, len(active))
+	for _, path := range active {
+		activeNames[filepath.Base(path)] = struct{}{}
+	}
+	obsolete := make(map[string]struct{})
+	for _, key := range keys {
+		if ext := filepath.Ext(key); ext == ".rf" || ext == ".parquet" {
+			name := filepath.Base(key)
+			if _, ok := activeNames[name]; !ok {
+				obsolete[name] = struct{}{}
+			}
+		}
+	}
+	return persistImmutableManifest(b, dir, active, obsolete)
 }
 
 // RegisterImmutableFiles adds only checksum-verified import objects to the
