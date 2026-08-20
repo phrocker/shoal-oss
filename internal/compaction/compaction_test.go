@@ -47,6 +47,7 @@ func TestCompactContextCancellation(t *testing.T) {
 		if p.EntriesWritten == 1 {
 			cancel()
 		}
+
 	})
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("CompactContext error = %v, want context.Canceled", err)
@@ -416,6 +417,19 @@ func TestCompact_OutputBudgetCatchesTheClosingFlush(t *testing.T) {
 	}
 }
 
+func TestCompact_OutputBudgetCatchesParquetOutput(t *testing.T) {
+	in := []kv{{K: mk("r", "cf", "cq", 1), V: strings.Repeat("x", 4096)}}
+	_, err := Compact(Spec{
+		Inputs:         []Input{{Name: "f1", Bytes: buildRFile(t, in)}},
+		Scope:          iterrt.ScopeMajc,
+		OutputFormat:   "parquet",
+		MaxOutputBytes: 64,
+	})
+	if !errors.Is(err, ErrOutputTooLarge) {
+		t.Fatalf("Compact err = %v, want ErrOutputTooLarge", err)
+	}
+}
+
 // TestCompact_OutputBudgetRefusesTheWriteRatherThanNoticingAfterwards:
 // a cell can be arbitrarily larger than BlockSize, so a single flush can
 // carry an unbounded amount of data. The budget has to refuse that write
@@ -530,5 +544,31 @@ func TestCompact_ZeroOutputBudgetIsUnlimited(t *testing.T) {
 	}
 	if len(res.Output) <= 64*1024 {
 		t.Fatalf("output is %d bytes; the fixture must exceed the budget the other tests set", len(res.Output))
+	}
+}
+
+func TestCompactContextParquetCancellationAndProgress(t *testing.T) {
+	input := buildRFile(t, []kv{
+		{K: mk("a", "", "", 1), V: "a"},
+		{K: mk("b", "", "", 1), V: "b"},
+		{K: mk("c", "", "", 1), V: "c"},
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	var observed int64
+	_, err := CompactContext(ctx, Spec{
+		Inputs:       []Input{{Name: "in.rf", Bytes: input}},
+		Scope:        iterrt.ScopeMajc,
+		OutputFormat: "parquet",
+	}, func(p Progress) {
+		observed = p.EntriesWritten
+		if observed == 1 {
+			cancel()
+		}
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("CompactContext parquet error = %v, want context.Canceled", err)
+	}
+	if observed != 1 {
+		t.Fatalf("observed entries = %d, want 1", observed)
 	}
 }

@@ -252,6 +252,89 @@ func (e *Engine) Scan(tableName string, r iterrt.Range, opts ScanOptions) (*Scan
 	return tbl.scan(r, opts)
 }
 
+// SetTableFileFormat changes the immutable format used by future flushes and
+// compactions. Existing RFile and Parquet files remain readable together.
+func (e *Engine) SetTableFileFormat(tableName string, format tablet.FileFormat) error {
+	return e.SetTableStorageFormat(tableName, StorageFormat(format))
+}
+
+// SetTableStorageFormat changes the immutable format through the engine-level,
+// format-neutral API. Existing immutable files remain readable during migration.
+func (e *Engine) SetTableStorageFormat(tableName string, format StorageFormat) error {
+	parsed, err := ParseStorageFormat(string(format))
+	if err != nil {
+		return err
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	tbl, ok := e.tables[tableName]
+	if !ok {
+		return fmt.Errorf("engine: table %q not found", tableName)
+	}
+	return tbl.setFileFormat(tablet.FileFormat(parsed))
+}
+
+// MigrateTableStorageFormat atomically selects the write format, flushes, and
+// compacts a table so concurrent migrations cannot report a format they did
+// not persist.
+func (e *Engine) MigrateTableStorageFormat(tableName string, format StorageFormat, stack []iterrt.IterSpec) error {
+	parsed, err := ParseStorageFormat(string(format))
+	if err != nil {
+		return err
+	}
+	e.mu.RLock()
+	tbl, ok := e.tables[tableName]
+	e.mu.RUnlock()
+	if !ok {
+		return fmt.Errorf("engine: table %q not found", tableName)
+	}
+	if err := tbl.migrate(tablet.FileFormat(parsed), stack); err != nil {
+		return err
+	}
+	e.metrics.flushes.Add(1)
+	e.metrics.compactions.Add(1)
+	return nil
+}
+
+// StoragePolicy describes the configured write format and the formats
+// currently read from the table's authoritative immutable generation.
+type StoragePolicy struct {
+	Workload    WorkloadProfile
+	WriteFormat StorageFormat
+	ReadFormats []StorageFormat
+	Mixed       bool
+	Role        string
+}
+
+// TableStoragePolicy returns a stable snapshot suitable for status and EXPLAIN.
+func (e *Engine) TableStoragePolicy(tableName string) (StoragePolicy, error) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	tbl, ok := e.tables[tableName]
+	if !ok {
+		return StoragePolicy{}, fmt.Errorf("engine: table %q not found", tableName)
+	}
+	policy := StoragePolicy{
+		WriteFormat: StorageFormat(tbl.fileFormat()),
+		Role:        "authoritative",
+	}
+	if policy.WriteFormat == StorageFormatParquet {
+		policy.Workload = WorkloadAnalytical
+	} else {
+		policy.Workload = WorkloadOperational
+	}
+	seen := make(map[StorageFormat]struct{})
+	for _, file := range tbl.rfiles() {
+		seen[StorageFormat(fileFormatForPath(file.Path))] = struct{}{}
+	}
+	for format := range seen {
+		policy.ReadFormats = append(policy.ReadFormats, format)
+	}
+	sort.Slice(policy.ReadFormats, func(i, j int) bool { return policy.ReadFormats[i] < policy.ReadFormats[j] })
+	policy.Mixed = len(policy.ReadFormats) > 1
+	return policy, nil
+}
+
 // ScanHosted runs a scan whose top-of-stack iterators are hosted above a
 // re-seekable whole-table merge (rather than per-tablet). Use it for
 // iterators that must re-seek across the entire row space — e.g. the

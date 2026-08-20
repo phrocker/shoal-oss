@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/phrocker/shoal/internal/storage"
+	"github.com/phrocker/shoal/internal/tablet"
 )
 
 // SyncStateVersion is the on-disk schema version of a SyncState file.
@@ -86,6 +87,10 @@ func (e *Engine) ExportRFilesIncremental(ctx context.Context, tableName string, 
 
 	e.mu.RLock()
 	tbl, ok := e.tables[tableName]
+	var configuredFormat tablet.FileFormat
+	if ok {
+		configuredFormat = tbl.fileFormat()
+	}
 	e.mu.RUnlock()
 	if !ok {
 		return nil, fmt.Errorf("engine: table %q not found", tableName)
@@ -106,19 +111,20 @@ func (e *Engine) ExportRFilesIncremental(ctx context.Context, tableName string, 
 		Sequence: priorSeq + 1,
 		Shipped:  map[string]RFileExportFile{},
 	}
+	files := tbl.rfiles()
 	manifest := &RFileExportManifest{
 		Version:             RFileExportManifestVersion,
 		CreatedAt:           time.Now().UTC(),
 		SourceTable:         tableName,
 		EngineVersion:       opts.EngineVersion,
-		RFileCompatibility:  "accumulo-rfile/shoal",
+		RFileCompatibility:  exportCompatibility(files),
+		FileFormat:          configuredFormat,
 		CFSchema:            opts.CFSchema,
 		VisibilityStamp:     opts.VisibilityStamp,
 		AuthorizationsStamp: opts.AuthorizationsStamp,
 		Tablets:             tbl.exportTablets(),
 	}
 	opts.applyStampDefaults(manifest)
-	files := tbl.rfiles()
 	var uploaded, skipped []string
 	current := make(map[string]bool, len(files))
 	for _, f := range files {
@@ -127,6 +133,8 @@ func (e *Engine) ExportRFilesIncremental(ctx context.Context, tableName string, 
 		current[rel] = true
 
 		if prev, ok := priorShipped[rel]; ok && prev.DestinationPath == dstPath {
+			prev.Format = string(fileFormatForPath(f.Path))
+			prev.Role = ExportRoleAuthoritative
 			manifest.RFiles = append(manifest.RFiles, prev)
 			state.Shipped[rel] = prev
 			skipped = append(skipped, rel)
@@ -145,7 +153,7 @@ func (e *Engine) ExportRFilesIncremental(ctx context.Context, tableName string, 
 			Size:            size,
 			SHA256:          sum,
 			BCFileVersion:   bcVersion,
-			Format:          ExportFormatRFile,
+			Format:          string(fileFormatForPath(f.Path)),
 			Role:            ExportRoleAuthoritative,
 		}
 		manifest.RFiles = append(manifest.RFiles, entry)
@@ -166,6 +174,7 @@ func (e *Engine) ExportRFilesIncremental(ctx context.Context, tableName string, 
 		}
 		return manifest.RFiles[i].DestinationPath < manifest.RFiles[j].DestinationPath
 	})
+	manifest.Version = exportManifestVersion(manifest)
 	sort.Strings(uploaded)
 	sort.Strings(skipped)
 	sort.Strings(retired)

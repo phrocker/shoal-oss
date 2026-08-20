@@ -78,6 +78,7 @@ import (
 
 	"github.com/phrocker/shoal/internal/engine"
 	"github.com/phrocker/shoal/internal/storage"
+	"github.com/phrocker/shoal/internal/tablet"
 )
 
 // bulkLoadMappingFile is the fixed filename Accumulo's BulkSerialize reads
@@ -167,8 +168,8 @@ type LoadMapping []Mapping
 // ambiguous legacy input.
 //
 // manifest.Version is checked first (inside resolveManifestTablets,
-// shared with RequiredDestinationSplits below), against
-// engine.RFileExportManifestVersion, before any chain or RFile
+// shared with RequiredDestinationSplits below), against the supported legacy
+// and current export versions, before any chain or RFile
 // validation: a manifest from an unsupported export format is rejected
 // here, in Promote's own preflight call to this function, rather than
 // only later inside StageBulkDir's call to engine.VerifyRFileExport --
@@ -177,6 +178,25 @@ type LoadMapping []Mapping
 func BuildLoadMapping(manifest *engine.RFileExportManifest) (LoadMapping, error) {
 	if manifest == nil {
 		return nil, fmt.Errorf("promotion: nil export manifest")
+	}
+	if manifest.FileFormat == tablet.FormatParquet ||
+		(manifest.RFileCompatibility != "" && manifest.RFileCompatibility != "accumulo-rfile/shoal") {
+		return nil, fmt.Errorf("promotion: manifest compatibility %q with format %q cannot be registered as Accumulo tablet files",
+			manifest.RFileCompatibility, manifest.FileFormat)
+	}
+	for _, file := range manifest.RFiles {
+		format := file.Format
+		if format == "" {
+			format = engine.ExportFormatRFile
+		}
+		role := file.Role
+		if role == "" {
+			role = engine.ExportRoleAuthoritative
+		}
+		if format != engine.ExportFormatRFile || role != engine.ExportRoleAuthoritative {
+			return nil, fmt.Errorf("promotion: file %q has format %q and role %q; Accumulo bulk import requires authoritative RFiles",
+				file.DestinationPath, format, role)
+		}
 	}
 	tablets, declared, err := resolveManifestTablets(manifest)
 	if err != nil {
@@ -234,8 +254,8 @@ type resolvedTablet struct {
 // under. See resolveTabletChain for the exact chain-shape requirements and
 // BuildLoadMapping's doc comment for the widening rule.
 //
-// manifest.Version is checked first, against
-// engine.RFileExportManifestVersion: both of resolveManifestTablets's
+// manifest.Version is checked first against the supported legacy and current
+// export versions: both of resolveManifestTablets's
 // two callers (BuildLoadMapping and RequiredDestinationSplits) document
 // themselves as performing "the same" validation, so the version check
 // belongs here, once, rather than duplicated (or, worse, present in one
@@ -244,7 +264,8 @@ type resolvedTablet struct {
 // pre-create splits through AddTableSplitsForTable, so it must reject an
 // unsupported version just as eagerly as BuildLoadMapping does).
 func resolveManifestTablets(manifest *engine.RFileExportManifest) ([]resolvedTablet, map[int]struct{}, error) {
-	if manifest.Version != engine.RFileExportManifestVersion {
+	if manifest.Version != engine.RFileExportManifestLegacyVersion &&
+		manifest.Version != engine.RFileExportManifestVersion {
 		return nil, nil, fmt.Errorf("promotion: unsupported manifest version %d", manifest.Version)
 	}
 	if len(manifest.Tablets) == 0 {

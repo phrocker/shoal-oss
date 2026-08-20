@@ -38,10 +38,118 @@ const (
 	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
 )
 
+// TableWorkload is the table's access-pattern profile. It controls the
+// default immutable persistence format when file_format is left unspecified.
+type TableWorkload int32
+
+const (
+	TableWorkload_TABLE_WORKLOAD_UNSPECIFIED TableWorkload = 0
+	TableWorkload_TABLE_WORKLOAD_OPERATIONAL TableWorkload = 1
+	TableWorkload_TABLE_WORKLOAD_ANALYTICAL  TableWorkload = 2
+)
+
+// Enum value maps for TableWorkload.
+var (
+	TableWorkload_name = map[int32]string{
+		0: "TABLE_WORKLOAD_UNSPECIFIED",
+		1: "TABLE_WORKLOAD_OPERATIONAL",
+		2: "TABLE_WORKLOAD_ANALYTICAL",
+	}
+	TableWorkload_value = map[string]int32{
+		"TABLE_WORKLOAD_UNSPECIFIED": 0,
+		"TABLE_WORKLOAD_OPERATIONAL": 1,
+		"TABLE_WORKLOAD_ANALYTICAL":  2,
+	}
+)
+
+func (x TableWorkload) Enum() *TableWorkload {
+	p := new(TableWorkload)
+	*p = x
+	return p
+}
+
+func (x TableWorkload) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (TableWorkload) Descriptor() protoreflect.EnumDescriptor {
+	return file_embed_proto_enumTypes[0].Descriptor()
+}
+
+func (TableWorkload) Type() protoreflect.EnumType {
+	return &file_embed_proto_enumTypes[0]
+}
+
+func (x TableWorkload) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use TableWorkload.Descriptor instead.
+func (TableWorkload) EnumDescriptor() ([]byte, []int) {
+	return file_embed_proto_rawDescGZIP(), []int{0}
+}
+
+// TableFileFormat is the immutable persistence format written by flushes and
+// compactions.
+type TableFileFormat int32
+
+const (
+	TableFileFormat_TABLE_FILE_FORMAT_UNSPECIFIED TableFileFormat = 0
+	TableFileFormat_TABLE_FILE_FORMAT_RFILE       TableFileFormat = 1
+	TableFileFormat_TABLE_FILE_FORMAT_PARQUET     TableFileFormat = 2
+)
+
+// Enum value maps for TableFileFormat.
+var (
+	TableFileFormat_name = map[int32]string{
+		0: "TABLE_FILE_FORMAT_UNSPECIFIED",
+		1: "TABLE_FILE_FORMAT_RFILE",
+		2: "TABLE_FILE_FORMAT_PARQUET",
+	}
+	TableFileFormat_value = map[string]int32{
+		"TABLE_FILE_FORMAT_UNSPECIFIED": 0,
+		"TABLE_FILE_FORMAT_RFILE":       1,
+		"TABLE_FILE_FORMAT_PARQUET":     2,
+	}
+)
+
+func (x TableFileFormat) Enum() *TableFileFormat {
+	p := new(TableFileFormat)
+	*p = x
+	return p
+}
+
+func (x TableFileFormat) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (TableFileFormat) Descriptor() protoreflect.EnumDescriptor {
+	return file_embed_proto_enumTypes[1].Descriptor()
+}
+
+func (TableFileFormat) Type() protoreflect.EnumType {
+	return &file_embed_proto_enumTypes[1]
+}
+
+func (x TableFileFormat) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use TableFileFormat.Descriptor instead.
+func (TableFileFormat) EnumDescriptor() ([]byte, []int) {
+	return file_embed_proto_rawDescGZIP(), []int{1}
+}
+
 type CreateTableRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Table         string                 `protobuf:"bytes,1,opt,name=table,proto3" json:"table,omitempty"`
-	Splits        []string               `protobuf:"bytes,2,rep,name=splits,proto3" json:"splits,omitempty"`
+	state  protoimpl.MessageState `protogen:"open.v1"`
+	Table  string                 `protobuf:"bytes,1,opt,name=table,proto3" json:"table,omitempty"`
+	Splits []string               `protobuf:"bytes,2,rep,name=splits,proto3" json:"splits,omitempty"`
+	// Optional workload profile. Unspecified preserves the existing default
+	// create-table behavior unless file_format implies a specific profile.
+	Workload TableWorkload `protobuf:"varint,3,opt,name=workload,proto3,enum=shoal.embed.v1.TableWorkload" json:"workload,omitempty"`
+	// Optional immutable persistence format. Unspecified preserves the existing
+	// create-table behavior unless workload implies a specific format.
+	FileFormat    TableFileFormat `protobuf:"varint,4,opt,name=file_format,json=fileFormat,proto3,enum=shoal.embed.v1.TableFileFormat" json:"file_format,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -90,10 +198,26 @@ func (x *CreateTableRequest) GetSplits() []string {
 	return nil
 }
 
+func (x *CreateTableRequest) GetWorkload() TableWorkload {
+	if x != nil {
+		return x.Workload
+	}
+	return TableWorkload_TABLE_WORKLOAD_UNSPECIFIED
+}
+
+func (x *CreateTableRequest) GetFileFormat() TableFileFormat {
+	if x != nil {
+		return x.FileFormat
+	}
+	return TableFileFormat_TABLE_FILE_FORMAT_UNSPECIFIED
+}
+
 type CreateTableResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Table         string                 `protobuf:"bytes,1,opt,name=table,proto3" json:"table,omitempty"`
 	Tablets       int32                  `protobuf:"varint,2,opt,name=tablets,proto3" json:"tablets,omitempty"`
+	Workload      TableWorkload          `protobuf:"varint,3,opt,name=workload,proto3,enum=shoal.embed.v1.TableWorkload" json:"workload,omitempty"`
+	FileFormat    TableFileFormat        `protobuf:"varint,4,opt,name=file_format,json=fileFormat,proto3,enum=shoal.embed.v1.TableFileFormat" json:"file_format,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -140,6 +264,20 @@ func (x *CreateTableResponse) GetTablets() int32 {
 		return x.Tablets
 	}
 	return 0
+}
+
+func (x *CreateTableResponse) GetWorkload() TableWorkload {
+	if x != nil {
+		return x.Workload
+	}
+	return TableWorkload_TABLE_WORKLOAD_UNSPECIFIED
+}
+
+func (x *CreateTableResponse) GetFileFormat() TableFileFormat {
+	if x != nil {
+		return x.FileFormat
+	}
+	return TableFileFormat_TABLE_FILE_FORMAT_UNSPECIFIED
 }
 
 type Mutation struct {
@@ -1393,8 +1531,15 @@ func (*FlushResponse) Descriptor() ([]byte, []int) {
 }
 
 type CompactRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Table         string                 `protobuf:"bytes,1,opt,name=table,proto3" json:"table,omitempty"`
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Table string                 `protobuf:"bytes,1,opt,name=table,proto3" json:"table,omitempty"`
+	// Optional target workload profile for compaction/migration. When set
+	// without file_format, compaction rewrites immutable files using that
+	// profile's default format.
+	Workload TableWorkload `protobuf:"varint,2,opt,name=workload,proto3,enum=shoal.embed.v1.TableWorkload" json:"workload,omitempty"`
+	// Optional target immutable persistence format for compaction/migration.
+	// When set without workload, workload is inferred from the format.
+	FileFormat    TableFileFormat `protobuf:"varint,3,opt,name=file_format,json=fileFormat,proto3,enum=shoal.embed.v1.TableFileFormat" json:"file_format,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1436,8 +1581,25 @@ func (x *CompactRequest) GetTable() string {
 	return ""
 }
 
+func (x *CompactRequest) GetWorkload() TableWorkload {
+	if x != nil {
+		return x.Workload
+	}
+	return TableWorkload_TABLE_WORKLOAD_UNSPECIFIED
+}
+
+func (x *CompactRequest) GetFileFormat() TableFileFormat {
+	if x != nil {
+		return x.FileFormat
+	}
+	return TableFileFormat_TABLE_FILE_FORMAT_UNSPECIFIED
+}
+
 type CompactResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
+	Table         string                 `protobuf:"bytes,1,opt,name=table,proto3" json:"table,omitempty"`
+	Workload      TableWorkload          `protobuf:"varint,2,opt,name=workload,proto3,enum=shoal.embed.v1.TableWorkload" json:"workload,omitempty"`
+	FileFormat    TableFileFormat        `protobuf:"varint,3,opt,name=file_format,json=fileFormat,proto3,enum=shoal.embed.v1.TableFileFormat" json:"file_format,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1470,6 +1632,27 @@ func (x *CompactResponse) ProtoReflect() protoreflect.Message {
 // Deprecated: Use CompactResponse.ProtoReflect.Descriptor instead.
 func (*CompactResponse) Descriptor() ([]byte, []int) {
 	return file_embed_proto_rawDescGZIP(), []int{18}
+}
+
+func (x *CompactResponse) GetTable() string {
+	if x != nil {
+		return x.Table
+	}
+	return ""
+}
+
+func (x *CompactResponse) GetWorkload() TableWorkload {
+	if x != nil {
+		return x.Workload
+	}
+	return TableWorkload_TABLE_WORKLOAD_UNSPECIFIED
+}
+
+func (x *CompactResponse) GetFileFormat() TableFileFormat {
+	if x != nil {
+		return x.FileFormat
+	}
+	return TableFileFormat_TABLE_FILE_FORMAT_UNSPECIFIED
 }
 
 type StatusRequest struct {
@@ -1508,16 +1691,93 @@ func (*StatusRequest) Descriptor() ([]byte, []int) {
 	return file_embed_proto_rawDescGZIP(), []int{19}
 }
 
+type TableStatus struct {
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	Table          string                 `protobuf:"bytes,1,opt,name=table,proto3" json:"table,omitempty"`
+	Tablets        int32                  `protobuf:"varint,2,opt,name=tablets,proto3" json:"tablets,omitempty"`
+	ImmutableFiles int32                  `protobuf:"varint,3,opt,name=immutable_files,json=immutableFiles,proto3" json:"immutable_files,omitempty"`
+	Workload       TableWorkload          `protobuf:"varint,4,opt,name=workload,proto3,enum=shoal.embed.v1.TableWorkload" json:"workload,omitempty"`
+	FileFormat     TableFileFormat        `protobuf:"varint,5,opt,name=file_format,json=fileFormat,proto3,enum=shoal.embed.v1.TableFileFormat" json:"file_format,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
+}
+
+func (x *TableStatus) Reset() {
+	*x = TableStatus{}
+	mi := &file_embed_proto_msgTypes[20]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *TableStatus) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*TableStatus) ProtoMessage() {}
+
+func (x *TableStatus) ProtoReflect() protoreflect.Message {
+	mi := &file_embed_proto_msgTypes[20]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use TableStatus.ProtoReflect.Descriptor instead.
+func (*TableStatus) Descriptor() ([]byte, []int) {
+	return file_embed_proto_rawDescGZIP(), []int{20}
+}
+
+func (x *TableStatus) GetTable() string {
+	if x != nil {
+		return x.Table
+	}
+	return ""
+}
+
+func (x *TableStatus) GetTablets() int32 {
+	if x != nil {
+		return x.Tablets
+	}
+	return 0
+}
+
+func (x *TableStatus) GetImmutableFiles() int32 {
+	if x != nil {
+		return x.ImmutableFiles
+	}
+	return 0
+}
+
+func (x *TableStatus) GetWorkload() TableWorkload {
+	if x != nil {
+		return x.Workload
+	}
+	return TableWorkload_TABLE_WORKLOAD_UNSPECIFIED
+}
+
+func (x *TableStatus) GetFileFormat() TableFileFormat {
+	if x != nil {
+		return x.FileFormat
+	}
+	return TableFileFormat_TABLE_FILE_FORMAT_UNSPECIFIED
+}
+
 type StatusResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Tables        []string               `protobuf:"bytes,1,rep,name=tables,proto3" json:"tables,omitempty"`
+	TableStatuses []*TableStatus         `protobuf:"bytes,2,rep,name=table_statuses,json=tableStatuses,proto3" json:"table_statuses,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *StatusResponse) Reset() {
 	*x = StatusResponse{}
-	mi := &file_embed_proto_msgTypes[20]
+	mi := &file_embed_proto_msgTypes[21]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1529,7 +1789,7 @@ func (x *StatusResponse) String() string {
 func (*StatusResponse) ProtoMessage() {}
 
 func (x *StatusResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_embed_proto_msgTypes[20]
+	mi := &file_embed_proto_msgTypes[21]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1542,7 +1802,7 @@ func (x *StatusResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StatusResponse.ProtoReflect.Descriptor instead.
 func (*StatusResponse) Descriptor() ([]byte, []int) {
-	return file_embed_proto_rawDescGZIP(), []int{20}
+	return file_embed_proto_rawDescGZIP(), []int{21}
 }
 
 func (x *StatusResponse) GetTables() []string {
@@ -1552,17 +1812,30 @@ func (x *StatusResponse) GetTables() []string {
 	return nil
 }
 
+func (x *StatusResponse) GetTableStatuses() []*TableStatus {
+	if x != nil {
+		return x.TableStatuses
+	}
+	return nil
+}
+
 var File_embed_proto protoreflect.FileDescriptor
 
 const file_embed_proto_rawDesc = "" +
 	"\n" +
-	"\vembed.proto\x12\x0eshoal.embed.v1\"B\n" +
+	"\vembed.proto\x12\x0eshoal.embed.v1\"\xbf\x01\n" +
 	"\x12CreateTableRequest\x12\x14\n" +
 	"\x05table\x18\x01 \x01(\tR\x05table\x12\x16\n" +
-	"\x06splits\x18\x02 \x03(\tR\x06splits\"E\n" +
+	"\x06splits\x18\x02 \x03(\tR\x06splits\x129\n" +
+	"\bworkload\x18\x03 \x01(\x0e2\x1d.shoal.embed.v1.TableWorkloadR\bworkload\x12@\n" +
+	"\vfile_format\x18\x04 \x01(\x0e2\x1f.shoal.embed.v1.TableFileFormatR\n" +
+	"fileFormat\"\xc2\x01\n" +
 	"\x13CreateTableResponse\x12\x14\n" +
 	"\x05table\x18\x01 \x01(\tR\x05table\x12\x18\n" +
-	"\atablets\x18\x02 \x01(\x05R\atablets\"M\n" +
+	"\atablets\x18\x02 \x01(\x05R\atablets\x129\n" +
+	"\bworkload\x18\x03 \x01(\x0e2\x1d.shoal.embed.v1.TableWorkloadR\bworkload\x12@\n" +
+	"\vfile_format\x18\x04 \x01(\x0e2\x1f.shoal.embed.v1.TableFileFormatR\n" +
+	"fileFormat\"M\n" +
 	"\bMutation\x12\x10\n" +
 	"\x03row\x18\x01 \x01(\fR\x03row\x12/\n" +
 	"\aentries\x18\x02 \x03(\v2\x15.shoal.embed.v1.EntryR\aentries\"\xd0\x01\n" +
@@ -1662,13 +1935,36 @@ const file_embed_proto_rawDesc = "" +
 	"\x05cells\x18\x01 \x03(\v2\x14.shoal.embed.v1.CellR\x05cells\"$\n" +
 	"\fFlushRequest\x12\x14\n" +
 	"\x05table\x18\x01 \x01(\tR\x05table\"\x0f\n" +
-	"\rFlushResponse\"&\n" +
+	"\rFlushResponse\"\xa3\x01\n" +
 	"\x0eCompactRequest\x12\x14\n" +
-	"\x05table\x18\x01 \x01(\tR\x05table\"\x11\n" +
-	"\x0fCompactResponse\"\x0f\n" +
-	"\rStatusRequest\"(\n" +
+	"\x05table\x18\x01 \x01(\tR\x05table\x129\n" +
+	"\bworkload\x18\x02 \x01(\x0e2\x1d.shoal.embed.v1.TableWorkloadR\bworkload\x12@\n" +
+	"\vfile_format\x18\x03 \x01(\x0e2\x1f.shoal.embed.v1.TableFileFormatR\n" +
+	"fileFormat\"\xa4\x01\n" +
+	"\x0fCompactResponse\x12\x14\n" +
+	"\x05table\x18\x01 \x01(\tR\x05table\x129\n" +
+	"\bworkload\x18\x02 \x01(\x0e2\x1d.shoal.embed.v1.TableWorkloadR\bworkload\x12@\n" +
+	"\vfile_format\x18\x03 \x01(\x0e2\x1f.shoal.embed.v1.TableFileFormatR\n" +
+	"fileFormat\"\x0f\n" +
+	"\rStatusRequest\"\xe3\x01\n" +
+	"\vTableStatus\x12\x14\n" +
+	"\x05table\x18\x01 \x01(\tR\x05table\x12\x18\n" +
+	"\atablets\x18\x02 \x01(\x05R\atablets\x12'\n" +
+	"\x0fimmutable_files\x18\x03 \x01(\x05R\x0eimmutableFiles\x129\n" +
+	"\bworkload\x18\x04 \x01(\x0e2\x1d.shoal.embed.v1.TableWorkloadR\bworkload\x12@\n" +
+	"\vfile_format\x18\x05 \x01(\x0e2\x1f.shoal.embed.v1.TableFileFormatR\n" +
+	"fileFormat\"l\n" +
 	"\x0eStatusResponse\x12\x16\n" +
-	"\x06tables\x18\x01 \x03(\tR\x06tables2\xca\x03\n" +
+	"\x06tables\x18\x01 \x03(\tR\x06tables\x12B\n" +
+	"\x0etable_statuses\x18\x02 \x03(\v2\x1b.shoal.embed.v1.TableStatusR\rtableStatuses*n\n" +
+	"\rTableWorkload\x12\x1e\n" +
+	"\x1aTABLE_WORKLOAD_UNSPECIFIED\x10\x00\x12\x1e\n" +
+	"\x1aTABLE_WORKLOAD_OPERATIONAL\x10\x01\x12\x1d\n" +
+	"\x19TABLE_WORKLOAD_ANALYTICAL\x10\x02*p\n" +
+	"\x0fTableFileFormat\x12!\n" +
+	"\x1dTABLE_FILE_FORMAT_UNSPECIFIED\x10\x00\x12\x1b\n" +
+	"\x17TABLE_FILE_FORMAT_RFILE\x10\x01\x12\x1d\n" +
+	"\x19TABLE_FILE_FORMAT_PARQUET\x10\x022\xca\x03\n" +
 	"\n" +
 	"ShoalEmbed\x12V\n" +
 	"\vCreateTable\x12\".shoal.embed.v1.CreateTableRequest\x1a#.shoal.embed.v1.CreateTableResponse\x12D\n" +
@@ -1690,57 +1986,72 @@ func file_embed_proto_rawDescGZIP() []byte {
 	return file_embed_proto_rawDescData
 }
 
-var file_embed_proto_msgTypes = make([]protoimpl.MessageInfo, 21)
+var file_embed_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
+var file_embed_proto_msgTypes = make([]protoimpl.MessageInfo, 22)
 var file_embed_proto_goTypes = []any{
-	(*CreateTableRequest)(nil),  // 0: shoal.embed.v1.CreateTableRequest
-	(*CreateTableResponse)(nil), // 1: shoal.embed.v1.CreateTableResponse
-	(*Mutation)(nil),            // 2: shoal.embed.v1.Mutation
-	(*Entry)(nil),               // 3: shoal.embed.v1.Entry
-	(*WriteRequest)(nil),        // 4: shoal.embed.v1.WriteRequest
-	(*WriteResponse)(nil),       // 5: shoal.embed.v1.WriteResponse
-	(*ScanRequest)(nil),         // 6: shoal.embed.v1.ScanRequest
-	(*TermFilter)(nil),          // 7: shoal.embed.v1.TermFilter
-	(*NumericRange)(nil),        // 8: shoal.embed.v1.NumericRange
-	(*VectorSearch)(nil),        // 9: shoal.embed.v1.VectorSearch
-	(*ScoreFilter)(nil),         // 10: shoal.embed.v1.ScoreFilter
-	(*EdgeExpand)(nil),          // 11: shoal.embed.v1.EdgeExpand
-	(*EdgeWeight)(nil),          // 12: shoal.embed.v1.EdgeWeight
-	(*Cell)(nil),                // 13: shoal.embed.v1.Cell
-	(*ScanResponse)(nil),        // 14: shoal.embed.v1.ScanResponse
-	(*FlushRequest)(nil),        // 15: shoal.embed.v1.FlushRequest
-	(*FlushResponse)(nil),       // 16: shoal.embed.v1.FlushResponse
-	(*CompactRequest)(nil),      // 17: shoal.embed.v1.CompactRequest
-	(*CompactResponse)(nil),     // 18: shoal.embed.v1.CompactResponse
-	(*StatusRequest)(nil),       // 19: shoal.embed.v1.StatusRequest
-	(*StatusResponse)(nil),      // 20: shoal.embed.v1.StatusResponse
+	(TableWorkload)(0),          // 0: shoal.embed.v1.TableWorkload
+	(TableFileFormat)(0),        // 1: shoal.embed.v1.TableFileFormat
+	(*CreateTableRequest)(nil),  // 2: shoal.embed.v1.CreateTableRequest
+	(*CreateTableResponse)(nil), // 3: shoal.embed.v1.CreateTableResponse
+	(*Mutation)(nil),            // 4: shoal.embed.v1.Mutation
+	(*Entry)(nil),               // 5: shoal.embed.v1.Entry
+	(*WriteRequest)(nil),        // 6: shoal.embed.v1.WriteRequest
+	(*WriteResponse)(nil),       // 7: shoal.embed.v1.WriteResponse
+	(*ScanRequest)(nil),         // 8: shoal.embed.v1.ScanRequest
+	(*TermFilter)(nil),          // 9: shoal.embed.v1.TermFilter
+	(*NumericRange)(nil),        // 10: shoal.embed.v1.NumericRange
+	(*VectorSearch)(nil),        // 11: shoal.embed.v1.VectorSearch
+	(*ScoreFilter)(nil),         // 12: shoal.embed.v1.ScoreFilter
+	(*EdgeExpand)(nil),          // 13: shoal.embed.v1.EdgeExpand
+	(*EdgeWeight)(nil),          // 14: shoal.embed.v1.EdgeWeight
+	(*Cell)(nil),                // 15: shoal.embed.v1.Cell
+	(*ScanResponse)(nil),        // 16: shoal.embed.v1.ScanResponse
+	(*FlushRequest)(nil),        // 17: shoal.embed.v1.FlushRequest
+	(*FlushResponse)(nil),       // 18: shoal.embed.v1.FlushResponse
+	(*CompactRequest)(nil),      // 19: shoal.embed.v1.CompactRequest
+	(*CompactResponse)(nil),     // 20: shoal.embed.v1.CompactResponse
+	(*StatusRequest)(nil),       // 21: shoal.embed.v1.StatusRequest
+	(*TableStatus)(nil),         // 22: shoal.embed.v1.TableStatus
+	(*StatusResponse)(nil),      // 23: shoal.embed.v1.StatusResponse
 }
 var file_embed_proto_depIdxs = []int32{
-	3,  // 0: shoal.embed.v1.Mutation.entries:type_name -> shoal.embed.v1.Entry
-	2,  // 1: shoal.embed.v1.WriteRequest.mutations:type_name -> shoal.embed.v1.Mutation
-	7,  // 2: shoal.embed.v1.ScanRequest.term_filter:type_name -> shoal.embed.v1.TermFilter
-	9,  // 3: shoal.embed.v1.ScanRequest.vector_search:type_name -> shoal.embed.v1.VectorSearch
-	11, // 4: shoal.embed.v1.ScanRequest.edge_expand:type_name -> shoal.embed.v1.EdgeExpand
-	10, // 5: shoal.embed.v1.ScanRequest.score_filter:type_name -> shoal.embed.v1.ScoreFilter
-	8,  // 6: shoal.embed.v1.TermFilter.numeric_range:type_name -> shoal.embed.v1.NumericRange
-	12, // 7: shoal.embed.v1.EdgeExpand.edge_weights:type_name -> shoal.embed.v1.EdgeWeight
-	13, // 8: shoal.embed.v1.ScanResponse.cells:type_name -> shoal.embed.v1.Cell
-	0,  // 9: shoal.embed.v1.ShoalEmbed.CreateTable:input_type -> shoal.embed.v1.CreateTableRequest
-	4,  // 10: shoal.embed.v1.ShoalEmbed.Write:input_type -> shoal.embed.v1.WriteRequest
-	6,  // 11: shoal.embed.v1.ShoalEmbed.Scan:input_type -> shoal.embed.v1.ScanRequest
-	15, // 12: shoal.embed.v1.ShoalEmbed.Flush:input_type -> shoal.embed.v1.FlushRequest
-	17, // 13: shoal.embed.v1.ShoalEmbed.Compact:input_type -> shoal.embed.v1.CompactRequest
-	19, // 14: shoal.embed.v1.ShoalEmbed.Status:input_type -> shoal.embed.v1.StatusRequest
-	1,  // 15: shoal.embed.v1.ShoalEmbed.CreateTable:output_type -> shoal.embed.v1.CreateTableResponse
-	5,  // 16: shoal.embed.v1.ShoalEmbed.Write:output_type -> shoal.embed.v1.WriteResponse
-	14, // 17: shoal.embed.v1.ShoalEmbed.Scan:output_type -> shoal.embed.v1.ScanResponse
-	16, // 18: shoal.embed.v1.ShoalEmbed.Flush:output_type -> shoal.embed.v1.FlushResponse
-	18, // 19: shoal.embed.v1.ShoalEmbed.Compact:output_type -> shoal.embed.v1.CompactResponse
-	20, // 20: shoal.embed.v1.ShoalEmbed.Status:output_type -> shoal.embed.v1.StatusResponse
-	15, // [15:21] is the sub-list for method output_type
-	9,  // [9:15] is the sub-list for method input_type
-	9,  // [9:9] is the sub-list for extension type_name
-	9,  // [9:9] is the sub-list for extension extendee
-	0,  // [0:9] is the sub-list for field type_name
+	0,  // 0: shoal.embed.v1.CreateTableRequest.workload:type_name -> shoal.embed.v1.TableWorkload
+	1,  // 1: shoal.embed.v1.CreateTableRequest.file_format:type_name -> shoal.embed.v1.TableFileFormat
+	0,  // 2: shoal.embed.v1.CreateTableResponse.workload:type_name -> shoal.embed.v1.TableWorkload
+	1,  // 3: shoal.embed.v1.CreateTableResponse.file_format:type_name -> shoal.embed.v1.TableFileFormat
+	5,  // 4: shoal.embed.v1.Mutation.entries:type_name -> shoal.embed.v1.Entry
+	4,  // 5: shoal.embed.v1.WriteRequest.mutations:type_name -> shoal.embed.v1.Mutation
+	9,  // 6: shoal.embed.v1.ScanRequest.term_filter:type_name -> shoal.embed.v1.TermFilter
+	11, // 7: shoal.embed.v1.ScanRequest.vector_search:type_name -> shoal.embed.v1.VectorSearch
+	13, // 8: shoal.embed.v1.ScanRequest.edge_expand:type_name -> shoal.embed.v1.EdgeExpand
+	12, // 9: shoal.embed.v1.ScanRequest.score_filter:type_name -> shoal.embed.v1.ScoreFilter
+	10, // 10: shoal.embed.v1.TermFilter.numeric_range:type_name -> shoal.embed.v1.NumericRange
+	14, // 11: shoal.embed.v1.EdgeExpand.edge_weights:type_name -> shoal.embed.v1.EdgeWeight
+	15, // 12: shoal.embed.v1.ScanResponse.cells:type_name -> shoal.embed.v1.Cell
+	0,  // 13: shoal.embed.v1.CompactRequest.workload:type_name -> shoal.embed.v1.TableWorkload
+	1,  // 14: shoal.embed.v1.CompactRequest.file_format:type_name -> shoal.embed.v1.TableFileFormat
+	0,  // 15: shoal.embed.v1.CompactResponse.workload:type_name -> shoal.embed.v1.TableWorkload
+	1,  // 16: shoal.embed.v1.CompactResponse.file_format:type_name -> shoal.embed.v1.TableFileFormat
+	0,  // 17: shoal.embed.v1.TableStatus.workload:type_name -> shoal.embed.v1.TableWorkload
+	1,  // 18: shoal.embed.v1.TableStatus.file_format:type_name -> shoal.embed.v1.TableFileFormat
+	22, // 19: shoal.embed.v1.StatusResponse.table_statuses:type_name -> shoal.embed.v1.TableStatus
+	2,  // 20: shoal.embed.v1.ShoalEmbed.CreateTable:input_type -> shoal.embed.v1.CreateTableRequest
+	6,  // 21: shoal.embed.v1.ShoalEmbed.Write:input_type -> shoal.embed.v1.WriteRequest
+	8,  // 22: shoal.embed.v1.ShoalEmbed.Scan:input_type -> shoal.embed.v1.ScanRequest
+	17, // 23: shoal.embed.v1.ShoalEmbed.Flush:input_type -> shoal.embed.v1.FlushRequest
+	19, // 24: shoal.embed.v1.ShoalEmbed.Compact:input_type -> shoal.embed.v1.CompactRequest
+	21, // 25: shoal.embed.v1.ShoalEmbed.Status:input_type -> shoal.embed.v1.StatusRequest
+	3,  // 26: shoal.embed.v1.ShoalEmbed.CreateTable:output_type -> shoal.embed.v1.CreateTableResponse
+	7,  // 27: shoal.embed.v1.ShoalEmbed.Write:output_type -> shoal.embed.v1.WriteResponse
+	16, // 28: shoal.embed.v1.ShoalEmbed.Scan:output_type -> shoal.embed.v1.ScanResponse
+	18, // 29: shoal.embed.v1.ShoalEmbed.Flush:output_type -> shoal.embed.v1.FlushResponse
+	20, // 30: shoal.embed.v1.ShoalEmbed.Compact:output_type -> shoal.embed.v1.CompactResponse
+	23, // 31: shoal.embed.v1.ShoalEmbed.Status:output_type -> shoal.embed.v1.StatusResponse
+	26, // [26:32] is the sub-list for method output_type
+	20, // [20:26] is the sub-list for method input_type
+	20, // [20:20] is the sub-list for extension type_name
+	20, // [20:20] is the sub-list for extension extendee
+	0,  // [0:20] is the sub-list for field type_name
 }
 
 func init() { file_embed_proto_init() }
@@ -1753,13 +2064,14 @@ func file_embed_proto_init() {
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_embed_proto_rawDesc), len(file_embed_proto_rawDesc)),
-			NumEnums:      0,
-			NumMessages:   21,
+			NumEnums:      2,
+			NumMessages:   22,
 			NumExtensions: 0,
 			NumServices:   1,
 		},
 		GoTypes:           file_embed_proto_goTypes,
 		DependencyIndexes: file_embed_proto_depIdxs,
+		EnumInfos:         file_embed_proto_enumTypes,
 		MessageInfos:      file_embed_proto_msgTypes,
 	}.Build()
 	File_embed_proto = out.File

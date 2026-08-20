@@ -35,6 +35,8 @@ package tablet
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -48,6 +50,7 @@ import (
 	"github.com/phrocker/shoal/internal/compaction"
 	"github.com/phrocker/shoal/internal/iterrt"
 	"github.com/phrocker/shoal/internal/localwal"
+	"github.com/phrocker/shoal/internal/parquetfile"
 	"github.com/phrocker/shoal/internal/rfile"
 	"github.com/phrocker/shoal/internal/rfile/adjacency"
 	"github.com/phrocker/shoal/internal/rfile/bcfile/block"
@@ -62,17 +65,36 @@ import (
 // against write amplification for bulk ingest workloads.
 const DefaultFlushThreshold = 256_000
 
+type FileFormat string
+
+const (
+	FormatRFile   FileFormat = "rfile"
+	FormatParquet FileFormat = "parquet"
+)
+
+func ParseFileFormat(value string) (FileFormat, error) {
+	switch FileFormat(value) {
+	case "", FormatRFile:
+		return FormatRFile, nil
+	case FormatParquet:
+		return FormatParquet, nil
+	default:
+		return "", fmt.Errorf("tablet: unsupported file format %q (want rfile or parquet)", value)
+	}
+}
+
 // Tablet is one range of a table's key space.
 type Tablet struct {
-	mu      sync.RWMutex
-	dir     string
-	active  *skiplistMemtable
-	files   []string // sorted list of RFile paths/keys, oldest first
-	wal     *localwal.WAL
-	seq     atomic.Int64
-	logger  *slog.Logger
-	opts    Options
-	backend storage.Backend // object store for RFile bytes (default: local FS)
+	mu       sync.RWMutex
+	dir      string
+	active   *skiplistMemtable
+	files    []string // sorted list of RFile paths/keys, oldest first
+	wal      *localwal.WAL
+	seq      atomic.Int64
+	logger   *slog.Logger
+	opts     Options
+	backend  storage.Backend // object store for RFile bytes (default: local FS)
+	obsolete map[string]struct{}
 }
 
 // Options configures a Tablet.
@@ -116,6 +138,11 @@ type Options struct {
 	// The WAL is always local regardless of this setting.
 	Backend storage.Backend
 
+	// FileFormat selects the immutable file format written by flush and
+	// compaction. Existing RFile and Parquet files can be read together.
+	// The zero value preserves the historical RFile behavior.
+	FileFormat FileFormat
+
 	// OnRFile, when set, is invoked after a flush or compaction writes a new
 	// immutable RFile, with the event kind ("flush" | "compact") and the new
 	// RFile's base name. It enables event-driven shipping (sync as soon as an
@@ -136,6 +163,11 @@ func Open(dir string, opts Options) (*Tablet, error) {
 	if opts.Logger == nil {
 		opts.Logger = slog.Default()
 	}
+	format, err := ParseFileFormat(string(opts.FileFormat))
+	if err != nil {
+		return nil, err
+	}
+	opts.FileFormat = format
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("tablet: mkdir %s: %w", dir, err)
 	}
@@ -155,11 +187,12 @@ func Open(dir string, opts Options) (*Tablet, error) {
 
 	// Discover existing RFiles via the backend manifest (a directory
 	// listing for the local FS; a prefix scan for memory/cloud stores).
-	keys, err := listRFiles(backend, dir)
+	keys, obsolete, err := discoverImmutableFiles(backend, dir, false)
 	if err != nil {
 		return nil, fmt.Errorf("tablet: list %s: %w", dir, err)
 	}
 	t.files = keys
+	t.obsolete = obsolete
 	sort.Strings(t.files)
 
 	// Open WAL
@@ -356,6 +389,10 @@ func (t *Tablet) Neighbors(row, edgeCF []byte, env iterrt.IteratorEnvironment) (
 	// files + memtable) and skip the per-file/memtable work below.
 	allIndexed := true
 	for _, path := range filesCopy {
+		if fileFormat(path) == FormatParquet {
+			allIndexed = false
+			break
+		}
 		sf, err := t.sharedForPath(path)
 		if err != nil {
 			return nil, fmt.Errorf("tablet: neighbors open %s: %w", path, err)
@@ -477,7 +514,7 @@ func (t *Tablet) Source(env iterrt.IteratorEnvironment) (iterrt.SortedKeyValueIt
 	var closers []func()
 
 	for _, path := range filesCopy {
-		src, closer, err := t.openRFileSource(path, env)
+		src, closer, err := t.openFileSource(path, env)
 		if err != nil {
 			// Clean up any already-opened readers
 			for _, c := range closers {
@@ -506,21 +543,21 @@ func (t *Tablet) Source(env iterrt.IteratorEnvironment) (iterrt.SortedKeyValueIt
 	return merge, closeAll, nil
 }
 
-// Flush forces the memtable to disk as a new RFile and truncates the WAL.
+// Flush forces the memtable to a new immutable RFile or Parquet file and truncates the WAL.
 func (t *Tablet) Flush() error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return t.flushLocked()
 }
 
-// Compact merges all on-disk RFiles through the given iterator stack
-// into a single output RFile. This is where application-specific iterators
+// Compact merges all immutable files through the given iterator stack
+// into one file in the table's configured format. This is where application-specific iterators
 // (decay, pruning, dedup) run.
 func (t *Tablet) Compact(stack []iterrt.IterSpec) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	if len(t.files) < 2 {
+	if len(t.files) == 0 || (len(t.files) == 1 && fileFormat(t.files[0]) == t.opts.FileFormat) {
 		return nil // nothing to compact
 	}
 
@@ -540,24 +577,48 @@ func (t *Tablet) Compact(stack []iterrt.IterSpec) error {
 		Scope:               iterrt.ScopeMajc,
 		FullMajorCompaction: true,
 		AdjacencyEdgeCF:     t.opts.AdjacencyEdgeCF,
+		OutputFormat:        string(t.opts.FileFormat),
 	})
 	if err != nil {
 		return fmt.Errorf("tablet: compact: %w", err)
 	}
 
-	// Write output RFile
-	outName := fmt.Sprintf("C%013d.rf", time.Now().UnixMilli())
+	outName := fmt.Sprintf("C%013d%s", time.Now().UnixMilli(), t.opts.FileFormat.extension())
 	outPath := filepath.Join(t.dir, outName)
 	if err := storage.WriteAll(context.Background(), t.backend, outPath, result.Output); err != nil {
 		return fmt.Errorf("tablet: write compacted: %w", err)
 	}
 
-	// Remove old files
 	oldFiles := t.files
-	t.files = []string{outPath}
+	obsolete := cloneObsolete(t.obsolete)
 	for _, old := range oldFiles {
-		t.opts.Cache.Drop(old)
-		removeObject(t.backend, old)
+		obsolete[filepath.Base(old)] = struct{}{}
+	}
+	if err := persistImmutableManifest(t.backend, t.dir, []string{outPath}, obsolete); err != nil {
+		if storage.IsCommittedWriteError(err) {
+			t.files = []string{outPath}
+			t.obsolete = obsolete
+			return fmt.Errorf("tablet: publish compacted generation committed with cleanup error: %w", err)
+		}
+		_ = removeObject(t.backend, outPath)
+		return fmt.Errorf("tablet: publish compacted generation: %w", err)
+	}
+	t.files = []string{outPath}
+	t.obsolete = obsolete
+	for _, old := range oldFiles {
+		if t.opts.Cache != nil {
+			t.opts.Cache.Drop(old)
+		}
+		if err := removeObject(t.backend, old); err == nil {
+			delete(t.obsolete, filepath.Base(old))
+		} else {
+			t.logger.Warn("compaction cleanup deferred",
+				slog.String("file", old),
+				slog.String("err", err.Error()))
+		}
+	}
+	if err := persistImmutableManifest(t.backend, t.dir, t.files, t.obsolete); err != nil {
+		t.logger.Warn("compaction cleanup manifest update failed", slog.String("err", err.Error()))
 	}
 
 	t.logger.Info("compaction complete",
@@ -571,14 +632,15 @@ func (t *Tablet) Compact(stack []iterrt.IterSpec) error {
 	return nil
 }
 
-// FileCount returns the number of on-disk RFiles.
+// FileCount returns the number of immutable files.
 func (t *Tablet) FileCount() int {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	return len(t.files)
 }
 
-// RFiles returns a snapshot of the tablet's immutable RFile paths/keys.
+// RFiles returns a snapshot of the tablet's immutable file paths/keys.
+// The name is retained for API compatibility; entries may be RFile or Parquet.
 func (t *Tablet) RFiles() []string {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
@@ -595,16 +657,19 @@ func (t *Tablet) RFiles() []string {
 // times RefreshFiles runs, so re-importing an unchanged manifest is a no-op.
 // Returns the number of RFiles now tracked.
 func (t *Tablet) RefreshFiles() (int, error) {
-	keys, err := listRFiles(t.backend, t.dir)
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	keys, obsolete, err := discoverImmutableFiles(t.backend, t.dir, true)
 	if err != nil {
 		return 0, fmt.Errorf("tablet: refresh list %s: %w", t.dir, err)
 	}
 	sort.Strings(keys)
-	t.mu.Lock()
+	if err := persistImmutableManifest(t.backend, t.dir, keys, obsolete); err != nil {
+		return 0, fmt.Errorf("tablet: refresh manifest %s: %w", t.dir, err)
+	}
 	t.files = keys
-	n := len(t.files)
-	t.mu.Unlock()
-	return n, nil
+	t.obsolete = obsolete
+	return len(t.files), nil
 }
 
 // MemtableSize returns the cell count in the active memtable.
@@ -639,33 +704,33 @@ func (t *Tablet) flushLocked() error {
 		return fmt.Errorf("flush: seek: %w", err)
 	}
 
-	// Write to buffer, then atomically to file
-	var buf bytes.Buffer
-	w, err := rfile.NewWriter(&buf, rfile.WriterOptions{Codec: block.CodecSnappy, AdjacencyEdgeCF: t.opts.AdjacencyEdgeCF})
+	data, count, err := t.encode(iter)
 	if err != nil {
-		return fmt.Errorf("flush: new writer: %w", err)
+		return fmt.Errorf("flush: %w", err)
 	}
-	var count int64
-	for iter.HasTop() {
-		if err := w.Append(iter.GetTopKey(), iter.GetTopValue()); err != nil {
-			return fmt.Errorf("flush: append cell %d: %w", count, err)
-		}
-		count++
-		if err := iter.Next(); err != nil {
-			return fmt.Errorf("flush: next after cell %d: %w", count, err)
-		}
-	}
-	if err := w.Close(); err != nil {
-		return fmt.Errorf("flush: close writer: %w", err)
-	}
-
-	outName := fmt.Sprintf("F%013d.rf", time.Now().UnixMilli())
+	outName := fmt.Sprintf("F%013d%s", time.Now().UnixMilli(), t.opts.FileFormat.extension())
 	outPath := filepath.Join(t.dir, outName)
-	if err := storage.WriteAll(context.Background(), t.backend, outPath, buf.Bytes()); err != nil {
+	if err := storage.WriteAll(context.Background(), t.backend, outPath, data); err != nil {
 		return fmt.Errorf("flush: write %s: %w", outPath, err)
 	}
 
-	t.files = append(t.files, outPath)
+	files := append(append([]string(nil), t.files...), outPath)
+	if err := persistImmutableManifest(t.backend, t.dir, files, t.obsolete); err != nil {
+		if storage.IsCommittedWriteError(err) {
+			t.files = files
+			t.active = newSkiplistMemtable()
+			if truncateErr := t.wal.Truncate(); truncateErr != nil {
+				return errors.Join(
+					fmt.Errorf("flush: generation committed with cleanup error: %w", err),
+					fmt.Errorf("flush: truncate wal after committed generation: %w", truncateErr),
+				)
+			}
+			return fmt.Errorf("flush: generation committed with cleanup error: %w", err)
+		}
+		_ = removeObject(t.backend, outPath)
+		return fmt.Errorf("flush: publish generation: %w", err)
+	}
+	t.files = files
 	t.active = newSkiplistMemtable()
 
 	if err := t.wal.Truncate(); err != nil {
@@ -679,6 +744,58 @@ func (t *Tablet) flushLocked() error {
 	if t.opts.OnRFile != nil {
 		t.opts.OnRFile("flush", outName)
 	}
+	return nil
+}
+
+func (t *Tablet) encode(iter iterrt.SortedKeyValueIterator) ([]byte, int64, error) {
+	if t.opts.FileFormat == FormatParquet {
+		return parquetfile.Encode(iter)
+	}
+	var buf bytes.Buffer
+	w, err := rfile.NewWriter(&buf, rfile.WriterOptions{Codec: block.CodecSnappy, AdjacencyEdgeCF: t.opts.AdjacencyEdgeCF})
+	if err != nil {
+		return nil, 0, fmt.Errorf("new rfile writer: %w", err)
+	}
+	var count int64
+	for iter.HasTop() {
+		if err := w.Append(iter.GetTopKey(), iter.GetTopValue()); err != nil {
+			return nil, count, fmt.Errorf("append cell %d: %w", count, err)
+		}
+		count++
+		if err := iter.Next(); err != nil {
+			return nil, count, fmt.Errorf("next after cell %d: %w", count-1, err)
+		}
+	}
+	if err := w.Close(); err != nil {
+		return nil, count, fmt.Errorf("close rfile writer: %w", err)
+	}
+	return buf.Bytes(), count, nil
+}
+
+func (f FileFormat) extension() string {
+	if f == FormatParquet {
+		return ".parquet"
+	}
+	return ".rf"
+}
+
+func fileFormat(path string) FileFormat {
+	if filepath.Ext(path) == ".parquet" {
+		return FormatParquet
+	}
+	return FormatRFile
+}
+
+// SetFileFormat changes the format used by subsequent flushes and compactions.
+// Existing immutable files remain readable, enabling online mixed-format migration.
+func (t *Tablet) SetFileFormat(format FileFormat) error {
+	parsed, err := ParseFileFormat(string(format))
+	if err != nil {
+		return err
+	}
+	t.mu.Lock()
+	t.opts.FileFormat = parsed
+	t.mu.Unlock()
 	return nil
 }
 
@@ -713,13 +830,31 @@ func (t *Tablet) sharedForPath(path string) (*rfile.SharedFile, error) {
 	return (*Cache)(nil).sharedFile(path, data, nil)
 }
 
-// openRFileSource opens one RFile as an SKVI leaf, returning the iterator
+// openFileSource opens one immutable file as an SKVI leaf, returning the iterator
 // and a closer function. Bytes come from the tablet's backend (served from
 // the shared cache when warm); the reader shares a decompressed-block
 // cache keyed by path when caching is enabled. RFiles are immutable by
 // path, so the shared bytes slice is safe to wrap in concurrent read-only
 // readers.
-func (t *Tablet) openRFileSource(path string, env iterrt.IteratorEnvironment) (iterrt.SortedKeyValueIterator, func(), error) {
+func (t *Tablet) openFileSource(path string, env iterrt.IteratorEnvironment) (iterrt.SortedKeyValueIterator, func(), error) {
+	if fileFormat(path) == FormatParquet {
+		open := func() (storage.File, error) {
+			return t.backend.Open(context.Background(), path)
+		}
+		file, err := open()
+		if err != nil {
+			return nil, nil, err
+		}
+		src, err := parquetfile.NewSource(file, open)
+		if err != nil {
+			return nil, nil, err
+		}
+		if err := src.Init(nil, nil, env); err != nil {
+			_ = src.Close()
+			return nil, nil, err
+		}
+		return src, func() { _ = src.Close() }, nil
+	}
 	data, err := t.fileBytes(path)
 	if err != nil {
 		return nil, nil, err
@@ -757,11 +892,77 @@ func (t *Tablet) openRFileSource(path string, env iterrt.IteratorEnvironment) (i
 	return src, func() { rdr.Close() }, nil
 }
 
-// listRFiles discovers a tablet's RFiles under dir through the backend's
-// Lister capability (a prefix scan for memory/cloud, a directory listing
-// for local). Falls back to an os.ReadDir for a backend without Lister.
-// Only ".rf" objects are returned (the WAL and other files are ignored).
-func listRFiles(b storage.Backend, dir string) ([]string, error) {
+const immutableManifestVersion = 1
+
+type immutableManifest struct {
+	Version  int      `json:"version"`
+	Active   []string `json:"active"`
+	Obsolete []string `json:"obsolete,omitempty"`
+}
+
+func discoverImmutableFiles(b storage.Backend, dir string, adoptUnknown bool) ([]string, map[string]struct{}, error) {
+	keys, err := listTabletObjects(b, dir)
+	if err != nil {
+		return nil, nil, err
+	}
+	available := make(map[string]string)
+	manifestPresent := false
+	for _, key := range keys {
+		switch filepath.Base(key) {
+		case "files.json":
+			manifestPresent = true
+		default:
+			if ext := filepath.Ext(key); ext == ".rf" || ext == ".parquet" {
+				available[filepath.Base(key)] = key
+			}
+		}
+	}
+	obsolete := make(map[string]struct{})
+	if !manifestPresent {
+		active := make([]string, 0, len(available))
+		for _, key := range available {
+			active = append(active, key)
+		}
+		return active, obsolete, nil
+	}
+	data, err := storage.ReadAll(context.Background(), b, filepath.Join(dir, "files.json"))
+	if err != nil {
+		return nil, nil, fmt.Errorf("read immutable manifest: %w", err)
+	}
+	var manifest immutableManifest
+	if err := json.Unmarshal(data, &manifest); err != nil {
+		return nil, nil, fmt.Errorf("decode immutable manifest: %w", err)
+	}
+	if manifest.Version != immutableManifestVersion {
+		return nil, nil, fmt.Errorf("unsupported immutable manifest version %d", manifest.Version)
+	}
+	for _, name := range manifest.Obsolete {
+		obsolete[name] = struct{}{}
+	}
+	active := make([]string, 0, len(manifest.Active))
+	known := make(map[string]struct{}, len(manifest.Active))
+	for _, name := range manifest.Active {
+		path, ok := available[name]
+		if !ok {
+			return nil, nil, fmt.Errorf("authoritative immutable file %q is missing", name)
+		}
+		active = append(active, path)
+		known[name] = struct{}{}
+	}
+	if adoptUnknown {
+		for name, path := range available {
+			if _, ok := known[name]; ok {
+				continue
+			}
+			if _, retired := obsolete[name]; !retired {
+				active = append(active, path)
+			}
+		}
+	}
+	return active, obsolete, nil
+}
+
+func listTabletObjects(b storage.Backend, dir string) ([]string, error) {
 	var keys []string
 	if lister, ok := b.(storage.Lister); ok {
 		ks, err := lister.List(context.Background(), dir)
@@ -780,24 +981,92 @@ func listRFiles(b storage.Backend, dir string) ([]string, error) {
 			}
 		}
 	}
-	out := keys[:0]
-	for _, k := range keys {
-		if filepath.Ext(k) == ".rf" {
-			out = append(out, k)
-		}
-	}
-	return out, nil
+	return keys, nil
 }
 
-// removeObject deletes an RFile through the backend's Remover capability,
-// falling back to os.Remove. Best-effort: a failed delete leaves an
-// orphan object but does not corrupt the live file set.
-func removeObject(b storage.Backend, path string) {
-	if r, ok := b.(storage.Remover); ok {
-		_ = r.Remove(context.Background(), path)
-		return
+func persistImmutableManifest(b storage.Backend, dir string, active []string, obsolete map[string]struct{}) error {
+	manifest := immutableManifest{Version: immutableManifestVersion}
+	for _, path := range active {
+		manifest.Active = append(manifest.Active, filepath.Base(path))
 	}
-	_ = os.Remove(path)
+	for name := range obsolete {
+		manifest.Obsolete = append(manifest.Obsolete, name)
+	}
+	sort.Strings(manifest.Active)
+	sort.Strings(manifest.Obsolete)
+	data, err := json.MarshalIndent(manifest, "", "  ")
+	if err != nil {
+		return fmt.Errorf("encode immutable manifest: %w", err)
+	}
+	return storage.WriteAll(context.Background(), b, filepath.Join(dir, "files.json"), append(data, '\n'))
+}
+
+func cloneObsolete(in map[string]struct{}) map[string]struct{} {
+	out := make(map[string]struct{}, len(in))
+	for name := range in {
+		out[name] = struct{}{}
+	}
+	return out
+}
+
+// PublishImmutableFiles records the authoritative immutable generation for a
+// tablet directory. Importers call it after checksum verification so stale
+// objects already present under the destination prefix are not rediscovered.
+func PublishImmutableFiles(b storage.Backend, dir string, active []string) error {
+	keys, err := listTabletObjects(b, dir)
+	if err != nil {
+		return err
+	}
+	activeNames := make(map[string]struct{}, len(active))
+	for _, path := range active {
+		activeNames[filepath.Base(path)] = struct{}{}
+	}
+	obsolete := make(map[string]struct{})
+	for _, key := range keys {
+		if ext := filepath.Ext(key); ext == ".rf" || ext == ".parquet" {
+			name := filepath.Base(key)
+			if _, ok := activeNames[name]; !ok {
+				obsolete[name] = struct{}{}
+			}
+		}
+	}
+	return persistImmutableManifest(b, dir, active, obsolete)
+}
+
+// RegisterImmutableFiles adds only checksum-verified import objects to the
+// authoritative generation. It never adopts unrelated objects from the prefix.
+func (t *Tablet) RegisterImmutableFiles(paths []string) (int, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	active := append([]string(nil), t.files...)
+	seen := make(map[string]struct{}, len(active)+len(paths))
+	for _, path := range active {
+		seen[path] = struct{}{}
+	}
+	for _, path := range paths {
+		if _, ok := seen[path]; ok {
+			continue
+		}
+		active = append(active, path)
+		seen[path] = struct{}{}
+		delete(t.obsolete, filepath.Base(path))
+	}
+	sort.Strings(active)
+	if err := persistImmutableManifest(t.backend, t.dir, active, t.obsolete); err != nil {
+		return 0, err
+	}
+	t.files = active
+	return len(t.files), nil
+}
+
+func removeObject(b storage.Backend, path string) error {
+	if r, ok := b.(storage.Remover); ok {
+		return r.Remove(context.Background(), path)
+	}
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
 }
 
 // Scanner is a pull-based iterator over scan results.

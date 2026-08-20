@@ -123,6 +123,8 @@ func cmdInit(args []string) {
 	dataDir := fs.String("data", defaultDataDir(), "data directory")
 	tableName := fs.String("table", "", "table name (required)")
 	splits := fs.String("splits", "", "comma-separated split points (e.g. 'entity:,event:,knowledge:')")
+	format := fs.String("format", "auto", "immutable storage format: auto | rfile | parquet")
+	workload := fs.String("workload", "operational", "auto-format workload: operational | analytical")
 	fs.Parse(args)
 
 	if *tableName == "" {
@@ -136,6 +138,21 @@ func cmdInit(args []string) {
 	defer eng.Close()
 
 	opts := engine.TableOptions{}
+	switch *workload {
+	case string(engine.WorkloadOperational):
+		opts.Workload = engine.WorkloadOperational
+	case string(engine.WorkloadAnalytical):
+		opts.Workload = engine.WorkloadAnalytical
+	default:
+		die("init: unsupported workload %q (want operational or analytical)", *workload)
+	}
+	if *format != "auto" {
+		fileFormat, err := engine.ParseStorageFormat(*format)
+		if err != nil {
+			die("init: %v", err)
+		}
+		opts.FileFormat = fileFormat
+	}
 	if *splits != "" {
 		parts := strings.Split(*splits, ",")
 		opts.Splits = engine.PrefixSplit(parts...)
@@ -212,12 +229,13 @@ func cmdWrite(args []string) {
 
 // CellJSON is the JSON output format for scan results.
 type CellJSON struct {
-	Row string `json:"row"`
-	CF  string `json:"cf"`
-	CQ  string `json:"cq"`
-	CV  string `json:"cv,omitempty"`
-	TS  int64  `json:"ts"`
-	Val string `json:"value"`
+	Row     string `json:"row"`
+	CF      string `json:"cf"`
+	CQ      string `json:"cq"`
+	CV      string `json:"cv,omitempty"`
+	TS      int64  `json:"ts"`
+	Val     string `json:"value"`
+	Deleted bool   `json:"deleted,omitempty"`
 }
 
 // cmdScan scans a table and prints JSON lines.
@@ -277,6 +295,7 @@ func cmdCompact(args []string) {
 	fs := flag.NewFlagSet("compact", flag.ExitOnError)
 	dataDir := fs.String("data", defaultDataDir(), "data directory")
 	tableName := fs.String("table", "", "table name (required)")
+	format := fs.String("format", "", "rewrite immutable files as rfile or parquet")
 	fs.Parse(args)
 
 	if *tableName == "" {
@@ -289,7 +308,17 @@ func cmdCompact(args []string) {
 	}
 	defer eng.Close()
 
-	// Flush before compacting to ensure all data is in RFiles
+	if *format != "" {
+		fileFormat, err := engine.ParseStorageFormat(*format)
+		if err != nil {
+			die("compact: %v", err)
+		}
+		if err := eng.SetTableStorageFormat(*tableName, fileFormat); err != nil {
+			die("compact: set format: %v", err)
+		}
+	}
+
+	// Flush before compacting to ensure all data is immutable.
 	if err := eng.Flush(*tableName); err != nil {
 		die("compact: flush: %v", err)
 	}

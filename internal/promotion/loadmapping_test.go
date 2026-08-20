@@ -9,6 +9,7 @@ import (
 
 	"github.com/phrocker/shoal/internal/engine"
 	"github.com/phrocker/shoal/internal/storage/memory"
+	"github.com/phrocker/shoal/internal/tablet"
 )
 
 func strPtr(s string) *string { return &s }
@@ -150,6 +151,7 @@ func TestBuildLoadMappingRejectsNilManifest(t *testing.T) {
 	if _, err := BuildLoadMapping(nil); err == nil {
 		t.Fatal("BuildLoadMapping(nil) = nil error, want error")
 	}
+
 }
 
 // TestBuildLoadMappingRejectsUnsupportedManifestVersion is the direct
@@ -709,5 +711,36 @@ func TestReadLoadMappingRoundTripsSingleTabletWriteLoadMapping(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got, mapping) {
 		t.Fatalf("round-tripped mapping = %#v, want %#v", got, mapping)
+	}
+}
+
+func TestBuildLoadMappingRejectsParquetAndDerivedFiles(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*engine.RFileExportManifest)
+	}{
+		{
+			name: "parquet table",
+			mutate: func(manifest *engine.RFileExportManifest) {
+				manifest.FileFormat = tablet.FormatParquet
+				manifest.RFileCompatibility = "parquet/shoal"
+				manifest.RFiles[0].Format = engine.ExportFormatParquet
+			},
+		},
+		{
+			name: "derived rfile",
+			mutate: func(manifest *engine.RFileExportManifest) {
+				manifest.RFiles[0].Role = engine.ExportRoleDerived
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			manifest := singleTabletManifest()
+			test.mutate(manifest)
+			if _, err := BuildLoadMapping(manifest); err == nil {
+				t.Fatal("BuildLoadMapping = nil error, want format/role rejection")
+			}
+		})
 	}
 }

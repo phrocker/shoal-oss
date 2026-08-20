@@ -1,6 +1,7 @@
 package enginebackend
 
 import (
+	"fmt"
 	"sort"
 	"testing"
 
@@ -8,6 +9,7 @@ import (
 	"github.com/phrocker/shoal/internal/documentschema"
 	"github.com/phrocker/shoal/internal/engine"
 	"github.com/phrocker/shoal/internal/shoalql"
+	"github.com/phrocker/shoal/internal/tablet"
 )
 
 // docSpec describes one document to write across the document and global-index
@@ -102,13 +104,19 @@ func writeDoc(t *testing.T, eng *engine.Engine, docTable, indexTable string, d d
 }
 
 func newEngineWithDocs(t *testing.T) (*engine.Engine, *shoalql.Executor, shoalql.Catalog) {
+	return newEngineWithDocsFormat(t, tablet.FormatRFile)
+}
+
+func newEngineWithDocsFormat(t *testing.T, format tablet.FileFormat) (*engine.Engine, *shoalql.Executor, shoalql.Catalog) {
 	t.Helper()
 	eng, err := engine.Open(t.TempDir(), engine.Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, tbl := range []string{"docs", "docsIndex"} {
-		if err := eng.CreateTable(tbl, engine.TableOptions{}); err != nil {
+		if err := eng.CreateTable(tbl, engine.TableOptions{
+			TabletOptions: tablet.Options{FileFormat: format},
+		}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -133,6 +141,20 @@ func newEngineWithDocs(t *testing.T) (*engine.Engine, *shoalql.Executor, shoalql
 	}
 	exec := shoalql.NewExecutor(New(eng))
 	return eng, exec, shoalql.NewDocumentCatalog("emails", "docs", "docsIndex")
+}
+
+func TestDocE2E_ParquetParity(t *testing.T) {
+	query := "SELECT id, SUBJECT FROM emails WHERE SENDER = 'alice'"
+	run := func(format tablet.FileFormat) []string {
+		eng, exec, cat := newEngineWithDocsFormat(t, format)
+		defer eng.Close()
+		return idsOf(t, runE2E(t, cat, exec, query, shoalql.PlanOptions{}))
+	}
+	rfileIDs := run(tablet.FormatRFile)
+	parquetIDs := run(tablet.FormatParquet)
+	if fmt.Sprint(parquetIDs) != fmt.Sprint(rfileIDs) {
+		t.Fatalf("document query differs: rfile=%v parquet=%v", rfileIDs, parquetIDs)
+	}
 }
 
 // idsOf collects the "id" column of a result into a sorted slice.

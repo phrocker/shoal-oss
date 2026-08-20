@@ -41,13 +41,14 @@ import (
 	"io"
 
 	"github.com/phrocker/shoal/internal/iterrt"
+	"github.com/phrocker/shoal/internal/parquetfile"
 	"github.com/phrocker/shoal/internal/rfile"
 	"github.com/phrocker/shoal/internal/rfile/bcfile"
 	"github.com/phrocker/shoal/internal/rfile/bcfile/block"
 	"github.com/phrocker/shoal/internal/rfile/wire"
 )
 
-// Input is one RFile feeding a compaction. Bytes is the whole RFile
+// Input is one immutable file feeding a compaction. Bytes is the whole file
 // image; Name is a human label used only in error messages (typically
 // the metadata file entry, e.g. the tablet-relative path).
 //
@@ -56,14 +57,15 @@ import (
 // a bytes.Reader). A streaming variant is a later optimisation; it does
 // not change the composer's contract.
 type Input struct {
-	Name  string
-	Bytes []byte
+	Name   string
+	Bytes  []byte
+	Format string
 }
 
 // Spec describes a single compaction unit fully: the inputs, the
 // iterator stack to apply, the scope, and the output RFile's encoding.
 type Spec struct {
-	// Inputs are the RFiles to merge, in any order — the MergingIterator
+	// Inputs are the immutable files to merge, in any order — the MergingIterator
 	// sorts across them. An empty Inputs list produces an empty (but
 	// valid) output RFile.
 	Inputs []Input
@@ -124,11 +126,14 @@ type Spec struct {
 	// oversized cell) and the in-memory index levels. Size the budget
 	// with that headroom in mind.
 	MaxOutputBytes int64
+
+	// OutputFormat selects "rfile" (default) or "parquet".
+	OutputFormat string
 }
 
 // Result reports what a Compact call produced.
 type Result struct {
-	// Output is the written RFile image.
+	// Output is the written immutable file image.
 	Output []byte
 	// EntriesWritten is the cell count drained into the output — the
 	// number of cells the iterator stack surfaced, which may be less
@@ -207,11 +212,33 @@ func CompactContext(ctx context.Context, spec Spec, observe func(Progress)) (*Re
 	}
 	defer closer.Close()
 
+	if spec.OutputFormat == "parquet" {
+		var buf bytes.Buffer
+		written, err := parquetfile.EncodeToWithOptions(
+			&budgetedWriter{w: &buf, max: spec.MaxOutputBytes},
+			top,
+			parquetfile.EncodeOptions{
+				Check: ctx.Err,
+				Observe: func(written int64) {
+					if observe != nil {
+						observe(Progress{EntriesWritten: written})
+					}
+				},
+			},
+		)
+		if err != nil {
+			return nil, fmt.Errorf("compaction: %w", err)
+		}
+		return &Result{Output: buf.Bytes(), EntriesWritten: written}, nil
+	}
+	if spec.OutputFormat != "" && spec.OutputFormat != "rfile" {
+		return nil, fmt.Errorf("compaction: unknown output format %q", spec.OutputFormat)
+	}
+
 	codec := spec.Codec
 	if codec == "" {
 		codec = block.CodecSnappy
 	}
-
 	var buf bytes.Buffer
 	w, err := rfile.NewWriter(&budgetedWriter{w: &buf, max: spec.MaxOutputBytes}, rfile.WriterOptions{
 		Codec:           codec,
@@ -221,7 +248,6 @@ func CompactContext(ctx context.Context, spec Spec, observe func(Progress)) (*Re
 	if err != nil {
 		return nil, fmt.Errorf("compaction: new writer: %w", err)
 	}
-
 	var written int64
 	for top.HasTop() {
 		if err := ctx.Err(); err != nil {
@@ -244,7 +270,6 @@ func CompactContext(ctx context.Context, spec Spec, observe func(Progress)) (*Re
 	if err := w.Close(); err != nil {
 		return nil, fmt.Errorf("compaction: close writer: %w", err)
 	}
-
 	return &Result{Output: buf.Bytes(), EntriesWritten: written}, nil
 }
 
@@ -355,9 +380,27 @@ func (f closerFunc) Close() error { f(); return nil }
 // does not DeepCopy its sources today, but a future stack (a parent that
 // re-seeks its source) might, and an opener that re-derives a reader
 // from the same in-memory image is free to provide.
-func openInputSource(in Input, env iterrt.IteratorEnvironment) (*iterrt.RFileSource, io.Closer, error) {
+func openInputSource(in Input, env iterrt.IteratorEnvironment) (iterrt.SortedKeyValueIterator, io.Closer, error) {
 	if len(in.Bytes) == 0 {
 		return nil, nil, fmt.Errorf("compaction: input %q is empty", in.Name)
+	}
+	format := in.Format
+	if format == "" && len(in.Name) >= len(".parquet") && in.Name[len(in.Name)-len(".parquet"):] == ".parquet" {
+		format = "parquet"
+	}
+	if format == "parquet" {
+		cells, err := parquetfile.Decode(in.Bytes)
+		if err != nil {
+			return nil, nil, fmt.Errorf("compaction: open parquet %q: %w", in.Name, err)
+		}
+		src := iterrt.NewSliceSource(cells)
+		if err := src.Init(nil, nil, env); err != nil {
+			return nil, nil, fmt.Errorf("compaction: source init %q: %w", in.Name, err)
+		}
+		return src, closerFunc(func() {}), nil
+	}
+	if format != "" && format != "rfile" {
+		return nil, nil, fmt.Errorf("compaction: unknown input format %q for %q", format, in.Name)
 	}
 
 	open := func() (*rfile.Reader, error) {
