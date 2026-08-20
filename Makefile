@@ -73,13 +73,6 @@ thrift-gen: thrift-check
 	# Drop standalone -remote debug CLIs; they target a newer apache/thrift
 	# Go runtime API and we don't use them.
 	find $(THRIFT_OUT) -type d -name '*-remote' -exec rm -rf {} +
-	# The 0.17 Go generator leaves trailing spaces and an extra blank line in
-	# tabletmgmt output. Normalize that package so new generated files pass
-	# the repository's diff checks deterministically.
-	if test -d $(THRIFT_OUT)/tabletmgmt; then \
-	  find $(THRIFT_OUT)/tabletmgmt -name '*.go' -exec \
-	    sed -i -e 's/[[:space:]]\+$$//' -e '$${/^$$/d;}' {} +; \
-	fi
 	# Thrift derives the Go package from the hyphenated IDL basename, which is
 	# not a valid Go identifier. Accumulo's Java generator does not need a Go
 	# namespace, so normalize this one package after generation.
@@ -93,6 +86,13 @@ thrift-gen: thrift-check
 	  mv $(THRIFT_OUT)/compaction-coordinator $(THRIFT_OUT)/compactioncoordinator; \
 	fi
 	$(MAKE) patch-thrift-nil-binary
+	# The 0.17 Go generator and the generic patch pass leave trailing spaces
+	# and an extra blank line in tabletmgmt output. Normalize last so checked-in
+	# generated files pass diff checks and thrift-verify deterministically.
+	if test -d $(THRIFT_OUT)/tabletmgmt; then \
+	  find $(THRIFT_OUT)/tabletmgmt -name '*.go' -exec \
+	    sed -i -e 's/[[:space:]]\+$$//' -e '$${/^$$/d;}' {} +; \
+	fi
 
 .PHONY: thrift-verify
 thrift-verify: validate thrift-check
