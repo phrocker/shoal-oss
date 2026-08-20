@@ -18,12 +18,11 @@ import (
 
 // MaxResultBytes is the soft cap on aggregate TKeyValue payload bytes
 // per StartScan / StartMultiScan response. Mirrors Accumulo's default
-// 4MB scan batch; V0/V0.5 returns everything in one shot, so this is
-// the hard limit too.
+// 4MB scan batch.
 const MaxResultBytes = 4 << 20
 
-// StartScan implements TabletScanClientServiceIf. Single-shot: everything
-// is returned in the InitialScan; ContinueScan signals exhausted.
+// StartScan evaluates the requested range and retains results beyond the
+// response budget for lossless ContinueScan paging.
 //
 // Algorithm:
 //  1. Look up the tablet's RFile list via metadata walker (locator-cache-
@@ -37,9 +36,9 @@ const MaxResultBytes = 4 << 20
 //     versioning iterator typically caps to 1 by default for most tables).
 //  6. Skip deleted cells (tombstones) — by V0's simplified semantics, a
 //     deletion marker swallows the whole coordinate.
-//  7. Stop at range end (respecting inclusive/exclusive flags) or when
-//     accumulated bytes hit MaxResultBytes.
-//  8. Return InitialScan with More=false.
+//  7. Stop at the requested range end, then split the materialized result
+//     on whole-key/value boundaries.
+//  8. Return the first page and retain any remainder under the scan ID.
 func (s *Server) StartScan(
 	ctx context.Context,
 	tinfo *client.TInfo,
@@ -85,20 +84,30 @@ func (s *Server) StartScan(
 			return nil, fmt.Errorf("lookup tablet: %w", terr)
 		}
 		results, approxBytes, _, werr := s.scanTabletRangeWAL(
-			ctx, tablet, rangeArg, columns, authorizations, MaxResultBytes,
+			ctx, tablet, rangeArg, columns, authorizations, int(^uint(0)>>1),
 		)
 		if werr != nil {
 			return nil, werr
 		}
+		page := splitScanResults(results, s.pages)
+		scanID := data.ScanID(0)
+		if page.more {
+			scanID, err = s.scans.create(time.Now(), page.remaining)
+			if err != nil {
+				return nil, err
+			}
+		}
 		s.logger.LogAttrs(ctx, slog.LevelInfo, "scan complete (wal route)",
 			slog.String("table", string(extent.Table)),
-			slog.Int("cells_returned", len(results)),
-			slog.Int("approx_bytes", approxBytes),
+			slog.Int("cells_returned", len(page.results)),
+			slog.Int("cells_total", len(results)),
+			slog.Int("approx_bytes_total", approxBytes),
+			slog.Bool("continued", page.more),
 			slog.Duration("dur", time.Since(t0)),
 		)
 		return &data.InitialScan{
-			ScanID:  0,
-			Result_: &data.ScanResult_{Results: results, More: false},
+			ScanID:  scanID,
+			Result_: &data.ScanResult_{Results: page.results, More: page.more},
 		}, nil
 	}
 
@@ -111,24 +120,35 @@ func (s *Server) StartScan(
 	}
 
 	results, approxBytes, _, err := s.scanTabletRanges(
-		ctx, files, []*data.TRange{rangeArg}, columns, ev, MaxResultBytes, postProc,
+		ctx, files, []*data.TRange{rangeArg}, columns, ev, int(^uint(0)>>1), postProc,
 	)
 	if err != nil {
 		return nil, err
 	}
 
+	page := splitScanResults(results, s.pages)
+	scanID := data.ScanID(0)
+	if page.more {
+		scanID, err = s.scans.create(time.Now(), page.remaining)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	s.logger.LogAttrs(ctx, slog.LevelInfo, "scan complete",
 		slog.String("table", string(extent.Table)),
 		slog.Int("files", len(files)),
-		slog.Int("cells_returned", len(results)),
-		slog.Int("approx_bytes", approxBytes),
+		slog.Int("cells_returned", len(page.results)),
+		slog.Int("cells_total", len(results)),
+		slog.Int("approx_bytes_total", approxBytes),
+		slog.Bool("continued", page.more),
 		slog.Duration("dur", time.Since(t0)),
 		slog.Int("vis_cache", ev.CacheSize()),
 	)
 
 	return &data.InitialScan{
-		ScanID:  0,
-		Result_: &data.ScanResult_{Results: results, More: false},
+		ScanID:  scanID,
+		Result_: &data.ScanResult_{Results: page.results, More: page.more},
 	}, nil
 }
 
