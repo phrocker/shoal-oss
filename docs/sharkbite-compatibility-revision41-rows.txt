@@ -1,8 +1,8 @@
-# Revision-40 accepted matrix rows for docs/sharkbite-compatibility.md.
+# Revision-41 accepted matrix rows for docs/sharkbite-compatibility.md.
 # One entry per row: ROW-ID followed by the audited status, in document order.
 # Pinning the status next to the id means a swap of two rows' statuses inside one
 # section cannot pass the aggregate count checks undetected.
-# Update only when the independently audited revision-40 inventory itself changes.
+# Update only when the independently audited revision-41 inventory itself changes.
 # Regenerate from the audited document, review every added/removed/reclassified row
 # in code review, and keep the list in document order for human auditability.
 
@@ -736,21 +736,21 @@ SB-CXX-0204 Not required (rationale required)
 SB-CXX-0205 Not required (rationale required)
 SB-CXX-0206 Not required (rationale required)
 SB-CXX-0207 Not required (rationale required)
-SB-CXX-0208 Missing Go
-SB-CXX-0209 Missing Go
-SB-CXX-0210 Missing Go
+SB-CXX-0208 Missing C ABI
+SB-CXX-0209 Missing C ABI
+SB-CXX-0210 Missing C ABI
 SB-CXX-0211 Missing Go
-SB-CXX-0212 Missing Go
-SB-CXX-0213 Missing Go
-SB-CXX-0214 Missing Go
+SB-CXX-0212 Missing C ABI
+SB-CXX-0213 Missing C ABI
+SB-CXX-0214 Missing C ABI
 SB-CXX-0215 Missing Go
-SB-CXX-0216 Missing Go
-SB-CXX-0217 Missing Go
-SB-CXX-0218 Missing Go
-SB-CXX-0219 Missing Go
-SB-CXX-0220 Missing Go
-SB-CXX-0221 Missing Go
-SB-CXX-0222 Missing Go
+SB-CXX-0216 Missing C ABI
+SB-CXX-0217 Missing C ABI
+SB-CXX-0218 Missing C ABI
+SB-CXX-0219 Missing C ABI
+SB-CXX-0220 Missing C ABI
+SB-CXX-0221 Missing C ABI
+SB-CXX-0222 Missing C ABI
 SB-CXX-0223 Missing Go
 SB-CXX-0224 Missing Go
 SB-CXX-0225 Missing Go
@@ -1073,23 +1073,23 @@ SB-CXX-0541 Missing C ABI
 SB-CXX-0542 Not required (rationale required)
 SB-CXX-0543 Behavior mismatch
 SB-CXX-0544 Not required (rationale required)
-SB-CXX-0545 Missing Go
+SB-CXX-0545 Missing C ABI
 SB-CXX-0546 Not required (rationale required)
 SB-CXX-0547 Missing Go
 SB-CXX-0548 Missing Go
 SB-CXX-0549 Not required (rationale required)
-SB-CXX-0550 Missing Go
-SB-CXX-0551 Missing Go
-SB-CXX-0552 Missing Go
-SB-CXX-0553 Missing Go
+SB-CXX-0550 Missing C ABI
+SB-CXX-0551 Missing C ABI
+SB-CXX-0552 Missing C ABI
+SB-CXX-0553 Missing C ABI
 SB-CXX-0554 Missing Go
-SB-CXX-0555 Missing Go
-SB-CXX-0556 Missing Go
-SB-CXX-0557 Missing Go
-SB-CXX-0558 Missing Go
-SB-CXX-0559 Missing Go
-SB-CXX-0560 Missing Go
-SB-CXX-0561 Missing Go
+SB-CXX-0555 Missing C ABI
+SB-CXX-0556 Missing C ABI
+SB-CXX-0557 Missing C ABI
+SB-CXX-0558 Missing C ABI
+SB-CXX-0559 Missing C ABI
+SB-CXX-0560 Missing C ABI
+SB-CXX-0561 Missing C ABI
 SB-CXX-0562 Missing Go
 SB-CXX-0563 Missing Go
 SB-CXX-0564 Missing Go

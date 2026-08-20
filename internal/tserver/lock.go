@@ -20,8 +20,6 @@ package tserver
 import (
 	"fmt"
 	"math"
-
-	"github.com/google/uuid"
 )
 
 // LockID identifies one held Accumulo ServiceLock. It mirrors the ephemeral
@@ -41,9 +39,12 @@ type LockID struct {
 // Valid reports whether the lock identity could name a real ServiceLock node,
 // and so is usable for fencing.
 //
-// The checks mirror the node parser in internal/zk (see firstLockNode): the
-// UUID must parse as a UUID, and the sequence must fit the signed 32-bit
-// counter Accumulo's ServiceLock.validateAndSort reads with Integer.parseInt.
+// The checks are the ones Accumulo's ServiceLock.validateAndSort makes: the
+// UUID must be the 36-character dashed form Java's UUID.fromString accepts,
+// and the sequence must fit the signed 32-bit counter it reads with
+// Integer.parseInt. internal/zk's node parser is looser — it takes whatever
+// uuid.Parse accepts, including the undashed and URN spellings Java rejects —
+// so this is parity with Accumulo rather than with that parser.
 // An identity outside that shape could never appear as a "zlock#<uuid>#<seq>"
 // node, so it cannot be a lock this process holds — trusting it as fencing
 // authority would be fencing against nothing.
@@ -51,8 +52,7 @@ func (l LockID) Valid() bool {
 	if l.Sequence < 0 || l.Sequence > math.MaxInt32 {
 		return false
 	}
-	_, err := uuid.Parse(l.UUID)
-	return err == nil
+	return validAccumuloUUID(l.UUID)
 }
 
 // Equal reports whether two lock identities are the same held lock.
