@@ -52,6 +52,7 @@ V1 + IVF-PQ iterator port shipped. Embedded standalone engine shipped.
 | RFile reader (block-level CRC, prefetch, snappy/gz/zlib) | shipped |
 | `RFile.blockmeta` zone-map block-skip extension | shipped — forward-compatible with Java `RFile.Reader` |
 | VisibilityFilter pushdown | shipped — alloc-free warm cache |
+| Accumulo 4 iterator capability admission | shipped — versioned, fail-closed scan/minc/majc registry and [machine-readable inventory](docs/iterator-capability-registry.md) |
 | File / locator / block caches | shipped |
 | Startup pre-warm (`-prewarm-tables=auto`) | shipped — distributed-serving mode |
 | Client-side hedge coordinator | shipped — `scanRow*` + `scanBatch*` overloads |
