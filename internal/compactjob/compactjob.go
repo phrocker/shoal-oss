@@ -139,6 +139,14 @@ const (
 	// commit; this refusal is an integration gate, not a protocol gap.
 	ClassExecutionUnavailable = "org.apache.accumulo.shoal.ExecutorNotWired"
 
+	// ClassConfigurationUnavailable reports that the effective table
+	// configuration could not be resolved consistently before execution.
+	ClassConfigurationUnavailable = "org.apache.accumulo.shoal.TableConfigurationUnavailable"
+
+	// ClassExecutionFailed reports a storage or compaction failure after the
+	// complete capability gate succeeded.
+	ClassExecutionFailed = "org.apache.accumulo.shoal.CompactionExecutionFailed"
+
 	// ClassCommitUnavailable is retained as a source-compatible alias for
 	// callers built against the previous slice.
 	ClassCommitUnavailable = ClassExecutionUnavailable
@@ -263,6 +271,65 @@ type Options struct {
 	// Limits bounds the job's inputs. The zero value is unlimited; pass
 	// DefaultLimits() for the standard budget.
 	Limits Limits
+}
+
+// OptionsFromTableProperties resolves the effective table configuration into
+// the writer defaults used by Translate. Properties that require output
+// features Shoal does not implement are refused before any storage I/O.
+func OptionsFromTableProperties(properties map[string]string, limits Limits) (Options, error) {
+	if properties == nil {
+		return Options{}, refuse(ClassUnsupportedProperty, "tableConfiguration", "missing effective table configuration")
+	}
+	if fileType := properties["table.file.type"]; fileType != "" && fileType != "rf" {
+		return Options{}, refuse(ClassUnsupportedProperty, "table.file.type",
+			"unsupported table file type %q; shoal writes RFiles only", fileType)
+	}
+	for key, value := range properties {
+		if value == "" {
+			continue
+		}
+		if isCryptoOverride(key) &&
+			!strings.Contains(value, "NoCryptoService") {
+			return Options{}, refuse(ClassUnsupportedCrypto, key,
+				"shoal writes cleartext RFiles; encrypted output must come from a Java compactor")
+		}
+		if strings.HasPrefix(key, "table.summarizer.") ||
+			strings.HasPrefix(key, "table.sampler.opt.") {
+			return Options{}, refuse(ClassUnsupportedProperty, key,
+				"shoal cannot reproduce this table output feature")
+		}
+	}
+	if sampler := properties["table.sampler"]; sampler != "" {
+		return Options{}, refuse(ClassUnsupportedProperty, "table.sampler",
+			"shoal cannot reproduce sampled RFile output")
+	}
+	if groups := properties["table.groups.enabled"]; groups != "" {
+		return Options{}, refuse(ClassUnsupportedProperty, "table.groups.enabled",
+			"shoal cannot reproduce locality-group RFile output")
+	}
+	if strings.EqualFold(properties["table.bloom.enabled"], "true") {
+		return Options{}, refuse(ClassUnsupportedProperty, "table.bloom.enabled",
+			"shoal cannot reproduce Bloom-filtered RFile output")
+	}
+
+	opts := Options{Limits: limits}
+	if raw := properties[propCompressType]; raw != "" {
+		codec, ok := accumuloCodecs[raw]
+		if !ok {
+			return Options{}, refuse(ClassUnsupportedProperty, propCompressType,
+				"unsupported compression codec %q (shoal writes %s)", raw, supportedCodecList())
+		}
+		opts.DefaultCodec = codec
+	}
+	if raw := properties[propCompressBlockSize]; raw != "" {
+		size, err := parseMemoryBytes(raw)
+		if err != nil || size <= 0 || size > maxBlockSize {
+			return Options{}, refuse(ClassUnsupportedProperty, propCompressBlockSize,
+				"unsupported compression block size %q", raw)
+		}
+		opts.DefaultBlockSize = int(size)
+	}
+	return opts, nil
 }
 
 // InputFile is one translated entry of job.files.
