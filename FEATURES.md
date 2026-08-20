@@ -74,20 +74,23 @@ live adapter is unavailable.
 | Structured errors, logging, deadlines, retries, GIL, and fork-safety contracts | Shipped |
 | Windows shared/static ABI and wheel artifacts | Shipped |
 | Linux manylinux distribution | Shipped |
-| Native macOS dylib/wheel runtime and Mach-O verification | External validation pending |
-| Controlled manylinux/macOS release workflow | Infrastructure blocked — local release tooling exists, but the repository workflow still requires workflow-authorized credentials |
+| Native macOS dylib/wheel runtime and Mach-O verification | Optional/deferred by @phrocker on 2026-08-20 |
+| Controlled Linux manylinux release workflow | Infrastructure blocked — local release tooling exists, but the repository workflow still requires workflow-authorized credentials; macOS publication is optional |
 
 The normative matrix is
 [`docs/sharkbite-compatibility.md`](docs/sharkbite-compatibility.md), with
 scope defined by
 [`docs/sharkbite-client-scope.md`](docs/sharkbite-client-scope.md). Revision
-54 satisfies 389 of 397 required rows. The eight remaining rows require
+55 satisfies 389 of 394 required rows. The five remaining rows require
 external evidence:
 
-- macOS/release: `SB-PKG-008`, `SB-PKG-011`, `SB-XCUT-014`,
-  `SB-XCUT-019`;
+- Linux release automation: `SB-PKG-011`;
 - live Accumulo 4: `SB-SCAN-022`, `SB-SCAN-026`, `SB-XCUT-015`,
   `SB-XCUT-016`.
+
+Native macOS publication/runtime rows `SB-PKG-008`, `SB-XCUT-014`, and
+`SB-XCUT-019` remain visible but are optional/deferred under the named,
+dated owner decision.
 
 ## Operations and conformance
 
