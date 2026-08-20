@@ -7,6 +7,7 @@ import (
 
 	"github.com/parquet-go/parquet-go"
 	"github.com/phrocker/shoal/internal/iterrt"
+	"github.com/phrocker/shoal/internal/parquetfile"
 )
 
 type sliceScanCursor struct {
@@ -60,7 +61,7 @@ func TestWriteScanParquetRoundTrip(t *testing.T) {
 		t.Fatalf("count = %d, want 2", count)
 	}
 
-	rows, err := parquet.Read[parquetCell](bytes.NewReader(buffer.Bytes()), int64(buffer.Len()))
+	rows, err := parquet.Read[parquetfile.Cell](bytes.NewReader(buffer.Bytes()), int64(buffer.Len()))
 	if err != nil {
 		t.Fatalf("read parquet: %v", err)
 	}

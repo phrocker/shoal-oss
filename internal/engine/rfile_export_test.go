@@ -16,6 +16,7 @@ import (
 	"github.com/phrocker/shoal/internal/iterrt"
 	"github.com/phrocker/shoal/internal/storage"
 	"github.com/phrocker/shoal/internal/storage/memory"
+	"github.com/phrocker/shoal/internal/tablet"
 )
 
 type exportSourceBackend struct{}
@@ -112,7 +113,7 @@ func TestRFileExportImportMemoryRoundTrip(t *testing.T) {
 		t.Fatalf("ExportRFiles: %v", err)
 	}
 	defer src.Close()
-	if got, want := manifest.Version, RFileExportManifestVersion; got != want {
+	if got, want := manifest.Version, RFileExportManifestLegacyVersion; got != want {
 		t.Fatalf("manifest version = %d, want %d", got, want)
 	}
 	if got, want := manifest.CFSchema, "graphschema/v1"; got != want {
@@ -564,6 +565,178 @@ func TestCopyWithSHA256CountsPartialWriteProgressBeforeError(t *testing.T) {
 	}
 	if dst.lastWriter.stagePresent {
 		t.Fatal("partial error write left staged bytes behind")
+	}
+}
+
+func TestParquetExportImportWithVisibilityStamp(t *testing.T) {
+	ctx := context.Background()
+	srcDir := filepath.Join(t.TempDir(), "src")
+	dstDir := filepath.Join(t.TempDir(), "dst")
+	src, err := Open(srcDir, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer src.Close()
+	if err := src.CreateTable("graph", TableOptions{
+		TabletOptions: tablet.Options{FileFormat: tablet.FormatParquet},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	m, _ := cclient.NewMutation([]byte("row"))
+	m.Put([]byte("cf"), []byte("cq"), nil, 7, []byte("value"))
+	if err := src.Write("graph", []*cclient.Mutation{m}); err != nil {
+		t.Fatal(err)
+	}
+
+	backend := memory.New()
+	manifest, err := src.ExportRFiles(ctx, "graph", backend, RFileExportOptions{
+		DestinationRoot:      dstDir,
+		StampVisibilityLabel: "tenantA",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if manifest.FileFormat != tablet.FormatParquet || len(manifest.RFiles) != 1 {
+		t.Fatalf("unexpected manifest: %+v", manifest)
+	}
+	if manifest.Version != RFileExportManifestVersion {
+		t.Fatalf("manifest version = %d, want %d", manifest.Version, RFileExportManifestVersion)
+	}
+	manifest.Version = RFileExportManifestLegacyVersion
+	if err := VerifyRFileExport(ctx, backend, manifest); err == nil || !strings.Contains(err.Error(), "authoritative RFile") {
+		t.Fatalf("VerifyRFileExport legacy parquet error = %v", err)
+	}
+	manifest.Version = RFileExportManifestVersion
+	if manifest.RFiles[0].Format != string(tablet.FormatParquet) || manifest.RFiles[0].BCFileVersion != "" {
+		t.Fatalf("unexpected parquet file metadata: %+v", manifest.RFiles[0])
+	}
+
+	dst, err := Open(dstDir, Options{Backend: backend})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dst.Close()
+	if err := dst.ImportRFileManifest(ctx, manifest); err != nil {
+		t.Fatal(err)
+	}
+	got := scanAll(t, dst, "graph")
+	if fmt.Sprint(got) != "[row|cf|cq|tenantA|7|value]" {
+		t.Fatalf("imported parquet cells = %v", got)
+	}
+}
+
+func TestMixedFormatExportManifestUsesActualFileFormats(t *testing.T) {
+	ctx := context.Background()
+	src, err := Open(t.TempDir(), Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer src.Close()
+	if err := src.CreateTable("graph", TableOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	write := func(row string) {
+		m, _ := cclient.NewMutation([]byte(row))
+		m.Put([]byte("cf"), []byte("cq"), nil, 1, []byte(row))
+		if err := src.Write("graph", []*cclient.Mutation{m}); err != nil {
+			t.Fatal(err)
+		}
+		if err := src.Flush("graph"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("rfile")
+	if err := src.SetTableFileFormat("graph", tablet.FormatParquet); err != nil {
+		t.Fatal(err)
+	}
+	write("parquet")
+	policy, err := src.TableStoragePolicy("graph")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if policy.WriteFormat != StorageFormatParquet || !policy.Mixed ||
+		fmt.Sprint(policy.ReadFormats) != "[parquet rfile]" || policy.Role != "authoritative" {
+		t.Fatalf("mixed storage policy = %+v", policy)
+	}
+
+	dst := memory.New()
+	manifest, err := src.ExportRFiles(ctx, "graph", dst, RFileExportOptions{
+		DestinationRoot: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if manifest.FileFormat != tablet.FormatParquet ||
+		manifest.RFileCompatibility != "mixed-rfile-parquet/shoal" ||
+		manifest.Version != RFileExportManifestVersion {
+		t.Fatalf("mixed manifest metadata = %+v", manifest)
+	}
+	formats := map[string]bool{}
+	for _, file := range manifest.RFiles {
+		formats[file.Format] = true
+	}
+	if !formats[string(tablet.FormatRFile)] || !formats[string(tablet.FormatParquet)] {
+		t.Fatalf("mixed manifest file formats = %v", formats)
+	}
+}
+
+func TestImportRFileManifestRejectsDerivedFiles(t *testing.T) {
+	ctx := context.Background()
+	src, err := Open(filepath.Join(t.TempDir(), "src"), Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer src.Close()
+	if err := src.CreateTable("graph", TableOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	writeRow(t, src, "graph", "row", 0)
+
+	backend := memory.New()
+	manifest, err := src.ExportRFiles(ctx, "graph", backend, RFileExportOptions{DestinationRoot: "export"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest.Version = RFileExportManifestVersion
+	manifest.RFiles[0].Role = ExportRoleDerived
+
+	dst, err := Open(filepath.Join(t.TempDir(), "dst"), Options{Backend: backend})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dst.Close()
+	if err := dst.ImportRFileManifest(ctx, manifest); err == nil || !strings.Contains(err.Error(), "only authoritative") {
+		t.Fatalf("ImportRFileManifest error = %v, want derived-role rejection", err)
+	}
+}
+
+func TestImportRFileManifestRejectsSameCountDifferentSplits(t *testing.T) {
+	ctx := context.Background()
+	src, err := Open(filepath.Join(t.TempDir(), "src"), Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer src.Close()
+	if err := src.CreateTable("graph", TableOptions{Splits: PrefixSplit("m")}); err != nil {
+		t.Fatal(err)
+	}
+	writeRow(t, src, "graph", "row", 0)
+
+	backend := memory.New()
+	manifest, err := src.ExportRFiles(ctx, "graph", backend, RFileExportOptions{DestinationRoot: "export"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dst, err := Open(filepath.Join(t.TempDir(), "dst"), Options{Backend: backend})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dst.Close()
+	if err := dst.CreateTable("graph", TableOptions{Splits: PrefixSplit("n")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := dst.ImportRFileManifest(ctx, manifest); err == nil || !strings.Contains(err.Error(), "split 0") {
+		t.Fatalf("ImportRFileManifest error = %v, want split mismatch", err)
 	}
 }
 

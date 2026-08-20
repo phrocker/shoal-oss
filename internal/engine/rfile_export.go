@@ -22,9 +22,13 @@ import (
 	"github.com/phrocker/shoal/internal/rfile/bcfile"
 	"github.com/phrocker/shoal/internal/rfile/bcfile/block"
 	"github.com/phrocker/shoal/internal/storage"
+	"github.com/phrocker/shoal/internal/tablet"
 )
 
-const RFileExportManifestVersion = 1
+const (
+	RFileExportManifestLegacyVersion = 1
+	RFileExportManifestVersion       = 2
+)
 
 // producerIDRe constrains a fan-in producer id to characters that are safe in
 // both object keys and local file names and that exclude the "~" namespacing
@@ -51,6 +55,7 @@ type RFileExportManifest struct {
 	SourceTable         string              `json:"source_table"`
 	EngineVersion       string              `json:"engine_version,omitempty"`
 	RFileCompatibility  string              `json:"rfile_compatibility"`
+	FileFormat          tablet.FileFormat   `json:"file_format,omitempty"`
 	CFSchema            string              `json:"cf_schema,omitempty"`
 	VisibilityStamp     string              `json:"visibility_stamp,omitempty"`
 	AuthorizationsStamp string              `json:"authorizations_stamp,omitempty"`
@@ -98,26 +103,8 @@ type RFileExportManifest struct {
 // never round-trip through the legacy keys: MarshalJSON always emits
 // only the *_b64 keys.
 //
-// The reverse direction -- an old reader (compiled before this fix)
-// decoding a new manifest that only carries the *_b64 keys -- was also
-// considered: such a reader has no start_row/end_row keys to find, so
-// StartRow/EndRow silently decode to nil instead of the manifest's
-// actual boundary rows, rather than an explicit rejection. That is a
-// real gap in principle (RFileExportManifestVersion was not bumped, so
-// nothing forces an old reader to notice), but it is not currently
-// exploitable: the only two existing consumers of RFileExportManifest
-// are ImportRFileManifest below, which reads Tablets purely for each
-// entry's Index (to create a t-%04d directory) and for
-// tabletCount()'s divergent-splits guard (a count, not boundary
-// values) -- never StartRow/EndRow -- and internal/promotion, the only
-// consumer that reads tablet boundary values at all, which is new in
-// this same change and therefore has no pre-existing "old" build to
-// misread anything. If a future consumer starts depending on
-// StartRow/EndRow's actual values without also handling the *_b64
-// keys, this silent-nil gap would become real, at which point bumping
-// RFileExportManifestVersion (and widening VerifyRFileExport's
-// version check accordingly) is the fix; it was not done as part of
-// this change because there was nothing for it to protect yet.
+// Version 2 readers consume these byte-safe boundaries directly. Legacy
+// version 1 remains accepted only for authoritative RFile manifests.
 type RFileExportTablet struct {
 	Index    int
 	StartRow *string
@@ -300,18 +287,24 @@ func (e *Engine) ExportRFiles(ctx context.Context, tableName string, dst storage
 
 	e.mu.RLock()
 	tbl, ok := e.tables[tableName]
+	var configuredFormat tablet.FileFormat
+	if ok {
+		configuredFormat = tbl.fileFormat()
+	}
 	e.mu.RUnlock()
 	if !ok {
 		return nil, fmt.Errorf("engine: table %q not found", tableName)
 	}
 
 	files := tbl.rfiles()
+	compatibility := exportCompatibility(files)
 	manifest := &RFileExportManifest{
 		Version:             RFileExportManifestVersion,
 		CreatedAt:           time.Now().UTC(),
 		SourceTable:         tableName,
 		EngineVersion:       opts.EngineVersion,
-		RFileCompatibility:  "accumulo-rfile/shoal",
+		RFileCompatibility:  compatibility,
+		FileFormat:          configuredFormat,
 		CFSchema:            opts.CFSchema,
 		VisibilityStamp:     opts.VisibilityStamp,
 		AuthorizationsStamp: opts.AuthorizationsStamp,
@@ -335,7 +328,7 @@ func (e *Engine) ExportRFiles(ctx context.Context, tableName string, dst storage
 			Size:            size,
 			SHA256:          sum,
 			BCFileVersion:   bcVersion,
-			Format:          ExportFormatRFile,
+			Format:          string(fileFormatForPath(f.Path)),
 			Role:            ExportRoleAuthoritative,
 		})
 	}
@@ -345,6 +338,7 @@ func (e *Engine) ExportRFiles(ctx context.Context, tableName string, dst storage
 		}
 		return manifest.RFiles[i].DestinationPath < manifest.RFiles[j].DestinationPath
 	})
+	manifest.Version = exportManifestVersion(manifest)
 
 	manifestPath := opts.ManifestPath
 	if manifestPath == "" {
@@ -370,6 +364,53 @@ func (m *RFileExportManifest) tabletCount() int {
 	return len(m.Tablets)
 }
 
+func manifestSplits(manifest *RFileExportManifest) ([][]byte, error) {
+	if len(manifest.Tablets) == 0 {
+		return nil, nil
+	}
+	splits := make([][]byte, 0, len(manifest.Tablets)-1)
+	var priorEnd *string
+	for i, tb := range manifest.Tablets {
+		if tb.Index != i {
+			return nil, fmt.Errorf("engine: manifest tablet position %d declares index %d", i, tb.Index)
+		}
+		if !equalRowBoundary(tb.StartRow, priorEnd) {
+			return nil, fmt.Errorf("engine: manifest tablet %d start row does not match prior end row", i)
+		}
+		if i+1 < len(manifest.Tablets) {
+			if tb.EndRow == nil {
+				return nil, fmt.Errorf("engine: manifest tablet %d has an unbounded end before the final tablet", i)
+			}
+			splits = append(splits, append([]byte(nil), []byte(*tb.EndRow)...))
+		} else if tb.EndRow != nil {
+			return nil, fmt.Errorf("engine: final manifest tablet %d must have an unbounded end", i)
+		}
+		priorEnd = tb.EndRow
+	}
+	return splits, nil
+}
+
+func equalRowBoundary(a, b *string) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return *a == *b
+}
+
+func exportManifestVersion(manifest *RFileExportManifest) int {
+	if manifest.FileFormat == tablet.FormatParquet ||
+		(manifest.RFileCompatibility != "" && manifest.RFileCompatibility != "accumulo-rfile/shoal") {
+		return RFileExportManifestVersion
+	}
+	for _, file := range manifest.RFiles {
+		if (file.Format != "" && file.Format != ExportFormatRFile) ||
+			(file.Role != "" && file.Role != ExportRoleAuthoritative) {
+			return RFileExportManifestVersion
+		}
+	}
+	return RFileExportManifestLegacyVersion
+}
+
 func joinBackendPath(dst storage.Backend, root, rel string) string {
 	if usesBackendSeparatorJoinRoot(dst, root) {
 		return strings.TrimRight(root, `/\`) + "/" + filepath.ToSlash(rel)
@@ -386,10 +427,24 @@ func VerifyRFileExport(ctx context.Context, b storage.Backend, manifest *RFileEx
 	if manifest == nil {
 		return fmt.Errorf("engine: nil import manifest")
 	}
-	if manifest.Version != RFileExportManifestVersion {
+	if manifest.Version != RFileExportManifestLegacyVersion && manifest.Version != RFileExportManifestVersion {
 		return fmt.Errorf("engine: unsupported manifest version %d", manifest.Version)
 	}
+	if manifest.Version == RFileExportManifestLegacyVersion &&
+		exportManifestVersion(manifest) != RFileExportManifestLegacyVersion {
+		return fmt.Errorf("engine: manifest version %d is valid only for authoritative RFile exports", manifest.Version)
+	}
 	for _, rf := range manifest.RFiles {
+		if rf.TabletIndex < 0 || rf.TabletIndex >= manifest.tabletCount() {
+			return fmt.Errorf("engine: import file %q references undeclared tablet index %d", rf.DestinationPath, rf.TabletIndex)
+		}
+		role := rf.Role
+		if role == "" {
+			role = ExportRoleAuthoritative
+		}
+		if role != ExportRoleAuthoritative {
+			return fmt.Errorf("engine: import file %q has role %q; only authoritative files are queryable", rf.DestinationPath, role)
+		}
 		size, sum, err := hashObject(ctx, b, rf.DestinationPath)
 		if err != nil {
 			return err
@@ -422,6 +477,10 @@ func (e *Engine) ImportRFileManifest(ctx context.Context, manifest *RFileExportM
 	if err := VerifyRFileExport(ctx, e.backend, manifest); err != nil {
 		return err
 	}
+	splits, err := manifestSplits(manifest)
+	if err != nil {
+		return err
+	}
 	tableDir := filepath.Join(e.dir, manifest.SourceTable)
 	for _, tb := range manifest.Tablets {
 		if err := os.MkdirAll(filepath.Join(tableDir, fmt.Sprintf("t-%04d", tb.Index)), 0o755); err != nil {
@@ -433,22 +492,47 @@ func (e *Engine) ImportRFileManifest(ctx context.Context, manifest *RFileExportM
 			return fmt.Errorf("engine: mkdir imported tablet: %w", err)
 		}
 	}
+	filesByTablet := make(map[int][]string)
+	for _, file := range manifest.RFiles {
+		filesByTablet[file.TabletIndex] = append(filesByTablet[file.TabletIndex], file.DestinationPath)
+	}
 
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if existing, exists := e.tables[manifest.SourceTable]; exists {
-		// Guard the one merge case re-discovery can't reconcile: a manifest
-		// that introduces more tablets (divergent splits) than the open table
-		// has. Same-layout fan-in (the common case: same logical table from
-		// many producers) refreshes cleanly.
-		if manifest.tabletCount() > len(existing.tablets) {
+		if len(splits) != len(existing.splits) {
 			return fmt.Errorf("engine: cannot merge import for table %q: manifest has %d tablet(s), open table has %d (divergent splits unsupported)",
-				manifest.SourceTable, manifest.tabletCount(), len(existing.tablets))
+				manifest.SourceTable, len(splits)+1, len(existing.tablets))
 		}
-		if _, err := existing.refreshFiles(); err != nil {
-			return fmt.Errorf("engine: merge import for table %q: %w", manifest.SourceTable, err)
+		for i := range splits {
+			if !bytes.Equal(splits[i], existing.splits[i]) {
+				return fmt.Errorf("engine: cannot merge import for table %q: split %d is %x, open table has %x",
+					manifest.SourceTable, i, splits[i], existing.splits[i])
+			}
+		}
+		for i := range existing.tablets {
+			if _, err := existing.tablets[i].RegisterImmutableFiles(filesByTablet[i]); err != nil {
+				return fmt.Errorf("engine: merge import for table %q tablet %d: %w", manifest.SourceTable, i, err)
+			}
 		}
 		return nil
+	}
+	format, err := tablet.ParseFileFormat(string(manifest.FileFormat))
+	if err != nil {
+		return err
+	}
+	if err := writeTableManifest(tableDir, tableManifest{
+		Version:    tableManifestVersion,
+		Splits:     splits,
+		FileFormat: format,
+	}); err != nil {
+		return err
+	}
+	for i := 0; i < manifest.tabletCount(); i++ {
+		tabletDir := filepath.Join(tableDir, fmt.Sprintf("t-%04d", i))
+		if err := tablet.PublishImmutableFiles(e.backend, tabletDir, filesByTablet[i]); err != nil {
+			return fmt.Errorf("engine: publish imported tablet %d manifest: %w", i, err)
+		}
 	}
 	tbl, err := openTable(tableDir, manifest.SourceTable, e.logger, e.cache, e.walSyncMode, e.walSyncInterval, e.backend, e.publishRFile)
 	if err != nil {
@@ -487,10 +571,11 @@ func stampRFileObject(ctx context.Context, src storage.Backend, srcPath string, 
 		},
 	}}
 	res, err := compaction.Compact(compaction.Spec{
-		Inputs: []compaction.Input{{Name: srcPath, Bytes: data}},
-		Stack:  stack,
-		Scope:  iterrt.ScopeMajc,
-		Codec:  block.CodecSnappy,
+		Inputs:       []compaction.Input{{Name: srcPath, Bytes: data}},
+		Stack:        stack,
+		Scope:        iterrt.ScopeMajc,
+		Codec:        block.CodecSnappy,
+		OutputFormat: string(fileFormatForPath(srcPath)),
 	})
 	if err != nil {
 		return 0, "", "", fmt.Errorf("engine: stamp export source %s: %w", srcPath, err)
@@ -504,6 +589,33 @@ func stampRFileObject(ctx context.Context, src storage.Backend, srcPath string, 
 		bcVersion = footer.Version.String()
 	}
 	return int64(len(res.Output)), hex.EncodeToString(sum[:]), bcVersion, nil
+}
+
+func fileFormatForPath(path string) tablet.FileFormat {
+	if filepath.Ext(path) == ".parquet" {
+		return tablet.FormatParquet
+	}
+	return tablet.FormatRFile
+}
+
+func exportCompatibility(files []tableRFile) string {
+	var rfile, parquet bool
+	for _, file := range files {
+		switch fileFormatForPath(file.Path) {
+		case tablet.FormatParquet:
+			parquet = true
+		default:
+			rfile = true
+		}
+	}
+	switch {
+	case rfile && parquet:
+		return "mixed-rfile-parquet/shoal"
+	case parquet:
+		return "parquet/shoal"
+	default:
+		return "accumulo-rfile/shoal"
+	}
 }
 
 func copyWithSHA256(ctx context.Context, src storage.Backend, srcPath string, dst storage.Backend, dstPath string) (written int64, sum string, bcVersion string, err error) {
