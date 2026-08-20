@@ -33,6 +33,7 @@ import (
 	"path"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -220,8 +221,13 @@ func validateConfig(cfg Config) error {
 		return fmt.Errorf("%w: invalid fence", ErrInvalidConfig)
 	}
 	host, port, err := net.SplitHostPort(cfg.ServerAddress)
-	if err != nil || host == "" || port == "" {
+	if err != nil || host == "" || port == "" ||
+		host == "." || host == ".." || strings.ContainsAny(host, `/\`+"\x00") {
 		return fmt.Errorf("%w: server address must be host:port", ErrInvalidConfig)
+	}
+	portNumber, err := strconv.ParseUint(port, 10, 16)
+	if err != nil || portNumber == 0 {
+		return fmt.Errorf("%w: server address has invalid port", ErrInvalidConfig)
 	}
 	return nil
 }

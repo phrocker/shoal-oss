@@ -581,6 +581,16 @@ func TestOpenHonorsCancellation(t *testing.T) {
 	}
 }
 
+func TestOpenRejectsUnsafeServerAddress(t *testing.T) {
+	for _, address := range []string{"..:9997", `host\child:9997`, "host:not-a-port", "host:0"} {
+		cfg := testConfig(newMemoryStore(nil), newMemoryMetadata(nil), newSink(nil), &verifier{})
+		cfg.ServerAddress = address
+		if _, _, err := Open(context.Background(), cfg); !errors.Is(err, ErrInvalidConfig) {
+			t.Fatalf("Open(%q) error = %v", address, err)
+		}
+	}
+}
+
 func TestReconcileTimeoutDefaultIsFinite(t *testing.T) {
 	tablet := openTest(t, newMemoryStore(nil), newMemoryMetadata(nil), newSink(nil), &verifier{})
 	ctx, cancel := tablet.reconcileContext()
