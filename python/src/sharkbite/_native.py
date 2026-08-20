@@ -12,6 +12,14 @@ from .errors import exception_for_status
 
 ABI_MAJOR = 1
 CAP_OWNED_SCAN_RESULT = 5
+CAP_MUTATION = 6
+CAP_BATCH_WRITER = 7
+CAP_STRUCTURED_WRITE_FAILURE = 8
+CAP_TABLE_ADMIN = 9
+CAP_NAMESPACE_ADMIN = 10
+CAP_SECURITY_ADMIN = 11
+CAP_TABLE_SPLITS = 12
+CAP_TABLE_MAINTENANCE = 19
 CAP_HIGH_LEVEL_CLIENT = 21
 CAP_HIGH_LEVEL_SCANNER = 22
 CAP_COMPATIBILITY_ERRORS = 23
@@ -27,6 +35,7 @@ CAPABILITY_SYMBOLS = {
         "shoal_client_create",
         "shoal_client_close",
         "shoal_client_free",
+        "shoal_client_list_tables",
         "shoal_client_set_threads",
         "shoal_client_set_table",
     },
@@ -34,6 +43,107 @@ CAPABILITY_SYMBOLS = {
         "shoal_range_init",
         "shoal_client_select_column",
         "shoal_client_scan_range",
+    },
+    CAP_MUTATION: {
+        "shoal_mutation_create",
+        "shoal_mutation_put",
+        "shoal_mutation_delete",
+        "shoal_mutation_free",
+    },
+    CAP_BATCH_WRITER: {
+        "shoal_batch_writer_config_init",
+        "shoal_connector_create_batch_writer",
+        "shoal_batch_writer_add",
+        "shoal_batch_writer_flush",
+        "shoal_batch_writer_close",
+        "shoal_batch_writer_free",
+    },
+    CAP_STRUCTURED_WRITE_FAILURE: {
+        "shoal_write_failure_get_flags",
+        "shoal_write_failure_failed_extent_count",
+        "shoal_write_failure_get_failed_extent",
+        "shoal_write_failure_constraint_count",
+        "shoal_write_failure_get_constraint",
+        "shoal_write_failure_authorization_count",
+        "shoal_write_failure_get_authorization",
+        "shoal_write_failure_cleanup_count",
+        "shoal_write_failure_get_cleanup",
+        "shoal_write_failure_free",
+    },
+    CAP_TABLE_ADMIN: {
+        "shoal_connector_list_tables",
+        "shoal_connector_table_exists",
+        "shoal_connector_create_table",
+        "shoal_connector_delete_table",
+        "shoal_connector_rename_table",
+        "shoal_connector_flush_table",
+        "shoal_connector_set_table_property",
+        "shoal_connector_remove_table_property",
+        "shoal_connector_effective_table_properties",
+        "shoal_table_list_count",
+        "shoal_table_list_get",
+        "shoal_table_list_free",
+        "shoal_table_properties_count",
+        "shoal_table_properties_get",
+        "shoal_table_properties_free",
+    },
+    CAP_NAMESPACE_ADMIN: {
+        "shoal_connector_list_namespaces",
+        "shoal_connector_namespace_exists",
+        "shoal_connector_create_namespace",
+        "shoal_connector_delete_namespace",
+        "shoal_connector_rename_namespace",
+        "shoal_connector_set_namespace_property",
+        "shoal_connector_remove_namespace_property",
+        "shoal_connector_effective_namespace_properties",
+        "shoal_connector_namespace_properties",
+        "shoal_connector_versioned_namespace_properties",
+        "shoal_namespace_list_count",
+        "shoal_namespace_list_get",
+        "shoal_namespace_list_free",
+        "shoal_namespace_properties_count",
+        "shoal_namespace_properties_get",
+        "shoal_namespace_properties_free",
+        "shoal_versioned_properties_version",
+        "shoal_versioned_properties_count",
+        "shoal_versioned_properties_get",
+        "shoal_versioned_properties_free",
+    },
+    CAP_SECURITY_ADMIN: {
+        "shoal_connector_create_user",
+        "shoal_connector_drop_user",
+        "shoal_connector_change_password",
+        "shoal_connector_change_user_authorizations",
+        "shoal_connector_get_user_authorizations",
+        "shoal_connector_has_system_permission",
+        "shoal_connector_has_table_permission",
+        "shoal_connector_has_namespace_permission",
+        "shoal_connector_grant_system_permission",
+        "shoal_connector_revoke_system_permission",
+        "shoal_connector_grant_table_permission",
+        "shoal_connector_revoke_table_permission",
+        "shoal_connector_grant_namespace_permission",
+        "shoal_connector_revoke_namespace_permission",
+        "shoal_bytes_list_count",
+        "shoal_bytes_list_get",
+        "shoal_bytes_list_free",
+    },
+    CAP_TABLE_SPLITS: {
+        "shoal_connector_list_table_splits",
+        "shoal_connector_add_table_splits",
+        "shoal_bytes_list_count",
+        "shoal_bytes_list_get",
+        "shoal_bytes_list_free",
+    },
+    CAP_TABLE_MAINTENANCE: {
+        "shoal_connector_flush_table_range",
+        "shoal_connector_add_table_constraint",
+        "shoal_connector_list_table_constraints",
+        "shoal_connector_remove_table_constraint",
+        "shoal_table_constraint_view_init",
+        "shoal_table_constraint_list_count",
+        "shoal_table_constraint_list_get",
+        "shoal_table_constraint_list_free",
     },
 }
 
@@ -104,6 +214,80 @@ class ClientConfig(C.Structure):
         ("authorization_count", C.c_size_t),
         ("thread_count", C.c_int32),
     ]
+
+
+class BatchWriterConfig(C.Structure):
+    _fields_ = [
+        ("struct_size", C.c_uint32),
+        ("table_name", C.c_char_p),
+        ("table_id", C.c_char_p),
+        ("max_memory_bytes", C.c_int64),
+        ("max_batch_bytes", C.c_int64),
+        ("max_latency_ms", C.c_int64),
+        ("max_write_threads", C.c_int32),
+        ("max_retries", C.c_int32),
+        ("retry_backoff_ms", C.c_int64),
+        ("durability", C.c_int32),
+    ]
+
+
+class TableView(C.Structure):
+    _fields_ = [("name", C.c_char_p), ("id", C.c_char_p)]
+
+
+class PropertyView(C.Structure):
+    _fields_ = [("key", C.c_char_p), ("value", C.c_char_p)]
+
+
+class NamespaceView(C.Structure):
+    _fields_ = [("name", C.c_char_p), ("id", C.c_char_p)]
+
+
+class ConstraintView(C.Structure):
+    _fields_ = [
+        ("struct_size", C.c_uint32),
+        ("number", C.c_int32),
+        ("class_name", C.c_char_p),
+    ]
+
+
+class FailedExtentView(C.Structure):
+    _fields_ = [
+        ("server", C.c_char_p),
+        ("table_id", C.c_char_p),
+        ("prev_row", Bytes),
+        ("end_row", Bytes),
+        ("has_prev_row", C.c_uint8),
+        ("has_end_row", C.c_uint8),
+        ("submitted", C.c_size_t),
+        ("committed", C.c_int64),
+    ]
+
+
+class ConstraintViolationView(C.Structure):
+    _fields_ = [
+        ("server", C.c_char_p),
+        ("constraint_class", C.c_char_p),
+        ("violation_code", C.c_int16),
+        ("description", C.c_char_p),
+        ("violating_mutation_count", C.c_int64),
+    ]
+
+
+class AuthorizationFailureView(C.Structure):
+    _fields_ = [
+        ("server", C.c_char_p),
+        ("table_id", C.c_char_p),
+        ("prev_row", Bytes),
+        ("end_row", Bytes),
+        ("has_prev_row", C.c_uint8),
+        ("has_end_row", C.c_uint8),
+        ("code", C.c_char_p),
+    ]
+
+
+class CleanupFailureView(C.Structure):
+    _fields_ = [("server", C.c_char_p), ("message", C.c_char_p)]
 
 
 @dataclass(frozen=True)
@@ -211,6 +395,12 @@ class NativeAPI:
         self._function("shoal_connector_free", None, PP)
         optional = {"required": False}
         self._function(
+            "shoal_batch_writer_config_init",
+            None,
+            C.POINTER(BatchWriterConfig),
+            **optional,
+        )
+        self._function(
             "shoal_client_config_init", None, C.POINTER(ClientConfig), **optional
         )
         self._function("shoal_range_init", None, C.POINTER(Range), **optional)
@@ -229,6 +419,9 @@ class NativeAPI:
         )
         self._function(
             "shoal_client_set_table", C.c_int32, P, C.c_char_p, PP, **optional
+        )
+        self._function(
+            "shoal_client_list_tables", C.c_int32, P, C.c_int64, PP, PP, **optional
         )
         self._function(
             "shoal_client_select_column",
@@ -260,11 +453,183 @@ class NativeAPI:
             **optional,
         )
         self._function("shoal_scan_result_free", None, PP, **optional)
+        self._function("shoal_mutation_create", C.c_int32, Bytes, PP, PP, **optional)
+        self._function(
+            "shoal_mutation_put",
+            C.c_int32,
+            P,
+            Bytes,
+            Bytes,
+            Bytes,
+            C.c_int64,
+            Bytes,
+            PP,
+            **optional,
+        )
+        self._function(
+            "shoal_mutation_delete",
+            C.c_int32,
+            P,
+            Bytes,
+            Bytes,
+            Bytes,
+            C.c_int64,
+            PP,
+            **optional,
+        )
+        self._function(
+            "shoal_mutation_put_latest",
+            C.c_int32,
+            P,
+            Bytes,
+            Bytes,
+            Bytes,
+            Bytes,
+            PP,
+            **optional,
+        )
+        self._function(
+            "shoal_mutation_delete_latest",
+            C.c_int32,
+            P,
+            Bytes,
+            Bytes,
+            Bytes,
+            PP,
+            **optional,
+        )
+        self._function("shoal_mutation_size", C.c_int32, P, C.POINTER(C.c_size_t), PP, **optional)
+        self._function("shoal_mutation_free", None, PP, **optional)
+        self._function(
+            "shoal_connector_create_batch_writer",
+            C.c_int32,
+            P,
+            C.POINTER(BatchWriterConfig),
+            PP,
+            PP,
+            **optional,
+        )
+        for name in ("shoal_batch_writer_add",):
+            self._function(name, C.c_int32, P, P, C.c_int64, PP, PP, **optional)
+        for name in ("shoal_batch_writer_flush", "shoal_batch_writer_close"):
+            self._function(name, C.c_int32, P, C.c_int64, PP, PP, **optional)
+        self._function("shoal_batch_writer_free", None, PP, **optional)
+        self._function("shoal_write_failure_get_flags", C.c_uint32, P, **optional)
+        for stem, view in (
+            ("failed_extent", FailedExtentView),
+            ("constraint", ConstraintViolationView),
+            ("authorization", AuthorizationFailureView),
+            ("cleanup", CleanupFailureView),
+        ):
+            self._function(
+                f"shoal_write_failure_{stem}_count", C.c_size_t, P, **optional
+            )
+            self._function(
+                f"shoal_write_failure_get_{stem}",
+                C.c_int32,
+                P,
+                C.c_size_t,
+                C.POINTER(view),
+                PP,
+                **optional,
+            )
+        self._function("shoal_write_failure_free", None, PP, **optional)
+        self._bind_admin(P, PP, optional)
         self._function("shoal_error_code", C.c_int32, P)
         self._function("shoal_error_message", C.c_char_p, P)
         self._function("shoal_error_free", None, PP)
         if hasattr(self.lib, "shoal_error_compatibility"):
             self._function("shoal_error_compatibility", C.c_int32, P)
+
+    def _bind_admin(self, P: object, PP: object, optional: dict[str, bool]) -> None:
+        i32, i64, u8, size = C.c_int32, C.c_int64, C.c_uint8, C.c_size_t
+        cp, bp = C.c_char_p, C.POINTER(Bytes)
+        for prefix, view in (
+            ("table", TableView),
+            ("namespace", NamespaceView),
+        ):
+            self._function(f"shoal_{prefix}_list_count", size, P, **optional)
+            self._function(
+                f"shoal_{prefix}_list_get", i32, P, size, C.POINTER(view), PP, **optional
+            )
+            self._function(f"shoal_{prefix}_list_free", None, PP, **optional)
+        for prefix in ("table", "namespace"):
+            self._function(f"shoal_{prefix}_properties_count", size, P, **optional)
+            self._function(
+                f"shoal_{prefix}_properties_get",
+                i32,
+                P,
+                size,
+                C.POINTER(PropertyView),
+                PP,
+                **optional,
+            )
+            self._function(f"shoal_{prefix}_properties_free", None, PP, **optional)
+        self._function("shoal_bytes_list_count", size, P, **optional)
+        self._function("shoal_bytes_list_get", i32, P, size, bp, PP, **optional)
+        self._function("shoal_bytes_list_free", None, PP, **optional)
+        self._function("shoal_connector_list_tables", i32, P, i64, PP, PP, **optional)
+        self._function("shoal_connector_table_exists", i32, P, cp, i64, C.POINTER(u8), PP, **optional)
+        for name in ("create", "delete"):
+            self._function(f"shoal_connector_{name}_table", i32, P, cp, i64, PP, **optional)
+        self._function("shoal_connector_rename_table", i32, P, cp, cp, i64, PP, **optional)
+        self._function("shoal_connector_flush_table", i32, P, cp, u8, i64, PP, **optional)
+        self._function("shoal_connector_flush_table_range", i32, P, cp, bp, bp, u8, i64, PP, **optional)
+        for name in ("set", "remove"):
+            args = (P, cp, cp, cp, i64, PP) if name == "set" else (P, cp, cp, i64, PP)
+            self._function(f"shoal_connector_{name}_table_property", i32, *args, **optional)
+        self._function("shoal_connector_effective_table_properties", i32, P, cp, i64, PP, PP, **optional)
+        self._function("shoal_connector_list_table_splits", i32, P, cp, i64, PP, PP, **optional)
+        self._function("shoal_connector_add_table_splits", i32, P, cp, bp, size, i64, PP, **optional)
+        self._function("shoal_table_constraint_view_init", None, C.POINTER(ConstraintView), **optional)
+        self._function("shoal_connector_add_table_constraint", i32, P, cp, cp, i64, C.POINTER(i32), PP, **optional)
+        self._function("shoal_connector_list_table_constraints", i32, P, cp, i64, PP, PP, **optional)
+        self._function("shoal_table_constraint_list_count", size, P, **optional)
+        self._function("shoal_table_constraint_list_get", i32, P, size, C.POINTER(ConstraintView), PP, **optional)
+        self._function("shoal_table_constraint_list_free", None, PP, **optional)
+        self._function("shoal_connector_remove_table_constraint", i32, P, cp, i32, i64, PP, **optional)
+        self._function("shoal_connector_list_namespaces", i32, P, i64, PP, PP, **optional)
+        self._function("shoal_connector_namespace_exists", i32, P, cp, i64, C.POINTER(u8), PP, **optional)
+        for name in ("create", "delete"):
+            self._function(f"shoal_connector_{name}_namespace", i32, P, cp, i64, PP, **optional)
+        self._function("shoal_connector_rename_namespace", i32, P, cp, cp, i64, PP, **optional)
+        for name in ("set", "remove"):
+            args = (P, cp, cp, cp, i64, PP) if name == "set" else (P, cp, cp, i64, PP)
+            self._function(f"shoal_connector_{name}_namespace_property", i32, *args, **optional)
+        for name in ("effective_namespace_properties", "namespace_properties"):
+            self._function(f"shoal_connector_{name}", i32, P, cp, i64, PP, PP, **optional)
+        self._function(
+            "shoal_connector_versioned_namespace_properties",
+            i32,
+            P,
+            cp,
+            i64,
+            PP,
+            PP,
+            **optional,
+        )
+        self._function("shoal_versioned_properties_version", i64, P, **optional)
+        self._function("shoal_versioned_properties_count", size, P, **optional)
+        self._function(
+            "shoal_versioned_properties_get",
+            i32,
+            P,
+            size,
+            C.POINTER(PropertyView),
+            PP,
+            **optional,
+        )
+        self._function("shoal_versioned_properties_free", None, PP, **optional)
+        self._function("shoal_connector_create_user", i32, P, cp, bp, i64, PP, **optional)
+        self._function("shoal_connector_drop_user", i32, P, cp, i64, PP, **optional)
+        self._function("shoal_connector_change_password", i32, P, cp, bp, i64, PP, **optional)
+        self._function("shoal_connector_change_user_authorizations", i32, P, cp, bp, size, i64, PP, **optional)
+        self._function("shoal_connector_get_user_authorizations", i32, P, cp, i64, PP, PP, **optional)
+        for scope in ("system", "table", "namespace"):
+            middle = (cp,) if scope == "system" else (cp, cp)
+            self._function(f"shoal_connector_has_{scope}_permission", i32, P, *middle, C.c_int8, i64, C.POINTER(u8), PP, **optional)
+            for action in ("grant", "revoke"):
+                self._function(f"shoal_connector_{action}_{scope}_permission", i32, P, *middle, C.c_int8, i64, PP, **optional)
 
     def require(self, *capabilities: int) -> None:
         missing_capabilities = [
@@ -304,6 +669,82 @@ class NativeAPI:
             if error.value:
                 self.lib.shoal_error_free(C.byref(error))
         raise exception_for_status(status, message, compatibility_class=compatibility)
+
+    def check_write(
+        self, status: int, failure: C.c_void_p, error: C.c_void_p
+    ) -> None:
+        details: dict[str, object] | None = None
+        try:
+            if failure.value:
+                details = self.copy_write_failure(failure)
+            self.check(status, error)
+        except BaseException as exc:
+            if details is not None:
+                setattr(exc, "write_failure", details)
+                setattr(exc, "write_failure_flags", details["flags"])
+            raise
+        finally:
+            if failure.value:
+                self.lib.shoal_write_failure_free(C.byref(failure))
+
+    def copy_write_failure(self, failure: C.c_void_p) -> dict[str, object]:
+        def text(value: bytes | None) -> str:
+            return value.decode("utf-8", "surrogateescape") if value else ""
+
+        def collect(stem: str, view_type: type[C.Structure], convert: object) -> list[object]:
+            values: list[object] = []
+            count = getattr(self.lib, f"shoal_write_failure_{stem}_count")(failure)
+            getter = getattr(self.lib, f"shoal_write_failure_get_{stem}")
+            for index in range(count):
+                view = view_type()
+                item_error = C.c_void_p()
+                status = getter(failure, index, C.byref(view), C.byref(item_error))
+                self.check(status, item_error)
+                values.append(convert(view))
+            return values
+
+        def extent(view: FailedExtentView) -> dict[str, object]:
+            return {
+                "server": text(view.server),
+                "table_id": text(view.table_id),
+                "prev_row": _bytes(view.prev_row) if view.has_prev_row else None,
+                "end_row": _bytes(view.end_row) if view.has_end_row else None,
+                "submitted": int(view.submitted),
+                "committed": int(view.committed),
+            }
+
+        def violation(view: ConstraintViolationView) -> dict[str, object]:
+            return {
+                "server": text(view.server),
+                "constraint_class": text(view.constraint_class),
+                "violation_code": int(view.violation_code),
+                "description": text(view.description),
+                "violating_mutation_count": int(view.violating_mutation_count),
+            }
+
+        def authorization(view: AuthorizationFailureView) -> dict[str, object]:
+            return {
+                "server": text(view.server),
+                "table_id": text(view.table_id),
+                "prev_row": _bytes(view.prev_row) if view.has_prev_row else None,
+                "end_row": _bytes(view.end_row) if view.has_end_row else None,
+                "code": text(view.code),
+            }
+
+        def cleanup(view: CleanupFailureView) -> dict[str, object]:
+            return {"server": text(view.server), "message": text(view.message)}
+
+        return {
+            "flags": int(self.lib.shoal_write_failure_get_flags(failure)),
+            "failed_extents": collect("failed_extent", FailedExtentView, extent),
+            "constraint_violations": collect(
+                "constraint", ConstraintViolationView, violation
+            ),
+            "authorization_failures": collect(
+                "authorization", AuthorizationFailureView, authorization
+            ),
+            "cleanup_failures": collect("cleanup", CleanupFailureView, cleanup),
+        }
 
     @staticmethod
     def copy_view(view: KeyValueView) -> tuple[tuple[bytes, bytes, bytes, bytes, int], bytes]:
