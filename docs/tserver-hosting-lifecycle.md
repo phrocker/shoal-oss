@@ -634,6 +634,20 @@ held node would leave a caller that was told the lock was gone going on
 to hold it, and would promote a surviving duplicate to holder of a lock
 nobody is waiting on.
 
+That refusal covers an acquisition that has finished waiting as well as
+one still in the queue. Taking ownership and handing it back are not one
+step — the generation is recorded under one lock and the watch handed
+over under another — so a release can land in between, find a generation
+held, end it, delete the node and return while the acquisition is still
+on its way out. Reporting success there would hand back a `LockID` for a
+generation that was over before the caller saw it, and nothing later
+would contradict it, because the ending such a caller would wait for has
+already been recorded. `Release` marks the lock released before it ends
+anything, so a release that has returned is visible to the acquisition,
+and reading that after the wait is what orders the two. A release
+arriving after that read is an ordinary release of a lock the call
+really did acquire, and `Maintain` reports it.
+
 `Maintain` is woken by the release directly rather than by the node's
 deletion coming back as a watch event. Ordinarily both happen; but a
 delete that fails leaves the node in place, and with no verify interval

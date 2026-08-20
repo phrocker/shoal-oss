@@ -2906,6 +2906,84 @@ func TestMaintainInheritsTheWatchTheQueuedAcquisitionArmed(t *testing.T) {
 	}
 }
 
+// TestAReleaseAtTheHandoverIsNotReportedAsAnAcquisition closes the last window
+// in which Acquire could report a lock it does not have.
+//
+// Committing ownership and returning it are not one step. acquired records the
+// generation under l.mu and lets go of it, and the handover that follows takes
+// a different lock. A Release arriving in between finds a held generation,
+// ends it as a release, deletes the node and returns — and the acquisition
+// then walks out of a directory it no longer occupies with the LockID it was
+// briefly given. A caller that fenced a Host on that LockID would host against
+// a generation that was over before it started, and nothing downstream would
+// say so, because the loss it would wait for has already been recorded.
+//
+// The window is real rather than theoretical: the handover blocks on watchMu,
+// which any Maintain already running holds while it arms. Holding it here is
+// how the race is made deterministic rather than how it is created.
+//
+// A release is reported however far the acquisition got, which is what
+// waitForOwnership has always promised for a release landing mid-wait. The
+// promise now covers the one moment the wait had already finished.
+func TestAReleaseAtTheHandoverIsNotReportedAsAnAcquisition(t *testing.T) {
+	f := newFakeZK()
+	dir := testLockPath()
+	f.seed(dir, nil, false)
+	ahead := path.Join(dir, f.seedForeignLock(dir, otherUUID, 0))
+
+	lock := newTestLock(t, f)
+	ours := lockNodePath(lock.UUID(), 1)
+
+	// Stop the acquisition between committing ownership and returning it.
+	// adoptWatch is the only step in Acquire's path that takes watchMu, so
+	// holding it parks the goroutine exactly in the window under test.
+	lock.watchMu.Lock()
+
+	type outcome struct {
+		id  LockID
+		err error
+	}
+	acquired := make(chan outcome, 1)
+	go func() {
+		id, err := lock.Acquire(context.Background(), testLockData(t, lock))
+		acquired <- outcome{id: id, err: err}
+	}()
+
+	// Queued behind the stranger, then first in line when it goes.
+	waitArmed(t, f, ahead)
+	if err := f.Delete(ahead, -1); err != nil {
+		t.Fatalf("Delete(%s): %v", ahead, err)
+	}
+	// Node() answers only for a generation that is held, so this is the
+	// acquisition telling us it has committed and is now in the handover.
+	waitFor(t, "the acquisition to commit ownership", func() bool {
+		return lock.Node() != ""
+	})
+
+	if err := lock.Release(); err != nil {
+		t.Fatalf("Release: %v", err)
+	}
+	lock.watchMu.Unlock()
+
+	got := <-acquired
+	if !errors.Is(got.err, ErrLockReleased) {
+		t.Fatalf("Acquire returned id %v and error %v, want ErrLockReleased for a "+
+			"generation the release had already ended", got.id, got.err)
+	}
+	if got.id != (LockID{}) {
+		t.Fatalf("Acquire returned LockID %v alongside its refusal", got.id)
+	}
+	if node := lock.Node(); node != "" {
+		t.Fatalf("lock still reports holding %q after the release", node)
+	}
+	if lock.LossReason() != LossReleased {
+		t.Fatalf("loss reason %s, want RELEASED", lock.LossReason())
+	}
+	if f.exists(ours) {
+		t.Fatalf("%s survived the release", ours)
+	}
+}
+
 // TestAnAbandonedAcquisitionArmsNoWatchOnAnotherCandidate covers the one watch
 // this package cannot take back. A ZooKeeper watch is released only by firing:
 // go-zookeeper has no removeWatches, and it re-registers the outstanding ones

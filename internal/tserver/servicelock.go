@@ -636,9 +636,23 @@ func (l *ServiceLock) isReleased() bool {
 // trip over the missing node as be woken by the release itself; reporting the
 // release is both deterministic and the more useful of the two facts, because
 // it names the cause rather than the symptom.
+//
+// That covers a wait that finished, not only one that failed. Committing
+// ownership and handing it back are separate steps — acquired records the
+// generation and lets go of l.mu, and the handover after it takes a different
+// lock — so a release can land in between, end the generation it finds held,
+// delete the node and return while the acquisition is still on its way out.
+// Reporting success there would hand back a LockID for a generation that was
+// already over, and the caller would fence work to it with nothing left to
+// tell it otherwise, because the ending it would wait for has been recorded.
+//
+// Release sets released before it ends anything, so a release that has
+// returned is visible here: reading it after the wait is what orders the two.
+// A release that arrives after this read is an ordinary release of a lock this
+// call really did acquire, and Maintain reports it.
 func (l *ServiceLock) waitForOwnership(ctx context.Context) (LockID, error) {
 	id, err := l.queueForOwnership(ctx)
-	if err != nil && l.isReleased() {
+	if l.isReleased() {
 		return LockID{}, fmt.Errorf("%w: %s", ErrLockReleased, l.dir)
 	}
 	return id, err

@@ -480,6 +480,13 @@ func TestAddressAccumuloWouldRewriteIsRefused(t *testing.T) {
 			if !errors.Is(err, ErrInvalidLockData) {
 				t.Fatalf("TabletServerLockData(%q): want ErrInvalidLockData, got %v", address, err)
 			}
+			// The address is the last segment of the lock directory as well
+			// as the descriptor's endpoint, and Accumulo builds a server's
+			// identity from both. A character that makes one unreadable must
+			// not be allowed to name the other.
+			if _, err := TabletServerLockPath(testInstancePath, testGroup, address); !errors.Is(err, ErrInvalidLockData) {
+				t.Fatalf("TabletServerLockPath(%q): want ErrInvalidLockData, got %v", address, err)
+			}
 		})
 	}
 }
