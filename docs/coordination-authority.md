@@ -266,12 +266,14 @@ The handoff proceeds as follows:
 12. Retain an auditable lineage record tying local generation, export
     checksums, destination table, FATE identity, and terminal authority epoch.
 
-The current `managerclient.ExecuteStatus` helper performs
-begin/execute/wait/finish as one call and does not expose the allocated FATE
-identity for durable recording. The handoff phase therefore requires a
-promotion-specific API that separates allocation from submission; the current
-`Promote`/`BulkImport` slice is not this cutover protocol, as documented in
-[`promotion.md`](./promotion.md#5-whats-deferred).
+`managerclient.DurableFateAdapter` and Accumulo's
+`AllocateBulkImport`/`SubmitBulkImport`/`WaitBulkImport`/`FinishBulkImport`
+separate allocation from submission. `promotion.Machine` persists the
+allocated identity before execute, records the terminal result before finish,
+and carries immutable authority tokens through the handoff. The legacy
+`Promote`/`BulkImport` helper remains a one-shot staging API; concrete
+embedded and manager-owned authority-record adapters are still required
+before this protocol is exposed as an operational cutover.
 
 Before import submission, a failed attempt may return to `LOCAL_WRITABLE` only
 after durably marking the destination's reserved epoch `N` aborted while the

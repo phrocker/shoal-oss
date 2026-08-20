@@ -96,6 +96,41 @@ func TestPooledExecuteBulkImportLifecycle(t *testing.T) {
 	}
 }
 
+func TestPooledDurableFateLifecycleDoesNotFinishBeforeCaller(t *testing.T) {
+	pooled, pool := newTestPooled(t)
+	defer pool.Close()
+
+	rpc := &fakeFateRPC{id: fateID{Type: 1, UUID: "durable-1"}}
+	pooled.dial = func(context.Context, transportpool.Key) (io.Closer, error) {
+		return &fakeTransport{rpc: rpc}, nil
+	}
+	pooled.newClient = clientFromFakeTransport
+	req := Request{
+		Operation: TableBulkImport, Instance: FateUser,
+		Arguments: [][]byte{[]byte("t-1"), []byte("hdfs://nn/bulk/events"), []byte("false")},
+		Options:   map[string]string{},
+	}
+	id, err := pooled.BeginFate(context.Background(), "manager:9997", FateUser)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := pooled.ExecuteFate(context.Background(), "manager:9997", id, req); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pooled.WaitFate(context.Background(), "manager:9997", id); err != nil {
+		t.Fatal(err)
+	}
+	if rpc.finish.Load() != 0 {
+		t.Fatalf("finish calls before durable record = %d, want 0", rpc.finish.Load())
+	}
+	if err := pooled.FinishFate(context.Background(), "manager:9997", id); err != nil {
+		t.Fatal(err)
+	}
+	if rpc.finish.Load() != 1 {
+		t.Fatalf("finish calls = %d, want 1", rpc.finish.Load())
+	}
+}
+
 func TestPooledFinishesAfterOperationFailure(t *testing.T) {
 	pooled, pool := newTestPooled(t)
 	defer pool.Close()

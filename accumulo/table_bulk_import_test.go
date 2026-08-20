@@ -9,6 +9,30 @@ import (
 	"github.com/phrocker/shoal/internal/zk"
 )
 
+type fakeDurableManager struct {
+	*fakeManagerAdapter
+	id       managerclient.FateID
+	executed managerclient.Request
+	waited   int
+	finished int
+}
+
+func (m *fakeDurableManager) BeginFate(context.Context, string, managerclient.FateInstance) (managerclient.FateID, error) {
+	return m.id, nil
+}
+func (m *fakeDurableManager) ExecuteFate(_ context.Context, _ string, _ managerclient.FateID, req managerclient.Request) error {
+	m.executed = req
+	return nil
+}
+func (m *fakeDurableManager) WaitFate(context.Context, string, managerclient.FateID) (string, error) {
+	m.waited++
+	return "SUCCESS", nil
+}
+func (m *fakeDurableManager) FinishFate(context.Context, string, managerclient.FateID) error {
+	m.finished++
+	return nil
+}
+
 func TestBulkImportUsesTableIDAndFateArguments(t *testing.T) {
 	names := &fakeTableNames{byName: map[string]string{"events": "1", "accumulo.audit": "+a"}}
 	namespaces := newFakeNamespacesFromTables(names)
@@ -135,6 +159,7 @@ func TestBulkImportValidationCancellationAndLifecycle(t *testing.T) {
 	); !errors.Is(err, ErrInvalidTableName) {
 		t.Fatalf("empty table name error = %v", err)
 	}
+
 	if err := connector.BulkImport(
 		context.Background(), "events", "", BulkImportOptions{},
 	); !errors.Is(err, ErrInvalidBulkDir) {
@@ -173,5 +198,41 @@ func TestBulkImportValidationCancellationAndLifecycle(t *testing.T) {
 	defer manager.mu.Unlock()
 	if len(manager.requests) != 0 {
 		t.Fatalf("invalid requests reached manager: %#v", manager.requests)
+	}
+}
+
+func TestDurableBulkImportUsesPersistedFateAndPinnedTableID(t *testing.T) {
+	connector := testConnectorWithDiscovery(t, &fakeTabletWalker{}, &fakeTableNames{})
+	manager := &fakeDurableManager{
+		fakeManagerAdapter: &fakeManagerAdapter{},
+		id:                 managerclient.FateID{Type: 1, UUID: "bulk-durable"},
+	}
+	connector.manager = manager
+	connector.managerAddr = fakeManagerAddress{address: "manager:9997"}
+
+	id, err := connector.AllocateBulkImport(context.Background(), "events")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := connector.SubmitBulkImport(context.Background(), id, "events", "pinned-42", "hdfs://nn/promotions/p-1", BulkImportOptions{SetTime: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := connector.WaitBulkImport(context.Background(), "events", id); err != nil {
+		t.Fatal(err)
+	}
+	if manager.finished != 0 {
+		t.Fatal("wait finished FATE before terminal state was persisted")
+	}
+	if err := connector.FinishBulkImport(context.Background(), "events", id); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"pinned-42", "hdfs://nn/promotions/p-1", "true"}
+	for i, value := range want {
+		if got := string(manager.executed.Arguments[i]); got != value {
+			t.Fatalf("argument %d = %q, want %q", i, got, value)
+		}
+	}
+	if manager.waited != 1 || manager.finished != 1 {
+		t.Fatalf("wait/finish = %d/%d", manager.waited, manager.finished)
 	}
 }
