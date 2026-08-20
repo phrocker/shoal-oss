@@ -55,6 +55,10 @@ struct shoal_column_visibility {
   uint64_t id;
 };
 
+struct shoal_owned_key {
+  uint64_t id;
+};
+
 struct shoal_visibility_node {
   uint64_t id;
 };
@@ -316,6 +320,9 @@ void shoal_bridge_authorizations_free(shoal_authorizations *authorizations);
 shoal_column_visibility *shoal_bridge_column_visibility_alloc(uint64_t id);
 uint64_t shoal_bridge_column_visibility_id(const shoal_column_visibility *value);
 void shoal_bridge_column_visibility_free(shoal_column_visibility *value);
+shoal_owned_key *shoal_bridge_owned_key_alloc(uint64_t id);
+uint64_t shoal_bridge_owned_key_id(const shoal_owned_key *value);
+void shoal_bridge_owned_key_free(shoal_owned_key *value);
 shoal_visibility_node *shoal_bridge_visibility_node_alloc(uint64_t id);
 uint64_t shoal_bridge_visibility_node_id(const shoal_visibility_node *value);
 void shoal_bridge_visibility_node_free(shoal_visibility_node *value);

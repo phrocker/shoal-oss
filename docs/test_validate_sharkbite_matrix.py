@@ -722,22 +722,22 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
 
     def test_pinned_inventory_constants_are_internally_consistent(self) -> None:
         validator.validate_pinned_inventory_constants()
-        self.assertEqual(validator.EXPECTED_REVISION, 39)
+        self.assertEqual(validator.EXPECTED_REVISION, 40)
         self.assertEqual(validator.EXPECTED_TOTAL_ROWS, 3203)
         self.assertEqual(validator.EXPECTED_REQUIRED_ROWS, 2811)
         self.assertEqual(
             validator.EXPECTED_STATUS_COUNTS,
             {
-                "Covered": 131,
+                "Covered": 167,
                 "Missing Go": 2274,
-                "Missing C ABI": 100,
+                "Missing C ABI": 64,
                 "Behavior mismatch": 219,
                 validator.INTENTIONAL_DIVERGENCE_STATUS: 87,
                 validator.NOT_REQUIRED_STATUS: 392,
             },
         )
-        self.assertEqual(validator.EXPECTED_C_ABI_DECLARED_EXPORTS, 264)
-        self.assertEqual(validator.EXPECTED_C_ABI_REFERENCED_EXPORTS, 259)
+        self.assertEqual(validator.EXPECTED_C_ABI_DECLARED_EXPORTS, 293)
+        self.assertEqual(validator.EXPECTED_C_ABI_REFERENCED_EXPORTS, 288)
         self.assertEqual(
             validator.EXPECTED_C_ABI_UNREFERENCED_EXPORTS,
             (
@@ -777,7 +777,8 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
 
     def test_collect_c_abi_free_function_inventory_matches_header(self) -> None:
         free_functions = validator.collect_c_abi_free_function_inventory()
-        self.assertEqual(len(free_functions), 36)
+        self.assertEqual(len(free_functions), 37)
+        self.assertIn("shoal_owned_key_free", free_functions)
         self.assertIn("shoal_key_value_result_free", free_functions)
         self.assertIn("shoal_authorizations_free", free_functions)
         self.assertIn("shoal_column_visibility_free", free_functions)
@@ -811,7 +812,7 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
 
     def test_stale_typed_free_inventory_narrative_is_rejected(self) -> None:
         text = load_document_text()
-        mutated = text.replace("36 typed free functions", "8 typed free functions", 1)
+        mutated = text.replace("37 typed free functions", "8 typed free functions", 1)
         self.assertNotEqual(mutated, text)
         self.assert_validation_fails(
             lambda: validator.validate_counts(mutated.splitlines(), mutated),
@@ -893,7 +894,7 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
             lambda: validator.validate_revision_inventory(
                 row_ids, reclassified, prefix_counts
             ),
-            f"revision {validator.EXPECTED_REVISION} inventory expects 131 rows for Covered, found 132",
+            f"revision {validator.EXPECTED_REVISION} inventory expects 167 rows for Covered, found 168",
         )
 
     def test_declared_count_edit_still_fails_internal_cross_check(self) -> None:
@@ -909,7 +910,7 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
     def test_stale_c_abi_symbol_inventory_narrative_is_rejected(self) -> None:
         text = load_document_text()
         mutated = text.replace(
-            "applied to 264 declared exports in `capi/include/shoal.h`",
+            "applied to 293 declared exports in `capi/include/shoal.h`",
             "applied to 44 declared exports in `capi/include/shoal.h`",
             1,
         )
@@ -922,7 +923,7 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
     def test_revision_bump_requires_validator_constant_update(self) -> None:
         text = load_document_text()
         mutated = text.replace(
-            f"Revision {validator.EXPECTED_REVISION} — records the public tablet extent API",
+            f"Revision {validator.EXPECTED_REVISION} — completes the 36-row owned mutable key tranche",
             f"Revision {validator.EXPECTED_REVISION + 1} — adds the next audited ABI slice",
         ).replace(
             f"As of revision {validator.EXPECTED_REVISION} that is",
@@ -931,7 +932,7 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
         self.assertNotEqual(mutated, text)
         self.assert_validation_fails(
             lambda: validator.validate_counts(mutated.splitlines(), mutated),
-            f"document status is missing expected detail: Revision {validator.EXPECTED_REVISION} — records the public tablet extent API",
+            f"document status is missing expected detail: Revision {validator.EXPECTED_REVISION} — completes the 36-row owned mutable key tranche",
         )
 
     # ---- matrix table separators -------------------------------------------

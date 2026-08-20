@@ -8,9 +8,9 @@
 
 _Static_assert(SHOAL_ABI_VERSION == 1u, "unexpected compatibility ABI version");
 _Static_assert(SHOAL_ABI_VERSION_MAJOR == 1u, "unexpected ABI major");
-_Static_assert(SHOAL_ABI_VERSION_MINOR == 14u, "unexpected ABI minor");
+_Static_assert(SHOAL_ABI_VERSION_MINOR == 15u, "unexpected ABI minor");
 _Static_assert(SHOAL_ABI_VERSION_PATCH == 0u, "unexpected ABI patch");
-_Static_assert(SHOAL_ABI_VERSION_PACKED == 0x00010e00u,
+_Static_assert(SHOAL_ABI_VERSION_PACKED == 0x00010f00u,
                "unexpected packed ABI version");
 _Static_assert(SHOAL_ABI_CAPABILITY_CONNECTOR == 0u,
                "unexpected connector capability id");
@@ -62,11 +62,13 @@ _Static_assert(SHOAL_ABI_CAPABILITY_STREAMING_SCAN_CURSOR == 24u,
                "unexpected streaming scan cursor capability id");
 _Static_assert(SHOAL_ABI_CAPABILITY_COLUMN_VISIBILITY == 25u,
                "unexpected column visibility capability id");
-_Static_assert(SHOAL_ABI_CAPABILITY_COUNT == 26u,
+_Static_assert(SHOAL_ABI_CAPABILITY_OWNED_KEY == 26u,
+               "unexpected owned key capability id");
+_Static_assert(SHOAL_ABI_CAPABILITY_COUNT == 27u,
                "unexpected capability count");
 _Static_assert(SHOAL_ABI_CAPABILITY_WORD_COUNT == 1u,
                "unexpected capability word count");
-_Static_assert(SHOAL_ABI_CAPABILITY_WORD0 == UINT64_C(0x3ffffff),
+_Static_assert(SHOAL_ABI_CAPABILITY_WORD0 == UINT64_C(0x7ffffff),
                "unexpected capability word 0");
 
 #define ASSERT_PERMISSION_VALUE(name, value)                                  \
@@ -2622,6 +2624,130 @@ int main(void) {
   config.struct_size = SHOAL_CONNECTOR_CONFIG_V1_SIZE - 1;
   expect_error(shoal_connector_create(&config, &connector, &error),
                SHOAL_STATUS_INVALID_ARGUMENT, &error, "struct_size");
+
+  uint8_t owned_row_data[] = {'r', 0, 'w'};
+  uint8_t owned_family_data[] = {'c', 'f'};
+  uint8_t owned_qualifier_data[] = {'c', 'q'};
+  uint8_t owned_visibility_data[] = {'A', '&', 'B'};
+  shoal_owned_key *owned_key = NULL;
+  shoal_owned_key *owned_key_copy = NULL;
+  expect_error(shoal_owned_key_create(
+                   (shoal_bytes){NULL, 1}, &owned_key, &error),
+               SHOAL_STATUS_INVALID_ARGUMENT, &error, "key row");
+  assert(shoal_owned_key_create_full(
+             (shoal_bytes){owned_row_data, sizeof(owned_row_data)},
+             (shoal_bytes){owned_family_data, sizeof(owned_family_data)},
+             (shoal_bytes){owned_qualifier_data, sizeof(owned_qualifier_data)},
+             (shoal_bytes){owned_visibility_data,
+                           sizeof(owned_visibility_data)},
+             42, &owned_key, &error) == SHOAL_STATUS_OK);
+  owned_row_data[0] = 'X';
+  shoal_bytes_result *owned_bytes = NULL;
+  assert(shoal_owned_key_row(owned_key, &owned_bytes, &error) ==
+         SHOAL_STATUS_OK);
+  shoal_bytes owned_value = shoal_bytes_result_get(owned_bytes);
+  assert(owned_value.length == 3 && owned_value.data[0] == 'r' &&
+         owned_value.data[1] == 0 && owned_value.data[2] == 'w');
+  shoal_bytes_result_free(&owned_bytes);
+  assert(shoal_owned_key_column_family(owned_key, &owned_bytes, &error) ==
+         SHOAL_STATUS_OK);
+  shoal_bytes_result_free(&owned_bytes);
+  assert(shoal_owned_key_column_qualifier(owned_key, &owned_bytes, &error) ==
+         SHOAL_STATUS_OK);
+  shoal_bytes_result_free(&owned_bytes);
+  assert(shoal_owned_key_column_visibility(owned_key, &owned_bytes, &error) ==
+         SHOAL_STATUS_OK);
+  shoal_bytes_result_free(&owned_bytes);
+  assert(shoal_owned_key_clone(owned_key, &owned_key_copy, &error) ==
+         SHOAL_STATUS_OK);
+  uint8_t predicate_value = 0;
+  int32_t owned_order = 99;
+  assert(shoal_owned_key_compare(owned_key, owned_key_copy, &owned_order,
+                                 &error) == SHOAL_STATUS_OK);
+  assert(owned_order == 0);
+  assert(shoal_owned_key_compare_visibility(
+             owned_key, owned_key_copy, &owned_order, &error) ==
+         SHOAL_STATUS_OK);
+  assert(owned_order == 0);
+  assert(shoal_owned_key_equal(owned_key, owned_key_copy, &predicate_value,
+                               &error) == SHOAL_STATUS_OK);
+  assert(predicate_value == 1);
+  assert(shoal_owned_key_not_equal(owned_key, owned_key_copy,
+                                   &predicate_value, &error) ==
+         SHOAL_STATUS_OK);
+  assert(predicate_value == 0);
+  assert(shoal_owned_key_less(owned_key, owned_key_copy, &predicate_value,
+                              &error) == SHOAL_STATUS_OK);
+  assert(predicate_value == 0);
+  assert(shoal_owned_key_less_or_equal(
+             owned_key, owned_key_copy, &predicate_value, &error) ==
+         SHOAL_STATUS_OK);
+  assert(predicate_value == 1);
+  assert(shoal_owned_key_empty(owned_key, &predicate_value, &error) ==
+         SHOAL_STATUS_OK);
+  assert(predicate_value == 0);
+  int64_t owned_timestamp = 0;
+  assert(shoal_owned_key_timestamp(owned_key, &owned_timestamp, &error) ==
+         SHOAL_STATUS_OK);
+  assert(owned_timestamp == 42);
+  assert(shoal_owned_key_set_timestamp(owned_key, 41, &error) ==
+         SHOAL_STATUS_OK);
+  expect_error(shoal_owned_key_set_deleted(owned_key, 2, &error),
+               SHOAL_STATUS_INVALID_ARGUMENT, &error, "0 or 1");
+  assert(shoal_owned_key_set_deleted(owned_key, 1, &error) == SHOAL_STATUS_OK);
+  assert(shoal_owned_key_is_deleted(owned_key, &predicate_value, &error) ==
+         SHOAL_STATUS_OK);
+  assert(predicate_value == 1);
+  assert(shoal_owned_key_set_row(
+             owned_key, (shoal_bytes){(const uint8_t *)"a", 1}, &error) ==
+         SHOAL_STATUS_OK);
+  assert(shoal_owned_key_set_column_family(
+             owned_key, (shoal_bytes){(const uint8_t *)"b", 1}, &error) ==
+         SHOAL_STATUS_OK);
+  assert(shoal_owned_key_set_column_qualifier(
+             owned_key, (shoal_bytes){(const uint8_t *)"c", 1}, &error) ==
+         SHOAL_STATUS_OK);
+  assert(shoal_owned_key_set_column_visibility(
+             owned_key, (shoal_bytes){(const uint8_t *)"d", 1}, &error) ==
+         SHOAL_STATUS_OK);
+  size_t owned_size = 0;
+  assert(shoal_owned_key_size(owned_key, &owned_size, &error) ==
+         SHOAL_STATUS_OK);
+  assert(owned_size == 12);
+  assert(shoal_owned_key_length(owned_key, &owned_size, &error) ==
+         SHOAL_STATUS_OK);
+  assert(owned_size == 12);
+  assert(shoal_owned_key_row_size(owned_key, &owned_size, &error) ==
+         SHOAL_STATUS_OK && owned_size == 1);
+  assert(shoal_owned_key_column_family_size(owned_key, &owned_size, &error) ==
+         SHOAL_STATUS_OK && owned_size == 1);
+  assert(shoal_owned_key_column_qualifier_size(owned_key, &owned_size,
+                                               &error) == SHOAL_STATUS_OK &&
+         owned_size == 1);
+  assert(shoal_owned_key_column_visibility_size(owned_key, &owned_size,
+                                                &error) == SHOAL_STATUS_OK &&
+         owned_size == 1);
+  shoal_owned_key_free(&owned_key_copy);
+  shoal_test_result_alloc_fail_after(0);
+  assert(shoal_owned_key_clone(owned_key, &owned_key_copy, &error) ==
+         SHOAL_STATUS_OUT_OF_MEMORY);
+  assert(owned_key_copy == NULL);
+  shoal_error_free(&error);
+  shoal_test_result_alloc_reset();
+  shoal_test_result_alloc_fail_after(0);
+  assert(shoal_owned_key_row(owned_key, &owned_bytes, &error) ==
+         SHOAL_STATUS_OUT_OF_MEMORY);
+  assert(owned_bytes == NULL);
+  shoal_error_free(&error);
+  shoal_test_result_alloc_reset();
+  owned_bytes = (shoal_bytes_result *)(uintptr_t)1;
+  expect_error(shoal_owned_key_row(NULL, &owned_bytes, &error),
+               SHOAL_STATUS_INVALID_HANDLE, &error, "handle");
+  assert(owned_bytes == NULL);
+  shoal_owned_key_free(&owned_key_copy);
+  shoal_owned_key_free(&owned_key_copy);
+  shoal_owned_key_free(&owned_key);
+  shoal_owned_key_free(&owned_key);
 
   return 0;
 }
