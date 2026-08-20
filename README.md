@@ -7,7 +7,10 @@ The `shoal-sharkbite` distribution is available under
 `import pysharkbite`, negotiates the stable C ABI at runtime, and provides
 scanning, mutation/batch-writer, and table/namespace/security administration
 paths. It is not yet a complete Sharkbite-compatible distribution;
-unsupported legacy APIs fail explicitly. Linux manylinux_2_28 x86-64 is the
+unsupported core APIs fail explicitly. The
+[normative client-scope ADR](docs/sharkbite-client-scope.md) separates those
+blockers from optional Torch, pandas, embedded, and historical C++ surfaces.
+Linux manylinux_2_28 x86-64 is the
 first supported wheel target; Windows is host-verified and macOS remains a
 host-verification gap governed by the
 [release and native-library policy](docs/python-release.md).

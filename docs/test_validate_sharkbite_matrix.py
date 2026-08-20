@@ -122,6 +122,14 @@ def delete_matrix_row_consistently(text: str, row_id: str, prefix: str) -> str:
         validator.EXPECTED_STATUS_COUNTS[validator.NOT_REQUIRED_STATUS],
         validator.EXPECTED_STATUS_COUNTS[validator.NOT_REQUIRED_STATUS] - 1,
     )
+    removed_scope = next(
+        entry[1] for entry in validator.load_expected_scope() if entry[0] == row_id
+    )
+    mutated = replace_standalone_number(
+        mutated,
+        validator.EXPECTED_SCOPE_COUNTS[removed_scope],
+        validator.EXPECTED_SCOPE_COUNTS[removed_scope] - 1,
+    )
 
     adjusted: list[str] = []
     for line in mutated.splitlines():
@@ -144,13 +152,23 @@ def pinned_constants_for_deleted_not_required_row(prefix: str, row_id: str) -> d
     }
     prefix_counts[prefix][validator.NOT_REQUIRED_STATUS] -= 1
     manifest = tuple(entry for entry in validator.load_expected_rows() if entry[0] != row_id)
+    scope_counts = dict(validator.EXPECTED_SCOPE_COUNTS)
+    removed_scope = next(
+        entry[1] for entry in validator.load_expected_scope() if entry[0] == row_id
+    )
+    scope_counts[removed_scope] -= 1
+    scope_manifest = tuple(
+        entry for entry in validator.load_expected_scope() if entry[0] != row_id
+    )
     return {
         "EXPECTED_TOTAL_ROWS": validator.EXPECTED_TOTAL_ROWS - 1,
         "EXPECTED_REQUIRED_ROWS": validator.EXPECTED_REQUIRED_ROWS,
         "EXPECTED_STATUS_COUNTS": status_counts,
         "EXPECTED_PREFIX_TOTALS": prefix_totals,
         "EXPECTED_PREFIX_COUNTS": prefix_counts,
+        "EXPECTED_SCOPE_COUNTS": scope_counts,
         "load_expected_rows": lambda: manifest,
+        "load_expected_scope": lambda: scope_manifest,
     }
 
 
@@ -1918,7 +1936,7 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
     def test_commented_release_gate_narrative_is_rejected(self) -> None:
         commented = self._comment_out_paragraph(load_document_text(), "As of revision")
         self.assertIn(
-            "which record a permanent capability loss rather than delivered compatibility",
+            "The remaining required gaps are 19",
             validator.normalize_whitespace(commented),
             "the sentence must survive for this to test rendering, not deletion",
         )
@@ -1967,7 +1985,7 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
             load_document_text(), "As of revision", "pre"
         )
         self.assertIn(
-            "which record a permanent capability loss rather than delivered compatibility",
+            "The remaining required gaps are 19",
             validator.normalize_whitespace(wrapped),
             "the sentence must survive for this to test rendering, not deletion",
         )
@@ -2062,7 +2080,7 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
         text = load_document_text()
         relocated = self._relocate_paragraph(text, "As of revision")
         self.assertIn(
-            "which record a permanent capability loss rather than delivered compatibility",
+            "The remaining required gaps are 19",
             validator.normalize_whitespace(relocated),
             "the sentence must survive somewhere for this to test relocation, not deletion",
         )
@@ -2457,9 +2475,19 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
 
     def test_pinned_inventory_constants_are_internally_consistent(self) -> None:
         validator.validate_pinned_inventory_constants()
-        self.assertEqual(validator.EXPECTED_REVISION, 46)
+        self.assertEqual(validator.EXPECTED_REVISION, 47)
         self.assertEqual(validator.EXPECTED_TOTAL_ROWS, 3203)
-        self.assertEqual(validator.EXPECTED_REQUIRED_ROWS, 2812)
+        self.assertEqual(validator.EXPECTED_REQUIRED_ROWS, 397)
+        self.assertEqual(
+            validator.EXPECTED_SCOPE_COUNTS,
+            {
+                "Covered": 118,
+                "Approved divergence": 90,
+                "Required gap": 189,
+                "Optional": 2763,
+                "Not required": 43,
+            },
+        )
         self.assertEqual(
             validator.EXPECTED_STATUS_COUNTS,
             {
@@ -2509,6 +2537,38 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
         self.assertIn("shoal_column_visibility_create", referenced)
         self.assertIn("shoal_visibility_evaluator_evaluate_tree", referenced)
         self.assertIn("shoal_error_visibility_parse", referenced)
+
+    def test_scope_manifest_matches_normative_rules_and_counts(self) -> None:
+        rows = validator.parse_rows(load_document_text().splitlines())[2]
+        counts = validator.validate_scope_manifest(rows)
+        self.assertEqual(dict(counts), validator.EXPECTED_SCOPE_COUNTS)
+        entries = {entry[0]: entry for entry in validator.load_expected_scope()}
+        for row_id in ("SB-XCUT-014", "SB-XCUT-019", "SB-PKG-008"):
+            self.assertEqual(entries[row_id][1], "Required gap")
+        for row_id in ("SB-PKG-012", "SB-PKG-013", "SB-TORCH-001", "SB-PANDA-001"):
+            self.assertEqual(entries[row_id][1], "Optional")
+
+    def test_scope_manifest_rejects_unjustified_bulk_reclassification(self) -> None:
+        entries = list(validator.load_expected_scope())
+        index = next(i for i, entry in enumerate(entries) if entry[0] == "SB-PKG-008")
+        row_id, _disposition, _rule, status = entries[index]
+        entries[index] = (row_id, "Optional", "optional-python-extra", status)
+        with mock.patch.object(validator, "load_expected_scope", return_value=tuple(entries)):
+            self.assert_validation_fails(
+                lambda: validator.validate_scope_manifest(
+                    validator.parse_rows(load_document_text().splitlines())[2]
+                ),
+                "unjustified scope classification for SB-PKG-008",
+                "change the normative rule set and its tests",
+            )
+
+    def test_scope_manifest_provenance_header_is_pinned(self) -> None:
+        lines = validator.EXPECTED_SCOPE_MANIFEST.read_text(encoding="utf-8").splitlines()
+        lines[2] = "# Sharkbite source: unreviewed."
+        self.assert_validation_fails(
+            lambda: validator.validate_scope_manifest_provenance(lines),
+            "scope manifest provenance header does not match revision 47",
+        )
 
     def test_collect_c_abi_free_function_inventory_matches_header(self) -> None:
         free_functions = validator.collect_c_abi_free_function_inventory()
@@ -2663,16 +2723,16 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
     def test_revision_bump_requires_validator_constant_update(self) -> None:
         text = load_document_text()
         mutated = text.replace(
-            f"Revision {validator.EXPECTED_REVISION} — adds deterministic cross-platform artifact evidence",
-            f"Revision {validator.EXPECTED_REVISION + 1} — adds the next audited ABI slice",
+            f"Revision {validator.EXPECTED_REVISION} — establishes the client-scope ADR",
+            f"Revision {validator.EXPECTED_REVISION + 1} — adds the next audited scope",
         ).replace(
-            f"As of revision {validator.EXPECTED_REVISION} that is",
-            f"As of revision {validator.EXPECTED_REVISION + 1} that is",
+            f"As of revision {validator.EXPECTED_REVISION},",
+            f"As of revision {validator.EXPECTED_REVISION + 1},",
         )
         self.assertNotEqual(mutated, text)
         self.assert_validation_fails(
             lambda: validator.validate_counts(mutated.splitlines(), mutated),
-            f"document status is missing expected detail: Revision {validator.EXPECTED_REVISION} — adds deterministic cross-platform artifact evidence",
+            f"document status is missing expected detail: Revision {validator.EXPECTED_REVISION} — establishes the client-scope ADR",
         )
 
     # ---- matrix table separators -------------------------------------------
