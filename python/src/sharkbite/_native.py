@@ -15,6 +15,8 @@ from .errors import exception_for_status
 ABI_MAJOR = 1
 MIN_ABI_VERSION = (1, 17, 0)
 CAP_OWNED_SCAN_RESULT = 5
+CAP_SCANNER = 3
+CAP_BATCH_SCANNER = 4
 CAP_MUTATION = 6
 CAP_BATCH_WRITER = 7
 CAP_STRUCTURED_WRITE_FAILURE = 8
@@ -26,6 +28,7 @@ CAP_TABLE_MAINTENANCE = 19
 CAP_HIGH_LEVEL_CLIENT = 21
 CAP_HIGH_LEVEL_SCANNER = 22
 CAP_COMPATIBILITY_ERRORS = 23
+CAP_STREAMING_SCAN_CURSOR = 24
 CAP_RFILE = 16
 CAP_HDFS = 27
 CAP_RFILE_LOCALITY_GROUPS = 28
@@ -36,6 +39,24 @@ CAPABILITY_SYMBOLS = {
         "shoal_scan_result_count",
         "shoal_scan_result_get",
         "shoal_scan_result_free",
+    },
+    CAP_SCANNER: {
+        "shoal_scanner_config_init",
+        "shoal_connector_create_scanner",
+        "shoal_scanner_close",
+        "shoal_scanner_free",
+    },
+    CAP_BATCH_SCANNER: {
+        "shoal_scanner_config_init",
+        "shoal_connector_create_batch_scanner",
+        "shoal_batch_scanner_close",
+        "shoal_batch_scanner_free",
+    },
+    CAP_STREAMING_SCAN_CURSOR: {
+        "shoal_batch_scanner_stream",
+        "shoal_scan_cursor_next",
+        "shoal_scan_cursor_close",
+        "shoal_scan_cursor_free",
     },
     CAP_HIGH_LEVEL_CLIENT: {
         "shoal_client_config_init",
@@ -219,6 +240,45 @@ class Range(C.Structure):
         ("end", RangeBound),
         ("start_inclusive", C.c_uint8),
         ("end_inclusive", C.c_uint8),
+    ]
+
+
+class Column(C.Structure):
+    _fields_ = [
+        ("family", Bytes),
+        ("qualifier", Bytes),
+        ("has_qualifier", C.c_uint8),
+    ]
+
+
+class IteratorOption(C.Structure):
+    _fields_ = [("key", C.c_char_p), ("value", C.c_char_p)]
+
+
+class IteratorSetting(C.Structure):
+    _fields_ = [
+        ("name", C.c_char_p),
+        ("class_name", C.c_char_p),
+        ("priority", C.c_int32),
+        ("options", C.POINTER(IteratorOption)),
+        ("option_count", C.c_size_t),
+    ]
+
+
+class ScannerConfig(C.Structure):
+    _fields_ = [
+        ("struct_size", C.c_uint32),
+        ("table_name", C.c_char_p),
+        ("table_id", C.c_char_p),
+        ("batch_size", C.c_int32),
+        ("authorizations", C.POINTER(Bytes)),
+        ("authorization_count", C.c_size_t),
+        ("columns", C.POINTER(Column)),
+        ("column_count", C.c_size_t),
+        ("iterators", C.POINTER(IteratorSetting)),
+        ("iterator_count", C.c_size_t),
+        ("parallelism", C.c_int32),
+        ("use_multi_scan", C.c_uint8),
     ]
 
 
@@ -549,6 +609,48 @@ class NativeAPI:
             PP,
             **optional,
         )
+        self._function(
+            "shoal_scanner_config_init",
+            None,
+            C.POINTER(ScannerConfig),
+            **optional,
+        )
+        self._function(
+            "shoal_connector_create_batch_scanner",
+            C.c_int32,
+            P,
+            C.POINTER(ScannerConfig),
+            PP,
+            PP,
+            **optional,
+        )
+        self._function(
+            "shoal_batch_scanner_close", C.c_int32, P, PP, **optional
+        )
+        self._function("shoal_batch_scanner_free", None, PP, **optional)
+        self._function(
+            "shoal_batch_scanner_stream",
+            C.c_int32,
+            P,
+            C.POINTER(Range),
+            C.c_size_t,
+            C.c_int64,
+            PP,
+            PP,
+            **optional,
+        )
+        self._function(
+            "shoal_scan_cursor_next",
+            C.c_int32,
+            P,
+            C.c_size_t,
+            PP,
+            C.POINTER(C.c_uint8),
+            PP,
+            **optional,
+        )
+        self._function("shoal_scan_cursor_close", C.c_int32, P, PP, **optional)
+        self._function("shoal_scan_cursor_free", None, PP, **optional)
         self._function("shoal_scan_result_count", C.c_size_t, P, **optional)
         self._function(
             "shoal_scan_result_get",

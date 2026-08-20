@@ -1,19 +1,28 @@
 from __future__ import annotations
 
 import ctypes as C
+import asyncio
+from collections import deque
 import time
 from dataclasses import dataclass
-from typing import Iterator, Sequence
+import threading
+from typing import Callable, Iterator, Sequence
 
 from ._native import (
     CAP_HIGH_LEVEL_CLIENT,
     CAP_HIGH_LEVEL_SCANNER,
+    CAP_BATCH_SCANNER,
     CAP_OWNED_SCAN_RESULT,
+    CAP_STREAMING_SCAN_CURSOR,
+    Bytes,
     ClientConfig,
+    Column,
     ConnectorConfig,
+    IteratorSetting,
     KeyValueView,
     NativeAPI,
     Range,
+    ScannerConfig,
     as_bytes,
     c_bytes,
 )
@@ -398,6 +407,486 @@ class Scanner:
 
     def __exit__(self, *_: object) -> None:
         self.close()
+
+
+@dataclass(frozen=True)
+class _RangeBoundSnapshot:
+    kind: int
+    row: bytes
+    key: tuple[bytes, bytes, bytes, bytes, int]
+
+
+@dataclass(frozen=True)
+class _RangeSnapshot:
+    start: _RangeBoundSnapshot
+    end: _RangeBoundSnapshot
+    start_inclusive: bool
+    end_inclusive: bool
+
+    @staticmethod
+    def _bytes(value: Bytes) -> bytes:
+        if not value.data or not value.length:
+            return b""
+        return C.string_at(value.data, value.length)
+
+    @classmethod
+    def _bound(cls, bound: object) -> _RangeBoundSnapshot:
+        key = bound.key
+        return _RangeBoundSnapshot(
+            int(bound.kind),
+            cls._bytes(bound.row),
+            (
+                cls._bytes(key.row),
+                cls._bytes(key.column_family),
+                cls._bytes(key.column_qualifier),
+                cls._bytes(key.column_visibility),
+                int(key.timestamp),
+            ),
+        )
+
+    @classmethod
+    def from_value(cls, value: object) -> _RangeSnapshot:
+        converter = getattr(value, "_as_native_range", None)
+        if converter is not None:
+            value = converter()
+        if not isinstance(value, Range):
+            raise TypeError("range must be a sharkbite.Range")
+        return cls(
+            cls._bound(value.start),
+            cls._bound(value.end),
+            bool(value.start_inclusive),
+            bool(value.end_inclusive),
+        )
+
+    def native(self, api: NativeAPI) -> tuple[Range, list[object]]:
+        result = Range()
+        api.lib.shoal_range_init(C.byref(result))
+        keepalive: list[object] = []
+        for name, snapshot in (("start", self.start), ("end", self.end)):
+            bound = getattr(result, name)
+            bound.kind = snapshot.kind
+            row, row_buffer = c_bytes(snapshot.row)
+            bound.row = row
+            keepalive.append(row_buffer)
+            for field, value in zip(
+                (
+                    "row",
+                    "column_family",
+                    "column_qualifier",
+                    "column_visibility",
+                ),
+                snapshot.key[:4],
+            ):
+                native, buffer = c_bytes(value)
+                setattr(bound.key, field, native)
+                keepalive.append(buffer)
+            bound.key.timestamp = snapshot.key[4]
+        result.start_inclusive = self.start_inclusive
+        result.end_inclusive = self.end_inclusive
+        return result, keepalive
+
+
+class Results(Iterator[object]):
+    _chunk_size = 1024
+
+    def __init__(
+        self,
+        opener: Callable[[], tuple[C.c_void_p, C.c_void_p]],
+        api: NativeAPI,
+    ) -> None:
+        self._opener = opener
+        self._api = api
+        self._lock = threading.RLock()
+        self._next_lock = threading.Lock()
+        self._scanner = C.c_void_p()
+        self._cursor = C.c_void_p()
+        self._pending: deque[object] = deque()
+        self._exhausted = False
+        self._closed = False
+        self._disposed = False
+        self._terminal_error: BaseException | None = None
+
+    def _restart(self) -> None:
+        if self._disposed:
+            raise RuntimeError("results are closed")
+        self._close_native()
+        self._scanner, self._cursor = self._opener()
+        self._pending.clear()
+        self._exhausted = False
+        self._closed = False
+        self._terminal_error = None
+
+    def __iter__(self) -> Results:
+        with self._lock:
+            self._restart()
+        return self
+
+    def __next__(self) -> object:
+        with self._next_lock:
+            with self._lock:
+                if self._closed:
+                    raise StopIteration
+                if not self._cursor.value and not self._exhausted:
+                    self._restart()
+                if self._pending:
+                    return self._pending.popleft()
+                if self._terminal_error is not None:
+                    error = self._terminal_error
+                    self._terminal_error = None
+                    self._finish()
+                    raise error
+                if self._exhausted:
+                    self._finish()
+                    raise StopIteration
+            self._pull()
+            with self._lock:
+                if self._closed:
+                    raise StopIteration
+                if self._pending:
+                    return self._pending.popleft()
+                if self._terminal_error is not None:
+                    error = self._terminal_error
+                    self._terminal_error = None
+                    self._finish()
+                    raise error
+                self._finish()
+                raise StopIteration
+
+    def _pull(self) -> None:
+        result = C.c_void_p()
+        exhausted = C.c_uint8()
+        error = C.c_void_p()
+        status = self._api.lib.shoal_scan_cursor_next(
+            self._cursor,
+            self._chunk_size,
+            C.byref(result),
+            C.byref(exhausted),
+            C.byref(error),
+        )
+        try:
+            if result.value:
+                from .storage import KeyValue
+
+                for index in range(self._api.lib.shoal_scan_result_count(result)):
+                    view = KeyValueView()
+                    item_error = C.c_void_p()
+                    item_status = self._api.lib.shoal_scan_result_get(
+                        result, index, C.byref(view), C.byref(item_error)
+                    )
+                    self._api.check(item_status, item_error)
+                    raw_key, value = self._api.copy_view(view)
+                    with self._lock:
+                        if not self._closed:
+                            self._pending.append(KeyValue(Key(*raw_key), value))
+        finally:
+            if result.value:
+                self._api.lib.shoal_scan_result_free(C.byref(result))
+        with self._lock:
+            self._exhausted = bool(exhausted.value)
+        if status:
+            try:
+                self._api.check(status, error)
+            except BaseException as exc:
+                with self._lock:
+                    if self._pending:
+                        self._terminal_error = exc
+                        return
+                raise
+
+    def __aiter__(self) -> Results:
+        return iter(self)
+
+    async def __anext__(self) -> object:
+        def advance() -> tuple[bool, object | None]:
+            try:
+                return True, self.__next__()
+            except StopIteration:
+                return False, None
+
+        available, value = await asyncio.to_thread(advance)
+        if not available:
+            raise StopAsyncIteration
+        return value
+
+    def __await__(self) -> Iterator[object]:
+        async def ready() -> Results:
+            return iter(self)
+
+        return ready().__await__()
+
+    def close(self) -> None:
+        with self._lock:
+            if self._disposed:
+                return
+            self._disposed = True
+            self._closed = True
+            self._close_native()
+            self._pending.clear()
+
+    def _finish(self) -> None:
+        self._close_native()
+        self._pending.clear()
+
+    def _close_native(self) -> None:
+        cursor_error: BaseException | None = None
+        if self._cursor.value:
+            error = C.c_void_p()
+            status = self._api.lib.shoal_scan_cursor_close(
+                self._cursor, C.byref(error)
+            )
+            try:
+                self._api.check(status, error)
+            except BaseException as exc:
+                cursor_error = exc
+            finally:
+                self._api.lib.shoal_scan_cursor_free(C.byref(self._cursor))
+        if self._scanner.value:
+            error = C.c_void_p()
+            status = self._api.lib.shoal_batch_scanner_close(
+                self._scanner, C.byref(error)
+            )
+            try:
+                self._api.check(status, error)
+            finally:
+                self._api.lib.shoal_batch_scanner_free(C.byref(self._scanner))
+        if cursor_error is not None:
+            raise cursor_error
+
+    def __enter__(self) -> Results:
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
+class BatchScanner:
+    def __init__(
+        self,
+        connector: Connector,
+        table: str,
+        auths: Sequence[str | bytes],
+        threads: int = 10,
+    ) -> None:
+        if auths is None:
+            from .errors import ClientException
+
+            raise ClientException("authorizations must not be None")
+        if threads <= 0:
+            raise ValueError("threads must be positive")
+        self._connector = connector
+        self._api = connector._api
+        self._api.require(
+            CAP_BATCH_SCANNER, CAP_OWNED_SCAN_RESULT, CAP_STREAMING_SCAN_CURSOR
+        )
+        self._table = table
+        self._auths = tuple(as_bytes(value) for value in auths)
+        self._threads = threads
+        self._ranges: list[_RangeSnapshot] = []
+        self._columns: list[tuple[bytes, bytes | None]] = []
+        self._iterators: list[tuple[str, str, int]] = []
+        self._results: set[Results] = set()
+        self._lock = threading.RLock()
+        self._closed = False
+
+    @property
+    def closed(self) -> bool:
+        with self._lock:
+            return self._closed
+
+    def addRange(self, scan_range: object) -> None:
+        with self._lock:
+            self._ensure_open()
+            self._ranges.append(_RangeSnapshot.from_value(scan_range))
+
+    def withRange(self, scan_range: object) -> BatchScanner:
+        self.addRange(scan_range)
+        return self
+
+    def fetchColumn(
+        self, column_family: str | bytes, column_qualifier: str | bytes | None = None
+    ) -> None:
+        with self._lock:
+            self._ensure_open()
+            self._columns.append(
+                (
+                    as_bytes(column_family),
+                    None if column_qualifier is None else as_bytes(column_qualifier),
+                )
+            )
+
+    def addIterator(self, iterator: object) -> None:
+        if isinstance(iterator, PythonIterator):
+            raise unsupported_python_iterator()
+        try:
+            name = iterator.getName()
+            class_name = iterator.getClass()
+            priority = iterator.getPriority()
+        except AttributeError as exc:
+            raise TypeError("iterator must be an IterInfo or PythonIterator") from exc
+        with self._lock:
+            self._ensure_open()
+            self._iterators.append((str(name), str(class_name), int(priority)))
+
+    def setOption(self, option: ScannerOptions | int) -> None:
+        raise unsupported_scanner_option(option)
+
+    def removeOption(self, option: ScannerOptions | int) -> None:
+        raise unsupported_scanner_option(option)
+
+    def getResultSet(self, *, timeout_ms: int = 0) -> Results:
+        with self._lock:
+            self._ensure_open()
+            if not self._ranges:
+                raise ValueError("at least one range is required")
+            snapshot = (
+                tuple(self._ranges),
+                tuple(self._columns),
+                tuple(self._iterators),
+            )
+        result = Results(
+            lambda: self._open(snapshot, timeout_ms),
+            self._api,
+        )
+        with self._lock:
+            self._ensure_open()
+            self._results.add(result)
+        return result
+
+    def _open(
+        self,
+        snapshot: tuple[
+            tuple[_RangeSnapshot, ...],
+            tuple[tuple[bytes, bytes | None], ...],
+            tuple[tuple[str, str, int], ...],
+        ],
+        timeout_ms: int,
+    ) -> tuple[C.c_void_p, C.c_void_p]:
+        ranges, columns, iterators = snapshot
+        config = ScannerConfig()
+        self._api.lib.shoal_scanner_config_init(C.byref(config))
+        keepalive: list[object] = []
+        table = self._table.encode()
+        keepalive.append(table)
+        config.table_name = table
+        config.parallelism = self._threads
+
+        auth_values = [c_bytes(value) for value in self._auths]
+        if auth_values:
+            auth_array = (Bytes * len(auth_values))(*(item[0] for item in auth_values))
+            config.authorizations = auth_array
+            config.authorization_count = len(auth_values)
+            keepalive.extend([auth_array, *(item[1] for item in auth_values)])
+
+        column_values: list[Column] = []
+        for family, qualifier in columns:
+            family_view, family_buffer = c_bytes(family)
+            keepalive.append(family_buffer)
+            value = Column()
+            value.family = family_view
+            if qualifier is not None:
+                qualifier_view, qualifier_buffer = c_bytes(qualifier)
+                value.qualifier = qualifier_view
+                value.has_qualifier = 1
+                keepalive.append(qualifier_buffer)
+            column_values.append(value)
+        if column_values:
+            column_array = (Column * len(column_values))(*column_values)
+            config.columns = column_array
+            config.column_count = len(column_values)
+            keepalive.append(column_array)
+
+        iterator_values: list[IteratorSetting] = []
+        for name, class_name, priority in iterators:
+            native = IteratorSetting()
+            name_bytes = name.encode()
+            class_bytes = class_name.encode()
+            native.name = name_bytes
+            native.class_name = class_bytes
+            native.priority = priority
+            iterator_values.append(native)
+            keepalive.extend((name_bytes, class_bytes))
+        if iterator_values:
+            iterator_array = (IteratorSetting * len(iterator_values))(*iterator_values)
+            config.iterators = iterator_array
+            config.iterator_count = len(iterator_values)
+            keepalive.append(iterator_array)
+
+        scanner = C.c_void_p()
+        error = C.c_void_p()
+        status = self._api.lib.shoal_connector_create_batch_scanner(
+            self._connector._handle,
+            C.byref(config),
+            C.byref(scanner),
+            C.byref(error),
+        )
+        self._api.check(status, error)
+
+        native_ranges: list[Range] = []
+        for scan_range in ranges:
+            native, retained = scan_range.native(self._api)
+            native_ranges.append(native)
+            keepalive.extend(retained)
+        range_array = (Range * len(native_ranges))(*native_ranges)
+        keepalive.append(range_array)
+        cursor = C.c_void_p()
+        error = C.c_void_p()
+        status = self._api.lib.shoal_batch_scanner_stream(
+            scanner,
+            range_array,
+            len(native_ranges),
+            timeout_ms,
+            C.byref(cursor),
+            C.byref(error),
+        )
+        try:
+            self._api.check(status, error)
+        except BaseException:
+            close_error = C.c_void_p()
+            self._api.lib.shoal_batch_scanner_close(
+                scanner, C.byref(close_error)
+            )
+            self._api.lib.shoal_batch_scanner_free(C.byref(scanner))
+            raise
+        return scanner, cursor
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            results = tuple(self._results)
+            self._results.clear()
+        first_error: BaseException | None = None
+        for result in results:
+            try:
+                result.close()
+            except BaseException as exc:
+                if first_error is None:
+                    first_error = exc
+        if first_error is not None:
+            raise first_error
+
+    def _ensure_open(self) -> None:
+        if self._closed:
+            raise RuntimeError("batch scanner is closed")
+
+    def __enter__(self) -> BatchScanner:
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
 
 
 class AccumuloBase(Client):

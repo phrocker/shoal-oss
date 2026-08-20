@@ -12,7 +12,7 @@ class CompiledLibraryTests(unittest.TestCase):
     )
     def test_writer_and_administration_symbols_match_reported_capabilities(self):
         api = NativeAPI()
-        api.require(6, 7, 8, 9, 10, 11, 12, 19, 29)
+        api.require(4, 5, 6, 7, 8, 9, 10, 11, 12, 19, 24, 29)
         self.assertEqual(api.info.version[0], 1)
         with Mutation(b"row", _api=api) as mutation:
             mutation.put(b"cf", b"cq", b"A", 7, b"value")

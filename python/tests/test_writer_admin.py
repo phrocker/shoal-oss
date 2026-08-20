@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes as C
+import threading
 import unittest
 
 from sharkbite import (
@@ -56,6 +57,7 @@ class FakeLibrary:
         self.shoal_logging_set_level = Function(self._logging_set)
         self.shoal_logging_get_level = Function(lambda: self.log_level)
         self.log_level = 0
+        self.mutation_size = 7
         self._bind_admin()
 
     @staticmethod
@@ -86,7 +88,7 @@ class FakeLibrary:
         return 0
 
     def _mutation_size(self, handle, out_size, error):
-        C.cast(out_size, C.POINTER(C.c_size_t)).contents.value = 7
+        C.cast(out_size, C.POINTER(C.c_size_t)).contents.value = self.mutation_size
         return 0
 
     def _writer_add(self, *args):
@@ -249,6 +251,41 @@ class WriterAdminTests(unittest.TestCase):
         self.assertEqual(self.api.lib.log_level, 1)
         LoggingConfiguration._set(2, self.api)
         self.assertEqual(self.api.lib.log_level, 2)
+
+    def test_writer_accepts_empty_mutation_without_native_rejection(self):
+        self.api.lib.mutation_size = 0
+        with Mutation(b"row", _api=self.api) as mutation:
+            with BatchWriter(self.connector, "t") as writer:
+                self.assertTrue(writer.addMutation(mutation))
+        self.assertFalse(any(name == "add" for name, _ in self.api.lib.calls))
+
+    def test_writer_context_propagates_body_exception(self):
+        with self.assertRaisesRegex(RuntimeError, "body"):
+            with BatchWriter(self.connector, "t"):
+                raise RuntimeError("body")
+
+    def test_writer_concurrent_adds_are_python_thread_safe(self):
+        with Mutation(b"row", _api=self.api) as mutation:
+            mutation.put()
+            with BatchWriter(self.connector, "t") as writer:
+                errors = []
+
+                def add():
+                    try:
+                        writer.addMutation(mutation)
+                    except BaseException as exc:
+                        errors.append(exc)
+
+                threads = [threading.Thread(target=add) for _ in range(32)]
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join()
+                self.assertFalse(errors)
+        self.assertEqual(
+            sum(call[0] == "add" for call in self.api.lib.calls),
+            32,
+        )
 
     def test_table_namespace_security_legacy_shapes(self):
         table = self.connector.tableOps("t")

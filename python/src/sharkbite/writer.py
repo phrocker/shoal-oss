@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ctypes as C
 from dataclasses import dataclass
+import threading
 
 from ._native import (
     CAP_BATCH_WRITER,
@@ -243,60 +244,79 @@ class BatchWriter:
         )
         self._api.check(status, error)
         self._closed = False
+        self._closing = False
         self._close_error: BaseException | None = None
+        self._condition = threading.Condition()
 
     @property
     def closed(self) -> bool:
-        return self._closed
+        with self._condition:
+            return self._closed
 
     def mutation(self, row: str | bytes) -> Mutation:
-        self._ensure_open()
+        with self._condition:
+            self._ensure_open()
         return Mutation(row, _api=self._api)
 
     def add_mutation(self, mutation: Mutation, *, timeout_ms: int = 0) -> bool:
-        self._ensure_open()
-        mutation._ensure_open()
-        failure = C.c_void_p()
-        error = C.c_void_p()
-        status = self._api.lib.shoal_batch_writer_add(
-            self._handle,
-            mutation._handle,
-            timeout_ms,
-            C.byref(failure),
-            C.byref(error),
-        )
-        self._api.check_write(status, failure, error)
-        return True
+        self._begin_call()
+        try:
+            mutation._ensure_open()
+            if mutation.size() == 0:
+                return True
+            failure = C.c_void_p()
+            error = C.c_void_p()
+            status = self._api.lib.shoal_batch_writer_add(
+                self._handle,
+                mutation._handle,
+                timeout_ms,
+                C.byref(failure),
+                C.byref(error),
+            )
+            self._api.check_write(status, failure, error)
+            return True
+        finally:
+            self._end_call()
 
     addMutation = add_mutation
 
     def flush(self, override: bool = False, *, timeout_ms: int = 0) -> bool:
         del override
-        self._ensure_open()
-        failure = C.c_void_p()
-        error = C.c_void_p()
-        status = self._api.lib.shoal_batch_writer_flush(
-            self._handle, timeout_ms, C.byref(failure), C.byref(error)
-        )
-        self._api.check_write(status, failure, error)
-        return True
+        self._begin_call()
+        try:
+            failure = C.c_void_p()
+            error = C.c_void_p()
+            status = self._api.lib.shoal_batch_writer_flush(
+                self._handle, timeout_ms, C.byref(failure), C.byref(error)
+            )
+            self._api.check_write(status, failure, error)
+            return True
+        finally:
+            self._end_call()
 
     def size(self, *, timeout_ms: int = 0) -> int:
-        self._ensure_open()
-        self._api.require(CAP_CLIENT_PARITY_CONTROLS)
-        result = C.c_size_t()
-        error = C.c_void_p()
-        status = self._api.lib.shoal_batch_writer_size(
-            self._handle, timeout_ms, C.byref(result), C.byref(error)
-        )
-        self._api.check(status, error)
-        return int(result.value)
+        self._begin_call()
+        try:
+            self._api.require(CAP_CLIENT_PARITY_CONTROLS)
+            result = C.c_size_t()
+            error = C.c_void_p()
+            status = self._api.lib.shoal_batch_writer_size(
+                self._handle, timeout_ms, C.byref(result), C.byref(error)
+            )
+            self._api.check(status, error)
+            return int(result.value)
+        finally:
+            self._end_call()
 
     def close(self, *, timeout_ms: int = 0) -> None:
-        if self._closed:
-            if self._close_error is not None:
-                raise self._close_error
-            return
+        with self._condition:
+            while self._closing and not self._closed:
+                self._condition.wait()
+            if self._closed:
+                if self._close_error is not None:
+                    raise self._close_error
+                return
+            self._closing = True
         failure = C.c_void_p()
         error = C.c_void_p()
         status = self._api.lib.shoal_batch_writer_close(
@@ -309,11 +329,21 @@ class BatchWriter:
             raise
         finally:
             self._api.lib.shoal_batch_writer_free(C.byref(self._handle))
-            self._closed = True
+            with self._condition:
+                self._closed = True
+                self._closing = False
+                self._condition.notify_all()
 
     def _ensure_open(self) -> None:
-        if self._closed:
+        if self._closed or self._closing:
             raise RuntimeError("batch writer is closed")
+
+    def _begin_call(self) -> None:
+        with self._condition:
+            self._ensure_open()
+
+    def _end_call(self) -> None:
+        pass
 
     def __enter__(self) -> BatchWriter:
         return self
