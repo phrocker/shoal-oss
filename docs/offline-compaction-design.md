@@ -176,10 +176,10 @@ internal/compaction.Compact(Spec{Inputs, Stack, Majc,      │  see §6)
 internal/storage ─► write A<uuid>.rf + fsync
         │
         ▼
-internal/offlinecompact/commit ─► OFFLINE fence re-check + metadata CAS
+internal/offlinecompact/verify ─► self-consistency + shadow oracle
         │
         ▼
-internal/offlinecompact/verify ─► self-consistency + shadow oracle
+internal/offlinecompact/commit ─► OFFLINE fence re-check + inspection plan
 ```
 
 ### 4.1 `internal/offlinecompact` (new package)
@@ -191,7 +191,9 @@ Pure-ish orchestrator. Given `(tableID, optional row range, options)`:
 3. For each tablet: resolve majc stack (itercfg), fetch inputs
    (storage), `compaction.Compact`, write output.
 4. Verify (§5).
-5. Fence re-check, then commit (§4.3) unless dry-run.
+5. Fence re-check, then emit the inspection-only plan. The package retains
+   legacy commit seams for regression tests, but the shipped CLI does not call
+   them.
 
 Kept free of I/O primitives it does not own — it composes `metadata`,
 `storage`, `itercfg`, `compaction`, and `zk` rather than reimplementing
@@ -267,10 +269,8 @@ shoal-offline-compact \
   --zk <quorum> --instance <name> \
   --table <name|id> [--range <startRow>:<endRow>] \
   [--dry-run=true]              # default true: plan+verify, no commit.
-                               #   false enters deprecated legacy seams;
-                               #   prohibited in release workflows.
-  [--commit-mode=plan|direct]  # default: plan. direct is deprecated;
-                               #   plans are inspection-only today.
+                               #   false is rejected before external work.
+  [--commit-mode=plan]         # direct is rejected before external work.
   [--verify=true]              # default: run §5 checks
   [--out <dir>]                # where to write the commit plan (Mode P)
 ```

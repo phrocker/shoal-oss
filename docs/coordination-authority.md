@@ -258,10 +258,12 @@ The handoff proceeds as follows:
    destination write fence remains held.
 9. Revoke local authority and durably record `LOCAL_RETIRED`, linking source
    epoch `E` to the destination's reserved epoch `N`.
-10. Bring the destination online through the manager, verify the transition,
-   and durably record `ACCUMULO_WRITABLE` at epoch `N`. Only then may
-   distributed clients admit writes.
-11. Retain an auditable lineage record tying local generation, export
+10. While the destination remains `OFFLINE`, durably transition its
+    manager-owned authority record from reserved to active epoch `N` and verify
+    that record.
+11. Bring the destination online through the manager and verify the transition.
+    Only then may distributed clients admit writes.
+12. Retain an auditable lineage record tying local generation, export
     checksums, destination table, FATE identity, and terminal authority epoch.
 
 The current `managerclient.ExecuteStatus` helper performs

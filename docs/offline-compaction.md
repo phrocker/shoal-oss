@@ -247,15 +247,19 @@ GC, and apply the metadata change authoritatively.
 
 ## 9. Post-run validation
 
-After onlining the table:
+After today's inspection-only run, discard the artifacts, online the unchanged
+table, and confirm a full (or targeted range) scan still returns the original
+data and file layout.
+
+For the future authoritative commit workflow, after its terminal result is
+verified and the table is onlined:
 
 - Full scan (or targeted range scan) and confirm the data is intact.
-  Post-compaction, versioning/age-off iterators in the `majc` stack will
-  have collapsed old versions — expect the compacted view, not the raw
-  pre-compaction cell count.
-- Confirm each compacted tablet now references exactly one `file:` entry
-  (Accumulo shell: `scan -t accumulo.metadata -c file` for the tablet
-  rows, or the monitor).
+  Versioning/age-off iterators in the `majc` stack may have collapsed old
+  versions, so expect the compacted view rather than the raw pre-compaction
+  cell count.
+- Confirm each compacted tablet references exactly one `file:` entry using
+  the monitor or supported Accumulo diagnostics.
 
 ---
 
