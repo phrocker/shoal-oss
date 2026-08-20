@@ -1933,7 +1933,7 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
     def test_commented_release_gate_narrative_is_rejected(self) -> None:
         commented = self._comment_out_paragraph(load_document_text(), "As of revision")
         self.assertIn(
-            "The remaining required gaps are 18",
+            "The remaining required gaps are 9",
             validator.normalize_whitespace(commented),
             "the sentence must survive for this to test rendering, not deletion",
         )
@@ -1982,7 +1982,7 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
             load_document_text(), "As of revision", "pre"
         )
         self.assertIn(
-            "The remaining required gaps are 18",
+            "The remaining required gaps are 9",
             validator.normalize_whitespace(wrapped),
             "the sentence must survive for this to test rendering, not deletion",
         )
@@ -2077,7 +2077,7 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
         text = load_document_text()
         relocated = self._relocate_paragraph(text, "As of revision")
         self.assertIn(
-            "The remaining required gaps are 18",
+            "The remaining required gaps are 9",
             validator.normalize_whitespace(relocated),
             "the sentence must survive somewhere for this to test relocation, not deletion",
         )
@@ -2471,15 +2471,15 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
 
     def test_pinned_inventory_constants_are_internally_consistent(self) -> None:
         validator.validate_pinned_inventory_constants()
-        self.assertEqual(validator.EXPECTED_REVISION, 50)
+        self.assertEqual(validator.EXPECTED_REVISION, 51)
         self.assertEqual(validator.EXPECTED_TOTAL_ROWS, 3203)
         self.assertEqual(validator.EXPECTED_REQUIRED_ROWS, 397)
         self.assertEqual(
             validator.EXPECTED_SCOPE_COUNTS,
             {
-                "Covered": 173,
+                "Covered": 233,
                 "Approved divergence": 94,
-                "Required gap": 130,
+                "Required gap": 70,
                 "Optional": 2763,
                 "Not required": 43,
             },
@@ -2487,10 +2487,10 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
         self.assertEqual(
             validator.EXPECTED_STATUS_COUNTS,
             {
-                "Covered": 236,
-                "Missing Go": 2218,
-                "Missing C ABI": 82,
-                "Behavior mismatch": 182,
+                "Covered": 296,
+                "Missing Go": 2209,
+                "Missing C ABI": 81,
+                "Behavior mismatch": 132,
                 validator.INTENTIONAL_DIVERGENCE_STATUS: 94,
                 validator.NOT_REQUIRED_STATUS: 391,
             },
@@ -2554,7 +2554,7 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
         lines[2] = "# Sharkbite source: unreviewed."
         self.assert_validation_fails(
             lambda: validator.validate_scope_manifest_provenance(lines),
-            "scope manifest provenance header does not match revision 50",
+            "scope manifest provenance header does not match revision 51",
         )
 
     def test_collect_c_abi_free_function_inventory_matches_header(self) -> None:
@@ -2681,17 +2681,17 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
             lambda: validator.validate_revision_inventory(
                 row_ids, reclassified, prefix_counts
             ),
-            f"revision {validator.EXPECTED_REVISION} inventory expects 236 rows for Covered, found 237",
+            f"revision {validator.EXPECTED_REVISION} inventory expects 296 rows for Covered, found 297",
         )
 
     def test_declared_count_edit_still_fails_internal_cross_check(self) -> None:
         text = load_document_text()
         mutated = replace_pattern_once(
-            text, re.escape("| Missing Go | 2218 |"), "| Missing Go | 2217 |"
+            text, re.escape("| Missing Go | 2209 |"), "| Missing Go | 2208 |"
         )
         self.assert_validation_fails(
             lambda: validator.validate_counts(mutated.splitlines(), mutated),
-            "status summary says 2217 rows for Missing Go, but parsed 2218",
+            "status summary says 2208 rows for Missing Go, but parsed 2209",
         )
 
     def test_stale_c_abi_symbol_inventory_narrative_is_rejected(self) -> None:
