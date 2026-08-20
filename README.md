@@ -2,10 +2,13 @@
 
 Shoal is an Accumulo-compatible sorted key-value engine and replacement
 runtime written in Go. It runs as a standalone embedded database, exposes Go,
-C, and Python client APIs, and can replace Accumulo scan, tablet-server, and
-compaction roles. RFile and Parquet are native storage formats; ShoalQL runs
-SQL, graph, document, exact-vector, and distributed IVF-PQ queries across
-local and Accumulo-backed data.
+C, and Python client APIs, and implements Accumulo-compatible scan,
+tablet-server, and compaction roles. Production replacement remains gated by
+the live conformance verdicts tracked in
+[issue #74](https://github.com/phrocker/shoal-oss/issues/74). RFile and
+Parquet are native storage formats; ShoalQL runs SQL, graph, document,
+exact-vector, and distributed IVF-PQ queries across local and Accumulo-backed
+data.
 
 See [`FEATURES.md`](FEATURES.md) for the complete capability matrix, current
 validation state, and the few remaining external platform gates.
@@ -17,13 +20,13 @@ validation state, and the few remaining external platform gates.
 | Run a local database with RFile or Parquet | [Embedded engine](#embedded-engine-standalone-no-zookeeper) |
 | Use Sharkbite-compatible Python APIs | [`python/README.md`](python/README.md) |
 | Embed the Go client or stable C ABI | [`accumulo/`](accumulo/) · [`capi/README.md`](capi/README.md) |
-| Run Shoal replacement roles with Accumulo | [`FEATURES.md`](FEATURES.md#accumulo-replacement-roles) · [`docs/tserver-hosting-lifecycle.md`](docs/tserver-hosting-lifecycle.md) |
+| Evaluate Shoal replacement roles with Accumulo | [`FEATURES.md`](FEATURES.md#accumulo-replacement-roles) · [`docs/tserver-hosting-lifecycle.md`](docs/tserver-hosting-lifecycle.md) |
 | Run graph, document, SQL, or vector search | [`FEATURES.md`](FEATURES.md#query-and-indexing) · [`docs/ai-knowledge-graph.md`](docs/ai-knowledge-graph.md) |
 | Validate against an exact Accumulo 4 cluster | [`test/accumulo/README.md`](test/accumulo/README.md) |
 
 ## Quick start
 
-Prerequisites for local development are Go 1.25+, Python 3, and `make`.
+Prerequisites for local development are Go 1.25+, Python 3.9+, and `make`.
 Docker with Compose v2 is required only for live Accumulo conformance.
 
 ```bash
@@ -38,8 +41,9 @@ Run the embedded engine without ZooKeeper or Accumulo:
 ```bash
 go run ./cmd/shoal-embed init --table events --workload analytical \
   --data ~/.shoal/data
-go run ./cmd/shoal-embed write --table events --data ~/.shoal/data \
-  < mutations.jsonl
+printf '%s\n' \
+  '{"row":"event:1","entries":[{"cf":"meta","cq":"type","value":"login"}]}' |
+  go run ./cmd/shoal-embed write --table events --data ~/.shoal/data
 go run ./cmd/shoal-embed scan --table events --data ~/.shoal/data
 ```
 
@@ -49,6 +53,7 @@ Build and install the Sharkbite-compatible Python package:
 make capi
 python -m pip install ./python
 export SHOAL_LIBRARY="$PWD/bin/capi/libshoal.so"
+# macOS: export SHOAL_LIBRARY="$PWD/bin/capi/libshoal.dylib"
 ```
 
 On Windows PowerShell, use
