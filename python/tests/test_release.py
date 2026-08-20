@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import tomllib
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -18,6 +19,17 @@ class ReleasePolicyTests(unittest.TestCase):
         self.assertEqual(pysharkbite.__version__, sharkbite.__version__)
         self.assertIs(pysharkbite.Connector, sharkbite.Connector)
         self.assertIn("__version__", sharkbite.__all__)
+        self.assertEqual(pysharkbite.__all__, sharkbite.__all__)
+        for name in sharkbite.__all__:
+            self.assertIs(getattr(pysharkbite, name), getattr(sharkbite, name))
+
+    def test_distribution_metadata_contract(self):
+        project = tomllib.loads(
+            (Path(__file__).parents[1] / "pyproject.toml").read_text(encoding="utf-8")
+        )["project"]
+        self.assertEqual(project["name"], "shoal-sharkbite")
+        self.assertEqual(project["version"], sharkbite.__version__)
+        self.assertEqual(project["requires-python"], ">=3.9")
 
     def test_discovery_does_not_search_working_directory_by_default(self):
         with mock.patch.dict(os.environ, {}, clear=True):
