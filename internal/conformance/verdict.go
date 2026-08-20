@@ -34,7 +34,7 @@ import (
 )
 
 const (
-	SchemaVersion    = 1
+	SchemaVersion    = 2
 	AccumuloVersion  = "4.0.0-SNAPSHOT"
 	AccumuloRevision = "1a716b2c1bb5762ead4b46d2bc4f53e13873b314"
 )
@@ -65,19 +65,24 @@ type Metadata struct {
 }
 
 type Evidence struct {
+	Gate          string   `json:"gate"`
 	Kind          string   `json:"kind"`
 	Reference     string   `json:"reference"`
+	SourceSHA256  string   `json:"source_sha256"`
 	ReplayCommand []string `json:"replay_command,omitempty"`
 }
 
 type Gate struct {
-	Role          string     `json:"role"`
-	Required      bool       `json:"required"`
-	State         State      `json:"state"`
-	Summary       string     `json:"summary"`
-	Evidence      []Evidence `json:"evidence"`
-	ReplayFixture string     `json:"replay_fixture"`
-	FixtureSHA256 string     `json:"fixture_sha256"`
+	Role                 string     `json:"role"`
+	Adapter              string     `json:"adapter"`
+	Required             bool       `json:"required"`
+	State                State      `json:"state"`
+	EvidenceState        State      `json:"evidence_state"`
+	Summary              string     `json:"summary"`
+	MissingRequiredGates []string   `json:"missing_required_gates"`
+	Evidence             []Evidence `json:"evidence"`
+	ReplayFixture        string     `json:"replay_fixture"`
+	FixtureSHA256        string     `json:"fixture_sha256"`
 }
 
 type Verdict struct {
@@ -89,10 +94,45 @@ type Verdict struct {
 type Fixture struct {
 	SchemaVersion    int        `json:"schema_version"`
 	Role             string     `json:"role"`
+	Adapter          string     `json:"adapter"`
 	AccumuloVersion  string     `json:"accumulo_version"`
 	AccumuloRevision string     `json:"accumulo_revision"`
 	Summary          string     `json:"summary"`
 	Evidence         []Evidence `json:"evidence"`
+}
+
+type adapterSpec struct {
+	Name          string
+	RequiredGates []string
+	LiveGate      string
+}
+
+var adapters = map[string]adapterSpec{
+	"client": {
+		Name:          "client-contract-v1",
+		RequiredGates: []string{"crud", "visibility", "range", "pinned-java-client-lifecycle"},
+		LiveGate:      "pinned-java-client-lifecycle",
+	},
+	"promotion": {
+		Name:          "promotion-equivalence-v1",
+		RequiredGates: []string{"before-after-equivalence", "live-destination-equivalence"},
+		LiveGate:      "live-destination-equivalence",
+	},
+	"scanserver": {
+		Name:          "stateful-scan-continuation-v1",
+		RequiredGates: []string{"stateful-continuation", "live-scanserver-process"},
+		LiveGate:      "live-scanserver-process",
+	},
+	"tserver": {
+		Name:          "tserver-lifecycle-v1",
+		RequiredGates: []string{"service-lock-lifecycle", "assignment-lifecycle", "live-tserver-process"},
+		LiveGate:      "live-tserver-process",
+	},
+	"compactor": {
+		Name:          "compactor-executor-v1",
+		RequiredGates: []string{"publication", "completion", "live-compactor-process"},
+		LiveGate:      "live-compactor-process",
+	},
 }
 
 type CommandResult struct {
@@ -179,6 +219,7 @@ func Run(ctx context.Context, opts Options) (Verdict, int, error) {
 		if loadErr != nil {
 			gate.Role = role
 			gate.State = Fail
+			gate.EvidenceState = Fail
 			gate.Summary = loadErr.Error()
 			verdict.Gates = append(verdict.Gates, gate)
 			continue
@@ -186,17 +227,28 @@ func Run(ctx context.Context, opts Options) (Verdict, int, error) {
 		if fixture.Role != role {
 			gate.Role = role
 			gate.State = Fail
+			gate.EvidenceState = Fail
 			gate.Summary = fmt.Sprintf("replay fixture declares role %q", fixture.Role)
+			verdict.Gates = append(verdict.Gates, gate)
+			continue
+		}
+		spec := adapters[role]
+		if fixture.Adapter != spec.Name {
+			gate.State = Fail
+			gate.EvidenceState = Fail
+			gate.Summary = fmt.Sprintf("replay fixture declares adapter %q, want %q", fixture.Adapter, spec.Name)
 			verdict.Gates = append(verdict.Gates, gate)
 			continue
 		}
 		if !gate.Required {
 			gate.State = Skipped
+			gate.EvidenceState = Skipped
 			gate.Summary = "gate not selected as required"
-		} else if opts.Mode == "live" {
-			runLive(ctx, opts, &verdict, &gate)
 		} else {
-			runReplay(ctx, opts, fixture, &gate)
+			runAdapter(ctx, opts, fixture, spec, &gate)
+			if gate.EvidenceState == Pass && opts.Mode == "live" {
+				runLive(ctx, opts, spec, &verdict, &gate)
+			}
 		}
 		verdict.Gates = append(verdict.Gates, gate)
 	}
@@ -238,11 +290,12 @@ func loadFixture(root, relative string) (Gate, Fixture, error) {
 	if fixture.AccumuloVersion != AccumuloVersion || fixture.AccumuloRevision != AccumuloRevision {
 		return gate, Fixture{}, fmt.Errorf("replay fixture %s targets a different Accumulo build", relative)
 	}
-	if fixture.Role == "" || fixture.Summary == "" || len(fixture.Evidence) == 0 {
+	if fixture.Role == "" || fixture.Adapter == "" || fixture.Summary == "" || len(fixture.Evidence) == 0 {
 		return gate, Fixture{}, fmt.Errorf("replay fixture %s is incomplete", relative)
 	}
 	for _, evidence := range fixture.Evidence {
-		if evidence.Kind == "" || evidence.Reference == "" || len(evidence.ReplayCommand) == 0 {
+		if evidence.Gate == "" || evidence.Kind == "" || evidence.Reference == "" ||
+			evidence.SourceSHA256 == "" || len(evidence.ReplayCommand) == 0 {
 			return gate, Fixture{}, fmt.Errorf("replay fixture %s contains incomplete evidence", relative)
 		}
 		referencePath := strings.SplitN(evidence.Reference, "#", 2)[0]
@@ -257,18 +310,35 @@ func loadFixture(root, relative string) (Gate, Fixture, error) {
 			!bytes.Contains(content, []byte(fragment[1])) {
 			return gate, Fixture{}, fmt.Errorf("evidence symbol %s is absent", evidence.Reference)
 		}
+		sum := sha256.Sum256(normalizeSource(content))
+		if actual := hex.EncodeToString(sum[:]); actual != evidence.SourceSHA256 {
+			return gate, Fixture{}, fmt.Errorf(
+				"stale evidence %s: source sha256 %s, fixture has %s",
+				evidence.Reference, actual, evidence.SourceSHA256,
+			)
+		}
 	}
 	gate.Role = fixture.Role
+	gate.Adapter = fixture.Adapter
 	gate.Summary = fixture.Summary
 	gate.Evidence = fixture.Evidence
 	return gate, fixture, nil
 }
 
-func runReplay(ctx context.Context, opts Options, fixture Fixture, gate *Gate) {
+func runAdapter(ctx context.Context, opts Options, fixture Fixture, spec adapterSpec, gate *Gate) {
+	covered := make(map[string]bool, len(fixture.Evidence))
 	for _, evidence := range fixture.Evidence {
+		if !slices.Contains(spec.RequiredGates, evidence.Gate) {
+			gate.State = Fail
+			gate.EvidenceState = Fail
+			gate.Summary = fmt.Sprintf("adapter %s does not declare evidence gate %q", spec.Name, evidence.Gate)
+			return
+		}
+		covered[evidence.Gate] = true
 		result := opts.Executor.Run(ctx, opts.Root, evidence.ReplayCommand)
 		if result.ExitCode != 0 {
 			gate.State = Fail
+			gate.EvidenceState = Fail
 			gate.Summary = fmt.Sprintf(
 				"replay failed for %s (exit %d): %s",
 				evidence.Reference,
@@ -278,20 +348,52 @@ func runReplay(ctx context.Context, opts Options, fixture Fixture, gate *Gate) {
 			return
 		}
 	}
+	gate.EvidenceState = Pass
+	gate.MissingRequiredGates = missingGates(spec.RequiredGates, covered)
+	if len(gate.MissingRequiredGates) != 0 {
+		gate.State = Unsupported
+		gate.Summary = "adapter evidence passed; required production gates are not wired"
+		return
+	}
 	gate.State = Pass
 }
 
-func runLive(ctx context.Context, opts Options, verdict *Verdict, gate *Gate) {
+func missingGates(required []string, covered map[string]bool) []string {
+	var missing []string
+	for _, name := range required {
+		if !covered[name] {
+			missing = append(missing, name)
+		}
+	}
+	return missing
+}
+
+func runLive(ctx context.Context, opts Options, spec adapterSpec, verdict *Verdict, gate *Gate) {
 	if gate.Role != "client" {
 		gate.State = Unsupported
-		gate.Summary = "the live Accumulo harness has no Shoal role adapter for this gate"
+		gate.Summary = "adapter evidence passed; the live Accumulo harness has no Shoal process wiring for this role"
 		return
 	}
 	command := []string{"python", "test/accumulo/harness.py", "test"}
+	harnessSHA, err := sourceSHA256(opts.Root, "test/accumulo/harness.py")
+	if err != nil {
+		gate.State = Fail
+		gate.Summary = err.Error()
+		return
+	}
 	result := opts.Executor.Run(ctx, opts.Root, command)
 	switch result.ExitCode {
 	case 0:
-		gate.State = Pass
+		gate.MissingRequiredGates = slices.DeleteFunc(gate.MissingRequiredGates, func(name string) bool {
+			return name == spec.LiveGate
+		})
+		if len(gate.MissingRequiredGates) == 0 {
+			gate.State = Pass
+			gate.Summary = "adapter evidence and pinned Java client lifecycle passed"
+		} else {
+			gate.State = Unsupported
+			gate.Summary = "live client lifecycle passed; required adapter gates remain unwired"
+		}
 		verdict.Metadata.Environment.Docker = "available"
 	case 2:
 		gate.State = Unsupported
@@ -303,10 +405,25 @@ func runLive(ctx context.Context, opts Options, verdict *Verdict, gate *Gate) {
 		verdict.Metadata.Environment.Docker = "available"
 	}
 	gate.Evidence = append(gate.Evidence, Evidence{
+		Gate:          spec.LiveGate,
 		Kind:          "live-command",
 		Reference:     "test/accumulo/harness.py#full_run",
+		SourceSHA256:  harnessSHA,
 		ReplayCommand: command,
 	})
+}
+
+func sourceSHA256(root, relative string) (string, error) {
+	content, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(relative)))
+	if err != nil {
+		return "", fmt.Errorf("read evidence %s: %w", relative, err)
+	}
+	sum := sha256.Sum256(normalizeSource(content))
+	return hex.EncodeToString(sum[:]), nil
+}
+
+func normalizeSource(content []byte) []byte {
+	return bytes.ReplaceAll(content, []byte("\r\n"), []byte("\n"))
 }
 
 func ExitCode(verdict Verdict) int {
