@@ -26,7 +26,9 @@ before applying any record from a WAL, repairs an incomplete trailing frame,
 rejects checksum/interior corruption, sorts by sequence, and deduplicates by
 operation identity.
 
-Rollover leaves old references in metadata. The next minor-compaction slice
-must atomically publish its RFile and delete the corresponding WAL references;
-only after that commit may it call `Tablet.Retire`. This package intentionally
-does not claim that metadata transaction.
+Rollover leaves old references in metadata. `internal/mincauthority` now owns
+the next boundary: it checkpoints a stable memtable/WAL snapshot, publishes
+and validates a native RFile, then atomically adds that file and removes only
+the covered WAL references. The hosted-tablet adapter may call `Tablet.Retire`
+only after that metadata commit. The adapter and ingest Thrift service wiring
+remain future work.

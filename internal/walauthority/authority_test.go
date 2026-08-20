@@ -187,6 +187,89 @@ func testRequest(id string, value byte) ingestrouter.CommitRequest {
 	}
 }
 
+func TestSealForMinorCompactionMakesAtomicSequenceBoundary(t *testing.T) {
+	store := newMemoryStore(nil)
+	metadata := newMemoryMetadata(nil)
+	sink := newSink(nil)
+	cfg := testConfig(store, metadata, sink, &verifier{})
+	ids := []string{
+		"11111111-1111-4111-8111-111111111111",
+		"22222222-2222-4222-8222-222222222222",
+	}
+	cfg.NewID = func() string {
+		id := ids[0]
+		ids = ids[1:]
+		return id
+	}
+	tablet, _, err := Open(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tablet.Commit(context.Background(), testRequest("before", 1)); err != nil {
+		t.Fatal(err)
+	}
+	var captured MinorCompactionBoundary
+	boundary, err := tablet.SealForMinorCompaction(context.Background(), func(value MinorCompactionBoundary) error {
+		captured = value
+		sink.mu.Lock()
+		defer sink.mu.Unlock()
+		if len(sink.ops) != 1 || sink.ops[0].OperationID != "before" {
+			t.Fatalf("snapshot observed operations %+v", sink.ops)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if boundary.Sequence != 1 || captured.Sequence != 1 || len(boundary.References) != 1 {
+		t.Fatalf("boundary=%+v captured=%+v", boundary, captured)
+	}
+	if err := tablet.Commit(context.Background(), testRequest("after", 2)); err != nil {
+		t.Fatal(err)
+	}
+	refs, err := metadata.References(context.Background(), cfg.Extent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(refs) != 2 {
+		t.Fatalf("references=%+v", refs)
+	}
+	sink.mu.Lock()
+	defer sink.mu.Unlock()
+	if len(sink.ops) != 2 || sink.ops[1].Sequence != 2 {
+		t.Fatalf("operations=%+v", sink.ops)
+	}
+}
+
+func TestSealForMinorCompactionCallbackFailureDoesNotRoll(t *testing.T) {
+	store := newMemoryStore(nil)
+	metadata := newMemoryMetadata(nil)
+	cfg := testConfig(store, metadata, newSink(nil), &verifier{})
+	tablet, _, err := Open(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tablet.Commit(context.Background(), testRequest("before", 1)); err != nil {
+		t.Fatal(err)
+	}
+	want := errors.New("snapshot failed")
+	if _, err := tablet.SealForMinorCompaction(context.Background(), func(MinorCompactionBoundary) error {
+		return want
+	}); !errors.Is(err, want) {
+		t.Fatalf("got %v, want callback failure", err)
+	}
+	if err := tablet.Commit(context.Background(), testRequest("after", 2)); err != nil {
+		t.Fatal(err)
+	}
+	refs, err := metadata.References(context.Background(), cfg.Extent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(refs) != 1 {
+		t.Fatalf("failed seal rolled WAL: %+v", refs)
+	}
+}
+
 func openTest(t *testing.T, store *memoryStore, metadata *memoryMetadata, sink *recordingSink, verify *verifier) *Tablet {
 	t.Helper()
 	tablet, _, err := Open(context.Background(), testConfig(store, metadata, sink, verify))
