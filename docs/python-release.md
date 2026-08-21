@@ -107,14 +107,59 @@ To validate the current `main` revision without publishing:
 
 Publication is deliberately release-bound. Publishing a GitHub release for
 `vMAJOR.MINOR.PATCH` automatically builds and uploads the wheel, sdist,
-manifest, and checksums. The tag must exactly match the version in
-`python/pyproject.toml`. Manual dispatches only validate and retain workflow
-artifacts; they cannot publish release assets. Uploads do not use `--clobber`;
-an existing same-named asset causes the publication job to fail rather than
-silently replacing released bytes. The artifact build job has read-only
-repository permissions for every trigger. Separate trusted non-pull-request
-jobs receive only the attestation permissions or release-event
-`contents: write` permission they require.
+manifest, and checksums to the GitHub release, then publishes the exact
+previously built wheel and sdist to the **`shoal-sharkbite`** PyPI project.
+The tag must exactly match the version in `python/pyproject.toml`. Tag pushes
+alone build and validate but do not publish.
+
+Manual dispatch is safe by default: `publish_to_pypi` defaults to false, so a
+normal dispatch only validates and retains workflow artifacts. A manual PyPI
+publication requires all three controls: select the matching version tag as
+the workflow ref, explicitly enable `publish_to_pypi`, and receive approval
+from the protected `pypi` GitHub environment. Selecting a branch with the
+publish input enabled fails before publication.
+
+The PyPI job downloads the run artifact produced by the read-only build job,
+then independently verifies the exact wheel/sdist set, every size and SHA-256
+digest in `release-manifest.json`, `SHA256SUMS`, source commit, package name,
+version tag, and platform before copying only the two distributions into the
+upload directory. PyPI authentication uses Trusted Publishing OIDC in the
+isolated job with `id-token: write`; no PyPI username, API token, repository
+secret, or environment secret is used. The pinned PyPA publish action also
+uploads PyPI attestations.
+
+GitHub release uploads do not use `--clobber`; an existing same-named asset
+causes publication to fail rather than silently replacing released bytes. The
+artifact build job has read-only repository permissions for every trigger.
+Separate jobs receive only the GitHub attestation, GitHub release, or PyPI OIDC
+permissions they require.
+
+### One-time PyPI and GitHub configuration
+
+The distribution/project name is **`shoal-sharkbite`**. It owns and installs
+the `sharkbite` and `pysharkbite` import packages, but it does not claim or
+publish to the separately reserved `sharkbite` PyPI project. The Shoal
+maintainers must own or maintain `shoal-sharkbite` on PyPI.
+
+Configure the publisher once:
+
+1. In repository **Settings → Environments**, create an environment named
+   exactly `pypi`. Require designated maintainer approval, restrict deployment
+   branches/tags to protected `v*` release tags, and prevent unreviewed
+   environment bypass according to repository policy. Store no PyPI secret.
+2. In the `shoal-sharkbite` PyPI project's **Publishing** settings, add a
+   GitHub trusted publisher with owner `phrocker`, repository `shoal-oss`,
+   workflow `python-manylinux-release.yml`, and environment `pypi`.
+3. If the PyPI project does not yet exist, create a pending trusted publisher
+   for the same `shoal-sharkbite` project and identity, then let the first
+   intentional approved release create it. Ensure the organization project
+   owners and maintainers are recorded in PyPI after creation.
+
+Trusted Publisher values are identity-sensitive; changing the repository,
+workflow filename, or environment requires updating PyPI before the next
+release. Validation runs must not be used to test public publication. Build,
+install, import, and native ABI evidence is proved in the separate read-only
+build job and can run without PyPI configuration.
 
 `verify_release.py` validates both archives and manifests, then installs the
 wheel into a fresh project-local virtual environment with `--no-index` and
