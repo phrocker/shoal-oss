@@ -139,3 +139,36 @@ jobs:
 
       - name: Test (race)
         run: go test -race -count=1 ${{ steps.pkgs.outputs.list }}
+
+  docker:
+    name: docker image
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # amd64 is built natively and loaded so the binaries can actually be run.
+      - name: Build image (linux/amd64)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: shoal:ci
+
+      - name: Smoke test the image
+        run: docker run --rm shoal:ci
+
+      # The Dockerfile pins its build stage to the native platform and drives
+      # the target through GOOS/GOARCH, so arm64 cross-compiles without QEMU.
+      # Nothing is pushed; this only proves the foreign-arch image assembles.
+      - name: Build image (linux/arm64)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/arm64
+          push: false
