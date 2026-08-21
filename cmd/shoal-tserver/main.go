@@ -232,6 +232,7 @@ func main() {
 	ingest, err := ingestservice.New(ingestservice.Config{
 		Router: router, Authenticator: authenticator,
 		ConditionalReader: scans,
+		Logger:            logger,
 		TserverLock: func() string {
 			lock, ok := host.Lock()
 			if !ok {

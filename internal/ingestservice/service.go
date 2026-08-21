@@ -11,9 +11,12 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -58,6 +61,7 @@ type Config struct {
 	MaxSessionBytes   int64
 	SessionTTL        time.Duration
 	Now               func() time.Time
+	Logger            *slog.Logger
 }
 
 type Metrics struct {
@@ -73,6 +77,7 @@ type Metrics struct {
 
 type Service struct {
 	cfg Config
+	log *slog.Logger
 
 	mu                  sync.Mutex
 	drainDone           chan struct{}
@@ -97,9 +102,14 @@ type conditionalSession struct {
 	credentials    *security.TCredentials
 	authorizations [][]byte
 	tableID        string
-	results        map[int64]data.TCMStatus
+	results        map[conditionalResultKey]data.TCMStatus
 	lastUsed       time.Time
 	closed         bool
+}
+
+type conditionalResultKey struct {
+	id     int64
+	digest [sha256.Size]byte
 }
 
 type updateSession struct {
@@ -145,12 +155,15 @@ func New(cfg Config) (*Service, error) {
 	if cfg.Now == nil {
 		cfg.Now = time.Now
 	}
+	if cfg.Logger == nil {
+		cfg.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	}
 	var seed [8]byte
 	if _, err := rand.Read(seed[:]); err != nil {
 		return nil, fmt.Errorf("ingestservice: session id seed: %w", err)
 	}
 	s := &Service{
-		cfg: cfg, sessions: make(map[data.UpdateID]*updateSession),
+		cfg: cfg, log: cfg.Logger, sessions: make(map[data.UpdateID]*updateSession),
 		conditionalSessions: make(map[data.UpdateID]*conditionalSession),
 		drainDone:           make(chan struct{}),
 	}
@@ -284,6 +297,10 @@ func (s *Service) ApplyUpdates(
 	case outcome.Status == ingestrouter.OutcomeRetry:
 		session.recordFailure(keyExtent, session.committedPrefix(keyExtent))
 		s.retriedBatches.Add(1)
+		s.log.WarnContext(ctx, "ingest mutation retry",
+			"table", extent.TableID,
+			"error", errors.Join(applyErr, outcome.Cause),
+		)
 	default:
 		session.recordFailure(keyExtent, session.committedPrefix(keyExtent))
 		s.rejectedBatches.Add(1)
@@ -376,7 +393,7 @@ func (s *Service) StartConditionalUpdate(
 	s.conditionalSessions[id] = &conditionalSession{
 		ctx: sessionCtx, cancel: cancel, credentials: cloneCredentials(credentials),
 		authorizations: cloneBytesList(authorizations), tableID: tableID,
-		results: make(map[int64]data.TCMStatus), lastUsed: now,
+		results: make(map[conditionalResultKey]data.TCMStatus), lastUsed: now,
 	}
 	s.mu.Unlock()
 	s.started.Add(1)
@@ -429,13 +446,18 @@ func (s *Service) ConditionalUpdate(
 			if mutation == nil || mutation.Mutation == nil {
 				continue
 			}
-			if status, ok := session.results[mutation.ID]; ok {
+			resultKey := conditionalResultKey{
+				id: mutation.ID, digest: conditionalMutationDigest(mutation),
+			}
+			if status, ok := session.results[resultKey]; ok {
 				results = append(results, &data.TCMResult_{Cmid: mutation.ID, Status: status})
 				continue
 			}
-			status := s.applyConditional(ctx, updateID, session, extent, mutation, symbols)
+			status := s.applyConditional(
+				ctx, updateID, session, extent, mutation, resultKey.digest, symbols,
+			)
 			if status != data.TCMStatus_IGNORED {
-				session.results[mutation.ID] = status
+				session.results[resultKey] = status
 			}
 			results = append(results, &data.TCMResult_{Cmid: mutation.ID, Status: status})
 		}
@@ -449,6 +471,7 @@ func (s *Service) applyConditional(
 	session *conditionalSession,
 	extent ingestrouter.Extent,
 	wireMutation *data.TConditionalMutation,
+	mutationDigest [sha256.Size]byte,
 	symbols []string,
 ) data.TCMStatus {
 	for _, condition := range wireMutation.Conditions {
@@ -470,7 +493,7 @@ func (s *Service) applyConditional(
 	accepted, err := s.cfg.Router.ConditionalCommit(
 		ctx,
 		fmt.Sprintf("%d:%s", updateID, extent.TableID),
-		fmt.Sprintf("conditional:%d", wireMutation.ID),
+		fmt.Sprintf("conditional:%d:%x", wireMutation.ID, mutationDigest),
 		ingestrouter.Batch{Extent: extent, Mutations: []ingestrouter.Mutation{mutation}},
 		func(ctx context.Context, active []ingestrouter.Cell) (bool, error) {
 			base, err := s.cfg.ConditionalReader.ReadConditionalRow(
@@ -487,6 +510,11 @@ func (s *Service) applyConditional(
 	)
 	if err != nil {
 		s.retriedBatches.Add(1)
+		s.log.WarnContext(ctx, "conditional mutation retry",
+			"table", extent.TableID,
+			"mutation_id", wireMutation.ID,
+			"error", err,
+		)
 		return data.TCMStatus_IGNORED
 	}
 	if !accepted {
@@ -496,6 +524,52 @@ func (s *Service) applyConditional(
 	s.appliedBatches.Add(1)
 	s.appliedMutations.Add(1)
 	return data.TCMStatus_ACCEPTED
+}
+
+func conditionalMutationDigest(mutation *data.TConditionalMutation) [sha256.Size]byte {
+	hash := sha256.New()
+	writeDigestInt64(hash, mutation.ID)
+	for _, condition := range mutation.Conditions {
+		if condition == nil {
+			writeDigestInt64(hash, -1)
+			continue
+		}
+		writeDigestBytes(hash, condition.Cf)
+		writeDigestBytes(hash, condition.Cq)
+		writeDigestBytes(hash, condition.Cv)
+		writeDigestInt64(hash, condition.Ts)
+		if condition.HasTimestamp {
+			writeDigestInt64(hash, 1)
+		} else {
+			writeDigestInt64(hash, 0)
+		}
+		writeDigestBytes(hash, condition.Val)
+		writeDigestBytes(hash, condition.Iterators)
+	}
+	wire := mutation.Mutation
+	writeDigestBytes(hash, wire.Row)
+	writeDigestBytes(hash, wire.Data)
+	writeDigestInt64(hash, int64(wire.Entries))
+	for _, value := range wire.Values {
+		writeDigestBytes(hash, value)
+	}
+	for _, source := range wire.Sources {
+		writeDigestBytes(hash, []byte(source))
+	}
+	var digest [sha256.Size]byte
+	copy(digest[:], hash.Sum(nil))
+	return digest
+}
+
+func writeDigestBytes(hash interface{ Write([]byte) (int, error) }, value []byte) {
+	writeDigestInt64(hash, int64(len(value)))
+	_, _ = hash.Write(value)
+}
+
+func writeDigestInt64(hash interface{ Write([]byte) (int, error) }, value int64) {
+	var encoded [8]byte
+	binary.BigEndian.PutUint64(encoded[:], uint64(value))
+	_, _ = hash.Write(encoded[:])
 }
 
 func conditionsMatch(

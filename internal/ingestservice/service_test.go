@@ -321,10 +321,38 @@ func TestConditionalUpdateAcceptsRejectsAndCachesResults(t *testing.T) {
 	if err != nil || len(results) != 1 || results[0].Status != data.TCMStatus_ACCEPTED {
 		t.Fatalf("cached result = %#v, %v", results, err)
 	}
+	replacementMutation, _ := cclient.NewMutation([]byte("a"))
+	replacementMutation.PutLatest(
+		[]byte("cf"), []byte("cq2"), []byte("A"), []byte("replacement"),
+	)
+	replacementWire, err := replacementMutation.ToThrift()
+	if err != nil {
+		t.Fatal(err)
+	}
+	reusedID := &data.TConditionalMutation{
+		ID: 11, Mutation: replacementWire,
+		Conditions: []*data.TCondition{{
+			Cf: []byte("cf"), Cq: []byte("cq"), Val: []byte("old"),
+		}},
+	}
+	results, err = service.ConditionalUpdate(
+		context.Background(), nil, data.UpdateID(session.SessionId),
+		data.CMBatch{testExtent("1", "z"): {reusedID}}, nil,
+	)
+	if err != nil || len(results) != 1 || results[0].Status != data.TCMStatus_ACCEPTED {
+		t.Fatalf("reused mutation ID result = %#v, %v", results, err)
+	}
+	results, err = service.ConditionalUpdate(
+		context.Background(), nil, data.UpdateID(session.SessionId),
+		data.CMBatch{testExtent("1", "z"): {accepted}}, nil,
+	)
+	if err != nil || len(results) != 1 || results[0].Status != data.TCMStatus_ACCEPTED {
+		t.Fatalf("original cached result after ID reuse = %#v, %v", results, err)
+	}
 	tablet.mu.Lock()
 	defer tablet.mu.Unlock()
-	if len(tablet.commits) != 1 {
-		t.Fatalf("commits = %d, want 1", len(tablet.commits))
+	if len(tablet.commits) != 2 {
+		t.Fatalf("commits = %d, want 2", len(tablet.commits))
 	}
 }
 
