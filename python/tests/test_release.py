@@ -14,6 +14,24 @@ from sharkbite._native import _verify_bundled_library, library_candidates
 
 
 class ReleasePolicyTests(unittest.TestCase):
+    def test_workflow_uses_guarded_tokenless_pypi_publishing(self):
+        workflow = (
+            Path(__file__).parents[2]
+            / ".github"
+            / "workflows"
+            / "python-manylinux-release.yml"
+        ).read_text(encoding="utf-8")
+        self.assertIn("publish_to_pypi:", workflow)
+        self.assertIn("default: false", workflow)
+        self.assertIn("environment:\n      name: pypi", workflow)
+        self.assertIn("url: https://pypi.org/p/shoal-sharkbite", workflow)
+        self.assertIn("id-token: write", workflow)
+        self.assertIn("pypa/gh-action-pypi-publish@", workflow)
+        self.assertIn("Verify exact publish subjects", workflow)
+        self.assertIn("github.ref_type == 'tag'", workflow)
+        self.assertNotIn("PYPI_API_TOKEN", workflow)
+        self.assertNotRegex(workflow, r"(?m)^\s+password:")
+
     def test_import_names_share_version_and_public_api(self):
         self.assertEqual(sharkbite.__version__, "0.5.0")
         self.assertEqual(pysharkbite.__version__, sharkbite.__version__)

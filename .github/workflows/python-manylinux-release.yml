@@ -2,6 +2,12 @@ name: Publish Python manylinux artifacts
 
 on:
   workflow_dispatch:
+    inputs:
+      publish_to_pypi:
+        description: "Publish from the selected version tag after pypi environment approval"
+        required: true
+        default: false
+        type: boolean
   push:
     tags:
       - "v*"
@@ -50,6 +56,7 @@ jobs:
         shell: bash
         env:
           EVENT_NAME: ${{ github.event_name }}
+          PUBLISH_TO_PYPI: ${{ inputs.publish_to_pypi }}
           RELEASE_TAG: ${{ github.event.release.tag_name }}
           REF_TYPE: ${{ github.ref_type }}
         run: |
@@ -64,6 +71,10 @@ jobs:
           esac
           if [[ -n "$tag" && "$tag" != "v${version}" ]]; then
             echo "::error::Tag ${tag} does not match shoal-sharkbite ${version}"
+            exit 1
+          fi
+          if [[ "$EVENT_NAME" == "workflow_dispatch" && "$PUBLISH_TO_PYPI" == "true" && "$REF_TYPE" != "tag" ]]; then
+            echo "::error::Manual PyPI publication requires selecting the matching version tag"
             exit 1
           fi
 
@@ -124,7 +135,7 @@ jobs:
             dist/SHA256SUMS
             dist/release-manifest.json
 
-  publish:
+  github-release:
     name: Publish GitHub release assets
     if: github.event_name == 'release'
     needs: [build, attest]
@@ -144,3 +155,80 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: gh release upload "$RELEASE_TAG" dist/* --repo "$GITHUB_REPOSITORY"
+
+  pypi-publish:
+    name: Publish shoal-sharkbite to PyPI
+    if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.publish_to_pypi && github.ref_type == 'tag')
+    needs: [build, attest]
+    runs-on: ubuntu-24.04
+    environment:
+      name: pypi
+      url: https://pypi.org/p/shoal-sharkbite
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Download verified artifacts
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+        with:
+          name: shoal-sharkbite-manylinux-${{ github.sha }}
+          path: dist
+
+      - name: Verify exact publish subjects
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || github.ref_name }}
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          dist = Path("dist")
+          manifest = json.loads((dist / "release-manifest.json").read_text())
+          artifacts = manifest["artifacts"]
+          expected = {item["filename"]: item for item in artifacts}
+          archives = sorted(
+              path for path in dist.iterdir()
+              if path.name.endswith((".whl", ".tar.gz"))
+          )
+          if len(archives) != 2 or {path.name for path in archives} != set(expected):
+              raise SystemExit("downloaded wheel/sdist set differs from release manifest")
+          for path in archives:
+              digest = hashlib.sha256(path.read_bytes()).hexdigest()
+              item = expected[path.name]
+              if digest != item["sha256"] or path.stat().st_size != item["size"]:
+                  raise SystemExit(f"release artifact mismatch: {path.name}")
+          sums = {
+              name: digest
+              for digest, name in (
+                  line.split("  ", 1)
+                  for line in (dist / "SHA256SUMS").read_text().splitlines()
+              )
+          }
+          if sums != {name: item["sha256"] for name, item in expected.items()}:
+              raise SystemExit("SHA256SUMS differs from release manifest")
+          if manifest["source"] != {
+              "commit": os.environ["GITHUB_SHA"],
+              "dirty": False,
+              "source_date_epoch": manifest["source"]["source_date_epoch"],
+          }:
+              raise SystemExit("release manifest source does not match the event commit")
+          if manifest["package"]["name"] != "shoal-sharkbite":
+              raise SystemExit("unexpected PyPI project name")
+          if os.environ["RELEASE_TAG"] != f'v{manifest["package"]["version"]}':
+              raise SystemExit("release tag does not match package version")
+          if manifest["platform_tag"] != "manylinux_2_28_x86_64":
+              raise SystemExit("unexpected wheel platform")
+          publish = dist / "publish"
+          publish.mkdir()
+          for path in archives:
+              (publish / path.name).write_bytes(path.read_bytes())
+          PY
+
+      - name: Publish with PyPI Trusted Publishing
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
+        with:
+          packages-dir: dist/publish/
+          print-hash: true
