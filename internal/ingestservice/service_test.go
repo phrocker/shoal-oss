@@ -443,6 +443,44 @@ func TestSessionExpiryBackpressureAndDrain(t *testing.T) {
 	}
 }
 
+func TestSessionExpirySkipsActiveConditionalSession(t *testing.T) {
+	now := time.Unix(100, 0)
+	service := newTestService(t, func(cfg *Config) {
+		cfg.ConditionalReader = fakeConditionalReader{}
+		cfg.TserverLock = func() string { return "lock" }
+		cfg.SessionTTL = time.Second
+		cfg.Now = func() time.Time { return now }
+	}, &fakeDirectory{tablets: make(map[string]*fakeTablet), errs: make(map[string]error)})
+	first, err := service.StartConditionalUpdate(
+		context.Background(), nil, testCredentials(), nil, "1",
+		tabletingest.TDurability_SYNC, "",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := service.conditionalSessions[data.UpdateID(first.SessionId)]
+	session.mu.Lock()
+	now = now.Add(2 * time.Second)
+
+	started := make(chan error, 1)
+	go func() {
+		_, err := service.StartConditionalUpdate(
+			context.Background(), nil, testCredentials(), nil, "1",
+			tabletingest.TDurability_SYNC, "",
+		)
+		started <- err
+	}()
+	select {
+	case err := <-started:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("starting a nested conditional session blocked on active-session expiration")
+	}
+	session.mu.Unlock()
+}
+
 func TestConcurrentCancelAndApply(t *testing.T) {
 	extent := ingestrouter.Extent{TableID: "1", EndRow: []byte("z")}
 	service := newTestService(t, nil, &fakeDirectory{

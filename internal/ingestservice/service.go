@@ -674,7 +674,9 @@ func (s *Service) removeConditionalSession(id data.UpdateID) *conditionalSession
 
 func (s *Service) expireLocked(now time.Time) {
 	for id, session := range s.sessions {
-		session.mu.Lock()
+		if !session.mu.TryLock() {
+			continue
+		}
 		expired := now.Sub(session.lastUsed) >= s.cfg.SessionTTL
 		if expired {
 			session.close()
@@ -686,7 +688,9 @@ func (s *Service) expireLocked(now time.Time) {
 		}
 	}
 	for id, session := range s.conditionalSessions {
-		session.mu.Lock()
+		if !session.mu.TryLock() {
+			continue
+		}
 		expired := now.Sub(session.lastUsed) >= s.cfg.SessionTTL
 		if expired {
 			session.close()
