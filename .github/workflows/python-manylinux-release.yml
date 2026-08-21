@@ -1,0 +1,129 @@
+name: Publish Python manylinux artifacts
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+  release:
+    types: [published]
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/python-manylinux-release.yml"
+      - "capi/**"
+      - "cmd/shoal-capi/**"
+      - "docs/python-release.md"
+      - "go.mod"
+      - "go.sum"
+      - "python/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: python-manylinux-release-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  MANYLINUX_IMAGE: quay.io/pypa/manylinux_2_28_x86_64@sha256:2e78900cf94fe627b4be0d1f6ff709e8bd4527ca8768103c5fb8c77d40bf3750
+
+jobs:
+  build:
+    name: Build, reproduce, and smoke test
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Checkout release source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.event_name == 'release' && github.event.release.tag_name || github.ref }}
+
+      - name: Validate release tag
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("python/pyproject.toml", "rb"))["project"]["version"])')
+          tag=""
+          case "$EVENT_NAME" in
+            push) tag="$GITHUB_REF_NAME" ;;
+            release) tag="$RELEASE_TAG" ;;
+            workflow_dispatch)
+              if [[ "$REF_TYPE" == "tag" ]]; then tag="$GITHUB_REF_NAME"; fi
+              ;;
+          esac
+          if [[ -n "$tag" && "$tag" != "v${version}" ]]; then
+            echo "::error::Tag ${tag} does not match shoal-sharkbite ${version}"
+            exit 1
+          fi
+
+      - name: Build and verify twice in controlled manylinux
+        shell: bash
+        run: |
+          source_epoch=$(git show -s --format=%ct HEAD)
+          run_build() {
+            docker run --rm \
+              --env SOURCE_DATE_EPOCH="$source_epoch" \
+              --volume "$GITHUB_WORKSPACE:/io" \
+              --workdir /io \
+              "$MANYLINUX_IMAGE" \
+              bash python/scripts/build_manylinux.sh
+          }
+          run_build
+          mkdir .release-first
+          cp python/dist/* .release-first/
+          run_build
+          diff -u .release-first/SHA256SUMS python/dist/SHA256SUMS
+          diff -u .release-first/release-manifest.json python/dist/release-manifest.json
+          rm -rf .release-first
+
+      - name: Upload verified artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: shoal-sharkbite-manylinux-${{ github.sha }}
+          path: |
+            python/dist/*.whl
+            python/dist/*.tar.gz
+            python/dist/SHA256SUMS
+            python/dist/release-manifest.json
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Attest release artifacts
+        if: github.event_name != 'pull_request'
+        uses: actions/attest-build-provenance@96b4a1ef7235a096b17240c259729fdd70c83d45 # v2
+        with:
+          subject-path: |
+            python/dist/*.whl
+            python/dist/*.tar.gz
+            python/dist/SHA256SUMS
+            python/dist/release-manifest.json
+
+  publish:
+    name: Publish GitHub release assets
+    if: github.event_name == 'release'
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download verified artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: shoal-sharkbite-manylinux-${{ github.sha }}
+          path: dist
+
+      - name: Upload immutable release assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: gh release upload "$RELEASE_TAG" dist/*

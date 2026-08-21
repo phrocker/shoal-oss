@@ -79,6 +79,41 @@ Outputs under `python/dist/`:
 Sign `release-manifest.json` and `SHA256SUMS` in the publication system. Do not
 place private keys or credentials in the repository or build environment.
 
+## Controlled manylinux release workflow
+
+`.github/workflows/python-manylinux-release.yml` is the authoritative Linux
+x86-64 build and publication lane. It runs for relevant pull requests, version
+tags, published GitHub releases, and manual dispatches. The job uses an
+immutable `manylinux_2_28_x86_64` image digest, downloads the exact Go 1.25.0
+toolchain after verifying its published SHA-256 digest, installs exact Python
+build-tool versions, and builds the artifacts twice. Both `SHA256SUMS` and the
+complete release manifest must be byte-identical before artifacts are retained.
+
+Every build performs archive validation, a clean wheel install/import/native
+ABI mutation smoke test, a preload-before-import test, and a clean source
+distribution build/install/native smoke test with the Go toolchain absent from
+the test environments. Non-pull-request runs also create GitHub artifact
+attestations. Run artifacts are retained for 30 days.
+
+To validate the current `main` revision without publishing:
+
+1. Open **Actions → Publish Python manylinux artifacts → Run workflow**.
+2. Select `main` and run the workflow.
+3. Download `shoal-sharkbite-manylinux-<commit>` and verify it locally with
+   `sha256sum --check SHA256SUMS`.
+4. Verify provenance with
+   `gh attestation verify <artifact> --repo phrocker/shoal-oss`.
+
+Publication is deliberately release-bound. Publishing a GitHub release for
+`vMAJOR.MINOR.PATCH` automatically builds and uploads the wheel, sdist,
+manifest, and checksums. The tag must exactly match the version in
+`python/pyproject.toml`. Manual dispatches only validate and retain workflow
+artifacts; they cannot publish release assets. Uploads do not use `--clobber`;
+an existing same-named asset causes the publication job to fail rather than
+silently replacing released bytes. Pull requests and manual validation have
+read-only repository permissions; only the isolated release-event publish job
+receives `contents: write`.
+
 `verify_release.py` validates both archives and manifests, then installs the
 wheel into a fresh project-local virtual environment with `--no-index` and
 with the Go toolchain absent from `PATH`. It also builds the source-only sdist
