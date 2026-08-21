@@ -5,8 +5,9 @@ Sharkbite replacement and not a release under the reserved `sharkbite`
 distribution name. The distribution is named `shoal-sharkbite`; it installs
 the import-compatible modules `sharkbite` and `pysharkbite`.
 The [normative scope ADR](../docs/sharkbite-client-scope.md) currently records
-397 required rows, 389 satisfied rows, and 8 explicit core gaps; optional
-Torch, pandas, embedded, and historical C++ surfaces do not block this package.
+394 required rows, 389 satisfied rows, and 5 explicit core gaps; optional
+Torch, pandas, embedded, historical C++, and deferred native macOS surfaces do
+not block this package.
 
 Supported now:
 

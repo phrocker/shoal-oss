@@ -7,9 +7,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/phrocker/shoal/internal/engine"
-	"github.com/phrocker/shoal/internal/storage/memory"
-	"github.com/phrocker/shoal/internal/tablet"
+	"github.com/phrocker/shoal-oss/internal/engine"
+	"github.com/phrocker/shoal-oss/internal/storage/memory"
+	"github.com/phrocker/shoal-oss/internal/tablet"
 )
 
 func strPtr(s string) *string { return &s }

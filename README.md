@@ -24,6 +24,12 @@ validation state, and the few remaining platform and infrastructure gates.
 | Run graph, document, SQL, or vector search | [`FEATURES.md`](FEATURES.md#query-and-indexing) · [`docs/graph-schema.md`](docs/graph-schema.md) · [`docs/shoalql-accumulo.md`](docs/shoalql-accumulo.md) |
 | Validate against an exact Accumulo 4 cluster | [`test/accumulo/README.md`](test/accumulo/README.md) |
 
+Go consumers should use the canonical repository-backed module path:
+
+```bash
+go get github.com/phrocker/shoal-oss/accumulo
+```
+
 ## Quick start
 
 Prerequisites for local development are Go 1.25+, Python 3.9+, `make`, and a
@@ -124,6 +130,13 @@ shoal-embed compact --table graph --format parquet --data ~/.shoal/data
 shoal-embed serve  --data ~/.shoal/data --port 9876
 ```
 
+The server is also published as a non-root, multi-architecture container at
+`ghcr.io/phrocker/shoal-oss/shoal-embed`. It starts the gRPC and observability
+listeners with container-safe defaults and includes `proto/embed.proto` for
+non-Go client generation. See
+[`docs/shoal-embed-container.md`](docs/shoal-embed-container.md) for runtime,
+versioning, proto extraction, and local smoke-test instructions.
+
 Programmatic use mirrors the CLI:
 
 ```go
@@ -136,6 +149,44 @@ sc, _ := eng.Scan("graph", iterrt.InfiniteRange(), engine.ScanOptions{})
 for sc.Next() { /* sc.Key(), sc.Value() */ sc.Advance() }
 sc.Close()
 eng.Close()
+```
+
+### Conditional gRPC writes
+
+`ShoalEmbed.ConditionalWrite` supports compare-and-set conditions on each
+mutation. It is deliberately separate from unconditional `Write`: an older
+server returns `UNIMPLEMENTED` instead of ignoring unknown condition fields
+and applying entries unconditionally during a rolling upgrade. Conditions
+target the mutation row plus an exact
+`column_family` / `column_qualifier` / `column_visibility` coordinate and
+require either `absent` or `value_equals`. With no condition timestamp, the
+newest version is checked and a newest tombstone counts as absent. Setting the
+optional timestamp checks that exact version instead.
+
+All conditions on one mutation are evaluated atomically with its WAL-backed
+write under the owning tablet's writer lock. Concurrent ordinary and
+conditional writers therefore cannot interleave between comparison and write.
+`WriteResponse.results` contains one accepted/rejected status per mutation in
+request order; `written` remains the accepted count and is unchanged for
+legacy unconditional requests.
+
+```go
+resp, err := client.ConditionalWrite(ctx, &embedpb.WriteRequest{
+    Table: "leases",
+    Mutations: []*embedpb.Mutation{{
+        Row: []byte("service-a"),
+        Conditions: []*embedpb.Condition{{
+            ColumnFamily: []byte("lease"),
+            ColumnQualifier: []byte("owner"),
+            Predicate: &embedpb.Condition_Absent{Absent: true},
+        }},
+        Entries: []*embedpb.Entry{{
+            ColumnFamily: []byte("lease"),
+            ColumnQualifier: []byte("owner"),
+            Value: []byte("worker-7"),
+        }},
+    }},
+})
 ```
 
 **Local and at scale.** Durable RFile or Parquet files flush through a pluggable
@@ -272,9 +323,16 @@ intentionally opt-in and reports Docker absence as a skipped, unexecuted test
 with a nonzero status.
 Go 1.25+ (transitively from `cloud.google.com/go/storage`).
 
-Docker image (multi-stage, distroless static):
+Platform Docker image (multi-stage, distroless static):
 ```bash
 docker build -t shoal:dev .
+```
+
+Build and smoke-test the minimal standalone `shoal-embed` image:
+
+```bash
+make container-build
+make container-smoke
 ```
 
 ## Layout

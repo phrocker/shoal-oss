@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/phrocker/shoal/internal/rfile/bcfile"
+	"github.com/phrocker/shoal-oss/internal/rfile/bcfile"
 )
 
 // makeGzipBlocks lays N identical-payload gzip blocks end-to-end starting

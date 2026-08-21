@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/phrocker/shoal/internal/scanclient"
-	"github.com/phrocker/shoal/internal/thrift/gen/data"
+	"github.com/phrocker/shoal-oss/internal/scanclient"
+	"github.com/phrocker/shoal-oss/internal/thrift/gen/data"
 )
 
 // ErrStreamClosed reports iteration on a result stream after Close.

@@ -9,9 +9,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/phrocker/shoal/internal/metadata"
-	"github.com/phrocker/shoal/internal/scanserver"
-	"github.com/phrocker/shoal/internal/storage"
+	"github.com/phrocker/shoal-oss/internal/metadata"
+	"github.com/phrocker/shoal-oss/internal/scanserver"
+	"github.com/phrocker/shoal-oss/internal/storage"
 )
 
 func TestSemanticReadinessRequiresEveryComponentAndAcceptance(t *testing.T) {

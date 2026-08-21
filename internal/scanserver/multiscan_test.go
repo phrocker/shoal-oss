@@ -6,10 +6,10 @@ import (
 	"sort"
 	"testing"
 
-	"github.com/phrocker/shoal/internal/cache"
-	"github.com/phrocker/shoal/internal/metadata"
-	"github.com/phrocker/shoal/internal/storage/memory"
-	"github.com/phrocker/shoal/internal/thrift/gen/data"
+	"github.com/phrocker/shoal-oss/internal/cache"
+	"github.com/phrocker/shoal-oss/internal/metadata"
+	"github.com/phrocker/shoal-oss/internal/storage/memory"
+	"github.com/phrocker/shoal-oss/internal/thrift/gen/data"
 )
 
 // rowRange builds a TRange covering [startRow, stopRow) — start
@@ -56,8 +56,8 @@ func TestStartMultiScan_SingleTabletMultipleRanges(t *testing.T) {
 	cells := []cellSpec{}
 	for i := 0; i < 30; i++ {
 		cells = append(cells, cellSpec{
-			row:   fmt.Sprintf("row%02d", i),
-			cf:    "cf", cq: "cq",
+			row: fmt.Sprintf("row%02d", i),
+			cf:  "cf", cq: "cq",
 			value: fmt.Sprintf("v%02d", i),
 			ts:    int64(i + 1),
 		})

@@ -8,10 +8,10 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/phrocker/shoal/internal/rfile/bcfile"
-	"github.com/phrocker/shoal/internal/rfile/bcfile/block"
-	"github.com/phrocker/shoal/internal/rfile/blockmeta"
-	"github.com/phrocker/shoal/internal/rfile/index"
+	"github.com/phrocker/shoal-oss/internal/rfile/bcfile"
+	"github.com/phrocker/shoal-oss/internal/rfile/bcfile/block"
+	"github.com/phrocker/shoal-oss/internal/rfile/blockmeta"
+	"github.com/phrocker/shoal-oss/internal/rfile/index"
 )
 
 // writeAugmentedRFile produces a small RFile with zone-map metadata so

@@ -29,10 +29,10 @@ import (
 	"github.com/apache/thrift/lib/go/thrift"
 	gozk "github.com/go-zookeeper/zk"
 
-	"github.com/phrocker/shoal/internal/thrift/gen/manager"
-	"github.com/phrocker/shoal/internal/thrift/gen/security"
-	"github.com/phrocker/shoal/internal/thrift/gen/tabletmgmt"
-	"github.com/phrocker/shoal/internal/tserver"
+	"github.com/phrocker/shoal-oss/internal/thrift/gen/manager"
+	"github.com/phrocker/shoal-oss/internal/thrift/gen/security"
+	"github.com/phrocker/shoal-oss/internal/thrift/gen/tabletmgmt"
+	"github.com/phrocker/shoal-oss/internal/tserver"
 )
 
 const (

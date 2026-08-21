@@ -9,7 +9,7 @@ import (
 
 	"github.com/apache/thrift/lib/go/thrift"
 
-	"github.com/phrocker/shoal/internal/managerclient"
+	"github.com/phrocker/shoal-oss/internal/managerclient"
 )
 
 func TestNamespacePropertyMutationsUseManagerRPCsAndDefaultNamespace(t *testing.T) {

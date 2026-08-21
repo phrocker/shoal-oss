@@ -43,10 +43,10 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/phrocker/shoal/internal/iterrt"
-	"github.com/phrocker/shoal/internal/metadata"
-	"github.com/phrocker/shoal/internal/shadow/itercfg"
-	"github.com/phrocker/shoal/internal/zk"
+	"github.com/phrocker/shoal-oss/internal/iterrt"
+	"github.com/phrocker/shoal-oss/internal/metadata"
+	"github.com/phrocker/shoal-oss/internal/shadow/itercfg"
+	"github.com/phrocker/shoal-oss/internal/zk"
 )
 
 // --- metadata model + conditional applier -----------------------------

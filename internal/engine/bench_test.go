@@ -44,11 +44,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/phrocker/shoal/internal/cclient"
-	"github.com/phrocker/shoal/internal/engine"
-	"github.com/phrocker/shoal/internal/iterrt"
-	"github.com/phrocker/shoal/internal/localwal"
-	"github.com/phrocker/shoal/internal/tablet"
+	"github.com/phrocker/shoal-oss/internal/cclient"
+	"github.com/phrocker/shoal-oss/internal/engine"
+	"github.com/phrocker/shoal-oss/internal/iterrt"
+	"github.com/phrocker/shoal-oss/internal/localwal"
+	"github.com/phrocker/shoal-oss/internal/tablet"
 )
 
 // --- Write benchmarks ---
@@ -1079,8 +1079,8 @@ func init() {
 //	ParallelScan_3Tablets:    Full scan across 3 tablets (parallel merge)
 //
 // Expected advantages over SQLite:
-//	- Write: comparable (both are append-to-WAL + memtable/WAL-mode)
-//	- Scan: faster for prefix scans (tablet-level skip vs row scan)
-//	- Parallel: significantly faster (3 goroutines vs 1 SQLite reader)
-//	- Compact: no SQLite equivalent (VACUUM is the closest, but different)
+//   - Write: comparable (both are append-to-WAL + memtable/WAL-mode)
+//   - Scan: faster for prefix scans (tablet-level skip vs row scan)
+//   - Parallel: significantly faster (3 goroutines vs 1 SQLite reader)
+//   - Compact: no SQLite equivalent (VACUUM is the closest, but different)
 var _ = filepath.Join // keep filepath import for bench temp dirs

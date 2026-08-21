@@ -18,8 +18,8 @@ import (
 	"time"
 
 	cloudstorage "cloud.google.com/go/storage"
-	shstorage "github.com/phrocker/shoal/internal/storage"
-	memorystorage "github.com/phrocker/shoal/internal/storage/memory"
+	shstorage "github.com/phrocker/shoal-oss/internal/storage"
+	memorystorage "github.com/phrocker/shoal-oss/internal/storage/memory"
 	"google.golang.org/api/googleapi"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"

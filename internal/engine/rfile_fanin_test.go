@@ -5,7 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/phrocker/shoal/internal/storage/memory"
+	"github.com/phrocker/shoal-oss/internal/storage/memory"
 )
 
 // TestImportFanInMergesReimport proves the fan-in fix: a second import of a

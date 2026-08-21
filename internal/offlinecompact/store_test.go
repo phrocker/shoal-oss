@@ -24,8 +24,8 @@ import (
 	"io"
 	"testing"
 
-	"github.com/phrocker/shoal/internal/storage"
-	"github.com/phrocker/shoal/internal/storage/memory"
+	"github.com/phrocker/shoal-oss/internal/storage"
+	"github.com/phrocker/shoal-oss/internal/storage/memory"
 )
 
 func TestBackendStore_WriteThenRead(t *testing.T) {

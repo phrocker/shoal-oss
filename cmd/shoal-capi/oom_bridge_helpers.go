@@ -11,7 +11,7 @@ import "C"
 import (
 	"errors"
 
-	"github.com/phrocker/shoal/accumulo"
+	"github.com/phrocker/shoal-oss/accumulo"
 )
 
 func testErrorMessageAllocFailAfter(successfulAllocations uint) {

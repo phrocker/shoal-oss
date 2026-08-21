@@ -36,10 +36,10 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/phrocker/shoal/internal/agentmem"
-	"github.com/phrocker/shoal/internal/embedpb"
-	"github.com/phrocker/shoal/internal/graphschema"
-	"github.com/phrocker/shoal/internal/ivfpq"
+	"github.com/phrocker/shoal-oss/internal/agentmem"
+	"github.com/phrocker/shoal-oss/internal/embedpb"
+	"github.com/phrocker/shoal-oss/internal/graphschema"
+	"github.com/phrocker/shoal-oss/internal/ivfpq"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )

@@ -4,8 +4,8 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/phrocker/shoal/internal/cred"
-	"github.com/phrocker/shoal/internal/thrift/gen/security"
+	"github.com/phrocker/shoal-oss/internal/cred"
+	"github.com/phrocker/shoal-oss/internal/thrift/gen/security"
 )
 
 // Credentials contains authentication material without exposing generated

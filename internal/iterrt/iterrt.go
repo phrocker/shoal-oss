@@ -40,7 +40,7 @@
 //     run multiple concurrent seeks (e.g. source-of-a-source fan-out).
 package iterrt
 
-import "github.com/phrocker/shoal/internal/rfile/wire"
+import "github.com/phrocker/shoal-oss/internal/rfile/wire"
 
 // Key is the cell coordinate type threaded through the runtime. Aliased to
 // wire.Key so RFile readers, the WAL merger, and iterators all speak one

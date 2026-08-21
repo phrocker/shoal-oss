@@ -3,8 +3,8 @@ package accumulo
 import (
 	"errors"
 
-	"github.com/phrocker/shoal/internal/cclient"
-	"github.com/phrocker/shoal/internal/thrift/gen/data"
+	"github.com/phrocker/shoal-oss/internal/cclient"
+	"github.com/phrocker/shoal-oss/internal/thrift/gen/data"
 )
 
 // MutationLatestTimestamp requests a tablet-server-assigned timestamp.

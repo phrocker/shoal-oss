@@ -12,8 +12,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/phrocker/shoal/internal/engine"
-	"github.com/phrocker/shoal/internal/storage/local"
+	"github.com/phrocker/shoal-oss/internal/engine"
+	"github.com/phrocker/shoal-oss/internal/storage/local"
 	"golang.org/x/sys/windows"
 )
 

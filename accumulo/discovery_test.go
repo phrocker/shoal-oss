@@ -9,10 +9,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/phrocker/shoal/internal/metadata"
-	nslookup "github.com/phrocker/shoal/internal/namespaces"
-	"github.com/phrocker/shoal/internal/tablenames"
-	"github.com/phrocker/shoal/internal/zk"
+	"github.com/phrocker/shoal-oss/internal/metadata"
+	nslookup "github.com/phrocker/shoal-oss/internal/namespaces"
+	"github.com/phrocker/shoal-oss/internal/tablenames"
+	"github.com/phrocker/shoal-oss/internal/zk"
 )
 
 type fakeTabletWalker struct {

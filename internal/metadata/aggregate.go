@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"fmt"
 
-	"github.com/phrocker/shoal/internal/thrift/gen/data"
+	"github.com/phrocker/shoal-oss/internal/thrift/gen/data"
 )
 
 // AggregateRows folds a sorted KV stream from the metadata table into one

@@ -10,14 +10,14 @@
       "gate": "stateful-continuation",
       "kind": "go-test",
       "reference": "internal/scanserver/session_test.go#TestStartScan_ContinuationAtExactByteBoundary",
-      "source_sha256": "69ff59302df42c542d1f0e27ade21850cb3abb156c4448bfa4e4071c3e96b05f",
+      "source_sha256": "58a6de4b92c16bfe14597c8ef0d6c5bfcd847ef199f0b7c0e424b96f0fccc7fe",
       "replay_command": ["go", "test", "./internal/scanserver", "-run", "^TestStartScan_ContinuationAtExactByteBoundary$", "-count=1"]
     },
     {
       "gate": "cancel-resume",
       "kind": "go-test",
       "reference": "internal/scanserver/session_test.go#TestContinueScan_CanceledRequestDoesNotConsumePage",
-      "source_sha256": "69ff59302df42c542d1f0e27ade21850cb3abb156c4448bfa4e4071c3e96b05f",
+      "source_sha256": "58a6de4b92c16bfe14597c8ef0d6c5bfcd847ef199f0b7c0e424b96f0fccc7fe",
       "replay_command": ["go", "test", "./internal/scanserver", "-run", "^TestContinueScan_CanceledRequestDoesNotConsumePage$", "-count=1"]
     }
   ]

@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	publicrfile "github.com/phrocker/shoal/rfile"
+	publicrfile "github.com/phrocker/shoal-oss/rfile"
 )
 
 func TestStatusForRFileErrors(t *testing.T) {

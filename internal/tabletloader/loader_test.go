@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/phrocker/shoal/internal/metadata"
-	"github.com/phrocker/shoal/internal/tserver"
+	"github.com/phrocker/shoal-oss/internal/metadata"
+	"github.com/phrocker/shoal-oss/internal/tserver"
 )
 
 const testGeneration Generation = "/accumulo/i/tservers/default/host:9997/zlock#11111111-1111-1111-1111-111111111111#0000000007$abc"

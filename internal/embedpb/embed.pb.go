@@ -140,6 +140,55 @@ func (TableFileFormat) EnumDescriptor() ([]byte, []int) {
 	return file_embed_proto_rawDescGZIP(), []int{1}
 }
 
+type MutationStatus int32
+
+const (
+	MutationStatus_MUTATION_STATUS_UNSPECIFIED MutationStatus = 0
+	MutationStatus_MUTATION_STATUS_ACCEPTED    MutationStatus = 1
+	MutationStatus_MUTATION_STATUS_REJECTED    MutationStatus = 2
+)
+
+// Enum value maps for MutationStatus.
+var (
+	MutationStatus_name = map[int32]string{
+		0: "MUTATION_STATUS_UNSPECIFIED",
+		1: "MUTATION_STATUS_ACCEPTED",
+		2: "MUTATION_STATUS_REJECTED",
+	}
+	MutationStatus_value = map[string]int32{
+		"MUTATION_STATUS_UNSPECIFIED": 0,
+		"MUTATION_STATUS_ACCEPTED":    1,
+		"MUTATION_STATUS_REJECTED":    2,
+	}
+)
+
+func (x MutationStatus) Enum() *MutationStatus {
+	p := new(MutationStatus)
+	*p = x
+	return p
+}
+
+func (x MutationStatus) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (MutationStatus) Descriptor() protoreflect.EnumDescriptor {
+	return file_embed_proto_enumTypes[2].Descriptor()
+}
+
+func (MutationStatus) Type() protoreflect.EnumType {
+	return &file_embed_proto_enumTypes[2]
+}
+
+func (x MutationStatus) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use MutationStatus.Descriptor instead.
+func (MutationStatus) EnumDescriptor() ([]byte, []int) {
+	return file_embed_proto_rawDescGZIP(), []int{2}
+}
+
 type CreateTableRequest struct {
 	state  protoimpl.MessageState `protogen:"open.v1"`
 	Table  string                 `protobuf:"bytes,1,opt,name=table,proto3" json:"table,omitempty"`
@@ -281,9 +330,13 @@ func (x *CreateTableResponse) GetFileFormat() TableFileFormat {
 }
 
 type Mutation struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Row           []byte                 `protobuf:"bytes,1,opt,name=row,proto3" json:"row,omitempty"`
-	Entries       []*Entry               `protobuf:"bytes,2,rep,name=entries,proto3" json:"entries,omitempty"`
+	state   protoimpl.MessageState `protogen:"open.v1"`
+	Row     []byte                 `protobuf:"bytes,1,opt,name=row,proto3" json:"row,omitempty"`
+	Entries []*Entry               `protobuf:"bytes,2,rep,name=entries,proto3" json:"entries,omitempty"`
+	// Compare-and-set predicates used by ConditionalWrite. All conditions must
+	// match before any entry is written. Write rejects mutations that set this
+	// field so callers cannot accidentally depend on unknown-field behavior.
+	Conditions    []*Condition `protobuf:"bytes,3,rep,name=conditions,proto3" json:"conditions,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -328,6 +381,13 @@ func (x *Mutation) GetRow() []byte {
 func (x *Mutation) GetEntries() []*Entry {
 	if x != nil {
 		return x.Entries
+	}
+	return nil
+}
+
+func (x *Mutation) GetConditions() []*Condition {
+	if x != nil {
+		return x.Conditions
 	}
 	return nil
 }
@@ -416,6 +476,127 @@ func (x *Entry) GetDelete() bool {
 	return false
 }
 
+type Condition struct {
+	state           protoimpl.MessageState `protogen:"open.v1"`
+	ColumnFamily    []byte                 `protobuf:"bytes,1,opt,name=column_family,json=columnFamily,proto3" json:"column_family,omitempty"`
+	ColumnQualifier []byte                 `protobuf:"bytes,2,opt,name=column_qualifier,json=columnQualifier,proto3" json:"column_qualifier,omitempty"`
+	// Visibility is part of an Accumulo cell coordinate. Conditions only
+	// inspect versions with this exact visibility; empty means empty visibility.
+	ColumnVisibility []byte `protobuf:"bytes,3,opt,name=column_visibility,json=columnVisibility,proto3" json:"column_visibility,omitempty"`
+	// When present, inspect the exact timestamp. When absent, inspect the newest
+	// version at the coordinate; a newest tombstone makes the coordinate absent.
+	Timestamp *int64 `protobuf:"varint,4,opt,name=timestamp,proto3,oneof" json:"timestamp,omitempty"`
+	// Types that are valid to be assigned to Predicate:
+	//
+	//	*Condition_Absent
+	//	*Condition_ValueEquals
+	Predicate     isCondition_Predicate `protobuf_oneof:"predicate"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *Condition) Reset() {
+	*x = Condition{}
+	mi := &file_embed_proto_msgTypes[4]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *Condition) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*Condition) ProtoMessage() {}
+
+func (x *Condition) ProtoReflect() protoreflect.Message {
+	mi := &file_embed_proto_msgTypes[4]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use Condition.ProtoReflect.Descriptor instead.
+func (*Condition) Descriptor() ([]byte, []int) {
+	return file_embed_proto_rawDescGZIP(), []int{4}
+}
+
+func (x *Condition) GetColumnFamily() []byte {
+	if x != nil {
+		return x.ColumnFamily
+	}
+	return nil
+}
+
+func (x *Condition) GetColumnQualifier() []byte {
+	if x != nil {
+		return x.ColumnQualifier
+	}
+	return nil
+}
+
+func (x *Condition) GetColumnVisibility() []byte {
+	if x != nil {
+		return x.ColumnVisibility
+	}
+	return nil
+}
+
+func (x *Condition) GetTimestamp() int64 {
+	if x != nil && x.Timestamp != nil {
+		return *x.Timestamp
+	}
+	return 0
+}
+
+func (x *Condition) GetPredicate() isCondition_Predicate {
+	if x != nil {
+		return x.Predicate
+	}
+	return nil
+}
+
+func (x *Condition) GetAbsent() bool {
+	if x != nil {
+		if x, ok := x.Predicate.(*Condition_Absent); ok {
+			return x.Absent
+		}
+	}
+	return false
+}
+
+func (x *Condition) GetValueEquals() []byte {
+	if x != nil {
+		if x, ok := x.Predicate.(*Condition_ValueEquals); ok {
+			return x.ValueEquals
+		}
+	}
+	return nil
+}
+
+type isCondition_Predicate interface {
+	isCondition_Predicate()
+}
+
+type Condition_Absent struct {
+	// Set true to require that no live value exists at the selected
+	// coordinate/version.
+	Absent bool `protobuf:"varint,5,opt,name=absent,proto3,oneof"`
+}
+
+type Condition_ValueEquals struct {
+	// Require that the selected live value exactly equals these bytes.
+	ValueEquals []byte `protobuf:"bytes,6,opt,name=value_equals,json=valueEquals,proto3,oneof"`
+}
+
+func (*Condition_Absent) isCondition_Predicate() {}
+
+func (*Condition_ValueEquals) isCondition_Predicate() {}
+
 type WriteRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Table         string                 `protobuf:"bytes,1,opt,name=table,proto3" json:"table,omitempty"`
@@ -426,7 +607,7 @@ type WriteRequest struct {
 
 func (x *WriteRequest) Reset() {
 	*x = WriteRequest{}
-	mi := &file_embed_proto_msgTypes[4]
+	mi := &file_embed_proto_msgTypes[5]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -438,7 +619,7 @@ func (x *WriteRequest) String() string {
 func (*WriteRequest) ProtoMessage() {}
 
 func (x *WriteRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_embed_proto_msgTypes[4]
+	mi := &file_embed_proto_msgTypes[5]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -451,7 +632,7 @@ func (x *WriteRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WriteRequest.ProtoReflect.Descriptor instead.
 func (*WriteRequest) Descriptor() ([]byte, []int) {
-	return file_embed_proto_rawDescGZIP(), []int{4}
+	return file_embed_proto_rawDescGZIP(), []int{5}
 }
 
 func (x *WriteRequest) GetTable() string {
@@ -468,16 +649,64 @@ func (x *WriteRequest) GetMutations() []*Mutation {
 	return nil
 }
 
-type WriteResponse struct {
+type MutationResult struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
-	Written       int32                  `protobuf:"varint,1,opt,name=written,proto3" json:"written,omitempty"`
+	Status        MutationStatus         `protobuf:"varint,1,opt,name=status,proto3,enum=shoal.embed.v1.MutationStatus" json:"status,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *MutationResult) Reset() {
+	*x = MutationResult{}
+	mi := &file_embed_proto_msgTypes[6]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *MutationResult) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*MutationResult) ProtoMessage() {}
+
+func (x *MutationResult) ProtoReflect() protoreflect.Message {
+	mi := &file_embed_proto_msgTypes[6]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use MutationResult.ProtoReflect.Descriptor instead.
+func (*MutationResult) Descriptor() ([]byte, []int) {
+	return file_embed_proto_rawDescGZIP(), []int{6}
+}
+
+func (x *MutationResult) GetStatus() MutationStatus {
+	if x != nil {
+		return x.Status
+	}
+	return MutationStatus_MUTATION_STATUS_UNSPECIFIED
+}
+
+type WriteResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Number of accepted mutations. For requests without conditions this
+	// remains equal to len(mutations), preserving the original contract.
+	Written int32 `protobuf:"varint,1,opt,name=written,proto3" json:"written,omitempty"`
+	// One result per request mutation, in request order.
+	Results       []*MutationResult `protobuf:"bytes,2,rep,name=results,proto3" json:"results,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *WriteResponse) Reset() {
 	*x = WriteResponse{}
-	mi := &file_embed_proto_msgTypes[5]
+	mi := &file_embed_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -489,7 +718,7 @@ func (x *WriteResponse) String() string {
 func (*WriteResponse) ProtoMessage() {}
 
 func (x *WriteResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_embed_proto_msgTypes[5]
+	mi := &file_embed_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -502,7 +731,7 @@ func (x *WriteResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WriteResponse.ProtoReflect.Descriptor instead.
 func (*WriteResponse) Descriptor() ([]byte, []int) {
-	return file_embed_proto_rawDescGZIP(), []int{5}
+	return file_embed_proto_rawDescGZIP(), []int{7}
 }
 
 func (x *WriteResponse) GetWritten() int32 {
@@ -510,6 +739,13 @@ func (x *WriteResponse) GetWritten() int32 {
 		return x.Written
 	}
 	return 0
+}
+
+func (x *WriteResponse) GetResults() []*MutationResult {
+	if x != nil {
+		return x.Results
+	}
+	return nil
 }
 
 type ScanRequest struct {
@@ -566,7 +802,7 @@ type ScanRequest struct {
 
 func (x *ScanRequest) Reset() {
 	*x = ScanRequest{}
-	mi := &file_embed_proto_msgTypes[6]
+	mi := &file_embed_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -578,7 +814,7 @@ func (x *ScanRequest) String() string {
 func (*ScanRequest) ProtoMessage() {}
 
 func (x *ScanRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_embed_proto_msgTypes[6]
+	mi := &file_embed_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -591,7 +827,7 @@ func (x *ScanRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ScanRequest.ProtoReflect.Descriptor instead.
 func (*ScanRequest) Descriptor() ([]byte, []int) {
-	return file_embed_proto_rawDescGZIP(), []int{6}
+	return file_embed_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *ScanRequest) GetTable() string {
@@ -723,7 +959,7 @@ type TermFilter struct {
 
 func (x *TermFilter) Reset() {
 	*x = TermFilter{}
-	mi := &file_embed_proto_msgTypes[7]
+	mi := &file_embed_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -735,7 +971,7 @@ func (x *TermFilter) String() string {
 func (*TermFilter) ProtoMessage() {}
 
 func (x *TermFilter) ProtoReflect() protoreflect.Message {
-	mi := &file_embed_proto_msgTypes[7]
+	mi := &file_embed_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -748,7 +984,7 @@ func (x *TermFilter) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TermFilter.ProtoReflect.Descriptor instead.
 func (*TermFilter) Descriptor() ([]byte, []int) {
-	return file_embed_proto_rawDescGZIP(), []int{7}
+	return file_embed_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *TermFilter) GetTermRows() [][]byte {
@@ -813,7 +1049,7 @@ type NumericRange struct {
 
 func (x *NumericRange) Reset() {
 	*x = NumericRange{}
-	mi := &file_embed_proto_msgTypes[8]
+	mi := &file_embed_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -825,7 +1061,7 @@ func (x *NumericRange) String() string {
 func (*NumericRange) ProtoMessage() {}
 
 func (x *NumericRange) ProtoReflect() protoreflect.Message {
-	mi := &file_embed_proto_msgTypes[8]
+	mi := &file_embed_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -838,7 +1074,7 @@ func (x *NumericRange) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NumericRange.ProtoReflect.Descriptor instead.
 func (*NumericRange) Descriptor() ([]byte, []int) {
-	return file_embed_proto_rawDescGZIP(), []int{8}
+	return file_embed_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *NumericRange) GetLower() float64 {
@@ -917,7 +1153,7 @@ type VectorSearch struct {
 
 func (x *VectorSearch) Reset() {
 	*x = VectorSearch{}
-	mi := &file_embed_proto_msgTypes[9]
+	mi := &file_embed_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -929,7 +1165,7 @@ func (x *VectorSearch) String() string {
 func (*VectorSearch) ProtoMessage() {}
 
 func (x *VectorSearch) ProtoReflect() protoreflect.Message {
-	mi := &file_embed_proto_msgTypes[9]
+	mi := &file_embed_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -942,7 +1178,7 @@ func (x *VectorSearch) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use VectorSearch.ProtoReflect.Descriptor instead.
 func (*VectorSearch) Descriptor() ([]byte, []int) {
-	return file_embed_proto_rawDescGZIP(), []int{9}
+	return file_embed_proto_rawDescGZIP(), []int{11}
 }
 
 func (x *VectorSearch) GetQuery() []byte {
@@ -1024,7 +1260,7 @@ type ScoreFilter struct {
 
 func (x *ScoreFilter) Reset() {
 	*x = ScoreFilter{}
-	mi := &file_embed_proto_msgTypes[10]
+	mi := &file_embed_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1036,7 +1272,7 @@ func (x *ScoreFilter) String() string {
 func (*ScoreFilter) ProtoMessage() {}
 
 func (x *ScoreFilter) ProtoReflect() protoreflect.Message {
-	mi := &file_embed_proto_msgTypes[10]
+	mi := &file_embed_proto_msgTypes[12]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1049,7 +1285,7 @@ func (x *ScoreFilter) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ScoreFilter.ProtoReflect.Descriptor instead.
 func (*ScoreFilter) Descriptor() ([]byte, []int) {
-	return file_embed_proto_rawDescGZIP(), []int{10}
+	return file_embed_proto_rawDescGZIP(), []int{12}
 }
 
 func (x *ScoreFilter) GetScoreCf() []byte {
@@ -1156,7 +1392,7 @@ type EdgeExpand struct {
 
 func (x *EdgeExpand) Reset() {
 	*x = EdgeExpand{}
-	mi := &file_embed_proto_msgTypes[11]
+	mi := &file_embed_proto_msgTypes[13]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1168,7 +1404,7 @@ func (x *EdgeExpand) String() string {
 func (*EdgeExpand) ProtoMessage() {}
 
 func (x *EdgeExpand) ProtoReflect() protoreflect.Message {
-	mi := &file_embed_proto_msgTypes[11]
+	mi := &file_embed_proto_msgTypes[13]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1181,7 +1417,7 @@ func (x *EdgeExpand) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use EdgeExpand.ProtoReflect.Descriptor instead.
 func (*EdgeExpand) Descriptor() ([]byte, []int) {
-	return file_embed_proto_rawDescGZIP(), []int{11}
+	return file_embed_proto_rawDescGZIP(), []int{13}
 }
 
 func (x *EdgeExpand) GetAnchorRows() [][]byte {
@@ -1280,7 +1516,7 @@ type EdgeWeight struct {
 
 func (x *EdgeWeight) Reset() {
 	*x = EdgeWeight{}
-	mi := &file_embed_proto_msgTypes[12]
+	mi := &file_embed_proto_msgTypes[14]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1292,7 +1528,7 @@ func (x *EdgeWeight) String() string {
 func (*EdgeWeight) ProtoMessage() {}
 
 func (x *EdgeWeight) ProtoReflect() protoreflect.Message {
-	mi := &file_embed_proto_msgTypes[12]
+	mi := &file_embed_proto_msgTypes[14]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1305,7 +1541,7 @@ func (x *EdgeWeight) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use EdgeWeight.ProtoReflect.Descriptor instead.
 func (*EdgeWeight) Descriptor() ([]byte, []int) {
-	return file_embed_proto_rawDescGZIP(), []int{12}
+	return file_embed_proto_rawDescGZIP(), []int{14}
 }
 
 func (x *EdgeWeight) GetRelationship() string {
@@ -1336,7 +1572,7 @@ type Cell struct {
 
 func (x *Cell) Reset() {
 	*x = Cell{}
-	mi := &file_embed_proto_msgTypes[13]
+	mi := &file_embed_proto_msgTypes[15]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1348,7 +1584,7 @@ func (x *Cell) String() string {
 func (*Cell) ProtoMessage() {}
 
 func (x *Cell) ProtoReflect() protoreflect.Message {
-	mi := &file_embed_proto_msgTypes[13]
+	mi := &file_embed_proto_msgTypes[15]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1361,7 +1597,7 @@ func (x *Cell) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Cell.ProtoReflect.Descriptor instead.
 func (*Cell) Descriptor() ([]byte, []int) {
-	return file_embed_proto_rawDescGZIP(), []int{13}
+	return file_embed_proto_rawDescGZIP(), []int{15}
 }
 
 func (x *Cell) GetRow() []byte {
@@ -1415,7 +1651,7 @@ type ScanResponse struct {
 
 func (x *ScanResponse) Reset() {
 	*x = ScanResponse{}
-	mi := &file_embed_proto_msgTypes[14]
+	mi := &file_embed_proto_msgTypes[16]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1427,7 +1663,7 @@ func (x *ScanResponse) String() string {
 func (*ScanResponse) ProtoMessage() {}
 
 func (x *ScanResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_embed_proto_msgTypes[14]
+	mi := &file_embed_proto_msgTypes[16]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1440,7 +1676,7 @@ func (x *ScanResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ScanResponse.ProtoReflect.Descriptor instead.
 func (*ScanResponse) Descriptor() ([]byte, []int) {
-	return file_embed_proto_rawDescGZIP(), []int{14}
+	return file_embed_proto_rawDescGZIP(), []int{16}
 }
 
 func (x *ScanResponse) GetCells() []*Cell {
@@ -1459,7 +1695,7 @@ type FlushRequest struct {
 
 func (x *FlushRequest) Reset() {
 	*x = FlushRequest{}
-	mi := &file_embed_proto_msgTypes[15]
+	mi := &file_embed_proto_msgTypes[17]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1471,7 +1707,7 @@ func (x *FlushRequest) String() string {
 func (*FlushRequest) ProtoMessage() {}
 
 func (x *FlushRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_embed_proto_msgTypes[15]
+	mi := &file_embed_proto_msgTypes[17]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1484,7 +1720,7 @@ func (x *FlushRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FlushRequest.ProtoReflect.Descriptor instead.
 func (*FlushRequest) Descriptor() ([]byte, []int) {
-	return file_embed_proto_rawDescGZIP(), []int{15}
+	return file_embed_proto_rawDescGZIP(), []int{17}
 }
 
 func (x *FlushRequest) GetTable() string {
@@ -1502,7 +1738,7 @@ type FlushResponse struct {
 
 func (x *FlushResponse) Reset() {
 	*x = FlushResponse{}
-	mi := &file_embed_proto_msgTypes[16]
+	mi := &file_embed_proto_msgTypes[18]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1514,7 +1750,7 @@ func (x *FlushResponse) String() string {
 func (*FlushResponse) ProtoMessage() {}
 
 func (x *FlushResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_embed_proto_msgTypes[16]
+	mi := &file_embed_proto_msgTypes[18]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1527,7 +1763,7 @@ func (x *FlushResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FlushResponse.ProtoReflect.Descriptor instead.
 func (*FlushResponse) Descriptor() ([]byte, []int) {
-	return file_embed_proto_rawDescGZIP(), []int{16}
+	return file_embed_proto_rawDescGZIP(), []int{18}
 }
 
 type CompactRequest struct {
@@ -1546,7 +1782,7 @@ type CompactRequest struct {
 
 func (x *CompactRequest) Reset() {
 	*x = CompactRequest{}
-	mi := &file_embed_proto_msgTypes[17]
+	mi := &file_embed_proto_msgTypes[19]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1558,7 +1794,7 @@ func (x *CompactRequest) String() string {
 func (*CompactRequest) ProtoMessage() {}
 
 func (x *CompactRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_embed_proto_msgTypes[17]
+	mi := &file_embed_proto_msgTypes[19]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1571,7 +1807,7 @@ func (x *CompactRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CompactRequest.ProtoReflect.Descriptor instead.
 func (*CompactRequest) Descriptor() ([]byte, []int) {
-	return file_embed_proto_rawDescGZIP(), []int{17}
+	return file_embed_proto_rawDescGZIP(), []int{19}
 }
 
 func (x *CompactRequest) GetTable() string {
@@ -1606,7 +1842,7 @@ type CompactResponse struct {
 
 func (x *CompactResponse) Reset() {
 	*x = CompactResponse{}
-	mi := &file_embed_proto_msgTypes[18]
+	mi := &file_embed_proto_msgTypes[20]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1618,7 +1854,7 @@ func (x *CompactResponse) String() string {
 func (*CompactResponse) ProtoMessage() {}
 
 func (x *CompactResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_embed_proto_msgTypes[18]
+	mi := &file_embed_proto_msgTypes[20]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1631,7 +1867,7 @@ func (x *CompactResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CompactResponse.ProtoReflect.Descriptor instead.
 func (*CompactResponse) Descriptor() ([]byte, []int) {
-	return file_embed_proto_rawDescGZIP(), []int{18}
+	return file_embed_proto_rawDescGZIP(), []int{20}
 }
 
 func (x *CompactResponse) GetTable() string {
@@ -1663,7 +1899,7 @@ type StatusRequest struct {
 
 func (x *StatusRequest) Reset() {
 	*x = StatusRequest{}
-	mi := &file_embed_proto_msgTypes[19]
+	mi := &file_embed_proto_msgTypes[21]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1675,7 +1911,7 @@ func (x *StatusRequest) String() string {
 func (*StatusRequest) ProtoMessage() {}
 
 func (x *StatusRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_embed_proto_msgTypes[19]
+	mi := &file_embed_proto_msgTypes[21]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1688,7 +1924,7 @@ func (x *StatusRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StatusRequest.ProtoReflect.Descriptor instead.
 func (*StatusRequest) Descriptor() ([]byte, []int) {
-	return file_embed_proto_rawDescGZIP(), []int{19}
+	return file_embed_proto_rawDescGZIP(), []int{21}
 }
 
 type TableStatus struct {
@@ -1704,7 +1940,7 @@ type TableStatus struct {
 
 func (x *TableStatus) Reset() {
 	*x = TableStatus{}
-	mi := &file_embed_proto_msgTypes[20]
+	mi := &file_embed_proto_msgTypes[22]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1716,7 +1952,7 @@ func (x *TableStatus) String() string {
 func (*TableStatus) ProtoMessage() {}
 
 func (x *TableStatus) ProtoReflect() protoreflect.Message {
-	mi := &file_embed_proto_msgTypes[20]
+	mi := &file_embed_proto_msgTypes[22]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1729,7 +1965,7 @@ func (x *TableStatus) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TableStatus.ProtoReflect.Descriptor instead.
 func (*TableStatus) Descriptor() ([]byte, []int) {
-	return file_embed_proto_rawDescGZIP(), []int{20}
+	return file_embed_proto_rawDescGZIP(), []int{22}
 }
 
 func (x *TableStatus) GetTable() string {
@@ -1777,7 +2013,7 @@ type StatusResponse struct {
 
 func (x *StatusResponse) Reset() {
 	*x = StatusResponse{}
-	mi := &file_embed_proto_msgTypes[21]
+	mi := &file_embed_proto_msgTypes[23]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1789,7 +2025,7 @@ func (x *StatusResponse) String() string {
 func (*StatusResponse) ProtoMessage() {}
 
 func (x *StatusResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_embed_proto_msgTypes[21]
+	mi := &file_embed_proto_msgTypes[23]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1802,7 +2038,7 @@ func (x *StatusResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StatusResponse.ProtoReflect.Descriptor instead.
 func (*StatusResponse) Descriptor() ([]byte, []int) {
-	return file_embed_proto_rawDescGZIP(), []int{21}
+	return file_embed_proto_rawDescGZIP(), []int{23}
 }
 
 func (x *StatusResponse) GetTables() []string {
@@ -1835,22 +2071,38 @@ const file_embed_proto_rawDesc = "" +
 	"\atablets\x18\x02 \x01(\x05R\atablets\x129\n" +
 	"\bworkload\x18\x03 \x01(\x0e2\x1d.shoal.embed.v1.TableWorkloadR\bworkload\x12@\n" +
 	"\vfile_format\x18\x04 \x01(\x0e2\x1f.shoal.embed.v1.TableFileFormatR\n" +
-	"fileFormat\"M\n" +
+	"fileFormat\"\x88\x01\n" +
 	"\bMutation\x12\x10\n" +
 	"\x03row\x18\x01 \x01(\fR\x03row\x12/\n" +
-	"\aentries\x18\x02 \x03(\v2\x15.shoal.embed.v1.EntryR\aentries\"\xd0\x01\n" +
+	"\aentries\x18\x02 \x03(\v2\x15.shoal.embed.v1.EntryR\aentries\x129\n" +
+	"\n" +
+	"conditions\x18\x03 \x03(\v2\x19.shoal.embed.v1.ConditionR\n" +
+	"conditions\"\xd0\x01\n" +
 	"\x05Entry\x12#\n" +
 	"\rcolumn_family\x18\x01 \x01(\fR\fcolumnFamily\x12)\n" +
 	"\x10column_qualifier\x18\x02 \x01(\fR\x0fcolumnQualifier\x12+\n" +
 	"\x11column_visibility\x18\x03 \x01(\fR\x10columnVisibility\x12\x1c\n" +
 	"\ttimestamp\x18\x04 \x01(\x03R\ttimestamp\x12\x14\n" +
 	"\x05value\x18\x05 \x01(\fR\x05value\x12\x16\n" +
-	"\x06delete\x18\x06 \x01(\bR\x06delete\"\\\n" +
+	"\x06delete\x18\x06 \x01(\bR\x06delete\"\x85\x02\n" +
+	"\tCondition\x12#\n" +
+	"\rcolumn_family\x18\x01 \x01(\fR\fcolumnFamily\x12)\n" +
+	"\x10column_qualifier\x18\x02 \x01(\fR\x0fcolumnQualifier\x12+\n" +
+	"\x11column_visibility\x18\x03 \x01(\fR\x10columnVisibility\x12!\n" +
+	"\ttimestamp\x18\x04 \x01(\x03H\x01R\ttimestamp\x88\x01\x01\x12\x18\n" +
+	"\x06absent\x18\x05 \x01(\bH\x00R\x06absent\x12#\n" +
+	"\fvalue_equals\x18\x06 \x01(\fH\x00R\vvalueEqualsB\v\n" +
+	"\tpredicateB\f\n" +
+	"\n" +
+	"_timestamp\"\\\n" +
 	"\fWriteRequest\x12\x14\n" +
 	"\x05table\x18\x01 \x01(\tR\x05table\x126\n" +
-	"\tmutations\x18\x02 \x03(\v2\x18.shoal.embed.v1.MutationR\tmutations\")\n" +
+	"\tmutations\x18\x02 \x03(\v2\x18.shoal.embed.v1.MutationR\tmutations\"H\n" +
+	"\x0eMutationResult\x126\n" +
+	"\x06status\x18\x01 \x01(\x0e2\x1e.shoal.embed.v1.MutationStatusR\x06status\"c\n" +
 	"\rWriteResponse\x12\x18\n" +
-	"\awritten\x18\x01 \x01(\x05R\awritten\"\x8d\x04\n" +
+	"\awritten\x18\x01 \x01(\x05R\awritten\x128\n" +
+	"\aresults\x18\x02 \x03(\v2\x1e.shoal.embed.v1.MutationResultR\aresults\"\x8d\x04\n" +
 	"\vScanRequest\x12\x14\n" +
 	"\x05table\x18\x01 \x01(\tR\x05table\x12\x1d\n" +
 	"\n" +
@@ -1964,15 +2216,20 @@ const file_embed_proto_rawDesc = "" +
 	"\x0fTableFileFormat\x12!\n" +
 	"\x1dTABLE_FILE_FORMAT_UNSPECIFIED\x10\x00\x12\x1b\n" +
 	"\x17TABLE_FILE_FORMAT_RFILE\x10\x01\x12\x1d\n" +
-	"\x19TABLE_FILE_FORMAT_PARQUET\x10\x022\xca\x03\n" +
+	"\x19TABLE_FILE_FORMAT_PARQUET\x10\x02*m\n" +
+	"\x0eMutationStatus\x12\x1f\n" +
+	"\x1bMUTATION_STATUS_UNSPECIFIED\x10\x00\x12\x1c\n" +
+	"\x18MUTATION_STATUS_ACCEPTED\x10\x01\x12\x1c\n" +
+	"\x18MUTATION_STATUS_REJECTED\x10\x022\x9b\x04\n" +
 	"\n" +
 	"ShoalEmbed\x12V\n" +
 	"\vCreateTable\x12\".shoal.embed.v1.CreateTableRequest\x1a#.shoal.embed.v1.CreateTableResponse\x12D\n" +
-	"\x05Write\x12\x1c.shoal.embed.v1.WriteRequest\x1a\x1d.shoal.embed.v1.WriteResponse\x12C\n" +
+	"\x05Write\x12\x1c.shoal.embed.v1.WriteRequest\x1a\x1d.shoal.embed.v1.WriteResponse\x12O\n" +
+	"\x10ConditionalWrite\x12\x1c.shoal.embed.v1.WriteRequest\x1a\x1d.shoal.embed.v1.WriteResponse\x12C\n" +
 	"\x04Scan\x12\x1b.shoal.embed.v1.ScanRequest\x1a\x1c.shoal.embed.v1.ScanResponse0\x01\x12D\n" +
 	"\x05Flush\x12\x1c.shoal.embed.v1.FlushRequest\x1a\x1d.shoal.embed.v1.FlushResponse\x12J\n" +
 	"\aCompact\x12\x1e.shoal.embed.v1.CompactRequest\x1a\x1f.shoal.embed.v1.CompactResponse\x12G\n" +
-	"\x06Status\x12\x1d.shoal.embed.v1.StatusRequest\x1a\x1e.shoal.embed.v1.StatusResponseB,Z*github.com/phrocker/shoal/internal/embedpbb\x06proto3"
+	"\x06Status\x12\x1d.shoal.embed.v1.StatusRequest\x1a\x1e.shoal.embed.v1.StatusResponseB0Z.github.com/phrocker/shoal-oss/internal/embedpbb\x06proto3"
 
 var (
 	file_embed_proto_rawDescOnce sync.Once
@@ -1986,72 +2243,80 @@ func file_embed_proto_rawDescGZIP() []byte {
 	return file_embed_proto_rawDescData
 }
 
-var file_embed_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
-var file_embed_proto_msgTypes = make([]protoimpl.MessageInfo, 22)
+var file_embed_proto_enumTypes = make([]protoimpl.EnumInfo, 3)
+var file_embed_proto_msgTypes = make([]protoimpl.MessageInfo, 24)
 var file_embed_proto_goTypes = []any{
 	(TableWorkload)(0),          // 0: shoal.embed.v1.TableWorkload
 	(TableFileFormat)(0),        // 1: shoal.embed.v1.TableFileFormat
-	(*CreateTableRequest)(nil),  // 2: shoal.embed.v1.CreateTableRequest
-	(*CreateTableResponse)(nil), // 3: shoal.embed.v1.CreateTableResponse
-	(*Mutation)(nil),            // 4: shoal.embed.v1.Mutation
-	(*Entry)(nil),               // 5: shoal.embed.v1.Entry
-	(*WriteRequest)(nil),        // 6: shoal.embed.v1.WriteRequest
-	(*WriteResponse)(nil),       // 7: shoal.embed.v1.WriteResponse
-	(*ScanRequest)(nil),         // 8: shoal.embed.v1.ScanRequest
-	(*TermFilter)(nil),          // 9: shoal.embed.v1.TermFilter
-	(*NumericRange)(nil),        // 10: shoal.embed.v1.NumericRange
-	(*VectorSearch)(nil),        // 11: shoal.embed.v1.VectorSearch
-	(*ScoreFilter)(nil),         // 12: shoal.embed.v1.ScoreFilter
-	(*EdgeExpand)(nil),          // 13: shoal.embed.v1.EdgeExpand
-	(*EdgeWeight)(nil),          // 14: shoal.embed.v1.EdgeWeight
-	(*Cell)(nil),                // 15: shoal.embed.v1.Cell
-	(*ScanResponse)(nil),        // 16: shoal.embed.v1.ScanResponse
-	(*FlushRequest)(nil),        // 17: shoal.embed.v1.FlushRequest
-	(*FlushResponse)(nil),       // 18: shoal.embed.v1.FlushResponse
-	(*CompactRequest)(nil),      // 19: shoal.embed.v1.CompactRequest
-	(*CompactResponse)(nil),     // 20: shoal.embed.v1.CompactResponse
-	(*StatusRequest)(nil),       // 21: shoal.embed.v1.StatusRequest
-	(*TableStatus)(nil),         // 22: shoal.embed.v1.TableStatus
-	(*StatusResponse)(nil),      // 23: shoal.embed.v1.StatusResponse
+	(MutationStatus)(0),         // 2: shoal.embed.v1.MutationStatus
+	(*CreateTableRequest)(nil),  // 3: shoal.embed.v1.CreateTableRequest
+	(*CreateTableResponse)(nil), // 4: shoal.embed.v1.CreateTableResponse
+	(*Mutation)(nil),            // 5: shoal.embed.v1.Mutation
+	(*Entry)(nil),               // 6: shoal.embed.v1.Entry
+	(*Condition)(nil),           // 7: shoal.embed.v1.Condition
+	(*WriteRequest)(nil),        // 8: shoal.embed.v1.WriteRequest
+	(*MutationResult)(nil),      // 9: shoal.embed.v1.MutationResult
+	(*WriteResponse)(nil),       // 10: shoal.embed.v1.WriteResponse
+	(*ScanRequest)(nil),         // 11: shoal.embed.v1.ScanRequest
+	(*TermFilter)(nil),          // 12: shoal.embed.v1.TermFilter
+	(*NumericRange)(nil),        // 13: shoal.embed.v1.NumericRange
+	(*VectorSearch)(nil),        // 14: shoal.embed.v1.VectorSearch
+	(*ScoreFilter)(nil),         // 15: shoal.embed.v1.ScoreFilter
+	(*EdgeExpand)(nil),          // 16: shoal.embed.v1.EdgeExpand
+	(*EdgeWeight)(nil),          // 17: shoal.embed.v1.EdgeWeight
+	(*Cell)(nil),                // 18: shoal.embed.v1.Cell
+	(*ScanResponse)(nil),        // 19: shoal.embed.v1.ScanResponse
+	(*FlushRequest)(nil),        // 20: shoal.embed.v1.FlushRequest
+	(*FlushResponse)(nil),       // 21: shoal.embed.v1.FlushResponse
+	(*CompactRequest)(nil),      // 22: shoal.embed.v1.CompactRequest
+	(*CompactResponse)(nil),     // 23: shoal.embed.v1.CompactResponse
+	(*StatusRequest)(nil),       // 24: shoal.embed.v1.StatusRequest
+	(*TableStatus)(nil),         // 25: shoal.embed.v1.TableStatus
+	(*StatusResponse)(nil),      // 26: shoal.embed.v1.StatusResponse
 }
 var file_embed_proto_depIdxs = []int32{
 	0,  // 0: shoal.embed.v1.CreateTableRequest.workload:type_name -> shoal.embed.v1.TableWorkload
 	1,  // 1: shoal.embed.v1.CreateTableRequest.file_format:type_name -> shoal.embed.v1.TableFileFormat
 	0,  // 2: shoal.embed.v1.CreateTableResponse.workload:type_name -> shoal.embed.v1.TableWorkload
 	1,  // 3: shoal.embed.v1.CreateTableResponse.file_format:type_name -> shoal.embed.v1.TableFileFormat
-	5,  // 4: shoal.embed.v1.Mutation.entries:type_name -> shoal.embed.v1.Entry
-	4,  // 5: shoal.embed.v1.WriteRequest.mutations:type_name -> shoal.embed.v1.Mutation
-	9,  // 6: shoal.embed.v1.ScanRequest.term_filter:type_name -> shoal.embed.v1.TermFilter
-	11, // 7: shoal.embed.v1.ScanRequest.vector_search:type_name -> shoal.embed.v1.VectorSearch
-	13, // 8: shoal.embed.v1.ScanRequest.edge_expand:type_name -> shoal.embed.v1.EdgeExpand
-	12, // 9: shoal.embed.v1.ScanRequest.score_filter:type_name -> shoal.embed.v1.ScoreFilter
-	10, // 10: shoal.embed.v1.TermFilter.numeric_range:type_name -> shoal.embed.v1.NumericRange
-	14, // 11: shoal.embed.v1.EdgeExpand.edge_weights:type_name -> shoal.embed.v1.EdgeWeight
-	15, // 12: shoal.embed.v1.ScanResponse.cells:type_name -> shoal.embed.v1.Cell
-	0,  // 13: shoal.embed.v1.CompactRequest.workload:type_name -> shoal.embed.v1.TableWorkload
-	1,  // 14: shoal.embed.v1.CompactRequest.file_format:type_name -> shoal.embed.v1.TableFileFormat
-	0,  // 15: shoal.embed.v1.CompactResponse.workload:type_name -> shoal.embed.v1.TableWorkload
-	1,  // 16: shoal.embed.v1.CompactResponse.file_format:type_name -> shoal.embed.v1.TableFileFormat
-	0,  // 17: shoal.embed.v1.TableStatus.workload:type_name -> shoal.embed.v1.TableWorkload
-	1,  // 18: shoal.embed.v1.TableStatus.file_format:type_name -> shoal.embed.v1.TableFileFormat
-	22, // 19: shoal.embed.v1.StatusResponse.table_statuses:type_name -> shoal.embed.v1.TableStatus
-	2,  // 20: shoal.embed.v1.ShoalEmbed.CreateTable:input_type -> shoal.embed.v1.CreateTableRequest
-	6,  // 21: shoal.embed.v1.ShoalEmbed.Write:input_type -> shoal.embed.v1.WriteRequest
-	8,  // 22: shoal.embed.v1.ShoalEmbed.Scan:input_type -> shoal.embed.v1.ScanRequest
-	17, // 23: shoal.embed.v1.ShoalEmbed.Flush:input_type -> shoal.embed.v1.FlushRequest
-	19, // 24: shoal.embed.v1.ShoalEmbed.Compact:input_type -> shoal.embed.v1.CompactRequest
-	21, // 25: shoal.embed.v1.ShoalEmbed.Status:input_type -> shoal.embed.v1.StatusRequest
-	3,  // 26: shoal.embed.v1.ShoalEmbed.CreateTable:output_type -> shoal.embed.v1.CreateTableResponse
-	7,  // 27: shoal.embed.v1.ShoalEmbed.Write:output_type -> shoal.embed.v1.WriteResponse
-	16, // 28: shoal.embed.v1.ShoalEmbed.Scan:output_type -> shoal.embed.v1.ScanResponse
-	18, // 29: shoal.embed.v1.ShoalEmbed.Flush:output_type -> shoal.embed.v1.FlushResponse
-	20, // 30: shoal.embed.v1.ShoalEmbed.Compact:output_type -> shoal.embed.v1.CompactResponse
-	23, // 31: shoal.embed.v1.ShoalEmbed.Status:output_type -> shoal.embed.v1.StatusResponse
-	26, // [26:32] is the sub-list for method output_type
-	20, // [20:26] is the sub-list for method input_type
-	20, // [20:20] is the sub-list for extension type_name
-	20, // [20:20] is the sub-list for extension extendee
-	0,  // [0:20] is the sub-list for field type_name
+	6,  // 4: shoal.embed.v1.Mutation.entries:type_name -> shoal.embed.v1.Entry
+	7,  // 5: shoal.embed.v1.Mutation.conditions:type_name -> shoal.embed.v1.Condition
+	5,  // 6: shoal.embed.v1.WriteRequest.mutations:type_name -> shoal.embed.v1.Mutation
+	2,  // 7: shoal.embed.v1.MutationResult.status:type_name -> shoal.embed.v1.MutationStatus
+	9,  // 8: shoal.embed.v1.WriteResponse.results:type_name -> shoal.embed.v1.MutationResult
+	12, // 9: shoal.embed.v1.ScanRequest.term_filter:type_name -> shoal.embed.v1.TermFilter
+	14, // 10: shoal.embed.v1.ScanRequest.vector_search:type_name -> shoal.embed.v1.VectorSearch
+	16, // 11: shoal.embed.v1.ScanRequest.edge_expand:type_name -> shoal.embed.v1.EdgeExpand
+	15, // 12: shoal.embed.v1.ScanRequest.score_filter:type_name -> shoal.embed.v1.ScoreFilter
+	13, // 13: shoal.embed.v1.TermFilter.numeric_range:type_name -> shoal.embed.v1.NumericRange
+	17, // 14: shoal.embed.v1.EdgeExpand.edge_weights:type_name -> shoal.embed.v1.EdgeWeight
+	18, // 15: shoal.embed.v1.ScanResponse.cells:type_name -> shoal.embed.v1.Cell
+	0,  // 16: shoal.embed.v1.CompactRequest.workload:type_name -> shoal.embed.v1.TableWorkload
+	1,  // 17: shoal.embed.v1.CompactRequest.file_format:type_name -> shoal.embed.v1.TableFileFormat
+	0,  // 18: shoal.embed.v1.CompactResponse.workload:type_name -> shoal.embed.v1.TableWorkload
+	1,  // 19: shoal.embed.v1.CompactResponse.file_format:type_name -> shoal.embed.v1.TableFileFormat
+	0,  // 20: shoal.embed.v1.TableStatus.workload:type_name -> shoal.embed.v1.TableWorkload
+	1,  // 21: shoal.embed.v1.TableStatus.file_format:type_name -> shoal.embed.v1.TableFileFormat
+	25, // 22: shoal.embed.v1.StatusResponse.table_statuses:type_name -> shoal.embed.v1.TableStatus
+	3,  // 23: shoal.embed.v1.ShoalEmbed.CreateTable:input_type -> shoal.embed.v1.CreateTableRequest
+	8,  // 24: shoal.embed.v1.ShoalEmbed.Write:input_type -> shoal.embed.v1.WriteRequest
+	8,  // 25: shoal.embed.v1.ShoalEmbed.ConditionalWrite:input_type -> shoal.embed.v1.WriteRequest
+	11, // 26: shoal.embed.v1.ShoalEmbed.Scan:input_type -> shoal.embed.v1.ScanRequest
+	20, // 27: shoal.embed.v1.ShoalEmbed.Flush:input_type -> shoal.embed.v1.FlushRequest
+	22, // 28: shoal.embed.v1.ShoalEmbed.Compact:input_type -> shoal.embed.v1.CompactRequest
+	24, // 29: shoal.embed.v1.ShoalEmbed.Status:input_type -> shoal.embed.v1.StatusRequest
+	4,  // 30: shoal.embed.v1.ShoalEmbed.CreateTable:output_type -> shoal.embed.v1.CreateTableResponse
+	10, // 31: shoal.embed.v1.ShoalEmbed.Write:output_type -> shoal.embed.v1.WriteResponse
+	10, // 32: shoal.embed.v1.ShoalEmbed.ConditionalWrite:output_type -> shoal.embed.v1.WriteResponse
+	19, // 33: shoal.embed.v1.ShoalEmbed.Scan:output_type -> shoal.embed.v1.ScanResponse
+	21, // 34: shoal.embed.v1.ShoalEmbed.Flush:output_type -> shoal.embed.v1.FlushResponse
+	23, // 35: shoal.embed.v1.ShoalEmbed.Compact:output_type -> shoal.embed.v1.CompactResponse
+	26, // 36: shoal.embed.v1.ShoalEmbed.Status:output_type -> shoal.embed.v1.StatusResponse
+	30, // [30:37] is the sub-list for method output_type
+	23, // [23:30] is the sub-list for method input_type
+	23, // [23:23] is the sub-list for extension type_name
+	23, // [23:23] is the sub-list for extension extendee
+	0,  // [0:23] is the sub-list for field type_name
 }
 
 func init() { file_embed_proto_init() }
@@ -2059,13 +2324,17 @@ func file_embed_proto_init() {
 	if File_embed_proto != nil {
 		return
 	}
+	file_embed_proto_msgTypes[4].OneofWrappers = []any{
+		(*Condition_Absent)(nil),
+		(*Condition_ValueEquals)(nil),
+	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_embed_proto_rawDesc), len(file_embed_proto_rawDesc)),
-			NumEnums:      2,
-			NumMessages:   22,
+			NumEnums:      3,
+			NumMessages:   24,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

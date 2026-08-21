@@ -8,8 +8,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/phrocker/shoal/internal/rfile/bcfile"
-	"github.com/phrocker/shoal/internal/rfile/bcfile/block"
+	"github.com/phrocker/shoal-oss/internal/rfile/bcfile"
+	"github.com/phrocker/shoal-oss/internal/rfile/bcfile/block"
 )
 
 // roundtrip writes cells through Writer, reopens via Reader, drains, and

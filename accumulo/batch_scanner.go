@@ -7,8 +7,8 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/phrocker/shoal/internal/scanclient"
-	"github.com/phrocker/shoal/internal/thrift/gen/data"
+	"github.com/phrocker/shoal-oss/internal/scanclient"
+	"github.com/phrocker/shoal-oss/internal/thrift/gen/data"
 )
 
 // BatchScanner scans one or more ranges across tablet boundaries.

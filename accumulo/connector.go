@@ -4,13 +4,13 @@ import (
 	"errors"
 	"sync"
 
-	"github.com/phrocker/shoal/internal/ingestclient"
-	"github.com/phrocker/shoal/internal/managerclient"
-	"github.com/phrocker/shoal/internal/metadata"
-	"github.com/phrocker/shoal/internal/namespaces"
-	"github.com/phrocker/shoal/internal/scanclient"
-	"github.com/phrocker/shoal/internal/tablenames"
-	"github.com/phrocker/shoal/internal/transportpool"
+	"github.com/phrocker/shoal-oss/internal/ingestclient"
+	"github.com/phrocker/shoal-oss/internal/managerclient"
+	"github.com/phrocker/shoal-oss/internal/metadata"
+	"github.com/phrocker/shoal-oss/internal/namespaces"
+	"github.com/phrocker/shoal-oss/internal/scanclient"
+	"github.com/phrocker/shoal-oss/internal/tablenames"
+	"github.com/phrocker/shoal-oss/internal/transportpool"
 )
 
 // Connector is the root handle for Accumulo client operations.

@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/phrocker/shoal/internal/shoalql"
+	"github.com/phrocker/shoal-oss/internal/shoalql"
 )
 
 func explainDetails(t *testing.T, cat shoalql.Catalog, exec *shoalql.Executor, sql string) shoalql.ExplainDetails {

@@ -19,7 +19,7 @@ syntax = "proto3";
 
 package shoal.embed.v1;
 
-option go_package = "github.com/phrocker/shoal/internal/embedpb";
+option go_package = "github.com/phrocker/shoal-oss/internal/embedpb";
 
 // ShoalEmbed is the gRPC service for the embedded storage engine.
 // It exposes table management, writes, scans, compaction, and status.
@@ -27,8 +27,14 @@ service ShoalEmbed {
   // CreateTable creates a new table with optional split points.
   rpc CreateTable(CreateTableRequest) returns (CreateTableResponse);
 
-  // Write writes a batch of mutations to a table.
+  // Write writes an unconditional batch of mutations to a table.
   rpc Write(WriteRequest) returns (WriteResponse);
+
+  // ConditionalWrite atomically evaluates optional per-mutation conditions
+  // and writes accepted mutations. A separate RPC makes mixed-version clients
+  // fail closed: servers predating conditional writes return UNIMPLEMENTED
+  // instead of ignoring unknown condition fields and writing unconditionally.
+  rpc ConditionalWrite(WriteRequest) returns (WriteResponse);
 
   // Scan reads cells from a table. Results are streamed back.
   rpc Scan(ScanRequest) returns (stream ScanResponse);
@@ -84,6 +90,10 @@ message CreateTableResponse {
 message Mutation {
   bytes row = 1;
   repeated Entry entries = 2;
+  // Compare-and-set predicates used by ConditionalWrite. All conditions must
+  // match before any entry is written. Write rejects mutations that set this
+  // field so callers cannot accidentally depend on unknown-field behavior.
+  repeated Condition conditions = 3;
 }
 
 message Entry {
@@ -95,13 +105,45 @@ message Entry {
   bool delete = 6;
 }
 
+message Condition {
+  bytes column_family = 1;
+  bytes column_qualifier = 2;
+  // Visibility is part of an Accumulo cell coordinate. Conditions only
+  // inspect versions with this exact visibility; empty means empty visibility.
+  bytes column_visibility = 3;
+  // When present, inspect the exact timestamp. When absent, inspect the newest
+  // version at the coordinate; a newest tombstone makes the coordinate absent.
+  optional int64 timestamp = 4;
+  oneof predicate {
+    // Set true to require that no live value exists at the selected
+    // coordinate/version.
+    bool absent = 5;
+    // Require that the selected live value exactly equals these bytes.
+    bytes value_equals = 6;
+  }
+}
+
 message WriteRequest {
   string table = 1;
   repeated Mutation mutations = 2;
 }
 
+enum MutationStatus {
+  MUTATION_STATUS_UNSPECIFIED = 0;
+  MUTATION_STATUS_ACCEPTED = 1;
+  MUTATION_STATUS_REJECTED = 2;
+}
+
+message MutationResult {
+  MutationStatus status = 1;
+}
+
 message WriteResponse {
+  // Number of accepted mutations. For requests without conditions this
+  // remains equal to len(mutations), preserving the original contract.
   int32 written = 1;
+  // One result per request mutation, in request order.
+  repeated MutationResult results = 2;
 }
 
 // ── Scan ────────────────────────────────────────────────────────

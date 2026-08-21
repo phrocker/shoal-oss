@@ -23,8 +23,8 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/phrocker/shoal/internal/metadata"
-	"github.com/phrocker/shoal/internal/offlinecompact"
+	"github.com/phrocker/shoal-oss/internal/metadata"
+	"github.com/phrocker/shoal-oss/internal/offlinecompact"
 )
 
 func TestValidateReleaseCommitOptions(t *testing.T) {

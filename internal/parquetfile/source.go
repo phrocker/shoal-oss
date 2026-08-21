@@ -7,9 +7,9 @@ import (
 	"io"
 
 	"github.com/parquet-go/parquet-go"
-	"github.com/phrocker/shoal/internal/iterrt"
-	"github.com/phrocker/shoal/internal/rfile/wire"
-	"github.com/phrocker/shoal/internal/storage"
+	"github.com/phrocker/shoal-oss/internal/iterrt"
+	"github.com/phrocker/shoal-oss/internal/rfile/wire"
+	"github.com/phrocker/shoal-oss/internal/storage"
 )
 
 type FileOpener func() (storage.File, error)

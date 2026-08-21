@@ -15,10 +15,10 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/phrocker/shoal/accumulo"
-	publichdfs "github.com/phrocker/shoal/hdfs"
-	"github.com/phrocker/shoal/internal/storage"
-	publicrfile "github.com/phrocker/shoal/rfile"
+	"github.com/phrocker/shoal-oss/accumulo"
+	publichdfs "github.com/phrocker/shoal-oss/hdfs"
+	"github.com/phrocker/shoal-oss/internal/storage"
+	publicrfile "github.com/phrocker/shoal-oss/rfile"
 )
 
 //export shoal_scanner_config_init

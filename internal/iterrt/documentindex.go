@@ -24,8 +24,8 @@ import (
 	"sort"
 	"strconv"
 
-	"github.com/phrocker/shoal/internal/documentschema"
-	"github.com/phrocker/shoal/internal/rfile/wire"
+	"github.com/phrocker/shoal-oss/internal/documentschema"
+	"github.com/phrocker/shoal-oss/internal/rfile/wire"
 )
 
 // DocumentIndexIterator is the DataWave-style document retrieval pushdown

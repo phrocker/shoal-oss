@@ -21,14 +21,14 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/phrocker/shoal/internal/ingestrouter"
-	"github.com/phrocker/shoal/internal/metadata"
-	"github.com/phrocker/shoal/internal/mincauthority"
-	"github.com/phrocker/shoal/internal/rfile"
-	"github.com/phrocker/shoal/internal/storage"
-	"github.com/phrocker/shoal/internal/tabletloader"
-	"github.com/phrocker/shoal/internal/tserver"
-	"github.com/phrocker/shoal/internal/walauthority"
+	"github.com/phrocker/shoal-oss/internal/ingestrouter"
+	"github.com/phrocker/shoal-oss/internal/metadata"
+	"github.com/phrocker/shoal-oss/internal/mincauthority"
+	"github.com/phrocker/shoal-oss/internal/rfile"
+	"github.com/phrocker/shoal-oss/internal/storage"
+	"github.com/phrocker/shoal-oss/internal/tabletloader"
+	"github.com/phrocker/shoal-oss/internal/tserver"
+	"github.com/phrocker/shoal-oss/internal/walauthority"
 )
 
 type MetadataAuthority interface {

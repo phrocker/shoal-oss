@@ -39,7 +39,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/phrocker/shoal/internal/rfile/bcfile/block"
+	"github.com/phrocker/shoal-oss/internal/rfile/bcfile/block"
 )
 
 // defaultParityConfig is the standard C0 identity-compaction scenario.

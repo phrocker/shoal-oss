@@ -9,7 +9,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/phrocker/shoal/internal/rfile/bcfile"
+	"github.com/phrocker/shoal-oss/internal/rfile/bcfile"
 )
 
 // gzipBytes returns the BCFile-"gz"-compressed form of data, used to

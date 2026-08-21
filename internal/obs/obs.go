@@ -31,7 +31,7 @@ import (
 	"strings"
 	"sync/atomic"
 
-	"github.com/phrocker/shoal/internal/engine"
+	"github.com/phrocker/shoal-oss/internal/engine"
 )
 
 // Source is the read-only engine view the observability server reports on.

@@ -6,9 +6,9 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/phrocker/shoal/internal/managerclient"
-	"github.com/phrocker/shoal/internal/tablenames"
-	"github.com/phrocker/shoal/internal/zk"
+	"github.com/phrocker/shoal-oss/internal/managerclient"
+	"github.com/phrocker/shoal-oss/internal/tablenames"
+	"github.com/phrocker/shoal-oss/internal/zk"
 )
 
 // FlushTable requests a full-table flush. When wait is true, the call waits

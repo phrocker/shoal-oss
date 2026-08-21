@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/phrocker/shoal/internal/cred"
+	"github.com/phrocker/shoal-oss/internal/cred"
 )
 
 func TestPasswordCredentialsCopiesAndRedacts(t *testing.T) {

@@ -9,8 +9,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/phrocker/shoal/internal/ingestclient"
-	"github.com/phrocker/shoal/internal/thrift/gen/data"
+	"github.com/phrocker/shoal-oss/internal/ingestclient"
+	"github.com/phrocker/shoal-oss/internal/thrift/gen/data"
 )
 
 const (

@@ -21,7 +21,7 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/phrocker/shoal/internal/zk"
+	"github.com/phrocker/shoal-oss/internal/zk"
 )
 
 // FenceToken is an opaque continuity token for a table's OFFLINE guard.

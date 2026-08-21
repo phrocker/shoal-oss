@@ -2474,16 +2474,16 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
 
     def test_pinned_inventory_constants_are_internally_consistent(self) -> None:
         validator.validate_pinned_inventory_constants()
-        self.assertEqual(validator.EXPECTED_REVISION, 54)
+        self.assertEqual(validator.EXPECTED_REVISION, 55)
         self.assertEqual(validator.EXPECTED_TOTAL_ROWS, 3203)
-        self.assertEqual(validator.EXPECTED_REQUIRED_ROWS, 397)
+        self.assertEqual(validator.EXPECTED_REQUIRED_ROWS, 394)
         self.assertEqual(
             validator.EXPECTED_SCOPE_COUNTS,
             {
                 "Covered": 291,
                 "Approved divergence": 98,
-                "Required gap": 8,
-                "Optional": 2763,
+                "Required gap": 5,
+                "Optional": 2766,
                 "Not required": 43,
             },
         )
@@ -2537,22 +2537,26 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
         counts = validator.validate_scope_manifest(rows)
         self.assertEqual(dict(counts), validator.EXPECTED_SCOPE_COUNTS)
         entries = {entry[0]: entry for entry in validator.load_expected_scope()}
-        for row_id in ("SB-XCUT-014", "SB-XCUT-019", "SB-PKG-008", "SB-PKG-011"):
-            self.assertEqual(entries[row_id][1], "Required gap")
+        for row_id in ("SB-XCUT-014", "SB-XCUT-019", "SB-PKG-008"):
+            self.assertEqual(
+                entries[row_id][1:3],
+                ("Optional", "optional-deferred-macos-native"),
+            )
+        self.assertEqual(entries["SB-PKG-011"][1:3], ("Required gap", "core-required-gap"))
         for row_id in ("SB-PKG-012", "SB-PKG-013", "SB-TORCH-001", "SB-PANDA-001"):
             self.assertEqual(entries[row_id][1], "Optional")
 
     def test_scope_manifest_rejects_unjustified_bulk_reclassification(self) -> None:
         entries = list(validator.load_expected_scope())
-        index = next(i for i, entry in enumerate(entries) if entry[0] == "SB-PKG-008")
+        index = next(i for i, entry in enumerate(entries) if entry[0] == "SB-PKG-011")
         row_id, _disposition, _rule, status = entries[index]
-        entries[index] = (row_id, "Optional", "optional-python-extra", status)
+        entries[index] = (row_id, "Optional", "optional-deferred-macos-native", status)
         with mock.patch.object(validator, "load_expected_scope", return_value=tuple(entries)):
             self.assert_validation_fails(
                 lambda: validator.validate_scope_manifest(
                     validator.parse_rows(load_document_text().splitlines())[2]
                 ),
-                "unjustified scope classification for SB-PKG-008",
+                "unjustified scope classification for SB-PKG-011",
                 "change the normative rule set and its tests",
             )
 
@@ -2561,7 +2565,7 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
         lines[2] = "# Sharkbite source: unreviewed."
         self.assert_validation_fails(
             lambda: validator.validate_scope_manifest_provenance(lines),
-            "scope manifest provenance header does not match revision 54",
+            "scope manifest provenance header does not match revision 55",
         )
 
     def test_collect_c_abi_free_function_inventory_matches_header(self) -> None:

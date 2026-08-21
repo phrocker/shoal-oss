@@ -36,12 +36,13 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	ShoalEmbed_CreateTable_FullMethodName = "/shoal.embed.v1.ShoalEmbed/CreateTable"
-	ShoalEmbed_Write_FullMethodName       = "/shoal.embed.v1.ShoalEmbed/Write"
-	ShoalEmbed_Scan_FullMethodName        = "/shoal.embed.v1.ShoalEmbed/Scan"
-	ShoalEmbed_Flush_FullMethodName       = "/shoal.embed.v1.ShoalEmbed/Flush"
-	ShoalEmbed_Compact_FullMethodName     = "/shoal.embed.v1.ShoalEmbed/Compact"
-	ShoalEmbed_Status_FullMethodName      = "/shoal.embed.v1.ShoalEmbed/Status"
+	ShoalEmbed_CreateTable_FullMethodName      = "/shoal.embed.v1.ShoalEmbed/CreateTable"
+	ShoalEmbed_Write_FullMethodName            = "/shoal.embed.v1.ShoalEmbed/Write"
+	ShoalEmbed_ConditionalWrite_FullMethodName = "/shoal.embed.v1.ShoalEmbed/ConditionalWrite"
+	ShoalEmbed_Scan_FullMethodName             = "/shoal.embed.v1.ShoalEmbed/Scan"
+	ShoalEmbed_Flush_FullMethodName            = "/shoal.embed.v1.ShoalEmbed/Flush"
+	ShoalEmbed_Compact_FullMethodName          = "/shoal.embed.v1.ShoalEmbed/Compact"
+	ShoalEmbed_Status_FullMethodName           = "/shoal.embed.v1.ShoalEmbed/Status"
 )
 
 // ShoalEmbedClient is the client API for ShoalEmbed service.
@@ -53,8 +54,13 @@ const (
 type ShoalEmbedClient interface {
 	// CreateTable creates a new table with optional split points.
 	CreateTable(ctx context.Context, in *CreateTableRequest, opts ...grpc.CallOption) (*CreateTableResponse, error)
-	// Write writes a batch of mutations to a table.
+	// Write writes an unconditional batch of mutations to a table.
 	Write(ctx context.Context, in *WriteRequest, opts ...grpc.CallOption) (*WriteResponse, error)
+	// ConditionalWrite atomically evaluates optional per-mutation conditions
+	// and writes accepted mutations. A separate RPC makes mixed-version clients
+	// fail closed: servers predating conditional writes return UNIMPLEMENTED
+	// instead of ignoring unknown condition fields and writing unconditionally.
+	ConditionalWrite(ctx context.Context, in *WriteRequest, opts ...grpc.CallOption) (*WriteResponse, error)
 	// Scan reads cells from a table. Results are streamed back.
 	Scan(ctx context.Context, in *ScanRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ScanResponse], error)
 	// Flush forces memtables to RFiles for a table.
@@ -87,6 +93,16 @@ func (c *shoalEmbedClient) Write(ctx context.Context, in *WriteRequest, opts ...
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(WriteResponse)
 	err := c.cc.Invoke(ctx, ShoalEmbed_Write_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *shoalEmbedClient) ConditionalWrite(ctx context.Context, in *WriteRequest, opts ...grpc.CallOption) (*WriteResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(WriteResponse)
+	err := c.cc.Invoke(ctx, ShoalEmbed_ConditionalWrite_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -151,8 +167,13 @@ func (c *shoalEmbedClient) Status(ctx context.Context, in *StatusRequest, opts .
 type ShoalEmbedServer interface {
 	// CreateTable creates a new table with optional split points.
 	CreateTable(context.Context, *CreateTableRequest) (*CreateTableResponse, error)
-	// Write writes a batch of mutations to a table.
+	// Write writes an unconditional batch of mutations to a table.
 	Write(context.Context, *WriteRequest) (*WriteResponse, error)
+	// ConditionalWrite atomically evaluates optional per-mutation conditions
+	// and writes accepted mutations. A separate RPC makes mixed-version clients
+	// fail closed: servers predating conditional writes return UNIMPLEMENTED
+	// instead of ignoring unknown condition fields and writing unconditionally.
+	ConditionalWrite(context.Context, *WriteRequest) (*WriteResponse, error)
 	// Scan reads cells from a table. Results are streamed back.
 	Scan(*ScanRequest, grpc.ServerStreamingServer[ScanResponse]) error
 	// Flush forces memtables to RFiles for a table.
@@ -176,6 +197,9 @@ func (UnimplementedShoalEmbedServer) CreateTable(context.Context, *CreateTableRe
 }
 func (UnimplementedShoalEmbedServer) Write(context.Context, *WriteRequest) (*WriteResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Write not implemented")
+}
+func (UnimplementedShoalEmbedServer) ConditionalWrite(context.Context, *WriteRequest) (*WriteResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ConditionalWrite not implemented")
 }
 func (UnimplementedShoalEmbedServer) Scan(*ScanRequest, grpc.ServerStreamingServer[ScanResponse]) error {
 	return status.Error(codes.Unimplemented, "method Scan not implemented")
@@ -242,6 +266,24 @@ func _ShoalEmbed_Write_Handler(srv interface{}, ctx context.Context, dec func(in
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(ShoalEmbedServer).Write(ctx, req.(*WriteRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _ShoalEmbed_ConditionalWrite_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(WriteRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ShoalEmbedServer).ConditionalWrite(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ShoalEmbed_ConditionalWrite_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ShoalEmbedServer).ConditionalWrite(ctx, req.(*WriteRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -325,6 +367,10 @@ var ShoalEmbed_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "Write",
 			Handler:    _ShoalEmbed_Write_Handler,
+		},
+		{
+			MethodName: "ConditionalWrite",
+			Handler:    _ShoalEmbed_ConditionalWrite_Handler,
 		},
 		{
 			MethodName: "Flush",

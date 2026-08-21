@@ -15,7 +15,7 @@ import (
 	"time"
 	"unsafe"
 
-	publichdfs "github.com/phrocker/shoal/hdfs"
+	publichdfs "github.com/phrocker/shoal-oss/hdfs"
 )
 
 type ownedHDFSClient struct {

@@ -17,28 +17,28 @@
       "gate": "assignment-lifecycle",
       "kind": "go-test",
       "reference": "internal/tserverrpc/adapter_test.go#TestLifecycleReportsRemainOrderedDuringReconnect",
-      "source_sha256": "22f750514abe4ed0507b5f9d260e1c89a4194aaf19fb5650b4388caba3a61906",
+      "source_sha256": "a46f29e4de3d6610f66157a1ae8dee67a88fb821fc7912e6affc7f7331b6ed48",
       "replay_command": ["go", "test", "./internal/tserverrpc", "-run", "^TestLifecycleReportsRemainOrderedDuringReconnect$", "-count=1"]
     },
     {
       "gate": "ingest-minor-compaction",
       "kind": "go-test",
       "reference": "internal/hostedingest/tablet_test.go#TestTabletDurableCommitMinorCompactionAndAmbiguousResponses",
-      "source_sha256": "a6be11f9e377e9cbc4b33155e8b41c29b270cebac4ed1df1f77f24532e222f0d",
+      "source_sha256": "f73bb7e33b982a7ad9119c0d94f7940333dfd983bc96087c9e694838f3ee52da",
       "replay_command": ["go", "test", "./internal/hostedingest", "-run", "^TestTabletDurableCommitMinorCompactionAndAmbiguousResponses$", "-count=1"]
     },
     {
       "gate": "wal-recovery",
       "kind": "go-test",
       "reference": "internal/hostedingest/tablet_test.go#TestTabletRestartReplaysReferencedWALExactlyOnce",
-      "source_sha256": "a6be11f9e377e9cbc4b33155e8b41c29b270cebac4ed1df1f77f24532e222f0d",
+      "source_sha256": "f73bb7e33b982a7ad9119c0d94f7940333dfd983bc96087c9e694838f3ee52da",
       "replay_command": ["go", "test", "./internal/hostedingest", "-run", "^TestTabletRestartReplaysReferencedWALExactlyOnce$", "-count=1"]
     },
     {
       "gate": "restart-fencing",
       "kind": "go-test",
       "reference": "internal/hostedingest/tablet_test.go#TestTabletFencesStaleOwnerDuringCommit",
-      "source_sha256": "a6be11f9e377e9cbc4b33155e8b41c29b270cebac4ed1df1f77f24532e222f0d",
+      "source_sha256": "f73bb7e33b982a7ad9119c0d94f7940333dfd983bc96087c9e694838f3ee52da",
       "replay_command": ["go", "test", "./internal/hostedingest", "-run", "^TestTabletFencesStaleOwnerDuringCommit$", "-count=1"]
     }
   ]

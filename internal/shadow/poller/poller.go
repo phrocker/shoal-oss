@@ -51,8 +51,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/phrocker/shoal/internal/metadata"
-	"github.com/phrocker/shoal/internal/shadow/metrics"
+	"github.com/phrocker/shoal-oss/internal/metadata"
+	"github.com/phrocker/shoal-oss/internal/shadow/metrics"
 )
 
 // Event is one observed file-set change for a single tablet. EventKind

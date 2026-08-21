@@ -31,7 +31,7 @@ package memtable
 import (
 	"math/rand"
 
-	"github.com/phrocker/shoal/internal/rfile/wire"
+	"github.com/phrocker/shoal-oss/internal/rfile/wire"
 )
 
 const (

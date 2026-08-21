@@ -27,8 +27,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/phrocker/shoal/internal/thrift/gen/client"
-	"github.com/phrocker/shoal/internal/thrift/gen/security"
+	"github.com/phrocker/shoal-oss/internal/thrift/gen/client"
+	"github.com/phrocker/shoal-oss/internal/thrift/gen/security"
 )
 
 // DialCoordinator's happy path requires a live coordinator; we only

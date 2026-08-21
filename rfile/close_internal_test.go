@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/phrocker/shoal/accumulo"
+	"github.com/phrocker/shoal-oss/accumulo"
 )
 
 // TestWriterCloseRepeatsItsFailure pins that a failed finalization is never

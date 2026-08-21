@@ -40,7 +40,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	shstorage "github.com/phrocker/shoal/internal/storage"
+	shstorage "github.com/phrocker/shoal-oss/internal/storage"
 )
 
 // Backend opens GCS objects via a shared *storage.Client. Safe for
