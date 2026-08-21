@@ -193,6 +193,19 @@ func main() {
 		WALRoot: *walRoot, MincRoot: *mincRoot, StateRoot: *stateRoot,
 		WALStore: walauthority.NewLocalStore(), Outputs: files,
 		Metadata: metadataFactory, FlushCells: *flushCells,
+		FlushID: func(ctx context.Context, tableID string) (int64, error) {
+			raw, _, err := session.Get(path.Join(
+				loc.InstancePath(), "tables", tableID, "flush-id",
+			))
+			if err != nil {
+				return 0, err
+			}
+			flushID, err := strconv.ParseInt(string(raw), 10, 64)
+			if err != nil {
+				return 0, fmt.Errorf("parse flush ID for table %s: %w", tableID, err)
+			}
+			return flushID, nil
+		},
 	})
 	if err != nil {
 		die("hosted ingest: %v", err)

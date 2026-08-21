@@ -261,6 +261,7 @@ func (a *Authority) Commit(
 	if err := a.validateIdentity(request.Extent, request.Fence); err != nil {
 		return mincauthority.CommitRejected, err
 	}
+
 	fileQualifier, fileValue, err := encodeFile(request.File)
 	if err != nil {
 		return mincauthority.CommitRejected, err
@@ -313,6 +314,23 @@ func (a *Authority) Commit(
 		return mincauthority.CommitRejected, errors.Join(commitErr, readErr)
 	}
 	return mincauthority.CommitUnknown, errors.Join(commitErr, readErr)
+}
+
+func (a *Authority) UpdateFlushID(ctx context.Context, flushID int64) error {
+	if flushID < 0 {
+		return ErrInvalidConfig
+	}
+	status, err := a.mutate(ctx, a.ownerConditions(), []update{{
+		cf: []byte(metadata.CFServer), cq: []byte(metadata.CQFlushID),
+		value: []byte(strconv.FormatInt(flushID, 10)),
+	}})
+	if status == ingestclient.ConditionalAccepted {
+		return nil
+	}
+	if status == ingestclient.ConditionalRejected {
+		return errors.Join(ErrRejected, err)
+	}
+	return err
 }
 
 func (a *Authority) commitApplied(

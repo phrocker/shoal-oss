@@ -87,6 +87,7 @@ type Config struct {
 	WALStore       walauthority.Store
 	Outputs        storage.Backend
 	Metadata       MetadataFactory
+	FlushID        func(context.Context, string) (int64, error)
 	FlushCells     int
 	Now            func() time.Time
 	NewOperationID func() string
@@ -202,7 +203,7 @@ func (f *Factory) Open(
 	}()
 	tablet := &Tablet{
 		extent: extent, fence: fence, verifier: verifier, flushCells: f.cfg.FlushCells,
-		metadata:  metadata,
+		metadata: metadata, flushID: f.cfg.FlushID,
 		snapshots: make(map[string]mincauthority.Snapshot),
 		applied:   make(map[string]struct{}), assigned: make(map[string][]ingestrouter.Mutation),
 		timeType: timeType, tabletTime: tabletTime, nextTimestamp: nextTimestamp,
@@ -316,6 +317,7 @@ type Tablet struct {
 	tabletTime         int64
 	timestampExhausted bool
 	flushCells         int
+	flushID            func(context.Context, string) (int64, error)
 	newOperationID     func() string
 	pendingFlush       string
 	resume             []string
@@ -518,12 +520,28 @@ func (t *Tablet) Complete(ctx context.Context, snapshotID string, _ mincauthorit
 }
 
 func (t *Tablet) Flush(ctx context.Context) error {
+	var flushID int64
+	if t.flushID != nil {
+		var err error
+		flushID, err = t.flushID(ctx, t.extent.TableID)
+		if err != nil {
+			return err
+		}
+	}
 	t.opMu.Lock()
 	defer t.opMu.Unlock()
 	if err := t.resumePending(ctx); err != nil {
 		return err
 	}
-	return t.flush(ctx)
+	if err := t.flush(ctx); err != nil {
+		return err
+	}
+	if updater, ok := t.metadata.(interface {
+		UpdateFlushID(context.Context, int64) error
+	}); ok && t.flushID != nil {
+		return updater.UpdateFlushID(ctx, flushID)
+	}
+	return nil
 }
 
 func (t *Tablet) resumePending(ctx context.Context) error {
