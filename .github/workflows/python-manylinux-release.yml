@@ -11,12 +11,16 @@ on:
     branches: [main]
     paths:
       - ".github/workflows/python-manylinux-release.yml"
+      - "accumulo/**"
       - "capi/**"
       - "cmd/shoal-capi/**"
       - "docs/python-release.md"
       - "go.mod"
       - "go.sum"
+      - "hdfs/**"
+      - "internal/**"
       - "python/**"
+      - "rfile/**"
 
 permissions:
   contents: read
