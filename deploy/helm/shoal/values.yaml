@@ -1,3 +1,5 @@
+mode: single
+
 image:
   repository: ghcr.io/example/shoal
   tag: dev
@@ -13,6 +15,9 @@ objectStorage:
   gcsKeyJson: '{"type":"service_account","project_id":"REPLACE_ME"}'
 
 writeTier:
+  # null selects the safe default for mode; an explicit boolean remains
+  # available for compatibility with existing installations.
+  enabled: null
   replicas: 1
   dataDir: /var/lib/shoal
   grpcPort: 9876
@@ -55,6 +60,7 @@ writeTier:
     requireClientCert: false
 
 readFleet:
+  enabled: null
   replicas: 3
   listen: :9800
   servicePort: 9800
@@ -102,7 +108,7 @@ readFleet:
     maxUnavailable: 1
 
 tserver:
-  enabled: false
+  enabled: null
   replicas: 2
   thriftPort: 9997
   metricsPort: 9998
@@ -119,7 +125,7 @@ tserver:
   tls: {enabled: false, secretName: "", requireClientCert: false}
 
 compactor:
-  enabled: false
+  enabled: null
   replicas: 2
   thriftPort: 9810
   metricsPort: 9811

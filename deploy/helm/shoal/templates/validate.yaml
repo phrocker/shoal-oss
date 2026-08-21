@@ -1,0 +1,12 @@
+{{- $validModes := list "single" "distributed" "accumulo" -}}
+{{- if not (has .Values.mode $validModes) -}}
+{{- fail "mode must be one of: single, distributed, accumulo" -}}
+{{- end -}}
+{{- $writeTierEnabled := eq (include "shoal.writeTierEnabled" .) "true" -}}
+{{- $tserverEnabled := eq (include "shoal.tserverEnabled" .) "true" -}}
+{{- if and $writeTierEnabled $tserverEnabled -}}
+{{- fail "invalid write authority configuration: Shoal-only writeTier and Accumulo tserver cannot both be enabled" -}}
+{{- end -}}
+{{- if and (eq .Values.mode "distributed") $writeTierEnabled (gt (int .Values.writeTier.replicas) 1) -}}
+{{- fail "distributed mode supports exactly one writable writeTier replica until the Kubernetes Lease adapter exists" -}}
+{{- end -}}

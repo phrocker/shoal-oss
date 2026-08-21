@@ -65,15 +65,31 @@ For `shoal-tserver`, also replace `accumulo-instance-secret` and
 
 ## Deploy with Helm
 
+Choose one canonical deployment mode:
+
+- `single`: one Shoal-only write tier.
+- `distributed`: one Shoal-only write tier plus the read fleet.
+- `accumulo`: Accumulo tservers, read fleet, and compactors; no Shoal-only
+  write tier is rendered.
+
+Each example values file is installable with one command:
+
 ```bash
-helm upgrade --install shoal deploy/helm/shoal \
-  --set image.repository=ghcr.io/YOUR_ORG/shoal \
-  --set image.tag=TAG \
-  --set objectStorage.bucket=YOUR_BUCKET \
-  --set objectStorage.prefix=shards/shard-0000 \
-  --set readFleet.zk='zk-0.zk:2181,zk-1.zk:2181,zk-2.zk:2181' \
-  --set readFleet.accumuloPassword='REPLACE_ME'
+helm upgrade --install shoal deploy/helm/shoal -f deploy/helm/shoal/values-single.yaml
+helm upgrade --install shoal deploy/helm/shoal -f deploy/helm/shoal/values-distributed.yaml
+helm upgrade --install shoal deploy/helm/shoal -f deploy/helm/shoal/values-accumulo.yaml
 ```
+
+Replace the example image and environment-specific storage, ZooKeeper,
+credentials, and HDFS values before deployment. Role-level `enabled` values
+remain optional compatibility overrides; when omitted, `mode` selects the safe
+resource set above. Helm fails immediately if both Shoal-only `writeTier` and
+Accumulo `tserver` write authority are enabled.
+
+**Not production-ready:** distributed Shoal-only write coordination remains
+limited to one writable replica. Multiple writable replicas must not be used
+until the Kubernetes Lease adapter exists; the chart rejects that
+configuration.
 
 ## Wired binary flags and environment
 
