@@ -26,7 +26,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  MANYLINUX_IMAGE: quay.io/pypa/manylinux_2_28_x86_64@sha256:2e78900cf94fe627b4be0d1f6ff709e8bd4527ca8768103c5fb8c77d40bf3750
+  MANYLINUX_IMAGE: quay.io/pypa/manylinux_2_28_x86_64@sha256:0c87ccb5996dab6c3b7612ee4fda7b80c4ab3c44a86c2541e4a872afdf4f131b
 
 jobs:
   build:
