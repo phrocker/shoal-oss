@@ -126,6 +126,7 @@ type Adapter struct {
 	closed         bool
 	registered     bool
 	operations     map[string]*operation
+	flushing       map[string]struct{}
 	managerEpoch   tserver.LockID
 	managerSession uint64
 }
@@ -193,6 +194,7 @@ func New(ctx context.Context, cfg Config) (*Adapter, error) {
 		cancel:      cancel,
 		reportWake:  make(chan struct{}, 1),
 		operations:  make(map[string]*operation),
+		flushing:    make(map[string]struct{}),
 	}
 	go adapter.runReporter()
 	return adapter, nil
@@ -552,9 +554,24 @@ func (a *Adapter) Flush(
 		if !extentIntersects(tablet.Extent, startRow, endRow) {
 			continue
 		}
-		if err := a.backend.Flush(ctx, tablet.Extent); err != nil {
-			return err
+		key := extentKey(tablet.Extent)
+		a.mu.Lock()
+		if _, ok := a.flushing[key]; ok {
+			a.mu.Unlock()
+			continue
 		}
+		a.flushing[key] = struct{}{}
+		a.mu.Unlock()
+		go func(extent tserver.Extent, key string) {
+			defer func() {
+				a.mu.Lock()
+				delete(a.flushing, key)
+				a.mu.Unlock()
+			}()
+			if err := a.backend.Flush(a.ctx, extent); err != nil && a.onError != nil {
+				a.onError(fmt.Errorf("flush %s: %w", extent, err))
+			}
+		}(tablet.Extent, key)
 	}
 	return nil
 }
