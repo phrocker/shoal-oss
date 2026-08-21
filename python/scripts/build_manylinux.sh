@@ -34,10 +34,8 @@ export PIP_NO_INPUT=1
 git config --global --add safe.directory "$(pwd)"
 "${PYTHON_BIN}" -m pip install \
   --only-binary=:all: \
-  auditwheel==6.4.2 \
-  build==1.2.2.post1 \
-  setuptools==75.8.0 \
-  wheel==0.45.1
+  --require-hashes \
+  --requirement python/requirements-release.txt
 
 go version
 "${PYTHON_BIN}" --version

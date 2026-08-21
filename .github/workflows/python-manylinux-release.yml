@@ -34,15 +34,13 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       contents: read
-      id-token: write
-      attestations: write
     steps:
       - name: Checkout release source
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           fetch-depth: 0
           persist-credentials: false
-          ref: ${{ github.event_name == 'release' && github.event.release.tag_name || github.ref }}
+          ref: ${{ github.sha }}
 
       - name: Validate release tag
         shell: bash
@@ -86,7 +84,7 @@ jobs:
           rm -rf .release-first
 
       - name: Upload verified artifacts
-        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: shoal-sharkbite-manylinux-${{ github.sha }}
           path: |
@@ -97,26 +95,41 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+  attest:
+    name: Attest verified artifacts
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download verified artifacts
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+        with:
+          name: shoal-sharkbite-manylinux-${{ github.sha }}
+          path: dist
+
       - name: Attest release artifacts
-        if: github.event_name != 'pull_request'
         uses: actions/attest-build-provenance@43d14bc2b83dec42d39ecae14e916627a18bb661 # v3
         with:
           subject-path: |
-            python/dist/*.whl
-            python/dist/*.tar.gz
-            python/dist/SHA256SUMS
-            python/dist/release-manifest.json
+            dist/*.whl
+            dist/*.tar.gz
+            dist/SHA256SUMS
+            dist/release-manifest.json
 
   publish:
     name: Publish GitHub release assets
     if: github.event_name == 'release'
-    needs: build
+    needs: [build, attest]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
       - name: Download verified artifacts
-        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
         with:
           name: shoal-sharkbite-manylinux-${{ github.sha }}
           path: dist
@@ -126,4 +139,4 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ github.event.release.tag_name }}
-        run: gh release upload "$RELEASE_TAG" dist/*
+        run: gh release upload "$RELEASE_TAG" dist/* --repo "$GITHUB_REPOSITORY"
