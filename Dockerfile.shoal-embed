@@ -1,7 +1,6 @@
 # syntax=docker/dockerfile:1.7
 
-ARG GO_IMAGE=golang:1.25.0-bookworm@sha256:1b7b9f0f0e0a1d2155f531db587cc48ec26aaf97ab64364225f5bf18a054e66a
-ARG RUNTIME_IMAGE=gcr.io/distroless/static-debian12:nonroot@sha256:81dc45d05a7444ead8c92a389621fafabc8e40f8fd1a19d7e5df14e61e98bc1a
+ARG GO_IMAGE=golang@sha256:ebd54034f076819b3054f155db53660ded951612bb4dfd277f933e62059e5d5a
 
 FROM --platform=$BUILDPLATFORM ${GO_IMAGE} AS build
 WORKDIR /src
@@ -29,7 +28,10 @@ RUN --mount=type=cache,target=/go/pkg/mod \
       -o /out/shoal-embed ./cmd/shoal-embed \
  && mkdir -p /out/data
 
-FROM ${RUNTIME_IMAGE}
+FROM --platform=linux/amd64 gcr.io/distroless/static-debian12@sha256:b7ebc675e6df3e26840de28a9d119969806b5542902111bfd111964d0930c08a AS runtime-amd64
+FROM --platform=linux/arm64 gcr.io/distroless/static-debian12@sha256:ff3d007f159ebbbdf9130affa1125b10c50a909821c7130419df4e979a197c79 AS runtime-arm64
+
+FROM runtime-${TARGETARCH}
 
 ARG VERSION=dev
 ARG REVISION=unknown
