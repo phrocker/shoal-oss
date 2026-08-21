@@ -75,17 +75,16 @@ live adapter is unavailable.
 | Windows shared/static ABI and wheel artifacts | Shipped |
 | Linux manylinux distribution | Shipped |
 | Native macOS dylib/wheel runtime and Mach-O verification | Optional/deferred by @phrocker on 2026-08-20 |
-| Controlled Linux manylinux release workflow | Infrastructure blocked — local release tooling exists, but the repository workflow still requires workflow-authorized credentials; macOS publication is optional |
+| Controlled Linux manylinux release workflow | Shipped and main-verified in run [32493148857](https://github.com/phrocker/shoal-oss/actions/runs/32493148857); macOS publication is optional |
 
 The normative matrix is
 [`docs/sharkbite-compatibility.md`](docs/sharkbite-compatibility.md), with
 scope defined by
 [`docs/sharkbite-client-scope.md`](docs/sharkbite-client-scope.md). Revision
-55 satisfies 389 of 394 required rows. The five remaining rows require
-external evidence:
+56 satisfies 390 of 394 required rows. The four remaining rows require live
+Accumulo 4 evidence:
 
-- Linux release automation: `SB-PKG-011`;
-- live Accumulo 4: `SB-SCAN-022`, `SB-SCAN-026`, `SB-XCUT-015`,
+- `SB-SCAN-022`, `SB-SCAN-026`, `SB-XCUT-015`,
   `SB-XCUT-016`.
 
 Native macOS publication/runtime rows `SB-PKG-008`, `SB-XCUT-014`, and
