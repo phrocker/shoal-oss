@@ -48,6 +48,7 @@ func (s *Server) scanTabletRanges(
 	}
 
 	wantedCFs := wantedCFsFromColumns(columns)
+	columnMatcher := buildColumnMatcher(columns)
 
 	// Open every file → one fileIter per LG (with CF pushdown). We open
 	// without seeking; per-range Seek lands them at each range's start.
@@ -98,6 +99,14 @@ func (s *Server) scanTabletRanges(
 				// Don't push back — this iter is past the range stop. It
 				// stays out of the heap for the rest of THIS range, but
 				// the next range will Seek it again.
+				continue
+			}
+
+			if columnMatcher != nil && !columnMatcher.match(k.ColumnFamily, k.ColumnQualifier) {
+				it.advance()
+				if pk, _ := it.peek(); pk != nil {
+					heap.Push(h, it)
+				}
 				continue
 			}
 

@@ -120,6 +120,45 @@ func TestStartScan_SingleFileFullRange(t *testing.T) {
 	}
 }
 
+func TestStartScan_FiltersRequestedColumns(t *testing.T) {
+	mem := memory.New()
+	const filePath = "gs://test-bucket/tables/1/t-aaa/A0000.rf"
+	writeRFileToMemory(t, mem, filePath, []cellSpec{
+		{row: "r01", cf: "file", cq: "a", value: "file", ts: 1},
+		{row: "r01", cf: "loc", cq: "session", value: "host:9997", ts: 1},
+		{row: "r01", cf: "srv", cq: "flush", value: "7", ts: 1},
+		{row: "r01", cf: "srv", cq: "lock", value: "lock", ts: 1},
+	})
+	srv, err := NewServer(Options{
+		Locator: &stubLocator{tablets: map[string][]metadata.TabletInfo{
+			"1": {{TableID: "1", Files: []metadata.FileEntry{{Path: filePath}}}},
+		}},
+		Storage: mem,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	resp, err := srv.StartScan(context.Background(), nil, nil,
+		&data.TKeyExtent{Table: []byte("1")},
+		&data.TRange{InfiniteStartKey: true, InfiniteStopKey: true},
+		[]*data.TColumn{
+			{ColumnFamily: []byte("loc")},
+			{ColumnFamily: []byte("srv"), ColumnQualifier: []byte("flush")},
+		},
+		0, nil, nil, nil, false, false, 0, nil, 0, "", nil, 0,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := resp.Result_.Results; len(got) != 2 ||
+		string(got[0].Key.ColFamily) != "loc" ||
+		string(got[1].Key.ColFamily) != "srv" ||
+		string(got[1].Key.ColQualifier) != "flush" {
+		t.Fatalf("filtered results = %#v", got)
+	}
+}
+
 // TestStartScan_MultiFileMergeAndDedupe: two RFiles in one tablet; the
 // second has an updated version (higher ts) of one cell. Scan should
 // emit each (row,cf,cq,cv) once, with the latest version.
