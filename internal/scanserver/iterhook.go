@@ -17,6 +17,7 @@ import (
 )
 
 const wholeRowIteratorClassName = "org.apache.accumulo.core.iterators.user.WholeRowIterator"
+const rowFateStatusFilterClassName = "org.apache.accumulo.core.fate.user.RowFateStatusFilter"
 const tabletManagementIteratorClassName = "org.apache.accumulo.server.manager.state.TabletManagementIterator"
 const hasMigrationFilterClassName = "org.apache.accumulo.core.metadata.schema.filters.HasMigrationFilter"
 const hasExternalCompactionsFilterClassName = "org.apache.accumulo.core.metadata.schema.filters.HasExternalCompactionsFilter"
@@ -98,6 +99,31 @@ func buildPostProcessor(ssiList []*data.IterInfo, ssio map[string]map[string]str
 				maxBufferSize = parsed
 			}
 			picked = &wholeRowProcessor{maxBufferSize: maxBufferSize}
+		case rowFateStatusFilterClassName:
+			if picked != nil {
+				return nil, fmt.Errorf("scanserver: multiple shoal-recognized iterators not supported in V1")
+			}
+			statuses := make(map[string]struct{})
+			for _, status := range strings.Split(ssio[info.IterName]["statuses"], ",") {
+				if status != "" {
+					statuses[status] = struct{}{}
+				}
+			}
+			picked = &wholeRowProcessor{
+				maxBufferSize: math.MaxInt64,
+				accept: func(cells []wholeRowCell) bool {
+					for _, cell := range cells {
+						if string(cell.key.ColumnFamily) != "txadmin" ||
+							string(cell.key.ColumnQualifier) != "status" {
+							continue
+						}
+						if _, ok := statuses[string(cell.value)]; ok {
+							return true
+						}
+					}
+					return false
+				},
+			}
 		case tabletManagementIteratorClassName:
 			if picked != nil {
 				return nil, fmt.Errorf("scanserver: multiple shoal-recognized iterators not supported in V1")
@@ -196,6 +222,7 @@ type wholeRowProcessor struct {
 	current       []wholeRowCell
 	bufferSize    int64
 	maxBufferSize int64
+	accept        func([]wholeRowCell) bool
 	results       []*data.TKeyValue
 	overflow      error
 }
@@ -245,7 +272,9 @@ func (p *wholeRowProcessor) flush() {
 	if len(p.current) == 0 {
 		return
 	}
-	p.results = append(p.results, encodeWholeRow(p.currentRow, p.current))
+	if p.accept == nil || p.accept(p.current) {
+		p.results = append(p.results, encodeWholeRow(p.currentRow, p.current))
+	}
 	p.currentRow = nil
 	p.current = nil
 	p.bufferSize = 0

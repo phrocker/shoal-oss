@@ -225,6 +225,35 @@ func TestWholeRowProcessorEnforcesMaxBufferSize(t *testing.T) {
 	}
 }
 
+func TestRowFateStatusFilter(t *testing.T) {
+	processor, err := buildPostProcessor(
+		[]*data.IterInfo{{
+			Priority: 100, ClassName: rowFateStatusFilterClassName, IterName: "statuses",
+		}},
+		map[string]map[string]string{"statuses": {"statuses": "NEW,IN_PROGRESS"}},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	processor.offer(&wire.Key{
+		Row: []byte("accepted"), ColumnFamily: []byte("txadmin"),
+		ColumnQualifier: []byte("status"), Timestamp: 2,
+	}, []byte("IN_PROGRESS"))
+	processor.offer(&wire.Key{
+		Row: []byte("accepted"), ColumnFamily: []byte("tx"),
+		ColumnQualifier: []byte("ctime"), Timestamp: 1,
+	}, []byte("1"))
+	processor.offer(&wire.Key{
+		Row: []byte("rejected"), ColumnFamily: []byte("txadmin"),
+		ColumnQualifier: []byte("status"), Timestamp: 1,
+	}, []byte("SUCCESSFUL"))
+
+	got := processor.drain()
+	if len(got) != 1 || string(got[0].Key.Row) != "accepted" {
+		t.Fatalf("drain = %#v, want only accepted row", got)
+	}
+}
+
 func TestWholeRowProcessorParsesAccumuloMemory(t *testing.T) {
 	for input, want := range map[string]int64{
 		"1": 1, "2B": 2, "3k": 3 << 10, "4M": 4 << 20, "5g": 5 << 30,
