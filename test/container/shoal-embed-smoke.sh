@@ -49,7 +49,8 @@ test "$(docker run --rm --entrypoint /usr/local/bin/shoal-embed "${IMAGE}" versi
 container="$(docker run --detach --publish 127.0.0.1::9877 "${IMAGE}")"
 host_port="$(docker port "${container}" 9877/tcp | awk -F: 'NR == 1 { print $NF }')"
 for _ in $(seq 1 30); do
-  if curl --fail --silent "http://127.0.0.1:${host_port}/readyz" >/dev/null; then
+  if curl --fail --silent "http://127.0.0.1:${host_port}/readyz" >/dev/null \
+    && curl --fail --silent "http://127.0.0.1:${host_port}/healthz" >/dev/null; then
     echo "shoal-embed container smoke test passed (${IMAGE})"
     exit 0
   fi

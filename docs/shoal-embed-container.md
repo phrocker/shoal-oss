@@ -35,7 +35,9 @@ protoc --python_out=. --grpc_python_out=. embed.proto
 
 The same file can be downloaded without a container runtime from
 `https://raw.githubusercontent.com/phrocker/shoal-oss/v1.2.3/proto/embed.proto`.
-Keep the image tag and proto tag identical.
+The publication workflow removes the leading `v` from image tags: source tag
+`v1.2.3` publishes image tag `1.2.3`. Use the same semantic version in both
+places.
 
 ## Reproducible local build and smoke test
 
