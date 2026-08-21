@@ -379,6 +379,45 @@ func TestConditionsMatchSetEncodingIteratorEmptyFamily(t *testing.T) {
 	}
 }
 
+func TestConditionsMatchRowExistsIterator(t *testing.T) {
+	symbols := []string{"rowExists", rowExistsIteratorClass}
+	condition := &data.TCondition{
+		Iterators: []byte{1, 0, 1, 10, 0},
+	}
+	matched, err := conditionsMatch([]byte("r"), []*data.TCondition{condition}, nil, symbols)
+	if err != nil || !matched {
+		t.Fatalf("absent row matched=%v err=%v", matched, err)
+	}
+	matched, err = conditionsMatch([]byte("r"), []*data.TCondition{condition}, []ingestrouter.Cell{{
+		Row: []byte("r"), ColumnFamily: []byte("tx"), ColumnQualifier: []byte("status"),
+		Value: []byte("NEW"), Timestamp: 1,
+	}}, symbols)
+	if err != nil || matched {
+		t.Fatalf("existing row matched=%v err=%v", matched, err)
+	}
+}
+
+func TestConditionsMatchStatusMappingIterator(t *testing.T) {
+	symbols := []string{"status", statusMappingIteratorClass, "statusSet", "NEW,IN_PROGRESS"}
+	condition := &data.TCondition{
+		Cf: []byte("tx"), Cq: []byte("status"), Val: []byte("present"),
+		Iterators: []byte{1, 0, 1, 100, 1, 2, 3},
+	}
+	cells := []ingestrouter.Cell{{
+		Row: []byte("r"), ColumnFamily: []byte("tx"), ColumnQualifier: []byte("status"),
+		Value: []byte("IN_PROGRESS"), Timestamp: 1,
+	}}
+	matched, err := conditionsMatch([]byte("r"), []*data.TCondition{condition}, cells, symbols)
+	if err != nil || !matched {
+		t.Fatalf("accepted status matched=%v err=%v", matched, err)
+	}
+	cells[0].Value = []byte("FAILED")
+	matched, err = conditionsMatch([]byte("r"), []*data.TCondition{condition}, cells, symbols)
+	if err != nil || matched {
+		t.Fatalf("rejected status matched=%v err=%v", matched, err)
+	}
+}
+
 func TestWriteAuthorizationFailureIsReportedSeparately(t *testing.T) {
 	router, err := ingestrouter.New(&fakeDirectory{
 		tablets: make(map[string]*fakeTablet), errs: make(map[string]error),

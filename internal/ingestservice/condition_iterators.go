@@ -7,12 +7,17 @@ import (
 	"fmt"
 	"sort"
 	"strconv"
+	"strings"
 
 	"github.com/phrocker/shoal/internal/ingestrouter"
 	"github.com/phrocker/shoal/internal/thrift/gen/data"
 )
 
-const setEncodingIteratorClass = "org.apache.accumulo.server.metadata.iterators.SetEncodingIterator"
+const (
+	rowExistsIteratorClass     = "org.apache.accumulo.core.fate.user.RowExistsIterator"
+	statusMappingIteratorClass = "org.apache.accumulo.core.fate.user.StatusMappingIterator"
+	setEncodingIteratorClass   = "org.apache.accumulo.server.metadata.iterators.SetEncodingIterator"
+)
 
 type conditionIterator struct {
 	class   string
@@ -80,11 +85,24 @@ func validateConditionIterators(encoded []byte, symbols []string) (bool, error) 
 	if len(iterators) == 0 {
 		return false, nil
 	}
-	if len(iterators) != 1 || iterators[0].class != setEncodingIteratorClass {
+	if len(iterators) != 1 {
 		return false, fmt.Errorf("unsupported condition iterators %#v", iterators)
 	}
-	if _, err := strconv.ParseBool(iterators[0].options["concat.value"]); err != nil {
-		return false, errors.New("invalid SetEncodingIterator concat.value")
+	switch iterator := iterators[0]; iterator.class {
+	case rowExistsIteratorClass:
+		if len(iterator.options) != 0 {
+			return false, errors.New("RowExistsIterator does not accept options")
+		}
+	case statusMappingIteratorClass:
+		if iterator.options["statusSet"] == "" {
+			return false, errors.New("StatusMappingIterator requires statusSet")
+		}
+	case setEncodingIteratorClass:
+		if _, err := strconv.ParseBool(iterator.options["concat.value"]); err != nil {
+			return false, errors.New("invalid SetEncodingIterator concat.value")
+		}
+	default:
+		return false, fmt.Errorf("unsupported condition iterator %q", iterator.class)
 	}
 	return true, nil
 }
@@ -144,7 +162,73 @@ func iteratorConditionMatches(
 	if err != nil {
 		return false, err
 	}
-	concat, err := strconv.ParseBool(iterators[0].options["concat.value"])
+	switch iterator := iterators[0]; iterator.class {
+	case rowExistsIteratorClass:
+		return rowExistsConditionMatches(row, condition, cells), nil
+	case statusMappingIteratorClass:
+		return statusMappingConditionMatches(row, condition, cells, iterator.options["statusSet"]), nil
+	case setEncodingIteratorClass:
+		return setEncodingConditionMatches(row, condition, cells, iterator.options["concat.value"])
+	default:
+		return false, fmt.Errorf("unsupported condition iterator %q", iterator.class)
+	}
+}
+
+func rowExistsConditionMatches(
+	row []byte,
+	condition *data.TCondition,
+	cells []ingestrouter.Cell,
+) bool {
+	for _, cell := range latestRowCells(row, cells) {
+		if !cell.Deleted {
+			return condition.Val != nil && bytes.Equal(cell.Value, condition.Val)
+		}
+	}
+	return condition.Val == nil
+}
+
+func statusMappingConditionMatches(
+	row []byte,
+	condition *data.TCondition,
+	cells []ingestrouter.Cell,
+	statusSet string,
+) bool {
+	var current *ingestrouter.Cell
+	for i := range cells {
+		cell := &cells[i]
+		if !bytes.Equal(cell.Row, row) ||
+			!bytes.Equal(cell.ColumnFamily, condition.Cf) ||
+			!bytes.Equal(cell.ColumnQualifier, condition.Cq) ||
+			!bytes.Equal(cell.ColumnVisibility, condition.Cv) {
+			continue
+		}
+		if condition.HasTimestamp && cell.Timestamp != condition.Ts {
+			continue
+		}
+		if current == nil || cell.Timestamp >= current.Timestamp {
+			current = cell
+		}
+	}
+	if current == nil || current.Deleted {
+		return condition.Val == nil
+	}
+	mapped := []byte("absent")
+	for _, accepted := range strings.Split(statusSet, ",") {
+		if string(current.Value) == accepted {
+			mapped = []byte("present")
+			break
+		}
+	}
+	return bytes.Equal(mapped, condition.Val)
+}
+
+func setEncodingConditionMatches(
+	row []byte,
+	condition *data.TCondition,
+	cells []ingestrouter.Cell,
+	concatValue string,
+) (bool, error) {
+	concat, err := strconv.ParseBool(concatValue)
 	if err != nil {
 		return false, errors.New("invalid SetEncodingIterator concat.value")
 	}
@@ -182,4 +266,23 @@ func iteratorConditionMatches(
 	}
 	_ = binary.Write(&encoded, binary.BigEndian, int32(len(entries)))
 	return bytes.Equal(encoded.Bytes(), condition.Val), nil
+}
+
+func latestRowCells(row []byte, cells []ingestrouter.Cell) []ingestrouter.Cell {
+	latest := make(map[string]ingestrouter.Cell)
+	for _, cell := range cells {
+		if !bytes.Equal(cell.Row, row) {
+			continue
+		}
+		key := string(cell.ColumnFamily) + "\x00" + string(cell.ColumnQualifier) +
+			"\x00" + string(cell.ColumnVisibility)
+		if previous, ok := latest[key]; !ok || cell.Timestamp >= previous.Timestamp {
+			latest[key] = cell
+		}
+	}
+	out := make([]ingestrouter.Cell, 0, len(latest))
+	for _, cell := range latest {
+		out = append(out, cell)
+	}
+	return out
 }
