@@ -3,6 +3,7 @@ package scanserver
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"testing"
 
@@ -13,6 +14,8 @@ import (
 	"github.com/phrocker/shoal/internal/rfile/wire"
 	"github.com/phrocker/shoal/internal/storage/memory"
 	"github.com/phrocker/shoal/internal/thrift/gen/data"
+	"github.com/phrocker/shoal/internal/thrift/gen/tabletserver"
+	"github.com/phrocker/shoal/internal/tserverprocess"
 )
 
 // stubLocator returns a fixed tablet list for one table. Satisfies
@@ -231,8 +234,8 @@ func TestStartScan_BoundedRange(t *testing.T) {
 	resp, err := srv.StartScan(context.Background(), nil, nil,
 		&data.TKeyExtent{Table: []byte("1")},
 		&data.TRange{
-			Start: &data.TKey{Row: []byte("row05"), ColFamily: nil, ColQualifier: nil, ColVisibility: nil, Timestamp: 1<<63 - 1},
-			Stop:  &data.TKey{Row: []byte("row10"), ColFamily: nil, ColQualifier: nil, ColVisibility: nil, Timestamp: 1<<63 - 1},
+			Start:             &data.TKey{Row: []byte("row05"), ColFamily: nil, ColQualifier: nil, ColVisibility: nil, Timestamp: 1<<63 - 1},
+			Stop:              &data.TKey{Row: []byte("row10"), ColFamily: nil, ColQualifier: nil, ColVisibility: nil, Timestamp: 1<<63 - 1},
 			StartKeyInclusive: true,
 			StopKeyInclusive:  false,
 		},
@@ -308,5 +311,33 @@ func TestStartScan_NoMatchingTablet(t *testing.T) {
 	)
 	if err == nil {
 		t.Errorf("expected error for unknown extent")
+	}
+}
+
+type errorLocator struct {
+	err error
+}
+
+func (l errorLocator) LocateTable(context.Context, string) ([]metadata.TabletInfo, error) {
+	return nil, l.err
+}
+
+func TestStartScan_NotHostedReturnsNotServingTablet(t *testing.T) {
+	srv, _ := NewServer(Options{
+		Locator: errorLocator{err: tserverprocess.ErrNotHosted},
+		Storage: memory.New(),
+	})
+	extent := &data.TKeyExtent{Table: []byte("1")}
+
+	_, err := srv.StartScan(context.Background(), nil, nil, extent,
+		&data.TRange{InfiniteStartKey: true, InfiniteStopKey: true},
+		nil, 0, nil, nil, nil, false, false, 0, nil, 0, "", nil, 0,
+	)
+	var notServing *tabletserver.NotServingTabletException
+	if !errors.As(err, &notServing) {
+		t.Fatalf("StartScan error = %v, want NotServingTabletException", err)
+	}
+	if notServing.Extent != extent {
+		t.Fatalf("exception extent = %#v, want %#v", notServing.Extent, extent)
 	}
 }

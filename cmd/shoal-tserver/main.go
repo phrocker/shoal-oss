@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"path"
 	"strconv"
 	"strings"
 	"syscall"
@@ -137,6 +138,14 @@ func main() {
 	if sessionGeneration == "0" {
 		die("ZooKeeper session has no identity")
 	}
+	lockPath, err := tserver.TabletServerLockPath(loc.InstancePath(), *group, *advertise)
+	if err != nil {
+		die("tablet-server lock path: %v", err)
+	}
+	lockIDPath, err := tserver.TabletServerLockIDPath(*group, *advertise)
+	if err != nil {
+		die("tablet-server lock ID path: %v", err)
+	}
 	pool, err := transportpool.New(transportpool.Config{IdleTimeout: time.Minute, MaxIdlePerEndpoint: 4})
 	if err != nil {
 		die("transport pool: %v", err)
@@ -215,7 +224,7 @@ func main() {
 			if !ok {
 				return ""
 			}
-			return lock.String()
+			return path.Join(lockIDPath, lock.String()) + "$" + sessionGeneration
 		},
 	})
 	if err != nil {
@@ -308,10 +317,6 @@ func main() {
 		Host: host, Release: adapter.ReleaseDropped, RetryBackoff: time.Second,
 		OnError: func(err error) { logger.Warn("ServiceLock generation ended", "error", err) },
 		NewGeneration: func() (*tserver.ServiceLock, tserver.ServiceLockData, error) {
-			lockPath, err := tserver.TabletServerLockPath(loc.InstancePath(), *group, *advertise)
-			if err != nil {
-				return nil, tserver.ServiceLockData{}, err
-			}
 			lock, err := tserver.NewServiceLock(zk.LockSession{SharedSession: session}, tserver.ServiceLockOptions{
 				Path: lockPath, VerifyInterval: *lockVerify,
 			})

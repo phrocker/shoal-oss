@@ -2,6 +2,7 @@ package scanserver
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -13,6 +14,8 @@ import (
 	"github.com/phrocker/shoal/internal/thrift/gen/data"
 	"github.com/phrocker/shoal/internal/thrift/gen/security"
 	"github.com/phrocker/shoal/internal/thrift/gen/tabletscan"
+	"github.com/phrocker/shoal/internal/thrift/gen/tabletserver"
+	"github.com/phrocker/shoal/internal/tserverprocess"
 	"github.com/phrocker/shoal/internal/visfilter"
 )
 
@@ -77,6 +80,9 @@ func (s *Server) StartScan(
 
 	files, err := s.lookupFiles(ctx, extent, rangeArg)
 	if err != nil {
+		if errors.Is(err, tserverprocess.ErrNotHosted) {
+			return nil, &tabletserver.NotServingTabletException{Extent: extent}
+		}
 		return nil, fmt.Errorf("lookup files: %w", err)
 	}
 	s.logger.LogAttrs(ctx, slog.LevelDebug, "scan: tablet→files",

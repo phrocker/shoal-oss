@@ -559,9 +559,7 @@ func (a *Authority) lockID() string {
 	if !ok {
 		return ""
 	}
-	lockPath, err := tserver.TabletServerLockPath(
-		a.factory.cfg.InstancePath, a.factory.cfg.Group, a.factory.cfg.Address,
-	)
+	lockPath, err := tserver.TabletServerLockIDPath(a.factory.cfg.Group, a.factory.cfg.Address)
 	if err != nil {
 		return ""
 	}

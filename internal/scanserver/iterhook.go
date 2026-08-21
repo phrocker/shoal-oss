@@ -21,6 +21,7 @@ const tabletManagementIteratorClassName = "org.apache.accumulo.server.manager.st
 const hasMigrationFilterClassName = "org.apache.accumulo.core.metadata.schema.filters.HasMigrationFilter"
 const hasExternalCompactionsFilterClassName = "org.apache.accumulo.core.metadata.schema.filters.HasExternalCompactionsFilter"
 const hasCurrentFilterClassName = "org.apache.accumulo.core.metadata.schema.filters.HasCurrentFilter"
+const gcWalsFilterClassName = "org.apache.accumulo.core.metadata.schema.filters.GcWalsFilter"
 
 // cellPostProcessor consumes cells from the heap-merge in the order
 // they would have been emitted, then produces the final result list.
@@ -124,6 +125,11 @@ func buildPostProcessor(ssiList []*data.IterInfo, ssio map[string]map[string]str
 				return nil, fmt.Errorf("scanserver: multiple shoal-recognized iterators not supported in V1")
 			}
 			picked = newMetadataColumnFilter(metadata.CFCurrentLocation, "")
+		case gcWalsFilterClassName:
+			if picked != nil {
+				return nil, fmt.Errorf("scanserver: multiple shoal-recognized iterators not supported in V1")
+			}
+			picked = newGcWalsFilter(ssio[info.IterName]["liveTservers"])
 		default:
 			// Unknown iterator. Java would error if a class wasn't on
 			// the classpath; shoal mirrors this rather than silently

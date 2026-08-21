@@ -32,3 +32,32 @@ func TestHasMigrationProcessorFiltersRows(t *testing.T) {
 		}
 	}
 }
+
+func TestGcWalsFilterFiltersRows(t *testing.T) {
+	processor := newGcWalsFilter("live:9997[abc],other:9997[def]")
+	offer := func(row, cf, cq, value string) {
+		t.Helper()
+		processor.offer(&wire.Key{
+			Row: []byte(row), ColumnFamily: []byte(cf), ColumnQualifier: []byte(cq),
+		}, []byte(value))
+	}
+
+	offer("1;dead", metadata.CFCurrentLocation, "123", "dead:9997")
+	offer("1;dead", metadata.CFTabletSection, metadata.CQPrevRow, "")
+	offer("1;live", metadata.CFCurrentLocation, "abc", "live:9997")
+	offer("1;live", metadata.CFTabletSection, metadata.CQPrevRow, "")
+	offer("1;logs", metadata.CFCurrentLocation, "def", "other:9997")
+	offer("1;logs", metadata.CFLog, "wal", "")
+	offer("1;unassigned", metadata.CFTabletSection, metadata.CQPrevRow, "")
+	offer("1;future-dead", metadata.CFFutureLocation, "456", "future:9997")
+
+	got := processor.drain()
+	rows := make(map[string]int)
+	for _, cell := range got {
+		rows[string(cell.Key.Row)]++
+	}
+	if len(rows) != 3 || rows["1;dead"] != 2 || rows["1;logs"] != 2 ||
+		rows["1;future-dead"] != 1 {
+		t.Fatalf("GC WAL filter returned rows %#v", rows)
+	}
+}
