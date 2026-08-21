@@ -24,6 +24,10 @@ THRIFT                ?= thrift
 THRIFT_IDL            := internal/thrift/idl
 THRIFT_OUT            := internal/thrift/gen
 THRIFT_PACKAGE_PREFIX := github.com/phrocker/shoal-oss/internal/thrift/gen/
+IMAGE                 ?= shoal-embed:dev
+VERSION               ?= dev
+REVISION              ?= $(shell git rev-parse HEAD)
+CREATED               ?= $(shell git show -s --format=%cI HEAD)
 
 GOOS := $(shell go env GOOS)
 ifeq ($(GOOS),windows)
@@ -204,6 +208,21 @@ _patch-struct-fields:
 .PHONY: build
 build:
 	go build ./...
+
+.PHONY: container-build
+container-build:
+	docker build \
+	  --file Dockerfile.shoal-embed \
+	  --build-arg VERSION=$(VERSION) \
+	  --build-arg REVISION=$(REVISION) \
+	  --build-arg CREATED=$(CREATED) \
+	  --tag $(IMAGE) \
+	  .
+
+.PHONY: container-smoke
+container-smoke:
+	IMAGE=$(IMAGE) VERSION=$(VERSION) REVISION=$(REVISION) CREATED=$(CREATED) \
+	  bash test/container/shoal-embed-smoke.sh
 
 .PHONY: capi
 capi:
