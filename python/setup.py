@@ -4,7 +4,21 @@ import os
 from pathlib import Path
 
 from setuptools import setup
+from setuptools.dist import Distribution
 from wheel.bdist_wheel import bdist_wheel
+
+
+def platform_distribution() -> bool:
+    bundled = list((Path(__file__).parent / "src" / "sharkbite" / ".libs").glob("*"))
+    has_native = any(
+        path.suffix.lower() in {".dll", ".dylib", ".so"} for path in bundled
+    )
+    return has_native or os.environ.get("SHOAL_WHEEL_PREVIEW") == "1"
+
+
+class PlatformDistribution(Distribution):
+    def has_ext_modules(self) -> bool:
+        return platform_distribution()
 
 
 class PlatformWheel(bdist_wheel):
@@ -27,4 +41,4 @@ class PlatformWheel(bdist_wheel):
         return "py3", "none", platform_tag
 
 
-setup(cmdclass={"bdist_wheel": PlatformWheel})
+setup(cmdclass={"bdist_wheel": PlatformWheel}, distclass=PlatformDistribution)

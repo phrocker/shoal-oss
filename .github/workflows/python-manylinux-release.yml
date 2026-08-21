@@ -1,0 +1,146 @@
+name: Publish Python manylinux artifacts
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+  release:
+    types: [published]
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/python-manylinux-release.yml"
+      - "accumulo/**"
+      - "capi/**"
+      - "cmd/shoal-capi/**"
+      - "docs/python-release.md"
+      - "go.mod"
+      - "go.sum"
+      - "hdfs/**"
+      - "internal/**"
+      - "python/**"
+      - "rfile/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: python-manylinux-release-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  MANYLINUX_IMAGE: quay.io/pypa/manylinux_2_28_x86_64@sha256:0c87ccb5996dab6c3b7612ee4fda7b80c4ab3c44a86c2541e4a872afdf4f131b
+
+jobs:
+  build:
+    name: Build, reproduce, and smoke test
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout release source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.sha }}
+
+      - name: Validate release tag
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("python/pyproject.toml", "rb"))["project"]["version"])')
+          tag=""
+          case "$EVENT_NAME" in
+            push) tag="$GITHUB_REF_NAME" ;;
+            release) tag="$RELEASE_TAG" ;;
+            workflow_dispatch)
+              if [[ "$REF_TYPE" == "tag" ]]; then tag="$GITHUB_REF_NAME"; fi
+              ;;
+          esac
+          if [[ -n "$tag" && "$tag" != "v${version}" ]]; then
+            echo "::error::Tag ${tag} does not match shoal-sharkbite ${version}"
+            exit 1
+          fi
+
+      - name: Build and verify twice in controlled manylinux
+        shell: bash
+        run: |
+          source_epoch=$(git show -s --format=%ct HEAD)
+          run_build() {
+            docker run --rm \
+              --env SOURCE_DATE_EPOCH="$source_epoch" \
+              --volume "$GITHUB_WORKSPACE:/io" \
+              --workdir /io \
+              "$MANYLINUX_IMAGE" \
+              bash python/scripts/build_manylinux.sh
+          }
+          run_build
+          mkdir .release-first
+          cp python/dist/* .release-first/
+          run_build
+          diff -u .release-first/SHA256SUMS python/dist/SHA256SUMS
+          diff -u .release-first/release-manifest.json python/dist/release-manifest.json
+          rm -rf .release-first
+
+      - name: Upload verified artifacts
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: shoal-sharkbite-manylinux-${{ github.sha }}
+          path: |
+            python/dist/*.whl
+            python/dist/*.tar.gz
+            python/dist/SHA256SUMS
+            python/dist/release-manifest.json
+          if-no-files-found: error
+          retention-days: 30
+
+  attest:
+    name: Attest verified artifacts
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download verified artifacts
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+        with:
+          name: shoal-sharkbite-manylinux-${{ github.sha }}
+          path: dist
+
+      - name: Attest release artifacts
+        uses: actions/attest-build-provenance@43d14bc2b83dec42d39ecae14e916627a18bb661 # v3
+        with:
+          subject-path: |
+            dist/*.whl
+            dist/*.tar.gz
+            dist/SHA256SUMS
+            dist/release-manifest.json
+
+  publish:
+    name: Publish GitHub release assets
+    if: github.event_name == 'release'
+    needs: [build, attest]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download verified artifacts
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+        with:
+          name: shoal-sharkbite-manylinux-${{ github.sha }}
+          path: dist
+
+      - name: Upload immutable release assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: gh release upload "$RELEASE_TAG" dist/* --repo "$GITHUB_REPOSITORY"
