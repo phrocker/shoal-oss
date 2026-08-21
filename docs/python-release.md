@@ -10,6 +10,11 @@ import pysharkbite
 assert pysharkbite.Client is sharkbite.Client
 ```
 
+In the coordinated release model, the separately maintained **`sharkbite`**
+PyPI project is published as a thin compatibility distribution. It depends on
+`shoal-sharkbite`; it does not own either import package or any native
+artifact.
+
 The distribution version is independent of the native ABI version. Release
 `0.5.0` requires Shoal ABI `1.19.0` or newer within ABI major 1. The package is
 still an incremental compatibility layer: publishing it does not make the
@@ -138,8 +143,9 @@ permissions they require.
 
 The distribution/project name is **`shoal-sharkbite`**. It owns and installs
 the `sharkbite` and `pysharkbite` import packages, but it does not claim or
-publish to the separately reserved `sharkbite` PyPI project. The Shoal
-maintainers must own or maintain `shoal-sharkbite` on PyPI.
+publish to the existing `sharkbite` PyPI project. That project is controlled
+and released from the separate Sharkbite repository. The Shoal maintainers
+must own or maintain `shoal-sharkbite` on PyPI.
 
 Configure the publisher once:
 
@@ -160,6 +166,41 @@ workflow filename, or environment requires updating PyPI before the next
 release. Validation runs must not be used to test public publication. Build,
 install, import, and native ABI evidence is proved in the separate read-only
 build job and can run without PyPI configuration.
+
+### Coordinated `shoal-sharkbite` and `sharkbite` releases
+
+Use one PEP 440 version that is new and valid for both PyPI projects. Release
+the implementation before the compatibility distribution:
+
+1. Publish `shoal-sharkbite==VERSION` from this repository through the
+   approved release workflow.
+2. Wait for PyPI to serve that exact version. In a clean environment, install
+   `shoal-sharkbite==VERSION` with dependencies disabled, verify its published
+   hashes and provenance against the release manifest, import both
+   `sharkbite` and `pysharkbite`, and run the native ABI/capability smoke test.
+3. Only after those checks pass, publish `sharkbite==VERSION` from the separate
+   Sharkbite repository. That distribution must depend on exactly
+   `shoal-sharkbite==VERSION`.
+4. In another clean environment, install `sharkbite==VERSION`, run
+   `pip check`, import both compatibility names, and confirm the installed
+   native library and import files came from `shoal-sharkbite==VERSION`.
+
+The ownership boundary is strict:
+
+- `shoal-sharkbite` owns the `sharkbite/` and `pysharkbite/` import trees,
+  package data, type information, bundled native library, and native checksum
+  manifest.
+- The thin `sharkbite` distribution owns only its generated
+  `sharkbite-VERSION.dist-info/` metadata. Its wheel must contain no Python
+  package, module, namespace, script, package data, or native library.
+- Before publishing the thin wheel, inspect its archive and installation
+  record to prove that no path overlaps a path installed by
+  `shoal-sharkbite`.
+
+If the implementation publication or verification fails, do not publish the
+thin distribution. PyPI artifacts are immutable: correct a failed coordinated
+release with a new version rather than attempting to replace either project's
+files.
 
 `verify_release.py` validates both archives and manifests, then installs the
 wheel into a fresh project-local virtual environment with `--no-index` and
