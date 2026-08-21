@@ -24,6 +24,8 @@ import (
 // 4MB scan batch.
 const MaxResultBytes = 4 << 20
 
+var errTabletNotHosted = errors.New("scanserver: tablet is not hosted")
+
 // StartScan evaluates the requested range and retains results beyond the
 // response budget for lossless ContinueScan paging.
 //
@@ -80,7 +82,7 @@ func (s *Server) StartScan(
 
 	files, err := s.lookupFiles(ctx, extent, rangeArg)
 	if err != nil {
-		if errors.Is(err, tserverprocess.ErrNotHosted) {
+		if errors.Is(err, tserverprocess.ErrNotHosted) || errors.Is(err, errTabletNotHosted) {
 			return nil, &tabletserver.NotServingTabletException{Extent: extent}
 		}
 		return nil, fmt.Errorf("lookup files: %w", err)
@@ -200,7 +202,7 @@ func (s *Server) lookupFiles(ctx context.Context, extent *data.TKeyExtent, range
 				return t.Files, nil
 			}
 		}
-		return nil, fmt.Errorf("scanserver: auto-locate: no tablet covers row %q in table %q",
+		return nil, fmt.Errorf("%w: no tablet covers row %q in table %q", errTabletNotHosted,
 			string(row), tabletID)
 	}
 
@@ -209,7 +211,7 @@ func (s *Server) lookupFiles(ctx context.Context, extent *data.TKeyExtent, range
 			return t.Files, nil
 		}
 	}
-	return nil, fmt.Errorf("scanserver: no tablet matches extent table=%q prev=%q end=%q",
+	return nil, fmt.Errorf("%w: no tablet matches extent table=%q prev=%q end=%q", errTabletNotHosted,
 		string(extent.Table), string(extent.PrevEndRow), string(extent.EndRow))
 }
 

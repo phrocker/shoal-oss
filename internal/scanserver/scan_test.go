@@ -296,8 +296,8 @@ func TestStartScan_DeletionSwallowsCoord(t *testing.T) {
 	}
 }
 
-// TestStartScan_NoMatchingTablet returns an error when the extent
-// doesn't match any tablet.
+// TestStartScan_NoMatchingTablet returns the retryable exception Accumulo
+// expects when the extent is not hosted by this server.
 func TestStartScan_NoMatchingTablet(t *testing.T) {
 	loc := &stubLocator{tablets: map[string][]metadata.TabletInfo{
 		"1": {{TableID: "1", EndRow: []byte("k"), PrevRow: nil}},
@@ -309,8 +309,9 @@ func TestStartScan_NoMatchingTablet(t *testing.T) {
 		&data.TRange{InfiniteStartKey: true, InfiniteStopKey: true},
 		nil, 0, nil, nil, nil, false, false, 0, nil, 0, "", nil, 0,
 	)
-	if err == nil {
-		t.Errorf("expected error for unknown extent")
+	var notServing *tabletserver.NotServingTabletException
+	if !errors.As(err, &notServing) {
+		t.Fatalf("StartScan error = %v, want NotServingTabletException", err)
 	}
 }
 
