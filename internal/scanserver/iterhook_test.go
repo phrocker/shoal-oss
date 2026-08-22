@@ -207,6 +207,46 @@ func TestWholeRowProcessorUsesAccumuloEncoding(t *testing.T) {
 	}
 }
 
+func TestGrepProcessorMatchesConfiguredFields(t *testing.T) {
+	processor, err := buildPostProcessor(
+		[]*data.IterInfo{{
+			Priority: 40, ClassName: grepIteratorClassName, IterName: "grep",
+		}},
+		map[string]map[string]string{"grep": {
+			"term": "table-7", "matchRow": "false", "matchColumnFamily": "false",
+			"matchColumnQualifier": "false", "matchValue": "true",
+		}},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	processor.offer(&wire.Key{
+		Row: []byte("table-7-row"), ColumnFamily: []byte("cf"),
+		ColumnQualifier: []byte("cq"), Timestamp: 2,
+	}, []byte("other"))
+	processor.offer(&wire.Key{
+		Row: []byte("other-row"), ColumnFamily: []byte("cf"),
+		ColumnQualifier: []byte("cq"), Timestamp: 1,
+	}, []byte("hdfs://accumulo/tables/table-7/F.rf"))
+
+	got := processor.drain()
+	if len(got) != 1 || string(got[0].Key.Row) != "other-row" {
+		t.Fatalf("drain = %#v, want value match only", got)
+	}
+}
+
+func TestGrepProcessorRequiresTerm(t *testing.T) {
+	_, err := buildPostProcessor(
+		[]*data.IterInfo{{
+			Priority: 40, ClassName: grepIteratorClassName, IterName: "grep",
+		}},
+		map[string]map[string]string{"grep": {}},
+	)
+	if err == nil {
+		t.Fatal("expected missing term error")
+	}
+}
+
 func TestWholeRowProcessorEnforcesMaxBufferSize(t *testing.T) {
 	processor, err := buildPostProcessor(
 		[]*data.IterInfo{{

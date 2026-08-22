@@ -17,6 +17,7 @@ import (
 )
 
 const wholeRowIteratorClassName = "org.apache.accumulo.core.iterators.user.WholeRowIterator"
+const grepIteratorClassName = "org.apache.accumulo.core.iterators.user.GrepIterator"
 const rowFateStatusFilterClassName = "org.apache.accumulo.core.fate.user.RowFateStatusFilter"
 const tabletManagementIteratorClassName = "org.apache.accumulo.server.manager.state.TabletManagementIterator"
 const hasMigrationFilterClassName = "org.apache.accumulo.core.metadata.schema.filters.HasMigrationFilter"
@@ -99,6 +100,18 @@ func buildPostProcessor(ssiList []*data.IterInfo, ssio map[string]map[string]str
 				maxBufferSize = parsed
 			}
 			picked = &wholeRowProcessor{maxBufferSize: maxBufferSize}
+		case grepIteratorClassName:
+			if picked != nil {
+				return nil, fmt.Errorf("scanserver: multiple shoal-recognized iterators not supported in V1")
+			}
+			processor, err := newGrepProcessor(ssio[info.IterName])
+			if err != nil {
+				return nil, fmt.Errorf(
+					"scanserver: build grep iterator (%s): %w",
+					info.IterName, err,
+				)
+			}
+			picked = processor
 		case rowFateStatusFilterClassName:
 			if picked != nil {
 				return nil, fmt.Errorf("scanserver: multiple shoal-recognized iterators not supported in V1")
@@ -211,6 +224,71 @@ func (p *ivfpqProcessor) drain() []*data.TKeyValue {
 }
 
 func (p *ivfpqProcessor) err() error { return nil }
+
+type grepProcessor struct {
+	term         []byte
+	matchRow     bool
+	matchColFam  bool
+	matchColQual bool
+	matchColVis  bool
+	matchValue   bool
+	results      []*data.TKeyValue
+}
+
+func newGrepProcessor(options map[string]string) (*grepProcessor, error) {
+	term, ok := options["term"]
+	if !ok {
+		return nil, errors.New("missing term option")
+	}
+	return &grepProcessor{
+		term:         []byte(term),
+		matchRow:     javaBooleanOption(options, "matchRow", true),
+		matchColFam:  javaBooleanOption(options, "matchColumnFamily", true),
+		matchColQual: javaBooleanOption(options, "matchColumnQualifier", true),
+		matchColVis:  javaBooleanOption(options, "matchColumnVisibility", false),
+		matchValue:   javaBooleanOption(options, "matchValue", true),
+	}, nil
+}
+
+func javaBooleanOption(options map[string]string, name string, fallback bool) bool {
+	value, ok := options[name]
+	if !ok {
+		return fallback
+	}
+	return strings.EqualFold(value, "true")
+}
+
+func (p *grepProcessor) offer(k *wire.Key, value []byte) {
+	if k == nil {
+		return
+	}
+	matches := (p.matchRow && bytes.Contains(k.Row, p.term)) ||
+		(p.matchColFam && bytes.Contains(k.ColumnFamily, p.term)) ||
+		(p.matchColQual && bytes.Contains(k.ColumnQualifier, p.term)) ||
+		(p.matchColVis && bytes.Contains(k.ColumnVisibility, p.term)) ||
+		(p.matchValue && bytes.Contains(value, p.term))
+	if !matches {
+		return
+	}
+	p.results = append(p.results, &data.TKeyValue{
+		Key: &data.TKey{
+			Row:           cloneBytes(k.Row),
+			ColFamily:     cloneBytes(k.ColumnFamily),
+			ColQualifier:  cloneBytes(k.ColumnQualifier),
+			ColVisibility: cloneBytes(k.ColumnVisibility),
+			Timestamp:     k.Timestamp,
+		},
+		Value: cloneBytes(value),
+	})
+}
+
+func (p *grepProcessor) drain() []*data.TKeyValue {
+	results := p.results
+	p.results = nil
+	return results
+}
+
+func (p *grepProcessor) err() error { return nil }
 
 type wholeRowCell struct {
 	key   wire.Key
