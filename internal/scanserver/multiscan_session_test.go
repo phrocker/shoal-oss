@@ -36,6 +36,15 @@ func TestStartMultiScan_ContinuationAtExactByteBoundary(t *testing.T) {
 
 	fullSrv := newSessionTestServer(t, loc, mem, 1<<20, time.Minute)
 	full := startMultiScan(t, fullSrv, batch)
+	if full.Result_.More {
+		t.Fatal("single-page multiscan unexpectedly requires continuation")
+	}
+	if full.ScanID == 0 {
+		t.Fatal("single-page multiscan returned scan ID 0")
+	}
+	if err := fullSrv.CloseMultiScan(context.Background(), nil, full.ScanID); err != nil {
+		t.Fatalf("CloseMultiScan after single-page result: %v", err)
+	}
 	fullPairs := pairsOf(full.Result_.Results)
 	capBytes := approxKVSize(full.Result_.Results[0]) + approxKVSize(full.Result_.Results[1])
 

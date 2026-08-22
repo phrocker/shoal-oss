@@ -67,8 +67,12 @@ func (s *Server) StartMultiScan(
 		return nil, err
 	}
 	if len(batch) == 0 {
+		scanID, err := s.multiScans.createCompleted(time.Now())
+		if err != nil {
+			return nil, err
+		}
 		return &data.InitialMultiScan{
-			ScanID:  0,
+			ScanID:  scanID,
 			Result_: &data.MultiScanResult_{Results: nil, More: false},
 		}, nil
 	}
@@ -170,20 +174,24 @@ func (s *Server) StartMultiScan(
 		FullScans: fullScans,
 	}
 	page := splitMultiScanResult(complete, s.pages)
-	scanID := data.ScanID(0)
+	var (
+		scanID    data.ScanID
+		createErr error
+	)
 	if page.result.More {
 		if !s.Accepting() {
 			return nil, s.rejectDraining()
 		}
-		createdID, createErr := s.multiScans.create(
+		scanID, createErr = s.multiScans.create(
 			time.Now(),
 			page.remaining,
 			page.tail,
 		)
-		if createErr != nil {
-			return nil, createErr
-		}
-		scanID = createdID
+	} else {
+		scanID, createErr = s.multiScans.createCompleted(time.Now())
+	}
+	if createErr != nil {
+		return nil, createErr
 	}
 	s.metrics.failuresTabletMulti.Add(uint64(len(failures)))
 
