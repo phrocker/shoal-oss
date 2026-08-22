@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"unicode/utf16"
+	"unicode/utf8"
 
 	"github.com/phrocker/shoal-oss/internal/rfile/wire"
 )
@@ -81,7 +82,8 @@ func readSamplerConfiguration(r *bytes.Reader) (*SamplerConfiguration, error) {
 	}, nil
 }
 
-// readModifiedUTF reads and strictly validates Java DataInput modified UTF-8.
+// readModifiedUTF reads Java DataInput modified UTF-8. Unpaired UTF-16
+// surrogates are preserved as WTF-8 bytes in the returned Go string.
 func readModifiedUTF(r *bytes.Reader) (string, error) {
 	var lengthBytes [2]byte
 	if _, err := io.ReadFull(r, lengthBytes[:]); err != nil {
@@ -153,21 +155,30 @@ func decodeModifiedUTF(body []byte) (string, error) {
 		}
 	}
 
-	runes := make([]rune, 0, len(codeUnits))
+	decoded := make([]byte, 0, len(body))
 	for i := 0; i < len(codeUnits); i++ {
 		unit := codeUnits[i]
 		switch {
 		case 0xd800 <= unit && unit <= 0xdbff:
-			if i+1 >= len(codeUnits) || codeUnits[i+1] < 0xdc00 || codeUnits[i+1] > 0xdfff {
-				return "", fmt.Errorf("modified UTF code unit %d: unpaired high surrogate %#x", i, unit)
+			if i+1 < len(codeUnits) && 0xdc00 <= codeUnits[i+1] && codeUnits[i+1] <= 0xdfff {
+				decoded = utf8.AppendRune(decoded, utf16.DecodeRune(rune(unit), rune(codeUnits[i+1])))
+				i++
+			} else {
+				decoded = appendWTF8CodeUnit(decoded, unit)
 			}
-			runes = append(runes, utf16.DecodeRune(rune(unit), rune(codeUnits[i+1])))
-			i++
 		case 0xdc00 <= unit && unit <= 0xdfff:
-			return "", fmt.Errorf("modified UTF code unit %d: unpaired low surrogate %#x", i, unit)
+			decoded = appendWTF8CodeUnit(decoded, unit)
 		default:
-			runes = append(runes, rune(unit))
+			decoded = utf8.AppendRune(decoded, rune(unit))
 		}
 	}
-	return string(runes), nil
+	return string(decoded), nil
+}
+
+func appendWTF8CodeUnit(dst []byte, unit uint16) []byte {
+	return append(dst,
+		0xe0|byte(unit>>12),
+		0x80|byte(unit>>6)&0x3f,
+		0x80|byte(unit)&0x3f,
+	)
 }

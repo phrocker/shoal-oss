@@ -163,7 +163,7 @@ func decompressGzip(compressed []byte, rawSize int64) ([]byte, error) {
 	// honest this is a single allocation.
 	out := make([]byte, 0, rawSize)
 	buf := bytes.NewBuffer(out)
-	if _, err := io.Copy(buf, zr); err != nil {
+	if _, err := io.Copy(buf, io.LimitReader(zr, rawSize+1)); err != nil {
 		return nil, fmt.Errorf("block: zlib body: %w", err)
 	}
 	got := buf.Bytes()

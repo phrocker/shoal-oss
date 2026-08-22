@@ -85,6 +85,34 @@ func TestCopyWithSHA256AbortsDestinationOnReadFailure(t *testing.T) {
 	}
 }
 
+func TestImportRFileManifestRejectsUnsafeSourceTableBeforeSideEffects(t *testing.T) {
+	for _, name := range []string{"", ".", "..", "../outside", `..\outside`, "/absolute", `C:\absolute`} {
+		t.Run(fmt.Sprintf("%q", name), func(t *testing.T) {
+			root := t.TempDir()
+			dst, err := Open(filepath.Join(root, "engine"), Options{Backend: memory.New()})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer dst.Close()
+
+			err = dst.ImportRFileManifest(context.Background(), &RFileExportManifest{
+				Version:     RFileExportManifestVersion,
+				SourceTable: name,
+			})
+			if err == nil || !strings.Contains(err.Error(), "invalid imported table name") {
+				t.Fatalf("ImportRFileManifest(%q) error = %v, want table-name rejection", name, err)
+			}
+			entries, readErr := os.ReadDir(root)
+			if readErr != nil {
+				t.Fatal(readErr)
+			}
+			if len(entries) != 1 || entries[0].Name() != "engine" {
+				t.Fatalf("root entries = %v, want only engine directory", entries)
+			}
+		})
+	}
+}
+
 func TestRFileExportImportMemoryRoundTrip(t *testing.T) {
 	ctx := context.Background()
 	srcDir := filepath.Join(t.TempDir(), "src")

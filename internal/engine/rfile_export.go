@@ -813,6 +813,12 @@ func (r *verificationReaderAt) firstError() error {
 // per-cell tenant visibility stamps providing isolation; see
 // RFileExportOptions.StampVisibilityLabel).
 func (e *Engine) ImportRFileManifest(ctx context.Context, manifest *RFileExportManifest) error {
+	if manifest == nil {
+		return errors.New("engine: nil RFile import manifest")
+	}
+	if err := validateImportedTableName(manifest.SourceTable); err != nil {
+		return err
+	}
 	if err := verifyImmutableExport(ctx, e.backend, manifest, newVerificationSnapshot); err != nil {
 		return err
 	}
@@ -864,6 +870,7 @@ func (e *Engine) ImportRFileManifest(ctx context.Context, manifest *RFileExportM
 		}
 		return nil
 	}
+
 	if err := writeTableManifest(tableDir, tableManifest{
 		Version:    tableManifestVersion,
 		Splits:     splits,
@@ -882,6 +889,15 @@ func (e *Engine) ImportRFileManifest(ctx context.Context, manifest *RFileExportM
 		return err
 	}
 	e.tables[manifest.SourceTable] = tbl
+	return nil
+}
+
+func validateImportedTableName(name string) error {
+	if name == "" || name == "." || name == ".." ||
+		filepath.IsAbs(name) || filepath.VolumeName(name) != "" ||
+		strings.ContainsAny(name, `/\`) {
+		return fmt.Errorf("engine: invalid imported table name %q: must be a non-empty single path component", name)
+	}
 	return nil
 }
 

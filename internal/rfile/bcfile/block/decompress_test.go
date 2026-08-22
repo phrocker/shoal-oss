@@ -3,6 +3,7 @@ package block
 import (
 	"bytes"
 	"compress/zlib"
+	"encoding/binary"
 	"errors"
 	"io"
 	"strings"
@@ -118,6 +119,33 @@ func TestDecompressor_GzipRawSizeMismatch(t *testing.T) {
 	}, CodecGzip)
 	if !errors.Is(err, ErrSizeMismatch) {
 		t.Errorf("err = %v, want ErrSizeMismatch", err)
+	}
+}
+
+func TestDecompressor_GzipStopsAtDeclaredRawSize(t *testing.T) {
+	payload := bytes.Repeat([]byte("x"), 1<<20)
+	gz := gzipBytes(t, payload)
+	_, err := Default().Block(bytes.NewReader(gz), bcfile.BlockRegion{
+		CompressedSize: int64(len(gz)),
+		RawSize:        1,
+	}, CodecGzip)
+	if !errors.Is(err, ErrSizeMismatch) {
+		t.Fatalf("err = %v, want ErrSizeMismatch", err)
+	}
+}
+
+func TestDecompressor_SnappyRejectsChunkBeyondDeclaredOutput(t *testing.T) {
+	compressed, err := encodeSnappy([]byte("oversized"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	binary.BigEndian.PutUint32(compressed[:4], 1)
+	_, err = Default().Block(bytes.NewReader(compressed), bcfile.BlockRegion{
+		CompressedSize: int64(len(compressed)),
+		RawSize:        1,
+	}, CodecSnappy)
+	if !errors.Is(err, ErrSizeMismatch) {
+		t.Fatalf("err = %v, want ErrSizeMismatch", err)
 	}
 }
 
