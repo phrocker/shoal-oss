@@ -57,6 +57,38 @@ func (r managerResolver) ManagerAddress(ctx context.Context) (string, error) {
 	return zk.ManagerAddress(ctx, r.locator)
 }
 
+type runtimeAuthenticator struct {
+	exact   tserverprocess.ExactAuthenticator
+	manager tserverprocess.ManagerAuthenticator
+}
+
+func (a runtimeAuthenticator) Authenticate(
+	ctx context.Context,
+	candidate *security.TCredentials,
+) error {
+	return a.exact.Authenticate(ctx, candidate)
+}
+
+func (a runtimeAuthenticator) AuthorizeWrite(
+	ctx context.Context,
+	candidate *security.TCredentials,
+	tableID string,
+) error {
+	if err := a.exact.AuthorizeWrite(ctx, candidate, tableID); err == nil {
+		return nil
+	}
+	return a.manager.AuthorizeWrite(ctx, candidate, tableID)
+}
+
+func (a runtimeAuthenticator) Validate(
+	ctx context.Context,
+	candidate *security.TCredentials,
+	requested [][]byte,
+	tableIDs []string,
+) error {
+	return a.exact.Validate(ctx, candidate, requested, tableIDs)
+}
+
 func main() {
 	showVersion := flag.Bool("version", false, "print version and exit")
 	listen := flag.String("listen", ":9997", "Thrift listen address")
@@ -218,10 +250,16 @@ func main() {
 	}
 	namespaceNames := namespaces.NewResolver(loc)
 	tableNames := tablenames.NewResolver(loc, namespaceNames)
-	authenticator := tserverprocess.ManagerAuthenticator{
-		Resolver: managerResolver{locator: loc}, System: systemCredentials,
-		InstanceID: loc.InstanceID(), AccumuloVersion: *accVersion,
-		TableNames: tableNames,
+	authenticator := runtimeAuthenticator{
+		exact: tserverprocess.ExactAuthenticator{
+			Identities: []*security.TCredentials{outbound, systemCredentials},
+			Writers:    []*security.TCredentials{systemCredentials},
+		},
+		manager: tserverprocess.ManagerAuthenticator{
+			Resolver: managerResolver{locator: loc}, System: systemCredentials,
+			InstanceID: loc.InstanceID(), AccumuloVersion: *accVersion,
+			TableNames: tableNames,
+		},
 	}
 	scans, err := scanserver.NewServer(scanserver.Options{
 		Locator: store, Storage: files, BlockCache: cache.NewBlockCache(256 << 20), Logger: logger,
