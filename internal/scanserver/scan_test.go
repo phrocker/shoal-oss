@@ -3,6 +3,7 @@ package scanserver
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"testing"
 
@@ -13,6 +14,8 @@ import (
 	"github.com/phrocker/shoal-oss/internal/rfile/wire"
 	"github.com/phrocker/shoal-oss/internal/storage/memory"
 	"github.com/phrocker/shoal-oss/internal/thrift/gen/data"
+	"github.com/phrocker/shoal-oss/internal/thrift/gen/tabletserver"
+	"github.com/phrocker/shoal-oss/internal/tserverprocess"
 )
 
 // stubLocator returns a fixed tablet list for one table. Satisfies
@@ -114,6 +117,45 @@ func TestStartScan_SingleFileFullRange(t *testing.T) {
 		if string(kv.Value) != cells[i].value {
 			t.Errorf("cell %d value=%q; want %q", i, kv.Value, cells[i].value)
 		}
+	}
+}
+
+func TestStartScan_FiltersRequestedColumns(t *testing.T) {
+	mem := memory.New()
+	const filePath = "gs://test-bucket/tables/1/t-aaa/A0000.rf"
+	writeRFileToMemory(t, mem, filePath, []cellSpec{
+		{row: "r01", cf: "file", cq: "a", value: "file", ts: 1},
+		{row: "r01", cf: "loc", cq: "session", value: "host:9997", ts: 1},
+		{row: "r01", cf: "srv", cq: "flush", value: "7", ts: 1},
+		{row: "r01", cf: "srv", cq: "lock", value: "lock", ts: 1},
+	})
+	srv, err := NewServer(Options{
+		Locator: &stubLocator{tablets: map[string][]metadata.TabletInfo{
+			"1": {{TableID: "1", Files: []metadata.FileEntry{{Path: filePath}}}},
+		}},
+		Storage: mem,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	resp, err := srv.StartScan(context.Background(), nil, nil,
+		&data.TKeyExtent{Table: []byte("1")},
+		&data.TRange{InfiniteStartKey: true, InfiniteStopKey: true},
+		[]*data.TColumn{
+			{ColumnFamily: []byte("loc")},
+			{ColumnFamily: []byte("srv"), ColumnQualifier: []byte("flush")},
+		},
+		0, nil, nil, nil, false, false, 0, nil, 0, "", nil, 0,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := resp.Result_.Results; len(got) != 2 ||
+		string(got[0].Key.ColFamily) != "loc" ||
+		string(got[1].Key.ColFamily) != "srv" ||
+		string(got[1].Key.ColQualifier) != "flush" {
+		t.Fatalf("filtered results = %#v", got)
 	}
 }
 
@@ -293,8 +335,8 @@ func TestStartScan_DeletionSwallowsCoord(t *testing.T) {
 	}
 }
 
-// TestStartScan_NoMatchingTablet returns an error when the extent
-// doesn't match any tablet.
+// TestStartScan_NoMatchingTablet returns the retryable exception Accumulo
+// expects when the extent is not hosted by this server.
 func TestStartScan_NoMatchingTablet(t *testing.T) {
 	loc := &stubLocator{tablets: map[string][]metadata.TabletInfo{
 		"1": {{TableID: "1", EndRow: []byte("k"), PrevRow: nil}},
@@ -306,7 +348,36 @@ func TestStartScan_NoMatchingTablet(t *testing.T) {
 		&data.TRange{InfiniteStartKey: true, InfiniteStopKey: true},
 		nil, 0, nil, nil, nil, false, false, 0, nil, 0, "", nil, 0,
 	)
-	if err == nil {
-		t.Errorf("expected error for unknown extent")
+	var notServing *tabletserver.NotServingTabletException
+	if !errors.As(err, &notServing) {
+		t.Fatalf("StartScan error = %v, want NotServingTabletException", err)
+	}
+}
+
+type errorLocator struct {
+	err error
+}
+
+func (l errorLocator) LocateTable(context.Context, string) ([]metadata.TabletInfo, error) {
+	return nil, l.err
+}
+
+func TestStartScan_NotHostedReturnsNotServingTablet(t *testing.T) {
+	srv, _ := NewServer(Options{
+		Locator: errorLocator{err: tserverprocess.ErrNotHosted},
+		Storage: memory.New(),
+	})
+	extent := &data.TKeyExtent{Table: []byte("1")}
+
+	_, err := srv.StartScan(context.Background(), nil, nil, extent,
+		&data.TRange{InfiniteStartKey: true, InfiniteStopKey: true},
+		nil, 0, nil, nil, nil, false, false, 0, nil, 0, "", nil, 0,
+	)
+	var notServing *tabletserver.NotServingTabletException
+	if !errors.As(err, &notServing) {
+		t.Fatalf("StartScan error = %v, want NotServingTabletException", err)
+	}
+	if notServing.Extent != extent {
+		t.Fatalf("exception extent = %#v, want %#v", notServing.Extent, extent)
 	}
 }

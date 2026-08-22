@@ -2,6 +2,7 @@ package tserverprocess
 
 import (
 	"context"
+	"crypto/subtle"
 	"errors"
 	"fmt"
 	"net"
@@ -23,6 +24,69 @@ const managerServiceName = "mgr"
 const clientServiceName = "client"
 const tablePermissionRead int8 = 0
 const tablePermissionWrite int8 = 2
+
+// ExactAuthenticator admits only explicitly configured trusted identities.
+// It is used during system-table bootstrap, when no ClientService endpoint is
+// available yet to authenticate the manager or the configured administrative
+// user.
+type ExactAuthenticator struct {
+	Identities []*security.TCredentials
+	Writers    []*security.TCredentials
+}
+
+func (a ExactAuthenticator) Authenticate(
+	_ context.Context,
+	candidate *security.TCredentials,
+) error {
+	for _, trusted := range a.Identities {
+		if credentialsEqual(candidate, trusted) {
+			return nil
+		}
+	}
+	return errors.New("tserverprocess: credentials rejected")
+}
+
+func (a ExactAuthenticator) AuthorizeWrite(
+	ctx context.Context,
+	candidate *security.TCredentials,
+	_ string,
+) error {
+	for _, trusted := range a.Writers {
+		if credentialsEqual(candidate, trusted) {
+			return nil
+		}
+	}
+	if err := a.Authenticate(ctx, candidate); err != nil {
+		return err
+	}
+	return errors.New("tserverprocess: credentials are not authorized to write")
+}
+
+func (a ExactAuthenticator) Validate(
+	ctx context.Context,
+	candidate *security.TCredentials,
+	requested [][]byte,
+	_ []string,
+) error {
+	if err := a.Authenticate(ctx, candidate); err != nil {
+		return err
+	}
+	if len(requested) != 0 {
+		return fmt.Errorf(
+			"tserverprocess: principal %q requested unsupported authorizations",
+			candidate.Principal)
+	}
+	return nil
+}
+
+func credentialsEqual(left, right *security.TCredentials) bool {
+	return left != nil && right != nil &&
+		left.Principal == right.Principal &&
+		left.TokenClassName == right.TokenClassName &&
+		left.InstanceId == right.InstanceId &&
+		len(left.Token) == len(right.Token) &&
+		subtle.ConstantTimeCompare(left.Token, right.Token) == 1
+}
 
 type AddressResolver interface {
 	ManagerAddress(context.Context) (string, error)

@@ -28,6 +28,10 @@ func (f fakeMetadataFactory) Open(
 	return f.metadata, nil
 }
 
+type systemMetadataFactory struct{ fakeMetadataFactory }
+
+func (systemMetadataFactory) SupportsSystemTablets() bool { return true }
+
 func TestFactoryRefusesSystemTabletWithoutConditionalHosting(t *testing.T) {
 	host, attempt := hostAssignment(t)
 	factory := testFactory(t, host, &fakeMetadata{}, 1)
@@ -36,6 +40,23 @@ func TestFactoryRefusesSystemTabletWithoutConditionalHosting(t *testing.T) {
 	}, attempt)
 	if !errors.Is(err, ErrSystemTabletConditionalUnsupported) {
 		t.Fatalf("Open metadata tablet = %v", err)
+	}
+}
+
+func TestFactoryAllowsSystemTabletWithConditionalHosting(t *testing.T) {
+	host, attempt := hostAssignment(t)
+	factory := testFactory(t, host, &fakeMetadata{}, 1)
+	factory.cfg.Metadata = systemMetadataFactory{
+		fakeMetadataFactory{metadata: &fakeMetadata{}},
+	}
+	tablet, err := factory.Open(context.Background(), tabletloader.Specification{
+		Extent: tserver.Extent{TableID: metadata.RootTableID},
+	}, attempt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tablet == nil {
+		t.Fatal("Open returned a nil tablet")
 	}
 }
 

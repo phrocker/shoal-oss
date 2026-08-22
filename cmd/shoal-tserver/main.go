@@ -24,20 +24,18 @@ import (
 	"github.com/phrocker/shoal-oss/internal/ingestclient"
 	"github.com/phrocker/shoal-oss/internal/ingestrouter"
 	"github.com/phrocker/shoal-oss/internal/ingestservice"
-	"github.com/phrocker/shoal-oss/internal/managerclient"
 	"github.com/phrocker/shoal-oss/internal/metadata"
 	"github.com/phrocker/shoal-oss/internal/metadatacas"
-	"github.com/phrocker/shoal-oss/internal/namespaces"
 	"github.com/phrocker/shoal-oss/internal/protocol"
 	"github.com/phrocker/shoal-oss/internal/roleops"
 	"github.com/phrocker/shoal-oss/internal/scanserver"
+	"github.com/phrocker/shoal-oss/internal/shadow/itercfg"
 	"github.com/phrocker/shoal-oss/internal/storage"
 	"github.com/phrocker/shoal-oss/internal/storage/azure"
 	"github.com/phrocker/shoal-oss/internal/storage/gcs"
 	"github.com/phrocker/shoal-oss/internal/storage/hdfs"
 	"github.com/phrocker/shoal-oss/internal/storage/local"
 	"github.com/phrocker/shoal-oss/internal/storage/s3"
-	"github.com/phrocker/shoal-oss/internal/tablenames"
 	"github.com/phrocker/shoal-oss/internal/tabletloader"
 	"github.com/phrocker/shoal-oss/internal/thrift/gen/security"
 	"github.com/phrocker/shoal-oss/internal/tlsserver"
@@ -140,17 +138,19 @@ func main() {
 	if sessionGeneration == "0" {
 		die("ZooKeeper session has no identity")
 	}
-
+	lockPath, err := tserver.TabletServerLockPath(loc.InstancePath(), *group, *advertise)
+	if err != nil {
+		die("tablet-server lock path: %v", err)
+	}
+	lockIDPath, err := tserver.TabletServerLockIDPath(*group, *advertise)
+	if err != nil {
+		die("tablet-server lock ID path: %v", err)
+	}
 	pool, err := transportpool.New(transportpool.Config{IdleTimeout: time.Minute, MaxIdlePerEndpoint: 4})
 	if err != nil {
 		die("transport pool: %v", err)
 	}
 	defer pool.Close()
-	managerAPI, err := managerclient.NewPooled(pool, loc.InstanceID(), *accVersion, outbound, 10*time.Second)
-	if err != nil {
-		die("manager client: %v", err)
-	}
-	defer managerAPI.Close()
 	conditionalAPI, err := ingestclient.NewPooled(
 		pool, loc.InstanceID(), *accVersion, systemCredentials, 10*time.Second,
 	)
@@ -160,8 +160,7 @@ func main() {
 	defer conditionalAPI.Close()
 
 	walker := metadata.NewWalker(loc, outbound, *accVersion).WithLogger(logger)
-	namespaceNames := namespaces.NewResolver(loc)
-	tableNames := tablenames.NewResolver(loc, namespaceNames)
+	tableConfig := itercfg.NewResolver(loc, 0, logger)
 	host := tserver.NewHost()
 	files, closeStorage, err := openStorage(runCtx, *storageScheme)
 	if err != nil {
@@ -181,7 +180,7 @@ func main() {
 			Host: host, Generation: tabletloader.Generation(sessionGeneration),
 		},
 		Metadata: tserverprocess.MetadataSource{Locator: walker, Address: *advertise},
-		Config:   tserverprocess.ManagerConfigSource{Resolver: resolver, Client: managerAPI},
+		Config:   tserverprocess.ZKConfigSource{Resolver: tableConfig},
 		Files:    tabletloader.StrictReferenceResolver{},
 		Logs:     tabletloader.StrictReferenceResolver{},
 		Retry:    tabletloader.DefaultRetryPolicy(),
@@ -194,6 +193,19 @@ func main() {
 		WALRoot: *walRoot, MincRoot: *mincRoot, StateRoot: *stateRoot,
 		WALStore: walauthority.NewLocalStore(), Outputs: files,
 		Metadata: metadataFactory, FlushCells: *flushCells,
+		FlushID: func(ctx context.Context, tableID string) (int64, error) {
+			raw, _, err := session.Get(path.Join(
+				loc.InstancePath(), "tables", tableID, "flush-id",
+			))
+			if err != nil {
+				return 0, err
+			}
+			flushID, err := strconv.ParseInt(string(raw), 10, 64)
+			if err != nil {
+				return 0, fmt.Errorf("parse flush ID for table %s: %w", tableID, err)
+			}
+			return flushID, nil
+		},
 	})
 	if err != nil {
 		die("hosted ingest: %v", err)
@@ -202,9 +214,9 @@ func main() {
 	if err != nil {
 		die("tablet store: %v", err)
 	}
-	authenticator := tserverprocess.ManagerAuthenticator{
-		Resolver: resolver, System: systemCredentials, InstanceID: loc.InstanceID(),
-		AccumuloVersion: *accVersion, TableNames: tableNames,
+	authenticator := tserverprocess.ExactAuthenticator{
+		Identities: []*security.TCredentials{outbound, systemCredentials},
+		Writers:    []*security.TCredentials{outbound, systemCredentials},
 	}
 	scans, err := scanserver.NewServer(scanserver.Options{
 		Locator: store, Storage: files, BlockCache: cache.NewBlockCache(256 << 20), Logger: logger,
@@ -219,6 +231,15 @@ func main() {
 	}
 	ingest, err := ingestservice.New(ingestservice.Config{
 		Router: router, Authenticator: authenticator,
+		ConditionalReader: scans,
+		Logger:            logger,
+		TserverLock: func() string {
+			lock, ok := host.Lock()
+			if !ok {
+				return ""
+			}
+			return path.Join(lockIDPath, lock.String()) + "$" + sessionGeneration
+		},
 	})
 	if err != nil {
 		die("ingest service: %v", err)
@@ -237,7 +258,7 @@ func main() {
 			Principal: *systemPrincipal, Token: token, TokenType: *systemTokenClass,
 		},
 		Reporter: reporter, InstanceID: loc.InstanceID(),
-		ManagerLockPath: path.Join(loc.InstancePath(), "managers/lock"),
+		ManagerLockPath: "/managers/lock",
 		Name:            *advertise, Version: version, Stop: cancelRun,
 		OnError: func(err error) { logger.Error("tserver operation", "error", err) },
 	})
@@ -310,10 +331,6 @@ func main() {
 		Host: host, Release: adapter.ReleaseDropped, RetryBackoff: time.Second,
 		OnError: func(err error) { logger.Warn("ServiceLock generation ended", "error", err) },
 		NewGeneration: func() (*tserver.ServiceLock, tserver.ServiceLockData, error) {
-			lockPath, err := tserver.TabletServerLockPath(loc.InstancePath(), *group, *advertise)
-			if err != nil {
-				return nil, tserver.ServiceLockData{}, err
-			}
 			lock, err := tserver.NewServiceLock(zk.LockSession{SharedSession: session}, tserver.ServiceLockOptions{
 				Path: lockPath, VerifyInterval: *lockVerify,
 			})

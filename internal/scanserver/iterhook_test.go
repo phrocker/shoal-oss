@@ -11,6 +11,7 @@ import (
 	"github.com/phrocker/shoal-oss/internal/cache"
 	"github.com/phrocker/shoal-oss/internal/ivfpq"
 	"github.com/phrocker/shoal-oss/internal/metadata"
+	"github.com/phrocker/shoal-oss/internal/rfile/wire"
 	"github.com/phrocker/shoal-oss/internal/storage/memory"
 	"github.com/phrocker/shoal-oss/internal/thrift/gen/data"
 )
@@ -158,6 +159,154 @@ func TestStartScan_UnknownIteratorErrors(t *testing.T) {
 	)
 	if err == nil {
 		t.Errorf("expected error for unknown iterator class")
+	}
+}
+
+func TestWholeRowProcessorUsesAccumuloEncoding(t *testing.T) {
+	processor := &wholeRowProcessor{}
+	processor.offer(&wire.Key{
+		Row: []byte("r1"), ColumnFamily: []byte("cf"),
+		ColumnQualifier: []byte("cq1"), Timestamp: 7,
+	}, []byte("v1"))
+	processor.offer(&wire.Key{
+		Row: []byte("r1"), ColumnFamily: []byte("cf"),
+		ColumnQualifier: []byte("cq2"), ColumnVisibility: []byte("A"), Timestamp: 6,
+	}, []byte("v2"))
+	processor.offer(&wire.Key{Row: []byte("r2"), Timestamp: 5}, []byte("v3"))
+
+	got := processor.drain()
+	if len(got) != 2 || string(got[0].Key.Row) != "r1" ||
+		got[0].Key.Timestamp != math.MaxInt64 || string(got[1].Key.Row) != "r2" {
+		t.Fatalf("drain = %#v", got)
+	}
+	in := bytes.NewReader(got[0].Value)
+	var count int32
+	if err := binary.Read(in, binary.BigEndian, &count); err != nil || count != 2 {
+		t.Fatalf("encoded count = %d, %v", count, err)
+	}
+	readField := func() []byte {
+		t.Helper()
+		var length int32
+		if err := binary.Read(in, binary.BigEndian, &length); err != nil {
+			t.Fatal(err)
+		}
+		value := make([]byte, length)
+		if _, err := in.Read(value); err != nil {
+			t.Fatal(err)
+		}
+		return value
+	}
+	if string(readField()) != "cf" || string(readField()) != "cq1" ||
+		len(readField()) != 0 {
+		t.Fatal("first encoded key fields do not match")
+	}
+	var timestamp int64
+	if err := binary.Read(in, binary.BigEndian, &timestamp); err != nil ||
+		timestamp != 7 || string(readField()) != "v1" {
+		t.Fatal("first encoded timestamp/value do not match")
+	}
+}
+
+func TestGrepProcessorMatchesConfiguredFields(t *testing.T) {
+	processor, err := buildPostProcessor(
+		[]*data.IterInfo{{
+			Priority: 40, ClassName: grepIteratorClassName, IterName: "grep",
+		}},
+		map[string]map[string]string{"grep": {
+			"term": "table-7", "matchRow": "false", "matchColumnFamily": "false",
+			"matchColumnQualifier": "false", "matchValue": "true",
+		}},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	processor.offer(&wire.Key{
+		Row: []byte("table-7-row"), ColumnFamily: []byte("cf"),
+		ColumnQualifier: []byte("cq"), Timestamp: 2,
+	}, []byte("other"))
+	processor.offer(&wire.Key{
+		Row: []byte("other-row"), ColumnFamily: []byte("cf"),
+		ColumnQualifier: []byte("cq"), Timestamp: 1,
+	}, []byte("hdfs://accumulo/tables/table-7/F.rf"))
+
+	got := processor.drain()
+	if len(got) != 1 || string(got[0].Key.Row) != "other-row" {
+		t.Fatalf("drain = %#v, want value match only", got)
+	}
+}
+
+func TestGrepProcessorRequiresTerm(t *testing.T) {
+	_, err := buildPostProcessor(
+		[]*data.IterInfo{{
+			Priority: 40, ClassName: grepIteratorClassName, IterName: "grep",
+		}},
+		map[string]map[string]string{"grep": {}},
+	)
+	if err == nil {
+		t.Fatal("expected missing term error")
+	}
+}
+
+func TestWholeRowProcessorEnforcesMaxBufferSize(t *testing.T) {
+	processor, err := buildPostProcessor(
+		[]*data.IterInfo{{
+			Priority: 10, ClassName: wholeRowIteratorClassName, IterName: "whole",
+		}},
+		map[string]map[string]string{"whole": {"maxBufferSize": "128B"}},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	processor.offer(&wire.Key{
+		Row: []byte("row"), ColumnFamily: []byte("cf"), ColumnQualifier: []byte("cq"),
+	}, []byte("value"))
+	if processor.err() == nil {
+		t.Fatal("expected row buffer overflow")
+	}
+}
+
+func TestRowFateStatusFilter(t *testing.T) {
+	processor, err := buildPostProcessor(
+		[]*data.IterInfo{{
+			Priority: 100, ClassName: rowFateStatusFilterClassName, IterName: "statuses",
+		}},
+		map[string]map[string]string{"statuses": {"statuses": "NEW,IN_PROGRESS"}},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	processor.offer(&wire.Key{
+		Row: []byte("accepted"), ColumnFamily: []byte("txadmin"),
+		ColumnQualifier: []byte("status"), Timestamp: 2,
+	}, []byte("IN_PROGRESS"))
+	processor.offer(&wire.Key{
+		Row: []byte("accepted"), ColumnFamily: []byte("tx"),
+		ColumnQualifier: []byte("ctime"), Timestamp: 1,
+	}, []byte("1"))
+	processor.offer(&wire.Key{
+		Row: []byte("rejected"), ColumnFamily: []byte("txadmin"),
+		ColumnQualifier: []byte("status"), Timestamp: 1,
+	}, []byte("SUCCESSFUL"))
+
+	got := processor.drain()
+	if len(got) != 1 || string(got[0].Key.Row) != "accepted" {
+		t.Fatalf("drain = %#v, want only accepted row", got)
+	}
+}
+
+func TestWholeRowProcessorParsesAccumuloMemory(t *testing.T) {
+	for input, want := range map[string]int64{
+		"1": 1, "2B": 2, "3k": 3 << 10, "4M": 4 << 20, "5g": 5 << 30,
+	} {
+		got, err := parseAccumuloMemory(input)
+		if err != nil || got != want {
+			t.Fatalf("parseAccumuloMemory(%q) = %d, %v; want %d", input, got, err, want)
+		}
+	}
+	for _, input := range []string{"", "-1", " 1K", "9223372036854775807G"} {
+		if _, err := parseAccumuloMemory(input); err == nil {
+			t.Fatalf("parseAccumuloMemory(%q) unexpectedly succeeded", input)
+		}
 	}
 }
 

@@ -84,6 +84,8 @@ import (
 	"time"
 	"unicode/utf16"
 
+	gozk "github.com/go-zookeeper/zk"
+
 	"github.com/phrocker/shoal-oss/internal/iterrt"
 	nslookup "github.com/phrocker/shoal-oss/internal/namespaces"
 	"github.com/phrocker/shoal-oss/internal/tablenames"
@@ -92,6 +94,18 @@ import (
 // ClassAllowlist is retained for API compatibility. It is generated from the
 // shared registry so compactor admission and table configuration cannot drift.
 var ClassAllowlist = classAllowlist()
+
+// accumulo40TableDefaults pins the table properties consumed by Shoal to the
+// defaults in Apache Accumulo revision 1a716b2c. ZooKeeper stores overrides,
+// not a complete effective configuration.
+var accumulo40TableDefaults = map[string]string{
+	"table.file.type":               "rf",
+	"table.file.compress.type":      "gz",
+	"table.file.compress.blocksize": "100k",
+	"table.bloom.enabled":           "false",
+	"table.groups.enabled":          "",
+	"table.sampler":                 "",
+}
 
 func classAllowlist() map[string]string {
 	out := map[string]string{}
@@ -252,6 +266,38 @@ func (r *Resolver) InvalidateNames() {
 	r.names.Invalidate()
 }
 
+// EffectiveProperties returns the merged system, namespace, and table
+// configuration for tableID. Missing namespace- or table-level configuration
+// nodes are valid, while transport and decoding failures fail the read.
+func (r *Resolver) EffectiveProperties(ctx context.Context, tableID string) (map[string]string, error) {
+	if r == nil || r.locator == nil || tableID == "" {
+		return nil, errors.New("itercfg: invalid effective-configuration dependency")
+	}
+	merged := make(map[string]string, len(accumulo40TableDefaults))
+	for key, value := range accumulo40TableDefaults {
+		merged[key] = value
+	}
+	systemPath := path.Join(r.locator.InstancePath(), "config")
+	if err := r.mergePropsFrom(ctx, systemPath, "", merged); err != nil {
+		return nil, fmt.Errorf("itercfg: read system configuration: %w", err)
+	}
+	tableNS, err := r.tableNamespaceID(ctx, tableID)
+	if err != nil {
+		return nil, fmt.Errorf("itercfg: read namespace for table %s: %w", tableID, err)
+	}
+	if tableNS != "" {
+		nsPath := path.Join(r.locator.InstancePath(), "namespaces", tableNS, "config")
+		if err := r.mergeOptionalPropsFrom(ctx, nsPath, "", merged); err != nil {
+			return nil, fmt.Errorf("itercfg: read namespace %s configuration: %w", tableNS, err)
+		}
+	}
+	tablePath := path.Join(r.locator.InstancePath(), "tables", tableID, "config")
+	if err := r.mergeOptionalPropsFrom(ctx, tablePath, "", merged); err != nil {
+		return nil, fmt.Errorf("itercfg: read table %s configuration: %w", tableID, err)
+	}
+	return merged, nil
+}
+
 // Resolve loads the iterator stack for tableID at scope, parses
 // table.iterator.<scope>.* properties, and returns the resolved chain.
 // Cache hits return the cached result iff age < ttl.
@@ -333,6 +379,18 @@ func (r *Resolver) mergePropsFrom(ctx context.Context, znodePath, prefix string,
 		}
 	}
 	return nil
+}
+
+func (r *Resolver) mergeOptionalPropsFrom(
+	ctx context.Context,
+	znodePath, prefix string,
+	out map[string]string,
+) error {
+	err := r.mergePropsFrom(ctx, znodePath, prefix, out)
+	if errors.Is(err, gozk.ErrNoNode) {
+		return nil
+	}
+	return err
 }
 
 // tableNamespaceID returns the namespace-id znode-value stored at
@@ -458,6 +516,10 @@ func parseStack(tableID string, scope iterrt.IteratorScope, prefix string, props
 			continue
 		}
 		name, tail, hasTail := strings.Cut(rest, ".")
+		optKey, isOption := strings.CutPrefix(tail, "opt.")
+		if hasTail && !isOption {
+			continue
+		}
 		entry, ok := entries[name]
 		if !ok {
 			entry = &rawEntry{name: name, priority: -1, opts: map[string]string{}}
@@ -480,11 +542,9 @@ func parseStack(tableID string, scope iterrt.IteratorScope, prefix string, props
 			continue
 		}
 		// Option property: "opt.<key>".
-		if optKey, ok := strings.CutPrefix(tail, "opt."); ok {
+		if isOption {
 			entry.opts[optKey] = v
 		}
-		// Anything else (e.g. table.iterator.majc.<name>.something-else)
-		// — ignored; reserved for future Accumulo extensions.
 	}
 
 	// Order by priority ascending (lowest priority runs LOWEST in the

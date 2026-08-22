@@ -229,7 +229,7 @@ func TestWriteTierMonitoringRulesUseExportedMetrics(t *testing.T) {
 
 func TestHelmWriteRolesDeclareTLSPDBAndPersistentRestartState(t *testing.T) {
 	values := readManifest(t, "helm/shoal/values.yaml")
-	for _, section := range []string{"tserver:", "compactor:", "shutdownTimeout:", "walStorageSize:", "stateStorageSize:"} {
+	for _, section := range []string{"mode: single", "tserver:", "compactor:", "shutdownTimeout:", "walStorageSize:", "stateStorageSize:"} {
 		if !strings.Contains(values, section) {
 			t.Errorf("values missing %q", section)
 		}
@@ -247,6 +247,103 @@ func TestHelmWriteRolesDeclareTLSPDBAndPersistentRestartState(t *testing.T) {
 				t.Errorf("%s missing %q", template, want)
 			}
 		}
+	}
+}
+
+func TestHelmDeploymentModesAndAuthorityValidation(t *testing.T) {
+	helmPath, err := exec.LookPath("helm")
+	if err != nil {
+		t.Skip("helm binary not found on PATH")
+	}
+
+	render := func(t *testing.T, valuesFile string) string {
+		t.Helper()
+		args := []string{"template", "shoal", "helm/shoal", "-f", valuesFile}
+		out, err := exec.Command(helmPath, args...).CombinedOutput()
+		if err != nil {
+			t.Fatalf("helm %s: %v\n%s", strings.Join(args, " "), err, out)
+		}
+		return string(out)
+	}
+
+	cases := []struct {
+		name    string
+		values  string
+		want    []string
+		notWant []string
+	}{
+		{
+			name:    "single",
+			values:  "helm/shoal/values-single.yaml",
+			want:    []string{"app.kubernetes.io/component: write-tier"},
+			notWant: []string{"app.kubernetes.io/component: read-fleet", "app.kubernetes.io/component: tserver", "app.kubernetes.io/component: compactor"},
+		},
+		{
+			name:    "distributed",
+			values:  "helm/shoal/values-distributed.yaml",
+			want:    []string{"app.kubernetes.io/component: write-tier", "app.kubernetes.io/component: read-fleet"},
+			notWant: []string{"app.kubernetes.io/component: tserver", "app.kubernetes.io/component: compactor"},
+		},
+		{
+			name:    "accumulo",
+			values:  "helm/shoal/values-accumulo.yaml",
+			want:    []string{"app.kubernetes.io/component: read-fleet", "app.kubernetes.io/component: tserver", "app.kubernetes.io/component: compactor"},
+			notWant: []string{"app.kubernetes.io/component: write-tier"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out := render(t, tc.values)
+			for _, want := range tc.want {
+				if !strings.Contains(out, want) {
+					t.Errorf("render missing %q", want)
+				}
+			}
+			for _, notWant := range tc.notWant {
+				if strings.Contains(out, notWant) {
+					t.Errorf("render unexpectedly contains %q", notWant)
+				}
+			}
+		})
+	}
+
+	invalid := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{
+			name: "unknown mode",
+			args: []string{"--set", "mode=legacy"},
+			want: "mode must be one of: single, distributed, accumulo",
+		},
+		{
+			name: "single dual writer",
+			args: []string{"--set", "tserver.enabled=true"},
+			want: "Shoal-only writeTier and Accumulo tserver cannot both be enabled",
+		},
+		{
+			name: "accumulo dual writer",
+			args: []string{"--set", "mode=accumulo", "--set", "writeTier.enabled=true"},
+			want: "Shoal-only writeTier and Accumulo tserver cannot both be enabled",
+		},
+		{
+			name: "distributed multiple writers",
+			args: []string{"--set", "mode=distributed", "--set", "writeTier.replicas=2"},
+			want: "distributed mode supports exactly one writable writeTier replica",
+		},
+	}
+	for _, tc := range invalid {
+		t.Run(tc.name, func(t *testing.T) {
+			args := append([]string{"template", "shoal", "helm/shoal"}, tc.args...)
+			out, err := exec.Command(helmPath, args...).CombinedOutput()
+			if err == nil {
+				t.Fatalf("helm %s unexpectedly succeeded", strings.Join(args, " "))
+			}
+			if !strings.Contains(string(out), tc.want) {
+				t.Fatalf("helm error missing %q:\n%s", tc.want, out)
+			}
+		})
 	}
 }
 
@@ -424,10 +521,12 @@ func TestHelmChartLintsAndRenders(t *testing.T) {
 			wantNotContains: []string{"scheme: HTTPS"},
 		},
 		{name: "read fleet TLS enabled", args: []string{
+			"--set", "mode=distributed",
 			"--set", "readFleet.tls.enabled=true",
 			"--set", "readFleet.tls.secretName=shoal-read-tls",
 		}},
 		{name: "read fleet mTLS enabled", args: []string{
+			"--set", "mode=distributed",
 			"--set", "readFleet.tls.enabled=true",
 			"--set", "readFleet.tls.secretName=shoal-read-tls",
 			"--set", "readFleet.tls.requireClientCert=true",

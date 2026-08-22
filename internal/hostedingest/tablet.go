@@ -40,6 +40,10 @@ type MetadataFactory interface {
 	Open(context.Context, tabletloader.Specification, ingestrouter.Fence) (MetadataAuthority, error)
 }
 
+type systemTabletMetadataFactory interface {
+	SupportsSystemTablets() bool
+}
+
 func (t *Tablet) formattedTabletTimeLocked() string {
 	return string([]byte{t.timeType}) + strconv.FormatInt(t.tabletTime, 10)
 }
@@ -83,6 +87,7 @@ type Config struct {
 	WALStore       walauthority.Store
 	Outputs        storage.Backend
 	Metadata       MetadataFactory
+	FlushID        func(context.Context, string) (int64, error)
 	FlushCells     int
 	Now            func() time.Time
 	NewOperationID func() string
@@ -167,7 +172,10 @@ func (f *Factory) Open(
 		TableID: spec.Extent.TableID, PrevEndRow: spec.Extent.PrevEndRow, EndRow: spec.Extent.EndRow,
 	}
 	if extent.TableID == metadata.RootTableID || extent.TableID == metadata.MetadataTableID {
-		return nil, ErrSystemTabletConditionalUnsupported
+		conditional, ok := f.cfg.Metadata.(systemTabletMetadataFactory)
+		if !ok || !conditional.SupportsSystemTablets() {
+			return nil, ErrSystemTabletConditionalUnsupported
+		}
 	}
 	timeType, tabletTime, nextTimestamp, exhausted, err := initialTabletTime(spec.Time, f.cfg.Now())
 	if err != nil {
@@ -195,7 +203,7 @@ func (f *Factory) Open(
 	}()
 	tablet := &Tablet{
 		extent: extent, fence: fence, verifier: verifier, flushCells: f.cfg.FlushCells,
-		metadata:  metadata,
+		metadata: metadata, flushID: f.cfg.FlushID,
 		snapshots: make(map[string]mincauthority.Snapshot),
 		applied:   make(map[string]struct{}), assigned: make(map[string][]ingestrouter.Mutation),
 		timeType: timeType, tabletTime: tabletTime, nextTimestamp: nextTimestamp,
@@ -309,6 +317,7 @@ type Tablet struct {
 	tabletTime         int64
 	timestampExhausted bool
 	flushCells         int
+	flushID            func(context.Context, string) (int64, error)
 	newOperationID     func() string
 	pendingFlush       string
 	resume             []string
@@ -325,6 +334,44 @@ func (t *Tablet) Authority() ingestrouter.CommitAuthority {
 func (t *Tablet) Commit(ctx context.Context, request ingestrouter.CommitRequest) error {
 	t.opMu.Lock()
 	defer t.opMu.Unlock()
+	return t.commitLocked(ctx, request)
+}
+
+func (t *Tablet) ConditionalCommit(
+	ctx context.Context,
+	request ingestrouter.CommitRequest,
+	evaluate ingestrouter.ConditionalEvaluator,
+) (bool, error) {
+	t.opMu.Lock()
+	defer t.opMu.Unlock()
+	if err := t.resumePending(ctx); err != nil {
+		return false, err
+	}
+	t.mu.Lock()
+	active := make([]ingestrouter.Cell, len(t.active))
+	for i, cell := range t.active {
+		active[i] = ingestrouter.Cell{
+			Row:              append([]byte(nil), cell.Key.Row...),
+			ColumnFamily:     append([]byte(nil), cell.Key.ColumnFamily...),
+			ColumnQualifier:  append([]byte(nil), cell.Key.ColumnQualifier...),
+			ColumnVisibility: append([]byte(nil), cell.Key.ColumnVisibility...),
+			Timestamp:        cell.Key.Timestamp,
+			Value:            append([]byte(nil), cell.Value...),
+			Deleted:          cell.Key.Deleted,
+		}
+	}
+	t.mu.Unlock()
+	accepted, err := evaluate(ctx, active)
+	if err != nil || !accepted {
+		return accepted, err
+	}
+	if err := t.commitLocked(ctx, request); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (t *Tablet) commitLocked(ctx context.Context, request ingestrouter.CommitRequest) error {
 	if err := t.resumePending(ctx); err != nil {
 		return err
 	}
@@ -473,12 +520,28 @@ func (t *Tablet) Complete(ctx context.Context, snapshotID string, _ mincauthorit
 }
 
 func (t *Tablet) Flush(ctx context.Context) error {
+	var flushID int64
+	if t.flushID != nil {
+		var err error
+		flushID, err = t.flushID(ctx, t.extent.TableID)
+		if err != nil {
+			return err
+		}
+	}
 	t.opMu.Lock()
 	defer t.opMu.Unlock()
 	if err := t.resumePending(ctx); err != nil {
 		return err
 	}
-	return t.flush(ctx)
+	if err := t.flush(ctx); err != nil {
+		return err
+	}
+	if updater, ok := t.metadata.(interface {
+		UpdateFlushID(context.Context, int64) error
+	}); ok && t.flushID != nil {
+		return updater.UpdateFlushID(ctx, flushID)
+	}
+	return nil
 }
 
 func (t *Tablet) resumePending(ctx context.Context) error {

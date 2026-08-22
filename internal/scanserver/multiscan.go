@@ -48,6 +48,7 @@ func (s *Server) scanTabletRanges(
 	}
 
 	wantedCFs := wantedCFsFromColumns(columns)
+	columnMatcher := buildColumnMatcher(columns)
 
 	// Open every file → one fileIter per LG (with CF pushdown). We open
 	// without seeking; per-range Seek lands them at each range's start.
@@ -101,6 +102,14 @@ func (s *Server) scanTabletRanges(
 				continue
 			}
 
+			if columnMatcher != nil && !columnMatcher.match(k.ColumnFamily, k.ColumnQualifier) {
+				it.advance()
+				if pk, _ := it.peek(); pk != nil {
+					heap.Push(h, it)
+				}
+				continue
+			}
+
 			if lastEmitted != nil && sameCoord(k, lastEmitted) {
 				it.advance()
 				if pk, _ := it.peek(); pk != nil {
@@ -125,6 +134,9 @@ func (s *Server) scanTabletRanges(
 				// here because the iterator emits a bounded result
 				// (top-K) regardless of input size.
 				postProc.offer(k, v)
+				if err := postProc.err(); err != nil {
+					return nil, 0, false, err
+				}
 			} else {
 				kv := &data.TKeyValue{
 					Key: &data.TKey{
@@ -157,6 +169,9 @@ func (s *Server) scanTabletRanges(
 
 	if postProc != nil {
 		drained := postProc.drain()
+		if err := postProc.err(); err != nil {
+			return nil, 0, false, err
+		}
 		// Recompute byte count for the iterator's output so callers
 		// can still report something useful in the More=truncated
 		// telemetry. Almost always under budget (top-K × tiny score

@@ -1,4 +1,4 @@
-{{- if .Values.tserver.enabled }}
+{{- if eq (include "shoal.tserverEnabled" .) "true" }}
 apiVersion: v1
 kind: Service
 metadata: {name: shoal-tserver}

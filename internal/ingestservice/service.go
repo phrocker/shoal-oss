@@ -8,11 +8,15 @@
 package ingestservice
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -27,11 +31,10 @@ import (
 )
 
 var (
-	ErrDraining               = errors.New("ingestservice: draining")
-	ErrUnsupportedDurability  = errors.New("ingestservice: durability mode is unsupported")
-	ErrConditionalUnsupported = errors.New("ingestservice: conditional mutations are unsupported")
-	ErrBackpressure           = errors.New("ingestservice: backpressure limit exceeded")
-	ErrPermissionDenied       = errors.New("ingestservice: permission denied")
+	ErrDraining              = errors.New("ingestservice: draining")
+	ErrUnsupportedDurability = errors.New("ingestservice: durability mode is unsupported")
+	ErrBackpressure          = errors.New("ingestservice: backpressure limit exceeded")
+	ErrPermissionDenied      = errors.New("ingestservice: permission denied")
 )
 
 type Authenticator interface {
@@ -39,13 +42,26 @@ type Authenticator interface {
 	AuthorizeWrite(context.Context, *security.TCredentials, string) error
 }
 
+type ConditionalReader interface {
+	ReadConditionalRow(
+		context.Context,
+		*security.TCredentials,
+		ingestrouter.Extent,
+		[]byte,
+		[][]byte,
+	) ([]ingestrouter.Cell, error)
+}
+
 type Config struct {
-	Router          *ingestrouter.Router
-	Authenticator   Authenticator
-	MaxSessions     int
-	MaxSessionBytes int64
-	SessionTTL      time.Duration
-	Now             func() time.Time
+	Router            *ingestrouter.Router
+	Authenticator     Authenticator
+	ConditionalReader ConditionalReader
+	TserverLock       func() string
+	MaxSessions       int
+	MaxSessionBytes   int64
+	SessionTTL        time.Duration
+	Now               func() time.Time
+	Logger            *slog.Logger
 }
 
 type Metrics struct {
@@ -61,12 +77,14 @@ type Metrics struct {
 
 type Service struct {
 	cfg Config
+	log *slog.Logger
 
-	mu        sync.Mutex
-	drainDone chan struct{}
-	sessions  map[data.UpdateID]*updateSession
-	nextID    atomic.Int64
-	accepting atomic.Bool
+	mu                  sync.Mutex
+	drainDone           chan struct{}
+	sessions            map[data.UpdateID]*updateSession
+	conditionalSessions map[data.UpdateID]*conditionalSession
+	nextID              atomic.Int64
+	accepting           atomic.Bool
 
 	started          atomic.Uint64
 	appliedBatches   atomic.Uint64
@@ -75,6 +93,23 @@ type Service struct {
 	retriedBatches   atomic.Uint64
 	expiredSessions  atomic.Uint64
 	backpressure     atomic.Uint64
+}
+
+type conditionalSession struct {
+	mu             sync.Mutex
+	ctx            context.Context
+	cancel         context.CancelFunc
+	credentials    *security.TCredentials
+	authorizations [][]byte
+	tableID        string
+	results        map[conditionalResultKey]data.TCMStatus
+	lastUsed       time.Time
+	closed         bool
+}
+
+type conditionalResultKey struct {
+	id     int64
+	digest [sha256.Size]byte
 }
 
 type updateSession struct {
@@ -120,13 +155,17 @@ func New(cfg Config) (*Service, error) {
 	if cfg.Now == nil {
 		cfg.Now = time.Now
 	}
+	if cfg.Logger == nil {
+		cfg.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	}
 	var seed [8]byte
 	if _, err := rand.Read(seed[:]); err != nil {
 		return nil, fmt.Errorf("ingestservice: session id seed: %w", err)
 	}
 	s := &Service{
-		cfg: cfg, sessions: make(map[data.UpdateID]*updateSession),
-		drainDone: make(chan struct{}),
+		cfg: cfg, log: cfg.Logger, sessions: make(map[data.UpdateID]*updateSession),
+		conditionalSessions: make(map[data.UpdateID]*conditionalSession),
+		drainDone:           make(chan struct{}),
 	}
 	s.nextID.Store(int64(binary.BigEndian.Uint64(seed[:]) & ((1 << 62) - 1)))
 	s.accepting.Store(true)
@@ -151,7 +190,7 @@ func (s *Service) StartUpdate(
 	now := s.cfg.Now()
 	s.mu.Lock()
 	s.expireLocked(now)
-	if len(s.sessions) >= s.cfg.MaxSessions {
+	if len(s.sessions)+len(s.conditionalSessions) >= s.cfg.MaxSessions {
 		s.mu.Unlock()
 		s.backpressure.Add(1)
 		return 0, securityError(credentials, clientgen.SecurityErrorCode_CONNECTION_ERROR)
@@ -258,6 +297,10 @@ func (s *Service) ApplyUpdates(
 	case outcome.Status == ingestrouter.OutcomeRetry:
 		session.recordFailure(keyExtent, session.committedPrefix(keyExtent))
 		s.retriedBatches.Add(1)
+		s.log.WarnContext(ctx, "ingest mutation retry",
+			"table", extent.TableID,
+			"error", errors.Join(applyErr, outcome.Cause),
+		)
 	default:
 		session.recordFailure(keyExtent, session.committedPrefix(keyExtent))
 		s.rejectedBatches.Add(1)
@@ -311,33 +354,302 @@ func (s *Service) CancelUpdate(
 }
 
 func (s *Service) StartConditionalUpdate(
-	_ context.Context,
+	ctx context.Context,
 	_ *clientgen.TInfo,
 	credentials *security.TCredentials,
-	_ [][]byte,
-	_ string,
-	_ tabletingest.TDurability,
+	authorizations [][]byte,
+	tableID string,
+	durability tabletingest.TDurability,
 	_ string,
 ) (*data.TConditionalSession, error) {
-	return nil, securityError(credentials, clientgen.SecurityErrorCode_UNSUPPORTED_OPERATION)
+	if !s.accepting.Load() {
+		return nil, securityError(credentials, clientgen.SecurityErrorCode_CONNECTION_ERROR)
+	}
+	if s.cfg.ConditionalReader == nil || s.cfg.TserverLock == nil || !supportedDurability(durability) {
+		return nil, securityError(credentials, clientgen.SecurityErrorCode_UNSUPPORTED_OPERATION)
+	}
+	if err := s.cfg.Authenticator.Authenticate(ctx, credentials); err != nil {
+		return nil, securityError(credentials, clientgen.SecurityErrorCode_BAD_CREDENTIALS)
+	}
+	if tableID == "" {
+		return nil, securityError(credentials, clientgen.SecurityErrorCode_TABLE_DOESNT_EXIST)
+	}
+	if err := s.cfg.Authenticator.AuthorizeWrite(ctx, credentials, tableID); err != nil {
+		return nil, securityError(credentials, clientgen.SecurityErrorCode_PERMISSION_DENIED)
+	}
+	now := s.cfg.Now()
+	s.mu.Lock()
+	s.expireLocked(now)
+	if len(s.sessions)+len(s.conditionalSessions) >= s.cfg.MaxSessions {
+		s.mu.Unlock()
+		s.backpressure.Add(1)
+		return nil, securityError(credentials, clientgen.SecurityErrorCode_CONNECTION_ERROR)
+	}
+	id := data.UpdateID(s.nextID.Add(1))
+	if id <= 0 {
+		id = data.UpdateID(s.nextID.Add(1 << 30))
+	}
+	sessionCtx, cancel := context.WithCancel(context.Background())
+	s.conditionalSessions[id] = &conditionalSession{
+		ctx: sessionCtx, cancel: cancel, credentials: cloneCredentials(credentials),
+		authorizations: cloneBytesList(authorizations), tableID: tableID,
+		results: make(map[conditionalResultKey]data.TCMStatus), lastUsed: now,
+	}
+	s.mu.Unlock()
+	s.started.Add(1)
+	lockID := s.cfg.TserverLock()
+	if lockID == "" {
+		if session := s.removeConditionalSession(id); session != nil {
+			session.mu.Lock()
+			session.close()
+			session.mu.Unlock()
+		}
+		return nil, securityError(credentials, clientgen.SecurityErrorCode_CONNECTION_ERROR)
+	}
+	return &data.TConditionalSession{
+		SessionId: int64(id), TserverLock: lockID,
+		TTL: s.cfg.SessionTTL.Milliseconds(),
+	}, nil
 }
 
 func (s *Service) ConditionalUpdate(
+	ctx context.Context,
+	_ *clientgen.TInfo,
+	updateID data.UpdateID,
+	batches data.CMBatch,
+	symbols []string,
+) ([]*data.TCMResult_, error) {
+	session := s.conditionalSession(updateID)
+	if session == nil {
+		return nil, tabletserver.NewNoSuchScanIDException()
+	}
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	if session.closed || session.ctx.Err() != nil {
+		return nil, tabletserver.NewNoSuchScanIDException()
+	}
+	session.lastUsed = s.cfg.Now()
+	results := make([]*data.TCMResult_, 0)
+	for wireExtent, mutations := range batches {
+		extent, err := decodeExtent(wireExtent)
+		if err != nil || extent.TableID != session.tableID {
+			for _, mutation := range mutations {
+				if mutation != nil {
+					results = append(results, &data.TCMResult_{
+						Cmid: mutation.ID, Status: data.TCMStatus_IGNORED,
+					})
+				}
+			}
+			continue
+		}
+		for _, mutation := range mutations {
+			if mutation == nil || mutation.Mutation == nil {
+				continue
+			}
+			resultKey := conditionalResultKey{
+				id: mutation.ID, digest: conditionalMutationDigest(mutation),
+			}
+			if status, ok := session.results[resultKey]; ok {
+				results = append(results, &data.TCMResult_{Cmid: mutation.ID, Status: status})
+				continue
+			}
+			status := s.applyConditional(
+				ctx, updateID, session, extent, mutation, resultKey.digest, symbols,
+			)
+			if status != data.TCMStatus_IGNORED {
+				session.results[resultKey] = status
+			}
+			results = append(results, &data.TCMResult_{Cmid: mutation.ID, Status: status})
+		}
+	}
+	return results, nil
+}
+
+func (s *Service) applyConditional(
+	ctx context.Context,
+	updateID data.UpdateID,
+	session *conditionalSession,
+	extent ingestrouter.Extent,
+	wireMutation *data.TConditionalMutation,
+	mutationDigest [sha256.Size]byte,
+	symbols []string,
+) data.TCMStatus {
+	for _, condition := range wireMutation.Conditions {
+		if condition == nil {
+			return data.TCMStatus_VIOLATED
+		}
+		if _, err := validateConditionIterators(condition.Iterators, symbols); err != nil {
+			return data.TCMStatus_VIOLATED
+		}
+	}
+	decoded, err := cclient.FromThrift(wireMutation.Mutation)
+	if err != nil {
+		return data.TCMStatus_VIOLATED
+	}
+	mutation := routerMutation(decoded)
+	if len(mutation.Row) == 0 {
+		return data.TCMStatus_VIOLATED
+	}
+	accepted, err := s.cfg.Router.ConditionalCommit(
+		ctx,
+		fmt.Sprintf("%d:%s", updateID, extent.TableID),
+		fmt.Sprintf("conditional:%d:%x", wireMutation.ID, mutationDigest),
+		ingestrouter.Batch{Extent: extent, Mutations: []ingestrouter.Mutation{mutation}},
+		func(ctx context.Context, active []ingestrouter.Cell) (bool, error) {
+			base, err := s.cfg.ConditionalReader.ReadConditionalRow(
+				ctx, session.credentials, extent, mutation.Row, session.authorizations,
+			)
+			if err != nil {
+				return false, err
+			}
+			matched, err := conditionsMatch(
+				mutation.Row, wireMutation.Conditions, append(base, active...), symbols,
+			)
+			return matched, err
+		},
+	)
+	if err != nil {
+		s.retriedBatches.Add(1)
+		s.log.WarnContext(ctx, "conditional mutation retry",
+			"table", extent.TableID,
+			"mutation_id", wireMutation.ID,
+			"error", err,
+		)
+		return data.TCMStatus_IGNORED
+	}
+	if !accepted {
+		s.rejectedBatches.Add(1)
+		return data.TCMStatus_REJECTED
+	}
+	s.appliedBatches.Add(1)
+	s.appliedMutations.Add(1)
+	return data.TCMStatus_ACCEPTED
+}
+
+func conditionalMutationDigest(mutation *data.TConditionalMutation) [sha256.Size]byte {
+	hash := sha256.New()
+	writeDigestInt64(hash, mutation.ID)
+	for _, condition := range mutation.Conditions {
+		if condition == nil {
+			writeDigestInt64(hash, -1)
+			continue
+		}
+		writeDigestBytes(hash, condition.Cf)
+		writeDigestBytes(hash, condition.Cq)
+		writeDigestBytes(hash, condition.Cv)
+		writeDigestInt64(hash, condition.Ts)
+		if condition.HasTimestamp {
+			writeDigestInt64(hash, 1)
+		} else {
+			writeDigestInt64(hash, 0)
+		}
+		writeDigestBytes(hash, condition.Val)
+		writeDigestBytes(hash, condition.Iterators)
+	}
+	wire := mutation.Mutation
+	writeDigestBytes(hash, wire.Row)
+	writeDigestBytes(hash, wire.Data)
+	writeDigestInt64(hash, int64(wire.Entries))
+	for _, value := range wire.Values {
+		writeDigestBytes(hash, value)
+	}
+	for _, source := range wire.Sources {
+		writeDigestBytes(hash, []byte(source))
+	}
+	var digest [sha256.Size]byte
+	copy(digest[:], hash.Sum(nil))
+	return digest
+}
+
+func writeDigestBytes(hash interface{ Write([]byte) (int, error) }, value []byte) {
+	writeDigestInt64(hash, int64(len(value)))
+	_, _ = hash.Write(value)
+}
+
+func writeDigestInt64(hash interface{ Write([]byte) (int, error) }, value int64) {
+	var encoded [8]byte
+	binary.BigEndian.PutUint64(encoded[:], uint64(value))
+	_, _ = hash.Write(encoded[:])
+}
+
+func conditionsMatch(
+	row []byte,
+	conditions []*data.TCondition,
+	cells []ingestrouter.Cell,
+	symbols []string,
+) (bool, error) {
+	for _, condition := range conditions {
+		hasIterators, err := validateConditionIterators(condition.Iterators, symbols)
+		if err != nil {
+			return false, err
+		}
+		if hasIterators {
+			matches, err := iteratorConditionMatches(row, condition, cells, symbols)
+			if err != nil || !matches {
+				return matches, err
+			}
+			continue
+		}
+		var current *ingestrouter.Cell
+		for i := range cells {
+			cell := &cells[i]
+			if !bytes.Equal(cell.Row, row) ||
+				!bytes.Equal(cell.ColumnFamily, condition.Cf) ||
+				!bytes.Equal(cell.ColumnQualifier, condition.Cq) ||
+				!bytes.Equal(cell.ColumnVisibility, condition.Cv) {
+				continue
+			}
+			if condition.HasTimestamp && cell.Timestamp != condition.Ts {
+				continue
+			}
+			if current == nil || cell.Timestamp >= current.Timestamp {
+				current = cell
+			}
+		}
+		if current != nil && current.Deleted {
+			current = nil
+		}
+		if condition.Val == nil {
+			if current != nil {
+				return false, nil
+			}
+			continue
+		}
+		if current == nil || !bytes.Equal(current.Value, condition.Val) {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+func (s *Service) InvalidateConditionalUpdate(
 	_ context.Context,
 	_ *clientgen.TInfo,
-	_ data.UpdateID,
-	_ data.CMBatch,
-	_ []string,
-) ([]*data.TCMResult_, error) {
-	return nil, tabletserver.NewNoSuchScanIDException()
+	updateID data.UpdateID,
+) error {
+	session := s.removeConditionalSession(updateID)
+	if session == nil {
+		return tabletserver.NewNoSuchScanIDException()
+	}
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	session.close()
+	return nil
 }
 
-func (s *Service) InvalidateConditionalUpdate(context.Context, *clientgen.TInfo, data.UpdateID) error {
-	return tabletserver.NewNoSuchScanIDException()
-}
-
-func (s *Service) CloseConditionalUpdate(context.Context, *clientgen.TInfo, data.UpdateID) error {
-	return ErrConditionalUnsupported
+func (s *Service) CloseConditionalUpdate(
+	_ context.Context,
+	_ *clientgen.TInfo,
+	updateID data.UpdateID,
+) error {
+	session := s.removeConditionalSession(updateID)
+	if session == nil {
+		return tabletserver.NewNoSuchScanIDException()
+	}
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	session.close()
+	return nil
 }
 
 func (s *Service) BeginDrain() {
@@ -346,16 +658,29 @@ func (s *Service) BeginDrain() {
 	}
 	s.mu.Lock()
 	sessions := s.sessions
+	conditionalSessions := s.conditionalSessions
 	s.sessions = make(map[data.UpdateID]*updateSession)
+	s.conditionalSessions = make(map[data.UpdateID]*conditionalSession)
 	s.mu.Unlock()
 	for _, session := range sessions {
 		session.cancel()
 	}
+	for _, session := range conditionalSessions {
+		session.cancel()
+	}
 	go func() {
 		var wg sync.WaitGroup
-		wg.Add(len(sessions))
+		wg.Add(len(sessions) + len(conditionalSessions))
 		for _, session := range sessions {
 			go func(session *updateSession) {
+				defer wg.Done()
+				session.mu.Lock()
+				session.close()
+				session.mu.Unlock()
+			}(session)
+		}
+		for _, session := range conditionalSessions {
+			go func(session *conditionalSession) {
 				defer wg.Done()
 				session.mu.Lock()
 				session.close()
@@ -381,7 +706,7 @@ func (s *Service) Accepting() bool { return s.accepting.Load() }
 
 func (s *Service) Metrics() Metrics {
 	s.mu.Lock()
-	active := int64(len(s.sessions))
+	active := int64(len(s.sessions) + len(s.conditionalSessions))
 	s.mu.Unlock()
 	return Metrics{
 		ActiveSessions: active, Started: s.started.Load(),
@@ -406,9 +731,26 @@ func (s *Service) removeSession(id data.UpdateID) *updateSession {
 	return session
 }
 
+func (s *Service) conditionalSession(id data.UpdateID) *conditionalSession {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.expireLocked(s.cfg.Now())
+	return s.conditionalSessions[id]
+}
+
+func (s *Service) removeConditionalSession(id data.UpdateID) *conditionalSession {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	session := s.conditionalSessions[id]
+	delete(s.conditionalSessions, id)
+	return session
+}
+
 func (s *Service) expireLocked(now time.Time) {
 	for id, session := range s.sessions {
-		session.mu.Lock()
+		if !session.mu.TryLock() {
+			continue
+		}
 		expired := now.Sub(session.lastUsed) >= s.cfg.SessionTTL
 		if expired {
 			session.close()
@@ -416,6 +758,20 @@ func (s *Service) expireLocked(now time.Time) {
 		session.mu.Unlock()
 		if expired {
 			delete(s.sessions, id)
+			s.expiredSessions.Add(1)
+		}
+	}
+	for id, session := range s.conditionalSessions {
+		if !session.mu.TryLock() {
+			continue
+		}
+		expired := now.Sub(session.lastUsed) >= s.cfg.SessionTTL
+		if expired {
+			session.close()
+		}
+		session.mu.Unlock()
+		if expired {
+			delete(s.conditionalSessions, id)
 			s.expiredSessions.Add(1)
 		}
 	}
@@ -430,6 +786,21 @@ func (s *updateSession) close() {
 	for _, session := range s.tables {
 		session.Close()
 	}
+	if s.credentials != nil {
+		for i := range s.credentials.Token {
+			s.credentials.Token[i] = 0
+		}
+		s.credentials.Token = nil
+		s.credentials = nil
+	}
+}
+
+func (s *conditionalSession) close() {
+	if s.closed {
+		return
+	}
+	s.closed = true
+	s.cancel()
 	if s.credentials != nil {
 		for i := range s.credentials.Token {
 			s.credentials.Token[i] = 0
@@ -490,6 +861,14 @@ func securityError(credentials *security.TCredentials, code clientgen.SecurityEr
 		user = credentials.Principal
 	}
 	return &clientgen.ThriftSecurityException{User: user, Code: code}
+}
+
+func cloneBytesList(values [][]byte) [][]byte {
+	out := make([][]byte, len(values))
+	for i := range values {
+		out[i] = append([]byte(nil), values[i]...)
+	}
+	return out
 }
 
 func decodeExtent(in *data.TKeyExtent) (ingestrouter.Extent, error) {

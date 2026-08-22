@@ -378,6 +378,24 @@ func TestNormalizeRanges_KeepsDisjoint(t *testing.T) {
 	}
 }
 
+func TestClipRangeToExtentUsesExclusivePreviousAndInclusiveEndRows(t *testing.T) {
+	clipped := clipRangeToExtent(
+		&data.TRange{InfiniteStartKey: true, InfiniteStopKey: true},
+		&data.TKeyExtent{Table: []byte("1"), PrevEndRow: []byte("m"), EndRow: []byte("t")},
+	)
+	if clipped == nil || string(clipped.Start.Row) != "m\x00" ||
+		!clipped.StartKeyInclusive || string(clipped.Stop.Row) != "t\x00" ||
+		clipped.StopKeyInclusive {
+		t.Fatalf("clipped range = %#v", clipped)
+	}
+	if got := clipRangeToExtent(
+		exactRow("a"),
+		&data.TKeyExtent{Table: []byte("1"), PrevEndRow: []byte("m"), EndRow: []byte("t")},
+	); got != nil {
+		t.Fatalf("non-overlapping range = %#v, want nil", got)
+	}
+}
+
 // rowsOf extracts row bytes from a result list.
 func rowsOf(kvs []*data.TKeyValue) []string {
 	out := make([]string, 0, len(kvs))

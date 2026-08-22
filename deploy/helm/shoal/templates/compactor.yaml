@@ -1,4 +1,4 @@
-{{- if .Values.compactor.enabled }}
+{{- if eq (include "shoal.compactorEnabled" .) "true" }}
 apiVersion: v1
 kind: Service
 metadata: {name: shoal-compactor}

@@ -1,5 +1,4 @@
 import java.nio.charset.StandardCharsets;
-import java.nio.ByteBuffer;
 import java.security.MessageDigest;
 import java.util.ArrayList;
 import java.util.Base64;
@@ -38,10 +37,7 @@ public final class AccumuloSmoke {
     }
     if ("system-token".equals(args[0])) {
       try (ServerContext context = new ServerContext(SiteConfiguration.auto())) {
-        ByteBuffer serialized =
-            context.getCredentials().toThrift(context.getInstanceID()).getToken().duplicate();
-        byte[] token = new byte[serialized.remaining()];
-        serialized.get(token);
+        byte[] token = context.getCredentials().toThrift(context.getInstanceID()).getToken();
         System.out.println(Base64.getEncoder().encodeToString(token));
       }
       return;

@@ -10,35 +10,35 @@
       "gate": "service-lock-lifecycle",
       "kind": "go-test",
       "reference": "internal/tserver/servicelock_test.go#TestAcquireCreatesAnAccumuloCompatibleLockNode",
-      "source_sha256": "68bb7d1c618652b02455d9bb0175643196c6e75e7e503f39a09eb8f5ef90d5b0",
+      "source_sha256": "719739cd8a9581d98c8c6aa25a4bec76e60ca479278d115bb4da56c058a83687",
       "replay_command": ["go", "test", "./internal/tserver", "-run", "^TestAcquireCreatesAnAccumuloCompatibleLockNode$", "-count=1"]
     },
     {
       "gate": "assignment-lifecycle",
       "kind": "go-test",
       "reference": "internal/tserverrpc/adapter_test.go#TestLifecycleReportsRemainOrderedDuringReconnect",
-      "source_sha256": "a46f29e4de3d6610f66157a1ae8dee67a88fb821fc7912e6affc7f7331b6ed48",
+      "source_sha256": "f248bfd0e3cbefb9dc47cc6033a179fe6c0ad2e0b98b69f9e8dcbc9f7fc2999b",
       "replay_command": ["go", "test", "./internal/tserverrpc", "-run", "^TestLifecycleReportsRemainOrderedDuringReconnect$", "-count=1"]
     },
     {
       "gate": "ingest-minor-compaction",
       "kind": "go-test",
       "reference": "internal/hostedingest/tablet_test.go#TestTabletDurableCommitMinorCompactionAndAmbiguousResponses",
-      "source_sha256": "f73bb7e33b982a7ad9119c0d94f7940333dfd983bc96087c9e694838f3ee52da",
+      "source_sha256": "11f206063ea10d388c0870102107a23ea14e517b16e25a9a4e62ba0f57a0172a",
       "replay_command": ["go", "test", "./internal/hostedingest", "-run", "^TestTabletDurableCommitMinorCompactionAndAmbiguousResponses$", "-count=1"]
     },
     {
       "gate": "wal-recovery",
       "kind": "go-test",
       "reference": "internal/hostedingest/tablet_test.go#TestTabletRestartReplaysReferencedWALExactlyOnce",
-      "source_sha256": "f73bb7e33b982a7ad9119c0d94f7940333dfd983bc96087c9e694838f3ee52da",
+      "source_sha256": "11f206063ea10d388c0870102107a23ea14e517b16e25a9a4e62ba0f57a0172a",
       "replay_command": ["go", "test", "./internal/hostedingest", "-run", "^TestTabletRestartReplaysReferencedWALExactlyOnce$", "-count=1"]
     },
     {
       "gate": "restart-fencing",
       "kind": "go-test",
       "reference": "internal/hostedingest/tablet_test.go#TestTabletFencesStaleOwnerDuringCommit",
-      "source_sha256": "f73bb7e33b982a7ad9119c0d94f7940333dfd983bc96087c9e694838f3ee52da",
+      "source_sha256": "11f206063ea10d388c0870102107a23ea14e517b16e25a9a4e62ba0f57a0172a",
       "replay_command": ["go", "test", "./internal/hostedingest", "-run", "^TestTabletFencesStaleOwnerDuringCommit$", "-count=1"]
     }
   ]

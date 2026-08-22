@@ -20,13 +20,97 @@ package itercfg
 import (
 	"bytes"
 	"compress/gzip"
+	"context"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"testing"
+
+	gozk "github.com/go-zookeeper/zk"
 
 	"github.com/phrocker/shoal-oss/internal/iterrt"
 )
+
+type rawConfigLocator struct {
+	instancePath string
+	data         map[string][]byte
+}
+
+func (l rawConfigLocator) InstancePath() string { return l.instancePath }
+
+func (l rawConfigLocator) GetRaw(_ context.Context, path string) ([]byte, error) {
+	value, ok := l.data[path]
+	if !ok {
+		return nil, fmt.Errorf("get %s: %w", path, gozk.ErrNoNode)
+	}
+	return append([]byte(nil), value...), nil
+}
+
+func TestEffectivePropertiesMergesConfigurationHierarchy(t *testing.T) {
+	locator := rawConfigLocator{
+		instancePath: "/accumulo/iid",
+		data: map[string][]byte{
+			"/accumulo/iid/config": buildSyntheticPropBlob(t, map[string]string{
+				"general.custom.system": "system",
+				"table.file.max":        "10",
+			}, false),
+			"/accumulo/iid/tables/5/namespace": []byte("ns1"),
+			"/accumulo/iid/namespaces/ns1/config": buildSyntheticPropBlob(t, map[string]string{
+				"table.file.max": "12",
+			}, false),
+			"/accumulo/iid/tables/5/config": buildSyntheticPropBlob(t, map[string]string{
+				"table.file.max": "15",
+			}, false),
+		},
+	}
+	got, err := NewResolver(locator, 0, nil).EffectiveProperties(context.Background(), "5")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got["general.custom.system"] != "system" || got["table.file.max"] != "15" {
+		t.Fatalf("EffectiveProperties = %#v", got)
+	}
+	if got["table.file.type"] != "rf" || got["table.file.compress.type"] != "gz" {
+		t.Fatalf("EffectiveProperties omitted pinned defaults: %#v", got)
+	}
+}
+
+func TestEffectivePropertiesOverridesPinnedDefaults(t *testing.T) {
+	locator := rawConfigLocator{
+		instancePath: "/accumulo/iid",
+		data: map[string][]byte{
+			"/accumulo/iid/config": buildSyntheticPropBlob(t, map[string]string{
+				"table.file.compress.type": "zstd",
+			}, false),
+			"/accumulo/iid/tables/5/namespace": []byte("+default"),
+		},
+	}
+	got, err := NewResolver(locator, 0, nil).EffectiveProperties(context.Background(), "5")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got["table.file.compress.type"] != "zstd" {
+		t.Fatalf("compression type = %q, want zstd", got["table.file.compress.type"])
+	}
+}
+
+func TestEffectivePropertiesAllowsMissingOptionalConfigurationNodes(t *testing.T) {
+	locator := rawConfigLocator{
+		instancePath: "/accumulo/iid",
+		data: map[string][]byte{
+			"/accumulo/iid/config":              buildSyntheticPropBlob(t, map[string]string{"table.file.max": "10"}, false),
+			"/accumulo/iid/tables/+r/namespace": []byte("+accumulo"),
+		},
+	}
+	got, err := NewResolver(locator, 0, nil).EffectiveProperties(context.Background(), "+r")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got["table.file.max"] != "10" {
+		t.Fatalf("EffectiveProperties = %#v", got)
+	}
+}
 
 // graphVidxStack mirrors a representative graph_vidx iterator config:
 // latentEdgeDiscovery at priority 10, vers at priority 20.
@@ -123,6 +207,22 @@ func TestParseStack_NoIteratorsConfigured(t *testing.T) {
 	}
 	if len(got.Stack) != 0 {
 		t.Errorf("stack = %+v, want empty", got.Stack)
+	}
+}
+
+func TestParseStackIgnoresUnrelatedNestedProperties(t *testing.T) {
+	props := map[string]string{
+		"table.iterator.scan.vers":                    "20,org.apache.accumulo.core.iterators.user.VersioningIterator",
+		"table.iterator.scan.vers.opt.maxVersions":    "1",
+		"table.iterator.scan.table.custom.constraint": "ignored",
+		"table.iterator.scan.tserver.memory.maps.max": "ignored",
+	}
+	got, err := parseStack("tbl", iterrt.ScopeScan, "table.iterator.scan.", props)
+	if err != nil {
+		t.Fatalf("parseStack: %v", err)
+	}
+	if len(got.Stack) != 1 || got.Stack[0].Name != iterrt.IterVersioning {
+		t.Fatalf("stack = %+v, want versioning only", got.Stack)
 	}
 }
 

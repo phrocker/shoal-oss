@@ -23,3 +23,35 @@ app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
 app.kubernetes.io/managed-by: {{ .Release.Service }}
 app.kubernetes.io/part-of: shoal-platform
 {{- end -}}
+
+{{- define "shoal.writeTierEnabled" -}}
+{{- if kindIs "bool" .Values.writeTier.enabled -}}
+{{- .Values.writeTier.enabled -}}
+{{- else -}}
+{{- or (eq .Values.mode "single") (eq .Values.mode "distributed") -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "shoal.readFleetEnabled" -}}
+{{- if kindIs "bool" .Values.readFleet.enabled -}}
+{{- .Values.readFleet.enabled -}}
+{{- else -}}
+{{- or (eq .Values.mode "distributed") (eq .Values.mode "accumulo") -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "shoal.tserverEnabled" -}}
+{{- if kindIs "bool" .Values.tserver.enabled -}}
+{{- .Values.tserver.enabled -}}
+{{- else -}}
+{{- eq .Values.mode "accumulo" -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "shoal.compactorEnabled" -}}
+{{- if kindIs "bool" .Values.compactor.enabled -}}
+{{- .Values.compactor.enabled -}}
+{{- else -}}
+{{- eq .Values.mode "accumulo" -}}
+{{- end -}}
+{{- end -}}

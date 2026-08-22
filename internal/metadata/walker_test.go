@@ -73,6 +73,7 @@ type fakeWalkerLifecycle struct {
 	address string
 	starts  int
 	closes  int
+	results []*data.TKeyValue
 }
 
 func (f *fakeWalkerLifecycle) Start(
@@ -85,7 +86,31 @@ func (f *fakeWalkerLifecycle) Start(
 	if string(req.Extent.Table) != RootTableID {
 		return nil, context.Canceled
 	}
-	return &data.InitialScan{ScanID: 7, Result_: &data.ScanResult_{}}, nil
+	return &data.InitialScan{
+		ScanID: 7, Result_: &data.ScanResult_{Results: f.results},
+	}, nil
+}
+
+func TestLocateMetadataTableDoesNotRequireHostedMetadataTablets(t *testing.T) {
+	lifecycle := &fakeWalkerLifecycle{results: []*data.TKeyValue{{
+		Key: &data.TKey{
+			Row: []byte(MetadataTableID + "<"), ColFamily: []byte(CFTabletSection),
+			ColQualifier: []byte(CQPrevRow), Timestamp: 1,
+		},
+		Value: []byte{0},
+	}}}
+	walker := NewWalkerWithLifecycle(fakeWalkerLocator{}, lifecycle)
+	tablets, err := walker.LocateTable(context.Background(), MetadataTableID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tablets) != 1 || tablets[0].TableID != MetadataTableID ||
+		tablets[0].Location != nil {
+		t.Fatalf("metadata tablets = %#v", tablets)
+	}
+	if lifecycle.starts != 1 {
+		t.Fatalf("scan starts = %d, want root scan only", lifecycle.starts)
+	}
 }
 
 func (*fakeWalkerLifecycle) Continue(context.Context, string, data.ScanID, int64) (*data.ScanResult_, error) {

@@ -160,6 +160,16 @@ func PublicACL() []gozk.ACL {
 // into the node gets: the directory name and the advertised address are the
 // same address, and a reader that finds them disagreeing has no server.
 func TabletServerLockPath(instancePath, group, address string) (string, error) {
+	lockIDPath, err := TabletServerLockIDPath(group, address)
+	if err != nil {
+		return "", err
+	}
+	return path.Join(instancePath, lockIDPath), nil
+}
+
+// TabletServerLockIDPath returns the instance-relative path Accumulo embeds
+// in serialized ZooUtil.LockID values.
+func TabletServerLockIDPath(group, address string) (string, error) {
 	if group == "" {
 		group = DefaultResourceGroup
 	}
@@ -170,7 +180,7 @@ func TabletServerLockPath(instancePath, group, address string) (string, error) {
 	if err := validateAdvertiseAddress(address); err != nil {
 		return "", fmt.Errorf("%w: %w", ErrInvalidLockData, err)
 	}
-	return path.Join(instancePath, zTabletServers, group, address), nil
+	return path.Join("/", zTabletServers, group, address), nil
 }
 
 // tabletServerLockIdentity returns the resource group and address a

@@ -37,7 +37,7 @@ import (
 
 const (
 	testInstance    = "instance-1"
-	testManagerPath = "/accumulo/instance-1/managers/lock"
+	testManagerPath = "/managers/lock"
 	testServerUUID  = "11111111-1111-4111-8111-111111111111"
 	testManagerUUID = "22222222-2222-4222-8222-222222222222"
 )

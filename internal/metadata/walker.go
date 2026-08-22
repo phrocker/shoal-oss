@@ -152,6 +152,9 @@ func (w *Walker) LocateTable(ctx context.Context, tableID string) ([]TabletInfo,
 		}
 		return []TabletInfo{root}, nil
 	}
+	if tableID == MetadataTableID {
+		return w.ScanRootTablet(ctx)
+	}
 	all, err := w.BootstrapAll(ctx)
 	if err != nil {
 		return nil, err

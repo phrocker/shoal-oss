@@ -120,6 +120,9 @@ func (s *Store) load(ctx context.Context, extent tserver.Extent, attempt tserver
 	var ingestTablet ingestrouter.HostedTablet
 	if err == nil && writable {
 		ingestTablet, err = s.opener.Open(ctx, spec, attempt)
+		if err != nil {
+			err = fmt.Errorf("open writable tablet: %w", err)
+		}
 	}
 
 	s.mu.Lock()

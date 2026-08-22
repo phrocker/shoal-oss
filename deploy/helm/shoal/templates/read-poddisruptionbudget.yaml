@@ -1,4 +1,4 @@
-{{- if .Values.readFleet.podDisruptionBudget.enabled }}
+{{- if and (eq (include "shoal.readFleetEnabled" .) "true") .Values.readFleet.podDisruptionBudget.enabled }}
 apiVersion: policy/v1
 kind: PodDisruptionBudget
 metadata:

@@ -1,3 +1,4 @@
+{{- if eq (include "shoal.readFleetEnabled" .) "true" }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -146,3 +147,4 @@ spec:
           secret:
             secretName: {{ required "readFleet.tls.secretName is required when readFleet.tls.enabled=true" .Values.readFleet.tls.secretName }}
         {{- end }}
+{{- end }}

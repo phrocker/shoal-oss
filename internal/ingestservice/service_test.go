@@ -1,7 +1,9 @@
 package ingestservice
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"sync"
 	"testing"
@@ -62,6 +64,34 @@ type fakeTablet struct {
 	fence   ingestrouter.Fence
 	commits []ingestrouter.CommitRequest
 	err     error
+	active  []ingestrouter.Cell
+}
+
+func (t *fakeTablet) ConditionalCommit(
+	ctx context.Context,
+	request ingestrouter.CommitRequest,
+	evaluate ingestrouter.ConditionalEvaluator,
+) (bool, error) {
+	accepted, err := evaluate(ctx, t.active)
+	if err != nil || !accepted {
+		return accepted, err
+	}
+	return true, t.Commit(ctx, request)
+}
+
+type fakeConditionalReader struct {
+	cells []ingestrouter.Cell
+	err   error
+}
+
+func (r fakeConditionalReader) ReadConditionalRow(
+	context.Context,
+	*security.TCredentials,
+	ingestrouter.Extent,
+	[]byte,
+	[][]byte,
+) ([]ingestrouter.Cell, error) {
+	return append([]ingestrouter.Cell(nil), r.cells...), r.err
 }
 
 func (t *fakeTablet) Extent() ingestrouter.Extent { return t.extent }
@@ -239,6 +269,183 @@ func TestUnsupportedModesAndConditionalFailExplicitly(t *testing.T) {
 	}
 }
 
+func TestConditionalUpdateAcceptsRejectsAndCachesResults(t *testing.T) {
+	extent := ingestrouter.Extent{TableID: "1", EndRow: []byte("z")}
+	tablet := &fakeTablet{
+		extent: extent,
+		fence:  ingestrouter.Fence{ServerGeneration: "s", ManagerGeneration: "m", Assignment: 1},
+	}
+	service := newTestService(t, func(cfg *Config) {
+		cfg.ConditionalReader = fakeConditionalReader{cells: []ingestrouter.Cell{{
+			Row: []byte("a"), ColumnFamily: []byte("cf"), ColumnQualifier: []byte("cq"),
+			Value: []byte("old"), Timestamp: 7,
+		}}}
+		cfg.TserverLock = func() string { return "lock" }
+	}, &fakeDirectory{
+		tablets: map[string]*fakeTablet{extent.Key(): tablet}, errs: map[string]error{},
+	})
+	session, err := service.StartConditionalUpdate(
+		context.Background(), nil, testCredentials(), nil, "1",
+		tabletingest.TDurability_SYNC, "",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	accepted := &data.TConditionalMutation{
+		ID: 11, Mutation: testMutation(t, "a"),
+		Conditions: []*data.TCondition{{
+			Cf: []byte("cf"), Cq: []byte("cq"), Val: []byte("old"),
+		}},
+	}
+	rejected := &data.TConditionalMutation{
+		ID: 12, Mutation: testMutation(t, "a"),
+		Conditions: []*data.TCondition{{
+			Cf: []byte("cf"), Cq: []byte("cq"), Val: []byte("wrong"),
+		}},
+	}
+	batch := data.CMBatch{testExtent("1", "z"): {accepted, rejected}}
+	results, err := service.ConditionalUpdate(
+		context.Background(), nil, data.UpdateID(session.SessionId), batch, nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 2 || results[0].Status != data.TCMStatus_ACCEPTED ||
+		results[1].Status != data.TCMStatus_REJECTED {
+		t.Fatalf("results = %#v", results)
+	}
+	results, err = service.ConditionalUpdate(
+		context.Background(), nil, data.UpdateID(session.SessionId),
+		data.CMBatch{testExtent("1", "z"): {accepted}}, nil,
+	)
+	if err != nil || len(results) != 1 || results[0].Status != data.TCMStatus_ACCEPTED {
+		t.Fatalf("cached result = %#v, %v", results, err)
+	}
+	replacementMutation, _ := cclient.NewMutation([]byte("a"))
+	replacementMutation.PutLatest(
+		[]byte("cf"), []byte("cq2"), []byte("A"), []byte("replacement"),
+	)
+	replacementWire, err := replacementMutation.ToThrift()
+	if err != nil {
+		t.Fatal(err)
+	}
+	reusedID := &data.TConditionalMutation{
+		ID: 11, Mutation: replacementWire,
+		Conditions: []*data.TCondition{{
+			Cf: []byte("cf"), Cq: []byte("cq"), Val: []byte("old"),
+		}},
+	}
+	results, err = service.ConditionalUpdate(
+		context.Background(), nil, data.UpdateID(session.SessionId),
+		data.CMBatch{testExtent("1", "z"): {reusedID}}, nil,
+	)
+	if err != nil || len(results) != 1 || results[0].Status != data.TCMStatus_ACCEPTED {
+		t.Fatalf("reused mutation ID result = %#v, %v", results, err)
+	}
+	results, err = service.ConditionalUpdate(
+		context.Background(), nil, data.UpdateID(session.SessionId),
+		data.CMBatch{testExtent("1", "z"): {accepted}}, nil,
+	)
+	if err != nil || len(results) != 1 || results[0].Status != data.TCMStatus_ACCEPTED {
+		t.Fatalf("original cached result after ID reuse = %#v, %v", results, err)
+	}
+	tablet.mu.Lock()
+	defer tablet.mu.Unlock()
+	if len(tablet.commits) != 2 {
+		t.Fatalf("commits = %d, want 2", len(tablet.commits))
+	}
+}
+
+func TestConditionsMatchActiveTombstone(t *testing.T) {
+	condition := &data.TCondition{
+		Cf: []byte("cf"), Cq: []byte("cq"), Val: nil, Iterators: []byte{0},
+	}
+	cells := []ingestrouter.Cell{
+		{Row: []byte("r"), ColumnFamily: []byte("cf"), ColumnQualifier: []byte("cq"), Timestamp: 1, Value: []byte("v")},
+		{Row: []byte("r"), ColumnFamily: []byte("cf"), ColumnQualifier: []byte("cq"), Timestamp: 2, Deleted: true},
+	}
+	matched, err := conditionsMatch([]byte("r"), []*data.TCondition{condition}, cells, nil)
+	if err != nil || !matched {
+		t.Fatal("latest tombstone did not satisfy absent-value condition")
+	}
+}
+
+func TestConditionsMatchSetEncodingIterator(t *testing.T) {
+	symbols := []string{"set", setEncodingIteratorClass, "concat.value", "true"}
+	iterators := []byte{1, 0, 1, 10, 1, 2, 3}
+	var expected bytes.Buffer
+	entry := []byte("session\x00tserver:9997")
+	if err := binary.Write(&expected, binary.BigEndian, int32(len(entry))); err != nil {
+		t.Fatal(err)
+	}
+	expected.Write(entry)
+	if err := binary.Write(&expected, binary.BigEndian, int32(1)); err != nil {
+		t.Fatal(err)
+	}
+	condition := &data.TCondition{
+		Cf: []byte("future"), Val: expected.Bytes(), Iterators: iterators,
+	}
+	cells := []ingestrouter.Cell{{
+		Row: []byte("r"), ColumnFamily: []byte("future"),
+		ColumnQualifier: []byte("session"), Value: []byte("tserver:9997"), Timestamp: 1,
+	}}
+	matched, err := conditionsMatch([]byte("r"), []*data.TCondition{condition}, cells, symbols)
+	if err != nil || !matched {
+		t.Fatalf("set condition matched=%v err=%v", matched, err)
+	}
+}
+
+func TestConditionsMatchSetEncodingIteratorEmptyFamily(t *testing.T) {
+	symbols := []string{"set", setEncodingIteratorClass, "concat.value", "false"}
+	condition := &data.TCondition{
+		Cf: []byte("future"), Val: []byte{0, 0, 0, 0},
+		Iterators: []byte{1, 0, 1, 10, 1, 2, 3},
+	}
+	matched, err := conditionsMatch([]byte("r"), []*data.TCondition{condition}, nil, symbols)
+	if err != nil || !matched {
+		t.Fatalf("empty set condition matched=%v err=%v", matched, err)
+	}
+}
+
+func TestConditionsMatchRowExistsIterator(t *testing.T) {
+	symbols := []string{"rowExists", rowExistsIteratorClass}
+	condition := &data.TCondition{
+		Iterators: []byte{1, 0, 1, 10, 0},
+	}
+	matched, err := conditionsMatch([]byte("r"), []*data.TCondition{condition}, nil, symbols)
+	if err != nil || !matched {
+		t.Fatalf("absent row matched=%v err=%v", matched, err)
+	}
+	matched, err = conditionsMatch([]byte("r"), []*data.TCondition{condition}, []ingestrouter.Cell{{
+		Row: []byte("r"), ColumnFamily: []byte("tx"), ColumnQualifier: []byte("status"),
+		Value: []byte("NEW"), Timestamp: 1,
+	}}, symbols)
+	if err != nil || matched {
+		t.Fatalf("existing row matched=%v err=%v", matched, err)
+	}
+}
+
+func TestConditionsMatchStatusMappingIterator(t *testing.T) {
+	symbols := []string{"status", statusMappingIteratorClass, "statusSet", "NEW,IN_PROGRESS"}
+	condition := &data.TCondition{
+		Cf: []byte("tx"), Cq: []byte("status"), Val: []byte("present"),
+		Iterators: []byte{1, 0, 1, 100, 1, 2, 3},
+	}
+	cells := []ingestrouter.Cell{{
+		Row: []byte("r"), ColumnFamily: []byte("tx"), ColumnQualifier: []byte("status"),
+		Value: []byte("IN_PROGRESS"), Timestamp: 1,
+	}}
+	matched, err := conditionsMatch([]byte("r"), []*data.TCondition{condition}, cells, symbols)
+	if err != nil || !matched {
+		t.Fatalf("accepted status matched=%v err=%v", matched, err)
+	}
+	cells[0].Value = []byte("FAILED")
+	matched, err = conditionsMatch([]byte("r"), []*data.TCondition{condition}, cells, symbols)
+	if err != nil || matched {
+		t.Fatalf("rejected status matched=%v err=%v", matched, err)
+	}
+}
+
 func TestWriteAuthorizationFailureIsReportedSeparately(t *testing.T) {
 	router, err := ingestrouter.New(&fakeDirectory{
 		tablets: make(map[string]*fakeTablet), errs: make(map[string]error),
@@ -301,6 +508,44 @@ func TestSessionExpiryBackpressureAndDrain(t *testing.T) {
 	if err := service.Drain(ctx); err != nil {
 		t.Fatalf("bounded drain: %v", err)
 	}
+}
+
+func TestSessionExpirySkipsActiveConditionalSession(t *testing.T) {
+	now := time.Unix(100, 0)
+	service := newTestService(t, func(cfg *Config) {
+		cfg.ConditionalReader = fakeConditionalReader{}
+		cfg.TserverLock = func() string { return "lock" }
+		cfg.SessionTTL = time.Second
+		cfg.Now = func() time.Time { return now }
+	}, &fakeDirectory{tablets: make(map[string]*fakeTablet), errs: make(map[string]error)})
+	first, err := service.StartConditionalUpdate(
+		context.Background(), nil, testCredentials(), nil, "1",
+		tabletingest.TDurability_SYNC, "",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := service.conditionalSessions[data.UpdateID(first.SessionId)]
+	session.mu.Lock()
+	now = now.Add(2 * time.Second)
+
+	started := make(chan error, 1)
+	go func() {
+		_, err := service.StartConditionalUpdate(
+			context.Background(), nil, testCredentials(), nil, "1",
+			tabletingest.TDurability_SYNC, "",
+		)
+		started <- err
+	}()
+	select {
+	case err := <-started:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("starting a nested conditional session blocked on active-session expiration")
+	}
+	session.mu.Unlock()
 }
 
 func TestConcurrentCancelAndApply(t *testing.T) {

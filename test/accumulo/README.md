@@ -6,13 +6,21 @@ revision as Shoal's vendored Thrift IDLs:
 
 - Accumulo `4.0.0-SNAPSHOT`
 - revision `1a716b2c1bb5762ead4b46d2bc4f53e13873b314`
+- Accumulo Access revision `5d7a94492832121f507029d9d7e7627fd88e95ba`
 - Hadoop `3.4.2`
 - ZooKeeper `3.9.5`
 - Thrift `0.17.0` (in the pinned Accumulo build)
 
-The image build verifies SHA-512 hashes for both the Accumulo source archive
-and Hadoop binary archive. It requires network access to Maven Central, Apache
-archives, and GitHub while building.
+The image build verifies SHA-512 hashes for the Accumulo and Accumulo Access
+source archives and copies Hadoop and ZooKeeper from digest-pinned official
+images. Accumulo Access is built from the last upstream revision compatible
+with the pinned Accumulo source, avoiding the moving `1.0.0-SNAPSHOT`
+artifact. The build requires network access to Maven Central, Docker Hub, and
+GitHub.
+
+The local harness pulls the resulting public GHCR image by immutable digest,
+so normal test runs do not rebuild Accumulo or download Hadoop from the Apache
+archive server.
 
 ## Commands
 

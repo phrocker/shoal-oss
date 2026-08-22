@@ -18,6 +18,10 @@ class HarnessTest(unittest.TestCase):
             "1a716b2c1bb5762ead4b46d2bc4f53e13873b314",
             harness.ACCUMULO_REVISION,
         )
+        self.assertEqual(
+            "5d7a94492832121f507029d9d7e7627fd88e95ba",
+            harness.ACCUMULO_ACCESS_REVISION,
+        )
 
     def test_compose_command_is_stable_and_project_scoped(self):
         command = harness.compose_command("up", "--detach", "--build")
@@ -59,11 +63,28 @@ class HarnessTest(unittest.TestCase):
                 "up",
                 "--detach",
                 "--build",
+                "--no-deps",
                 "shoal-tserver",
                 "shoal-compactor",
             ),
             harness.compose_services("shoal-tserver", "shoal-compactor"),
         )
+
+    @mock.patch.object(harness.shutil, "rmtree")
+    @mock.patch.object(harness, "run")
+    def test_down_includes_profiled_role_services(self, run, rmtree):
+        harness.down()
+        run.assert_called_once_with(
+            harness.compose_command(
+                "--profile",
+                "shoal",
+                "down",
+                "--volumes",
+                "--remove-orphans",
+            ),
+            check=False,
+        )
+        rmtree.assert_called_once_with(harness.LIVE_DIR, ignore_errors=True)
 
     def test_static_configuration_wires_production_role_scenarios(self):
         compose = harness.COMPOSE_FILE.read_text(encoding="utf-8")

@@ -228,7 +228,7 @@ func (l *Loader) Load(ctx context.Context, extent tserver.Extent) (Specification
 func (l *Loader) loadOnce(ctx context.Context, extent tserver.Extent, generation Generation) (Specification, error) {
 	ms, err := l.metadata.ReadTablet(ctx, extent)
 	if err != nil {
-		return Specification{}, err
+		return Specification{}, fmt.Errorf("read tablet metadata: %w", err)
 	}
 	if err := l.check(ctx, extent, generation); err != nil {
 		return Specification{}, err
@@ -239,7 +239,7 @@ func (l *Loader) loadOnce(ctx context.Context, extent tserver.Extent, generation
 
 	cs, err := l.config.ReadTableConfiguration(ctx, extent.TableID)
 	if err != nil {
-		return Specification{}, err
+		return Specification{}, fmt.Errorf("read table configuration: %w", err)
 	}
 	if err := l.check(ctx, extent, generation); err != nil {
 		return Specification{}, err

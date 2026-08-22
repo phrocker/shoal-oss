@@ -18,4 +18,5 @@ const (
 	CQDirectory       = "dir"    // ServerColumnFamily.DIRECTORY_QUAL
 	CQTime            = "time"   // ServerColumnFamily.TIME_QUAL
 	CQLock            = "lock"   // ServerColumnFamily.LOCK_QUAL
+	CQFlushID         = "flush"  // ServerColumnFamily.FLUSH_COLUMN qualifier
 )

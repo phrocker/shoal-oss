@@ -1,4 +1,4 @@
-{{- if .Values.writeTier.podDisruptionBudget.enabled }}
+{{- if and (eq (include "shoal.writeTierEnabled" .) "true") .Values.writeTier.podDisruptionBudget.enabled }}
 apiVersion: policy/v1
 kind: PodDisruptionBudget
 metadata:

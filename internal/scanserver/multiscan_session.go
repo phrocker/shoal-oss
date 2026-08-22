@@ -159,6 +159,37 @@ func (r *multiScanSessionRegistry) create(now time.Time, remaining []*data.TKeyV
 	return 0, &tabletscan.ScanServerBusyException{}
 }
 
+func (r *multiScanSessionRegistry) createCompleted(now time.Time) (data.ScanID, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.expireLocked(now)
+	if len(r.sessions) >= r.capacity {
+		if r.metrics != nil {
+			r.metrics.backpressureCapacity.Add(1)
+		}
+		return 0, &tabletscan.ScanServerBusyException{}
+	}
+
+	for attempts := 0; attempts < 32; attempts++ {
+		id, err := newOpaqueScanID()
+		if err != nil {
+			return 0, err
+		}
+		if _, exists := r.sessions[id]; exists {
+			continue
+		}
+		r.sessions[id] = &multiScanSession{
+			createdAt:      now,
+			lastAccessedAt: now,
+			expiresAt:      now.Add(r.ttl),
+			exhausted:      true,
+		}
+		return id, nil
+	}
+	return 0, &tabletscan.ScanServerBusyException{}
+}
+
 func (r *multiScanSessionRegistry) continueMultiScan(now time.Time, scanID data.ScanID, byteCap int) (*data.MultiScanResult_, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
