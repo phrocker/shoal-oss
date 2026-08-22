@@ -58,7 +58,7 @@ import (
 	"io"
 	"sort"
 
-	"github.com/phrocker/shoal/internal/rfile/wire"
+	"github.com/phrocker/shoal-oss/internal/rfile/wire"
 )
 
 // MetaBlockName is the BCFile MetaIndex entry under which the adjacency

@@ -8,8 +8,8 @@ import (
 	"math/rand"
 	"testing"
 
-	"github.com/phrocker/shoal/internal/rfile/bcfile"
-	"github.com/phrocker/shoal/internal/rfile/bcfile/block"
+	"github.com/phrocker/shoal-oss/internal/rfile/bcfile"
+	"github.com/phrocker/shoal-oss/internal/rfile/bcfile/block"
 )
 
 // This file isolates the cost of block compression on the RFile write and

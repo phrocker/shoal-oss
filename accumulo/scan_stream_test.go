@@ -8,10 +8,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/phrocker/shoal/internal/metadata"
-	"github.com/phrocker/shoal/internal/scanclient"
-	"github.com/phrocker/shoal/internal/thrift/gen/data"
-	"github.com/phrocker/shoal/internal/thrift/gen/tabletserver"
+	"github.com/phrocker/shoal-oss/internal/metadata"
+	"github.com/phrocker/shoal-oss/internal/scanclient"
+	"github.com/phrocker/shoal-oss/internal/thrift/gen/data"
+	"github.com/phrocker/shoal-oss/internal/thrift/gen/tabletserver"
 )
 
 func streamTestConnector(t *testing.T) *Connector {

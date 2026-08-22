@@ -70,14 +70,14 @@ import (
 	"unicode/utf16"
 	"unicode/utf8"
 
-	"github.com/phrocker/shoal/internal/compaction"
-	"github.com/phrocker/shoal/internal/iterrt"
-	"github.com/phrocker/shoal/internal/metadata"
-	"github.com/phrocker/shoal/internal/rfile/bcfile/block"
-	"github.com/phrocker/shoal/internal/shadow/itercfg"
-	"github.com/phrocker/shoal/internal/thrift/gen/data"
-	"github.com/phrocker/shoal/internal/thrift/gen/manager"
-	"github.com/phrocker/shoal/internal/thrift/gen/tabletserver"
+	"github.com/phrocker/shoal-oss/internal/compaction"
+	"github.com/phrocker/shoal-oss/internal/iterrt"
+	"github.com/phrocker/shoal-oss/internal/metadata"
+	"github.com/phrocker/shoal-oss/internal/rfile/bcfile/block"
+	"github.com/phrocker/shoal-oss/internal/shadow/itercfg"
+	"github.com/phrocker/shoal-oss/internal/thrift/gen/data"
+	"github.com/phrocker/shoal-oss/internal/thrift/gen/manager"
+	"github.com/phrocker/shoal-oss/internal/thrift/gen/tabletserver"
 )
 
 // ECIDPrefix is the prefix Accumulo's ExternalCompactionId carries. It

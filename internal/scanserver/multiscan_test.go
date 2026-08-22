@@ -6,10 +6,10 @@ import (
 	"sort"
 	"testing"
 
-	"github.com/phrocker/shoal/internal/cache"
-	"github.com/phrocker/shoal/internal/metadata"
-	"github.com/phrocker/shoal/internal/storage/memory"
-	"github.com/phrocker/shoal/internal/thrift/gen/data"
+	"github.com/phrocker/shoal-oss/internal/cache"
+	"github.com/phrocker/shoal-oss/internal/metadata"
+	"github.com/phrocker/shoal-oss/internal/storage/memory"
+	"github.com/phrocker/shoal-oss/internal/thrift/gen/data"
 )
 
 // rowRange builds a TRange covering [startRow, stopRow) — start

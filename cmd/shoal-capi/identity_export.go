@@ -13,7 +13,7 @@ import (
 	"fmt"
 	"unsafe"
 
-	"github.com/phrocker/shoal/accumulo"
+	"github.com/phrocker/shoal-oss/accumulo"
 )
 
 type zooKeeperInstanceResolver func(context.Context, accumulo.ZooKeeperConfig) (accumulo.Instance, error)

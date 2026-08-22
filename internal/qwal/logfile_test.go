@@ -30,7 +30,7 @@ import (
 	"io"
 	"testing"
 
-	"github.com/phrocker/shoal/internal/rfile/wire"
+	"github.com/phrocker/shoal-oss/internal/rfile/wire"
 )
 
 // walBuilder hand-encodes a WAL byte stream in the exact Java wire format.
@@ -38,7 +38,7 @@ type walBuilder struct {
 	buf bytes.Buffer
 }
 
-func (w *walBuilder) u8(b byte)   { w.buf.WriteByte(b) }
+func (w *walBuilder) u8(b byte)    { w.buf.WriteByte(b) }
 func (w *walBuilder) raw(p []byte) { w.buf.Write(p) }
 
 func (w *walBuilder) i32(v int32) {
@@ -156,11 +156,11 @@ func buildFixture(t *testing.T) []byte {
 	w.u8(byte(EventDefineTablet))
 	w.i64(10)
 	w.i32(7)
-	w.text([]byte("graph"))       // tableId
-	w.u8(1)                       // hasEndRow
-	w.text([]byte("rowM"))        // endRow
-	w.u8(1)                       // hasPrevEndRow
-	w.text([]byte("rowA"))        // prevEndRow
+	w.text([]byte("graph")) // tableId
+	w.u8(1)                 // hasEndRow
+	w.text([]byte("rowM"))  // endRow
+	w.u8(1)                 // hasPrevEndRow
+	w.text([]byte("rowA"))  // prevEndRow
 	w.emptyValue()
 
 	// MUTATION: ordinal 2, i64 seq, i32 tabletId, then LogFileValue (count=1).

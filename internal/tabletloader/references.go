@@ -8,7 +8,7 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/phrocker/shoal/internal/metadata"
+	"github.com/phrocker/shoal-oss/internal/metadata"
 )
 
 // StrictReferenceResolver performs the schema-level checks common to every

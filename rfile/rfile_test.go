@@ -9,8 +9,8 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/phrocker/shoal/accumulo"
-	"github.com/phrocker/shoal/rfile"
+	"github.com/phrocker/shoal-oss/accumulo"
+	"github.com/phrocker/shoal-oss/rfile"
 )
 
 func entry(row, family, qualifier string, timestamp int64, value string) rfile.Entry {

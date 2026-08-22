@@ -27,10 +27,10 @@ import (
 	"reflect"
 	"strings"
 
-	"github.com/phrocker/shoal/internal/embedpb"
-	"github.com/phrocker/shoal/internal/embedstore"
-	"github.com/phrocker/shoal/internal/engine"
-	"github.com/phrocker/shoal/internal/tablet"
+	"github.com/phrocker/shoal-oss/internal/embedpb"
+	"github.com/phrocker/shoal-oss/internal/embedstore"
+	"github.com/phrocker/shoal-oss/internal/engine"
+	"github.com/phrocker/shoal-oss/internal/tablet"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -243,10 +243,36 @@ func (s *embedServer) Write(ctx context.Context, req *embedpb.WriteRequest) (*em
 	if req.Table == "" {
 		return nil, status.Error(codes.InvalidArgument, "table is required")
 	}
-	if err := s.store.Write(ctx, req.Table, req.Mutations); err != nil {
+	for _, mutation := range req.Mutations {
+		if mutation != nil && len(mutation.Conditions) > 0 {
+			return nil, status.Error(codes.InvalidArgument, "conditional mutations require ConditionalWrite")
+		}
+	}
+	return s.writeWithResults(ctx, req)
+}
+
+func (s *embedServer) ConditionalWrite(ctx context.Context, req *embedpb.WriteRequest) (*embedpb.WriteResponse, error) {
+	if req.Table == "" {
+		return nil, status.Error(codes.InvalidArgument, "table is required")
+	}
+	return s.writeWithResults(ctx, req)
+}
+
+func (s *embedServer) writeWithResults(ctx context.Context, req *embedpb.WriteRequest) (*embedpb.WriteResponse, error) {
+	results, err := s.store.WriteWithResults(ctx, req.Table, req.Mutations)
+	if errors.Is(err, embedstore.ErrInvalidCondition) {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+	if err != nil {
 		return nil, status.Errorf(codes.Internal, "write: %v", err)
 	}
-	return &embedpb.WriteResponse{Written: int32(len(req.Mutations))}, nil
+	var written int32
+	for _, result := range results {
+		if result.Status == embedpb.MutationStatus_MUTATION_STATUS_ACCEPTED {
+			written++
+		}
+	}
+	return &embedpb.WriteResponse{Written: written, Results: results}, nil
 }
 
 // scanStatusError maps embedstore's validation sentinels onto gRPC codes,

@@ -22,10 +22,10 @@ import (
 	"os"
 	"testing"
 
-	"github.com/phrocker/shoal/internal/cclient"
-	"github.com/phrocker/shoal/internal/engine"
-	"github.com/phrocker/shoal/internal/iterrt"
-	"github.com/phrocker/shoal/internal/tablet"
+	"github.com/phrocker/shoal-oss/internal/cclient"
+	"github.com/phrocker/shoal-oss/internal/engine"
+	"github.com/phrocker/shoal-oss/internal/iterrt"
+	"github.com/phrocker/shoal-oss/internal/tablet"
 )
 
 // scanEdges returns the set of resolved (cq|value) edge cells for row via

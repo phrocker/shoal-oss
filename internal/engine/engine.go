@@ -48,13 +48,13 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/phrocker/shoal/internal/cclient"
-	"github.com/phrocker/shoal/internal/iterrt"
-	"github.com/phrocker/shoal/internal/localwal"
-	"github.com/phrocker/shoal/internal/rfile/wire"
-	"github.com/phrocker/shoal/internal/storage"
-	"github.com/phrocker/shoal/internal/storage/local"
-	"github.com/phrocker/shoal/internal/tablet"
+	"github.com/phrocker/shoal-oss/internal/cclient"
+	"github.com/phrocker/shoal-oss/internal/iterrt"
+	"github.com/phrocker/shoal-oss/internal/localwal"
+	"github.com/phrocker/shoal-oss/internal/rfile/wire"
+	"github.com/phrocker/shoal-oss/internal/storage"
+	"github.com/phrocker/shoal-oss/internal/storage/local"
+	"github.com/phrocker/shoal-oss/internal/tablet"
 )
 
 // Engine is the embedded Accumulo-model storage engine.
@@ -217,6 +217,53 @@ func (e *Engine) Write(table string, mutations []*cclient.Mutation) error {
 	}
 	e.metrics.cellsWritten.Add(cells)
 	return nil
+}
+
+// Condition and ConditionalMutation expose the tablet CAS model at the engine
+// boundary without duplicating its locking or persistence implementation.
+type Condition = tablet.Condition
+type ConditionKind = tablet.ConditionKind
+type ConditionalMutation = tablet.ConditionalMutation
+
+const (
+	ConditionAbsent      = tablet.ConditionAbsent
+	ConditionValueEquals = tablet.ConditionValueEquals
+)
+
+// ConditionalWrite evaluates and applies each mutation atomically at its
+// owning tablet. Results align with mutations and are true only when accepted.
+func (e *Engine) ConditionalWrite(table string, mutations []ConditionalMutation) ([]bool, error) {
+	for mutationIndex, mutation := range mutations {
+		if mutation.Mutation == nil {
+			return nil, fmt.Errorf("engine: conditional mutation %d is nil", mutationIndex)
+		}
+		for conditionIndex, condition := range mutation.Conditions {
+			if condition.Kind != ConditionAbsent && condition.Kind != ConditionValueEquals {
+				return nil, fmt.Errorf("engine: conditional mutation %d condition %d has unsupported kind %d", mutationIndex, conditionIndex, condition.Kind)
+			}
+		}
+	}
+	e.mu.RLock()
+	tbl, ok := e.tables[table]
+	e.mu.RUnlock()
+	if !ok {
+		return nil, fmt.Errorf("engine: table %q not found", table)
+	}
+	results, err := tbl.conditionalWrite(mutations)
+	if err != nil {
+		return nil, err
+	}
+	e.metrics.writes.Add(1)
+	var accepted, cells uint64
+	for i, mutation := range mutations {
+		if results[i] {
+			accepted++
+			cells += uint64(mutation.Mutation.Size())
+		}
+	}
+	e.metrics.mutations.Add(accepted)
+	e.metrics.cellsWritten.Add(cells)
+	return results, nil
 }
 
 // ScanOptions configures a scan.

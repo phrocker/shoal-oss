@@ -1,6 +1,6 @@
 package shoalql
 
-import "github.com/phrocker/shoal/internal/graphschema"
+import "github.com/phrocker/shoal-oss/internal/graphschema"
 
 // GraphBinding maps a logical table onto shoal's graph key layout
 // (graphschema): rows are prefixed (evt:, ent:), text lives in the content:

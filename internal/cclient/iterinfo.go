@@ -5,7 +5,7 @@ package cclient
 import (
 	"errors"
 
-	"github.com/phrocker/shoal/internal/thrift/gen/data"
+	"github.com/phrocker/shoal-oss/internal/thrift/gen/data"
 )
 
 // IterInfo describes a server-side iterator for a scan: its name (the

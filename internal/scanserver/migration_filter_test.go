@@ -3,8 +3,8 @@ package scanserver
 import (
 	"testing"
 
-	"github.com/phrocker/shoal/internal/metadata"
-	"github.com/phrocker/shoal/internal/rfile/wire"
+	"github.com/phrocker/shoal-oss/internal/metadata"
+	"github.com/phrocker/shoal-oss/internal/rfile/wire"
 )
 
 func TestHasMigrationProcessorFiltersRows(t *testing.T) {

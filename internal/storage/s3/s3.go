@@ -58,7 +58,7 @@ import (
 	"github.com/aws/smithy-go"
 	"github.com/google/uuid"
 
-	shstorage "github.com/phrocker/shoal/internal/storage"
+	shstorage "github.com/phrocker/shoal-oss/internal/storage"
 )
 
 // Backend opens S3 objects via a shared *s3sdk.Client. Safe for

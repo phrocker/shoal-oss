@@ -32,9 +32,9 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 
-	"github.com/phrocker/shoal/internal/embedpb"
-	"github.com/phrocker/shoal/internal/engine"
-	"github.com/phrocker/shoal/internal/obs"
+	"github.com/phrocker/shoal-oss/internal/embedpb"
+	"github.com/phrocker/shoal-oss/internal/engine"
+	"github.com/phrocker/shoal-oss/internal/obs"
 )
 
 // serveConfig configures a shoal-embed "serve" runtime: the gRPC data-plane

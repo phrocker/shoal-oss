@@ -27,7 +27,7 @@ import (
 	"path/filepath"
 	"sync"
 
-	"github.com/phrocker/shoal/internal/storage"
+	"github.com/phrocker/shoal-oss/internal/storage"
 )
 
 // Backend wraps an inner storage.Backend with an on-disk read-through cache.

@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/phrocker/shoal/internal/tserver"
+	"github.com/phrocker/shoal-oss/internal/tserver"
 )
 
 type admission bool

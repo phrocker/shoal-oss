@@ -13,7 +13,7 @@ import (
 	"sync"
 	"unsafe"
 
-	"github.com/phrocker/shoal/accumulo"
+	"github.com/phrocker/shoal-oss/accumulo"
 )
 
 type scanCursorSource interface {

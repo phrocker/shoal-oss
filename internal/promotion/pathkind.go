@@ -7,7 +7,7 @@ import (
 	"runtime"
 	"strings"
 
-	"github.com/phrocker/shoal/internal/storage"
+	"github.com/phrocker/shoal-oss/internal/storage"
 	"golang.org/x/text/cases"
 	"golang.org/x/text/unicode/norm"
 )

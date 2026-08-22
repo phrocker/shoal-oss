@@ -17,7 +17,7 @@
 
 package iterrt
 
-import "github.com/phrocker/shoal/internal/rfile/wire"
+import "github.com/phrocker/shoal-oss/internal/rfile/wire"
 
 // kv is a test cell.
 type kv struct {

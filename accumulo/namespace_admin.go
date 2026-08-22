@@ -7,9 +7,9 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/phrocker/shoal/internal/managerclient"
-	nslookup "github.com/phrocker/shoal/internal/namespaces"
-	"github.com/phrocker/shoal/internal/zk"
+	"github.com/phrocker/shoal-oss/internal/managerclient"
+	nslookup "github.com/phrocker/shoal-oss/internal/namespaces"
+	"github.com/phrocker/shoal-oss/internal/zk"
 )
 
 // CreateNamespace creates a namespace and waits for the Accumulo 4 FATE

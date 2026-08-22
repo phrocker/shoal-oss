@@ -20,8 +20,8 @@ package offlinecompact
 import (
 	"testing"
 
-	"github.com/phrocker/shoal/internal/compaction"
-	"github.com/phrocker/shoal/internal/iterrt"
+	"github.com/phrocker/shoal-oss/internal/compaction"
+	"github.com/phrocker/shoal-oss/internal/iterrt"
 )
 
 // majcSpec builds an identity-stack full-major spec over one input RFile.

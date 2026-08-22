@@ -6,10 +6,10 @@ import (
 	"fmt"
 	"sort"
 
-	"github.com/phrocker/shoal/internal/metadata"
-	"github.com/phrocker/shoal/internal/rfile/wire"
-	"github.com/phrocker/shoal/internal/thrift/gen/data"
-	"github.com/phrocker/shoal/internal/visfilter"
+	"github.com/phrocker/shoal-oss/internal/metadata"
+	"github.com/phrocker/shoal-oss/internal/rfile/wire"
+	"github.com/phrocker/shoal-oss/internal/thrift/gen/data"
+	"github.com/phrocker/shoal-oss/internal/visfilter"
 )
 
 // scanTabletRanges drives the heap-merge engine across one tablet's

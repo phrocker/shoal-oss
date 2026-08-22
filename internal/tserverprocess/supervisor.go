@@ -11,7 +11,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/phrocker/shoal/internal/tserver"
+	"github.com/phrocker/shoal-oss/internal/tserver"
 )
 
 type GenerationFactory func() (*tserver.ServiceLock, tserver.ServiceLockData, error)

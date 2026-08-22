@@ -21,10 +21,10 @@ import (
 	"context"
 	"testing"
 
-	"github.com/phrocker/shoal/internal/checkpoint"
-	"github.com/phrocker/shoal/internal/embedpb"
-	"github.com/phrocker/shoal/internal/embedstore"
-	"github.com/phrocker/shoal/internal/engine"
+	"github.com/phrocker/shoal-oss/internal/checkpoint"
+	"github.com/phrocker/shoal-oss/internal/embedpb"
+	"github.com/phrocker/shoal-oss/internal/embedstore"
+	"github.com/phrocker/shoal-oss/internal/engine"
 )
 
 func newStore(t *testing.T) (*embedstore.EngineStore, string) {

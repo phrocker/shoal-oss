@@ -5,8 +5,8 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/phrocker/shoal/internal/managerclient"
-	"github.com/phrocker/shoal/internal/zk"
+	"github.com/phrocker/shoal-oss/internal/managerclient"
+	"github.com/phrocker/shoal-oss/internal/zk"
 )
 
 func TestTablePropertyMutationsUseAccumulo4ManagerRPCs(t *testing.T) {

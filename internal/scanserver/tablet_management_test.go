@@ -6,8 +6,8 @@ import (
 	"encoding/json"
 	"testing"
 
-	"github.com/phrocker/shoal/internal/metadata"
-	"github.com/phrocker/shoal/internal/rfile/wire"
+	"github.com/phrocker/shoal-oss/internal/metadata"
+	"github.com/phrocker/shoal-oss/internal/rfile/wire"
 )
 
 func TestTabletManagementProcessorLocationConvergence(t *testing.T) {

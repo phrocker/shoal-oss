@@ -4,7 +4,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/phrocker/shoal/internal/rfile/bcfile/block"
+	"github.com/phrocker/shoal-oss/internal/rfile/bcfile/block"
 )
 
 func TestOptionsFromTableProperties(t *testing.T) {

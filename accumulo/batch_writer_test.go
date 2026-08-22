@@ -10,11 +10,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/phrocker/shoal/internal/cclient"
-	"github.com/phrocker/shoal/internal/ingestclient"
-	"github.com/phrocker/shoal/internal/metadata"
-	clientpkg "github.com/phrocker/shoal/internal/thrift/gen/client"
-	"github.com/phrocker/shoal/internal/thrift/gen/data"
+	"github.com/phrocker/shoal-oss/internal/cclient"
+	"github.com/phrocker/shoal-oss/internal/ingestclient"
+	"github.com/phrocker/shoal-oss/internal/metadata"
+	clientpkg "github.com/phrocker/shoal-oss/internal/thrift/gen/client"
+	"github.com/phrocker/shoal-oss/internal/thrift/gen/data"
 )
 
 type fakeBatchWriterIngest struct {

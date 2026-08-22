@@ -7,9 +7,9 @@ import (
 	"strings"
 	"unicode/utf8"
 
-	"github.com/phrocker/shoal/accumulo"
-	"github.com/phrocker/shoal/internal/engine"
-	"github.com/phrocker/shoal/internal/storage"
+	"github.com/phrocker/shoal-oss/accumulo"
+	"github.com/phrocker/shoal-oss/internal/engine"
+	"github.com/phrocker/shoal-oss/internal/storage"
 )
 
 // Promoter is the Accumulo-side capability Promote needs: reconciling a

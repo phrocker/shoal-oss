@@ -33,13 +33,13 @@ import (
 
 	"github.com/apache/thrift/lib/go/thrift"
 
-	"github.com/phrocker/shoal/internal/thrift/gen/client"
-	"github.com/phrocker/shoal/internal/thrift/gen/data"
-	"github.com/phrocker/shoal/internal/thrift/gen/manager"
-	"github.com/phrocker/shoal/internal/thrift/gen/security"
-	"github.com/phrocker/shoal/internal/thrift/gen/tabletmgmt"
-	"github.com/phrocker/shoal/internal/thrift/gen/tabletserver"
-	"github.com/phrocker/shoal/internal/tserver"
+	"github.com/phrocker/shoal-oss/internal/thrift/gen/client"
+	"github.com/phrocker/shoal-oss/internal/thrift/gen/data"
+	"github.com/phrocker/shoal-oss/internal/thrift/gen/manager"
+	"github.com/phrocker/shoal-oss/internal/thrift/gen/security"
+	"github.com/phrocker/shoal-oss/internal/thrift/gen/tabletmgmt"
+	"github.com/phrocker/shoal-oss/internal/thrift/gen/tabletserver"
+	"github.com/phrocker/shoal-oss/internal/tserver"
 )
 
 const (

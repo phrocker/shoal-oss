@@ -5,7 +5,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/phrocker/shoal/internal/transportpool"
+	"github.com/phrocker/shoal-oss/internal/transportpool"
 )
 
 const (

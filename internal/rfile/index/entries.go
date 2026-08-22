@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"fmt"
 
-	"github.com/phrocker/shoal/internal/rfile/wire"
+	"github.com/phrocker/shoal-oss/internal/rfile/wire"
 )
 
 // Entries is a random-access view of the IndexEntries in one IndexBlock.

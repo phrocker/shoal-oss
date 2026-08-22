@@ -3,7 +3,7 @@ package rfile
 import (
 	"fmt"
 
-	"github.com/phrocker/shoal/accumulo"
+	"github.com/phrocker/shoal-oss/accumulo"
 )
 
 // StreamRelocation is the argument every seekable stream accepts: where to

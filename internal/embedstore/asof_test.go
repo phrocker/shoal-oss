@@ -21,9 +21,9 @@ import (
 	"context"
 	"testing"
 
-	"github.com/phrocker/shoal/internal/embedpb"
-	"github.com/phrocker/shoal/internal/embedstore"
-	"github.com/phrocker/shoal/internal/engine"
+	"github.com/phrocker/shoal-oss/internal/embedpb"
+	"github.com/phrocker/shoal-oss/internal/embedstore"
+	"github.com/phrocker/shoal-oss/internal/engine"
 )
 
 // TestScanAsOf reconstructs a single coordinate's history through the public

@@ -10,10 +10,10 @@ import (
 	"time"
 	"unicode"
 
-	"github.com/phrocker/shoal/internal/scanclient"
-	"github.com/phrocker/shoal/internal/thrift/gen/data"
-	"github.com/phrocker/shoal/internal/thrift/gen/security"
-	"github.com/phrocker/shoal/internal/zk"
+	"github.com/phrocker/shoal-oss/internal/scanclient"
+	"github.com/phrocker/shoal-oss/internal/thrift/gen/data"
+	"github.com/phrocker/shoal-oss/internal/thrift/gen/security"
+	"github.com/phrocker/shoal-oss/internal/zk"
 )
 
 // Walker walks the ZK → root tablet → metadata table chain to materialize

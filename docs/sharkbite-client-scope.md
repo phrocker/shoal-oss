@@ -1,6 +1,6 @@
 # ADR: Sharkbite client compatibility scope
 
-Status: Accepted, normative for `docs/sharkbite-compatibility.md` revision 55.
+Status: Accepted, normative for `docs/sharkbite-compatibility.md` revision 56.
 
 ## Decision
 
@@ -12,7 +12,7 @@ semantics. It does not require a source-compatible recreation of Sharkbite's
 historical C++ implementation.
 
 Every matrix row has exactly one release-scope disposition in
-`docs/sharkbite-compatibility-revision55-scope.tsv`:
+`docs/sharkbite-compatibility-revision56-scope.tsv`:
 
 1. **Covered** — a required client row whose matrix status is `Covered`.
 2. **Approved divergence** — a required row with a named, dated decision in
@@ -33,10 +33,10 @@ On 2026-08-20, owner @phrocker decided that native macOS wheel, dylib, archive,
 link/runtime, and Mach-O verification are not required for the current client
 release. Exactly `SB-PKG-008`, `SB-XCUT-014`, and `SB-XCUT-019` are therefore
 `Optional` under `optional-deferred-macos-native`; their underlying matrix
-statuses and evidence remain unchanged. `SB-PKG-011` is not included: a
-controlled Linux manylinux publication workflow remains required, while
-macOS publication in that workflow is optional. No other prefix-level or
-platform bulk exclusion is permitted.
+statuses and evidence remain unchanged. `SB-PKG-011` is not included in that
+deferral: revision 56 covers it with the controlled Linux manylinux workflow
+and verified main-branch run, while macOS publication remains optional. No
+other prefix-level or platform bulk exclusion is permitted.
 
 ## Evidence and anti-bulk rules
 
@@ -56,6 +56,7 @@ macOS-native rows above.
 
 The core code/package gate is open only when every required row is `Covered` or
 an `Approved divergence`. Live Accumulo evidence tracked by #74 remains
-explicit required scope. Revision 55 defers exactly the three named
-macOS-native rows without claiming coverage; `SB-PKG-011` remains a required
-Linux manylinux release-automation gap.
+explicit required scope. Revision 56 retains exactly the three named
+macOS-native rows as optional without claiming coverage. `SB-PKG-011` is
+covered by the merged controlled Linux manylinux workflow and successful
+main-branch run 32493148857.

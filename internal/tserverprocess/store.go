@@ -15,14 +15,14 @@ import (
 	"sort"
 	"sync"
 
-	"github.com/phrocker/shoal/internal/ingestrouter"
-	"github.com/phrocker/shoal/internal/iterrt"
-	"github.com/phrocker/shoal/internal/metadata"
-	"github.com/phrocker/shoal/internal/mincauthority"
-	"github.com/phrocker/shoal/internal/shadow/itercfg"
-	"github.com/phrocker/shoal/internal/tabletloader"
-	"github.com/phrocker/shoal/internal/tserver"
-	"github.com/phrocker/shoal/internal/tserverrpc"
+	"github.com/phrocker/shoal-oss/internal/ingestrouter"
+	"github.com/phrocker/shoal-oss/internal/iterrt"
+	"github.com/phrocker/shoal-oss/internal/metadata"
+	"github.com/phrocker/shoal-oss/internal/mincauthority"
+	"github.com/phrocker/shoal-oss/internal/shadow/itercfg"
+	"github.com/phrocker/shoal-oss/internal/tabletloader"
+	"github.com/phrocker/shoal-oss/internal/tserver"
+	"github.com/phrocker/shoal-oss/internal/tserverrpc"
 )
 
 var (

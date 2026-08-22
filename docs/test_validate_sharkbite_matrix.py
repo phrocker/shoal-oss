@@ -99,7 +99,7 @@ def matrix_table(header: str, separator: str | None, *rows: str) -> list[str]:
 
 
 def replace_standalone_number(text: str, old: int, new: int) -> str:
-    return re.sub(rf"(?<![\d,]){old}(?![\d,])", str(new), text)
+    return re.sub(rf"(?<![A-Za-z\d,]){old}(?![A-Za-z\d,])", str(new), text)
 
 
 def delete_matrix_row_consistently(text: str, row_id: str, prefix: str) -> str:
@@ -2474,15 +2474,15 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
 
     def test_pinned_inventory_constants_are_internally_consistent(self) -> None:
         validator.validate_pinned_inventory_constants()
-        self.assertEqual(validator.EXPECTED_REVISION, 55)
+        self.assertEqual(validator.EXPECTED_REVISION, 56)
         self.assertEqual(validator.EXPECTED_TOTAL_ROWS, 3203)
         self.assertEqual(validator.EXPECTED_REQUIRED_ROWS, 394)
         self.assertEqual(
             validator.EXPECTED_SCOPE_COUNTS,
             {
-                "Covered": 291,
+                "Covered": 292,
                 "Approved divergence": 98,
-                "Required gap": 5,
+                "Required gap": 4,
                 "Optional": 2766,
                 "Not required": 43,
             },
@@ -2490,9 +2490,9 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
         self.assertEqual(
             validator.EXPECTED_STATUS_COUNTS,
             {
-                "Covered": 354,
+                "Covered": 355,
                 "Missing Go": 2201,
-                "Missing C ABI": 76,
+                "Missing C ABI": 75,
                 "Behavior mismatch": 83,
                 validator.INTENTIONAL_DIVERGENCE_STATUS: 98,
                 validator.NOT_REQUIRED_STATUS: 391,
@@ -2542,7 +2542,7 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
                 entries[row_id][1:3],
                 ("Optional", "optional-deferred-macos-native"),
             )
-        self.assertEqual(entries["SB-PKG-011"][1:3], ("Required gap", "core-required-gap"))
+        self.assertEqual(entries["SB-PKG-011"][1:3], ("Covered", "core-covered"))
         for row_id in ("SB-PKG-012", "SB-PKG-013", "SB-TORCH-001", "SB-PANDA-001"):
             self.assertEqual(entries[row_id][1], "Optional")
 
@@ -2565,7 +2565,7 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
         lines[2] = "# Sharkbite source: unreviewed."
         self.assert_validation_fails(
             lambda: validator.validate_scope_manifest_provenance(lines),
-            "scope manifest provenance header does not match revision 55",
+            "scope manifest provenance header does not match revision 56",
         )
 
     def test_collect_c_abi_free_function_inventory_matches_header(self) -> None:
@@ -2692,7 +2692,7 @@ class ValidateSharkbiteMatrixTests(unittest.TestCase):
             lambda: validator.validate_revision_inventory(
                 row_ids, reclassified, prefix_counts
             ),
-            f"revision {validator.EXPECTED_REVISION} inventory expects 354 rows for Covered, found 355",
+            f"revision {validator.EXPECTED_REVISION} inventory expects 355 rows for Covered, found 356",
         )
 
     def test_declared_count_edit_still_fails_internal_cross_check(self) -> None:

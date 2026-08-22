@@ -25,12 +25,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/phrocker/shoal/internal/agentmem"
-	"github.com/phrocker/shoal/internal/embedpb"
-	"github.com/phrocker/shoal/internal/embedstore"
-	"github.com/phrocker/shoal/internal/engine"
-	"github.com/phrocker/shoal/internal/graphschema"
-	"github.com/phrocker/shoal/internal/storage/memory"
+	"github.com/phrocker/shoal-oss/internal/agentmem"
+	"github.com/phrocker/shoal-oss/internal/embedpb"
+	"github.com/phrocker/shoal-oss/internal/embedstore"
+	"github.com/phrocker/shoal-oss/internal/engine"
+	"github.com/phrocker/shoal-oss/internal/graphschema"
+	"github.com/phrocker/shoal-oss/internal/storage/memory"
 )
 
 // TestAgentmemRoundTripExportImport is the headline "unlock" proof, run fully

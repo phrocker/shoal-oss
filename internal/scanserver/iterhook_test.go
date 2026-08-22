@@ -8,12 +8,12 @@ import (
 	"math"
 	"testing"
 
-	"github.com/phrocker/shoal/internal/cache"
-	"github.com/phrocker/shoal/internal/ivfpq"
-	"github.com/phrocker/shoal/internal/metadata"
-	"github.com/phrocker/shoal/internal/rfile/wire"
-	"github.com/phrocker/shoal/internal/storage/memory"
-	"github.com/phrocker/shoal/internal/thrift/gen/data"
+	"github.com/phrocker/shoal-oss/internal/cache"
+	"github.com/phrocker/shoal-oss/internal/ivfpq"
+	"github.com/phrocker/shoal-oss/internal/metadata"
+	"github.com/phrocker/shoal-oss/internal/rfile/wire"
+	"github.com/phrocker/shoal-oss/internal/storage/memory"
+	"github.com/phrocker/shoal-oss/internal/thrift/gen/data"
 )
 
 // TestStartScan_WithIvfPqIterator end-to-end checks the iterator hook:

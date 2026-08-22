@@ -29,7 +29,7 @@ import (
 
 	gozk "github.com/go-zookeeper/zk"
 
-	"github.com/phrocker/shoal/internal/iterrt"
+	"github.com/phrocker/shoal-oss/internal/iterrt"
 )
 
 type rawConfigLocator struct {

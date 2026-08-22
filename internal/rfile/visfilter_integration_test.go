@@ -7,9 +7,9 @@ import (
 	"io"
 	"testing"
 
-	"github.com/phrocker/shoal/internal/rfile/bcfile"
-	"github.com/phrocker/shoal/internal/rfile/bcfile/block"
-	"github.com/phrocker/shoal/internal/visfilter"
+	"github.com/phrocker/shoal-oss/internal/rfile/bcfile"
+	"github.com/phrocker/shoal-oss/internal/rfile/bcfile/block"
+	"github.com/phrocker/shoal-oss/internal/visfilter"
 )
 
 // TestVisfilter_EndToEnd writes an RFile with cells under a few CV

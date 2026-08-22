@@ -25,7 +25,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/phrocker/shoal/internal/storage"
+	"github.com/phrocker/shoal-oss/internal/storage"
 )
 
 // Client is the subset of the colinmarc/hdfs client used by Backend.

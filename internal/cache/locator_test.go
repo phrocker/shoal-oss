@@ -7,7 +7,7 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/phrocker/shoal/internal/metadata"
+	"github.com/phrocker/shoal-oss/internal/metadata"
 )
 
 // fakeLocator is a TableLocator stub. Records call counts so tests can

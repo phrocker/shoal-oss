@@ -9,8 +9,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/phrocker/shoal/internal/ingestrouter"
-	"github.com/phrocker/shoal/internal/thrift/gen/data"
+	"github.com/phrocker/shoal-oss/internal/ingestrouter"
+	"github.com/phrocker/shoal-oss/internal/thrift/gen/data"
 )
 
 const (

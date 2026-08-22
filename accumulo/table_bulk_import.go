@@ -5,8 +5,8 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/phrocker/shoal/internal/managerclient"
-	"github.com/phrocker/shoal/internal/tablenames"
+	"github.com/phrocker/shoal-oss/internal/managerclient"
+	"github.com/phrocker/shoal-oss/internal/tablenames"
 )
 
 // BulkImportOptions controls a BulkImport call.

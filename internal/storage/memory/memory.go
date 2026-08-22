@@ -13,7 +13,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/phrocker/shoal/internal/storage"
+	"github.com/phrocker/shoal-oss/internal/storage"
 )
 
 // Backend is an in-memory map[path]bytes. Concurrent-safe Put/Open.

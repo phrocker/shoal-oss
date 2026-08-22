@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/phrocker/shoal/internal/deployment"
+	"github.com/phrocker/shoal-oss/internal/deployment"
 )
 
 func TestPlanCommandDeterministic(t *testing.T) {

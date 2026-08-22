@@ -42,7 +42,7 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blockblob"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/service"
 
-	shstorage "github.com/phrocker/shoal/internal/storage"
+	shstorage "github.com/phrocker/shoal-oss/internal/storage"
 )
 
 type fakeAzureObject struct {

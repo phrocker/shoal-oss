@@ -5,10 +5,10 @@ import (
 	"errors"
 	"math"
 
-	"github.com/phrocker/shoal/internal/ingestrouter"
-	"github.com/phrocker/shoal/internal/thrift/gen/client"
-	"github.com/phrocker/shoal/internal/thrift/gen/data"
-	"github.com/phrocker/shoal/internal/thrift/gen/security"
+	"github.com/phrocker/shoal-oss/internal/ingestrouter"
+	"github.com/phrocker/shoal-oss/internal/thrift/gen/client"
+	"github.com/phrocker/shoal-oss/internal/thrift/gen/data"
+	"github.com/phrocker/shoal-oss/internal/thrift/gen/security"
 )
 
 // ReadConditionalRow reads the immutable portion of one row. Hosted tablets

@@ -26,7 +26,7 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/phrocker/shoal/internal/tlsserver"
+	"github.com/phrocker/shoal-oss/internal/tlsserver"
 )
 
 // tlsFilesConfig is the resolved (flag-or-env) TLS file configuration for

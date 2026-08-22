@@ -43,7 +43,7 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/phrocker/shoal/internal/rfile/wire"
+	"github.com/phrocker/shoal-oss/internal/rfile/wire"
 )
 
 // Flag bits in the first ("fieldsSame") byte. Mirrors RelativeKey.java:44-51.

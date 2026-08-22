@@ -7,7 +7,7 @@ import (
 	"math"
 	"strings"
 
-	"github.com/phrocker/shoal/internal/thrift/gen/data"
+	"github.com/phrocker/shoal-oss/internal/thrift/gen/data"
 )
 
 // Range describes a row-bounded scan range.

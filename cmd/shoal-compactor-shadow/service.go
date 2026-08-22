@@ -33,15 +33,15 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/phrocker/shoal/internal/cred"
-	"github.com/phrocker/shoal/internal/iterrt"
-	"github.com/phrocker/shoal/internal/metadata"
-	"github.com/phrocker/shoal/internal/shadow"
-	"github.com/phrocker/shoal/internal/shadow/itercfg"
-	shmetrics "github.com/phrocker/shoal/internal/shadow/metrics"
-	"github.com/phrocker/shoal/internal/shadow/poller"
-	"github.com/phrocker/shoal/internal/storage"
-	"github.com/phrocker/shoal/internal/zk"
+	"github.com/phrocker/shoal-oss/internal/cred"
+	"github.com/phrocker/shoal-oss/internal/iterrt"
+	"github.com/phrocker/shoal-oss/internal/metadata"
+	"github.com/phrocker/shoal-oss/internal/shadow"
+	"github.com/phrocker/shoal-oss/internal/shadow/itercfg"
+	shmetrics "github.com/phrocker/shoal-oss/internal/shadow/metrics"
+	"github.com/phrocker/shoal-oss/internal/shadow/poller"
+	"github.com/phrocker/shoal-oss/internal/storage"
+	"github.com/phrocker/shoal-oss/internal/zk"
 )
 
 // serviceOptions is the parsed --service-mode CLI surface. Built in

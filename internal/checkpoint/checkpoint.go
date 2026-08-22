@@ -36,7 +36,7 @@ import (
 	"sort"
 	"strconv"
 
-	"github.com/phrocker/shoal/internal/embedpb"
+	"github.com/phrocker/shoal-oss/internal/embedpb"
 )
 
 // RowPrefix namespaces checkpoint metadata rows within a table. It is distinct

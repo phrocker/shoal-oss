@@ -11,9 +11,9 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/phrocker/shoal/internal/ingestrouter"
-	"github.com/phrocker/shoal/internal/rfile"
-	"github.com/phrocker/shoal/internal/walauthority"
+	"github.com/phrocker/shoal-oss/internal/ingestrouter"
+	"github.com/phrocker/shoal-oss/internal/rfile"
+	"github.com/phrocker/shoal-oss/internal/walauthority"
 )
 
 var (

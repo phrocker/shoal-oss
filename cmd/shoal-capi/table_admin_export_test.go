@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/phrocker/shoal/accumulo"
+	"github.com/phrocker/shoal-oss/accumulo"
 )
 
 func TestStatusForTableAdministrationErrors(t *testing.T) {

@@ -4,8 +4,8 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/phrocker/shoal/internal/storage"
-	"github.com/phrocker/shoal/internal/storage/memory"
+	"github.com/phrocker/shoal-oss/internal/storage"
+	"github.com/phrocker/shoal-oss/internal/storage/memory"
 )
 
 // TestValidateDestinationWritableRejectsNilDestination proves a nil dst

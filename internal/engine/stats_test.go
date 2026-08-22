@@ -20,9 +20,9 @@ package engine_test
 import (
 	"testing"
 
-	"github.com/phrocker/shoal/internal/cclient"
-	"github.com/phrocker/shoal/internal/engine"
-	"github.com/phrocker/shoal/internal/iterrt"
+	"github.com/phrocker/shoal-oss/internal/cclient"
+	"github.com/phrocker/shoal-oss/internal/engine"
+	"github.com/phrocker/shoal-oss/internal/iterrt"
 )
 
 func TestEngine_StatsAndMetrics(t *testing.T) {

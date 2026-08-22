@@ -40,7 +40,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/phrocker/shoal/internal/ingestrouter"
+	"github.com/phrocker/shoal-oss/internal/ingestrouter"
 )
 
 var (

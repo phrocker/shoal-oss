@@ -7,7 +7,7 @@ import (
 	"io"
 	"os"
 
-	"github.com/phrocker/shoal/internal/deployment"
+	"github.com/phrocker/shoal-oss/internal/deployment"
 )
 
 func main() {

@@ -21,7 +21,7 @@ import (
 	"strconv"
 	"testing"
 
-	"github.com/phrocker/shoal/internal/documentschema"
+	"github.com/phrocker/shoal-oss/internal/documentschema"
 )
 
 // docCells builds the physical cells (event field entries + field index

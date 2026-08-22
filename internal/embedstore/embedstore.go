@@ -40,10 +40,10 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/phrocker/shoal/internal/cclient"
-	"github.com/phrocker/shoal/internal/embedpb"
-	"github.com/phrocker/shoal/internal/engine"
-	"github.com/phrocker/shoal/internal/iterrt"
+	"github.com/phrocker/shoal-oss/internal/cclient"
+	"github.com/phrocker/shoal-oss/internal/embedpb"
+	"github.com/phrocker/shoal-oss/internal/engine"
+	"github.com/phrocker/shoal-oss/internal/iterrt"
 )
 
 // DefaultScanBatchSize is the cell batch size used by streaming callers when a
@@ -61,6 +61,11 @@ var (
 	ErrVectorQueryRequired = errors.New("vector_search.query is required")
 	// ErrNegativeMaxHops is returned when edge_expand.max_hops is negative.
 	ErrNegativeMaxHops = errors.New("edge_expand.max_hops must be non-negative")
+	// ErrInvalidCondition is returned when a mutation condition has no predicate.
+	ErrInvalidCondition = errors.New("mutation condition requires absent or value_equals")
+	// ErrConditionalRejected is returned by Write when any conditional mutation
+	// is rejected. Call WriteWithResults to inspect per-mutation outcomes.
+	ErrConditionalRejected = errors.New("one or more conditional mutations were rejected")
 )
 
 // EngineStore is an engine-backed implementation of the embedpb data plane.
@@ -107,17 +112,41 @@ func (s *EngineStore) CreateTable(_ context.Context, table string, splits []stri
 
 // Write applies mutations to table. Entries with a zero timestamp are stamped
 // with a fresh monotonic timestamp.
-func (s *EngineStore) Write(_ context.Context, table string, muts []*embedpb.Mutation) error {
-	if table == "" {
-		return errors.New("embedstore: table is required")
+func (s *EngineStore) Write(ctx context.Context, table string, muts []*embedpb.Mutation) error {
+	results, err := s.WriteWithResults(ctx, table, muts)
+	if err != nil {
+		return err
 	}
-	mutations := make([]*cclient.Mutation, 0, len(muts))
-	for _, pm := range muts {
+	for _, result := range results {
+		if result.Status == embedpb.MutationStatus_MUTATION_STATUS_REJECTED {
+			return ErrConditionalRejected
+		}
+	}
+	return nil
+}
+
+// WriteWithResults applies mutations and returns one accepted/rejected result
+// per mutation. Conditions and writes are evaluated atomically by the owning
+// tablet; mutations without conditions are always accepted.
+func (s *EngineStore) WriteWithResults(_ context.Context, table string, muts []*embedpb.Mutation) ([]*embedpb.MutationResult, error) {
+	if table == "" {
+		return nil, errors.New("embedstore: table is required")
+	}
+	mutations := make([]engine.ConditionalMutation, 0, len(muts))
+	unconditional := make([]*cclient.Mutation, 0, len(muts))
+	hasConditions := false
+	for mutationIndex, pm := range muts {
+		if pm == nil {
+			return nil, fmt.Errorf("embedstore: mutation %d is nil", mutationIndex)
+		}
 		m, err := cclient.NewMutation(pm.Row)
 		if err != nil {
-			return fmt.Errorf("embedstore: mutation %q: %w", pm.Row, err)
+			return nil, fmt.Errorf("embedstore: mutation %q: %w", pm.Row, err)
 		}
 		for _, e := range pm.Entries {
+			if e == nil {
+				return nil, fmt.Errorf("embedstore: mutation %q has nil entry", pm.Row)
+			}
 			ts := e.Timestamp
 			if ts == 0 {
 				ts = s.nextTimestamp()
@@ -128,9 +157,61 @@ func (s *EngineStore) Write(_ context.Context, table string, muts []*embedpb.Mut
 				m.Put(e.ColumnFamily, e.ColumnQualifier, e.ColumnVisibility, ts, e.Value)
 			}
 		}
-		mutations = append(mutations, m)
+		conditions := make([]engine.Condition, 0, len(pm.Conditions))
+		hasConditions = hasConditions || len(pm.Conditions) > 0
+		for conditionIndex, condition := range pm.Conditions {
+			if condition == nil {
+				return nil, fmt.Errorf("embedstore: mutation %q condition %d is nil", pm.Row, conditionIndex)
+			}
+			converted := engine.Condition{
+				ColumnFamily:     append([]byte(nil), condition.ColumnFamily...),
+				ColumnQualifier:  append([]byte(nil), condition.ColumnQualifier...),
+				ColumnVisibility: append([]byte(nil), condition.ColumnVisibility...),
+			}
+			if condition.Timestamp != nil {
+				timestamp := *condition.Timestamp
+				converted.Timestamp = &timestamp
+			}
+			switch predicate := condition.Predicate.(type) {
+			case *embedpb.Condition_Absent:
+				if !predicate.Absent {
+					return nil, fmt.Errorf("embedstore: mutation %q condition %d: absent must be true: %w", pm.Row, conditionIndex, ErrInvalidCondition)
+				}
+				converted.Kind = engine.ConditionAbsent
+			case *embedpb.Condition_ValueEquals:
+				converted.Kind = engine.ConditionValueEquals
+				converted.Value = append([]byte(nil), predicate.ValueEquals...)
+			default:
+				return nil, fmt.Errorf("embedstore: mutation %q condition %d: %w", pm.Row, conditionIndex, ErrInvalidCondition)
+			}
+			conditions = append(conditions, converted)
+		}
+		mutations = append(mutations, engine.ConditionalMutation{Mutation: m, Conditions: conditions})
+		unconditional = append(unconditional, m)
 	}
-	return s.eng.Write(table, mutations)
+	if !hasConditions {
+		if err := s.eng.Write(table, unconditional); err != nil {
+			return nil, err
+		}
+		results := make([]*embedpb.MutationResult, len(muts))
+		for i := range results {
+			results[i] = &embedpb.MutationResult{Status: embedpb.MutationStatus_MUTATION_STATUS_ACCEPTED}
+		}
+		return results, nil
+	}
+	accepted, err := s.eng.ConditionalWrite(table, mutations)
+	if err != nil {
+		return nil, err
+	}
+	results := make([]*embedpb.MutationResult, len(accepted))
+	for i, ok := range accepted {
+		status := embedpb.MutationStatus_MUTATION_STATUS_REJECTED
+		if ok {
+			status = embedpb.MutationStatus_MUTATION_STATUS_ACCEPTED
+		}
+		results[i] = &embedpb.MutationResult{Status: status}
+	}
+	return results, nil
 }
 
 // Flush forces table's memtables to disk.

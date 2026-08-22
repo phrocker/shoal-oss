@@ -30,10 +30,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/phrocker/shoal/internal/cred"
-	"github.com/phrocker/shoal/internal/metadata"
-	"github.com/phrocker/shoal/internal/thrift/gen/data"
-	"github.com/phrocker/shoal/internal/zk"
+	"github.com/phrocker/shoal-oss/internal/cred"
+	"github.com/phrocker/shoal-oss/internal/metadata"
+	"github.com/phrocker/shoal-oss/internal/thrift/gen/data"
+	"github.com/phrocker/shoal-oss/internal/zk"
 )
 
 func main() {
@@ -190,12 +190,12 @@ func fieldStr(b []byte) string {
 // rootScanCaptureKV is the JSON shape used by ground-truth tests. All
 // byte fields are hex-encoded so the file round-trips exactly.
 type rootScanCaptureKV struct {
-	RowHex      string `json:"rowHex"`
-	CFHex       string `json:"cfHex"`
-	CQHex       string `json:"cqHex"`
-	CVHex       string `json:"cvHex"`
-	TS          int64  `json:"ts"`
-	ValueHex    string `json:"valueHex"`
+	RowHex   string `json:"rowHex"`
+	CFHex    string `json:"cfHex"`
+	CQHex    string `json:"cqHex"`
+	CVHex    string `json:"cvHex"`
+	TS       int64  `json:"ts"`
+	ValueHex string `json:"valueHex"`
 }
 
 type rootScanCapture struct {

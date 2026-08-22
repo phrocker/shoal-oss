@@ -5,7 +5,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/phrocker/shoal/internal/storage/memory"
+	"github.com/phrocker/shoal-oss/internal/storage/memory"
 )
 
 func TestBackendOutputStorePublishesIdempotentlyAndRejectsCollision(t *testing.T) {

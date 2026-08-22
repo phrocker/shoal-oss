@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/phrocker/shoal/accumulo"
+	"github.com/phrocker/shoal-oss/accumulo"
 )
 
 type recordingBufferedWriter struct {

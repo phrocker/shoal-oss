@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/phrocker/shoal/internal/ingestrouter"
+	"github.com/phrocker/shoal-oss/internal/ingestrouter"
 )
 
 type memoryStore struct {

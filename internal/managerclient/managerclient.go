@@ -11,11 +11,11 @@ import (
 
 	"github.com/apache/thrift/lib/go/thrift"
 
-	"github.com/phrocker/shoal/internal/protocol"
-	clientgen "github.com/phrocker/shoal/internal/thrift/gen/client"
-	"github.com/phrocker/shoal/internal/thrift/gen/manager"
-	"github.com/phrocker/shoal/internal/thrift/gen/security"
-	"github.com/phrocker/shoal/internal/transportpool"
+	"github.com/phrocker/shoal-oss/internal/protocol"
+	clientgen "github.com/phrocker/shoal-oss/internal/thrift/gen/client"
+	"github.com/phrocker/shoal-oss/internal/thrift/gen/manager"
+	"github.com/phrocker/shoal-oss/internal/thrift/gen/security"
+	"github.com/phrocker/shoal-oss/internal/transportpool"
 )
 
 const (

@@ -5,8 +5,8 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/phrocker/shoal/internal/managerclient"
-	"github.com/phrocker/shoal/internal/zk"
+	"github.com/phrocker/shoal-oss/internal/managerclient"
+	"github.com/phrocker/shoal-oss/internal/zk"
 )
 
 // BulkImportFateID is the durable Accumulo transaction identity for a Bulk

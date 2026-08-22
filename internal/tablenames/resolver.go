@@ -10,7 +10,7 @@ import (
 	"strings"
 	"sync"
 
-	nslookup "github.com/phrocker/shoal/internal/namespaces"
+	nslookup "github.com/phrocker/shoal-oss/internal/namespaces"
 )
 
 const defaultNamespaceName = ""

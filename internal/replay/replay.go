@@ -36,7 +36,7 @@ import (
 	"fmt"
 	"sort"
 
-	"github.com/phrocker/shoal/internal/embedpb"
+	"github.com/phrocker/shoal-oss/internal/embedpb"
 )
 
 // RowPrefix namespaces ledger rows. A step lives at

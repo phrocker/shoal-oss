@@ -4,9 +4,9 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/phrocker/shoal/internal/storage"
-	"github.com/phrocker/shoal/internal/storage/local"
-	"github.com/phrocker/shoal/internal/storage/memory"
+	"github.com/phrocker/shoal-oss/internal/storage"
+	"github.com/phrocker/shoal-oss/internal/storage/local"
+	"github.com/phrocker/shoal-oss/internal/storage/memory"
 )
 
 type schemeAwareBackend struct {

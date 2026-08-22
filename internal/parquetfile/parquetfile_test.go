@@ -4,8 +4,8 @@ import (
 	"bytes"
 	"testing"
 
-	"github.com/phrocker/shoal/internal/iterrt"
-	"github.com/phrocker/shoal/internal/rfile/wire"
+	"github.com/phrocker/shoal-oss/internal/iterrt"
+	"github.com/phrocker/shoal-oss/internal/rfile/wire"
 )
 
 func TestEncodeDecodePreservesAccumuloKey(t *testing.T) {

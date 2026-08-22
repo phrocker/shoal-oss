@@ -17,8 +17,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/phrocker/shoal/internal/metadata"
-	"github.com/phrocker/shoal/internal/tserver"
+	"github.com/phrocker/shoal-oss/internal/metadata"
+	"github.com/phrocker/shoal-oss/internal/tserver"
 )
 
 var (

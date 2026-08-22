@@ -15,11 +15,11 @@ import (
 	"math"
 	"sort"
 
-	"github.com/phrocker/shoal/internal/managerclient"
-	"github.com/phrocker/shoal/internal/metadata"
-	"github.com/phrocker/shoal/internal/tabletloader"
-	"github.com/phrocker/shoal/internal/thrift/gen/security"
-	"github.com/phrocker/shoal/internal/tserver"
+	"github.com/phrocker/shoal-oss/internal/managerclient"
+	"github.com/phrocker/shoal-oss/internal/metadata"
+	"github.com/phrocker/shoal-oss/internal/tabletloader"
+	"github.com/phrocker/shoal-oss/internal/thrift/gen/security"
+	"github.com/phrocker/shoal-oss/internal/tserver"
 )
 
 type TableLocator interface {

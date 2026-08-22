@@ -11,7 +11,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/phrocker/shoal/internal/embedpb"
+	"github.com/phrocker/shoal-oss/internal/embedpb"
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/proto"
 )
@@ -154,8 +154,39 @@ func (s GRPCStore) CreateTable(ctx context.Context, table string, splits []strin
 	return err
 }
 func (s GRPCStore) Write(ctx context.Context, table string, muts []*embedpb.Mutation) error {
-	_, err := s.Client.Write(ctx, &embedpb.WriteRequest{Table: table, Mutations: muts})
-	return err
+	results, err := s.WriteWithResults(ctx, table, muts)
+	if err != nil {
+		return err
+	}
+	for _, result := range results {
+		if result.Status == embedpb.MutationStatus_MUTATION_STATUS_REJECTED {
+			return errors.New("agentmem: conditional mutation rejected")
+		}
+	}
+	return nil
+}
+func (s GRPCStore) WriteWithResults(ctx context.Context, table string, muts []*embedpb.Mutation) ([]*embedpb.MutationResult, error) {
+	hasConditions := false
+	for _, mutation := range muts {
+		hasConditions = hasConditions || mutation != nil && len(mutation.Conditions) > 0
+	}
+	req := &embedpb.WriteRequest{Table: table, Mutations: muts}
+	var (
+		resp *embedpb.WriteResponse
+		err  error
+	)
+	if hasConditions {
+		resp, err = s.Client.ConditionalWrite(ctx, req)
+	} else {
+		resp, err = s.Client.Write(ctx, req)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if hasConditions && len(resp.Results) != len(muts) {
+		return nil, errors.New("agentmem: server did not return conditional mutation results")
+	}
+	return resp.Results, nil
 }
 func (s GRPCStore) Flush(ctx context.Context, table string) error {
 	_, err := s.Client.Flush(ctx, &embedpb.FlushRequest{Table: table})

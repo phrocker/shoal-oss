@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"sort"
 
-	"github.com/phrocker/shoal/internal/rfile/wire"
-	"github.com/phrocker/shoal/internal/rfile/bcfile"
+	"github.com/phrocker/shoal-oss/internal/rfile/bcfile"
+	"github.com/phrocker/shoal-oss/internal/rfile/wire"
 )
 
 // LevelReader fetches a child IndexBlock by its BCFile region. The

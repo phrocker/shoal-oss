@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/phrocker/shoal/internal/storage"
+	"github.com/phrocker/shoal-oss/internal/storage"
 )
 
 func TestLocal_CreateAndReadBack(t *testing.T) {

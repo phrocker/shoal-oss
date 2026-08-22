@@ -6,13 +6,13 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/phrocker/shoal/internal/rfile/adjacency"
-	"github.com/phrocker/shoal/internal/rfile/bcfile"
-	"github.com/phrocker/shoal/internal/rfile/bcfile/block"
-	"github.com/phrocker/shoal/internal/rfile/blockmeta"
-	"github.com/phrocker/shoal/internal/rfile/index"
-	"github.com/phrocker/shoal/internal/rfile/relkey"
-	"github.com/phrocker/shoal/internal/rfile/wire"
+	"github.com/phrocker/shoal-oss/internal/rfile/adjacency"
+	"github.com/phrocker/shoal-oss/internal/rfile/bcfile"
+	"github.com/phrocker/shoal-oss/internal/rfile/bcfile/block"
+	"github.com/phrocker/shoal-oss/internal/rfile/blockmeta"
+	"github.com/phrocker/shoal-oss/internal/rfile/index"
+	"github.com/phrocker/shoal-oss/internal/rfile/relkey"
+	"github.com/phrocker/shoal-oss/internal/rfile/wire"
 )
 
 // DefaultBlockSize is the per-data-block target byte size for newly

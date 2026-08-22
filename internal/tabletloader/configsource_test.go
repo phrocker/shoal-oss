@@ -5,7 +5,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/phrocker/shoal/internal/managerclient"
+	"github.com/phrocker/shoal-oss/internal/managerclient"
 )
 
 type fakeManagerConfigClient struct {

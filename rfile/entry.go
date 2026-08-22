@@ -1,6 +1,6 @@
 package rfile
 
-import "github.com/phrocker/shoal/accumulo"
+import "github.com/phrocker/shoal-oss/accumulo"
 
 // Entry is one RFile cell: a key, its value, and the tombstone flag Accumulo
 // stores alongside the key.

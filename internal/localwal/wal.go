@@ -42,8 +42,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/phrocker/shoal/internal/cclient"
-	"github.com/phrocker/shoal/internal/rfile/wire"
+	"github.com/phrocker/shoal-oss/internal/cclient"
+	"github.com/phrocker/shoal-oss/internal/rfile/wire"
 )
 
 // SyncMode controls how aggressively the WAL forces data to stable

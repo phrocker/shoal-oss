@@ -25,7 +25,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/phrocker/shoal/internal/conformance"
+	"github.com/phrocker/shoal-oss/internal/conformance"
 )
 
 func main() {

@@ -8,7 +8,7 @@ import (
 	"strconv"
 	"sync"
 
-	"github.com/phrocker/shoal/internal/zk"
+	"github.com/phrocker/shoal-oss/internal/zk"
 )
 
 // ServerKind names the Accumulo 4 server role that advertises a client
