@@ -43,6 +43,10 @@ const (
 	// UidList collapses to a count only (IGNORE=true), mirroring DataWave's
 	// GlobalIndexUidAggregator.MAX default.
 	DefaultMaxUids = 20
+	// StructureNodeField stores one stable section or span record.
+	StructureNodeField = "_shoal.node"
+	// StructureChildField stores ordered parent-to-child relationships.
+	StructureChildField = "_shoal.child"
 )
 
 // --- shard id ---
@@ -86,6 +90,205 @@ func ParseEventCF(cf []byte) (datatype, uid string, ok bool) {
 // after the first NUL and may itself contain NUL bytes.
 func ParseEventCQ(cq []byte) (field, value string, ok bool) {
 	return split1(cq)
+}
+
+// --- hierarchical document structure ---
+
+// StructureKind identifies a node in a document hierarchy.
+type StructureKind byte
+
+const (
+	StructureSection StructureKind = 1
+	StructureSpan    StructureKind = 2
+)
+
+const (
+	structureNodeVersion      = 1
+	structureQualifierMagic   = "\x89SHOALDOC"
+	structureQualifierVersion = 1
+)
+
+// StructureNode is the revision-specific structural metadata for a stable
+// section or span ID. Source offsets are zero-based and half-open. Source
+// pages are one-based; zero means page information is unavailable.
+type StructureNode struct {
+	Kind        StructureKind
+	ParentID    string
+	Order       uint32
+	StartOffset uint64
+	EndOffset   uint64
+	StartPage   uint32
+	EndPage     uint32
+}
+
+// Encode serializes a StructureNode. Revision identity is encoded in the
+// structure qualifier, not inferred from a cell timestamp.
+func (n StructureNode) Encode() []byte {
+	b := []byte{structureNodeVersion, byte(n.Kind)}
+	var fixed [28]byte
+	binary.BigEndian.PutUint32(fixed[0:4], n.Order)
+	binary.BigEndian.PutUint64(fixed[4:12], n.StartOffset)
+	binary.BigEndian.PutUint64(fixed[12:20], n.EndOffset)
+	binary.BigEndian.PutUint32(fixed[20:24], n.StartPage)
+	binary.BigEndian.PutUint32(fixed[24:28], n.EndPage)
+	b = append(b, fixed[:]...)
+	b = appendUvarint(b, uint64(len(n.ParentID)))
+	return append(b, n.ParentID...)
+}
+
+// DecodeStructureNode parses and validates a StructureNode.
+func DecodeStructureNode(data []byte) (StructureNode, error) {
+	var n StructureNode
+	if len(data) < 30 || data[0] != structureNodeVersion {
+		return n, errors.New("documentschema: invalid structure node version")
+	}
+	n.Kind = StructureKind(data[1])
+	if n.Kind != StructureSection && n.Kind != StructureSpan {
+		return n, errors.New("documentschema: invalid structure node kind")
+	}
+	n.Order = binary.BigEndian.Uint32(data[2:6])
+	n.StartOffset = binary.BigEndian.Uint64(data[6:14])
+	n.EndOffset = binary.BigEndian.Uint64(data[14:22])
+	n.StartPage = binary.BigEndian.Uint32(data[22:26])
+	n.EndPage = binary.BigEndian.Uint32(data[26:30])
+	parentLen, rest, err := readUvarint(data[30:])
+	if err != nil {
+		return n, err
+	}
+	if uint64(len(rest)) != parentLen {
+		return n, errors.New("documentschema: invalid structure node parent")
+	}
+	n.ParentID = string(rest)
+	if n.EndOffset < n.StartOffset {
+		return n, errors.New("documentschema: invalid structure node offsets")
+	}
+	if n.StartPage > 0 && n.EndPage > 0 && n.EndPage < n.StartPage {
+		return n, errors.New("documentschema: invalid structure node pages")
+	}
+	return n, nil
+}
+
+// StructureNodePrefix builds the qualifier prefix shared by all nodes in one
+// explicit revision namespace.
+func StructureNodePrefix(revisionID string) []byte {
+	return structureRevisionPrefix(StructureNodeField, revisionID)
+}
+
+// StructureNodeCQ builds the event qualifier for a revision-scoped stable
+// structural node ID.
+func StructureNodeCQ(revisionID, nodeID string) []byte {
+	b := StructureNodePrefix(revisionID)
+	b = appendUvarint(b, uint64(len(nodeID)))
+	return append(b, nodeID...)
+}
+
+// ParseStructureNodeCQ returns the explicit revision and stable node ID from a
+// validated structural node qualifier.
+func ParseStructureNodeCQ(cq []byte) (revisionID, nodeID string, ok bool) {
+	revisionID, rest, ok := parseStructureRevision(cq, StructureNodeField)
+	if !ok {
+		return "", "", false
+	}
+	nodeID, rest, ok = consumeString(rest)
+	if !ok || nodeID == "" || len(rest) != 0 {
+		return "", "", false
+	}
+	return revisionID, nodeID, true
+}
+
+// StructureChildPrefix builds the qualifier prefix shared by every ordered
+// child of parentID in one revision. IDs are length-prefixed and may contain
+// NUL bytes.
+func StructureChildPrefix(revisionID, parentID string) []byte {
+	b := structureRevisionPrefix(StructureChildField, revisionID)
+	b = appendUvarint(b, uint64(len(parentID)))
+	return append(b, parentID...)
+}
+
+// StructureChildCQ builds an ordered parent-to-child relationship qualifier.
+func StructureChildCQ(revisionID, parentID string, order uint32, childID string) []byte {
+	b := StructureChildPrefix(revisionID, parentID)
+	var encodedOrder [4]byte
+	binary.BigEndian.PutUint32(encodedOrder[:], order)
+	b = append(b, encodedOrder[:]...)
+	b = appendUvarint(b, uint64(len(childID)))
+	return append(b, childID...)
+}
+
+// ParseStructureChildCQ parses an ordered parent-to-child relationship.
+func ParseStructureChildCQ(
+	cq []byte,
+) (revisionID, parentID string, order uint32, childID string, ok bool) {
+	revisionID, rest, ok := parseStructureRevision(cq, StructureChildField)
+	if !ok {
+		return "", "", 0, "", false
+	}
+	parentID, rest, ok = consumeString(rest)
+	if !ok || len(rest) < 4 {
+		return "", "", 0, "", false
+	}
+	order = binary.BigEndian.Uint32(rest[:4])
+	childID, rest, ok = consumeString(rest[4:])
+	if !ok || childID == "" || len(rest) != 0 {
+		return "", "", 0, "", false
+	}
+	return revisionID, parentID, order, childID, true
+}
+
+// IsStructureField reports whether field is reserved for Shoal's document
+// hierarchy. A matching field name alone does not identify a structural cell;
+// use IsStructureCell when deciding whether to hide a cell from projection.
+func IsStructureField(field string) bool {
+	return field == StructureNodeField || field == StructureChildField
+}
+
+// IsStructureCell reports whether qualifier and value form a complete,
+// validated structural encoding. Legacy user fields that happen to use a
+// reserved field name do not match.
+func IsStructureCell(qualifier, value []byte) bool {
+	if _, _, ok := ParseStructureNodeCQ(qualifier); ok {
+		_, err := DecodeStructureNode(value)
+		return err == nil
+	}
+	if _, _, _, _, ok := ParseStructureChildCQ(qualifier); ok {
+		return len(value) == 0
+	}
+	return false
+}
+
+func structureRevisionPrefix(field, revisionID string) []byte {
+	b := EventCQ(field, "")
+	b = append(b, structureQualifierMagic...)
+	b = append(b, structureQualifierVersion)
+	b = appendUvarint(b, uint64(len(revisionID)))
+	return append(b, revisionID...)
+}
+
+func parseStructureRevision(cq []byte, wantField string) (string, []byte, bool) {
+	field, payload, ok := ParseEventCQ(cq)
+	if !ok || field != wantField {
+		return "", nil, false
+	}
+	headerLen := len(structureQualifierMagic) + 1
+	if len(payload) < headerLen ||
+		payload[:len(structureQualifierMagic)] != structureQualifierMagic ||
+		payload[len(structureQualifierMagic)] != structureQualifierVersion {
+		return "", nil, false
+	}
+	revisionID, rest, ok := consumeString([]byte(payload[headerLen:]))
+	if !ok || revisionID == "" {
+		return "", nil, false
+	}
+	return revisionID, rest, true
+}
+
+func consumeString(data []byte) (string, []byte, bool) {
+	length, rest, err := readUvarint(data)
+	if err != nil || length > uint64(len(rest)) {
+		return "", nil, false
+	}
+	n := int(length)
+	return string(rest[:n]), rest[n:], true
 }
 
 // --- field index: cf=fi\x00FIELD  cq=value\x00datatype\x00uid ---

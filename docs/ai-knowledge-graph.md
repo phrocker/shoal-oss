@@ -20,9 +20,9 @@
 -->
 # Design: AI-aware local knowledge graph
 
-> **Status:** proposal / design sketch. Not yet implemented. This document
-> describes a direction for evolving the embedded engine; it intentionally
-> does not commit any consumer to it.
+> **Status:** core pushdown capabilities implemented. The product and
+> deployment direction is continued in
+> [platform-product-plan.md](platform-product-plan.md).
 
 ## Motivation
 
@@ -152,10 +152,12 @@ language is invisible to them.
   validated codebase for marginal tail-latency gains; embedding the engine
   in a consumer's process would couple it to that consumer and undermine the
   standalone, JVM-free mission. Keep Go.
-- **Deployment shape: gRPC sidecar.** The engine runs as an out-of-process
-  `shoal-embed` server (one static binary) that consumers dial. This keeps
-  it language-agnostic and droppable next to existing Accumulo-style
-  deployments.
+- **Deployment shape: embedded or gRPC.** Local Python applications may load a
+  narrow public Go facade through a generated CPython extension. Remote and
+  clustered applications use `shoal-embed` or a Shoal router over gRPC. Both
+  transports implement the same coarse graph/document contracts. Accumulo
+  integration continues to use Accumulo-native Thrift, metadata, visibility,
+  and RFile formats at the storage boundary.
 - **No breaking changes.** Every capability here is additive (new optional
   fields / new RPCs / new reserved column families). Existing deployments
   are unaffected.
@@ -164,7 +166,8 @@ language is invisible to them.
 
 - No domain model, schema, or business logic in the engine.
 - No replacement of the existing scan/write/compact contract.
-- No in-process embedding into a consumer runtime.
+- No direct binding to iterator, cell, protobuf, or other internal engine
+  types. In-process bindings expose only the stable public facade.
 - No JVM dependency.
 
 ## Suggested first slice

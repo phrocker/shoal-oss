@@ -1,19 +1,26 @@
 package engine
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/phrocker/shoal-oss/internal/cclient"
 	"github.com/phrocker/shoal-oss/internal/iterrt"
+	"github.com/phrocker/shoal-oss/internal/rfile"
+	"github.com/phrocker/shoal-oss/internal/rfile/bcfile"
+	"github.com/phrocker/shoal-oss/internal/rfile/wire"
 	"github.com/phrocker/shoal-oss/internal/storage"
 	"github.com/phrocker/shoal-oss/internal/storage/memory"
 	"github.com/phrocker/shoal-oss/internal/tablet"
@@ -75,6 +82,34 @@ func TestCopyWithSHA256AbortsDestinationOnReadFailure(t *testing.T) {
 	}
 	if writer.closed {
 		t.Fatal("failed export closed and could have committed destination")
+	}
+}
+
+func TestImportRFileManifestRejectsUnsafeSourceTableBeforeSideEffects(t *testing.T) {
+	for _, name := range []string{"", ".", "..", "../outside", `..\outside`, "/absolute", `C:\absolute`} {
+		t.Run(fmt.Sprintf("%q", name), func(t *testing.T) {
+			root := t.TempDir()
+			dst, err := Open(filepath.Join(root, "engine"), Options{Backend: memory.New()})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer dst.Close()
+
+			err = dst.ImportRFileManifest(context.Background(), &RFileExportManifest{
+				Version:     RFileExportManifestVersion,
+				SourceTable: name,
+			})
+			if err == nil || !strings.Contains(err.Error(), "invalid imported table name") {
+				t.Fatalf("ImportRFileManifest(%q) error = %v, want table-name rejection", name, err)
+			}
+			entries, readErr := os.ReadDir(root)
+			if readErr != nil {
+				t.Fatal(readErr)
+			}
+			if len(entries) != 1 || entries[0].Name() != "engine" {
+				t.Fatalf("root entries = %v, want only engine directory", entries)
+			}
+		})
 	}
 }
 
@@ -738,6 +773,561 @@ func TestImportRFileManifestRejectsSameCountDifferentSplits(t *testing.T) {
 	if err := dst.ImportRFileManifest(ctx, manifest); err == nil || !strings.Contains(err.Error(), "split 0") {
 		t.Fatalf("ImportRFileManifest error = %v, want split mismatch", err)
 	}
+}
+
+func TestVerifyRFileExportRejectsParquet(t *testing.T) {
+	ctx := context.Background()
+	backend := memory.New()
+	manifest := exportManifestForBytes(
+		filepath.Join(t.TempDir(), "F0001.parquet"),
+		[]byte("parquet bytes are not accepted by RFile import"),
+	)
+
+	err := VerifyRFileExport(ctx, backend, manifest)
+	if !errors.Is(err, storage.ErrImmutablePolicy) {
+		t.Fatalf("VerifyRFileExport(Parquet) = %v, want ErrImmutablePolicy", err)
+	}
+	if errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("VerifyRFileExport(Parquet) reached backend open: %v", err)
+	}
+}
+
+func TestVerifyRFileExportRejectsForgedValidFooter(t *testing.T) {
+	data := forgedBCFileWithoutRFileIndex(t)
+	path := filepath.Join(t.TempDir(), "F0001.rf")
+	backend := memory.New()
+	backend.Put(path, data)
+
+	err := VerifyRFileExport(context.Background(), backend, exportManifestForBytes(path, data))
+	if !errors.Is(err, storage.ErrImmutablePolicy) {
+		t.Fatalf("VerifyRFileExport(forged BCFile) = %v, want ErrImmutablePolicy", err)
+	}
+	if !errors.Is(err, bcfile.ErrNoSuchMetaBlock) {
+		t.Fatalf("VerifyRFileExport(forged BCFile) = %v, want ErrNoSuchMetaBlock", err)
+	}
+}
+
+func TestVerifyRFileExportScansEveryLocalityGroup(t *testing.T) {
+	data := validMultiGroupRFileBytes(t)
+	valueOffset := bytes.Index(data, []byte("named-value"))
+	if valueOffset < 4 {
+		t.Fatal("named locality-group value not found in uncompressed fixture")
+	}
+	data = append([]byte(nil), data...)
+	for i := valueOffset - 4; i < valueOffset; i++ {
+		data[i] = 0xff
+	}
+	path := filepath.Join(t.TempDir(), "F0001.rf")
+	backend := memory.New()
+	backend.Put(path, data)
+
+	if err := VerifyRFileExport(
+		context.Background(), backend, exportManifestForBytes(path, data),
+	); err == nil || !strings.Contains(err.Error(), "locality group 1") {
+		t.Fatalf("VerifyRFileExport(corrupt named locality group) error = %v", err)
+	}
+}
+
+func TestVerifyRFileExportPinsOneObjectSnapshot(t *testing.T) {
+	forged := forgedBCFileWithoutRFileIndex(t)
+	valid := validRFileBytes(t)
+	path := filepath.Join(t.TempDir(), "F0001.rf")
+	backend := &replacementBackend{generations: [][]byte{forged, valid}}
+
+	err := VerifyRFileExport(context.Background(), backend, exportManifestForBytes(path, forged))
+	if !errors.Is(err, storage.ErrImmutablePolicy) ||
+		!errors.Is(err, bcfile.ErrNoSuchMetaBlock) {
+		t.Fatalf("VerifyRFileExport(replaced object) = %v, want structural policy error", err)
+	}
+	if got := backend.OpenCount(); got != 1 {
+		t.Fatalf("backend opens = %d, want exactly 1 pinned snapshot", got)
+	}
+}
+
+func TestStageVerifiedImportFilesRejectsPostVerificationReplacement(t *testing.T) {
+	valid := validRFileBytes(t)
+	replacement := forgedBCFileWithoutRFileIndex(t)
+	path := filepath.Join(t.TempDir(), "F0001.rf")
+	manifest := exportManifestForBytes(path, valid)
+	backend := memory.New()
+	backend.Put(path, valid)
+
+	if err := verifyImmutableExport(
+		context.Background(), backend, manifest, newVerificationSnapshot,
+	); err != nil {
+		t.Fatalf("verifyImmutableExport: %v", err)
+	}
+	backend.Put(path, replacement)
+
+	if _, err := stageVerifiedImportFiles(
+		context.Background(), backend, manifest.RFiles,
+	); err == nil || !strings.Contains(err.Error(), "changed after verification") {
+		t.Fatalf("stageVerifiedImportFiles replacement error = %v", err)
+	}
+}
+
+func TestStageVerifiedImportFilesRegistersExactStagedObject(t *testing.T) {
+	valid := validRFileBytes(t)
+	path := filepath.Join(t.TempDir(), "F0001.rf")
+	manifest := exportManifestForBytes(path, valid)
+	backend := memory.New()
+	backend.Put(path, valid)
+
+	staged, err := stageVerifiedImportFiles(
+		context.Background(), backend, manifest.RFiles,
+	)
+	if err != nil {
+		t.Fatalf("stageVerifiedImportFiles: %v", err)
+	}
+	if len(staged) != 1 || staged[0].DestinationPath == path {
+		t.Fatalf("staged files = %+v, want one distinct staged path", staged)
+	}
+
+	backend.Put(path, forgedBCFileWithoutRFileIndex(t))
+	size, sum, err := hashObject(context.Background(), backend, staged[0].DestinationPath)
+	if err != nil {
+		t.Fatalf("hash staged object: %v", err)
+	}
+	if size != manifest.RFiles[0].Size || sum != manifest.RFiles[0].SHA256 {
+		t.Fatalf("staged object changed with source: size=%d sha256=%s", size, sum)
+	}
+}
+
+func TestVerifyRFileExportRejectsChangingReadGeneration(t *testing.T) {
+	valueSize := 3 * verificationSnapshotChunkSize
+	first := validRFileBytesWithValue(t, bytes.Repeat([]byte{0x35}, valueSize))
+	second := validRFileBytesWithValue(t, bytes.Repeat([]byte{0xa7}, valueSize))
+	if len(first) <= verificationSnapshotChunkSize {
+		t.Fatalf("first generation size = %d, want more than one snapshot chunk", len(first))
+	}
+	if len(first) != len(second) {
+		t.Fatalf("generation sizes differ: first=%d second=%d", len(first), len(second))
+	}
+
+	path := filepath.Join(t.TempDir(), "F0001.rf")
+	file := &changingGenerationFile{first: first, second: second}
+	backend := &singleFileBackend{file: file}
+
+	err := VerifyRFileExport(context.Background(), backend, exportManifestForBytes(path, first))
+	if err == nil || !strings.Contains(err.Error(), "sha256") {
+		t.Fatalf("VerifyRFileExport(changing generation) = %v, want hash rejection", err)
+	}
+	if errors.Is(err, storage.ErrImmutablePolicy) {
+		t.Fatalf("VerifyRFileExport(changing generation) misclassified hash rejection: %v", err)
+	}
+	if reads, switched := file.state(); reads < 2 || !switched {
+		t.Fatalf("backend range reads = %d, switched=%t; want a mid-copy generation change",
+			reads, switched)
+	}
+}
+
+func TestVerifyRFileExportParsesOnlyLocalSnapshot(t *testing.T) {
+	valid := validRFileBytes(t)
+	path := filepath.Join(t.TempDir(), "F0001.rf")
+	file := &snapshotFile{
+		data:      valid,
+		failAfter: 1,
+		failErr:   errors.New("backend accessed after snapshot copy"),
+	}
+	backend := &singleFileBackend{file: file}
+
+	if err := VerifyRFileExport(context.Background(), backend, exportManifestForBytes(path, valid)); err != nil {
+		t.Fatalf("VerifyRFileExport() = %v, want local-snapshot validation", err)
+	}
+	if got := file.ReadCount(); got != 1 {
+		t.Fatalf("backend ReadAt calls = %d, want one materialization read", got)
+	}
+}
+
+func TestVerifyRFileExportPreservesOperationalErrors(t *testing.T) {
+	valid := validRFileBytes(t)
+	path := filepath.Join(t.TempDir(), "F0001.rf")
+	manifest := exportManifestForBytes(path, valid)
+
+	t.Run("backend read error during materialization", func(t *testing.T) {
+		readErr := errors.New("injected backend read failure")
+		large := validRFileBytesWithValue(t,
+			bytes.Repeat([]byte{0x5c}, 3*verificationSnapshotChunkSize))
+		backend := &singleFileBackend{file: &snapshotFile{
+			data:      large,
+			failAfter: 1,
+			failErr:   readErr,
+		}}
+		err := VerifyRFileExport(context.Background(), backend,
+			exportManifestForBytes(path, large))
+		if !errors.Is(err, readErr) {
+			t.Fatalf("VerifyRFileExport() = %v, want injected read error", err)
+		}
+		if errors.Is(err, storage.ErrImmutablePolicy) {
+			t.Fatalf("VerifyRFileExport() misclassified I/O as policy error: %v", err)
+		}
+	})
+
+	t.Run("cancellation during materialization", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		backend := &singleFileBackend{file: &snapshotFile{
+			data:        valid,
+			afterReadAt: cancel,
+		}}
+		err := VerifyRFileExport(ctx, backend, manifest)
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("VerifyRFileExport() = %v, want context.Canceled", err)
+		}
+		if errors.Is(err, storage.ErrImmutablePolicy) {
+			t.Fatalf("VerifyRFileExport() misclassified cancellation as policy error: %v", err)
+		}
+	})
+
+	t.Run("backend close", func(t *testing.T) {
+		closeErr := errors.New("injected backend close failure")
+		backend := &singleFileBackend{file: &snapshotFile{
+			data:     valid,
+			closeErr: closeErr,
+		}}
+		err := VerifyRFileExport(context.Background(), backend, manifest)
+		if !errors.Is(err, closeErr) {
+			t.Fatalf("VerifyRFileExport() = %v, want injected close error", err)
+		}
+		if errors.Is(err, storage.ErrImmutablePolicy) {
+			t.Fatalf("VerifyRFileExport() misclassified close failure as policy error: %v", err)
+		}
+	})
+}
+
+func TestVerifyRFileExportPreservesSnapshotErrors(t *testing.T) {
+	valid := validRFileBytes(t)
+	path := filepath.Join(t.TempDir(), "F0001.rf")
+	manifest := exportManifestForBytes(path, valid)
+	backend := &singleFileBackend{file: &snapshotFile{data: valid}}
+
+	tests := []struct {
+		name        string
+		configure   func(*injectedVerificationSnapshot)
+		createErr   error
+		cleanupErr  error
+		wantCleanup bool
+	}{
+		{
+			name:      "create",
+			createErr: errors.New("injected temp create failure"),
+		},
+		{
+			name: "write",
+			configure: func(s *injectedVerificationSnapshot) {
+				s.writeErr = errors.New("injected disk write failure")
+			},
+			wantCleanup: true,
+		},
+		{
+			name: "sync",
+			configure: func(s *injectedVerificationSnapshot) {
+				s.syncErr = errors.New("injected disk sync failure")
+			},
+			wantCleanup: true,
+		},
+		{
+			name: "read",
+			configure: func(s *injectedVerificationSnapshot) {
+				s.readErr = errors.New("injected disk read failure")
+			},
+			wantCleanup: true,
+		},
+		{
+			name:        "cleanup",
+			cleanupErr:  errors.New("injected snapshot cleanup failure"),
+			wantCleanup: true,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			snapshot := &injectedVerificationSnapshot{}
+			if tc.configure != nil {
+				tc.configure(snapshot)
+			}
+			var preserved error
+			if tc.createErr != nil {
+				preserved = tc.createErr
+			} else if snapshot.writeErr != nil {
+				preserved = snapshot.writeErr
+			} else if snapshot.syncErr != nil {
+				preserved = snapshot.syncErr
+			} else if snapshot.readErr != nil {
+				preserved = snapshot.readErr
+			} else {
+				preserved = tc.cleanupErr
+			}
+			cleanupCalled := false
+			factory := func() (verificationSnapshot, func() error, error) {
+				if tc.createErr != nil {
+					return nil, nil, tc.createErr
+				}
+				return snapshot, func() error {
+					cleanupCalled = true
+					return tc.cleanupErr
+				}, nil
+			}
+
+			err := verifyRFileExport(context.Background(), backend, manifest, factory)
+			if !errors.Is(err, preserved) {
+				t.Fatalf("verifyRFileExport() = %v, want %v", err, preserved)
+			}
+			if errors.Is(err, storage.ErrImmutablePolicy) {
+				t.Fatalf("verifyRFileExport() misclassified snapshot error as policy error: %v", err)
+			}
+			if cleanupCalled != tc.wantCleanup {
+				t.Fatalf("cleanup called = %t, want %t", cleanupCalled, tc.wantCleanup)
+			}
+		})
+	}
+}
+
+func TestVerificationSnapshotCleanup(t *testing.T) {
+	snapshot, cleanup, err := newVerificationSnapshot()
+	if err != nil {
+		t.Fatalf("newVerificationSnapshot: %v", err)
+	}
+	f, ok := snapshot.(*os.File)
+	if !ok {
+		t.Fatalf("snapshot type = %T, want *os.File", snapshot)
+	}
+	path := f.Name()
+	if err := cleanup(); err != nil {
+		t.Fatalf("cleanup: %v", err)
+	}
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("snapshot still exists after cleanup: %v", err)
+	}
+}
+
+func exportManifestForBytes(path string, data []byte) *RFileExportManifest {
+	sum := sha256.Sum256(data)
+	return &RFileExportManifest{
+		Version:     RFileExportManifestVersion,
+		SourceTable: "verification-test",
+		RFiles: []RFileExportFile{{
+			DestinationPath: path,
+			Size:            int64(len(data)),
+			SHA256:          fmt.Sprintf("%x", sum),
+		}},
+	}
+}
+
+func validRFileBytes(t *testing.T) []byte {
+	return validRFileBytesWithValue(t, []byte("value"))
+}
+
+func validRFileBytesWithValue(t *testing.T, value []byte) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	writer, err := rfile.NewWriter(&buf, rfile.WriterOptions{})
+	if err != nil {
+		t.Fatalf("NewWriter: %v", err)
+	}
+	if err := writer.Append(&wire.Key{
+		Row:             []byte("row"),
+		ColumnFamily:    []byte("cf"),
+		ColumnQualifier: []byte("cq"),
+		Timestamp:       1,
+	}, value); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	return buf.Bytes()
+}
+
+func validMultiGroupRFileBytes(t *testing.T) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	writer, err := rfile.NewWriter(&buf, rfile.WriterOptions{})
+	if err != nil {
+		t.Fatalf("NewWriter: %v", err)
+	}
+	if err := writer.Append(&wire.Key{
+		Row:          []byte("row"),
+		ColumnFamily: []byte("default"),
+		Timestamp:    1,
+	}, []byte("default-value")); err != nil {
+		t.Fatalf("append default locality group: %v", err)
+	}
+	if err := writer.AddLocalityGroup("named"); err != nil {
+		t.Fatalf("AddLocalityGroup: %v", err)
+	}
+	if err := writer.Append(&wire.Key{
+		Row:          []byte("row"),
+		ColumnFamily: []byte("named"),
+		Timestamp:    1,
+	}, []byte("named-value")); err != nil {
+		t.Fatalf("append named locality group: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	return buf.Bytes()
+}
+
+func forgedBCFileWithoutRFileIndex(t *testing.T) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	writer := bcfile.NewWriter(&buf, bcfile.CodecNone)
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close forged BCFile: %v", err)
+	}
+	if _, err := bcfile.ReadFooter(bytes.NewReader(buf.Bytes()), int64(buf.Len())); err != nil {
+		t.Fatalf("forged fixture footer is invalid: %v", err)
+	}
+	return buf.Bytes()
+}
+
+type replacementBackend struct {
+	mu          sync.Mutex
+	generations [][]byte
+	opens       int
+}
+
+func (b *replacementBackend) Open(_ context.Context, _ string) (storage.File, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	index := b.opens
+	if index >= len(b.generations) {
+		index = len(b.generations) - 1
+	}
+	b.opens++
+	return &snapshotFile{data: bytes.Clone(b.generations[index])}, nil
+}
+
+func (b *replacementBackend) OpenCount() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.opens
+}
+
+type singleFileBackend struct {
+	file storage.File
+}
+
+func (b *singleFileBackend) Open(_ context.Context, _ string) (storage.File, error) {
+	return b.file, nil
+}
+
+type snapshotFile struct {
+	data []byte
+
+	mu          sync.Mutex
+	reads       int
+	failAfter   int
+	failErr     error
+	closeErr    error
+	afterReadAt func()
+}
+
+func (f *snapshotFile) ReadAt(p []byte, off int64) (int, error) {
+	f.mu.Lock()
+	f.reads++
+	read := f.reads
+	failAfter := f.failAfter
+	failErr := f.failErr
+	afterReadAt := f.afterReadAt
+	f.afterReadAt = nil
+	f.mu.Unlock()
+
+	if failAfter > 0 && read > failAfter {
+		return 0, failErr
+	}
+	if off >= int64(len(f.data)) {
+		return 0, io.EOF
+	}
+	n := copy(p, f.data[off:])
+	var err error
+	if n != len(p) {
+		err = io.EOF
+	}
+	if afterReadAt != nil {
+		afterReadAt()
+	}
+	return n, err
+}
+
+func (f *snapshotFile) ReadCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.reads
+}
+
+func (f *snapshotFile) Close() error { return f.closeErr }
+func (f *snapshotFile) Size() int64  { return int64(len(f.data)) }
+
+type changingGenerationFile struct {
+	first  []byte
+	second []byte
+
+	mu       sync.Mutex
+	reads    int
+	switched bool
+}
+
+func (f *changingGenerationFile) ReadAt(p []byte, off int64) (int, error) {
+	f.mu.Lock()
+	f.reads++
+	data := f.first
+	if f.reads > 1 {
+		data = f.second
+		f.switched = true
+	}
+	f.mu.Unlock()
+
+	if off >= int64(len(data)) {
+		return 0, io.EOF
+	}
+	n := copy(p, data[off:])
+	if n != len(p) {
+		return n, io.EOF
+	}
+	return n, nil
+}
+
+func (f *changingGenerationFile) state() (int, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.reads, f.switched
+}
+
+func (f *changingGenerationFile) Close() error { return nil }
+func (f *changingGenerationFile) Size() int64  { return int64(len(f.first)) }
+
+type injectedVerificationSnapshot struct {
+	data []byte
+
+	writeErr error
+	syncErr  error
+	readErr  error
+}
+
+func (s *injectedVerificationSnapshot) Write(p []byte) (int, error) {
+	if s.writeErr != nil {
+		return 0, s.writeErr
+	}
+	s.data = append(s.data, p...)
+	return len(p), nil
+}
+
+func (s *injectedVerificationSnapshot) Sync() error {
+	return s.syncErr
+}
+
+func (s *injectedVerificationSnapshot) ReadAt(p []byte, off int64) (int, error) {
+	if s.readErr != nil {
+		return 0, s.readErr
+	}
+	if off >= int64(len(s.data)) {
+		return 0, io.EOF
+	}
+	n := copy(p, s.data[off:])
+	if n != len(p) {
+		return n, io.EOF
+	}
+	return n, nil
 }
 
 func scanAll(t *testing.T, eng *Engine, table string) []string {

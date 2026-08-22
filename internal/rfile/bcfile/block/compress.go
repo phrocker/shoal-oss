@@ -3,9 +3,10 @@ package block
 import (
 	"bytes"
 	"compress/zlib"
-	"errors"
 	"fmt"
 	"sync"
+
+	"github.com/phrocker/shoal-oss/internal/rfile/bcfile"
 )
 
 // EncoderFunc compresses raw payload bytes using a specific codec, and
@@ -18,8 +19,8 @@ type EncoderFunc func(raw []byte) ([]byte, error)
 // for round-trip, but the implementations are independent (a writer
 // could legitimately ship without read codecs and vice versa).
 type Compressor struct {
-	mu      sync.RWMutex
-	codecs  map[string]EncoderFunc
+	mu     sync.RWMutex
+	codecs map[string]EncoderFunc
 }
 
 // NewCompressor returns an empty Compressor with no codecs registered.
@@ -29,13 +30,15 @@ func NewCompressor() *Compressor {
 
 // DefaultCompressor returns a Compressor wired for "none" (identity
 // passthrough — used when raw blocks are smaller after attempted
-// compression), "gz" (zlib via Hadoop DefaultCodec), and "snappy"
-// (Hadoop block-framed snappy via BlockCompressorStream).
+// compression), "gz" (zlib via Hadoop DefaultCodec), "snappy" and "lz4"
+// (Hadoop block-framed streams), and "zstd" (a standard zstd stream).
 func DefaultCompressor() *Compressor {
 	c := NewCompressor()
 	c.Register(CodecNone, encodeNone)
 	c.Register(CodecGzip, encodeGzip)
 	c.Register(CodecSnappy, encodeSnappy)
+	c.Register(CodecZstd, encodeZstd)
+	c.Register(CodecLZ4, encodeLZ4)
 	return c
 }
 
@@ -60,13 +63,25 @@ func (c *Compressor) Has(codec string) bool {
 // bytes (which the BCFile writer then writes to disk and tracks in its
 // DataIndex).
 func (c *Compressor) Encode(raw []byte, codec string) ([]byte, error) {
+	if int64(len(raw)) > bcfile.MaxRawBlockSize {
+		return nil, fmt.Errorf("block: raw size %d exceeds %d-byte limit",
+			len(raw), bcfile.MaxRawBlockSize)
+	}
 	c.mu.RLock()
 	fn, ok := c.codecs[codec]
 	c.mu.RUnlock()
 	if !ok {
 		return nil, fmt.Errorf("%w: %q", ErrUnsupportedCodec, codec)
 	}
-	return fn(raw)
+	compressed, err := fn(raw)
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(compressed)) > bcfile.MaxCompressedBlockSize {
+		return nil, fmt.Errorf("block: compressed size %d exceeds %d-byte limit",
+			len(compressed), bcfile.MaxCompressedBlockSize)
+	}
+	return compressed, nil
 }
 
 func encodeNone(raw []byte) ([]byte, error) {
@@ -89,7 +104,3 @@ func encodeGzip(raw []byte) ([]byte, error) {
 	}
 	return buf.Bytes(), nil
 }
-
-// Sentinel — re-exported so callers don't have to dig through both
-// compress.go and decompress.go for related errors.
-var _ = errors.New

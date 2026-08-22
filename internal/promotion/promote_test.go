@@ -133,14 +133,13 @@ func (f *fakePromoter) BulkImport(_ context.Context, tableName, bulkDir string, 
 
 func TestPromoteStagesThenSubmitsBulkImport(t *testing.T) {
 	src := memory.New()
-	src.Put("export/events/t-0000/F0001.rf", []byte("data"))
+	data, file := testRFile(t, 0, "export/events/t-0000/F0001.rf", []byte("data"))
+	src.Put(file.DestinationPath, data)
 	manifest := &engine.RFileExportManifest{
 		Version:     engine.RFileExportManifestVersion,
 		SourceTable: "events",
 		Tablets:     []engine.RFileExportTablet{{Index: 0}},
-		RFiles: []engine.RFileExportFile{
-			{TabletIndex: 0, DestinationPath: "export/events/t-0000/F0001.rf", Size: 4, SHA256: "3a6eb0790f39ac87c94f3856b2dd2c5d110e6811602261a9a923d3bb23adc8b7"},
-		},
+		RFiles:      []engine.RFileExportFile{file},
 	}
 	dst := memory.New()
 	importer := &fakePromoter{}
@@ -192,14 +191,13 @@ func TestPromoteDoesNotSubmitWhenStagingFails(t *testing.T) {
 
 func TestPromotePropagatesBulkImportError(t *testing.T) {
 	src := memory.New()
-	src.Put("export/events/t-0000/F0001.rf", []byte("data"))
+	data, file := testRFile(t, 0, "export/events/t-0000/F0001.rf", []byte("data"))
+	src.Put(file.DestinationPath, data)
 	manifest := &engine.RFileExportManifest{
 		Version:     engine.RFileExportManifestVersion,
 		SourceTable: "events",
 		Tablets:     []engine.RFileExportTablet{{Index: 0}},
-		RFiles: []engine.RFileExportFile{
-			{TabletIndex: 0, DestinationPath: "export/events/t-0000/F0001.rf", Size: 4, SHA256: "3a6eb0790f39ac87c94f3856b2dd2c5d110e6811602261a9a923d3bb23adc8b7"},
-		},
+		RFiles:      []engine.RFileExportFile{file},
 	}
 	dst := memory.New()
 	importer := &fakePromoter{err: accumulo.ErrTableNotFound}
@@ -553,15 +551,10 @@ func TestPromoteRejectsLoadMapAliasBeforeAddTableSplits(t *testing.T) {
 // the same function.
 func TestPromoteRejectsCorruptExportBeforeAddTableSplits(t *testing.T) {
 	src := memory.New()
-	src.Put("events/t-0000/F0001.rf", []byte("a"))
-	src.Put("events/t-0001/F0002.rf", []byte("b"))
 	manifest := twoTabletManifest()
 	manifest.RFiles[0].DestinationPath = "events/t-0000/F0001.rf"
-	manifest.RFiles[0].Size = 1
-	manifest.RFiles[0].SHA256 = "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb"
 	manifest.RFiles[1].DestinationPath = "events/t-0001/F0002.rf"
-	manifest.RFiles[1].Size = 1
-	// Deliberately wrong: sha256("b") is 3e23e816...9d, not this value.
+	populateManifestRFiles(t, src, manifest)
 	manifest.RFiles[1].SHA256 = "0000000000000000000000000000000000000000000000000000000000000000"
 
 	dst := memory.New()
@@ -590,15 +583,10 @@ func TestPromoteRejectsCorruptExportBeforeAddTableSplits(t *testing.T) {
 // manifest -- is what actually catches this.
 func TestPromoteRejectsSourceMutatedDuringAddTableSplits(t *testing.T) {
 	src := memory.New()
-	src.Put("events/t-0000/F0001.rf", []byte("a"))
-	src.Put("events/t-0001/F0002.rf", []byte("b"))
 	manifest := twoTabletManifest()
 	manifest.RFiles[0].DestinationPath = "events/t-0000/F0001.rf"
-	manifest.RFiles[0].Size = 1
-	manifest.RFiles[0].SHA256 = "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb"
 	manifest.RFiles[1].DestinationPath = "events/t-0001/F0002.rf"
-	manifest.RFiles[1].Size = 1
-	manifest.RFiles[1].SHA256 = "3e23e8160039594a33894f6564e1b1348bbd7a0088d42c4acb73eeaed59c009d"
+	populateManifestRFiles(t, src, manifest)
 
 	dst := memory.New()
 	importer := &fakePromoter{}
@@ -608,7 +596,7 @@ func TestPromoteRejectsSourceMutatedDuringAddTableSplits(t *testing.T) {
 	// round-trip is itself in flight, i.e. strictly after
 	// stagingPreflight already verified the original "a" content.
 	importer.onAddTableSplits = func() {
-		src.Put("events/t-0000/F0001.rf", []byte("X"))
+		src.Put("events/t-0000/F0001.rf", validRFileBytes(t, []byte("X")))
 	}
 	if _, err := Promote(context.Background(), src, manifest, dst, "/bulk/events-1", importer, "events", Options{}); err == nil {
 		t.Fatal("Promote with src mutated during AddTableSplits = nil error, want error")
@@ -626,15 +614,10 @@ func TestPromoteRejectsSourceMutatedDuringAddTableSplits(t *testing.T) {
 
 func TestPromoteReconcilesSplitsThenStagesThenSubmitsForMultiTabletManifest(t *testing.T) {
 	src := memory.New()
-	src.Put("events/t-0000/F0001.rf", []byte("a"))
-	src.Put("events/t-0001/F0002.rf", []byte("b"))
 	manifest := twoTabletManifest()
 	manifest.RFiles[0].DestinationPath = "events/t-0000/F0001.rf"
-	manifest.RFiles[0].Size = 1
-	manifest.RFiles[0].SHA256 = "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb"
 	manifest.RFiles[1].DestinationPath = "events/t-0001/F0002.rf"
-	manifest.RFiles[1].Size = 1
-	manifest.RFiles[1].SHA256 = "3e23e8160039594a33894f6564e1b1348bbd7a0088d42c4acb73eeaed59c009d"
+	populateManifestRFiles(t, src, manifest)
 
 	dst := memory.New()
 	importer := &fakePromoter{}
@@ -673,14 +656,13 @@ func TestPromoteReconcilesSplitsThenStagesThenSubmitsForMultiTabletManifest(t *t
 
 func TestPromoteSkipsAddTableSplitsForSingleTabletManifest(t *testing.T) {
 	src := memory.New()
-	src.Put("export/events/t-0000/F0001.rf", []byte("data"))
+	data, file := testRFile(t, 0, "export/events/t-0000/F0001.rf", []byte("data"))
+	src.Put(file.DestinationPath, data)
 	manifest := &engine.RFileExportManifest{
 		Version:     engine.RFileExportManifestVersion,
 		SourceTable: "events",
 		Tablets:     []engine.RFileExportTablet{{Index: 0}},
-		RFiles: []engine.RFileExportFile{
-			{TabletIndex: 0, DestinationPath: "export/events/t-0000/F0001.rf", Size: 4, SHA256: "3a6eb0790f39ac87c94f3856b2dd2c5d110e6811602261a9a923d3bb23adc8b7"},
-		},
+		RFiles:      []engine.RFileExportFile{file},
 	}
 	dst := memory.New()
 	importer := &fakePromoter{}
@@ -697,15 +679,10 @@ func TestPromoteSkipsAddTableSplitsForSingleTabletManifest(t *testing.T) {
 
 func TestPromoteAbortsBeforeStagingWhenAddTableSplitsFails(t *testing.T) {
 	src := memory.New()
-	src.Put("events/t-0000/F0001.rf", []byte("a"))
-	src.Put("events/t-0001/F0002.rf", []byte("b"))
 	manifest := twoTabletManifest()
 	manifest.RFiles[0].DestinationPath = "events/t-0000/F0001.rf"
-	manifest.RFiles[0].Size = 1
-	manifest.RFiles[0].SHA256 = "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb"
 	manifest.RFiles[1].DestinationPath = "events/t-0001/F0002.rf"
-	manifest.RFiles[1].Size = 1
-	manifest.RFiles[1].SHA256 = "3e23e8160039594a33894f6564e1b1348bbd7a0088d42c4acb73eeaed59c009d"
+	populateManifestRFiles(t, src, manifest)
 
 	dst := memory.New()
 	importer := &fakePromoter{splitErr: accumulo.ErrTableOffline}
@@ -726,16 +703,7 @@ func TestPromoteAbortsBeforeStagingWhenAddTableSplitsFails(t *testing.T) {
 func TestPromoteEndToEndThreeTabletSuccess(t *testing.T) {
 	src := memory.New()
 	manifest := threeTabletManifest()
-	wantHashes := []string{
-		"ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb", // sha256("a")
-		"3e23e8160039594a33894f6564e1b1348bbd7a0088d42c4acb73eeaed59c009d", // sha256("b")
-		"2e7d2c03a9507ae265ecf5b5356885a53393a2029d241394997265a1a25aefc6", // sha256("c")
-	}
-	for i := range manifest.RFiles {
-		src.Put(manifest.RFiles[i].DestinationPath, []byte{byte('a' + i)})
-		manifest.RFiles[i].Size = 1
-		manifest.RFiles[i].SHA256 = wantHashes[i]
-	}
+	populateManifestRFiles(t, src, manifest)
 
 	dst := memory.New()
 	importer := &fakePromoter{}
@@ -772,18 +740,10 @@ func TestPromoteEndToEndThreeTabletSuccess(t *testing.T) {
 // RFile's size/hash filled in and staged into src, so a test can call
 // Promote against it directly without repeating the fixture setup
 // TestPromoteEndToEndThreeTabletSuccess already establishes.
-func populatedThreeTabletManifest(src *memory.Backend) *engine.RFileExportManifest {
+func populatedThreeTabletManifest(t *testing.T, src *memory.Backend) *engine.RFileExportManifest {
+	t.Helper()
 	manifest := threeTabletManifest()
-	wantHashes := []string{
-		"ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb", // sha256("a")
-		"3e23e8160039594a33894f6564e1b1348bbd7a0088d42c4acb73eeaed59c009d", // sha256("b")
-		"2e7d2c03a9507ae265ecf5b5356885a53393a2029d241394997265a1a25aefc6", // sha256("c")
-	}
-	for i := range manifest.RFiles {
-		src.Put(manifest.RFiles[i].DestinationPath, []byte{byte('a' + i)})
-		manifest.RFiles[i].Size = 1
-		manifest.RFiles[i].SHA256 = wantHashes[i]
-	}
+	populateManifestRFiles(t, src, manifest)
 	return manifest
 }
 
@@ -802,7 +762,7 @@ func populatedThreeTabletManifest(src *memory.Backend) *engine.RFileExportManife
 // submitting anything.
 func TestPromoteRejectsExtraDestinationSplitBeforeLastRequiredRow(t *testing.T) {
 	src := memory.New()
-	manifest := populatedThreeTabletManifest(src)
+	manifest := populatedThreeTabletManifest(t, src)
 	dst := memory.New()
 	importer := &fakePromoter{
 		listSplitsSet:      true,
@@ -840,15 +800,10 @@ func TestPromoteRejectsExtraDestinationSplitBeforeLastRequiredRow(t *testing.T) 
 // reconciled against.
 func TestPromoteRejectsWhenDestinationTableChangesIdentityDuringStaging(t *testing.T) {
 	src := memory.New()
-	src.Put("events/t-0000/F0001.rf", []byte("a"))
-	src.Put("events/t-0001/F0002.rf", []byte("b"))
 	manifest := twoTabletManifest()
 	manifest.RFiles[0].DestinationPath = "events/t-0000/F0001.rf"
-	manifest.RFiles[0].Size = 1
-	manifest.RFiles[0].SHA256 = "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb"
 	manifest.RFiles[1].DestinationPath = "events/t-0001/F0002.rf"
-	manifest.RFiles[1].Size = 1
-	manifest.RFiles[1].SHA256 = "3e23e8160039594a33894f6564e1b1348bbd7a0088d42c4acb73eeaed59c009d"
+	populateManifestRFiles(t, src, manifest)
 
 	dst := memory.New()
 	importer := &fakePromoter{tableID: "original-id"}
@@ -899,15 +854,10 @@ func TestPromoteRejectsWhenDestinationTableChangesIdentityDuringStaging(t *testi
 // ListTableSplits/BulkImport.
 func TestPromoteRejectsWhenDestinationTableChangesIdentityBeforeAddTableSplits(t *testing.T) {
 	src := memory.New()
-	src.Put("events/t-0000/F0001.rf", []byte("a"))
-	src.Put("events/t-0001/F0002.rf", []byte("b"))
 	manifest := twoTabletManifest()
 	manifest.RFiles[0].DestinationPath = "events/t-0000/F0001.rf"
-	manifest.RFiles[0].Size = 1
-	manifest.RFiles[0].SHA256 = "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb"
 	manifest.RFiles[1].DestinationPath = "events/t-0001/F0002.rf"
-	manifest.RFiles[1].Size = 1
-	manifest.RFiles[1].SHA256 = "3e23e8160039594a33894f6564e1b1348bbd7a0088d42c4acb73eeaed59c009d"
+	populateManifestRFiles(t, src, manifest)
 
 	dst := memory.New()
 	wantErr := errors.Join(accumulo.ErrTableIdentityChanged, errors.New(`accumulo: table "events" changed identity (was table ID "original-id", is now "recreated-id") before AddTableSplits`))
@@ -1006,15 +956,10 @@ func TestPromoteRejectsIdentityChangeEvenWithEmptyLoadMapping(t *testing.T) {
 // exists as expected.
 func TestPromoteAbortsBeforeAddTableSplitsWhenResolveTableIDFails(t *testing.T) {
 	src := memory.New()
-	src.Put("events/t-0000/F0001.rf", []byte("a"))
-	src.Put("events/t-0001/F0002.rf", []byte("b"))
 	manifest := twoTabletManifest()
 	manifest.RFiles[0].DestinationPath = "events/t-0000/F0001.rf"
-	manifest.RFiles[0].Size = 1
-	manifest.RFiles[0].SHA256 = "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb"
 	manifest.RFiles[1].DestinationPath = "events/t-0001/F0002.rf"
-	manifest.RFiles[1].Size = 1
-	manifest.RFiles[1].SHA256 = "3e23e8160039594a33894f6564e1b1348bbd7a0088d42c4acb73eeaed59c009d"
+	populateManifestRFiles(t, src, manifest)
 
 	dst := memory.New()
 	importer := &fakePromoter{resolveTableIDErr: accumulo.ErrTableOffline}
@@ -1079,7 +1024,7 @@ func TestPromoteRejectsReadOnlyDestinationBeforeAddTableSplits(t *testing.T) {
 // be rejected.
 func TestPromoteAllowsTrailingDestinationSplitAfterLastRequiredRow(t *testing.T) {
 	src := memory.New()
-	manifest := populatedThreeTabletManifest(src)
+	manifest := populatedThreeTabletManifest(t, src)
 	dst := memory.New()
 	importer := &fakePromoter{
 		listSplitsSet:      true,
@@ -1106,7 +1051,7 @@ func TestPromoteAllowsTrailingDestinationSplitAfterLastRequiredRow(t *testing.T)
 // mapping that no longer matches the destination's real splits.
 func TestPromoteRejectsWhenDestinationIsMissingARequiredSplit(t *testing.T) {
 	src := memory.New()
-	manifest := populatedThreeTabletManifest(src)
+	manifest := populatedThreeTabletManifest(t, src)
 	dst := memory.New()
 	importer := &fakePromoter{
 		listSplitsSet:      true,

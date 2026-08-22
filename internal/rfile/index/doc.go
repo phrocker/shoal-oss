@@ -14,13 +14,25 @@
 //	    bool hasSamples
 //	    if hasSamples:
 //	        N × LocalityGroupMetadata  (one sample group per main group)
-//	        SamplerConfiguration       (deferred — not parsed yet)
+//	        byte samplerVersion = 1
+//	        modified-UTF samplerClassName
+//	        int32 samplerOptionCount
+//	        samplerOptionCount × { modified-UTF key; modified-UTF value }
 //	    bool hasVectorIndex
 //	    if hasVectorIndex:
-//	        VectorIndex                (deferred)
+//	        VectorIndex                (opaque; no local schema/producer)
 //	        bool hasTessellation
 //	        if hasTessellation:
-//	            VectorIndexFooter      (deferred)
+//	            VectorIndexFooter      (opaque; no local schema/producer)
+//
+// Sampler strings use Java's modified UTF-8, including the two-byte NUL
+// encoding and UTF-16 surrogate pairs. The parser validates that encoding,
+// option counts, duplicate keys, truncation, and definite trailing bytes.
+//
+// The local writer only emits hasVectorIndex=false, and the repository has no
+// parseable VectorIndex or VectorIndexFooter metadata schema. When that flag is
+// true, the parser therefore preserves the complete vector/tessellation tail
+// losslessly as a typed OpaqueExtension rather than guessing a wire boundary.
 //
 // LocalityGroupMetadata layout (versions 3/4/6/7/8 share the prefix; 8
 // adds nothing structural — the wire is identical for our purposes):
@@ -35,10 +47,11 @@
 //	if hasFirstKey: Key             (rfile.Key wire format)
 //	MultiLevelIndex root block      (level/offset/hasNext/numOffsets/offsets[]/indexSize/data[])
 //
-// This package decodes the meta block down to LocalityGroup and stores
-// the MultiLevelIndex root block as opaque bytes. The tree-walk over
-// that root block (and any deeper levels — those live in their own
-// BCFile data blocks) is Phase 3b's job.
+// This package decodes the meta block down to LocalityGroup and
+// SamplerConfiguration and stores the MultiLevelIndex root block and unknown
+// vector/tessellation extension as opaque bytes. The tree-walk over that root
+// block (and any deeper levels — those live in their own BCFile data blocks)
+// is Phase 3b's job.
 //
 // Reference Java sources:
 //

@@ -66,7 +66,7 @@ func TestCompressor_RoundtripGzip(t *testing.T) {
 
 func TestCompressor_UnsupportedCodec(t *testing.T) {
 	c := DefaultCompressor()
-	_, err := c.Encode([]byte("x"), CodecZstd)
+	_, err := c.Encode([]byte("x"), "brotli")
 	if !errors.Is(err, ErrUnsupportedCodec) {
 		t.Errorf("err = %v, want ErrUnsupportedCodec", err)
 	}
@@ -74,12 +74,10 @@ func TestCompressor_UnsupportedCodec(t *testing.T) {
 
 func TestCompressor_Has(t *testing.T) {
 	c := DefaultCompressor()
-	if !c.Has(CodecNone) || !c.Has(CodecGzip) || !c.Has(CodecSnappy) {
-		t.Errorf("Default compressor missing required codec; has none=%v gz=%v snappy=%v",
-			c.Has(CodecNone), c.Has(CodecGzip), c.Has(CodecSnappy))
-	}
-	if c.Has(CodecZstd) {
-		t.Errorf("Default compressor must NOT register zstd (unsupported)")
+	for _, codec := range []string{CodecNone, CodecGzip, CodecSnappy, CodecZstd, CodecLZ4} {
+		if !c.Has(codec) {
+			t.Errorf("DefaultCompressor() missing codec %q", codec)
+		}
 	}
 }
 

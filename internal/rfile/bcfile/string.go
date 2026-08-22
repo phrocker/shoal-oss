@@ -30,6 +30,10 @@ func ReadString(r ByteAndReader) (s string, ok bool, err error) {
 	if length < 0 {
 		return "", false, fmt.Errorf("%w: length %d", ErrCorruptString, length)
 	}
+	if remaining, ok := r.(interface{ Len() int }); ok && int64(length) > int64(remaining.Len()) {
+		return "", false, fmt.Errorf("%w: length %d exceeds remaining %d bytes",
+			ErrCorruptString, length, remaining.Len())
+	}
 	buf := make([]byte, length)
 	if _, err := io.ReadFull(r, buf); err != nil {
 		return "", false, fmt.Errorf("bcfile: read string body (%d bytes): %w", length, err)

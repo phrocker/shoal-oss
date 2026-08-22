@@ -227,6 +227,12 @@ func groupDocuments(stream RowStream) ([]*docRow, error) {
 		}
 
 		if field, value, ok := documentschema.ParseEventCQ(k.ColumnQualifier); ok {
+			if documentschema.IsStructureCell(k.ColumnQualifier, stream.Value()) {
+				if err := stream.Advance(); err != nil {
+					return nil, err
+				}
+				continue
+			}
 			if _, exists := cur.fields[field]; !exists {
 				cur.fields[field] = value
 			}

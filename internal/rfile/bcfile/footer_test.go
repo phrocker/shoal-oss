@@ -67,8 +67,8 @@ func TestCheckSupported(t *testing.T) {
 func TestFooterRoundtripV3(t *testing.T) {
 	want := Footer{
 		Version:            APIVersion3,
-		OffsetIndexMeta:    0xabcd1234,
-		OffsetCryptoParams: 0x12345678,
+		OffsetIndexMeta:    12,
+		OffsetCryptoParams: 80,
 	}
 	var buf bytes.Buffer
 	// Write some leading body bytes so trailer-relative offsets aren't at 0.
@@ -91,7 +91,7 @@ func TestFooterRoundtripV1(t *testing.T) {
 	var buf bytes.Buffer
 	buf.Write(bytes.Repeat([]byte{0xaa}, 50)) // body padding
 	// 8 bytes offsetIndexMeta (BE)
-	off := []byte{0, 0, 0, 0, 0x12, 0x34, 0x56, 0x78}
+	off := []byte{0, 0, 0, 0, 0, 0, 0, 12}
 	buf.Write(off)
 	// version v1
 	if err := WriteVersion(&buf, APIVersion1); err != nil {
@@ -108,8 +108,8 @@ func TestFooterRoundtripV1(t *testing.T) {
 	if got.Version != APIVersion1 {
 		t.Errorf("Version = %v, want %v", got.Version, APIVersion1)
 	}
-	if got.OffsetIndexMeta != 0x12345678 {
-		t.Errorf("OffsetIndexMeta = %#x, want %#x", got.OffsetIndexMeta, 0x12345678)
+	if got.OffsetIndexMeta != 12 {
+		t.Errorf("OffsetIndexMeta = %d, want 12", got.OffsetIndexMeta)
 	}
 	if got.OffsetCryptoParams != 0 {
 		t.Errorf("OffsetCryptoParams = %d, want 0 (v1 has no crypto params)", got.OffsetCryptoParams)
