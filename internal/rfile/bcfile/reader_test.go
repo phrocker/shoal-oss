@@ -4,6 +4,9 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"io"
+	"math"
+	"strings"
 	"testing"
 )
 
@@ -120,6 +123,11 @@ func TestReader_RawBlockBoundsCheck(t *testing.T) {
 	if err == nil {
 		t.Errorf("expected negative-size error")
 	}
+	// Offset + size must be checked without overflowing int64.
+	_, err = r.RawBlock(BlockRegion{Offset: 1, CompressedSize: math.MaxInt64})
+	if err == nil || !strings.Contains(err.Error(), "out of bounds") {
+		t.Errorf("overflowing block region error = %v, want bounds rejection", err)
+	}
 }
 
 func TestReader_RawBlockReturnsExactBytes(t *testing.T) {
@@ -147,4 +155,108 @@ func TestReader_NotABCFile(t *testing.T) {
 	if !errors.Is(err, ErrBadMagic) {
 		t.Errorf("err = %v, want ErrBadMagic", err)
 	}
+}
+
+func TestReaderRejectsHostileFooterOffsets(t *testing.T) {
+	tests := []struct {
+		name   string
+		footer Footer
+	}{
+		{
+			name: "uint64 conversion overflow",
+			footer: Footer{
+				Version:            APIVersion3,
+				OffsetIndexMeta:    -1,
+				OffsetCryptoParams: 8,
+			},
+		},
+		{
+			name: "negative crypto offset",
+			footer: Footer{
+				Version:            APIVersion3,
+				OffsetIndexMeta:    1,
+				OffsetCryptoParams: -1,
+			},
+		},
+		{
+			name: "non-monotonic offsets",
+			footer: Footer{
+				Version:            APIVersion3,
+				OffsetIndexMeta:    16,
+				OffsetCryptoParams: 8,
+			},
+		},
+		{
+			name: "huge offset outside tiny file",
+			footer: Footer{
+				Version:            APIVersion3,
+				OffsetIndexMeta:    1,
+				OffsetCryptoParams: math.MaxInt64,
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var image bytes.Buffer
+			image.Write(make([]byte, 32))
+			if err := WriteFooter(&image, tc.footer); err != nil {
+				t.Fatalf("WriteFooter: %v", err)
+			}
+			_, err := NewReader(bytes.NewReader(image.Bytes()), int64(image.Len()))
+			if !errors.Is(err, ErrInvalidFooterOffsets) {
+				t.Fatalf("NewReader() = %v, want ErrInvalidFooterOffsets", err)
+			}
+		})
+	}
+}
+
+func TestReaderRejectsHugeMetaIndexBeforeAllocation(t *testing.T) {
+	fileLength := int64(math.MaxInt64)
+	footer := Footer{
+		Version:            APIVersion3,
+		OffsetIndexMeta:    1,
+		OffsetCryptoParams: fileLength - int64(FooterMinSizeV3),
+	}
+	src := newSparseFooterReader(t, fileLength, footer)
+
+	_, err := NewReader(src, fileLength)
+	if !errors.Is(err, ErrMetaIndexTooLarge) {
+		t.Fatalf("NewReader() = %v, want ErrMetaIndexTooLarge", err)
+	}
+	if src.reads != 2 {
+		t.Fatalf("ReadAt calls = %d, want only the two footer reads", src.reads)
+	}
+}
+
+type sparseFooterReader struct {
+	fileLength  int64
+	trailer     []byte
+	trailerBase int64
+	reads       int
+}
+
+func newSparseFooterReader(t *testing.T, fileLength int64, footer Footer) *sparseFooterReader {
+	t.Helper()
+	var trailer bytes.Buffer
+	if err := WriteFooter(&trailer, footer); err != nil {
+		t.Fatalf("WriteFooter: %v", err)
+	}
+	return &sparseFooterReader{
+		fileLength:  fileLength,
+		trailer:     trailer.Bytes(),
+		trailerBase: fileLength - int64(trailer.Len()),
+	}
+}
+
+func (r *sparseFooterReader) ReadAt(p []byte, off int64) (int, error) {
+	r.reads++
+	if off < r.trailerBase || off > r.fileLength-int64(len(p)) {
+		return 0, io.EOF
+	}
+	start := off - r.trailerBase
+	n := copy(p, r.trailer[start:])
+	if n != len(p) {
+		return n, io.EOF
+	}
+	return n, nil
 }

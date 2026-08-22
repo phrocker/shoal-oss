@@ -13,6 +13,10 @@ data.
 See [`FEATURES.md`](FEATURES.md) for the complete capability matrix, current
 validation state, and the few remaining platform and infrastructure gates.
 
+Shoal's north star is a local-to-Accumulo knowledge plane for agent systems;
+see the accepted direction in
+[`docs/platform-product-plan.md`](docs/platform-product-plan.md).
+
 ## Choose a path
 
 | Goal | Start here |

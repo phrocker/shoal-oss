@@ -21,9 +21,9 @@ const metaNamePrefix = "data:"
 // MetaIndexEntry names one meta block: which BlockRegion it lives at,
 // what compression algorithm it uses, and its (prefix-stripped) name.
 type MetaIndexEntry struct {
-	Name             string // user-facing name, prefix already stripped (e.g. "BCFile.index", "RFile.index")
-	CompressionAlgo  string // codec name as written by the producer (e.g. "gz", "snappy", "none")
-	Region           BlockRegion
+	Name            string // user-facing name, prefix already stripped (e.g. "BCFile.index", "RFile.index")
+	CompressionAlgo string // codec name as written by the producer (e.g. "gz", "snappy", "none")
+	Region          BlockRegion
 }
 
 // MetaIndex is the deserialized meta-block index: a map keyed by the
@@ -48,7 +48,7 @@ func ReadMetaIndex(r ByteAndReader) (*MetaIndex, error) {
 	if count < 0 {
 		return nil, fmt.Errorf("bcfile: negative MetaIndex count %d", count)
 	}
-	out := &MetaIndex{Entries: make(map[string]MetaIndexEntry, count)}
+	out := &MetaIndex{Entries: make(map[string]MetaIndexEntry)}
 	for i := int32(0); i < count; i++ {
 		entry, err := readMetaIndexEntry(r)
 		if err != nil {
@@ -146,13 +146,13 @@ func ReadDataIndex(r ByteAndReader) (*DataIndex, error) {
 	if count < 0 {
 		return nil, fmt.Errorf("bcfile: negative DataIndex block count %d", count)
 	}
-	blocks := make([]BlockRegion, count)
+	blocks := make([]BlockRegion, 0)
 	for i := int32(0); i < count; i++ {
 		region, err := ReadBlockRegion(r)
 		if err != nil {
 			return nil, fmt.Errorf("DataIndex block %d: %w", i, err)
 		}
-		blocks[i] = region
+		blocks = append(blocks, region)
 	}
 	return &DataIndex{DefaultCompression: algo, Blocks: blocks}, nil
 }

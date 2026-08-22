@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/phrocker/shoal-oss/internal/documentschema"
 	"github.com/phrocker/shoal-oss/internal/graphschema"
 	"github.com/phrocker/shoal-oss/internal/iterrt"
 )
@@ -98,6 +99,43 @@ func runSQL(t *testing.T, be Backend, sql string, opts PlanOptions) *Result {
 		t.Fatalf("run: %v", err)
 	}
 	return res
+}
+
+func TestGroupDocumentsHidesStructureCells(t *testing.T) {
+	eventCF := string(documentschema.EventCF("pdf", "doc-1"))
+	node := documentschema.StructureNode{
+		Kind:        documentschema.StructureSection,
+		StartOffset: 0,
+		EndOffset:   100,
+	}
+	stream := &fakeStream{cells: []Cell{
+		cell("20260821_0", eventCF, string(documentschema.EventCQ("TITLE", "Guide")), ""),
+		cell("20260821_0", eventCF,
+			string(documentschema.EventCQ(documentschema.StructureNodeField, "legacy-node")),
+			"user node value"),
+		cell("20260821_0", eventCF,
+			string(documentschema.EventCQ(documentschema.StructureChildField, "legacy-child")),
+			"user child value"),
+		cell("20260821_0", eventCF,
+			string(documentschema.StructureNodeCQ("revision-1", "section-1")),
+			string(node.Encode())),
+		cell("20260821_0", eventCF,
+			string(documentschema.StructureChildCQ("revision-1", "", 0, "section-1")), ""),
+	}}
+
+	docs, err := groupDocuments(stream)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(docs) != 1 {
+		t.Fatalf("documents = %d", len(docs))
+	}
+	if len(docs[0].fields) != 3 ||
+		docs[0].fields["TITLE"] != "Guide" ||
+		docs[0].fields[documentschema.StructureNodeField] != "legacy-node" ||
+		docs[0].fields[documentschema.StructureChildField] != "legacy-child" {
+		t.Fatalf("projected fields = %#v", docs[0].fields)
+	}
 }
 
 // --- tests ---

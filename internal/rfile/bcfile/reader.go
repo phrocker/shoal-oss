@@ -7,6 +7,8 @@ import (
 	"io"
 )
 
+const maxMetaIndexRegionSize int64 = 64 * 1024 * 1024
+
 // Reader is a partial BCFile reader: it parses the trailer and meta-block
 // index but stops short of decompressing data/meta blocks. The block
 // decompressor lives in a sibling package (see `internal/rfile/bcfile/block`
@@ -30,11 +32,15 @@ type Reader struct {
 // isn't present in the index.
 var ErrNoSuchMetaBlock = errors.New("bcfile: no such meta block")
 
+// ErrMetaIndexTooLarge indicates that a footer describes a MetaIndex region
+// too large to materialize safely.
+var ErrMetaIndexTooLarge = errors.New("bcfile: MetaIndex region too large")
+
 // NewReader parses the BCFile trailer + MetaIndex from src. It does NOT
 // touch the DataIndex or any data blocks (those are gated on a codec).
 //
-// The src must support io.ReaderAt; we issue exactly two ReadAt calls:
-// one for the trailer and one for the MetaIndex bytes.
+// The src must support io.ReaderAt; initialization reads the trailer tail,
+// the footer offsets, and the bounded MetaIndex region.
 func NewReader(src io.ReaderAt, fileLength int64) (*Reader, error) {
 	footer, err := ReadFooter(src, fileLength)
 	if err != nil {
@@ -53,7 +59,11 @@ func NewReader(src io.ReaderAt, fileLength int64) (*Reader, error) {
 		return nil, fmt.Errorf("bcfile: MetaIndex region empty (start=%d, end=%d)",
 			footer.OffsetIndexMeta, miEnd)
 	}
-	miBuf := make([]byte, miLen)
+	if miLen > maxMetaIndexRegionSize {
+		return nil, fmt.Errorf("%w: %d bytes exceeds %d-byte limit",
+			ErrMetaIndexTooLarge, miLen, maxMetaIndexRegionSize)
+	}
+	miBuf := make([]byte, int(miLen))
 	if _, err := src.ReadAt(miBuf, footer.OffsetIndexMeta); err != nil {
 		return nil, fmt.Errorf("bcfile: read MetaIndex region: %w", err)
 	}
@@ -99,11 +109,17 @@ func (r *Reader) RawBlock(region BlockRegion) ([]byte, error) {
 	if region.CompressedSize < 0 {
 		return nil, fmt.Errorf("bcfile: negative CompressedSize %d", region.CompressedSize)
 	}
-	if region.Offset < 0 || region.Offset+region.CompressedSize > r.fileLength {
+	if region.Offset < 0 || region.Offset > r.fileLength ||
+		region.CompressedSize > r.fileLength-region.Offset {
 		return nil, fmt.Errorf("bcfile: block region out of bounds: offset=%d size=%d fileLen=%d",
 			region.Offset, region.CompressedSize, r.fileLength)
 	}
-	buf := make([]byte, region.CompressedSize)
+	size := int(region.CompressedSize)
+	if int64(size) != region.CompressedSize {
+		return nil, fmt.Errorf("bcfile: block size %d exceeds platform allocation limit",
+			region.CompressedSize)
+	}
+	buf := make([]byte, size)
 	if _, err := r.src.ReadAt(buf, region.Offset); err != nil {
 		return nil, fmt.Errorf("bcfile: read block @ %d (%d bytes): %w",
 			region.Offset, region.CompressedSize, err)
@@ -114,18 +130,8 @@ func (r *Reader) RawBlock(region BlockRegion) ([]byte, error) {
 // metaIndexUpperBound returns the byte offset where the trailer begins —
 // i.e. the upper bound of the MetaIndex region.
 func (r *Reader) metaIndexUpperBound() int64 {
-	trailerSize := int64(MagicSize + VersionSize)
 	if r.footer.Version.CompatibleWith(APIVersion3) {
-		trailerSize += 16 // offsetIndexMeta + offsetCryptoParams
-	} else {
-		trailerSize += 8 // offsetIndexMeta only
-	}
-	// In v3, the crypto params block lives between MetaIndex and the
-	// trailer; we don't know its length statically. Conservative bound:
-	// stop at offsetCryptoParams. For v1 there's no crypto block, so
-	// stop at the trailer.
-	if r.footer.Version.CompatibleWith(APIVersion3) && r.footer.OffsetCryptoParams > r.footer.OffsetIndexMeta {
 		return r.footer.OffsetCryptoParams
 	}
-	return r.fileLength - trailerSize
+	return r.fileLength - int64(FooterMinSizeV1)
 }

@@ -1,6 +1,7 @@
 package documentschema
 
 import (
+	"encoding/binary"
 	"reflect"
 	"testing"
 	"time"
@@ -48,6 +49,141 @@ func TestEventCQ_ValueWithNul(t *testing.T) {
 	f, v, ok := ParseEventCQ(cq)
 	if !ok || f != "NUM" || v != "12\x0034" {
 		t.Fatalf("event cq = %q,%q,%v", f, v, ok)
+	}
+}
+
+func TestStructureNodeRoundTrip(t *testing.T) {
+	revisionID := "revision\x007"
+	want := StructureNode{
+		Kind:        StructureSection,
+		ParentID:    "parent\x00id",
+		Order:       7,
+		StartOffset: 101,
+		EndOffset:   205,
+		StartPage:   3,
+		EndPage:     4,
+	}
+	got, err := DecodeStructureNode(want.Encode())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("structure node = %+v, want %+v", got, want)
+	}
+
+	gotRevision, nodeID, ok := ParseStructureNodeCQ(
+		StructureNodeCQ(revisionID, "section\x001"))
+	if !ok || gotRevision != revisionID || nodeID != "section\x001" {
+		t.Fatalf("structure node qualifier = %q,%q,%v", gotRevision, nodeID, ok)
+	}
+}
+
+func TestStructureNodeRejectsInvalidRange(t *testing.T) {
+	node := StructureNode{
+		Kind:        StructureSpan,
+		StartOffset: 20,
+		EndOffset:   10,
+	}
+	if _, err := DecodeStructureNode(node.Encode()); err == nil {
+		t.Fatal("expected invalid offset range")
+	}
+}
+
+func TestStructureChildRoundTripAndOrdering(t *testing.T) {
+	revisionID := "revision\x007"
+	parent := "section\x00root"
+	first := StructureChildCQ(revisionID, parent, 1, "span\x00a")
+	second := StructureChildCQ(revisionID, parent, 2, "span\x00b")
+	if string(first) >= string(second) {
+		t.Fatalf("children not ordered by ordinal: %x >= %x", first, second)
+	}
+
+	gotRevision, gotParent, gotOrder, gotChild, ok := ParseStructureChildCQ(first)
+	if !ok || gotRevision != revisionID || gotParent != parent ||
+		gotOrder != 1 || gotChild != "span\x00a" {
+		t.Fatalf(
+			"structure child = %q,%q,%d,%q,%v",
+			gotRevision, gotParent, gotOrder, gotChild, ok)
+	}
+	prefix := StructureChildPrefix(revisionID, parent)
+	if len(first) < len(prefix) || string(first[:len(prefix)]) != string(prefix) {
+		t.Fatalf("child qualifier %x does not have parent prefix %x", first, prefix)
+	}
+}
+
+func TestStructureRevisionNamespacesDoNotOverlap(t *testing.T) {
+	node1 := StructureNodeCQ("revision-1", "section")
+	node2 := StructureNodeCQ("revision-2", "section")
+	if string(node1) == string(node2) {
+		t.Fatal("node qualifiers for distinct revisions must differ")
+	}
+	child1 := StructureChildCQ("revision-1", "section", 1, "span")
+	child2 := StructureChildCQ("revision-2", "section", 1, "span")
+	if string(child1) == string(child2) {
+		t.Fatal("child qualifiers for distinct revisions must differ")
+	}
+	prefix := StructureNodePrefix("revision-1")
+	if len(node1) < len(prefix) || string(node1[:len(prefix)]) != string(prefix) {
+		t.Fatalf("node qualifier %x does not have revision prefix %x", node1, prefix)
+	}
+}
+
+func TestStructureRecognitionRequiresValidatedEncoding(t *testing.T) {
+	if !IsStructureField(StructureNodeField) || !IsStructureField(StructureChildField) {
+		t.Fatal("expected structure fields to be reserved")
+	}
+	if IsStructureField("TITLE") {
+		t.Fatal("user field must not be reserved")
+	}
+
+	nodeValue := StructureNode{Kind: StructureSection}.Encode()
+	if !IsStructureCell(StructureNodeCQ("revision-1", "root"), nodeValue) {
+		t.Fatal("valid node encoding was not recognized")
+	}
+	if !IsStructureCell(StructureChildCQ("revision-1", "", 0, "root"), nil) {
+		t.Fatal("valid child encoding was not recognized")
+	}
+	if IsStructureCell(EventCQ(StructureNodeField, "legacy-node"), nodeValue) {
+		t.Fatal("legacy user node field was recognized as structural")
+	}
+	if IsStructureCell(EventCQ(StructureChildField, "legacy-child"), nil) {
+		t.Fatal("legacy user child field was recognized as structural")
+	}
+	if IsStructureCell(StructureNodeCQ("revision-1", "root"), []byte("user value")) {
+		t.Fatal("invalid node value was recognized as structural")
+	}
+	if IsStructureCell(
+		StructureChildCQ("revision-1", "", 0, "root"), []byte("user value")) {
+		t.Fatal("non-empty child value was recognized as structural")
+	}
+}
+
+func TestParseStructureChildCQRejectsOverflowLengths(t *testing.T) {
+	var maxLength [binary.MaxVarintLen64]byte
+	n := binary.PutUvarint(maxLength[:], ^uint64(0))
+
+	revisionOverflow := EventCQ(StructureChildField, "")
+	revisionOverflow = append(revisionOverflow, structureQualifierMagic...)
+	revisionOverflow = append(revisionOverflow, structureQualifierVersion)
+	revisionOverflow = append(revisionOverflow, maxLength[:n]...)
+
+	parentOverflow := structureRevisionPrefix(StructureChildField, "revision-1")
+	parentOverflow = append(parentOverflow, maxLength[:n]...)
+
+	childOverflow := StructureChildPrefix("revision-1", "root")
+	childOverflow = append(childOverflow, 0, 0, 0, 1)
+	childOverflow = append(childOverflow, maxLength[:n]...)
+
+	for name, qualifier := range map[string][]byte{
+		"revision": revisionOverflow,
+		"parent":   parentOverflow,
+		"child":    childOverflow,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, _, _, _, ok := ParseStructureChildCQ(qualifier); ok {
+				t.Fatalf("accepted overflow qualifier %x", qualifier)
+			}
+		})
 	}
 }
 

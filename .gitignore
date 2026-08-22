@@ -18,6 +18,10 @@ cpu
 cpw
 mp
 
+# Python bytecode
+__pycache__/
+*.py[cod]
+
 # build artifacts
 /build/
 *.exe
