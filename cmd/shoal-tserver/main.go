@@ -26,6 +26,7 @@ import (
 	"github.com/phrocker/shoal/internal/ingestservice"
 	"github.com/phrocker/shoal/internal/metadata"
 	"github.com/phrocker/shoal/internal/metadatacas"
+	"github.com/phrocker/shoal/internal/namespaces"
 	"github.com/phrocker/shoal/internal/protocol"
 	"github.com/phrocker/shoal/internal/roleops"
 	"github.com/phrocker/shoal/internal/scanserver"
@@ -36,6 +37,7 @@ import (
 	"github.com/phrocker/shoal/internal/storage/hdfs"
 	"github.com/phrocker/shoal/internal/storage/local"
 	"github.com/phrocker/shoal/internal/storage/s3"
+	"github.com/phrocker/shoal/internal/tablenames"
 	"github.com/phrocker/shoal/internal/tabletloader"
 	"github.com/phrocker/shoal/internal/thrift/gen/security"
 	"github.com/phrocker/shoal/internal/tlsserver"
@@ -214,9 +216,12 @@ func main() {
 	if err != nil {
 		die("tablet store: %v", err)
 	}
-	authenticator := tserverprocess.ExactAuthenticator{
-		Identities: []*security.TCredentials{outbound, systemCredentials},
-		Writers:    []*security.TCredentials{systemCredentials},
+	namespaceNames := namespaces.NewResolver(loc)
+	tableNames := tablenames.NewResolver(loc, namespaceNames)
+	authenticator := tserverprocess.ManagerAuthenticator{
+		Resolver: managerResolver{locator: loc}, System: systemCredentials,
+		InstanceID: loc.InstanceID(), AccumuloVersion: *accVersion,
+		TableNames: tableNames,
 	}
 	scans, err := scanserver.NewServer(scanserver.Options{
 		Locator: store, Storage: files, BlockCache: cache.NewBlockCache(256 << 20), Logger: logger,
