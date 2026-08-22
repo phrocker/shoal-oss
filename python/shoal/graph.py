@@ -81,12 +81,22 @@ class Path:
                 ErrorCode.INVALID_ARGUMENT,
                 "graph path requires a node",
             )
+        if any(not node.id for node in self.nodes):
+            raise new_error(
+                ErrorCode.INVALID_ARGUMENT,
+                "graph path node requires an id",
+            )
         if len(self.edges) != len(self.nodes) - 1:
             raise new_error(
                 ErrorCode.INVALID_ARGUMENT,
                 "graph path has inconsistent edges",
             )
         for index, edge in enumerate(self.edges):
+            if not edge.id or not edge.type:
+                raise new_error(
+                    ErrorCode.INVALID_ARGUMENT,
+                    "graph path edge requires an id and type",
+                )
             if (
                 edge.from_id != self.nodes[index].id
                 or edge.to_id != self.nodes[index + 1].id

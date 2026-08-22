@@ -779,6 +779,27 @@ func TestVerifyRFileExportRejectsForgedValidFooter(t *testing.T) {
 	}
 }
 
+func TestVerifyRFileExportScansEveryLocalityGroup(t *testing.T) {
+	data := validMultiGroupRFileBytes(t)
+	valueOffset := bytes.Index(data, []byte("named-value"))
+	if valueOffset < 4 {
+		t.Fatal("named locality-group value not found in uncompressed fixture")
+	}
+	data = append([]byte(nil), data...)
+	for i := valueOffset - 4; i < valueOffset; i++ {
+		data[i] = 0xff
+	}
+	path := filepath.Join(t.TempDir(), "F0001.rf")
+	backend := memory.New()
+	backend.Put(path, data)
+
+	if err := VerifyRFileExport(
+		context.Background(), backend, exportManifestForBytes(path, data),
+	); err == nil || !strings.Contains(err.Error(), "locality group 1") {
+		t.Fatalf("VerifyRFileExport(corrupt named locality group) error = %v", err)
+	}
+}
+
 func TestVerifyRFileExportPinsOneObjectSnapshot(t *testing.T) {
 	forged := forgedBCFileWithoutRFileIndex(t)
 	valid := validRFileBytes(t)
@@ -792,6 +813,55 @@ func TestVerifyRFileExportPinsOneObjectSnapshot(t *testing.T) {
 	}
 	if got := backend.OpenCount(); got != 1 {
 		t.Fatalf("backend opens = %d, want exactly 1 pinned snapshot", got)
+	}
+}
+
+func TestStageVerifiedImportFilesRejectsPostVerificationReplacement(t *testing.T) {
+	valid := validRFileBytes(t)
+	replacement := forgedBCFileWithoutRFileIndex(t)
+	path := filepath.Join(t.TempDir(), "F0001.rf")
+	manifest := exportManifestForBytes(path, valid)
+	backend := memory.New()
+	backend.Put(path, valid)
+
+	if err := verifyImmutableExport(
+		context.Background(), backend, manifest, newVerificationSnapshot,
+	); err != nil {
+		t.Fatalf("verifyImmutableExport: %v", err)
+	}
+	backend.Put(path, replacement)
+
+	if _, err := stageVerifiedImportFiles(
+		context.Background(), backend, manifest.RFiles,
+	); err == nil || !strings.Contains(err.Error(), "changed after verification") {
+		t.Fatalf("stageVerifiedImportFiles replacement error = %v", err)
+	}
+}
+
+func TestStageVerifiedImportFilesRegistersExactStagedObject(t *testing.T) {
+	valid := validRFileBytes(t)
+	path := filepath.Join(t.TempDir(), "F0001.rf")
+	manifest := exportManifestForBytes(path, valid)
+	backend := memory.New()
+	backend.Put(path, valid)
+
+	staged, err := stageVerifiedImportFiles(
+		context.Background(), backend, manifest.RFiles,
+	)
+	if err != nil {
+		t.Fatalf("stageVerifiedImportFiles: %v", err)
+	}
+	if len(staged) != 1 || staged[0].DestinationPath == path {
+		t.Fatalf("staged files = %+v, want one distinct staged path", staged)
+	}
+
+	backend.Put(path, forgedBCFileWithoutRFileIndex(t))
+	size, sum, err := hashObject(context.Background(), backend, staged[0].DestinationPath)
+	if err != nil {
+		t.Fatalf("hash staged object: %v", err)
+	}
+	if size != manifest.RFiles[0].Size || sum != manifest.RFiles[0].SHA256 {
+		t.Fatalf("staged object changed with source: size=%d sha256=%s", size, sum)
 	}
 }
 
@@ -1032,6 +1102,36 @@ func validRFileBytesWithValue(t *testing.T, value []byte) []byte {
 		Timestamp:       1,
 	}, value); err != nil {
 		t.Fatalf("Append: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	return buf.Bytes()
+}
+
+func validMultiGroupRFileBytes(t *testing.T) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	writer, err := rfile.NewWriter(&buf, rfile.WriterOptions{})
+	if err != nil {
+		t.Fatalf("NewWriter: %v", err)
+	}
+	if err := writer.Append(&wire.Key{
+		Row:          []byte("row"),
+		ColumnFamily: []byte("default"),
+		Timestamp:    1,
+	}, []byte("default-value")); err != nil {
+		t.Fatalf("append default locality group: %v", err)
+	}
+	if err := writer.AddLocalityGroup("named"); err != nil {
+		t.Fatalf("AddLocalityGroup: %v", err)
+	}
+	if err := writer.Append(&wire.Key{
+		Row:          []byte("row"),
+		ColumnFamily: []byte("named"),
+		Timestamp:    1,
+	}, []byte("named-value")); err != nil {
+		t.Fatalf("append named locality group: %v", err)
 	}
 	if err := writer.Close(); err != nil {
 		t.Fatalf("Close: %v", err)

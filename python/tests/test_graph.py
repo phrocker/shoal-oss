@@ -40,6 +40,30 @@ class GraphTest(unittest.TestCase):
             "invalid_argument: graph path has inconsistent edges",
         )
 
+    def test_path_requires_node_ids(self) -> None:
+        with self.assertRaises(ShoalError) as raised:
+            Path(nodes=[Node()]).validate()
+        self.assertEqual(
+            str(raised.exception),
+            "invalid_argument: graph path node requires an id",
+        )
+
+    def test_path_requires_edge_id_and_type(self) -> None:
+        for edge in (
+            Edge(from_id="a", to_id="b", type="supports"),
+            Edge(id="edge-1", from_id="a", to_id="b"),
+        ):
+            with self.subTest(edge=edge):
+                with self.assertRaises(ShoalError) as raised:
+                    Path(
+                        nodes=[Node(id="a"), Node(id="b")],
+                        edges=[edge],
+                    ).validate()
+                self.assertEqual(
+                    str(raised.exception),
+                    "invalid_argument: graph path edge requires an id and type",
+                )
+
     def test_path_requires_connected_edges(self) -> None:
         path = Path(
             nodes=[Node(id="a"), Node(id="b")],

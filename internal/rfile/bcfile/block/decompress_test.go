@@ -124,7 +124,7 @@ func TestDecompressor_GzipRawSizeMismatch(t *testing.T) {
 func TestDecompressor_UnsupportedCodec(t *testing.T) {
 	d := Default()
 	src := fileLike(map[int64][]byte{0: {0, 0, 0}})
-	_, err := d.Block(src, bcfile.BlockRegion{Offset: 0, CompressedSize: 3, RawSize: 3}, CodecZstd)
+	_, err := d.Block(src, bcfile.BlockRegion{Offset: 0, CompressedSize: 3, RawSize: 3}, "brotli")
 	if !errors.Is(err, ErrUnsupportedCodec) {
 		t.Errorf("err = %v, want ErrUnsupportedCodec", err)
 	}
@@ -154,12 +154,29 @@ func TestDecompressor_Register(t *testing.T) {
 
 func TestDecompressor_Has(t *testing.T) {
 	d := Default()
-	if !d.Has(CodecNone) || !d.Has(CodecGzip) || !d.Has(CodecSnappy) {
-		t.Errorf("Default() should register none + gz + snappy; has none=%v gz=%v snappy=%v",
-			d.Has(CodecNone), d.Has(CodecGzip), d.Has(CodecSnappy))
+	for _, codec := range []string{CodecNone, CodecGzip, CodecSnappy, CodecZstd, CodecLZ4} {
+		if !d.Has(codec) {
+			t.Errorf("Default() missing codec %q", codec)
+		}
 	}
-	if d.Has(CodecZstd) {
-		t.Errorf("Default() must NOT register zstd (unsupported)")
+}
+
+func TestDecompressor_BlockSizeLimits(t *testing.T) {
+	d := Default()
+	src := fileLike(nil)
+
+	_, err := d.Block(src, bcfile.BlockRegion{
+		CompressedSize: bcfile.MaxCompressedBlockSize + 1,
+	}, CodecNone)
+	if err == nil {
+		t.Fatal("expected oversized compressed block to fail")
+	}
+
+	_, err = d.Block(src, bcfile.BlockRegion{
+		RawSize: bcfile.MaxRawBlockSize + 1,
+	}, CodecNone)
+	if err == nil {
+		t.Fatal("expected oversized raw block to fail")
 	}
 }
 

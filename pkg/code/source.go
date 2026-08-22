@@ -302,5 +302,7 @@ func validSourcePath(sourcePath string) bool {
 		!strings.Contains(sourcePath, `\`) &&
 		!pathpkg.IsAbs(sourcePath) &&
 		sourcePath != "." &&
+		sourcePath != ".." &&
+		!strings.HasPrefix(sourcePath, "../") &&
 		pathpkg.Clean(sourcePath) == sourcePath
 }

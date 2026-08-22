@@ -110,6 +110,22 @@ func TestSourceRequiresRevisionAndContentHash(t *testing.T) {
 	}
 }
 
+func TestSourceRejectsRepositoryTraversalPaths(t *testing.T) {
+	content := []byte("package sample")
+	repository := testRepository(t)
+	for _, sourcePath := range []string{"..", "../outside.go", "../../outside.go"} {
+		t.Run(sourcePath, func(t *testing.T) {
+			_, err := codeast.NewSource(
+				repository, "refs/heads/main", sourcePath, "commit-1",
+				codeast.HashContent(content), uint64(len(content)),
+			)
+			if !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
+				t.Fatalf("NewSource(%q) error = %v, want invalid argument", sourcePath, err)
+			}
+		})
+	}
+}
+
 func TestParseRequestCopiesExactContent(t *testing.T) {
 	fixture := newFixture(t, "commit-1")
 	copied := fixture.request.Content()

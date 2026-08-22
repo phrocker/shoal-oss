@@ -125,8 +125,33 @@ func TestReader_RawBlockBoundsCheck(t *testing.T) {
 	}
 	// Offset + size must be checked without overflowing int64.
 	_, err = r.RawBlock(BlockRegion{Offset: 1, CompressedSize: math.MaxInt64})
-	if err == nil || !strings.Contains(err.Error(), "out of bounds") {
-		t.Errorf("overflowing block region error = %v, want bounds rejection", err)
+	if err == nil || !strings.Contains(err.Error(), "exceeds") {
+		t.Errorf("overflowing block region error = %v, want allocation-limit rejection", err)
+	}
+	// Raw size is bounded before any decompressor can preallocate it.
+	_, err = r.RawBlock(BlockRegion{
+		Offset: 0, CompressedSize: 0, RawSize: MaxRawBlockSize + 1,
+	})
+	if err == nil || !strings.Contains(err.Error(), "raw block size") {
+		t.Errorf("oversized raw block error = %v, want raw-size rejection", err)
+	}
+}
+
+func TestReaderRejectsOversizedIndexedRegionBeforeAllocation(t *testing.T) {
+	mi := &MetaIndex{Entries: map[string]MetaIndexEntry{
+		"RFile.index": {
+			Name:            "RFile.index",
+			CompressionAlgo: "gz",
+			Region: BlockRegion{
+				Offset: 0, CompressedSize: 0, RawSize: MaxRawBlockSize + 1,
+			},
+		},
+	}}
+	bs, _ := buildSyntheticBCFile(t, mi, nil, 0)
+
+	_, err := NewReader(bytes.NewReader(bs), int64(len(bs)))
+	if err == nil || !strings.Contains(err.Error(), "raw block size") {
+		t.Fatalf("NewReader oversized region error = %v, want preallocation rejection", err)
 	}
 }
 

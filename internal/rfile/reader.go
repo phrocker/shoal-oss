@@ -396,6 +396,9 @@ func OpenAll(bc *bcfile.Reader, dec *block.Decompressor, opts ...OpenOption) ([]
 // returned slice as read-only for the duration of its lifetime in the
 // cache (typically until LRU eviction).
 func (r *Reader) fetchBlock(region bcfile.BlockRegion, codec string) ([]byte, error) {
+	if err := bcfile.ValidateBlockRegion(region, r.bc.FileLength()); err != nil {
+		return nil, err
+	}
 	if r.cache != nil && r.cacheKey != "" {
 		if v, ok := r.cache.Get(r.cacheKey, region.Offset); ok {
 			return v, nil
@@ -496,6 +499,11 @@ func (r *Reader) loadDataCodec() (string, error) {
 	di, err := bcfile.ReadDataIndex(bytes.NewReader(raw))
 	if err != nil {
 		return "", fmt.Errorf("parse DataIndex: %w", err)
+	}
+	for i, region := range di.Blocks {
+		if err := bcfile.ValidateBlockRegion(region, r.bc.FileLength()); err != nil {
+			return "", fmt.Errorf("validate DataIndex block %d: %w", i, err)
+		}
 	}
 	return di.DefaultCompression, nil
 }

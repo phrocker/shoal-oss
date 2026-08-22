@@ -71,6 +71,11 @@ func NewReader(src io.ReaderAt, fileLength int64) (*Reader, error) {
 	if err != nil {
 		return nil, err
 	}
+	for name, entry := range mi.Entries {
+		if err := ValidateBlockRegion(entry.Region, fileLength); err != nil {
+			return nil, fmt.Errorf("bcfile: MetaIndex entry %q: %w", name, err)
+		}
+	}
 	r.metaIndex = mi
 	return r, nil
 }
@@ -106,13 +111,8 @@ func (r *Reader) MetaBlockEntry(name string) (MetaIndexEntry, error) {
 // want to feed bytes to a snappy/gzip/zstd reader use this. The slice
 // is freshly allocated.
 func (r *Reader) RawBlock(region BlockRegion) ([]byte, error) {
-	if region.CompressedSize < 0 {
-		return nil, fmt.Errorf("bcfile: negative CompressedSize %d", region.CompressedSize)
-	}
-	if region.Offset < 0 || region.Offset > r.fileLength ||
-		region.CompressedSize > r.fileLength-region.Offset {
-		return nil, fmt.Errorf("bcfile: block region out of bounds: offset=%d size=%d fileLen=%d",
-			region.Offset, region.CompressedSize, r.fileLength)
+	if err := ValidateBlockRegion(region, r.fileLength); err != nil {
+		return nil, err
 	}
 	size := int(region.CompressedSize)
 	if int64(size) != region.CompressedSize {

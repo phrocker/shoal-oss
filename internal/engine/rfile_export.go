@@ -731,23 +731,32 @@ func validateRFileSnapshot(ctx context.Context, src io.ReaderAt, size int64) (st
 	if err != nil {
 		return "", err
 	}
-	reader, err := rfile.Open(bc, block.Default())
+	readers, err := rfile.OpenAll(bc, block.Default())
 	if err != nil {
 		return "", err
 	}
-	defer reader.Close()
-	if err := reader.Seek(nil); err != nil {
-		return "", err
-	}
-	for {
-		if err := ctx.Err(); err != nil {
-			return "", err
+	defer func() {
+		for _, reader := range readers {
+			_ = reader.Close()
 		}
-		if _, _, err := reader.Next(); err != nil {
-			if errors.Is(err, io.EOF) {
-				break
+	}()
+	if len(readers) == 0 {
+		return "", fmt.Errorf("RFile has no readable locality groups")
+	}
+	for group, reader := range readers {
+		if err := reader.Seek(nil); err != nil {
+			return "", fmt.Errorf("seek locality group %d: %w", group, err)
+		}
+		for {
+			if err := ctx.Err(); err != nil {
+				return "", err
 			}
-			return "", err
+			if _, _, err := reader.Next(); err != nil {
+				if errors.Is(err, io.EOF) {
+					break
+				}
+				return "", fmt.Errorf("scan locality group %d: %w", group, err)
+			}
 		}
 	}
 	return bc.Footer().Version.String(), nil
@@ -789,8 +798,10 @@ func (r *verificationReaderAt) firstError() error {
 
 // ImportRFileManifest verifies the manifest's RFiles and makes them queryable
 // in this engine. The RFiles are expected to already be present at their
-// DestinationPath on this engine's backend (export places them there) — import
-// registers, it does not copy.
+// DestinationPath on this engine's backend (export places them there). Import
+// copies each verified object to an engine-owned, content-addressed path and
+// registers that exact copy so later source replacement cannot change the
+// imported table.
 //
 // Fan-in: a second import of a table this engine already serves MERGES the
 // manifest's RFiles into the open table instead of dropping them. Because
@@ -809,6 +820,14 @@ func (e *Engine) ImportRFileManifest(ctx context.Context, manifest *RFileExportM
 	if err != nil {
 		return err
 	}
+	format, err := tablet.ParseFileFormat(string(manifest.FileFormat))
+	if err != nil {
+		return err
+	}
+	stagedFiles, err := stageVerifiedImportFiles(ctx, e.backend, manifest.RFiles)
+	if err != nil {
+		return err
+	}
 	tableDir := filepath.Join(e.dir, manifest.SourceTable)
 	for _, tb := range manifest.Tablets {
 		if err := os.MkdirAll(filepath.Join(tableDir, fmt.Sprintf("t-%04d", tb.Index)), 0o755); err != nil {
@@ -821,7 +840,7 @@ func (e *Engine) ImportRFileManifest(ctx context.Context, manifest *RFileExportM
 		}
 	}
 	filesByTablet := make(map[int][]string)
-	for _, file := range manifest.RFiles {
+	for _, file := range stagedFiles {
 		filesByTablet[file.TabletIndex] = append(filesByTablet[file.TabletIndex], file.DestinationPath)
 	}
 
@@ -845,10 +864,6 @@ func (e *Engine) ImportRFileManifest(ctx context.Context, manifest *RFileExportM
 		}
 		return nil
 	}
-	format, err := tablet.ParseFileFormat(string(manifest.FileFormat))
-	if err != nil {
-		return err
-	}
 	if err := writeTableManifest(tableDir, tableManifest{
 		Version:    tableManifestVersion,
 		Splits:     splits,
@@ -868,6 +883,57 @@ func (e *Engine) ImportRFileManifest(ctx context.Context, manifest *RFileExportM
 	}
 	e.tables[manifest.SourceTable] = tbl
 	return nil
+}
+
+func stageVerifiedImportFiles(
+	ctx context.Context,
+	b storage.Backend,
+	files []RFileExportFile,
+) ([]RFileExportFile, error) {
+	if _, ok := b.(storage.WritableBackend); !ok {
+		return nil, fmt.Errorf("%w: engine: importing verified files requires a writable backend",
+			storage.ErrReadOnly)
+	}
+	staged := append([]RFileExportFile(nil), files...)
+	for i := range staged {
+		sourcePath := staged[i].DestinationPath
+		extension := filepath.Ext(sourcePath)
+		stagedPath := joinBackendPath(
+			b,
+			backendParentPath(sourcePath),
+			".shoal-import-"+staged[i].SHA256+extension,
+		)
+		written, sum, _, err := copyWithSHA256(ctx, b, sourcePath, b, stagedPath)
+		if err != nil {
+			return nil, fmt.Errorf("engine: stage verified import %s: %w", sourcePath, err)
+		}
+		if written != staged[i].Size || sum != staged[i].SHA256 {
+			return nil, fmt.Errorf(
+				"engine: stage verified import %s changed after verification: size=%d sha256=%s",
+				sourcePath, written, sum,
+			)
+		}
+		storedSize, storedSum, err := hashObject(ctx, b, stagedPath)
+		if err != nil {
+			return nil, fmt.Errorf("engine: verify staged import %s: %w", stagedPath, err)
+		}
+		if storedSize != staged[i].Size || storedSum != staged[i].SHA256 {
+			return nil, fmt.Errorf(
+				"engine: staged import %s does not match verified bytes: size=%d sha256=%s",
+				stagedPath, storedSize, storedSum,
+			)
+		}
+		staged[i].DestinationPath = stagedPath
+	}
+	return staged, nil
+}
+
+func backendParentPath(path string) string {
+	index := strings.LastIndexAny(path, `/\`)
+	if index < 0 {
+		return ""
+	}
+	return path[:index]
 }
 
 // copyOrStampRFile copies an RFile byte-for-byte, or — when a tenant
