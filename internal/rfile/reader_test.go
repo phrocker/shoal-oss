@@ -598,6 +598,45 @@ func TestReader_LocalityGroup_Accessor(t *testing.T) {
 	}
 }
 
+func TestValidateDataRegionsRejectsMetadataOverlapAndDataOverlap(t *testing.T) {
+	tests := []struct {
+		name    string
+		regions []bcfile.BlockRegion
+		end     int64
+	}{
+		{
+			name: "metadata overlap",
+			regions: []bcfile.BlockRegion{
+				{Offset: 90, CompressedSize: 11, RawSize: 11},
+			},
+			end: 100,
+		},
+		{
+			name: "data overlap",
+			regions: []bcfile.BlockRegion{
+				{Offset: 10, CompressedSize: 20, RawSize: 20},
+				{Offset: 29, CompressedSize: 10, RawSize: 10},
+			},
+			end: 100,
+		},
+		{
+			name: "out of order",
+			regions: []bcfile.BlockRegion{
+				{Offset: 30, CompressedSize: 10, RawSize: 10},
+				{Offset: 10, CompressedSize: 10, RawSize: 10},
+			},
+			end: 100,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := validateDataRegions(tt.regions, tt.end); err == nil {
+				t.Fatal("expected invalid data regions to be rejected")
+			}
+		})
+	}
+}
+
 func TestReader_Close_Idempotent(t *testing.T) {
 	r := openSynthetic(t, [][]cell{{mkCell("a", "1")}})
 	if err := r.Close(); err != nil {

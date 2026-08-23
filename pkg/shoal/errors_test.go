@@ -39,3 +39,29 @@ func TestErrorCodeSurvivesWrapping(t *testing.T) {
 		t.Fatalf("expected wrapped cause %v, got %v", cause, wrapped)
 	}
 }
+
+func TestIsErrorCodeTraversesNestedShoalErrors(t *testing.T) {
+	inner := shoal.NewError(shoal.ErrorUnavailable, "backend unavailable")
+	outer := shoal.WrapError(shoal.ErrorInternal, "retrieve failed", inner)
+
+	if !shoal.IsErrorCode(outer, shoal.ErrorUnavailable) {
+		t.Fatalf("expected nested unavailable error, got %v", outer)
+	}
+	if !shoal.IsErrorCode(outer, shoal.ErrorInternal) {
+		t.Fatalf("expected outer internal error, got %v", outer)
+	}
+}
+
+func TestIsErrorCodeTraversesJoinedErrors(t *testing.T) {
+	err := errors.Join(
+		shoal.NewError(shoal.ErrorNotFound, "document"),
+		fmt.Errorf("remote: %w", shoal.NewError(shoal.ErrorConflict, "revision")),
+	)
+
+	if !shoal.IsErrorCode(err, shoal.ErrorConflict) {
+		t.Fatalf("expected joined conflict error, got %v", err)
+	}
+	if shoal.IsErrorCode(err, shoal.ErrorUnauthorized) {
+		t.Fatalf("unexpected unauthorized match in %v", err)
+	}
+}

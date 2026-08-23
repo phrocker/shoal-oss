@@ -19,14 +19,16 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import field
 from datetime import datetime
+from typing import Optional
 
+from ._compat import frozen_dataclass
 from .errors import ErrorCode, ShoalError, new_error
 from .types import ID, Metadata, freeze_metadata
 
 
-@dataclass(frozen=True, slots=True)
+@frozen_dataclass
 class SourcePosition:
     """A zero-based content offset and optional one-based source page."""
 
@@ -34,7 +36,7 @@ class SourcePosition:
     page: int = 0
 
 
-@dataclass(frozen=True, slots=True)
+@frozen_dataclass
 class SourceRange:
     """A half-open source interval ``[start, end)``."""
 
@@ -62,13 +64,13 @@ class SourceRange:
             )
 
 
-@dataclass(frozen=True, slots=True)
+@frozen_dataclass
 class Revision:
     """An immutable version of a document."""
 
     id: ID = ""
     document_id: ID = ""
-    created_at: datetime | None = None
+    created_at: Optional[datetime] = None
     source_version: str = ""
     metadata: Metadata = field(default_factory=freeze_metadata)
 
@@ -76,7 +78,7 @@ class Revision:
         object.__setattr__(self, "metadata", freeze_metadata(self.metadata))
 
 
-@dataclass(frozen=True, slots=True)
+@frozen_dataclass
 class Document:
     """The revision-specific root of a hierarchical source."""
 
@@ -90,7 +92,7 @@ class Document:
         object.__setattr__(self, "metadata", freeze_metadata(self.metadata))
 
 
-@dataclass(frozen=True, slots=True)
+@frozen_dataclass
 class Section:
     """An ordered node in a document tree."""
 
@@ -107,7 +109,7 @@ class Section:
         object.__setattr__(self, "metadata", freeze_metadata(self.metadata))
 
 
-@dataclass(frozen=True, slots=True)
+@frozen_dataclass
 class Span:
     """An ordered, directly attributable piece of source content."""
 
@@ -124,7 +126,7 @@ class Span:
         object.__setattr__(self, "metadata", freeze_metadata(self.metadata))
 
 
-@dataclass(frozen=True, slots=True)
+@frozen_dataclass
 class Citation:
     """An exact reference to evidence in one document revision."""
 

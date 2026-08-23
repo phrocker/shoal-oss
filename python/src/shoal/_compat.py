@@ -15,24 +15,23 @@
 # specific language governing permissions and limitations
 # under the License.
 
-"""Common public value types."""
+"""Compatibility helpers for Shoal's supported Python versions."""
 
-from __future__ import annotations
-
-from types import MappingProxyType
-from typing import Mapping, Optional
-
-ID = str
-Score = float
-Metadata = Mapping[str, str]
+import sys
+from dataclasses import dataclass
+from enum import Enum
+from functools import partial
 
 
-def freeze_metadata(metadata: Optional[Mapping[str, str]] = None) -> Metadata:
-    """Return an immutable snapshot of application-defined metadata."""
+class StrEnum(str, Enum):
+    """A Python 3.9-compatible subset of :class:`enum.StrEnum`."""
 
-    values = dict(metadata or {})
-    if any(not isinstance(key, str) for key in values):
-        raise TypeError("metadata keys must be strings")
-    if any(not isinstance(value, str) for value in values.values()):
-        raise TypeError("metadata values must be strings")
-    return MappingProxyType(values)
+    def __str__(self) -> str:
+        return str.__str__(self)
+
+
+frozen_dataclass = partial(
+    dataclass,
+    frozen=True,
+    **({"slots": True} if sys.version_info >= (3, 10) else {}),
+)

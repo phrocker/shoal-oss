@@ -61,7 +61,7 @@ func TestReader_ParsesFooterAndMetaIndex(t *testing.T) {
 			Region:          BlockRegion{Offset: 200, CompressedSize: 80, RawSize: 256},
 		},
 	}}
-	dataBlock := bytes.Repeat([]byte{0x42}, 100)
+	dataBlock := bytes.Repeat([]byte{0x42}, 200)
 	bs, footer := buildSyntheticBCFile(t, want, dataBlock, 100)
 
 	r, err := NewReader(bytes.NewReader(bs), int64(len(bs)))
@@ -152,6 +152,30 @@ func TestReaderRejectsOversizedIndexedRegionBeforeAllocation(t *testing.T) {
 	_, err := NewReader(bytes.NewReader(bs), int64(len(bs)))
 	if err == nil || !strings.Contains(err.Error(), "raw block size") {
 		t.Fatalf("NewReader oversized region error = %v, want preallocation rejection", err)
+	}
+}
+
+func TestReaderRejectsMetaBlockInsideMetaIndex(t *testing.T) {
+	mi := &MetaIndex{Entries: map[string]MetaIndexEntry{
+		DataIndexBlockName: {
+			Name:            DataIndexBlockName,
+			CompressionAlgo: "none",
+			Region:          BlockRegion{Offset: 1, CompressedSize: 1, RawSize: 1},
+		},
+	}}
+	_, footer := buildSyntheticBCFile(t, mi, nil, 0)
+	mi.Entries[DataIndexBlockName] = MetaIndexEntry{
+		Name:            DataIndexBlockName,
+		CompressionAlgo: "none",
+		Region: BlockRegion{
+			Offset: footer.OffsetIndexMeta, CompressedSize: 1, RawSize: 1,
+		},
+	}
+	bs, _ := buildSyntheticBCFile(t, mi, nil, 0)
+
+	_, err := NewReader(bytes.NewReader(bs), int64(len(bs)))
+	if err == nil || !strings.Contains(err.Error(), "out of bounds") {
+		t.Fatalf("NewReader metadata overlap error = %v, want bounds rejection", err)
 	}
 }
 

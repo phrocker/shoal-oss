@@ -72,7 +72,7 @@ func NewReader(src io.ReaderAt, fileLength int64) (*Reader, error) {
 		return nil, err
 	}
 	for name, entry := range mi.Entries {
-		if err := ValidateBlockRegion(entry.Region, fileLength); err != nil {
+		if err := ValidateBlockRegion(entry.Region, footer.OffsetIndexMeta); err != nil {
 			return nil, fmt.Errorf("bcfile: MetaIndex entry %q: %w", name, err)
 		}
 	}
@@ -95,6 +95,18 @@ func (r *Reader) FileLength() int64 { return r.fileLength }
 
 // MetaIndex returns the parsed meta-block index.
 func (r *Reader) MetaIndex() *MetaIndex { return r.metaIndex }
+
+// DataRegionEnd returns the first byte reserved for meta blocks. Data
+// blocks must end at or before this offset.
+func (r *Reader) DataRegionEnd() int64 {
+	end := r.footer.OffsetIndexMeta
+	for _, entry := range r.metaIndex.Entries {
+		if entry.Region.Offset < end {
+			end = entry.Region.Offset
+		}
+	}
+	return end
+}
 
 // MetaBlockEntry returns the index entry for the named meta block, or
 // ErrNoSuchMetaBlock.

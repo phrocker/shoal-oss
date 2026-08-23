@@ -20,8 +20,8 @@
 package shoal
 
 import (
-	"errors"
 	"fmt"
+	"reflect"
 )
 
 // ErrorCode identifies a transport-independent failure category.
@@ -74,6 +74,63 @@ func (e *Error) Unwrap() error {
 
 // IsErrorCode reports whether err or any wrapped error has code.
 func IsErrorCode(err error, code ErrorCode) bool {
-	var target *Error
-	return errors.As(err, &target) && target.Code == code
+	pending := []error{err}
+	seenComparable := make(map[error]struct{})
+	seenReference := make(map[errorReference]struct{})
+	for len(pending) > 0 {
+		current := pending[len(pending)-1]
+		pending = pending[:len(pending)-1]
+		if current == nil {
+			continue
+		}
+		if errorAlreadyVisited(current, seenComparable, seenReference) {
+			continue
+		}
+		if shoalErr, ok := current.(*Error); ok && shoalErr.Code == code {
+			return true
+		}
+		switch wrapped := current.(type) {
+		case interface{ Unwrap() []error }:
+			pending = append(pending, wrapped.Unwrap()...)
+		case interface{ Unwrap() error }:
+			pending = append(pending, wrapped.Unwrap())
+		}
+	}
+	return false
+}
+
+type errorReference struct {
+	typ     reflect.Type
+	pointer uintptr
+}
+
+func errorAlreadyVisited(
+	err error,
+	comparable map[error]struct{},
+	references map[errorReference]struct{},
+) bool {
+	value := reflect.ValueOf(err)
+	if value.Type().Comparable() {
+		if _, ok := comparable[err]; ok {
+			return true
+		}
+		comparable[err] = struct{}{}
+		return false
+	}
+	var pointer uintptr
+	switch value.Kind() {
+	case reflect.Chan, reflect.Map, reflect.Pointer, reflect.Slice,
+		reflect.UnsafePointer:
+		pointer = uintptr(value.UnsafePointer())
+	case reflect.Func:
+		pointer = value.Pointer()
+	default:
+		return false
+	}
+	reference := errorReference{typ: value.Type(), pointer: pointer}
+	if _, ok := references[reference]; ok {
+		return true
+	}
+	references[reference] = struct{}{}
+	return false
 }

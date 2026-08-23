@@ -19,7 +19,9 @@
 
 from __future__ import annotations
 
-from enum import StrEnum
+from typing import Optional, Union
+
+from ._compat import StrEnum
 
 
 class ErrorCode(StrEnum):
@@ -40,10 +42,10 @@ class ShoalError(Exception):
 
     def __init__(
         self,
-        code: ErrorCode | str,
+        code: Union[ErrorCode, str],
         message: str = "",
         *,
-        cause: BaseException | None = None,
+        cause: Optional[BaseException] = None,
     ) -> None:
         self.code = ErrorCode(code)
         self.message = message
@@ -57,14 +59,14 @@ class ShoalError(Exception):
         return f"{self.code.value}: {self.message}"
 
 
-def new_error(code: ErrorCode | str, message: str = "") -> ShoalError:
+def new_error(code: Union[ErrorCode, str], message: str = "") -> ShoalError:
     """Construct a public error without an underlying cause."""
 
     return ShoalError(code, message)
 
 
 def wrap_error(
-    code: ErrorCode | str,
+    code: Union[ErrorCode, str],
     message: str,
     cause: BaseException,
 ) -> ShoalError:
@@ -73,7 +75,10 @@ def wrap_error(
     return ShoalError(code, message, cause=cause)
 
 
-def is_error_code(error: BaseException | None, code: ErrorCode | str) -> bool:
+def is_error_code(
+    error: Optional[BaseException],
+    code: Union[ErrorCode, str],
+) -> bool:
     """Return whether an exception or an exception in its chain has ``code``."""
 
     expected = ErrorCode(code)

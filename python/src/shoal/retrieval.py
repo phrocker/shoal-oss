@@ -19,12 +19,12 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import field
 from datetime import datetime
-from enum import StrEnum
 from types import MappingProxyType
-from typing import Mapping, Protocol, runtime_checkable
+from typing import List, Mapping, Optional, Protocol, Tuple, Union, runtime_checkable
 
+from ._compat import StrEnum, frozen_dataclass
 from .document import Citation
 from .errors import ErrorCode, new_error
 from .graph import Path
@@ -40,7 +40,7 @@ class Mode(StrEnum):
     GRAPH = "graph"
 
 
-@dataclass(frozen=True, slots=True)
+@frozen_dataclass
 class Scope:
     """Bounds retrieval to known documents or graph nodes."""
 
@@ -52,19 +52,19 @@ class Scope:
         object.__setattr__(self, "node_ids", tuple(self.node_ids))
 
 
-@dataclass(frozen=True, slots=True)
+@frozen_dataclass
 class Request:
     """One coarse knowledge retrieval operation."""
 
     text: str = ""
     top_k: int = 0
-    modes: tuple[Mode | str, ...] = ()
+    modes: Tuple[Union[Mode, str], ...] = ()
     scope: Scope = field(default_factory=Scope)
-    as_of: datetime | None = None
+    as_of: Optional[datetime] = None
     explain: bool = False
 
     def __post_init__(self) -> None:
-        normalized_modes: list[Mode | str] = []
+        normalized_modes: List[Union[Mode, str]] = []
         for mode in self.modes:
             try:
                 normalized_modes.append(Mode(mode))
@@ -105,7 +105,7 @@ class Request:
             )
 
 
-@dataclass(frozen=True, slots=True)
+@frozen_dataclass
 class Evidence:
     """Immutable source evidence and an optional graph path."""
 
@@ -115,7 +115,7 @@ class Evidence:
     score: Score = 0.0
 
 
-@dataclass(frozen=True, slots=True)
+@frozen_dataclass
 class Explanation:
     """Why a result was selected, without an execution or storage plan."""
 
@@ -134,20 +134,20 @@ class Explanation:
         )
 
 
-@dataclass(frozen=True, slots=True)
+@frozen_dataclass
 class Result:
     """One ranked, evidence-addressable retrieval result."""
 
     id: ID = ""
     score: Score = 0.0
     evidence: tuple[Evidence, ...] = ()
-    explanation: Explanation | None = None
+    explanation: Optional[Explanation] = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "evidence", tuple(self.evidence))
 
 
-@dataclass(frozen=True, slots=True)
+@frozen_dataclass
 class Response:
     """The complete result of one retrieval request."""
 
@@ -188,7 +188,7 @@ class RemoteTransport(Protocol):
         ...
 
 
-@dataclass(frozen=True, slots=True)
+@frozen_dataclass
 class NativeRetriever:
     """Validating adapter for a native retrieval transport."""
 
@@ -199,7 +199,7 @@ class NativeRetriever:
         return self.transport.retrieve(request)
 
 
-@dataclass(frozen=True, slots=True)
+@frozen_dataclass
 class RemoteRetriever:
     """Validating adapter for a remote retrieval transport."""
 

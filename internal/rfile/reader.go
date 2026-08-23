@@ -500,12 +500,28 @@ func (r *Reader) loadDataCodec() (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("parse DataIndex: %w", err)
 	}
-	for i, region := range di.Blocks {
-		if err := bcfile.ValidateBlockRegion(region, r.bc.FileLength()); err != nil {
-			return "", fmt.Errorf("validate DataIndex block %d: %w", i, err)
-		}
+	if err := validateDataRegions(di.Blocks, r.bc.DataRegionEnd()); err != nil {
+		return "", err
 	}
 	return di.DefaultCompression, nil
+}
+
+func validateDataRegions(regions []bcfile.BlockRegion, dataRegionEnd int64) error {
+	for i, region := range regions {
+		if err := bcfile.ValidateBlockRegion(region, dataRegionEnd); err != nil {
+			return fmt.Errorf("validate DataIndex block %d: %w", i, err)
+		}
+		if i > 0 {
+			previous := regions[i-1]
+			if region.Offset < previous.Offset+previous.CompressedSize {
+				return fmt.Errorf(
+					"validate DataIndex block %d: overlaps or precedes block %d",
+					i, i-1,
+				)
+			}
+		}
+	}
+	return nil
 }
 
 // LocalityGroup returns the default LG metadata that the reader is

@@ -19,13 +19,14 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import field
 
+from ._compat import frozen_dataclass
 from .errors import ErrorCode, new_error
 from .types import ID, Metadata, Score, freeze_metadata
 
 
-@dataclass(frozen=True, slots=True)
+@frozen_dataclass
 class Node:
     """A schema-neutral knowledge graph node."""
 
@@ -43,7 +44,7 @@ class Node:
         )
 
 
-@dataclass(frozen=True, slots=True)
+@frozen_dataclass
 class Edge:
     """A directed, typed relationship between two nodes."""
 
@@ -62,7 +63,7 @@ class Edge:
         )
 
 
-@dataclass(frozen=True, slots=True)
+@frozen_dataclass
 class Path:
     """An ordered graph explanation."""
 
