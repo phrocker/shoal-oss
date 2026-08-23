@@ -131,7 +131,7 @@ pkg/graph/       nodes, edges, graph mutation, expansion, and query requests
 pkg/document/    documents, sections, spans, trees, and page retrieval
 pkg/retrieval/   lexical, vector, tree, and hybrid retrieval plans
 bindings/python/ gopy input facade and generated build configuration
-python/shoal/    supported Python package and transport selection
+python/src/shoal/ supported Python package and transport selection
 ```
 
 Public types are transport-neutral. Embedded and gRPC implementations must

@@ -215,6 +215,10 @@ func expectedIngestionKey(result ParseResult) (ID, error) {
 	source := result.Source()
 	language := result.Language()
 	parser := result.Parser()
+	payloadDigest, err := parseResultPayloadDigest(result)
+	if err != nil {
+		return ID{}, err
+	}
 	return deriveID(
 		"ingest",
 		source.ID().String(),
@@ -224,6 +228,7 @@ func expectedIngestionKey(result ParseResult) (ID, error) {
 		parser.Name(),
 		parser.Version(),
 		parser.ConfigurationHash().String(),
+		payloadDigest.String(),
 	)
 }
 

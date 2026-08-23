@@ -586,6 +586,30 @@ func TestIngestionIsBoundToParseRequestAndResult(t *testing.T) {
 		t.Fatal("identical bound parse values produced different idempotency keys")
 	}
 
+	changedDiagnostic := diagnostic(
+		t, codeast.DiagnosticHint, "different result payload",
+		codeast.WithDiagnosticCode("example"),
+		codeast.WithDiagnosticRange(exactRange(t, fixture.content, 7, 8)))
+	changedResult, err := codeast.NewParseResult(
+		fixture.request, fixture.language, fixture.parser,
+		codeast.WithSyntaxRoots(fixture.root),
+		codeast.WithSyntaxNodes(fixture.root, fixture.child),
+		codeast.WithSemanticSymbols(fixture.symbol),
+		codeast.WithExternalEntities(fixture.external),
+		codeast.WithRelationships(fixture.relationship),
+		codeast.WithDiagnostics(changedDiagnostic),
+	)
+	if err != nil {
+		t.Fatalf("create changed parse result: %v", err)
+	}
+	changed, err := codeast.NewIngestRequest(fixture.request, changedResult)
+	if err != nil {
+		t.Fatalf("create changed ingest request: %v", err)
+	}
+	if first.IdempotencyKey() == changed.IdempotencyKey() {
+		t.Fatal("different validated parse results produced the same idempotency key")
+	}
+
 	other := newFixture(t, "commit-2")
 	if _, err := codeast.NewIngestRequest(other.request, fixture.result); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
 		t.Fatalf("expected request/result mismatch, got %v", err)

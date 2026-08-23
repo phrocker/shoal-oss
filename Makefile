@@ -234,7 +234,7 @@ capi:
 
 .PHONY: python-test
 python-test:
-	cd python && python -m unittest discover -s tests -v
+	cd python && PYTHONPATH=src python -m unittest discover -s tests -v
 
 .PHONY: python-dist
 python-dist:
