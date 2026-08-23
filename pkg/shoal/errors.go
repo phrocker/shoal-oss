@@ -86,7 +86,8 @@ func IsErrorCode(err error, code ErrorCode) bool {
 		if errorAlreadyVisited(current, seenComparable, seenReference) {
 			continue
 		}
-		if shoalErr, ok := current.(*Error); ok && shoalErr.Code == code {
+		if shoalErr, ok := current.(*Error); ok && shoalErr != nil &&
+			shoalErr.Code == code {
 			return true
 		}
 		switch wrapped := current.(type) {

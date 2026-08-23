@@ -44,13 +44,14 @@ type SkipPredicate func(leafIdx int, entry *index.IndexEntry, bm *blockmeta.Bloc
 // share the same Reader through Seek/Next; instantiate two readers
 // from the same bcfile.Reader+Decompressor instead.
 type Reader struct {
-	bc         *bcfile.Reader
-	dec        *block.Decompressor
-	idx        *index.Reader
-	walker     *index.Walker
-	lg         *index.LocalityGroup
-	dataCodec  string
-	dataBlocks []bcfile.BlockRegion
+	bc           *bcfile.Reader
+	dec          *block.Decompressor
+	idx          *index.Reader
+	walker       *index.Walker
+	lg           *index.LocalityGroup
+	dataCodec    string
+	dataBlocks   []bcfile.BlockRegion
+	dataBlockSet map[bcfile.BlockRegion]struct{}
 
 	// Optional block cache. nil disables caching. Keyed by (cacheKey,
 	// region.Offset). When set, every block fetch (data, BCFile.index,
@@ -220,14 +221,15 @@ func Open(bc *bcfile.Reader, dec *block.Decompressor, opts ...OpenOption) (*Read
 // backs concurrent scans; each scan gets its own cursor Reader (own
 // decompressor + cursor state) via NewReaderFromShared.
 type SharedFile struct {
-	bc         *bcfile.Reader
-	idx        *index.Reader
-	lg         *index.LocalityGroup
-	dataCodec  string
-	dataBlocks []bcfile.BlockRegion
-	bm         *blockmeta.BlockMeta
-	adj        *adjacency.Index
-	leaves     []*index.IndexEntry
+	bc           *bcfile.Reader
+	idx          *index.Reader
+	lg           *index.LocalityGroup
+	dataCodec    string
+	dataBlocks   []bcfile.BlockRegion
+	dataBlockSet map[bcfile.BlockRegion]struct{}
+	bm           *blockmeta.BlockMeta
+	adj          *adjacency.Index
+	leaves       []*index.IndexEntry
 }
 
 // OpenShared parses an RFile once and collects its default-LG leaves,
@@ -245,14 +247,15 @@ func OpenShared(bc *bcfile.Reader, dec *block.Decompressor, opts ...OpenOption) 
 		return nil, err
 	}
 	return &SharedFile{
-		bc:         bc,
-		idx:        r.idx,
-		lg:         r.lg,
-		dataCodec:  r.dataCodec,
-		dataBlocks: r.dataBlocks,
-		bm:         r.bm,
-		adj:        r.adj,
-		leaves:     leaves,
+		bc:           bc,
+		idx:          r.idx,
+		lg:           r.lg,
+		dataCodec:    r.dataCodec,
+		dataBlocks:   r.dataBlocks,
+		dataBlockSet: r.dataBlockSet,
+		bm:           r.bm,
+		adj:          r.adj,
+		leaves:       leaves,
 	}, nil
 }
 
@@ -286,6 +289,7 @@ func NewReaderFromShared(sf *SharedFile, dec *block.Decompressor, opts ...OpenOp
 		lg:           sf.lg,
 		dataCodec:    sf.dataCodec,
 		dataBlocks:   sf.dataBlocks,
+		dataBlockSet: sf.dataBlockSet,
 		bm:           sf.bm,
 		adj:          sf.adj,
 		leaves:       sf.leaves,
@@ -376,15 +380,16 @@ func OpenAll(bc *bcfile.Reader, dec *block.Decompressor, opts ...OpenOption) ([]
 			continue
 		}
 		r := &Reader{
-			bc:         bc,
-			dec:        dec,
-			cache:      root.cache,
-			cacheKey:   root.cacheKey,
-			idx:        idx,
-			lg:         lg,
-			dataCodec:  dataCodec,
-			dataBlocks: root.dataBlocks,
-			bm:         bm,
+			bc:           bc,
+			dec:          dec,
+			cache:        root.cache,
+			cacheKey:     root.cacheKey,
+			idx:          idx,
+			lg:           lg,
+			dataCodec:    dataCodec,
+			dataBlocks:   root.dataBlocks,
+			dataBlockSet: root.dataBlockSet,
+			bm:           bm,
 		}
 		r.walker = r.makeWalker(idx, lg.RootIndex, dataCodec)
 		out = append(out, r)
@@ -429,15 +434,8 @@ func (r *Reader) fetchDataBlock(
 	// Java-produced RFiles can omit the optional DataIndex block list.
 	// When present, require an exact tuple match; when absent, the
 	// data/meta boundary above remains authoritative.
-	if len(r.dataBlocks) > 0 {
-		declared := false
-		for _, candidate := range r.dataBlocks {
-			if candidate == region {
-				declared = true
-				break
-			}
-		}
-		if !declared {
+	if r.dataBlockSet != nil {
+		if _, declared := r.dataBlockSet[region]; !declared {
 			return nil, fmt.Errorf(
 				"rfile: block region is not declared by BCFile.index: offset=%d compressed=%d raw=%d",
 				region.Offset, region.CompressedSize, region.RawSize,
@@ -537,6 +535,12 @@ func (r *Reader) loadDataCodec() (string, error) {
 		return "", err
 	}
 	r.dataBlocks = append([]bcfile.BlockRegion(nil), di.Blocks...)
+	if len(di.Blocks) > 0 {
+		r.dataBlockSet = make(map[bcfile.BlockRegion]struct{}, len(di.Blocks))
+		for _, region := range di.Blocks {
+			r.dataBlockSet[region] = struct{}{}
+		}
+	}
 	return di.DefaultCompression, nil
 }
 

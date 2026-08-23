@@ -65,3 +65,12 @@ func TestIsErrorCodeTraversesJoinedErrors(t *testing.T) {
 		t.Fatalf("unexpected unauthorized match in %v", err)
 	}
 }
+
+func TestIsErrorCodeRejectsTypedNilError(t *testing.T) {
+	var typedNil *shoal.Error
+	var err error = typedNil
+
+	if shoal.IsErrorCode(err, shoal.ErrorInternal) {
+		t.Fatal("typed-nil error unexpectedly matched")
+	}
+}

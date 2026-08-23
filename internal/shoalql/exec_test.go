@@ -108,7 +108,7 @@ func TestGroupDocumentsHidesStructureCells(t *testing.T) {
 		StartOffset: 0,
 		EndOffset:   100,
 	}
-	stream := &fakeStream{cells: []Cell{
+	cells := []Cell{
 		cell("20260821_0", eventCF, string(documentschema.EventCQ("TITLE", "Guide")), ""),
 		cell("20260821_0", eventCF,
 			string(documentschema.EventCQ(documentschema.StructureNodeField, "legacy-node")),
@@ -121,12 +121,18 @@ func TestGroupDocumentsHidesStructureCells(t *testing.T) {
 			string(node.Encode())),
 		cell("20260821_0", eventCF,
 			string(documentschema.StructureChildCQ("revision-1", "", 0, "section-1")), ""),
-	}}
+	}
 
-	docs, err := groupDocuments(stream)
+	docs, err := groupDocuments(&fakeStream{cells: cells})
 	if err != nil {
 		t.Fatal(err)
 	}
+	assertProjectedDocumentFields(t, docs)
+	assertProjectedDocumentFields(t, groupDocumentCells(cells))
+}
+
+func assertProjectedDocumentFields(t *testing.T, docs []*docRow) {
+	t.Helper()
 	if len(docs) != 1 {
 		t.Fatalf("documents = %d", len(docs))
 	}
