@@ -628,12 +628,34 @@ func TestValidateDataRegionsRejectsMetadataOverlapAndDataOverlap(t *testing.T) {
 			end: 100,
 		},
 	}
+
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			if err := validateDataRegions(tt.regions, tt.end); err == nil {
 				t.Fatal("expected invalid data regions to be rejected")
 			}
 		})
+	}
+}
+
+func TestFetchDataBlockRequiresValidatedDataRegion(t *testing.T) {
+	r := openSynthetic(t, [][]cell{{mkCell("a", "1")}})
+	defer r.Close()
+
+	unlisted := r.dataBlocks[0]
+	unlisted.RawSize++
+	if _, err := r.fetchDataBlock(unlisted, r.dataCodec); err == nil ||
+		!strings.Contains(err.Error(), "not declared by BCFile.index") {
+		t.Fatalf("fetchDataBlock unlisted region error = %v, want declaration rejection", err)
+	}
+
+	meta, err := r.bc.MetaBlockEntry(IndexMetaBlockName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.fetchDataBlock(meta.Region, meta.CompressionAlgo); err == nil ||
+		!strings.Contains(err.Error(), "block region") {
+		t.Fatalf("fetchDataBlock metadata region error = %v, want declaration rejection", err)
 	}
 }
 

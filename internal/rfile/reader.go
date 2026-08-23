@@ -44,12 +44,13 @@ type SkipPredicate func(leafIdx int, entry *index.IndexEntry, bm *blockmeta.Bloc
 // share the same Reader through Seek/Next; instantiate two readers
 // from the same bcfile.Reader+Decompressor instead.
 type Reader struct {
-	bc        *bcfile.Reader
-	dec       *block.Decompressor
-	idx       *index.Reader
-	walker    *index.Walker
-	lg        *index.LocalityGroup
-	dataCodec string
+	bc         *bcfile.Reader
+	dec        *block.Decompressor
+	idx        *index.Reader
+	walker     *index.Walker
+	lg         *index.LocalityGroup
+	dataCodec  string
+	dataBlocks []bcfile.BlockRegion
 
 	// Optional block cache. nil disables caching. Keyed by (cacheKey,
 	// region.Offset). When set, every block fetch (data, BCFile.index,
@@ -219,13 +220,14 @@ func Open(bc *bcfile.Reader, dec *block.Decompressor, opts ...OpenOption) (*Read
 // backs concurrent scans; each scan gets its own cursor Reader (own
 // decompressor + cursor state) via NewReaderFromShared.
 type SharedFile struct {
-	bc        *bcfile.Reader
-	idx       *index.Reader
-	lg        *index.LocalityGroup
-	dataCodec string
-	bm        *blockmeta.BlockMeta
-	adj       *adjacency.Index
-	leaves    []*index.IndexEntry
+	bc         *bcfile.Reader
+	idx        *index.Reader
+	lg         *index.LocalityGroup
+	dataCodec  string
+	dataBlocks []bcfile.BlockRegion
+	bm         *blockmeta.BlockMeta
+	adj        *adjacency.Index
+	leaves     []*index.IndexEntry
 }
 
 // OpenShared parses an RFile once and collects its default-LG leaves,
@@ -243,13 +245,14 @@ func OpenShared(bc *bcfile.Reader, dec *block.Decompressor, opts ...OpenOption) 
 		return nil, err
 	}
 	return &SharedFile{
-		bc:        bc,
-		idx:       r.idx,
-		lg:        r.lg,
-		dataCodec: r.dataCodec,
-		bm:        r.bm,
-		adj:       r.adj,
-		leaves:    leaves,
+		bc:         bc,
+		idx:        r.idx,
+		lg:         r.lg,
+		dataCodec:  r.dataCodec,
+		dataBlocks: r.dataBlocks,
+		bm:         r.bm,
+		adj:        r.adj,
+		leaves:     leaves,
 	}, nil
 }
 
@@ -282,6 +285,7 @@ func NewReaderFromShared(sf *SharedFile, dec *block.Decompressor, opts ...OpenOp
 		idx:          sf.idx,
 		lg:           sf.lg,
 		dataCodec:    sf.dataCodec,
+		dataBlocks:   sf.dataBlocks,
 		bm:           sf.bm,
 		adj:          sf.adj,
 		leaves:       sf.leaves,
@@ -298,7 +302,7 @@ func NewReaderFromShared(sf *SharedFile, dec *block.Decompressor, opts ...OpenOp
 // nested index nodes go through the same cache as data blocks.
 func (r *Reader) makeWalker(idx *index.Reader, root *index.IndexBlock, dataCodec string) *index.Walker {
 	lr := index.LevelReaderFunc(func(region bcfile.BlockRegion) (*index.IndexBlock, error) {
-		raw, err := r.fetchBlock(region, dataCodec)
+		raw, err := r.fetchDataBlock(region, dataCodec)
 		if err != nil {
 			return nil, fmt.Errorf("level-reader fetch: %w", err)
 		}
@@ -372,14 +376,15 @@ func OpenAll(bc *bcfile.Reader, dec *block.Decompressor, opts ...OpenOption) ([]
 			continue
 		}
 		r := &Reader{
-			bc:        bc,
-			dec:       dec,
-			cache:     root.cache,
-			cacheKey:  root.cacheKey,
-			idx:       idx,
-			lg:        lg,
-			dataCodec: dataCodec,
-			bm:        bm,
+			bc:         bc,
+			dec:        dec,
+			cache:      root.cache,
+			cacheKey:   root.cacheKey,
+			idx:        idx,
+			lg:         lg,
+			dataCodec:  dataCodec,
+			dataBlocks: root.dataBlocks,
+			bm:         bm,
 		}
 		r.walker = r.makeWalker(idx, lg.RootIndex, dataCodec)
 		out = append(out, r)
@@ -412,6 +417,34 @@ func (r *Reader) fetchBlock(region bcfile.BlockRegion, codec string) ([]byte, er
 		r.cache.Put(r.cacheKey, region.Offset, raw)
 	}
 	return raw, nil
+}
+
+func (r *Reader) fetchDataBlock(
+	region bcfile.BlockRegion,
+	codec string,
+) ([]byte, error) {
+	if err := bcfile.ValidateBlockRegion(region, r.bc.DataRegionEnd()); err != nil {
+		return nil, err
+	}
+	// Java-produced RFiles can omit the optional DataIndex block list.
+	// When present, require an exact tuple match; when absent, the
+	// data/meta boundary above remains authoritative.
+	if len(r.dataBlocks) > 0 {
+		declared := false
+		for _, candidate := range r.dataBlocks {
+			if candidate == region {
+				declared = true
+				break
+			}
+		}
+		if !declared {
+			return nil, fmt.Errorf(
+				"rfile: block region is not declared by BCFile.index: offset=%d compressed=%d raw=%d",
+				region.Offset, region.CompressedSize, region.RawSize,
+			)
+		}
+	}
+	return r.fetchBlock(region, codec)
 }
 
 // loadBlockMeta returns the parsed RFile.blockmeta meta-block if the
@@ -503,6 +536,7 @@ func (r *Reader) loadDataCodec() (string, error) {
 	if err := validateDataRegions(di.Blocks, r.bc.DataRegionEnd()); err != nil {
 		return "", err
 	}
+	r.dataBlocks = append([]bcfile.BlockRegion(nil), di.Blocks...)
 	return di.DefaultCompression, nil
 }
 
@@ -786,7 +820,7 @@ func (r *Reader) collectLeaves() ([]*index.IndexEntry, error) {
 // decompresses, opens a relkey.Reader over it. Stores in r.currentBlk.
 func (r *Reader) openLeaf(i int) error {
 	leaf := r.leaves[i]
-	raw, err := r.fetchBlock(bcfile.BlockRegion{
+	raw, err := r.fetchDataBlock(bcfile.BlockRegion{
 		Offset:         leaf.Offset,
 		CompressedSize: leaf.CompressedSize,
 		RawSize:        leaf.RawSize,
