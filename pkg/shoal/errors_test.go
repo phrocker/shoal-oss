@@ -27,6 +27,18 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
+type nonComparableCycleError struct {
+	values []string
+}
+
+func (e nonComparableCycleError) Error() string {
+	return "cycle"
+}
+
+func (e nonComparableCycleError) Unwrap() error {
+	return e
+}
+
 func TestErrorCodeSurvivesWrapping(t *testing.T) {
 	cause := errors.New("backend unavailable")
 	err := shoal.WrapError(shoal.ErrorUnavailable, "knowledge store unavailable", cause)
@@ -72,5 +84,13 @@ func TestIsErrorCodeRejectsTypedNilError(t *testing.T) {
 
 	if shoal.IsErrorCode(err, shoal.ErrorInternal) {
 		t.Fatal("typed-nil error unexpectedly matched")
+	}
+}
+
+func TestIsErrorCodeStopsAtNonComparableValueCycle(t *testing.T) {
+	err := nonComparableCycleError{values: []string{"cycle"}}
+
+	if shoal.IsErrorCode(err, shoal.ErrorInternal) {
+		t.Fatal("cyclic error unexpectedly matched")
 	}
 }

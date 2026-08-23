@@ -45,6 +45,8 @@ type Error struct {
 	cause   error
 }
 
+const maxErrorTraversalNodes = 10_000
+
 // NewError constructs a public error without an underlying cause.
 func NewError(code ErrorCode, message string) *Error {
 	return &Error{Code: code, Message: message}
@@ -77,12 +79,17 @@ func IsErrorCode(err error, code ErrorCode) bool {
 	pending := []error{err}
 	seenComparable := make(map[error]struct{})
 	seenReference := make(map[errorReference]struct{})
+	visited := 0
 	for len(pending) > 0 {
+		if visited >= maxErrorTraversalNodes {
+			return false
+		}
 		current := pending[len(pending)-1]
 		pending = pending[:len(pending)-1]
 		if current == nil {
 			continue
 		}
+		visited++
 		if errorAlreadyVisited(current, seenComparable, seenReference) {
 			continue
 		}
