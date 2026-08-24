@@ -766,8 +766,8 @@ func bindClientOptionsWithDialContextSource(source *dialContextSource, options h
 }
 
 func bindClientOptionsWithContextSource(ctxSource func() context.Context, options hdfsclient.ClientOptions) hdfsclient.ClientOptions {
-	options.NamenodeDialFunc = bindDialContextWithSource(ctxSource, options.NamenodeDialFunc)
-	options.DatanodeDialFunc = bindDialContextWithSource(ctxSource, options.DatanodeDialFunc)
+	options.NamenodeDialFunc = bindOperationDialContext(ctxSource, options.NamenodeDialFunc)
+	options.DatanodeDialFunc = bindOperationDialContext(ctxSource, options.DatanodeDialFunc)
 	return options
 }
 
@@ -788,12 +788,36 @@ func bindDialContextWithSource(ctxSource func() context.Context, dial func(conte
 			release()
 			return nil, err
 		}
-		conn = bindConnContext(effectiveCtx, conn, release)
 		if err := applyCombinedConnDeadline(conn, requestCtx, ctxSource); err != nil {
 			release()
 			_ = conn.Close()
 			return nil, err
 		}
+		return bindConnContext(effectiveCtx, conn, release), nil
+	}
+}
+
+func bindOperationDialContext(ctxSource func() context.Context, dial func(context.Context, string, string) (net.Conn, error)) func(context.Context, string, string) (net.Conn, error) {
+	if dial == nil {
+		dial = (&net.Dialer{}).DialContext
+	}
+	return func(requestCtx context.Context, network, addr string) (net.Conn, error) {
+		effectiveCtx, release := combineDialContexts(requestCtx, ctxSource())
+		conn, err := dial(effectiveCtx, network, addr)
+		if err != nil {
+			release()
+			return nil, err
+		}
+		if err := applyCombinedConnDeadline(conn, requestCtx, ctxSource); err != nil {
+			release()
+			_ = conn.Close()
+			return nil, err
+		}
+		// The context bounds this dial. RPC and file-read methods install
+		// their own request contexts after connection establishment, so
+		// retaining this dial context on the reusable connection would let
+		// connection recycling cancel the whole operation.
+		release()
 		return conn, nil
 	}
 }

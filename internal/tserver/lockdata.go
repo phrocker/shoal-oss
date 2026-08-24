@@ -113,6 +113,8 @@ const (
 	ServiceTabletScan ThriftService = "TABLET_SCAN"
 	// ServiceTabletServer is the legacy combined tablet-server endpoint.
 	ServiceTabletServer ThriftService = "TSERV"
+	// ServiceCompactor is the coordinator-facing external compactor endpoint.
+	ServiceCompactor ThriftService = "COMPACTOR"
 )
 
 // thriftServiceOrder is the declaration order of ServiceLockData.ThriftService.
@@ -339,6 +341,33 @@ func TabletServerLockData(serverUUID, address, group string, services ...ThriftS
 		return ServiceLockData{}, fmt.Errorf("%w: a tablet server must advertise %s, which the manager reads off every lock in the tree",
 			ErrInvalidLockData, ServiceTabletServer)
 	}
+	if err := data.Validate(); err != nil {
+		return ServiceLockData{}, err
+	}
+	return data, nil
+}
+
+// CompactorLockData builds the payload an external compactor publishes under
+// <instance>/compactors/<group>/<address>. Accumulo compactors expose both
+// ClientService and CompactorService on the same Thrift listener.
+func CompactorLockData(serverUUID, address, group string) (ServiceLockData, error) {
+	if group == "" {
+		group = DefaultResourceGroup
+	}
+	data := ServiceLockData{Descriptors: []ServiceDescriptor{
+		{
+			UUID:    serverUUID,
+			Service: ServiceClient,
+			Address: address,
+			Group:   group,
+		},
+		{
+			UUID:    serverUUID,
+			Service: ServiceCompactor,
+			Address: address,
+			Group:   group,
+		},
+	}}
 	if err := data.Validate(); err != nil {
 		return ServiceLockData{}, err
 	}

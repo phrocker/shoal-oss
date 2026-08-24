@@ -196,6 +196,8 @@ services:
       - zookeeper:2181
       - -instance
       - shoal
+      - -instance-secret
+      - shoal-test-instance-secret
       - -accumulo-version
       - 4.0.0-SNAPSHOT
       - -password

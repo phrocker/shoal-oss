@@ -374,7 +374,14 @@ func ReadAll(ctx context.Context, b Backend, path string) ([]byte, error) {
 		}
 		readOff := off
 		end := min(off+transferChunkSize, size)
-		n, err := f.ReadAt(buf[off:end], off)
+		var n int
+		if contextual, ok := f.(interface {
+			ReadAtContext(context.Context, []byte, int64) (int, error)
+		}); ok {
+			n, err = contextual.ReadAtContext(ctx, buf[off:end], off)
+		} else {
+			n, err = f.ReadAt(buf[off:end], off)
+		}
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return nil, fmt.Errorf("readall: read %s off=%d: %w", path, readOff, joinContextCallError(err, ctxErr))
 		}

@@ -274,11 +274,17 @@ func (w *worker) process(
 	if err != nil {
 		w.metrics.failed.Add(1)
 		if errors.Is(err, context.Canceled) {
-			w.metrics.cancelled.Add(1)
 			if coordinatorCancelled.Load() {
+				w.metrics.cancelled.Add(1)
 				return jobOutcome{coordinatorReleased: true}
 			}
-			return jobOutcome{class: compactjob.ClassShuttingDown}
+			if jobCtx.Err() != nil {
+				w.metrics.cancelled.Add(1)
+				return jobOutcome{class: compactjob.ClassShuttingDown}
+			}
+			w.logger.Error("compaction execution returned cancellation while job context remained active",
+				slog.String("ecid", plan.ECID), slog.String("err", err.Error()))
+			return jobOutcome{class: compactjob.ClassExecutionFailed}
 		}
 		w.logger.Error("compaction execution failed",
 			slog.String("ecid", plan.ECID), slog.String("err", err.Error()))

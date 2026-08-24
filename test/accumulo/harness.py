@@ -19,6 +19,7 @@ COMPOSE_FILE = HARNESS / "docker-compose.yml"
 PROJECT = "shoal-accumulo4-test"
 SHOAL_TSERVER = "shoal-tserver"
 SHOAL_COMPACTOR = "shoal-compactor"
+NATIVE_TSERVER = "tserver"
 LIVE_DIR = HARNESS / ".live"
 SYSTEM_TOKEN_FILE = LIVE_DIR / "system-token"
 ACCUMULO_REVISION = "1a716b2c1bb5762ead4b46d2bc4f53e13873b314"
@@ -232,6 +233,18 @@ def run(command: list[str], *, check: bool = True) -> subprocess.CompletedProces
     return subprocess.run(command, text=True, check=check)
 
 
+def run_compactor_smoke() -> None:
+    timeout = int(os.environ.get("SHOAL_ACCUMULO_COMPACTOR_TIMEOUT", "600"))
+    command = client_command("compactor")
+    print("+", subprocess.list2cmdline(command), flush=True)
+    try:
+        subprocess.run(command, text=True, check=True, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"compactor smoke did not complete within {timeout} seconds"
+        ) from exc
+
+
 def wait_ready() -> None:
     timeout = int(os.environ.get("SHOAL_ACCUMULO_READY_TIMEOUT", "300"))
     deadline = time.monotonic() + timeout
@@ -381,11 +394,14 @@ def _run_tserver_role() -> None:
 
 def _run_compactor_role() -> None:
     _start_role_base()
-    run(compose_services(SHOAL_TSERVER, SHOAL_COMPACTOR))
-    _wait_mode("shoal-ready")
-    run(client_command("compactor"))
+    # Keep this gate focused on the Shoal compactor. A native tablet server
+    # supplies Accumulo's independent metadata-driven job-planning surface;
+    # the Shoal tablet-server path has its own live role gate.
+    run(compose_services(NATIVE_TSERVER, SHOAL_COMPACTOR))
+    _wait_mode("ready")
+    run_compactor_smoke()
     run(compose_command("restart", SHOAL_COMPACTOR))
-    run(client_command("compactor"))
+    run_compactor_smoke()
     print(
         "SHOAL_EVIDENCE compactor=pass publication=verified completion=verified "
         "java-readable=verified promotion-equivalence=verified "
@@ -407,7 +423,10 @@ def role_run(role: str) -> None:
         succeeded = True
     finally:
         if not succeeded:
-            run(compose_command("logs", "--no-color"), check=False)
+            run(
+                compose_command("--profile", "shoal", "logs", "--no-color"),
+                check=False,
+            )
         down()
 
 

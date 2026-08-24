@@ -126,6 +126,7 @@ import (
 	"github.com/phrocker/shoal-oss/internal/thrift/gen/tabletserver"
 	"github.com/phrocker/shoal-oss/internal/tlsserver"
 	"github.com/phrocker/shoal-oss/internal/transportpool"
+	"github.com/phrocker/shoal-oss/internal/tserver"
 	"github.com/phrocker/shoal-oss/internal/zk"
 )
 
@@ -148,6 +149,7 @@ func main() {
 	coordinatorAddr := flag.String("coordinator", "", "host:port override for the manager's CompactionCoordinator. Default (empty): discover it from the manager's ServiceLock data in /accumulo/<uuid>/managers/lock (ThriftService.COORDINATOR) and re-resolve it across manager failover.")
 	zkServers := flag.String("zk", "", "comma-separated ZK quorum")
 	instanceName := flag.String("instance", "accumulo", "Accumulo instance name")
+	instanceSecret := flag.String("instance-secret", "", "ZooKeeper instance secret (prefer ACCUMULO_INSTANCE_SECRET)")
 	accVersion := flag.String("accumulo-version", "4.0.0-SNAPSHOT", "server major.minor must match")
 	user := flag.String("user", "root", "principal for the coordinator RPC (root-equivalent — same trust path Java compactor uses)")
 	password := flag.String("password", "", "password (prefer SHOAL_PASSWORD env)")
@@ -190,6 +192,9 @@ func main() {
 	if *password == "" {
 		*password = os.Getenv("SHOAL_PASSWORD")
 	}
+	if *instanceSecret == "" {
+		*instanceSecret = os.Getenv("ACCUMULO_INSTANCE_SECRET")
+	}
 	if *tlsCert == "" {
 		*tlsCert = os.Getenv("SHOAL_TLS_CERT")
 	}
@@ -201,6 +206,9 @@ func main() {
 	}
 	if *password == "" {
 		die("shoal-compactor: password required (-password or SHOAL_PASSWORD env)")
+	}
+	if *instanceSecret == "" {
+		die("shoal-compactor: instance secret required (-instance-secret or ACCUMULO_INSTANCE_SECRET env)")
 	}
 	if *releaseTimeout <= 0 {
 		die("shoal-compactor: -release-timeout must be positive (a job shoal accepted has to be released)")
@@ -245,7 +253,7 @@ func main() {
 	)
 
 	servers := strings.Split(*zkServers, ",")
-	loc, err := zk.New(servers, *instanceName, *zkTimeout)
+	loc, err := zk.NewWithAuth(servers, *instanceName, *zkTimeout, *instanceSecret)
 	if err != nil {
 		die("shoal-compactor: zk.New: %v", err)
 	}
@@ -254,11 +262,9 @@ func main() {
 
 	creds := cred.NewPasswordCreds(*user, *password, loc.InstanceID())
 
-	storageCtx, storageCancel := context.WithTimeout(context.Background(), 30*time.Second)
-	hdfsBackend, err := hdfs.NewContext(storageCtx, *hdfsNamenode)
-	storageCancel()
+	hdfsBackend, err := hdfs.New(*hdfsNamenode)
 	if err != nil {
-		die("shoal-compactor: hdfs.NewContext: %v", err)
+		die("shoal-compactor: hdfs.New: %v", err)
 	}
 	defer hdfsBackend.Close()
 
@@ -367,6 +373,45 @@ func main() {
 		}()
 	}
 
+	sharedSession, err := loc.SharedSession()
+	if err != nil {
+		die("shoal-compactor: shared ZooKeeper session: %v", err)
+	}
+	lockPath, err := tserver.CompactorLockPath(loc.InstancePath(), *groupName, *advertiseAddr)
+	if err != nil {
+		die("shoal-compactor: ServiceLock path: %v", err)
+	}
+	serviceLock, err := tserver.NewServiceLock(
+		zk.LockSession{SharedSession: sharedSession},
+		tserver.ServiceLockOptions{Path: lockPath},
+	)
+	if err != nil {
+		die("shoal-compactor: ServiceLock: %v", err)
+	}
+	lockData, err := tserver.CompactorLockData(
+		serviceLock.UUID(), *advertiseAddr, *groupName,
+	)
+	if err != nil {
+		die("shoal-compactor: ServiceLock data: %v", err)
+	}
+	lockID, err := serviceLock.Acquire(ctx, lockData)
+	if err != nil {
+		die("shoal-compactor: acquire ServiceLock: %v", err)
+	}
+	logger.Info("compactor ServiceLock acquired",
+		slog.String("lock", lockID.String()),
+		slog.String("path", lockPath))
+	lockDone := make(chan error, 1)
+	go func() {
+		maintainErr := serviceLock.Maintain(ctx)
+		lockDone <- maintainErr
+		if ctx.Err() == nil {
+			logger.Error("compactor ServiceLock ended",
+				slog.Any("err", maintainErr))
+			cancel()
+		}
+	}()
+
 	stopCh := make(chan os.Signal, 1)
 	signal.Notify(stopCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
@@ -416,6 +461,13 @@ func main() {
 		},
 	})
 
+	if err := serviceLock.Release(); err != nil {
+		logger.Warn("release compactor ServiceLock", slog.String("err", err.Error()))
+	}
+	if maintainErr := <-lockDone; maintainErr != nil && ctx.Err() == nil {
+		logger.Warn("compactor ServiceLock maintenance ended",
+			slog.String("err", maintainErr.Error()))
+	}
 	metrics.accepting.Store(false)
 	metrics.ready.Store(false)
 	metrics.roleServiceReady.Store(false)

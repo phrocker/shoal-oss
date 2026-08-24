@@ -94,8 +94,10 @@ public final class AccumuloSmoke {
 
     private static void compactor(AccumuloClient client) throws Exception {
       TableOperations tables = client.tableOperations();
+      System.out.println("SHOAL_PROGRESS compactor=recreate-table");
       recreate(tables, COMPACTION_TABLE);
       for (int batch = 0; batch < 4; batch++) {
+        System.out.println("SHOAL_PROGRESS compactor=write-flush batch=" + batch);
         try (BatchWriter writer = client.createBatchWriter(COMPACTION_TABLE)) {
           for (int row = batch * 16; row < (batch + 1) * 16; row++) {
             put(writer, row);
@@ -103,15 +105,19 @@ public final class AccumuloSmoke {
         }
         tables.flush(COMPACTION_TABLE, null, null, true);
       }
+      System.out.println("SHOAL_PROGRESS compactor=verify-before");
       String before = verifyRows(client, COMPACTION_TABLE, 64);
+      System.out.println("SHOAL_PROGRESS compactor=request-waiting");
       tables.setProperty(COMPACTION_TABLE, "table.compaction.dispatcher.opts.service", "shoal");
       tables.compact(COMPACTION_TABLE, new CompactionConfig().setWait(true));
+      System.out.println("SHOAL_PROGRESS compactor=verify-after");
       String after = verifyRows(client, COMPACTION_TABLE, 64);
       if (!before.equals(after)) {
         throw new IllegalStateException("promotion changed canonical cells: "
             + before + " != " + after);
       }
       for (int batch = 0; batch < 3; batch++) {
+        System.out.println("SHOAL_PROGRESS compactor=write-history batch=" + batch);
         try (BatchWriter writer = client.createBatchWriter(COMPACTION_TABLE)) {
           for (int row = 0; row < 64; row++) {
             Mutation mutation = new Mutation(String.format("row-%04d", row));
@@ -122,8 +128,10 @@ public final class AccumuloSmoke {
         }
         tables.flush(COMPACTION_TABLE, null, null, true);
       }
+      System.out.println("SHOAL_PROGRESS compactor=request-cancel");
       tables.compact(COMPACTION_TABLE, new CompactionConfig().setWait(false));
       tables.cancelCompaction(COMPACTION_TABLE);
+      System.out.println("SHOAL_PROGRESS compactor=verify-cancel");
       String afterCancel = verifyRows(client, COMPACTION_TABLE, 64);
       if (!after.equals(afterCancel)) {
         throw new IllegalStateException("cancellation changed canonical cells: "

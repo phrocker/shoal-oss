@@ -174,6 +174,22 @@ func TestWorkerCompletesExactlyOnce(t *testing.T) {
 	}
 }
 
+func TestWorkerDoesNotTreatExecutorCancellationAsShutdown(t *testing.T) {
+	job := translatableJob(newECID())
+	exec := &fakeExecutor{err: context.Canceled}
+	config := &staticTableOptions{options: compactjob.Options{Limits: compactjob.DefaultLimits()}}
+	w := testWorker(t, config, exec, &memoryJournal{})
+
+	outcome := w.process(context.Background(), &workerCoordinator{}, job)
+	if outcome.class != compactjob.ClassExecutionFailed || outcome.coordinatorReleased {
+		t.Fatalf("outcome = %+v", outcome)
+	}
+	if w.metrics.cancelled.Load() != 0 || w.metrics.failed.Load() != 1 {
+		t.Fatalf("cancelled/failed = %d/%d, want 0/1",
+			w.metrics.cancelled.Load(), w.metrics.failed.Load())
+	}
+}
+
 func TestWorkerRefusesConfigFailureBeforeExecution(t *testing.T) {
 	job := translatableJob(newECID())
 	exec := &fakeExecutor{result: workerResult(job)}
