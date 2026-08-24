@@ -69,6 +69,9 @@ func ReadMetaIndex(r ByteAndReader) (*MetaIndex, error) {
 		if err != nil {
 			return nil, fmt.Errorf("MetaIndex entry %d: %w", i, err)
 		}
+		if _, exists := out.Entries[entry.Name]; exists {
+			return nil, fmt.Errorf("bcfile: duplicate MetaIndex entry %q", entry.Name)
+		}
 		out.Entries[entry.Name] = entry
 	}
 	return out, nil

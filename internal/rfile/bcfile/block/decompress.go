@@ -159,17 +159,14 @@ func decompressGzip(compressed []byte, rawSize int64) ([]byte, error) {
 		return nil, fmt.Errorf("block: zlib header: %w", err)
 	}
 	defer zr.Close()
-	// Pre-size the buffer so the codec doesn't append-grow. If rawSize is
-	// honest this is a single allocation.
-	out := make([]byte, 0, rawSize)
-	buf := bytes.NewBuffer(out)
-	if _, err := io.Copy(buf, io.LimitReader(zr, rawSize+1)); err != nil {
-		return nil, fmt.Errorf("block: zlib body: %w", err)
+	out := make([]byte, rawSize+1)
+	n, readErr := io.ReadFull(zr, out)
+	if readErr != nil && !errors.Is(readErr, io.EOF) && !errors.Is(readErr, io.ErrUnexpectedEOF) {
+		return nil, fmt.Errorf("block: zlib body: %w", readErr)
 	}
-	got := buf.Bytes()
-	if int64(len(got)) != rawSize {
+	if int64(n) != rawSize {
 		return nil, fmt.Errorf("%w: codec=gz got=%d rawSize=%d",
-			ErrSizeMismatch, len(got), rawSize)
+			ErrSizeMismatch, n, rawSize)
 	}
-	return got, nil
+	return out[:n:n], nil
 }
