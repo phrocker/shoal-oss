@@ -127,7 +127,7 @@ func toStatusError(err error) error {
 	}
 
 	var publicError *shoal.Error
-	if !errors.As(err, &publicError) {
+	if !errors.As(err, &publicError) || publicError == nil {
 		return status.Error(codes.Internal, "knowledge retrieval failed")
 	}
 

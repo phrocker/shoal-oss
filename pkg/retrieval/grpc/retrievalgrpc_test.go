@@ -174,6 +174,12 @@ func TestLoopbackValidationAndStableErrorCodes(t *testing.T) {
 			}
 		})
 	}
+
+	returned = nil
+	_, err := remote.Retrieve(context.Background(), retrieval.Request{Text: "query"})
+	if !shoal.IsErrorCode(err, shoal.ErrorInternal) {
+		t.Fatalf("typed nil error = %v, want internal", err)
+	}
 }
 
 func TestClientRejectsMalformedResponse(t *testing.T) {
