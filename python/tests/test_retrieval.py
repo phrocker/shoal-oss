@@ -82,18 +82,19 @@ class RetrievalTest(unittest.TestCase):
 
     def test_native_and_remote_adapters_validate_before_transport(self) -> None:
         for adapter_type in (NativeRetriever, RemoteRetriever):
-            with self.subTest(adapter=adapter_type.__name__):
-                transport = StubTransport()
-                client = adapter_type(transport)
-                with self.assertRaises(ShoalError) as raised:
-                    client.retrieve(Request(text="  "))
-                self.assertTrue(
-                    is_error_code(
-                        raised.exception,
-                        ErrorCode.INVALID_ARGUMENT,
+            for text in ("  ", "\ud800"):
+                with self.subTest(adapter=adapter_type.__name__, text=text):
+                    transport = StubTransport()
+                    client = adapter_type(transport)
+                    with self.assertRaises(ShoalError) as raised:
+                        client.retrieve(Request(text=text))
+                    self.assertTrue(
+                        is_error_code(
+                            raised.exception,
+                            ErrorCode.INVALID_ARGUMENT,
+                        )
                     )
-                )
-                self.assertEqual(transport.requests, [])
+                    self.assertEqual(transport.requests, [])
 
     def test_request_rejects_unknown_mode(self) -> None:
         request = Request(text="query", modes=["cells"])

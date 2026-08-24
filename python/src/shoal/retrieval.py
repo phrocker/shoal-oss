@@ -89,7 +89,12 @@ class Request:
     def validate(self) -> None:
         """Validate transport-independent request invariants."""
 
-        if not isinstance(self.text, str) or not self.text.strip():
+        if not _is_wire_string(self.text):
+            raise new_error(
+                ErrorCode.INVALID_ARGUMENT,
+                "retrieval text must be a valid UTF-8 string",
+            )
+        if not self.text.strip():
             raise new_error(
                 ErrorCode.INVALID_ARGUMENT,
                 "retrieval text is required",

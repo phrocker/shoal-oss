@@ -343,6 +343,175 @@ func TestServerRejectsInvalidOutgoingResponse(t *testing.T) {
 	}
 }
 
+func TestServerRejectsInvalidUTF8OutgoingResponse(t *testing.T) {
+	invalid := string([]byte{0xff})
+	tests := []struct {
+		name   string
+		mutate func(*retrieval.Response)
+	}{
+		{
+			name: "request ID",
+			mutate: func(response *retrieval.Response) {
+				response.RequestID = shoal.ID(invalid)
+			},
+		},
+		{
+			name: "result ID",
+			mutate: func(response *retrieval.Response) {
+				response.Results[0].ID = shoal.ID(invalid)
+			},
+		},
+		{
+			name: "citation document ID",
+			mutate: func(response *retrieval.Response) {
+				response.Results[0].Evidence[0].Citation.DocumentID = shoal.ID(invalid)
+			},
+		},
+		{
+			name: "citation revision ID",
+			mutate: func(response *retrieval.Response) {
+				response.Results[0].Evidence[0].Citation.RevisionID = shoal.ID(invalid)
+			},
+		},
+		{
+			name: "citation section ID",
+			mutate: func(response *retrieval.Response) {
+				response.Results[0].Evidence[0].Citation.SectionID = shoal.ID(invalid)
+			},
+		},
+		{
+			name: "citation span ID",
+			mutate: func(response *retrieval.Response) {
+				response.Results[0].Evidence[0].Citation.SpanID = shoal.ID(invalid)
+			},
+		},
+		{
+			name: "evidence quote",
+			mutate: func(response *retrieval.Response) {
+				response.Results[0].Evidence[0].Quote = invalid
+			},
+		},
+		{
+			name: "node ID",
+			mutate: func(response *retrieval.Response) {
+				path := validPublicPath()
+				path.Nodes[0].ID = shoal.ID(invalid)
+				path.Edges[0].From = shoal.ID(invalid)
+				response.Results[0].Evidence[0].Path = path
+			},
+		},
+		{
+			name: "node kind",
+			mutate: func(response *retrieval.Response) {
+				path := validPublicPath()
+				path.Nodes[0].Kind = invalid
+				response.Results[0].Evidence[0].Path = path
+			},
+		},
+		{
+			name: "node label",
+			mutate: func(response *retrieval.Response) {
+				path := validPublicPath()
+				path.Nodes[0].Labels = []string{invalid}
+				response.Results[0].Evidence[0].Path = path
+			},
+		},
+		{
+			name: "node property key",
+			mutate: func(response *retrieval.Response) {
+				path := validPublicPath()
+				path.Nodes[0].Properties = shoal.Metadata{invalid: "value"}
+				response.Results[0].Evidence[0].Path = path
+			},
+		},
+		{
+			name: "node property value",
+			mutate: func(response *retrieval.Response) {
+				path := validPublicPath()
+				path.Nodes[0].Properties = shoal.Metadata{"key": invalid}
+				response.Results[0].Evidence[0].Path = path
+			},
+		},
+		{
+			name: "edge ID",
+			mutate: func(response *retrieval.Response) {
+				path := validPublicPath()
+				path.Edges[0].ID = shoal.ID(invalid)
+				response.Results[0].Evidence[0].Path = path
+			},
+		},
+		{
+			name: "edge endpoint",
+			mutate: func(response *retrieval.Response) {
+				path := validPublicPath()
+				path.Nodes[1].ID = shoal.ID(invalid)
+				path.Edges[0].To = shoal.ID(invalid)
+				response.Results[0].Evidence[0].Path = path
+			},
+		},
+		{
+			name: "edge type",
+			mutate: func(response *retrieval.Response) {
+				path := validPublicPath()
+				path.Edges[0].Type = invalid
+				response.Results[0].Evidence[0].Path = path
+			},
+		},
+		{
+			name: "edge property key",
+			mutate: func(response *retrieval.Response) {
+				path := validPublicPath()
+				path.Edges[0].Properties = shoal.Metadata{invalid: "value"}
+				response.Results[0].Evidence[0].Path = path
+			},
+		},
+		{
+			name: "edge property value",
+			mutate: func(response *retrieval.Response) {
+				path := validPublicPath()
+				path.Edges[0].Properties = shoal.Metadata{"key": invalid}
+				response.Results[0].Evidence[0].Path = path
+			},
+		},
+		{
+			name: "explanation summary",
+			mutate: func(response *retrieval.Response) {
+				response.Results[0].Explanation = &retrieval.Explanation{Summary: invalid}
+			},
+		},
+		{
+			name: "explanation score name",
+			mutate: func(response *retrieval.Response) {
+				response.Results[0].Explanation = &retrieval.Explanation{
+					Scores: map[string]shoal.Score{invalid: 0.5},
+				}
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			response := validPublicResponse()
+			test.mutate(&response)
+			fake := fakeRetriever{retrieve: func(
+				context.Context, retrieval.Request,
+			) (retrieval.Response, error) {
+				return response, nil
+			}}
+			connection, stop := startGRPCLoopback(t, func(server *grpc.Server) {
+				retrievalgrpc.RegisterServer(server, fake)
+			})
+			defer stop()
+
+			_, err := knowledgepb.NewKnowledgeRetrievalClient(connection).Retrieve(
+				context.Background(), &knowledgepb.RetrieveRequest{Text: "query"})
+			if status.Code(err) != codes.Internal {
+				t.Fatalf("gRPC code = %v, want internal (error: %v)", status.Code(err), err)
+			}
+		})
+	}
+}
+
 func TestServerRejectsUnknownRequestEnum(t *testing.T) {
 	called := false
 	fake := fakeRetriever{retrieve: func(

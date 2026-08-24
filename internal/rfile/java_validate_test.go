@@ -127,15 +127,28 @@ func TestJavaValidate_NoneCodec(t *testing.T) {
 // shoal and hands it to Java's PrintInfo. Confirms our Hadoop block-
 // framed snappy encoder is bit-compatible with Hadoop's decoder.
 func TestJavaValidate_SnappyRoundtrip(t *testing.T) {
+	testJavaCodecRoundtrip(t, block.CodecSnappy)
+}
+
+func TestJavaValidate_AdditionalHadoopCodecs(t *testing.T) {
+	for _, codec := range []string{block.CodecLZ4, block.CodecZstd} {
+		t.Run(codec, func(t *testing.T) {
+			testJavaCodecRoundtrip(t, codec)
+		})
+	}
+}
+
+func testJavaCodecRoundtrip(t *testing.T, codec string) {
+	t.Helper()
 	dir := t.TempDir()
-	path := filepath.Join(dir, "shoal-snappy.rf")
-	writeFixtureRFile(t, path, 100, block.CodecSnappy)
+	path := filepath.Join(dir, "shoal-"+codec+".rf")
+	writeFixtureRFile(t, path, 100, codec)
 
 	out, err := runJavaValidator(t, path)
 	if err != nil {
-		t.Fatalf("Java validator failed (snappy): %v\nOutput:\n%s", err, out)
+		t.Fatalf("Java validator failed (%s): %v\nOutput:\n%s", codec, err, out)
 	}
-	t.Logf("Java snappy validator output (first 2KB):\n%s", truncate(out, 2048))
+	t.Logf("Java %s validator output (first 2KB):\n%s", codec, truncate(out, 2048))
 	for _, sentinel := range []string{"Locality group", "Num"} {
 		if !bytes.Contains(out, []byte(sentinel)) {
 			t.Errorf("validator output missing %q sentinel", sentinel)
