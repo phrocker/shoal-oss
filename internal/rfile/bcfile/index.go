@@ -13,6 +13,11 @@ import (
 // BCFile.DataIndex.BLOCK_NAME = "BCFile.index".
 const DataIndexBlockName = "BCFile.index"
 
+// maxMetaIndexEntries bounds decoded map growth independently of the encoded
+// MetaIndex region size. Production BCFiles use only a small set of metadata
+// blocks; this limit leaves ample extension room while bounding hostile input.
+const maxMetaIndexEntries int32 = 1 << 16
+
 // maxDataIndexBlocks bounds decoded index memory independently of the
 // compressed meta-block size. One million blocks already describes RFiles
 // far larger than practical production files while keeping the region slice
@@ -54,7 +59,11 @@ func ReadMetaIndex(r ByteAndReader) (*MetaIndex, error) {
 	if count < 0 {
 		return nil, fmt.Errorf("bcfile: negative MetaIndex count %d", count)
 	}
-	out := &MetaIndex{Entries: make(map[string]MetaIndexEntry)}
+	if count > maxMetaIndexEntries {
+		return nil, fmt.Errorf("bcfile: MetaIndex entry count %d exceeds %d-entry limit",
+			count, maxMetaIndexEntries)
+	}
+	out := &MetaIndex{Entries: make(map[string]MetaIndexEntry, int(count))}
 	for i := int32(0); i < count; i++ {
 		entry, err := readMetaIndexEntry(r)
 		if err != nil {

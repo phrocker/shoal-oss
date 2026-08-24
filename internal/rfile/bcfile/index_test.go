@@ -131,6 +131,18 @@ func TestMetaIndexMissingPrefix(t *testing.T) {
 	}
 }
 
+func TestMetaIndexRejectsExcessiveEntryCount(t *testing.T) {
+	var buf bytes.Buffer
+	if _, err := WriteVInt(byteWriterShim{w: &buf}, maxMetaIndexEntries+1); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := ReadMetaIndex(&buf)
+	if err == nil {
+		t.Fatal("ReadMetaIndex accepted excessive entry count")
+	}
+}
+
 func TestDataIndexRoundtrip(t *testing.T) {
 	want := &DataIndex{
 		DefaultCompression: "gz",
