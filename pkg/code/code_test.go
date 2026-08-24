@@ -50,6 +50,7 @@ func TestCanonicalTypedIDsAndReservedNamespaces(t *testing.T) {
 
 	for _, namespace := range []string{
 		"source", "syntax", "symbol", "external", "relationship", "ingest",
+		"parse-result",
 	} {
 		t.Run(namespace, func(t *testing.T) {
 			if _, err := codeast.NewStableID(namespace, "caller-value"); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
@@ -73,6 +74,37 @@ func TestCanonicalTypedIDsAndReservedNamespaces(t *testing.T) {
 		codeast.WithSyntaxChildren(fixture.child))
 	if otherOccurrence.ID() == fixture.root.ID() {
 		t.Fatal("distinct typed occurrences produced the same canonical ID")
+	}
+}
+
+func TestRangeContainmentRequiresConsistentCoordinates(t *testing.T) {
+	outerStart, err := codeast.NewPosition(0, 10, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	outerEnd, err := codeast.NewPosition(10, 20, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	innerStart, err := codeast.NewPosition(1, 5, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	innerEnd, err := codeast.NewPosition(2, 6, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	outer, err := codeast.NewRange(outerStart, outerEnd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inner, err := codeast.NewRange(innerStart, innerEnd)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if outer.Contains(inner) {
+		t.Fatal("range with contradictory boundary coordinates was contained")
 	}
 }
 

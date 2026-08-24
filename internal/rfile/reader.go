@@ -163,6 +163,9 @@ func Open(bc *bcfile.Reader, dec *block.Decompressor, opts ...OpenOption) (*Read
 	if err != nil {
 		return nil, fmt.Errorf("rfile: parse %q: %w", IndexMetaBlockName, err)
 	}
+	if err := validateReadableIndex(idx); err != nil {
+		return nil, err
+	}
 
 	defaultLG := pickDefaultLG(idx.Groups)
 	if defaultLG == nil {
@@ -359,6 +362,9 @@ func OpenAll(bc *bcfile.Reader, dec *block.Decompressor, opts ...OpenOption) ([]
 	if err != nil {
 		return nil, fmt.Errorf("rfile: parse %q: %w", IndexMetaBlockName, err)
 	}
+	if err := validateReadableIndex(idx); err != nil {
+		return nil, err
+	}
 	dataCodec, err := root.loadDataCodec()
 	if err != nil {
 		return nil, fmt.Errorf("rfile: load data codec: %w", err)
@@ -395,6 +401,16 @@ func OpenAll(bc *bcfile.Reader, dec *block.Decompressor, opts ...OpenOption) ([]
 		out = append(out, r)
 	}
 	return out, nil
+}
+
+func validateReadableIndex(idx *index.Reader) error {
+	if idx.VectorExtension != nil {
+		return errors.New("rfile: vector-index extensions are not supported")
+	}
+	if len(idx.SampleGroups) > 0 || idx.SamplerConfiguration != nil {
+		return errors.New("rfile: sampled files are not supported")
+	}
+	return nil
 }
 
 // fetchBlock fetches + decompresses one BCFile region, consulting the

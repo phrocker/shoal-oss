@@ -226,6 +226,14 @@ func TestClientRejectsMalformedResponse(t *testing.T) {
 				}
 			},
 		},
+		{
+			name: "unknown explanation mode",
+			mutate: func(response *knowledgepb.RetrieveResponse) {
+				response.Results[0].Explanation = &knowledgepb.Explanation{
+					Modes: []knowledgepb.RetrievalMode{knowledgepb.RetrievalMode(99)},
+				}
+			},
+		},
 	}
 
 	for _, test := range tests {
@@ -326,36 +334,6 @@ func TestServerRejectsInvalidOutgoingResponse(t *testing.T) {
 				t.Fatalf("gRPC code = %v, want internal (error: %v)", status.Code(err), err)
 			}
 		})
-	}
-}
-
-func TestUnknownResponseEnumPreservesResult(t *testing.T) {
-	response := validProtoResponse()
-	response.Results[0].Explanation = &knowledgepb.Explanation{
-		Modes: []knowledgepb.RetrievalMode{
-			knowledgepb.RetrievalMode_RETRIEVAL_MODE_LEXICAL,
-			knowledgepb.RetrievalMode(99),
-			knowledgepb.RetrievalMode_RETRIEVAL_MODE_GRAPH,
-		},
-		Summary: "future mode also contributed",
-	}
-	remote, stop := startRawLoopback(t, response)
-	defer stop()
-
-	got, err := remote.Retrieve(context.Background(), retrieval.Request{Text: "query"})
-	if err != nil {
-		t.Fatalf("Retrieve: %v", err)
-	}
-	if len(got.Results) != 1 || got.Results[0].ID != "result-1" {
-		t.Fatalf("results = %#v, want result-1", got.Results)
-	}
-	explanation := got.Results[0].Explanation
-	if explanation == nil || explanation.Summary != "future mode also contributed" {
-		t.Fatalf("explanation = %#v", explanation)
-	}
-	wantModes := []retrieval.Mode{retrieval.ModeLexical, retrieval.ModeGraph}
-	if !reflect.DeepEqual(explanation.Modes, wantModes) {
-		t.Fatalf("modes = %#v, want %#v", explanation.Modes, wantModes)
 	}
 }
 

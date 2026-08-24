@@ -27,6 +27,9 @@ from ._compat import frozen_dataclass
 from .errors import ErrorCode, ShoalError, new_error
 from .types import ID, Metadata, freeze_metadata
 
+_MAX_INT64 = (1 << 63) - 1
+_MAX_INT32 = (1 << 31) - 1
+
 
 @frozen_dataclass
 class SourcePosition:
@@ -46,13 +49,20 @@ class SourceRange:
     def validate(self) -> None:
         """Validate ordering and coordinate invariants."""
 
+        coordinates = (
+            ("start offset", self.start.offset, _MAX_INT64),
+            ("end offset", self.end.offset, _MAX_INT64),
+            ("start page", self.start.page, _MAX_INT32),
+            ("end page", self.end.page, _MAX_INT32),
+        )
+        for name, value, maximum in coordinates:
+            if type(value) is not int or value < 0 or value > maximum:
+                raise new_error(
+                    ErrorCode.INVALID_ARGUMENT,
+                    f"{name} must be an in-range integer",
+                )
         if self.start.offset < 0 or self.end.offset < self.start.offset:
             raise new_error(ErrorCode.INVALID_ARGUMENT, "invalid source offsets")
-        if self.start.page < 0 or self.end.page < 0:
-            raise new_error(
-                ErrorCode.INVALID_ARGUMENT,
-                "source pages cannot be negative",
-            )
         if (
             self.start.page > 0
             and self.end.page > 0

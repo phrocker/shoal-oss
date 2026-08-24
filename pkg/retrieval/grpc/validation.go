@@ -123,6 +123,13 @@ func validateProtoResponse(response *knowledgepb.RetrieveResponse) error {
 			}
 		}
 		if explanation := result.GetExplanation(); explanation != nil {
+			for modeIndex, mode := range explanation.GetModes() {
+				if _, err := modeFromProto(mode); err != nil {
+					return fmt.Errorf(
+						"result %d explanation mode %d: %w",
+						resultIndex, modeIndex, err)
+				}
+			}
 			for name, score := range explanation.GetScores() {
 				if err := validateFinite(
 					fmt.Sprintf("result %d explanation score %q", resultIndex, name),

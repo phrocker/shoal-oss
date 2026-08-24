@@ -659,6 +659,35 @@ func TestFetchDataBlockRequiresValidatedDataRegion(t *testing.T) {
 	}
 }
 
+func TestValidateReadableIndexRejectsUnverifiedExtensions(t *testing.T) {
+	tests := []struct {
+		name string
+		idx  *index.Reader
+	}{
+		{
+			name: "vector extension",
+			idx: &index.Reader{VectorExtension: &index.OpaqueExtension{
+				Kind: index.OpaqueV8VectorAndTessellation,
+			}},
+		},
+		{
+			name: "sample groups",
+			idx:  &index.Reader{SampleGroups: []*index.LocalityGroup{{}}},
+		},
+		{
+			name: "sampler configuration",
+			idx:  &index.Reader{SamplerConfiguration: &index.SamplerConfiguration{}},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if err := validateReadableIndex(test.idx); err == nil {
+				t.Fatal("expected unsupported index feature rejection")
+			}
+		})
+	}
+}
+
 func TestReader_Close_Idempotent(t *testing.T) {
 	r := openSynthetic(t, [][]cell{{mkCell("a", "1")}})
 	if err := r.Close(); err != nil {

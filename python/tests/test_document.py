@@ -91,6 +91,30 @@ class DocumentTest(unittest.TestCase):
                     )
                 )
 
+    def test_source_range_rejects_non_wire_coordinates(self) -> None:
+        invalid_ranges = (
+            SourceRange(
+                start=SourcePosition(offset=True),
+                end=SourcePosition(offset=1),
+            ),
+            SourceRange(
+                start=SourcePosition(offset=1.5),  # type: ignore[arg-type]
+                end=SourcePosition(offset=2),
+            ),
+            SourceRange(
+                start=SourcePosition(offset=0),
+                end=SourcePosition(offset=1 << 63),
+            ),
+            SourceRange(
+                start=SourcePosition(offset=0, page=1 << 31),
+                end=SourcePosition(offset=1, page=1 << 31),
+            ),
+        )
+        for source_range in invalid_ranges:
+            with self.subTest(source_range=source_range):
+                with self.assertRaises(ShoalError):
+                    source_range.validate()
+
     def test_citation_range_error_preserves_wrapped_error_semantics(
         self,
     ) -> None:

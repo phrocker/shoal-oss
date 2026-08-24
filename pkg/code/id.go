@@ -41,6 +41,7 @@ var reservedIDNamespaces = map[string]struct{}{
 	"external":     {},
 	"relationship": {},
 	"ingest":       {},
+	"parse-result": {},
 }
 
 // NewStableID deterministically derives an extension ID from length-delimited

@@ -97,8 +97,12 @@ func (r Range) Contains(inner Range) bool {
 	if r.Validate() != nil || inner.Validate() != nil {
 		return false
 	}
-	return r.start.byteOffset <= inner.start.byteOffset &&
-		inner.end.byteOffset <= r.end.byteOffset
+	startOrder, err := comparePositions(r.start, inner.start)
+	if err != nil || startOrder > 0 {
+		return false
+	}
+	endOrder, err := comparePositions(inner.end, r.end)
+	return err == nil && endOrder <= 0
 }
 
 // IsEmpty reports whether the range has no source bytes.
