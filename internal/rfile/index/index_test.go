@@ -250,6 +250,41 @@ func TestIndexBlockMultiLevelRoundtrip(t *testing.T) {
 	}
 }
 
+func TestIndexBlockRejectsInvalidOffsets(t *testing.T) {
+	tests := map[string]*IndexBlock{
+		"nonzero first": {
+			Offsets: []int32{1},
+			Data:    []byte{0, 0},
+		},
+		"duplicate": {
+			Offsets: []int32{0, 0},
+			Data:    []byte{0},
+		},
+		"decreasing": {
+			Offsets: []int32{0, 2, 1},
+			Data:    []byte{0, 0, 0},
+		},
+		"outside data": {
+			Offsets: []int32{0, 1},
+			Data:    []byte{0},
+		},
+		"data without offsets": {
+			Data: []byte{0},
+		},
+	}
+	for name, block := range tests {
+		t.Run(name, func(t *testing.T) {
+			var buf bytes.Buffer
+			if err := WriteIndexBlock(&buf, block); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := ReadIndexBlock(bytes.NewReader(buf.Bytes()), V8); err == nil {
+				t.Fatal("ReadIndexBlock accepted invalid offsets")
+			}
+		})
+	}
+}
+
 func TestIndexBlockFlatV3(t *testing.T) {
 	// v3/v4 layout: int32 size + size × IndexEntry (no level/offset/hasNext header).
 	// Build that wire form by hand, then verify ReadIndexBlock(..., V3) reads it

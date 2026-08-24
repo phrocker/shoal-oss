@@ -380,9 +380,9 @@ func OpenAll(bc *bcfile.Reader, dec *block.Decompressor, opts ...OpenOption) ([]
 
 	out := make([]*Reader, 0, len(idx.Groups))
 	for _, lg := range idx.Groups {
-		// Empty LGs (no first key) carry no cells; skip to avoid
-		// constructing a walker over an empty root.
-		if lg.NumTotalEntries == 0 || lg.RootIndex == nil {
+		// Empty roots carry no cells; skip to avoid constructing a walker
+		// over an empty index.
+		if lg.RootIndex == nil || lg.RootIndex.NumEntries() == 0 {
 			continue
 		}
 		r := &Reader{
@@ -409,6 +409,18 @@ func validateReadableIndex(idx *index.Reader) error {
 	}
 	if len(idx.SampleGroups) > 0 || idx.SamplerConfiguration != nil {
 		return errors.New("rfile: sampled files are not supported")
+	}
+	for group, lg := range idx.Groups {
+		if lg.RootIndex == nil {
+			return fmt.Errorf("rfile: locality group %d has no root index", group)
+		}
+		rootEmpty := lg.RootIndex.NumEntries() == 0
+		countEmpty := lg.NumTotalEntries == 0
+		if rootEmpty != countEmpty {
+			return fmt.Errorf(
+				"rfile: locality group %d total-entry count is inconsistent with its root index",
+				group)
+		}
 	}
 	return nil
 }

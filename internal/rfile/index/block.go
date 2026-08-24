@@ -89,6 +89,9 @@ func readMultiLevelBlock(r wire.ByteAndReader) (*IndexBlock, error) {
 	if indexSize < 0 {
 		return nil, fmt.Errorf("IndexBlock: negative indexSize %d", indexSize)
 	}
+	if err := validateIndexOffsets(offsets, indexSize); err != nil {
+		return nil, err
+	}
 	if err := validateDecodedLength(
 		"IndexBlock data", indexSize, r, maxIndexDataBytes, 0,
 	); err != nil {
@@ -105,6 +108,30 @@ func readMultiLevelBlock(r wire.ByteAndReader) (*IndexBlock, error) {
 		Offsets: offsets,
 		Data:    data,
 	}, nil
+}
+
+func validateIndexOffsets(offsets []int32, indexSize int32) error {
+	if len(offsets) == 0 {
+		if indexSize != 0 {
+			return fmt.Errorf("IndexBlock: %d data bytes have no offsets", indexSize)
+		}
+		return nil
+	}
+	if offsets[0] != 0 {
+		return fmt.Errorf("IndexBlock: first offset %d is not zero", offsets[0])
+	}
+	for i, offset := range offsets {
+		if offset < 0 || offset >= indexSize {
+			return fmt.Errorf(
+				"IndexBlock: offset[%d]=%d is outside [0,%d)", i, offset, indexSize)
+		}
+		if i > 0 && offset <= offsets[i-1] {
+			return fmt.Errorf(
+				"IndexBlock: offset[%d]=%d is not greater than offset[%d]=%d",
+				i, offset, i-1, offsets[i-1])
+		}
+	}
+	return nil
 }
 
 // readFlatBlock handles the v3/v4 layout: int32 size + size × IndexEntry.

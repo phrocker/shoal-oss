@@ -688,6 +688,29 @@ func TestValidateReadableIndexRejectsUnverifiedExtensions(t *testing.T) {
 	}
 }
 
+func TestValidateReadableIndexRejectsEntryCountRootMismatch(t *testing.T) {
+	tests := map[string]*index.LocalityGroup{
+		"zero count with nonempty root": {
+			NumTotalEntries: 0,
+			RootIndex:       &index.IndexBlock{Offsets: []int32{0}},
+		},
+		"positive count with empty root": {
+			NumTotalEntries: 1,
+			RootIndex:       &index.IndexBlock{},
+		},
+	}
+	for name, group := range tests {
+		t.Run(name, func(t *testing.T) {
+			err := validateReadableIndex(&index.Reader{
+				Groups: []*index.LocalityGroup{group},
+			})
+			if err == nil || !strings.Contains(err.Error(), "inconsistent with its root index") {
+				t.Fatalf("validateReadableIndex() = %v, want count/root mismatch", err)
+			}
+		})
+	}
+}
+
 func TestReader_Close_Idempotent(t *testing.T) {
 	r := openSynthetic(t, [][]cell{{mkCell("a", "1")}})
 	if err := r.Close(); err != nil {
