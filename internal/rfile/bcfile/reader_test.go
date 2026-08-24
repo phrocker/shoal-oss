@@ -179,6 +179,27 @@ func TestReaderRejectsMetaBlockInsideMetaIndex(t *testing.T) {
 	}
 }
 
+func TestReaderRejectsOverlappingMetaBlocks(t *testing.T) {
+	mi := &MetaIndex{Entries: map[string]MetaIndexEntry{
+		DataIndexBlockName: {
+			Name:            DataIndexBlockName,
+			CompressionAlgo: "none",
+			Region:          BlockRegion{Offset: 10, CompressedSize: 20, RawSize: 20},
+		},
+		"RFile.index": {
+			Name:            "RFile.index",
+			CompressionAlgo: "none",
+			Region:          BlockRegion{Offset: 20, CompressedSize: 20, RawSize: 20},
+		},
+	}}
+	bs, _ := buildSyntheticBCFile(t, mi, bytes.Repeat([]byte{0x42}, 50), 0)
+
+	_, err := NewReader(bytes.NewReader(bs), int64(len(bs)))
+	if err == nil || !strings.Contains(err.Error(), "overlap") {
+		t.Fatalf("NewReader overlapping metadata error = %v, want overlap rejection", err)
+	}
+}
+
 func TestReader_RawBlockReturnsExactBytes(t *testing.T) {
 	dataBlock := []byte("hello, bcfile data block")
 	mi := &MetaIndex{Entries: map[string]MetaIndexEntry{

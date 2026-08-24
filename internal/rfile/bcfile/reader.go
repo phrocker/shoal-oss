@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sort"
 )
 
 const maxMetaIndexRegionSize int64 = 64 * 1024 * 1024
@@ -76,8 +77,33 @@ func NewReader(src io.ReaderAt, fileLength int64) (*Reader, error) {
 			return nil, fmt.Errorf("bcfile: MetaIndex entry %q: %w", name, err)
 		}
 	}
+	if err := validateMetaIndexRegions(mi); err != nil {
+		return nil, err
+	}
 	r.metaIndex = mi
 	return r, nil
+}
+
+func validateMetaIndexRegions(mi *MetaIndex) error {
+	entries := make([]MetaIndexEntry, 0, len(mi.Entries))
+	for _, entry := range mi.Entries {
+		entries = append(entries, entry)
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].Region.Offset != entries[j].Region.Offset {
+			return entries[i].Region.Offset < entries[j].Region.Offset
+		}
+		return entries[i].Name < entries[j].Name
+	})
+	for i := 1; i < len(entries); i++ {
+		previous := entries[i-1]
+		current := entries[i]
+		if current.Region.Offset < previous.Region.Offset+previous.Region.CompressedSize {
+			return fmt.Errorf("bcfile: MetaIndex entries %q and %q overlap",
+				previous.Name, current.Name)
+		}
+	}
+	return nil
 }
 
 // Footer returns the parsed BCFile trailer.
