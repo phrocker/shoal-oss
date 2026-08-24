@@ -84,6 +84,34 @@ func TestEntries_AtBoundsError(t *testing.T) {
 	}
 }
 
+func TestEntries_AtRequiresExactDeclaredSegment(t *testing.T) {
+	entry := &IndexEntry{
+		Key: sampleKey("a"), NumEntries: 1, Offset: 1, CompressedSize: 1, RawSize: 1,
+	}
+	var encoded bytes.Buffer
+	if err := WriteIndexEntry(&encoded, entry); err != nil {
+		t.Fatal(err)
+	}
+
+	tests := map[string]*IndexBlock{
+		"trailing bytes": {
+			Offsets: []int32{0},
+			Data:    append(append([]byte(nil), encoded.Bytes()...), 0),
+		},
+		"entry crosses next offset": {
+			Offsets: []int32{0, int32(encoded.Len() - 1)},
+			Data:    append(append([]byte(nil), encoded.Bytes()...), encoded.Bytes()...),
+		},
+	}
+	for name, block := range tests {
+		t.Run(name, func(t *testing.T) {
+			if _, err := EntriesOf(block).At(0); err == nil {
+				t.Fatal("At accepted an entry outside its exact declared segment")
+			}
+		})
+	}
+}
+
 func TestEntries_NilBlock(t *testing.T) {
 	view := EntriesOf(nil)
 	if view.Len() != 0 {

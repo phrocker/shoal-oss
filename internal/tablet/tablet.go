@@ -35,6 +35,8 @@ package tablet
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -43,6 +45,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -1160,16 +1163,22 @@ func (t *Tablet) RegisterImmutableFiles(paths []string) (int, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	active := append([]string(nil), t.files...)
-	seen := make(map[string]struct{}, len(active)+len(paths))
+	seen := make(map[string]string, len(active)+len(paths))
 	for _, path := range active {
-		seen[path] = struct{}{}
+		seen[immutableFileIdentity(path)] = path
 	}
 	for _, path := range paths {
-		if _, ok := seen[path]; ok {
+		identity := immutableFileIdentity(path)
+		if existing, ok := seen[identity]; ok {
+			if existing != path {
+				if err := removeObject(t.backend, path); err != nil {
+					return 0, fmt.Errorf("tablet: remove redundant immutable file %s: %w", path, err)
+				}
+			}
 			continue
 		}
 		active = append(active, path)
-		seen[path] = struct{}{}
+		seen[identity] = path
 		delete(t.obsolete, filepath.Base(path))
 	}
 	sort.Strings(active)
@@ -1178,6 +1187,26 @@ func (t *Tablet) RegisterImmutableFiles(paths []string) (int, error) {
 	}
 	t.files = active
 	return len(t.files), nil
+}
+
+func immutableFileIdentity(path string) string {
+	const importPrefix = ".shoal-import-"
+	name := filepath.Base(path)
+	if !strings.HasPrefix(name, importPrefix) {
+		return path
+	}
+	encoded := strings.TrimPrefix(name, importPrefix)
+	if len(encoded) < sha256.Size*2 {
+		return path
+	}
+	digest := encoded[:sha256.Size*2]
+	if _, err := hex.DecodeString(digest); err != nil {
+		return path
+	}
+	if len(encoded) == len(digest) || encoded[len(digest)] != '-' && encoded[len(digest)] != '.' {
+		return path
+	}
+	return importPrefix + strings.ToLower(digest) + filepath.Ext(name)
 }
 
 func removeObject(b storage.Backend, path string) error {

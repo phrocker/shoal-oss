@@ -33,33 +33,47 @@ func (e *Entries) Len() int {
 // the preserved Data bytes — repeated calls re-decode, so callers
 // hot-pathing the same index should hold onto the result.
 func (e *Entries) At(i int) (*IndexEntry, error) {
-	if i < 0 || i >= e.Len() {
-		return nil, fmt.Errorf("Entries.At: index %d out of range [0, %d)", i, e.Len())
+	segment, err := e.segment(i, "At")
+	if err != nil {
+		return nil, err
 	}
-	start := int(e.block.Offsets[i])
-	if start < 0 || start > len(e.block.Data) {
-		return nil, fmt.Errorf("Entries.At: offset %d out of range [0, %d]", start, len(e.block.Data))
+	r := bytes.NewReader(segment)
+	entry, err := ReadIndexEntry(r)
+	if err != nil {
+		return nil, err
 	}
-	// We don't slice with an explicit end — ReadIndexEntry consumes
-	// exactly the bytes one entry occupies, so giving it the tail
-	// slice is fine. If readers ever start needing the end position
-	// (for sub-slicing into a separate buffer), we can compute it
-	// from Offsets[i+1] / len(Data).
-	r := bytes.NewReader(e.block.Data[start:])
-	return ReadIndexEntry(r)
+	if r.Len() != 0 {
+		return nil, fmt.Errorf(
+			"Entries.At: entry %d left %d bytes in its declared segment", i, r.Len())
+	}
+	return entry, nil
 }
 
 // KeyAt is a perf-oriented helper for binary search: only reads the
 // Key portion of entry i, skipping the entries/offsets/sizes tail.
 // Equivalent to At(i).Key but ~2× faster for typical key sizes.
 func (e *Entries) KeyAt(i int) (*wire.Key, error) {
+	segment, err := e.segment(i, "KeyAt")
+	if err != nil {
+		return nil, err
+	}
+	return wire.ReadKey(bytes.NewReader(segment))
+}
+
+func (e *Entries) segment(i int, operation string) ([]byte, error) {
 	if i < 0 || i >= e.Len() {
-		return nil, fmt.Errorf("Entries.KeyAt: index %d out of range [0, %d)", i, e.Len())
+		return nil, fmt.Errorf(
+			"Entries.%s: index %d out of range [0, %d)", operation, i, e.Len())
 	}
 	start := int(e.block.Offsets[i])
-	if start < 0 || start > len(e.block.Data) {
-		return nil, fmt.Errorf("Entries.KeyAt: offset %d out of range [0, %d]", start, len(e.block.Data))
+	end := len(e.block.Data)
+	if i+1 < e.Len() {
+		end = int(e.block.Offsets[i+1])
 	}
-	r := bytes.NewReader(e.block.Data[start:])
-	return wire.ReadKey(r)
+	if start < 0 || start > end || end > len(e.block.Data) {
+		return nil, fmt.Errorf(
+			"Entries.%s: segment [%d,%d) out of range [0,%d]",
+			operation, start, end, len(e.block.Data))
+	}
+	return e.block.Data[start:end], nil
 }

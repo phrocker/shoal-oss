@@ -3,6 +3,7 @@ package engine
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
@@ -768,9 +769,6 @@ func validateRFileSnapshot(
 			_ = reader.Close()
 		}
 	}()
-	if len(readers) == 0 {
-		return "", fmt.Errorf("RFile has no readable locality groups")
-	}
 	for group, reader := range readers {
 		if err := reader.Seek(nil); err != nil {
 			return "", fmt.Errorf("seek locality group %d: %w", group, err)
@@ -953,37 +951,65 @@ func stageVerifiedImportFiles(
 			storage.ErrReadOnly)
 	}
 	staged := append([]RFileExportFile(nil), files...)
+	created := make([]string, 0, len(staged))
 	for i := range staged {
 		sourcePath := staged[i].DestinationPath
 		extension := filepath.Ext(sourcePath)
+		var nonce [16]byte
+		if _, err := rand.Read(nonce[:]); err != nil {
+			return nil, cleanupFailedStagedImports(ctx, b, created,
+				fmt.Errorf("engine: generate staged import path: %w", err))
+		}
 		stagedPath := joinBackendPath(
 			b,
 			backendParentPath(sourcePath),
-			".shoal-import-"+staged[i].SHA256+extension,
+			".shoal-import-"+staged[i].SHA256+"-"+hex.EncodeToString(nonce[:])+extension,
 		)
+		created = append(created, stagedPath)
 		written, sum, _, err := copyWithSHA256(ctx, b, sourcePath, b, stagedPath)
 		if err != nil {
-			return nil, fmt.Errorf("engine: stage verified import %s: %w", sourcePath, err)
+			return nil, cleanupFailedStagedImports(ctx, b, created,
+				fmt.Errorf("engine: stage verified import %s: %w", sourcePath, err))
 		}
 		if written != staged[i].Size || sum != staged[i].SHA256 {
-			return nil, fmt.Errorf(
+			return nil, cleanupFailedStagedImports(ctx, b, created, fmt.Errorf(
 				"engine: stage verified import %s changed after verification: size=%d sha256=%s",
 				sourcePath, written, sum,
-			)
+			))
 		}
 		storedSize, storedSum, err := hashObject(ctx, b, stagedPath)
 		if err != nil {
-			return nil, fmt.Errorf("engine: verify staged import %s: %w", stagedPath, err)
+			return nil, cleanupFailedStagedImports(ctx, b, created,
+				fmt.Errorf("engine: verify staged import %s: %w", stagedPath, err))
 		}
 		if storedSize != staged[i].Size || storedSum != staged[i].SHA256 {
-			return nil, fmt.Errorf(
+			return nil, cleanupFailedStagedImports(ctx, b, created, fmt.Errorf(
 				"engine: staged import %s does not match verified bytes: size=%d sha256=%s",
 				stagedPath, storedSize, storedSum,
-			)
+			))
 		}
 		staged[i].DestinationPath = stagedPath
 	}
 	return staged, nil
+}
+
+func cleanupFailedStagedImports(
+	ctx context.Context,
+	b storage.Backend,
+	paths []string,
+	cause error,
+) error {
+	remover, ok := b.(storage.Remover)
+	if !ok {
+		return cause
+	}
+	for _, path := range paths {
+		if err := remover.Remove(ctx, path); err != nil {
+			cause = errors.Join(cause,
+				fmt.Errorf("engine: remove failed staged import %s: %w", path, err))
+		}
+	}
+	return cause
 }
 
 func backendParentPath(path string) string {

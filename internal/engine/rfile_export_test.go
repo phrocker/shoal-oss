@@ -878,6 +878,26 @@ func TestVerifyRFileExportAcceptsRowWithinManifestTablet(t *testing.T) {
 	}
 }
 
+func TestVerifyRFileExportAcceptsEmptyRFile(t *testing.T) {
+	var data bytes.Buffer
+	writer, err := rfile.NewWriter(&data, rfile.WriterOptions{})
+	if err != nil {
+		t.Fatalf("NewWriter: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("Writer.Close: %v", err)
+	}
+
+	path := filepath.Join(t.TempDir(), "empty.rf")
+	backend := memory.New()
+	backend.Put(path, data.Bytes())
+	if err := VerifyRFileExport(
+		context.Background(), backend, exportManifestForBytes(path, data.Bytes()),
+	); err != nil {
+		t.Fatalf("VerifyRFileExport(empty RFile): %v", err)
+	}
+}
+
 func TestVerifyRFileExportPinsOneObjectSnapshot(t *testing.T) {
 	forged := forgedBCFileWithoutRFileIndex(t)
 	valid := validRFileBytes(t)
@@ -940,6 +960,37 @@ func TestStageVerifiedImportFilesRegistersExactStagedObject(t *testing.T) {
 	}
 	if size != manifest.RFiles[0].Size || sum != manifest.RFiles[0].SHA256 {
 		t.Fatalf("staged object changed with source: size=%d sha256=%s", size, sum)
+	}
+}
+
+func TestStageVerifiedImportFilesDoesNotReplaceRegisteredObjectOnMismatch(t *testing.T) {
+	valid := validRFileBytes(t)
+	path := filepath.Join(t.TempDir(), "F0001.rf")
+	manifest := exportManifestForBytes(path, valid)
+	backend := memory.New()
+	backend.Put(path, valid)
+
+	first, err := stageVerifiedImportFiles(
+		context.Background(), backend, manifest.RFiles,
+	)
+	if err != nil {
+		t.Fatalf("first stageVerifiedImportFiles: %v", err)
+	}
+	registeredPath := first[0].DestinationPath
+
+	backend.Put(path, forgedBCFileWithoutRFileIndex(t))
+	if _, err := stageVerifiedImportFiles(
+		context.Background(), backend, manifest.RFiles,
+	); err == nil || !strings.Contains(err.Error(), "changed after verification") {
+		t.Fatalf("second stageVerifiedImportFiles error = %v, want mismatch", err)
+	}
+
+	size, sum, err := hashObject(context.Background(), backend, registeredPath)
+	if err != nil {
+		t.Fatalf("hash registered object: %v", err)
+	}
+	if size != manifest.RFiles[0].Size || sum != manifest.RFiles[0].SHA256 {
+		t.Fatalf("registered object was replaced: size=%d sha256=%s", size, sum)
 	}
 }
 
