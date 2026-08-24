@@ -10,14 +10,14 @@
       "gate": "before-after-equivalence",
       "kind": "go-test",
       "reference": "internal/promotion/promote_test.go#TestPromoteEndToEndThreeTabletSuccess",
-      "source_sha256": "6b4208c43bfda159c9188fbd25a41800d8f59b4ffb4d74cc271733a55b5ddb3d",
+      "source_sha256": "a9911bf3647ed70919236e233a73a073afef42f63e4bf4baa4bbfbdec29f3933",
       "replay_command": ["go", "test", "./internal/promotion", "-run", "^TestPromoteEndToEndThreeTabletSuccess$", "-count=1"]
     },
     {
       "gate": "java-readability",
       "kind": "go-test",
       "reference": "internal/promotion/promote_test.go#TestPromoteReconcilesSplitsThenStagesThenSubmitsForMultiTabletManifest",
-      "source_sha256": "6b4208c43bfda159c9188fbd25a41800d8f59b4ffb4d74cc271733a55b5ddb3d",
+      "source_sha256": "a9911bf3647ed70919236e233a73a073afef42f63e4bf4baa4bbfbdec29f3933",
       "replay_command": ["go", "test", "./internal/promotion", "-run", "^TestPromoteReconcilesSplitsThenStagesThenSubmitsForMultiTabletManifest$", "-count=1"]
     }
   ]
