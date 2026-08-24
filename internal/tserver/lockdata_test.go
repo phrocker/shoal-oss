@@ -97,6 +97,23 @@ func TestResourceGroupGrammarMatchesAccumulo(t *testing.T) {
 	}
 }
 
+func TestCompactorLockData(t *testing.T) {
+	data, err := CompactorLockData(canonicalTestUUID, testAddress, "shoal_default")
+	if err != nil {
+		t.Fatalf("CompactorLockData: %v", err)
+	}
+	if len(data.Descriptors) != 1 {
+		t.Fatalf("descriptors = %d, want 1", len(data.Descriptors))
+	}
+	for i, service := range []ThriftService{ServiceCompactor} {
+		got := data.Descriptors[i]
+		if got.UUID != canonicalTestUUID || got.Service != service ||
+			got.Address != testAddress || got.Group != "shoal_default" {
+			t.Fatalf("descriptor[%d] = %+v", i, got)
+		}
+	}
+}
+
 // TestServiceDescriptorRefusesAGroupAccumuloWouldReject covers a resource
 // group arriving from configuration.
 //

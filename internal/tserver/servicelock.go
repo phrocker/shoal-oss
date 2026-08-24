@@ -183,6 +183,22 @@ func TabletServerLockIDPath(group, address string) (string, error) {
 	return path.Join("/", zTabletServers, group, address), nil
 }
 
+// CompactorLockPath returns the ServiceLock directory Accumulo enumerates for
+// an external compactor.
+func CompactorLockPath(instancePath, group, address string) (string, error) {
+	if group == "" {
+		group = DefaultResourceGroup
+	}
+	if !validResourceGroup(group) {
+		return "", fmt.Errorf("%w: resource group %q is not a name Accumulo reads (must match %s)",
+			ErrInvalidLockData, group, resourceGroupPattern)
+	}
+	if err := validateAdvertiseAddress(address); err != nil {
+		return "", fmt.Errorf("%w: %w", ErrInvalidLockData, err)
+	}
+	return path.Join(instancePath, "compactors", group, address), nil
+}
+
 // tabletServerLockIdentity returns the resource group and address a
 // tablet-server lock directory names — the two variable segments of
 // <instance>/tservers/<group>/<address>.

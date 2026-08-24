@@ -46,6 +46,19 @@ class HarnessTest(unittest.TestCase):
             harness.client_command("smoke")[-6:],
         )
 
+    @mock.patch.object(harness.subprocess, "run")
+    def test_compactor_smoke_has_bounded_timeout(self, run):
+        with mock.patch.dict(
+            harness.os.environ, {"SHOAL_ACCUMULO_COMPACTOR_TIMEOUT": "42"}
+        ):
+            harness.run_compactor_smoke()
+        run.assert_called_once_with(
+            harness.client_command("compactor"),
+            text=True,
+            check=True,
+            timeout=42,
+        )
+
     def test_role_commands_are_explicit_and_noninteractive(self):
         self.assertEqual(
             [
@@ -85,6 +98,21 @@ class HarnessTest(unittest.TestCase):
             check=False,
         )
         rmtree.assert_called_once_with(harness.LIVE_DIR, ignore_errors=True)
+
+    @mock.patch.object(harness, "_run_compactor_role", side_effect=RuntimeError("failed"))
+    @mock.patch.object(harness, "down")
+    @mock.patch.object(harness, "run")
+    @mock.patch.object(harness, "require_docker")
+    def test_role_failure_logs_profiled_services(
+        self, _require_docker, run, down, _role
+    ):
+        with self.assertRaisesRegex(RuntimeError, "failed"):
+            harness.role_run("compactor")
+        run.assert_called_once_with(
+            harness.compose_command("--profile", "shoal", "logs", "--no-color"),
+            check=False,
+        )
+        down.assert_called_once()
 
     def test_static_configuration_wires_production_role_scenarios(self):
         compose = harness.COMPOSE_FILE.read_text(encoding="utf-8")

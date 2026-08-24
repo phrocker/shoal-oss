@@ -59,9 +59,10 @@ kubectl apply -f deploy/k8s/tserver.yaml
 kubectl apply -f deploy/k8s/compactor.yaml
 ```
 
-The Secret is a template only. Replace `key.json` with a real GCS service-account key if not using Workload Identity / node Application Default Credentials, and replace `accumulo-password` with the metadata-walk password used by `cmd/shoal`.
-For `shoal-tserver`, also replace `accumulo-instance-secret` and
-`accumulo-system-token-base64`; never store production values in Git.
+The Secret is a template only. Replace `key.json` with a real GCS service-account key if not using Workload Identity / node Application Default Credentials, and replace `accumulo-password` with the metadata-walk password used by `cmd/shoal`, `shoal-tserver`, and `shoal-compactor`.
+Both `shoal-tserver` and `shoal-compactor` require
+`accumulo-instance-secret` and `accumulo-system-token-base64`; never store
+production values in Git.
 
 ## Deploy with Helm
 
@@ -85,6 +86,10 @@ credentials, and HDFS values before deployment. Role-level `enabled` values
 remain optional compatibility overrides; when omitted, `mode` selects the safe
 resource set above. Helm fails immediately if both Shoal-only `writeTier` and
 Accumulo `tserver` write authority are enabled.
+
+In `accumulo` mode, the Secret named by `tserver.credentialsSecretName` and
+`compactor.credentialsSecretName` must provide `accumulo-password`,
+`accumulo-instance-secret`, and `accumulo-system-token-base64`.
 
 **Not production-ready:** distributed Shoal-only write coordination remains
 limited to one writable replica. Multiple writable replicas must not be used

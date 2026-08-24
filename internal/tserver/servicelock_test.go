@@ -1587,6 +1587,16 @@ func TestTabletServerLockIDPath(t *testing.T) {
 	}
 }
 
+func TestCompactorLockPath(t *testing.T) {
+	got, err := CompactorLockPath(testInstancePath, "shoal_default", testAddress)
+	if err != nil {
+		t.Fatalf("CompactorLockPath: %v", err)
+	}
+	if want := testInstancePath + "/compactors/shoal_default/" + testAddress; got != want {
+		t.Fatalf("CompactorLockPath = %q, want %q", got, want)
+	}
+}
+
 // TestTabletServerLockPathRefusesAGroupAccumuloWouldReject covers the group
 // arriving from configuration. The path segments are cleaned when they are
 // joined, so a name with a traversal in it does not produce a rejected path —

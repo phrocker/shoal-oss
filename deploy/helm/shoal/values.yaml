@@ -127,6 +127,9 @@ tserver:
 compactor:
   enabled: null
   replicas: 2
+  # Pre-existing Secret containing accumulo-password,
+  # accumulo-instance-secret, and accumulo-system-token-base64.
+  credentialsSecretName: shoal-accumulo-write-credentials
   thriftPort: 9810
   metricsPort: 9811
   group: shoal_default

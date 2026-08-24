@@ -64,6 +64,10 @@ spec:
               valueFrom: {fieldRef: {fieldPath: status.podIP}}
             - name: SHOAL_PASSWORD
               valueFrom: {secretKeyRef: {name: shoal-object-storage-credentials, key: accumulo-password}}
+            - name: ACCUMULO_INSTANCE_SECRET
+              valueFrom: {secretKeyRef: {name: shoal-object-storage-credentials, key: accumulo-instance-secret}}
+            - name: SHOAL_SYSTEM_TOKEN_BASE64
+              valueFrom: {secretKeyRef: {name: shoal-object-storage-credentials, key: accumulo-system-token-base64}}
           ports:
             - {name: thrift, containerPort: 9810}
             - {name: metrics, containerPort: 9811}

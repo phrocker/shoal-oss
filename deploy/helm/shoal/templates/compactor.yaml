@@ -60,7 +60,9 @@ spec:
           env:
             - {name: POD_NAME, valueFrom: {fieldRef: {fieldPath: metadata.name}}}
             - {name: POD_NAMESPACE, valueFrom: {fieldRef: {fieldPath: metadata.namespace}}}
-            - {name: SHOAL_PASSWORD, valueFrom: {secretKeyRef: {name: {{ .Values.objectStorage.credentialsSecretName }}, key: accumulo-password}}}
+            - {name: SHOAL_PASSWORD, valueFrom: {secretKeyRef: {name: {{ .Values.compactor.credentialsSecretName }}, key: accumulo-password}}}
+            - {name: ACCUMULO_INSTANCE_SECRET, valueFrom: {secretKeyRef: {name: {{ .Values.compactor.credentialsSecretName }}, key: accumulo-instance-secret}}}
+            - {name: SHOAL_SYSTEM_TOKEN_BASE64, valueFrom: {secretKeyRef: {name: {{ .Values.compactor.credentialsSecretName }}, key: accumulo-system-token-base64}}}
           ports:
             - {name: thrift, containerPort: {{ .Values.compactor.thriftPort }}}
             - {name: metrics, containerPort: {{ .Values.compactor.metricsPort }}}

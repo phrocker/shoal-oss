@@ -10,7 +10,7 @@
       "gate": "service-lock-lifecycle",
       "kind": "go-test",
       "reference": "internal/tserver/servicelock_test.go#TestAcquireCreatesAnAccumuloCompatibleLockNode",
-      "source_sha256": "719739cd8a9581d98c8c6aa25a4bec76e60ca479278d115bb4da56c058a83687",
+      "source_sha256": "76a5e7b3ea9a2928f06c563276485a1795ac56f48be259e987f93c6408e768ab",
       "replay_command": ["go", "test", "./internal/tserver", "-run", "^TestAcquireCreatesAnAccumuloCompatibleLockNode$", "-count=1"]
     },
     {
