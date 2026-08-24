@@ -956,6 +956,33 @@ func TestVerifyRFileExportScansEveryLocalityGroup(t *testing.T) {
 	}
 }
 
+func TestImportRFileManifestRejectsNamedLocalityGroupData(t *testing.T) {
+	data := validMultiGroupRFileBytes(t)
+	path := filepath.Join(t.TempDir(), "F0001.rf")
+	backend := memory.New()
+	backend.Put(path, data)
+	manifest := exportManifestForBytes(path, data)
+
+	if err := VerifyRFileExport(context.Background(), backend, manifest); err != nil {
+		t.Fatalf("VerifyRFileExport(valid named locality group): %v", err)
+	}
+	dst, err := Open(filepath.Join(t.TempDir(), "dst"), Options{Backend: backend})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dst.Close()
+	err = dst.ImportRFileManifest(context.Background(), manifest)
+	if !errors.Is(err, storage.ErrImmutablePolicy) ||
+		!errors.Is(err, errNamedLocalityGroupUnsupported) {
+		t.Fatalf("ImportRFileManifest error = %v, want named locality-group policy rejection", err)
+	}
+	for _, key := range backend.Keys() {
+		if strings.Contains(filepath.Base(key), ".shoal-import-") {
+			t.Fatalf("rejected locality-group import staged object %q", key)
+		}
+	}
+}
+
 func TestVerifyRFileExportRejectsRowsOutsideManifestTablet(t *testing.T) {
 	data := validRFileBytes(t)
 	tests := []struct {

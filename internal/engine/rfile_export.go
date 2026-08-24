@@ -487,7 +487,7 @@ func verifyRFileExport(
 			return fmt.Errorf("engine: verify %s: %w", rf.DestinationPath, err)
 		}
 		if err := verifyRFileExportObject(
-			ctx, b, rf, tablets[rf.TabletIndex], snapshotFactory,
+			ctx, b, rf, tablets[rf.TabletIndex], snapshotFactory, true,
 		); err != nil {
 			return err
 		}
@@ -522,7 +522,7 @@ func verifyImmutableExport(
 		}
 		if format == storage.ImmutableFormatRFile {
 			if err := verifyRFileExportObject(
-				ctx, b, file, tablets[file.TabletIndex], snapshotFactory,
+				ctx, b, file, tablets[file.TabletIndex], snapshotFactory, false,
 			); err != nil {
 				return err
 			}
@@ -596,6 +596,7 @@ func verifyRFileExportObject(
 	rf RFileExportFile,
 	tablet RFileExportTablet,
 	snapshotFactory verificationSnapshotFactory,
+	allowNamedLocalityGroups bool,
 ) (err error) {
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("engine: verify %s: %w", rf.DestinationPath, err)
@@ -658,7 +659,9 @@ func verifyRFileExportObject(
 	}
 
 	snapshot := &verificationReaderAt{ctx: ctx, source: local}
-	version, err := validateRFileSnapshot(ctx, snapshot, size, tablet)
+	version, err := validateRFileSnapshot(
+		ctx, snapshot, size, tablet, allowNamedLocalityGroups,
+	)
 	if err != nil {
 		if readErr := snapshot.firstError(); readErr != nil {
 			return fmt.Errorf("engine: read verification snapshot for %s: %w",
@@ -666,6 +669,10 @@ func verifyRFileExportObject(
 		}
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return fmt.Errorf("engine: verify %s: %w", rf.DestinationPath, err)
+		}
+		if errors.Is(err, errNamedLocalityGroupUnsupported) {
+			return fmt.Errorf("%w: engine: verify %s: %w",
+				storage.ErrImmutablePolicy, rf.DestinationPath, err)
 		}
 		return fmt.Errorf("%w: %s is not a structurally valid RFile: %w",
 			storage.ErrImmutablePolicy, rf.DestinationPath, err)
@@ -843,6 +850,7 @@ func validateRFileSnapshot(
 	src io.ReaderAt,
 	size int64,
 	tablet RFileExportTablet,
+	allowNamedLocalityGroups bool,
 ) (string, error) {
 	bc, err := bcfile.NewReader(src, size)
 	if err != nil {
@@ -858,6 +866,12 @@ func validateRFileSnapshot(
 		}
 	}()
 	for group, reader := range readers {
+		if !allowNamedLocalityGroups && !reader.LocalityGroup().IsDefault {
+			return "", fmt.Errorf(
+				"%w: locality group %d contains data that embedded tablet scans cannot read",
+				errNamedLocalityGroupUnsupported, group,
+			)
+		}
 		if err := reader.Seek(nil); err != nil {
 			return "", fmt.Errorf("seek locality group %d: %w", group, err)
 		}
@@ -882,6 +896,10 @@ func validateRFileSnapshot(
 	}
 	return bc.Footer().Version.String(), nil
 }
+
+var errNamedLocalityGroupUnsupported = errors.New(
+	"named RFile locality groups are unsupported for embedded imports",
+)
 
 func rowBelongsToTablet(row []byte, tablet RFileExportTablet) bool {
 	if tablet.StartRow != nil && bytes.Compare(row, []byte(*tablet.StartRow)) < 0 {
