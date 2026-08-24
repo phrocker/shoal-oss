@@ -176,6 +176,36 @@ func TestReconstructEnforcesConsistency(t *testing.T) {
 		)
 		requireErrorContains(t, input, Limits{}, "outside parent")
 	})
+	t.Run("known child start page after parent", func(t *testing.T) {
+		input := testInput(
+			[]NodeRecord{
+				nodeRecordWithPages(
+					"root", documentschema.StructureSection, "", 0, 10, 20, 1, 2),
+				nodeRecordWithPages(
+					"span", documentschema.StructureSpan, "root", 1, 12, 18, 3, 0),
+			},
+			[]ChildRecord{
+				childRecord("", 0, "root"),
+				childRecord("root", 1, "span"),
+			},
+		)
+		requireErrorContains(t, input, Limits{}, "outside parent")
+	})
+	t.Run("known child end page before parent", func(t *testing.T) {
+		input := testInput(
+			[]NodeRecord{
+				nodeRecordWithPages(
+					"root", documentschema.StructureSection, "", 0, 10, 20, 2, 3),
+				nodeRecordWithPages(
+					"span", documentschema.StructureSpan, "root", 1, 12, 18, 0, 1),
+			},
+			[]ChildRecord{
+				childRecord("", 0, "root"),
+				childRecord("root", 1, "span"),
+			},
+		)
+		requireErrorContains(t, input, Limits{}, "outside parent")
+	})
 	t.Run("mixed revision", func(t *testing.T) {
 		input := minimalInput()
 		input.Children[0].Qualifier =
@@ -292,6 +322,24 @@ func nodeRecord(
 	start, end uint64,
 ) NodeRecord {
 	return nodeRecordForRevision(testRevision, id, kind, parent, order, start, end)
+}
+
+func nodeRecordWithPages(
+	id string, kind documentschema.StructureKind, parent string, order uint32,
+	start, end uint64, startPage, endPage uint32,
+) NodeRecord {
+	return NodeRecord{
+		Qualifier: documentschema.StructureNodeCQ(string(testRevision), id),
+		Value: documentschema.StructureNode{
+			Kind:        kind,
+			ParentID:    parent,
+			Order:       order,
+			StartOffset: start,
+			EndOffset:   end,
+			StartPage:   startPage,
+			EndPage:     endPage,
+		}.Encode(),
+	}
 }
 
 func nodeRecordForRevision(

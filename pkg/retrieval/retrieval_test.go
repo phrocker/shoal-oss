@@ -22,6 +22,7 @@ package retrieval_test
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/phrocker/shoal-oss/pkg/retrieval"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
@@ -52,5 +53,40 @@ func TestRequestRejectsUnknownMode(t *testing.T) {
 	request := retrieval.Request{Text: "query", Modes: []retrieval.Mode{"cells"}}
 	if err := request.Validate(); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
 		t.Fatalf("expected invalid argument, got %v", err)
+	}
+}
+
+func TestRequestRejectsInvalidUTF8(t *testing.T) {
+	tests := map[string]retrieval.Request{
+		"text": {
+			Text: string([]byte{0xff}),
+		},
+		"document ID": {
+			Text:  "query",
+			Scope: retrieval.Scope{DocumentIDs: []shoal.ID{shoal.ID(string([]byte{0xff}))}},
+		},
+		"node ID": {
+			Text:  "query",
+			Scope: retrieval.Scope{NodeIDs: []shoal.ID{shoal.ID(string([]byte{0xff}))}},
+		},
+	}
+	for name, request := range tests {
+		t.Run(name, func(t *testing.T) {
+			if err := request.Validate(); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
+				t.Fatalf("expected invalid argument, got %v", err)
+			}
+		})
+	}
+}
+
+func TestRequestRejectsAsOfOutsideProtobufRange(t *testing.T) {
+	for _, asOf := range []time.Time{
+		time.Date(0, time.December, 31, 23, 59, 59, 0, time.UTC),
+		time.Date(10000, time.January, 1, 0, 0, 0, 0, time.UTC),
+	} {
+		request := retrieval.Request{Text: "query", AsOf: asOf}
+		if err := request.Validate(); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
+			t.Fatalf("Validate() for %v = %v, want invalid argument", asOf, err)
+		}
 	}
 }

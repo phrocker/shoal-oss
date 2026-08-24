@@ -24,6 +24,7 @@ import (
 	"context"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/phrocker/shoal-oss/pkg/document"
 	"github.com/phrocker/shoal-oss/pkg/graph"
@@ -58,14 +59,36 @@ type Request struct {
 
 // Validate checks transport-independent request invariants.
 func (r Request) Validate() error {
+	if !utf8.ValidString(r.Text) {
+		return shoal.NewError(shoal.ErrorInvalidArgument, "retrieval text must be valid UTF-8")
+	}
 	if strings.TrimSpace(r.Text) == "" {
 		return shoal.NewError(shoal.ErrorInvalidArgument, "retrieval text is required")
+	}
+	for _, id := range r.Scope.DocumentIDs {
+		if !utf8.ValidString(string(id)) {
+			return shoal.NewError(
+				shoal.ErrorInvalidArgument, "retrieval document ID must be valid UTF-8")
+		}
+	}
+	for _, id := range r.Scope.NodeIDs {
+		if !utf8.ValidString(string(id)) {
+			return shoal.NewError(
+				shoal.ErrorInvalidArgument, "retrieval node ID must be valid UTF-8")
+		}
 	}
 	for _, mode := range r.Modes {
 		switch mode {
 		case ModeLexical, ModeVector, ModeTree, ModeGraph:
 		default:
 			return shoal.NewError(shoal.ErrorInvalidArgument, "unknown retrieval mode")
+		}
+	}
+	if !r.AsOf.IsZero() {
+		year := r.AsOf.UTC().Year()
+		if year < 1 || year > 9999 {
+			return shoal.NewError(
+				shoal.ErrorInvalidArgument, "retrieval as_of is outside the supported range")
 		}
 	}
 	return nil

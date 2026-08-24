@@ -354,10 +354,17 @@ func rangeContains(parent, child document.SourceRange) bool {
 	if child.Start.Offset < parent.Start.Offset || child.End.Offset > parent.End.Offset {
 		return false
 	}
-	if parent.Start.Page > 0 && child.Start.Page > 0 && child.Start.Page < parent.Start.Page {
+	return pageWithin(parent, child.Start.Page) && pageWithin(parent, child.End.Page)
+}
+
+func pageWithin(parent document.SourceRange, page int32) bool {
+	if page == 0 {
+		return true
+	}
+	if parent.Start.Page > 0 && page < parent.Start.Page {
 		return false
 	}
-	return parent.End.Page == 0 || child.End.Page == 0 || child.End.Page <= parent.End.Page
+	return parent.End.Page == 0 || page <= parent.End.Page
 }
 
 func rejectCycles(nodeList []*structuralNode, nodes map[shoal.ID]*structuralNode) error {
