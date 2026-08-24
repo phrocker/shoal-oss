@@ -45,18 +45,16 @@ func readSamplerConfiguration(r *bytes.Reader) (*SamplerConfiguration, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%w: option count: %w", ErrCorruptSamplerConfiguration, err)
 	}
-	if optionCount < 0 {
-		return nil, fmt.Errorf("%w: negative option count %d",
-			ErrCorruptSamplerConfiguration, optionCount)
-	}
 	// Every key/value pair needs at least two uint16 string lengths. Bound the
-	// allocation by the bytes still available before constructing the map.
-	if int64(optionCount)*4 > int64(r.Len()) {
-		return nil, fmt.Errorf("%w: option count %d exceeds remaining %d bytes",
-			ErrCorruptSamplerConfiguration, optionCount, r.Len())
+	// allocation by both an explicit cardinality limit and the bytes still
+	// available before constructing the map.
+	if err := validateDecodedCount(
+		"sampler options", optionCount, r, maxSamplerOptions, 4, 0,
+	); err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrCorruptSamplerConfiguration, err)
 	}
 
-	options := make(map[string]string)
+	options := make(map[string]string, optionCount)
 	for i := int32(0); i < optionCount; i++ {
 		key, err := readModifiedUTF(r)
 		if err != nil {

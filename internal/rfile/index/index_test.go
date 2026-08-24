@@ -781,6 +781,16 @@ func TestParse_V8SampleMetadataValidation(t *testing.T) {
 			},
 		},
 		{
+			name: "option count exceeds cardinality limit",
+			write: func(t *testing.T, buf *bytes.Buffer) {
+				buf.WriteByte(1)
+				writeModifiedUTF(t, buf, "Sampler")
+				optionCount := maxSamplerOptions + 1
+				wire.WriteInt32(buf, optionCount)
+				buf.Write(make([]byte, int(optionCount)*4))
+			},
+		},
+		{
 			name: "malformed modified UTF",
 			write: func(t *testing.T, buf *bytes.Buffer) {
 				buf.WriteByte(1)

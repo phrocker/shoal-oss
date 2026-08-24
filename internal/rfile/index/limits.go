@@ -8,6 +8,7 @@ const (
 	// Accumulo RFile index cardinalities.
 	maxLocalityGroups int32 = 1 << 12
 	maxColumnFamilies int32 = 1 << 16
+	maxSamplerOptions int32 = 1 << 16
 	maxIndexEntries   int32 = 1 << 20
 	maxIndexDataBytes int32 = 64 * 1024 * 1024
 )
