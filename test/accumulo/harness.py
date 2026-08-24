@@ -151,7 +151,7 @@ def validate(root: Path = ROOT) -> list[str]:
             "-accumulo-version 4.0.0-SNAPSHOT",
         ),
         "Shoal tserver ingest": (compose, "-enable-ingest"),
-        "Shoal compactor group": (compose, "- shoal_default"),
+        "Shoal compactor group": (compose, "-group shoal_default"),
     }
     for description, (text, expected) in required_text.items():
         if expected not in text:

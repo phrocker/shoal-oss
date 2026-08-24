@@ -94,6 +94,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"encoding/base64"
 	"errors"
 	"flag"
 	"fmt"
@@ -127,6 +128,7 @@ import (
 	"github.com/phrocker/shoal-oss/internal/tlsserver"
 	"github.com/phrocker/shoal-oss/internal/transportpool"
 	"github.com/phrocker/shoal-oss/internal/tserver"
+	"github.com/phrocker/shoal-oss/internal/tserverprocess"
 	"github.com/phrocker/shoal-oss/internal/zk"
 )
 
@@ -153,6 +155,9 @@ func main() {
 	accVersion := flag.String("accumulo-version", "4.0.0-SNAPSHOT", "server major.minor must match")
 	user := flag.String("user", "root", "principal for the coordinator RPC (root-equivalent — same trust path Java compactor uses)")
 	password := flag.String("password", "", "password (prefer SHOAL_PASSWORD env)")
+	systemPrincipal := flag.String("system-principal", "!SYSTEM", "manager system principal")
+	systemToken := flag.String("system-token-base64", "", "base64 system token (prefer SHOAL_SYSTEM_TOKEN_BASE64)")
+	systemTokenClass := flag.String("system-token-class", "org.apache.accumulo.server.security.SystemCredentials$SystemToken", "system token class")
 	zkTimeout := flag.Duration("zk-timeout", 30*time.Second, "ZK session timeout")
 	connectTimeout := flag.Duration("connect-timeout", cclient.DefaultConnectTimeout, "cap on the TCP handshake to the coordinator; a manager that is unreachable at the network level fails fast so the address can be re-resolved")
 	rpcTimeout := flag.Duration("rpc-timeout", cclient.DefaultRPCTimeout, "cap on each coordinator read/write; bounds getCompactionJob against a manager that accepts the connection and then goes silent (Java's general.rpc.timeout)")
@@ -195,6 +200,9 @@ func main() {
 	if *instanceSecret == "" {
 		*instanceSecret = os.Getenv("ACCUMULO_INSTANCE_SECRET")
 	}
+	if *systemToken == "" {
+		*systemToken = os.Getenv("SHOAL_SYSTEM_TOKEN_BASE64")
+	}
 	if *tlsCert == "" {
 		*tlsCert = os.Getenv("SHOAL_TLS_CERT")
 	}
@@ -209,6 +217,10 @@ func main() {
 	}
 	if *instanceSecret == "" {
 		die("shoal-compactor: instance secret required (-instance-secret or ACCUMULO_INSTANCE_SECRET env)")
+	}
+	token, decodeErr := base64.StdEncoding.DecodeString(*systemToken)
+	if decodeErr != nil || len(token) == 0 {
+		die("shoal-compactor: invalid empty -system-token-base64: %v", decodeErr)
 	}
 	if *releaseTimeout <= 0 {
 		die("shoal-compactor: -release-timeout must be positive (a job shoal accepted has to be released)")
@@ -261,6 +273,12 @@ func main() {
 	logger.Info("zk connected", slog.String("instance_id", loc.InstanceID()))
 
 	creds := cred.NewPasswordCreds(*user, *password, loc.InstanceID())
+	systemCredentials := &security.TCredentials{
+		Principal:      *systemPrincipal,
+		TokenClassName: *systemTokenClass,
+		Token:          append([]byte(nil), token...),
+		InstanceId:     loc.InstanceID(),
+	}
 
 	hdfsBackend, err := hdfs.New(*hdfsNamenode)
 	if err != nil {
@@ -292,7 +310,9 @@ func main() {
 		die("shoal-compactor: completion journal directory: %v", err)
 	}
 	metrics.journalReady.Store(true)
-	role := &compactorRole{}
+	role := &compactorRole{auth: tserverprocess.ExactAuthenticator{
+		Identities: []*security.TCredentials{creds, systemCredentials},
+	}}
 	jobWorker := &worker{
 		logger:         logger,
 		creds:          creds,
@@ -348,6 +368,9 @@ func main() {
 		transportFactory,
 		protocol.NewServerFactory(loc.InstanceID(), *accVersion),
 	)
+	if err := roleServer.Listen(); err != nil {
+		die("shoal-compactor: listen CompactorService %s: %v", *listenAddr, err)
+	}
 	roleDone := make(chan error, 1)
 	go func() {
 		err := roleServer.Serve()

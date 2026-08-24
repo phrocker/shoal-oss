@@ -5,10 +5,14 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/phrocker/shoal-oss/internal/thrift/gen/client"
+	clientgen "github.com/phrocker/shoal-oss/internal/thrift/gen/client"
 	"github.com/phrocker/shoal-oss/internal/thrift/gen/security"
 	"github.com/phrocker/shoal-oss/internal/thrift/gen/tabletserver"
 )
+
+type credentialAuthenticator interface {
+	Authenticate(context.Context, *security.TCredentials) error
+}
 
 // compactorRole is the coordinator-facing CompactorService state for the
 // single job this worker executes at a time.
@@ -17,6 +21,24 @@ type compactorRole struct {
 	job       *tabletserver.TExternalCompactionJob
 	cancel    context.CancelFunc
 	cancelled *atomic.Bool
+	auth      credentialAuthenticator
+}
+
+func (r *compactorRole) authorize(ctx context.Context, credentials *security.TCredentials) error {
+	if r.auth == nil {
+		return nil
+	}
+	if err := r.auth.Authenticate(ctx, credentials); err != nil {
+		user := ""
+		if credentials != nil {
+			user = credentials.Principal
+		}
+		return &clientgen.ThriftSecurityException{
+			User: user,
+			Code: clientgen.SecurityErrorCode_PERMISSION_DENIED,
+		}
+	}
+	return nil
 }
 
 func (r *compactorRole) begin(
@@ -42,20 +64,26 @@ func (r *compactorRole) end(ecid string) {
 }
 
 func (r *compactorRole) GetRunningCompaction(
-	context.Context,
-	*client.TInfo,
-	*security.TCredentials,
+	ctx context.Context,
+	_ *clientgen.TInfo,
+	credentials *security.TCredentials,
 ) (*tabletserver.TExternalCompactionJob, error) {
+	if err := r.authorize(ctx, credentials); err != nil {
+		return nil, err
+	}
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return r.job, nil
 }
 
 func (r *compactorRole) GetRunningCompactionId(
-	context.Context,
-	*client.TInfo,
-	*security.TCredentials,
+	ctx context.Context,
+	_ *clientgen.TInfo,
+	credentials *security.TCredentials,
 ) (string, error) {
+	if err := r.authorize(ctx, credentials); err != nil {
+		return "", err
+	}
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	if r.job == nil {
@@ -65,19 +93,25 @@ func (r *compactorRole) GetRunningCompactionId(
 }
 
 func (r *compactorRole) GetActiveCompactions(
-	context.Context,
-	*client.TInfo,
-	*security.TCredentials,
+	ctx context.Context,
+	_ *clientgen.TInfo,
+	credentials *security.TCredentials,
 ) ([]*tabletserver.ActiveCompaction, error) {
+	if err := r.authorize(ctx, credentials); err != nil {
+		return nil, err
+	}
 	return nil, nil
 }
 
 func (r *compactorRole) Cancel(
-	_ context.Context,
-	_ *client.TInfo,
-	_ *security.TCredentials,
+	ctx context.Context,
+	_ *clientgen.TInfo,
+	credentials *security.TCredentials,
 	ecid string,
 ) error {
+	if err := r.authorize(ctx, credentials); err != nil {
+		return err
+	}
 	r.mu.RLock()
 	job, cancel, cancelled := r.job, r.cancel, r.cancelled
 	r.mu.RUnlock()

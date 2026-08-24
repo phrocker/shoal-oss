@@ -184,32 +184,18 @@ services:
       context: ../..
       dockerfile: test/accumulo/shoal.Dockerfile
     hostname: shoal-compactor
+    entrypoint: ["/bin/sh", "-ec"]
     command:
-      - shoal-compactor
-      - -listen
-      - :9810
-      - -advertise
-      - shoal-compactor:9810
-      - -metrics-address
-      - :9811
-      - -zk
-      - zookeeper:2181
-      - -instance
-      - shoal
-      - -instance-secret
-      - shoal-test-instance-secret
-      - -accumulo-version
-      - 4.0.0-SNAPSHOT
-      - -password
-      - secret
-      - -group
-      - shoal_default
-      - -hdfs-namenode
-      - namenode:8020
-      - -state-file
-      - /var/lib/shoal-compactor/completion.json
-      - -cancel-interval
-      - 100ms
+      - |
+        export SHOAL_SYSTEM_TOKEN_BASE64="$$(cat /run/shoal/system-token)"
+        exec shoal-compactor \
+          -listen :9810 -advertise shoal-compactor:9810 \
+          -metrics-address :9811 -zk zookeeper:2181 -instance shoal \
+          -instance-secret shoal-test-instance-secret \
+          -accumulo-version 4.0.0-SNAPSHOT -password secret \
+          -group shoal_default -hdfs-namenode namenode:8020 \
+          -state-file /var/lib/shoal-compactor/completion.json \
+          -cancel-interval 100ms
     depends_on:
       manager:
         condition: service_started
@@ -219,6 +205,7 @@ services:
       - "127.0.0.1:19810:9810"
       - "127.0.0.1:19811:9811"
     volumes:
+      - ./.live:/run/shoal:ro
       - shoal-compactor-state:/var/lib/shoal-compactor
 
   garbage-collector:

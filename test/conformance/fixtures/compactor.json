@@ -31,7 +31,7 @@
       "gate": "restart-reconciliation",
       "kind": "go-test",
       "reference": "cmd/shoal-compactor/worker_test.go#TestWorkerRestartCompletesUnattemptedIntentOnce",
-      "source_sha256": "d5ba932386b7e73230622f2d040d2fb2877475857777ca4444ed5df13b703fed",
+      "source_sha256": "09251069af69ce06f7b4a842d2000891d4e8b731500583b9ef41cc1436d7b7bd",
       "replay_command": ["go", "test", "./cmd/shoal-compactor", "-run", "^TestWorkerRestartCompletesUnattemptedIntentOnce$", "-count=1"]
     },
     {

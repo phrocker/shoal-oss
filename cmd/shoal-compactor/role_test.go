@@ -2,9 +2,14 @@ package main
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
+
+	clientgen "github.com/phrocker/shoal-oss/internal/thrift/gen/client"
+	"github.com/phrocker/shoal-oss/internal/thrift/gen/security"
+	"github.com/phrocker/shoal-oss/internal/tserverprocess"
 )
 
 func TestCompactorRoleCancellationAndLifecycle(t *testing.T) {
@@ -56,4 +61,37 @@ func TestCompactorRoleConcurrentReadsAndTransitions(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+}
+
+func TestCompactorRoleRejectsUntrustedCredentials(t *testing.T) {
+	trusted := &security.TCredentials{
+		Principal:      "!SYSTEM",
+		TokenClassName: "system-token",
+		Token:          []byte("trusted"),
+		InstanceId:     "instance",
+	}
+	role := &compactorRole{auth: tserverprocess.ExactAuthenticator{
+		Identities: []*security.TCredentials{trusted},
+	}}
+	job := translatableJob(newECID())
+	ctx, cancel := context.WithCancel(context.Background())
+	var cancelled atomic.Bool
+	role.begin(job, cancel, &cancelled)
+
+	if _, err := role.GetRunningCompactionId(context.Background(), nil, trusted); err != nil {
+		t.Fatalf("trusted read: %v", err)
+	}
+	untrusted := &security.TCredentials{Principal: "attacker"}
+	_, err := role.GetRunningCompactionId(context.Background(), nil, untrusted)
+	var securityErr *clientgen.ThriftSecurityException
+	if !errors.As(err, &securityErr) ||
+		securityErr.Code != clientgen.SecurityErrorCode_PERMISSION_DENIED {
+		t.Fatalf("untrusted read error = %v", err)
+	}
+	if err := role.Cancel(context.Background(), nil, untrusted, job.GetExternalCompactionId()); !errors.As(err, &securityErr) {
+		t.Fatalf("untrusted cancel error = %v", err)
+	}
+	if ctx.Err() != nil || cancelled.Load() {
+		t.Fatal("untrusted credentials cancelled the job")
+	}
 }
