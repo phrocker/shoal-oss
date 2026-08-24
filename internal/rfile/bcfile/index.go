@@ -13,6 +13,12 @@ import (
 // BCFile.DataIndex.BLOCK_NAME = "BCFile.index".
 const DataIndexBlockName = "BCFile.index"
 
+// maxDataIndexBlocks bounds decoded index memory independently of the
+// compressed meta-block size. One million blocks already describes RFiles
+// far larger than practical production files while keeping the region slice
+// below 24 MiB.
+const maxDataIndexBlocks int32 = 1 << 20
+
 // metaNamePrefix is prepended to every MetaIndexEntry's user-facing name
 // when serialized. The Java reader strips it on read; we do the same.
 // Keeping this internal — exported names are always prefix-free.
@@ -146,7 +152,11 @@ func ReadDataIndex(r ByteAndReader) (*DataIndex, error) {
 	if count < 0 {
 		return nil, fmt.Errorf("bcfile: negative DataIndex block count %d", count)
 	}
-	blocks := make([]BlockRegion, 0)
+	if count > maxDataIndexBlocks {
+		return nil, fmt.Errorf("bcfile: DataIndex block count %d exceeds %d-block limit",
+			count, maxDataIndexBlocks)
+	}
+	blocks := make([]BlockRegion, 0, int(count))
 	for i := int32(0); i < count; i++ {
 		region, err := ReadBlockRegion(r)
 		if err != nil {

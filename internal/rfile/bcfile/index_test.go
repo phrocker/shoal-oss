@@ -175,3 +175,18 @@ func TestDataIndexEmpty(t *testing.T) {
 		t.Errorf("empty roundtrip: got %+v", got)
 	}
 }
+
+func TestDataIndexRejectsExcessiveBlockCount(t *testing.T) {
+	var buf bytes.Buffer
+	if err := WriteString(&buf, "none"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := WriteVInt(byteWriterShim{w: &buf}, maxDataIndexBlocks+1); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := ReadDataIndex(&buf)
+	if err == nil {
+		t.Fatal("ReadDataIndex accepted excessive block count")
+	}
+}
