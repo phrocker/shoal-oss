@@ -69,6 +69,8 @@ type Backend struct {
 	artifactOps s3ArtifactOperations
 }
 
+var _ shstorage.Remover = (*Backend)(nil)
+
 type s3Artifact struct {
 	key          string
 	lastModified time.Time
@@ -129,6 +131,22 @@ func New(ctx context.Context, opts ...Option) (*Backend, error) {
 // Close is a no-op: the v2 S3 client holds no persistent connection.
 // Kept for symmetry with the GCS backend.
 func (b *Backend) Close() error { return nil }
+
+// Remove deletes path. A missing path is not an error.
+func (b *Backend) Remove(ctx context.Context, path string) error {
+	bucket, key, err := ParsePath(path)
+	if err != nil {
+		return err
+	}
+	_, err = b.client.DeleteObject(ctx, &s3sdk.DeleteObjectInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String(key),
+	})
+	if err != nil && !isNotFound(err) {
+		return fmt.Errorf("s3: remove s3://%s/%s: %w", bucket, key, err)
+	}
+	return nil
+}
 
 // Open resolves path to a (bucket, key) pair, calls HeadObject for size, and
 // returns a File that issues a Range GET per ReadAt.

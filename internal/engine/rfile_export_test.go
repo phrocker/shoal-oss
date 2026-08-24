@@ -32,6 +32,34 @@ func (exportSourceBackend) Open(context.Context, string) (storage.File, error) {
 	return exportFailingFile{}, nil
 }
 
+type committedImportBackend struct {
+	*memory.Backend
+	failManifest bool
+}
+
+func (b *committedImportBackend) Create(ctx context.Context, path string) (storage.Writer, error) {
+	writer, err := b.Backend.Create(ctx, path)
+	if err != nil {
+		return nil, err
+	}
+	if filepath.Base(path) != "files.json" || !b.failManifest {
+		return writer, nil
+	}
+	b.failManifest = false
+	return &committedImportWriter{Writer: writer}, nil
+}
+
+type committedImportWriter struct {
+	storage.Writer
+}
+
+func (w *committedImportWriter) Close() error {
+	if err := w.Writer.Close(); err != nil {
+		return err
+	}
+	return storage.MarkCommittedWrite(errors.New("injected post-commit cleanup failure"))
+}
+
 type exportFailingFile struct{}
 
 func (exportFailingFile) ReadAt([]byte, int64) (int, error) { return 0, io.ErrUnexpectedEOF }
@@ -190,6 +218,62 @@ func TestRFileExportImportMemoryRoundTrip(t *testing.T) {
 	gotCells := scanAll(t, dst, "graph")
 	if fmt.Sprint(gotCells) != fmt.Sprint(wantCells) {
 		t.Fatalf("imported scan mismatch\ngot  %v\nwant %v", gotCells, wantCells)
+	}
+}
+
+func TestImportRFileManifestPreservesFilesAfterCommittedManifestError(t *testing.T) {
+	ctx := context.Background()
+	src, err := Open(filepath.Join(t.TempDir(), "src"), Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer src.Close()
+	if err := src.CreateTable("graph", TableOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	writeRow(t, src, "graph", "row", 0)
+
+	backend := &committedImportBackend{Backend: memory.New()}
+	dstDir := filepath.Join(t.TempDir(), "dst")
+	dst, err := Open(dstDir, Options{Backend: backend})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := dst.CreateTable("graph", TableOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := src.ExportRFiles(ctx, "graph", backend, RFileExportOptions{
+		DestinationRoot: dstDir,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend.failManifest = true
+	err = dst.ImportRFileManifest(ctx, manifest)
+	if !storage.IsCommittedWriteError(err) {
+		t.Fatalf("ImportRFileManifest error = %v, want committed-write error", err)
+	}
+	if err := dst.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := Open(dstDir, Options{Backend: backend})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if got := scanAll(t, reopened, "graph"); fmt.Sprint(got) != "[row|cf|cq-0|tenantA|100|value-row]" {
+		t.Fatalf("reopened imported cells = %v", got)
+	}
+	foundStaged := false
+	for _, key := range backend.Keys() {
+		if strings.Contains(filepath.Base(key), ".shoal-import-") {
+			foundStaged = true
+			break
+		}
+	}
+	if !foundStaged {
+		t.Fatal("committed import object was removed by rollback")
 	}
 }
 
@@ -772,6 +856,50 @@ func TestImportRFileManifestRejectsSameCountDifferentSplits(t *testing.T) {
 	}
 	if err := dst.ImportRFileManifest(ctx, manifest); err == nil || !strings.Contains(err.Error(), "split 0") {
 		t.Fatalf("ImportRFileManifest error = %v, want split mismatch", err)
+	}
+	for _, key := range backend.Keys() {
+		if strings.Contains(filepath.Base(key), ".shoal-import-") {
+			t.Fatalf("rejected import leaked staged object %q", key)
+		}
+	}
+}
+
+func TestVerifyImmutableExportRejectsInvalidParquet(t *testing.T) {
+	data := []byte("not a parquet file")
+	path := filepath.Join(t.TempDir(), "F0001.parquet")
+	backend := memory.New()
+	backend.Put(path, data)
+	manifest := exportManifestForBytes(path, data)
+	manifest.FileFormat = tablet.FormatParquet
+	manifest.RFileCompatibility = "parquet/shoal"
+	manifest.RFiles[0].Format = ExportFormatParquet
+
+	err := verifyImmutableExport(
+		context.Background(), backend, manifest, newVerificationSnapshot,
+	)
+	if !errors.Is(err, storage.ErrImmutablePolicy) ||
+		!strings.Contains(err.Error(), "structurally valid Parquet") {
+		t.Fatalf("verifyImmutableExport(invalid Parquet) = %v, want structural rejection", err)
+	}
+}
+
+func TestStageVerifiedImportFilesRequiresRemovalSupport(t *testing.T) {
+	data := validRFileBytes(t)
+	path := filepath.Join(t.TempDir(), "F0001.rf")
+	backend := memory.New()
+	backend.Put(path, data)
+	withoutRemove := struct{ storage.WritableBackend }{WritableBackend: backend}
+
+	_, err := stageVerifiedImportFiles(
+		context.Background(), withoutRemove, exportManifestForBytes(path, data).RFiles,
+	)
+	if !errors.Is(err, storage.ErrRemoverUnsupported) {
+		t.Fatalf("stageVerifiedImportFiles() = %v, want ErrRemoverUnsupported", err)
+	}
+	for _, key := range backend.Keys() {
+		if strings.Contains(filepath.Base(key), ".shoal-import-") {
+			t.Fatalf("unsupported backend created staged object %q", key)
+		}
 	}
 }
 

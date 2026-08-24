@@ -51,6 +51,8 @@ type Backend struct {
 	artifactOps   gcsArtifactOperations
 }
 
+var _ shstorage.Remover = (*Backend)(nil)
+
 type gcsArtifact struct {
 	name       string
 	updated    time.Time
@@ -118,6 +120,19 @@ func (b *Backend) Close() error {
 	err := b.client.Close()
 	b.client = nil
 	return err
+}
+
+// Remove deletes path. A missing path is not an error.
+func (b *Backend) Remove(ctx context.Context, path string) error {
+	bucket, object, err := ParsePath(path)
+	if err != nil {
+		return err
+	}
+	err = b.client.Bucket(bucket).Object(object).Delete(ctx)
+	if err != nil && !errors.Is(err, storage.ErrObjectNotExist) {
+		return fmt.Errorf("gcs: remove gs://%s/%s: %w", bucket, object, err)
+	}
+	return nil
 }
 
 // Open resolves path to a (bucket, object) pair, fetches the object's

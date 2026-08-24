@@ -1158,11 +1158,13 @@ func PublishImmutableFiles(b storage.Backend, dir string, active []string) error
 }
 
 // RegisterImmutableFiles adds only checksum-verified import objects to the
-// authoritative generation. It never adopts unrelated objects from the prefix.
-func (t *Tablet) RegisterImmutableFiles(paths []string) (int, error) {
+// authoritative generation. The returned paths became authoritative even when
+// the returned error reports cleanup after a committed manifest write.
+func (t *Tablet) RegisterImmutableFiles(paths []string) ([]string, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	active := append([]string(nil), t.files...)
+	adopted := make([]string, 0, len(paths))
 	seen := make(map[string]string, len(active)+len(paths))
 	for _, path := range active {
 		seen[immutableFileIdentity(path)] = path
@@ -1172,21 +1174,26 @@ func (t *Tablet) RegisterImmutableFiles(paths []string) (int, error) {
 		if existing, ok := seen[identity]; ok {
 			if existing != path {
 				if err := removeObject(t.backend, path); err != nil {
-					return 0, fmt.Errorf("tablet: remove redundant immutable file %s: %w", path, err)
+					return nil, fmt.Errorf("tablet: remove redundant immutable file %s: %w", path, err)
 				}
 			}
 			continue
 		}
 		active = append(active, path)
+		adopted = append(adopted, path)
 		seen[identity] = path
 		delete(t.obsolete, filepath.Base(path))
 	}
 	sort.Strings(active)
 	if err := persistImmutableManifest(t.backend, t.dir, active, t.obsolete); err != nil {
-		return 0, err
+		if storage.IsCommittedWriteError(err) {
+			t.files = active
+			return adopted, err
+		}
+		return nil, err
 	}
 	t.files = active
-	return len(t.files), nil
+	return adopted, nil
 }
 
 func immutableFileIdentity(path string) string {
@@ -1210,13 +1217,11 @@ func immutableFileIdentity(path string) string {
 }
 
 func removeObject(b storage.Backend, path string) error {
-	if r, ok := b.(storage.Remover); ok {
-		return r.Remove(context.Background(), path)
+	r, ok := b.(storage.Remover)
+	if !ok {
+		return storage.ErrRemoverUnsupported
 	}
-	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-		return err
-	}
-	return nil
+	return r.Remove(context.Background(), path)
 }
 
 // Scanner is a pull-based iterator over scan results.

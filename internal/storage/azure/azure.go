@@ -83,6 +83,8 @@ type Backend struct {
 	validateSourceOnCreate bool
 }
 
+var _ shstorage.Remover = (*Backend)(nil)
+
 type azureArtifact struct {
 	name         string
 	versionID    *string
@@ -266,6 +268,19 @@ func New(_ context.Context, opts ...Option) (*Backend, error) {
 // Close is a no-op: the service client holds no persistent connection.
 // Kept for symmetry with the GCS/S3 backends.
 func (b *Backend) Close() error { return nil }
+
+// Remove deletes path. A missing path is not an error.
+func (b *Backend) Remove(ctx context.Context, path string) error {
+	containerName, blobName, err := ParsePath(path)
+	if err != nil {
+		return err
+	}
+	_, err = b.svc.NewContainerClient(containerName).NewBlobClient(blobName).Delete(ctx, nil)
+	if err != nil && !isBlobNotFound(err) {
+		return fmt.Errorf("azure: remove az://%s/%s: %w", containerName, blobName, err)
+	}
+	return nil
+}
 
 // Open resolves path to a (container, blob) pair, calls GetProperties for size,
 // and returns a File that issues a ranged DownloadStream per ReadAt.
