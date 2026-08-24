@@ -110,7 +110,9 @@ func (r *compactorRole) Cancel(
 	ecid string,
 ) error {
 	if err := r.authorize(ctx, credentials); err != nil {
-		return err
+		// Accumulo's cancel RPC has no declared security exception. Reject the
+		// request without surfacing an internal Thrift application error.
+		return nil
 	}
 	r.mu.RLock()
 	job, cancel, cancelled := r.job, r.cancel, r.cancelled
