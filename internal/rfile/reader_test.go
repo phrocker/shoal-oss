@@ -691,10 +691,12 @@ func TestValidateReadableIndexRejectsUnverifiedExtensions(t *testing.T) {
 func TestValidateReadableIndexRejectsEntryCountRootMismatch(t *testing.T) {
 	tests := map[string]*index.LocalityGroup{
 		"zero count with nonempty root": {
+			IsDefault:       true,
 			NumTotalEntries: 0,
 			RootIndex:       &index.IndexBlock{Offsets: []int32{0}},
 		},
 		"positive count with empty root": {
+			IsDefault:       true,
 			NumTotalEntries: 1,
 			RootIndex:       &index.IndexBlock{},
 		},
@@ -706,6 +708,80 @@ func TestValidateReadableIndexRejectsEntryCountRootMismatch(t *testing.T) {
 			})
 			if err == nil || !strings.Contains(err.Error(), "inconsistent with its root index") {
 				t.Fatalf("validateReadableIndex() = %v, want count/root mismatch", err)
+			}
+		})
+	}
+}
+
+func TestValidateReadableIndexRejectsInvalidLocalityGroupLayouts(t *testing.T) {
+	emptyRoot := func() *index.IndexBlock {
+		return &index.IndexBlock{}
+	}
+	tests := map[string]struct {
+		groups []*index.LocalityGroup
+		want   string
+	}{
+		"missing default": {
+			groups: []*index.LocalityGroup{{
+				Name:           "named",
+				ColumnFamilies: map[string]int64{"cf": 1},
+				RootIndex:      emptyRoot(),
+			}},
+			want: "exactly one default locality group",
+		},
+		"duplicate default": {
+			groups: []*index.LocalityGroup{
+				{IsDefault: true, RootIndex: emptyRoot()},
+				{IsDefault: true, RootIndex: emptyRoot()},
+			},
+			want: "exactly one default locality group",
+		},
+		"named default": {
+			groups: []*index.LocalityGroup{{
+				IsDefault: true,
+				Name:      "invalid",
+				RootIndex: emptyRoot(),
+			}},
+			want: "default locality group 0 has name",
+		},
+		"empty named group name": {
+			groups: []*index.LocalityGroup{
+				{IsDefault: true, RootIndex: emptyRoot()},
+				{RootIndex: emptyRoot()},
+			},
+			want: "named locality group 1 has an empty name",
+		},
+		"duplicate named group": {
+			groups: []*index.LocalityGroup{
+				{IsDefault: true, RootIndex: emptyRoot()},
+				{Name: "named", RootIndex: emptyRoot()},
+				{Name: "named", RootIndex: emptyRoot()},
+			},
+			want: "duplicate name",
+		},
+		"column family in multiple groups": {
+			groups: []*index.LocalityGroup{
+				{
+					IsDefault:       true,
+					ColumnFamilies:  map[string]int64{"shared": 1},
+					NumTotalEntries: 1,
+					RootIndex:       &index.IndexBlock{Offsets: []int32{0}},
+				},
+				{
+					Name:            "named",
+					ColumnFamilies:  map[string]int64{"shared": 1},
+					NumTotalEntries: 1,
+					RootIndex:       &index.IndexBlock{Offsets: []int32{0}},
+				},
+			},
+			want: "belongs to locality groups 0 and 1",
+		},
+	}
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			err := validateReadableIndex(&index.Reader{Groups: test.groups})
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("validateReadableIndex() = %v, want error containing %q", err, test.want)
 			}
 		})
 	}

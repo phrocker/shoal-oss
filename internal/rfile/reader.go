@@ -404,13 +404,48 @@ func OpenAll(bc *bcfile.Reader, dec *block.Decompressor, opts ...OpenOption) ([]
 }
 
 func validateReadableIndex(idx *index.Reader) error {
+	if idx == nil {
+		return errors.New("rfile: nil index")
+	}
 	if idx.VectorExtension != nil {
 		return errors.New("rfile: vector-index extensions are not supported")
 	}
 	if len(idx.SampleGroups) > 0 || idx.SamplerConfiguration != nil {
 		return errors.New("rfile: sampled files are not supported")
 	}
+	defaultGroups := 0
+	namedGroups := make(map[string]int)
+	columnFamilies := make(map[string]int)
 	for group, lg := range idx.Groups {
+		if lg == nil {
+			return fmt.Errorf("rfile: locality group %d is nil", group)
+		}
+		if lg.IsDefault {
+			defaultGroups++
+			if lg.Name != "" {
+				return fmt.Errorf("rfile: default locality group %d has name %q", group, lg.Name)
+			}
+		} else {
+			if lg.Name == "" {
+				return fmt.Errorf("rfile: named locality group %d has an empty name", group)
+			}
+			if previous, exists := namedGroups[lg.Name]; exists {
+				return fmt.Errorf(
+					"rfile: locality groups %d and %d have duplicate name %q",
+					previous, group, lg.Name,
+				)
+			}
+			namedGroups[lg.Name] = group
+		}
+		for cf := range lg.ColumnFamilies {
+			if previous, exists := columnFamilies[cf]; exists {
+				return fmt.Errorf(
+					"rfile: column family %q belongs to locality groups %d and %d",
+					cf, previous, group,
+				)
+			}
+			columnFamilies[cf] = group
+		}
 		if lg.RootIndex == nil {
 			return fmt.Errorf("rfile: locality group %d has no root index", group)
 		}
@@ -421,6 +456,12 @@ func validateReadableIndex(idx *index.Reader) error {
 				"rfile: locality group %d total-entry count is inconsistent with its root index",
 				group)
 		}
+	}
+	if defaultGroups != 1 {
+		return fmt.Errorf(
+			"rfile: expected exactly one default locality group, found %d",
+			defaultGroups,
+		)
 	}
 	return nil
 }
