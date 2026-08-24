@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -315,6 +316,31 @@ func TestSeek_LevelReaderErrorPropagates(t *testing.T) {
 	}
 }
 
+func TestSeek_RejectsInvalidLevelTransition(t *testing.T) {
+	root := buildIndexBlock(t, 1, []*IndexEntry{
+		{Key: keyRow("z"), Offset: 10, CompressedSize: 1, RawSize: 1},
+	})
+	lr := &fakeLevelReader{blocks: map[int64]*IndexBlock{
+		10: buildIndexBlock(t, 1, []*IndexEntry{
+			{Key: keyRow("z"), Offset: 10, CompressedSize: 1, RawSize: 1},
+		}),
+	}}
+	if _, err := NewWalker(root, lr).Seek(keyRow("a")); err == nil ||
+		!strings.Contains(err.Error(), "child block level 1, want 0") {
+		t.Fatalf("Seek error = %v, want invalid level transition", err)
+	}
+}
+
+func TestSeek_RejectsExcessiveRootLevel(t *testing.T) {
+	root := buildIndexBlock(t, maxTraversalDepth+1, []*IndexEntry{
+		{Key: keyRow("z"), Offset: 10, CompressedSize: 1, RawSize: 1},
+	})
+	if _, err := NewWalker(root, &fakeLevelReader{}).Seek(keyRow("a")); err == nil ||
+		!strings.Contains(err.Error(), "exceeds maximum traversal depth") {
+		t.Fatalf("Seek error = %v, want traversal depth rejection", err)
+	}
+}
+
 func TestIterateLeaves_SingleLevel(t *testing.T) {
 	entries := []*IndexEntry{
 		{Key: keyRow("a"), Offset: 1},
@@ -360,6 +386,21 @@ func TestIterateLeaves_TwoLevel(t *testing.T) {
 	// Descended into 3 child blocks (one per root entry).
 	if got := atomic.LoadInt64(&lr.calls); got != 3 {
 		t.Errorf("level fetches = %d, want 3", got)
+	}
+}
+
+func TestIterateLeaves_RejectsRepeatedChildRegion(t *testing.T) {
+	leaf := buildIndexBlock(t, 0, []*IndexEntry{
+		{Key: keyRow("z"), Offset: 100, CompressedSize: 1, RawSize: 1},
+	})
+	root := buildIndexBlock(t, 1, []*IndexEntry{
+		{Key: keyRow("m"), Offset: 10, CompressedSize: 1, RawSize: 1},
+		{Key: keyRow("z"), Offset: 10, CompressedSize: 1, RawSize: 1},
+	})
+	lr := &fakeLevelReader{blocks: map[int64]*IndexBlock{10: leaf}}
+	err := NewWalker(root, lr).IterateLeaves(func(*IndexEntry) error { return nil })
+	if err == nil || !strings.Contains(err.Error(), "repeated child block region") {
+		t.Fatalf("IterateLeaves error = %v, want repeated region rejection", err)
 	}
 }
 

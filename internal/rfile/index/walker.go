@@ -38,6 +38,13 @@ func (f LevelReaderFunc) ReadIndexBlock(region bcfile.BlockRegion) (*IndexBlock,
 // row is missing. Past-end means there's no such block at all.
 var ErrPastEnd = errors.New("rfile/index: target key is past the last index entry")
 
+const maxTraversalDepth int32 = 64
+
+type blockRegionKey struct {
+	offset         int64
+	compressedSize int64
+}
+
 // Walker walks a multi-level index tree from a preserved root IndexBlock,
 // fetching child blocks on demand via the LevelReader. Stateless across
 // Seek calls — each Seek descends from root.
@@ -63,6 +70,10 @@ func NewWalker(root *IndexBlock, lr LevelReader) *Walker {
 // key >= target.
 func (w *Walker) Seek(target *wire.Key) (*IndexEntry, error) {
 	cur := w.root
+	if err := validateRootLevel(cur); err != nil {
+		return nil, err
+	}
+	visited := make(map[blockRegionKey]struct{})
 	for {
 		entries := EntriesOf(cur)
 		idx, err := binarySearchKey(entries, target)
@@ -90,11 +101,11 @@ func (w *Walker) Seek(target *wire.Key) (*IndexEntry, error) {
 		if w.lr == nil {
 			return nil, fmt.Errorf("rfile/index: multi-level index requires LevelReader (level=%d)", cur.Level)
 		}
-		child, err := w.lr.ReadIndexBlock(bcfile.BlockRegion{
+		child, err := readChildBlock(w.lr, cur.Level, bcfile.BlockRegion{
 			Offset:         entry.Offset,
 			CompressedSize: entry.CompressedSize,
 			RawSize:        entry.RawSize,
-		})
+		}, visited)
 		if err != nil {
 			return nil, fmt.Errorf("rfile/index: descend to level %d: %w", cur.Level-1, err)
 		}
@@ -141,10 +152,18 @@ func binarySearchKey(entries *Entries, target *wire.Key) (int, error) {
 // (The index is small relative to data, so prefetching index blocks
 // is rarely the bottleneck.)
 func (w *Walker) IterateLeaves(fn func(*IndexEntry) error) error {
-	return iterateLeaves(w.root, w.lr, fn)
+	if err := validateRootLevel(w.root); err != nil {
+		return err
+	}
+	return iterateLeaves(w.root, w.lr, fn, make(map[blockRegionKey]struct{}))
 }
 
-func iterateLeaves(block *IndexBlock, lr LevelReader, fn func(*IndexEntry) error) error {
+func iterateLeaves(
+	block *IndexBlock,
+	lr LevelReader,
+	fn func(*IndexEntry) error,
+	visited map[blockRegionKey]struct{},
+) error {
 	entries := EntriesOf(block)
 	n := entries.Len()
 	for i := 0; i < n; i++ {
@@ -161,19 +180,63 @@ func iterateLeaves(block *IndexBlock, lr LevelReader, fn func(*IndexEntry) error
 		if lr == nil {
 			return fmt.Errorf("rfile/index: multi-level iterate requires LevelReader (level=%d)", block.Level)
 		}
-		child, err := lr.ReadIndexBlock(bcfile.BlockRegion{
+		child, err := readChildBlock(lr, block.Level, bcfile.BlockRegion{
 			Offset:         entry.Offset,
 			CompressedSize: entry.CompressedSize,
 			RawSize:        entry.RawSize,
-		})
+		}, visited)
 		if err != nil {
 			return fmt.Errorf("rfile/index: descend to level %d: %w", block.Level-1, err)
 		}
-		if err := iterateLeaves(child, lr, fn); err != nil {
+		if err := iterateLeaves(child, lr, fn, visited); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+func validateRootLevel(root *IndexBlock) error {
+	if root == nil {
+		return errors.New("rfile/index: nil root index block")
+	}
+	if root.Level < 0 {
+		return fmt.Errorf("rfile/index: negative root level %d", root.Level)
+	}
+	if root.Level > maxTraversalDepth {
+		return fmt.Errorf(
+			"rfile/index: root level %d exceeds maximum traversal depth %d",
+			root.Level, maxTraversalDepth,
+		)
+	}
+	return nil
+}
+
+func readChildBlock(
+	lr LevelReader,
+	parentLevel int32,
+	region bcfile.BlockRegion,
+	visited map[blockRegionKey]struct{},
+) (*IndexBlock, error) {
+	key := blockRegionKey{offset: region.Offset, compressedSize: region.CompressedSize}
+	if _, ok := visited[key]; ok {
+		return nil, fmt.Errorf("repeated child block region %+v", region)
+	}
+	visited[key] = struct{}{}
+	child, err := lr.ReadIndexBlock(region)
+	if err != nil {
+		return nil, err
+	}
+	if child == nil {
+		return nil, errors.New("LevelReader returned nil child block")
+	}
+	expectedLevel := parentLevel - 1
+	if child.Level != expectedLevel {
+		return nil, fmt.Errorf(
+			"child block level %d, want %d from parent level %d",
+			child.Level, expectedLevel, parentLevel,
+		)
+	}
+	return child, nil
 }
 
 // Root returns the root IndexBlock the walker was constructed with.
