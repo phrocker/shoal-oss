@@ -23,6 +23,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	pathpkg "path"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -301,8 +302,18 @@ func validSourcePath(sourcePath string) bool {
 	return requiredExact(sourcePath) &&
 		!strings.Contains(sourcePath, `\`) &&
 		!pathpkg.IsAbs(sourcePath) &&
+		filepath.VolumeName(sourcePath) == "" &&
+		!hasWindowsDriveVolume(sourcePath) &&
 		sourcePath != "." &&
 		sourcePath != ".." &&
 		!strings.HasPrefix(sourcePath, "../") &&
 		pathpkg.Clean(sourcePath) == sourcePath
+}
+
+func hasWindowsDriveVolume(sourcePath string) bool {
+	if len(sourcePath) < 2 || sourcePath[1] != ':' {
+		return false
+	}
+	drive := sourcePath[0]
+	return drive >= 'A' && drive <= 'Z' || drive >= 'a' && drive <= 'z'
 }

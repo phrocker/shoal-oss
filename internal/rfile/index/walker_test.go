@@ -404,6 +404,24 @@ func TestIterateLeaves_RejectsRepeatedChildRegion(t *testing.T) {
 	}
 }
 
+func TestIterateLeaves_RejectsRepeatedLeafRegion(t *testing.T) {
+	root := buildIndexBlock(t, 0, []*IndexEntry{
+		{Key: keyRow("m"), Offset: 10, CompressedSize: 2, RawSize: 3},
+		{Key: keyRow("z"), Offset: 10, CompressedSize: 2, RawSize: 4},
+	})
+	callbacks := 0
+	err := NewWalker(root, nil).IterateLeaves(func(*IndexEntry) error {
+		callbacks++
+		return nil
+	})
+	if err == nil || !strings.Contains(err.Error(), "repeated leaf block region") {
+		t.Fatalf("IterateLeaves error = %v, want repeated leaf region rejection", err)
+	}
+	if callbacks != 1 {
+		t.Fatalf("callback count = %d, want 1 before repeated region rejection", callbacks)
+	}
+}
+
 func TestIterateLeaves_FnEarlyAbort(t *testing.T) {
 	root, lr := build2LevelTree(t)
 	w := NewWalker(root, lr)

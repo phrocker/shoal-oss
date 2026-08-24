@@ -172,6 +172,16 @@ func iterateLeaves(
 			return err
 		}
 		if block.Level == 0 {
+			region := bcfile.BlockRegion{
+				Offset:         entry.Offset,
+				CompressedSize: entry.CompressedSize,
+				RawSize:        entry.RawSize,
+			}
+			key := blockRegionKey{offset: region.Offset, compressedSize: region.CompressedSize}
+			if _, ok := visited[key]; ok {
+				return fmt.Errorf("rfile/index: repeated leaf block region %+v", region)
+			}
+			visited[key] = struct{}{}
 			if err := fn(entry); err != nil {
 				return err
 			}

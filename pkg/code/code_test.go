@@ -145,7 +145,14 @@ func TestSourceRequiresRevisionAndContentHash(t *testing.T) {
 func TestSourceRejectsRepositoryTraversalPaths(t *testing.T) {
 	content := []byte("package sample")
 	repository := testRepository(t)
-	for _, sourcePath := range []string{"..", "../outside.go", "../../outside.go"} {
+	for _, sourcePath := range []string{
+		"..",
+		"../outside.go",
+		"../../outside.go",
+		"C:/outside.go",
+		"C:outside.go",
+		"z:/outside.go",
+	} {
 		t.Run(sourcePath, func(t *testing.T) {
 			_, err := codeast.NewSource(
 				repository, "refs/heads/main", sourcePath, "commit-1",
