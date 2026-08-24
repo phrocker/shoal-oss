@@ -449,6 +449,9 @@ func validateReadableIndex(idx *index.Reader) error {
 		if lg.RootIndex == nil {
 			return fmt.Errorf("rfile: locality group %d has no root index", group)
 		}
+		if err := index.ValidateBlock(lg.RootIndex); err != nil {
+			return fmt.Errorf("rfile: locality group %d root index: %w", group, err)
+		}
 		rootEmpty := lg.RootIndex.NumEntries() == 0
 		countEmpty := lg.NumTotalEntries == 0
 		if rootEmpty != countEmpty {

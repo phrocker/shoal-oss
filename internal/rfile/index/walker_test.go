@@ -146,9 +146,9 @@ func TestSeek_SingleLevelExactMatch(t *testing.T) {
 // Walker should return the first entry whose key >= target.
 func TestSeek_SingleLevelInsertionPoint(t *testing.T) {
 	entries := []*IndexEntry{
-		{Key: keyRow("apple"), Offset: 100},
-		{Key: keyRow("mango"), Offset: 200},
-		{Key: keyRow("zebra"), Offset: 300},
+		{Key: keyRow("apple"), NumEntries: 1, Offset: 100},
+		{Key: keyRow("mango"), NumEntries: 1, Offset: 200},
+		{Key: keyRow("zebra"), NumEntries: 1, Offset: 300},
 	}
 	root := buildIndexBlock(t, 0, entries)
 	w := NewWalker(root, nil)
@@ -176,8 +176,8 @@ func TestSeek_SingleLevelInsertionPoint(t *testing.T) {
 
 func TestSeek_PastEnd(t *testing.T) {
 	root := buildIndexBlock(t, 0, []*IndexEntry{
-		{Key: keyRow("a"), Offset: 100},
-		{Key: keyRow("b"), Offset: 200},
+		{Key: keyRow("a"), NumEntries: 1, Offset: 100},
+		{Key: keyRow("b"), NumEntries: 1, Offset: 200},
 	})
 	w := NewWalker(root, nil)
 
@@ -343,9 +343,9 @@ func TestSeek_RejectsExcessiveRootLevel(t *testing.T) {
 
 func TestIterateLeaves_SingleLevel(t *testing.T) {
 	entries := []*IndexEntry{
-		{Key: keyRow("a"), Offset: 1},
-		{Key: keyRow("b"), Offset: 2},
-		{Key: keyRow("c"), Offset: 3},
+		{Key: keyRow("a"), NumEntries: 1, Offset: 1},
+		{Key: keyRow("b"), NumEntries: 1, Offset: 2},
+		{Key: keyRow("c"), NumEntries: 1, Offset: 3},
 	}
 	w := NewWalker(buildIndexBlock(t, 0, entries), nil)
 
@@ -391,23 +391,24 @@ func TestIterateLeaves_TwoLevel(t *testing.T) {
 
 func TestIterateLeaves_RejectsRepeatedChildRegion(t *testing.T) {
 	leaf := buildIndexBlock(t, 0, []*IndexEntry{
-		{Key: keyRow("z"), Offset: 100, CompressedSize: 1, RawSize: 1},
-	})
-	root := buildIndexBlock(t, 1, []*IndexEntry{
-		{Key: keyRow("m"), Offset: 10, CompressedSize: 1, RawSize: 1},
-		{Key: keyRow("z"), Offset: 10, CompressedSize: 1, RawSize: 1},
+		{Key: keyRow("z"), NumEntries: 1, Offset: 100, CompressedSize: 1, RawSize: 1},
 	})
 	lr := &fakeLevelReader{blocks: map[int64]*IndexBlock{10: leaf}}
-	err := NewWalker(root, lr).IterateLeaves(func(*IndexEntry) error { return nil })
+	region := bcfile.BlockRegion{Offset: 10, CompressedSize: 1, RawSize: 1}
+	visited := make(map[blockRegionKey]struct{})
+	if _, err := readChildBlock(lr, 1, region, nil, keyRow("z"), visited); err != nil {
+		t.Fatalf("first readChildBlock: %v", err)
+	}
+	_, err := readChildBlock(lr, 1, region, nil, keyRow("z"), visited)
 	if err == nil || !strings.Contains(err.Error(), "repeated child block region") {
-		t.Fatalf("IterateLeaves error = %v, want repeated region rejection", err)
+		t.Fatalf("readChildBlock error = %v, want repeated region rejection", err)
 	}
 }
 
 func TestIterateLeaves_RejectsRepeatedLeafRegion(t *testing.T) {
 	root := buildIndexBlock(t, 0, []*IndexEntry{
-		{Key: keyRow("m"), Offset: 10, CompressedSize: 2, RawSize: 3},
-		{Key: keyRow("z"), Offset: 10, CompressedSize: 2, RawSize: 4},
+		{Key: keyRow("m"), NumEntries: 1, Offset: 10, CompressedSize: 2, RawSize: 3},
+		{Key: keyRow("z"), NumEntries: 1, Offset: 10, CompressedSize: 2, RawSize: 4},
 	})
 	callbacks := 0
 	err := NewWalker(root, nil).IterateLeaves(func(*IndexEntry) error {
@@ -419,6 +420,91 @@ func TestIterateLeaves_RejectsRepeatedLeafRegion(t *testing.T) {
 	}
 	if callbacks != 1 {
 		t.Fatalf("callback count = %d, want 1 before repeated region rejection", callbacks)
+	}
+}
+
+func TestIterateLeaves_RejectsUnorderedEntries(t *testing.T) {
+	root := buildIndexBlock(t, 0, []*IndexEntry{
+		{Key: keyRow("z"), NumEntries: 1, Offset: 10, CompressedSize: 1, RawSize: 1},
+		{Key: keyRow("a"), NumEntries: 1, Offset: 20, CompressedSize: 1, RawSize: 1},
+	})
+	callbacks := 0
+	err := NewWalker(root, nil).IterateLeaves(func(*IndexEntry) error {
+		callbacks++
+		return nil
+	})
+	if err == nil || !strings.Contains(err.Error(), "not strictly after") {
+		t.Fatalf("IterateLeaves error = %v, want key-order rejection", err)
+	}
+	if callbacks != 0 {
+		t.Fatalf("callback count = %d, want 0", callbacks)
+	}
+}
+
+func TestIterateLeaves_RejectsNonPositiveLeafCount(t *testing.T) {
+	for _, count := range []int32{0, -1} {
+		t.Run(fmt.Sprintf("count_%d", count), func(t *testing.T) {
+			root := buildIndexBlock(t, 0, []*IndexEntry{{
+				Key: keyRow("a"), NumEntries: count, Offset: 10, CompressedSize: 1, RawSize: 1,
+			}})
+			err := NewWalker(root, nil).IterateLeaves(func(*IndexEntry) error {
+				t.Fatal("callback invoked for invalid leaf count")
+				return nil
+			})
+			if err == nil || !strings.Contains(err.Error(), "non-positive cell count") {
+				t.Fatalf("IterateLeaves error = %v, want leaf-count rejection", err)
+			}
+		})
+	}
+}
+
+func TestIterateLeaves_RejectsParentKeyMismatch(t *testing.T) {
+	leaf := buildIndexBlock(t, 0, []*IndexEntry{
+		{Key: keyRow("a"), NumEntries: 1, Offset: 100, CompressedSize: 1, RawSize: 1},
+		{Key: keyRow("m"), NumEntries: 1, Offset: 200, CompressedSize: 1, RawSize: 1},
+	})
+	root := buildIndexBlock(t, 1, []*IndexEntry{{
+		Key: keyRow("b"), Offset: 10, CompressedSize: 1, RawSize: 1,
+	}})
+	lr := &fakeLevelReader{blocks: map[int64]*IndexBlock{10: leaf}}
+	err := NewWalker(root, lr).IterateLeaves(func(*IndexEntry) error { return nil })
+	if err == nil || !strings.Contains(err.Error(), "does not match parent upper bound") {
+		t.Fatalf("IterateLeaves error = %v, want parent-bound rejection", err)
+	}
+}
+
+func TestSeek_RejectsParentKeyMismatch(t *testing.T) {
+	leaf := buildIndexBlock(t, 0, []*IndexEntry{
+		{Key: keyRow("a"), NumEntries: 1, Offset: 100, CompressedSize: 1, RawSize: 1},
+		{Key: keyRow("m"), NumEntries: 1, Offset: 200, CompressedSize: 1, RawSize: 1},
+	})
+	root := buildIndexBlock(t, 1, []*IndexEntry{{
+		Key: keyRow("z"), Offset: 10, CompressedSize: 1, RawSize: 1,
+	}})
+	lr := &fakeLevelReader{blocks: map[int64]*IndexBlock{10: leaf}}
+	_, err := NewWalker(root, lr).Seek(keyRow("m"))
+	if err == nil || !strings.Contains(err.Error(), "does not match parent upper bound") {
+		t.Fatalf("Seek error = %v, want parent-bound rejection", err)
+	}
+}
+
+func TestIterateLeaves_RejectsOverlappingChildKeyRanges(t *testing.T) {
+	first := buildIndexBlock(t, 0, []*IndexEntry{
+		{Key: keyRow("a"), NumEntries: 1, Offset: 100, CompressedSize: 1, RawSize: 1},
+		{Key: keyRow("m"), NumEntries: 1, Offset: 200, CompressedSize: 1, RawSize: 1},
+	})
+	second := buildIndexBlock(t, 0, []*IndexEntry{
+		{Key: keyRow("b"), NumEntries: 1, Offset: 300, CompressedSize: 1, RawSize: 1},
+		{Key: keyRow("z"), NumEntries: 1, Offset: 400, CompressedSize: 1, RawSize: 1},
+	})
+	root := buildIndexBlock(t, 1, []*IndexEntry{
+		{Key: keyRow("m"), Offset: 10, CompressedSize: 1, RawSize: 1},
+		{Key: keyRow("z"), Offset: 20, CompressedSize: 1, RawSize: 1},
+	})
+	lr := &fakeLevelReader{blocks: map[int64]*IndexBlock{10: first, 20: second}}
+	err := NewWalker(root, lr).IterateLeaves(func(*IndexEntry) error { return nil })
+	if err == nil || !strings.Contains(err.Error(), "not strictly after parent lower bound") {
+		t.Fatalf("IterateLeaves error = %v, want overlapping-range rejection", err)
 	}
 }
 
@@ -454,12 +540,12 @@ func TestIterateLeaves_FnEarlyAbort(t *testing.T) {
 func build3LevelTree(t *testing.T) (*IndexBlock, *fakeLevelReader) {
 	t.Helper()
 	leafA := buildIndexBlock(t, 0, []*IndexEntry{
-		{Key: keyRow("aa"), Offset: 1000, CompressedSize: 1, RawSize: 1},
-		{Key: keyRow("ab"), Offset: 1100, CompressedSize: 1, RawSize: 1},
+		{Key: keyRow("aa"), NumEntries: 1, Offset: 1000, CompressedSize: 1, RawSize: 1},
+		{Key: keyRow("ab"), NumEntries: 1, Offset: 1100, CompressedSize: 1, RawSize: 1},
 	})
 	leafB := buildIndexBlock(t, 0, []*IndexEntry{
-		{Key: keyRow("ba"), Offset: 1200, CompressedSize: 1, RawSize: 1},
-		{Key: keyRow("bb"), Offset: 1300, CompressedSize: 1, RawSize: 1},
+		{Key: keyRow("ba"), NumEntries: 1, Offset: 1200, CompressedSize: 1, RawSize: 1},
+		{Key: keyRow("bb"), NumEntries: 1, Offset: 1300, CompressedSize: 1, RawSize: 1},
 	})
 	level1 := buildIndexBlock(t, 1, []*IndexEntry{
 		{Key: keyRow("ab"), Offset: 100, CompressedSize: 50, RawSize: 100}, // points at leafA

@@ -688,12 +688,27 @@ func TestValidateReadableIndexRejectsUnverifiedExtensions(t *testing.T) {
 	}
 }
 
+func buildValidationIndexBlock(t *testing.T, entries ...*index.IndexEntry) *index.IndexBlock {
+	t.Helper()
+	var data bytes.Buffer
+	offsets := make([]int32, 0, len(entries))
+	for _, entry := range entries {
+		offsets = append(offsets, int32(data.Len()))
+		if err := index.WriteIndexEntry(&data, entry); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return &index.IndexBlock{Offsets: offsets, Data: data.Bytes()}
+}
+
 func TestValidateReadableIndexRejectsEntryCountRootMismatch(t *testing.T) {
 	tests := map[string]*index.LocalityGroup{
 		"zero count with nonempty root": {
 			IsDefault:       true,
 			NumTotalEntries: 0,
-			RootIndex:       &index.IndexBlock{Offsets: []int32{0}},
+			RootIndex: buildValidationIndexBlock(t, &index.IndexEntry{
+				Key: mkCell("a", "1").K, NumEntries: 1,
+			}),
 		},
 		"positive count with empty root": {
 			IsDefault:       true,
@@ -710,6 +725,22 @@ func TestValidateReadableIndexRejectsEntryCountRootMismatch(t *testing.T) {
 				t.Fatalf("validateReadableIndex() = %v, want count/root mismatch", err)
 			}
 		})
+	}
+}
+
+func TestValidateReadableIndexRejectsUnorderedRoot(t *testing.T) {
+	root := buildValidationIndexBlock(
+		t,
+		&index.IndexEntry{Key: mkCell("z", "1").K, NumEntries: 1},
+		&index.IndexEntry{Key: mkCell("a", "1").K, NumEntries: 1},
+	)
+	err := validateReadableIndex(&index.Reader{Groups: []*index.LocalityGroup{{
+		IsDefault:       true,
+		NumTotalEntries: 2,
+		RootIndex:       root,
+	}}})
+	if err == nil || !strings.Contains(err.Error(), "not strictly after") {
+		t.Fatalf("validateReadableIndex() = %v, want key-order rejection", err)
 	}
 }
 
@@ -765,13 +796,17 @@ func TestValidateReadableIndexRejectsInvalidLocalityGroupLayouts(t *testing.T) {
 					IsDefault:       true,
 					ColumnFamilies:  map[string]int64{"shared": 1},
 					NumTotalEntries: 1,
-					RootIndex:       &index.IndexBlock{Offsets: []int32{0}},
+					RootIndex: buildValidationIndexBlock(t, &index.IndexEntry{
+						Key: mkCell("a", "1").K, NumEntries: 1,
+					}),
 				},
 				{
 					Name:            "named",
 					ColumnFamilies:  map[string]int64{"shared": 1},
 					NumTotalEntries: 1,
-					RootIndex:       &index.IndexBlock{Offsets: []int32{0}},
+					RootIndex: buildValidationIndexBlock(t, &index.IndexEntry{
+						Key: mkCell("b", "1").K, NumEntries: 1,
+					}),
 				},
 			},
 			want: "belongs to locality groups 0 and 1",
