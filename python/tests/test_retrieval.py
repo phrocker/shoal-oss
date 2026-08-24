@@ -16,6 +16,7 @@
 # under the License.
 
 import unittest
+from datetime import datetime, timedelta, timezone
 
 from shoal import ErrorCode, ShoalError, is_error_code
 from shoal.retrieval import (
@@ -26,6 +27,7 @@ from shoal.retrieval import (
     Request,
     Response,
     Retriever,
+    Scope,
 )
 
 
@@ -112,6 +114,59 @@ class RetrievalTest(unittest.TestCase):
                         ErrorCode.INVALID_ARGUMENT,
                     )
                 )
+
+    def test_request_rejects_invalid_scope(self) -> None:
+        invalid_requests = (
+            Request(text="query", scope=None),
+            Request(text="query", scope=Scope(document_ids=(1,))),
+            Request(text="query", scope=Scope(node_ids=("\ud800",))),
+        )
+        for request in invalid_requests:
+            with self.subTest(scope=request.scope):
+                with self.assertRaises(ShoalError) as raised:
+                    request.validate()
+                self.assertTrue(
+                    is_error_code(
+                        raised.exception,
+                        ErrorCode.INVALID_ARGUMENT,
+                    )
+                )
+
+    def test_request_rejects_ambiguous_or_unrepresentable_as_of(self) -> None:
+        invalid_values = (
+            datetime(2026, 8, 24),
+            datetime(
+                1,
+                1,
+                1,
+                tzinfo=timezone(timedelta(hours=1)),
+            ),
+            datetime(
+                9999,
+                12,
+                31,
+                23,
+                59,
+                59,
+                tzinfo=timezone(timedelta(hours=-1)),
+            ),
+        )
+        for as_of in invalid_values:
+            with self.subTest(as_of=as_of):
+                with self.assertRaises(ShoalError) as raised:
+                    Request(text="query", as_of=as_of).validate()
+                self.assertTrue(
+                    is_error_code(
+                        raised.exception,
+                        ErrorCode.INVALID_ARGUMENT,
+                    )
+                )
+
+    def test_request_accepts_representable_aware_as_of(self) -> None:
+        Request(
+            text="query",
+            as_of=datetime(2026, 8, 24, tzinfo=timezone.utc),
+        ).validate()
 
 
 if __name__ == "__main__":

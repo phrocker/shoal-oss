@@ -20,7 +20,7 @@
 from __future__ import annotations
 
 from dataclasses import field
-from datetime import datetime
+from datetime import datetime, timezone
 from types import MappingProxyType
 from typing import List, Mapping, Optional, Protocol, Tuple, Union, runtime_checkable
 
@@ -50,6 +50,20 @@ class Scope:
     def __post_init__(self) -> None:
         object.__setattr__(self, "document_ids", tuple(self.document_ids))
         object.__setattr__(self, "node_ids", tuple(self.node_ids))
+
+    def validate(self) -> None:
+        """Validate identifiers for transport as protobuf strings."""
+
+        for name, values in (
+            ("document ID", self.document_ids),
+            ("node ID", self.node_ids),
+        ):
+            for value in values:
+                if not _is_wire_string(value):
+                    raise new_error(
+                        ErrorCode.INVALID_ARGUMENT,
+                        f"retrieval {name} must be a valid UTF-8 string",
+                    )
 
 
 @frozen_dataclass
@@ -98,11 +112,45 @@ class Request:
                     ErrorCode.INVALID_ARGUMENT,
                     "unknown retrieval mode",
                 ) from None
-        if self.as_of is not None and not isinstance(self.as_of, datetime):
+        if not isinstance(self.scope, Scope):
             raise new_error(
                 ErrorCode.INVALID_ARGUMENT,
-                "as_of must be a datetime",
+                "scope must be a Scope",
             )
+        self.scope.validate()
+        if self.as_of is not None:
+            if not isinstance(self.as_of, datetime):
+                raise new_error(
+                    ErrorCode.INVALID_ARGUMENT,
+                    "as_of must be a datetime",
+                )
+            if self.as_of.utcoffset() is None:
+                raise new_error(
+                    ErrorCode.INVALID_ARGUMENT,
+                    "as_of must be timezone-aware",
+                )
+            try:
+                utc_as_of = self.as_of.astimezone(timezone.utc)
+            except (OverflowError, ValueError):
+                raise new_error(
+                    ErrorCode.INVALID_ARGUMENT,
+                    "as_of is outside the supported UTC range",
+                ) from None
+            if utc_as_of.year < 1 or utc_as_of.year > 9999:
+                raise new_error(
+                    ErrorCode.INVALID_ARGUMENT,
+                    "as_of is outside the supported UTC range",
+                )
+
+
+def _is_wire_string(value: object) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
 
 
 @frozen_dataclass
