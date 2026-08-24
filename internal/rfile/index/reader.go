@@ -82,6 +82,11 @@ func Parse(raw []byte) (*Reader, error) {
 	if groupCount < 0 {
 		return nil, fmt.Errorf("RFile.index: negative group count %d", groupCount)
 	}
+	if err := validateDecodedCount(
+		"RFile.index group", groupCount, r, maxLocalityGroups, 1, 0,
+	); err != nil {
+		return nil, err
+	}
 	out.Groups = make([]*LocalityGroup, 0, groupCount)
 	for i := int32(0); i < groupCount; i++ {
 		lg, err := ReadLocalityGroup(r, version)

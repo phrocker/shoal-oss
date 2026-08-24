@@ -463,6 +463,10 @@ func verifyRFileExport(
 	if err := validateExportManifest(manifest); err != nil {
 		return err
 	}
+	tablets, err := verificationTablets(manifest)
+	if err != nil {
+		return err
+	}
 	for _, rf := range manifest.RFiles {
 		format, err := validateExportFile(manifest, rf)
 		if err != nil {
@@ -479,7 +483,9 @@ func verifyRFileExport(
 		); err != nil {
 			return fmt.Errorf("engine: verify %s: %w", rf.DestinationPath, err)
 		}
-		if err := verifyRFileExportObject(ctx, b, rf, snapshotFactory); err != nil {
+		if err := verifyRFileExportObject(
+			ctx, b, rf, tablets[rf.TabletIndex], snapshotFactory,
+		); err != nil {
 			return err
 		}
 	}
@@ -495,6 +501,10 @@ func verifyImmutableExport(
 	if err := validateExportManifest(manifest); err != nil {
 		return err
 	}
+	tablets, err := verificationTablets(manifest)
+	if err != nil {
+		return err
+	}
 	for _, file := range manifest.RFiles {
 		format, err := validateExportFile(manifest, file)
 		if err != nil {
@@ -508,7 +518,9 @@ func verifyImmutableExport(
 			return fmt.Errorf("engine: verify %s: %w", file.DestinationPath, err)
 		}
 		if format == storage.ImmutableFormatRFile {
-			if err := verifyRFileExportObject(ctx, b, file, snapshotFactory); err != nil {
+			if err := verifyRFileExportObject(
+				ctx, b, file, tablets[file.TabletIndex], snapshotFactory,
+			); err != nil {
 				return err
 			}
 			continue
@@ -525,6 +537,16 @@ func verifyImmutableExport(
 		}
 	}
 	return nil
+}
+
+func verificationTablets(manifest *RFileExportManifest) ([]RFileExportTablet, error) {
+	if _, err := manifestSplits(manifest); err != nil {
+		return nil, err
+	}
+	if len(manifest.Tablets) == 0 {
+		return []RFileExportTablet{{Index: 0}}, nil
+	}
+	return manifest.Tablets, nil
 }
 
 func validateExportManifest(manifest *RFileExportManifest) error {
@@ -574,6 +596,7 @@ func verifyRFileExportObject(
 	ctx context.Context,
 	b storage.Backend,
 	rf RFileExportFile,
+	tablet RFileExportTablet,
 	snapshotFactory verificationSnapshotFactory,
 ) (err error) {
 	if err := ctx.Err(); err != nil {
@@ -637,7 +660,7 @@ func verifyRFileExportObject(
 	}
 
 	snapshot := &verificationReaderAt{ctx: ctx, source: local}
-	version, err := validateRFileSnapshot(ctx, snapshot, size)
+	version, err := validateRFileSnapshot(ctx, snapshot, size, tablet)
 	if err != nil {
 		if readErr := snapshot.firstError(); readErr != nil {
 			return fmt.Errorf("engine: read verification snapshot for %s: %w",
@@ -726,7 +749,12 @@ func writeVerificationSnapshot(dst io.Writer, p []byte) error {
 	return nil
 }
 
-func validateRFileSnapshot(ctx context.Context, src io.ReaderAt, size int64) (string, error) {
+func validateRFileSnapshot(
+	ctx context.Context,
+	src io.ReaderAt,
+	size int64,
+	tablet RFileExportTablet,
+) (string, error) {
 	bc, err := bcfile.NewReader(src, size)
 	if err != nil {
 		return "", err
@@ -751,15 +779,29 @@ func validateRFileSnapshot(ctx context.Context, src io.ReaderAt, size int64) (st
 			if err := ctx.Err(); err != nil {
 				return "", err
 			}
-			if _, _, err := reader.Next(); err != nil {
+			key, _, err := reader.Next()
+			if err != nil {
 				if errors.Is(err, io.EOF) {
 					break
 				}
 				return "", fmt.Errorf("scan locality group %d: %w", group, err)
 			}
+			if !rowBelongsToTablet(key.Row, tablet) {
+				return "", fmt.Errorf(
+					"locality group %d contains row %x outside manifest tablet %d bounds",
+					group, key.Row, tablet.Index,
+				)
+			}
 		}
 	}
 	return bc.Footer().Version.String(), nil
+}
+
+func rowBelongsToTablet(row []byte, tablet RFileExportTablet) bool {
+	if tablet.StartRow != nil && bytes.Compare(row, []byte(*tablet.StartRow)) < 0 {
+		return false
+	}
+	return tablet.EndRow == nil || bytes.Compare(row, []byte(*tablet.EndRow)) < 0
 }
 
 type verificationReaderAt struct {

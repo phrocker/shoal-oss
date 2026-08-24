@@ -69,6 +69,11 @@ func readMultiLevelBlock(r wire.ByteAndReader) (*IndexBlock, error) {
 	if numOffsets < 0 {
 		return nil, fmt.Errorf("IndexBlock: negative numOffsets %d", numOffsets)
 	}
+	if err := validateDecodedCount(
+		"IndexBlock offsets", numOffsets, r, maxIndexEntries, 4, 4,
+	); err != nil {
+		return nil, err
+	}
 	offsets := make([]int32, numOffsets)
 	for i := int32(0); i < numOffsets; i++ {
 		o, err := wire.ReadInt32(r)
@@ -83,6 +88,11 @@ func readMultiLevelBlock(r wire.ByteAndReader) (*IndexBlock, error) {
 	}
 	if indexSize < 0 {
 		return nil, fmt.Errorf("IndexBlock: negative indexSize %d", indexSize)
+	}
+	if err := validateDecodedLength(
+		"IndexBlock data", indexSize, r, maxIndexDataBytes, 0,
+	); err != nil {
+		return nil, err
 	}
 	data := make([]byte, indexSize)
 	if _, err := io.ReadFull(r, data); err != nil {
@@ -108,6 +118,11 @@ func readFlatBlock(r wire.ByteAndReader, version int32) (*IndexBlock, error) {
 	}
 	if size < 0 {
 		return nil, fmt.Errorf("IndexBlock: negative flat size %d", size)
+	}
+	if err := validateDecodedCount(
+		"IndexBlock flat entries", size, r, maxIndexEntries, 1, 0,
+	); err != nil {
+		return nil, err
 	}
 	// Decode each IndexEntry from the wire, then re-encode it into Data
 	// at a known offset. Avoids dual-format handling downstream.

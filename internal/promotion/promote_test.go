@@ -596,7 +596,8 @@ func TestPromoteRejectsSourceMutatedDuringAddTableSplits(t *testing.T) {
 	// round-trip is itself in flight, i.e. strictly after
 	// stagingPreflight already verified the original "a" content.
 	importer.onAddTableSplits = func() {
-		src.Put("events/t-0000/F0001.rf", validRFileBytes(t, []byte("X")))
+		row := representativeTabletRow(t, manifest, manifest.RFiles[0].TabletIndex)
+		src.Put("events/t-0000/F0001.rf", validRFileBytesForRow(t, row, []byte("X")))
 	}
 	if _, err := Promote(context.Background(), src, manifest, dst, "/bulk/events-1", importer, "events", Options{}); err == nil {
 		t.Fatal("Promote with src mutated during AddTableSplits = nil error, want error")

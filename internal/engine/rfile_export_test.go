@@ -828,6 +828,56 @@ func TestVerifyRFileExportScansEveryLocalityGroup(t *testing.T) {
 	}
 }
 
+func TestVerifyRFileExportRejectsRowsOutsideManifestTablet(t *testing.T) {
+	data := validRFileBytes(t)
+	tests := []struct {
+		name        string
+		split       string
+		tabletIndex int
+	}{
+		{name: "at or above end row", split: "m", tabletIndex: 0},
+		{name: "below start row", split: "s", tabletIndex: 1},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "F0001.rf")
+			backend := memory.New()
+			backend.Put(path, data)
+			manifest := exportManifestForBytes(path, data)
+			manifest.Tablets = []RFileExportTablet{
+				{Index: 0, EndRow: &test.split},
+				{Index: 1, StartRow: &test.split},
+			}
+			manifest.RFiles[0].TabletIndex = test.tabletIndex
+
+			err := VerifyRFileExport(context.Background(), backend, manifest)
+			if !errors.Is(err, storage.ErrImmutablePolicy) ||
+				!strings.Contains(err.Error(), "outside manifest tablet") {
+				t.Fatalf("VerifyRFileExport(out-of-tablet row) = %v, want structural policy error", err)
+			}
+		})
+	}
+}
+
+func TestVerifyRFileExportAcceptsRowWithinManifestTablet(t *testing.T) {
+	data := validRFileBytes(t)
+	path := filepath.Join(t.TempDir(), "F0001.rf")
+	backend := memory.New()
+	backend.Put(path, data)
+	manifest := exportManifestForBytes(path, data)
+	start, end := "q", "s"
+	manifest.Tablets = []RFileExportTablet{
+		{Index: 0, EndRow: &start},
+		{Index: 1, StartRow: &start, EndRow: &end},
+		{Index: 2, StartRow: &end},
+	}
+	manifest.RFiles[0].TabletIndex = 1
+
+	if err := VerifyRFileExport(context.Background(), backend, manifest); err != nil {
+		t.Fatalf("VerifyRFileExport(in-tablet row) = %v, want success", err)
+	}
+}
+
 func TestVerifyRFileExportPinsOneObjectSnapshot(t *testing.T) {
 	forged := forgedBCFileWithoutRFileIndex(t)
 	valid := validRFileBytes(t)

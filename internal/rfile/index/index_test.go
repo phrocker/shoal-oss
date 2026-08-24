@@ -22,6 +22,140 @@ func sampleKey(rowSuffix string) *wire.Key {
 	}
 }
 
+func TestRejectsHostileDecodedCountsBeforeAllocation(t *testing.T) {
+	t.Run("locality groups", func(t *testing.T) {
+		var buf bytes.Buffer
+		if err := wire.WriteInt32(&buf, RIndexMagic); err != nil {
+			t.Fatal(err)
+		}
+		if err := wire.WriteInt32(&buf, V8); err != nil {
+			t.Fatal(err)
+		}
+		if err := wire.WriteInt32(&buf, maxLocalityGroups+1); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Parse(buf.Bytes()); err == nil {
+			t.Fatal("Parse accepted excessive locality-group count")
+		}
+	})
+
+	t.Run("column families", func(t *testing.T) {
+		var buf bytes.Buffer
+		if err := wire.WriteBool(&buf, true); err != nil {
+			t.Fatal(err)
+		}
+		if err := wire.WriteInt32(&buf, maxColumnFamilies+1); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := ReadLocalityGroup(bytes.NewReader(buf.Bytes()), V8); err == nil {
+			t.Fatal("ReadLocalityGroup accepted excessive column-family count")
+		}
+	})
+
+	t.Run("multi-level offsets", func(t *testing.T) {
+		var buf bytes.Buffer
+		for _, value := range []int32{0, 0} {
+			if err := wire.WriteInt32(&buf, value); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := wire.WriteBool(&buf, false); err != nil {
+			t.Fatal(err)
+		}
+		if err := wire.WriteInt32(&buf, maxIndexEntries+1); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := ReadIndexBlock(bytes.NewReader(buf.Bytes()), V8); err == nil {
+			t.Fatal("ReadIndexBlock accepted excessive offset count")
+		}
+	})
+
+	t.Run("multi-level data", func(t *testing.T) {
+		var buf bytes.Buffer
+		for _, value := range []int32{0, 0} {
+			if err := wire.WriteInt32(&buf, value); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := wire.WriteBool(&buf, false); err != nil {
+			t.Fatal(err)
+		}
+		for _, value := range []int32{0, 1} {
+			if err := wire.WriteInt32(&buf, value); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if _, err := ReadIndexBlock(bytes.NewReader(buf.Bytes()), V8); err == nil {
+			t.Fatal("ReadIndexBlock accepted an index-data length with no encoded data")
+		}
+	})
+
+	t.Run("flat entries", func(t *testing.T) {
+		var buf bytes.Buffer
+		if err := wire.WriteInt32(&buf, maxIndexEntries+1); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := ReadIndexBlock(bytes.NewReader(buf.Bytes()), V4); err == nil {
+			t.Fatal("ReadIndexBlock accepted excessive flat-entry count")
+		}
+	})
+}
+
+func TestRejectsDecodedCountsBeyondRemainingBytes(t *testing.T) {
+	t.Run("locality groups", func(t *testing.T) {
+		var buf bytes.Buffer
+		for _, value := range []int32{RIndexMagic, V8, 1} {
+			if err := wire.WriteInt32(&buf, value); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if _, err := Parse(buf.Bytes()); err == nil {
+			t.Fatal("Parse accepted a group count with no encoded group")
+		}
+	})
+
+	t.Run("column families", func(t *testing.T) {
+		var buf bytes.Buffer
+		if err := wire.WriteBool(&buf, true); err != nil {
+			t.Fatal(err)
+		}
+		if err := wire.WriteInt32(&buf, 1); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := ReadLocalityGroup(bytes.NewReader(buf.Bytes()), V8); err == nil {
+			t.Fatal("ReadLocalityGroup accepted a column-family count with no encoded entry")
+		}
+	})
+
+	t.Run("multi-level offsets", func(t *testing.T) {
+		var buf bytes.Buffer
+		for _, value := range []int32{0, 0} {
+			if err := wire.WriteInt32(&buf, value); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := wire.WriteBool(&buf, false); err != nil {
+			t.Fatal(err)
+		}
+		if err := wire.WriteInt32(&buf, 1); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := ReadIndexBlock(bytes.NewReader(buf.Bytes()), V8); err == nil {
+			t.Fatal("ReadIndexBlock accepted an offset count with no encoded offset")
+		}
+	})
+
+	t.Run("flat entries", func(t *testing.T) {
+		var buf bytes.Buffer
+		if err := wire.WriteInt32(&buf, 1); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := ReadIndexBlock(bytes.NewReader(buf.Bytes()), V4); err == nil {
+			t.Fatal("ReadIndexBlock accepted an entry count with no encoded entry")
+		}
+	})
+}
+
 func TestIndexEntryRoundtrip(t *testing.T) {
 	want := &IndexEntry{
 		Key:            sampleKey("aaa"),

@@ -12,13 +12,17 @@ import (
 )
 
 func validRFileBytes(t *testing.T, value []byte) []byte {
+	return validRFileBytesForRow(t, []byte("row"), value)
+}
+
+func validRFileBytesForRow(t *testing.T, row, value []byte) []byte {
 	t.Helper()
 	var data bytes.Buffer
 	writer, err := rfile.NewWriter(&data, rfile.WriterOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := writer.Append(&rfile.Key{Row: []byte("row"), Timestamp: 1}, value); err != nil {
+	if err := writer.Append(&rfile.Key{Row: row, Timestamp: 1}, value); err != nil {
 		t.Fatal(err)
 	}
 	if err := writer.Close(); err != nil {
@@ -30,15 +34,62 @@ func validRFileBytes(t *testing.T, value []byte) []byte {
 func populateManifestRFiles(t *testing.T, src *memory.Backend, manifest *engine.RFileExportManifest) {
 	t.Helper()
 	for i := range manifest.RFiles {
-		data, file := testRFile(t, manifest.RFiles[i].TabletIndex, manifest.RFiles[i].DestinationPath, []byte{byte('a' + i)})
+		tabletIndex := manifest.RFiles[i].TabletIndex
+		row := representativeTabletRow(t, manifest, tabletIndex)
+		data, file := testRFileForRow(
+			t, tabletIndex, manifest.RFiles[i].DestinationPath, row, []byte{byte('a' + i)},
+		)
 		src.Put(file.DestinationPath, data)
 		manifest.RFiles[i] = file
 	}
 }
 
-func testRFile(t *testing.T, tabletIndex int, path string, value []byte) ([]byte, engine.RFileExportFile) {
+func representativeTabletRow(
+	t *testing.T,
+	manifest *engine.RFileExportManifest,
+	tabletIndex int,
+) []byte {
 	t.Helper()
-	data := validRFileBytes(t, value)
+	if len(manifest.Tablets) == 0 {
+		return []byte("row")
+	}
+	for _, tablet := range manifest.Tablets {
+		if tablet.Index != tabletIndex {
+			continue
+		}
+		if tablet.StartRow != nil {
+			return []byte(*tablet.StartRow)
+		}
+		if tablet.EndRow == nil {
+			return []byte("row")
+		}
+		end := []byte(*tablet.EndRow)
+		if len(end) == 0 {
+			t.Fatalf("tablet %d has an empty exclusive end row", tabletIndex)
+		}
+		row := append([]byte(nil), end...)
+		if row[len(row)-1] == 0 {
+			return row[:len(row)-1]
+		}
+		row[len(row)-1]--
+		return row
+	}
+	t.Fatalf("manifest has no tablet %d", tabletIndex)
+	return nil
+}
+
+func testRFile(t *testing.T, tabletIndex int, path string, value []byte) ([]byte, engine.RFileExportFile) {
+	return testRFileForRow(t, tabletIndex, path, []byte("row"), value)
+}
+
+func testRFileForRow(
+	t *testing.T,
+	tabletIndex int,
+	path string,
+	row, value []byte,
+) ([]byte, engine.RFileExportFile) {
+	t.Helper()
+	data := validRFileBytesForRow(t, row, value)
 	sum := sha256.Sum256(data)
 	return data, engine.RFileExportFile{
 		TabletIndex:     tabletIndex,

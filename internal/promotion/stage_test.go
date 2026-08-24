@@ -1036,8 +1036,8 @@ func (b *mutatingSourceBackend) Open(ctx context.Context, path string) (shstorag
 // would be written describing corrupted data as trustworthy.
 func TestStageBulkDirRejectsSourceMutatedBetweenPreflightVerifyAndItsOwnCopy(t *testing.T) {
 	const srcPath = "events/t-0000/F0001.rf"
-	original := validRFileBytes(t, []byte("original-bytes"))
-	mutated := validRFileBytes(t, []byte("mutated-bytes!"))
+	original := validRFileBytesForRow(t, []byte("a"), []byte("original-bytes"))
+	mutated := validRFileBytesForRow(t, []byte("a"), []byte("mutated-bytes!"))
 	if len(original) != len(mutated) {
 		t.Fatalf("test fixture bug: original (%d) and mutated (%d) must be equal length so storage.Copy's own length bookkeeping cannot itself detect the swap, isolating the destination-verification behavior under test", len(original), len(mutated))
 	}
@@ -1098,7 +1098,9 @@ func TestStageBulkDirInvalidatesStaleLoadMappingOnFailedRetry(t *testing.T) {
 	}
 
 	realSrc := memory.New()
-	first, firstFile := testRFile(t, 0, "events/t-0000/F0001.rf", []byte("f0001-bytes"))
+	first, firstFile := testRFileForRow(
+		t, 0, "events/t-0000/F0001.rf", []byte("a"), []byte("f0001-bytes"),
+	)
 	realSrc.Put(firstFile.DestinationPath, first)
 	realSrc.Put(srcPath, original)
 
@@ -1184,7 +1186,9 @@ func TestStageBulkDirOverwritesStaleLoadMappingWithUnparseablePlaceholderWhenBac
 	mutated := validRFileBytes(t, []byte("mutated-bytes!"))
 
 	realSrc := memory.New()
-	first, firstFile := testRFile(t, 0, "events/t-0000/F0001.rf", []byte("f0001-bytes"))
+	first, firstFile := testRFileForRow(
+		t, 0, "events/t-0000/F0001.rf", []byte("a"), []byte("f0001-bytes"),
+	)
 	realSrc.Put(firstFile.DestinationPath, first)
 	realSrc.Put(srcPath, original)
 
