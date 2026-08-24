@@ -348,19 +348,12 @@ func TabletServerLockData(serverUUID, address, group string, services ...ThriftS
 }
 
 // CompactorLockData builds the payload an external compactor publishes under
-// <instance>/compactors/<group>/<address>. Accumulo compactors expose both
-// ClientService and CompactorService on the same Thrift listener.
+// <instance>/compactors/<group>/<address>.
 func CompactorLockData(serverUUID, address, group string) (ServiceLockData, error) {
 	if group == "" {
 		group = DefaultResourceGroup
 	}
 	data := ServiceLockData{Descriptors: []ServiceDescriptor{
-		{
-			UUID:    serverUUID,
-			Service: ServiceClient,
-			Address: address,
-			Group:   group,
-		},
 		{
 			UUID:    serverUUID,
 			Service: ServiceCompactor,

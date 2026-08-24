@@ -102,10 +102,10 @@ func TestCompactorLockData(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CompactorLockData: %v", err)
 	}
-	if len(data.Descriptors) != 2 {
-		t.Fatalf("descriptors = %d, want 2", len(data.Descriptors))
+	if len(data.Descriptors) != 1 {
+		t.Fatalf("descriptors = %d, want 1", len(data.Descriptors))
 	}
-	for i, service := range []ThriftService{ServiceClient, ServiceCompactor} {
+	for i, service := range []ThriftService{ServiceCompactor} {
 		got := data.Descriptors[i]
 		if got.UUID != canonicalTestUUID || got.Service != service ||
 			got.Address != testAddress || got.Group != "shoal_default" {
