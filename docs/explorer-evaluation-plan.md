@@ -75,10 +75,10 @@ The fixture deliberately defines stronger semantics:
 
 ### 1.2 Current public `Request` mapping
 
-Each current expectation maps to one public retrieval request. The exceptions
-are the explicitly labelled **FUTURE** public principal and filter capabilities,
-which require proposed adapter behavior today, and the non-evaluable `q14` and
-`q19` schema probes.
+Each currently applicable expectation maps to one public retrieval request.
+The exceptions are the explicitly labelled **FUTURE** public principal and
+filter capabilities, which require proposed adapter behavior today, and cases
+whose applicability requires capabilities the target has not advertised.
 
 | Fixture field | Public mapping | Status |
 | --- | --- | --- |
@@ -104,6 +104,13 @@ concrete modes, and current evaluation does not prescribe empty-mode behavior.
 can scope graph node IDs, but it cannot request a bounded one-hop neighborhood.
 The case activates only when a target advertises a versioned bounded graph
 neighborhood contract and exposes the effective modes used.
+
+`q11`, `q12`, `q13`, `q15`, and `q16` retain complete desired graph-native,
+authorization, and cache oracles but are transport-conditional and **FUTURE**
+for current retrieval/gRPC evaluation. They activate only after the target
+advertises every capability listed by their applicability records. Until then
+they contribute to fixture-oracle validation only, not current conformance,
+embedded/remote parity, relevance, or release decisions.
 
 `q10-unauthorized-error` maps `scope.document_ids:
 ["amber-lag-runbook"]` and `filters.revision_ids: ["r1"]` to exactly one
@@ -172,8 +179,10 @@ schema used by this plan; objects are closed and reject every unlisted field.
 
 The delivered fixture contains 4 document revisions, 10 citation-backed
 relationships, 1 hierarchy with 5 nodes, 1 graph snapshot with 18 nodes,
-15 edges, 2 paths, and 19 expectations. Seventeen expectations are currently
-evaluable; `q14` and `q19` are future/not-evaluable contract probes.
+15 edges, 2 paths, and 19 expectations. Twelve expectations are currently
+evaluable and seven are future/not-evaluable under the current public
+retrieval/gRPC contract (specifically
+`q11`, `q12`, `q13`, `q14`, `q15`, `q16`, and `q19`).
 
 ```text
 DocumentRef = {
@@ -450,8 +459,34 @@ Expectation = {
     },
     neighborhood?: NeighborhoodRequest
   },
-  expected: CurrentExpected | FutureExpected
+  expected: CurrentExpected | FutureExpected,
+  applicability: Applicability
 }
+
+Applicability = {
+  surface: "public_retrieval_grpc",
+  state:
+    "current_evaluable" |
+    "future_not_evaluable_current_public_contract",
+  current_gate_eligibility: {
+    conformance: boolean,
+    embedded_remote_parity: boolean,
+    release: boolean,
+    relevance: boolean
+  },
+  activation: {
+    requires_all_capabilities: unique Capability[]
+  }
+}
+
+Capability =
+  public_graph_native_anchor_v1 |
+  public_graph_navigation_v1 |
+  public_authorization_filter_v1 |
+  public_principal_partitioned_cache_v1 |
+  public_default_mode_contract_v1 |
+  observable_effective_modes_v1 |
+  public_bounded_graph_neighborhood_v1
 
 CurrentExpected = {
   execution_state: complete | partial | error,
@@ -536,6 +571,22 @@ versioned bounded-graph-neighborhood contract and observable effective modes.
 Its declared request is `top_k: 10` with root `node:fanout-hub`, direction
 `outgoing`, `max_depth: 1`, and `max_fan_out: 10`.
 
+`applicability` is the sole authority for current gate participation:
+
+- `current_evaluable` requires all four gate-eligibility booleans to be true
+  and no activation capabilities;
+- `future_not_evaluable_current_public_contract` requires all four booleans to
+  be false and at least one named, versioned capability; and
+- a future case activates only after the target advertises every required
+  capability on `public_retrieval_grpc`.
+
+Desired execution, authorization, result, evidence, relevance, and ranking
+oracles never override applicability. `q11` requires
+`public_graph_native_anchor_v1` and `public_graph_navigation_v1`. `q12`, `q13`,
+`q15`, and `q16` additionally require `public_authorization_filter_v1` and
+`public_principal_partitioned_cache_v1`. Their populated `CurrentExpected`
+payloads preserve future oracle value but do not make them currently evaluable.
+
 `q05-section-hierarchy` is the required genuine tree-only case. It evaluates a
 section heading and document ancestor from `hierarchy.jsonl`, has no graph
 relationship expectation, and cannot be passed by retrieving a `part_of`
@@ -554,6 +605,10 @@ including:
 
 - malformed JSONL, unknown fields, blank records, duplicate IDs, or missing
   references;
+- a missing, extra, or open-ended applicability field, unknown capability, or
+  gate booleans inconsistent with applicability state;
+- a future case counted in current conformance, embedded/remote parity,
+  relevance, or release, or activated without every required capability;
 - corpus path escape, BOM, CR byte, invalid UTF-8, missing final LF, length or
   hash mismatch;
 - citation slice/quote mismatch or citation assigned to the wrong section;
@@ -652,7 +707,7 @@ The run manifest MUST enumerate these independent dimensions:
 | Parser | Every supported candidate parser; one independent reference parser |
 | Revision | Single, multiple, before boundary, exact boundary, after boundary |
 | Mode | Lexical, vector, tree, graph, declared hybrid; public default is FUTURE/non-gating |
-| Evidence | Citation, hierarchy-native, graph-native, multi-document |
+| Evidence | Citation, hierarchy-native, multi-document; graph-native is FUTURE/transport-conditional |
 | Authorization | Public, authorized restricted, filtered, direct-identity denied |
 | Execution | Complete, error; partial once publicly supported |
 | Transport | Embedded, remote |
@@ -663,9 +718,9 @@ The run manifest MUST enumerate these independent dimensions:
 
 Pairwise coverage MUST include every pair among supported values. A
 machine-generated pairwise coverage report MUST list covered and missing pairs.
-No unsupported pair may be silently counted as covered. `q14` and `q19` are
-excluded from current target pairwise coverage until their activation contracts
-are satisfied.
+No unsupported pair may be silently counted as covered. All seven
+future/not-evaluable cases are excluded from current target pairwise coverage
+until their applicability requirements are satisfied.
 
 ### 5.2 Mandatory higher-order cells
 
@@ -673,25 +728,27 @@ Pairwise coverage does not replace these explicit cases:
 
 - revision boundary x direct scope x unauthorized principal;
 - tree-only x hierarchy-native evidence x Markdown;
-- graph-only x graph-native evidence x no document citation;
-- graph-only x hidden restricted intermediate x unauthorized principal;
-- authorized warm x unauthorized probe x shared cache;
-- unauthorized first x authorized control x shared cache;
+- graph-only x graph-native evidence x no document citation (**FUTURE**);
+- graph-only x hidden restricted intermediate x unauthorized principal
+  (**FUTURE**);
+- authorized warm x unauthorized probe x shared cache (**FUTURE**);
+- unauthorized first x authorized control x shared cache (**FUTURE**);
 - embedded x remote x each independently tested mode;
 - each source format x each supported parser x citation boundary;
 - multi-document evidence x deduplication x tied ranking; and
 - high fan-out x as-of filter x authorization filter.
 
-The last cell is **FUTURE** until the bounded-neighborhood contract required by
-`q19` activates; its deterministic fan-out-10 fixture oracle is validated now.
+The graph-native, graph-authorization, cache, and last fan-out cells retain
+fixture oracles but are **FUTURE** target cells until their declared
+capabilities activate.
 
 ## 6. Metric definitions
 
 All metrics are computed per case and macro-averaged by case unless a weighted
 average is explicitly named. Reports MUST include raw counts and per-mode,
-per-format, per-transport, per-storage, and per-authorization slices. `q14` and
-`q19` are excluded from every current target metric population, denominator,
-relevance metric, and per-mode slice.
+per-format, per-transport, per-storage, and per-authorization slices. All seven
+future/not-evaluable cases are excluded from every current target metric
+population, denominator, relevance metric, and per-mode slice.
 
 Unless a metric below defines a stronger empty-set rule, a zero denominator is
 reported as `not_applicable` and excluded from macro-averages; it is never
@@ -762,9 +819,13 @@ When `IDCG@k == 0`, `nDCG@k` is `1` only when the deduplicated result list is
 empty; otherwise it is `0`. An empty returned list has precision `1` only when
 gold is also empty, otherwise `0`. Recall is `1` when both sets are empty.
 
-Tie groups permit any order within a tier. Results from a lower-quality tier
-MUST NOT precede a higher-quality tier. Duplicate `result_id` values after the
-first are discarded for relevance and separately counted as a defect:
+Across distinct implementations or baselines, permutations within one gold tie
+group are relevance-equivalent. That equivalence does not relax deterministic
+replay: repeated identical inputs to the same build and configuration MUST
+produce the exact same canonical normalized order, including within tie groups.
+Results from a lower-quality tier MUST NOT precede a higher-quality tier.
+Duplicate `result_id` values after the first are discarded for relevance and
+separately counted as a defect:
 
 ```text
 Duplicate rate = duplicate result occurrences / raw result occurrences
@@ -806,24 +867,34 @@ Useful path rate =
 The graph-enabled run MUST add supported evidence, not merely different prose.
 `q06-cross-document-path` tests citation-supported cross-document relationships.
 `q11-graph-native-navigation` tests graph-only evidence. Current gRPC scoring of
-the latter remains `not_evaluable_future_anchor_contract`.
+the latter remains `not_evaluable_future_anchor_contract`, and q11 is excluded
+from current conformance, parity, relevance, and release counts until
+`public_graph_native_anchor_v1` and `public_graph_navigation_v1` are advertised.
 
 ### 6.7 Deterministic ordering
 
-Normalize results to stable result IDs, evidence IDs, and tie groups.
+Normalize each response to a canonical ordered sequence of stable result IDs,
+ordered evidence IDs, ordered path steps, and tie groups. Canonicalization
+normalizes representation only; it MUST NOT sort away or otherwise conceal the
+order returned by the target.
 
 ```text
 Replay mismatch rate =
-  replays differing outside allowed tie permutations / replay comparisons
+  identical-input replays whose exact canonical normalized sequence differs
+  / identical-input replay comparisons
 Cross-process mismatch rate =
-  process pairs with differing normalized output / process comparisons
+  identical-input process pairs with differing exact canonical normalized order
+  / identical-input process comparisons
 Tie violation rate =
   lower-tier-before-higher-tier pairs / comparable result pairs
 ```
 
 Run each deterministic case 100 times in one process, 20 fresh processes, and
-with at least three input enumeration permutations. Scores alone are not stable
-identities and MUST NOT be used as final tie-breakers.
+with at least three input enumeration permutations. Every repeated run of each
+identical input must match exactly, including within ties. Tie permutations may
+be relevance-equivalent only when comparing distinct implementations or
+baselines; they are always replay mismatches for identical runs. Scores alone
+are not stable identities and MUST NOT be used as final tie-breakers.
 
 ### 6.8 Revision and as-of correctness
 
@@ -875,9 +946,12 @@ Authorized suppression =
   authorized controls missing expected results after unauthorized priming
 ```
 
-All four counts MUST be zero.
+Every applicable count MUST be zero. Under the current public retrieval/gRPC
+surface, only currently applicable authorization cases contribute to release
+counts; graph-native canary, contamination, and suppression counts remain
+future until their capability sets activate.
 
-Delivered canary coverage is strictly limited to:
+Delivered future-oracle canary coverage is strictly limited to:
 
 | Delivered channel | Record kind |
 | --- | --- |
@@ -890,7 +964,7 @@ Canary origins are only declared `node.canary_token`, `edge.canary_token`, and
 scope are excluded input origins. A token copied from excluded request metadata
 is not evidence of protected-corpus leakage.
 
-The required cache probes are:
+The desired future cache probes are:
 
 1. `q12-authorized-canary-warm` then
    `q13-unauthorized-canary-probe`: no leak and no poisoning.
@@ -900,6 +974,13 @@ The required cache probes are:
 
 The second run in each pair MUST share the candidate cache with the first.
 Each case also runs against an isolated cache as its control.
+
+These sequences preserve precise future expected behavior, but neither is a
+current retrieval/gRPC, embedded/remote parity, relevance, or release gate.
+They activate only after the target advertises
+`public_graph_native_anchor_v1`, `public_graph_navigation_v1`,
+`public_authorization_filter_v1`, and
+`public_principal_partitioned_cache_v1`.
 
 For both unauthorized cases, `q13` and `q15`, the complete forbidden-record
 closure is:
@@ -936,6 +1017,12 @@ document and revision IDs, evidence membership, citations, graph paths, nil
 versus empty normalization, finite scores, and UTF-8. Error parity includes
 invalid input, authorization denial, cancellation, and deadline behavior.
 
+The current embedded/remote parity population is exactly the 12
+`current_evaluable` cases. `q11`, `q12`, `q13`, `q15`, and `q16` are excluded
+along with `q14` and `q19`; populated desired graph-native/cache oracles do not
+override their all-false gate eligibility. Each excluded case joins parity only
+after every capability in its applicability record is advertised.
+
 Every mode MUST be tested independently in embedded and remote configurations;
 one hybrid parity test is insufficient. Every advertised storage adapter MUST
 run the same conformance pack. Storage-specific ordering, stale revisions, or
@@ -944,13 +1031,21 @@ difference.
 
 ### 6.11 Performance and scale
 
-All latency is client-observed wall time. Throughput intervals begin before the
-first accepted byte and end after durable/queryable completion.
+All latency is client-observed wall time from request dispatch to the observed
+terminal success, error, cancellation, or timeout. The latency population
+contains every measured request; outcome is not a latency filter. Ingestion
+throughput intervals begin before the first accepted byte and end after
+durable/queryable completion.
 
 ```text
 Ingestion throughput = successfully queryable source MiB / elapsed seconds
-Query throughput = completed requests / steady-state seconds
-p95/p99 latency = empirical percentile over successful measured requests
+Terminal query throughput = requests reaching any terminal outcome
+  / steady-state seconds
+Successful query throughput = successful requests / steady-state seconds
+p95/p99 latency = empirical percentile over all measured request durations
+Success rate = successful requests / measured requests
+Error rate = non-timeout errors / measured requests
+Timeout rate = timed-out requests / measured requests
 Scale correctness = exact passing sampled cases / sampled scale cases
 Fan-out amplification =
   candidate graph records examined or returned / gold contributing records
@@ -958,8 +1053,13 @@ Fan-out amplification =
 
 Reports MUST separate cold start, cold cache, and warm cache; concurrency;
 corpus size; graph size; fan-out; result limit; transport; storage; and machine
-profile. Timeouts and errors are counted in reliability and are not deleted
-from latency reporting.
+profile. Reliability rates are reported separately from latency percentiles.
+Errors retain their observed duration. A request timeout uses the observed
+duration from dispatch until its deadline/cancellation outcome. A request still
+nonterminal at the declared hard harness cutoff `H` is forcibly cancelled,
+classified as a timeout, and assigned duration `H`; the same declared `H` MUST
+be used for every compared configuration. No error or timeout may be deleted,
+zeroed, or replaced with a successful-request duration to improve p95 or p99.
 
 ### 6.12 User task completion and explainability
 
@@ -981,10 +1081,10 @@ override failed retrieval, citation, temporal, path, or authorization gates.
 
 ## 7. Release gates
 
-`q14` and `q19` contribute no current target hard-gate, relevance, ranking,
-regression, performance, or release-decision outcome. Closed-schema and
-deterministic-oracle validation of their `FutureExpected` records is
-fixture-integrity validation only, not a target behavior gate.
+All seven future/not-evaluable cases contribute no current target hard-gate,
+relevance, ranking, parity, regression, performance, or release-decision
+outcome. Closed-schema and deterministic-oracle validation of their desired
+records is fixture-integrity validation only, not a target behavior gate.
 
 ### 7.1 T0 deterministic correctness and security gates
 
@@ -999,28 +1099,32 @@ All are hard pass/fail gates:
 | Independent parser agreement with adjudicated gold | 100% for both parsers |
 | Hierarchy node/parent/depth/containment | 100% on fixture |
 | Fixture citation byte and identity accuracy | 100% |
-| Evidence membership precision and recall | 100% on exact fixture cases |
-| Relationship, graph, and hierarchy path validity | 100% |
+| Evidence membership precision and recall | 100% on currently applicable target cases; future oracles validated structurally |
+| Relationship and hierarchy path validity | 100% on currently applicable target cases |
+| Graph-native evidence/path validity | FUTURE; 100% after required capabilities activate |
 | Temporal and revision boundary accuracy | 100% |
 | Temporal leakage | 0 |
 | Deterministic replay/cross-process mismatch | 0 |
 | Tie violations and duplicate result rate | 0 |
-| Authorization record or delivered-channel canary leak | 0 |
-| Cross-principal contamination or authorized suppression | 0 |
-| Both cache orderings | 100% exact |
+| Current authorization isolation (`q09`, `q10`) | 0 forbidden-record leaks |
+| Graph-native canary leak, contamination, or authorized suppression | FUTURE; 0 after all required capabilities activate |
+| Both graph-native cache orderings | FUTURE; 100% exact after all required capabilities activate |
 | Current execution-state mapping | 100%; no synthesized partial response |
-| Embedded/remote normalized response and error parity | 100% |
+| Embedded/remote normalized response and error parity | 100% across the 12 currently applicable cases |
 | Storage conformance parity | 100% for every release-supported adapter |
 
-T0 authorization coverage is not complete until the future document, revision,
-section, span, source, explanation, and error-body canary fixtures exist.
-Until then, delivered graph-channel checks gate what they cover and release
-notes MUST disclose the remaining channel gap.
+Current T0 authorization coverage is limited to applicable `q09` and `q10`.
+The graph-native canary/cache oracles in `q12`, `q13`, `q15`, and `q16` remain
+future and transport-conditional until graph-native anchor, graph navigation,
+authorization-filter, and principal-partitioned-cache capabilities are all
+advertised. Document, revision, section, span, source, explanation, and
+error-body canaries remain additional future T0 expansions. Release notes MUST
+disclose all of these gaps.
 
 ### 7.2 Relevance and usefulness gates
 
-Apply to the blind release set, with per-mode results. The future `q14`
-default-mode and `q19` bounded-neighborhood probes are excluded:
+Apply to applicability-current cases in the blind release set, with per-mode
+results. All seven future/not-evaluable cases are excluded:
 
 | Metric | Overall gate | Per-mode floor |
 | --- | ---: | ---: |
@@ -1035,9 +1139,13 @@ default-mode and `q19` bounded-neighborhood probes are excluded:
 | Graph evidence gain on graph-eligible pairs | >= +0.10 absolute | no negative per-task regression |
 
 Report exact 95% bootstrap confidence intervals with 10,000 resamples.
-Passing requires the point estimate to meet the gate and the lower bound to be
-no more than 0.03 below it. Authorization and deterministic exactness never use
-confidence allowances.
+For every minimum or "at least" gate, use the lower confidence bound; passing
+requires the point estimate to meet the gate and the lower bound to be no more
+than 0.03 below it. For every maximum or "at most" gate, use the upper
+confidence bound; passing requires the point estimate to meet the gate and the
+upper bound to be no more than 0.03 above it. Thus unsupported-claim rate uses
+its upper bound, never its lower bound. Authorization and deterministic
+exactness never use confidence allowances.
 
 ### 7.3 Regression gates
 
@@ -1050,6 +1158,11 @@ Against the last accepted release on the identical blind dataset:
 - no p95 or p99 latency regression greater than 10%;
 - no throughput regression greater than 10%; and
 - no new unsupported format/parser pair.
+
+Define each degradation as a positive regression magnitude (quality or
+throughput drop, or latency increase). Because these are maximum-allowed gates,
+their upper confidence bounds determine passing; a lower bound MUST NOT be used
+to approve a possible regression.
 
 If a quality improvement intentionally changes gold ordering, the gold revision
 must be reviewed independently and both releases rerun on old and new gold.
@@ -1064,9 +1177,10 @@ The following MUST run without a generative model:
 - lexical baseline;
 - explicit tree and graph traversal;
 - revision/as-of filtering;
-- authorization and cache probes;
+- authorization and cache fixture probes, with target verdicts conditioned on
+  applicability;
 - stable result normalization, deduplication, path validation, and metrics;
-- embedded/remote/storage parity; and
+- embedded/remote/storage parity over applicability-current cases; and
 - latency, throughput, scale, and fan-out measurement.
 
 A vector implementation MAY require a fixed embedding artifact, but the
@@ -1108,10 +1222,10 @@ path, or citation mismatch.
 | L0 | Schema, hashes, bytes, references, mutations | Every change | Exact |
 | L1 | Public document/graph/retrieval contract units | Every change | Exact |
 | L2 | Candidate/reference parser and adapter components | Parser/adapter change | Exact |
-| L3 | Embedded black-box fixture by independent mode | Every change | T0 exact gates |
-| L4 | Remote black-box fixture by independent mode | Every change | T0 exact gates and parity |
-| L5 | Each storage adapter and both cache orderings | Storage/auth/cache change; nightly | T0 exact gates |
-| L6 | Blind relevance and task suite | Pull request sample; full nightly/release | Relevance gates |
+| L3 | Embedded black-box applicability-current cases by independent mode | Every change | Current T0 exact gates |
+| L4 | Remote black-box applicability-current cases by independent mode | Every change | Current T0 exact gates and parity |
+| L5 | Each storage adapter; future cache orderings after capability activation | Storage/auth/cache change; nightly | Current gates now; cache gates when activated |
+| L6 | Applicability-current blind relevance and task suite | Pull request sample; full nightly/release | Relevance gates |
 | L7 | T0-T2 performance, scale, and fan-out | Nightly/release | Performance gates |
 | L8 | Model-assisted synthesis and human audit | Scheduled/release | Separate model gates |
 
@@ -1139,6 +1253,12 @@ On the declared reference machine and storage profile:
 | T1 | <= 750 ms | <= 1.5 s | >= 50 requests/s | >= 99.9% |
 | T2 | <= 2.5 s | <= 5 s | >= 25 requests/s | >= 99.9% |
 | T3 | Report | Report | Report | >= 99.9% sampled |
+
+The p95/p99 cells use all measured durations, including errors and timeouts
+under the timeout rule in Section 6.11. Their upper 95% confidence bounds MUST
+meet the at-most thresholds. Minimum throughput and scale-correctness cells use
+their lower 95% bounds. Reliability remains a separately reported distribution
+of success, error, and timeout outcomes.
 
 T1 and T2 ingestion MUST sustain at least 2 MiB/s and complete with zero lost
 or duplicate logical revisions. These absolute targets are provisional until a
@@ -1186,13 +1306,13 @@ intermediates, prompts, credentials, or proprietary internals.
 4. Implement stable result/evidence normalization, multi-document evidence
    membership, deduplication, tie-group comparison, and nDCG zero-IDCG behavior.
 5. Run lexical, vector, tree, graph, and declared hybrid independently.
-   Preserve `q14` and `q19` only as non-evaluable future schema probes until
-   their activation contracts are available.
+   Apply target gates only to applicability-current cases; preserve all seven
+   future cases and their desired oracles until activation.
 6. Implement candidate/reference parser lineage recording and the versioned
    format/parser support relation.
-7. Implement authorization isolation with `q09`, `q10`, `q12`-`q13`, and
-   `q15`-`q16`, shared-cache controls, hidden-intermediate probes, and zero-leak
-   fail-fast behavior.
+7. Implement current authorization isolation with `q09` and `q10`. Preserve
+   `q12`-`q13` and `q15`-`q16` as future shared-cache,
+   hidden-intermediate, zero-leak oracles without adding them to current gates.
 8. Add negative fixture packs for malformed bytes, invalid ranges, duplicate
    IDs, broken hierarchy, broken paths, invalid temporal intervals, bad mode
    declarations, authorization leaks, and poisoned caches.
@@ -1211,8 +1331,10 @@ intermediates, prompts, credentials, or proprietary internals.
    corrupt indexes, retry duplication, and high fan-out authorization.
 5. Implement T1/T2 performance runs, cold/warm separation, and regression
    baselines.
-6. Add a public graph-native remote evidence anchor; then change graph-only
-   gRPC evaluation from not evaluable to exact parity.
+6. Add versioned public graph-native anchor and navigation capabilities, plus
+   authorization-filter and principal-partitioned-cache capabilities for
+   `q12`-`q16`; activate each case only when its complete capability set is
+   advertised, then add it to gRPC conformance and parity.
 7. Add public partial-execution metadata and cases that distinguish failed
    modes/shards from authorization filtering.
 
@@ -1243,7 +1365,7 @@ A release report MUST include:
 The release passes only when every applicable hard gate passes, every supported
 matrix pair is covered, relevance and performance gates pass, and no result is
 silently omitted. `not_evaluable` is an explicit disclosed state, never a pass.
-The `q14` and `q19` future statuses are disclosed but do not participate in the
-release decision.
+All seven future/not-evaluable case statuses are disclosed but do not
+participate in the current release decision.
 Any authorization leak, wrong as-of revision, invalid evidence path, strict
 schema failure, or deterministic parity mismatch is an unconditional failure.

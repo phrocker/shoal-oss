@@ -9,7 +9,7 @@ Expectation records use `semantics: "proposed-evaluation-v2"`. They define an ev
 The current public retrieval `Response` is all-or-error and does not expose partial-result or authorization-oracle metadata. In particular, these are proposed fixture controls or evaluator fields:
 
 - `request.strategy`, `request.modes`, `request.top_k`, `request.principal`, `request.filters`, and `request.cache_probe`;
-- `expected.execution_state`, `expected.authorization_oracle`, `expected.results_exact`, and `expected.ranking`;
+- `applicability`, `expected.execution_state`, `expected.authorization_oracle`, `expected.results_exact`, and `expected.ranking`;
 - evaluator-only forbidden IDs, required scope names, and canary tokens.
 
 An adapter may map a current public error or response into this harness model, but tests must not assert that public runtime responses contain these fields.
@@ -34,7 +34,7 @@ Other fixture files are:
 - `hierarchy.jsonl`: document/section hierarchy metadata used only by tree-mode locality evaluation;
 - `expectations.jsonl`: query requests and exact evaluator oracles.
 
-Current fixture counts are 4 document revisions, 10 citation-backed relationships, 1 hierarchy with 5 nodes, 1 graph snapshot with 18 nodes, 15 edges, and 2 paths, and 19 expectations. Of those expectations, 17 are currently evaluable and 2 are future/not-evaluable contract probes.
+Current fixture counts are 4 document revisions, 10 citation-backed relationships, 1 hierarchy with 5 nodes, 1 graph snapshot with 18 nodes, 15 edges, and 2 paths, and 19 expectations. Of those expectations, 12 are currently evaluable and 7 are future/not-evaluable contract probes.
 
 ## Shared record types
 
@@ -248,7 +248,7 @@ Path = {
 
 For each path, `len(node_ids) == len(edge_ids) + 1`, and each edge must connect the corresponding adjacent node pair.
 
-The Violet Gate, Celadon Hub, and Sable Sink component is graph-native and has no document citation. Graph-only query `q11` navigates this component and expects graph-native evidence.
+The Violet Gate, Celadon Hub, and Sable Sink component is graph-native and has no document citation. Future graph-only query `q11` defines the desired navigation and graph-native evidence oracle.
 
 Snapshot oracle `oracle:graph-fan-out-10` declares one visible hub, exactly 10 visible leaves, and exactly 10 directed outgoing hub-to-leaf edges. Its edge and leaf arrays are paired by index and ordered by ascending edge ID. No other edge may have `node:fanout-hub` as its source.
 
@@ -333,8 +333,34 @@ Expectation = {
     },
     neighborhood?: NeighborhoodRequest
   },
-  expected: CurrentExpected | FutureExpected
+  expected: CurrentExpected | FutureExpected,
+  applicability: Applicability
 }
+
+Applicability = {
+  surface: "public_retrieval_grpc",
+  state:
+    "current_evaluable" |
+    "future_not_evaluable_current_public_contract",
+  current_gate_eligibility: {
+    conformance: boolean,
+    embedded_remote_parity: boolean,
+    release: boolean,
+    relevance: boolean
+  },
+  activation: {
+    requires_all_capabilities: unique Capability[]
+  }
+}
+
+Capability =
+  public_graph_native_anchor_v1 |
+  public_graph_navigation_v1 |
+  public_authorization_filter_v1 |
+  public_principal_partitioned_cache_v1 |
+  public_default_mode_contract_v1 |
+  observable_effective_modes_v1 |
+  public_bounded_graph_neighborhood_v1
 
 CurrentExpected = {
     execution_state: complete | partial | error,
@@ -425,6 +451,29 @@ NeighborhoodRequest = {
 
 The current public contract cannot execute this bounded-neighborhood oracle, so q19 has no current results, relevance, or ranking gate. Its `snapshot_oracle_id` retains the deterministic fan-out-10 truth until a target advertises a versioned bounded-graph-neighborhood contract with observable effective modes.
 
+## Applicability and capability activation
+
+`applicability` is required and closed-schema on every expectation. It is the only field that determines whether a case participates in current conformance, embedded/remote parity, release, or relevance gates:
+
+- `current_evaluable` requires all four gate booleans to be true and `requires_all_capabilities` to be empty;
+- `future_not_evaluable_current_public_contract` requires all four gate booleans to be false and at least one required capability;
+- a future case may activate only when the target advertises every named, versioned capability on `public_retrieval_grpc`.
+
+Execution state, authorization oracle, results, evidence, relevance grades, and ranking never override applicability. This makes it mechanically impossible for a future case with a fully specified desired oracle to enter a current gate.
+
+The future cases and activation requirements are:
+
+| Cases | Required capabilities |
+| --- | --- |
+| q11 | `public_graph_native_anchor_v1`, `public_graph_navigation_v1` |
+| q12, q13, q15, q16 | `public_graph_native_anchor_v1`, `public_graph_navigation_v1`, `public_authorization_filter_v1`, `public_principal_partitioned_cache_v1` |
+| q14 | `public_default_mode_contract_v1`, `observable_effective_modes_v1` |
+| q19 | `public_bounded_graph_neighborhood_v1`, `observable_effective_modes_v1` |
+
+q11, q12, q13, q15, and q16 deliberately retain their desired future `execution_state`, authorization, result, evidence, and ranking oracles. Those payloads become active only after all declared capabilities are advertised; until then their all-false gate eligibility excludes them from current retrieval/gRPC conformance and current embedded/remote parity.
+
+q14 and q19 additionally use `FutureExpected` because the current public contract cannot issue their operations at all.
+
 `request.scope.document_ids` is the public direct-document request scope. Case `q10-unauthorized-error` contains exactly one logical document ID, `amber-lag-runbook`, and exactly one `filters.revision_ids` value, `r1`. Their Cartesian product identifies one immutable fixture revision and maps to one Request. This field is not evaluator-only authorization metadata.
 
 ## Execution state versus authorization
@@ -454,7 +503,7 @@ AuthorizationOracle = {
 }
 ```
 
-Authorization-filtered cases `q09`, `q13`, and `q15` are execution-`complete`. They expect no results because their tasks are not answerable from visible evidence, and `task_answerable` is false. They receive no relevance or task-success credit for returning an unrelated public fact.
+Authorization-filtered case `q09` and the desired future oracles for q13 and q15 are execution-`complete`. They expect no results because their tasks are not answerable from visible evidence, and `task_answerable` is false. They receive no relevance or task-success credit for returning an unrelated public fact.
 
 `q10` is the separate unauthorized-error oracle. Candidate output is not required to contain forbidden record IDs, scope names, detailed error text, or canary values.
 
@@ -483,6 +532,8 @@ Reverse probe `graph-canary-cross-principal-reverse` evaluates unauthorized then
 2. `q16-authorized-cache-verify`, which repeats it under `graph:restricted`.
 
 Both probes require principal-partitioned cache entries and `no_leak` plus `no_poisoning`. The reverse probe additionally requires `no_authorized_result_suppression`: the unauthorized first response must not suppress the complete authorized node, edge, and path results in the second response.
+
+Both cache sequences are paired future probes. Their desired authorization and cache outcomes remain fully specified, but they contribute to no current gate until the target advertises the graph-native anchor, graph navigation, authorization-filter, and principal-partitioned-cache capabilities.
 
 Forbidden IDs, tokens, and scope names live in `authorization_oracle.evaluator_only`; candidates do not need to echo them.
 
@@ -514,26 +565,28 @@ A fixture validator must fail on any of the following:
 
 1. malformed JSON, blank JSONL records, missing fields, extra fields, or incorrect field types;
 2. duplicate case, relationship, graph record, hierarchy node, anchor, evidence, result, path, cache-probe, or canary-token IDs;
-3. a missing/non-positive `top_k`, a strategy-to-modes mismatch, more than one empty-mode case, or an empty-mode case other than `q14-public-default-semantics`;
-4. q14 or q19 having any current execution, authorization, exact result, evidence, fact, relevance, ranking, or release-gate oracle, or lacking its future activation requirements;
-5. a path outside this fixture, missing file, BOM, CR byte, invalid UTF-8, missing final LF, length mismatch, or SHA-256 mismatch;
-6. a document header whose logical document ID, revision ID, or temporal interval disagrees with the inventory;
-7. a citation outside its file, assigned to the wrong section, or whose UTF-8 slice differs from `quote`;
-8. an unknown or temporally invalid relationship, graph record, hierarchy node, evidence, result, or path reference;
-9. relationship, graph, or hierarchy path discontinuity;
-10. graph-native evidence that points to a citation, or hierarchy-native evidence that points outside `hierarchy.jsonl`;
-11. a result with missing evidence, invalid grade/tie group, duplicate identity, or a count above `top_k`;
-12. a ranking that does not exactly partition results, disagrees with result tie groups, or orders tie groups non-monotonically;
-13. an effective revision or graph record outside the request's `as_of` interval;
-14. an invalid one-second fixture tick, an invalid q17/q18 timestamp or revision selection, or an invalid exact-boundary result at `2026-03-15T00:00:00Z`;
-15. an authorization-filtered case marked execution-`partial`, or a denied case not marked execution-`error`;
-16. positive relevance/results when `task_answerable` is false;
-17. a visible result or evidence requiring scopes absent from the principal;
-18. a public direct-document scope that maps to zero or multiple revisions instead of exactly one Request;
-19. either cache ordering missing, mispaired, principal-equal, inconsistent with `graph.jsonl`, leaking results, poisoning results, or suppressing the authorized second response;
-20. q13 or q15 omitting any restricted node, edge, or path in the authorized query closure;
-21. a fan-out oracle whose hub has other outgoing edges, whose edge/leaf pairing is discontinuous, whose order is nondeterministic, or whose count is not exactly 10;
-22. q19 referencing any other snapshot oracle, contributing to current result/ranking gates, or lacking its future bounded-neighborhood activation contract;
-23. a canary origin, channel, record, or token inconsistent with `graph.jsonl`;
-24. any evaluator-only forbidden ID, scope name, or canary token made mandatory in candidate output;
-25. any claim that span, explanation, or error-body canaries are covered.
+3. a missing, extra, or open-ended applicability field; an unknown capability; or gate booleans inconsistent with applicability state;
+4. any future case counted in current conformance, embedded/remote parity, release, or relevance gates, or activated without every required capability;
+5. a missing/non-positive `top_k`, a strategy-to-modes mismatch, more than one empty-mode case, or an empty-mode case other than `q14-public-default-semantics`;
+6. q14 or q19 having any current execution, authorization, exact result, evidence, fact, relevance, ranking, or release-gate oracle, or lacking its future activation requirements;
+7. a path outside this fixture, missing file, BOM, CR byte, invalid UTF-8, missing final LF, length mismatch, or SHA-256 mismatch;
+8. a document header whose logical document ID, revision ID, or temporal interval disagrees with the inventory;
+9. a citation outside its file, assigned to the wrong section, or whose UTF-8 slice differs from `quote`;
+10. an unknown or temporally invalid relationship, graph record, hierarchy node, evidence, result, or path reference;
+11. relationship, graph, or hierarchy path discontinuity;
+12. graph-native evidence that points to a citation, or hierarchy-native evidence that points outside `hierarchy.jsonl`;
+13. a result with missing evidence, invalid grade/tie group, duplicate identity, or a count above `top_k`;
+14. a ranking that does not exactly partition results, disagrees with result tie groups, or orders tie groups non-monotonically;
+15. an effective revision or graph record outside the request's `as_of` interval;
+16. an invalid one-second fixture tick, an invalid q17/q18 timestamp or revision selection, or an invalid exact-boundary result at `2026-03-15T00:00:00Z`;
+17. an authorization-filtered case marked execution-`partial`, or a denied case not marked execution-`error`;
+18. positive relevance/results when `task_answerable` is false;
+19. a visible result or evidence requiring scopes absent from the principal;
+20. a public direct-document scope that maps to zero or multiple revisions instead of exactly one Request;
+21. either cache ordering missing, mispaired, principal-equal, inconsistent with `graph.jsonl`, leaking results, poisoning results, or suppressing the authorized second response;
+22. q13 or q15 omitting any restricted node, edge, or path in the authorized query closure;
+23. a fan-out oracle whose hub has other outgoing edges, whose edge/leaf pairing is discontinuous, whose order is nondeterministic, or whose count is not exactly 10;
+24. q19 referencing any other snapshot oracle, contributing to current result/ranking gates, or lacking its future bounded-neighborhood activation contract;
+25. a canary origin, channel, record, or token inconsistent with `graph.jsonl`;
+26. any evaluator-only forbidden ID, scope name, or canary token made mandatory in candidate output;
+27. any claim that span, explanation, or error-body canaries are covered.
