@@ -318,6 +318,41 @@ func TestRequestIdentityPreservesScopeBoundariesAndAllFields(t *testing.T) {
 	}
 }
 
+func TestExplanationReportsWeightedModeContribution(t *testing.T) {
+	corpus, err := explorer.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer corpus.Close()
+	if _, err := corpus.Ingest(context.Background(), explorer.Source{
+		URI: "file:///weighted.md", MediaType: explorer.MediaTypeMarkdown,
+		Content: "# Heading\n\nEvidence without the relationship term.\n",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	response, err := corpus.Retrieve(context.Background(), retrieval.Request{
+		Text: "contains", TopK: 1,
+		Modes:   []retrieval.Mode{retrieval.ModeGraph},
+		Explain: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(response.Results) != 1 {
+		t.Fatalf("results = %+v", response.Results)
+	}
+	result := response.Results[0]
+	if result.Explanation == nil {
+		t.Fatal("missing explanation")
+	}
+	if got := result.Explanation.Scores[string(retrieval.ModeGraph)]; got != result.Score {
+		t.Fatalf("graph contribution = %v, result score = %v", got, result.Score)
+	}
+	if result.Score != shoal.Score(0.25) {
+		t.Fatalf("weighted graph score = %v", result.Score)
+	}
+}
+
 func TestMarkdownHeadingsPreserveHashesAndIgnoreFences(t *testing.T) {
 	ctx := context.Background()
 	corpus, err := explorer.Open(t.TempDir())

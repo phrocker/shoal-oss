@@ -173,14 +173,8 @@ func (e *Explorer) Retrieve(
 		if request.Explain {
 			scores := map[string]shoal.Score{}
 			for _, mode := range match.activeModes {
-				switch mode {
-				case retrieval.ModeLexical:
-					scores[string(mode)] = match.lexical
-				case retrieval.ModeTree:
-					scores[string(mode)] = match.tree
-				case retrieval.ModeGraph:
-					scores[string(mode)] = match.graph
-				}
+				scores[string(mode)] = modeScore(
+					mode, match.lexical, match.tree, match.graph)
 			}
 			result.Explanation = &retrieval.Explanation{
 				Modes:   append([]retrieval.Mode(nil), match.activeModes...),
@@ -226,16 +220,24 @@ func combinedScore(
 ) shoal.Score {
 	var score shoal.Score
 	for _, mode := range modes {
-		switch mode {
-		case retrieval.ModeLexical:
-			score += lexical
-		case retrieval.ModeTree:
-			score += treeScore*0.35 + lexical*0.65
-		case retrieval.ModeGraph:
-			score += graphScore*0.25 + lexical*0.75
-		}
+		score += modeScore(mode, lexical, treeScore, graphScore)
 	}
 	return score / shoal.Score(len(modes))
+}
+
+func modeScore(
+	mode retrieval.Mode, lexical, treeScore, graphScore shoal.Score,
+) shoal.Score {
+	switch mode {
+	case retrieval.ModeLexical:
+		return lexical
+	case retrieval.ModeTree:
+		return treeScore*0.35 + lexical*0.65
+	case retrieval.ModeGraph:
+		return graphScore*0.25 + lexical*0.75
+	default:
+		return 0
+	}
 }
 
 func evidencePath(
