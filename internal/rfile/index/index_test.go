@@ -2,9 +2,11 @@ package index
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"io"
 	"testing"
+	"unicode/utf16"
 
 	"github.com/phrocker/shoal-oss/internal/rfile/wire"
 )
@@ -18,6 +20,140 @@ func sampleKey(rowSuffix string) *wire.Key {
 		Timestamp:        12345,
 		Deleted:          false,
 	}
+}
+
+func TestRejectsHostileDecodedCountsBeforeAllocation(t *testing.T) {
+	t.Run("locality groups", func(t *testing.T) {
+		var buf bytes.Buffer
+		if err := wire.WriteInt32(&buf, RIndexMagic); err != nil {
+			t.Fatal(err)
+		}
+		if err := wire.WriteInt32(&buf, V8); err != nil {
+			t.Fatal(err)
+		}
+		if err := wire.WriteInt32(&buf, maxLocalityGroups+1); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Parse(buf.Bytes()); err == nil {
+			t.Fatal("Parse accepted excessive locality-group count")
+		}
+	})
+
+	t.Run("column families", func(t *testing.T) {
+		var buf bytes.Buffer
+		if err := wire.WriteBool(&buf, true); err != nil {
+			t.Fatal(err)
+		}
+		if err := wire.WriteInt32(&buf, maxColumnFamilies+1); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := ReadLocalityGroup(bytes.NewReader(buf.Bytes()), V8); err == nil {
+			t.Fatal("ReadLocalityGroup accepted excessive column-family count")
+		}
+	})
+
+	t.Run("multi-level offsets", func(t *testing.T) {
+		var buf bytes.Buffer
+		for _, value := range []int32{0, 0} {
+			if err := wire.WriteInt32(&buf, value); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := wire.WriteBool(&buf, false); err != nil {
+			t.Fatal(err)
+		}
+		if err := wire.WriteInt32(&buf, maxIndexEntries+1); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := ReadIndexBlock(bytes.NewReader(buf.Bytes()), V8); err == nil {
+			t.Fatal("ReadIndexBlock accepted excessive offset count")
+		}
+	})
+
+	t.Run("multi-level data", func(t *testing.T) {
+		var buf bytes.Buffer
+		for _, value := range []int32{0, 0} {
+			if err := wire.WriteInt32(&buf, value); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := wire.WriteBool(&buf, false); err != nil {
+			t.Fatal(err)
+		}
+		for _, value := range []int32{0, 1} {
+			if err := wire.WriteInt32(&buf, value); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if _, err := ReadIndexBlock(bytes.NewReader(buf.Bytes()), V8); err == nil {
+			t.Fatal("ReadIndexBlock accepted an index-data length with no encoded data")
+		}
+	})
+
+	t.Run("flat entries", func(t *testing.T) {
+		var buf bytes.Buffer
+		if err := wire.WriteInt32(&buf, maxIndexEntries+1); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := ReadIndexBlock(bytes.NewReader(buf.Bytes()), V4); err == nil {
+			t.Fatal("ReadIndexBlock accepted excessive flat-entry count")
+		}
+	})
+}
+
+func TestRejectsDecodedCountsBeyondRemainingBytes(t *testing.T) {
+	t.Run("locality groups", func(t *testing.T) {
+		var buf bytes.Buffer
+		for _, value := range []int32{RIndexMagic, V8, 1} {
+			if err := wire.WriteInt32(&buf, value); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if _, err := Parse(buf.Bytes()); err == nil {
+			t.Fatal("Parse accepted a group count with no encoded group")
+		}
+	})
+
+	t.Run("column families", func(t *testing.T) {
+		var buf bytes.Buffer
+		if err := wire.WriteBool(&buf, true); err != nil {
+			t.Fatal(err)
+		}
+		if err := wire.WriteInt32(&buf, 1); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := ReadLocalityGroup(bytes.NewReader(buf.Bytes()), V8); err == nil {
+			t.Fatal("ReadLocalityGroup accepted a column-family count with no encoded entry")
+		}
+	})
+
+	t.Run("multi-level offsets", func(t *testing.T) {
+		var buf bytes.Buffer
+		for _, value := range []int32{0, 0} {
+			if err := wire.WriteInt32(&buf, value); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := wire.WriteBool(&buf, false); err != nil {
+			t.Fatal(err)
+		}
+		if err := wire.WriteInt32(&buf, 1); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := ReadIndexBlock(bytes.NewReader(buf.Bytes()), V8); err == nil {
+			t.Fatal("ReadIndexBlock accepted an offset count with no encoded offset")
+		}
+	})
+
+	t.Run("flat entries", func(t *testing.T) {
+		var buf bytes.Buffer
+		if err := wire.WriteInt32(&buf, 1); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := ReadIndexBlock(bytes.NewReader(buf.Bytes()), V4); err == nil {
+			t.Fatal("ReadIndexBlock accepted an entry count with no encoded entry")
+		}
+	})
 }
 
 func TestIndexEntryRoundtrip(t *testing.T) {
@@ -114,6 +250,41 @@ func TestIndexBlockMultiLevelRoundtrip(t *testing.T) {
 	}
 }
 
+func TestIndexBlockRejectsInvalidOffsets(t *testing.T) {
+	tests := map[string]*IndexBlock{
+		"nonzero first": {
+			Offsets: []int32{1},
+			Data:    []byte{0, 0},
+		},
+		"duplicate": {
+			Offsets: []int32{0, 0},
+			Data:    []byte{0},
+		},
+		"decreasing": {
+			Offsets: []int32{0, 2, 1},
+			Data:    []byte{0, 0, 0},
+		},
+		"outside data": {
+			Offsets: []int32{0, 1},
+			Data:    []byte{0},
+		},
+		"data without offsets": {
+			Data: []byte{0},
+		},
+	}
+	for name, block := range tests {
+		t.Run(name, func(t *testing.T) {
+			var buf bytes.Buffer
+			if err := WriteIndexBlock(&buf, block); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := ReadIndexBlock(bytes.NewReader(buf.Bytes()), V8); err == nil {
+				t.Fatal("ReadIndexBlock accepted invalid offsets")
+			}
+		})
+	}
+}
+
 func TestIndexBlockFlatV3(t *testing.T) {
 	// v3/v4 layout: int32 size + size × IndexEntry (no level/offset/hasNext header).
 	// Build that wire form by hand, then verify ReadIndexBlock(..., V3) reads it
@@ -179,6 +350,52 @@ func makeMinimalIndexBlock(t *testing.T) *IndexBlock {
 		HasNext: false,
 		Offsets: []int32{0},
 		Data:    data.Bytes(),
+	}
+}
+
+func writeModifiedUTF(t *testing.T, w io.Writer, value string) {
+	t.Helper()
+
+	var encoded bytes.Buffer
+	for _, unit := range utf16.Encode([]rune(value)) {
+		switch {
+		case unit >= 0x0001 && unit <= 0x007f:
+			encoded.WriteByte(byte(unit))
+		case unit <= 0x07ff:
+			encoded.WriteByte(0xc0 | byte(unit>>6))
+			encoded.WriteByte(0x80 | byte(unit&0x3f))
+		default:
+			encoded.WriteByte(0xe0 | byte(unit>>12))
+			encoded.WriteByte(0x80 | byte((unit>>6)&0x3f))
+			encoded.WriteByte(0x80 | byte(unit&0x3f))
+		}
+	}
+	if encoded.Len() > 0xffff {
+		t.Fatalf("modified UTF fixture is too long: %d", encoded.Len())
+	}
+
+	var length [2]byte
+	binary.BigEndian.PutUint16(length[:], uint16(encoded.Len()))
+	if _, err := w.Write(length[:]); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write(encoded.Bytes()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func writeSamplerConfiguration(t *testing.T, w io.Writer, className string, options [][2]string) {
+	t.Helper()
+	if _, err := w.Write([]byte{samplerConfigurationVersion}); err != nil {
+		t.Fatal(err)
+	}
+	writeModifiedUTF(t, w, className)
+	if err := wire.WriteInt32(w, int32(len(options))); err != nil {
+		t.Fatal(err)
+	}
+	for _, option := range options {
+		writeModifiedUTF(t, w, option[0])
+		writeModifiedUTF(t, w, option[1])
 	}
 }
 
@@ -446,7 +663,7 @@ func TestParse_V8WithoutOptionalTrailers(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if r.SampleGroups != nil || r.VectorIndexRaw != nil {
+	if r.SampleGroups != nil || r.SamplerConfiguration != nil || r.VectorExtension != nil {
 		t.Errorf("optional trailers should be nil")
 	}
 }
@@ -466,29 +683,42 @@ func TestParse_V8WithVectorTrailer(t *testing.T) {
 	}
 	wire.WriteBool(&buf, false) // hasSamples = false
 	wire.WriteBool(&buf, true)  // hasVectorIndex = true
-	// Pad with arbitrary bytes that we expect to land in VectorIndexRaw.
+	// No local vector metadata producer/schema exists, so the complete tail
+	// (including a hypothetical tessellation flag/footer) is opaque.
 	buf.Write([]byte{0xab, 0xcd, 0xef, 0x12, 0x34})
 
 	r, err := Parse(buf.Bytes())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Equal(r.VectorIndexRaw, []byte{0xab, 0xcd, 0xef, 0x12, 0x34}) {
-		t.Errorf("VectorIndexRaw = %x", r.VectorIndexRaw)
+	if r.VectorExtension == nil {
+		t.Fatal("VectorExtension is nil")
+	}
+	if r.VectorExtension.Kind != OpaqueV8VectorAndTessellation {
+		t.Errorf("VectorExtension.Kind = %q", r.VectorExtension.Kind)
+	}
+	if !bytes.Equal(r.VectorExtension.Data, []byte{0xab, 0xcd, 0xef, 0x12, 0x34}) {
+		t.Errorf("VectorExtension.Data = %x", r.VectorExtension.Data)
 	}
 }
 
-func TestParse_V8SampleGroupsErrorsCleanly(t *testing.T) {
-	// Sample groups are unimplemented; Parse must error rather than silently
-	// drop them or hang.
+func TestParse_V8SampleGroupsAndFollowingFlags(t *testing.T) {
 	var buf bytes.Buffer
 	wire.WriteInt32(&buf, RIndexMagic)
 	wire.WriteInt32(&buf, V8)
-	wire.WriteInt32(&buf, 1)
+	wire.WriteInt32(&buf, 2)
 	if err := WriteLocalityGroup(&buf, &LocalityGroup{
 		IsDefault:       true,
 		ColumnFamilies:  map[string]int64{},
 		NumTotalEntries: 0,
+		RootIndex:       &IndexBlock{Offsets: []int32{}, Data: []byte{}},
+	}, V8); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteLocalityGroup(&buf, &LocalityGroup{
+		Name:            "main-named",
+		ColumnFamilies:  map[string]int64{"main": 2},
+		NumTotalEntries: 2,
 		RootIndex:       &IndexBlock{Offsets: []int32{}, Data: []byte{}},
 	}, V8); err != nil {
 		t.Fatal(err)
@@ -502,9 +732,150 @@ func TestParse_V8SampleGroupsErrorsCleanly(t *testing.T) {
 	}, V8); err != nil {
 		t.Fatal(err)
 	}
+	if err := WriteLocalityGroup(&buf, &LocalityGroup{
+		Name:            "sample-named",
+		ColumnFamilies:  map[string]int64{"sample": 1},
+		NumTotalEntries: 1,
+		RootIndex:       &IndexBlock{Offsets: []int32{}, Data: []byte{}},
+	}, V8); err != nil {
+		t.Fatal(err)
+	}
+	writeSamplerConfiguration(t, &buf, "example.Sampler\x00😀", [][2]string{
+		{"has\x00nul", "yes"},
+		{"emoji", "😀"},
+	})
+	wire.WriteBool(&buf, true) // hasVectorIndex = true
+	buf.Write([]byte{0x01, 0x02, 0x03})
 
-	_, err := Parse(buf.Bytes())
-	if err == nil {
-		t.Errorf("expected error for unimplemented sample groups")
+	got, err := Parse(buf.Bytes())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.SampleGroups) != 2 {
+		t.Fatalf("len(SampleGroups) = %d, want 2", len(got.SampleGroups))
+	}
+	if !got.SampleGroups[0].IsDefault || got.SampleGroups[1].Name != "sample-named" {
+		t.Errorf("sample locality groups not preserved: %+v", got.SampleGroups)
+	}
+	if got.SamplerConfiguration == nil {
+		t.Fatal("SamplerConfiguration is nil")
+	}
+	if got.SamplerConfiguration.Version != 1 {
+		t.Errorf("sampler version = %d, want 1", got.SamplerConfiguration.Version)
+	}
+	if got.SamplerConfiguration.ClassName != "example.Sampler\x00😀" {
+		t.Errorf("sampler class = %q", got.SamplerConfiguration.ClassName)
+	}
+	if got.SamplerConfiguration.Options["has\x00nul"] != "yes" ||
+		got.SamplerConfiguration.Options["emoji"] != "😀" {
+		t.Errorf("sampler options = %#v", got.SamplerConfiguration.Options)
+	}
+	if got.VectorExtension == nil {
+		t.Fatal("VectorExtension is nil")
+	}
+	if !bytes.Equal(got.VectorExtension.Data, []byte{0x01, 0x02, 0x03}) {
+		t.Errorf("VectorExtension.Data = %x", got.VectorExtension.Data)
+	}
+}
+
+func TestParse_V8SampleMetadataValidation(t *testing.T) {
+	base := func(t *testing.T) bytes.Buffer {
+		t.Helper()
+		var buf bytes.Buffer
+		wire.WriteInt32(&buf, RIndexMagic)
+		wire.WriteInt32(&buf, V8)
+		wire.WriteInt32(&buf, 0)
+		wire.WriteBool(&buf, true)
+		return buf
+	}
+
+	tests := []struct {
+		name  string
+		write func(*testing.T, *bytes.Buffer)
+	}{
+		{
+			name: "unsupported version",
+			write: func(t *testing.T, buf *bytes.Buffer) {
+				buf.WriteByte(2)
+			},
+		},
+		{
+			name: "negative option count",
+			write: func(t *testing.T, buf *bytes.Buffer) {
+				buf.WriteByte(1)
+				writeModifiedUTF(t, buf, "Sampler")
+				wire.WriteInt32(buf, -1)
+			},
+		},
+		{
+			name: "option count exceeds remaining bytes",
+			write: func(t *testing.T, buf *bytes.Buffer) {
+				buf.WriteByte(1)
+				writeModifiedUTF(t, buf, "Sampler")
+				wire.WriteInt32(buf, 1)
+			},
+		},
+		{
+			name: "option count exceeds cardinality limit",
+			write: func(t *testing.T, buf *bytes.Buffer) {
+				buf.WriteByte(1)
+				writeModifiedUTF(t, buf, "Sampler")
+				optionCount := maxSamplerOptions + 1
+				wire.WriteInt32(buf, optionCount)
+				buf.Write(make([]byte, int(optionCount)*4))
+			},
+		},
+		{
+			name: "malformed modified UTF",
+			write: func(t *testing.T, buf *bytes.Buffer) {
+				buf.WriteByte(1)
+				buf.Write([]byte{0, 1, 0})
+				wire.WriteInt32(buf, 0)
+			},
+		},
+		{
+			name: "truncated option value",
+			write: func(t *testing.T, buf *bytes.Buffer) {
+				buf.WriteByte(1)
+				writeModifiedUTF(t, buf, "Sampler")
+				wire.WriteInt32(buf, 1)
+				writeModifiedUTF(t, buf, "key")
+				buf.Write([]byte{0, 2, 'x'})
+			},
+		},
+		{
+			name: "duplicate option key",
+			write: func(t *testing.T, buf *bytes.Buffer) {
+				writeSamplerConfiguration(t, buf, "Sampler", [][2]string{
+					{"same", "first"},
+					{"same", "second"},
+				})
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			buf := base(t)
+			test.write(t, &buf)
+			_, err := Parse(buf.Bytes())
+			if !errors.Is(err, ErrCorruptSamplerConfiguration) {
+				t.Fatalf("err = %v, want ErrCorruptSamplerConfiguration", err)
+			}
+		})
+	}
+}
+
+func TestParse_V8RejectsTrailingBytesWithoutVectorExtension(t *testing.T) {
+	var buf bytes.Buffer
+	wire.WriteInt32(&buf, RIndexMagic)
+	wire.WriteInt32(&buf, V8)
+	wire.WriteInt32(&buf, 0)
+	wire.WriteBool(&buf, false)
+	wire.WriteBool(&buf, false)
+	buf.WriteByte(0xff)
+
+	if _, err := Parse(buf.Bytes()); err == nil {
+		t.Fatal("expected trailing-byte error")
 	}
 }

@@ -35,6 +35,8 @@ package tablet
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -43,6 +45,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -1155,39 +1158,70 @@ func PublishImmutableFiles(b storage.Backend, dir string, active []string) error
 }
 
 // RegisterImmutableFiles adds only checksum-verified import objects to the
-// authoritative generation. It never adopts unrelated objects from the prefix.
-func (t *Tablet) RegisterImmutableFiles(paths []string) (int, error) {
+// authoritative generation. The returned paths became authoritative even when
+// the returned error reports cleanup after a committed manifest write.
+func (t *Tablet) RegisterImmutableFiles(paths []string) ([]string, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	active := append([]string(nil), t.files...)
-	seen := make(map[string]struct{}, len(active)+len(paths))
+	adopted := make([]string, 0, len(paths))
+	seen := make(map[string]string, len(active)+len(paths))
 	for _, path := range active {
-		seen[path] = struct{}{}
+		seen[immutableFileIdentity(path)] = path
 	}
 	for _, path := range paths {
-		if _, ok := seen[path]; ok {
+		identity := immutableFileIdentity(path)
+		if existing, ok := seen[identity]; ok {
+			if existing != path {
+				if err := removeObject(t.backend, path); err != nil {
+					return nil, fmt.Errorf("tablet: remove redundant immutable file %s: %w", path, err)
+				}
+			}
 			continue
 		}
 		active = append(active, path)
-		seen[path] = struct{}{}
+		adopted = append(adopted, path)
+		seen[identity] = path
 		delete(t.obsolete, filepath.Base(path))
 	}
 	sort.Strings(active)
 	if err := persistImmutableManifest(t.backend, t.dir, active, t.obsolete); err != nil {
-		return 0, err
+		if storage.IsCommittedWriteError(err) {
+			t.files = active
+			return adopted, err
+		}
+		return nil, err
 	}
 	t.files = active
-	return len(t.files), nil
+	return adopted, nil
+}
+
+func immutableFileIdentity(path string) string {
+	const importPrefix = ".shoal-import-"
+	name := filepath.Base(path)
+	if !strings.HasPrefix(name, importPrefix) {
+		return path
+	}
+	encoded := strings.TrimPrefix(name, importPrefix)
+	if len(encoded) < sha256.Size*2 {
+		return path
+	}
+	digest := encoded[:sha256.Size*2]
+	if _, err := hex.DecodeString(digest); err != nil {
+		return path
+	}
+	if len(encoded) == len(digest) || encoded[len(digest)] != '-' && encoded[len(digest)] != '.' {
+		return path
+	}
+	return importPrefix + strings.ToLower(digest) + filepath.Ext(name)
 }
 
 func removeObject(b storage.Backend, path string) error {
-	if r, ok := b.(storage.Remover); ok {
-		return r.Remove(context.Background(), path)
+	r, ok := b.(storage.Remover)
+	if !ok {
+		return storage.ErrRemoverUnsupported
 	}
-	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-		return err
-	}
-	return nil
+	return r.Remove(context.Background(), path)
 }
 
 // Scanner is a pull-based iterator over scan results.

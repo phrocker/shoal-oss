@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"sort"
 	"sync"
@@ -94,17 +95,16 @@ func TestStageBulkDirRejectsReadOnlyDestinationBeforeAnyRead(t *testing.T) {
 
 func TestStageBulkDirFlattensCopiesAndWritesLoadMapping(t *testing.T) {
 	src := memory.New()
-	src.Put("export/events/t-0000/F0001.rf", []byte("tablet0-file1"))
-	src.Put("export/events/t-0000/F0002.rf", []byte("tablet0-file2"))
+	data1, file1 := testRFile(t, 0, "export/events/t-0000/F0001.rf", []byte("tablet0-file1"))
+	data2, file2 := testRFile(t, 0, "export/events/t-0000/F0002.rf", []byte("tablet0-file2"))
+	src.Put(file1.DestinationPath, data1)
+	src.Put(file2.DestinationPath, data2)
 
 	manifest := &engine.RFileExportManifest{
 		Version:     engine.RFileExportManifestVersion,
 		SourceTable: "events",
 		Tablets:     []engine.RFileExportTablet{{Index: 0}},
-		RFiles: []engine.RFileExportFile{
-			{TabletIndex: 0, DestinationPath: "export/events/t-0000/F0001.rf", Size: 13, SHA256: "e47fb24ed70774dd8af7d59bf58fc740e126716aac3474bd262eb17f3e395e43"},
-			{TabletIndex: 0, DestinationPath: "export/events/t-0000/F0002.rf", Size: 13, SHA256: "066219c3f0f1a1bfccf12ef7e4d6957d102b3bf2e047fca44ba178a92e526cf0"},
-		},
+		RFiles:      []engine.RFileExportFile{file1, file2},
 	}
 
 	dst := memory.New()
@@ -141,8 +141,8 @@ func TestStageBulkDirFlattensCopiesAndWritesLoadMapping(t *testing.T) {
 	if _, err := f.ReadAt(buf, 0); err != nil {
 		t.Fatal(err)
 	}
-	if string(buf) != "tablet0-file1" {
-		t.Fatalf("staged content = %q, want %q", buf, "tablet0-file1")
+	if !reflect.DeepEqual(buf, data1) {
+		t.Fatalf("staged content differs from source")
 	}
 
 	onDisk, err := ReadLoadMapping(ctx, dst, "hdfs://nn/bulk/events-1")
@@ -174,7 +174,8 @@ func TestStageBulkDirSerializesConcurrentWritersForSameDestination(t *testing.T)
 		}
 	}
 
-	firstBytes, secondBytes := []byte("first-stage"), []byte("second-stage")
+	firstBytes := validRFileBytes(t, []byte("first-stage"))
+	secondBytes := validRFileBytes(t, []byte("second-stage"))
 	firstMemory := memory.New()
 	firstMemory.Put(srcPath, firstBytes)
 	first := &blockingOpenBackend{
@@ -219,7 +220,7 @@ func TestStageBulkDirSerializesAliasedLocalDestinationsAcrossBackendInstances(t 
 	absoluteBulkDir := filepath.Join(root, "bulk")
 	relativeBulkDir := "bulk"
 	const srcPath = "export/events/t-0000/F0001.rf"
-	data := []byte("stage-data")
+	data := validRFileBytes(t, []byte("stage-data"))
 	sum := sha256.Sum256(data)
 	manifest := &engine.RFileExportManifest{
 		Version:     engine.RFileExportManifestVersion,
@@ -468,16 +469,14 @@ func TestStageBulkDirRejectsCorruptSourceBeforeCopying(t *testing.T) {
 
 func TestStageBulkDirDedupesRepeatedDestinationPathCopy(t *testing.T) {
 	src := memory.New()
-	src.Put("export/events/t-0000/F0001.rf", []byte("tablet0-file1"))
+	data, file := testRFile(t, 0, "export/events/t-0000/F0001.rf", []byte("tablet0-file1"))
+	src.Put(file.DestinationPath, data)
 
 	manifest := &engine.RFileExportManifest{
 		Version:     engine.RFileExportManifestVersion,
 		SourceTable: "events",
 		Tablets:     []engine.RFileExportTablet{{Index: 0}},
-		RFiles: []engine.RFileExportFile{
-			{TabletIndex: 0, DestinationPath: "export/events/t-0000/F0001.rf", Size: 13, SHA256: "e47fb24ed70774dd8af7d59bf58fc740e126716aac3474bd262eb17f3e395e43"},
-			{TabletIndex: 0, DestinationPath: "export/events/t-0000/F0001.rf", Size: 13, SHA256: "e47fb24ed70774dd8af7d59bf58fc740e126716aac3474bd262eb17f3e395e43"},
-		},
+		RFiles:      []engine.RFileExportFile{file, file},
 	}
 	dst := memory.New()
 	ctx := context.Background()
@@ -529,7 +528,7 @@ func TestStageBulkDirDedupesPhysicalSourceAliasesBeforeCopying(t *testing.T) {
 				t.Fatal(err)
 			}
 			realPath := filepath.Join(realDir, "F0001.rf")
-			content := []byte("physical source bytes")
+			content := validRFileBytes(t, []byte("physical source bytes"))
 			if err := os.WriteFile(realPath, content, 0o644); err != nil {
 				t.Fatal(err)
 			}
@@ -836,15 +835,10 @@ func TestStageBulkDirRejectsUndeclaredTabletIndexBeforeCopying(t *testing.T) {
 
 func TestStageBulkDirAcceptsMultiTabletManifest(t *testing.T) {
 	src := memory.New()
-	src.Put("events/t-0000/F0001.rf", []byte("a"))
-	src.Put("events/t-0001/F0002.rf", []byte("b"))
 	manifest := twoTabletManifest()
 	manifest.RFiles[0].DestinationPath = "events/t-0000/F0001.rf"
-	manifest.RFiles[0].Size = 1
-	manifest.RFiles[0].SHA256 = "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb"
 	manifest.RFiles[1].DestinationPath = "events/t-0001/F0002.rf"
-	manifest.RFiles[1].Size = 1
-	manifest.RFiles[1].SHA256 = "3e23e8160039594a33894f6564e1b1348bbd7a0088d42c4acb73eeaed59c009d"
+	populateManifestRFiles(t, src, manifest)
 
 	dst := memory.New()
 	ctx := context.Background()
@@ -943,20 +937,11 @@ func (b *cancelingBackend) Create(ctx context.Context, path string) (shstorage.W
 // corrupt-content) set of files.
 func TestStageBulkDirCancellationLeavesNoPartialObjectAndRetrySucceeds(t *testing.T) {
 	src := memory.New()
-	src.Put("events/t-0000/F0001.rf", []byte("a"))
-	src.Put("events/t-0001/F0002.rf", []byte("b"))
-	src.Put("events/t-0002/F0003.rf", []byte("c"))
-
 	manifest := threeTabletManifest()
 	manifest.RFiles[0].DestinationPath = "events/t-0000/F0001.rf"
-	manifest.RFiles[0].Size = 1
-	manifest.RFiles[0].SHA256 = "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb"
 	manifest.RFiles[1].DestinationPath = "events/t-0001/F0002.rf"
-	manifest.RFiles[1].Size = 1
-	manifest.RFiles[1].SHA256 = "3e23e8160039594a33894f6564e1b1348bbd7a0088d42c4acb73eeaed59c009d"
 	manifest.RFiles[2].DestinationPath = "events/t-0002/F0003.rf"
-	manifest.RFiles[2].Size = 1
-	manifest.RFiles[2].SHA256 = "2e7d2c03a9507ae265ecf5b5356885a53393a2029d241394997265a1a25aefc6"
+	populateManifestRFiles(t, src, manifest)
 
 	realDst := memory.New()
 	cancelCtx, cancel := context.WithCancel(context.Background())
@@ -1051,25 +1036,24 @@ func (b *mutatingSourceBackend) Open(ctx context.Context, path string) (shstorag
 // would be written describing corrupted data as trustworthy.
 func TestStageBulkDirRejectsSourceMutatedBetweenPreflightVerifyAndItsOwnCopy(t *testing.T) {
 	const srcPath = "events/t-0000/F0001.rf"
-	original := []byte("original-bytes")
-	mutated := []byte("mutated-bytes!")
+	original := validRFileBytesForRow(t, []byte("a"), []byte("original-bytes"))
+	mutated := validRFileBytesForRow(t, []byte("a"), []byte("mutated-bytes!"))
 	if len(original) != len(mutated) {
 		t.Fatalf("test fixture bug: original (%d) and mutated (%d) must be equal length so storage.Copy's own length bookkeeping cannot itself detect the swap, isolating the destination-verification behavior under test", len(original), len(mutated))
 	}
 
 	realSrc := memory.New()
 	realSrc.Put(srcPath, original)
-	realSrc.Put("events/t-0001/F0002.rf", []byte("b"))
+	second, secondFile := testRFile(t, 1, "events/t-0001/F0002.rf", []byte("b"))
+	realSrc.Put(secondFile.DestinationPath, second)
 
 	originalSum := sha256.Sum256(original)
-	bSum := sha256.Sum256([]byte("b"))
 	manifest := twoTabletManifest()
 	manifest.RFiles[0].DestinationPath = srcPath
 	manifest.RFiles[0].Size = int64(len(original))
 	manifest.RFiles[0].SHA256 = hex.EncodeToString(originalSum[:])
 	manifest.RFiles[1].DestinationPath = "events/t-0001/F0002.rf"
-	manifest.RFiles[1].Size = 1
-	manifest.RFiles[1].SHA256 = hex.EncodeToString(bSum[:])
+	manifest.RFiles[1] = secondFile
 
 	src := &mutatingSourceBackend{Backend: realSrc, path: srcPath, mutateAt: 2, newContent: mutated}
 	dst := memory.New()
@@ -1107,22 +1091,22 @@ func TestStageBulkDirRejectsSourceMutatedBetweenPreflightVerifyAndItsOwnCopy(t *
 // failed verification.
 func TestStageBulkDirInvalidatesStaleLoadMappingOnFailedRetry(t *testing.T) {
 	const srcPath = "events/t-0001/F0002.rf"
-	original := []byte("original-bytes")
-	mutated := []byte("mutated-bytes!")
+	original := validRFileBytes(t, []byte("original-bytes"))
+	mutated := validRFileBytes(t, []byte("mutated-bytes!"))
 	if len(original) != len(mutated) {
 		t.Fatalf("test fixture bug: original (%d) and mutated (%d) must be equal length so storage.Copy's own length bookkeeping cannot itself detect the swap, isolating the destination-verification behavior under test", len(original), len(mutated))
 	}
 
 	realSrc := memory.New()
-	realSrc.Put("events/t-0000/F0001.rf", []byte("f0001-bytes"))
+	first, firstFile := testRFileForRow(
+		t, 0, "events/t-0000/F0001.rf", []byte("a"), []byte("f0001-bytes"),
+	)
+	realSrc.Put(firstFile.DestinationPath, first)
 	realSrc.Put(srcPath, original)
 
-	f1Sum := sha256.Sum256([]byte("f0001-bytes"))
 	originalSum := sha256.Sum256(original)
 	manifest := twoTabletManifest()
-	manifest.RFiles[0].DestinationPath = "events/t-0000/F0001.rf"
-	manifest.RFiles[0].Size = int64(len("f0001-bytes"))
-	manifest.RFiles[0].SHA256 = hex.EncodeToString(f1Sum[:])
+	manifest.RFiles[0] = firstFile
 	manifest.RFiles[1].DestinationPath = srcPath
 	manifest.RFiles[1].Size = int64(len(original))
 	manifest.RFiles[1].SHA256 = hex.EncodeToString(originalSum[:])
@@ -1198,19 +1182,19 @@ func (b *nonRemovableBackend) Create(ctx context.Context, path string) (shstorag
 // mistake it for a still-valid "staging complete" marker.
 func TestStageBulkDirOverwritesStaleLoadMappingWithUnparseablePlaceholderWhenBackendCannotDelete(t *testing.T) {
 	const srcPath = "events/t-0001/F0002.rf"
-	original := []byte("original-bytes")
-	mutated := []byte("mutated-bytes!")
+	original := validRFileBytes(t, []byte("original-bytes"))
+	mutated := validRFileBytes(t, []byte("mutated-bytes!"))
 
 	realSrc := memory.New()
-	realSrc.Put("events/t-0000/F0001.rf", []byte("f0001-bytes"))
+	first, firstFile := testRFileForRow(
+		t, 0, "events/t-0000/F0001.rf", []byte("a"), []byte("f0001-bytes"),
+	)
+	realSrc.Put(firstFile.DestinationPath, first)
 	realSrc.Put(srcPath, original)
 
-	f1Sum := sha256.Sum256([]byte("f0001-bytes"))
 	originalSum := sha256.Sum256(original)
 	manifest := twoTabletManifest()
-	manifest.RFiles[0].DestinationPath = "events/t-0000/F0001.rf"
-	manifest.RFiles[0].Size = int64(len("f0001-bytes"))
-	manifest.RFiles[0].SHA256 = hex.EncodeToString(f1Sum[:])
+	manifest.RFiles[0] = firstFile
 	manifest.RFiles[1].DestinationPath = srcPath
 	manifest.RFiles[1].Size = int64(len(original))
 	manifest.RFiles[1].SHA256 = hex.EncodeToString(originalSum[:])

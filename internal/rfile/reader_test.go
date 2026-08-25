@@ -598,6 +598,230 @@ func TestReader_LocalityGroup_Accessor(t *testing.T) {
 	}
 }
 
+func TestValidateDataRegionsRejectsMetadataOverlapAndDataOverlap(t *testing.T) {
+	tests := []struct {
+		name    string
+		regions []bcfile.BlockRegion
+		end     int64
+	}{
+		{
+			name: "metadata overlap",
+			regions: []bcfile.BlockRegion{
+				{Offset: 90, CompressedSize: 11, RawSize: 11},
+			},
+			end: 100,
+		},
+		{
+			name: "data overlap",
+			regions: []bcfile.BlockRegion{
+				{Offset: 10, CompressedSize: 20, RawSize: 20},
+				{Offset: 29, CompressedSize: 10, RawSize: 10},
+			},
+			end: 100,
+		},
+		{
+			name: "out of order",
+			regions: []bcfile.BlockRegion{
+				{Offset: 30, CompressedSize: 10, RawSize: 10},
+				{Offset: 10, CompressedSize: 10, RawSize: 10},
+			},
+			end: 100,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := validateDataRegions(tt.regions, tt.end); err == nil {
+				t.Fatal("expected invalid data regions to be rejected")
+			}
+		})
+	}
+}
+
+func TestFetchDataBlockRequiresValidatedDataRegion(t *testing.T) {
+	r := openSynthetic(t, [][]cell{{mkCell("a", "1")}})
+	defer r.Close()
+
+	unlisted := r.dataBlocks[0]
+	unlisted.RawSize++
+	if _, err := r.fetchDataBlock(unlisted, r.dataCodec); err == nil ||
+		!strings.Contains(err.Error(), "not declared by BCFile.index") {
+		t.Fatalf("fetchDataBlock unlisted region error = %v, want declaration rejection", err)
+	}
+
+	meta, err := r.bc.MetaBlockEntry(IndexMetaBlockName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.fetchDataBlock(meta.Region, meta.CompressionAlgo); err == nil ||
+		!strings.Contains(err.Error(), "block region") {
+		t.Fatalf("fetchDataBlock metadata region error = %v, want declaration rejection", err)
+	}
+}
+
+func TestValidateReadableIndexRejectsUnverifiedExtensions(t *testing.T) {
+	tests := []struct {
+		name string
+		idx  *index.Reader
+	}{
+		{
+			name: "vector extension",
+			idx: &index.Reader{VectorExtension: &index.OpaqueExtension{
+				Kind: index.OpaqueV8VectorAndTessellation,
+			}},
+		},
+		{
+			name: "sample groups",
+			idx:  &index.Reader{SampleGroups: []*index.LocalityGroup{{}}},
+		},
+		{
+			name: "sampler configuration",
+			idx:  &index.Reader{SamplerConfiguration: &index.SamplerConfiguration{}},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if err := validateReadableIndex(test.idx); err == nil {
+				t.Fatal("expected unsupported index feature rejection")
+			}
+		})
+	}
+}
+
+func buildValidationIndexBlock(t *testing.T, entries ...*index.IndexEntry) *index.IndexBlock {
+	t.Helper()
+	var data bytes.Buffer
+	offsets := make([]int32, 0, len(entries))
+	for _, entry := range entries {
+		offsets = append(offsets, int32(data.Len()))
+		if err := index.WriteIndexEntry(&data, entry); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return &index.IndexBlock{Offsets: offsets, Data: data.Bytes()}
+}
+
+func TestValidateReadableIndexRejectsEntryCountRootMismatch(t *testing.T) {
+	tests := map[string]*index.LocalityGroup{
+		"zero count with nonempty root": {
+			IsDefault:       true,
+			NumTotalEntries: 0,
+			RootIndex: buildValidationIndexBlock(t, &index.IndexEntry{
+				Key: mkCell("a", "1").K, NumEntries: 1,
+			}),
+		},
+		"positive count with empty root": {
+			IsDefault:       true,
+			NumTotalEntries: 1,
+			RootIndex:       &index.IndexBlock{},
+		},
+	}
+	for name, group := range tests {
+		t.Run(name, func(t *testing.T) {
+			err := validateReadableIndex(&index.Reader{
+				Groups: []*index.LocalityGroup{group},
+			})
+			if err == nil || !strings.Contains(err.Error(), "inconsistent with its root index") {
+				t.Fatalf("validateReadableIndex() = %v, want count/root mismatch", err)
+			}
+		})
+	}
+}
+
+func TestValidateReadableIndexRejectsUnorderedRoot(t *testing.T) {
+	root := buildValidationIndexBlock(
+		t,
+		&index.IndexEntry{Key: mkCell("z", "1").K, NumEntries: 1},
+		&index.IndexEntry{Key: mkCell("a", "1").K, NumEntries: 1},
+	)
+	err := validateReadableIndex(&index.Reader{Groups: []*index.LocalityGroup{{
+		IsDefault:       true,
+		NumTotalEntries: 2,
+		RootIndex:       root,
+	}}})
+	if err == nil || !strings.Contains(err.Error(), "not strictly after") {
+		t.Fatalf("validateReadableIndex() = %v, want key-order rejection", err)
+	}
+}
+
+func TestValidateReadableIndexRejectsInvalidLocalityGroupLayouts(t *testing.T) {
+	emptyRoot := func() *index.IndexBlock {
+		return &index.IndexBlock{}
+	}
+	tests := map[string]struct {
+		groups []*index.LocalityGroup
+		want   string
+	}{
+		"missing default": {
+			groups: []*index.LocalityGroup{{
+				Name:           "named",
+				ColumnFamilies: map[string]int64{"cf": 1},
+				RootIndex:      emptyRoot(),
+			}},
+			want: "exactly one default locality group",
+		},
+		"duplicate default": {
+			groups: []*index.LocalityGroup{
+				{IsDefault: true, RootIndex: emptyRoot()},
+				{IsDefault: true, RootIndex: emptyRoot()},
+			},
+			want: "exactly one default locality group",
+		},
+		"named default": {
+			groups: []*index.LocalityGroup{{
+				IsDefault: true,
+				Name:      "invalid",
+				RootIndex: emptyRoot(),
+			}},
+			want: "default locality group 0 has name",
+		},
+		"empty named group name": {
+			groups: []*index.LocalityGroup{
+				{IsDefault: true, RootIndex: emptyRoot()},
+				{RootIndex: emptyRoot()},
+			},
+			want: "named locality group 1 has an empty name",
+		},
+		"duplicate named group": {
+			groups: []*index.LocalityGroup{
+				{IsDefault: true, RootIndex: emptyRoot()},
+				{Name: "named", RootIndex: emptyRoot()},
+				{Name: "named", RootIndex: emptyRoot()},
+			},
+			want: "duplicate name",
+		},
+		"column family in multiple groups": {
+			groups: []*index.LocalityGroup{
+				{
+					IsDefault:       true,
+					ColumnFamilies:  map[string]int64{"shared": 1},
+					NumTotalEntries: 1,
+					RootIndex: buildValidationIndexBlock(t, &index.IndexEntry{
+						Key: mkCell("a", "1").K, NumEntries: 1,
+					}),
+				},
+				{
+					Name:            "named",
+					ColumnFamilies:  map[string]int64{"shared": 1},
+					NumTotalEntries: 1,
+					RootIndex: buildValidationIndexBlock(t, &index.IndexEntry{
+						Key: mkCell("b", "1").K, NumEntries: 1,
+					}),
+				},
+			},
+			want: "belongs to locality groups 0 and 1",
+		},
+	}
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			err := validateReadableIndex(&index.Reader{Groups: test.groups})
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("validateReadableIndex() = %v, want error containing %q", err, test.want)
+			}
+		})
+	}
+}
+
 func TestReader_Close_Idempotent(t *testing.T) {
 	r := openSynthetic(t, [][]cell{{mkCell("a", "1")}})
 	if err := r.Close(); err != nil {

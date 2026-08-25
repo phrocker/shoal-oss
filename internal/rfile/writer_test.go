@@ -100,6 +100,19 @@ func TestWriter_RoundtripWithGzipCodec(t *testing.T) {
 	cellsEqual(t, got, cells)
 }
 
+func TestWriter_RoundtripWithAdditionalHadoopCodecs(t *testing.T) {
+	cells := make([]cell, 0, 30)
+	for i := 0; i < 30; i++ {
+		cells = append(cells, mkCell(fmt.Sprintf("k%03d", i), strings.Repeat("ab", 100)))
+	}
+	for _, codec := range []string{block.CodecZstd, block.CodecLZ4} {
+		t.Run(codec, func(t *testing.T) {
+			got := roundtrip(t, WriterOptions{Codec: codec}, cells)
+			cellsEqual(t, got, cells)
+		})
+	}
+}
+
 func TestWriter_AppendNilKeyErrors(t *testing.T) {
 	w, _ := NewWriter(&bytes.Buffer{}, WriterOptions{})
 	if err := w.Append(nil, []byte("v")); err == nil {
@@ -133,9 +146,9 @@ func TestWriter_CloseIdempotent(t *testing.T) {
 }
 
 func TestWriter_UnregisteredCodecErrors(t *testing.T) {
-	_, err := NewWriter(&bytes.Buffer{}, WriterOptions{Codec: "zstd"})
+	_, err := NewWriter(&bytes.Buffer{}, WriterOptions{Codec: "brotli"})
 	if err == nil {
-		t.Errorf("zstd not registered: expected error")
+		t.Errorf("brotli not registered: expected error")
 	}
 }
 

@@ -161,6 +161,8 @@ import importlib.util
 import shutil
 import pysharkbite
 import sharkbite
+import shoal
+from shoal.document import Document
 from sharkbite import Mutation, NativeAPI
 assert shutil.which("go") is None
 distribution = importlib.metadata.distribution("shoal-sharkbite")
@@ -169,8 +171,11 @@ assert distribution.version == sharkbite.__version__
 owners = importlib.metadata.packages_distributions()
 assert "shoal-sharkbite" in owners["sharkbite"]
 assert "shoal-sharkbite" in owners["pysharkbite"]
+assert "shoal-sharkbite" in owners["shoal"]
 assert importlib.util.find_spec("sharkbite").origin == sharkbite.__file__
 assert importlib.util.find_spec("pysharkbite").origin == pysharkbite.__file__
+assert importlib.util.find_spec("shoal").origin == shoal.__file__
+assert Document.__module__ == "shoal.document"
 assert pysharkbite.__all__ == sharkbite.__all__
 for name in sharkbite.__all__:
     assert getattr(pysharkbite, name) is getattr(sharkbite, name)
@@ -256,12 +261,15 @@ import shutil
 from pathlib import Path
 import pysharkbite
 import sharkbite
+import shoal
+from shoal.document import Document
 from sharkbite import Mutation, NativeAPI
 assert shutil.which("go") is None
 distribution = importlib.metadata.distribution("shoal-sharkbite")
 assert distribution.metadata["Name"] == "shoal-sharkbite"
 assert distribution.version == sharkbite.__version__
 assert pysharkbite.__all__ == sharkbite.__all__
+assert Document.__module__ == "shoal.document"
 for name in sharkbite.__all__:
     assert getattr(pysharkbite, name) is getattr(sharkbite, name)
 assert not any((Path(sharkbite.__file__).parent / ".libs").glob("*"))

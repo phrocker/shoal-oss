@@ -3,17 +3,12 @@ package index
 import (
 	"bytes"
 	"fmt"
-	"io"
 
 	"github.com/phrocker/shoal-oss/internal/rfile/wire"
 )
 
 // Reader is the parsed RFile.index meta block: the version stamp and
 // the list of locality groups (main + sample).
-//
-// Sample / vector / tessellation extensions are recorded as raw byte
-// slices when present — Phase 3a doesn't decode them, but doesn't drop
-// them either, so a higher-level RFile reader can pass them on.
 type Reader struct {
 	Version int32
 
@@ -23,15 +18,31 @@ type Reader struct {
 	// attached (v8 only). nil when no samples were stored.
 	SampleGroups []*LocalityGroup
 
-	// SamplerConfigRaw is the unparsed bytes of the SamplerConfiguration
-	// trailer. Phase 3a doesn't crack it open; surfaced as opaque so
-	// readers can either ignore or hand off.
-	SamplerConfigRaw []byte
+	// SamplerConfiguration describes how SampleGroups were selected.
+	// It is non-nil exactly when sample data is present.
+	SamplerConfiguration *SamplerConfiguration
 
-	// VectorIndexRaw / TessellationFooterRaw — same opaque-preservation
-	// strategy for the v8 vector index extension.
-	VectorIndexRaw        []byte
-	TessellationFooterRaw []byte
+	// VectorExtension preserves the unresolved v8 vector index section.
+	// Its payload also includes any tessellation flag/footer because no
+	// local schema exists for locating that boundary.
+	VectorExtension *OpaqueExtension
+}
+
+// OpaqueExtensionKind identifies an extension whose bytes are preserved but
+// whose wire schema is not available to this parser.
+type OpaqueExtensionKind string
+
+const (
+	// OpaqueV8VectorAndTessellation is the complete byte tail after a true
+	// hasVectorIndex flag, including any embedded tessellation flag/footer.
+	OpaqueV8VectorAndTessellation OpaqueExtensionKind = "v8-vector-and-tessellation"
+)
+
+// OpaqueExtension preserves an extension payload losslessly until its wire
+// schema is available.
+type OpaqueExtension struct {
+	Kind OpaqueExtensionKind
+	Data []byte
 }
 
 // Parse reads an RFile.index meta block from raw (already-decompressed)
@@ -71,6 +82,11 @@ func Parse(raw []byte) (*Reader, error) {
 	if groupCount < 0 {
 		return nil, fmt.Errorf("RFile.index: negative group count %d", groupCount)
 	}
+	if err := validateDecodedCount(
+		"RFile.index group", groupCount, r, maxLocalityGroups, 1, 0,
+	); err != nil {
+		return nil, err
+	}
 	out.Groups = make([]*LocalityGroup, 0, groupCount)
 	for i := int32(0); i < groupCount; i++ {
 		lg, err := ReadLocalityGroup(r, version)
@@ -83,14 +99,14 @@ func Parse(raw []byte) (*Reader, error) {
 	// v8-only trailers: samples + vector index + tessellation. Each is
 	// gated by a leading bool.
 	if version == V8 {
-		if err := readV8Tail(r, out, groupCount); err != nil {
+		if err := readV8Tail(raw, r, out, groupCount); err != nil {
 			return nil, err
 		}
 	}
 	return out, nil
 }
 
-func readV8Tail(r *bytes.Reader, out *Reader, groupCount int32) error {
+func readV8Tail(raw []byte, r *bytes.Reader, out *Reader, groupCount int32) error {
 	// Samples?
 	hasSamples, err := readOptionalBool(r, "hasSamples")
 	if err != nil {
@@ -105,14 +121,11 @@ func readV8Tail(r *bytes.Reader, out *Reader, groupCount int32) error {
 			}
 			out.SampleGroups = append(out.SampleGroups, lg)
 		}
-		// SamplerConfiguration follows. We don't parse it; capture the
-		// remaining bytes up to the next optional flag (vector index).
-		// Java reads it via SamplerConfigurationImpl(mb), which consumes
-		// a known-shaped record — but that record's size is variable and
-		// only knowable by parsing it. For now we error out if a sample
-		// is present, since shoal V0 doesn't need samples; flip this to
-		// real parsing when sample-aware reads matter.
-		return fmt.Errorf("rfile/index: sample groups present but SamplerConfiguration parsing is not yet implemented")
+		samplerConfiguration, err := readSamplerConfiguration(r)
+		if err != nil {
+			return fmt.Errorf("RFile.index sampler configuration: %w", err)
+		}
+		out.SamplerConfiguration = samplerConfiguration
 	}
 	// Vector index?
 	hasVector, err := readOptionalBool(r, "hasVectorIndex")
@@ -120,12 +133,19 @@ func readV8Tail(r *bytes.Reader, out *Reader, groupCount int32) error {
 		return err
 	}
 	if hasVector {
-		// VectorIndex has its own readFields; until ported, capture the
-		// remainder. This is loss-of-information but not data corruption
-		// — callers that need vectors get an explicit error elsewhere.
-		remaining, _ := io.ReadAll(r)
-		out.VectorIndexRaw = remaining
+		// No vector metadata producer or parseable schema exists locally.
+		// Without that record's boundary, the following tessellation flag
+		// cannot be located safely, so preserve the complete tail as one
+		// explicitly typed opaque extension.
+		remaining := raw[len(raw)-r.Len():]
+		out.VectorExtension = &OpaqueExtension{
+			Kind: OpaqueV8VectorAndTessellation,
+			Data: remaining,
+		}
 		return nil
+	}
+	if r.Len() != 0 {
+		return fmt.Errorf("RFile.index: %d trailing bytes after v8 optional flags", r.Len())
 	}
 	return nil
 }

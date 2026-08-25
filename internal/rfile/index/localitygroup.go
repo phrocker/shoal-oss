@@ -88,6 +88,11 @@ func ReadLocalityGroup(r wire.ByteAndReader, ver int32) (*LocalityGroup, error) 
 	} else if cfCount < 0 {
 		return nil, fmt.Errorf("%w: negative cfCount %d", ErrCorruptColumnFamilies, cfCount)
 	} else {
+		if err := validateDecodedCount(
+			"LG column families", cfCount, r, maxColumnFamilies, 12, 0,
+		); err != nil {
+			return nil, fmt.Errorf("%w: %w", ErrCorruptColumnFamilies, err)
+		}
 		out.ColumnFamilies = make(map[string]int64, cfCount)
 		for i := int32(0); i < cfCount; i++ {
 			cfLen, err := wire.ReadInt32(r)
@@ -98,6 +103,11 @@ func ReadLocalityGroup(r wire.ByteAndReader, ver int32) (*LocalityGroup, error) 
 				return nil, fmt.Errorf("%w: cf[%d] negative length %d",
 					ErrCorruptColumnFamilies, i, cfLen)
 			}
+			if err := validateDecodedLength(
+				fmt.Sprintf("LG cf[%d]", i), cfLen, r, maxIndexDataBytes, 8,
+			); err != nil {
+				return nil, fmt.Errorf("%w: %w", ErrCorruptColumnFamilies, err)
+			}
 			cfBytes := make([]byte, cfLen)
 			if _, err := io.ReadFull(r, cfBytes); err != nil {
 				return nil, fmt.Errorf("LG cf[%d] body: %w", i, err)
@@ -105,6 +115,10 @@ func ReadLocalityGroup(r wire.ByteAndReader, ver int32) (*LocalityGroup, error) 
 			count, err := wire.ReadInt64(r)
 			if err != nil {
 				return nil, fmt.Errorf("LG cf[%d] count: %w", i, err)
+			}
+			if count < 0 {
+				return nil, fmt.Errorf("%w: cf[%d] negative count %d",
+					ErrCorruptColumnFamilies, i, count)
 			}
 			out.ColumnFamilies[string(cfBytes)] = count
 		}
@@ -127,6 +141,9 @@ func ReadLocalityGroup(r wire.ByteAndReader, ver int32) (*LocalityGroup, error) 
 		size, err := wire.ReadInt32(r)
 		if err != nil {
 			return nil, fmt.Errorf("LG MLI size: %w", err)
+		}
+		if size < 0 {
+			return nil, fmt.Errorf("LG MLI: negative total-entry count %d", size)
 		}
 		out.NumTotalEntries = size
 	}

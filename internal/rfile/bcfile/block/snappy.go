@@ -75,8 +75,17 @@ func decompressSnappy(compressed []byte, rawSize int64) ([]byte, error) {
 			chunk := compressed[pos : pos+int(chunkLen)]
 			pos += int(chunkLen)
 
-			// snappy.Decode validates the embedded uncompressed length.
-			decoded, err := snappy.Decode(nil, chunk)
+			decodedLen, err := snappy.DecodedLen(chunk)
+			if err != nil {
+				return nil, fmt.Errorf("block: snappy decode chunk length @ byte %d: %w", pos-int(chunkLen), err)
+			}
+			frameRemaining := int64(originalSize) - (int64(len(out)) - frameStart)
+			rawRemaining := rawSize - int64(len(out))
+			if int64(decodedLen) > frameRemaining || int64(decodedLen) > rawRemaining {
+				return nil, fmt.Errorf("%w: codec=snappy chunk=%d frameRemaining=%d rawRemaining=%d",
+					ErrSizeMismatch, decodedLen, frameRemaining, rawRemaining)
+			}
+			decoded, err := snappy.Decode(make([]byte, 0, decodedLen), chunk)
 			if err != nil {
 				return nil, fmt.Errorf("block: snappy decode chunk @ byte %d: %w", pos-int(chunkLen), err)
 			}

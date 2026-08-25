@@ -192,12 +192,14 @@ func CleanupStaleArtifacts(
 }
 
 // Remover is a Backend that can delete an object by path. Used to drop a
-// compaction's input RFiles once the merged output is durable. Local +
-// Memory implement it. Deleting a non-existent path is not an error.
+// compaction's input RFiles once the merged output is durable. Deleting a
+// non-existent path is not an error.
 type Remover interface {
 	Backend
 	Remove(ctx context.Context, path string) error
 }
+
+var ErrRemoverUnsupported = errors.New("storage: remover unsupported")
 
 // ErrNotFound is the sentinel for "the requested path doesn't exist."
 // Backends should wrap their own not-found errors with errors.Join or

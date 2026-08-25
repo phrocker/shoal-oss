@@ -3,6 +3,7 @@ package engine
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
@@ -15,12 +16,16 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/phrocker/shoal-oss/internal/compaction"
 	"github.com/phrocker/shoal-oss/internal/iterrt"
+	"github.com/phrocker/shoal-oss/internal/parquetfile"
+	"github.com/phrocker/shoal-oss/internal/rfile"
 	"github.com/phrocker/shoal-oss/internal/rfile/bcfile"
 	"github.com/phrocker/shoal-oss/internal/rfile/bcfile/block"
+	"github.com/phrocker/shoal-oss/internal/rfile/wire"
 	"github.com/phrocker/shoal-oss/internal/storage"
 	"github.com/phrocker/shoal-oss/internal/tablet"
 )
@@ -29,6 +34,8 @@ const (
 	RFileExportManifestLegacyVersion = 1
 	RFileExportManifestVersion       = 2
 )
+
+const verificationSnapshotChunkSize = 256 * 1024
 
 // producerIDRe constrains a fan-in producer id to characters that are safe in
 // both object keys and local file names and that exclude the "~" namespacing
@@ -422,8 +429,125 @@ func usesBackendSeparatorJoinRoot(dst storage.Backend, root string) bool {
 	return storage.UsesBackendPathJoin(dst, root)
 }
 
-// VerifyRFileExport verifies that every manifest object exists and matches size/hash.
+// VerifyRFileExport verifies that every manifest entry is an authoritative,
+// structurally valid RFile whose bytes match the recorded size and hash.
+// Accumulo promotion and the RFile branch of local manifest import share this
+// strict gate; generic local immutable/Parquet policy is intentionally
+// separate.
 func VerifyRFileExport(ctx context.Context, b storage.Backend, manifest *RFileExportManifest) error {
+	return verifyRFileExport(ctx, b, manifest, newVerificationSnapshot)
+}
+
+type verificationSnapshot interface {
+	io.ReaderAt
+	io.Writer
+	Sync() error
+}
+
+type verificationSnapshotFactory func() (verificationSnapshot, func() error, error)
+
+func newVerificationSnapshot() (verificationSnapshot, func() error, error) {
+	f, err := os.CreateTemp("", "shoal-rfile-verify-*.rf")
+	if err != nil {
+		return nil, nil, err
+	}
+	cleanup := func() error {
+		return errors.Join(f.Close(), os.Remove(f.Name()))
+	}
+	return f, cleanup, nil
+}
+
+func verifyRFileExport(
+	ctx context.Context,
+	b storage.Backend,
+	manifest *RFileExportManifest,
+	snapshotFactory verificationSnapshotFactory,
+) error {
+	if err := validateExportManifest(manifest); err != nil {
+		return err
+	}
+	tablets, err := verificationTablets(manifest)
+	if err != nil {
+		return err
+	}
+	for _, rf := range manifest.RFiles {
+		format, err := validateExportFile(manifest, rf)
+		if err != nil {
+			return err
+		}
+		if format != storage.ImmutableFormatRFile {
+			return fmt.Errorf("%w: engine: import file %q has format %q; only RFiles are queryable",
+				storage.ErrImmutablePolicy, rf.DestinationPath, format)
+		}
+		if err := storage.ValidateImmutablePath(
+			rf.DestinationPath,
+			storage.ImmutableRoleAuthoritative,
+			storage.ImmutablePurposeRFileImport,
+		); err != nil {
+			return fmt.Errorf("engine: verify %s: %w", rf.DestinationPath, err)
+		}
+		if err := verifyRFileExportObject(
+			ctx, b, rf, tablets[rf.TabletIndex], snapshotFactory, true,
+		); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func verifyImmutableExport(
+	ctx context.Context,
+	b storage.Backend,
+	manifest *RFileExportManifest,
+	snapshotFactory verificationSnapshotFactory,
+) error {
+	if err := validateExportManifest(manifest); err != nil {
+		return err
+	}
+	tablets, err := verificationTablets(manifest)
+	if err != nil {
+		return err
+	}
+	for _, file := range manifest.RFiles {
+		format, err := validateExportFile(manifest, file)
+		if err != nil {
+			return err
+		}
+		if err := storage.ValidateImmutablePath(
+			file.DestinationPath,
+			storage.ImmutableRoleAuthoritative,
+			storage.ImmutablePurposeLocalStorage,
+		); err != nil {
+			return fmt.Errorf("engine: verify %s: %w", file.DestinationPath, err)
+		}
+		if format == storage.ImmutableFormatRFile {
+			if err := verifyRFileExportObject(
+				ctx, b, file, tablets[file.TabletIndex], snapshotFactory, false,
+			); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := verifyParquetExportObject(
+			ctx, b, file, tablets[file.TabletIndex], snapshotFactory,
+		); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func verificationTablets(manifest *RFileExportManifest) ([]RFileExportTablet, error) {
+	if _, err := manifestSplits(manifest); err != nil {
+		return nil, err
+	}
+	if len(manifest.Tablets) == 0 {
+		return []RFileExportTablet{{Index: 0}}, nil
+	}
+	return manifest.Tablets, nil
+}
+
+func validateExportManifest(manifest *RFileExportManifest) error {
 	if manifest == nil {
 		return fmt.Errorf("engine: nil import manifest")
 	}
@@ -434,35 +558,396 @@ func VerifyRFileExport(ctx context.Context, b storage.Backend, manifest *RFileEx
 		exportManifestVersion(manifest) != RFileExportManifestLegacyVersion {
 		return fmt.Errorf("engine: manifest version %d is valid only for authoritative RFile exports", manifest.Version)
 	}
-	for _, rf := range manifest.RFiles {
-		if rf.TabletIndex < 0 || rf.TabletIndex >= manifest.tabletCount() {
-			return fmt.Errorf("engine: import file %q references undeclared tablet index %d", rf.DestinationPath, rf.TabletIndex)
+	return nil
+}
+
+func validateExportFile(manifest *RFileExportManifest, file RFileExportFile) (storage.ImmutableFormat, error) {
+	if file.TabletIndex < 0 || file.TabletIndex >= manifest.tabletCount() {
+		return "", fmt.Errorf("engine: import file %q references undeclared tablet index %d",
+			file.DestinationPath, file.TabletIndex)
+	}
+	role := file.Role
+	if role == "" {
+		role = ExportRoleAuthoritative
+	}
+	if role != ExportRoleAuthoritative {
+		return "", fmt.Errorf("engine: import file %q has role %q; only authoritative files are queryable",
+			file.DestinationPath, role)
+	}
+	format := storage.ImmutableFormat(file.Format)
+	if format == "" {
+		format = storage.ImmutableFormatRFile
+	}
+	if format != storage.ImmutableFormatRFile && format != storage.ImmutableFormatParquet {
+		return "", fmt.Errorf("%w: engine: import file %q has unsupported format %q",
+			storage.ErrImmutablePolicy, file.DestinationPath, format)
+	}
+	pathFormat := storage.ImmutableFormatForPath(file.DestinationPath)
+	if format != pathFormat {
+		return "", fmt.Errorf("%w: engine: import file %q declares format %q but path has format %q",
+			storage.ErrImmutablePolicy, file.DestinationPath, format, pathFormat)
+	}
+	return format, nil
+}
+
+func verifyRFileExportObject(
+	ctx context.Context,
+	b storage.Backend,
+	rf RFileExportFile,
+	tablet RFileExportTablet,
+	snapshotFactory verificationSnapshotFactory,
+	allowNamedLocalityGroups bool,
+) (err error) {
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("engine: verify %s: %w", rf.DestinationPath, err)
+	}
+	if rf.Size < 0 {
+		return fmt.Errorf("engine: verify %s: negative manifest size %d", rf.DestinationPath, rf.Size)
+	}
+	f, err := b.Open(ctx, rf.DestinationPath)
+	if err != nil {
+		return fmt.Errorf("engine: verify open %s: %w", rf.DestinationPath, err)
+	}
+	sourceOpen := true
+	defer func() {
+		if sourceOpen {
+			if closeErr := f.Close(); closeErr != nil {
+				err = errors.Join(err,
+					fmt.Errorf("engine: verify close %s: %w", rf.DestinationPath, closeErr))
+			}
 		}
-		role := rf.Role
-		if role == "" {
-			role = ExportRoleAuthoritative
+	}()
+
+	size := f.Size()
+	if size != rf.Size {
+		return fmt.Errorf("engine: verify %s: size %d, want %d", rf.DestinationPath, size, rf.Size)
+	}
+
+	local, cleanup, err := snapshotFactory()
+	if err != nil {
+		return fmt.Errorf("engine: create verification snapshot for %s: %w", rf.DestinationPath, err)
+	}
+	defer func() {
+		if cleanupErr := cleanup(); cleanupErr != nil {
+			err = errors.Join(err,
+				fmt.Errorf("engine: cleanup verification snapshot for %s: %w",
+					rf.DestinationPath, cleanupErr))
 		}
-		if role != ExportRoleAuthoritative {
-			return fmt.Errorf("engine: import file %q has role %q; only authoritative files are queryable", rf.DestinationPath, role)
+	}()
+
+	copied, sum, copyErr := materializeVerificationSnapshot(ctx, f, local, size)
+	closeErr := f.Close()
+	sourceOpen = false
+	if copyErr != nil {
+		err = fmt.Errorf("engine: materialize verification snapshot for %s: %w",
+			rf.DestinationPath, copyErr)
+		if closeErr != nil {
+			err = errors.Join(err,
+				fmt.Errorf("engine: verify close %s: %w", rf.DestinationPath, closeErr))
 		}
-		size, sum, err := hashObject(ctx, b, rf.DestinationPath)
+		return err
+	}
+	if closeErr != nil {
+		return fmt.Errorf("engine: verify close %s: %w", rf.DestinationPath, closeErr)
+	}
+	if copied != size {
+		return fmt.Errorf("engine: verify %s: copied size %d, want %d",
+			rf.DestinationPath, copied, size)
+	}
+	if sum != rf.SHA256 {
+		return fmt.Errorf("engine: verify %s: sha256 %s, want %s", rf.DestinationPath, sum, rf.SHA256)
+	}
+
+	snapshot := &verificationReaderAt{ctx: ctx, source: local}
+	version, err := validateRFileSnapshot(
+		ctx, snapshot, size, tablet, allowNamedLocalityGroups,
+	)
+	if err != nil {
+		if readErr := snapshot.firstError(); readErr != nil {
+			return fmt.Errorf("engine: read verification snapshot for %s: %w",
+				rf.DestinationPath, readErr)
+		}
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return fmt.Errorf("engine: verify %s: %w", rf.DestinationPath, err)
+		}
+		if errors.Is(err, errNamedLocalityGroupUnsupported) {
+			return fmt.Errorf("%w: engine: verify %s: %w",
+				storage.ErrImmutablePolicy, rf.DestinationPath, err)
+		}
+		return fmt.Errorf("%w: %s is not a structurally valid RFile: %w",
+			storage.ErrImmutablePolicy, rf.DestinationPath, err)
+	}
+	if rf.BCFileVersion != "" && version != rf.BCFileVersion {
+		return fmt.Errorf("%w: engine: verify %s: BCFile version %s, want %s",
+			storage.ErrImmutablePolicy, rf.DestinationPath, version, rf.BCFileVersion)
+	}
+	return nil
+}
+
+func verifyParquetExportObject(
+	ctx context.Context,
+	b storage.Backend,
+	file RFileExportFile,
+	tablet RFileExportTablet,
+	snapshotFactory verificationSnapshotFactory,
+) (err error) {
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("engine: verify %s: %w", file.DestinationPath, err)
+	}
+	if file.Size < 0 {
+		return fmt.Errorf("engine: verify %s: negative manifest size %d", file.DestinationPath, file.Size)
+	}
+	source, err := b.Open(ctx, file.DestinationPath)
+	if err != nil {
+		return fmt.Errorf("engine: verify open %s: %w", file.DestinationPath, err)
+	}
+	sourceOpen := true
+	defer func() {
+		if sourceOpen {
+			if closeErr := source.Close(); closeErr != nil {
+				err = errors.Join(err,
+					fmt.Errorf("engine: verify close %s: %w", file.DestinationPath, closeErr))
+			}
+		}
+	}()
+	if size := source.Size(); size != file.Size {
+		return fmt.Errorf("engine: verify %s: size %d, want %d",
+			file.DestinationPath, size, file.Size)
+	}
+
+	local, cleanup, err := snapshotFactory()
+	if err != nil {
+		return fmt.Errorf("engine: create verification snapshot for %s: %w", file.DestinationPath, err)
+	}
+	defer func() {
+		if cleanupErr := cleanup(); cleanupErr != nil {
+			err = errors.Join(err,
+				fmt.Errorf("engine: cleanup verification snapshot for %s: %w",
+					file.DestinationPath, cleanupErr))
+		}
+	}()
+
+	copied, sum, copyErr := materializeVerificationSnapshot(ctx, source, local, file.Size)
+	closeErr := source.Close()
+	sourceOpen = false
+	if copyErr != nil {
+		err = fmt.Errorf("engine: materialize verification snapshot for %s: %w",
+			file.DestinationPath, copyErr)
+		if closeErr != nil {
+			err = errors.Join(err,
+				fmt.Errorf("engine: verify close %s: %w", file.DestinationPath, closeErr))
+		}
+		return err
+	}
+	if closeErr != nil {
+		return fmt.Errorf("engine: verify close %s: %w", file.DestinationPath, closeErr)
+	}
+	if copied != file.Size {
+		return fmt.Errorf("engine: verify %s: copied size %d, want %d",
+			file.DestinationPath, copied, file.Size)
+	}
+	if sum != file.SHA256 {
+		return fmt.Errorf("engine: verify %s: sha256 %s, want %s",
+			file.DestinationPath, sum, file.SHA256)
+	}
+
+	snapshot := &verificationReaderAt{ctx: ctx, source: local}
+	err = parquetfile.Validate(snapshot, file.Size, func(key *wire.Key) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if !rowBelongsToTablet(key.Row, tablet) {
+			return fmt.Errorf("row %x outside manifest tablet %d bounds", key.Row, tablet.Index)
+		}
+		return nil
+	})
+	if err != nil {
+		if readErr := snapshot.firstError(); readErr != nil {
+			return fmt.Errorf("engine: read verification snapshot for %s: %w",
+				file.DestinationPath, readErr)
+		}
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return fmt.Errorf("engine: verify %s: %w", file.DestinationPath, err)
+		}
+		return fmt.Errorf("%w: %s is not a structurally valid Parquet file: %w",
+			storage.ErrImmutablePolicy, file.DestinationPath, err)
+	}
+	return nil
+}
+
+func materializeVerificationSnapshot(
+	ctx context.Context,
+	src io.ReaderAt,
+	dst verificationSnapshot,
+	size int64,
+) (int64, string, error) {
+	h := sha256.New()
+	buf := make([]byte, verificationSnapshotChunkSize)
+	var off int64
+	for off < size {
+		if err := ctx.Err(); err != nil {
+			return off, "", err
+		}
+		remaining := size - off
+		want := len(buf)
+		if remaining < int64(want) {
+			want = int(remaining)
+		}
+		n, readErr := src.ReadAt(buf[:want], off)
+		if n < 0 || n > want {
+			return off, "", fmt.Errorf("invalid ReadAt count %d for %d-byte request", n, want)
+		}
+		if n > 0 {
+			if err := ctx.Err(); err != nil {
+				return off, "", err
+			}
+			if err := writeVerificationSnapshot(dst, buf[:n]); err != nil {
+				return off, "", err
+			}
+			_, _ = h.Write(buf[:n])
+			off += int64(n)
+		}
+		if readErr != nil {
+			if errors.Is(readErr, io.EOF) && off == size {
+				break
+			}
+			return off, "", readErr
+		}
+		if n == 0 {
+			return off, "", io.ErrNoProgress
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return off, "", err
+	}
+	if err := dst.Sync(); err != nil {
+		return off, "", err
+	}
+	return off, hex.EncodeToString(h.Sum(nil)), nil
+}
+
+func writeVerificationSnapshot(dst io.Writer, p []byte) error {
+	for len(p) > 0 {
+		n, err := dst.Write(p)
+		if n < 0 || n > len(p) {
+			return fmt.Errorf("invalid Write count %d for %d-byte request", n, len(p))
+		}
+		if n > 0 {
+			p = p[n:]
+		}
 		if err != nil {
 			return err
 		}
-		if size != rf.Size {
-			return fmt.Errorf("engine: verify %s: size %d, want %d", rf.DestinationPath, size, rf.Size)
-		}
-		if sum != rf.SHA256 {
-			return fmt.Errorf("engine: verify %s: sha256 %s, want %s", rf.DestinationPath, sum, rf.SHA256)
+		if n == 0 {
+			return io.ErrShortWrite
 		}
 	}
 	return nil
 }
 
-// ImportRFileManifest verifies the manifest's RFiles and makes them queryable
-// in this engine. The RFiles are expected to already be present at their
-// DestinationPath on this engine's backend (export places them there) — import
-// registers, it does not copy.
+func validateRFileSnapshot(
+	ctx context.Context,
+	src io.ReaderAt,
+	size int64,
+	tablet RFileExportTablet,
+	allowNamedLocalityGroups bool,
+) (string, error) {
+	bc, err := bcfile.NewReader(src, size)
+	if err != nil {
+		return "", err
+	}
+	readers, err := rfile.OpenAll(bc, block.Default())
+	if err != nil {
+		return "", err
+	}
+	defer func() {
+		for _, reader := range readers {
+			_ = reader.Close()
+		}
+	}()
+	for group, reader := range readers {
+		if !allowNamedLocalityGroups && !reader.LocalityGroup().IsDefault {
+			return "", fmt.Errorf(
+				"%w: locality group %d contains data that embedded tablet scans cannot read",
+				errNamedLocalityGroupUnsupported, group,
+			)
+		}
+		if err := reader.Seek(nil); err != nil {
+			return "", fmt.Errorf("seek locality group %d: %w", group, err)
+		}
+		for {
+			if err := ctx.Err(); err != nil {
+				return "", err
+			}
+			key, _, err := reader.Next()
+			if err != nil {
+				if errors.Is(err, io.EOF) {
+					break
+				}
+				return "", fmt.Errorf("scan locality group %d: %w", group, err)
+			}
+			if !rowBelongsToTablet(key.Row, tablet) {
+				return "", fmt.Errorf(
+					"locality group %d contains row %x outside manifest tablet %d bounds",
+					group, key.Row, tablet.Index,
+				)
+			}
+		}
+	}
+	return bc.Footer().Version.String(), nil
+}
+
+var errNamedLocalityGroupUnsupported = errors.New(
+	"named RFile locality groups are unsupported for embedded imports",
+)
+
+func rowBelongsToTablet(row []byte, tablet RFileExportTablet) bool {
+	if tablet.StartRow != nil && bytes.Compare(row, []byte(*tablet.StartRow)) < 0 {
+		return false
+	}
+	return tablet.EndRow == nil || bytes.Compare(row, []byte(*tablet.EndRow)) < 0
+}
+
+type verificationReaderAt struct {
+	ctx    context.Context
+	source io.ReaderAt
+
+	mu  sync.Mutex
+	err error
+}
+
+func (r *verificationReaderAt) ReadAt(p []byte, off int64) (int, error) {
+	if err := r.ctx.Err(); err != nil {
+		r.recordError(err)
+		return 0, err
+	}
+	n, err := r.source.ReadAt(p, off)
+	if err != nil {
+		r.recordError(err)
+	}
+	return n, err
+}
+
+func (r *verificationReaderAt) recordError(err error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.err == nil {
+		r.err = err
+	}
+}
+
+func (r *verificationReaderAt) firstError() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.err
+}
+
+// ImportRFileManifest verifies the manifest's immutable files and makes them
+// queryable in this engine. The files are expected to already be present at
+// their DestinationPath on this engine's backend (export places them there).
+// Import copies each verified object to an engine-owned, content-addressed path
+// and registers that exact copy so later source replacement cannot change the
+// imported table.
 //
 // Fan-in: a second import of a table this engine already serves MERGES the
 // manifest's RFiles into the open table instead of dropping them. Because
@@ -473,14 +958,34 @@ func VerifyRFileExport(ctx context.Context, b storage.Backend, manifest *RFileEx
 // agents export the same logical table into one cluster engine safely (with
 // per-cell tenant visibility stamps providing isolation; see
 // RFileExportOptions.StampVisibilityLabel).
-func (e *Engine) ImportRFileManifest(ctx context.Context, manifest *RFileExportManifest) error {
-	if err := VerifyRFileExport(ctx, e.backend, manifest); err != nil {
+func (e *Engine) ImportRFileManifest(ctx context.Context, manifest *RFileExportManifest) (err error) {
+	if manifest == nil {
+		return errors.New("engine: nil RFile import manifest")
+	}
+	if err := validateImportedTableName(manifest.SourceTable); err != nil {
+		return err
+	}
+	if err := verifyImmutableExport(ctx, e.backend, manifest, newVerificationSnapshot); err != nil {
 		return err
 	}
 	splits, err := manifestSplits(manifest)
 	if err != nil {
 		return err
 	}
+	format, err := tablet.ParseFileFormat(string(manifest.FileFormat))
+	if err != nil {
+		return err
+	}
+	stagedFiles, err := stageVerifiedImportFiles(ctx, e.backend, manifest.RFiles)
+	if err != nil {
+		return err
+	}
+	rollback := newStagedImportRollback(e.backend, stagedFiles)
+	defer func() {
+		if err != nil {
+			err = rollback.cleanup(err)
+		}
+	}()
 	tableDir := filepath.Join(e.dir, manifest.SourceTable)
 	for _, tb := range manifest.Tablets {
 		if err := os.MkdirAll(filepath.Join(tableDir, fmt.Sprintf("t-%04d", tb.Index)), 0o755); err != nil {
@@ -493,7 +998,7 @@ func (e *Engine) ImportRFileManifest(ctx context.Context, manifest *RFileExportM
 		}
 	}
 	filesByTablet := make(map[int][]string)
-	for _, file := range manifest.RFiles {
+	for _, file := range stagedFiles {
 		filesByTablet[file.TabletIndex] = append(filesByTablet[file.TabletIndex], file.DestinationPath)
 	}
 
@@ -511,16 +1016,16 @@ func (e *Engine) ImportRFileManifest(ctx context.Context, manifest *RFileExportM
 			}
 		}
 		for i := range existing.tablets {
-			if _, err := existing.tablets[i].RegisterImmutableFiles(filesByTablet[i]); err != nil {
-				return fmt.Errorf("engine: merge import for table %q tablet %d: %w", manifest.SourceTable, i, err)
+			adopted, registerErr := existing.tablets[i].RegisterImmutableFiles(filesByTablet[i])
+			rollback.release(adopted)
+			if registerErr != nil {
+				return fmt.Errorf("engine: merge import for table %q tablet %d: %w",
+					manifest.SourceTable, i, registerErr)
 			}
 		}
 		return nil
 	}
-	format, err := tablet.ParseFileFormat(string(manifest.FileFormat))
-	if err != nil {
-		return err
-	}
+
 	if err := writeTableManifest(tableDir, tableManifest{
 		Version:    tableManifestVersion,
 		Splits:     splits,
@@ -530,8 +1035,12 @@ func (e *Engine) ImportRFileManifest(ctx context.Context, manifest *RFileExportM
 	}
 	for i := 0; i < manifest.tabletCount(); i++ {
 		tabletDir := filepath.Join(tableDir, fmt.Sprintf("t-%04d", i))
-		if err := tablet.PublishImmutableFiles(e.backend, tabletDir, filesByTablet[i]); err != nil {
-			return fmt.Errorf("engine: publish imported tablet %d manifest: %w", i, err)
+		publishErr := tablet.PublishImmutableFiles(e.backend, tabletDir, filesByTablet[i])
+		if publishErr == nil || storage.IsCommittedWriteError(publishErr) {
+			rollback.release(filesByTablet[i])
+		}
+		if publishErr != nil {
+			return fmt.Errorf("engine: publish imported tablet %d manifest: %w", i, publishErr)
 		}
 	}
 	tbl, err := openTable(tableDir, manifest.SourceTable, e.logger, e.cache, e.walSyncMode, e.walSyncInterval, e.backend, e.publishRFile)
@@ -540,6 +1049,143 @@ func (e *Engine) ImportRFileManifest(ctx context.Context, manifest *RFileExportM
 	}
 	e.tables[manifest.SourceTable] = tbl
 	return nil
+}
+
+type stagedImportRollback struct {
+	remover storage.Remover
+	pending map[string]struct{}
+}
+
+func newStagedImportRollback(b storage.Backend, files []RFileExportFile) *stagedImportRollback {
+	rollback := &stagedImportRollback{
+		pending: make(map[string]struct{}, len(files)),
+	}
+	rollback.remover, _ = b.(storage.Remover)
+	for _, file := range files {
+		rollback.pending[file.DestinationPath] = struct{}{}
+	}
+	return rollback
+}
+
+func (r *stagedImportRollback) release(paths []string) {
+	for _, path := range paths {
+		delete(r.pending, path)
+	}
+}
+
+func (r *stagedImportRollback) cleanup(cause error) error {
+	if len(r.pending) == 0 {
+		return cause
+	}
+	if r.remover == nil {
+		return errors.Join(cause, storage.ErrRemoverUnsupported)
+	}
+	paths := make([]string, 0, len(r.pending))
+	for path := range r.pending {
+		paths = append(paths, path)
+	}
+	sort.Strings(paths)
+	cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	for _, path := range paths {
+		if err := r.remover.Remove(cleanupCtx, path); err != nil {
+			cause = errors.Join(cause,
+				fmt.Errorf("engine: rollback staged import %s: %w", path, err))
+		}
+	}
+	return cause
+}
+
+func validateImportedTableName(name string) error {
+	if name == "" || name == "." || name == ".." ||
+		filepath.IsAbs(name) || filepath.VolumeName(name) != "" ||
+		strings.ContainsAny(name, `/\`) {
+		return fmt.Errorf("engine: invalid imported table name %q: must be a non-empty single path component", name)
+	}
+	return nil
+}
+
+func stageVerifiedImportFiles(
+	ctx context.Context,
+	b storage.Backend,
+	files []RFileExportFile,
+) ([]RFileExportFile, error) {
+	if _, ok := b.(storage.WritableBackend); !ok {
+		return nil, fmt.Errorf("%w: engine: importing verified files requires a writable backend",
+			storage.ErrReadOnly)
+	}
+	if _, ok := b.(storage.Remover); !ok {
+		return nil, fmt.Errorf("%w: engine: importing verified files requires deletion support",
+			storage.ErrRemoverUnsupported)
+	}
+	staged := append([]RFileExportFile(nil), files...)
+	created := make([]string, 0, len(staged))
+	for i := range staged {
+		sourcePath := staged[i].DestinationPath
+		extension := filepath.Ext(sourcePath)
+		var nonce [16]byte
+		if _, err := rand.Read(nonce[:]); err != nil {
+			return nil, cleanupFailedStagedImports(ctx, b, created,
+				fmt.Errorf("engine: generate staged import path: %w", err))
+		}
+		stagedPath := joinBackendPath(
+			b,
+			backendParentPath(sourcePath),
+			".shoal-import-"+staged[i].SHA256+"-"+hex.EncodeToString(nonce[:])+extension,
+		)
+		created = append(created, stagedPath)
+		written, sum, _, err := copyWithSHA256(ctx, b, sourcePath, b, stagedPath)
+		if err != nil {
+			return nil, cleanupFailedStagedImports(ctx, b, created,
+				fmt.Errorf("engine: stage verified import %s: %w", sourcePath, err))
+		}
+		if written != staged[i].Size || sum != staged[i].SHA256 {
+			return nil, cleanupFailedStagedImports(ctx, b, created, fmt.Errorf(
+				"engine: stage verified import %s changed after verification: size=%d sha256=%s",
+				sourcePath, written, sum,
+			))
+		}
+		storedSize, storedSum, err := hashObject(ctx, b, stagedPath)
+		if err != nil {
+			return nil, cleanupFailedStagedImports(ctx, b, created,
+				fmt.Errorf("engine: verify staged import %s: %w", stagedPath, err))
+		}
+		if storedSize != staged[i].Size || storedSum != staged[i].SHA256 {
+			return nil, cleanupFailedStagedImports(ctx, b, created, fmt.Errorf(
+				"engine: staged import %s does not match verified bytes: size=%d sha256=%s",
+				stagedPath, storedSize, storedSum,
+			))
+		}
+		staged[i].DestinationPath = stagedPath
+	}
+	return staged, nil
+}
+
+func cleanupFailedStagedImports(
+	ctx context.Context,
+	b storage.Backend,
+	paths []string,
+	cause error,
+) error {
+	remover, ok := b.(storage.Remover)
+	if !ok {
+		return errors.Join(cause, storage.ErrRemoverUnsupported)
+	}
+	for _, path := range paths {
+		if err := remover.Remove(ctx, path); err != nil {
+			cause = errors.Join(cause,
+				fmt.Errorf("engine: remove failed staged import %s: %w", path, err))
+		}
+	}
+	return cause
+}
+
+func backendParentPath(path string) string {
+	index := strings.LastIndexAny(path, `/\`)
+	if index < 0 {
+		return ""
+	}
+	return path[:index]
 }
 
 // copyOrStampRFile copies an RFile byte-for-byte, or — when a tenant
@@ -695,16 +1341,16 @@ func hashObject(ctx context.Context, b storage.Backend, path string) (int64, str
 		if off+want > f.Size() {
 			want = f.Size() - off
 		}
-		n, rerr := f.ReadAt(buf[:want], off)
+		n, readErr := f.ReadAt(buf[:want], off)
 		if n > 0 {
 			_, _ = h.Write(buf[:n])
 			off += int64(n)
 		}
-		if rerr != nil {
-			if errors.Is(rerr, io.EOF) {
+		if readErr != nil {
+			if errors.Is(readErr, io.EOF) {
 				break
 			}
-			return off, "", fmt.Errorf("engine: verify read %s: %w", path, rerr)
+			return off, "", fmt.Errorf("engine: verify read %s: %w", path, readErr)
 		}
 	}
 	return off, hex.EncodeToString(h.Sum(nil)), nil

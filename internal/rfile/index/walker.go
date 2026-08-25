@@ -38,6 +38,13 @@ func (f LevelReaderFunc) ReadIndexBlock(region bcfile.BlockRegion) (*IndexBlock,
 // row is missing. Past-end means there's no such block at all.
 var ErrPastEnd = errors.New("rfile/index: target key is past the last index entry")
 
+const maxTraversalDepth int32 = 64
+
+type blockRegionKey struct {
+	offset         int64
+	compressedSize int64
+}
+
 // Walker walks a multi-level index tree from a preserved root IndexBlock,
 // fetching child blocks on demand via the LevelReader. Stateless across
 // Seek calls — each Seek descends from root.
@@ -63,7 +70,14 @@ func NewWalker(root *IndexBlock, lr LevelReader) *Walker {
 // key >= target.
 func (w *Walker) Seek(target *wire.Key) (*IndexEntry, error) {
 	cur := w.root
+	if err := validateRootLevel(cur); err != nil {
+		return nil, err
+	}
+	visited := make(map[blockRegionKey]struct{})
 	for {
+		if _, _, err := validateBlockEntries(cur); err != nil {
+			return nil, err
+		}
 		entries := EntriesOf(cur)
 		idx, err := binarySearchKey(entries, target)
 		if err != nil {
@@ -90,11 +104,18 @@ func (w *Walker) Seek(target *wire.Key) (*IndexEntry, error) {
 		if w.lr == nil {
 			return nil, fmt.Errorf("rfile/index: multi-level index requires LevelReader (level=%d)", cur.Level)
 		}
-		child, err := w.lr.ReadIndexBlock(bcfile.BlockRegion{
+		var lowerBound *wire.Key
+		if idx > 0 {
+			lowerBound, err = entries.KeyAt(idx - 1)
+			if err != nil {
+				return nil, err
+			}
+		}
+		child, err := readChildBlock(w.lr, cur.Level, bcfile.BlockRegion{
 			Offset:         entry.Offset,
 			CompressedSize: entry.CompressedSize,
 			RawSize:        entry.RawSize,
-		})
+		}, lowerBound, entry.Key, visited)
 		if err != nil {
 			return nil, fmt.Errorf("rfile/index: descend to level %d: %w", cur.Level-1, err)
 		}
@@ -141,39 +162,187 @@ func binarySearchKey(entries *Entries, target *wire.Key) (int, error) {
 // (The index is small relative to data, so prefetching index blocks
 // is rarely the bottleneck.)
 func (w *Walker) IterateLeaves(fn func(*IndexEntry) error) error {
-	return iterateLeaves(w.root, w.lr, fn)
+	if err := validateRootLevel(w.root); err != nil {
+		return err
+	}
+	state := &iterationState{visited: make(map[blockRegionKey]struct{})}
+	return iterateLeaves(w.root, w.lr, fn, state)
 }
 
-func iterateLeaves(block *IndexBlock, lr LevelReader, fn func(*IndexEntry) error) error {
+type iterationState struct {
+	visited  map[blockRegionKey]struct{}
+	lastLeaf *wire.Key
+}
+
+func iterateLeaves(
+	block *IndexBlock,
+	lr LevelReader,
+	fn func(*IndexEntry) error,
+	state *iterationState,
+) error {
+	if _, _, err := validateBlockEntries(block); err != nil {
+		return err
+	}
 	entries := EntriesOf(block)
 	n := entries.Len()
+	var lowerBound *wire.Key
 	for i := 0; i < n; i++ {
 		entry, err := entries.At(i)
 		if err != nil {
 			return err
 		}
 		if block.Level == 0 {
+			region := bcfile.BlockRegion{
+				Offset:         entry.Offset,
+				CompressedSize: entry.CompressedSize,
+				RawSize:        entry.RawSize,
+			}
+			key := blockRegionKey{offset: region.Offset, compressedSize: region.CompressedSize}
+			if _, ok := state.visited[key]; ok {
+				return fmt.Errorf("rfile/index: repeated leaf block region %+v", region)
+			}
+			state.visited[key] = struct{}{}
+			if state.lastLeaf != nil && entry.Key.Compare(state.lastLeaf) <= 0 {
+				return fmt.Errorf(
+					"rfile/index: leaf key %v is not strictly after previous leaf key %v",
+					entry.Key, state.lastLeaf,
+				)
+			}
+			state.lastLeaf = entry.Key
 			if err := fn(entry); err != nil {
 				return err
 			}
+			lowerBound = entry.Key
 			continue
 		}
 		if lr == nil {
 			return fmt.Errorf("rfile/index: multi-level iterate requires LevelReader (level=%d)", block.Level)
 		}
-		child, err := lr.ReadIndexBlock(bcfile.BlockRegion{
+		child, err := readChildBlock(lr, block.Level, bcfile.BlockRegion{
 			Offset:         entry.Offset,
 			CompressedSize: entry.CompressedSize,
 			RawSize:        entry.RawSize,
-		})
+		}, lowerBound, entry.Key, state.visited)
 		if err != nil {
 			return fmt.Errorf("rfile/index: descend to level %d: %w", block.Level-1, err)
 		}
-		if err := iterateLeaves(child, lr, fn); err != nil {
+		if err := iterateLeaves(child, lr, fn, state); err != nil {
 			return err
 		}
+		lowerBound = entry.Key
 	}
 	return nil
+}
+
+func validateRootLevel(root *IndexBlock) error {
+	if root == nil {
+		return errors.New("rfile/index: nil root index block")
+	}
+	if root.Level < 0 {
+		return fmt.Errorf("rfile/index: negative root level %d", root.Level)
+	}
+	if root.Level > maxTraversalDepth {
+		return fmt.Errorf(
+			"rfile/index: root level %d exceeds maximum traversal depth %d",
+			root.Level, maxTraversalDepth,
+		)
+	}
+	return nil
+}
+
+func readChildBlock(
+	lr LevelReader,
+	parentLevel int32,
+	region bcfile.BlockRegion,
+	lowerBound *wire.Key,
+	upperBound *wire.Key,
+	visited map[blockRegionKey]struct{},
+) (*IndexBlock, error) {
+	key := blockRegionKey{offset: region.Offset, compressedSize: region.CompressedSize}
+	if _, ok := visited[key]; ok {
+		return nil, fmt.Errorf("repeated child block region %+v", region)
+	}
+	visited[key] = struct{}{}
+	child, err := lr.ReadIndexBlock(region)
+	if err != nil {
+		return nil, err
+	}
+	if child == nil {
+		return nil, errors.New("LevelReader returned nil child block")
+	}
+	expectedLevel := parentLevel - 1
+	if child.Level != expectedLevel {
+		return nil, fmt.Errorf(
+			"child block level %d, want %d from parent level %d",
+			child.Level, expectedLevel, parentLevel,
+		)
+	}
+	first, last, err := validateBlockEntries(child)
+	if err != nil {
+		return nil, err
+	}
+	if first == nil {
+		return nil, errors.New("child index block has no entries")
+	}
+	if lowerBound != nil && first.Compare(lowerBound) <= 0 {
+		return nil, fmt.Errorf(
+			"child first key %v is not strictly after parent lower bound %v",
+			first, lowerBound,
+		)
+	}
+	if upperBound == nil || !last.Equal(upperBound) {
+		return nil, fmt.Errorf(
+			"child final key %v does not match parent upper bound %v",
+			last, upperBound,
+		)
+	}
+	return child, nil
+}
+
+// ValidateBlock rejects index blocks that are unsafe for binary search.
+func ValidateBlock(block *IndexBlock) error {
+	if err := validateRootLevel(block); err != nil {
+		return err
+	}
+	_, _, err := validateBlockEntries(block)
+	return err
+}
+
+func validateBlockEntries(block *IndexBlock) (*wire.Key, *wire.Key, error) {
+	if block == nil {
+		return nil, nil, errors.New("rfile/index: nil index block")
+	}
+	if block.Level < 0 {
+		return nil, nil, fmt.Errorf("rfile/index: negative block level %d", block.Level)
+	}
+	entries := EntriesOf(block)
+	var first, previous *wire.Key
+	for i := 0; i < entries.Len(); i++ {
+		entry, err := entries.At(i)
+		if err != nil {
+			return nil, nil, err
+		}
+		if entry.Key == nil {
+			return nil, nil, fmt.Errorf("rfile/index: entry %d has nil key", i)
+		}
+		if previous != nil && entry.Key.Compare(previous) <= 0 {
+			return nil, nil, fmt.Errorf(
+				"rfile/index: entry %d key %v is not strictly after entry %d key %v",
+				i, entry.Key, i-1, previous,
+			)
+		}
+		if block.Level == 0 && entry.NumEntries <= 0 {
+			return nil, nil, fmt.Errorf(
+				"rfile/index: leaf entry %d has non-positive cell count %d",
+				i, entry.NumEntries,
+			)
+		}
+		if first == nil {
+			first = entry.Key
+		}
+		previous = entry.Key
+	}
+	return first, previous, nil
 }
 
 // Root returns the root IndexBlock the walker was constructed with.

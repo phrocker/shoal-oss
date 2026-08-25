@@ -227,9 +227,7 @@ func groupDocuments(stream RowStream) ([]*docRow, error) {
 		}
 
 		if field, value, ok := documentschema.ParseEventCQ(k.ColumnQualifier); ok {
-			if _, exists := cur.fields[field]; !exists {
-				cur.fields[field] = value
-			}
+			addDocumentField(cur.fields, field, value, k.ColumnQualifier, stream.Value())
 		}
 		if err := stream.Advance(); err != nil {
 			return nil, err
@@ -257,12 +255,25 @@ func groupDocumentCells(cells []Cell) []*docRow {
 			out = append(out, doc)
 		}
 		if field, value, ok := documentschema.ParseEventCQ(cell.Key.ColumnQualifier); ok {
-			if _, exists := doc.fields[field]; !exists {
-				doc.fields[field] = value
-			}
+			addDocumentField(doc.fields, field, value, cell.Key.ColumnQualifier, cell.Value)
 		}
 	}
 	return out
+}
+
+func addDocumentField(
+	fields map[string]string,
+	field string,
+	value string,
+	cq []byte,
+	cellValue []byte,
+) {
+	if documentschema.IsStructureCell(cq, cellValue) {
+		return
+	}
+	if _, exists := fields[field]; !exists {
+		fields[field] = value
+	}
 }
 
 // projectDocuments builds the result for an explicit projection.

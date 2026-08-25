@@ -152,3 +152,65 @@ func Decode(data []byte) ([]iterrt.Cell, error) {
 	}
 	return cells, nil
 }
+
+// Validate verifies the Parquet structure, decodes every row, and enforces
+// Shoal's sorted-key invariant. validateKey may impose additional constraints.
+func Validate(src io.ReaderAt, size int64, validateKey func(*wire.Key) error) error {
+	if size < 0 {
+		return fmt.Errorf("parquet: negative size %d", size)
+	}
+	file, err := parquet.OpenFile(src, size, parquet.ReadBufferSize(64<<10))
+	if err != nil {
+		return fmt.Errorf("parquet: open: %w", err)
+	}
+	var previous *wire.Key
+	var row int64
+	batch := make([]Cell, 256)
+	for groupIndex, group := range file.RowGroups() {
+		reader := parquet.NewGenericRowGroupReader[Cell](group)
+		for {
+			n, readErr := reader.Read(batch)
+			for i := 0; i < n; i++ {
+				key := parquetCellKey(&batch[i])
+				if previous != nil && previous.Compare(key) > 0 {
+					_ = reader.Close()
+					return fmt.Errorf("parquet: cells are not sorted at row %d", row)
+				}
+				if validateKey != nil {
+					if err := validateKey(key); err != nil {
+						_ = reader.Close()
+						return fmt.Errorf("parquet: validate row %d: %w", row, err)
+					}
+				}
+				previous = key.Clone()
+				row++
+			}
+			if readErr != nil {
+				if readErr != io.EOF {
+					_ = reader.Close()
+					return fmt.Errorf("parquet: read row group %d: %w", groupIndex, readErr)
+				}
+				break
+			}
+			if n == 0 {
+				_ = reader.Close()
+				return fmt.Errorf("parquet: read row group %d: %w", groupIndex, io.ErrNoProgress)
+			}
+		}
+		if err := reader.Close(); err != nil {
+			return fmt.Errorf("parquet: close row group %d: %w", groupIndex, err)
+		}
+	}
+	return nil
+}
+
+func parquetCellKey(row *Cell) *wire.Key {
+	return &wire.Key{
+		Row:              row.Row,
+		ColumnFamily:     row.CF,
+		ColumnQualifier:  row.CQ,
+		ColumnVisibility: row.CV,
+		Timestamp:        row.Timestamp,
+		Deleted:          row.Deleted,
+	}
+}

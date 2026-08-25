@@ -119,16 +119,13 @@ func (f *fakeAuthority) CompleteFanIn(context.Context, *Intent) error {
 
 func durableFixture(t *testing.T, mode Mode) (*Machine, Request, *fakeDurablePromoter, *fakeAuthority) {
 	t.Helper()
+	data, file := testRFile(t, 0, "export/events/t-0000/F0001.rf", []byte("value"))
 	src := memory.New()
-	src.Put("export/events/t-0000/F0001.rf", []byte("data"))
+	src.Put(file.DestinationPath, data)
 	manifest := &engine.RFileExportManifest{
 		Version: engine.RFileExportManifestVersion, SourceTable: "events",
 		Tablets: []engine.RFileExportTablet{{Index: 0}},
-		RFiles: []engine.RFileExportFile{{
-			TabletIndex: 0, DestinationPath: "export/events/t-0000/F0001.rf",
-			Size: 4, SHA256: "3a6eb0790f39ac87c94f3856b2dd2c5d110e6811602261a9a923d3bb23adc8b7",
-			Format: engine.ExportFormatRFile, Role: engine.ExportRoleAuthoritative,
-		}},
+		RFiles:  []engine.RFileExportFile{file},
 	}
 	req := Request{
 		Mode: mode, ProducerID: "agent-a", SourceGeneration: 7,
@@ -159,6 +156,9 @@ func TestDurablePromotionRecoversAmbiguousSubmitUsingSameFateID(t *testing.T) {
 	first, err := machine.Run(context.Background(), req)
 	if err == nil {
 		t.Fatal("first run error = nil, want ambiguous submit error")
+	}
+	if first == nil {
+		t.Fatalf("first intent = nil after ambiguous submit: %v", err)
 	}
 	if first.State != StateFateAllocated || first.SubmissionAttempts != 1 {
 		t.Fatalf("first state = %s attempts=%d", first.State, first.SubmissionAttempts)

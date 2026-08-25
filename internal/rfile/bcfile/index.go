@@ -13,6 +13,17 @@ import (
 // BCFile.DataIndex.BLOCK_NAME = "BCFile.index".
 const DataIndexBlockName = "BCFile.index"
 
+// maxMetaIndexEntries bounds decoded map growth independently of the encoded
+// MetaIndex region size. Production BCFiles use only a small set of metadata
+// blocks; this limit leaves ample extension room while bounding hostile input.
+const maxMetaIndexEntries int32 = 1 << 16
+
+// maxDataIndexBlocks bounds decoded index memory independently of the
+// compressed meta-block size. One million blocks already describes RFiles
+// far larger than practical production files while keeping the region slice
+// below 24 MiB.
+const maxDataIndexBlocks int32 = 1 << 20
+
 // metaNamePrefix is prepended to every MetaIndexEntry's user-facing name
 // when serialized. The Java reader strips it on read; we do the same.
 // Keeping this internal — exported names are always prefix-free.
@@ -21,9 +32,9 @@ const metaNamePrefix = "data:"
 // MetaIndexEntry names one meta block: which BlockRegion it lives at,
 // what compression algorithm it uses, and its (prefix-stripped) name.
 type MetaIndexEntry struct {
-	Name             string // user-facing name, prefix already stripped (e.g. "BCFile.index", "RFile.index")
-	CompressionAlgo  string // codec name as written by the producer (e.g. "gz", "snappy", "none")
-	Region           BlockRegion
+	Name            string // user-facing name, prefix already stripped (e.g. "BCFile.index", "RFile.index")
+	CompressionAlgo string // codec name as written by the producer (e.g. "gz", "snappy", "none")
+	Region          BlockRegion
 }
 
 // MetaIndex is the deserialized meta-block index: a map keyed by the
@@ -48,11 +59,18 @@ func ReadMetaIndex(r ByteAndReader) (*MetaIndex, error) {
 	if count < 0 {
 		return nil, fmt.Errorf("bcfile: negative MetaIndex count %d", count)
 	}
-	out := &MetaIndex{Entries: make(map[string]MetaIndexEntry, count)}
+	if count > maxMetaIndexEntries {
+		return nil, fmt.Errorf("bcfile: MetaIndex entry count %d exceeds %d-entry limit",
+			count, maxMetaIndexEntries)
+	}
+	out := &MetaIndex{Entries: make(map[string]MetaIndexEntry, int(count))}
 	for i := int32(0); i < count; i++ {
 		entry, err := readMetaIndexEntry(r)
 		if err != nil {
 			return nil, fmt.Errorf("MetaIndex entry %d: %w", i, err)
+		}
+		if _, exists := out.Entries[entry.Name]; exists {
+			return nil, fmt.Errorf("bcfile: duplicate MetaIndex entry %q", entry.Name)
 		}
 		out.Entries[entry.Name] = entry
 	}
@@ -146,13 +164,17 @@ func ReadDataIndex(r ByteAndReader) (*DataIndex, error) {
 	if count < 0 {
 		return nil, fmt.Errorf("bcfile: negative DataIndex block count %d", count)
 	}
-	blocks := make([]BlockRegion, count)
+	if count > maxDataIndexBlocks {
+		return nil, fmt.Errorf("bcfile: DataIndex block count %d exceeds %d-block limit",
+			count, maxDataIndexBlocks)
+	}
+	blocks := make([]BlockRegion, 0, int(count))
 	for i := int32(0); i < count; i++ {
 		region, err := ReadBlockRegion(r)
 		if err != nil {
 			return nil, fmt.Errorf("DataIndex block %d: %w", i, err)
 		}
-		blocks[i] = region
+		blocks = append(blocks, region)
 	}
 	return &DataIndex{DefaultCompression: algo, Blocks: blocks}, nil
 }

@@ -18,10 +18,10 @@
     under the License.
 
 -->
-# Veculo-on-shoal graph schema
+# Agent knowledge graph schema
 
 `internal/graphschema` defines shared byte conventions for modeling an
-agentic memory graph on top of shoal's generic `row -> (cf,cq,cv,ts) -> value`
+agent knowledge graph on top of shoal's generic `row -> (cf,cq,cv,ts) -> value`
 cells. It is a consumer library only: the engine and `internal/iterrt` remain
 schema-agnostic.
 

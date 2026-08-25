@@ -69,6 +69,11 @@ func readMultiLevelBlock(r wire.ByteAndReader) (*IndexBlock, error) {
 	if numOffsets < 0 {
 		return nil, fmt.Errorf("IndexBlock: negative numOffsets %d", numOffsets)
 	}
+	if err := validateDecodedCount(
+		"IndexBlock offsets", numOffsets, r, maxIndexEntries, 4, 4,
+	); err != nil {
+		return nil, err
+	}
 	offsets := make([]int32, numOffsets)
 	for i := int32(0); i < numOffsets; i++ {
 		o, err := wire.ReadInt32(r)
@@ -84,6 +89,14 @@ func readMultiLevelBlock(r wire.ByteAndReader) (*IndexBlock, error) {
 	if indexSize < 0 {
 		return nil, fmt.Errorf("IndexBlock: negative indexSize %d", indexSize)
 	}
+	if err := validateIndexOffsets(offsets, indexSize); err != nil {
+		return nil, err
+	}
+	if err := validateDecodedLength(
+		"IndexBlock data", indexSize, r, maxIndexDataBytes, 0,
+	); err != nil {
+		return nil, err
+	}
 	data := make([]byte, indexSize)
 	if _, err := io.ReadFull(r, data); err != nil {
 		return nil, fmt.Errorf("IndexBlock data (%d bytes): %w", indexSize, err)
@@ -97,6 +110,30 @@ func readMultiLevelBlock(r wire.ByteAndReader) (*IndexBlock, error) {
 	}, nil
 }
 
+func validateIndexOffsets(offsets []int32, indexSize int32) error {
+	if len(offsets) == 0 {
+		if indexSize != 0 {
+			return fmt.Errorf("IndexBlock: %d data bytes have no offsets", indexSize)
+		}
+		return nil
+	}
+	if offsets[0] != 0 {
+		return fmt.Errorf("IndexBlock: first offset %d is not zero", offsets[0])
+	}
+	for i, offset := range offsets {
+		if offset < 0 || offset >= indexSize {
+			return fmt.Errorf(
+				"IndexBlock: offset[%d]=%d is outside [0,%d)", i, offset, indexSize)
+		}
+		if i > 0 && offset <= offsets[i-1] {
+			return fmt.Errorf(
+				"IndexBlock: offset[%d]=%d is not greater than offset[%d]=%d",
+				i, offset, i-1, offsets[i-1])
+		}
+	}
+	return nil
+}
+
 // readFlatBlock handles the v3/v4 layout: int32 size + size × IndexEntry.
 // We materialize each entry's bytes back into an Offsets[]+Data[] form so
 // the post-decode shape matches the multi-level case — that way the
@@ -108,6 +145,11 @@ func readFlatBlock(r wire.ByteAndReader, version int32) (*IndexBlock, error) {
 	}
 	if size < 0 {
 		return nil, fmt.Errorf("IndexBlock: negative flat size %d", size)
+	}
+	if err := validateDecodedCount(
+		"IndexBlock flat entries", size, r, maxIndexEntries, 1, 0,
+	); err != nil {
+		return nil, err
 	}
 	// Decode each IndexEntry from the wire, then re-encode it into Data
 	// at a known offset. Avoids dual-format handling downstream.

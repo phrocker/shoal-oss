@@ -30,8 +30,8 @@ const (
 	CodecNone   = "none"
 	CodecGzip   = "gz"     // Hadoop's GzipCodec name in BCFile
 	CodecSnappy = "snappy" // Hadoop SnappyCodec — block-framed; see snappy.go
-	CodecZstd   = "zstd"   // not yet supported
-	CodecLZ4    = "lz4"    // not yet supported
+	CodecZstd   = "zstd"   // Hadoop ZStandardCodec — standard zstd stream
+	CodecLZ4    = "lz4"    // Hadoop Lz4Codec — block-framed; see lz4.go
 )
 
 // ErrUnsupportedCodec is returned when a BCFile uses a codec this package
@@ -52,8 +52,7 @@ var ErrSizeMismatch = errors.New("block: decompressed size mismatch")
 type CodecFunc func(compressed []byte, rawSize int64) ([]byte, error)
 
 // Decompressor dispatches BCFile block reads through registered codecs.
-// Default registers "none" + "gz" — extend via Register for snappy / zstd
-// once those wire formats are settled.
+// Default registers the Hadoop codecs supported by BCFile.
 type Decompressor struct {
 	mu     sync.RWMutex
 	codecs map[string]CodecFunc
@@ -66,14 +65,15 @@ func NewDecompressor() *Decompressor {
 }
 
 // Default returns a Decompressor wired for the codecs we support today:
-// "none", "gz" (zlib via DefaultCodec), and "snappy" (Hadoop block-framed
-// snappy via BlockDecompressorStream). zstd/lz4 are still unregistered
-// pending real-cluster confirmation that they're in use.
+// "none", "gz" (zlib via DefaultCodec), "snappy" and "lz4" (Hadoop
+// block-framed streams), and "zstd" (a standard zstd stream).
 func Default() *Decompressor {
 	d := NewDecompressor()
 	d.Register(CodecNone, decompressNone)
 	d.Register(CodecGzip, decompressGzip)
 	d.Register(CodecSnappy, decompressSnappy)
+	d.Register(CodecZstd, decompressZstd)
+	d.Register(CodecLZ4, decompressLZ4)
 	return d
 }
 
@@ -107,6 +107,14 @@ func (d *Decompressor) Block(src io.ReaderAt, region bcfile.BlockRegion, codec s
 	}
 	if region.RawSize < 0 {
 		return nil, fmt.Errorf("block: negative RawSize %d", region.RawSize)
+	}
+	if region.CompressedSize > bcfile.MaxCompressedBlockSize {
+		return nil, fmt.Errorf("block: CompressedSize %d exceeds %d-byte limit",
+			region.CompressedSize, bcfile.MaxCompressedBlockSize)
+	}
+	if region.RawSize > bcfile.MaxRawBlockSize {
+		return nil, fmt.Errorf("block: RawSize %d exceeds %d-byte limit",
+			region.RawSize, bcfile.MaxRawBlockSize)
 	}
 	d.mu.RLock()
 	fn, ok := d.codecs[codec]
@@ -151,17 +159,14 @@ func decompressGzip(compressed []byte, rawSize int64) ([]byte, error) {
 		return nil, fmt.Errorf("block: zlib header: %w", err)
 	}
 	defer zr.Close()
-	// Pre-size the buffer so the codec doesn't append-grow. If rawSize is
-	// honest this is a single allocation.
-	out := make([]byte, 0, rawSize)
-	buf := bytes.NewBuffer(out)
-	if _, err := io.Copy(buf, zr); err != nil {
-		return nil, fmt.Errorf("block: zlib body: %w", err)
+	out := make([]byte, rawSize+1)
+	n, readErr := io.ReadFull(zr, out)
+	if readErr != nil && !errors.Is(readErr, io.EOF) && !errors.Is(readErr, io.ErrUnexpectedEOF) {
+		return nil, fmt.Errorf("block: zlib body: %w", readErr)
 	}
-	got := buf.Bytes()
-	if int64(len(got)) != rawSize {
+	if int64(n) != rawSize {
 		return nil, fmt.Errorf("%w: codec=gz got=%d rawSize=%d",
-			ErrSizeMismatch, len(got), rawSize)
+			ErrSizeMismatch, n, rawSize)
 	}
-	return got, nil
+	return out[:n:n], nil
 }

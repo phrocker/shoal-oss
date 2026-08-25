@@ -20,8 +20,10 @@ require (
 	github.com/go-zookeeper/zk v1.0.4
 	github.com/golang/snappy v1.0.0
 	github.com/google/uuid v1.6.0
+	github.com/klauspost/compress v1.17.9
 	github.com/mattn/go-sqlite3 v1.14.46
 	github.com/parquet-go/parquet-go v0.32.0
+	github.com/pierrec/lz4/v4 v4.1.21
 	golang.org/x/sys v0.46.0
 	golang.org/x/text v0.38.0
 	google.golang.org/api v0.278.0
@@ -76,11 +78,9 @@ require (
 	github.com/jcmturner/goidentity/v6 v6.0.1 // indirect
 	github.com/jcmturner/gokrb5/v8 v8.4.4 // indirect
 	github.com/jcmturner/rpc/v2 v2.0.3 // indirect
-	github.com/klauspost/compress v1.17.9 // indirect
 	github.com/kylelemons/godebug v1.1.0 // indirect
 	github.com/parquet-go/bitpack v1.0.0 // indirect
 	github.com/parquet-go/jsonlite v1.0.0 // indirect
-	github.com/pierrec/lz4/v4 v4.1.21 // indirect
 	github.com/pkg/browser v0.0.0-20240102092130-5ac0b6a4141c // indirect
 	github.com/planetscale/vtprotobuf v0.6.1-0.20240319094008-0393e58bdf10 // indirect
 	github.com/spiffe/go-spiffe/v2 v2.6.0 // indirect

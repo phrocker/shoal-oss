@@ -44,12 +44,14 @@ type SkipPredicate func(leafIdx int, entry *index.IndexEntry, bm *blockmeta.Bloc
 // share the same Reader through Seek/Next; instantiate two readers
 // from the same bcfile.Reader+Decompressor instead.
 type Reader struct {
-	bc        *bcfile.Reader
-	dec       *block.Decompressor
-	idx       *index.Reader
-	walker    *index.Walker
-	lg        *index.LocalityGroup
-	dataCodec string
+	bc           *bcfile.Reader
+	dec          *block.Decompressor
+	idx          *index.Reader
+	walker       *index.Walker
+	lg           *index.LocalityGroup
+	dataCodec    string
+	dataBlocks   []bcfile.BlockRegion
+	dataBlockSet map[bcfile.BlockRegion]struct{}
 
 	// Optional block cache. nil disables caching. Keyed by (cacheKey,
 	// region.Offset). When set, every block fetch (data, BCFile.index,
@@ -161,6 +163,9 @@ func Open(bc *bcfile.Reader, dec *block.Decompressor, opts ...OpenOption) (*Read
 	if err != nil {
 		return nil, fmt.Errorf("rfile: parse %q: %w", IndexMetaBlockName, err)
 	}
+	if err := validateReadableIndex(idx); err != nil {
+		return nil, err
+	}
 
 	defaultLG := pickDefaultLG(idx.Groups)
 	if defaultLG == nil {
@@ -219,13 +224,15 @@ func Open(bc *bcfile.Reader, dec *block.Decompressor, opts ...OpenOption) (*Read
 // backs concurrent scans; each scan gets its own cursor Reader (own
 // decompressor + cursor state) via NewReaderFromShared.
 type SharedFile struct {
-	bc        *bcfile.Reader
-	idx       *index.Reader
-	lg        *index.LocalityGroup
-	dataCodec string
-	bm        *blockmeta.BlockMeta
-	adj       *adjacency.Index
-	leaves    []*index.IndexEntry
+	bc           *bcfile.Reader
+	idx          *index.Reader
+	lg           *index.LocalityGroup
+	dataCodec    string
+	dataBlocks   []bcfile.BlockRegion
+	dataBlockSet map[bcfile.BlockRegion]struct{}
+	bm           *blockmeta.BlockMeta
+	adj          *adjacency.Index
+	leaves       []*index.IndexEntry
 }
 
 // OpenShared parses an RFile once and collects its default-LG leaves,
@@ -243,13 +250,15 @@ func OpenShared(bc *bcfile.Reader, dec *block.Decompressor, opts ...OpenOption) 
 		return nil, err
 	}
 	return &SharedFile{
-		bc:        bc,
-		idx:       r.idx,
-		lg:        r.lg,
-		dataCodec: r.dataCodec,
-		bm:        r.bm,
-		adj:       r.adj,
-		leaves:    leaves,
+		bc:           bc,
+		idx:          r.idx,
+		lg:           r.lg,
+		dataCodec:    r.dataCodec,
+		dataBlocks:   r.dataBlocks,
+		dataBlockSet: r.dataBlockSet,
+		bm:           r.bm,
+		adj:          r.adj,
+		leaves:       leaves,
 	}, nil
 }
 
@@ -282,6 +291,8 @@ func NewReaderFromShared(sf *SharedFile, dec *block.Decompressor, opts ...OpenOp
 		idx:          sf.idx,
 		lg:           sf.lg,
 		dataCodec:    sf.dataCodec,
+		dataBlocks:   sf.dataBlocks,
+		dataBlockSet: sf.dataBlockSet,
 		bm:           sf.bm,
 		adj:          sf.adj,
 		leaves:       sf.leaves,
@@ -298,7 +309,7 @@ func NewReaderFromShared(sf *SharedFile, dec *block.Decompressor, opts ...OpenOp
 // nested index nodes go through the same cache as data blocks.
 func (r *Reader) makeWalker(idx *index.Reader, root *index.IndexBlock, dataCodec string) *index.Walker {
 	lr := index.LevelReaderFunc(func(region bcfile.BlockRegion) (*index.IndexBlock, error) {
-		raw, err := r.fetchBlock(region, dataCodec)
+		raw, err := r.fetchDataBlock(region, dataCodec)
 		if err != nil {
 			return nil, fmt.Errorf("level-reader fetch: %w", err)
 		}
@@ -351,6 +362,9 @@ func OpenAll(bc *bcfile.Reader, dec *block.Decompressor, opts ...OpenOption) ([]
 	if err != nil {
 		return nil, fmt.Errorf("rfile: parse %q: %w", IndexMetaBlockName, err)
 	}
+	if err := validateReadableIndex(idx); err != nil {
+		return nil, err
+	}
 	dataCodec, err := root.loadDataCodec()
 	if err != nil {
 		return nil, fmt.Errorf("rfile: load data codec: %w", err)
@@ -366,25 +380,93 @@ func OpenAll(bc *bcfile.Reader, dec *block.Decompressor, opts ...OpenOption) ([]
 
 	out := make([]*Reader, 0, len(idx.Groups))
 	for _, lg := range idx.Groups {
-		// Empty LGs (no first key) carry no cells; skip to avoid
-		// constructing a walker over an empty root.
-		if lg.NumTotalEntries == 0 || lg.RootIndex == nil {
+		// Empty roots carry no cells; skip to avoid constructing a walker
+		// over an empty index.
+		if lg.RootIndex == nil || lg.RootIndex.NumEntries() == 0 {
 			continue
 		}
 		r := &Reader{
-			bc:        bc,
-			dec:       dec,
-			cache:     root.cache,
-			cacheKey:  root.cacheKey,
-			idx:       idx,
-			lg:        lg,
-			dataCodec: dataCodec,
-			bm:        bm,
+			bc:           bc,
+			dec:          dec,
+			cache:        root.cache,
+			cacheKey:     root.cacheKey,
+			idx:          idx,
+			lg:           lg,
+			dataCodec:    dataCodec,
+			dataBlocks:   root.dataBlocks,
+			dataBlockSet: root.dataBlockSet,
+			bm:           bm,
 		}
 		r.walker = r.makeWalker(idx, lg.RootIndex, dataCodec)
 		out = append(out, r)
 	}
 	return out, nil
+}
+
+func validateReadableIndex(idx *index.Reader) error {
+	if idx == nil {
+		return errors.New("rfile: nil index")
+	}
+	if idx.VectorExtension != nil {
+		return errors.New("rfile: vector-index extensions are not supported")
+	}
+	if len(idx.SampleGroups) > 0 || idx.SamplerConfiguration != nil {
+		return errors.New("rfile: sampled files are not supported")
+	}
+	defaultGroups := 0
+	namedGroups := make(map[string]int)
+	columnFamilies := make(map[string]int)
+	for group, lg := range idx.Groups {
+		if lg == nil {
+			return fmt.Errorf("rfile: locality group %d is nil", group)
+		}
+		if lg.IsDefault {
+			defaultGroups++
+			if lg.Name != "" {
+				return fmt.Errorf("rfile: default locality group %d has name %q", group, lg.Name)
+			}
+		} else {
+			if lg.Name == "" {
+				return fmt.Errorf("rfile: named locality group %d has an empty name", group)
+			}
+			if previous, exists := namedGroups[lg.Name]; exists {
+				return fmt.Errorf(
+					"rfile: locality groups %d and %d have duplicate name %q",
+					previous, group, lg.Name,
+				)
+			}
+			namedGroups[lg.Name] = group
+		}
+		for cf := range lg.ColumnFamilies {
+			if previous, exists := columnFamilies[cf]; exists {
+				return fmt.Errorf(
+					"rfile: column family %q belongs to locality groups %d and %d",
+					cf, previous, group,
+				)
+			}
+			columnFamilies[cf] = group
+		}
+		if lg.RootIndex == nil {
+			return fmt.Errorf("rfile: locality group %d has no root index", group)
+		}
+		if err := index.ValidateBlock(lg.RootIndex); err != nil {
+			return fmt.Errorf("rfile: locality group %d root index: %w", group, err)
+		}
+		rootEmpty := lg.RootIndex.NumEntries() == 0
+		countEmpty := lg.NumTotalEntries == 0
+		if rootEmpty != countEmpty {
+			return fmt.Errorf(
+				"rfile: locality group %d total-entry count is inconsistent with its root index",
+				group)
+		}
+	}
+	if defaultGroups != 1 {
+		return fmt.Errorf(
+			"rfile: expected exactly one default locality group, found %d",
+			defaultGroups,
+		)
+	}
+	return nil
 }
 
 // fetchBlock fetches + decompresses one BCFile region, consulting the
@@ -396,6 +478,9 @@ func OpenAll(bc *bcfile.Reader, dec *block.Decompressor, opts ...OpenOption) ([]
 // returned slice as read-only for the duration of its lifetime in the
 // cache (typically until LRU eviction).
 func (r *Reader) fetchBlock(region bcfile.BlockRegion, codec string) ([]byte, error) {
+	if err := bcfile.ValidateBlockRegion(region, r.bc.FileLength()); err != nil {
+		return nil, err
+	}
 	if r.cache != nil && r.cacheKey != "" {
 		if v, ok := r.cache.Get(r.cacheKey, region.Offset); ok {
 			return v, nil
@@ -409,6 +494,27 @@ func (r *Reader) fetchBlock(region bcfile.BlockRegion, codec string) ([]byte, er
 		r.cache.Put(r.cacheKey, region.Offset, raw)
 	}
 	return raw, nil
+}
+
+func (r *Reader) fetchDataBlock(
+	region bcfile.BlockRegion,
+	codec string,
+) ([]byte, error) {
+	if err := bcfile.ValidateBlockRegion(region, r.bc.DataRegionEnd()); err != nil {
+		return nil, err
+	}
+	// Java-produced RFiles can omit the optional DataIndex block list.
+	// When present, require an exact tuple match; when absent, the
+	// data/meta boundary above remains authoritative.
+	if r.dataBlockSet != nil {
+		if _, declared := r.dataBlockSet[region]; !declared {
+			return nil, fmt.Errorf(
+				"rfile: block region is not declared by BCFile.index: offset=%d compressed=%d raw=%d",
+				region.Offset, region.CompressedSize, region.RawSize,
+			)
+		}
+	}
+	return r.fetchBlock(region, codec)
 }
 
 // loadBlockMeta returns the parsed RFile.blockmeta meta-block if the
@@ -497,7 +603,35 @@ func (r *Reader) loadDataCodec() (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("parse DataIndex: %w", err)
 	}
+	if err := validateDataRegions(di.Blocks, r.bc.DataRegionEnd()); err != nil {
+		return "", err
+	}
+	r.dataBlocks = append([]bcfile.BlockRegion(nil), di.Blocks...)
+	if len(di.Blocks) > 0 {
+		r.dataBlockSet = make(map[bcfile.BlockRegion]struct{}, len(di.Blocks))
+		for _, region := range di.Blocks {
+			r.dataBlockSet[region] = struct{}{}
+		}
+	}
 	return di.DefaultCompression, nil
+}
+
+func validateDataRegions(regions []bcfile.BlockRegion, dataRegionEnd int64) error {
+	for i, region := range regions {
+		if err := bcfile.ValidateBlockRegion(region, dataRegionEnd); err != nil {
+			return fmt.Errorf("validate DataIndex block %d: %w", i, err)
+		}
+		if i > 0 {
+			previous := regions[i-1]
+			if region.Offset < previous.Offset+previous.CompressedSize {
+				return fmt.Errorf(
+					"validate DataIndex block %d: overlaps or precedes block %d",
+					i, i-1,
+				)
+			}
+		}
+	}
+	return nil
 }
 
 // LocalityGroup returns the default LG metadata that the reader is
@@ -762,7 +896,7 @@ func (r *Reader) collectLeaves() ([]*index.IndexEntry, error) {
 // decompresses, opens a relkey.Reader over it. Stores in r.currentBlk.
 func (r *Reader) openLeaf(i int) error {
 	leaf := r.leaves[i]
-	raw, err := r.fetchBlock(bcfile.BlockRegion{
+	raw, err := r.fetchDataBlock(bcfile.BlockRegion{
 		Offset:         leaf.Offset,
 		CompressedSize: leaf.CompressedSize,
 		RawSize:        leaf.RawSize,

@@ -3,6 +3,7 @@ package bcfile
 import (
 	"bytes"
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -131,6 +132,44 @@ func TestMetaIndexMissingPrefix(t *testing.T) {
 	}
 }
 
+func TestMetaIndexRejectsExcessiveEntryCount(t *testing.T) {
+	var buf bytes.Buffer
+	if _, err := WriteVInt(byteWriterShim{w: &buf}, maxMetaIndexEntries+1); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := ReadMetaIndex(&buf)
+	if err == nil {
+		t.Fatal("ReadMetaIndex accepted excessive entry count")
+	}
+}
+
+func TestMetaIndexRejectsDuplicateNames(t *testing.T) {
+	var buf bytes.Buffer
+	if _, err := WriteVInt(byteWriterShim{w: &buf}, 2); err != nil {
+		t.Fatal(err)
+	}
+	for _, region := range []BlockRegion{
+		{Offset: 10, CompressedSize: 5, RawSize: 20},
+		{Offset: 30, CompressedSize: 7, RawSize: 25},
+	} {
+		if err := WriteString(&buf, metaNamePrefix+"duplicate"); err != nil {
+			t.Fatal(err)
+		}
+		if err := WriteString(&buf, "gz"); err != nil {
+			t.Fatal(err)
+		}
+		if err := WriteBlockRegion(&buf, region); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if _, err := ReadMetaIndex(&buf); err == nil ||
+		!strings.Contains(err.Error(), "duplicate MetaIndex entry") {
+		t.Fatalf("ReadMetaIndex() = %v, want duplicate-name error", err)
+	}
+}
+
 func TestDataIndexRoundtrip(t *testing.T) {
 	want := &DataIndex{
 		DefaultCompression: "gz",
@@ -173,5 +212,20 @@ func TestDataIndexEmpty(t *testing.T) {
 	}
 	if got.DefaultCompression != "none" || len(got.Blocks) != 0 {
 		t.Errorf("empty roundtrip: got %+v", got)
+	}
+}
+
+func TestDataIndexRejectsExcessiveBlockCount(t *testing.T) {
+	var buf bytes.Buffer
+	if err := WriteString(&buf, "none"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := WriteVInt(byteWriterShim{w: &buf}, maxDataIndexBlocks+1); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := ReadDataIndex(&buf)
+	if err == nil {
+		t.Fatal("ReadDataIndex accepted excessive block count")
 	}
 }
