@@ -49,8 +49,8 @@ an internal field, a model judgment, or a weaker proxy.
 The current public contracts support these direct assertions:
 
 - **CURRENT-CONTRACT:** document and revision identity; half-open source ranges;
-  document hierarchy shape; graph node, edge, and path structure; request query,
-  modes, limit, direct document scope, and as-of time; result ordering; evidence
+  document hierarchy shape; graph node, edge, and path structure; request text,
+  modes, top-K, direct document scope, and as-of time; result ordering; evidence
   citations and graph paths; errors, cancellation, and deadlines.
 - **CURRENT-CONTRACT:** `document.SourceRange` is half-open `[Start, End)`.
 - **CURRENT-CONTRACT:** `document.SourcePosition.Offset` is a content offset.
@@ -77,26 +77,33 @@ The fixture deliberately defines stronger semantics:
 
 Each current expectation maps to one public retrieval request. The exceptions
 are the explicitly labelled **FUTURE** public principal and filter capabilities,
-which require proposed adapter behavior today, and the non-evaluable `q14`
-schema probe.
+which require proposed adapter behavior today, and the non-evaluable `q14` and
+`q19` schema probes.
 
 | Fixture field | Public mapping | Status |
 | --- | --- | --- |
-| `query` | `Request.Query` | **CURRENT-CONTRACT** |
-| `request.modes` | Concrete modes map to `Request.Modes`; empty-mode semantics are not prescribed | **CURRENT-CONTRACT** except `q14`, which is **FUTURE** |
-| `request.top_k` | `Request.Limit` | **CURRENT-CONTRACT** |
-| `request.as_of` | `Request.AsOf` | **CURRENT-CONTRACT** |
-| `request.scope.document_ids` | `Request.Scope.DocumentIDs` | **CURRENT-CONTRACT** |
+| `query` | `retrieval.Request.Text` | **CURRENT-CONTRACT** |
+| `request.modes` | Concrete modes map to `retrieval.Request.Modes`; empty-mode semantics are not prescribed | **CURRENT-CONTRACT** except `q14`, which is **FUTURE** |
+| `request.top_k` | `retrieval.Request.TopK` | **CURRENT-CONTRACT** |
+| `request.as_of` | `retrieval.Request.AsOf` | **CURRENT-CONTRACT** |
+| `request.scope.document_ids` | `retrieval.Request.Scope.DocumentIDs` | **CURRENT-CONTRACT** |
 | `request.strategy` | Harness declaration used to select and verify modes | **PROPOSED-V2** |
 | `request.principal` | Authorization context supplied by the adapter | **PROPOSED-V2**, **FUTURE** public API |
 | `request.filters` | Adapter filter controls | **PROPOSED-V2**, **FUTURE** public API |
 | `request.cache_probe` | Evaluator sequencing metadata, not request payload | **PROPOSED-V2** |
+| `request.neighborhood` | No current public request field or neighborhood operation | **FUTURE** |
 
 `q14-public-default-semantics` is **FUTURE** and
 `not_evaluable_current_public_contract`. It activates only when a target
 advertises a versioned default-mode contract and exposes the effective modes
 used for the request. Until then, Explorer and CLI adapters materialize
 concrete modes, and current evaluation does not prescribe empty-mode behavior.
+
+`q19-future-fan-out-10` is also **FUTURE** and
+`not_evaluable_current_public_contract`. The current public retrieval request
+can scope graph node IDs, but it cannot request a bounded one-hop neighborhood.
+The case activates only when a target advertises a versioned bounded graph
+neighborhood contract and exposes the effective modes used.
 
 `q10-unauthorized-error` maps `scope.document_ids:
 ["amber-lag-runbook"]` and `filters.revision_ids: ["r1"]` to exactly one
@@ -162,6 +169,11 @@ testdata/explorer-eval/
 `semantics: "proposed-evaluation-v2"`. The following is the one normative
 schema used by this plan; objects are closed and reject every unlisted field.
 `T[]` is an array, `T?` is optional, and `null` is JSON null.
+
+The delivered fixture contains 4 document revisions, 10 citation-backed
+relationships, 1 hierarchy with 5 nodes, 1 graph snapshot with 18 nodes,
+15 edges, 2 paths, and 19 expectations. Seventeen expectations are currently
+evaluable; `q14` and `q19` are future/not-evaluable contract probes.
 
 ```text
 DocumentRef = {
@@ -243,6 +255,18 @@ CacheProbeDefinition = {
   )[1..]
 }
 
+DeterministicGraphOracle = {
+  oracle_id: unique non-empty string,
+  oracle_type: "directed_fan_out",
+  hub_node_id: existing Node.node_id,
+  direction: "outgoing",
+  edge_ids: existing Edge.edge_id[1..],
+  leaf_node_ids: existing Node.node_id[1..],
+  expected_edge_count: integer >= 1,
+  expected_leaf_count: integer >= 1,
+  deterministic_order: "edge_id_ascending"
+}
+
 Snapshot = {
   record_type: "snapshot",
   snapshot_id: unique non-empty string,
@@ -263,10 +287,12 @@ Snapshot = {
       "request.modes",
       "request.principal",
       "request.filters",
-      "request.scope"
+      "request.scope",
+      "request.neighborhood"
     ]
   },
-  cache_probes: CacheProbeDefinition[1..]
+  cache_probes: CacheProbeDefinition[1..],
+  deterministic_oracles: DeterministicGraphOracle[1..]
 }
 
 Node = {
@@ -421,9 +447,10 @@ Expectation = {
       probe_id: existing Snapshot.cache_probes.probe_id,
       sequence_position: 1 | 2,
       paired_case_id: existing case_id
-    }
+    },
+    neighborhood?: NeighborhoodRequest
   },
-  expected: CurrentExpected | FutureDefaultExpected
+  expected: CurrentExpected | FutureExpected
 }
 
 CurrentExpected = {
@@ -440,7 +467,7 @@ CurrentExpected = {
   error_exact: ErrorOracle | null
 }
 
-FutureDefaultExpected = {
+FutureExpected = {
   execution_state: null,
   authorization_oracle: null,
   documents_exact: [],
@@ -459,10 +486,19 @@ FutureDefaultExpected = {
     ranking_gate: false,
     activation: {
       requires_target_advertisement:
-        "versioned_default_mode_contract",
+        "versioned_default_mode_contract" |
+        "versioned_bounded_graph_neighborhood_contract",
       requires_observable_effective_modes: true
-    }
+    },
+    snapshot_oracle_id?: existing DeterministicGraphOracle.oracle_id
   }
+}
+
+NeighborhoodRequest = {
+  root_node_id: existing Node.node_id,
+  direction: "outgoing",
+  max_depth: 1,
+  max_fan_out: integer >= 1
 }
 ```
 
@@ -482,12 +518,23 @@ references, or any strategy/mode combination not listed below:
 | `public-default-semantics` | `[]` |
 
 Every case has `top_k > 0`. `q14-public-default-semantics` is the sole permitted
-empty-modes case. It uses `FutureDefaultExpected`, is **FUTURE**, and is not
+empty-modes case. It uses `FutureExpected`, is **FUTURE**, and is not
 evaluable under the current public contract. Its null current oracles mean
 "not evaluated," not another execution or authorization state. It has no
 current result, relevance, ranking, hard-gate, or release-decision assertion.
 Activation requires target advertisement of a versioned default-mode contract
 and observable effective modes.
+
+`q19-future-fan-out-10` also uses `FutureExpected`. Its
+`snapshot_oracle_id: "oracle:graph-fan-out-10"` references a deterministic
+fixture oracle with exactly 10 outgoing edges from `node:fanout-hub`, exactly
+10 paired leaf nodes, and ascending edge-ID order. Fixture structure and oracle
+determinism are currently evaluable. Target neighborhood results, relevance,
+ranking, latency, and release behavior are not: the current public contract has
+no bounded-neighborhood operation. Those checks activate only with the
+versioned bounded-graph-neighborhood contract and observable effective modes.
+Its declared request is `top_k: 10` with root `node:fanout-hub`, direction
+`outgoing`, `max_depth: 1`, and `max_fan_out: 10`.
 
 `q05-section-hierarchy` is the required genuine tree-only case. It evaluates a
 section heading and document ancestor from `hierarchy.jsonl`, has no graph
@@ -514,9 +561,18 @@ including:
 - graph and relationship temporal or path discontinuity;
 - result/evidence/ranking inconsistency;
 - effective revision selection outside `[valid_from, valid_to_exclusive)`;
+- an invalid one-second fixture tick or wrong `q17`, `q03`, or `q18` revision;
 - an authorization-filtered case labelled partial;
 - positive results when `task_answerable` is false;
 - visible evidence requiring scopes absent from the principal;
+- `q13` or `q15` omitting a restricted node, edge, or path from the complete
+  authorized-query closure;
+- a fan-out oracle with a count other than 10, a discontinuous edge/leaf pair,
+  an additional outgoing hub edge, or nondeterministic edge order;
+- `q19` referencing an oracle other than `oracle:graph-fan-out-10` or lacking
+  its future bounded-neighborhood activation contract;
+- `q14` or `q19` containing a current result, relevance, ranking, execution,
+  authorization, or target release-gate oracle;
 - either cache ordering absent or mispaired; or
 - evaluator-only data made mandatory in candidate output.
 
@@ -607,9 +663,9 @@ The run manifest MUST enumerate these independent dimensions:
 
 Pairwise coverage MUST include every pair among supported values. A
 machine-generated pairwise coverage report MUST list covered and missing pairs.
-No unsupported pair may be silently counted as covered.
-`q14` is excluded from current pairwise coverage until its activation contract
-is satisfied.
+No unsupported pair may be silently counted as covered. `q14` and `q19` are
+excluded from current target pairwise coverage until their activation contracts
+are satisfied.
 
 ### 5.2 Mandatory higher-order cells
 
@@ -626,13 +682,16 @@ Pairwise coverage does not replace these explicit cases:
 - multi-document evidence x deduplication x tied ranking; and
 - high fan-out x as-of filter x authorization filter.
 
+The last cell is **FUTURE** until the bounded-neighborhood contract required by
+`q19` activates; its deterministic fan-out-10 fixture oracle is validated now.
+
 ## 6. Metric definitions
 
 All metrics are computed per case and macro-averaged by case unless a weighted
 average is explicitly named. Reports MUST include raw counts and per-mode,
-per-format, per-transport, per-storage, and per-authorization slices.
-`q14` is excluded from every current metric population, denominator, relevance
-metric, and per-mode slice.
+per-format, per-transport, per-storage, and per-authorization slices. `q14` and
+`q19` are excluded from every current target metric population, denominator,
+relevance metric, and per-mode slice.
 
 Unless a metric below defines a stronger empty-set rule, a zero denominator is
 reported as `not_applicable` and excluded from macro-averages; it is never
@@ -787,6 +846,13 @@ Temporal leakage rate =
 Tests include one tick before, exactly at, and one tick after every boundary,
 open-ended intervals, all-revision mode, and revision-specific direct scope.
 
+The delivered fixture defines one tick as exactly one second and covers the
+protocol boundary `2026-03-15T00:00:00Z` explicitly:
+
+- `q17-one-tick-before-boundary` uses `2026-03-14T23:59:59Z` and selects `r1`;
+- `q03-revision-boundary` uses exactly `2026-03-15T00:00:00Z` and selects `r2`;
+- `q18-one-tick-after-boundary` uses `2026-03-15T00:00:01Z` and selects `r2`.
+
 ### 6.9 Authorization isolation
 
 Execution completeness and visibility are separate:
@@ -834,6 +900,18 @@ The required cache probes are:
 
 The second run in each pair MUST share the candidate cache with the first.
 Each case also runs against an isolated cache as its control.
+
+For both unauthorized cases, `q13` and `q15`, the complete forbidden-record
+closure is:
+
+- `node:umber-vault` and `edge:umber-links-opal`;
+- hidden intermediate `node:opal-bridge`;
+- `edge:jade-routes-opal` and `edge:opal-routes-silver`; and
+- `path:jade-via-opal-to-silver`.
+
+The leak oracle covers every restricted node and edge referenced by the
+authorized path, not only the three records carrying canary tokens or returned
+as top-level authorized results.
 
 **FUTURE required T0 expansion:** add independent canaries for document,
 revision, section, span, source, explanation, and error-body channels.
@@ -903,10 +981,10 @@ override failed retrieval, citation, temporal, path, or authorization gates.
 
 ## 7. Release gates
 
-`q14` contributes no current target hard-gate, relevance, ranking, regression,
-or release-decision outcome. Closed-schema validation of its
-`FutureDefaultExpected` record is fixture-integrity validation only, not a
-target behavior gate.
+`q14` and `q19` contribute no current target hard-gate, relevance, ranking,
+regression, performance, or release-decision outcome. Closed-schema and
+deterministic-oracle validation of their `FutureExpected` records is
+fixture-integrity validation only, not a target behavior gate.
 
 ### 7.1 T0 deterministic correctness and security gates
 
@@ -942,7 +1020,7 @@ notes MUST disclose the remaining channel gap.
 ### 7.2 Relevance and usefulness gates
 
 Apply to the blind release set, with per-mode results. The future `q14`
-default-mode probe is excluded:
+default-mode and `q19` bounded-neighborhood probes are excluded:
 
 | Metric | Overall gate | Per-mode floor |
 | --- | ---: | ---: |
@@ -1048,7 +1126,7 @@ same schema invariants, and include sampled exact gold.
 
 | Tier | Documents | UTF-8 corpus | Revisions | Graph nodes/edges | Max tested fan-out | Purpose |
 | --- | ---: | ---: | ---: | ---: | ---: | --- |
-| T0 fixture | 3 (4 revision files) | < 1 MiB | 4 | < 100 | 10 | Per-change correctness |
+| T0 fixture | 3 (4 revision files) | < 1 MiB | 4 | 18 / 15 | 10 (fixture oracle; target q19 FUTURE) | Per-change correctness |
 | T1 small | 10,000 | 1 GiB | 20,000 | 100,000 / 500,000 | 100 | Pull request/nightly |
 | T2 medium | 100,000 | 10 GiB | 250,000 | 1,000,000 / 5,000,000 | 1,000 | Release |
 | T3 large | 1,000,000 | 100 GiB | 2,500,000 | 10,000,000 / 50,000,000 | Declared maximum | Qualification/report-only until supported |
@@ -1067,9 +1145,16 @@ or duplicate logical revisions. These absolute targets are provisional until a
 reference machine manifest is checked in; the 10% release-to-release regression
 gate applies regardless.
 
-At each tier, graph tests MUST separately measure fan-outs 1, 10, 100, and the
-tier maximum. Query latency and records examined MUST be reported by fan-out;
-averaging low and high fan-out cases is prohibited.
+At T1 through T3, graph tests MUST separately measure fan-outs 1, 10, 100, and
+the tier maximum, deduplicating repeated values. Query latency and records
+examined MUST be reported by fan-out; averaging low and high fan-out cases is
+prohibited.
+
+At T0, the value 10 is grounded by `oracle:graph-fan-out-10`: the validator
+checks the hub, 10 paired outgoing edges and leaves, absence of any other
+outgoing hub edge, and deterministic edge-ID order. It is not a current target
+performance or release gate because `q19` cannot be executed through the
+current public request contract.
 
 ## 11. Explainability output
 
@@ -1094,14 +1179,15 @@ intermediates, prompts, credentials, or proprietary internals.
 1. Implement the closed-schema validator and mutation pack; accept every
    delivered record and reject every unlisted or mistyped field.
 2. Implement corpus hash, UTF-8 byte-slice, section ownership, hierarchy,
-   relationship, graph, ranking, and temporal validators.
+   relationship, graph, deterministic fan-out-10 oracle, ranking, and temporal
+   validators.
 3. Implement the one-request adapter, including `q10` direct document scope,
    current all-or-error mapping, and explicit unsupported handling.
 4. Implement stable result/evidence normalization, multi-document evidence
    membership, deduplication, tie-group comparison, and nDCG zero-IDCG behavior.
 5. Run lexical, vector, tree, graph, and declared hybrid independently.
-   Preserve `q14` only as the non-evaluable future schema probe; Explorer and
-   CLI materialize concrete modes until its activation contract is available.
+   Preserve `q14` and `q19` only as non-evaluable future schema probes until
+   their activation contracts are available.
 6. Implement candidate/reference parser lineage recording and the versioned
    format/parser support relation.
 7. Implement authorization isolation with `q09`, `q10`, `q12`-`q13`, and
@@ -1157,7 +1243,7 @@ A release report MUST include:
 The release passes only when every applicable hard gate passes, every supported
 matrix pair is covered, relevance and performance gates pass, and no result is
 silently omitted. `not_evaluable` is an explicit disclosed state, never a pass.
-The `q14` future status is disclosed but does not participate in the release
-decision.
+The `q14` and `q19` future statuses are disclosed but do not participate in the
+release decision.
 Any authorization leak, wrong as-of revision, invalid evidence path, strict
 schema failure, or deterministic parity mismatch is an unconditional failure.
