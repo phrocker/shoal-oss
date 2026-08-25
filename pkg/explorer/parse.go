@@ -21,6 +21,7 @@ package explorer
 
 import (
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"sort"
@@ -467,10 +468,15 @@ func inferredTitle(uri string, lines []sourceLine, mediaType string) string {
 
 func stableID(kind string, parts ...string) string {
 	hash := sha256.New()
-	_, _ = hash.Write([]byte(kind))
+	var length [8]byte
+	writeComponent := func(value string) {
+		binary.BigEndian.PutUint64(length[:], uint64(len(value)))
+		_, _ = hash.Write(length[:])
+		_, _ = hash.Write([]byte(value))
+	}
+	writeComponent(kind)
 	for _, part := range parts {
-		_, _ = hash.Write([]byte{0})
-		_, _ = hash.Write([]byte(part))
+		writeComponent(part)
 	}
 	return kind + "_" + hex.EncodeToString(hash.Sum(nil)[:16])
 }
@@ -508,8 +514,15 @@ func canonicalMetadata(metadata shoal.Metadata) string {
 	}
 	sort.Strings(keys)
 	var canonical strings.Builder
+	var length [8]byte
 	for _, key := range keys {
-		fmt.Fprintf(&canonical, "%d:%s%d:%s", len(key), key, len(metadata[key]), metadata[key])
+		binary.BigEndian.PutUint64(length[:], uint64(len(key)))
+		_, _ = canonical.Write(length[:])
+		canonical.WriteString(key)
+		value := metadata[key]
+		binary.BigEndian.PutUint64(length[:], uint64(len(value)))
+		_, _ = canonical.Write(length[:])
+		canonical.WriteString(value)
 	}
 	return canonical.String()
 }

@@ -143,12 +143,12 @@ func (e *Explorer) Retrieve(
 		}
 		return ranked[i].span.Range.Start.Offset < ranked[j].span.Range.Start.Offset
 	})
-	topK := int(request.TopK)
+	topK := request.TopK
 	if topK == 0 {
 		topK = 10
 	}
-	if len(ranked) > topK {
-		ranked = ranked[:topK]
+	if uint64(topK) < uint64(len(ranked)) {
+		ranked = ranked[:int(topK)]
 	}
 
 	response := retrieval.Response{

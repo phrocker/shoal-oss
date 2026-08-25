@@ -211,6 +211,59 @@ func TestVectorModeFailsExplicitly(t *testing.T) {
 	}
 }
 
+func TestRevisionIdentityPreservesComponentBoundaries(t *testing.T) {
+	ctx := context.Background()
+	corpus, err := explorer.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer corpus.Close()
+
+	first, err := corpus.Ingest(ctx, explorer.Source{
+		URI: "file:///collision.txt", Title: "a\x00b",
+		MediaType: explorer.MediaTypeText, Content: "c",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := corpus.Ingest(ctx, explorer.Source{
+		URI: "file:///collision.txt", Title: "a",
+		MediaType: explorer.MediaTypeText, Content: "b\x00c",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Revision.ID == second.Revision.ID {
+		t.Fatalf("distinct component sequences produced revision %q", first.Revision.ID)
+	}
+	if second.Disposition != explorer.IngestApplied {
+		t.Fatalf("second disposition = %q", second.Disposition)
+	}
+}
+
+func TestRetrieveAcceptsMaximumTopK(t *testing.T) {
+	corpus, err := explorer.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer corpus.Close()
+	if _, err := corpus.Ingest(context.Background(), explorer.Source{
+		URI: "file:///topk.txt", MediaType: explorer.MediaTypeText,
+		Content: "maximum result limit",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	response, err := corpus.Retrieve(context.Background(), retrieval.Request{
+		Text: "maximum", TopK: ^uint32(0),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(response.Results) != 1 {
+		t.Fatalf("results = %+v", response.Results)
+	}
+}
+
 func TestMarkdownHeadingsPreserveHashesAndIgnoreFences(t *testing.T) {
 	ctx := context.Background()
 	corpus, err := explorer.Open(t.TempDir())
