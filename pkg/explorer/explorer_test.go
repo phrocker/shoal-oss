@@ -23,6 +23,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/graph"
@@ -261,6 +262,59 @@ func TestRetrieveAcceptsMaximumTopK(t *testing.T) {
 	}
 	if len(response.Results) != 1 {
 		t.Fatalf("results = %+v", response.Results)
+	}
+}
+
+func TestRequestIdentityPreservesScopeBoundariesAndAllFields(t *testing.T) {
+	corpus, err := explorer.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer corpus.Close()
+	ctx := context.Background()
+	base := retrieval.Request{
+		Text:  "query",
+		TopK:  1,
+		Modes: []retrieval.Mode{retrieval.ModeLexical},
+		Scope: retrieval.Scope{
+			DocumentIDs: []shoal.ID{"a b", "c"},
+			NodeIDs:     []shoal.ID{"node"},
+		},
+		AsOf: time.Date(2026, 8, 25, 15, 0, 0, 0, time.UTC),
+	}
+	baseResponse, err := corpus.Retrieve(ctx, base)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	scopeCollision := base
+	scopeCollision.Scope.DocumentIDs = []shoal.ID{"a", "b c"}
+	explainChange := base
+	explainChange.Explain = true
+	topKChange := base
+	topKChange.TopK = 2
+	modeChange := base
+	modeChange.Modes = []retrieval.Mode{retrieval.ModeTree}
+	nodeChange := base
+	nodeChange.Scope.NodeIDs = []shoal.ID{"other"}
+	asOfChange := base
+	asOfChange.AsOf = base.AsOf.Add(time.Nanosecond)
+
+	for name, request := range map[string]retrieval.Request{
+		"scope boundaries": scopeCollision,
+		"explain":          explainChange,
+		"top k":            topKChange,
+		"modes":            modeChange,
+		"node scope":       nodeChange,
+		"as of":            asOfChange,
+	} {
+		response, err := corpus.Retrieve(ctx, request)
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if response.RequestID == baseResponse.RequestID {
+			t.Errorf("%s did not change request ID %q", name, response.RequestID)
+		}
 	}
 }
 

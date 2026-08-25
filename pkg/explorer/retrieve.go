@@ -21,9 +21,10 @@ package explorer
 
 import (
 	"context"
-	"fmt"
 	"sort"
+	"strconv"
 	"strings"
+	"time"
 	"unicode"
 
 	"github.com/phrocker/shoal-oss/pkg/document"
@@ -152,10 +153,8 @@ func (e *Explorer) Retrieve(
 	}
 
 	response := retrieval.Response{
-		RequestID: shoal.ID(stableID(
-			"request", request.Text, fmt.Sprint(request.TopK),
-			fmt.Sprint(modes), fmt.Sprint(request.Scope), request.AsOf.UTC().String())),
-		Results: make([]retrieval.Result, 0, len(ranked)),
+		RequestID: requestID(request),
+		Results:   make([]retrieval.Result, 0, len(ranked)),
 	}
 	for _, match := range ranked {
 		result := retrieval.Result{
@@ -192,6 +191,34 @@ func (e *Explorer) Retrieve(
 		response.Results = append(response.Results, result)
 	}
 	return response, nil
+}
+
+func requestID(request retrieval.Request) shoal.ID {
+	parts := []string{
+		"text", request.Text,
+		"top_k", strconv.FormatUint(uint64(request.TopK), 10),
+		"modes", strconv.Itoa(len(request.Modes)),
+	}
+	for _, mode := range request.Modes {
+		parts = append(parts, string(mode))
+	}
+	parts = append(parts, "document_ids", strconv.Itoa(len(request.Scope.DocumentIDs)))
+	for _, id := range request.Scope.DocumentIDs {
+		parts = append(parts, string(id))
+	}
+	parts = append(parts, "node_ids", strconv.Itoa(len(request.Scope.NodeIDs)))
+	for _, id := range request.Scope.NodeIDs {
+		parts = append(parts, string(id))
+	}
+	asOf := ""
+	if !request.AsOf.IsZero() {
+		asOf = request.AsOf.UTC().Format(time.RFC3339Nano)
+	}
+	parts = append(parts,
+		"as_of", asOf,
+		"explain", strconv.FormatBool(request.Explain),
+	)
+	return shoal.ID(stableID("request", parts...))
 }
 
 func combinedScore(
