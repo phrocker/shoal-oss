@@ -1,44 +1,92 @@
 # shoal
 
-Shoal is an Accumulo-compatible sorted key-value engine and replacement
-runtime written in Go. It runs as a standalone embedded database, exposes Go,
-C, and Python client APIs, and implements Accumulo-compatible scan,
-tablet-server, and compaction roles. Production replacement remains gated by
-the live conformance verdicts tracked in
-[issue #74](https://github.com/phrocker/shoal-oss/issues/74). RFile and
-Parquet are native storage formats; ShoalQL runs SQL, graph, document,
-exact-vector, and distributed IVF-PQ queries across local and Accumulo-backed
-data.
+**Turn documents and code into navigable, attributable knowledge. Start
+embedded, then scale the same data model and query semantics to Accumulo.**
 
-See [`FEATURES.md`](FEATURES.md) for the complete capability matrix, current
-validation state, and the few remaining platform and infrastructure gates.
+Shoal is a local-to-cluster knowledge plane for applications and agent
+systems. It combines hierarchical documents, typed graph relationships,
+lexical and vector indexes, temporal queries, authorization, and exact source
+citations. The Explorer product layer gives users a simple workflow without
+restricting the platform to one parser, one retrieval strategy, or one model
+provider.
 
-Shoal's north star is a local-to-Accumulo knowledge plane for agent systems;
-see the accepted direction in
-[`docs/platform-product-plan.md`](docs/platform-product-plan.md).
+## What can you build?
+
+- **Document intelligence:** navigate long technical, legal, financial, and
+  operational documents by structure, then retrieve exact cited passages.
+- **Code exploration:** connect files, symbols, revisions, diagnostics, and
+  source ranges without coupling Shoal to one parser.
+- **Cross-document knowledge graphs:** relate evidence across documents and
+  inspect the path behind a result.
+- **Private knowledge for agents:** keep source content and indexes local or
+  inside your own infrastructure; model and workflow execution stay outside
+  Shoal.
+- **Local-to-cluster applications:** prototype against an embedded corpus and
+  retain the graph, document, and retrieval contracts as storage moves toward
+  Accumulo scale.
+
+## Explorer alpha: ingest, explore, retrieve
+
+The alpha accepts UTF-8 Markdown and plain text, persists the corpus in
+Shoal's embedded engine, builds deterministic document and graph structure,
+and returns revision-specific span citations.
+
+```bash
+# 1. Ingest a source into a durable local corpus.
+go run ./cmd/shoal-explore ingest \
+  -data .shoal/explorer -file docs/platform-product-plan.md
+
+# 2. List documents, then inspect one document or graph neighborhood.
+go run ./cmd/shoal-explore list -data .shoal/explorer
+go run ./cmd/shoal-explore outline \
+  -data .shoal/explorer -document <document-id>
+go run ./cmd/shoal-explore neighbors \
+  -data .shoal/explorer -node <section-or-document-id> -depth 2
+
+# 3. Retrieve evidence with exact source ranges and an explanation path.
+go run ./cmd/shoal-explore query \
+  -data .shoal/explorer \
+  -text "what gates local to cluster promotion?"
+```
+
+Explorer currently provides deterministic lexical, tree, and hierarchy-graph
+ranking. Vector mode fails explicitly until a vector strategy is configured;
+it never silently substitutes a different retrieval plan. PDF, source-code,
+embedding, and remote adapters can use the same public contracts while
+remaining separate from the product workflow.
+
+### Trees, graphs, and vectors are complementary
+
+A document tree is an excellent way to preserve a source's authored
+structure, but it is not the whole knowledge model. Shoal keeps tree
+navigation as one retrieval strategy alongside lexical search, vector search,
+typed cross-document graph traversal, temporal state, and authorization.
+Explorer is therefore an opinionated view over general document, graph, and
+retrieval APIs—not a tree-only storage system.
 
 ## Choose a path
 
 | Goal | Start here |
 |---|---|
+| Ingest and explore a cited document corpus | [Explorer alpha](#explorer-alpha-ingest-explore-retrieve) |
+| Build with the public document, graph, and retrieval contracts | [`pkg/document`](pkg/document) · [`pkg/graph`](pkg/graph) · [`pkg/retrieval`](pkg/retrieval) · [`pkg/explorer`](pkg/explorer) |
 | Run a local database with RFile or Parquet | [Embedded engine](#embedded-engine-standalone-no-zookeeper) |
 | Use Sharkbite import-compatible Python APIs | [`python/README.md`](python/README.md) |
-| Embed the Go client or stable C ABI | [`accumulo/`](accumulo/) · [`capi/README.md`](capi/README.md) |
+| Embed the Accumulo client or stable C ABI | [`accumulo/`](accumulo/) · [`capi/README.md`](capi/README.md) |
 | Evaluate Shoal replacement roles with Accumulo | [`FEATURES.md`](FEATURES.md#accumulo-replacement-roles) · [`docs/tserver-hosting-lifecycle.md`](docs/tserver-hosting-lifecycle.md) |
-| Run graph, document, SQL, or vector search | [`FEATURES.md`](FEATURES.md#query-and-indexing) · [`docs/graph-schema.md`](docs/graph-schema.md) · [`docs/shoalql-accumulo.md`](docs/shoalql-accumulo.md) |
 | Validate against an exact Accumulo 4 cluster | [`test/accumulo/README.md`](test/accumulo/README.md) |
 
-Go consumers should use the canonical repository-backed module path:
+See [`FEATURES.md`](FEATURES.md) for the complete capability and validation
+matrix, and [`docs/platform-product-plan.md`](docs/platform-product-plan.md)
+for the accepted local-to-Accumulo product direction. Production replacement
+roles remain gated by the live conformance verdicts tracked in
+[issue #74](https://github.com/phrocker/shoal-oss/issues/74).
 
-```bash
-go get github.com/phrocker/shoal-oss/accumulo
-```
+## Build and platform quick start
 
-## Quick start
-
-Prerequisites for local development are Go 1.25+, Python 3.9+, `make`, and a
-native C toolchain. Docker with Compose v2 is required for the live HDFS
-integration suite and live Accumulo conformance.
+Local development requires Go 1.25+, Python 3.9+, `make`, and a native C
+toolchain. Docker with Compose v2 is required only for the live HDFS and
+Accumulo conformance suites.
 
 ```bash
 git clone https://github.com/phrocker/shoal-oss.git
@@ -47,7 +95,13 @@ make build
 make test
 ```
 
-Run the embedded engine without ZooKeeper or Accumulo:
+Go Accumulo-client consumers can use:
+
+```bash
+go get github.com/phrocker/shoal-oss/accumulo
+```
+
+Run the lower-level embedded engine without ZooKeeper or Accumulo:
 
 ```bash
 go run ./cmd/shoal-embed init --table events --workload analytical \
