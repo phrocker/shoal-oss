@@ -281,6 +281,34 @@ func (d *decoder) readUint64(name string) uint64 {
 	return binary.BigEndian.Uint64(value)
 }
 
+func (d *decoder) readNonNegativeInt64(name string) int64 {
+	value := d.readUint64(name)
+	if d.err != nil {
+		return 0
+	}
+	if value > math.MaxInt64 {
+		d.err = invalid(name + " exceeds the supported signed range")
+		return 0
+	}
+	return int64(value)
+}
+
+func (d *decoder) readNonNegativeInt32(name string) int32 {
+	value := d.readUint32(name)
+	if d.err != nil {
+		return 0
+	}
+	if value > math.MaxInt32 {
+		d.err = invalid(name + " exceeds the supported signed range")
+		return 0
+	}
+	return int32(value)
+}
+
+func (d *decoder) readInt64(name string) int64 {
+	return int64(d.readUint64(name))
+}
+
 func (d *decoder) readBytes(name string, maximum int) []byte {
 	length := uint64(d.readUint32(name + " length"))
 	if d.err != nil {
@@ -475,12 +503,12 @@ func decodeEdge(d *decoder) graph.Edge {
 func decodeRange(d *decoder, name string) document.SourceRange {
 	return document.SourceRange{
 		Start: document.SourcePosition{
-			Offset: int64(d.readUint64(name + " start offset")),
-			Page:   int32(d.readUint32(name + " start page")),
+			Offset: d.readNonNegativeInt64(name + " start offset"),
+			Page:   d.readNonNegativeInt32(name + " start page"),
 		},
 		End: document.SourcePosition{
-			Offset: int64(d.readUint64(name + " end offset")),
-			Page:   int32(d.readUint32(name + " end page")),
+			Offset: d.readNonNegativeInt64(name + " end offset"),
+			Page:   d.readNonNegativeInt32(name + " end page"),
 		},
 	}
 }
@@ -490,7 +518,9 @@ func decodeTime(d *decoder, name string) time.Time {
 	case 0:
 		return time.Time{}
 	case 1:
-		seconds := int64(d.readUint64(name + " seconds"))
+		// Unix seconds are a signed two's-complement field. Negative values
+		// are required for supported timestamps before 1970.
+		seconds := d.readInt64(name + " seconds")
 		nanoseconds := d.readUint32(name + " nanoseconds")
 		if d.err != nil {
 			return time.Time{}

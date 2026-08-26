@@ -29,6 +29,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
+	"math"
 	"time"
 
 	"github.com/phrocker/shoal-oss/pkg/document"
@@ -74,8 +75,9 @@ func (d SHA256) String() string {
 }
 
 // PublicationV1 is optional publication metadata for a canonical envelope.
-// It is deliberately separate from Revision.CreatedAt, which remains source
-// metadata.
+// Sequence is in [1, math.MaxInt64], and PublishedAt is a nonzero supported
+// time. Publication metadata is deliberately separate from
+// Revision.CreatedAt, which remains source metadata.
 type PublicationV1 struct {
 	Sequence    uint64
 	PublishedAt time.Time
@@ -137,6 +139,18 @@ func (r RecordV1) Validate() error {
 		if err := edge.Validate(); err != nil {
 			return err
 		}
+		if _, exists := nodeIDs[edge.From]; !exists {
+			return shoal.NewError(
+				shoal.ErrorInvalidArgument,
+				"graph edge from endpoint is missing from canonical record",
+			)
+		}
+		if _, exists := nodeIDs[edge.To]; !exists {
+			return shoal.NewError(
+				shoal.ErrorInvalidArgument,
+				"graph edge to endpoint is missing from canonical record",
+			)
+		}
 		if _, duplicate := edgeIDs[edge.ID]; duplicate {
 			return shoal.NewError(
 				shoal.ErrorInvalidArgument, "duplicate graph edge ID")
@@ -145,6 +159,17 @@ func (r RecordV1) Validate() error {
 	}
 
 	if r.Publication != nil {
+		if r.Publication.Sequence == 0 ||
+			r.Publication.Sequence > math.MaxInt64 {
+			return shoal.NewError(
+				shoal.ErrorInvalidArgument,
+				"publication sequence must be between 1 and MaxInt64",
+			)
+		}
+		if r.Publication.PublishedAt.IsZero() {
+			return shoal.NewError(
+				shoal.ErrorInvalidArgument, "publication time is required")
+		}
 		if err := validateTime("publication time", r.Publication.PublishedAt); err != nil {
 			return err
 		}

@@ -28,6 +28,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -138,6 +139,47 @@ func TestV1DigestAndSourceSHA256(t *testing.T) {
 	}
 }
 
+func TestV1PublicationBoundariesRoundTrip(t *testing.T) {
+	tests := map[string]PublicationV1{
+		"minimum sequence and pre-epoch time": {
+			Sequence: 1,
+			PublishedAt: time.Date(
+				1, time.January, 2, 0, 0, 0, 1, time.UTC),
+		},
+		"maximum sequence and year": {
+			Sequence: math.MaxInt64,
+			PublishedAt: time.Date(
+				9999, time.December, 31, 23, 59, 59, 999_999_999, time.UTC),
+		},
+	}
+	for name, publication := range tests {
+		t.Run(name, func(t *testing.T) {
+			record := fixtureRecord(false)
+			record.Publication = &publication
+			encoded, err := MarshalV1(record)
+			if err != nil {
+				t.Fatal(err)
+			}
+			decoded, err := UnmarshalV1(encoded)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if decoded.Publication == nil ||
+				decoded.Publication.Sequence != publication.Sequence ||
+				!decoded.Publication.PublishedAt.Equal(publication.PublishedAt) {
+				t.Fatalf(
+					"publication = %#v, want %#v",
+					decoded.Publication,
+					publication,
+				)
+			}
+			if !decoded.Revision.CreatedAt.Equal(record.Revision.CreatedAt) {
+				t.Fatal("publication metadata changed Revision.CreatedAt")
+			}
+		})
+	}
+}
+
 func TestV1PreservesOrderedSlicesAndEmptyPublication(t *testing.T) {
 	record := fixtureRecord(false)
 	record.Publication = nil
@@ -177,6 +219,19 @@ func TestV1MarshalRejectsInvalidRecords(t *testing.T) {
 		"invalid edge": func(record *RecordV1) {
 			record.Edges[0].Type = " "
 		},
+		"zero publication sequence": func(record *RecordV1) {
+			record.Publication.Sequence = 0
+		},
+		"publication sequence above MaxInt64": func(record *RecordV1) {
+			record.Publication.Sequence = uint64(math.MaxInt64) + 1
+		},
+		"missing publication time": func(record *RecordV1) {
+			record.Publication.PublishedAt = time.Time{}
+		},
+		"publication time before supported year": func(record *RecordV1) {
+			record.Publication.PublishedAt = time.Date(
+				0, time.December, 31, 0, 0, 0, 0, time.UTC)
+		},
 		"invalid publication time": func(record *RecordV1) {
 			record.Publication.PublishedAt = time.Date(
 				10_000, time.January, 1, 0, 0, 0, 0, time.UTC)
@@ -188,6 +243,84 @@ func TestV1MarshalRejectsInvalidRecords(t *testing.T) {
 			mutate(&record)
 			_, err := MarshalV1(record)
 			assertInvalidArgument(t, err)
+		})
+	}
+}
+
+func TestV1GraphEndpoints(t *testing.T) {
+	tests := map[string]func(*RecordV1){
+		"missing from": func(record *RecordV1) {
+			record.Edges[0].From = shoal.ID("missing-from")
+		},
+		"missing to": func(record *RecordV1) {
+			record.Edges[0].To = shoal.ID("missing-to")
+		},
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			record := fixtureRecord(false)
+			mutate(&record)
+			_, err := MarshalV1(record)
+			assertInvalidArgument(t, err)
+		})
+	}
+
+	record := fixtureRecord(false)
+	record.Edges = []graph.Edge{
+		{
+			ID:     shoal.ID("self-edge"),
+			From:   record.Nodes[0].ID,
+			To:     record.Nodes[0].ID,
+			Type:   "self",
+			Weight: 1,
+		},
+		{
+			ID:     shoal.ID("parallel-edge-1"),
+			From:   record.Nodes[0].ID,
+			To:     record.Nodes[1].ID,
+			Type:   "parallel",
+			Weight: 2,
+		},
+		{
+			ID:     shoal.ID("parallel-edge-2"),
+			From:   record.Nodes[0].ID,
+			To:     record.Nodes[1].ID,
+			Type:   "parallel",
+			Weight: 3,
+		},
+	}
+	encoded, err := MarshalV1(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := UnmarshalV1(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(decoded.Edges, record.Edges) {
+		t.Fatalf("edges = %#v, want %#v", decoded.Edges, record.Edges)
+	}
+}
+
+func TestV1RangeIntegerOverflowRejectedBeforeConversion(t *testing.T) {
+	tests := map[string]func(*RecordV1){
+		"offset": func(record *RecordV1) {
+			record.Sections[0].Range.Start.Offset = -1
+		},
+		"page": func(record *RecordV1) {
+			record.Sections[0].Range.Start.Page = -1
+		},
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			record := fixtureRecord(false)
+			mutate(&record)
+			encoded := marshalUncheckedV1(t, record)
+			_, err := UnmarshalV1(encoded)
+			assertInvalidArgument(t, err)
+			if !strings.Contains(err.Error(), "exceeds the supported signed range") {
+				t.Fatalf("error = %v, want signed range rejection", err)
+			}
 		})
 	}
 }
@@ -267,6 +400,37 @@ func TestV1UnmarshalRejectsCorruption(t *testing.T) {
 			corrupt[envelopeHeaderBytes] = 2
 			rewriteChecksum(corrupt)
 			return corrupt
+		},
+		"zero publication sequence": func(t *testing.T) []byte {
+			record := fixtureRecord(false)
+			record.Publication.Sequence = 0
+			return marshalUncheckedV1(t, record)
+		},
+		"publication sequence above MaxInt64": func(t *testing.T) []byte {
+			record := fixtureRecord(false)
+			record.Publication.Sequence = uint64(math.MaxInt64) + 1
+			return marshalUncheckedV1(t, record)
+		},
+		"missing publication time": func(t *testing.T) []byte {
+			record := fixtureRecord(false)
+			record.Publication.PublishedAt = time.Time{}
+			return marshalUncheckedV1(t, record)
+		},
+		"unsupported publication year": func(t *testing.T) []byte {
+			record := fixtureRecord(false)
+			record.Publication.PublishedAt = time.Date(
+				10_000, time.January, 1, 0, 0, 0, 0, time.UTC)
+			return marshalUncheckedV1(t, record)
+		},
+		"dangling from endpoint": func(t *testing.T) []byte {
+			record := fixtureRecord(false)
+			record.Edges[0].From = shoal.ID("missing-from")
+			return marshalUncheckedV1(t, record)
+		},
+		"dangling to endpoint": func(t *testing.T) []byte {
+			record := fixtureRecord(false)
+			record.Edges[0].To = shoal.ID("missing-to")
+			return marshalUncheckedV1(t, record)
 		},
 		"oversized source before allocation": func(*testing.T) []byte {
 			payload := []byte{0, 0x20, 0x00, 0x00, 0x01}
@@ -474,6 +638,27 @@ func replacePayloadBytes(
 func rewriteChecksum(encoded []byte) {
 	sum := sha256.Sum256(encoded[:len(encoded)-envelopeChecksumSize])
 	copy(encoded[len(encoded)-envelopeChecksumSize:], sum[:])
+}
+
+func marshalUncheckedV1(t *testing.T, record RecordV1) []byte {
+	t.Helper()
+	encoder := newEncoder()
+	encodeRecordV1(encoder, record)
+	if encoder.err != nil {
+		t.Fatal(encoder.err)
+	}
+	payloadLength := len(encoder.data) - envelopeHeaderBytes
+	copy(encoder.data, canonicalMagic)
+	binary.BigEndian.PutUint16(
+		encoder.data[len(canonicalMagic):], VersionV1)
+	binary.BigEndian.PutUint16(
+		encoder.data[len(canonicalMagic)+2:], uint16(KindRecord))
+	binary.BigEndian.PutUint64(
+		encoder.data[envelopeHeaderBytes-8:], uint64(payloadLength))
+	encoder.data = append(
+		encoder.data, make([]byte, envelopeChecksumSize)...)
+	rewriteChecksum(encoder.data)
+	return encoder.data
 }
 
 func wrapPayload(payload []byte) []byte {
