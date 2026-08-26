@@ -138,6 +138,21 @@ func parseSource(source Source, createdAt time.Time) (parsedSource, error) {
 		Metadata:      cloneMetadata(source.Metadata),
 	}
 	nodes, edges := materializeGraph(doc, sections, spans)
+	if err := document.ValidateRevisionContent(
+		source.Content, doc, revision, sections, spans,
+	); err != nil {
+		return parsedSource{}, err
+	}
+	for _, node := range nodes {
+		if err := node.Validate(); err != nil {
+			return parsedSource{}, err
+		}
+	}
+	for _, edge := range edges {
+		if err := edge.Validate(); err != nil {
+			return parsedSource{}, err
+		}
+	}
 	return parsedSource{
 		document: doc,
 		revision: revision,
@@ -493,7 +508,7 @@ func validateMetadata(metadata shoal.Metadata) error {
 				shoal.ErrorInvalidArgument, "source metadata must be valid UTF-8")
 		}
 	}
-	return nil
+	return shoal.ValidateMetadata("source metadata", metadata)
 }
 
 func cloneMetadata(metadata shoal.Metadata) shoal.Metadata {

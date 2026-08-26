@@ -31,7 +31,12 @@ import (
 )
 
 func requestToProto(request retrieval.Request) (*knowledgepb.RetrieveRequest, error) {
-	if err := request.Validate(); err != nil {
+	normalized, err := request.Normalize()
+	if err != nil {
+		return nil, err
+	}
+	request = normalized
+	if err := validateRequestWire(request); err != nil {
 		return nil, err
 	}
 
@@ -113,14 +118,16 @@ func requestFromProto(request *knowledgepb.RetrieveRequest) (retrieval.Request, 
 			NodeIDs:     stringsToIDs(scope.GetNodeIds()),
 		}
 	}
-	if err := publicRequest.Validate(); err != nil {
+	if err := validateRequestWire(publicRequest); err != nil {
 		return retrieval.Request{}, err
 	}
-	return publicRequest, nil
+	return publicRequest.Normalize()
 }
 
-func responseToProto(response retrieval.Response) (*knowledgepb.RetrieveResponse, error) {
-	if err := validateResponse(response); err != nil {
+func responseToProto(
+	request retrieval.Request, response retrieval.Response,
+) (*knowledgepb.RetrieveResponse, error) {
+	if err := validateResponse(request, response); err != nil {
 		return nil, err
 	}
 	var results []*knowledgepb.RetrievalResult
@@ -140,7 +147,9 @@ func responseToProto(response retrieval.Response) (*knowledgepb.RetrieveResponse
 	}, nil
 }
 
-func responseFromProto(response *knowledgepb.RetrieveResponse) (retrieval.Response, error) {
+func responseFromProto(
+	request retrieval.Request, response *knowledgepb.RetrieveResponse,
+) (retrieval.Response, error) {
 	if err := validateProtoResponse(response); err != nil {
 		return retrieval.Response{}, err
 	}
@@ -155,10 +164,14 @@ func responseFromProto(response *knowledgepb.RetrieveResponse) (retrieval.Respon
 			results[i] = publicResult
 		}
 	}
-	return retrieval.Response{
+	publicResponse := retrieval.Response{
 		RequestID: shoal.ID(response.GetRequestId()),
 		Results:   results,
-	}, nil
+	}
+	if err := validateResponse(request, publicResponse); err != nil {
+		return retrieval.Response{}, err
+	}
+	return publicResponse, nil
 }
 
 func resultToProto(result retrieval.Result) (*knowledgepb.RetrievalResult, error) {
@@ -212,8 +225,19 @@ func resultFromProto(result *knowledgepb.RetrievalResult) (retrieval.Result, err
 
 	var explanation *retrieval.Explanation
 	if protoExplanation := result.GetExplanation(); protoExplanation != nil {
+		var modes []retrieval.Mode
+		if len(protoExplanation.GetModes()) > 0 {
+			modes = make([]retrieval.Mode, len(protoExplanation.GetModes()))
+			for i, mode := range protoExplanation.GetModes() {
+				publicMode, err := modeFromProto(mode)
+				if err != nil {
+					return retrieval.Result{}, err
+				}
+				modes[i] = publicMode
+			}
+		}
 		explanation = &retrieval.Explanation{
-			Modes:   responseModesFromProto(protoExplanation.GetModes()),
+			Modes:   modes,
 			Summary: protoExplanation.GetSummary(),
 			Scores:  float64ToScores(protoExplanation.GetScores()),
 		}
@@ -394,17 +418,6 @@ func modeFromProto(mode knowledgepb.RetrievalMode) (retrieval.Mode, error) {
 	default:
 		return "", shoal.NewError(shoal.ErrorInvalidArgument, "unknown retrieval mode")
 	}
-}
-
-func responseModesFromProto(modes []knowledgepb.RetrievalMode) []retrieval.Mode {
-	var known []retrieval.Mode
-	for _, mode := range modes {
-		publicMode, err := modeFromProto(mode)
-		if err == nil {
-			known = append(known, publicMode)
-		}
-	}
-	return known
 }
 
 func idsToStrings(ids []shoal.ID) []string {

@@ -183,7 +183,8 @@ func (e *Explorer) Documents(ctx context.Context) ([]DocumentSummary, error) {
 	}
 	sort.Slice(summaries, func(i, j int) bool {
 		if summaries[i].Document.Title == summaries[j].Document.Title {
-			return summaries[i].Document.ID < summaries[j].Document.ID
+			return shoal.CompareID(
+				summaries[i].Document.ID, summaries[j].Document.ID) < 0
 		}
 		return summaries[i].Document.Title < summaries[j].Document.Title
 	})
@@ -198,9 +199,11 @@ func (e *Explorer) Document(
 	if err := contextError(ctx); err != nil {
 		return DocumentView{}, err
 	}
-	if documentID == "" {
-		return DocumentView{}, shoal.NewError(
-			shoal.ErrorInvalidArgument, "document ID is required")
+	if err := shoal.ValidateRequiredID("document ID", documentID); err != nil {
+		return DocumentView{}, err
+	}
+	if err := shoal.ValidateOptionalID("revision ID", revisionID); err != nil {
+		return DocumentView{}, err
 	}
 	e.mu.RLock()
 	defer e.mu.RUnlock()
@@ -235,7 +238,7 @@ func (e *Explorer) Connect(ctx context.Context, edge graph.Edge) error {
 	if err := contextError(ctx); err != nil {
 		return err
 	}
-	if err := validateEdge(edge); err != nil {
+	if err := validatePersistedEdge(edge); err != nil {
 		return err
 	}
 	e.mu.Lock()
@@ -270,23 +273,13 @@ func (e *Explorer) Neighborhood(
 	if err := contextError(ctx); err != nil {
 		return Neighborhood{}, err
 	}
-	if len(request.NodeIDs) == 0 {
-		return Neighborhood{}, shoal.NewError(
-			shoal.ErrorInvalidArgument, "at least one graph node ID is required")
+	normalized, err := request.Normalize()
+	if err != nil {
+		return Neighborhood{}, err
 	}
-	if request.Depth == 0 {
-		request.Depth = 1
-	}
-	if request.Depth > 16 {
-		return Neighborhood{}, shoal.NewError(
-			shoal.ErrorInvalidArgument, "graph depth cannot exceed 16")
-	}
+	request = normalized
 	typeFilter := make(map[string]struct{}, len(request.EdgeTypes))
 	for _, edgeType := range request.EdgeTypes {
-		if !utf8.ValidString(edgeType) || strings.TrimSpace(edgeType) == "" {
-			return Neighborhood{}, shoal.NewError(
-				shoal.ErrorInvalidArgument, "edge types must be non-empty UTF-8")
-		}
 		typeFilter[edgeType] = struct{}{}
 	}
 
@@ -339,8 +332,12 @@ func (e *Explorer) Neighborhood(
 	for _, edge := range selectedEdges {
 		result.Edges = append(result.Edges, cloneEdge(edge))
 	}
-	sort.Slice(result.Nodes, func(i, j int) bool { return result.Nodes[i].ID < result.Nodes[j].ID })
-	sort.Slice(result.Edges, func(i, j int) bool { return result.Edges[i].ID < result.Edges[j].ID })
+	sort.Slice(result.Nodes, func(i, j int) bool {
+		return shoal.CompareID(result.Nodes[i].ID, result.Nodes[j].ID) < 0
+	})
+	sort.Slice(result.Edges, func(i, j int) bool {
+		return shoal.CompareID(result.Edges[i].ID, result.Edges[j].ID) < 0
+	})
 	return result, nil
 }
 
@@ -361,6 +358,13 @@ func (e *Explorer) load() error {
 			continue
 		}
 		row := string(key.Row)
+		if err := validateStrictJSONStringEncoding(scanner.Value()); err != nil {
+			return shoal.WrapError(
+				shoal.ErrorInternal,
+				"stored explorer record has invalid JSON string encoding",
+				err,
+			)
+		}
 		switch {
 		case strings.HasPrefix(row, documentRow):
 			var record persistedDocument
@@ -380,8 +384,9 @@ func (e *Explorer) load() error {
 			if err := json.Unmarshal(scanner.Value(), &record); err != nil {
 				return shoal.WrapError(shoal.ErrorInternal, "decode explorer edge", err)
 			}
-			if err := validateEdge(record.Edge); err != nil {
-				return shoal.WrapError(shoal.ErrorInternal, "stored explorer edge is invalid", err)
+			if err := validateLegacyPersistedEdge(record.Edge); err != nil {
+				return shoal.WrapError(
+					shoal.ErrorInternal, "stored explorer edge is invalid", err)
 			}
 			e.edges[record.Edge.ID] = record.Edge
 		}
@@ -454,7 +459,7 @@ func latestRevision(
 		}
 		if latest == nil || record.Revision.CreatedAt.After(latest.Revision.CreatedAt) ||
 			(record.Revision.CreatedAt.Equal(latest.Revision.CreatedAt) &&
-				record.Revision.ID > latest.Revision.ID) {
+				shoal.CompareID(record.Revision.ID, latest.Revision.ID) > 0) {
 			latest = record
 		}
 	}
@@ -536,27 +541,6 @@ func ingestResult(record *persistedDocument, disposition IngestDisposition) Inge
 	}
 }
 
-func validateEdge(edge graph.Edge) error {
-	if edge.ID == "" || edge.From == "" || edge.To == "" ||
-		strings.TrimSpace(edge.Type) == "" {
-		return shoal.NewError(shoal.ErrorInvalidArgument, "edge is structurally incomplete")
-	}
-	for _, value := range []string{
-		string(edge.ID), string(edge.From), string(edge.To), edge.Type,
-	} {
-		if !utf8.ValidString(value) {
-			return shoal.NewError(shoal.ErrorInvalidArgument, "edge values must be valid UTF-8")
-		}
-	}
-	if math.IsNaN(float64(edge.Weight)) || math.IsInf(float64(edge.Weight), 0) {
-		return shoal.NewError(shoal.ErrorInvalidArgument, "edge weight must be finite")
-	}
-	if err := validateMetadata(edge.Properties); err != nil {
-		return err
-	}
-	return nil
-}
-
 func edgesEqual(left, right graph.Edge) bool {
 	if left.ID != right.ID || left.From != right.From || left.To != right.To ||
 		left.Type != right.Type || left.Weight != right.Weight ||
@@ -569,6 +553,56 @@ func edgesEqual(left, right graph.Edge) bool {
 		}
 	}
 	return true
+}
+
+func validatePersistedEdge(edge graph.Edge) error {
+	if err := edge.Validate(); err != nil {
+		return err
+	}
+	for _, value := range []string{
+		string(edge.ID), string(edge.From), string(edge.To), edge.Type,
+	} {
+		if !utf8.ValidString(value) {
+			return shoal.NewError(
+				shoal.ErrorInvalidArgument,
+				"embedded edge values must be valid UTF-8",
+			)
+		}
+	}
+	for key, value := range edge.Properties {
+		if !utf8.ValidString(key) || !utf8.ValidString(value) {
+			return shoal.NewError(
+				shoal.ErrorInvalidArgument,
+				"embedded edge properties must be valid UTF-8",
+			)
+		}
+	}
+	return nil
+}
+
+func validateLegacyPersistedEdge(edge graph.Edge) error {
+	if edge.ID == "" || edge.From == "" || edge.To == "" ||
+		strings.TrimSpace(edge.Type) == "" {
+		return shoal.NewError(shoal.ErrorInvalidArgument, "edge is structurally incomplete")
+	}
+	for _, value := range []string{
+		string(edge.ID), string(edge.From), string(edge.To), edge.Type,
+	} {
+		if !utf8.ValidString(value) {
+			return shoal.NewError(
+				shoal.ErrorInvalidArgument, "edge values must be valid UTF-8")
+		}
+	}
+	if math.IsNaN(float64(edge.Weight)) || math.IsInf(float64(edge.Weight), 0) {
+		return shoal.NewError(shoal.ErrorInvalidArgument, "edge weight must be finite")
+	}
+	for key, value := range edge.Properties {
+		if !utf8.ValidString(key) || !utf8.ValidString(value) {
+			return shoal.NewError(
+				shoal.ErrorInvalidArgument, "edge properties must be valid UTF-8")
+		}
+	}
+	return nil
 }
 
 func cloneNode(node graph.Node) graph.Node {

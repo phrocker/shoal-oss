@@ -35,6 +35,9 @@ This specification is grounded in the following public Shoal material:
   local-to-remote product direction;
 - `docs/distributed-vector-index.md` for freshness, explicit fallback,
   cancellation, deterministic ranking, and recall-claim behavior;
+- `docs/explorer-public-contract.md` for adopted storage-neutral identity,
+  byte-range, validation, retrieval normalization, ordering, seed, and error
+  semantics;
 - `pkg/document/document.go` for revisions, hierarchy, spans, ranges, and
   citations;
 - `pkg/graph/graph.go` for schema-neutral nodes, directed edges, weights, and
@@ -49,6 +52,9 @@ The following labels are normative:
 - **Current - shipped primitive:** public status documentation describes an
   underlying mechanism as shipped. This does not establish an Explorer
   surface.
+- **Current - embedded implementation:** `pkg/explorer` implements the
+  operation locally. This does not establish a storage-neutral repository,
+  remote parity, or Accumulo conformance.
 - **Alpha - proposed surface:** required for the first Explorer product slice;
   not a claim of current implementation.
 - **Future - proposed:** intentionally beyond Alpha.
@@ -110,12 +116,13 @@ Every advertised capability has exactly one primary state:
 | Document, revision, section, span, range, citation values | Public contract | Current | `pkg/document` |
 | Node, edge, weight, and connected path values | Public contract | Current | `pkg/graph` |
 | Retrieval request/result/evidence/explanation values | Public contract | Current | `pkg/retrieval` |
+| Retrieval normalization, bounds, deterministic order, and seed-shape rules | Public contract | Current | `pkg/retrieval`; `docs/explorer-public-contract.md` |
 | Document predicates, graph traversal, lexical, exact vector, approximate vector | Shipped primitive | Current | `FEATURES.md`; not an Explorer claim |
-| Corpus create/open experience | Proposed surface | Alpha | Requires a coarse corpus service |
+| Embedded corpus create/open and direct ingestion | Embedded implementation | Current | `pkg/explorer`; not a storage-neutral or remote repository contract |
 | Ingestion job and readiness experience | Dependency-blocked | Alpha | No reviewed public ingestion/status contract |
-| Document hierarchy and source workspace | Proposed surface | Alpha | Requires document read/navigation adapters |
-| Graph neighborhood workspace | Proposed surface | Alpha | Requires bounded graph read/expand adapters |
-| Search and strategy comparison over citation-backed evidence | Proposed surface | Alpha | Requires one retriever implementation and capability metadata |
+| Embedded document hierarchy and span navigation | Embedded implementation | Current | `pkg/explorer`; canonical source-byte hydration and remote/storage-neutral conformance remain dependency-blocked |
+| Embedded both-direction graph neighborhood workspace | Embedded implementation | Current | `pkg/explorer`; depth is 1..16 and final values order by ID |
+| Embedded citation-backed retrieval | Embedded implementation | Current | `pkg/explorer`; vector and explicit `AsOf` return `unavailable` |
 | Ask with generated prose over citation-backed evidence | Proposed surface | Alpha | Optional composition outside required Shoal runtime |
 | Explicit partial-result UI | Dependency-blocked | Future | Current response has no completeness envelope |
 | Authorization-aware result semantics | Dependency-blocked | Future | Current retrieval contract has no authorization/restriction envelope |
@@ -244,21 +251,19 @@ prohibited identities. Authorization restriction metadata is orthogonal to
 execution completeness: a response may be complete for the principal while
 containing fewer items than another principal would receive.
 
-### RC-07: empty `Modes` and `TopK == 0` are unresolved
+### RC-07: normalized public defaults
 
-`retrieval.Request.Validate` accepts an empty `Modes` list and `TopK == 0`.
-The reviewed public contract does not say whether those values mean defaults,
-no retrieval, unlimited results, or another behavior.
+`retrieval.Request.Normalize` now defines stable shorthand:
 
-Until the contract resolves the ambiguity:
+- empty `Modes` becomes exactly lexical;
+- `TopK == 0` becomes 20;
+- duplicate modes and scope IDs collapse by first occurrence.
 
-- CLI and API examples require at least one explicit mode and a positive
-  `TopK`.
-- The visual surface may preselect a product default only when the target
-  recommends one through capability metadata; it must display and send the
-  concrete values.
-- Saved requests always persist effective modes and top-K.
-- Explorer must not describe empty modes or zero top-K as stable shorthand.
+The visual surface MAY accept that shorthand but SHOULD display the normalized
+effective mode and limit. Saved requests SHOULD persist normalized values so
+reviews and replays remain explicit. A target still must not claim support for
+vector, `AsOf`, tree, or graph shapes that it cannot execute; unsupported
+requested behavior returns `unavailable` rather than fallback.
 
 ### RC-08: capability negotiation
 
@@ -559,7 +564,8 @@ Human and `--format json` output must preserve:
 - exact citations/ranges and path data;
 - fallback, freshness, and benchmark warnings.
 
-The CLI must not accept empty modes or zero top-K while RC-07 is unresolved.
+The CLI MAY accept empty modes or zero top-K as public shorthand, but its
+human and JSON output must show the normalized lexical mode and top-K 20.
 Credentials should not be supplied through command-history-visible arguments.
 Graph commands are graph-native browsing. Search or Ask in graph mode is
 available only for citation-backed evidence until RC-04 is resolved.
@@ -912,7 +918,7 @@ Alpha is ready only when:
 2. Coarse corpus lifecycle
 3. Ingestion operation and readiness status
 4. Document list/tree/span hydration and graph expansion
-5. Resolved semantics for empty modes and zero top-K
+5. Observable normalized/effective modes and limits across targets
 6. Discriminated evidence anchors for document, graph, and external evidence
 7. Explicit partial-result envelope
 8. Authorization context and restriction metadata

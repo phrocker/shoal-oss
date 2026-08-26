@@ -17,17 +17,32 @@
  * under the License.
  */
 
-// Package shoal defines values shared by Shoal's public knowledge APIs.
-package shoal
+package explorer
 
-// ID is a stable, caller-visible opaque byte string. Shoal does not generate,
-// normalize, or require UTF-8 for IDs at the public value layer.
-type ID string
+import "testing"
 
-// Metadata contains application-defined attributes. Shoal treats keys and
-// values as opaque.
-type Metadata map[string]string
+func TestValidateStrictJSONStringEncoding(t *testing.T) {
+	valid := [][]byte{
+		[]byte(`{"value":"plain"}`),
+		[]byte(`{"value":"🙂"}`),
+		[]byte(`{"value":"\ud83d\ude42"}`),
+	}
+	for _, data := range valid {
+		if err := validateStrictJSONStringEncoding(data); err != nil {
+			t.Fatalf("valid JSON string %q: %v", data, err)
+		}
+	}
 
-// Score is a comparable relevance or relationship score. Higher values are
-// more relevant unless a specific operation documents otherwise.
-type Score float64
+	invalidUTF8 := append([]byte(`{"value":"`), 0xff)
+	invalidUTF8 = append(invalidUTF8, []byte(`"}`)...)
+	invalid := [][]byte{
+		invalidUTF8,
+		[]byte(`{"value":"\ud83d"}`),
+		[]byte(`{"value":"\ude42"}`),
+	}
+	for _, data := range invalid {
+		if err := validateStrictJSONStringEncoding(data); err == nil {
+			t.Fatalf("invalid JSON string %q was accepted", data)
+		}
+	}
+}

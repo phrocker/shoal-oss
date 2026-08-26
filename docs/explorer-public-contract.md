@@ -1,0 +1,208 @@
+# Shoal Explorer public contract
+
+## Status and scope
+
+This document is the concise normative, storage-neutral contract for public
+Shoal document, graph, retrieval, error, and code-ingestion values. The terms
+**MUST**, **MUST NOT**, **SHOULD**, and **MAY** are normative.
+
+`pkg/explorer.Client` currently exposes `Ingest`, `Documents`, `Document`,
+`Connect`, `Neighborhood`, and `Retrieve`. Those operations form a useful
+embedded/product facade, but they are not yet a general document/graph storage
+repository contract. Storage publication, history, deletion, authorization,
+migration, and mutation APIs remain additive work.
+
+## Identity, bytes, and bounds
+
+- `shoal.ID` is an opaque byte string. Implementations MUST retain every byte,
+  including NUL and non-UTF-8 bytes accepted through direct Go values.
+- IDs order lexicographically by unsigned raw bytes. Implementations MUST NOT
+  apply Unicode normalization, case folding, trimming, parsing, regeneration,
+  or a generic ID-generation scheme.
+- A public ID is required where its containing value says so and is at most
+  1,024 bytes.
+- Metadata is opaque application data, not an authorization channel. Per
+  object it is limited to 256 entries, 256 bytes per key, 4 KiB per value, and
+  256 KiB total. Validation MUST NOT rewrite accepted keys or values.
+- Scores and graph weights MUST be finite.
+- Kind, type, title, heading, and source-version strings are at most 4 KiB.
+  Graph nodes MAY have an empty kind. A node has at most 64 nonempty labels,
+  each at most 256 bytes.
+- Transport encodings MAY impose additional representability checks. In
+  particular, protobuf string fields require valid UTF-8; that wire rule does
+  not redefine the direct Go ID contract.
+
+## Documents, revisions, and source ranges
+
+- `(Document.ID, Revision.ID)` identifies one immutable revision.
+  `Document.RevisionID`, `Revision.DocumentID`, and every section/span owner
+  MUST agree.
+- `Revision.CreatedAt` and `Revision.SourceVersion` are source metadata. They
+  are not publication sequence, commit order, a latest-winner rule, or an
+  `AsOf` frontier.
+- Canonical revision source is valid UTF-8. `SourcePosition.Offset` is a
+  zero-based UTF-8 **byte** offset. `SourceRange` is half-open
+  `[Start.Offset, End.Offset)`.
+- Empty ranges are valid, including `[len(source), len(source))`. Both
+  endpoints MUST be in bounds and on UTF-8 rune boundaries.
+- A revision contains exactly one connected, acyclic section tree. Its root
+  is `Document.RootSectionID` and has empty `ParentID`; every other section has
+  one same-revision parent.
+- Child section ranges are contained by their parent. Span ranges are
+  contained by their section. Child sections and direct spans share one
+  sibling `Order` namespace; duplicate orders are invalid.
+- `Span.Text` MUST equal the exact canonical source byte slice named by its
+  range. Spans are not a source reconstruction format.
+- Initial hard maxima are 512 MiB canonical source, 100,000 sections, and
+  1,000,000 spans per revision.
+- These rules apply at new operation boundaries and explicit validation.
+  Implementations MUST NOT reinterpret old persisted alpha records merely
+  because they are passively loaded.
+
+## Citations, quotes, and evidence
+
+- `Citation.Validate` is structural: document/revision identity, at least one
+  section or span anchor, bounded IDs, and a structurally valid range.
+- Contextual resolution additionally requires the exact retained revision,
+  canonical source bytes, and referenced sections/spans. If both section and
+  span are present, the span belongs to the section, and the cited range is
+  contained by every named object.
+- A canonical quote is exactly
+  `source[Start.Offset:End.Offset]`. Submitted quote text, indexes, spans, and
+  the latest revision are not quote authority.
+- Citation validation helpers do not imply that a storage implementation can
+  hydrate retained source. Missing hydration is an unavailable capability,
+  not permission to approximate a quote.
+- `retrieval.Evidence` structurally requires a valid citation, a finite score,
+  and, when present, a valid directed `graph.Path`. Canonical quote equality
+  remains a document-context check.
+
+## Graphs, paths, and neighborhoods
+
+- `graph.Edge` is directed from `From` to `To`. Cycles, self-edges, and
+  parallel edges with distinct IDs are valid.
+- `graph.Path.Edges[i]` MUST run from `Path.Nodes[i].ID` to
+  `Path.Nodes[i+1].ID`. Repeated nodes and directed cycles are valid; reverse
+  or mixed walks are not paths.
+- For `B <- A -> C`, a neighborhood rooted at `B` MAY contain `A`, `C`, and
+  the canonical edges when its requested depth/direction permits. It MUST NOT
+  report `[B,A]` or `[B,A,C]` as a `graph.Path`.
+- Incoming or mixed traversal is therefore neighborhood-only unless every
+  emitted path step is directed from the current path tail. No replacement
+  public walk type is defined.
+- The current embedded `Neighborhood` expands both incoming and outgoing
+  edges, normalizes depth zero to one, rejects depth above 16, and serializes
+  final nodes by raw node ID and edges by raw edge ID. It does not return
+  paths.
+
+## Retrieval requests
+
+### Normalization and limits
+
+`Request.Normalize` returns cloned values and MUST NOT mutate caller-owned
+slices. Normalization is idempotent:
+
+- `TopK == 0` becomes 20; normalized `TopK` is at most 1,000.
+- Empty modes become exactly lexical.
+- Duplicate modes and duplicate scope IDs collapse by first occurrence.
+- Query text is nonblank valid UTF-8 and at most 16 KiB.
+- Combined normalized document/node scope cardinality is at most 10,000.
+  Scope IDs are nonempty and individually obey the public ID bound.
+- Nonzero `AsOf` represents the same instant normalized to UTC.
+
+Equivalent normalized requests have the same request identity where an
+implementation exposes one. Duplicate modes MUST NOT change scores.
+
+### Scope and modes
+
+- IDs are ORed within `DocumentIDs` and within `NodeIDs`.
+- When both lists are nonempty, a candidate satisfies both dimensions only
+  through a canonical document/graph association. Metadata, labels, string
+  equality, or coincident IDs MUST NOT fabricate that association.
+- Requesting vector mode requires vector support. An implementation that does
+  not support it returns `unavailable`; it MUST NOT silently drop vector,
+  substitute lexical retrieval, or claim an approximate result as exact.
+- The fixed seed planner is lexical, then tree, then graph:
+  - standalone tree requires document scope or bounded lexical seeds;
+  - standalone graph requires node scope, implemented document-association
+    seeds, or bounded earlier lexical/tree seeds;
+  - a shape with no bounded seed source returns `unavailable` before corpus
+    scanning. It MUST NOT fall back to a corpus-wide tree or graph seed scan.
+
+### `AsOf`, completeness, and order
+
+- `AsOf` requires a store-defined publication frontier. It MUST NOT be
+  implemented by comparing `Revision.CreatedAt`.
+- A store without publication-frontier semantics returns `unavailable` for an
+  explicit `AsOf`. The current embedded Explorer does so.
+- `Retrieve` is unary and complete-or-error. It has no partial-result envelope
+  or cursor.
+- Results order by score descending, then raw result-ID bytes ascending.
+  Result IDs are nonempty, bounded, and unique, and result count does not
+  exceed normalized `TopK`.
+- Evidence orders by score descending, then
+  `(document, revision, section, span, start offset, end offset)`, then the
+  directed path tuple of node IDs followed by edge IDs.
+- A future shared fusion/duplicate-result merge function MUST preserve these
+  boundaries. No generic fusion score is defined by the current public shape.
+
+## Latest state, mutations, and retries
+
+Current public values contain no generic epoch or tombstone field. Future
+additive storage APIs use this vocabulary:
+
+- latest selection chooses the greatest visible published generation at the
+  requested frontier **including tombstones**, then interprets that winner;
+- create requires expected base `ABSENT`; update/delete name the exact base;
+- generic mutations carry a nonempty idempotency token of at most 128 bytes,
+  scoped by operation/domain; token reuse with different canonical content is
+  `conflict`;
+- a lost response resolves to the committed token outcome and MUST NOT create
+  new identities or duplicate artifacts.
+
+These are requirements on future APIs, not permission to add epoch/tombstone
+fields to existing public values.
+
+`pkg/code` retains its existing typed stable-ID algorithms. `Source.Ref` is
+excluded from `Source.ID` and the ingestion key because multiple refs can
+resolve to one immutable revision. Retrying a committed identical ingestion
+returns `IngestUnchanged` with identical artifact identities. A materializer
+version change cannot reinterpret an existing key; it honors the committed
+outcome or uses a future versioned operation/key contract.
+
+## Stable public error categories
+
+Only the existing categories are used:
+
+| Condition | Code |
+|---|---|
+| Invalid value, static bound, malformed range/tree/path | `invalid_argument` |
+| Absent or hidden individual object; unavailable retained history | `not_found` |
+| Idempotency/precondition/base mismatch | `conflict` |
+| Whole-operation authentication or authorization denial | `unauthorized` |
+| Unsupported requested capability/shape, transient store failure, or runtime budget exhaustion | `unavailable` |
+| Caller cancellation | `canceled` |
+| Deadline elapsed | `deadline_exceeded` |
+| Detectable committed-data corruption or implementation fault | `internal` |
+
+Object-level authorization, when implemented, is indistinguishable from
+absence. Error text MUST NOT expose storage coordinates or hidden identities.
+
+## Store-dependent and deferred behavior
+
+The contract above does not claim current implementation of:
+
+- a storage-neutral document/graph repository, generic mutation API, latest
+  publication frontier, tombstone persistence, history retention, or
+  citation hydration;
+- authorization, canonical association persistence, pagination, migration,
+  or distributed publication/conditional-write coordination;
+- an Accumulo schema or adapter;
+- vector indexing, generic fusion scoring, or a new graph walk/path shape;
+- the code materializer that maps parser-neutral code artifacts into
+  document/graph storage.
+
+Adapters advertise and test only the capabilities they implement. Missing
+store-dependent behavior returns the stable public error appropriate to the
+condition; it is never approximated by reinterpreting source timestamps,
+metadata, graph labels, or another retrieval mode.

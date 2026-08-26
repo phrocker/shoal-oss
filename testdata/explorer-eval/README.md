@@ -14,7 +14,10 @@ The current public retrieval `Response` is all-or-error and does not expose part
 
 An adapter may map a current public error or response into this harness model, but tests must not assert that public runtime responses contain these fields.
 
-UTF-8 byte offsets are a fixture convention, not a current public guarantee. A fixture citation uses a zero-based, half-open byte range: `bytes[byte_start:byte_end]`. The range is valid only when decoding that byte slice as UTF-8 produces `quote` exactly.
+UTF-8 byte offsets now match the public contract. A fixture citation uses a
+zero-based, half-open byte range: `bytes[byte_start:byte_end]`. Both endpoints
+must be UTF-8 boundaries, and decoding that byte slice must produce `quote`
+exactly.
 
 ## Files and immutable document revisions
 
@@ -88,7 +91,12 @@ The valid strategy-to-mode declarations are:
 | `declared-hybrid` | `["lexical","vector"]` |
 | `public-default-semantics` | `[]` |
 
-Exactly one case, `q14-public-default-semantics`, may use `modes: []`. It is a FUTURE schema probe and is `not_evaluable` under the current public contract. It does not claim that a default was discovered from, inferred from, or selected by a backend. Evaluation becomes enabled only when the target advertises a versioned default-mode contract and exposes the effective modes used for that request. Empty modes in every other case are invalid.
+Exactly one case, `q14-public-default-semantics`, may use `modes: []`; the
+public request normatively normalizes it to lexical. The full fixture case
+remains FUTURE because it also requests explicit `AsOf`, requires observable
+effective modes, and has no current result oracle. Empty modes in every other
+fixture strategy remain invalid schema even though the public request value
+would normalize them.
 
 The other strategy labels are harness controls, not a model, storage, scoring, or current public request guarantee.
 
@@ -436,7 +444,11 @@ ErrorOracle = {
 
 For `CurrentExpected`, `results_exact` contains at most `request.top_k` records. Every result appears exactly once in ranking. A ranking tier's `tie_group` equals every member result's `tie_group`; earlier tiers use strictly increasing tie-group numbers.
 
-`q14` uses `FutureExpected`. It has no Finch ownership oracle or any other exact document, citation, relationship, fact, result, relevance, authorization, execution, or ranking assertion. It contributes nothing to current release gates. Once a target advertises a versioned default-mode contract and reports observable effective modes, a future fixture revision may promote it to `CurrentExpected` and add result or ranking oracles.
+`q14` uses `FutureExpected`. Empty modes normatively mean lexical, but the case
+has no Finch ownership oracle or any other exact result/ranking assertion and
+requests explicit `AsOf`. It contributes nothing to current release gates. A
+future fixture revision may promote it only after the target supports its
+publication-frontier `AsOf`, reports effective modes, and gains exact oracles.
 
 `q19-future-fan-out-10` also uses `FutureExpected`. Its public request shape is suitable for a bounded-neighborhood evaluator:
 

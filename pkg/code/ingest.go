@@ -108,10 +108,7 @@ func (r ArtifactRef) Validate() error {
 	default:
 		return shoal.NewError(shoal.ErrorInvalidArgument, "invalid artifact kind")
 	}
-	if !requiredExact(string(r.identifier)) {
-		return shoal.NewError(shoal.ErrorInvalidArgument, "artifact identifier is required")
-	}
-	return nil
+	return shoal.ValidateRequiredID("artifact identifier", r.identifier)
 }
 
 func (r ArtifactRef) Kind() ArtifactKind {
@@ -201,15 +198,56 @@ func (r IngestResult) Artifacts() []ArtifactRef {
 }
 
 // Ingest is implemented by adapters that materialize parser-neutral results.
-// Repeating a request must not create duplicate artifacts; implementations
-// return IngestUnchanged with the same artifact identities after the first
-// successful application.
+// Repeating a committed request must not create duplicate artifacts;
+// implementations return IngestUnchanged with the same artifact identities
+// after the first successful application. A materializer-version change must
+// not reinterpret an existing idempotency key; it must honor the committed
+// outcome or use a future versioned operation/key contract.
 type Ingest interface {
 	Ingest(context.Context, IngestRequest) (IngestResult, error)
 }
 
 // Ingester is the conventional name for an Ingest implementation.
 type Ingester = Ingest
+
+// ValidateCommittedRetry checks the public outcome rule for retrying an
+// already committed ingestion. Ref differences are ignored because Source.ID
+// and the ingestion key identify the immutable source; artifact identities and
+// order must remain exact.
+func ValidateCommittedRetry(committed, retry IngestResult) error {
+	if err := committed.idempotencyKey.Validate(); err != nil {
+		return err
+	}
+	if err := retry.idempotencyKey.Validate(); err != nil {
+		return err
+	}
+	if committed.idempotencyKey != retry.idempotencyKey ||
+		committed.source.ID() != retry.source.ID() {
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument, "ingestion retry does not identify the committed request")
+	}
+	if retry.disposition != IngestUnchanged {
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument, "committed ingestion retry must be unchanged")
+	}
+	if len(committed.artifacts) != len(retry.artifacts) {
+		return shoal.NewError(
+			shoal.ErrorConflict, "ingestion retry changed committed artifacts")
+	}
+	for index, artifact := range committed.artifacts {
+		if err := artifact.Validate(); err != nil {
+			return err
+		}
+		if err := retry.artifacts[index].Validate(); err != nil {
+			return err
+		}
+		if artifact != retry.artifacts[index] {
+			return shoal.NewError(
+				shoal.ErrorConflict, "ingestion retry changed committed artifacts")
+		}
+	}
+	return nil
+}
 
 func expectedIngestionKey(result ParseResult) (ID, error) {
 	source := result.Source()

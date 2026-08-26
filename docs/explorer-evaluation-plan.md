@@ -49,12 +49,15 @@ an internal field, a model judgment, or a weaker proxy.
 The current public contracts support these direct assertions:
 
 - **CURRENT-CONTRACT:** document and revision identity; half-open source ranges;
-  document hierarchy shape; graph node, edge, and path structure; request text,
-  modes, top-K, direct document scope, and as-of time; result ordering; evidence
-  citations and graph paths; errors, cancellation, and deadlines.
-- **CURRENT-CONTRACT:** `document.SourceRange` is half-open `[Start, End)`.
-- **CURRENT-CONTRACT:** `document.SourcePosition.Offset` is a content offset.
-  The public contract does **not** guarantee that it counts UTF-8 bytes.
+  UTF-8 byte boundaries; document hierarchy/ownership validation; graph node,
+  edge, and directed-path structure; request normalization, modes, top-K,
+  document/node scope, and as-of value normalization; deterministic result and
+  evidence ordering; citations and graph paths; stable errors, cancellation,
+  and deadlines.
+- **CURRENT-CONTRACT:** `document.SourceRange` is half-open `[Start, End)` and
+  `document.SourcePosition.Offset` is a zero-based UTF-8 byte offset.
+- **CURRENT-CONTRACT:** empty modes normalize to lexical, `TopK == 0`
+  normalizes to 20, and duplicate modes/scope IDs preserve first occurrence.
 - **CURRENT-CONTRACT:** retrieval is all-or-error. A public `Response` has no
   partial-result status and no authorization-oracle metadata.
 - **CURRENT-CONTRACT:** current gRPC retrieval evidence is citation-shaped.
@@ -62,11 +65,10 @@ The current public contracts support these direct assertions:
   `not_evaluable_future_anchor_contract` through current gRPC until a public
   graph-native anchor exists.
 
-The fixture deliberately defines stronger semantics:
+The fixture deliberately defines additional semantics:
 
-- **PROPOSED-V2:** fixture citation offsets are zero-based, half-open UTF-8 byte
-  ranges. Exact byte tests validate fixture or future-contract semantics, not
-  the current meaning of `SourcePosition.Offset`.
+- **CURRENT-CONTRACT:** fixture zero-based, half-open UTF-8 byte ranges may be
+  checked directly with the public source-aware range and quote helpers.
 - **PROPOSED-V2:** execution state, authorization policy, strategy, filters,
   principal scopes, stable result IDs, relevance grades, and cache-probe
   controls are evaluator fields.
@@ -83,21 +85,22 @@ whose applicability requires capabilities the target has not advertised.
 | Fixture field | Public mapping | Status |
 | --- | --- | --- |
 | `query` | `retrieval.Request.Text` | **CURRENT-CONTRACT** |
-| `request.modes` | Concrete modes map to `retrieval.Request.Modes`; empty-mode semantics are not prescribed | **CURRENT-CONTRACT** except `q14`, which is **FUTURE** |
+| `request.modes` | Concrete modes map to `retrieval.Request.Modes`; empty modes normalize to lexical | **CURRENT-CONTRACT** |
 | `request.top_k` | `retrieval.Request.TopK` | **CURRENT-CONTRACT** |
 | `request.as_of` | `retrieval.Request.AsOf` | **CURRENT-CONTRACT** |
 | `request.scope.document_ids` | `retrieval.Request.Scope.DocumentIDs` | **CURRENT-CONTRACT** |
+| `request.scope.node_ids` | `retrieval.Request.Scope.NodeIDs` | **CURRENT-CONTRACT** |
 | `request.strategy` | Harness declaration used to select and verify modes | **PROPOSED-V2** |
 | `request.principal` | Authorization context supplied by the adapter | **PROPOSED-V2**, **FUTURE** public API |
 | `request.filters` | Adapter filter controls | **PROPOSED-V2**, **FUTURE** public API |
 | `request.cache_probe` | Evaluator sequencing metadata, not request payload | **PROPOSED-V2** |
-| `request.neighborhood` | No current public request field or neighborhood operation | **FUTURE** |
+| `request.neighborhood` | No retrieval request field; `pkg/explorer` has an embedded both-direction neighborhood operation without direction/fan-out fields or remote/storage-neutral conformance | **CURRENT-BLACK-BOX** only for the embedded shape; fixture request remains **FUTURE** |
 
-`q14-public-default-semantics` is **FUTURE** and
-`not_evaluable_current_public_contract`. It activates only when a target
-advertises a versioned default-mode contract and exposes the effective modes
-used for the request. Until then, Explorer and CLI adapters materialize
-concrete modes, and current evaluation does not prescribe empty-mode behavior.
+`q14-public-default-semantics` now has a **CURRENT-CONTRACT** lexical default.
+The delivered `proposed-evaluation-v2` case remains **FUTURE** as a release
+gate because it also requests explicit `AsOf`, requires observable effective
+modes, and has no current result oracle. A target may separately conformance
+test normalization without claiming that the full q14 fixture is evaluable.
 
 `q19-future-fan-out-10` is also **FUTURE** and
 `not_evaluable_current_public_contract`. The current public retrieval request
@@ -553,21 +556,20 @@ references, or any strategy/mode combination not listed below:
 | `public-default-semantics` | `[]` |
 
 Every case has `top_k > 0`. `q14-public-default-semantics` is the sole permitted
-empty-modes case. It uses `FutureExpected`, is **FUTURE**, and is not
-evaluable under the current public contract. Its null current oracles mean
-"not evaluated," not another execution or authorization state. It has no
-current result, relevance, ranking, hard-gate, or release-decision assertion.
-Activation requires target advertisement of a versioned default-mode contract
-and observable effective modes.
+empty-modes case and normatively normalizes to lexical. It remains a
+`FutureExpected` fixture case because its explicit `AsOf`, effective-mode
+observability, and result oracle are not currently available. Its null current
+oracles mean "not evaluated," not another execution or authorization state.
 
 `q19-future-fan-out-10` also uses `FutureExpected`. Its
 `snapshot_oracle_id: "oracle:graph-fan-out-10"` references a deterministic
 fixture oracle with exactly 10 outgoing edges from `node:fanout-hub`, exactly
 10 paired leaf nodes, and ascending edge-ID order. Fixture structure and oracle
 determinism are currently evaluable. Target neighborhood results, relevance,
-ranking, latency, and release behavior are not: the current public contract has
-no bounded-neighborhood operation. Those checks activate only with the
-versioned bounded-graph-neighborhood contract and observable effective modes.
+ranking, latency, and release behavior are not: the embedded public operation
+has no direction or fan-out fields and no remote/storage-neutral conformance.
+Those checks activate only with the versioned bounded-graph-neighborhood
+contract and observable effective limits.
 Its declared request is `top_k: 10` with root `node:fanout-hub`, direction
 `outgoing`, `max_depth: 1`, and `max_fan_out: 10`.
 

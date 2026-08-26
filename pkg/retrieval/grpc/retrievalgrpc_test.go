@@ -240,6 +240,31 @@ func TestClientRejectsMalformedResponse(t *testing.T) {
 				}
 			},
 		},
+		{
+			name: "duplicate result ID",
+			mutate: func(response *knowledgepb.RetrieveResponse) {
+				response.Results = append(
+					response.Results, validProtoResponse().Results[0])
+			},
+		},
+		{
+			name: "nondeterministic result order",
+			mutate: func(response *knowledgepb.RetrieveResponse) {
+				higher := validProtoResponse().Results[0]
+				higher.Id = "result-2"
+				higher.Score = response.Results[0].Score + 1
+				response.Results = append(response.Results, higher)
+			},
+		},
+		{
+			name: "nondeterministic evidence order",
+			mutate: func(response *knowledgepb.RetrieveResponse) {
+				earlier := validProtoResponse().Results[0].Evidence[0]
+				earlier.Citation.DocumentId = "doc-0"
+				response.Results[0].Evidence = append(
+					response.Results[0].Evidence, earlier)
+			},
+		},
 	}
 
 	for _, test := range tests {
@@ -254,6 +279,23 @@ func TestClientRejectsMalformedResponse(t *testing.T) {
 				t.Fatalf("error = %v, want internal", err)
 			}
 		})
+	}
+}
+
+func TestClientRejectsResponseOverTopK(t *testing.T) {
+	response := validProtoResponse()
+	second := validProtoResponse().Results[0]
+	second.Id = "result-2"
+	second.Score = response.Results[0].Score - 0.1
+	response.Results = append(response.Results, second)
+	remote, stop := startRawLoopback(t, response)
+	defer stop()
+
+	_, err := remote.Retrieve(context.Background(), retrieval.Request{
+		Text: "query", TopK: 1,
+	})
+	if !shoal.IsErrorCode(err, shoal.ErrorInternal) {
+		t.Fatalf("error = %v, want internal", err)
 	}
 }
 
@@ -540,6 +582,31 @@ func TestServerRejectsUnknownRequestEnum(t *testing.T) {
 	}
 }
 
+func TestClientRetainsWireSpecificUTF8Checks(t *testing.T) {
+	called := false
+	fake := fakeRetriever{retrieve: func(
+		context.Context, retrieval.Request,
+	) (retrieval.Response, error) {
+		called = true
+		return retrieval.Response{}, nil
+	}}
+	remote, stop := startLoopback(t, fake)
+	defer stop()
+
+	_, err := remote.Retrieve(context.Background(), retrieval.Request{
+		Text: "query",
+		Scope: retrieval.Scope{
+			DocumentIDs: []shoal.ID{shoal.ID(string([]byte{0xff}))},
+		},
+	})
+	if !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
+		t.Fatalf("invalid wire ID error = %v", err)
+	}
+	if called {
+		t.Fatal("retriever was called for a non-UTF-8 protobuf string")
+	}
+}
+
 func TestZeroValueParityAndEmptyNormalization(t *testing.T) {
 	response := retrieval.Response{}
 	var received []retrieval.Request
@@ -553,7 +620,11 @@ func TestZeroValueParityAndEmptyNormalization(t *testing.T) {
 	defer stop()
 
 	request := retrieval.Request{Text: "query"}
-	inProcess, err := fake.Retrieve(context.Background(), request)
+	normalizedRequest, err := request.Normalize()
+	if err != nil {
+		t.Fatal(err)
+	}
+	inProcess, err := fake.Retrieve(context.Background(), normalizedRequest)
 	if err != nil {
 		t.Fatalf("in-process Retrieve: %v", err)
 	}
@@ -585,7 +656,8 @@ func TestZeroValueParityAndEmptyNormalization(t *testing.T) {
 		t.Fatalf("results = %#v, want normalized nil", normalized.Results)
 	}
 	gotRequest := received[len(received)-1]
-	if gotRequest.Modes != nil ||
+	if gotRequest.TopK != retrieval.DefaultTopK ||
+		!reflect.DeepEqual(gotRequest.Modes, []retrieval.Mode{retrieval.ModeLexical}) ||
 		gotRequest.Scope.DocumentIDs != nil ||
 		gotRequest.Scope.NodeIDs != nil {
 		t.Fatalf("request was not normalized: %#v", gotRequest)

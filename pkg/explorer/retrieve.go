@@ -44,6 +44,11 @@ type rankedSpan struct {
 	activeModes []retrieval.Mode
 }
 
+type pathEdge struct {
+	from shoal.ID
+	to   shoal.ID
+}
+
 // Retrieve searches the newest eligible document revisions and returns exact
 // span citations with a navigable evidence path.
 func (e *Explorer) Retrieve(
@@ -52,20 +57,28 @@ func (e *Explorer) Retrieve(
 	if err := contextError(ctx); err != nil {
 		return retrieval.Response{}, err
 	}
-	if err := request.Validate(); err != nil {
+	normalized, err := request.Normalize()
+	if err != nil {
 		return retrieval.Response{}, err
 	}
-	modes := append([]retrieval.Mode(nil), request.Modes...)
-	if len(modes) == 0 {
-		modes = []retrieval.Mode{retrieval.ModeLexical, retrieval.ModeTree}
-	}
-	for _, mode := range modes {
+	request = normalized
+	for _, mode := range request.Modes {
 		if mode == retrieval.ModeVector {
 			return retrieval.Response{}, shoal.NewError(
 				shoal.ErrorUnavailable,
 				"vector retrieval is not configured for the embedded Explorer")
 		}
 	}
+	if !request.AsOf.IsZero() {
+		return retrieval.Response{}, shoal.NewError(
+			shoal.ErrorUnavailable,
+			"as-of retrieval requires publication-frontier semantics",
+		)
+	}
+	if err := request.ValidateSeedPlan(false); err != nil {
+		return retrieval.Response{}, err
+	}
+	modes := request.Modes
 	queryTerms := uniqueTerms(request.Text)
 	if len(queryTerms) == 0 {
 		return retrieval.Response{}, shoal.NewError(
@@ -86,7 +99,7 @@ func (e *Explorer) Retrieve(
 				continue
 			}
 		}
-		record := latestRevision(revisions, request.AsOf)
+		record := latestRevision(revisions, time.Time{})
 		if record == nil {
 			continue
 		}
@@ -95,7 +108,7 @@ func (e *Explorer) Retrieve(
 			sectionByID[section.ID] = section
 		}
 		nodes := make(map[shoal.ID]graph.Node, len(record.Nodes))
-		edges := make(map[string]graph.Edge, len(record.Edges))
+		edges := make(map[pathEdge]graph.Edge, len(record.Edges))
 		for _, node := range record.Nodes {
 			nodes[node.ID] = node
 		}
@@ -139,15 +152,9 @@ func (e *Explorer) Retrieve(
 		if ranked[i].score != ranked[j].score {
 			return ranked[i].score > ranked[j].score
 		}
-		if ranked[i].record.Document.ID != ranked[j].record.Document.ID {
-			return ranked[i].record.Document.ID < ranked[j].record.Document.ID
-		}
-		return ranked[i].span.Range.Start.Offset < ranked[j].span.Range.Start.Offset
+		return shoal.CompareID(ranked[i].span.ID, ranked[j].span.ID) < 0
 	})
 	topK := request.TopK
-	if topK == 0 {
-		topK = 10
-	}
 	if uint64(topK) < uint64(len(ranked)) {
 		ranked = ranked[:int(topK)]
 	}
@@ -183,6 +190,10 @@ func (e *Explorer) Retrieve(
 			}
 		}
 		response.Results = append(response.Results, result)
+	}
+	if err := response.ValidateFor(request); err != nil {
+		return retrieval.Response{}, shoal.WrapError(
+			shoal.ErrorInternal, "embedded retrieval produced an invalid response", err)
 	}
 	return response, nil
 }
@@ -244,7 +255,7 @@ func evidencePath(
 	record *persistedDocument,
 	sections map[shoal.ID]document.Section,
 	nodes map[shoal.ID]graph.Node,
-	edges map[string]graph.Edge,
+	edges map[pathEdge]graph.Edge,
 	span document.Span,
 ) (graph.Path, error) {
 	var sectionIDs []shoal.ID
@@ -378,6 +389,6 @@ func idSet(ids []shoal.ID) map[shoal.ID]struct{} {
 	return result
 }
 
-func pathEdgeKey(from, to shoal.ID) string {
-	return string(from) + "\x00" + string(to)
+func pathEdgeKey(from, to shoal.ID) pathEdge {
+	return pathEdge{from: from, to: to}
 }

@@ -2,7 +2,9 @@
 
 ## Status and terminology
 
-This document is a proposed implementation design. It distinguishes:
+This document is a proposed implementation design built on the adopted
+storage-neutral contract in `docs/explorer-public-contract.md`. It
+distinguishes:
 
 - **Current—implemented:** behavior directly expressed by public Shoal or
   public `accumulo` contracts.
@@ -96,15 +98,15 @@ without pretending that Accumulo offers cross-row transactions.
 
 | Area | Verified current behavior | Current gap or consequence |
 |---|---|---|
-| Shared values | `pkg/shoal/types.go` defines stable caller-visible `ID`, opaque `Metadata`, and higher-is-better `Score`. | IDs have no universal encoding or generation rule. Metadata is not an authorization channel. |
-| Documents | `pkg/document/document.go` defines revision-specific `Document`, immutable `Revision`, ordered `Section`/`Span`, zero-based offsets, one-based optional pages, and half-open ranges. | There is no public document repository, read/write API, latest-revision rule, complete-tree validator, canonical source-byte field, or offset-unit definition. |
-| Citations | `document.Citation.Validate` requires document/revision IDs, a section or span, and a valid range. | Validation does not prove existence, ownership, containment, or that `Evidence.Quote` matches source bytes. |
-| Graph | `pkg/graph/graph.go` defines schema-neutral nodes, directed typed edges, and ordered connected paths; `Path.Validate` checks structure and adjacency. | There is no public graph persistence, mutation, neighborhood, snapshot, deletion, or traversal-order contract. |
-| Retrieval | `pkg/retrieval/retrieval.go` defines lexical, vector, tree, graph, and hybrid requests; scopes; `TopK`; `AsOf`; evidence; explanations; and `Retriever.Retrieve`. | There is no public engine behavior for mode defaults, `TopK == 0`, duplicate modes/scopes, scope combination, score formulas, ties, deduplication, vector exactness, or pagination. |
-| Retrieval validation | `retrieval.Request.Validate` checks nonblank UTF-8 text, UTF-8 scoped IDs, known modes, and a protobuf-compatible `AsOf` year. | It does not currently bound query bytes, `TopK`, scope cardinality, candidates, time, or memory. |
-| gRPC | `pkg/retrieval/grpc/retrievalgrpc.go` validates, delegates the same context to `Retriever`, preserves cancellation/deadlines, and maps public errors. `conversion.go` preserves slice order. `validation.go` rejects malformed citations/paths, invalid UTF-8, and non-finite scores. | gRPC contains no storage/query engine and currently establishes no authenticated principal or authorization policy. It has no pagination. |
-| Errors | `pkg/shoal/errors.go` defines `invalid_argument`, `not_found`, `conflict`, `unauthorized`, `unavailable`, `canceled`, `deadline_exceeded`, and `internal`. | Object-level non-disclosure behavior is not defined. |
+| Shared values | `pkg/shoal` defines opaque caller-visible IDs, raw unsigned-byte ID comparison, bounded opaque metadata, finite scores, and stable error literals. | IDs intentionally have no universal generation or Unicode rule. Metadata is not an authorization channel. |
+| Documents | `pkg/document` defines UTF-8 byte offsets, half-open/empty ranges, source-boundary validation, bounded value validators, complete revision-content validation, and immutable revision ownership. | There is no storage-neutral document repository, latest/publication API, canonical source field on `Revision`, or persisted history/tombstone API. |
+| Citations | `document.Citation.Validate` remains structural; `ResolveCitationQuote` and `ValidateCitationQuote` check exact retained source, ownership, containment, and quote bytes when context is supplied. | These helpers do not provide storage hydration or prove that retained source is available in an adapter. |
+| Graph | `pkg/graph` validates bounded nodes/edges, finite weights, and directed connected paths while allowing cycles, self-edges, parallel edges, and optional node kind. | There is no storage-neutral graph persistence, generation, deletion, association, or path-producing traversal API. |
+| Retrieval | `pkg/retrieval` defines normalization (`TopK=20`, lexical default, stable deduplication, UTC `AsOf`), scope/seed rules, hard request bounds, evidence validation, deterministic result/evidence order, uniqueness, and complete-response validation. | Analyzer/scorer/fusion formulas, pagination, publication-frontier resolution, associations, and vector implementation remain store-dependent or deferred. |
+| gRPC | `pkg/retrieval/grpc` normalizes before delegation, preserves repeated-field order, retains wire-specific UTF-8 checks, maps public errors, and validates remote response bounds, uniqueness, finite values, and deterministic order. | gRPC contains no storage/query engine and currently establishes no authenticated principal or authorization policy. It has no pagination. |
+| Errors | `pkg/shoal/errors.go` defines and tests the stable literals `invalid_argument`, `not_found`, `conflict`, `unauthorized`, `unavailable`, `canceled`, `deadline_exceeded`, and `internal`; `docs/explorer-public-contract.md` assigns condition categories. | Authorization non-disclosure cannot be claimed until an authorization boundary exists. |
 | Code ingestion | `pkg/code/id.go`, `source.go`, and `ingest.go` define deterministic length-delimited SHA-256 IDs, immutable source identity, an exact idempotency key, and `applied`/`unchanged` retry behavior. | These rules are specific to `pkg/code`. Generic document/graph IDs remain opaque and must not be regenerated by storage. Atomic document-plus-graph publication is not defined. |
+| Embedded Explorer | `pkg/explorer.Client` currently exposes ingest, document listing/read, graph connect/neighborhood, and retrieval operations; the embedded implementation normalizes retrieval/neighborhood requests and explicitly rejects unsupported vector and `AsOf`. | This is a coarse product facade, not a high-level storage-neutral repository or proof of Accumulo conformance. |
 | Embedded storage | `proto/embed.proto:ConditionalWrite` defines row-local conditional mutation semantics; `ScanRequest.as_of` defines lower-level timestamp filtering. | These are storage primitives, not a public Explorer snapshot, document, graph, citation, or authorization contract. |
 | Accumulo reads | `accumulo/scanner.go` exposes scanner authorizations, columns, and iterator settings. `batch_scanner.go` documents input-range/tablet order unless multi-scan is used. `scan_stream.go` bounds memory to a scanner batch. | Accumulo scans are not a multi-row/multi-table snapshot. Batch and stream results may be accompanied by errors. |
 | Accumulo writes | `accumulo/mutation.go` provides one-row puts/deletes. `batch_writer.go` provides bounded buffering, durability, safe retries, and explicit ambiguous-partial-commit failure. | BatchWriter is not atomic across mutations. No public Accumulo `ConditionalWriter`/conditional-mutation API is currently exposed; the publication CAS in this design is an implementation prerequisite. |
@@ -114,9 +116,11 @@ without pretending that Accumulo offers cross-row transactions.
 
 ### 2.2 Baseline conclusions
 
-1. The only existing coarse public operation is `Retriever.Retrieve`; exact
-   document, outline, citation-resolution, graph-neighborhood, and mutation
-   operations must be additive public APIs or test-harness operations.
+1. `pkg/explorer.Client` already exposes ingest, document, graph-connect,
+   neighborhood, and retrieval operations. It remains a coarse embedded/product
+   facade rather than a high-level storage-neutral repository; exact retained
+   citation hydration, history, publication, deletion, association, and generic
+   mutation operations remain additive APIs or test-harness operations.
 2. `ModeVector` is an enum value, not proof that a compatible distributed
    vector implementation exists. The first adapter must not claim vector
    support.
@@ -505,9 +509,11 @@ testable, and independent of Accumulo's cell-version pruning.
 
 ## 5. Operation-by-operation paths
 
-Names other than `Retrieve` and `Ingest` are proposed additive Explorer
-operations. Their request/response types must use public document/graph
-values and opaque cursors, never Accumulo rows or iterator settings.
+`pkg/explorer.Client` currently names `Ingest`, `Documents`, `Document`,
+`Connect`, `Neighborhood`, and `Retrieve`. More exact operations named below
+are proposed additive storage-neutral APIs. Their request/response types must
+use public document/graph values and opaque cursors, never Accumulo rows or
+iterator settings.
 
 | Operation | Read/write path and Accumulo primitives | Deterministic result |
 |---|---|---|
@@ -1427,17 +1433,17 @@ Canonical comparison hashes logical values, not physical cells:
 | Tombstone winner selection | No shared coverage. | Newest committed generation is selected including tombstones; latest read becomes `not_found`; earlier live generation is never resurrected by pre-filtering tombstones. |
 | Tree integrity/order | Public values exist; no public repository suite. | Out-of-storage-order writes return preorder/sibling order; duplicate order, orphan, cycle, disconnection, and containment violations never publish. |
 | Revision/as-of | Retrieval carries `AsOf`; high-level selection is undefined. | Before-first, exact boundary, between publications, after tombstone, equal source `CreatedAt`, and retained-history floor agree. |
-| Section-only citation/source bytes | Structural validation exists; storage integrity is untested. | Full UTF-8 source bytes/chunks round-trip; byte offsets and UTF-8 boundaries agree; section-only and span citations reconstruct exact source slices after restart/compaction. |
-| Citation/quote/evidence association | Structural validation exists; association storage is new. | IDs resolve to one revision, canonical associations join both scope dimensions, quote equals source interval, evidence/path visibility agrees, missing association cannot be inferred. |
+| Section-only citation/source bytes | Public source-aware range, aggregate revision, and citation-quote validation exists; storage integrity is untested. | Full UTF-8 source bytes/chunks round-trip; byte offsets and UTF-8 boundaries agree; section-only and span citations reconstruct exact source slices after restart/compaction. |
+| Citation/quote/evidence association | Public contextual quote validation exists; association storage is new. | IDs resolve to one revision, canonical associations join both scope dimensions, quote equals source interval, evidence/path visibility agrees, missing association cannot be inferred. |
 | Superseded/deleted postings | No high-level coverage. | Postings for nonwinner revisions never affect counts, authorized ranking, refill, or top-K; winner tombstone removes the document. |
-| Graph one-hop/multi-hop | Public graph values only. | Forward/reverse parity, winner-including-tombstone selection, cycles, parallel edges, depth/degree/frontier caps, and bucket-count variations agree. |
+| Graph one-hop/multi-hop | Public graph validators and embedded both-direction neighborhood exist; durable generation semantics do not. | Forward/reverse parity, winner-including-tombstone selection, cycles, parallel edges, depth/degree/frontier caps, and bucket-count variations agree. |
 | Source endpoint liveness | No shared coverage. | A tombstoned/hidden/retired/uncommitted seed or edge source removes the direct neighbor before degree/global limits, even when target and adjacency rows remain live. |
 | Concurrent endpoint replacement | No shared coverage. | Two replacements from one base serialize; stale adjacency never matches canonical winner or consumes a limit; old/new endpoint tombstones and reverse rows agree. |
 | Graph global ordering | No shared coverage. | Cross-seed, depth, path-representation rank, direction, source, target, type, edge, node, and path tuples produce byte-identical limited results across tablet/multi-scan order. |
 | Directed path representability | Existing `graph.Path.Validate` requires directed adjacency. | Fixture `B <- A -> C`: incoming expansion from `B` may return `A`/edge `A->B` as neighborhood data but never path `[B,A]`; mixed walk `B<-A->C` never becomes a path. Incoming-only path-required requests return `unavailable`; retrieval emits only directed connected evidence paths. |
-| Retrieval ordering | `Score` higher-is-better; no public tie rule. | Exact score bits, result ID tie-break, evidence order, deduplication, TopK, and deterministic fusion agree. |
-| Scope | Scope values/UTF-8 validation exist; combination undefined. | Empty/document/node/both scopes use the normative OR-within/AND-between association rule and cannot affect authorization. |
-| Standalone tree/graph seeds | Modes exist; empty-scope generation is undefined. | Scoped/association/hybrid seed sources are bounded; standalone empty-seed tree/graph returns deterministic `unavailable` before I/O in every adapter/transport. |
+| Retrieval ordering | Public result/evidence total orders, finite scores, unique IDs, and TopK response validation exist; fusion scoring is undefined. | Exact score bits, result ID tie-break, evidence order, deduplication, TopK, and deterministic fusion agree. |
+| Scope | Public normalization defines OR-within/AND-between association semantics and bounded opaque IDs; canonical association storage is absent. | Empty/document/node/both scopes use the normative association rule and cannot affect authorization. |
+| Standalone tree/graph seeds | Public fixed-planner validation and embedded pre-scan rejection exist. | Scoped/association/hybrid seed sources are bounded; standalone empty-seed tree/graph returns deterministic `unavailable` before I/O in every adapter/transport. |
 | Errors | **Existing:** `pkg/shoal/errors_test.go` and gRPC tests cover categories/mapping. | Missing, hidden, conflict, corrupt, overload, cancellation, deadline, history-pruned, and mode-unavailable cases match. |
 | Safe retries | **Existing lower-level:** `accumulo/batch_writer_test.go` covers bounded safe retries and ambiguous terminal failures. | High-level retry never duplicates artifacts or epochs and never exposes staged rows. |
 | Epoch allocation/frontier crash windows | No high-level coverage. | Fault/ambiguous response before/after allocator mutation, reservation terminalization, outcome write, checkpoint write, and reservation retirement yields no lost slot or frontier/time disagreement. |
@@ -1454,7 +1460,7 @@ Canonical comparison hashes logical values, not physical cells:
 | Index rebuild publication race | No shared coverage. | Fault/concurrent content or policy-copy publication around build frontier `B`, delta journal/dual-write, seal, and activation epoch `A` yields either old or new complete IGEN with required policy-copy coverage; no missed delta, early activation, or mixed family generation. |
 | Snapshot lease, retirement, and stale retry | No shared coverage. | Active/ambiguous leases block GC; history floor advances before deletion; crash leaves safe extra data; old token/guard/authority cannot resurrect compacted data. |
 | Writer authority cutover/rollback | No shared coverage. | Backfill/dual-write/cutover/rollback verify durable authority plus **both** backend mirrors before routing. Stale direct embedded writer after cutover and stale direct Accumulo writer after rollback are rejected; ambiguous transitions remain write-closed. |
-| Bounds | Current retrieval validation is limited. | Every ID/metadata/source/cardinality/manifest/mutation/request bound has identical `invalid_argument`; runtime exhaustion is `unavailable`. |
+| Bounds | M0 public ID/metadata/document/graph/retrieval static bounds are shared; storage/manifest bounds remain future. | Every ID/metadata/source/cardinality/manifest/mutation/request bound has identical `invalid_argument`; runtime exhaustion is `unavailable`. |
 | Deterministic serialization | Partial order/normalization coverage exists. | Canonical record bytes, checksums, and deterministic protobuf bytes match across adapter, transport, restart, tablet layout, and compaction. |
 | Vector request | Enum exists; implementation is not established. | Initial adapters both return deterministic `unavailable`; future vector suites are separately gated. |
 
@@ -1651,7 +1657,7 @@ After the agreed rollback window:
 
 | Milestone | Dependencies | Deliverable | Exit criteria |
 |---|---|---|---|
-| M0 — Public contract adoption | Public API owners | Adopt this document's winner/tombstone, UTF-8 byte offset, normalization, scope, mode-seed, ranking, error, mutation-token/precondition, retention, and traversal rules in public docs/tests | No adapter-local semantic decision remains |
+| M0 — Public contract adoption | Public API owners | `docs/explorer-public-contract.md` plus shared public validators/tests adopt UTF-8 byte offset, normalization, scope, mode-seed, ranking, error, future mutation-token/precondition, and traversal rules; winner/tombstone vocabulary remains additive because current values contain no such fields | Public-value semantics are shared; persistence/publication/authorization decisions remain explicitly deferred to later milestones |
 | M1 — Canonical conformance foundation | M0 | Public-value harness, materializer/codec/checksums, deterministic serialization, source-byte fixtures, scorer/analyzer interfaces, fault/authority model | Embedded reference passes winner, citation, association, ordering, bounds, and error cases |
 | M2 — Authorization foundation | M0–M1 | Trusted context resolver, partition/label codec, service accounts, authorized-projection ranking, non-disclosure/caching/logging | Embedded reference passes authorization/noninterference/revocation tests |
 | M3 — Atomic coordination and recovery | M0–M2 | Native ConditionalWriter; bounded TXN/manifest chunks; allocator reservations/outcomes; allocator-row checkpoint mutations; entity guards/claims; LPART/VDIGEST policy-copy catalog/fences; index-generation catalog; snapshot leases; history floor/retirements; durable authority plus embedded/Accumulo mirrors; recovery/reconciliation workers | Fault/ambiguous-response injection covers LPART broadening/narrowing/crash/rollback with no duplicate counts, both authority mirrors, and index rebuild `B`/journal/seal/`A` races, in addition to claim/guard/allocation/commit/outcome/checkpoint/lease/floor recovery |
@@ -1700,7 +1706,7 @@ relax the normative behavior above.
 | Item | Why it matters / required decision |
 |---|---|
 | Native Accumulo conditional writer | Current public `accumulo` API does not expose it. Claims, fencing, and publication are blocked without a supported native implementation. Embedded `ConditionalWrite` is not a substitute for Accumulo internals. |
-| Public contract adoption | Current public values leave several behaviors open. API owners must adopt this document's byte-offset, normalization, winner, scope, error, and traversal rules before implementation is advertised. |
+| Public contract adoption | M0 adopts byte-offset, normalization, scope, error, and traversal rules in `docs/explorer-public-contract.md`. Winner/tombstone persistence, publication frontiers, authorization, and mutation shapes remain later additive work and must not be inferred from the value helpers. |
 | Embedded historical export | Migration requires exact publication order/time and canonical source bytes. If embedded storage cannot export them, promotion is blocked rather than approximated. |
 | Shared ranking implementation | Exact analyzer, scorer, fusion, and authorized-projection statistics must be shared or proven byte-equivalent; storage-local approximations are not acceptable. |
 | Authorization vocabulary | Domain/source/policy authority, principal resolver, service ceilings, and migration mapping need ownership and operational approval. |
