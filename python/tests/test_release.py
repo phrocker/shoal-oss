@@ -33,7 +33,7 @@ class ReleasePolicyTests(unittest.TestCase):
         self.assertNotRegex(workflow, r"(?m)^\s+password:")
 
     def test_import_names_share_version_and_public_api(self):
-        self.assertEqual(sharkbite.__version__, "0.5.0")
+        self.assertEqual(sharkbite.__version__, "1.3.0")
         self.assertEqual(pysharkbite.__version__, sharkbite.__version__)
         self.assertIs(pysharkbite.Connector, sharkbite.Connector)
         self.assertIn("__version__", sharkbite.__all__)
