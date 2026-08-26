@@ -33,21 +33,14 @@ import (
 
 func TestMaterializeNestedCodeDeterministically(t *testing.T) {
 	fixture := newMaterializerFixture(t)
-	sourceMetadata, err := codematerializer.NewSourceMetadata(
-		"repo://example/acme/pkg/café.go",
-		"pkg/café.go",
-	)
-	if err != nil {
-		t.Fatalf("source metadata: %v", err)
-	}
 
 	first, err := codematerializer.Materialize(
-		fixture.ingest, fixture.content, sourceMetadata)
+		fixture.ingest, fixture.content)
 	if err != nil {
 		t.Fatalf("first materialization: %v", err)
 	}
 	second, err := codematerializer.Materialize(
-		fixture.ingest, append([]byte(nil), fixture.content...), sourceMetadata)
+		fixture.ingest, append([]byte(nil), fixture.content...))
 	if err != nil {
 		t.Fatalf("second materialization: %v", err)
 	}
@@ -100,12 +93,16 @@ func TestMaterializeNestedCodeDeterministically(t *testing.T) {
 
 	publicSource := first.Source()
 	if publicSource.Content != string(fixture.content) ||
-		publicSource.URI != sourceMetadata.URI() ||
-		publicSource.Title != sourceMetadata.Title() {
+		publicSource.URI !=
+			fixture.source.Repository().Locator()+"#/"+fixture.source.Path() ||
+		publicSource.Title != "café.go" {
 		t.Fatalf("public source = %+v", publicSource)
 	}
 	if publicSource.Metadata["shoal.code.path"] != fixture.source.Path() {
 		t.Fatalf("public source metadata = %#v", publicSource.Metadata)
+	}
+	if _, present := publicSource.Metadata["shoal.code.ref"]; present {
+		t.Fatal("source ref leaked into canonical metadata")
 	}
 
 	sections := first.Sections()
@@ -157,6 +154,11 @@ func TestMaterializeNestedCodeDeterministically(t *testing.T) {
 	}
 
 	nodes := first.Nodes()
+	for _, node := range nodes {
+		if _, present := node.Properties["shoal.code.ref"]; present {
+			t.Fatalf("source ref leaked into graph node %q", node.ID)
+		}
+	}
 	for _, id := range []shoal.ID{
 		shoal.ID(fixture.source.ID().String()),
 		shoal.ID(fixture.callNode.ID().String()),
@@ -278,9 +280,37 @@ func TestMaterializeNestedCodeDeterministically(t *testing.T) {
 	}
 }
 
+func TestMaterializeIsIdenticalAcrossSourceRefs(t *testing.T) {
+	branch := newMaterializerFixtureWithRef(t, "refs/heads/main")
+	tag := newMaterializerFixtureWithRef(t, "refs/tags/v1.0.0")
+	if branch.source.Ref() == tag.source.Ref() {
+		t.Fatal("fixture refs must differ")
+	}
+	if branch.source.ID() != tag.source.ID() ||
+		branch.ingest.IdempotencyKey() != tag.ingest.IdempotencyKey() {
+		t.Fatal("source ref unexpectedly changed canonical ingestion identity")
+	}
+
+	branchMaterialization, err := codematerializer.Materialize(
+		branch.ingest, branch.content)
+	if err != nil {
+		t.Fatalf("branch materialization: %v", err)
+	}
+	tagMaterialization, err := codematerializer.Materialize(
+		tag.ingest, tag.content)
+	if err != nil {
+		t.Fatalf("tag materialization: %v", err)
+	}
+	branchSnapshot := materializationSnapshot(t, branchMaterialization)
+	tagSnapshot := materializationSnapshot(t, tagMaterialization)
+	if !bytes.Equal(branchSnapshot, tagSnapshot) {
+		t.Fatalf("source ref changed canonical public values:\n%s\n%s",
+			branchSnapshot, tagSnapshot)
+	}
+}
+
 func TestMaterializeRejectsMismatchedAndInvalidSourceBytes(t *testing.T) {
 	fixture := newMaterializerFixture(t)
-	sourceMetadata := mustSourceMetadata(t)
 	sameLength := append([]byte(nil), fixture.content...)
 	sameLength[len(sameLength)-2] = 'x'
 	for name, source := range map[string][]byte{
@@ -289,7 +319,7 @@ func TestMaterializeRejectsMismatchedAndInvalidSourceBytes(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			if _, err := codematerializer.Materialize(
-				fixture.ingest, source, sourceMetadata,
+				fixture.ingest, source,
 			); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
 				t.Fatalf("error = %v", err)
 			}
@@ -299,7 +329,7 @@ func TestMaterializeRejectsMismatchedAndInvalidSourceBytes(t *testing.T) {
 	invalid := []byte{0xff, '\n'}
 	invalidIngest := ingestForContent(t, invalid)
 	if _, err := codematerializer.Materialize(
-		invalidIngest, invalid, sourceMetadata,
+		invalidIngest, invalid,
 	); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
 		t.Fatalf("invalid UTF-8 error = %v", err)
 	}
@@ -328,7 +358,7 @@ func TestMaterializeRejectsSyntaxRangeInsideUTF8Encoding(t *testing.T) {
 		t.Fatalf("ingest request: %v", err)
 	}
 	if _, err := codematerializer.Materialize(
-		ingest, content, mustSourceMetadata(t),
+		ingest, content,
 	); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
 		t.Fatalf("UTF-8 boundary error = %v", err)
 	}
@@ -356,7 +386,7 @@ func TestMaterializeRejectsIncompatibleCodeProperties(t *testing.T) {
 		t.Fatalf("ingest request: %v", err)
 	}
 	if _, err := codematerializer.Materialize(
-		ingest, content, mustSourceMetadata(t),
+		ingest, content,
 	); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
 		t.Fatalf("property compatibility error = %v", err)
 	}
@@ -380,12 +410,19 @@ type materializerFixture struct {
 
 func newMaterializerFixture(t *testing.T) materializerFixture {
 	t.Helper()
+	return newMaterializerFixtureWithRef(t, "refs/heads/main")
+}
+
+func newMaterializerFixtureWithRef(
+	t *testing.T, ref string,
+) materializerFixture {
+	t.Helper()
 	content := []byte(
 		"import \"mód\"\n" +
 			"func café() {\n" +
 			"\tmód.Call(\"héllo\")\n" +
 			"}\n")
-	source := testSource(t, content)
+	source := testSourceWithRef(t, content, ref)
 	parseRequest := mustParseRequest(t, source, content)
 
 	importStart := bytes.Index(content, []byte("import"))
@@ -524,13 +561,20 @@ func ingestForContent(t *testing.T, content []byte) codeast.IngestRequest {
 
 func testSource(t *testing.T, content []byte) codeast.Source {
 	t.Helper()
+	return testSourceWithRef(t, content, "refs/heads/main")
+}
+
+func testSourceWithRef(
+	t *testing.T, content []byte, ref string,
+) codeast.Source {
+	t.Helper()
 	repository, err := codeast.NewRepository("https://example.test/acme/repository")
 	if err != nil {
 		t.Fatalf("repository: %v", err)
 	}
 	source, err := codeast.NewSource(
 		repository,
-		"refs/heads/main",
+		ref,
 		"pkg/café.go",
 		"0123456789abcdef",
 		codeast.HashContent(content),
@@ -621,16 +665,6 @@ func exactPosition(
 		t.Fatalf("position: %v", err)
 	}
 	return position
-}
-
-func mustSourceMetadata(t *testing.T) codematerializer.SourceMetadata {
-	t.Helper()
-	metadata, err := codematerializer.NewSourceMetadata(
-		"repo://example/acme/pkg/café.go", "pkg/café.go")
-	if err != nil {
-		t.Fatalf("source metadata: %v", err)
-	}
-	return metadata
 }
 
 func stableID(t *testing.T, namespace string, parts ...string) shoal.ID {

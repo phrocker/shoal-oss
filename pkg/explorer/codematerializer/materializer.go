@@ -31,8 +31,8 @@
 package codematerializer
 
 import (
-	"bytes"
 	"fmt"
+	pathpkg "path"
 	"sort"
 	"strconv"
 	"strings"
@@ -49,55 +49,15 @@ const (
 	// Version is the Section 6.9 deterministic public materializer version.
 	Version = "explorer-code-v1"
 
+	// MaxGraphNodes and MaxGraphEdges mirror the Section 10.5 canonical codec
+	// transaction bounds until that shared codec package is available.
+	MaxGraphNodes = 1_000_000
+	MaxGraphEdges = 1_000_000
+	// MaxAssociations mirrors the Section 10.5 canonical association bound.
+	MaxAssociations = 2_000_000
+
 	metadataPrefix = "shoal.code."
 )
-
-// SourceMetadata supplies the deterministic public URI and title that cannot
-// be inferred without imposing a repository locator URI policy.
-type SourceMetadata struct {
-	uri   string
-	title string
-}
-
-// NewSourceMetadata constructs validated immutable public source metadata.
-func NewSourceMetadata(uri, title string) (SourceMetadata, error) {
-	value := SourceMetadata{
-		uri:   uri,
-		title: title,
-	}
-	if err := value.Validate(); err != nil {
-		return SourceMetadata{}, err
-	}
-	return value, nil
-}
-
-// Validate checks public source metadata without normalizing caller values.
-func (m SourceMetadata) Validate() error {
-	if !utf8.ValidString(m.uri) || strings.TrimSpace(m.uri) == "" {
-		return shoal.NewError(
-			shoal.ErrorInvalidArgument,
-			"code materialization source URI is required and must be valid UTF-8",
-		)
-	}
-	if !utf8.ValidString(m.title) || strings.TrimSpace(m.title) == "" {
-		return shoal.NewError(
-			shoal.ErrorInvalidArgument,
-			"code materialization title is required and must be valid UTF-8",
-		)
-	}
-	if err := shoal.ValidateSemanticString("code materialization title", m.title); err != nil {
-		return err
-	}
-	return nil
-}
-
-func (m SourceMetadata) URI() string {
-	return m.uri
-}
-
-func (m SourceMetadata) Title() string {
-	return m.title
-}
 
 // AssociationTarget identifies whether a citation is attributable to a graph
 // node or a graph edge.
@@ -219,23 +179,30 @@ type syntaxRecord struct {
 	spanID    shoal.ID
 }
 
+type projectedCounts struct {
+	nodes        int
+	edges        int
+	associations int
+}
+
 // Materialize validates the ingestion request and the independently supplied
-// exact source bytes, then builds the explorer-code-v1 public projection. The
-// source byte slice and all caller-owned maps and slices remain untouched.
+// exact source bytes, then builds the explorer-code-v1 public projection.
+// Public URI is repository locator + "#/" + canonical source path, without
+// normalizing either component; title is path.Base(canonical source path).
+// Source.Ref is deliberately excluded because it is not part of Source.ID.
+// The source byte slice and all caller-owned maps and slices remain untouched.
 func Materialize(
 	request codeast.IngestRequest,
 	exactSource []byte,
-	sourceMetadata SourceMetadata,
 ) (Materialization, error) {
-	if err := request.Validate(); err != nil {
-		return Materialization{}, err
+	if uint64(len(exactSource)) > uint64(document.MaxRevisionSourceBytes) ||
+		request.ContentSize() > uint64(document.MaxRevisionSourceBytes) {
+		return Materialization{}, shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"code materialization source exceeds the public byte bound",
+		)
 	}
-	if err := sourceMetadata.Validate(); err != nil {
-		return Materialization{}, err
-	}
-
-	parseRequest := request.ParseRequest()
-	source := parseRequest.Source()
+	source := request.Source()
 	if uint64(len(exactSource)) != source.SizeBytes() {
 		return Materialization{}, shoal.NewError(
 			shoal.ErrorInvalidArgument,
@@ -248,7 +215,7 @@ func Materialize(
 			"source hash does not match materialization bytes",
 		)
 	}
-	if !bytes.Equal(exactSource, parseRequest.Content()) {
+	if !request.ContentEqual(exactSource) {
 		return Materialization{}, shoal.NewError(
 			shoal.ErrorInvalidArgument,
 			"materialization bytes do not match the ingestion parse request",
@@ -260,26 +227,33 @@ func Materialize(
 			"code materialization source must be valid UTF-8",
 		)
 	}
-	if len(exactSource) > document.MaxRevisionSourceBytes {
-		return Materialization{}, shoal.NewError(
-			shoal.ErrorInvalidArgument,
-			"code materialization source exceeds the public byte bound",
-		)
-	}
-
-	parseResult := request.ParseResult()
-	if len(parseResult.Nodes())+1 > document.MaxSectionsPerRevision {
+	inputCounts := request.ParseResultCounts()
+	if inputCounts.SyntaxNodes+1 > document.MaxSectionsPerRevision {
 		return Materialization{}, shoal.NewError(
 			shoal.ErrorInvalidArgument,
 			"code materialization has too many document sections",
 		)
 	}
-	if len(parseResult.Nodes()) > document.MaxSpansPerRevision {
+	if inputCounts.SyntaxNodes > document.MaxSpansPerRevision {
 		return Materialization{}, shoal.NewError(
 			shoal.ErrorInvalidArgument,
 			"code materialization has too many document spans",
 		)
 	}
+	counts, err := preflightProjectedCounts(inputCounts)
+	if err != nil {
+		return Materialization{}, err
+	}
+	if err := request.Validate(); err != nil {
+		return Materialization{}, err
+	}
+
+	parseResult := request.ParseResult()
+	syntaxNodes := parseResult.Nodes()
+	symbols := parseResult.Symbols()
+	externals := parseResult.Externals()
+	relationships := parseResult.Relationships()
+	roots := parseResult.Roots()
 
 	documentID, err := stableID(
 		"shoal.document", source.Repository().Locator(), source.Path())
@@ -306,14 +280,16 @@ func Materialize(
 		return Materialization{}, err
 	}
 
+	sourceURI := canonicalSourceURI(source)
+	title := pathpkg.Base(source.Path())
 	publicMetadata, err := materializationMetadata(
 		source, parseResult, request.IdempotencyKey())
 	if err != nil {
 		return Materialization{}, err
 	}
 	publicSource := explorer.Source{
-		URI:       sourceMetadata.URI(),
-		Title:     sourceMetadata.Title(),
+		URI:       sourceURI,
+		Title:     title,
 		MediaType: explorer.MediaTypeText,
 		Content:   string(exactSource),
 		Metadata:  cloneMetadata(publicMetadata),
@@ -321,7 +297,7 @@ func Materialize(
 	doc := document.Document{
 		ID:            documentID,
 		RevisionID:    revisionID,
-		Title:         sourceMetadata.Title(),
+		Title:         title,
 		RootSectionID: rootSectionID,
 		Metadata:      cloneMetadata(publicMetadata),
 	}
@@ -342,19 +318,20 @@ func Materialize(
 	if err != nil {
 		return Materialization{}, err
 	}
-	sections := []document.Section{{
+	sections := make([]document.Section, 1, len(syntaxNodes)+1)
+	sections[0] = document.Section{
 		ID:         rootSectionID,
 		DocumentID: documentID,
 		RevisionID: revisionID,
-		Heading:    sourceMetadata.Title(),
+		Heading:    title,
 		Range:      fullRange,
 		Metadata:   rootMetadata,
-	}}
-	spans := make([]document.Span, 0, len(parseResult.Nodes()))
-	records := make([]syntaxRecord, 0, len(parseResult.Nodes()))
-	recordByID := make(map[codeast.ID]syntaxRecord, len(parseResult.Nodes()))
-	nodeByID := make(map[codeast.ID]codeast.SyntaxNode, len(parseResult.Nodes()))
-	for _, node := range parseResult.Nodes() {
+	}
+	spans := make([]document.Span, 0, len(syntaxNodes))
+	records := make([]syntaxRecord, 0, len(syntaxNodes))
+	recordByID := make(map[codeast.ID]syntaxRecord, len(syntaxNodes))
+	nodeByID := make(map[codeast.ID]codeast.SyntaxNode, len(syntaxNodes))
+	for _, node := range syntaxNodes {
 		nodeByID[node.ID()] = node
 	}
 
@@ -367,7 +344,7 @@ func Materialize(
 				"validated syntax traversal references an unknown node",
 			)
 		}
-		sourceRange, err := publicRange(node.Range(), exactSource)
+		sourceRange, err := publicRange(node.Range(), publicSource.Content)
 		if err != nil {
 			return fmt.Errorf("syntax node %s: %w", node.ID(), err)
 		}
@@ -419,7 +396,7 @@ func Materialize(
 		}
 		return nil
 	}
-	for index, rootID := range parseResult.Roots() {
+	for index, rootID := range roots {
 		if err := appendSyntax(rootID, rootSectionID, uint32(index)); err != nil {
 			return Materialization{}, err
 		}
@@ -427,19 +404,19 @@ func Materialize(
 
 	nodes, err := materializeNodes(
 		doc, revision, sections, spans, source, records,
-		parseResult.Symbols(), parseResult.Externals())
+		symbols, externals, counts.nodes)
 	if err != nil {
 		return Materialization{}, err
 	}
 	edges, err := materializeEdges(
 		doc, sections, spans, source, records, recordByID,
-		parseResult.Symbols(), parseResult.Relationships())
+		symbols, relationships, counts.edges)
 	if err != nil {
 		return Materialization{}, err
 	}
 	associations, err := materializeAssociations(
 		doc, revision, rootSectionID, records, recordByID,
-		parseResult.Symbols(), parseResult.Relationships())
+		symbols, relationships, counts.associations)
 	if err != nil {
 		return Materialization{}, err
 	}
@@ -485,16 +462,48 @@ func (m Materialization) ValidateFor(request codeast.IngestRequest) error {
 		return shoal.NewError(
 			shoal.ErrorInvalidArgument, "invalid code materializer version")
 	}
-	parseRequest := request.ParseRequest()
-	source := parseRequest.Source()
+	source := request.Source()
 	if m.idempotencyKey != request.IdempotencyKey() || m.sourceID != source.ID() {
 		return shoal.NewError(
 			shoal.ErrorInvalidArgument,
 			"code materialization does not match ingestion request",
 		)
 	}
-	if err := validateExplorerSource(m.source, parseRequest.Content()); err != nil {
+	if err := validateExplorerSource(m.source, request); err != nil {
 		return err
+	}
+	if m.source.URI != canonicalSourceURI(source) ||
+		m.source.Title != pathpkg.Base(source.Path()) {
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"materialized source URI or title is not canonical",
+		)
+	}
+	if _, present := m.source.Metadata[metadataPrefix+"ref"]; present {
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"materialized source metadata must not contain source ref",
+		)
+	}
+	for _, node := range m.nodes {
+		if _, present := node.Properties[metadataPrefix+"ref"]; present {
+			return shoal.NewError(
+				shoal.ErrorInvalidArgument,
+				"materialized graph properties must not contain source ref",
+			)
+		}
+	}
+	counts, err := preflightProjectedCounts(request.ParseResultCounts())
+	if err != nil {
+		return err
+	}
+	if len(m.nodes) != counts.nodes ||
+		len(m.edges) != counts.edges ||
+		len(m.associations) != counts.associations {
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"materialized graph cardinality does not match canonical projection",
+		)
 	}
 
 	expectedDocumentID, err := stableID(
@@ -586,7 +595,6 @@ func materializationMetadata(
 	return mergeMetadata(nil, shoal.Metadata{
 		metadataPrefix + "materializer_version":      Version,
 		metadataPrefix + "repository":                source.Repository().Locator(),
-		metadataPrefix + "ref":                       source.Ref(),
 		metadataPrefix + "path":                      source.Path(),
 		metadataPrefix + "revision":                  source.Revision(),
 		metadataPrefix + "content_hash":              source.ContentHash().String(),
@@ -610,9 +618,9 @@ func materializeNodes(
 	records []syntaxRecord,
 	symbols []codeast.SemanticSymbol,
 	externals []codeast.ExternalEntity,
+	projectedNodeCount int,
 ) ([]graph.Node, error) {
-	nodes := make([]graph.Node, 0,
-		2+len(sections)+len(spans)+len(records)+len(symbols)+len(externals))
+	nodes := make([]graph.Node, 0, projectedNodeCount)
 	appendNode := func(node graph.Node) error {
 		if err := node.Validate(); err != nil {
 			return err
@@ -635,7 +643,6 @@ func materializeNodes(
 	}
 	sourceProperties, err := mergeMetadata(nil, shoal.Metadata{
 		metadataPrefix + "repository":   source.Repository().Locator(),
-		metadataPrefix + "ref":          source.Ref(),
 		metadataPrefix + "path":         source.Path(),
 		metadataPrefix + "revision":     source.Revision(),
 		metadataPrefix + "content_hash": source.ContentHash().String(),
@@ -770,9 +777,9 @@ func materializeEdges(
 	recordByID map[codeast.ID]syntaxRecord,
 	symbols []codeast.SemanticSymbol,
 	relationships []codeast.Relationship,
+	projectedEdgeCount int,
 ) ([]graph.Edge, error) {
-	edges := make([]graph.Edge, 0,
-		1+len(sections)+len(spans)+2*len(records)+len(symbols)+len(relationships))
+	edges := make([]graph.Edge, 0, projectedEdgeCount)
 	appendDerived := func(edgeType string, from, to shoal.ID) error {
 		edge, err := derivedEdge(edgeType, from, to)
 		if err != nil {
@@ -873,9 +880,9 @@ func materializeAssociations(
 	recordByID map[codeast.ID]syntaxRecord,
 	symbols []codeast.SemanticSymbol,
 	relationships []codeast.Relationship,
+	projectedAssociationCount int,
 ) ([]Association, error) {
-	associations := make([]Association, 0,
-		len(records)+len(symbols)+len(relationships))
+	associations := make([]Association, 0, projectedAssociationCount)
 	for _, record := range records {
 		publicRange, err := rangeWithoutSource(record.node.Range())
 		if err != nil {
@@ -956,6 +963,86 @@ func materializeAssociations(
 	return associations, nil
 }
 
+func canonicalSourceURI(source codeast.Source) string {
+	return source.Repository().Locator() + "#/" + source.Path()
+}
+
+func preflightProjectedCounts(
+	input codeast.ParseResultCounts,
+) (projectedCounts, error) {
+	nodeCount, ok := checkedCountSum(
+		3,
+		checkedCountProduct(input.SyntaxNodes, 3),
+		input.Symbols,
+		input.Externals,
+	)
+	if !ok {
+		return projectedCounts{}, countOverflowError("graph node")
+	}
+	edgeCount, ok := checkedCountSum(
+		2,
+		checkedCountProduct(input.SyntaxNodes, 4),
+		input.DeclaredSymbols,
+		input.Relationships,
+	)
+	if !ok {
+		return projectedCounts{}, countOverflowError("graph edge")
+	}
+	associationCount, ok := checkedCountSum(
+		input.SyntaxNodes, input.DeclaredSymbols, input.RangedRelationships)
+	if !ok {
+		return projectedCounts{}, countOverflowError("association")
+	}
+	if nodeCount > MaxGraphNodes {
+		return projectedCounts{}, shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"code materialization exceeds the graph node bound",
+		)
+	}
+	if edgeCount > MaxGraphEdges {
+		return projectedCounts{}, shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"code materialization exceeds the graph edge bound",
+		)
+	}
+	if associationCount > MaxAssociations {
+		return projectedCounts{}, shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"code materialization exceeds the association bound",
+		)
+	}
+	return projectedCounts{
+		nodes:        int(nodeCount),
+		edges:        int(edgeCount),
+		associations: int(associationCount),
+	}, nil
+}
+
+func checkedCountProduct(value, factor uint64) uint64 {
+	if factor != 0 && value > ^uint64(0)/factor {
+		return ^uint64(0)
+	}
+	return value * factor
+}
+
+func checkedCountSum(values ...uint64) (uint64, bool) {
+	total := uint64(0)
+	for _, value := range values {
+		if value == ^uint64(0) || total > ^uint64(0)-value {
+			return 0, false
+		}
+		total += value
+	}
+	return total, true
+}
+
+func countOverflowError(kind string) error {
+	return shoal.NewError(
+		shoal.ErrorInvalidArgument,
+		"code materialization "+kind+" count overflows",
+	)
+}
+
 func stableID(namespace string, parts ...string) (shoal.ID, error) {
 	id, err := codeast.NewStableID(namespace, parts...)
 	if err != nil {
@@ -980,7 +1067,7 @@ func derivedEdge(edgeType string, from, to shoal.ID) (graph.Edge, error) {
 }
 
 func publicRange(
-	sourceRange codeast.Range, source []byte,
+	sourceRange codeast.Range, source string,
 ) (document.SourceRange, error) {
 	value, err := rangeWithoutSource(sourceRange)
 	if err != nil {
@@ -990,7 +1077,7 @@ func publicRange(
 		return document.SourceRange{}, shoal.NewError(
 			shoal.ErrorInvalidArgument, "source range exceeds exact source bytes")
 	}
-	if err := value.ValidateSource(string(source)); err != nil {
+	if err := value.ValidateSource(source); err != nil {
 		return document.SourceRange{}, err
 	}
 	return value, nil
@@ -1012,7 +1099,9 @@ func rangeWithoutSource(sourceRange codeast.Range) (document.SourceRange, error)
 	}, nil
 }
 
-func validateExplorerSource(source explorer.Source, exact []byte) error {
+func validateExplorerSource(
+	source explorer.Source, request codeast.IngestRequest,
+) error {
 	if !utf8.ValidString(source.URI) || strings.TrimSpace(source.URI) == "" {
 		return shoal.NewError(
 			shoal.ErrorInvalidArgument, "materialized source URI is invalid")
@@ -1028,7 +1117,9 @@ func validateExplorerSource(source explorer.Source, exact []byte) error {
 		return shoal.NewError(
 			shoal.ErrorInvalidArgument, "materialized code source must be text/plain")
 	}
-	if !utf8.ValidString(source.Content) || !bytes.Equal([]byte(source.Content), exact) {
+	if !utf8.ValidString(source.Content) ||
+		uint64(len(source.Content)) != request.ContentSize() ||
+		!request.ContentStringEqual(source.Content) {
 		return shoal.NewError(
 			shoal.ErrorInvalidArgument,
 			"materialized source content does not match exact parse bytes",
