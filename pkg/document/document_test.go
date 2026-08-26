@@ -20,11 +20,25 @@
 package document_test
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/phrocker/shoal-oss/pkg/document"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
+
+func TestValidateRevisionContentRejectsExcessiveLineFragmentation(t *testing.T) {
+	source := strings.Repeat("\n", document.MaxSourceLinesPerRevision+1)
+	if err := document.ValidateRevisionContent(
+		source,
+		document.Document{},
+		document.Revision{},
+		nil,
+		nil,
+	); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
+		t.Fatalf("fragmentation error = %v", err)
+	}
+}
 
 func TestCitationRequiresRevisionSpecificSource(t *testing.T) {
 	citation := document.Citation{

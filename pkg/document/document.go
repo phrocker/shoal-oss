@@ -22,6 +22,7 @@ package document
 
 import (
 	"fmt"
+	"strings"
 	"time"
 	"unicode/utf8"
 
@@ -32,6 +33,10 @@ const (
 	MaxRevisionSourceBytes = 512 * 1024 * 1024
 	MaxSectionsPerRevision = 100_000
 	MaxSpansPerRevision    = 1_000_000
+	// MaxSourceLinesPerRevision permits every bounded section and span to
+	// occupy its own line with a blank separator while preventing newline-only
+	// sources from amplifying into an unbounded parser index.
+	MaxSourceLinesPerRevision = 2*(MaxSectionsPerRevision+MaxSpansPerRevision) + 1
 )
 
 // SourcePosition identifies a zero-based UTF-8 byte offset and, when known, a
@@ -267,6 +272,10 @@ func ValidateRevisionContent(
 		return shoal.NewError(
 			shoal.ErrorInvalidArgument, "canonical source exceeds the public byte bound")
 	}
+	if sourceLineFragmentsExceed(source, MaxSourceLinesPerRevision) {
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument, "canonical source has too many line fragments")
+	}
 	if len(sections) > MaxSectionsPerRevision {
 		return shoal.NewError(
 			shoal.ErrorInvalidArgument, "revision has too many sections")
@@ -404,6 +413,22 @@ func ValidateRevisionContent(
 			shoal.ErrorInvalidArgument, "section hierarchy is not connected")
 	}
 	return nil
+}
+
+func sourceLineFragmentsExceed(source string, maximum int) bool {
+	fragments := 0
+	for start := 0; start < len(source); {
+		fragments++
+		if fragments > maximum {
+			return true
+		}
+		newline := strings.IndexByte(source[start:], '\n')
+		if newline < 0 {
+			break
+		}
+		start += newline + 1
+	}
+	return false
 }
 
 // ResolveCitationQuote validates exact retained revision content and returns

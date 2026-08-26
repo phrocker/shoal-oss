@@ -99,7 +99,10 @@ func (e *Explorer) Retrieve(
 				continue
 			}
 		}
-		record := latestRevision(revisions, time.Time{})
+		record, err := latestRevision(revisions)
+		if err != nil {
+			return retrieval.Response{}, err
+		}
 		if record == nil {
 			continue
 		}
