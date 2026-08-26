@@ -28,9 +28,10 @@ import (
 
 const (
 	// UnicodeTermAnalyzerVersion identifies the exact Unicode letter/number,
-	// lowercase, unique-term analysis behavior. A behavior change, including
-	// a Unicode table change that affects output, requires a new identifier.
-	UnicodeTermAnalyzerVersion = "unicode-letter-number-lower-unique-v1"
+	// lowercase, unique-term analysis behavior and the exact standard-library
+	// Unicode tables used by unicode.IsLetter, IsNumber, and strings.ToLower.
+	UnicodeTermAnalyzerVersion = "unicode-letter-number-lower-unique-v1+unicode-" +
+		unicode.Version
 
 	// CoverageFusionScorerVersion identifies the exact term coverage and
 	// lexical/tree/graph fusion formulas implemented below.

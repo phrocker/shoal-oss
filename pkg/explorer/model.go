@@ -24,6 +24,7 @@ package explorer
 import (
 	"context"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/phrocker/shoal-oss/pkg/document"
@@ -44,6 +45,13 @@ type Source struct {
 	MediaType string
 	Content   string
 	Metadata  shoal.Metadata
+}
+
+// IngestOptions controls descriptive source-revision values without changing
+// publication order. A zero CreatedAt uses the current time; a nonzero value
+// is retained exactly after UTC normalization.
+type IngestOptions struct {
+	CreatedAt time.Time
 }
 
 // IngestDisposition reports whether ingestion created a revision or found the

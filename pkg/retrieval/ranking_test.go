@@ -23,6 +23,7 @@ import (
 	"math"
 	"reflect"
 	"testing"
+	"unicode"
 
 	"github.com/phrocker/shoal-oss/pkg/retrieval"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
@@ -104,7 +105,9 @@ func TestRankingVersionIdentifiersAreStable(t *testing.T) {
 	scorer := retrieval.CoverageFusionScorer{}
 	for index := 0; index < 3; index++ {
 		gotAnalyzer := analyzer.Version()
-		if gotAnalyzer != "unicode-letter-number-lower-unique-v1" {
+		wantAnalyzer := "unicode-letter-number-lower-unique-v1+unicode-" +
+			unicode.Version
+		if gotAnalyzer != wantAnalyzer {
 			t.Fatalf("analyzer version literal = %q", gotAnalyzer)
 		}
 		if gotAnalyzer != retrieval.UnicodeTermAnalyzerVersion {

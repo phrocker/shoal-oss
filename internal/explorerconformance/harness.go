@@ -37,15 +37,17 @@ import (
 // Lifecycle owns one isolated Explorer client and its storage-neutral restart
 // and cleanup hooks.
 type Lifecycle struct {
-	Client  explorer.Client
-	Restart func(context.Context) (explorer.Client, error)
-	Close   func() error
+	Client   explorer.Client
+	IngestAt func(context.Context, explorer.Source, time.Time) (explorer.IngestResult, error)
+	Restart  func(context.Context) (explorer.Client, error)
+	Close    func() error
 }
 
 // ClientFactory opens one isolated client lifecycle for a conformance case.
-// Direct and loopback adapters can implement the same shape without exposing
-// storage engines, rows, scanners, or transport internals.
-type ClientFactory func(testing.TB) (Lifecycle, error)
+// It receives independently owned, normalized fixture controls. Direct and
+// loopback adapters can implement the same shape without exposing storage
+// engines, rows, scanners, or transport internals.
+type ClientFactory func(testing.TB, FixtureControls) (Lifecycle, error)
 
 // Run executes the M1 storage-neutral public Explorer conformance suite.
 func Run(t *testing.T, factory ClientFactory) {
@@ -75,12 +77,17 @@ func Run(t *testing.T, factory ClientFactory) {
 }
 
 func winnerAndExplicitRevision(t *testing.T, factory ClientFactory) {
-	lifecycle := openLifecycle(t, factory)
 	ctx := context.Background()
-	controls, err := (FixtureControls{
+	controls := FixtureControls{
 		Clock: FakeClock{Instants: []time.Time{
-			time.Date(2099, time.January, 1, 0, 0, 0, 0, time.UTC),
-			time.Date(2001, time.January, 1, 0, 0, 0, 0, time.UTC),
+			time.Date(
+				2099, time.January, 1, 0, 0, 0, 0,
+				time.FixedZone("future-source", 60*60),
+			),
+			time.Date(
+				2001, time.January, 1, 0, 0, 0, 0,
+				time.FixedZone("past-source", -5*60*60),
+			),
 		}},
 		Authorities: WriterAuthorityHistory{{
 			Generation: 1,
@@ -88,31 +95,27 @@ func winnerAndExplicitRevision(t *testing.T, factory ClientFactory) {
 			Holder:     "embedded-fixture",
 			Fence:      1,
 		}},
-	}).Normalize()
+	}
+	lifecycle := openLifecycle(t, factory, controls)
+	controls, err := controls.Normalize()
 	if err != nil {
 		t.Fatal(err)
 	}
 	firstClock, _ := controls.Clock.At(0)
 	secondClock, _ := controls.Clock.At(1)
-	first, err := lifecycle.Client.Ingest(ctx, explorer.Source{
+	first, err := lifecycle.IngestAt(ctx, explorer.Source{
 		URI:       "file:///winner.txt",
 		MediaType: explorer.MediaTypeText,
 		Content:   "firstonly",
-		Metadata: shoal.Metadata{
-			"fixture_created_at": firstClock.Format(time.RFC3339Nano),
-		},
-	})
+	}, firstClock)
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := lifecycle.Client.Ingest(ctx, explorer.Source{
+	second, err := lifecycle.IngestAt(ctx, explorer.Source{
 		URI:       "file:///winner.txt",
 		MediaType: explorer.MediaTypeText,
 		Content:   "secondonly",
-		Metadata: shoal.Metadata{
-			"fixture_created_at": secondClock.Format(time.RFC3339Nano),
-		},
-	})
+	}, secondClock)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -123,12 +126,24 @@ func winnerAndExplicitRevision(t *testing.T, factory ClientFactory) {
 	if !firstClock.After(secondClock) {
 		t.Fatal("fixture must put the earlier publication timestamp after the winner timestamp")
 	}
+	if !first.Revision.CreatedAt.Equal(firstClock) ||
+		!second.Revision.CreatedAt.Equal(secondClock) ||
+		!first.Revision.CreatedAt.After(second.Revision.CreatedAt) {
+		t.Fatalf(
+			"revision CreatedAt values = first %v, second %v",
+			first.Revision.CreatedAt, second.Revision.CreatedAt,
+		)
+	}
+	restartLifecycle(t, lifecycle)
 	documents, err := lifecycle.Client.Documents(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(documents) != 1 || documents[0].Revision.ID != second.Revision.ID {
 		t.Fatalf("current documents = %+v", documents)
+	}
+	if !documents[0].Revision.CreatedAt.Equal(secondClock) {
+		t.Fatalf("winner CreatedAt after restart = %v", documents[0].Revision.CreatedAt)
 	}
 	current, err := lifecycle.Client.Document(ctx, second.Document.ID, "")
 	if err != nil {
@@ -146,6 +161,9 @@ func winnerAndExplicitRevision(t *testing.T, factory ClientFactory) {
 	if !viewContains(firstView, "firstonly") {
 		t.Fatalf("explicit first revision = %+v", firstView)
 	}
+	if !firstView.Revision.CreatedAt.Equal(firstClock) {
+		t.Fatalf("explicit first CreatedAt = %v", firstView.Revision.CreatedAt)
+	}
 	secondView, err := lifecycle.Client.Document(
 		ctx, second.Document.ID, second.Revision.ID)
 	if err != nil {
@@ -153,6 +171,9 @@ func winnerAndExplicitRevision(t *testing.T, factory ClientFactory) {
 	}
 	if !viewContains(secondView, "secondonly") {
 		t.Fatalf("explicit second revision = %+v", secondView)
+	}
+	if !secondView.Revision.CreatedAt.Equal(secondClock) {
+		t.Fatalf("explicit second CreatedAt = %v", secondView.Revision.CreatedAt)
 	}
 	oldResponse, err := lifecycle.Client.Retrieve(ctx, retrieval.Request{
 		Text: "firstonly", TopK: 10,
@@ -178,7 +199,7 @@ func winnerAndExplicitRevision(t *testing.T, factory ClientFactory) {
 }
 
 func citationSourceIntegrity(t *testing.T, factory ClientFactory) {
-	lifecycle := openLifecycle(t, factory)
+	lifecycle := openLifecycle(t, factory, standardControls())
 	ctx := context.Background()
 	source := explorer.Source{
 		URI:       "file:///citation.md",
@@ -259,7 +280,7 @@ func citationSourceIntegrity(t *testing.T, factory ClientFactory) {
 }
 
 func graphAssociation(t *testing.T, factory ClientFactory) {
-	lifecycle := openLifecycle(t, factory)
+	lifecycle := openLifecycle(t, factory, standardControls())
 	ctx := context.Background()
 	first, err := lifecycle.Client.Ingest(ctx, explorer.Source{
 		URI: "file:///association-a.txt", MediaType: explorer.MediaTypeText,
@@ -343,7 +364,7 @@ func graphAssociation(t *testing.T, factory ClientFactory) {
 }
 
 func deterministicOrdering(t *testing.T, factory ClientFactory) {
-	lifecycle := openLifecycle(t, factory)
+	lifecycle := openLifecycle(t, factory, standardControls())
 	ctx := context.Background()
 	for _, name := range []string{"charlie", "alpha", "bravo"} {
 		if _, err := lifecycle.Client.Ingest(ctx, explorer.Source{
@@ -397,7 +418,7 @@ func deterministicOrdering(t *testing.T, factory ClientFactory) {
 }
 
 func opaqueValues(t *testing.T, factory ClientFactory) {
-	lifecycle := openLifecycle(t, factory)
+	lifecycle := openLifecycle(t, factory, standardControls())
 	ctx := context.Background()
 	metadata := shoal.Metadata{
 		string([]byte{'k', 0, 0xff}): string([]byte{0xfd, 0, 'v'}),
@@ -457,7 +478,7 @@ func opaqueValues(t *testing.T, factory ClientFactory) {
 }
 
 func normalizationAndErrors(t *testing.T, factory ClientFactory) {
-	lifecycle := openLifecycle(t, factory)
+	lifecycle := openLifecycle(t, factory, standardControls())
 	ctx := context.Background()
 	ingested, err := lifecycle.Client.Ingest(ctx, explorer.Source{
 		URI: "file:///normalization.txt", MediaType: explorer.MediaTypeText,
@@ -574,7 +595,7 @@ func normalizationAndErrors(t *testing.T, factory ClientFactory) {
 }
 
 func unsupportedRetrieval(t *testing.T, factory ClientFactory) {
-	lifecycle := openLifecycle(t, factory)
+	lifecycle := openLifecycle(t, factory, standardControls())
 	ctx := context.Background()
 	if _, err := lifecycle.Client.Retrieve(ctx, retrieval.Request{
 		Text: "query", Modes: []retrieval.Mode{retrieval.ModeVector},
@@ -599,7 +620,7 @@ func unsupportedRetrieval(t *testing.T, factory ClientFactory) {
 }
 
 func restart(t *testing.T, factory ClientFactory) {
-	lifecycle := openLifecycle(t, factory)
+	lifecycle := openLifecycle(t, factory, standardControls())
 	ctx := context.Background()
 	source := explorer.Source{
 		URI: "file:///restart.txt", MediaType: explorer.MediaTypeText,
@@ -669,14 +690,21 @@ func restart(t *testing.T, factory ClientFactory) {
 	}
 }
 
-func openLifecycle(t *testing.T, factory ClientFactory) *Lifecycle {
+func openLifecycle(
+	t *testing.T, factory ClientFactory, controls FixtureControls,
+) *Lifecycle {
 	t.Helper()
-	lifecycle, err := factory(t)
+	normalized, err := controls.Normalize()
+	if err != nil {
+		t.Fatalf("normalize Explorer fixture controls: %v", err)
+	}
+	lifecycle, err := factory(t, normalized)
 	if err != nil {
 		t.Fatalf("open Explorer client: %v", err)
 	}
-	if lifecycle.Client == nil || lifecycle.Restart == nil || lifecycle.Close == nil {
-		t.Fatal("Explorer lifecycle requires client, restart, and close hooks")
+	if lifecycle.Client == nil || lifecycle.IngestAt == nil ||
+		lifecycle.Restart == nil || lifecycle.Close == nil {
+		t.Fatal("Explorer lifecycle requires client, exact-time ingest, restart, and close hooks")
 	}
 	t.Cleanup(func() {
 		if err := lifecycle.Close(); err != nil {
@@ -684,6 +712,23 @@ func openLifecycle(t *testing.T, factory ClientFactory) *Lifecycle {
 		}
 	})
 	return &lifecycle
+}
+
+func standardControls() FixtureControls {
+	return FixtureControls{
+		Clock: FakeClock{Instants: []time.Time{
+			time.Date(
+				2026, time.August, 26, 12, 0, 0, 0,
+				time.FixedZone("fixture", -4*60*60),
+			),
+		}},
+		Authorities: WriterAuthorityHistory{{
+			Generation: 1,
+			Mode:       WriterAuthorityEmbeddedPrimary,
+			Holder:     "embedded-fixture",
+			Fence:      1,
+		}},
+	}
 }
 
 func restartLifecycle(t *testing.T, lifecycle *Lifecycle) {
