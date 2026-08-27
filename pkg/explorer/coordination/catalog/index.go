@@ -228,11 +228,17 @@ func (c *Client) SealIndexGeneration(
 	var digestPartsInput [][]byte
 	digestPartsInput = append(digestPartsInput, []byte("index-delta-set-v1"))
 	for _, delta := range deltas {
-		if delta.Epoch <= sealed.BuildThrough || delta.Epoch > sealed.DeltaThrough {
+		if delta.Epoch <= build.Manifest.SourceEpoch || delta.Epoch > sealed.DeltaThrough {
 			return IndexBuild{}, ErrCorruption
 		}
 		if delta.ManifestDigest != build.Manifest.ManifestDigest || delta.State != coordination.LifecycleVerified {
 			return IndexBuild{}, ErrCorruption
+		}
+		if err := c.indexVerifier.VerifyDelta(ctx, c.domain, delta, authority); err != nil {
+			return IndexBuild{}, classifyVerifier(err)
+		}
+		if delta.Epoch <= sealed.BuildThrough {
+			continue
 		}
 		key := outcomeKey(delta.Epoch, delta.TXN)
 		if _, exists := seen[key]; exists {
@@ -353,7 +359,13 @@ func (c *Client) LookupIndexGeneration(
 	if err != nil {
 		return IndexPin{}, err
 	}
-	cells, err := c.store.ScanPrefix(ctx, prefix, familyActivation, qualifierActive, c.visibility, c.maxScan)
+	start, err := coordination.IndexActivationSeek(c.domain, family, snapshot)
+	if err != nil {
+		return IndexPin{}, err
+	}
+	cells, err := c.store.ScanPrefixFrom(
+		ctx, prefix, start, familyActivation, qualifierActive, c.visibility, c.maxScan,
+	)
 	if err != nil {
 		return IndexPin{}, classifyUnavailable(err)
 	}
@@ -369,7 +381,7 @@ func (c *Client) LookupIndexGeneration(
 			return IndexPin{}, ErrCorruption
 		}
 		if key.ActivationEpoch > snapshot {
-			continue
+			return IndexPin{}, ErrCorruption
 		}
 		if observedEpoch == 0 {
 			observedEpoch = key.ActivationEpoch

@@ -82,6 +82,14 @@ func (s *memoryStore) ScanPrefix(
 	prefix, family, qualifier, visibility []byte,
 	limit int,
 ) ([]allocator.Cell, error) {
+	return s.ScanPrefixFrom(context.Background(), prefix, prefix, family, qualifier, visibility, limit)
+}
+
+func (s *memoryStore) ScanPrefixFrom(
+	_ context.Context,
+	prefix, start, family, qualifier, visibility []byte,
+	limit int,
+) ([]allocator.Cell, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	result := make([]allocator.Cell, 0, limit)
@@ -91,6 +99,7 @@ func (s *memoryStore) ScanPrefix(
 		}
 		value := values[len(values)-1]
 		if bytes.HasPrefix(value.Coordinate.Row, prefix) &&
+			bytes.Compare(value.Coordinate.Row, start) >= 0 &&
 			bytes.Equal(value.Coordinate.Family, family) &&
 			bytes.Equal(value.Coordinate.Qualifier, qualifier) &&
 			bytes.Equal(value.Coordinate.Visibility, visibility) {
@@ -114,6 +123,7 @@ func (s *memoryStore) CompareAndMutate(_ context.Context, mutation allocator.Mut
 	if currentFault == faultUnknownBefore {
 		return allocator.StatusUnknown, allocator.ErrConditionalUnknown
 	}
+
 	for _, condition := range mutation.Conditions {
 		current, found := s.latest(condition.Coordinate)
 		if condition.Absent {
@@ -142,6 +152,13 @@ func (s *memoryStore) CompareAndMutate(_ context.Context, mutation allocator.Mut
 		return allocator.StatusUnknown, allocator.ErrConditionalUnknown
 	}
 	return allocator.StatusAccepted, nil
+}
+
+func (s *memoryStore) put(cell allocator.Cell) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	key := coordinateKey(cell.Coordinate)
+	s.versions[key] = append(s.versions[key], cloneCell(cell))
 }
 
 type fixtures struct {
@@ -465,6 +482,21 @@ func TestIndexLifecycleGapSealActivationAndRetirement(t *testing.T) {
 	if err := client.PublishIndexActivation(context.Background(), contradictoryActivation); !errors.Is(err, ErrCorruption) {
 		t.Fatalf("activation contradiction error = %v", err)
 	}
+	for epoch := coordination.Epoch(14); epoch < 20; epoch++ {
+		newer := activation
+		newer.ActivationEpoch = epoch
+		newer.TXN = coordination.TXN([]byte{byte(epoch)})
+		data, encodeErr := coordination.MarshalIndexActivationV2(newer)
+		if encodeErr != nil {
+			t.Fatal(encodeErr)
+		}
+		row, _ := coordination.IndexActivationRow(client.domain, newer.Family, newer.ActivationEpoch, newer.IGEN)
+		store.put(allocator.Cell{
+			Coordinate: client.coordinate(row, familyActivation, qualifierActive),
+			Value:      data, Timestamp: int64(epoch),
+		})
+	}
+	client.maxScan = 2
 	pin, err := client.LookupIndexGeneration(context.Background(), []byte("lexical"), 13)
 	if err != nil || !bytes.Equal(pin.Manifest.IGEN, igen) || pin.PinDigest == (coordination.Digest{}) {
 		t.Fatalf("lookup: %#v, %v", pin, err)
@@ -500,9 +532,95 @@ func TestAppendOnlyContradictions(t *testing.T) {
 	if err := client.PublishPolicyMapping(context.Background(), fence, set, mapping); err != nil {
 		t.Fatal(err)
 	}
+	for generation := coordination.Generation(2); generation < 8; generation++ {
+		newer := mapping
+		newer.MapGeneration = generation
+		data, encodeErr := coordination.MarshalPolicyCopyMapV3(newer)
+		if encodeErr != nil {
+			t.Fatal(encodeErr)
+		}
+		row, _ := coordination.PolicyCopyMapRow(client.domain, newer.LPART, generation, newer.VisibilityDigest)
+		store.put(allocator.Cell{
+			Coordinate: client.coordinate(row, familyMap, qualifierActive),
+			Value:      data, Timestamp: int64(generation),
+		})
+	}
+	client.maxScan = 2
+	if pin, err := client.LookupPolicyCopy(context.Background(), []byte("lpart"), 1); err != nil ||
+		pin.Map.MapGeneration != 1 {
+		t.Fatalf("deep policy lookup = %#v, %v", pin, err)
+	}
 	contradiction := mapping
 	contradiction.ActivationRef = []byte("other")
 	if err := client.PublishPolicyMapping(context.Background(), fence, set, contradiction); !errors.Is(err, ErrCorruption) {
 		t.Fatalf("mapping contradiction error = %v", err)
+	}
+}
+
+func TestIndexSealFoldsPreBuildDeltasIntoBase(t *testing.T) {
+	now := time.Date(2026, 8, 27, 12, 0, 0, 0, time.UTC)
+	store := newMemoryStore()
+	fixture := &fixtures{
+		authority: Authority{Generation: 3, RetentionGeneration: 4, HistoryFloor: 5},
+		status:    OperationTerminal,
+	}
+	client := newTestClient(t, store, fixture, &now)
+	igen, err := client.ReserveIndexGeneration(context.Background(), []byte("tree"), []byte("reserve-tree"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	buildManifest := makeGeneration(t, []byte("tree"), igen, 10, digest("empty"), coordination.IndexGenerationBuilding)
+	build, err := client.CreateIndexGeneration(context.Background(), IndexBuild{
+		Manifest: buildManifest, Owner: []byte("builder"), OperationID: []byte("tree-build"),
+		Fence: 10, AuthorityGeneration: 3, RetentionGeneration: 4,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	deltas := make([]coordination.IndexDeltaV1, 0, 4)
+	for epoch := coordination.Epoch(11); epoch <= 14; epoch++ {
+		delta := makeDelta(t, build.Manifest, epoch, string([]byte{'t', byte(epoch)}))
+		if err := client.AppendIndexDelta(context.Background(), delta); err != nil {
+			t.Fatal(err)
+		}
+		deltas = append(deltas, delta)
+	}
+	badPreBuild, err := coordination.NewIndexDeltaV1(
+		build.Manifest.Family, build.Manifest.IGEN, 11, deltas[0].TXN, digest("wrong-manifest"),
+		deltas[0].Entries, coordination.LifecycleVerified,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	badBytes, _ := coordination.MarshalIndexDeltaV1(badPreBuild)
+	badRow, _ := coordination.IndexDeltaRow(
+		client.domain, badPreBuild.Family, badPreBuild.IGEN, badPreBuild.Epoch, badPreBuild.TXN,
+	)
+	badCoordinate := client.coordinate(badRow, familyDelta, qualifierDelta)
+	store.put(allocator.Cell{Coordinate: badCoordinate, Value: badBytes, Timestamp: 11})
+	postBuild13, _ := coordination.MarshalIndexDeltaV1(deltas[2])
+	postBuild14, _ := coordination.MarshalIndexDeltaV1(deltas[3])
+	deltaDigest := digestParts([]byte("index-delta-set-v1"), postBuild13, postBuild14)
+	sealed := makeGeneration(t, []byte("tree"), igen, 14, deltaDigest, coordination.IndexGenerationSealed)
+	sealed.BuildThrough = 12
+	sealed, err = coordination.NewIndexGenerationV2(sealed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.outcomes = []CommittedOutcome{
+		{Epoch: 13, TXN: deltas[2].TXN},
+		{Epoch: 14, TXN: deltas[3].TXN},
+	}
+	if _, err := client.SealIndexGeneration(
+		context.Background(), []byte("builder"), []byte("tree-build"), 10, sealed,
+	); !errors.Is(err, ErrCorruption) {
+		t.Fatalf("malformed pre-build delta error = %v", err)
+	}
+	goodBytes, _ := coordination.MarshalIndexDeltaV1(deltas[0])
+	store.put(allocator.Cell{Coordinate: badCoordinate, Value: goodBytes, Timestamp: 11})
+	if _, err := client.SealIndexGeneration(
+		context.Background(), []byte("builder"), []byte("tree-build"), 10, sealed,
+	); err != nil {
+		t.Fatalf("seal with pre-build deltas: %v", err)
 	}
 }

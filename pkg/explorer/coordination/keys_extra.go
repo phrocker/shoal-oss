@@ -118,6 +118,17 @@ func PolicyCopyMapPrefix(domain DomainID, lpart LPART) ([]byte, error) {
 	return append(row, E(lpart)...), nil
 }
 
+func PolicyCopyMapSeek(domain DomainID, lpart LPART, generation Generation) ([]byte, error) {
+	if err := generation.Validate(); err != nil {
+		return nil, err
+	}
+	prefix, err := PolicyCopyMapPrefix(domain, lpart)
+	if err != nil {
+		return nil, err
+	}
+	return append(prefix, INV64(uint64(generation))...), nil
+}
+
 func PolicyCopyRow(domain DomainID, lpart LPART, generation Generation, visibility Digest) ([]byte, error) {
 	if err := validatePolicyKey(domain, lpart, generation, visibility); err != nil {
 		return nil, err
@@ -379,6 +390,17 @@ func IndexActivationPrefix(domain DomainID, family Family) ([]byte, error) {
 	row := rowPrefix(RowKind('A'), B8('G', domain, family))
 	row = append(row, E(domain)...)
 	return append(row, E(family)...), nil
+}
+
+func IndexActivationSeek(domain DomainID, family Family, epoch Epoch) ([]byte, error) {
+	if err := epoch.Validate(); err != nil {
+		return nil, err
+	}
+	prefix, err := IndexActivationPrefix(domain, family)
+	if err != nil {
+		return nil, err
+	}
+	return append(prefix, INV64(uint64(epoch))...), nil
 }
 
 func ParseIndexActivationRow(row []byte) (IndexActivationKey, error) {

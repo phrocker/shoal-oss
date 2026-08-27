@@ -70,14 +70,23 @@ func (s *AccumuloStore) ScanPrefix(
 	rowPrefix, family, qualifier, visibility []byte,
 	limit int,
 ) ([]allocator.Cell, error) {
-	if len(rowPrefix) == 0 || limit < 1 || limit > MaxCatalogScan {
+	return s.ScanPrefixFrom(ctx, rowPrefix, rowPrefix, family, qualifier, visibility, limit)
+}
+
+func (s *AccumuloStore) ScanPrefixFrom(
+	ctx context.Context,
+	rowPrefix, startRow, family, qualifier, visibility []byte,
+	limit int,
+) ([]allocator.Cell, error) {
+	if len(rowPrefix) == 0 || !bytes.HasPrefix(startRow, rowPrefix) ||
+		bytes.Compare(startRow, rowPrefix) < 0 || limit < 1 || limit > MaxCatalogScan {
 		return nil, ErrBounds
 	}
 	endRow, ok := prefixSuccessor(rowPrefix)
 	if !ok {
 		return nil, ErrBounds
 	}
-	start := &accumulo.Key{Row: append([]byte(nil), rowPrefix...), Timestamp: math.MaxInt64}
+	start := &accumulo.Key{Row: append([]byte(nil), startRow...), Timestamp: math.MaxInt64}
 	end := &accumulo.Key{Row: endRow, Timestamp: math.MaxInt64}
 	scanRange, err := accumulo.NewKeyRange(start, true, end, false)
 	if err != nil {

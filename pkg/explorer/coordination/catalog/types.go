@@ -48,6 +48,7 @@ var (
 type Store interface {
 	ReadExact(context.Context, []allocator.Coordinate) ([]allocator.Cell, error)
 	ScanPrefix(context.Context, []byte, []byte, []byte, []byte, int) ([]allocator.Cell, error)
+	ScanPrefixFrom(context.Context, []byte, []byte, []byte, []byte, []byte, int) ([]allocator.Cell, error)
 	CompareAndMutate(context.Context, allocator.Mutation) (allocator.Status, error)
 }
 

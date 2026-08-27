@@ -464,7 +464,13 @@ func (c *Client) LookupPolicyCopy(ctx context.Context, lpart coordination.LPART,
 	if err != nil {
 		return PolicyPin{}, err
 	}
-	cells, err := c.store.ScanPrefix(ctx, prefix, familyMap, qualifierActive, c.visibility, c.maxScan)
+	start, err := coordination.PolicyCopyMapSeek(c.domain, lpart, policyGeneration)
+	if err != nil {
+		return PolicyPin{}, err
+	}
+	cells, err := c.store.ScanPrefixFrom(
+		ctx, prefix, start, familyMap, qualifierActive, c.visibility, c.maxScan,
+	)
 	if err != nil {
 		return PolicyPin{}, classifyUnavailable(err)
 	}
@@ -480,7 +486,7 @@ func (c *Client) LookupPolicyCopy(ctx context.Context, lpart coordination.LPART,
 			return PolicyPin{}, ErrCorruption
 		}
 		if key.Generation > policyGeneration {
-			continue
+			return PolicyPin{}, ErrCorruption
 		}
 		if observedGeneration == 0 {
 			observedGeneration = key.Generation

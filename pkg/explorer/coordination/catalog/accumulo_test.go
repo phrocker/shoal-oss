@@ -19,6 +19,7 @@ import (
 	"testing"
 
 	"github.com/phrocker/shoal-oss/accumulo"
+	"github.com/phrocker/shoal-oss/pkg/explorer/coordination"
 )
 
 type recordingScanner struct {
@@ -45,6 +46,7 @@ func TestAccumuloPrefixScanUsesExactExclusiveSuccessor(t *testing.T) {
 	if !errors.Is(err, sentinel) {
 		t.Fatalf("scan error = %v", err)
 	}
+
 	if scanner.scanRange == nil {
 		t.Fatal("scanner did not receive a range")
 	}
@@ -53,6 +55,47 @@ func TestAccumuloPrefixScanUsesExactExclusiveSuccessor(t *testing.T) {
 	}
 	if !bytes.Equal(scanner.scanRange.EndRow(), []byte{1, 3}) {
 		t.Fatalf("end row = %x, want 0103", scanner.scanRange.EndRow())
+	}
+}
+
+func TestAccumuloPrefixSeekUsesTrustedStartAndPrefixEnd(t *testing.T) {
+	policyPrefix, _ := coordination.PolicyCopyMapPrefix([]byte("domain"), []byte("part"))
+	policyStart, _ := coordination.PolicyCopyMapSeek([]byte("domain"), []byte("part"), 17)
+	indexPrefix, _ := coordination.IndexActivationPrefix([]byte("domain"), []byte("lexical"))
+	indexStart, _ := coordination.IndexActivationSeek([]byte("domain"), []byte("lexical"), 23)
+	for name, test := range map[string]struct {
+		prefix []byte
+		start  []byte
+	}{
+		"policy": {prefix: policyPrefix, start: policyStart},
+		"index":  {prefix: indexPrefix, start: indexStart},
+	} {
+		t.Run(name, func(t *testing.T) {
+			sentinel := errors.New("stop after mapping")
+			scanner := &recordingScanner{err: sentinel}
+			store := &AccumuloStore{scanner: scanner}
+			_, err := store.ScanPrefixFrom(
+				context.Background(), test.prefix, test.start,
+				[]byte("m"), []byte("active"), []byte("svc"), 4,
+			)
+			if !errors.Is(err, sentinel) {
+				t.Fatalf("scan error = %v", err)
+			}
+			if !bytes.Equal(scanner.scanRange.StartRow(), test.start) {
+				t.Fatalf("start row = %x, want %x", scanner.scanRange.StartRow(), test.start)
+			}
+			end, _ := prefixSuccessor(test.prefix)
+			if !bytes.Equal(scanner.scanRange.EndRow(), end) {
+				t.Fatalf("end row = %x, want %x", scanner.scanRange.EndRow(), end)
+			}
+		})
+	}
+	store := &AccumuloStore{}
+	if _, err := store.ScanPrefixFrom(
+		context.Background(), policyPrefix, indexStart,
+		[]byte("m"), []byte("active"), []byte("svc"), 4,
+	); !errors.Is(err, ErrBounds) {
+		t.Fatalf("out-of-prefix start error = %v", err)
 	}
 }
 

@@ -96,9 +96,17 @@ func TestM3RowOrderingAndSharedAllocatorRows(t *testing.T) {
 	if !bytes.HasPrefix(newMap, mapPrefix) {
 		t.Fatal("policy map prefix does not cover mapping rows")
 	}
+	mapSeek, _ := PolicyCopyMapSeek(domain, LPART("part"), 8)
+	if !bytes.HasPrefix(newMap, mapSeek) || bytes.Compare(oldMap, mapSeek) < 0 {
+		t.Fatal("policy map seek does not begin at the requested inverse generation")
+	}
 	activationPrefix, _ := IndexActivationPrefix(domain, Family("lexical"))
 	if !bytes.HasPrefix(newActivation, activationPrefix) {
 		t.Fatal("index activation prefix does not cover activation rows")
+	}
+	activationSeek, _ := IndexActivationSeek(domain, Family("lexical"), 11)
+	if !bytes.HasPrefix(newActivation, activationSeek) || bytes.Compare(oldActivation, activationSeek) < 0 {
+		t.Fatal("index activation seek does not begin at the requested inverse epoch")
 	}
 	delta, _ := IndexDeltaRow(domain, Family("lexical"), IGEN("g1"), 10, TXN("txn"))
 	deltaPrefix, _ := IndexDeltaPrefix(domain, Family("lexical"), IGEN("g1"))
