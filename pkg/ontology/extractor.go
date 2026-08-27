@@ -528,15 +528,15 @@ func (r ExtractionResult) ValidateFor(request ExtractionRequest) error {
 			if propertyOwners[property] == nil {
 				propertyOwners[property] = make(map[shoal.ID]struct{})
 			}
-			for _, property := range request.version.properties {
-				for _, constraint := range property.constraints {
-					if constraint.Kind() == ConstraintPattern {
-						pattern, _ := constraint.Pattern()
-						propertyPatterns[property.ID()] = regexp.MustCompile(pattern)
-					}
-				}
-			}
 			propertyOwners[property][relationship.ID()] = struct{}{}
+		}
+	}
+	for _, property := range request.version.properties {
+		for _, constraint := range property.constraints {
+			if constraint.Kind() == ConstraintPattern {
+				pattern, _ := constraint.Pattern()
+				propertyPatterns[property.ID()] = regexp.MustCompile(pattern)
+			}
 		}
 	}
 	type assertionGroup struct {
@@ -545,12 +545,22 @@ func (r ExtractionResult) ValidateFor(request ExtractionRequest) error {
 	}
 	counts := make(map[assertionGroup]uint32)
 	subjects := make(map[shoal.ID]struct{})
+	subjectTypes := make(map[shoal.ID]shoal.ID)
+	subjectTypeCounts := make(map[shoal.ID]uint32)
 	uniqueValues := make(map[string]struct{})
 	for _, assertion := range r.assertions {
 		subjects[assertion.Subject()] = struct{}{}
 		subjectType, present := assertion.SubjectType()
 		if !present {
 			return invalid("assertion subject type is required")
+		}
+		if existing, exists := subjectTypes[assertion.Subject()]; exists {
+			if existing != subjectType {
+				return invalid("assertion subject has inconsistent ontology types")
+			}
+		} else {
+			subjectTypes[assertion.Subject()] = subjectType
+			subjectTypeCounts[subjectType]++
 		}
 		for _, evidence := range assertion.Evidence() {
 			metadata, exists := requestEvidence[evidence.ID()]
@@ -639,17 +649,24 @@ func (r ExtractionResult) ValidateFor(request ExtractionRequest) error {
 		}
 	}
 	for predicate, property := range properties {
+		targetSubjects := uint32(len(subjects))
+		if owners := propertyOwners[predicate]; owners != nil {
+			targetSubjects = 0
+			for owner := range owners {
+				targetSubjects += subjectTypeCounts[owner]
+			}
+		}
 		for _, constraint := range property.constraints {
 			switch constraint.Kind() {
 			case ConstraintRequired:
-				if len(subjects) != 0 &&
-					predicateSubjects[predicate] != uint32(len(subjects)) {
+				if targetSubjects != 0 &&
+					predicateSubjects[predicate] != targetSubjects {
 					return invalid("required property assertion is missing")
 				}
 			case ConstraintMinimumCount:
 				minimum, _ := constraint.Count()
-				if len(subjects) != 0 &&
-					(predicateSubjects[predicate] != uint32(len(subjects)) ||
+				if targetSubjects != 0 &&
+					(predicateSubjects[predicate] != targetSubjects ||
 						predicateMinimums[predicate] < minimum) {
 					return invalid("assertion count is below property minimum")
 				}
