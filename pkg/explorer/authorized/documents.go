@@ -99,21 +99,14 @@ func (c *Client) Document(
 		return explorer.DocumentView{}, err
 	}
 
-	var (
-		view         explorer.DocumentView
-		registration RevisionRegistration
-		ok           bool
-	)
+	var registration RevisionRegistration
+	var ok bool
 	if revisionID == "" {
-		view, err = c.base.Document(ctx, documentID, "")
-		if err != nil {
-			return explorer.DocumentView{}, directBaseError(err)
-		}
 		registration, ok, err = c.policyStore.CurrentRevision(ctx, documentID)
 		if err != nil {
 			return explorer.DocumentView{}, policyCatalogReadError(ctx, err)
 		}
-		if !ok || registration.RevisionID != view.Revision.ID {
+		if !ok {
 			return explorer.DocumentView{}, auth.ObjectNotFound()
 		}
 	} else {
@@ -125,18 +118,6 @@ func (c *Client) Document(
 		if !ok {
 			return explorer.DocumentView{}, auth.ObjectNotFound()
 		}
-		allowed, ruleErr := ruleAllows(
-			registration.Rule, decision, auth.OperationRead, now)
-		if ruleErr != nil {
-			return explorer.DocumentView{}, ruleErr
-		}
-		if !allowed {
-			return explorer.DocumentView{}, auth.ObjectNotFound()
-		}
-		view, err = c.base.Document(ctx, documentID, revisionID)
-		if err != nil {
-			return explorer.DocumentView{}, directBaseError(err)
-		}
 	}
 	allowed, err := ruleAllows(
 		registration.Rule, decision, auth.OperationRead, now)
@@ -145,6 +126,10 @@ func (c *Client) Document(
 	}
 	if !allowed {
 		return explorer.DocumentView{}, auth.ObjectNotFound()
+	}
+	view, err := c.base.Document(ctx, documentID, registration.RevisionID)
+	if err != nil {
+		return explorer.DocumentView{}, directBaseError(err)
 	}
 	if view.Document.ID != documentID ||
 		view.Document.RevisionID != registration.RevisionID ||

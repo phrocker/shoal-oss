@@ -376,6 +376,36 @@ func TestAuthorizedVisibilityAndRetrievalProjection(t *testing.T) {
 	}
 }
 
+func TestHiddenCurrentDocumentIsAuthorizedBeforeBaseRead(t *testing.T) {
+	f := newFixture(t)
+	hidden, err := f.clientB.Ingest(f.admin(t), explorer.Source{
+		URI: "file:///hidden-current.txt", MediaType: explorer.MediaTypeText,
+		Content: "hidden current content",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	documentCalls := 0
+	hooked := &hookClient{
+		Client: f.base,
+		document: func(
+			context.Context, shoal.ID, shoal.ID,
+		) (explorer.DocumentView, error) {
+			documentCalls++
+			return explorer.DocumentView{}, shoal.NewError(
+				shoal.ErrorUnavailable, "backend detail")
+		},
+	}
+	client := f.newClient(t, hooked, f.store, f.sourceA, f.policyA, nil)
+	_, err = client.Document(f.alice(t), hidden.Document.ID, "")
+	if !shoal.IsErrorCode(err, shoal.ErrorNotFound) {
+		t.Fatalf("hidden current document error = %v", err)
+	}
+	if documentCalls != 0 {
+		t.Fatalf("hidden current document reached base %d times", documentCalls)
+	}
+}
+
 func TestResolverExpiryOperationAndSelectorFailures(t *testing.T) {
 	f := newFixture(t)
 	if _, err := f.clientA.Documents(context.Background()); !shoal.IsErrorCode(
