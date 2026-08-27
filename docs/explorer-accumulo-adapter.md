@@ -1696,6 +1696,17 @@ After the agreed rollback window:
 | M8 — Canary and cutover | M7 | Generation-bound routing, reverse replication, fenced cutover/rollback, SLO gates | Exactly one writer authority throughout; all promotion gates green through rollback window |
 | M9 — Vector evaluation (**deferred**) | M0, M6–M8 plus separate vector contract | Accumulo-native exact/ANN prototype and conformance/recall/security suite | Explicit accuracy/freshness semantics, no unauthorized displacement, and operational approval |
 
+The M3 control slice is implemented in
+`pkg/explorer/coordination/control`: authoritative snapshot leases, atomic
+allocator-row history-floor/head updates, retirement decisions, durable
+writer authority synchronized with the allocator head, backend observations,
+and a fail-closed routing/cutover barrier. The package uses injected exact
+read/prefix-scan/row-CAS, UTC clocks, pin/object/migration verifiers, and an
+optional trusted exact deleter. Catalog and entity-guard adapters consume the
+agreed durable state; allocator's Accumulo store provides matching bounded
+prefix/seek scans. Physical object deletion, background scheduling/status
+indexes, and live-cluster fault tests remain later integration work.
+
 M1 now has concrete package surfaces in `pkg/explorer/canonical`,
 `pkg/explorer/codematerializer`, `pkg/retrieval/ranking.go`, and
 `internal/explorerconformance`. The embedded reference runs the harness with

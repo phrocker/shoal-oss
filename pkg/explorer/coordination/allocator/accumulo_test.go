@@ -49,9 +49,35 @@ func TestAccumuloStoreExactReadUsesTrustedCoordinates(t *testing.T) {
 		!bytes.Equal(cells[0].Value, []byte("head-value")) || cells[0].Timestamp != 7 {
 		t.Fatalf("ReadExact = %#v, %v", cells, err)
 	}
+
 	if len(scanner.ranges) != 1 || !bytes.Equal(scanner.ranges[0].StartRow(), row) ||
 		!bytes.Equal(scanner.ranges[0].EndRow(), row) {
 		t.Fatalf("exact row range = %#v", scanner.ranges)
+	}
+}
+
+func TestAccumuloStorePrefixSeekUsesExactColumnAndBoundedRange(t *testing.T) {
+	prefix := []byte{1, 'L', 7, 6, 'd', 'o', 'm', 'a', 'i', 'n'}
+	start := append(append([]byte(nil), prefix...), 'b')
+	visibility := []byte("CONTROL")
+	scanner := &fakeAccumuloScanner{values: []accumulo.KeyValue{
+		{Key: accumulo.Key{Row: append(append([]byte(nil), prefix...), 'b'), ColumnFamily: []byte("l"), ColumnQualifier: []byte("lease"), ColumnVisibility: visibility, Timestamp: 2}, Value: []byte("b")},
+		{Key: accumulo.Key{Row: append(append([]byte(nil), prefix...), 'b'), ColumnFamily: []byte("l"), ColumnQualifier: []byte("lease"), ColumnVisibility: visibility, Timestamp: 1}, Value: []byte("shadowed")},
+		{Key: accumulo.Key{Row: append(append([]byte(nil), prefix...), 'c'), ColumnFamily: []byte("x"), ColumnQualifier: []byte("lease"), ColumnVisibility: visibility, Timestamp: 3}, Value: []byte("wrong-column")},
+		{Key: accumulo.Key{Row: append(append([]byte(nil), prefix...), 'd'), ColumnFamily: []byte("l"), ColumnQualifier: []byte("lease"), ColumnVisibility: visibility, Timestamp: 4}, Value: []byte("d")},
+	}}
+	store := &AccumuloStore{scanner: scanner}
+	cells, err := store.ScanPrefixFrom(context.Background(), prefix, start, []byte("l"), []byte("lease"), visibility, 3)
+	if err != nil || len(cells) != 2 || string(cells[0].Value) != "b" || string(cells[1].Value) != "d" {
+		t.Fatalf("ScanPrefixFrom = %#v, %v", cells, err)
+	}
+	if len(scanner.ranges) != 1 || !bytes.Equal(scanner.ranges[0].StartRow(), start) {
+		t.Fatalf("prefix start range = %#v", scanner.ranges)
+	}
+	wantEnd := append([]byte(nil), prefix...)
+	wantEnd[len(wantEnd)-1]++
+	if !bytes.Equal(scanner.ranges[0].EndRow(), wantEnd) {
+		t.Fatalf("prefix end = %x, want %x", scanner.ranges[0].EndRow(), wantEnd)
 	}
 }
 

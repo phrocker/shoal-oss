@@ -163,6 +163,7 @@ func (s *AccumuloStore) ScanRowPrefix(
 	if limit < 1 || limit > coordinationReadBound {
 		return nil, errors.New("allocator: scan limit is outside its bound")
 	}
+
 	start := &accumulo.Key{
 		Row: row, ColumnFamily: family, ColumnQualifier: qualifierStart,
 		ColumnVisibility: visibility, Timestamp: math.MaxInt64,
@@ -209,6 +210,96 @@ func (s *AccumuloStore) ScanRowPrefix(
 		}
 	}
 	return result, nil
+}
+
+// ScanPrefix reads newest cells at one exact column across a bounded row
+// prefix. It is used by coordination records whose authoritative rows are
+// intentionally distributed by a hash band.
+func (s *AccumuloStore) ScanPrefix(
+	ctx context.Context,
+	rowPrefix, family, qualifier, visibility []byte,
+	limit int,
+) ([]Cell, error) {
+	return s.ScanPrefixFrom(ctx, rowPrefix, rowPrefix, family, qualifier, visibility, limit)
+}
+
+// ScanPrefixFrom is ScanPrefix with an inclusive row seek.
+func (s *AccumuloStore) ScanPrefixFrom(
+	ctx context.Context,
+	rowPrefix, startRow, family, qualifier, visibility []byte,
+	limit int,
+) ([]Cell, error) {
+	if len(rowPrefix) == 0 || !bytes.HasPrefix(startRow, rowPrefix) ||
+		bytes.Compare(startRow, rowPrefix) < 0 || limit < 1 || limit > coordinationReadBound {
+		return nil, errors.New("allocator: prefix scan arguments are outside their bound")
+	}
+	endRow, ok := prefixSuccessor(rowPrefix)
+	if !ok {
+		return nil, errors.New("allocator: row prefix has no bounded successor")
+	}
+	start := &accumulo.Key{Row: append([]byte(nil), startRow...), Timestamp: math.MaxInt64}
+	end := &accumulo.Key{Row: endRow, Timestamp: math.MaxInt64}
+	scanRange, err := accumulo.NewKeyRange(start, true, end, false)
+	if err != nil {
+		return nil, err
+	}
+	scanner, err := s.newScanner([]accumulo.Column{
+		accumulo.NewColumnWithVisibility(family, qualifier, visibility),
+	})
+	if err != nil {
+		return nil, err
+	}
+	values, err := scanBounded(ctx, scanner, scanRange, limit)
+	if err != nil {
+		var cleanup *accumulo.CleanupError
+		if !errors.As(err, &cleanup) {
+			return nil, err
+		}
+	}
+	selected := make(map[string]Cell)
+	for _, value := range values {
+		if !bytes.HasPrefix(value.Key.Row, rowPrefix) ||
+			!bytes.Equal(value.Key.ColumnFamily, family) ||
+			!bytes.Equal(value.Key.ColumnQualifier, qualifier) ||
+			!bytes.Equal(value.Key.ColumnVisibility, visibility) {
+			continue
+		}
+		cell := Cell{
+			Coordinate: Coordinate{
+				Row: append([]byte(nil), value.Key.Row...), Family: append([]byte(nil), value.Key.ColumnFamily...),
+				Qualifier:  append([]byte(nil), value.Key.ColumnQualifier...),
+				Visibility: append([]byte(nil), value.Key.ColumnVisibility...),
+			},
+			Value: append([]byte(nil), value.Value...), Timestamp: value.Key.Timestamp,
+		}
+		key := string(cell.Coordinate.Row) + "\x00" + string(cell.Coordinate.Family) + "\x00" +
+			string(cell.Coordinate.Qualifier) + "\x00" + string(cell.Coordinate.Visibility)
+		previous, found := selected[key]
+		if !found || cell.Timestamp > previous.Timestamp {
+			selected[key] = cell
+		} else if cell.Timestamp == previous.Timestamp && !bytes.Equal(cell.Value, previous.Value) {
+			return nil, errors.New("allocator: conflicting values at one prefix-scan timestamp")
+		}
+	}
+	result := make([]Cell, 0, len(selected))
+	for _, cell := range selected {
+		result = append(result, cell)
+	}
+	sort.Slice(result, func(i, j int) bool {
+		return bytes.Compare(result[i].Coordinate.Row, result[j].Coordinate.Row) < 0
+	})
+	return result, err
+}
+
+func prefixSuccessor(value []byte) ([]byte, bool) {
+	result := append([]byte(nil), value...)
+	for index := len(result) - 1; index >= 0; index-- {
+		if result[index] != 0xff {
+			result[index]++
+			return result[:index+1], true
+		}
+	}
+	return nil, false
 }
 
 func (s *AccumuloStore) newScanner(columns []accumulo.Column) (accumuloScanner, error) {
