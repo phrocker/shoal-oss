@@ -15,6 +15,7 @@ package catalog
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"sort"
 	"sync"
@@ -34,9 +35,11 @@ const (
 )
 
 type memoryStore struct {
-	mu       sync.Mutex
-	versions map[string][]allocator.Cell
-	fault    fault
+	mu        sync.Mutex
+	versions  map[string][]allocator.Cell
+	fault     fault
+	faultAt   int
+	mutations int
 }
 
 func newMemoryStore() *memoryStore {
@@ -118,8 +121,13 @@ func (s *memoryStore) ScanPrefixFrom(
 func (s *memoryStore) CompareAndMutate(_ context.Context, mutation allocator.Mutation) (allocator.Status, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	currentFault := s.fault
-	s.fault = faultNone
+	s.mutations++
+	currentFault := faultNone
+	if s.fault != faultNone && (s.faultAt == 0 || s.mutations == s.faultAt) {
+		currentFault = s.fault
+		s.fault = faultNone
+		s.faultAt = 0
+	}
 	if currentFault == faultUnknownBefore {
 		return allocator.StatusUnknown, allocator.ErrConditionalUnknown
 	}
@@ -330,6 +338,7 @@ func TestPolicyFenceTakeoverAndGenerationConcurrency(t *testing.T) {
 		authority: Authority{Generation: 3, RetentionGeneration: 4, HistoryFloor: 20},
 		status:    OperationTerminal,
 	}
+
 	client := newTestClient(t, store, fixture, &now)
 	const count = 32
 	values := make(chan coordination.Generation, count)
@@ -377,6 +386,178 @@ func TestPolicyFenceTakeoverAndGenerationConcurrency(t *testing.T) {
 	if _, err := client.AcquirePolicyFence(context.Background(), unknown); !errors.Is(err, ErrUnknown) {
 		t.Fatalf("unknown-before error = %v", err)
 	}
+}
+
+func TestPolicyPublicationAndRetirementMarkers(t *testing.T) {
+	newPolicy := func(t *testing.T) (*memoryStore, *fixtures, *Client, *time.Time, PolicyFence, PolicyManifestSet, coordination.PolicyCopyMapV3) {
+		t.Helper()
+		now := time.Date(2026, 8, 27, 12, 0, 0, 0, time.UTC)
+		store := newMemoryStore()
+		fixture := &fixtures{
+			authority: Authority{Generation: 3, RetentionGeneration: 4, HistoryFloor: 20},
+			status:    OperationTerminal,
+		}
+		client := newTestClient(t, store, fixture, &now)
+		request := fenceRequest(now, 1, "owner", 1)
+		fence, err := client.AcquirePolicyFence(context.Background(), request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		set, err := client.WritePolicyManifest(context.Background(), fence, manifestSet(t, 1))
+		if err != nil {
+			t.Fatal(err)
+		}
+		mapping := coordination.PolicyCopyMapV3{
+			LPART: []byte("lpart"), MapGeneration: 7, CopyGeneration: 1,
+			VisibilityDigest: digest("visibility"), CopyDigest: set.PhysicalDigest,
+			ActivationKind: coordination.ActivationPolicyRoot, ActivationRef: []byte("root"),
+			State: coordination.CopyStateActive,
+		}
+		return store, fixture, client, &now, fence, set, mapping
+	}
+
+	t.Run("unmarked and stale maps remain unselectable", func(t *testing.T) {
+		store, _, client, now, fence, set, mapping := newPolicy(t)
+		encoded, err := coordination.MarshalPolicyCopyMapV3(mapping)
+		if err != nil {
+			t.Fatal(err)
+		}
+		row, _ := coordination.PolicyCopyMapRow(client.domain, mapping.LPART, mapping.MapGeneration, mapping.VisibilityDigest)
+		store.put(allocator.Cell{Coordinate: client.coordinate(row, familyMap, qualifierActive), Value: encoded, Timestamp: int64(mapping.MapGeneration)})
+		if _, err := client.LookupPolicyCopy(context.Background(), mapping.LPART, mapping.MapGeneration); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("unmarked map lookup = %v", err)
+		}
+		store.fault = faultUnknownAfter
+		store.faultAt = store.mutations + 2
+		if err := client.PublishPolicyMapping(context.Background(), fence, set, mapping); err != nil {
+			t.Fatalf("unknown-after marker publication: %v", err)
+		}
+		stale := mapping
+		stale.MapGeneration++
+		stale.ActivationRef = []byte("stale-after-takeover")
+		staleData, _ := coordination.MarshalPolicyCopyMapV3(stale)
+		staleRow, _ := coordination.PolicyCopyMapRow(client.domain, stale.LPART, stale.MapGeneration, stale.VisibilityDigest)
+		store.put(allocator.Cell{Coordinate: client.coordinate(staleRow, familyMap, qualifierActive), Value: staleData, Timestamp: int64(stale.MapGeneration)})
+		*now = fence.Request.LeaseUntil
+		nextRequest := fenceRequest(*now, 1, "next", 2)
+		next, err := client.AcquirePolicyFence(context.Background(), nextRequest)
+		if err != nil {
+			t.Fatalf("takeover: %v", err)
+		}
+		if next.publication == nil || next.publication.Map.MapGeneration != mapping.MapGeneration {
+			t.Fatalf("takeover lost publication marker: %#v", next.publication)
+		}
+		if err := client.PublishPolicyMapping(context.Background(), fence, set, stale); !errors.Is(err, ErrStaleOwner) {
+			t.Fatalf("former owner published after takeover: %v", err)
+		}
+		pin, err := client.LookupPolicyCopy(context.Background(), mapping.LPART, stale.MapGeneration)
+		if err != nil || pin.Map.MapGeneration != mapping.MapGeneration {
+			t.Fatalf("stale map selected: %#v, %v", pin, err)
+		}
+	})
+
+	t.Run("retirement marker survives crash and takeover", func(t *testing.T) {
+		store, fixture, client, now, fence, set, mapping := newPolicy(t)
+		if err := client.PublishPolicyMapping(context.Background(), fence, set, mapping); err != nil {
+			t.Fatal(err)
+		}
+		store.fault = faultUnknownBefore
+		store.faultAt = store.mutations + 2
+		if err := client.RetirePolicyCopy(context.Background(), fence, set, 19); !errors.Is(err, ErrUnknown) {
+			t.Fatalf("crash after marker = %v", err)
+		}
+		if _, err := client.LookupPolicyCopy(context.Background(), mapping.LPART, mapping.MapGeneration); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("committed retirement remained selectable: %v", err)
+		}
+		*now = fence.Request.LeaseUntil
+		nextRequest := fenceRequest(*now, 1, "next", 2)
+		next, err := client.AcquirePolicyFence(context.Background(), nextRequest)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if next.retirement == nil {
+			t.Fatal("takeover lost retirement authorization")
+		}
+		fixture.policyPin = true
+		if err := client.RetirePolicyCopy(context.Background(), next, set, 19); err != nil {
+			t.Fatalf("authorized retirement resume consulted new pins or failed: %v", err)
+		}
+		row, _ := coordination.PolicyCopyRow(client.domain, next.Request.LPART, next.Request.CopyGeneration, next.Request.VisibilityDigest)
+		cell, found, err := client.readOne(context.Background(), client.coordinate(row, familyCopy, qualifierRoot))
+		if err != nil || !found {
+			t.Fatalf("retired root read: %v", err)
+		}
+		root, err := unmarshalPolicyRoot(cell.Value)
+		if err != nil || root.State != coordination.CopyStateRetired {
+			t.Fatalf("root not retired: %#v, %v", root, err)
+		}
+	})
+
+	t.Run("former owner cannot authorize retirement after takeover", func(t *testing.T) {
+		_, _, client, now, fence, set, mapping := newPolicy(t)
+		if err := client.PublishPolicyMapping(context.Background(), fence, set, mapping); err != nil {
+			t.Fatal(err)
+		}
+		*now = fence.Request.LeaseUntil
+		nextRequest := fenceRequest(*now, 1, "next", 2)
+		next, err := client.AcquirePolicyFence(context.Background(), nextRequest)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := client.RetirePolicyCopy(context.Background(), fence, set, 19); !errors.Is(err, ErrStaleOwner) {
+			t.Fatalf("former owner retirement = %v", err)
+		}
+		current, _, _, found, err := client.readFence(context.Background(), next.Request)
+		if err != nil || !found {
+			t.Fatalf("read takeover fence: %v", err)
+		}
+		if current.retirement != nil {
+			t.Fatal("takeover unexpectedly contains retirement marker")
+		}
+		pin, err := client.LookupPolicyCopy(context.Background(), mapping.LPART, mapping.MapGeneration)
+		if err != nil || pin.Map.MapGeneration != mapping.MapGeneration {
+			t.Fatalf("failed retirement changed lookup: %#v, %v", pin, err)
+		}
+	})
+
+	t.Run("marker codec is versioned bounded and canonical", func(t *testing.T) {
+		_, _, _, now, fence, set, mapping := newPolicy(t)
+		mapping.CopyDigest = set.PhysicalDigest
+		mapData, err := coordination.MarshalPolicyCopyMapV3(mapping)
+		if err != nil {
+			t.Fatal(err)
+		}
+		fence.publication = &policyPublicationMarker{Map: mapping, MapDigest: coordination.Sum(mapData)}
+		fence.retirement = &policyRetirementMarker{
+			Through: 19, PublicationDigest: fence.publication.MapDigest,
+			PredecessorRootDigest: digest("root-before"), SuccessorRootDigest: digest("root-after"),
+		}
+		fence.UpdatedAt = *now
+		encoded, err := marshalFence(fence)
+		if err != nil {
+			t.Fatal(err)
+		}
+		decoded, err := unmarshalFence(encoded)
+		if err != nil {
+			t.Fatal(err)
+		}
+		canonical, err := marshalFence(decoded)
+		if err != nil || !bytes.Equal(canonical, encoded) {
+			t.Fatalf("marker codec not canonical: %v", err)
+		}
+		legacy := cloneFence(fence)
+		legacy.publication = nil
+		legacy.retirement = nil
+		legacyData, err := marshalFence(legacy)
+		if err != nil {
+			t.Fatal(err)
+		}
+		encoded[len(legacyData)-sha256.Size] = 2
+		rechecksum(encoded)
+		if _, err := unmarshalFence(encoded); err == nil {
+			t.Fatal("unknown marker extension version accepted")
+		}
+	})
 }
 
 func makeGeneration(t *testing.T, family coordination.Family, igen coordination.IGEN, through coordination.Epoch, delta coordination.Digest, state coordination.IndexGenerationState) coordination.IndexGenerationV2 {

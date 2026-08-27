@@ -438,19 +438,25 @@ func (c *Client) TransitionPrimary(ctx context.Context, request AuthorityRequest
 	if c.route == nil || c.migration == nil {
 		return Authority{}, ErrUnavailable
 	}
+	now, err := requestNow(request.Now, c.now)
+	if err != nil {
+		return Authority{}, err
+	}
+	request.Now = now
 	if err := c.route.Close(ctx, coordination.DomainID(c.domain)); err != nil {
 		return Authority{}, classify(err)
 	}
-	current, _, err := c.CurrentAuthority(ctx, request.Now)
+	current, _, err := c.CurrentAuthority(ctx, now)
 	if err != nil {
 		return Authority{}, err
 	}
 	var target Authority
-	if current.Mode == request.Mode && bytes.Equal(current.Record.Owner, request.Owner) && current.Record.State == coordination.AuthorityActive {
+	if current.Mode == request.Mode && bytes.Equal(current.Record.Owner, request.Owner) &&
+		current.Record.State == coordination.AuthorityActive && now.Before(current.Record.LeaseUntil) {
 		target = current
 	} else {
-		if current.Record.State == coordination.AuthorityActive && request.Now.Before(current.Record.LeaseUntil) {
-			transition := AuthorityTransition{Owner: current.Record.Owner, Term: current.Record.Term, Generation: current.Record.Generation, Fence: current.Record.Fence, Now: request.Now}
+		if current.Record.State == coordination.AuthorityActive && now.Before(current.Record.LeaseUntil) {
+			transition := AuthorityTransition{Owner: current.Record.Owner, Term: current.Record.Term, Generation: current.Record.Generation, Fence: current.Record.Fence, Now: now}
 			if _, err = c.SupersedeAuthority(ctx, transition); err != nil {
 				return Authority{}, err
 			}
@@ -482,7 +488,7 @@ func (c *Client) TransitionPrimary(ctx context.Context, request AuthorityRequest
 	if err = c.route.Open(ctx, coordination.DomainID(c.domain), target.Mode, target.Record.Generation, target.Record.Fence); err != nil {
 		return Authority{}, classify(err)
 	}
-	if _, err = c.RoutingBarrier(ctx, target.UpdatedAt); err != nil {
+	if _, err = c.RoutingBarrier(ctx, now); err != nil {
 		return Authority{}, err
 	}
 	return target, nil

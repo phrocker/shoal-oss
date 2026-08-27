@@ -196,7 +196,36 @@ func marshalFence(value PolicyFence) ([]byte, error) {
 	} else {
 		w.u8(0)
 	}
-	return envelope('F', w.Bytes()), nil
+	if value.publication != nil || value.retirement != nil {
+		w.u8(1)
+		flags := byte(0)
+		if value.publication != nil {
+			flags |= 1
+		}
+		if value.retirement != nil {
+			flags |= 2
+		}
+		w.u8(flags)
+		if value.publication != nil {
+			mapping, err := coordination.MarshalPolicyCopyMapV3(value.publication.Map)
+			if err != nil {
+				return nil, err
+			}
+			w.blob(mapping)
+			w.digest(value.publication.MapDigest)
+		}
+		if value.retirement != nil {
+			w.u64(uint64(value.retirement.Through))
+			w.digest(value.retirement.PublicationDigest)
+			w.digest(value.retirement.PredecessorRootDigest)
+			w.digest(value.retirement.SuccessorRootDigest)
+		}
+	}
+	encoded := envelope('F', w.Bytes())
+	if len(encoded) > coordination.MaxRootBytes {
+		return nil, ErrBounds
+	}
+	return encoded, nil
 }
 
 func unmarshalFence(data []byte) (PolicyFence, error) {
@@ -221,6 +250,31 @@ func unmarshalFence(data []byte) (PolicyFence, error) {
 		return PolicyFence{}, ErrCorruption
 	}
 	value.Active = active == 1
+	if r.err == nil && r.off < len(payload) {
+		if version := r.u8(); version != 1 {
+			return PolicyFence{}, ErrCorruption
+		}
+		flags := r.u8()
+		if flags == 0 || flags&^byte(3) != 0 || flags&2 != 0 && flags&1 == 0 {
+			return PolicyFence{}, ErrCorruption
+		}
+		if flags&1 != 0 {
+			encoded := r.blob(coordination.MaxRootBytes)
+			mapping, decodeErr := coordination.UnmarshalPolicyCopyMapV3(encoded)
+			if decodeErr != nil {
+				return PolicyFence{}, ErrCorruption
+			}
+			value.publication = &policyPublicationMarker{Map: mapping, MapDigest: r.digest()}
+		}
+		if flags&2 != 0 {
+			value.retirement = &policyRetirementMarker{
+				Through:               coordination.Epoch(r.u64()),
+				PublicationDigest:     r.digest(),
+				PredecessorRootDigest: r.digest(),
+				SuccessorRootDigest:   r.digest(),
+			}
+		}
+	}
 	if r.err != nil || r.off != len(payload) {
 		return PolicyFence{}, ErrCorruption
 	}

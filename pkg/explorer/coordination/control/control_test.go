@@ -450,6 +450,79 @@ func TestAuthorityMirrorsAndBarrier(t *testing.T) {
 	if acquired.Record.Generation != 4 || acquired.Record.Fence != 2 || string(acquired.Record.Term) != "term-2" {
 		t.Fatalf("acquired=%+v", acquired)
 	}
+
+	t.Run("same-owner transition uses current normalized time", func(t *testing.T) {
+		cases := []struct {
+			name       string
+			leaseUntil time.Duration
+			at         time.Duration
+			wantGen    coordination.Generation
+		}{
+			{name: "live lease", leaseUntil: time.Hour, at: time.Minute, wantGen: 1},
+			{name: "expired since prior update", leaseUntil: time.Second, at: 2 * time.Second, wantGen: 2},
+			{name: "exact expiry boundary", leaseUntil: time.Hour, at: time.Hour, wantGen: 2},
+		}
+		for _, test := range cases {
+			t.Run(test.name, func(t *testing.T) {
+				base := time.Date(2026, 8, 28, 10, 0, 0, 0, time.UTC)
+				store := newStore()
+				seedHead(t, store, baseHead(base))
+				client, route := newClient(t, store, base, leases{})
+				target, err := client.InitializeAuthority(context.Background(), AuthorityRequest{
+					Owner: []byte("writer"), Mode: coordination.WriterModeEmbeddedPrimary,
+					LeaseUntil: base.Add(test.leaseUntil), Now: base, Term: []byte("term-1"),
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				client.terms = fixedIDs{term: []byte("term-2")}
+				requestNow := base.Add(test.at)
+				got, err := client.TransitionPrimary(context.Background(), AuthorityRequest{
+					Owner: []byte("writer"), Mode: coordination.WriterModeEmbeddedPrimary,
+					LeaseUntil: requestNow.Add(time.Hour), Now: requestNow,
+				})
+				if err != nil {
+					t.Fatalf("transition: %v", err)
+				}
+				if got.Record.Generation != test.wantGen {
+					t.Fatalf("generation=%d, want %d (original=%d)", got.Record.Generation, test.wantGen, target.Record.Generation)
+				}
+				decision, err := client.RoutingBarrier(context.Background(), requestNow)
+				if err != nil || !decision.Enabled {
+					t.Fatalf("route not live at request time: %#v, %v", decision, err)
+				}
+				if _, _, _, open, _ := route.Current(context.Background(), []byte("domain")); !open {
+					t.Fatal("route remained closed")
+				}
+			})
+		}
+	})
+
+	t.Run("same-owner unknown publication resumes", func(t *testing.T) {
+		base := time.Date(2026, 8, 28, 12, 0, 0, 0, time.UTC)
+		store := newStore()
+		seedHead(t, store, baseHead(base))
+		client, _ := newClient(t, store, base, leases{})
+		if _, err := client.InitializeAuthority(context.Background(), AuthorityRequest{
+			Owner: []byte("writer"), Mode: coordination.WriterModeEmbeddedPrimary,
+			LeaseUntil: base.Add(time.Hour), Now: base, Term: []byte("term-1"),
+		}); err != nil {
+			t.Fatal(err)
+		}
+		store.faults = []fault{unknownAfter}
+		request := AuthorityRequest{
+			Owner: []byte("writer"), Mode: coordination.WriterModeEmbeddedPrimary,
+			LeaseUntil: base.Add(time.Hour), Now: base.Add(time.Minute),
+		}
+		first, err := client.TransitionPrimary(context.Background(), request)
+		if err != nil {
+			t.Fatalf("unknown-after transition: %v", err)
+		}
+		second, err := client.TransitionPrimary(context.Background(), request)
+		if err != nil || second.Record.Generation != first.Record.Generation {
+			t.Fatalf("resume changed authority: %#v, %v", second, err)
+		}
+	})
 }
 
 func TestRetirementApprovalAndApplication(t *testing.T) {

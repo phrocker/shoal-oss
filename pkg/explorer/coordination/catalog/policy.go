@@ -63,6 +63,28 @@ func validateFence(value PolicyFence) error {
 	if err := value.RecordGeneration.Validate(); err != nil {
 		return err
 	}
+	if value.publication != nil {
+		encoded, err := coordination.MarshalPolicyCopyMapV3(value.publication.Map)
+		if err != nil {
+			return err
+		}
+		if !bytes.Equal(value.publication.Map.LPART, r.LPART) ||
+			value.publication.Map.CopyGeneration != r.CopyGeneration ||
+			value.publication.Map.VisibilityDigest != r.VisibilityDigest ||
+			value.publication.Map.State != coordination.CopyStateActive ||
+			coordination.Sum(encoded) != value.publication.MapDigest {
+			return ErrConflict
+		}
+	}
+	if value.retirement != nil {
+		if value.publication == nil || value.retirement.Through.Validate() != nil ||
+			value.retirement.PublicationDigest != value.publication.MapDigest ||
+			value.retirement.PredecessorRootDigest == (coordination.Digest{}) ||
+			value.retirement.SuccessorRootDigest == (coordination.Digest{}) ||
+			value.retirement.PredecessorRootDigest == value.retirement.SuccessorRootDigest {
+			return ErrConflict
+		}
+	}
 	return validUTC(value.UpdatedAt)
 }
 
@@ -159,6 +181,8 @@ func (c *Client) AcquirePolicyFence(ctx context.Context, request PolicyFenceRequ
 			if current.RecordGeneration == coordination.Generation(math.MaxInt64) {
 				return PolicyFence{}, ErrOverflow
 			}
+			candidate.publication = clonePublicationMarker(current.publication)
+			candidate.retirement = cloneRetirementMarker(current.retirement)
 			candidate.RecordGeneration = current.RecordGeneration + 1
 			candidate.UpdatedAt = c.clock().UTC()
 			value, encodeErr := marshalFence(candidate)
@@ -414,13 +438,6 @@ func (c *Client) PublishPolicyMapping(ctx context.Context, fence PolicyFence, se
 		mapping.CopyDigest != set.PhysicalDigest || mapping.State != coordination.CopyStateActive {
 		return ErrConflict
 	}
-	currentFence, _, _, found, err := c.readFence(ctx, fence.Request)
-	if err != nil {
-		return err
-	}
-	if !found || !currentFence.Active || !sameFenceOwner(currentFence.Request, fence.Request) {
-		return ErrStaleOwner
-	}
 	if err := c.verifyStoredPolicySet(ctx, fence.Request, set); err != nil {
 		return err
 	}
@@ -453,7 +470,37 @@ func (c *Client) PublishPolicyMapping(ctx context.Context, fence PolicyFence, se
 	if err != nil {
 		return err
 	}
-	return c.absentOrIdentical(ctx, c.coordinate(row, familyMap, qualifierActive), data, int64(mapping.MapGeneration))
+	if err := c.absentOrIdentical(ctx, c.coordinate(row, familyMap, qualifierActive), data, int64(mapping.MapGeneration)); err != nil {
+		return err
+	}
+
+	currentFence, before, timestamp, found, err := c.readFence(ctx, fence.Request)
+	if err != nil {
+		return err
+	}
+	if !found || !currentFence.Active || !sameFenceOwner(currentFence.Request, fence.Request) ||
+		!currentFence.Request.LeaseUntil.After(c.clock().UTC()) {
+		return ErrStaleOwner
+	}
+	marker := &policyPublicationMarker{Map: cloneMap(mapping), MapDigest: coordination.Sum(data)}
+	if currentFence.publication != nil {
+		if !publicationMarkerEqual(currentFence.publication, marker) {
+			return ErrConflict
+		}
+		return nil
+	}
+	if currentFence.retirement != nil || currentFence.RecordGeneration == coordination.Generation(math.MaxInt64) {
+		return ErrConflict
+	}
+	currentFence.publication = marker
+	currentFence.RecordGeneration++
+	currentFence.UpdatedAt = c.clock().UTC()
+	after, err := marshalFence(currentFence)
+	if err != nil {
+		return err
+	}
+	coordinate, _ := c.policyFenceCoordinate(fence.Request)
+	return c.transition(ctx, coordinate, before, timestamp, after, int64(currentFence.RecordGeneration))
 }
 
 func (c *Client) LookupPolicyCopy(ctx context.Context, lpart coordination.LPART, policyGeneration coordination.Generation) (PolicyPin, error) {
@@ -501,6 +548,13 @@ func (c *Client) LookupPolicyCopy(ctx context.Context, lpart coordination.LPART,
 			return PolicyPin{}, ErrCorruption
 		}
 		if value.State == coordination.CopyStateActive {
+			published, retired, markerErr := c.policyMapState(ctx, value, cell.Value)
+			if markerErr != nil {
+				return PolicyPin{}, markerErr
+			}
+			if !published || retired {
+				continue
+			}
 			if selected == nil {
 				copy := value
 				selected = &copy
@@ -518,6 +572,58 @@ func (c *Client) LookupPolicyCopy(ctx context.Context, lpart coordination.LPART,
 	}
 	data, _ := coordination.MarshalPolicyCopyMapV3(*selected)
 	return PolicyPin{Map: cloneMap(*selected), PinDigest: digestParts([]byte("policy-pin-v1"), data)}, nil
+}
+
+func (c *Client) policyMapState(
+	ctx context.Context,
+	mapping coordination.PolicyCopyMapV3,
+	encoded []byte,
+) (bool, bool, error) {
+	request := PolicyFenceRequest{
+		LPART: mapping.LPART, CopyGeneration: mapping.CopyGeneration,
+		VisibilityDigest: mapping.VisibilityDigest,
+	}
+	fence, _, _, found, err := c.readFence(ctx, request)
+	if err != nil {
+		return false, false, err
+	}
+	if !found || fence.publication == nil {
+		return false, false, nil
+	}
+	digest := coordination.Sum(encoded)
+	if fence.publication.MapDigest != digest || !mapsEqual(fence.publication.Map, mapping) {
+		return false, false, nil
+	}
+	row, err := coordination.PolicyCopyRow(c.domain, mapping.LPART, mapping.CopyGeneration, mapping.VisibilityDigest)
+	if err != nil {
+		return false, false, err
+	}
+	rootCell, found, err := c.readOne(ctx, c.coordinate(row, familyCopy, qualifierRoot))
+	if err != nil {
+		return false, false, err
+	}
+	if !found {
+		return false, false, nil
+	}
+	root, err := unmarshalPolicyRoot(rootCell.Value)
+	if err != nil || root.Set.PhysicalDigest != mapping.CopyDigest {
+		return false, false, ErrCorruption
+	}
+	if fence.retirement == nil {
+		if root.State == coordination.CopyStateRetired {
+			return false, false, ErrCorruption
+		}
+		return true, false, nil
+	}
+	if fence.retirement.PublicationDigest != digest {
+		return false, false, ErrCorruption
+	}
+	rootDigest := coordination.Sum(rootCell.Value)
+	if rootDigest != fence.retirement.PredecessorRootDigest &&
+		rootDigest != fence.retirement.SuccessorRootDigest {
+		return false, false, ErrCorruption
+	}
+	return true, true, nil
 }
 
 func (c *Client) verifyStoredPolicySet(
@@ -578,6 +684,71 @@ func (c *Client) RetirePolicyCopy(ctx context.Context, fence PolicyFence, set Po
 	if err := through.Validate(); err != nil {
 		return err
 	}
+	set, err := normalizeManifestSet(set)
+	if err != nil {
+		return err
+	}
+	currentFence, beforeFence, fenceTimestamp, found, err := c.readFence(ctx, fence.Request)
+	if err != nil {
+		return err
+	}
+	if !found {
+		return ErrNotFound
+	}
+	row, _ := coordination.PolicyCopyRow(c.domain, fence.Request.LPART, fence.Request.CopyGeneration, fence.Request.VisibilityDigest)
+	coordinate := c.coordinate(row, familyCopy, qualifierRoot)
+	cell, rootFound, err := c.readOne(ctx, coordinate)
+	if err != nil {
+		return err
+	}
+	if !rootFound {
+		return ErrNotFound
+	}
+	root, err := unmarshalPolicyRoot(cell.Value)
+	if err != nil {
+		return err
+	}
+	if root.Set.ManifestDigest != set.ManifestDigest {
+		return ErrCorruption
+	}
+	retiredRoot := root
+	if retiredRoot.State != coordination.CopyStateRetired {
+		if retiredRoot.RecordGeneration == coordination.Generation(math.MaxInt64) {
+			return ErrOverflow
+		}
+		retiredRoot.State = coordination.CopyStateRetired
+		retiredRoot.RecordGeneration++
+	}
+	retiredData, err := marshalPolicyRoot(retiredRoot)
+	if err != nil {
+		return err
+	}
+	currentDigest := coordination.Sum(cell.Value)
+	retiredDigest := coordination.Sum(retiredData)
+	if currentFence.retirement != nil {
+		marker := currentFence.retirement
+		if marker.Through != through || marker.PublicationDigest != publicationDigest(currentFence.publication) ||
+			(currentDigest != marker.PredecessorRootDigest && currentDigest != marker.SuccessorRootDigest) ||
+			retiredDigest != marker.SuccessorRootDigest {
+			return ErrConflict
+		}
+		if currentDigest == marker.PredecessorRootDigest {
+			if err := c.transition(ctx, coordinate, cell.Value, cell.Timestamp, retiredData, int64(retiredRoot.RecordGeneration)); err != nil {
+				return err
+			}
+		}
+		if currentFence.Active && sameFenceOwner(currentFence.Request, fence.Request) {
+			return c.ReleasePolicyFence(ctx, currentFence.Request)
+		}
+		return nil
+	}
+	if !currentFence.Active || !sameFenceOwner(currentFence.Request, fence.Request) ||
+		!currentFence.Request.LeaseUntil.After(c.clock().UTC()) {
+		return ErrStaleOwner
+	}
+	if currentFence.publication == nil {
+		return ErrConflict
+	}
 	selected, err := c.leases.SelectsPolicyCopy(ctx, c.domain, fence.Request.LPART, fence.Request.CopyGeneration, fence.Request.VisibilityDigest)
 	if err != nil {
 		return classifyUnavailable(err)
@@ -595,10 +766,6 @@ func (c *Client) RetirePolicyCopy(ctx context.Context, fence PolicyFence, set Po
 	if through >= authority.HistoryFloor {
 		return ErrStaleRetention
 	}
-	set, err = normalizeManifestSet(set)
-	if err != nil {
-		return err
-	}
 	proof := PolicyCopyProof{
 		Domain: c.domain, LPART: fence.Request.LPART, CopyGeneration: fence.Request.CopyGeneration,
 		VisibilityDigest: fence.Request.VisibilityDigest, ManifestDigest: set.ManifestDigest,
@@ -610,34 +777,39 @@ func (c *Client) RetirePolicyCopy(ctx context.Context, fence PolicyFence, set Po
 	if err := c.policyVerifier.AllowPolicyRetirement(ctx, proof, through); err != nil {
 		return classifyVerifier(err)
 	}
-	row, _ := coordination.PolicyCopyRow(c.domain, fence.Request.LPART, fence.Request.CopyGeneration, fence.Request.VisibilityDigest)
-	coordinate := c.coordinate(row, familyCopy, qualifierRoot)
-	cell, found, err := c.readOne(ctx, coordinate)
-	if err != nil {
-		return err
-	}
-	if !found {
-		return ErrNotFound
-	}
-	root, err := unmarshalPolicyRoot(cell.Value)
-	if err != nil {
-		return err
-	}
-	if root.Set.ManifestDigest != set.ManifestDigest {
+	if root.State == coordination.CopyStateRetired {
 		return ErrCorruption
 	}
-	if root.State != coordination.CopyStateRetired {
-		root.State = coordination.CopyStateRetired
-		root.RecordGeneration++
-		data, encodeErr := marshalPolicyRoot(root)
-		if encodeErr != nil {
-			return encodeErr
-		}
-		if err := c.transition(ctx, coordinate, cell.Value, cell.Timestamp, data, int64(root.RecordGeneration)); err != nil {
-			return err
-		}
+	currentFence.retirement = &policyRetirementMarker{
+		Through:               through,
+		PublicationDigest:     currentFence.publication.MapDigest,
+		PredecessorRootDigest: currentDigest,
+		SuccessorRootDigest:   retiredDigest,
 	}
-	return c.ReleasePolicyFence(ctx, fence.Request)
+	if currentFence.RecordGeneration == coordination.Generation(math.MaxInt64) {
+		return ErrOverflow
+	}
+	currentFence.RecordGeneration++
+	currentFence.UpdatedAt = c.clock().UTC()
+	afterFence, err := marshalFence(currentFence)
+	if err != nil {
+		return err
+	}
+	fenceCoordinate, _ := c.policyFenceCoordinate(fence.Request)
+	if err := c.transition(ctx, fenceCoordinate, beforeFence, fenceTimestamp, afterFence, int64(currentFence.RecordGeneration)); err != nil {
+		return err
+	}
+	if err := c.transition(ctx, coordinate, cell.Value, cell.Timestamp, retiredData, int64(retiredRoot.RecordGeneration)); err != nil {
+		return err
+	}
+	latest, _, _, found, err := c.readFence(ctx, fence.Request)
+	if err != nil {
+		return err
+	}
+	if found && latest.Active && sameFenceOwner(latest.Request, fence.Request) {
+		return c.ReleasePolicyFence(ctx, latest.Request)
+	}
+	return nil
 }
 
 func classifyVerifier(err error) error {
@@ -675,6 +847,8 @@ func cloneFenceRequest(value PolicyFenceRequest) PolicyFenceRequest {
 
 func cloneFence(value PolicyFence) PolicyFence {
 	value.Request = cloneFenceRequest(value.Request)
+	value.publication = clonePublicationMarker(value.publication)
+	value.retirement = cloneRetirementMarker(value.retirement)
 	return value
 }
 
@@ -697,4 +871,36 @@ func cloneMap(value coordination.PolicyCopyMapV3) coordination.PolicyCopyMapV3 {
 	value.LPART = append(coordination.LPART(nil), value.LPART...)
 	value.ActivationRef = append([]byte(nil), value.ActivationRef...)
 	return value
+}
+
+func clonePublicationMarker(value *policyPublicationMarker) *policyPublicationMarker {
+	if value == nil {
+		return nil
+	}
+	return &policyPublicationMarker{Map: cloneMap(value.Map), MapDigest: value.MapDigest}
+}
+
+func cloneRetirementMarker(value *policyRetirementMarker) *policyRetirementMarker {
+	if value == nil {
+		return nil
+	}
+	copy := *value
+	return &copy
+}
+
+func publicationMarkerEqual(left, right *policyPublicationMarker) bool {
+	return left != nil && right != nil && left.MapDigest == right.MapDigest && mapsEqual(left.Map, right.Map)
+}
+
+func mapsEqual(left, right coordination.PolicyCopyMapV3) bool {
+	leftData, leftErr := coordination.MarshalPolicyCopyMapV3(left)
+	rightData, rightErr := coordination.MarshalPolicyCopyMapV3(right)
+	return leftErr == nil && rightErr == nil && bytes.Equal(leftData, rightData)
+}
+
+func publicationDigest(marker *policyPublicationMarker) coordination.Digest {
+	if marker == nil {
+		return coordination.Digest{}
+	}
+	return marker.MapDigest
 }

@@ -149,6 +149,20 @@ type PolicyFence struct {
 	RecordGeneration coordination.Generation
 	UpdatedAt        time.Time
 	Active           bool
+	publication      *policyPublicationMarker
+	retirement       *policyRetirementMarker
+}
+
+type policyPublicationMarker struct {
+	Map       coordination.PolicyCopyMapV3
+	MapDigest coordination.Digest
+}
+
+type policyRetirementMarker struct {
+	Through               coordination.Epoch
+	PublicationDigest     coordination.Digest
+	PredecessorRootDigest coordination.Digest
+	SuccessorRootDigest   coordination.Digest
 }
 
 type PolicyManifestSet struct {
