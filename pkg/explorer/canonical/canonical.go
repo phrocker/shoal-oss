@@ -241,12 +241,16 @@ func decodePayloadV1(payload []byte) (RecordV1, error) {
 }
 
 func verifyCanonicalPayload(record RecordV1, payload []byte) error {
+	// The record already validated, so a re-encoding failure is a violation of
+	// this package's own invariants rather than a malformed caller payload.
 	reencoded, err := MarshalV1(record)
 	if err != nil {
-		return invalid("canonical record is not canonically encoded")
+		return shoal.NewError(
+			shoal.ErrorInternal, "re-encoding a validated canonical record failed")
 	}
 	if len(reencoded) < envelopeHeaderBytes+envelopeChecksumSize {
-		return invalid("canonical record is not canonically encoded")
+		return shoal.NewError(
+			shoal.ErrorInternal, "re-encoded canonical record is truncated")
 	}
 	expected := reencoded[envelopeHeaderBytes : len(reencoded)-envelopeChecksumSize]
 	if !bytes.Equal(expected, payload) {
