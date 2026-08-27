@@ -58,12 +58,15 @@ func (c Coordinate) equal(other Coordinate) bool {
 type Cell struct {
 	Coordinate Coordinate
 	Value      []byte
+	Timestamp  int64
 }
 
 type Condition struct {
-	Coordinate Coordinate
-	Value      []byte
-	Absent     bool
+	Coordinate   Coordinate
+	Value        []byte
+	Absent       bool
+	Timestamp    int64
+	TimestampSet bool
 }
 
 type Update struct {

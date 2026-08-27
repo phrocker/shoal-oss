@@ -19,11 +19,15 @@
 
 package coordination
 
-import "time"
+import (
+	"math"
+	"time"
+)
 
 // AllocatorHeadV1 is the single authoritative mutable allocator-row head.
 // Reservation and checkpoint cells are separate coordinates on the same row.
 type AllocatorHeadV1 struct {
+	HeadGeneration            Generation
 	NextEpoch                 Epoch
 	RetiredThrough            Epoch
 	Frontier                  Epoch
@@ -43,6 +47,9 @@ type AllocatorHeadV1 struct {
 }
 
 func (h AllocatorHeadV1) Validate() error {
+	if err := h.HeadGeneration.Validate(); err != nil {
+		return err
+	}
 	if err := h.NextEpoch.Validate(); err != nil {
 		return err
 	}
@@ -122,7 +129,25 @@ func (h AllocatorHeadV1) Validate() error {
 	return nil
 }
 
+// ValidateAllocatorHeadSuccessor requires exactly one generation increment.
+func ValidateAllocatorHeadSuccessor(previous, next AllocatorHeadV1) error {
+	if err := previous.Validate(); err != nil {
+		return err
+	}
+	if err := next.Validate(); err != nil {
+		return err
+	}
+	if previous.HeadGeneration == Generation(math.MaxInt64) {
+		return invalid("allocator head generation is exhausted")
+	}
+	if next.HeadGeneration != previous.HeadGeneration+1 {
+		return invalid("allocator head generation must increase exactly once")
+	}
+	return nil
+}
+
 func encodeAllocatorHead(e *encoder, h AllocatorHeadV1) {
+	e.u64(uint64(h.HeadGeneration))
 	e.u64(uint64(h.NextEpoch))
 	e.u64(uint64(h.RetiredThrough))
 	e.u64(uint64(h.Frontier))
@@ -157,6 +182,7 @@ func UnmarshalAllocatorHeadV1(data []byte) (AllocatorHeadV1, error) {
 	}
 	d := &decoder{data: payload}
 	h := AllocatorHeadV1{
+		HeadGeneration:            Generation(d.positive("head generation")),
 		NextEpoch:                 Epoch(d.positive("next epoch")),
 		RetiredThrough:            Epoch(d.u64("retired through")),
 		Frontier:                  Epoch(d.u64("frontier")),

@@ -81,36 +81,27 @@ func (s *AccumuloStore) ReadExact(ctx context.Context, coordinates []Coordinate)
 	if len(coordinates) > coordinationReadBound {
 		return nil, errors.New("allocator: exact read exceeds its bound")
 	}
-	groups := make(map[string][]Coordinate)
-	rows := make(map[string][]byte)
-	for _, coordinate := range coordinates {
-		key := string(coordinate.Row)
-		groups[key] = append(groups[key], coordinate.clone())
-		rows[key] = append([]byte(nil), coordinate.Row...)
-	}
 	result := make([]Cell, 0, len(coordinates))
-	for key, requested := range groups {
-		columns := make([]accumulo.Column, len(requested))
-		for i, coordinate := range requested {
-			columns[i] = accumulo.NewColumnWithVisibility(
-				coordinate.Family, coordinate.Qualifier, coordinate.Visibility,
-			)
-		}
-		scanner, err := s.newScanner(columns)
+	for _, coordinate := range coordinates {
+		scanner, err := s.newScanner([]accumulo.Column{accumulo.NewColumnWithVisibility(
+			coordinate.Family, coordinate.Qualifier, coordinate.Visibility,
+		)})
 		if err != nil {
 			return nil, err
 		}
-		scanRange, err := accumulo.NewRangeRow(rows[key])
+		scanRange, err := accumulo.NewRangeRow(coordinate.Row)
 		if err != nil {
 			return nil, err
 		}
-		values, err := scanBounded(ctx, scanner, scanRange, len(requested)+1)
+		values, err := scanBounded(ctx, scanner, scanRange, 2)
 		if err != nil {
 			var cleanup *accumulo.CleanupError
 			if !errors.As(err, &cleanup) {
 				return nil, err
 			}
 		}
+		var selected Cell
+		found := false
 		for _, value := range values {
 			cell := Cell{
 				Coordinate: Coordinate{
@@ -119,14 +110,19 @@ func (s *AccumuloStore) ReadExact(ctx context.Context, coordinates []Coordinate)
 					Qualifier:  append([]byte(nil), value.Key.ColumnQualifier...),
 					Visibility: append([]byte(nil), value.Key.ColumnVisibility...),
 				},
-				Value: append([]byte(nil), value.Value...),
+				Value: append([]byte(nil), value.Value...), Timestamp: value.Key.Timestamp,
 			}
-			for _, coordinate := range requested {
-				if cell.Coordinate.equal(coordinate) {
-					result = append(result, cell)
-					break
-				}
+			if !cell.Coordinate.equal(coordinate) {
+				continue
 			}
+			if !found || cell.Timestamp > selected.Timestamp {
+				selected, found = cell, true
+			} else if cell.Timestamp == selected.Timestamp && !bytes.Equal(cell.Value, selected.Value) {
+				return nil, errors.New("allocator: conflicting values at one exact timestamp")
+			}
+		}
+		if found {
+			result = append(result, selected)
 		}
 	}
 	return result, nil
@@ -206,7 +202,7 @@ func (s *AccumuloStore) ScanRowPrefix(
 				Qualifier:  append([]byte(nil), value.Key.ColumnQualifier...),
 				Visibility: append([]byte(nil), value.Key.ColumnVisibility...),
 			},
-			Value: append([]byte(nil), value.Value...),
+			Value: append([]byte(nil), value.Value...), Timestamp: value.Key.Timestamp,
 		})
 		if len(result) == limit {
 			break
@@ -259,6 +255,9 @@ func (s *AccumuloStore) CompareAndMutate(ctx context.Context, request Mutation) 
 		}
 		if err != nil {
 			return StatusUnknown, fmt.Errorf("allocator: invalid condition: %w", err)
+		}
+		if condition.TimestampSet {
+			conditions[i] = conditions[i].WithTimestamp(condition.Timestamp)
 		}
 	}
 	conditional, err := accumulo.NewConditionalMutation(mutation, conditions...)

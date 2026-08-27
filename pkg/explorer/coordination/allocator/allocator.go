@@ -145,11 +145,7 @@ func (c *Client) CurrentHead(ctx context.Context) (coordination.AllocatorHeadV1,
 	if !found {
 		return coordination.AllocatorHeadV1{}, ErrNotFound
 	}
-	head, err := coordination.UnmarshalAllocatorHeadV1(cell.Value)
-	if err != nil {
-		return coordination.AllocatorHeadV1{}, fmt.Errorf("%w: allocator head is invalid", ErrCorruption)
-	}
-	return head, nil
+	return decodeHeadCell(cell)
 }
 
 func (c *Client) Reservation(ctx context.Context, epoch coordination.Epoch) (coordination.ReservationV1, error) {
@@ -161,7 +157,7 @@ func (c *Client) Reservation(ctx context.Context, epoch coordination.Epoch) (coo
 		return coordination.ReservationV1{}, ErrNotFound
 	}
 	value, err := coordination.UnmarshalReservationV1(cell.Value)
-	if err != nil || value.Epoch != epoch {
+	if err != nil || value.Epoch != epoch || cell.Timestamp != int64(epoch) {
 		return coordination.ReservationV1{}, fmt.Errorf("%w: reservation is invalid", ErrCorruption)
 	}
 	return value, nil
@@ -176,7 +172,7 @@ func (c *Client) Outcome(ctx context.Context, epoch coordination.Epoch) (coordin
 		return coordination.EpochOutcomeV1{}, ErrNotFound
 	}
 	value, err := coordination.UnmarshalEpochOutcomeV1(cell.Value)
-	if err != nil || value.Epoch != epoch {
+	if err != nil || value.Epoch != epoch || cell.Timestamp != int64(epoch) {
 		return coordination.EpochOutcomeV1{}, fmt.Errorf("%w: outcome is invalid", ErrCorruption)
 	}
 	return value, nil
@@ -225,6 +221,9 @@ func (c *Client) Reserve(ctx context.Context, request ReserveRequest) (coordinat
 		return coordination.ReservationV1{}, err
 	}
 	next := predecessor
+	if err := incrementHeadGeneration(&next); err != nil {
+		return coordination.ReservationV1{}, err
+	}
 	next.NextEpoch++
 	next.ActiveReservations++
 	if next.ActiveWindowStart == 0 {
@@ -234,14 +233,17 @@ func (c *Client) Reserve(ctx context.Context, request ReserveRequest) (coordinat
 	if err != nil {
 		return coordination.ReservationV1{}, fmt.Errorf("%w: %v", ErrOverflow, err)
 	}
+	if err := coordination.ValidateAllocatorHeadSuccessor(predecessor, next); err != nil {
+		return coordination.ReservationV1{}, fmt.Errorf("%w: invalid allocator head successor", ErrCorruption)
+	}
 	mutation := Mutation{
 		Row: c.allocatorRow(),
 		Conditions: []Condition{
-			{Coordinate: c.headCoordinate(), Value: predecessorBytes},
+			{Coordinate: c.headCoordinate(), Value: predecessorBytes, Timestamp: int64(predecessor.HeadGeneration), TimestampSet: true},
 			{Coordinate: c.reservationCoordinate(epoch), Absent: true},
 		},
 		Updates: []Update{
-			{Coordinate: c.headCoordinate(), Value: nextBytes, Timestamp: int64(next.NextEpoch)},
+			{Coordinate: c.headCoordinate(), Value: nextBytes, Timestamp: int64(next.HeadGeneration)},
 			{Coordinate: c.reservationCoordinate(epoch), Value: reservationBytes, Timestamp: int64(epoch)},
 		},
 	}
@@ -303,9 +305,12 @@ func (c *Client) Terminalize(
 	}
 	if !predecessor.State.Terminal() {
 		mutation := Mutation{
-			Row:        c.allocatorRow(),
-			Conditions: []Condition{{Coordinate: c.reservationCoordinate(predecessor.Epoch), Value: beforeBytes}},
-			Updates:    []Update{{Coordinate: c.reservationCoordinate(predecessor.Epoch), Value: terminalBytes, Timestamp: int64(predecessor.Epoch)}},
+			Row: c.allocatorRow(),
+			Conditions: []Condition{{
+				Coordinate: c.reservationCoordinate(predecessor.Epoch), Value: beforeBytes,
+				Timestamp: int64(predecessor.Epoch), TimestampSet: true,
+			}},
+			Updates: []Update{{Coordinate: c.reservationCoordinate(predecessor.Epoch), Value: terminalBytes, Timestamp: int64(predecessor.Epoch)}},
 		}
 		if err := c.applyReservationTransition(ctx, mutation, terminal); err != nil {
 			return 0, coordination.EpochOutcomeV1{}, err
@@ -444,20 +449,26 @@ func (c *Client) AdvanceFrontier(ctx context.Context) (coordination.FrontierChec
 	}
 	headBytes, _ := coordination.MarshalAllocatorHeadV1(head)
 	next := head
+	if err := incrementHeadGeneration(&next); err != nil {
+		return coordination.FrontierCheckpointV1{}, err
+	}
 	next.Frontier = checkpoint.Frontier
 	next.VisibleAt = checkpoint.VisibleAt
 	next.CheckpointDigest = checkpoint.Digest
 	nextBytes, _ := coordination.MarshalAllocatorHeadV1(next)
+	if err := coordination.ValidateAllocatorHeadSuccessor(head, next); err != nil {
+		return coordination.FrontierCheckpointV1{}, fmt.Errorf("%w: invalid allocator head successor", ErrCorruption)
+	}
 	checkpointBytes, _ := coordination.MarshalFrontierCheckpointV1(checkpoint)
 	history := c.historyCoordinate(checkpoint.VisibleAt, checkpoint.Frontier)
 	mutation := Mutation{
 		Row: c.allocatorRow(),
 		Conditions: []Condition{
-			{Coordinate: c.headCoordinate(), Value: headBytes},
+			{Coordinate: c.headCoordinate(), Value: headBytes, Timestamp: int64(head.HeadGeneration), TimestampSet: true},
 			{Coordinate: history, Absent: true},
 		},
 		Updates: []Update{
-			{Coordinate: c.headCoordinate(), Value: nextBytes, Timestamp: int64(checkpoint.Frontier)},
+			{Coordinate: c.headCoordinate(), Value: nextBytes, Timestamp: int64(next.HeadGeneration)},
 			{Coordinate: history, Value: checkpointBytes, Timestamp: int64(checkpoint.Frontier)},
 		},
 	}
@@ -518,7 +529,10 @@ func (c *Client) Retire(ctx context.Context) (coordination.AllocatorHeadV1, erro
 	conditions := make([]Condition, 0, limit+1)
 	updates := make([]Update, 0, limit+1)
 	headBytes, _ := coordination.MarshalAllocatorHeadV1(head)
-	conditions = append(conditions, Condition{Coordinate: c.headCoordinate(), Value: headBytes})
+	conditions = append(conditions, Condition{
+		Coordinate: c.headCoordinate(), Value: headBytes,
+		Timestamp: int64(head.HeadGeneration), TimestampSet: true,
+	})
 	retired := 0
 	for i := 0; i < limit; i++ {
 		epoch := start + coordination.Epoch(i)
@@ -538,7 +552,10 @@ func (c *Client) Retire(ctx context.Context) (coordination.AllocatorHeadV1, erro
 		}
 		value, _ := coordination.MarshalReservationV1(reservation)
 		coordinate := c.reservationCoordinate(epoch)
-		conditions = append(conditions, Condition{Coordinate: coordinate, Value: value})
+		conditions = append(conditions, Condition{
+			Coordinate: coordinate, Value: value,
+			Timestamp: int64(epoch), TimestampSet: true,
+		})
 		updates = append(updates, Update{Coordinate: coordinate, Delete: true, Timestamp: int64(epoch)})
 		retired++
 	}
@@ -546,6 +563,9 @@ func (c *Client) Retire(ctx context.Context) (coordination.AllocatorHeadV1, erro
 		return coordination.AllocatorHeadV1{}, ErrNotFound
 	}
 	next := head
+	if err := incrementHeadGeneration(&next); err != nil {
+		return coordination.AllocatorHeadV1{}, err
+	}
 	next.RetiredThrough = start + coordination.Epoch(retired-1)
 	if uint32(retired) > next.ActiveReservations {
 		return coordination.AllocatorHeadV1{}, fmt.Errorf("%w: retirement exceeds active window", ErrCorruption)
@@ -560,7 +580,10 @@ func (c *Client) Retire(ctx context.Context) (coordination.AllocatorHeadV1, erro
 	if err != nil {
 		return coordination.AllocatorHeadV1{}, fmt.Errorf("%w: retirement metadata invalid", ErrCorruption)
 	}
-	updates = append([]Update{{Coordinate: c.headCoordinate(), Value: nextBytes, Timestamp: int64(next.NextEpoch)}}, updates...)
+	if err := coordination.ValidateAllocatorHeadSuccessor(head, next); err != nil {
+		return coordination.AllocatorHeadV1{}, fmt.Errorf("%w: invalid allocator head successor", ErrCorruption)
+	}
+	updates = append([]Update{{Coordinate: c.headCoordinate(), Value: nextBytes, Timestamp: int64(next.HeadGeneration)}}, updates...)
 	mutation := Mutation{Row: c.allocatorRow(), Conditions: conditions, Updates: updates}
 	for attempt := 0; ; attempt++ {
 		status, writeErr := c.store.CompareAndMutate(ctx, mutation)
@@ -613,7 +636,7 @@ func (c *Client) CheckpointAtOrBefore(ctx context.Context, at time.Time) (coordi
 		return coordination.FrontierCheckpointV1{}, ErrNotFound
 	}
 	checkpoint, err := coordination.UnmarshalFrontierCheckpointV1(cells[0].Value)
-	if err != nil || checkpoint.VisibleAt.After(at) {
+	if err != nil || checkpoint.VisibleAt.After(at) || cells[0].Timestamp != int64(checkpoint.Frontier) {
 		return coordination.FrontierCheckpointV1{}, fmt.Errorf("%w: checkpoint history is invalid", ErrCorruption)
 	}
 	return checkpoint, nil
@@ -638,12 +661,12 @@ func (c *Client) reconcileAllocation(ctx context.Context, predecessor coordinati
 	if !headFound {
 		return reconcileCorrupt, fmt.Errorf("%w: allocator head disappeared", ErrCorruption)
 	}
-	head, decodeErr := coordination.UnmarshalAllocatorHeadV1(headCell.Value)
+	head, decodeErr := decodeHeadCell(headCell)
 	if decodeErr != nil {
-		return reconcileCorrupt, fmt.Errorf("%w: allocator head is invalid", ErrCorruption)
+		return reconcileCorrupt, decodeErr
 	}
 	if head.NextEpoch == predecessor.NextEpoch+1 && reservationFound {
-		got, reservationErr := coordination.UnmarshalReservationV1(reservationCell.Value)
+		got, reservationErr := decodeReservationCell(reservationCell, reservation.Epoch)
 		if reservationErr == nil && reservationEqual(got, reservation) {
 			return reconcileApplied, nil
 		}
@@ -653,7 +676,7 @@ func (c *Client) reconcileAllocation(ctx context.Context, predecessor coordinati
 		return reconcileRetry, nil
 	}
 	if reservationFound {
-		got, reservationErr := coordination.UnmarshalReservationV1(reservationCell.Value)
+		got, reservationErr := decodeReservationCell(reservationCell, reservation.Epoch)
 		if reservationErr == nil && reservationEqual(got, reservation) && head.NextEpoch > predecessor.NextEpoch {
 			return reconcileApplied, nil
 		}
@@ -683,15 +706,16 @@ func (c *Client) reconcileCheckpoint(ctx context.Context, predecessor coordinati
 	if !headFound {
 		return reconcileCorrupt, fmt.Errorf("%w: allocator head disappeared", ErrCorruption)
 	}
-	head, decodeErr := coordination.UnmarshalAllocatorHeadV1(headCell.Value)
+	head, decodeErr := decodeHeadCell(headCell)
 	if decodeErr != nil {
-		return reconcileCorrupt, fmt.Errorf("%w: allocator head is invalid", ErrCorruption)
+		return reconcileCorrupt, decodeErr
 	}
 	headApplied := head.Frontier == checkpoint.Frontier && head.VisibleAt.Equal(checkpoint.VisibleAt) && head.CheckpointDigest == checkpoint.Digest
 	historyApplied := false
 	if historyFound {
 		got, checkpointErr := coordination.UnmarshalFrontierCheckpointV1(historyCell.Value)
-		historyApplied = checkpointErr == nil && checkpointEqual(got, checkpoint)
+		historyApplied = checkpointErr == nil && historyCell.Timestamp == int64(checkpoint.Frontier) &&
+			checkpointEqual(got, checkpoint)
 	}
 	if headApplied && historyApplied {
 		return reconcileApplied, nil
@@ -719,9 +743,9 @@ func (c *Client) reconcileRetirement(ctx context.Context, predecessor, next coor
 	if !found {
 		return reconcileCorrupt, fmt.Errorf("%w: allocator head disappeared", ErrCorruption)
 	}
-	head, decodeErr := coordination.UnmarshalAllocatorHeadV1(headCell.Value)
+	head, decodeErr := decodeHeadCell(headCell)
 	if decodeErr != nil {
-		return reconcileCorrupt, fmt.Errorf("%w: allocator head is invalid", ErrCorruption)
+		return reconcileCorrupt, decodeErr
 	}
 	absent := 0
 	predecessors := 0
@@ -729,7 +753,8 @@ func (c *Client) reconcileRetirement(ctx context.Context, predecessor, next coor
 		cell, exists := findCell(cells, condition.Coordinate)
 		if !exists {
 			absent++
-		} else if bytes.Equal(cell.Value, condition.Value) {
+		} else if bytes.Equal(cell.Value, condition.Value) &&
+			(!condition.TimestampSet || cell.Timestamp == condition.Timestamp) {
 			predecessors++
 		} else {
 			return reconcileCorrupt, fmt.Errorf("%w: retirement reservation changed", ErrCorruption)
@@ -840,6 +865,30 @@ func classifyUnavailable(err error) error {
 		return err
 	}
 	return errors.Join(ErrUnavailable, err)
+}
+
+func incrementHeadGeneration(head *coordination.AllocatorHeadV1) error {
+	if head.HeadGeneration == coordination.Generation(math.MaxInt64) {
+		return errors.Join(ErrExhausted, ErrOverflow)
+	}
+	head.HeadGeneration++
+	return nil
+}
+
+func decodeHeadCell(cell Cell) (coordination.AllocatorHeadV1, error) {
+	head, err := coordination.UnmarshalAllocatorHeadV1(cell.Value)
+	if err != nil || cell.Timestamp != int64(head.HeadGeneration) {
+		return coordination.AllocatorHeadV1{}, fmt.Errorf("%w: allocator head record and timestamp disagree", ErrCorruption)
+	}
+	return head, nil
+}
+
+func decodeReservationCell(cell Cell, epoch coordination.Epoch) (coordination.ReservationV1, error) {
+	reservation, err := coordination.UnmarshalReservationV1(cell.Value)
+	if err != nil || reservation.Epoch != epoch || cell.Timestamp != int64(epoch) {
+		return coordination.ReservationV1{}, fmt.Errorf("%w: reservation record and timestamp disagree", ErrCorruption)
+	}
+	return reservation, nil
 }
 
 func (c *Client) wait(ctx context.Context) error {

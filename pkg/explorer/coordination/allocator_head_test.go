@@ -8,7 +8,7 @@ import (
 
 func fixtureAllocatorHead() AllocatorHeadV1 {
 	return AllocatorHeadV1{
-		NextEpoch: 18, RetiredThrough: 12, Frontier: 17,
+		HeadGeneration: 23, NextEpoch: 18, RetiredThrough: 12, Frontier: 17,
 		VisibleAt:        time.Date(2026, 8, 27, 14, 30, 0, 123, time.UTC),
 		CheckpointDigest: testDigest("checkpoint"), HistoryFloor: 3,
 		RetentionGeneration: 8, WriterAuthorityGeneration: 9,
@@ -45,6 +45,7 @@ func TestAllocatorHeadGoldenRoundTripAndCorruption(t *testing.T) {
 
 func TestAllocatorHeadRejectsNoncanonicalState(t *testing.T) {
 	tests := []func(*AllocatorHeadV1){
+		func(h *AllocatorHeadV1) { h.HeadGeneration = 0 },
 		func(h *AllocatorHeadV1) { h.NextEpoch = 0 },
 		func(h *AllocatorHeadV1) { h.Frontier = h.NextEpoch },
 		func(h *AllocatorHeadV1) { h.ActiveReservations = h.MaxActiveReservations + 1 },
@@ -58,5 +59,23 @@ func TestAllocatorHeadRejectsNoncanonicalState(t *testing.T) {
 		if _, err := MarshalAllocatorHeadV1(value); err == nil {
 			t.Fatalf("invalid fixture %d accepted", i)
 		}
+	}
+}
+
+func TestAllocatorHeadSuccessorGeneration(t *testing.T) {
+	previous := fixtureAllocatorHead()
+	next := previous
+	next.HeadGeneration++
+	if err := ValidateAllocatorHeadSuccessor(previous, next); err != nil {
+		t.Fatal(err)
+	}
+	next.HeadGeneration++
+	if err := ValidateAllocatorHeadSuccessor(previous, next); err == nil {
+		t.Fatal("skipped head generation accepted")
+	}
+	previous.HeadGeneration = Generation(^uint64(0) >> 1)
+	next = previous
+	if err := ValidateAllocatorHeadSuccessor(previous, next); err == nil {
+		t.Fatal("exhausted head generation accepted")
 	}
 }

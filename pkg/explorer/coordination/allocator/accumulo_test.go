@@ -8,6 +8,9 @@ import (
 	"testing"
 
 	"github.com/phrocker/shoal-oss/accumulo"
+	"github.com/phrocker/shoal-oss/internal/cclient"
+	"github.com/phrocker/shoal-oss/internal/thrift/gen/data"
+	"github.com/phrocker/shoal-oss/pkg/explorer/coordination"
 )
 
 type fakeAccumuloScanner struct {
@@ -35,20 +38,149 @@ func TestAccumuloStoreExactReadUsesTrustedCoordinates(t *testing.T) {
 	row := []byte("allocator-row")
 	visibility := []byte("CONTROL")
 	scanner := &fakeAccumuloScanner{values: []accumulo.KeyValue{
-		{Key: accumulo.Key{Row: row, ColumnFamily: []byte("q"), ColumnQualifier: []byte("head"), ColumnVisibility: visibility}, Value: []byte("head-value")},
+		{Key: accumulo.Key{Row: row, ColumnFamily: []byte("q"), ColumnQualifier: []byte("head"), ColumnVisibility: visibility, Timestamp: 7}, Value: []byte("head-value")},
+		{Key: accumulo.Key{Row: row, ColumnFamily: []byte("q"), ColumnQualifier: []byte("head"), ColumnVisibility: visibility, Timestamp: 6}, Value: []byte("shadowed")},
 		{Key: accumulo.Key{Row: row, ColumnFamily: []byte("r"), ColumnQualifier: []byte("other"), ColumnVisibility: visibility}, Value: []byte("ignored")},
 	}}
 	store := &AccumuloStore{scanner: scanner}
 	coordinate := Coordinate{Row: row, Family: []byte("q"), Qualifier: []byte("head"), Visibility: visibility}
 	cells, err := store.ReadExact(context.Background(), []Coordinate{coordinate})
 	if err != nil || len(cells) != 1 || !cells[0].Coordinate.equal(coordinate) ||
-		!bytes.Equal(cells[0].Value, []byte("head-value")) {
+		!bytes.Equal(cells[0].Value, []byte("head-value")) || cells[0].Timestamp != 7 {
 		t.Fatalf("ReadExact = %#v, %v", cells, err)
 	}
 	if len(scanner.ranges) != 1 || !bytes.Equal(scanner.ranges[0].StartRow(), row) ||
 		!bytes.Equal(scanner.ranges[0].EndRow(), row) {
 		t.Fatalf("exact row range = %#v", scanner.ranges)
 	}
+}
+
+func TestAccumuloStoreMapsAllocatorOperationTimestamps(t *testing.T) {
+	memory := newMemoryStore()
+	client := newTestClient(t, memory, 8)
+	reservation := reserveOne(t, client, "txn")
+	if _, _, err := client.Terminalize(context.Background(), reservation, coordination.StateAborted); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.AdvanceFrontier(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Retire(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(memory.captured) != 5 {
+		t.Fatalf("captured %d mutations, want reserve/terminal/outcome/checkpoint/retire", len(memory.captured))
+	}
+	tests := []struct {
+		name       string
+		mutation   Mutation
+		timestamps map[string]struct {
+			timestamp int64
+			deleted   bool
+		}
+		conditionTimestamps map[string]int64
+	}{
+		{"reserve", memory.captured[0], map[string]struct {
+			timestamp int64
+			deleted   bool
+		}{"q/head": {2, false}, "r/" + string(coordination.U64(1)): {1, false}}, map[string]int64{"q/head": 1}},
+		{"terminal", memory.captured[1], map[string]struct {
+			timestamp int64
+			deleted   bool
+		}{"r/" + string(coordination.U64(1)): {1, false}}, map[string]int64{"r/" + string(coordination.U64(1)): 1}},
+		{"outcome", memory.captured[2], map[string]struct {
+			timestamp int64
+			deleted   bool
+		}{"o/terminal": {1, false}}, nil},
+		{"checkpoint", memory.captured[3], map[string]struct {
+			timestamp int64
+			deleted   bool
+		}{"q/head": {3, false}, "f/*": {1, false}}, map[string]int64{"q/head": 2}},
+		{"retire", memory.captured[4], map[string]struct {
+			timestamp int64
+			deleted   bool
+		}{"q/head": {4, false}, "r/" + string(coordination.U64(1)): {1, true}}, map[string]int64{
+			"q/head": 3, "r/" + string(coordination.U64(1)): 1,
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			writer := &fakeAccumuloWriter{status: accumulo.ConditionalAccepted}
+			store := &AccumuloStore{writer: writer}
+			status, err := store.CompareAndMutate(context.Background(), test.mutation)
+			if status != StatusAccepted || err != nil {
+				t.Fatalf("CompareAndMutate = %v, %v", status, err)
+			}
+			entries, conditions := decodeConditionalMutation(t, writer.mutation)
+			for key, want := range test.timestamps {
+				found := false
+				for _, entry := range entries {
+					entryKey := string(entry.ColFamily) + "/" + string(entry.ColQualifier)
+					if key == "f/*" && string(entry.ColFamily) == "f" {
+						entryKey = key
+					}
+					if entryKey == key {
+						found = true
+						if entry.Timestamp != want.timestamp || entry.Deleted != want.deleted || !entry.HasTimestamp {
+							t.Fatalf("%s = timestamp %d delete=%v explicit=%v", key, entry.Timestamp, entry.Deleted, entry.HasTimestamp)
+						}
+					}
+				}
+				if !found {
+					t.Fatalf("missing update %q", key)
+				}
+			}
+			for key, timestamp := range test.conditionTimestamps {
+				found := false
+				for _, condition := range conditions {
+					conditionKey := string(condition.Cf) + "/" + string(condition.Cq)
+					if conditionKey == key {
+						found = true
+						if !condition.HasTimestamp || condition.Ts != timestamp {
+							t.Fatalf("%s condition timestamp = %d explicit=%v", key, condition.Ts, condition.HasTimestamp)
+						}
+					}
+				}
+				if !found {
+					t.Fatalf("missing timestamped condition %q", key)
+				}
+			}
+		})
+	}
+}
+
+func decodeConditionalMutation(t *testing.T, mutation *accumulo.ConditionalMutation) ([]cclient.MutationEntry, []*data.TCondition) {
+	t.Helper()
+	value := reflect.ValueOf(mutation).Elem()
+	wireMutation := value.FieldByName("mutation").Elem()
+	valuesField := wireMutation.FieldByName("Values")
+	values := make([][]byte, valuesField.Len())
+	for i := range values {
+		values[i] = append([]byte(nil), valuesField.Index(i).Bytes()...)
+	}
+	wire := &data.TMutation{
+		Row:    append([]byte(nil), wireMutation.FieldByName("Row").Bytes()...),
+		Data:   append([]byte(nil), wireMutation.FieldByName("Data").Bytes()...),
+		Values: values, Entries: int32(wireMutation.FieldByName("Entries").Int()),
+	}
+	decoded, err := cclient.FromThrift(wire)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conditionValues := value.FieldByName("conditions")
+	conditions := make([]*data.TCondition, conditionValues.Len())
+	for i := range conditions {
+		condition := conditionValues.Index(i)
+		conditions[i] = &data.TCondition{
+			Cf:           append([]byte(nil), condition.FieldByName("columnFamily").Bytes()...),
+			Cq:           append([]byte(nil), condition.FieldByName("columnQualifier").Bytes()...),
+			Cv:           append([]byte(nil), condition.FieldByName("columnVisibility").Bytes()...),
+			Val:          append([]byte(nil), condition.FieldByName("value").Bytes()...),
+			Ts:           condition.FieldByName("timestamp").Int(),
+			HasTimestamp: condition.FieldByName("timestampSet").Bool(),
+		}
+	}
+	return decoded.Entries(), conditions
 }
 
 func TestAccumuloStoreConditionalMappingAndUnknownClassification(t *testing.T) {
