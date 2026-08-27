@@ -193,9 +193,12 @@ func (c ManifestChunkV2) Validate() error {
 	if len(c.Entries) == 0 || len(c.Entries) > MaxChunkEntries {
 		return invalid("manifest chunk entry count is outside its bound")
 	}
-	for _, entry := range c.Entries {
+	for index, entry := range c.Entries {
 		if err := entry.Validate(); err != nil {
 			return err
+		}
+		if index > 0 && CompareManifestEntries(c.Entries[index-1], entry) >= 0 {
+			return invalid("manifest entries must be strictly ordered")
 		}
 	}
 	if c.LogicalEntriesDigest != entryDigest(c.Entries, true) {
@@ -307,6 +310,11 @@ func ChunkManifest(entries []ManifestEntry) ([]ManifestChunkV2, error) {
 	if len(entries) == 0 {
 		return nil, nil
 	}
+	for index := 1; index < len(entries); index++ {
+		if CompareManifestEntries(entries[index-1], entries[index]) >= 0 {
+			return nil, invalid("manifest entries must be strictly ordered")
+		}
+	}
 	chunks := make([]ManifestChunkV2, 0, (len(entries)+MaxChunkEntries-1)/MaxChunkEntries)
 	start := 0
 	var previous Digest
@@ -344,6 +352,7 @@ func VerifyManifest(chunks []ManifestChunkV2) (ManifestSummary, error) {
 	}
 	var summary ManifestSummary
 	var previous Digest
+	var lastEntry *ManifestEntry
 	for index, chunk := range chunks {
 		if chunk.Index != uint32(index) {
 			return ManifestSummary{}, invalid("manifest chunks are missing, duplicated, or reordered")
@@ -354,6 +363,9 @@ func VerifyManifest(chunks []ManifestChunkV2) (ManifestSummary, error) {
 		if err := chunk.Validate(); err != nil {
 			return ManifestSummary{}, err
 		}
+		if lastEntry != nil && CompareManifestEntries(*lastEntry, chunk.Entries[0]) >= 0 {
+			return ManifestSummary{}, invalid("manifest entries must be strictly ordered across chunks")
+		}
 		if err := checkedAdd("manifest entry total", &summary.TotalEntries, uint64(len(chunk.Entries))); err != nil {
 			return ManifestSummary{}, err
 		}
@@ -363,6 +375,7 @@ func VerifyManifest(chunks []ManifestChunkV2) (ManifestSummary, error) {
 		if err := checkedAdd("manifest byte total", &summary.TotalEncodedBytes, uint64(chunk.EncodedBytes)); err != nil {
 			return ManifestSummary{}, err
 		}
+		lastEntry = &chunk.Entries[len(chunk.Entries)-1]
 		previous = chunk.ChainDigest()
 	}
 	summary.ChunkCount = uint32(len(chunks))

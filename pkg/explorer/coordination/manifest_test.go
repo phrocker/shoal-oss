@@ -146,6 +146,28 @@ func TestManifestRejectsChainAndDigestFailures(t *testing.T) {
 	}
 }
 
+func TestManifestRejectsUnorderedAndDuplicateEntries(t *testing.T) {
+	first := fixtureEntry(0, 1)
+	second := fixtureEntry(1, 1)
+	if _, err := ChunkManifest([]ManifestEntry{second, first}); err == nil {
+		t.Fatal("unordered manifest entries accepted")
+	}
+	if _, err := ChunkManifest([]ManifestEntry{first, first}); err == nil {
+		t.Fatal("duplicate manifest entries accepted")
+	}
+
+	chunks, err := ChunkManifest([]ManifestEntry{first, second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	chunks[0].Entries[0], chunks[0].Entries[1] = chunks[0].Entries[1], chunks[0].Entries[0]
+	chunks[0].LogicalEntriesDigest = entryDigest(chunks[0].Entries, true)
+	chunks[0].PhysicalEntriesDigest = entryDigest(chunks[0].Entries, false)
+	if _, err := VerifyManifest(chunks); err == nil {
+		t.Fatal("unordered encoded manifest entries accepted")
+	}
+}
+
 func TestManifestRejectsCorruptionAndTruncation(t *testing.T) {
 	chunks, err := ChunkManifest([]ManifestEntry{fixtureEntry(0, 1)})
 	if err != nil {
