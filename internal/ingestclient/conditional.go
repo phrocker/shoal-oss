@@ -91,6 +91,7 @@ func (p *Pooled) ConditionalWriteWithDurability(
 	extent *data.TKeyExtent,
 	mutation *data.TConditionalMutation,
 	durability Durability,
+	authorizationSets ...[][]byte,
 ) (ConditionalOutcome, error) {
 	if err := ctx.Err(); err != nil {
 		return ConditionalOutcome{}, err
@@ -101,6 +102,13 @@ func (p *Pooled) ConditionalWriteWithDurability(
 	}
 	if durability > DurabilityNone {
 		return ConditionalOutcome{}, errors.New("ingestclient: invalid conditional durability")
+	}
+	if len(authorizationSets) > 1 {
+		return ConditionalOutcome{}, errors.New("ingestclient: multiple conditional authorization sets")
+	}
+	var authorizations [][]byte
+	if len(authorizationSets) == 1 {
+		authorizations = cloneConditionalAuthorizations(authorizationSets[0])
 	}
 	credentials, err := p.credentialsForRPC()
 	if err != nil {
@@ -124,7 +132,7 @@ func (p *Pooled) ConditionalWriteWithDurability(
 		)
 	}
 	session, err := thriftClient.StartConditionalUpdate(
-		ctx, clientpkg.NewTInfo(), credentials, nil, tableID,
+		ctx, clientpkg.NewTInfo(), credentials, authorizations, tableID,
 		tabletingest.TDurability(durability), "",
 	)
 	if err != nil {
@@ -194,4 +202,15 @@ func sessionID(session *data.TConditionalSession) data.UpdateID {
 		return 0
 	}
 	return data.UpdateID(session.SessionId)
+}
+
+func cloneConditionalAuthorizations(authorizations [][]byte) [][]byte {
+	if len(authorizations) == 0 {
+		return nil
+	}
+	cloned := make([][]byte, len(authorizations))
+	for i, authorization := range authorizations {
+		cloned[i] = append([]byte(nil), authorization...)
+	}
+	return cloned
 }

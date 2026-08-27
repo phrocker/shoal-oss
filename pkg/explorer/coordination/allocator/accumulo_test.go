@@ -29,6 +29,17 @@ type fakeAccumuloWriter struct {
 	mutation *accumulo.ConditionalMutation
 }
 
+func TestTrustedConditionalWriterOptionsOverrideAndCopyAuthorizations(t *testing.T) {
+	trusted := [][]byte{[]byte("CONTROL")}
+	options := trustedConditionalWriterOptions(accumulo.ConditionalWriterOptions{
+		Authorizations: [][]byte{[]byte("request-override")},
+	}, trusted)
+	trusted[0][0] = 'X'
+	if !reflect.DeepEqual(options.Authorizations, [][]byte{[]byte("CONTROL")}) {
+		t.Fatalf("writer authorizations = %q", options.Authorizations)
+	}
+}
+
 func (w *fakeAccumuloWriter) Write(_ context.Context, mutation *accumulo.ConditionalMutation) (accumulo.ConditionalStatus, error) {
 	w.mutation = mutation
 	return w.status, w.err

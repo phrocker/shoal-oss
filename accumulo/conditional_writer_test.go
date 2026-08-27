@@ -70,6 +70,7 @@ func TestConditionalWriterAcceptedRejectedAndCleanupErrors(t *testing.T) {
 		{"accepted cleanup", ingestclient.ConditionalAccepted, cleanupErr, ConditionalAccepted, cleanupErr},
 		{"rejected cleanup", ingestclient.ConditionalRejected, cleanupErr, ConditionalRejected, cleanupErr},
 	}
+
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			writer := newConditionalTestWriter(t, ConditionalWriterOptions{
@@ -82,6 +83,7 @@ func TestConditionalWriterAcceptedRejectedAndCleanupErrors(t *testing.T) {
 				extent *data.TKeyExtent,
 				mutation *data.TConditionalMutation,
 				durability ingestclient.Durability,
+				_ [][]byte,
 			) (ingestclient.ConditionalOutcome, error) {
 				gotDurability = durability
 				if address != "ts1:9997" ||
@@ -107,6 +109,47 @@ func TestConditionalWriterAcceptedRejectedAndCleanupErrors(t *testing.T) {
 	}
 }
 
+func TestConditionalWriterUsesImmutableAuthorizationsForVisibleAbsenceChecks(t *testing.T) {
+	authorizations := [][]byte{[]byte("control"), []byte("ops")}
+	writer := newConditionalTestWriter(t, ConditionalWriterOptions{
+		Authorizations: authorizations,
+	})
+	authorizations[0][0] = 'X'
+	writer.write = func(
+		_ context.Context,
+		_, _, _ string,
+		_ *data.TKeyExtent,
+		_ *data.TConditionalMutation,
+		_ ingestclient.Durability,
+		got [][]byte,
+	) (ingestclient.ConditionalOutcome, error) {
+		if !equalAuthorizationLists(got, [][]byte{[]byte("control"), []byte("ops")}) {
+			return ingestclient.ConditionalOutcome{
+				Status: ingestclient.ConditionalAccepted, Submitted: true,
+			}, nil
+		}
+		return ingestclient.ConditionalOutcome{
+			Status: ingestclient.ConditionalRejected, Submitted: true,
+		}, nil
+	}
+	status, err := writer.Write(context.Background(), testConditionalMutation(t, "a"))
+	if err != nil || status != ConditionalRejected {
+		t.Fatalf("visible existing condition appeared absent: %s, %v", status, err)
+	}
+}
+
+func equalAuthorizationLists(left, right [][]byte) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if !bytes.Equal(left[i], right[i]) {
+			return false
+		}
+	}
+	return true
+}
+
 func TestConditionalWriterUnknownIsNeverRetried(t *testing.T) {
 	writer := newConditionalTestWriter(t, ConditionalWriterOptions{})
 	calls := 0
@@ -114,6 +157,7 @@ func TestConditionalWriterUnknownIsNeverRetried(t *testing.T) {
 	writer.write = func(
 		context.Context, string, string, string,
 		*data.TKeyExtent, *data.TConditionalMutation, ingestclient.Durability,
+		[][]byte,
 	) (ingestclient.ConditionalOutcome, error) {
 		calls++
 		return ingestclient.ConditionalOutcome{Submitted: true}, transportErr
@@ -134,6 +178,7 @@ func TestConditionalWriterRejectsUnsupportedServerStatusAsUnknown(t *testing.T) 
 	writer.write = func(
 		context.Context, string, string, string,
 		*data.TKeyExtent, *data.TConditionalMutation, ingestclient.Durability,
+		[][]byte,
 	) (ingestclient.ConditionalOutcome, error) {
 		calls++
 		return ingestclient.ConditionalOutcome{
@@ -163,6 +208,7 @@ func TestConditionalWriterRetriesOnlyBeforeSubmission(t *testing.T) {
 	writer.write = func(
 		context.Context, string, string, string,
 		*data.TKeyExtent, *data.TConditionalMutation, ingestclient.Durability,
+		[][]byte,
 	) (ingestclient.ConditionalOutcome, error) {
 		calls++
 		if calls == 1 {
@@ -190,6 +236,7 @@ func TestConditionalWriterCancellationDuringRetry(t *testing.T) {
 	writer.write = func(
 		context.Context, string, string, string,
 		*data.TKeyExtent, *data.TConditionalMutation, ingestclient.Durability,
+		[][]byte,
 	) (ingestclient.ConditionalOutcome, error) {
 		cancel()
 		return ingestclient.ConditionalOutcome{}, errors.New("stale server")
@@ -227,6 +274,7 @@ func TestConditionalWriterRetriesMalformedAndStaleRouting(t *testing.T) {
 	writer.write = func(
 		_ context.Context, address, serverLock, tableID string,
 		_ *data.TKeyExtent, _ *data.TConditionalMutation, _ ingestclient.Durability,
+		_ [][]byte,
 	) (ingestclient.ConditionalOutcome, error) {
 		if address != "new:9997" || serverLock != "/locks/new$new" || tableID != "1" {
 			t.Fatalf("route = %q/%q/%q", address, serverLock, tableID)
@@ -258,6 +306,7 @@ func TestConditionalWriterMissingServerLockFailsBeforeSubmission(t *testing.T) {
 	writer.write = func(
 		context.Context, string, string, string,
 		*data.TKeyExtent, *data.TConditionalMutation, ingestclient.Durability,
+		[][]byte,
 	) (ingestclient.ConditionalOutcome, error) {
 		submissions++
 		return ingestclient.ConditionalOutcome{}, nil
@@ -403,6 +452,8 @@ func TestConditionalWriterValidation(t *testing.T) {
 		{table: Table{Name: "events"}, options: ConditionalWriterOptions{RetryBackoff: -1}},
 		{table: Table{Name: "events"}, options: ConditionalWriterOptions{RetryBackoff: time.Minute + 1}},
 		{table: Table{Name: "events"}, options: ConditionalWriterOptions{Durability: Durability(99)}},
+		{table: Table{Name: "events"}, options: ConditionalWriterOptions{Authorizations: [][]byte{[]byte("bad label")}}},
+		{table: Table{Name: "events"}, options: ConditionalWriterOptions{Authorizations: [][]byte{nil}}},
 	} {
 		if _, err := connector.NewConditionalWriter(test.table, test.options); err == nil {
 			t.Fatalf("NewConditionalWriter(%#v, %#v) succeeded", test.table, test.options)

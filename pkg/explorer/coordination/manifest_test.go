@@ -193,3 +193,35 @@ func TestManifestEntryDoesNotStoreValueBytes(t *testing.T) {
 		t.Fatal("manifest entries must describe values by length/digest, not store values")
 	}
 }
+
+func TestChunkManifestSizesEachEntryOnce(t *testing.T) {
+	entries := make([]ManifestEntry, MaxChunkEntries)
+	for i := range entries {
+		entries[i] = fixtureEntry(i, MaxManifestValueBytes)
+		entries[i].Row = append(entries[i].Row, bytes.Repeat([]byte{'x'}, 15_000)...)
+	}
+	calls := 0
+	chunks, err := chunkManifestWithSizer(entries, func(entry ManifestEntry) (int, error) {
+		calls++
+		return manifestEntryEncodedSize(entry)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls != len(entries) {
+		t.Fatalf("entry sizing calls = %d, want %d", calls, len(entries))
+	}
+	if len(chunks) < 2 {
+		t.Fatalf("near-large entries produced only %d chunk", len(chunks))
+	}
+}
+
+func TestChunkManifestRejectsSingleOversizedEntry(t *testing.T) {
+	entry := fixtureEntry(0, 1)
+	_, err := chunkManifestWithSizer([]ManifestEntry{entry}, func(ManifestEntry) (int, error) {
+		return MaxChunkBytes, nil
+	})
+	if err == nil || !bytes.Contains([]byte(err.Error()), []byte("single manifest entry")) {
+		t.Fatalf("oversized entry error = %v", err)
+	}
+}

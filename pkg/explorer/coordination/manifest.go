@@ -246,7 +246,7 @@ func newManifestChunk(index uint32, entries []ManifestEntry, previous Digest) (M
 		return ManifestChunkV2{}, invalid("manifest chunk exceeds 1 MiB")
 	}
 	c.EncodedBytes = uint32(len(e.data) + envelopeHeaderSize + checksumSize)
-	return c, c.Validate()
+	return c, nil
 }
 
 func MarshalManifestChunkV2(c ManifestChunkV2) ([]byte, error) {
@@ -304,6 +304,25 @@ func UnmarshalManifestChunkV2(data []byte) (ManifestChunkV2, error) {
 }
 
 func ChunkManifest(entries []ManifestEntry) ([]ManifestChunkV2, error) {
+	return chunkManifestWithSizer(entries, manifestEntryEncodedSize)
+}
+
+func manifestEntryEncodedSize(entry ManifestEntry) (int, error) {
+	if err := entry.Validate(); err != nil {
+		return 0, err
+	}
+	e := newPayloadEncoder(MaxChunkBytes)
+	encodeEntry(e, entry, false)
+	if e.err != nil {
+		return 0, e.err
+	}
+	return len(e.data), nil
+}
+
+func chunkManifestWithSizer(
+	entries []ManifestEntry,
+	entrySize func(ManifestEntry) (int, error),
+) ([]ManifestChunkV2, error) {
 	if len(entries) > MaxManifestEntries {
 		return nil, invalid("manifest has too many entries")
 	}
@@ -315,22 +334,35 @@ func ChunkManifest(entries []ManifestEntry) ([]ManifestChunkV2, error) {
 			return nil, invalid("manifest entries must be strictly ordered")
 		}
 	}
+	sizes := make([]int, len(entries))
+	for index, entry := range entries {
+		size, err := entrySize(entry)
+		if err != nil {
+			return nil, err
+		}
+		sizes[index] = size
+	}
+	const fixedChunkBytes = envelopeHeaderSize + checksumSize + 4 + 4 + 4 + 3*sha256.Size
 	chunks := make([]ManifestChunkV2, 0, (len(entries)+MaxChunkEntries-1)/MaxChunkEntries)
 	start := 0
 	var previous Digest
 	for start < len(entries) {
-		end := min(start+MaxChunkEntries, len(entries))
-		var chunk ManifestChunkV2
-		var err error
-		for {
-			chunk, err = newManifestChunk(uint32(len(chunks)), entries[start:end], previous)
-			if err == nil {
-				break
-			}
-			if end-start == 1 {
-				return nil, err
-			}
-			end--
+		end := start
+		encodedBytes := fixedChunkBytes
+		for end < len(entries) && end-start < MaxChunkEntries &&
+			encodedBytes+sizes[end] <= MaxChunkBytes {
+			encodedBytes += sizes[end]
+			end++
+		}
+		if end == start {
+			return nil, invalid("single manifest entry exceeds 1 MiB chunk bound")
+		}
+		chunk, err := newManifestChunk(uint32(len(chunks)), entries[start:end], previous)
+		if err != nil {
+			return nil, err
+		}
+		if int(chunk.EncodedBytes) != encodedBytes {
+			return nil, invalid("manifest chunk sizing mismatch")
 		}
 		chunks = append(chunks, chunk)
 		previous = chunk.ChainDigest()

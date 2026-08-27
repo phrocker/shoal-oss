@@ -18,13 +18,12 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"math"
 	"time"
 
 	"github.com/phrocker/shoal-oss/pkg/explorer/coordination"
 )
 
-var catalogMagic = [4]byte{'E', 'C', 'A', '1'}
+var catalogMagic = [4]byte{'E', 'C', 'A', '2'}
 
 type writer struct{ bytes.Buffer }
 
@@ -40,12 +39,16 @@ func (w *writer) u64(value uint64) {
 	binary.BigEndian.PutUint64(b[:], value)
 	w.raw(b[:])
 }
+func (w *writer) i64(value int64) { w.u64(uint64(value)) }
 func (w *writer) blob(value []byte) {
 	w.u32(uint32(len(value)))
 	w.raw(value)
 }
 func (w *writer) digest(value coordination.Digest) { w.raw(value[:]) }
-func (w *writer) timestamp(value time.Time)        { w.u64(uint64(value.UnixNano())) }
+func (w *writer) timestamp(value time.Time) {
+	w.i64(value.Unix())
+	w.u32(uint32(value.Nanosecond()))
+}
 
 type reader struct {
 	data []byte
@@ -86,6 +89,7 @@ func (r *reader) u64() uint64 {
 	}
 	return binary.BigEndian.Uint64(value)
 }
+func (r *reader) i64() int64 { return int64(r.u64()) }
 func (r *reader) blob(max int) []byte {
 	size := r.u32()
 	if size > uint32(max) {
@@ -100,12 +104,13 @@ func (r *reader) digest() coordination.Digest {
 	return value
 }
 func (r *reader) timestamp() time.Time {
-	value := r.u64()
-	if value > math.MaxInt64 {
+	seconds := r.i64()
+	nanos := r.u32()
+	if nanos >= uint32(time.Second) {
 		r.err = errors.New("catalog: invalid timestamp")
 		return time.Time{}
 	}
-	return time.Unix(0, int64(value)).UTC()
+	return time.Unix(seconds, int64(nanos)).UTC()
 }
 
 func envelope(kind byte, payload []byte) []byte {
@@ -210,7 +215,12 @@ func unmarshalFence(data []byte) (PolicyFence, error) {
 		Fence:               coordination.Fence(r.u64()),
 		AuthorityGeneration: coordination.Generation(r.u64()),
 		RetentionGeneration: coordination.Generation(r.u64()),
-	}, RecordGeneration: coordination.Generation(r.u64()), UpdatedAt: r.timestamp(), Active: r.u8() == 1}
+	}, RecordGeneration: coordination.Generation(r.u64()), UpdatedAt: r.timestamp()}
+	active := r.u8()
+	if active > 1 {
+		return PolicyFence{}, ErrCorruption
+	}
+	value.Active = active == 1
 	if r.err != nil || r.off != len(payload) {
 		return PolicyFence{}, ErrCorruption
 	}

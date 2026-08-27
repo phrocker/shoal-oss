@@ -243,12 +243,19 @@ type ConditionalWriterOptions struct {
 	RetryBackoff time.Duration
 
 	Durability Durability
+
+	// Authorizations are the trusted visibility labels used while evaluating
+	// conditional row reads. The labels are validated and copied at
+	// construction. An empty set preserves the historical blank-visibility
+	// behavior.
+	Authorizations [][]byte
 }
 
 type normalizedConditionalWriterOptions struct {
-	maxRetries   int
-	retryBackoff time.Duration
-	durability   ingestclient.Durability
+	maxRetries     int
+	retryBackoff   time.Duration
+	durability     ingestclient.Durability
+	authorizations [][]byte
 }
 
 type conditionalRPC interface {
@@ -260,6 +267,7 @@ type conditionalRPC interface {
 		*data.TKeyExtent,
 		*data.TConditionalMutation,
 		ingestclient.Durability,
+		...[][]byte,
 	) (ingestclient.ConditionalOutcome, error)
 }
 
@@ -282,6 +290,7 @@ type ConditionalWriter struct {
 		*data.TKeyExtent,
 		*data.TConditionalMutation,
 		ingestclient.Durability,
+		[][]byte,
 	) (ingestclient.ConditionalOutcome, error)
 }
 
@@ -315,7 +324,18 @@ func (c *Connector) NewConditionalWriter(
 	writer.resolve = writer.resolveTable
 	writer.locate = c.LocateTablet
 	writer.invalidate = c.InvalidateTablet
-	writer.write = rpc.ConditionalWriteWithDurability
+	writer.write = func(
+		ctx context.Context,
+		address, serverLock, tableID string,
+		extent *data.TKeyExtent,
+		mutation *data.TConditionalMutation,
+		durability ingestclient.Durability,
+		authorizations [][]byte,
+	) (ingestclient.ConditionalOutcome, error) {
+		return rpc.ConditionalWriteWithDurability(
+			ctx, address, serverLock, tableID, extent, mutation, durability, authorizations,
+		)
+	}
 	return writer, nil
 }
 
@@ -368,6 +388,7 @@ func (w *ConditionalWriter) Write(
 				tabletExtentToThrift(tablet),
 				wire,
 				w.options.durability,
+				cloneByteSlices(w.options.authorizations),
 			)
 			switch outcome.Status {
 			case ingestclient.ConditionalAccepted:
@@ -483,11 +504,58 @@ func normalizeConditionalWriterOptions(
 			"accumulo: conditional writer durability is invalid",
 		)
 	}
+	authorizations, err := normalizeConditionalAuthorizations(options.Authorizations)
+	if err != nil {
+		return normalizedConditionalWriterOptions{}, err
+	}
 	return normalizedConditionalWriterOptions{
-		maxRetries:   options.MaxRetries,
-		retryBackoff: options.RetryBackoff,
-		durability:   ingestclient.Durability(options.Durability),
+		maxRetries:     options.MaxRetries,
+		retryBackoff:   options.RetryBackoff,
+		durability:     ingestclient.Durability(options.Durability),
+		authorizations: authorizations,
 	}, nil
+}
+
+const (
+	maxConditionalAuthorizations      = 1024
+	maxConditionalAuthorizationBytes  = 1024
+	maxConditionalAuthorizationsBytes = 1 << 20
+)
+
+func normalizeConditionalAuthorizations(authorizations [][]byte) ([][]byte, error) {
+	if len(authorizations) > maxConditionalAuthorizations {
+		return nil, fmt.Errorf(
+			"%w: conditional authorization count exceeds %d",
+			ErrInvalidAuthorizations, maxConditionalAuthorizations,
+		)
+	}
+	result := make([][]byte, len(authorizations))
+	total := 0
+	for i, authorization := range authorizations {
+		if len(authorization) == 0 || len(authorization) > maxConditionalAuthorizationBytes {
+			return nil, fmt.Errorf(
+				"%w: conditional authorization %d has invalid length",
+				ErrInvalidAuthorizations, i,
+			)
+		}
+		total += len(authorization)
+		if total > maxConditionalAuthorizationsBytes {
+			return nil, fmt.Errorf(
+				"%w: conditional authorizations exceed %d bytes",
+				ErrInvalidAuthorizations, maxConditionalAuthorizationsBytes,
+			)
+		}
+		for _, character := range authorization {
+			if !ValidAuthorizationCharacter(character) {
+				return nil, fmt.Errorf(
+					"%w: conditional authorization %q holds invalid character %q",
+					ErrInvalidAuthorizations, authorization, rune(character),
+				)
+			}
+		}
+		result[i] = append([]byte(nil), authorization...)
+	}
+	return result, nil
 }
 
 func cloneConditionalThriftMutation(mutation *data.TMutation) *data.TMutation {

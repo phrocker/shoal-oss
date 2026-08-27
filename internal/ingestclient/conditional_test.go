@@ -63,6 +63,7 @@ func TestConditionalWriteFullServerLockAndSubmittedOutcomes(t *testing.T) {
 			pooled, pool := newConditionalTestPooled(t, rpc)
 			defer pool.Close()
 			mutation := testConditionalWireMutation()
+			authorizations := [][]byte{[]byte("coordination"), []byte("ops")}
 			outcome, err := pooled.ConditionalWriteWithDurability(
 				context.Background(),
 				"ts1:9997",
@@ -71,7 +72,9 @@ func TestConditionalWriteFullServerLockAndSubmittedOutcomes(t *testing.T) {
 				testExtent(),
 				mutation,
 				DurabilityFlush,
+				authorizations,
 			)
+			authorizations[0][0] = 'X'
 			if outcome.Status != test.wantStatus || !outcome.Submitted ||
 				!errors.Is(err, test.wantErr) {
 				t.Fatalf("outcome = %#v, %v; want %v submitted, %v", outcome, err, test.wantStatus, test.wantErr)
@@ -80,6 +83,9 @@ func TestConditionalWriteFullServerLockAndSubmittedOutcomes(t *testing.T) {
 			defer rpc.mu.Unlock()
 			if rpc.durability != tabletingest.TDurability_FLUSH {
 				t.Fatalf("durability = %v, want FLUSH", rpc.durability)
+			}
+			if !equalByteSlices(rpc.authorizations, [][]byte{[]byte("coordination"), []byte("ops")}) {
+				t.Fatalf("authorizations = %q", rpc.authorizations)
 			}
 			if test.updateErr == nil && !equalStrings(rpc.calls, []string{"start", "update", "close"}) {
 				t.Fatalf("calls = %v", rpc.calls)
@@ -148,21 +154,22 @@ func testConditionalWireMutation() *data.TConditionalMutation {
 type fakeConditionalRPC struct {
 	mu sync.Mutex
 
-	session       *data.TConditionalSession
-	startErr      error
-	resultStatus  data.TCMStatus
-	updateErr     error
-	closeErr      error
-	invalidateErr error
-	durability    tabletingest.TDurability
-	calls         []string
+	session        *data.TConditionalSession
+	startErr       error
+	resultStatus   data.TCMStatus
+	updateErr      error
+	closeErr       error
+	invalidateErr  error
+	durability     tabletingest.TDurability
+	authorizations [][]byte
+	calls          []string
 }
 
 func (r *fakeConditionalRPC) StartConditionalUpdate(
 	_ context.Context,
 	_ *clientpkg.TInfo,
 	_ *security.TCredentials,
-	_ [][]byte,
+	authorizations [][]byte,
 	_ string,
 	durability tabletingest.TDurability,
 	_ string,
@@ -171,7 +178,20 @@ func (r *fakeConditionalRPC) StartConditionalUpdate(
 	defer r.mu.Unlock()
 	r.calls = append(r.calls, "start")
 	r.durability = durability
+	r.authorizations = cloneConditionalAuthorizations(authorizations)
 	return r.session, r.startErr
+}
+
+func equalByteSlices(left, right [][]byte) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if string(left[i]) != string(right[i]) {
+			return false
+		}
+	}
+	return true
 }
 
 func (r *fakeConditionalRPC) ConditionalUpdate(

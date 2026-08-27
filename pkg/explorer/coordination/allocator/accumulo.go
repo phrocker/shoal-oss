@@ -67,14 +67,27 @@ func NewAccumuloStore(config AccumuloConfig) (*AccumuloStore, error) {
 	for i := range config.Authorizations {
 		authorizations[i] = append([]byte(nil), config.Authorizations[i]...)
 	}
-	writer, err := config.Connector.NewConditionalWriter(config.Table, config.WriterOptions)
+	writerOptions := trustedConditionalWriterOptions(config.WriterOptions, authorizations)
+	writer, err := config.Connector.NewConditionalWriter(config.Table, writerOptions)
 	if err != nil {
 		return nil, err
 	}
+
 	return &AccumuloStore{
 		connector: config.Connector, table: config.Table, authorizations: authorizations,
 		batchSize: config.ScannerBatchSize, writer: writer,
 	}, nil
+}
+
+func trustedConditionalWriterOptions(
+	options accumulo.ConditionalWriterOptions,
+	authorizations [][]byte,
+) accumulo.ConditionalWriterOptions {
+	options.Authorizations = make([][]byte, len(authorizations))
+	for i := range authorizations {
+		options.Authorizations[i] = append([]byte(nil), authorizations[i]...)
+	}
+	return options
 }
 
 func (s *AccumuloStore) ReadExact(ctx context.Context, coordinates []Coordinate) ([]Cell, error) {
