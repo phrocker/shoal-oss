@@ -246,6 +246,7 @@ type Observation struct {
 
 type RoutingDecision struct {
 	Authority Authority
+	Head      coordination.AllocatorHeadV1
 	Embedded  Observation
 	Accumulo  Observation
 	Enabled   bool
@@ -266,17 +267,16 @@ func (s AuthoritySource) Current(ctx context.Context, domain coordination.Domain
 		return CurrentAuthority{}, ErrUnavailable
 	}
 
-	now := s.Client.now()
-	a, head, err := s.Client.CurrentAuthority(ctx, now)
-	if err != nil {
+	decision, err := s.Client.RoutingBarrier(ctx, s.Client.now())
+	if err != nil || !decision.Enabled {
+		if err == nil {
+			err = ErrUnavailable
+		}
 		return CurrentAuthority{}, err
 	}
-	if a.Record.State != coordination.AuthorityActive || !now.Before(a.Record.LeaseUntil) {
-		return CurrentAuthority{}, ErrUnavailable
-	}
 	return CurrentAuthority{
-		Generation: a.Record.Generation, Fence: a.Record.Fence, RetentionGeneration: head.RetentionGeneration,
-		HistoryFloor: head.HistoryFloor,
+		Generation: decision.Authority.Record.Generation, Fence: decision.Authority.Record.Fence,
+		RetentionGeneration: decision.Head.RetentionGeneration, HistoryFloor: decision.Head.HistoryFloor,
 	}, nil
 }
 

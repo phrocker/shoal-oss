@@ -401,7 +401,7 @@ func (c *Client) Observation(ctx context.Context, backend coordination.BackendID
 }
 
 func (c *Client) RoutingBarrier(ctx context.Context, now time.Time) (RoutingDecision, error) {
-	authority, _, err := c.CurrentAuthority(ctx, now)
+	authority, head, err := c.CurrentAuthority(ctx, now)
 	if err != nil {
 		return RoutingDecision{}, err
 	}
@@ -413,7 +413,7 @@ func (c *Client) RoutingBarrier(ctx context.Context, now time.Time) (RoutingDeci
 	if err != nil {
 		return RoutingDecision{}, ErrUnavailable
 	}
-	result := RoutingDecision{Authority: authority, Embedded: embedded, Accumulo: accumulo}
+	result := RoutingDecision{Authority: authority, Head: head, Embedded: embedded, Accumulo: accumulo}
 	if !observationAgrees(authority, embedded) || !observationAgrees(authority, accumulo) {
 		return result, ErrConflict
 	}

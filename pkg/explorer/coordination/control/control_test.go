@@ -433,6 +433,9 @@ func TestAuthorityMirrorsAndBarrier(t *testing.T) {
 	if _, err = client.RoutingBarrier(context.Background(), now.Add(time.Second)); !errors.Is(err, ErrUnavailable) {
 		t.Fatalf("closed route=%v", err)
 	}
+	if _, err = (AuthoritySource{Client: client}).Current(context.Background(), coordination.DomainID("domain")); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("closed-route authority source=%v", err)
+	}
 	if err = r.Open(context.Background(), coordination.DomainID("domain"), renewed.Mode, 2, 1); err != nil {
 		t.Fatal(err)
 	}
@@ -444,6 +447,11 @@ func TestAuthorityMirrorsAndBarrier(t *testing.T) {
 	if err != nil || allocatorAuthority.Generation != renewed.Record.Generation ||
 		allocatorAuthority.Fence != renewed.Record.Fence {
 		t.Fatalf("allocator authority=%+v %v", allocatorAuthority, err)
+	}
+	current, err := (AuthoritySource{Client: client}).Current(context.Background(), coordination.DomainID("domain"))
+	if err != nil || current.Generation != renewed.Record.Generation || current.Fence != renewed.Record.Fence ||
+		current.RetentionGeneration != decision.Head.RetentionGeneration || current.HistoryFloor != decision.Head.HistoryFloor {
+		t.Fatalf("current authority=%+v %v", current, err)
 	}
 	stale := decision.Accumulo
 	stale.Record.AuthorityGeneration = 1
