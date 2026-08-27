@@ -44,6 +44,7 @@ const (
 	MaxManifestValueBytes  = 1 << 20
 	MaxPolicyCopyEntries   = 4096
 	MaxIndexDeltaEntries   = 4096
+	MaxPolicyCopyPins      = 64
 	MaxIndexPins           = 64
 	MaxBackendIDBytes      = 1024
 	MaxObjectKindBytes     = 256

@@ -75,7 +75,7 @@ type OperationSource interface {
 }
 
 type LeaseSource interface {
-	SelectsPolicyCopy(context.Context, coordination.DomainID, coordination.LPART, coordination.Generation, coordination.Digest) (bool, error)
+	SelectsPolicyCopy(context.Context, coordination.DomainID, coordination.PolicyCopyPin) (bool, error)
 	SelectsIndexGeneration(context.Context, coordination.DomainID, coordination.Family, coordination.IGEN) (bool, error)
 }
 

@@ -749,7 +749,10 @@ func (c *Client) RetirePolicyCopy(ctx context.Context, fence PolicyFence, set Po
 	if currentFence.publication == nil {
 		return ErrConflict
 	}
-	selected, err := c.leases.SelectsPolicyCopy(ctx, c.domain, fence.Request.LPART, fence.Request.CopyGeneration, fence.Request.VisibilityDigest)
+	selected, err := c.leases.SelectsPolicyCopy(ctx, c.domain, coordination.PolicyCopyPin{
+		LPART: fence.Request.LPART, MapGeneration: currentFence.publication.Map.MapGeneration,
+		CopyGeneration: fence.Request.CopyGeneration, VisibilityDigest: fence.Request.VisibilityDigest,
+	})
 	if err != nil {
 		return classifyUnavailable(err)
 	}

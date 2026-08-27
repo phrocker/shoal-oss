@@ -165,7 +165,7 @@ func (s *memoryStore) CompareAndMutate(ctx context.Context, m allocator.Mutation
 
 type pins struct{ err error }
 
-func (p pins) VerifySnapshotPins(context.Context, coordination.DomainID, coordination.SnapshotLeaseV2) error {
+func (p pins) VerifySnapshotPins(context.Context, coordination.DomainID, coordination.SnapshotLeaseV3) error {
 	return p.err
 }
 
@@ -242,6 +242,12 @@ func (migration) DrainAndVerify(context.Context, coordination.DomainID, coordina
 }
 
 func digest(s string) coordination.Digest { return coordination.Sum([]byte(s)) }
+func policyPin(lpart string, mapGeneration, copyGeneration coordination.Generation, visibility string) coordination.PolicyCopyPin {
+	return coordination.PolicyCopyPin{
+		LPART: coordination.LPART(lpart), MapGeneration: mapGeneration,
+		CopyGeneration: copyGeneration, VisibilityDigest: digest(visibility),
+	}
+}
 func baseHead(now time.Time) coordination.AllocatorHeadV1 {
 	return coordination.AllocatorHeadV1{
 		HeadGeneration: 1, NextEpoch: 11, RetiredThrough: 10, Frontier: 10, VisibleAt: now, CheckpointDigest: digest("checkpoint"),
@@ -293,7 +299,8 @@ func TestLeaseLifecycleUnknownAndBounds(t *testing.T) {
 	seedHead(t, store, baseHead(now))
 	client, _ := newClient(t, store, now, leases{})
 	initialize(t, client, now)
-	request := CreateLeaseRequest{Owner: coordination.OwnerID("reader"), Fence: 1, Frontier: 10, AuthorityGeneration: 1, RetentionGeneration: 1, PolicyGeneration: 1, PolicyCopyPinDigest: digest("pins"), IndexPins: []coordination.IndexPin{{Family: coordination.Family("lexical"), IGEN: coordination.IGEN("i1")}}, Now: now, ExpiresAt: now.Add(time.Minute)}
+	policyPins := []coordination.PolicyCopyPin{policyPin("part", 1, 1, "visibility")}
+	request := CreateLeaseRequest{Owner: coordination.OwnerID("reader"), Fence: 1, Frontier: 10, AuthorityGeneration: 1, RetentionGeneration: 1, PolicyGeneration: 1, PolicyCopyPinDigest: coordination.PolicyCopyPinDigest(policyPins), PolicyCopyPins: policyPins, IndexPins: []coordination.IndexPin{{Family: coordination.Family("lexical"), IGEN: coordination.IGEN("i1")}}, Now: now, ExpiresAt: now.Add(time.Minute)}
 	store.faults = []fault{unknownAfter}
 	lease, err := client.CreateLease(context.Background(), request)
 	if err != nil {
@@ -301,6 +308,11 @@ func TestLeaseLifecycleUnknownAndBounds(t *testing.T) {
 	}
 	if lease.RecordGeneration != 1 || string(lease.Record.LeaseID) != "lease-1" {
 		t.Fatalf("lease=%+v", lease)
+	}
+	if len(lease.Record.PolicyCopyPins) != 1 ||
+		coordination.ComparePolicyCopyPins(lease.Record.PolicyCopyPins[0], policyPins[0]) != 0 ||
+		lease.Record.PolicyCopyPinDigest != coordination.PolicyCopyPinDigest(lease.Record.PolicyCopyPins) {
+		t.Fatalf("unknown create readback lost exact policy pins: %+v", lease.Record)
 	}
 	if _, err = client.RenewLease(context.Background(), RenewLeaseRequest{LeaseID: lease.Record.LeaseID, Owner: lease.Record.Owner, Fence: 1, RecordGeneration: 1, AuthorityGeneration: 1, RetentionGeneration: 1, Now: now.Add(time.Second), ExpiresAt: now.Add(2 * time.Minute)}); err != nil {
 		t.Fatal(err)
@@ -330,10 +342,13 @@ func TestExpiredLeaseTakeoverKeepsPins(t *testing.T) {
 	seedHead(t, store, baseHead(now))
 	client, _ := newClient(t, store, now, leases{})
 	initialize(t, client, now)
+	policyPins := []coordination.PolicyCopyPin{policyPin("part", 1, 1, "visibility")}
+	indexPins := []coordination.IndexPin{{Family: coordination.Family("lexical"), IGEN: coordination.IGEN("i1")}}
 	created, err := client.CreateLease(context.Background(), CreateLeaseRequest{
 		Owner: coordination.OwnerID("old"), Fence: 1, Frontier: 10,
 		AuthorityGeneration: 1, RetentionGeneration: 1, PolicyGeneration: 1,
-		PolicyCopyPinDigest: digest("pins"), Now: now, ExpiresAt: now.Add(time.Minute),
+		PolicyCopyPinDigest: coordination.PolicyCopyPinDigest(policyPins), PolicyCopyPins: policyPins,
+		IndexPins: indexPins, Now: now, ExpiresAt: now.Add(time.Minute),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -354,7 +369,9 @@ func TestExpiredLeaseTakeoverKeepsPins(t *testing.T) {
 		t.Fatal(err)
 	}
 	if string(taken.Record.Owner) != "new" || taken.Record.Frontier != created.Record.Frontier ||
-		taken.Record.PolicyCopyPinDigest != created.Record.PolicyCopyPinDigest {
+		taken.Record.PolicyCopyPinDigest != created.Record.PolicyCopyPinDigest ||
+		!equalPolicyCopyPins(taken.Record.PolicyCopyPins, created.Record.PolicyCopyPins) ||
+		!equalPins(taken.Record.IndexPins, created.Record.IndexPins) {
 		t.Fatalf("takeover changed pins: %+v", taken)
 	}
 }
@@ -599,14 +616,18 @@ func retirementRowsInBand(t *testing.T, count int) []coordination.EntityID {
 	return nil
 }
 
-func seedLease(t *testing.T, store *memoryStore, client *Client, now time.Time, id coordination.LeaseID, state coordination.LeaseState, pin coordination.Digest) {
+func seedLease(t *testing.T, store *memoryStore, client *Client, now time.Time, id coordination.LeaseID, state coordination.LeaseState, policyPins []coordination.PolicyCopyPin, indexPins []coordination.IndexPin, expiresAt time.Time) {
 	t.Helper()
+	if expiresAt.IsZero() {
+		expiresAt = now.Add(time.Hour)
+	}
 	value := Lease{
-		Record: coordination.SnapshotLeaseV2{
+		Record: coordination.SnapshotLeaseV3{
 			LeaseID: id, Frontier: 10, Owner: coordination.OwnerID("reader"), Fence: 1,
 			AuthorityGeneration: 1, RetentionGeneration: 1, PolicyGeneration: 1,
-			PolicyCopyPinDigest: pin, CreatedAt: now, RenewedAt: now,
-			ExpiresAt: now.Add(time.Hour), State: state,
+			PolicyCopyPinDigest: coordination.PolicyCopyPinDigest(policyPins),
+			PolicyCopyPins:      policyPins, IndexPins: indexPins, CreatedAt: now, RenewedAt: now,
+			ExpiresAt: expiresAt, State: state,
 		},
 		RecordGeneration: 1, UpdatedAt: now,
 	}
@@ -655,7 +676,7 @@ func TestLeasePaginationStaysInBandAcrossFilteredPages(t *testing.T) {
 		if index >= 4 {
 			state = coordination.LeaseStateActive
 		}
-		seedLease(t, store, client, now, id, state, digest("pins"))
+		seedLease(t, store, client, now, id, state, nil, nil, time.Time{})
 	}
 	var cursor LeaseCursor
 	seen := make(map[string]int)
@@ -731,14 +752,14 @@ func TestLeaseSafetyQueryFailsClosedAtScanBound(t *testing.T) {
 	ids := leaseRowsInBand(t, 4)
 	for index, id := range ids {
 		state := coordination.LeaseStateActive
-		pin := digest("other")
+		pins := []coordination.PolicyCopyPin{policyPin("part", 1, 1, "other")}
 		if index == len(ids)-1 {
-			pin = digest("target")
+			pins = []coordination.PolicyCopyPin{policyPin("part", 1, 1, "target")}
 		}
-		seedLease(t, store, client, now, id, state, pin)
+		seedLease(t, store, client, now, id, state, pins, nil, time.Time{})
 	}
 	selected, err := (LeaseSource{Client: client}).SelectsPolicyCopy(
-		context.Background(), coordination.DomainID("domain"), coordination.LPART("part"), 1, digest("target"),
+		context.Background(), coordination.DomainID("domain"), policyPin("part", 1, 1, "target"),
 	)
 	if selected || !errors.Is(err, ErrBounds) || !errors.Is(err, ErrUnavailable) {
 		t.Fatalf("safety query = %v, %v; want fail-closed bounds", selected, err)
@@ -748,5 +769,104 @@ func TestLeaseSafetyQueryFailsClosedAtScanBound(t *testing.T) {
 	)
 	if selected || !errors.Is(err, ErrBounds) || !errors.Is(err, ErrUnavailable) {
 		t.Fatalf("index safety query = %v, %v; want fail-closed bounds", selected, err)
+	}
+	t.Run("exact membership", testLeaseSourceUsesExactPolicyAndIndexPinMembership)
+	t.Run("canonical commitment", testCreateLeaseValidatesCanonicalPolicyPinCommitment)
+}
+
+func testLeaseSourceUsesExactPolicyAndIndexPinMembership(t *testing.T) {
+	now := time.Date(2026, 8, 27, 16, 0, 0, 0, time.UTC)
+	store := newStore()
+	seedHead(t, store, baseHead(now))
+	client, _ := newClient(t, store, now, leases{})
+	initialize(t, client, now)
+
+	policyPins := []coordination.PolicyCopyPin{
+		policyPin("z-part", 7, 3, "z-visibility"),
+		policyPin("a-part", 4, 2, "a-visibility"),
+		policyPin("m-part", 6, 5, "m-visibility"),
+	}
+	indexPins := []coordination.IndexPin{
+		{Family: coordination.Family("tree"), IGEN: coordination.IGEN("i3")},
+		{Family: coordination.Family("association"), IGEN: coordination.IGEN("i1")},
+		{Family: coordination.Family("lexical"), IGEN: coordination.IGEN("i2")},
+	}
+	seedLease(t, store, client, now, coordination.LeaseID("active"), coordination.LeaseStateActive, policyPins, indexPins, time.Time{})
+	seedLease(t, store, client, now, coordination.LeaseID("released"), coordination.LeaseStateReleased,
+		[]coordination.PolicyCopyPin{policyPin("released", 1, 1, "released")}, []coordination.IndexPin{{Family: coordination.Family("released"), IGEN: coordination.IGEN("released")}}, time.Time{})
+	seedLease(t, store, client, now.Add(-2*time.Hour), coordination.LeaseID("expired"), coordination.LeaseStateActive,
+		[]coordination.PolicyCopyPin{policyPin("expired", 1, 1, "expired")}, []coordination.IndexPin{{Family: coordination.Family("expired"), IGEN: coordination.IGEN("expired")}}, now.Add(-time.Hour))
+
+	source := LeaseSource{Client: client}
+	for _, pin := range []coordination.PolicyCopyPin{policyPins[1], policyPins[2], policyPins[0]} {
+		selected, err := source.SelectsPolicyCopy(context.Background(), coordination.DomainID("domain"), pin)
+		if err != nil || !selected {
+			t.Fatalf("policy pin %+v selected=%v err=%v", pin, selected, err)
+		}
+	}
+	for name, pin := range map[string]coordination.PolicyCopyPin{
+		"nonmember":        policyPin("none", 1, 1, "none"),
+		"wrong map":        policyPin("m-part", 7, 5, "m-visibility"),
+		"wrong generation": policyPin("m-part", 6, 4, "m-visibility"),
+		"wrong visibility": policyPin("m-part", 6, 5, "other"),
+		"released":         policyPin("released", 1, 1, "released"),
+		"expired":          policyPin("expired", 1, 1, "expired"),
+	} {
+		selected, err := source.SelectsPolicyCopy(context.Background(), coordination.DomainID("domain"), pin)
+		if err != nil || selected {
+			t.Fatalf("%s policy pin selected=%v err=%v", name, selected, err)
+		}
+	}
+	for _, pin := range []coordination.IndexPin{indexPins[1], indexPins[2], indexPins[0]} {
+		selected, err := source.SelectsIndexGeneration(context.Background(), coordination.DomainID("domain"), pin.Family, pin.IGEN)
+		if err != nil || !selected {
+			t.Fatalf("index pin %+v selected=%v err=%v", pin, selected, err)
+		}
+	}
+	for name, pin := range map[string]coordination.IndexPin{
+		"nonmember": {Family: coordination.Family("lexical"), IGEN: coordination.IGEN("none")},
+		"released":  {Family: coordination.Family("released"), IGEN: coordination.IGEN("released")},
+		"expired":   {Family: coordination.Family("expired"), IGEN: coordination.IGEN("expired")},
+	} {
+		selected, err := source.SelectsIndexGeneration(context.Background(), coordination.DomainID("domain"), pin.Family, pin.IGEN)
+		if err != nil || selected {
+			t.Fatalf("%s index pin selected=%v err=%v", name, selected, err)
+		}
+	}
+}
+
+func testCreateLeaseValidatesCanonicalPolicyPinCommitment(t *testing.T) {
+	now := time.Date(2026, 8, 27, 16, 0, 0, 0, time.UTC)
+	store := newStore()
+	seedHead(t, store, baseHead(now))
+	client, _ := newClient(t, store, now, leases{})
+	initialize(t, client, now)
+	policyPins := []coordination.PolicyCopyPin{
+		policyPin("z", 3, 2, "z"), policyPin("a", 1, 1, "a"),
+	}
+	request := CreateLeaseRequest{
+		Owner: coordination.OwnerID("reader"), Fence: 1, Frontier: 10,
+		AuthorityGeneration: 1, RetentionGeneration: 1, PolicyGeneration: 3,
+		PolicyCopyPinDigest: coordination.PolicyCopyPinDigest(policyPins), PolicyCopyPins: policyPins,
+		Now: now, ExpiresAt: now.Add(time.Minute),
+	}
+	created, err := client.CreateLease(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if coordination.ComparePolicyCopyPins(created.Record.PolicyCopyPins[0], created.Record.PolicyCopyPins[1]) >= 0 ||
+		created.Record.PolicyCopyPinDigest != coordination.PolicyCopyPinDigest(created.Record.PolicyCopyPins) {
+		t.Fatalf("noncanonical lease readback: %+v", created.Record)
+	}
+	request.Owner = coordination.OwnerID("tampered")
+	request.PolicyCopyPinDigest = digest("tampered")
+	if _, err = client.CreateLease(context.Background(), request); err == nil {
+		t.Fatal("caller-supplied mismatched policy pin digest accepted")
+	}
+	request.Owner = coordination.OwnerID("duplicate")
+	request.PolicyCopyPins = append(policyPins, policyPins[0])
+	request.PolicyCopyPinDigest = coordination.PolicyCopyPinDigest(request.PolicyCopyPins)
+	if _, err = client.CreateLease(context.Background(), request); err == nil {
+		t.Fatal("duplicate policy pin accepted")
 	}
 }

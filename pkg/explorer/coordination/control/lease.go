@@ -54,11 +54,15 @@ func (c *Client) CreateLease(ctx context.Context, request CreateLeaseRequest) (L
 	if err := id.Validate(); err != nil {
 		return Lease{}, err
 	}
-	record := coordination.SnapshotLeaseV2{
+	record := coordination.SnapshotLeaseV3{
 		LeaseID: append(coordination.LeaseID(nil), id...), Frontier: request.Frontier, Owner: append(coordination.OwnerID(nil), request.Owner...),
 		Fence: request.Fence, AuthorityGeneration: request.AuthorityGeneration, RetentionGeneration: request.RetentionGeneration,
 		PolicyGeneration: request.PolicyGeneration, PolicyCopyPinDigest: request.PolicyCopyPinDigest,
-		IndexPins: clonePins(request.IndexPins), CreatedAt: now, RenewedAt: now, ExpiresAt: request.ExpiresAt, State: coordination.LeaseStateActive,
+		PolicyCopyPins: clonePolicyCopyPins(request.PolicyCopyPins), IndexPins: clonePins(request.IndexPins),
+		CreatedAt: now, RenewedAt: now, ExpiresAt: request.ExpiresAt, State: coordination.LeaseStateActive,
+	}
+	if err := record.Validate(); err != nil {
+		return Lease{}, err
 	}
 	if c.pins == nil {
 		return Lease{}, ErrUnavailable
@@ -275,6 +279,7 @@ func (c *Client) replaceTakenOverLease(ctx context.Context, current, next Lease)
 	if current.Record.Frontier != next.Record.Frontier ||
 		current.Record.PolicyGeneration != next.Record.PolicyGeneration ||
 		current.Record.PolicyCopyPinDigest != next.Record.PolicyCopyPinDigest ||
+		!equalPolicyCopyPins(current.Record.PolicyCopyPins, next.Record.PolicyCopyPins) ||
 		!equalPins(current.Record.IndexPins, next.Record.IndexPins) ||
 		!bytes.Equal(current.Record.LeaseID, next.Record.LeaseID) ||
 		!next.Record.ExpiresAt.After(current.Record.ExpiresAt) {
@@ -420,7 +425,7 @@ func sortLeases(result []Lease) {
 	})
 }
 
-func (c *Client) anyLease(ctx context.Context, now time.Time, predicate func(coordination.SnapshotLeaseV2) bool) (bool, error) {
+func (c *Client) anyLease(ctx context.Context, now time.Time, predicate func(coordination.SnapshotLeaseV3) bool) (bool, error) {
 	cursor := LeaseCursor{}
 	scanned := 0
 	for {
@@ -472,9 +477,22 @@ func clonePins(value []coordination.IndexPin) []coordination.IndexPin {
 	coordination.SortIndexPins(result)
 	return result
 }
+func clonePolicyCopyPins(value []coordination.PolicyCopyPin) []coordination.PolicyCopyPin {
+	result := make([]coordination.PolicyCopyPin, len(value))
+	for i := range value {
+		result[i] = coordination.PolicyCopyPin{
+			LPART:         append(coordination.LPART(nil), value[i].LPART...),
+			MapGeneration: value[i].MapGeneration, CopyGeneration: value[i].CopyGeneration,
+			VisibilityDigest: value[i].VisibilityDigest,
+		}
+	}
+	coordination.SortPolicyCopyPins(result)
+	return result
+}
 func cloneLease(value Lease) Lease {
 	value.Record.LeaseID = append(coordination.LeaseID(nil), value.Record.LeaseID...)
 	value.Record.Owner = append(coordination.OwnerID(nil), value.Record.Owner...)
+	value.Record.PolicyCopyPins = clonePolicyCopyPins(value.Record.PolicyCopyPins)
 	value.Record.IndexPins = clonePins(value.Record.IndexPins)
 	return value
 }
@@ -482,6 +500,17 @@ func leaseEqual(a, b Lease) bool {
 	av, _ := marshalLease(a)
 	bv, _ := marshalLease(b)
 	return bytes.Equal(av, bv)
+}
+func equalPolicyCopyPins(a, b []coordination.PolicyCopyPin) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for index := range a {
+		if coordination.ComparePolicyCopyPins(a[index], b[index]) != 0 {
+			return false
+		}
+	}
+	return true
 }
 func equalPins(a, b []coordination.IndexPin) bool {
 	if len(a) != len(b) {

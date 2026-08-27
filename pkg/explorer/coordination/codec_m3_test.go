@@ -114,11 +114,15 @@ func fixtureIndexActivation() IndexActivationV2 {
 	}
 }
 
-func fixtureLease() SnapshotLeaseV2 {
-	return SnapshotLeaseV2{
+func fixtureLease() SnapshotLeaseV3 {
+	policyPins := []PolicyCopyPin{
+		{LPART: LPART{0, 0xff, 'p'}, MapGeneration: 8, CopyGeneration: 7, VisibilityDigest: testDigest("visibility-1")},
+		{LPART: LPART("tree"), MapGeneration: 9, CopyGeneration: 6, VisibilityDigest: testDigest("visibility-2")},
+	}
+	return SnapshotLeaseV3{
 		LeaseID: LeaseID{0, 0xff, 'l'}, Frontier: 17, Owner: OwnerID("reader"),
 		Fence: 3, AuthorityGeneration: 7, RetentionGeneration: 8, PolicyGeneration: 9,
-		PolicyCopyPinDigest: testDigest("pins"),
+		PolicyCopyPinDigest: PolicyCopyPinDigest(policyPins), PolicyCopyPins: policyPins,
 		IndexPins: []IndexPin{
 			{Family: Family{0, 0xff, 'f'}, IGEN: IGEN("i1")},
 			{Family: Family("tree"), IGEN: IGEN("t1")},
@@ -180,7 +184,7 @@ func TestM3RecordGoldensRoundTripsAndEnvelopeRejection(t *testing.T) {
 		{"index_generation_v2.bin", KindIndexGeneration, func() ([]byte, error) { return MarshalIndexGenerationV2(fixtureIndexGeneration()) }, func(b []byte) (any, error) { return UnmarshalIndexGenerationV2(b) }, fixtureIndexGeneration()},
 		{"index_delta_v1.bin", KindIndexDelta, func() ([]byte, error) { return MarshalIndexDeltaV1(fixtureIndexDelta(t)) }, func(b []byte) (any, error) { return UnmarshalIndexDeltaV1(b) }, fixtureIndexDelta(t)},
 		{"index_activation_v2.bin", KindIndexActivation, func() ([]byte, error) { return MarshalIndexActivationV2(fixtureIndexActivation()) }, func(b []byte) (any, error) { return UnmarshalIndexActivationV2(b) }, fixtureIndexActivation()},
-		{"snapshot_lease_v2.bin", KindSnapshotLease, func() ([]byte, error) { return MarshalSnapshotLeaseV2(fixtureLease()) }, func(b []byte) (any, error) { return UnmarshalSnapshotLeaseV2(b) }, fixtureLease()},
+		{"snapshot_lease_v3.bin", KindSnapshotLease, func() ([]byte, error) { return MarshalSnapshotLeaseV3(fixtureLease()) }, func(b []byte) (any, error) { return UnmarshalSnapshotLeaseV3(b) }, fixtureLease()},
 		{"retirement_decision_v1.bin", KindRetirementDecision, func() ([]byte, error) { return MarshalRetirementDecisionV1(fixtureRetirement()) }, func(b []byte) (any, error) { return UnmarshalRetirementDecisionV1(b) }, fixtureRetirement()},
 		{"history_floor_v1.bin", KindHistoryFloor, func() ([]byte, error) { return MarshalHistoryFloorV1(fixtureFloor()) }, func(b []byte) (any, error) { return UnmarshalHistoryFloorV1(b) }, fixtureFloor()},
 		{"writer_authority_v1.bin", KindWriterAuthority, func() ([]byte, error) { return MarshalWriterAuthorityV1(fixtureAuthority()) }, func(b []byte) (any, error) { return UnmarshalWriterAuthorityV1(b) }, fixtureAuthority()},
@@ -423,8 +427,44 @@ func TestM3BoundsEnumsAbsenceAndOverflow(t *testing.T) {
 	}
 	lease := fixtureLease()
 	lease.CreatedAt = time.Time{}
-	if _, err := MarshalSnapshotLeaseV2(lease); err == nil {
+	if _, err := MarshalSnapshotLeaseV3(lease); err == nil {
 		t.Fatal("missing lease created_at accepted")
+	}
+	lease = fixtureLease()
+	lease.PolicyCopyPinDigest = testDigest("tampered")
+	if _, err := MarshalSnapshotLeaseV3(lease); err == nil {
+		t.Fatal("tampered policy-copy pin digest accepted")
+	}
+	lease = fixtureLease()
+	lease.PolicyCopyPins = make([]PolicyCopyPin, MaxPolicyCopyPins+1)
+	for index := range lease.PolicyCopyPins {
+		lease.PolicyCopyPins[index] = PolicyCopyPin{
+			LPART: LPART("part"), MapGeneration: Generation(index + 1), CopyGeneration: 1,
+			VisibilityDigest: testDigest("visibility"),
+		}
+	}
+	lease.PolicyCopyPinDigest = PolicyCopyPinDigest(lease.PolicyCopyPins)
+	if _, err := MarshalSnapshotLeaseV3(lease); err == nil {
+		t.Fatal("oversized policy-copy pin list accepted")
+	}
+	lease = fixtureLease()
+	lease.PolicyCopyPins = append(lease.PolicyCopyPins, lease.PolicyCopyPins[0])
+	lease.PolicyCopyPinDigest = PolicyCopyPinDigest(lease.PolicyCopyPins)
+	if _, err := MarshalSnapshotLeaseV3(lease); err == nil {
+		t.Fatal("duplicate policy-copy pin accepted")
+	}
+	lease = fixtureLease()
+	lease.IndexPins = make([]IndexPin, MaxIndexPins+1)
+	for index := range lease.IndexPins {
+		lease.IndexPins[index] = IndexPin{Family: Family("family"), IGEN: IGEN(string(rune(index + 1)))}
+	}
+	if _, err := MarshalSnapshotLeaseV3(lease); err == nil {
+		t.Fatal("oversized index pin list accepted")
+	}
+	lease = fixtureLease()
+	lease.IndexPins = append(lease.IndexPins, lease.IndexPins[0])
+	if _, err := MarshalSnapshotLeaseV3(lease); err == nil {
+		t.Fatal("duplicate index pin accepted")
 	}
 	authority := fixtureAuthority()
 	authority.State = AuthorityState(255)
@@ -434,6 +474,70 @@ func TestM3BoundsEnumsAbsenceAndOverflow(t *testing.T) {
 	}
 	if _, err := PolicyGenerationRow(DomainID("domain"), Generation(-1)); err == nil {
 		t.Fatal("overflowed generation accepted")
+	}
+}
+
+func TestSnapshotLeaseCanonicalPinSortingAndImmutability(t *testing.T) {
+	lease := fixtureLease()
+	lease.PolicyCopyPins[0], lease.PolicyCopyPins[1] = lease.PolicyCopyPins[1], lease.PolicyCopyPins[0]
+	lease.IndexPins[0], lease.IndexPins[1] = lease.IndexPins[1], lease.IndexPins[0]
+	encoded, err := MarshalSnapshotLeaseV3(lease)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := UnmarshalSnapshotLeaseV3(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ComparePolicyCopyPins(decoded.PolicyCopyPins[0], decoded.PolicyCopyPins[1]) >= 0 ||
+		CompareIndexPins(decoded.IndexPins[0], decoded.IndexPins[1]) >= 0 {
+		t.Fatal("snapshot lease pins were not canonically sorted")
+	}
+	reencoded, err := MarshalSnapshotLeaseV3(decoded)
+	if err != nil || !bytes.Equal(encoded, reencoded) {
+		t.Fatalf("canonical fixed point failed: %v", err)
+	}
+	next := decoded
+	next.ExpiresAt = next.ExpiresAt.Add(time.Minute)
+	next.RenewedAt = next.RenewedAt.Add(time.Minute)
+	next.PolicyCopyPins = append([]PolicyCopyPin(nil), next.PolicyCopyPins...)
+	next.PolicyCopyPins[0].CopyGeneration++
+	next.PolicyCopyPinDigest = PolicyCopyPinDigest(next.PolicyCopyPins)
+	if ValidateSnapshotLeaseTransition(decoded, next) == nil {
+		t.Fatal("changed policy-copy pins accepted across lease transition")
+	}
+	next = decoded
+	next.ExpiresAt = next.ExpiresAt.Add(time.Minute)
+	next.RenewedAt = next.RenewedAt.Add(time.Minute)
+	next.IndexPins = append([]IndexPin(nil), next.IndexPins...)
+	next.IndexPins[0].IGEN = IGEN("changed")
+	SortIndexPins(next.IndexPins)
+	if ValidateSnapshotLeaseTransition(decoded, next) == nil {
+		t.Fatal("changed index pins accepted across lease transition")
+	}
+}
+
+func TestSnapshotLeaseRejectsTamperedPersistedPinCommitment(t *testing.T) {
+	encoded, err := MarshalSnapshotLeaseV3(fixtureLease())
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := encoded[envelopeHeaderSize : len(encoded)-checksumSize]
+	d := decoder{data: payload}
+	_ = d.bytes("lease ID", MaxOpaqueIDBytes, true)
+	_ = d.positive("frontier")
+	_ = d.bytes("owner", MaxOwnerBytes, true)
+	for index := 0; index < 4; index++ {
+		_ = d.positive("generation")
+	}
+	if d.err != nil {
+		t.Fatal(d.err)
+	}
+	encoded[envelopeHeaderSize+d.offset] ^= 0xff
+	sum := Sum(encoded[:len(encoded)-checksumSize])
+	copy(encoded[len(encoded)-checksumSize:], sum[:])
+	if _, err := UnmarshalSnapshotLeaseV3(encoded); err == nil {
+		t.Fatal("tampered persisted policy-copy pin digest accepted")
 	}
 }
 

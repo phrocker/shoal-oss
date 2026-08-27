@@ -170,13 +170,14 @@ func (s *memoryStore) put(cell allocator.Cell) {
 }
 
 type fixtures struct {
-	authority Authority
-	status    OperationDisposition
-	policyErr error
-	indexErr  error
-	policyPin bool
-	indexPin  bool
-	outcomes  []CommittedOutcome
+	authority     Authority
+	status        OperationDisposition
+	policyErr     error
+	indexErr      error
+	policyPin     bool
+	indexPin      bool
+	seenPolicyPin coordination.PolicyCopyPin
+	outcomes      []CommittedOutcome
 }
 
 func (f *fixtures) Current(context.Context, coordination.DomainID) (Authority, error) {
@@ -185,7 +186,8 @@ func (f *fixtures) Current(context.Context, coordination.DomainID) (Authority, e
 func (f *fixtures) Status(context.Context, coordination.DomainID, []byte) (OperationDisposition, error) {
 	return f.status, nil
 }
-func (f *fixtures) SelectsPolicyCopy(context.Context, coordination.DomainID, coordination.LPART, coordination.Generation, coordination.Digest) (bool, error) {
+func (f *fixtures) SelectsPolicyCopy(_ context.Context, _ coordination.DomainID, pin coordination.PolicyCopyPin) (bool, error) {
+	f.seenPolicyPin = pin
 	return f.policyPin, nil
 }
 func (f *fixtures) SelectsIndexGeneration(context.Context, coordination.DomainID, coordination.Family, coordination.IGEN) (bool, error) {
@@ -321,6 +323,12 @@ func TestPolicyLifecycleAndUnknownReadback(t *testing.T) {
 	fixture.policyPin = true
 	if err := client.RetirePolicyCopy(context.Background(), fence, set, 19); !errors.Is(err, ErrLeaseActive) {
 		t.Fatalf("lease retirement error = %v", err)
+	}
+	if coordination.ComparePolicyCopyPins(fixture.seenPolicyPin, coordination.PolicyCopyPin{
+		LPART: mapping.LPART, MapGeneration: mapping.MapGeneration,
+		CopyGeneration: mapping.CopyGeneration, VisibilityDigest: mapping.VisibilityDigest,
+	}) != 0 {
+		t.Fatalf("retirement queried wrong exact policy pin: %+v", fixture.seenPolicyPin)
 	}
 	fixture.policyPin = false
 	if err := client.RetirePolicyCopy(context.Background(), fence, set, 19); err != nil {

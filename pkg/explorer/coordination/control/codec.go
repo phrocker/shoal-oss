@@ -116,7 +116,7 @@ func (r *reader) done() error {
 }
 
 func marshalLease(value Lease) ([]byte, error) {
-	inner, err := coordination.MarshalSnapshotLeaseV2(value.Record)
+	inner, err := coordination.MarshalSnapshotLeaseV3(value.Record)
 	if err != nil {
 		return nil, err
 	}
@@ -144,7 +144,7 @@ func unmarshalLease(value []byte) (Lease, error) {
 	if err := r.done(); err != nil {
 		return Lease{}, err
 	}
-	result.Record, err = coordination.UnmarshalSnapshotLeaseV2(inner)
+	result.Record, err = coordination.UnmarshalSnapshotLeaseV3(inner)
 	if err != nil || result.RecordGeneration <= 0 || result.UpdatedAt.IsZero() {
 		return Lease{}, ErrCorruption
 	}

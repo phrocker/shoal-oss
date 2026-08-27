@@ -69,7 +69,7 @@ const (
 	VersionIndexGenerationV2     uint16 = 2
 	VersionIndexDeltaV1          uint16 = 1
 	VersionIndexActivationV2     uint16 = 2
-	VersionSnapshotLeaseV2       uint16 = 2
+	VersionSnapshotLeaseV3       uint16 = 3
 	VersionRetirementDecisionV1  uint16 = 1
 	VersionHistoryFloorV1        uint16 = 1
 	VersionWriterAuthorityV1     uint16 = 1

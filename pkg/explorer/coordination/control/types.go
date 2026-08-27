@@ -24,6 +24,7 @@ package control
 import (
 	"context"
 	"errors"
+	"sort"
 	"time"
 
 	"github.com/phrocker/shoal-oss/pkg/explorer/coordination"
@@ -64,7 +65,7 @@ type Store interface {
 }
 
 type PinVerifier interface {
-	VerifySnapshotPins(context.Context, coordination.DomainID, coordination.SnapshotLeaseV2) error
+	VerifySnapshotPins(context.Context, coordination.DomainID, coordination.SnapshotLeaseV3) error
 }
 
 type RetentionLeaseVerifier interface {
@@ -126,7 +127,7 @@ type Config struct {
 }
 
 type Lease struct {
-	Record           coordination.SnapshotLeaseV2
+	Record           coordination.SnapshotLeaseV3
 	RecordGeneration coordination.Generation
 	UpdatedAt        time.Time
 }
@@ -139,6 +140,7 @@ type CreateLeaseRequest struct {
 	RetentionGeneration coordination.Generation
 	PolicyGeneration    coordination.Generation
 	PolicyCopyPinDigest coordination.Digest
+	PolicyCopyPins      []coordination.PolicyCopyPin
 	IndexPins           []coordination.IndexPin
 	Now                 time.Time
 	ExpiresAt           time.Time
@@ -301,12 +303,19 @@ func (s AuthoritySource) AllocatorAuthority(ctx context.Context, domain coordina
 
 type LeaseSource struct{ Client *Client }
 
-func (s LeaseSource) SelectsPolicyCopy(ctx context.Context, domain coordination.DomainID, _ coordination.LPART, generation coordination.Generation, digest coordination.Digest) (bool, error) {
+func (s LeaseSource) SelectsPolicyCopy(ctx context.Context, domain coordination.DomainID, pin coordination.PolicyCopyPin) (bool, error) {
 	if s.Client == nil || string(domain) != string(s.Client.domain) {
 		return false, ErrUnavailable
 	}
-	return s.Client.anyLease(ctx, s.Client.now(), func(l coordination.SnapshotLeaseV2) bool {
-		return l.PolicyGeneration == generation && l.PolicyCopyPinDigest == digest
+	if err := pin.Validate(); err != nil {
+		return false, err
+	}
+	return s.Client.anyLease(ctx, s.Client.now(), func(l coordination.SnapshotLeaseV3) bool {
+		index := sort.Search(len(l.PolicyCopyPins), func(index int) bool {
+			return coordination.ComparePolicyCopyPins(l.PolicyCopyPins[index], pin) >= 0
+		})
+		return index < len(l.PolicyCopyPins) &&
+			coordination.ComparePolicyCopyPins(l.PolicyCopyPins[index], pin) == 0
 	})
 }
 
@@ -314,12 +323,11 @@ func (s LeaseSource) SelectsIndexGeneration(ctx context.Context, domain coordina
 	if s.Client == nil || string(domain) != string(s.Client.domain) {
 		return false, ErrUnavailable
 	}
-	return s.Client.anyLease(ctx, s.Client.now(), func(l coordination.SnapshotLeaseV2) bool {
-		for _, pin := range l.IndexPins {
-			if string(pin.Family) == string(family) && string(pin.IGEN) == string(igen) {
-				return true
-			}
-		}
-		return false
+	pin := coordination.IndexPin{Family: family, IGEN: igen}
+	return s.Client.anyLease(ctx, s.Client.now(), func(l coordination.SnapshotLeaseV3) bool {
+		index := sort.Search(len(l.IndexPins), func(index int) bool {
+			return coordination.CompareIndexPins(l.IndexPins[index], pin) >= 0
+		})
+		return index < len(l.IndexPins) && coordination.CompareIndexPins(l.IndexPins[index], pin) == 0
 	})
 }
