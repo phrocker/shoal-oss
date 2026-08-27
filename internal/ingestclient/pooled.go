@@ -23,8 +23,9 @@ type Pooled struct {
 	credentials *security.TCredentials
 	closed      bool
 
-	dial      transportpool.DialFunc
-	newClient func(io.Closer) (ingestRPC, error)
+	dial                 transportpool.DialFunc
+	newClient            func(io.Closer) (ingestRPC, error)
+	newConditionalClient func(io.Closer) (conditionalRPC, error)
 }
 
 var _ Adapter = (*Pooled)(nil)
@@ -58,6 +59,7 @@ func NewPooled(
 	}
 	pooled.dial = pooled.dialThrift
 	pooled.newClient = pooled.newThriftRPC
+	pooled.newConditionalClient = pooled.newThriftConditionalRPC
 	return pooled, nil
 }
 

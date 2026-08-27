@@ -111,7 +111,7 @@ without pretending that Accumulo offers cross-row transactions.
 | Authorization core | `pkg/explorer/auth` provides immutable decisions, capability-bound context resolution, canonical policy/visibility encoding, service-role ceilings, scanner-authorization derivation, generation guards, partitioned cache keys, and redacted audit values. | Durable authority/policy-copy catalogs, authenticated gRPC interceptor wiring, and Accumulo service-account deployment remain later work. |
 | Embedded storage | `proto/embed.proto:ConditionalWrite` defines row-local conditional mutation semantics; `ScanRequest.as_of` defines lower-level timestamp filtering. | These are storage primitives, not a public Explorer snapshot, document, graph, citation, or authorization contract. |
 | Accumulo reads | `accumulo/scanner.go` exposes scanner authorizations, columns, and iterator settings. `batch_scanner.go` documents input-range/tablet order unless multi-scan is used. `scan_stream.go` bounds memory to a scanner batch. | Accumulo scans are not a multi-row/multi-table snapshot. Batch and stream results may be accompanied by errors. |
-| Accumulo writes | `accumulo/mutation.go` provides one-row puts/deletes. `batch_writer.go` provides bounded buffering, durability, safe retries, and explicit ambiguous-partial-commit failure. | BatchWriter is not atomic across mutations. No public Accumulo `ConditionalWriter`/conditional-mutation API is currently exposed; the publication CAS in this design is an implementation prerequisite. |
+| Accumulo writes | `accumulo/mutation.go` provides one-row puts/deletes. `batch_writer.go` provides bounded buffering, durability, safe retries, and explicit ambiguous-partial-commit failure. `conditional_writer.go` exposes exact-row absence/value conditions, optional exact timestamps, and Accepted/Rejected/Unknown results over the native Accumulo conditional-update protocol. `pkg/explorer/coordination` provides bounded deterministic M3 record/key vocabulary, including transaction leases and physical `PartitionCommitCopyV1` fences. The allocator, guard, catalog, and control packages provide their documented row-CAS lifecycles. `pkg/explorer/coordination/transaction` adds absent-or-identical claims, immutable manifest chunks, sorted guard acquisition, owner-fenced allocation/takeover, injected physical write/verification, row-atomic root-plus-LPART publication, terminal outcome/checkpoint/finalization, deterministic stored results, corruption quarantine, an in-memory durable fault backend, and trusted Accumulo mutation mapping. `pkg/explorer/coordination/recovery` adds bounded band scanning, authoritative recheck, lease takeover, concurrency caps, cancellation, and bounded backoff. | BatchWriter is not atomic across mutations. The live Accumulo physical sink, concrete document/graph materializer binding, deployment schema/bootstrap, and live-cluster fault suite are deferred. Policy relabel and index-rebuild packages have independent recovery primitives; a single end-to-end live fault campaign spanning those operations is not yet present. |
 | Accumulo ordering/history | `accumulo/key.go:Key.Compare` defines row/CF/CQ/visibility ascending, timestamp descending, tombstone-first ordering. | Scanner order is not public Explorer order, and versioning/compaction can remove cell history. |
 | Accumulo security | `accumulo/authorizations.go`, `column_visibility.go`, `scanner.go`, and `security.go` expose byte-exact authorizations, boolean visibility expressions, per-scan authorizations, and user/table/namespace permissions. | They do not derive labels from a Shoal principal, prevent blank visibility, or define Explorer non-disclosure. |
 | Table administration | `accumulo/table_admin.go`, `table_properties.go`, `table_add_splits.go`, and `table_bulk_import.go` expose table creation, properties, binary splits, and manager-authoritative bulk import. | Explorer-specific locality groups, iterator stacks, split plans, retention, and compaction policy do not exist today. |
@@ -489,16 +489,23 @@ creation.
 | `explorer_tree` — rebuildable preorder/path/range index | `V1 ‖ kind ‖ E(IGEN) ‖ B8('T',D,doc) ‖ E(D) ‖ E(doc) ‖ E(rev) ‖ suffix` | `p:path -> TreePathV3{...,txn,epoch,lpart,copyPolicyGeneration,vdigest,igen}`; `r:range -> RangeRefV3{...,txn,epoch,lpart,copyPolicyGeneration,vdigest,igen}`; `o:outline -> OutlineRefV3{...,txn,epoch,lpart,copyPolicyGeneration,vdigest,igen}` | `EPOCH` | Active revision physical copy | `paths={p}`, `ranges={r}`, `outline={o}` | One row per index entry; canonical sections/spans remain authoritative. | Retain while IGEN and revision are selectable. |
 | `explorer_associations` — canonical association generations/tombstones plus rebuildable forward/reverse joins | Canonical: `V1 ‖ 'C' ‖ B8('A',D,assoc) ‖ E(D) ‖ E(assoc) ‖ INV64(EPOCH) ‖ E(TXN)`; document direction: `V1 ‖ 'D' ‖ E(IGEN) ‖ B8('A',D,doc) ‖ E(D) ‖ E(doc) ‖ E(rev) ‖ SK ‖ E(sourceID) ‖ E(assoc) ‖ INV64(EPOCH) ‖ E(TXN)`; graph direction: analogous `'G' ‖ E(IGEN) ‖ GK ‖ E(graphID) ‖ E(assoc) ‖ INV64(EPOCH) ‖ E(TXN)` | `o:association -> AssociationV3{state,endpoints,relation,txn,epoch,digest,lpart,copyPolicyGeneration,vdigest}`; `x:ref -> AssociationRefV3{state,assoc,txn,epoch,digest,lpart,copyPolicyGeneration,vdigest,igen}` | `EPOCH` | Active conjunction physical copy | `object={o}`, `index={x}` | Canonical row hashes association ID; directional rows hash lookup endpoint. Winner validation precedes scope/evidence joins. | Canonical generations follow endpoint history; index rows follow IGEN. |
 | `explorer_entity_heads` — authoritative expected-base/activation guard | `V1 ‖ 'H' ‖ B8('H',D,kind,id) ‖ E(D) ‖ kind ‖ E(id)` | `s:head -> EntityHeadV2{winnerState,winnerID,winnerEpoch,logicalDigest,lpart,logicalPolicyID,retirementGeneration}`; `s:pending -> PendingMutationV2{txn,preconditionMode,expectedBase,intendedLogicalDigest,intendedLpart,owner,lease,fence,writerAuthorityGeneration,reuse}` | Monotonic state generation | Fixed control visibility | `state={s}` | One row per logical document/node/edge/association or index family. Multi-entity bundles acquire rows in canonical order. | Retained beyond entity/index data so stale writers cannot recreate retired state, fork activation, or bypass `ABSENT_OR_IDENTICAL`. |
-| `explorer_commits` — bounded TXN root, allocator/reservation/frontier authority, and immutable epoch outcomes | TXN: `V1 ‖ 'T' ‖ B8('C',D,TXN) ‖ E(D) ‖ E(TXN)`; allocator/frontier: `V1 ‖ 'Q' ‖ B8('C',D) ‖ E(D)`; outcome: `V1 ‖ 'O' ‖ B8('C',D) ‖ E(D) ‖ U64(EPOCH)` | TXN `s:root -> TxnRootV3{state,logicalDigest,tokenHash,epoch,owner,fence,manifestRoot,chunkCount,lparts,result}` and commit copy `p:E(LPART) ‖ U64(COPYGEN) ‖ VDIGEST -> PartitionCommitCopyV1{COMMITTED,txn,epoch,lpart,copyPolicyGeneration,vdigest,logicalDigest,physicalCopyDigest,requiredIndexFamilies}`; allocator `q:{next,retiredThrough,frontier,lastVisibleAt,checkpointDigest,historyFloor,retentionGeneration,writerAuthorityGeneration,writerMode,writerHolder,writerFence,importPlanDigest,importMaxEpoch}`, `r:U64(epoch) -> ReservationV1{txn,owner,lease,fence,authorityGeneration,state}`, and `f:INV_TIME(visibleAt) ‖ U64(frontier) -> FrontierCheckpointV1{frontier,visibleAt,predecessorDigest,outcomesDigest,digest}`; outcome `o:terminal -> EpochOutcomeV1{epoch,txn,state,ownerFence,authorityGeneration,digest}` | TXN/allocator state generation; commit-copy/reservation/outcome uses epoch; checkpoint history cell uses frontier | Each `p:*` coordinate uses the physical visibility whose digest is VDIGEST; control cells use service visibility | `root={s}`, `partitionCopies={p}`, `allocator={q,r,f}`, `outcome={o}` | One intentional allocator/frontier row per domain with bounded active reservations; TXN/outcome rows split normally. Checkpoint history is batched and pruned only below history floor; domain partitioning is the scale boundary. | Logical root/outcomes are immutable; commit copies follow retained policy generations; terminal reservations retire only after checkpoint. |
+| `explorer_commits` — bounded TXN root, allocator/reservation/frontier authority, and immutable epoch outcomes | TXN: `V1 ‖ 'T' ‖ B8('C',D,TXN) ‖ E(D) ‖ E(TXN)`; allocator/frontier: `V1 ‖ 'Q' ‖ B8('C',D) ‖ E(D)`; outcome: `V1 ‖ 'O' ‖ B8('C',D) ‖ E(D) ‖ U64(EPOCH)` | TXN `s:root -> TxnRootV3{state,logicalDigest,tokenHash,epoch,owner,fence,manifestRoot,chunkCount,lparts,result}` and commit copy `p:E(LPART) ‖ U64(COPYGEN) ‖ VDIGEST -> PartitionCommitCopyV1{COMMITTED,txn,epoch,lpart,copyPolicyGeneration,vdigest,logicalDigest,physicalCopyDigest,requiredIndexFamilies}`; allocator `q:{headGeneration,next,retiredThrough,frontier,lastVisibleAt,checkpointDigest,historyFloor,retentionGeneration,writerAuthorityGeneration,writerMode,writerHolder,writerFence,importPlanDigest,importMaxEpoch}`, `r:U64(epoch) -> ReservationV1{reservationGeneration,txn,owner,lease,fence,authorityGeneration,state}`, and `f:INV_TIME(visibleAt) ‖ U64(frontier) -> FrontierCheckpointV1{frontier,visibleAt,predecessorDigest,outcomesDigest,digest}`; outcome `o:terminal -> EpochOutcomeV1{epoch,txn,state,ownerFence,authorityGeneration,digest}` | Allocator head uses its strictly increasing `headGeneration`; reservations use strictly increasing `reservationGeneration`; commit copies/outcomes use epoch; checkpoint history uses frontier | Each `p:*` coordinate uses the physical visibility whose digest is VDIGEST; control cells use service visibility | `root={s}`, `partitionCopies={p}`, `allocator={q,r,f}`, `outcome={o}` | One intentional allocator/frontier row per domain with bounded active reservations; TXN/outcome rows split normally. Checkpoint history is batched and pruned only below history floor; domain partitioning is the scale boundary. | Logical root/outcomes are immutable; commit copies follow retained policy generations; terminal reservations retire only after checkpoint. |
 | `explorer_transaction_manifests` — bounded manifest chunks | `V1 ‖ 'M' ‖ B8('M',D,TXN) ‖ E(D) ‖ E(TXN) ‖ U32(chunk)` | `m:chunk -> ManifestChunkV2{index,entryCount,encodedBytes,logicalEntriesDigest,physicalEntriesDigest,previousDigest}`; each entry includes LPART, COPYGEN, VDIGEST, logical digest, and physical-copy digest | TXN state generation | Control visibility; VDIGEST is stored, not raw expressions | `manifest={m}` | At most 4,096 entries and 1 MiB encoded bytes per row. Root row contains only chunk count/totals/logical root digest. | Retain with TXN through repair/idempotency horizon. Verification requires contiguous chunk indices, chained digests, root totals, and every manifest-declared row/copy. |
-| `explorer_policy_copies` — sealed physical-copy manifests, per-LPART mapping history, and relabel-generation fence | Copy: `V1 ‖ 'C' ‖ B8('Y',D,LPART) ‖ E(D) ‖ E(LPART) ‖ U64(COPYGEN) ‖ VDIGEST`; map: `V1 ‖ 'M' ‖ B8('Y',D,LPART) ‖ E(D) ‖ E(LPART) ‖ INV64(MAPGEN) ‖ VDIGEST`; relabel root: `V1 ‖ 'G' ‖ B8('Y',D) ‖ E(D) ‖ U64(MAPGEN)` | `c:copy -> PolicyCopyManifestV1{SEALED,lpart,copyPolicyGeneration,vdigest,logicalDigest,physicalCopyDigest,rowCount,manifestRoot}`; `m:active -> PolicyCopyMapV3{lpart,mapPolicyGeneration,copyPolicyGeneration,vdigest,copyDigest,activationKind,activationRef}`; `p:commit -> PolicyGenerationCommitV2{COMMITTED,predecessorGeneration,mode,changedMapRoot,changedLpartCount,digest}` | COPYGEN / MAPGEN | Control visibility; copied data/commit cells retain their data visibility | `copy={c}`, `mapping={m}`, `generation={p}` | Per-LPART mapping rows sort newest MAPGEN first. An initial mapping is activated by its content TXN; relabel mappings are activated together by the generation root. Partial maps/copies are ignored. | Retain mapping history/copies while requests may pin MAPGEN; delete old physical data copies only after leases drain. |
+| `explorer_policy_copies` — sealed physical-copy manifests, per-LPART mapping history, and relabel-generation fence | Copy/fence: `V1 ‖ 'C' ‖ B8('Y',D,LPART) ‖ E(D) ‖ E(LPART) ‖ U64(COPYGEN) ‖ VDIGEST`; map: `V1 ‖ 'M' ‖ B8('Y',D,LPART) ‖ E(D) ‖ E(LPART) ‖ INV64(MAPGEN) ‖ VDIGEST`; relabel root: `V1 ‖ 'G' ‖ B8('Y',D) ‖ E(D) ‖ U64(MAPGEN)` | `c:copy -> PolicyCopyManifestV1{SEALED,lpart,copyPolicyGeneration,vdigest,logicalDigest,physicalCopyDigest,rowCount,manifestRoot}`; `c:fence -> PolicyFence{owner,lease,fence,authorityGeneration,retentionGeneration,publicationMarker?,retirementMarker?}` where the publication marker embeds and digests the exact active `PolicyCopyMapV3`, and retirement binds that publication plus predecessor/successor root digests; `m:active -> PolicyCopyMapV3{lpart,mapPolicyGeneration,copyPolicyGeneration,vdigest,copyDigest,activationKind,activationRef}`; `p:commit -> PolicyGenerationCommitV2{COMMITTED,predecessorGeneration,mode,changedMapRoot,changedLpartCount,digest}` | Fence record generation / COPYGEN / MAPGEN | Control visibility; copied data/commit cells retain their data visibility | `copy={c}`, `mapping={m}`, `generation={p}` | Map rows are immutable but non-selectable until the same-row fence CAS publishes an exact marker. Takeover preserves committed markers. Retirement is selectable-as-retired as soon as its same-row authorization marker commits, and any reconciler may finish the bound root transition after a crash. Missing or mismatched markers fail closed. | Retain mapping history/copies while requests may pin MAPGEN; delete old physical data copies only after leases drain. |
 | `explorer_index_generations` — build/seal manifests, durable delta journal, and activation checkpoints | Manifest: `V1 ‖ 'G' ‖ B8('G',D,family,IGEN) ‖ E(D) ‖ E(family) ‖ E(IGEN)`; delta: `V1 ‖ 'D' ‖ B8('G',D,family,IGEN) ‖ E(D) ‖ E(family) ‖ E(IGEN) ‖ U64(EPOCH) ‖ E(TXN)`; activation: `V1 ‖ 'A' ‖ B8('G',D,family) ‖ E(D) ‖ E(family) ‖ INV64(activationEpoch) ‖ E(IGEN)` | `m:manifest -> IndexGenerationV2{state=BUILDING/SEALED,family,igen,schema,buckets,buildThrough,deltaThrough,policyCopyCoverageDigest,digest}`; `d:delta -> IndexDeltaV1{epoch,txn,requiredRowsDigest,state}`; `a:active -> IndexActivationV2{activationEpoch,igen,manifestDigest,txn,lpart,copyPolicyGeneration,vdigest}` | Build generation / content epoch / activation epoch | Control visibility | `manifest={m}`, `delta={d}`, `activation={a}` | Generation-specific delta rows split by epoch. No mutable active pointer; request at H chooses newest committed activation `<=H` and verifies SEALED manifest/copy coverage. | Keep deltas through seal/activation recovery; retain generation until no snapshot/cursor selects it. |
-| `explorer_snapshot_leases` — authoritative active reader/cursor pins | `V1 ‖ 'L' ‖ B8('L',D,lease) ‖ E(D) ‖ E(lease)` | `l:lease -> SnapshotLeaseV2{owner,fence,frontier,retentionGeneration,policyGeneration,policyCopyPinDigest,indexPins,expiresAt,state}` | Lease generation | Control visibility | `lease={l}` | One row per process-level reader lease or cursor; process leases publish their minimum active H and union of policy/IGEN pins. | Expire only by authenticated lease clock/heartbeat rules; retained briefly for audit. |
+| `explorer_snapshot_leases` — authoritative active reader/cursor pins | `V1 ‖ 'L' ‖ B8('L',D,lease) ‖ E(D) ‖ E(lease)` | `l:lease -> SnapshotLeaseV3{owner,fence,frontier,retentionGeneration,policyGeneration,policyCopyPins,policyCopyPinDigest,indexPins,expiresAt,state}` | Lease generation | Control visibility | `lease={l}` | One row per process-level reader lease or cursor; process leases publish their minimum active H and bounded canonical unions of exact policy-copy/IGEN pins. | Expire only by authenticated lease clock/heartbeat rules; retained briefly for audit. |
 | `explorer_retirements` — authoritative per-identity retirement records | `V1 ‖ 'R' ‖ B8('X',D,kind,id) ‖ E(D) ‖ kind ‖ E(id)` | `r:retired -> RetirementV1{retirementGeneration,retiredThroughEpoch,lastDigest,reason,writerAuthorityGeneration}` | Retirement generation | Fixed control visibility | `retirement={r}` | One row per retired identity; checked with entity guard before mutation. | Retained permanently or beyond all token/claim reuse horizons. |
 | `explorer_status` — non-authoritative recovery/GC/snapshot hints | `V1 ‖ kind ‖ bucket ‖ E(D) ‖ stateOrDeadline ‖ E(resource)` | `i:ref -> StatusRefV1{authoritativeRow,state,deadline,generation}`; `d:summary -> redacted diagnostic` | Status generation | Control visibility | `index={i}`, `diagnostic={d}` | Time/state buckets. Every entry is rechecked against allocator, TXN, entity-head, or retirement authority. | Hints expire; never used alone for publication, floor, retirement, or writer authority. |
 | `explorer_vector_exact` — **deferred** exact embeddings | `V1 ‖ 'V' ‖ B8('V',D,doc) ‖ E(D) ‖ E(model) ‖ E(doc) ‖ E(rev) ‖ K ‖ E(target)` | `v:embedding -> ExactVectorV2{dimension,precision,metric,bytes,txn,epoch,lpart,copyPolicyGeneration,vdigest}` | `EPOCH` | Active target physical copy | `vectors={v}` | One row per target/model. | Not created initially. |
 | `explorer_vector_postings` — **deferred** approximate postings | `V1 ‖ 'P' ‖ E(IGEN) ‖ bucket ‖ E(D) ‖ E(model) ‖ U32(centroid) ‖ E(doc) ‖ E(rev) ‖ K ‖ E(target)` | `p:code -> VectorPostingV2{code,exactRef,txn,epoch,lpart,copyPolicyGeneration,vdigest,igen}` | `EPOCH` | Active target physical copy | `postings={p}` | Generation-specific centroid/target buckets. | Not created initially; follows IGEN retention. |
 | `explorer_vector_manifests` — **deferred** vector model assets | `V1 ‖ 'M' ‖ B8('V',D,model,IGEN) ‖ E(D) ‖ E(model) ‖ E(IGEN)` | `m:manifest -> VectorManifestV1{metric,dimension,precision,codebookDigest,state}` | Activation epoch | Control visibility; no protected corpus statistics exposed | `manifest={m}` | One row per model generation. | Not created initially. |
+
+The catalog implementation uses bounded `ECA2` internal envelopes for
+generation heads, owner/fence metadata (including versioned optional
+publication/retirement marker extensions), and policy-copy manifest-set roots.
+They include a kind byte, payload length, and SHA-256 checksum. These are
+pre-GA V1 coordination formats and may change before the first compatibility
+commitment; public object and canonical logical codecs are unaffected.
 
 ### 4.3 Why no Accumulo-version revision model
 
@@ -678,6 +685,22 @@ The allocator row is the authority for `next`, active owner-bearing
 reservations, history floor, retention generation, and writer authority. One
 row mutation performs allocation plus reservation. The active window is
 bounded; allocation returns `unavailable` rather than exceed it.
+The mutable `q:head` record starts at `headGeneration=1`; every accepted
+logical head mutation increments it exactly once and writes the head cell at
+that explicit timestamp. Epoch and frontier values are never reused as head
+timestamps, because a later retirement or low-frontier checkpoint must not be
+shadowed by an older allocation with a larger epoch timestamp.
+Bootstrap calls `EnsureInitialized` with trusted domain configuration and
+conditionally creates exactly `q:head` at explicit timestamp 1. An identical
+existing initial head is success; a different valid head conflicts, and an
+invalid record/timestamp pair is corruption. There is no external
+implicit-timestamp seeding requirement.
+
+Each active reservation starts at `reservationGeneration=1`. Every mutable
+reservation transition increments that generation exactly once and uses it as
+the reservation cell timestamp; the epoch remains in the qualifier and value.
+This avoids same-coordinate/same-timestamp differing values and leaves a
+monotonic version axis for later lease renewal or fenced takeover work.
 
 Each terminal reservation is copied to an immutable outcome row:
 
@@ -763,8 +786,18 @@ copies therefore cannot double count, displace candidates, or consume limits.
 The coordinator creates/refreshes an authoritative snapshot lease before
 data scans. Short unary requests MAY share a process lease containing the
 minimum active H and union of active policy-copy/IGEN pins; cursors require
-their own lease. Failure to establish/refresh a required lease is
-`unavailable`.
+their own lease. Policy-copy pins are bounded, canonically sorted, duplicate
+free `(LPART, MAPGEN, COPYGEN, VDIGEST)` tuples. Their aggregate digest is a
+canonical commitment for cache keys, not a membership oracle. Index pins are
+bounded, canonically sorted, duplicate-free `(family, IGEN)` tuples.
+Retirement tests exact tuple membership in active, unexpired leases and fails
+closed on malformed records or scan bounds. Failure to establish/refresh a
+required lease is `unavailable`.
+
+Snapshot lease wire version 3 adds the exact policy-copy tuple list and is
+intentionally incompatible with version 2. M3 is pre-GA and has no supported
+persisted live lease records; deployments using development version-2 records
+must discard them rather than attempting an ambiguous migration.
 
 Accumulo may return data written after the request started, but its epoch is
 greater than the pin and is rejected. Data at or below the pin is immutable.
@@ -1452,8 +1485,8 @@ Canonical comparison hashes logical values, not physical cells:
 | Standalone tree/graph seeds | Public fixed-planner validation and embedded pre-scan rejection exist. | Scoped/association/hybrid seed sources are bounded; standalone empty-seed tree/graph returns deterministic `unavailable` before I/O in every adapter/transport. |
 | Errors | **Existing:** `pkg/shoal/errors_test.go` and gRPC tests cover categories/mapping. | Missing, hidden, conflict, corrupt, overload, cancellation, deadline, history-pruned, and mode-unavailable cases match. |
 | Safe retries | **Existing lower-level:** `accumulo/batch_writer_test.go` covers bounded safe retries and ambiguous terminal failures. | High-level retry never duplicates artifacts or epochs and never exposes staged rows. |
-| Epoch allocation/frontier crash windows | No high-level coverage. | Fault/ambiguous response before/after allocator mutation, reservation terminalization, outcome write, checkpoint write, and reservation retirement yields no lost slot or frontier/time disagreement. |
-| Partial writes/crash recovery | No high-level coverage. | Fault after each claim/guard/manifest chunk/mutation/verification/LPART commit-copy/outcome/head-finalization boundary converges to committed or terminal. |
+| Epoch allocation/frontier crash windows | The allocator package covers accepted/rejected/unknown reservation, terminal outcome, checkpoint, retirement, one-sided corruption, bounded batches, and concurrent unique allocation without live Accumulo. Entity-guard tests cover exact-row acquisition/finalization readback, mixed-state corruption, deterministic multi-row ordering/rollback, renewal, and takeover without live Accumulo. End-to-end ingestion/recovery-worker coverage is not yet present. | Extend the conformance harness through publication, worker restart, authority cutover/rollback, and checkpoint wait boundaries. |
+| Partial writes/crash recovery | Guard-row accepted-before/after and contradictory partial-row outcomes are covered at the injected store seam. High-level TXN claims, manifest/materialization writes, commit-copy/outcome orchestration, and worker restart coverage remain absent. | Fault after each claim/manifest chunk/mutation/verification/LPART commit-copy/outcome boundary and prove convergence to committed or terminal. |
 | Manifest chunking | No shared coverage. | Missing, duplicate, reordered, oversized, and digest-broken chunks fail before commit; large valid manifests keep TXN root bounded. |
 | Mid-read failures | Public scanners can return values plus errors. | Accumulated partial values are never serialized; retry stays on the same snapshot. |
 | Authorization | Accumulo scan authorizations exist; no Explorer bridge. | Public/empty/restricted grants, mixed scopes, hidden intermediates, counts, scores, explanations, caches, and logs show noninterference. |
@@ -1674,6 +1707,29 @@ After the agreed rollback window:
 | M8 — Canary and cutover | M7 | Generation-bound routing, reverse replication, fenced cutover/rollback, SLO gates | Exactly one writer authority throughout; all promotion gates green through rollback window |
 | M9 — Vector evaluation (**deferred**) | M0, M6–M8 plus separate vector contract | Accumulo-native exact/ANN prototype and conformance/recall/security suite | Explicit accuracy/freshness semantics, no unauthorized displacement, and operational approval |
 
+The M3 control slice is implemented in
+`pkg/explorer/coordination/control`: authoritative snapshot leases, atomic
+allocator-row history-floor/head updates, retirement decisions, durable
+writer authority synchronized with the allocator head, backend observations,
+and a fail-closed routing/cutover barrier. The package uses injected exact
+read/prefix-scan/row-CAS, UTC clocks, pin/object/migration verifiers, and an
+optional trusted exact deleter. Catalog and entity-guard adapters consume the
+agreed durable state; allocator's Accumulo store provides matching bounded
+prefix/seek scans. Physical object deletion, background scheduling/status
+indexes, and live-cluster fault tests remain later integration work.
+
+The M3 transaction slice is implemented in
+`pkg/explorer/coordination/transaction` and
+`pkg/explorer/coordination/recovery`. Transaction roots and leases use exact
+row reads/CAS and monotonic generations; manifest rows are immutable; initial
+LPART commit copies and the committed root are one bounded row mutation.
+Recovery rechecks roots, manifests, guards, reservations, outcomes, and
+frontiers rather than trusting queue hints. The reusable
+`internal/explorerconformance` checks the durable in-memory fault model and
+trusted Accumulo physical-cell mapping. Live Accumulo integration, a concrete
+Explorer document/graph physical sink, and combined policy/index rebuild
+fault campaigns remain explicitly deferred.
+
 M1 now has concrete package surfaces in `pkg/explorer/canonical`,
 `pkg/explorer/codematerializer`, `pkg/retrieval/ranking.go`, and
 `internal/explorerconformance`. The embedded reference runs the harness with
@@ -1690,10 +1746,11 @@ and restart with a reused in-process policy catalog. M3/M4 must replace that
 catalog with atomic durable policy/publication state before cross-process or
 Accumulo restart guarantees are claimed.
 
-The dependency order is intentional. Recovery, retirement, frontier,
-manifest, and writer-authority machinery is complete in M3, before any
-document/graph milestone can claim restart or fault tolerance. Migration
-cannot begin before all serving semantics and recovery paths pass.
+The dependency order is intentional. M3 supplies the reusable transaction,
+recovery, retirement, frontier, manifest, and writer-authority machinery
+before a document/graph adapter may claim restart or fault tolerance.
+Migration cannot begin before the deferred concrete adapter and live
+integration paths pass.
 
 ## 13. Explicit non-goals
 
@@ -1727,7 +1784,8 @@ relax the normative behavior above.
 
 | Item | Why it matters / required decision |
 |---|---|
-| Native Accumulo conditional writer | Current public `accumulo` API does not expose it. Claims, fencing, and publication are blocked without a supported native implementation. Embedded `ConditionalWrite` is not a substitute for Accumulo internals. |
+| Native Accumulo conditional writer | The M3 slices expose a public exact-row API over Accumulo's native conditional-update RPC, the bounded coordination vocabulary, a production allocator client with allocator-head fencing, row-atomic reservations/checkpoints/retirement, immutable outcomes, and a production entity-guard client with canonical acquisition ordering, APPEND/ABSENT_OR_IDENTICAL decisions inside row CAS, renewal/takeover fencing, publication-authority-gated finalization, retention checks, and authoritative ambiguous-response readback. Both use trusted Scanner/ConditionalWriter mapping. High-level TXN/revision claims and ingestion/materialization orchestration, LPART commit-copy writing, durable catalogs/mirrors, snapshot-lease lifecycle, routing, authority lifecycle, and recovery/reconciliation workers remain incomplete. These slices do not make full M3 complete. |
+| Pre-GA allocator wire compatibility | `AllocatorHeadV1` and `ReservationV1` currently include explicit monotonic record generations. This branch has not shipped, so their V1 fixtures were updated in place and no migration from the earlier branch-only bytes is provided. |
 | Public contract adoption | M0 adopts byte-offset, normalization, scope, error, and traversal rules in `docs/explorer-public-contract.md`. Winner/tombstone persistence, publication frontiers, authorization, and mutation shapes remain later additive work and must not be inferred from the value helpers. |
 | Embedded historical export | Migration requires exact publication order/time and canonical source bytes. If embedded storage cannot export them, promotion is blocked rather than approximated. |
 | Shared ranking implementation | Exact analyzer, scorer, fusion, and authorized-projection statistics must be shared or proven byte-equivalent; storage-local approximations are not acceptable. |
