@@ -21,6 +21,7 @@ package ontology
 
 import (
 	"context"
+	"regexp"
 	"sort"
 	"strconv"
 	"time"
@@ -457,6 +458,9 @@ func (r ExtractionResult) Validate() error {
 		if err := validateBoundedVersion(proposal.ProposedVersion(), r.limits); err != nil {
 			return err
 		}
+		if err := validateBoundedMetadata(proposal.schema.metadata, r.limits); err != nil {
+			return err
+		}
 		if err := validateBoundedMetadata(proposal.Metadata(), r.limits); err != nil {
 			return err
 		}
@@ -510,6 +514,7 @@ func (r ExtractionResult) ValidateFor(request ExtractionRequest) error {
 		relationships[relationship.ID()] = relationship
 	}
 	propertyOwners := make(map[shoal.ID]map[shoal.ID]struct{})
+	propertyPatterns := make(map[shoal.ID]*regexp.Regexp)
 	for _, concept := range request.version.concepts {
 		for _, property := range concept.properties {
 			if propertyOwners[property] == nil {
@@ -522,6 +527,14 @@ func (r ExtractionResult) ValidateFor(request ExtractionRequest) error {
 		for _, property := range relationship.properties {
 			if propertyOwners[property] == nil {
 				propertyOwners[property] = make(map[shoal.ID]struct{})
+			}
+			for _, property := range request.version.properties {
+				for _, constraint := range property.constraints {
+					if constraint.Kind() == ConstraintPattern {
+						pattern, _ := constraint.Pattern()
+						propertyPatterns[property.ID()] = regexp.MustCompile(pattern)
+					}
+				}
 			}
 			propertyOwners[property][relationship.ID()] = struct{}{}
 		}
@@ -551,7 +564,9 @@ func (r ExtractionResult) ValidateFor(request ExtractionRequest) error {
 			if !exists {
 				return invalid("assertion references an unknown property")
 			}
-			if err := validatePropertyValue(property, assertion.Object()); err != nil {
+			if err := validatePropertyValue(
+				property, assertion.Object(), propertyPatterns[property.ID()],
+			); err != nil {
 				return err
 			}
 			if IDNamespace(subjectType) == "concept" {
@@ -653,11 +668,13 @@ func (r ExtractionResult) ValidateFor(request ExtractionRequest) error {
 	return nil
 }
 
-func validatePropertyValue(property PropertyDefinition, value Value) error {
+func validatePropertyValue(
+	property PropertyDefinition, value Value, pattern *regexp.Regexp,
+) error {
 	if !valueMatchesType(value, property.ValueType()) {
 		return invalid("assertion value does not match property type")
 	}
-	if !valueSatisfiesConstraints(value, property.constraints, true) {
+	if !valueSatisfiesConstraints(value, property.constraints, true, pattern) {
 		return invalid("assertion value violates property constraints")
 	}
 	return nil
@@ -739,7 +756,9 @@ func extractionResultID(result ExtractionResult) (shoal.ID, error) {
 			return "", err
 		}
 		proposalIDs[index] = canonicalParts(
-			string(proposal.ID()), canonicalMetadata(proposal.metadata))
+			string(proposal.ID()), proposal.schema.canonical(),
+			canonicalMetadata(proposal.metadata),
+		)
 	}
 	return deriveID(
 		"extraction",
@@ -925,6 +944,9 @@ func preflightExtractionResult(
 		}
 	}
 	for _, proposal := range proposals {
+		if err := validateBoundedMetadata(proposal.schema.metadata, limits); err != nil {
+			return err
+		}
 		size += proposalPayloadBytes(proposal)
 		if size > uint64(limits.MaxPayloadBytes) {
 			return invalid("extraction result payload exceeds result limit")

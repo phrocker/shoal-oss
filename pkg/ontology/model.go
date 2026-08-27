@@ -790,6 +790,9 @@ func (a Assertion) Validate() error {
 		return err
 	}
 	if a.objectType != "" {
+		if IDNamespace(a.predicate) != "relationship" {
+			return invalid("assertion object type requires a relationship predicate")
+		}
 		if err := validateTypedID(a.objectType, "concept"); err != nil {
 			return err
 		}
@@ -1156,6 +1159,7 @@ func (d PropertyDefinition) Validate() error {
 	var minimumCount, maximumCount *uint32
 	var minimumValue, maximumValue *Value
 	var allowedValues []Value
+	var compiledPattern *regexp.Regexp
 	for index, constraint := range d.constraints {
 		if err := constraint.Validate(); err != nil {
 			return err
@@ -1191,6 +1195,8 @@ func (d PropertyDefinition) Validate() error {
 			if d.valueType != ValueString {
 				return invalid("pattern constraint requires a string property")
 			}
+			pattern, _ := constraint.Pattern()
+			compiledPattern = regexp.MustCompile(pattern)
 		case ConstraintAllowedValues:
 			allowedValues = constraint.AllowedValues()
 			for _, value := range allowedValues {
@@ -1213,7 +1219,7 @@ func (d PropertyDefinition) Validate() error {
 		return invalid("minimum value exceeds maximum value")
 	}
 	for _, value := range allowedValues {
-		if !valueSatisfiesConstraints(value, d.constraints, false) {
+		if !valueSatisfiesConstraints(value, d.constraints, false, compiledPattern) {
 			return invalid("allowed value contradicts property constraints")
 		}
 	}
@@ -1321,6 +1327,7 @@ func compareNumericValues(left, right Value) int {
 
 func valueSatisfiesConstraints(
 	value Value, constraints []Constraint, includeAllowed bool,
+	compiledPattern *regexp.Regexp,
 ) bool {
 	for _, constraint := range constraints {
 		switch constraint.Kind() {
@@ -1335,9 +1342,12 @@ func valueSatisfiesConstraints(
 				return false
 			}
 		case ConstraintPattern:
-			pattern, _ := constraint.Pattern()
 			text, _ := value.StringValue()
-			if !regexp.MustCompile(pattern).MatchString(text) {
+			if compiledPattern == nil {
+				pattern, _ := constraint.Pattern()
+				compiledPattern = regexp.MustCompile(pattern)
+			}
+			if !compiledPattern.MatchString(text) {
 				return false
 			}
 		case ConstraintAllowedValues:
