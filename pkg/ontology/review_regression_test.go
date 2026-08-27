@@ -80,7 +80,7 @@ func TestExtractionRejectsEvidenceWithDifferentMetadata(t *testing.T) {
 		t.Fatal("request identity did not include evidence metadata")
 	}
 	assertion := mustAssertion(
-		t, fixture.title.ID(), ontology.AssertionExplicit,
+		t, fixture.person.ID(), fixture.title.ID(), ontology.AssertionExplicit,
 		[]ontology.EvidenceRef{altered}, fixture.provenance,
 	)
 	_, err = ontology.NewExtractionResult(
@@ -131,10 +131,12 @@ func TestExtractionAppliesPropertyValueAndCardinalityConstraints(t *testing.T) {
 		first, _ := ontology.NewAssertion(
 			"entity:one", uniqueProperty.ID(), value, ontology.AssertionExplicit, 1,
 			[]ontology.EvidenceRef{fixture.evidence}, fixture.provenance, nil,
+			ontology.WithAssertionSubjectType(fixture.person.ID()),
 		)
 		second, _ := ontology.NewAssertion(
 			"entity:two", uniqueProperty.ID(), value, ontology.AssertionExplicit, 1,
 			[]ontology.EvidenceRef{fixture.evidence}, fixture.provenance, nil,
+			ontology.WithAssertionSubjectType(fixture.person.ID()),
 		)
 		if _, err := ontology.NewExtractionResult(
 			request, []ontology.Assertion{first, second}, nil,
@@ -153,6 +155,7 @@ func TestExtractionAppliesPropertyValueAndCardinalityConstraints(t *testing.T) {
 		"entity:person-1", numeric.ID(), ontology.NewIntegerValue(15),
 		ontology.AssertionExplicit, 1, []ontology.EvidenceRef{fixture.evidence},
 		fixture.provenance, nil,
+		ontology.WithAssertionSubjectType(fixture.person.ID()),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -182,6 +185,7 @@ func TestExtractionAppliesPropertyValueAndCardinalityConstraints(t *testing.T) {
 	patternMismatch, err := ontology.NewAssertion(
 		"entity:person-1", code.ID(), lower, ontology.AssertionExplicit, 1,
 		[]ontology.EvidenceRef{fixture.evidence}, fixture.provenance, nil,
+		ontology.WithAssertionSubjectType(fixture.person.ID()),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -198,10 +202,12 @@ func TestExtractionAppliesPropertyValueAndCardinalityConstraints(t *testing.T) {
 	first, _ := ontology.NewAssertion(
 		"entity:person-1", code.ID(), firstValue, ontology.AssertionExplicit, 1,
 		[]ontology.EvidenceRef{fixture.evidence}, fixture.provenance, nil,
+		ontology.WithAssertionSubjectType(fixture.person.ID()),
 	)
 	second, _ := ontology.NewAssertion(
 		"entity:person-1", code.ID(), secondValue, ontology.AssertionExplicit, 1,
 		[]ontology.EvidenceRef{secondEvidence}, fixture.provenance, nil,
+		ontology.WithAssertionSubjectType(fixture.person.ID()),
 	)
 	if _, err := ontology.NewExtractionResult(
 		request, []ontology.Assertion{first, second}, nil,
@@ -325,6 +331,7 @@ func TestExtractionPayloadBudgetBoundsVariableText(t *testing.T) {
 		"entity:person-1", fixture.title.ID(), largeValue,
 		ontology.AssertionExplicit, 1, []ontology.EvidenceRef{fixture.evidence},
 		fixture.provenance, nil,
+		ontology.WithAssertionSubjectType(fixture.person.ID()),
 	)
 	if err != nil {
 		t.Fatal(err)

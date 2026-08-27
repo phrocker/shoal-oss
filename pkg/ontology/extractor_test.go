@@ -201,7 +201,7 @@ func TestExtractionRejectsEvidenceOutsideRequest(t *testing.T) {
 	}
 	outside := mustEvidence(t, 10, 15, "outside")
 	assertion := mustAssertion(
-		t, fixture.title.ID(), ontology.AssertionExplicit,
+		t, fixture.person.ID(), fixture.title.ID(), ontology.AssertionExplicit,
 		[]ontology.EvidenceRef{outside}, fixture.provenance,
 	)
 	_, err = ontology.NewExtractionResult(
@@ -225,7 +225,7 @@ func TestExtractionRejectsUnknownAndMismatchedDefinitions(t *testing.T) {
 	unknown := mustProperty(
 		t, "unknown", "Unknown", "", ontology.ValueString, nil, nil)
 	unknownAssertion := mustAssertion(
-		t, unknown.ID(), ontology.AssertionExplicit,
+		t, fixture.person.ID(), unknown.ID(), ontology.AssertionExplicit,
 		[]ontology.EvidenceRef{fixture.evidence}, fixture.provenance,
 	)
 	_, err = ontology.NewExtractionResult(
@@ -242,6 +242,7 @@ func TestExtractionRejectsUnknownAndMismatchedDefinitions(t *testing.T) {
 		"entity:person-1", fixture.score.ID(), stringValue,
 		ontology.AssertionExplicit, 1,
 		[]ontology.EvidenceRef{fixture.evidence}, fixture.provenance, nil,
+		ontology.WithAssertionSubjectType(fixture.project.ID()),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -260,6 +261,8 @@ func TestExtractionRejectsUnknownAndMismatchedDefinitions(t *testing.T) {
 		"entity:person-1", fixture.worksOn.ID(), relationshipValue,
 		ontology.AssertionExplicit, 1,
 		[]ontology.EvidenceRef{fixture.evidence}, fixture.provenance, nil,
+		ontology.WithAssertionSubjectType(fixture.person.ID()),
+		ontology.WithAssertionObjectType(fixture.project.ID()),
 	)
 	if err != nil {
 		t.Fatal(err)

@@ -93,7 +93,7 @@ func TestTypedIdentityUniquenessAndAssertionOrigin(t *testing.T) {
 
 	otherEvidence := mustEvidence(t, 1, 8, "project")
 	otherAssertion := mustAssertion(
-		t, fixture.title.ID(), ontology.AssertionExplicit,
+		t, fixture.person.ID(), fixture.title.ID(), ontology.AssertionExplicit,
 		[]ontology.EvidenceRef{otherEvidence}, fixture.provenance,
 	)
 	if otherAssertion.ID() == fixture.explicit.ID() {
@@ -784,11 +784,11 @@ func newOntologyFixture(t *testing.T) ontologyFixture {
 		t.Fatal(err)
 	}
 	explicit := mustAssertion(
-		t, title.ID(), ontology.AssertionExplicit,
+		t, person.ID(), title.ID(), ontology.AssertionExplicit,
 		[]ontology.EvidenceRef{evidence}, provenance,
 	)
 	inferred := mustAssertion(
-		t, title.ID(), ontology.AssertionInferred,
+		t, person.ID(), title.ID(), ontology.AssertionInferred,
 		[]ontology.EvidenceRef{evidence}, provenance,
 	)
 	return ontologyFixture{
@@ -840,6 +840,7 @@ func validCitation(start, end int64) document.Citation {
 
 func mustAssertion(
 	t *testing.T,
+	subjectType shoal.ID,
 	predicate shoal.ID,
 	origin ontology.AssertionOrigin,
 	evidence []ontology.EvidenceRef,
@@ -853,6 +854,7 @@ func mustAssertion(
 	assertion, err := ontology.NewAssertion(
 		"entity:person-1", predicate, value, origin, 0.9,
 		evidence, provenance, shoal.Metadata{"review": "pending"},
+		ontology.WithAssertionSubjectType(subjectType),
 	)
 	if err != nil {
 		t.Fatal(err)

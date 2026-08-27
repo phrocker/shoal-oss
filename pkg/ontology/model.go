@@ -688,15 +688,39 @@ const (
 
 // Assertion is one immutable, cited ontology fact.
 type Assertion struct {
-	id         shoal.ID
-	subject    shoal.ID
-	predicate  shoal.ID
-	object     Value
-	origin     AssertionOrigin
-	confidence shoal.Score
-	evidence   []EvidenceRef
-	provenance ExtractionProvenance
-	metadata   shoal.Metadata
+	id          shoal.ID
+	subject     shoal.ID
+	subjectType shoal.ID
+	predicate   shoal.ID
+	object      Value
+	objectType  shoal.ID
+	origin      AssertionOrigin
+	confidence  shoal.Score
+	evidence    []EvidenceRef
+	provenance  ExtractionProvenance
+	metadata    shoal.Metadata
+}
+
+type assertionOptions struct {
+	subjectType shoal.ID
+	objectType  shoal.ID
+}
+
+// AssertionOption binds ontology type context to an assertion.
+type AssertionOption func(*assertionOptions)
+
+// WithAssertionSubjectType identifies the subject's concept or relationship type.
+func WithAssertionSubjectType(subjectType shoal.ID) AssertionOption {
+	return func(options *assertionOptions) {
+		options.subjectType = subjectType
+	}
+}
+
+// WithAssertionObjectType identifies a relationship object's concept type.
+func WithAssertionObjectType(objectType shoal.ID) AssertionOption {
+	return func(options *assertionOptions) {
+		options.objectType = objectType
+	}
 }
 
 // NewAssertion creates a cited explicit or inferred assertion.
@@ -709,9 +733,17 @@ func NewAssertion(
 	evidence []EvidenceRef,
 	provenance ExtractionProvenance,
 	metadata shoal.Metadata,
+	options ...AssertionOption,
 ) (Assertion, error) {
+	config := assertionOptions{}
+	for _, option := range options {
+		if option != nil {
+			option(&config)
+		}
+	}
 	assertion := Assertion{
-		subject: subject, predicate: predicate, object: object, origin: origin,
+		subject: subject, subjectType: config.subjectType,
+		predicate: predicate, object: object, objectType: config.objectType, origin: origin,
 		confidence: confidence, evidence: cloneEvidence(evidence),
 		provenance: provenance.clone(), metadata: cloneMetadata(metadata),
 	}
@@ -738,6 +770,15 @@ func (a Assertion) Validate() error {
 	if err := validateReference(a.subject, "assertion subject"); err != nil {
 		return err
 	}
+	if a.subjectType != "" {
+		if err := ValidateID(a.subjectType); err != nil {
+			return err
+		}
+		namespace := IDNamespace(a.subjectType)
+		if namespace != "concept" && namespace != "relationship" {
+			return invalid("assertion subject type must be a concept or relationship")
+		}
+	}
 	if err := ValidateID(a.predicate); err != nil {
 		return err
 	}
@@ -747,6 +788,11 @@ func (a Assertion) Validate() error {
 	}
 	if err := a.object.Validate(); err != nil {
 		return err
+	}
+	if a.objectType != "" {
+		if err := validateTypedID(a.objectType, "concept"); err != nil {
+			return err
+		}
 	}
 	switch a.origin {
 	case AssertionExplicit, AssertionInferred:
@@ -792,12 +838,20 @@ func (a Assertion) Subject() shoal.ID {
 	return a.subject
 }
 
+func (a Assertion) SubjectType() (shoal.ID, bool) {
+	return a.subjectType, a.subjectType != ""
+}
+
 func (a Assertion) Predicate() shoal.ID {
 	return a.predicate
 }
 
 func (a Assertion) Object() Value {
 	return a.object
+}
+
+func (a Assertion) ObjectType() (shoal.ID, bool) {
+	return a.objectType, a.objectType != ""
 }
 
 func (a Assertion) Origin() AssertionOrigin {
@@ -850,8 +904,10 @@ func assertionID(assertion Assertion) (shoal.ID, error) {
 	return deriveID(
 		"assertion",
 		string(assertion.subject),
+		string(assertion.subjectType),
 		string(assertion.predicate),
 		assertion.object.canonical(),
+		string(assertion.objectType),
 		string(assertion.origin),
 		canonicalFloat(float64(assertion.confidence)),
 		canonicalParts(evidenceIDs...),
