@@ -1,0 +1,1208 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements. See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership. The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License. You may obtain a copy of the License at
+ *
+ *     https://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied. See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+package authorized
+
+import (
+	"context"
+	"encoding/binary"
+	"sort"
+	"strings"
+	"sync"
+	"unicode/utf8"
+
+	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
+	"github.com/phrocker/shoal-oss/pkg/graph"
+	"github.com/phrocker/shoal-oss/pkg/shoal"
+)
+
+// RevisionRegistration is the immutable policy-catalog record for one exact
+// revision. Current controls an atomic current-node/current-edge projection;
+// it is not part of immutable content equality.
+type RevisionRegistration struct {
+	DocumentID     shoal.ID
+	RevisionID     shoal.ID
+	NodeIDs        []shoal.ID
+	IntrinsicEdges []graph.Edge
+	ContentDigest  auth.Digest
+	Rule           AccessRule
+	Current        bool
+}
+
+// NodeRegistration identifies the current revision and rule owning a node.
+type NodeRegistration struct {
+	DocumentID shoal.ID
+	RevisionID shoal.ID
+	Rule       AccessRule
+}
+
+// EdgeRegistration owns an edge and only its edge-local rule. Endpoint rules
+// are deliberately not flattened into this record and must be read from the
+// current node catalog on every authorization. DocumentID and RevisionID are
+// set for revision-intrinsic edges and empty for application edges.
+type EdgeRegistration struct {
+	Edge       graph.Edge
+	DocumentID shoal.ID
+	RevisionID shoal.ID
+	Rule       AccessRule
+}
+
+// MutationLease serializes base mutations shared by clients using one store.
+type MutationLease interface {
+	Release()
+}
+
+// SourcePolicyClaim reserves one source URI under a policy rule. Pending
+// claims represent an unresolved mutation and require authorization under both
+// Rule and PreviousRule when the latter is present. Version is an opaque
+// compare-and-swap generation owned by the PolicyStore.
+type SourcePolicyClaim struct {
+	SourceURI     string
+	Rule          AccessRule
+	PreviousRule  *AccessRule
+	Pending       bool
+	Version       uint64
+	hadPriorClaim bool
+	priorPending  bool
+	priorVersion  uint64
+	acquisitionID uint64
+	tokenSeal     auth.Digest
+}
+
+// PolicyStore is the non-durable M2 policy-catalog boundary. Implementations
+// must make each put and source-claim transition atomic and return independent
+// values from reads. A successful source-claim CAS exclusively owns that URI
+// until it is committed, pended, or rolled back. For the exact token returned
+// by a successful CAS, each finalizer must be local, atomic, idempotent for the
+// same outcome, and infallible; errors indicate invalid tokens or store
+// invariant violations. That token is a capability: SourceClaim must return
+// only observable claim state and never a value a finalizer would accept, so
+// that reading a claim cannot finalize one. Fallible durable coordination
+// belongs to M3.
+type PolicyStore interface {
+	AcquireMutation(context.Context) (MutationLease, error)
+	SourceClaim(context.Context, string) (SourcePolicyClaim, bool, error)
+	CompareAndSwapSourceClaim(
+		context.Context, string, *SourcePolicyClaim, AccessRule,
+	) (SourcePolicyClaim, error)
+	CommitSourceClaim(context.Context, SourcePolicyClaim) error
+	PendSourceClaim(context.Context, SourcePolicyClaim) error
+	RollbackSourceClaim(context.Context, SourcePolicyClaim) error
+	PutRevision(context.Context, RevisionRegistration) error
+	Revision(context.Context, shoal.ID, shoal.ID) (RevisionRegistration, bool, error)
+	CurrentRevision(context.Context, shoal.ID) (RevisionRegistration, bool, error)
+	Node(context.Context, shoal.ID) (NodeRegistration, bool, error)
+	ReserveEdge(context.Context, EdgeRegistration) error
+	RollbackEdgeReservation(context.Context, EdgeRegistration) error
+	PutEdge(context.Context, EdgeRegistration) error
+	Edge(context.Context, shoal.ID) (EdgeRegistration, bool, error)
+}
+
+type revisionKey struct {
+	documentID shoal.ID
+	revisionID shoal.ID
+}
+
+// sourceClaimState separates the observable claim from the sealed
+// finalization capability. token is populated only while held and is never
+// returned by a read, so observing a claim never confers the ability to
+// finalize it.
+type sourceClaimState struct {
+	claim SourcePolicyClaim
+	token SourcePolicyClaim
+	held  bool
+}
+
+// MemoryPolicyStore is a concurrency-safe reference catalog. Reusing the same
+// instance across wrapped-client restarts preserves registrations, but process
+// exit loses them; it is not durable recovery storage.
+type MemoryPolicyStore struct {
+	mutationMu     sync.Mutex
+	mu             sync.RWMutex
+	sourceClaims   map[string]sourceClaimState
+	sourceVersion  uint64
+	revisions      map[revisionKey]RevisionRegistration
+	revisionIDs    map[shoal.ID]revisionKey
+	current        map[shoal.ID]revisionKey
+	nodes          map[shoal.ID]NodeRegistration
+	intrinsicEdges map[shoal.ID]EdgeRegistration
+	edgeClaims     map[shoal.ID]EdgeRegistration
+	edges          map[shoal.ID]EdgeRegistration
+}
+
+// NewMemoryPolicyStore constructs an empty reference catalog.
+func NewMemoryPolicyStore() *MemoryPolicyStore {
+	return &MemoryPolicyStore{
+		sourceClaims:   make(map[string]sourceClaimState),
+		revisions:      make(map[revisionKey]RevisionRegistration),
+		revisionIDs:    make(map[shoal.ID]revisionKey),
+		current:        make(map[shoal.ID]revisionKey),
+		nodes:          make(map[shoal.ID]NodeRegistration),
+		intrinsicEdges: make(map[shoal.ID]EdgeRegistration),
+		edgeClaims:     make(map[shoal.ID]EdgeRegistration),
+		edges:          make(map[shoal.ID]EdgeRegistration),
+	}
+}
+
+type memoryMutationLease struct {
+	store *MemoryPolicyStore
+	once  sync.Once
+}
+
+func (l *memoryMutationLease) Release() {
+	if l == nil || l.store == nil {
+		return
+	}
+	l.once.Do(l.store.mutationMu.Unlock)
+}
+
+// AcquireMutation serializes base mutations across all wrappers sharing this
+// policy store so authorization checks remain pinned through the base write.
+func (s *MemoryPolicyStore) AcquireMutation(
+	ctx context.Context,
+) (MutationLease, error) {
+	if err := contextFailure(ctx); err != nil {
+		return nil, err
+	}
+	if s == nil {
+		return nil, catalogUnavailable()
+	}
+	s.mutationMu.Lock()
+	if err := contextFailure(ctx); err != nil {
+		s.mutationMu.Unlock()
+		return nil, err
+	}
+	return &memoryMutationLease{store: s}, nil
+}
+
+// SourceClaim returns the current source-URI policy claim without its
+// finalization capability, so an observed claim can never be committed,
+// pended, or rolled back by a caller that does not hold the CAS token.
+func (s *MemoryPolicyStore) SourceClaim(
+	ctx context.Context,
+	sourceURI string,
+) (SourcePolicyClaim, bool, error) {
+	if err := contextFailure(ctx); err != nil {
+		return SourcePolicyClaim{}, false, err
+	}
+	if err := validateSourceURI(sourceURI); err != nil {
+		return SourcePolicyClaim{}, false, err
+	}
+	if s == nil {
+		return SourcePolicyClaim{}, false, catalogUnavailable()
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	state, ok := s.sourceClaims[sourceURI]
+	if !ok {
+		return SourcePolicyClaim{}, false, nil
+	}
+	cloned, err := cloneSourcePolicyClaim(state.claim)
+	if err != nil {
+		return SourcePolicyClaim{}, false, catalogUnavailable()
+	}
+	return cloned, true, nil
+}
+
+// CompareAndSwapSourceClaim atomically acquires exclusive mutation ownership.
+// A committed claim may transition to a desired rule. A pending claim may only
+// reacquire ownership for its existing desired rule. A nil expected claim
+// requires the URI to be unclaimed.
+func (s *MemoryPolicyStore) CompareAndSwapSourceClaim(
+	ctx context.Context,
+	sourceURI string,
+	expected *SourcePolicyClaim,
+	desired AccessRule,
+) (SourcePolicyClaim, error) {
+	if err := contextFailure(ctx); err != nil {
+		return SourcePolicyClaim{}, err
+	}
+	if err := validateSourceURI(sourceURI); err != nil {
+		return SourcePolicyClaim{}, err
+	}
+	rule, err := desired.clone()
+	if err != nil {
+		return SourcePolicyClaim{}, err
+	}
+	var normalizedExpected *SourcePolicyClaim
+	if expected != nil {
+		cloned, cloneErr := cloneSourcePolicyClaim(*expected)
+		if cloneErr != nil {
+			return SourcePolicyClaim{}, cloneErr
+		}
+		if cloned.SourceURI != sourceURI || cloned.Version == 0 {
+			return SourcePolicyClaim{}, shoal.NewError(
+				shoal.ErrorInvalidArgument, "source policy claim is invalid")
+		}
+		normalizedExpected = &cloned
+	}
+	if s == nil {
+		return SourcePolicyClaim{}, catalogUnavailable()
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.initialize()
+	current, exists := s.sourceClaims[sourceURI]
+	if current.held {
+		return SourcePolicyClaim{}, catalogConflict()
+	}
+	if normalizedExpected == nil {
+		if exists {
+			return SourcePolicyClaim{}, catalogConflict()
+		}
+	} else if !exists ||
+		!sourcePolicyClaimsEqual(current.claim, *normalizedExpected) {
+		return SourcePolicyClaim{}, catalogConflict()
+	}
+	if exists && current.claim.Pending &&
+		!current.claim.Rule.equal(rule) {
+		return SourcePolicyClaim{}, catalogConflict()
+	}
+	if s.sourceVersion == ^uint64(0) {
+		return SourcePolicyClaim{}, catalogUnavailable()
+	}
+	s.sourceVersion++
+	claim := SourcePolicyClaim{
+		SourceURI:     sourceURI,
+		Rule:          rule,
+		Pending:       true,
+		Version:       s.sourceVersion,
+		hadPriorClaim: exists,
+		acquisitionID: s.sourceVersion,
+	}
+	state := sourceClaimState{held: true}
+	if exists {
+		claim.priorPending = current.claim.Pending
+		claim.priorVersion = current.claim.Version
+		if current.claim.Pending {
+			if current.claim.PreviousRule != nil {
+				previousRule, ruleErr := current.claim.PreviousRule.clone()
+				if ruleErr != nil {
+					return SourcePolicyClaim{}, catalogUnavailable()
+				}
+				claim.PreviousRule = &previousRule
+			}
+		} else {
+			previousRule, ruleErr := current.claim.Rule.clone()
+			if ruleErr != nil {
+				return SourcePolicyClaim{}, catalogUnavailable()
+			}
+			claim.PreviousRule = &previousRule
+		}
+	}
+	claim.tokenSeal = sourceClaimTokenSeal(claim)
+	state.token = claim
+	state.claim = sourceClaimObservable(claim)
+	s.sourceClaims[sourceURI] = state
+	return cloneSourcePolicyClaim(claim)
+}
+
+// CommitSourceClaim releases exclusive mutation ownership, makes the desired
+// rule authoritative, and clears pending recovery state.
+func (s *MemoryPolicyStore) CommitSourceClaim(
+	ctx context.Context,
+	claim SourcePolicyClaim,
+) error {
+	return s.finishSourceClaim(ctx, claim, sourceClaimFinishCommit)
+}
+
+// PendSourceClaim releases exclusive mutation ownership while preserving an
+// unresolved desired/previous rule pair for an authorized recovery attempt.
+func (s *MemoryPolicyStore) PendSourceClaim(
+	ctx context.Context,
+	claim SourcePolicyClaim,
+) error {
+	return s.finishSourceClaim(ctx, claim, sourceClaimFinishPending)
+}
+
+// RollbackSourceClaim releases exclusive mutation ownership and restores the
+// claim that preceded the CAS, deleting a newly-created claim.
+func (s *MemoryPolicyStore) RollbackSourceClaim(
+	ctx context.Context,
+	claim SourcePolicyClaim,
+) error {
+	return s.finishSourceClaim(ctx, claim, sourceClaimFinishRollback)
+}
+
+type sourceClaimFinish uint8
+
+const (
+	sourceClaimFinishCommit sourceClaimFinish = iota
+	sourceClaimFinishPending
+	sourceClaimFinishRollback
+)
+
+func (s *MemoryPolicyStore) finishSourceClaim(
+	ctx context.Context,
+	claim SourcePolicyClaim,
+	finish sourceClaimFinish,
+) error {
+	if err := contextFailure(ctx); err != nil {
+		return err
+	}
+	normalized, err := cloneSourcePolicyClaim(claim)
+	if err != nil {
+		return err
+	}
+	if err := validateSourceURI(normalized.SourceURI); err != nil {
+		return err
+	}
+	if normalized.Version == 0 {
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument, "source policy claim is invalid")
+	}
+	if normalized.acquisitionID == 0 {
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument, "source policy claim token is invalid")
+	}
+	if normalized.tokenSeal == (auth.Digest{}) ||
+		normalized.tokenSeal != sourceClaimTokenSeal(normalized) {
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument, "source policy claim token is invalid")
+	}
+	if s == nil {
+		return catalogUnavailable()
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	state, ok := s.sourceClaims[normalized.SourceURI]
+	if !ok || !state.held ||
+		!sourcePolicyClaimsEqual(state.token, normalized) {
+		completed, completionErr := sourceClaimCompletion(
+			normalized, finish)
+		if completionErr != nil {
+			return completionErr
+		}
+		if completed == nil {
+			if !ok {
+				return nil
+			}
+		} else if ok && !state.held &&
+			sourcePolicyClaimsEqual(state.claim, *completed) {
+			return nil
+		}
+		return catalogConflict()
+	}
+	switch finish {
+	case sourceClaimFinishRollback:
+		previous, previousErr := sourceClaimCompletion(
+			normalized, sourceClaimFinishRollback)
+		if previousErr != nil {
+			return previousErr
+		}
+		if previous == nil {
+			delete(s.sourceClaims, normalized.SourceURI)
+			return nil
+		}
+		s.sourceClaims[normalized.SourceURI] = sourceClaimState{
+			claim: *previous,
+		}
+		return nil
+	case sourceClaimFinishPending:
+		state.held = false
+		state.token = SourcePolicyClaim{}
+		completed, completionErr := sourceClaimCompletion(
+			normalized, sourceClaimFinishPending)
+		if completionErr != nil || completed == nil {
+			return catalogUnavailable()
+		}
+		state.claim = *completed
+		s.sourceClaims[normalized.SourceURI] = state
+		return nil
+	case sourceClaimFinishCommit:
+		state.held = false
+		state.token = SourcePolicyClaim{}
+		completed, completionErr := sourceClaimCompletion(
+			normalized, sourceClaimFinishCommit)
+		if completionErr != nil || completed == nil {
+			return catalogUnavailable()
+		}
+		state.claim = *completed
+		s.sourceClaims[normalized.SourceURI] = state
+		return nil
+	default:
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument, "source claim finish is invalid")
+	}
+}
+
+func sourceClaimCompletion(
+	token SourcePolicyClaim,
+	finish sourceClaimFinish,
+) (*SourcePolicyClaim, error) {
+	stable := SourcePolicyClaim{
+		SourceURI: token.SourceURI,
+		Version:   token.Version,
+	}
+	switch finish {
+	case sourceClaimFinishCommit:
+		rule, err := token.Rule.clone()
+		if err != nil {
+			return nil, err
+		}
+		stable.Rule = rule
+		return &stable, nil
+	case sourceClaimFinishPending:
+		rule, err := token.Rule.clone()
+		if err != nil {
+			return nil, err
+		}
+		stable.Rule = rule
+		stable.Pending = true
+		if token.PreviousRule != nil {
+			previous, previousErr := token.PreviousRule.clone()
+			if previousErr != nil {
+				return nil, previousErr
+			}
+			stable.PreviousRule = &previous
+		}
+		return &stable, nil
+	case sourceClaimFinishRollback:
+		if !token.hadPriorClaim {
+			return nil, nil
+		}
+		stable.Version = token.priorVersion
+		stable.Pending = token.priorPending
+		if token.priorPending {
+			rule, err := token.Rule.clone()
+			if err != nil {
+				return nil, err
+			}
+			stable.Rule = rule
+			if token.PreviousRule != nil {
+				previous, previousErr := token.PreviousRule.clone()
+				if previousErr != nil {
+					return nil, previousErr
+				}
+				stable.PreviousRule = &previous
+			}
+			return &stable, nil
+		}
+		if token.PreviousRule == nil {
+			return nil, shoal.NewError(
+				shoal.ErrorInvalidArgument, "source policy claim is invalid")
+		}
+		rule, err := token.PreviousRule.clone()
+		if err != nil {
+			return nil, err
+		}
+		stable.Rule = rule
+		return &stable, nil
+	default:
+		return nil, shoal.NewError(
+			shoal.ErrorInvalidArgument, "source claim finish is invalid")
+	}
+}
+
+// PutRevision atomically registers immutable revision content and, when
+// Current is true, replaces that document's current node/edge projection.
+func (s *MemoryPolicyStore) PutRevision(
+	ctx context.Context,
+	registration RevisionRegistration,
+) error {
+	if err := contextFailure(ctx); err != nil {
+		return err
+	}
+	normalized, err := normalizeRevisionRegistration(registration)
+	if err != nil {
+		return err
+	}
+	if s == nil {
+		return catalogUnavailable()
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.initialize()
+	key := revisionKey{
+		documentID: normalized.DocumentID,
+		revisionID: normalized.RevisionID,
+	}
+	if owner, ok := s.revisionIDs[normalized.RevisionID]; ok && owner != key {
+		return catalogConflict()
+	}
+	if existing, ok := s.revisions[key]; ok {
+		if !revisionContentEqual(existing, normalized) {
+			return catalogConflict()
+		}
+		if !normalized.Current {
+			normalized.IntrinsicEdges = cloneRevisionRegistration(existing).IntrinsicEdges
+		} else if len(existing.IntrinsicEdges) > 0 &&
+			!intrinsicEdgesEqual(existing.IntrinsicEdges, normalized.IntrinsicEdges) {
+			return catalogConflict()
+		}
+	}
+	if normalized.Current {
+		for _, nodeID := range normalized.NodeIDs {
+			if owner, ok := s.nodes[nodeID]; ok &&
+				owner.DocumentID != normalized.DocumentID {
+				return catalogConflict()
+			}
+		}
+		for _, edge := range normalized.IntrinsicEdges {
+			if _, custom := s.edges[edge.ID]; custom {
+				return catalogConflict()
+			}
+			if owner, ok := s.intrinsicEdges[edge.ID]; ok &&
+				owner.DocumentID != normalized.DocumentID {
+				return catalogConflict()
+			}
+		}
+	}
+
+	stored := cloneRevisionRegistration(normalized)
+	stored.Current = false
+	s.revisions[key] = stored
+	s.revisionIDs[normalized.RevisionID] = key
+	if normalized.Current {
+		s.replaceCurrent(key, normalized)
+	}
+	return nil
+}
+
+// Revision returns one exact immutable revision registration.
+func (s *MemoryPolicyStore) Revision(
+	ctx context.Context,
+	documentID, revisionID shoal.ID,
+) (RevisionRegistration, bool, error) {
+	if err := contextFailure(ctx); err != nil {
+		return RevisionRegistration{}, false, err
+	}
+	if err := shoal.ValidateRequiredID("document ID", documentID); err != nil {
+		return RevisionRegistration{}, false, err
+	}
+	if err := shoal.ValidateRequiredID("revision ID", revisionID); err != nil {
+		return RevisionRegistration{}, false, err
+	}
+	if s == nil {
+		return RevisionRegistration{}, false, catalogUnavailable()
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	key := revisionKey{documentID: documentID, revisionID: revisionID}
+	registration, ok := s.revisions[key]
+	if !ok {
+		return RevisionRegistration{}, false, nil
+	}
+	cloned := cloneRevisionRegistration(registration)
+	cloned.Current = s.current[documentID] == key
+	return cloned, true, nil
+}
+
+// CurrentRevision returns the exact current registration for a document.
+func (s *MemoryPolicyStore) CurrentRevision(
+	ctx context.Context,
+	documentID shoal.ID,
+) (RevisionRegistration, bool, error) {
+	if err := contextFailure(ctx); err != nil {
+		return RevisionRegistration{}, false, err
+	}
+	if err := shoal.ValidateRequiredID("document ID", documentID); err != nil {
+		return RevisionRegistration{}, false, err
+	}
+	if s == nil {
+		return RevisionRegistration{}, false, catalogUnavailable()
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	key, ok := s.current[documentID]
+	if !ok {
+		return RevisionRegistration{}, false, nil
+	}
+	registration, ok := s.revisions[key]
+	if !ok {
+		return RevisionRegistration{}, false, catalogUnavailable()
+	}
+	cloned := cloneRevisionRegistration(registration)
+	cloned.Current = true
+	return cloned, true, nil
+}
+
+// Node returns the current registration owning a graph node.
+func (s *MemoryPolicyStore) Node(
+	ctx context.Context,
+	nodeID shoal.ID,
+) (NodeRegistration, bool, error) {
+	if err := contextFailure(ctx); err != nil {
+		return NodeRegistration{}, false, err
+	}
+	if err := shoal.ValidateRequiredID("graph node ID", nodeID); err != nil {
+		return NodeRegistration{}, false, err
+	}
+	if s == nil {
+		return NodeRegistration{}, false, catalogUnavailable()
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	registration, ok := s.nodes[nodeID]
+	if !ok {
+		return NodeRegistration{}, false, nil
+	}
+	cloned, err := cloneNodeRegistration(registration)
+	if err != nil {
+		return NodeRegistration{}, false, catalogUnavailable()
+	}
+	return cloned, true, nil
+}
+
+// ReserveEdge atomically reserves an application edge identity and rule before
+// the base mutation. Existing identical reservations are retryable; any
+// identity, content, or rule mismatch conflicts.
+func (s *MemoryPolicyStore) ReserveEdge(
+	ctx context.Context,
+	registration EdgeRegistration,
+) error {
+	if err := contextFailure(ctx); err != nil {
+		return err
+	}
+	normalized, err := normalizeApplicationEdgeRegistration(registration)
+	if err != nil {
+		return err
+	}
+	if s == nil {
+		return catalogUnavailable()
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.initialize()
+	if _, intrinsic := s.intrinsicEdges[normalized.Edge.ID]; intrinsic {
+		return catalogConflict()
+	}
+	if existing, ok := s.edges[normalized.Edge.ID]; ok &&
+		!edgeRegistrationsEqual(existing, normalized) {
+		return catalogConflict()
+	}
+	if existing, ok := s.edgeClaims[normalized.Edge.ID]; ok {
+		if edgeRegistrationsEqual(existing, normalized) {
+			return nil
+		}
+		return catalogConflict()
+	}
+	s.edgeClaims[normalized.Edge.ID] = cloneEdgeRegistration(normalized)
+	return nil
+}
+
+// RollbackEdgeReservation removes an uncommitted matching reservation after a
+// definite base failure. Reservations survive ambiguous or catalog failures.
+func (s *MemoryPolicyStore) RollbackEdgeReservation(
+	ctx context.Context,
+	registration EdgeRegistration,
+) error {
+	if err := contextFailure(ctx); err != nil {
+		return err
+	}
+	normalized, err := normalizeApplicationEdgeRegistration(registration)
+	if err != nil {
+		return err
+	}
+	if s == nil {
+		return catalogUnavailable()
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.initialize()
+	if _, committed := s.edges[normalized.Edge.ID]; committed {
+		return nil
+	}
+	existing, ok := s.edgeClaims[normalized.Edge.ID]
+	if !ok {
+		return nil
+	}
+	if !edgeRegistrationsEqual(existing, normalized) {
+		return catalogConflict()
+	}
+	delete(s.edgeClaims, normalized.Edge.ID)
+	return nil
+}
+
+// PutEdge atomically registers an application edge and its edge-local rule.
+// Identical content and canonical rule are idempotent; identity or policy
+// reuse conflicts.
+func (s *MemoryPolicyStore) PutEdge(
+	ctx context.Context,
+	registration EdgeRegistration,
+) error {
+	if err := contextFailure(ctx); err != nil {
+		return err
+	}
+	normalized, err := normalizeApplicationEdgeRegistration(registration)
+	if err != nil {
+		return err
+	}
+	if s == nil {
+		return catalogUnavailable()
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.initialize()
+	if _, intrinsic := s.intrinsicEdges[normalized.Edge.ID]; intrinsic {
+		return catalogConflict()
+	}
+	if claim, ok := s.edgeClaims[normalized.Edge.ID]; ok &&
+		!edgeRegistrationsEqual(claim, normalized) {
+		return catalogConflict()
+	}
+	if existing, ok := s.edges[normalized.Edge.ID]; ok {
+		if edgeRegistrationsEqual(existing, normalized) {
+			delete(s.edgeClaims, normalized.Edge.ID)
+			return nil
+		}
+		return catalogConflict()
+	}
+	s.edges[normalized.Edge.ID] = cloneEdgeRegistration(normalized)
+	delete(s.edgeClaims, normalized.Edge.ID)
+	return nil
+}
+
+// Edge returns a current intrinsic edge or a registered application edge.
+func (s *MemoryPolicyStore) Edge(
+	ctx context.Context,
+	edgeID shoal.ID,
+) (EdgeRegistration, bool, error) {
+	if err := contextFailure(ctx); err != nil {
+		return EdgeRegistration{}, false, err
+	}
+	if err := shoal.ValidateRequiredID("graph edge ID", edgeID); err != nil {
+		return EdgeRegistration{}, false, err
+	}
+	if s == nil {
+		return EdgeRegistration{}, false, catalogUnavailable()
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	registration, ok := s.edges[edgeID]
+	if !ok {
+		registration, ok = s.intrinsicEdges[edgeID]
+	}
+	if !ok {
+		return EdgeRegistration{}, false, nil
+	}
+	cloned, err := cloneEdgeRegistrationChecked(registration)
+	if err != nil {
+		return EdgeRegistration{}, false, catalogUnavailable()
+	}
+	return cloned, true, nil
+}
+
+func (s *MemoryPolicyStore) initialize() {
+	if s.sourceClaims == nil {
+		s.sourceClaims = make(map[string]sourceClaimState)
+	}
+	if s.revisions == nil {
+		s.revisions = make(map[revisionKey]RevisionRegistration)
+	}
+	if s.revisionIDs == nil {
+		s.revisionIDs = make(map[shoal.ID]revisionKey)
+	}
+	if s.current == nil {
+		s.current = make(map[shoal.ID]revisionKey)
+	}
+	if s.nodes == nil {
+		s.nodes = make(map[shoal.ID]NodeRegistration)
+	}
+	if s.intrinsicEdges == nil {
+		s.intrinsicEdges = make(map[shoal.ID]EdgeRegistration)
+	}
+	if s.edgeClaims == nil {
+		s.edgeClaims = make(map[shoal.ID]EdgeRegistration)
+	}
+	if s.edges == nil {
+		s.edges = make(map[shoal.ID]EdgeRegistration)
+	}
+}
+
+func validateSourceURI(sourceURI string) error {
+	if !utf8.ValidString(sourceURI) || strings.TrimSpace(sourceURI) == "" {
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"source URI is required and must be valid UTF-8",
+		)
+	}
+	return nil
+}
+
+func cloneSourcePolicyClaim(
+	claim SourcePolicyClaim,
+) (SourcePolicyClaim, error) {
+	rule, err := claim.Rule.clone()
+	if err != nil {
+		return SourcePolicyClaim{}, err
+	}
+	claim.Rule = rule
+	if claim.PreviousRule != nil {
+		previous, previousErr := claim.PreviousRule.clone()
+		if previousErr != nil {
+			return SourcePolicyClaim{}, previousErr
+		}
+		claim.PreviousRule = &previous
+	}
+	if !claim.Pending && claim.PreviousRule != nil {
+		return SourcePolicyClaim{}, shoal.NewError(
+			shoal.ErrorInvalidArgument, "source policy claim is invalid")
+	}
+	if !claim.Pending || claim.Version == 0 {
+		if claim.hadPriorClaim || claim.priorPending ||
+			claim.priorVersion != 0 {
+			return SourcePolicyClaim{}, shoal.NewError(
+				shoal.ErrorInvalidArgument, "source policy claim is invalid")
+		}
+	} else if claim.hadPriorClaim {
+		if claim.priorVersion == 0 ||
+			(!claim.priorPending && claim.PreviousRule == nil) {
+			return SourcePolicyClaim{}, shoal.NewError(
+				shoal.ErrorInvalidArgument, "source policy claim is invalid")
+		}
+	} else if claim.priorPending || claim.priorVersion != 0 {
+		return SourcePolicyClaim{}, shoal.NewError(
+			shoal.ErrorInvalidArgument, "source policy claim is invalid")
+	}
+	return claim, nil
+}
+
+func sourcePolicyClaimsEqual(left, right SourcePolicyClaim) bool {
+	return left.SourceURI == right.SourceURI &&
+		left.Version == right.Version &&
+		left.Pending == right.Pending &&
+		left.hadPriorClaim == right.hadPriorClaim &&
+		left.priorPending == right.priorPending &&
+		left.priorVersion == right.priorVersion &&
+		left.acquisitionID == right.acquisitionID &&
+		left.tokenSeal == right.tokenSeal &&
+		left.Rule.equal(right.Rule) &&
+		optionalRulesEqual(left.PreviousRule, right.PreviousRule)
+}
+
+// sourceClaimObservable strips the sealed finalization capability from a claim
+// token, leaving only the state readers are allowed to observe. Reading a
+// claim must never confer the ability to finalize it.
+func sourceClaimObservable(token SourcePolicyClaim) SourcePolicyClaim {
+	observable := token
+	observable.hadPriorClaim = false
+	observable.priorPending = false
+	observable.priorVersion = 0
+	observable.acquisitionID = 0
+	observable.tokenSeal = auth.Digest{}
+	return observable
+}
+
+func sourceClaimTokenSeal(claim SourcePolicyClaim) auth.Digest {
+	encoded := make([]byte, 0, len(claim.SourceURI)+128)
+	appendUint64 := func(value uint64) {
+		var buffer [8]byte
+		binary.BigEndian.PutUint64(buffer[:], value)
+		encoded = append(encoded, buffer[:]...)
+	}
+	appendText := func(value string) {
+		appendUint64(uint64(len(value)))
+		encoded = append(encoded, value...)
+	}
+	appendText(claim.SourceURI)
+	appendText(claim.Rule.String())
+	if claim.PreviousRule == nil {
+		encoded = append(encoded, 0)
+	} else {
+		encoded = append(encoded, 1)
+		appendText(claim.PreviousRule.String())
+	}
+	if claim.Pending {
+		encoded = append(encoded, 1)
+	} else {
+		encoded = append(encoded, 0)
+	}
+	appendUint64(claim.Version)
+	if claim.hadPriorClaim {
+		encoded = append(encoded, 1)
+	} else {
+		encoded = append(encoded, 0)
+	}
+	if claim.priorPending {
+		encoded = append(encoded, 1)
+	} else {
+		encoded = append(encoded, 0)
+	}
+	appendUint64(claim.priorVersion)
+	appendUint64(claim.acquisitionID)
+	return auth.DigestBytes("explorer-source-claim-token-v1", encoded)
+}
+
+func optionalRulesEqual(left, right *AccessRule) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	return left.equal(*right)
+}
+
+func (s *MemoryPolicyStore) replaceCurrent(
+	key revisionKey,
+	registration RevisionRegistration,
+) {
+	if previousKey, ok := s.current[registration.DocumentID]; ok {
+		if previous, exists := s.revisions[previousKey]; exists {
+			for _, nodeID := range previous.NodeIDs {
+				if owner, present := s.nodes[nodeID]; present &&
+					owner.DocumentID == previous.DocumentID &&
+					owner.RevisionID == previous.RevisionID {
+					delete(s.nodes, nodeID)
+				}
+			}
+			for _, edge := range previous.IntrinsicEdges {
+				if owner, present := s.intrinsicEdges[edge.ID]; present &&
+					owner.DocumentID == previous.DocumentID &&
+					owner.RevisionID == previous.RevisionID {
+					delete(s.intrinsicEdges, edge.ID)
+				}
+			}
+		}
+	}
+	for _, nodeID := range registration.NodeIDs {
+		s.nodes[nodeID] = NodeRegistration{
+			DocumentID: registration.DocumentID,
+			RevisionID: registration.RevisionID,
+			Rule:       mustCloneRule(registration.Rule),
+		}
+	}
+	for _, edge := range registration.IntrinsicEdges {
+		s.intrinsicEdges[edge.ID] = EdgeRegistration{
+			Edge:       cloneGraphEdge(edge),
+			DocumentID: registration.DocumentID,
+			RevisionID: registration.RevisionID,
+			Rule:       mustCloneRule(registration.Rule),
+		}
+	}
+	s.current[registration.DocumentID] = key
+}
+
+func normalizeRevisionRegistration(
+	registration RevisionRegistration,
+) (RevisionRegistration, error) {
+	if err := shoal.ValidateRequiredID(
+		"document ID", registration.DocumentID,
+	); err != nil {
+		return RevisionRegistration{}, err
+	}
+	if err := shoal.ValidateRequiredID(
+		"revision ID", registration.RevisionID,
+	); err != nil {
+		return RevisionRegistration{}, err
+	}
+	rule, err := registration.Rule.clone()
+	if err != nil {
+		return RevisionRegistration{}, err
+	}
+	if registration.ContentDigest == (auth.Digest{}) {
+		return RevisionRegistration{}, shoal.NewError(
+			shoal.ErrorInvalidArgument, "revision content digest is required")
+	}
+	nodeIDs := append([]shoal.ID(nil), registration.NodeIDs...)
+	if len(nodeIDs) == 0 {
+		return RevisionRegistration{}, shoal.NewError(
+			shoal.ErrorInvalidArgument, "revision graph nodes are required")
+	}
+	sort.Slice(nodeIDs, func(left, right int) bool {
+		return shoal.CompareID(nodeIDs[left], nodeIDs[right]) < 0
+	})
+	nodes := make(map[shoal.ID]struct{}, len(nodeIDs))
+	deduplicatedNodes := nodeIDs[:0]
+	for _, nodeID := range nodeIDs {
+		if err := shoal.ValidateRequiredID("graph node ID", nodeID); err != nil {
+			return RevisionRegistration{}, err
+		}
+		if _, duplicate := nodes[nodeID]; duplicate {
+			continue
+		}
+		nodes[nodeID] = struct{}{}
+		deduplicatedNodes = append(deduplicatedNodes, nodeID)
+	}
+	if _, ok := nodes[registration.DocumentID]; !ok {
+		return RevisionRegistration{}, shoal.NewError(
+			shoal.ErrorInvalidArgument, "revision graph lacks its document node")
+	}
+
+	edges := make([]graph.Edge, len(registration.IntrinsicEdges))
+	for index, edge := range registration.IntrinsicEdges {
+		if err := edge.Validate(); err != nil {
+			return RevisionRegistration{}, err
+		}
+		if _, ok := nodes[edge.From]; !ok {
+			return RevisionRegistration{}, shoal.NewError(
+				shoal.ErrorInvalidArgument, "intrinsic edge source is outside the revision")
+		}
+		if _, ok := nodes[edge.To]; !ok {
+			return RevisionRegistration{}, shoal.NewError(
+				shoal.ErrorInvalidArgument, "intrinsic edge target is outside the revision")
+		}
+		edges[index] = cloneGraphEdge(edge)
+	}
+	sort.Slice(edges, func(left, right int) bool {
+		return shoal.CompareID(edges[left].ID, edges[right].ID) < 0
+	})
+	deduplicatedEdges := edges[:0]
+	for _, edge := range edges {
+		if len(deduplicatedEdges) > 0 &&
+			deduplicatedEdges[len(deduplicatedEdges)-1].ID == edge.ID {
+			if !graphEdgesEqual(deduplicatedEdges[len(deduplicatedEdges)-1], edge) {
+				return RevisionRegistration{}, shoal.NewError(
+					shoal.ErrorInvalidArgument,
+					"revision graph reuses an edge identity",
+				)
+			}
+			continue
+		}
+		deduplicatedEdges = append(deduplicatedEdges, edge)
+	}
+	return RevisionRegistration{
+		DocumentID:     registration.DocumentID,
+		RevisionID:     registration.RevisionID,
+		NodeIDs:        deduplicatedNodes,
+		IntrinsicEdges: deduplicatedEdges,
+		ContentDigest:  registration.ContentDigest,
+		Rule:           rule,
+		Current:        registration.Current,
+	}, nil
+}
+
+func normalizeApplicationEdgeRegistration(
+	registration EdgeRegistration,
+) (EdgeRegistration, error) {
+	if err := registration.Edge.Validate(); err != nil {
+		return EdgeRegistration{}, err
+	}
+	rule, err := registration.Rule.clone()
+	if err != nil {
+		return EdgeRegistration{}, err
+	}
+	return EdgeRegistration{Edge: cloneGraphEdge(registration.Edge), Rule: rule}, nil
+}
+
+func revisionContentEqual(left, right RevisionRegistration) bool {
+	if left.DocumentID != right.DocumentID ||
+		left.RevisionID != right.RevisionID ||
+		left.ContentDigest != right.ContentDigest ||
+		!left.Rule.equal(right.Rule) ||
+		len(left.NodeIDs) != len(right.NodeIDs) {
+		return false
+	}
+	for index := range left.NodeIDs {
+		if left.NodeIDs[index] != right.NodeIDs[index] {
+			return false
+		}
+	}
+	return true
+}
+
+func intrinsicEdgesEqual(left, right []graph.Edge) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if !graphEdgesEqual(left[index], right[index]) {
+			return false
+		}
+	}
+	return true
+}
+
+func edgeRegistrationsEqual(left, right EdgeRegistration) bool {
+	return graphEdgesEqual(left.Edge, right.Edge) &&
+		left.DocumentID == right.DocumentID &&
+		left.RevisionID == right.RevisionID &&
+		left.Rule.equal(right.Rule)
+}
+
+func cloneRevisionRegistration(
+	registration RevisionRegistration,
+) RevisionRegistration {
+	cloned := registration
+	cloned.NodeIDs = append([]shoal.ID(nil), registration.NodeIDs...)
+	cloned.IntrinsicEdges = make([]graph.Edge, len(registration.IntrinsicEdges))
+	for index, edge := range registration.IntrinsicEdges {
+		cloned.IntrinsicEdges[index] = cloneGraphEdge(edge)
+	}
+	cloned.Rule = mustCloneRule(registration.Rule)
+	return cloned
+}
+
+func cloneNodeRegistration(
+	registration NodeRegistration,
+) (NodeRegistration, error) {
+	rule, err := registration.Rule.clone()
+	if err != nil {
+		return NodeRegistration{}, err
+	}
+	registration.Rule = rule
+	return registration, nil
+}
+
+func cloneEdgeRegistration(
+	registration EdgeRegistration,
+) EdgeRegistration {
+	cloned, _ := cloneEdgeRegistrationChecked(registration)
+	return cloned
+}
+
+func cloneEdgeRegistrationChecked(
+	registration EdgeRegistration,
+) (EdgeRegistration, error) {
+	rule, err := registration.Rule.clone()
+	if err != nil {
+		return EdgeRegistration{}, err
+	}
+	registration.Edge = cloneGraphEdge(registration.Edge)
+	registration.Rule = rule
+	return registration, nil
+}
+
+func cloneGraphEdge(edge graph.Edge) graph.Edge {
+	edge.Properties = cloneMetadata(edge.Properties)
+	return edge
+}
+
+func graphEdgesEqual(left, right graph.Edge) bool {
+	if left.ID != right.ID || left.From != right.From || left.To != right.To ||
+		left.Type != right.Type || !scoresEqual(left.Weight, right.Weight) ||
+		len(left.Properties) != len(right.Properties) {
+		return false
+	}
+	for key, value := range left.Properties {
+		if right.Properties[key] != value {
+			return false
+		}
+	}
+	return true
+}
+
+func mustCloneRule(rule AccessRule) AccessRule {
+	cloned, err := rule.clone()
+	if err != nil {
+		return AccessRule{}
+	}
+	return cloned
+}
+
+func catalogConflict() error {
+	return shoal.NewError(shoal.ErrorConflict, "authorization policy catalog conflict")
+}
+
+func catalogUnavailable() error {
+	return shoal.NewError(
+		shoal.ErrorUnavailable, "authorization policy catalog unavailable")
+}
+
+var _ PolicyStore = (*MemoryPolicyStore)(nil)

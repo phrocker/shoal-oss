@@ -196,6 +196,36 @@ func TestCrossDocumentNeighborhoodPersists(t *testing.T) {
 		neighborhood.Edges[0].ID != edge.ID {
 		t.Fatalf("neighborhood = %+v", neighborhood)
 	}
+	incoming, err := corpus.Neighborhood(ctx, explorer.NeighborhoodRequest{
+		NodeIDs:   []shoal.ID{second.Document.ID},
+		EdgeTypes: []string{"depends_on"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(incoming.Nodes) != 2 || len(incoming.Edges) != 1 ||
+		incoming.Edges[0].ID != edge.ID {
+		t.Fatalf("incoming neighborhood = %+v", incoming)
+	}
+	if shoal.CompareID(incoming.Nodes[0].ID, incoming.Nodes[1].ID) >= 0 {
+		t.Fatalf("nodes are not in raw ID order: %+v", incoming.Nodes)
+	}
+	combined, err := corpus.Neighborhood(ctx, explorer.NeighborhoodRequest{
+		NodeIDs: []shoal.ID{first.Document.ID, second.Document.ID},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index := 1; index < len(combined.Nodes); index++ {
+		if shoal.CompareID(combined.Nodes[index-1].ID, combined.Nodes[index].ID) >= 0 {
+			t.Fatalf("combined nodes are not in raw ID order: %+v", combined.Nodes)
+		}
+	}
+	for index := 1; index < len(combined.Edges); index++ {
+		if shoal.CompareID(combined.Edges[index-1].ID, combined.Edges[index].ID) >= 0 {
+			t.Fatalf("combined edges are not in raw ID order: %+v", combined.Edges)
+		}
+	}
 }
 
 func TestVectorModeFailsExplicitly(t *testing.T) {
@@ -203,12 +233,99 @@ func TestVectorModeFailsExplicitly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	defer corpus.Close()
 	_, err = corpus.Retrieve(context.Background(), retrieval.Request{
 		Text: "query", Modes: []retrieval.Mode{retrieval.ModeVector},
 	})
 	if !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
 		t.Fatalf("expected unavailable, got %v", err)
+	}
+}
+
+func TestDocumentRejectsOversizedIdentifiers(t *testing.T) {
+	corpus, err := explorer.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer corpus.Close()
+
+	_, err = corpus.Document(
+		context.Background(),
+		shoal.ID(strings.Repeat("x", shoal.MaxIDBytes+1)),
+		"",
+	)
+	if !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
+		t.Fatalf("oversized document ID error = %v", err)
+	}
+	_, err = corpus.Document(
+		context.Background(),
+		"document",
+		shoal.ID(strings.Repeat("x", shoal.MaxIDBytes+1)),
+	)
+	if !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
+		t.Fatalf("oversized revision ID error = %v", err)
+	}
+}
+
+func TestUnseededStandaloneTreeAndGraphFailExplicitly(t *testing.T) {
+	corpus, err := explorer.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer corpus.Close()
+	for _, mode := range []retrieval.Mode{
+		retrieval.ModeTree, retrieval.ModeGraph,
+	} {
+		_, err := corpus.Retrieve(context.Background(), retrieval.Request{
+			Text: "query", Modes: []retrieval.Mode{mode},
+		})
+		if !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
+			t.Fatalf("%s error = %v", mode, err)
+		}
+	}
+}
+
+func TestRetrieveNormalizationKeepsIdentityAndScoresStable(t *testing.T) {
+	corpus, err := explorer.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer corpus.Close()
+	if _, err := corpus.Ingest(context.Background(), explorer.Source{
+		URI: "file:///normalize.txt", MediaType: explorer.MediaTypeText,
+		Content: "stable lexical score",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	requests := []retrieval.Request{
+		{Text: "stable"},
+		{
+			Text: "stable", TopK: retrieval.DefaultTopK,
+			Modes: []retrieval.Mode{retrieval.ModeLexical},
+		},
+		{
+			Text: "stable", TopK: retrieval.DefaultTopK,
+			Modes: []retrieval.Mode{
+				retrieval.ModeLexical, retrieval.ModeLexical,
+			},
+		},
+	}
+	var first retrieval.Response
+	for index, request := range requests {
+		response, err := corpus.Retrieve(context.Background(), request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if index == 0 {
+			first = response
+			continue
+		}
+		if response.RequestID != first.RequestID ||
+			len(response.Results) != len(first.Results) ||
+			response.Results[0].Score != first.Results[0].Score {
+			t.Fatalf("normalized response %d = %#v, first = %#v", index, response, first)
+		}
 	}
 }
 
@@ -242,7 +359,7 @@ func TestRevisionIdentityPreservesComponentBoundaries(t *testing.T) {
 	}
 }
 
-func TestRetrieveAcceptsMaximumTopK(t *testing.T) {
+func TestRetrieveEnforcesMaximumTopK(t *testing.T) {
 	corpus, err := explorer.Open(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -255,13 +372,18 @@ func TestRetrieveAcceptsMaximumTopK(t *testing.T) {
 		t.Fatal(err)
 	}
 	response, err := corpus.Retrieve(context.Background(), retrieval.Request{
-		Text: "maximum", TopK: ^uint32(0),
+		Text: "maximum", TopK: retrieval.MaxTopK,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(response.Results) != 1 {
 		t.Fatalf("results = %+v", response.Results)
+	}
+	if _, err := corpus.Retrieve(context.Background(), retrieval.Request{
+		Text: "maximum", TopK: retrieval.MaxTopK + 1,
+	}); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
+		t.Fatalf("oversized TopK error = %v", err)
 	}
 }
 
@@ -280,7 +402,6 @@ func TestRequestIdentityPreservesScopeBoundariesAndAllFields(t *testing.T) {
 			DocumentIDs: []shoal.ID{"a b", "c"},
 			NodeIDs:     []shoal.ID{"node"},
 		},
-		AsOf: time.Date(2026, 8, 25, 15, 0, 0, 0, time.UTC),
 	}
 	baseResponse, err := corpus.Retrieve(ctx, base)
 	if err != nil {
@@ -297,16 +418,12 @@ func TestRequestIdentityPreservesScopeBoundariesAndAllFields(t *testing.T) {
 	modeChange.Modes = []retrieval.Mode{retrieval.ModeTree}
 	nodeChange := base
 	nodeChange.Scope.NodeIDs = []shoal.ID{"other"}
-	asOfChange := base
-	asOfChange.AsOf = base.AsOf.Add(time.Nanosecond)
-
 	for name, request := range map[string]retrieval.Request{
 		"scope boundaries": scopeCollision,
 		"explain":          explainChange,
 		"top k":            topKChange,
 		"modes":            modeChange,
 		"node scope":       nodeChange,
-		"as of":            asOfChange,
 	} {
 		response, err := corpus.Retrieve(ctx, request)
 		if err != nil {
@@ -316,6 +433,23 @@ func TestRequestIdentityPreservesScopeBoundariesAndAllFields(t *testing.T) {
 			t.Errorf("%s did not change request ID %q", name, response.RequestID)
 		}
 	}
+
+	equivalent := base
+	equivalent.Modes = []retrieval.Mode{
+		retrieval.ModeLexical, retrieval.ModeLexical,
+	}
+	equivalent.Scope.DocumentIDs = []shoal.ID{"a b", "c", "a b"}
+	equivalent.Scope.NodeIDs = []shoal.ID{"node", "node"}
+	equivalentResponse, err := corpus.Retrieve(ctx, equivalent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if equivalentResponse.RequestID != baseResponse.RequestID {
+		t.Fatalf(
+			"equivalent requests have IDs %q and %q",
+			equivalentResponse.RequestID, baseResponse.RequestID,
+		)
+	}
 }
 
 func TestExplanationReportsWeightedModeContribution(t *testing.T) {
@@ -324,15 +458,19 @@ func TestExplanationReportsWeightedModeContribution(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer corpus.Close()
-	if _, err := corpus.Ingest(context.Background(), explorer.Source{
+	ingested, err := corpus.Ingest(context.Background(), explorer.Source{
 		URI: "file:///weighted.md", MediaType: explorer.MediaTypeMarkdown,
 		Content: "# Heading\n\nEvidence without the relationship term.\n",
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatal(err)
 	}
 	response, err := corpus.Retrieve(context.Background(), retrieval.Request{
 		Text: "contains", TopK: 1,
-		Modes:   []retrieval.Mode{retrieval.ModeGraph},
+		Modes: []retrieval.Mode{retrieval.ModeGraph},
+		Scope: retrieval.Scope{
+			NodeIDs: []shoal.ID{ingested.Document.ID},
+		},
 		Explain: true,
 	})
 	if err != nil {
@@ -350,6 +488,60 @@ func TestExplanationReportsWeightedModeContribution(t *testing.T) {
 	}
 	if result.Score != shoal.Score(0.25) {
 		t.Fatalf("weighted graph score = %v", result.Score)
+	}
+}
+
+func TestRetrieveRejectsAsOfWithoutPublicationFrontier(t *testing.T) {
+	corpus, err := explorer.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer corpus.Close()
+	_, err = corpus.Retrieve(context.Background(), retrieval.Request{
+		Text: "query",
+		AsOf: time.Date(2026, 8, 25, 15, 0, 0, 0, time.UTC),
+	})
+	if !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
+		t.Fatalf("AsOf error = %v", err)
+	}
+}
+
+func TestNeighborhoodRequestNormalization(t *testing.T) {
+	request := explorer.NeighborhoodRequest{
+		NodeIDs: []shoal.ID{"node\x00", "node\x00", shoal.ID("\xff")},
+		EdgeTypes: []string{
+			"links", "links",
+		},
+	}
+	normalized, err := request.Normalize()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if normalized.Depth != 1 ||
+		len(normalized.NodeIDs) != 2 ||
+		len(normalized.EdgeTypes) != 1 {
+		t.Fatalf("normalized request = %#v", normalized)
+	}
+	normalized.NodeIDs[0] = "changed"
+	if request.NodeIDs[0] != "node\x00" {
+		t.Fatal("Normalize mutated neighborhood request")
+	}
+	request.Depth = 17
+	if _, err := request.Normalize(); !shoal.IsErrorCode(
+		err, shoal.ErrorInvalidArgument,
+	) {
+		t.Fatalf("depth error = %v", err)
+	}
+	for _, edgeType := range []string{" \t ", string([]byte{0xff})} {
+		request := explorer.NeighborhoodRequest{
+			NodeIDs:   []shoal.ID{"node"},
+			EdgeTypes: []string{edgeType},
+		}
+		if _, err := request.Normalize(); !shoal.IsErrorCode(
+			err, shoal.ErrorInvalidArgument,
+		) {
+			t.Fatalf("edge type %q error = %v", edgeType, err)
+		}
 	}
 }
 

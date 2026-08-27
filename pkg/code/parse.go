@@ -20,6 +20,7 @@
 package code
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"sort"
@@ -68,6 +69,31 @@ func (r ParseRequest) Source() Source {
 // Content returns a copy of the exact source bytes.
 func (r ParseRequest) Content() []byte {
 	return append([]byte(nil), r.content...)
+}
+
+// ContentSize returns the exact source byte length without copying content.
+func (r ParseRequest) ContentSize() uint64 {
+	return uint64(len(r.content))
+}
+
+// ContentEqual compares exact source bytes without exposing or copying the
+// request's retained content.
+func (r ParseRequest) ContentEqual(content []byte) bool {
+	return bytes.Equal(r.content, content)
+}
+
+// ContentStringEqual compares exact source bytes with a string without
+// exposing or copying the request's retained content.
+func (r ParseRequest) ContentStringEqual(content string) bool {
+	if len(r.content) != len(content) {
+		return false
+	}
+	for index, value := range r.content {
+		if value != content[index] {
+			return false
+		}
+	}
+	return true
 }
 
 func (r ParseRequest) clone() ParseRequest {
@@ -153,6 +179,17 @@ type ParseResult struct {
 	externals     []ExternalEntity
 	relationships []Relationship
 	diagnostics   []Diagnostic
+}
+
+// ParseResultCounts reports collection and explicit source-attribution
+// cardinalities without copying parse-result values.
+type ParseResultCounts struct {
+	SyntaxNodes         uint64
+	Symbols             uint64
+	Externals           uint64
+	Relationships       uint64
+	DeclaredSymbols     uint64
+	RangedRelationships uint64
 }
 
 // NewParseResult constructs a result with functional options and validates it
@@ -251,6 +288,28 @@ func (r ParseResult) Relationships() []Relationship {
 
 func (r ParseResult) Diagnostics() []Diagnostic {
 	return append([]Diagnostic(nil), r.diagnostics...)
+}
+
+// Counts returns collection and explicit source-attribution cardinalities
+// without copying parser-owned values.
+func (r ParseResult) Counts() ParseResultCounts {
+	counts := ParseResultCounts{
+		SyntaxNodes:   uint64(len(r.nodes)),
+		Symbols:       uint64(len(r.symbols)),
+		Externals:     uint64(len(r.externals)),
+		Relationships: uint64(len(r.relationships)),
+	}
+	for _, symbol := range r.symbols {
+		if _, present := symbol.SyntaxNodeID(); present {
+			counts.DeclaredSymbols++
+		}
+	}
+	for _, relationship := range r.relationships {
+		if _, present := relationship.Range(); present {
+			counts.RangedRelationships++
+		}
+	}
+	return counts
 }
 
 // Node returns a copy of the syntax node with id.

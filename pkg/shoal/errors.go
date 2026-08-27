@@ -24,7 +24,14 @@ import (
 	"reflect"
 )
 
-// ErrorCode identifies a transport-independent failure category.
+// ErrorCode identifies a stable transport-independent failure category.
+//
+// Invalid values use ErrorInvalidArgument; absence uses ErrorNotFound;
+// optimistic concurrency and idempotency mismatches use ErrorConflict;
+// whole-operation access denial uses ErrorUnauthorized; unsupported shapes,
+// transient failures, and exhausted runtime budgets use ErrorUnavailable;
+// cancellation and deadlines use their corresponding codes; and detectable
+// committed-data corruption or implementation faults use ErrorInternal.
 type ErrorCode string
 
 const (

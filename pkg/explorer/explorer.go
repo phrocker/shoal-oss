@@ -20,9 +20,7 @@
 package explorer
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"math"
 	"sort"
@@ -31,40 +29,32 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/phrocker/shoal-oss/internal/cclient"
 	"github.com/phrocker/shoal-oss/internal/engine"
-	"github.com/phrocker/shoal-oss/internal/iterrt"
 	"github.com/phrocker/shoal-oss/pkg/document"
 	"github.com/phrocker/shoal-oss/pkg/graph"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
-const (
-	explorerTable = "_shoal_explorer"
-	recordCF      = "record"
-	recordCQ      = "v1"
-	documentRow   = "document/"
-	edgeRow       = "edge/"
-)
-
 // Explorer is a durable embedded implementation of the Explorer and Retriever
 // contracts. Its API contains no engine, cell, or storage-format types.
 type Explorer struct {
-	mu        sync.RWMutex
-	engine    *engine.Engine
-	documents map[shoal.ID]map[shoal.ID]*persistedDocument
-	edges     map[shoal.ID]graph.Edge
-	closed    bool
+	mu                      sync.RWMutex
+	engine                  *engine.Engine
+	documents               map[shoal.ID]map[shoal.ID]*persistedDocument
+	edges                   map[shoal.ID]graph.Edge
+	lastPublicationSequence uint64
+	closed                  bool
 }
 
 type persistedDocument struct {
-	Document document.Document
-	Revision document.Revision
-	Source   Source
-	Sections []document.Section
-	Spans    []document.Span
-	Nodes    []graph.Node
-	Edges    []graph.Edge
+	Document            document.Document
+	Revision            document.Revision
+	Source              Source
+	Sections            []document.Section
+	Spans               []document.Span
+	Nodes               []graph.Node
+	Edges               []graph.Edge
+	PublicationSequence uint64 `json:"publication_sequence,omitempty"`
 }
 
 type persistedEdge struct {
@@ -121,10 +111,28 @@ func (e *Explorer) Close() error {
 
 // Ingest parses and durably stores one immutable text or Markdown revision.
 func (e *Explorer) Ingest(ctx context.Context, source Source) (IngestResult, error) {
+	return e.ingest(ctx, source, time.Time{})
+}
+
+// IngestWithOptions parses and durably stores one immutable revision with
+// additive descriptive options. CreatedAt never determines the current
+// revision; durable publication order does.
+func (e *Explorer) IngestWithOptions(
+	ctx context.Context, source Source, options IngestOptions,
+) (IngestResult, error) {
+	return e.ingest(ctx, source, options.CreatedAt)
+}
+
+func (e *Explorer) ingest(
+	ctx context.Context, source Source, createdAt time.Time,
+) (IngestResult, error) {
 	if err := contextError(ctx); err != nil {
 		return IngestResult{}, err
 	}
-	parsed, err := parseSource(source, time.Now())
+	if createdAt.IsZero() {
+		createdAt = time.Now()
+	}
+	parsed, err := parseSource(source, createdAt)
 	if err != nil {
 		return IngestResult{}, err
 	}
@@ -148,8 +156,19 @@ func (e *Explorer) Ingest(ctx context.Context, source Source) (IngestResult, err
 			return ingestResult(existing, IngestUnchanged), nil
 		}
 	}
-	if err := e.writeJSON(
-		documentRow+string(record.Document.ID)+"/"+string(record.Revision.ID), record); err != nil {
+	if e.lastPublicationSequence == math.MaxUint64 {
+		return IngestResult{}, shoal.NewError(
+			shoal.ErrorUnavailable, "embedded publication sequence is exhausted")
+	}
+	// A write error can occur after the WAL append committed, so attempted
+	// publication sequences must never be reused.
+	e.lastPublicationSequence++
+	record.PublicationSequence = e.lastPublicationSequence
+	if err := e.writeRecord(
+		documentRecordRow(record.Document.ID, record.Revision.ID),
+		embeddedRecordDocument,
+		record,
+	); err != nil {
 		return IngestResult{}, err
 	}
 	if e.documents[record.Document.ID] == nil {
@@ -171,7 +190,10 @@ func (e *Explorer) Documents(ctx context.Context) ([]DocumentSummary, error) {
 	}
 	summaries := make([]DocumentSummary, 0, len(e.documents))
 	for _, revisions := range e.documents {
-		record := latestRevision(revisions, time.Time{})
+		record, err := latestRevision(revisions)
+		if err != nil {
+			return nil, err
+		}
 		if record == nil {
 			continue
 		}
@@ -183,7 +205,8 @@ func (e *Explorer) Documents(ctx context.Context) ([]DocumentSummary, error) {
 	}
 	sort.Slice(summaries, func(i, j int) bool {
 		if summaries[i].Document.Title == summaries[j].Document.Title {
-			return summaries[i].Document.ID < summaries[j].Document.ID
+			return shoal.CompareID(
+				summaries[i].Document.ID, summaries[j].Document.ID) < 0
 		}
 		return summaries[i].Document.Title < summaries[j].Document.Title
 	})
@@ -198,9 +221,11 @@ func (e *Explorer) Document(
 	if err := contextError(ctx); err != nil {
 		return DocumentView{}, err
 	}
-	if documentID == "" {
-		return DocumentView{}, shoal.NewError(
-			shoal.ErrorInvalidArgument, "document ID is required")
+	if err := shoal.ValidateRequiredID("document ID", documentID); err != nil {
+		return DocumentView{}, err
+	}
+	if err := shoal.ValidateOptionalID("revision ID", revisionID); err != nil {
+		return DocumentView{}, err
 	}
 	e.mu.RLock()
 	defer e.mu.RUnlock()
@@ -208,9 +233,19 @@ func (e *Explorer) Document(
 		return DocumentView{}, err
 	}
 	revisions := e.documents[documentID]
-	var record *persistedDocument
+	var (
+		record *persistedDocument
+		err    error
+	)
 	if revisionID == "" {
-		record = latestRevision(revisions, time.Time{})
+		if len(revisions) == 0 {
+			return DocumentView{}, shoal.NewError(
+				shoal.ErrorNotFound, "document revision not found")
+		}
+		record, err = latestRevision(revisions)
+		if err != nil {
+			return DocumentView{}, err
+		}
 	} else {
 		record = revisions[revisionID]
 	}
@@ -235,7 +270,7 @@ func (e *Explorer) Connect(ctx context.Context, edge graph.Edge) error {
 	if err := contextError(ctx); err != nil {
 		return err
 	}
-	if err := validateEdge(edge); err != nil {
+	if err := validatePersistedEdge(edge); err != nil {
 		return err
 	}
 	e.mu.Lock()
@@ -243,7 +278,10 @@ func (e *Explorer) Connect(ctx context.Context, edge graph.Edge) error {
 	if err := e.requireOpen(); err != nil {
 		return err
 	}
-	nodes, allEdges := e.currentGraph(time.Time{})
+	nodes, allEdges, err := e.currentGraph()
+	if err != nil {
+		return err
+	}
 	if _, ok := nodes[edge.From]; !ok {
 		return shoal.NewError(shoal.ErrorNotFound, "edge source node not found")
 	}
@@ -256,7 +294,9 @@ func (e *Explorer) Connect(ctx context.Context, edge graph.Edge) error {
 		}
 		return shoal.NewError(shoal.ErrorConflict, "edge ID already has different content")
 	}
-	if err := e.writeJSON(edgeRow+string(edge.ID), persistedEdge{Edge: edge}); err != nil {
+	if err := e.writeRecord(
+		edgeRecordRow(edge.ID), embeddedRecordEdge, persistedEdge{Edge: edge},
+	); err != nil {
 		return err
 	}
 	e.edges[edge.ID] = cloneEdge(edge)
@@ -270,23 +310,13 @@ func (e *Explorer) Neighborhood(
 	if err := contextError(ctx); err != nil {
 		return Neighborhood{}, err
 	}
-	if len(request.NodeIDs) == 0 {
-		return Neighborhood{}, shoal.NewError(
-			shoal.ErrorInvalidArgument, "at least one graph node ID is required")
+	normalized, err := request.Normalize()
+	if err != nil {
+		return Neighborhood{}, err
 	}
-	if request.Depth == 0 {
-		request.Depth = 1
-	}
-	if request.Depth > 16 {
-		return Neighborhood{}, shoal.NewError(
-			shoal.ErrorInvalidArgument, "graph depth cannot exceed 16")
-	}
+	request = normalized
 	typeFilter := make(map[string]struct{}, len(request.EdgeTypes))
 	for _, edgeType := range request.EdgeTypes {
-		if !utf8.ValidString(edgeType) || strings.TrimSpace(edgeType) == "" {
-			return Neighborhood{}, shoal.NewError(
-				shoal.ErrorInvalidArgument, "edge types must be non-empty UTF-8")
-		}
 		typeFilter[edgeType] = struct{}{}
 	}
 
@@ -295,7 +325,10 @@ func (e *Explorer) Neighborhood(
 	if err := e.requireOpen(); err != nil {
 		return Neighborhood{}, err
 	}
-	nodes, edges := e.currentGraph(time.Time{})
+	nodes, edges, err := e.currentGraph()
+	if err != nil {
+		return Neighborhood{}, err
+	}
 	seen := make(map[shoal.ID]struct{})
 	frontier := make(map[shoal.ID]struct{})
 	for _, id := range request.NodeIDs {
@@ -339,73 +372,13 @@ func (e *Explorer) Neighborhood(
 	for _, edge := range selectedEdges {
 		result.Edges = append(result.Edges, cloneEdge(edge))
 	}
-	sort.Slice(result.Nodes, func(i, j int) bool { return result.Nodes[i].ID < result.Nodes[j].ID })
-	sort.Slice(result.Edges, func(i, j int) bool { return result.Edges[i].ID < result.Edges[j].ID })
-	return result, nil
-}
-
-func (e *Explorer) load() error {
-	scanner, err := e.engine.Scan(explorerTable, iterrt.InfiniteRange(), engine.ScanOptions{
-		ColumnFamilies: [][]byte{[]byte(recordCF)}, ColumnFamiliesInclusive: true,
+	sort.Slice(result.Nodes, func(i, j int) bool {
+		return shoal.CompareID(result.Nodes[i].ID, result.Nodes[j].ID) < 0
 	})
-	if err != nil {
-		return shoal.WrapError(shoal.ErrorInternal, "scan explorer records", err)
-	}
-	defer scanner.Close()
-	for scanner.Next() {
-		key := scanner.Key()
-		if !bytes.Equal(key.ColumnQualifier, []byte(recordCQ)) {
-			if err := scanner.Advance(); err != nil {
-				return shoal.WrapError(shoal.ErrorInternal, "advance explorer scan", err)
-			}
-			continue
-		}
-		row := string(key.Row)
-		switch {
-		case strings.HasPrefix(row, documentRow):
-			var record persistedDocument
-			if err := json.Unmarshal(scanner.Value(), &record); err != nil {
-				return shoal.WrapError(shoal.ErrorInternal, "decode explorer document", err)
-			}
-			if record.Document.ID == "" || record.Revision.ID == "" {
-				return shoal.NewError(shoal.ErrorInternal, "stored explorer document is incomplete")
-			}
-			if e.documents[record.Document.ID] == nil {
-				e.documents[record.Document.ID] = make(map[shoal.ID]*persistedDocument)
-			}
-			copy := record
-			e.documents[record.Document.ID][record.Revision.ID] = &copy
-		case strings.HasPrefix(row, edgeRow):
-			var record persistedEdge
-			if err := json.Unmarshal(scanner.Value(), &record); err != nil {
-				return shoal.WrapError(shoal.ErrorInternal, "decode explorer edge", err)
-			}
-			if err := validateEdge(record.Edge); err != nil {
-				return shoal.WrapError(shoal.ErrorInternal, "stored explorer edge is invalid", err)
-			}
-			e.edges[record.Edge.ID] = record.Edge
-		}
-		if err := scanner.Advance(); err != nil {
-			return shoal.WrapError(shoal.ErrorInternal, "advance explorer scan", err)
-		}
-	}
-	return nil
-}
-
-func (e *Explorer) writeJSON(row string, value any) error {
-	encoded, err := json.Marshal(value)
-	if err != nil {
-		return shoal.WrapError(shoal.ErrorInternal, "encode explorer record", err)
-	}
-	mutation, err := cclient.NewMutation([]byte(row))
-	if err != nil {
-		return shoal.WrapError(shoal.ErrorInternal, "create explorer mutation", err)
-	}
-	mutation.PutLatest([]byte(recordCF), []byte(recordCQ), nil, encoded)
-	if err := e.engine.Write(explorerTable, []*cclient.Mutation{mutation}); err != nil {
-		return shoal.WrapError(shoal.ErrorUnavailable, "write explorer record", err)
-	}
-	return nil
+	sort.Slice(result.Edges, func(i, j int) bool {
+		return shoal.CompareID(result.Edges[i].ID, result.Edges[j].ID) < 0
+	})
+	return result, nil
 }
 
 func (e *Explorer) requireOpen() error {
@@ -415,13 +388,18 @@ func (e *Explorer) requireOpen() error {
 	return nil
 }
 
-func (e *Explorer) currentGraph(
-	asOf time.Time,
-) (map[shoal.ID]graph.Node, map[shoal.ID]graph.Edge) {
+func (e *Explorer) currentGraph() (
+	map[shoal.ID]graph.Node,
+	map[shoal.ID]graph.Edge,
+	error,
+) {
 	nodes := make(map[shoal.ID]graph.Node)
 	edges := make(map[shoal.ID]graph.Edge)
 	for _, revisions := range e.documents {
-		record := latestRevision(revisions, asOf)
+		record, err := latestRevision(revisions)
+		if err != nil {
+			return nil, nil, err
+		}
 		if record == nil {
 			continue
 		}
@@ -441,24 +419,40 @@ func (e *Explorer) currentGraph(
 		}
 		edges[id] = edge
 	}
-	return nodes, edges
+	return nodes, edges, nil
 }
 
 func latestRevision(
-	revisions map[shoal.ID]*persistedDocument, asOf time.Time,
-) *persistedDocument {
+	revisions map[shoal.ID]*persistedDocument,
+) (*persistedDocument, error) {
+	if len(revisions) == 1 {
+		for _, record := range revisions {
+			return record, nil
+		}
+	}
 	var latest *persistedDocument
+	sequences := make(map[uint64]struct{}, len(revisions))
 	for _, record := range revisions {
-		if !asOf.IsZero() && record.Revision.CreatedAt.After(asOf) {
+		if record.PublicationSequence == 0 {
 			continue
 		}
-		if latest == nil || record.Revision.CreatedAt.After(latest.Revision.CreatedAt) ||
-			(record.Revision.CreatedAt.Equal(latest.Revision.CreatedAt) &&
-				record.Revision.ID > latest.Revision.ID) {
+		if _, duplicate := sequences[record.PublicationSequence]; duplicate {
+			return nil, shoal.NewError(
+				shoal.ErrorInternal, "stored publication sequences are not unique")
+		}
+		sequences[record.PublicationSequence] = struct{}{}
+		if latest == nil ||
+			record.PublicationSequence > latest.PublicationSequence {
 			latest = record
 		}
 	}
-	return latest
+	if latest == nil {
+		return nil, shoal.NewError(
+			shoal.ErrorUnavailable,
+			"embedded publication order is unavailable for legacy revisions",
+		)
+	}
+	return latest, nil
 }
 
 func buildSectionView(record *persistedDocument) (SectionView, error) {
@@ -536,27 +530,6 @@ func ingestResult(record *persistedDocument, disposition IngestDisposition) Inge
 	}
 }
 
-func validateEdge(edge graph.Edge) error {
-	if edge.ID == "" || edge.From == "" || edge.To == "" ||
-		strings.TrimSpace(edge.Type) == "" {
-		return shoal.NewError(shoal.ErrorInvalidArgument, "edge is structurally incomplete")
-	}
-	for _, value := range []string{
-		string(edge.ID), string(edge.From), string(edge.To), edge.Type,
-	} {
-		if !utf8.ValidString(value) {
-			return shoal.NewError(shoal.ErrorInvalidArgument, "edge values must be valid UTF-8")
-		}
-	}
-	if math.IsNaN(float64(edge.Weight)) || math.IsInf(float64(edge.Weight), 0) {
-		return shoal.NewError(shoal.ErrorInvalidArgument, "edge weight must be finite")
-	}
-	if err := validateMetadata(edge.Properties); err != nil {
-		return err
-	}
-	return nil
-}
-
 func edgesEqual(left, right graph.Edge) bool {
 	if left.ID != right.ID || left.From != right.From || left.To != right.To ||
 		left.Type != right.Type || left.Weight != right.Weight ||
@@ -569,6 +542,44 @@ func edgesEqual(left, right graph.Edge) bool {
 		}
 	}
 	return true
+}
+
+func validatePersistedEdge(edge graph.Edge) error {
+	if err := edge.Validate(); err != nil {
+		return err
+	}
+	if !utf8.ValidString(edge.Type) {
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"embedded edge type must be valid UTF-8",
+		)
+	}
+	return nil
+}
+
+func validateLegacyPersistedEdge(edge graph.Edge) error {
+	if edge.ID == "" || edge.From == "" || edge.To == "" ||
+		strings.TrimSpace(edge.Type) == "" {
+		return shoal.NewError(shoal.ErrorInvalidArgument, "edge is structurally incomplete")
+	}
+	for _, value := range []string{
+		string(edge.ID), string(edge.From), string(edge.To), edge.Type,
+	} {
+		if !utf8.ValidString(value) {
+			return shoal.NewError(
+				shoal.ErrorInvalidArgument, "edge values must be valid UTF-8")
+		}
+	}
+	if math.IsNaN(float64(edge.Weight)) || math.IsInf(float64(edge.Weight), 0) {
+		return shoal.NewError(shoal.ErrorInvalidArgument, "edge weight must be finite")
+	}
+	for key, value := range edge.Properties {
+		if !utf8.ValidString(key) || !utf8.ValidString(value) {
+			return shoal.NewError(
+				shoal.ErrorInvalidArgument, "edge properties must be valid UTF-8")
+		}
+	}
+	return nil
 }
 
 func cloneNode(node graph.Node) graph.Node {

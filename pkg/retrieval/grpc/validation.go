@@ -21,7 +21,6 @@ package retrievalgrpc
 
 import (
 	"fmt"
-	"math"
 	"unicode/utf8"
 
 	"github.com/phrocker/shoal-oss/internal/knowledgepb"
@@ -31,7 +30,27 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
-func validateResponse(response retrieval.Response) error {
+func validateRequestWire(request retrieval.Request) error {
+	if err := validateWireString("retrieval text", request.Text); err != nil {
+		return shoal.WrapError(shoal.ErrorInvalidArgument, err.Error(), err)
+	}
+	for _, id := range request.Scope.DocumentIDs {
+		if err := validateWireString("retrieval document ID", string(id)); err != nil {
+			return shoal.WrapError(shoal.ErrorInvalidArgument, err.Error(), err)
+		}
+	}
+	for _, id := range request.Scope.NodeIDs {
+		if err := validateWireString("retrieval node ID", string(id)); err != nil {
+			return shoal.WrapError(shoal.ErrorInvalidArgument, err.Error(), err)
+		}
+	}
+	return nil
+}
+
+func validateResponse(request retrieval.Request, response retrieval.Response) error {
+	if err := response.ValidateFor(request); err != nil {
+		return err
+	}
 	if err := validateWireString("request ID", string(response.RequestID)); err != nil {
 		return err
 	}
@@ -40,19 +59,9 @@ func validateResponse(response retrieval.Response) error {
 		if err := validateWireString(resultName+" ID", string(result.ID)); err != nil {
 			return err
 		}
-		if err := validateFinite(
-			fmt.Sprintf("result %d score", resultIndex), result.Score,
-		); err != nil {
-			return err
-		}
 		for evidenceIndex, evidence := range result.Evidence {
 			evidenceName := fmt.Sprintf(
 				"result %d evidence %d", resultIndex, evidenceIndex)
-			if err := evidence.Citation.Validate(); err != nil {
-				return fmt.Errorf(
-					"result %d evidence %d citation: %w",
-					resultIndex, evidenceIndex, err)
-			}
 			if err := validateCitationStrings(
 				evidenceName+" citation", evidence.Citation,
 			); err != nil {
@@ -61,24 +70,8 @@ func validateResponse(response retrieval.Response) error {
 			if err := validateWireString(evidenceName+" quote", evidence.Quote); err != nil {
 				return err
 			}
-			if err := validateFinite(
-				fmt.Sprintf("result %d evidence %d score", resultIndex, evidenceIndex),
-				evidence.Score,
-			); err != nil {
-				return err
-			}
 			if pathPresent(evidence.Path) {
-				if err := evidence.Path.Validate(); err != nil {
-					return fmt.Errorf(
-						"result %d evidence %d path: %w",
-						resultIndex, evidenceIndex, err)
-				}
 				if err := validatePathStrings(evidenceName+" path", evidence.Path); err != nil {
-					return err
-				}
-				if err := validatePathScores(
-					resultIndex, evidenceIndex, evidence.Path,
-				); err != nil {
 					return err
 				}
 			}
@@ -89,15 +82,9 @@ func validateResponse(response retrieval.Response) error {
 			); err != nil {
 				return err
 			}
-			for name, score := range result.Explanation.Scores {
+			for name := range result.Explanation.Scores {
 				if err := validateWireString(
 					resultName+" explanation score name", name,
-				); err != nil {
-					return err
-				}
-				if err := validateFinite(
-					fmt.Sprintf("result %d explanation score %q", resultIndex, name),
-					score,
 				); err != nil {
 					return err
 				}
@@ -191,13 +178,15 @@ func validateProtoResponse(response *knowledgepb.RetrieveResponse) error {
 	if response == nil {
 		return fmt.Errorf("knowledge retrieval response is required")
 	}
+	if err := validateWireString("request ID", response.GetRequestId()); err != nil {
+		return err
+	}
 	for resultIndex, result := range response.GetResults() {
 		if result == nil {
 			return fmt.Errorf("result %d is required", resultIndex)
 		}
-		if err := validateFinite(
-			fmt.Sprintf("result %d score", resultIndex),
-			shoal.Score(result.GetScore()),
+		if err := validateWireString(
+			fmt.Sprintf("result %d ID", resultIndex), result.GetId(),
 		); err != nil {
 			return err
 		}
@@ -211,27 +200,12 @@ func validateProtoResponse(response *knowledgepb.RetrieveResponse) error {
 					"result %d evidence %d citation is required",
 					resultIndex, evidenceIndex)
 			}
-			if err := citationFromProto(evidence.GetCitation()).Validate(); err != nil {
+			if evidence.GetPath() != nil &&
+				len(evidence.GetPath().GetNodes()) == 0 &&
+				len(evidence.GetPath().GetEdges()) == 0 {
 				return fmt.Errorf(
-					"result %d evidence %d citation: %w",
-					resultIndex, evidenceIndex, err)
-			}
-			if err := validateFinite(
-				fmt.Sprintf("result %d evidence %d score", resultIndex, evidenceIndex),
-				shoal.Score(evidence.GetScore()),
-			); err != nil {
-				return err
-			}
-			if evidence.GetPath() != nil {
-				path := pathFromProto(evidence.GetPath())
-				if err := path.Validate(); err != nil {
-					return fmt.Errorf(
-						"result %d evidence %d path: %w",
-						resultIndex, evidenceIndex, err)
-				}
-				if err := validatePathScores(resultIndex, evidenceIndex, path); err != nil {
-					return err
-				}
+					"result %d evidence %d path cannot be empty",
+					resultIndex, evidenceIndex)
 			}
 		}
 		if explanation := result.GetExplanation(); explanation != nil {
@@ -242,36 +216,7 @@ func validateProtoResponse(response *knowledgepb.RetrieveResponse) error {
 						resultIndex, modeIndex, err)
 				}
 			}
-			for name, score := range explanation.GetScores() {
-				if err := validateFinite(
-					fmt.Sprintf("result %d explanation score %q", resultIndex, name),
-					shoal.Score(score),
-				); err != nil {
-					return err
-				}
-			}
 		}
-	}
-	return nil
-}
-
-func validatePathScores(resultIndex, evidenceIndex int, path graph.Path) error {
-	for edgeIndex, edge := range path.Edges {
-		if err := validateFinite(
-			fmt.Sprintf(
-				"result %d evidence %d path edge %d weight",
-				resultIndex, evidenceIndex, edgeIndex),
-			edge.Weight,
-		); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func validateFinite(name string, score shoal.Score) error {
-	if math.IsNaN(float64(score)) || math.IsInf(float64(score), 0) {
-		return fmt.Errorf("%s must be finite", name)
 	}
 	return nil
 }
