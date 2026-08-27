@@ -1099,6 +1099,7 @@ func (d PropertyDefinition) Validate() error {
 	seen := make(map[ConstraintKind]struct{}, len(d.constraints))
 	var minimumCount, maximumCount *uint32
 	var minimumValue, maximumValue *Value
+	var allowedValues []Value
 	for index, constraint := range d.constraints {
 		if err := constraint.Validate(); err != nil {
 			return err
@@ -1135,7 +1136,8 @@ func (d PropertyDefinition) Validate() error {
 				return invalid("pattern constraint requires a string property")
 			}
 		case ConstraintAllowedValues:
-			for _, value := range constraint.AllowedValues() {
+			allowedValues = constraint.AllowedValues()
+			for _, value := range allowedValues {
 				if !valueMatchesType(value, d.valueType) {
 					return invalid("allowed value does not match property type")
 				}
@@ -1146,9 +1148,18 @@ func (d PropertyDefinition) Validate() error {
 		*minimumCount > *maximumCount {
 		return invalid("minimum count exceeds maximum count")
 	}
+	if _, required := seen[ConstraintRequired]; required &&
+		maximumCount != nil && *maximumCount == 0 {
+		return invalid("required property cannot have a maximum count of zero")
+	}
 	if minimumValue != nil && maximumValue != nil &&
 		compareNumericValues(*minimumValue, *maximumValue) > 0 {
 		return invalid("minimum value exceeds maximum value")
+	}
+	for _, value := range allowedValues {
+		if !valueSatisfiesConstraints(value, d.constraints, false) {
+			return invalid("allowed value contradicts property constraints")
+		}
 	}
 	return nil
 }
@@ -1250,6 +1261,46 @@ func numericRat(value Value) *big.Rat {
 
 func compareNumericValues(left, right Value) int {
 	return numericRat(left).Cmp(numericRat(right))
+}
+
+func valueSatisfiesConstraints(
+	value Value, constraints []Constraint, includeAllowed bool,
+) bool {
+	for _, constraint := range constraints {
+		switch constraint.Kind() {
+		case ConstraintMinimumValue:
+			minimum, _ := constraint.Value()
+			if compareNumericValues(value, minimum) < 0 {
+				return false
+			}
+		case ConstraintMaximumValue:
+			maximum, _ := constraint.Value()
+			if compareNumericValues(value, maximum) > 0 {
+				return false
+			}
+		case ConstraintPattern:
+			pattern, _ := constraint.Pattern()
+			text, _ := value.StringValue()
+			if !regexp.MustCompile(pattern).MatchString(text) {
+				return false
+			}
+		case ConstraintAllowedValues:
+			if !includeAllowed {
+				continue
+			}
+			matched := false
+			for _, allowed := range constraint.AllowedValues() {
+				if allowed.canonical() == value.canonical() {
+					matched = true
+					break
+				}
+			}
+			if !matched {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func cloneConstraints(values []Constraint) []Constraint {

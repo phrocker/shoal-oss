@@ -515,6 +515,47 @@ func TestPropertyRejectsInvalidConstraints(t *testing.T) {
 				[]ontology.Constraint{required, required}, nil)
 			return err
 		},
+		"required with zero maximum count": func() error {
+			maximum, err := ontology.NewCountConstraint(
+				ontology.ConstraintMaximumCount, 0)
+			if err != nil {
+				return err
+			}
+			_, err = ontology.NewPropertyDefinition(
+				"name", "Name", "", ontology.ValueString,
+				[]ontology.Constraint{required, maximum}, nil)
+			return err
+		},
+		"allowed value below minimum": func() error {
+			allowed, err := ontology.NewAllowedValuesConstraint(
+				[]ontology.Value{ontology.NewIntegerValue(1)})
+			if err != nil {
+				return err
+			}
+			_, err = ontology.NewPropertyDefinition(
+				"age", "Age", "", ontology.ValueInteger,
+				[]ontology.Constraint{minimumTen, allowed}, nil)
+			return err
+		},
+		"allowed value fails pattern": func() error {
+			pattern, err := ontology.NewPatternConstraint(`^[A-Z]+$`)
+			if err != nil {
+				return err
+			}
+			lower, err := ontology.NewStringValue("lower")
+			if err != nil {
+				return err
+			}
+			allowed, err := ontology.NewAllowedValuesConstraint(
+				[]ontology.Value{lower})
+			if err != nil {
+				return err
+			}
+			_, err = ontology.NewPropertyDefinition(
+				"code", "Code", "", ontology.ValueString,
+				[]ontology.Constraint{pattern, allowed}, nil)
+			return err
+		},
 		"pattern type mismatch": func() error {
 			pattern, err := ontology.NewPatternConstraint("[0-9]+")
 			if err != nil {

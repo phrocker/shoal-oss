@@ -47,6 +47,7 @@ const (
 	hardMaxSchemaMembers    = 32768
 	hardMaxMetadataEntries  = 4096
 	hardMaxMetadataBytes    = 1 << 20
+	hardMaxPayloadBytes     = 64 << 20
 )
 
 // ExtractionLimits bounds one v1 extraction envelope. Zero assertions or
@@ -62,6 +63,7 @@ type ExtractionLimits struct {
 	MaxSchemaMembers    uint32
 	MaxMetadataEntries  uint32
 	MaxMetadataBytes    uint32
+	MaxPayloadBytes     uint32
 }
 
 // DefaultExtractionLimits returns conservative v1 limits.
@@ -71,6 +73,7 @@ func DefaultExtractionLimits() ExtractionLimits {
 		MaxQuoteBytes: 64 << 10, MaxInstructionBytes: 64 << 10,
 		MaxPathNodes: 1024, MaxPathEdges: 2048, MaxSchemaMembers: 4096,
 		MaxMetadataEntries: 256, MaxMetadataBytes: 64 << 10,
+		MaxPayloadBytes: 4 << 20,
 	}
 }
 
@@ -87,7 +90,8 @@ func (l ExtractionLimits) Validate() error {
 		l.MaxSchemaMembers == 0 || l.MaxSchemaMembers > hardMaxSchemaMembers ||
 		l.MaxMetadataEntries == 0 ||
 		l.MaxMetadataEntries > hardMaxMetadataEntries ||
-		l.MaxMetadataBytes == 0 || l.MaxMetadataBytes > hardMaxMetadataBytes {
+		l.MaxMetadataBytes == 0 || l.MaxMetadataBytes > hardMaxMetadataBytes ||
+		l.MaxPayloadBytes == 0 || l.MaxPayloadBytes > hardMaxPayloadBytes {
 		return invalid("extraction limits are outside v1 safety bounds")
 	}
 	return nil
@@ -105,6 +109,7 @@ func (l ExtractionLimits) canonical() string {
 		strconv.FormatUint(uint64(l.MaxSchemaMembers), 10),
 		strconv.FormatUint(uint64(l.MaxMetadataEntries), 10),
 		strconv.FormatUint(uint64(l.MaxMetadataBytes), 10),
+		strconv.FormatUint(uint64(l.MaxPayloadBytes), 10),
 	)
 }
 
@@ -173,6 +178,9 @@ func (r ExtractionRequest) Validate() error {
 	}
 	if err := validateBoundedVersion(r.version, r.limits); err != nil {
 		return err
+	}
+	if extractionRequestPayloadBytes(r) > uint64(r.limits.MaxPayloadBytes) {
+		return invalid("extraction request payload exceeds request limit")
 	}
 	if len(r.evidence) == 0 {
 		return invalid("extraction request requires evidence")
@@ -391,6 +399,9 @@ func (r ExtractionResult) Validate() error {
 	if err := validateBoundedMetadata(r.provenance.Metadata(), r.limits); err != nil {
 		return err
 	}
+	if extractionResultPayloadBytes(r) > uint64(r.limits.MaxPayloadBytes) {
+		return invalid("extraction result payload exceeds result limit")
+	}
 	for index, assertion := range r.assertions {
 		if err := assertion.Validate(); err != nil {
 			return err
@@ -403,6 +414,9 @@ func (r ExtractionResult) Validate() error {
 		}
 		if err := validateBoundedMetadata(assertion.Metadata(), r.limits); err != nil {
 			return err
+		}
+		if assertionPayloadBytes(assertion) > uint64(r.limits.MaxPayloadBytes) {
+			return invalid("assertion payload exceeds result limit")
 		}
 		if index > 0 &&
 			string(r.assertions[index-1].ID()) >= string(assertion.ID()) {
@@ -421,6 +435,9 @@ func (r ExtractionResult) Validate() error {
 		}
 		if err := validateBoundedMetadata(proposal.Metadata(), r.limits); err != nil {
 			return err
+		}
+		if proposalPayloadBytes(proposal) > uint64(r.limits.MaxPayloadBytes) {
+			return invalid("proposal payload exceeds result limit")
 		}
 		if index > 0 &&
 			string(r.proposals[index-1].ID()) >= string(proposal.ID()) {
@@ -451,27 +468,44 @@ func (r ExtractionResult) ValidateFor(request ExtractionRequest) error {
 		r.provenance.canonical() != request.Provenance().canonical() {
 		return invalid("extraction result envelope does not match request")
 	}
-	requestEvidence := make(map[shoal.ID]struct{}, len(request.evidence))
+	requestEvidence := make(map[shoal.ID]string, len(request.evidence))
 	for _, evidence := range request.evidence {
-		requestEvidence[evidence.ID()] = struct{}{}
+		requestEvidence[evidence.ID()] = canonicalMetadata(evidence.metadata)
 	}
+	properties := make(map[shoal.ID]PropertyDefinition, len(request.version.properties))
+	for _, property := range request.version.properties {
+		properties[property.ID()] = property
+	}
+	relationships := make(map[shoal.ID]struct{}, len(request.version.relationships))
+	for _, relationship := range request.version.relationships {
+		relationships[relationship.ID()] = struct{}{}
+	}
+	type assertionGroup struct {
+		subject   shoal.ID
+		predicate shoal.ID
+	}
+	counts := make(map[assertionGroup]uint32)
 	for _, assertion := range r.assertions {
 		for _, evidence := range assertion.Evidence() {
-			if _, exists := requestEvidence[evidence.ID()]; !exists {
+			metadata, exists := requestEvidence[evidence.ID()]
+			if !exists || metadata != canonicalMetadata(evidence.metadata) {
 				return invalid("assertion cites evidence outside the extraction request")
 			}
 		}
 		switch IDNamespace(assertion.Predicate()) {
 		case "property":
-			property, exists := request.version.property(assertion.Predicate())
+			property, exists := properties[assertion.Predicate()]
 			if !exists {
 				return invalid("assertion references an unknown property")
 			}
-			if !valueMatchesType(assertion.Object(), property.ValueType()) {
-				return invalid("assertion value does not match property type")
+			if err := validatePropertyValue(property, assertion.Object()); err != nil {
+				return err
 			}
+			counts[assertionGroup{
+				subject: assertion.Subject(), predicate: assertion.Predicate(),
+			}]++
 		case "relationship":
-			if _, exists := request.version.relationship(assertion.Predicate()); !exists {
+			if _, exists := relationships[assertion.Predicate()]; !exists {
 				return invalid("assertion references an unknown relationship")
 			}
 			if assertion.Object().Type() != ValueReference {
@@ -481,10 +515,41 @@ func (r ExtractionResult) ValidateFor(request ExtractionRequest) error {
 			return invalid("assertion predicate is not in the ontology")
 		}
 	}
+	for group, count := range counts {
+		property := properties[group.predicate]
+		for _, constraint := range property.constraints {
+			switch constraint.Kind() {
+			case ConstraintMinimumCount:
+				minimum, _ := constraint.Count()
+				if count < minimum {
+					return invalid("assertion count is below property minimum")
+				}
+			case ConstraintMaximumCount:
+				maximum, _ := constraint.Count()
+				if count > maximum {
+					return invalid("assertion count exceeds property maximum")
+				}
+			}
+		}
+	}
 	for _, proposal := range r.proposals {
 		if proposal.Schema().ID() != request.version.Schema().ID() {
 			return invalid("extracted proposal belongs to a different schema")
 		}
+		baseVersionID, present := proposal.BaseVersionID()
+		if !present || baseVersionID != request.version.ID() {
+			return invalid("extracted proposal does not use the request ontology version")
+		}
+	}
+	return nil
+}
+
+func validatePropertyValue(property PropertyDefinition, value Value) error {
+	if !valueMatchesType(value, property.ValueType()) {
+		return invalid("assertion value does not match property type")
+	}
+	if !valueSatisfiesConstraints(value, property.constraints, true) {
+		return invalid("assertion value violates property constraints")
 	}
 	return nil
 }
@@ -601,6 +666,79 @@ func validateBoundedVersion(version OntologyVersion, limits ExtractionLimits) er
 		}
 	}
 	return nil
+}
+
+func extractionRequestPayloadBytes(request ExtractionRequest) uint64 {
+	size := ontologyVersionPayloadBytes(request.version) +
+		uint64(len(request.instructions)) +
+		provenancePayloadBytes(request.provenance) +
+		uint64(len(canonicalMetadata(request.metadata)))
+	for _, evidence := range request.evidence {
+		size += evidencePayloadBytes(evidence)
+	}
+	return size
+}
+
+func extractionResultPayloadBytes(result ExtractionResult) uint64 {
+	size := provenancePayloadBytes(result.provenance) +
+		uint64(len(canonicalMetadata(result.metadata)))
+	for _, assertion := range result.assertions {
+		size += assertionPayloadBytes(assertion)
+	}
+	for _, proposal := range result.proposals {
+		size += proposalPayloadBytes(proposal)
+	}
+	return size
+}
+
+func ontologyVersionPayloadBytes(version OntologyVersion) uint64 {
+	size := uint64(len(version.schema.key) + len(version.schema.name) +
+		len(version.schema.description) + len(version.version) +
+		len(canonicalMetadata(version.schema.metadata)) +
+		len(canonicalMetadata(version.metadata)))
+	for _, concept := range version.concepts {
+		size += uint64(len(concept.canonical()))
+	}
+	for _, relationship := range version.relationships {
+		size += uint64(len(relationship.canonical()))
+	}
+	for _, property := range version.properties {
+		size += uint64(len(property.canonical()))
+	}
+	return size
+}
+
+func evidencePayloadBytes(evidence EvidenceRef) uint64 {
+	return uint64(len(canonicalCitation(evidence.citation)) +
+		len(evidence.quote) + len(canonicalGraphPath(evidence.path)) +
+		len(canonicalMetadata(evidence.metadata)))
+}
+
+func provenancePayloadBytes(provenance ExtractionProvenance) uint64 {
+	return uint64(len(provenance.canonical()))
+}
+
+func assertionPayloadBytes(assertion Assertion) uint64 {
+	size := uint64(len(assertion.subject) + len(assertion.predicate) +
+		len(assertion.object.canonical()) + len(assertion.provenance.canonical()) +
+		len(canonicalMetadata(assertion.metadata)))
+	for _, evidence := range assertion.evidence {
+		size += evidencePayloadBytes(evidence)
+	}
+	return size
+}
+
+func proposalPayloadBytes(proposal GovernedProposal) uint64 {
+	size := uint64(len(proposal.schema.key)+len(proposal.schema.name)+
+		len(proposal.schema.description)+len(proposal.baseVersionID)+
+		len(proposal.proposedBy)+len(proposal.rationale)+
+		len(canonicalMetadata(proposal.schema.metadata))+
+		len(canonicalMetadata(proposal.metadata))) +
+		ontologyVersionPayloadBytes(proposal.proposedVersion)
+	for _, transition := range proposal.transitions {
+		size += uint64(len(transition.actor) + len(transition.note))
+	}
+	return size
 }
 
 func validateBoundedMetadata(metadata shoal.Metadata, limits ExtractionLimits) error {
