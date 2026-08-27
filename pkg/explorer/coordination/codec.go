@@ -37,6 +37,19 @@ const (
 	KindReservation
 	KindEpochOutcome
 	KindFrontierCheckpoint
+	KindEntityGuard
+	KindPendingMutation
+	KindPolicyCopyManifest
+	KindPolicyCopyMap
+	KindPolicyCopyFence
+	KindIndexGeneration
+	KindIndexDelta
+	KindIndexActivation
+	KindSnapshotLease
+	KindRetirementDecision
+	KindHistoryFloor
+	KindWriterAuthority
+	KindBackendObservation
 )
 
 const (
@@ -45,6 +58,19 @@ const (
 	VersionReservationV1        uint16 = 1
 	VersionEpochOutcomeV1       uint16 = 1
 	VersionFrontierCheckpointV1 uint16 = 1
+	VersionEntityGuardV1        uint16 = 1
+	VersionPendingMutationV1    uint16 = 1
+	VersionPolicyCopyManifestV1 uint16 = 1
+	VersionPolicyCopyMapV3      uint16 = 3
+	VersionPolicyCopyFenceV1    uint16 = 1
+	VersionIndexGenerationV2    uint16 = 2
+	VersionIndexDeltaV1         uint16 = 1
+	VersionIndexActivationV2    uint16 = 2
+	VersionSnapshotLeaseV2      uint16 = 2
+	VersionRetirementDecisionV1 uint16 = 1
+	VersionHistoryFloorV1       uint16 = 1
+	VersionWriterAuthorityV1    uint16 = 1
+	VersionBackendObservationV1 uint16 = 1
 
 	envelopeMagic      = "SHOALCO\x00"
 	envelopeHeaderSize = len(envelopeMagic) + 2 + 2 + 4

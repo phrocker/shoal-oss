@@ -42,6 +42,11 @@ const (
 	MaxChunkBytes          = 1 << 20
 	MaxCoordinateBytes     = 16 << 10
 	MaxManifestValueBytes  = 1 << 20
+	MaxPolicyCopyEntries   = 4096
+	MaxIndexDeltaEntries   = 4096
+	MaxIndexPins           = 64
+	MaxBackendIDBytes      = 1024
+	MaxObjectKindBytes     = 256
 )
 
 type DomainID []byte
@@ -50,6 +55,11 @@ type LPART []byte
 type OwnerID []byte
 type IGEN []byte
 type Family []byte
+type EntityKind []byte
+type EntityID []byte
+type LeaseID []byte
+type BackendID []byte
+type AuthorityTerm []byte
 
 type Digest [sha256.Size]byte
 
@@ -85,6 +95,21 @@ func (v IGEN) Validate() error {
 	return validateOpaque("index generation ID", v, MaxOpaqueIDBytes, true)
 }
 func (v Family) Validate() error { return validateOpaque("index family", v, MaxOpaqueIDBytes, true) }
+func (v EntityKind) Validate() error {
+	return validateOpaque("entity kind", v, MaxObjectKindBytes, true)
+}
+func (v EntityID) Validate() error {
+	return validateOpaque("entity ID", v, MaxOpaqueIDBytes, true)
+}
+func (v LeaseID) Validate() error {
+	return validateOpaque("lease ID", v, MaxOpaqueIDBytes, true)
+}
+func (v BackendID) Validate() error {
+	return validateOpaque("backend ID", v, MaxBackendIDBytes, true)
+}
+func (v AuthorityTerm) Validate() error {
+	return validateOpaque("authority term", v, MaxOpaqueIDBytes, true)
+}
 
 func validatePositive(name string, value int64) error {
 	if value <= 0 {
@@ -212,3 +237,133 @@ func ValidateTransition(from, to TxnState) error {
 }
 
 func invalid(message string) error { return fmt.Errorf("coordination: %s", message) }
+
+type GuardState uint8
+
+const (
+	GuardStateHeld GuardState = iota + 1
+	GuardStateReleased
+	GuardStateCommitted
+	GuardStateAborted
+	GuardStateConflicted
+	GuardStatePoisoned
+)
+
+func (s GuardState) Validate() error {
+	if s < GuardStateHeld || s > GuardStatePoisoned {
+		return invalid("guard state is unknown")
+	}
+	return nil
+}
+
+func (s GuardState) Terminal() bool { return s >= GuardStateCommitted }
+
+type LifecycleState uint8
+
+const (
+	LifecycleBuilding LifecycleState = iota + 1
+	LifecycleVerified
+	LifecycleActive
+	LifecycleRetired
+	LifecyclePoisoned
+)
+
+func (s LifecycleState) Validate() error {
+	if s < LifecycleBuilding || s > LifecyclePoisoned {
+		return invalid("lifecycle state is unknown")
+	}
+	return nil
+}
+
+type CopyState uint8
+
+const (
+	CopyStateBuilding CopyState = iota + 1
+	CopyStateSealed
+	CopyStateActive
+	CopyStateRetired
+	CopyStatePoisoned
+)
+
+func (s CopyState) Validate() error {
+	if s < CopyStateBuilding || s > CopyStatePoisoned {
+		return invalid("policy-copy state is unknown")
+	}
+	return nil
+}
+
+type ActivationKind uint8
+
+const (
+	ActivationContentTXN ActivationKind = iota + 1
+	ActivationPolicyRoot
+)
+
+func (k ActivationKind) Validate() error {
+	if k != ActivationContentTXN && k != ActivationPolicyRoot {
+		return invalid("activation kind is unknown")
+	}
+	return nil
+}
+
+type LeaseState uint8
+
+const (
+	LeaseStateActive LeaseState = iota + 1
+	LeaseStateReleased
+	LeaseStateExpired
+)
+
+func (s LeaseState) Validate() error {
+	if s < LeaseStateActive || s > LeaseStateExpired {
+		return invalid("lease state is unknown")
+	}
+	return nil
+}
+
+type RetirementState uint8
+
+const (
+	RetirementCandidate RetirementState = iota + 1
+	RetirementApproved
+	RetirementRejected
+	RetirementApplied
+	RetirementPoisoned
+)
+
+func (s RetirementState) Validate() error {
+	if s < RetirementCandidate || s > RetirementPoisoned {
+		return invalid("retirement state is unknown")
+	}
+	return nil
+}
+
+type AuthorityState uint8
+
+const (
+	AuthorityActive AuthorityState = iota + 1
+	AuthorityRevoked
+	AuthoritySuperseded
+)
+
+func (s AuthorityState) Validate() error {
+	if s < AuthorityActive || s > AuthoritySuperseded {
+		return invalid("authority state is unknown")
+	}
+	return nil
+}
+
+type BackendState uint8
+
+const (
+	BackendWriteClosed BackendState = iota + 1
+	BackendPrimary
+	BackendReplica
+)
+
+func (s BackendState) Validate() error {
+	if s < BackendWriteClosed || s > BackendReplica {
+		return invalid("backend state is unknown")
+	}
+	return nil
+}
