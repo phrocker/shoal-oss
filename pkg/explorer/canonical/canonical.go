@@ -229,7 +229,30 @@ func decodePayloadV1(payload []byte) (RecordV1, error) {
 	if err := record.Validate(); err != nil {
 		return RecordV1{}, err
 	}
+	// A decodable payload is not necessarily the canonical encoding of what it
+	// decodes to: field orderings and alternate presence forms can differ while
+	// still decoding to an equal record. Re-encoding and requiring an exact
+	// match makes the encoding injective, so one record has exactly one valid
+	// byte representation and therefore exactly one digest.
+	if err := verifyCanonicalPayload(record, payload); err != nil {
+		return RecordV1{}, err
+	}
 	return record, nil
+}
+
+func verifyCanonicalPayload(record RecordV1, payload []byte) error {
+	reencoded, err := MarshalV1(record)
+	if err != nil {
+		return invalid("canonical record is not canonically encoded")
+	}
+	if len(reencoded) < envelopeHeaderBytes+envelopeChecksumSize {
+		return invalid("canonical record is not canonically encoded")
+	}
+	expected := reencoded[envelopeHeaderBytes : len(reencoded)-envelopeChecksumSize]
+	if !bytes.Equal(expected, payload) {
+		return invalid("canonical record is not canonically encoded")
+	}
+	return nil
 }
 
 // Digest validates canonical bytes and returns the embedded SHA-256 checksum

@@ -688,3 +688,126 @@ func assertInvalidArgument(t *testing.T, err error) {
 		t.Fatalf("error = %v, want invalid_argument", err)
 	}
 }
+
+// A record must have exactly one valid byte encoding. The encoder emits
+// metadata in byte-sorted key order, so a permuted-but-decodable payload is a
+// second encoding of the same record and must be rejected; otherwise one
+// record would have two distinct digests.
+func TestUnmarshalRejectsNoncanonicalMetadataOrder(t *testing.T) {
+	record := fixtureRecord(false)
+	record.Document.Metadata = map[string]string{"aa": "11", "bb": "22"}
+	original, err := MarshalV1(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	entry := func(key, value string) []byte {
+		encoded := make([]byte, 0, len(key)+len(value)+8)
+		for _, text := range []string{key, value} {
+			var size [4]byte
+			binary.BigEndian.PutUint32(size[:], uint32(len(text)))
+			encoded = append(encoded, size[:]...)
+			encoded = append(encoded, text...)
+		}
+		return encoded
+	}
+	sorted := append(entry("aa", "11"), entry("bb", "22")...)
+	permuted := append(entry("bb", "22"), entry("aa", "11")...)
+	offset := bytes.Index(original, sorted)
+	if offset < 0 {
+		t.Fatal("sorted metadata entries not found in canonical bytes")
+	}
+
+	mutated := append([]byte(nil), original...)
+	copy(mutated[offset:], permuted)
+	sum := sha256.Sum256(mutated[:len(mutated)-envelopeChecksumSize])
+	copy(mutated[len(mutated)-envelopeChecksumSize:], sum[:])
+	if bytes.Equal(original, mutated) {
+		t.Fatal("permutation did not change the encoding")
+	}
+
+	// The envelope checksum is recomputed, so only a canonicality check can
+	// reject these bytes.
+	if err := VerifyChecksum(mutated); err != nil {
+		t.Fatalf("mutated envelope checksum = %v", err)
+	}
+	_, err = UnmarshalV1(mutated)
+	assertInvalidArgument(t, err)
+	if _, err := Digest(mutated); err == nil {
+		t.Fatal("Digest accepted a noncanonical encoding")
+	} else {
+		assertInvalidArgument(t, err)
+	}
+}
+
+// A zero time is encoded as a single absence marker. The long form carrying an
+// instant that is itself zero decodes to the same record, so it is a second
+// encoding and must be rejected.
+func TestUnmarshalRejectsAlternateZeroTimeEncoding(t *testing.T) {
+	record := fixtureRecord(false)
+	record.Publication = nil
+	record.Revision.CreatedAt = time.Time{}
+	original, err := MarshalV1(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	longForm := make([]byte, 0, 13)
+	longForm = append(longForm, 1)
+	var seconds [8]byte
+	binary.BigEndian.PutUint64(seconds[:], uint64(time.Time{}.Unix()))
+	longForm = append(longForm, seconds[:]...)
+	longForm = append(longForm, 0, 0, 0, 0)
+
+	// Rewrite each absence marker in turn; every resulting payload that still
+	// decodes must be rejected as noncanonical.
+	body := original[:len(original)-envelopeChecksumSize]
+	attempted := false
+	for offset := envelopeHeaderBytes; offset < len(body); offset++ {
+		if body[offset] != 0 {
+			continue
+		}
+		mutatedBody := make([]byte, 0, len(body)+len(longForm))
+		mutatedBody = append(mutatedBody, body[:offset]...)
+		mutatedBody = append(mutatedBody, longForm...)
+		mutatedBody = append(mutatedBody, body[offset+1:]...)
+		binary.BigEndian.PutUint64(
+			mutatedBody[envelopeHeaderBytes-8:envelopeHeaderBytes],
+			uint64(len(mutatedBody)-envelopeHeaderBytes),
+		)
+		sum := sha256.Sum256(mutatedBody)
+		mutated := append(append([]byte(nil), mutatedBody...), sum[:]...)
+		if bytes.Equal(mutated, original) {
+			continue
+		}
+		attempted = true
+		if _, err := UnmarshalV1(mutated); err == nil {
+			t.Fatalf("alternate zero-time encoding accepted at offset %d", offset)
+		}
+	}
+	if !attempted {
+		t.Fatal("no alternate encoding was constructed")
+	}
+}
+
+// Every accepted encoding must be a fixed point of decode-then-encode.
+func TestUnmarshalAcceptsOnlyFixedPointEncodings(t *testing.T) {
+	for _, alternate := range []bool{false, true} {
+		record := fixtureRecord(alternate)
+		encoded, err := MarshalV1(record)
+		if err != nil {
+			t.Fatal(err)
+		}
+		decoded, err := UnmarshalV1(encoded)
+		if err != nil {
+			t.Fatal(err)
+		}
+		reencoded, err := MarshalV1(decoded)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(encoded, reencoded) {
+			t.Fatal("canonical bytes are not a decode/encode fixed point")
+		}
+	}
+}

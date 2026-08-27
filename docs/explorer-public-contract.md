@@ -172,6 +172,13 @@ implementation exposes one. Duplicate modes MUST NOT change scores.
   name nodes in that record, public values and ownership validate, IDs are
   unique within each value family, and unknown versions or malformed,
   oversized, truncated, checksum-broken, or trailing data are rejected.
+- The encoding is injective: each logical record has exactly one valid byte
+  representation, so equal records always have equal digests and distinct
+  bytes never decode to equal records. Decoding therefore rejects any payload
+  that is merely decodable rather than canonical — such as permuted metadata
+  entries or an alternate long-form encoding of a zero time — even when its
+  envelope checksum is consistent. `Digest` is a content identity and is safe
+  to use for deduplication, idempotency, and integrity equality.
 
 ## Latest state, mutations, and retries
 
