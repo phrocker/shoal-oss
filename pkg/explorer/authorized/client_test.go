@@ -22,7 +22,9 @@ package authorized_test
 import (
 	"context"
 	"errors"
+	"math"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -173,6 +175,17 @@ func (f *fixture) decision(
 	sources, policies [][]byte,
 	operations []auth.Operation,
 ) auth.Decision {
+	return f.decisionAtGeneration(
+		t, subject, sources, policies, operations, 1)
+}
+
+func (f *fixture) decisionAtGeneration(
+	t *testing.T,
+	subject string,
+	sources, policies [][]byte,
+	operations []auth.Operation,
+	generation int64,
+) auth.Decision {
 	t.Helper()
 	decision, err := auth.NewDecision(auth.DecisionConfig{
 		Subject:               shoal.ID(subject),
@@ -181,7 +194,7 @@ func (f *fixture) decision(
 		AllowedOperations:     operations,
 		PermittedSourceIDs:    sources,
 		PermittedPolicyIDs:    policies,
-		PolicyGeneration:      1,
+		PolicyGeneration:      generation,
 		AuthenticationExpires: f.clock.Now().Add(time.Hour),
 		RequestID:             shoal.ID(subject + "-request"),
 	})
@@ -492,6 +505,87 @@ func TestResolverExpiryOperationAndSelectorFailures(t *testing.T) {
 	}
 }
 
+func TestResolverErrorCategoriesArePreserved(t *testing.T) {
+	f := newFixture(t)
+	selector, err := authorized.NewStaticPolicySelector(f.sourceA, f.policyA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name string
+		err  error
+		code shoal.ErrorCode
+	}{
+		{
+			name: "canceled",
+			err:  shoal.NewError(shoal.ErrorCanceled, "sensitive resolver detail"),
+			code: shoal.ErrorCanceled,
+		},
+		{
+			name: "deadline",
+			err:  shoal.NewError(shoal.ErrorDeadline, "sensitive resolver detail"),
+			code: shoal.ErrorDeadline,
+		},
+		{
+			name: "unavailable",
+			err:  shoal.NewError(shoal.ErrorUnavailable, "sensitive resolver detail"),
+			code: shoal.ErrorUnavailable,
+		},
+		{
+			name: "internal",
+			err:  shoal.NewError(shoal.ErrorInternal, "sensitive resolver detail"),
+			code: shoal.ErrorInternal,
+		},
+		{
+			name: "unauthorized",
+			err:  shoal.NewError(shoal.ErrorUnauthorized, "sensitive resolver detail"),
+			code: shoal.ErrorUnauthorized,
+		},
+		{
+			name: "not found denial",
+			err:  shoal.NewError(shoal.ErrorNotFound, "sensitive resolver detail"),
+			code: shoal.ErrorUnauthorized,
+		},
+		{
+			name: "invalid context denial",
+			err: shoal.NewError(
+				shoal.ErrorInvalidArgument, "sensitive resolver detail"),
+			code: shoal.ErrorUnauthorized,
+		},
+		{
+			name: "unknown infrastructure",
+			err:  errors.New("sensitive resolver detail"),
+			code: shoal.ErrorUnavailable,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			client, err := authorized.NewClient(authorized.Config{
+				Base: f.base,
+				Resolver: resolverFunc(func(
+					context.Context,
+				) (auth.Decision, error) {
+					return auth.Decision{}, test.err
+				}),
+				PolicySelector:   selector,
+				PolicyStore:      f.store,
+				GenerationReader: f.reader,
+				Clock:            f.clock.Now,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = client.Documents(context.Background())
+			if !shoal.IsErrorCode(err, test.code) {
+				t.Fatalf("resolver error = %v, want %s", err, test.code)
+			}
+			if strings.Contains(err.Error(), "sensitive") {
+				t.Fatalf("resolver error disclosed details: %v", err)
+			}
+		})
+	}
+}
+
 func TestPolicyStoreFailureRetryAndImmutablePolicyConflict(t *testing.T) {
 	f := newFixture(t)
 	failing := &failStore{PolicyStore: f.store, revisionFailures: 1}
@@ -585,6 +679,147 @@ func TestGenerationChangeAfterBaseOperation(t *testing.T) {
 	}
 }
 
+func TestGenerationChangeBetweenSelectionAndMutationPreventsSideEffects(
+	t *testing.T,
+) {
+	t.Run("ingest", func(t *testing.T) {
+		f := newFixture(t)
+		counting := &countingClient{Client: f.base}
+		static, err := authorized.NewStaticPolicySelector(f.sourceA, f.policyA)
+		if err != nil {
+			t.Fatal(err)
+		}
+		selector := authorized.PolicySelectorFunc(func(
+			ctx context.Context,
+			decision auth.Decision,
+			source explorer.Source,
+		) (auth.Policy, error) {
+			policy, err := static.SelectPolicy(ctx, decision, source)
+			f.reader.Set(f.domain, 2)
+			return policy, err
+		})
+		client, err := authorized.NewClient(authorized.Config{
+			Base:               counting,
+			Resolver:           f.authority.Resolver(),
+			PolicySelector:     selector,
+			EdgePolicySelector: static,
+			PolicyStore:        f.store,
+			GenerationReader:   f.reader,
+			Clock:              f.clock.Now,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = client.Ingest(f.admin(t), explorer.Source{
+			URI:       "file:///selection-generation.txt",
+			MediaType: explorer.MediaTypeText,
+			Content:   "must not mutate",
+		})
+		if !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
+			t.Fatalf("generation error = %v", err)
+		}
+		if counting.IngestCount() != 0 {
+			t.Fatalf("base ingest count = %d", counting.IngestCount())
+		}
+	})
+
+	t.Run("connect", func(t *testing.T) {
+		f := newFixture(t)
+		first, err := f.clientA.Ingest(f.admin(t), explorer.Source{
+			URI: "file:///selection-edge-a.txt", MediaType: explorer.MediaTypeText,
+			Content: "edge a",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		second, err := f.clientA.Ingest(f.admin(t), explorer.Source{
+			URI: "file:///selection-edge-b.txt", MediaType: explorer.MediaTypeText,
+			Content: "edge b",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		counting := &countingClient{Client: f.base}
+		static, err := authorized.NewStaticPolicySelector(f.sourceA, f.policyA)
+		if err != nil {
+			t.Fatal(err)
+		}
+		edgeSelector := authorized.EdgePolicySelectorFunc(func(
+			ctx context.Context,
+			decision auth.Decision,
+			edge graph.Edge,
+		) (auth.Policy, error) {
+			policy, err := static.SelectEdgePolicy(ctx, decision, edge)
+			f.reader.Set(f.domain, 2)
+			return policy, err
+		})
+		client, err := authorized.NewClient(authorized.Config{
+			Base:               counting,
+			Resolver:           f.authority.Resolver(),
+			PolicySelector:     static,
+			EdgePolicySelector: edgeSelector,
+			PolicyStore:        f.store,
+			GenerationReader:   f.reader,
+			Clock:              f.clock.Now,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = client.Connect(f.admin(t), graph.Edge{
+			ID:   "selection-generation-edge",
+			From: first.Document.ID, To: second.Document.ID,
+			Type: "link", Weight: 1,
+		})
+		if !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
+			t.Fatalf("generation error = %v", err)
+		}
+		if counting.ConnectCount() != 0 {
+			t.Fatalf("base connect count = %d", counting.ConnectCount())
+		}
+	})
+}
+
+func TestNewGenerationReadsOldLogicalPoliciesAndOldGenerationFailsGuard(
+	t *testing.T,
+) {
+	f := newFixture(t)
+	source := explorer.Source{
+		URI: "file:///logical-generation.txt", MediaType: explorer.MediaTypeText,
+		Content: "logical authorization outlives physical epoch",
+	}
+	result, err := f.clientA.Ingest(f.admin(t), source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldContext := f.alice(t)
+	f.reader.Set(f.domain, 2)
+	if _, err := f.clientA.Documents(oldContext); !shoal.IsErrorCode(
+		err, shoal.ErrorUnavailable,
+	) {
+		t.Fatalf("old generation error = %v", err)
+	}
+	newDecision := f.decisionAtGeneration(
+		t,
+		"alice-generation-two",
+		[][]byte{f.sourceA},
+		[][]byte{f.policyA},
+		allOperations,
+		2,
+	)
+	newContext := f.context(t, newDecision)
+	if _, err := f.clientA.Document(
+		newContext, result.Document.ID, result.Revision.ID); err != nil {
+		t.Fatal(err)
+	}
+	retried, err := f.clientA.Ingest(newContext, source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retried.Disposition != explorer.IngestUnchanged {
+		t.Fatalf("new-generation retry disposition = %q", retried.Disposition)
+	}
+}
+
 func TestUnreadableGenerationIsUnavailable(t *testing.T) {
 	f := newFixture(t)
 	if _, err := f.clientA.Ingest(f.admin(t), explorer.Source{
@@ -640,6 +875,164 @@ func TestMaliciousRetrievalResultFailsClosed(t *testing.T) {
 	_, err = client.Retrieve(f.alice(t), retrieval.Request{Text: "hidden token"})
 	if !shoal.IsErrorCode(err, shoal.ErrorInternal) {
 		t.Fatalf("malicious result error = %v", err)
+	}
+}
+
+func TestMaliciousRetrievalContentFailsClosed(t *testing.T) {
+	f := newFixture(t)
+	visible, err := f.clientA.Ingest(f.admin(t), explorer.Source{
+		URI:       "file:///retrieval-validation.md",
+		Title:     "Alpha beta evidence",
+		MediaType: explorer.MediaTypeMarkdown,
+		Content:   "# Evidence\n\nalpha beta canonical span\n",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := retrieval.Request{
+		Text: "alpha beta",
+		Modes: []retrieval.Mode{
+			retrieval.ModeLexical,
+			retrieval.ModeTree,
+			retrieval.ModeGraph,
+		},
+		Explain: true,
+	}
+	if _, err := f.clientA.Retrieve(f.alice(t), request); err != nil {
+		t.Fatalf("valid reconstructed response: %v", err)
+	}
+	tests := []struct {
+		name   string
+		mutate func(*retrieval.Response)
+	}{
+		{
+			name: "quote",
+			mutate: func(response *retrieval.Response) {
+				response.Results[0].Evidence[0].Quote = "altered quote"
+			},
+		},
+		{
+			name: "range",
+			mutate: func(response *retrieval.Response) {
+				response.Results[0].Evidence[0].Citation.Range.End.Offset--
+			},
+		},
+		{
+			name: "node property",
+			mutate: func(response *retrieval.Response) {
+				node := &response.Results[0].Evidence[0].Path.Nodes[0]
+				node.Properties = cloneMetadata(node.Properties)
+				node.Properties["title"] = "altered title"
+			},
+		},
+		{
+			name: "edge property",
+			mutate: func(response *retrieval.Response) {
+				edge := &response.Results[0].Evidence[0].Path.Edges[0]
+				edge.Properties = cloneMetadata(edge.Properties)
+				edge.Properties["altered"] = "property"
+			},
+		},
+		{
+			name: "explanation summary",
+			mutate: func(response *retrieval.Response) {
+				response.Results[0].Explanation.Summary = "untrusted summary"
+			},
+		},
+		{
+			name: "result score",
+			mutate: func(response *retrieval.Response) {
+				score := response.Results[0].Score
+				response.Results[0].Score = shoal.Score(math.Nextafter(
+					float64(score), math.Inf(1)))
+			},
+		},
+		{
+			name: "explanation score",
+			mutate: func(response *retrieval.Response) {
+				scores := response.Results[0].Explanation.Scores
+				value := scores[string(retrieval.ModeLexical)]
+				scores[string(retrieval.ModeLexical)] = shoal.Score(math.Nextafter(
+					float64(value), math.Inf(1)))
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			response, err := f.base.Retrieve(
+				context.Background(),
+				retrieval.Request{
+					Text:    request.Text,
+					Modes:   append([]retrieval.Mode(nil), request.Modes...),
+					Explain: true,
+					Scope: retrieval.Scope{DocumentIDs: []shoal.ID{
+						visible.Document.ID,
+					}},
+				},
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			test.mutate(&response)
+			malicious := &hookClient{
+				Client: f.base,
+				retrieve: func(
+					context.Context,
+					retrieval.Request,
+				) (retrieval.Response, error) {
+					return response, nil
+				},
+			}
+			client := f.newClient(
+				t, malicious, f.store, f.sourceA, f.policyA, nil)
+			_, err = client.Retrieve(f.alice(t), request)
+			if !shoal.IsErrorCode(err, shoal.ErrorInternal) {
+				t.Fatalf("malicious response error = %v", err)
+			}
+		})
+	}
+}
+
+func TestRetrievalHydratesAndVerifiesCatalogedContentBeforeScoring(
+	t *testing.T,
+) {
+	f := newFixture(t)
+	if _, err := f.clientA.Ingest(f.admin(t), explorer.Source{
+		URI: "file:///hydrate-before-score.txt", MediaType: explorer.MediaTypeText,
+		Content: "hydrate canonical content",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	retrieveCalls := 0
+	malicious := &hookClient{
+		Client: f.base,
+		document: func(
+			ctx context.Context,
+			documentID, revisionID shoal.ID,
+		) (explorer.DocumentView, error) {
+			view, err := f.base.Document(ctx, documentID, revisionID)
+			if err == nil {
+				view.Document.Title = "altered before scoring"
+			}
+			return view, err
+		},
+		retrieve: func(
+			ctx context.Context,
+			request retrieval.Request,
+		) (retrieval.Response, error) {
+			retrieveCalls++
+			return f.base.Retrieve(ctx, request)
+		},
+	}
+	client := f.newClient(
+		t, malicious, f.store, f.sourceA, f.policyA, nil)
+	_, err := client.Retrieve(
+		f.alice(t), retrieval.Request{Text: "hydrate"})
+	if !shoal.IsErrorCode(err, shoal.ErrorInternal) {
+		t.Fatalf("hydration mismatch error = %v", err)
+	}
+	if retrieveCalls != 0 {
+		t.Fatalf("base retrieve calls = %d", retrieveCalls)
 	}
 }
 
@@ -805,6 +1198,9 @@ type hookClient struct {
 	explorer.Client
 	afterIngest func()
 	retrieve    func(context.Context, retrieval.Request) (retrieval.Response, error)
+	document    func(
+		context.Context, shoal.ID, shoal.ID,
+	) (explorer.DocumentView, error)
 }
 
 func (c *hookClient) Ingest(
@@ -826,6 +1222,58 @@ func (c *hookClient) Retrieve(
 		return c.retrieve(ctx, request)
 	}
 	return c.Client.Retrieve(ctx, request)
+}
+
+func (c *hookClient) Document(
+	ctx context.Context,
+	documentID, revisionID shoal.ID,
+) (explorer.DocumentView, error) {
+	if c.document != nil {
+		return c.document(ctx, documentID, revisionID)
+	}
+	return c.Client.Document(ctx, documentID, revisionID)
+}
+
+type resolverFunc func(context.Context) (auth.Decision, error)
+
+func (f resolverFunc) Resolve(ctx context.Context) (auth.Decision, error) {
+	return f(ctx)
+}
+
+type countingClient struct {
+	explorer.Client
+	mu           sync.Mutex
+	ingestCount  int
+	connectCount int
+}
+
+func (c *countingClient) Ingest(
+	ctx context.Context,
+	source explorer.Source,
+) (explorer.IngestResult, error) {
+	c.mu.Lock()
+	c.ingestCount++
+	c.mu.Unlock()
+	return c.Client.Ingest(ctx, source)
+}
+
+func (c *countingClient) Connect(ctx context.Context, edge graph.Edge) error {
+	c.mu.Lock()
+	c.connectCount++
+	c.mu.Unlock()
+	return c.Client.Connect(ctx, edge)
+}
+
+func (c *countingClient) IngestCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.ingestCount
+}
+
+func (c *countingClient) ConnectCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.connectCount
 }
 
 func documentError(

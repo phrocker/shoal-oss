@@ -21,6 +21,7 @@ package authorized
 
 import (
 	"bytes"
+	"encoding/binary"
 	"sort"
 	"time"
 
@@ -32,11 +33,12 @@ import (
 // components are privately and defensively owned.
 type AccessRule struct {
 	policies []auth.Policy
-	encoded  [][]byte
+	keys     [][]byte
 }
 
 // NewAccessRule validates, canonicalizes, and deduplicates a nonempty policy
-// conjunction. One rule cannot span authorization domains or generations.
+// conjunction by immutable logical policy identity. One rule cannot span
+// authorization domains, but physical policy epochs may differ.
 func NewAccessRule(policies ...auth.Policy) (AccessRule, error) {
 	if len(policies) == 0 {
 		return AccessRule{}, shoal.NewError(
@@ -47,62 +49,62 @@ func NewAccessRule(policies ...auth.Policy) (AccessRule, error) {
 			shoal.ErrorInvalidArgument, "access rule exceeds the policy bound")
 	}
 	type component struct {
-		policy  auth.Policy
-		encoded []byte
+		policy auth.Policy
+		key    []byte
 	}
 	components := make([]component, 0, len(policies))
 	var domain []byte
-	var epoch int64
 	for index, policy := range policies {
-		cloned, encoded, err := clonePolicy(policy)
+		cloned, _, err := clonePolicy(policy)
 		if err != nil {
 			return AccessRule{}, err
 		}
+		key := logicalPolicyKey(cloned)
 		if index == 0 {
 			domain = cloned.AuthorizationDomain()
-			epoch = cloned.Epoch()
-		} else if !bytes.Equal(domain, cloned.AuthorizationDomain()) ||
-			epoch != cloned.Epoch() {
+		} else if !bytes.Equal(domain, cloned.AuthorizationDomain()) {
 			return AccessRule{}, shoal.NewError(
 				shoal.ErrorInvalidArgument,
-				"access rule policies must share a domain and generation",
+				"access rule policies must share an authorization domain",
 			)
 		}
-		components = append(components, component{policy: cloned, encoded: encoded})
+		components = append(components, component{policy: cloned, key: key})
 	}
 	sort.Slice(components, func(left, right int) bool {
-		return bytes.Compare(components[left].encoded, components[right].encoded) < 0
+		if compared := bytes.Compare(
+			components[left].key, components[right].key,
+		); compared != 0 {
+			return compared < 0
+		}
+		return components[left].policy.Epoch() < components[right].policy.Epoch()
 	})
 	rule := AccessRule{
 		policies: make([]auth.Policy, 0, len(components)),
-		encoded:  make([][]byte, 0, len(components)),
+		keys:     make([][]byte, 0, len(components)),
 	}
 	for _, component := range components {
-		if len(rule.encoded) > 0 &&
-			bytes.Equal(rule.encoded[len(rule.encoded)-1], component.encoded) {
+		if len(rule.keys) > 0 &&
+			bytes.Equal(rule.keys[len(rule.keys)-1], component.key) {
 			continue
 		}
 		rule.policies = append(rule.policies, component.policy)
-		rule.encoded = append(rule.encoded, append([]byte(nil), component.encoded...))
+		rule.keys = append(rule.keys, append([]byte(nil), component.key...))
 	}
 	return rule, nil
 }
 
 // Authorize requires every policy component to authorize the exact operation
-// under the current decision and generation.
+// under the current decision's logical domain/source/policy grants. Physical
+// policy epochs do not participate in immutable object authorization.
 func (r AccessRule) Authorize(
 	decision auth.Decision,
 	operation auth.Operation,
 	now time.Time,
 ) error {
-	if len(r.policies) == 0 || len(r.policies) != len(r.encoded) ||
-		decision.PolicyGeneration() <= 0 {
+	if len(r.policies) == 0 || len(r.policies) != len(r.keys) {
 		return authorizationDenied()
 	}
 	for _, policy := range r.policies {
-		if policy.Epoch() != decision.PolicyGeneration() {
-			return authorizationDenied()
-		}
 		if role := policy.ServiceRole(); role != "" {
 			if !decision.TrustedService() || decision.ServiceRole() != role ||
 				!role.Allows(operation) {
@@ -125,12 +127,10 @@ func (r AccessRule) String() string {
 	if len(r.policies) == 0 {
 		return "access-rule{invalid}"
 	}
-	conjunction, err := auth.ConjoinPolicies(r.policies...)
-	if err != nil {
-		return "access-rule{invalid}"
-	}
 	return "access-rule{" +
-		auth.DigestBytes("explorer-access-rule-v1", conjunction).String() + "}"
+		auth.DigestBytes(
+			"explorer-access-rule-logical-v1", logicalRuleBytes(r.keys),
+		).String() + "}"
 }
 
 func (r AccessRule) clone() (AccessRule, error) {
@@ -146,15 +146,15 @@ func (r AccessRule) components() []auth.Policy {
 }
 
 func (r AccessRule) equal(other AccessRule) bool {
-	if len(r.encoded) != len(other.encoded) {
+	if len(r.keys) != len(other.keys) {
 		return false
 	}
-	for index := range r.encoded {
-		if !bytes.Equal(r.encoded[index], other.encoded[index]) {
+	for index := range r.keys {
+		if !bytes.Equal(r.keys[index], other.keys[index]) {
 			return false
 		}
 	}
-	return len(r.encoded) > 0
+	return len(r.keys) > 0
 }
 
 func clonePolicy(policy auth.Policy) (auth.Policy, []byte, error) {
@@ -167,4 +167,30 @@ func clonePolicy(policy auth.Policy) (auth.Policy, []byte, error) {
 		return auth.Policy{}, nil, err
 	}
 	return cloned, append([]byte(nil), encoded...), nil
+}
+
+func logicalPolicyKey(policy auth.Policy) []byte {
+	var key bytes.Buffer
+	writeLogicalComponent := func(value []byte) {
+		var length [8]byte
+		binary.BigEndian.PutUint64(length[:], uint64(len(value)))
+		_, _ = key.Write(length[:])
+		_, _ = key.Write(value)
+	}
+	writeLogicalComponent(policy.AuthorizationDomain())
+	writeLogicalComponent(policy.SourceID())
+	writeLogicalComponent(policy.GrantPolicyID())
+	writeLogicalComponent([]byte(policy.ServiceRole()))
+	return key.Bytes()
+}
+
+func logicalRuleBytes(keys [][]byte) []byte {
+	var encoded bytes.Buffer
+	for _, key := range keys {
+		var length [8]byte
+		binary.BigEndian.PutUint64(length[:], uint64(len(key)))
+		_, _ = encoded.Write(length[:])
+		_, _ = encoded.Write(key)
+	}
+	return encoded.Bytes()
 }

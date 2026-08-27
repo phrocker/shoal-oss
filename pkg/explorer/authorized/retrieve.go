@@ -21,7 +21,6 @@ package authorized
 
 import (
 	"context"
-	"time"
 
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/retrieval"
@@ -127,6 +126,11 @@ func (c *Client) Retrieve(
 		DocumentIDs: append([]shoal.ID(nil), documentIDs...),
 		NodeIDs:     append([]shoal.ID(nil), nodeIDs...),
 	}
+	corpus, err := c.hydrateRetrievalCorpus(
+		ctx, documentIDs, selected, decision, now)
+	if err != nil {
+		return retrieval.Response{}, err
+	}
 	response, err := c.base.Retrieve(ctx, projected)
 	if err != nil {
 		return retrieval.Response{}, err
@@ -135,7 +139,7 @@ func (c *Client) Retrieve(
 		return retrieval.Response{}, inconsistentRetrieval()
 	}
 	if err := c.validateRetrievedResponse(
-		ctx, response, selected, selectedNodes, decision, now,
+		ctx, response, projected, corpus, decision, now,
 	); err != nil {
 		return retrieval.Response{}, err
 	}
@@ -159,108 +163,6 @@ func (c *Client) emptyRetrieval(
 		return retrieval.Response{}, err
 	}
 	return response, nil
-}
-
-func (c *Client) validateRetrievedResponse(
-	ctx context.Context,
-	response retrieval.Response,
-	documents map[shoal.ID]RevisionRegistration,
-	nodes map[shoal.ID]NodeRegistration,
-	decision auth.Decision,
-	now time.Time,
-) error {
-	for _, result := range response.Results {
-		if len(result.Evidence) == 0 {
-			return inconsistentRetrieval()
-		}
-		if err := c.validateRetrievedNode(
-			ctx, result.ID, nodes, decision, now); err != nil {
-			return err
-		}
-		for _, evidence := range result.Evidence {
-			citation := evidence.Citation
-			registration, ok := documents[citation.DocumentID]
-			if !ok || registration.RevisionID != citation.RevisionID {
-				return inconsistentRetrieval()
-			}
-			if citation.SectionID != "" {
-				if err := c.validateRetrievedNode(
-					ctx, citation.SectionID, nodes, decision, now); err != nil {
-					return err
-				}
-				node := nodes[citation.SectionID]
-				if node.DocumentID != citation.DocumentID ||
-					node.RevisionID != citation.RevisionID {
-					return inconsistentRetrieval()
-				}
-			}
-			if citation.SpanID != "" {
-				if err := c.validateRetrievedNode(
-					ctx, citation.SpanID, nodes, decision, now); err != nil {
-					return err
-				}
-				node := nodes[citation.SpanID]
-				if node.DocumentID != citation.DocumentID ||
-					node.RevisionID != citation.RevisionID {
-					return inconsistentRetrieval()
-				}
-			}
-			for _, node := range evidence.Path.Nodes {
-				if err := c.validateRetrievedNode(
-					ctx, node.ID, nodes, decision, now); err != nil {
-					return err
-				}
-			}
-			for _, edge := range evidence.Path.Edges {
-				registration, ok, err := c.policyStore.Edge(ctx, edge.ID)
-				if err != nil {
-					return policyCatalogReadError(ctx, err)
-				}
-				if !ok || !graphEdgesEqual(registration.Edge, edge) {
-					return inconsistentRetrieval()
-				}
-				allowed, err := ruleAllows(
-					registration.Rule, decision, auth.OperationRetrieve, now)
-				if err != nil {
-					return err
-				}
-				if !allowed {
-					return inconsistentRetrieval()
-				}
-			}
-		}
-	}
-	return nil
-}
-
-func (c *Client) validateRetrievedNode(
-	ctx context.Context,
-	nodeID shoal.ID,
-	expected map[shoal.ID]NodeRegistration,
-	decision auth.Decision,
-	now time.Time,
-) error {
-	expectedRegistration, ok := expected[nodeID]
-	if !ok {
-		return inconsistentRetrieval()
-	}
-	current, ok, err := c.policyStore.Node(ctx, nodeID)
-	if err != nil {
-		return policyCatalogReadError(ctx, err)
-	}
-	if !ok || current.DocumentID != expectedRegistration.DocumentID ||
-		current.RevisionID != expectedRegistration.RevisionID {
-		return inconsistentRetrieval()
-	}
-	allowed, err := ruleAllows(
-		current.Rule, decision, auth.OperationRetrieve, now)
-	if err != nil {
-		return err
-	}
-	if !allowed {
-		return inconsistentRetrieval()
-	}
-	return nil
 }
 
 func inconsistentRetrieval() error {

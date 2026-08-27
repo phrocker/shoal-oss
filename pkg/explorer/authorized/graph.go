@@ -30,8 +30,8 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
-// Connect authorizes both current endpoints and stores the conjunction of the
-// trusted edge policy and both endpoint rules.
+// Connect authorizes both current endpoints and stores only the trusted
+// edge-local policy. Endpoint rules are re-evaluated dynamically on every use.
 func (c *Client) Connect(ctx context.Context, edge graph.Edge) error {
 	if err := edge.Validate(); err != nil {
 		return err
@@ -59,26 +59,26 @@ func (c *Client) Connect(ctx context.Context, edge graph.Edge) error {
 	if err != nil {
 		return err
 	}
-	components := edgeRule.components()
-	components = append(components, from.Rule.components()...)
-	components = append(components, to.Rule.components()...)
-	effective, err := NewAccessRule(components...)
-	if err != nil {
+	if !rulesShareDomain(edgeRule, from.Rule) ||
+		!rulesShareDomain(edgeRule, to.Rule) {
 		return authorizationDenied()
 	}
-	if err := effective.Authorize(
+	if err := edgeRule.Authorize(
 		decision, auth.OperationConnect, now); err != nil {
 		return authorizationDenied()
 	}
 
 	c.mutationMu.Lock()
 	defer c.mutationMu.Unlock()
+	if err := guard.Check(ctx); err != nil {
+		return err
+	}
 	if err := c.base.Connect(ctx, cloneGraphEdge(ownedEdge)); err != nil {
 		return directBaseError(err)
 	}
 	if err := c.policyStore.PutEdge(ctx, EdgeRegistration{
 		Edge: ownedEdge,
-		Rule: effective,
+		Rule: edgeRule,
 	}); err != nil {
 		return policyCatalogWriteError(ctx, err)
 	}
@@ -168,8 +168,8 @@ func (c *Client) Neighborhood(
 		if !ok || !graphEdgesEqual(registration.Edge, edge) {
 			continue
 		}
-		allowed, err := ruleAllows(
-			registration.Rule, decision, auth.OperationNeighborhood, now)
+		allowed, err := c.edgeAllows(
+			ctx, registration, decision, auth.OperationNeighborhood, now)
 		if err != nil {
 			return explorer.Neighborhood{}, err
 		}
@@ -229,6 +229,42 @@ func (c *Client) Neighborhood(
 		return explorer.Neighborhood{}, err
 	}
 	return result, nil
+}
+
+func (c *Client) edgeAllows(
+	ctx context.Context,
+	registration EdgeRegistration,
+	decision auth.Decision,
+	operation auth.Operation,
+	now time.Time,
+) (bool, error) {
+	allowed, err := ruleAllows(registration.Rule, decision, operation, now)
+	if err != nil || !allowed {
+		return allowed, err
+	}
+	from, ok, err := c.policyStore.Node(ctx, registration.Edge.From)
+	if err != nil {
+		return false, policyCatalogReadError(ctx, err)
+	}
+	if !ok {
+		return false, nil
+	}
+	to, ok, err := c.policyStore.Node(ctx, registration.Edge.To)
+	if err != nil {
+		return false, policyCatalogReadError(ctx, err)
+	}
+	if !ok {
+		return false, nil
+	}
+	fromAllowed, err := ruleAllows(from.Rule, decision, operation, now)
+	if err != nil || !fromAllowed {
+		return fromAllowed, err
+	}
+	toAllowed, err := ruleAllows(to.Rule, decision, operation, now)
+	if err != nil || !toAllowed {
+		return toAllowed, err
+	}
+	return true, nil
 }
 
 func (c *Client) authorizedNode(

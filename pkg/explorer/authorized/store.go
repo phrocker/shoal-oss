@@ -49,7 +49,9 @@ type NodeRegistration struct {
 	Rule       AccessRule
 }
 
-// EdgeRegistration owns an edge and its rule. DocumentID and RevisionID are
+// EdgeRegistration owns an edge and only its edge-local rule. Endpoint rules
+// are deliberately not flattened into this record and must be read from the
+// current node catalog on every authorization. DocumentID and RevisionID are
 // set for revision-intrinsic edges and empty for application edges.
 type EdgeRegistration struct {
 	Edge       graph.Edge
@@ -250,8 +252,9 @@ func (s *MemoryPolicyStore) Node(
 	return cloned, true, nil
 }
 
-// PutEdge atomically registers an application edge. Identical content and
-// canonical rule are idempotent; identity or policy reuse conflicts.
+// PutEdge atomically registers an application edge and its edge-local rule.
+// Identical content and canonical rule are idempotent; identity or policy
+// reuse conflicts.
 func (s *MemoryPolicyStore) PutEdge(
 	ctx context.Context,
 	registration EdgeRegistration,
@@ -560,7 +563,7 @@ func cloneGraphEdge(edge graph.Edge) graph.Edge {
 
 func graphEdgesEqual(left, right graph.Edge) bool {
 	if left.ID != right.ID || left.From != right.From || left.To != right.To ||
-		left.Type != right.Type || left.Weight != right.Weight ||
+		left.Type != right.Type || !scoresEqual(left.Weight, right.Weight) ||
 		len(left.Properties) != len(right.Properties) {
 		return false
 	}

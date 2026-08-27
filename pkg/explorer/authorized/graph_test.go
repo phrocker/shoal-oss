@@ -70,6 +70,21 @@ func TestGraphAuthorizationReachabilityAndConjunction(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	storedEdge, ok, err := f.store.Edge(context.Background(), "a-to-hidden")
+	if err != nil || !ok {
+		t.Fatalf("stored edge: ok=%v err=%v", ok, err)
+	}
+	aliceDecision := f.decision(
+		t,
+		"edge-local-only",
+		[][]byte{f.sourceA},
+		[][]byte{f.policyA},
+		allOperations,
+	)
+	if err := storedEdge.Rule.Authorize(
+		aliceDecision, auth.OperationNeighborhood, f.clock.Now()); err != nil {
+		t.Fatalf("edge record flattened endpoint rules: %v", err)
+	}
 
 	nodeIDs := []shoal.ID{first.Document.ID}
 	edgeTypes := []string{"link"}
@@ -202,6 +217,95 @@ func TestConnectCatalogFailureRetryReconciles(t *testing.T) {
 	}
 	if len(neighborhood.Edges) != 1 {
 		t.Fatalf("reconciled edge missing: %#v", neighborhood)
+	}
+}
+
+func TestExistingEdgeUsesCurrentEndpointRules(t *testing.T) {
+	f := newFixture(t)
+	admin := f.admin(t)
+	first, err := f.clientA.Ingest(admin, explorer.Source{
+		URI: "file:///dynamic-edge-a.txt", MediaType: explorer.MediaTypeText,
+		Content: "dynamic edge a",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondSource := explorer.Source{
+		URI: "file:///dynamic-edge-b.txt", MediaType: explorer.MediaTypeText,
+		Content: "dynamic edge b",
+	}
+	second, err := f.clientA.Ingest(admin, secondSource)
+	if err != nil {
+		t.Fatal(err)
+	}
+	edge := graph.Edge{
+		ID:   "dynamic-endpoint-edge",
+		From: first.Document.ID, To: second.Document.ID,
+		Type: "dynamic", Weight: 1,
+	}
+	if err := f.clientA.Connect(admin, edge); err != nil {
+		t.Fatal(err)
+	}
+	stored, ok, err := f.store.Edge(context.Background(), edge.ID)
+	if err != nil || !ok {
+		t.Fatalf("stored edge: ok=%v err=%v", ok, err)
+	}
+	aliceDecision := f.decision(
+		t,
+		"edge-local-alice",
+		[][]byte{f.sourceA},
+		[][]byte{f.policyA},
+		allOperations,
+	)
+	if err := stored.Rule.Authorize(
+		aliceDecision, auth.OperationNeighborhood, f.clock.Now()); err != nil {
+		t.Fatalf("stored edge rule contains endpoint policies: %v", err)
+	}
+	before, err := f.clientA.Neighborhood(
+		f.alice(t),
+		explorer.NeighborhoodRequest{
+			NodeIDs: []shoal.ID{first.Document.ID},
+			Depth:   1, EdgeTypes: []string{"dynamic"},
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(before.Edges) != 1 || !hasNode(before, second.Document.ID) {
+		t.Fatalf("edge missing before endpoint change: %#v", before)
+	}
+
+	if _, err := f.clientB.Ingest(admin, explorer.Source{
+		URI: secondSource.URI, MediaType: secondSource.MediaType,
+		Content: "endpoint now requires policy b",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	after, err := f.clientA.Neighborhood(
+		f.alice(t),
+		explorer.NeighborhoodRequest{
+			NodeIDs: []shoal.ID{first.Document.ID},
+			Depth:   1, EdgeTypes: []string{"dynamic"},
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(after.Edges) != 0 || hasNode(after, second.Document.ID) {
+		t.Fatalf("stale endpoint authorization leaked edge: %#v", after)
+	}
+	adminGraph, err := f.clientA.Neighborhood(
+		admin,
+		explorer.NeighborhoodRequest{
+			NodeIDs: []shoal.ID{first.Document.ID},
+			Depth:   1, EdgeTypes: []string{"dynamic"},
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(adminGraph.Edges) != 1 || !hasNode(adminGraph, second.Document.ID) {
+		t.Fatalf("current endpoint grants did not admit edge: %#v", adminGraph)
 	}
 }
 

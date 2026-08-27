@@ -118,6 +118,9 @@ func (c *Client) Ingest(
 
 	c.mutationMu.Lock()
 	defer c.mutationMu.Unlock()
+	if err := guard.Check(ctx); err != nil {
+		return explorer.IngestResult{}, err
+	}
 	result, err := c.base.Ingest(ctx, cloneSource(ownedSource))
 	if err != nil {
 		return explorer.IngestResult{}, err
@@ -184,11 +187,8 @@ func (c *Client) begin(
 	}
 	decision, err := c.resolver.Resolve(ctx)
 	if err != nil {
-		if contextErr := contextFailure(ctx); contextErr != nil {
-			return auth.Decision{}, auth.GenerationGuard{}, time.Time{}, contextErr
-		}
 		return auth.Decision{}, auth.GenerationGuard{}, time.Time{},
-			authorizationDenied()
+			resolverFailure(ctx, err)
 	}
 	now := c.clock()
 	if now.IsZero() {
@@ -208,6 +208,9 @@ func (c *Client) begin(
 	if err != nil {
 		return auth.Decision{}, auth.GenerationGuard{}, time.Time{},
 			authorizationDenied()
+	}
+	if err := guard.Check(ctx); err != nil {
+		return auth.Decision{}, auth.GenerationGuard{}, time.Time{}, err
 	}
 	return decision, guard, now, nil
 }
@@ -244,6 +247,9 @@ func selectedPolicyRule(
 	policy auth.Policy,
 	now time.Time,
 ) (AccessRule, error) {
+	if policy.Epoch() != decision.PolicyGeneration() {
+		return AccessRule{}, authorizationDenied()
+	}
 	rule, err := NewAccessRule(policy)
 	if err != nil {
 		return AccessRule{}, shoal.NewError(
@@ -324,6 +330,35 @@ func policySelectionError(ctx context.Context, err error) error {
 	}
 	return shoal.NewError(
 		shoal.ErrorUnavailable, "trusted policy selection unavailable")
+}
+
+func resolverFailure(ctx context.Context, err error) error {
+	if contextErr := contextFailure(ctx); contextErr != nil {
+		return contextErr
+	}
+	var shoalErr *shoal.Error
+	if !errors.As(err, &shoalErr) || shoalErr == nil {
+		return shoal.NewError(
+			shoal.ErrorUnavailable, "authorization resolution unavailable")
+	}
+	switch shoalErr.Code {
+	case shoal.ErrorCanceled:
+		return shoal.NewError(shoal.ErrorCanceled, "operation canceled")
+	case shoal.ErrorDeadline:
+		return shoal.NewError(
+			shoal.ErrorDeadline, "operation deadline exceeded")
+	case shoal.ErrorUnavailable:
+		return shoal.NewError(
+			shoal.ErrorUnavailable, "authorization resolution unavailable")
+	case shoal.ErrorInternal:
+		return shoal.NewError(
+			shoal.ErrorInternal, "authorization resolution failed")
+	case shoal.ErrorUnauthorized, shoal.ErrorNotFound, shoal.ErrorInvalidArgument:
+		return authorizationDenied()
+	default:
+		return shoal.NewError(
+			shoal.ErrorUnavailable, "authorization resolution unavailable")
+	}
 }
 
 func policyCatalogReadError(ctx context.Context, _ error) error {

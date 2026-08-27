@@ -36,7 +36,7 @@ import (
 
 func TestAccessRuleConjunctionCanonicalization(t *testing.T) {
 	policyA := mustPolicy(t, "domain", "source-a", "policy-a")
-	policyB := mustPolicy(t, "domain", "source-b", "policy-b")
+	policyB := mustPolicyEpoch(t, "domain", "source-b", "policy-b", 2)
 	rule, err := authorized.NewAccessRule(policyB, policyA, policyA)
 	if err != nil {
 		t.Fatal(err)
@@ -54,11 +54,12 @@ func TestAccessRuleConjunctionCanonicalization(t *testing.T) {
 	) {
 		t.Fatalf("partial conjunction error = %v", err)
 	}
-	both := mustDecision(
+	both := mustDecisionAtGeneration(
 		t, now, "rule-both",
 		[]byte("domain"),
 		[][]byte{[]byte("source-a"), []byte("source-b")},
 		[][]byte{[]byte("policy-a"), []byte("policy-b")},
+		3,
 	)
 	if err := rule.Authorize(both, auth.OperationRead, now); err != nil {
 		t.Fatal(err)
@@ -75,6 +76,21 @@ func TestAccessRuleConjunctionCanonicalization(t *testing.T) {
 		err, shoal.ErrorInvalidArgument,
 	) {
 		t.Fatalf("cross-domain rule error = %v", err)
+	}
+	sameLogicalNewEpoch := mustPolicyEpoch(
+		t, "domain", "source-a", "policy-a", 9)
+	deduplicated, err := authorized.NewAccessRule(
+		sameLogicalNewEpoch, policyA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	single, err := authorized.NewAccessRule(policyA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deduplicated.String() != single.String() {
+		t.Fatalf("physical epochs changed logical rule: %s != %s",
+			deduplicated.String(), single.String())
 	}
 }
 
@@ -232,6 +248,16 @@ func TestMemoryPolicyStoreAtomicIdempotentAndDefensive(t *testing.T) {
 	if err := store.PutEdge(ctx, edge); err != nil {
 		t.Fatalf("identical edge was not idempotent: %v", err)
 	}
+	newEpochRule, err := authorized.NewAccessRule(
+		mustPolicyEpoch(t, "domain", "source-a", "policy-a", 7))
+	if err != nil {
+		t.Fatal(err)
+	}
+	newEpochEdge := edge
+	newEpochEdge.Rule = newEpochRule
+	if err := store.PutEdge(ctx, newEpochEdge); err != nil {
+		t.Fatalf("logical edge policy changed across epoch: %v", err)
+	}
 	edge.Edge.Properties["edge"] = "mutated"
 	storedEdge, ok, err := store.Edge(ctx, "application-edge")
 	if err != nil || !ok ||
@@ -289,12 +315,20 @@ func mustPolicy(
 	t *testing.T,
 	domain, source, policy string,
 ) auth.Policy {
+	return mustPolicyEpoch(t, domain, source, policy, 1)
+}
+
+func mustPolicyEpoch(
+	t *testing.T,
+	domain, source, policy string,
+	epoch int64,
+) auth.Policy {
 	t.Helper()
 	value, err := auth.NewPolicy(auth.PolicyConfig{
 		AuthorizationDomain: []byte(domain),
 		SourceID:            []byte(source),
 		GrantPolicyID:       []byte(policy),
-		Epoch:               1,
+		Epoch:               epoch,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -309,6 +343,18 @@ func mustDecision(
 	domain []byte,
 	sources, policies [][]byte,
 ) auth.Decision {
+	return mustDecisionAtGeneration(
+		t, now, subject, domain, sources, policies, 1)
+}
+
+func mustDecisionAtGeneration(
+	t *testing.T,
+	now time.Time,
+	subject string,
+	domain []byte,
+	sources, policies [][]byte,
+	generation int64,
+) auth.Decision {
 	t.Helper()
 	decision, err := auth.NewDecision(auth.DecisionConfig{
 		Subject:               shoal.ID(subject),
@@ -317,7 +363,7 @@ func mustDecision(
 		AllowedOperations:     allOperations,
 		PermittedSourceIDs:    sources,
 		PermittedPolicyIDs:    policies,
-		PolicyGeneration:      1,
+		PolicyGeneration:      generation,
 		AuthenticationExpires: now.Add(time.Hour),
 		RequestID:             shoal.ID(subject + "-request"),
 	})
