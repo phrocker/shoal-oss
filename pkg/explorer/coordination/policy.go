@@ -291,9 +291,6 @@ func ValidatePolicyCopyMapSuccessor(previous, next PolicyCopyMapV3) error {
 	if next.MapGeneration <= previous.MapGeneration {
 		return invalid("policy-copy map generation must increase")
 	}
-	if previous.State == CopyStateActive && next.MapGeneration == previous.MapGeneration {
-		return invalid("committed mapping is immutable")
-	}
 	return nil
 }
 

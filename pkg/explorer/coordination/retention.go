@@ -301,14 +301,14 @@ func ValidateRetirementTransition(previous, next RetirementDecisionV1) error {
 		previous.ProofDigest != next.ProofDigest {
 		return invalid("retirement identity and proof are immutable")
 	}
+	if next.AuthorityGeneration < previous.AuthorityGeneration {
+		return invalid("retirement authority generation must not decrease")
+	}
 	if previous.State != RetirementCandidate {
 		if previous.State == RetirementApproved && next.State == RetirementApplied {
 			return nil
 		}
 		return invalid("terminal retirement decision cannot transition")
-	}
-	if next.AuthorityGeneration < previous.AuthorityGeneration {
-		return invalid("retirement authority generation must not decrease")
 	}
 	switch next.State {
 	case RetirementApproved, RetirementRejected, RetirementPoisoned:

@@ -36,7 +36,7 @@ type IndexGenerationV2 struct {
 	PolicyCopyCoverageDigest Digest
 	ManifestDigest           Digest
 	DeltaDigest              Digest
-	State                    LifecycleState
+	State                    IndexGenerationState
 }
 
 func (g IndexGenerationV2) computedDigest() Digest {
@@ -50,7 +50,6 @@ func (g IndexGenerationV2) computedDigest() Digest {
 	e.u64(uint64(g.DeltaThrough))
 	e.digest(g.PolicyCopyCoverageDigest)
 	e.digest(g.DeltaDigest)
-	e.byte(byte(g.State))
 	return sha256.Sum256(e.data)
 }
 
@@ -114,20 +113,40 @@ func ValidateIndexGenerationTransition(previous, next IndexGenerationV2) error {
 		previous.SourceEpoch != next.SourceEpoch {
 		return invalid("index-generation identity fields are immutable")
 	}
-	if next.BuildThrough < previous.BuildThrough || next.DeltaThrough < previous.DeltaThrough {
-		return invalid("index-generation frontiers must not decrease")
-	}
-	if previous.State == LifecycleRetired || previous.State == LifecyclePoisoned {
+	if previous.State == IndexGenerationPoisoned {
 		return invalid("terminal index-generation state cannot transition")
 	}
-	if next.State == LifecyclePoisoned {
+	if previous.State == IndexGenerationSealed {
+		if next.State != IndexGenerationPoisoned {
+			return invalid("sealed index-generation manifest cannot mutate")
+		}
+		if next.BuildThrough != previous.BuildThrough ||
+			next.DeltaThrough != previous.DeltaThrough ||
+			next.PolicyCopyCoverageDigest != previous.PolicyCopyCoverageDigest ||
+			next.DeltaDigest != previous.DeltaDigest ||
+			next.ManifestDigest != previous.ManifestDigest {
+			return invalid("sealed index-generation manifest contents are immutable")
+		}
 		return nil
 	}
-	legal := previous.State == LifecycleBuilding && next.State == LifecycleVerified ||
-		previous.State == LifecycleVerified && next.State == LifecycleActive ||
-		previous.State == LifecycleActive && next.State == LifecycleRetired
-	if !legal {
+	if previous.State != IndexGenerationBuilding {
 		return invalid("illegal index-generation state transition")
+	}
+	if next.State == IndexGenerationPoisoned {
+		if next.BuildThrough != previous.BuildThrough ||
+			next.DeltaThrough != previous.DeltaThrough ||
+			next.PolicyCopyCoverageDigest != previous.PolicyCopyCoverageDigest ||
+			next.DeltaDigest != previous.DeltaDigest ||
+			next.ManifestDigest != previous.ManifestDigest {
+			return invalid("poisoning an index-generation manifest cannot alter its contents")
+		}
+		return nil
+	}
+	if next.State != IndexGenerationBuilding && next.State != IndexGenerationSealed {
+		return invalid("illegal index-generation state transition")
+	}
+	if next.BuildThrough < previous.BuildThrough || next.DeltaThrough < previous.DeltaThrough {
+		return invalid("index-generation frontiers must not decrease")
 	}
 	return nil
 }
@@ -171,7 +190,7 @@ func UnmarshalIndexGenerationV2(data []byte) (IndexGenerationV2, error) {
 		PolicyCopyCoverageDigest: d.digest("policy-copy coverage digest"),
 		ManifestDigest:           d.digest("manifest digest"),
 		DeltaDigest:              d.digest("delta digest"),
-		State:                    LifecycleState(d.byte("state")),
+		State:                    IndexGenerationState(d.byte("state")),
 	}
 	if d.err != nil {
 		return IndexGenerationV2{}, d.err

@@ -83,7 +83,7 @@ func fixtureIndexGeneration() IndexGenerationV2 {
 		Family: Family{0, 0xff, 'f'}, IGEN: IGEN("igen"), Schema: []byte("schema-v1"),
 		Buckets: 32, SourceEpoch: 10, BuildThrough: 12, DeltaThrough: 14,
 		PolicyCopyCoverageDigest: testDigest("coverage"), DeltaDigest: testDigest("deltas"),
-		State: LifecycleVerified,
+		State: IndexGenerationSealed,
 	}
 	value.ManifestDigest = value.ComputeDigest()
 	return value
@@ -261,17 +261,20 @@ func TestM3TransitionAndMonotonicityValidation(t *testing.T) {
 		t.Fatal("duplicate map generation accepted")
 	}
 
-	generation := fixtureIndexGeneration()
-	activeGeneration := generation
-	activeGeneration.State = LifecycleActive
-	activeGeneration.ManifestDigest = activeGeneration.ComputeDigest()
-	if err := ValidateIndexGenerationTransition(generation, activeGeneration); err != nil {
+	sealedGeneration := fixtureIndexGeneration()
+	buildingGeneration := sealedGeneration
+	buildingGeneration.State = IndexGenerationBuilding
+	buildingGeneration.BuildThrough--
+	buildingGeneration.DeltaThrough--
+	buildingGeneration.ManifestDigest = buildingGeneration.ComputeDigest()
+	if err := ValidateIndexGenerationTransition(buildingGeneration, sealedGeneration); err != nil {
 		t.Fatal(err)
 	}
-	retiredGeneration := activeGeneration
-	retiredGeneration.State = LifecycleRetired
-	retiredGeneration.ManifestDigest = retiredGeneration.ComputeDigest()
-	if err := ValidateIndexGenerationTransition(activeGeneration, retiredGeneration); err != nil {
+	progressedGeneration := buildingGeneration
+	progressedGeneration.BuildThrough++
+	progressedGeneration.DeltaThrough++
+	progressedGeneration.ManifestDigest = progressedGeneration.ComputeDigest()
+	if err := ValidateIndexGenerationTransition(buildingGeneration, progressedGeneration); err != nil {
 		t.Fatal(err)
 	}
 
@@ -331,6 +334,21 @@ func TestM3TransitionAndMonotonicityValidation(t *testing.T) {
 	}
 	if !observation.RejectsAuthority(observation.AuthorityGeneration-1, observation.AuthorityFence) {
 		t.Fatal("stale authority generation was not rejected")
+	}
+
+}
+
+func TestRetirementApprovedToAppliedRejectsStaleAuthorityGeneration(t *testing.T) {
+	approved := fixtureRetirement()
+	approved.State = RetirementApproved
+	applied := approved
+	applied.State = RetirementApplied
+	if err := ValidateRetirementTransition(approved, applied); err != nil {
+		t.Fatal(err)
+	}
+	applied.AuthorityGeneration--
+	if ValidateRetirementTransition(approved, applied) == nil {
+		t.Fatal("stale APPROVED to APPLIED authority generation accepted")
 	}
 }
 
@@ -416,5 +434,57 @@ func TestM3BoundsEnumsAbsenceAndOverflow(t *testing.T) {
 	}
 	if _, err := PolicyGenerationRow(DomainID("domain"), Generation(-1)); err == nil {
 		t.Fatal("overflowed generation accepted")
+	}
+}
+
+func TestIndexGenerationManifestLifecycle(t *testing.T) {
+	for _, state := range []IndexGenerationState{
+		IndexGenerationState(LifecycleActive),
+		IndexGenerationState(LifecycleRetired),
+	} {
+		value := fixtureIndexGeneration()
+		value.State = state
+		if _, err := MarshalIndexGenerationV2(value); err == nil {
+			t.Fatalf("manifest state %d accepted", state)
+		}
+		encoded, err := MarshalIndexGenerationV2(fixtureIndexGeneration())
+		if err != nil {
+			t.Fatal(err)
+		}
+		encoded[len(encoded)-checksumSize-1] = byte(state)
+		sum := Sum(encoded[:len(encoded)-checksumSize])
+		copy(encoded[len(encoded)-checksumSize:], sum[:])
+		if _, err := UnmarshalIndexGenerationV2(encoded); err == nil {
+			t.Fatalf("encoded manifest state %d accepted", state)
+		}
+	}
+
+	sealed := fixtureIndexGeneration()
+	changedFrontier := sealed
+	changedFrontier.DeltaThrough++
+	changedFrontier.ManifestDigest = changedFrontier.ComputeDigest()
+	if ValidateIndexGenerationTransition(sealed, changedFrontier) == nil {
+		t.Fatal("post-seal frontier change accepted")
+	}
+
+	changedDigest := sealed
+	changedDigest.DeltaDigest = testDigest("different delta digest")
+	changedDigest.ManifestDigest = changedDigest.ComputeDigest()
+	if ValidateIndexGenerationTransition(sealed, changedDigest) == nil {
+		t.Fatal("post-seal digest change accepted")
+	}
+
+	poisoned := sealed
+	poisoned.State = IndexGenerationPoisoned
+	if err := ValidateIndexGenerationTransition(sealed, poisoned); err != nil {
+		t.Fatal(err)
+	}
+	if poisoned.ManifestDigest != sealed.ManifestDigest {
+		t.Fatal("poison transition changed sealed manifest digest")
+	}
+
+	active := fixtureIndexActivation()
+	if active.State != LifecycleActive {
+		t.Fatal("activation record is not the active-generation representation")
 	}
 }

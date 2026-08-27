@@ -275,6 +275,23 @@ func (s LifecycleState) Validate() error {
 	return nil
 }
 
+type IndexGenerationState uint8
+
+const (
+	IndexGenerationBuilding IndexGenerationState = 1
+	IndexGenerationSealed   IndexGenerationState = 2
+	IndexGenerationPoisoned IndexGenerationState = 5
+)
+
+func (s IndexGenerationState) Validate() error {
+	switch s {
+	case IndexGenerationBuilding, IndexGenerationSealed, IndexGenerationPoisoned:
+		return nil
+	default:
+		return invalid("index-generation state is unknown")
+	}
+}
+
 type CopyState uint8
 
 const (
