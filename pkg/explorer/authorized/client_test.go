@@ -323,6 +323,9 @@ func TestAuthorizedVisibilityAndRetrievalProjection(t *testing.T) {
 		response.Results[0].Evidence[0].Citation.DocumentID != visible.Document.ID {
 		t.Fatalf("authorized retrieval = %#v", response)
 	}
+	if response.RequestID != "" {
+		t.Fatalf("authorized retrieval exposed backend request ID %q", response.RequestID)
+	}
 
 	empty, err := f.clientA.Retrieve(alice, retrieval.Request{
 		Text: "alpha beta",
@@ -370,6 +373,36 @@ func TestAuthorizedVisibilityAndRetrievalProjection(t *testing.T) {
 		!reflect.DeepEqual(nodeScope, nodeCopy) ||
 		!reflect.DeepEqual(modes, modeCopy) {
 		t.Fatal("Retrieve mutated caller slices")
+	}
+}
+
+func TestHiddenCurrentDocumentIsAuthorizedBeforeBaseRead(t *testing.T) {
+	f := newFixture(t)
+	hidden, err := f.clientB.Ingest(f.admin(t), explorer.Source{
+		URI: "file:///hidden-current.txt", MediaType: explorer.MediaTypeText,
+		Content: "hidden current content",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	documentCalls := 0
+	hooked := &hookClient{
+		Client: f.base,
+		document: func(
+			context.Context, shoal.ID, shoal.ID,
+		) (explorer.DocumentView, error) {
+			documentCalls++
+			return explorer.DocumentView{}, shoal.NewError(
+				shoal.ErrorUnavailable, "backend detail")
+		},
+	}
+	client := f.newClient(t, hooked, f.store, f.sourceA, f.policyA, nil)
+	_, err = client.Document(f.alice(t), hidden.Document.ID, "")
+	if !shoal.IsErrorCode(err, shoal.ErrorNotFound) {
+		t.Fatalf("hidden current document error = %v", err)
+	}
+	if documentCalls != 0 {
+		t.Fatalf("hidden current document reached base %d times", documentCalls)
 	}
 }
 
@@ -745,15 +778,23 @@ func TestConcurrentClientsShareSourceClaim(t *testing.T) {
 		firstErr <- err
 	}()
 	<-started
-	if _, err := f.clientB.Ingest(
-		f.bob(t), source,
-	); !shoal.IsErrorCode(err, shoal.ErrorNotFound) {
+	secondErr := make(chan error, 1)
+	go func() {
+		_, err := f.clientB.Ingest(f.bob(t), source)
+		secondErr <- err
+	}()
+	select {
+	case err := <-secondErr:
 		close(release)
-		t.Fatalf("concurrent different-policy ingest = %v", err)
+		t.Fatalf("concurrent ingest was not serialized: %v", err)
+	case <-time.After(20 * time.Millisecond):
 	}
 	close(release)
 	if err := <-firstErr; err != nil {
 		t.Fatal(err)
+	}
+	if err := <-secondErr; !shoal.IsErrorCode(err, shoal.ErrorNotFound) {
+		t.Fatalf("concurrent different-policy ingest = %v", err)
 	}
 }
 
@@ -1112,16 +1153,23 @@ func TestConcurrentPendingRecoveryIsSerialized(t *testing.T) {
 		firstErr <- err
 	}()
 	<-started
-	if _, err := f.clientB.Ingest(
-		f.admin(t), sourceB,
-	); err == nil || (!shoal.IsErrorCode(err, shoal.ErrorConflict) &&
-		!shoal.IsErrorCode(err, shoal.ErrorUnavailable)) {
+	secondErr := make(chan error, 1)
+	go func() {
+		_, err := f.clientB.Ingest(f.admin(t), sourceB)
+		secondErr <- err
+	}()
+	select {
+	case err := <-secondErr:
 		close(release)
-		t.Fatalf("concurrent authorized recovery = %v", err)
+		t.Fatalf("concurrent recovery was not serialized: %v", err)
+	case <-time.After(20 * time.Millisecond):
 	}
 	close(release)
 	if err := <-firstErr; err != nil {
 		t.Fatal(err)
+	}
+	if err := <-secondErr; err != nil {
+		t.Fatalf("serialized authorized recovery = %v", err)
 	}
 	summaries, err := f.base.Documents(context.Background())
 	if err != nil {
@@ -1515,6 +1563,7 @@ func TestMaliciousRetrievalResultFailsClosed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	_ = visible
 	hidden, err := f.clientB.Ingest(f.admin(t), explorer.Source{
 		URI: "file:///hidden-malicious.txt", MediaType: explorer.MediaTypeText,
@@ -1548,6 +1597,28 @@ func TestMaliciousRetrievalResultFailsClosed(t *testing.T) {
 	}
 }
 
+func TestRetrievalRejectsUnseededPlanBeforeCorpusScan(t *testing.T) {
+	f := newFixture(t)
+	documentsCalls := 0
+	hooked := &hookClient{
+		Client: f.base,
+		documents: func(ctx context.Context) ([]explorer.DocumentSummary, error) {
+			documentsCalls++
+			return f.base.Documents(ctx)
+		},
+	}
+	client := f.newClient(t, hooked, f.store, f.sourceA, f.policyA, nil)
+	_, err := client.Retrieve(f.alice(t), retrieval.Request{
+		Text: "tree only", Modes: []retrieval.Mode{retrieval.ModeTree},
+	})
+	if !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
+		t.Fatalf("unseeded tree request error = %v", err)
+	}
+	if documentsCalls != 0 {
+		t.Fatalf("unseeded request scanned corpus %d times", documentsCalls)
+	}
+}
+
 func TestMaliciousRetrievalContentFailsClosed(t *testing.T) {
 	f := newFixture(t)
 	visible, err := f.clientA.Ingest(f.admin(t), explorer.Source{
@@ -1575,6 +1646,12 @@ func TestMaliciousRetrievalContentFailsClosed(t *testing.T) {
 		name   string
 		mutate func(*retrieval.Response)
 	}{
+		{
+			name: "missing canonical result",
+			mutate: func(response *retrieval.Response) {
+				response.Results = nil
+			},
+		},
 		{
 			name: "quote",
 			mutate: func(response *retrieval.Response) {
@@ -1627,6 +1704,7 @@ func TestMaliciousRetrievalContentFailsClosed(t *testing.T) {
 			},
 		},
 	}
+
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			response, err := f.base.Retrieve(
@@ -1660,6 +1738,72 @@ func TestMaliciousRetrievalContentFailsClosed(t *testing.T) {
 				t.Fatalf("malicious response error = %v", err)
 			}
 		})
+	}
+}
+
+func TestDocumentsReconstructCanonicalSummaries(t *testing.T) {
+	f := newFixture(t)
+	result, err := f.clientA.Ingest(f.admin(t), explorer.Source{
+		URI: "file:///canonical-summary.txt", Title: "Canonical title",
+		MediaType: explorer.MediaTypeText, Content: "canonical summary",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	malicious := &hookClient{
+		Client: f.base,
+		documents: func(ctx context.Context) ([]explorer.DocumentSummary, error) {
+			summaries, err := f.base.Documents(ctx)
+			if err == nil {
+				summaries[0].Document.Title = "altered title"
+				summaries[0].Document.Metadata = shoal.Metadata{"leak": "value"}
+				summaries[0].SourceURI = "file:///altered-secret.txt"
+			}
+			return summaries, err
+		},
+	}
+	client := f.newClient(t, malicious, f.store, f.sourceA, f.policyA, nil)
+	summaries, err := client.Documents(f.alice(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(summaries) != 1 ||
+		summaries[0].Document.ID != result.Document.ID ||
+		summaries[0].Document.Title != "Canonical title" ||
+		summaries[0].SourceURI != "file:///canonical-summary.txt" ||
+		summaries[0].Document.Metadata["leak"] != "" {
+		t.Fatalf("authorized summaries = %#v", summaries)
+	}
+}
+
+func TestIngestReconstructsCanonicalResult(t *testing.T) {
+	f := newFixture(t)
+	malicious := &ingestOverrideClient{
+		Client: f.base,
+		ingest: func(
+			ctx context.Context,
+			source explorer.Source,
+		) (explorer.IngestResult, error) {
+			result, err := f.base.Ingest(ctx, source)
+			if err == nil {
+				result.Document.Title = "altered title"
+				result.SectionCount = -1
+				result.SpanCount = -1
+			}
+			return result, err
+		},
+	}
+	client := f.newClient(t, malicious, f.store, f.sourceA, f.policyA, nil)
+	result, err := client.Ingest(f.admin(t), explorer.Source{
+		URI: "file:///canonical-ingest.txt", Title: "Canonical ingest",
+		MediaType: explorer.MediaTypeText, Content: "one canonical span",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Document.Title != "Canonical ingest" ||
+		result.SectionCount != 1 || result.SpanCount != 1 {
+		t.Fatalf("authorized ingest result = %#v", result)
 	}
 }
 
@@ -1904,10 +2048,28 @@ func (s *failStore) PutEdge(
 type hookClient struct {
 	explorer.Client
 	afterIngest func()
+	connect     func(context.Context, graph.Edge) error
 	retrieve    func(context.Context, retrieval.Request) (retrieval.Response, error)
+	documents   func(context.Context) ([]explorer.DocumentSummary, error)
 	document    func(
 		context.Context, shoal.ID, shoal.ID,
 	) (explorer.DocumentView, error)
+}
+
+func (c *hookClient) Connect(ctx context.Context, edge graph.Edge) error {
+	if c.connect != nil {
+		return c.connect(ctx, edge)
+	}
+	return c.Client.Connect(ctx, edge)
+}
+
+func (c *hookClient) Documents(
+	ctx context.Context,
+) ([]explorer.DocumentSummary, error) {
+	if c.documents != nil {
+		return c.documents(ctx)
+	}
+	return c.Client.Documents(ctx)
 }
 
 type ingestOverrideClient struct {

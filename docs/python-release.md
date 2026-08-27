@@ -16,7 +16,7 @@ PyPI project is published as a thin compatibility distribution. It depends on
 artifact.
 
 The distribution version is independent of the native ABI version. Release
-`0.5.0` requires Shoal ABI `1.19.0` or newer within ABI major 1. The package is
+`1.3.0` requires Shoal ABI `1.19.0` or newer within ABI major 1. The package is
 still an incremental compatibility layer: publishing it does not make the
 uncovered required rows in `sharkbite-compatibility.md` compatible. Scope is
 defined by `sharkbite-client-scope.md`, not by the raw count of historical C++

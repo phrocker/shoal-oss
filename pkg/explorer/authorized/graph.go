@@ -41,6 +41,17 @@ func (c *Client) Connect(ctx context.Context, edge graph.Edge) error {
 	if err != nil {
 		return err
 	}
+
+	c.mutationMu.Lock()
+	defer c.mutationMu.Unlock()
+	lease, err := c.policyStore.AcquireMutation(ctx)
+	if err != nil {
+		return policyCatalogWriteError(ctx, err)
+	}
+	defer lease.Release()
+	if err := guard.Check(ctx); err != nil {
+		return err
+	}
 	from, err := c.authorizedNode(
 		ctx, ownedEdge.From, decision, auth.OperationConnect, now)
 	if err != nil {
@@ -67,19 +78,24 @@ func (c *Client) Connect(ctx context.Context, edge graph.Edge) error {
 		decision, auth.OperationConnect, now); err != nil {
 		return authorizationDenied()
 	}
-
-	c.mutationMu.Lock()
-	defer c.mutationMu.Unlock()
 	if err := guard.Check(ctx); err != nil {
 		return err
 	}
+	registration := EdgeRegistration{Edge: ownedEdge, Rule: edgeRule}
+	if err := c.policyStore.ReserveEdge(ctx, registration); err != nil {
+		return policyCatalogWriteError(ctx, err)
+	}
 	if err := c.base.Connect(ctx, cloneGraphEdge(ownedEdge)); err != nil {
+		if !explorer.IsIndeterminateCommit(err) {
+			if rollbackErr := c.policyStore.RollbackEdgeReservation(
+				context.WithoutCancel(ctx), registration,
+			); rollbackErr != nil {
+				return policyCatalogWriteError(ctx, rollbackErr)
+			}
+		}
 		return directBaseError(err)
 	}
-	if err := c.policyStore.PutEdge(ctx, EdgeRegistration{
-		Edge: ownedEdge,
-		Rule: edgeRule,
-	}); err != nil {
+	if err := c.policyStore.PutEdge(ctx, registration); err != nil {
 		return policyCatalogWriteError(ctx, err)
 	}
 	return guard.Check(ctx)
@@ -110,7 +126,8 @@ func (c *Client) Neighborhood(
 		return explorer.Neighborhood{}, directBaseError(err)
 	}
 
-	visibleNodes := make(map[shoal.ID]graph.Node, len(raw.Nodes))
+	candidates := make(map[shoal.ID]graph.Node, len(raw.Nodes))
+	registrations := make(map[shoal.ID]NodeRegistration, len(raw.Nodes))
 	for _, node := range raw.Nodes {
 		if err := node.Validate(); err != nil {
 			return explorer.Neighborhood{}, inconsistentBase()
@@ -130,10 +147,23 @@ func (c *Client) Neighborhood(
 		if !allowed {
 			continue
 		}
-		if _, duplicate := visibleNodes[node.ID]; duplicate {
+		if _, duplicate := candidates[node.ID]; duplicate {
 			return explorer.Neighborhood{}, inconsistentBase()
 		}
-		visibleNodes[node.ID] = cloneGraphNode(node)
+		candidates[node.ID] = cloneGraphNode(node)
+		registrations[node.ID] = registration
+	}
+	canonicalNodes, err := c.canonicalRegisteredNodes(ctx, registrations)
+	if err != nil {
+		return explorer.Neighborhood{}, err
+	}
+	visibleNodes := make(map[shoal.ID]graph.Node, len(candidates))
+	for nodeID, node := range candidates {
+		canonical, ok := canonicalNodes[nodeID]
+		if !ok || !graphNodesEqual(canonical, node) {
+			return explorer.Neighborhood{}, inconsistentBase()
+		}
+		visibleNodes[nodeID] = node
 	}
 	for _, seed := range normalized.NodeIDs {
 		if _, ok := visibleNodes[seed]; !ok {
@@ -288,5 +318,74 @@ func (c *Client) authorizedNode(
 	if !allowed {
 		return NodeRegistration{}, auth.ObjectNotFound()
 	}
+	if _, err := c.canonicalRegisteredNodes(
+		ctx, map[shoal.ID]NodeRegistration{nodeID: registration},
+	); err != nil {
+		return NodeRegistration{}, err
+	}
 	return registration, nil
+}
+
+func (c *Client) canonicalRegisteredNodes(
+	ctx context.Context,
+	registrations map[shoal.ID]NodeRegistration,
+) (map[shoal.ID]graph.Node, error) {
+	summaries, err := c.base.Documents(ctx)
+	if err != nil {
+		return nil, err
+	}
+	currentBase := make(map[shoal.ID]shoal.ID, len(summaries))
+	for _, summary := range summaries {
+		if err := validateSummary(summary); err != nil {
+			return nil, inconsistentBase()
+		}
+		if _, duplicate := currentBase[summary.Document.ID]; duplicate {
+			return nil, inconsistentBase()
+		}
+		currentBase[summary.Document.ID] = summary.Revision.ID
+	}
+	required := make(map[shoal.ID]shoal.ID)
+	for _, registration := range registrations {
+		if revisionID, ok := required[registration.DocumentID]; ok &&
+			revisionID != registration.RevisionID {
+			return nil, inconsistentBase()
+		}
+		required[registration.DocumentID] = registration.RevisionID
+	}
+	canonicalDocuments := make(
+		map[shoal.ID]*canonicalRetrievalDocument, len(required))
+	for documentID, revisionID := range required {
+		if currentBase[documentID] != revisionID {
+			return nil, auth.ObjectNotFound()
+		}
+		current, ok, err := c.policyStore.CurrentRevision(ctx, documentID)
+		if err != nil {
+			return nil, policyCatalogReadError(ctx, err)
+		}
+		if !ok || current.RevisionID != revisionID {
+			return nil, auth.ObjectNotFound()
+		}
+		view, err := c.base.Document(ctx, documentID, revisionID)
+		if err != nil {
+			return nil, directBaseError(err)
+		}
+		if err := verifyDocumentViewRegistration(view, current); err != nil {
+			return nil, err
+		}
+		canonical, err := buildCanonicalRetrievalDocument(view, current)
+		if err != nil {
+			return nil, inconsistentBase()
+		}
+		canonicalDocuments[documentID] = canonical
+	}
+	nodes := make(map[shoal.ID]graph.Node, len(registrations))
+	for nodeID, registration := range registrations {
+		canonical := canonicalDocuments[registration.DocumentID]
+		node, ok := canonical.nodes[nodeID]
+		if !ok {
+			return nil, inconsistentBase()
+		}
+		nodes[nodeID] = cloneGraphNode(node)
+	}
+	return nodes, nil
 }
