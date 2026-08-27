@@ -311,6 +311,51 @@ func TestMemoryPolicyStoreConcurrentAccess(t *testing.T) {
 	}
 }
 
+func TestMemoryPolicyStoreSourceClaimCAS(t *testing.T) {
+	ctx := context.Background()
+	store := authorized.NewMemoryPolicyStore()
+	ruleA, err := authorized.NewAccessRule(
+		mustPolicy(t, "domain", "source-a", "policy-a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ruleB, err := authorized.NewAccessRule(
+		mustPolicy(t, "domain", "source-b", "policy-b"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	const uri = "file:///claimed.txt"
+	first, err := store.CompareAndSwapSourceClaim(ctx, uri, nil, ruleA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CompareAndSwapSourceClaim(
+		ctx, uri, nil, ruleB,
+	); !shoal.IsErrorCode(err, shoal.ErrorConflict) {
+		t.Fatalf("concurrent source claim = %v", err)
+	}
+	if err := store.CommitSourceClaim(ctx, first); err != nil {
+		t.Fatal(err)
+	}
+	stored, ok, err := store.SourceClaim(ctx, uri)
+	if err != nil || !ok || stored.Version != first.Version {
+		t.Fatalf("stored source claim = %#v ok=%v err=%v", stored, ok, err)
+	}
+	transitioned, err := store.CompareAndSwapSourceClaim(
+		ctx, uri, &stored, ruleB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RollbackSourceClaim(ctx, transitioned); err != nil {
+		t.Fatal(err)
+	}
+	restored, ok, err := store.SourceClaim(ctx, uri)
+	if err != nil || !ok || restored.Version != first.Version ||
+		restored.Rule.String() != ruleA.String() {
+		t.Fatalf("restored source claim = %#v ok=%v err=%v", restored, ok, err)
+	}
+}
+
 func mustPolicy(
 	t *testing.T,
 	domain, source, policy string,

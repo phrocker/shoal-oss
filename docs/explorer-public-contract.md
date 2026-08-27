@@ -226,7 +226,12 @@ document/graph relationships that a later storage adapter must persist.
   who cannot see the document is refused with the same `not_found` shape as an
   absent one, so a source URI cannot be probed, seized, or relabeled. A caller
   the current rule authorizes may reclassify the document, because the newly
-  selected policy must also authorize that same caller.
+  selected policy must also authorize that same caller. Shared source-URI
+  claims are acquired or compare-and-swap transitioned before base mutation,
+  serialize concurrent wrapped clients, and retain the selected rule when a
+  base commit outlives a policy-catalog failure. Legacy registered documents
+  lazily backfill claims only after current-rule authorization; an existing
+  document with neither a claim nor registration is unavailable.
 - Structured policy labels are canonical lowercase no-padding base32 terms
   for domain, source, policy/epoch, and trusted service role. Callers cannot
   submit visibility expressions. Service-account ceilings intersect required

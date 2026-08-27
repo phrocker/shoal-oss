@@ -104,7 +104,10 @@ func NewClient(config Config) (*Client, error) {
 func (c *Client) Ingest(
 	ctx context.Context,
 	source explorer.Source,
-) (explorer.IngestResult, error) {
+) (
+	returned explorer.IngestResult,
+	returnedErr error,
+) {
 	decision, guard, now, err := c.begin(ctx, auth.OperationIngest)
 	if err != nil {
 		return explorer.IngestResult{}, err
@@ -121,14 +124,35 @@ func (c *Client) Ingest(
 	if err := guard.Check(ctx); err != nil {
 		return explorer.IngestResult{}, err
 	}
-	if err := c.authorizeExistingSource(
-		ctx, ownedSource.URI, decision, now); err != nil {
+	claim, err := c.claimSourceMutation(
+		ctx, ownedSource.URI, decision, rule, now)
+	if err != nil {
+		return explorer.IngestResult{}, err
+	}
+	preserveClaim := false
+	defer func() {
+		cleanupContext := context.WithoutCancel(ctx)
+		var cleanupErr error
+		if preserveClaim {
+			cleanupErr = c.policyStore.CommitSourceClaim(
+				cleanupContext, claim)
+		} else {
+			cleanupErr = c.policyStore.RollbackSourceClaim(
+				cleanupContext, claim)
+		}
+		if cleanupErr != nil && returnedErr == nil {
+			returned = explorer.IngestResult{}
+			returnedErr = policyCatalogWriteError(cleanupContext, cleanupErr)
+		}
+	}()
+	if err := guard.Check(ctx); err != nil {
 		return explorer.IngestResult{}, err
 	}
 	result, err := c.base.Ingest(ctx, cloneSource(ownedSource))
 	if err != nil {
 		return explorer.IngestResult{}, err
 	}
+	preserveClaim = result.Disposition == explorer.IngestApplied
 	view, err := c.base.Document(
 		ctx, result.Document.ID, result.Revision.ID)
 	if err != nil {
@@ -175,6 +199,7 @@ func (c *Client) Ingest(
 	}); err != nil {
 		return explorer.IngestResult{}, policyCatalogWriteError(ctx, err)
 	}
+	preserveClaim = true
 	cloned := cloneIngestResult(result)
 	if err := guard.Check(ctx); err != nil {
 		return explorer.IngestResult{}, err
@@ -182,13 +207,65 @@ func (c *Client) Ingest(
 	return cloned, nil
 }
 
-// authorizeExistingSource keeps re-ingesting a known source URI from seizing a
-// document that is already registered under a rule the caller cannot satisfy.
-// The caller must be authorized to ingest under the existing rule, and
-// selectedPolicyRule has already required authorization under the newly
-// selected rule, so a reclassification stays within the caller's own grants.
-// A caller who cannot see the document is refused exactly like an absent one.
-func (c *Client) authorizeExistingSource(
+// claimSourceMutation acquires shared source-URI mutation ownership before the
+// base is changed. Existing claims authorize retries after a base commit even
+// when revision registration failed. Legacy registered documents may backfill
+// a missing claim only after authorization under their current rule.
+func (c *Client) claimSourceMutation(
+	ctx context.Context,
+	sourceURI string,
+	decision auth.Decision,
+	selectedRule AccessRule,
+	now time.Time,
+) (SourcePolicyClaim, error) {
+	if err := validateSourceURI(sourceURI); err != nil {
+		return SourcePolicyClaim{}, err
+	}
+	existingClaim, claimed, err := c.policyStore.SourceClaim(ctx, sourceURI)
+	if err != nil {
+		return SourcePolicyClaim{}, policyCatalogReadError(ctx, err)
+	}
+	var expected *SourcePolicyClaim
+	if claimed {
+		allowed, ruleErr := ruleAllows(
+			existingClaim.Rule, decision, auth.OperationIngest, now)
+		if ruleErr != nil {
+			return SourcePolicyClaim{}, ruleErr
+		}
+		if !allowed {
+			return SourcePolicyClaim{}, auth.ObjectNotFound()
+		}
+		expected = &existingClaim
+	} else if err := c.authorizeLegacySource(
+		ctx, sourceURI, decision, now); err != nil {
+		return SourcePolicyClaim{}, err
+	}
+	claim, err := c.policyStore.CompareAndSwapSourceClaim(
+		ctx, sourceURI, expected, selectedRule)
+	if err == nil {
+		return claim, nil
+	}
+	if !shoal.IsErrorCode(err, shoal.ErrorConflict) {
+		return SourcePolicyClaim{}, policyCatalogWriteError(ctx, err)
+	}
+	latest, ok, readErr := c.policyStore.SourceClaim(ctx, sourceURI)
+	if readErr != nil {
+		return SourcePolicyClaim{}, policyCatalogReadError(ctx, readErr)
+	}
+	if ok {
+		allowed, ruleErr := ruleAllows(
+			latest.Rule, decision, auth.OperationIngest, now)
+		if ruleErr != nil {
+			return SourcePolicyClaim{}, ruleErr
+		}
+		if !allowed {
+			return SourcePolicyClaim{}, auth.ObjectNotFound()
+		}
+	}
+	return SourcePolicyClaim{}, policyCatalogWriteError(ctx, err)
+}
+
+func (c *Client) authorizeLegacySource(
 	ctx context.Context,
 	sourceURI string,
 	decision auth.Decision,
@@ -221,7 +298,13 @@ func (c *Client) authorizeExistingSource(
 		return policyCatalogReadError(ctx, err)
 	}
 	if !ok {
-		return nil
+		return catalogUnavailable()
+	}
+	for _, summary := range summaries {
+		if summary.Document.ID == documentID &&
+			registration.RevisionID != summary.Revision.ID {
+			return catalogUnavailable()
+		}
 	}
 	allowed, err := ruleAllows(
 		registration.Rule, decision, auth.OperationIngest, now)

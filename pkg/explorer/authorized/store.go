@@ -22,7 +22,9 @@ package authorized
 import (
 	"context"
 	"sort"
+	"strings"
 	"sync"
+	"unicode/utf8"
 
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/graph"
@@ -60,9 +62,25 @@ type EdgeRegistration struct {
 	Rule       AccessRule
 }
 
+// SourcePolicyClaim reserves one source URI under a policy rule. Version is an
+// opaque compare-and-swap generation owned by the PolicyStore.
+type SourcePolicyClaim struct {
+	SourceURI string
+	Rule      AccessRule
+	Version   uint64
+}
+
 // PolicyStore is the non-durable M2 policy-catalog boundary. Implementations
-// must make each put atomic and return independent values from reads.
+// must make each put and source-claim transition atomic and return independent
+// values from reads. A successful source-claim CAS exclusively owns that URI
+// until it is committed or rolled back.
 type PolicyStore interface {
+	SourceClaim(context.Context, string) (SourcePolicyClaim, bool, error)
+	CompareAndSwapSourceClaim(
+		context.Context, string, *SourcePolicyClaim, AccessRule,
+	) (SourcePolicyClaim, error)
+	CommitSourceClaim(context.Context, SourcePolicyClaim) error
+	RollbackSourceClaim(context.Context, SourcePolicyClaim) error
 	PutRevision(context.Context, RevisionRegistration) error
 	Revision(context.Context, shoal.ID, shoal.ID) (RevisionRegistration, bool, error)
 	CurrentRevision(context.Context, shoal.ID) (RevisionRegistration, bool, error)
@@ -76,11 +94,19 @@ type revisionKey struct {
 	revisionID shoal.ID
 }
 
+type sourceClaimState struct {
+	claim    SourcePolicyClaim
+	held     bool
+	previous *SourcePolicyClaim
+}
+
 // MemoryPolicyStore is a concurrency-safe reference catalog. Reusing the same
 // instance across wrapped-client restarts preserves registrations, but process
 // exit loses them; it is not durable recovery storage.
 type MemoryPolicyStore struct {
 	mu             sync.RWMutex
+	sourceClaims   map[string]sourceClaimState
+	sourceVersion  uint64
 	revisions      map[revisionKey]RevisionRegistration
 	revisionIDs    map[shoal.ID]revisionKey
 	current        map[shoal.ID]revisionKey
@@ -92,6 +118,7 @@ type MemoryPolicyStore struct {
 // NewMemoryPolicyStore constructs an empty reference catalog.
 func NewMemoryPolicyStore() *MemoryPolicyStore {
 	return &MemoryPolicyStore{
+		sourceClaims:   make(map[string]sourceClaimState),
 		revisions:      make(map[revisionKey]RevisionRegistration),
 		revisionIDs:    make(map[shoal.ID]revisionKey),
 		current:        make(map[shoal.ID]revisionKey),
@@ -99,6 +126,171 @@ func NewMemoryPolicyStore() *MemoryPolicyStore {
 		intrinsicEdges: make(map[shoal.ID]EdgeRegistration),
 		edges:          make(map[shoal.ID]EdgeRegistration),
 	}
+}
+
+// SourceClaim returns the current source-URI policy claim.
+func (s *MemoryPolicyStore) SourceClaim(
+	ctx context.Context,
+	sourceURI string,
+) (SourcePolicyClaim, bool, error) {
+	if err := contextFailure(ctx); err != nil {
+		return SourcePolicyClaim{}, false, err
+	}
+	if err := validateSourceURI(sourceURI); err != nil {
+		return SourcePolicyClaim{}, false, err
+	}
+	if s == nil {
+		return SourcePolicyClaim{}, false, catalogUnavailable()
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	state, ok := s.sourceClaims[sourceURI]
+	if !ok {
+		return SourcePolicyClaim{}, false, nil
+	}
+	cloned, err := cloneSourcePolicyClaim(state.claim)
+	if err != nil {
+		return SourcePolicyClaim{}, false, catalogUnavailable()
+	}
+	return cloned, true, nil
+}
+
+// CompareAndSwapSourceClaim atomically acquires exclusive mutation ownership
+// and changes a source URI from the exact expected claim to the desired rule.
+// A nil expected claim requires the URI to be unclaimed.
+func (s *MemoryPolicyStore) CompareAndSwapSourceClaim(
+	ctx context.Context,
+	sourceURI string,
+	expected *SourcePolicyClaim,
+	desired AccessRule,
+) (SourcePolicyClaim, error) {
+	if err := contextFailure(ctx); err != nil {
+		return SourcePolicyClaim{}, err
+	}
+	if err := validateSourceURI(sourceURI); err != nil {
+		return SourcePolicyClaim{}, err
+	}
+	rule, err := desired.clone()
+	if err != nil {
+		return SourcePolicyClaim{}, err
+	}
+	var normalizedExpected *SourcePolicyClaim
+	if expected != nil {
+		cloned, cloneErr := cloneSourcePolicyClaim(*expected)
+		if cloneErr != nil {
+			return SourcePolicyClaim{}, cloneErr
+		}
+		if cloned.SourceURI != sourceURI || cloned.Version == 0 {
+			return SourcePolicyClaim{}, shoal.NewError(
+				shoal.ErrorInvalidArgument, "source policy claim is invalid")
+		}
+		normalizedExpected = &cloned
+	}
+	if s == nil {
+		return SourcePolicyClaim{}, catalogUnavailable()
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.initialize()
+	current, exists := s.sourceClaims[sourceURI]
+	if current.held {
+		return SourcePolicyClaim{}, catalogConflict()
+	}
+	if normalizedExpected == nil {
+		if exists {
+			return SourcePolicyClaim{}, catalogConflict()
+		}
+	} else if !exists ||
+		!sourcePolicyClaimsEqual(current.claim, *normalizedExpected) {
+		return SourcePolicyClaim{}, catalogConflict()
+	}
+	if s.sourceVersion == ^uint64(0) {
+		return SourcePolicyClaim{}, catalogUnavailable()
+	}
+	s.sourceVersion++
+	claim := SourcePolicyClaim{
+		SourceURI: sourceURI,
+		Rule:      rule,
+		Version:   s.sourceVersion,
+	}
+	state := sourceClaimState{claim: claim, held: true}
+	if exists {
+		previous, cloneErr := cloneSourcePolicyClaim(current.claim)
+		if cloneErr != nil {
+			return SourcePolicyClaim{}, catalogUnavailable()
+		}
+		state.previous = &previous
+	}
+	s.sourceClaims[sourceURI] = state
+	return cloneSourcePolicyClaim(claim)
+}
+
+// CommitSourceClaim releases exclusive mutation ownership and preserves the
+// claim's desired rule.
+func (s *MemoryPolicyStore) CommitSourceClaim(
+	ctx context.Context,
+	claim SourcePolicyClaim,
+) error {
+	return s.finishSourceClaim(ctx, claim, false)
+}
+
+// RollbackSourceClaim releases exclusive mutation ownership and restores the
+// claim that preceded the CAS, deleting a newly-created claim.
+func (s *MemoryPolicyStore) RollbackSourceClaim(
+	ctx context.Context,
+	claim SourcePolicyClaim,
+) error {
+	return s.finishSourceClaim(ctx, claim, true)
+}
+
+func (s *MemoryPolicyStore) finishSourceClaim(
+	ctx context.Context,
+	claim SourcePolicyClaim,
+	rollback bool,
+) error {
+	if err := contextFailure(ctx); err != nil {
+		return err
+	}
+	normalized, err := cloneSourcePolicyClaim(claim)
+	if err != nil {
+		return err
+	}
+	if err := validateSourceURI(normalized.SourceURI); err != nil {
+		return err
+	}
+	if normalized.Version == 0 {
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument, "source policy claim is invalid")
+	}
+	if s == nil {
+		return catalogUnavailable()
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	state, ok := s.sourceClaims[normalized.SourceURI]
+	if !ok || !state.held ||
+		!sourcePolicyClaimsEqual(state.claim, normalized) {
+		return catalogConflict()
+	}
+	if rollback {
+		if state.previous == nil {
+			delete(s.sourceClaims, normalized.SourceURI)
+			return nil
+		}
+		previous, cloneErr := cloneSourcePolicyClaim(*state.previous)
+		if cloneErr != nil {
+			return catalogUnavailable()
+		}
+		s.sourceClaims[normalized.SourceURI] = sourceClaimState{
+			claim: previous,
+		}
+		return nil
+	}
+	state.held = false
+	state.previous = nil
+	s.sourceClaims[normalized.SourceURI] = state
+	return nil
 }
 
 // PutRevision atomically registers immutable revision content and, when
@@ -316,6 +508,9 @@ func (s *MemoryPolicyStore) Edge(
 }
 
 func (s *MemoryPolicyStore) initialize() {
+	if s.sourceClaims == nil {
+		s.sourceClaims = make(map[string]sourceClaimState)
+	}
 	if s.revisions == nil {
 		s.revisions = make(map[revisionKey]RevisionRegistration)
 	}
@@ -334,6 +529,33 @@ func (s *MemoryPolicyStore) initialize() {
 	if s.edges == nil {
 		s.edges = make(map[shoal.ID]EdgeRegistration)
 	}
+}
+
+func validateSourceURI(sourceURI string) error {
+	if !utf8.ValidString(sourceURI) || strings.TrimSpace(sourceURI) == "" {
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"source URI is required and must be valid UTF-8",
+		)
+	}
+	return nil
+}
+
+func cloneSourcePolicyClaim(
+	claim SourcePolicyClaim,
+) (SourcePolicyClaim, error) {
+	rule, err := claim.Rule.clone()
+	if err != nil {
+		return SourcePolicyClaim{}, err
+	}
+	claim.Rule = rule
+	return claim, nil
+}
+
+func sourcePolicyClaimsEqual(left, right SourcePolicyClaim) bool {
+	return left.SourceURI == right.SourceURI &&
+		left.Version == right.Version &&
+		left.Rule.equal(right.Rule)
 }
 
 func (s *MemoryPolicyStore) replaceCurrent(

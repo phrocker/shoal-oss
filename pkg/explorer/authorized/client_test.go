@@ -606,6 +606,19 @@ func TestPolicyStoreFailureRetryAndImmutablePolicyConflict(t *testing.T) {
 	if len(raw) != 1 {
 		t.Fatalf("base commit missing after catalog failure: %#v", raw)
 	}
+	failedRevisionID := raw[0].Revision.ID
+	if _, err := f.clientB.Ingest(f.bob(t), source); !shoal.IsErrorCode(
+		err, shoal.ErrorNotFound,
+	) {
+		t.Fatalf("different-policy seizure after catalog failure = %v", err)
+	}
+	raw, err = f.base.Documents(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(raw) != 1 || raw[0].Revision.ID != failedRevisionID {
+		t.Fatalf("denied retry changed base document: %#v", raw)
+	}
 	result, err := client.Ingest(f.admin(t), source)
 	if err != nil {
 		t.Fatal(err)
@@ -623,6 +636,124 @@ func TestPolicyStoreFailureRetryAndImmutablePolicyConflict(t *testing.T) {
 		err, shoal.ErrorConflict,
 	) {
 		t.Fatalf("immutable policy reuse error = %v", err)
+	}
+}
+
+func TestExistingSourceWithoutClaimOrRegistrationIsUnavailable(t *testing.T) {
+	f := newFixture(t)
+	source := explorer.Source{
+		URI: "file:///uncataloged.txt", MediaType: explorer.MediaTypeText,
+		Content: "uncataloged base content",
+	}
+	raw, err := f.base.Ingest(context.Background(), source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.clientA.Ingest(
+		f.admin(t), source,
+	); !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
+		t.Fatalf("uncataloged existing source error = %v", err)
+	}
+	current, err := f.base.Documents(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(current) != 1 || current[0].Revision.ID != raw.Revision.ID {
+		t.Fatalf("unavailable ingest changed base: %#v", current)
+	}
+}
+
+func TestLegacyRegistrationBackfillsClaimAfterAuthorization(t *testing.T) {
+	f := newFixture(t)
+	const uri = "file:///legacy-claim.txt"
+	original, err := f.clientA.Ingest(f.admin(t), explorer.Source{
+		URI: uri, MediaType: explorer.MediaTypeText,
+		Content: "legacy policy A content",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	registration, ok, err := f.store.CurrentRevision(
+		context.Background(), original.Document.ID)
+	if err != nil || !ok {
+		t.Fatalf("original registration: ok=%v err=%v", ok, err)
+	}
+	legacyStore := authorized.NewMemoryPolicyStore()
+	if err := legacyStore.PutRevision(
+		context.Background(), registration); err != nil {
+		t.Fatal(err)
+	}
+	legacyA := f.newClient(
+		t, f.base, legacyStore, f.sourceA, f.policyA, nil)
+	legacyB := f.newClient(
+		t, f.base, legacyStore, f.sourceB, f.policyB, nil)
+
+	if _, err := legacyB.Ingest(f.bob(t), explorer.Source{
+		URI: uri, MediaType: explorer.MediaTypeText,
+		Content: "unauthorized legacy seizure",
+	}); !shoal.IsErrorCode(err, shoal.ErrorNotFound) {
+		t.Fatalf("unauthorized legacy backfill = %v", err)
+	}
+	if _, ok, err := legacyStore.SourceClaim(
+		context.Background(), uri); err != nil || ok {
+		t.Fatalf("unauthorized caller created claim: ok=%v err=%v", ok, err)
+	}
+
+	reclassified, err := legacyB.Ingest(f.admin(t), explorer.Source{
+		URI: uri, MediaType: explorer.MediaTypeText,
+		Content: "authorized policy B reclassification",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, ok, err := legacyStore.SourceClaim(context.Background(), uri)
+	if err != nil || !ok {
+		t.Fatalf("backfilled source claim: ok=%v err=%v", ok, err)
+	}
+	if reclassified.Document.ID != original.Document.ID {
+		t.Fatalf("reclassification changed document: %#v", reclassified)
+	}
+	if _, err := legacyA.Document(
+		f.alice(t), reclassified.Document.ID, reclassified.Revision.ID,
+	); !shoal.IsErrorCode(err, shoal.ErrorNotFound) {
+		t.Fatalf("old policy retained reclassified document: %v", err)
+	}
+	if claim.Rule.String() == registration.Rule.String() {
+		t.Fatal("authorized reclassification did not transition source claim")
+	}
+}
+
+func TestConcurrentClientsShareSourceClaim(t *testing.T) {
+	f := newFixture(t)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	hooked := &hookClient{
+		Client: f.base,
+		afterIngest: func() {
+			close(started)
+			<-release
+		},
+	}
+	first := f.newClient(t, hooked, f.store, f.sourceA, f.policyA, nil)
+	source := explorer.Source{
+		URI: "file:///concurrent-claim.txt", MediaType: explorer.MediaTypeText,
+		Content: "concurrent claim content",
+	}
+	firstErr := make(chan error, 1)
+	go func() {
+		_, err := first.Ingest(f.admin(t), source)
+		firstErr <- err
+	}()
+	<-started
+	if _, err := f.clientB.Ingest(
+		f.bob(t), source,
+	); !shoal.IsErrorCode(err, shoal.ErrorNotFound) {
+		close(release)
+		t.Fatalf("concurrent different-policy ingest = %v", err)
+	}
+	close(release)
+	if err := <-firstErr; err != nil {
+		t.Fatal(err)
 	}
 }
 
