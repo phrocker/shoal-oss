@@ -140,8 +140,6 @@ func (c *Client) Ingest(
 		case sourceClaimRollback:
 			cleanupErr = c.policyStore.RollbackSourceClaim(
 				cleanupContext, claim)
-		case sourceClaimRetainPending:
-			return
 		}
 		if cleanupErr != nil && returnedErr == nil {
 			returned = explorer.IngestResult{}
@@ -154,7 +152,11 @@ func (c *Client) Ingest(
 	result, err := c.base.Ingest(ctx, cloneSource(ownedSource))
 	if err != nil {
 		if explorer.IsIndeterminateCommit(err) {
-			claimOutcome = sourceClaimRetainPending
+			// The base may have committed under the selected rule, so the
+			// claim must advance rather than roll back to a rule that could
+			// overwrite committed content. Ownership is still released so the
+			// authorized owner can retry.
+			claimOutcome = sourceClaimCommit
 		}
 		return explorer.IngestResult{}, err
 	}
@@ -225,7 +227,6 @@ type sourceClaimOutcome uint8
 const (
 	sourceClaimRollback sourceClaimOutcome = iota
 	sourceClaimCommit
-	sourceClaimRetainPending
 )
 
 // claimSourceMutation acquires shared source-URI mutation ownership before the

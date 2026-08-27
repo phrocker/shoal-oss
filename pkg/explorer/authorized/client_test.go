@@ -757,7 +757,7 @@ func TestConcurrentClientsShareSourceClaim(t *testing.T) {
 	}
 }
 
-func TestIndeterminateBaseCommitRetainsPendingReclassification(t *testing.T) {
+func TestIndeterminateBaseCommitAdvancesClaimAndAllowsRetry(t *testing.T) {
 	f := newFixture(t)
 	const uri = "file:///indeterminate-reclassification.txt"
 	original, err := f.clientA.Ingest(f.admin(t), explorer.Source{
@@ -810,12 +810,27 @@ func TestIndeterminateBaseCommitRetainsPendingReclassification(t *testing.T) {
 		URI: uri, MediaType: explorer.MediaTypeText,
 		Content: "old policy overwrite attempt",
 	}); !shoal.IsErrorCode(err, shoal.ErrorNotFound) {
-		t.Fatalf("old policy pending-claim mutation = %v", err)
+		t.Fatalf("old policy advanced-claim mutation = %v", err)
 	}
-	if _, err := f.clientB.Ingest(f.bob(t), reclassifiedSource); err == nil ||
-		(!shoal.IsErrorCode(err, shoal.ErrorConflict) &&
-			!shoal.IsErrorCode(err, shoal.ErrorUnavailable)) {
-		t.Fatalf("selected policy pending-claim mutation = %v", err)
+	afterDenied, err := f.base.Documents(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(afterDenied) != 1 ||
+		afterDenied[0].Revision.ID != committedRevisionID {
+		t.Fatalf("denied retry changed base: %#v", afterDenied)
+	}
+
+	// The claim advanced to the selected rule instead of staying exclusively
+	// held, so the authorized principal can retry the ambiguous commit rather
+	// than the source URI being retired forever.
+	retried, err := f.clientB.Ingest(f.bob(t), reclassifiedSource)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retried.Disposition != explorer.IngestUnchanged ||
+		retried.Revision.ID != committedRevisionID {
+		t.Fatalf("authorized retry = %#v", retried)
 	}
 	afterRetries, err := f.base.Documents(context.Background())
 	if err != nil {
@@ -823,7 +838,7 @@ func TestIndeterminateBaseCommitRetainsPendingReclassification(t *testing.T) {
 	}
 	if len(afterRetries) != 1 ||
 		afterRetries[0].Revision.ID != committedRevisionID {
-		t.Fatalf("pending-claim retries changed base: %#v", afterRetries)
+		t.Fatalf("advanced-claim retries changed base: %#v", afterRetries)
 	}
 }
 
@@ -1731,5 +1746,70 @@ func TestReingestCannotSeizeAnotherPolicysDocument(t *testing.T) {
 		Content:   "alpha owned content revised again",
 	}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestTransientIndeterminateCommitDoesNotRetireSourceURI(t *testing.T) {
+	f := newFixture(t)
+	const uri = "file:///transient-indeterminate.txt"
+	if _, err := f.clientA.Ingest(f.admin(t), explorer.Source{
+		URI: uri, MediaType: explorer.MediaTypeText,
+		Content: "original policy A revision",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	failed := false
+	flaky := &ingestOverrideClient{
+		Client: f.base,
+		ingest: func(
+			ctx context.Context,
+			source explorer.Source,
+		) (explorer.IngestResult, error) {
+			if failed {
+				return f.base.Ingest(ctx, source)
+			}
+			failed = true
+			return explorer.IngestResult{}, explorer.MarkIndeterminateCommit(
+				shoal.NewError(
+					shoal.ErrorUnavailable, "transient storage blip"),
+			)
+		},
+	}
+	owner := f.newClient(t, flaky, f.store, f.sourceA, f.policyA, nil)
+	if _, err := owner.Ingest(f.admin(t), explorer.Source{
+		URI: uri, MediaType: explorer.MediaTypeText,
+		Content: "policy A revision two",
+	}); !explorer.IsIndeterminateCommit(err) {
+		t.Fatalf("indeterminate commit error = %v", err)
+	}
+
+	// A transient ambiguous write must not retire the source URI: once the
+	// base recovers, the authorized owner can still publish.
+	result, err := owner.Ingest(f.admin(t), explorer.Source{
+		URI: uri, MediaType: explorer.MediaTypeText,
+		Content: "policy A revision three",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Disposition != explorer.IngestApplied {
+		t.Fatalf("recovered ingest = %#v", result)
+	}
+	summaries, err := f.clientA.Documents(f.alice(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(summaries) != 1 ||
+		summaries[0].Revision.ID != result.Revision.ID {
+		t.Fatalf("recovered document = %#v", summaries)
+	}
+
+	// Recovery must not widen access: an unrelated policy still cannot take
+	// the URI, and stays indistinguishable from an absent document.
+	if _, err := f.clientB.Ingest(f.bob(t), explorer.Source{
+		URI: uri, MediaType: explorer.MediaTypeText,
+		Content: "policy B seizure attempt",
+	}); !shoal.IsErrorCode(err, shoal.ErrorNotFound) {
+		t.Fatalf("post-recovery seizure error = %v", err)
 	}
 }
