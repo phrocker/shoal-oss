@@ -545,8 +545,15 @@ func (r ExtractionResult) ValidateFor(request ExtractionRequest) error {
 			return invalid("assertion predicate is not in the ontology")
 		}
 	}
+	predicateSubjects := make(map[shoal.ID]uint32)
+	predicateMinimums := make(map[shoal.ID]uint32)
 	for group, count := range counts {
 		property := properties[group.predicate]
+		predicateSubjects[group.predicate]++
+		minimum, exists := predicateMinimums[group.predicate]
+		if !exists || count < minimum {
+			predicateMinimums[group.predicate] = count
+		}
 		for _, constraint := range property.constraints {
 			switch constraint.Kind() {
 			case ConstraintMaximumCount:
@@ -557,20 +564,20 @@ func (r ExtractionResult) ValidateFor(request ExtractionRequest) error {
 			}
 		}
 	}
-	for subject := range subjects {
-		for predicate, property := range properties {
-			count := counts[assertionGroup{subject: subject, predicate: predicate}]
-			for _, constraint := range property.constraints {
-				switch constraint.Kind() {
-				case ConstraintRequired:
-					if count == 0 {
-						return invalid("required property assertion is missing")
-					}
-				case ConstraintMinimumCount:
-					minimum, _ := constraint.Count()
-					if count < minimum {
-						return invalid("assertion count is below property minimum")
-					}
+	for predicate, property := range properties {
+		for _, constraint := range property.constraints {
+			switch constraint.Kind() {
+			case ConstraintRequired:
+				if len(subjects) != 0 &&
+					predicateSubjects[predicate] != uint32(len(subjects)) {
+					return invalid("required property assertion is missing")
+				}
+			case ConstraintMinimumCount:
+				minimum, _ := constraint.Count()
+				if len(subjects) != 0 &&
+					(predicateSubjects[predicate] != uint32(len(subjects)) ||
+						predicateMinimums[predicate] < minimum) {
+					return invalid("assertion count is below property minimum")
 				}
 			}
 		}
