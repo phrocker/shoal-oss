@@ -625,6 +625,16 @@ func (r ExtractionResult) ValidateFor(request ExtractionRequest) error {
 			if !present || !containsID(relationship.toConcepts, objectType) {
 				return invalid("relationship does not allow the assertion object concept")
 			}
+			objectID, _ := assertion.Object().ReferenceValue()
+			subjects[objectID] = struct{}{}
+			if existing, exists := subjectTypes[objectID]; exists {
+				if existing != objectType {
+					return invalid("referenced entity has inconsistent ontology types")
+				}
+			} else {
+				subjectTypes[objectID] = objectType
+				subjectTypeCounts[objectType]++
+			}
 		default:
 			return invalid("assertion predicate is not in the ontology")
 		}
