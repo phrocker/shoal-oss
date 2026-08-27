@@ -238,6 +238,10 @@ func (e *Explorer) Document(
 		err    error
 	)
 	if revisionID == "" {
+		if len(revisions) == 0 {
+			return DocumentView{}, shoal.NewError(
+				shoal.ErrorNotFound, "document revision not found")
+		}
 		record, err = latestRevision(revisions)
 		if err != nil {
 			return DocumentView{}, err
