@@ -143,8 +143,30 @@ implementation exposes one. Duplicate modes MUST NOT change scores.
 - Evidence orders by score descending, then
   `(document, revision, section, span, start offset, end offset)`, then the
   directed path tuple of node IDs followed by edge IDs.
-- A future shared fusion/duplicate-result merge function MUST preserve these
-  boundaries. No generic fusion score is defined by the current public shape.
+- `pkg/retrieval` exposes versioned analyzer and scorer contracts. The shared
+  embedded analyzer version includes its Unicode table version, and the shared
+  coverage/fusion scorer fixes the lexical, tree, and graph formulas. An
+  adapter claiming those versions MUST produce bit-identical terms and scores.
+- A future duplicate-result merge function MUST preserve these boundaries.
+  No adapter may claim a shared analyzer/scorer version while substituting
+  storage-local behavior.
+
+## Canonical logical records
+
+- `pkg/explorer/canonical` defines the versioned deterministic logical record
+  encoding used for cross-adapter comparison. It is distinct from the
+  embedded persistence envelope and contains no rows, columns, visibilities,
+  iterators, or tablet coordinates.
+- Canonical bytes preserve opaque IDs and metadata exactly, sort metadata keys
+  by unsigned bytes, retain caller-supplied slice order, and carry exact source
+  bytes. The envelope includes magic, version, kind, payload length, and a
+  SHA-256 checksum.
+- A present publication coordinate has a positive signed-64-bit sequence and
+  nonzero publication time. It is separate from `Revision.CreatedAt`.
+- A canonical document-revision record is complete: graph edge endpoints must
+  name nodes in that record, public values and ownership validate, IDs are
+  unique within each value family, and unknown versions or malformed,
+  oversized, truncated, checksum-broken, or trailing data are rejected.
 
 ## Latest state, mutations, and retries
 
@@ -169,6 +191,13 @@ resolve to one immutable revision. Retrying a committed identical ingestion
 returns `IngestUnchanged` with identical artifact identities. A materializer
 version change cannot reinterpret an existing key; it honors the committed
 outcome or uses a future versioned operation/key contract.
+
+`pkg/explorer/codematerializer` implements `explorer-code-v1`. It derives the
+document title and source URI only from identity-bound repository/path values,
+excludes mutable refs from canonical output, preserves existing code entity
+and relationship IDs byte-for-byte, and returns document then graph artifact
+references in stable order. Its additive association values describe the
+document/graph relationships that a later storage adapter must persist.
 
 ## Stable public error categories
 
@@ -198,9 +227,8 @@ The contract above does not claim current implementation of:
 - authorization, canonical association persistence, pagination, migration,
   or distributed publication/conditional-write coordination;
 - an Accumulo schema or adapter;
-- vector indexing, generic fusion scoring, or a new graph walk/path shape;
-- the code materializer that maps parser-neutral code artifacts into
-  document/graph storage.
+- vector indexing, alternative scorer implementations, or a new graph
+  walk/path shape.
 
 Adapters advertise and test only the capabilities they implement. Missing
 store-dependent behavior returns the stable public error appropriate to the
