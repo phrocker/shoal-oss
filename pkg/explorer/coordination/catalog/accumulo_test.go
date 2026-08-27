@@ -107,3 +107,14 @@ func TestPrefixSuccessorBoundaries(t *testing.T) {
 		t.Fatal("all-ff prefix unexpectedly has a successor")
 	}
 }
+
+func TestCleanupErrorMeansScanResultsRemainUsable(t *testing.T) {
+	cleanup := &accumulo.CleanupError{ScanID: 19, Err: errors.New("close failed")}
+	if err := usableScanCloseError(cleanup); err != nil {
+		t.Fatalf("usableScanCloseError = %v, want nil", err)
+	}
+	sentinel := errors.New("stream failed")
+	if err := usableScanCloseError(sentinel); !errors.Is(err, sentinel) {
+		t.Fatalf("usableScanCloseError = %v, want stream failure", err)
+	}
+}

@@ -58,6 +58,13 @@ func envelope(kind byte, body []byte) []byte {
 	return append(result, sum[:]...)
 }
 
+func boundedEnvelope(kind byte, body []byte) ([]byte, error) {
+	if len(body) > coordination.MaxRootBytes {
+		return nil, ErrBounds
+	}
+	return envelope(kind, body), nil
+}
+
 func openEnvelope(value []byte, kind byte) ([]byte, error) {
 	if len(value) < 9+sha256.Size || value[0] != 'E' || value[1] != 'C' || value[2] != 'T' ||
 		value[3] != controlSchema || value[4] != kind {
@@ -130,7 +137,7 @@ func marshalLease(value Lease) ([]byte, error) {
 	w.u64(uint64(value.RecordGeneration))
 	w.tm(value.UpdatedAt)
 	w.bytes(inner)
-	return envelope(kindLease, w.b), nil
+	return boundedEnvelope(kindLease, w.b)
 }
 
 func unmarshalLease(value []byte) (Lease, error) {
@@ -178,7 +185,7 @@ func marshalRetirement(value Retirement) ([]byte, error) {
 	w.u64(uint64(value.RecordGeneration))
 	w.tm(value.UpdatedAt)
 	w.bytes(inner)
-	return envelope(kindRetirement, w.b), nil
+	return boundedEnvelope(kindRetirement, w.b)
 }
 
 func unmarshalRetirement(value []byte) (Retirement, error) {
@@ -220,7 +227,7 @@ func marshalAuthority(value Authority) ([]byte, error) {
 	w.u64(uint64(value.RecordGeneration))
 	w.tm(value.UpdatedAt)
 	w.bytes(inner)
-	return envelope(kindAuthority, w.b), nil
+	return boundedEnvelope(kindAuthority, w.b)
 }
 
 func unmarshalAuthority(value []byte) (Authority, error) {
@@ -256,7 +263,7 @@ func marshalObservation(value Observation) ([]byte, error) {
 	w.u64(uint64(value.Mode))
 	w.u64(uint64(value.RecordGeneration))
 	w.bytes(inner)
-	return envelope(kindObservation, w.b), nil
+	return boundedEnvelope(kindObservation, w.b)
 }
 
 func unmarshalObservation(value []byte) (Observation, error) {

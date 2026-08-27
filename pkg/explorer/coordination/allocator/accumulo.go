@@ -144,7 +144,8 @@ func (s *AccumuloStore) ReadExact(ctx context.Context, coordinates []Coordinate)
 func scanBounded(ctx context.Context, scanner accumuloScanner, scanRange *accumulo.Range, limit int) ([]accumulo.KeyValue, error) {
 	streaming, ok := scanner.(accumuloStreamScanner)
 	if !ok {
-		return scanner.Scan(ctx, scanRange)
+		values, err := scanner.Scan(ctx, scanRange)
+		return values, usableScanError(err)
 	}
 	stream, err := streaming.Stream(ctx, scanRange)
 	if err != nil {
@@ -159,11 +160,18 @@ func scanBounded(ctx context.Context, scanner accumuloScanner, scanRange *accumu
 	if streamErr != nil {
 		return nil, errors.Join(streamErr, closeErr)
 	}
-	var cleanup *accumulo.CleanupError
-	if closeErr != nil && !errors.As(closeErr, &cleanup) {
-		return nil, closeErr
+	if err := usableScanError(closeErr); err != nil {
+		return nil, err
 	}
-	return values, closeErr
+	return values, nil
+}
+
+func usableScanError(err error) error {
+	var cleanup *accumulo.CleanupError
+	if errors.As(err, &cleanup) {
+		return nil
+	}
+	return err
 }
 
 const coordinationReadBound = 10_001
@@ -301,7 +309,7 @@ func (s *AccumuloStore) ScanPrefixFrom(
 	sort.Slice(result, func(i, j int) bool {
 		return bytes.Compare(result[i].Coordinate.Row, result[j].Coordinate.Row) < 0
 	})
-	return result, err
+	return result, nil
 }
 
 func prefixSuccessor(value []byte) ([]byte, bool) {

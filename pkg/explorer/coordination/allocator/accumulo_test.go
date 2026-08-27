@@ -16,11 +16,12 @@ import (
 type fakeAccumuloScanner struct {
 	values []accumulo.KeyValue
 	ranges []*accumulo.Range
+	err    error
 }
 
 func (s *fakeAccumuloScanner) Scan(_ context.Context, scanRange *accumulo.Range) ([]accumulo.KeyValue, error) {
 	s.ranges = append(s.ranges, scanRange)
-	return append([]accumulo.KeyValue(nil), s.values...), nil
+	return append([]accumulo.KeyValue(nil), s.values...), s.err
 }
 
 type fakeAccumuloWriter struct {
@@ -89,6 +90,29 @@ func TestAccumuloStorePrefixSeekUsesExactColumnAndBoundedRange(t *testing.T) {
 	wantEnd[len(wantEnd)-1]++
 	if !bytes.Equal(scanner.ranges[0].EndRow(), wantEnd) {
 		t.Fatalf("prefix end = %x, want %x", scanner.ranges[0].EndRow(), wantEnd)
+	}
+}
+
+func TestAccumuloStorePrefixSeekAcceptsUsableResultsAfterCleanupFailure(t *testing.T) {
+	prefix := []byte("prefix")
+	row := append(append([]byte(nil), prefix...), "-row"...)
+	visibility := []byte("CONTROL")
+	scanner := &fakeAccumuloScanner{
+		values: []accumulo.KeyValue{{
+			Key: accumulo.Key{
+				Row: row, ColumnFamily: []byte("l"), ColumnQualifier: []byte("lease"),
+				ColumnVisibility: visibility, Timestamp: 2,
+			},
+			Value: []byte("value"),
+		}},
+		err: &accumulo.CleanupError{ScanID: 17, Err: errors.New("close failed")},
+	}
+	store := &AccumuloStore{scanner: scanner}
+	cells, err := store.ScanPrefixFrom(
+		context.Background(), prefix, prefix, []byte("l"), []byte("lease"), visibility, 1,
+	)
+	if err != nil || len(cells) != 1 || !bytes.Equal(cells[0].Value, []byte("value")) {
+		t.Fatalf("ScanPrefixFrom = %#v, %v", cells, err)
 	}
 }
 

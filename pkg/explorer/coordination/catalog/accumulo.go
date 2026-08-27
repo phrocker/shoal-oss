@@ -130,14 +130,21 @@ func (s *AccumuloStore) ScanPrefixFrom(
 	if streamErr != nil {
 		return nil, errors.Join(streamErr, closeErr)
 	}
-	var cleanup *accumulo.CleanupError
-	if closeErr != nil && !errors.As(closeErr, &cleanup) {
-		return nil, closeErr
+	if err := usableScanCloseError(closeErr); err != nil {
+		return nil, err
 	}
 	sort.Slice(values, func(i, j int) bool {
 		return bytes.Compare(values[i].Coordinate.Row, values[j].Coordinate.Row) < 0
 	})
-	return values, closeErr
+	return values, nil
+}
+
+func usableScanCloseError(err error) error {
+	var cleanup *accumulo.CleanupError
+	if errors.As(err, &cleanup) {
+		return nil
+	}
+	return err
 }
 
 func prefixSuccessor(value []byte) ([]byte, bool) {

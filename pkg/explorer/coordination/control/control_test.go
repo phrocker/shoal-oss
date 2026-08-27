@@ -642,6 +642,35 @@ func seedLease(t *testing.T, store *memoryStore, client *Client, now time.Time, 
 	store.put(allocator.Update{Coordinate: coordinate, Value: encoded, Timestamp: 1})
 }
 
+func TestMarshalLeaseRejectsOuterBodyAboveDecodeLimit(t *testing.T) {
+	now := time.Date(2026, 8, 27, 19, 0, 0, 0, time.UTC)
+	pins := make([]coordination.PolicyCopyPin, coordination.MaxPolicyCopyPins)
+	for index := range pins {
+		lpart := bytes.Repeat([]byte{'a'}, 969)
+		lpart[0] = byte(index + 1)
+		pins[index] = coordination.PolicyCopyPin{
+			LPART: lpart, MapGeneration: 1, CopyGeneration: 1, VisibilityDigest: digest("visibility"),
+		}
+	}
+	record := coordination.SnapshotLeaseV3{
+		LeaseID: coordination.LeaseID("lease"), Frontier: 1, Owner: coordination.OwnerID("reader"), Fence: 1,
+		AuthorityGeneration: 1, RetentionGeneration: 1, PolicyGeneration: 1,
+		PolicyCopyPins: pins, CreatedAt: now, RenewedAt: now, ExpiresAt: now.Add(time.Hour),
+		State: coordination.LeaseStateActive,
+	}
+	record.PolicyCopyPinDigest = coordination.PolicyCopyPinDigest(record.PolicyCopyPins)
+	inner, err := coordination.MarshalSnapshotLeaseV3(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(inner) > coordination.MaxRootBytes || len(inner)+32 <= coordination.MaxRootBytes {
+		t.Fatalf("inner lease size = %d, want outer metadata to cross %d", len(inner), coordination.MaxRootBytes)
+	}
+	if _, err := marshalLease(Lease{Record: record, RecordGeneration: 1, UpdatedAt: now}); !errors.Is(err, ErrBounds) {
+		t.Fatalf("marshalLease error = %v, want ErrBounds", err)
+	}
+}
+
 func seedRetirement(t *testing.T, store *memoryStore, client *Client, now time.Time, id coordination.EntityID, state coordination.RetirementState) {
 	t.Helper()
 	value := Retirement{
