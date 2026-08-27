@@ -78,14 +78,16 @@ func TestConditionalWriterAcceptedRejectedAndCleanupErrors(t *testing.T) {
 			var gotDurability ingestclient.Durability
 			writer.write = func(
 				_ context.Context,
-				address, session, tableID string,
+				address, serverLock, tableID string,
 				extent *data.TKeyExtent,
 				mutation *data.TConditionalMutation,
 				durability ingestclient.Durability,
 			) (ingestclient.ConditionalOutcome, error) {
 				gotDurability = durability
-				if address != "ts1:9997" || session != "a" || tableID != "1" {
-					t.Fatalf("route = %q/%q/%q", address, session, tableID)
+				if address != "ts1:9997" ||
+					serverLock != "/accumulo/instance/tservers/default/ts1:9997/zlock#a$0000000001" ||
+					tableID != "1" {
+					t.Fatalf("route = %q/%q/%q", address, serverLock, tableID)
 				}
 				if string(extent.Table) != "1" || mutation.ID == 0 {
 					t.Fatalf("wire identity = %#v, mutation ID %d", extent, mutation.ID)
@@ -209,29 +211,67 @@ func TestConditionalWriterRetriesMalformedAndStaleRouting(t *testing.T) {
 		if locates == 1 {
 			return Tablet{
 				Extent: TabletExtent{TableID: "other"},
-				Server: &TabletServer{HostPort: "old:9997", Session: "old"},
+				Server: &TabletServer{
+					HostPort: "old:9997", Session: "old", ServerLock: "/locks/old$old",
+				},
 			}, nil
 		}
 		return Tablet{
 			Extent: TabletExtent{TableID: "1", EndRow: []byte("k")},
-			Server: &TabletServer{HostPort: "new:9997", Session: "new"},
+			Server: &TabletServer{
+				HostPort: "new:9997", Session: "new", ServerLock: "/locks/new$new",
+			},
 		}, nil
 	}
 	writer.invalidate = func(Table, []byte) error { return nil }
 	writer.write = func(
-		_ context.Context, address, session, tableID string,
+		_ context.Context, address, serverLock, tableID string,
 		_ *data.TKeyExtent, _ *data.TConditionalMutation, _ ingestclient.Durability,
 	) (ingestclient.ConditionalOutcome, error) {
-		if address != "new:9997" || session != "new" || tableID != "1" {
-			t.Fatalf("route = %q/%q/%q", address, session, tableID)
+		if address != "new:9997" || serverLock != "/locks/new$new" || tableID != "1" {
+			t.Fatalf("route = %q/%q/%q", address, serverLock, tableID)
 		}
 		return ingestclient.ConditionalOutcome{
 			Status: ingestclient.ConditionalRejected, Submitted: true,
 		}, nil
 	}
+
 	status, err := writer.Write(context.Background(), testConditionalMutation(t, "a"))
 	if status != ConditionalRejected || err != nil || locates != 2 {
 		t.Fatalf("Write = %s, %v, locates=%d", status, err, locates)
+	}
+}
+
+func TestConditionalWriterMissingServerLockFailsBeforeSubmission(t *testing.T) {
+	writer := newConditionalTestWriter(t, ConditionalWriterOptions{
+		MaxRetries:   1,
+		RetryBackoff: time.Nanosecond,
+	})
+	writer.locate = func(context.Context, Table, []byte) (Tablet, error) {
+		return Tablet{
+			Extent: TabletExtent{TableID: "1", EndRow: []byte("k")},
+			Server: &TabletServer{HostPort: "ts1:9997", Session: "a"},
+		}, nil
+	}
+	writer.invalidate = func(Table, []byte) error { return nil }
+	submissions := 0
+	writer.write = func(
+		context.Context, string, string, string,
+		*data.TKeyExtent, *data.TConditionalMutation, ingestclient.Durability,
+	) (ingestclient.ConditionalOutcome, error) {
+		submissions++
+		return ingestclient.ConditionalOutcome{}, nil
+	}
+	status, err := writer.Write(context.Background(), testConditionalMutation(t, "a"))
+	if status != ConditionalUnknown || !errors.Is(err, ErrUnsupportedOperation) ||
+		!errors.Is(err, ErrConditionalRetryExhausted) {
+		t.Fatalf("Write = %s, %v", status, err)
+	}
+	if submissions != 0 {
+		t.Fatalf("submissions = %d, want 0", submissions)
+	}
+	if errors.Is(err, ErrConditionalUnknown) {
+		t.Fatalf("pre-submission failure marked indeterminate: %v", err)
 	}
 }
 

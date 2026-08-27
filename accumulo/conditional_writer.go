@@ -34,11 +34,15 @@ var (
 )
 
 // ConditionalStatus is the result of one exact-row conditional mutation.
+// ConditionalUnknown is also the zero status returned for errors proven to
+// occur before submission. Only errors.Is(err, ErrConditionalUnknown) means
+// the mutation may have applied and requires authoritative reconciliation.
 type ConditionalStatus uint8
 
 const (
-	// ConditionalUnknown requires authoritative reread and reconciliation.
-	// It must never be blindly retried.
+	// ConditionalUnknown is non-authoritative. For a pre-submission error it
+	// is merely the zero status. If errors.Is(err, ErrConditionalUnknown), the
+	// mutation may have applied and requires authoritative reconciliation.
 	ConditionalUnknown ConditionalStatus = iota
 	ConditionalAccepted
 	ConditionalRejected
@@ -315,8 +319,9 @@ func (c *Connector) NewConditionalWriter(
 
 // Write applies mutation once its conditions are evaluated. Accepted and
 // Rejected remain authoritative even when err reports session cleanup failure.
-// Unknown means the mutation may have taken effect: authoritatively reread and
-// reconcile the row, and never blindly retry the mutation.
+// If status is Unknown and errors.Is(err, ErrConditionalUnknown), the mutation
+// may have taken effect: authoritatively reread and reconcile the row, and
+// never blindly retry it. Other Unknown errors occurred before submission.
 func (w *ConditionalWriter) Write(
 	ctx context.Context,
 	mutation *ConditionalMutation,
@@ -356,7 +361,7 @@ func (w *ConditionalWriter) Write(
 			outcome, writeErr := w.write(
 				ctx,
 				tablet.Server.HostPort,
-				tablet.Server.Session,
+				tablet.Server.ServerLock,
 				table.ID,
 				tabletExtentToThrift(tablet),
 				wire,
@@ -436,6 +441,12 @@ func validateConditionalTablet(table Table, row []byte, tablet Tablet) error {
 	}
 	if tablet.Server == nil || tablet.Server.HostPort == "" || tablet.Server.Session == "" {
 		return fmt.Errorf("%w: table=%s row=%q", ErrTabletNotLocated, table.ID, row)
+	}
+	if tablet.Server.ServerLock == "" {
+		return fmt.Errorf(
+			"%w: table=%s row=%q has no full tablet-server lock identity",
+			ErrUnsupportedOperation, table.ID, row,
+		)
 	}
 	if (tablet.Extent.PrevRow != nil && bytes.Compare(row, tablet.Extent.PrevRow) <= 0) ||
 		(tablet.Extent.EndRow != nil && bytes.Compare(row, tablet.Extent.EndRow) > 0) {

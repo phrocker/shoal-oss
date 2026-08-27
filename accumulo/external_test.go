@@ -253,6 +253,10 @@ func TestPublicConditionalWriterAPICompiles(t *testing.T) {
 	var _ *accumulo.ConditionalMutation = conditional
 	var _ *accumulo.ConditionalWriter
 	var _ accumulo.ConditionalStatus
+	server := accumulo.TabletServer{
+		HostPort: "ts1:9997", Session: "1a2b", ServerLock: "/locks/server$1a2b",
+	}
+	_ = server.ServerLock
 	_ = accumulo.ConditionalUnknown
 	_ = accumulo.ConditionalAccepted
 	_ = accumulo.ConditionalRejected

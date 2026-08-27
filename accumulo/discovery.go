@@ -41,7 +41,10 @@ type TabletExtent struct {
 // TabletServer is a tablet's current server assignment.
 type TabletServer struct {
 	HostPort string
-	Session  string
+	// Session is the current-location metadata qualifier/generation.
+	Session string
+	// ServerLock is the full srv:lock identity returned by conditional sessions.
+	ServerLock string
 }
 
 // Tablet is the public, Go-native discovery view of an Accumulo tablet.
@@ -303,8 +306,9 @@ func publicTablet(tablet metadata.TabletInfo) Tablet {
 	}
 	if tablet.Location != nil {
 		out.Server = &TabletServer{
-			HostPort: tablet.Location.HostPort,
-			Session:  tablet.Location.Session,
+			HostPort:   tablet.Location.HostPort,
+			Session:    tablet.Location.Session,
+			ServerLock: tablet.ServerLock,
 		}
 	}
 	return out

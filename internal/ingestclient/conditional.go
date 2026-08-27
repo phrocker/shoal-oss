@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 
 	"github.com/apache/thrift/lib/go/thrift"
 	clientpkg "github.com/phrocker/shoal-oss/internal/thrift/gen/client"
 	"github.com/phrocker/shoal-oss/internal/thrift/gen/data"
+	"github.com/phrocker/shoal-oss/internal/thrift/gen/security"
 	"github.com/phrocker/shoal-oss/internal/thrift/gen/tabletingest"
 	"github.com/phrocker/shoal-oss/internal/transportpool"
 )
@@ -29,8 +31,46 @@ type ConditionalOutcome struct {
 	Submitted bool
 }
 
-// ConditionalWrite sends one exact-row conditional mutation. Unknown means
-// the caller must reread authoritative state before deciding whether to retry.
+type conditionalRPC interface {
+	StartConditionalUpdate(
+		context.Context,
+		*clientpkg.TInfo,
+		*security.TCredentials,
+		[][]byte,
+		string,
+		tabletingest.TDurability,
+		string,
+	) (*data.TConditionalSession, error)
+	ConditionalUpdate(
+		context.Context,
+		*clientpkg.TInfo,
+		data.UpdateID,
+		data.CMBatch,
+		[]string,
+	) ([]*data.TCMResult_, error)
+	InvalidateConditionalUpdate(
+		context.Context,
+		*clientpkg.TInfo,
+		data.UpdateID,
+	) error
+	CloseConditionalUpdate(
+		context.Context,
+		*clientpkg.TInfo,
+		data.UpdateID,
+	) error
+}
+
+func (p *Pooled) newThriftConditionalRPC(transport io.Closer) (conditionalRPC, error) {
+	rawTransport, ok := transport.(thrift.TTransport)
+	if !ok {
+		return nil, errors.New("ingestclient: conditional lease is not a thrift transport")
+	}
+	return newThriftClient(rawTransport, p.instanceID, p.accumuloVersion), nil
+}
+
+// ConditionalWrite sends one exact-row conditional mutation. This legacy
+// convenience form does not expose whether an Unknown result was submitted;
+// callers needing safe retry classification use ConditionalWriteWithDurability.
 func (p *Pooled) ConditionalWrite(
 	ctx context.Context,
 	address, tableID string,
@@ -47,7 +87,7 @@ func (p *Pooled) ConditionalWrite(
 // and reports whether submission began.
 func (p *Pooled) ConditionalWriteWithDurability(
 	ctx context.Context,
-	address, expectedServerSession, tableID string,
+	address, expectedServerLock, tableID string,
 	extent *data.TKeyExtent,
 	mutation *data.TConditionalMutation,
 	durability Durability,
@@ -76,14 +116,13 @@ func (p *Pooled) ConditionalWriteWithDurability(
 	if err != nil {
 		return ConditionalOutcome{}, err
 	}
-	rawTransport, ok := lease.Transport().(thrift.TTransport)
-	if !ok {
+	thriftClient, err := p.newConditionalClient(lease.Transport())
+	if err != nil {
 		return ConditionalOutcome{}, errors.Join(
-			errors.New("ingestclient: conditional lease is not a thrift transport"),
+			err,
 			lease.Invalidate(),
 		)
 	}
-	thriftClient := newThriftClient(rawTransport, p.instanceID, p.accumuloVersion)
 	session, err := thriftClient.StartConditionalUpdate(
 		ctx, clientpkg.NewTInfo(), credentials, nil, tableID,
 		tabletingest.TDurability(durability), "",
@@ -98,14 +137,14 @@ func (p *Pooled) ConditionalWriteWithDurability(
 			lease.Invalidate(),
 		)
 	}
-	if expectedServerSession != "" && session.TserverLock != expectedServerSession {
+	if expectedServerLock != "" && session.TserverLock != expectedServerLock {
 		_ = thriftClient.InvalidateConditionalUpdate(
 			ctx, clientpkg.NewTInfo(), data.UpdateID(session.SessionId),
 		)
 		return ConditionalOutcome{}, errors.Join(
 			fmt.Errorf(
-				"ingestclient: conditional server session changed: located %q, connected %q",
-				expectedServerSession, session.TserverLock,
+				"ingestclient: conditional server lock changed: located %q, connected %q",
+				expectedServerLock, session.TserverLock,
 			),
 			lease.Invalidate(),
 		)

@@ -303,9 +303,21 @@ func testConnectorWithNamespaceDiscoveryAndState(
 
 func discoveryTablets() []metadata.TabletInfo {
 	return []metadata.TabletInfo{
-		{TableID: "1", EndRow: []byte("k"), Location: &metadata.Location{HostPort: "ts1:9997", Session: "a"}},
-		{TableID: "1", PrevRow: []byte("k"), EndRow: []byte("p"), Location: &metadata.Location{HostPort: "ts2:9997", Session: "b"}},
-		{TableID: "1", PrevRow: []byte("p"), Location: &metadata.Location{HostPort: "ts3:9997", Session: "c"}},
+		{
+			TableID: "1", EndRow: []byte("k"),
+			Location:   &metadata.Location{HostPort: "ts1:9997", Session: "a"},
+			ServerLock: "/accumulo/instance/tservers/default/ts1:9997/zlock#a$0000000001",
+		},
+		{
+			TableID: "1", PrevRow: []byte("k"), EndRow: []byte("p"),
+			Location:   &metadata.Location{HostPort: "ts2:9997", Session: "b"},
+			ServerLock: "/accumulo/instance/tservers/default/ts2:9997/zlock#b$0000000002",
+		},
+		{
+			TableID: "1", PrevRow: []byte("p"),
+			Location:   &metadata.Location{HostPort: "ts3:9997", Session: "c"},
+			ServerLock: "/accumulo/instance/tservers/default/ts3:9997/zlock#c$0000000003",
+		},
 	}
 }
 
@@ -342,6 +354,9 @@ func TestDiscoveryTableLookupAndRouting(t *testing.T) {
 		}
 		if tablet.Server.HostPort != tc.host {
 			t.Fatalf("LocateTablet(%q) host = %q, want %q", tc.row, tablet.Server.HostPort, tc.host)
+		}
+		if tablet.Server.Session == "" || tablet.Server.ServerLock == "" {
+			t.Fatalf("LocateTablet(%q) server identity = %#v", tc.row, tablet.Server)
 		}
 	}
 	if walker.calls != 1 {
