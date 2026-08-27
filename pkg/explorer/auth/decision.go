@@ -155,6 +155,14 @@ func NewDecision(config DecisionConfig) (Decision, error) {
 		); err != nil {
 			return Decision{}, err
 		}
+		for _, operation := range operations {
+			if !config.ServiceRole.Allows(operation) {
+				return Decision{}, shoal.NewError(
+					shoal.ErrorInvalidArgument,
+					"allowed operation exceeds the service role ceiling",
+				)
+			}
+		}
 	}
 
 	return Decision{
@@ -341,12 +349,14 @@ func (d Decision) authorize(
 }
 
 func (d Decision) preflight(operation Operation, now time.Time) (Decision, error) {
-	if operation.Validate() != nil || now.IsZero() {
+	if operation.Validate() != nil || now.IsZero() ||
+		(d.serviceRole != "" && !d.serviceRole.Allows(operation)) {
 		return Decision{}, unauthorized()
 	}
 	cloned, err := d.cloneValidated()
 	if err != nil || !now.Before(cloned.expiresAt) ||
-		!cloned.operationAllowed(operation) {
+		!cloned.operationAllowed(operation) ||
+		(cloned.serviceRole != "" && !cloned.serviceRole.Allows(operation)) {
 		return Decision{}, unauthorized()
 	}
 	return cloned, nil

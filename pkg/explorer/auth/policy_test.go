@@ -306,7 +306,7 @@ func TestScannerCeilingRejectsDisallowedAndMismatchedServiceRoles(t *testing.T) 
 	required := strings.Split(string(encoded), "&")
 
 	writeConfig := baseDecisionConfig()
-	writeConfig.AllowedOperations = []auth.Operation{auth.OperationRead}
+	writeConfig.AllowedOperations = []auth.Operation{auth.OperationIngest}
 	writeConfig.ServiceRole = auth.ServiceRoleDataWrite
 	writeConfig.ServiceCeilingIdentity = "ceiling-write"
 	writeDecision := mustDecision(t, writeConfig)

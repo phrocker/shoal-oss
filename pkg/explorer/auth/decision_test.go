@@ -83,24 +83,151 @@ func TestOperationAndServiceRoleValidation(t *testing.T) {
 		t.Fatalf("unknown operation error = %v", err)
 	}
 
-	roles := []auth.ServiceRole{
-		auth.ServiceRoleDataRead,
-		auth.ServiceRoleDataWrite,
-		auth.ServiceRoleCoordination,
-		auth.ServiceRoleDerivation,
-		auth.ServiceRoleMigration,
-		auth.ServiceRoleSecurityAdmin,
+	matrix := map[auth.ServiceRole]map[auth.Operation]bool{
+		auth.ServiceRoleDataRead: {
+			auth.OperationList:         true,
+			auth.OperationRead:         true,
+			auth.OperationNeighborhood: true,
+			auth.OperationRetrieve:     true,
+			auth.OperationValidate:     true,
+		},
+		auth.ServiceRoleDataWrite: {
+			auth.OperationIngest:   true,
+			auth.OperationConnect:  true,
+			auth.OperationValidate: true,
+		},
+		auth.ServiceRoleCoordination: {
+			auth.OperationValidate: true,
+		},
+		auth.ServiceRoleDerivation: {
+			auth.OperationRead:     true,
+			auth.OperationConnect:  true,
+			auth.OperationValidate: true,
+		},
+		auth.ServiceRoleMigration: {
+			auth.OperationIngest:       true,
+			auth.OperationList:         true,
+			auth.OperationRead:         true,
+			auth.OperationConnect:      true,
+			auth.OperationNeighborhood: true,
+			auth.OperationRetrieve:     true,
+			auth.OperationValidate:     true,
+		},
+		auth.ServiceRoleSecurityAdmin: {
+			auth.OperationValidate: true,
+		},
 	}
-	for _, role := range roles {
+	for role, allowed := range matrix {
 		if err := role.Validate(); err != nil {
 			t.Fatalf("%q.Validate() = %v", role, err)
 		}
+		for _, operation := range operations {
+			if got, want := role.Allows(operation), allowed[operation]; got != want {
+				t.Errorf("%q.Allows(%q) = %t, want %t", role, operation, got, want)
+			}
+		}
+		if role.Allows(auth.Operation("invalid")) {
+			t.Errorf("%q permits an invalid operation", role)
+		}
 	}
-	if auth.ServiceRoleDataRead.Allows(auth.OperationIngest) {
-		t.Fatal("data-read role unexpectedly permits ingest")
+	for _, role := range []auth.ServiceRole{"", "invalid"} {
+		if err := role.Validate(); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
+			t.Errorf("%q.Validate() = %v", role, err)
+		}
+		for _, operation := range operations {
+			if role.Allows(operation) {
+				t.Errorf("%q unexpectedly permits %q", role, operation)
+			}
+		}
 	}
-	if auth.ServiceRoleDataWrite.Allows(auth.OperationRead) {
-		t.Fatal("data-write role unexpectedly permits read")
+}
+
+func TestDecisionEnforcesServiceRoleOperationMatrix(t *testing.T) {
+	operations := []auth.Operation{
+		auth.OperationIngest,
+		auth.OperationList,
+		auth.OperationRead,
+		auth.OperationConnect,
+		auth.OperationNeighborhood,
+		auth.OperationRetrieve,
+		auth.OperationValidate,
+	}
+	matrix := map[auth.ServiceRole]map[auth.Operation]bool{
+		auth.ServiceRoleDataRead: {
+			auth.OperationList:         true,
+			auth.OperationRead:         true,
+			auth.OperationNeighborhood: true,
+			auth.OperationRetrieve:     true,
+			auth.OperationValidate:     true,
+		},
+		auth.ServiceRoleDataWrite: {
+			auth.OperationIngest:   true,
+			auth.OperationConnect:  true,
+			auth.OperationValidate: true,
+		},
+		auth.ServiceRoleCoordination: {
+			auth.OperationValidate: true,
+		},
+		auth.ServiceRoleDerivation: {
+			auth.OperationRead:     true,
+			auth.OperationConnect:  true,
+			auth.OperationValidate: true,
+		},
+		auth.ServiceRoleMigration: {
+			auth.OperationIngest:       true,
+			auth.OperationList:         true,
+			auth.OperationRead:         true,
+			auth.OperationConnect:      true,
+			auth.OperationNeighborhood: true,
+			auth.OperationRetrieve:     true,
+			auth.OperationValidate:     true,
+		},
+		auth.ServiceRoleSecurityAdmin: {
+			auth.OperationValidate: true,
+		},
+	}
+	for role, allowed := range matrix {
+		for _, operation := range operations {
+			config := baseDecisionConfig()
+			config.ServiceRole = role
+			config.ServiceCeilingIdentity = "matrix-ceiling"
+			config.AllowedOperations = []auth.Operation{operation}
+			decision, err := auth.NewDecision(config)
+			if allowed[operation] {
+				if err != nil {
+					t.Errorf("NewDecision(%q, %q) = %v", role, operation, err)
+					continue
+				}
+				resource := auth.ResourceRequest{
+					AuthorizationDomain: []byte("domain-secret"),
+				}
+				if err := decision.Authorize(operation, resource, testNow); err != nil {
+					t.Errorf("Authorize(%q, %q) = %v", role, operation, err)
+				}
+			} else if !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
+				t.Errorf("NewDecision(%q, %q) = %v, want invalid_argument",
+					role, operation, err)
+			}
+		}
+	}
+
+	for _, operation := range operations {
+		config := baseDecisionConfig()
+		config.ServiceRole = ""
+		config.ServiceCeilingIdentity = ""
+		config.AllowedOperations = []auth.Operation{operation}
+		if _, err := auth.NewDecision(config); err != nil {
+			t.Errorf("non-service NewDecision(%q) = %v", operation, err)
+		}
+	}
+
+	invalid := baseDecisionConfig()
+	invalid.ServiceRole = auth.ServiceRole("invalid")
+	invalid.AllowedOperations = []auth.Operation{auth.OperationRead}
+	if _, err := auth.NewDecision(invalid); !shoal.IsErrorCode(
+		err, shoal.ErrorInvalidArgument,
+	) {
+		t.Fatalf("NewDecision(invalid role) = %v", err)
 	}
 }
 
