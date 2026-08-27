@@ -433,6 +433,19 @@ func TestConditionalWriterValidation(t *testing.T) {
 	if _, err := NewConditionalMutation(fullMutation, many...); err == nil {
 		t.Fatal("too many conditions accepted")
 	}
+	largeCondition, err := NewValueCondition(
+		[]byte("cf"), nil, nil, bytes.Repeat([]byte{'v'}, maxConditionalComponentBytes),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	largeConditions := make([]Condition, 17)
+	for index := range largeConditions {
+		largeConditions[index] = largeCondition
+	}
+	if _, err := NewConditionalMutation(fullMutation, largeConditions...); err == nil {
+		t.Fatal("aggregate oversized conditions accepted")
+	}
 
 	connector := testConnectorWithDiscovery(
 		t,

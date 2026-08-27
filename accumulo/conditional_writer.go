@@ -205,7 +205,21 @@ func NewConditionalMutation(
 			maxConditionalComponentBytes,
 		)
 	}
-	if mutationWireSize(wireMutation) > maxConditionalMutationBytes {
+	encodedSize := mutationWireSize(wireMutation)
+	for index, condition := range conditions {
+		wire, conditionErr := condition.toThrift()
+		if conditionErr != nil {
+			return nil, fmt.Errorf("accumulo: condition %d: %w", index, conditionErr)
+		}
+		encodedSize += conditionWireSize(wire)
+		if encodedSize > maxConditionalMutationBytes {
+			return nil, fmt.Errorf(
+				"accumulo: conditional mutation exceeds %d encoded bytes",
+				maxConditionalMutationBytes,
+			)
+		}
+	}
+	if encodedSize > maxConditionalMutationBytes {
 		return nil, fmt.Errorf(
 			"accumulo: conditional mutation exceeds %d encoded bytes",
 			maxConditionalMutationBytes,
@@ -217,12 +231,16 @@ func NewConditionalMutation(
 		conditions: make([]Condition, len(conditions)),
 	}
 	for index, condition := range conditions {
-		if _, err := condition.toThrift(); err != nil {
-			return nil, fmt.Errorf("accumulo: condition %d: %w", index, err)
-		}
 		snapshot.conditions[index] = condition.clone()
 	}
 	return snapshot, nil
+}
+
+func conditionWireSize(condition *data.TCondition) int64 {
+	if condition == nil {
+		return 0
+	}
+	return int64(len(condition.Cf)+len(condition.Cq)+len(condition.Cv)+len(condition.Val)) + 32
 }
 
 // Row returns a defensive copy of the target row.

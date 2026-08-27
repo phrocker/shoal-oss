@@ -205,7 +205,7 @@ func unmarshalRetirement(value []byte) (Retirement, error) {
 	}
 	result.Decision, err = coordination.UnmarshalRetirementDecisionV1(inner)
 	if err != nil || result.Owner.Validate() != nil || result.Fence <= 0 ||
-		result.RetentionGeneration <= 0 || result.RecordGeneration <= 0 {
+		result.RetentionGeneration <= 0 || result.RecordGeneration <= 0 || result.UpdatedAt.IsZero() {
 		return Retirement{}, ErrCorruption
 	}
 	return result, nil
@@ -219,7 +219,10 @@ func marshalAuthority(value Authority) ([]byte, error) {
 	if err := value.Mode.Validate(); err != nil {
 		return nil, err
 	}
-	if value.RecordGeneration != value.Record.Generation || value.UpdatedAt.IsZero() || value.UpdatedAt.Location() != time.UTC {
+	if err := value.RecordGeneration.Validate(); err != nil {
+		return nil, err
+	}
+	if value.UpdatedAt.IsZero() || value.UpdatedAt.Location() != time.UTC {
 		return nil, ErrCorruption
 	}
 	var w writer
@@ -242,7 +245,7 @@ func unmarshalAuthority(value []byte) (Authority, error) {
 		return Authority{}, err
 	}
 	result.Record, err = coordination.UnmarshalWriterAuthorityV1(inner)
-	if err != nil || result.Mode.Validate() != nil || result.RecordGeneration != result.Record.Generation || result.UpdatedAt.IsZero() {
+	if err != nil || result.Mode.Validate() != nil || result.RecordGeneration.Validate() != nil || result.UpdatedAt.IsZero() {
 		return Authority{}, ErrCorruption
 	}
 	return result, nil

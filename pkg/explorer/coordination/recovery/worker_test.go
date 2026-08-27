@@ -20,20 +20,53 @@
 package recovery
 
 import (
+	"bytes"
 	"context"
-	"errors"
+	"sort"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/phrocker/shoal-oss/pkg/explorer/coordination"
+	"github.com/phrocker/shoal-oss/pkg/explorer/coordination/allocator"
 	"github.com/phrocker/shoal-oss/pkg/explorer/coordination/transaction"
 )
 
 type fixedSource []coordination.TXN
 
-func (s fixedSource) Candidates(context.Context, coordination.DomainID, int) ([]coordination.TXN, error) {
-	return s, nil
+func (s fixedSource) Candidates(_ context.Context, _ coordination.DomainID, after []byte, limit int) ([]coordination.TXN, []byte, error) {
+	start := 0
+	if len(after) != 0 {
+		start = int(after[0])
+	}
+	end := min(start+limit, len(s))
+	var next []byte
+	if end < len(s) {
+		next = []byte{byte(end)}
+	}
+	return s[start:end], next, nil
+}
+
+type pageScanner []allocator.Cell
+
+func (s pageScanner) ScanPrefixFrom(
+	_ context.Context,
+	prefix, start, _, _, _ []byte,
+	limit int,
+) ([]allocator.Cell, error) {
+	var result []allocator.Cell
+	for _, cell := range s {
+		if bytes.HasPrefix(cell.Coordinate.Row, prefix) && bytes.Compare(cell.Coordinate.Row, start) >= 0 {
+			result = append(result, cell)
+		}
+	}
+	sort.Slice(result, func(i, j int) bool {
+		return bytes.Compare(result[i].Coordinate.Row, result[j].Coordinate.Row) < 0
+	})
+	if len(result) > limit {
+		result = result[:limit]
+	}
+	return result, nil
 }
 
 type fakeCoordinator struct {
@@ -85,8 +118,11 @@ func TestWorkerBoundsAndAuthoritativeRecheck(t *testing.T) {
 		t.Fatalf("RunOnce = recovered %d, %v", coordinator.recovered, err)
 	}
 	worker.config.Source = fixedSource{coordination.TXN("a"), coordination.TXN("b"), coordination.TXN("c")}
-	if err := worker.RunOnce(context.Background()); !errors.Is(err, transaction.ErrUnavailable) {
-		t.Fatalf("overflow queue = %v", err)
+	if err := worker.RunOnce(context.Background()); err != nil {
+		t.Fatalf("first bounded page = %v", err)
+	}
+	if err := worker.RunOnce(context.Background()); err != nil || coordinator.recovered != 5 {
+		t.Fatalf("second bounded page = recovered %d, %v", coordinator.recovered, err)
 	}
 }
 
@@ -102,6 +138,7 @@ func TestWorkerPoolHonorsConcurrencyCap(t *testing.T) {
 		},
 		recoverLag: time.Millisecond,
 	}
+
 	candidates := make(fixedSource, 24)
 	for i := range candidates {
 		candidates[i] = coordination.TXN{byte(i + 1)}
@@ -122,5 +159,27 @@ func TestWorkerPoolHonorsConcurrencyCap(t *testing.T) {
 	if coordinator.recovered != len(candidates) || coordinator.maxActive > 3 ||
 		coordinator.maxActive < 2 {
 		t.Fatalf("pool recovered=%d maxActive=%d", coordinator.recovered, coordinator.maxActive)
+	}
+}
+
+func TestBandedSourcePaginatesPastCompletedHistory(t *testing.T) {
+	domain := coordination.DomainID("domain")
+	txns := []coordination.TXN{coordination.TXN("a"), coordination.TXN("b"), coordination.TXN("c")}
+	scanner := make(pageScanner, 0, len(txns))
+	for _, txn := range txns {
+		row, err := coordination.TxnRow(domain, txn)
+		if err != nil {
+			t.Fatal(err)
+		}
+		scanner = append(scanner, allocator.Cell{Coordinate: allocator.Coordinate{Row: row}})
+	}
+	source := BandedSource{Scanner: scanner}
+	first, cursor, err := source.Candidates(context.Background(), domain, nil, 2)
+	if err != nil || len(first) != 2 || len(cursor) == 0 {
+		t.Fatalf("first page = %#v, %x, %v", first, cursor, err)
+	}
+	second, next, err := source.Candidates(context.Background(), domain, cursor, 2)
+	if err != nil || len(second) != 1 || len(next) != 0 {
+		t.Fatalf("second page = %#v, %x, %v", second, next, err)
 	}
 }

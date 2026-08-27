@@ -153,6 +153,10 @@ func (c *Client) AcquireAuthority(ctx context.Context, request AuthorityRequest)
 	if err != nil {
 		return Authority{}, err
 	}
+	nextRecordGeneration, err := increment(current.RecordGeneration)
+	if err != nil {
+		return Authority{}, err
+	}
 	nextFence, err := incrementFence(current.Record.Fence)
 	if err != nil {
 		return Authority{}, err
@@ -166,7 +170,7 @@ func (c *Client) AcquireAuthority(ctx context.Context, request AuthorityRequest)
 	}
 	record := coordination.WriterAuthorityV1{Term: term, Generation: nextGeneration, Owner: append(coordination.OwnerID(nil), request.Owner...), LeaseUntil: request.LeaseUntil, Fence: nextFence, State: coordination.AuthorityActive, PredecessorDigest: current.Record.Digest}
 	record.Digest = record.ComputeDigest()
-	next := Authority{Record: record, Mode: request.Mode, RecordGeneration: nextGeneration, UpdatedAt: now}
+	next := Authority{Record: record, Mode: request.Mode, RecordGeneration: nextRecordGeneration, UpdatedAt: now}
 	if err := coordination.ValidateWriterAuthorityAcquisition(&current.Record, next.Record); err != nil {
 		return Authority{}, err
 	}
@@ -238,11 +242,15 @@ func (c *Client) terminalAuthority(ctx context.Context, request AuthorityTransit
 
 func (c *Client) replaceAuthority(ctx context.Context, current Authority, head coordination.AllocatorHeadV1, next Authority) (Authority, error) {
 	if bytes.Equal(next.Record.Term, current.Record.Term) {
-		if next.Record.Generation != current.Record.Generation+1 ||
+		if next.Record.Generation != current.Record.Generation ||
+			next.RecordGeneration != current.RecordGeneration+1 ||
 			!bytes.Equal(next.Record.Owner, current.Record.Owner) ||
 			next.Record.Fence != current.Record.Fence ||
-			next.Record.PredecessorDigest != current.Record.Digest {
+			next.Record.PredecessorDigest != current.Record.PredecessorDigest {
 			return Authority{}, ErrConflict
+		}
+		if err := coordination.ValidateWriterAuthorityTransition(current.Record, next.Record); err != nil {
+			return Authority{}, err
 		}
 	} else if err := coordination.ValidateWriterAuthorityAcquisition(&current.Record, next.Record); err != nil {
 		return Authority{}, err
@@ -290,15 +298,13 @@ func (c *Client) replaceAuthority(ctx context.Context, current Authority, head c
 }
 
 func (c *Client) authoritySuccessor(current Authority, now time.Time, state coordination.AuthorityState) (Authority, error) {
-	generation, err := increment(current.Record.Generation)
+	recordGeneration, err := increment(current.RecordGeneration)
 	if err != nil {
 		return Authority{}, err
 	}
 	next := cloneAuthority(current)
-	next.Record.Generation = generation
-	next.RecordGeneration = generation
+	next.RecordGeneration = recordGeneration
 	next.Record.State = state
-	next.Record.PredecessorDigest = current.Record.Digest
 	next.UpdatedAt = now
 	return next, nil
 }

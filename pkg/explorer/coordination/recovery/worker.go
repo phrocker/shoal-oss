@@ -24,7 +24,6 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"fmt"
 	"sort"
 	"sync"
 	"time"
@@ -35,7 +34,7 @@ import (
 )
 
 type CandidateSource interface {
-	Candidates(context.Context, coordination.DomainID, int) ([]coordination.TXN, error)
+	Candidates(context.Context, coordination.DomainID, []byte, int) ([]coordination.TXN, []byte, error)
 }
 
 type Coordinator interface {
@@ -59,6 +58,8 @@ type Config struct {
 
 type Worker struct {
 	config Config
+	mu     sync.Mutex
+	cursor []byte
 }
 
 func New(config Config) (*Worker, error) {
@@ -100,13 +101,13 @@ func New(config Config) (*Worker, error) {
 }
 
 func (w *Worker) RunOnce(ctx context.Context) error {
-	candidates, err := w.config.Source.Candidates(ctx, w.config.Domain, w.config.Limit+1)
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	candidates, next, err := w.config.Source.Candidates(ctx, w.config.Domain, w.cursor, w.config.Limit)
 	if err != nil {
 		return errors.Join(transaction.ErrUnavailable, err)
 	}
-	if len(candidates) > w.config.Limit {
-		return fmt.Errorf("%w: recovery queue exceeds its configured bound", transaction.ErrUnavailable)
-	}
+	w.cursor = append(w.cursor[:0], next...)
 	sort.Slice(candidates, func(i, j int) bool { return bytes.Compare(candidates[i], candidates[j]) < 0 })
 	workerCount := min(w.config.Concurrency, len(candidates))
 	jobs := make(chan coordination.TXN)
@@ -193,31 +194,44 @@ type BandedSource struct {
 func (s BandedSource) Candidates(
 	ctx context.Context,
 	domain coordination.DomainID,
+	after []byte,
 	limit int,
-) ([]coordination.TXN, error) {
+) ([]coordination.TXN, []byte, error) {
 	if s.Scanner == nil || limit < 1 {
-		return nil, errors.New("explorer recovery: invalid banded source")
+		return nil, nil, errors.New("explorer recovery: invalid banded source")
 	}
 	result := make([]coordination.TXN, 0, limit)
-	for band := 0; band < 256; band++ {
+	startBand := 0
+	if len(after) != 0 {
+		if len(after) < 3 || after[0] != 1 || after[1] != byte(coordination.RowTxn) {
+			return nil, nil, errors.New("explorer recovery: invalid recovery cursor")
+		}
+		startBand = int(after[2])
+	}
+	for band := startBand; band < 256; band++ {
 		prefix := []byte{1, byte(coordination.RowTxn), byte(band)}
 		prefix = append(prefix, coordination.E(domain)...)
+		start := prefix
+		if bytes.HasPrefix(after, prefix) {
+			start = after
+		}
 		cells, err := s.Scanner.ScanPrefixFrom(
-			ctx, prefix, prefix, []byte("s"), []byte("root"), s.ControlVisibility, limit-len(result),
+			ctx, prefix, start, []byte("s"), []byte("root"), s.ControlVisibility, limit-len(result),
 		)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		for _, cell := range cells {
 			parsed, parseErr := coordination.ParseCoordinationRow(cell.Coordinate.Row)
 			if parseErr != nil || parsed.Kind != coordination.RowTxn {
-				return nil, errors.New("explorer recovery: invalid transaction scan row")
+				return nil, nil, errors.New("explorer recovery: invalid transaction scan row")
 			}
 			result = append(result, append(coordination.TXN(nil), parsed.TXN...))
 			if len(result) == limit {
-				return result, nil
+				return result, append(append([]byte(nil), cell.Coordinate.Row...), 0), nil
 			}
 		}
+		after = nil
 	}
-	return result, nil
+	return result, nil, nil
 }

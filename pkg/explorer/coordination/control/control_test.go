@@ -417,7 +417,8 @@ func TestAuthorityMirrorsAndBarrier(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if renewed.Record.Generation != 2 || renewed.Record.Fence != 1 || renewed.Record.PredecessorDigest != a.Record.Digest {
+	if renewed.Record.Generation != a.Record.Generation || renewed.RecordGeneration != a.RecordGeneration+1 ||
+		renewed.Record.Fence != 1 || renewed.Record.PredecessorDigest != a.Record.PredecessorDigest {
 		t.Fatalf("renewed=%+v", renewed)
 	}
 	if _, err = client.RenewAuthority(context.Background(), AuthorityTransition{
@@ -432,7 +433,7 @@ func TestAuthorityMirrorsAndBarrier(t *testing.T) {
 		if string(backend) == "embedded" {
 			state = coordination.BackendPrimary
 		}
-		obs := coordination.BackendObservationV1{Backend: backend, AuthorityGeneration: 2, AuthorityFence: 1, ObservedFrontier: 10, State: state, ObservedDigest: renewed.Record.Digest, ObservedAt: now.Add(time.Second)}
+		obs := coordination.BackendObservationV1{Backend: backend, AuthorityGeneration: renewed.Record.Generation, AuthorityFence: 1, ObservedFrontier: 10, State: state, ObservedDigest: renewed.Record.Digest, ObservedAt: now.Add(time.Second)}
 		if _, err = client.PublishObservation(context.Background(), Observation{Record: obs, Mode: renewed.Mode}); err != nil {
 			t.Fatal(err)
 		}
@@ -443,7 +444,7 @@ func TestAuthorityMirrorsAndBarrier(t *testing.T) {
 	if _, err = (AuthoritySource{Client: client}).Current(context.Background(), coordination.DomainID("domain")); !errors.Is(err, ErrUnavailable) {
 		t.Fatalf("closed-route authority source=%v", err)
 	}
-	if err = r.Open(context.Background(), coordination.DomainID("domain"), renewed.Mode, 2, 1); err != nil {
+	if err = r.Open(context.Background(), coordination.DomainID("domain"), renewed.Mode, renewed.Record.Generation, 1); err != nil {
 		t.Fatal(err)
 	}
 	decision, err := client.RoutingBarrier(context.Background(), now.Add(time.Second))
@@ -461,7 +462,7 @@ func TestAuthorityMirrorsAndBarrier(t *testing.T) {
 		t.Fatalf("current authority=%+v %v", current, err)
 	}
 	stale := decision.Accumulo
-	stale.Record.AuthorityGeneration = 1
+	stale.Record.AuthorityGeneration = renewed.Record.Generation + 1
 	stale.Record.ObservedDigest = digest("stale")
 	stale.RecordGeneration++
 	if _, err = client.PublishObservation(context.Background(), stale); !errors.Is(err, ErrStaleAuthority) {
@@ -471,7 +472,9 @@ func TestAuthorityMirrorsAndBarrier(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if revoked.Record.Generation != 3 || revoked.Record.State != coordination.AuthorityRevoked {
+	if revoked.Record.Generation != renewed.Record.Generation ||
+		revoked.RecordGeneration != renewed.RecordGeneration+1 ||
+		revoked.Record.State != coordination.AuthorityRevoked {
 		t.Fatalf("revoked=%+v", revoked)
 	}
 	client.terms = fixedIDs{term: coordination.AuthorityTerm("term-2")}
@@ -479,7 +482,9 @@ func TestAuthorityMirrorsAndBarrier(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if acquired.Record.Generation != 4 || acquired.Record.Fence != 2 || string(acquired.Record.Term) != "term-2" {
+	if acquired.Record.Generation != renewed.Record.Generation+1 ||
+		acquired.RecordGeneration != revoked.RecordGeneration+1 ||
+		acquired.Record.Fence != 2 || string(acquired.Record.Term) != "term-2" {
 		t.Fatalf("acquired=%+v", acquired)
 	}
 
@@ -683,6 +688,29 @@ func TestMarshalLeaseRejectsOuterBodyAboveDecodeLimit(t *testing.T) {
 	}
 	if _, err := marshalLease(Lease{Record: record, RecordGeneration: 1, UpdatedAt: now}); !errors.Is(err, ErrBounds) {
 		t.Fatalf("marshalLease error = %v, want ErrBounds", err)
+	}
+}
+
+func TestUnmarshalRetirementRejectsZeroUpdatedAt(t *testing.T) {
+	now := time.Date(2026, 8, 27, 19, 0, 0, 0, time.UTC)
+	decision := coordination.RetirementDecisionV1{
+		ObjectKind: coordination.EntityKind("D"), ObjectID: coordination.EntityID("doc"),
+		ObjectGeneration: 1, SafeAfterFrontier: 5, SafeAfterTime: now, HistoryFloor: 1,
+		ProofDigest: digest("proof"), AuthorityGeneration: 1, State: coordination.RetirementCandidate,
+	}
+	inner, err := coordination.MarshalRetirementDecisionV1(decision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var w writer
+	w.bytes(coordination.OwnerID("gc"))
+	w.u64(1)
+	w.u64(1)
+	w.u64(1)
+	w.tm(time.Time{})
+	w.bytes(inner)
+	if _, err := unmarshalRetirement(envelope(kindRetirement, w.b)); !errors.Is(err, ErrCorruption) {
+		t.Fatalf("zero UpdatedAt error = %v", err)
 	}
 }
 
