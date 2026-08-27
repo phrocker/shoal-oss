@@ -1361,7 +1361,11 @@ func valueSatisfiesConstraints(
 			}
 			matched := false
 			for _, allowed := range constraint.AllowedValues() {
-				if allowed.canonical() == value.canonical() {
+				numeric := (allowed.Type() == ValueInteger ||
+					allowed.Type() == ValueNumber) &&
+					(value.Type() == ValueInteger || value.Type() == ValueNumber)
+				if numeric && compareNumericValues(allowed, value) == 0 ||
+					!numeric && allowed.canonical() == value.canonical() {
 					matched = true
 					break
 				}

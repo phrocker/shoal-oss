@@ -33,6 +33,7 @@ func TestUniqueNumberPropertyNormalizesIntegerAndNumberValues(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	property := mustProperty(
 		t, "unique-number", "Unique number", "", ontology.ValueNumber,
 		[]ontology.Constraint{unique}, nil,
@@ -80,5 +81,38 @@ func TestUniqueNumberPropertyNormalizesIntegerAndNumberValues(t *testing.T) {
 		testTime.Add(2*time.Hour), nil,
 	); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
 		t.Fatalf("mixed numeric uniqueness error = %v", err)
+	}
+}
+
+func TestNumberAllowedValuesAcceptEquivalentIntegerAndNumberValues(t *testing.T) {
+	fixture := newOntologyFixture(t)
+	allowed, err := ontology.NewAllowedValuesConstraint(
+		[]ontology.Value{ontology.NewIntegerValue(1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	property := mustProperty(
+		t, "allowed-number", "Allowed number", "", ontology.ValueNumber,
+		[]ontology.Constraint{allowed}, nil,
+	)
+	request := requestWithProperty(
+		t, fixture, property, []ontology.EvidenceRef{fixture.evidence})
+	number, err := ontology.NewNumberValue(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertion, err := ontology.NewAssertion(
+		"entity:one", property.ID(), number, ontology.AssertionExplicit, 1,
+		[]ontology.EvidenceRef{fixture.evidence}, fixture.provenance, nil,
+		ontology.WithAssertionSubjectType(fixture.person.ID()),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ontology.NewExtractionResult(
+		request, []ontology.Assertion{assertion}, nil,
+		testTime.Add(2*time.Hour), nil,
+	); err != nil {
+		t.Fatalf("equivalent numeric allowed value rejected: %v", err)
 	}
 }

@@ -954,12 +954,11 @@ func preflightExtractionRequest(
 	if err := validateBoundedMetadata(provenance.metadata, limits); err != nil {
 		return err
 	}
-	var size = ontologyVersionPayloadBytes(version) +
-		uint64(len(instructions)) + provenancePayloadBytes(provenance) +
-		uint64(len(canonicalMetadata(metadata)))
-	if size > uint64(limits.MaxPayloadBytes) {
-		return invalid("extraction request payload exceeds request limit")
-	}
+	counter := payloadCounter{limit: uint64(limits.MaxPayloadBytes)}
+	counter.addVersion(version)
+	counter.addString(instructions)
+	counter.addProvenance(provenance)
+	counter.addMetadata(metadata)
 	for _, item := range evidence {
 		if uint64(len(item.quote)) > uint64(limits.MaxQuoteBytes) {
 			return invalid("evidence quote exceeds request limit")
@@ -971,10 +970,10 @@ func preflightExtractionRequest(
 		if err := validateBoundedEvidenceMetadata(item, limits); err != nil {
 			return err
 		}
-		size += evidencePayloadBytes(item)
-		if size > uint64(limits.MaxPayloadBytes) {
-			return invalid("extraction request payload exceeds request limit")
-		}
+		counter.addEvidence(item)
+	}
+	if counter.exceeded {
+		return invalid("extraction request payload exceeds request limit")
 	}
 	return nil
 }
@@ -995,24 +994,176 @@ func preflightExtractionResult(
 	if err := validateBoundedMetadata(metadata, limits); err != nil {
 		return err
 	}
-	size := provenancePayloadBytes(request.provenance) +
-		uint64(len(canonicalMetadata(metadata)))
+	counter := payloadCounter{limit: uint64(limits.MaxPayloadBytes)}
+	counter.addProvenance(request.provenance)
+	counter.addMetadata(metadata)
 	for _, assertion := range assertions {
-		size += assertionPayloadBytes(assertion)
-		if size > uint64(limits.MaxPayloadBytes) {
-			return invalid("extraction result payload exceeds result limit")
-		}
+		counter.addAssertion(assertion)
 	}
 	for _, proposal := range proposals {
 		if err := validateBoundedMetadata(proposal.schema.metadata, limits); err != nil {
 			return err
 		}
-		size += proposalPayloadBytes(proposal)
-		if size > uint64(limits.MaxPayloadBytes) {
-			return invalid("extraction result payload exceeds result limit")
-		}
+		counter.addProposal(proposal)
+	}
+	if counter.exceeded {
+		return invalid("extraction result payload exceeds result limit")
 	}
 	return nil
+}
+
+type payloadCounter struct {
+	size     uint64
+	limit    uint64
+	exceeded bool
+}
+
+func (c *payloadCounter) addLength(length int) {
+	if c.exceeded {
+		return
+	}
+	value := uint64(length)
+	if value > c.limit-c.size {
+		c.exceeded = true
+		return
+	}
+	c.size += value
+}
+
+func (c *payloadCounter) addString(value string) {
+	c.addLength(len(value))
+}
+
+func (c *payloadCounter) addMetadata(metadata shoal.Metadata) {
+	for key, value := range metadata {
+		c.addString(key)
+		c.addString(value)
+	}
+}
+
+func (c *payloadCounter) addValue(value Value) {
+	switch value.Type() {
+	case ValueString:
+		text, _ := value.StringValue()
+		c.addString(text)
+	case ValueReference:
+		reference, _ := value.ReferenceValue()
+		c.addString(string(reference))
+	}
+}
+
+func (c *payloadCounter) addVersion(version OntologyVersion) {
+	c.addString(version.schema.key)
+	c.addString(version.schema.name)
+	c.addString(version.schema.description)
+	c.addMetadata(version.schema.metadata)
+	c.addString(version.version)
+	c.addMetadata(version.metadata)
+	for _, concept := range version.concepts {
+		c.addString(string(concept.id))
+		c.addString(concept.key)
+		c.addString(concept.name)
+		c.addString(concept.description)
+		for _, property := range concept.properties {
+			c.addString(string(property))
+		}
+		c.addMetadata(concept.metadata)
+	}
+	for _, relationship := range version.relationships {
+		c.addString(string(relationship.id))
+		c.addString(relationship.key)
+		c.addString(relationship.name)
+		c.addString(relationship.description)
+		for _, concept := range relationship.fromConcepts {
+			c.addString(string(concept))
+		}
+		for _, concept := range relationship.toConcepts {
+			c.addString(string(concept))
+		}
+		for _, property := range relationship.properties {
+			c.addString(string(property))
+		}
+		c.addMetadata(relationship.metadata)
+	}
+	for _, property := range version.properties {
+		c.addString(string(property.id))
+		c.addString(property.key)
+		c.addString(property.name)
+		c.addString(property.description)
+		for _, constraint := range property.constraints {
+			c.addString(constraint.pattern)
+			c.addValue(constraint.value)
+			for _, allowed := range constraint.allowed {
+				c.addValue(allowed)
+			}
+		}
+		c.addMetadata(property.metadata)
+	}
+}
+
+func (c *payloadCounter) addEvidence(evidence EvidenceRef) {
+	c.addString(string(evidence.citation.DocumentID))
+	c.addString(string(evidence.citation.RevisionID))
+	c.addString(string(evidence.citation.SectionID))
+	c.addString(string(evidence.citation.SpanID))
+	c.addString(evidence.quote)
+	c.addMetadata(evidence.metadata)
+	for _, node := range evidence.path.Nodes {
+		c.addString(string(node.ID))
+		c.addString(node.Kind)
+		for _, label := range node.Labels {
+			c.addString(label)
+		}
+		c.addMetadata(node.Properties)
+	}
+	for _, edge := range evidence.path.Edges {
+		c.addString(string(edge.ID))
+		c.addString(string(edge.From))
+		c.addString(string(edge.To))
+		c.addString(edge.Type)
+		c.addMetadata(edge.Properties)
+	}
+}
+
+func (c *payloadCounter) addProvenance(provenance ExtractionProvenance) {
+	c.addString(provenance.provider)
+	c.addString(provenance.model)
+	c.addString(provenance.modelVersion)
+	c.addString(provenance.prompt)
+	c.addString(provenance.promptVersion)
+	c.addString(provenance.extractor)
+	c.addString(provenance.extractorVersion)
+	c.addMetadata(provenance.metadata)
+}
+
+func (c *payloadCounter) addAssertion(assertion Assertion) {
+	c.addString(string(assertion.subject))
+	c.addString(string(assertion.subjectType))
+	c.addString(string(assertion.predicate))
+	c.addString(string(assertion.objectType))
+	c.addValue(assertion.object)
+	c.addProvenance(assertion.provenance)
+	c.addMetadata(assertion.metadata)
+	for _, evidence := range assertion.evidence {
+		c.addEvidence(evidence)
+	}
+}
+
+func (c *payloadCounter) addProposal(proposal GovernedProposal) {
+	c.addString(proposal.schema.key)
+	c.addString(proposal.schema.name)
+	c.addString(proposal.schema.description)
+	c.addMetadata(proposal.schema.metadata)
+	c.addString(string(proposal.baseSchemaID))
+	c.addString(string(proposal.baseVersionID))
+	c.addVersion(proposal.proposedVersion)
+	c.addString(proposal.proposedBy)
+	c.addString(proposal.rationale)
+	c.addMetadata(proposal.metadata)
+	for _, transition := range proposal.transitions {
+		c.addString(transition.actor)
+		c.addString(transition.note)
+	}
 }
 
 func proposalPayloadBytes(proposal GovernedProposal) uint64 {
