@@ -1313,3 +1313,101 @@ func cloneMetadata(value shoal.Metadata) shoal.Metadata {
 	}
 	return cloned
 }
+
+func TestReingestCannotSeizeAnotherPolicysDocument(t *testing.T) {
+	f := newFixture(t)
+	const uri = "file:///contested.txt"
+	owned, err := f.clientA.Ingest(f.admin(t), explorer.Source{
+		URI:       uri,
+		Title:     "Owned",
+		MediaType: explorer.MediaTypeText,
+		Content:   "alpha owned content",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A caller who cannot see the existing document must not learn that the
+	// source URI is taken: the refusal matches an absent document exactly.
+	_, seizeErr := f.clientB.Ingest(f.bob(t), explorer.Source{
+		URI:       uri,
+		Title:     "Seized",
+		MediaType: explorer.MediaTypeText,
+		Content:   "beta seized content",
+	})
+	absentErr := documentError(f.clientB, f.bob(t), owned.Document.ID, owned.Revision.ID)
+	if seizeErr == nil || seizeErr.Error() != absentErr.Error() ||
+		!shoal.IsErrorCode(seizeErr, shoal.ErrorNotFound) {
+		t.Fatalf("hidden seizure error %v differs from absent %v", seizeErr, absentErr)
+	}
+
+	// A caller who can read the document may reclassify it, because that stays
+	// within grants the caller already holds.
+	if _, err := f.clientB.Ingest(f.admin(t), explorer.Source{
+		URI:       uri,
+		Title:     "Reclassified",
+		MediaType: explorer.MediaTypeText,
+		Content:   "gamma reclassified content",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Restore policy A ownership for the remaining assertions.
+	owned, err = f.clientA.Ingest(f.admin(t), explorer.Source{
+		URI:       uri,
+		Title:     "Owned",
+		MediaType: explorer.MediaTypeText,
+		Content:   "alpha owned content again",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The owner keeps the document, its revision, and its rule.
+	summaries, err := f.clientA.Documents(f.alice(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(summaries) != 1 ||
+		summaries[0].Document.ID != owned.Document.ID ||
+		summaries[0].Revision.ID != owned.Revision.ID {
+		t.Fatalf("owner lost the contested document: %#v", summaries)
+	}
+	if _, err := f.clientB.Documents(f.bob(t)); err != nil {
+		t.Fatal(err)
+	}
+
+	// The rightful owner may still publish a new revision.
+	updated, err := f.clientA.Ingest(f.admin(t), explorer.Source{
+		URI:       uri,
+		Title:     "Owned",
+		MediaType: explorer.MediaTypeText,
+		Content:   "alpha owned content revised",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Document.ID != owned.Document.ID ||
+		updated.Revision.ID == owned.Revision.ID {
+		t.Fatalf("owner revision = %#v", updated)
+	}
+
+	// Logical ownership is epoch independent, so a physical generation change
+	// does not block the owner's next revision.
+	f.reader.Set(f.domain, 2)
+	newContext := f.context(t, f.decisionAtGeneration(
+		t,
+		"admin-generation-two",
+		[][]byte{f.sourceA, f.sourceB},
+		[][]byte{f.policyA, f.policyB},
+		allOperations,
+		2,
+	))
+	if _, err := f.clientA.Ingest(newContext, explorer.Source{
+		URI:       uri,
+		Title:     "Owned",
+		MediaType: explorer.MediaTypeText,
+		Content:   "alpha owned content revised again",
+	}); err != nil {
+		t.Fatal(err)
+	}
+}

@@ -121,6 +121,10 @@ func (c *Client) Ingest(
 	if err := guard.Check(ctx); err != nil {
 		return explorer.IngestResult{}, err
 	}
+	if err := c.authorizeExistingSource(
+		ctx, ownedSource.URI, decision, now); err != nil {
+		return explorer.IngestResult{}, err
+	}
 	result, err := c.base.Ingest(ctx, cloneSource(ownedSource))
 	if err != nil {
 		return explorer.IngestResult{}, err
@@ -176,6 +180,58 @@ func (c *Client) Ingest(
 		return explorer.IngestResult{}, err
 	}
 	return cloned, nil
+}
+
+// authorizeExistingSource keeps re-ingesting a known source URI from seizing a
+// document that is already registered under a rule the caller cannot satisfy.
+// The caller must be authorized to ingest under the existing rule, and
+// selectedPolicyRule has already required authorization under the newly
+// selected rule, so a reclassification stays within the caller's own grants.
+// A caller who cannot see the document is refused exactly like an absent one.
+func (c *Client) authorizeExistingSource(
+	ctx context.Context,
+	sourceURI string,
+	decision auth.Decision,
+	now time.Time,
+) error {
+	summaries, err := c.base.Documents(ctx)
+	if err != nil {
+		return err
+	}
+	var documentID shoal.ID
+	found := false
+	for _, summary := range summaries {
+		if summary.SourceURI != sourceURI {
+			continue
+		}
+		if err := validateSummary(summary); err != nil {
+			return inconsistentBase()
+		}
+		if found && summary.Document.ID != documentID {
+			return inconsistentBase()
+		}
+		documentID = summary.Document.ID
+		found = true
+	}
+	if !found {
+		return nil
+	}
+	registration, ok, err := c.policyStore.CurrentRevision(ctx, documentID)
+	if err != nil {
+		return policyCatalogReadError(ctx, err)
+	}
+	if !ok {
+		return nil
+	}
+	allowed, err := ruleAllows(
+		registration.Rule, decision, auth.OperationIngest, now)
+	if err != nil {
+		return err
+	}
+	if !allowed {
+		return auth.ObjectNotFound()
+	}
+	return nil
 }
 
 func (c *Client) begin(

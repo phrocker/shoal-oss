@@ -221,6 +221,12 @@ document/graph relationships that a later storage adapter must persist.
   authorized current-document/node projection before ranking, so hidden
   candidates cannot displace results or influence scores, explanations, or
   limits.
+- Ingesting a source URI that already identifies a registered document
+  requires ingest authorization under that document's current rule. A caller
+  who cannot see the document is refused with the same `not_found` shape as an
+  absent one, so a source URI cannot be probed, seized, or relabeled. A caller
+  the current rule authorizes may reclassify the document, because the newly
+  selected policy must also authorize that same caller.
 - Structured policy labels are canonical lowercase no-padding base32 terms
   for domain, source, policy/epoch, and trusted service role. Callers cannot
   submit visibility expressions. Service-account ceilings intersect required
