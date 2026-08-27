@@ -50,7 +50,7 @@ func fixtureRoot() TxnRootV3 {
 
 func fixtureReservation() ReservationV1 {
 	return ReservationV1{
-		Epoch: 17, TXN: TXN{0, 0xff, 't'}, Owner: OwnerID("owner"),
+		ReservationGeneration: 2, Epoch: 17, TXN: TXN{0, 0xff, 't'}, Owner: OwnerID("owner"),
 		LeaseUntil: time.Date(2026, 8, 27, 13, 59, 20, 123456789, time.UTC),
 		Fence:      4, AuthorityGeneration: 9, State: StateWriting,
 	}
@@ -77,6 +77,32 @@ func fixtureCheckpoint(t *testing.T) FrontierCheckpointV1 {
 		t.Fatal(err)
 	}
 	return value
+}
+
+func TestReservationSuccessorGeneration(t *testing.T) {
+	previous := fixtureReservation()
+	previous.State = StateWriting
+	next := previous
+	next.ReservationGeneration++
+	next.State = StateCommitted
+	if err := ValidateReservationSuccessor(previous, next); err != nil {
+		t.Fatal(err)
+	}
+	next.ReservationGeneration++
+	if err := ValidateReservationSuccessor(previous, next); err == nil {
+		t.Fatal("skipped reservation generation accepted")
+	}
+	next = previous
+	next.ReservationGeneration++
+	next.TXN = TXN("other")
+	if err := ValidateReservationSuccessor(previous, next); err == nil {
+		t.Fatal("changed reservation identity accepted")
+	}
+	previous.ReservationGeneration = Generation(^uint64(0) >> 1)
+	next = previous
+	if err := ValidateReservationSuccessor(previous, next); err == nil {
+		t.Fatal("exhausted reservation generation accepted")
+	}
 }
 
 func golden(t *testing.T, name string, encoded []byte) []byte {

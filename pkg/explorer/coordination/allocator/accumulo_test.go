@@ -57,7 +57,10 @@ func TestAccumuloStoreExactReadUsesTrustedCoordinates(t *testing.T) {
 
 func TestAccumuloStoreMapsAllocatorOperationTimestamps(t *testing.T) {
 	memory := newMemoryStore()
-	client := newTestClient(t, memory, 8)
+	client := newUninitializedClient(t, memory)
+	if _, err := client.EnsureInitialized(context.Background(), initializeOptions(8)); err != nil {
+		t.Fatal(err)
+	}
 	reservation := reserveOne(t, client, "txn")
 	if _, _, err := client.Terminalize(context.Background(), reservation, coordination.StateAborted); err != nil {
 		t.Fatal(err)
@@ -68,8 +71,8 @@ func TestAccumuloStoreMapsAllocatorOperationTimestamps(t *testing.T) {
 	if _, err := client.Retire(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if len(memory.captured) != 5 {
-		t.Fatalf("captured %d mutations, want reserve/terminal/outcome/checkpoint/retire", len(memory.captured))
+	if len(memory.captured) != 6 {
+		t.Fatalf("captured %d mutations, want initialize/reserve/terminal/outcome/checkpoint/retire", len(memory.captured))
 	}
 	tests := []struct {
 		name       string
@@ -80,27 +83,31 @@ func TestAccumuloStoreMapsAllocatorOperationTimestamps(t *testing.T) {
 		}
 		conditionTimestamps map[string]int64
 	}{
-		{"reserve", memory.captured[0], map[string]struct {
+		{"initialize", memory.captured[0], map[string]struct {
+			timestamp int64
+			deleted   bool
+		}{"q/head": {1, false}}, nil},
+		{"reserve", memory.captured[1], map[string]struct {
 			timestamp int64
 			deleted   bool
 		}{"q/head": {2, false}, "r/" + string(coordination.U64(1)): {1, false}}, map[string]int64{"q/head": 1}},
-		{"terminal", memory.captured[1], map[string]struct {
+		{"terminal", memory.captured[2], map[string]struct {
 			timestamp int64
 			deleted   bool
-		}{"r/" + string(coordination.U64(1)): {1, false}}, map[string]int64{"r/" + string(coordination.U64(1)): 1}},
-		{"outcome", memory.captured[2], map[string]struct {
+		}{"r/" + string(coordination.U64(1)): {2, false}}, map[string]int64{"r/" + string(coordination.U64(1)): 1}},
+		{"outcome", memory.captured[3], map[string]struct {
 			timestamp int64
 			deleted   bool
 		}{"o/terminal": {1, false}}, nil},
-		{"checkpoint", memory.captured[3], map[string]struct {
+		{"checkpoint", memory.captured[4], map[string]struct {
 			timestamp int64
 			deleted   bool
 		}{"q/head": {3, false}, "f/*": {1, false}}, map[string]int64{"q/head": 2}},
-		{"retire", memory.captured[4], map[string]struct {
+		{"retire", memory.captured[5], map[string]struct {
 			timestamp int64
 			deleted   bool
-		}{"q/head": {4, false}, "r/" + string(coordination.U64(1)): {1, true}}, map[string]int64{
-			"q/head": 3, "r/" + string(coordination.U64(1)): 1,
+		}{"q/head": {4, false}, "r/" + string(coordination.U64(1)): {2, true}}, map[string]int64{
+			"q/head": 3, "r/" + string(coordination.U64(1)): 2,
 		}},
 	}
 	for _, test := range tests {
@@ -146,6 +153,15 @@ func TestAccumuloStoreMapsAllocatorOperationTimestamps(t *testing.T) {
 				}
 			}
 		})
+	}
+	writer := &fakeAccumuloWriter{
+		status: accumulo.ConditionalUnknown,
+		err:    errors.Join(accumulo.ErrConditionalUnknown, errors.New("initialization response lost")),
+	}
+	store := &AccumuloStore{writer: writer}
+	status, err := store.CompareAndMutate(context.Background(), memory.captured[0])
+	if status != StatusUnknown || !errors.Is(err, ErrConditionalUnknown) {
+		t.Fatalf("initialization unknown mapping = %v, %v", status, err)
 	}
 }
 

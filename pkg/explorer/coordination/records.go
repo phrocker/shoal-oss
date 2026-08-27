@@ -224,16 +224,20 @@ func UnmarshalTxnRootV3(data []byte) (TxnRootV3, error) {
 }
 
 type ReservationV1 struct {
-	Epoch               Epoch
-	TXN                 TXN
-	Owner               OwnerID
-	LeaseUntil          time.Time
-	Fence               Fence
-	AuthorityGeneration Generation
-	State               TxnState
+	ReservationGeneration Generation
+	Epoch                 Epoch
+	TXN                   TXN
+	Owner                 OwnerID
+	LeaseUntil            time.Time
+	Fence                 Fence
+	AuthorityGeneration   Generation
+	State                 TxnState
 }
 
 func (r ReservationV1) Validate() error {
+	if err := r.ReservationGeneration.Validate(); err != nil {
+		return err
+	}
 	if err := r.Epoch.Validate(); err != nil {
 		return err
 	}
@@ -258,7 +262,37 @@ func (r ReservationV1) Validate() error {
 	return nil
 }
 
+func ValidateReservationSuccessor(previous, next ReservationV1) error {
+	if err := previous.Validate(); err != nil {
+		return err
+	}
+	if err := next.Validate(); err != nil {
+		return err
+	}
+	if previous.ReservationGeneration == Generation(math.MaxInt64) {
+		return invalid("reservation generation is exhausted")
+	}
+	if next.ReservationGeneration != previous.ReservationGeneration+1 {
+		return invalid("reservation generation must increase exactly once")
+	}
+	if previous.Epoch != next.Epoch || !bytes.Equal(previous.TXN, next.TXN) ||
+		!bytes.Equal(previous.Owner, next.Owner) || previous.Fence != next.Fence ||
+		previous.AuthorityGeneration != next.AuthorityGeneration {
+		return invalid("reservation identity is immutable")
+	}
+	if previous.State.Terminal() {
+		return invalid("terminal reservation cannot transition")
+	}
+	if !next.State.Terminal() {
+		if err := ValidateTransition(previous.State, next.State); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func encodeReservation(e *encoder, r ReservationV1) {
+	e.u64(uint64(r.ReservationGeneration))
 	e.u64(uint64(r.Epoch))
 	e.bytes("transaction ID", r.TXN)
 	e.bytes("owner", r.Owner)
@@ -284,13 +318,14 @@ func UnmarshalReservationV1(data []byte) (ReservationV1, error) {
 	}
 	d := &decoder{data: payload}
 	r := ReservationV1{
-		Epoch:               Epoch(d.positive("epoch")),
-		TXN:                 TXN(d.bytes("transaction ID", MaxOpaqueIDBytes, true)),
-		Owner:               OwnerID(d.bytes("owner", MaxOwnerBytes, true)),
-		LeaseUntil:          d.timestamp("reservation lease"),
-		Fence:               Fence(d.positive("fence")),
-		AuthorityGeneration: Generation(d.positive("authority generation")),
-		State:               TxnState(d.byte("state")),
+		ReservationGeneration: Generation(d.positive("reservation generation")),
+		Epoch:                 Epoch(d.positive("epoch")),
+		TXN:                   TXN(d.bytes("transaction ID", MaxOpaqueIDBytes, true)),
+		Owner:                 OwnerID(d.bytes("owner", MaxOwnerBytes, true)),
+		LeaseUntil:            d.timestamp("reservation lease"),
+		Fence:                 Fence(d.positive("fence")),
+		AuthorityGeneration:   Generation(d.positive("authority generation")),
+		State:                 TxnState(d.byte("state")),
 	}
 	if d.err != nil {
 		return ReservationV1{}, d.err

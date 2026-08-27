@@ -230,6 +230,15 @@ func testHead(max uint32) coordination.AllocatorHeadV1 {
 
 func newTestClient(t *testing.T, store *memoryStore, max uint32) *Client {
 	t.Helper()
+	client := newUninitializedClient(t, store)
+	head := testHead(max)
+	value, _ := coordination.MarshalAllocatorHeadV1(head)
+	store.put(client.headCoordinate(), value, int64(head.HeadGeneration), false)
+	return client
+}
+
+func newUninitializedClient(t *testing.T, store *memoryStore) *Client {
+	t.Helper()
 	client, err := New(Config{
 		Domain: coordination.DomainID("domain"), ControlVisibility: []byte("CONTROL"), Store: store,
 		Clock:      func() time.Time { return time.Date(2026, 8, 27, 15, 0, 0, 0, time.UTC) },
@@ -238,10 +247,58 @@ func newTestClient(t *testing.T, store *memoryStore, max uint32) *Client {
 	if err != nil {
 		t.Fatal(err)
 	}
-	head := testHead(max)
-	value, _ := coordination.MarshalAllocatorHeadV1(head)
-	store.put(client.headCoordinate(), value, int64(head.HeadGeneration), false)
 	return client
+}
+
+func initializeOptions(max uint32) InitializeOptions {
+	return InitializeOptions{
+		HistoryFloor: 1, RetentionGeneration: 2,
+		Authority: Authority{
+			Generation: 3, Mode: coordination.WriterModeAccumuloPrimary,
+			Holder: coordination.OwnerID("authority"), Fence: 4,
+		},
+		MaxActiveReservations: max,
+	}
+}
+
+func TestEnsureInitializedAcceptedUnknownIdempotentAndConflict(t *testing.T) {
+	for _, faults := range [][]faultMode{nil, {faultUnknownBefore, faultNone}, {faultUnknownAfter}} {
+		store := newMemoryStore()
+		client := newUninitializedClient(t, store)
+		store.faults = faults
+		head, err := client.EnsureInitialized(context.Background(), initializeOptions(8))
+		if err != nil || head.HeadGeneration != 1 || head.NextEpoch != 1 {
+			t.Fatalf("EnsureInitialized faults %v = %#v, %v", faults, head, err)
+		}
+		if len(store.captured[0].Conditions) != 1 || !store.captured[0].Conditions[0].Absent ||
+			len(store.captured[0].Updates) != 1 || store.captured[0].Updates[0].Timestamp != 1 {
+			t.Fatalf("initialization mutation = %#v", store.captured[0])
+		}
+		retry, err := client.Initialize(context.Background(), initializeOptions(8))
+		if err != nil || !allocatorHeadEqual(retry, head) {
+			t.Fatalf("idempotent Initialize = %#v, %v", retry, err)
+		}
+		conflict := initializeOptions(7)
+		if _, err := client.EnsureInitialized(context.Background(), conflict); !errors.Is(err, ErrConflict) {
+			t.Fatalf("conflicting initialization = %v", err)
+		}
+	}
+}
+
+func TestEnsureInitializedRejectsInvalidAndCorruptExisting(t *testing.T) {
+	store := newMemoryStore()
+	client := newUninitializedClient(t, store)
+	options := initializeOptions(8)
+	options.HistoryFloor = 2
+	if _, err := client.EnsureInitialized(context.Background(), options); err == nil {
+		t.Fatal("invalid initial history floor accepted")
+	}
+	head := testHead(8)
+	value, _ := coordination.MarshalAllocatorHeadV1(head)
+	store.put(client.headCoordinate(), value, 2, false)
+	if _, err := client.EnsureInitialized(context.Background(), initializeOptions(8)); !errors.Is(err, ErrCorruption) {
+		t.Fatalf("corrupt existing initialization = %v", err)
+	}
 }
 
 func reserveRequest(head coordination.AllocatorHeadV1, txn string) ReserveRequest {
@@ -382,7 +439,8 @@ func TestTerminalizeCrashBoundariesAndContradictoryOutcome(t *testing.T) {
 			t.Fatalf("Terminalize faults %v = %v %#v %v", faults, completion, outcome, err)
 		}
 		retry, got, err := client.Terminalize(context.Background(), coordination.ReservationV1{
-			Epoch: reservation.Epoch, TXN: reservation.TXN, Owner: reservation.Owner,
+			ReservationGeneration: reservation.ReservationGeneration + 1,
+			Epoch:                 reservation.Epoch, TXN: reservation.TXN, Owner: reservation.Owner,
 			LeaseUntil: reservation.LeaseUntil, Fence: reservation.Fence,
 			AuthorityGeneration: reservation.AuthorityGeneration, State: coordination.StateCommitted,
 		}, coordination.StateCommitted)
@@ -399,6 +457,38 @@ func TestTerminalizeCrashBoundariesAndContradictoryOutcome(t *testing.T) {
 	store.put(client.outcomeCoordinate(reservation.Epoch), value, int64(reservation.Epoch), false)
 	if _, _, err := client.Terminalize(context.Background(), reservation, coordination.StateCommitted); !errors.Is(err, ErrCorruption) {
 		t.Fatalf("contradictory outcome = %v", err)
+	}
+}
+
+func TestTerminalReservationUsesNewGenerationAndRetainedVersions(t *testing.T) {
+	store := newMemoryStore()
+	client := newTestClient(t, store, 8)
+	reservation := reserveOne(t, client, "txn")
+	if reservation.ReservationGeneration != 1 {
+		t.Fatalf("active reservation generation = %d", reservation.ReservationGeneration)
+	}
+	if _, _, err := client.Terminalize(context.Background(), reservation, coordination.StateAborted); err != nil {
+		t.Fatal(err)
+	}
+	terminal, err := client.Reservation(context.Background(), reservation.Epoch)
+	if err != nil || terminal.ReservationGeneration != 2 || terminal.State != coordination.StateAborted {
+		t.Fatalf("terminal reservation = %#v, %v", terminal, err)
+	}
+	versions := store.cells[cellKey(client.reservationCoordinate(reservation.Epoch))]
+	if len(versions) != 2 || versions[0].cell.Timestamp == versions[1].cell.Timestamp {
+		t.Fatalf("retained reservation versions = %#v", versions)
+	}
+}
+
+func TestTerminalizeRejectsReservationGenerationOverflow(t *testing.T) {
+	store := newMemoryStore()
+	client := newTestClient(t, store, 8)
+	reservation := reserveOne(t, client, "txn")
+	reservation.ReservationGeneration = coordination.Generation(^uint64(0) >> 1)
+	value, _ := coordination.MarshalReservationV1(reservation)
+	store.put(client.reservationCoordinate(reservation.Epoch), value, int64(reservation.ReservationGeneration), false)
+	if _, _, err := client.Terminalize(context.Background(), reservation, coordination.StateAborted); !errors.Is(err, ErrOverflow) {
+		t.Fatalf("reservation generation overflow = %v", err)
 	}
 }
 

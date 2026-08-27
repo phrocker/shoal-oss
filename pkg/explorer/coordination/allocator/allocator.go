@@ -128,6 +128,15 @@ type Authority struct {
 	Fence      coordination.Fence
 }
 
+type InitializeOptions struct {
+	HistoryFloor          coordination.Epoch
+	RetentionGeneration   coordination.Generation
+	Authority             Authority
+	MaxActiveReservations uint32
+	ImportPlanDigest      coordination.Digest
+	ImportMaxEpoch        coordination.Epoch
+}
+
 type ReserveRequest struct {
 	Predecessor         coordination.AllocatorHeadV1
 	TXN                 coordination.TXN
@@ -135,6 +144,68 @@ type ReserveRequest struct {
 	LeaseUntil          time.Time
 	Authority           Authority
 	RetentionGeneration coordination.Generation
+}
+
+func (c *Client) EnsureInitialized(ctx context.Context, options InitializeOptions) (coordination.AllocatorHeadV1, error) {
+	options.Authority.Holder = append(coordination.OwnerID(nil), options.Authority.Holder...)
+	head := coordination.AllocatorHeadV1{
+		HeadGeneration: 1, NextEpoch: 1, HistoryFloor: options.HistoryFloor,
+		RetentionGeneration:       options.RetentionGeneration,
+		WriterAuthorityGeneration: options.Authority.Generation,
+		WriterMode:                options.Authority.Mode, WriterHolder: options.Authority.Holder,
+		WriterFence: options.Authority.Fence, MaxActiveReservations: options.MaxActiveReservations,
+		ImportPlanDigest: options.ImportPlanDigest, ImportMaxEpoch: options.ImportMaxEpoch,
+	}
+	if err := head.Validate(); err != nil {
+		return coordination.AllocatorHeadV1{}, err
+	}
+	value, err := coordination.MarshalAllocatorHeadV1(head)
+	if err != nil {
+		return coordination.AllocatorHeadV1{}, err
+	}
+	mutation := Mutation{
+		Row:        c.allocatorRow(),
+		Conditions: []Condition{{Coordinate: c.headCoordinate(), Absent: true}},
+		Updates:    []Update{{Coordinate: c.headCoordinate(), Value: value, Timestamp: int64(head.HeadGeneration)}},
+	}
+	ambiguous := false
+	for attempt := 0; ; attempt++ {
+		status, writeErr := c.store.CompareAndMutate(ctx, mutation)
+		if status == StatusAccepted {
+			return head, nil
+		}
+		if status != StatusRejected && !errors.Is(writeErr, ErrConditionalUnknown) {
+			return coordination.AllocatorHeadV1{}, classifyUnavailable(writeErr)
+		}
+		ambiguous = ambiguous || errors.Is(writeErr, ErrConditionalUnknown)
+		cell, found, readErr := c.readOne(ctx, c.headCoordinate())
+		if readErr != nil {
+			return coordination.AllocatorHeadV1{}, readErr
+		}
+		if found {
+			existing, decodeErr := decodeHeadCell(cell)
+			if decodeErr != nil {
+				return coordination.AllocatorHeadV1{}, decodeErr
+			}
+			if allocatorHeadEqual(existing, head) {
+				return existing, nil
+			}
+			return coordination.AllocatorHeadV1{}, ErrConflict
+		}
+		if attempt >= c.maxRetries {
+			if ambiguous {
+				return coordination.AllocatorHeadV1{}, errors.Join(ErrUnavailable, ErrConditionalUnknown)
+			}
+			return coordination.AllocatorHeadV1{}, ErrUnavailable
+		}
+		if err := c.wait(ctx); err != nil {
+			return coordination.AllocatorHeadV1{}, err
+		}
+	}
+}
+
+func (c *Client) Initialize(ctx context.Context, options InitializeOptions) (coordination.AllocatorHeadV1, error) {
+	return c.EnsureInitialized(ctx, options)
 }
 
 func (c *Client) CurrentHead(ctx context.Context) (coordination.AllocatorHeadV1, error) {
@@ -156,11 +227,7 @@ func (c *Client) Reservation(ctx context.Context, epoch coordination.Epoch) (coo
 	if !found {
 		return coordination.ReservationV1{}, ErrNotFound
 	}
-	value, err := coordination.UnmarshalReservationV1(cell.Value)
-	if err != nil || value.Epoch != epoch || cell.Timestamp != int64(epoch) {
-		return coordination.ReservationV1{}, fmt.Errorf("%w: reservation is invalid", ErrCorruption)
-	}
-	return value, nil
+	return decodeReservationCell(cell, epoch)
 }
 
 func (c *Client) Outcome(ctx context.Context, epoch coordination.Epoch) (coordination.EpochOutcomeV1, error) {
@@ -207,7 +274,7 @@ func (c *Client) Reserve(ctx context.Context, request ReserveRequest) (coordinat
 	}
 	epoch := predecessor.NextEpoch
 	reservation := coordination.ReservationV1{
-		Epoch: epoch, TXN: append(coordination.TXN(nil), request.TXN...),
+		ReservationGeneration: 1, Epoch: epoch, TXN: append(coordination.TXN(nil), request.TXN...),
 		Owner: append(coordination.OwnerID(nil), request.Owner...), LeaseUntil: request.LeaseUntil,
 		Fence: request.Authority.Fence, AuthorityGeneration: request.Authority.Generation,
 		State: coordination.StateEpochReserved,
@@ -244,7 +311,7 @@ func (c *Client) Reserve(ctx context.Context, request ReserveRequest) (coordinat
 		},
 		Updates: []Update{
 			{Coordinate: c.headCoordinate(), Value: nextBytes, Timestamp: int64(next.HeadGeneration)},
-			{Coordinate: c.reservationCoordinate(epoch), Value: reservationBytes, Timestamp: int64(epoch)},
+			{Coordinate: c.reservationCoordinate(epoch), Value: reservationBytes, Timestamp: int64(reservation.ReservationGeneration)},
 		},
 	}
 	for attempt := 0; ; attempt++ {
@@ -297,20 +364,31 @@ func (c *Client) Terminalize(
 		return 0, coordination.EpochOutcomeV1{}, errors.New("allocator: terminal state is required")
 	}
 	terminal := predecessor
-	terminal.State = state
+	if !predecessor.State.Terminal() {
+		if terminal.ReservationGeneration == coordination.Generation(math.MaxInt64) {
+			return 0, coordination.EpochOutcomeV1{}, errors.Join(ErrExhausted, ErrOverflow)
+		}
+		terminal.ReservationGeneration++
+		terminal.State = state
+	}
 	beforeBytes, _ := coordination.MarshalReservationV1(predecessor)
 	terminalBytes, err := coordination.MarshalReservationV1(terminal)
 	if err != nil {
 		return 0, coordination.EpochOutcomeV1{}, err
 	}
 	if !predecessor.State.Terminal() {
+		if err := coordination.ValidateReservationSuccessor(predecessor, terminal); err != nil {
+			return 0, coordination.EpochOutcomeV1{}, fmt.Errorf("%w: invalid reservation successor", ErrCorruption)
+		}
+	}
+	if !predecessor.State.Terminal() {
 		mutation := Mutation{
 			Row: c.allocatorRow(),
 			Conditions: []Condition{{
 				Coordinate: c.reservationCoordinate(predecessor.Epoch), Value: beforeBytes,
-				Timestamp: int64(predecessor.Epoch), TimestampSet: true,
+				Timestamp: int64(predecessor.ReservationGeneration), TimestampSet: true,
 			}},
-			Updates: []Update{{Coordinate: c.reservationCoordinate(predecessor.Epoch), Value: terminalBytes, Timestamp: int64(predecessor.Epoch)}},
+			Updates: []Update{{Coordinate: c.reservationCoordinate(predecessor.Epoch), Value: terminalBytes, Timestamp: int64(terminal.ReservationGeneration)}},
 		}
 		if err := c.applyReservationTransition(ctx, mutation, terminal); err != nil {
 			return 0, coordination.EpochOutcomeV1{}, err
@@ -342,9 +420,8 @@ func (c *Client) applyReservationTransition(ctx context.Context, mutation Mutati
 			if reservationEqual(got, terminal) {
 				return nil
 			}
-			if bytes.Equal(got.TXN, terminal.TXN) && bytes.Equal(got.Owner, terminal.Owner) &&
-				got.Fence == terminal.Fence && got.AuthorityGeneration == terminal.AuthorityGeneration &&
-				got.State == mutationState(mutation.Conditions[0].Value) {
+			expected, expectedErr := coordination.UnmarshalReservationV1(mutation.Conditions[0].Value)
+			if expectedErr == nil && reservationEqual(got, expected) {
 				if attempt >= c.maxRetries {
 					return errors.Join(ErrUnavailable, ErrConditionalUnknown)
 				}
@@ -554,9 +631,9 @@ func (c *Client) Retire(ctx context.Context) (coordination.AllocatorHeadV1, erro
 		coordinate := c.reservationCoordinate(epoch)
 		conditions = append(conditions, Condition{
 			Coordinate: coordinate, Value: value,
-			Timestamp: int64(epoch), TimestampSet: true,
+			Timestamp: int64(reservation.ReservationGeneration), TimestampSet: true,
 		})
-		updates = append(updates, Update{Coordinate: coordinate, Delete: true, Timestamp: int64(epoch)})
+		updates = append(updates, Update{Coordinate: coordinate, Delete: true, Timestamp: int64(reservation.ReservationGeneration)})
 		retired++
 	}
 	if retired == 0 {
@@ -686,14 +763,6 @@ func (c *Client) reconcileAllocation(ctx context.Context, predecessor coordinati
 		return reconcileCorrupt, fmt.Errorf("%w: one-sided allocation state", ErrCorruption)
 	}
 	return reconcileConflict, ErrConflict
-}
-
-func mutationState(value []byte) coordination.TxnState {
-	reservation, err := coordination.UnmarshalReservationV1(value)
-	if err != nil {
-		return coordination.StateAbsent
-	}
-	return reservation.State
 }
 
 func (c *Client) reconcileCheckpoint(ctx context.Context, predecessor coordination.AllocatorHeadV1, checkpoint coordination.FrontierCheckpointV1, history Coordinate) (reconcileDecision, error) {
@@ -885,7 +954,8 @@ func decodeHeadCell(cell Cell) (coordination.AllocatorHeadV1, error) {
 
 func decodeReservationCell(cell Cell, epoch coordination.Epoch) (coordination.ReservationV1, error) {
 	reservation, err := coordination.UnmarshalReservationV1(cell.Value)
-	if err != nil || reservation.Epoch != epoch || cell.Timestamp != int64(epoch) {
+	if err != nil || reservation.Epoch != epoch ||
+		cell.Timestamp != int64(reservation.ReservationGeneration) {
 		return coordination.ReservationV1{}, fmt.Errorf("%w: reservation record and timestamp disagree", ErrCorruption)
 	}
 	return reservation, nil
