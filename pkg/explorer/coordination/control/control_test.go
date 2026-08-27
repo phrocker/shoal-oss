@@ -420,6 +420,13 @@ func TestAuthorityMirrorsAndBarrier(t *testing.T) {
 	if renewed.Record.Generation != 2 || renewed.Record.Fence != 1 || renewed.Record.PredecessorDigest != a.Record.Digest {
 		t.Fatalf("renewed=%+v", renewed)
 	}
+	if _, err = client.RenewAuthority(context.Background(), AuthorityTransition{
+		Owner: renewed.Record.Owner, Term: renewed.Record.Term, Generation: renewed.Record.Generation,
+		Fence: renewed.Record.Fence, Mode: renewed.Mode, LeaseUntil: now.Add(MaxLeaseTTL + time.Hour),
+		Now: now.Add(2 * time.Second),
+	}); !errors.Is(err, ErrBounds) {
+		t.Fatalf("unbounded authority renewal = %v", err)
+	}
 	for _, backend := range []coordination.BackendID{coordination.BackendID("embedded"), coordination.BackendID("accumulo")} {
 		state := coordination.BackendReplica
 		if string(backend) == "embedded" {
@@ -563,7 +570,7 @@ func TestRetirementApprovalAndApplication(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	approved, err := client.ApproveRetirement(context.Background(), RetirementTransition{Kind: 'D', ID: decision.ObjectID, Owner: value.Owner, Fence: 1, RecordGeneration: 1, AuthorityGeneration: 1, RetentionGeneration: 1, HistoryFloor: 5, Now: now.Add(time.Second)})
+	approved, err := client.ApproveRetirement(context.Background(), RetirementTransition{Kind: coordination.EntityKind("D"), ID: decision.ObjectID, Owner: value.Owner, Fence: 1, RecordGeneration: 1, AuthorityGeneration: 1, RetentionGeneration: 1, HistoryFloor: 5, Now: now.Add(time.Second)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -571,7 +578,7 @@ func TestRetirementApprovalAndApplication(t *testing.T) {
 	if _, err = client.AdvanceHistoryFloor(context.Background(), floor, 6, digest("advance"), now.Add(2*time.Second)); err != nil {
 		t.Fatal(err)
 	}
-	applied, err := client.ApplyRetirement(context.Background(), RetirementTransition{Kind: 'D', ID: decision.ObjectID, Owner: value.Owner, Fence: 1, RecordGeneration: approved.RecordGeneration, AuthorityGeneration: 1, RetentionGeneration: 2, HistoryFloor: 6, Now: now.Add(3 * time.Second)}, false)
+	applied, err := client.ApplyRetirement(context.Background(), RetirementTransition{Kind: coordination.EntityKind("D"), ID: decision.ObjectID, Owner: value.Owner, Fence: 1, RecordGeneration: approved.RecordGeneration, AuthorityGeneration: 1, RetentionGeneration: 2, HistoryFloor: 6, Now: now.Add(3 * time.Second)}, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -613,8 +620,8 @@ func retirementRowsInBand(t *testing.T, count int) []coordination.EntityID {
 		if len(byBand[band]) == count {
 			ids := byBand[band]
 			sort.Slice(ids, func(i, j int) bool {
-				left, _ := coordination.RetirementRow(domain, 'D', ids[i])
-				right, _ := coordination.RetirementRow(domain, 'D', ids[j])
+				left, _ := coordination.RetirementRow(domain, coordination.EntityKind("D"), ids[i])
+				right, _ := coordination.RetirementRow(domain, coordination.EntityKind("D"), ids[j])
 				return bytes.Compare(left, right) < 0
 			})
 			return ids
@@ -694,7 +701,7 @@ func seedRetirement(t *testing.T, store *memoryStore, client *Client, now time.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	coordinate, err := client.retirementCoordinate('D', id)
+	coordinate, err := client.retirementCoordinate(coordination.EntityKind("D"), id)
 	if err != nil {
 		t.Fatal(err)
 	}

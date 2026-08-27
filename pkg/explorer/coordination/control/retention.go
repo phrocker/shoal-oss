@@ -222,13 +222,13 @@ func (c *Client) PublishRetirementCandidate(ctx context.Context, request Retirem
 	if err != nil {
 		return Retirement{}, err
 	}
-	coordinate, err := c.retirementCoordinate(kindByte(request.Decision.ObjectKind), request.Decision.ObjectID)
+	coordinate, err := c.retirementCoordinate(request.Decision.ObjectKind, request.Decision.ObjectID)
 	if err != nil {
 		return Retirement{}, err
 	}
 	mutation := allocator.Mutation{Row: coordinate.Row, Conditions: []allocator.Condition{absent(coordinate)}, Updates: []allocator.Update{{Coordinate: coordinate, Value: encoded, Timestamp: 1}}}
 	err = c.mutate(ctx, mutation, func() (bool, error) {
-		got, e := c.Retirement(ctx, kindByte(request.Decision.ObjectKind), request.Decision.ObjectID)
+		got, e := c.Retirement(ctx, request.Decision.ObjectKind, request.Decision.ObjectID)
 		if e != nil {
 			return false, e
 		}
@@ -240,7 +240,7 @@ func (c *Client) PublishRetirementCandidate(ctx context.Context, request Retirem
 	return cloneRetirement(value), nil
 }
 
-func (c *Client) Retirement(ctx context.Context, kind byte, id coordination.EntityID) (Retirement, error) {
+func (c *Client) Retirement(ctx context.Context, kind coordination.EntityKind, id coordination.EntityID) (Retirement, error) {
 	coordinate, err := c.retirementCoordinate(kind, id)
 	if err != nil {
 		return Retirement{}, err
@@ -254,7 +254,7 @@ func (c *Client) Retirement(ctx context.Context, kind byte, id coordination.Enti
 		return Retirement{}, ErrNotFound
 	}
 	value, err := unmarshalRetirement(cell.Value)
-	if err != nil || cell.Timestamp != int64(value.RecordGeneration) || kindByte(value.Decision.ObjectKind) != kind || !bytes.Equal(value.Decision.ObjectID, id) {
+	if err != nil || cell.Timestamp != int64(value.RecordGeneration) || !bytes.Equal(value.Decision.ObjectKind, kind) || !bytes.Equal(value.Decision.ObjectID, id) {
 		return Retirement{}, ErrCorruption
 	}
 	return cloneRetirement(value), nil
@@ -366,10 +366,10 @@ func (c *Client) replaceRetirement(ctx context.Context, current, next Retirement
 	if err != nil {
 		return Retirement{}, err
 	}
-	coordinate, _ := c.retirementCoordinate(kindByte(current.Decision.ObjectKind), current.Decision.ObjectID)
+	coordinate, _ := c.retirementCoordinate(current.Decision.ObjectKind, current.Decision.ObjectID)
 	mutation := allocator.Mutation{Row: coordinate.Row, Conditions: []allocator.Condition{{Coordinate: coordinate, Value: old, Timestamp: int64(current.RecordGeneration), TimestampSet: true}}, Updates: []allocator.Update{{Coordinate: coordinate, Value: encoded, Timestamp: int64(next.RecordGeneration)}}}
 	err = c.mutate(ctx, mutation, func() (bool, error) {
-		got, e := c.Retirement(ctx, kindByte(current.Decision.ObjectKind), current.Decision.ObjectID)
+		got, e := c.Retirement(ctx, current.Decision.ObjectKind, current.Decision.ObjectID)
 		if e != nil {
 			return false, e
 		}
@@ -455,10 +455,4 @@ func retirementEqual(a, b Retirement) bool {
 }
 func retirementBandPrefix(band byte, domain coordination.DomainID) []byte {
 	return append([]byte{1, 'R', band}, coordination.E(domain)...)
-}
-func kindByte(kind coordination.EntityKind) byte {
-	if len(kind) == 1 {
-		return kind[0]
-	}
-	return coordination.B8('X', kind)
 }

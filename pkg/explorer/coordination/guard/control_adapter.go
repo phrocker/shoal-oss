@@ -46,7 +46,7 @@ func (r ControlRetirement) Retired(ctx context.Context, domain coordination.Doma
 	if r.Client == nil || !r.Client.MatchesDomain(domain) {
 		return false, 0, ErrUnavailable
 	}
-	value, err := r.Client.Retirement(ctx, entity.Kind, entity.ID)
+	value, err := r.Client.Retirement(ctx, coordination.EntityKind{entity.Kind}, entity.ID)
 	if errors.Is(err, control.ErrNotFound) {
 		return false, 1, nil
 	}

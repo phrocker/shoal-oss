@@ -340,6 +340,9 @@ func (c *Client) Takeover(
 	if err := utc("takeover lease", leaseUntil); err != nil {
 		return TakeoverResult{}, err
 	}
+	if !leaseUntil.After(now) {
+		return TakeoverResult{}, ErrConflict
+	}
 	if current.Intent.LeaseUntil.After(now) {
 		return TakeoverResult{}, ErrBusy
 	}

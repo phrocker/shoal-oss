@@ -613,6 +613,13 @@ func TestRenewTakeoverAndTerminalOwnerHandling(t *testing.T) {
 	if err != nil || !takeover.TakenOver || takeover.Pending.Generation != renewed.Generation+1 {
 		t.Fatalf("takeover = %#v, %v", takeover, err)
 	}
+	if _, err := client.Takeover(
+		context.Background(), takeover.Pending, coordination.OwnerID("owner-c"),
+		takeover.Pending.Intent.LeaseUntil, takeover.Pending.Intent.Fence+1,
+		takeover.Pending.Intent.LeaseUntil,
+	); !errors.Is(err, ErrConflict) {
+		t.Fatalf("expired replacement lease = %v", err)
+	}
 	if _, err := client.Renew(
 		context.Background(), renewed, expiredAt.Add(2*time.Minute), expiredAt,
 	); !errors.Is(err, ErrExpired) && !errors.Is(err, ErrConflict) {

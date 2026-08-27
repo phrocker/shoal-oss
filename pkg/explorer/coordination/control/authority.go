@@ -191,6 +191,9 @@ func (c *Client) RenewAuthority(ctx context.Context, request AuthorityTransition
 	if request.Mode != current.Mode || !request.LeaseUntil.After(current.Record.LeaseUntil) {
 		return Authority{}, ErrBounds
 	}
+	if err := c.validateLeaseWindow(now, request.LeaseUntil); err != nil {
+		return Authority{}, err
+	}
 	next, err := c.authoritySuccessor(current, now, current.Record.State)
 	if err != nil {
 		return Authority{}, err

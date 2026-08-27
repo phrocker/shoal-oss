@@ -39,13 +39,13 @@ func TestM3CoordinationRowGoldensAndRoundTrips(t *testing.T) {
 	}{
 		{"entity_head_row_v1.bin", func() ([]byte, error) { return EntityHeadRow(domain, 1, EntityID{0, 0xff, 'e'}) }, func(b []byte) (any, error) { return ParseEntityHeadRow(b) }, EntityHeadKey{Domain: domain, Kind: 1, ID: EntityID{0, 0xff, 'e'}}},
 		{"policy_copy_row_v1.bin", func() ([]byte, error) { return PolicyCopyRow(domain, lpart, 4, visibility) }, func(b []byte) (any, error) { return ParsePolicyCopyRow(b) }, PolicyCopyKey{Domain: domain, LPART: lpart, Generation: 4, VisibilityDigest: visibility}},
-		{"policy_copy_map_row_v1.bin", func() ([]byte, error) { return PolicyCopyMapRow(domain, lpart, 8, visibility) }, func(b []byte) (any, error) { return ParsePolicyCopyMapRow(b) }, PolicyCopyKey{Domain: domain, LPART: lpart, Generation: 8, VisibilityDigest: visibility}},
+		{"policy_copy_map_row_v1.bin", func() ([]byte, error) { return PolicyCopyMapRow(domain, lpart, 8, visibility) }, func(b []byte) (any, error) { return ParsePolicyCopyMapRow(b) }, PolicyCopyKey{Domain: domain, LPART: lpart, Generation: 8}},
 		{"policy_generation_row_v1.bin", func() ([]byte, error) { return PolicyGenerationRow(domain, 8) }, func(b []byte) (any, error) { return ParsePolicyGenerationRow(b) }, PolicyGenerationKey{Domain: domain, Generation: 8}},
 		{"index_generation_row_v1.bin", func() ([]byte, error) { return IndexGenerationRow(domain, family, igen) }, func(b []byte) (any, error) { return ParseIndexGenerationRow(b) }, IndexGenerationKey{Domain: domain, Family: family, IGEN: igen}},
 		{"index_delta_row_v1.bin", func() ([]byte, error) { return IndexDeltaRow(domain, family, igen, 13, TXN{0, 0xff, 't'}) }, func(b []byte) (any, error) { return ParseIndexDeltaRow(b) }, IndexDeltaKey{IndexGenerationKey: IndexGenerationKey{Domain: domain, Family: family, IGEN: igen}, Epoch: 13, TXN: TXN{0, 0xff, 't'}}},
-		{"index_activation_row_v1.bin", func() ([]byte, error) { return IndexActivationRow(domain, family, 16, igen) }, func(b []byte) (any, error) { return ParseIndexActivationRow(b) }, IndexActivationKey{Domain: domain, Family: family, ActivationEpoch: 16, IGEN: igen}},
+		{"index_activation_row_v1.bin", func() ([]byte, error) { return IndexActivationRow(domain, family, 16, igen) }, func(b []byte) (any, error) { return ParseIndexActivationRow(b) }, IndexActivationKey{Domain: domain, Family: family, ActivationEpoch: 16}},
 		{"snapshot_lease_row_v1.bin", func() ([]byte, error) { return SnapshotLeaseRow(domain, LeaseID{0, 0xff, 'l'}) }, func(b []byte) (any, error) { return ParseSnapshotLeaseRow(b) }, SnapshotLeaseKey{Domain: domain, Lease: LeaseID{0, 0xff, 'l'}}},
-		{"retirement_row_v1.bin", func() ([]byte, error) { return RetirementRow(domain, 2, EntityID{0, 0xff, 'r'}) }, func(b []byte) (any, error) { return ParseRetirementRow(b) }, RetirementKey{Domain: domain, Kind: 2, ID: EntityID{0, 0xff, 'r'}}},
+		{"retirement_row_v1.bin", func() ([]byte, error) { return RetirementRow(domain, EntityKind{2}, EntityID{0, 0xff, 'r'}) }, func(b []byte) (any, error) { return ParseRetirementRow(b) }, RetirementKey{Domain: domain, Kind: EntityKind{2}, ID: EntityID{0, 0xff, 'r'}}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -91,6 +91,35 @@ func TestM3RowOrderingAndSharedAllocatorRows(t *testing.T) {
 	newActivation, _ := IndexActivationRow(domain, Family("lexical"), 11, IGEN("g2"))
 	if bytes.Compare(newActivation, oldActivation) >= 0 {
 		t.Fatal("newer index activation does not sort first")
+	}
+	sameMap, _ := PolicyCopyMapRow(domain, LPART("part"), 8, testDigest("other"))
+	if !bytes.Equal(newMap, sameMap) {
+		t.Fatal("policy mapping identity includes visibility digest")
+	}
+	sameActivation, _ := IndexActivationRow(domain, Family("lexical"), 11, IGEN("other"))
+	if !bytes.Equal(newActivation, sameActivation) {
+		t.Fatal("index activation identity includes generation")
+	}
+	firstKind := EntityKind("multi-byte-kind")
+	var collidingKind EntityKind
+	for value := 0; value < 10_000; value++ {
+		candidate := EntityKind([]byte{byte(value >> 8), byte(value)})
+		if !bytes.Equal(candidate, firstKind) && B8('X', candidate) == B8('X', firstKind) {
+			collidingKind = candidate
+			break
+		}
+	}
+	if collidingKind == nil {
+		t.Fatal("could not construct legacy retirement-kind hash collision")
+	}
+	firstRetirement, _ := RetirementRow(domain, firstKind, EntityID("same-id"))
+	secondRetirement, _ := RetirementRow(domain, collidingKind, EntityID("same-id"))
+	if bytes.Equal(firstRetirement, secondRetirement) {
+		t.Fatal("retirement row identity loses the full object kind")
+	}
+	parsedRetirement, err := ParseRetirementRow(secondRetirement)
+	if err != nil || !bytes.Equal(parsedRetirement.Kind, collidingKind) {
+		t.Fatalf("retirement kind did not round trip: %#v, %v", parsedRetirement, err)
 	}
 	mapPrefix, _ := PolicyCopyMapPrefix(domain, LPART("part"))
 	if !bytes.HasPrefix(newMap, mapPrefix) {

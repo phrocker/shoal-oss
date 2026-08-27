@@ -191,7 +191,7 @@ func (c *Client) leaseCoordinate(id coordination.LeaseID) (allocator.Coordinate,
 	}
 	return c.coordinate(row, familyLease, qualifierLease), nil
 }
-func (c *Client) retirementCoordinate(kind byte, id coordination.EntityID) (allocator.Coordinate, error) {
+func (c *Client) retirementCoordinate(kind coordination.EntityKind, id coordination.EntityID) (allocator.Coordinate, error) {
 	row, err := coordination.RetirementRow(coordination.DomainID(c.domain), kind, id)
 	if err != nil {
 		return allocator.Coordinate{}, err

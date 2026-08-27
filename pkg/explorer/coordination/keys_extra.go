@@ -151,8 +151,7 @@ func PolicyCopyMapRow(domain DomainID, lpart LPART, generation Generation, visib
 	row := rowPrefix(RowKind('M'), B8('Y', domain, lpart))
 	row = append(row, E(domain)...)
 	row = append(row, E(lpart)...)
-	row = append(row, INV64(uint64(generation))...)
-	return append(row, visibility[:]...), nil
+	return append(row, INV64(uint64(generation))...), nil
 }
 
 func ParsePolicyCopyMapRow(row []byte) (PolicyCopyKey, error) {
@@ -182,7 +181,11 @@ func parsePolicyRow(row []byte, kind byte, inverse bool) (PolicyCopyKey, error) 
 		return PolicyCopyKey{}, err
 	}
 	offset += used
-	if len(row)-offset != 8+sha256Size {
+	expected := 8 + sha256Size
+	if kind == 'M' {
+		expected = 8
+	}
+	if len(row)-offset != expected {
 		return PolicyCopyKey{}, invalid("policy-copy row has malformed components")
 	}
 	raw := binary.BigEndian.Uint64(row[offset : offset+8])
@@ -195,12 +198,16 @@ func parsePolicyRow(row []byte, kind byte, inverse bool) (PolicyCopyKey, error) 
 	result := PolicyCopyKey{
 		Domain: domain, LPART: LPART(lpart), Generation: Generation(raw),
 	}
-	copy(result.VisibilityDigest[:], row[offset+8:])
+	if kind != 'M' {
+		copy(result.VisibilityDigest[:], row[offset+8:])
+	}
 	if err := result.LPART.Validate(); err != nil {
 		return PolicyCopyKey{}, err
 	}
-	if err := result.VisibilityDigest.Validate("visibility digest"); err != nil {
-		return PolicyCopyKey{}, err
+	if kind != 'M' {
+		if err := result.VisibilityDigest.Validate("visibility digest"); err != nil {
+			return PolicyCopyKey{}, err
+		}
 	}
 	if row[2] != B8('Y', result.Domain, result.LPART) {
 		return PolicyCopyKey{}, invalid("policy-copy row partition band mismatch")
@@ -376,8 +383,7 @@ func IndexActivationRow(domain DomainID, family Family, epoch Epoch, igen IGEN) 
 	row := rowPrefix(RowKind('A'), B8('G', domain, family))
 	row = append(row, E(domain)...)
 	row = append(row, E(family)...)
-	row = append(row, INV64(uint64(epoch))...)
-	return append(row, E(igen)...), nil
+	return append(row, INV64(uint64(epoch))...), nil
 }
 
 func IndexActivationPrefix(domain DomainID, family Family) ([]byte, error) {
@@ -413,27 +419,20 @@ func ParseIndexActivationRow(row []byte) (IndexActivationKey, error) {
 		return IndexActivationKey{}, err
 	}
 	offset += used
-	if len(row)-offset < 10 {
+	if len(row)-offset != 8 {
 		return IndexActivationKey{}, invalid("index-activation row is truncated")
 	}
 	value := ^binary.BigEndian.Uint64(row[offset : offset+8])
 	if value == 0 || value > math.MaxInt64 {
 		return IndexActivationKey{}, invalid("index activation epoch is outside the supported range")
 	}
-	igenBytes, used, err := DecodeE(row[offset+8:])
-	if err != nil {
-		return IndexActivationKey{}, err
-	}
 	result := IndexActivationKey{
-		Domain: domain, Family: Family(familyBytes), ActivationEpoch: Epoch(value), IGEN: IGEN(igenBytes),
+		Domain: domain, Family: Family(familyBytes), ActivationEpoch: Epoch(value),
 	}
 	if err := result.Family.Validate(); err != nil {
 		return IndexActivationKey{}, err
 	}
-	if err := result.IGEN.Validate(); err != nil {
-		return IndexActivationKey{}, err
-	}
-	if offset+8+used != len(row) || row[2] != B8('G', domain, result.Family) {
+	if offset+8 != len(row) || row[2] != B8('G', domain, result.Family) {
 		return IndexActivationKey{}, invalid("index-activation row has malformed or trailing components")
 	}
 	return result, nil
@@ -513,23 +512,23 @@ func ParseSnapshotLeaseRow(row []byte) (SnapshotLeaseKey, error) {
 
 type RetirementKey struct {
 	Domain DomainID
-	Kind   byte
+	Kind   EntityKind
 	ID     EntityID
 }
 
-func RetirementRow(domain DomainID, kind byte, id EntityID) ([]byte, error) {
+func RetirementRow(domain DomainID, kind EntityKind, id EntityID) ([]byte, error) {
 	if err := domain.Validate(); err != nil {
 		return nil, err
 	}
-	if kind == 0 {
-		return nil, invalid("retirement kind byte is required")
+	if err := kind.Validate(); err != nil {
+		return nil, err
 	}
 	if err := id.Validate(); err != nil {
 		return nil, err
 	}
-	row := rowPrefix(RowKind('R'), B8('X', domain, []byte{kind}, id))
+	row := rowPrefix(RowKind('R'), B8('X', domain, kind, id))
 	row = append(row, E(domain)...)
-	row = append(row, kind)
+	row = append(row, E(kind)...)
 	return append(row, E(id)...), nil
 }
 
@@ -538,20 +537,24 @@ func ParseRetirementRow(row []byte) (RetirementKey, error) {
 	if err != nil {
 		return RetirementKey{}, err
 	}
-	if offset >= len(row) || row[offset] == 0 {
-		return RetirementKey{}, invalid("retirement kind is missing")
-	}
-	kind := row[offset]
-	id, used, err := DecodeE(row[offset+1:])
+	kind, used, err := DecodeE(row[offset:])
 	if err != nil {
 		return RetirementKey{}, err
 	}
-	result := RetirementKey{Domain: domain, Kind: kind, ID: EntityID(id)}
+	offset += used
+	id, used, err := DecodeE(row[offset:])
+	if err != nil {
+		return RetirementKey{}, err
+	}
+	result := RetirementKey{Domain: domain, Kind: EntityKind(kind), ID: EntityID(id)}
+	if err := result.Kind.Validate(); err != nil {
+		return RetirementKey{}, err
+	}
 	if err := result.ID.Validate(); err != nil {
 		return RetirementKey{}, err
 	}
-	if offset+1+used != len(row) ||
-		row[2] != B8('X', result.Domain, []byte{result.Kind}, result.ID) {
+	if offset+used != len(row) ||
+		row[2] != B8('X', result.Domain, result.Kind, result.ID) {
 		return RetirementKey{}, invalid("retirement row has malformed or trailing components")
 	}
 	return result, nil

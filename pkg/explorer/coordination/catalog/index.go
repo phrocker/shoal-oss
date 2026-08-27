@@ -392,7 +392,7 @@ func (c *Client) LookupIndexGeneration(
 		}
 		activation, decodeErr := coordination.UnmarshalIndexActivationV2(cell.Value)
 		if decodeErr != nil || activation.ActivationEpoch != key.ActivationEpoch ||
-			!bytes.Equal(activation.IGEN, key.IGEN) || cell.Timestamp != int64(activation.ActivationEpoch) {
+			!bytes.Equal(activation.Family, family) || cell.Timestamp != int64(activation.ActivationEpoch) {
 			return IndexPin{}, ErrCorruption
 		}
 		if activation.State != coordination.LifecycleActive {

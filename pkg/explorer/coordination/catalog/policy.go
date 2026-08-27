@@ -544,7 +544,7 @@ func (c *Client) LookupPolicyCopy(ctx context.Context, lpart coordination.LPART,
 		}
 		value, decodeErr := coordination.UnmarshalPolicyCopyMapV3(cell.Value)
 		if decodeErr != nil || value.MapGeneration != key.Generation ||
-			value.VisibilityDigest != key.VisibilityDigest || cell.Timestamp != int64(value.MapGeneration) {
+			!bytes.Equal(value.LPART, lpart) || cell.Timestamp != int64(value.MapGeneration) {
 			return PolicyPin{}, ErrCorruption
 		}
 		if value.State == coordination.CopyStateActive {

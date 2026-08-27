@@ -199,7 +199,7 @@ type RetirementRequest struct {
 }
 
 type RetirementTransition struct {
-	Kind                byte
+	Kind                coordination.EntityKind
 	ID                  coordination.EntityID
 	Owner               coordination.OwnerID
 	Fence               coordination.Fence
