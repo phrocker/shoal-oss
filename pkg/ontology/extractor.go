@@ -543,6 +543,12 @@ func (r ExtractionResult) ValidateFor(request ExtractionRequest) error {
 		subject   shoal.ID
 		predicate shoal.ID
 	}
+	relationshipInstances := make(map[shoal.ID]shoal.ID)
+	for _, assertion := range r.assertions {
+		if IDNamespace(assertion.Predicate()) == "relationship" {
+			relationshipInstances[assertion.ID()] = assertion.Predicate()
+		}
+	}
 	counts := make(map[assertionGroup]uint32)
 	subjects := make(map[shoal.ID]struct{})
 	subjectTypes := make(map[shoal.ID]shoal.ID)
@@ -587,6 +593,10 @@ func (r ExtractionResult) ValidateFor(request ExtractionRequest) error {
 				if _, exists := relationships[subjectType]; !exists {
 					return invalid("assertion subject relationship is not in the ontology")
 				}
+				if instanceType, exists := relationshipInstances[assertion.Subject()]; !exists || instanceType != subjectType {
+					return invalid(
+						"relationship property must target an asserted relationship instance")
+				}
 			} else {
 				return invalid("assertion subject type is not in the ontology")
 			}
@@ -628,6 +638,16 @@ func (r ExtractionResult) ValidateFor(request ExtractionRequest) error {
 				containsID(relationship.fromConcepts, objectType)
 			if !forward && !reverse {
 				return invalid("relationship does not allow the assertion endpoint concepts")
+			}
+			instanceID := assertion.ID()
+			subjects[instanceID] = struct{}{}
+			if existing, exists := subjectTypes[instanceID]; exists {
+				if existing != assertion.Predicate() {
+					return invalid("relationship instance has inconsistent ontology type")
+				}
+			} else {
+				subjectTypes[instanceID] = assertion.Predicate()
+				subjectTypeCounts[assertion.Predicate()]++
 			}
 			objectID, _ := assertion.Object().ReferenceValue()
 			subjects[objectID] = struct{}{}
