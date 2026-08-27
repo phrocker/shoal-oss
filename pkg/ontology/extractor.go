@@ -617,13 +617,17 @@ func (r ExtractionResult) ValidateFor(request ExtractionRequest) error {
 			if assertion.Object().Type() != ValueReference {
 				return invalid("relationship assertion requires a reference object")
 			}
-			if IDNamespace(subjectType) != "concept" ||
-				!containsID(relationship.fromConcepts, subjectType) {
-				return invalid("relationship does not allow the assertion subject concept")
-			}
 			objectType, present := assertion.ObjectType()
-			if !present || !containsID(relationship.toConcepts, objectType) {
-				return invalid("relationship does not allow the assertion object concept")
+			if IDNamespace(subjectType) != "concept" || !present {
+				return invalid("relationship assertion requires concept endpoint types")
+			}
+			forward := containsID(relationship.fromConcepts, subjectType) &&
+				containsID(relationship.toConcepts, objectType)
+			reverse := !relationship.directed &&
+				containsID(relationship.toConcepts, subjectType) &&
+				containsID(relationship.fromConcepts, objectType)
+			if !forward && !reverse {
+				return invalid("relationship does not allow the assertion endpoint concepts")
 			}
 			objectID, _ := assertion.Object().ReferenceValue()
 			subjects[objectID] = struct{}{}
