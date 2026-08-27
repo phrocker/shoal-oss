@@ -1102,9 +1102,14 @@ func (d RelationshipDefinition) clone() RelationshipDefinition {
 }
 
 func (d RelationshipDefinition) canonical() string {
+	fromConcepts := canonicalIDs(d.fromConcepts)
+	toConcepts := canonicalIDs(d.toConcepts)
+	if !d.directed && fromConcepts > toConcepts {
+		fromConcepts, toConcepts = toConcepts, fromConcepts
+	}
 	return canonicalParts(
 		string(d.id), d.key, d.name, d.description,
-		canonicalIDs(d.fromConcepts), canonicalIDs(d.toConcepts),
+		fromConcepts, toConcepts,
 		canonicalIDs(d.properties), strconv.FormatBool(d.directed),
 		canonicalMetadata(d.metadata),
 	)
