@@ -1,0 +1,592 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements. See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership. The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License. You may obtain a copy of the License at
+ *
+ *     https://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied. See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+package authorized
+
+import (
+	"context"
+	"sort"
+	"sync"
+
+	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
+	"github.com/phrocker/shoal-oss/pkg/graph"
+	"github.com/phrocker/shoal-oss/pkg/shoal"
+)
+
+// RevisionRegistration is the immutable policy-catalog record for one exact
+// revision. Current controls an atomic current-node/current-edge projection;
+// it is not part of immutable content equality.
+type RevisionRegistration struct {
+	DocumentID     shoal.ID
+	RevisionID     shoal.ID
+	NodeIDs        []shoal.ID
+	IntrinsicEdges []graph.Edge
+	ContentDigest  auth.Digest
+	Rule           AccessRule
+	Current        bool
+}
+
+// NodeRegistration identifies the current revision and rule owning a node.
+type NodeRegistration struct {
+	DocumentID shoal.ID
+	RevisionID shoal.ID
+	Rule       AccessRule
+}
+
+// EdgeRegistration owns an edge and its rule. DocumentID and RevisionID are
+// set for revision-intrinsic edges and empty for application edges.
+type EdgeRegistration struct {
+	Edge       graph.Edge
+	DocumentID shoal.ID
+	RevisionID shoal.ID
+	Rule       AccessRule
+}
+
+// PolicyStore is the non-durable M2 policy-catalog boundary. Implementations
+// must make each put atomic and return independent values from reads.
+type PolicyStore interface {
+	PutRevision(context.Context, RevisionRegistration) error
+	Revision(context.Context, shoal.ID, shoal.ID) (RevisionRegistration, bool, error)
+	CurrentRevision(context.Context, shoal.ID) (RevisionRegistration, bool, error)
+	Node(context.Context, shoal.ID) (NodeRegistration, bool, error)
+	PutEdge(context.Context, EdgeRegistration) error
+	Edge(context.Context, shoal.ID) (EdgeRegistration, bool, error)
+}
+
+type revisionKey struct {
+	documentID shoal.ID
+	revisionID shoal.ID
+}
+
+// MemoryPolicyStore is a concurrency-safe reference catalog. Reusing the same
+// instance across wrapped-client restarts preserves registrations, but process
+// exit loses them; it is not durable recovery storage.
+type MemoryPolicyStore struct {
+	mu             sync.RWMutex
+	revisions      map[revisionKey]RevisionRegistration
+	revisionIDs    map[shoal.ID]revisionKey
+	current        map[shoal.ID]revisionKey
+	nodes          map[shoal.ID]NodeRegistration
+	intrinsicEdges map[shoal.ID]EdgeRegistration
+	edges          map[shoal.ID]EdgeRegistration
+}
+
+// NewMemoryPolicyStore constructs an empty reference catalog.
+func NewMemoryPolicyStore() *MemoryPolicyStore {
+	return &MemoryPolicyStore{
+		revisions:      make(map[revisionKey]RevisionRegistration),
+		revisionIDs:    make(map[shoal.ID]revisionKey),
+		current:        make(map[shoal.ID]revisionKey),
+		nodes:          make(map[shoal.ID]NodeRegistration),
+		intrinsicEdges: make(map[shoal.ID]EdgeRegistration),
+		edges:          make(map[shoal.ID]EdgeRegistration),
+	}
+}
+
+// PutRevision atomically registers immutable revision content and, when
+// Current is true, replaces that document's current node/edge projection.
+func (s *MemoryPolicyStore) PutRevision(
+	ctx context.Context,
+	registration RevisionRegistration,
+) error {
+	if err := contextFailure(ctx); err != nil {
+		return err
+	}
+	normalized, err := normalizeRevisionRegistration(registration)
+	if err != nil {
+		return err
+	}
+	if s == nil {
+		return catalogUnavailable()
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.initialize()
+	key := revisionKey{
+		documentID: normalized.DocumentID,
+		revisionID: normalized.RevisionID,
+	}
+	if owner, ok := s.revisionIDs[normalized.RevisionID]; ok && owner != key {
+		return catalogConflict()
+	}
+	if existing, ok := s.revisions[key]; ok {
+		if !revisionContentEqual(existing, normalized) {
+			return catalogConflict()
+		}
+		if !normalized.Current {
+			normalized.IntrinsicEdges = cloneRevisionRegistration(existing).IntrinsicEdges
+		} else if len(existing.IntrinsicEdges) > 0 &&
+			!intrinsicEdgesEqual(existing.IntrinsicEdges, normalized.IntrinsicEdges) {
+			return catalogConflict()
+		}
+	}
+	if normalized.Current {
+		for _, nodeID := range normalized.NodeIDs {
+			if owner, ok := s.nodes[nodeID]; ok &&
+				owner.DocumentID != normalized.DocumentID {
+				return catalogConflict()
+			}
+		}
+		for _, edge := range normalized.IntrinsicEdges {
+			if _, custom := s.edges[edge.ID]; custom {
+				return catalogConflict()
+			}
+			if owner, ok := s.intrinsicEdges[edge.ID]; ok &&
+				owner.DocumentID != normalized.DocumentID {
+				return catalogConflict()
+			}
+		}
+	}
+
+	stored := cloneRevisionRegistration(normalized)
+	stored.Current = false
+	s.revisions[key] = stored
+	s.revisionIDs[normalized.RevisionID] = key
+	if normalized.Current {
+		s.replaceCurrent(key, normalized)
+	}
+	return nil
+}
+
+// Revision returns one exact immutable revision registration.
+func (s *MemoryPolicyStore) Revision(
+	ctx context.Context,
+	documentID, revisionID shoal.ID,
+) (RevisionRegistration, bool, error) {
+	if err := contextFailure(ctx); err != nil {
+		return RevisionRegistration{}, false, err
+	}
+	if err := shoal.ValidateRequiredID("document ID", documentID); err != nil {
+		return RevisionRegistration{}, false, err
+	}
+	if err := shoal.ValidateRequiredID("revision ID", revisionID); err != nil {
+		return RevisionRegistration{}, false, err
+	}
+	if s == nil {
+		return RevisionRegistration{}, false, catalogUnavailable()
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	key := revisionKey{documentID: documentID, revisionID: revisionID}
+	registration, ok := s.revisions[key]
+	if !ok {
+		return RevisionRegistration{}, false, nil
+	}
+	cloned := cloneRevisionRegistration(registration)
+	cloned.Current = s.current[documentID] == key
+	return cloned, true, nil
+}
+
+// CurrentRevision returns the exact current registration for a document.
+func (s *MemoryPolicyStore) CurrentRevision(
+	ctx context.Context,
+	documentID shoal.ID,
+) (RevisionRegistration, bool, error) {
+	if err := contextFailure(ctx); err != nil {
+		return RevisionRegistration{}, false, err
+	}
+	if err := shoal.ValidateRequiredID("document ID", documentID); err != nil {
+		return RevisionRegistration{}, false, err
+	}
+	if s == nil {
+		return RevisionRegistration{}, false, catalogUnavailable()
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	key, ok := s.current[documentID]
+	if !ok {
+		return RevisionRegistration{}, false, nil
+	}
+	registration, ok := s.revisions[key]
+	if !ok {
+		return RevisionRegistration{}, false, catalogUnavailable()
+	}
+	cloned := cloneRevisionRegistration(registration)
+	cloned.Current = true
+	return cloned, true, nil
+}
+
+// Node returns the current registration owning a graph node.
+func (s *MemoryPolicyStore) Node(
+	ctx context.Context,
+	nodeID shoal.ID,
+) (NodeRegistration, bool, error) {
+	if err := contextFailure(ctx); err != nil {
+		return NodeRegistration{}, false, err
+	}
+	if err := shoal.ValidateRequiredID("graph node ID", nodeID); err != nil {
+		return NodeRegistration{}, false, err
+	}
+	if s == nil {
+		return NodeRegistration{}, false, catalogUnavailable()
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	registration, ok := s.nodes[nodeID]
+	if !ok {
+		return NodeRegistration{}, false, nil
+	}
+	cloned, err := cloneNodeRegistration(registration)
+	if err != nil {
+		return NodeRegistration{}, false, catalogUnavailable()
+	}
+	return cloned, true, nil
+}
+
+// PutEdge atomically registers an application edge. Identical content and
+// canonical rule are idempotent; identity or policy reuse conflicts.
+func (s *MemoryPolicyStore) PutEdge(
+	ctx context.Context,
+	registration EdgeRegistration,
+) error {
+	if err := contextFailure(ctx); err != nil {
+		return err
+	}
+	normalized, err := normalizeApplicationEdgeRegistration(registration)
+	if err != nil {
+		return err
+	}
+	if s == nil {
+		return catalogUnavailable()
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.initialize()
+	if _, intrinsic := s.intrinsicEdges[normalized.Edge.ID]; intrinsic {
+		return catalogConflict()
+	}
+	if existing, ok := s.edges[normalized.Edge.ID]; ok {
+		if edgeRegistrationsEqual(existing, normalized) {
+			return nil
+		}
+		return catalogConflict()
+	}
+	s.edges[normalized.Edge.ID] = cloneEdgeRegistration(normalized)
+	return nil
+}
+
+// Edge returns a current intrinsic edge or a registered application edge.
+func (s *MemoryPolicyStore) Edge(
+	ctx context.Context,
+	edgeID shoal.ID,
+) (EdgeRegistration, bool, error) {
+	if err := contextFailure(ctx); err != nil {
+		return EdgeRegistration{}, false, err
+	}
+	if err := shoal.ValidateRequiredID("graph edge ID", edgeID); err != nil {
+		return EdgeRegistration{}, false, err
+	}
+	if s == nil {
+		return EdgeRegistration{}, false, catalogUnavailable()
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	registration, ok := s.edges[edgeID]
+	if !ok {
+		registration, ok = s.intrinsicEdges[edgeID]
+	}
+	if !ok {
+		return EdgeRegistration{}, false, nil
+	}
+	cloned, err := cloneEdgeRegistrationChecked(registration)
+	if err != nil {
+		return EdgeRegistration{}, false, catalogUnavailable()
+	}
+	return cloned, true, nil
+}
+
+func (s *MemoryPolicyStore) initialize() {
+	if s.revisions == nil {
+		s.revisions = make(map[revisionKey]RevisionRegistration)
+	}
+	if s.revisionIDs == nil {
+		s.revisionIDs = make(map[shoal.ID]revisionKey)
+	}
+	if s.current == nil {
+		s.current = make(map[shoal.ID]revisionKey)
+	}
+	if s.nodes == nil {
+		s.nodes = make(map[shoal.ID]NodeRegistration)
+	}
+	if s.intrinsicEdges == nil {
+		s.intrinsicEdges = make(map[shoal.ID]EdgeRegistration)
+	}
+	if s.edges == nil {
+		s.edges = make(map[shoal.ID]EdgeRegistration)
+	}
+}
+
+func (s *MemoryPolicyStore) replaceCurrent(
+	key revisionKey,
+	registration RevisionRegistration,
+) {
+	if previousKey, ok := s.current[registration.DocumentID]; ok {
+		if previous, exists := s.revisions[previousKey]; exists {
+			for _, nodeID := range previous.NodeIDs {
+				if owner, present := s.nodes[nodeID]; present &&
+					owner.DocumentID == previous.DocumentID &&
+					owner.RevisionID == previous.RevisionID {
+					delete(s.nodes, nodeID)
+				}
+			}
+			for _, edge := range previous.IntrinsicEdges {
+				if owner, present := s.intrinsicEdges[edge.ID]; present &&
+					owner.DocumentID == previous.DocumentID &&
+					owner.RevisionID == previous.RevisionID {
+					delete(s.intrinsicEdges, edge.ID)
+				}
+			}
+		}
+	}
+	for _, nodeID := range registration.NodeIDs {
+		s.nodes[nodeID] = NodeRegistration{
+			DocumentID: registration.DocumentID,
+			RevisionID: registration.RevisionID,
+			Rule:       mustCloneRule(registration.Rule),
+		}
+	}
+	for _, edge := range registration.IntrinsicEdges {
+		s.intrinsicEdges[edge.ID] = EdgeRegistration{
+			Edge:       cloneGraphEdge(edge),
+			DocumentID: registration.DocumentID,
+			RevisionID: registration.RevisionID,
+			Rule:       mustCloneRule(registration.Rule),
+		}
+	}
+	s.current[registration.DocumentID] = key
+}
+
+func normalizeRevisionRegistration(
+	registration RevisionRegistration,
+) (RevisionRegistration, error) {
+	if err := shoal.ValidateRequiredID(
+		"document ID", registration.DocumentID,
+	); err != nil {
+		return RevisionRegistration{}, err
+	}
+	if err := shoal.ValidateRequiredID(
+		"revision ID", registration.RevisionID,
+	); err != nil {
+		return RevisionRegistration{}, err
+	}
+	rule, err := registration.Rule.clone()
+	if err != nil {
+		return RevisionRegistration{}, err
+	}
+	if registration.ContentDigest == (auth.Digest{}) {
+		return RevisionRegistration{}, shoal.NewError(
+			shoal.ErrorInvalidArgument, "revision content digest is required")
+	}
+	nodeIDs := append([]shoal.ID(nil), registration.NodeIDs...)
+	if len(nodeIDs) == 0 {
+		return RevisionRegistration{}, shoal.NewError(
+			shoal.ErrorInvalidArgument, "revision graph nodes are required")
+	}
+	sort.Slice(nodeIDs, func(left, right int) bool {
+		return shoal.CompareID(nodeIDs[left], nodeIDs[right]) < 0
+	})
+	nodes := make(map[shoal.ID]struct{}, len(nodeIDs))
+	deduplicatedNodes := nodeIDs[:0]
+	for _, nodeID := range nodeIDs {
+		if err := shoal.ValidateRequiredID("graph node ID", nodeID); err != nil {
+			return RevisionRegistration{}, err
+		}
+		if _, duplicate := nodes[nodeID]; duplicate {
+			continue
+		}
+		nodes[nodeID] = struct{}{}
+		deduplicatedNodes = append(deduplicatedNodes, nodeID)
+	}
+	if _, ok := nodes[registration.DocumentID]; !ok {
+		return RevisionRegistration{}, shoal.NewError(
+			shoal.ErrorInvalidArgument, "revision graph lacks its document node")
+	}
+
+	edges := make([]graph.Edge, len(registration.IntrinsicEdges))
+	for index, edge := range registration.IntrinsicEdges {
+		if err := edge.Validate(); err != nil {
+			return RevisionRegistration{}, err
+		}
+		if _, ok := nodes[edge.From]; !ok {
+			return RevisionRegistration{}, shoal.NewError(
+				shoal.ErrorInvalidArgument, "intrinsic edge source is outside the revision")
+		}
+		if _, ok := nodes[edge.To]; !ok {
+			return RevisionRegistration{}, shoal.NewError(
+				shoal.ErrorInvalidArgument, "intrinsic edge target is outside the revision")
+		}
+		edges[index] = cloneGraphEdge(edge)
+	}
+	sort.Slice(edges, func(left, right int) bool {
+		return shoal.CompareID(edges[left].ID, edges[right].ID) < 0
+	})
+	deduplicatedEdges := edges[:0]
+	for _, edge := range edges {
+		if len(deduplicatedEdges) > 0 &&
+			deduplicatedEdges[len(deduplicatedEdges)-1].ID == edge.ID {
+			if !graphEdgesEqual(deduplicatedEdges[len(deduplicatedEdges)-1], edge) {
+				return RevisionRegistration{}, shoal.NewError(
+					shoal.ErrorInvalidArgument,
+					"revision graph reuses an edge identity",
+				)
+			}
+			continue
+		}
+		deduplicatedEdges = append(deduplicatedEdges, edge)
+	}
+	return RevisionRegistration{
+		DocumentID:     registration.DocumentID,
+		RevisionID:     registration.RevisionID,
+		NodeIDs:        deduplicatedNodes,
+		IntrinsicEdges: deduplicatedEdges,
+		ContentDigest:  registration.ContentDigest,
+		Rule:           rule,
+		Current:        registration.Current,
+	}, nil
+}
+
+func normalizeApplicationEdgeRegistration(
+	registration EdgeRegistration,
+) (EdgeRegistration, error) {
+	if err := registration.Edge.Validate(); err != nil {
+		return EdgeRegistration{}, err
+	}
+	rule, err := registration.Rule.clone()
+	if err != nil {
+		return EdgeRegistration{}, err
+	}
+	return EdgeRegistration{Edge: cloneGraphEdge(registration.Edge), Rule: rule}, nil
+}
+
+func revisionContentEqual(left, right RevisionRegistration) bool {
+	if left.DocumentID != right.DocumentID ||
+		left.RevisionID != right.RevisionID ||
+		left.ContentDigest != right.ContentDigest ||
+		!left.Rule.equal(right.Rule) ||
+		len(left.NodeIDs) != len(right.NodeIDs) {
+		return false
+	}
+	for index := range left.NodeIDs {
+		if left.NodeIDs[index] != right.NodeIDs[index] {
+			return false
+		}
+	}
+	return true
+}
+
+func intrinsicEdgesEqual(left, right []graph.Edge) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if !graphEdgesEqual(left[index], right[index]) {
+			return false
+		}
+	}
+	return true
+}
+
+func edgeRegistrationsEqual(left, right EdgeRegistration) bool {
+	return graphEdgesEqual(left.Edge, right.Edge) &&
+		left.DocumentID == right.DocumentID &&
+		left.RevisionID == right.RevisionID &&
+		left.Rule.equal(right.Rule)
+}
+
+func cloneRevisionRegistration(
+	registration RevisionRegistration,
+) RevisionRegistration {
+	cloned := registration
+	cloned.NodeIDs = append([]shoal.ID(nil), registration.NodeIDs...)
+	cloned.IntrinsicEdges = make([]graph.Edge, len(registration.IntrinsicEdges))
+	for index, edge := range registration.IntrinsicEdges {
+		cloned.IntrinsicEdges[index] = cloneGraphEdge(edge)
+	}
+	cloned.Rule = mustCloneRule(registration.Rule)
+	return cloned
+}
+
+func cloneNodeRegistration(
+	registration NodeRegistration,
+) (NodeRegistration, error) {
+	rule, err := registration.Rule.clone()
+	if err != nil {
+		return NodeRegistration{}, err
+	}
+	registration.Rule = rule
+	return registration, nil
+}
+
+func cloneEdgeRegistration(
+	registration EdgeRegistration,
+) EdgeRegistration {
+	cloned, _ := cloneEdgeRegistrationChecked(registration)
+	return cloned
+}
+
+func cloneEdgeRegistrationChecked(
+	registration EdgeRegistration,
+) (EdgeRegistration, error) {
+	rule, err := registration.Rule.clone()
+	if err != nil {
+		return EdgeRegistration{}, err
+	}
+	registration.Edge = cloneGraphEdge(registration.Edge)
+	registration.Rule = rule
+	return registration, nil
+}
+
+func cloneGraphEdge(edge graph.Edge) graph.Edge {
+	edge.Properties = cloneMetadata(edge.Properties)
+	return edge
+}
+
+func graphEdgesEqual(left, right graph.Edge) bool {
+	if left.ID != right.ID || left.From != right.From || left.To != right.To ||
+		left.Type != right.Type || left.Weight != right.Weight ||
+		len(left.Properties) != len(right.Properties) {
+		return false
+	}
+	for key, value := range left.Properties {
+		if right.Properties[key] != value {
+			return false
+		}
+	}
+	return true
+}
+
+func mustCloneRule(rule AccessRule) AccessRule {
+	cloned, err := rule.clone()
+	if err != nil {
+		return AccessRule{}
+	}
+	return cloned
+}
+
+func catalogConflict() error {
+	return shoal.NewError(shoal.ErrorConflict, "authorization policy catalog conflict")
+}
+
+func catalogUnavailable() error {
+	return shoal.NewError(
+		shoal.ErrorUnavailable, "authorization policy catalog unavailable")
+}
+
+var _ PolicyStore = (*MemoryPolicyStore)(nil)
