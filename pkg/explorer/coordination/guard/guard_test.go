@@ -459,6 +459,91 @@ func TestAtomicCreateReuseAppendAndConflicts(t *testing.T) {
 	}
 }
 
+func TestReuseCommitIsIdempotentAndRejectsChangedHead(t *testing.T) {
+	store := newMemoryStore()
+	client, _, _ := newClient(t, store)
+	ctx := context.Background()
+
+	createIntent := testIntent("reuse-retry", "txn-create", "owner-create", ModeAbsentOrIdentical)
+	create, err := client.Acquire(ctx, createIntent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	originalHead := commitAcquisition(t, client, create, 40)
+
+	reuseIntent := testIntent("reuse-retry", "txn-reuse-one", "owner-reuse-one", ModeAbsentOrIdentical)
+	reuse, err := client.Acquire(ctx, reuseIntent)
+	if err != nil || reuse.Decision != DecisionReuse {
+		t.Fatalf("first reuse acquisition = %#v, %v", reuse, err)
+	}
+	reusePublished := published(reuse.Pending.Intent, 41)
+	prepared, err := client.Prepare(ctx, reuse.Pending, reusePublished, testNow.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := client.Commit(ctx, prepared, reusePublished, testNow.Add(2*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := client.Commit(ctx, prepared, reusePublished, testNow.Add(3*time.Second))
+	if err != nil {
+		t.Fatalf("second reuse commit failed: %v", err)
+	}
+	if !headEqual(first, originalHead) || !headEqual(second, originalHead) {
+		t.Fatal("repeated reuse commit did not return the preserved canonical head")
+	}
+
+	reuseAgainIntent := testIntent("reuse-retry", "txn-reuse-two", "owner-reuse-two", ModeAbsentOrIdentical)
+	reuseAgain, err := client.Acquire(ctx, reuseAgainIntent)
+	if err != nil || reuseAgain.Decision != DecisionReuse {
+		t.Fatalf("second reuse acquisition = %#v, %v", reuseAgain, err)
+	}
+	reuseAgainPublished := published(reuseAgain.Pending.Intent, 42)
+	preparedAgain, err := client.Prepare(
+		ctx, reuseAgain.Pending, reuseAgainPublished, testNow.Add(4*time.Second),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.faults = []fault{unknownAfter}
+	unknownResult, err := client.Commit(
+		ctx, preparedAgain, reuseAgainPublished, testNow.Add(5*time.Second),
+	)
+	if err != nil {
+		t.Fatalf("unknown-after reuse commit did not reconcile: %v", err)
+	}
+	if !headEqual(unknownResult, originalHead) {
+		t.Fatal("unknown-after reuse commit did not return the preserved head")
+	}
+
+	changed := cloneHead(originalHead)
+	changed.Generation++
+	changed.UpdatedAt = testNow.Add(6 * time.Second)
+	changed.Epoch++
+	changed.TXN = coordination.TXN("different-canonical-txn")
+	changed.LogicalDigest = digest("changed-logical-state")
+	row, _ := coordination.EntityHeadRow(
+		coordination.DomainID("domain"),
+		reuseAgain.Pending.Intent.Entity.Kind,
+		reuseAgain.Pending.Intent.Entity.ID,
+	)
+	headBytes, err := MarshalHead(changed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.mu.Lock()
+	store.put(allocator.Update{
+		Coordinate: client.coordinate(row, qualifierHead),
+		Value:      headBytes, Timestamp: int64(changed.Generation),
+	})
+	store.mu.Unlock()
+	if _, err := client.Commit(
+		ctx, preparedAgain, reuseAgainPublished, testNow.Add(7*time.Second),
+	); !errors.Is(err, ErrConflict) && !errors.Is(err, ErrCorruption) {
+		t.Fatalf("changed head accepted by reuse retry: %v", err)
+	}
+}
+
 func TestAcquireManyOrdersDeduplicatesAndRollsBack(t *testing.T) {
 	store := newMemoryStore()
 	client, _, _ := newClient(t, store)

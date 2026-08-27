@@ -131,7 +131,7 @@ func (c *Client) Acquire(ctx context.Context, intent Intent) (Acquisition, error
 			return Acquisition{}, err
 		}
 		if previousPending != nil && previousPending.Active {
-			if sameIntent(previousPending.Intent, intent) {
+			if sameAcquisitionIntent(*previousPending, intent) {
 				return Acquisition{
 					Entity: intent.Entity, Decision: previousPending.Decision,
 					Pending: clonePending(*previousPending), Head: cloneHeadPtr(head),
@@ -146,13 +146,18 @@ func (c *Client) Acquire(ctx context.Context, intent Intent) (Acquisition, error
 		if err != nil {
 			return Acquisition{}, err
 		}
+		storedIntent := cloneIntent(intent)
+		if decision == DecisionReuse {
+			storedIntent.ExpectedEpoch = head.Epoch
+			storedIntent.ExpectedDigest = head.LogicalDigest
+		}
 		generation, err := nextGeneration(headGeneration(head), pendingGeneration(previousPending))
 		if err != nil {
 			return Acquisition{}, err
 		}
 		pending := Pending{
 			Generation: generation, UpdatedAt: c.clock().UTC(), Active: true,
-			Decision: decision, Intent: cloneIntent(intent),
+			Decision: decision, Intent: storedIntent,
 		}
 		if err := pending.Validate(); err != nil {
 			return Acquisition{}, err
@@ -429,15 +434,19 @@ func (c *Client) Commit(ctx context.Context, current Pending, published Publishe
 		return Head{}, err
 	}
 	if actual == nil || !pendingEqual(*actual, current) {
-		if head != nil && headMatchesPublished(*head, published) && (actual == nil || !actual.Active) {
+		if current.Decision == DecisionReuse && head != nil &&
+			reuseHeadMatchesIntent(*head, current.Intent) &&
+			(actual == nil || !actual.Active) {
+			return cloneHead(*head), nil
+		}
+		if current.Decision != DecisionReuse && head != nil &&
+			headMatchesPublished(*head, published) && (actual == nil || !actual.Active) {
 			return cloneHead(*head), nil
 		}
 		return Head{}, ErrConflict
 	}
 	if current.Decision == DecisionReuse {
-		if head == nil || head.State != StateLive || head.LogicalDigest != current.Intent.DesiredDigest ||
-			!bytes.Equal(head.LPART, current.Intent.LPART) ||
-			!bytes.Equal(head.LogicalPolicyID, current.Intent.LogicalPolicyID) {
+		if head == nil || !reuseHeadMatchesIntent(*head, current.Intent) {
 			return Head{}, ErrCorruption
 		}
 		released, err := releasedPending(current, now, head.Generation)
@@ -845,6 +854,24 @@ func headMatchesPublished(head Head, published Published) bool {
 		bytes.Equal(head.WinnerID, published.WinnerID) &&
 		bytes.Equal(head.LPART, published.LPART) &&
 		bytes.Equal(head.LogicalPolicyID, published.LogicalPolicyID)
+}
+
+func reuseHeadMatchesIntent(head Head, intent Intent) bool {
+	return head.State == StateLive && head.Epoch == intent.ExpectedEpoch &&
+		head.LogicalDigest == intent.DesiredDigest &&
+		head.LogicalDigest == intent.ExpectedDigest &&
+		bytes.Equal(head.WinnerID, intent.DesiredWinnerID) &&
+		bytes.Equal(head.LPART, intent.LPART) &&
+		bytes.Equal(head.LogicalPolicyID, intent.LogicalPolicyID)
+}
+
+func sameAcquisitionIntent(pending Pending, intent Intent) bool {
+	stored := cloneIntent(pending.Intent)
+	if pending.Decision == DecisionReuse && intent.Mode == ModeAbsentOrIdentical {
+		stored.ExpectedEpoch = intent.ExpectedEpoch
+		stored.ExpectedDigest = intent.ExpectedDigest
+	}
+	return sameIntent(stored, intent)
 }
 
 func cloneHead(value Head) Head {
