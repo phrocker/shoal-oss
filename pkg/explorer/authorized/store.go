@@ -86,7 +86,10 @@ type SourcePolicyClaim struct {
 // until it is committed, pended, or rolled back. For the exact token returned
 // by a successful CAS, each finalizer must be local, atomic, idempotent for the
 // same outcome, and infallible; errors indicate invalid tokens or store
-// invariant violations. Fallible durable coordination belongs to M3.
+// invariant violations. That token is a capability: SourceClaim must return
+// only observable claim state and never a value a finalizer would accept, so
+// that reading a claim cannot finalize one. Fallible durable coordination
+// belongs to M3.
 type PolicyStore interface {
 	SourceClaim(context.Context, string) (SourcePolicyClaim, bool, error)
 	CompareAndSwapSourceClaim(
@@ -108,8 +111,13 @@ type revisionKey struct {
 	revisionID shoal.ID
 }
 
+// sourceClaimState separates the observable claim from the sealed
+// finalization capability. token is populated only while held and is never
+// returned by a read, so observing a claim never confers the ability to
+// finalize it.
 type sourceClaimState struct {
 	claim SourcePolicyClaim
+	token SourcePolicyClaim
 	held  bool
 }
 
@@ -141,7 +149,9 @@ func NewMemoryPolicyStore() *MemoryPolicyStore {
 	}
 }
 
-// SourceClaim returns the current source-URI policy claim.
+// SourceClaim returns the current source-URI policy claim without its
+// finalization capability, so an observed claim can never be committed,
+// pended, or rolled back by a caller that does not hold the CAS token.
 func (s *MemoryPolicyStore) SourceClaim(
 	ctx context.Context,
 	sourceURI string,
@@ -256,7 +266,8 @@ func (s *MemoryPolicyStore) CompareAndSwapSourceClaim(
 		}
 	}
 	claim.tokenSeal = sourceClaimTokenSeal(claim)
-	state.claim = claim
+	state.token = claim
+	state.claim = sourceClaimObservable(claim)
 	s.sourceClaims[sourceURI] = state
 	return cloneSourcePolicyClaim(claim)
 }
@@ -331,7 +342,7 @@ func (s *MemoryPolicyStore) finishSourceClaim(
 	defer s.mu.Unlock()
 	state, ok := s.sourceClaims[normalized.SourceURI]
 	if !ok || !state.held ||
-		!sourcePolicyClaimsEqual(state.claim, normalized) {
+		!sourcePolicyClaimsEqual(state.token, normalized) {
 		completed, completionErr := sourceClaimCompletion(
 			normalized, finish)
 		if completionErr != nil {
@@ -364,6 +375,7 @@ func (s *MemoryPolicyStore) finishSourceClaim(
 		return nil
 	case sourceClaimFinishPending:
 		state.held = false
+		state.token = SourcePolicyClaim{}
 		completed, completionErr := sourceClaimCompletion(
 			normalized, sourceClaimFinishPending)
 		if completionErr != nil || completed == nil {
@@ -374,6 +386,7 @@ func (s *MemoryPolicyStore) finishSourceClaim(
 		return nil
 	case sourceClaimFinishCommit:
 		state.held = false
+		state.token = SourcePolicyClaim{}
 		completed, completionErr := sourceClaimCompletion(
 			normalized, sourceClaimFinishCommit)
 		if completionErr != nil || completed == nil {
@@ -753,6 +766,19 @@ func sourcePolicyClaimsEqual(left, right SourcePolicyClaim) bool {
 		left.tokenSeal == right.tokenSeal &&
 		left.Rule.equal(right.Rule) &&
 		optionalRulesEqual(left.PreviousRule, right.PreviousRule)
+}
+
+// sourceClaimObservable strips the sealed finalization capability from a claim
+// token, leaving only the state readers are allowed to observe. Reading a
+// claim must never confer the ability to finalize it.
+func sourceClaimObservable(token SourcePolicyClaim) SourcePolicyClaim {
+	observable := token
+	observable.hadPriorClaim = false
+	observable.priorPending = false
+	observable.priorVersion = 0
+	observable.acquisitionID = 0
+	observable.tokenSeal = auth.Digest{}
+	return observable
 }
 
 func sourceClaimTokenSeal(claim SourcePolicyClaim) auth.Digest {

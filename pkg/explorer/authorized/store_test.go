@@ -499,3 +499,78 @@ func mustDecisionAtGeneration(
 	}
 	return decision
 }
+
+// Reading a claim must never confer the ability to finalize it. The sealed
+// finalization token is a capability held only by the acquiring caller, so an
+// observer that can call SourceClaim must not be able to commit, pend, or roll
+// back an in-flight claim it does not own.
+func TestSourceClaimReadIsNotAFinalizationToken(t *testing.T) {
+	ctx := context.Background()
+	store := authorized.NewMemoryPolicyStore()
+	ruleA, err := authorized.NewAccessRule(
+		mustPolicy(t, "domain", "source-a", "policy-a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ruleB, err := authorized.NewAccessRule(
+		mustPolicy(t, "domain", "source-b", "policy-b"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	const uri = "file:///observed.txt"
+
+	// Establish a committed claim under ruleA, then begin a reclassification
+	// to ruleB so an observer sees a held claim mid-transition.
+	initial, err := store.CompareAndSwapSourceClaim(ctx, uri, nil, ruleA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CommitSourceClaim(ctx, initial); err != nil {
+		t.Fatal(err)
+	}
+	committed, ok, err := store.SourceClaim(ctx, uri)
+	if err != nil || !ok {
+		t.Fatalf("committed read ok=%v err=%v", ok, err)
+	}
+	inFlight, err := store.CompareAndSwapSourceClaim(
+		ctx, uri, &committed, ruleB)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	observed, ok, err := store.SourceClaim(ctx, uri)
+	if err != nil || !ok {
+		t.Fatalf("in-flight read ok=%v err=%v", ok, err)
+	}
+	// The observable claim still reports the in-flight transition, but it
+	// must not be usable as the holder's finalization token.
+	if !observed.Pending || observed.PreviousRule == nil ||
+		observed.PreviousRule.String() != ruleA.String() ||
+		observed.Rule.String() != ruleB.String() {
+		t.Fatalf("observed claim = %#v", observed)
+	}
+	for name, finish := range map[string]func(
+		context.Context, authorized.SourcePolicyClaim,
+	) error{
+		"commit":   store.CommitSourceClaim,
+		"pend":     store.PendSourceClaim,
+		"rollback": store.RollbackSourceClaim,
+	} {
+		if err := finish(ctx, observed); !shoal.IsErrorCode(
+			err, shoal.ErrorInvalidArgument,
+		) {
+			t.Fatalf("%s with observed claim = %v", name, err)
+		}
+	}
+
+	// The rightful holder still owns the transition and can finalize it, and
+	// the observer never displaced the claim.
+	if err := store.CommitSourceClaim(ctx, inFlight); err != nil {
+		t.Fatalf("holder commit = %v", err)
+	}
+	final, ok, err := store.SourceClaim(ctx, uri)
+	if err != nil || !ok || final.Pending ||
+		final.Rule.String() != ruleB.String() {
+		t.Fatalf("final claim = %#v ok=%v err=%v", final, ok, err)
+	}
+}
