@@ -247,7 +247,9 @@ func (e *Explorer) writeRecord(row []byte, kind byte, value any) error {
 	}
 	mutation.PutLatest([]byte(recordCF), []byte(recordCQV2), nil, encoded)
 	if err := e.engine.Write(explorerTable, []*cclient.Mutation{mutation}); err != nil {
-		return shoal.WrapError(shoal.ErrorUnavailable, "write explorer record", err)
+		return MarkIndeterminateCommit(
+			shoal.WrapError(shoal.ErrorUnavailable, "write explorer record", err),
+		)
 	}
 	return nil
 }

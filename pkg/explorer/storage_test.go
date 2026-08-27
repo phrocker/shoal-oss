@@ -22,6 +22,7 @@ package explorer
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"reflect"
 	"testing"
 	"time"
@@ -31,6 +32,39 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/retrieval"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
+
+func TestWriteRecordMarksOnlyEngineWriteFailureIndeterminate(t *testing.T) {
+	corpus, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	encodingErr := corpus.writeRecord(
+		[]byte("encoding-error"), embeddedRecordEdge, make(chan int))
+	if encodingErr == nil ||
+		!shoal.IsErrorCode(encodingErr, shoal.ErrorInternal) ||
+		IsIndeterminateCommit(encodingErr) {
+		t.Fatalf("encoding error = %v", encodingErr)
+	}
+	if err := corpus.Close(); err != nil {
+		t.Fatal(err)
+	}
+	writeErr := corpus.writeRecord(
+		edgeRecordRow("closed-engine-edge"),
+		embeddedRecordEdge,
+		persistedEdge{Edge: graph.Edge{
+			ID: "closed-engine-edge", From: "from", To: "to",
+			Type: "links", Weight: 1,
+		}},
+	)
+	if writeErr == nil ||
+		!shoal.IsErrorCode(writeErr, shoal.ErrorUnavailable) ||
+		!IsIndeterminateCommit(writeErr) {
+		t.Fatalf("engine write error = %v", writeErr)
+	}
+	if errors.Unwrap(writeErr) == nil {
+		t.Fatalf("engine write marker lost cause: %v", writeErr)
+	}
+}
 
 func TestPublicationSequenceDrivesCurrentSelectionAndPersists(t *testing.T) {
 	ctx := context.Background()

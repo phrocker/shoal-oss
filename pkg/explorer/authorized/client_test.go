@@ -757,6 +757,97 @@ func TestConcurrentClientsShareSourceClaim(t *testing.T) {
 	}
 }
 
+func TestIndeterminateBaseCommitRetainsPendingReclassification(t *testing.T) {
+	f := newFixture(t)
+	const uri = "file:///indeterminate-reclassification.txt"
+	original, err := f.clientA.Ingest(f.admin(t), explorer.Source{
+		URI: uri, MediaType: explorer.MediaTypeText,
+		Content: "original policy A revision",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	indeterminateBase := &ingestOverrideClient{
+		Client: f.base,
+		ingest: func(
+			ctx context.Context,
+			source explorer.Source,
+		) (explorer.IngestResult, error) {
+			if _, err := f.base.Ingest(ctx, source); err != nil {
+				return explorer.IngestResult{}, err
+			}
+			return explorer.IngestResult{}, explorer.MarkIndeterminateCommit(
+				shoal.NewError(
+					shoal.ErrorUnavailable,
+					"indeterminate test storage commit",
+				),
+			)
+		},
+	}
+	reclassifier := f.newClient(
+		t, indeterminateBase, f.store, f.sourceB, f.policyB, nil)
+	reclassifiedSource := explorer.Source{
+		URI: uri, MediaType: explorer.MediaTypeText,
+		Content: "committed policy B revision",
+	}
+	if _, err := reclassifier.Ingest(
+		f.admin(t), reclassifiedSource,
+	); !explorer.IsIndeterminateCommit(err) ||
+		!shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
+		t.Fatalf("indeterminate reclassification error = %v", err)
+	}
+	afterCommit, err := f.base.Documents(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(afterCommit) != 1 ||
+		afterCommit[0].Revision.ID == original.Revision.ID {
+		t.Fatalf("test base did not commit reclassification: %#v", afterCommit)
+	}
+	committedRevisionID := afterCommit[0].Revision.ID
+
+	if _, err := f.clientA.Ingest(f.alice(t), explorer.Source{
+		URI: uri, MediaType: explorer.MediaTypeText,
+		Content: "old policy overwrite attempt",
+	}); !shoal.IsErrorCode(err, shoal.ErrorNotFound) {
+		t.Fatalf("old policy pending-claim mutation = %v", err)
+	}
+	if _, err := f.clientB.Ingest(f.bob(t), reclassifiedSource); err == nil ||
+		(!shoal.IsErrorCode(err, shoal.ErrorConflict) &&
+			!shoal.IsErrorCode(err, shoal.ErrorUnavailable)) {
+		t.Fatalf("selected policy pending-claim mutation = %v", err)
+	}
+	afterRetries, err := f.base.Documents(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(afterRetries) != 1 ||
+		afterRetries[0].Revision.ID != committedRevisionID {
+		t.Fatalf("pending-claim retries changed base: %#v", afterRetries)
+	}
+}
+
+func TestDefiniteBaseFailureRollsBackNewClaim(t *testing.T) {
+	f := newFixture(t)
+	const uri = "file:///definite-rollback.txt"
+	if _, err := f.clientA.Ingest(f.admin(t), explorer.Source{
+		URI: uri, MediaType: "application/json", Content: "{}",
+	}); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) ||
+		explorer.IsIndeterminateCommit(err) {
+		t.Fatalf("definite invalid ingest error = %v", err)
+	}
+	result, err := f.clientB.Ingest(f.bob(t), explorer.Source{
+		URI: uri, MediaType: explorer.MediaTypeText,
+		Content: "corrected policy B content",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Disposition != explorer.IngestApplied {
+		t.Fatalf("corrected retry = %#v", result)
+	}
+}
+
 func TestHistoricalRevisionRetryIsIdempotent(t *testing.T) {
 	f := newFixture(t)
 	admin := f.admin(t)
@@ -1332,6 +1423,20 @@ type hookClient struct {
 	document    func(
 		context.Context, shoal.ID, shoal.ID,
 	) (explorer.DocumentView, error)
+}
+
+type ingestOverrideClient struct {
+	explorer.Client
+	ingest func(
+		context.Context, explorer.Source,
+	) (explorer.IngestResult, error)
+}
+
+func (c *ingestOverrideClient) Ingest(
+	ctx context.Context,
+	source explorer.Source,
+) (explorer.IngestResult, error) {
+	return c.ingest(ctx, source)
 }
 
 func (c *hookClient) Ingest(

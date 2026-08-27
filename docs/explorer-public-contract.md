@@ -231,7 +231,9 @@ document/graph relationships that a later storage adapter must persist.
   serialize concurrent wrapped clients, and retain the selected rule when a
   base commit outlives a policy-catalog failure. Legacy registered documents
   lazily backfill claims only after current-rule authorization; an existing
-  document with neither a claim nor registration is unavailable.
+  document with neither a claim nor registration is unavailable. An explicitly
+  indeterminate base commit leaves its exclusive claim pending and blocks every
+  later mutation until recovery; M3 supplies durable outcome reconciliation.
 - Structured policy labels are canonical lowercase no-padding base32 terms
   for domain, source, policy/epoch, and trusted service role. Callers cannot
   submit visibility expressions. Service-account ceilings intersect required

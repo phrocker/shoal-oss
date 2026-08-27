@@ -129,16 +129,19 @@ func (c *Client) Ingest(
 	if err != nil {
 		return explorer.IngestResult{}, err
 	}
-	preserveClaim := false
+	claimOutcome := sourceClaimRollback
 	defer func() {
 		cleanupContext := context.WithoutCancel(ctx)
 		var cleanupErr error
-		if preserveClaim {
+		switch claimOutcome {
+		case sourceClaimCommit:
 			cleanupErr = c.policyStore.CommitSourceClaim(
 				cleanupContext, claim)
-		} else {
+		case sourceClaimRollback:
 			cleanupErr = c.policyStore.RollbackSourceClaim(
 				cleanupContext, claim)
+		case sourceClaimRetainPending:
+			return
 		}
 		if cleanupErr != nil && returnedErr == nil {
 			returned = explorer.IngestResult{}
@@ -150,9 +153,14 @@ func (c *Client) Ingest(
 	}
 	result, err := c.base.Ingest(ctx, cloneSource(ownedSource))
 	if err != nil {
+		if explorer.IsIndeterminateCommit(err) {
+			claimOutcome = sourceClaimRetainPending
+		}
 		return explorer.IngestResult{}, err
 	}
-	preserveClaim = result.Disposition == explorer.IngestApplied
+	if result.Disposition == explorer.IngestApplied {
+		claimOutcome = sourceClaimCommit
+	}
 	view, err := c.base.Document(
 		ctx, result.Document.ID, result.Revision.ID)
 	if err != nil {
@@ -199,13 +207,21 @@ func (c *Client) Ingest(
 	}); err != nil {
 		return explorer.IngestResult{}, policyCatalogWriteError(ctx, err)
 	}
-	preserveClaim = true
+	claimOutcome = sourceClaimCommit
 	cloned := cloneIngestResult(result)
 	if err := guard.Check(ctx); err != nil {
 		return explorer.IngestResult{}, err
 	}
 	return cloned, nil
 }
+
+type sourceClaimOutcome uint8
+
+const (
+	sourceClaimRollback sourceClaimOutcome = iota
+	sourceClaimCommit
+	sourceClaimRetainPending
+)
 
 // claimSourceMutation acquires shared source-URI mutation ownership before the
 // base is changed. Existing claims authorize retries after a base commit even
