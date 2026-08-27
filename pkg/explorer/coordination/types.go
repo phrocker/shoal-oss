@@ -1,0 +1,214 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements. See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership. The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License. You may obtain a copy of the License at
+ *
+ *     https://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied. See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+// Package coordination defines byte-exact control records and row keys used
+// by Explorer's distributed publication protocol. It deliberately does not
+// encode public logical Explorer values.
+package coordination
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"math"
+	"time"
+)
+
+const (
+	MaxOpaqueIDBytes       = 1024
+	MaxOwnerBytes          = 1024
+	MaxResultIdentities    = 4096
+	MaxResultIdentityBytes = 1024
+	MaxLPARTs              = 64
+	MaxRootBytes           = 64 << 10
+	MaxManifestEntries     = 32_000_000
+	MaxChunkEntries        = 4096
+	MaxChunkBytes          = 1 << 20
+	MaxCoordinateBytes     = 16 << 10
+	MaxManifestValueBytes  = 1 << 20
+)
+
+type DomainID []byte
+type TXN []byte
+type LPART []byte
+type OwnerID []byte
+type IGEN []byte
+type Family []byte
+
+type Digest [sha256.Size]byte
+
+func (d Digest) String() string { return hex.EncodeToString(d[:]) }
+func Sum(data []byte) Digest    { return sha256.Sum256(data) }
+
+func (d Digest) Validate(name string) error {
+	if d == (Digest{}) {
+		return invalid(name + " is required")
+	}
+	return nil
+}
+
+type Epoch int64
+type Generation int64
+type Fence int64
+
+func validateOpaque(name string, value []byte, maximum int, required bool) error {
+	if required && len(value) == 0 {
+		return invalid(name + " is required")
+	}
+	if len(value) > maximum {
+		return invalid(fmt.Sprintf("%s exceeds %d bytes", name, maximum))
+	}
+	return nil
+}
+
+func (v DomainID) Validate() error { return validateOpaque("domain ID", v, MaxOpaqueIDBytes, true) }
+func (v TXN) Validate() error      { return validateOpaque("transaction ID", v, MaxOpaqueIDBytes, true) }
+func (v LPART) Validate() error    { return validateOpaque("LPART", v, MaxOpaqueIDBytes, true) }
+func (v OwnerID) Validate() error  { return validateOpaque("owner ID", v, MaxOwnerBytes, true) }
+func (v IGEN) Validate() error {
+	return validateOpaque("index generation ID", v, MaxOpaqueIDBytes, true)
+}
+func (v Family) Validate() error { return validateOpaque("index family", v, MaxOpaqueIDBytes, true) }
+
+func validatePositive(name string, value int64) error {
+	if value <= 0 {
+		return invalid(name + " must be between 1 and MaxInt64")
+	}
+	return nil
+}
+
+func (v Epoch) Validate() error      { return validatePositive("epoch", int64(v)) }
+func (v Generation) Validate() error { return validatePositive("generation", int64(v)) }
+func (v Fence) Validate() error      { return validatePositive("fence", int64(v)) }
+
+func validateTime(name string, value time.Time, optional bool) error {
+	if value.IsZero() {
+		if optional {
+			return nil
+		}
+		return invalid(name + " is required")
+	}
+	year := value.UTC().Year()
+	if year < 1 || year > 9999 {
+		return invalid(name + " is outside years 1 through 9999")
+	}
+	if value.Location() != time.UTC {
+		return invalid(name + " must use UTC")
+	}
+	return nil
+}
+
+func checkedAdd(name string, total *uint64, value uint64) error {
+	if value > math.MaxInt64 || *total > math.MaxInt64-value {
+		return invalid(name + " overflows the supported int64 range")
+	}
+	*total += value
+	return nil
+}
+
+type TxnState uint8
+
+const (
+	StateAbsent TxnState = iota
+	StateClaimed
+	StatePlanned
+	StateGuardsAcquired
+	StateEpochReserved
+	StateWriting
+	StateVerified
+	StatePrepared
+	StateCommitted
+	StateAborted
+	StateConflicted
+	StatePoisoned
+)
+
+func (s TxnState) String() string {
+	switch s {
+	case StateAbsent:
+		return "ABSENT"
+	case StateClaimed:
+		return "CLAIMED"
+	case StatePlanned:
+		return "PLANNED"
+	case StateGuardsAcquired:
+		return "GUARDS_ACQUIRED"
+	case StateEpochReserved:
+		return "EPOCH_RESERVED"
+	case StateWriting:
+		return "WRITING"
+	case StateVerified:
+		return "VERIFIED"
+	case StatePrepared:
+		return "PREPARED"
+	case StateCommitted:
+		return "COMMITTED"
+	case StateAborted:
+		return "ABORTED"
+	case StateConflicted:
+		return "CONFLICTED"
+	case StatePoisoned:
+		return "POISONED"
+	default:
+		return fmt.Sprintf("TxnState(%d)", s)
+	}
+}
+
+func (s TxnState) ValidatePersisted() error {
+	if s < StateClaimed || s > StatePoisoned {
+		return invalid("transaction state is not persistable")
+	}
+	return nil
+}
+
+func (s TxnState) Terminal() bool {
+	return s == StateCommitted || s == StateAborted ||
+		s == StateConflicted || s == StatePoisoned
+}
+
+func (s TxnState) Nonterminal() bool {
+	return s >= StateClaimed && s <= StatePrepared
+}
+
+func ValidateTransition(from, to TxnState) error {
+	if from == StateAbsent {
+		if to == StateClaimed {
+			return nil
+		}
+		return invalid("ABSENT may transition only to CLAIMED")
+	}
+	if err := from.ValidatePersisted(); err != nil {
+		return err
+	}
+	if err := to.ValidatePersisted(); err != nil {
+		return err
+	}
+	if from.Terminal() {
+		return invalid("terminal transaction state cannot transition")
+	}
+	if to == StateAborted || to == StateConflicted || to == StatePoisoned {
+		return nil
+	}
+	if to == from+1 {
+		return nil
+	}
+	return invalid(fmt.Sprintf("illegal transaction transition %s to %s", from, to))
+}
+
+func invalid(message string) error { return fmt.Errorf("coordination: %s", message) }
