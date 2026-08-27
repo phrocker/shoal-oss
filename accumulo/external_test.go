@@ -209,6 +209,57 @@ func TestPublicBatchWriterAPICompiles(t *testing.T) {
 	_ = accumulo.ErrBatchWriterRetryExhausted
 }
 
+func TestPublicConditionalWriterAPICompiles(t *testing.T) {
+	absent, err := accumulo.NewAbsentCondition([]byte("cf"), []byte("cq"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	value, err := accumulo.NewValueCondition(
+		[]byte("cf"), []byte("cq"), []byte("private"), []byte("expected"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	value = value.WithTimestamp(123)
+	mutation, err := accumulo.NewMutation([]byte("row"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	mutation.PutLatest([]byte("cf"), []byte("cq"), nil, []byte("next"))
+	conditional, err := accumulo.NewConditionalMutation(mutation, absent, value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = conditional.Row()
+
+	instance, _ := accumulo.NewStaticInstance("accumulo", "uuid-1")
+	credentials, _ := accumulo.PasswordCredentials("root", []byte("secret"))
+	connector, err := accumulo.NewConnector(instance, credentials, accumulo.ConnectorOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connector.Close()
+	_, err = connector.NewConditionalWriter(
+		accumulo.Table{Name: "events"},
+		accumulo.ConditionalWriterOptions{
+			MaxRetries: 3, RetryBackoff: time.Millisecond, Durability: accumulo.DurabilitySync,
+		},
+	)
+	if !errors.Is(err, accumulo.ErrDiscoveryUnavailable) {
+		t.Fatalf("error = %v, want ErrDiscoveryUnavailable", err)
+	}
+
+	var _ accumulo.Condition = absent
+	var _ *accumulo.ConditionalMutation = conditional
+	var _ *accumulo.ConditionalWriter
+	var _ accumulo.ConditionalStatus
+	_ = accumulo.ConditionalUnknown
+	_ = accumulo.ConditionalAccepted
+	_ = accumulo.ConditionalRejected
+	_ = accumulo.ErrConditionalUnknown
+	_ = accumulo.ErrConditionalRetryExhausted
+}
+
 func TestPublicSecurityAPICompiles(t *testing.T) {
 	instance, _ := accumulo.NewStaticInstance("accumulo", "uuid-1")
 	credentials, _ := accumulo.PasswordCredentials("root", []byte("secret"))
