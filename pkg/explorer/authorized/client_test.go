@@ -1533,6 +1533,7 @@ func TestMaliciousRetrievalResultFailsClosed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	_ = visible
 	hidden, err := f.clientB.Ingest(f.admin(t), explorer.Source{
 		URI: "file:///hidden-malicious.txt", MediaType: explorer.MediaTypeText,
@@ -1563,6 +1564,28 @@ func TestMaliciousRetrievalResultFailsClosed(t *testing.T) {
 	_, err = client.Retrieve(f.alice(t), retrieval.Request{Text: "hidden token"})
 	if !shoal.IsErrorCode(err, shoal.ErrorInternal) {
 		t.Fatalf("malicious result error = %v", err)
+	}
+}
+
+func TestRetrievalRejectsUnseededPlanBeforeCorpusScan(t *testing.T) {
+	f := newFixture(t)
+	documentsCalls := 0
+	hooked := &hookClient{
+		Client: f.base,
+		documents: func(ctx context.Context) ([]explorer.DocumentSummary, error) {
+			documentsCalls++
+			return f.base.Documents(ctx)
+		},
+	}
+	client := f.newClient(t, hooked, f.store, f.sourceA, f.policyA, nil)
+	_, err := client.Retrieve(f.alice(t), retrieval.Request{
+		Text: "tree only", Modes: []retrieval.Mode{retrieval.ModeTree},
+	})
+	if !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
+		t.Fatalf("unseeded tree request error = %v", err)
+	}
+	if documentsCalls != 0 {
+		t.Fatalf("unseeded request scanned corpus %d times", documentsCalls)
 	}
 }
 

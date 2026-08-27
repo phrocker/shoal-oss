@@ -761,11 +761,13 @@ func (s *MemoryPolicyStore) PutEdge(
 	}
 	if existing, ok := s.edges[normalized.Edge.ID]; ok {
 		if edgeRegistrationsEqual(existing, normalized) {
+			delete(s.edgeClaims, normalized.Edge.ID)
 			return nil
 		}
 		return catalogConflict()
 	}
 	s.edges[normalized.Edge.ID] = cloneEdgeRegistration(normalized)
+	delete(s.edgeClaims, normalized.Edge.ID)
 	return nil
 }
 

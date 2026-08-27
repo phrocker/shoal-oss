@@ -37,6 +37,9 @@ func (c *Client) Retrieve(
 	if err != nil {
 		return retrieval.Response{}, err
 	}
+	if err := normalized.ValidateSeedPlan(true); err != nil {
+		return retrieval.Response{}, err
+	}
 	decision, guard, now, err := c.begin(ctx, auth.OperationRetrieve)
 	if err != nil {
 		return retrieval.Response{}, err
