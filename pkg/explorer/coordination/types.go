@@ -47,6 +47,7 @@ const (
 	MaxIndexPins           = 64
 	MaxBackendIDBytes      = 1024
 	MaxObjectKindBytes     = 256
+	MaxActiveReservations  = 10_000
 )
 
 type DomainID []byte
@@ -76,6 +77,20 @@ func (d Digest) Validate(name string) error {
 type Epoch int64
 type Generation int64
 type Fence int64
+
+type WriterMode uint8
+
+const (
+	WriterModeEmbeddedPrimary WriterMode = iota + 1
+	WriterModeAccumuloPrimary
+)
+
+func (m WriterMode) Validate() error {
+	if m != WriterModeEmbeddedPrimary && m != WriterModeAccumuloPrimary {
+		return invalid("writer mode is unknown")
+	}
+	return nil
+}
 
 func validateOpaque(name string, value []byte, maximum int, required bool) error {
 	if required && len(value) == 0 {

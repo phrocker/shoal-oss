@@ -50,6 +50,7 @@ const (
 	KindHistoryFloor
 	KindWriterAuthority
 	KindBackendObservation
+	KindAllocatorHead
 )
 
 const (
@@ -71,6 +72,7 @@ const (
 	VersionHistoryFloorV1       uint16 = 1
 	VersionWriterAuthorityV1    uint16 = 1
 	VersionBackendObservationV1 uint16 = 1
+	VersionAllocatorHeadV1      uint16 = 1
 
 	envelopeMagic      = "SHOALCO\x00"
 	envelopeHeaderSize = len(envelopeMagic) + 2 + 2 + 4
