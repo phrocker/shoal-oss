@@ -1683,6 +1683,7 @@ func (t ProposalTransition) At() time.Time {
 type GovernedProposal struct {
 	id              shoal.ID
 	schema          OntologySchema
+	baseSchemaID    shoal.ID
 	baseVersionID   shoal.ID
 	proposedVersion OntologyVersion
 	proposedBy      string
@@ -1693,22 +1694,29 @@ type GovernedProposal struct {
 	metadata        shoal.Metadata
 }
 
-// NewGovernedProposal creates a draft proposal. baseVersionID may be zero for
+// NewGovernedProposal creates a draft proposal. baseVersion may be zero for
 // the first version of a schema.
 func NewGovernedProposal(
 	schema OntologySchema,
-	baseVersionID shoal.ID,
+	baseVersion OntologyVersion,
 	proposedVersion OntologyVersion,
 	proposedBy, rationale string,
 	createdAt time.Time,
 	metadata shoal.Metadata,
 ) (GovernedProposal, error) {
 	proposal := GovernedProposal{
-		schema: schema.clone(), baseVersionID: baseVersionID,
+		schema:          schema.clone(),
 		proposedVersion: proposedVersion.clone(),
 		proposedBy:      proposedBy, rationale: rationale,
 		createdAt: normalizeTime(createdAt), state: ProposalDraft,
 		metadata: cloneMetadata(metadata),
+	}
+	if baseVersion.ID() != "" {
+		if err := baseVersion.Validate(); err != nil {
+			return GovernedProposal{}, err
+		}
+		proposal.baseSchemaID = baseVersion.Schema().ID()
+		proposal.baseVersionID = baseVersion.ID()
 	}
 	id, err := proposalID(proposal)
 	if err != nil {
@@ -1729,9 +1737,18 @@ func (p GovernedProposal) Validate() error {
 	if err := p.schema.Validate(); err != nil {
 		return err
 	}
+	if (p.baseSchemaID == "") != (p.baseVersionID == "") {
+		return invalid("proposal base schema and version must both be present")
+	}
 	if p.baseVersionID != "" {
+		if err := validateTypedID(p.baseSchemaID, "schema"); err != nil {
+			return err
+		}
 		if err := validateTypedID(p.baseVersionID, "ontology-version"); err != nil {
 			return err
+		}
+		if p.baseSchemaID != p.schema.ID() {
+			return invalid("proposal base version belongs to a different schema")
 		}
 	}
 	if err := p.proposedVersion.Validate(); err != nil {
@@ -1857,6 +1874,9 @@ func proposalID(proposal GovernedProposal) (shoal.ID, error) {
 		return "", err
 	}
 	if proposal.baseVersionID != "" {
+		if err := validateTypedID(proposal.baseSchemaID, "schema"); err != nil {
+			return "", err
+		}
 		if err := validateTypedID(proposal.baseVersionID, "ontology-version"); err != nil {
 			return "", err
 		}
@@ -1873,7 +1893,10 @@ func proposalID(proposal GovernedProposal) (shoal.ID, error) {
 	return deriveID(
 		"proposal",
 		string(proposal.schema.ID()),
-		canonicalOptional(proposal.baseVersionID != "", string(proposal.baseVersionID)),
+		canonicalOptional(
+			proposal.baseVersionID != "",
+			canonicalParts(string(proposal.baseSchemaID), string(proposal.baseVersionID)),
+		),
 		string(proposal.proposedVersion.ID()),
 		proposal.proposedBy,
 		proposal.rationale,

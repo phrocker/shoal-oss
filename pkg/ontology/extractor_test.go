@@ -361,7 +361,7 @@ func TestExtractionLimitsFailClosedAndAllowNoAssertion(t *testing.T) {
 		t.Fatal(err)
 	}
 	proposal, err := ontology.NewGovernedProposal(
-		fixture.schema, fixture.version.ID(), nextVersion,
+		fixture.schema, fixture.version, nextVersion,
 		"extractor", "proposed ontology update", testTime.Add(3*time.Hour), nil,
 	)
 	if err != nil {

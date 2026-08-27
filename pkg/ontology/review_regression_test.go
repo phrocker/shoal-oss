@@ -63,6 +63,52 @@ func TestExtractionAppliesPropertyValueAndCardinalityConstraints(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
+	t.Run("minimum count and unique values", func(t *testing.T) {
+		fixture := newOntologyFixture(t)
+		minimum, err := ontology.NewCountConstraint(ontology.ConstraintMinimumCount, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		requiredProperty := mustProperty(
+			t, "required-output", "Required output", "", ontology.ValueString,
+			[]ontology.Constraint{minimum}, nil,
+		)
+		request := requestWithProperty(
+			t, fixture, requiredProperty, []ontology.EvidenceRef{fixture.evidence})
+		if _, err := ontology.NewExtractionResult(
+			request, []ontology.Assertion{fixture.explicit}, nil,
+			testTime.Add(time.Minute), nil,
+		); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
+			t.Fatalf("zero-count minimum error = %v", err)
+		}
+
+		unique, err := ontology.NewFlagConstraint(ontology.ConstraintUnique)
+		if err != nil {
+			t.Fatal(err)
+		}
+		uniqueProperty := mustProperty(
+			t, "unique-code", "Unique code", "", ontology.ValueString,
+			[]ontology.Constraint{unique}, nil,
+		)
+		request = requestWithProperty(
+			t, fixture, uniqueProperty, []ontology.EvidenceRef{fixture.evidence})
+		value, _ := ontology.NewStringValue("shared")
+		first, _ := ontology.NewAssertion(
+			"entity:one", uniqueProperty.ID(), value, ontology.AssertionExplicit, 1,
+			[]ontology.EvidenceRef{fixture.evidence}, fixture.provenance, nil,
+		)
+		second, _ := ontology.NewAssertion(
+			"entity:two", uniqueProperty.ID(), value, ontology.AssertionExplicit, 1,
+			[]ontology.EvidenceRef{fixture.evidence}, fixture.provenance, nil,
+		)
+		if _, err := ontology.NewExtractionResult(
+			request, []ontology.Assertion{first, second}, nil,
+			testTime.Add(time.Minute), nil,
+		); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
+			t.Fatalf("duplicate unique value error = %v", err)
+		}
+	})
 	numeric := mustProperty(
 		t, "bounded-score", "Bounded score", "", ontology.ValueInteger,
 		[]ontology.Constraint{allowed}, nil,
@@ -141,6 +187,33 @@ func TestExtractionRejectsProposalForDifferentBaseVersion(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
+	t.Run("different schema", func(t *testing.T) {
+		fixture := newOntologyFixture(t)
+		otherSchema, err := ontology.NewOntologySchema("other", "Other", "", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		otherBase, err := ontology.NewOntologyVersion(
+			otherSchema, "1", testTime.Add(time.Hour), nil, nil, nil, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		nextVersion, err := ontology.NewOntologyVersion(
+			fixture.schema, "next-schema-check", testTime.Add(2*time.Hour),
+			fixture.version.Concepts(), fixture.version.Relationships(),
+			fixture.version.Properties(), nil,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := ontology.NewGovernedProposal(
+			fixture.schema, otherBase, nextVersion, "author", "invalid base",
+			testTime.Add(3*time.Hour), nil,
+		); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
+			t.Fatalf("cross-schema base error = %v", err)
+		}
+	})
 	unrelatedBase, err := ontology.NewOntologyVersion(
 		fixture.schema, "unrelated", testTime.Add(time.Hour),
 		fixture.version.Concepts(), fixture.version.Relationships(),
@@ -158,7 +231,7 @@ func TestExtractionRejectsProposalForDifferentBaseVersion(t *testing.T) {
 		t.Fatal(err)
 	}
 	proposal, err := ontology.NewGovernedProposal(
-		fixture.schema, unrelatedBase.ID(), proposed, "extractor",
+		fixture.schema, unrelatedBase, proposed, "extractor",
 		"propose update", testTime.Add(3*time.Hour), nil,
 	)
 	if err != nil {
@@ -238,7 +311,7 @@ func TestExtractionPayloadBudgetBoundsVariableText(t *testing.T) {
 		t.Fatal(err)
 	}
 	proposal, err := ontology.NewGovernedProposal(
-		fixture.schema, fixture.version.ID(), nextVersion, "extractor", huge,
+		fixture.schema, fixture.version, nextVersion, "extractor", huge,
 		testTime.Add(3*time.Hour), nil,
 	)
 	if err != nil {

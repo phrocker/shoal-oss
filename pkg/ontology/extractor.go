@@ -485,6 +485,8 @@ func (r ExtractionResult) ValidateFor(request ExtractionRequest) error {
 		predicate shoal.ID
 	}
 	counts := make(map[assertionGroup]uint32)
+	predicateCounts := make(map[shoal.ID]uint32)
+	uniqueValues := make(map[string]struct{})
 	for _, assertion := range r.assertions {
 		for _, evidence := range assertion.Evidence() {
 			metadata, exists := requestEvidence[evidence.ID()]
@@ -504,6 +506,18 @@ func (r ExtractionResult) ValidateFor(request ExtractionRequest) error {
 			counts[assertionGroup{
 				subject: assertion.Subject(), predicate: assertion.Predicate(),
 			}]++
+			predicateCounts[assertion.Predicate()]++
+			for _, constraint := range property.constraints {
+				if constraint.Kind() != ConstraintUnique {
+					continue
+				}
+				key := canonicalParts(
+					string(assertion.Predicate()), assertion.Object().canonical())
+				if _, duplicate := uniqueValues[key]; duplicate {
+					return invalid("assertion value violates property uniqueness")
+				}
+				uniqueValues[key] = struct{}{}
+			}
 		case "relationship":
 			if _, exists := relationships[assertion.Predicate()]; !exists {
 				return invalid("assertion references an unknown relationship")
@@ -519,16 +533,22 @@ func (r ExtractionResult) ValidateFor(request ExtractionRequest) error {
 		property := properties[group.predicate]
 		for _, constraint := range property.constraints {
 			switch constraint.Kind() {
-			case ConstraintMinimumCount:
-				minimum, _ := constraint.Count()
-				if count < minimum {
-					return invalid("assertion count is below property minimum")
-				}
 			case ConstraintMaximumCount:
 				maximum, _ := constraint.Count()
 				if count > maximum {
 					return invalid("assertion count exceeds property maximum")
 				}
+			}
+		}
+	}
+	for predicate, property := range properties {
+		for _, constraint := range property.constraints {
+			if constraint.Kind() != ConstraintMinimumCount {
+				continue
+			}
+			minimum, _ := constraint.Count()
+			if predicateCounts[predicate] < minimum {
+				return invalid("assertion count is below property minimum")
 			}
 		}
 	}
@@ -730,7 +750,8 @@ func assertionPayloadBytes(assertion Assertion) uint64 {
 
 func proposalPayloadBytes(proposal GovernedProposal) uint64 {
 	size := uint64(len(proposal.schema.key)+len(proposal.schema.name)+
-		len(proposal.schema.description)+len(proposal.baseVersionID)+
+		len(proposal.schema.description)+len(proposal.baseSchemaID)+
+		len(proposal.baseVersionID)+
 		len(proposal.proposedBy)+len(proposal.rationale)+
 		len(canonicalMetadata(proposal.schema.metadata))+
 		len(canonicalMetadata(proposal.metadata))) +

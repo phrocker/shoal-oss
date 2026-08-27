@@ -598,7 +598,7 @@ func TestGovernedProposalLifecycleAndInvalidStates(t *testing.T) {
 		t.Fatal(err)
 	}
 	proposal, err := ontology.NewGovernedProposal(
-		fixture.schema, fixture.version.ID(), nextVersion,
+		fixture.schema, fixture.version, nextVersion,
 		"author", "add ontology coverage", testTime.Add(2*time.Hour), nil,
 	)
 	if err != nil {
