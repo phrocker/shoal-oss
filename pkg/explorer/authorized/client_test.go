@@ -323,6 +323,9 @@ func TestAuthorizedVisibilityAndRetrievalProjection(t *testing.T) {
 		response.Results[0].Evidence[0].Citation.DocumentID != visible.Document.ID {
 		t.Fatalf("authorized retrieval = %#v", response)
 	}
+	if response.RequestID != "" {
+		t.Fatalf("authorized retrieval exposed backend request ID %q", response.RequestID)
+	}
 
 	empty, err := f.clientA.Retrieve(alice, retrieval.Request{
 		Text: "alpha beta",
@@ -1576,6 +1579,12 @@ func TestMaliciousRetrievalContentFailsClosed(t *testing.T) {
 		mutate func(*retrieval.Response)
 	}{
 		{
+			name: "missing canonical result",
+			mutate: func(response *retrieval.Response) {
+				response.Results = nil
+			},
+		},
+		{
 			name: "quote",
 			mutate: func(response *retrieval.Response) {
 				response.Results[0].Evidence[0].Quote = "altered quote"
@@ -1627,6 +1636,7 @@ func TestMaliciousRetrievalContentFailsClosed(t *testing.T) {
 			},
 		},
 	}
+
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			response, err := f.base.Retrieve(
@@ -1660,6 +1670,72 @@ func TestMaliciousRetrievalContentFailsClosed(t *testing.T) {
 				t.Fatalf("malicious response error = %v", err)
 			}
 		})
+	}
+}
+
+func TestDocumentsReconstructCanonicalSummaries(t *testing.T) {
+	f := newFixture(t)
+	result, err := f.clientA.Ingest(f.admin(t), explorer.Source{
+		URI: "file:///canonical-summary.txt", Title: "Canonical title",
+		MediaType: explorer.MediaTypeText, Content: "canonical summary",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	malicious := &hookClient{
+		Client: f.base,
+		documents: func(ctx context.Context) ([]explorer.DocumentSummary, error) {
+			summaries, err := f.base.Documents(ctx)
+			if err == nil {
+				summaries[0].Document.Title = "altered title"
+				summaries[0].Document.Metadata = shoal.Metadata{"leak": "value"}
+				summaries[0].SourceURI = "file:///altered-secret.txt"
+			}
+			return summaries, err
+		},
+	}
+	client := f.newClient(t, malicious, f.store, f.sourceA, f.policyA, nil)
+	summaries, err := client.Documents(f.alice(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(summaries) != 1 ||
+		summaries[0].Document.ID != result.Document.ID ||
+		summaries[0].Document.Title != "Canonical title" ||
+		summaries[0].SourceURI != "file:///canonical-summary.txt" ||
+		summaries[0].Document.Metadata["leak"] != "" {
+		t.Fatalf("authorized summaries = %#v", summaries)
+	}
+}
+
+func TestIngestReconstructsCanonicalResult(t *testing.T) {
+	f := newFixture(t)
+	malicious := &ingestOverrideClient{
+		Client: f.base,
+		ingest: func(
+			ctx context.Context,
+			source explorer.Source,
+		) (explorer.IngestResult, error) {
+			result, err := f.base.Ingest(ctx, source)
+			if err == nil {
+				result.Document.Title = "altered title"
+				result.SectionCount = -1
+				result.SpanCount = -1
+			}
+			return result, err
+		},
+	}
+	client := f.newClient(t, malicious, f.store, f.sourceA, f.policyA, nil)
+	result, err := client.Ingest(f.admin(t), explorer.Source{
+		URI: "file:///canonical-ingest.txt", Title: "Canonical ingest",
+		MediaType: explorer.MediaTypeText, Content: "one canonical span",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Document.Title != "Canonical ingest" ||
+		result.SectionCount != 1 || result.SpanCount != 1 {
+		t.Fatalf("authorized ingest result = %#v", result)
 	}
 }
 
@@ -1905,9 +1981,19 @@ type hookClient struct {
 	explorer.Client
 	afterIngest func()
 	retrieve    func(context.Context, retrieval.Request) (retrieval.Response, error)
+	documents   func(context.Context) ([]explorer.DocumentSummary, error)
 	document    func(
 		context.Context, shoal.ID, shoal.ID,
 	) (explorer.DocumentView, error)
+}
+
+func (c *hookClient) Documents(
+	ctx context.Context,
+) ([]explorer.DocumentSummary, error) {
+	if c.documents != nil {
+		return c.documents(ctx)
+	}
+	return c.Client.Documents(ctx)
 }
 
 type ingestOverrideClient struct {

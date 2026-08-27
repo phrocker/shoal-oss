@@ -130,6 +130,13 @@ func (c *Client) Neighborhood(
 		if !allowed {
 			continue
 		}
+		canonical, err := c.canonicalRegisteredNode(ctx, node.ID, registration)
+		if err != nil {
+			return explorer.Neighborhood{}, err
+		}
+		if !graphNodesEqual(canonical, node) {
+			return explorer.Neighborhood{}, inconsistentBase()
+		}
 		if _, duplicate := visibleNodes[node.ID]; duplicate {
 			return explorer.Neighborhood{}, inconsistentBase()
 		}
@@ -288,5 +295,52 @@ func (c *Client) authorizedNode(
 	if !allowed {
 		return NodeRegistration{}, auth.ObjectNotFound()
 	}
+	if _, err := c.canonicalRegisteredNode(ctx, nodeID, registration); err != nil {
+		return NodeRegistration{}, err
+	}
 	return registration, nil
+}
+
+func (c *Client) canonicalRegisteredNode(
+	ctx context.Context,
+	nodeID shoal.ID,
+	registration NodeRegistration,
+) (graph.Node, error) {
+	current, ok, err := c.policyStore.CurrentRevision(
+		ctx, registration.DocumentID)
+	if err != nil {
+		return graph.Node{}, policyCatalogReadError(ctx, err)
+	}
+	if !ok || current.RevisionID != registration.RevisionID {
+		return graph.Node{}, auth.ObjectNotFound()
+	}
+	summaries, err := c.base.Documents(ctx)
+	if err != nil {
+		return graph.Node{}, err
+	}
+	isCurrent, err := exactRevisionIsCurrent(
+		summaries, registration.DocumentID, registration.RevisionID)
+	if err != nil {
+		return graph.Node{}, err
+	}
+	if !isCurrent {
+		return graph.Node{}, auth.ObjectNotFound()
+	}
+	view, err := c.base.Document(
+		ctx, registration.DocumentID, registration.RevisionID)
+	if err != nil {
+		return graph.Node{}, directBaseError(err)
+	}
+	if err := verifyDocumentViewRegistration(view, current); err != nil {
+		return graph.Node{}, err
+	}
+	canonical, err := buildCanonicalRetrievalDocument(view, current)
+	if err != nil {
+		return graph.Node{}, inconsistentBase()
+	}
+	node, ok := canonical.nodes[nodeID]
+	if !ok {
+		return graph.Node{}, inconsistentBase()
+	}
+	return cloneGraphNode(node), nil
 }

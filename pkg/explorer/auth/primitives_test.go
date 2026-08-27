@@ -215,6 +215,10 @@ func TestRedactionAndAuditEventsRetainNoRawSensitiveValues(t *testing.T) {
 		if strings.Contains(redacted.String(), raw) {
 			t.Fatalf("Redact().String() exposed %q: %q", raw, redacted)
 		}
+		if redacted.Digest() ==
+			auth.DigestBytes("explorer-redacted-value-v1", []byte(raw)) {
+			t.Fatalf("Redact() retained a guessable unkeyed digest for %q", raw)
+		}
 		if redacted.Size() != len(raw) {
 			t.Fatalf("Redact().Size() = %d, want %d", redacted.Size(), len(raw))
 		}

@@ -230,6 +230,7 @@ func TestExistingEdgeUsesCurrentEndpointRules(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	secondSource := explorer.Source{
 		URI: "file:///dynamic-edge-b.txt", MediaType: explorer.MediaTypeText,
 		Content: "dynamic edge b",
@@ -306,6 +307,37 @@ func TestExistingEdgeUsesCurrentEndpointRules(t *testing.T) {
 	}
 	if len(adminGraph.Edges) != 1 || !hasNode(adminGraph, second.Document.ID) {
 		t.Fatalf("current endpoint grants did not admit edge: %#v", adminGraph)
+	}
+}
+
+func TestGraphRejectsUncatalogedCurrentRevision(t *testing.T) {
+	f := newFixture(t)
+	source := explorer.Source{
+		URI: "file:///stale-graph.txt", Title: "Registered",
+		MediaType: explorer.MediaTypeText, Content: "registered content",
+	}
+	registered, err := f.clientA.Ingest(f.admin(t), source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.base.Ingest(context.Background(), explorer.Source{
+		URI: source.URI, Title: "Uncataloged",
+		MediaType: source.MediaType, Content: "uncataloged replacement",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	_, err = f.clientA.Neighborhood(f.alice(t), explorer.NeighborhoodRequest{
+		NodeIDs: []shoal.ID{registered.Document.ID},
+	})
+	if !shoal.IsErrorCode(err, shoal.ErrorNotFound) {
+		t.Fatalf("stale neighborhood seed error = %v", err)
+	}
+	err = f.clientA.Connect(f.alice(t), graph.Edge{
+		ID: "stale-connect", From: registered.Document.ID,
+		To: registered.Document.ID, Type: "link", Weight: 1,
+	})
+	if !shoal.IsErrorCode(err, shoal.ErrorNotFound) {
+		t.Fatalf("stale connect endpoint error = %v", err)
 	}
 }
 

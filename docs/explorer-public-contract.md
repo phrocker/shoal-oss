@@ -267,11 +267,14 @@ document/graph relationships that a later storage adapter must persist.
   hidden intermediary cannot reveal or bridge visible nodes.
 - Backend retrieval values are not trusted merely because their IDs are
   authorized. The wrapper verifies registered document digests, exact
-  citations/quotes/ranges, canonical path nodes/edges, and the shared
-  analyzer/scorer explanation before returning them.
+  citations/quotes/ranges, canonical path nodes/edges, the exact canonical
+  top-K prefix, and the shared analyzer/scorer explanation before returning
+  them. Backend request IDs are cleared rather than exposed.
 - Authorization fingerprints, cache keys, audit values, and public strings
   contain digests/categories rather than raw queries, source text, quotes,
   IDs, labels, credentials, physical coordinates, or serialized responses.
+  Audit value pseudonyms use an ephemeral process HMAC key so low-entropy
+  values cannot be recovered by hashing guesses and rotate on process restart.
 - `authorized.MemoryPolicyStore` is an M2 reference catalog that can be reused
   across an in-process embedded restart. It is not durable process recovery;
   M3/M4 must atomically persist policy/publication state before production

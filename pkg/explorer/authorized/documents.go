@@ -62,7 +62,19 @@ func (c *Client) Documents(
 		if !allowed {
 			continue
 		}
-		visible = append(visible, cloneDocumentSummary(summary))
+		view, err := c.base.Document(
+			ctx, registration.DocumentID, registration.RevisionID)
+		if err != nil {
+			return nil, directBaseError(err)
+		}
+		if err := verifyDocumentViewRegistration(view, registration); err != nil {
+			return nil, err
+		}
+		visible = append(visible, explorer.DocumentSummary{
+			Document:  cloneDocument(view.Document),
+			Revision:  cloneRevision(view.Revision),
+			SourceURI: view.SourceURI,
+		})
 	}
 	if err := guard.Check(ctx); err != nil {
 		return nil, err

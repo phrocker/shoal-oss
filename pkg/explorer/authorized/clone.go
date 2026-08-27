@@ -43,12 +43,6 @@ func cloneSource(source explorer.Source) explorer.Source {
 	return source
 }
 
-func cloneIngestResult(result explorer.IngestResult) explorer.IngestResult {
-	result.Document = cloneDocument(result.Document)
-	result.Revision = cloneRevision(result.Revision)
-	return result
-}
-
 func cloneDocumentSummary(summary explorer.DocumentSummary) explorer.DocumentSummary {
 	summary.Document = cloneDocument(summary.Document)
 	summary.Revision = cloneRevision(summary.Revision)

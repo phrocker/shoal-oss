@@ -20,10 +20,19 @@
 package auth
 
 import (
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/phrocker/shoal-oss/pkg/shoal"
+)
+
+var (
+	auditRedactionKeyOnce sync.Once
+	auditRedactionKey     [sha256.Size]byte
 )
 
 const (
@@ -41,12 +50,28 @@ type RedactedValue struct {
 }
 
 // Redact irreversibly reduces a query, quote, source text, ID, label,
-// credential, visibility, row/table coordinate, or response to a safe value.
+// credential, visibility, row/table coordinate, or response to a process-keyed
+// pseudonym. The ephemeral key prevents offline guessing and rotates whenever
+// the process restarts.
 func Redact(value []byte) RedactedValue {
 	return RedactedValue{
-		digest: DigestBytes("explorer-redacted-value-v1", value),
+		digest: auditDigest(value),
 		size:   len(value),
 	}
+}
+
+func auditDigest(value []byte) Digest {
+	auditRedactionKeyOnce.Do(func() {
+		if _, err := rand.Read(auditRedactionKey[:]); err != nil {
+			panic("explorer auth: audit redaction key generation failed")
+		}
+	})
+	mac := hmac.New(sha256.New, auditRedactionKey[:])
+	_, _ = mac.Write([]byte("explorer-redacted-value-v2"))
+	_, _ = mac.Write(value)
+	var digest Digest
+	copy(digest[:], mac.Sum(nil))
+	return digest
 }
 
 // Digest returns the non-reversible value identity.

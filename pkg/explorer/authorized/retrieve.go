@@ -144,6 +144,7 @@ func (c *Client) Retrieve(
 		return retrieval.Response{}, err
 	}
 	cloned := cloneRetrievalResponse(response)
+	cloned.RequestID = ""
 	if err := guard.Check(ctx); err != nil {
 		return retrieval.Response{}, err
 	}

@@ -22,6 +22,7 @@ package authorized
 import (
 	"context"
 	"math"
+	"sort"
 	"strings"
 	"time"
 
@@ -255,6 +256,47 @@ func (c *Client) validateRetrievedResponse(
 	nodeScope := make(map[shoal.ID]struct{}, len(request.Scope.NodeIDs))
 	for _, nodeID := range request.Scope.NodeIDs {
 		nodeScope[nodeID] = struct{}{}
+	}
+	expectedIDs := make([]shoal.ID, 0)
+	expectedResults := make([]retrieval.Result, 0)
+	for _, canonical := range corpus.documents {
+		for _, span := range canonical.spans {
+			if len(nodeScope) > 0 &&
+				!canonicalSpanInNodeScope(canonical, span, nodeScope) {
+				continue
+			}
+			path, err := canonicalEvidencePath(canonical, span)
+			if err != nil {
+				return inconsistentRetrieval()
+			}
+			scores := canonicalComponentScores(
+				canonical, span, path, queryTerms, scorer, analyzer)
+			score := scorer.CombinedScore(request.Modes, scores)
+			if score <= 0 {
+				continue
+			}
+			expectedResults = append(expectedResults, retrieval.Result{
+				ID: span.ID, Score: score,
+			})
+		}
+	}
+	sort.Slice(expectedResults, func(left, right int) bool {
+		return retrieval.CompareResult(
+			expectedResults[left], expectedResults[right]) < 0
+	})
+	if uint32(len(expectedResults)) > request.TopK {
+		expectedResults = expectedResults[:request.TopK]
+	}
+	for _, result := range expectedResults {
+		expectedIDs = append(expectedIDs, result.ID)
+	}
+	if len(response.Results) != len(expectedIDs) {
+		return inconsistentRetrieval()
+	}
+	for index, result := range response.Results {
+		if result.ID != expectedIDs[index] {
+			return inconsistentRetrieval()
+		}
 	}
 	for _, result := range response.Results {
 		if len(result.Evidence) != 1 {

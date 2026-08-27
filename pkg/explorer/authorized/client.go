@@ -220,11 +220,36 @@ func (c *Client) Ingest(
 	if current {
 		claimOutcome = sourceClaimCommit
 	}
-	cloned := cloneIngestResult(result)
+	sectionCount, spanCount := documentViewCounts(view)
+	cloned := explorer.IngestResult{
+		Disposition:  result.Disposition,
+		Document:     cloneDocument(view.Document),
+		Revision:     cloneRevision(view.Revision),
+		SectionCount: sectionCount,
+		SpanCount:    spanCount,
+	}
+	if cloned.Disposition != explorer.IngestApplied &&
+		cloned.Disposition != explorer.IngestUnchanged {
+		return explorer.IngestResult{}, inconsistentBase()
+	}
 	if err := guard.Check(ctx); err != nil {
 		return explorer.IngestResult{}, err
 	}
 	return cloned, nil
+}
+
+func documentViewCounts(view explorer.DocumentView) (int, int) {
+	sections, spans := 0, 0
+	var visit func(explorer.SectionView)
+	visit = func(section explorer.SectionView) {
+		sections++
+		spans += len(section.Spans)
+		for _, child := range section.Children {
+			visit(child)
+		}
+	}
+	visit(view.Root)
+	return sections, spans
 }
 
 type sourceClaimOutcome uint8
