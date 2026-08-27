@@ -40,43 +40,104 @@ const (
 )
 
 type encoder struct {
-	data []byte
-	err  error
+	data     []byte
+	expected []byte
+	offset   int
+	compare  bool
+	mismatch bool
+	err      error
 }
 
 func newEncoder() *encoder {
 	return &encoder{data: make([]byte, envelopeHeaderBytes)}
 }
 
+func newComparingEncoder(expected []byte) *encoder {
+	return &encoder{expected: expected, compare: true}
+}
+
 func (e *encoder) ensure(size int) bool {
 	if e.err != nil {
 		return false
 	}
-	if size < 0 || len(e.data) > MaxCanonicalRecordBytes-envelopeChecksumSize-size {
+	position := len(e.data)
+	if e.compare {
+		position = envelopeHeaderBytes + e.offset
+	}
+	if size < 0 ||
+		position > MaxCanonicalRecordBytes-envelopeChecksumSize-size {
 		e.err = invalid("canonical record exceeds the aggregate byte bound")
 		return false
 	}
 	return true
 }
 
-func (e *encoder) putByte(value byte) {
-	if e.ensure(1) {
-		e.data = append(e.data, value)
+func (e *encoder) writeBytes(value []byte) {
+	if !e.ensure(len(value)) {
+		return
 	}
+	if !e.compare {
+		e.data = append(e.data, value...)
+		return
+	}
+	start := e.offset
+	e.offset += len(value)
+	if e.mismatch {
+		return
+	}
+	if start > len(e.expected) || len(value) > len(e.expected)-start {
+		e.mismatch = true
+		return
+	}
+	for index, item := range value {
+		if e.expected[start+index] != item {
+			e.mismatch = true
+			return
+		}
+	}
+}
+
+func (e *encoder) writeString(value string) {
+	if !e.ensure(len(value)) {
+		return
+	}
+	if !e.compare {
+		e.data = append(e.data, value...)
+		return
+	}
+	start := e.offset
+	e.offset += len(value)
+	if e.mismatch {
+		return
+	}
+	if start > len(e.expected) || len(value) > len(e.expected)-start {
+		e.mismatch = true
+		return
+	}
+	for index := range value {
+		if e.expected[start+index] != value[index] {
+			e.mismatch = true
+			return
+		}
+	}
+}
+
+func (e *encoder) putByte(value byte) {
+	var encoded [1]byte
+	encoded[0] = value
+	e.writeBytes(encoded[:])
 }
 
 func (e *encoder) putUint32(value uint32) {
-	if !e.ensure(4) {
-		return
-	}
-	e.data = binary.BigEndian.AppendUint32(e.data, value)
+	var encoded [4]byte
+	binary.BigEndian.PutUint32(encoded[:], value)
+	e.writeBytes(encoded[:])
 }
 
 func (e *encoder) putUint64(value uint64) {
-	if !e.ensure(8) {
-		return
-	}
-	e.data = binary.BigEndian.AppendUint64(e.data, value)
+	var encoded [8]byte
+	binary.BigEndian.PutUint64(encoded[:], value)
+	e.writeBytes(encoded[:])
 }
 
 func (e *encoder) putBytes(name string, value []byte) {
@@ -85,13 +146,16 @@ func (e *encoder) putBytes(name string, value []byte) {
 		return
 	}
 	e.putUint32(uint32(len(value)))
-	if e.ensure(len(value)) {
-		e.data = append(e.data, value...)
-	}
+	e.writeBytes(value)
 }
 
 func (e *encoder) putString(name, value string) {
-	e.putBytes(name, []byte(value))
+	if len(value) > math.MaxUint32 {
+		e.err = invalid(name + " exceeds the codec byte bound")
+		return
+	}
+	e.putUint32(uint32(len(value)))
+	e.writeString(value)
 }
 
 func (e *encoder) putID(name string, value shoal.ID) {

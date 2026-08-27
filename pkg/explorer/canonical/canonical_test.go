@@ -28,6 +28,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -600,6 +601,18 @@ func fixtureRecord(alternateInsertion bool) RecordV1 {
 	}
 }
 
+func largeFixtureRecord(extraBytes int) RecordV1 {
+	record := fixtureRecord(false)
+	record.Source = append(record.Source, bytes.Repeat([]byte{'x'}, extraBytes)...)
+	end := int64(len(record.Source))
+	record.Sections[0].Range.End.Offset = end
+	record.Sections[1].Range.End.Offset = end
+	record.Spans[1].Range.End.Offset = end
+	record.Spans[1].Text = string(
+		record.Source[record.Spans[1].Range.Start.Offset:])
+	return record
+}
+
 func metadata(alternateInsertion bool, entries ...[2]string) shoal.Metadata {
 	result := make(shoal.Metadata, len(entries))
 	if alternateInsertion {
@@ -809,5 +822,63 @@ func TestUnmarshalAcceptsOnlyFixedPointEncodings(t *testing.T) {
 		if !bytes.Equal(encoded, reencoded) {
 			t.Fatal("canonical bytes are not a decode/encode fixed point")
 		}
+	}
+}
+
+func TestCanonicalPayloadComparisonClassifiesDifferences(t *testing.T) {
+	record := fixtureRecord(false)
+	encoded, err := MarshalV1(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := encoded[envelopeHeaderBytes : len(encoded)-envelopeChecksumSize]
+	if err := verifyCanonicalPayload(record, payload); err != nil {
+		t.Fatal(err)
+	}
+	tests := map[string][]byte{
+		"truncated": append([]byte(nil), payload[:len(payload)-1]...),
+		"trailing":  append(append([]byte(nil), payload...), 0),
+		"mismatch": func() []byte {
+			mutated := append([]byte(nil), payload...)
+			mutated[len(mutated)/2] ^= 0xff
+			return mutated
+		}(),
+	}
+	for name, candidate := range tests {
+		t.Run(name, func(t *testing.T) {
+			assertInvalidArgument(
+				t, verifyCanonicalPayload(record, candidate))
+		})
+	}
+}
+
+func TestCanonicalPayloadComparisonDoesNotAllocateRecordSizedBuffer(
+	t *testing.T,
+) {
+	record := largeFixtureRecord(4 << 20)
+	encoded, err := MarshalV1(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := encoded[envelopeHeaderBytes : len(encoded)-envelopeChecksumSize]
+
+	runtime.GC()
+	var before runtime.MemStats
+	runtime.ReadMemStats(&before)
+	if err := verifyCanonicalPayload(record, payload); err != nil {
+		t.Fatal(err)
+	}
+	var after runtime.MemStats
+	runtime.ReadMemStats(&after)
+	runtime.KeepAlive(record)
+	runtime.KeepAlive(encoded)
+
+	const maximumVerifierAllocation = 2 << 20
+	if allocated := after.TotalAlloc - before.TotalAlloc; allocated > maximumVerifierAllocation {
+		t.Fatalf(
+			"canonical payload verification allocated %d bytes, limit %d",
+			allocated,
+			maximumVerifierAllocation,
+		)
 	}
 }
