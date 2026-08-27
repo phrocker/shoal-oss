@@ -333,34 +333,56 @@ func (c *Client) replaceLease(ctx context.Context, current, next Lease) (Lease, 
 }
 
 func (c *Client) ListLeases(ctx context.Context, now time.Time, cursor LeaseCursor, limit int, activeOnly bool) ([]Lease, LeaseCursor, error) {
+	values, next, _, err := c.listLeasesPage(ctx, now, cursor, limit, activeOnly, c.maxScan)
+	return values, next, err
+}
+
+func (c *Client) listLeasesPage(
+	ctx context.Context,
+	now time.Time,
+	cursor LeaseCursor,
+	limit int,
+	activeOnly bool,
+	scanBudget int,
+) ([]Lease, LeaseCursor, int, error) {
 	now, err := requestNow(now, c.now)
 	if err != nil {
-		return nil, LeaseCursor{}, err
+		return nil, LeaseCursor{}, 0, err
 	}
-	if limit < 1 || limit > c.maxScan {
-		return nil, LeaseCursor{}, ErrBounds
+	if limit < 1 || limit > c.maxScan || scanBudget < 1 || scanBudget > c.maxScan {
+		return nil, LeaseCursor{}, 0, ErrBounds
+	}
+	if len(cursor.Row) != 0 &&
+		!bytes.HasPrefix(cursor.Row, leaseBandPrefix(cursor.Band, coordination.DomainID(c.domain))) {
+		return nil, LeaseCursor{}, 0, ErrBounds
 	}
 	result := make([]Lease, 0, limit)
 	band := cursor.Band
 	start := append([]byte(nil), cursor.Row...)
+	scanned := 0
 	for ; ; band++ {
 		prefix := leaseBandPrefix(band, coordination.DomainID(c.domain))
 		if len(start) == 0 || !bytes.HasPrefix(start, prefix) {
 			start = prefix
 		}
-		cells, scanErr := c.store.ScanPrefixFrom(ctx, prefix, start, familyLease, qualifierLease, c.visibility, limit-len(result)+1)
-		if scanErr != nil {
-			return nil, LeaseCursor{}, classify(scanErr)
+		fetch := limit - len(result) + 1
+		if remaining := scanBudget - scanned; fetch > remaining {
+			fetch = remaining
 		}
+		cells, scanErr := c.store.ScanPrefixFrom(ctx, prefix, start, familyLease, qualifierLease, c.visibility, fetch)
+		if scanErr != nil {
+			return nil, LeaseCursor{}, scanned, classify(scanErr)
+		}
+		scanned += len(cells)
 		for _, cell := range cells {
 			value, decodeErr := unmarshalLease(cell.Value)
 			if decodeErr != nil || cell.Timestamp != int64(value.RecordGeneration) {
-				return nil, LeaseCursor{}, ErrCorruption
+				return nil, LeaseCursor{}, scanned, ErrCorruption
 			}
 			if activeOnly {
 				active, e := value.Record.ActiveAt(now)
 				if e != nil {
-					return nil, LeaseCursor{}, ErrCorruption
+					return nil, LeaseCursor{}, scanned, ErrCorruption
 				}
 				if !active {
 					continue
@@ -369,8 +391,12 @@ func (c *Client) ListLeases(ctx context.Context, now time.Time, cursor LeaseCurs
 			result = append(result, cloneLease(value))
 			if len(result) == limit {
 				sortLeases(result)
-				return result, LeaseCursor{Band: band, Row: append(append([]byte(nil), cell.Coordinate.Row...), 0)}, nil
+				return result, afterLeaseCell(band, cell), scanned, nil
 			}
+		}
+		if len(cells) == fetch {
+			sortLeases(result)
+			return result, afterLeaseCell(band, cells[len(cells)-1]), scanned, nil
 		}
 		if band == 255 {
 			break
@@ -378,7 +404,11 @@ func (c *Client) ListLeases(ctx context.Context, now time.Time, cursor LeaseCurs
 		start = nil
 	}
 	sortLeases(result)
-	return result, LeaseCursor{}, nil
+	return result, LeaseCursor{}, scanned, nil
+}
+
+func afterLeaseCell(band byte, cell allocator.Cell) LeaseCursor {
+	return LeaseCursor{Band: band, Row: append(append([]byte(nil), cell.Coordinate.Row...), 0)}
 }
 
 func sortLeases(result []Lease) {
@@ -392,11 +422,17 @@ func sortLeases(result []Lease) {
 
 func (c *Client) anyLease(ctx context.Context, now time.Time, predicate func(coordination.SnapshotLeaseV2) bool) (bool, error) {
 	cursor := LeaseCursor{}
+	scanned := 0
 	for {
-		values, next, err := c.ListLeases(ctx, now, cursor, c.maxScan, true)
+		remaining := c.maxScan - scanned
+		if remaining == 0 {
+			return false, errors.Join(ErrUnavailable, ErrBounds)
+		}
+		values, next, pageScanned, err := c.listLeasesPage(ctx, now, cursor, remaining, true, remaining)
 		if err != nil {
 			return false, err
 		}
+		scanned += pageScanned
 		for _, value := range values {
 			if predicate(value.Record) {
 				return true, nil
@@ -404,6 +440,9 @@ func (c *Client) anyLease(ctx context.Context, now time.Time, predicate func(coo
 		}
 		if len(next.Row) == 0 {
 			return false, nil
+		}
+		if scanned >= c.maxScan {
+			return false, errors.Join(ErrUnavailable, ErrBounds)
 		}
 		cursor = next
 	}

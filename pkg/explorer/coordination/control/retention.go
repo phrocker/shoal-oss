@@ -386,16 +386,30 @@ func (c *Client) ListPendingRetirements(ctx context.Context, after []byte, limit
 		return nil, nil, ErrBounds
 	}
 	var values []Retirement
-	for band := 0; band < 256; band++ {
+	startBand := 0
+	if len(after) != 0 {
+		if len(after) < 3 || after[0] != 1 || after[1] != 'R' ||
+			!bytes.HasPrefix(after, retirementBandPrefix(after[2], coordination.DomainID(c.domain))) {
+			return nil, nil, ErrBounds
+		}
+		startBand = int(after[2])
+	}
+	scanned := 0
+	for band := startBand; band < 256; band++ {
 		prefix := retirementBandPrefix(byte(band), coordination.DomainID(c.domain))
 		start := prefix
 		if len(after) > 0 && bytes.HasPrefix(after, prefix) {
 			start = after
 		}
-		cells, err := c.store.ScanPrefixFrom(ctx, prefix, start, familyRetirement, qualifierRetirement, c.visibility, limit-len(values)+1)
+		fetch := limit - len(values) + 1
+		if remaining := c.maxScan - scanned; fetch > remaining {
+			fetch = remaining
+		}
+		cells, err := c.store.ScanPrefixFrom(ctx, prefix, start, familyRetirement, qualifierRetirement, c.visibility, fetch)
 		if err != nil {
 			return nil, nil, classify(err)
 		}
+		scanned += len(cells)
 		for _, cell := range cells {
 			value, e := unmarshalRetirement(cell.Value)
 			if e != nil || cell.Timestamp != int64(value.RecordGeneration) {
@@ -409,6 +423,11 @@ func (c *Client) ListPendingRetirements(ctx context.Context, after []byte, limit
 				return values, append(append([]byte(nil), cell.Coordinate.Row...), 0), nil
 			}
 		}
+		if len(cells) == fetch {
+			sortRetirements(values)
+			return values, append(append([]byte(nil), cells[len(cells)-1].Coordinate.Row...), 0), nil
+		}
+		after = nil
 	}
 	sortRetirements(values)
 	return values, nil, nil

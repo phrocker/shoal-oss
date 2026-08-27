@@ -16,6 +16,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"sort"
 	"sync"
 	"testing"
@@ -478,5 +479,201 @@ func TestRetirementApprovalAndApplication(t *testing.T) {
 	}
 	if applied.Decision.State != coordination.RetirementApplied || applied.RecordGeneration != 3 {
 		t.Fatalf("applied=%+v", applied)
+	}
+}
+
+func leaseRowsInBand(t *testing.T, count int) []coordination.LeaseID {
+	t.Helper()
+	domain := coordination.DomainID("domain")
+	byBand := make(map[byte][]coordination.LeaseID)
+	for index := 0; index < 100_000; index++ {
+		id := coordination.LeaseID(fmt.Sprintf("lease-%06d", index))
+		band := coordination.B8('L', domain, id)
+		byBand[band] = append(byBand[band], id)
+		if len(byBand[band]) == count {
+			ids := byBand[band]
+			sort.Slice(ids, func(i, j int) bool {
+				left, _ := coordination.SnapshotLeaseRow(domain, ids[i])
+				right, _ := coordination.SnapshotLeaseRow(domain, ids[j])
+				return bytes.Compare(left, right) < 0
+			})
+			return ids
+		}
+	}
+	t.Fatal("could not find enough lease IDs in one band")
+	return nil
+}
+
+func retirementRowsInBand(t *testing.T, count int) []coordination.EntityID {
+	t.Helper()
+	domain := coordination.DomainID("domain")
+	byBand := make(map[byte][]coordination.EntityID)
+	for index := 0; index < 100_000; index++ {
+		id := coordination.EntityID(fmt.Sprintf("object-%06d", index))
+		band := coordination.B8('X', domain, []byte{'D'}, id)
+		byBand[band] = append(byBand[band], id)
+		if len(byBand[band]) == count {
+			ids := byBand[band]
+			sort.Slice(ids, func(i, j int) bool {
+				left, _ := coordination.RetirementRow(domain, 'D', ids[i])
+				right, _ := coordination.RetirementRow(domain, 'D', ids[j])
+				return bytes.Compare(left, right) < 0
+			})
+			return ids
+		}
+	}
+	t.Fatal("could not find enough retirement IDs in one band")
+	return nil
+}
+
+func seedLease(t *testing.T, store *memoryStore, client *Client, now time.Time, id coordination.LeaseID, state coordination.LeaseState, pin coordination.Digest) {
+	t.Helper()
+	value := Lease{
+		Record: coordination.SnapshotLeaseV2{
+			LeaseID: id, Frontier: 10, Owner: coordination.OwnerID("reader"), Fence: 1,
+			AuthorityGeneration: 1, RetentionGeneration: 1, PolicyGeneration: 1,
+			PolicyCopyPinDigest: pin, CreatedAt: now, RenewedAt: now,
+			ExpiresAt: now.Add(time.Hour), State: state,
+		},
+		RecordGeneration: 1, UpdatedAt: now,
+	}
+	encoded, err := marshalLease(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	coordinate, err := client.leaseCoordinate(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.put(allocator.Update{Coordinate: coordinate, Value: encoded, Timestamp: 1})
+}
+
+func seedRetirement(t *testing.T, store *memoryStore, client *Client, now time.Time, id coordination.EntityID, state coordination.RetirementState) {
+	t.Helper()
+	value := Retirement{
+		Decision: coordination.RetirementDecisionV1{
+			ObjectKind: coordination.EntityKind("D"), ObjectID: id, ObjectGeneration: 1,
+			SafeAfterFrontier: 5, SafeAfterTime: now, HistoryFloor: 1,
+			ProofDigest: digest("proof"), AuthorityGeneration: 1, State: state,
+		},
+		Owner: coordination.OwnerID("gc"), Fence: 1, RetentionGeneration: 1,
+		RecordGeneration: 1, UpdatedAt: now,
+	}
+	encoded, err := marshalRetirement(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	coordinate, err := client.retirementCoordinate('D', id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.put(allocator.Update{Coordinate: coordinate, Value: encoded, Timestamp: 1})
+}
+
+func TestLeasePaginationStaysInBandAcrossFilteredPages(t *testing.T) {
+	now := time.Date(2026, 8, 27, 16, 0, 0, 0, time.UTC)
+	store := newStore()
+	seedHead(t, store, baseHead(now))
+	client, _ := newClient(t, store, now, leases{})
+	initialize(t, client, now)
+	ids := leaseRowsInBand(t, 7)
+	for index, id := range ids {
+		state := coordination.LeaseStateReleased
+		if index >= 4 {
+			state = coordination.LeaseStateActive
+		}
+		seedLease(t, store, client, now, id, state, digest("pins"))
+	}
+	var cursor LeaseCursor
+	seen := make(map[string]int)
+	for {
+		values, next, err := client.ListLeases(context.Background(), now, cursor, 2, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, value := range values {
+			seen[string(value.Record.LeaseID)]++
+		}
+		if len(next.Row) == 0 {
+			break
+		}
+		cursor = next
+	}
+	if len(seen) != 3 {
+		t.Fatalf("saw %d active leases, want 3: %#v", len(seen), seen)
+	}
+	for _, id := range ids[4:] {
+		if seen[string(id)] != 1 {
+			t.Fatalf("lease %q appeared %d times", id, seen[string(id)])
+		}
+	}
+}
+
+func TestRetirementPaginationStaysInBandAcrossFilteredPages(t *testing.T) {
+	now := time.Date(2026, 8, 27, 16, 0, 0, 0, time.UTC)
+	store := newStore()
+	seedHead(t, store, baseHead(now))
+	client, _ := newClient(t, store, now, leases{})
+	initialize(t, client, now)
+	ids := retirementRowsInBand(t, 7)
+	for index, id := range ids {
+		state := coordination.RetirementApplied
+		if index >= 4 {
+			state = coordination.RetirementCandidate
+		}
+		seedRetirement(t, store, client, now, id, state)
+	}
+	var cursor []byte
+	seen := make(map[string]int)
+	for {
+		values, next, err := client.ListPendingRetirements(context.Background(), cursor, 2)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, value := range values {
+			seen[string(value.Decision.ObjectID)]++
+		}
+		if len(next) == 0 {
+			break
+		}
+		cursor = next
+	}
+	if len(seen) != 3 {
+		t.Fatalf("saw %d pending retirements, want 3: %#v", len(seen), seen)
+	}
+	for _, id := range ids[4:] {
+		if seen[string(id)] != 1 {
+			t.Fatalf("retirement %q appeared %d times", id, seen[string(id)])
+		}
+	}
+}
+
+func TestLeaseSafetyQueryFailsClosedAtScanBound(t *testing.T) {
+	now := time.Date(2026, 8, 27, 16, 0, 0, 0, time.UTC)
+	store := newStore()
+	seedHead(t, store, baseHead(now))
+	client, _ := newClient(t, store, now, leases{})
+	initialize(t, client, now)
+	client.maxScan = 3
+	ids := leaseRowsInBand(t, 4)
+	for index, id := range ids {
+		state := coordination.LeaseStateActive
+		pin := digest("other")
+		if index == len(ids)-1 {
+			pin = digest("target")
+		}
+		seedLease(t, store, client, now, id, state, pin)
+	}
+	selected, err := (LeaseSource{Client: client}).SelectsPolicyCopy(
+		context.Background(), coordination.DomainID("domain"), coordination.LPART("part"), 1, digest("target"),
+	)
+	if selected || !errors.Is(err, ErrBounds) || !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("safety query = %v, %v; want fail-closed bounds", selected, err)
+	}
+	selected, err = (LeaseSource{Client: client}).SelectsIndexGeneration(
+		context.Background(), coordination.DomainID("domain"), coordination.Family("lexical"), coordination.IGEN("target"),
+	)
+	if selected || !errors.Is(err, ErrBounds) || !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("index safety query = %v, %v; want fail-closed bounds", selected, err)
 	}
 }
