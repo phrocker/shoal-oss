@@ -23,6 +23,9 @@ package explorer
 
 import (
 	"context"
+	"strings"
+	"time"
+	"unicode/utf8"
 
 	"github.com/phrocker/shoal-oss/pkg/document"
 	"github.com/phrocker/shoal-oss/pkg/graph"
@@ -42,6 +45,13 @@ type Source struct {
 	MediaType string
 	Content   string
 	Metadata  shoal.Metadata
+}
+
+// IngestOptions controls descriptive source-revision values without changing
+// publication order. A zero CreatedAt uses the current time; a nonzero value
+// is retained exactly after UTC normalization.
+type IngestOptions struct {
+	CreatedAt time.Time
 }
 
 // IngestDisposition reports whether ingestion created a revision or found the
@@ -90,6 +100,54 @@ type NeighborhoodRequest struct {
 	NodeIDs   []shoal.ID
 	Depth     uint32
 	EdgeTypes []string
+}
+
+// Normalize clones and validates a bounded neighborhood request. Depth zero
+// means one. Duplicate seeds and edge types collapse by first occurrence.
+func (r NeighborhoodRequest) Normalize() (NeighborhoodRequest, error) {
+	normalized := NeighborhoodRequest{
+		Depth:     r.Depth,
+		NodeIDs:   make([]shoal.ID, 0, len(r.NodeIDs)),
+		EdgeTypes: make([]string, 0, len(r.EdgeTypes)),
+	}
+	if normalized.Depth == 0 {
+		normalized.Depth = 1
+	}
+	if normalized.Depth > 16 {
+		return NeighborhoodRequest{}, shoal.NewError(
+			shoal.ErrorInvalidArgument, "graph depth cannot exceed 16")
+	}
+	seenNodes := make(map[shoal.ID]struct{}, len(r.NodeIDs))
+	for _, id := range r.NodeIDs {
+		if err := shoal.ValidateRequiredID("graph node ID", id); err != nil {
+			return NeighborhoodRequest{}, err
+		}
+		if _, duplicate := seenNodes[id]; duplicate {
+			continue
+		}
+		seenNodes[id] = struct{}{}
+		normalized.NodeIDs = append(normalized.NodeIDs, id)
+	}
+	if len(normalized.NodeIDs) == 0 {
+		return NeighborhoodRequest{}, shoal.NewError(
+			shoal.ErrorInvalidArgument, "at least one graph node ID is required")
+	}
+	seenTypes := make(map[string]struct{}, len(r.EdgeTypes))
+	for _, edgeType := range r.EdgeTypes {
+		if !utf8.ValidString(edgeType) || strings.TrimSpace(edgeType) == "" {
+			return NeighborhoodRequest{}, shoal.NewError(
+				shoal.ErrorInvalidArgument, "edge types must be valid nonblank UTF-8")
+		}
+		if err := shoal.ValidateSemanticString("edge type", edgeType); err != nil {
+			return NeighborhoodRequest{}, err
+		}
+		if _, duplicate := seenTypes[edgeType]; duplicate {
+			continue
+		}
+		seenTypes[edgeType] = struct{}{}
+		normalized.EdgeTypes = append(normalized.EdgeTypes, edgeType)
+	}
+	return normalized, nil
 }
 
 // Neighborhood is a deterministic graph subgraph.

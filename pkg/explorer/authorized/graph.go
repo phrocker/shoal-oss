@@ -1,0 +1,391 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements. See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership. The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License. You may obtain a copy of the License at
+ *
+ *     https://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied. See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+package authorized
+
+import (
+	"context"
+	"sort"
+	"time"
+
+	"github.com/phrocker/shoal-oss/pkg/explorer"
+	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
+	"github.com/phrocker/shoal-oss/pkg/graph"
+	"github.com/phrocker/shoal-oss/pkg/shoal"
+)
+
+// Connect authorizes both current endpoints and stores only the trusted
+// edge-local policy. Endpoint rules are re-evaluated dynamically on every use.
+func (c *Client) Connect(ctx context.Context, edge graph.Edge) error {
+	if err := edge.Validate(); err != nil {
+		return err
+	}
+	ownedEdge := cloneGraphEdge(edge)
+	decision, guard, now, err := c.begin(ctx, auth.OperationConnect)
+	if err != nil {
+		return err
+	}
+
+	c.mutationMu.Lock()
+	defer c.mutationMu.Unlock()
+	lease, err := c.policyStore.AcquireMutation(ctx)
+	if err != nil {
+		return policyCatalogWriteError(ctx, err)
+	}
+	defer lease.Release()
+	if err := guard.Check(ctx); err != nil {
+		return err
+	}
+	from, err := c.authorizedNode(
+		ctx, ownedEdge.From, decision, auth.OperationConnect, now)
+	if err != nil {
+		return err
+	}
+	to, err := c.authorizedNode(
+		ctx, ownedEdge.To, decision, auth.OperationConnect, now)
+	if err != nil {
+		return err
+	}
+	if !rulesShareDomain(from.Rule, to.Rule) {
+		return auth.ObjectNotFound()
+	}
+	edgeRule, err := c.selectEdgeRule(
+		ctx, decision, cloneGraphEdge(ownedEdge), now)
+	if err != nil {
+		return err
+	}
+	if !rulesShareDomain(edgeRule, from.Rule) ||
+		!rulesShareDomain(edgeRule, to.Rule) {
+		return authorizationDenied()
+	}
+	if err := edgeRule.Authorize(
+		decision, auth.OperationConnect, now); err != nil {
+		return authorizationDenied()
+	}
+	if err := guard.Check(ctx); err != nil {
+		return err
+	}
+	registration := EdgeRegistration{Edge: ownedEdge, Rule: edgeRule}
+	if err := c.policyStore.ReserveEdge(ctx, registration); err != nil {
+		return policyCatalogWriteError(ctx, err)
+	}
+	if err := c.base.Connect(ctx, cloneGraphEdge(ownedEdge)); err != nil {
+		if !explorer.IsIndeterminateCommit(err) {
+			if rollbackErr := c.policyStore.RollbackEdgeReservation(
+				context.WithoutCancel(ctx), registration,
+			); rollbackErr != nil {
+				return policyCatalogWriteError(ctx, rollbackErr)
+			}
+		}
+		return directBaseError(err)
+	}
+	if err := c.policyStore.PutEdge(ctx, registration); err != nil {
+		return policyCatalogWriteError(ctx, err)
+	}
+	return guard.Check(ctx)
+}
+
+// Neighborhood filters by current node and edge rules, then recomputes
+// reachability so hidden intermediates cannot disclose or bridge.
+func (c *Client) Neighborhood(
+	ctx context.Context,
+	request explorer.NeighborhoodRequest,
+) (explorer.Neighborhood, error) {
+	normalized, err := request.Normalize()
+	if err != nil {
+		return explorer.Neighborhood{}, err
+	}
+	decision, guard, now, err := c.begin(ctx, auth.OperationNeighborhood)
+	if err != nil {
+		return explorer.Neighborhood{}, err
+	}
+	for _, nodeID := range normalized.NodeIDs {
+		if _, err := c.authorizedNode(
+			ctx, nodeID, decision, auth.OperationNeighborhood, now); err != nil {
+			return explorer.Neighborhood{}, err
+		}
+	}
+	raw, err := c.base.Neighborhood(ctx, normalized)
+	if err != nil {
+		return explorer.Neighborhood{}, directBaseError(err)
+	}
+
+	candidates := make(map[shoal.ID]graph.Node, len(raw.Nodes))
+	registrations := make(map[shoal.ID]NodeRegistration, len(raw.Nodes))
+	for _, node := range raw.Nodes {
+		if err := node.Validate(); err != nil {
+			return explorer.Neighborhood{}, inconsistentBase()
+		}
+		registration, ok, err := c.policyStore.Node(ctx, node.ID)
+		if err != nil {
+			return explorer.Neighborhood{}, policyCatalogReadError(ctx, err)
+		}
+		if !ok {
+			continue
+		}
+		allowed, err := ruleAllows(
+			registration.Rule, decision, auth.OperationNeighborhood, now)
+		if err != nil {
+			return explorer.Neighborhood{}, err
+		}
+		if !allowed {
+			continue
+		}
+		if _, duplicate := candidates[node.ID]; duplicate {
+			return explorer.Neighborhood{}, inconsistentBase()
+		}
+		candidates[node.ID] = cloneGraphNode(node)
+		registrations[node.ID] = registration
+	}
+	canonicalNodes, err := c.canonicalRegisteredNodes(ctx, registrations)
+	if err != nil {
+		return explorer.Neighborhood{}, err
+	}
+	visibleNodes := make(map[shoal.ID]graph.Node, len(candidates))
+	for nodeID, node := range candidates {
+		canonical, ok := canonicalNodes[nodeID]
+		if !ok || !graphNodesEqual(canonical, node) {
+			return explorer.Neighborhood{}, inconsistentBase()
+		}
+		visibleNodes[nodeID] = node
+	}
+	for _, seed := range normalized.NodeIDs {
+		if _, ok := visibleNodes[seed]; !ok {
+			return explorer.Neighborhood{}, inconsistentBase()
+		}
+	}
+
+	typeFilter := make(map[string]struct{}, len(normalized.EdgeTypes))
+	for _, edgeType := range normalized.EdgeTypes {
+		typeFilter[edgeType] = struct{}{}
+	}
+	admittedEdges := make(map[shoal.ID]graph.Edge, len(raw.Edges))
+	for _, edge := range raw.Edges {
+		if err := edge.Validate(); err != nil {
+			return explorer.Neighborhood{}, inconsistentBase()
+		}
+		if len(typeFilter) > 0 {
+			if _, ok := typeFilter[edge.Type]; !ok {
+				continue
+			}
+		}
+		if _, ok := visibleNodes[edge.From]; !ok {
+			continue
+		}
+		if _, ok := visibleNodes[edge.To]; !ok {
+			continue
+		}
+		registration, ok, err := c.policyStore.Edge(ctx, edge.ID)
+		if err != nil {
+			return explorer.Neighborhood{}, policyCatalogReadError(ctx, err)
+		}
+		if !ok || !graphEdgesEqual(registration.Edge, edge) {
+			continue
+		}
+		allowed, err := c.edgeAllows(
+			ctx, registration, decision, auth.OperationNeighborhood, now)
+		if err != nil {
+			return explorer.Neighborhood{}, err
+		}
+		if !allowed {
+			continue
+		}
+		if _, duplicate := admittedEdges[edge.ID]; duplicate {
+			return explorer.Neighborhood{}, inconsistentBase()
+		}
+		admittedEdges[edge.ID] = cloneGraphEdge(edge)
+	}
+
+	reachable := make(map[shoal.ID]struct{}, len(normalized.NodeIDs))
+	frontier := make(map[shoal.ID]struct{}, len(normalized.NodeIDs))
+	for _, seed := range normalized.NodeIDs {
+		reachable[seed] = struct{}{}
+		frontier[seed] = struct{}{}
+	}
+	selectedEdges := make(map[shoal.ID]graph.Edge)
+	for depth := uint32(0); depth < normalized.Depth && len(frontier) > 0; depth++ {
+		next := make(map[shoal.ID]struct{})
+		for edgeID, edge := range admittedEdges {
+			_, from := frontier[edge.From]
+			_, to := frontier[edge.To]
+			if !from && !to {
+				continue
+			}
+			selectedEdges[edgeID] = edge
+			for _, nodeID := range []shoal.ID{edge.From, edge.To} {
+				if _, seen := reachable[nodeID]; seen {
+					continue
+				}
+				reachable[nodeID] = struct{}{}
+				next[nodeID] = struct{}{}
+			}
+		}
+		frontier = next
+	}
+
+	result := explorer.Neighborhood{
+		Nodes: make([]graph.Node, 0, len(reachable)),
+		Edges: make([]graph.Edge, 0, len(selectedEdges)),
+	}
+	for nodeID := range reachable {
+		result.Nodes = append(result.Nodes, cloneGraphNode(visibleNodes[nodeID]))
+	}
+	for _, edge := range selectedEdges {
+		result.Edges = append(result.Edges, cloneGraphEdge(edge))
+	}
+	sort.Slice(result.Nodes, func(left, right int) bool {
+		return shoal.CompareID(result.Nodes[left].ID, result.Nodes[right].ID) < 0
+	})
+	sort.Slice(result.Edges, func(left, right int) bool {
+		return shoal.CompareID(result.Edges[left].ID, result.Edges[right].ID) < 0
+	})
+	if err := guard.Check(ctx); err != nil {
+		return explorer.Neighborhood{}, err
+	}
+	return result, nil
+}
+
+func (c *Client) edgeAllows(
+	ctx context.Context,
+	registration EdgeRegistration,
+	decision auth.Decision,
+	operation auth.Operation,
+	now time.Time,
+) (bool, error) {
+	allowed, err := ruleAllows(registration.Rule, decision, operation, now)
+	if err != nil || !allowed {
+		return allowed, err
+	}
+	from, ok, err := c.policyStore.Node(ctx, registration.Edge.From)
+	if err != nil {
+		return false, policyCatalogReadError(ctx, err)
+	}
+	if !ok {
+		return false, nil
+	}
+	to, ok, err := c.policyStore.Node(ctx, registration.Edge.To)
+	if err != nil {
+		return false, policyCatalogReadError(ctx, err)
+	}
+	if !ok {
+		return false, nil
+	}
+	fromAllowed, err := ruleAllows(from.Rule, decision, operation, now)
+	if err != nil || !fromAllowed {
+		return fromAllowed, err
+	}
+	toAllowed, err := ruleAllows(to.Rule, decision, operation, now)
+	if err != nil || !toAllowed {
+		return toAllowed, err
+	}
+	return true, nil
+}
+
+func (c *Client) authorizedNode(
+	ctx context.Context,
+	nodeID shoal.ID,
+	decision auth.Decision,
+	operation auth.Operation,
+	now time.Time,
+) (NodeRegistration, error) {
+	registration, ok, err := c.policyStore.Node(ctx, nodeID)
+	if err != nil {
+		return NodeRegistration{}, policyCatalogReadError(ctx, err)
+	}
+	if !ok {
+		return NodeRegistration{}, auth.ObjectNotFound()
+	}
+	allowed, err := ruleAllows(registration.Rule, decision, operation, now)
+	if err != nil {
+		return NodeRegistration{}, err
+	}
+	if !allowed {
+		return NodeRegistration{}, auth.ObjectNotFound()
+	}
+	if _, err := c.canonicalRegisteredNodes(
+		ctx, map[shoal.ID]NodeRegistration{nodeID: registration},
+	); err != nil {
+		return NodeRegistration{}, err
+	}
+	return registration, nil
+}
+
+func (c *Client) canonicalRegisteredNodes(
+	ctx context.Context,
+	registrations map[shoal.ID]NodeRegistration,
+) (map[shoal.ID]graph.Node, error) {
+	summaries, err := c.base.Documents(ctx)
+	if err != nil {
+		return nil, err
+	}
+	currentBase := make(map[shoal.ID]shoal.ID, len(summaries))
+	for _, summary := range summaries {
+		if err := validateSummary(summary); err != nil {
+			return nil, inconsistentBase()
+		}
+		if _, duplicate := currentBase[summary.Document.ID]; duplicate {
+			return nil, inconsistentBase()
+		}
+		currentBase[summary.Document.ID] = summary.Revision.ID
+	}
+	required := make(map[shoal.ID]shoal.ID)
+	for _, registration := range registrations {
+		if revisionID, ok := required[registration.DocumentID]; ok &&
+			revisionID != registration.RevisionID {
+			return nil, inconsistentBase()
+		}
+		required[registration.DocumentID] = registration.RevisionID
+	}
+	canonicalDocuments := make(
+		map[shoal.ID]*canonicalRetrievalDocument, len(required))
+	for documentID, revisionID := range required {
+		if currentBase[documentID] != revisionID {
+			return nil, auth.ObjectNotFound()
+		}
+		current, ok, err := c.policyStore.CurrentRevision(ctx, documentID)
+		if err != nil {
+			return nil, policyCatalogReadError(ctx, err)
+		}
+		if !ok || current.RevisionID != revisionID {
+			return nil, auth.ObjectNotFound()
+		}
+		view, err := c.base.Document(ctx, documentID, revisionID)
+		if err != nil {
+			return nil, directBaseError(err)
+		}
+		if err := verifyDocumentViewRegistration(view, current); err != nil {
+			return nil, err
+		}
+		canonical, err := buildCanonicalRetrievalDocument(view, current)
+		if err != nil {
+			return nil, inconsistentBase()
+		}
+		canonicalDocuments[documentID] = canonical
+	}
+	nodes := make(map[shoal.ID]graph.Node, len(registrations))
+	for nodeID, registration := range registrations {
+		canonical := canonicalDocuments[registration.DocumentID]
+		node, ok := canonical.nodes[nodeID]
+		if !ok {
+			return nil, inconsistentBase()
+		}
+		nodes[nodeID] = cloneGraphNode(node)
+	}
+	return nodes, nil
+}

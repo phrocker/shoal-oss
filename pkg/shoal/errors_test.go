@@ -94,3 +94,21 @@ func TestIsErrorCodeStopsAtNonComparableValueCycle(t *testing.T) {
 		t.Fatal("cyclic error unexpectedly matched")
 	}
 }
+
+func TestErrorCodeLiteralsAreStable(t *testing.T) {
+	codes := map[shoal.ErrorCode]string{
+		shoal.ErrorInvalidArgument: "invalid_argument",
+		shoal.ErrorNotFound:        "not_found",
+		shoal.ErrorConflict:        "conflict",
+		shoal.ErrorUnauthorized:    "unauthorized",
+		shoal.ErrorUnavailable:     "unavailable",
+		shoal.ErrorCanceled:        "canceled",
+		shoal.ErrorDeadline:        "deadline_exceeded",
+		shoal.ErrorInternal:        "internal",
+	}
+	for code, literal := range codes {
+		if string(code) != literal {
+			t.Fatalf("error code %q changed from %q", code, literal)
+		}
+	}
+}

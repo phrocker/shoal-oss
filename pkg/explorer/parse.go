@@ -63,10 +63,34 @@ type orderedChild struct {
 	index     int
 }
 
+type parserLimits struct {
+	maxSourceBytes int
+	maxSourceLines int
+	maxSections    int
+	maxSpans       int
+}
+
+var defaultParserLimits = parserLimits{
+	maxSourceBytes: document.MaxRevisionSourceBytes,
+	maxSourceLines: document.MaxSourceLinesPerRevision,
+	maxSections:    document.MaxSectionsPerRevision,
+	maxSpans:       document.MaxSpansPerRevision,
+}
+
 func parseSource(source Source, createdAt time.Time) (parsedSource, error) {
+	return parseSourceWithLimits(source, createdAt, defaultParserLimits)
+}
+
+func parseSourceWithLimits(
+	source Source, createdAt time.Time, limits parserLimits,
+) (parsedSource, error) {
 	if !utf8.ValidString(source.URI) || strings.TrimSpace(source.URI) == "" {
 		return parsedSource{}, shoal.NewError(
 			shoal.ErrorInvalidArgument, "source URI is required and must be valid UTF-8")
+	}
+	if len(source.Content) > limits.maxSourceBytes {
+		return parsedSource{}, shoal.NewError(
+			shoal.ErrorInvalidArgument, "source content exceeds the public byte bound")
 	}
 	if !utf8.ValidString(source.Title) || !utf8.ValidString(source.Content) {
 		return parsedSource{}, shoal.NewError(
@@ -88,7 +112,10 @@ func parseSource(source Source, createdAt time.Time) (parsedSource, error) {
 		return parsedSource{}, err
 	}
 
-	lines := splitSourceLines(source.Content)
+	lines, err := splitSourceLines(source.Content, limits.maxSourceLines)
+	if err != nil {
+		return parsedSource{}, err
+	}
 	title := strings.TrimSpace(source.Title)
 	if title == "" {
 		title = inferredTitle(source.URI, lines, source.MediaType)
@@ -115,12 +142,20 @@ func parseSource(source Source, createdAt time.Time) (parsedSource, error) {
 	sections := []document.Section{root}
 	var headings []headingRecord
 	if source.MediaType == MediaTypeMarkdown {
-		headings = parseHeadings(lines, documentID, revisionID, rootID, len(source.Content))
+		headings, err = parseHeadings(
+			lines, documentID, revisionID, rootID, len(source.Content), limits.maxSections)
+		if err != nil {
+			return parsedSource{}, err
+		}
 		for _, heading := range headings {
 			sections = append(sections, heading.section)
 		}
 	}
-	spans := parseParagraphs(source.Content, lines, headings, documentID, revisionID, rootID)
+	spans, err := parseParagraphs(
+		source.Content, lines, headings, documentID, revisionID, rootID, limits.maxSpans)
+	if err != nil {
+		return parsedSource{}, err
+	}
 	assignChildOrder(sections, spans)
 
 	doc := document.Document{
@@ -138,6 +173,21 @@ func parseSource(source Source, createdAt time.Time) (parsedSource, error) {
 		Metadata:      cloneMetadata(source.Metadata),
 	}
 	nodes, edges := materializeGraph(doc, sections, spans)
+	if err := document.ValidateRevisionContent(
+		source.Content, doc, revision, sections, spans,
+	); err != nil {
+		return parsedSource{}, err
+	}
+	for _, node := range nodes {
+		if err := node.Validate(); err != nil {
+			return parsedSource{}, err
+		}
+	}
+	for _, edge := range edges {
+		if err := edge.Validate(); err != nil {
+			return parsedSource{}, err
+		}
+	}
 	return parsedSource{
 		document: doc,
 		revision: revision,
@@ -149,9 +199,20 @@ func parseSource(source Source, createdAt time.Time) (parsedSource, error) {
 	}, nil
 }
 
-func splitSourceLines(content string) []sourceLine {
-	lines := make([]sourceLine, 0, strings.Count(content, "\n")+1)
+func splitSourceLines(content string, maximum int) ([]sourceLine, error) {
+	capacity := len(content)/80 + 1
+	if capacity > maximum {
+		capacity = maximum
+	}
+	if capacity > 4096 {
+		capacity = 4096
+	}
+	lines := make([]sourceLine, 0, capacity)
 	for start := 0; start < len(content); {
+		if len(lines) >= maximum {
+			return nil, shoal.NewError(
+				shoal.ErrorInvalidArgument, "source content has too many line fragments")
+		}
 		newline := strings.IndexByte(content[start:], '\n')
 		end := len(content)
 		if newline >= 0 {
@@ -169,7 +230,7 @@ func splitSourceLines(content string) []sourceLine {
 		})
 		start = end
 	}
-	return lines
+	return lines, nil
 }
 
 func markdownHeading(line string) (int, string, bool) {
@@ -225,8 +286,11 @@ func parseMarkdownFence(line string) (markdownFence, string, bool) {
 	return markdownFence{marker: marker, length: length}, trimmed[length:], true
 }
 
-func parseHeadings(lines []sourceLine, documentID, revisionID, rootID shoal.ID,
-	contentLength int) []headingRecord {
+func parseHeadings(
+	lines []sourceLine,
+	documentID, revisionID, rootID shoal.ID,
+	contentLength, maxSections int,
+) ([]headingRecord, error) {
 	var headings []headingRecord
 	var stack []int
 	occurrences := make(map[string]int)
@@ -249,6 +313,10 @@ func parseHeadings(lines []sourceLine, documentID, revisionID, rootID shoal.ID,
 		level, title, ok := markdownHeading(line.text)
 		if !ok {
 			continue
+		}
+		if len(headings)+1 >= maxSections {
+			return nil, shoal.NewError(
+				shoal.ErrorInvalidArgument, "revision has too many sections")
 		}
 		for len(stack) > 0 && headings[stack[len(stack)-1]].level >= level {
 			stack = stack[:len(stack)-1]
@@ -280,20 +348,27 @@ func parseHeadings(lines []sourceLine, documentID, revisionID, rootID shoal.ID,
 		headings = append(headings, record)
 		stack = append(stack, len(headings)-1)
 	}
-	for i := range headings {
-		for j := i + 1; j < len(headings); j++ {
-			if headings[j].level <= headings[i].level {
-				headings[i].section.Range.End.Offset =
-					int64(lines[headings[j].lineIndex].start)
-				break
-			}
+	stack = stack[:0]
+	for index := range headings {
+		for len(stack) > 0 &&
+			headings[stack[len(stack)-1]].level >= headings[index].level {
+			closed := stack[len(stack)-1]
+			stack = stack[:len(stack)-1]
+			headings[closed].section.Range.End.Offset =
+				int64(lines[headings[index].lineIndex].start)
 		}
+		stack = append(stack, index)
 	}
-	return headings
+	return headings, nil
 }
 
-func parseParagraphs(content string, lines []sourceLine, headings []headingRecord,
-	documentID, revisionID, rootID shoal.ID) []document.Span {
+func parseParagraphs(
+	content string,
+	lines []sourceLine,
+	headings []headingRecord,
+	documentID, revisionID, rootID shoal.ID,
+	maxSpans int,
+) ([]document.Span, error) {
 	headingLines := make(map[int]struct{}, len(headings))
 	for _, heading := range headings {
 		headingLines[heading.lineIndex] = struct{}{}
@@ -333,6 +408,10 @@ func parseParagraphs(content string, lines []sourceLine, headings []headingRecor
 			end -= size
 		}
 		if start < end {
+			if len(spans) >= maxSpans {
+				return nil, shoal.NewError(
+					shoal.ErrorInvalidArgument, "revision has too many spans")
+			}
 			sectionID := rootID
 			for i := range headings {
 				section := headings[i].section
@@ -360,7 +439,7 @@ func parseParagraphs(content string, lines []sourceLine, headings []headingRecor
 		}
 		lineIndex = endLine + 1
 	}
-	return spans
+	return spans, nil
 }
 
 func assignChildOrder(sections []document.Section, spans []document.Span) {
@@ -487,13 +566,7 @@ func hexDigest(value string) string {
 }
 
 func validateMetadata(metadata shoal.Metadata) error {
-	for key, value := range metadata {
-		if !utf8.ValidString(key) || !utf8.ValidString(value) {
-			return shoal.NewError(
-				shoal.ErrorInvalidArgument, "source metadata must be valid UTF-8")
-		}
-	}
-	return nil
+	return shoal.ValidateMetadata("source metadata", metadata)
 }
 
 func cloneMetadata(metadata shoal.Metadata) shoal.Metadata {

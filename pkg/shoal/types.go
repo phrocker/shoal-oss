@@ -20,7 +20,8 @@
 // Package shoal defines values shared by Shoal's public knowledge APIs.
 package shoal
 
-// ID is a stable, caller-visible identifier.
+// ID is a stable, caller-visible opaque byte string. Shoal does not generate,
+// normalize, or require UTF-8 for IDs at the public value layer.
 type ID string
 
 // Metadata contains application-defined attributes. Shoal treats keys and

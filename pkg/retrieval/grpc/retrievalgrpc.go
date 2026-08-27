@@ -70,7 +70,7 @@ func (s *server) Retrieve(
 		return nil, toStatusError(err)
 	}
 
-	protoResponse, err := responseToProto(response)
+	protoResponse, err := responseToProto(publicRequest, response)
 	if err != nil {
 		return nil, status.Error(codes.Internal, err.Error())
 	}
@@ -101,7 +101,11 @@ func (c *client) Retrieve(
 		return retrieval.Response{}, fromStatusError(toStatusError(err))
 	}
 
-	protoRequest, err := requestToProto(request)
+	normalized, err := request.Normalize()
+	if err != nil {
+		return retrieval.Response{}, err
+	}
+	protoRequest, err := requestToProto(normalized)
 	if err != nil {
 		return retrieval.Response{}, err
 	}
@@ -110,7 +114,7 @@ func (c *client) Retrieve(
 		return retrieval.Response{}, fromStatusError(err)
 	}
 
-	response, err := responseFromProto(protoResponse)
+	response, err := responseFromProto(normalized, protoResponse)
 	if err != nil {
 		return retrieval.Response{}, shoal.WrapError(
 			shoal.ErrorInternal, "invalid knowledge retrieval response", err)

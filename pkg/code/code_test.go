@@ -167,6 +167,19 @@ func TestSourceRejectsRepositoryTraversalPaths(t *testing.T) {
 
 func TestParseRequestCopiesExactContent(t *testing.T) {
 	fixture := newFixture(t, "commit-1")
+	if fixture.request.ContentSize() != uint64(len(fixture.content)) {
+		t.Fatalf("content size = %d", fixture.request.ContentSize())
+	}
+	if !fixture.request.ContentEqual(fixture.content) ||
+		!fixture.request.ContentStringEqual(string(fixture.content)) {
+		t.Fatal("non-copying content comparison rejected exact bytes")
+	}
+	different := append([]byte(nil), fixture.content...)
+	different[0] = 'z'
+	if fixture.request.ContentEqual(different) ||
+		fixture.request.ContentStringEqual(string(different)) {
+		t.Fatal("non-copying content comparison accepted different bytes")
+	}
 	copied := fixture.request.Content()
 	copied[0] = 'z'
 	if fixture.request.Content()[0] != fixture.content[0] {
@@ -617,6 +630,22 @@ func TestIngestionIsBoundToParseRequestAndResult(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create ingest request: %v", err)
 	}
+	if first.Source() != fixture.source ||
+		first.ContentSize() != uint64(len(fixture.content)) ||
+		!first.ContentEqual(fixture.content) ||
+		!first.ContentStringEqual(string(fixture.content)) {
+		t.Fatal("ingest request non-copying source/content accessors changed exact input")
+	}
+	counts := first.ParseResultCounts()
+	if counts.SyntaxNodes != 2 ||
+		counts.Symbols != 1 ||
+		counts.Externals != 1 ||
+		counts.Relationships != 1 ||
+		counts.DeclaredSymbols != 1 ||
+		counts.RangedRelationships != 1 {
+		t.Fatalf("parse result counts = %+v", counts)
+	}
+
 	again, err := codeast.NewIngestRequest(fixture.request, fixture.result)
 	if err != nil {
 		t.Fatalf("create repeated ingest request: %v", err)
@@ -675,6 +704,121 @@ func TestIngestionIsBoundToParseRequestAndResult(t *testing.T) {
 	}
 	if err := ingestResult.ValidateFor(first); err != nil {
 		t.Fatalf("validate ingest result: %v", err)
+	}
+}
+
+func TestSourceRefIsExcludedFromSourceAndIngestionIdentity(t *testing.T) {
+	content := []byte("package sample\n")
+	repository := testRepository(t)
+	hash := codeast.HashContent(content)
+	mainSource, err := codeast.NewSource(
+		repository, "refs/heads/main", "pkg/sample.go", "commit-1",
+		hash, uint64(len(content)),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tagSource, err := codeast.NewSource(
+		repository, "refs/tags/v1", "pkg/sample.go", "commit-1",
+		hash, uint64(len(content)),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mainSource.ID() != tagSource.ID() {
+		t.Fatal("Source.Ref changed immutable source identity")
+	}
+	language, err := codeast.NewLanguage("go", "1.25", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	parser, err := codeast.NewParserProvenance(
+		"test-parser", "1.0.0", codeast.HashContent(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyFor := func(source codeast.Source) codeast.ID {
+		request, requestErr := codeast.NewParseRequest(source, content)
+		if requestErr != nil {
+			t.Fatal(requestErr)
+		}
+		result, resultErr := codeast.NewParseResult(request, language, parser)
+		if resultErr != nil {
+			t.Fatal(resultErr)
+		}
+		ingest, ingestErr := codeast.NewIngestRequest(request, result)
+		if ingestErr != nil {
+			t.Fatal(ingestErr)
+		}
+		return ingest.IdempotencyKey()
+	}
+	if keyFor(mainSource) != keyFor(tagSource) {
+		t.Fatal("Source.Ref changed ingestion idempotency key")
+	}
+}
+
+func TestArtifactRefPreservesOpaqueIdentifierBytes(t *testing.T) {
+	identifier := shoal.ID(" \x00artifact ")
+	reference, err := codeast.NewArtifactRef(codeast.ArtifactDocument, identifier)
+	if err != nil {
+		t.Fatalf("opaque artifact identifier: %v", err)
+	}
+	if reference.Identifier() != identifier {
+		t.Fatalf("identifier = %q, want exact %q", reference.Identifier(), identifier)
+	}
+	if _, err := codeast.NewArtifactRef(
+		codeast.ArtifactDocument,
+		shoal.ID(strings.Repeat("x", shoal.MaxIDBytes+1)),
+	); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
+		t.Fatalf("oversized artifact identifier error = %v", err)
+	}
+}
+
+func TestCommittedRetryKeepsArtifactIDsAcrossMaterializerVersions(t *testing.T) {
+	fixture := newFixture(t, "commit-1")
+	request, err := codeast.NewIngestRequest(fixture.request, fixture.result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	documentRef, err := codeast.NewArtifactRef(codeast.ArtifactDocument, "document-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	graphRef, err := codeast.NewArtifactRef(codeast.ArtifactGraph, "graph-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	committed, err := codeast.NewIngestResult(
+		request, codeast.IngestApplied, []codeast.ArtifactRef{documentRef, graphRef})
+	if err != nil {
+		t.Fatal(err)
+	}
+	retry, err := codeast.NewIngestResult(
+		request, codeast.IngestUnchanged, []codeast.ArtifactRef{documentRef, graphRef})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := codeast.ValidateCommittedRetry(committed, retry); err != nil {
+		t.Fatalf("identical retry: %v", err)
+	}
+
+	reinterpretedRef, err := codeast.NewArtifactRef(
+		codeast.ArtifactDocument, "materializer-v2-document")
+	if err != nil {
+		t.Fatal(err)
+	}
+	reinterpreted, err := codeast.NewIngestResult(
+		request, codeast.IngestUnchanged,
+		[]codeast.ArtifactRef{reinterpretedRef, graphRef},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := codeast.ValidateCommittedRetry(
+		committed, reinterpreted,
+	); !shoal.IsErrorCode(err, shoal.ErrorConflict) {
+		t.Fatalf("reinterpreted retry error = %v", err)
 	}
 }
 
