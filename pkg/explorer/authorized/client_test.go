@@ -883,6 +883,92 @@ func TestHistoricalRevisionRetryIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestHistoricalRetryCannotTransitionCurrentSourceClaim(t *testing.T) {
+	f := newFixture(t)
+	const uri = "file:///historical-claim-transition.txt"
+	oldSource := explorer.Source{
+		URI: uri, MediaType: explorer.MediaTypeText,
+		Content: "old policy B revision",
+	}
+	old, err := f.clientB.Ingest(f.bob(t), oldSource)
+	if err != nil {
+		t.Fatal(err)
+	}
+	failing := &failStore{PolicyStore: f.store, revisionFailures: 1}
+	ruleAClient := f.newClient(
+		t, f.base, failing, f.sourceA, f.policyA, nil)
+	newSource := explorer.Source{
+		URI: uri, MediaType: explorer.MediaTypeText,
+		Content: "newer policy A revision",
+	}
+	if _, err := ruleAClient.Ingest(
+		f.admin(t), newSource,
+	); !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
+		t.Fatalf("newer policy A catalog failure = %v", err)
+	}
+	current, err := f.base.Documents(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(current) != 1 || current[0].Revision.ID == old.Revision.ID {
+		t.Fatalf("newer base revision was not applied: %#v", current)
+	}
+	newRevisionID := current[0].Revision.ID
+	claimA, ok, err := f.store.SourceClaim(context.Background(), uri)
+	if err != nil || !ok {
+		t.Fatalf("policy A source claim: ok=%v err=%v", ok, err)
+	}
+
+	retried, err := f.clientB.Ingest(f.admin(t), oldSource)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retried.Disposition != explorer.IngestUnchanged ||
+		retried.Revision.ID != old.Revision.ID {
+		t.Fatalf("historical policy B retry = %#v", retried)
+	}
+	claimAfterRetry, ok, err := f.store.SourceClaim(
+		context.Background(), uri)
+	if err != nil || !ok {
+		t.Fatalf("source claim after historical retry: ok=%v err=%v", ok, err)
+	}
+	if claimAfterRetry.Version != claimA.Version ||
+		claimAfterRetry.Rule.String() != claimA.Rule.String() {
+		t.Fatalf(
+			"historical retry transitioned claim: before=%#v after=%#v",
+			claimA, claimAfterRetry,
+		)
+	}
+
+	if _, err := f.clientB.Ingest(f.bob(t), explorer.Source{
+		URI: uri, MediaType: explorer.MediaTypeText,
+		Content: "policy B overwrite attempt",
+	}); !shoal.IsErrorCode(err, shoal.ErrorNotFound) {
+		t.Fatalf("policy B overwrite after historical retry = %v", err)
+	}
+	current, err = f.base.Documents(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(current) != 1 || current[0].Revision.ID != newRevisionID {
+		t.Fatalf("policy B attempt changed current base: %#v", current)
+	}
+
+	reconciled, err := f.clientA.Ingest(f.alice(t), newSource)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reconciled.Disposition != explorer.IngestUnchanged ||
+		reconciled.Revision.ID != newRevisionID {
+		t.Fatalf("current unchanged reconciliation = %#v", reconciled)
+	}
+	if _, err := f.clientA.Document(
+		f.alice(t), reconciled.Document.ID, reconciled.Revision.ID,
+	); err != nil {
+		t.Fatalf("reconciled current revision: %v", err)
+	}
+}
+
 func TestGenerationChangeAfterBaseOperation(t *testing.T) {
 	f := newFixture(t)
 	hooked := &hookClient{

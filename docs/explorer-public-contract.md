@@ -234,6 +234,8 @@ document/graph relationships that a later storage adapter must persist.
   document with neither a claim nor registration is unavailable. An explicitly
   indeterminate base commit leaves its exclusive claim pending and blocks every
   later mutation until recovery; M3 supplies durable outcome reconciliation.
+  Only a returned current revision may finalize a claim transition; registering
+  an unchanged historical revision restores the previous source-wide claim.
 - Structured policy labels are canonical lowercase no-padding base32 terms
   for domain, source, policy/epoch, and trusted service role. Callers cannot
   submit visibility expressions. Service-account ceilings intersect required

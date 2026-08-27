@@ -185,6 +185,9 @@ func (c *Client) Ingest(
 	if err != nil {
 		return explorer.IngestResult{}, err
 	}
+	if !current {
+		claimOutcome = sourceClaimRollback
+	}
 	var intrinsicEdges []graph.Edge
 	if current {
 		intrinsicEdges, err = c.intrinsicEdges(ctx, nodeIDs)
@@ -207,7 +210,9 @@ func (c *Client) Ingest(
 	}); err != nil {
 		return explorer.IngestResult{}, policyCatalogWriteError(ctx, err)
 	}
-	claimOutcome = sourceClaimCommit
+	if current {
+		claimOutcome = sourceClaimCommit
+	}
 	cloned := cloneIngestResult(result)
 	if err := guard.Check(ctx); err != nil {
 		return explorer.IngestResult{}, err
