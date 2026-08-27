@@ -613,7 +613,9 @@ func (r ExtractionResult) ValidateFor(request ExtractionRequest) error {
 					continue
 				}
 				key := canonicalParts(
-					string(assertion.Predicate()), assertion.Object().canonical())
+					string(assertion.Predicate()),
+					propertyValueKey(property, assertion.Object()),
+				)
 				if _, duplicate := uniqueValues[key]; duplicate {
 					return invalid("assertion value violates property uniqueness")
 				}
@@ -736,6 +738,13 @@ func containsID(values []shoal.ID, target shoal.ID) bool {
 		return string(values[index]) >= string(target)
 	})
 	return index < len(values) && values[index] == target
+}
+
+func propertyValueKey(property PropertyDefinition, value Value) string {
+	if property.ValueType() == ValueNumber {
+		return canonicalParts(string(ValueNumber), numericRat(value).RatString())
+	}
+	return value.canonical()
 }
 
 func (r ExtractionResult) ID() shoal.ID {
