@@ -757,7 +757,56 @@ func TestConcurrentClientsShareSourceClaim(t *testing.T) {
 	}
 }
 
-func TestIndeterminateBaseCommitAdvancesClaimAndAllowsRetry(t *testing.T) {
+func TestPendingFirstIngestRetriesUnderDesiredRule(t *testing.T) {
+	f := newFixture(t)
+	const uri = "file:///pending-first-ingest.txt"
+	failed := false
+	flaky := &ingestOverrideClient{
+		Client: f.base,
+		ingest: func(
+			ctx context.Context,
+			source explorer.Source,
+		) (explorer.IngestResult, error) {
+			if !failed {
+				failed = true
+				return explorer.IngestResult{}, explorer.MarkIndeterminateCommit(
+					shoal.NewError(
+						shoal.ErrorUnavailable, "ambiguous first ingest"),
+				)
+			}
+			return f.base.Ingest(ctx, source)
+		},
+	}
+	owner := f.newClient(t, flaky, f.store, f.sourceB, f.policyB, nil)
+	source := explorer.Source{
+		URI: uri, MediaType: explorer.MediaTypeText,
+		Content: "pending first ingest content",
+	}
+	if _, err := owner.Ingest(
+		f.bob(t), source,
+	); !explorer.IsIndeterminateCommit(err) {
+		t.Fatalf("first ingest error = %v", err)
+	}
+	pending, ok, err := f.store.SourceClaim(context.Background(), uri)
+	if err != nil || !ok || !pending.Pending ||
+		pending.PreviousRule != nil {
+		t.Fatalf("pending first-ingest claim = %#v ok=%v err=%v", pending, ok, err)
+	}
+	result, err := owner.Ingest(f.bob(t), source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Disposition != explorer.IngestApplied {
+		t.Fatalf("first-ingest recovery = %#v", result)
+	}
+	resolved, ok, err := f.store.SourceClaim(context.Background(), uri)
+	if err != nil || !ok || resolved.Pending ||
+		resolved.PreviousRule != nil {
+		t.Fatalf("resolved first-ingest claim = %#v ok=%v err=%v", resolved, ok, err)
+	}
+}
+
+func TestPendingReclassificationAfterCommittedBaseRequiresBothRules(t *testing.T) {
 	f := newFixture(t)
 	const uri = "file:///indeterminate-reclassification.txt"
 	original, err := f.clientA.Ingest(f.admin(t), explorer.Source{
@@ -805,12 +854,22 @@ func TestIndeterminateBaseCommitAdvancesClaimAndAllowsRetry(t *testing.T) {
 		t.Fatalf("test base did not commit reclassification: %#v", afterCommit)
 	}
 	committedRevisionID := afterCommit[0].Revision.ID
+	pending, ok, err := f.store.SourceClaim(context.Background(), uri)
+	if err != nil || !ok || !pending.Pending ||
+		pending.PreviousRule == nil {
+		t.Fatalf("pending reclassification claim = %#v ok=%v err=%v", pending, ok, err)
+	}
 
 	if _, err := f.clientA.Ingest(f.alice(t), explorer.Source{
 		URI: uri, MediaType: explorer.MediaTypeText,
 		Content: "old policy overwrite attempt",
 	}); !shoal.IsErrorCode(err, shoal.ErrorNotFound) {
-		t.Fatalf("old policy advanced-claim mutation = %v", err)
+		t.Fatalf("old policy pending recovery = %v", err)
+	}
+	if _, err := f.clientB.Ingest(f.bob(t), reclassifiedSource); !shoal.IsErrorCode(
+		err, shoal.ErrorNotFound,
+	) {
+		t.Fatalf("desired policy pending recovery = %v", err)
 	}
 	afterDenied, err := f.base.Documents(context.Background())
 	if err != nil {
@@ -821,10 +880,7 @@ func TestIndeterminateBaseCommitAdvancesClaimAndAllowsRetry(t *testing.T) {
 		t.Fatalf("denied retry changed base: %#v", afterDenied)
 	}
 
-	// The claim advanced to the selected rule instead of staying exclusively
-	// held, so the authorized principal can retry the ambiguous commit rather
-	// than the source URI being retired forever.
-	retried, err := f.clientB.Ingest(f.bob(t), reclassifiedSource)
+	retried, err := f.clientB.Ingest(f.admin(t), reclassifiedSource)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -838,7 +894,241 @@ func TestIndeterminateBaseCommitAdvancesClaimAndAllowsRetry(t *testing.T) {
 	}
 	if len(afterRetries) != 1 ||
 		afterRetries[0].Revision.ID != committedRevisionID {
-		t.Fatalf("advanced-claim retries changed base: %#v", afterRetries)
+		t.Fatalf("pending recovery changed base: %#v", afterRetries)
+	}
+	resolved, ok, err := f.store.SourceClaim(context.Background(), uri)
+	if err != nil || !ok || resolved.Pending ||
+		resolved.PreviousRule != nil {
+		t.Fatalf("resolved reclassification claim = %#v ok=%v err=%v", resolved, ok, err)
+	}
+}
+
+func TestPendingReclassificationBeforeBaseCommitRequiresBothRules(t *testing.T) {
+	f := newFixture(t)
+	const uri = "file:///precommit-indeterminate.txt"
+	original, err := f.clientA.Ingest(f.alice(t), explorer.Source{
+		URI: uri, MediaType: explorer.MediaTypeText,
+		Content: "original policy A revision",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ambiguous := &ingestOverrideClient{
+		Client: f.base,
+		ingest: func(
+			context.Context,
+			explorer.Source,
+		) (explorer.IngestResult, error) {
+			return explorer.IngestResult{}, explorer.MarkIndeterminateCommit(
+				shoal.NewError(
+					shoal.ErrorUnavailable, "ambiguous before base commit"),
+			)
+		},
+	}
+	reclassifier := f.newClient(
+		t, ambiguous, f.store, f.sourceB, f.policyB, nil)
+	sourceB := explorer.Source{
+		URI: uri, MediaType: explorer.MediaTypeText,
+		Content: "policy B recovery revision",
+	}
+	if _, err := reclassifier.Ingest(
+		f.admin(t), sourceB,
+	); !explorer.IsIndeterminateCommit(err) {
+		t.Fatalf("precommit indeterminate error = %v", err)
+	}
+	if _, err := f.clientA.Ingest(
+		f.alice(t), sourceB,
+	); !shoal.IsErrorCode(err, shoal.ErrorNotFound) {
+		t.Fatalf("previous-rule-only recovery = %v", err)
+	}
+	if _, err := f.clientB.Ingest(
+		f.bob(t), sourceB,
+	); !shoal.IsErrorCode(err, shoal.ErrorNotFound) {
+		t.Fatalf("desired-rule-only seizure = %v", err)
+	}
+	if _, err := f.clientA.Ingest(
+		f.admin(t), explorer.Source{
+			URI: uri, MediaType: explorer.MediaTypeText,
+			Content: "different selected-rule transition",
+		},
+	); !shoal.IsErrorCode(err, shoal.ErrorNotFound) {
+		t.Fatalf("pending selected-rule transition = %v", err)
+	}
+	beforeRecovery, err := f.base.Documents(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(beforeRecovery) != 1 ||
+		beforeRecovery[0].Revision.ID != original.Revision.ID {
+		t.Fatalf("denied recovery changed base: %#v", beforeRecovery)
+	}
+	recovered, err := f.clientB.Ingest(f.admin(t), sourceB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recovered.Disposition != explorer.IngestApplied {
+		t.Fatalf("precommit recovery = %#v", recovered)
+	}
+}
+
+func TestDefiniteRecoveryFailureRestoresPendingClaim(t *testing.T) {
+	f := newFixture(t)
+	const uri = "file:///pending-definite-failure.txt"
+	if _, err := f.clientA.Ingest(f.alice(t), explorer.Source{
+		URI: uri, MediaType: explorer.MediaTypeText,
+		Content: "original policy A revision",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	sourceB := explorer.Source{
+		URI: uri, MediaType: explorer.MediaTypeText,
+		Content: "policy B recovery revision",
+	}
+	ambiguous := &ingestOverrideClient{
+		Client: f.base,
+		ingest: func(
+			context.Context,
+			explorer.Source,
+		) (explorer.IngestResult, error) {
+			return explorer.IngestResult{}, explorer.MarkIndeterminateCommit(
+				shoal.NewError(shoal.ErrorUnavailable, "ambiguous write"),
+			)
+		},
+	}
+	if _, err := f.newClient(
+		t, ambiguous, f.store, f.sourceB, f.policyB, nil,
+	).Ingest(f.admin(t), sourceB); !explorer.IsIndeterminateCommit(err) {
+		t.Fatalf("initial pending error = %v", err)
+	}
+	before, ok, err := f.store.SourceClaim(context.Background(), uri)
+	if err != nil || !ok || !before.Pending {
+		t.Fatalf("initial pending claim = %#v ok=%v err=%v", before, ok, err)
+	}
+	attempt := 0
+	definiteFailure := &ingestOverrideClient{
+		Client: f.base,
+		ingest: func(
+			ctx context.Context,
+			source explorer.Source,
+		) (explorer.IngestResult, error) {
+			attempt++
+			switch attempt {
+			case 1:
+				return explorer.IngestResult{}, shoal.NewError(
+					shoal.ErrorUnavailable, "definite precommit failure")
+			case 2:
+				return explorer.IngestResult{}, explorer.MarkIndeterminateCommit(
+					shoal.NewError(
+						shoal.ErrorUnavailable, "second ambiguous failure"),
+				)
+			}
+			return f.base.Ingest(ctx, source)
+		},
+	}
+	recovery := f.newClient(
+		t, definiteFailure, f.store, f.sourceB, f.policyB, nil)
+	if _, err := recovery.Ingest(
+		f.admin(t), sourceB,
+	); !shoal.IsErrorCode(err, shoal.ErrorUnavailable) ||
+		explorer.IsIndeterminateCommit(err) {
+		t.Fatalf("definite recovery failure = %v", err)
+	}
+	restored, ok, err := f.store.SourceClaim(context.Background(), uri)
+	if err != nil || !ok || !restored.Pending ||
+		restored.Version != before.Version ||
+		restored.Rule.String() != before.Rule.String() ||
+		restored.PreviousRule == nil {
+		t.Fatalf("restored pending claim = %#v ok=%v err=%v", restored, ok, err)
+	}
+	if _, err := f.clientB.Ingest(
+		f.bob(t), sourceB,
+	); !shoal.IsErrorCode(err, shoal.ErrorNotFound) {
+		t.Fatalf("desired-only retry after definite failure = %v", err)
+	}
+	if _, err := recovery.Ingest(
+		f.admin(t), sourceB,
+	); !explorer.IsIndeterminateCommit(err) {
+		t.Fatalf("subsequent indeterminate recovery = %v", err)
+	}
+	repended, ok, err := f.store.SourceClaim(context.Background(), uri)
+	if err != nil || !ok || !repended.Pending ||
+		repended.PreviousRule == nil ||
+		repended.Rule.String() != before.Rule.String() {
+		t.Fatalf("repended source claim = %#v ok=%v err=%v", repended, ok, err)
+	}
+	result, err := recovery.Ingest(f.admin(t), sourceB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Disposition != explorer.IngestApplied {
+		t.Fatalf("later recovery = %#v", result)
+	}
+}
+
+func TestConcurrentPendingRecoveryIsSerialized(t *testing.T) {
+	f := newFixture(t)
+	const uri = "file:///concurrent-pending-recovery.txt"
+	if _, err := f.clientA.Ingest(f.alice(t), explorer.Source{
+		URI: uri, MediaType: explorer.MediaTypeText,
+		Content: "original policy A revision",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	sourceB := explorer.Source{
+		URI: uri, MediaType: explorer.MediaTypeText,
+		Content: "policy B recovery revision",
+	}
+	ambiguous := &ingestOverrideClient{
+		Client: f.base,
+		ingest: func(
+			context.Context,
+			explorer.Source,
+		) (explorer.IngestResult, error) {
+			return explorer.IngestResult{}, explorer.MarkIndeterminateCommit(
+				shoal.NewError(shoal.ErrorUnavailable, "ambiguous write"),
+			)
+		},
+	}
+	if _, err := f.newClient(
+		t, ambiguous, f.store, f.sourceB, f.policyB, nil,
+	).Ingest(f.admin(t), sourceB); !explorer.IsIndeterminateCommit(err) {
+		t.Fatalf("initial pending error = %v", err)
+	}
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	hooked := &hookClient{
+		Client: f.base,
+		afterIngest: func() {
+			close(started)
+			<-release
+		},
+	}
+	recovery := f.newClient(
+		t, hooked, f.store, f.sourceB, f.policyB, nil)
+	firstErr := make(chan error, 1)
+	go func() {
+		_, err := recovery.Ingest(f.admin(t), sourceB)
+		firstErr <- err
+	}()
+	<-started
+	if _, err := f.clientB.Ingest(
+		f.admin(t), sourceB,
+	); err == nil || (!shoal.IsErrorCode(err, shoal.ErrorConflict) &&
+		!shoal.IsErrorCode(err, shoal.ErrorUnavailable)) {
+		close(release)
+		t.Fatalf("concurrent authorized recovery = %v", err)
+	}
+	close(release)
+	if err := <-firstErr; err != nil {
+		t.Fatal(err)
+	}
+	summaries, err := f.base.Documents(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(summaries) != 1 {
+		t.Fatalf("concurrent recovery base = %#v", summaries)
 	}
 }
 

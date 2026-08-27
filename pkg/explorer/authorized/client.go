@@ -137,6 +137,9 @@ func (c *Client) Ingest(
 		case sourceClaimCommit:
 			cleanupErr = c.policyStore.CommitSourceClaim(
 				cleanupContext, claim)
+		case sourceClaimPend:
+			cleanupErr = c.policyStore.PendSourceClaim(
+				cleanupContext, claim)
 		case sourceClaimRollback:
 			cleanupErr = c.policyStore.RollbackSourceClaim(
 				cleanupContext, claim)
@@ -152,11 +155,7 @@ func (c *Client) Ingest(
 	result, err := c.base.Ingest(ctx, cloneSource(ownedSource))
 	if err != nil {
 		if explorer.IsIndeterminateCommit(err) {
-			// The base may have committed under the selected rule, so the
-			// claim must advance rather than roll back to a rule that could
-			// overwrite committed content. Ownership is still released so the
-			// authorized owner can retry.
-			claimOutcome = sourceClaimCommit
+			claimOutcome = sourceClaimPend
 		}
 		return explorer.IngestResult{}, err
 	}
@@ -227,6 +226,7 @@ type sourceClaimOutcome uint8
 const (
 	sourceClaimRollback sourceClaimOutcome = iota
 	sourceClaimCommit
+	sourceClaimPend
 )
 
 // claimSourceMutation acquires shared source-URI mutation ownership before the
@@ -249,8 +249,8 @@ func (c *Client) claimSourceMutation(
 	}
 	var expected *SourcePolicyClaim
 	if claimed {
-		allowed, ruleErr := ruleAllows(
-			existingClaim.Rule, decision, auth.OperationIngest, now)
+		allowed, ruleErr := sourceClaimAllowsMutation(
+			existingClaim, selectedRule, decision, now)
 		if ruleErr != nil {
 			return SourcePolicyClaim{}, ruleErr
 		}
@@ -275,8 +275,8 @@ func (c *Client) claimSourceMutation(
 		return SourcePolicyClaim{}, policyCatalogReadError(ctx, readErr)
 	}
 	if ok {
-		allowed, ruleErr := ruleAllows(
-			latest.Rule, decision, auth.OperationIngest, now)
+		allowed, ruleErr := sourceClaimAllowsMutation(
+			latest, selectedRule, decision, now)
 		if ruleErr != nil {
 			return SourcePolicyClaim{}, ruleErr
 		}
@@ -285,6 +285,27 @@ func (c *Client) claimSourceMutation(
 		}
 	}
 	return SourcePolicyClaim{}, policyCatalogWriteError(ctx, err)
+}
+
+func sourceClaimAllowsMutation(
+	claim SourcePolicyClaim,
+	selectedRule AccessRule,
+	decision auth.Decision,
+	now time.Time,
+) (bool, error) {
+	if claim.Pending && !claim.Rule.equal(selectedRule) {
+		return false, nil
+	}
+	allowed, err := ruleAllows(
+		claim.Rule, decision, auth.OperationIngest, now)
+	if err != nil || !allowed {
+		return allowed, err
+	}
+	if claim.Pending && claim.PreviousRule != nil {
+		return ruleAllows(
+			*claim.PreviousRule, decision, auth.OperationIngest, now)
+	}
+	return true, nil
 }
 
 func (c *Client) authorizeLegacySource(

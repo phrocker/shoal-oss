@@ -62,24 +62,29 @@ type EdgeRegistration struct {
 	Rule       AccessRule
 }
 
-// SourcePolicyClaim reserves one source URI under a policy rule. Version is an
-// opaque compare-and-swap generation owned by the PolicyStore.
+// SourcePolicyClaim reserves one source URI under a policy rule. Pending
+// claims represent an unresolved mutation and require authorization under both
+// Rule and PreviousRule when the latter is present. Version is an opaque
+// compare-and-swap generation owned by the PolicyStore.
 type SourcePolicyClaim struct {
-	SourceURI string
-	Rule      AccessRule
-	Version   uint64
+	SourceURI    string
+	Rule         AccessRule
+	PreviousRule *AccessRule
+	Pending      bool
+	Version      uint64
 }
 
 // PolicyStore is the non-durable M2 policy-catalog boundary. Implementations
 // must make each put and source-claim transition atomic and return independent
 // values from reads. A successful source-claim CAS exclusively owns that URI
-// until it is committed or rolled back.
+// until it is committed, pended, or rolled back.
 type PolicyStore interface {
 	SourceClaim(context.Context, string) (SourcePolicyClaim, bool, error)
 	CompareAndSwapSourceClaim(
 		context.Context, string, *SourcePolicyClaim, AccessRule,
 	) (SourcePolicyClaim, error)
 	CommitSourceClaim(context.Context, SourcePolicyClaim) error
+	PendSourceClaim(context.Context, SourcePolicyClaim) error
 	RollbackSourceClaim(context.Context, SourcePolicyClaim) error
 	PutRevision(context.Context, RevisionRegistration) error
 	Revision(context.Context, shoal.ID, shoal.ID) (RevisionRegistration, bool, error)
@@ -155,9 +160,10 @@ func (s *MemoryPolicyStore) SourceClaim(
 	return cloned, true, nil
 }
 
-// CompareAndSwapSourceClaim atomically acquires exclusive mutation ownership
-// and changes a source URI from the exact expected claim to the desired rule.
-// A nil expected claim requires the URI to be unclaimed.
+// CompareAndSwapSourceClaim atomically acquires exclusive mutation ownership.
+// A committed claim may transition to a desired rule. A pending claim may only
+// reacquire ownership for its existing desired rule. A nil expected claim
+// requires the URI to be unclaimed.
 func (s *MemoryPolicyStore) CompareAndSwapSourceClaim(
 	ctx context.Context,
 	sourceURI string,
@@ -205,6 +211,10 @@ func (s *MemoryPolicyStore) CompareAndSwapSourceClaim(
 		!sourcePolicyClaimsEqual(current.claim, *normalizedExpected) {
 		return SourcePolicyClaim{}, catalogConflict()
 	}
+	if exists && current.claim.Pending &&
+		!current.claim.Rule.equal(rule) {
+		return SourcePolicyClaim{}, catalogConflict()
+	}
 	if s.sourceVersion == ^uint64(0) {
 		return SourcePolicyClaim{}, catalogUnavailable()
 	}
@@ -212,6 +222,7 @@ func (s *MemoryPolicyStore) CompareAndSwapSourceClaim(
 	claim := SourcePolicyClaim{
 		SourceURI: sourceURI,
 		Rule:      rule,
+		Pending:   true,
 		Version:   s.sourceVersion,
 	}
 	state := sourceClaimState{claim: claim, held: true}
@@ -221,18 +232,43 @@ func (s *MemoryPolicyStore) CompareAndSwapSourceClaim(
 			return SourcePolicyClaim{}, catalogUnavailable()
 		}
 		state.previous = &previous
+		if current.claim.Pending {
+			if current.claim.PreviousRule != nil {
+				previousRule, ruleErr := current.claim.PreviousRule.clone()
+				if ruleErr != nil {
+					return SourcePolicyClaim{}, catalogUnavailable()
+				}
+				claim.PreviousRule = &previousRule
+			}
+		} else {
+			previousRule, ruleErr := current.claim.Rule.clone()
+			if ruleErr != nil {
+				return SourcePolicyClaim{}, catalogUnavailable()
+			}
+			claim.PreviousRule = &previousRule
+		}
+		state.claim = claim
 	}
 	s.sourceClaims[sourceURI] = state
 	return cloneSourcePolicyClaim(claim)
 }
 
-// CommitSourceClaim releases exclusive mutation ownership and preserves the
-// claim's desired rule.
+// CommitSourceClaim releases exclusive mutation ownership, makes the desired
+// rule authoritative, and clears pending recovery state.
 func (s *MemoryPolicyStore) CommitSourceClaim(
 	ctx context.Context,
 	claim SourcePolicyClaim,
 ) error {
-	return s.finishSourceClaim(ctx, claim, false)
+	return s.finishSourceClaim(ctx, claim, sourceClaimFinishCommit)
+}
+
+// PendSourceClaim releases exclusive mutation ownership while preserving an
+// unresolved desired/previous rule pair for an authorized recovery attempt.
+func (s *MemoryPolicyStore) PendSourceClaim(
+	ctx context.Context,
+	claim SourcePolicyClaim,
+) error {
+	return s.finishSourceClaim(ctx, claim, sourceClaimFinishPending)
 }
 
 // RollbackSourceClaim releases exclusive mutation ownership and restores the
@@ -241,13 +277,21 @@ func (s *MemoryPolicyStore) RollbackSourceClaim(
 	ctx context.Context,
 	claim SourcePolicyClaim,
 ) error {
-	return s.finishSourceClaim(ctx, claim, true)
+	return s.finishSourceClaim(ctx, claim, sourceClaimFinishRollback)
 }
+
+type sourceClaimFinish uint8
+
+const (
+	sourceClaimFinishCommit sourceClaimFinish = iota
+	sourceClaimFinishPending
+	sourceClaimFinishRollback
+)
 
 func (s *MemoryPolicyStore) finishSourceClaim(
 	ctx context.Context,
 	claim SourcePolicyClaim,
-	rollback bool,
+	finish sourceClaimFinish,
 ) error {
 	if err := contextFailure(ctx); err != nil {
 		return err
@@ -273,7 +317,8 @@ func (s *MemoryPolicyStore) finishSourceClaim(
 		!sourcePolicyClaimsEqual(state.claim, normalized) {
 		return catalogConflict()
 	}
-	if rollback {
+	switch finish {
+	case sourceClaimFinishRollback:
 		if state.previous == nil {
 			delete(s.sourceClaims, normalized.SourceURI)
 			return nil
@@ -286,11 +331,23 @@ func (s *MemoryPolicyStore) finishSourceClaim(
 			claim: previous,
 		}
 		return nil
+	case sourceClaimFinishPending:
+		state.held = false
+		state.previous = nil
+		state.claim.Pending = true
+		s.sourceClaims[normalized.SourceURI] = state
+		return nil
+	case sourceClaimFinishCommit:
+		state.held = false
+		state.previous = nil
+		state.claim.Pending = false
+		state.claim.PreviousRule = nil
+		s.sourceClaims[normalized.SourceURI] = state
+		return nil
+	default:
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument, "source claim finish is invalid")
 	}
-	state.held = false
-	state.previous = nil
-	s.sourceClaims[normalized.SourceURI] = state
-	return nil
 }
 
 // PutRevision atomically registers immutable revision content and, when
@@ -549,13 +606,33 @@ func cloneSourcePolicyClaim(
 		return SourcePolicyClaim{}, err
 	}
 	claim.Rule = rule
+	if claim.PreviousRule != nil {
+		previous, previousErr := claim.PreviousRule.clone()
+		if previousErr != nil {
+			return SourcePolicyClaim{}, previousErr
+		}
+		claim.PreviousRule = &previous
+	}
+	if !claim.Pending && claim.PreviousRule != nil {
+		return SourcePolicyClaim{}, shoal.NewError(
+			shoal.ErrorInvalidArgument, "source policy claim is invalid")
+	}
 	return claim, nil
 }
 
 func sourcePolicyClaimsEqual(left, right SourcePolicyClaim) bool {
 	return left.SourceURI == right.SourceURI &&
 		left.Version == right.Version &&
-		left.Rule.equal(right.Rule)
+		left.Pending == right.Pending &&
+		left.Rule.equal(right.Rule) &&
+		optionalRulesEqual(left.PreviousRule, right.PreviousRule)
+}
+
+func optionalRulesEqual(left, right *AccessRule) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	return left.equal(*right)
 }
 
 func (s *MemoryPolicyStore) replaceCurrent(

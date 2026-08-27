@@ -232,11 +232,14 @@ document/graph relationships that a later storage adapter must persist.
   base commit outlives a policy-catalog failure. Legacy registered documents
   lazily backfill claims only after current-rule authorization; an existing
   document with neither a claim nor registration is unavailable. An explicitly
-  indeterminate base commit advances the claim to the selected rule and
-  releases exclusive ownership, because the base may already have committed
-  under that rule: a principal the selected rule authorizes may retry, while
-  the previously claimed rule can no longer overwrite the ambiguous outcome. A
-  transient ambiguous write therefore never retires a source URI.
+  indeterminate base commit releases operation ownership but leaves a pending
+  claim containing the selected rule and any previous rule. First-ingest
+  recovery requires the selected rule; reclassification recovery requires both
+  rules and must select the pending desired rule, preventing either side from
+  seizing an ambiguous outcome. One recovery attempt reacquires exclusive
+  ownership. Definite failure restores the pending state, another indeterminate
+  result keeps it pending, and successful current registration commits the
+  desired rule. M3 supplies durable outcome reconciliation across processes.
   Only a returned current revision may finalize a claim transition; registering
   an unchanged historical revision restores the previous source-wide claim.
 - Structured policy labels are canonical lowercase no-padding base32 terms

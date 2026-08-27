@@ -329,28 +329,49 @@ func TestMemoryPolicyStoreSourceClaimCAS(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if !first.Pending || first.PreviousRule != nil {
+		t.Fatalf("new source claim token = %#v", first)
+	}
 	if _, err := store.CompareAndSwapSourceClaim(
 		ctx, uri, nil, ruleB,
 	); !shoal.IsErrorCode(err, shoal.ErrorConflict) {
 		t.Fatalf("concurrent source claim = %v", err)
 	}
-	if err := store.CommitSourceClaim(ctx, first); err != nil {
+	if err := store.PendSourceClaim(ctx, first); err != nil {
+		t.Fatal(err)
+	}
+	pending, ok, err := store.SourceClaim(ctx, uri)
+	if err != nil || !ok || !pending.Pending ||
+		pending.PreviousRule != nil {
+		t.Fatalf("pending source claim = %#v ok=%v err=%v", pending, ok, err)
+	}
+	recovery, err := store.CompareAndSwapSourceClaim(
+		ctx, uri, &pending, ruleA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CommitSourceClaim(ctx, recovery); err != nil {
 		t.Fatal(err)
 	}
 	stored, ok, err := store.SourceClaim(ctx, uri)
-	if err != nil || !ok || stored.Version != first.Version {
-		t.Fatalf("stored source claim = %#v ok=%v err=%v", stored, ok, err)
+	if err != nil || !ok || stored.Pending || stored.PreviousRule != nil {
+		t.Fatalf("committed source claim = %#v ok=%v err=%v", stored, ok, err)
 	}
 	transitioned, err := store.CompareAndSwapSourceClaim(
 		ctx, uri, &stored, ruleB)
 	if err != nil {
 		t.Fatal(err)
 	}
+	if !transitioned.Pending || transitioned.PreviousRule == nil ||
+		transitioned.PreviousRule.String() != ruleA.String() {
+		t.Fatalf("transition token = %#v", transitioned)
+	}
 	if err := store.RollbackSourceClaim(ctx, transitioned); err != nil {
 		t.Fatal(err)
 	}
 	restored, ok, err := store.SourceClaim(ctx, uri)
-	if err != nil || !ok || restored.Version != first.Version ||
+	if err != nil || !ok || restored.Version != stored.Version ||
+		restored.Pending || restored.PreviousRule != nil ||
 		restored.Rule.String() != ruleA.String() {
 		t.Fatalf("restored source claim = %#v ok=%v err=%v", restored, ok, err)
 	}
