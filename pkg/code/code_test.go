@@ -167,6 +167,19 @@ func TestSourceRejectsRepositoryTraversalPaths(t *testing.T) {
 
 func TestParseRequestCopiesExactContent(t *testing.T) {
 	fixture := newFixture(t, "commit-1")
+	if fixture.request.ContentSize() != uint64(len(fixture.content)) {
+		t.Fatalf("content size = %d", fixture.request.ContentSize())
+	}
+	if !fixture.request.ContentEqual(fixture.content) ||
+		!fixture.request.ContentStringEqual(string(fixture.content)) {
+		t.Fatal("non-copying content comparison rejected exact bytes")
+	}
+	different := append([]byte(nil), fixture.content...)
+	different[0] = 'z'
+	if fixture.request.ContentEqual(different) ||
+		fixture.request.ContentStringEqual(string(different)) {
+		t.Fatal("non-copying content comparison accepted different bytes")
+	}
 	copied := fixture.request.Content()
 	copied[0] = 'z'
 	if fixture.request.Content()[0] != fixture.content[0] {
@@ -616,6 +629,21 @@ func TestIngestionIsBoundToParseRequestAndResult(t *testing.T) {
 	first, err := codeast.NewIngestRequest(fixture.request, fixture.result)
 	if err != nil {
 		t.Fatalf("create ingest request: %v", err)
+	}
+	if first.Source() != fixture.source ||
+		first.ContentSize() != uint64(len(fixture.content)) ||
+		!first.ContentEqual(fixture.content) ||
+		!first.ContentStringEqual(string(fixture.content)) {
+		t.Fatal("ingest request non-copying source/content accessors changed exact input")
+	}
+	counts := first.ParseResultCounts()
+	if counts.SyntaxNodes != 2 ||
+		counts.Symbols != 1 ||
+		counts.Externals != 1 ||
+		counts.Relationships != 1 ||
+		counts.DeclaredSymbols != 1 ||
+		counts.RangedRelationships != 1 {
+		t.Fatalf("parse result counts = %+v", counts)
 	}
 
 	again, err := codeast.NewIngestRequest(fixture.request, fixture.result)

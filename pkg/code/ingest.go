@@ -74,6 +74,33 @@ func (r IngestRequest) ParseRequest() ParseRequest {
 	return r.parseRequest.clone()
 }
 
+// Source returns the exact source identity without copying parse bytes.
+func (r IngestRequest) Source() Source {
+	return r.parseRequest.Source()
+}
+
+// ContentSize returns the exact parse byte length without copying content.
+func (r IngestRequest) ContentSize() uint64 {
+	return r.parseRequest.ContentSize()
+}
+
+// ContentEqual compares exact parse bytes without exposing or copying them.
+func (r IngestRequest) ContentEqual(content []byte) bool {
+	return r.parseRequest.ContentEqual(content)
+}
+
+// ContentStringEqual compares exact parse bytes with a string without
+// exposing or copying them.
+func (r IngestRequest) ContentStringEqual(content string) bool {
+	return r.parseRequest.ContentStringEqual(content)
+}
+
+// ParseResultCounts reports result collection and explicit
+// source-attribution cardinalities without copying parse-result values.
+func (r IngestRequest) ParseResultCounts() ParseResultCounts {
+	return r.parseResult.Counts()
+}
+
 func (r IngestRequest) ParseResult() ParseResult {
 	return cloneParseResult(r.parseResult)
 }

@@ -25,7 +25,6 @@ import (
 	"strconv"
 	"strings"
 	"time"
-	"unicode"
 
 	"github.com/phrocker/shoal-oss/pkg/document"
 	"github.com/phrocker/shoal-oss/pkg/graph"
@@ -78,8 +77,10 @@ func (e *Explorer) Retrieve(
 	if err := request.ValidateSeedPlan(false); err != nil {
 		return retrieval.Response{}, err
 	}
+	analyzer := retrieval.UnicodeTermAnalyzer{}
+	scorer := retrieval.CoverageFusionScorer{}
 	modes := request.Modes
-	queryTerms := uniqueTerms(request.Text)
+	queryTerms := analyzer.Analyze(request.Text)
 	if len(queryTerms) == 0 {
 		return retrieval.Response{}, shoal.NewError(
 			shoal.ErrorInvalidArgument, "retrieval text has no searchable terms")
@@ -123,24 +124,28 @@ func (e *Explorer) Retrieve(
 				!spanInNodeScope(record, sectionByID, span, nodeScope) {
 				continue
 			}
-			lexical := termCoverage(queryTerms, uniqueTerms(span.Text))
+			lexical := scorer.Coverage(queryTerms, analyzer.Analyze(span.Text))
 			headingText := record.Document.Title
 			for sectionID := span.SectionID; sectionID != ""; {
 				section := sectionByID[sectionID]
 				headingText += " " + section.Heading
 				sectionID = section.ParentID
 			}
-			treeScore := termCoverage(queryTerms, uniqueTerms(headingText))
+			treeScore := scorer.Coverage(queryTerms, analyzer.Analyze(headingText))
 			graphScore := shoal.Score(0)
 			path, err := evidencePath(record, sectionByID, nodes, edges, span)
 			if err != nil {
 				return retrieval.Response{}, err
 			}
 			if len(path.Edges) > 0 {
-				graphScore = termCoverage(
-					queryTerms, uniqueTerms(pathSearchText(path, span.Text)))
+				graphScore = scorer.Coverage(
+					queryTerms, analyzer.Analyze(pathSearchText(path, span.Text)))
 			}
-			score := combinedScore(modes, lexical, treeScore, graphScore)
+			score := scorer.CombinedScore(modes, retrieval.ComponentScores{
+				Lexical: lexical,
+				Tree:    treeScore,
+				Graph:   graphScore,
+			})
 			if score <= 0 {
 				continue
 			}
@@ -183,13 +188,17 @@ func (e *Explorer) Retrieve(
 		if request.Explain {
 			scores := map[string]shoal.Score{}
 			for _, mode := range match.activeModes {
-				scores[string(mode)] = modeScore(
-					mode, match.lexical, match.tree, match.graph)
+				scores[string(mode)] = scorer.ModeScore(mode, retrieval.ComponentScores{
+					Lexical: match.lexical,
+					Tree:    match.tree,
+					Graph:   match.graph,
+				})
 			}
 			result.Explanation = &retrieval.Explanation{
-				Modes:   append([]retrieval.Mode(nil), match.activeModes...),
-				Summary: "ranked source span using configured Explorer strategies",
-				Scores:  scores,
+				Modes: append([]retrieval.Mode(nil), match.activeModes...),
+				Summary: "ranked source span using analyzer " + analyzer.Version() +
+					" and scorer " + scorer.Version(),
+				Scores: scores,
 			}
 		}
 		response.Results = append(response.Results, result)
@@ -227,31 +236,6 @@ func requestID(request retrieval.Request) shoal.ID {
 		"explain", strconv.FormatBool(request.Explain),
 	)
 	return shoal.ID(stableID("request", parts...))
-}
-
-func combinedScore(
-	modes []retrieval.Mode, lexical, treeScore, graphScore shoal.Score,
-) shoal.Score {
-	var score shoal.Score
-	for _, mode := range modes {
-		score += modeScore(mode, lexical, treeScore, graphScore)
-	}
-	return score / shoal.Score(len(modes))
-}
-
-func modeScore(
-	mode retrieval.Mode, lexical, treeScore, graphScore shoal.Score,
-) shoal.Score {
-	switch mode {
-	case retrieval.ModeLexical:
-		return lexical
-	case retrieval.ModeTree:
-		return treeScore*0.35 + lexical*0.65
-	case retrieval.ModeGraph:
-		return graphScore*0.25 + lexical*0.75
-	default:
-		return 0
-	}
 }
 
 func evidencePath(
@@ -346,39 +330,6 @@ func pathSearchText(path graph.Path, quote string) string {
 		text.WriteString(edge.Type)
 	}
 	return text.String()
-}
-
-func uniqueTerms(value string) map[string]struct{} {
-	terms := make(map[string]struct{})
-	var current strings.Builder
-	flush := func() {
-		if current.Len() > 0 {
-			terms[current.String()] = struct{}{}
-			current.Reset()
-		}
-	}
-	for _, r := range strings.ToLower(value) {
-		if unicode.IsLetter(r) || unicode.IsNumber(r) {
-			current.WriteRune(r)
-		} else {
-			flush()
-		}
-	}
-	flush()
-	return terms
-}
-
-func termCoverage(query, candidate map[string]struct{}) shoal.Score {
-	if len(query) == 0 {
-		return 0
-	}
-	matched := 0
-	for term := range query {
-		if _, ok := candidate[term]; ok {
-			matched++
-		}
-	}
-	return shoal.Score(matched) / shoal.Score(len(query))
 }
 
 func idSet(ids []shoal.ID) map[shoal.ID]struct{} {

@@ -111,10 +111,28 @@ func (e *Explorer) Close() error {
 
 // Ingest parses and durably stores one immutable text or Markdown revision.
 func (e *Explorer) Ingest(ctx context.Context, source Source) (IngestResult, error) {
+	return e.ingest(ctx, source, time.Time{})
+}
+
+// IngestWithOptions parses and durably stores one immutable revision with
+// additive descriptive options. CreatedAt never determines the current
+// revision; durable publication order does.
+func (e *Explorer) IngestWithOptions(
+	ctx context.Context, source Source, options IngestOptions,
+) (IngestResult, error) {
+	return e.ingest(ctx, source, options.CreatedAt)
+}
+
+func (e *Explorer) ingest(
+	ctx context.Context, source Source, createdAt time.Time,
+) (IngestResult, error) {
 	if err := contextError(ctx); err != nil {
 		return IngestResult{}, err
 	}
-	parsed, err := parseSource(source, time.Now())
+	if createdAt.IsZero() {
+		createdAt = time.Now()
+	}
+	parsed, err := parseSource(source, createdAt)
 	if err != nil {
 		return IngestResult{}, err
 	}
