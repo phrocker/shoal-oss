@@ -94,6 +94,30 @@ type PolicyCopyKey struct {
 	VisibilityDigest Digest
 }
 
+func PolicyCopyHeadRow(domain DomainID, lpart LPART) ([]byte, error) {
+	if err := domain.Validate(); err != nil {
+		return nil, err
+	}
+	if err := lpart.Validate(); err != nil {
+		return nil, err
+	}
+	row := rowPrefix(RowKind('H'), B8('Y', domain, lpart))
+	row = append(row, E(domain)...)
+	return append(row, E(lpart)...), nil
+}
+
+func PolicyCopyMapPrefix(domain DomainID, lpart LPART) ([]byte, error) {
+	if err := domain.Validate(); err != nil {
+		return nil, err
+	}
+	if err := lpart.Validate(); err != nil {
+		return nil, err
+	}
+	row := rowPrefix(RowKind('M'), B8('Y', domain, lpart))
+	row = append(row, E(domain)...)
+	return append(row, E(lpart)...), nil
+}
+
 func PolicyCopyRow(domain DomainID, lpart LPART, generation Generation, visibility Digest) ([]byte, error) {
 	if err := validatePolicyKey(domain, lpart, generation, visibility); err != nil {
 		return nil, err
@@ -194,6 +218,15 @@ func PolicyCopyFenceRow(domain DomainID, generation Generation) ([]byte, error) 
 	return PolicyGenerationRow(domain, generation)
 }
 
+func PolicyCopyFenceRowV2(
+	domain DomainID,
+	lpart LPART,
+	generation Generation,
+	visibility Digest,
+) ([]byte, error) {
+	return PolicyCopyRow(domain, lpart, generation, visibility)
+}
+
 func ParsePolicyGenerationRow(row []byte) (PolicyGenerationKey, error) {
 	domain, offset, err := parseTableRowPrefix(row, 'G')
 	if err != nil {
@@ -217,6 +250,18 @@ type IndexGenerationKey struct {
 	Domain DomainID
 	Family Family
 	IGEN   IGEN
+}
+
+func IndexGenerationHeadRow(domain DomainID, family Family) ([]byte, error) {
+	if err := domain.Validate(); err != nil {
+		return nil, err
+	}
+	if err := family.Validate(); err != nil {
+		return nil, err
+	}
+	row := rowPrefix(RowKind('H'), B8('G', domain, family))
+	row = append(row, E(domain)...)
+	return append(row, E(family)...), nil
 }
 
 func IndexGenerationRow(domain DomainID, family Family, igen IGEN) ([]byte, error) {
@@ -262,6 +307,16 @@ func IndexDeltaRow(domain DomainID, family Family, igen IGEN, epoch Epoch, txn T
 	row = append(row, E(igen)...)
 	row = append(row, U64(uint64(epoch))...)
 	return append(row, E(txn)...), nil
+}
+
+func IndexDeltaPrefix(domain DomainID, family Family, igen IGEN) ([]byte, error) {
+	if err := validateIndexKey(domain, family, igen); err != nil {
+		return nil, err
+	}
+	row := rowPrefix(RowKind('D'), B8('G', domain, family, igen))
+	row = append(row, E(domain)...)
+	row = append(row, E(family)...)
+	return append(row, E(igen)...), nil
 }
 
 func ParseIndexDeltaRow(row []byte) (IndexDeltaKey, error) {
@@ -312,6 +367,18 @@ func IndexActivationRow(domain DomainID, family Family, epoch Epoch, igen IGEN) 
 	row = append(row, E(family)...)
 	row = append(row, INV64(uint64(epoch))...)
 	return append(row, E(igen)...), nil
+}
+
+func IndexActivationPrefix(domain DomainID, family Family) ([]byte, error) {
+	if err := domain.Validate(); err != nil {
+		return nil, err
+	}
+	if err := family.Validate(); err != nil {
+		return nil, err
+	}
+	row := rowPrefix(RowKind('A'), B8('G', domain, family))
+	row = append(row, E(domain)...)
+	return append(row, E(family)...), nil
 }
 
 func ParseIndexActivationRow(row []byte) (IndexActivationKey, error) {

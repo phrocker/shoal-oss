@@ -1,0 +1,508 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements. See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership. The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License. You may obtain a copy of the License at
+ *
+ *     https://www.apache.org/licenses/LICENSE-2.0
+ */
+
+package catalog
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"sort"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/phrocker/shoal-oss/pkg/explorer/coordination"
+	"github.com/phrocker/shoal-oss/pkg/explorer/coordination/allocator"
+)
+
+type fault uint8
+
+const (
+	faultNone fault = iota
+	faultUnknownBefore
+	faultUnknownAfter
+)
+
+type memoryStore struct {
+	mu       sync.Mutex
+	versions map[string][]allocator.Cell
+	fault    fault
+}
+
+func newMemoryStore() *memoryStore {
+	return &memoryStore{versions: make(map[string][]allocator.Cell)}
+}
+
+func coordinateKey(value allocator.Coordinate) string {
+	return string(value.Row) + "\x00" + string(value.Family) + "\x00" +
+		string(value.Qualifier) + "\x00" + string(value.Visibility)
+}
+
+func cloneCell(value allocator.Cell) allocator.Cell {
+	value.Coordinate.Row = append([]byte(nil), value.Coordinate.Row...)
+	value.Coordinate.Family = append([]byte(nil), value.Coordinate.Family...)
+	value.Coordinate.Qualifier = append([]byte(nil), value.Coordinate.Qualifier...)
+	value.Coordinate.Visibility = append([]byte(nil), value.Coordinate.Visibility...)
+	value.Value = append([]byte(nil), value.Value...)
+	return value
+}
+
+func (s *memoryStore) latest(coordinate allocator.Coordinate) (allocator.Cell, bool) {
+	values := s.versions[coordinateKey(coordinate)]
+	if len(values) == 0 {
+		return allocator.Cell{}, false
+	}
+	return values[len(values)-1], true
+}
+
+func (s *memoryStore) ReadExact(_ context.Context, coordinates []allocator.Coordinate) ([]allocator.Cell, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	result := make([]allocator.Cell, 0, len(coordinates))
+	for _, coordinate := range coordinates {
+		if value, ok := s.latest(coordinate); ok {
+			result = append(result, cloneCell(value))
+		}
+	}
+	return result, nil
+}
+
+func (s *memoryStore) ScanPrefix(
+	_ context.Context,
+	prefix, family, qualifier, visibility []byte,
+	limit int,
+) ([]allocator.Cell, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	result := make([]allocator.Cell, 0, limit)
+	for _, values := range s.versions {
+		if len(values) == 0 {
+			continue
+		}
+		value := values[len(values)-1]
+		if bytes.HasPrefix(value.Coordinate.Row, prefix) &&
+			bytes.Equal(value.Coordinate.Family, family) &&
+			bytes.Equal(value.Coordinate.Qualifier, qualifier) &&
+			bytes.Equal(value.Coordinate.Visibility, visibility) {
+			result = append(result, cloneCell(value))
+		}
+	}
+	sort.Slice(result, func(i, j int) bool {
+		return bytes.Compare(result[i].Coordinate.Row, result[j].Coordinate.Row) < 0
+	})
+	if len(result) > limit {
+		result = result[:limit]
+	}
+	return result, nil
+}
+
+func (s *memoryStore) CompareAndMutate(_ context.Context, mutation allocator.Mutation) (allocator.Status, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	currentFault := s.fault
+	s.fault = faultNone
+	if currentFault == faultUnknownBefore {
+		return allocator.StatusUnknown, allocator.ErrConditionalUnknown
+	}
+	for _, condition := range mutation.Conditions {
+		current, found := s.latest(condition.Coordinate)
+		if condition.Absent {
+			if found {
+				return allocator.StatusRejected, nil
+			}
+			continue
+		}
+		if !found || !bytes.Equal(current.Value, condition.Value) ||
+			(condition.TimestampSet && current.Timestamp != condition.Timestamp) {
+			return allocator.StatusRejected, nil
+		}
+	}
+	for _, update := range mutation.Updates {
+		if update.Delete {
+			delete(s.versions, coordinateKey(update.Coordinate))
+			continue
+		}
+		cell := allocator.Cell{
+			Coordinate: update.Coordinate, Value: append([]byte(nil), update.Value...), Timestamp: update.Timestamp,
+		}
+		key := coordinateKey(update.Coordinate)
+		s.versions[key] = append(s.versions[key], cloneCell(cell))
+	}
+	if currentFault == faultUnknownAfter {
+		return allocator.StatusUnknown, allocator.ErrConditionalUnknown
+	}
+	return allocator.StatusAccepted, nil
+}
+
+type fixtures struct {
+	authority Authority
+	status    OperationDisposition
+	policyErr error
+	indexErr  error
+	policyPin bool
+	indexPin  bool
+	outcomes  []CommittedOutcome
+}
+
+func (f *fixtures) Current(context.Context, coordination.DomainID) (Authority, error) {
+	return f.authority, nil
+}
+func (f *fixtures) Status(context.Context, coordination.DomainID, []byte) (OperationDisposition, error) {
+	return f.status, nil
+}
+func (f *fixtures) SelectsPolicyCopy(context.Context, coordination.DomainID, coordination.LPART, coordination.Generation, coordination.Digest) (bool, error) {
+	return f.policyPin, nil
+}
+func (f *fixtures) SelectsIndexGeneration(context.Context, coordination.DomainID, coordination.Family, coordination.IGEN) (bool, error) {
+	return f.indexPin, nil
+}
+func (f *fixtures) VerifyCopy(context.Context, PolicyCopyProof) error { return f.policyErr }
+func (f *fixtures) VerifyMapping(context.Context, coordination.DomainID, coordination.PolicyCopyMapV3) error {
+	return f.policyErr
+}
+func (f *fixtures) AllowPolicyRetirement(context.Context, PolicyCopyProof, coordination.Epoch) error {
+	return f.policyErr
+}
+func (f *fixtures) VerifyDelta(context.Context, coordination.DomainID, coordination.IndexDeltaV1, Authority) error {
+	return f.indexErr
+}
+func (f *fixtures) CommittedOutcomes(context.Context, coordination.DomainID, coordination.Epoch, coordination.Epoch, int) ([]CommittedOutcome, error) {
+	return append([]CommittedOutcome(nil), f.outcomes...), f.indexErr
+}
+func (f *fixtures) VerifyBase(context.Context, coordination.DomainID, coordination.IndexGenerationV2, coordination.Epoch) error {
+	return f.indexErr
+}
+func (f *fixtures) VerifySealing(context.Context, coordination.DomainID, coordination.IndexGenerationV2, []coordination.IndexDeltaV1) error {
+	return f.indexErr
+}
+func (f *fixtures) VerifyActivation(context.Context, coordination.DomainID, coordination.IndexActivationV2, coordination.IndexGenerationV2) error {
+	return f.indexErr
+}
+func (f *fixtures) VerifyLookup(context.Context, coordination.DomainID, coordination.IndexActivationV2, coordination.IndexGenerationV2) error {
+	return f.indexErr
+}
+func (f *fixtures) AllowIndexRetirement(context.Context, coordination.DomainID, coordination.IndexGenerationV2) error {
+	return f.indexErr
+}
+
+func newTestClient(t *testing.T, store *memoryStore, fixture *fixtures, now *time.Time) *Client {
+	t.Helper()
+	client, err := New(Config{
+		Domain: []byte("domain"), ControlVisibility: []byte("svc"), Store: store,
+		Authority: fixture, Operations: fixture, Leases: fixture,
+		PolicyVerifier: fixture, IndexVerifier: fixture,
+		Clock: func() time.Time { return *now }, MaxRetries: 100, RetryBackoff: time.Nanosecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return client
+}
+
+func digest(value string) coordination.Digest { return coordination.Sum([]byte(value)) }
+
+func fenceRequest(now time.Time, generation coordination.Generation, owner string, fence coordination.Fence) PolicyFenceRequest {
+	return PolicyFenceRequest{
+		LPART: []byte("lpart"), CopyGeneration: generation, VisibilityDigest: digest("visibility"),
+		Owner: []byte(owner), OperationID: []byte("operation-" + owner), LeaseUntil: now.Add(time.Minute),
+		Fence: fence, AuthorityGeneration: 3, RetentionGeneration: 4,
+	}
+}
+
+func manifestSet(t *testing.T, generation coordination.Generation) PolicyManifestSet {
+	t.Helper()
+	manifest, err := coordination.NewPolicyCopyManifestV1(
+		[]byte("lpart"), generation, digest("visibility"), []byte("backend"), []byte("table"),
+		[]coordination.PolicyCopyEntry{{
+			Table: []byte("table"), RowIdentity: []byte("row"),
+			LogicalDigest: digest("logical-row"), PhysicalDigest: digest("physical-row"),
+		}}, coordination.CopyStateSealed,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return PolicyManifestSet{
+		Chunks:        []coordination.PolicyCopyManifestV1{manifest},
+		LogicalDigest: digest("logical-set"), PhysicalDigest: digest("physical-set"),
+	}
+}
+
+func TestPolicyLifecycleAndUnknownReadback(t *testing.T) {
+	now := time.Date(2026, 8, 27, 12, 0, 0, 0, time.UTC)
+	store := newMemoryStore()
+	fixture := &fixtures{
+		authority: Authority{Generation: 3, RetentionGeneration: 4, HistoryFloor: 20},
+		status:    OperationTerminal,
+	}
+	client := newTestClient(t, store, fixture, &now)
+	generation, err := client.ReserveCopyGeneration(context.Background(), []byte("lpart"), []byte("reserve-policy"))
+	if err != nil || generation != 1 {
+		t.Fatalf("reserve copy generation: %v, %d", err, generation)
+	}
+	request := fenceRequest(now, generation, "owner", 1)
+	store.fault = faultUnknownAfter
+	fence, err := client.AcquirePolicyFence(context.Background(), request)
+	if err != nil {
+		t.Fatalf("unknown-after acquire: %v", err)
+	}
+	if _, err := client.AcquirePolicyFence(context.Background(), request); err != nil {
+		t.Fatalf("idempotent acquire: %v", err)
+	}
+	renewed := request
+	renewed.LeaseUntil = request.LeaseUntil.Add(time.Minute)
+	if _, err := client.RenewPolicyFence(context.Background(), renewed); err != nil {
+		t.Fatalf("renew: %v", err)
+	}
+	stale := renewed
+	stale.Owner = []byte("stale")
+	if _, err := client.RenewPolicyFence(context.Background(), stale); !errors.Is(err, ErrStaleOwner) {
+		t.Fatalf("stale renewal error = %v", err)
+	}
+	set, err := client.WritePolicyManifest(context.Background(), fence, manifestSet(t, generation))
+	if err != nil {
+		t.Fatalf("write manifest: %v", err)
+	}
+	mapping := coordination.PolicyCopyMapV3{
+		LPART: []byte("lpart"), MapGeneration: 7, CopyGeneration: generation,
+		VisibilityDigest: digest("visibility"), CopyDigest: set.PhysicalDigest,
+		ActivationKind: coordination.ActivationPolicyRoot, ActivationRef: []byte("root"),
+		State: coordination.CopyStateActive,
+	}
+	fixture.policyErr = ErrConflict
+	if err := client.PublishPolicyMapping(context.Background(), fence, set, mapping); !errors.Is(err, ErrConflict) {
+		t.Fatalf("unverified mapping error = %v", err)
+	}
+	fixture.policyErr = nil
+	if err := client.PublishPolicyMapping(context.Background(), fence, set, mapping); err != nil {
+		t.Fatalf("publish mapping: %v", err)
+	}
+	if err := client.PublishPolicyMapping(context.Background(), fence, set, mapping); err != nil {
+		t.Fatalf("idempotent mapping: %v", err)
+	}
+	pin, err := client.LookupPolicyCopy(context.Background(), []byte("lpart"), 7)
+	if err != nil || pin.Map.CopyGeneration != generation || pin.PinDigest == (coordination.Digest{}) {
+		t.Fatalf("lookup pin: %#v, %v", pin, err)
+	}
+	fixture.policyPin = true
+	if err := client.RetirePolicyCopy(context.Background(), fence, set, 19); !errors.Is(err, ErrLeaseActive) {
+		t.Fatalf("lease retirement error = %v", err)
+	}
+	fixture.policyPin = false
+	if err := client.RetirePolicyCopy(context.Background(), fence, set, 19); err != nil {
+		t.Fatalf("retire: %v", err)
+	}
+	if err := client.ReleasePolicyFence(context.Background(), stale); !errors.Is(err, ErrStaleOwner) {
+		t.Fatalf("stale release error = %v", err)
+	}
+}
+
+func TestPolicyFenceTakeoverAndGenerationConcurrency(t *testing.T) {
+	now := time.Date(2026, 8, 27, 12, 0, 0, 0, time.UTC)
+	store := newMemoryStore()
+	fixture := &fixtures{
+		authority: Authority{Generation: 3, RetentionGeneration: 4, HistoryFloor: 20},
+		status:    OperationTerminal,
+	}
+	client := newTestClient(t, store, fixture, &now)
+	const count = 32
+	values := make(chan coordination.Generation, count)
+	var group sync.WaitGroup
+	for i := range count {
+		group.Add(1)
+		go func(index int) {
+			defer group.Done()
+			value, err := client.ReserveCopyGeneration(
+				context.Background(), []byte("parallel"), []byte{byte(index + 1)},
+			)
+			if err != nil {
+				t.Errorf("reserve: %v", err)
+				return
+			}
+			values <- value
+		}(i)
+	}
+	group.Wait()
+	close(values)
+	seen := make(map[coordination.Generation]bool)
+	for value := range values {
+		seen[value] = true
+	}
+	if len(seen) != count {
+		t.Fatalf("reserved %d unique generations", len(seen))
+	}
+	first := fenceRequest(now, 1, "first", 1)
+	first.LeaseUntil = now.Add(-time.Second)
+	if _, err := client.AcquirePolicyFence(context.Background(), first); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.RenewPolicyFence(context.Background(), first); !errors.Is(err, ErrExpired) {
+		t.Fatalf("expired renewal error = %v", err)
+	}
+	second := fenceRequest(now, 1, "second", 2)
+	if _, err := client.AcquirePolicyFence(context.Background(), second); err != nil {
+		t.Fatalf("takeover: %v", err)
+	}
+	if _, err := client.AcquirePolicyFence(context.Background(), first); !errors.Is(err, ErrBusy) {
+		t.Fatalf("stale takeover error = %v", err)
+	}
+	unknown := fenceRequest(now, 2, "unknown", 1)
+	store.fault = faultUnknownBefore
+	if _, err := client.AcquirePolicyFence(context.Background(), unknown); !errors.Is(err, ErrUnknown) {
+		t.Fatalf("unknown-before error = %v", err)
+	}
+}
+
+func makeGeneration(t *testing.T, family coordination.Family, igen coordination.IGEN, through coordination.Epoch, delta coordination.Digest, state coordination.IndexGenerationState) coordination.IndexGenerationV2 {
+	t.Helper()
+	value, err := coordination.NewIndexGenerationV2(coordination.IndexGenerationV2{
+		Family: family, IGEN: igen, Schema: []byte("schema"), Buckets: 8,
+		SourceEpoch: 10, BuildThrough: 10, DeltaThrough: through,
+		PolicyCopyCoverageDigest: digest("coverage"), DeltaDigest: delta, State: state,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return value
+}
+
+func makeDelta(t *testing.T, build coordination.IndexGenerationV2, epoch coordination.Epoch, txn string) coordination.IndexDeltaV1 {
+	t.Helper()
+	value, err := coordination.NewIndexDeltaV1(
+		build.Family, build.IGEN, epoch, []byte(txn), build.ManifestDigest,
+		[]coordination.IndexDeltaEntry{{
+			Kind: []byte("posting"), ID: []byte(txn),
+			LogicalDigest: digest("logical-" + txn), PhysicalDigest: digest("physical-" + txn),
+		}}, coordination.LifecycleVerified,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return value
+}
+
+func TestIndexLifecycleGapSealActivationAndRetirement(t *testing.T) {
+	now := time.Date(2026, 8, 27, 12, 0, 0, 0, time.UTC)
+	store := newMemoryStore()
+	fixture := &fixtures{
+		authority: Authority{Generation: 3, RetentionGeneration: 4, HistoryFloor: 5},
+		status:    OperationTerminal,
+	}
+	client := newTestClient(t, store, fixture, &now)
+	igen, err := client.ReserveIndexGeneration(context.Background(), []byte("lexical"), []byte("reserve-index"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	buildManifest := makeGeneration(t, []byte("lexical"), igen, 10, digest("empty"), coordination.IndexGenerationBuilding)
+	build := IndexBuild{
+		Manifest: buildManifest, Owner: []byte("builder"), OperationID: []byte("build-op"),
+		Fence: 9, AuthorityGeneration: 3, RetentionGeneration: 4,
+	}
+	store.fault = faultUnknownAfter
+	build, err = client.CreateIndexGeneration(context.Background(), build)
+	if err != nil {
+		t.Fatalf("create unknown-after: %v", err)
+	}
+	if _, err := client.CreateIndexGeneration(context.Background(), build); err != nil {
+		t.Fatalf("idempotent create: %v", err)
+	}
+	delta11 := makeDelta(t, build.Manifest, 11, "txn-11")
+	delta12 := makeDelta(t, build.Manifest, 12, "txn-12")
+	fixture.indexErr = ErrConflict
+	if err := client.AppendIndexDelta(context.Background(), delta11); !errors.Is(err, ErrConflict) {
+		t.Fatalf("unverified delta error = %v", err)
+	}
+	fixture.indexErr = nil
+	if err := client.AppendIndexDelta(context.Background(), delta11); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.AppendIndexDelta(context.Background(), delta12); err != nil {
+		t.Fatal(err)
+	}
+	contradictoryDelta := makeDelta(t, build.Manifest, 11, "txn-11")
+	contradictoryDelta.Entries[0].PhysicalDigest = digest("different")
+	contradictoryDelta, _ = coordination.NewIndexDeltaV1(
+		contradictoryDelta.Family, contradictoryDelta.IGEN, contradictoryDelta.Epoch,
+		contradictoryDelta.TXN, contradictoryDelta.ManifestDigest,
+		contradictoryDelta.Entries, coordination.LifecycleVerified,
+	)
+	if err := client.AppendIndexDelta(context.Background(), contradictoryDelta); !errors.Is(err, ErrCorruption) {
+		t.Fatalf("delta contradiction error = %v", err)
+	}
+	encoded11, _ := coordination.MarshalIndexDeltaV1(delta11)
+	encoded12, _ := coordination.MarshalIndexDeltaV1(delta12)
+	deltaDigest := digestParts([]byte("index-delta-set-v1"), encoded11, encoded12)
+	sealed := makeGeneration(t, []byte("lexical"), igen, 12, deltaDigest, coordination.IndexGenerationSealed)
+	fixture.outcomes = []CommittedOutcome{{Epoch: 11, TXN: []byte("txn-11")}}
+	if _, err := client.SealIndexGeneration(context.Background(), []byte("builder"), []byte("build-op"), 9, sealed); !errors.Is(err, ErrCorruption) {
+		t.Fatalf("missing outcome error = %v", err)
+	}
+	fixture.outcomes = append(fixture.outcomes, CommittedOutcome{Epoch: 12, TXN: []byte("txn-12")})
+	sealedBuild, err := client.SealIndexGeneration(context.Background(), []byte("builder"), []byte("build-op"), 9, sealed)
+	if err != nil || sealedBuild.Manifest.State != coordination.IndexGenerationSealed {
+		t.Fatalf("seal: %#v, %v", sealedBuild, err)
+	}
+	activation := coordination.IndexActivationV2{
+		Family: []byte("lexical"), IGEN: igen, ActivationEpoch: 13, SourceFrontier: 12,
+		ManifestDigest: sealed.ManifestDigest, DeltaDigest: sealed.DeltaDigest, TXN: []byte("activation"),
+		Fence: 9, AuthorityGeneration: 3, State: coordination.LifecycleActive,
+	}
+	store.fault = faultUnknownAfter
+	if err := client.PublishIndexActivation(context.Background(), activation); err != nil {
+		t.Fatalf("activation unknown-after: %v", err)
+	}
+	contradictoryActivation := activation
+	contradictoryActivation.TXN = []byte("different")
+	if err := client.PublishIndexActivation(context.Background(), contradictoryActivation); !errors.Is(err, ErrCorruption) {
+		t.Fatalf("activation contradiction error = %v", err)
+	}
+	pin, err := client.LookupIndexGeneration(context.Background(), []byte("lexical"), 13)
+	if err != nil || !bytes.Equal(pin.Manifest.IGEN, igen) || pin.PinDigest == (coordination.Digest{}) {
+		t.Fatalf("lookup: %#v, %v", pin, err)
+	}
+	fixture.indexPin = true
+	if err := client.RetireIndexGeneration(context.Background(), []byte("lexical"), igen); !errors.Is(err, ErrLeaseActive) {
+		t.Fatalf("lease retirement error = %v", err)
+	}
+	fixture.indexPin = false
+	if err := client.RetireIndexGeneration(context.Background(), []byte("lexical"), igen); err != nil {
+		t.Fatalf("retire: %v", err)
+	}
+	if _, err := client.LookupIndexGeneration(context.Background(), []byte("lexical"), 13); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("retired lookup error = %v", err)
+	}
+}
+
+func TestAppendOnlyContradictions(t *testing.T) {
+	now := time.Date(2026, 8, 27, 12, 0, 0, 0, time.UTC)
+	store := newMemoryStore()
+	fixture := &fixtures{authority: Authority{Generation: 3, RetentionGeneration: 4, HistoryFloor: 5}}
+	client := newTestClient(t, store, fixture, &now)
+	generation, _ := client.ReserveCopyGeneration(context.Background(), []byte("lpart"), []byte("reserve-policy"))
+	request := fenceRequest(now, generation, "owner", 1)
+	fence, _ := client.AcquirePolicyFence(context.Background(), request)
+	set, _ := client.WritePolicyManifest(context.Background(), fence, manifestSet(t, generation))
+	mapping := coordination.PolicyCopyMapV3{
+		LPART: []byte("lpart"), MapGeneration: 1, CopyGeneration: generation,
+		VisibilityDigest: digest("visibility"), CopyDigest: set.PhysicalDigest,
+		ActivationKind: coordination.ActivationPolicyRoot, ActivationRef: []byte("root"),
+		State: coordination.CopyStateActive,
+	}
+	if err := client.PublishPolicyMapping(context.Background(), fence, set, mapping); err != nil {
+		t.Fatal(err)
+	}
+	contradiction := mapping
+	contradiction.ActivationRef = []byte("other")
+	if err := client.PublishPolicyMapping(context.Background(), fence, set, contradiction); !errors.Is(err, ErrCorruption) {
+		t.Fatalf("mapping contradiction error = %v", err)
+	}
+}

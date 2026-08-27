@@ -92,6 +92,24 @@ func TestM3RowOrderingAndSharedAllocatorRows(t *testing.T) {
 	if bytes.Compare(newActivation, oldActivation) >= 0 {
 		t.Fatal("newer index activation does not sort first")
 	}
+	mapPrefix, _ := PolicyCopyMapPrefix(domain, LPART("part"))
+	if !bytes.HasPrefix(newMap, mapPrefix) {
+		t.Fatal("policy map prefix does not cover mapping rows")
+	}
+	activationPrefix, _ := IndexActivationPrefix(domain, Family("lexical"))
+	if !bytes.HasPrefix(newActivation, activationPrefix) {
+		t.Fatal("index activation prefix does not cover activation rows")
+	}
+	delta, _ := IndexDeltaRow(domain, Family("lexical"), IGEN("g1"), 10, TXN("txn"))
+	deltaPrefix, _ := IndexDeltaPrefix(domain, Family("lexical"), IGEN("g1"))
+	if !bytes.HasPrefix(delta, deltaPrefix) {
+		t.Fatal("index delta prefix does not cover delta rows")
+	}
+	copyHead, _ := PolicyCopyHeadRow(domain, LPART("part"))
+	indexHead, _ := IndexGenerationHeadRow(domain, Family("lexical"))
+	if bytes.Equal(copyHead, indexHead) {
+		t.Fatal("catalog generation heads collide")
+	}
 	allocator, _ := AllocatorRow(domain)
 	for name, makeRow := range map[string]func(DomainID) ([]byte, error){
 		"history floor": HistoryFloorRow, "writer authority": WriterAuthorityRow,
