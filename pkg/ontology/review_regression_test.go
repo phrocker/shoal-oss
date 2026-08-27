@@ -45,6 +45,17 @@ func TestExtractionRejectsEvidenceWithDifferentMetadata(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	alteredRequest, err := ontology.NewExtractionRequest(
+		fixture.version, []ontology.EvidenceRef{altered},
+		"Extract cited facts.", fixture.provenance,
+		ontology.DefaultExtractionLimits(), nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if request.ID() == alteredRequest.ID() {
+		t.Fatal("request identity did not include evidence metadata")
+	}
 	assertion := mustAssertion(
 		t, fixture.title.ID(), ontology.AssertionExplicit,
 		[]ontology.EvidenceRef{altered}, fixture.provenance,

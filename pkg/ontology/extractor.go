@@ -295,7 +295,8 @@ func extractionRequestID(request ExtractionRequest) (shoal.ID, error) {
 		if err := evidence.Validate(); err != nil {
 			return "", err
 		}
-		evidenceIDs[index] = string(evidence.ID())
+		evidenceIDs[index] = canonicalParts(
+			string(evidence.ID()), canonicalMetadata(evidence.metadata))
 	}
 	return deriveID(
 		"extraction",

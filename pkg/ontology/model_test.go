@@ -289,6 +289,31 @@ func TestOntologyVersionRejectsDuplicateMembers(t *testing.T) {
 			properties:    []ontology.PropertyDefinition{fixture.title, fixture.title},
 		},
 	}
+
+	t.Run("schema content identity", func(t *testing.T) {
+		fixture := newOntologyFixture(t)
+		changedSchema, err := ontology.NewOntologySchema(
+			fixture.schema.Key(), "Renamed schema", "Changed description",
+			shoal.Metadata{"owner": "different"},
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if changedSchema.ID() != fixture.schema.ID() {
+			t.Fatal("test requires schemas to share logical identity")
+		}
+		changedVersion, err := ontology.NewOntologyVersion(
+			changedSchema, fixture.version.Version(), fixture.version.CreatedAt(),
+			fixture.version.Concepts(), fixture.version.Relationships(),
+			fixture.version.Properties(), fixture.version.Metadata(),
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if changedVersion.ID() == fixture.version.ID() {
+			t.Fatal("ontology version identity omitted schema snapshot content")
+		}
+	})
 	for name, test := range tests {
 		t.Run(name, func(t *testing.T) {
 			_, err := ontology.NewOntologyVersion(

@@ -1363,6 +1363,11 @@ func (s OntologySchema) Metadata() shoal.Metadata {
 	return cloneMetadata(s.metadata)
 }
 
+func (s OntologySchema) canonical() string {
+	return canonicalParts(
+		string(s.id), s.key, s.name, s.description, canonicalMetadata(s.metadata))
+}
+
 func (s OntologySchema) clone() OntologySchema {
 	s.metadata = cloneMetadata(s.metadata)
 	return s
@@ -1564,7 +1569,7 @@ func ontologyVersionID(version OntologyVersion) (shoal.ID, error) {
 	}
 	return deriveID(
 		"ontology-version",
-		string(version.schema.ID()),
+		version.schema.canonical(),
 		version.version,
 		canonicalTime(version.createdAt),
 		canonicalParts(concepts...),
