@@ -284,15 +284,20 @@ func (s *MemoryStore) Verify(_ context.Context, epoch coordination.Epoch, cells 
 	if fault != 0 {
 		return ErrUnavailable
 	}
+	expected := mapTrusted(epoch, cells)
+	got := make([]TrustedCell, 0, len(cells))
 	for _, cell := range cells {
-		wanted := expandCell(epoch, cell)
-		got, found := s.physical[physicalKey(wanted)]
-		if !found || !bytes.Equal(got.Value, wanted.Value) ||
-			coordination.Sum(got.Value) != cell.Entry.ValueDigest {
-			return ErrInternal
+		physical := expandCell(epoch, cell)
+		value, found := s.physical[physicalKey(physical)]
+		if found {
+			got = append(got, TrustedCell{
+				Table: value.Table, Row: value.Row, Family: value.Family,
+				Qualifier: value.Qualifier, Visibility: value.Visibility,
+				Timestamp: value.Timestamp, Value: value.Value,
+			})
 		}
 	}
-	return nil
+	return verifyTrustedCells(expected, got, physicalValueDigests(cells))
 }
 
 func (s *MemoryStore) Record(_ context.Context, domain coordination.DomainID, txn coordination.TXN, reason string) error {

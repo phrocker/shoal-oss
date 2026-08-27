@@ -30,11 +30,11 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/explorer/coordination/transaction"
 )
 
-func coordinationEntry() coordination.ManifestEntry {
+func coordinationEntry(id, value string) coordination.ManifestEntry {
 	return coordination.ManifestEntry{
-		Table: []byte("table"), Row: []byte("row"), ColumnFamily: []byte("f"),
-		ColumnQualifier: []byte("q"), EpochSlot: coordination.EpochSlotContent,
-		ValueLength: 5, ValueDigest: coordination.Sum([]byte("value")),
+		Table: []byte("table"), Row: []byte("row-" + id), ColumnFamily: []byte("f"),
+		ColumnQualifier: []byte("q-" + id), EpochSlot: coordination.EpochSlotContent,
+		ValueLength: uint32(len(value)), ValueDigest: coordination.Sum([]byte(value)),
 		LPART: coordination.LPART("policy"), CopyGeneration: 1,
 		VisibilityDigest:   coordination.Sum([]byte("A")),
 		LogicalDigest:      coordination.Sum([]byte("logical")),
@@ -70,19 +70,20 @@ func RunPhysicalMappingSuite(
 	captured func() []transaction.TrustedCell,
 ) {
 	t.Helper()
-	cell := transaction.PhysicalCell{
-		Entry: coordinationEntry(),
-		Value: []byte("value"), Visibility: []byte("A"),
+	cells := []transaction.PhysicalCell{
+		{Entry: coordinationEntry("z", "value-z"), Value: []byte("value-z"), Visibility: []byte("A")},
+		{Entry: coordinationEntry("a", "value-a"), Value: []byte("value-a"), Visibility: []byte("A")},
+		{Entry: coordinationEntry("m", "value-m"), Value: []byte("value-m"), Visibility: []byte("A")},
 	}
-	if err := adapter.Write(context.Background(), 9, []transaction.PhysicalCell{cell}); err != nil {
+	if err := adapter.Write(context.Background(), 9, cells); err != nil {
 		t.Fatal(err)
 	}
 	values := captured()
-	if len(values) != 1 || values[0].Timestamp != 9 ||
+	if len(values) != len(cells) || values[0].Timestamp != 9 ||
 		string(values[0].Table) != "table" || string(values[0].Visibility) != "A" {
 		t.Fatalf("trusted mapping = %#v", values)
 	}
-	if err := adapter.Verify(context.Background(), 9, []transaction.PhysicalCell{cell}); err != nil {
+	if err := adapter.Verify(context.Background(), 9, cells); err != nil {
 		t.Fatal(err)
 	}
 }

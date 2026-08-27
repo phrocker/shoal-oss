@@ -108,32 +108,37 @@ func (w *Worker) RunOnce(ctx context.Context) error {
 		return fmt.Errorf("%w: recovery queue exceeds its configured bound", transaction.ErrUnavailable)
 	}
 	sort.Slice(candidates, func(i, j int) bool { return bytes.Compare(candidates[i], candidates[j]) < 0 })
-	sem := make(chan struct{}, w.config.Concurrency)
-	var wg sync.WaitGroup
-	var mu sync.Mutex
-	var combined error
-	for _, txn := range candidates {
-		txn := append(coordination.TXN(nil), txn...)
-		wg.Add(1)
+	workerCount := min(w.config.Concurrency, len(candidates))
+	jobs := make(chan coordination.TXN)
+	errs := make(chan error, len(candidates))
+	var workers sync.WaitGroup
+	for range workerCount {
+		workers.Add(1)
 		go func() {
-			defer wg.Done()
-			select {
-			case sem <- struct{}{}:
-				defer func() { <-sem }()
-			case <-ctx.Done():
-				mu.Lock()
-				combined = errors.Join(combined, ctx.Err())
-				mu.Unlock()
-				return
-			}
-			if err := w.recoverOne(ctx, txn); err != nil {
-				mu.Lock()
-				combined = errors.Join(combined, err)
-				mu.Unlock()
+			defer workers.Done()
+			for txn := range jobs {
+				if err := w.recoverOne(ctx, txn); err != nil {
+					errs <- err
+				}
 			}
 		}()
 	}
-	wg.Wait()
+send:
+	for _, txn := range candidates {
+		select {
+		case jobs <- append(coordination.TXN(nil), txn...):
+		case <-ctx.Done():
+			errs <- ctx.Err()
+			break send
+		}
+	}
+	close(jobs)
+	workers.Wait()
+	close(errs)
+	var combined error
+	for err := range errs {
+		combined = errors.Join(combined, err)
+	}
 	return combined
 }
 

@@ -22,6 +22,7 @@ package recovery
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -36,8 +37,12 @@ func (s fixedSource) Candidates(context.Context, coordination.DomainID, int) ([]
 }
 
 type fakeCoordinator struct {
-	snapshot  transaction.Snapshot
-	recovered int
+	snapshot   transaction.Snapshot
+	mu         sync.Mutex
+	recovered  int
+	active     int
+	maxActive  int
+	recoverLag time.Duration
 }
 
 func (f *fakeCoordinator) Inspect(context.Context, coordination.TXN) (transaction.Snapshot, error) {
@@ -45,7 +50,17 @@ func (f *fakeCoordinator) Inspect(context.Context, coordination.TXN) (transactio
 }
 
 func (f *fakeCoordinator) Recover(context.Context, coordination.TXN, coordination.OwnerID, time.Time, transaction.Authority) (transaction.Result, error) {
+	f.mu.Lock()
 	f.recovered++
+	f.active++
+	if f.active > f.maxActive {
+		f.maxActive = f.active
+	}
+	f.mu.Unlock()
+	time.Sleep(f.recoverLag)
+	f.mu.Lock()
+	f.active--
+	f.mu.Unlock()
 	return transaction.Result{Epoch: f.snapshot.Root.Epoch}, nil
 }
 
@@ -72,5 +87,40 @@ func TestWorkerBoundsAndAuthoritativeRecheck(t *testing.T) {
 	worker.config.Source = fixedSource{coordination.TXN("a"), coordination.TXN("b"), coordination.TXN("c")}
 	if err := worker.RunOnce(context.Background()); !errors.Is(err, transaction.ErrUnavailable) {
 		t.Fatalf("overflow queue = %v", err)
+	}
+}
+
+func TestWorkerPoolHonorsConcurrencyCap(t *testing.T) {
+	now := time.Date(2026, 8, 27, 16, 0, 0, 0, time.UTC)
+	coordinator := &fakeCoordinator{
+		snapshot: transaction.Snapshot{
+			Root: coordination.TxnRootV3{State: coordination.StateClaimed},
+			Lease: coordination.TxnLeaseV1{
+				Generation: 1, Owner: coordination.OwnerID("old"), Fence: 1,
+				LeaseUntil: now.Add(-time.Minute),
+			},
+		},
+		recoverLag: time.Millisecond,
+	}
+	candidates := make(fixedSource, 24)
+	for i := range candidates {
+		candidates[i] = coordination.TXN{byte(i + 1)}
+	}
+	worker, err := New(Config{
+		Domain: coordination.DomainID("domain"), Owner: coordination.OwnerID("recovery"),
+		Source: candidates, Coordinator: coordinator, Clock: func() time.Time { return now },
+		Authority: transaction.Authority{}, Limit: len(candidates), Concurrency: 3,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := worker.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	coordinator.mu.Lock()
+	defer coordinator.mu.Unlock()
+	if coordinator.recovered != len(candidates) || coordinator.maxActive > 3 ||
+		coordinator.maxActive < 2 {
+		t.Fatalf("pool recovered=%d maxActive=%d", coordinator.recovered, coordinator.maxActive)
 	}
 }

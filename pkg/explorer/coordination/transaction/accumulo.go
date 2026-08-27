@@ -22,7 +22,9 @@ package transaction
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
+	"fmt"
 
 	"github.com/phrocker/shoal-oss/pkg/explorer/coordination"
 	"github.com/phrocker/shoal-oss/pkg/explorer/coordination/allocator"
@@ -91,22 +93,73 @@ func (a *AccumuloPhysicalAdapter) Verify(ctx context.Context, epoch coordination
 	if err != nil {
 		return err
 	}
-	if len(got) != len(wanted) {
-		return ErrInternal
+	return verifyTrustedCells(wanted, got, physicalValueDigests(cells))
+}
+
+type expectedTrustedCell struct {
+	cell        TrustedCell
+	valueDigest coordination.Digest
+}
+
+func verifyTrustedCells(wanted, got []TrustedCell, valueDigests []coordination.Digest) error {
+	if len(wanted) != len(valueDigests) {
+		return fmt.Errorf("%w: physical verification digest count mismatch", ErrInternal)
 	}
-	for i := range wanted {
-		if !trustedCellEqual(wanted[i], got[i]) {
-			return ErrInternal
+	expected := make(map[string]expectedTrustedCell, len(wanted))
+	for ordinal, cell := range wanted {
+		key := trustedCellKey(cell)
+		if _, exists := expected[key]; exists {
+			return fmt.Errorf("%w: expected physical key duplicate at ordinal %d", ErrInternal, ordinal)
 		}
+		if coordination.Sum(cell.Value) != valueDigests[ordinal] {
+			return fmt.Errorf("%w: expected physical value digest mismatch at ordinal %d", ErrInternal, ordinal)
+		}
+		expected[key] = expectedTrustedCell{cell: cell, valueDigest: valueDigests[ordinal]}
+	}
+	seen := make(map[string]struct{}, len(got))
+	for ordinal, cell := range got {
+		key := trustedCellKey(cell)
+		if _, duplicate := seen[key]; duplicate {
+			return fmt.Errorf("%w: returned physical key duplicate at ordinal %d", ErrInternal, ordinal)
+		}
+		seen[key] = struct{}{}
+		wantedCell, exists := expected[key]
+		if !exists {
+			return fmt.Errorf("%w: unexpected physical key at ordinal %d", ErrInternal, ordinal)
+		}
+		if !bytes.Equal(wantedCell.cell.Value, cell.Value) ||
+			coordination.Sum(cell.Value) != wantedCell.valueDigest {
+			return fmt.Errorf("%w: physical value digest mismatch at ordinal %d", ErrInternal, ordinal)
+		}
+	}
+	if len(seen) != len(expected) {
+		return fmt.Errorf("%w: missing physical key", ErrInternal)
 	}
 	return nil
 }
 
-func trustedCellEqual(a, b TrustedCell) bool {
-	return bytes.Equal(a.Table, b.Table) && bytes.Equal(a.Row, b.Row) &&
-		bytes.Equal(a.Family, b.Family) && bytes.Equal(a.Qualifier, b.Qualifier) &&
-		bytes.Equal(a.Visibility, b.Visibility) && a.Timestamp == b.Timestamp &&
-		bytes.Equal(a.Value, b.Value)
+func physicalValueDigests(cells []PhysicalCell) []coordination.Digest {
+	result := make([]coordination.Digest, len(cells))
+	for i := range cells {
+		result[i] = cells[i].Entry.ValueDigest
+	}
+	return result
+}
+
+func trustedCellKey(cell TrustedCell) string {
+	encoded := make([]byte, 0, 64)
+	var length [8]byte
+	for _, component := range [][]byte{
+		cell.Table, cell.Row, cell.Family, cell.Qualifier, cell.Visibility,
+	} {
+		binary.BigEndian.PutUint64(length[:], uint64(len(component)))
+		encoded = append(encoded, length[:]...)
+		encoded = append(encoded, component...)
+	}
+	var timestamp [8]byte
+	binary.BigEndian.PutUint64(timestamp[:], uint64(cell.Timestamp))
+	encoded = append(encoded, timestamp[:]...)
+	return string(encoded)
 }
 
 var _ Store = (*AccumuloStore)(nil)

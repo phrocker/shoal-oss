@@ -34,7 +34,11 @@ func (s *mappingSink) WriteTrusted(_ context.Context, cells []transaction.Truste
 }
 
 func (s *mappingSink) ReadTrusted(_ context.Context, _ []transaction.TrustedCell) ([]transaction.TrustedCell, error) {
-	return append([]transaction.TrustedCell(nil), s.cells...), nil
+	result := append([]transaction.TrustedCell(nil), s.cells...)
+	for left, right := 0, len(result)-1; left < right; left, right = left+1, right-1 {
+		result[left], result[right] = result[right], result[left]
+	}
+	return result, nil
 }
 
 func TestMemoryAtomicStoreConformance(t *testing.T) {
