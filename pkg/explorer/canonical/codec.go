@@ -114,7 +114,7 @@ func (e *encoder) writeString(value string) {
 		e.mismatch = true
 		return
 	}
-	for index := range value {
+	for index := 0; index < len(value); index++ {
 		if e.expected[start+index] != value[index] {
 			e.mismatch = true
 			return

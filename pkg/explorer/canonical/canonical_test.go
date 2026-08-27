@@ -707,13 +707,6 @@ func assertInvalidArgument(t *testing.T, err error) {
 // second encoding of the same record and must be rejected; otherwise one
 // record would have two distinct digests.
 func TestUnmarshalRejectsNoncanonicalMetadataOrder(t *testing.T) {
-	record := fixtureRecord(false)
-	record.Document.Metadata = map[string]string{"aa": "11", "bb": "22"}
-	original, err := MarshalV1(record)
-	if err != nil {
-		t.Fatal(err)
-	}
-
 	entry := func(key, value string) []byte {
 		encoded := make([]byte, 0, len(key)+len(value)+8)
 		for _, text := range []string{key, value} {
@@ -724,32 +717,53 @@ func TestUnmarshalRejectsNoncanonicalMetadataOrder(t *testing.T) {
 		}
 		return encoded
 	}
-	sorted := append(entry("aa", "11"), entry("bb", "22")...)
-	permuted := append(entry("bb", "22"), entry("aa", "11")...)
-	offset := bytes.Index(original, sorted)
-	if offset < 0 {
-		t.Fatal("sorted metadata entries not found in canonical bytes")
-	}
+	for _, test := range []struct {
+		name          string
+		first, second string
+	}{
+		{name: "ASCII", first: "aa", second: "bb"},
+		{name: "shared UTF-8 prefix", first: "é", second: "ê"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			record := fixtureRecord(false)
+			record.Document.Metadata = map[string]string{
+				test.first: "11", test.second: "22",
+			}
+			original, err := MarshalV1(record)
+			if err != nil {
+				t.Fatal(err)
+			}
+			sorted := append(
+				entry(test.first, "11"), entry(test.second, "22")...)
+			permuted := append(
+				entry(test.second, "22"), entry(test.first, "11")...)
+			offset := bytes.Index(original, sorted)
+			if offset < 0 {
+				t.Fatal("sorted metadata entries not found in canonical bytes")
+			}
 
-	mutated := append([]byte(nil), original...)
-	copy(mutated[offset:], permuted)
-	sum := sha256.Sum256(mutated[:len(mutated)-envelopeChecksumSize])
-	copy(mutated[len(mutated)-envelopeChecksumSize:], sum[:])
-	if bytes.Equal(original, mutated) {
-		t.Fatal("permutation did not change the encoding")
-	}
+			mutated := append([]byte(nil), original...)
+			copy(mutated[offset:], permuted)
+			sum := sha256.Sum256(
+				mutated[:len(mutated)-envelopeChecksumSize])
+			copy(mutated[len(mutated)-envelopeChecksumSize:], sum[:])
+			if bytes.Equal(original, mutated) {
+				t.Fatal("permutation did not change the encoding")
+			}
 
-	// The envelope checksum is recomputed, so only a canonicality check can
-	// reject these bytes.
-	if err := VerifyChecksum(mutated); err != nil {
-		t.Fatalf("mutated envelope checksum = %v", err)
-	}
-	_, err = UnmarshalV1(mutated)
-	assertInvalidArgument(t, err)
-	if _, err := Digest(mutated); err == nil {
-		t.Fatal("Digest accepted a noncanonical encoding")
-	} else {
-		assertInvalidArgument(t, err)
+			// The envelope checksum is recomputed, so only a canonicality check
+			// can reject these bytes.
+			if err := VerifyChecksum(mutated); err != nil {
+				t.Fatalf("mutated envelope checksum = %v", err)
+			}
+			_, err = UnmarshalV1(mutated)
+			assertInvalidArgument(t, err)
+			if _, err := Digest(mutated); err == nil {
+				t.Fatal("Digest accepted a noncanonical encoding")
+			} else {
+				assertInvalidArgument(t, err)
+			}
+		})
 	}
 }
 
