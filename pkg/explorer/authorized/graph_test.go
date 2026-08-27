@@ -202,9 +202,16 @@ func TestConnectCatalogFailureRetryReconciles(t *testing.T) {
 	) {
 		t.Fatalf("first edge catalog failure = %v", err)
 	}
+	other := f.newClient(t, f.base, f.store, f.sourceB, f.policyB, nil)
+	if err := other.Connect(f.admin(t), edge); !shoal.IsErrorCode(
+		err, shoal.ErrorConflict,
+	) {
+		t.Fatalf("different-policy edge seizure = %v", err)
+	}
 	if err := client.Connect(f.admin(t), edge); err != nil {
 		t.Fatal(err)
 	}
+
 	neighborhood, err := client.Neighborhood(
 		f.alice(t),
 		explorer.NeighborhoodRequest{
@@ -217,6 +224,103 @@ func TestConnectCatalogFailureRetryReconciles(t *testing.T) {
 	}
 	if len(neighborhood.Edges) != 1 {
 		t.Fatalf("reconciled edge missing: %#v", neighborhood)
+	}
+}
+
+func TestConnectPinsEndpointsThroughBaseMutation(t *testing.T) {
+	f := newFixture(t)
+	source := explorer.Source{
+		URI: "file:///pinned-endpoint.txt", MediaType: explorer.MediaTypeText,
+		Content: "pinned endpoint",
+	}
+	endpoint, err := f.clientA.Ingest(f.admin(t), source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan struct{})
+	release := make(chan struct{})
+	hooked := &hookClient{
+		Client: f.base,
+		connect: func(ctx context.Context, edge graph.Edge) error {
+			close(started)
+			<-release
+			return f.base.Connect(ctx, edge)
+		},
+	}
+	client := f.newClient(t, hooked, f.store, f.sourceA, f.policyA, nil)
+	connectErr := make(chan error, 1)
+	go func() {
+		connectErr <- client.Connect(f.admin(t), graph.Edge{
+			ID: "pinned-edge", From: endpoint.Document.ID,
+			To: endpoint.Document.ID, Type: "link", Weight: 1,
+		})
+	}()
+	<-started
+	ingestErr := make(chan error, 1)
+	go func() {
+		_, err := f.clientB.Ingest(f.admin(t), explorer.Source{
+			URI: source.URI, MediaType: source.MediaType,
+			Content: "new endpoint policy",
+		})
+		ingestErr <- err
+	}()
+	select {
+	case err := <-ingestErr:
+		close(release)
+		t.Fatalf("endpoint mutation was not fenced: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(release)
+	if err := <-connectErr; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-ingestErr; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestNeighborhoodHydratesEachDocumentOnce(t *testing.T) {
+	f := newFixture(t)
+	result, err := f.clientA.Ingest(f.admin(t), explorer.Source{
+		URI:       "file:///batched-neighborhood.md",
+		MediaType: explorer.MediaTypeMarkdown,
+		Content:   "# One\n\nalpha\n\n## Two\n\nbeta\n",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	documentCalls, documentsCalls := 0, 0
+	hooked := &hookClient{
+		Client: f.base,
+		documents: func(ctx context.Context) ([]explorer.DocumentSummary, error) {
+			documentsCalls++
+			return f.base.Documents(ctx)
+		},
+		document: func(
+			ctx context.Context, documentID, revisionID shoal.ID,
+		) (explorer.DocumentView, error) {
+			documentCalls++
+			return f.base.Document(ctx, documentID, revisionID)
+		},
+	}
+	client := f.newClient(t, hooked, f.store, f.sourceA, f.policyA, nil)
+	neighborhood, err := client.Neighborhood(
+		f.alice(t),
+		explorer.NeighborhoodRequest{
+			NodeIDs: []shoal.ID{result.Document.ID}, Depth: 4,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(neighborhood.Nodes) < 4 {
+		t.Fatalf("neighborhood did not exercise batching: %#v", neighborhood)
+	}
+	if documentsCalls != 2 || documentCalls != 2 {
+		t.Fatalf(
+			"canonical hydration calls: Documents=%d Document=%d",
+			documentsCalls, documentCalls,
+		)
 	}
 }
 

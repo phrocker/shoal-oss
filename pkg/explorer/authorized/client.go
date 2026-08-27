@@ -121,6 +121,11 @@ func (c *Client) Ingest(
 
 	c.mutationMu.Lock()
 	defer c.mutationMu.Unlock()
+	lease, err := c.policyStore.AcquireMutation(ctx)
+	if err != nil {
+		return explorer.IngestResult{}, policyCatalogWriteError(ctx, err)
+	}
+	defer lease.Release()
 	if err := guard.Check(ctx); err != nil {
 		return explorer.IngestResult{}, err
 	}

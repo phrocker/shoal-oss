@@ -264,7 +264,10 @@ document/graph relationships that a later storage adapter must persist.
   immutable objects written under an earlier physical policy epoch.
 - Graph edges require their own policy plus the current policies of both
   endpoints. Neighborhood reachability is recomputed after authorization so a
-  hidden intermediary cannot reveal or bridge visible nodes.
+  hidden intermediary cannot reveal or bridge visible nodes. Wrappers sharing
+  a policy store serialize base mutations, reserve each edge ID and selected
+  rule before the base write, and retain that reservation after ambiguous or
+  catalog failures so another selector cannot seize or relabel the edge.
 - Backend retrieval values are not trusted merely because their IDs are
   authorized. The wrapper verifies registered document digests, exact
   citations/quotes/ranges, canonical path nodes/edges, the exact canonical

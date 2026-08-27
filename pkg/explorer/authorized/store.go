@@ -63,6 +63,11 @@ type EdgeRegistration struct {
 	Rule       AccessRule
 }
 
+// MutationLease serializes base mutations shared by clients using one store.
+type MutationLease interface {
+	Release()
+}
+
 // SourcePolicyClaim reserves one source URI under a policy rule. Pending
 // claims represent an unresolved mutation and require authorization under both
 // Rule and PreviousRule when the latter is present. Version is an opaque
@@ -91,6 +96,7 @@ type SourcePolicyClaim struct {
 // that reading a claim cannot finalize one. Fallible durable coordination
 // belongs to M3.
 type PolicyStore interface {
+	AcquireMutation(context.Context) (MutationLease, error)
 	SourceClaim(context.Context, string) (SourcePolicyClaim, bool, error)
 	CompareAndSwapSourceClaim(
 		context.Context, string, *SourcePolicyClaim, AccessRule,
@@ -102,6 +108,8 @@ type PolicyStore interface {
 	Revision(context.Context, shoal.ID, shoal.ID) (RevisionRegistration, bool, error)
 	CurrentRevision(context.Context, shoal.ID) (RevisionRegistration, bool, error)
 	Node(context.Context, shoal.ID) (NodeRegistration, bool, error)
+	ReserveEdge(context.Context, EdgeRegistration) error
+	RollbackEdgeReservation(context.Context, EdgeRegistration) error
 	PutEdge(context.Context, EdgeRegistration) error
 	Edge(context.Context, shoal.ID) (EdgeRegistration, bool, error)
 }
@@ -125,6 +133,7 @@ type sourceClaimState struct {
 // instance across wrapped-client restarts preserves registrations, but process
 // exit loses them; it is not durable recovery storage.
 type MemoryPolicyStore struct {
+	mutationMu     sync.Mutex
 	mu             sync.RWMutex
 	sourceClaims   map[string]sourceClaimState
 	sourceVersion  uint64
@@ -133,6 +142,7 @@ type MemoryPolicyStore struct {
 	current        map[shoal.ID]revisionKey
 	nodes          map[shoal.ID]NodeRegistration
 	intrinsicEdges map[shoal.ID]EdgeRegistration
+	edgeClaims     map[shoal.ID]EdgeRegistration
 	edges          map[shoal.ID]EdgeRegistration
 }
 
@@ -145,8 +155,40 @@ func NewMemoryPolicyStore() *MemoryPolicyStore {
 		current:        make(map[shoal.ID]revisionKey),
 		nodes:          make(map[shoal.ID]NodeRegistration),
 		intrinsicEdges: make(map[shoal.ID]EdgeRegistration),
+		edgeClaims:     make(map[shoal.ID]EdgeRegistration),
 		edges:          make(map[shoal.ID]EdgeRegistration),
 	}
+}
+
+type memoryMutationLease struct {
+	store *MemoryPolicyStore
+	once  sync.Once
+}
+
+func (l *memoryMutationLease) Release() {
+	if l == nil || l.store == nil {
+		return
+	}
+	l.once.Do(l.store.mutationMu.Unlock)
+}
+
+// AcquireMutation serializes base mutations across all wrappers sharing this
+// policy store so authorization checks remain pinned through the base write.
+func (s *MemoryPolicyStore) AcquireMutation(
+	ctx context.Context,
+) (MutationLease, error) {
+	if err := contextFailure(ctx); err != nil {
+		return nil, err
+	}
+	if s == nil {
+		return nil, catalogUnavailable()
+	}
+	s.mutationMu.Lock()
+	if err := contextFailure(ctx); err != nil {
+		s.mutationMu.Unlock()
+		return nil, err
+	}
+	return &memoryMutationLease{store: s}, nil
 }
 
 // SourceClaim returns the current source-URI policy claim without its
@@ -620,6 +662,76 @@ func (s *MemoryPolicyStore) Node(
 	return cloned, true, nil
 }
 
+// ReserveEdge atomically reserves an application edge identity and rule before
+// the base mutation. Existing identical reservations are retryable; any
+// identity, content, or rule mismatch conflicts.
+func (s *MemoryPolicyStore) ReserveEdge(
+	ctx context.Context,
+	registration EdgeRegistration,
+) error {
+	if err := contextFailure(ctx); err != nil {
+		return err
+	}
+	normalized, err := normalizeApplicationEdgeRegistration(registration)
+	if err != nil {
+		return err
+	}
+	if s == nil {
+		return catalogUnavailable()
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.initialize()
+	if _, intrinsic := s.intrinsicEdges[normalized.Edge.ID]; intrinsic {
+		return catalogConflict()
+	}
+	if existing, ok := s.edges[normalized.Edge.ID]; ok &&
+		!edgeRegistrationsEqual(existing, normalized) {
+		return catalogConflict()
+	}
+	if existing, ok := s.edgeClaims[normalized.Edge.ID]; ok {
+		if edgeRegistrationsEqual(existing, normalized) {
+			return nil
+		}
+		return catalogConflict()
+	}
+	s.edgeClaims[normalized.Edge.ID] = cloneEdgeRegistration(normalized)
+	return nil
+}
+
+// RollbackEdgeReservation removes an uncommitted matching reservation after a
+// definite base failure. Reservations survive ambiguous or catalog failures.
+func (s *MemoryPolicyStore) RollbackEdgeReservation(
+	ctx context.Context,
+	registration EdgeRegistration,
+) error {
+	if err := contextFailure(ctx); err != nil {
+		return err
+	}
+	normalized, err := normalizeApplicationEdgeRegistration(registration)
+	if err != nil {
+		return err
+	}
+	if s == nil {
+		return catalogUnavailable()
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.initialize()
+	if _, committed := s.edges[normalized.Edge.ID]; committed {
+		return nil
+	}
+	existing, ok := s.edgeClaims[normalized.Edge.ID]
+	if !ok {
+		return nil
+	}
+	if !edgeRegistrationsEqual(existing, normalized) {
+		return catalogConflict()
+	}
+	delete(s.edgeClaims, normalized.Edge.ID)
+	return nil
+}
+
 // PutEdge atomically registers an application edge and its edge-local rule.
 // Identical content and canonical rule are idempotent; identity or policy
 // reuse conflicts.
@@ -641,6 +753,10 @@ func (s *MemoryPolicyStore) PutEdge(
 	defer s.mu.Unlock()
 	s.initialize()
 	if _, intrinsic := s.intrinsicEdges[normalized.Edge.ID]; intrinsic {
+		return catalogConflict()
+	}
+	if claim, ok := s.edgeClaims[normalized.Edge.ID]; ok &&
+		!edgeRegistrationsEqual(claim, normalized) {
 		return catalogConflict()
 	}
 	if existing, ok := s.edges[normalized.Edge.ID]; ok {
@@ -701,6 +817,9 @@ func (s *MemoryPolicyStore) initialize() {
 	}
 	if s.intrinsicEdges == nil {
 		s.intrinsicEdges = make(map[shoal.ID]EdgeRegistration)
+	}
+	if s.edgeClaims == nil {
+		s.edgeClaims = make(map[shoal.ID]EdgeRegistration)
 	}
 	if s.edges == nil {
 		s.edges = make(map[shoal.ID]EdgeRegistration)

@@ -748,15 +748,23 @@ func TestConcurrentClientsShareSourceClaim(t *testing.T) {
 		firstErr <- err
 	}()
 	<-started
-	if _, err := f.clientB.Ingest(
-		f.bob(t), source,
-	); !shoal.IsErrorCode(err, shoal.ErrorNotFound) {
+	secondErr := make(chan error, 1)
+	go func() {
+		_, err := f.clientB.Ingest(f.bob(t), source)
+		secondErr <- err
+	}()
+	select {
+	case err := <-secondErr:
 		close(release)
-		t.Fatalf("concurrent different-policy ingest = %v", err)
+		t.Fatalf("concurrent ingest was not serialized: %v", err)
+	case <-time.After(20 * time.Millisecond):
 	}
 	close(release)
 	if err := <-firstErr; err != nil {
 		t.Fatal(err)
+	}
+	if err := <-secondErr; !shoal.IsErrorCode(err, shoal.ErrorNotFound) {
+		t.Fatalf("concurrent different-policy ingest = %v", err)
 	}
 }
 
@@ -1115,16 +1123,23 @@ func TestConcurrentPendingRecoveryIsSerialized(t *testing.T) {
 		firstErr <- err
 	}()
 	<-started
-	if _, err := f.clientB.Ingest(
-		f.admin(t), sourceB,
-	); err == nil || (!shoal.IsErrorCode(err, shoal.ErrorConflict) &&
-		!shoal.IsErrorCode(err, shoal.ErrorUnavailable)) {
+	secondErr := make(chan error, 1)
+	go func() {
+		_, err := f.clientB.Ingest(f.admin(t), sourceB)
+		secondErr <- err
+	}()
+	select {
+	case err := <-secondErr:
 		close(release)
-		t.Fatalf("concurrent authorized recovery = %v", err)
+		t.Fatalf("concurrent recovery was not serialized: %v", err)
+	case <-time.After(20 * time.Millisecond):
 	}
 	close(release)
 	if err := <-firstErr; err != nil {
 		t.Fatal(err)
+	}
+	if err := <-secondErr; err != nil {
+		t.Fatalf("serialized authorized recovery = %v", err)
 	}
 	summaries, err := f.base.Documents(context.Background())
 	if err != nil {
@@ -1980,11 +1995,19 @@ func (s *failStore) PutEdge(
 type hookClient struct {
 	explorer.Client
 	afterIngest func()
+	connect     func(context.Context, graph.Edge) error
 	retrieve    func(context.Context, retrieval.Request) (retrieval.Response, error)
 	documents   func(context.Context) ([]explorer.DocumentSummary, error)
 	document    func(
 		context.Context, shoal.ID, shoal.ID,
 	) (explorer.DocumentView, error)
+}
+
+func (c *hookClient) Connect(ctx context.Context, edge graph.Edge) error {
+	if c.connect != nil {
+		return c.connect(ctx, edge)
+	}
+	return c.Client.Connect(ctx, edge)
 }
 
 func (c *hookClient) Documents(
