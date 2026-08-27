@@ -729,17 +729,13 @@ func TestWireTimestampsAreCanonicalizedAndRequired(t *testing.T) {
 
 func newOntologyFixture(t *testing.T) ontologyFixture {
 	t.Helper()
-	required, err := ontology.NewFlagConstraint(ontology.ConstraintRequired)
-	if err != nil {
-		t.Fatal(err)
-	}
 	title := mustProperty(
 		t, "title", "Title", "Canonical display title",
 		ontology.ValueString, nil, shoal.Metadata{"searchable": "true"},
 	)
 	score := mustProperty(
 		t, "score", "Score", "Confidence score",
-		ontology.ValueNumber, []ontology.Constraint{required}, nil,
+		ontology.ValueNumber, nil, nil,
 	)
 	person, err := ontology.NewConceptDefinition(
 		"person", "Person", "A person", []shoal.ID{title.ID()}, nil,

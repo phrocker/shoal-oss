@@ -200,6 +200,16 @@ func (r ExtractionRequest) Validate() error {
 				uint64(len(path.Edges)) > uint64(r.limits.MaxPathEdges) {
 				return invalid("evidence graph path exceeds request limit")
 			}
+			for _, node := range path.Nodes {
+				if err := validateBoundedMetadata(node.Properties, r.limits); err != nil {
+					return err
+				}
+			}
+			for _, edge := range path.Edges {
+				if err := validateBoundedMetadata(edge.Properties, r.limits); err != nil {
+					return err
+				}
+			}
 		}
 		if err := validateBoundedMetadata(evidence.Metadata(), r.limits); err != nil {
 			return err
@@ -413,6 +423,11 @@ func (r ExtractionResult) Validate() error {
 		if uint64(len(assertion.Evidence())) > uint64(r.limits.MaxEvidence) {
 			return invalid("assertion evidence exceeds result limit")
 		}
+		for _, evidence := range assertion.Evidence() {
+			if err := validateBoundedEvidenceMetadata(evidence, r.limits); err != nil {
+				return err
+			}
+		}
 		if err := validateBoundedMetadata(assertion.Metadata(), r.limits); err != nil {
 			return err
 		}
@@ -486,9 +501,10 @@ func (r ExtractionResult) ValidateFor(request ExtractionRequest) error {
 		predicate shoal.ID
 	}
 	counts := make(map[assertionGroup]uint32)
-	predicateCounts := make(map[shoal.ID]uint32)
+	subjects := make(map[shoal.ID]struct{})
 	uniqueValues := make(map[string]struct{})
 	for _, assertion := range r.assertions {
+		subjects[assertion.Subject()] = struct{}{}
 		for _, evidence := range assertion.Evidence() {
 			metadata, exists := requestEvidence[evidence.ID()]
 			if !exists || metadata != canonicalMetadata(evidence.metadata) {
@@ -507,7 +523,6 @@ func (r ExtractionResult) ValidateFor(request ExtractionRequest) error {
 			counts[assertionGroup{
 				subject: assertion.Subject(), predicate: assertion.Predicate(),
 			}]++
-			predicateCounts[assertion.Predicate()]++
 			for _, constraint := range property.constraints {
 				if constraint.Kind() != ConstraintUnique {
 					continue
@@ -542,14 +557,21 @@ func (r ExtractionResult) ValidateFor(request ExtractionRequest) error {
 			}
 		}
 	}
-	for predicate, property := range properties {
-		for _, constraint := range property.constraints {
-			if constraint.Kind() != ConstraintMinimumCount {
-				continue
-			}
-			minimum, _ := constraint.Count()
-			if predicateCounts[predicate] < minimum {
-				return invalid("assertion count is below property minimum")
+	for subject := range subjects {
+		for predicate, property := range properties {
+			count := counts[assertionGroup{subject: subject, predicate: predicate}]
+			for _, constraint := range property.constraints {
+				switch constraint.Kind() {
+				case ConstraintRequired:
+					if count == 0 {
+						return invalid("required property assertion is missing")
+					}
+				case ConstraintMinimumCount:
+					minimum, _ := constraint.Count()
+					if count < minimum {
+						return invalid("assertion count is below property minimum")
+					}
+				}
 			}
 		}
 	}
@@ -772,6 +794,28 @@ func validateBoundedMetadata(metadata shoal.Metadata, limits ExtractionLimits) e
 		size += uint64(len(key)) + uint64(len(value))
 		if size > uint64(limits.MaxMetadataBytes) {
 			return invalid("metadata bytes exceed extraction limit")
+		}
+	}
+	return nil
+}
+
+func validateBoundedEvidenceMetadata(
+	evidence EvidenceRef, limits ExtractionLimits,
+) error {
+	if err := validateBoundedMetadata(evidence.metadata, limits); err != nil {
+		return err
+	}
+	if !evidence.hasPath {
+		return nil
+	}
+	for _, node := range evidence.path.Nodes {
+		if err := validateBoundedMetadata(node.Properties, limits); err != nil {
+			return err
+		}
+	}
+	for _, edge := range evidence.path.Edges {
+		if err := validateBoundedMetadata(edge.Properties, limits); err != nil {
+			return err
 		}
 	}
 	return nil

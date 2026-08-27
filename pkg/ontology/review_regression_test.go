@@ -24,6 +24,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/phrocker/shoal-oss/pkg/graph"
 	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
@@ -38,6 +39,28 @@ func TestExtractionRejectsEvidenceWithDifferentMetadata(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
+	t.Run("nested path metadata", func(t *testing.T) {
+		fixture := newOntologyFixture(t)
+		evidence, err := ontology.NewEvidenceRef(
+			fixture.evidence.Citation(), fixture.evidence.Quote(), nil,
+			ontology.WithEvidencePath(graph.Path{Nodes: []graph.Node{{
+				ID: "node", Kind: "entity",
+				Properties: shoal.Metadata{"first": "1", "second": "2"},
+			}}}),
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		limits := ontology.DefaultExtractionLimits()
+		limits.MaxMetadataEntries = 1
+		if _, err := ontology.NewExtractionRequest(
+			fixture.version, []ontology.EvidenceRef{evidence},
+			"Extract cited facts.", fixture.provenance, limits, nil,
+		); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
+			t.Fatalf("nested path metadata bound error = %v", err)
+		}
+	})
 	altered, err := ontology.NewEvidenceRef(
 		fixture.evidence.Citation(), fixture.evidence.Quote(),
 		shoal.Metadata{"source": "altered"},
@@ -77,7 +100,7 @@ func TestExtractionAppliesPropertyValueAndCardinalityConstraints(t *testing.T) {
 
 	t.Run("minimum count and unique values", func(t *testing.T) {
 		fixture := newOntologyFixture(t)
-		minimum, err := ontology.NewCountConstraint(ontology.ConstraintMinimumCount, 1)
+		minimum, err := ontology.NewCountConstraint(ontology.ConstraintMinimumCount, 2)
 		if err != nil {
 			t.Fatal(err)
 		}
