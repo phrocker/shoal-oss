@@ -9,8 +9,13 @@ Shoal document, graph, retrieval, error, and code-ingestion values. The terms
 `pkg/explorer.Client` currently exposes `Ingest`, `Documents`, `Document`,
 `Connect`, `Neighborhood`, and `Retrieve`. Those operations form a useful
 embedded/product facade, but they are not yet a general document/graph storage
-repository contract. Storage publication, history, deletion, authorization,
-migration, and mutation APIs remain additive work.
+repository contract. Storage publication, history, deletion, durable policy
+persistence, migration, and mutation APIs remain additive work.
+
+`pkg/explorer/authorized.Client` is the M2 authorization-enforcing wrapper for
+that facade. Deployments must use it with a trusted `pkg/explorer/auth`
+resolver, policy selector, policy catalog, and generation reader; constructing
+or retaining an unwrapped client remains an explicitly unauthenticated path.
 
 ## Identity, bytes, and bounds
 
@@ -199,6 +204,46 @@ and relationship IDs byte-for-byte, and returns document then graph artifact
 references in stable order. Its additive association values describe the
 document/graph relationships that a later storage adapter must persist.
 
+## Authorization and non-disclosure
+
+- `pkg/explorer/auth.Decision` is immutable trusted input. It binds subject,
+  actor/client, authorization domain, allowed operations, source/policy
+  grants, policy generation, expiry, request identity, and an optional
+  least-privilege service role. Metadata, retrieval scope, graph labels, URI
+  text, and claimed object ownership never add grants.
+- Trusted context binding is capability-scoped: a binder from one
+  `auth.Authority` cannot forge values accepted by another authority's
+  resolver. Missing, expired, wrong-domain, or wrong-operation whole-request
+  authority returns `unauthorized`; cancellation and deadlines retain their
+  stable categories.
+- Direct hidden objects return the same `not_found` shape as absent objects.
+  Collections omit hidden values. Retrieval intersects scope with the
+  authorized current-document/node projection before ranking, so hidden
+  candidates cannot displace results or influence scores, explanations, or
+  limits.
+- Structured policy labels are canonical lowercase no-padding base32 terms
+  for domain, source, policy/epoch, and trusted service role. Callers cannot
+  submit visibility expressions. Service-account ceilings intersect required
+  labels and service roles cap allowed operations.
+- Policy generation is rechecked before mutations and before response
+  serialization. A changed or unreadable generation returns `unavailable`;
+  old contexts cannot mutate. A newly issued decision may still authorize
+  immutable objects written under an earlier physical policy epoch.
+- Graph edges require their own policy plus the current policies of both
+  endpoints. Neighborhood reachability is recomputed after authorization so a
+  hidden intermediary cannot reveal or bridge visible nodes.
+- Backend retrieval values are not trusted merely because their IDs are
+  authorized. The wrapper verifies registered document digests, exact
+  citations/quotes/ranges, canonical path nodes/edges, and the shared
+  analyzer/scorer explanation before returning them.
+- Authorization fingerprints, cache keys, audit values, and public strings
+  contain digests/categories rather than raw queries, source text, quotes,
+  IDs, labels, credentials, physical coordinates, or serialized responses.
+- `authorized.MemoryPolicyStore` is an M2 reference catalog that can be reused
+  across an in-process embedded restart. It is not durable process recovery;
+  M3/M4 must atomically persist policy/publication state before production
+  adapters claim restart or failover safety.
+
 ## Stable public error categories
 
 Only the existing categories are used:
@@ -224,8 +269,9 @@ The contract above does not claim current implementation of:
 - a storage-neutral document/graph repository, generic mutation API, latest
   publication frontier, tombstone persistence, history retention, or
   citation hydration;
-- authorization, canonical association persistence, pagination, migration,
-  or distributed publication/conditional-write coordination;
+- durable authorization-policy persistence, canonical association
+  persistence, pagination, migration, or distributed
+  publication/conditional-write coordination;
 - an Accumulo schema or adapter;
 - vector indexing, alternative scorer implementations, or a new graph
   walk/path shape.
