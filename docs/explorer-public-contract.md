@@ -242,6 +242,11 @@ document/graph relationships that a later storage adapter must persist.
   desired rule. M3 supplies durable outcome reconciliation across processes.
   Only a returned current revision may finalize a claim transition; registering
   an unchanged historical revision restores the previous source-wide claim.
+  M2 claim finalization is local and atomic: commit, pend, and rollback of an
+  exact acquired token are infallible and idempotent for the same outcome.
+  Finalization errors therefore mean an invalid token or catalog invariant
+  violation and are never discarded. Fallible durable coordination and
+  recovery belong to M3.
 - Structured policy labels are canonical lowercase no-padding base32 terms
   for domain, source, policy/epoch, and trusted service role. Callers cannot
   submit visibility expressions. Service-account ceilings intersect required

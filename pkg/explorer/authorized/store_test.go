@@ -340,6 +340,14 @@ func TestMemoryPolicyStoreSourceClaimCAS(t *testing.T) {
 	if err := store.PendSourceClaim(ctx, first); err != nil {
 		t.Fatal(err)
 	}
+	if err := store.PendSourceClaim(ctx, first); err != nil {
+		t.Fatalf("repeated pend = %v", err)
+	}
+	if err := store.CommitSourceClaim(ctx, first); !shoal.IsErrorCode(
+		err, shoal.ErrorConflict,
+	) {
+		t.Fatalf("different finish after pend = %v", err)
+	}
 	pending, ok, err := store.SourceClaim(ctx, uri)
 	if err != nil || !ok || !pending.Pending ||
 		pending.PreviousRule != nil {
@@ -352,6 +360,19 @@ func TestMemoryPolicyStoreSourceClaimCAS(t *testing.T) {
 	}
 	if err := store.CommitSourceClaim(ctx, recovery); err != nil {
 		t.Fatal(err)
+	}
+	if err := store.CommitSourceClaim(ctx, recovery); err != nil {
+		t.Fatalf("repeated commit = %v", err)
+	}
+	if err := store.PendSourceClaim(ctx, recovery); !shoal.IsErrorCode(
+		err, shoal.ErrorConflict,
+	) {
+		t.Fatalf("different finish after commit = %v", err)
+	}
+	if err := store.RollbackSourceClaim(ctx, recovery); !shoal.IsErrorCode(
+		err, shoal.ErrorConflict,
+	) {
+		t.Fatalf("rollback after commit = %v", err)
 	}
 	stored, ok, err := store.SourceClaim(ctx, uri)
 	if err != nil || !ok || stored.Pending || stored.PreviousRule != nil {
@@ -369,11 +390,51 @@ func TestMemoryPolicyStoreSourceClaimCAS(t *testing.T) {
 	if err := store.RollbackSourceClaim(ctx, transitioned); err != nil {
 		t.Fatal(err)
 	}
+	if err := store.RollbackSourceClaim(ctx, transitioned); err != nil {
+		t.Fatalf("repeated rollback = %v", err)
+	}
+	if err := store.CommitSourceClaim(ctx, transitioned); !shoal.IsErrorCode(
+		err, shoal.ErrorConflict,
+	) {
+		t.Fatalf("commit after rollback = %v", err)
+	}
+	if err := store.PendSourceClaim(ctx, transitioned); !shoal.IsErrorCode(
+		err, shoal.ErrorConflict,
+	) {
+		t.Fatalf("pend after rollback = %v", err)
+	}
 	restored, ok, err := store.SourceClaim(ctx, uri)
 	if err != nil || !ok || restored.Version != stored.Version ||
 		restored.Pending || restored.PreviousRule != nil ||
 		restored.Rule.String() != ruleA.String() {
 		t.Fatalf("restored source claim = %#v ok=%v err=%v", restored, ok, err)
+	}
+	next, err := store.CompareAndSwapSourceClaim(ctx, uri, &restored, ruleB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RollbackSourceClaim(ctx, transitioned); !shoal.IsErrorCode(
+		err, shoal.ErrorConflict,
+	) {
+		t.Fatalf("stale rollback affected newer acquisition = %v", err)
+	}
+	if err := store.RollbackSourceClaim(ctx, next); err != nil {
+		t.Fatal(err)
+	}
+
+	const newURI = "file:///rollback-to-absent.txt"
+	created, err := store.CompareAndSwapSourceClaim(ctx, newURI, nil, ruleA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RollbackSourceClaim(ctx, created); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RollbackSourceClaim(ctx, created); err != nil {
+		t.Fatalf("repeated rollback to absence = %v", err)
+	}
+	if _, ok, err := store.SourceClaim(ctx, newURI); err != nil || ok {
+		t.Fatalf("rollback-to-absence state: ok=%v err=%v", ok, err)
 	}
 }
 

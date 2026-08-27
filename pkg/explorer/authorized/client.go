@@ -144,9 +144,15 @@ func (c *Client) Ingest(
 			cleanupErr = c.policyStore.RollbackSourceClaim(
 				cleanupContext, claim)
 		}
-		if cleanupErr != nil && returnedErr == nil {
+		if cleanupErr != nil {
+			catalogErr := policyCatalogWriteError(
+				cleanupContext, cleanupErr)
 			returned = explorer.IngestResult{}
-			returnedErr = policyCatalogWriteError(cleanupContext, cleanupErr)
+			if returnedErr == nil {
+				returnedErr = catalogErr
+			} else {
+				returnedErr = errors.Join(returnedErr, catalogErr)
+			}
 		}
 	}()
 	if err := guard.Check(ctx); err != nil {

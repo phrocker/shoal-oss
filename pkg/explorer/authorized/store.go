@@ -21,6 +21,7 @@ package authorized
 
 import (
 	"context"
+	"encoding/binary"
 	"sort"
 	"strings"
 	"sync"
@@ -67,17 +68,25 @@ type EdgeRegistration struct {
 // Rule and PreviousRule when the latter is present. Version is an opaque
 // compare-and-swap generation owned by the PolicyStore.
 type SourcePolicyClaim struct {
-	SourceURI    string
-	Rule         AccessRule
-	PreviousRule *AccessRule
-	Pending      bool
-	Version      uint64
+	SourceURI     string
+	Rule          AccessRule
+	PreviousRule  *AccessRule
+	Pending       bool
+	Version       uint64
+	hadPriorClaim bool
+	priorPending  bool
+	priorVersion  uint64
+	acquisitionID uint64
+	tokenSeal     auth.Digest
 }
 
 // PolicyStore is the non-durable M2 policy-catalog boundary. Implementations
 // must make each put and source-claim transition atomic and return independent
 // values from reads. A successful source-claim CAS exclusively owns that URI
-// until it is committed, pended, or rolled back.
+// until it is committed, pended, or rolled back. For the exact token returned
+// by a successful CAS, each finalizer must be local, atomic, idempotent for the
+// same outcome, and infallible; errors indicate invalid tokens or store
+// invariant violations. Fallible durable coordination belongs to M3.
 type PolicyStore interface {
 	SourceClaim(context.Context, string) (SourcePolicyClaim, bool, error)
 	CompareAndSwapSourceClaim(
@@ -100,9 +109,8 @@ type revisionKey struct {
 }
 
 type sourceClaimState struct {
-	claim    SourcePolicyClaim
-	held     bool
-	previous *SourcePolicyClaim
+	claim SourcePolicyClaim
+	held  bool
 }
 
 // MemoryPolicyStore is a concurrency-safe reference catalog. Reusing the same
@@ -220,18 +228,17 @@ func (s *MemoryPolicyStore) CompareAndSwapSourceClaim(
 	}
 	s.sourceVersion++
 	claim := SourcePolicyClaim{
-		SourceURI: sourceURI,
-		Rule:      rule,
-		Pending:   true,
-		Version:   s.sourceVersion,
+		SourceURI:     sourceURI,
+		Rule:          rule,
+		Pending:       true,
+		Version:       s.sourceVersion,
+		hadPriorClaim: exists,
+		acquisitionID: s.sourceVersion,
 	}
-	state := sourceClaimState{claim: claim, held: true}
+	state := sourceClaimState{held: true}
 	if exists {
-		previous, cloneErr := cloneSourcePolicyClaim(current.claim)
-		if cloneErr != nil {
-			return SourcePolicyClaim{}, catalogUnavailable()
-		}
-		state.previous = &previous
+		claim.priorPending = current.claim.Pending
+		claim.priorVersion = current.claim.Version
 		if current.claim.Pending {
 			if current.claim.PreviousRule != nil {
 				previousRule, ruleErr := current.claim.PreviousRule.clone()
@@ -247,8 +254,9 @@ func (s *MemoryPolicyStore) CompareAndSwapSourceClaim(
 			}
 			claim.PreviousRule = &previousRule
 		}
-		state.claim = claim
 	}
+	claim.tokenSeal = sourceClaimTokenSeal(claim)
+	state.claim = claim
 	s.sourceClaims[sourceURI] = state
 	return cloneSourcePolicyClaim(claim)
 }
@@ -307,6 +315,15 @@ func (s *MemoryPolicyStore) finishSourceClaim(
 		return shoal.NewError(
 			shoal.ErrorInvalidArgument, "source policy claim is invalid")
 	}
+	if normalized.acquisitionID == 0 {
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument, "source policy claim token is invalid")
+	}
+	if normalized.tokenSeal == (auth.Digest{}) ||
+		normalized.tokenSeal != sourceClaimTokenSeal(normalized) {
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument, "source policy claim token is invalid")
+	}
 	if s == nil {
 		return catalogUnavailable()
 	}
@@ -315,37 +332,126 @@ func (s *MemoryPolicyStore) finishSourceClaim(
 	state, ok := s.sourceClaims[normalized.SourceURI]
 	if !ok || !state.held ||
 		!sourcePolicyClaimsEqual(state.claim, normalized) {
+		completed, completionErr := sourceClaimCompletion(
+			normalized, finish)
+		if completionErr != nil {
+			return completionErr
+		}
+		if completed == nil {
+			if !ok {
+				return nil
+			}
+		} else if ok && !state.held &&
+			sourcePolicyClaimsEqual(state.claim, *completed) {
+			return nil
+		}
 		return catalogConflict()
 	}
 	switch finish {
 	case sourceClaimFinishRollback:
-		if state.previous == nil {
+		previous, previousErr := sourceClaimCompletion(
+			normalized, sourceClaimFinishRollback)
+		if previousErr != nil {
+			return previousErr
+		}
+		if previous == nil {
 			delete(s.sourceClaims, normalized.SourceURI)
 			return nil
 		}
-		previous, cloneErr := cloneSourcePolicyClaim(*state.previous)
-		if cloneErr != nil {
-			return catalogUnavailable()
-		}
 		s.sourceClaims[normalized.SourceURI] = sourceClaimState{
-			claim: previous,
+			claim: *previous,
 		}
 		return nil
 	case sourceClaimFinishPending:
 		state.held = false
-		state.previous = nil
-		state.claim.Pending = true
+		completed, completionErr := sourceClaimCompletion(
+			normalized, sourceClaimFinishPending)
+		if completionErr != nil || completed == nil {
+			return catalogUnavailable()
+		}
+		state.claim = *completed
 		s.sourceClaims[normalized.SourceURI] = state
 		return nil
 	case sourceClaimFinishCommit:
 		state.held = false
-		state.previous = nil
-		state.claim.Pending = false
-		state.claim.PreviousRule = nil
+		completed, completionErr := sourceClaimCompletion(
+			normalized, sourceClaimFinishCommit)
+		if completionErr != nil || completed == nil {
+			return catalogUnavailable()
+		}
+		state.claim = *completed
 		s.sourceClaims[normalized.SourceURI] = state
 		return nil
 	default:
 		return shoal.NewError(
+			shoal.ErrorInvalidArgument, "source claim finish is invalid")
+	}
+}
+
+func sourceClaimCompletion(
+	token SourcePolicyClaim,
+	finish sourceClaimFinish,
+) (*SourcePolicyClaim, error) {
+	stable := SourcePolicyClaim{
+		SourceURI: token.SourceURI,
+		Version:   token.Version,
+	}
+	switch finish {
+	case sourceClaimFinishCommit:
+		rule, err := token.Rule.clone()
+		if err != nil {
+			return nil, err
+		}
+		stable.Rule = rule
+		return &stable, nil
+	case sourceClaimFinishPending:
+		rule, err := token.Rule.clone()
+		if err != nil {
+			return nil, err
+		}
+		stable.Rule = rule
+		stable.Pending = true
+		if token.PreviousRule != nil {
+			previous, previousErr := token.PreviousRule.clone()
+			if previousErr != nil {
+				return nil, previousErr
+			}
+			stable.PreviousRule = &previous
+		}
+		return &stable, nil
+	case sourceClaimFinishRollback:
+		if !token.hadPriorClaim {
+			return nil, nil
+		}
+		stable.Version = token.priorVersion
+		stable.Pending = token.priorPending
+		if token.priorPending {
+			rule, err := token.Rule.clone()
+			if err != nil {
+				return nil, err
+			}
+			stable.Rule = rule
+			if token.PreviousRule != nil {
+				previous, previousErr := token.PreviousRule.clone()
+				if previousErr != nil {
+					return nil, previousErr
+				}
+				stable.PreviousRule = &previous
+			}
+			return &stable, nil
+		}
+		if token.PreviousRule == nil {
+			return nil, shoal.NewError(
+				shoal.ErrorInvalidArgument, "source policy claim is invalid")
+		}
+		rule, err := token.PreviousRule.clone()
+		if err != nil {
+			return nil, err
+		}
+		stable.Rule = rule
+		return &stable, nil
+	default:
+		return nil, shoal.NewError(
 			shoal.ErrorInvalidArgument, "source claim finish is invalid")
 	}
 }
@@ -617,6 +723,22 @@ func cloneSourcePolicyClaim(
 		return SourcePolicyClaim{}, shoal.NewError(
 			shoal.ErrorInvalidArgument, "source policy claim is invalid")
 	}
+	if !claim.Pending || claim.Version == 0 {
+		if claim.hadPriorClaim || claim.priorPending ||
+			claim.priorVersion != 0 {
+			return SourcePolicyClaim{}, shoal.NewError(
+				shoal.ErrorInvalidArgument, "source policy claim is invalid")
+		}
+	} else if claim.hadPriorClaim {
+		if claim.priorVersion == 0 ||
+			(!claim.priorPending && claim.PreviousRule == nil) {
+			return SourcePolicyClaim{}, shoal.NewError(
+				shoal.ErrorInvalidArgument, "source policy claim is invalid")
+		}
+	} else if claim.priorPending || claim.priorVersion != 0 {
+		return SourcePolicyClaim{}, shoal.NewError(
+			shoal.ErrorInvalidArgument, "source policy claim is invalid")
+	}
 	return claim, nil
 }
 
@@ -624,8 +746,53 @@ func sourcePolicyClaimsEqual(left, right SourcePolicyClaim) bool {
 	return left.SourceURI == right.SourceURI &&
 		left.Version == right.Version &&
 		left.Pending == right.Pending &&
+		left.hadPriorClaim == right.hadPriorClaim &&
+		left.priorPending == right.priorPending &&
+		left.priorVersion == right.priorVersion &&
+		left.acquisitionID == right.acquisitionID &&
+		left.tokenSeal == right.tokenSeal &&
 		left.Rule.equal(right.Rule) &&
 		optionalRulesEqual(left.PreviousRule, right.PreviousRule)
+}
+
+func sourceClaimTokenSeal(claim SourcePolicyClaim) auth.Digest {
+	encoded := make([]byte, 0, len(claim.SourceURI)+128)
+	appendUint64 := func(value uint64) {
+		var buffer [8]byte
+		binary.BigEndian.PutUint64(buffer[:], value)
+		encoded = append(encoded, buffer[:]...)
+	}
+	appendText := func(value string) {
+		appendUint64(uint64(len(value)))
+		encoded = append(encoded, value...)
+	}
+	appendText(claim.SourceURI)
+	appendText(claim.Rule.String())
+	if claim.PreviousRule == nil {
+		encoded = append(encoded, 0)
+	} else {
+		encoded = append(encoded, 1)
+		appendText(claim.PreviousRule.String())
+	}
+	if claim.Pending {
+		encoded = append(encoded, 1)
+	} else {
+		encoded = append(encoded, 0)
+	}
+	appendUint64(claim.Version)
+	if claim.hadPriorClaim {
+		encoded = append(encoded, 1)
+	} else {
+		encoded = append(encoded, 0)
+	}
+	if claim.priorPending {
+		encoded = append(encoded, 1)
+	} else {
+		encoded = append(encoded, 0)
+	}
+	appendUint64(claim.priorVersion)
+	appendUint64(claim.acquisitionID)
+	return auth.DigestBytes("explorer-source-claim-token-v1", encoded)
 }
 
 func optionalRulesEqual(left, right *AccessRule) bool {

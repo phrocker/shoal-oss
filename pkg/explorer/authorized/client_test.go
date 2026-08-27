@@ -1153,6 +1153,63 @@ func TestDefiniteBaseFailureRollsBackNewClaim(t *testing.T) {
 	}
 }
 
+func TestIngestSurfacesOriginalAndCleanupFailures(t *testing.T) {
+	t.Run("indeterminate and pend", func(t *testing.T) {
+		f := newFixture(t)
+		store := &failFinalizeStore{
+			PolicyStore: f.store,
+			pendErr: shoal.NewError(
+				shoal.ErrorConflict, "injected pend failure"),
+		}
+		base := &ingestOverrideClient{
+			Client: f.base,
+			ingest: func(
+				context.Context,
+				explorer.Source,
+			) (explorer.IngestResult, error) {
+				return explorer.IngestResult{},
+					explorer.MarkIndeterminateCommit(shoal.NewError(
+						shoal.ErrorUnavailable,
+						"injected indeterminate failure",
+					))
+			},
+		}
+		client := f.newClient(
+			t, base, store, f.sourceA, f.policyA, nil)
+		if _, err := client.Ingest(f.alice(t), explorer.Source{
+			URI:       "file:///cleanup-pend.txt",
+			MediaType: explorer.MediaTypeText,
+			Content:   "cleanup pend content",
+		}); err == nil ||
+			!explorer.IsIndeterminateCommit(err) ||
+			!shoal.IsErrorCode(err, shoal.ErrorUnavailable) ||
+			!shoal.IsErrorCode(err, shoal.ErrorConflict) {
+			t.Fatalf("joined indeterminate cleanup error = %v", err)
+		}
+	})
+
+	t.Run("definite and rollback", func(t *testing.T) {
+		f := newFixture(t)
+		store := &failFinalizeStore{
+			PolicyStore: f.store,
+			rollbackErr: shoal.NewError(
+				shoal.ErrorConflict, "injected rollback failure"),
+		}
+		client := f.newClient(
+			t, f.base, store, f.sourceA, f.policyA, nil)
+		if _, err := client.Ingest(f.alice(t), explorer.Source{
+			URI:       "file:///cleanup-rollback.txt",
+			MediaType: "application/json",
+			Content:   "{}",
+		}); err == nil ||
+			!shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) ||
+			!shoal.IsErrorCode(err, shoal.ErrorConflict) ||
+			explorer.IsIndeterminateCommit(err) {
+			t.Fatalf("joined definite cleanup error = %v", err)
+		}
+	})
+}
+
 func TestHistoricalRevisionRetryIsIdempotent(t *testing.T) {
 	f := newFixture(t)
 	admin := f.admin(t)
@@ -1777,6 +1834,43 @@ type failStore struct {
 	mu               sync.Mutex
 	revisionFailures int
 	edgeFailures     int
+}
+
+type failFinalizeStore struct {
+	authorized.PolicyStore
+	commitErr   error
+	pendErr     error
+	rollbackErr error
+}
+
+func (s *failFinalizeStore) CommitSourceClaim(
+	ctx context.Context,
+	claim authorized.SourcePolicyClaim,
+) error {
+	if s.commitErr != nil {
+		return s.commitErr
+	}
+	return s.PolicyStore.CommitSourceClaim(ctx, claim)
+}
+
+func (s *failFinalizeStore) PendSourceClaim(
+	ctx context.Context,
+	claim authorized.SourcePolicyClaim,
+) error {
+	if s.pendErr != nil {
+		return s.pendErr
+	}
+	return s.PolicyStore.PendSourceClaim(ctx, claim)
+}
+
+func (s *failFinalizeStore) RollbackSourceClaim(
+	ctx context.Context,
+	claim authorized.SourcePolicyClaim,
+) error {
+	if s.rollbackErr != nil {
+		return s.rollbackErr
+	}
+	return s.PolicyStore.RollbackSourceClaim(ctx, claim)
 }
 
 func (s *failStore) PutRevision(
