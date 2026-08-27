@@ -291,6 +291,30 @@ func ValidateReservationSuccessor(previous, next ReservationV1) error {
 	return nil
 }
 
+func ValidateReservationTakeover(previous, next ReservationV1) error {
+	if err := previous.Validate(); err != nil {
+		return err
+	}
+	if err := next.Validate(); err != nil {
+		return err
+	}
+	if previous.State.Terminal() {
+		return invalid("terminal reservation cannot be taken over")
+	}
+	if previous.ReservationGeneration == Generation(math.MaxInt64) ||
+		next.ReservationGeneration != previous.ReservationGeneration+1 {
+		return invalid("reservation generation must increase exactly once")
+	}
+	if previous.Epoch != next.Epoch || !bytes.Equal(previous.TXN, next.TXN) ||
+		previous.AuthorityGeneration != next.AuthorityGeneration || previous.State != next.State {
+		return invalid("reservation takeover changed immutable identity")
+	}
+	if next.Fence <= previous.Fence || !next.LeaseUntil.After(previous.LeaseUntil) {
+		return invalid("reservation takeover must advance fence and lease")
+	}
+	return nil
+}
+
 func encodeReservation(e *encoder, r ReservationV1) {
 	e.u64(uint64(r.ReservationGeneration))
 	e.u64(uint64(r.Epoch))

@@ -143,6 +143,7 @@ type ReserveRequest struct {
 	Owner               coordination.OwnerID
 	LeaseUntil          time.Time
 	Authority           Authority
+	OwnerFence          coordination.Fence
 	RetentionGeneration coordination.Generation
 }
 
@@ -266,6 +267,12 @@ func (c *Client) Reserve(ctx context.Context, request ReserveRequest) (coordinat
 	if err := validateAuthority(predecessor, request.Authority, request.RetentionGeneration); err != nil {
 		return coordination.ReservationV1{}, err
 	}
+	if request.OwnerFence == 0 {
+		request.OwnerFence = request.Authority.Fence
+	}
+	if err := request.OwnerFence.Validate(); err != nil {
+		return coordination.ReservationV1{}, err
+	}
 	if predecessor.NextEpoch == coordination.Epoch(math.MaxInt64) {
 		return coordination.ReservationV1{}, errors.Join(ErrExhausted, ErrOverflow)
 	}
@@ -276,7 +283,7 @@ func (c *Client) Reserve(ctx context.Context, request ReserveRequest) (coordinat
 	reservation := coordination.ReservationV1{
 		ReservationGeneration: 1, Epoch: epoch, TXN: append(coordination.TXN(nil), request.TXN...),
 		Owner: append(coordination.OwnerID(nil), request.Owner...), LeaseUntil: request.LeaseUntil,
-		Fence: request.Authority.Fence, AuthorityGeneration: request.Authority.Generation,
+		Fence: request.OwnerFence, AuthorityGeneration: request.Authority.Generation,
 		State: coordination.StateEpochReserved,
 	}
 	reservationBytes, err := coordination.MarshalReservationV1(reservation)
@@ -404,6 +411,59 @@ func (c *Client) Terminalize(
 		return CompletionReservationDurableOutcomePending, outcome, err
 	}
 	return CompletionOutcomeDurable, outcome, nil
+}
+
+// TakeoverReservation replaces an expired nonterminal owner under a strictly
+// newer transaction fence. It does not allocate a new epoch.
+func (c *Client) TakeoverReservation(
+	ctx context.Context,
+	predecessor coordination.ReservationV1,
+	owner coordination.OwnerID,
+	leaseUntil time.Time,
+	fence coordination.Fence,
+	now time.Time,
+) (coordination.ReservationV1, error) {
+	if err := predecessor.Validate(); err != nil {
+		return coordination.ReservationV1{}, err
+	}
+	if predecessor.State.Terminal() {
+		return coordination.ReservationV1{}, ErrConflict
+	}
+	if now.IsZero() || now.Location() != time.UTC || leaseUntil.IsZero() || leaseUntil.Location() != time.UTC {
+		return coordination.ReservationV1{}, errors.New("allocator: takeover times must be UTC")
+	}
+	if predecessor.LeaseUntil.After(now) || !leaseUntil.After(now) ||
+		fence <= predecessor.Fence {
+		return coordination.ReservationV1{}, ErrConflict
+	}
+	if err := owner.Validate(); err != nil {
+		return coordination.ReservationV1{}, err
+	}
+	next := predecessor
+	next.ReservationGeneration++
+	next.Owner = append(coordination.OwnerID(nil), owner...)
+	next.LeaseUntil = leaseUntil
+	next.Fence = fence
+	if err := coordination.ValidateReservationTakeover(predecessor, next); err != nil {
+		return coordination.ReservationV1{}, fmt.Errorf("%w: invalid reservation takeover", ErrCorruption)
+	}
+	beforeBytes, _ := coordination.MarshalReservationV1(predecessor)
+	nextBytes, _ := coordination.MarshalReservationV1(next)
+	mutation := Mutation{
+		Row: c.allocatorRow(),
+		Conditions: []Condition{{
+			Coordinate: c.reservationCoordinate(predecessor.Epoch), Value: beforeBytes,
+			Timestamp: int64(predecessor.ReservationGeneration), TimestampSet: true,
+		}},
+		Updates: []Update{{
+			Coordinate: c.reservationCoordinate(next.Epoch), Value: nextBytes,
+			Timestamp: int64(next.ReservationGeneration),
+		}},
+	}
+	if err := c.applyReservationTransition(ctx, mutation, next); err != nil {
+		return coordination.ReservationV1{}, err
+	}
+	return next, nil
 }
 
 func (c *Client) applyReservationTransition(ctx context.Context, mutation Mutation, terminal coordination.ReservationV1) error {

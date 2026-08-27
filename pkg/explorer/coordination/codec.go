@@ -51,28 +51,32 @@ const (
 	KindWriterAuthority
 	KindBackendObservation
 	KindAllocatorHead
+	KindPartitionCommitCopy
+	KindTxnLease
 )
 
 const (
-	VersionTxnRootV3            uint16 = 3
-	VersionManifestChunkV2      uint16 = 2
-	VersionReservationV1        uint16 = 1
-	VersionEpochOutcomeV1       uint16 = 1
-	VersionFrontierCheckpointV1 uint16 = 1
-	VersionEntityGuardV1        uint16 = 1
-	VersionPendingMutationV1    uint16 = 1
-	VersionPolicyCopyManifestV1 uint16 = 1
-	VersionPolicyCopyMapV3      uint16 = 3
-	VersionPolicyCopyFenceV1    uint16 = 1
-	VersionIndexGenerationV2    uint16 = 2
-	VersionIndexDeltaV1         uint16 = 1
-	VersionIndexActivationV2    uint16 = 2
-	VersionSnapshotLeaseV2      uint16 = 2
-	VersionRetirementDecisionV1 uint16 = 1
-	VersionHistoryFloorV1       uint16 = 1
-	VersionWriterAuthorityV1    uint16 = 1
-	VersionBackendObservationV1 uint16 = 1
-	VersionAllocatorHeadV1      uint16 = 1
+	VersionTxnRootV3             uint16 = 3
+	VersionManifestChunkV2       uint16 = 2
+	VersionReservationV1         uint16 = 1
+	VersionEpochOutcomeV1        uint16 = 1
+	VersionFrontierCheckpointV1  uint16 = 1
+	VersionEntityGuardV1         uint16 = 1
+	VersionPendingMutationV1     uint16 = 1
+	VersionPolicyCopyManifestV1  uint16 = 1
+	VersionPolicyCopyMapV3       uint16 = 3
+	VersionPolicyCopyFenceV1     uint16 = 1
+	VersionIndexGenerationV2     uint16 = 2
+	VersionIndexDeltaV1          uint16 = 1
+	VersionIndexActivationV2     uint16 = 2
+	VersionSnapshotLeaseV2       uint16 = 2
+	VersionRetirementDecisionV1  uint16 = 1
+	VersionHistoryFloorV1        uint16 = 1
+	VersionWriterAuthorityV1     uint16 = 1
+	VersionBackendObservationV1  uint16 = 1
+	VersionAllocatorHeadV1       uint16 = 1
+	VersionPartitionCommitCopyV1 uint16 = 1
+	VersionTxnLeaseV1            uint16 = 1
 
 	envelopeMagic      = "SHOALCO\x00"
 	envelopeHeaderSize = len(envelopeMagic) + 2 + 2 + 4

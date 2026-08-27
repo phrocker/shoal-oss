@@ -17,9 +17,11 @@ const (
 	defaultConditionalWriterRetryBackoff = 100 * time.Millisecond
 	maxConditionalWriterRetries          = 100
 	maxConditionalWriterRetryBackoff     = time.Minute
-	maxConditionalConditions             = 64
-	maxConditionalComponentBytes         = 1 << 20
-	maxConditionalMutationBytes          = 16 << 20
+	// One TXN-root predecessor plus absence checks for all 64 initial LPART
+	// commit copies must fit in one row-atomic publication mutation.
+	maxConditionalConditions     = 65
+	maxConditionalComponentBytes = 1 << 20
+	maxConditionalMutationBytes  = 16 << 20
 )
 
 var (

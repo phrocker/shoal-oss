@@ -111,7 +111,7 @@ without pretending that Accumulo offers cross-row transactions.
 | Authorization core | `pkg/explorer/auth` provides immutable decisions, capability-bound context resolution, canonical policy/visibility encoding, service-role ceilings, scanner-authorization derivation, generation guards, partitioned cache keys, and redacted audit values. | Durable authority/policy-copy catalogs, authenticated gRPC interceptor wiring, and Accumulo service-account deployment remain later work. |
 | Embedded storage | `proto/embed.proto:ConditionalWrite` defines row-local conditional mutation semantics; `ScanRequest.as_of` defines lower-level timestamp filtering. | These are storage primitives, not a public Explorer snapshot, document, graph, citation, or authorization contract. |
 | Accumulo reads | `accumulo/scanner.go` exposes scanner authorizations, columns, and iterator settings. `batch_scanner.go` documents input-range/tablet order unless multi-scan is used. `scan_stream.go` bounds memory to a scanner batch. | Accumulo scans are not a multi-row/multi-table snapshot. Batch and stream results may be accompanied by errors. |
-| Accumulo writes | `accumulo/mutation.go` provides one-row puts/deletes. `batch_writer.go` provides bounded buffering, durability, safe retries, and explicit ambiguous-partial-commit failure. `conditional_writer.go` exposes exact-row absence/value conditions, optional exact timestamps, and Accepted/Rejected/Unknown results over the native Accumulo conditional-update protocol. `pkg/explorer/coordination` provides bounded deterministic M3 record/key vocabulary, including allocator and catalog generation heads. `pkg/explorer/coordination/allocator` implements row-atomic reservation, ordered terminal outcome creation, contiguous frontier checkpoints, bounded reservation retirement, exact recovery reads, and a Connector/Scanner/ConditionalWriter-backed store. `pkg/explorer/coordination/guard` implements exact-row entity heads and pending intents, APPEND/ABSENT_OR_IDENTICAL/MUTATE/RETIRE acquisition, ordered multi-entity acquisition, lease renewal/takeover, publication-authority-gated prepare/finalize/release, retirement/floor fencing, ambiguous-result readback, and the trusted Accumulo adapter. `pkg/explorer/coordination/catalog` implements policy-copy fences, monotonic COPYGEN/IGEN reservation, bounded immutable copy manifests/maps/deltas/activations, verifier-gated seal/publish/retire transitions, snapshot lookup pins, ambiguous-result readback, and exact bounded Accumulo prefix/seek scans without live-cluster tests. | BatchWriter is not atomic across mutations. High-level TXN/revision claims, physical publication/materialization wiring, durable authority/lease implementations, backend routing, and recovery/reconciliation workers remain incomplete. Full M3 is not complete. |
+| Accumulo writes | `accumulo/mutation.go` provides one-row puts/deletes. `batch_writer.go` provides bounded buffering, durability, safe retries, and explicit ambiguous-partial-commit failure. `conditional_writer.go` exposes exact-row absence/value conditions, optional exact timestamps, and Accepted/Rejected/Unknown results over the native Accumulo conditional-update protocol. `pkg/explorer/coordination` provides bounded deterministic M3 record/key vocabulary, including transaction leases and physical `PartitionCommitCopyV1` fences. The allocator, guard, catalog, and control packages provide their documented row-CAS lifecycles. `pkg/explorer/coordination/transaction` adds absent-or-identical claims, immutable manifest chunks, sorted guard acquisition, owner-fenced allocation/takeover, injected physical write/verification, row-atomic root-plus-LPART publication, terminal outcome/checkpoint/finalization, deterministic stored results, corruption quarantine, an in-memory durable fault backend, and trusted Accumulo mutation mapping. `pkg/explorer/coordination/recovery` adds bounded band scanning, authoritative recheck, lease takeover, concurrency caps, cancellation, and bounded backoff. | BatchWriter is not atomic across mutations. The live Accumulo physical sink, concrete document/graph materializer binding, deployment schema/bootstrap, and live-cluster fault suite are deferred. Policy relabel and index-rebuild packages have independent recovery primitives; a single end-to-end live fault campaign spanning those operations is not yet present. |
 | Accumulo ordering/history | `accumulo/key.go:Key.Compare` defines row/CF/CQ/visibility ascending, timestamp descending, tombstone-first ordering. | Scanner order is not public Explorer order, and versioning/compaction can remove cell history. |
 | Accumulo security | `accumulo/authorizations.go`, `column_visibility.go`, `scanner.go`, and `security.go` expose byte-exact authorizations, boolean visibility expressions, per-scan authorizations, and user/table/namespace permissions. | They do not derive labels from a Shoal principal, prevent blank visibility, or define Explorer non-disclosure. |
 | Table administration | `accumulo/table_admin.go`, `table_properties.go`, `table_add_splits.go`, and `table_bulk_import.go` expose table creation, properties, binary splits, and manager-authoritative bulk import. | Explorer-specific locality groups, iterator stacks, split plans, retention, and compaction policy do not exist today. |
@@ -1707,6 +1707,18 @@ agreed durable state; allocator's Accumulo store provides matching bounded
 prefix/seek scans. Physical object deletion, background scheduling/status
 indexes, and live-cluster fault tests remain later integration work.
 
+The M3 transaction slice is implemented in
+`pkg/explorer/coordination/transaction` and
+`pkg/explorer/coordination/recovery`. Transaction roots and leases use exact
+row reads/CAS and monotonic generations; manifest rows are immutable; initial
+LPART commit copies and the committed root are one bounded row mutation.
+Recovery rechecks roots, manifests, guards, reservations, outcomes, and
+frontiers rather than trusting queue hints. The reusable
+`internal/explorerconformance` checks the durable in-memory fault model and
+trusted Accumulo physical-cell mapping. Live Accumulo integration, a concrete
+Explorer document/graph physical sink, and combined policy/index rebuild
+fault campaigns remain explicitly deferred.
+
 M1 now has concrete package surfaces in `pkg/explorer/canonical`,
 `pkg/explorer/codematerializer`, `pkg/retrieval/ranking.go`, and
 `internal/explorerconformance`. The embedded reference runs the harness with
@@ -1723,10 +1735,11 @@ and restart with a reused in-process policy catalog. M3/M4 must replace that
 catalog with atomic durable policy/publication state before cross-process or
 Accumulo restart guarantees are claimed.
 
-The dependency order is intentional. Recovery, retirement, frontier,
-manifest, and writer-authority machinery is complete in M3, before any
-document/graph milestone can claim restart or fault tolerance. Migration
-cannot begin before all serving semantics and recovery paths pass.
+The dependency order is intentional. M3 supplies the reusable transaction,
+recovery, retirement, frontier, manifest, and writer-authority machinery
+before a document/graph adapter may claim restart or fault tolerance.
+Migration cannot begin before the deferred concrete adapter and live
+integration paths pass.
 
 ## 13. Explicit non-goals
 

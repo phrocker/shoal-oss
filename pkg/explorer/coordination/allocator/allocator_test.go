@@ -310,6 +310,38 @@ func reserveRequest(head coordination.AllocatorHeadV1, txn string) ReserveReques
 	}
 }
 
+func TestReservationTakeoverAdvancesOwnerFenceAndGeneration(t *testing.T) {
+	store := newMemoryStore()
+	client := newTestClient(t, store, 4)
+	head, err := client.CurrentHead(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	reservation, err := client.Reserve(context.Background(), reserveRequest(head, "takeover"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := reservation.LeaseUntil.Add(time.Second)
+	next, err := client.TakeoverReservation(
+		context.Background(), reservation, coordination.OwnerID("recovery"),
+		now.Add(time.Minute), reservation.Fence+1, now,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next.ReservationGeneration != reservation.ReservationGeneration+1 ||
+		next.Fence != reservation.Fence+1 || string(next.Owner) != "recovery" {
+		t.Fatalf("takeover = %#v", next)
+	}
+	retry, err := client.TakeoverReservation(
+		context.Background(), reservation, coordination.OwnerID("recovery"),
+		now.Add(time.Minute), reservation.Fence+1, now,
+	)
+	if err != nil || !reservationEqual(retry, next) {
+		t.Fatalf("ambiguous-style takeover retry = %#v, %v", retry, err)
+	}
+}
+
 func TestReserveAcceptedUnknownAndIdempotentConflict(t *testing.T) {
 	for _, fault := range []faultMode{faultNone, faultUnknownBefore, faultUnknownAfter} {
 		t.Run(fmt.Sprint(fault), func(t *testing.T) {
