@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/phrocker/shoal-oss/internal/embedpb"
+	"github.com/phrocker/shoal-oss/pkg/extraction"
 	modelio "github.com/phrocker/shoal-oss/pkg/model"
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/proto"
@@ -56,6 +57,17 @@ type Config struct {
 	MaxDepth    int
 	TokenBudget int
 
+	// OntologyExtractor and OntologyRequestFactory enable structured,
+	// ontology-guided enrichment. They are opt-in and never fall back to the
+	// legacy LLM interface after a provider or validation failure.
+	OntologyExtractor      OntologyExtractor
+	OntologyRequestFactory OntologyRequestFactory
+
+	// ConsolidationPublisher receives validated proposed plans. Storage
+	// publication remains outside agentmem unless a caller supplies an atomic
+	// high-level publisher.
+	ConsolidationPublisher func(context.Context, extraction.PublicationPlan) error
+
 	// UseIVF, when true, sources the semantic anchor list from a trained
 	// IVF-PQ index (see cmd/shoal-ivf-train and IvfIndex) instead of the
 	// brute-force VectorSearch path. It degrades gracefully: if no index has
@@ -91,6 +103,9 @@ func New(cfg Config) (*Client, error) {
 	if cfg.Store == nil {
 		return nil, errors.New("agentmem: store is required")
 	}
+	if (cfg.OntologyExtractor == nil) != (cfg.OntologyRequestFactory == nil) {
+		return nil, errors.New("agentmem: ontology extractor and request factory must be configured together")
+	}
 	if cfg.Table == "" {
 		cfg.Table = DefaultTable
 	}
@@ -101,7 +116,13 @@ func New(cfg Config) (*Client, error) {
 		cfg.LLM = FakeLLM{}
 	}
 	if cfg.Enricher == nil {
-		cfg.Enricher = HeuristicEnricher{}
+		if cfg.OntologyExtractor != nil && cfg.OntologyRequestFactory != nil {
+			cfg.Enricher = StructuredEnricher{
+				Extractor: cfg.OntologyExtractor, RequestFactory: cfg.OntologyRequestFactory,
+			}
+		} else {
+			cfg.Enricher = HeuristicEnricher{}
+		}
 	}
 	if cfg.Classifier == nil {
 		cfg.Classifier = RuleClassifier{}

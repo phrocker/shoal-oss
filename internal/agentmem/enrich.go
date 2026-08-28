@@ -3,6 +3,8 @@ package agentmem
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"regexp"
 	"sort"
 	"strings"
@@ -22,6 +24,8 @@ type Enricher interface {
 
 type HeuristicEnricher struct{}
 
+// LLMEnricher is retained for compatibility with the legacy flat entity API.
+// Deprecated: use StructuredEnricher for ontology-guided extraction.
 type LLMEnricher struct {
 	LLM      LLM
 	Fallback Enricher
@@ -100,11 +104,11 @@ func (l LLMEnricher) Entities(ctx context.Context, text string) ([]Entity, error
 	}
 	resp, err := l.LLM.Infer(ctx, "Extract named entities from the text as a JSON array. Each object must have id, label, and type. Types must be PERSON, ORGANIZATION, LOCATION, or CONCEPT. Use canonical ids like person:john_doe. Return only JSON.\n\nText:\n"+text)
 	if err != nil {
-		return nil, nil
+		return nil, err
 	}
-	ents := parseLLMEntities(resp)
-	if ents == nil {
-		return nil, nil
+	ents, err := parseLLMEntities(resp)
+	if err != nil {
+		return nil, err
 	}
 	return ents, nil
 }
@@ -232,19 +236,23 @@ func fallbackEnricher(l LLMEnricher) Enricher {
 	return HeuristicEnricher{}
 }
 
-func parseLLMEntities(resp string) []Entity {
-	start := strings.Index(resp, "[")
-	end := strings.LastIndex(resp, "]")
-	if start < 0 || end < start {
-		return nil
+func parseLLMEntities(resp string) ([]Entity, error) {
+	if len(resp) > 1<<20 {
+		return nil, errors.New("agentmem: entity response exceeds byte limit")
 	}
 	var raw []struct {
 		ID    string `json:"id"`
 		Label string `json:"label"`
 		Type  string `json:"type"`
 	}
-	if err := json.Unmarshal([]byte(resp[start:end+1]), &raw); err != nil {
-		return nil
+	decoder := json.NewDecoder(strings.NewReader(resp))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&raw); err != nil {
+		return nil, err
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		return nil, errors.New("agentmem: entity response contains trailing JSON")
 	}
 	seen := map[string]Entity{}
 	for _, r := range raw {
@@ -264,7 +272,7 @@ func parseLLMEntities(resp string) []Entity {
 		out = append(out, ent)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
-	return out
+	return out, nil
 }
 
 func normalizeEntityType(typ string) string {
