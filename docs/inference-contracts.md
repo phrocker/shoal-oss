@@ -59,3 +59,33 @@ full in-memory transcript. Callers must not log that record; only the optional
 No Copilot, SDK-process, or other hosted execution backend is bundled yet. A
 future backend can implement `Runner` without changing inference contracts;
 the package deliberately includes no arbitrary subprocess runner.
+
+## Explorer context construction
+
+`pkg/contextpack` implements the deterministic construction layer between
+authorized Explorer retrieval and `inference.ContextPack`. Its builder:
+
+- validates and canonically orders retrieval results before preserving exact
+  citation/quote and graph-path evidence;
+- rehydrates and revalidates every available citation and path through the
+  public `Document` and `Neighborhood` interfaces;
+- binds the pack to caller-supplied snapshot, authorization, policy metadata,
+  and optional ontology identities without deriving access from UI filters;
+- records content-derived retrieval/result/explanation identity without
+  placing explanation prose in model context;
+- applies fail-closed result, evidence, document, section, span, hydration-byte,
+  graph, path, quote, metadata/provenance, total-context byte, and optional
+  caller-tokenizer limits; and
+- exposes explicit `OpenSection` and `ExpandNeighbors` operations that produce
+  a new immutable pack. Duplicate evidence is canonical-deduplicated only when
+  its immutable anchor identity and content are identical.
+
+Callers may supply already authorized public document views and neighborhoods,
+or let the builder hydrate missing values through `contextpack.Reader`.
+Callers that configure `MaxContextTokens` also supply a provider-neutral
+`TokenEstimator`; the builder invokes it only on the completed immutable pack
+and never contacts a model provider.
+Unauthorized and absent content therefore retain the reader's
+indistinguishable not-found behavior. The package contains no storage rows,
+Accumulo visibility expressions, credentials, raw grants, generated prose, or
+model/provider calls.

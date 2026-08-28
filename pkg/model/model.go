@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 )
 
 var (
@@ -15,6 +16,9 @@ var (
 	ErrCanceled          = fmt.Errorf("model: request canceled: %w", context.Canceled)
 	ErrMalformedResponse = errors.New("model: malformed response")
 	ErrOversizedResponse = errors.New("model: oversized response")
+	ErrCredential        = errors.New("model: credential unavailable")
+	ErrAuthentication    = errors.New("model: authentication failed")
+	ErrRateLimited       = errors.New("model: rate limited")
 )
 
 // TextGenerator generates text from a bounded provider-neutral request.
@@ -64,6 +68,8 @@ type Error struct {
 	Operation  string
 	StatusCode int
 	Detail     string
+	Retryable  bool
+	RetryAfter time.Duration
 }
 
 func (e *Error) Error() string {

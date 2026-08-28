@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 const (
@@ -213,7 +214,8 @@ func validateOllamaConfig(cfg OllamaConfig, path string) (OllamaConfig, string, 
 }
 
 func validateTextRequest(op, text string, maxOutputTokens int, maxTextBytes int64) error {
-	if int64(len(text)) > maxTextBytes || maxOutputTokens < 0 || maxOutputTokens > maxConfiguredOutputTokens {
+	if !utf8.ValidString(text) || int64(len(text)) > maxTextBytes ||
+		maxOutputTokens < 0 || maxOutputTokens > maxConfiguredOutputTokens {
 		return &Error{Kind: ErrInvalidRequest, Operation: op}
 	}
 	return nil
