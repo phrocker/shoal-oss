@@ -323,7 +323,11 @@ func TestOpaquePinAndRequestIDsRemainLosslessMetadata(t *testing.T) {
 func TestFollowUpCanonicalizesGraphLabels(t *testing.T) {
 	pins := testPins(t)
 	node := graph.Node{ID: "node", Labels: []string{"z", "a"}}
-	anchor, err := inference.NewGraphAnchor(graph.Path{Nodes: []graph.Node{node}})
+	second := graph.Node{ID: "second"}
+	edge := graph.Edge{ID: "edge", From: node.ID, To: second.ID, Type: "related"}
+	anchor, err := inference.NewGraphAnchor(graph.Path{
+		Nodes: []graph.Node{node, second}, Edges: []graph.Edge{edge},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -337,8 +341,12 @@ func TestFollowUpCanonicalizesGraphLabels(t *testing.T) {
 	}
 	hydrated := node
 	hydrated.Properties = shoal.Metadata{}
+	hydratedEdge := edge
+	hydratedEdge.Properties = shoal.Metadata{}
 	reader := &recordingReader{
-		neighborhood: explorer.Neighborhood{Nodes: []graph.Node{hydrated}},
+		neighborhood: explorer.Neighborhood{
+			Nodes: []graph.Node{hydrated, second}, Edges: []graph.Edge{hydratedEdge},
+		},
 	}
 	if _, err := (Builder{Reader: reader}).ExpandNeighbors(
 		context.Background(), pack, ExpandNeighborsRequest{NodeIDs: []shoal.ID{node.ID}},
@@ -396,6 +404,22 @@ func TestBoundsFailClosed(t *testing.T) {
 			Request: request, Response: response, Pins: pins,
 		})
 	assertCode(t, err, shoal.ErrorInvalidArgument)
+
+	oversized := cloneResponse(response)
+	oversized.Results = oversized.Results[:1]
+	evidence := oversized.Results[0].Evidence[0]
+	oversized.Results[0].Evidence = make([]retrieval.Evidence, DefaultMaxAnchors+1)
+	for index := range oversized.Results[0].Evidence {
+		oversized.Results[0].Evidence[index] = evidence
+	}
+	reader := &recordingReader{}
+	_, err = (Builder{Reader: reader}).Build(context.Background(), InitialRequest{
+		Request: request, Response: oversized, Pins: pins,
+	})
+	assertCode(t, err, shoal.ErrorInvalidArgument)
+	if reader.documentCalls != 0 || reader.neighborhoodCalls != 0 {
+		t.Fatal("oversized evidence reached the hydration seam")
+	}
 }
 
 func TestMutationIsolationAndNoUncitedExplanationText(t *testing.T) {
@@ -472,6 +496,18 @@ func TestHydratedDuplicatesRequireExactContentAndRequestedIdentity(t *testing.T)
 	})
 	assertCode(t, err, shoal.ErrorInvalidArgument)
 
+	nilMetadata := cloneView(view)
+	nilMetadata.Document.Metadata = nil
+	emptyMetadata := cloneView(view)
+	emptyMetadata.Document.Metadata = shoal.Metadata{}
+	limits := mustLimits(t, Limits{})
+	if _, err := newVerifier(
+		context.Background(), nil, limits,
+		[]explorer.DocumentView{nilMetadata, emptyMetadata}, nil,
+	); err != nil {
+		t.Fatalf("canonical empty metadata was treated as conflicting: %v", err)
+	}
+
 	opaqueLeft := cloneView(view)
 	opaqueLeft.Document.Metadata = shoal.Metadata{"opaque": "\xff"}
 	opaqueRight := cloneView(view)
@@ -490,6 +526,37 @@ func TestHydratedDuplicatesRequireExactContentAndRequestedIdentity(t *testing.T)
 		Selection: EvidenceSelection{Documents: true}, Pins: pins,
 	})
 	assertCode(t, err, shoal.ErrorInvalidArgument)
+}
+
+func TestOpenSectionSkipsValidEmptySpans(t *testing.T) {
+	client, request, response, pins := embeddedFixture(t)
+	response.Results = response.Results[:1]
+	initial, err := (Builder{Reader: client}).Build(context.Background(), InitialRequest{
+		Request: request, Response: response,
+		Selection: EvidenceSelection{Documents: true}, Pins: pins,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	citation := firstDocumentCitation(t, initial)
+	view, err := client.Document(context.Background(), citation.DocumentID, citation.RevisionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sectionID := firstSectionWithSpans(t, view.Root)
+	if !appendEmptySpan(&view.Root, sectionID) {
+		t.Fatal("section was not found")
+	}
+	reader := &recordingReader{documentView: view}
+	if _, err := (Builder{Reader: reader}).OpenSection(
+		context.Background(), initial, OpenSectionRequest{
+			DocumentID: citation.DocumentID,
+			RevisionID: citation.RevisionID,
+			SectionIDs: []shoal.ID{sectionID},
+		},
+	); err != nil {
+		t.Fatalf("valid empty span rejected section expansion: %v", err)
+	}
 }
 
 func TestTokenBudgetAppliesToInitialAndFollowUpPacks(t *testing.T) {
@@ -651,6 +718,28 @@ func firstSectionWithSpans(t *testing.T, root explorer.SectionView) shoal.ID {
 	}
 	t.Fatal("document has no section with spans")
 	return ""
+}
+
+func appendEmptySpan(view *explorer.SectionView, sectionID shoal.ID) bool {
+	if view.Section.ID == sectionID {
+		offset := view.Section.Range.Start.Offset
+		view.Spans = append(view.Spans, document.Span{
+			ID: "empty-span", DocumentID: view.Section.DocumentID,
+			RevisionID: view.Section.RevisionID, SectionID: sectionID,
+			Order: ^uint32(0),
+			Range: document.SourceRange{
+				Start: document.SourcePosition{Offset: offset},
+				End:   document.SourcePosition{Offset: offset},
+			},
+		})
+		return true
+	}
+	for index := range view.Children {
+		if appendEmptySpan(&view.Children[index], sectionID) {
+			return true
+		}
+	}
+	return false
 }
 
 func firstGraphPath(t *testing.T, pack inference.ContextPack) graph.Path {

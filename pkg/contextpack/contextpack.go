@@ -165,6 +165,14 @@ func (b Builder) Build(ctx context.Context, input InitialRequest) (inference.Con
 		return inference.ContextPack{}, invalid(
 			"retrieval as_of does not match the trusted snapshot pin")
 	}
+	selection := input.Selection
+	if !selection.Documents && !selection.Paths {
+		selection.Documents = true
+		selection.Paths = true
+	}
+	if err := preflightResponse(input.Response, selection, limits); err != nil {
+		return inference.ContextPack{}, err
+	}
 	response := cloneResponse(input.Response)
 	retrieval.SortResults(&response)
 	if err := response.ValidateFor(request); err != nil {
@@ -173,18 +181,10 @@ func (b Builder) Build(ctx context.Context, input InitialRequest) (inference.Con
 	if len(response.Results) == 0 {
 		return inference.ContextPack{}, invalid("context retrieval returned no evidence")
 	}
-	if len(response.Results) > limits.MaxResults {
-		return inference.ContextPack{}, invalid("context retrieval exceeds the result bound")
-	}
 
 	verifier, err := newVerifier(ctx, b.Reader, limits, input.Documents, input.Neighborhoods)
 	if err != nil {
 		return inference.ContextPack{}, err
-	}
-	selection := input.Selection
-	if !selection.Documents && !selection.Paths {
-		selection.Documents = true
-		selection.Paths = true
 	}
 	anchors := make([]inference.EvidenceAnchor, 0)
 	for _, result := range response.Results {
@@ -280,6 +280,9 @@ func (b Builder) OpenSection(
 	anchors := pack.Evidence()
 	for _, sectionID := range selected {
 		for _, span := range index.spansBySection[sectionID] {
+			if len(span.Text) == 0 {
+				continue
+			}
 			citation := document.Citation{
 				DocumentID: span.DocumentID,
 				RevisionID: span.RevisionID,
@@ -555,7 +558,7 @@ func (v *verifier) addDocument(view explorer.DocumentView) error {
 	}
 	key := documentKey{view.Document.ID, view.Revision.ID}
 	if existing := v.documents[key]; existing != nil {
-		if !canonicalEqual(existing.view, view) {
+		if !canonicalEqual(existing.view, index.view) {
 			return invalid("duplicate hydrated document has different content")
 		}
 		return nil
@@ -591,6 +594,7 @@ func (v *verifier) addNeighborhood(neighborhood explorer.Neighborhood) error {
 		if err := edge.Validate(); err != nil {
 			return err
 		}
+		edge = cloneEdge(edge)
 		if _, ok := localNodes[edge.From]; !ok {
 			return invalid("hydrated graph edge source is missing")
 		}
@@ -861,6 +865,69 @@ func provenanceMetadata(
 		return nil, err
 	}
 	return metadata, nil
+}
+
+func preflightResponse(
+	response retrieval.Response,
+	selection EvidenceSelection,
+	limits Limits,
+) error {
+	if len(response.Results) > limits.MaxResults {
+		return invalid("context retrieval exceeds the result bound")
+	}
+	evidenceItems := 0
+	selectedAnchors := 0
+	quoteBytes := 0
+	graphNodes := 0
+	graphEdges := 0
+	explanationBytes := 0
+	for _, result := range response.Results {
+		for _, evidence := range result.Evidence {
+			evidenceItems++
+			if evidenceItems > limits.MaxAnchors {
+				return invalid("retrieval evidence exceeds the hydration bound")
+			}
+			quoteBytes += len(evidence.Quote)
+			if quoteBytes > limits.MaxQuoteBytes {
+				return invalid("retrieval evidence exceeds the total quote byte bound")
+			}
+			if selection.Documents {
+				selectedAnchors++
+			}
+			if pathPresent(evidence.Path) {
+				if len(evidence.Path.Nodes) > limits.MaxPathNodes {
+					return invalid("retrieval graph path exceeds the path bound")
+				}
+				graphNodes += len(evidence.Path.Nodes)
+				graphEdges += len(evidence.Path.Edges)
+				if graphNodes > limits.MaxGraphNodes {
+					return invalid("retrieval evidence exceeds the graph node bound")
+				}
+				if graphEdges > limits.MaxGraphEdges {
+					return invalid("retrieval evidence exceeds the graph edge bound")
+				}
+				if selection.Paths {
+					selectedAnchors++
+				}
+			}
+			if selectedAnchors > limits.MaxAnchors {
+				return invalid("context evidence exceeds the anchor bound")
+			}
+		}
+		if result.Explanation != nil {
+			explanationBytes += len(result.Explanation.Summary)
+			for _, mode := range result.Explanation.Modes {
+				explanationBytes += len(mode)
+			}
+			for name := range result.Explanation.Scores {
+				explanationBytes += len(name) + 8
+			}
+			if explanationBytes > limits.MaxProvenanceBytes {
+				return invalid("retrieval explanation exceeds the provenance byte bound")
+			}
+		}
+	}
+	return nil
 }
 
 func retrievalIdentity(request retrieval.Request, response retrieval.Response) (string, error) {
