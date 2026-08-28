@@ -203,7 +203,7 @@ func (s *EmbeddedService) Neighborhood(
 		Snapshot: snapshot, Neighborhood: result.Neighborhood,
 		Truncated: result.Truncated,
 	}
-	if result.NextAfterEdgeID != "" {
+	if result.Continuation {
 		response.NextCursor = encodeGraphCursor(
 			snapshot.ID, normalizedRequest, result.NextAfterEdgeID)
 	}
@@ -403,7 +403,7 @@ func decodeGraphCursor(
 		return "", shoal.NewError(
 			shoal.ErrorInvalidArgument, "graph cursor does not match the request")
 	}
-	after, err := decodeID(payload.After)
+	after, err := decodeOptionalID(payload.After)
 	if err != nil {
 		return "", shoal.NewError(shoal.ErrorInvalidArgument, "invalid graph cursor")
 	}

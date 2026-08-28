@@ -309,12 +309,13 @@ function selectNode(id) {
     $("path-from").value = id;
   }
 
-  function updateContinueButton() {
-    $("continue-expansion").hidden =
-      !state.selected || !state.graphCursors.has(state.selected);
-  }
   renderGraphList();
   draw();
+}
+
+function updateContinueButton() {
+  $("continue-expansion").hidden =
+    !state.selected || !state.graphCursors.has(state.selected);
 }
 
 const canvas = $("canvas");

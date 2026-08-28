@@ -94,7 +94,7 @@ func TestEmbeddedServiceBoundsAndSnapshot(t *testing.T) {
 	firstPage, err := service.Neighborhood(ctx, webapi.NeighborhoodRequest{
 		Snapshot: documents.Snapshot,
 		NodeIDs:  []shoal.ID{first.Document.ID, first.Document.ID},
-		Depth:    1, Fanout: 1, MaxNodes: 10,
+		Depth:    1, Fanout: 10, MaxNodes: 2,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -105,7 +105,7 @@ func TestEmbeddedServiceBoundsAndSnapshot(t *testing.T) {
 	secondPage, err := service.Neighborhood(ctx, webapi.NeighborhoodRequest{
 		Snapshot: documents.Snapshot,
 		NodeIDs:  []shoal.ID{first.Document.ID, first.Document.ID},
-		Depth:    1, Fanout: 1, MaxNodes: 10, Cursor: firstPage.NextCursor,
+		Depth:    1, Fanout: 10, MaxNodes: 2, Cursor: firstPage.NextCursor,
 	})
 	if err != nil {
 		t.Fatal(err)

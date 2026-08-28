@@ -107,6 +107,10 @@ func (e *Explorer) BoundedNeighborhood(
 	}
 	edges := make(map[shoal.ID]graph.Edge)
 	truncated := false
+	cursorEligible := len(normalized.NodeIDs) == 1 && normalized.Depth == 1
+	nextAfter := request.AfterEdgeID
+	continuation := false
+	stopExpansion := false
 	for level := uint32(0); level < normalized.Depth && len(frontier) > 0; level++ {
 		next := make([]shoal.ID, 0)
 		for _, seed := range frontier {
@@ -118,11 +122,17 @@ func (e *Explorer) BoundedNeighborhood(
 				seed, request.Direction, request.Fanout, after)
 			if limited {
 				truncated = true
+				if cursorEligible {
+					continuation = true
+				}
 			}
 			for _, edgeID := range edgeIDs {
 				edge := e.graphEdges[edgeID]
 				if len(typeFilter) > 0 {
 					if _, ok := typeFilter[edge.Type]; !ok {
+						if cursorEligible {
+							nextAfter = edgeID
+						}
 						continue
 					}
 				}
@@ -133,14 +143,27 @@ func (e *Explorer) BoundedNeighborhood(
 				if _, exists := seen[other]; !exists {
 					if uint32(len(seen)) >= request.MaxNodes {
 						truncated = true
-						continue
+						if cursorEligible && nextAfter != request.AfterEdgeID {
+							continuation = true
+						}
+						stopExpansion = true
+						break
 					}
 					seen[other] = struct{}{}
 					nodes[other] = cloneNode(e.graphNodes[other])
 					next = append(next, other)
 				}
 				edges[edge.ID] = cloneEdge(edge)
+				if cursorEligible {
+					nextAfter = edgeID
+				}
 			}
+			if stopExpansion {
+				break
+			}
+		}
+		if stopExpansion {
+			break
 		}
 		frontier = next
 	}
@@ -160,16 +183,15 @@ func (e *Explorer) BoundedNeighborhood(
 	sort.Slice(result.Edges, func(i, j int) bool {
 		return shoal.CompareID(result.Edges[i].ID, result.Edges[j].ID) < 0
 	})
-	var next shoal.ID
-	if len(normalized.NodeIDs) == 1 && normalized.Depth == 1 && truncated {
-		edgeIDs, limited := e.boundedEdgeIDs(
-			normalized.NodeIDs[0], request.Direction, request.Fanout, request.AfterEdgeID)
-		if limited && len(edgeIDs) > 0 {
-			next = edgeIDs[len(edgeIDs)-1]
-		}
+	if cursorEligible && nextAfter == request.AfterEdgeID {
+		continuation = false
+	}
+	if !continuation {
+		nextAfter = ""
 	}
 	return BoundedNeighborhood{
-		Neighborhood: result, Truncated: truncated, NextAfterEdgeID: next,
+		Neighborhood: result, Truncated: truncated,
+		NextAfterEdgeID: nextAfter, Continuation: continuation,
 	}, nil
 }
 

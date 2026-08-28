@@ -189,6 +189,7 @@ type BoundedNeighborhood struct {
 	Neighborhood    Neighborhood
 	Truncated       bool
 	NextAfterEdgeID shoal.ID
+	Continuation    bool
 }
 
 // BoundedClient is the backend boundary required by scalable Explorer
