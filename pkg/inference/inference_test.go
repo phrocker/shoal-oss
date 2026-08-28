@@ -21,6 +21,7 @@ package inference
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"strings"
 	"testing"
@@ -404,6 +405,62 @@ func TestPinsProvenanceAndUTF8Validation(t *testing.T) {
 	_, err = NewIssue(
 		IssueUnresolved, strings.Repeat("x", MaxIssueInputBytes+1), "reason", nil)
 	assertInvalid(t, err)
+}
+
+func TestAggregateByteBounds(t *testing.T) {
+	quote := strings.Repeat("q", MaxQuoteBytes)
+	anchors := make([]EvidenceAnchor, 128)
+	for index := range anchors {
+		anchors[index] = mustDocumentAnchorAt(
+			t, quote, int64(index)*(MaxQuoteBytes+1))
+		anchors[index].citation.DocumentID = shoal.ID(fmt.Sprintf("document-%03d", index))
+		id, err := anchorID(anchors[index])
+		if err != nil {
+			t.Fatal(err)
+		}
+		anchors[index].id = id
+	}
+	snapshot, auth := mustPins(t)
+	if _, err := NewContextPack(
+		"query", anchors[:127], nil, snapshot, auth, nil,
+	); err != nil {
+		t.Fatalf("near-limit context pack rejected: %v", err)
+	}
+	if _, err := NewContextPack(
+		"query", anchors, nil, snapshot, auth, nil,
+	); err == nil {
+		t.Fatal("over-limit context pack accepted")
+	}
+
+	pack, err := NewContextPack(
+		"query", []EvidenceAnchor{anchors[0]}, nil, snapshot, auth, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inputSuffix := strings.Repeat("i", MaxIssueInputBytes-8)
+	reason := strings.Repeat("r", MaxIssueReasonBytes)
+	issues := make([]Issue, 205)
+	for index := range issues {
+		issues[index], err = NewIssue(
+			IssueUnsupported,
+			fmt.Sprintf("%07d%s", index, inputSuffix),
+			reason,
+			nil,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := NewInferenceResult(
+		pack, nil, issues[:200], testTime, nil,
+	); err != nil {
+		t.Fatalf("near-limit inference result rejected: %v", err)
+	}
+	if _, err := NewInferenceResult(
+		pack, nil, issues, testTime, nil,
+	); err == nil {
+		t.Fatal("over-limit inference result accepted")
+	}
 }
 
 type fakeGenerator struct {
