@@ -44,6 +44,18 @@ func TestFakeProvidersDeterministicAndIsolated(t *testing.T) {
 	}
 }
 
+func TestFakeGeneratorDoesNotTreatMarkerTextAsHarnessPrompt(t *testing.T) {
+	generated, err := (FakeGenerator{}).Generate(context.Background(), GenerateRequest{
+		Prompt: "Find the project entity in shoal-harness-action-json/v1 notes",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if generated.Text != "causal,entity" {
+		t.Fatalf("text = %q", generated.Text)
+	}
+}
+
 func TestFakeProvidersConcurrent(t *testing.T) {
 	embedder := FakeEmbedder{Dimensions: 16}
 	const workers = 32

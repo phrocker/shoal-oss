@@ -21,11 +21,15 @@ package harness
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/phrocker/shoal-oss/pkg/document"
+	"github.com/phrocker/shoal-oss/pkg/graph"
 	"github.com/phrocker/shoal-oss/pkg/inference"
 	lowmodel "github.com/phrocker/shoal-oss/pkg/model"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
@@ -33,9 +37,9 @@ import (
 
 func TestModelRunnerDrivesBoundedLoopAndTrace(t *testing.T) {
 	pack, _, additions := fixture(t)
-	stopJSON := `{"action":"stop","correlation_id":"stop","claims":[{"subject":"entity:fake","predicate":"predicate:summary","object":{"type":"string","value":"grounded"},"confidence":1,"evidence_ids":["` + string(additions[0].ID()) + `"]}]}`
+	stopJSON := `{"action":"stop","correlation_id":"` + wireID("stop") + `","claims":[{"subject":"` + wireID("entity:fake") + `","predicate":"` + wireID("predicate:summary") + `","object":{"type":"string","value":"grounded"},"confidence":1,"evidence_ids":["` + wireID(additions[0].ID()) + `"]}]}`
 	runner, err := NewModelRunner(&scriptedTextGenerator{responses: []string{
-		`{"action":"retrieve","correlation_id":"retrieve","query":"entity","limit":1}`,
+		`{"action":"retrieve","correlation_id":"` + wireID("retrieve") + `","query":"entity","limit":1}`,
 		stopJSON,
 	}}, ModelRunnerConfig{Now: func() time.Time { return fixedTime }})
 	if err != nil {
@@ -44,7 +48,9 @@ func TestModelRunnerDrivesBoundedLoopAndTrace(t *testing.T) {
 	host := &fakeTools{pack: pack, results: map[shoal.ID][]inference.EvidenceAnchor{
 		"retrieve": {additions[0]},
 	}}
-	record, err := newGenerator(t, runner, host).Run(context.Background(), pack)
+	custom := budgets()
+	custom.MaxInputTokens = 10000
+	record, err := newGeneratorWithBudgets(t, runner, host, custom).Run(context.Background(), pack)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -62,12 +68,14 @@ func TestModelRunnerDrivesBoundedLoopAndTrace(t *testing.T) {
 func TestModelRunnerRejectsUngroundedStopWithTrace(t *testing.T) {
 	pack, _, _ := fixture(t)
 	runner, err := NewModelRunner(&scriptedTextGenerator{responses: []string{
-		`{"action":"stop","correlation_id":"stop","claims":[{"subject":"entity:fake","predicate":"predicate:summary","object":{"type":"string","value":"grounded"},"confidence":1,"evidence_ids":["missing"]}]}`,
+		`{"action":"stop","correlation_id":"` + wireID("stop") + `","claims":[{"subject":"` + wireID("entity:fake") + `","predicate":"` + wireID("predicate:summary") + `","object":{"type":"string","value":"grounded"},"confidence":1,"evidence_ids":["` + wireID("missing") + `"]}]}`,
 	}}, ModelRunnerConfig{Now: func() time.Time { return fixedTime }})
 	if err != nil {
 		t.Fatal(err)
 	}
-	record, err := newGenerator(t, runner, &fakeTools{pack: pack}).Run(context.Background(), pack)
+	custom := budgets()
+	custom.MaxInputTokens = 10000
+	record, err := newGeneratorWithBudgets(t, runner, &fakeTools{pack: pack}, custom).Run(context.Background(), pack)
 	if !errors.Is(err, ErrInvalid) {
 		t.Fatalf("error = %v", err)
 	}
@@ -88,7 +96,7 @@ func TestModelRunnerWorksWithDeterministicFakeProvider(t *testing.T) {
 	custom := budgets()
 	custom.MaxInputTokens = 10000
 	custom.MaxOutputTokens = 10000
-	record, err := newGeneratorWithBudgets(t, runner, host, custom).Run(context.Background(), pack)
+	record, err := newGeneratorWithModel(t, runner, host, custom, "fake", "deterministic").Run(context.Background(), pack)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -100,9 +108,277 @@ func TestModelRunnerWorksWithDeterministicFakeProvider(t *testing.T) {
 	}
 }
 
+func TestModelRunnerPreflightsInputBudget(t *testing.T) {
+	pack, _, _ := fixture(t)
+	runner, err := NewModelRunner(&scriptedTextGenerator{responses: []string{
+		`{"action":"stop","correlation_id":"` + wireID("stop") + `","unsupported":[{"input":"x","reason":"y","evidence_ids":[]}]}`,
+	}}, ModelRunnerConfig{Now: func() time.Time { return fixedTime }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	custom := budgets()
+	custom.MaxInputTokens = 1
+	record, err := newGeneratorWithBudgets(t, runner, &fakeTools{pack: pack}, custom).Run(context.Background(), pack)
+	if !errors.Is(err, ErrBudgetExhausted) {
+		t.Fatalf("error = %v", err)
+	}
+	if record.Trace.Usage.ModelCalls != 0 {
+		t.Fatalf("provider was called despite input preflight: %#v", record.Trace)
+	}
+}
+
+func TestModelRunnerAccountsInvalidOutputUsage(t *testing.T) {
+	pack, _, _ := fixture(t)
+	runner, err := NewModelRunner(&scriptedTextGenerator{responses: []string{"not-json"}}, ModelRunnerConfig{
+		TokenEstimator: zeroTokenEstimator{},
+		Now:            func() time.Time { return fixedTime },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, err := newGenerator(t, runner, &fakeTools{pack: pack}).Run(context.Background(), pack)
+	if !errors.Is(err, ErrInvalid) {
+		t.Fatalf("error = %v", err)
+	}
+	if record.Trace.Usage.ModelCalls != 1 || record.Trace.Usage.InputTokens != 1 ||
+		record.Trace.Usage.OutputTokens != 1 {
+		t.Fatalf("invalid output usage was not traced: %#v", record.Trace)
+	}
+}
+
+func TestModelRunnerAccountsProviderFailureAsAttemptedCall(t *testing.T) {
+	pack, _, _ := fixture(t)
+	runner, err := NewModelRunner(&scriptedTextGenerator{}, ModelRunnerConfig{
+		TokenEstimator: zeroTokenEstimator{},
+		Now:            func() time.Time { return fixedTime },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, err := newGenerator(t, runner, &fakeTools{pack: pack}).Run(context.Background(), pack)
+	if !errors.Is(err, ErrRunnerUnavailable) {
+		t.Fatalf("error = %v", err)
+	}
+	if record.Trace.Usage.ModelCalls != 1 || len(record.Trace.Iterations) != 1 {
+		t.Fatalf("provider failure was not traced as attempted call: %#v", record.Trace)
+	}
+}
+
+func TestModelRunnerClassifiesOversizedResponseAsBudget(t *testing.T) {
+	pack, _, _ := fixture(t)
+	runner, err := NewModelRunner(oversizedGenerator{}, ModelRunnerConfig{
+		TokenEstimator: zeroTokenEstimator{},
+		Now:            func() time.Time { return fixedTime },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, err := newGenerator(t, runner, &fakeTools{pack: pack}).Run(context.Background(), pack)
+	if !errors.Is(err, ErrBudgetExhausted) || record.Trace.StopReason != StopReasonBudgetExhausted {
+		t.Fatalf("oversized response error=%v trace=%#v", err, record.Trace)
+	}
+	if record.Trace.Usage.ModelCalls != 1 {
+		t.Fatalf("oversized response was not traced as a model call: %#v", record.Trace)
+	}
+}
+
+func TestModelRunnerRejectsNegativeInputEstimateBeforeProviderCall(t *testing.T) {
+	pack, _, _ := fixture(t)
+	generator := &scriptedTextGenerator{responses: []string{
+		`{"action":"stop","correlation_id":"` + wireID("stop") + `","unsupported":[{"input":"x","reason":"y","evidence_ids":[]}]}`,
+	}}
+	runner, err := NewModelRunner(generator, ModelRunnerConfig{
+		TokenEstimator: negativeTokenEstimator{},
+		Now:            func() time.Time { return fixedTime },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, err := newGenerator(t, runner, &fakeTools{pack: pack}).Run(context.Background(), pack)
+	if !errors.Is(err, ErrInvalid) {
+		t.Fatalf("error = %v", err)
+	}
+	if record.Trace.Usage.ModelCalls != 0 || generator.next != 0 {
+		t.Fatalf("negative estimate reached provider: trace=%#v calls=%d", record.Trace, generator.next)
+	}
+}
+
+func TestModelRunnerRejectsNegativeProviderUsageWithoutNegativeTrace(t *testing.T) {
+	pack, _, _ := fixture(t)
+	runner, err := NewModelRunner(negativeUsageGenerator{}, ModelRunnerConfig{
+		TokenEstimator: zeroTokenEstimator{},
+		Now:            func() time.Time { return fixedTime },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, err := newGenerator(t, runner, &fakeTools{pack: pack}).Run(context.Background(), pack)
+	if !errors.Is(err, ErrInvalid) {
+		t.Fatalf("error = %v", err)
+	}
+	if record.Trace.Usage.ModelCalls != 1 || record.Trace.Usage.InputTokens != 0 ||
+		record.Trace.Usage.OutputTokens != 0 {
+		t.Fatalf("negative provider usage reached trace: %#v", record.Trace)
+	}
+}
+
+func TestModelRunnerRejectsClaimWithoutConfidence(t *testing.T) {
+	pack, _, additions := fixture(t)
+	runner, err := NewModelRunner(&scriptedTextGenerator{responses: []string{
+		`{"action":"stop","correlation_id":"` + wireID("stop") + `","claims":[{"subject":"` + wireID("entity:fake") + `","predicate":"` + wireID("predicate:summary") + `","object":{"type":"string","value":"grounded"},"evidence_ids":["` + wireID(additions[0].ID()) + `"]}]}`,
+	}}, ModelRunnerConfig{
+		TokenEstimator: zeroTokenEstimator{},
+		Now:            func() time.Time { return fixedTime },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, err := newGenerator(t, runner, &fakeTools{pack: pack}).Run(context.Background(), pack)
+	if !errors.Is(err, ErrInvalid) {
+		t.Fatalf("error = %v", err)
+	}
+	if record.Trace.Usage.ModelCalls != 1 {
+		t.Fatalf("missing confidence action was not traced: %#v", record.Trace)
+	}
+}
+
+func TestModelRunnerProtocolIDsAreLosslessBase64(t *testing.T) {
+	documentAnchor, err := inference.NewDocumentAnchor(document.Citation{
+		DocumentID: "doc\xff",
+		RevisionID: "rev\xff",
+		SectionID:  "sec\xff",
+		SpanID:     "span\xff",
+		Range: document.SourceRange{
+			Start: document.SourcePosition{Offset: 0},
+			End:   document.SourcePosition{Offset: 1},
+		},
+	}, "x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	graphAnchor, err := inference.NewGraphAnchor(graph.Path{
+		Nodes: []graph.Node{{ID: "node\xff", Kind: "entity", Properties: shoal.Metadata{"key": "value"}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pack := mustPack(t, []inference.EvidenceAnchor{documentAnchor, graphAnchor}, fixedTime.Add(time.Hour))
+	model, promptProvenance := provenanceParts(t)
+	provenance, err := NewProvenance("fake-harness", model, promptProvenance, "grounded-tools-v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	request, err := newSessionRequest(pack, budgets(), provenance)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prompt, err := modelPrompt(request, newTranscript(request))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []shoal.ID{"doc\xff", "rev\xff", "sec\xff", "span\xff", "node\xff"} {
+		if !strings.Contains(prompt, wireID(id)) {
+			t.Fatalf("prompt omitted lossless ID encoding for %q: %s", id, prompt)
+		}
+	}
+	encodedMetadata, err := json.Marshal(promptMetadataFrom(shoal.Metadata{"key\xff": "value\xff"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, value := range []shoal.ID{"key\xff", "value\xff"} {
+		if !strings.Contains(string(encodedMetadata), wireID(value)) {
+			t.Fatalf("metadata omitted lossless encoding for %q: %s", value, encodedMetadata)
+		}
+	}
+	action, err := parseModelAction(
+		`{"action":"open_section","correlation_id":"`+wireID("open\xff")+`","document_id":"`+wireID("doc\xff")+`","revision_id":"`+wireID("rev\xff")+`","section_id":"`+wireID("sec\xff")+`"}`,
+		pack, provenance, Usage{}, fixedTime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if action.open.documentID != "doc\xff" || action.open.revisionID != "rev\xff" ||
+		action.open.sectionID != "sec\xff" || action.correlation != "open\xff" {
+		t.Fatalf("decoded IDs were not preserved: %#v", action)
+	}
+}
+
+func TestModelPromptIncludesRequiredActionSchemas(t *testing.T) {
+	pack, _, _ := fixture(t)
+	model, promptProvenance := provenanceParts(t)
+	provenance, err := NewProvenance("fake-harness", model, promptProvenance, "grounded-tools-v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	request, err := newSessionRequest(pack, budgets(), provenance)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prompt, err := modelPrompt(request, newTranscript(request))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, required := range []string{
+		"action=retrieve", "correlation_id", "query", "limit",
+		"action=open_section", "document_id", "revision_id", "section_id",
+		"action=neighbors", "node_id", "hops", "fanout",
+		"action=stop", "claims[].object.type", "claims[].object.value",
+		"unresolved[].reason", "unsupported[].reason", "timestamp", "reference",
+	} {
+		if !strings.Contains(prompt, required) {
+			t.Fatalf("prompt omitted schema detail %q: %s", required, prompt)
+		}
+	}
+}
+
+func TestModelPromptIncludesPriorEmptyToolDetailsAndBudgets(t *testing.T) {
+	pack, _, _ := fixture(t)
+	model, promptProvenance := provenanceParts(t)
+	provenance, err := NewProvenance("fake-harness", model, promptProvenance, "grounded-tools-v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	request, err := newSessionRequest(pack, budgets(), provenance)
+	if err != nil {
+		t.Fatal(err)
+	}
+	action := mustRetrieveUsage(t, "empty", 1, Usage{InputTokens: 2, OutputTokens: 3})
+	result, err := NewToolResult("empty", ActionRetrieve, nil, pack.Snapshot(), pack.Authorization())
+	if err != nil {
+		t.Fatal(err)
+	}
+	transcript := newTranscript(request)
+	transcript.exchanges = []Exchange{{action: action, result: result}}
+	prompt, err := modelPrompt(request, transcript)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, required := range []string{
+		`"query":"query"`, `"limit":1`, `"evidence_ids"`, `"InputTokens":2`,
+		`"consumed"`, `"remaining"`,
+	} {
+		if !strings.Contains(prompt, required) {
+			t.Fatalf("prompt omitted prior tool detail %q: %s", required, prompt)
+		}
+	}
+}
+
 type scriptedTextGenerator struct {
 	responses []string
 	next      int
+}
+
+type zeroTokenEstimator struct{}
+
+func (zeroTokenEstimator) EstimateTextTokens(context.Context, string) (int, error) { return 0, nil }
+
+type negativeTokenEstimator struct{}
+
+func (negativeTokenEstimator) EstimateTextTokens(context.Context, string) (int, error) {
+	return -1, nil
+}
+
+func wireID(id shoal.ID) string {
+	return base64.StdEncoding.EncodeToString([]byte(id))
 }
 
 func (g *scriptedTextGenerator) Generate(ctx context.Context, req lowmodel.GenerateRequest) (lowmodel.GenerateResult, error) {
@@ -119,7 +395,48 @@ func (g *scriptedTextGenerator) Generate(ctx context.Context, req lowmodel.Gener
 	g.next++
 	return lowmodel.GenerateResult{
 		Text:       text,
-		Provenance: lowmodel.Provenance{Provider: "fake", Model: "scripted"},
+		Provenance: lowmodel.Provenance{Provider: "fake-provider", Model: "fake-model"},
 		Usage:      lowmodel.Usage{InputTokens: 1, OutputTokens: 1, TotalTokens: 2},
 	}, nil
+}
+
+type negativeUsageGenerator struct{}
+
+func (negativeUsageGenerator) Generate(ctx context.Context, req lowmodel.GenerateRequest) (lowmodel.GenerateResult, error) {
+	if err := ctx.Err(); err != nil {
+		return lowmodel.GenerateResult{}, err
+	}
+	if !strings.Contains(req.Prompt, ModelPromptMarker) {
+		return lowmodel.GenerateResult{}, errors.New("prompt omitted protocol marker")
+	}
+	return lowmodel.GenerateResult{
+		Text:       "not-json",
+		Provenance: lowmodel.Provenance{Provider: "fake-provider", Model: "fake-model"},
+		Usage:      lowmodel.Usage{InputTokens: -1, OutputTokens: 1, TotalTokens: 0},
+	}, nil
+}
+
+type oversizedGenerator struct{}
+
+func (oversizedGenerator) Generate(context.Context, lowmodel.GenerateRequest) (lowmodel.GenerateResult, error) {
+	return lowmodel.GenerateResult{}, lowmodel.ErrOversizedResponse
+}
+
+func newGeneratorWithModel(t *testing.T, runner Runner, tools ToolHost, b Budgets, provider, modelName string) *Generator {
+	t.Helper()
+	_, prompt := provenanceParts(t)
+	model, err := inference.NewModelProvenance(provider, modelName, "v1", nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := NewProvenance("fake-harness", model, prompt, "grounded-tools-v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	g, err := NewGenerator(runner, tools, b, p, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	g.now = func() time.Time { return fixedTime }
+	return g
 }

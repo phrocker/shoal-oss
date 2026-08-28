@@ -3,6 +3,7 @@ package model
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"math"
@@ -26,7 +27,7 @@ func (f FakeGenerator) Generate(ctx context.Context, req GenerateRequest) (Gener
 	if err := validateTextRequest("fake generate", req.Prompt, req.MaxOutputTokens, DefaultMaxTextBytes); err != nil {
 		return GenerateResult{}, &Error{Kind: ErrInvalidRequest, Operation: "fake generate"}
 	}
-	if strings.Contains(req.Prompt, "shoal-harness-action-json/v1") {
+	if isHarnessActionPrompt(req.Prompt) {
 		return f.generateHarnessAction(req)
 	}
 	prompt := strings.ToLower(req.Prompt)
@@ -59,18 +60,18 @@ func (f FakeGenerator) generateHarnessAction(req GenerateRequest) (GenerateResul
 	if name == "" {
 		name = "deterministic"
 	}
-	text := `{"action":"retrieve","correlation_id":"fake-retrieve-1","query":"entity","limit":1}`
+	text := `{"action":"retrieve","correlation_id":"` + fakeProtocolID("fake-retrieve-1") + `","query":"entity","limit":1}`
 	if !strings.Contains(req.Prompt, `"transcript":[]`) {
 		evidenceID := firstHarnessEvidenceID(req.Prompt)
 		if evidenceID == "" {
-			text = `{"action":"stop","correlation_id":"fake-stop","unsupported":[{"input":"final claim","reason":"no evidence anchor was visible","evidence_ids":[]}]}`
+			text = `{"action":"stop","correlation_id":"` + fakeProtocolID("fake-stop") + `","unsupported":[{"input":"final claim","reason":"no evidence anchor was visible","evidence_ids":[]}]}`
 		} else {
 			payload := map[string]any{
 				"action":         "stop",
-				"correlation_id": "fake-stop",
+				"correlation_id": fakeProtocolID("fake-stop"),
 				"claims": []map[string]any{{
-					"subject":      "entity:fake",
-					"predicate":    "predicate:summary",
+					"subject":      fakeProtocolID("entity:fake"),
+					"predicate":    fakeProtocolID("predicate:summary"),
 					"object":       map[string]any{"type": "string", "value": "grounded"},
 					"confidence":   1,
 					"evidence_ids": []string{evidenceID},
@@ -98,6 +99,10 @@ func (f FakeGenerator) generateHarnessAction(req GenerateRequest) (GenerateResul
 	}, nil
 }
 
+func fakeProtocolID(id string) string {
+	return base64.StdEncoding.EncodeToString([]byte(id))
+}
+
 func firstHarnessEvidenceID(prompt string) string {
 	index := strings.Index(prompt, `"evidence":[{"id":"`)
 	if index < 0 {
@@ -109,6 +114,22 @@ func firstHarnessEvidenceID(prompt string) string {
 		return ""
 	}
 	return prompt[start : start+end]
+}
+
+func isHarnessActionPrompt(prompt string) bool {
+	var envelope struct {
+		Protocol string          `json:"protocol"`
+		Tools    []string        `json:"tools"`
+		Evidence json.RawMessage `json:"evidence"`
+	}
+	if err := json.Unmarshal([]byte(prompt), &envelope); err != nil {
+		return false
+	}
+	if envelope.Protocol != "shoal-harness-action-json/v1" ||
+		len(envelope.Tools) == 0 || len(envelope.Evidence) == 0 {
+		return false
+	}
+	return true
 }
 
 type FakeEmbedder struct {

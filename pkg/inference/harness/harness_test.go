@@ -197,6 +197,20 @@ func TestBudgetBoundaries(t *testing.T) {
 			t.Fatal(err)
 		}
 	})
+	t.Run("token overage is traced", func(t *testing.T) {
+		host := &fakeTools{pack: pack, results: map[shoal.ID][]inference.EvidenceAnchor{"x": {additions[0]}}}
+		first := mustRetrieveUsage(t, "x", 1, Usage{InputTokens: 11, OutputTokens: 12})
+		g := newGenerator(t, NewFakeRunner(ScriptAction(first)), host)
+		record, err := g.Run(context.Background(), pack)
+		if !errors.Is(err, ErrBudgetExhausted) {
+			t.Fatalf("error = %v", err)
+		}
+		if record.Trace.Usage.InputTokens != 11 || record.Trace.Usage.OutputTokens != 12 ||
+			record.Trace.Iterations[0].Budget.InputTokens != 11 ||
+			record.Trace.Iterations[0].Budget.OutputTokens != 12 {
+			t.Fatalf("over-budget token usage was not traced: %#v", record.Trace)
+		}
+	})
 }
 
 func TestActionKeysFrameOpaqueIDs(t *testing.T) {
@@ -227,6 +241,77 @@ func TestStepAndCycleLimits(t *testing.T) {
 	if !errors.Is(err, ErrBudgetExhausted) {
 		t.Fatalf("step error = %v", err)
 	}
+}
+
+func TestRunAccountsSuccessfulActionBeforePostCallCancellation(t *testing.T) {
+	pack, _, additions := fixture(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	action := mustRetrieveUsage(t, "x", 1, Usage{InputTokens: 2, OutputTokens: 3})
+	runner := NewFakeRunner(func(context.Context, Transcript) (Action, error) {
+		cancel()
+		return action, nil
+	})
+	host := &fakeTools{pack: pack, results: map[shoal.ID][]inference.EvidenceAnchor{"x": {additions[0]}}}
+	record, err := newGenerator(t, runner, host).Run(ctx, pack)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v", err)
+	}
+	if record.Trace.Usage.ModelCalls != 1 || record.Trace.Usage.InputTokens != 2 ||
+		record.Trace.Usage.OutputTokens != 3 {
+		t.Fatalf("successful action was not accounted before cancellation: %#v", record.Trace)
+	}
+}
+
+func TestRunAccountsDuplicateCorrelationBeforeRejecting(t *testing.T) {
+	pack, _, additions := fixture(t)
+	host := &fakeTools{pack: pack, results: map[shoal.ID][]inference.EvidenceAnchor{"x": {additions[0]}}}
+	first := mustRetrieveUsage(t, "x", 1, Usage{InputTokens: 1, OutputTokens: 1})
+	second := mustRetrieveUsage(t, "x", 1, Usage{InputTokens: 2, OutputTokens: 3})
+	record, err := newGenerator(t, NewFakeRunner(ScriptAction(first), ScriptAction(second)), host).Run(context.Background(), pack)
+	if !errors.Is(err, ErrInvalid) {
+		t.Fatalf("error = %v", err)
+	}
+	if record.Trace.Usage.ModelCalls != 2 || record.Trace.Usage.InputTokens != 3 ||
+		record.Trace.Usage.OutputTokens != 4 {
+		t.Fatalf("duplicate action usage was not accounted: %#v", record.Trace)
+	}
+}
+
+func TestRunAccountsAttemptedToolUsageBeforeBudgetFailures(t *testing.T) {
+	pack, _, additions := fixture(t)
+	t.Run("evidence", func(t *testing.T) {
+		custom := budgets()
+		custom.MaxEvidence = 1
+		host := &fakeTools{pack: pack, results: map[shoal.ID][]inference.EvidenceAnchor{
+			"x": {additions[0], additions[1]},
+		}}
+		record, err := newGeneratorWithBudgets(
+			t, NewFakeRunner(ScriptAction(mustRetrieve(t, "x", "query", 2))), host, custom,
+		).Run(context.Background(), pack)
+		if !errors.Is(err, ErrBudgetExhausted) {
+			t.Fatalf("error = %v", err)
+		}
+		if record.Trace.Usage.Evidence != 2 || len(record.Trace.Iterations[0].EvidenceIDs) != 2 {
+			t.Fatalf("attempted evidence overage was not traced: %#v", record.Trace)
+		}
+	})
+	t.Run("graph nodes", func(t *testing.T) {
+		custom := budgets()
+		custom.MaxGraphNodes = 1
+		host := &fakeTools{pack: pack, results: map[shoal.ID][]inference.EvidenceAnchor{
+			"x": {graphNeighborAnchor(t)},
+		}}
+		record, err := newGeneratorWithBudgets(
+			t, NewFakeRunner(ScriptAction(mustRetrieve(t, "x", "query", 1))), host, custom,
+		).Run(context.Background(), pack)
+		if !errors.Is(err, ErrBudgetExhausted) {
+			t.Fatalf("error = %v", err)
+		}
+		if record.Trace.Usage.GraphNodes != 2 || len(record.Trace.Iterations[0].EvidenceIDs) != 1 {
+			t.Fatalf("attempted graph-node overage was not traced: %#v", record.Trace)
+		}
+	})
 }
 
 func TestCancellationTimeoutAndRunnerFailure(t *testing.T) {
@@ -344,6 +429,56 @@ func TestEvaluationRecordIsRedactedAndIncludesBudgets(t *testing.T) {
 	encoded := fmt.Sprintf("%+v", recorder.record)
 	if strings.Contains(encoded, string(secretCorrelation)) {
 		t.Fatal("evaluation record retained correlation ID")
+	}
+}
+
+func TestBudgetDefaultsPreserveFormerKeyedLiterals(t *testing.T) {
+	pack, initial, _ := fixture(t)
+	legacy := Budgets{
+		MaxSteps: 1, MaxElapsed: time.Second, MaxInputTokens: 1, MaxOutputTokens: 1,
+		MaxGraphHops: 1, MaxFanout: 1, MaxRepeatedAction: 1,
+	}
+	stop, _ := NewStopAction("stop", resultFor(t, pack, initial), Usage{})
+	g := newGeneratorWithBudgets(t, NewFakeRunner(ScriptAction(stop)), &fakeTools{pack: pack}, legacy)
+	record, err := g.Run(context.Background(), pack)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.Trace.Budgets.MaxEvidence != 1 || record.Trace.Budgets.MaxGraphNodes != 2 {
+		t.Fatalf("legacy budgets not normalized: %#v", record.Trace.Budgets)
+	}
+}
+
+func TestEvidenceBudgetCannotExceedInferenceContract(t *testing.T) {
+	b := budgets()
+	b.MaxEvidence = inference.MaxEvidenceAnchors + 1
+	model, prompt := provenanceParts(t)
+	provenance, err := NewProvenance("fake-harness", model, prompt, "grounded-tools-v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewGenerator(NewFakeRunner(), &fakeTools{}, b, provenance, nil); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("oversized evidence budget error = %v", err)
+	}
+	b = budgets()
+	b.MaxFanout = int(maxUint32Value) + 1
+	if _, err := NewGenerator(NewFakeRunner(), &fakeTools{}, b, provenance, nil); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("oversized graph budget error = %v", err)
+	}
+	if uint32RepresentableProduct(int(maxUint32Value), int(maxUint32Value)) {
+		t.Fatal("overflowing graph budget product accepted")
+	}
+}
+
+func TestRunRefreshesGraphHopBudgetWhenNeighborFails(t *testing.T) {
+	pack, _, _ := fixture(t)
+	action := mustNeighbors(t, "neighbors", "missing-node", 1, 1)
+	record, err := newGenerator(t, NewFakeRunner(ScriptAction(action)), &fakeTools{pack: pack}).Run(context.Background(), pack)
+	if !errors.Is(err, ErrInvalid) {
+		t.Fatalf("error = %v", err)
+	}
+	if record.Trace.Usage.GraphHops != 1 || record.Trace.Iterations[0].Budget.GraphHops != 1 {
+		t.Fatalf("failed neighbor hop was not traced: %#v", record.Trace)
 	}
 }
 

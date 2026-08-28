@@ -22,9 +22,12 @@ package harness
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"sort"
+	"time"
 
 	"github.com/phrocker/shoal-oss/pkg/contextpack"
+	"github.com/phrocker/shoal-oss/pkg/document"
 	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/graph"
 	"github.com/phrocker/shoal-oss/pkg/inference"
@@ -51,7 +54,9 @@ func NewExplorerToolHost(client explorer.Client, builder contextpack.Builder) (*
 	}
 	host := &ExplorerToolHost{Client: client, Builder: builder}
 	if bounded, ok := client.(explorer.BoundedClient); ok {
-		host.BoundedClient = bounded
+		if available, ok := client.(interface{ BoundedAvailable() bool }); !ok || available.BoundedAvailable() {
+			host.BoundedClient = bounded
+		}
 	}
 	return host, nil
 }
@@ -64,6 +69,12 @@ func (h *ExplorerToolHost) Retrieve(
 	if err := h.validate(); err != nil {
 		return ToolResult{}, err
 	}
+	if err := h.validateSnapshot(ctx, call); err != nil {
+		return ToolResult{}, err
+	}
+	if err := h.validateAuthorization(ctx, call); err != nil {
+		return ToolResult{}, err
+	}
 	retrievalRequest := retrieval.Request{
 		Text:    request.Query(),
 		TopK:    uint32(request.Limit()),
@@ -71,13 +82,42 @@ func (h *ExplorerToolHost) Retrieve(
 		AsOf:    call.Snapshot().AsOf(),
 		Explain: h.RetrievalExplain,
 	}
-	response, err := h.Client.Retrieve(ctx, retrievalRequest)
+	clientRequest := retrievalRequest
+	if h.BoundedClient != nil {
+		clientRequest.AsOf = time.Time{}
+	}
+	response, err := h.Client.Retrieve(ctx, clientRequest)
 	if err != nil {
 		return ToolResult{}, err
 	}
-	pack, err := h.builder().Build(ctx, contextpack.InitialRequest{
-		Request:  retrievalRequest,
-		Response: response,
+	if err := validateRetrievalResponseShape(response, request.Limit(), call.Budgets()); err != nil {
+		return ToolResult{}, err
+	}
+	if err := response.ValidateFor(clientRequest); err != nil {
+		return ToolResult{}, err
+	}
+	if err := h.validateSnapshot(ctx, call); err != nil {
+		return ToolResult{}, err
+	}
+	if err := h.validateAuthorization(ctx, call); err != nil {
+		return ToolResult{}, err
+	}
+	if err := h.verifyRetrievalPaths(ctx, response, call.Budgets()); err != nil {
+		return ToolResult{}, err
+	}
+	if len(response.Results) == 0 {
+		return NewToolResult(
+			call.CorrelationID(), ActionRetrieve, nil,
+			call.Snapshot(), call.Authorization())
+	}
+	neighborhoods, err := neighborhoodsFromRetrievalResponse(response)
+	if err != nil {
+		return ToolResult{}, err
+	}
+	pack, err := h.builderFor(call.Budgets().MaxFanout, call.Budgets().MaxGraphNodes).Build(ctx, contextpack.InitialRequest{
+		Request:       retrievalRequest,
+		Response:      response,
+		Neighborhoods: neighborhoods,
 		Pins: contextpack.Pins{
 			Snapshot:      call.Snapshot(),
 			Authorization: call.Authorization(),
@@ -86,6 +126,12 @@ func (h *ExplorerToolHost) Retrieve(
 		Metadata: h.Metadata,
 	})
 	if err != nil {
+		return ToolResult{}, err
+	}
+	if err := h.validateSnapshot(ctx, call); err != nil {
+		return ToolResult{}, err
+	}
+	if err := h.validateAuthorization(ctx, call); err != nil {
 		return ToolResult{}, err
 	}
 	return NewToolResult(
@@ -101,18 +147,28 @@ func (h *ExplorerToolHost) OpenSection(
 	if err := h.validate(); err != nil {
 		return ToolResult{}, err
 	}
-	current := call.Context()
-	next, err := h.builder().OpenSection(ctx, current, contextpack.OpenSectionRequest{
-		DocumentID: request.DocumentID(),
-		RevisionID: request.RevisionID(),
-		SectionIDs: []shoal.ID{request.SectionID()},
-		Depth:      0,
-	})
+	if err := h.validateSnapshot(ctx, call); err != nil {
+		return ToolResult{}, err
+	}
+	if err := h.validateAuthorization(ctx, call); err != nil {
+		return ToolResult{}, err
+	}
+	view, err := h.Client.Document(ctx, request.DocumentID(), request.RevisionID())
+	if err != nil {
+		return ToolResult{}, err
+	}
+	if err := h.validateSnapshot(ctx, call); err != nil {
+		return ToolResult{}, err
+	}
+	if err := h.validateAuthorization(ctx, call); err != nil {
+		return ToolResult{}, err
+	}
+	anchors, err := sectionAnchors(ctx, view, request, call.Budgets().MaxEvidence)
 	if err != nil {
 		return ToolResult{}, err
 	}
 	return NewToolResult(
-		call.CorrelationID(), ActionOpenSection, verifiedAdditions(current, next),
+		call.CorrelationID(), ActionOpenSection, anchors,
 		call.Snapshot(), call.Authorization())
 }
 
@@ -127,23 +183,357 @@ func (h *ExplorerToolHost) Neighbors(
 	if h.BoundedClient == nil {
 		return ToolResult{}, invalid("bounded explorer client is required for neighbors")
 	}
+	maxNodes := call.Budgets().MaxGraphNodes
+	if maxNodes <= 0 {
+		maxNodes = request.Fanout() + request.Hops()
+	} else {
+		maxNodes = remainingGraphNodeCap(call.Context(), request.NodeID(), maxNodes)
+	}
+	maxAnchors := call.Budgets().MaxEvidence
+	if maxAnchors <= 0 {
+		maxAnchors = request.Fanout() * request.Hops()
+	}
+	if err := h.validateSnapshot(ctx, call); err != nil {
+		return ToolResult{}, err
+	}
+	if err := h.validateAuthorization(ctx, call); err != nil {
+		return ToolResult{}, err
+	}
 	bounded, err := h.BoundedClient.BoundedNeighborhood(ctx, explorer.BoundedNeighborhoodRequest{
-		NodeIDs:   []shoal.ID{request.NodeID()},
-		Depth:     uint32(request.Hops()),
-		Fanout:    uint32(request.Fanout()),
-		MaxNodes:  uint32(request.Fanout() + 1),
-		Direction: explorer.GraphDirectionOutgoing,
+		NodeIDs:         []shoal.ID{request.NodeID()},
+		Depth:           uint32(request.Hops()),
+		Fanout:          uint32(request.Fanout()),
+		MaxNodes:        uint32(maxNodes),
+		MaxScannedEdges: uint32(authorizationScanEdgeLimit(request.Fanout(), maxNodes)),
+		Direction:       explorer.GraphDirectionOutgoing,
 	})
 	if err != nil {
 		return ToolResult{}, err
 	}
-	anchors, err := graphAnchorsFromNeighborhood(request.NodeID(), bounded.Neighborhood)
+	if err := validateBoundedNeighborhoodResponse(
+		explorer.BoundedNeighborhoodRequest{
+			NodeIDs: []shoal.ID{request.NodeID()}, Depth: uint32(request.Hops()),
+			Fanout: uint32(request.Fanout()), MaxNodes: uint32(maxNodes),
+			Direction: explorer.GraphDirectionOutgoing,
+		},
+		bounded.Neighborhood,
+	); err != nil {
+		return ToolResult{}, err
+	}
+	if err := h.validateSnapshot(ctx, call); err != nil {
+		return ToolResult{}, err
+	}
+	if err := h.validateAuthorization(ctx, call); err != nil {
+		return ToolResult{}, err
+	}
+	anchors, err := graphAnchorsFromNeighborhood(
+		request.NodeID(), bounded.Neighborhood, request.Hops(), maxAnchors)
 	if err != nil {
 		return ToolResult{}, err
 	}
 	return NewToolResult(
 		call.CorrelationID(), ActionNeighbors, anchors,
 		call.Snapshot(), call.Authorization())
+}
+
+func remainingGraphNodeCap(pack inference.ContextPack, seed shoal.ID, maxNodes int) int {
+	existing := graphNodeSet(pack.Evidence())
+	alreadyCounted := len(existing)
+	if _, ok := existing[seed]; ok && alreadyCounted > 0 {
+		alreadyCounted--
+	}
+	remaining := maxNodes - alreadyCounted
+	if remaining < 1 {
+		return 1
+	}
+	return remaining
+}
+
+func validateBoundedNeighborhoodResponse(
+	request explorer.BoundedNeighborhoodRequest,
+	neighborhood explorer.Neighborhood,
+) error {
+	if uint32(len(neighborhood.Nodes)) > request.MaxNodes {
+		return budget("graph nodes")
+	}
+	typeFilter := make(map[string]struct{}, len(request.EdgeTypes))
+	for _, edgeType := range request.EdgeTypes {
+		typeFilter[edgeType] = struct{}{}
+	}
+	counts := make(map[shoal.ID]uint32)
+	for _, edge := range neighborhood.Edges {
+		if len(typeFilter) > 0 {
+			if _, ok := typeFilter[edge.Type]; !ok {
+				return invalid("bounded neighborhood returned an edge outside the requested type filter")
+			}
+		}
+		switch request.Direction {
+		case explorer.GraphDirectionIncoming:
+			counts[edge.To]++
+		case explorer.GraphDirectionBoth, "":
+			counts[edge.From]++
+			if edge.To != edge.From {
+				counts[edge.To]++
+			}
+		default:
+			counts[edge.From]++
+		}
+	}
+	for _, count := range counts {
+		if count > request.Fanout {
+			return budget("graph fanout")
+		}
+	}
+	return nil
+}
+
+func (h *ExplorerToolHost) validateAuthorization(ctx context.Context, call ToolContext) error {
+	validator, ok := h.Client.(interface {
+		ValidateAuthorization(context.Context, inference.AuthPin) error
+	})
+	if !ok {
+		return nil
+	}
+	return validator.ValidateAuthorization(ctx, call.Authorization())
+}
+
+func validateRetrievalResponseShape(response retrieval.Response, requestLimit int, budgets Budgets) error {
+	if len(response.Results) > requestLimit {
+		return budget("retrieval result")
+	}
+	maxEvidence := budgets.MaxEvidence
+	if maxEvidence <= 0 {
+		maxEvidence = requestLimit
+	}
+	maxPathNodes := budgets.MaxGraphNodes
+	if maxPathNodes <= 0 {
+		maxPathNodes = requestLimit + 1
+	}
+	maxPathEdges := maxPathNodes - 1
+	totalEvidence := 0
+	for _, result := range response.Results {
+		if len(result.Evidence) > maxEvidence {
+			return budget("retrieval evidence")
+		}
+		totalEvidence += len(result.Evidence)
+		if totalEvidence > maxEvidence {
+			return budget("retrieval evidence")
+		}
+		for _, evidence := range result.Evidence {
+			pathNodes := len(evidence.Path.Nodes)
+			pathEdges := len(evidence.Path.Edges)
+			if pathNodes == 0 && pathEdges == 0 {
+				continue
+			}
+			if pathNodes > maxPathNodes {
+				return budget("retrieval graph path")
+			}
+			if pathEdges > maxPathEdges {
+				return budget("retrieval graph path")
+			}
+		}
+	}
+	return nil
+}
+
+func (h *ExplorerToolHost) validateSnapshot(ctx context.Context, call ToolContext) error {
+	if h.BoundedClient == nil {
+		return nil
+	}
+	snapshot, err := h.BoundedClient.Snapshot(ctx)
+	if err != nil {
+		return err
+	}
+	if shoal.ID(snapshot.ID) != call.Snapshot().ID() ||
+		!snapshot.AsOf.UTC().Equal(call.Snapshot().AsOf()) {
+		return invalid("explorer snapshot does not match the pinned context")
+	}
+	return nil
+}
+
+func (h *ExplorerToolHost) verifyRetrievalPaths(ctx context.Context, response retrieval.Response, budgets Budgets) error {
+	if h.BoundedClient == nil {
+		return nil
+	}
+	for _, result := range response.Results {
+		for _, evidence := range result.Evidence {
+			for _, node := range evidence.Path.Nodes {
+				if err := h.verifyNode(ctx, node, budgets); err != nil {
+					return err
+				}
+			}
+			for _, edge := range evidence.Path.Edges {
+				if err := h.verifyEdge(ctx, edge, budgets); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func (h *ExplorerToolHost) verifyNode(ctx context.Context, expected graph.Node, budgets Budgets) error {
+	fanout, maxNodes, _ := graphVerificationBounds(budgets)
+	bounded, err := h.BoundedClient.BoundedNeighborhood(ctx, explorer.BoundedNeighborhoodRequest{
+		NodeIDs:         []shoal.ID{expected.ID},
+		Depth:           1,
+		Fanout:          uint32(fanout),
+		MaxNodes:        uint32(maxNodes),
+		MaxScannedEdges: uint32(authorizationScanEdgeLimit(fanout, maxNodes)),
+		Direction:       explorer.GraphDirectionOutgoing,
+	})
+	if err != nil {
+		return err
+	}
+	for _, node := range bounded.Neighborhood.Nodes {
+		if node.ID == expected.ID {
+			if !reflect.DeepEqual(node, expected) {
+				return invalid("retrieval graph node does not match Explorer data")
+			}
+			return nil
+		}
+	}
+	return invalid("retrieval graph node is absent from Explorer data")
+}
+
+func (h *ExplorerToolHost) verifyEdge(ctx context.Context, expected graph.Edge, budgets Budgets) error {
+	fanout, maxNodes, maxPages := graphVerificationBounds(budgets)
+	after := shoal.ID("")
+	for page := 0; page < maxPages; page++ {
+		bounded, err := h.BoundedClient.BoundedNeighborhood(ctx, explorer.BoundedNeighborhoodRequest{
+			NodeIDs:         []shoal.ID{expected.From},
+			Depth:           1,
+			Fanout:          uint32(fanout),
+			MaxNodes:        uint32(maxNodes),
+			MaxScannedEdges: uint32(authorizationScanEdgeLimit(fanout, maxNodes)),
+			Direction:       explorer.GraphDirectionOutgoing,
+			AfterEdgeID:     after,
+		})
+		if err != nil {
+			return err
+		}
+		for _, edge := range bounded.Neighborhood.Edges {
+			if edge.ID == expected.ID {
+				if !reflect.DeepEqual(edge, expected) {
+					return invalid("retrieval graph edge does not match Explorer data")
+				}
+				return nil
+			}
+		}
+		if !bounded.Continuation {
+			return invalid("retrieval graph edge is absent from Explorer data")
+		}
+		after = bounded.NextAfterEdgeID
+	}
+	return budget("graph verification")
+}
+
+func graphVerificationBounds(budgets Budgets) (int, int, int) {
+	fanout := budgets.MaxFanout
+	if fanout <= 0 {
+		fanout = 1
+	}
+	maxNodes := budgets.MaxGraphNodes
+	if maxNodes <= 0 {
+		maxNodes = fanout + 1
+	}
+	maxPages := budgets.MaxFanout
+	if maxPages <= 0 {
+		maxPages = 1
+	}
+	return fanout, maxNodes, maxPages
+}
+
+func authorizationScanEdgeLimit(fanout, maxNodes int) int {
+	if fanout <= 0 {
+		fanout = 1
+	}
+	if maxNodes <= 0 {
+		maxNodes = fanout + 1
+	}
+	return fanout * maxNodes
+}
+
+func sectionAnchors(
+	ctx context.Context,
+	view explorer.DocumentView,
+	request OpenSectionRequest,
+	maxAnchors int,
+) ([]inference.EvidenceAnchor, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := view.Document.Validate(); err != nil {
+		return nil, err
+	}
+	if err := view.Revision.Validate(); err != nil {
+		return nil, err
+	}
+	if view.Document.ID != request.DocumentID() || view.Revision.ID != request.RevisionID() {
+		return nil, invalid("hydrated document identity does not match request")
+	}
+	if maxAnchors <= 0 {
+		maxAnchors = inference.MaxEvidenceAnchors
+	}
+	var section *explorer.SectionView
+	var find func(*explorer.SectionView) error
+	find = func(current *explorer.SectionView) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if section != nil {
+			return nil
+		}
+		if current.Section.ID == request.SectionID() {
+			section = current
+			return nil
+		}
+		for i := range current.Children {
+			if err := find(&current.Children[i]); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if err := find(&view.Root); err != nil {
+		return nil, err
+	}
+	if section == nil {
+		return nil, invalid("requested section is absent from hydrated document")
+	}
+	capacity := len(section.Spans)
+	if capacity > maxAnchors {
+		capacity = maxAnchors
+	}
+	anchors := make([]inference.EvidenceAnchor, 0, capacity)
+	for _, span := range section.Spans {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if span.DocumentID != view.Document.ID ||
+			span.RevisionID != view.Revision.ID ||
+			span.SectionID != section.Section.ID {
+			return nil, invalid("hydrated span ownership does not match section")
+		}
+		if span.Text == "" {
+			continue
+		}
+		if len(anchors) >= maxAnchors {
+			return nil, budget("section evidence")
+		}
+		anchor, err := inference.NewDocumentAnchor(document.Citation{
+			DocumentID: span.DocumentID,
+			RevisionID: span.RevisionID,
+			SectionID:  span.SectionID,
+			SpanID:     span.ID,
+			Range:      span.Range,
+		}, span.Text)
+		if err != nil {
+			return nil, err
+		}
+		anchors = append(anchors, anchor)
+	}
+	return anchors, nil
 }
 
 func (h *ExplorerToolHost) validate() error {
@@ -162,16 +552,132 @@ func (h *ExplorerToolHost) validate() error {
 }
 
 func (h *ExplorerToolHost) builder() contextpack.Builder {
+	return h.builderFor(0, 0)
+}
+
+func (h *ExplorerToolHost) builderFor(fanout, maxNodes int) contextpack.Builder {
 	builder := h.Builder
-	if builder.Reader == nil {
+	if h.BoundedClient != nil {
+		builder.Reader = boundedContextReader{
+			documents: h.Client,
+			graph:     h.BoundedClient,
+			fanout:    fanout,
+			maxNodes:  maxNodes,
+		}
+	} else if builder.Reader == nil {
 		builder.Reader = h.Client
 	}
 	return builder
 }
 
-func graphAnchorsFromNeighborhood(seed shoal.ID, neighborhood explorer.Neighborhood) ([]inference.EvidenceAnchor, error) {
+type boundedContextReader struct {
+	documents explorer.Client
+	graph     explorer.BoundedClient
+	fanout    int
+	maxNodes  int
+}
+
+func (r boundedContextReader) Document(ctx context.Context, documentID, revisionID shoal.ID) (explorer.DocumentView, error) {
+	return r.documents.Document(ctx, documentID, revisionID)
+}
+
+func (r boundedContextReader) Neighborhood(ctx context.Context, request explorer.NeighborhoodRequest) (explorer.Neighborhood, error) {
+	normalized, err := request.Normalize()
+	if err != nil {
+		return explorer.Neighborhood{}, err
+	}
+	fanout := r.fanout
+	if fanout <= 0 {
+		fanout = 1
+	}
+	maxNodes := r.maxNodes
+	if maxNodes <= 0 {
+		maxNodes = fanout + len(normalized.NodeIDs)
+	}
+	boundedRequest := explorer.BoundedNeighborhoodRequest{
+		NodeIDs:         normalized.NodeIDs,
+		Depth:           normalized.Depth,
+		Fanout:          uint32(fanout),
+		MaxNodes:        uint32(maxNodes),
+		MaxScannedEdges: uint32(authorizationScanEdgeLimit(fanout, maxNodes)),
+		EdgeTypes:       normalized.EdgeTypes,
+		Direction:       explorer.GraphDirectionOutgoing,
+	}
+	bounded, err := r.graph.BoundedNeighborhood(ctx, boundedRequest)
+	if err != nil {
+		return explorer.Neighborhood{}, err
+	}
+	if err := validateBoundedNeighborhoodResponse(boundedRequest, bounded.Neighborhood); err != nil {
+		return explorer.Neighborhood{}, err
+	}
+	return bounded.Neighborhood, nil
+}
+
+func neighborhoodsFromRetrievalResponse(response retrieval.Response) ([]explorer.Neighborhood, error) {
+	nodes := make(map[shoal.ID]graph.Node)
+	edges := make(map[shoal.ID]graph.Edge)
+	for _, result := range response.Results {
+		for _, evidence := range result.Evidence {
+			path := evidence.Path
+			for _, node := range path.Nodes {
+				if err := node.Validate(); err != nil {
+					return nil, err
+				}
+				if existing, duplicate := nodes[node.ID]; duplicate && !reflect.DeepEqual(existing, node) {
+					return nil, invalid("retrieval graph path has duplicate node ID")
+				}
+				nodes[node.ID] = node
+			}
+			for _, edge := range path.Edges {
+				if err := edge.Validate(); err != nil {
+					return nil, err
+				}
+				if existing, duplicate := edges[edge.ID]; duplicate && !reflect.DeepEqual(existing, edge) {
+					return nil, invalid("retrieval graph path has duplicate edge ID")
+				}
+				edges[edge.ID] = edge
+			}
+		}
+	}
+	if len(nodes) == 0 && len(edges) == 0 {
+		return nil, nil
+	}
+	neighborhood := explorer.Neighborhood{
+		Nodes: make([]graph.Node, 0, len(nodes)),
+		Edges: make([]graph.Edge, 0, len(edges)),
+	}
+	for _, node := range nodes {
+		neighborhood.Nodes = append(neighborhood.Nodes, node)
+	}
+	for _, edge := range edges {
+		neighborhood.Edges = append(neighborhood.Edges, edge)
+	}
+	sort.Slice(neighborhood.Nodes, func(i, j int) bool {
+		return shoal.CompareID(neighborhood.Nodes[i].ID, neighborhood.Nodes[j].ID) < 0
+	})
+	sort.Slice(neighborhood.Edges, func(i, j int) bool {
+		return shoal.CompareID(neighborhood.Edges[i].ID, neighborhood.Edges[j].ID) < 0
+	})
+	return []explorer.Neighborhood{neighborhood}, nil
+}
+
+func graphAnchorsFromNeighborhood(
+	seed shoal.ID,
+	neighborhood explorer.Neighborhood,
+	maxHops int,
+	maxAnchors int,
+) ([]inference.EvidenceAnchor, error) {
+	if maxHops <= 0 || maxAnchors <= 0 {
+		return nil, invalid("neighbors hops and fanout must be positive")
+	}
 	nodes := make(map[shoal.ID]graph.Node, len(neighborhood.Nodes))
 	for _, node := range neighborhood.Nodes {
+		if err := node.Validate(); err != nil {
+			return nil, err
+		}
+		if _, duplicate := nodes[node.ID]; duplicate {
+			return nil, invalid("bounded neighborhood has duplicate node ID")
+		}
 		nodes[node.ID] = node
 	}
 	if _, ok := nodes[seed]; !ok {
@@ -181,24 +687,80 @@ func graphAnchorsFromNeighborhood(seed shoal.ID, neighborhood explorer.Neighborh
 	sort.Slice(edges, func(i, j int) bool {
 		return shoal.CompareID(edges[i].ID, edges[j].ID) < 0
 	})
-	anchors := make([]inference.EvidenceAnchor, 0, len(edges))
+	outgoing := make(map[shoal.ID][]graph.Edge)
+	seenEdges := make(map[shoal.ID]struct{}, len(edges))
 	for _, edge := range edges {
-		if edge.From != seed {
+		if err := edge.Validate(); err != nil {
+			return nil, err
+		}
+		if _, duplicate := seenEdges[edge.ID]; duplicate {
+			return nil, invalid("bounded neighborhood has duplicate edge ID")
+		}
+		seenEdges[edge.ID] = struct{}{}
+		outgoing[edge.From] = append(outgoing[edge.From], edge)
+	}
+	type queuedPath struct {
+		nodes []graph.Node
+		edges []graph.Edge
+		seen  map[shoal.ID]struct{}
+	}
+	anchors := make([]inference.EvidenceAnchor, 0, len(edges))
+	seenAnchors := make(map[shoal.ID]struct{})
+	queue := []queuedPath{{
+		nodes: []graph.Node{nodes[seed]},
+		seen:  map[shoal.ID]struct{}{seed: struct{}{}},
+	}}
+	for len(queue) > 0 && len(anchors) < maxAnchors {
+		current := queue[0]
+		queue = queue[1:]
+		if len(current.edges) >= maxHops {
 			continue
 		}
-		from, fromOK := nodes[edge.From]
-		to, toOK := nodes[edge.To]
-		if !fromOK || !toOK {
+		last := current.nodes[len(current.nodes)-1]
+		for _, edge := range outgoing[last.ID] {
+			if len(anchors) >= maxAnchors {
+				break
+			}
+			next, ok := nodes[edge.To]
+			if !ok {
+				return nil, invalid("bounded neighborhood edge has a missing endpoint")
+			}
+			if _, cycle := current.seen[next.ID]; cycle {
+				continue
+			}
+			nextSeen := make(map[shoal.ID]struct{}, len(current.seen)+1)
+			for id := range current.seen {
+				nextSeen[id] = struct{}{}
+			}
+			nextSeen[next.ID] = struct{}{}
+			nextPath := queuedPath{
+				nodes: append(append([]graph.Node(nil), current.nodes...), next),
+				edges: append(append([]graph.Edge(nil), current.edges...), edge),
+				seen:  nextSeen,
+			}
+			anchor, err := inference.NewGraphAnchor(graph.Path{
+				Nodes: nextPath.nodes,
+				Edges: nextPath.edges,
+			})
+			if err != nil {
+				return nil, fmt.Errorf("%w: %v", ErrInvalid, err)
+			}
+			if _, duplicate := seenAnchors[anchor.ID()]; !duplicate {
+				seenAnchors[anchor.ID()] = struct{}{}
+				anchors = append(anchors, anchor)
+			}
+			if len(nextPath.edges) < maxHops && len(anchors) < maxAnchors {
+				queue = append(queue, nextPath)
+			}
+		}
+	}
+	for _, edge := range edges {
+		if _, fromOK := nodes[edge.From]; !fromOK {
 			return nil, invalid("bounded neighborhood edge has a missing endpoint")
 		}
-		anchor, err := inference.NewGraphAnchor(graph.Path{
-			Nodes: []graph.Node{from, to},
-			Edges: []graph.Edge{edge},
-		})
-		if err != nil {
-			return nil, fmt.Errorf("%w: %v", ErrInvalid, err)
+		if _, toOK := nodes[edge.To]; !toOK {
+			return nil, invalid("bounded neighborhood edge has a missing endpoint")
 		}
-		anchors = append(anchors, anchor)
 	}
 	return anchors, nil
 }

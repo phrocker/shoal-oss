@@ -48,24 +48,31 @@ deterministic scripted actions and faults for tests. `ModelRunner` adapts a
 low-level `pkg/model.TextGenerator` into the same loop by prompting for one
 strict JSON action per iteration, parsing only the allowlisted tools, and
 constructing final `Claim` or `Issue` values through `pkg/inference`
-constructors. Malformed JSON, arbitrary tools, and final claims that cite
-evidence outside the assembled context fail closed instead of being passed
-through.
+constructors. Every JSON protocol ID is base64-encoded opaque bytes before it
+is shown to the model and decoded before request/result construction, so
+non-UTF-8 Shoal IDs round-trip losslessly. Malformed JSON, arbitrary tools,
+and final claims that cite evidence outside the assembled context fail closed
+instead of being passed through.
 
 Budgets are caller-visible and enforced by the harness: model-call steps,
-wall-clock duration, input/output token usage reported by the provider,
+wall-clock duration, input token preflight through a configured estimator (or a
+conservative byte count), input/output token usage reported by the provider,
 retrieved evidence anchors, graph hops, graph node count, per-action fan-out,
 and repeated-action cycles. Cancellation and deadline errors are returned
 explicitly; provider failures are reported as unavailable with no fallback.
 Each `Run` returns a trace with iterations, decisions, tool evidence IDs,
-budget consumption, stop reason, and failures.
+budget consumption, stop reason, and failures, including usage for model calls
+that return invalid JSON or mismatched provenance.
+For compatibility, omitted evidence and graph-node budgets default from the
+fan-out budget.
 
 `ExplorerToolHost` connects those actions to an already authorized Explorer
 client. Retrieval preserves the original snapshot `AsOf`, section opening
 hydrates only issued document/revision/section IDs, and neighbor expansion
 requires `explorer.BoundedClient` so depth, fan-out, and node caps are enforced
 before graph materialization. Tool results carry the original snapshot and
-authorization pins, so the loop never widens visibility.
+authorization pins; clients that expose authorization-pin validation are
+checked before and after tool execution so the loop never widens visibility.
 
 Evaluation records contain provenance, budgets, action kinds, and token usage
 only; they exclude prompts, correlation IDs, tool inputs/results, credentials,

@@ -22,9 +22,12 @@ package harness
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -41,7 +44,12 @@ const ModelPromptMarker = "shoal-harness-action-json/v1"
 
 type ModelRunnerConfig struct {
 	MaxOutputTokens int
+	TokenEstimator  TextTokenEstimator
 	Now             func() time.Time
+}
+
+type TextTokenEstimator interface {
+	EstimateTextTokens(context.Context, string) (int, error)
 }
 
 type ModelRunner struct {
@@ -88,8 +96,22 @@ func (s *modelSession) Next(ctx context.Context, transcript Transcript) (Action,
 	if err != nil {
 		return Action{}, err
 	}
+	remainingInput := s.request.budgets.MaxInputTokens - transcriptInputTokens(transcript)
+	if remainingInput <= 0 {
+		return Action{}, budget("input token")
+	}
+	estimatedInput, err := s.runner.estimateInputTokens(ctx, prompt)
+	if err != nil {
+		return Action{}, err
+	}
+	if estimatedInput < 0 {
+		return Action{}, invalid("input token estimate cannot be negative")
+	}
+	if estimatedInput > remainingInput {
+		return Action{}, budget("input token")
+	}
 	remainingOutput := s.request.budgets.MaxOutputTokens - transcriptOutputTokens(transcript)
-	if remainingOutput < 0 {
+	if remainingOutput <= 0 {
 		return Action{}, budget("output token")
 	}
 	maxOutput := remainingOutput
@@ -101,13 +123,74 @@ func (s *modelSession) Next(ctx context.Context, transcript Transcript) (Action,
 		MaxOutputTokens: maxOutput,
 	})
 	if err != nil {
-		return Action{}, err
+		if errors.Is(err, lowmodel.ErrOversizedResponse) {
+			return Action{}, newActionError(budget("output token"), Usage{})
+		}
+		return Action{}, newActionError(err, Usage{})
 	}
 	usage := Usage{
 		InputTokens:  generated.Usage.InputTokens,
 		OutputTokens: generated.Usage.OutputTokens,
 	}
-	return parseModelAction(generated.Text, transcript.context, s.request.provenance, usage, s.runner.cfg.Now())
+	if usage.InputTokens < 0 || usage.OutputTokens < 0 {
+		return Action{}, newActionError(invalid("model token usage cannot be negative"), Usage{})
+	}
+	if err := validateGeneratedProvenance(generated.Provenance, s.request.provenance.model); err != nil {
+		return Action{}, newActionError(err, usage)
+	}
+	action, err := parseModelAction(generated.Text, transcript.context, s.request.provenance, usage, s.runner.cfg.Now())
+	if err != nil {
+		return Action{}, newActionError(err, usage)
+	}
+	return action, nil
+}
+
+func (r *ModelRunner) estimateInputTokens(ctx context.Context, prompt string) (int, error) {
+	if r.cfg.TokenEstimator != nil {
+		return r.cfg.TokenEstimator.EstimateTextTokens(ctx, prompt)
+	}
+	return len([]byte(prompt)), nil
+}
+
+func transcriptInputTokens(transcript Transcript) int {
+	total := 0
+	for _, exchange := range transcript.exchanges {
+		total += exchange.action.usage.InputTokens
+	}
+	if transcript.final != nil {
+		total += transcript.final.usage.InputTokens
+	}
+	return total
+}
+
+func validateGeneratedProvenance(generated lowmodel.Provenance, expected inference.ModelProvenance) error {
+	if strings.TrimSpace(generated.Provider) == "" || strings.TrimSpace(generated.Model) == "" {
+		return invalid("model generation omitted provider provenance")
+	}
+	if generated.Provider != expected.Provider() || generated.Model != expected.Model() {
+		return invalid("model generation provenance does not match the harness session")
+	}
+	return nil
+}
+
+type actionError struct {
+	err   error
+	usage Usage
+}
+
+func newActionError(err error, usage Usage) error {
+	return actionError{err: err, usage: usage}
+}
+
+func (e actionError) Error() string { return e.err.Error() }
+func (e actionError) Unwrap() error { return e.err }
+
+func actionErrorUsage(err error) (Usage, bool) {
+	var actionErr actionError
+	if errors.As(err, &actionErr) {
+		return actionErr.usage, true
+	}
+	return Usage{}, false
 }
 
 func transcriptOutputTokens(transcript Transcript) int {
@@ -125,61 +208,248 @@ type promptEnvelope struct {
 	Protocol    string           `json:"protocol"`
 	Tools       []string         `json:"tools"`
 	Budgets     Budgets          `json:"budgets"`
+	Consumed    BudgetUsage      `json:"consumed"`
+	Remaining   BudgetUsage      `json:"remaining"`
 	Snapshot    promptSnapshot   `json:"snapshot"`
 	Auth        promptAuth       `json:"authorization"`
 	Query       string           `json:"query"`
-	ContextID   shoal.ID         `json:"context_id"`
+	ContextID   protocolID       `json:"context_id"`
 	Evidence    []promptEvidence `json:"evidence"`
 	Transcript  []promptExchange `json:"transcript"`
+	Schemas     []promptSchema   `json:"schemas"`
 	Instruction string           `json:"instruction"`
 }
 
 type promptSnapshot struct {
-	ID   shoal.ID `json:"id"`
-	AsOf string   `json:"as_of"`
+	ID   protocolID `json:"id"`
+	AsOf string     `json:"as_of"`
 }
 
 type promptAuth struct {
-	Fingerprint shoal.ID `json:"fingerprint"`
-	ExpiresAt   string   `json:"expires_at"`
+	Fingerprint protocolID `json:"fingerprint"`
+	ExpiresAt   string     `json:"expires_at"`
 }
 
 type promptEvidence struct {
-	ID       shoal.ID             `json:"id"`
+	ID       protocolID           `json:"id"`
 	Kind     inference.AnchorKind `json:"kind"`
-	Citation *document.Citation   `json:"citation,omitempty"`
+	Citation *promptCitation      `json:"citation,omitempty"`
 	Quote    string               `json:"quote,omitempty"`
-	Path     *graph.Path          `json:"path,omitempty"`
+	Path     *promptPath          `json:"path,omitempty"`
 }
 
 type promptExchange struct {
+	Action      ActionKind   `json:"action"`
+	Correlation protocolID   `json:"correlation_id"`
+	Query       string       `json:"query,omitempty"`
+	Limit       int          `json:"limit,omitempty"`
+	DocumentID  protocolID   `json:"document_id,omitempty"`
+	RevisionID  protocolID   `json:"revision_id,omitempty"`
+	SectionID   protocolID   `json:"section_id,omitempty"`
+	NodeID      protocolID   `json:"node_id,omitempty"`
+	Hops        int          `json:"hops,omitempty"`
+	Fanout      int          `json:"fanout,omitempty"`
+	Usage       Usage        `json:"usage"`
+	EvidenceIDs []protocolID `json:"evidence_ids"`
+}
+
+type promptCitation struct {
+	DocumentID protocolID           `json:"document_id"`
+	RevisionID protocolID           `json:"revision_id"`
+	SectionID  protocolID           `json:"section_id,omitempty"`
+	SpanID     protocolID           `json:"span_id,omitempty"`
+	Range      document.SourceRange `json:"range"`
+}
+
+type promptPath struct {
+	Nodes []promptNode `json:"nodes"`
+	Edges []promptEdge `json:"edges"`
+}
+
+type promptNode struct {
+	ID         protocolID            `json:"id"`
+	Kind       string                `json:"kind,omitempty"`
+	Labels     []string              `json:"labels,omitempty"`
+	Properties []promptMetadataEntry `json:"properties,omitempty"`
+}
+
+type promptEdge struct {
+	ID         protocolID            `json:"id"`
+	From       protocolID            `json:"from"`
+	To         protocolID            `json:"to"`
+	Type       string                `json:"type"`
+	Weight     shoal.Score           `json:"weight"`
+	Properties []promptMetadataEntry `json:"properties,omitempty"`
+}
+
+type promptMetadataEntry struct {
+	Key   protocolBytes `json:"key"`
+	Value protocolBytes `json:"value"`
+}
+
+type promptSchema struct {
 	Action      ActionKind `json:"action"`
-	Correlation shoal.ID   `json:"correlation_id"`
-	EvidenceIDs []shoal.ID `json:"evidence_ids,omitempty"`
+	Required    []string   `json:"required"`
+	Description string     `json:"description"`
+}
+
+type protocolID shoal.ID
+
+type protocolBytes string
+
+func newProtocolID(id shoal.ID) protocolID {
+	return protocolID(id)
+}
+
+func (id protocolID) shoalID() shoal.ID {
+	return shoal.ID(id)
+}
+
+func (id protocolID) MarshalJSON() ([]byte, error) {
+	return json.Marshal(base64.StdEncoding.EncodeToString([]byte(id)))
+}
+
+func newProtocolBytes(value string) protocolBytes {
+	return protocolBytes(value)
+}
+
+func (value protocolBytes) MarshalJSON() ([]byte, error) {
+	return json.Marshal(base64.StdEncoding.EncodeToString([]byte(value)))
+}
+
+func (id *protocolID) UnmarshalJSON(data []byte) error {
+	var encoded string
+	if err := json.Unmarshal(data, &encoded); err != nil {
+		return err
+	}
+	decoded, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		return invalid("protocol ID is not valid base64")
+	}
+	if len(decoded) > shoal.MaxIDBytes {
+		return invalid("protocol ID exceeds the public byte bound")
+	}
+	*id = protocolID(shoal.ID(string(decoded)))
+	return nil
+}
+
+func protocolIDs(ids []shoal.ID) []protocolID {
+	if len(ids) == 0 {
+		return nil
+	}
+	result := make([]protocolID, 0, len(ids))
+	for _, id := range ids {
+		result = append(result, newProtocolID(id))
+	}
+	return result
+}
+
+func shoalIDs(ids []protocolID) []shoal.ID {
+	if len(ids) == 0 {
+		return nil
+	}
+	result := make([]shoal.ID, 0, len(ids))
+	for _, id := range ids {
+		result = append(result, id.shoalID())
+	}
+	return result
+}
+
+func promptCitationFrom(citation document.Citation) *promptCitation {
+	return &promptCitation{
+		DocumentID: newProtocolID(citation.DocumentID),
+		RevisionID: newProtocolID(citation.RevisionID),
+		SectionID:  newProtocolID(citation.SectionID),
+		SpanID:     newProtocolID(citation.SpanID),
+		Range:      citation.Range,
+	}
+}
+
+func promptPathFrom(path graph.Path) *promptPath {
+	result := promptPath{
+		Nodes: make([]promptNode, 0, len(path.Nodes)),
+		Edges: make([]promptEdge, 0, len(path.Edges)),
+	}
+	for _, node := range path.Nodes {
+		result.Nodes = append(result.Nodes, promptNode{
+			ID:         newProtocolID(node.ID),
+			Kind:       node.Kind,
+			Labels:     append([]string(nil), node.Labels...),
+			Properties: promptMetadataFrom(node.Properties),
+		})
+	}
+	for _, edge := range path.Edges {
+		result.Edges = append(result.Edges, promptEdge{
+			ID:         newProtocolID(edge.ID),
+			From:       newProtocolID(edge.From),
+			To:         newProtocolID(edge.To),
+			Type:       edge.Type,
+			Weight:     edge.Weight,
+			Properties: promptMetadataFrom(edge.Properties),
+		})
+	}
+	return &result
+}
+
+func promptMetadataFrom(metadata shoal.Metadata) []promptMetadataEntry {
+	if len(metadata) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(metadata))
+	for key := range metadata {
+		keys = append(keys, key)
+	}
+	sort.Slice(keys, func(left, right int) bool {
+		return shoal.CompareID(shoal.ID(keys[left]), shoal.ID(keys[right])) < 0
+	})
+	entries := make([]promptMetadataEntry, 0, len(keys))
+	for _, key := range keys {
+		entries = append(entries, promptMetadataEntry{
+			Key:   newProtocolBytes(key),
+			Value: newProtocolBytes(metadata[key]),
+		})
+	}
+	return entries
 }
 
 func modelPrompt(request SessionRequest, transcript Transcript) (string, error) {
 	contextEvidence := transcript.context.Evidence()
 	evidence := make([]promptEvidence, 0, len(contextEvidence))
 	for _, anchor := range contextEvidence {
-		item := promptEvidence{ID: anchor.ID(), Kind: anchor.Kind()}
+		item := promptEvidence{ID: newProtocolID(anchor.ID()), Kind: anchor.Kind()}
 		if citation, quote, ok := anchor.Document(); ok {
-			item.Citation = &citation
+			item.Citation = promptCitationFrom(citation)
 			item.Quote = quote
 		}
 		if path, ok := anchor.Path(); ok {
-			item.Path = &path
+			item.Path = promptPathFrom(path)
 		}
 		evidence = append(evidence, item)
 	}
 	exchanges := make([]promptExchange, 0, len(transcript.exchanges))
 	for _, exchange := range transcript.exchanges {
-		exchanges = append(exchanges, promptExchange{
+		item := promptExchange{
 			Action:      exchange.action.kind,
-			Correlation: exchange.action.correlation,
-			EvidenceIDs: anchorIDs(exchange.result.anchors),
-		})
+			Correlation: newProtocolID(exchange.action.correlation),
+			Usage:       exchange.action.usage,
+			EvidenceIDs: protocolIDs(anchorIDs(exchange.result.anchors)),
+		}
+		switch exchange.action.kind {
+		case ActionRetrieve:
+			item.Query = exchange.action.retrieve.query
+			item.Limit = exchange.action.retrieve.limit
+		case ActionOpenSection:
+			item.DocumentID = newProtocolID(exchange.action.open.documentID)
+			item.RevisionID = newProtocolID(exchange.action.open.revisionID)
+			item.SectionID = newProtocolID(exchange.action.open.sectionID)
+		case ActionNeighbors:
+			item.NodeID = newProtocolID(exchange.action.neighbors.nodeID)
+			item.Hops = exchange.action.neighbors.hops
+			item.Fanout = exchange.action.neighbors.fanout
+		}
+		exchanges = append(exchanges, item)
 	}
+	consumed := promptConsumed(transcript)
 	envelope := promptEnvelope{
 		Protocol: ModelPromptMarker,
 		Tools: []string{
@@ -187,14 +457,54 @@ func modelPrompt(request SessionRequest, transcript Transcript) (string, error) 
 			string(ActionNeighbors), string(ActionStop),
 		},
 		Budgets:    request.budgets,
-		Snapshot:   promptSnapshot{ID: request.context.Snapshot().ID(), AsOf: request.context.Snapshot().AsOf().Format(time.RFC3339Nano)},
-		Auth:       promptAuth{Fingerprint: request.context.Authorization().Fingerprint(), ExpiresAt: request.context.Authorization().ExpiresAt().Format(time.RFC3339Nano)},
+		Consumed:   consumed,
+		Remaining:  promptRemaining(request.budgets, consumed),
+		Snapshot:   promptSnapshot{ID: newProtocolID(request.context.Snapshot().ID()), AsOf: request.context.Snapshot().AsOf().Format(time.RFC3339Nano)},
+		Auth:       promptAuth{Fingerprint: newProtocolID(request.context.Authorization().Fingerprint()), ExpiresAt: request.context.Authorization().ExpiresAt().Format(time.RFC3339Nano)},
 		Query:      request.context.Query(),
-		ContextID:  transcript.context.ID(),
+		ContextID:  newProtocolID(transcript.context.ID()),
 		Evidence:   evidence,
 		Transcript: exchanges,
+		Schemas: []promptSchema{
+			{
+				Action: ActionRetrieve,
+				Required: []string{
+					"action=retrieve", "correlation_id", "query", "limit",
+				},
+				Description: "Retrieve ranked evidence for query with positive limit. correlation_id is base64-encoded opaque ID bytes.",
+			},
+			{
+				Action: ActionOpenSection,
+				Required: []string{
+					"action=open_section", "correlation_id", "document_id", "revision_id", "section_id",
+				},
+				Description: "Open exactly one visible section previously present in evidence. All *_id fields are base64-encoded opaque ID bytes.",
+			},
+			{
+				Action: ActionNeighbors,
+				Required: []string{
+					"action=neighbors", "correlation_id", "node_id", "hops", "fanout",
+				},
+				Description: "Expand from one visible graph node with positive hops and fanout. node_id is base64-encoded opaque ID bytes.",
+			},
+			{
+				Action: ActionStop,
+				Required: []string{
+					"action=stop", "correlation_id",
+					"claims[].subject", "claims[].predicate",
+					"claims[].object.type", "claims[].object.value",
+					"claims[].confidence", "claims[].evidence_ids",
+					"unresolved[].input", "unresolved[].reason",
+					"unsupported[].input", "unsupported[].reason",
+				},
+				Description: "Stop with at least one claim, unresolved issue, or unsupported issue. " +
+					"Ontology object types are string, integer, number, boolean, timestamp, or reference. " +
+					"Every claim evidence_ids entry must be copied from evidence[].id.",
+			},
+		},
 		Instruction: "Return only one JSON object. Use action retrieve, open_section, neighbors, or stop. " +
-			"Final stop claims must cite evidence_ids from this context; put unsupported or ungrounded output in unsupported.",
+			"All JSON ID fields are base64-encoded opaque ID bytes. Final stop claims must cite evidence_ids from this context; " +
+			"put unsupported or ungrounded output in unsupported.",
 	}
 	payload, err := json.Marshal(envelope)
 	if err != nil {
@@ -203,15 +513,49 @@ func modelPrompt(request SessionRequest, transcript Transcript) (string, error) 
 	return string(payload), nil
 }
 
+func promptConsumed(transcript Transcript) BudgetUsage {
+	usage := BudgetUsage{
+		ModelCalls: len(transcript.exchanges),
+		GraphNodes: len(graphNodeSet(transcript.context.Evidence())),
+	}
+	for _, exchange := range transcript.exchanges {
+		usage.InputTokens += exchange.action.usage.InputTokens
+		usage.OutputTokens += exchange.action.usage.OutputTokens
+		usage.Evidence += len(exchange.result.anchors)
+		if exchange.action.kind == ActionNeighbors {
+			usage.GraphHops += exchange.action.neighbors.hops
+		}
+	}
+	return usage
+}
+
+func promptRemaining(budgets Budgets, consumed BudgetUsage) BudgetUsage {
+	return BudgetUsage{
+		ModelCalls:   nonnegative(budgets.MaxSteps - consumed.ModelCalls),
+		InputTokens:  nonnegative(budgets.MaxInputTokens - consumed.InputTokens),
+		OutputTokens: nonnegative(budgets.MaxOutputTokens - consumed.OutputTokens),
+		Evidence:     nonnegative(budgets.MaxEvidence - consumed.Evidence),
+		GraphHops:    nonnegative(budgets.MaxGraphHops - consumed.GraphHops),
+		GraphNodes:   nonnegative(budgets.MaxGraphNodes - consumed.GraphNodes),
+	}
+}
+
+func nonnegative(value int) int {
+	if value < 0 {
+		return 0
+	}
+	return value
+}
+
 type modelActionPayload struct {
 	Action        ActionKind          `json:"action"`
-	CorrelationID shoal.ID            `json:"correlation_id"`
+	CorrelationID protocolID          `json:"correlation_id"`
 	Query         string              `json:"query"`
 	Limit         int                 `json:"limit"`
-	DocumentID    shoal.ID            `json:"document_id"`
-	RevisionID    shoal.ID            `json:"revision_id"`
-	SectionID     shoal.ID            `json:"section_id"`
-	NodeID        shoal.ID            `json:"node_id"`
+	DocumentID    protocolID          `json:"document_id"`
+	RevisionID    protocolID          `json:"revision_id"`
+	SectionID     protocolID          `json:"section_id"`
+	NodeID        protocolID          `json:"node_id"`
 	Hops          int                 `json:"hops"`
 	Fanout        int                 `json:"fanout"`
 	Claims        []modelClaimPayload `json:"claims"`
@@ -220,17 +564,17 @@ type modelActionPayload struct {
 }
 
 type modelClaimPayload struct {
-	Subject     shoal.ID        `json:"subject"`
-	Predicate   shoal.ID        `json:"predicate"`
+	Subject     protocolID      `json:"subject"`
+	Predicate   protocolID      `json:"predicate"`
 	Object      json.RawMessage `json:"object"`
-	Confidence  shoal.Score     `json:"confidence"`
-	EvidenceIDs []shoal.ID      `json:"evidence_ids"`
+	Confidence  *shoal.Score    `json:"confidence"`
+	EvidenceIDs []protocolID    `json:"evidence_ids"`
 }
 
 type modelIssuePayload struct {
-	Input       string     `json:"input"`
-	Reason      string     `json:"reason"`
-	EvidenceIDs []shoal.ID `json:"evidence_ids"`
+	Input       string       `json:"input"`
+	Reason      string       `json:"reason"`
+	EvidenceIDs []protocolID `json:"evidence_ids"`
 }
 
 func parseModelAction(
@@ -255,25 +599,26 @@ func parseModelAction(
 		if err != nil {
 			return Action{}, err
 		}
-		return NewRetrieveAction(payload.CorrelationID, request, usage)
+		return NewRetrieveAction(payload.CorrelationID.shoalID(), request, usage)
 	case ActionOpenSection:
-		request, err := NewOpenSectionRequest(payload.DocumentID, payload.RevisionID, payload.SectionID)
+		request, err := NewOpenSectionRequest(
+			payload.DocumentID.shoalID(), payload.RevisionID.shoalID(), payload.SectionID.shoalID())
 		if err != nil {
 			return Action{}, err
 		}
-		return NewOpenSectionAction(payload.CorrelationID, request, usage)
+		return NewOpenSectionAction(payload.CorrelationID.shoalID(), request, usage)
 	case ActionNeighbors:
-		request, err := NewNeighborsRequest(payload.NodeID, payload.Hops, payload.Fanout)
+		request, err := NewNeighborsRequest(payload.NodeID.shoalID(), payload.Hops, payload.Fanout)
 		if err != nil {
 			return Action{}, err
 		}
-		return NewNeighborsAction(payload.CorrelationID, request, usage)
+		return NewNeighborsAction(payload.CorrelationID.shoalID(), request, usage)
 	case ActionStop:
 		result, err := resultFromPayload(pack, provenance, payload, generatedAt)
 		if err != nil {
 			return Action{}, fmt.Errorf("%w: model stop result: %v", ErrInvalid, err)
 		}
-		return NewStopAction(payload.CorrelationID, result, usage)
+		return NewStopAction(payload.CorrelationID.shoalID(), result, usage)
 	default:
 		return Action{}, invalid("model selected an unknown or forbidden action")
 	}
@@ -287,12 +632,15 @@ func resultFromPayload(
 ) (inference.InferenceResult, error) {
 	claims := make([]inference.Claim, 0, len(payload.Claims))
 	for _, item := range payload.Claims {
+		if item.Confidence == nil {
+			return inference.InferenceResult{}, invalid("claim confidence is required")
+		}
 		value, err := parseOntologyValue(item.Object)
 		if err != nil {
 			return inference.InferenceResult{}, err
 		}
 		claim, err := inference.NewClaim(
-			item.Subject, item.Predicate, value, item.Confidence, item.EvidenceIDs,
+			item.Subject.shoalID(), item.Predicate.shoalID(), value, *item.Confidence, shoalIDs(item.EvidenceIDs),
 			inference.ClaimInferred, provenance.model, provenance.prompt, nil)
 		if err != nil {
 			return inference.InferenceResult{}, err
@@ -302,7 +650,7 @@ func resultFromPayload(
 	issues := make([]inference.Issue, 0, len(payload.Unresolved)+len(payload.Unsupported))
 	for _, item := range payload.Unresolved {
 		issue, err := inference.NewIssue(
-			inference.IssueUnresolved, item.Input, item.Reason, item.EvidenceIDs)
+			inference.IssueUnresolved, item.Input, item.Reason, shoalIDs(item.EvidenceIDs))
 		if err != nil {
 			return inference.InferenceResult{}, err
 		}
@@ -310,7 +658,7 @@ func resultFromPayload(
 	}
 	for _, item := range payload.Unsupported {
 		issue, err := inference.NewIssue(
-			inference.IssueUnsupported, item.Input, item.Reason, item.EvidenceIDs)
+			inference.IssueUnsupported, item.Input, item.Reason, shoalIDs(item.EvidenceIDs))
 		if err != nil {
 			return inference.InferenceResult{}, err
 		}
@@ -376,11 +724,11 @@ func parseOntologyValue(raw json.RawMessage) (ontology.Value, error) {
 		}
 		return ontology.NewTimestampValue(parsed)
 	case ontology.ValueReference:
-		var value shoal.ID
+		var value protocolID
 		if err := json.Unmarshal(payload.Value, &value); err != nil {
 			return ontology.Value{}, invalid("reference claim object has invalid value")
 		}
-		return ontology.NewReferenceValue(value)
+		return ontology.NewReferenceValue(value.shoalID())
 	default:
 		return ontology.Value{}, invalid(fmt.Sprintf("unsupported claim object type %q", payload.Type))
 	}
