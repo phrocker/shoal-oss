@@ -21,6 +21,9 @@ provider.
 - **Private knowledge for agents:** keep source content and indexes local or
   inside your own infrastructure; model and workflow execution stay outside
   Shoal.
+- **Grounded inference contracts:** assemble immutable document and graph
+  evidence packs and validate structured, provenance-bearing claims without
+  coupling applications to a model vendor or transport.
 - **Local-to-cluster applications:** prototype against an embedded corpus and
   retain the graph, document, and retrieval contracts as storage moves toward
   Accumulo scale.
@@ -69,7 +72,8 @@ retrieval APIs—not a tree-only storage system.
 | Goal | Start here |
 |---|---|
 | Ingest and explore a cited document corpus | [Explorer alpha](#explorer-alpha-ingest-explore-retrieve) |
-| Build with the public document, graph, and retrieval contracts | [`pkg/document`](pkg/document) · [`pkg/graph`](pkg/graph) · [`pkg/retrieval`](pkg/retrieval) · [`pkg/explorer`](pkg/explorer) |
+| Build with the public knowledge contracts | [`pkg/document`](pkg/document) · [`pkg/graph`](pkg/graph) · [`pkg/retrieval`](pkg/retrieval) · [`pkg/ontology`](pkg/ontology) · [`pkg/inference`](pkg/inference) · [`pkg/explorer`](pkg/explorer) |
+| Define grounded generation boundaries | [`docs/inference-contracts.md`](docs/inference-contracts.md) |
 | Run a local database with RFile or Parquet | [Embedded engine](#embedded-engine-standalone-no-zookeeper) |
 | Use Sharkbite import-compatible Python APIs | [`python/README.md`](python/README.md) |
 | Embed the Accumulo client or stable C ABI | [`accumulo/`](accumulo/) · [`capi/README.md`](capi/README.md) |
@@ -81,6 +85,10 @@ matrix, and [`docs/platform-product-plan.md`](docs/platform-product-plan.md)
 for the accepted local-to-Accumulo product direction. Production replacement
 roles remain gated by the live conformance verdicts tracked in
 [issue #74](https://github.com/phrocker/shoal-oss/issues/74).
+
+`pkg/inference` currently provides public, provider-neutral contracts only.
+Shoal does not yet ship runtime LLM orchestration or a model-provider
+transport.
 
 ## Build and platform quick start
 

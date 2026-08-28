@@ -44,6 +44,19 @@ operational contracts remain in the linked runbooks and ADRs.
 | Distributed IVF-PQ lifecycle, tombstones, freshness, and recall contracts | Shipped |
 | Local RFile, local Parquet, mixed, and Accumulo-backed corpus parity | Shipped |
 
+## Knowledge and inference contracts
+
+| Capability | Status |
+|---|---|
+| Hierarchical document, graph, retrieval, and ontology contracts | Shipped |
+| Provider-neutral grounded inference context, evidence, claim, result, and provenance contracts | Shipped |
+| Runtime LLM orchestration and model-provider transports | Not implemented |
+
+The inference surface is deliberately a contract boundary. It validates
+document-only, graph-only, and mixed evidence without introducing storage
+rows, RPC messages, raw prompts, credentials, or provider SDK types. See
+[`docs/inference-contracts.md`](docs/inference-contracts.md).
+
 ## Accumulo replacement roles
 
 | Role or capability | Status |
@@ -126,6 +139,8 @@ expected evidence, debugging, and cleanup commands.
 - [`docs/promotion.md`](docs/promotion.md): promotion and cutover
 - [`docs/offline-compaction.md`](docs/offline-compaction.md): offline
   compaction runbook
+- [`docs/inference-contracts.md`](docs/inference-contracts.md):
+  provider-neutral grounded inference contracts and current runtime status
 - [`python/README.md`](python/README.md): Python install and API usage
 - [`test/accumulo/README.md`](test/accumulo/README.md): exact Accumulo 4
   conformance harness
