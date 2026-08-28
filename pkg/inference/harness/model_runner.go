@@ -83,6 +83,22 @@ func (r *ModelRunner) Start(ctx context.Context, request SessionRequest) (Sessio
 	return &modelSession{runner: r, request: request}, nil
 }
 
+func (r *ModelRunner) CacheIdentity() (string, error) {
+	if r == nil || r.generator == nil {
+		return "", ErrCacheIdentityUnsafe
+	}
+	identity := framed(
+		"model-runner-v1",
+		fmt.Sprintf("%T", r.generator),
+		strconv.Itoa(r.cfg.MaxOutputTokens),
+		fmt.Sprintf("%T", r.cfg.TokenEstimator),
+	)
+	if unsafeCacheText(identity) {
+		return "", ErrCacheIdentityUnsafe
+	}
+	return identity, nil
+}
+
 type modelSession struct {
 	runner  *ModelRunner
 	request SessionRequest

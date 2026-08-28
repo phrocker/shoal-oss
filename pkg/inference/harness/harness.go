@@ -588,6 +588,7 @@ type Generator struct {
 	budgets    Budgets
 	provenance Provenance
 	recorder   Recorder
+	cache      Cache
 	now        func() time.Time
 }
 
@@ -603,6 +604,18 @@ func NewGenerator(runner Runner, tools ToolHost, budgets Budgets, provenance Pro
 		return nil, err
 	}
 	return &Generator{runner: runner, tools: tools, budgets: budgets, provenance: provenance, recorder: recorder, now: time.Now}, nil
+}
+
+func NewCachedGenerator(runner Runner, tools ToolHost, budgets Budgets, provenance Provenance, recorder Recorder, cache Cache) (*Generator, error) {
+	if cache == nil {
+		return nil, invalid("cache is required")
+	}
+	g, err := NewGenerator(runner, tools, budgets, provenance, recorder)
+	if err != nil {
+		return nil, err
+	}
+	g.cache = cache
+	return g, nil
 }
 
 func (g *Generator) Generate(ctx context.Context, pack inference.ContextPack) (inference.InferenceResult, error) {
@@ -633,6 +646,24 @@ func (g *Generator) Run(ctx context.Context, pack inference.ContextPack) (Record
 	if remainingAuth <= 0 {
 		err := invalid("authorization pin is stale")
 		return earlyFinish(StopReasonInvalid, "authorization", err)
+	}
+	cacheKey, cacheable := CacheKey{}, false
+	if g.cache != nil {
+		runtimeIdentity, identityErr := runtimeCacheIdentity(g.runner, g.tools)
+		key, err := cacheKeyForRequest(request, runtimeIdentity)
+		if identityErr == nil && err == nil {
+			if cached, ok, err := g.cache.Get(ctx, key); err == nil && ok {
+				if err := validateCachedRecord(cached, request, pack); err == nil {
+					if g.recorder != nil {
+						if err := g.recorder.Record(ctx, evaluationRecord(cached)); err != nil {
+							return earlyFinish(stopReasonFor(err), "recorder", err)
+						}
+					}
+					return cloneRecord(cached), nil
+				}
+			}
+			cacheKey, cacheable = key, true
+		}
 	}
 	maxElapsed := g.budgets.MaxElapsed
 	if remainingAuth < maxElapsed {
@@ -686,10 +717,14 @@ func (g *Generator) Run(ctx context.Context, pack inference.ContextPack) (Record
 				trace.Iterations[len(trace.Iterations)-1].Failure = err.Error()
 			}
 		}
-		return Record{
+		record := Record{
 			Request: request, Transcript: cloneTranscript(transcript),
 			Result: result, Trace: cloneRunTrace(trace),
-		}, err
+		}
+		if err == nil && reason == StopReasonStop && cacheable {
+			_ = g.cache.Put(runCtx, cacheKey, record)
+		}
+		return record, err
 	}
 	if len(graphNodes) > g.budgets.MaxGraphNodes {
 		err := budget("graph nodes")

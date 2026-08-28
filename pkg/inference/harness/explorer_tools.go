@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"reflect"
 	"sort"
+	"strconv"
 	"time"
 
 	"github.com/phrocker/shoal-oss/pkg/contextpack"
@@ -59,6 +60,53 @@ func NewExplorerToolHost(client explorer.Client, builder contextpack.Builder) (*
 		}
 	}
 	return host, nil
+}
+
+func (h *ExplorerToolHost) CacheIdentity() (string, error) {
+	if err := h.validate(); err != nil {
+		return "", err
+	}
+	metadataKeys := make([]string, 0, len(h.Metadata))
+	for key := range h.Metadata {
+		metadataKeys = append(metadataKeys, key)
+	}
+	sort.Strings(metadataKeys)
+	parts := []string{
+		"explorer-tool-host-v1",
+		fmt.Sprintf("%T", h.Client),
+		fmt.Sprintf("%T", h.BoundedClient),
+		string(h.PolicyID),
+		strconv.FormatBool(h.RetrievalExplain),
+	}
+	for _, mode := range h.RetrievalModes {
+		parts = append(parts, string(mode))
+	}
+	for _, key := range metadataKeys {
+		parts = append(parts, key, h.Metadata[key])
+	}
+	limits := h.Builder.Limits
+	parts = append(parts,
+		strconv.Itoa(limits.MaxResults),
+		strconv.Itoa(limits.MaxAnchors),
+		strconv.Itoa(limits.MaxDocuments),
+		strconv.Itoa(limits.MaxSections),
+		strconv.Itoa(limits.MaxSpans),
+		strconv.Itoa(limits.MaxGraphNodes),
+		strconv.Itoa(limits.MaxGraphEdges),
+		strconv.Itoa(limits.MaxPathNodes),
+		strconv.Itoa(limits.MaxContextBytes),
+		strconv.Itoa(limits.MaxHydrationBytes),
+		strconv.Itoa(limits.MaxContextTokens),
+		strconv.Itoa(limits.MaxQuoteBytes),
+		strconv.Itoa(limits.MaxProvenanceBytes),
+		strconv.FormatUint(uint64(limits.MaxHierarchyDepth), 10),
+		fmt.Sprintf("%T", h.Builder.Reader),
+		fmt.Sprintf("%T", h.Builder.TokenEstimator),
+	)
+	if unsafeIdentityParts(parts) {
+		return "", ErrCacheIdentityUnsafe
+	}
+	return framed(parts...), nil
 }
 
 func (h *ExplorerToolHost) Retrieve(
