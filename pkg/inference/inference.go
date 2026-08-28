@@ -96,6 +96,9 @@ func NewGraphAnchor(path graph.Path) (EvidenceAnchor, error) {
 		return EvidenceAnchor{}, invalid(
 			"graph evidence path exceeds the public count bound")
 	}
+	if err := path.Validate(); err != nil {
+		return EvidenceAnchor{}, err
+	}
 	anchor := EvidenceAnchor{
 		kind: AnchorGraph,
 		path: canonicalizePath(path),
@@ -305,8 +308,19 @@ func NewContextPack(
 	auth AuthPin,
 	metadata shoal.Metadata,
 ) (ContextPack, error) {
+	if !utf8.ValidString(query) {
+		return ContextPack{}, invalid("context query must be valid UTF-8")
+	}
+	if len(query) > MaxQueryBytes {
+		return ContextPack{}, invalid("context query exceeds the public byte bound")
+	}
 	if len(evidence) > MaxEvidenceAnchors {
 		return ContextPack{}, invalid("context pack has too many evidence anchors")
+	}
+	if err := preflightContextPack(
+		query, evidence, ontologyIdentity, snapshot, auth, metadata,
+	); err != nil {
+		return ContextPack{}, err
 	}
 	normalized := ContextPack{
 		query:    normalizeQuery(query),
@@ -433,6 +447,52 @@ func contextPackID(pack ContextPack) (shoal.ID, error) {
 	return deriveID("context-pack", canonical), nil
 }
 
+func preflightContextPack(
+	query string,
+	evidence []EvidenceAnchor,
+	ontologyIdentity *OntologyIdentity,
+	snapshot SnapshotPin,
+	auth AuthPin,
+	metadata shoal.Metadata,
+) error {
+	if strings.TrimSpace(query) == "" {
+		return invalid("context query is required")
+	}
+	if len(evidence) == 0 {
+		return invalid("context pack requires evidence anchors")
+	}
+	seen := make(map[shoal.ID]struct{}, len(evidence))
+	payloadBytes := len(query) + metadataBytes(metadata)
+	for _, anchor := range evidence {
+		if err := anchor.Validate(); err != nil {
+			return fmt.Errorf("context evidence: %w", err)
+		}
+		if _, duplicate := seen[anchor.ID()]; duplicate {
+			return invalid("context evidence contains duplicate canonical keys")
+		}
+		seen[anchor.ID()] = struct{}{}
+		payloadBytes += anchorPayloadBytes(anchor)
+		if payloadBytes > MaxContextPackBytes {
+			return invalid("context pack exceeds the public byte bound")
+		}
+	}
+	if ontologyIdentity != nil {
+		if err := ontologyIdentity.Validate(); err != nil {
+			return err
+		}
+	}
+	if err := snapshot.Validate(); err != nil {
+		return err
+	}
+	if err := auth.Validate(); err != nil {
+		return err
+	}
+	if auth.ExpiresAt().Before(snapshot.AsOf()) {
+		return invalid("authorization expires before the pinned snapshot")
+	}
+	return validateMetadata("context metadata", metadata)
+}
+
 // ModelProvenance identifies a model invocation without carrying credentials
 // or raw provider requests.
 type ModelProvenance struct {
@@ -453,7 +513,7 @@ func NewModelProvenance(
 		provider:   provider,
 		model:      model,
 		version:    version,
-		parameters: cloneMetadata(parameters),
+		parameters: parameters,
 	}
 	if seed != nil {
 		provenance.seed = *seed
@@ -462,6 +522,7 @@ func NewModelProvenance(
 	if err := provenance.Validate(); err != nil {
 		return ModelProvenance{}, err
 	}
+	provenance.parameters = cloneMetadata(parameters)
 	return provenance, nil
 }
 
@@ -572,6 +633,12 @@ func NewClaim(
 ) (Claim, error) {
 	if len(evidenceIDs) > MaxEvidenceRefsPerOutcome {
 		return Claim{}, invalid("claim has too many evidence references")
+	}
+	if err := preflightClaim(
+		subject, predicate, object, confidence, evidenceIDs,
+		status, model, prompt, metadata,
+	); err != nil {
+		return Claim{}, err
 	}
 	claim := Claim{
 		subject:     subject,
@@ -693,6 +760,61 @@ func claimID(claim Claim) (shoal.ID, error) {
 	), nil
 }
 
+func preflightClaim(
+	subject, predicate shoal.ID,
+	object ontology.Value,
+	confidence shoal.Score,
+	evidenceIDs []shoal.ID,
+	status ClaimStatus,
+	model ModelProvenance,
+	prompt PromptProvenance,
+	metadata shoal.Metadata,
+) error {
+	if err := shoal.ValidateRequiredID("claim subject", subject); err != nil {
+		return err
+	}
+	if err := shoal.ValidateRequiredID("claim predicate", predicate); err != nil {
+		return err
+	}
+	if err := object.Validate(); err != nil {
+		return fmt.Errorf("claim object: %w", err)
+	}
+	if len(canonicalValue(object)) > MaxClaimValueBytes {
+		return invalid("claim object exceeds the public byte bound")
+	}
+	if err := shoal.ValidateFiniteScore("claim confidence", confidence); err != nil {
+		return err
+	}
+	if confidence < 0 || confidence > 1 {
+		return invalid("claim confidence must be between zero and one")
+	}
+	switch status {
+	case ClaimObserved, ClaimInferred:
+	default:
+		return invalid("claim status is invalid")
+	}
+	if len(evidenceIDs) == 0 {
+		return invalid("claim requires evidence references")
+	}
+	seen := make(map[shoal.ID]struct{}, len(evidenceIDs))
+	for _, id := range evidenceIDs {
+		if err := shoal.ValidateRequiredID("claim evidence ID", id); err != nil {
+			return err
+		}
+		if _, duplicate := seen[id]; duplicate {
+			return invalid("claim evidence contains duplicate canonical keys")
+		}
+		seen[id] = struct{}{}
+	}
+	if err := model.Validate(); err != nil {
+		return err
+	}
+	if err := prompt.Validate(); err != nil {
+		return err
+	}
+	return validateMetadata("claim metadata", metadata)
+}
+
 // IssueKind distinguishes an unresolved request from an unsupported output.
 type IssueKind string
 
@@ -715,6 +837,9 @@ func NewIssue(
 ) (Issue, error) {
 	if len(evidenceIDs) > MaxEvidenceRefsPerOutcome {
 		return Issue{}, invalid("inference issue has too many evidence references")
+	}
+	if err := preflightIssue(kind, input, reason, evidenceIDs); err != nil {
+		return Issue{}, err
 	}
 	issue := Issue{
 		kind:        kind,
@@ -787,6 +912,37 @@ func issueID(issue Issue) (shoal.ID, error) {
 	), nil
 }
 
+func preflightIssue(
+	kind IssueKind, input, reason string, evidenceIDs []shoal.ID,
+) error {
+	switch kind {
+	case IssueUnresolved, IssueUnsupported:
+	default:
+		return invalid("inference issue kind is invalid")
+	}
+	if err := validateRequiredString(
+		"inference issue input", input, MaxIssueInputBytes,
+	); err != nil {
+		return err
+	}
+	if err := validateRequiredString(
+		"inference issue reason", reason, MaxIssueReasonBytes,
+	); err != nil {
+		return err
+	}
+	seen := make(map[shoal.ID]struct{}, len(evidenceIDs))
+	for _, id := range evidenceIDs {
+		if err := shoal.ValidateRequiredID("inference issue evidence ID", id); err != nil {
+			return err
+		}
+		if _, duplicate := seen[id]; duplicate {
+			return invalid("inference issue evidence contains duplicate canonical keys")
+		}
+		seen[id] = struct{}{}
+	}
+	return nil
+}
+
 // InferenceResult is the immutable output associated with one context pack.
 type InferenceResult struct {
 	id            shoal.ID
@@ -812,6 +968,9 @@ func NewInferenceResult(
 	}
 	if len(issues) > MaxIssues {
 		return InferenceResult{}, invalid("inference result has too many issues")
+	}
+	if err := preflightInferenceResult(claims, issues, generatedAt, metadata); err != nil {
+		return InferenceResult{}, err
 	}
 	result := InferenceResult{
 		contextPackID: pack.ID(),
@@ -961,6 +1120,53 @@ func inferenceResultID(result InferenceResult) (shoal.ID, error) {
 		return "", invalid("inference result exceeds the public byte bound")
 	}
 	return deriveID("inference-result", canonical), nil
+}
+
+func preflightInferenceResult(
+	claims []Claim,
+	issues []Issue,
+	generatedAt time.Time,
+	metadata shoal.Metadata,
+) error {
+	if len(claims) == 0 && len(issues) == 0 {
+		return invalid("inference result requires at least one outcome")
+	}
+	if err := validateTime("inference generation time", generatedAt); err != nil {
+		return err
+	}
+	if err := validateMetadata("inference result metadata", metadata); err != nil {
+		return err
+	}
+	payloadBytes := metadataBytes(metadata)
+	claimIDs := make(map[shoal.ID]struct{}, len(claims))
+	for _, claim := range claims {
+		if err := claim.Validate(); err != nil {
+			return err
+		}
+		if _, duplicate := claimIDs[claim.ID()]; duplicate {
+			return invalid("inference claims contain duplicate canonical keys")
+		}
+		claimIDs[claim.ID()] = struct{}{}
+		payloadBytes += claimPayloadBytes(claim)
+		if payloadBytes > MaxInferenceResultBytes {
+			return invalid("inference result exceeds the public byte bound")
+		}
+	}
+	issueIDs := make(map[shoal.ID]struct{}, len(issues))
+	for _, issue := range issues {
+		if err := issue.Validate(); err != nil {
+			return err
+		}
+		if _, duplicate := issueIDs[issue.ID()]; duplicate {
+			return invalid("inference issues contain duplicate canonical keys")
+		}
+		issueIDs[issue.ID()] = struct{}{}
+		payloadBytes += issuePayloadBytes(issue)
+		if payloadBytes > MaxInferenceResultBytes {
+			return invalid("inference result exceeds the public byte bound")
+		}
+	}
+	return nil
 }
 
 // Generator is the high-level provider-neutral grounded generation boundary.
