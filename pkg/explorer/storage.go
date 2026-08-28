@@ -232,7 +232,7 @@ func (e *Explorer) loadEdgeRecord(
 		return nil
 	}
 	formats[record.Edge.ID] = format
-	e.edges[record.Edge.ID] = record.Edge
+	e.edges[record.Edge.ID] = record
 	return nil
 }
 

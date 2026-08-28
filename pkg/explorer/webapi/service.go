@@ -19,10 +19,7 @@ package webapi
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/base64"
-	"encoding/hex"
-	"fmt"
 	"sort"
 	"strconv"
 	"strings"
@@ -45,12 +42,12 @@ type Service interface {
 
 // EmbeddedService adapts the public Explorer client to the workspace service.
 type EmbeddedService struct {
-	client explorer.Client
+	client explorer.BoundedClient
 }
 
 // NewEmbeddedService creates a local service without exposing the embedded
 // engine through the service contract.
-func NewEmbeddedService(client explorer.Client) (*EmbeddedService, error) {
+func NewEmbeddedService(client explorer.BoundedClient) (*EmbeddedService, error) {
 	if client == nil {
 		return nil, shoal.NewError(shoal.ErrorInvalidArgument, "explorer client is required")
 	}
@@ -101,6 +98,9 @@ func (s *EmbeddedService) Document(
 	if err != nil {
 		return DocumentResponse{}, err
 	}
+	if err := s.confirmSnapshot(ctx, snapshot); err != nil {
+		return DocumentResponse{}, err
+	}
 	return DocumentResponse{Snapshot: snapshot, Document: view}, nil
 }
 
@@ -134,6 +134,9 @@ func (s *EmbeddedService) Retrieve(
 		return RetrievalResponse{}, shoal.WrapError(
 			shoal.ErrorInternal, "invalid retrieval response", err)
 	}
+	if err := s.confirmSnapshot(ctx, snapshot); err != nil {
+		return RetrievalResponse{}, err
+	}
 	return RetrievalResponse{Snapshot: snapshot, Retrieval: response}, nil
 }
 
@@ -158,88 +161,19 @@ func (s *EmbeddedService) Neighborhood(
 			shoal.ErrorInvalidArgument, "graph seeds exceed max_nodes")
 	}
 
-	nodes := make(map[shoal.ID]graph.Node)
-	edges := make(map[shoal.ID]graph.Edge)
-	frontier := append([]shoal.ID(nil), request.NodeIDs...)
-	for level := uint32(0); level <= depth && len(frontier) > 0; level++ {
-		next := make([]shoal.ID, 0)
-		for _, seed := range frontier {
-			if uint32(len(nodes)) >= maxNodes {
-				break
-			}
-			part, err := s.client.Neighborhood(ctx, explorer.NeighborhoodRequest{
-				NodeIDs: []shoal.ID{seed}, Depth: 1, EdgeTypes: request.EdgeTypes,
-			})
-			if err != nil {
-				return NeighborhoodResponse{}, err
-			}
-			sort.Slice(part.Edges, func(i, j int) bool {
-				return shoal.CompareID(part.Edges[i].ID, part.Edges[j].ID) < 0
-			})
-			nodeByID := make(map[shoal.ID]graph.Node, len(part.Nodes))
-			for _, node := range part.Nodes {
-				nodeByID[node.ID] = node
-			}
-			if node, ok := nodeByID[seed]; ok {
-				nodes[seed] = node
-			}
-			if level == depth {
-				continue
-			}
-			var used uint32
-			for _, edge := range part.Edges {
-				if edge.From != seed && edge.To != seed {
-					continue
-				}
-				if used >= fanout {
-					break
-				}
-				other := edge.To
-				if other == seed {
-					other = edge.From
-				}
-				node, ok := nodeByID[other]
-				if !ok {
-					continue
-				}
-				if _, exists := nodes[other]; !exists {
-					if uint32(len(nodes)) >= maxNodes {
-						break
-					}
-					nodes[other] = node
-					next = append(next, other)
-				}
-				edges[edge.ID] = edge
-				used++
-			}
-		}
-		frontier = deduplicateIDs(next)
-	}
-	result := explorer.Neighborhood{
-		Nodes: make([]graph.Node, 0, len(nodes)),
-		Edges: make([]graph.Edge, 0, len(edges)),
-	}
-	for _, node := range nodes {
-		result.Nodes = append(result.Nodes, node)
-	}
-	for _, edge := range edges {
-		if _, from := nodes[edge.From]; !from {
-			continue
-		}
-		if _, to := nodes[edge.To]; !to {
-			continue
-		}
-		result.Edges = append(result.Edges, edge)
-	}
-	sort.Slice(result.Nodes, func(i, j int) bool {
-		return shoal.CompareID(result.Nodes[i].ID, result.Nodes[j].ID) < 0
+	result, err := s.client.BoundedNeighborhood(ctx, explorer.BoundedNeighborhoodRequest{
+		NodeIDs: request.NodeIDs, Depth: depth, Fanout: fanout,
+		MaxNodes: maxNodes, EdgeTypes: request.EdgeTypes,
 	})
-	sort.Slice(result.Edges, func(i, j int) bool {
-		return shoal.CompareID(result.Edges[i].ID, result.Edges[j].ID) < 0
-	})
+	if err != nil {
+		return NeighborhoodResponse{}, err
+	}
+	if err := s.confirmSnapshot(ctx, snapshot); err != nil {
+		return NeighborhoodResponse{}, err
+	}
 	return NeighborhoodResponse{
-		Snapshot: snapshot, Neighborhood: result,
-		Truncated: uint32(len(nodes)) >= maxNodes,
+		Snapshot: snapshot, Neighborhood: result.Neighborhood,
+		Truncated: result.Truncated,
 	}, nil
 }
 
@@ -256,98 +190,28 @@ func (s *EmbeddedService) Path(
 	if err := shoal.ValidateRequiredID("path target node ID", request.To); err != nil {
 		return PathResponse{}, err
 	}
-	depth, fanout, _, err := normalizeGraphBounds(request.MaxDepth, request.Fanout, MaxNodes)
+	depth, fanout, maxNodes, err := normalizeGraphBounds(
+		request.MaxDepth, request.Fanout, MaxNodes)
 	if err != nil {
 		return PathResponse{}, err
 	}
-	if request.From == request.To {
-		part, err := s.client.Neighborhood(ctx, explorer.NeighborhoodRequest{
-			NodeIDs: []shoal.ID{request.From}, Depth: 1,
-		})
-		if err != nil {
-			return PathResponse{}, err
-		}
-		for _, node := range part.Nodes {
-			if node.ID == request.From {
-				return PathResponse{
-					Snapshot: snapshot, Path: graph.Path{Nodes: []graph.Node{node}},
-				}, nil
-			}
-		}
+	bounded, err := s.client.BoundedNeighborhood(ctx, explorer.BoundedNeighborhoodRequest{
+		NodeIDs: []shoal.ID{request.From}, Depth: depth, Fanout: fanout,
+		MaxNodes: maxNodes, EdgeTypes: request.EdgeTypes,
+	})
+	if err != nil {
+		return PathResponse{}, err
 	}
-
-	type predecessor struct {
-		from shoal.ID
-		edge graph.Edge
-	}
-	nodes := make(map[shoal.ID]graph.Node)
-	previous := make(map[shoal.ID]predecessor)
-	seen := map[shoal.ID]struct{}{request.From: {}}
-	frontier := []shoal.ID{request.From}
-	found := false
-	for level := uint32(0); level < depth && len(frontier) > 0 && !found; level++ {
-		next := make([]shoal.ID, 0)
-		for _, seed := range frontier {
-			part, err := s.client.Neighborhood(ctx, explorer.NeighborhoodRequest{
-				NodeIDs: []shoal.ID{seed}, Depth: 1, EdgeTypes: request.EdgeTypes,
-			})
-			if err != nil {
-				return PathResponse{}, err
-			}
-			for _, node := range part.Nodes {
-				nodes[node.ID] = node
-			}
-			sort.Slice(part.Edges, func(i, j int) bool {
-				return shoal.CompareID(part.Edges[i].ID, part.Edges[j].ID) < 0
-			})
-			var used uint32
-			for _, edge := range part.Edges {
-				if edge.From != seed || used >= fanout {
-					continue
-				}
-				used++
-				if _, exists := seen[edge.To]; exists {
-					continue
-				}
-				seen[edge.To] = struct{}{}
-				previous[edge.To] = predecessor{from: seed, edge: edge}
-				next = append(next, edge.To)
-				if edge.To == request.To {
-					found = true
-					break
-				}
-			}
-			if found {
-				break
-			}
-		}
-		frontier = next
-	}
-	if !found {
-		return PathResponse{}, shoal.NewError(
-			shoal.ErrorNotFound, "no directed path within the server bounds")
-	}
-	nodeIDs := []shoal.ID{request.To}
-	pathEdges := make([]graph.Edge, 0)
-	for current := request.To; current != request.From; {
-		step := previous[current]
-		pathEdges = append(pathEdges, step.edge)
-		current = step.from
-		nodeIDs = append(nodeIDs, current)
-	}
-	reverseIDs(nodeIDs)
-	reverseEdges(pathEdges)
-	path := graph.Path{Edges: pathEdges, Nodes: make([]graph.Node, 0, len(nodeIDs))}
-	for _, id := range nodeIDs {
-		node, ok := nodes[id]
-		if !ok {
-			return PathResponse{}, shoal.NewError(
-				shoal.ErrorInternal, "path backend omitted a node")
-		}
-		path.Nodes = append(path.Nodes, node)
+	path, err := directedPath(
+		bounded.Neighborhood, request.From, request.To, depth)
+	if err != nil {
+		return PathResponse{}, err
 	}
 	if err := path.Validate(); err != nil {
 		return PathResponse{}, shoal.WrapError(shoal.ErrorInternal, "invalid path", err)
+	}
+	if err := s.confirmSnapshot(ctx, snapshot); err != nil {
+		return PathResponse{}, err
 	}
 	return PathResponse{Snapshot: snapshot, Path: path}, nil
 }
@@ -355,29 +219,56 @@ func (s *EmbeddedService) Path(
 func (s *EmbeddedService) current(
 	ctx context.Context, requested Snapshot,
 ) ([]explorer.DocumentSummary, Snapshot, error) {
+	before, err := s.client.Snapshot(ctx)
+	if err != nil {
+		return nil, Snapshot{}, err
+	}
+	snapshot := fromExplorerSnapshot(before)
+	if err := validateRequestedSnapshot(requested, snapshot); err != nil {
+		return nil, Snapshot{}, err
+	}
 	documents, err := s.client.Documents(ctx)
 	if err != nil {
 		return nil, Snapshot{}, err
 	}
-	hash := sha256.New()
-	asOf := time.Unix(0, 0).UTC()
-	for _, summary := range documents {
-		_, _ = fmt.Fprintf(hash, "%s\x00%s\x00", summary.Document.ID, summary.Revision.ID)
-		created := summary.Revision.CreatedAt.UTC()
-		if created.After(asOf) {
-			asOf = created
-		}
-	}
-	snapshot := Snapshot{ID: hex.EncodeToString(hash.Sum(nil)), AsOf: asOf}
-	if requested.ID != "" && requested.ID != snapshot.ID {
-		return nil, Snapshot{}, shoal.NewError(
-			shoal.ErrorConflict, "requested snapshot is no longer current")
-	}
-	if !requested.AsOf.IsZero() && !requested.AsOf.Equal(snapshot.AsOf) {
-		return nil, Snapshot{}, shoal.NewError(
-			shoal.ErrorConflict, "requested as_of does not match the snapshot")
+	if err := s.confirmSnapshot(ctx, snapshot); err != nil {
+		return nil, Snapshot{}, err
 	}
 	return documents, snapshot, nil
+}
+
+func (s *EmbeddedService) confirmSnapshot(ctx context.Context, expected Snapshot) error {
+	current, err := s.client.Snapshot(ctx)
+	if err != nil {
+		return err
+	}
+	if fromExplorerSnapshot(current) != expected {
+		return shoal.NewError(
+			shoal.ErrorConflict, "corpus changed while serving the snapshot")
+	}
+	return nil
+}
+
+func validateRequestedSnapshot(requested, current Snapshot) error {
+	if requested.ID != "" && requested.ID != current.ID {
+		return shoal.NewError(
+			shoal.ErrorConflict, "requested snapshot is no longer current")
+	}
+	if !requested.AsOf.IsZero() && !requested.AsOf.Equal(current.AsOf) {
+		return shoal.NewError(
+			shoal.ErrorConflict, "requested as_of does not match the snapshot")
+	}
+	if requested.Frontier != 0 && requested.Frontier != current.Frontier {
+		return shoal.NewError(
+			shoal.ErrorConflict, "requested frontier does not match the snapshot")
+	}
+	return nil
+}
+
+func fromExplorerSnapshot(snapshot explorer.Snapshot) Snapshot {
+	return Snapshot{
+		ID: snapshot.ID, AsOf: snapshot.AsOf, Frontier: snapshot.Frontier,
+	}
 }
 
 func normalizeLimit(limit uint32) (uint32, error) {
@@ -441,29 +332,80 @@ func decodeCursor(cursor, snapshot string) (int, error) {
 	return offset, nil
 }
 
-func deduplicateIDs(values []shoal.ID) []shoal.ID {
-	seen := make(map[shoal.ID]struct{}, len(values))
-	result := make([]shoal.ID, 0, len(values))
-	for _, value := range values {
-		if _, ok := seen[value]; ok {
-			continue
+func directedPath(
+	neighborhood explorer.Neighborhood, from, to shoal.ID, maxDepth uint32,
+) (graph.Path, error) {
+	nodes := make(map[shoal.ID]graph.Node, len(neighborhood.Nodes))
+	for _, node := range neighborhood.Nodes {
+		nodes[node.ID] = node
+	}
+	if _, ok := nodes[from]; !ok {
+		return graph.Path{}, shoal.NewError(shoal.ErrorNotFound, "path source node not found")
+	}
+	if from == to {
+		return graph.Path{Nodes: []graph.Node{nodes[from]}}, nil
+	}
+	outgoing := make(map[shoal.ID][]graph.Edge)
+	for _, edge := range neighborhood.Edges {
+		outgoing[edge.From] = append(outgoing[edge.From], edge)
+	}
+	for id := range outgoing {
+		sort.Slice(outgoing[id], func(i, j int) bool {
+			return shoal.CompareID(outgoing[id][i].ID, outgoing[id][j].ID) < 0
+		})
+	}
+	type predecessor struct {
+		from shoal.ID
+		edge graph.Edge
+	}
+	previous := make(map[shoal.ID]predecessor)
+	seen := map[shoal.ID]struct{}{from: {}}
+	frontier := []shoal.ID{from}
+	found := false
+	for level := uint32(0); level < maxDepth && len(frontier) > 0 && !found; level++ {
+		next := make([]shoal.ID, 0)
+		for _, id := range frontier {
+			for _, edge := range outgoing[id] {
+				if _, ok := seen[edge.To]; ok {
+					continue
+				}
+				seen[edge.To] = struct{}{}
+				previous[edge.To] = predecessor{from: id, edge: edge}
+				next = append(next, edge.To)
+				if edge.To == to {
+					found = true
+					break
+				}
+			}
+			if found {
+				break
+			}
 		}
-		seen[value] = struct{}{}
-		result = append(result, value)
+		frontier = next
 	}
-	return result
-}
-
-func reverseIDs(values []shoal.ID) {
-	for left, right := 0, len(values)-1; left < right; left, right = left+1, right-1 {
-		values[left], values[right] = values[right], values[left]
+	if !found {
+		return graph.Path{}, shoal.NewError(
+			shoal.ErrorNotFound, "no directed path within the server bounds")
 	}
-}
-
-func reverseEdges(values []graph.Edge) {
-	for left, right := 0, len(values)-1; left < right; left, right = left+1, right-1 {
-		values[left], values[right] = values[right], values[left]
+	nodeIDs := []shoal.ID{to}
+	pathEdges := make([]graph.Edge, 0)
+	for current := to; current != from; {
+		step := previous[current]
+		pathEdges = append(pathEdges, step.edge)
+		current = step.from
+		nodeIDs = append(nodeIDs, current)
 	}
+	for left, right := 0, len(nodeIDs)-1; left < right; left, right = left+1, right-1 {
+		nodeIDs[left], nodeIDs[right] = nodeIDs[right], nodeIDs[left]
+	}
+	for left, right := 0, len(pathEdges)-1; left < right; left, right = left+1, right-1 {
+		pathEdges[left], pathEdges[right] = pathEdges[right], pathEdges[left]
+	}
+	path := graph.Path{Edges: pathEdges, Nodes: make([]graph.Node, 0, len(nodeIDs))}
+	for _, id := range nodeIDs {
+		path.Nodes = append(path.Nodes, nodes[id])
+	}
+	return path, nil
 }
 
 var _ Service = (*EmbeddedService)(nil)

@@ -79,10 +79,11 @@ node expansion and directed path finding.
 The browser communicates only with `/api/v1/*`, a logical Explorer service
 contract. Requests and responses carry a snapshot ID and `as_of` value;
 document pages use snapshot-bound cursors, and the server enforces retrieval
-top-k plus graph depth, fanout, and node bounds. The first backend adapts the
-embedded `pkg/explorer` client, while the service boundary is independent of
-HTTP and embedded storage so a distributed backend can implement the same
-contract later.
+top-k plus graph depth, fanout, and node bounds. Opaque Shoal IDs use
+unpadded base64url on the HTTP wire so every valid ID round-trips. The first
+backend adapts the embedded `pkg/explorer` client, while the service boundary
+is independent of HTTP and embedded storage so a distributed backend can
+implement the same contract later.
 
 ### Trees, graphs, and vectors are complementary
 

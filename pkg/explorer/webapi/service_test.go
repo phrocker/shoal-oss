@@ -72,8 +72,9 @@ func TestEmbeddedServiceBoundsAndSnapshot(t *testing.T) {
 		t.Fatalf("top-k bound error = %v", err)
 	}
 	neighborhood, err := service.Neighborhood(ctx, webapi.NeighborhoodRequest{
-		Snapshot: documents.Snapshot, NodeIDs: []shoal.ID{first.Document.ID},
-		Depth: 2, Fanout: 1, MaxNodes: 2,
+		Snapshot: documents.Snapshot,
+		NodeIDs:  []shoal.ID{first.Document.ID, second.Document.ID},
+		Depth:    2, Fanout: 1, MaxNodes: 2,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -81,6 +82,13 @@ func TestEmbeddedServiceBoundsAndSnapshot(t *testing.T) {
 	if len(neighborhood.Neighborhood.Nodes) > 2 ||
 		len(neighborhood.Neighborhood.Edges) > 1 {
 		t.Fatalf("unbounded neighborhood = %+v", neighborhood)
+	}
+	nodeIDs := map[shoal.ID]bool{}
+	for _, node := range neighborhood.Neighborhood.Nodes {
+		nodeIDs[node.ID] = true
+	}
+	if !nodeIDs[first.Document.ID] || !nodeIDs[second.Document.ID] {
+		t.Fatalf("requested seeds were not reserved: %+v", neighborhood)
 	}
 	path, err := service.Path(ctx, webapi.PathRequest{
 		Snapshot: documents.Snapshot, From: first.Document.ID,
@@ -91,6 +99,69 @@ func TestEmbeddedServiceBoundsAndSnapshot(t *testing.T) {
 	}
 	if err := path.Path.Validate(); err != nil {
 		t.Fatalf("path: %v", err)
+	}
+}
+
+func TestSnapshotChangesWhenGraphChanges(t *testing.T) {
+	service, corpus, first, second := testService(t)
+	defer corpus.Close()
+	ctx := context.Background()
+	documents, err := service.Documents(ctx, webapi.DocumentsRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := corpus.Connect(ctx, graph.Edge{
+		ID: "reverse-edge", From: second.Document.ID, To: first.Document.ID,
+		Type: "references", Weight: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	_, err = service.Neighborhood(ctx, webapi.NeighborhoodRequest{
+		Snapshot: documents.Snapshot, NodeIDs: []shoal.ID{first.Document.ID},
+	})
+	if !shoal.IsErrorCode(err, shoal.ErrorConflict) {
+		t.Fatalf("stale graph snapshot error = %v", err)
+	}
+}
+
+func TestHTTPIDsAreBinarySafeAndReversible(t *testing.T) {
+	rawID := shoal.ID([]byte{0xff, 0x00, 'x'})
+	encoded, err := json.Marshal(webapi.NeighborhoodResponse{
+		Neighborhood: explorer.Neighborhood{
+			Nodes: []graph.Node{{ID: rawID, Kind: "binary"}},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(encoded, []byte("\ufffd")) {
+		t.Fatalf("JSON replaced opaque ID bytes: %s", encoded)
+	}
+	var wire struct {
+		Neighborhood struct {
+			Nodes []struct {
+				ID string `json:"id"`
+			} `json:"nodes"`
+		} `json:"neighborhood"`
+	}
+	if err := json.Unmarshal(encoded, &wire); err != nil {
+		t.Fatal(err)
+	}
+	requestJSON, err := json.Marshal(map[string]any{
+		"node_ids":  []string{wire.Neighborhood.Nodes[0].ID},
+		"depth":     1,
+		"fanout":    1,
+		"max_nodes": 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var request webapi.NeighborhoodRequest
+	if err := json.Unmarshal(requestJSON, &request); err != nil {
+		t.Fatal(err)
+	}
+	if len(request.NodeIDs) != 1 || request.NodeIDs[0] != rawID {
+		t.Fatalf("ID round trip = %q", request.NodeIDs)
 	}
 }
 
@@ -116,7 +187,20 @@ func TestEvidenceSerializationPreservesCitationAndExplanation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var decoded webapi.RetrievalResponse
+	var decoded struct {
+		Retrieval struct {
+			Results []struct {
+				ID       string `json:"id"`
+				Evidence []struct {
+					Quote    string `json:"quote"`
+					Citation struct {
+						DocumentID string `json:"document_id"`
+					} `json:"citation"`
+				} `json:"evidence"`
+				Explanation json.RawMessage `json:"explanation"`
+			} `json:"results"`
+		} `json:"retrieval"`
+	}
 	if err := json.Unmarshal(encoded, &decoded); err != nil {
 		t.Fatal(err)
 	}
@@ -126,7 +210,7 @@ func TestEvidenceSerializationPreservesCitationAndExplanation(t *testing.T) {
 	}
 	evidence := decoded.Retrieval.Results[0].Evidence[0]
 	if evidence.Quote == "" || evidence.Citation.DocumentID == "" ||
-		decoded.Retrieval.Results[0].Explanation == nil {
+		len(decoded.Retrieval.Results[0].Explanation) == 0 {
 		t.Fatalf("lost evidence fields: %+v", decoded)
 	}
 }

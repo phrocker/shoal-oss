@@ -41,7 +41,13 @@ type Explorer struct {
 	mu                      sync.RWMutex
 	engine                  *engine.Engine
 	documents               map[shoal.ID]map[shoal.ID]*persistedDocument
-	edges                   map[shoal.ID]graph.Edge
+	edges                   map[shoal.ID]persistedEdge
+	graphNodes              map[shoal.ID]graph.Node
+	graphEdges              map[shoal.ID]graph.Edge
+	adjacency               map[shoal.ID][]shoal.ID
+	graphErr                error
+	snapshot                Snapshot
+	openedAt                time.Time
 	lastPublicationSequence uint64
 	closed                  bool
 }
@@ -55,10 +61,12 @@ type persistedDocument struct {
 	Nodes               []graph.Node
 	Edges               []graph.Edge
 	PublicationSequence uint64 `json:"publication_sequence,omitempty"`
+	PublishedAt         time.Time
 }
 
 type persistedEdge struct {
-	Edge graph.Edge
+	Edge        graph.Edge
+	PublishedAt time.Time
 }
 
 // Open opens or creates a local Explorer corpus rooted at dir.
@@ -86,9 +94,14 @@ func Open(dir string) (*Explorer, error) {
 	explorer := &Explorer{
 		engine:    eng,
 		documents: make(map[shoal.ID]map[shoal.ID]*persistedDocument),
-		edges:     make(map[shoal.ID]graph.Edge),
+		edges:     make(map[shoal.ID]persistedEdge),
+		openedAt:  time.Now().UTC(),
 	}
 	if err := explorer.load(); err != nil {
+		_ = eng.Close()
+		return nil, err
+	}
+	if err := explorer.rebuildCurrentGraph(); err != nil {
 		_ = eng.Close()
 		return nil, err
 	}
@@ -137,13 +150,14 @@ func (e *Explorer) ingest(
 		return IngestResult{}, err
 	}
 	record := &persistedDocument{
-		Document: parsed.document,
-		Revision: parsed.revision,
-		Source:   parsed.source,
-		Sections: parsed.sections,
-		Spans:    parsed.spans,
-		Nodes:    parsed.nodes,
-		Edges:    parsed.edges,
+		Document:    parsed.document,
+		Revision:    parsed.revision,
+		Source:      parsed.source,
+		Sections:    parsed.sections,
+		Spans:       parsed.spans,
+		Nodes:       parsed.nodes,
+		Edges:       parsed.edges,
+		PublishedAt: time.Now().UTC(),
 	}
 
 	e.mu.Lock()
@@ -175,6 +189,9 @@ func (e *Explorer) ingest(
 		e.documents[record.Document.ID] = make(map[shoal.ID]*persistedDocument)
 	}
 	e.documents[record.Document.ID][record.Revision.ID] = record
+	if err := e.rebuildCurrentGraphLocked(); err != nil {
+		return IngestResult{}, err
+	}
 	return ingestResult(record, IngestApplied), nil
 }
 
@@ -278,28 +295,31 @@ func (e *Explorer) Connect(ctx context.Context, edge graph.Edge) error {
 	if err := e.requireOpen(); err != nil {
 		return err
 	}
-	nodes, allEdges, err := e.currentGraph()
-	if err != nil {
-		return err
-	}
-	if _, ok := nodes[edge.From]; !ok {
+	if _, ok := e.graphNodes[edge.From]; !ok {
 		return shoal.NewError(shoal.ErrorNotFound, "edge source node not found")
 	}
-	if _, ok := nodes[edge.To]; !ok {
+	if _, ok := e.graphNodes[edge.To]; !ok {
 		return shoal.NewError(shoal.ErrorNotFound, "edge target node not found")
 	}
-	if existing, ok := allEdges[edge.ID]; ok {
+	if existing, ok := e.graphEdges[edge.ID]; ok {
 		if edgesEqual(existing, edge) {
 			return nil
 		}
 		return shoal.NewError(shoal.ErrorConflict, "edge ID already has different content")
 	}
-	if err := e.writeRecord(
-		edgeRecordRow(edge.ID), embeddedRecordEdge, persistedEdge{Edge: edge},
-	); err != nil {
+	record := persistedEdge{Edge: edge, PublishedAt: time.Now().UTC()}
+	if err := e.writeRecord(edgeRecordRow(edge.ID), embeddedRecordEdge, record); err != nil {
 		return err
 	}
-	e.edges[edge.ID] = cloneEdge(edge)
+	e.edges[edge.ID] = record
+	e.graphEdges[edge.ID] = cloneEdge(edge)
+	for _, id := range []shoal.ID{edge.From, edge.To} {
+		e.adjacency[id] = append(e.adjacency[id], edge.ID)
+		sort.Slice(e.adjacency[id], func(i, j int) bool {
+			return shoal.CompareID(e.adjacency[id][i], e.adjacency[id][j]) < 0
+		})
+	}
+	e.refreshSnapshotLocked()
 	return nil
 }
 
@@ -325,10 +345,10 @@ func (e *Explorer) Neighborhood(
 	if err := e.requireOpen(); err != nil {
 		return Neighborhood{}, err
 	}
-	nodes, edges, err := e.currentGraph()
-	if err != nil {
-		return Neighborhood{}, err
+	if e.graphErr != nil {
+		return Neighborhood{}, e.graphErr
 	}
+	nodes, edges := e.graphNodes, e.graphEdges
 	seen := make(map[shoal.ID]struct{})
 	frontier := make(map[shoal.ID]struct{})
 	for _, id := range request.NodeIDs {
@@ -388,7 +408,7 @@ func (e *Explorer) requireOpen() error {
 	return nil
 }
 
-func (e *Explorer) currentGraph() (
+func (e *Explorer) computeCurrentGraph() (
 	map[shoal.ID]graph.Node,
 	map[shoal.ID]graph.Edge,
 	error,
@@ -410,7 +430,8 @@ func (e *Explorer) currentGraph() (
 			edges[edge.ID] = edge
 		}
 	}
-	for id, edge := range e.edges {
+	for id, record := range e.edges {
+		edge := record.Edge
 		if _, from := nodes[edge.From]; !from {
 			continue
 		}
@@ -420,6 +441,40 @@ func (e *Explorer) currentGraph() (
 		edges[id] = edge
 	}
 	return nodes, edges, nil
+}
+
+func (e *Explorer) rebuildCurrentGraph() error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.rebuildCurrentGraphLocked()
+}
+
+func (e *Explorer) rebuildCurrentGraphLocked() error {
+	nodes, edges, err := e.computeCurrentGraph()
+	if err != nil {
+		e.graphNodes = make(map[shoal.ID]graph.Node)
+		e.graphEdges = make(map[shoal.ID]graph.Edge)
+		e.adjacency = make(map[shoal.ID][]shoal.ID)
+		e.graphErr = err
+		e.refreshSnapshotLocked()
+		return nil
+	}
+	adjacency := make(map[shoal.ID][]shoal.ID, len(nodes))
+	for id, edge := range edges {
+		adjacency[edge.From] = append(adjacency[edge.From], id)
+		if edge.To != edge.From {
+			adjacency[edge.To] = append(adjacency[edge.To], id)
+		}
+	}
+	for id := range adjacency {
+		sort.Slice(adjacency[id], func(i, j int) bool {
+			return shoal.CompareID(adjacency[id][i], adjacency[id][j]) < 0
+		})
+	}
+	e.graphNodes, e.graphEdges, e.adjacency = nodes, edges, adjacency
+	e.graphErr = nil
+	e.refreshSnapshotLocked()
+	return nil
 }
 
 func latestRevision(
@@ -628,3 +683,4 @@ func contextError(ctx context.Context) error {
 }
 
 var _ Client = (*Explorer)(nil)
+var _ BoundedClient = (*Explorer)(nil)

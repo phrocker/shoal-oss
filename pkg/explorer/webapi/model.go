@@ -42,8 +42,9 @@ const (
 
 // Snapshot pins every workspace request to one logical corpus view.
 type Snapshot struct {
-	ID   string    `json:"id"`
-	AsOf time.Time `json:"as_of"`
+	ID       string    `json:"id"`
+	AsOf     time.Time `json:"as_of"`
+	Frontier uint64    `json:"frontier"`
 }
 
 // PageRequest carries bounded cursor pagination.

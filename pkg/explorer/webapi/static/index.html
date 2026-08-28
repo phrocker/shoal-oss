@@ -9,7 +9,7 @@
 <body>
   <header>
     <div><strong>Shoal Explorer</strong><span id="snapshot">loading snapshot…</span></div>
-    <form id="search"><input id="query" required placeholder="Retrieve cited evidence…" autocomplete="off"><button>Search</button></form>
+    <form id="search"><label class="sr-only" for="query">Retrieval query</label><input id="query" required placeholder="Retrieve cited evidence…" autocomplete="off"><button>Search</button></form>
   </header>
   <main>
     <aside class="left">
@@ -22,11 +22,14 @@
       <div id="graph" class="panel">
         <div class="graph-tools">
           <button id="expand" disabled>Expand selected</button>
+          <label class="sr-only" for="path-from">Path source node ID</label>
           <input id="path-from" placeholder="Path from node ID">
+          <label class="sr-only" for="path-to">Path target node ID</label>
           <input id="path-to" placeholder="Path to node ID">
           <button id="find-path">Find path</button>
         </div>
-        <canvas id="canvas"></canvas>
+        <canvas id="canvas" aria-hidden="true"></canvas>
+        <div id="graph-list" aria-label="Graph nodes and edges"></div>
       </div>
     </section>
     <aside class="right"><h2>Selection</h2><div id="selection" class="muted">Select evidence, a hierarchy section, or a graph node.</div></aside>

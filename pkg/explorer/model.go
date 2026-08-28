@@ -156,6 +156,39 @@ type Neighborhood struct {
 	Edges []graph.Edge
 }
 
+// Snapshot identifies one immutable logical corpus frontier.
+type Snapshot struct {
+	ID       string
+	AsOf     time.Time
+	Frontier uint64
+}
+
+// BoundedNeighborhoodRequest limits graph work as well as returned data.
+// Fanout caps adjacency entries examined per expanded node.
+type BoundedNeighborhoodRequest struct {
+	NodeIDs   []shoal.ID
+	Depth     uint32
+	Fanout    uint32
+	MaxNodes  uint32
+	EdgeTypes []string
+}
+
+// BoundedNeighborhood reports whether a server bound stopped expansion.
+type BoundedNeighborhood struct {
+	Neighborhood Neighborhood
+	Truncated    bool
+}
+
+// BoundedClient is the backend boundary required by scalable Explorer
+// transports. Bounds are enforced before graph materialization.
+type BoundedClient interface {
+	Client
+	Snapshot(context.Context) (Snapshot, error)
+	BoundedNeighborhood(
+		context.Context, BoundedNeighborhoodRequest,
+	) (BoundedNeighborhood, error)
+}
+
 // Client is the product-facing Explorer contract. Implementations can be
 // embedded or remote without changing document, graph, or retrieval values.
 type Client interface {
