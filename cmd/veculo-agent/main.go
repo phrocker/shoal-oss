@@ -5,11 +5,13 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"strings"
 	"time"
 
 	"github.com/phrocker/shoal-oss/internal/agentmem"
+	modelio "github.com/phrocker/shoal-oss/pkg/model"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )
@@ -20,9 +22,9 @@ func main() {
 	text := flag.String("text", "", "text for ingest/query; stdin is used when empty")
 	embedderName := flag.String("embedder", "fake", "embedder adapter: fake or ollama")
 	llmName := flag.String("llm", "fake", "LLM adapter: fake or ollama")
-	ollamaHost := flag.String("ollama-host", agentmem.DefaultOllamaHost, "Ollama HTTP host")
-	embedModel := flag.String("embed-model", agentmem.DefaultOllamaEmbedModel, "Ollama embedding model")
-	llmModel := flag.String("llm-model", agentmem.DefaultOllamaLLMModel, "Ollama LLM model")
+	ollamaHost := flag.String("ollama-host", modelio.DefaultOllamaBaseURL, "Ollama HTTP host")
+	embedModel := flag.String("embed-model", modelio.DefaultOllamaEmbedModel, "Ollama embedding model")
+	llmModel := flag.String("llm-model", modelio.DefaultOllamaGenerateModel, "Ollama LLM model")
 	flag.Parse()
 	if flag.NArg() < 1 {
 		usage()
@@ -35,19 +37,8 @@ func main() {
 	}
 	defer conn.Close()
 	cfg := agentmem.Config{Table: *table, Store: agentmem.NewGRPCStore(conn)}
-	switch strings.ToLower(strings.TrimSpace(*embedderName)) {
-	case "", "fake":
-	case "ollama":
-		cfg.Embedder = agentmem.NewOllamaEmbedder(agentmem.WithOllamaHost(*ollamaHost), agentmem.WithOllamaModel(*embedModel))
-	default:
-		fatal(fmt.Errorf("unknown embedder %q (want fake or ollama)", *embedderName))
-	}
-	switch strings.ToLower(strings.TrimSpace(*llmName)) {
-	case "", "fake":
-	case "ollama":
-		cfg.LLM = agentmem.NewOllamaLLM(agentmem.WithOllamaHost(*ollamaHost), agentmem.WithOllamaModel(*llmModel))
-	default:
-		fatal(fmt.Errorf("unknown llm %q (want fake or ollama)", *llmName))
+	if err := configureProviders(&cfg, *embedderName, *llmName, *ollamaHost, *embedModel, *llmModel, nil); err != nil {
+		fatal(err)
 	}
 	client, err := agentmem.New(cfg)
 	if err != nil {
@@ -80,6 +71,36 @@ func main() {
 		usage()
 		os.Exit(2)
 	}
+}
+
+func configureProviders(cfg *agentmem.Config, embedderName, llmName, host, embedModel, llmModel string, httpClient *http.Client) error {
+	switch strings.ToLower(strings.TrimSpace(embedderName)) {
+	case "", "fake":
+	case "ollama":
+		embedder, err := modelio.NewOllamaEmbedder(modelio.OllamaConfig{
+			BaseURL: host, Model: embedModel, HTTPClient: httpClient,
+		})
+		if err != nil {
+			return err
+		}
+		cfg.Embedder = agentmem.AdaptEmbedder(embedder)
+	default:
+		return fmt.Errorf("unknown embedder %q (want fake or ollama)", embedderName)
+	}
+	switch strings.ToLower(strings.TrimSpace(llmName)) {
+	case "", "fake":
+	case "ollama":
+		generator, err := modelio.NewOllamaGenerator(modelio.OllamaConfig{
+			BaseURL: host, Model: llmModel, HTTPClient: httpClient,
+		})
+		if err != nil {
+			return err
+		}
+		cfg.LLM = agentmem.AdaptTextGenerator(generator)
+	default:
+		return fmt.Errorf("unknown llm %q (want fake or ollama)", llmName)
+	}
+	return nil
 }
 
 func input(flagText string) string {

@@ -43,6 +43,7 @@ operational contracts remain in the linked runbooks and ADRs.
 | Exact vector search | Shipped |
 | Distributed IVF-PQ lifecycle, tombstones, freshness, and recall contracts | Shipped |
 | Local RFile, local Parquet, mixed, and Accumulo-backed corpus parity | Shipped |
+| Provider-neutral model I/O with deterministic fake and bounded Ollama adapters | Shipped |
 
 ## Accumulo replacement roles
 

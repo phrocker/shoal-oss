@@ -2,7 +2,6 @@ package agentmem
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
 	"math"
@@ -12,34 +11,26 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	modelio "github.com/phrocker/shoal-oss/pkg/model"
 )
 
 type FakeEmbedder struct{ Dim int }
 
-func (f FakeEmbedder) Embed(_ context.Context, text string) ([]float32, error) {
+func (f FakeEmbedder) Embed(ctx context.Context, text string) ([]float32, error) {
 	dim := f.Dim
 	if dim <= 0 {
 		dim = DefaultDim
 	}
-	vec := make([]float32, dim)
-	for i := 0; i < dim; i++ {
-		h := sha256.Sum256([]byte(fmt.Sprintf("%d:%s", i, strings.ToLower(text))))
-		bits := binary.BigEndian.Uint32(h[:4])
-		vec[i] = (float32(bits%2000000)/1000000.0 - 1.0)
-	}
-	normalize(vec)
-	return vec, nil
+	result, err := (modelio.FakeEmbedder{Dimensions: dim}).Embed(ctx, modelio.EmbedRequest{Text: text})
+	return result.Vector, err
 }
 
 type FakeLLM struct{}
 
-func (FakeLLM) Infer(_ context.Context, prompt string) (string, error) {
-	p := strings.ToLower(prompt)
-	parts := []string{"causal"}
-	if strings.Contains(p, "entity") || strings.Contains(p, "user") || strings.Contains(p, "project") {
-		parts = append(parts, "entity")
-	}
-	return strings.Join(parts, ","), nil
+func (FakeLLM) Infer(ctx context.Context, prompt string) (string, error) {
+	result, err := (modelio.FakeGenerator{}).Generate(ctx, modelio.GenerateRequest{Prompt: prompt})
+	return result.Text, err
 }
 
 type RuleClassifier struct{}

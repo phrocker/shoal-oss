@@ -99,7 +99,7 @@ func TestOllamaNonOKError(t *testing.T) {
 		t.Fatal("expected error")
 	}
 	msg := err.Error()
-	if !strings.Contains(msg, "500 Internal Server Error") || !strings.Contains(msg, "boom") {
-		t.Fatalf("error = %q, want status and body snippet", msg)
+	if !strings.Contains(msg, "status 500") || strings.Contains(msg, "boom") {
+		t.Fatalf("error = %q, want status and redacted body metadata", msg)
 	}
 }
