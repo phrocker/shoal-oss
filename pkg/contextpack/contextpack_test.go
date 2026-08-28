@@ -240,11 +240,15 @@ func TestOpenSectionAndExpandNeighborsAreExplicitBoundedAndImmutable(t *testing.
 
 func TestContextByteLimitIncludesPinsAndCanonicalFraming(t *testing.T) {
 	client, request, response, pins := embeddedFixture(t)
+	request.Text = "  exact   context  "
 	pack, err := (Builder{Reader: client}).Build(context.Background(), InitialRequest{
 		Request: request, Response: response, Pins: pins,
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+	if pack.Query() != "exact context" {
+		t.Fatalf("normalized query = %q", pack.Query())
 	}
 	size, _, _, _, err := contextPackByteSize(
 		pack.Query(), pack.Evidence(), pins, pack.Metadata(), DefaultMaxPathNodes)
@@ -256,6 +260,13 @@ func TestContextByteLimitIncludesPinsAndCanonicalFraming(t *testing.T) {
 		mustLimits(t, Limits{MaxContextBytes: size}),
 	); err != nil {
 		t.Fatalf("exact context byte limit rejected: %v", err)
+	}
+	if _, err := (Builder{
+		Reader: client, Limits: Limits{MaxContextBytes: size},
+	}).Build(context.Background(), InitialRequest{
+		Request: request, Response: response, Pins: pins,
+	}); err != nil {
+		t.Fatalf("normalized query rejected at exact context byte limit: %v", err)
 	}
 	if err := enforcePackBounds(
 		pack.Query(), pack.Evidence(), pins, pack.Metadata(),
@@ -407,6 +418,16 @@ func TestHydratedDuplicatesRequireExactContentAndRequestedIdentity(t *testing.T)
 	_, err = (Builder{Reader: client}).Build(context.Background(), InitialRequest{
 		Request: request, Response: response, Pins: pins,
 		Documents: []explorer.DocumentView{view, conflict},
+	})
+	assertCode(t, err, shoal.ErrorInvalidArgument)
+
+	opaqueLeft := cloneView(view)
+	opaqueLeft.Document.Metadata = shoal.Metadata{"opaque": "\xff"}
+	opaqueRight := cloneView(view)
+	opaqueRight.Document.Metadata = shoal.Metadata{"opaque": "\xfe"}
+	_, err = (Builder{Reader: client}).Build(context.Background(), InitialRequest{
+		Request: request, Response: response, Pins: pins,
+		Documents: []explorer.DocumentView{opaqueLeft, opaqueRight},
 	})
 	assertCode(t, err, shoal.ErrorInvalidArgument)
 

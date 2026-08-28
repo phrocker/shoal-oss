@@ -23,15 +23,14 @@
 package contextpack
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"hash"
 	"math"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -756,16 +755,30 @@ func (d *documentIndex) selectSections(
 		}
 	}
 	for level := uint32(0); len(frontier) > 0 && level <= depth; level++ {
-		next := make([]shoal.ID, 0)
+		nextSet := make(map[shoal.ID]struct{})
 		for _, id := range frontier {
+			if _, exists := selected[id]; exists {
+				continue
+			}
 			selected[id] = struct{}{}
 			if level < depth {
-				next = append(next, d.children[id]...)
+				for _, child := range d.children[id] {
+					if _, exists := selected[child]; !exists {
+						nextSet[child] = struct{}{}
+					}
+				}
 			}
 		}
-		if len(selected)+len(next) > limits.MaxSections {
+		if len(selected)+len(nextSet) > limits.MaxSections {
 			return nil, invalid("section expansion exceeds the section bound")
 		}
+		next := make([]shoal.ID, 0, len(nextSet))
+		for id := range nextSet {
+			next = append(next, id)
+		}
+		sort.Slice(next, func(i, j int) bool {
+			return shoal.CompareID(next[i], next[j]) < 0
+		})
 		frontier = next
 	}
 	result := make([]shoal.ID, 0, len(selected))
@@ -901,11 +914,12 @@ func buildPack(
 	metadata shoal.Metadata,
 	limits Limits,
 ) (inference.ContextPack, error) {
-	if err := enforcePackBounds(query, anchors, pins, metadata, limits); err != nil {
+	normalizedQuery := strings.Join(strings.Fields(query), " ")
+	if err := enforcePackBounds(normalizedQuery, anchors, pins, metadata, limits); err != nil {
 		return inference.ContextPack{}, err
 	}
 	return inference.NewContextPack(
-		query, anchors, pins.Ontology, pins.Snapshot, pins.Authorization, metadata)
+		normalizedQuery, anchors, pins.Ontology, pins.Snapshot, pins.Authorization, metadata)
 }
 
 func rebuildPack(
@@ -1145,10 +1159,23 @@ func cloneExplanation(explanation *retrieval.Explanation) *retrieval.Explanation
 }
 
 func cloneView(view explorer.DocumentView) explorer.DocumentView {
-	encoded, _ := json.Marshal(view)
-	var cloned explorer.DocumentView
-	_ = json.Unmarshal(encoded, &cloned)
-	return cloned
+	view.Document.Metadata = cloneMetadata(view.Document.Metadata)
+	view.Revision.Metadata = cloneMetadata(view.Revision.Metadata)
+	view.Root = cloneSectionView(view.Root)
+	return view
+}
+
+func cloneSectionView(view explorer.SectionView) explorer.SectionView {
+	view.Section.Metadata = cloneMetadata(view.Section.Metadata)
+	view.Spans = append([]document.Span(nil), view.Spans...)
+	for index := range view.Spans {
+		view.Spans[index].Metadata = cloneMetadata(view.Spans[index].Metadata)
+	}
+	view.Children = append([]explorer.SectionView(nil), view.Children...)
+	for index := range view.Children {
+		view.Children[index] = cloneSectionView(view.Children[index])
+	}
+	return view
 }
 
 func cloneNode(node graph.Node) graph.Node {
@@ -1199,9 +1226,7 @@ func sortedEdges(edges []graph.Edge) []graph.Edge {
 }
 
 func canonicalEqual(left, right any) bool {
-	leftBytes, leftErr := json.Marshal(left)
-	rightBytes, rightErr := json.Marshal(right)
-	return leftErr == nil && rightErr == nil && bytes.Equal(leftBytes, rightBytes)
+	return reflect.DeepEqual(left, right)
 }
 
 func metadataBytes(metadata shoal.Metadata) int {
