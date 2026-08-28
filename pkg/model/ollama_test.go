@@ -153,6 +153,32 @@ func TestOllamaCancellationAndTimeouts(t *testing.T) {
 	}
 }
 
+func TestOllamaBodyReadTimeouts(t *testing.T) {
+	for _, status := range []int{http.StatusOK, http.StatusInternalServerError} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			release := make(chan struct{})
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(status)
+				w.(http.Flusher).Flush()
+				<-release
+			}))
+			defer func() {
+				close(release)
+				server.Close()
+			}()
+			generator, err := NewOllamaGenerator(OllamaConfig{
+				BaseURL: server.URL, Model: "model", HTTPClient: server.Client(), Timeout: 10 * time.Millisecond,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := generator.Generate(context.Background(), GenerateRequest{}); !errors.Is(err, ErrTimeout) {
+				t.Fatalf("body timeout error = %v", err)
+			}
+		})
+	}
+}
+
 func TestOllamaResponseValidationAndRedaction(t *testing.T) {
 	tests := []struct {
 		name   string

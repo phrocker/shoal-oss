@@ -249,7 +249,10 @@ func ollamaPost(ctx context.Context, cfg OllamaConfig, endpoint, op string, payl
 	}
 	defer response.Body.Close()
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		snippet, truncated := readSnippet(response.Body, cfg.ErrorSnippetBytes)
+		snippet, truncated, err := readSnippet(response.Body, cfg.ErrorSnippetBytes)
+		if err != nil {
+			return classifyTransportError(ctx, callCtx, op, err)
+		}
 		detail := fmt.Sprintf("response body redacted (%d bytes", len(snippet))
 		if truncated {
 			detail += "+"
@@ -260,7 +263,7 @@ func ollamaPost(ctx context.Context, cfg OllamaConfig, endpoint, op string, payl
 	limited := &io.LimitedReader{R: response.Body, N: cfg.MaxResponseBytes + 1}
 	data, err := io.ReadAll(limited)
 	if err != nil {
-		return &Error{Kind: ErrUnavailable, Operation: op}
+		return classifyTransportError(ctx, callCtx, op, err)
 	}
 	if int64(len(data)) > cfg.MaxResponseBytes {
 		return &Error{Kind: ErrOversizedResponse, Operation: op}
@@ -276,12 +279,15 @@ func ollamaPost(ctx context.Context, cfg OllamaConfig, endpoint, op string, payl
 	return nil
 }
 
-func readSnippet(r io.Reader, limit int64) ([]byte, bool) {
-	data, _ := io.ReadAll(io.LimitReader(r, limit+1))
-	if int64(len(data)) > limit {
-		return data[:limit], true
+func readSnippet(r io.Reader, limit int64) ([]byte, bool, error) {
+	data, err := io.ReadAll(io.LimitReader(r, limit+1))
+	if err != nil {
+		return nil, false, err
 	}
-	return data, false
+	if int64(len(data)) > limit {
+		return data[:limit], true, nil
+	}
+	return data, false, nil
 }
 
 func contextError(op string, err error) error {
@@ -294,6 +300,16 @@ func contextError(op string, err error) error {
 func isTimeout(err error) bool {
 	var netErr net.Error
 	return errors.As(err, &netErr) && netErr.Timeout()
+}
+
+func classifyTransportError(ctx, callCtx context.Context, op string, err error) error {
+	if ctx.Err() != nil {
+		return contextError(op, ctx.Err())
+	}
+	if callCtx.Err() != nil || isTimeout(err) {
+		return &Error{Kind: ErrTimeout, Operation: op}
+	}
+	return &Error{Kind: ErrUnavailable, Operation: op}
 }
 
 func isLoopbackHost(host string) bool {
