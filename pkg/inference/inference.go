@@ -498,13 +498,17 @@ func (p ModelProvenance) clone() ModelProvenance {
 // PromptProvenance identifies the bounded prompt template used for generation.
 // Prompt text is deliberately absent.
 type PromptProvenance struct {
-	template string
-	version  string
-	hash     string
+	templateID string
+	version    string
+	hash       string
 }
 
-func NewPromptProvenance(template, version, hash string) (PromptProvenance, error) {
-	provenance := PromptProvenance{template: template, version: version, hash: hash}
+func NewPromptProvenance(templateID, version, hash string) (PromptProvenance, error) {
+	provenance := PromptProvenance{
+		templateID: templateID,
+		version:    version,
+		hash:       hash,
+	}
 	if err := provenance.Validate(); err != nil {
 		return PromptProvenance{}, err
 	}
@@ -513,8 +517,8 @@ func NewPromptProvenance(template, version, hash string) (PromptProvenance, erro
 
 func (p PromptProvenance) Validate() error {
 	for name, value := range map[string]string{
-		"prompt template": p.template,
-		"prompt version":  p.version,
+		"prompt template ID": p.templateID,
+		"prompt version":     p.version,
 	} {
 		if err := validateRequiredString(name, value, shoal.MaxSemanticStringBytes); err != nil {
 			return err
@@ -523,9 +527,9 @@ func (p PromptProvenance) Validate() error {
 	return validateSHA256("prompt hash", p.hash)
 }
 
-func (p PromptProvenance) Template() string { return p.template }
-func (p PromptProvenance) Version() string  { return p.version }
-func (p PromptProvenance) Hash() string     { return p.hash }
+func (p PromptProvenance) TemplateID() string { return p.templateID }
+func (p PromptProvenance) Version() string    { return p.version }
+func (p PromptProvenance) Hash() string       { return p.hash }
 
 // ClaimStatus distinguishes source-observed claims from generated inferences.
 type ClaimStatus string

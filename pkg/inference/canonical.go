@@ -160,7 +160,7 @@ func canonicalModel(model ModelProvenance) string {
 }
 
 func canonicalPrompt(prompt PromptProvenance) string {
-	return canonicalParts(prompt.template, prompt.version, prompt.hash)
+	return canonicalParts(prompt.templateID, prompt.version, prompt.hash)
 }
 
 func validateCitation(citation document.Citation) error {
