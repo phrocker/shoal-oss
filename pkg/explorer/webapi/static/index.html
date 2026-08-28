@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Shoal Explorer</title>
+  <link rel="stylesheet" href="/assets/style.css">
+</head>
+<body>
+  <header>
+    <div><strong>Shoal Explorer</strong><span id="snapshot">loading snapshot…</span></div>
+    <form id="search"><input id="query" required placeholder="Retrieve cited evidence…" autocomplete="off"><button>Search</button></form>
+  </header>
+  <main>
+    <aside class="left">
+      <section><h2>Corpus</h2><div id="documents"></div><button id="more" hidden>More documents</button></section>
+      <section><h2>Hierarchy</h2><div id="hierarchy" class="tree muted">Select a document.</div></section>
+    </aside>
+    <section class="center">
+      <div class="tabs"><button class="tab active" data-panel="evidence">Evidence</button><button class="tab" data-panel="graph">Graph</button></div>
+      <div id="evidence" class="panel active"><p class="muted">Run a retrieval query to inspect exact evidence and explanations.</p></div>
+      <div id="graph" class="panel">
+        <div class="graph-tools">
+          <button id="expand" disabled>Expand selected</button>
+          <input id="path-from" placeholder="Path from node ID">
+          <input id="path-to" placeholder="Path to node ID">
+          <button id="find-path">Find path</button>
+        </div>
+        <canvas id="canvas"></canvas>
+      </div>
+    </section>
+    <aside class="right"><h2>Selection</h2><div id="selection" class="muted">Select evidence, a hierarchy section, or a graph node.</div></aside>
+  </main>
+  <script src="/assets/app.js"></script>
+</body>
+</html>

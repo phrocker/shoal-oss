@@ -60,6 +60,30 @@ it never silently substitutes a different retrieval plan. PDF, source-code,
 embedding, and remote adapters can use the same public contracts while
 remaining separate from the product workflow.
 
+### Optional local web workspace
+
+The separate `shoal-explore-web` binary serves an evidence-first workspace
+over an existing embedded Explorer corpus:
+
+```bash
+go run ./cmd/shoal-explore-web \
+  -data .shoal/explorer \
+  -listen 127.0.0.1:8080
+```
+
+Open <http://127.0.0.1:8080>. The workspace lists and pages documents,
+preserves the authored hierarchy, retrieves exact revision/span citations and
+score explanations, and provides an interactive bounded graph canvas with
+node expansion and directed path finding.
+
+The browser communicates only with `/api/v1/*`, a logical Explorer service
+contract. Requests and responses carry a snapshot ID and `as_of` value;
+document pages use snapshot-bound cursors, and the server enforces retrieval
+top-k plus graph depth, fanout, and node bounds. The first backend adapts the
+embedded `pkg/explorer` client, while the service boundary is independent of
+HTTP and embedded storage so a distributed backend can implement the same
+contract later.
+
 ### Trees, graphs, and vectors are complementary
 
 A document tree is an excellent way to preserve a source's authored
