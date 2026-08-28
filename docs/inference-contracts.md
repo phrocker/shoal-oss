@@ -2,8 +2,8 @@
 
 `pkg/inference` is Shoal's public boundary for grounded generation. It is
 independent of storage engines, RPC schemas, model vendors, and provider SDKs.
-Runtime LLM orchestration and low-level text or embedding provider transports
-are not implemented by this package.
+`pkg/inference/harness` implements a bounded adapter for trusted tool-using
+agent runtimes. Low-level text and embedding transports remain separate.
 
 ## Contract
 
@@ -34,6 +34,31 @@ its quote against retained canonical source with
 `document.ValidateCitationQuote`. They also remain responsible for executing a
 model, enforcing authorization at retrieval time, and implementing the
 `Generator` interface.
+
+## Tool-using agent harness
+
+The harness exposes typed `retrieve`, `open_section`, `neighbors`, and `stop`
+actions only. It validates logical IDs, correlation, canonical tool results,
+snapshot and authorization pins, evidence additions, final claim anchors,
+steps, elapsed time, observable token usage, graph hops/fan-out, repetition,
+and cancellation. Unknown actions and mismatched or stale results fail closed.
+
+`Runner` and `Session` are provider-neutral boundaries. `FakeRunner` supplies
+deterministic scripted actions and faults for tests. Evaluation records contain
+provenance, budgets, action kinds, and token usage only; they exclude prompts,
+correlation IDs, tool inputs/results, credentials, raw authorization grants,
+URLs, storage coordinates, shell, and filesystem access.
+
+The harness implements `inference.Generator`. Its returned result remains
+bound to the supplied context pack and carries canonically verified evidence
+additions, so `InferenceResult.ValidateFor` succeeds for the caller's original
+pack. `Run` additionally returns a `Record` with the exact expanded context and
+full in-memory transcript. Callers must not log that record; only the optional
+`Recorder` receives the separate redacted `EvaluationRecord`.
+
+No Copilot, SDK-process, or other hosted execution backend is bundled yet. A
+future backend can implement `Runner` without changing inference contracts;
+the package deliberately includes no arbitrary subprocess runner.
 
 ## Explorer context construction
 

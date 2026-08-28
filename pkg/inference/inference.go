@@ -947,6 +947,7 @@ func preflightIssue(
 type InferenceResult struct {
 	id            shoal.ID
 	contextPackID shoal.ID
+	additions     []EvidenceAnchor
 	claims        []Claim
 	issues        []Issue
 	generatedAt   time.Time
@@ -960,8 +961,42 @@ func NewInferenceResult(
 	generatedAt time.Time,
 	metadata shoal.Metadata,
 ) (InferenceResult, error) {
+	return NewExtendedInferenceResult(pack, nil, claims, issues, generatedAt, metadata)
+}
+
+// NewExtendedInferenceResult binds outcomes to the supplied context pack plus
+// verified evidence additions while retaining the caller's original context
+// identity.
+func NewExtendedInferenceResult(
+	pack ContextPack,
+	additions []EvidenceAnchor,
+	claims []Claim,
+	issues []Issue,
+	generatedAt time.Time,
+	metadata shoal.Metadata,
+) (InferenceResult, error) {
 	if err := pack.Validate(); err != nil {
 		return InferenceResult{}, err
+	}
+	if len(additions) > MaxEvidenceAnchors || len(pack.evidence)+len(additions) > MaxEvidenceAnchors {
+		return InferenceResult{}, invalid("inference result has too many evidence additions")
+	}
+	normalizedAdditions := cloneAnchors(additions)
+	sort.Slice(normalizedAdditions, func(i, j int) bool {
+		return shoal.CompareID(normalizedAdditions[i].ID(), normalizedAdditions[j].ID()) < 0
+	})
+	seen := make(map[shoal.ID]struct{}, len(pack.evidence)+len(normalizedAdditions))
+	for _, anchor := range pack.evidence {
+		seen[anchor.ID()] = struct{}{}
+	}
+	for _, anchor := range normalizedAdditions {
+		if err := anchor.Validate(); err != nil {
+			return InferenceResult{}, err
+		}
+		if _, duplicate := seen[anchor.ID()]; duplicate {
+			return InferenceResult{}, invalid("inference result evidence additions must be new and unique")
+		}
+		seen[anchor.ID()] = struct{}{}
 	}
 	if len(claims) > MaxClaims {
 		return InferenceResult{}, invalid("inference result has too many claims")
@@ -974,6 +1009,7 @@ func NewInferenceResult(
 	}
 	result := InferenceResult{
 		contextPackID: pack.ID(),
+		additions:     normalizedAdditions,
 		claims:        cloneClaims(claims),
 		issues:        cloneIssues(issues),
 		generatedAt:   normalizeTime(generatedAt),
@@ -1022,8 +1058,14 @@ func (r InferenceResult) ValidateFor(pack ContextPack) error {
 	if r.contextPackID != pack.ID() {
 		return invalid("inference result does not match context pack")
 	}
-	available := make(map[shoal.ID]struct{}, len(pack.evidence))
+	available := make(map[shoal.ID]struct{}, len(pack.evidence)+len(r.additions))
 	for _, anchor := range pack.evidence {
+		available[anchor.ID()] = struct{}{}
+	}
+	for _, anchor := range r.additions {
+		if _, duplicate := available[anchor.ID()]; duplicate {
+			return invalid("inference result evidence addition overlaps the context pack")
+		}
 		available[anchor.ID()] = struct{}{}
 	}
 	for _, claim := range r.claims {
@@ -1043,9 +1085,12 @@ func (r InferenceResult) ValidateFor(pack ContextPack) error {
 	return nil
 }
 
-func (r InferenceResult) ID() shoal.ID             { return r.id }
-func (r InferenceResult) ContextPackID() shoal.ID  { return r.contextPackID }
-func (r InferenceResult) Claims() []Claim          { return cloneClaims(r.claims) }
+func (r InferenceResult) ID() shoal.ID            { return r.id }
+func (r InferenceResult) ContextPackID() shoal.ID { return r.contextPackID }
+func (r InferenceResult) Claims() []Claim         { return cloneClaims(r.claims) }
+func (r InferenceResult) EvidenceAdditions() []EvidenceAnchor {
+	return cloneAnchors(r.additions)
+}
 func (r InferenceResult) GeneratedAt() time.Time   { return r.generatedAt }
 func (r InferenceResult) Metadata() shoal.Metadata { return cloneMetadata(r.metadata) }
 
@@ -1069,6 +1114,19 @@ func inferenceResultID(result InferenceResult) (shoal.ID, error) {
 	}
 	if len(result.issues) > MaxIssues {
 		return "", invalid("inference result has too many issues")
+	}
+	if len(result.additions) > MaxEvidenceAnchors {
+		return "", invalid("inference result has too many evidence additions")
+	}
+	additionIDs := make([]string, len(result.additions))
+	for index, anchor := range result.additions {
+		if err := anchor.Validate(); err != nil {
+			return "", err
+		}
+		if index > 0 && shoal.CompareID(result.additions[index-1].ID(), anchor.ID()) >= 0 {
+			return "", invalid("inference result evidence additions must be unique and canonically ordered")
+		}
+		additionIDs[index] = string(anchor.ID())
 	}
 	claimIDs := make([]string, len(result.claims))
 	for index, claim := range result.claims {
@@ -1097,6 +1155,12 @@ func inferenceResultID(result InferenceResult) (shoal.ID, error) {
 		return "", err
 	}
 	payloadBytes := metadataBytes(result.metadata)
+	for _, anchor := range result.additions {
+		payloadBytes += anchorPayloadBytes(anchor)
+		if payloadBytes > MaxInferenceResultBytes {
+			return "", invalid("inference result exceeds the public byte bound")
+		}
+	}
 	for _, claim := range result.claims {
 		payloadBytes += claimPayloadBytes(claim)
 		if payloadBytes > MaxInferenceResultBytes {
@@ -1109,13 +1173,17 @@ func inferenceResultID(result InferenceResult) (shoal.ID, error) {
 			return "", invalid("inference result exceeds the public byte bound")
 		}
 	}
-	canonical := canonicalParts(
+	canonicalValues := []string{
 		string(result.contextPackID),
 		canonicalParts(claimIDs...),
 		canonicalParts(issueIDs...),
 		canonicalTime(result.generatedAt),
 		canonicalMetadata(result.metadata),
-	)
+	}
+	if len(additionIDs) > 0 {
+		canonicalValues = append(canonicalValues, canonicalParts(additionIDs...))
+	}
+	canonical := canonicalParts(canonicalValues...)
 	if payloadBytes+len(canonical) > MaxInferenceResultBytes {
 		return "", invalid("inference result exceeds the public byte bound")
 	}
