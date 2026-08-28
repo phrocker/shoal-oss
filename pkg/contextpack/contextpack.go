@@ -1011,19 +1011,53 @@ func preflightResponse(
 			}
 		}
 		if result.Explanation != nil {
-			explanationBytes += len(result.Explanation.Summary)
-			for _, mode := range result.Explanation.Modes {
-				explanationBytes += len(mode)
+			bytes, err := explanationPreflightBytes(*result.Explanation)
+			if err != nil {
+				return err
 			}
-			for name := range result.Explanation.Scores {
-				explanationBytes += len(name) + 8
-			}
-			if explanationBytes > limits.MaxProvenanceBytes {
+			var ok bool
+			explanationBytes, ok = addBounded(
+				explanationBytes, bytes, limits.MaxProvenanceBytes)
+			if !ok {
 				return invalid("retrieval explanation exceeds the provenance byte bound")
 			}
 		}
 	}
 	return nil
+}
+
+func explanationPreflightBytes(explanation retrieval.Explanation) (int, error) {
+	total := 24 + len(explanation.Summary)
+	if len(explanation.Summary) > retrieval.MaxExplanationBytes {
+		return 0, invalid("explanation summary exceeds the public byte bound")
+	}
+	for _, mode := range explanation.Modes {
+		switch mode {
+		case retrieval.ModeLexical, retrieval.ModeVector,
+			retrieval.ModeTree, retrieval.ModeGraph:
+		default:
+			return 0, invalid("explanation contains an unknown mode")
+		}
+		var ok bool
+		total, ok = addBounded(total, 8+len(mode), int(^uint(0)>>1))
+		if !ok {
+			return 0, invalid("retrieval explanation byte size overflows")
+		}
+	}
+	for name, score := range explanation.Scores {
+		if err := shoal.ValidateSemanticString("explanation score name", name); err != nil {
+			return 0, err
+		}
+		if err := shoal.ValidateFiniteScore("explanation score", score); err != nil {
+			return 0, err
+		}
+		var ok bool
+		total, ok = addBounded(total, 16+len(name), int(^uint(0)>>1))
+		if !ok {
+			return 0, invalid("retrieval explanation byte size overflows")
+		}
+	}
+	return total, nil
 }
 
 func retrievalIdentity(request retrieval.Request, response retrieval.Response) (string, error) {
@@ -1483,6 +1517,32 @@ func sortedEdges(edges []graph.Edge) []graph.Edge {
 }
 
 func canonicalEqual(left, right any) bool {
+	switch typedLeft := left.(type) {
+	case graph.Edge:
+		typedRight, ok := right.(graph.Edge)
+		if !ok ||
+			math.Float64bits(float64(typedLeft.Weight)) !=
+				math.Float64bits(float64(typedRight.Weight)) {
+			return false
+		}
+		typedLeft.Weight = 0
+		typedRight.Weight = 0
+		return reflect.DeepEqual(typedLeft, typedRight)
+	case graph.Path:
+		typedRight, ok := right.(graph.Path)
+		if !ok ||
+			len(typedLeft.Nodes) != len(typedRight.Nodes) ||
+			len(typedLeft.Edges) != len(typedRight.Edges) ||
+			!reflect.DeepEqual(typedLeft.Nodes, typedRight.Nodes) {
+			return false
+		}
+		for index := range typedLeft.Edges {
+			if !canonicalEqual(typedLeft.Edges[index], typedRight.Edges[index]) {
+				return false
+			}
+		}
+		return true
+	}
 	return reflect.DeepEqual(left, right)
 }
 

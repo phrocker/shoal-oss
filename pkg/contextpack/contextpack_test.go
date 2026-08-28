@@ -22,6 +22,7 @@ package contextpack
 import (
 	"context"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -509,6 +510,22 @@ func TestBoundsFailClosed(t *testing.T) {
 		t.Fatal("oversized graph evidence reached the hydration seam")
 	}
 
+	oversizedExplanation := cloneResponse(response)
+	oversizedExplanation.Results[0].Explanation = &retrieval.Explanation{
+		Modes: make([]retrieval.Mode, DefaultMaxProvenanceBytes/8+1),
+	}
+	for index := range oversizedExplanation.Results[0].Explanation.Modes {
+		oversizedExplanation.Results[0].Explanation.Modes[index] = retrieval.ModeLexical
+	}
+	reader = &recordingReader{}
+	_, err = (Builder{Reader: reader}).Build(context.Background(), InitialRequest{
+		Request: request, Response: oversizedExplanation, Pins: pins,
+	})
+	assertCode(t, err, shoal.ErrorInvalidArgument)
+	if reader.documentCalls != 0 || reader.neighborhoodCalls != 0 {
+		t.Fatal("oversized explanation reached the hydration seam")
+	}
+
 	neighborhood := explorer.Neighborhood{
 		Nodes: []graph.Node{{
 			ID: "node", Properties: shoal.Metadata{"payload": strings.Repeat("x", 32)},
@@ -634,6 +651,23 @@ func TestHydratedDuplicatesRequireExactContentAndRequestedIdentity(t *testing.T)
 		[]explorer.DocumentView{view, localTime}, nil,
 	); err != nil {
 		t.Fatalf("equivalent revision timestamps were treated as conflicting: %v", err)
+	}
+	negativeZero := shoal.Score(math.Copysign(0, -1))
+	positiveZero := shoal.Score(0)
+	nodes := []graph.Node{{ID: "left"}, {ID: "right"}}
+	leftEdge := graph.Edge{
+		ID: "edge", From: "left", To: "right", Type: "related", Weight: negativeZero,
+	}
+	rightEdge := leftEdge
+	rightEdge.Weight = positiveZero
+	if _, err := newVerifier(
+		context.Background(), nil, limits, nil,
+		[]explorer.Neighborhood{
+			{Nodes: nodes, Edges: []graph.Edge{leftEdge}},
+			{Nodes: nodes, Edges: []graph.Edge{rightEdge}},
+		},
+	); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
+		t.Fatalf("distinct signed-zero edge weights error = %v", err)
 	}
 
 	opaqueLeft := cloneView(view)
