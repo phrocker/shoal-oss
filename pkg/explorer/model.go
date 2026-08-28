@@ -171,7 +171,17 @@ type BoundedNeighborhoodRequest struct {
 	Fanout    uint32
 	MaxNodes  uint32
 	EdgeTypes []string
+	Direction GraphDirection
 }
+
+// GraphDirection selects which adjacency entries consume bounded fanout.
+type GraphDirection string
+
+const (
+	GraphDirectionBoth     GraphDirection = "both"
+	GraphDirectionOutgoing GraphDirection = "outgoing"
+	GraphDirectionIncoming GraphDirection = "incoming"
+)
 
 // BoundedNeighborhood reports whether a server bound stopped expansion.
 type BoundedNeighborhood struct {

@@ -225,14 +225,26 @@ function showError(element, error) {
 }
 
 function renderGraphList() {
-  $("graph-list").innerHTML = "";
+  $("graph-nodes").innerHTML = "";
+  $("graph-edges").innerHTML = "";
   for (const node of state.nodes.values()) {
     const button = document.createElement("button");
     button.textContent = (node.labels && node.labels[0]) || node.kind || node.id;
     button.setAttribute("aria-pressed", String(node.id === state.selected));
     button.onclick = () => selectNode(node.id);
-    $("graph-list").append(button);
+    $("graph-nodes").append(button);
   }
+  for (const edge of state.edges.values()) {
+    const item = document.createElement("li");
+    const from = state.nodes.get(edge.from);
+    const to = state.nodes.get(edge.to);
+    item.textContent = `${nodeName(from, edge.from)} → ${nodeName(to, edge.to)} (${edge.type})`;
+    $("graph-edges").append(item);
+  }
+}
+
+function nodeName(node, fallback) {
+  return node ? ((node.labels && node.labels[0]) || node.kind || node.id) : fallback;
 }
 
 function selectNode(id) {
@@ -318,5 +330,8 @@ canvas.onclick = (event) => {
   selectNode(hit);
 };
 
-new ResizeObserver(draw).observe(canvas);
+new ResizeObserver(() => {
+  positions.clear();
+  draw();
+}).observe(canvas);
 loadDocuments();

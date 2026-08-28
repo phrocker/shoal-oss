@@ -57,8 +57,15 @@ func NewEmbeddedService(client explorer.BoundedClient) (*EmbeddedService, error)
 func (s *EmbeddedService) Documents(
 	ctx context.Context, request DocumentsRequest,
 ) (DocumentsResponse, error) {
-	documents, snapshot, err := s.current(ctx, request.Snapshot)
+	snapshot, err := s.pin(ctx, request.Snapshot)
 	if err != nil {
+		return DocumentsResponse{}, err
+	}
+	documents, err := s.client.Documents(ctx)
+	if err != nil {
+		return DocumentsResponse{}, err
+	}
+	if err := s.confirmSnapshot(ctx, snapshot); err != nil {
 		return DocumentsResponse{}, err
 	}
 	limit, err := normalizeLimit(request.Page.Limit)
@@ -90,7 +97,7 @@ func (s *EmbeddedService) Documents(
 func (s *EmbeddedService) Document(
 	ctx context.Context, request DocumentRequest,
 ) (DocumentResponse, error) {
-	_, snapshot, err := s.current(ctx, request.Snapshot)
+	snapshot, err := s.pin(ctx, request.Snapshot)
 	if err != nil {
 		return DocumentResponse{}, err
 	}
@@ -107,7 +114,7 @@ func (s *EmbeddedService) Document(
 func (s *EmbeddedService) Retrieve(
 	ctx context.Context, request RetrievalRequest,
 ) (RetrievalResponse, error) {
-	_, snapshot, err := s.current(ctx, request.Snapshot)
+	snapshot, err := s.pin(ctx, request.Snapshot)
 	if err != nil {
 		return RetrievalResponse{}, err
 	}
@@ -143,7 +150,7 @@ func (s *EmbeddedService) Retrieve(
 func (s *EmbeddedService) Neighborhood(
 	ctx context.Context, request NeighborhoodRequest,
 ) (NeighborhoodResponse, error) {
-	_, snapshot, err := s.current(ctx, request.Snapshot)
+	snapshot, err := s.pin(ctx, request.Snapshot)
 	if err != nil {
 		return NeighborhoodResponse{}, err
 	}
@@ -180,7 +187,7 @@ func (s *EmbeddedService) Neighborhood(
 func (s *EmbeddedService) Path(
 	ctx context.Context, request PathRequest,
 ) (PathResponse, error) {
-	_, snapshot, err := s.current(ctx, request.Snapshot)
+	snapshot, err := s.pin(ctx, request.Snapshot)
 	if err != nil {
 		return PathResponse{}, err
 	}
@@ -198,6 +205,7 @@ func (s *EmbeddedService) Path(
 	bounded, err := s.client.BoundedNeighborhood(ctx, explorer.BoundedNeighborhoodRequest{
 		NodeIDs: []shoal.ID{request.From}, Depth: depth, Fanout: fanout,
 		MaxNodes: maxNodes, EdgeTypes: request.EdgeTypes,
+		Direction: explorer.GraphDirectionOutgoing,
 	})
 	if err != nil {
 		return PathResponse{}, err
@@ -216,25 +224,18 @@ func (s *EmbeddedService) Path(
 	return PathResponse{Snapshot: snapshot, Path: path}, nil
 }
 
-func (s *EmbeddedService) current(
+func (s *EmbeddedService) pin(
 	ctx context.Context, requested Snapshot,
-) ([]explorer.DocumentSummary, Snapshot, error) {
+) (Snapshot, error) {
 	before, err := s.client.Snapshot(ctx)
 	if err != nil {
-		return nil, Snapshot{}, err
+		return Snapshot{}, err
 	}
 	snapshot := fromExplorerSnapshot(before)
 	if err := validateRequestedSnapshot(requested, snapshot); err != nil {
-		return nil, Snapshot{}, err
+		return Snapshot{}, err
 	}
-	documents, err := s.client.Documents(ctx)
-	if err != nil {
-		return nil, Snapshot{}, err
-	}
-	if err := s.confirmSnapshot(ctx, snapshot); err != nil {
-		return nil, Snapshot{}, err
-	}
-	return documents, snapshot, nil
+	return snapshot, nil
 }
 
 func (s *EmbeddedService) confirmSnapshot(ctx context.Context, expected Snapshot) error {

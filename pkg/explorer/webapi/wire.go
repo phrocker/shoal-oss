@@ -22,6 +22,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"time"
 
 	"github.com/phrocker/shoal-oss/pkg/document"
@@ -32,41 +33,41 @@ import (
 )
 
 type wireDocument struct {
-	ID            string         `json:"id"`
-	RevisionID    string         `json:"revision_id"`
-	Title         string         `json:"title"`
-	RootSectionID string         `json:"root_section_id"`
-	Metadata      shoal.Metadata `json:"metadata,omitempty"`
+	ID            string       `json:"id"`
+	RevisionID    string       `json:"revision_id"`
+	Title         string       `json:"title"`
+	RootSectionID string       `json:"root_section_id"`
+	Metadata      wireMetadata `json:"metadata,omitempty"`
 }
 
 type wireRevision struct {
-	ID            string         `json:"id"`
-	DocumentID    string         `json:"document_id"`
-	CreatedAt     time.Time      `json:"created_at"`
-	SourceVersion string         `json:"source_version"`
-	Metadata      shoal.Metadata `json:"metadata,omitempty"`
+	ID            string       `json:"id"`
+	DocumentID    string       `json:"document_id"`
+	CreatedAt     time.Time    `json:"created_at"`
+	SourceVersion string       `json:"source_version"`
+	Metadata      wireMetadata `json:"metadata,omitempty"`
 }
 
 type wireSection struct {
-	ID         string         `json:"id"`
-	DocumentID string         `json:"document_id"`
-	RevisionID string         `json:"revision_id"`
-	ParentID   string         `json:"parent_id,omitempty"`
-	Order      uint32         `json:"order"`
-	Heading    string         `json:"heading"`
-	Range      wireRange      `json:"range"`
-	Metadata   shoal.Metadata `json:"metadata,omitempty"`
+	ID         string       `json:"id"`
+	DocumentID string       `json:"document_id"`
+	RevisionID string       `json:"revision_id"`
+	ParentID   string       `json:"parent_id,omitempty"`
+	Order      uint32       `json:"order"`
+	Heading    string       `json:"heading"`
+	Range      wireRange    `json:"range"`
+	Metadata   wireMetadata `json:"metadata,omitempty"`
 }
 
 type wireSpan struct {
-	ID         string         `json:"id"`
-	DocumentID string         `json:"document_id"`
-	RevisionID string         `json:"revision_id"`
-	SectionID  string         `json:"section_id"`
-	Order      uint32         `json:"order"`
-	Range      wireRange      `json:"range"`
-	Text       string         `json:"text"`
-	Metadata   shoal.Metadata `json:"metadata,omitempty"`
+	ID         string       `json:"id"`
+	DocumentID string       `json:"document_id"`
+	RevisionID string       `json:"revision_id"`
+	SectionID  string       `json:"section_id"`
+	Order      uint32       `json:"order"`
+	Range      wireRange    `json:"range"`
+	Text       string       `json:"text"`
+	Metadata   wireMetadata `json:"metadata,omitempty"`
 }
 
 type wireSectionView struct {
@@ -76,19 +77,19 @@ type wireSectionView struct {
 }
 
 type wireNode struct {
-	ID         string         `json:"id"`
-	Kind       string         `json:"kind,omitempty"`
-	Labels     []string       `json:"labels,omitempty"`
-	Properties shoal.Metadata `json:"properties,omitempty"`
+	ID         string       `json:"id"`
+	Kind       string       `json:"kind,omitempty"`
+	Labels     []string     `json:"labels,omitempty"`
+	Properties wireMetadata `json:"properties,omitempty"`
 }
 
 type wireEdge struct {
-	ID         string         `json:"id"`
-	From       string         `json:"from"`
-	To         string         `json:"to"`
-	Type       string         `json:"type"`
-	Weight     shoal.Score    `json:"weight"`
-	Properties shoal.Metadata `json:"properties,omitempty"`
+	ID         string       `json:"id"`
+	From       string       `json:"from"`
+	To         string       `json:"to"`
+	Type       string       `json:"type"`
+	Weight     shoal.Score  `json:"weight"`
+	Properties wireMetadata `json:"properties,omitempty"`
 }
 
 type wirePath struct {
@@ -111,6 +112,13 @@ type wireExplanation struct {
 	Summary string                 `json:"summary"`
 	Scores  map[string]shoal.Score `json:"scores"`
 }
+
+type wireMetadataEntry struct {
+	Key   string `json:"key"`
+	Value string `json:"value"`
+}
+
+type wireMetadata []wireMetadataEntry
 
 func (r DocumentsResponse) MarshalJSON() ([]byte, error) {
 	documents := make([]any, 0, len(r.Documents))
@@ -310,14 +318,15 @@ func wireDocumentValue(value document.Document) wireDocument {
 	return wireDocument{
 		ID: encodeID(value.ID), RevisionID: encodeID(value.RevisionID),
 		Title: value.Title, RootSectionID: encodeID(value.RootSectionID),
-		Metadata: value.Metadata,
+		Metadata: wireMetadataValue(value.Metadata),
 	}
 }
 
 func wireRevisionValue(value document.Revision) wireRevision {
 	return wireRevision{
 		ID: encodeID(value.ID), DocumentID: encodeID(value.DocumentID),
-		CreatedAt: value.CreatedAt, SourceVersion: value.SourceVersion, Metadata: value.Metadata,
+		CreatedAt: value.CreatedAt, SourceVersion: value.SourceVersion,
+		Metadata: wireMetadataValue(value.Metadata),
 	}
 }
 
@@ -341,7 +350,7 @@ func wireSectionValue(value document.Section) wireSection {
 		ID: encodeID(value.ID), DocumentID: encodeID(value.DocumentID),
 		RevisionID: encodeID(value.RevisionID), ParentID: encodeOptionalID(value.ParentID),
 		Order: value.Order, Heading: value.Heading,
-		Range: wireRangeValue(value.Range), Metadata: value.Metadata,
+		Range: wireRangeValue(value.Range), Metadata: wireMetadataValue(value.Metadata),
 	}
 }
 
@@ -350,7 +359,7 @@ func wireSpanValue(value document.Span) wireSpan {
 		ID: encodeID(value.ID), DocumentID: encodeID(value.DocumentID),
 		RevisionID: encodeID(value.RevisionID), SectionID: encodeID(value.SectionID),
 		Order: value.Order, Range: wireRangeValue(value.Range),
-		Text: value.Text, Metadata: value.Metadata,
+		Text: value.Text, Metadata: wireMetadataValue(value.Metadata),
 	}
 }
 
@@ -384,14 +393,15 @@ func wirePathValue(value graph.Path) wirePath {
 func wireNodeValue(value graph.Node) wireNode {
 	return wireNode{
 		ID: encodeID(value.ID), Kind: value.Kind,
-		Labels: value.Labels, Properties: value.Properties,
+		Labels: value.Labels, Properties: wireMetadataValue(value.Properties),
 	}
 }
 
 func wireEdgeValue(value graph.Edge) wireEdge {
 	return wireEdge{
 		ID: encodeID(value.ID), From: encodeID(value.From), To: encodeID(value.To),
-		Type: value.Type, Weight: value.Weight, Properties: value.Properties,
+		Type: value.Type, Weight: value.Weight,
+		Properties: wireMetadataValue(value.Properties),
 	}
 }
 
@@ -423,6 +433,22 @@ func wireExplanationValue(value *retrieval.Explanation) *wireExplanation {
 	return &wireExplanation{
 		Modes: value.Modes, Summary: value.Summary, Scores: value.Scores,
 	}
+}
+
+func wireMetadataValue(value shoal.Metadata) wireMetadata {
+	keys := make([]string, 0, len(value))
+	for key := range value {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	metadata := make(wireMetadata, 0, len(keys))
+	for _, key := range keys {
+		metadata = append(metadata, wireMetadataEntry{
+			Key:   base64.RawURLEncoding.EncodeToString([]byte(key)),
+			Value: base64.RawURLEncoding.EncodeToString([]byte(value[key])),
+		})
+	}
+	return metadata
 }
 
 func encodeID(value shoal.ID) string {

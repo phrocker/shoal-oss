@@ -54,6 +54,15 @@ func (e *Explorer) BoundedNeighborhood(
 		return BoundedNeighborhood{}, shoal.NewError(
 			shoal.ErrorInvalidArgument, "bounded graph limits must be nonzero")
 	}
+	if request.Direction == "" {
+		request.Direction = GraphDirectionBoth
+	}
+	switch request.Direction {
+	case GraphDirectionBoth, GraphDirectionOutgoing, GraphDirectionIncoming:
+	default:
+		return BoundedNeighborhood{}, shoal.NewError(
+			shoal.ErrorInvalidArgument, "unknown graph direction")
+	}
 	normalized, err := (NeighborhoodRequest{
 		NodeIDs: request.NodeIDs, Depth: request.Depth, EdgeTypes: request.EdgeTypes,
 	}).Normalize()
@@ -101,12 +110,18 @@ func (e *Explorer) BoundedNeighborhood(
 			edgeIDs := e.adjacency[seed]
 			examined := uint32(0)
 			for _, edgeID := range edgeIDs {
+				edge := e.graphEdges[edgeID]
+				if request.Direction == GraphDirectionOutgoing && edge.From != seed {
+					continue
+				}
+				if request.Direction == GraphDirectionIncoming && edge.To != seed {
+					continue
+				}
 				if examined >= request.Fanout {
 					truncated = true
 					break
 				}
 				examined++
-				edge := e.graphEdges[edgeID]
 				if len(typeFilter) > 0 {
 					if _, ok := typeFilter[edge.Type]; !ok {
 						continue

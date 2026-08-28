@@ -29,7 +29,16 @@
           <button id="find-path">Find path</button>
         </div>
         <canvas id="canvas" aria-hidden="true"></canvas>
-        <div id="graph-list" aria-label="Graph nodes and edges"></div>
+        <div id="graph-list">
+          <section aria-labelledby="graph-nodes-heading">
+            <h3 id="graph-nodes-heading">Graph nodes</h3>
+            <div id="graph-nodes"></div>
+          </section>
+          <section aria-labelledby="graph-edges-heading">
+            <h3 id="graph-edges-heading">Graph edges</h3>
+            <ul id="graph-edges"></ul>
+          </section>
+        </div>
       </div>
     </section>
     <aside class="right"><h2>Selection</h2><div id="selection" class="muted">Select evidence, a hierarchy section, or a graph node.</div></aside>

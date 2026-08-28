@@ -124,11 +124,54 @@ func TestSnapshotChangesWhenGraphChanges(t *testing.T) {
 	}
 }
 
+func TestPathFanoutCountsOnlyOutgoingEdges(t *testing.T) {
+	service, corpus, first, second := testService(t)
+	defer corpus.Close()
+	ctx := context.Background()
+	firstView, err := corpus.Document(ctx, first.Document.ID, first.Revision.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondView, err := corpus.Document(ctx, second.Document.ID, second.Revision.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	from := firstSpanID(t, firstView.Root)
+	to := firstSpanID(t, secondView.Root)
+	if err := corpus.Connect(ctx, graph.Edge{
+		ID: "a-incoming", From: to, To: from, Type: "noise", Weight: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := corpus.Connect(ctx, graph.Edge{
+		ID: "z-outgoing", From: from, To: to, Type: "path", Weight: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	documents, err := service.Documents(ctx, webapi.DocumentsRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	path, err := service.Path(ctx, webapi.PathRequest{
+		Snapshot: documents.Snapshot, From: from, To: to,
+		MaxDepth: 1, Fanout: 1, EdgeTypes: []string{"noise", "path"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(path.Path.Edges) != 1 || path.Path.Edges[0].ID != "z-outgoing" {
+		t.Fatalf("path = %+v", path.Path)
+	}
+}
+
 func TestHTTPIDsAreBinarySafeAndReversible(t *testing.T) {
 	rawID := shoal.ID([]byte{0xff, 0x00, 'x'})
 	encoded, err := json.Marshal(webapi.NeighborhoodResponse{
 		Neighborhood: explorer.Neighborhood{
-			Nodes: []graph.Node{{ID: rawID, Kind: "binary"}},
+			Nodes: []graph.Node{{
+				ID: rawID, Kind: "binary",
+				Properties: shoal.Metadata{string([]byte{0xfe}): string([]byte{0xfd})},
+			}},
 		},
 	})
 	if err != nil {
@@ -301,4 +344,30 @@ func testService(
 		t.Fatal(err)
 	}
 	return service, corpus, first, second
+}
+
+func firstSpanID(t *testing.T, view explorer.SectionView) shoal.ID {
+	t.Helper()
+	if len(view.Spans) > 0 {
+		return view.Spans[0].ID
+	}
+	for _, child := range view.Children {
+		if id := firstSpanIDOptional(child); id != "" {
+			return id
+		}
+	}
+	t.Fatal("document has no span")
+	return ""
+}
+
+func firstSpanIDOptional(view explorer.SectionView) shoal.ID {
+	if len(view.Spans) > 0 {
+		return view.Spans[0].ID
+	}
+	for _, child := range view.Children {
+		if id := firstSpanIDOptional(child); id != "" {
+			return id
+		}
+	}
+	return ""
 }

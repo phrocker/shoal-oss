@@ -313,7 +313,11 @@ func (e *Explorer) Connect(ctx context.Context, edge graph.Edge) error {
 	}
 	e.edges[edge.ID] = record
 	e.graphEdges[edge.ID] = cloneEdge(edge)
-	for _, id := range []shoal.ID{edge.From, edge.To} {
+	adjacent := []shoal.ID{edge.From}
+	if edge.To != edge.From {
+		adjacent = append(adjacent, edge.To)
+	}
+	for _, id := range adjacent {
 		e.adjacency[id] = append(e.adjacency[id], edge.ID)
 		sort.Slice(e.adjacency[id], func(i, j int) bool {
 			return shoal.CompareID(e.adjacency[id][i], e.adjacency[id][j]) < 0
