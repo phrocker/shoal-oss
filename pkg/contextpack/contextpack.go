@@ -50,10 +50,12 @@ const (
 	DefaultMaxAnchors         = 1024
 	DefaultMaxDocuments       = 256
 	DefaultMaxSections        = 4096
+	DefaultMaxSpans           = 8192
 	DefaultMaxGraphNodes      = 4096
 	DefaultMaxGraphEdges      = 8192
 	DefaultMaxPathNodes       = 256
 	DefaultMaxContextBytes    = 4 * 1024 * 1024
+	DefaultMaxHydrationBytes  = 8 * 1024 * 1024
 	DefaultMaxQuoteBytes      = 1024 * 1024
 	DefaultMaxProvenanceBytes = 64 * 1024
 	DefaultMaxHierarchyDepth  = 16
@@ -80,10 +82,12 @@ type Limits struct {
 	MaxAnchors         int
 	MaxDocuments       int
 	MaxSections        int
+	MaxSpans           int
 	MaxGraphNodes      int
 	MaxGraphEdges      int
 	MaxPathNodes       int
 	MaxContextBytes    int
+	MaxHydrationBytes  int
 	MaxContextTokens   int
 	MaxQuoteBytes      int
 	MaxProvenanceBytes int
@@ -348,6 +352,9 @@ func (b Builder) ExpandNeighbors(
 	if err != nil {
 		return inference.ContextPack{}, err
 	}
+	if err := validateNeighborhoodResponse(normalized, neighborhood, limits); err != nil {
+		return inference.ContextPack{}, err
+	}
 	verifier, err := newVerifier(ctx, b.Reader, limits, nil, []explorer.Neighborhood{neighborhood})
 	if err != nil {
 		return inference.ContextPack{}, err
@@ -401,6 +408,8 @@ type verifier struct {
 	nodes     map[shoal.ID]graph.Node
 	edges     map[shoal.ID]graph.Edge
 	sections  int
+	spans     int
+	bytes     int
 }
 
 type documentKey struct {
@@ -414,6 +423,7 @@ type documentIndex struct {
 	spans          map[shoal.ID]document.Span
 	children       map[shoal.ID][]shoal.ID
 	spansBySection map[shoal.ID][]document.Span
+	bytes          int
 }
 
 func newVerifier(
@@ -519,6 +529,10 @@ func (v *verifier) graphAnchor(path graph.Path) (inference.EvidenceAnchor, error
 		if err != nil {
 			return inference.EvidenceAnchor{}, err
 		}
+		request := explorer.NeighborhoodRequest{NodeIDs: nodeIDs, Depth: 1}
+		if err := validateNeighborhoodResponse(request, neighborhood, v.limits); err != nil {
+			return inference.EvidenceAnchor{}, err
+		}
 		if err := v.addNeighborhood(neighborhood); err != nil {
 			return inference.EvidenceAnchor{}, err
 		}
@@ -567,17 +581,24 @@ func (v *verifier) verifyExisting(anchors []inference.EvidenceAnchor) error {
 }
 
 func (v *verifier) addDocument(view explorer.DocumentView) error {
-	remaining := v.limits.MaxSections - v.sections
-	index, err := indexDocument(view, remaining)
-	if err != nil {
-		return err
-	}
 	key := documentKey{view.Document.ID, view.Revision.ID}
 	if existing := v.documents[key]; existing != nil {
+		index, err := indexDocument(
+			view, v.limits.MaxSections, v.limits.MaxSpans, v.limits.MaxHydrationBytes)
+		if err != nil {
+			return err
+		}
 		if !canonicalEqual(existing.view, index.view) {
 			return invalid("duplicate hydrated document has different content")
 		}
 		return nil
+	}
+	remaining := v.limits.MaxSections - v.sections
+	remainingSpans := v.limits.MaxSpans - v.spans
+	remainingBytes := v.limits.MaxHydrationBytes - v.bytes
+	index, err := indexDocument(view, remaining, remainingSpans, remainingBytes)
+	if err != nil {
+		return err
 	}
 	if len(v.documents)+1 > v.limits.MaxDocuments {
 		return invalid("hydrated documents exceed the document bound")
@@ -586,11 +607,19 @@ func (v *verifier) addDocument(view explorer.DocumentView) error {
 		return invalid("hydrated documents exceed the section bound")
 	}
 	v.sections += len(index.sections)
+	v.spans += len(index.spans)
+	v.bytes += index.bytes
 	v.documents[key] = index
 	return nil
 }
 
 func (v *verifier) addNeighborhood(neighborhood explorer.Neighborhood) error {
+	if len(neighborhood.Nodes) > v.limits.MaxGraphNodes {
+		return invalid("hydrated graph exceeds the node bound")
+	}
+	if len(neighborhood.Edges) > v.limits.MaxGraphEdges {
+		return invalid("hydrated graph exceeds the edge bound")
+	}
 	localNodes := make(map[shoal.ID]graph.Node, len(neighborhood.Nodes))
 	for _, node := range neighborhood.Nodes {
 		if err := node.Validate(); err != nil {
@@ -652,7 +681,10 @@ func (v *verifier) addNeighborhood(neighborhood explorer.Neighborhood) error {
 	return nil
 }
 
-func indexDocument(view explorer.DocumentView, maxSections int) (*documentIndex, error) {
+func indexDocument(
+	view explorer.DocumentView,
+	maxSections, maxSpans, maxBytes int,
+) (*documentIndex, error) {
 	if err := view.Document.Validate(); err != nil {
 		return nil, err
 	}
@@ -663,8 +695,15 @@ func indexDocument(view explorer.DocumentView, maxSections int) (*documentIndex,
 		view.Revision.DocumentID != view.Document.ID {
 		return nil, invalid("hydrated document and revision ownership do not match")
 	}
-	if maxSections <= 0 || sectionViewCountExceeds(view.Root, maxSections) {
+	sections, spans, hydrationBytes := sectionViewStats(view)
+	if maxSections <= 0 || sections > maxSections {
 		return nil, invalid("hydrated documents exceed the section bound")
+	}
+	if maxSpans <= 0 || spans > maxSpans {
+		return nil, invalid("hydrated documents exceed the span bound")
+	}
+	if maxBytes <= 0 || hydrationBytes > maxBytes {
+		return nil, invalid("hydrated documents exceed the byte bound")
 	}
 	index := &documentIndex{
 		view:           cloneView(view),
@@ -672,6 +711,7 @@ func indexDocument(view explorer.DocumentView, maxSections int) (*documentIndex,
 		spans:          make(map[shoal.ID]document.Span),
 		children:       make(map[shoal.ID][]shoal.ID),
 		spansBySection: make(map[shoal.ID][]document.Span),
+		bytes:          hydrationBytes,
 	}
 	var walk func(explorer.SectionView, shoal.ID) error
 	walk = func(sectionView explorer.SectionView, expectedParent shoal.ID) error {
@@ -1225,10 +1265,12 @@ func normalizeLimits(input Limits) (Limits, error) {
 	defaultInt(&limits.MaxAnchors, DefaultMaxAnchors)
 	defaultInt(&limits.MaxDocuments, DefaultMaxDocuments)
 	defaultInt(&limits.MaxSections, DefaultMaxSections)
+	defaultInt(&limits.MaxSpans, DefaultMaxSpans)
 	defaultInt(&limits.MaxGraphNodes, DefaultMaxGraphNodes)
 	defaultInt(&limits.MaxGraphEdges, DefaultMaxGraphEdges)
 	defaultInt(&limits.MaxPathNodes, DefaultMaxPathNodes)
 	defaultInt(&limits.MaxContextBytes, DefaultMaxContextBytes)
+	defaultInt(&limits.MaxHydrationBytes, DefaultMaxHydrationBytes)
 	defaultInt(&limits.MaxQuoteBytes, DefaultMaxQuoteBytes)
 	defaultInt(&limits.MaxProvenanceBytes, DefaultMaxProvenanceBytes)
 	if limits.MaxHierarchyDepth == 0 {
@@ -1237,9 +1279,11 @@ func normalizeLimits(input Limits) (Limits, error) {
 	for name, value := range map[string]int{
 		"result": limits.MaxResults, "anchor": limits.MaxAnchors,
 		"document": limits.MaxDocuments, "section": limits.MaxSections,
+		"span":       limits.MaxSpans,
 		"graph node": limits.MaxGraphNodes, "graph edge": limits.MaxGraphEdges,
 		"path node": limits.MaxPathNodes, "context byte": limits.MaxContextBytes,
-		"quote byte": limits.MaxQuoteBytes, "provenance byte": limits.MaxProvenanceBytes,
+		"hydration byte": limits.MaxHydrationBytes,
+		"quote byte":     limits.MaxQuoteBytes, "provenance byte": limits.MaxProvenanceBytes,
 	} {
 		if value <= 0 {
 			return Limits{}, invalid(name + " limit must be positive")
@@ -1262,6 +1306,12 @@ func normalizeLimits(input Limits) (Limits, error) {
 	}
 	if limits.MaxHierarchyDepth > 16 {
 		return Limits{}, invalid("hierarchy depth limit exceeds the Explorer contract")
+	}
+	if limits.MaxSections > document.MaxSectionsPerRevision {
+		return Limits{}, invalid("section limit exceeds the document contract")
+	}
+	if limits.MaxSpans > document.MaxSpansPerRevision {
+		return Limits{}, invalid("span limit exceeds the document contract")
 	}
 	return limits, nil
 }
@@ -1537,22 +1587,93 @@ func rangeContains(outer, inner document.SourceRange) bool {
 	return outer.Start.Offset <= inner.Start.Offset && inner.End.Offset <= outer.End.Offset
 }
 
-func sectionViewCountExceeds(root explorer.SectionView, maximum int) bool {
-	count := 0
-	stack := []*explorer.SectionView{&root}
+func sectionViewStats(view explorer.DocumentView) (int, int, int) {
+	sections := 0
+	spans := 0
+	totalBytes := len(view.Document.ID) + len(view.Document.RevisionID) +
+		len(view.Document.Title) + len(view.Document.RootSectionID) +
+		metadataBytes(view.Document.Metadata) +
+		len(view.Revision.ID) + len(view.Revision.DocumentID) +
+		len(view.Revision.SourceVersion) + metadataBytes(view.Revision.Metadata) +
+		len(view.SourceURI)
+	stack := []*explorer.SectionView{&view.Root}
 	for len(stack) > 0 {
 		last := len(stack) - 1
 		current := stack[last]
 		stack = stack[:last]
-		count++
-		if count > maximum {
-			return true
+		sections++
+		totalBytes += len(current.Section.ID) + len(current.Section.DocumentID) +
+			len(current.Section.RevisionID) + len(current.Section.ParentID) +
+			len(current.Section.Heading) + metadataBytes(current.Section.Metadata) + 28
+		spans += len(current.Spans)
+		for _, span := range current.Spans {
+			totalBytes += len(span.ID) + len(span.DocumentID) + len(span.RevisionID) +
+				len(span.SectionID) + len(span.Text) + metadataBytes(span.Metadata) + 28
 		}
 		for index := range current.Children {
 			stack = append(stack, &current.Children[index])
 		}
 	}
-	return false
+	return sections, spans, totalBytes
+}
+
+func validateNeighborhoodResponse(
+	request explorer.NeighborhoodRequest,
+	neighborhood explorer.Neighborhood,
+	limits Limits,
+) error {
+	if len(neighborhood.Nodes) > limits.MaxGraphNodes {
+		return invalid("hydrated graph exceeds the node bound")
+	}
+	if len(neighborhood.Edges) > limits.MaxGraphEdges {
+		return invalid("hydrated graph exceeds the edge bound")
+	}
+	nodes := make(map[shoal.ID]struct{}, len(neighborhood.Nodes))
+	for _, node := range neighborhood.Nodes {
+		nodes[node.ID] = struct{}{}
+	}
+	seen := make(map[shoal.ID]struct{}, len(request.NodeIDs))
+	frontier := make(map[shoal.ID]struct{}, len(request.NodeIDs))
+	for _, id := range request.NodeIDs {
+		if _, ok := nodes[id]; !ok {
+			return invalid("hydrated neighborhood omitted a requested node")
+		}
+		seen[id] = struct{}{}
+		frontier[id] = struct{}{}
+	}
+	typeFilter := make(map[string]struct{}, len(request.EdgeTypes))
+	for _, edgeType := range request.EdgeTypes {
+		typeFilter[edgeType] = struct{}{}
+	}
+	selectedEdges := make(map[shoal.ID]struct{}, len(neighborhood.Edges))
+	for depth := uint32(0); depth < request.Depth && len(frontier) > 0; depth++ {
+		next := make(map[shoal.ID]struct{})
+		for _, edge := range neighborhood.Edges {
+			if len(typeFilter) > 0 {
+				if _, ok := typeFilter[edge.Type]; !ok {
+					continue
+				}
+			}
+			_, from := frontier[edge.From]
+			_, to := frontier[edge.To]
+			if !from && !to {
+				continue
+			}
+			selectedEdges[edge.ID] = struct{}{}
+			for _, id := range []shoal.ID{edge.From, edge.To} {
+				if _, exists := seen[id]; !exists {
+					seen[id] = struct{}{}
+					next[id] = struct{}{}
+				}
+			}
+		}
+		frontier = next
+	}
+	if len(seen) != len(neighborhood.Nodes) ||
+		len(selectedEdges) != len(neighborhood.Edges) {
+		return invalid("hydrated neighborhood exceeds the requested scope")
+	}
+	return nil
 }
 
 func pathPresent(path graph.Path) bool {

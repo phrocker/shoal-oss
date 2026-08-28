@@ -166,6 +166,20 @@ func TestBuildRejectsStaleCitationRangeRevisionAndPath(t *testing.T) {
 	})
 	assertCode(t, err, shoal.ErrorInvalidArgument)
 
+	_, err = (Builder{Reader: client, Limits: Limits{MaxSpans: 1}}).
+		Build(context.Background(), InitialRequest{
+			Request: request, Response: response,
+			Selection: EvidenceSelection{Documents: true}, Pins: pins,
+		})
+	assertCode(t, err, shoal.ErrorInvalidArgument)
+
+	_, err = (Builder{Reader: client, Limits: Limits{MaxHydrationBytes: 1}}).
+		Build(context.Background(), InitialRequest{
+			Request: request, Response: response,
+			Selection: EvidenceSelection{Documents: true}, Pins: pins,
+		})
+	assertCode(t, err, shoal.ErrorInvalidArgument)
+
 	badPath := cloneResponse(response)
 	badPath.Results[0].Evidence[0].Path.Nodes[0].Labels =
 		append(badPath.Results[0].Evidence[0].Path.Nodes[0].Labels, "stale")
@@ -392,6 +406,17 @@ func TestFollowUpCanonicalizesGraphLabels(t *testing.T) {
 			Nodes: []graph.Node{hydrated, second}, Edges: []graph.Edge{hydratedEdge},
 		},
 	}
+	overbroad := &recordingReader{
+		neighborhood: explorer.Neighborhood{
+			Nodes: []graph.Node{hydrated, second, {ID: "outside"}},
+			Edges: []graph.Edge{hydratedEdge},
+		},
+	}
+	if _, err := (Builder{Reader: overbroad}).ExpandNeighbors(
+		context.Background(), pack, ExpandNeighborsRequest{NodeIDs: []shoal.ID{node.ID}},
+	); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
+		t.Fatalf("over-broad neighborhood error = %v", err)
+	}
 	if _, err := (Builder{Reader: reader}).ExpandNeighbors(
 		context.Background(), pack, ExpandNeighborsRequest{NodeIDs: []shoal.ID{node.ID}},
 	); err != nil {
@@ -550,6 +575,14 @@ func TestHydratedDuplicatesRequireExactContentAndRequestedIdentity(t *testing.T)
 		[]explorer.DocumentView{nilMetadata, emptyMetadata}, nil,
 	); err != nil {
 		t.Fatalf("canonical empty metadata was treated as conflicting: %v", err)
+	}
+	sectionCount, _, _ := sectionViewStats(view)
+	exactLimits := mustLimits(t, Limits{MaxSections: sectionCount})
+	if _, err := newVerifier(
+		context.Background(), nil, exactLimits,
+		[]explorer.DocumentView{view, cloneView(view)}, nil,
+	); err != nil {
+		t.Fatalf("exact duplicate exceeded remaining section budget: %v", err)
 	}
 	localTime := cloneView(view)
 	localTime.Revision.CreatedAt = localTime.Revision.CreatedAt.In(
