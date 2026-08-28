@@ -70,6 +70,15 @@ type Budgets struct {
 	MaxRepeatedAction int
 }
 
+// NormalizeBudgets applies public budget defaults and validates all bounds.
+func NormalizeBudgets(b Budgets) (Budgets, error) {
+	b = b.normalized()
+	if err := b.validate(); err != nil {
+		return Budgets{}, err
+	}
+	return b, nil
+}
+
 func validateResultProvenance(result inference.InferenceResult, expected Provenance) error {
 	for _, claim := range result.Claims() {
 		model := claim.ModelProvenance()
@@ -615,7 +624,12 @@ func (g *Generator) Run(ctx context.Context, pack inference.ContextPack) (Record
 	if err != nil {
 		return Record{}, err
 	}
-	trace := RunTrace{Budgets: g.budgets}
+	initialEvidence := len(pack.Evidence())
+	initialGraphNodes := graphNodeSet(pack.Evidence())
+	trace := RunTrace{
+		Budgets: g.budgets,
+		Usage:   BudgetUsage{Evidence: initialEvidence, GraphNodes: len(initialGraphNodes)},
+	}
 	earlyFinish := func(reason StopReason, operation string, err error) (Record, error) {
 		trace.StopReason = reason
 		trace.Failures = append(trace.Failures, FailureTrace{
@@ -634,6 +648,14 @@ func (g *Generator) Run(ctx context.Context, pack inference.ContextPack) (Record
 		err := invalid("authorization pin is stale")
 		return earlyFinish(StopReasonInvalid, "authorization", err)
 	}
+	if initialEvidence > g.budgets.MaxEvidence {
+		err := budget("evidence")
+		return earlyFinish(StopReasonBudgetExhausted, "budget", err)
+	}
+	if len(initialGraphNodes) > g.budgets.MaxGraphNodes {
+		err := budget("graph nodes")
+		return earlyFinish(StopReasonBudgetExhausted, "budget", err)
+	}
 	maxElapsed := g.budgets.MaxElapsed
 	if remainingAuth < maxElapsed {
 		maxElapsed = remainingAuth
@@ -645,7 +667,7 @@ func (g *Generator) Run(ctx context.Context, pack inference.ContextPack) (Record
 		if runCtx.Err() != nil {
 			return earlyFinish(stopReasonFor(runCtx.Err()), "model", runCtx.Err())
 		}
-		err := fmt.Errorf("%w: %v", ErrRunnerUnavailable, err)
+		err := fmt.Errorf("%w: %w", ErrRunnerUnavailable, err)
 		return earlyFinish(StopReasonUnavailable, "model", err)
 	}
 	if session == nil {
@@ -654,7 +676,7 @@ func (g *Generator) Run(ctx context.Context, pack inference.ContextPack) (Record
 	transcript := newTranscript(request)
 	seenCorrelation := map[shoal.ID]struct{}{}
 	repeats := map[string]int{}
-	inputTokens, outputTokens, hops, evidence := 0, 0, 0, 0
+	inputTokens, outputTokens, hops, evidence := 0, 0, 0, len(transcript.context.Evidence())
 	graphNodes := graphNodeSet(transcript.context.Evidence())
 	currentUsage := func() BudgetUsage {
 		return BudgetUsage{
@@ -691,10 +713,6 @@ func (g *Generator) Run(ctx context.Context, pack inference.ContextPack) (Record
 			Result: result, Trace: cloneRunTrace(trace),
 		}, err
 	}
-	if len(graphNodes) > g.budgets.MaxGraphNodes {
-		err := budget("graph nodes")
-		return finish(StopReasonBudgetExhausted, -1, "budget", inference.InferenceResult{}, err)
-	}
 	for step := 0; step < g.budgets.MaxSteps; step++ {
 		if !g.now().Before(pack.Authorization().ExpiresAt()) {
 			err := invalid("authorization pin expired during execution")
@@ -715,7 +733,7 @@ func (g *Generator) Run(ctx context.Context, pack inference.ContextPack) (Record
 			if errors.Is(nextErr, ErrInvalid) || errors.Is(nextErr, ErrBudgetExhausted) {
 				return finish(stopReasonFor(nextErr), step, "model", inference.InferenceResult{}, nextErr)
 			}
-			err := fmt.Errorf("%w: %v", ErrRunnerUnavailable, nextErr)
+			err := fmt.Errorf("%w: %w", ErrRunnerUnavailable, nextErr)
 			return finish(StopReasonUnavailable, step, "model", inference.InferenceResult{}, err)
 		}
 		iteration := IterationTrace{

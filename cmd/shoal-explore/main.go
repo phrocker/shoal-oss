@@ -46,7 +46,7 @@ func main() {
 func run(ctx context.Context, args []string, output io.Writer) error {
 	if len(args) == 0 {
 		return errors.New(
-			"usage: shoal-explore <ingest|list|outline|query|connect|neighbors>")
+			"usage: shoal-explore <ingest|list|outline|query|ask|connect|neighbors>")
 	}
 	switch args[0] {
 	case "ingest":
@@ -57,6 +57,8 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 		return runOutline(ctx, args[1:], output)
 	case "query":
 		return runQuery(ctx, args[1:], output)
+	case "ask":
+		return runAsk(ctx, args[1:], output)
 	case "connect":
 		return runConnect(ctx, args[1:], output)
 	case "neighbors":

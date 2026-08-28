@@ -57,11 +57,18 @@ func TestModelRunnerDrivesBoundedLoopAndTrace(t *testing.T) {
 	if record.Trace.StopReason != StopReasonStop || len(record.Trace.Iterations) != 2 {
 		t.Fatalf("unexpected trace: %#v", record.Trace)
 	}
-	if record.Trace.Usage.ModelCalls != 2 || record.Trace.Usage.Evidence != 1 {
+	if record.Trace.Usage.ModelCalls != 2 || record.Trace.Usage.Evidence != 2 {
 		t.Fatalf("budget usage not recorded: %#v", record.Trace.Usage)
 	}
 	if len(record.Result.Claims()) != 1 {
 		t.Fatal("grounded claim was not returned")
+	}
+}
+
+func TestModelPromptTemplateHashIsStable(t *testing.T) {
+	const want = "sha256:21d657e9286481d67592c7c2a44ee0db23a658f82a6f47e25576e9b56c0a32bc"
+	if got := ModelPromptTemplateHash(); got != want {
+		t.Fatalf("template hash = %s, want %s", got, want)
 	}
 }
 
@@ -328,10 +335,18 @@ func TestModelPromptIncludesRequiredActionSchemas(t *testing.T) {
 			t.Fatalf("prompt omitted schema detail %q: %s", required, prompt)
 		}
 	}
+	var envelope promptEnvelope
+	if err := json.Unmarshal([]byte(prompt), &envelope); err != nil {
+		t.Fatal(err)
+	}
+	if envelope.Consumed.Evidence != len(pack.Evidence()) ||
+		envelope.Remaining.Evidence != budgets().MaxEvidence-len(pack.Evidence()) {
+		t.Fatalf("prompt evidence budget excludes initial anchors: consumed=%#v remaining=%#v", envelope.Consumed, envelope.Remaining)
+	}
 }
 
 func TestModelPromptIncludesPriorEmptyToolDetailsAndBudgets(t *testing.T) {
-	pack, _, _ := fixture(t)
+	pack, _, additions := fixture(t)
 	model, promptProvenance := provenanceParts(t)
 	provenance, err := NewProvenance("fake-harness", model, promptProvenance, "grounded-tools-v1")
 	if err != nil {
@@ -359,6 +374,29 @@ func TestModelPromptIncludesPriorEmptyToolDetailsAndBudgets(t *testing.T) {
 		if !strings.Contains(prompt, required) {
 			t.Fatalf("prompt omitted prior tool detail %q: %s", required, prompt)
 		}
+	}
+	result, err = NewToolResult("retrieved", ActionRetrieve, additions[:1], pack.Snapshot(), pack.Authorization())
+	if err != nil {
+		t.Fatal(err)
+	}
+	action = mustRetrieveUsage(t, "retrieved", 1, Usage{InputTokens: 2, OutputTokens: 3})
+	transcript = newTranscript(request)
+	transcript.context, err = addAnchors(transcript.context, result.anchors)
+	if err != nil {
+		t.Fatal(err)
+	}
+	transcript.exchanges = []Exchange{{action: action, result: result}}
+	prompt, err = modelPrompt(request, transcript)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var envelope promptEnvelope
+	if err := json.Unmarshal([]byte(prompt), &envelope); err != nil {
+		t.Fatal(err)
+	}
+	if envelope.Consumed.Evidence != len(pack.Evidence())+len(result.anchors) ||
+		envelope.Remaining.Evidence != budgets().MaxEvidence-envelope.Consumed.Evidence {
+		t.Fatalf("prompt double-counted evidence budget: consumed=%#v remaining=%#v", envelope.Consumed, envelope.Remaining)
 	}
 }
 

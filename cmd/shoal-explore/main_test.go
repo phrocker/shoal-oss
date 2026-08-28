@@ -20,7 +20,12 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -28,7 +33,10 @@ import (
 
 	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/graph"
+	"github.com/phrocker/shoal-oss/pkg/inference"
+	"github.com/phrocker/shoal-oss/pkg/inference/harness"
 	"github.com/phrocker/shoal-oss/pkg/retrieval"
+	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
 func TestIngestListQueryWorkflow(t *testing.T) {
@@ -57,6 +65,305 @@ func TestIngestListQueryWorkflow(t *testing.T) {
 	if !strings.Contains(output.String(), "Use exponential backoff for retries.") {
 		t.Fatalf("query output = %s", output.String())
 	}
+}
+
+func TestAskWorkflowUsesFakeProviderDeterministically(t *testing.T) {
+	data := ingestAskFixture(t)
+	args := []string{
+		"ask", "-data", data,
+		"-provider", "fake",
+		"-question", "What keeps grounded answers tied to exact quotes?",
+	}
+	var first bytes.Buffer
+	if err := run(context.Background(), args, &first); err != nil {
+		t.Fatal(err)
+	}
+	var second bytes.Buffer
+	if err := run(context.Background(), args, &second); err != nil {
+		t.Fatal(err)
+	}
+	if first.String() != second.String() {
+		t.Fatalf("ask output is not deterministic:\nfirst=%s\nsecond=%s", first.String(), second.String())
+	}
+	if strings.Contains(first.String(), "DetailedTrace") {
+		t.Fatalf("default ask output dumped detailed trace: %s", first.String())
+	}
+	result := decodeJSON[askOutput](t, first.Bytes())
+	if result.Answer != "grounded" || result.StopReason != harness.StopReasonStop ||
+		len(result.Claims) != 1 || len(result.Evidence) == 0 {
+		t.Fatalf("ask result = %+v", result)
+	}
+	if result.Provenance.Provider != "fake" ||
+		result.Provenance.PromptTemplate == "" ||
+		result.Trace.Budgets.MaxSteps == 0 ||
+		result.Execution.AuthorizationEnforced {
+		t.Fatalf("missing provenance, budgets, or local execution disclosure: %+v", result)
+	}
+	referenced := make(map[string]bool)
+	for _, id := range result.Claims[0].EvidenceIDs {
+		referenced[string(id)] = true
+	}
+	foundReference := false
+	foundQuote := false
+	for _, evidence := range result.Evidence {
+		if referenced[string(evidence.ID)] {
+			foundReference = true
+		}
+		if evidence.Citation != nil &&
+			strings.Contains(evidence.Quote, "Entity Alpha keeps grounded answers tied to exact quotes.") {
+			foundQuote = true
+			if evidence.ByteRange == nil ||
+				evidence.ByteRange.End.Offset-evidence.ByteRange.Start.Offset != int64(len(evidence.Quote)) {
+				t.Fatalf("bad byte range for evidence: %+v", evidence)
+			}
+		}
+	}
+	if !foundReference || !foundQuote {
+		t.Fatalf("missing referenced evidence or exact quote: %+v", result.Evidence)
+	}
+	if result.Trace.Iterations == 0 || result.Trace.Evidence == 0 ||
+		result.Trace.StopReason != harness.StopReasonStop {
+		t.Fatalf("trace summary = %+v", result.Trace)
+	}
+	for _, tool := range result.Trace.Tools {
+		if tool == string(harness.ActionStop) {
+			t.Fatalf("stop was reported as a tool: %+v", result.Trace.Tools)
+		}
+	}
+}
+
+func TestAskMarkdownAndNoEvidenceOutput(t *testing.T) {
+	data := ingestAskFixture(t)
+	var markdown bytes.Buffer
+	if err := run(context.Background(), []string{
+		"ask", "-data", data,
+		"-question", "What keeps grounded answers tied to exact quotes?",
+		"-provider", "fake",
+		"-format", "markdown",
+		"-trace",
+	}, &markdown); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"# Answer",
+		"Entity Alpha keeps grounded answers tied to exact quotes.",
+		"authorization enforced: `false`",
+		"budget limits:",
+		"### Detailed trace",
+	} {
+		if !strings.Contains(markdown.String(), want) {
+			t.Fatalf("markdown missing %q:\n%s", want, markdown.String())
+		}
+	}
+
+	var output bytes.Buffer
+	if err := run(context.Background(), []string{
+		"ask", "-data", data,
+		"-question", "unmatched zephyr token",
+		"-provider", "fake",
+	}, &output); err != nil {
+		t.Fatalf("no-evidence ask failed: %v\n%s", err, output.String())
+	}
+	result := decodeJSON[askOutput](t, output.Bytes())
+	if len(result.Claims) != 0 || len(result.Issues) != 1 ||
+		result.Issues[0].Kind != "unresolved" ||
+		result.StopReason != harness.StopReasonStop {
+		t.Fatalf("no-evidence result = %+v", result)
+	}
+}
+
+func TestAskMarkdownCodePadsBacktickBoundaries(t *testing.T) {
+	rendered := markdownCode("`model`")
+	if rendered != "`` `model` ``" {
+		t.Fatalf("markdown code span = %q", rendered)
+	}
+}
+
+func TestAskBudgetExhaustionReportsStopReason(t *testing.T) {
+	data := ingestAskFixture(t)
+	var output bytes.Buffer
+	err := run(context.Background(), []string{
+		"ask", "-data", data,
+		"-question", "What keeps grounded answers tied to exact quotes?",
+		"-provider", "fake",
+		"-max-input-tokens", "1",
+		"-trace",
+	}, &output)
+	if !errors.Is(err, harness.ErrBudgetExhausted) {
+		t.Fatalf("error = %v\noutput = %s", err, output.String())
+	}
+	result := decodeJSON[askOutput](t, output.Bytes())
+	if result.StopReason != harness.StopReasonBudgetExhausted ||
+		result.Trace.StopReason != harness.StopReasonBudgetExhausted ||
+		result.DetailedTrace == nil ||
+		result.Answer != "No grounded answer could be produced from the available evidence." ||
+		len(result.Issues) != 1 ||
+		result.Issues[0].Kind != inference.IssueUnresolved ||
+		!strings.Contains(result.Issues[0].Reason, string(harness.StopReasonBudgetExhausted)) {
+		t.Fatalf("budget result = %+v", result)
+	}
+}
+
+func TestAskInvalidBudgetsFailBeforeNoEvidenceShortcut(t *testing.T) {
+	data := ingestAskFixture(t)
+	var output bytes.Buffer
+	err := run(context.Background(), []string{
+		"ask", "-data", data,
+		"-question", "unmatched zephyr token",
+		"-provider", "fake",
+		"-max-steps", "-1",
+	}, &output)
+	if !errors.Is(err, harness.ErrInvalid) {
+		t.Fatalf("error = %v\noutput = %s", err, output.String())
+	}
+	if output.Len() != 0 {
+		t.Fatalf("invalid budgets should not emit no-evidence output: %s", output.String())
+	}
+}
+
+func TestAskInvalidFlagAndProviderErrors(t *testing.T) {
+	tests := [][]string{
+		{"ask", "-question", "q", "extra"},
+		{"ask", "-provider", "unknown", "-question", "q"},
+		{"ask", "-provider", "openai-compatible", "-question", "q"},
+		{"ask", "-question", "q", "-modes", "nope"},
+		{"ask", "-question", "q", "-format", "xml"},
+		{"ask", "-question", "q", "-top", "0"},
+	}
+	for _, args := range tests {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			var output bytes.Buffer
+			if err := run(context.Background(), args, &output); err == nil {
+				t.Fatalf("expected error for %v; output=%s", args, output.String())
+			}
+		})
+	}
+}
+
+func TestAskDoesNotLeakOpenAICompatibleSecret(t *testing.T) {
+	data := ingestAskFixture(t)
+	const secret = "test-secret-must-never-appear"
+	t.Setenv("SHOAL_TEST_OPENAI_KEY", secret)
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer "+secret {
+			t.Fatalf("authorization header = %q", got)
+		}
+		http.Error(w, "server echoed "+secret, http.StatusUnauthorized)
+	}))
+	defer server.Close()
+	previousClient := askOpenAIHTTPClient
+	askOpenAIHTTPClient = server.Client()
+	defer func() { askOpenAIHTTPClient = previousClient }()
+
+	var output bytes.Buffer
+	err := run(context.Background(), []string{
+		"ask", "-data", data,
+		"-question", "What keeps grounded answers tied to exact quotes?",
+		"-provider", "openai-compatible",
+		"-api-base-url", server.URL,
+		"-model", "test-model",
+		"-api-key-env", "SHOAL_TEST_OPENAI_KEY",
+	}, &output)
+	if err == nil {
+		t.Fatal("expected provider failure")
+	}
+	if !strings.Contains(err.Error(), "provider authentication failed") {
+		t.Fatalf("error did not classify authentication failure: %v", err)
+	}
+	combined := output.String() + "\n" + err.Error()
+	if strings.Contains(combined, secret) {
+		t.Fatalf("secret leaked in ask output/error: %s", combined)
+	}
+}
+
+func TestAskOllamaProviderRunsHarness(t *testing.T) {
+	data := ingestAskFixture(t)
+	var calls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/generate" {
+			t.Fatalf("path = %s", r.URL.Path)
+		}
+		calls++
+		action := `{"action":"retrieve","correlation_id":"` + base64.StdEncoding.EncodeToString([]byte("ollama-retrieve")) + `","query":"entity","limit":1}`
+		if calls > 1 {
+			evidenceID := firstPromptEvidenceID(t, r)
+			action = `{"action":"stop","correlation_id":"` + base64.StdEncoding.EncodeToString([]byte("ollama-stop")) + `","claims":[{"subject":"` + base64.StdEncoding.EncodeToString([]byte("entity:ollama")) + `","predicate":"` + base64.StdEncoding.EncodeToString([]byte("predicate:summary")) + `","object":{"type":"string","value":"ollama grounded"},"confidence":1,"evidence_ids":["` + evidenceID + `"]}]}`
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"response":%q,"prompt_eval_count":1,"eval_count":1}`, action)
+	}))
+	defer server.Close()
+
+	var output bytes.Buffer
+	if err := run(context.Background(), []string{
+		"ask", "-data", data,
+		"-question", "What keeps grounded answers tied to exact quotes?",
+		"-provider", "ollama",
+		"-ollama-url", server.URL,
+		"-model", "test-ollama",
+	}, &output); err != nil {
+		t.Fatalf("ollama ask failed: %v\n%s", err, output.String())
+	}
+	result := decodeJSON[askOutput](t, output.Bytes())
+	if result.Answer != "ollama grounded" || result.Provenance.Provider != "ollama" || calls != 2 {
+		t.Fatalf("ollama result=%+v calls=%d", result, calls)
+	}
+}
+
+func TestAskMetadataOutputEncodesOpaqueBytes(t *testing.T) {
+	metadata := shoal.Metadata{
+		string([]byte{'k', 0xff}): string([]byte{'v', 0xfe}),
+		"plain":                   "text",
+	}
+	encoded := metadataForOutput(metadata)
+	if len(encoded) != 2 {
+		t.Fatalf("metadata entries = %+v", encoded)
+	}
+	if encoded[0].Key != askBytes(base64.RawURLEncoding.EncodeToString([]byte{'k', 0xff})) ||
+		encoded[0].Value != askBytes(base64.RawURLEncoding.EncodeToString([]byte{'v', 0xfe})) ||
+		encoded[1].Key != "cGxhaW4" ||
+		encoded[1].Value != "dGV4dA" {
+		t.Fatalf("metadata was not losslessly encoded: %+v", encoded)
+	}
+}
+
+func firstPromptEvidenceID(t *testing.T, r *http.Request) string {
+	t.Helper()
+	var payload struct {
+		Prompt string `json:"prompt"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		t.Fatal(err)
+	}
+	const marker = `"evidence":[{"id":"`
+	start := strings.Index(payload.Prompt, marker)
+	if start < 0 {
+		t.Fatalf("prompt missing evidence: %s", payload.Prompt)
+	}
+	start += len(marker)
+	end := strings.IndexByte(payload.Prompt[start:], '"')
+	if end < 0 {
+		t.Fatalf("prompt evidence ID not terminated: %s", payload.Prompt[start:])
+	}
+	return payload.Prompt[start : start+end]
+}
+
+func ingestAskFixture(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	source := filepath.Join(dir, "ask-guide.md")
+	if err := os.WriteFile(source, []byte(
+		"# Ask Guide\n\nEntity Alpha keeps grounded answers tied to exact quotes.\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	data := filepath.Join(dir, "data")
+	var output bytes.Buffer
+	if err := run(context.Background(), []string{
+		"ingest", "-data", data, "-file", source,
+	}, &output); err != nil {
+		t.Fatal(err)
+	}
+	return data
 }
 
 func TestDocumentedDemoWorkflow(t *testing.T) {
@@ -176,6 +483,32 @@ func TestDocumentedDemoWorkflow(t *testing.T) {
 		if first.Explanation.Scores[string(mode)] <= 0 {
 			t.Fatalf("missing %s score in %+v", mode, first.Explanation)
 		}
+	}
+
+	output.Reset()
+	if err := run(ctx, []string{
+		"ask", "-data", data,
+		"-provider", "fake",
+		"-question", "What keeps release notes grounded?",
+	}, &output); err != nil {
+		t.Fatal(err)
+	}
+	ask := decodeJSON[askOutput](t, output.Bytes())
+	if ask.Answer != "grounded" ||
+		ask.StopReason != harness.StopReasonStop ||
+		len(ask.Claims) != 1 ||
+		ask.Trace.Iterations == 0 {
+		t.Fatalf("ask = %+v", ask)
+	}
+	foundAskQuote := false
+	for _, evidence := range ask.Evidence {
+		if evidence.Quote == expectedQuote {
+			foundAskQuote = true
+			break
+		}
+	}
+	if !foundAskQuote {
+		t.Fatalf("ask evidence missing expected quote: %+v", ask.Evidence)
 	}
 
 	output.Reset()

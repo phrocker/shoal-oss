@@ -56,6 +56,14 @@ go run ./cmd/shoal-explore neighbors \
 go run ./cmd/shoal-explore query \
   -data .shoal/explorer \
   -text "what gates local to cluster promotion?"
+
+# 4. Ask a grounded question. The default fake provider is deterministic and
+#    offline; use -provider ollama or -provider openai-compatible for local or
+#    authenticated API-key-backed models.
+go run ./cmd/shoal-explore ask \
+  -data .shoal/explorer \
+  -provider fake \
+  -question "what gates local to cluster promotion?"
 ```
 
 Explorer currently provides deterministic lexical, tree, and hierarchy-graph
@@ -63,6 +71,22 @@ ranking. Vector mode fails explicitly until a vector strategy is configured;
 it never silently substitutes a different retrieval plan. PDF, source-code,
 embedding, and remote adapters can use the same public contracts while
 remaining separate from the product workflow.
+
+`shoal-explore ask` builds a snapshot-pinned context pack from retrieved
+evidence, runs the bounded `pkg/inference/harness` exploration loop, and emits
+only verified claims plus supporting evidence. Output includes exact document
+citations, quotes, byte ranges, any graph paths, redacted provenance, local
+execution semantics, budget limits, and a concise trace summary; add `-trace`
+for per-iteration details or `-format markdown` for a readable report. When no
+evidence matches, the command returns a grounded no-answer response with an
+unresolved issue instead of inventing a claim. Opaque Shoal IDs in ask output
+and graph metadata keys/values are base64-encoded so document, graph, and
+evidence identifiers round-trip losslessly. The default provider is the
+deterministic fake so the command works without network access; select
+`-provider ollama` for a local Ollama model. Credentials for
+`-provider openai-compatible` are read at request time from `-api-key-env`
+(default `SHOAL_OPENAI_API_KEY`, falling back to `OPENAI_API_KEY`) and are
+never printed or stored.
 
 ### Optional local web workspace
 
