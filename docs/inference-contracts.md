@@ -53,7 +53,8 @@ The harness implements `inference.Generator`. Its returned result remains
 bound to the supplied context pack and carries canonically verified evidence
 additions, so `InferenceResult.ValidateFor` succeeds for the caller's original
 pack. `Run` additionally returns a `Record` with the exact expanded context and
-redacted evaluation transcript.
+full in-memory transcript. Callers must not log that record; only the optional
+`Recorder` receives the separate redacted `EvaluationRecord`.
 
 No Copilot, SDK-process, or other hosted execution backend is bundled yet. A
 future backend can implement `Runner` without changing inference contracts;
