@@ -68,6 +68,45 @@ type Budgets struct {
 	MaxRepeatedAction int
 }
 
+func validateResultProvenance(result inference.InferenceResult, expected Provenance) error {
+	for _, claim := range result.Claims() {
+		model := claim.ModelProvenance()
+		prompt := claim.PromptProvenance()
+		if model.Provider() != expected.provider || model.Model() != expected.model ||
+			prompt.TemplateID() != expected.prompt.TemplateID() ||
+			prompt.Version() != expected.prompt.Version() ||
+			prompt.Hash() != expected.prompt.Hash() {
+			return invalid("claim provenance does not match the harness session")
+		}
+	}
+	return nil
+}
+
+func sectionAllowed(pack inference.ContextPack, request OpenSectionRequest) bool {
+	for _, anchor := range pack.Evidence() {
+		citation, _, ok := anchor.Document()
+		if ok && citation.DocumentID == request.documentID && citation.SectionID == request.sectionID {
+			return true
+		}
+	}
+	return false
+}
+
+func nodeAllowed(pack inference.ContextPack, nodeID shoal.ID) bool {
+	for _, anchor := range pack.Evidence() {
+		path, ok := anchor.Path()
+		if !ok {
+			continue
+		}
+		for _, node := range path.Nodes {
+			if node.ID == nodeID {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func (b Budgets) validate() error {
 	if b.MaxSteps <= 0 || b.MaxSteps > MaxTranscriptSteps {
 		return invalid("max steps is outside the supported range")
@@ -316,7 +355,7 @@ func (r ToolResult) validate() error {
 	if err := r.auth.Validate(); err != nil {
 		return err
 	}
-	if len(r.anchors) == 0 || len(r.anchors) > inference.MaxEvidenceAnchors {
+	if len(r.anchors) > inference.MaxEvidenceAnchors {
 		return invalid("tool result anchor count is outside the supported range")
 	}
 	for i, anchor := range r.anchors {
@@ -372,6 +411,7 @@ type Runner interface {
 	Start(context.Context, SessionRequest) (Session, error)
 }
 type Session interface {
+	// Next must stop promptly when ctx is canceled.
 	Next(context.Context, Transcript) (Action, error)
 }
 
@@ -391,14 +431,15 @@ type Record struct {
 // identities and digests, never raw prompts, authorization grants, or tool
 // payloads.
 type EvaluationRecord struct {
-	RequestID      shoal.ID
-	ContextPackID  shoal.ID
-	TranscriptID   shoal.ID
-	ResultID       shoal.ID
-	Provenance     Provenance
-	ActionKinds    []ActionKind
-	CorrelationIDs []shoal.ID
-	ActionDigests  []string
+	RequestID          shoal.ID
+	ContextPackID      shoal.ID
+	TranscriptID       shoal.ID
+	ResultID           shoal.ID
+	Provenance         Provenance
+	Budgets            Budgets
+	ActionKinds        []ActionKind
+	CorrelationDigests []string
+	ActionDigests      []string
 }
 
 type Recorder interface {
@@ -440,11 +481,17 @@ func (g *Generator) Run(ctx context.Context, pack inference.ContextPack) (Record
 	if !g.now().Before(pack.Authorization().ExpiresAt()) {
 		return Record{}, invalid("authorization pin is stale")
 	}
-	runCtx, cancel := context.WithTimeout(ctx, g.budgets.MaxElapsed)
+	remainingAuth := pack.Authorization().ExpiresAt().Sub(g.now())
+	if remainingAuth <= 0 {
+		return Record{}, invalid("authorization pin is stale")
+	}
+	maxElapsed := g.budgets.MaxElapsed
+	if remainingAuth < maxElapsed {
+		maxElapsed = remainingAuth
+	}
+	runCtx, cancel := context.WithTimeout(ctx, maxElapsed)
 	defer cancel()
-	session, err := callBounded(runCtx, func() (Session, error) {
-		return g.runner.Start(runCtx, request)
-	})
+	session, err := g.runner.Start(runCtx, request)
 	if err != nil {
 		if runCtx.Err() != nil {
 			return Record{}, runCtx.Err()
@@ -462,9 +509,7 @@ func (g *Generator) Run(ctx context.Context, pack inference.ContextPack) (Record
 		if !g.now().Before(pack.Authorization().ExpiresAt()) {
 			return Record{}, invalid("authorization pin expired during execution")
 		}
-		action, nextErr := callBounded(runCtx, func() (Action, error) {
-			return session.Next(runCtx, cloneTranscript(transcript))
-		})
+		action, nextErr := session.Next(runCtx, cloneTranscript(transcript))
 		if nextErr != nil {
 			if runCtx.Err() != nil {
 				return Record{}, runCtx.Err()
@@ -496,6 +541,9 @@ func (g *Generator) Run(ctx context.Context, pack inference.ContextPack) (Record
 			if err := result.ValidateFor(transcript.context); err != nil {
 				return Record{}, fmt.Errorf("%w: final result: %v", ErrInvalid, err)
 			}
+			if err := validateResultProvenance(result, g.provenance); err != nil {
+				return Record{}, err
+			}
 			if transcript.context.Snapshot() != pack.Snapshot() || transcript.context.Authorization() != pack.Authorization() {
 				return Record{}, invalid("final context pins changed")
 			}
@@ -516,21 +564,21 @@ func (g *Generator) Run(ctx context.Context, pack inference.ContextPack) (Record
 			if action.retrieve.limit > g.budgets.MaxFanout {
 				return Record{}, budget("retrieve fanout")
 			}
-			toolResult, err = callBounded(runCtx, func() (ToolResult, error) {
-				return g.tools.Retrieve(runCtx, action.retrieve, action.correlation)
-			})
+			toolResult, err = g.tools.Retrieve(runCtx, action.retrieve, action.correlation)
 		case ActionOpenSection:
-			toolResult, err = callBounded(runCtx, func() (ToolResult, error) {
-				return g.tools.OpenSection(runCtx, action.open, action.correlation)
-			})
+			if !sectionAllowed(transcript.context, action.open) {
+				return Record{}, invalid("open_section IDs were not issued to this session")
+			}
+			toolResult, err = g.tools.OpenSection(runCtx, action.open, action.correlation)
 		case ActionNeighbors:
 			hops += action.neighbors.hops
 			if hops > g.budgets.MaxGraphHops || action.neighbors.fanout > g.budgets.MaxFanout {
 				return Record{}, budget("graph traversal")
 			}
-			toolResult, err = callBounded(runCtx, func() (ToolResult, error) {
-				return g.tools.Neighbors(runCtx, action.neighbors, action.correlation)
-			})
+			if !nodeAllowed(transcript.context, action.neighbors.nodeID) {
+				return Record{}, invalid("neighbors node ID was not issued to this session")
+			}
+			toolResult, err = g.tools.Neighbors(runCtx, action.neighbors, action.correlation)
 		default:
 			return Record{}, invalid("unknown or forbidden action")
 		}
@@ -572,40 +620,22 @@ func (g *Generator) Run(ctx context.Context, pack inference.ContextPack) (Record
 	return Record{}, budget("step")
 }
 
-type boundedResult[T any] struct {
-	value T
-	err   error
-}
-
-func callBounded[T any](ctx context.Context, call func() (T, error)) (T, error) {
-	completed := make(chan boundedResult[T], 1)
-	go func() {
-		value, err := call()
-		completed <- boundedResult[T]{value: value, err: err}
-	}()
-	select {
-	case <-ctx.Done():
-		var zero T
-		return zero, ctx.Err()
-	case result := <-completed:
-		return result.value, result.err
-	}
-}
-
 func evaluationRecord(record Record) EvaluationRecord {
 	evaluation := EvaluationRecord{
-		RequestID:      record.Request.ID(),
-		ContextPackID:  record.Request.context.ID(),
-		TranscriptID:   record.Transcript.ID(),
-		ResultID:       record.Result.ID(),
-		Provenance:     record.Request.provenance,
-		ActionKinds:    make([]ActionKind, 0, len(record.Transcript.exchanges)+1),
-		CorrelationIDs: make([]shoal.ID, 0, len(record.Transcript.exchanges)+1),
-		ActionDigests:  make([]string, 0, len(record.Transcript.exchanges)+1),
+		RequestID:          record.Request.ID(),
+		ContextPackID:      record.Request.context.ID(),
+		TranscriptID:       record.Transcript.ID(),
+		ResultID:           record.Result.ID(),
+		Provenance:         record.Request.provenance,
+		Budgets:            record.Request.budgets,
+		ActionKinds:        make([]ActionKind, 0, len(record.Transcript.exchanges)+1),
+		CorrelationDigests: make([]string, 0, len(record.Transcript.exchanges)+1),
+		ActionDigests:      make([]string, 0, len(record.Transcript.exchanges)+1),
 	}
 	add := func(action Action) {
 		evaluation.ActionKinds = append(evaluation.ActionKinds, action.kind)
-		evaluation.CorrelationIDs = append(evaluation.CorrelationIDs, action.correlation)
+		correlation := sha256.Sum256([]byte(action.correlation))
+		evaluation.CorrelationDigests = append(evaluation.CorrelationDigests, hex.EncodeToString(correlation[:]))
 		sum := sha256.Sum256([]byte(actionKey(action)))
 		evaluation.ActionDigests = append(evaluation.ActionDigests, hex.EncodeToString(sum[:]))
 	}
@@ -668,13 +698,15 @@ func actionKey(a Action) string {
 func transcriptID(t Transcript) shoal.ID {
 	parts := []string{string(t.requestID), string(t.context.ID())}
 	for _, e := range t.exchanges {
-		parts = append(parts, string(e.action.kind), string(e.action.correlation), actionKey(e.action))
+		parts = append(parts, string(e.action.kind), string(e.action.correlation), actionKey(e.action),
+			strconv.Itoa(e.action.usage.InputTokens), strconv.Itoa(e.action.usage.OutputTokens))
 		for _, a := range e.result.anchors {
 			parts = append(parts, string(a.ID()))
 		}
 	}
 	if t.final != nil {
-		parts = append(parts, string(t.final.kind), string(t.final.correlation), actionKey(*t.final), string(t.final.result.ID()))
+		parts = append(parts, string(t.final.kind), string(t.final.correlation), actionKey(*t.final),
+			strconv.Itoa(t.final.usage.InputTokens), strconv.Itoa(t.final.usage.OutputTokens), string(t.final.result.ID()))
 	}
 	return deriveID("transcript", parts...)
 }

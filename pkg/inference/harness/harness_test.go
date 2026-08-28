@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"github.com/phrocker/shoal-oss/pkg/document"
+	"github.com/phrocker/shoal-oss/pkg/graph"
 	"github.com/phrocker/shoal-oss/pkg/inference"
 	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
@@ -38,7 +39,7 @@ var fixedTime = time.Date(2026, 8, 28, 12, 0, 0, 0, time.UTC)
 func TestSuccessfulTraceAndCanonicalTranscript(t *testing.T) {
 	pack, initial, additions := fixture(t)
 	retrieve := mustRetrieve(t, "r1", "more evidence", 2)
-	open := mustOpen(t, "r2", "document", "section")
+	open := mustOpen(t, "r2", "document", "section-initial")
 	neighbors := mustNeighbors(t, "r3", "node-a", 1, 2)
 	host := &fakeTools{pack: pack, results: map[shoal.ID][]inference.EvidenceAnchor{
 		"r1": {additions[0]}, "r2": {additions[1]}, "r3": {additions[2]},
@@ -49,6 +50,7 @@ func TestSuccessfulTraceAndCanonicalTranscript(t *testing.T) {
 			if len(transcript.Exchanges()) != 3 || len(transcript.Context().Evidence()) != 4 {
 				t.Fatal("runner did not receive grounded additions")
 			}
+
 			result := resultFor(t, transcript.Context(), additions[2])
 			return NewStopAction("r4", result, Usage{OutputTokens: 1})
 		},
@@ -81,6 +83,17 @@ func TestSuccessfulTraceAndCanonicalTranscript(t *testing.T) {
 	}
 	if initial.ID() == additions[0].ID() {
 		t.Fatal("fixture anchors collided")
+	}
+}
+
+func TestEmptyToolResultIsGrounded(t *testing.T) {
+	pack, initial, _ := fixture(t)
+	host := &fakeTools{pack: pack, results: map[shoal.ID][]inference.EvidenceAnchor{"empty": nil}}
+	runner := NewFakeRunner(ScriptAction(mustRetrieve(t, "empty", "nothing", 1)), func(_ context.Context, tr Transcript) (Action, error) {
+		return NewStopAction("stop", resultFor(t, tr.Context(), initial), Usage{})
+	})
+	if _, err := newGenerator(t, runner, host).Generate(context.Background(), pack); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -211,6 +224,56 @@ func TestRejectsDuplicateCorrelationAndMismatchedToolResult(t *testing.T) {
 	}
 }
 
+func TestRejectsUnissuedCapabilitiesAndProvenance(t *testing.T) {
+	pack, initial, _ := fixture(t)
+	host := &fakeTools{pack: pack}
+	for name, action := range map[string]Action{
+		"section": mustOpen(t, "open", "document", "not-issued"),
+		"node":    mustNeighbors(t, "neighbors", "not-issued", 1, 1),
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := newGenerator(t, NewFakeRunner(ScriptAction(action)), host).Generate(context.Background(), pack)
+			if !errors.Is(err, ErrInvalid) {
+				t.Fatalf("error = %v", err)
+			}
+		})
+	}
+
+	model, _ := inference.NewModelProvenance("other-provider", "other-model", "", nil, nil)
+	_, prompt := provenanceParts(t)
+	value, _ := ontology.NewStringValue("grounded")
+	claim, _ := inference.NewClaim("subject", "predicate", value, 1, []shoal.ID{initial.ID()}, inference.ClaimInferred, model, prompt, nil)
+	result, _ := inference.NewInferenceResult(pack, []inference.Claim{claim}, nil, fixedTime, nil)
+	stop, _ := NewStopAction("stop", result, Usage{})
+	_, err := newGenerator(t, NewFakeRunner(ScriptAction(stop)), host).Generate(context.Background(), pack)
+	if !errors.Is(err, ErrInvalid) {
+		t.Fatalf("provenance error = %v", err)
+	}
+}
+
+func TestEvaluationRecordIsRedactedAndIncludesBudgets(t *testing.T) {
+	pack, initial, _ := fixture(t)
+	recorder := &captureRecorder{}
+	secretCorrelation := shoal.ID("https://secret.example/token")
+	stop, _ := NewStopAction(secretCorrelation, resultFor(t, pack, initial), Usage{InputTokens: 1})
+	_, prompt := provenanceParts(t)
+	provenance, _ := NewProvenance("fake-harness", "fake-provider", "fake-model", prompt, "grounded-tools-v1")
+	g, err := NewGenerator(NewFakeRunner(ScriptAction(stop)), &fakeTools{pack: pack}, budgets(), provenance, recorder)
+	if err != nil {
+		t.Fatal(err)
+	}
+	g.now = func() time.Time { return fixedTime }
+	if _, err := g.Generate(context.Background(), pack); err != nil {
+		t.Fatal(err)
+	}
+	if recorder.record.Budgets != budgets() || len(recorder.record.CorrelationDigests) != 1 {
+		t.Fatal("evaluation record omitted budgets or correlation digest")
+	}
+	if strings.Contains(recorder.record.CorrelationDigests[0], string(secretCorrelation)) {
+		t.Fatal("evaluation record retained raw correlation ID")
+	}
+}
+
 func TestRejectsStaleSnapshotAndAuthorization(t *testing.T) {
 	pack, _, additions := fixture(t)
 	host := &fakeTools{pack: pack, results: map[shoal.ID][]inference.EvidenceAnchor{"x": {additions[0]}}, stale: true}
@@ -297,6 +360,13 @@ type fakeTools struct {
 	stale    bool
 }
 
+type captureRecorder struct{ record EvaluationRecord }
+
+func (r *captureRecorder) Record(_ context.Context, record EvaluationRecord) error {
+	r.record = record
+	return nil
+}
+
 func (f *fakeTools) Retrieve(_ context.Context, _ RetrieveRequest, id shoal.ID) (ToolResult, error) {
 	return f.make(id, ActionRetrieve)
 }
@@ -341,8 +411,17 @@ func newGeneratorWithBudgets(t *testing.T, runner Runner, tools ToolHost, b Budg
 func fixture(t *testing.T) (inference.ContextPack, inference.EvidenceAnchor, []inference.EvidenceAnchor) {
 	t.Helper()
 	initial := anchor(t, "initial", 0)
-	additions := []inference.EvidenceAnchor{anchor(t, "retrieve", 10), anchor(t, "open", 20), anchor(t, "neighbors", 30)}
+	additions := []inference.EvidenceAnchor{anchor(t, "retrieve", 10), graphAnchor(t), anchor(t, "neighbors", 30)}
 	return mustPack(t, []inference.EvidenceAnchor{initial}, fixedTime.Add(time.Hour)), initial, additions
+}
+
+func graphAnchor(t *testing.T) inference.EvidenceAnchor {
+	t.Helper()
+	anchor, err := inference.NewGraphAnchor(graph.Path{Nodes: []graph.Node{{ID: "node-a", Kind: "entity"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return anchor
 }
 func anchor(t *testing.T, quote string, offset int64) inference.EvidenceAnchor {
 	t.Helper()
@@ -396,11 +475,14 @@ func resultFor(t *testing.T, pack inference.ContextPack, evidence inference.Evid
 	return result
 }
 func mustRetrieve(t *testing.T, id shoal.ID, query string, limit int) Action {
-	return mustRetrieveUsage(t, id, limit, Usage{})
+	return mustRetrieveQueryUsage(t, id, query, limit, Usage{})
 }
 func mustRetrieveUsage(t *testing.T, id shoal.ID, limit int, usage Usage) Action {
+	return mustRetrieveQueryUsage(t, id, "query", limit, usage)
+}
+func mustRetrieveQueryUsage(t *testing.T, id shoal.ID, query string, limit int, usage Usage) Action {
 	t.Helper()
-	req, err := NewRetrieveRequest("query", limit)
+	req, err := NewRetrieveRequest(query, limit)
 	if err != nil {
 		t.Fatal(err)
 	}
