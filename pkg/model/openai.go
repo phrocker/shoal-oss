@@ -259,7 +259,7 @@ func validateOpenAIConfig(cfg OpenAIConfig, needGeneration, needEmbedding bool) 
 		return nil, &Error{Kind: ErrInvalidConfig, Operation: op}
 	}
 	u, err := url.Parse(baseURL)
-	if err != nil || !u.IsAbs() || u.Scheme != "https" || u.Host == "" || u.User != nil ||
+	if err != nil || !u.IsAbs() || u.Scheme != "https" || u.Hostname() == "" || u.User != nil ||
 		u.RawQuery != "" || u.ForceQuery || strings.Contains(baseURL, "#") ||
 		u.Fragment != "" || (u.Path != "" && u.Path != "/") {
 		return nil, &Error{Kind: ErrInvalidConfig, Operation: op}
@@ -403,6 +403,9 @@ func (o *openAIClient) post(ctx context.Context, path, op string, payload, out i
 	}
 	if int64(len(data)) > o.maxResponseBytes {
 		return &Error{Kind: ErrOversizedResponse, Operation: op}
+	}
+	if !utf8.Valid(data) {
+		return &Error{Kind: ErrMalformedResponse, Operation: op}
 	}
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	if err := decoder.Decode(out); err != nil {

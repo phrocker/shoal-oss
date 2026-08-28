@@ -286,6 +286,7 @@ func TestOpenAIResponseBoundsAndMalformedJSON(t *testing.T) {
 		want     error
 	}{
 		{name: "malformed", body: `{`, want: ErrMalformedResponse},
+		{name: "invalid utf8", body: `{"choices":[{"message":{"content":"` + string([]byte{0xff}) + `"}}]}`, want: ErrMalformedResponse},
 		{name: "trailing json", body: `{"choices":[]} {}`, want: ErrMalformedResponse},
 		{name: "oversized", body: `{"choices":[{"message":{"content":"answer"}}]}`, maxBytes: 8, want: ErrOversizedResponse},
 	}
@@ -409,6 +410,7 @@ func TestOpenAIConfigAndRequestValidation(t *testing.T) {
 	base := openAITestConfig(validServer)
 	tests := []OpenAIConfig{
 		func() OpenAIConfig { c := base; c.BaseURL = "http://example.com"; return c }(),
+		func() OpenAIConfig { c := base; c.BaseURL = "https://:443"; return c }(),
 		func() OpenAIConfig { c := base; c.BaseURL += "/prefix"; return c }(),
 		func() OpenAIConfig { c := base; c.BaseURL += "?query=1"; return c }(),
 		func() OpenAIConfig { c := base; c.BaseURL += "?"; return c }(),
@@ -433,6 +435,16 @@ func TestOpenAIConfigAndRequestValidation(t *testing.T) {
 	}
 	if _, err := generator.Generate(context.Background(), GenerateRequest{Prompt: "four"}); !errors.Is(err, ErrInvalidRequest) {
 		t.Fatalf("request error = %v", err)
+	}
+	if _, err := generator.Generate(context.Background(), GenerateRequest{Prompt: string([]byte{0xff})}); !errors.Is(err, ErrInvalidRequest) {
+		t.Fatalf("invalid UTF-8 request error = %v", err)
+	}
+	embedder, err := NewOpenAIEmbedder(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := embedder.Embed(context.Background(), EmbedRequest{Text: string([]byte{0xff})}); !errors.Is(err, ErrInvalidRequest) {
+		t.Fatalf("invalid UTF-8 embedding request error = %v", err)
 	}
 }
 
