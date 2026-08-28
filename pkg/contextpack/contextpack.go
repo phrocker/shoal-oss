@@ -26,12 +26,16 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"hash"
+	"math"
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/phrocker/shoal-oss/pkg/document"
@@ -319,9 +323,6 @@ func (b Builder) ExpandNeighbors(
 	}).Normalize()
 	if err != nil {
 		return inference.ContextPack{}, err
-	}
-	if int(normalized.Depth) > limits.MaxPathNodes-1 {
-		return inference.ContextPack{}, invalid("graph expansion exceeds the path bound")
 	}
 	neighborhood, err := b.Reader.Neighborhood(ctx, normalized)
 	if err != nil {
@@ -836,48 +837,61 @@ func provenanceMetadata(
 }
 
 func retrievalIdentity(request retrieval.Request, response retrieval.Response) (string, error) {
-	type evidenceIdentity struct {
-		Citation document.Citation `json:"citation"`
-		Quote    string            `json:"quote"`
-		Path     graph.Path        `json:"path"`
-		Score    shoal.Score       `json:"score"`
+	digest := sha256.New()
+	writePart(digest, []byte(builderVersion))
+	writePart(digest, []byte(request.Text))
+	writeUint64(digest, uint64(request.TopK))
+	writeUint64(digest, uint64(len(request.Modes)))
+	for _, mode := range request.Modes {
+		writePart(digest, []byte(mode))
 	}
-	type resultIdentity struct {
-		ID          shoal.ID               `json:"id"`
-		Score       shoal.Score            `json:"score"`
-		Evidence    []evidenceIdentity     `json:"evidence"`
-		Explanation *retrieval.Explanation `json:"explanation,omitempty"`
+	documentIDs := append([]shoal.ID(nil), request.Scope.DocumentIDs...)
+	nodeIDs := append([]shoal.ID(nil), request.Scope.NodeIDs...)
+	sort.Slice(documentIDs, func(i, j int) bool {
+		return shoal.CompareID(documentIDs[i], documentIDs[j]) < 0
+	})
+	sort.Slice(nodeIDs, func(i, j int) bool {
+		return shoal.CompareID(nodeIDs[i], nodeIDs[j]) < 0
+	})
+	writeIDs(digest, documentIDs)
+	writeIDs(digest, nodeIDs)
+	writeBool(digest, !request.AsOf.IsZero())
+	if !request.AsOf.IsZero() {
+		writePart(digest, []byte(canonicalTime(request.AsOf)))
 	}
-	results := make([]resultIdentity, 0, len(response.Results))
+	writeBool(digest, request.Explain)
+	writePart(digest, []byte(response.RequestID))
+	writeUint64(digest, uint64(len(response.Results)))
 	for _, result := range response.Results {
-		item := resultIdentity{
-			ID: result.ID, Score: result.Score, Explanation: cloneExplanation(result.Explanation),
-		}
+		writePart(digest, []byte(result.ID))
+		writeScore(digest, result.Score)
+		writeUint64(digest, uint64(len(result.Evidence)))
 		for _, evidence := range result.Evidence {
-			item.Evidence = append(item.Evidence, evidenceIdentity{
-				Citation: evidence.Citation,
-				Quote:    evidence.Quote,
-				Path:     clonePath(evidence.Path),
-				Score:    evidence.Score,
-			})
+			writeCitation(digest, evidence.Citation)
+			writePart(digest, []byte(evidence.Quote))
+			writePath(digest, evidence.Path)
+			writeScore(digest, evidence.Score)
 		}
-		results = append(results, item)
+		if result.Explanation == nil {
+			writeBool(digest, false)
+			continue
+		}
+		writeBool(digest, true)
+		modes := append([]retrieval.Mode(nil), result.Explanation.Modes...)
+		sort.Slice(modes, func(i, j int) bool { return modes[i] < modes[j] })
+		writeUint64(digest, uint64(len(modes)))
+		for _, mode := range modes {
+			writePart(digest, []byte(mode))
+		}
+		writePart(digest, []byte(result.Explanation.Summary))
+		keys := sortedMetadataKeys(result.Explanation.Scores)
+		writeUint64(digest, uint64(len(keys)))
+		for _, key := range keys {
+			writePart(digest, []byte(key))
+			writeScore(digest, result.Explanation.Scores[key])
+		}
 	}
-	payload := struct {
-		Version   string            `json:"version"`
-		Request   retrieval.Request `json:"request"`
-		RequestID shoal.ID          `json:"request_id"`
-		Results   []resultIdentity  `json:"results"`
-	}{
-		Version: builderVersion, Request: request,
-		RequestID: response.RequestID, Results: results,
-	}
-	encoded, err := json.Marshal(payload)
-	if err != nil {
-		return "", shoal.WrapError(shoal.ErrorInvalidArgument, "encode retrieval identity", err)
-	}
-	sum := sha256.Sum256(encoded)
-	return "sha256:" + hex.EncodeToString(sum[:]), nil
+	return "sha256:" + hex.EncodeToString(digest.Sum(nil)), nil
 }
 
 func buildPack(
@@ -887,7 +901,7 @@ func buildPack(
 	metadata shoal.Metadata,
 	limits Limits,
 ) (inference.ContextPack, error) {
-	if err := enforcePackBounds(query, anchors, metadata, limits); err != nil {
+	if err := enforcePackBounds(query, anchors, pins, metadata, limits); err != nil {
 		return inference.ContextPack{}, err
 	}
 	return inference.NewContextPack(
@@ -956,47 +970,81 @@ func anchorsEqual(left, right inference.EvidenceAnchor) bool {
 func enforcePackBounds(
 	query string,
 	anchors []inference.EvidenceAnchor,
+	pins Pins,
 	metadata shoal.Metadata,
 	limits Limits,
 ) error {
 	if len(anchors) > limits.MaxAnchors {
 		return invalid("context evidence exceeds the anchor bound")
 	}
+	contextBytes, quoteBytes, graphNodes, graphEdges, err :=
+		contextPackByteSize(query, anchors, pins, metadata, limits.MaxPathNodes)
+	if err != nil {
+		return err
+	}
+	if quoteBytes > limits.MaxQuoteBytes {
+		return invalid("context evidence exceeds the total quote byte bound")
+	}
+	if graphNodes > limits.MaxGraphNodes {
+		return invalid("context evidence exceeds the graph node bound")
+	}
+	if graphEdges > limits.MaxGraphEdges {
+		return invalid("context evidence exceeds the graph edge bound")
+	}
+	if contextBytes > limits.MaxContextBytes {
+		return invalid("context pack exceeds the builder byte bound")
+	}
+	return nil
+}
+
+func contextPackByteSize(
+	query string,
+	anchors []inference.EvidenceAnchor,
+	pins Pins,
+	metadata shoal.Metadata,
+	maxPathNodes int,
+) (int, int, int, int, error) {
 	quoteBytes := 0
 	graphNodes := 0
 	graphEdges := 0
-	contextBytes := len(query) + metadataBytes(metadata)
+	payloadBytes := len(query) + metadataBytes(metadata)
+	anchorIDs := make([]string, 0, len(anchors))
 	for _, anchor := range anchors {
-		contextBytes += len(anchor.ID()) + len(anchor.Kind())
+		anchorIDs = append(anchorIDs, string(anchor.ID()))
 		if citation, quote, ok := anchor.Document(); ok {
 			quoteBytes += len(quote)
-			contextBytes += len(quote) + citationBytes(citation)
+			payloadBytes += len(anchor.ID()) + len(quote) +
+				len(citation.DocumentID) + len(citation.RevisionID) +
+				len(citation.SectionID) + len(citation.SpanID) + 24
 		} else if path, ok := anchor.Path(); ok {
-			if len(path.Nodes) > limits.MaxPathNodes {
-				return invalid("context graph path exceeds the path bound")
+			if len(path.Nodes) > maxPathNodes {
+				return 0, 0, 0, 0, invalid("context graph path exceeds the path bound")
 			}
 			graphNodes += len(path.Nodes)
 			graphEdges += len(path.Edges)
-			if graphNodes > limits.MaxGraphNodes {
-				return invalid("context evidence exceeds the graph node bound")
-			}
-			if graphEdges > limits.MaxGraphEdges {
-				return invalid("context evidence exceeds the graph edge bound")
-			}
-			encoded, err := json.Marshal(path)
-			if err != nil {
-				return shoal.WrapError(shoal.ErrorInvalidArgument, "encode graph path", err)
-			}
-			contextBytes += len(encoded)
-		}
-		if quoteBytes > limits.MaxQuoteBytes {
-			return invalid("context evidence exceeds the total quote byte bound")
-		}
-		if contextBytes > limits.MaxContextBytes {
-			return invalid("context pack exceeds the builder byte bound")
+			payloadBytes += len(anchor.ID()) + pathPayloadBytes(path)
 		}
 	}
-	return nil
+	ontologyLength := 0
+	if pins.Ontology != nil {
+		ontologyLength = canonicalPartsLength(
+			len(pins.Ontology.SchemaID()), len(pins.Ontology.VersionID()))
+	}
+	anchorIDLengths := make([]int, len(anchorIDs))
+	for index, id := range anchorIDs {
+		anchorIDLengths[index] = len(id)
+	}
+	canonicalLength := canonicalPartsLength(
+		len(query),
+		canonicalPartsLength(anchorIDLengths...),
+		ontologyLength,
+		len(pins.Snapshot.ID()),
+		len(canonicalTime(pins.Snapshot.AsOf())),
+		len(pins.Authorization.Fingerprint()),
+		len(canonicalTime(pins.Authorization.ExpiresAt())),
+		canonicalMetadataLength(metadata),
+	)
+	return payloadBytes + canonicalLength, quoteBytes, graphNodes, graphEdges, nil
 }
 
 func normalizeLimits(input Limits) (Limits, error) {
@@ -1164,11 +1212,126 @@ func metadataBytes(metadata shoal.Metadata) int {
 	return total
 }
 
-func citationBytes(citation document.Citation) int {
-	return len(citation.DocumentID) + len(citation.RevisionID) +
-		len(citation.SectionID) + len(citation.SpanID) +
-		len(strconv.FormatInt(citation.Range.Start.Offset, 10)) +
-		len(strconv.FormatInt(citation.Range.End.Offset, 10))
+func pathPayloadBytes(path graph.Path) int {
+	total := 0
+	for _, node := range path.Nodes {
+		total += len(node.ID) + len(node.Kind) + metadataBytes(node.Properties)
+		for _, label := range node.Labels {
+			total += len(label)
+		}
+	}
+	for _, edge := range path.Edges {
+		total += len(edge.ID) + len(edge.From) + len(edge.To) + len(edge.Type) + 8
+		total += metadataBytes(edge.Properties)
+	}
+	return total
+}
+
+func canonicalPartsLength(partLengths ...int) int {
+	total := 0
+	for _, length := range partLengths {
+		total += len(strconv.Itoa(length)) + 1 + length
+	}
+	return total
+}
+
+func canonicalMetadataLength(metadata shoal.Metadata) int {
+	lengths := make([]int, 0, len(metadata)*2)
+	for _, key := range sortedMetadataKeys(metadata) {
+		lengths = append(lengths, len(key), len(metadata[key]))
+	}
+	return canonicalPartsLength(lengths...)
+}
+
+func canonicalTime(value time.Time) string {
+	return value.UTC().Format(time.RFC3339Nano)
+}
+
+func sortedMetadataKeys[T any](values map[string]T) []string {
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func writePart(writer hash.Hash, value []byte) {
+	writeUint64(writer, uint64(len(value)))
+	_, _ = writer.Write(value)
+}
+
+func writeUint64(writer hash.Hash, value uint64) {
+	var encoded [8]byte
+	binary.BigEndian.PutUint64(encoded[:], value)
+	_, _ = writer.Write(encoded[:])
+}
+
+func writeInt64(writer hash.Hash, value int64) {
+	writeUint64(writer, uint64(value))
+}
+
+func writeBool(writer hash.Hash, value bool) {
+	if value {
+		_, _ = writer.Write([]byte{1})
+		return
+	}
+	_, _ = writer.Write([]byte{0})
+}
+
+func writeScore(writer hash.Hash, value shoal.Score) {
+	writeUint64(writer, math.Float64bits(float64(value)))
+}
+
+func writeIDs(writer hash.Hash, ids []shoal.ID) {
+	writeUint64(writer, uint64(len(ids)))
+	for _, id := range ids {
+		writePart(writer, []byte(id))
+	}
+}
+
+func writeCitation(writer hash.Hash, citation document.Citation) {
+	writePart(writer, []byte(citation.DocumentID))
+	writePart(writer, []byte(citation.RevisionID))
+	writePart(writer, []byte(citation.SectionID))
+	writePart(writer, []byte(citation.SpanID))
+	writeInt64(writer, citation.Range.Start.Offset)
+	writeInt64(writer, int64(citation.Range.Start.Page))
+	writeInt64(writer, citation.Range.End.Offset)
+	writeInt64(writer, int64(citation.Range.End.Page))
+}
+
+func writePath(writer hash.Hash, path graph.Path) {
+	writeUint64(writer, uint64(len(path.Nodes)))
+	for _, node := range path.Nodes {
+		writePart(writer, []byte(node.ID))
+		writePart(writer, []byte(node.Kind))
+		labels := append([]string(nil), node.Labels...)
+		sort.Strings(labels)
+		writeUint64(writer, uint64(len(labels)))
+		for _, label := range labels {
+			writePart(writer, []byte(label))
+		}
+		writeMetadata(writer, node.Properties)
+	}
+	writeUint64(writer, uint64(len(path.Edges)))
+	for _, edge := range path.Edges {
+		writePart(writer, []byte(edge.ID))
+		writePart(writer, []byte(edge.From))
+		writePart(writer, []byte(edge.To))
+		writePart(writer, []byte(edge.Type))
+		writeScore(writer, edge.Weight)
+		writeMetadata(writer, edge.Properties)
+	}
+}
+
+func writeMetadata(writer hash.Hash, metadata shoal.Metadata) {
+	keys := sortedMetadataKeys(metadata)
+	writeUint64(writer, uint64(len(keys)))
+	for _, key := range keys {
+		writePart(writer, []byte(key))
+		writePart(writer, []byte(metadata[key]))
+	}
 }
 
 func rangeContains(outer, inner document.SourceRange) bool {

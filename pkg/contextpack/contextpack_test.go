@@ -212,6 +212,14 @@ func TestOpenSectionAndExpandNeighborsAreExplicitBoundedAndImmutable(t *testing.
 	if len(full.Evidence()) == 0 {
 		t.Fatal("input pack was mutated")
 	}
+	if _, err := (Builder{
+		Reader: client, Limits: Limits{MaxPathNodes: 2},
+	}).ExpandNeighbors(context.Background(), initial, ExpandNeighborsRequest{
+		NodeIDs: []shoal.ID{path.Nodes[0].ID},
+		Depth:   2,
+	}); err != nil {
+		t.Fatalf("neighborhood depth was incorrectly treated as path length: %v", err)
+	}
 
 	_, err = (Builder{Reader: client, Limits: Limits{MaxHierarchyDepth: 1}}).
 		OpenSection(context.Background(), initial, OpenSectionRequest{
@@ -228,6 +236,53 @@ func TestOpenSectionAndExpandNeighborsAreExplicitBoundedAndImmutable(t *testing.
 		NodeIDs: []shoal.ID{path.Nodes[0].ID, path.Nodes[0].ID},
 	})
 	assertCode(t, err, shoal.ErrorInvalidArgument)
+}
+
+func TestContextByteLimitIncludesPinsAndCanonicalFraming(t *testing.T) {
+	client, request, response, pins := embeddedFixture(t)
+	pack, err := (Builder{Reader: client}).Build(context.Background(), InitialRequest{
+		Request: request, Response: response, Pins: pins,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	size, _, _, _, err := contextPackByteSize(
+		pack.Query(), pack.Evidence(), pins, pack.Metadata(), DefaultMaxPathNodes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := enforcePackBounds(
+		pack.Query(), pack.Evidence(), pins, pack.Metadata(),
+		mustLimits(t, Limits{MaxContextBytes: size}),
+	); err != nil {
+		t.Fatalf("exact context byte limit rejected: %v", err)
+	}
+	if err := enforcePackBounds(
+		pack.Query(), pack.Evidence(), pins, pack.Metadata(),
+		mustLimits(t, Limits{MaxContextBytes: size - 1}),
+	); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
+		t.Fatalf("over-limit context error = %v", err)
+	}
+}
+
+func TestRetrievalIdentityPreservesOpaqueIDs(t *testing.T) {
+	request, err := (retrieval.Request{Text: "query"}).Normalize()
+	if err != nil {
+		t.Fatal(err)
+	}
+	left := retrieval.Response{Results: []retrieval.Result{{ID: shoal.ID("\xff")}}}
+	right := retrieval.Response{Results: []retrieval.Result{{ID: shoal.ID("\xfe")}}}
+	leftIdentity, err := retrievalIdentity(request, left)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rightIdentity, err := retrievalIdentity(request, right)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if leftIdentity == rightIdentity {
+		t.Fatal("opaque result IDs collided in retrieval identity")
+	}
 }
 
 func TestBoundsFailClosed(t *testing.T) {
@@ -503,4 +558,13 @@ func assertCode(t *testing.T, err error, code shoal.ErrorCode) {
 	if !shoal.IsErrorCode(err, code) {
 		t.Fatalf("error = %v, want code %q", err, code)
 	}
+}
+
+func mustLimits(t *testing.T, limits Limits) Limits {
+	t.Helper()
+	normalized, err := normalizeLimits(limits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return normalized
 }
