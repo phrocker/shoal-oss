@@ -251,6 +251,9 @@ func (b Builder) OpenSection(
 	if request.Depth > limits.MaxHierarchyDepth {
 		return inference.ContextPack{}, invalid("section expansion exceeds the hierarchy depth bound")
 	}
+	if len(request.SectionIDs) > limits.MaxSections {
+		return inference.ContextPack{}, invalid("section selection exceeds the section bound")
+	}
 	if err := validateUniqueIDs("section ID", request.SectionIDs); err != nil {
 		return inference.ContextPack{}, err
 	}
@@ -323,6 +326,9 @@ func (b Builder) ExpandNeighbors(
 	}
 	if b.Reader == nil {
 		return inference.ContextPack{}, invalid("graph hydration requires an Explorer reader")
+	}
+	if len(request.NodeIDs) > limits.MaxGraphNodes {
+		return inference.ContextPack{}, invalid("graph seeds exceed the node bound")
 	}
 	if err := validateUniqueIDs("graph node ID", request.NodeIDs); err != nil {
 		return inference.ContextPack{}, err
@@ -935,8 +941,10 @@ func retrievalIdentity(request retrieval.Request, response retrieval.Response) (
 	writePart(digest, []byte(builderVersion))
 	writePart(digest, []byte(request.Text))
 	writeUint64(digest, uint64(request.TopK))
-	writeUint64(digest, uint64(len(request.Modes)))
-	for _, mode := range request.Modes {
+	modes := append([]retrieval.Mode(nil), request.Modes...)
+	sort.Slice(modes, func(i, j int) bool { return modes[i] < modes[j] })
+	writeUint64(digest, uint64(len(modes)))
+	for _, mode := range modes {
 		writePart(digest, []byte(mode))
 	}
 	documentIDs := append([]shoal.ID(nil), request.Scope.DocumentIDs...)
@@ -1273,6 +1281,9 @@ func cloneExplanation(explanation *retrieval.Explanation) *retrieval.Explanation
 func cloneView(view explorer.DocumentView) explorer.DocumentView {
 	view.Document.Metadata = cloneMetadata(view.Document.Metadata)
 	view.Revision.Metadata = cloneMetadata(view.Revision.Metadata)
+	if !view.Revision.CreatedAt.IsZero() {
+		view.Revision.CreatedAt = view.Revision.CreatedAt.UTC()
+	}
 	view.Root = cloneSectionView(view.Root)
 	return view
 }

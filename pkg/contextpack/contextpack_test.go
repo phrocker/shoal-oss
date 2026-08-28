@@ -103,6 +103,20 @@ func TestBuildFromEmbeddedExplorerExactEvidenceAndDeterminism(t *testing.T) {
 	if first.ID() != reordered.ID() {
 		t.Fatal("input result/evidence order changed canonical pack identity")
 	}
+	modeOrder := request
+	modeOrder.Modes = []retrieval.Mode{
+		retrieval.ModeGraph, retrieval.ModeTree, retrieval.ModeLexical,
+	}
+	reorderedModes, err := builder.Build(context.Background(), InitialRequest{
+		Request: modeOrder, Response: response, Pins: pins,
+		Metadata: shoal.Metadata{"application": "test"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.ID() != reorderedModes.ID() {
+		t.Fatal("retrieval mode order changed canonical pack identity")
+	}
 }
 
 func TestBuildDocumentGraphAndMixedSelection(t *testing.T) {
@@ -244,6 +258,28 @@ func TestOpenSectionAndExpandNeighborsAreExplicitBoundedAndImmutable(t *testing.
 		NodeIDs: []shoal.ID{path.Nodes[0].ID, path.Nodes[0].ID},
 	})
 	assertCode(t, err, shoal.ErrorInvalidArgument)
+
+	reader := &recordingReader{}
+	tooManySections := make([]shoal.ID, DefaultMaxSections+1)
+	for index := range tooManySections {
+		tooManySections[index] = shoal.ID(fmt.Sprintf("section-%d", index))
+	}
+	_, err = (Builder{Reader: reader}).OpenSection(
+		context.Background(), initial, OpenSectionRequest{
+			DocumentID: citation.DocumentID, RevisionID: citation.RevisionID,
+			SectionIDs: tooManySections,
+		})
+	assertCode(t, err, shoal.ErrorInvalidArgument)
+	tooManyNodes := make([]shoal.ID, DefaultMaxGraphNodes+1)
+	for index := range tooManyNodes {
+		tooManyNodes[index] = shoal.ID(fmt.Sprintf("node-%d", index))
+	}
+	_, err = (Builder{Reader: reader}).ExpandNeighbors(
+		context.Background(), full, ExpandNeighborsRequest{NodeIDs: tooManyNodes})
+	assertCode(t, err, shoal.ErrorInvalidArgument)
+	if reader.documentCalls != 0 || reader.neighborhoodCalls != 0 {
+		t.Fatal("oversized explicit expansion reached the hydration seam")
+	}
 }
 
 func TestContextByteLimitIncludesPinsAndCanonicalFraming(t *testing.T) {
@@ -506,6 +542,15 @@ func TestHydratedDuplicatesRequireExactContentAndRequestedIdentity(t *testing.T)
 		[]explorer.DocumentView{nilMetadata, emptyMetadata}, nil,
 	); err != nil {
 		t.Fatalf("canonical empty metadata was treated as conflicting: %v", err)
+	}
+	localTime := cloneView(view)
+	localTime.Revision.CreatedAt = localTime.Revision.CreatedAt.In(
+		time.FixedZone("offset", 2*60*60))
+	if _, err := newVerifier(
+		context.Background(), nil, limits,
+		[]explorer.DocumentView{view, localTime}, nil,
+	); err != nil {
+		t.Fatalf("equivalent revision timestamps were treated as conflicting: %v", err)
 	}
 
 	opaqueLeft := cloneView(view)
