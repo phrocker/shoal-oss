@@ -6,12 +6,11 @@ import (
 	"errors"
 	"io"
 	"math"
-	"net/http"
-	"strings"
 	"sync"
 	"time"
 
 	"github.com/phrocker/shoal-oss/internal/embedpb"
+	modelio "github.com/phrocker/shoal-oss/pkg/model"
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/proto"
 )
@@ -216,21 +215,32 @@ func (s GRPCStore) Scan(ctx context.Context, table string, req *embedpb.ScanRequ
 	return cells, nil
 }
 
-// OllamaLLM is optional. Tests use FakeLLM; this adapter is only constructed explicitly.
-type OllamaLLM struct {
-	Endpoint string
-	Client   *http.Client
-	Model    string
+type modelEmbedderAdapter struct{ embedder modelio.Embedder }
+
+func (a modelEmbedderAdapter) Embed(ctx context.Context, text string) ([]float32, error) {
+	result, err := a.embedder.Embed(ctx, modelio.EmbedRequest{Text: text})
+	return append([]float32(nil), result.Vector...), err
 }
 
-func (o OllamaLLM) Infer(ctx context.Context, prompt string) (string, error) {
-	// Keep the optional implementation dependency-free and conservative: callers may
-	// replace this with a platform adapter. Returning a deterministic local fallback
-	// avoids network use unless a downstream package opts into its own transport.
-	if strings.TrimSpace(o.Endpoint) == "" {
-		return FakeLLM{}.Infer(ctx, prompt)
+type modelGeneratorAdapter struct{ generator modelio.TextGenerator }
+
+func (a modelGeneratorAdapter) Infer(ctx context.Context, prompt string) (string, error) {
+	result, err := a.generator.Generate(ctx, modelio.GenerateRequest{Prompt: prompt})
+	return result.Text, err
+}
+
+func AdaptEmbedder(embedder modelio.Embedder) Embedder {
+	if embedder == nil {
+		return nil
 	}
-	return "ollama-adapter-configured", nil
+	return modelEmbedderAdapter{embedder: embedder}
+}
+
+func AdaptTextGenerator(generator modelio.TextGenerator) LLM {
+	if generator == nil {
+		return nil
+	}
+	return modelGeneratorAdapter{generator: generator}
 }
 
 func unixMillis(t time.Time) int64 {
