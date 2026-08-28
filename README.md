@@ -36,6 +36,10 @@ The alpha accepts UTF-8 Markdown and plain text, persists the corpus in
 Shoal's embedded engine, builds deterministic document and graph structure,
 and returns revision-specific span citations.
 
+For a clean-checkout, command-by-command demo that also starts the optional
+web workspace, see
+[`docs/explorer-demo-walkthrough.md`](docs/explorer-demo-walkthrough.md).
+
 ```bash
 # 1. Ingest a source into a durable local corpus.
 go run ./cmd/shoal-explore ingest \

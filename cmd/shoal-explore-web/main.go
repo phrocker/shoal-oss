@@ -23,6 +23,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -35,13 +36,16 @@ import (
 )
 
 func main() {
-	if err := run(os.Args[1:]); err != nil {
+	ctx, stop := signal.NotifyContext(
+		context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if err := run(ctx, os.Args[1:], os.Stdout); err != nil {
 		fmt.Fprintf(os.Stderr, "shoal-explore-web: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-func run(args []string) error {
+func run(ctx context.Context, args []string, output io.Writer) error {
 	flags := flag.NewFlagSet("shoal-explore-web", flag.ContinueOnError)
 	data := flags.String("data", ".shoal/explorer", "Explorer corpus directory")
 	listen := flags.String("listen", "127.0.0.1:8080", "HTTP listen address")
@@ -73,10 +77,7 @@ func run(args []string) error {
 		WriteTimeout:      30 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
-	fmt.Printf("Shoal Explorer listening at http://%s\n", listener.Addr())
-	ctx, stop := signal.NotifyContext(
-		context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
+	fmt.Fprintf(output, "Shoal Explorer listening at http://%s\n", listener.Addr())
 	shutdownDone := make(chan error, 1)
 	go func() {
 		<-ctx.Done()
