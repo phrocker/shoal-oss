@@ -216,6 +216,9 @@ type RetrieveRequest struct {
 }
 
 func NewRetrieveRequest(query string, limit int) (RetrieveRequest, error) {
+	if err := boundedString("retrieve query", query, MaxToolQueryBytes); err != nil {
+		return RetrieveRequest{}, err
+	}
 	query = strings.Join(strings.Fields(query), " ")
 	if err := boundedString("retrieve query", query, MaxToolQueryBytes); err != nil {
 		return RetrieveRequest{}, err
@@ -350,6 +353,9 @@ type ToolResult struct {
 }
 
 func NewToolResult(correlation shoal.ID, kind ActionKind, anchors []inference.EvidenceAnchor, snapshot inference.SnapshotPin, auth inference.AuthPin) (ToolResult, error) {
+	if len(anchors) > inference.MaxEvidenceAnchors {
+		return ToolResult{}, invalid("tool result anchor count is outside the supported range")
+	}
 	r := ToolResult{correlation: correlation, kind: kind, anchors: append([]inference.EvidenceAnchor(nil), anchors...), snapshot: snapshot, auth: auth}
 	sort.Slice(r.anchors, func(i, j int) bool { return shoal.CompareID(r.anchors[i].ID(), r.anchors[j].ID()) < 0 })
 	if err := r.validate(); err != nil {
@@ -432,6 +438,7 @@ func (t Transcript) Final() (Action, bool) {
 }
 
 type Runner interface {
+	// Start must stop promptly when ctx is canceled.
 	Start(context.Context, SessionRequest) (Session, error)
 }
 type Session interface {
@@ -440,6 +447,7 @@ type Session interface {
 }
 
 type ToolHost interface {
+	// Implementations must stop promptly when ctx is canceled.
 	Retrieve(context.Context, ToolContext, RetrieveRequest) (ToolResult, error)
 	OpenSection(context.Context, ToolContext, OpenSectionRequest) (ToolResult, error)
 	Neighbors(context.Context, ToolContext, NeighborsRequest) (ToolResult, error)
@@ -507,9 +515,11 @@ func NewGenerator(runner Runner, tools ToolHost, budgets Budgets, provenance Pro
 	return &Generator{runner: runner, tools: tools, budgets: budgets, provenance: provenance, recorder: recorder, now: time.Now}, nil
 }
 
-func (g *Generator) Generate(ctx context.Context, pack inference.ContextPack) (inference.InferenceResult, error) {
-	record, err := g.Run(ctx, pack)
-	return record.Result, err
+// Generate returns the final result together with the exact expanded context
+// against which it validates. Tool additions make returning only an
+// inference.InferenceResult through the base inference.Generator lossy.
+func (g *Generator) Generate(ctx context.Context, pack inference.ContextPack) (Record, error) {
+	return g.Run(ctx, pack)
 }
 
 func (g *Generator) Run(ctx context.Context, pack inference.ContextPack) (Record, error) {
@@ -727,7 +737,7 @@ func addAnchors(pack inference.ContextPack, additions []inference.EvidenceAnchor
 	}
 	for _, a := range additions {
 		if _, duplicate := seen[a.ID()]; duplicate {
-			return inference.ContextPack{}, invalid("tool result repeats existing evidence")
+			continue
 		}
 		seen[a.ID()] = struct{}{}
 		anchors = append(anchors, a)
@@ -858,5 +868,3 @@ func cloneTranscript(t Transcript) Transcript {
 	}
 	return t
 }
-
-var _ inference.Generator = (*Generator)(nil)

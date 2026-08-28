@@ -60,6 +60,7 @@ func TestSuccessfulTraceAndCanonicalTranscript(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	if err := record.Result.ValidateFor(record.Transcript.Context()); err != nil {
 		t.Fatal(err)
 	}
@@ -86,6 +87,21 @@ func TestSuccessfulTraceAndCanonicalTranscript(t *testing.T) {
 	}
 }
 
+func TestOverlappingToolEvidencePreservesSetSemantics(t *testing.T) {
+	pack, initial, _ := fixture(t)
+	host := &fakeTools{pack: pack, results: map[shoal.ID][]inference.EvidenceAnchor{"same": {initial}}}
+	runner := NewFakeRunner(ScriptAction(mustRetrieve(t, "same", "overlap", 1)), func(_ context.Context, tr Transcript) (Action, error) {
+		return NewStopAction("stop", resultFor(t, tr.Context(), initial), Usage{})
+	})
+	record, err := newGenerator(t, runner, host).Generate(context.Background(), pack)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(record.Transcript.Context().Evidence()) != 1 {
+		t.Fatal("overlapping evidence was duplicated")
+	}
+}
+
 func TestEmptyToolResultIsGrounded(t *testing.T) {
 	pack, initial, _ := fixture(t)
 	host := &fakeTools{pack: pack, results: map[shoal.ID][]inference.EvidenceAnchor{"empty": nil}}
@@ -106,6 +122,12 @@ func TestRejectsMalformedIDs(t *testing.T) {
 	}
 	if _, err := NewNeighborsRequest("", 1, 1); err == nil {
 		t.Fatal("empty node ID accepted")
+	}
+	if _, err := NewRetrieveRequest(string([]byte{0xff}), 1); err == nil {
+		t.Fatal("invalid UTF-8 query accepted")
+	}
+	if _, err := NewRetrieveRequest(strings.Repeat(" ", MaxToolQueryBytes+1), 1); err == nil {
+		t.Fatal("oversized raw query accepted")
 	}
 }
 
@@ -226,6 +248,17 @@ func TestCancellationTimeoutAndRunnerFailure(t *testing.T) {
 	g = newGenerator(t, NewFakeRunner(ScriptFault(errors.New("offline"))), &fakeTools{pack: pack})
 	if _, err := g.Generate(context.Background(), pack); !errors.Is(err, ErrRunnerUnavailable) {
 		t.Fatalf("runner error = %v", err)
+	}
+
+	short.MaxElapsed = time.Millisecond
+	g = newGeneratorWithBudgets(t, blockingRunner{}, &fakeTools{pack: pack}, short)
+	if _, err := g.Generate(context.Background(), pack); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("start cancellation error = %v", err)
+	}
+
+	g = newGeneratorWithBudgets(t, NewFakeRunner(ScriptAction(mustRetrieve(t, "tool", "wait", 1))), blockingTools{}, short)
+	if _, err := g.Generate(context.Background(), pack); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("tool cancellation error = %v", err)
 	}
 }
 
@@ -398,6 +431,28 @@ type captureRecorder struct{ record EvaluationRecord }
 func (r *captureRecorder) Record(_ context.Context, record EvaluationRecord) error {
 	r.record = record
 	return nil
+}
+
+type blockingRunner struct{}
+
+func (blockingRunner) Start(ctx context.Context, _ SessionRequest) (Session, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+type blockingTools struct{}
+
+func (blockingTools) Retrieve(ctx context.Context, _ ToolContext, _ RetrieveRequest) (ToolResult, error) {
+	<-ctx.Done()
+	return ToolResult{}, ctx.Err()
+}
+func (blockingTools) OpenSection(ctx context.Context, _ ToolContext, _ OpenSectionRequest) (ToolResult, error) {
+	<-ctx.Done()
+	return ToolResult{}, ctx.Err()
+}
+func (blockingTools) Neighbors(ctx context.Context, _ ToolContext, _ NeighborsRequest) (ToolResult, error) {
+	<-ctx.Done()
+	return ToolResult{}, ctx.Err()
 }
 
 func (f *fakeTools) Retrieve(_ context.Context, call ToolContext, _ RetrieveRequest) (ToolResult, error) {
