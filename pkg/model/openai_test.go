@@ -160,6 +160,7 @@ func TestOpenAICredentialFailuresAreRedacted(t *testing.T) {
 	}))
 	defer server.Close()
 	tests := []CredentialResolver{
+		CredentialResolverFunc(nil),
 		CredentialResolverFunc(func(context.Context) ([]byte, error) {
 			return nil, errors.New("resolver failed with " + testAPIKey)
 		}),

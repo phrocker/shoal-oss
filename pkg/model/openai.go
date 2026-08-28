@@ -37,6 +37,9 @@ type CredentialResolver interface {
 type CredentialResolverFunc func(context.Context) ([]byte, error)
 
 func (f CredentialResolverFunc) ResolveCredential(ctx context.Context) ([]byte, error) {
+	if f == nil {
+		return nil, ErrCredential
+	}
 	return f(ctx)
 }
 
