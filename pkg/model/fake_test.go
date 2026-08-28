@@ -6,6 +6,7 @@ import (
 	"reflect"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestFakeProvidersDeterministicAndIsolated(t *testing.T) {
@@ -88,5 +89,32 @@ func TestFakeProviderBounds(t *testing.T) {
 		Text: string(make([]byte, 128)),
 	}); !errors.Is(err, ErrInvalidRequest) {
 		t.Fatalf("embedder work bound error = %v", err)
+	}
+}
+
+type cancelAfterContext struct {
+	context.Context
+	mu        sync.Mutex
+	errChecks int
+}
+
+func (c *cancelAfterContext) Err() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.errChecks++
+	if c.errChecks >= 3 {
+		return context.Canceled
+	}
+	return nil
+}
+
+func (c *cancelAfterContext) Deadline() (time.Time, bool) { return time.Time{}, false }
+func (c *cancelAfterContext) Done() <-chan struct{}       { return nil }
+
+func TestFakeEmbedderInFlightCancellation(t *testing.T) {
+	ctx := &cancelAfterContext{Context: context.Background()}
+	_, err := (FakeEmbedder{Dimensions: 8}).Embed(ctx, EmbedRequest{Text: "cancel"})
+	if !errors.Is(err, ErrCanceled) {
+		t.Fatalf("error = %v, want ErrCanceled", err)
 	}
 }

@@ -63,3 +63,13 @@ func TestConfigureProvidersOllamaCompatibility(t *testing.T) {
 		t.Fatalf("Infer = %q, %v", text, err)
 	}
 }
+
+func TestConfigureProvidersBlankOllamaValuesUseDefaults(t *testing.T) {
+	cfg := agentmem.Config{}
+	if err := configureProviders(&cfg, "ollama", "ollama", " ", "", "\t", nil); err != nil {
+		t.Fatalf("blank Ollama values should use defaults: %v", err)
+	}
+	if cfg.Embedder == nil || cfg.LLM == nil {
+		t.Fatal("Ollama providers were not configured")
+	}
+}

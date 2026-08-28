@@ -76,14 +76,12 @@ func (f FakeEmbedder) Embed(ctx context.Context, req EmbedRequest) (EmbedResult,
 	vec := make([]float32, dim)
 	text := strings.ToLower(req.Text)
 	for i := range vec {
-		if i%64 == 0 {
-			if err := ctx.Err(); err != nil {
-				return EmbedResult{}, contextError("fake embed", err)
-			}
-		}
 		h := sha256.Sum256([]byte(strconv.Itoa(i) + ":" + text))
 		bits := binary.BigEndian.Uint32(h[:4])
 		vec[i] = float32(bits%2000000)/1000000.0 - 1.0
+		if err := ctx.Err(); err != nil {
+			return EmbedResult{}, contextError("fake embed", err)
+		}
 	}
 	normalize(vec)
 	name := strings.TrimSpace(f.Model)

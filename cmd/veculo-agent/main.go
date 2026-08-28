@@ -74,6 +74,15 @@ func main() {
 }
 
 func configureProviders(cfg *agentmem.Config, embedderName, llmName, host, embedModel, llmModel string, httpClient *http.Client) error {
+	if strings.TrimSpace(host) == "" {
+		host = modelio.DefaultOllamaBaseURL
+	}
+	if strings.TrimSpace(embedModel) == "" {
+		embedModel = modelio.DefaultOllamaEmbedModel
+	}
+	if strings.TrimSpace(llmModel) == "" {
+		llmModel = modelio.DefaultOllamaGenerateModel
+	}
 	switch strings.ToLower(strings.TrimSpace(embedderName)) {
 	case "", "fake":
 	case "ollama":

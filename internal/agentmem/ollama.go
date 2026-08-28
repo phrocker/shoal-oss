@@ -3,6 +3,7 @@ package agentmem
 import (
 	"context"
 	"net/http"
+	"strings"
 	"time"
 
 	modelio "github.com/phrocker/shoal-oss/pkg/model"
@@ -48,6 +49,12 @@ func NewOllamaEmbedder(opts ...OllamaOption) *OllamaEmbedder {
 	for _, opt := range opts {
 		opt(&cfg)
 	}
+	if strings.TrimSpace(cfg.BaseURL) == "" {
+		cfg.BaseURL = DefaultOllamaHost
+	}
+	if strings.TrimSpace(cfg.Model) == "" {
+		cfg.Model = DefaultOllamaEmbedModel
+	}
 	embedder, err := modelio.NewOllamaEmbedder(cfg)
 	return &OllamaEmbedder{embedder: embedder, err: err}
 }
@@ -56,6 +63,12 @@ func NewOllamaLLM(opts ...OllamaOption) LLM {
 	cfg := modelio.OllamaConfig{BaseURL: DefaultOllamaHost, Model: DefaultOllamaLLMModel}
 	for _, opt := range opts {
 		opt(&cfg)
+	}
+	if strings.TrimSpace(cfg.BaseURL) == "" {
+		cfg.BaseURL = DefaultOllamaHost
+	}
+	if strings.TrimSpace(cfg.Model) == "" {
+		cfg.Model = DefaultOllamaLLMModel
 	}
 	generator, err := modelio.NewOllamaGenerator(cfg)
 	return &ollamaLLM{generator: generator, err: err}
