@@ -548,7 +548,7 @@ func (g *Generator) Run(ctx context.Context, pack inference.ContextPack) (Record
 		if !g.now().Before(pack.Authorization().ExpiresAt()) {
 			return Record{}, invalid("authorization pin expired during execution")
 		}
-		action, nextErr := session.Next(runCtx, cloneTranscript(transcript))
+		action, nextErr := session.Next(runCtx, transcript)
 		if nextErr != nil {
 			if runCtx.Err() != nil {
 				return Record{}, runCtx.Err()
