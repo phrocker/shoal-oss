@@ -142,7 +142,9 @@ func (co *Consolidator) Run(ctx context.Context) error {
 		case <-co.stop:
 			return nil
 		case id := <-co.queue:
-			_ = co.Consolidate(ctx, id)
+			if err := co.Consolidate(ctx, id); err != nil {
+				return err
+			}
 		}
 	}
 }

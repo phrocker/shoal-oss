@@ -2,6 +2,7 @@ package agentmem
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -98,8 +99,40 @@ func TestLegacyConsolidatorDoesNotUseSubstringModelOutput(t *testing.T) {
 	if err := NewConsolidator(client, 1).Consolidate(context.Background(), "event"); err != nil {
 		t.Fatal(err)
 	}
+
 	if llm.calls != 0 {
 		t.Fatal("legacy consolidator called the substring-based LLM path")
+	}
+}
+
+func TestConsolidatorRunPropagatesPublisherFailure(t *testing.T) {
+	version, concept, property, pack := agentmemExtractionFixture(t, "Alice")
+	generator := &agentmemGenerator{
+		output: `{"entities":[{"key":"alice","type_id":"` + string(concept.ID()) +
+			`","properties":[{"property_id":"` + string(property.ID()) +
+			`","value":{"type":"string","value":"Alice"}}],"confidence":0.9,"evidence_anchor_ids":["` +
+			string(pack.Evidence()[0].ID()) + `"]}],"relations":[]}`,
+	}
+	publishErr := errors.New("publish failed")
+	client, err := New(Config{
+		Store: NewFakeStore(), OntologyExtractor: extraction.Orchestrator{Generator: generator},
+		OntologyRequestFactory: func(context.Context, string) (extraction.Request, error) {
+			return extraction.Request{
+				Version: version, Context: pack, Instructions: "Extract entities.",
+				Limits: extraction.DefaultLimits(),
+			}, nil
+		},
+		ConsolidationPublisher: func(context.Context, extraction.PublicationPlan) error {
+			return publishErr
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	consolidator := NewConsolidator(client, 1)
+	consolidator.Enqueue("event")
+	if err := consolidator.Run(context.Background()); !errors.Is(err, publishErr) {
+		t.Fatalf("Run error = %v, want publisher error", err)
 	}
 }
 

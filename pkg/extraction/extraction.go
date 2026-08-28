@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -324,10 +325,12 @@ func BuildPrompt(request Request) (string, error) {
 			pa.Quote = quote
 		} else if path, ok := anchor.Path(); ok {
 			for _, node := range path.Nodes {
-				pa.Nodes = append(pa.Nodes, string(node.ID))
+				pa.Nodes = append(pa.Nodes, graphNodeToken(node.ID))
 			}
 			for _, edge := range path.Edges {
-				pa.Edges = append(pa.Edges, string(edge.ID)+":"+edge.Type+":"+string(edge.From)+"->"+string(edge.To))
+				pa.Edges = append(pa.Edges,
+					graphIDToken("edge", edge.ID)+":"+edge.Type+":"+
+						graphNodeToken(edge.From)+"->"+graphNodeToken(edge.To))
 			}
 		}
 		p.Evidence = append(p.Evidence, pa)
@@ -613,7 +616,7 @@ func materialize(request Request, prompt string, mp model.Provenance, raw rawOut
 	if err != nil {
 		return Result{}, err
 	}
-	evidenceByAnchor, ontologyEvidence, nodeAnchors, err := evidenceMaps(request.Context)
+	evidenceByAnchor, ontologyEvidence, nodeAnchors, nodeTokens, err := evidenceMaps(request.Context)
 	if err != nil {
 		return Result{}, err
 	}
@@ -666,8 +669,12 @@ func materialize(request Request, prompt string, mp model.Provenance, raw rawOut
 		}
 		var id shoal.ID
 		action := ActionCreate
-		existing := shoal.ID(item.ExistingNodeID)
-		if existing != "" {
+		var existing shoal.ID
+		if item.ExistingNodeID != "" {
+			existing, err = decodeGraphNodeToken(item.ExistingNodeID, nodeTokens)
+			if err != nil {
+				return Result{}, fmt.Errorf("extraction: entity %q: %w", key, err)
+			}
 			groundingAnchors, ok := nodeAnchors[existing]
 			if !ok {
 				return Result{}, fmt.Errorf("extraction: entity %q references an ungrounded node ID", key)
@@ -687,7 +694,8 @@ func materialize(request Request, prompt string, mp model.Provenance, raw rawOut
 		}
 		props, propAssertions, propClaims, err := makeProperties(
 			id, typeID, item.Properties, *item.Confidence, anchorIDs, refs,
-			properties, concepts[typeID].Properties(), nodeAnchors, op, modelProv, promptProv,
+			properties, concepts[typeID].Properties(), nodeAnchors, nodeTokens,
+			op, modelProv, promptProv,
 		)
 		if err != nil {
 			return Result{}, fmt.Errorf("extraction: entity %q: %w", key, err)
@@ -787,7 +795,8 @@ func materialize(request Request, prompt string, mp model.Provenance, raw rawOut
 		claims = append(claims, claim)
 		props, propAssertions, propClaims, err := makeProperties(
 			assertion.ID(), relation.ID(), item.Properties, *item.Confidence,
-			anchorIDs, refs, properties, relation.Properties(), nodeAnchors, op, modelProv, promptProv,
+			anchorIDs, refs, properties, relation.Properties(), nodeAnchors,
+			nodeTokens, op, modelProv, promptProv,
 		)
 		if err != nil {
 			return Result{}, fmt.Errorf("extraction: relation %q: %w", item.TypeID, err)
@@ -838,15 +847,22 @@ type evidencePair struct {
 	ref    ontology.EvidenceRef
 }
 
-func evidenceMaps(pack inference.ContextPack) (map[shoal.ID]evidencePair, []ontology.EvidenceRef, map[shoal.ID]map[shoal.ID]struct{}, error) {
+func evidenceMaps(pack inference.ContextPack) (
+	map[shoal.ID]evidencePair,
+	[]ontology.EvidenceRef,
+	map[shoal.ID]map[shoal.ID]struct{},
+	map[string]shoal.ID,
+	error,
+) {
 	pairs := map[shoal.ID]evidencePair{}
 	var refs []ontology.EvidenceRef
 	nodes := map[shoal.ID]map[shoal.ID]struct{}{}
+	tokens := map[string]shoal.ID{}
 	for _, anchor := range pack.Evidence() {
 		if citation, quote, ok := anchor.Document(); ok {
 			ref, err := ontology.NewEvidenceRef(citation, quote, nil)
 			if err != nil {
-				return nil, nil, nil, err
+				return nil, nil, nil, nil, err
 			}
 			pairs[anchor.ID()] = evidencePair{anchor: anchor, ref: ref}
 			refs = append(refs, ref)
@@ -856,14 +872,15 @@ func evidenceMaps(pack inference.ContextPack) (map[shoal.ID]evidencePair, []onto
 					nodes[node.ID] = map[shoal.ID]struct{}{}
 				}
 				nodes[node.ID][anchor.ID()] = struct{}{}
+				tokens[graphNodeToken(node.ID)] = node.ID
 			}
 			pairs[anchor.ID()] = evidencePair{anchor: anchor}
 		}
 	}
 	if len(refs) == 0 {
-		return nil, nil, nil, errors.New("extraction: ontology extraction requires at least one document evidence anchor")
+		return nil, nil, nil, nil, errors.New("extraction: ontology extraction requires at least one document evidence anchor")
 	}
-	return pairs, refs, nodes, nil
+	return pairs, refs, nodes, tokens, nil
 }
 
 func resolveEvidence(raw []string, available map[shoal.ID]evidencePair) ([]shoal.ID, []ontology.EvidenceRef, error) {
@@ -898,6 +915,7 @@ func makeProperties(
 	anchorIDs []shoal.ID, refs []ontology.EvidenceRef,
 	definitions map[shoal.ID]ontology.PropertyDefinition, allowed []shoal.ID,
 	groundedNodes map[shoal.ID]map[shoal.ID]struct{},
+	nodeTokens map[string]shoal.ID,
 	op ontology.ExtractionProvenance, mp inference.ModelProvenance,
 	pp inference.PromptProvenance,
 ) ([]Property, []ontology.Assertion, []inference.Claim, error) {
@@ -918,13 +936,17 @@ func makeProperties(
 		if _, ok := allowedSet[id]; !ok {
 			return nil, nil, nil, fmt.Errorf("property %q does not apply to type %q", item.PropertyID, subjectType)
 		}
-		value, err := decodeValue(item.Value, definition.ValueType())
+		value, err := decodeValue(item.Value, definition.ValueType(), nodeTokens)
 		if err != nil {
 			return nil, nil, nil, fmt.Errorf("property %q: %w", item.PropertyID, err)
 		}
 		if reference, ok := value.ReferenceValue(); ok {
-			if _, grounded := groundedNodes[reference]; !grounded {
+			groundingAnchors, grounded := groundedNodes[reference]
+			if !grounded {
 				return nil, nil, nil, fmt.Errorf("property %q references an ungrounded node ID", item.PropertyID)
+			}
+			if !intersects(anchorIDs, groundingAnchors) {
+				return nil, nil, nil, fmt.Errorf("property %q omits the graph anchor grounding its node ID", item.PropertyID)
 			}
 		}
 		duplicateKey := item.PropertyID + "\x00" + valueText(value)
@@ -1002,7 +1024,7 @@ func intersects(ids []shoal.ID, available map[shoal.ID]struct{}) bool {
 	return false
 }
 
-func decodeValue(raw rawValue, expected ontology.ValueType) (ontology.Value, error) {
+func decodeValue(raw rawValue, expected ontology.ValueType, nodeTokens map[string]shoal.ID) (ontology.Value, error) {
 	if ontology.ValueType(raw.Type) != expected && !(expected == ontology.ValueNumber && raw.Type == string(ontology.ValueInteger)) {
 		return ontology.Value{}, fmt.Errorf("value type %q does not match %q", raw.Type, expected)
 	}
@@ -1057,7 +1079,11 @@ func decodeValue(raw rawValue, expected ontology.ValueType) (ontology.Value, err
 		if err := decode(&v); err != nil {
 			return ontology.Value{}, err
 		}
-		return ontology.NewReferenceValue(shoal.ID(v))
+		id, err := decodeGraphNodeToken(v, nodeTokens)
+		if err != nil {
+			return ontology.Value{}, err
+		}
+		return ontology.NewReferenceValue(id)
 	default:
 		return ontology.Value{}, fmt.Errorf("unsupported value type %q", raw.Type)
 	}
@@ -1087,7 +1113,31 @@ func allowedEndpoints(r ontology.RelationshipDefinition, from, to shoal.ID) bool
 
 func extractionLimits(request Request) ontology.ExtractionLimits {
 	limits := ontology.DefaultExtractionLimits()
+	if count := len(request.Context.Evidence()); count > int(limits.MaxEvidence) {
+		limits.MaxEvidence = uint32(count)
+	}
 	return limits
+}
+
+func graphNodeToken(id shoal.ID) string {
+	return graphIDToken("node", id)
+}
+
+func graphIDToken(kind string, id shoal.ID) string {
+	return kind + "-base64:" + base64.RawURLEncoding.EncodeToString([]byte(id))
+}
+
+func decodeGraphNodeToken(value string, available map[string]shoal.ID) (shoal.ID, error) {
+	id, ok := available[value]
+	if !ok {
+		return "", errors.New("node token is not grounded in the context")
+	}
+	encoded := strings.TrimPrefix(value, "node-base64:")
+	decoded, err := base64.RawURLEncoding.DecodeString(encoded)
+	if err != nil || string(decoded) != string(id) {
+		return "", errors.New("node token is not canonical")
+	}
+	return id, nil
 }
 
 func clonePlan(plan PublicationPlan) PublicationPlan {

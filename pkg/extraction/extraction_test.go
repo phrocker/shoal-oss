@@ -3,6 +3,7 @@ package extraction
 import (
 	"context"
 	"errors"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -43,6 +44,8 @@ type fixture struct {
 	thing          ontology.ConceptDefinition
 	anchor         inference.EvidenceAnchor
 	graphAnchor    inference.EvidenceAnchor
+	opaqueAnchor   inference.EvidenceAnchor
+	opaqueNodeID   shoal.ID
 }
 
 func TestExtractValidMultiEntityRelationAndStableRetry(t *testing.T) {
@@ -153,7 +156,7 @@ func TestOntologyAndGroundingFailures(t *testing.T) {
 		"hallucinated anchor":      strings.Replace(base, string(f.anchor.ID()), "evidence-anchor:missing", 1),
 		"unsupported graph anchor": strings.Replace(base, string(f.anchor.ID()), string(f.graphAnchor.ID()), 1),
 		"hallucinated node":        strings.Replace(base, `"existing_node_id":""`, `"existing_node_id":"node:missing"`, 1),
-		"omitted node anchor":      strings.Replace(base, `"existing_node_id":""`, `"existing_node_id":"node-1"`, 1),
+		"omitted node anchor":      strings.Replace(base, `"existing_node_id":""`, `"existing_node_id":"`+graphNodeToken("node-1")+`"`, 1),
 		"cross domain":             strings.Replace(base, `"from_entity_key":"alice","to_entity_key":"acme"`, `"from_entity_key":"acme","to_entity_key":"alice"`, 1),
 		"invalid edge":             strings.Replace(base, `"to_entity_key":"acme"`, `"to_entity_key":"missing"`, 1),
 		"uppercase key":            strings.Replace(base, `"key":"alice"`, `"key":"Alice"`, 1),
@@ -252,7 +255,7 @@ func TestEntityIdentityIncludesPromptScope(t *testing.T) {
 
 func TestExistingNodeRequiresAndRetainsGroundingAnchor(t *testing.T) {
 	f := newFixture(t)
-	output := strings.Replace(validOutput(f), `"existing_node_id":""`, `"existing_node_id":"node-1"`, 1)
+	output := strings.Replace(validOutput(f), `"existing_node_id":""`, `"existing_node_id":"`+graphNodeToken("node-1")+`"`, 1)
 	output = strings.Replace(output,
 		`"evidence_anchor_ids":["`+string(f.anchor.ID())+`"]`,
 		`"evidence_anchor_ids":["`+string(f.anchor.ID())+`","`+string(f.graphAnchor.ID())+`"]`, 1)
@@ -265,6 +268,61 @@ func TestExistingNodeRequiresAndRetainsGroundingAnchor(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("existing node did not retain its graph grounding")
+	}
+}
+
+func TestOpaqueGraphNodeIDRoundTripsThroughPromptToken(t *testing.T) {
+	f := newFixture(t)
+	token := graphNodeToken(f.opaqueNodeID)
+	if !strings.Contains(mustPrompt(t, f.request), token) {
+		t.Fatal("prompt omitted reversible opaque node token")
+	}
+	output := `{"entities":[{"key":"opaque","type_id":"` + string(f.thing.ID()) +
+		`","existing_node_id":"` + token +
+		`","properties":[],"confidence":0.8,"evidence_anchor_ids":["` +
+		string(f.anchor.ID()) + `","` + string(f.opaqueAnchor.ID()) +
+		`"]}],"relations":[]}`
+	plan := extractWith(t, f.request, output).PublicationPlan()
+	for _, entity := range plan.Entities {
+		if entity.ID == f.opaqueNodeID {
+			return
+		}
+	}
+	t.Fatal("opaque graph node ID did not round trip")
+}
+
+func TestOntologyEvidenceLimitTracksContextPack(t *testing.T) {
+	f := newFixture(t)
+	anchors := make([]inference.EvidenceAnchor, 257)
+	for i := range anchors {
+		quote := "x"
+		citation := document.Citation{
+			DocumentID: shoal.ID("doc-" + strconv.Itoa(i)),
+			RevisionID: "revision", SpanID: "span",
+			Range: document.SourceRange{
+				Start: document.SourcePosition{Offset: int64(i)},
+				End:   document.SourcePosition{Offset: int64(i + 1)},
+			},
+		}
+		anchor, err := inference.NewDocumentAnchor(citation, quote)
+		if err != nil {
+			t.Fatal(err)
+		}
+		anchors[i] = anchor
+	}
+	identity, _ := f.request.Context.Ontology()
+	pack, err := inference.NewContextPack(
+		"bounded evidence", anchors, &identity, f.request.Context.Snapshot(),
+		f.request.Context.Authorization(), nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := f.request
+	request.Context = pack
+	output := strings.Replace(validOutput(f), string(f.anchor.ID()), string(pack.Evidence()[0].ID()), -1)
+	if _, err := (Orchestrator{Generator: &scriptedGenerator{text: output}}).Extract(context.Background(), request); err != nil {
+		t.Fatalf("257-anchor request failed after model generation: %v", err)
 	}
 }
 
@@ -359,6 +417,11 @@ func newFixture(t *testing.T) fixture {
 	if err != nil {
 		t.Fatal(err)
 	}
+	opaqueNodeID := shoal.ID(string([]byte{0xff, 0x00, 'x'}))
+	opaqueAnchor, err := inference.NewGraphAnchor(graph.Path{Nodes: []graph.Node{{ID: opaqueNodeID, Kind: "event"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
 	snapshot, err := inference.NewSnapshotPin("snapshot-1", time.Unix(20, 0))
 	if err != nil {
 		t.Fatal(err)
@@ -367,7 +430,7 @@ func newFixture(t *testing.T) fixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	pack, err := inference.NewContextPack("UNCITED-SECRET", []inference.EvidenceAnchor{graphAnchor, anchor}, &identity, snapshot, auth, nil)
+	pack, err := inference.NewContextPack("UNCITED-SECRET", []inference.EvidenceAnchor{graphAnchor, opaqueAnchor, anchor}, &identity, snapshot, auth, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -375,7 +438,8 @@ func newFixture(t *testing.T) fixture {
 		request: Request{Version: version, Context: pack, Instructions: "Extract grounded work relationships.", Limits: DefaultLimits()},
 		person:  person, organization: organization, name: name, age: age,
 		worksAt: worksAt, associatedWith: associatedWith, thing: thing,
-		anchor: anchor, graphAnchor: graphAnchor,
+		anchor: anchor, graphAnchor: graphAnchor, opaqueAnchor: opaqueAnchor,
+		opaqueNodeID: opaqueNodeID,
 	}
 }
 
@@ -400,4 +464,13 @@ func assertExtractError(t *testing.T, request Request, output string) {
 	if _, err := (Orchestrator{Generator: &scriptedGenerator{text: output}}).Extract(context.Background(), request); err == nil {
 		t.Fatal("expected extraction error")
 	}
+}
+
+func mustPrompt(t *testing.T, request Request) string {
+	t.Helper()
+	prompt, err := BuildPrompt(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return prompt
 }
