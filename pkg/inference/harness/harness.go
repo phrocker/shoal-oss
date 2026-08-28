@@ -526,11 +526,12 @@ func (g *Generator) Run(ctx context.Context, pack inference.ContextPack) (Record
 			return Record{}, invalid("duplicate action correlation ID")
 		}
 		seenCorrelation[action.correlation] = struct{}{}
-		inputTokens += action.usage.InputTokens
-		outputTokens += action.usage.OutputTokens
-		if inputTokens > g.budgets.MaxInputTokens || outputTokens > g.budgets.MaxOutputTokens {
+		if exceedsRemaining(inputTokens, action.usage.InputTokens, g.budgets.MaxInputTokens) ||
+			exceedsRemaining(outputTokens, action.usage.OutputTokens, g.budgets.MaxOutputTokens) {
 			return Record{}, budget("token")
 		}
+		inputTokens += action.usage.InputTokens
+		outputTokens += action.usage.OutputTokens
 		key := actionKey(action)
 		repeats[key]++
 		if repeats[key] > g.budgets.MaxRepeatedAction {
@@ -571,10 +572,11 @@ func (g *Generator) Run(ctx context.Context, pack inference.ContextPack) (Record
 			}
 			toolResult, err = g.tools.OpenSection(runCtx, action.open, action.correlation)
 		case ActionNeighbors:
-			hops += action.neighbors.hops
-			if hops > g.budgets.MaxGraphHops || action.neighbors.fanout > g.budgets.MaxFanout {
+			if exceedsRemaining(hops, action.neighbors.hops, g.budgets.MaxGraphHops) ||
+				action.neighbors.fanout > g.budgets.MaxFanout {
 				return Record{}, budget("graph traversal")
 			}
+			hops += action.neighbors.hops
 			if !nodeAllowed(transcript.context, action.neighbors.nodeID) {
 				return Record{}, invalid("neighbors node ID was not issued to this session")
 			}
@@ -605,10 +607,10 @@ func (g *Generator) Run(ctx context.Context, pack inference.ContextPack) (Record
 				return Record{}, budget("neighbors result fanout")
 			}
 		}
-		fanout += len(toolResult.anchors)
-		if fanout > g.budgets.MaxFanout {
+		if exceedsRemaining(fanout, len(toolResult.anchors), g.budgets.MaxFanout) {
 			return Record{}, budget("tool result fanout")
 		}
+		fanout += len(toolResult.anchors)
 		nextPack, err := addAnchors(transcript.context, toolResult.anchors)
 		if err != nil {
 			return Record{}, err
@@ -685,14 +687,28 @@ func addAnchors(pack inference.ContextPack, additions []inference.EvidenceAnchor
 func actionKey(a Action) string {
 	switch a.kind {
 	case ActionRetrieve:
-		return string(a.kind) + "\x00" + a.retrieve.query + "\x00" + strconv.Itoa(a.retrieve.limit)
+		return framed(string(a.kind), a.retrieve.query, strconv.Itoa(a.retrieve.limit))
 	case ActionOpenSection:
-		return string(a.kind) + "\x00" + string(a.open.documentID) + "\x00" + string(a.open.sectionID)
+		return framed(string(a.kind), string(a.open.documentID), string(a.open.sectionID))
 	case ActionNeighbors:
-		return string(a.kind) + "\x00" + string(a.neighbors.nodeID) + "\x00" + strconv.Itoa(a.neighbors.hops) + "\x00" + strconv.Itoa(a.neighbors.fanout)
+		return framed(string(a.kind), string(a.neighbors.nodeID), strconv.Itoa(a.neighbors.hops), strconv.Itoa(a.neighbors.fanout))
 	default:
-		return string(a.kind)
+		return framed(string(a.kind))
 	}
+}
+
+func framed(parts ...string) string {
+	var builder strings.Builder
+	for _, part := range parts {
+		builder.WriteString(strconv.Itoa(len(part)))
+		builder.WriteByte(':')
+		builder.WriteString(part)
+	}
+	return builder.String()
+}
+
+func exceedsRemaining(current, delta, maximum int) bool {
+	return delta > maximum-current
 }
 
 func transcriptID(t Transcript) shoal.ID {

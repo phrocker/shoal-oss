@@ -146,6 +146,20 @@ func TestBudgetBoundaries(t *testing.T) {
 			}
 		})
 	}
+	t.Run("integer overflow", func(t *testing.T) {
+		large := int(^uint(0) >> 1)
+		custom := budgets()
+		custom.MaxInputTokens = large
+		first := mustRetrieveQueryUsage(t, "first", "first", 1, Usage{InputTokens: large})
+		second := mustRetrieveQueryUsage(t, "second", "second", 1, Usage{InputTokens: 1})
+		host := &fakeTools{pack: pack, results: map[shoal.ID][]inference.EvidenceAnchor{
+			"first": {additions[0]}, "second": {additions[1]},
+		}}
+		g := newGeneratorWithBudgets(t, NewFakeRunner(ScriptAction(first), ScriptAction(second)), host, custom)
+		if _, err := g.Generate(context.Background(), pack); !errors.Is(err, ErrBudgetExhausted) {
+			t.Fatalf("overflow error = %v", err)
+		}
+	})
 	t.Run("exact token boundary", func(t *testing.T) {
 		host := &fakeTools{pack: pack, results: map[shoal.ID][]inference.EvidenceAnchor{"x": {additions[0]}}}
 		first := mustRetrieveUsage(t, "x", 1, Usage{InputTokens: 10, OutputTokens: 10})
@@ -157,6 +171,14 @@ func TestBudgetBoundaries(t *testing.T) {
 			t.Fatal(err)
 		}
 	})
+}
+
+func TestActionKeysFrameOpaqueIDs(t *testing.T) {
+	left := mustOpen(t, "left", shoal.ID("a"), shoal.ID("b\x00c"))
+	right := mustOpen(t, "right", shoal.ID("a\x00b"), shoal.ID("c"))
+	if actionKey(left) == actionKey(right) {
+		t.Fatal("distinct opaque IDs produced the same action key")
+	}
 }
 
 func TestStepAndCycleLimits(t *testing.T) {
