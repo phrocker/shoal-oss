@@ -153,8 +153,10 @@ func TestOntologyAndGroundingFailures(t *testing.T) {
 		"hallucinated anchor":      strings.Replace(base, string(f.anchor.ID()), "evidence-anchor:missing", 1),
 		"unsupported graph anchor": strings.Replace(base, string(f.anchor.ID()), string(f.graphAnchor.ID()), 1),
 		"hallucinated node":        strings.Replace(base, `"existing_node_id":""`, `"existing_node_id":"node:missing"`, 1),
+		"omitted node anchor":      strings.Replace(base, `"existing_node_id":""`, `"existing_node_id":"node-1"`, 1),
 		"cross domain":             strings.Replace(base, `"from_entity_key":"alice","to_entity_key":"acme"`, `"from_entity_key":"acme","to_entity_key":"alice"`, 1),
 		"invalid edge":             strings.Replace(base, `"to_entity_key":"acme"`, `"to_entity_key":"missing"`, 1),
+		"uppercase key":            strings.Replace(base, `"key":"alice"`, `"key":"Alice"`, 1),
 	}
 	for name, output := range tests {
 		t.Run(name, func(t *testing.T) { assertExtractError(t, f.request, output) })
@@ -186,7 +188,7 @@ func TestProviderFailureHasNoSilentFallback(t *testing.T) {
 
 func TestHeuristicIsExplicitAndMutationIsolated(t *testing.T) {
 	f := newFixture(t)
-	result, err := (HeuristicExtractor{ConceptType: f.person.ID()}).Extract(context.Background(), f.request)
+	result, err := (HeuristicExtractor{ConceptType: f.thing.ID()}).Extract(context.Background(), f.request)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -237,10 +239,39 @@ func TestUndirectedRelationNormalizesWholePayload(t *testing.T) {
 	}
 }
 
+func TestEntityIdentityIncludesPromptScope(t *testing.T) {
+	f := newFixture(t)
+	first := extractWith(t, f.request, validOutput(f)).PublicationPlan()
+	changed := f.request
+	changed.Instructions = "Extract only explicitly named work relationships."
+	second := extractWith(t, changed, validOutput(f)).PublicationPlan()
+	if first.Entities[0].ID == second.Entities[0].ID {
+		t.Fatal("entity identity collapsed independent prompt scopes")
+	}
+}
+
+func TestExistingNodeRequiresAndRetainsGroundingAnchor(t *testing.T) {
+	f := newFixture(t)
+	output := strings.Replace(validOutput(f), `"existing_node_id":""`, `"existing_node_id":"node-1"`, 1)
+	output = strings.Replace(output,
+		`"evidence_anchor_ids":["`+string(f.anchor.ID())+`"]`,
+		`"evidence_anchor_ids":["`+string(f.anchor.ID())+`","`+string(f.graphAnchor.ID())+`"]`, 1)
+	plan := extractWith(t, f.request, output).PublicationPlan()
+	var found bool
+	for _, entity := range plan.Entities {
+		if entity.ID == "node-1" {
+			found = entity.Action == ActionReference && len(entity.EvidenceIDs) == 2
+		}
+	}
+	if !found {
+		t.Fatal("existing node did not retain its graph grounding")
+	}
+}
+
 func TestHeuristicHonorsEntityLimit(t *testing.T) {
 	f := newFixture(t)
 	f.request.Limits.MaxEntities = 1
-	if _, err := (HeuristicExtractor{ConceptType: f.person.ID()}).Extract(context.Background(), f.request); err == nil {
+	if _, err := (HeuristicExtractor{ConceptType: f.thing.ID()}).Extract(context.Background(), f.request); err == nil {
 		t.Fatal("expected heuristic entity limit failure")
 	}
 }

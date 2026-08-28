@@ -44,7 +44,10 @@ const (
 	DefaultMaxStringBytes = 64 << 10
 )
 
-var entityKeyPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
+var (
+	entityKeyPattern      = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
+	heuristicKeySanitizer = regexp.MustCompile(`[^a-zA-Z0-9]+`)
+)
 
 type Limits struct {
 	MaxOutputBytes  int
@@ -610,7 +613,7 @@ func materialize(request Request, prompt string, mp model.Provenance, raw rawOut
 	if err != nil {
 		return Result{}, err
 	}
-	evidenceByAnchor, ontologyEvidence, graphNodes, err := evidenceMaps(request.Context)
+	evidenceByAnchor, ontologyEvidence, nodeAnchors, err := evidenceMaps(request.Context)
 	if err != nil {
 		return Result{}, err
 	}
@@ -640,7 +643,7 @@ func materialize(request Request, prompt string, mp model.Provenance, raw rawOut
 	var claims []inference.Claim
 	for _, item := range raw.Entities {
 		key := strings.ToLower(strings.TrimSpace(item.Key))
-		if !entityKeyPattern.MatchString(item.Key) || key != strings.ToLower(item.Key) {
+		if !entityKeyPattern.MatchString(item.Key) || item.Key != key {
 			return Result{}, fmt.Errorf("extraction: invalid or non-canonical entity key %q", item.Key)
 		}
 		if _, duplicate := seenKeys[key]; duplicate {
@@ -650,6 +653,9 @@ func materialize(request Request, prompt string, mp model.Provenance, raw rawOut
 		typeID := shoal.ID(item.TypeID)
 		if _, ok := concepts[typeID]; !ok {
 			return Result{}, fmt.Errorf("extraction: unknown entity type %q", item.TypeID)
+		}
+		if err := validateEntityCardinality(concepts[typeID], item.Properties, properties); err != nil {
+			return Result{}, fmt.Errorf("extraction: entity %q: %w", key, err)
 		}
 		if err := validateConfidence(*item.Confidence); err != nil {
 			return Result{}, err
@@ -662,19 +668,26 @@ func materialize(request Request, prompt string, mp model.Provenance, raw rawOut
 		action := ActionCreate
 		existing := shoal.ID(item.ExistingNodeID)
 		if existing != "" {
-			if _, ok := graphNodes[existing]; !ok {
+			groundingAnchors, ok := nodeAnchors[existing]
+			if !ok {
 				return Result{}, fmt.Errorf("extraction: entity %q references an ungrounded node ID", key)
+			}
+			if !intersects(anchorIDs, groundingAnchors) {
+				return Result{}, fmt.Errorf("extraction: entity %q omits the graph anchor grounding its node ID", key)
 			}
 			id, action = existing, ActionReference
 		} else {
-			id, err = ontology.NewStableID("inferred-entity", string(request.Version.ID()), string(typeID), key)
+			id, err = ontology.NewStableID(
+				"inferred-entity", string(request.Version.ID()),
+				hash, string(typeID), key,
+			)
 			if err != nil {
 				return Result{}, err
 			}
 		}
 		props, propAssertions, propClaims, err := makeProperties(
 			id, typeID, item.Properties, *item.Confidence, anchorIDs, refs,
-			properties, concepts[typeID].Properties(), graphNodes, op, modelProv, promptProv,
+			properties, concepts[typeID].Properties(), nodeAnchors, op, modelProv, promptProv,
 		)
 		if err != nil {
 			return Result{}, fmt.Errorf("extraction: entity %q: %w", key, err)
@@ -774,7 +787,7 @@ func materialize(request Request, prompt string, mp model.Provenance, raw rawOut
 		claims = append(claims, claim)
 		props, propAssertions, propClaims, err := makeProperties(
 			assertion.ID(), relation.ID(), item.Properties, *item.Confidence,
-			anchorIDs, refs, properties, relation.Properties(), graphNodes, op, modelProv, promptProv,
+			anchorIDs, refs, properties, relation.Properties(), nodeAnchors, op, modelProv, promptProv,
 		)
 		if err != nil {
 			return Result{}, fmt.Errorf("extraction: relation %q: %w", item.TypeID, err)
@@ -825,10 +838,10 @@ type evidencePair struct {
 	ref    ontology.EvidenceRef
 }
 
-func evidenceMaps(pack inference.ContextPack) (map[shoal.ID]evidencePair, []ontology.EvidenceRef, map[shoal.ID]struct{}, error) {
+func evidenceMaps(pack inference.ContextPack) (map[shoal.ID]evidencePair, []ontology.EvidenceRef, map[shoal.ID]map[shoal.ID]struct{}, error) {
 	pairs := map[shoal.ID]evidencePair{}
 	var refs []ontology.EvidenceRef
-	nodes := map[shoal.ID]struct{}{}
+	nodes := map[shoal.ID]map[shoal.ID]struct{}{}
 	for _, anchor := range pack.Evidence() {
 		if citation, quote, ok := anchor.Document(); ok {
 			ref, err := ontology.NewEvidenceRef(citation, quote, nil)
@@ -839,7 +852,10 @@ func evidenceMaps(pack inference.ContextPack) (map[shoal.ID]evidencePair, []onto
 			refs = append(refs, ref)
 		} else if path, ok := anchor.Path(); ok {
 			for _, node := range path.Nodes {
-				nodes[node.ID] = struct{}{}
+				if nodes[node.ID] == nil {
+					nodes[node.ID] = map[shoal.ID]struct{}{}
+				}
+				nodes[node.ID][anchor.ID()] = struct{}{}
 			}
 			pairs[anchor.ID()] = evidencePair{anchor: anchor}
 		}
@@ -866,12 +882,11 @@ func resolveEvidence(raw []string, available map[shoal.ID]evidencePair) ([]shoal
 		if _, duplicate := seen[id]; duplicate {
 			return nil, nil, fmt.Errorf("duplicate evidence anchor %q", value)
 		}
-		if pair.ref.ID() == "" {
-			return nil, nil, fmt.Errorf("graph-only anchor %q cannot ground an ontology assertion", value)
-		}
 		seen[id] = struct{}{}
 		ids = append(ids, id)
-		refs = append(refs, pair.ref)
+		if pair.ref.ID() != "" {
+			refs = append(refs, pair.ref)
+		}
 	}
 	sort.Slice(ids, func(i, j int) bool { return string(ids[i]) < string(ids[j]) })
 	sort.Slice(refs, func(i, j int) bool { return string(refs[i].ID()) < string(refs[j].ID()) })
@@ -882,7 +897,7 @@ func makeProperties(
 	subject, subjectType shoal.ID, raw []rawProperty, confidence float64,
 	anchorIDs []shoal.ID, refs []ontology.EvidenceRef,
 	definitions map[shoal.ID]ontology.PropertyDefinition, allowed []shoal.ID,
-	groundedNodes map[shoal.ID]struct{},
+	groundedNodes map[shoal.ID]map[shoal.ID]struct{},
 	op ontology.ExtractionProvenance, mp inference.ModelProvenance,
 	pp inference.PromptProvenance,
 ) ([]Property, []ontology.Assertion, []inference.Claim, error) {
@@ -942,6 +957,49 @@ func makeProperties(
 		return valueText(props[i].Value) < valueText(props[j].Value)
 	})
 	return props, assertions, claims, nil
+}
+
+func validateEntityCardinality(
+	concept ontology.ConceptDefinition,
+	raw []rawProperty,
+	definitions map[shoal.ID]ontology.PropertyDefinition,
+) error {
+	counts := map[shoal.ID]uint32{}
+	for _, item := range raw {
+		counts[shoal.ID(item.PropertyID)]++
+	}
+	for _, id := range concept.Properties() {
+		definition := definitions[id]
+		count := counts[id]
+		for _, constraint := range definition.Constraints() {
+			switch constraint.Kind() {
+			case ontology.ConstraintRequired:
+				if count == 0 {
+					return fmt.Errorf("required property %q is missing", definition.Key())
+				}
+			case ontology.ConstraintMinimumCount:
+				minimum, _ := constraint.Count()
+				if count < minimum {
+					return fmt.Errorf("property %q is below its minimum count", definition.Key())
+				}
+			case ontology.ConstraintMaximumCount:
+				maximum, _ := constraint.Count()
+				if count > maximum {
+					return fmt.Errorf("property %q exceeds its maximum count", definition.Key())
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func intersects(ids []shoal.ID, available map[shoal.ID]struct{}) bool {
+	for _, id := range ids {
+		if _, ok := available[id]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 func decodeValue(raw rawValue, expected ontology.ValueType) (ontology.Value, error) {
@@ -1106,7 +1164,7 @@ func (h HeuristicExtractor) Extract(_ context.Context, request Request) (Result,
 			if first < 'A' || first > 'Z' {
 				continue
 			}
-			key := strings.ToLower(regexp.MustCompile(`[^a-zA-Z0-9]+`).ReplaceAllString(clean, "_"))
+			key := strings.ToLower(heuristicKeySanitizer.ReplaceAllString(clean, "_"))
 			key = strings.Trim(key, "_")
 			if !entityKeyPattern.MatchString(key) {
 				continue
