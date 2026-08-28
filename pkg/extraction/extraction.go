@@ -163,12 +163,14 @@ type Provenance struct {
 }
 
 type Property struct {
-	DefinitionID shoal.ID
-	Value        ontology.Value
+	DefinitionID    shoal.ID
+	Value           ontology.Value
+	ReferenceNodeID shoal.ID
 }
 
 type Entity struct {
 	ID             shoal.ID
+	ContractID     shoal.ID
 	Key            string
 	TypeID         shoal.ID
 	ExistingNodeID shoal.ID
@@ -182,16 +184,18 @@ type Entity struct {
 }
 
 type Edge struct {
-	ID          shoal.ID
-	TypeID      shoal.ID
-	From        shoal.ID
-	To          shoal.ID
-	State       State
-	Origin      Origin
-	Confidence  shoal.Score
-	EvidenceIDs []shoal.ID
-	Properties  []Property
-	Provenance  Provenance
+	ID             shoal.ID
+	TypeID         shoal.ID
+	From           shoal.ID
+	To             shoal.ID
+	FromContractID shoal.ID
+	ToContractID   shoal.ID
+	State          State
+	Origin         Origin
+	Confidence     shoal.Score
+	EvidenceIDs    []shoal.ID
+	Properties     []Property
+	Provenance     Provenance
 }
 
 type PublicationPlan struct {
@@ -641,7 +645,11 @@ func materialize(request Request, prompt string, mp model.Provenance, raw rawOut
 	}
 
 	seenKeys := map[string]struct{}{}
-	entityByKey := map[string]Entity{}
+	type entityBinding struct {
+		entity     Entity
+		contractID shoal.ID
+	}
+	entityByKey := map[string]entityBinding{}
 	var assertions []ontology.Assertion
 	var claims []inference.Claim
 	for _, item := range raw.Entities {
@@ -668,6 +676,7 @@ func materialize(request Request, prompt string, mp model.Provenance, raw rawOut
 			return Result{}, fmt.Errorf("extraction: entity %q: %w", key, err)
 		}
 		var id shoal.ID
+		var contractID shoal.ID
 		action := ActionCreate
 		var existing shoal.ID
 		if item.ExistingNodeID != "" {
@@ -683,6 +692,10 @@ func materialize(request Request, prompt string, mp model.Provenance, raw rawOut
 				return Result{}, fmt.Errorf("extraction: entity %q omits the graph anchor grounding its node ID", key)
 			}
 			id, action = existing, ActionReference
+			contractID, err = ontology.NewStableID("grounded-node", item.ExistingNodeID)
+			if err != nil {
+				return Result{}, err
+			}
 		} else {
 			id, err = ontology.NewStableID(
 				"inferred-entity", string(request.Version.ID()),
@@ -691,9 +704,10 @@ func materialize(request Request, prompt string, mp model.Provenance, raw rawOut
 			if err != nil {
 				return Result{}, err
 			}
+			contractID = id
 		}
 		props, propAssertions, propClaims, err := makeProperties(
-			id, typeID, item.Properties, *item.Confidence, anchorIDs, refs,
+			contractID, typeID, item.Properties, *item.Confidence, anchorIDs, refs,
 			properties, concepts[typeID].Properties(), nodeAnchors, nodeTokens,
 			op, modelProv, promptProv,
 		)
@@ -713,7 +727,7 @@ func materialize(request Request, prompt string, mp model.Provenance, raw rawOut
 			return Result{}, err
 		}
 		typeClaim, err := inference.NewClaim(
-			id, typePredicate, typeValue, shoal.Score(*item.Confidence),
+			contractID, typePredicate, typeValue, shoal.Score(*item.Confidence),
 			anchorIDs, inference.ClaimInferred, modelProv, promptProv,
 			shoal.Metadata{"kind": "entity_type"},
 		)
@@ -721,12 +735,13 @@ func materialize(request Request, prompt string, mp model.Provenance, raw rawOut
 			return Result{}, err
 		}
 		claims = append(claims, typeClaim)
-		entityByKey[key] = Entity{
-			ID: id, Key: key, TypeID: typeID, ExistingNodeID: existing,
+		entity := Entity{
+			ID: id, ContractID: contractID, Key: key, TypeID: typeID, ExistingNodeID: existing,
 			Action: action, State: StateProposed, Origin: OriginInferred,
 			Confidence: shoal.Score(*item.Confidence), EvidenceIDs: anchorIDs,
 			Properties: props, Provenance: provenance,
 		}
+		entityByKey[key] = entityBinding{entity: entity, contractID: contractID}
 	}
 	var edges []Edge
 	edgeKeys := map[string]struct{}{}
@@ -749,10 +764,10 @@ func materialize(request Request, prompt string, mp model.Provenance, raw rawOut
 		if !ok {
 			return Result{}, fmt.Errorf("extraction: relation references unknown target entity %q", item.ToKey)
 		}
-		if !allowedEndpoints(relation, from.TypeID, to.TypeID) {
+		if !allowedEndpoints(relation, from.entity.TypeID, to.entity.TypeID) {
 			return Result{}, fmt.Errorf("extraction: relation %q crosses disallowed ontology domains", item.TypeID)
 		}
-		if !relation.Directed() && string(from.ID) > string(to.ID) {
+		if !relation.Directed() && string(from.entity.ID) > string(to.entity.ID) {
 			from, to = to, from
 		}
 		if err := validateConfidence(*item.Confidence); err != nil {
@@ -762,7 +777,10 @@ func materialize(request Request, prompt string, mp model.Provenance, raw rawOut
 		if err != nil {
 			return Result{}, fmt.Errorf("extraction: relation %q: %w", item.TypeID, err)
 		}
-		edgeID, err := ontology.NewStableID("inferred-edge", string(request.Version.ID()), string(relation.ID()), string(from.ID), string(to.ID))
+		edgeID, err := ontology.NewStableID(
+			"inferred-edge", string(request.Version.ID()), string(relation.ID()),
+			string(from.contractID), string(to.contractID),
+		)
 		if err != nil {
 			return Result{}, err
 		}
@@ -771,21 +789,21 @@ func materialize(request Request, prompt string, mp model.Provenance, raw rawOut
 			return Result{}, errors.New("extraction: duplicate canonical relation")
 		}
 		edgeKeys[edgeKey] = struct{}{}
-		refValue, err := ontology.NewReferenceValue(to.ID)
+		refValue, err := ontology.NewReferenceValue(to.contractID)
 		if err != nil {
 			return Result{}, err
 		}
 		assertion, err := ontology.NewAssertion(
-			from.ID, relation.ID(), refValue, ontology.AssertionInferred,
+			from.contractID, relation.ID(), refValue, ontology.AssertionInferred,
 			shoal.Score(*item.Confidence), refs, op, nil,
-			ontology.WithAssertionSubjectType(from.TypeID),
-			ontology.WithAssertionObjectType(to.TypeID),
+			ontology.WithAssertionSubjectType(from.entity.TypeID),
+			ontology.WithAssertionObjectType(to.entity.TypeID),
 		)
 		if err != nil {
 			return Result{}, err
 		}
 		claim, err := inference.NewClaim(
-			from.ID, relation.ID(), refValue, shoal.Score(*item.Confidence),
+			from.contractID, relation.ID(), refValue, shoal.Score(*item.Confidence),
 			anchorIDs, inference.ClaimInferred, modelProv, promptProv, nil,
 		)
 		if err != nil {
@@ -804,7 +822,8 @@ func materialize(request Request, prompt string, mp model.Provenance, raw rawOut
 		assertions = append(assertions, propAssertions...)
 		claims = append(claims, propClaims...)
 		edges = append(edges, Edge{
-			ID: edgeID, TypeID: relation.ID(), From: from.ID, To: to.ID,
+			ID: edgeID, TypeID: relation.ID(), From: from.entity.ID, To: to.entity.ID,
+			FromContractID: from.contractID, ToContractID: to.contractID,
 			State: StateProposed, Origin: OriginInferred,
 			Confidence: shoal.Score(*item.Confidence), EvidenceIDs: anchorIDs,
 			Properties: props, Provenance: provenance,
@@ -823,8 +842,8 @@ func materialize(request Request, prompt string, mp model.Provenance, raw rawOut
 		return Result{}, fmt.Errorf("extraction: validate inference result: %w", err)
 	}
 	entities := make([]Entity, 0, len(entityByKey))
-	for _, entity := range entityByKey {
-		entities = append(entities, entity)
+	for _, binding := range entityByKey {
+		entities = append(entities, binding.entity)
 	}
 	sort.Slice(entities, func(i, j int) bool { return string(entities[i].ID) < string(entities[j].ID) })
 	sort.Slice(edges, func(i, j int) bool { return string(edges[i].ID) < string(edges[j].ID) })
@@ -936,12 +955,12 @@ func makeProperties(
 		if _, ok := allowedSet[id]; !ok {
 			return nil, nil, nil, fmt.Errorf("property %q does not apply to type %q", item.PropertyID, subjectType)
 		}
-		value, err := decodeValue(item.Value, definition.ValueType(), nodeTokens)
+		value, referenceNodeID, err := decodeValue(item.Value, definition.ValueType(), nodeTokens)
 		if err != nil {
 			return nil, nil, nil, fmt.Errorf("property %q: %w", item.PropertyID, err)
 		}
-		if reference, ok := value.ReferenceValue(); ok {
-			groundingAnchors, grounded := groundedNodes[reference]
+		if referenceNodeID != "" {
+			groundingAnchors, grounded := groundedNodes[referenceNodeID]
 			if !grounded {
 				return nil, nil, nil, fmt.Errorf("property %q references an ungrounded node ID", item.PropertyID)
 			}
@@ -968,7 +987,9 @@ func makeProperties(
 		if err != nil {
 			return nil, nil, nil, err
 		}
-		props = append(props, Property{DefinitionID: id, Value: value})
+		props = append(props, Property{
+			DefinitionID: id, Value: value, ReferenceNodeID: referenceNodeID,
+		})
 		assertions = append(assertions, assertion)
 		claims = append(claims, claim)
 	}
@@ -1024,9 +1045,11 @@ func intersects(ids []shoal.ID, available map[shoal.ID]struct{}) bool {
 	return false
 }
 
-func decodeValue(raw rawValue, expected ontology.ValueType, nodeTokens map[string]shoal.ID) (ontology.Value, error) {
+func decodeValue(
+	raw rawValue, expected ontology.ValueType, nodeTokens map[string]shoal.ID,
+) (ontology.Value, shoal.ID, error) {
 	if ontology.ValueType(raw.Type) != expected && !(expected == ontology.ValueNumber && raw.Type == string(ontology.ValueInteger)) {
-		return ontology.Value{}, fmt.Errorf("value type %q does not match %q", raw.Type, expected)
+		return ontology.Value{}, "", fmt.Errorf("value type %q does not match %q", raw.Type, expected)
 	}
 	decode := func(target any) error {
 		d := json.NewDecoder(bytes.NewReader(raw.Value))
@@ -1043,49 +1066,57 @@ func decodeValue(raw rawValue, expected ontology.ValueType, nodeTokens map[strin
 	case ontology.ValueString:
 		var v string
 		if err := decode(&v); err != nil {
-			return ontology.Value{}, err
+			return ontology.Value{}, "", err
 		}
-		return ontology.NewStringValue(v)
+		value, err := ontology.NewStringValue(v)
+		return value, "", err
 	case ontology.ValueInteger:
 		var v int64
 		if err := decode(&v); err != nil {
-			return ontology.Value{}, err
+			return ontology.Value{}, "", err
 		}
-		return ontology.NewIntegerValue(v), nil
+		return ontology.NewIntegerValue(v), "", nil
 	case ontology.ValueNumber:
 		var v float64
 		if err := decode(&v); err != nil {
-			return ontology.Value{}, err
+			return ontology.Value{}, "", err
 		}
-		return ontology.NewNumberValue(v)
+		value, err := ontology.NewNumberValue(v)
+		return value, "", err
 	case ontology.ValueBoolean:
 		var v bool
 		if err := decode(&v); err != nil {
-			return ontology.Value{}, err
+			return ontology.Value{}, "", err
 		}
-		return ontology.NewBooleanValue(v), nil
+		return ontology.NewBooleanValue(v), "", nil
 	case ontology.ValueTimestamp:
 		var v string
 		if err := decode(&v); err != nil {
-			return ontology.Value{}, err
+			return ontology.Value{}, "", err
 		}
 		t, err := time.Parse(time.RFC3339Nano, v)
 		if err != nil {
-			return ontology.Value{}, err
+			return ontology.Value{}, "", err
 		}
-		return ontology.NewTimestampValue(t)
+		value, err := ontology.NewTimestampValue(t)
+		return value, "", err
 	case ontology.ValueReference:
 		var v string
 		if err := decode(&v); err != nil {
-			return ontology.Value{}, err
+			return ontology.Value{}, "", err
 		}
 		id, err := decodeGraphNodeToken(v, nodeTokens)
 		if err != nil {
-			return ontology.Value{}, err
+			return ontology.Value{}, "", err
 		}
-		return ontology.NewReferenceValue(id)
+		contractID, err := ontology.NewStableID("grounded-node", v)
+		if err != nil {
+			return ontology.Value{}, "", err
+		}
+		value, err := ontology.NewReferenceValue(contractID)
+		return value, id, err
 	default:
-		return ontology.Value{}, fmt.Errorf("unsupported value type %q", raw.Type)
+		return ontology.Value{}, "", fmt.Errorf("unsupported value type %q", raw.Type)
 	}
 }
 

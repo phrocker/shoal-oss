@@ -26,8 +26,10 @@ The orchestrator:
 An existing graph node may only be referenced when its ID occurs in a supplied
 graph evidence path and the output cites that graph anchor. Graph IDs are
 represented in prompts and model output as reversible `node-base64:` tokens,
-so arbitrary opaque ID bytes remain exact. A referenced node's plan action is
-`reference`, so it is not recreated, overwritten, or relabeled. New entities use `create`. Consumers must submit
+so arbitrary opaque ID bytes remain exact. Plans retain both the raw graph ID
+and a canonical UTF-8 contract ID used by ontology assertions and inference
+claims. A referenced node's plan action is `reference`, so it is not recreated,
+overwritten, or relabeled. New entities use `create`. Consumers must submit
 plans through an atomic high-level Explorer publication API when one becomes
 available; model output must never be translated directly into graph-row
 writes.

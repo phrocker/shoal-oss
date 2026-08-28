@@ -277,14 +277,16 @@ func TestOpaqueGraphNodeIDRoundTripsThroughPromptToken(t *testing.T) {
 	if !strings.Contains(mustPrompt(t, f.request), token) {
 		t.Fatal("prompt omitted reversible opaque node token")
 	}
-	output := `{"entities":[{"key":"opaque","type_id":"` + string(f.thing.ID()) +
-		`","existing_node_id":"` + token +
-		`","properties":[],"confidence":0.8,"evidence_anchor_ids":["` +
-		string(f.anchor.ID()) + `","` + string(f.opaqueAnchor.ID()) +
-		`"]}],"relations":[]}`
+	output := strings.Replace(validOutput(f), `"existing_node_id":""`, `"existing_node_id":"`+token+`"`, 1)
+	output = strings.Replace(output,
+		`"evidence_anchor_ids":["`+string(f.anchor.ID())+`"]`,
+		`"evidence_anchor_ids":["`+string(f.anchor.ID())+`","`+string(f.opaqueAnchor.ID())+`"]`, 1)
 	plan := extractWith(t, f.request, output).PublicationPlan()
 	for _, entity := range plan.Entities {
 		if entity.ID == f.opaqueNodeID {
+			if entity.ContractID == entity.ID {
+				t.Fatal("opaque node did not receive a transport-safe contract ID")
+			}
 			return
 		}
 	}

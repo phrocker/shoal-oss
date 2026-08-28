@@ -25,7 +25,7 @@ type Enricher interface {
 type HeuristicEnricher struct{}
 
 // LLMEnricher is retained for compatibility with the legacy flat entity API.
-// Deprecated: use StructuredEnricher for ontology-guided extraction.
+// Deprecated: use Client.PlanEnrichment for ontology-guided extraction.
 type LLMEnricher struct {
 	LLM      LLM
 	Fallback Enricher
