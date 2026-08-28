@@ -117,8 +117,10 @@ roles remain gated by the live conformance verdicts tracked in
 
 `pkg/inference` provides public, provider-neutral contracts, and
 `pkg/contextpack` deterministically builds bounded packs from Explorer
-retrieval and hydration APIs. Shoal does not yet ship runtime LLM
-orchestration or a model-provider transport.
+retrieval and hydration APIs. `pkg/inference/harness` can run a bounded
+model-guided loop over an already authorized Explorer client and returns an
+inspectable trace. Shoal does not ship a Copilot/SDK hosted execution backend
+by default.
 
 ## Build and platform quick start
 

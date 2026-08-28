@@ -498,7 +498,11 @@ func (f *fakeTools) make(id shoal.ID, kind ActionKind) (ToolResult, error) {
 }
 
 func budgets() Budgets {
-	return Budgets{MaxSteps: 8, MaxElapsed: time.Second, MaxInputTokens: 10, MaxOutputTokens: 10, MaxGraphHops: 2, MaxFanout: 5, MaxRepeatedAction: 1}
+	return Budgets{
+		MaxSteps: 8, MaxElapsed: time.Second, MaxInputTokens: 10, MaxOutputTokens: 10,
+		MaxEvidence: 5, MaxGraphHops: 2, MaxGraphNodes: 5, MaxFanout: 5,
+		MaxRepeatedAction: 1,
+	}
 }
 func newGenerator(t *testing.T, runner Runner, tools ToolHost) *Generator {
 	return newGeneratorWithBudgets(t, runner, tools, budgets())

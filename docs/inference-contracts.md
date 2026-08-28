@@ -44,10 +44,33 @@ steps, elapsed time, observable token usage, graph hops/fan-out, repetition,
 and cancellation. Unknown actions and mismatched or stale results fail closed.
 
 `Runner` and `Session` are provider-neutral boundaries. `FakeRunner` supplies
-deterministic scripted actions and faults for tests. Evaluation records contain
-provenance, budgets, action kinds, and token usage only; they exclude prompts,
-correlation IDs, tool inputs/results, credentials, raw authorization grants,
-URLs, storage coordinates, shell, and filesystem access.
+deterministic scripted actions and faults for tests. `ModelRunner` adapts a
+low-level `pkg/model.TextGenerator` into the same loop by prompting for one
+strict JSON action per iteration, parsing only the allowlisted tools, and
+constructing final `Claim` or `Issue` values through `pkg/inference`
+constructors. Malformed JSON, arbitrary tools, and final claims that cite
+evidence outside the assembled context fail closed instead of being passed
+through.
+
+Budgets are caller-visible and enforced by the harness: model-call steps,
+wall-clock duration, input/output token usage reported by the provider,
+retrieved evidence anchors, graph hops, graph node count, per-action fan-out,
+and repeated-action cycles. Cancellation and deadline errors are returned
+explicitly; provider failures are reported as unavailable with no fallback.
+Each `Run` returns a trace with iterations, decisions, tool evidence IDs,
+budget consumption, stop reason, and failures.
+
+`ExplorerToolHost` connects those actions to an already authorized Explorer
+client. Retrieval preserves the original snapshot `AsOf`, section opening
+hydrates only issued document/revision/section IDs, and neighbor expansion
+requires `explorer.BoundedClient` so depth, fan-out, and node caps are enforced
+before graph materialization. Tool results carry the original snapshot and
+authorization pins, so the loop never widens visibility.
+
+Evaluation records contain provenance, budgets, action kinds, and token usage
+only; they exclude prompts, correlation IDs, tool inputs/results, credentials,
+raw authorization grants, URLs, storage coordinates, shell, and filesystem
+access.
 
 The harness implements `inference.Generator`. Its returned result remains
 bound to the supplied context pack and carries canonically verified evidence
@@ -56,9 +79,9 @@ pack. `Run` additionally returns a `Record` with the exact expanded context and
 full in-memory transcript. Callers must not log that record; only the optional
 `Recorder` receives the separate redacted `EvaluationRecord`.
 
-No Copilot, SDK-process, or other hosted execution backend is bundled yet. A
-future backend can implement `Runner` without changing inference contracts;
-the package deliberately includes no arbitrary subprocess runner.
+No Copilot, SDK-process, or other hosted execution backend is bundled. Future
+backends can implement `Runner` without changing inference contracts; the
+package deliberately includes no arbitrary subprocess runner.
 
 ## Explorer context construction
 

@@ -63,7 +63,9 @@ type Budgets struct {
 	MaxElapsed        time.Duration
 	MaxInputTokens    int
 	MaxOutputTokens   int
+	MaxEvidence       int
 	MaxGraphHops      int
+	MaxGraphNodes     int
 	MaxFanout         int
 	MaxRepeatedAction int
 }
@@ -138,8 +140,9 @@ func (b Budgets) validate() error {
 	if b.MaxElapsed <= 0 {
 		return invalid("max elapsed must be positive")
 	}
-	if b.MaxInputTokens < 0 || b.MaxOutputTokens < 0 || b.MaxGraphHops < 0 ||
-		b.MaxFanout <= 0 || b.MaxRepeatedAction <= 0 {
+	if b.MaxInputTokens < 0 || b.MaxOutputTokens < 0 || b.MaxEvidence <= 0 ||
+		b.MaxGraphHops < 0 || b.MaxGraphNodes <= 0 || b.MaxFanout <= 0 ||
+		b.MaxRepeatedAction <= 0 {
 		return invalid("budget values are outside the supported range")
 	}
 	return nil
@@ -464,6 +467,7 @@ type ToolHost interface {
 type ToolContext struct {
 	requestID     shoal.ID
 	contextPackID shoal.ID
+	context       inference.ContextPack
 	correlation   shoal.ID
 	snapshot      inference.SnapshotPin
 	auth          inference.AuthPin
@@ -471,6 +475,7 @@ type ToolContext struct {
 
 func (c ToolContext) RequestID() shoal.ID              { return c.requestID }
 func (c ToolContext) ContextPackID() shoal.ID          { return c.contextPackID }
+func (c ToolContext) Context() inference.ContextPack   { return clonePack(c.context) }
 func (c ToolContext) CorrelationID() shoal.ID          { return c.correlation }
 func (c ToolContext) Snapshot() inference.SnapshotPin  { return c.snapshot }
 func (c ToolContext) Authorization() inference.AuthPin { return c.auth }
@@ -479,6 +484,51 @@ type Record struct {
 	Request    SessionRequest
 	Transcript Transcript
 	Result     inference.InferenceResult
+	Trace      RunTrace
+}
+
+type StopReason string
+
+const (
+	StopReasonStop            StopReason = "stop"
+	StopReasonBudgetExhausted StopReason = "budget_exhausted"
+	StopReasonInvalid         StopReason = "invalid"
+	StopReasonUnavailable     StopReason = "unavailable"
+	StopReasonCanceled        StopReason = "canceled"
+	StopReasonDeadline        StopReason = "deadline"
+)
+
+type BudgetUsage struct {
+	ModelCalls   int
+	InputTokens  int
+	OutputTokens int
+	Evidence     int
+	GraphHops    int
+	GraphNodes   int
+}
+
+type IterationTrace struct {
+	Index         int
+	Decision      ActionKind
+	CorrelationID shoal.ID
+	Usage         Usage
+	EvidenceIDs   []shoal.ID
+	Budget        BudgetUsage
+	Failure       string
+}
+
+type FailureTrace struct {
+	Iteration int
+	Operation string
+	Error     string
+}
+
+type RunTrace struct {
+	Budgets    Budgets
+	Usage      BudgetUsage
+	Iterations []IterationTrace
+	StopReason StopReason
+	Failures   []FailureTrace
 }
 
 // EvaluationRecord is a redacted deterministic execution record. It contains
@@ -527,12 +577,24 @@ func (g *Generator) Run(ctx context.Context, pack inference.ContextPack) (Record
 	if err != nil {
 		return Record{}, err
 	}
+	trace := RunTrace{Budgets: g.budgets}
+	earlyFinish := func(reason StopReason, operation string, err error) (Record, error) {
+		trace.StopReason = reason
+		trace.Failures = append(trace.Failures, FailureTrace{
+			Iteration: -1,
+			Operation: operation,
+			Error:     err.Error(),
+		})
+		return Record{Request: request, Trace: cloneRunTrace(trace)}, err
+	}
 	if !g.now().Before(pack.Authorization().ExpiresAt()) {
-		return Record{}, invalid("authorization pin is stale")
+		err := invalid("authorization pin is stale")
+		return earlyFinish(StopReasonInvalid, "authorization", err)
 	}
 	remainingAuth := pack.Authorization().ExpiresAt().Sub(g.now())
 	if remainingAuth <= 0 {
-		return Record{}, invalid("authorization pin is stale")
+		err := invalid("authorization pin is stale")
+		return earlyFinish(StopReasonInvalid, "authorization", err)
 	}
 	maxElapsed := g.budgets.MaxElapsed
 	if remainingAuth < maxElapsed {
@@ -543,62 +605,119 @@ func (g *Generator) Run(ctx context.Context, pack inference.ContextPack) (Record
 	session, err := g.runner.Start(runCtx, request)
 	if err != nil {
 		if runCtx.Err() != nil {
-			return Record{}, runCtx.Err()
+			return earlyFinish(stopReasonFor(runCtx.Err()), "model", runCtx.Err())
 		}
-		return Record{}, fmt.Errorf("%w: %v", ErrRunnerUnavailable, err)
+		err := fmt.Errorf("%w: %v", ErrRunnerUnavailable, err)
+		return earlyFinish(StopReasonUnavailable, "model", err)
 	}
 	if session == nil {
-		return Record{}, ErrRunnerUnavailable
+		return earlyFinish(StopReasonUnavailable, "model", ErrRunnerUnavailable)
 	}
 	transcript := newTranscript(request)
 	seenCorrelation := map[shoal.ID]struct{}{}
 	repeats := map[string]int{}
-	inputTokens, outputTokens, hops, fanout := 0, 0, 0, 0
+	inputTokens, outputTokens, hops, evidence := 0, 0, 0, 0
+	graphNodes := graphNodeSet(transcript.context.Evidence())
+	currentUsage := func() BudgetUsage {
+		return BudgetUsage{
+			ModelCalls:   len(trace.Iterations),
+			InputTokens:  inputTokens,
+			OutputTokens: outputTokens,
+			Evidence:     evidence,
+			GraphHops:    hops,
+			GraphNodes:   len(graphNodes),
+		}
+	}
+	finish := func(
+		reason StopReason,
+		iteration int,
+		operation string,
+		result inference.InferenceResult,
+		err error,
+	) (Record, error) {
+		trace.Usage = currentUsage()
+		trace.StopReason = reason
+		if err != nil {
+			trace.Failures = append(trace.Failures, FailureTrace{
+				Iteration: iteration,
+				Operation: operation,
+				Error:     err.Error(),
+			})
+			if len(trace.Iterations) > 0 && iteration >= 0 &&
+				trace.Iterations[len(trace.Iterations)-1].Index == iteration {
+				trace.Iterations[len(trace.Iterations)-1].Failure = err.Error()
+			}
+		}
+		return Record{
+			Request: request, Transcript: cloneTranscript(transcript),
+			Result: result, Trace: cloneRunTrace(trace),
+		}, err
+	}
+	if len(graphNodes) > g.budgets.MaxGraphNodes {
+		err := budget("graph nodes")
+		return finish(StopReasonBudgetExhausted, -1, "budget", inference.InferenceResult{}, err)
+	}
 	for step := 0; step < g.budgets.MaxSteps; step++ {
 		if !g.now().Before(pack.Authorization().ExpiresAt()) {
-			return Record{}, invalid("authorization pin expired during execution")
+			err := invalid("authorization pin expired during execution")
+			return finish(StopReasonInvalid, step, "authorization", inference.InferenceResult{}, err)
 		}
 		action, nextErr := session.Next(runCtx, transcript)
 		if nextErr != nil {
 			if runCtx.Err() != nil {
-				return Record{}, runCtx.Err()
+				return finish(stopReasonFor(runCtx.Err()), step, "model", inference.InferenceResult{}, runCtx.Err())
 			}
-			return Record{}, fmt.Errorf("%w: %v", ErrRunnerUnavailable, nextErr)
+			if errors.Is(nextErr, ErrInvalid) || errors.Is(nextErr, ErrBudgetExhausted) {
+				return finish(stopReasonFor(nextErr), step, "model", inference.InferenceResult{}, nextErr)
+			}
+			err := fmt.Errorf("%w: %v", ErrRunnerUnavailable, nextErr)
+			return finish(StopReasonUnavailable, step, "model", inference.InferenceResult{}, err)
 		}
 		if err := runCtx.Err(); err != nil {
-			return Record{}, err
+			return finish(stopReasonFor(err), step, "model", inference.InferenceResult{}, err)
 		}
 		if !g.now().Before(pack.Authorization().ExpiresAt()) {
-			return Record{}, invalid("authorization pin expired during execution")
+			err := invalid("authorization pin expired during execution")
+			return finish(StopReasonInvalid, step, "authorization", inference.InferenceResult{}, err)
 		}
 		if err := action.validate(); err != nil {
-			return Record{}, err
+			return finish(StopReasonInvalid, step, "action", inference.InferenceResult{}, err)
 		}
 		if _, duplicate := seenCorrelation[action.correlation]; duplicate {
-			return Record{}, invalid("duplicate action correlation ID")
+			err := invalid("duplicate action correlation ID")
+			return finish(StopReasonInvalid, step, "action", inference.InferenceResult{}, err)
 		}
 		seenCorrelation[action.correlation] = struct{}{}
+		iteration := IterationTrace{
+			Index: step, Decision: action.kind, CorrelationID: action.correlation,
+			Usage: action.usage,
+		}
+		trace.Iterations = append(trace.Iterations, iteration)
 		if exceedsRemaining(inputTokens, action.usage.InputTokens, g.budgets.MaxInputTokens) ||
 			exceedsRemaining(outputTokens, action.usage.OutputTokens, g.budgets.MaxOutputTokens) {
-			return Record{}, budget("token")
+			err := budget("token")
+			return finish(StopReasonBudgetExhausted, step, "budget", inference.InferenceResult{}, err)
 		}
 		inputTokens += action.usage.InputTokens
 		outputTokens += action.usage.OutputTokens
 		key := actionKey(action)
 		repeats[key]++
 		if repeats[key] > g.budgets.MaxRepeatedAction {
-			return Record{}, budget("repeated action/cycle")
+			err := budget("repeated action/cycle")
+			return finish(StopReasonBudgetExhausted, step, "budget", inference.InferenceResult{}, err)
 		}
 		if action.kind == ActionStop {
 			runnerResult := cloneResult(action.result)
 			if err := runnerResult.ValidateFor(transcript.context); err != nil {
-				return Record{}, fmt.Errorf("%w: final result: %v", ErrInvalid, err)
+				err := fmt.Errorf("%w: final result: %v", ErrInvalid, err)
+				return finish(StopReasonInvalid, step, "final result", inference.InferenceResult{}, err)
 			}
 			if err := validateResultProvenance(runnerResult, g.provenance); err != nil {
-				return Record{}, err
+				return finish(StopReasonInvalid, step, "final result", inference.InferenceResult{}, err)
 			}
 			if transcript.context.Snapshot() != pack.Snapshot() || transcript.context.Authorization() != pack.Authorization() {
-				return Record{}, invalid("final context pins changed")
+				err := invalid("final context pins changed")
+				return finish(StopReasonInvalid, step, "final result", inference.InferenceResult{}, err)
 			}
 			final := action
 			transcript.final = &final
@@ -610,24 +729,28 @@ func (g *Generator) Run(ctx context.Context, pack inference.ContextPack) (Record
 				runnerResult.GeneratedAt(), runnerResult.Metadata(),
 			)
 			if err != nil {
-				return Record{}, err
+				return finish(StopReasonInvalid, step, "final result", inference.InferenceResult{}, err)
 			}
-			record := Record{Request: request, Transcript: cloneTranscript(transcript), Result: result}
+			trace.Iterations[len(trace.Iterations)-1].Budget = currentUsage()
+			record := Record{
+				Request: request, Transcript: cloneTranscript(transcript),
+				Result: result, Trace: cloneRunTrace(trace),
+			}
 			if g.recorder != nil {
 				if err := g.recorder.Record(runCtx, evaluationRecord(record)); err != nil {
-					return Record{}, err
+					return finish(stopReasonFor(err), step, "recorder", inference.InferenceResult{}, err)
 				}
-
 			}
 			if err := runCtx.Err(); err != nil {
-				return Record{}, err
+				return finish(stopReasonFor(err), step, "model", inference.InferenceResult{}, err)
 			}
-			return record, nil
+			return finish(StopReasonStop, step, "stop", result, nil)
 		}
 		var toolResult ToolResult
 		toolContext := ToolContext{
 			requestID:     request.id,
 			contextPackID: transcript.context.ID(),
+			context:       transcript.context,
 			correlation:   action.correlation,
 			snapshot:      pack.Snapshot(),
 			auth:          pack.Authorization(),
@@ -635,70 +758,86 @@ func (g *Generator) Run(ctx context.Context, pack inference.ContextPack) (Record
 		switch action.kind {
 		case ActionRetrieve:
 			if action.retrieve.limit > g.budgets.MaxFanout {
-				return Record{}, budget("retrieve fanout")
+				err := budget("retrieve fanout")
+				return finish(StopReasonBudgetExhausted, step, "budget", inference.InferenceResult{}, err)
 			}
 			toolResult, err = g.tools.Retrieve(runCtx, toolContext, action.retrieve)
 		case ActionOpenSection:
 			if !sectionAllowed(transcript.context, action.open) {
-				return Record{}, invalid("open_section IDs were not issued to this session")
+				err := invalid("open_section IDs were not issued to this session")
+				return finish(StopReasonInvalid, step, "authorization", inference.InferenceResult{}, err)
 			}
 			toolResult, err = g.tools.OpenSection(runCtx, toolContext, action.open)
 		case ActionNeighbors:
 			if exceedsRemaining(hops, action.neighbors.hops, g.budgets.MaxGraphHops) ||
 				action.neighbors.fanout > g.budgets.MaxFanout {
-				return Record{}, budget("graph traversal")
+				err := budget("graph traversal")
+				return finish(StopReasonBudgetExhausted, step, "budget", inference.InferenceResult{}, err)
 			}
 			hops += action.neighbors.hops
 			if !nodeAllowed(transcript.context, action.neighbors.nodeID) {
-				return Record{}, invalid("neighbors node ID was not issued to this session")
+				err := invalid("neighbors node ID was not issued to this session")
+				return finish(StopReasonInvalid, step, "authorization", inference.InferenceResult{}, err)
 			}
 			toolResult, err = g.tools.Neighbors(runCtx, toolContext, action.neighbors)
 		default:
-			return Record{}, invalid("unknown or forbidden action")
+			err := invalid("unknown or forbidden action")
+			return finish(StopReasonInvalid, step, "action", inference.InferenceResult{}, err)
 		}
 
 		if err != nil {
 			if runCtx.Err() != nil {
-				return Record{}, runCtx.Err()
+				return finish(stopReasonFor(runCtx.Err()), step, "tool", inference.InferenceResult{}, runCtx.Err())
 			}
-			return Record{}, err
+			return finish(stopReasonFor(err), step, "tool", inference.InferenceResult{}, err)
 		}
 		if err := runCtx.Err(); err != nil {
-			return Record{}, err
+			return finish(stopReasonFor(err), step, "tool", inference.InferenceResult{}, err)
 		}
 		if err := validateToolResult(action, toolResult, pack); err != nil {
-			return Record{}, err
+			return finish(StopReasonInvalid, step, "tool result", inference.InferenceResult{}, err)
 		}
 		switch action.kind {
 		case ActionRetrieve:
-			if len(toolResult.anchors) > action.retrieve.limit {
-				return Record{}, budget("retrieve result fanout")
-			}
+			// The retrieval limit bounds ranked results. A result may add both
+			// document and graph evidence anchors, so the global evidence budget
+			// accounts for the exact anchor count below.
 		case ActionNeighbors:
 			if len(toolResult.anchors) > action.neighbors.fanout {
-				return Record{}, budget("neighbors result fanout")
+				err := budget("neighbors result fanout")
+				return finish(StopReasonBudgetExhausted, step, "budget", inference.InferenceResult{}, err)
 			}
 			if err := validateNeighborResults(action.neighbors, toolResult.anchors); err != nil {
-				return Record{}, err
+				return finish(StopReasonInvalid, step, "tool result", inference.InferenceResult{}, err)
 			}
 		case ActionOpenSection:
 			if err := validateSectionResults(action.open, toolResult.anchors); err != nil {
-				return Record{}, err
+				return finish(StopReasonInvalid, step, "tool result", inference.InferenceResult{}, err)
 			}
 		}
-		if exceedsRemaining(fanout, len(toolResult.anchors), g.budgets.MaxFanout) {
-			return Record{}, budget("tool result fanout")
+		if exceedsRemaining(evidence, len(toolResult.anchors), g.budgets.MaxEvidence) {
+			err := budget("evidence")
+			return finish(StopReasonBudgetExhausted, step, "budget", inference.InferenceResult{}, err)
 		}
-		fanout += len(toolResult.anchors)
+		evidence += len(toolResult.anchors)
+		newGraphNodes := countNewGraphNodes(graphNodes, toolResult.anchors)
+		if exceedsRemaining(len(graphNodes), newGraphNodes, g.budgets.MaxGraphNodes) {
+			err := budget("graph nodes")
+			return finish(StopReasonBudgetExhausted, step, "budget", inference.InferenceResult{}, err)
+		}
+		addGraphNodes(graphNodes, toolResult.anchors)
 		nextPack, err := addAnchors(transcript.context, toolResult.anchors)
 		if err != nil {
-			return Record{}, err
+			return finish(StopReasonInvalid, step, "context pack", inference.InferenceResult{}, err)
 		}
 		transcript.context = nextPack
 		transcript.exchanges = append(transcript.exchanges, Exchange{action: action, result: cloneToolResult(toolResult)})
 		transcript.id = transcriptID(transcript)
+		trace.Iterations[len(trace.Iterations)-1].EvidenceIDs = anchorIDs(toolResult.anchors)
+		trace.Iterations[len(trace.Iterations)-1].Budget = currentUsage()
 	}
-	return Record{}, budget("step")
+	stepErr := budget("step")
+	return finish(StopReasonBudgetExhausted, g.budgets.MaxSteps, "budget", inference.InferenceResult{}, stepErr)
 }
 
 func verifiedAdditions(original, expanded inference.ContextPack) []inference.EvidenceAnchor {
@@ -713,6 +852,79 @@ func verifiedAdditions(original, expanded inference.ContextPack) []inference.Evi
 		}
 	}
 	return additions
+}
+
+func anchorIDs(anchors []inference.EvidenceAnchor) []shoal.ID {
+	ids := make([]shoal.ID, len(anchors))
+	for i, anchor := range anchors {
+		ids[i] = anchor.ID()
+	}
+	sort.Slice(ids, func(i, j int) bool { return shoal.CompareID(ids[i], ids[j]) < 0 })
+	return ids
+}
+
+func graphNodeSet(anchors []inference.EvidenceAnchor) map[shoal.ID]struct{} {
+	nodes := make(map[shoal.ID]struct{})
+	addGraphNodes(nodes, anchors)
+	return nodes
+}
+
+func countNewGraphNodes(seen map[shoal.ID]struct{}, anchors []inference.EvidenceAnchor) int {
+	count := 0
+	pending := make(map[shoal.ID]struct{})
+	for _, anchor := range anchors {
+		path, ok := anchor.Path()
+		if !ok {
+			continue
+		}
+		for _, node := range path.Nodes {
+			if _, exists := seen[node.ID]; exists {
+				continue
+			}
+			if _, exists := pending[node.ID]; exists {
+				continue
+			}
+			pending[node.ID] = struct{}{}
+			count++
+		}
+	}
+	return count
+}
+
+func addGraphNodes(seen map[shoal.ID]struct{}, anchors []inference.EvidenceAnchor) {
+	for _, anchor := range anchors {
+		path, ok := anchor.Path()
+		if !ok {
+			continue
+		}
+		for _, node := range path.Nodes {
+			seen[node.ID] = struct{}{}
+		}
+	}
+}
+
+func stopReasonFor(err error) StopReason {
+	switch {
+	case errors.Is(err, context.Canceled):
+		return StopReasonCanceled
+	case errors.Is(err, context.DeadlineExceeded):
+		return StopReasonDeadline
+	case errors.Is(err, ErrBudgetExhausted):
+		return StopReasonBudgetExhausted
+	case errors.Is(err, ErrInvalid):
+		return StopReasonInvalid
+	default:
+		return StopReasonUnavailable
+	}
+}
+
+func cloneRunTrace(trace RunTrace) RunTrace {
+	trace.Iterations = append([]IterationTrace(nil), trace.Iterations...)
+	for i := range trace.Iterations {
+		trace.Iterations[i].EvidenceIDs = append([]shoal.ID(nil), trace.Iterations[i].EvidenceIDs...)
+	}
+	trace.Failures = append([]FailureTrace(nil), trace.Failures...)
+	return trace
 }
 
 func evaluationRecord(record Record) EvaluationRecord {
@@ -839,7 +1051,9 @@ func deriveID(namespace string, parts ...string) shoal.ID {
 	return shoal.ID(namespace + ":" + hex.EncodeToString(h.Sum(nil)))
 }
 func canonicalBudgets(b Budgets) string {
-	return fmt.Sprintf("%d/%d/%d/%d/%d/%d/%d", b.MaxSteps, b.MaxElapsed.Nanoseconds(), b.MaxInputTokens, b.MaxOutputTokens, b.MaxGraphHops, b.MaxFanout, b.MaxRepeatedAction)
+	return fmt.Sprintf("%d/%d/%d/%d/%d/%d/%d/%d/%d",
+		b.MaxSteps, b.MaxElapsed.Nanoseconds(), b.MaxInputTokens, b.MaxOutputTokens,
+		b.MaxEvidence, b.MaxGraphHops, b.MaxGraphNodes, b.MaxFanout, b.MaxRepeatedAction)
 }
 func validateLogicalID(name string, id shoal.ID) error {
 	if len(id) > MaxLogicalIDBytes {

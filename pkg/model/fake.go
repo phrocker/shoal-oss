@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
+	"encoding/json"
 	"math"
 	"strconv"
 	"strings"
@@ -24,6 +25,9 @@ func (f FakeGenerator) Generate(ctx context.Context, req GenerateRequest) (Gener
 	}
 	if err := validateTextRequest("fake generate", req.Prompt, req.MaxOutputTokens, DefaultMaxTextBytes); err != nil {
 		return GenerateResult{}, &Error{Kind: ErrInvalidRequest, Operation: "fake generate"}
+	}
+	if strings.Contains(req.Prompt, "shoal-harness-action-json/v1") {
+		return f.generateHarnessAction(req)
 	}
 	prompt := strings.ToLower(req.Prompt)
 	parts := []string{"causal"}
@@ -48,6 +52,63 @@ func (f FakeGenerator) Generate(ctx context.Context, req GenerateRequest) (Gener
 			TotalTokens:  tokenEstimate(req.Prompt) + outputTokens,
 		},
 	}, nil
+}
+
+func (f FakeGenerator) generateHarnessAction(req GenerateRequest) (GenerateResult, error) {
+	name := strings.TrimSpace(f.Model)
+	if name == "" {
+		name = "deterministic"
+	}
+	text := `{"action":"retrieve","correlation_id":"fake-retrieve-1","query":"entity","limit":1}`
+	if !strings.Contains(req.Prompt, `"transcript":[]`) {
+		evidenceID := firstHarnessEvidenceID(req.Prompt)
+		if evidenceID == "" {
+			text = `{"action":"stop","correlation_id":"fake-stop","unsupported":[{"input":"final claim","reason":"no evidence anchor was visible","evidence_ids":[]}]}`
+		} else {
+			payload := map[string]any{
+				"action":         "stop",
+				"correlation_id": "fake-stop",
+				"claims": []map[string]any{{
+					"subject":      "entity:fake",
+					"predicate":    "predicate:summary",
+					"object":       map[string]any{"type": "string", "value": "grounded"},
+					"confidence":   1,
+					"evidence_ids": []string{evidenceID},
+				}},
+			}
+			encoded, err := json.Marshal(payload)
+			if err != nil {
+				return GenerateResult{}, &Error{Kind: ErrMalformedResponse, Operation: "fake generate"}
+			}
+			text = string(encoded)
+		}
+	}
+	outputTokens := tokenEstimate(text)
+	if req.MaxOutputTokens > 0 && outputTokens > req.MaxOutputTokens {
+		return GenerateResult{}, &Error{Kind: ErrOversizedResponse, Operation: "fake generate"}
+	}
+	return GenerateResult{
+		Text:       text,
+		Provenance: Provenance{Provider: "fake", Model: name},
+		Usage: Usage{
+			InputTokens:  tokenEstimate(req.Prompt),
+			OutputTokens: outputTokens,
+			TotalTokens:  tokenEstimate(req.Prompt) + outputTokens,
+		},
+	}, nil
+}
+
+func firstHarnessEvidenceID(prompt string) string {
+	index := strings.Index(prompt, `"evidence":[{"id":"`)
+	if index < 0 {
+		return ""
+	}
+	start := index + len(`"evidence":[{"id":"`)
+	end := strings.IndexByte(prompt[start:], '"')
+	if end < 0 {
+		return ""
+	}
+	return prompt[start : start+end]
 }
 
 type FakeEmbedder struct {
