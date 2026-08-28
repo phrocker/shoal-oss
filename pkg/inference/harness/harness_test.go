@@ -1,0 +1,436 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements. See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership. The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License. You may obtain a copy of the License at
+ *
+ *     https://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied. See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+package harness
+
+import (
+	"context"
+	"errors"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/phrocker/shoal-oss/pkg/document"
+	"github.com/phrocker/shoal-oss/pkg/inference"
+	"github.com/phrocker/shoal-oss/pkg/ontology"
+	"github.com/phrocker/shoal-oss/pkg/shoal"
+)
+
+var fixedTime = time.Date(2026, 8, 28, 12, 0, 0, 0, time.UTC)
+
+func TestSuccessfulTraceAndCanonicalTranscript(t *testing.T) {
+	pack, initial, additions := fixture(t)
+	retrieve := mustRetrieve(t, "r1", "more evidence", 2)
+	open := mustOpen(t, "r2", "document", "section")
+	neighbors := mustNeighbors(t, "r3", "node-a", 1, 2)
+	host := &fakeTools{pack: pack, results: map[shoal.ID][]inference.EvidenceAnchor{
+		"r1": {additions[0]}, "r2": {additions[1]}, "r3": {additions[2]},
+	}}
+	runner := NewFakeRunner(
+		ScriptAction(retrieve), ScriptAction(open), ScriptAction(neighbors),
+		func(_ context.Context, transcript Transcript) (Action, error) {
+			if len(transcript.Exchanges()) != 3 || len(transcript.Context().Evidence()) != 4 {
+				t.Fatal("runner did not receive grounded additions")
+			}
+			result := resultFor(t, transcript.Context(), additions[2])
+			return NewStopAction("r4", result, Usage{OutputTokens: 1})
+		},
+	)
+	g := newGenerator(t, runner, host)
+	record, err := g.Run(context.Background(), pack)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := record.Result.ValidateFor(record.Transcript.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if len(record.Transcript.Exchanges()) != 3 {
+		t.Fatal("wrong transcript length")
+	}
+	if final, ok := record.Transcript.Final(); !ok || final.Kind() != ActionStop {
+		t.Fatal("stop action missing from transcript")
+	}
+	if record.Transcript.ID() == "" || record.Request.ID() == "" {
+		t.Fatal("missing canonical identity")
+	}
+
+	g2 := newGenerator(t, runner, host)
+	record2, err := g2.Run(context.Background(), pack)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.Transcript.ID() != record2.Transcript.ID() || record.Request.ID() != record2.Request.ID() {
+		t.Fatal("deterministic execution changed canonical identity")
+	}
+	if initial.ID() == additions[0].ID() {
+		t.Fatal("fixture anchors collided")
+	}
+}
+
+func TestRejectsMalformedIDs(t *testing.T) {
+	if _, err := NewRetrieveAction("", RetrieveRequest{query: "q", limit: 1}, Usage{}); err == nil {
+		t.Fatal("empty correlation accepted")
+	}
+	if _, err := NewOpenSectionRequest("", "section"); err == nil {
+		t.Fatal("empty document ID accepted")
+	}
+	if _, err := NewNeighborsRequest("", 1, 1); err == nil {
+		t.Fatal("empty node ID accepted")
+	}
+}
+
+func TestRejectsUnknownAndForbiddenActions(t *testing.T) {
+	pack, _, _ := fixture(t)
+	for _, kind := range []ActionKind{"shell", "filesystem", "url", "storage", "credentials", "arbitrary"} {
+		t.Run(string(kind), func(t *testing.T) {
+			a := Action{kind: kind, correlation: "x"}
+			g := newGenerator(t, NewFakeRunner(ScriptAction(a)), &fakeTools{pack: pack})
+			_, err := g.Generate(context.Background(), pack)
+			if !errors.Is(err, ErrInvalid) {
+				t.Fatalf("error = %v", err)
+			}
+		})
+	}
+}
+
+func TestBudgetBoundaries(t *testing.T) {
+	pack, _, additions := fixture(t)
+	tests := []struct {
+		name    string
+		budgets Budgets
+		action  Action
+	}{
+		{"input tokens", budgets(), mustRetrieveUsage(t, "x", 1, Usage{InputTokens: 11})},
+		{"output tokens", budgets(), mustRetrieveUsage(t, "x", 1, Usage{OutputTokens: 11})},
+		{"retrieve fanout", budgets(), mustRetrieveUsage(t, "x", 6, Usage{})},
+		{"graph hops", budgets(), mustNeighbors(t, "x", "node", 3, 1)},
+		{"graph fanout", budgets(), mustNeighbors(t, "x", "node", 1, 6)},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			host := &fakeTools{pack: pack, results: map[shoal.ID][]inference.EvidenceAnchor{"x": {additions[0]}}}
+			g := newGeneratorWithBudgets(t, NewFakeRunner(ScriptAction(tc.action)), host, tc.budgets)
+			_, err := g.Generate(context.Background(), pack)
+			if !errors.Is(err, ErrBudgetExhausted) {
+				t.Fatalf("error = %v", err)
+			}
+		})
+	}
+	t.Run("exact token boundary", func(t *testing.T) {
+		host := &fakeTools{pack: pack, results: map[shoal.ID][]inference.EvidenceAnchor{"x": {additions[0]}}}
+		first := mustRetrieveUsage(t, "x", 1, Usage{InputTokens: 10, OutputTokens: 10})
+		runner := NewFakeRunner(ScriptAction(first), func(_ context.Context, tr Transcript) (Action, error) {
+			return NewStopAction("stop", resultFor(t, tr.Context(), additions[0]), Usage{})
+		})
+		g := newGenerator(t, runner, host)
+		if _, err := g.Generate(context.Background(), pack); err != nil {
+			t.Fatal(err)
+		}
+	})
+}
+
+func TestStepAndCycleLimits(t *testing.T) {
+	pack, _, additions := fixture(t)
+	host := &fakeTools{pack: pack, results: map[shoal.ID][]inference.EvidenceAnchor{
+		"a": {additions[0]}, "b": {additions[0]}, "c": {additions[0]},
+	}}
+	a := mustRetrieve(t, "a", "same", 1)
+	b := mustRetrieve(t, "b", "same", 1)
+	g := newGenerator(t, NewFakeRunner(ScriptAction(a), ScriptAction(b)), host)
+	_, err := g.Generate(context.Background(), pack)
+	if !errors.Is(err, ErrBudgetExhausted) {
+		t.Fatalf("cycle error = %v", err)
+	}
+
+	custom := budgets()
+	custom.MaxSteps = 1
+	g = newGeneratorWithBudgets(t, NewFakeRunner(ScriptAction(mustRetrieve(t, "c", "other", 1))), host, custom)
+	_, err = g.Generate(context.Background(), pack)
+	if !errors.Is(err, ErrBudgetExhausted) {
+		t.Fatalf("step error = %v", err)
+	}
+}
+
+func TestCancellationTimeoutAndRunnerFailure(t *testing.T) {
+	pack, _, _ := fixture(t)
+	block := ScriptStep(func(ctx context.Context, _ Transcript) (Action, error) {
+		<-ctx.Done()
+		return Action{}, ctx.Err()
+	})
+	g := newGenerator(t, NewFakeRunner(block), &fakeTools{pack: pack})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := g.Generate(ctx, pack); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancel error = %v", err)
+	}
+
+	short := budgets()
+	short.MaxElapsed = time.Millisecond
+	g = newGeneratorWithBudgets(t, NewFakeRunner(block), &fakeTools{pack: pack}, short)
+	if _, err := g.Generate(context.Background(), pack); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("timeout error = %v", err)
+	}
+
+	g = newGenerator(t, NewFakeRunner(ScriptFault(errors.New("offline"))), &fakeTools{pack: pack})
+	if _, err := g.Generate(context.Background(), pack); !errors.Is(err, ErrRunnerUnavailable) {
+		t.Fatalf("runner error = %v", err)
+	}
+}
+
+func TestRejectsDuplicateCorrelationAndMismatchedToolResult(t *testing.T) {
+	pack, _, additions := fixture(t)
+	first := mustRetrieve(t, "same", "a", 1)
+	second := mustOpen(t, "same", "document", "section")
+	host := &fakeTools{pack: pack, results: map[shoal.ID][]inference.EvidenceAnchor{"same": {additions[0]}}}
+	g := newGenerator(t, NewFakeRunner(ScriptAction(first), ScriptAction(second)), host)
+	if _, err := g.Generate(context.Background(), pack); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("duplicate error = %v", err)
+	}
+
+	host.mismatch = true
+	g = newGenerator(t, NewFakeRunner(ScriptAction(mustRetrieve(t, "x", "a", 1))), host)
+	if _, err := g.Generate(context.Background(), pack); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("mismatch error = %v", err)
+	}
+}
+
+func TestRejectsStaleSnapshotAndAuthorization(t *testing.T) {
+	pack, _, additions := fixture(t)
+	host := &fakeTools{pack: pack, results: map[shoal.ID][]inference.EvidenceAnchor{"x": {additions[0]}}, stale: true}
+	g := newGenerator(t, NewFakeRunner(ScriptAction(mustRetrieve(t, "x", "a", 1))), host)
+	if _, err := g.Generate(context.Background(), pack); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("stale result error = %v", err)
+	}
+
+	expired := packWithExpiry(t, fixedTime.Add(-time.Minute))
+	g = newGenerator(t, NewFakeRunner(), &fakeTools{pack: expired})
+	g.now = func() time.Time { return fixedTime }
+	if _, err := g.Generate(context.Background(), expired); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("stale auth error = %v", err)
+	}
+}
+
+func TestRejectsHallucinatedAnchorAndClaimWithoutEvidence(t *testing.T) {
+	pack, _, additions := fixture(t)
+	otherPack := mustPack(t, []inference.EvidenceAnchor{additions[2]}, fixedTime.Add(time.Hour))
+	badResult := resultFor(t, otherPack, additions[2])
+	stop, err := NewStopAction("stop", badResult, Usage{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	g := newGenerator(t, NewFakeRunner(ScriptAction(stop)), &fakeTools{pack: pack})
+	if _, err := g.Generate(context.Background(), pack); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("hallucination error = %v", err)
+	}
+
+	model, prompt := provenanceParts(t)
+	value, _ := ontology.NewStringValue("value")
+	if _, err := inference.NewClaim("subject", "predicate", value, 1, nil, inference.ClaimInferred, model, prompt, nil); err == nil {
+		t.Fatal("claim without evidence accepted")
+	}
+}
+
+func TestMutationIsolation(t *testing.T) {
+	pack, _, additions := fixture(t)
+	host := &fakeTools{pack: pack, results: map[shoal.ID][]inference.EvidenceAnchor{"x": {additions[0]}}}
+	runner := NewFakeRunner(ScriptAction(mustRetrieve(t, "x", "a", 1)), func(_ context.Context, tr Transcript) (Action, error) {
+		copy := tr.Exchanges()
+		copy[0].result.anchors[0] = additions[1]
+		if tr.Exchanges()[0].Result().Anchors()[0].ID() != additions[0].ID() {
+			t.Fatal("transcript mutated")
+		}
+		return NewStopAction("stop", resultFor(t, tr.Context(), additions[0]), Usage{})
+	})
+	record, err := newGenerator(t, runner, host).Run(context.Background(), pack)
+	if err != nil {
+		t.Fatal(err)
+	}
+	anchors := record.Transcript.Exchanges()[0].Result().Anchors()
+	anchors[0] = additions[1]
+	if record.Transcript.Exchanges()[0].Result().Anchors()[0].ID() != additions[0].ID() {
+		t.Fatal("record mutated")
+	}
+}
+
+func TestConcurrentGeneration(t *testing.T) {
+	pack, _, additions := fixture(t)
+	runner := NewFakeRunner(ScriptAction(mustRetrieve(t, "x", "a", 1)), func(_ context.Context, tr Transcript) (Action, error) {
+		return NewStopAction("stop", resultFor(t, tr.Context(), additions[0]), Usage{})
+	})
+	g := newGenerator(t, runner, &fakeTools{pack: pack, results: map[shoal.ID][]inference.EvidenceAnchor{"x": {additions[0]}}})
+	var wg sync.WaitGroup
+	errs := make(chan error, 16)
+	for range 16 {
+		wg.Add(1)
+		go func() { defer wg.Done(); _, err := g.Generate(context.Background(), pack); errs <- err }()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+type fakeTools struct {
+	pack     inference.ContextPack
+	results  map[shoal.ID][]inference.EvidenceAnchor
+	mismatch bool
+	stale    bool
+}
+
+func (f *fakeTools) Retrieve(_ context.Context, _ RetrieveRequest, id shoal.ID) (ToolResult, error) {
+	return f.make(id, ActionRetrieve)
+}
+func (f *fakeTools) OpenSection(_ context.Context, _ OpenSectionRequest, id shoal.ID) (ToolResult, error) {
+	return f.make(id, ActionOpenSection)
+}
+func (f *fakeTools) Neighbors(_ context.Context, _ NeighborsRequest, id shoal.ID) (ToolResult, error) {
+	return f.make(id, ActionNeighbors)
+}
+func (f *fakeTools) make(id shoal.ID, kind ActionKind) (ToolResult, error) {
+	correlation := id
+	if f.mismatch {
+		correlation = "different"
+	}
+	snapshot, auth := f.pack.Snapshot(), f.pack.Authorization()
+	if f.stale {
+		snapshot, _ = inference.NewSnapshotPin("stale", snapshot.AsOf())
+	}
+	return NewToolResult(correlation, kind, f.results[id], snapshot, auth)
+}
+
+func budgets() Budgets {
+	return Budgets{MaxSteps: 8, MaxElapsed: time.Second, MaxInputTokens: 10, MaxOutputTokens: 10, MaxGraphHops: 2, MaxFanout: 5, MaxRepeatedAction: 1}
+}
+func newGenerator(t *testing.T, runner Runner, tools ToolHost) *Generator {
+	return newGeneratorWithBudgets(t, runner, tools, budgets())
+}
+func newGeneratorWithBudgets(t *testing.T, runner Runner, tools ToolHost, b Budgets) *Generator {
+	t.Helper()
+	_, prompt := provenanceParts(t)
+	p, err := NewProvenance("fake-harness", "fake-provider", "fake-model", prompt, "grounded-tools-v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	g, err := NewGenerator(runner, tools, b, p, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	g.now = func() time.Time { return fixedTime }
+	return g
+}
+func fixture(t *testing.T) (inference.ContextPack, inference.EvidenceAnchor, []inference.EvidenceAnchor) {
+	t.Helper()
+	initial := anchor(t, "initial", 0)
+	additions := []inference.EvidenceAnchor{anchor(t, "retrieve", 10), anchor(t, "open", 20), anchor(t, "neighbors", 30)}
+	return mustPack(t, []inference.EvidenceAnchor{initial}, fixedTime.Add(time.Hour)), initial, additions
+}
+func anchor(t *testing.T, quote string, offset int64) inference.EvidenceAnchor {
+	t.Helper()
+	a, err := inference.NewDocumentAnchor(document.Citation{
+		DocumentID: "document", RevisionID: "revision", SectionID: shoal.ID("section-" + quote), SpanID: shoal.ID("span-" + quote),
+		Range: document.SourceRange{Start: document.SourcePosition{Offset: offset}, End: document.SourcePosition{Offset: offset + int64(len(quote))}},
+	}, quote)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return a
+}
+func mustPack(t *testing.T, anchors []inference.EvidenceAnchor, expiry time.Time) inference.ContextPack {
+	t.Helper()
+	snapshot, _ := inference.NewSnapshotPin("snapshot", fixedTime.Add(-time.Hour))
+	auth, _ := inference.NewAuthPin("auth", expiry)
+	pack, err := inference.NewContextPack("answer the question", anchors, nil, snapshot, auth, shoal.Metadata{"safe": "metadata"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return pack
+}
+func packWithExpiry(t *testing.T, expiry time.Time) inference.ContextPack {
+	t.Helper()
+	return mustPack(t, []inference.EvidenceAnchor{anchor(t, "initial", 0)}, expiry)
+}
+func provenanceParts(t *testing.T) (inference.ModelProvenance, inference.PromptProvenance) {
+	t.Helper()
+	model, err := inference.NewModelProvenance("fake-provider", "fake-model", "v1", nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prompt, err := inference.NewPromptProvenance("agent", "v1", "sha256:"+strings.Repeat("a", 64))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return model, prompt
+}
+func resultFor(t *testing.T, pack inference.ContextPack, evidence inference.EvidenceAnchor) inference.InferenceResult {
+	t.Helper()
+	model, prompt := provenanceParts(t)
+	value, _ := ontology.NewStringValue("grounded")
+	claim, err := inference.NewClaim("subject", "predicate", value, 1, []shoal.ID{evidence.ID()}, inference.ClaimInferred, model, prompt, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := inference.NewInferenceResult(pack, []inference.Claim{claim}, nil, fixedTime, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return result
+}
+func mustRetrieve(t *testing.T, id shoal.ID, query string, limit int) Action {
+	return mustRetrieveUsage(t, id, limit, Usage{})
+}
+func mustRetrieveUsage(t *testing.T, id shoal.ID, limit int, usage Usage) Action {
+	t.Helper()
+	req, err := NewRetrieveRequest("query", limit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, err := NewRetrieveAction(id, req, usage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return a
+}
+func mustOpen(t *testing.T, id, documentID, sectionID shoal.ID) Action {
+	t.Helper()
+	req, err := NewOpenSectionRequest(documentID, sectionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, err := NewOpenSectionAction(id, req, Usage{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return a
+}
+func mustNeighbors(t *testing.T, id, nodeID shoal.ID, hops, fanout int) Action {
+	t.Helper()
+	req, err := NewNeighborsRequest(nodeID, hops, fanout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, err := NewNeighborsAction(id, req, Usage{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return a
+}

@@ -51,7 +51,9 @@ operational contracts remain in the linked runbooks and ADRs.
 |---|---|
 | Hierarchical document, graph, retrieval, and ontology contracts | Shipped |
 | Provider-neutral grounded inference context, evidence, claim, result, and provenance contracts | Shipped |
-| Runtime LLM orchestration and model-provider transports | Not implemented |
+| Bounded provider-neutral tool-using agent harness contract and deterministic fake | Shipped |
+| Concrete Copilot/SDK agent execution backend | Not implemented |
+| Other runtime LLM orchestration and model-provider transports | Not implemented |
 
 The inference surface is deliberately a contract boundary. It validates
 document-only, graph-only, and mixed evidence without introducing storage
