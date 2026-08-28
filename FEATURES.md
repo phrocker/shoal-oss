@@ -59,6 +59,7 @@ an explicit endpoint, model names, and request-time credential resolver.
 | Concrete Copilot/SDK agent execution backend | Not implemented |
 | Other runtime LLM orchestration and model-provider transports | Not implemented |
 | Canonical bounded Explorer context construction, citation/path revalidation, and explicit section/neighbor expansion | Shipped |
+| Optional snapshot-pinned Explorer web workspace with cited retrieval and bounded graph/path exploration | Shipped |
 | Ontology-guided structured extraction, validation, stable inferred IDs, and publication planning | Shipped |
 | Atomic publication of extraction plans through Explorer | Not implemented |
 

@@ -41,7 +41,15 @@ type Explorer struct {
 	mu                      sync.RWMutex
 	engine                  *engine.Engine
 	documents               map[shoal.ID]map[shoal.ID]*persistedDocument
-	edges                   map[shoal.ID]graph.Edge
+	edges                   map[shoal.ID]persistedEdge
+	graphNodes              map[shoal.ID]graph.Node
+	graphEdges              map[shoal.ID]graph.Edge
+	outgoing                map[shoal.ID][]shoal.ID
+	incoming                map[shoal.ID][]shoal.ID
+	graphErr                error
+	graphInitialized        bool
+	snapshot                Snapshot
+	snapshotAnchor          time.Time
 	lastPublicationSequence uint64
 	closed                  bool
 }
@@ -55,10 +63,12 @@ type persistedDocument struct {
 	Nodes               []graph.Node
 	Edges               []graph.Edge
 	PublicationSequence uint64 `json:"publication_sequence,omitempty"`
+	PublishedAt         time.Time
 }
 
 type persistedEdge struct {
-	Edge graph.Edge
+	Edge        graph.Edge
+	PublishedAt time.Time
 }
 
 // Open opens or creates a local Explorer corpus rooted at dir.
@@ -86,11 +96,21 @@ func Open(dir string) (*Explorer, error) {
 	explorer := &Explorer{
 		engine:    eng,
 		documents: make(map[shoal.ID]map[shoal.ID]*persistedDocument),
-		edges:     make(map[shoal.ID]graph.Edge),
+		edges:     make(map[shoal.ID]persistedEdge),
 	}
 	if err := explorer.load(); err != nil {
 		_ = eng.Close()
 		return nil, err
+	}
+	if explorer.snapshotAnchor.IsZero() {
+		explorer.snapshotAnchor = time.Now().UTC()
+		if err := explorer.writeRecord(
+			snapshotAnchorRow, embeddedRecordSnapshotAnchor,
+			persistedSnapshotAnchor{CreatedAt: explorer.snapshotAnchor},
+		); err != nil {
+			_ = eng.Close()
+			return nil, err
+		}
 	}
 	return explorer, nil
 }
@@ -160,6 +180,7 @@ func (e *Explorer) ingest(
 		return IngestResult{}, shoal.NewError(
 			shoal.ErrorUnavailable, "embedded publication sequence is exhausted")
 	}
+	record.PublishedAt = time.Now().UTC()
 	// A write error can occur after the WAL append committed, so attempted
 	// publication sequences must never be reused.
 	e.lastPublicationSequence++
@@ -175,6 +196,11 @@ func (e *Explorer) ingest(
 		e.documents[record.Document.ID] = make(map[shoal.ID]*persistedDocument)
 	}
 	e.documents[record.Document.ID][record.Revision.ID] = record
+	if e.graphInitialized {
+		if err := e.rebuildCurrentGraphLocked(); err != nil {
+			return IngestResult{}, err
+		}
+	}
 	return ingestResult(record, IngestApplied), nil
 }
 
@@ -278,28 +304,36 @@ func (e *Explorer) Connect(ctx context.Context, edge graph.Edge) error {
 	if err := e.requireOpen(); err != nil {
 		return err
 	}
-	nodes, allEdges, err := e.currentGraph()
-	if err != nil {
+	if err := e.ensureGraphLocked(); err != nil {
 		return err
 	}
-	if _, ok := nodes[edge.From]; !ok {
+	if _, ok := e.graphNodes[edge.From]; !ok {
 		return shoal.NewError(shoal.ErrorNotFound, "edge source node not found")
 	}
-	if _, ok := nodes[edge.To]; !ok {
+	if _, ok := e.graphNodes[edge.To]; !ok {
 		return shoal.NewError(shoal.ErrorNotFound, "edge target node not found")
 	}
-	if existing, ok := allEdges[edge.ID]; ok {
+	if existing, ok := e.graphEdges[edge.ID]; ok {
 		if edgesEqual(existing, edge) {
 			return nil
 		}
 		return shoal.NewError(shoal.ErrorConflict, "edge ID already has different content")
 	}
-	if err := e.writeRecord(
-		edgeRecordRow(edge.ID), embeddedRecordEdge, persistedEdge{Edge: edge},
-	); err != nil {
+	record := persistedEdge{Edge: cloneEdge(edge), PublishedAt: time.Now().UTC()}
+	if err := e.writeRecord(edgeRecordRow(edge.ID), embeddedRecordEdge, record); err != nil {
 		return err
 	}
-	e.edges[edge.ID] = cloneEdge(edge)
+	e.edges[edge.ID] = record
+	e.graphEdges[edge.ID] = cloneEdge(edge)
+	e.outgoing[edge.From] = append(e.outgoing[edge.From], edge.ID)
+	sort.Slice(e.outgoing[edge.From], func(i, j int) bool {
+		return shoal.CompareID(e.outgoing[edge.From][i], e.outgoing[edge.From][j]) < 0
+	})
+	e.incoming[edge.To] = append(e.incoming[edge.To], edge.ID)
+	sort.Slice(e.incoming[edge.To], func(i, j int) bool {
+		return shoal.CompareID(e.incoming[edge.To][i], e.incoming[edge.To][j]) < 0
+	})
+	e.refreshSnapshotLocked()
 	return nil
 }
 
@@ -320,15 +354,18 @@ func (e *Explorer) Neighborhood(
 		typeFilter[edgeType] = struct{}{}
 	}
 
-	e.mu.RLock()
-	defer e.mu.RUnlock()
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	if err := e.requireOpen(); err != nil {
 		return Neighborhood{}, err
 	}
-	nodes, edges, err := e.currentGraph()
-	if err != nil {
+	if err := e.ensureGraphLocked(); err != nil {
 		return Neighborhood{}, err
 	}
+	if e.graphErr != nil {
+		return Neighborhood{}, e.graphErr
+	}
+	nodes, edges := e.graphNodes, e.graphEdges
 	seen := make(map[shoal.ID]struct{})
 	frontier := make(map[shoal.ID]struct{})
 	for _, id := range request.NodeIDs {
@@ -388,7 +425,7 @@ func (e *Explorer) requireOpen() error {
 	return nil
 }
 
-func (e *Explorer) currentGraph() (
+func (e *Explorer) computeCurrentGraph() (
 	map[shoal.ID]graph.Node,
 	map[shoal.ID]graph.Edge,
 	error,
@@ -410,7 +447,8 @@ func (e *Explorer) currentGraph() (
 			edges[edge.ID] = edge
 		}
 	}
-	for id, edge := range e.edges {
+	for id, record := range e.edges {
+		edge := record.Edge
 		if _, from := nodes[edge.From]; !from {
 			continue
 		}
@@ -420,6 +458,49 @@ func (e *Explorer) currentGraph() (
 		edges[id] = edge
 	}
 	return nodes, edges, nil
+}
+
+func (e *Explorer) ensureGraphLocked() error {
+	if e.graphInitialized {
+		return e.graphErr
+	}
+	return e.rebuildCurrentGraphLocked()
+}
+
+func (e *Explorer) rebuildCurrentGraphLocked() error {
+	nodes, edges, err := e.computeCurrentGraph()
+	if err != nil {
+		e.graphNodes = make(map[shoal.ID]graph.Node)
+		e.graphEdges = make(map[shoal.ID]graph.Edge)
+		e.outgoing = make(map[shoal.ID][]shoal.ID)
+		e.incoming = make(map[shoal.ID][]shoal.ID)
+		e.graphErr = err
+		e.graphInitialized = true
+		e.refreshSnapshotLocked()
+		return err
+	}
+	outgoing := make(map[shoal.ID][]shoal.ID, len(nodes))
+	incoming := make(map[shoal.ID][]shoal.ID, len(nodes))
+	for id, edge := range edges {
+		outgoing[edge.From] = append(outgoing[edge.From], id)
+		incoming[edge.To] = append(incoming[edge.To], id)
+	}
+	for id := range outgoing {
+		sort.Slice(outgoing[id], func(i, j int) bool {
+			return shoal.CompareID(outgoing[id][i], outgoing[id][j]) < 0
+		})
+	}
+	for id := range incoming {
+		sort.Slice(incoming[id], func(i, j int) bool {
+			return shoal.CompareID(incoming[id][i], incoming[id][j]) < 0
+		})
+	}
+	e.graphNodes, e.graphEdges = nodes, edges
+	e.outgoing, e.incoming = outgoing, incoming
+	e.graphErr = nil
+	e.graphInitialized = true
+	e.refreshSnapshotLocked()
+	return nil
 }
 
 func latestRevision(
@@ -628,3 +709,4 @@ func contextError(ctx context.Context) error {
 }
 
 var _ Client = (*Explorer)(nil)
+var _ BoundedClient = (*Explorer)(nil)

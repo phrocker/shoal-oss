@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Shoal Explorer</title>
+  <link rel="stylesheet" href="/assets/style.css">
+</head>
+<body>
+  <header>
+    <div><strong>Shoal Explorer</strong><span id="snapshot">loading snapshot…</span></div>
+    <form id="search"><label class="sr-only" for="query">Retrieval query</label><input id="query" required placeholder="Retrieve cited evidence…" autocomplete="off"><fieldset id="modes"><legend class="sr-only">Retrieval modes</legend><label><input type="checkbox" value="lexical" checked>Lexical</label><label><input type="checkbox" value="tree" checked>Tree</label><label><input type="checkbox" value="graph" checked>Graph</label><label><input type="checkbox" value="vector">Vector</label></fieldset><button>Search</button></form>
+  </header>
+  <main>
+    <aside class="left">
+      <section><h2>Corpus</h2><div id="documents"></div><button id="more" hidden>More documents</button></section>
+      <section><h2>Hierarchy</h2><div id="hierarchy" class="tree muted">Select a document.</div></section>
+    </aside>
+    <section class="center">
+      <div class="tabs" role="tablist" aria-label="Explorer views"><button id="tab-evidence" class="tab active" data-panel="evidence" role="tab" aria-controls="evidence" aria-selected="true">Evidence</button><button id="tab-graph" class="tab" data-panel="graph" role="tab" aria-controls="graph" aria-selected="false" tabindex="-1">Graph</button></div>
+      <div id="evidence" class="panel active" role="tabpanel" aria-labelledby="tab-evidence"><p class="muted">Run a retrieval query to inspect exact evidence and explanations.</p></div>
+      <div id="graph" class="panel" role="tabpanel" aria-labelledby="tab-graph">
+        <div class="graph-tools">
+          <button id="expand" disabled>Expand selected</button>
+          <button id="continue-expansion" hidden>More neighbors</button>
+          <label class="sr-only" for="path-from">Path source node ID</label>
+          <input id="path-from" placeholder="Path from node ID">
+          <label class="sr-only" for="path-to">Path target node ID</label>
+          <input id="path-to" placeholder="Path to node ID">
+          <button id="find-path">Find path</button>
+        </div>
+        <p id="graph-status" class="muted" aria-live="polite">No graph expansion yet.</p>
+        <canvas id="canvas" aria-hidden="true"></canvas>
+        <div id="graph-list">
+          <section aria-labelledby="graph-nodes-heading">
+            <h3 id="graph-nodes-heading">Graph nodes</h3>
+            <div id="graph-nodes"></div>
+          </section>
+          <section aria-labelledby="graph-edges-heading">
+            <h3 id="graph-edges-heading">Graph edges</h3>
+            <ul id="graph-edges"></ul>
+          </section>
+        </div>
+      </div>
+    </section>
+    <aside class="right"><h2>Selection</h2><div id="selection" class="muted">Select evidence, a hierarchy section, or a graph node.</div></aside>
+  </main>
+  <script src="/assets/app.js"></script>
+</body>
+</html>

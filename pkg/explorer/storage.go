@@ -28,6 +28,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/phrocker/shoal-oss/internal/cclient"
@@ -48,14 +49,22 @@ const (
 	documentRow   = "document/"
 	edgeRow       = "edge/"
 
-	embeddedRecordMagic      = "SHOALX2\x00"
-	embeddedEnvelopeVersion  = byte(1)
-	embeddedRecordDocument   = byte(1)
-	embeddedRecordEdge       = byte(2)
-	embeddedEnvelopeHeader   = 8 + 1 + 1 + 8 + sha256.Size
-	maxEmbeddedDocumentBytes = uint64(document.MaxRevisionSourceBytes) * 8
-	maxEmbeddedEdgeBytes     = uint64(2 * 1024 * 1024)
+	embeddedRecordMagic            = "SHOALX2\x00"
+	embeddedEnvelopeVersion        = byte(1)
+	embeddedRecordDocument         = byte(1)
+	embeddedRecordEdge             = byte(2)
+	embeddedRecordSnapshotAnchor   = byte(3)
+	embeddedEnvelopeHeader         = 8 + 1 + 1 + 8 + sha256.Size
+	maxEmbeddedDocumentBytes       = uint64(document.MaxRevisionSourceBytes) * 8
+	maxEmbeddedEdgeBytes           = uint64(2 * 1024 * 1024)
+	maxEmbeddedSnapshotAnchorBytes = uint64(1024)
 )
+
+var snapshotAnchorRow = []byte("meta/snapshot-anchor")
+
+type persistedSnapshotAnchor struct {
+	CreatedAt time.Time
+}
 
 type documentRevisionKey struct {
 	documentID shoal.ID
@@ -103,6 +112,10 @@ func (e *Explorer) load() error {
 			}
 		}
 		switch {
+		case bytes.Equal(key.Row, snapshotAnchorRow):
+			if err := e.loadSnapshotAnchor(qualifier, scanner.Value()); err != nil {
+				return err
+			}
 		case bytes.HasPrefix(key.Row, []byte(documentRow)):
 			if err := e.loadDocumentRecord(
 				key.Row,
@@ -124,6 +137,23 @@ func (e *Explorer) load() error {
 			return shoal.WrapError(shoal.ErrorInternal, "advance explorer scan", err)
 		}
 	}
+	return nil
+}
+
+func (e *Explorer) loadSnapshotAnchor(qualifier, encoded []byte) error {
+	if !bytes.Equal(qualifier, []byte(recordCQV2)) {
+		return nil
+	}
+	var record persistedSnapshotAnchor
+	if err := decodeEmbeddedRecord(
+		encoded, embeddedRecordSnapshotAnchor, &record,
+	); err != nil {
+		return shoal.WrapError(shoal.ErrorInternal, "decode snapshot anchor", err)
+	}
+	if record.CreatedAt.IsZero() {
+		return shoal.NewError(shoal.ErrorInternal, "snapshot anchor time is missing")
+	}
+	e.snapshotAnchor = record.CreatedAt.UTC()
 	return nil
 }
 
@@ -232,7 +262,7 @@ func (e *Explorer) loadEdgeRecord(
 		return nil
 	}
 	formats[record.Edge.ID] = format
-	e.edges[record.Edge.ID] = record.Edge
+	e.edges[record.Edge.ID] = record
 	return nil
 }
 
@@ -323,6 +353,8 @@ func embeddedRecordMaximum(kind byte) (uint64, error) {
 		return maxEmbeddedDocumentBytes, nil
 	case embeddedRecordEdge:
 		return maxEmbeddedEdgeBytes, nil
+	case embeddedRecordSnapshotAnchor:
+		return maxEmbeddedSnapshotAnchorBytes, nil
 	default:
 		return 0, fmt.Errorf("embedded record kind %d is unsupported", kind)
 	}
