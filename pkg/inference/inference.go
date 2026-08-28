@@ -92,6 +92,10 @@ func NewDocumentAnchor(citation document.Citation, quote string) (EvidenceAnchor
 // NewGraphAnchor creates a graph-native anchor without a placeholder
 // document citation.
 func NewGraphAnchor(path graph.Path) (EvidenceAnchor, error) {
+	if len(path.Nodes) > MaxPathNodes || len(path.Edges) > MaxPathEdges {
+		return EvidenceAnchor{}, invalid(
+			"graph evidence path exceeds the public count bound")
+	}
 	anchor := EvidenceAnchor{
 		kind: AnchorGraph,
 		path: canonicalizePath(path),
@@ -301,6 +305,9 @@ func NewContextPack(
 	auth AuthPin,
 	metadata shoal.Metadata,
 ) (ContextPack, error) {
+	if len(evidence) > MaxEvidenceAnchors {
+		return ContextPack{}, invalid("context pack has too many evidence anchors")
+	}
 	normalized := ContextPack{
 		query:    normalizeQuery(query),
 		evidence: cloneAnchors(evidence),
@@ -563,6 +570,9 @@ func NewClaim(
 	prompt PromptProvenance,
 	metadata shoal.Metadata,
 ) (Claim, error) {
+	if len(evidenceIDs) > MaxEvidenceRefsPerOutcome {
+		return Claim{}, invalid("claim has too many evidence references")
+	}
 	claim := Claim{
 		subject:     subject,
 		predicate:   predicate,
@@ -703,6 +713,9 @@ type Issue struct {
 func NewIssue(
 	kind IssueKind, input, reason string, evidenceIDs []shoal.ID,
 ) (Issue, error) {
+	if len(evidenceIDs) > MaxEvidenceRefsPerOutcome {
+		return Issue{}, invalid("inference issue has too many evidence references")
+	}
 	issue := Issue{
 		kind:        kind,
 		input:       input,
@@ -793,6 +806,12 @@ func NewInferenceResult(
 ) (InferenceResult, error) {
 	if err := pack.Validate(); err != nil {
 		return InferenceResult{}, err
+	}
+	if len(claims) > MaxClaims {
+		return InferenceResult{}, invalid("inference result has too many claims")
+	}
+	if len(issues) > MaxIssues {
+		return InferenceResult{}, invalid("inference result has too many issues")
 	}
 	result := InferenceResult{
 		contextPackID: pack.ID(),

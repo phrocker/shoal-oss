@@ -455,6 +455,94 @@ func TestGeneratorContractWithFake(t *testing.T) {
 	}
 }
 
+func TestStableIDGoldenVectors(t *testing.T) {
+	documentAnchor := mustDocumentAnchor(t, "alpha")
+	graphAnchor := mustGraphAnchor(t)
+	snapshot, auth := mustPins(t)
+	pack, err := NewContextPack(
+		"golden query",
+		[]EvidenceAnchor{graphAnchor, documentAnchor},
+		nil,
+		snapshot,
+		auth,
+		shoal.Metadata{"tenant": "golden"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	model, prompt := mustProvenance(t)
+	value, err := ontology.NewStringValue("golden value")
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err := NewClaim(
+		"golden-subject",
+		"golden-predicate",
+		value,
+		0.875,
+		[]shoal.ID{graphAnchor.ID(), documentAnchor.ID()},
+		ClaimInferred,
+		model,
+		prompt,
+		shoal.Metadata{"source": "golden"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unresolved, err := NewIssue(
+		IssueUnresolved,
+		"golden unresolved",
+		"insufficient evidence",
+		[]shoal.ID{documentAnchor.ID()},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unsupported, err := NewIssue(
+		IssueUnsupported,
+		"golden unsupported",
+		"unsupported operation",
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := NewInferenceResult(
+		pack,
+		[]Claim{claim},
+		[]Issue{unsupported, unresolved},
+		testTime.Add(time.Minute),
+		shoal.Metadata{"request": "golden"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	actual := map[string]shoal.ID{
+		"document anchor": documentAnchor.ID(),
+		"graph anchor":    graphAnchor.ID(),
+		"context pack":    pack.ID(),
+		"claim":           claim.ID(),
+		"unresolved":      unresolved.ID(),
+		"unsupported":     unsupported.ID(),
+		"result":          result.ID(),
+	}
+	expected := map[string]shoal.ID{
+		"document anchor": "evidence-anchor:c6399bc8a9e324ee23192615e98a68821f137d3665a5439f58d2d1c8e4e55678",
+		"graph anchor":    "evidence-anchor:75f03143bbb81fe5dacd7d829adf446113422f972c91c587a05f7d2b1e7a4616",
+		"context pack":    "context-pack:1cb209ea14257fa30268f8ba7a2ebf7dac373f7a148bae62ce151cfe05bd6776",
+		"claim":           "claim:cd447ab969ed650e6a80e5a1e821112496a8ae303301f1710b5e6c4bf248d59a",
+		"unresolved":      "inference-issue:76ff4d15a9f207d3a572d5c551f87bb2c0ddd6c3bcc4f1c66da391efb7e9fb1f",
+		"unsupported":     "inference-issue:051599545ba0e3112e95a925f11fe4f9e88f52f0dd7c0fbc098b4a8b748cf33e",
+		"result":          "inference-result:f62c64ef24d290e26ac21d2077bf4e6ce93edc4b63d93057a92882e7bc46d969",
+	}
+	for name, want := range expected {
+		if got := actual[name]; got != want {
+			t.Errorf("%s ID = %q, want %q", name, got, want)
+		}
+	}
+}
+
 func FuzzDocumentAnchorRejectsCorruptQuotes(f *testing.F) {
 	f.Add("alpha")
 	f.Add(string([]byte{0xff}))
