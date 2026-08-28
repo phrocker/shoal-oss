@@ -515,11 +515,9 @@ func NewGenerator(runner Runner, tools ToolHost, budgets Budgets, provenance Pro
 	return &Generator{runner: runner, tools: tools, budgets: budgets, provenance: provenance, recorder: recorder, now: time.Now}, nil
 }
 
-// Generate returns the final result together with the exact expanded context
-// against which it validates. Tool additions make returning only an
-// inference.InferenceResult through the base inference.Generator lossy.
-func (g *Generator) Generate(ctx context.Context, pack inference.ContextPack) (Record, error) {
-	return g.Run(ctx, pack)
+func (g *Generator) Generate(ctx context.Context, pack inference.ContextPack) (inference.InferenceResult, error) {
+	record, err := g.Run(ctx, pack)
+	return record.Result, err
 }
 
 func (g *Generator) Run(ctx context.Context, pack inference.ContextPack) (Record, error) {
@@ -587,11 +585,11 @@ func (g *Generator) Run(ctx context.Context, pack inference.ContextPack) (Record
 			return Record{}, budget("repeated action/cycle")
 		}
 		if action.kind == ActionStop {
-			result := cloneResult(action.result)
-			if err := result.ValidateFor(transcript.context); err != nil {
+			runnerResult := cloneResult(action.result)
+			if err := runnerResult.ValidateFor(transcript.context); err != nil {
 				return Record{}, fmt.Errorf("%w: final result: %v", ErrInvalid, err)
 			}
-			if err := validateResultProvenance(result, g.provenance); err != nil {
+			if err := validateResultProvenance(runnerResult, g.provenance); err != nil {
 				return Record{}, err
 			}
 			if transcript.context.Snapshot() != pack.Snapshot() || transcript.context.Authorization() != pack.Authorization() {
@@ -600,11 +598,21 @@ func (g *Generator) Run(ctx context.Context, pack inference.ContextPack) (Record
 			final := action
 			transcript.final = &final
 			transcript.id = transcriptID(transcript)
+			additions := verifiedAdditions(pack, transcript.context)
+			issues := append(runnerResult.Unresolved(), runnerResult.Unsupported()...)
+			result, err := inference.NewExtendedInferenceResult(
+				pack, additions, runnerResult.Claims(), issues,
+				runnerResult.GeneratedAt(), runnerResult.Metadata(),
+			)
+			if err != nil {
+				return Record{}, err
+			}
 			record := Record{Request: request, Transcript: cloneTranscript(transcript), Result: result}
 			if g.recorder != nil {
 				if err := g.recorder.Record(runCtx, evaluationRecord(record)); err != nil {
 					return Record{}, err
 				}
+
 			}
 			if err := runCtx.Err(); err != nil {
 				return Record{}, err
@@ -686,6 +694,20 @@ func (g *Generator) Run(ctx context.Context, pack inference.ContextPack) (Record
 		transcript.id = transcriptID(transcript)
 	}
 	return Record{}, budget("step")
+}
+
+func verifiedAdditions(original, expanded inference.ContextPack) []inference.EvidenceAnchor {
+	seen := make(map[shoal.ID]struct{}, len(original.Evidence()))
+	for _, anchor := range original.Evidence() {
+		seen[anchor.ID()] = struct{}{}
+	}
+	var additions []inference.EvidenceAnchor
+	for _, anchor := range expanded.Evidence() {
+		if _, exists := seen[anchor.ID()]; !exists {
+			additions = append(additions, anchor)
+		}
+	}
+	return additions
 }
 
 func evaluationRecord(record Record) EvaluationRecord {
@@ -862,6 +884,8 @@ func cloneTranscript(t Transcript) Transcript {
 	for i := range t.exchanges {
 		t.exchanges[i].result = cloneToolResult(t.exchanges[i].result)
 	}
+
+	var _ inference.Generator = (*Generator)(nil)
 	if t.final != nil {
 		final := *t.final
 		t.final = &final

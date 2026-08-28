@@ -61,8 +61,11 @@ func TestSuccessfulTraceAndCanonicalTranscript(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := record.Result.ValidateFor(record.Transcript.Context()); err != nil {
+	if err := record.Result.ValidateFor(pack); err != nil {
 		t.Fatal(err)
+	}
+	if len(record.Result.EvidenceAdditions()) != 3 {
+		t.Fatal("final result did not retain verified additions")
 	}
 	if len(record.Transcript.Exchanges()) != 3 {
 		t.Fatal("wrong transcript length")
@@ -93,7 +96,7 @@ func TestOverlappingToolEvidencePreservesSetSemantics(t *testing.T) {
 	runner := NewFakeRunner(ScriptAction(mustRetrieve(t, "same", "overlap", 1)), func(_ context.Context, tr Transcript) (Action, error) {
 		return NewStopAction("stop", resultFor(t, tr.Context(), initial), Usage{})
 	})
-	record, err := newGenerator(t, runner, host).Generate(context.Background(), pack)
+	record, err := newGenerator(t, runner, host).Run(context.Background(), pack)
 	if err != nil {
 		t.Fatal(err)
 	}

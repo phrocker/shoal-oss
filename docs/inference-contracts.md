@@ -49,11 +49,11 @@ provenance plus redacted action identities and digests; they exclude prompts,
 credentials, raw authorization grants, URLs, storage coordinates, shell, and
 filesystem access.
 
-Harness `Generate` returns a `Record` containing both the final
-`InferenceResult` and the exact expanded `ContextPack` in its transcript.
-Because iterative tools can add evidence, returning the result alone through
-the base `inference.Generator` would lose the context required by
-`InferenceResult.ValidateFor`.
+The harness implements `inference.Generator`. Its returned result remains
+bound to the supplied context pack and carries canonically verified evidence
+additions, so `InferenceResult.ValidateFor` succeeds for the caller's original
+pack. `Run` additionally returns a `Record` with the exact expanded context and
+redacted evaluation transcript.
 
 No Copilot, SDK-process, or other hosted execution backend is bundled yet. A
 future backend can implement `Runner` without changing inference contracts;

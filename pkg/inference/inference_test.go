@@ -203,6 +203,7 @@ func TestClaimAndResultCanonicalityAndValidation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	model, prompt := mustProvenance(t)
 	object, err := ontology.NewStringValue("value")
 	if err != nil {
@@ -297,6 +298,44 @@ func TestClaimAndResultCanonicalityAndValidation(t *testing.T) {
 	}
 	_, err = NewInferenceResult(pack, []Claim{outsideClaim}, nil, testTime, nil)
 	assertInvalid(t, err)
+}
+
+func TestExtendedInferenceResultRetainsVerifiedEvidence(t *testing.T) {
+	baseAnchor := mustDocumentAnchor(t, "base")
+	addition := mustDocumentAnchorAt(t, "added", 10)
+	snapshot, auth := mustPins(t)
+	pack, err := NewContextPack("query", []EvidenceAnchor{baseAnchor}, nil, snapshot, auth, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	model, prompt := mustProvenance(t)
+	value, _ := ontology.NewStringValue("value")
+	claim, err := NewClaim(
+		"subject", "predicate", value, 1, []shoal.ID{addition.ID()},
+		ClaimInferred, model, prompt, nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := NewExtendedInferenceResult(
+		pack, []EvidenceAnchor{addition}, []Claim{claim}, nil, testTime, nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := result.ValidateFor(pack); err != nil {
+		t.Fatal(err)
+	}
+	got := result.EvidenceAdditions()
+	got[0] = baseAnchor
+	if result.EvidenceAdditions()[0].ID() != addition.ID() {
+		t.Fatal("evidence additions were not defensively copied")
+	}
+	if _, err := NewExtendedInferenceResult(
+		pack, []EvidenceAnchor{baseAnchor}, []Claim{claim}, nil, testTime, nil,
+	); err == nil {
+		t.Fatal("overlapping evidence addition accepted")
+	}
 }
 
 func TestMutationLeaksArePrevented(t *testing.T) {
