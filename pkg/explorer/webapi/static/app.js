@@ -135,7 +135,7 @@ function renderEvidence(response) {
     const element = document.createElement("article");
     element.className = "result";
     const evidence = (result.evidence || []).map((item, index) =>
-      `<blockquote data-evidence="${index}">${escapeHTML(item.quote)}</blockquote>` +
+      `<button class="evidence-quote" data-evidence="${index}">${escapeHTML(item.quote)}</button>` +
       `<div class="citation">${escapeHTML(item.citation.document_id)} / ` +
       `${escapeHTML(item.citation.revision_id)} / bytes ` +
       `${item.citation.range.start.offset}–${item.citation.range.end.offset}</div>`,
@@ -146,7 +146,7 @@ function renderEvidence(response) {
       : "";
     element.innerHTML = `<b>${escapeHTML(result.id)}</b> ` +
       `<span class=score>${Number(result.score).toFixed(3)}</span>${evidence}${explanation}`;
-    element.querySelectorAll("blockquote").forEach((quote, index) => {
+    element.querySelectorAll(".evidence-quote").forEach((quote, index) => {
       quote.onclick = () => selectEvidence(result, result.evidence[index]);
     });
     $("evidence").append(element);
@@ -183,6 +183,9 @@ async function expandIDs(ids) {
     });
     pin(response.snapshot);
     mergeGraph(response.neighborhood);
+    $("graph-status").textContent = response.truncated
+      ? `Bounded result truncated at snapshot frontier ${response.snapshot.frontier}.`
+      : `Complete requested expansion at snapshot frontier ${response.snapshot.frontier}.`;
     activate("graph");
     draw();
   } catch (error) {
@@ -203,6 +206,8 @@ $("find-path").onclick = async () => {
     });
     pin(response.snapshot);
     mergeGraph(response.path);
+    $("graph-status").textContent =
+      `Directed path at snapshot frontier ${response.snapshot.frontier}.`;
     draw();
   } catch (error) {
     showError($("selection"), error);

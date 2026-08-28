@@ -22,6 +22,7 @@ import (
 	"embed"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
 	"mime"
@@ -114,7 +115,7 @@ func decodeRequest(writer http.ResponseWriter, request *http.Request, value any)
 	decoder := json.NewDecoder(request.Body)
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(value); err != nil {
-		return errors.New("request body must be one valid JSON object")
+		return fmt.Errorf("decode request body: %w", err)
 	}
 	var extra any
 	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {

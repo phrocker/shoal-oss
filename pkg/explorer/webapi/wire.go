@@ -23,6 +23,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strconv"
 	"time"
 
 	"github.com/phrocker/shoal-oss/pkg/document"
@@ -119,6 +120,37 @@ type wireMetadataEntry struct {
 }
 
 type wireMetadata []wireMetadataEntry
+
+// MarshalJSON keeps the uint64 frontier exact in JavaScript clients.
+func (s Snapshot) MarshalJSON() ([]byte, error) {
+	return json.Marshal(struct {
+		ID       string    `json:"id"`
+		AsOf     time.Time `json:"as_of"`
+		Frontier string    `json:"frontier"`
+	}{s.ID, s.AsOf, strconv.FormatUint(s.Frontier, 10)})
+}
+
+// UnmarshalJSON parses the decimal frontier string without float conversion.
+func (s *Snapshot) UnmarshalJSON(data []byte) error {
+	var wire struct {
+		ID       string    `json:"id"`
+		AsOf     time.Time `json:"as_of"`
+		Frontier string    `json:"frontier"`
+	}
+	if err := strictUnmarshal(data, &wire); err != nil {
+		return err
+	}
+	var frontier uint64
+	var err error
+	if wire.Frontier != "" {
+		frontier, err = strconv.ParseUint(wire.Frontier, 10, 64)
+		if err != nil {
+			return fmt.Errorf("frontier must be a decimal uint64 string")
+		}
+	}
+	*s = Snapshot{ID: wire.ID, AsOf: wire.AsOf, Frontier: frontier}
+	return nil
+}
 
 func (r DocumentsResponse) MarshalJSON() ([]byte, error) {
 	documents := make([]any, 0, len(r.Documents))

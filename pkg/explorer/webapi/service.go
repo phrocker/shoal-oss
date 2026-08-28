@@ -61,19 +61,19 @@ func (s *EmbeddedService) Documents(
 	if err != nil {
 		return DocumentsResponse{}, err
 	}
-	documents, err := s.client.Documents(ctx)
-	if err != nil {
-		return DocumentsResponse{}, err
-	}
-	if err := s.confirmSnapshot(ctx, snapshot); err != nil {
-		return DocumentsResponse{}, err
-	}
 	limit, err := normalizeLimit(request.Page.Limit)
 	if err != nil {
 		return DocumentsResponse{}, err
 	}
 	offset, err := decodeCursor(request.Page.Cursor, snapshot.ID)
 	if err != nil {
+		return DocumentsResponse{}, err
+	}
+	documents, err := s.client.Documents(ctx)
+	if err != nil {
+		return DocumentsResponse{}, err
+	}
+	if err := s.confirmSnapshot(ctx, snapshot); err != nil {
 		return DocumentsResponse{}, err
 	}
 	if offset > len(documents) {

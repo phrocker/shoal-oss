@@ -75,6 +75,31 @@ func TestSnapshotHashIncludesCollectionBoundaries(t *testing.T) {
 	}
 }
 
+func TestGraphIndexIsLazyForIngestOnlyClients(t *testing.T) {
+	corpus, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer corpus.Close()
+	for _, content := range []string{"first", "second", "third"} {
+		if _, err := corpus.Ingest(context.Background(), Source{
+			URI:       "file:///" + content + ".txt",
+			MediaType: MediaTypeText, Content: content,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if corpus.graphInitialized {
+			t.Fatal("ingest eagerly initialized the optional graph index")
+		}
+	}
+	if _, err := corpus.Snapshot(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !corpus.graphInitialized {
+		t.Fatal("snapshot did not initialize the graph index")
+	}
+}
+
 func TestBoundedNeighborhoodCountsSelfEdgeOnce(t *testing.T) {
 	corpus, err := Open(t.TempDir())
 	if err != nil {

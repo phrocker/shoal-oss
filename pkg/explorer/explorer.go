@@ -46,6 +46,7 @@ type Explorer struct {
 	graphEdges              map[shoal.ID]graph.Edge
 	adjacency               map[shoal.ID][]shoal.ID
 	graphErr                error
+	graphInitialized        bool
 	snapshot                Snapshot
 	snapshotAnchor          time.Time
 	lastPublicationSequence uint64
@@ -109,10 +110,6 @@ func Open(dir string) (*Explorer, error) {
 			_ = eng.Close()
 			return nil, err
 		}
-	}
-	if err := explorer.rebuildCurrentGraph(); err != nil {
-		_ = eng.Close()
-		return nil, err
 	}
 	return explorer, nil
 }
@@ -198,8 +195,10 @@ func (e *Explorer) ingest(
 		e.documents[record.Document.ID] = make(map[shoal.ID]*persistedDocument)
 	}
 	e.documents[record.Document.ID][record.Revision.ID] = record
-	if err := e.rebuildCurrentGraphLocked(); err != nil {
-		return IngestResult{}, err
+	if e.graphInitialized {
+		if err := e.rebuildCurrentGraphLocked(); err != nil {
+			return IngestResult{}, err
+		}
 	}
 	return ingestResult(record, IngestApplied), nil
 }
@@ -304,6 +303,9 @@ func (e *Explorer) Connect(ctx context.Context, edge graph.Edge) error {
 	if err := e.requireOpen(); err != nil {
 		return err
 	}
+	if err := e.ensureGraphLocked(); err != nil {
+		return err
+	}
 	if _, ok := e.graphNodes[edge.From]; !ok {
 		return shoal.NewError(shoal.ErrorNotFound, "edge source node not found")
 	}
@@ -353,9 +355,12 @@ func (e *Explorer) Neighborhood(
 		typeFilter[edgeType] = struct{}{}
 	}
 
-	e.mu.RLock()
-	defer e.mu.RUnlock()
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	if err := e.requireOpen(); err != nil {
+		return Neighborhood{}, err
+	}
+	if err := e.ensureGraphLocked(); err != nil {
 		return Neighborhood{}, err
 	}
 	if e.graphErr != nil {
@@ -456,9 +461,10 @@ func (e *Explorer) computeCurrentGraph() (
 	return nodes, edges, nil
 }
 
-func (e *Explorer) rebuildCurrentGraph() error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
+func (e *Explorer) ensureGraphLocked() error {
+	if e.graphInitialized {
+		return e.graphErr
+	}
 	return e.rebuildCurrentGraphLocked()
 }
 
@@ -469,6 +475,7 @@ func (e *Explorer) rebuildCurrentGraphLocked() error {
 		e.graphEdges = make(map[shoal.ID]graph.Edge)
 		e.adjacency = make(map[shoal.ID][]shoal.ID)
 		e.graphErr = err
+		e.graphInitialized = true
 		e.refreshSnapshotLocked()
 		return nil
 	}
@@ -486,6 +493,7 @@ func (e *Explorer) rebuildCurrentGraphLocked() error {
 	}
 	e.graphNodes, e.graphEdges, e.adjacency = nodes, edges, adjacency
 	e.graphErr = nil
+	e.graphInitialized = true
 	e.refreshSnapshotLocked()
 	return nil
 }

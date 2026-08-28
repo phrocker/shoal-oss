@@ -34,9 +34,12 @@ func (e *Explorer) Snapshot(ctx context.Context) (Snapshot, error) {
 	if err := contextError(ctx); err != nil {
 		return Snapshot{}, err
 	}
-	e.mu.RLock()
-	defer e.mu.RUnlock()
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	if err := e.requireOpen(); err != nil {
+		return Snapshot{}, err
+	}
+	if err := e.ensureGraphLocked(); err != nil {
 		return Snapshot{}, err
 	}
 	return e.snapshot, nil
@@ -78,13 +81,13 @@ func (e *Explorer) BoundedNeighborhood(
 		typeFilter[edgeType] = struct{}{}
 	}
 
-	e.mu.RLock()
-	defer e.mu.RUnlock()
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	if err := e.requireOpen(); err != nil {
 		return BoundedNeighborhood{}, err
 	}
-	if e.graphErr != nil {
-		return BoundedNeighborhood{}, e.graphErr
+	if err := e.ensureGraphLocked(); err != nil {
+		return BoundedNeighborhood{}, err
 	}
 	nodes := make(map[shoal.ID]graph.Node)
 	seen := make(map[shoal.ID]struct{})

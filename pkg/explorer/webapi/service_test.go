@@ -21,6 +21,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -205,6 +206,27 @@ func TestHTTPIDsAreBinarySafeAndReversible(t *testing.T) {
 	}
 	if len(request.NodeIDs) != 1 || request.NodeIDs[0] != rawID {
 		t.Fatalf("ID round trip = %q", request.NodeIDs)
+	}
+}
+
+func TestSnapshotFrontierJSONRoundTrip(t *testing.T) {
+	snapshot := webapi.Snapshot{
+		ID: "snapshot", AsOf: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
+		Frontier: math.MaxUint64,
+	}
+	encoded, err := json.Marshal(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(encoded, []byte(`"frontier":"18446744073709551615"`)) {
+		t.Fatalf("frontier is not an exact string: %s", encoded)
+	}
+	var decoded webapi.Snapshot
+	if err := json.Unmarshal(encoded, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded != snapshot {
+		t.Fatalf("snapshot round trip = %+v", decoded)
 	}
 }
 
