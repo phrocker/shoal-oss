@@ -620,11 +620,15 @@ func (v *verifier) addNeighborhood(neighborhood explorer.Neighborhood) error {
 	if len(neighborhood.Edges) > v.limits.MaxGraphEdges {
 		return invalid("hydrated graph exceeds the edge bound")
 	}
+	payloadBytes, err := neighborhoodPayloadBytes(neighborhood)
+	if err != nil {
+		return err
+	}
+	if payloadBytes > v.limits.MaxHydrationBytes {
+		return invalid("hydrated graph exceeds the byte bound")
+	}
 	localNodes := make(map[shoal.ID]graph.Node, len(neighborhood.Nodes))
 	for _, node := range neighborhood.Nodes {
-		if err := node.Validate(); err != nil {
-			return err
-		}
 		node = canonicalNode(node)
 		if existing, ok := localNodes[node.ID]; ok {
 			if !canonicalEqual(existing, node) {
@@ -636,9 +640,6 @@ func (v *verifier) addNeighborhood(neighborhood explorer.Neighborhood) error {
 	}
 	localEdges := make(map[shoal.ID]graph.Edge, len(neighborhood.Edges))
 	for _, edge := range neighborhood.Edges {
-		if err := edge.Validate(); err != nil {
-			return err
-		}
 		edge = cloneEdge(edge)
 		if _, ok := localNodes[edge.From]; !ok {
 			return invalid("hydrated graph edge source is missing")
@@ -654,6 +655,8 @@ func (v *verifier) addNeighborhood(neighborhood explorer.Neighborhood) error {
 		}
 		localEdges[edge.ID] = edge
 	}
+	additionalBytes := 0
+	additionalNodes := 0
 	for id, node := range localNodes {
 		if existing, ok := v.nodes[id]; ok {
 			if !canonicalEqual(existing, node) {
@@ -661,11 +664,18 @@ func (v *verifier) addNeighborhood(neighborhood explorer.Neighborhood) error {
 			}
 			continue
 		}
-		if len(v.nodes)+1 > v.limits.MaxGraphNodes {
+		additionalNodes++
+		if len(v.nodes)+additionalNodes > v.limits.MaxGraphNodes {
 			return invalid("hydrated graph exceeds the node bound")
 		}
-		v.nodes[id] = cloneNode(node)
+		var ok bool
+		additionalBytes, ok = addBounded(
+			additionalBytes, nodePayloadBytes(node), v.limits.MaxHydrationBytes-v.bytes)
+		if !ok {
+			return invalid("hydrated graph exceeds the byte bound")
+		}
 	}
+	additionalEdges := 0
 	for id, edge := range localEdges {
 		if existing, ok := v.edges[id]; ok {
 			if !canonicalEqual(existing, edge) {
@@ -673,11 +683,28 @@ func (v *verifier) addNeighborhood(neighborhood explorer.Neighborhood) error {
 			}
 			continue
 		}
-		if len(v.edges)+1 > v.limits.MaxGraphEdges {
+		additionalEdges++
+		if len(v.edges)+additionalEdges > v.limits.MaxGraphEdges {
 			return invalid("hydrated graph exceeds the edge bound")
 		}
-		v.edges[id] = cloneEdge(edge)
+		var ok bool
+		additionalBytes, ok = addBounded(
+			additionalBytes, edgePayloadBytes(edge), v.limits.MaxHydrationBytes-v.bytes)
+		if !ok {
+			return invalid("hydrated graph exceeds the byte bound")
+		}
 	}
+	for id, node := range localNodes {
+		if _, exists := v.nodes[id]; !exists {
+			v.nodes[id] = cloneNode(node)
+		}
+	}
+	for id, edge := range localEdges {
+		if _, exists := v.edges[id]; !exists {
+			v.edges[id] = cloneEdge(edge)
+		}
+	}
+	v.bytes += additionalBytes
 	return nil
 }
 
@@ -939,6 +966,7 @@ func preflightResponse(
 	quoteBytes := 0
 	graphNodes := 0
 	graphEdges := 0
+	graphBytes := 0
 	explanationBytes := 0
 	for _, result := range response.Results {
 		for _, evidence := range result.Evidence {
@@ -954,6 +982,9 @@ func preflightResponse(
 				selectedAnchors++
 			}
 			if pathPresent(evidence.Path) {
+				if err := evidence.Path.Validate(); err != nil {
+					return err
+				}
 				if len(evidence.Path.Nodes) > limits.MaxPathNodes {
 					return invalid("retrieval graph path exceeds the path bound")
 				}
@@ -964,6 +995,12 @@ func preflightResponse(
 				}
 				if graphEdges > limits.MaxGraphEdges {
 					return invalid("retrieval evidence exceeds the graph edge bound")
+				}
+				var ok bool
+				graphBytes, ok = addBounded(
+					graphBytes, pathPayloadBytes(evidence.Path), limits.MaxHydrationBytes)
+				if !ok {
+					return invalid("retrieval graph evidence exceeds the hydration byte bound")
 				}
 				if selection.Paths {
 					selectedAnchors++
@@ -1460,16 +1497,57 @@ func metadataBytes(metadata shoal.Metadata) int {
 func pathPayloadBytes(path graph.Path) int {
 	total := 0
 	for _, node := range path.Nodes {
-		total += len(node.ID) + len(node.Kind) + metadataBytes(node.Properties)
-		for _, label := range node.Labels {
-			total += len(label)
-		}
+		total += nodePayloadBytes(node)
 	}
 	for _, edge := range path.Edges {
-		total += len(edge.ID) + len(edge.From) + len(edge.To) + len(edge.Type) + 8
-		total += metadataBytes(edge.Properties)
+		total += edgePayloadBytes(edge)
 	}
 	return total
+}
+
+func neighborhoodPayloadBytes(neighborhood explorer.Neighborhood) (int, error) {
+	total := 0
+	for _, node := range neighborhood.Nodes {
+		if err := node.Validate(); err != nil {
+			return 0, err
+		}
+		var ok bool
+		total, ok = addBounded(total, nodePayloadBytes(node), int(^uint(0)>>1))
+		if !ok {
+			return 0, invalid("hydrated graph byte size overflows")
+		}
+	}
+	for _, edge := range neighborhood.Edges {
+		if err := edge.Validate(); err != nil {
+			return 0, err
+		}
+		var ok bool
+		total, ok = addBounded(total, edgePayloadBytes(edge), int(^uint(0)>>1))
+		if !ok {
+			return 0, invalid("hydrated graph byte size overflows")
+		}
+	}
+	return total, nil
+}
+
+func nodePayloadBytes(node graph.Node) int {
+	total := len(node.ID) + len(node.Kind) + metadataBytes(node.Properties)
+	for _, label := range node.Labels {
+		total += len(label)
+	}
+	return total
+}
+
+func edgePayloadBytes(edge graph.Edge) int {
+	return len(edge.ID) + len(edge.From) + len(edge.To) + len(edge.Type) + 8 +
+		metadataBytes(edge.Properties)
+}
+
+func addBounded(total, addition, limit int) (int, bool) {
+	if addition < 0 || total < 0 || total > limit || addition > limit-total {
+		return total, false
+	}
+	return total + addition, true
 }
 
 func canonicalPartsLength(partLengths ...int) int {

@@ -489,6 +489,48 @@ func TestBoundsFailClosed(t *testing.T) {
 	if reader.documentCalls != 0 || reader.neighborhoodCalls != 0 {
 		t.Fatal("oversized evidence reached the hydration seam")
 	}
+
+	graphBytes := 0
+	for _, result := range response.Results {
+		for _, evidence := range result.Evidence {
+			if pathPresent(evidence.Path) {
+				graphBytes += pathPayloadBytes(evidence.Path)
+			}
+		}
+	}
+	reader = &recordingReader{}
+	_, err = (Builder{
+		Reader: reader, Limits: Limits{MaxHydrationBytes: graphBytes - 1},
+	}).Build(context.Background(), InitialRequest{
+		Request: request, Response: response, Pins: pins,
+	})
+	assertCode(t, err, shoal.ErrorInvalidArgument)
+	if reader.documentCalls != 0 || reader.neighborhoodCalls != 0 {
+		t.Fatal("oversized graph evidence reached the hydration seam")
+	}
+
+	neighborhood := explorer.Neighborhood{
+		Nodes: []graph.Node{{
+			ID: "node", Properties: shoal.Metadata{"payload": strings.Repeat("x", 32)},
+		}},
+	}
+	neighborhoodBytes, err := neighborhoodPayloadBytes(neighborhood)
+	if err != nil {
+		t.Fatal(err)
+	}
+	limits := mustLimits(t, Limits{MaxHydrationBytes: neighborhoodBytes - 1})
+	if _, err := newVerifier(
+		context.Background(), nil, limits, nil, []explorer.Neighborhood{neighborhood},
+	); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
+		t.Fatalf("oversized hydrated graph error = %v", err)
+	}
+	limits = mustLimits(t, Limits{MaxHydrationBytes: neighborhoodBytes})
+	if _, err := newVerifier(
+		context.Background(), nil, limits, nil,
+		[]explorer.Neighborhood{neighborhood, neighborhood},
+	); err != nil {
+		t.Fatalf("exact duplicate graph hydration consumed bytes twice: %v", err)
+	}
 }
 
 func TestMutationIsolationAndNoUncitedExplanationText(t *testing.T) {
