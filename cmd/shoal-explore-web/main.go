@@ -57,13 +57,14 @@ func run(args []string) error {
 	if err != nil {
 		return err
 	}
-	handler, err := webapi.NewHandler(service)
-	if err != nil {
-		return err
-	}
 	listener, err := net.Listen("tcp", *listen)
 	if err != nil {
 		return fmt.Errorf("listen on %s: %w", *listen, err)
+	}
+	handler, err := webapi.NewHandler(service, listener.Addr().String())
+	if err != nil {
+		listener.Close()
+		return err
 	}
 	server := &http.Server{
 		Handler:           handler,

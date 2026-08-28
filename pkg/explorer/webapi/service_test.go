@@ -306,11 +306,14 @@ func TestEvidenceSerializationPreservesCitationAndExplanation(t *testing.T) {
 func TestHTTPHandlerValidationAndWorkspace(t *testing.T) {
 	service, corpus, _, _ := testService(t)
 	defer corpus.Close()
-	handler, err := webapi.NewHandler(service)
+	server := httptest.NewUnstartedServer(nil)
+	handler, err := webapi.NewHandler(service, server.Listener.Addr().String())
 	if err != nil {
+		server.Close()
 		t.Fatal(err)
 	}
-	server := httptest.NewServer(handler)
+	server.Config.Handler = handler
+	server.Start()
 	defer server.Close()
 
 	response, err := http.Get(server.URL + "/")
@@ -360,6 +363,20 @@ func TestHTTPHandlerValidationAndWorkspace(t *testing.T) {
 	}
 	if response.Header.Get("Content-Security-Policy") == "" {
 		t.Fatal("missing content security policy")
+	}
+
+	request, err := http.NewRequest(http.MethodGet, server.URL+"/api/v1/meta", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Host = "attacker.example"
+	response, err = http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusMisdirectedRequest {
+		t.Fatalf("forged host status = %s", response.Status)
 	}
 }
 

@@ -26,7 +26,9 @@ import (
 	"io"
 	"io/fs"
 	"mime"
+	"net"
 	"net/http"
+	"strings"
 
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
@@ -38,16 +40,25 @@ var staticFiles embed.FS
 
 // Handler exposes only the logical Explorer API and static workspace assets.
 type Handler struct {
-	service Service
-	mux     *http.ServeMux
+	service          Service
+	mux              *http.ServeMux
+	allowedAuthority string
 }
 
 // NewHandler constructs the standard HTTP transport.
-func NewHandler(service Service) (*Handler, error) {
+func NewHandler(service Service, allowedAuthority string) (*Handler, error) {
 	if service == nil {
 		return nil, shoal.NewError(shoal.ErrorInvalidArgument, "workspace service is required")
 	}
-	handler := &Handler{service: service, mux: http.NewServeMux()}
+	host, port, err := net.SplitHostPort(allowedAuthority)
+	if err != nil || host == "" || port == "" {
+		return nil, shoal.NewError(
+			shoal.ErrorInvalidArgument, "workspace authority must be a host and port")
+	}
+	handler := &Handler{
+		service: service, mux: http.NewServeMux(),
+		allowedAuthority: allowedAuthority,
+	}
 	handler.routes()
 	return handler, nil
 }
@@ -60,6 +71,10 @@ func (h *Handler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 		"default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; "+
 			"connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'",
 	)
+	if !strings.EqualFold(request.Host, h.allowedAuthority) {
+		http.Error(writer, "misdirected request", http.StatusMisdirectedRequest)
+		return
+	}
 	h.mux.ServeHTTP(writer, request)
 }
 
