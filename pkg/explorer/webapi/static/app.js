@@ -4,11 +4,13 @@ const state = {
   document: null,
   nodes: new Map(),
   edges: new Map(),
+  graphCursors: new Map(),
   selected: null,
 };
 const $ = (id) => document.getElementById(id);
 let documentGeneration = 0;
 let searchGeneration = 0;
+let documentsLoading = false;
 
 async function api(path, body) {
   const response = await fetch(`/api/v1/${path}`, {
@@ -35,6 +37,9 @@ function pin(snapshot) {
 }
 
 async function loadDocuments(reset = true) {
+  if (documentsLoading) return;
+  documentsLoading = true;
+  $("more").disabled = true;
   try {
     if (reset) {
       state.cursor = "";
@@ -58,6 +63,9 @@ async function loadDocuments(reset = true) {
     $("more").hidden = !state.cursor;
   } catch (error) {
     showError($("documents"), error);
+  } finally {
+    documentsLoading = false;
+    $("more").disabled = false;
   }
 }
 
@@ -121,7 +129,7 @@ $("search").onsubmit = async (event) => {
       query: {
         text: $("query").value,
         top_k: 20,
-        modes: ["lexical", "tree", "graph"],
+        modes: [...document.querySelectorAll("#modes input:checked")].map((input) => input.value),
         explain: true,
         as_of: state.snapshot.as_of,
       },
@@ -178,7 +186,7 @@ function mergeGraph(graph) {
   renderGraphList();
 }
 
-async function expandIDs(ids) {
+async function expandIDs(ids, cursor = "") {
   try {
     const response = await api("neighborhood", {
       snapshot: state.snapshot,
@@ -186,9 +194,14 @@ async function expandIDs(ids) {
       depth: 1,
       fanout: 18,
       max_nodes: 120,
+      cursor,
     });
     pin(response.snapshot);
     mergeGraph(response.neighborhood);
+    if (ids.length === 1) {
+      if (response.next_cursor) state.graphCursors.set(ids[0], response.next_cursor);
+      else state.graphCursors.delete(ids[0]);
+    }
     $("graph-status").textContent = response.truncated
       ? `Bounded result truncated at snapshot frontier ${response.snapshot.frontier}.`
       : `Complete requested expansion at snapshot frontier ${response.snapshot.frontier}.`;
@@ -200,6 +213,10 @@ async function expandIDs(ids) {
 }
 
 $("expand").onclick = () => state.selected && expandIDs([state.selected]);
+$("continue-expansion").onclick = () => {
+  const cursor = state.graphCursors.get(state.selected);
+  if (cursor) expandIDs([state.selected], cursor);
+};
 $("more").onclick = () => loadDocuments(false);
 $("find-path").onclick = async () => {
   try {
@@ -256,6 +273,7 @@ function renderGraphList() {
   for (const node of state.nodes.values()) {
     const button = document.createElement("button");
     button.textContent = (node.labels && node.labels[0]) || node.kind || node.id;
+    button.setAttribute("aria-label", `${button.textContent}, node ${node.id}`);
     button.setAttribute("aria-pressed", String(node.id === state.selected));
     button.onclick = () => selectNode(node.id);
     $("graph-nodes").append(button);
@@ -265,6 +283,10 @@ function renderGraphList() {
     const from = state.nodes.get(edge.from);
     const to = state.nodes.get(edge.to);
     item.textContent = `${nodeName(from, edge.from)} → ${nodeName(to, edge.to)} (${edge.type})`;
+    item.setAttribute(
+      "aria-label",
+      `${nodeName(from, edge.from)} ${edge.from} to ${nodeName(to, edge.to)} ${edge.to}, ${edge.type}`,
+    );
     $("graph-edges").append(item);
   }
 }
@@ -276,6 +298,7 @@ function nodeName(node, fallback) {
 function selectNode(id) {
   state.selected = id;
   $("expand").disabled = !id;
+  $("continue-expansion").hidden = !id || !state.graphCursors.has(id);
   const node = state.nodes.get(id);
   if (node) {
     $("selection").innerHTML = `<div class=kv><b>Node</b><span>${escapeHTML(id)}</span>` +

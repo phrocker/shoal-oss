@@ -226,7 +226,8 @@ func (r NeighborhoodResponse) MarshalJSON() ([]byte, error) {
 		Snapshot     Snapshot `json:"snapshot"`
 		Neighborhood any      `json:"neighborhood"`
 		Truncated    bool     `json:"truncated"`
-	}{r.Snapshot, wireNeighborhoodValue(r.Neighborhood), r.Truncated})
+		NextCursor   string   `json:"next_cursor,omitempty"`
+	}{r.Snapshot, wireNeighborhoodValue(r.Neighborhood), r.Truncated, r.NextCursor})
 }
 
 func (r PathResponse) MarshalJSON() ([]byte, error) {
@@ -267,6 +268,7 @@ func (r *NeighborhoodRequest) UnmarshalJSON(data []byte) error {
 		Fanout    uint32   `json:"fanout,omitempty"`
 		MaxNodes  uint32   `json:"max_nodes,omitempty"`
 		EdgeTypes []string `json:"edge_types,omitempty"`
+		Cursor    string   `json:"cursor,omitempty"`
 	}
 	if err := strictUnmarshal(data, &wire); err != nil {
 		return err
@@ -278,6 +280,7 @@ func (r *NeighborhoodRequest) UnmarshalJSON(data []byte) error {
 	*r = NeighborhoodRequest{
 		Snapshot: wire.Snapshot, NodeIDs: nodeIDs, Depth: wire.Depth,
 		Fanout: wire.Fanout, MaxNodes: wire.MaxNodes, EdgeTypes: wire.EdgeTypes,
+		Cursor: wire.Cursor,
 	}
 	return nil
 }

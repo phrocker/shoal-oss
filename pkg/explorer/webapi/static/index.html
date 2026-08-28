@@ -9,7 +9,7 @@
 <body>
   <header>
     <div><strong>Shoal Explorer</strong><span id="snapshot">loading snapshot…</span></div>
-    <form id="search"><label class="sr-only" for="query">Retrieval query</label><input id="query" required placeholder="Retrieve cited evidence…" autocomplete="off"><button>Search</button></form>
+    <form id="search"><label class="sr-only" for="query">Retrieval query</label><input id="query" required placeholder="Retrieve cited evidence…" autocomplete="off"><fieldset id="modes"><legend class="sr-only">Retrieval modes</legend><label><input type="checkbox" value="lexical" checked>Lexical</label><label><input type="checkbox" value="tree" checked>Tree</label><label><input type="checkbox" value="graph" checked>Graph</label><label><input type="checkbox" value="vector">Vector</label></fieldset><button>Search</button></form>
   </header>
   <main>
     <aside class="left">
@@ -22,6 +22,7 @@
       <div id="graph" class="panel" role="tabpanel" aria-labelledby="tab-graph">
         <div class="graph-tools">
           <button id="expand" disabled>Expand selected</button>
+          <button id="continue-expansion" hidden>More neighbors</button>
           <label class="sr-only" for="path-from">Path source node ID</label>
           <input id="path-from" placeholder="Path from node ID">
           <label class="sr-only" for="path-to">Path target node ID</label>

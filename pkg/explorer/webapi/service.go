@@ -19,7 +19,10 @@ package webapi
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
 	"sort"
 	"strconv"
 	"strings"
@@ -167,10 +170,20 @@ func (s *EmbeddedService) Neighborhood(
 		return NeighborhoodResponse{}, shoal.NewError(
 			shoal.ErrorInvalidArgument, "graph seeds exceed max_nodes")
 	}
+	normalizedRequest := request
+	normalizedRequest.Depth = depth
+	normalizedRequest.Fanout = fanout
+	normalizedRequest.MaxNodes = maxNodes
+	afterEdgeID, err := decodeGraphCursor(
+		request.Cursor, snapshot.ID, normalizedRequest)
+	if err != nil {
+		return NeighborhoodResponse{}, err
+	}
 
 	result, err := s.client.BoundedNeighborhood(ctx, explorer.BoundedNeighborhoodRequest{
 		NodeIDs: request.NodeIDs, Depth: depth, Fanout: fanout,
 		MaxNodes: maxNodes, EdgeTypes: request.EdgeTypes,
+		AfterEdgeID: afterEdgeID,
 	})
 	if err != nil {
 		return NeighborhoodResponse{}, err
@@ -178,10 +191,15 @@ func (s *EmbeddedService) Neighborhood(
 	if err := s.confirmSnapshot(ctx, snapshot); err != nil {
 		return NeighborhoodResponse{}, err
 	}
-	return NeighborhoodResponse{
+	response := NeighborhoodResponse{
 		Snapshot: snapshot, Neighborhood: result.Neighborhood,
 		Truncated: result.Truncated,
-	}, nil
+	}
+	if result.NextAfterEdgeID != "" {
+		response.NextCursor = encodeGraphCursor(
+			snapshot.ID, normalizedRequest, result.NextAfterEdgeID)
+	}
+	return response, nil
 }
 
 func (s *EmbeddedService) Path(
@@ -331,6 +349,76 @@ func decodeCursor(cursor, snapshot string) (int, error) {
 		return 0, shoal.NewError(shoal.ErrorInvalidArgument, "invalid document cursor")
 	}
 	return offset, nil
+}
+
+type graphCursorPayload struct {
+	Snapshot  string `json:"snapshot"`
+	Signature string `json:"signature"`
+	After     string `json:"after"`
+}
+
+func encodeGraphCursor(
+	snapshot string, request NeighborhoodRequest, after shoal.ID,
+) string {
+	encoded, _ := json.Marshal(graphCursorPayload{
+		Snapshot: snapshot, Signature: graphRequestSignature(request),
+		After: encodeID(after),
+	})
+	return base64.RawURLEncoding.EncodeToString(encoded)
+}
+
+func decodeGraphCursor(
+	cursor, snapshot string, request NeighborhoodRequest,
+) (shoal.ID, error) {
+	if cursor == "" {
+		return "", nil
+	}
+	if len(request.NodeIDs) != 1 || request.Depth != 1 {
+		return "", shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"graph cursors require one seed and depth 1",
+		)
+	}
+	encoded, err := base64.RawURLEncoding.DecodeString(cursor)
+	if err != nil {
+		return "", shoal.NewError(shoal.ErrorInvalidArgument, "invalid graph cursor")
+	}
+	var payload graphCursorPayload
+	if err := json.Unmarshal(encoded, &payload); err != nil {
+		return "", shoal.NewError(shoal.ErrorInvalidArgument, "invalid graph cursor")
+	}
+	if payload.Snapshot != snapshot {
+		return "", shoal.NewError(
+			shoal.ErrorConflict, "graph cursor belongs to another snapshot")
+	}
+	if payload.Signature != graphRequestSignature(request) {
+		return "", shoal.NewError(
+			shoal.ErrorInvalidArgument, "graph cursor does not match the request")
+	}
+	after, err := decodeID(payload.After)
+	if err != nil {
+		return "", shoal.NewError(shoal.ErrorInvalidArgument, "invalid graph cursor")
+	}
+	return after, nil
+}
+
+func graphRequestSignature(request NeighborhoodRequest) string {
+	value := struct {
+		NodeIDs   []string `json:"node_ids"`
+		Depth     uint32   `json:"depth"`
+		Fanout    uint32   `json:"fanout"`
+		MaxNodes  uint32   `json:"max_nodes"`
+		EdgeTypes []string `json:"edge_types"`
+	}{
+		Depth: request.Depth, Fanout: request.Fanout,
+		MaxNodes: request.MaxNodes, EdgeTypes: request.EdgeTypes,
+	}
+	for _, id := range request.NodeIDs {
+		value.NodeIDs = append(value.NodeIDs, encodeID(id))
+	}
+	encoded, _ := json.Marshal(value)
+	sum := sha256.Sum256(encoded)
+	return hex.EncodeToString(sum[:])
 }
 
 func directedPath(

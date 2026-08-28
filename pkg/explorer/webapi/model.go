@@ -100,6 +100,7 @@ type NeighborhoodRequest struct {
 	Fanout    uint32     `json:"fanout,omitempty"`
 	MaxNodes  uint32     `json:"max_nodes,omitempty"`
 	EdgeTypes []string   `json:"edge_types,omitempty"`
+	Cursor    string     `json:"cursor,omitempty"`
 }
 
 // NeighborhoodResponse returns only the bounded subgraph requested.
@@ -107,6 +108,7 @@ type NeighborhoodResponse struct {
 	Snapshot     Snapshot              `json:"snapshot"`
 	Neighborhood explorer.Neighborhood `json:"neighborhood"`
 	Truncated    bool                  `json:"truncated"`
+	NextCursor   string                `json:"next_cursor,omitempty"`
 }
 
 // PathRequest asks for one bounded directed path.

@@ -91,6 +91,27 @@ func TestEmbeddedServiceBoundsAndSnapshot(t *testing.T) {
 	if !nodeIDs[first.Document.ID] || !nodeIDs[second.Document.ID] {
 		t.Fatalf("requested seeds were not reserved: %+v", neighborhood)
 	}
+	firstPage, err := service.Neighborhood(ctx, webapi.NeighborhoodRequest{
+		Snapshot: documents.Snapshot, NodeIDs: []shoal.ID{first.Document.ID},
+		Depth: 1, Fanout: 1, MaxNodes: 10,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstPage.NextCursor == "" || len(firstPage.Neighborhood.Edges) != 1 {
+		t.Fatalf("first graph page = %+v", firstPage)
+	}
+	secondPage, err := service.Neighborhood(ctx, webapi.NeighborhoodRequest{
+		Snapshot: documents.Snapshot, NodeIDs: []shoal.ID{first.Document.ID},
+		Depth: 1, Fanout: 1, MaxNodes: 10, Cursor: firstPage.NextCursor,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(secondPage.Neighborhood.Edges) != 1 ||
+		secondPage.Neighborhood.Edges[0].ID == firstPage.Neighborhood.Edges[0].ID {
+		t.Fatalf("second graph page = %+v", secondPage)
+	}
 	path, err := service.Path(ctx, webapi.PathRequest{
 		Snapshot: documents.Snapshot, From: first.Document.ID,
 		To: second.Document.ID, MaxDepth: 2, Fanout: 2,

@@ -74,7 +74,9 @@ go run ./cmd/shoal-explore-web \
 Open <http://127.0.0.1:8080>. The workspace lists and pages documents,
 preserves the authored hierarchy, retrieves exact revision/span citations and
 score explanations, and provides an interactive bounded graph canvas with
-node expansion and directed path finding.
+cursor-based node expansion and directed path finding. Retrieval controls
+include vector mode; the embedded backend continues to fail that mode
+explicitly until a vector strategy is configured.
 
 The browser communicates only with `/api/v1/*`, a logical Explorer service
 contract. Requests and responses carry a snapshot ID and `as_of` value;

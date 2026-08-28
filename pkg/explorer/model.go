@@ -166,12 +166,13 @@ type Snapshot struct {
 // BoundedNeighborhoodRequest limits graph work as well as returned data.
 // Fanout caps adjacency entries examined per expanded node.
 type BoundedNeighborhoodRequest struct {
-	NodeIDs   []shoal.ID
-	Depth     uint32
-	Fanout    uint32
-	MaxNodes  uint32
-	EdgeTypes []string
-	Direction GraphDirection
+	NodeIDs     []shoal.ID
+	Depth       uint32
+	Fanout      uint32
+	MaxNodes    uint32
+	EdgeTypes   []string
+	Direction   GraphDirection
+	AfterEdgeID shoal.ID
 }
 
 // GraphDirection selects which adjacency entries consume bounded fanout.
@@ -185,8 +186,9 @@ const (
 
 // BoundedNeighborhood reports whether a server bound stopped expansion.
 type BoundedNeighborhood struct {
-	Neighborhood Neighborhood
-	Truncated    bool
+	Neighborhood    Neighborhood
+	Truncated       bool
+	NextAfterEdgeID shoal.ID
 }
 
 // BoundedClient is the backend boundary required by scalable Explorer

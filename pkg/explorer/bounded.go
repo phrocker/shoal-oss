@@ -110,8 +110,12 @@ func (e *Explorer) BoundedNeighborhood(
 	for level := uint32(0); level < normalized.Depth && len(frontier) > 0; level++ {
 		next := make([]shoal.ID, 0)
 		for _, seed := range frontier {
+			after := shoal.ID("")
+			if level == 0 && len(normalized.NodeIDs) == 1 {
+				after = request.AfterEdgeID
+			}
 			edgeIDs, limited := e.boundedEdgeIDs(
-				seed, request.Direction, request.Fanout)
+				seed, request.Direction, request.Fanout, after)
 			if limited {
 				truncated = true
 			}
@@ -156,19 +160,30 @@ func (e *Explorer) BoundedNeighborhood(
 	sort.Slice(result.Edges, func(i, j int) bool {
 		return shoal.CompareID(result.Edges[i].ID, result.Edges[j].ID) < 0
 	})
-	return BoundedNeighborhood{Neighborhood: result, Truncated: truncated}, nil
+	var next shoal.ID
+	if len(normalized.NodeIDs) == 1 && normalized.Depth == 1 && truncated {
+		edgeIDs, limited := e.boundedEdgeIDs(
+			normalized.NodeIDs[0], request.Direction, request.Fanout, request.AfterEdgeID)
+		if limited && len(edgeIDs) > 0 {
+			next = edgeIDs[len(edgeIDs)-1]
+		}
+	}
+	return BoundedNeighborhood{
+		Neighborhood: result, Truncated: truncated, NextAfterEdgeID: next,
+	}, nil
 }
 
 func (e *Explorer) boundedEdgeIDs(
-	nodeID shoal.ID, direction GraphDirection, fanout uint32,
+	nodeID shoal.ID, direction GraphDirection, fanout uint32, after shoal.ID,
 ) ([]shoal.ID, bool) {
 	switch direction {
 	case GraphDirectionOutgoing:
-		return limitEdgeIDs(e.outgoing[nodeID], fanout)
+		return limitEdgeIDsAfter(e.outgoing[nodeID], fanout, after)
 	case GraphDirectionIncoming:
-		return limitEdgeIDs(e.incoming[nodeID], fanout)
+		return limitEdgeIDsAfter(e.incoming[nodeID], fanout, after)
 	}
-	outgoing, incoming := e.outgoing[nodeID], e.incoming[nodeID]
+	outgoing := afterEdge(e.outgoing[nodeID], after)
+	incoming := afterEdge(e.incoming[nodeID], after)
 	result := make([]shoal.ID, 0, fanout)
 	left, right := 0, 0
 	for uint32(len(result)) < fanout && (left < len(outgoing) || right < len(incoming)) {
@@ -190,11 +205,22 @@ func (e *Explorer) boundedEdgeIDs(
 	return result, left < len(outgoing) || right < len(incoming)
 }
 
-func limitEdgeIDs(values []shoal.ID, fanout uint32) ([]shoal.ID, bool) {
+func limitEdgeIDsAfter(values []shoal.ID, fanout uint32, after shoal.ID) ([]shoal.ID, bool) {
+	values = afterEdge(values, after)
 	if uint32(len(values)) <= fanout {
 		return values, false
 	}
 	return values[:fanout], true
+}
+
+func afterEdge(values []shoal.ID, after shoal.ID) []shoal.ID {
+	if after == "" {
+		return values
+	}
+	index := sort.Search(len(values), func(index int) bool {
+		return shoal.CompareID(values[index], after) > 0
+	})
+	return values[index:]
 }
 
 func (e *Explorer) refreshSnapshotLocked() {
