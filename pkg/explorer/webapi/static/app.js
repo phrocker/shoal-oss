@@ -7,6 +7,8 @@ const state = {
   selected: null,
 };
 const $ = (id) => document.getElementById(id);
+let documentGeneration = 0;
+let searchGeneration = 0;
 
 async function api(path, body) {
   const response = await fetch(`/api/v1/${path}`, {
@@ -60,12 +62,14 @@ async function loadDocuments(reset = true) {
 }
 
 async function loadDocument(documentID, revisionID) {
+  const generation = ++documentGeneration;
   try {
     const response = await api("document", {
       snapshot: state.snapshot,
       document_id: documentID,
       revision_id: revisionID,
     });
+    if (generation !== documentGeneration) return;
     pin(response.snapshot);
     state.document = response.document;
     $("hierarchy").classList.remove("muted");
@@ -76,7 +80,7 @@ async function loadDocument(documentID, revisionID) {
     mergeGraph({nodes: [nodeFromDocument(response.document.document)], edges: []});
     draw();
   } catch (error) {
-    showError($("hierarchy"), error);
+    if (generation === documentGeneration) showError($("hierarchy"), error);
   }
 }
 
@@ -110,6 +114,7 @@ function nodeFromDocument(documentValue) {
 
 $("search").onsubmit = async (event) => {
   event.preventDefault();
+  const generation = ++searchGeneration;
   try {
     const response = await api("retrieve", {
       snapshot: state.snapshot,
@@ -121,10 +126,11 @@ $("search").onsubmit = async (event) => {
         as_of: state.snapshot.as_of,
       },
     });
+    if (generation !== searchGeneration) return;
     pin(response.snapshot);
     renderEvidence(response.retrieval);
   } catch (error) {
-    showError($("evidence"), error);
+    if (generation === searchGeneration) showError($("evidence"), error);
   }
 };
 
@@ -216,11 +222,24 @@ $("find-path").onclick = async () => {
 
 document.querySelectorAll(".tab").forEach((tab) => {
   tab.onclick = () => activate(tab.dataset.panel);
+  tab.onkeydown = (event) => {
+    if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+    const tabs = [...document.querySelectorAll(".tab")];
+    const offset = event.key === "ArrowRight" ? 1 : -1;
+    const target = tabs[(tabs.indexOf(tab) + offset + tabs.length) % tabs.length];
+    activate(target.dataset.panel);
+    target.focus();
+  };
 });
 
 function activate(id) {
   document.querySelectorAll(".tab,.panel").forEach((element) => {
     element.classList.remove("active");
+  });
+  document.querySelectorAll(".tab").forEach((tab) => {
+    const selected = tab.dataset.panel === id;
+    tab.setAttribute("aria-selected", String(selected));
+    tab.tabIndex = selected ? 0 : -1;
   });
   document.querySelector(`[data-panel="${id}"]`).classList.add("active");
   $(id).classList.add("active");

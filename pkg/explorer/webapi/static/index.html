@@ -17,9 +17,9 @@
       <section><h2>Hierarchy</h2><div id="hierarchy" class="tree muted">Select a document.</div></section>
     </aside>
     <section class="center">
-      <div class="tabs"><button class="tab active" data-panel="evidence">Evidence</button><button class="tab" data-panel="graph">Graph</button></div>
-      <div id="evidence" class="panel active"><p class="muted">Run a retrieval query to inspect exact evidence and explanations.</p></div>
-      <div id="graph" class="panel">
+      <div class="tabs" role="tablist" aria-label="Explorer views"><button id="tab-evidence" class="tab active" data-panel="evidence" role="tab" aria-controls="evidence" aria-selected="true">Evidence</button><button id="tab-graph" class="tab" data-panel="graph" role="tab" aria-controls="graph" aria-selected="false" tabindex="-1">Graph</button></div>
+      <div id="evidence" class="panel active" role="tabpanel" aria-labelledby="tab-evidence"><p class="muted">Run a retrieval query to inspect exact evidence and explanations.</p></div>
+      <div id="graph" class="panel" role="tabpanel" aria-labelledby="tab-graph">
         <div class="graph-tools">
           <button id="expand" disabled>Expand selected</button>
           <label class="sr-only" for="path-from">Path source node ID</label>

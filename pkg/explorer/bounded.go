@@ -110,21 +110,13 @@ func (e *Explorer) BoundedNeighborhood(
 	for level := uint32(0); level < normalized.Depth && len(frontier) > 0; level++ {
 		next := make([]shoal.ID, 0)
 		for _, seed := range frontier {
-			edgeIDs := e.adjacency[seed]
-			examined := uint32(0)
+			edgeIDs, limited := e.boundedEdgeIDs(
+				seed, request.Direction, request.Fanout)
+			if limited {
+				truncated = true
+			}
 			for _, edgeID := range edgeIDs {
 				edge := e.graphEdges[edgeID]
-				if request.Direction == GraphDirectionOutgoing && edge.From != seed {
-					continue
-				}
-				if request.Direction == GraphDirectionIncoming && edge.To != seed {
-					continue
-				}
-				if examined >= request.Fanout {
-					truncated = true
-					break
-				}
-				examined++
 				if len(typeFilter) > 0 {
 					if _, ok := typeFilter[edge.Type]; !ok {
 						continue
@@ -165,6 +157,44 @@ func (e *Explorer) BoundedNeighborhood(
 		return shoal.CompareID(result.Edges[i].ID, result.Edges[j].ID) < 0
 	})
 	return BoundedNeighborhood{Neighborhood: result, Truncated: truncated}, nil
+}
+
+func (e *Explorer) boundedEdgeIDs(
+	nodeID shoal.ID, direction GraphDirection, fanout uint32,
+) ([]shoal.ID, bool) {
+	switch direction {
+	case GraphDirectionOutgoing:
+		return limitEdgeIDs(e.outgoing[nodeID], fanout)
+	case GraphDirectionIncoming:
+		return limitEdgeIDs(e.incoming[nodeID], fanout)
+	}
+	outgoing, incoming := e.outgoing[nodeID], e.incoming[nodeID]
+	result := make([]shoal.ID, 0, fanout)
+	left, right := 0, 0
+	for uint32(len(result)) < fanout && (left < len(outgoing) || right < len(incoming)) {
+		var next shoal.ID
+		switch {
+		case right >= len(incoming):
+			next, left = outgoing[left], left+1
+		case left >= len(outgoing):
+			next, right = incoming[right], right+1
+		case shoal.CompareID(outgoing[left], incoming[right]) <= 0:
+			next, left = outgoing[left], left+1
+		default:
+			next, right = incoming[right], right+1
+		}
+		if len(result) == 0 || result[len(result)-1] != next {
+			result = append(result, next)
+		}
+	}
+	return result, left < len(outgoing) || right < len(incoming)
+}
+
+func limitEdgeIDs(values []shoal.ID, fanout uint32) ([]shoal.ID, bool) {
+	if uint32(len(values)) <= fanout {
+		return values, false
+	}
+	return values[:fanout], true
 }
 
 func (e *Explorer) refreshSnapshotLocked() {

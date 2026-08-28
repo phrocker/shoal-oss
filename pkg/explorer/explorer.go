@@ -44,7 +44,8 @@ type Explorer struct {
 	edges                   map[shoal.ID]persistedEdge
 	graphNodes              map[shoal.ID]graph.Node
 	graphEdges              map[shoal.ID]graph.Edge
-	adjacency               map[shoal.ID][]shoal.ID
+	outgoing                map[shoal.ID][]shoal.ID
+	incoming                map[shoal.ID][]shoal.ID
 	graphErr                error
 	graphInitialized        bool
 	snapshot                Snapshot
@@ -324,16 +325,14 @@ func (e *Explorer) Connect(ctx context.Context, edge graph.Edge) error {
 	}
 	e.edges[edge.ID] = record
 	e.graphEdges[edge.ID] = cloneEdge(edge)
-	adjacent := []shoal.ID{edge.From}
-	if edge.To != edge.From {
-		adjacent = append(adjacent, edge.To)
-	}
-	for _, id := range adjacent {
-		e.adjacency[id] = append(e.adjacency[id], edge.ID)
-		sort.Slice(e.adjacency[id], func(i, j int) bool {
-			return shoal.CompareID(e.adjacency[id][i], e.adjacency[id][j]) < 0
-		})
-	}
+	e.outgoing[edge.From] = append(e.outgoing[edge.From], edge.ID)
+	sort.Slice(e.outgoing[edge.From], func(i, j int) bool {
+		return shoal.CompareID(e.outgoing[edge.From][i], e.outgoing[edge.From][j]) < 0
+	})
+	e.incoming[edge.To] = append(e.incoming[edge.To], edge.ID)
+	sort.Slice(e.incoming[edge.To], func(i, j int) bool {
+		return shoal.CompareID(e.incoming[edge.To][i], e.incoming[edge.To][j]) < 0
+	})
 	e.refreshSnapshotLocked()
 	return nil
 }
@@ -473,25 +472,31 @@ func (e *Explorer) rebuildCurrentGraphLocked() error {
 	if err != nil {
 		e.graphNodes = make(map[shoal.ID]graph.Node)
 		e.graphEdges = make(map[shoal.ID]graph.Edge)
-		e.adjacency = make(map[shoal.ID][]shoal.ID)
+		e.outgoing = make(map[shoal.ID][]shoal.ID)
+		e.incoming = make(map[shoal.ID][]shoal.ID)
 		e.graphErr = err
 		e.graphInitialized = true
 		e.refreshSnapshotLocked()
-		return nil
+		return err
 	}
-	adjacency := make(map[shoal.ID][]shoal.ID, len(nodes))
+	outgoing := make(map[shoal.ID][]shoal.ID, len(nodes))
+	incoming := make(map[shoal.ID][]shoal.ID, len(nodes))
 	for id, edge := range edges {
-		adjacency[edge.From] = append(adjacency[edge.From], id)
-		if edge.To != edge.From {
-			adjacency[edge.To] = append(adjacency[edge.To], id)
-		}
+		outgoing[edge.From] = append(outgoing[edge.From], id)
+		incoming[edge.To] = append(incoming[edge.To], id)
 	}
-	for id := range adjacency {
-		sort.Slice(adjacency[id], func(i, j int) bool {
-			return shoal.CompareID(adjacency[id][i], adjacency[id][j]) < 0
+	for id := range outgoing {
+		sort.Slice(outgoing[id], func(i, j int) bool {
+			return shoal.CompareID(outgoing[id][i], outgoing[id][j]) < 0
 		})
 	}
-	e.graphNodes, e.graphEdges, e.adjacency = nodes, edges, adjacency
+	for id := range incoming {
+		sort.Slice(incoming[id], func(i, j int) bool {
+			return shoal.CompareID(incoming[id][i], incoming[id][j]) < 0
+		})
+	}
+	e.graphNodes, e.graphEdges = nodes, edges
+	e.outgoing, e.incoming = outgoing, incoming
 	e.graphErr = nil
 	e.graphInitialized = true
 	e.refreshSnapshotLocked()
