@@ -22,6 +22,7 @@ package harness
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -336,11 +337,13 @@ func TestEvaluationRecordIsRedactedAndIncludesBudgets(t *testing.T) {
 	if _, err := g.Generate(context.Background(), pack); err != nil {
 		t.Fatal(err)
 	}
-	if recorder.record.Budgets != budgets() || len(recorder.record.CorrelationDigests) != 1 {
-		t.Fatal("evaluation record omitted budgets or correlation digest")
+	if recorder.record.Budgets != budgets() || len(recorder.record.ActionKinds) != 1 ||
+		len(recorder.record.ActionUsage) != 1 {
+		t.Fatal("evaluation record omitted budgets or bounded action data")
 	}
-	if strings.Contains(recorder.record.CorrelationDigests[0], string(secretCorrelation)) {
-		t.Fatal("evaluation record retained raw correlation ID")
+	encoded := fmt.Sprintf("%+v", recorder.record)
+	if strings.Contains(encoded, string(secretCorrelation)) {
+		t.Fatal("evaluation record retained correlation ID")
 	}
 }
 
@@ -357,6 +360,20 @@ func TestRejectsStaleSnapshotAndAuthorization(t *testing.T) {
 	g.now = func() time.Time { return fixedTime }
 	if _, err := g.Generate(context.Background(), expired); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("stale auth error = %v", err)
+	}
+
+	stop, _ := NewStopAction("stop", resultFor(t, pack, pack.Evidence()[0]), Usage{})
+	g = newGenerator(t, NewFakeRunner(ScriptAction(stop)), &fakeTools{pack: pack})
+	calls := 0
+	g.now = func() time.Time {
+		calls++
+		if calls >= 4 {
+			return pack.Authorization().ExpiresAt()
+		}
+		return fixedTime
+	}
+	if _, err := g.Generate(context.Background(), pack); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("post-next expiry error = %v", err)
 	}
 }
 

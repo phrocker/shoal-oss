@@ -485,15 +485,10 @@ type Record struct {
 // identities and digests, never raw prompts, authorization grants, or tool
 // payloads.
 type EvaluationRecord struct {
-	RequestID          shoal.ID
-	ContextPackID      shoal.ID
-	TranscriptID       shoal.ID
-	ResultID           shoal.ID
-	Provenance         Provenance
-	Budgets            Budgets
-	ActionKinds        []ActionKind
-	CorrelationDigests []string
-	ActionDigests      []string
+	Provenance  Provenance
+	Budgets     Budgets
+	ActionKinds []ActionKind
+	ActionUsage []Usage
 }
 
 type Recorder interface {
@@ -572,6 +567,9 @@ func (g *Generator) Run(ctx context.Context, pack inference.ContextPack) (Record
 		}
 		if err := runCtx.Err(); err != nil {
 			return Record{}, err
+		}
+		if !g.now().Before(pack.Authorization().ExpiresAt()) {
+			return Record{}, invalid("authorization pin expired during execution")
 		}
 		if err := action.validate(); err != nil {
 			return Record{}, err
@@ -719,22 +717,14 @@ func verifiedAdditions(original, expanded inference.ContextPack) []inference.Evi
 
 func evaluationRecord(record Record) EvaluationRecord {
 	evaluation := EvaluationRecord{
-		RequestID:          record.Request.ID(),
-		ContextPackID:      record.Request.context.ID(),
-		TranscriptID:       record.Transcript.ID(),
-		ResultID:           record.Result.ID(),
-		Provenance:         record.Request.provenance,
-		Budgets:            record.Request.budgets,
-		ActionKinds:        make([]ActionKind, 0, len(record.Transcript.exchanges)+1),
-		CorrelationDigests: make([]string, 0, len(record.Transcript.exchanges)+1),
-		ActionDigests:      make([]string, 0, len(record.Transcript.exchanges)+1),
+		Provenance:  record.Request.provenance,
+		Budgets:     record.Request.budgets,
+		ActionKinds: make([]ActionKind, 0, len(record.Transcript.exchanges)+1),
+		ActionUsage: make([]Usage, 0, len(record.Transcript.exchanges)+1),
 	}
 	add := func(action Action) {
 		evaluation.ActionKinds = append(evaluation.ActionKinds, action.kind)
-		correlation := sha256.Sum256([]byte(action.correlation))
-		evaluation.CorrelationDigests = append(evaluation.CorrelationDigests, hex.EncodeToString(correlation[:]))
-		sum := sha256.Sum256([]byte(actionKey(action)))
-		evaluation.ActionDigests = append(evaluation.ActionDigests, hex.EncodeToString(sum[:]))
+		evaluation.ActionUsage = append(evaluation.ActionUsage, action.usage)
 	}
 	for _, exchange := range record.Transcript.exchanges {
 		add(exchange.action)

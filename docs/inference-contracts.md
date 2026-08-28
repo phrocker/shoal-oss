@@ -45,9 +45,9 @@ and cancellation. Unknown actions and mismatched or stale results fail closed.
 
 `Runner` and `Session` are provider-neutral boundaries. `FakeRunner` supplies
 deterministic scripted actions and faults for tests. Evaluation records contain
-provenance plus redacted action identities and digests; they exclude prompts,
-credentials, raw authorization grants, URLs, storage coordinates, shell, and
-filesystem access.
+provenance, budgets, action kinds, and token usage only; they exclude prompts,
+correlation IDs, tool inputs/results, credentials, raw authorization grants,
+URLs, storage coordinates, shell, and filesystem access.
 
 The harness implements `inference.Generator`. Its returned result remains
 bound to the supplied context pack and carries canonically verified evidence
