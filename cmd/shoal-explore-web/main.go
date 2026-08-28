@@ -47,20 +47,20 @@ func main() {
 
 func run(ctx context.Context, args []string, output io.Writer) error {
 	flags := flag.NewFlagSet("shoal-explore-web", flag.ContinueOnError)
+	backend := flags.String("backend", "embedded", "Explorer backend: embedded or remote")
 	data := flags.String("data", ".shoal/explorer", "Explorer corpus directory")
 	listen := flags.String("listen", "127.0.0.1:8080", "HTTP listen address")
+	remote := flags.String("remote", "", "Remote Explorer web API URL for -backend remote")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
-	corpus, err := explorer.Open(*data)
+
+	service, cleanup, err := openService(*backend, *data, *remote)
 	if err != nil {
 		return err
 	}
-	defer corpus.Close()
-	service, err := webapi.NewEmbeddedService(corpus)
-	if err != nil {
-		return err
-	}
+	defer cleanup()
+
 	listener, err := net.Listen("tcp", *listen)
 	if err != nil {
 		return fmt.Errorf("listen on %s: %w", *listen, err)
@@ -90,4 +90,28 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 		return <-shutdownDone
 	}
 	return err
+}
+
+func openService(backend, data, remote string) (webapi.Service, func(), error) {
+	switch backend {
+	case "embedded":
+		corpus, err := explorer.Open(data)
+		if err != nil {
+			return nil, func() {}, err
+		}
+		service, err := webapi.NewEmbeddedService(corpus)
+		if err != nil {
+			corpus.Close()
+			return nil, func() {}, err
+		}
+		return service, func() { corpus.Close() }, nil
+	case "remote":
+		service, err := webapi.NewRemoteService(remote, nil)
+		if err != nil {
+			return nil, func() {}, err
+		}
+		return service, func() {}, nil
+	default:
+		return nil, func() {}, fmt.Errorf("unknown backend %q", backend)
+	}
 }

@@ -29,16 +29,67 @@ import (
 )
 
 const (
-	DefaultPageSize uint32 = 25
-	MaxPageSize     uint32 = 100
-	MaxTopK         uint32 = 50
-	DefaultDepth    uint32 = 1
-	MaxDepth        uint32 = 4
-	DefaultFanout   uint32 = 12
-	MaxFanout       uint32 = 50
-	DefaultMaxNodes uint32 = 100
-	MaxNodes        uint32 = 250
+	DefaultPageSize      uint32 = 25
+	MaxPageSize          uint32 = 100
+	MaxTopK              uint32 = 50
+	DefaultDepth         uint32 = 1
+	MaxDepth             uint32 = 4
+	DefaultFanout        uint32 = 12
+	MaxFanout            uint32 = 50
+	DefaultMaxNodes      uint32 = 100
+	MaxNodes             uint32 = 250
+	MaxEdgeTypes         uint32 = 64
+	MaxEvidencePerResult uint32 = 32
+	MaxResponseBytes     uint64 = 64 << 20
 )
+
+// Capability identifies one browser-visible feature without revealing where or
+// how the backing Explorer service executes it.
+type Capability string
+
+const (
+	CapabilityDocuments    Capability = "documents"
+	CapabilityDocument     Capability = "document"
+	CapabilityRetrieve     Capability = "retrieve"
+	CapabilityNeighborhood Capability = "neighborhood"
+	CapabilityPath         Capability = "path"
+)
+
+// Capabilities advertises only stable logical features supported by a backend.
+type Capabilities struct {
+	Documents    bool `json:"documents"`
+	Document     bool `json:"document"`
+	Retrieve     bool `json:"retrieve"`
+	Neighborhood bool `json:"neighborhood"`
+	Path         bool `json:"path"`
+}
+
+// AllCapabilities returns the complete feature set implemented by the embedded
+// service. Remote services must advertise their supported features explicitly.
+func AllCapabilities() Capabilities {
+	return Capabilities{
+		Documents: true, Document: true, Retrieve: true,
+		Neighborhood: true, Path: true,
+	}
+}
+
+// Supports reports whether the feature is currently available.
+func (c Capabilities) Supports(capability Capability) bool {
+	switch capability {
+	case CapabilityDocuments:
+		return c.Documents
+	case CapabilityDocument:
+		return c.Document
+	case CapabilityRetrieve:
+		return c.Retrieve
+	case CapabilityNeighborhood:
+		return c.Neighborhood
+	case CapabilityPath:
+		return c.Path
+	default:
+		return false
+	}
+}
 
 // Snapshot pins every workspace request to one logical corpus view.
 type Snapshot struct {
@@ -129,9 +180,12 @@ type PathResponse struct {
 
 // MetadataResponse advertises server-enforced public bounds.
 type MetadataResponse struct {
-	MaxPageSize uint32 `json:"max_page_size"`
-	MaxTopK     uint32 `json:"max_top_k"`
-	MaxDepth    uint32 `json:"max_depth"`
-	MaxFanout   uint32 `json:"max_fanout"`
-	MaxNodes    uint32 `json:"max_nodes"`
+	MaxPageSize      uint32       `json:"max_page_size"`
+	MaxTopK          uint32       `json:"max_top_k"`
+	MaxDepth         uint32       `json:"max_depth"`
+	MaxFanout        uint32       `json:"max_fanout"`
+	MaxNodes         uint32       `json:"max_nodes"`
+	MaxEdgeTypes     uint32       `json:"max_edge_types"`
+	MaxResponseBytes uint64       `json:"max_response_bytes"`
+	Capabilities     Capabilities `json:"capabilities"`
 }

@@ -114,6 +114,19 @@ type wireExplanation struct {
 	Scores  map[string]shoal.Score `json:"scores"`
 }
 
+type wireCitation struct {
+	DocumentID string    `json:"document_id"`
+	RevisionID string    `json:"revision_id"`
+	SectionID  string    `json:"section_id,omitempty"`
+	SpanID     string    `json:"span_id,omitempty"`
+	Range      wireRange `json:"range"`
+}
+
+type wireNeighborhood struct {
+	Nodes []wireNode `json:"nodes"`
+	Edges []wireEdge `json:"edges"`
+}
+
 type wireMetadataEntry struct {
 	Key   string `json:"key"`
 	Value string `json:"value"`
@@ -152,6 +165,96 @@ func (s *Snapshot) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+func (r DocumentRequest) MarshalJSON() ([]byte, error) {
+	return json.Marshal(struct {
+		Snapshot   Snapshot `json:"snapshot"`
+		DocumentID string   `json:"document_id"`
+		RevisionID string   `json:"revision_id,omitempty"`
+	}{
+		Snapshot: r.Snapshot, DocumentID: encodeID(r.DocumentID),
+		RevisionID: encodeOptionalID(r.RevisionID),
+	})
+}
+
+func (r RetrievalRequest) MarshalJSON() ([]byte, error) {
+	documentIDs := make([]string, 0, len(r.Query.Scope.DocumentIDs))
+	for _, id := range r.Query.Scope.DocumentIDs {
+		documentIDs = append(documentIDs, encodeID(id))
+	}
+	nodeIDs := make([]string, 0, len(r.Query.Scope.NodeIDs))
+	for _, id := range r.Query.Scope.NodeIDs {
+		nodeIDs = append(nodeIDs, encodeID(id))
+	}
+	return json.Marshal(struct {
+		Snapshot Snapshot `json:"snapshot"`
+		Query    struct {
+			Text  string           `json:"text"`
+			TopK  uint32           `json:"top_k,omitempty"`
+			Modes []retrieval.Mode `json:"modes,omitempty"`
+			Scope struct {
+				DocumentIDs []string `json:"document_ids,omitempty"`
+				NodeIDs     []string `json:"node_ids,omitempty"`
+			} `json:"scope,omitempty"`
+			AsOf    time.Time `json:"as_of,omitempty"`
+			Explain bool      `json:"explain,omitempty"`
+		} `json:"query"`
+	}{
+		Snapshot: r.Snapshot,
+		Query: struct {
+			Text  string           `json:"text"`
+			TopK  uint32           `json:"top_k,omitempty"`
+			Modes []retrieval.Mode `json:"modes,omitempty"`
+			Scope struct {
+				DocumentIDs []string `json:"document_ids,omitempty"`
+				NodeIDs     []string `json:"node_ids,omitempty"`
+			} `json:"scope,omitempty"`
+			AsOf    time.Time `json:"as_of,omitempty"`
+			Explain bool      `json:"explain,omitempty"`
+		}{
+			Text: r.Query.Text, TopK: r.Query.TopK, Modes: r.Query.Modes,
+			Scope: struct {
+				DocumentIDs []string `json:"document_ids,omitempty"`
+				NodeIDs     []string `json:"node_ids,omitempty"`
+			}{DocumentIDs: documentIDs, NodeIDs: nodeIDs},
+			AsOf: r.Query.AsOf, Explain: r.Query.Explain,
+		},
+	})
+}
+
+func (r NeighborhoodRequest) MarshalJSON() ([]byte, error) {
+	nodeIDs := make([]string, 0, len(r.NodeIDs))
+	for _, id := range r.NodeIDs {
+		nodeIDs = append(nodeIDs, encodeID(id))
+	}
+	return json.Marshal(struct {
+		Snapshot  Snapshot `json:"snapshot"`
+		NodeIDs   []string `json:"node_ids"`
+		Depth     uint32   `json:"depth,omitempty"`
+		Fanout    uint32   `json:"fanout,omitempty"`
+		MaxNodes  uint32   `json:"max_nodes,omitempty"`
+		EdgeTypes []string `json:"edge_types,omitempty"`
+		Cursor    string   `json:"cursor,omitempty"`
+	}{
+		Snapshot: r.Snapshot, NodeIDs: nodeIDs, Depth: r.Depth,
+		Fanout: r.Fanout, MaxNodes: r.MaxNodes, EdgeTypes: r.EdgeTypes,
+		Cursor: r.Cursor,
+	})
+}
+
+func (r PathRequest) MarshalJSON() ([]byte, error) {
+	return json.Marshal(struct {
+		Snapshot  Snapshot `json:"snapshot"`
+		From      string   `json:"from"`
+		To        string   `json:"to"`
+		MaxDepth  uint32   `json:"max_depth,omitempty"`
+		Fanout    uint32   `json:"fanout,omitempty"`
+		EdgeTypes []string `json:"edge_types,omitempty"`
+	}{
+		Snapshot: r.Snapshot, From: encodeID(r.From), To: encodeID(r.To),
+		MaxDepth: r.MaxDepth, Fanout: r.Fanout, EdgeTypes: r.EdgeTypes,
+	})
+}
+
 func (r DocumentsResponse) MarshalJSON() ([]byte, error) {
 	documents := make([]any, 0, len(r.Documents))
 	for _, summary := range r.Documents {
@@ -171,6 +274,39 @@ func (r DocumentsResponse) MarshalJSON() ([]byte, error) {
 	}{r.Snapshot, documents, r.NextCursor})
 }
 
+func (r *DocumentsResponse) UnmarshalJSON(data []byte) error {
+	var wire struct {
+		Snapshot  Snapshot `json:"snapshot"`
+		Documents []struct {
+			Document  wireDocument `json:"document"`
+			Revision  wireRevision `json:"revision"`
+			SourceURI string       `json:"source_uri"`
+		} `json:"documents"`
+		NextCursor string `json:"next_cursor,omitempty"`
+	}
+	if err := strictUnmarshal(data, &wire); err != nil {
+		return err
+	}
+	documents := make([]explorer.DocumentSummary, 0, len(wire.Documents))
+	for _, item := range wire.Documents {
+		documentValue, err := documentValue(item.Document)
+		if err != nil {
+			return fmt.Errorf("documents.document: %w", err)
+		}
+		revisionValue, err := revisionValue(item.Revision)
+		if err != nil {
+			return fmt.Errorf("documents.revision: %w", err)
+		}
+		documents = append(documents, explorer.DocumentSummary{
+			Document: documentValue, Revision: revisionValue, SourceURI: item.SourceURI,
+		})
+	}
+	*r = DocumentsResponse{
+		Snapshot: wire.Snapshot, Documents: documents, NextCursor: wire.NextCursor,
+	}
+	return nil
+}
+
 func (r DocumentResponse) MarshalJSON() ([]byte, error) {
 	return json.Marshal(struct {
 		Snapshot Snapshot `json:"snapshot"`
@@ -185,6 +321,41 @@ func (r DocumentResponse) MarshalJSON() ([]byte, error) {
 		Revision:  wireRevisionValue(r.Document.Revision),
 		SourceURI: r.Document.SourceURI, Root: wireSectionViewValue(r.Document.Root),
 	}})
+}
+
+func (r *DocumentResponse) UnmarshalJSON(data []byte) error {
+	var wire struct {
+		Snapshot Snapshot `json:"snapshot"`
+		Document struct {
+			Document  wireDocument    `json:"document"`
+			Revision  wireRevision    `json:"revision"`
+			SourceURI string          `json:"source_uri"`
+			Root      wireSectionView `json:"root"`
+		} `json:"document"`
+	}
+	if err := strictUnmarshal(data, &wire); err != nil {
+		return err
+	}
+	documentValue, err := documentValue(wire.Document.Document)
+	if err != nil {
+		return fmt.Errorf("document.document: %w", err)
+	}
+	revisionValue, err := revisionValue(wire.Document.Revision)
+	if err != nil {
+		return fmt.Errorf("document.revision: %w", err)
+	}
+	root, err := sectionViewValue(wire.Document.Root)
+	if err != nil {
+		return fmt.Errorf("document.root: %w", err)
+	}
+	*r = DocumentResponse{
+		Snapshot: wire.Snapshot,
+		Document: explorer.DocumentView{
+			Document: documentValue, Revision: revisionValue,
+			SourceURI: wire.Document.SourceURI, Root: root,
+		},
+	}
+	return nil
 }
 
 func (r RetrievalResponse) MarshalJSON() ([]byte, error) {
@@ -221,6 +392,64 @@ func (r RetrievalResponse) MarshalJSON() ([]byte, error) {
 	}{encodeOptionalID(r.Retrieval.RequestID), results}})
 }
 
+func (r *RetrievalResponse) UnmarshalJSON(data []byte) error {
+	var wire struct {
+		Snapshot  Snapshot `json:"snapshot"`
+		Retrieval struct {
+			RequestID string `json:"request_id,omitempty"`
+			Results   []struct {
+				ID       string      `json:"id"`
+				Score    shoal.Score `json:"score"`
+				Evidence []struct {
+					Citation wireCitation `json:"citation"`
+					Quote    string       `json:"quote"`
+					Path     wirePath     `json:"path"`
+					Score    shoal.Score  `json:"score"`
+				} `json:"evidence"`
+				Explanation *wireExplanation `json:"explanation,omitempty"`
+			} `json:"results"`
+		} `json:"retrieval"`
+	}
+	if err := strictUnmarshal(data, &wire); err != nil {
+		return err
+	}
+	requestID, err := decodeOptionalID(wire.Retrieval.RequestID)
+	if err != nil {
+		return fmt.Errorf("retrieval.request_id: %w", err)
+	}
+	results := make([]retrieval.Result, 0, len(wire.Retrieval.Results))
+	for _, item := range wire.Retrieval.Results {
+		id, err := decodeID(item.ID)
+		if err != nil {
+			return fmt.Errorf("retrieval.results.id: %w", err)
+		}
+		evidence := make([]retrieval.Evidence, 0, len(item.Evidence))
+		for _, evidenceItem := range item.Evidence {
+			citation, err := citationValue(evidenceItem.Citation)
+			if err != nil {
+				return fmt.Errorf("retrieval.results.evidence.citation: %w", err)
+			}
+			path, err := pathValue(evidenceItem.Path)
+			if err != nil {
+				return fmt.Errorf("retrieval.results.evidence.path: %w", err)
+			}
+			evidence = append(evidence, retrieval.Evidence{
+				Citation: citation, Quote: evidenceItem.Quote,
+				Path: path, Score: evidenceItem.Score,
+			})
+		}
+		results = append(results, retrieval.Result{
+			ID: id, Score: item.Score, Evidence: evidence,
+			Explanation: explanationValue(item.Explanation),
+		})
+	}
+	*r = RetrievalResponse{
+		Snapshot:  wire.Snapshot,
+		Retrieval: retrieval.Response{RequestID: requestID, Results: results},
+	}
+	return nil
+}
+
 func (r NeighborhoodResponse) MarshalJSON() ([]byte, error) {
 	return json.Marshal(struct {
 		Snapshot     Snapshot `json:"snapshot"`
@@ -230,11 +459,48 @@ func (r NeighborhoodResponse) MarshalJSON() ([]byte, error) {
 	}{r.Snapshot, wireNeighborhoodValue(r.Neighborhood), r.Truncated, r.NextCursor})
 }
 
+func (r *NeighborhoodResponse) UnmarshalJSON(data []byte) error {
+	var wire struct {
+		Snapshot     Snapshot         `json:"snapshot"`
+		Neighborhood wireNeighborhood `json:"neighborhood"`
+		Truncated    bool             `json:"truncated"`
+		NextCursor   string           `json:"next_cursor,omitempty"`
+	}
+	if err := strictUnmarshal(data, &wire); err != nil {
+		return err
+	}
+	neighborhood, err := neighborhoodValue(wire.Neighborhood)
+	if err != nil {
+		return err
+	}
+	*r = NeighborhoodResponse{
+		Snapshot: wire.Snapshot, Neighborhood: neighborhood,
+		Truncated: wire.Truncated, NextCursor: wire.NextCursor,
+	}
+	return nil
+}
+
 func (r PathResponse) MarshalJSON() ([]byte, error) {
 	return json.Marshal(struct {
 		Snapshot Snapshot `json:"snapshot"`
 		Path     wirePath `json:"path"`
 	}{r.Snapshot, wirePathValue(r.Path)})
+}
+
+func (r *PathResponse) UnmarshalJSON(data []byte) error {
+	var wire struct {
+		Snapshot Snapshot `json:"snapshot"`
+		Path     wirePath `json:"path"`
+	}
+	if err := strictUnmarshal(data, &wire); err != nil {
+		return err
+	}
+	path, err := pathValue(wire.Path)
+	if err != nil {
+		return err
+	}
+	*r = PathResponse{Snapshot: wire.Snapshot, Path: path}
+	return nil
 }
 
 func (r *DocumentRequest) UnmarshalJSON(data []byte) error {
@@ -398,7 +664,7 @@ func wireSpanValue(value document.Span) wireSpan {
 	}
 }
 
-func wireNeighborhoodValue(value explorer.Neighborhood) any {
+func wireNeighborhoodValue(value explorer.Neighborhood) wireNeighborhood {
 	nodes := make([]wireNode, 0, len(value.Nodes))
 	edges := make([]wireEdge, 0, len(value.Edges))
 	for _, node := range value.Nodes {
@@ -407,10 +673,7 @@ func wireNeighborhoodValue(value explorer.Neighborhood) any {
 	for _, edge := range value.Edges {
 		edges = append(edges, wireEdgeValue(edge))
 	}
-	return struct {
-		Nodes []wireNode `json:"nodes"`
-		Edges []wireEdge `json:"edges"`
-	}{nodes, edges}
+	return wireNeighborhood{Nodes: nodes, Edges: edges}
 }
 
 func wirePathValue(value graph.Path) wirePath {
@@ -440,17 +703,11 @@ func wireEdgeValue(value graph.Edge) wireEdge {
 	}
 }
 
-func wireCitationValue(value document.Citation) any {
-	return struct {
-		DocumentID string    `json:"document_id"`
-		RevisionID string    `json:"revision_id"`
-		SectionID  string    `json:"section_id,omitempty"`
-		SpanID     string    `json:"span_id,omitempty"`
-		Range      wireRange `json:"range"`
-	}{
-		encodeID(value.DocumentID), encodeID(value.RevisionID),
-		encodeOptionalID(value.SectionID), encodeOptionalID(value.SpanID),
-		wireRangeValue(value.Range),
+func wireCitationValue(value document.Citation) wireCitation {
+	return wireCitation{
+		DocumentID: encodeID(value.DocumentID), RevisionID: encodeID(value.RevisionID),
+		SectionID: encodeOptionalID(value.SectionID),
+		SpanID:    encodeOptionalID(value.SpanID), Range: wireRangeValue(value.Range),
 	}
 }
 
@@ -484,6 +741,271 @@ func wireMetadataValue(value shoal.Metadata) wireMetadata {
 		})
 	}
 	return metadata
+}
+
+func documentValue(value wireDocument) (document.Document, error) {
+	id, err := decodeID(value.ID)
+	if err != nil {
+		return document.Document{}, fmt.Errorf("id: %w", err)
+	}
+	revisionID, err := decodeID(value.RevisionID)
+	if err != nil {
+		return document.Document{}, fmt.Errorf("revision_id: %w", err)
+	}
+	rootSectionID, err := decodeID(value.RootSectionID)
+	if err != nil {
+		return document.Document{}, fmt.Errorf("root_section_id: %w", err)
+	}
+	metadata, err := metadataValue(value.Metadata)
+	if err != nil {
+		return document.Document{}, fmt.Errorf("metadata: %w", err)
+	}
+	return document.Document{
+		ID: id, RevisionID: revisionID, Title: value.Title,
+		RootSectionID: rootSectionID, Metadata: metadata,
+	}, nil
+}
+
+func revisionValue(value wireRevision) (document.Revision, error) {
+	id, err := decodeID(value.ID)
+	if err != nil {
+		return document.Revision{}, fmt.Errorf("id: %w", err)
+	}
+	documentID, err := decodeID(value.DocumentID)
+	if err != nil {
+		return document.Revision{}, fmt.Errorf("document_id: %w", err)
+	}
+	metadata, err := metadataValue(value.Metadata)
+	if err != nil {
+		return document.Revision{}, fmt.Errorf("metadata: %w", err)
+	}
+	return document.Revision{
+		ID: id, DocumentID: documentID, CreatedAt: value.CreatedAt,
+		SourceVersion: value.SourceVersion, Metadata: metadata,
+	}, nil
+}
+
+func sectionViewValue(value wireSectionView) (explorer.SectionView, error) {
+	section, err := sectionValue(value.Section)
+	if err != nil {
+		return explorer.SectionView{}, fmt.Errorf("section: %w", err)
+	}
+	spans := make([]document.Span, 0, len(value.Spans))
+	for _, item := range value.Spans {
+		span, err := spanValue(item)
+		if err != nil {
+			return explorer.SectionView{}, fmt.Errorf("spans: %w", err)
+		}
+		spans = append(spans, span)
+	}
+	children := make([]explorer.SectionView, 0, len(value.Children))
+	for _, item := range value.Children {
+		child, err := sectionViewValue(item)
+		if err != nil {
+			return explorer.SectionView{}, fmt.Errorf("children: %w", err)
+		}
+		children = append(children, child)
+	}
+	return explorer.SectionView{Section: section, Spans: spans, Children: children}, nil
+}
+
+func sectionValue(value wireSection) (document.Section, error) {
+	id, err := decodeID(value.ID)
+	if err != nil {
+		return document.Section{}, fmt.Errorf("id: %w", err)
+	}
+	documentID, err := decodeID(value.DocumentID)
+	if err != nil {
+		return document.Section{}, fmt.Errorf("document_id: %w", err)
+	}
+	revisionID, err := decodeID(value.RevisionID)
+	if err != nil {
+		return document.Section{}, fmt.Errorf("revision_id: %w", err)
+	}
+	parentID, err := decodeOptionalID(value.ParentID)
+	if err != nil {
+		return document.Section{}, fmt.Errorf("parent_id: %w", err)
+	}
+	metadata, err := metadataValue(value.Metadata)
+	if err != nil {
+		return document.Section{}, fmt.Errorf("metadata: %w", err)
+	}
+	return document.Section{
+		ID: id, DocumentID: documentID, RevisionID: revisionID,
+		ParentID: parentID, Order: value.Order, Heading: value.Heading,
+		Range: sourceRangeValue(value.Range), Metadata: metadata,
+	}, nil
+}
+
+func spanValue(value wireSpan) (document.Span, error) {
+	id, err := decodeID(value.ID)
+	if err != nil {
+		return document.Span{}, fmt.Errorf("id: %w", err)
+	}
+	documentID, err := decodeID(value.DocumentID)
+	if err != nil {
+		return document.Span{}, fmt.Errorf("document_id: %w", err)
+	}
+	revisionID, err := decodeID(value.RevisionID)
+	if err != nil {
+		return document.Span{}, fmt.Errorf("revision_id: %w", err)
+	}
+	sectionID, err := decodeID(value.SectionID)
+	if err != nil {
+		return document.Span{}, fmt.Errorf("section_id: %w", err)
+	}
+	metadata, err := metadataValue(value.Metadata)
+	if err != nil {
+		return document.Span{}, fmt.Errorf("metadata: %w", err)
+	}
+	return document.Span{
+		ID: id, DocumentID: documentID, RevisionID: revisionID,
+		SectionID: sectionID, Order: value.Order, Range: sourceRangeValue(value.Range),
+		Text: value.Text, Metadata: metadata,
+	}, nil
+}
+
+func neighborhoodValue(value wireNeighborhood) (explorer.Neighborhood, error) {
+	nodes := make([]graph.Node, 0, len(value.Nodes))
+	for _, item := range value.Nodes {
+		node, err := nodeValue(item)
+		if err != nil {
+			return explorer.Neighborhood{}, fmt.Errorf("nodes: %w", err)
+		}
+		nodes = append(nodes, node)
+	}
+	edges := make([]graph.Edge, 0, len(value.Edges))
+	for _, item := range value.Edges {
+		edge, err := edgeValue(item)
+		if err != nil {
+			return explorer.Neighborhood{}, fmt.Errorf("edges: %w", err)
+		}
+		edges = append(edges, edge)
+	}
+	return explorer.Neighborhood{Nodes: nodes, Edges: edges}, nil
+}
+
+func pathValue(value wirePath) (graph.Path, error) {
+	nodes := make([]graph.Node, 0, len(value.Nodes))
+	for _, item := range value.Nodes {
+		node, err := nodeValue(item)
+		if err != nil {
+			return graph.Path{}, fmt.Errorf("nodes: %w", err)
+		}
+		nodes = append(nodes, node)
+	}
+	edges := make([]graph.Edge, 0, len(value.Edges))
+	for _, item := range value.Edges {
+		edge, err := edgeValue(item)
+		if err != nil {
+			return graph.Path{}, fmt.Errorf("edges: %w", err)
+		}
+		edges = append(edges, edge)
+	}
+	return graph.Path{Nodes: nodes, Edges: edges}, nil
+}
+
+func nodeValue(value wireNode) (graph.Node, error) {
+	id, err := decodeID(value.ID)
+	if err != nil {
+		return graph.Node{}, fmt.Errorf("id: %w", err)
+	}
+	metadata, err := metadataValue(value.Properties)
+	if err != nil {
+		return graph.Node{}, fmt.Errorf("properties: %w", err)
+	}
+	return graph.Node{
+		ID: id, Kind: value.Kind, Labels: value.Labels, Properties: metadata,
+	}, nil
+}
+
+func edgeValue(value wireEdge) (graph.Edge, error) {
+	id, err := decodeID(value.ID)
+	if err != nil {
+		return graph.Edge{}, fmt.Errorf("id: %w", err)
+	}
+	from, err := decodeID(value.From)
+	if err != nil {
+		return graph.Edge{}, fmt.Errorf("from: %w", err)
+	}
+	to, err := decodeID(value.To)
+	if err != nil {
+		return graph.Edge{}, fmt.Errorf("to: %w", err)
+	}
+	metadata, err := metadataValue(value.Properties)
+	if err != nil {
+		return graph.Edge{}, fmt.Errorf("properties: %w", err)
+	}
+	return graph.Edge{
+		ID: id, From: from, To: to, Type: value.Type,
+		Weight: value.Weight, Properties: metadata,
+	}, nil
+}
+
+func citationValue(value wireCitation) (document.Citation, error) {
+	documentID, err := decodeID(value.DocumentID)
+	if err != nil {
+		return document.Citation{}, fmt.Errorf("document_id: %w", err)
+	}
+	revisionID, err := decodeID(value.RevisionID)
+	if err != nil {
+		return document.Citation{}, fmt.Errorf("revision_id: %w", err)
+	}
+	sectionID, err := decodeOptionalID(value.SectionID)
+	if err != nil {
+		return document.Citation{}, fmt.Errorf("section_id: %w", err)
+	}
+	spanID, err := decodeOptionalID(value.SpanID)
+	if err != nil {
+		return document.Citation{}, fmt.Errorf("span_id: %w", err)
+	}
+	return document.Citation{
+		DocumentID: documentID, RevisionID: revisionID,
+		SectionID: sectionID, SpanID: spanID,
+		Range: sourceRangeValue(value.Range),
+	}, nil
+}
+
+func sourceRangeValue(value wireRange) document.SourceRange {
+	return document.SourceRange{
+		Start: document.SourcePosition{
+			Offset: value.Start.Offset, Page: value.Start.Page,
+		},
+		End: document.SourcePosition{
+			Offset: value.End.Offset, Page: value.End.Page,
+		},
+	}
+}
+
+func explanationValue(value *wireExplanation) *retrieval.Explanation {
+	if value == nil {
+		return nil
+	}
+	return &retrieval.Explanation{
+		Modes: value.Modes, Summary: value.Summary, Scores: value.Scores,
+	}
+}
+
+func metadataValue(value wireMetadata) (shoal.Metadata, error) {
+	if len(value) == 0 {
+		return nil, nil
+	}
+	metadata := make(shoal.Metadata, len(value))
+	for _, item := range value {
+		key, err := base64.RawURLEncoding.DecodeString(item.Key)
+		if err != nil {
+			return nil, fmt.Errorf("key must be unpadded base64url")
+		}
+		decodedValue, err := base64.RawURLEncoding.DecodeString(item.Value)
+		if err != nil {
+			return nil, fmt.Errorf("value must be unpadded base64url")
+		}
+		if _, duplicate := metadata[string(key)]; duplicate {
+			return nil, fmt.Errorf("metadata contains duplicate keys")
+		}
+		metadata[string(key)] = string(decodedValue)
+	}
+	return metadata, nil
 }
 
 func encodeID(value shoal.ID) string {

@@ -75,6 +75,16 @@ go run ./cmd/shoal-explore-web \
   -listen 127.0.0.1:8080
 ```
 
+The same browser contract can also be served through another Explorer web API
+endpoint without exposing storage or node topology to the browser:
+
+```bash
+go run ./cmd/shoal-explore-web \
+  -backend remote \
+  -remote http://127.0.0.1:8081 \
+  -listen 127.0.0.1:8080
+```
+
 Open <http://127.0.0.1:8080>. The workspace lists and pages documents,
 preserves the authored hierarchy, retrieves exact revision/span citations and
 score explanations, and provides an interactive bounded graph canvas with
@@ -87,9 +97,10 @@ contract. Requests and responses carry a snapshot ID and `as_of` value;
 document pages use snapshot-bound cursors, and the server enforces retrieval
 top-k plus graph depth, fanout, and node bounds. Opaque Shoal IDs use
 unpadded base64url on the HTTP wire so every valid ID round-trips. The first
-backend adapts the embedded `pkg/explorer` client, while the service boundary
-is independent of HTTP and embedded storage so a distributed backend can
-implement the same contract later.
+backend adapts the embedded `pkg/explorer` client; the remote backend proxies
+the same contract, negotiates logical feature capabilities via `/api/v1/meta`,
+advertises the aggregate JSON response budget as `max_response_bytes`, and
+keeps unsupported-feature decisions server-side.
 
 ### Trees, graphs, and vectors are complementary
 
