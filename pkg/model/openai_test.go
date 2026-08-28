@@ -169,6 +169,7 @@ func TestOpenAICredentialFailuresAreRedacted(t *testing.T) {
 		staticCredential("line\r\nbreak"),
 		staticCredential("control\x01byte"),
 		staticCredential("delete\x7fbyte"),
+		staticCredential(strings.Repeat("x", maxCredentialBytes+1)),
 	}
 	for i, resolver := range tests {
 		cfg := openAITestConfig(server)
@@ -360,6 +361,7 @@ func TestOpenAIEmbeddingValidation(t *testing.T) {
 		{name: "empty data", body: `{"data":[]}`, want: ErrMalformedResponse},
 		{name: "multiple embeddings", body: `{"data":[{"embedding":[1],"index":0},{"embedding":[2],"index":1}]}`, want: ErrMalformedResponse},
 		{name: "wrong index", body: `{"data":[{"embedding":[1],"index":1}]}`, want: ErrMalformedResponse},
+		{name: "missing index", body: `{"data":[{"embedding":[1]}]}`, want: ErrMalformedResponse},
 		{name: "empty vector", body: `{"data":[{"embedding":[],"index":0}]}`, want: ErrMalformedResponse},
 		{name: "null vector value", body: `{"data":[{"embedding":[null],"index":0}]}`, want: ErrMalformedResponse},
 		{name: "oversized vector", body: `{"data":[{"embedding":[1,2],"index":0}]}`, dimensions: 1, want: ErrOversizedResponse},

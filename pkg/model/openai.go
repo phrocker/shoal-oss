@@ -174,14 +174,15 @@ func (o *OpenAIEmbedder) Embed(ctx context.Context, req EmbedRequest) (EmbedResu
 	var out struct {
 		Data []struct {
 			Embedding []strictFloat64 `json:"embedding"`
-			Index     int             `json:"index"`
+			Index     *int            `json:"index"`
 		} `json:"data"`
 		Usage openAIUsage `json:"usage"`
 	}
 	if err := o.client.post(ctx, openAIEmbeddingPath, op, payload, &out); err != nil {
 		return EmbedResult{}, err
 	}
-	if len(out.Data) != 1 || out.Data[0].Index != 0 || len(out.Data[0].Embedding) == 0 {
+	if len(out.Data) != 1 || out.Data[0].Index == nil || *out.Data[0].Index != 0 ||
+		len(out.Data[0].Embedding) == 0 {
 		return EmbedResult{}, &Error{Kind: ErrMalformedResponse, Operation: op, Detail: "expected exactly one non-empty embedding"}
 	}
 	if len(out.Data[0].Embedding) > o.client.maxVectorDimensions {
@@ -367,6 +368,9 @@ func (o *openAIClient) post(ctx context.Context, path, op string, payload, out i
 		if ctx.Err() != nil || callCtx.Err() != nil {
 			return classifyTransportError(ctx, callCtx, op, err)
 		}
+		return &Error{Kind: ErrCredential, Operation: op}
+	}
+	if len(resolved) > maxCredentialBytes {
 		return &Error{Kind: ErrCredential, Operation: op}
 	}
 	credential := append([]byte(nil), resolved...)
