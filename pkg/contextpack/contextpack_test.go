@@ -60,7 +60,7 @@ func TestBuildFromEmbeddedExplorerExactEvidenceAndDeterminism(t *testing.T) {
 		first.Authorization().Fingerprint() != pins.Authorization.Fingerprint() {
 		t.Fatal("pack lost snapshot or authorization identity")
 	}
-	if first.Metadata()[metadataRequestKey] != string(response.RequestID) {
+	if first.Metadata()[metadataRequestKey] != encodeID(response.RequestID) {
 		t.Fatal("pack lost retrieval request identity")
 	}
 
@@ -296,6 +296,47 @@ func TestRetrievalIdentityPreservesOpaqueIDs(t *testing.T) {
 	}
 }
 
+func TestOpaquePinAndRequestIDsRemainLosslessMetadata(t *testing.T) {
+	client, request, response, pins := embeddedFixture(t)
+	response.RequestID = shoal.ID("\xff")
+	pins.PolicyID = shoal.ID("\xfe")
+	pack, err := (Builder{Reader: client}).Build(context.Background(), InitialRequest{
+		Request: request, Response: response, Pins: pins,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pack.Metadata()[metadataRequestKey] != "hex:ff" ||
+		pack.Metadata()[metadataPolicyKey] != "hex:fe" {
+		t.Fatal("opaque IDs were not preserved with an ASCII encoding")
+	}
+}
+
+func TestFollowUpCanonicalizesGraphLabels(t *testing.T) {
+	pins := testPins(t)
+	node := graph.Node{ID: "node", Labels: []string{"z", "a"}}
+	anchor, err := inference.NewGraphAnchor(graph.Path{Nodes: []graph.Node{node}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pack, err := inference.NewContextPack(
+		"query", []inference.EvidenceAnchor{anchor}, nil,
+		pins.Snapshot, pins.Authorization,
+		shoal.Metadata{metadataPolicyKey: encodeID(pins.PolicyID)},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader := &recordingReader{
+		neighborhood: explorer.Neighborhood{Nodes: []graph.Node{node}},
+	}
+	if _, err := (Builder{Reader: reader}).ExpandNeighbors(
+		context.Background(), pack, ExpandNeighborsRequest{NodeIDs: []shoal.ID{node.ID}},
+	); err != nil {
+		t.Fatalf("canonical graph labels rejected during follow-up: %v", err)
+	}
+}
+
 func TestBoundsFailClosed(t *testing.T) {
 	client, request, response, pins := embeddedFixture(t)
 	if len(response.Results) < 2 {
@@ -522,6 +563,12 @@ func embeddedFixture(
 	if len(response.Results) < 2 {
 		t.Fatalf("retrieval returned %d results", len(response.Results))
 	}
+	pins := testPins(t)
+	return client, request, response, pins
+}
+
+func testPins(t *testing.T) Pins {
+	t.Helper()
 	snapshot, err := inference.NewSnapshotPin(
 		"snapshot:test", time.Date(2026, 8, 28, 10, 5, 0, 0, time.UTC))
 	if err != nil {
@@ -532,7 +579,7 @@ func embeddedFixture(
 	if err != nil {
 		t.Fatal(err)
 	}
-	return client, request, response, Pins{
+	return Pins{
 		Snapshot: snapshot, Authorization: auth, PolicyID: "policy:test",
 	}
 }

@@ -465,7 +465,10 @@ func (v *verifier) graphAnchor(path graph.Path) (inference.EvidenceAnchor, error
 	}
 	missing := false
 	nodeIDs := make([]shoal.ID, 0, len(path.Nodes))
-	for _, node := range path.Nodes {
+	path = clonePath(path)
+	for index, node := range path.Nodes {
+		node = canonicalNode(node)
+		path.Nodes[index] = node
 		nodeIDs = append(nodeIDs, node.ID)
 		if existing, ok := v.nodes[node.ID]; !ok || !canonicalEqual(existing, node) {
 			missing = true
@@ -564,6 +567,7 @@ func (v *verifier) addNeighborhood(neighborhood explorer.Neighborhood) error {
 		if err := node.Validate(); err != nil {
 			return err
 		}
+		node = canonicalNode(node)
 		if existing, ok := localNodes[node.ID]; ok {
 			if !canonicalEqual(existing, node) {
 				return invalid("duplicate hydrated graph node has different content")
@@ -837,9 +841,9 @@ func provenanceMetadata(
 		return nil, err
 	}
 	metadata[metadataBuilderKey] = builderVersion
-	metadata[metadataRequestKey] = string(response.RequestID)
+	metadata[metadataRequestKey] = encodeID(response.RequestID)
 	metadata[metadataRetrievalKey] = identity
-	metadata[metadataPolicyKey] = string(policyID)
+	metadata[metadataPolicyKey] = encodeID(policyID)
 	if metadataBytes(metadata) > limits.MaxProvenanceBytes {
 		return nil, invalid("context metadata and provenance exceed the byte bound")
 	}
@@ -1184,6 +1188,12 @@ func cloneNode(node graph.Node) graph.Node {
 	return node
 }
 
+func canonicalNode(node graph.Node) graph.Node {
+	node = cloneNode(node)
+	sort.Strings(node.Labels)
+	return node
+}
+
 func cloneEdge(edge graph.Edge) graph.Edge {
 	edge.Properties = cloneMetadata(edge.Properties)
 	return edge
@@ -1357,6 +1367,10 @@ func writeMetadata(writer hash.Hash, metadata shoal.Metadata) {
 		writePart(writer, []byte(key))
 		writePart(writer, []byte(metadata[key]))
 	}
+}
+
+func encodeID(id shoal.ID) string {
+	return "hex:" + hex.EncodeToString([]byte(id))
 }
 
 func rangeContains(outer, inner document.SourceRange) bool {
