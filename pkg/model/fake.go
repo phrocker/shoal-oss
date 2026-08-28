@@ -9,7 +9,10 @@ import (
 	"strings"
 )
 
-const DefaultFakeDimensions = 16
+const (
+	DefaultFakeDimensions = 16
+	maxFakeWorkBytes      = 64 << 20
+)
 
 type FakeGenerator struct {
 	Model string
@@ -32,13 +35,17 @@ func (f FakeGenerator) Generate(ctx context.Context, req GenerateRequest) (Gener
 		name = "deterministic"
 	}
 	text := strings.Join(parts, ",")
+	outputTokens := tokenEstimate(text)
+	if req.MaxOutputTokens > 0 && outputTokens > req.MaxOutputTokens {
+		return GenerateResult{}, &Error{Kind: ErrOversizedResponse, Operation: "fake generate"}
+	}
 	return GenerateResult{
 		Text:       text,
 		Provenance: Provenance{Provider: "fake", Model: name},
 		Usage: Usage{
 			InputTokens:  tokenEstimate(req.Prompt),
-			OutputTokens: tokenEstimate(text),
-			TotalTokens:  tokenEstimate(req.Prompt) + tokenEstimate(text),
+			OutputTokens: outputTokens,
+			TotalTokens:  tokenEstimate(req.Prompt) + outputTokens,
 		},
 	}, nil
 }
@@ -62,9 +69,18 @@ func (f FakeEmbedder) Embed(ctx context.Context, req EmbedRequest) (EmbedResult,
 	if dim < 0 || dim > MaxVectorDimensions {
 		return EmbedResult{}, &Error{Kind: ErrInvalidConfig, Operation: "fake embed"}
 	}
+	workPerDimension := len(req.Text) + 32
+	if dim > maxFakeWorkBytes/workPerDimension {
+		return EmbedResult{}, &Error{Kind: ErrInvalidRequest, Operation: "fake embed"}
+	}
 	vec := make([]float32, dim)
 	text := strings.ToLower(req.Text)
 	for i := range vec {
+		if i%64 == 0 {
+			if err := ctx.Err(); err != nil {
+				return EmbedResult{}, contextError("fake embed", err)
+			}
+		}
 		h := sha256.Sum256([]byte(strconv.Itoa(i) + ":" + text))
 		bits := binary.BigEndian.Uint32(h[:4])
 		vec[i] = float32(bits%2000000)/1000000.0 - 1.0

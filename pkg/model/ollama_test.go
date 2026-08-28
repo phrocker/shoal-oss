@@ -259,6 +259,36 @@ func TestOllamaConfigAndRequestValidation(t *testing.T) {
 	}
 }
 
+func TestOllamaGenerationResponseValidation(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		want error
+	}{
+		{name: "missing response", body: `{}`, want: ErrMalformedResponse},
+		{name: "output tokens exceed request", body: `{"response":"too much","eval_count":3}`, want: ErrOversizedResponse},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_, _ = io.WriteString(w, test.body)
+			}))
+			defer server.Close()
+			generator, err := NewOllamaGenerator(OllamaConfig{
+				BaseURL: server.URL, Model: "model", HTTPClient: server.Client(),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := generator.Generate(context.Background(), GenerateRequest{
+				Prompt: "prompt", MaxOutputTokens: 2,
+			}); !errors.Is(err, test.want) {
+				t.Fatalf("error = %v, want %v", err, test.want)
+			}
+		})
+	}
+}
+
 func TestOllamaConcurrentSafetyAndResultIsolation(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.WriteString(w, `{"embedding":[1,2,3]}`)

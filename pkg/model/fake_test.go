@@ -77,3 +77,16 @@ func TestFakeCancellation(t *testing.T) {
 		t.Fatalf("error = %v, want ErrCanceled", err)
 	}
 }
+
+func TestFakeProviderBounds(t *testing.T) {
+	if _, err := (FakeGenerator{}).Generate(context.Background(), GenerateRequest{
+		Prompt: "entity", MaxOutputTokens: 1,
+	}); !errors.Is(err, ErrOversizedResponse) {
+		t.Fatalf("generator bound error = %v", err)
+	}
+	if _, err := (FakeEmbedder{Dimensions: MaxVectorDimensions}).Embed(context.Background(), EmbedRequest{
+		Text: string(make([]byte, 128)),
+	}); !errors.Is(err, ErrInvalidRequest) {
+		t.Fatalf("embedder work bound error = %v", err)
+	}
+}

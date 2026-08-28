@@ -91,21 +91,27 @@ func (o *OllamaGenerator) Generate(ctx context.Context, req GenerateRequest) (Ge
 		}{NumPredict: req.MaxOutputTokens}
 	}
 	var out struct {
-		Response        string `json:"response"`
-		PromptEvalCount int    `json:"prompt_eval_count"`
-		EvalCount       int    `json:"eval_count"`
+		Response        *string `json:"response"`
+		PromptEvalCount int     `json:"prompt_eval_count"`
+		EvalCount       int     `json:"eval_count"`
 	}
 	if err := ollamaPost(ctx, o.cfg, o.endpoint, "ollama generate", payload, &out); err != nil {
 		return GenerateResult{}, err
 	}
-	if int64(len(out.Response)) > o.cfg.MaxTextBytes {
+	if out.Response == nil {
+		return GenerateResult{}, &Error{Kind: ErrMalformedResponse, Operation: "ollama generate", Detail: "missing response"}
+	}
+	if int64(len(*out.Response)) > o.cfg.MaxTextBytes {
 		return GenerateResult{}, &Error{Kind: ErrOversizedResponse, Operation: "ollama generate"}
 	}
 	if !validUsage(out.PromptEvalCount, out.EvalCount) {
 		return GenerateResult{}, &Error{Kind: ErrMalformedResponse, Operation: "ollama generate", Detail: "invalid usage"}
 	}
+	if req.MaxOutputTokens > 0 && out.EvalCount > req.MaxOutputTokens {
+		return GenerateResult{}, &Error{Kind: ErrOversizedResponse, Operation: "ollama generate", Detail: "output token limit exceeded"}
+	}
 	return GenerateResult{
-		Text:       out.Response,
+		Text:       *out.Response,
 		Provenance: Provenance{Provider: "ollama", Model: o.cfg.Model},
 		Usage: Usage{
 			InputTokens:  nonNegative(out.PromptEvalCount),
