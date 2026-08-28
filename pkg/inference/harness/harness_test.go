@@ -120,7 +120,7 @@ func TestRejectsMalformedIDs(t *testing.T) {
 	if _, err := NewRetrieveAction("", RetrieveRequest{query: "q", limit: 1}, Usage{}); err == nil {
 		t.Fatal("empty correlation accepted")
 	}
-	if _, err := NewOpenSectionRequest("", "section"); err == nil {
+	if _, err := NewOpenSectionRequest("", "revision", "section"); err == nil {
 		t.Fatal("empty document ID accepted")
 	}
 	if _, err := NewNeighborsRequest("", 1, 1); err == nil {
@@ -286,8 +286,9 @@ func TestRejectsUnissuedCapabilitiesAndProvenance(t *testing.T) {
 	pack, initial, _ := fixture(t)
 	host := &fakeTools{pack: pack}
 	for name, action := range map[string]Action{
-		"section": mustOpen(t, "open", "document", "not-issued"),
-		"node":    mustNeighbors(t, "neighbors", "not-issued", 1, 1),
+		"section":  mustOpen(t, "open", "document", "not-issued"),
+		"revision": mustOpenRevision(t, "open-revision", "document", "stale-revision", "section-initial"),
+		"node":     mustNeighbors(t, "neighbors", "not-issued", 1, 1),
 	} {
 		t.Run(name, func(t *testing.T) {
 			_, err := newGenerator(t, NewFakeRunner(ScriptAction(action)), host).Generate(context.Background(), pack)
@@ -601,8 +602,12 @@ func mustRetrieveQueryUsage(t *testing.T, id shoal.ID, query string, limit int, 
 	return a
 }
 func mustOpen(t *testing.T, id, documentID, sectionID shoal.ID) Action {
+	return mustOpenRevision(t, id, documentID, "revision", sectionID)
+}
+
+func mustOpenRevision(t *testing.T, id, documentID, revisionID, sectionID shoal.ID) Action {
 	t.Helper()
-	req, err := NewOpenSectionRequest(documentID, sectionID)
+	req, err := NewOpenSectionRequest(documentID, revisionID, sectionID)
 	if err != nil {
 		t.Fatal(err)
 	}

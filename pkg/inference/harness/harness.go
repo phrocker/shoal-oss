@@ -86,7 +86,8 @@ func validateResultProvenance(result inference.InferenceResult, expected Provena
 func validateSectionResults(request OpenSectionRequest, anchors []inference.EvidenceAnchor) error {
 	for _, anchor := range anchors {
 		citation, _, ok := anchor.Document()
-		if !ok || citation.DocumentID != request.documentID || citation.SectionID != request.sectionID {
+		if !ok || citation.DocumentID != request.documentID ||
+			citation.RevisionID != request.revisionID || citation.SectionID != request.sectionID {
 			return invalid("open_section result does not match the requested section")
 		}
 	}
@@ -107,7 +108,8 @@ func validateNeighborResults(request NeighborsRequest, anchors []inference.Evide
 func sectionAllowed(pack inference.ContextPack, request OpenSectionRequest) bool {
 	for _, anchor := range pack.Evidence() {
 		citation, _, ok := anchor.Document()
-		if ok && citation.DocumentID == request.documentID && citation.SectionID == request.sectionID {
+		if ok && citation.DocumentID == request.documentID &&
+			citation.RevisionID == request.revisionID && citation.SectionID == request.sectionID {
 			return true
 		}
 	}
@@ -233,19 +235,24 @@ func (r RetrieveRequest) Limit() int    { return r.limit }
 
 type OpenSectionRequest struct {
 	documentID shoal.ID
+	revisionID shoal.ID
 	sectionID  shoal.ID
 }
 
-func NewOpenSectionRequest(documentID, sectionID shoal.ID) (OpenSectionRequest, error) {
+func NewOpenSectionRequest(documentID, revisionID, sectionID shoal.ID) (OpenSectionRequest, error) {
 	if err := validateLogicalID("document ID", documentID); err != nil {
+		return OpenSectionRequest{}, err
+	}
+	if err := validateLogicalID("revision ID", revisionID); err != nil {
 		return OpenSectionRequest{}, err
 	}
 	if err := validateLogicalID("section ID", sectionID); err != nil {
 		return OpenSectionRequest{}, err
 	}
-	return OpenSectionRequest{documentID: documentID, sectionID: sectionID}, nil
+	return OpenSectionRequest{documentID: documentID, revisionID: revisionID, sectionID: sectionID}, nil
 }
 func (r OpenSectionRequest) DocumentID() shoal.ID { return r.documentID }
+func (r OpenSectionRequest) RevisionID() shoal.ID { return r.revisionID }
 func (r OpenSectionRequest) SectionID() shoal.ID  { return r.sectionID }
 
 type NeighborsRequest struct {
@@ -327,7 +334,7 @@ func (a Action) validate() error {
 			return err
 		}
 	case ActionOpenSection:
-		if _, err := NewOpenSectionRequest(a.open.documentID, a.open.sectionID); err != nil {
+		if _, err := NewOpenSectionRequest(a.open.documentID, a.open.revisionID, a.open.sectionID); err != nil {
 			return err
 		}
 	case ActionNeighbors:
@@ -777,7 +784,7 @@ func actionKey(a Action) string {
 	case ActionRetrieve:
 		return framed(string(a.kind), a.retrieve.query, strconv.Itoa(a.retrieve.limit))
 	case ActionOpenSection:
-		return framed(string(a.kind), string(a.open.documentID), string(a.open.sectionID))
+		return framed(string(a.kind), string(a.open.documentID), string(a.open.revisionID), string(a.open.sectionID))
 	case ActionNeighbors:
 		return framed(string(a.kind), string(a.neighbors.nodeID), strconv.Itoa(a.neighbors.hops), strconv.Itoa(a.neighbors.fanout))
 	default:
