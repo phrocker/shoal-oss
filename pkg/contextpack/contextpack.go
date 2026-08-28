@@ -280,7 +280,11 @@ func (b Builder) OpenSection(
 	if err != nil {
 		return inference.ContextPack{}, err
 	}
-	anchors := pack.Evidence()
+	anchors, err := canonicalAnchors(pack.Evidence(), limits.MaxAnchors)
+	if err != nil {
+		return inference.ContextPack{}, err
+	}
+	anchorIDs := anchorMap(anchors)
 	for _, sectionID := range selected {
 		for _, span := range index.spansBySection[sectionID] {
 			if len(span.Text) == 0 {
@@ -297,12 +301,10 @@ func (b Builder) OpenSection(
 			if err != nil {
 				return inference.ContextPack{}, err
 			}
-			anchors = append(anchors, anchor)
+			if err := appendAnchor(&anchors, anchorIDs, anchor, limits.MaxAnchors); err != nil {
+				return inference.ContextPack{}, err
+			}
 		}
-	}
-	anchors, err = canonicalAnchors(anchors, limits.MaxAnchors)
-	if err != nil {
-		return inference.ContextPack{}, err
 	}
 	return rebuildPack(ctx, pack, anchors, limits, b.TokenEstimator)
 }
@@ -353,7 +355,11 @@ func (b Builder) ExpandNeighbors(
 	if err := verifier.verifyExisting(pack.Evidence()); err != nil {
 		return inference.ContextPack{}, err
 	}
-	anchors := pack.Evidence()
+	anchors, err := canonicalAnchors(pack.Evidence(), limits.MaxAnchors)
+	if err != nil {
+		return inference.ContextPack{}, err
+	}
+	anchorIDs := anchorMap(anchors)
 	for _, seed := range normalized.NodeIDs {
 		node, ok := verifier.nodes[seed]
 		if !ok {
@@ -363,7 +369,9 @@ func (b Builder) ExpandNeighbors(
 		if err != nil {
 			return inference.ContextPack{}, err
 		}
-		anchors = append(anchors, anchor)
+		if err := appendAnchor(&anchors, anchorIDs, anchor, limits.MaxAnchors); err != nil {
+			return inference.ContextPack{}, err
+		}
 	}
 	for _, edge := range sortedEdges(neighborhood.Edges) {
 		from, fromOK := verifier.nodes[edge.From]
@@ -378,11 +386,9 @@ func (b Builder) ExpandNeighbors(
 		if err != nil {
 			return inference.ContextPack{}, err
 		}
-		anchors = append(anchors, anchor)
-	}
-	anchors, err = canonicalAnchors(anchors, limits.MaxAnchors)
-	if err != nil {
-		return inference.ContextPack{}, err
+		if err := appendAnchor(&anchors, anchorIDs, anchor, limits.MaxAnchors); err != nil {
+			return inference.ContextPack{}, err
+		}
 	}
 	return rebuildPack(ctx, pack, anchors, limits, b.TokenEstimator)
 }
@@ -422,6 +428,9 @@ func newVerifier(
 		documents: make(map[documentKey]*documentIndex),
 		nodes:     make(map[shoal.ID]graph.Node),
 		edges:     make(map[shoal.ID]graph.Edge),
+	}
+	if len(views) > limits.MaxDocuments {
+		return nil, invalid("hydrated documents exceed the document bound")
 	}
 	for _, view := range views {
 		if err := v.addDocument(view); err != nil {
@@ -558,7 +567,8 @@ func (v *verifier) verifyExisting(anchors []inference.EvidenceAnchor) error {
 }
 
 func (v *verifier) addDocument(view explorer.DocumentView) error {
-	index, err := indexDocument(view)
+	remaining := v.limits.MaxSections - v.sections
+	index, err := indexDocument(view, remaining)
 	if err != nil {
 		return err
 	}
@@ -642,7 +652,7 @@ func (v *verifier) addNeighborhood(neighborhood explorer.Neighborhood) error {
 	return nil
 }
 
-func indexDocument(view explorer.DocumentView) (*documentIndex, error) {
+func indexDocument(view explorer.DocumentView, maxSections int) (*documentIndex, error) {
 	if err := view.Document.Validate(); err != nil {
 		return nil, err
 	}
@@ -652,6 +662,9 @@ func indexDocument(view explorer.DocumentView) (*documentIndex, error) {
 	if view.Document.RevisionID != view.Revision.ID ||
 		view.Revision.DocumentID != view.Document.ID {
 		return nil, invalid("hydrated document and revision ownership do not match")
+	}
+	if maxSections <= 0 || sectionViewCountExceeds(view.Root, maxSections) {
+		return nil, invalid("hydrated documents exceed the section bound")
 	}
 	index := &documentIndex{
 		view:           cloneView(view),
@@ -1080,6 +1093,34 @@ func canonicalAnchors(
 	return result, nil
 }
 
+func anchorMap(anchors []inference.EvidenceAnchor) map[shoal.ID]inference.EvidenceAnchor {
+	result := make(map[shoal.ID]inference.EvidenceAnchor, len(anchors))
+	for _, anchor := range anchors {
+		result[anchor.ID()] = anchor
+	}
+	return result
+}
+
+func appendAnchor(
+	anchors *[]inference.EvidenceAnchor,
+	seen map[shoal.ID]inference.EvidenceAnchor,
+	anchor inference.EvidenceAnchor,
+	maximum int,
+) error {
+	if existing, duplicate := seen[anchor.ID()]; duplicate {
+		if !anchorsEqual(existing, anchor) {
+			return invalid("duplicate anchor identity has different content")
+		}
+		return nil
+	}
+	if len(*anchors) >= maximum {
+		return invalid("context evidence exceeds the anchor bound")
+	}
+	seen[anchor.ID()] = anchor
+	*anchors = append(*anchors, anchor)
+	return nil
+}
+
 func anchorsEqual(left, right inference.EvidenceAnchor) bool {
 	if left.ID() != right.ID() || left.Kind() != right.Kind() {
 		return false
@@ -1494,6 +1535,24 @@ func encodeID(id shoal.ID) string {
 
 func rangeContains(outer, inner document.SourceRange) bool {
 	return outer.Start.Offset <= inner.Start.Offset && inner.End.Offset <= outer.End.Offset
+}
+
+func sectionViewCountExceeds(root explorer.SectionView, maximum int) bool {
+	count := 0
+	stack := []*explorer.SectionView{&root}
+	for len(stack) > 0 {
+		last := len(stack) - 1
+		current := stack[last]
+		stack = stack[:last]
+		count++
+		if count > maximum {
+			return true
+		}
+		for index := range current.Children {
+			stack = append(stack, &current.Children[index])
+		}
+	}
+	return false
 }
 
 func pathPresent(path graph.Path) bool {

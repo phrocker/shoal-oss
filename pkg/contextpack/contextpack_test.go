@@ -254,6 +254,14 @@ func TestOpenSectionAndExpandNeighborsAreExplicitBoundedAndImmutable(t *testing.
 		SectionIDs: []shoal.ID{sectionID},
 	})
 	assertCode(t, err, shoal.ErrorInvalidArgument)
+	boundedAnchors := initial.Evidence()
+	graphAnchor, err := inference.NewGraphAnchor(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = appendAnchor(
+		&boundedAnchors, anchorMap(boundedAnchors), graphAnchor, len(boundedAnchors))
+	assertCode(t, err, shoal.ErrorInvalidArgument)
 	_, err = builder.ExpandNeighbors(context.Background(), full, ExpandNeighborsRequest{
 		NodeIDs: []shoal.ID{path.Nodes[0].ID, path.Nodes[0].ID},
 	})
