@@ -171,10 +171,35 @@ func TestDuplicateCanonicalKeysAndCanonicalOrdering(t *testing.T) {
 	duplicate := strings.Replace(validOutput(f), `"key":"acme"`, `"key":"alice"`, 1)
 	assertExtractError(t, f.request, duplicate)
 
+	duplicateNode := strings.ReplaceAll(
+		validOutput(f),
+		`"existing_node_id":""`,
+		`"existing_node_id":"`+graphNodeToken("node-1")+`"`,
+	)
+	duplicateNode = strings.ReplaceAll(
+		duplicateNode,
+		`"evidence_anchor_ids":["`+string(f.anchor.ID())+`"]`,
+		`"evidence_anchor_ids":["`+string(f.anchor.ID())+`","`+string(f.graphAnchor.ID())+`"]`,
+	)
+	assertExtractError(t, f.request, duplicateNode)
+
 	result := extractWith(t, f.request, validOutput(f))
 	plan := result.PublicationPlan()
 	if string(plan.Entities[0].ID) >= string(plan.Entities[1].ID) {
 		t.Fatal("entities are not canonically ordered")
+	}
+}
+
+func TestOntologyProvenanceUsesPromptTemplateAndHashMetadata(t *testing.T) {
+	f := newFixture(t)
+	result := extractWith(t, f.request, validOutput(f))
+	provenance := result.OntologyResult().Provenance()
+	if provenance.Prompt() != PromptTemplateID {
+		t.Fatalf("ontology prompt = %q", provenance.Prompt())
+	}
+	hash := provenance.Metadata()["prompt_hash"]
+	if !strings.HasPrefix(hash, "sha256:") {
+		t.Fatalf("ontology prompt hash metadata = %#v", provenance.Metadata()["prompt_hash"])
 	}
 }
 

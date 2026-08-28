@@ -606,8 +606,8 @@ func materialize(request Request, prompt string, mp model.Provenance, raw rawOut
 		Extractor: ExtractorName, ExtractorVersion: ExtractorVersion,
 	}
 	op, err := ontology.NewExtractionProvenance(
-		mp.Provider, mp.Model, "unspecified", hash, PromptVersion,
-		ExtractorName, ExtractorVersion, shoal.Metadata{"mode": mode},
+		mp.Provider, mp.Model, "unspecified", PromptTemplateID, PromptVersion,
+		ExtractorName, ExtractorVersion, shoal.Metadata{"mode": mode, "prompt_hash": hash},
 	)
 	if err != nil {
 		return Result{}, err
@@ -645,6 +645,7 @@ func materialize(request Request, prompt string, mp model.Provenance, raw rawOut
 	}
 
 	seenKeys := map[string]struct{}{}
+	seenEntityIDs := map[shoal.ID]string{}
 	type entityBinding struct {
 		entity     Entity
 		contractID shoal.ID
@@ -706,6 +707,13 @@ func materialize(request Request, prompt string, mp model.Provenance, raw rawOut
 			}
 			contractID = id
 		}
+		if priorKey, duplicate := seenEntityIDs[id]; duplicate {
+			return Result{}, fmt.Errorf(
+				"extraction: entity %q duplicates entity ID already bound by %q",
+				key, priorKey,
+			)
+		}
+		seenEntityIDs[id] = key
 		props, propAssertions, propClaims, err := makeProperties(
 			contractID, typeID, item.Properties, *item.Confidence, anchorIDs, refs,
 			properties, concepts[typeID].Properties(), nodeAnchors, nodeTokens,
