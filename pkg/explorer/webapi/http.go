@@ -24,6 +24,7 @@ import (
 	"errors"
 	"io"
 	"io/fs"
+	"mime"
 	"net/http"
 
 	"github.com/phrocker/shoal-oss/pkg/shoal"
@@ -105,6 +106,10 @@ func endpoint[Request any, Response any](
 }
 
 func decodeRequest(writer http.ResponseWriter, request *http.Request, value any) error {
+	mediaType, _, err := mime.ParseMediaType(request.Header.Get("Content-Type"))
+	if err != nil || mediaType != "application/json" {
+		return errors.New("content type must be application/json")
+	}
 	request.Body = http.MaxBytesReader(writer, request.Body, maxRequestBytes)
 	decoder := json.NewDecoder(request.Body)
 	decoder.DisallowUnknownFields()

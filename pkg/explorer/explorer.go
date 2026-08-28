@@ -150,14 +150,13 @@ func (e *Explorer) ingest(
 		return IngestResult{}, err
 	}
 	record := &persistedDocument{
-		Document:    parsed.document,
-		Revision:    parsed.revision,
-		Source:      parsed.source,
-		Sections:    parsed.sections,
-		Spans:       parsed.spans,
-		Nodes:       parsed.nodes,
-		Edges:       parsed.edges,
-		PublishedAt: time.Now().UTC(),
+		Document: parsed.document,
+		Revision: parsed.revision,
+		Source:   parsed.source,
+		Sections: parsed.sections,
+		Spans:    parsed.spans,
+		Nodes:    parsed.nodes,
+		Edges:    parsed.edges,
 	}
 
 	e.mu.Lock()
@@ -174,6 +173,7 @@ func (e *Explorer) ingest(
 		return IngestResult{}, shoal.NewError(
 			shoal.ErrorUnavailable, "embedded publication sequence is exhausted")
 	}
+	record.PublishedAt = time.Now().UTC()
 	// A write error can occur after the WAL append committed, so attempted
 	// publication sequences must never be reused.
 	e.lastPublicationSequence++
@@ -307,7 +307,7 @@ func (e *Explorer) Connect(ctx context.Context, edge graph.Edge) error {
 		}
 		return shoal.NewError(shoal.ErrorConflict, "edge ID already has different content")
 	}
-	record := persistedEdge{Edge: edge, PublishedAt: time.Now().UTC()}
+	record := persistedEdge{Edge: cloneEdge(edge), PublishedAt: time.Now().UTC()}
 	if err := e.writeRecord(edgeRecordRow(edge.ID), embeddedRecordEdge, record); err != nil {
 		return err
 	}

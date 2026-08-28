@@ -279,6 +279,18 @@ func TestHTTPHandlerValidationAndWorkspace(t *testing.T) {
 	}
 
 	response, err = http.Post(
+		server.URL+"/api/v1/documents", "text/plain",
+		bytes.NewBufferString(`{"page":{"limit":1}}`),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusBadRequest {
+		t.Fatalf("plain-text request status = %s", response.Status)
+	}
+
+	response, err = http.Post(
 		server.URL+"/api/v1/documents", "application/json",
 		bytes.NewBufferString(`{"page":{"limit":1},"unexpected":true}`),
 	)

@@ -165,8 +165,10 @@ function selectEvidence(result, evidence) {
 }
 
 function mergeGraph(graph) {
+  const previousNodeCount = state.nodes.size;
   for (const node of graph.nodes || []) state.nodes.set(node.id, node);
   for (const edge of graph.edges || []) state.edges.set(edge.id, edge);
+  if (state.nodes.size !== previousNodeCount) positions.clear();
   renderGraphList();
 }
 

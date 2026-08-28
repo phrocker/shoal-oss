@@ -86,8 +86,8 @@ func (e *Explorer) BoundedNeighborhood(
 	if e.graphErr != nil {
 		return BoundedNeighborhood{}, e.graphErr
 	}
-	nodes := make(map[shoal.ID]graph.Node, request.MaxNodes)
-	seen := make(map[shoal.ID]struct{}, request.MaxNodes)
+	nodes := make(map[shoal.ID]graph.Node)
+	seen := make(map[shoal.ID]struct{})
 	frontier := make([]shoal.ID, 0, len(normalized.NodeIDs))
 	for _, id := range normalized.NodeIDs {
 		node, ok := e.graphNodes[id]
