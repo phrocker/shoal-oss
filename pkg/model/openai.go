@@ -231,15 +231,16 @@ func validateOpenAIConfig(cfg OpenAIConfig, needGeneration, needEmbedding bool) 
 	organization := strings.TrimSpace(cfg.Organization)
 	project := strings.TrimSpace(cfg.Project)
 	if baseURL == "" || cfg.Credentials == nil ||
-		(needGeneration && !validHeaderValue(generationModel, maxModelBytes)) ||
-		(needEmbedding && !validHeaderValue(embeddingModel, maxModelBytes)) ||
-		(organization != "" && !validHeaderValue(organization, maxOrganizationBytes)) ||
-		(project != "" && !validHeaderValue(project, maxProjectBytes)) {
+		(needGeneration && !validConfigValue(generationModel, maxModelBytes)) ||
+		(needEmbedding && !validConfigValue(embeddingModel, maxModelBytes)) ||
+		(organization != "" && !validHTTPHeaderValue(organization, maxOrganizationBytes)) ||
+		(project != "" && !validHTTPHeaderValue(project, maxProjectBytes)) {
 		return nil, &Error{Kind: ErrInvalidConfig, Operation: op}
 	}
 	u, err := url.Parse(baseURL)
 	if err != nil || !u.IsAbs() || u.Scheme != "https" || u.Host == "" || u.User != nil ||
-		u.RawQuery != "" || u.Fragment != "" || (u.Path != "" && u.Path != "/") {
+		u.RawQuery != "" || u.ForceQuery || strings.Contains(baseURL, "#") ||
+		u.Fragment != "" || (u.Path != "" && u.Path != "/") {
 		return nil, &Error{Kind: ErrInvalidConfig, Operation: op}
 	}
 	if cfg.HTTPClient == nil {
@@ -292,8 +293,41 @@ func validateOpenAIConfig(cfg OpenAIConfig, needGeneration, needEmbedding bool) 
 	}, nil
 }
 
-func validHeaderValue(value string, limit int) bool {
-	return value != "" && len(value) <= limit && !strings.ContainsAny(value, "\r\n\x00")
+func validConfigValue(value string, limit int) bool {
+	if value == "" || len(value) > limit {
+		return false
+	}
+	for i := 0; i < len(value); i++ {
+		if value[i] < ' ' || value[i] == 0x7f {
+			return false
+		}
+	}
+	return true
+}
+
+func validHTTPHeaderValue(value string, limit int) bool {
+	if value == "" || len(value) > limit {
+		return false
+	}
+	for i := 0; i < len(value); i++ {
+		if (value[i] < ' ' && value[i] != '\t') || value[i] == 0x7f {
+			return false
+		}
+	}
+	return true
+}
+
+func validCredential(value []byte) bool {
+	if len(value) == 0 || len(value) > maxCredentialBytes ||
+		len(bytes.TrimSpace(value)) != len(value) {
+		return false
+	}
+	for _, b := range value {
+		if (b < ' ' && b != '\t') || b == 0x7f {
+			return false
+		}
+	}
+	return true
 }
 
 func (o *openAIClient) post(ctx context.Context, path, op string, payload, out interface{}) error {
@@ -316,8 +350,7 @@ func (o *openAIClient) post(ctx context.Context, path, op string, payload, out i
 	}
 	credential := append([]byte(nil), resolved...)
 	defer clear(credential)
-	if len(credential) == 0 || len(credential) > maxCredentialBytes || bytes.IndexAny(credential, "\r\n\x00") >= 0 ||
-		len(bytes.TrimSpace(credential)) != len(credential) {
+	if !validCredential(credential) {
 		return &Error{Kind: ErrCredential, Operation: op}
 	}
 

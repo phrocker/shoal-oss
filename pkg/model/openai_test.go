@@ -166,6 +166,8 @@ func TestOpenAICredentialFailuresAreRedacted(t *testing.T) {
 		staticCredential(""),
 		staticCredential(" whitespace "),
 		staticCredential("line\r\nbreak"),
+		staticCredential("control\x01byte"),
+		staticCredential("delete\x7fbyte"),
 	}
 	for i, resolver := range tests {
 		cfg := openAITestConfig(server)
@@ -406,8 +408,12 @@ func TestOpenAIConfigAndRequestValidation(t *testing.T) {
 		func() OpenAIConfig { c := base; c.BaseURL = "http://example.com"; return c }(),
 		func() OpenAIConfig { c := base; c.BaseURL += "/prefix"; return c }(),
 		func() OpenAIConfig { c := base; c.BaseURL += "?query=1"; return c }(),
+		func() OpenAIConfig { c := base; c.BaseURL += "?"; return c }(),
+		func() OpenAIConfig { c := base; c.BaseURL += "#"; return c }(),
 		func() OpenAIConfig { c := base; c.GenerationModel = ""; return c }(),
 		func() OpenAIConfig { c := base; c.Organization = "bad\r\nheader"; return c }(),
+		func() OpenAIConfig { c := base; c.Organization = "bad\x01header"; return c }(),
+		func() OpenAIConfig { c := base; c.Project = "bad\x7fheader"; return c }(),
 		func() OpenAIConfig { c := base; c.Credentials = nil; return c }(),
 	}
 	for i, cfg := range tests {
