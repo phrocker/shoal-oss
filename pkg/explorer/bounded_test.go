@@ -149,6 +149,31 @@ func TestBoundedNeighborhoodCountsSelfEdgeOnce(t *testing.T) {
 	}
 }
 
+func TestSelfEdgeDoesNotCreateFalseContinuation(t *testing.T) {
+	edge := graph.Edge{ID: "self", From: "node", To: "node", Type: "self", Weight: 1}
+	corpus := &Explorer{
+		graphInitialized: true,
+		graphNodes: map[shoal.ID]graph.Node{
+			"node": {ID: "node"},
+		},
+		graphEdges: map[shoal.ID]graph.Edge{"self": edge},
+		outgoing:   map[shoal.ID][]shoal.ID{"node": {"self"}},
+		incoming:   map[shoal.ID][]shoal.ID{"node": {"self"}},
+	}
+	result, err := corpus.BoundedNeighborhood(
+		context.Background(),
+		BoundedNeighborhoodRequest{
+			NodeIDs: []shoal.ID{"node"}, Depth: 1, Fanout: 1, MaxNodes: 1,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Truncated || result.NextAfterEdgeID != "" {
+		t.Fatalf("self edge produced continuation: %+v", result)
+	}
+}
+
 func TestConnectClonesRetainedEdgeProperties(t *testing.T) {
 	corpus, err := Open(t.TempDir())
 	if err != nil {

@@ -162,6 +162,14 @@ func (s *EmbeddedService) Neighborhood(
 	if err != nil {
 		return NeighborhoodResponse{}, err
 	}
+	normalizedBase, err := (explorer.NeighborhoodRequest{
+		NodeIDs: request.NodeIDs, Depth: depth, EdgeTypes: request.EdgeTypes,
+	}).Normalize()
+	if err != nil {
+		return NeighborhoodResponse{}, err
+	}
+	request.NodeIDs = normalizedBase.NodeIDs
+	request.EdgeTypes = normalizedBase.EdgeTypes
 	if len(request.NodeIDs) == 0 {
 		return NeighborhoodResponse{}, shoal.NewError(
 			shoal.ErrorInvalidArgument, "at least one graph node ID is required")

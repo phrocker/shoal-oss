@@ -184,9 +184,9 @@ func (e *Explorer) boundedEdgeIDs(
 	}
 	outgoing := afterEdge(e.outgoing[nodeID], after)
 	incoming := afterEdge(e.incoming[nodeID], after)
-	result := make([]shoal.ID, 0, fanout)
+	result := make([]shoal.ID, 0)
 	left, right := 0, 0
-	for uint32(len(result)) < fanout && (left < len(outgoing) || right < len(incoming)) {
+	for uint32(len(result)) <= fanout && (left < len(outgoing) || right < len(incoming)) {
 		var next shoal.ID
 		switch {
 		case right >= len(incoming):
@@ -202,7 +202,10 @@ func (e *Explorer) boundedEdgeIDs(
 			result = append(result, next)
 		}
 	}
-	return result, left < len(outgoing) || right < len(incoming)
+	if uint32(len(result)) > fanout {
+		return result[:fanout], true
+	}
+	return result, false
 }
 
 func limitEdgeIDsAfter(values []shoal.ID, fanout uint32, after shoal.ID) ([]shoal.ID, bool) {

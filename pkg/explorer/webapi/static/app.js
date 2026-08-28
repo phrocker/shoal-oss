@@ -201,6 +201,7 @@ async function expandIDs(ids, cursor = "") {
     if (ids.length === 1) {
       if (response.next_cursor) state.graphCursors.set(ids[0], response.next_cursor);
       else state.graphCursors.delete(ids[0]);
+      updateContinueButton();
     }
     $("graph-status").textContent = response.truncated
       ? `Bounded result truncated at snapshot frontier ${response.snapshot.frontier}.`
@@ -298,7 +299,7 @@ function nodeName(node, fallback) {
 function selectNode(id) {
   state.selected = id;
   $("expand").disabled = !id;
-  $("continue-expansion").hidden = !id || !state.graphCursors.has(id);
+  updateContinueButton();
   const node = state.nodes.get(id);
   if (node) {
     $("selection").innerHTML = `<div class=kv><b>Node</b><span>${escapeHTML(id)}</span>` +
@@ -306,6 +307,11 @@ function selectNode(id) {
       `<span>${escapeHTML((node.labels || []).join(", "))}</span><b>Properties</b>` +
       `<span>${escapeHTML(JSON.stringify(node.properties || {}))}</span></div>`;
     $("path-from").value = id;
+  }
+
+  function updateContinueButton() {
+    $("continue-expansion").hidden =
+      !state.selected || !state.graphCursors.has(state.selected);
   }
   renderGraphList();
   draw();
