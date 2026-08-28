@@ -56,8 +56,9 @@ an explicit endpoint, model names, and request-time credential resolver.
 | Hierarchical document, graph, retrieval, and ontology contracts | Shipped |
 | Provider-neutral grounded inference context, evidence, claim, result, and provenance contracts | Shipped |
 | Bounded provider-neutral tool-using agent harness contract and deterministic fake | Shipped |
+| Bounded model-guided Explorer retrieval, section, and graph expansion loop with inspectable trace | Shipped |
 | Concrete Copilot/SDK agent execution backend | Not implemented |
-| Other runtime LLM orchestration and model-provider transports | Not implemented |
+| Other hosted runtime LLM orchestration backends | Not implemented |
 | Canonical bounded Explorer context construction, citation/path revalidation, and explicit section/neighbor expansion | Shipped |
 | Optional snapshot-pinned Explorer web workspace with cited retrieval and bounded graph/path exploration | Shipped |
 | Ontology-guided structured extraction, validation, stable inferred IDs, and publication planning | Shipped |

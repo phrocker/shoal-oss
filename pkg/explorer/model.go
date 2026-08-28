@@ -166,13 +166,17 @@ type Snapshot struct {
 // BoundedNeighborhoodRequest limits graph work as well as returned data.
 // Fanout caps adjacency entries examined per expanded node.
 type BoundedNeighborhoodRequest struct {
-	NodeIDs     []shoal.ID
-	Depth       uint32
-	Fanout      uint32
-	MaxNodes    uint32
-	EdgeTypes   []string
-	Direction   GraphDirection
-	AfterEdgeID shoal.ID
+	NodeIDs  []shoal.ID
+	Depth    uint32
+	Fanout   uint32
+	MaxNodes uint32
+	// MaxScannedEdges optionally caps total adjacency entries an
+	// authorization-filtering wrapper may scan to fill one authorized page.
+	// A zero value defaults to Fanout.
+	MaxScannedEdges uint32
+	EdgeTypes       []string
+	Direction       GraphDirection
+	AfterEdgeID     shoal.ID
 }
 
 // GraphDirection selects which adjacency entries consume bounded fanout.
