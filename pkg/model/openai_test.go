@@ -517,6 +517,40 @@ func TestOpenAIResultIsolationAndConcurrency(t *testing.T) {
 	}
 }
 
+type roundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripperFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return f(request)
+}
+
+func TestOpenAIRequestNotMutatedAfterTransportReturn(t *testing.T) {
+	var captured *http.Request
+	client := &http.Client{Transport: roundTripperFunc(func(request *http.Request) (*http.Response, error) {
+		captured = request
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(`{"choices":[{"message":{"content":"ok"}}],"usage":{}}`)),
+			Request:    request,
+		}, nil
+	})}
+	generator, err := NewOpenAIGenerator(OpenAIConfig{
+		BaseURL:         "https://example.com",
+		GenerationModel: "model",
+		Credentials:     staticCredential(testAPIKey),
+		HTTPClient:      client,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := generator.Generate(context.Background(), GenerateRequest{}); err != nil {
+		t.Fatal(err)
+	}
+	if captured == nil || captured.Header.Get(authorizationHeaderName) == "" {
+		t.Fatal("provider mutated a request after the transport returned")
+	}
+}
+
 func TestOpenAIInterfaces(t *testing.T) {
 	var _ TextGenerator = (*OpenAIGenerator)(nil)
 	var _ Embedder = (*OpenAIEmbedder)(nil)

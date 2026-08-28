@@ -388,7 +388,6 @@ func (o *openAIClient) post(ctx context.Context, path, op string, payload, out i
 		request.Header.Set("OpenAI-Project", o.project)
 	}
 	response, err := o.httpClient.Do(request)
-	request.Header.Del(authorizationHeaderName)
 	if err != nil {
 		return classifyTransportError(ctx, callCtx, op, err)
 	}
