@@ -47,7 +47,7 @@ type Explorer struct {
 	adjacency               map[shoal.ID][]shoal.ID
 	graphErr                error
 	snapshot                Snapshot
-	openedAt                time.Time
+	snapshotAnchor          time.Time
 	lastPublicationSequence uint64
 	closed                  bool
 }
@@ -95,11 +95,20 @@ func Open(dir string) (*Explorer, error) {
 		engine:    eng,
 		documents: make(map[shoal.ID]map[shoal.ID]*persistedDocument),
 		edges:     make(map[shoal.ID]persistedEdge),
-		openedAt:  time.Now().UTC(),
 	}
 	if err := explorer.load(); err != nil {
 		_ = eng.Close()
 		return nil, err
+	}
+	if explorer.snapshotAnchor.IsZero() {
+		explorer.snapshotAnchor = time.Now().UTC()
+		if err := explorer.writeRecord(
+			snapshotAnchorRow, embeddedRecordSnapshotAnchor,
+			persistedSnapshotAnchor{CreatedAt: explorer.snapshotAnchor},
+		); err != nil {
+			_ = eng.Close()
+			return nil, err
+		}
 	}
 	if err := explorer.rebuildCurrentGraph(); err != nil {
 		_ = eng.Close()

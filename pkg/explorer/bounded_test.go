@@ -21,10 +21,59 @@ import (
 	"context"
 	"math"
 	"testing"
+	"time"
 
 	"github.com/phrocker/shoal-oss/pkg/graph"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
+
+func TestSnapshotStableAcrossRestart(t *testing.T) {
+	dataDir := t.TempDir()
+	corpus, err := Open(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := corpus.Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := corpus.Close(); err != nil {
+		t.Fatal(err)
+	}
+	corpus, err = Open(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer corpus.Close()
+	after, err := corpus.Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before != after {
+		t.Fatalf("snapshot changed across restart: before=%+v after=%+v", before, after)
+	}
+}
+
+func TestSnapshotHashIncludesCollectionBoundaries(t *testing.T) {
+	anchor := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	first := &Explorer{
+		graphNodes: map[shoal.ID]graph.Node{
+			"node": {ID: "node", Labels: []string{"a"}, Properties: shoal.Metadata{"b": "c"}},
+		},
+		graphEdges: make(map[shoal.ID]graph.Edge), snapshotAnchor: anchor,
+	}
+	first.refreshSnapshotLocked()
+	second := &Explorer{
+		graphNodes: map[shoal.ID]graph.Node{
+			"node": {ID: "node", Labels: []string{"a", "b", "c"}},
+		},
+		graphEdges: make(map[shoal.ID]graph.Edge), snapshotAnchor: anchor,
+	}
+	second.refreshSnapshotLocked()
+	if first.snapshot.ID == second.snapshot.ID {
+		t.Fatal("distinct graph collections produced the same snapshot")
+	}
+}
 
 func TestBoundedNeighborhoodCountsSelfEdgeOnce(t *testing.T) {
 	corpus, err := Open(t.TempDir())

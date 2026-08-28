@@ -173,12 +173,15 @@ func (e *Explorer) refreshSnapshotLocked() {
 	sort.Slice(documentIDs, func(i, j int) bool {
 		return shoal.CompareID(documentIDs[i], documentIDs[j]) < 0
 	})
-	asOf := e.openedAt
+	writeSnapshotString(hash, "documents")
+	writeSnapshotCount(hash, len(documentIDs))
+	asOf := e.snapshotAnchor
 	for _, id := range documentIDs {
 		record, err := latestRevision(e.documents[id])
 		if err != nil || record == nil {
 			continue
 		}
+		writeSnapshotString(hash, "document")
 		writeSnapshotString(hash, string(record.Document.ID))
 		writeSnapshotString(hash, string(record.Revision.ID))
 		if record.PublishedAt.After(asOf) {
@@ -192,10 +195,14 @@ func (e *Explorer) refreshSnapshotLocked() {
 	sort.Slice(nodeIDs, func(i, j int) bool {
 		return shoal.CompareID(nodeIDs[i], nodeIDs[j]) < 0
 	})
+	writeSnapshotString(hash, "nodes")
+	writeSnapshotCount(hash, len(nodeIDs))
 	for _, id := range nodeIDs {
 		node := e.graphNodes[id]
+		writeSnapshotString(hash, "node")
 		writeSnapshotString(hash, string(node.ID))
 		writeSnapshotString(hash, node.Kind)
+		writeSnapshotCount(hash, len(node.Labels))
 		for _, label := range node.Labels {
 			writeSnapshotString(hash, label)
 		}
@@ -208,8 +215,11 @@ func (e *Explorer) refreshSnapshotLocked() {
 	sort.Slice(edgeIDs, func(i, j int) bool {
 		return shoal.CompareID(edgeIDs[i], edgeIDs[j]) < 0
 	})
+	writeSnapshotString(hash, "edges")
+	writeSnapshotCount(hash, len(edgeIDs))
 	for _, id := range edgeIDs {
 		edge := e.graphEdges[id]
+		writeSnapshotString(hash, "edge")
 		writeSnapshotString(hash, string(edge.ID))
 		writeSnapshotString(hash, string(edge.From))
 		writeSnapshotString(hash, string(edge.To))
@@ -246,8 +256,15 @@ func writeSnapshotMetadata(writer snapshotWriter, metadata shoal.Metadata) {
 		keys = append(keys, key)
 	}
 	sort.Strings(keys)
+	writeSnapshotCount(writer, len(keys))
 	for _, key := range keys {
 		writeSnapshotString(writer, key)
 		writeSnapshotString(writer, metadata[key])
 	}
+}
+
+func writeSnapshotCount(writer snapshotWriter, count int) {
+	var encoded [8]byte
+	binary.BigEndian.PutUint64(encoded[:], uint64(count))
+	_, _ = writer.Write(encoded[:])
 }
