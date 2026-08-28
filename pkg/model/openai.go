@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 const (
@@ -169,8 +170,8 @@ func (o *OpenAIEmbedder) Embed(ctx context.Context, req EmbedRequest) (EmbedResu
 	}
 	var out struct {
 		Data []struct {
-			Embedding []float64 `json:"embedding"`
-			Index     int       `json:"index"`
+			Embedding []strictFloat64 `json:"embedding"`
+			Index     int             `json:"index"`
 		} `json:"data"`
 		Usage openAIUsage `json:"usage"`
 	}
@@ -184,7 +185,8 @@ func (o *OpenAIEmbedder) Embed(ctx context.Context, req EmbedRequest) (EmbedResu
 		return EmbedResult{}, &Error{Kind: ErrOversizedResponse, Operation: op, Detail: "vector exceeds configured dimensions"}
 	}
 	vector := make([]float32, len(out.Data[0].Embedding))
-	for i, value := range out.Data[0].Embedding {
+	for i, encoded := range out.Data[0].Embedding {
+		value := float64(encoded)
 		if math.IsNaN(value) || math.IsInf(value, 0) || value > math.MaxFloat32 || value < -math.MaxFloat32 {
 			return EmbedResult{}, &Error{Kind: ErrMalformedResponse, Operation: op, Detail: "invalid vector value"}
 		}
@@ -202,25 +204,41 @@ func (o *OpenAIEmbedder) Embed(ctx context.Context, req EmbedRequest) (EmbedResu
 }
 
 type openAIUsage struct {
-	PromptTokens     int `json:"prompt_tokens"`
-	CompletionTokens int `json:"completion_tokens"`
-	TotalTokens      int `json:"total_tokens"`
+	PromptTokens     int  `json:"prompt_tokens"`
+	CompletionTokens int  `json:"completion_tokens"`
+	TotalTokens      *int `json:"total_tokens"`
 }
 
 func mapOpenAIUsage(op string, value openAIUsage) (Usage, error) {
-	if !validUsage(value.PromptTokens, value.CompletionTokens) ||
-		value.TotalTokens < 0 || value.TotalTokens > maxReportedUsageTokens {
+	if !validUsage(value.PromptTokens, value.CompletionTokens) {
 		return Usage{}, &Error{Kind: ErrMalformedResponse, Operation: op, Detail: "invalid usage"}
 	}
 	calculated := value.PromptTokens + value.CompletionTokens
-	if value.TotalTokens != 0 && value.TotalTokens != calculated {
-		return Usage{}, &Error{Kind: ErrMalformedResponse, Operation: op, Detail: "inconsistent usage"}
+	if value.TotalTokens != nil {
+		if *value.TotalTokens < 0 || *value.TotalTokens > maxReportedUsageTokens ||
+			*value.TotalTokens != calculated {
+			return Usage{}, &Error{Kind: ErrMalformedResponse, Operation: op, Detail: "inconsistent usage"}
+		}
 	}
 	return Usage{
 		InputTokens:  value.PromptTokens,
 		OutputTokens: value.CompletionTokens,
 		TotalTokens:  calculated,
 	}, nil
+}
+
+type strictFloat64 float64
+
+func (f *strictFloat64) UnmarshalJSON(data []byte) error {
+	if bytes.Equal(data, []byte("null")) {
+		return errors.New("null number")
+	}
+	var value float64
+	if err := json.Unmarshal(data, &value); err != nil {
+		return err
+	}
+	*f = strictFloat64(value)
+	return nil
 }
 
 func validateOpenAIConfig(cfg OpenAIConfig, needGeneration, needEmbedding bool) (*openAIClient, error) {
@@ -294,7 +312,7 @@ func validateOpenAIConfig(cfg OpenAIConfig, needGeneration, needEmbedding bool) 
 }
 
 func validConfigValue(value string, limit int) bool {
-	if value == "" || len(value) > limit {
+	if value == "" || len(value) > limit || !utf8.ValidString(value) {
 		return false
 	}
 	for i := 0; i < len(value); i++ {
@@ -306,7 +324,7 @@ func validConfigValue(value string, limit int) bool {
 }
 
 func validHTTPHeaderValue(value string, limit int) bool {
-	if value == "" || len(value) > limit {
+	if value == "" || len(value) > limit || !utf8.ValidString(value) {
 		return false
 	}
 	for i := 0; i < len(value); i++ {

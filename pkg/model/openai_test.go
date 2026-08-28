@@ -320,6 +320,7 @@ func TestOpenAIGenerationValidation(t *testing.T) {
 		{name: "oversized text", body: `{"choices":[{"message":{"content":"four"}}]}`, want: ErrOversizedResponse},
 		{name: "invalid usage", body: `{"choices":[{"message":{"content":"ok"}}],"usage":{"prompt_tokens":-1}}`, want: ErrMalformedResponse},
 		{name: "inconsistent usage", body: `{"choices":[{"message":{"content":"ok"}}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":3}}`, want: ErrMalformedResponse},
+		{name: "explicit zero total", body: `{"choices":[{"message":{"content":"ok"}}],"usage":{"prompt_tokens":1,"total_tokens":0}}`, want: ErrMalformedResponse},
 		{name: "output limit", body: `{"choices":[{"message":{"content":"ok"}}],"usage":{"completion_tokens":2,"total_tokens":2}}`, want: ErrOversizedResponse},
 	}
 	for _, test := range tests {
@@ -358,6 +359,7 @@ func TestOpenAIEmbeddingValidation(t *testing.T) {
 		{name: "multiple embeddings", body: `{"data":[{"embedding":[1],"index":0},{"embedding":[2],"index":1}]}`, want: ErrMalformedResponse},
 		{name: "wrong index", body: `{"data":[{"embedding":[1],"index":1}]}`, want: ErrMalformedResponse},
 		{name: "empty vector", body: `{"data":[{"embedding":[],"index":0}]}`, want: ErrMalformedResponse},
+		{name: "null vector value", body: `{"data":[{"embedding":[null],"index":0}]}`, want: ErrMalformedResponse},
 		{name: "oversized vector", body: `{"data":[{"embedding":[1,2],"index":0}]}`, dimensions: 1, want: ErrOversizedResponse},
 		{name: "overflow", body: `{"data":[{"embedding":[1e400],"index":0}]}`, want: ErrMalformedResponse},
 		{name: "invalid usage", body: `{"data":[{"embedding":[1],"index":0}],"usage":{"prompt_tokens":-1}}`, want: ErrMalformedResponse},
@@ -411,6 +413,7 @@ func TestOpenAIConfigAndRequestValidation(t *testing.T) {
 		func() OpenAIConfig { c := base; c.BaseURL += "?"; return c }(),
 		func() OpenAIConfig { c := base; c.BaseURL += "#"; return c }(),
 		func() OpenAIConfig { c := base; c.GenerationModel = ""; return c }(),
+		func() OpenAIConfig { c := base; c.GenerationModel = string([]byte{0xff}); return c }(),
 		func() OpenAIConfig { c := base; c.Organization = "bad\r\nheader"; return c }(),
 		func() OpenAIConfig { c := base; c.Organization = "bad\x01header"; return c }(),
 		func() OpenAIConfig { c := base; c.Project = "bad\x7fheader"; return c }(),
