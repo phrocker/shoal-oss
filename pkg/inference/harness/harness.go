@@ -72,11 +72,33 @@ func validateResultProvenance(result inference.InferenceResult, expected Provena
 	for _, claim := range result.Claims() {
 		model := claim.ModelProvenance()
 		prompt := claim.PromptProvenance()
-		if model.Provider() != expected.provider || model.Model() != expected.model ||
+		if modelIdentity(model) != modelIdentity(expected.model) ||
 			prompt.TemplateID() != expected.prompt.TemplateID() ||
 			prompt.Version() != expected.prompt.Version() ||
 			prompt.Hash() != expected.prompt.Hash() {
 			return invalid("claim provenance does not match the harness session")
+		}
+
+	}
+	return nil
+}
+
+func validateSectionResults(request OpenSectionRequest, anchors []inference.EvidenceAnchor) error {
+	for _, anchor := range anchors {
+		citation, _, ok := anchor.Document()
+		if !ok || citation.DocumentID != request.documentID || citation.SectionID != request.sectionID {
+			return invalid("open_section result does not match the requested section")
+		}
+	}
+	return nil
+}
+
+func validateNeighborResults(request NeighborsRequest, anchors []inference.EvidenceAnchor) error {
+	for _, anchor := range anchors {
+		path, ok := anchor.Path()
+		if !ok || len(path.Nodes) == 0 || path.Nodes[0].ID != request.nodeID ||
+			len(path.Edges) > request.hops {
+			return invalid("neighbors result exceeds or does not match the requested traversal")
 		}
 	}
 	return nil
@@ -123,19 +145,18 @@ func (b Budgets) validate() error {
 
 type Provenance struct {
 	harness    string
-	provider   string
-	model      string
+	model      inference.ModelProvenance
 	prompt     inference.PromptProvenance
 	toolPolicy string
 }
 
-func NewProvenance(harness, provider, model string, prompt inference.PromptProvenance, toolPolicy string) (Provenance, error) {
+func NewProvenance(harness string, model inference.ModelProvenance, prompt inference.PromptProvenance, toolPolicy string) (Provenance, error) {
 	p := Provenance{
-		harness: strings.TrimSpace(harness), provider: strings.TrimSpace(provider),
-		model: strings.TrimSpace(model), prompt: prompt, toolPolicy: strings.TrimSpace(toolPolicy),
+		harness: strings.TrimSpace(harness), model: model,
+		prompt: prompt, toolPolicy: strings.TrimSpace(toolPolicy),
 	}
 	for name, value := range map[string]string{
-		"harness": p.harness, "provider": p.provider, "model": p.model, "tool policy": p.toolPolicy,
+		"harness": p.harness, "tool policy": p.toolPolicy,
 	} {
 		if err := boundedString(name, value, shoal.MaxSemanticStringBytes); err != nil {
 			return Provenance{}, err
@@ -144,16 +165,19 @@ func NewProvenance(harness, provider, model string, prompt inference.PromptProve
 	if err := prompt.Validate(); err != nil {
 		return Provenance{}, err
 	}
+	if err := model.Validate(); err != nil {
+		return Provenance{}, err
+	}
 	return p, nil
 }
 
 func (p Provenance) Harness() string                    { return p.harness }
-func (p Provenance) Provider() string                   { return p.provider }
-func (p Provenance) Model() string                      { return p.model }
+func (p Provenance) Provider() string                   { return p.model.Provider() }
+func (p Provenance) Model() inference.ModelProvenance   { return p.model }
 func (p Provenance) Prompt() inference.PromptProvenance { return p.prompt }
 func (p Provenance) ToolPolicy() string                 { return p.toolPolicy }
 func (p Provenance) validate() error {
-	_, err := NewProvenance(p.harness, p.provider, p.model, p.prompt, p.toolPolicy)
+	_, err := NewProvenance(p.harness, p.model, p.prompt, p.toolPolicy)
 	return err
 }
 
@@ -175,7 +199,7 @@ func newSessionRequest(pack inference.ContextPack, budgets Budgets, provenance P
 		return SessionRequest{}, err
 	}
 	id := deriveID("session-request", string(pack.ID()), canonicalBudgets(budgets),
-		provenance.harness, provenance.provider, provenance.model,
+		provenance.harness, modelIdentity(provenance.model),
 		provenance.prompt.TemplateID(), provenance.prompt.Version(), provenance.prompt.Hash(),
 		provenance.toolPolicy)
 	return SessionRequest{id: id, context: pack, budgets: budgets, provenance: provenance}, nil
@@ -416,10 +440,25 @@ type Session interface {
 }
 
 type ToolHost interface {
-	Retrieve(context.Context, RetrieveRequest, shoal.ID) (ToolResult, error)
-	OpenSection(context.Context, OpenSectionRequest, shoal.ID) (ToolResult, error)
-	Neighbors(context.Context, NeighborsRequest, shoal.ID) (ToolResult, error)
+	Retrieve(context.Context, ToolContext, RetrieveRequest) (ToolResult, error)
+	OpenSection(context.Context, ToolContext, OpenSectionRequest) (ToolResult, error)
+	Neighbors(context.Context, ToolContext, NeighborsRequest) (ToolResult, error)
 }
+
+// ToolContext identifies the exact session projection for one tool call.
+type ToolContext struct {
+	requestID     shoal.ID
+	contextPackID shoal.ID
+	correlation   shoal.ID
+	snapshot      inference.SnapshotPin
+	auth          inference.AuthPin
+}
+
+func (c ToolContext) RequestID() shoal.ID              { return c.requestID }
+func (c ToolContext) ContextPackID() shoal.ID          { return c.contextPackID }
+func (c ToolContext) CorrelationID() shoal.ID          { return c.correlation }
+func (c ToolContext) Snapshot() inference.SnapshotPin  { return c.snapshot }
+func (c ToolContext) Authorization() inference.AuthPin { return c.auth }
 
 type Record struct {
 	Request    SessionRequest
@@ -557,20 +596,30 @@ func (g *Generator) Run(ctx context.Context, pack inference.ContextPack) (Record
 					return Record{}, err
 				}
 			}
+			if err := runCtx.Err(); err != nil {
+				return Record{}, err
+			}
 			return record, nil
 		}
 		var toolResult ToolResult
+		toolContext := ToolContext{
+			requestID:     request.id,
+			contextPackID: transcript.context.ID(),
+			correlation:   action.correlation,
+			snapshot:      pack.Snapshot(),
+			auth:          pack.Authorization(),
+		}
 		switch action.kind {
 		case ActionRetrieve:
 			if action.retrieve.limit > g.budgets.MaxFanout {
 				return Record{}, budget("retrieve fanout")
 			}
-			toolResult, err = g.tools.Retrieve(runCtx, action.retrieve, action.correlation)
+			toolResult, err = g.tools.Retrieve(runCtx, toolContext, action.retrieve)
 		case ActionOpenSection:
 			if !sectionAllowed(transcript.context, action.open) {
 				return Record{}, invalid("open_section IDs were not issued to this session")
 			}
-			toolResult, err = g.tools.OpenSection(runCtx, action.open, action.correlation)
+			toolResult, err = g.tools.OpenSection(runCtx, toolContext, action.open)
 		case ActionNeighbors:
 			if exceedsRemaining(hops, action.neighbors.hops, g.budgets.MaxGraphHops) ||
 				action.neighbors.fanout > g.budgets.MaxFanout {
@@ -580,7 +629,7 @@ func (g *Generator) Run(ctx context.Context, pack inference.ContextPack) (Record
 			if !nodeAllowed(transcript.context, action.neighbors.nodeID) {
 				return Record{}, invalid("neighbors node ID was not issued to this session")
 			}
-			toolResult, err = g.tools.Neighbors(runCtx, action.neighbors, action.correlation)
+			toolResult, err = g.tools.Neighbors(runCtx, toolContext, action.neighbors)
 		default:
 			return Record{}, invalid("unknown or forbidden action")
 		}
@@ -605,6 +654,13 @@ func (g *Generator) Run(ctx context.Context, pack inference.ContextPack) (Record
 		case ActionNeighbors:
 			if len(toolResult.anchors) > action.neighbors.fanout {
 				return Record{}, budget("neighbors result fanout")
+			}
+			if err := validateNeighborResults(action.neighbors, toolResult.anchors); err != nil {
+				return Record{}, err
+			}
+		case ActionOpenSection:
+			if err := validateSectionResults(action.open, toolResult.anchors); err != nil {
+				return Record{}, err
 			}
 		}
 		if exceedsRemaining(fanout, len(toolResult.anchors), g.budgets.MaxFanout) {
@@ -705,6 +761,25 @@ func framed(parts ...string) string {
 		builder.WriteString(part)
 	}
 	return builder.String()
+}
+
+func modelIdentity(model inference.ModelProvenance) string {
+	parameters := model.Parameters()
+	keys := make([]string, 0, len(parameters))
+	for key := range parameters {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	parts := []string{model.Provider(), model.Model(), model.Version()}
+	for _, key := range keys {
+		parts = append(parts, key, parameters[key])
+	}
+	if seed, ok := model.Seed(); ok {
+		parts = append(parts, "seed", strconv.FormatInt(seed, 10))
+	} else {
+		parts = append(parts, "no-seed")
+	}
+	return framed(parts...)
 }
 
 func exceedsRemaining(current, delta, maximum int) bool {

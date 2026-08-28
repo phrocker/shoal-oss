@@ -261,7 +261,7 @@ func TestRejectsUnissuedCapabilitiesAndProvenance(t *testing.T) {
 		})
 	}
 
-	model, _ := inference.NewModelProvenance("other-provider", "other-model", "", nil, nil)
+	model, _ := inference.NewModelProvenance("fake-provider", "fake-model", "other-version", shoal.Metadata{"temperature": "1"}, nil)
 	_, prompt := provenanceParts(t)
 	value, _ := ontology.NewStringValue("grounded")
 	claim, _ := inference.NewClaim("subject", "predicate", value, 1, []shoal.ID{initial.ID()}, inference.ClaimInferred, model, prompt, nil)
@@ -271,6 +271,16 @@ func TestRejectsUnissuedCapabilitiesAndProvenance(t *testing.T) {
 	if !errors.Is(err, ErrInvalid) {
 		t.Fatalf("provenance error = %v", err)
 	}
+
+	badNeighbor := anchor(t, "not-a-graph-path", 40)
+	host.results = map[shoal.ID][]inference.EvidenceAnchor{"retrieve": {graphAnchor(t)}, "neighbors": {badNeighbor}}
+	runner := NewFakeRunner(
+		ScriptAction(mustRetrieve(t, "retrieve", "graph", 1)),
+		ScriptAction(mustNeighbors(t, "neighbors", "node-a", 1, 1)),
+	)
+	if _, err := newGenerator(t, runner, host).Generate(context.Background(), pack); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("neighbors result error = %v", err)
+	}
 }
 
 func TestEvaluationRecordIsRedactedAndIncludesBudgets(t *testing.T) {
@@ -279,7 +289,8 @@ func TestEvaluationRecordIsRedactedAndIncludesBudgets(t *testing.T) {
 	secretCorrelation := shoal.ID("https://secret.example/token")
 	stop, _ := NewStopAction(secretCorrelation, resultFor(t, pack, initial), Usage{InputTokens: 1})
 	_, prompt := provenanceParts(t)
-	provenance, _ := NewProvenance("fake-harness", "fake-provider", "fake-model", prompt, "grounded-tools-v1")
+	model, _ := inference.NewModelProvenance("fake-provider", "fake-model", "v1", nil, nil)
+	provenance, _ := NewProvenance("fake-harness", model, prompt, "grounded-tools-v1")
 	g, err := NewGenerator(NewFakeRunner(ScriptAction(stop)), &fakeTools{pack: pack}, budgets(), provenance, recorder)
 	if err != nil {
 		t.Fatal(err)
@@ -389,14 +400,14 @@ func (r *captureRecorder) Record(_ context.Context, record EvaluationRecord) err
 	return nil
 }
 
-func (f *fakeTools) Retrieve(_ context.Context, _ RetrieveRequest, id shoal.ID) (ToolResult, error) {
-	return f.make(id, ActionRetrieve)
+func (f *fakeTools) Retrieve(_ context.Context, call ToolContext, _ RetrieveRequest) (ToolResult, error) {
+	return f.make(call.CorrelationID(), ActionRetrieve)
 }
-func (f *fakeTools) OpenSection(_ context.Context, _ OpenSectionRequest, id shoal.ID) (ToolResult, error) {
-	return f.make(id, ActionOpenSection)
+func (f *fakeTools) OpenSection(_ context.Context, call ToolContext, _ OpenSectionRequest) (ToolResult, error) {
+	return f.make(call.CorrelationID(), ActionOpenSection)
 }
-func (f *fakeTools) Neighbors(_ context.Context, _ NeighborsRequest, id shoal.ID) (ToolResult, error) {
-	return f.make(id, ActionNeighbors)
+func (f *fakeTools) Neighbors(_ context.Context, call ToolContext, _ NeighborsRequest) (ToolResult, error) {
+	return f.make(call.CorrelationID(), ActionNeighbors)
 }
 func (f *fakeTools) make(id shoal.ID, kind ActionKind) (ToolResult, error) {
 	correlation := id
@@ -418,8 +429,8 @@ func newGenerator(t *testing.T, runner Runner, tools ToolHost) *Generator {
 }
 func newGeneratorWithBudgets(t *testing.T, runner Runner, tools ToolHost, b Budgets) *Generator {
 	t.Helper()
-	_, prompt := provenanceParts(t)
-	p, err := NewProvenance("fake-harness", "fake-provider", "fake-model", prompt, "grounded-tools-v1")
+	model, prompt := provenanceParts(t)
+	p, err := NewProvenance("fake-harness", model, prompt, "grounded-tools-v1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -433,7 +444,7 @@ func newGeneratorWithBudgets(t *testing.T, runner Runner, tools ToolHost, b Budg
 func fixture(t *testing.T) (inference.ContextPack, inference.EvidenceAnchor, []inference.EvidenceAnchor) {
 	t.Helper()
 	initial := anchor(t, "initial", 0)
-	additions := []inference.EvidenceAnchor{anchor(t, "retrieve", 10), graphAnchor(t), anchor(t, "neighbors", 30)}
+	additions := []inference.EvidenceAnchor{graphAnchor(t), anchorInSection(t, "open", 20, "section-initial"), graphNeighborAnchor(t)}
 	return mustPack(t, []inference.EvidenceAnchor{initial}, fixedTime.Add(time.Hour)), initial, additions
 }
 
@@ -443,12 +454,29 @@ func graphAnchor(t *testing.T) inference.EvidenceAnchor {
 	if err != nil {
 		t.Fatal(err)
 	}
+
+	return anchor
+}
+
+func graphNeighborAnchor(t *testing.T) inference.EvidenceAnchor {
+	t.Helper()
+	anchor, err := inference.NewGraphAnchor(graph.Path{
+		Nodes: []graph.Node{{ID: "node-a", Kind: "entity"}, {ID: "node-b", Kind: "entity"}},
+		Edges: []graph.Edge{{ID: "edge-a-b", From: "node-a", To: "node-b", Type: "related", Weight: 1}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	return anchor
 }
 func anchor(t *testing.T, quote string, offset int64) inference.EvidenceAnchor {
+	return anchorInSection(t, quote, offset, shoal.ID("section-"+quote))
+}
+
+func anchorInSection(t *testing.T, quote string, offset int64, sectionID shoal.ID) inference.EvidenceAnchor {
 	t.Helper()
 	a, err := inference.NewDocumentAnchor(document.Citation{
-		DocumentID: "document", RevisionID: "revision", SectionID: shoal.ID("section-" + quote), SpanID: shoal.ID("span-" + quote),
+		DocumentID: "document", RevisionID: "revision", SectionID: sectionID, SpanID: shoal.ID("span-" + quote),
 		Range: document.SourceRange{Start: document.SourcePosition{Offset: offset}, End: document.SourcePosition{Offset: offset + int64(len(quote))}},
 	}, quote)
 	if err != nil {
