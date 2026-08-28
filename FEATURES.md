@@ -51,16 +51,18 @@ operational contracts remain in the linked runbooks and ADRs.
 |---|---|
 | Hierarchical document, graph, retrieval, and ontology contracts | Shipped |
 | Provider-neutral grounded inference context, evidence, claim, result, and provenance contracts | Shipped |
+| Canonical bounded Explorer context construction, citation/path revalidation, and explicit section/neighbor expansion | Shipped |
 | Ontology-guided structured extraction, validation, stable inferred IDs, and publication planning | Shipped |
 | Atomic publication of extraction plans through Explorer | Not implemented |
 
-The inference surface validates document-only, graph-only, and mixed evidence
-without introducing storage rows, RPC messages, credentials, or provider SDK
-types. The extraction orchestrator builds deterministic prompts only from an
-ontology snapshot and exact evidence anchors, rejects malformed or
-out-of-schema output, and returns proposed publication contracts without
-writing graph rows. See [`docs/inference-contracts.md`](docs/inference-contracts.md)
-and [`docs/ontology-extraction.md`](docs/ontology-extraction.md).
+The inference surface and context builder validate document-only, graph-only,
+and mixed evidence without introducing storage rows, RPC messages, raw
+prompts, credentials, or provider SDK types. The extraction orchestrator
+builds deterministic prompts only from an ontology snapshot and exact evidence
+anchors, rejects malformed or out-of-schema output, and returns proposed
+publication contracts without writing graph rows. See
+[`docs/inference-contracts.md`](docs/inference-contracts.md) and
+[`docs/ontology-extraction.md`](docs/ontology-extraction.md).
 
 ## Accumulo replacement roles
 

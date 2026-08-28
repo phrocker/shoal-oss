@@ -22,8 +22,10 @@ provider.
   inside your own infrastructure; model and workflow execution stay outside
   Shoal.
 - **Grounded inference contracts:** assemble immutable document and graph
-  evidence packs and validate structured, provenance-bearing claims without
-  coupling applications to a model vendor or transport.
+  evidence packs from verified Explorer results, expand explicitly selected
+  sections or graph neighborhoods, and validate structured,
+  provenance-bearing claims without coupling applications to a model vendor
+  or transport.
 - **Local-to-cluster applications:** prototype against an embedded corpus and
   retain the graph, document, and retrieval contracts as storage moves toward
   Accumulo scale.
@@ -86,9 +88,10 @@ for the accepted local-to-Accumulo product direction. Production replacement
 roles remain gated by the live conformance verdicts tracked in
 [issue #74](https://github.com/phrocker/shoal-oss/issues/74).
 
-`pkg/inference` currently provides public, provider-neutral contracts only.
-Shoal does not yet ship runtime LLM orchestration or a model-provider
-transport.
+`pkg/inference` provides public, provider-neutral contracts, and
+`pkg/contextpack` deterministically builds bounded packs from Explorer
+retrieval and hydration APIs. Shoal does not yet ship runtime LLM
+orchestration or a model-provider transport.
 
 ## Build and platform quick start
 
