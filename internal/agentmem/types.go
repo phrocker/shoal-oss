@@ -57,9 +57,9 @@ type Config struct {
 	MaxDepth    int
 	TokenBudget int
 
-	// OntologyExtractor and OntologyRequestFactory enable structured,
-	// ontology-guided enrichment. They are opt-in and never fall back to the
-	// legacy LLM interface after a provider or validation failure.
+	// OntologyExtractor and OntologyRequestFactory enable safe structured
+	// enrichment and consolidation planning without using the legacy entity
+	// row write path.
 	OntologyExtractor      OntologyExtractor
 	OntologyRequestFactory OntologyRequestFactory
 
@@ -116,13 +116,7 @@ func New(cfg Config) (*Client, error) {
 		cfg.LLM = FakeLLM{}
 	}
 	if cfg.Enricher == nil {
-		if cfg.OntologyExtractor != nil && cfg.OntologyRequestFactory != nil {
-			cfg.Enricher = StructuredEnricher{
-				Extractor: cfg.OntologyExtractor, RequestFactory: cfg.OntologyRequestFactory,
-			}
-		} else {
-			cfg.Enricher = HeuristicEnricher{}
-		}
+		cfg.Enricher = HeuristicEnricher{}
 	}
 	if cfg.Classifier == nil {
 		cfg.Classifier = RuleClassifier{}

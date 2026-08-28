@@ -473,6 +473,9 @@ func rejectDuplicateJSONFields(data []byte) error {
 				if !ok {
 					return errors.New("extraction: malformed object key")
 				}
+				if key != strings.ToLower(key) {
+					return fmt.Errorf("extraction: JSON field %q does not use exact schema casing", key)
+				}
 				if _, duplicate := seen[key]; duplicate {
 					return fmt.Errorf("extraction: duplicate JSON field %q", key)
 				}
@@ -678,6 +681,25 @@ func materialize(request Request, prompt string, mp model.Provenance, raw rawOut
 		}
 		assertions = append(assertions, propAssertions...)
 		claims = append(claims, propClaims...)
+		typePredicate, err := ontology.NewStableID(
+			"inferred-entity-type", string(request.Version.ID()),
+		)
+		if err != nil {
+			return Result{}, err
+		}
+		typeValue, err := ontology.NewReferenceValue(typeID)
+		if err != nil {
+			return Result{}, err
+		}
+		typeClaim, err := inference.NewClaim(
+			id, typePredicate, typeValue, shoal.Score(*item.Confidence),
+			anchorIDs, inference.ClaimInferred, modelProv, promptProv,
+			shoal.Metadata{"kind": "entity_type"},
+		)
+		if err != nil {
+			return Result{}, err
+		}
+		claims = append(claims, typeClaim)
 		entityByKey[key] = Entity{
 			ID: id, Key: key, TypeID: typeID, ExistingNodeID: existing,
 			Action: action, State: StateProposed, Origin: OriginInferred,
@@ -709,6 +731,9 @@ func materialize(request Request, prompt string, mp model.Provenance, raw rawOut
 		if !allowedEndpoints(relation, from.TypeID, to.TypeID) {
 			return Result{}, fmt.Errorf("extraction: relation %q crosses disallowed ontology domains", item.TypeID)
 		}
+		if !relation.Directed() && string(from.ID) > string(to.ID) {
+			from, to = to, from
+		}
 		if err := validateConfidence(*item.Confidence); err != nil {
 			return Result{}, err
 		}
@@ -716,11 +741,7 @@ func materialize(request Request, prompt string, mp model.Provenance, raw rawOut
 		if err != nil {
 			return Result{}, fmt.Errorf("extraction: relation %q: %w", item.TypeID, err)
 		}
-		fromID, toID := from.ID, to.ID
-		if !relation.Directed() && string(fromID) > string(toID) {
-			fromID, toID = toID, fromID
-		}
-		edgeID, err := ontology.NewStableID("inferred-edge", string(request.Version.ID()), string(relation.ID()), string(fromID), string(toID))
+		edgeID, err := ontology.NewStableID("inferred-edge", string(request.Version.ID()), string(relation.ID()), string(from.ID), string(to.ID))
 		if err != nil {
 			return Result{}, err
 		}
@@ -1068,6 +1089,7 @@ func (h HeuristicExtractor) Extract(_ context.Context, request Request) (Result,
 	if _, ok := conceptByID(request.Version, h.ConceptType); !ok {
 		return Result{}, errors.New("extraction: heuristic concept type is not in the ontology")
 	}
+	limits, _ := request.Limits.normalized()
 	seen := map[string]struct{}{}
 	var entities []rawEntity
 	for _, anchor := range request.Context.Evidence() {
@@ -1092,6 +1114,9 @@ func (h HeuristicExtractor) Extract(_ context.Context, request Request) (Result,
 			if _, exists := seen[key]; exists {
 				continue
 			}
+			if len(entities) >= limits.MaxEntities {
+				return Result{}, errors.New("extraction: output exceeds item count limit")
+			}
 			seen[key] = struct{}{}
 			entities = append(entities, rawEntity{
 				Key: key, TypeID: string(h.ConceptType), Confidence: floatPointer(0.5),
@@ -1102,38 +1127,11 @@ func (h HeuristicExtractor) Extract(_ context.Context, request Request) (Result,
 	if len(entities) == 0 {
 		return Result{}, errors.New("extraction: heuristic found no grounded entities")
 	}
-	// A type marker claim keeps the output shape identical without pretending
-	// that the heuristic discovered ontology properties.
-	marker, err := heuristicMarker(request.Version, h.ConceptType)
-	if err != nil {
-		return Result{}, err
-	}
-	for i := range entities {
-		entities[i].Properties = []rawProperty{{
-			PropertyID: string(marker.ID()),
-			Value:      rawValue{Type: string(ontology.ValueString), Value: json.RawMessage(strconv.Quote(entities[i].Key))},
-		}}
-	}
 	prompt, err := BuildPrompt(request)
 	if err != nil {
 		return Result{}, err
 	}
 	return materialize(request, prompt, model.Provenance{Provider: HeuristicProvider, Model: HeuristicModel}, rawOutput{Entities: entities}, "heuristic")
-}
-
-func heuristicMarker(version ontology.OntologyVersion, conceptID shoal.ID) (ontology.PropertyDefinition, error) {
-	concept, ok := conceptByID(version, conceptID)
-	if !ok {
-		return ontology.PropertyDefinition{}, errors.New("extraction: heuristic concept type is not in the ontology")
-	}
-	for _, id := range concept.Properties() {
-		for _, property := range version.Properties() {
-			if property.ID() == id && property.ValueType() == ontology.ValueString {
-				return property, nil
-			}
-		}
-	}
-	return ontology.PropertyDefinition{}, errors.New("extraction: heuristic concept requires a string property")
 }
 
 func conceptByID(version ontology.OntologyVersion, id shoal.ID) (ontology.ConceptDefinition, bool) {

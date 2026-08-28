@@ -15,39 +15,19 @@ type OntologyExtractor interface {
 
 type OntologyRequestFactory func(context.Context, string) (extraction.Request, error)
 
-// StructuredEnricher adapts the ontology-guided extractor to the legacy
-// agentmem entity shape. Publication remains the caller's responsibility.
-type StructuredEnricher struct {
-	Extractor      OntologyExtractor
-	RequestFactory OntologyRequestFactory
-	Summarizer     Enricher
-}
-
-func (e StructuredEnricher) Entities(ctx context.Context, text string) ([]Entity, error) {
-	if e.Extractor == nil || e.RequestFactory == nil {
-		return nil, ErrOntologyExtractionUnavailable
+// PlanEnrichment runs structured extraction without routing proposals through
+// the legacy entity-row write path.
+func (c *Client) PlanEnrichment(ctx context.Context, text string) (extraction.PublicationPlan, error) {
+	if c.cfg.OntologyExtractor == nil || c.cfg.OntologyRequestFactory == nil {
+		return extraction.PublicationPlan{}, ErrOntologyExtractionUnavailable
 	}
-	request, err := e.RequestFactory(ctx, text)
+	request, err := c.cfg.OntologyRequestFactory(ctx, text)
 	if err != nil {
-		return nil, err
+		return extraction.PublicationPlan{}, err
 	}
-	result, err := e.Extractor.Extract(ctx, request)
+	result, err := c.cfg.OntologyExtractor.Extract(ctx, request)
 	if err != nil {
-		return nil, err
+		return extraction.PublicationPlan{}, err
 	}
-	plan := result.PublicationPlan()
-	entities := make([]Entity, 0, len(plan.Entities))
-	for _, proposed := range plan.Entities {
-		entities = append(entities, Entity{
-			ID: string(proposed.ID), Label: proposed.Key, Type: string(proposed.TypeID),
-		})
-	}
-	return entities, nil
-}
-
-func (e StructuredEnricher) Summarize(ctx context.Context, text string) (string, error) {
-	if e.Summarizer != nil {
-		return e.Summarizer.Summarize(ctx, text)
-	}
-	return HeuristicEnricher{}.Summarize(ctx, text)
+	return result.PublicationPlan(), nil
 }

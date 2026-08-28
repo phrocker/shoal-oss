@@ -168,12 +168,12 @@ func (co *Consolidator) Consolidate(ctx context.Context, id string) error {
 		// Existing agents continue running without publishing unsafe links.
 		return nil
 	}
+	if co.client.cfg.ConsolidationPublisher == nil {
+		return nil
+	}
 	plan, err := co.PlanConsolidation(ctx, id)
 	if err != nil {
 		return err
-	}
-	if co.client.cfg.ConsolidationPublisher == nil {
-		return nil
 	}
 	return co.client.cfg.ConsolidationPublisher(ctx, plan)
 }

@@ -33,14 +33,16 @@ func (g *scriptedGenerator) Generate(_ context.Context, request model.GenerateRe
 }
 
 type fixture struct {
-	request      Request
-	person       ontology.ConceptDefinition
-	organization ontology.ConceptDefinition
-	name         ontology.PropertyDefinition
-	age          ontology.PropertyDefinition
-	worksAt      ontology.RelationshipDefinition
-	anchor       inference.EvidenceAnchor
-	graphAnchor  inference.EvidenceAnchor
+	request        Request
+	person         ontology.ConceptDefinition
+	organization   ontology.ConceptDefinition
+	name           ontology.PropertyDefinition
+	age            ontology.PropertyDefinition
+	worksAt        ontology.RelationshipDefinition
+	associatedWith ontology.RelationshipDefinition
+	thing          ontology.ConceptDefinition
+	anchor         inference.EvidenceAnchor
+	graphAnchor    inference.EvidenceAnchor
 }
 
 func TestExtractValidMultiEntityRelationAndStableRetry(t *testing.T) {
@@ -50,7 +52,7 @@ func TestExtractValidMultiEntityRelationAndStableRetry(t *testing.T) {
 	second := extractWith(t, f.request, output)
 
 	plan := first.PublicationPlan()
-	if len(plan.Entities) != 2 || len(plan.Edges) != 1 || len(plan.ClaimIDs) != 4 {
+	if len(plan.Entities) != 2 || len(plan.Edges) != 1 || len(plan.ClaimIDs) != 6 {
 		t.Fatalf("unexpected plan sizes: %+v", plan)
 	}
 	if plan.State != StateProposed || plan.Origin != OriginInferred {
@@ -122,6 +124,7 @@ func TestStrictParsingAndBounds(t *testing.T) {
 		"malformed":       `{"entities":[`,
 		"trailing":        `{"entities":[],"relations":[]} {}`,
 		"duplicate field": `{"entities":[],"entities":[],"relations":[]}`,
+		"case alias":      `{"Entities":[],"relations":[]}`,
 		"non finite":      `{"entities":[{"key":"alice","type_id":"` + string(f.person.ID()) + `","properties":[],"confidence":1e999,"evidence_anchor_ids":["` + string(f.anchor.ID()) + `"]}],"relations":[]}`,
 	}
 	for name, output := range tests {
@@ -187,6 +190,7 @@ func TestHeuristicIsExplicitAndMutationIsolated(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	plan := result.PublicationPlan()
 	if plan.Provenance.Provider != HeuristicProvider || plan.Provenance.Model != HeuristicModel {
 		t.Fatalf("heuristic provenance = %+v", plan.Provenance)
@@ -197,6 +201,47 @@ func TestHeuristicIsExplicitAndMutationIsolated(t *testing.T) {
 	again := result.PublicationPlan()
 	if again.Entities[0].ID != originalID || again.Entities[0].EvidenceIDs[0] != f.anchor.ID() {
 		t.Fatal("publication plan aliases caller mutation")
+	}
+}
+
+func TestPropertylessEntityProducesGroundedTypeClaim(t *testing.T) {
+	f := newFixture(t)
+	output := `{"entities":[{"key":"event","type_id":"` + string(f.thing.ID()) +
+		`","properties":[],"confidence":0.8,"evidence_anchor_ids":["` +
+		string(f.anchor.ID()) + `"]}],"relations":[]}`
+	result := extractWith(t, f.request, output)
+	if len(result.PublicationPlan().Entities) != 1 ||
+		len(result.OntologyResult().Assertions()) != 0 ||
+		len(result.InferenceResult().Claims()) != 1 {
+		t.Fatal("propertyless entity did not produce a type outcome")
+	}
+}
+
+func TestUndirectedRelationNormalizesWholePayload(t *testing.T) {
+	f := newFixture(t)
+	forward := strings.Replace(validOutput(f), string(f.worksAt.ID()), string(f.associatedWith.ID()), 1)
+	reverse := strings.Replace(forward,
+		`"from_entity_key":"alice","to_entity_key":"acme"`,
+		`"from_entity_key":"acme","to_entity_key":"alice"`, 1)
+	first := extractWith(t, f.request, forward).PublicationPlan()
+	second := extractWith(t, f.request, reverse).PublicationPlan()
+	if first.Edges[0].ID != second.Edges[0].ID ||
+		first.Edges[0].From != second.Edges[0].From ||
+		first.Edges[0].To != second.Edges[0].To {
+		t.Fatal("undirected edge payload is not canonical")
+	}
+	for i := range first.ClaimIDs {
+		if first.ClaimIDs[i] != second.ClaimIDs[i] {
+			t.Fatal("undirected claim IDs changed with endpoint order")
+		}
+	}
+}
+
+func TestHeuristicHonorsEntityLimit(t *testing.T) {
+	f := newFixture(t)
+	f.request.Limits.MaxEntities = 1
+	if _, err := (HeuristicExtractor{ConceptType: f.person.ID()}).Extract(context.Background(), f.request); err == nil {
+		t.Fatal("expected heuristic entity limit failure")
 	}
 }
 
@@ -211,7 +256,7 @@ func TestIntegrationFakeModelRealContracts(t *testing.T) {
 		t.Fatalf("unexpected model request: %+v", generator.req)
 	}
 	if len(result.OntologyResult().Assertions()) != 4 ||
-		len(result.InferenceResult().Claims()) != 4 {
+		len(result.InferenceResult().Claims()) != 6 {
 		t.Fatal("real contracts did not receive all extracted claims")
 	}
 }
@@ -246,7 +291,15 @@ func newFixture(t *testing.T) fixture {
 	if err != nil {
 		t.Fatal(err)
 	}
+	thing, err := ontology.NewConceptDefinition("thing", "Thing", "", nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	worksAt, err := ontology.NewRelationshipDefinition("works_at", "Works at", "", []shoal.ID{person.ID()}, []shoal.ID{organization.ID()}, nil, true, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	associatedWith, err := ontology.NewRelationshipDefinition("associated_with", "Associated with", "", []shoal.ID{person.ID()}, []shoal.ID{organization.ID()}, nil, false, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -254,7 +307,7 @@ func newFixture(t *testing.T) fixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	version, err := ontology.NewOntologyVersion(schema, "1", time.Unix(10, 0), []ontology.ConceptDefinition{organization, person}, []ontology.RelationshipDefinition{worksAt}, []ontology.PropertyDefinition{age, name}, nil)
+	version, err := ontology.NewOntologyVersion(schema, "1", time.Unix(10, 0), []ontology.ConceptDefinition{organization, person, thing}, []ontology.RelationshipDefinition{worksAt, associatedWith}, []ontology.PropertyDefinition{age, name}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -289,7 +342,9 @@ func newFixture(t *testing.T) fixture {
 	}
 	return fixture{
 		request: Request{Version: version, Context: pack, Instructions: "Extract grounded work relationships.", Limits: DefaultLimits()},
-		person:  person, organization: organization, name: name, age: age, worksAt: worksAt, anchor: anchor, graphAnchor: graphAnchor,
+		person:  person, organization: organization, name: name, age: age,
+		worksAt: worksAt, associatedWith: associatedWith, thing: thing,
+		anchor: anchor, graphAnchor: graphAnchor,
 	}
 }
 

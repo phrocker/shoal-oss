@@ -34,8 +34,8 @@ writes.
 provenance. It is never invoked as a fallback after a model timeout,
 unavailability, malformed response, or validation failure.
 
-`internal/agentmem.StructuredEnricher` adapts validated entity proposals to the
-legacy Veculo entity shape. Consolidation no longer interprets model response
-substrings. It can produce a structured plan and optionally hand it to a
-caller-supplied high-level publisher; without that publisher it performs no
-graph mutation.
+`internal/agentmem.Client.PlanEnrichment` exposes the complete validated plan
+without flattening it into the legacy Veculo entity write path. Consolidation
+no longer interprets model response substrings. It can produce a structured
+plan and hand it to a caller-supplied high-level publisher; without that
+publisher it performs no model call or graph mutation.

@@ -33,34 +33,40 @@ func (l *countingLLM) Infer(context.Context, string) (string, error) {
 	return "causal entity", nil
 }
 
-func TestStructuredEnricherUsesValidatedExtraction(t *testing.T) {
+func TestPlanEnrichmentPreservesValidatedPublicationPlan(t *testing.T) {
 	version, concept, property, pack := agentmemExtractionFixture(t, "Alice")
 	generator := &agentmemGenerator{}
 	generator.output = `{"entities":[{"key":"alice","type_id":"` + string(concept.ID()) +
 		`","properties":[{"property_id":"` + string(property.ID()) +
 		`","value":{"type":"string","value":"Alice"}}],"confidence":0.9,"evidence_anchor_ids":["` +
 		string(pack.Evidence()[0].ID()) + `"]}],"relations":[]}`
-	enricher := StructuredEnricher{
-		Extractor: extraction.Orchestrator{Generator: generator},
-		RequestFactory: func(context.Context, string) (extraction.Request, error) {
+	client, err := New(Config{
+		Store:             NewFakeStore(),
+		OntologyExtractor: extraction.Orchestrator{Generator: generator},
+		OntologyRequestFactory: func(context.Context, string) (extraction.Request, error) {
 			return extraction.Request{
 				Version: version, Context: pack, Instructions: "Extract entities.",
 				Limits: extraction.DefaultLimits(),
 			}, nil
 		},
-	}
-
-	entities, err := enricher.Entities(context.Background(), "Alice")
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if generator.calls != 1 || len(entities) != 1 ||
-		entities[0].Label != "alice" || entities[0].Type != string(concept.ID()) {
-		t.Fatalf("unexpected structured entities: %+v", entities)
+	plan, err := client.PlanEnrichment(context.Background(), "Alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if generator.calls != 1 || len(plan.Entities) != 1 ||
+		plan.Entities[0].Key != "alice" ||
+		plan.Entities[0].TypeID != concept.ID() ||
+		plan.Entities[0].State != extraction.StateProposed ||
+		len(plan.Entities[0].EvidenceIDs) != 1 {
+		t.Fatalf("unexpected structured plan: %+v", plan)
 	}
 }
 
-func TestNewSelectsStructuredEnricherOnlyWhenFullyConfigured(t *testing.T) {
+func TestNewKeepsLegacyWritesOnHeuristicEnricher(t *testing.T) {
 	version, _, _, pack := agentmemExtractionFixture(t, "Alice")
 	generator := &agentmemGenerator{output: `{"entities":[],"relations":[]}`}
 	factory := func(context.Context, string) (extraction.Request, error) {
@@ -76,7 +82,7 @@ func TestNewSelectsStructuredEnricherOnlyWhenFullyConfigured(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := client.cfg.Enricher.(StructuredEnricher); !ok {
+	if _, ok := client.cfg.Enricher.(HeuristicEnricher); !ok {
 		t.Fatalf("configured enricher type = %T", client.cfg.Enricher)
 	}
 	if _, err := New(Config{
