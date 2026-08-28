@@ -54,11 +54,16 @@ operational contracts remain in the linked runbooks and ADRs.
 | Bounded provider-neutral tool-using agent harness contract and deterministic fake | Shipped |
 | Concrete Copilot/SDK agent execution backend | Not implemented |
 | Other runtime LLM orchestration and model-provider transports | Not implemented |
+| Ontology-guided structured extraction, validation, stable inferred IDs, and publication planning | Shipped |
+| Atomic publication of extraction plans through Explorer | Not implemented |
 
-The inference surface is deliberately a contract boundary. It validates
-document-only, graph-only, and mixed evidence without introducing storage
-rows, RPC messages, raw prompts, credentials, or provider SDK types. See
-[`docs/inference-contracts.md`](docs/inference-contracts.md).
+The inference surface validates document-only, graph-only, and mixed evidence
+without introducing storage rows, RPC messages, credentials, or provider SDK
+types. The extraction orchestrator builds deterministic prompts only from an
+ontology snapshot and exact evidence anchors, rejects malformed or
+out-of-schema output, and returns proposed publication contracts without
+writing graph rows. See [`docs/inference-contracts.md`](docs/inference-contracts.md)
+and [`docs/ontology-extraction.md`](docs/ontology-extraction.md).
 
 ## Accumulo replacement roles
 
@@ -144,6 +149,8 @@ expected evidence, debugging, and cleanup commands.
   compaction runbook
 - [`docs/inference-contracts.md`](docs/inference-contracts.md):
   provider-neutral grounded inference contracts and current runtime status
+- [`docs/ontology-extraction.md`](docs/ontology-extraction.md):
+  structured ontology extraction and safe publication boundary
 - [`python/README.md`](python/README.md): Python install and API usage
 - [`test/accumulo/README.md`](test/accumulo/README.md): exact Accumulo 4
   conformance harness

@@ -10,6 +10,7 @@ import (
 
 	"github.com/phrocker/shoal-oss/internal/embedpb"
 	"github.com/phrocker/shoal-oss/internal/graphschema"
+	"github.com/phrocker/shoal-oss/pkg/extraction"
 )
 
 type IngestRequest struct {
@@ -141,7 +142,9 @@ func (co *Consolidator) Run(ctx context.Context) error {
 		case <-co.stop:
 			return nil
 		case id := <-co.queue:
-			_ = co.Consolidate(ctx, id)
+			if err := co.Consolidate(ctx, id); err != nil {
+				return err
+			}
 		}
 	}
 }
@@ -161,10 +164,33 @@ func (co *Consolidator) SeedAll(ctx context.Context) error {
 }
 
 func (co *Consolidator) Consolidate(ctx context.Context, id string) error {
+	if co.client.cfg.OntologyExtractor == nil &&
+		co.client.cfg.OntologyRequestFactory == nil {
+		// Legacy substring-based model output is intentionally disabled.
+		// Existing agents continue running without publishing unsafe links.
+		return nil
+	}
+	if co.client.cfg.ConsolidationPublisher == nil {
+		return nil
+	}
+	plan, err := co.PlanConsolidation(ctx, id)
+	if err != nil {
+		return err
+	}
+	return co.client.cfg.ConsolidationPublisher(ctx, plan)
+}
+
+// PlanConsolidation returns a validated proposed publication plan. It never
+// writes graph rows directly.
+func (co *Consolidator) PlanConsolidation(ctx context.Context, id string) (extraction.PublicationPlan, error) {
+	if co.client.cfg.OntologyExtractor == nil ||
+		co.client.cfg.OntologyRequestFactory == nil {
+		return extraction.PublicationPlan{}, ErrOntologyExtractionUnavailable
+	}
 	anchor := graphschema.EventRow(id)
 	cells, err := co.client.cfg.Store.Scan(ctx, co.client.cfg.Table, &embedpb.ScanRequest{EdgeExpand: &embedpb.EdgeExpand{AnchorRows: [][]byte{anchor}, EdgeCf: graphschema.TemporalEdgeCF(), PrimaryPrefix: []byte(graphschema.EventRowPrefix), IncludeAnchors: true, MaxHops: 2}})
 	if err != nil {
-		return err
+		return extraction.PublicationPlan{}, err
 	}
 	text := strings.Builder{}
 	nodes := rowsToNodes(cells)
@@ -174,25 +200,13 @@ func (co *Consolidator) Consolidate(ctx context.Context, id string) error {
 		text.WriteString(n.Content)
 		text.WriteByte('\n')
 	}
-	infer, err := co.client.cfg.LLM.Infer(ctx, "infer causal/entity links for neighborhood:\n"+text.String())
+	request, err := co.client.cfg.OntologyRequestFactory(ctx, text.String())
 	if err != nil {
-		return err
+		return extraction.PublicationPlan{}, err
 	}
-	var entries []*embedpb.Entry
-	ts := unixMillis(time.Now())
-	for _, n := range nodes {
-		if n.ID == id || n.ID == "" {
-			continue
-		}
-		if strings.Contains(infer, "causal") {
-			entries = append(entries, &embedpb.Entry{ColumnFamily: graphschema.CausalEdgeCF(), ColumnQualifier: []byte(n.ID), Timestamp: ts, Value: graphschema.PackWeight(0.7)})
-		}
-		if strings.Contains(infer, "entity") {
-			entries = append(entries, &embedpb.Entry{ColumnFamily: graphschema.EntityEdgeCF(), ColumnQualifier: []byte(n.ID), Timestamp: ts, Value: graphschema.PackWeight(0.5)})
-		}
+	result, err := co.client.cfg.OntologyExtractor.Extract(ctx, request)
+	if err != nil {
+		return extraction.PublicationPlan{}, err
 	}
-	if len(entries) == 0 {
-		return nil
-	}
-	return co.client.cfg.Store.Write(ctx, co.client.cfg.Table, []*embedpb.Mutation{{Row: anchor, Entries: entries}})
+	return result.PublicationPlan(), nil
 }
