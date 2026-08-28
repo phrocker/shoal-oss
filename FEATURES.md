@@ -43,7 +43,11 @@ operational contracts remain in the linked runbooks and ADRs.
 | Exact vector search | Shipped |
 | Distributed IVF-PQ lifecycle, tombstones, freshness, and recall contracts | Shipped |
 | Local RFile, local Parquet, mixed, and Accumulo-backed corpus parity | Shipped |
-| Provider-neutral model I/O with deterministic fake and bounded Ollama adapters | Shipped |
+| Provider-neutral model I/O with deterministic fake, bounded Ollama, and authenticated OpenAI-compatible adapters | Shipped |
+
+Authenticated hosted providers are opt-in adapters. Shoal does not configure,
+select, or imply any cloud model provider by default; applications must supply
+an explicit endpoint, model names, and request-time credential resolver.
 
 ## Knowledge and inference contracts
 
