@@ -48,9 +48,9 @@ authorized Explorer retrieval and `inference.ContextPack`. Its builder:
   and optional ontology identities without deriving access from UI filters;
 - records content-derived retrieval/result/explanation identity without
   placing explanation prose in model context;
-- applies fail-closed result, evidence, document, section, graph, path, quote,
-  metadata/provenance, total-context byte, and optional caller-tokenizer limits;
-  and
+- applies fail-closed result, evidence, document, section, span, hydration-byte,
+  graph, path, quote, metadata/provenance, total-context byte, and optional
+  caller-tokenizer limits; and
 - exposes explicit `OpenSection` and `ExpandNeighbors` operations that produce
   a new immutable pack. Duplicate evidence is canonical-deduplicated only when
   its immutable anchor identity and content are identical.
