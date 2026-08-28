@@ -73,7 +73,8 @@ type Reader interface {
 	Neighborhood(context.Context, explorer.NeighborhoodRequest) (explorer.Neighborhood, error)
 }
 
-// Limits are fail-closed construction ceilings. Zero fields select defaults.
+// Limits are fail-closed construction ceilings. Zero fields select defaults,
+// except MaxContextTokens, where zero disables tokenizer-specific accounting.
 type Limits struct {
 	MaxResults         int
 	MaxAnchors         int
@@ -83,6 +84,7 @@ type Limits struct {
 	MaxGraphEdges      int
 	MaxPathNodes       int
 	MaxContextBytes    int
+	MaxContextTokens   int
 	MaxQuoteBytes      int
 	MaxProvenanceBytes int
 	MaxHierarchyDepth  uint32
@@ -135,8 +137,15 @@ type ExpandNeighborsRequest struct {
 
 // Builder creates immutable inference packs.
 type Builder struct {
-	Reader Reader
-	Limits Limits
+	Reader         Reader
+	Limits         Limits
+	TokenEstimator TokenEstimator
+}
+
+// TokenEstimator provides provider-neutral token accounting without invoking
+// a model. Callers should supply the tokenizer used by their future generator.
+type TokenEstimator interface {
+	EstimateTokens(context.Context, inference.ContextPack) (int, error)
 }
 
 // Build creates an initial context pack from exact retrieval evidence.
@@ -209,7 +218,8 @@ func (b Builder) Build(ctx context.Context, input InitialRequest) (inference.Con
 	if err != nil {
 		return inference.ContextPack{}, err
 	}
-	return buildPack(request.Text, anchors, input.Pins, metadata, limits)
+	return buildPack(
+		ctx, request.Text, anchors, input.Pins, metadata, limits, b.TokenEstimator)
 }
 
 // OpenSection returns a new pack containing the existing verified evidence and
@@ -288,7 +298,7 @@ func (b Builder) OpenSection(
 	if err != nil {
 		return inference.ContextPack{}, err
 	}
-	return rebuildPack(pack, anchors, limits)
+	return rebuildPack(ctx, pack, anchors, limits, b.TokenEstimator)
 }
 
 // ExpandNeighbors returns a new pack containing verified existing evidence and
@@ -365,7 +375,7 @@ func (b Builder) ExpandNeighbors(
 	if err != nil {
 		return inference.ContextPack{}, err
 	}
-	return rebuildPack(pack, anchors, limits)
+	return rebuildPack(ctx, pack, anchors, limits, b.TokenEstimator)
 }
 
 type verifier struct {
@@ -912,32 +922,57 @@ func retrievalIdentity(request retrieval.Request, response retrieval.Response) (
 }
 
 func buildPack(
+	ctx context.Context,
 	query string,
 	anchors []inference.EvidenceAnchor,
 	pins Pins,
 	metadata shoal.Metadata,
 	limits Limits,
+	estimator TokenEstimator,
 ) (inference.ContextPack, error) {
 	normalizedQuery := strings.Join(strings.Fields(query), " ")
 	if err := enforcePackBounds(normalizedQuery, anchors, pins, metadata, limits); err != nil {
 		return inference.ContextPack{}, err
 	}
-	return inference.NewContextPack(
+	pack, err := inference.NewContextPack(
 		normalizedQuery, anchors, pins.Ontology, pins.Snapshot, pins.Authorization, metadata)
+	if err != nil {
+		return inference.ContextPack{}, err
+	}
+	if limits.MaxContextTokens > 0 {
+		if estimator == nil {
+			return inference.ContextPack{}, invalid(
+				"a token estimator is required when a context token limit is configured")
+		}
+		tokens, err := estimator.EstimateTokens(ctx, pack)
+		if err != nil {
+			return inference.ContextPack{}, fmt.Errorf("estimate context tokens: %w", err)
+		}
+		if tokens < 0 {
+			return inference.ContextPack{}, invalid(
+				"token estimator returned a negative count")
+		}
+		if tokens > limits.MaxContextTokens {
+			return inference.ContextPack{}, invalid("context pack exceeds the token bound")
+		}
+	}
+	return pack, nil
 }
 
 func rebuildPack(
+	ctx context.Context,
 	pack inference.ContextPack,
 	anchors []inference.EvidenceAnchor,
 	limits Limits,
+	estimator TokenEstimator,
 ) (inference.ContextPack, error) {
 	var ontology *inference.OntologyIdentity
 	if value, ok := pack.Ontology(); ok {
 		ontology = &value
 	}
-	return buildPack(pack.Query(), anchors, Pins{
+	return buildPack(ctx, pack.Query(), anchors, Pins{
 		Snapshot: pack.Snapshot(), Authorization: pack.Authorization(), Ontology: ontology,
-	}, pack.Metadata(), limits)
+	}, pack.Metadata(), limits, estimator)
 }
 
 func canonicalAnchors(
@@ -994,6 +1029,9 @@ func enforcePackBounds(
 ) error {
 	if len(anchors) > limits.MaxAnchors {
 		return invalid("context evidence exceeds the anchor bound")
+	}
+	if metadataBytes(metadata) > limits.MaxProvenanceBytes {
+		return invalid("context metadata and provenance exceed the byte bound")
 	}
 	contextBytes, quoteBytes, graphNodes, graphEdges, err :=
 		contextPackByteSize(query, anchors, pins, metadata, limits.MaxPathNodes)
@@ -1089,6 +1127,9 @@ func normalizeLimits(input Limits) (Limits, error) {
 	} {
 		if value <= 0 {
 			return Limits{}, invalid(name + " limit must be positive")
+		}
+		if limits.MaxContextTokens < 0 {
+			return Limits{}, invalid("context token limit cannot be negative")
 		}
 	}
 	if limits.MaxResults > int(retrieval.MaxTopK) {
@@ -1214,7 +1255,7 @@ func clonePath(path graph.Path) graph.Path {
 }
 
 func cloneMetadata(metadata shoal.Metadata) shoal.Metadata {
-	if metadata == nil {
+	if len(metadata) == 0 {
 		return nil
 	}
 	cloned := make(shoal.Metadata, len(metadata))

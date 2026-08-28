@@ -49,13 +49,17 @@ authorized Explorer retrieval and `inference.ContextPack`. Its builder:
 - records content-derived retrieval/result/explanation identity without
   placing explanation prose in model context;
 - applies fail-closed result, evidence, document, section, graph, path, quote,
-  metadata/provenance, and total-context limits; and
+  metadata/provenance, total-context byte, and optional caller-tokenizer limits;
+  and
 - exposes explicit `OpenSection` and `ExpandNeighbors` operations that produce
   a new immutable pack. Duplicate evidence is canonical-deduplicated only when
   its immutable anchor identity and content are identical.
 
 Callers may supply already authorized public document views and neighborhoods,
 or let the builder hydrate missing values through `contextpack.Reader`.
+Callers that configure `MaxContextTokens` also supply a provider-neutral
+`TokenEstimator`; the builder invokes it only on the completed immutable pack
+and never contacts a model provider.
 Unauthorized and absent content therefore retain the reader's
 indistinguishable not-found behavior. The package contains no storage rows,
 Accumulo visibility expressions, credentials, raw grants, generated prose, or

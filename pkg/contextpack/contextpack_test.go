@@ -29,6 +29,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/phrocker/shoal-oss/pkg/document"
 	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/graph"
 	"github.com/phrocker/shoal-oss/pkg/inference"
@@ -171,7 +172,7 @@ func TestOpenSectionAndExpandNeighborsAreExplicitBoundedAndImmutable(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	citation, _, _ := initial.Evidence()[0].Document()
+	citation := firstDocumentCitation(t, initial)
 	view, err := client.Document(context.Background(), citation.DocumentID, citation.RevisionID)
 	if err != nil {
 		t.Fatal(err)
@@ -230,6 +231,13 @@ func TestOpenSectionAndExpandNeighborsAreExplicitBoundedAndImmutable(t *testing.
 	_, err = builder.OpenSection(context.Background(), initial, OpenSectionRequest{
 		DocumentID: citation.DocumentID, RevisionID: citation.RevisionID,
 		SectionIDs: []shoal.ID{sectionID, sectionID},
+	})
+	assertCode(t, err, shoal.ErrorInvalidArgument)
+	_, err = (Builder{
+		Reader: client, Limits: Limits{MaxProvenanceBytes: 1},
+	}).OpenSection(context.Background(), initial, OpenSectionRequest{
+		DocumentID: citation.DocumentID, RevisionID: citation.RevisionID,
+		SectionIDs: []shoal.ID{sectionID},
 	})
 	assertCode(t, err, shoal.ErrorInvalidArgument)
 	_, err = builder.ExpandNeighbors(context.Background(), full, ExpandNeighborsRequest{
@@ -327,8 +335,10 @@ func TestFollowUpCanonicalizesGraphLabels(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	hydrated := node
+	hydrated.Properties = shoal.Metadata{}
 	reader := &recordingReader{
-		neighborhood: explorer.Neighborhood{Nodes: []graph.Node{node}},
+		neighborhood: explorer.Neighborhood{Nodes: []graph.Node{hydrated}},
 	}
 	if _, err := (Builder{Reader: reader}).ExpandNeighbors(
 		context.Background(), pack, ExpandNeighborsRequest{NodeIDs: []shoal.ID{node.ID}},
@@ -482,6 +492,51 @@ func TestHydratedDuplicatesRequireExactContentAndRequestedIdentity(t *testing.T)
 	assertCode(t, err, shoal.ErrorInvalidArgument)
 }
 
+func TestTokenBudgetAppliesToInitialAndFollowUpPacks(t *testing.T) {
+	client, request, response, pins := embeddedFixture(t)
+	limited := Builder{
+		Reader: client, Limits: Limits{MaxContextTokens: 1},
+		TokenEstimator: fixedTokenEstimator(2),
+	}
+	_, err := limited.Build(context.Background(), InitialRequest{
+		Request: request, Response: response, Pins: pins,
+	})
+	assertCode(t, err, shoal.ErrorInvalidArgument)
+
+	initial, err := (Builder{Reader: client}).Build(context.Background(), InitialRequest{
+		Request: request, Response: response, Pins: pins,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	citation := firstDocumentCitation(t, initial)
+	view, err := client.Document(context.Background(), citation.DocumentID, citation.RevisionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = limited.OpenSection(context.Background(), initial, OpenSectionRequest{
+		DocumentID: citation.DocumentID,
+		RevisionID: citation.RevisionID,
+		SectionIDs: []shoal.ID{firstSectionWithSpans(t, view.Root)},
+	})
+	assertCode(t, err, shoal.ErrorInvalidArgument)
+
+	_, err = (Builder{
+		Reader: client, Limits: Limits{MaxContextTokens: 1},
+	}).Build(context.Background(), InitialRequest{
+		Request: request, Response: response, Pins: pins,
+	})
+	assertCode(t, err, shoal.ErrorInvalidArgument)
+}
+
+type fixedTokenEstimator int
+
+func (e fixedTokenEstimator) EstimateTokens(
+	context.Context, inference.ContextPack,
+) (int, error) {
+	return int(e), nil
+}
+
 type recordingReader struct {
 	documentView      explorer.DocumentView
 	documentErr       error
@@ -607,6 +662,17 @@ func firstGraphPath(t *testing.T, pack inference.ContextPack) graph.Path {
 	}
 	t.Fatal("pack has no graph path")
 	return graph.Path{}
+}
+
+func firstDocumentCitation(t *testing.T, pack inference.ContextPack) document.Citation {
+	t.Helper()
+	for _, anchor := range pack.Evidence() {
+		if citation, _, ok := anchor.Document(); ok {
+			return citation
+		}
+	}
+	t.Fatal("pack has no document citation")
+	return document.Citation{}
 }
 
 func reverseResults(values []retrieval.Result) {
