@@ -1,4 +1,6 @@
 // Package model defines provider-neutral, low-level model I/O contracts.
+// Anthropic publishes no embeddings API; hosted embedding integrations here
+// are OpenAI-compatible endpoints and Voyage, not an Anthropic embedder.
 package model
 
 import (
@@ -31,6 +33,14 @@ type TextGenerator interface {
 // and bypass caching when a provider cannot supply one.
 type CacheIdentityProvider interface {
 	CacheIdentity() (string, error)
+}
+
+// EmbeddingSpaceIdentityProvider returns a stable, non-secret identity for the
+// vector space produced by an embedder. The identity is suitable for metadata
+// persistence and must distinguish provider kind, model identity/version pin,
+// dimensionality, and normalization convention.
+type EmbeddingSpaceIdentityProvider interface {
+	EmbeddingSpaceIdentity() (string, error)
 }
 
 // Embedder creates a vector embedding from a bounded provider-neutral request.

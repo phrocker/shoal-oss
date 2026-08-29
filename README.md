@@ -83,10 +83,17 @@ unresolved issue instead of inventing a claim. Opaque Shoal IDs in ask output
 and graph metadata keys/values are base64-encoded so document, graph, and
 evidence identifiers round-trip losslessly. The default provider is the
 deterministic fake so the command works without network access; select
-`-provider ollama` for a local Ollama model. Credentials for
-`-provider openai-compatible` are read at request time from `-api-key-env`
-(default `SHOAL_OPENAI_API_KEY`, falling back to `OPENAI_API_KEY`) and are
-never printed or stored.
+`-provider ollama` for a local Ollama model.
+
+For embeddings, the recommended local path is a real embedding model through
+`OllamaEmbedder` (for example `nomic-embed-text`, `mxbai-embed-large`, or
+`all-minilm`) or `OpenAIEmbedder` pointed at a loopback OpenAI-compatible
+server such as llama.cpp or vLLM with no API key. The `pkg/model` package also
+includes a dependency-free local lexical embedder strictly as a zero-dependency
+offline and CI fallback; it produces lexical/statistical vectors only and makes
+no semantic quality claim. Anthropic publishes no embeddings API, so hosted
+embedding paths are OpenAI-compatible endpoints or Voyage. Credentials for
+hosted providers are resolved at request time and are never printed or stored.
 
 ### Optional local web workspace
 

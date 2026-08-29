@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -41,6 +42,26 @@ func TestFakeProvidersDeterministicAndIsolated(t *testing.T) {
 	}
 	if generated.Provenance.Provider != "fake" || third.Provenance.Provider != "fake" {
 		t.Fatal("missing fake provenance")
+	}
+}
+
+func TestFakeEmbeddingSpaceIdentity(t *testing.T) {
+	embedder := FakeEmbedder{Dimensions: 8, Model: "deterministic"}
+	identity, err := embedder.CacheIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	space, err := embedder.EmbeddingSpaceIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"fake", "deterministic", "8", normalizationL2} {
+		if !strings.Contains(identity, want) {
+			t.Fatalf("identity %q missing %q", identity, want)
+		}
+		if !strings.Contains(space, want) {
+			t.Fatalf("space identity %q missing %q", space, want)
+		}
 	}
 }
 

@@ -196,6 +196,7 @@ func TestOllamaResponseValidationAndRedaction(t *testing.T) {
 		{name: "negative infinity vector", status: http.StatusOK, body: `{"embedding":[-Infinity]}`, want: ErrMalformedResponse},
 		{name: "overflow vector", status: http.StatusOK, body: `{"embedding":[1e400]}`, want: ErrMalformedResponse},
 		{name: "oversized vector", status: http.StatusOK, body: `{"embedding":[1,2,3]}`, config: func(c *OllamaConfig) { c.MaxVectorDimensions = 2 }, want: ErrOversizedResponse},
+		{name: "dimension mismatch", status: http.StatusOK, body: `{"embedding":[1,2,3]}`, config: func(c *OllamaConfig) { c.Dimensions = 2 }, want: ErrMalformedResponse},
 		{name: "invalid usage", status: http.StatusOK, body: `{"embedding":[1],"prompt_eval_count":-1}`, want: ErrMalformedResponse},
 	}
 
@@ -224,6 +225,34 @@ func TestOllamaResponseValidationAndRedaction(t *testing.T) {
 				t.Fatalf("error leaked or was unbounded: %q", err)
 			}
 		})
+	}
+}
+
+func TestOllamaEmbeddingSpaceIdentity(t *testing.T) {
+	embedder, err := NewOllamaEmbedder(OllamaConfig{
+		BaseURL:    "http://localhost:11434",
+		Model:      "nomic-embed-text",
+		Dimensions: 768,
+		HTTPClient: &http.Client{Transport: identityTransport{identity: "transport-v1"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity, err := embedder.CacheIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	space, err := embedder.EmbeddingSpaceIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"ollama", "nomic-embed-text", "768", normalizationProviderNativeUnchanged} {
+		if !strings.Contains(identity, want) {
+			t.Fatalf("identity %q missing %q", identity, want)
+		}
+		if !strings.Contains(space, want) {
+			t.Fatalf("space identity %q missing %q", space, want)
+		}
 	}
 }
 
