@@ -135,7 +135,7 @@ func TestEvaluationDetectsNegativeCases(t *testing.T) {
 	})
 
 	t.Run("invalid graph path", func(t *testing.T) {
-		graphCase := cases[2:3]
+		graphCase := []EvaluationCase{cases[2]}
 		graphCase[0].GraphPaths = map[shoal.ID]graph.Path{}
 		report, err := runFixtureEvaluation(t, graphCase, now)
 		if err != nil {
@@ -143,6 +143,26 @@ func TestEvaluationDetectsNegativeCases(t *testing.T) {
 		}
 		if report.Summary.InvalidGraphPathRefs != 1 {
 			t.Fatalf("invalid graph path was not detected: %#v", report.Summary)
+		}
+	})
+
+	t.Run("invalid graph path metadata", func(t *testing.T) {
+		graphCase := []EvaluationCase{cases[2]}
+		anchorID := graphCase[0].Pack.Evidence()[0].ID()
+		want := graphCase[0].GraphPaths[anchorID]
+		want.Nodes = append([]graph.Node(nil), want.Nodes...)
+		want.Edges = append([]graph.Edge(nil), want.Edges...)
+		want.Nodes[0].Labels = []string{"unexpected-label"}
+		want.Nodes[0].Properties = shoal.Metadata{"unexpected": "node"}
+		want.Edges[0].Weight = 0.5
+		want.Edges[0].Properties = shoal.Metadata{"unexpected": "edge"}
+		graphCase[0].GraphPaths = map[shoal.ID]graph.Path{anchorID: want}
+		report, err := runFixtureEvaluation(t, graphCase, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if report.Summary.InvalidGraphPathRefs != 1 {
+			t.Fatalf("invalid graph path metadata was not detected: %#v", report.Summary)
 		}
 	})
 

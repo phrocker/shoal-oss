@@ -20,7 +20,7 @@ func configuredCacheIdentity(value any) (string, bool, error) {
 
 func httpClientCacheIdentity(client *http.Client) (string, bool, error) {
 	if client == nil {
-		return "default-http-client-v1", true, nil
+		return "", false, nil
 	}
 	if identity, ok, err := configuredCacheIdentity(client); ok || err != nil {
 		return identity, ok, err
@@ -29,7 +29,7 @@ func httpClientCacheIdentity(client *http.Client) (string, bool, error) {
 		return "", false, nil
 	}
 	if client.Transport == nil {
-		return "custom-http-client-default-transport-v1", true, nil
+		return "", false, nil
 	}
 	if identity, ok, err := configuredCacheIdentity(client.Transport); ok || err != nil {
 		return "custom-http-client-transport:" + identity, ok, err

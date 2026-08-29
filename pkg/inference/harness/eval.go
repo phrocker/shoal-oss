@@ -25,6 +25,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -239,20 +240,56 @@ func validateFixtureGraphPath(anchorID shoal.ID, path graph.Path, expected map[s
 		return invalid("graph evidence path does not match fixture oracle")
 	}
 	for i := range path.Nodes {
-		if path.Nodes[i].ID != want.Nodes[i].ID ||
-			path.Nodes[i].Kind != want.Nodes[i].Kind {
+		if !fixtureGraphNodesEqual(path.Nodes[i], want.Nodes[i]) {
 			return invalid("graph evidence path node does not match fixture oracle")
 		}
 	}
 	for i := range path.Edges {
-		if path.Edges[i].ID != want.Edges[i].ID ||
-			path.Edges[i].From != want.Edges[i].From ||
-			path.Edges[i].To != want.Edges[i].To ||
-			path.Edges[i].Type != want.Edges[i].Type {
+		if !fixtureGraphEdgesEqual(path.Edges[i], want.Edges[i]) {
 			return invalid("graph evidence path edge does not match fixture oracle")
 		}
 	}
 	return nil
+}
+
+func fixtureGraphNodesEqual(got, want graph.Node) bool {
+	return got.ID == want.ID &&
+		got.Kind == want.Kind &&
+		stringSlicesEqual(got.Labels, want.Labels) &&
+		metadataEqual(got.Properties, want.Properties)
+}
+
+func fixtureGraphEdgesEqual(got, want graph.Edge) bool {
+	return got.ID == want.ID &&
+		got.From == want.From &&
+		got.To == want.To &&
+		got.Type == want.Type &&
+		math.Float64bits(float64(got.Weight)) == math.Float64bits(float64(want.Weight)) &&
+		metadataEqual(got.Properties, want.Properties)
+}
+
+func stringSlicesEqual(got, want []string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func metadataEqual(got, want shoal.Metadata) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for key, gotValue := range got {
+		if wantValue, ok := want[key]; !ok || wantValue != gotValue {
+			return false
+		}
+	}
+	return true
 }
 
 func claimMatchesExpected(claim inference.Claim, expected []ExpectedClaim) bool {
