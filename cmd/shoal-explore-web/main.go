@@ -70,7 +70,7 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 	)
 	embeddingDimensions := flags.Int(
 		"embedding-dimensions", 0,
-		"Fake embedding dimensions; zero uses the provider default",
+		"Embedding dimensions; required for ollama/openai, zero uses fake default",
 	)
 	if err := flags.Parse(args); err != nil {
 		return err
@@ -138,15 +138,23 @@ func (c embeddingConfig) embedder() (model.Embedder, error) {
 	case "fake":
 		return model.FakeEmbedder{Dimensions: c.dimensions, Model: c.model}, nil
 	case "ollama":
+		if c.dimensions <= 0 {
+			return nil, fmt.Errorf("embedding dimensions are required for ollama")
+		}
 		return model.NewOllamaEmbedder(model.OllamaConfig{
-			BaseURL: c.baseURL,
-			Model:   c.model,
+			BaseURL:    c.baseURL,
+			Model:      c.model,
+			Dimensions: c.dimensions,
 		})
 	case "openai":
+		if c.dimensions <= 0 {
+			return nil, fmt.Errorf("embedding dimensions are required for openai")
+		}
 		return model.NewOpenAIEmbedder(model.OpenAIConfig{
-			BaseURL:        c.baseURL,
-			EmbeddingModel: c.model,
-			Credentials:    envCredentialResolver(c.apiKeyEnv),
+			BaseURL:             c.baseURL,
+			EmbeddingModel:      c.model,
+			EmbeddingDimensions: c.dimensions,
+			Credentials:         envCredentialResolver(c.apiKeyEnv),
 		})
 	default:
 		return nil, fmt.Errorf("unknown embedding provider %q", c.provider)

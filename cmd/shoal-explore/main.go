@@ -306,7 +306,7 @@ func addEmbeddingFlags(flags *flag.FlagSet) embeddingFlags {
 		),
 		dimensions: flags.Int(
 			"embedding-dimensions", 0,
-			"Fake embedding dimensions; zero uses the provider default",
+			"Embedding dimensions; required for ollama/openai, zero uses fake default",
 		),
 	}
 }
@@ -320,16 +320,24 @@ func (f embeddingFlags) embedder() (model.Embedder, error) {
 			Model: *f.model, Dimensions: *f.dimensions,
 		}, nil
 	case "ollama":
+		if *f.dimensions <= 0 {
+			return nil, fmt.Errorf("embedding dimensions are required for ollama")
+		}
 		return model.NewOllamaEmbedder(model.OllamaConfig{
-			BaseURL: *f.baseURL,
-			Model:   *f.model,
+			BaseURL:    *f.baseURL,
+			Model:      *f.model,
+			Dimensions: *f.dimensions,
 		})
 	case "openai":
+		if *f.dimensions <= 0 {
+			return nil, fmt.Errorf("embedding dimensions are required for openai")
+		}
 		envName := *f.apiKeyEnv
 		return model.NewOpenAIEmbedder(model.OpenAIConfig{
-			BaseURL:        *f.baseURL,
-			EmbeddingModel: *f.model,
-			Credentials:    envCredentialResolver(envName),
+			BaseURL:             *f.baseURL,
+			EmbeddingModel:      *f.model,
+			EmbeddingDimensions: *f.dimensions,
+			Credentials:         envCredentialResolver(envName),
 		})
 	default:
 		return nil, fmt.Errorf("unknown embedding provider %q", *f.provider)

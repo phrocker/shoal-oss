@@ -31,6 +31,7 @@ import (
 	"time"
 
 	"github.com/phrocker/shoal-oss/pkg/explorer"
+	"github.com/phrocker/shoal-oss/pkg/model"
 )
 
 func TestDocumentedWebWorkspaceStartServesMeta(t *testing.T) {
@@ -109,6 +110,39 @@ func TestDefaultListenAddressIsDocumented(t *testing.T) {
 	if !bytes.Contains(source, []byte("-listen 127.0.0.1:8080")) ||
 		!bytes.Contains(source, []byte("The default listen address is also `127.0.0.1:8080`")) {
 		t.Fatalf("walkthrough does not document the default listen address")
+	}
+}
+
+func TestEmbeddingFlagsRequireAndForwardRemoteDimensions(t *testing.T) {
+	for _, provider := range []string{"ollama", "openai"} {
+		t.Run(provider, func(t *testing.T) {
+			_, err := (embeddingConfig{
+				provider: provider, model: "embed-model",
+				baseURL: "http://127.0.0.1:11434",
+			}).embedder()
+			if err == nil {
+				t.Fatal("missing embedding dimensions succeeded")
+			}
+
+			embedder, err := (embeddingConfig{
+				provider: provider, model: "embed-model",
+				baseURL: "http://127.0.0.1:11434", dimensions: 8,
+			}).embedder()
+			if err != nil {
+				t.Fatal(err)
+			}
+			space, ok := embedder.(model.EmbeddingSpaceIdentityProvider)
+			if !ok {
+				t.Fatal("embedder does not expose embedding space identity")
+			}
+			identity, err := space.EmbeddingSpaceIdentity()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(identity, "8") {
+				t.Fatalf("identity did not include dimensions: %q", identity)
+			}
+		})
 	}
 }
 

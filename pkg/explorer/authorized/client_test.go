@@ -631,6 +631,17 @@ func TestAuthorizedVectorCapabilityCachesVisibleProjection(t *testing.T) {
 	if documentCalls != 1 || scorer.calls != 1 {
 		t.Fatalf("cache misses: documents=%d scores=%d", documentCalls, scorer.calls)
 	}
+	f.clock.Set(f.clock.Now().Add(-time.Minute))
+	available, err := client.VectorAvailable(f.alice(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !available {
+		t.Fatal("vector unexpectedly unavailable after clock rollback")
+	}
+	if documentCalls != 2 || scorer.calls != 2 {
+		t.Fatalf("rollback reused cache: documents=%d scores=%d", documentCalls, scorer.calls)
+	}
 }
 
 func TestAuthorizedVectorCapabilityRequiresBaseRetrievalSupport(t *testing.T) {

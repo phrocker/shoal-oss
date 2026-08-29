@@ -194,8 +194,9 @@ func (c *Client) cachedAuthorizedVectorAvailability(
 	c.vectorMu.Lock()
 	defer c.vectorMu.Unlock()
 	cached := c.vectorAvailability
+	age := now.Sub(cached.checkedAt)
 	if cached.key == key && !cached.checkedAt.IsZero() &&
-		now.Sub(cached.checkedAt) < time.Minute {
+		age >= 0 && age < time.Minute {
 		return cached.available, true
 	}
 	return false, false
