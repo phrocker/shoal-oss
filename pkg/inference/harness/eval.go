@@ -22,23 +22,41 @@ package harness
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/phrocker/shoal-oss/pkg/document"
 	"github.com/phrocker/shoal-oss/pkg/inference"
+	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
 const FixtureEvaluationVersion = "shoal-grounded-inference-eval-v1"
 
 type EvaluationCase struct {
-	ID   string
-	Pack inference.ContextPack
+	ID             string
+	Pack           inference.ContextPack
+	ExpectedClaims []ExpectedClaim
+	Sources        map[DocumentRevision]string
+}
+
+type ExpectedClaim struct {
+	Subject     shoal.ID
+	Predicate   shoal.ID
+	Object      ontology.Value
+	EvidenceIDs []shoal.ID
+}
+
+type DocumentRevision struct {
+	DocumentID shoal.ID
+	RevisionID shoal.ID
 }
 
 type EvaluationReport struct {
@@ -54,6 +72,7 @@ type EvaluationCaseReport struct {
 	ResultID                string      `json:"result_id,omitempty"`
 	StopReason              StopReason  `json:"stop_reason"`
 	Iterations              int         `json:"iterations"`
+	TraceDigest             string      `json:"trace_digest"`
 	Budget                  BudgetUsage `json:"budget"`
 	Claims                  int         `json:"claims"`
 	SupportedClaims         int         `json:"supported_claims"`
@@ -97,7 +116,7 @@ func Evaluate(ctx context.Context, generator *Generator, cases []EvaluationCase,
 			return EvaluationReport{}, invalid("evaluation case ID is required")
 		}
 		record, err := generator.Run(ctx, tc.Pack)
-		caseReport := evaluateRecord(tc.ID, tc.Pack, record, err)
+		caseReport := evaluateRecord(tc, record, err)
 		report.Cases = append(report.Cases, caseReport)
 		report.Summary.CaseCount++
 		report.Summary.ClaimCount += caseReport.Claims
@@ -123,27 +142,28 @@ func (r EvaluationReport) CanonicalJSON() ([]byte, error) {
 	return json.MarshalIndent(r, "", "  ")
 }
 
-func evaluateRecord(id string, pack inference.ContextPack, record Record, runErr error) EvaluationCaseReport {
+func evaluateRecord(tc EvaluationCase, record Record, runErr error) EvaluationCaseReport {
 	resultID := ""
 	if runErr == nil {
 		resultID = string(record.Result.ID())
 	}
 	out := EvaluationCaseReport{
-		ID:            id,
-		ContextPackID: string(pack.ID()),
+		ID:            tc.ID,
+		ContextPackID: string(tc.Pack.ID()),
 		ResultID:      resultID,
 		StopReason:    record.Trace.StopReason,
 		Iterations:    len(record.Trace.Iterations),
+		TraceDigest:   traceDigest(record.Trace),
 		Budget:        record.Trace.Usage,
 	}
 	if runErr != nil {
 		out.Error = runErr.Error()
 		return out
 	}
-	available := evidenceIndex(pack.Evidence(), record.Result.EvidenceAdditions())
+	available := evidenceIndex(tc.Pack.Evidence(), record.Result.EvidenceAdditions())
 	for _, claim := range record.Result.Claims() {
 		out.Claims++
-		ok := true
+		ok := claimMatchesExpected(claim, tc.ExpectedClaims)
 		for _, evidenceID := range claim.EvidenceIDs() {
 			anchor, found := available[evidenceID]
 			if !found {
@@ -152,9 +172,9 @@ func evaluateRecord(id string, pack inference.ContextPack, record Record, runErr
 				continue
 			}
 			out.ValidEvidenceReferences++
-			if citation, _, cited := anchor.Document(); cited {
+			if citation, quote, cited := anchor.Document(); cited {
 				out.CitationReferences++
-				if err := citation.Validate(); err != nil {
+				if err := validateFixtureCitation(citation, quote, tc.Sources); err != nil {
 					out.InvalidCitationRefs++
 					ok = false
 				}
@@ -166,6 +186,125 @@ func evaluateRecord(id string, pack inference.ContextPack, record Record, runErr
 	}
 	out.UnsupportedIssues = len(record.Result.Unsupported())
 	return out
+}
+
+func claimMatchesExpected(claim inference.Claim, expected []ExpectedClaim) bool {
+	for _, item := range expected {
+		if claim.Subject() != item.Subject || claim.Predicate() != item.Predicate ||
+			!ontologyValuesEqual(claim.Object(), item.Object) {
+			continue
+		}
+		claimEvidence := claim.EvidenceIDs()
+		expectedEvidence := append([]shoal.ID(nil), item.EvidenceIDs...)
+		sort.Slice(expectedEvidence, func(i, j int) bool {
+			return shoal.CompareID(expectedEvidence[i], expectedEvidence[j]) < 0
+		})
+		if len(claimEvidence) != len(expectedEvidence) {
+			continue
+		}
+		matches := true
+		for i := range claimEvidence {
+			if claimEvidence[i] != expectedEvidence[i] {
+				matches = false
+				break
+			}
+		}
+		if matches {
+			return true
+		}
+	}
+	return false
+}
+
+func ontologyValuesEqual(left, right ontology.Value) bool {
+	if left.Type() != right.Type() {
+		return false
+	}
+	switch left.Type() {
+	case ontology.ValueString:
+		l, _ := left.StringValue()
+		r, _ := right.StringValue()
+		return l == r
+	case ontology.ValueInteger:
+		l, _ := left.IntegerValue()
+		r, _ := right.IntegerValue()
+		return l == r
+	case ontology.ValueNumber:
+		l, _ := left.NumberValue()
+		r, _ := right.NumberValue()
+		return l == r
+	case ontology.ValueBoolean:
+		l, _ := left.BooleanValue()
+		r, _ := right.BooleanValue()
+		return l == r
+	case ontology.ValueTimestamp:
+		l, _ := left.TimestampValue()
+		r, _ := right.TimestampValue()
+		return l.Equal(r)
+	case ontology.ValueReference:
+		l, _ := left.ReferenceValue()
+		r, _ := right.ReferenceValue()
+		return l == r
+	default:
+		return false
+	}
+}
+
+func validateFixtureCitation(citation document.Citation, quote string, sources map[DocumentRevision]string) error {
+	if err := citation.Validate(); err != nil {
+		return err
+	}
+	source, ok := sources[DocumentRevision{DocumentID: citation.DocumentID, RevisionID: citation.RevisionID}]
+	if !ok {
+		return invalid("citation source is absent from fixture case")
+	}
+	start, end := citation.Range.Start.Offset, citation.Range.End.Offset
+	if start < 0 || end <= start || end > int64(len(source)) {
+		return invalid("citation range is outside the fixture source")
+	}
+	if source[int(start):int(end)] != quote {
+		return invalid("citation quote does not match fixture source")
+	}
+	return nil
+}
+
+func traceDigest(trace RunTrace) string {
+	digest := sha256.New()
+	for _, iteration := range trace.Iterations {
+		writeDigestPart(digest, strconv.Itoa(iteration.Index))
+		writeDigestPart(digest, string(iteration.Decision))
+		writeDigestPart(digest, iteration.ActionKey)
+		writeDigestPart(digest, string(iteration.CorrelationID))
+		writeDigestPart(digest, strconv.Itoa(iteration.Usage.InputTokens))
+		writeDigestPart(digest, strconv.Itoa(iteration.Usage.OutputTokens))
+		writeDigestPart(digest, strconv.Itoa(iteration.Budget.ModelCalls))
+		writeDigestPart(digest, strconv.Itoa(iteration.Budget.InputTokens))
+		writeDigestPart(digest, strconv.Itoa(iteration.Budget.OutputTokens))
+		writeDigestPart(digest, strconv.Itoa(iteration.Budget.Evidence))
+		writeDigestPart(digest, strconv.Itoa(iteration.Budget.GraphHops))
+		writeDigestPart(digest, strconv.Itoa(iteration.Budget.GraphNodes))
+		writeDigestPart(digest, iteration.Failure)
+		for _, id := range iteration.EvidenceIDs {
+			writeDigestPart(digest, string(id))
+		}
+	}
+	writeDigestPart(digest, string(trace.StopReason))
+	for _, failure := range trace.Failures {
+		writeDigestPart(digest, strconv.Itoa(failure.Iteration))
+		writeDigestPart(digest, failure.Operation)
+		writeDigestPart(digest, failure.Error)
+	}
+	return "sha256:" + hex.EncodeToString(digest.Sum(nil))
+}
+
+type digestWriter interface {
+	Write([]byte) (int, error)
+}
+
+func writeDigestPart(digest digestWriter, part string) {
+	_, _ = digest.Write([]byte(strconv.Itoa(len(part))))
+	_, _ = digest.Write([]byte{':'})
+	_, _ = digest.Write([]byte(part))
 }
 
 func evidenceIndex(anchors ...[]inference.EvidenceAnchor) map[shoal.ID]inference.EvidenceAnchor {
@@ -258,6 +397,10 @@ func LoadFixtureEvaluationCases(root string, generatedAt time.Time) ([]Evaluatio
 		if err != nil {
 			return nil, err
 		}
+		value, err := ontology.NewStringValue("grounded")
+		if err != nil {
+			return nil, err
+		}
 		pack, err := inference.NewContextPack(
 			spec.query, []inference.EvidenceAnchor{anchor}, nil,
 			snapshot, auth, shoal.Metadata{"fixture": "explorer-eval"},
@@ -265,7 +408,19 @@ func LoadFixtureEvaluationCases(root string, generatedAt time.Time) ([]Evaluatio
 		if err != nil {
 			return nil, err
 		}
-		cases = append(cases, EvaluationCase{ID: spec.id, Pack: pack})
+		cases = append(cases, EvaluationCase{
+			ID:   spec.id,
+			Pack: pack,
+			ExpectedClaims: []ExpectedClaim{{
+				Subject:     "entity:fake",
+				Predicate:   "predicate:summary",
+				Object:      value,
+				EvidenceIDs: []shoal.ID{anchor.ID()},
+			}},
+			Sources: map[DocumentRevision]string{
+				DocumentRevision{DocumentID: spec.documentID, RevisionID: spec.revisionID}: string(content),
+			},
+		})
 	}
 	return cases, nil
 }

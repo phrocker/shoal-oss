@@ -547,6 +547,7 @@ type BudgetUsage struct {
 type IterationTrace struct {
 	Index         int
 	Decision      ActionKind
+	ActionKey     string
 	CorrelationID shoal.ID
 	Usage         Usage
 	EvidenceIDs   []shoal.ID
@@ -755,7 +756,7 @@ func (g *Generator) Run(ctx context.Context, pack inference.ContextPack) (Record
 		}
 		iteration := IterationTrace{
 			Index: step, Decision: action.kind, CorrelationID: action.correlation,
-			Usage: action.usage,
+			ActionKey: actionKey(action), Usage: action.usage,
 		}
 		trace.Iterations = append(trace.Iterations, iteration)
 		if err := action.validate(); err != nil {

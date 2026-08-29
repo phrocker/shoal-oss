@@ -87,11 +87,22 @@ func (r *ModelRunner) CacheIdentity() (string, error) {
 	if r == nil || r.generator == nil {
 		return "", ErrCacheIdentityUnsafe
 	}
+	generatorIdentity, err := dependencyCacheIdentity(r.generator, "model generator")
+	if err != nil {
+		return "", err
+	}
+	estimatorIdentity := "byte-estimator-v1"
+	if r.cfg.TokenEstimator != nil {
+		estimatorIdentity, err = dependencyCacheIdentity(r.cfg.TokenEstimator, "token estimator")
+		if err != nil {
+			return "", err
+		}
+	}
 	identity := framed(
 		"model-runner-v1",
-		fmt.Sprintf("%T", r.generator),
+		generatorIdentity,
 		strconv.Itoa(r.cfg.MaxOutputTokens),
-		fmt.Sprintf("%T", r.cfg.TokenEstimator),
+		estimatorIdentity,
 	)
 	if unsafeCacheText(identity) {
 		return "", ErrCacheIdentityUnsafe

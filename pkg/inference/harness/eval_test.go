@@ -28,6 +28,8 @@ import (
 
 	"github.com/phrocker/shoal-oss/pkg/inference"
 	lowmodel "github.com/phrocker/shoal-oss/pkg/model"
+	"github.com/phrocker/shoal-oss/pkg/ontology"
+	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
 func TestDeterministicFixtureEvaluationReport(t *testing.T) {
@@ -66,23 +68,116 @@ func TestDeterministicFixtureEvaluationReport(t *testing.T) {
 	}
 	for _, report := range first.Cases {
 		if report.Iterations != 2 || report.Budget.ModelCalls != 2 ||
-			report.ValidEvidenceReferences != 1 || report.CitationReferences != 1 {
+			report.ValidEvidenceReferences != 1 || report.CitationReferences != 1 ||
+			report.TraceDigest == "" {
 			t.Fatalf("case metrics not defensible: %#v", report)
 		}
 	}
 }
 
+func TestEvaluationDetectsNegativeCases(t *testing.T) {
+	now := time.Date(2026, 8, 28, 12, 0, 0, 0, time.UTC)
+	root := filepath.Join("..", "..", "..", "testdata", "explorer-eval")
+	cases, err := LoadFixtureEvaluationCases(root, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := cases[:1]
+
+	t.Run("unsupported claim", func(t *testing.T) {
+		g := scriptedEvaluationGenerator(t, now, func(_ context.Context, tr Transcript) (Action, error) {
+			value, _ := ontology.NewStringValue("not-grounded")
+			claim, err := inference.NewClaim(
+				"subject:unexpected", "predicate:summary", value, 1,
+				[]shoal.ID{tr.Context().Evidence()[0].ID()}, inference.ClaimInferred,
+				evalModelProvenance(t), evalPromptProvenance(t), nil,
+			)
+			if err != nil {
+				return Action{}, err
+			}
+			result, err := inference.NewInferenceResult(tr.Context(), []inference.Claim{claim}, nil, now, nil)
+			if err != nil {
+				return Action{}, err
+			}
+			return NewStopAction("stop", result, Usage{})
+		})
+		report, err := Evaluate(context.Background(), g, base, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if report.Summary.SupportedClaimCount != 0 || report.Summary.GroundingSupportRate != 0 {
+			t.Fatalf("unsupported claim counted as supported: %#v", report.Summary)
+		}
+	})
+
+	t.Run("stale citation", func(t *testing.T) {
+		stale := append([]EvaluationCase(nil), base...)
+		stale[0].Sources = map[DocumentRevision]string{
+			DocumentRevision{DocumentID: "aster-relay-protocol", RevisionID: "r2"}: "fixture contents changed",
+		}
+		report, err := runFixtureEvaluation(t, stale, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if report.Summary.InvalidCitationRefs != 1 {
+			t.Fatalf("stale citation was not detected: %#v", report.Summary)
+		}
+	})
+
+	t.Run("budget violation", func(t *testing.T) {
+		g := scriptedEvaluationGenerator(t, now, func(context.Context, Transcript) (Action, error) {
+			return mustRetrieve(t, "retrieve", "more", 1), nil
+		})
+		g.budgets.MaxSteps = 1
+		report, err := Evaluate(context.Background(), g, base, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if report.Cases[0].StopReason != StopReasonBudgetExhausted || report.Cases[0].Error == "" {
+			t.Fatalf("budget violation not reported: %#v", report.Cases[0])
+		}
+	})
+}
+
+func TestEvaluationTraceDigestDetectsDifferentToolTraces(t *testing.T) {
+	now := time.Date(2026, 8, 28, 12, 0, 0, 0, time.UTC)
+	root := filepath.Join("..", "..", "..", "testdata", "explorer-eval")
+	cases, err := LoadFixtureEvaluationCases(root, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	makeRunner := func(query string) *Generator {
+		return scriptedEvaluationGenerator(t, now,
+			func(context.Context, Transcript) (Action, error) {
+				return mustRetrieve(t, "retrieve", query, 1), nil
+			},
+			func(_ context.Context, tr Transcript) (Action, error) {
+				result := evalResultFor(t, tr.Context(), tr.Context().Evidence()[0], now)
+				return NewStopAction("stop", result, Usage{})
+			},
+		)
+	}
+	first, err := Evaluate(context.Background(), makeRunner("alpha"), cases[:1], now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := Evaluate(context.Background(), makeRunner("beta"), cases[:1], now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Cases[0].Iterations != second.Cases[0].Iterations ||
+		first.Cases[0].Budget != second.Cases[0].Budget {
+		t.Fatal("test setup should differ only by trace identity")
+	}
+	if first.Cases[0].TraceDigest == second.Cases[0].TraceDigest {
+		t.Fatal("different tool traces produced identical report digest")
+	}
+}
+
 func runFixtureEvaluation(t *testing.T, cases []EvaluationCase, now time.Time) (EvaluationReport, error) {
 	t.Helper()
-	seed := int64(1)
-	modelProvenance, err := inference.NewModelProvenance("fake", "deterministic", "v1", nil, &seed)
-	if err != nil {
-		t.Fatal(err)
-	}
-	prompt, err := inference.NewPromptProvenance("agent", "v1", "sha256:"+strings.Repeat("b", 64))
-	if err != nil {
-		t.Fatal(err)
-	}
+	modelProvenance := evalModelProvenance(t)
+	prompt := evalPromptProvenance(t)
 	provenance, err := NewProvenance("fixture-harness", modelProvenance, prompt, "fixture-tools-v1")
 	if err != nil {
 		t.Fatal(err)
@@ -91,6 +186,21 @@ func runFixtureEvaluation(t *testing.T, cases []EvaluationCase, now time.Time) (
 	if err != nil {
 		t.Fatal(err)
 	}
+	g := evalGenerator(t, runner, now, provenance)
+	return Evaluate(context.Background(), g, cases, now)
+}
+
+func scriptedEvaluationGenerator(t *testing.T, now time.Time, steps ...ScriptStep) *Generator {
+	t.Helper()
+	provenance, err := NewProvenance("fixture-harness", evalModelProvenance(t), evalPromptProvenance(t), "fixture-tools-v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return evalGenerator(t, NewFakeRunner(steps...), now, provenance)
+}
+
+func evalGenerator(t *testing.T, runner Runner, now time.Time, provenance Provenance) *Generator {
+	t.Helper()
 	b := Budgets{
 		MaxSteps: 4, MaxElapsed: time.Second, MaxInputTokens: 1_000_000, MaxOutputTokens: 10_000,
 		MaxEvidence: 4, MaxGraphHops: 1, MaxGraphNodes: 4, MaxFanout: 1, MaxRepeatedAction: 1,
@@ -100,7 +210,43 @@ func runFixtureEvaluation(t *testing.T, cases []EvaluationCase, now time.Time) (
 		t.Fatal(err)
 	}
 	g.now = func() time.Time { return now }
-	return Evaluate(context.Background(), g, cases, now)
+	return g
+}
+
+func evalModelProvenance(t *testing.T) inference.ModelProvenance {
+	t.Helper()
+	seed := int64(1)
+	modelProvenance, err := inference.NewModelProvenance("fake", "deterministic", "v1", nil, &seed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return modelProvenance
+}
+
+func evalPromptProvenance(t *testing.T) inference.PromptProvenance {
+	t.Helper()
+	prompt, err := inference.NewPromptProvenance("agent", "v1", "sha256:"+strings.Repeat("b", 64))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return prompt
+}
+
+func evalResultFor(t *testing.T, pack inference.ContextPack, evidence inference.EvidenceAnchor, generatedAt time.Time) inference.InferenceResult {
+	t.Helper()
+	value, _ := ontology.NewStringValue("grounded")
+	claim, err := inference.NewClaim(
+		"entity:fake", "predicate:summary", value, 1, []shoal.ID{evidence.ID()},
+		inference.ClaimInferred, evalModelProvenance(t), evalPromptProvenance(t), nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := inference.NewInferenceResult(pack, []inference.Claim{claim}, nil, generatedAt, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return result
 }
 
 type emptyRetrieveTools struct{}

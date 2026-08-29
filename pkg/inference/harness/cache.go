@@ -32,6 +32,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/phrocker/shoal-oss/pkg/inference"
+	"github.com/phrocker/shoal-oss/pkg/ontology"
 )
 
 const (
@@ -294,19 +295,11 @@ func cacheKeyForRequest(request SessionRequest, runtimeIdentity string) (CacheKe
 }
 
 func runtimeCacheIdentity(runner Runner, tools ToolHost) (string, error) {
-	runnerProvider, ok := runner.(CacheIdentityProvider)
-	if !ok {
-		return "", ErrCacheIdentityUnsafe
-	}
-	toolProvider, ok := tools.(CacheIdentityProvider)
-	if !ok {
-		return "", ErrCacheIdentityUnsafe
-	}
-	runnerIdentity, err := runnerProvider.CacheIdentity()
+	runnerIdentity, err := dependencyCacheIdentity(runner, "runner")
 	if err != nil {
 		return "", err
 	}
-	toolIdentity, err := toolProvider.CacheIdentity()
+	toolIdentity, err := dependencyCacheIdentity(tools, "tool host")
 	if err != nil {
 		return "", err
 	}
@@ -314,6 +307,21 @@ func runtimeCacheIdentity(runner Runner, tools ToolHost) (string, error) {
 		return "", ErrCacheIdentityUnsafe
 	}
 	return framed("runtime", runnerIdentity, toolIdentity), nil
+}
+
+func dependencyCacheIdentity(value any, _ string) (string, error) {
+	provider, ok := value.(CacheIdentityProvider)
+	if !ok {
+		return "", ErrCacheIdentityUnsafe
+	}
+	identity, err := provider.CacheIdentity()
+	if err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(identity) == "" || unsafeCacheText(identity) {
+		return "", ErrCacheIdentityUnsafe
+	}
+	return identity, nil
 }
 
 func validateCachedRecord(record Record, request SessionRequest, pack inference.ContextPack) error {
@@ -333,6 +341,7 @@ func validateCachedRecord(record Record, request SessionRequest, pack inference.
 func cloneRecord(record Record) Record {
 	record.Request = cloneSessionRequest(record.Request)
 	record.Transcript = cloneTranscript(record.Transcript)
+	record.Trace = cloneRunTrace(record.Trace)
 	return record
 }
 
@@ -399,27 +408,41 @@ func unsafeContextForCache(pack inference.ContextPack) bool {
 func unsafeRecordForCache(record Record) bool {
 	if unsafeCacheText(string(record.Request.id)) ||
 		unsafeContextForCache(record.Request.context) ||
-		unsafeProvenanceForCache(record.Request.provenance) {
+		unsafeProvenanceForCache(record.Request.provenance) ||
+		unsafeContextForCache(record.Transcript.context) {
 		return true
+	}
+	for _, exchange := range record.Transcript.exchanges {
+		if unsafeActionForCache(exchange.action) {
+			return true
+		}
+		if unsafeAnchorSetForCache(exchange.result.anchors) {
+			return true
+		}
+	}
+	if record.Transcript.final != nil {
+		if unsafeActionForCache(*record.Transcript.final) ||
+			unsafeResultForCache(record.Transcript.final.result) {
+			return true
+		}
 	}
 	for _, anchor := range record.Result.EvidenceAdditions() {
 		if unsafeAnchorForCache(anchor) {
 			return true
 		}
 	}
-	for _, claim := range record.Result.Claims() {
-		if unsafeCacheText(string(claim.Subject())) || unsafeCacheText(string(claim.Predicate())) {
+	if unsafeResultForCache(record.Result) {
+		return true
+	}
+	for _, iteration := range record.Trace.Iterations {
+		if unsafeCacheText(iteration.ActionKey) ||
+			unsafeCacheText(string(iteration.CorrelationID)) {
 			return true
 		}
-		for key, value := range claim.Metadata() {
-			if unsafeCacheText(key) || unsafeCacheText(value) {
+		for _, id := range iteration.EvidenceIDs {
+			if unsafeCacheText(string(id)) {
 				return true
 			}
-		}
-	}
-	for _, issue := range append(record.Result.Unresolved(), record.Result.Unsupported()...) {
-		if unsafeCacheText(issue.Input()) || unsafeCacheText(issue.Reason()) {
-			return true
 		}
 	}
 	for _, failure := range record.Trace.Failures {
@@ -428,6 +451,81 @@ func unsafeRecordForCache(record Record) bool {
 		}
 	}
 	return false
+}
+
+func unsafeResultForCache(result inference.InferenceResult) bool {
+	for key, value := range result.Metadata() {
+		if unsafeCacheText(key) || unsafeCacheText(value) {
+			return true
+		}
+	}
+	if unsafeAnchorSetForCache(result.EvidenceAdditions()) {
+		return true
+	}
+	for _, claim := range result.Claims() {
+		if unsafeCacheText(string(claim.Subject())) || unsafeCacheText(string(claim.Predicate())) {
+			return true
+		}
+		if unsafeOntologyValueForCache(claim.Object()) {
+			return true
+		}
+		for key, value := range claim.Metadata() {
+			if unsafeCacheText(key) || unsafeCacheText(value) {
+				return true
+			}
+		}
+	}
+	for _, issue := range append(result.Unresolved(), result.Unsupported()...) {
+		if unsafeCacheText(issue.Input()) || unsafeCacheText(issue.Reason()) {
+			return true
+		}
+	}
+	return false
+}
+
+func unsafeActionForCache(action Action) bool {
+	if unsafeCacheText(string(action.correlation)) {
+		return true
+	}
+	switch action.kind {
+	case ActionRetrieve:
+		return unsafeCacheText(action.retrieve.query)
+	case ActionOpenSection:
+		return unsafeCacheText(string(action.open.documentID)) ||
+			unsafeCacheText(string(action.open.revisionID)) ||
+			unsafeCacheText(string(action.open.sectionID))
+	case ActionNeighbors:
+		return unsafeCacheText(string(action.neighbors.nodeID))
+	case ActionStop:
+		return unsafeResultForCache(action.result)
+	default:
+		return false
+	}
+}
+
+func unsafeAnchorSetForCache(anchors []inference.EvidenceAnchor) bool {
+	for _, anchor := range anchors {
+		if unsafeAnchorForCache(anchor) {
+			return true
+		}
+	}
+	return false
+}
+
+func unsafeOntologyValueForCache(value ontology.Value) bool {
+	switch value.Type() {
+	case ontology.ValueString:
+		item, _ := value.StringValue()
+		return unsafeCacheText(item)
+	case ontology.ValueReference:
+		item, _ := value.ReferenceValue()
+		return unsafeCacheText(string(item))
+	case ontology.ValueTimestamp:
+		item, _ := value.TimestampValue()
+		return unsafeCacheText(item.UTC().Format(time.RFC3339Nano))
+	default:
+		return false
+	}
 }
 
 func unsafeAnchorForCache(anchor inference.EvidenceAnchor) bool {
@@ -505,6 +603,7 @@ func recordCacheBytes(record Record) int {
 	for _, anchor := range record.Request.context.Evidence() {
 		total += anchorCacheBytes(anchor)
 	}
+	total += contextPackCacheBytes(record.Transcript.context)
 	for _, exchange := range record.Transcript.exchanges {
 		total += len(actionKey(exchange.action)) + len(exchange.action.correlation) + 32
 		for _, anchor := range exchange.result.anchors {
@@ -513,12 +612,44 @@ func recordCacheBytes(record Record) int {
 	}
 	if record.Transcript.final != nil {
 		total += len(actionKey(*record.Transcript.final)) + len(record.Transcript.final.correlation) + 32
+		total += resultCacheBytes(record.Transcript.final.result)
 	}
-	for _, anchor := range record.Result.EvidenceAdditions() {
+	total += resultCacheBytes(record.Result)
+	total += len(record.Trace.Iterations)*96 + len(record.Trace.Failures)*96
+	for _, iteration := range record.Trace.Iterations {
+		total += len(iteration.CorrelationID) + len(iteration.ActionKey)
+		for _, id := range iteration.EvidenceIDs {
+			total += len(id)
+		}
+	}
+	for _, failure := range record.Trace.Failures {
+		total += len(failure.Operation) + len(failure.Error)
+	}
+	return total
+}
+
+func contextPackCacheBytes(pack inference.ContextPack) int {
+	total := len(pack.ID()) + len(pack.Query()) + 128
+	for key, value := range pack.Metadata() {
+		total += len(key) + len(value)
+	}
+	for _, anchor := range pack.Evidence() {
 		total += anchorCacheBytes(anchor)
 	}
-	for _, claim := range record.Result.Claims() {
+	return total
+}
+
+func resultCacheBytes(result inference.InferenceResult) int {
+	total := len(result.ID()) + len(result.ContextPackID()) + 128
+	for key, value := range result.Metadata() {
+		total += len(key) + len(value)
+	}
+	for _, anchor := range result.EvidenceAdditions() {
+		total += anchorCacheBytes(anchor)
+	}
+	for _, claim := range result.Claims() {
 		total += len(claim.ID()) + len(claim.Subject()) + len(claim.Predicate()) + 64
+		total += ontologyValueCacheBytes(claim.Object())
 		for _, id := range claim.EvidenceIDs() {
 			total += len(id)
 		}
@@ -526,17 +657,29 @@ func recordCacheBytes(record Record) int {
 			total += len(key) + len(value)
 		}
 	}
-	for _, issue := range append(record.Result.Unresolved(), record.Result.Unsupported()...) {
+	for _, issue := range append(result.Unresolved(), result.Unsupported()...) {
 		total += len(issue.ID()) + len(issue.Input()) + len(issue.Reason()) + 32
 		for _, id := range issue.EvidenceIDs() {
 			total += len(id)
 		}
 	}
-	total += len(record.Trace.Iterations)*96 + len(record.Trace.Failures)*96
-	for _, failure := range record.Trace.Failures {
-		total += len(failure.Operation) + len(failure.Error)
-	}
 	return total
+}
+
+func ontologyValueCacheBytes(value ontology.Value) int {
+	switch value.Type() {
+	case ontology.ValueString:
+		item, _ := value.StringValue()
+		return len(item)
+	case ontology.ValueReference:
+		item, _ := value.ReferenceValue()
+		return len(item)
+	case ontology.ValueTimestamp:
+		item, _ := value.TimestampValue()
+		return len(item.UTC().Format(time.RFC3339Nano))
+	default:
+		return 8
+	}
 }
 
 func anchorCacheBytes(anchor inference.EvidenceAnchor) int {

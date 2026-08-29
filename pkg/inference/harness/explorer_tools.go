@@ -66,6 +66,31 @@ func (h *ExplorerToolHost) CacheIdentity() (string, error) {
 	if err := h.validate(); err != nil {
 		return "", err
 	}
+	clientIdentity, err := dependencyCacheIdentity(h.Client, "explorer client")
+	if err != nil {
+		return "", err
+	}
+	boundedIdentity := "no-bounded-client"
+	if h.BoundedClient != nil {
+		boundedIdentity, err = dependencyCacheIdentity(h.BoundedClient, "bounded explorer client")
+		if err != nil {
+			return "", err
+		}
+	}
+	readerIdentity := "no-builder-reader"
+	if h.Builder.Reader != nil {
+		readerIdentity, err = dependencyCacheIdentity(h.Builder.Reader, "context builder reader")
+		if err != nil {
+			return "", err
+		}
+	}
+	estimatorIdentity := "no-token-estimator"
+	if h.Builder.TokenEstimator != nil {
+		estimatorIdentity, err = dependencyCacheIdentity(h.Builder.TokenEstimator, "context token estimator")
+		if err != nil {
+			return "", err
+		}
+	}
 	metadataKeys := make([]string, 0, len(h.Metadata))
 	for key := range h.Metadata {
 		metadataKeys = append(metadataKeys, key)
@@ -73,8 +98,10 @@ func (h *ExplorerToolHost) CacheIdentity() (string, error) {
 	sort.Strings(metadataKeys)
 	parts := []string{
 		"explorer-tool-host-v1",
-		fmt.Sprintf("%T", h.Client),
-		fmt.Sprintf("%T", h.BoundedClient),
+		clientIdentity,
+		boundedIdentity,
+		readerIdentity,
+		estimatorIdentity,
 		string(h.PolicyID),
 		strconv.FormatBool(h.RetrievalExplain),
 	}
@@ -100,8 +127,6 @@ func (h *ExplorerToolHost) CacheIdentity() (string, error) {
 		strconv.Itoa(limits.MaxQuoteBytes),
 		strconv.Itoa(limits.MaxProvenanceBytes),
 		strconv.FormatUint(uint64(limits.MaxHierarchyDepth), 10),
-		fmt.Sprintf("%T", h.Builder.Reader),
-		fmt.Sprintf("%T", h.Builder.TokenEstimator),
 	)
 	if unsafeIdentityParts(parts) {
 		return "", ErrCacheIdentityUnsafe

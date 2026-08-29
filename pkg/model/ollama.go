@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -72,6 +73,20 @@ func NewOllamaEmbedder(cfg OllamaConfig) (*OllamaEmbedder, error) {
 		return nil, err
 	}
 	return &OllamaEmbedder{cfg: cfg, endpoint: endpoint}, nil
+}
+
+func (o *OllamaGenerator) CacheIdentity() (string, error) {
+	if o == nil {
+		return "", ErrInvalidConfig
+	}
+	return ollamaCacheIdentity("ollama-generator-v1", o.cfg, o.endpoint), nil
+}
+
+func (o *OllamaEmbedder) CacheIdentity() (string, error) {
+	if o == nil {
+		return "", ErrInvalidConfig
+	}
+	return ollamaCacheIdentity("ollama-embedder-v1", o.cfg, o.endpoint), nil
 }
 
 func (o *OllamaGenerator) Generate(ctx context.Context, req GenerateRequest) (GenerateResult, error) {
@@ -159,6 +174,20 @@ func (o *OllamaEmbedder) Embed(ctx context.Context, req EmbedRequest) (EmbedResu
 		Provenance: Provenance{Provider: "ollama", Model: o.cfg.Model},
 		Usage:      Usage{InputTokens: usage, TotalTokens: usage},
 	}, nil
+}
+
+func ollamaCacheIdentity(kind string, cfg OllamaConfig, endpoint string) string {
+	return strings.Join([]string{
+		kind,
+		endpoint,
+		cfg.Model,
+		cfg.Timeout.String(),
+		strconv.FormatInt(cfg.MaxTextBytes, 10),
+		strconv.FormatInt(cfg.MaxRequestBytes, 10),
+		strconv.FormatInt(cfg.MaxResponseBytes, 10),
+		strconv.Itoa(cfg.MaxVectorDimensions),
+		strconv.FormatInt(cfg.ErrorSnippetBytes, 10),
+	}, "\x00")
 }
 
 func validateOllamaConfig(cfg OllamaConfig, path string) (OllamaConfig, string, error) {

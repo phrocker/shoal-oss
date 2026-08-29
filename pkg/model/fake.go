@@ -20,6 +20,14 @@ type FakeGenerator struct {
 	Model string
 }
 
+func (f FakeGenerator) CacheIdentity() (string, error) {
+	name := strings.TrimSpace(f.Model)
+	if name == "" {
+		name = "deterministic"
+	}
+	return "model-fake-generator-v1:" + name, nil
+}
+
 func (f FakeGenerator) Generate(ctx context.Context, req GenerateRequest) (GenerateResult, error) {
 	if err := ctx.Err(); err != nil {
 		return GenerateResult{}, contextError("fake generate", err)

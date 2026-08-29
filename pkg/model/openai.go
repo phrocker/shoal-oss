@@ -102,6 +102,20 @@ func NewOpenAIEmbedder(cfg OpenAIConfig) (*OpenAIEmbedder, error) {
 	return &OpenAIEmbedder{client: client}, nil
 }
 
+func (o *OpenAIGenerator) CacheIdentity() (string, error) {
+	if o == nil || o.client == nil {
+		return "", ErrInvalidConfig
+	}
+	return openAICacheIdentity("openai-compatible-generator-v1", o.client, o.client.generationModel), nil
+}
+
+func (o *OpenAIEmbedder) CacheIdentity() (string, error) {
+	if o == nil || o.client == nil {
+		return "", ErrInvalidConfig
+	}
+	return openAICacheIdentity("openai-compatible-embedder-v1", o.client, o.client.embeddingModel), nil
+}
+
 func (o *OpenAIGenerator) Generate(ctx context.Context, req GenerateRequest) (GenerateResult, error) {
 	const op = "openai-compatible generate"
 	if err := validateTextRequest(op, req.Prompt, req.MaxOutputTokens, o.client.maxTextBytes); err != nil {
@@ -205,6 +219,22 @@ func (o *OpenAIEmbedder) Embed(ctx context.Context, req EmbedRequest) (EmbedResu
 		Provenance: Provenance{Provider: openAIProvider, Model: o.client.embeddingModel},
 		Usage:      usage,
 	}, nil
+}
+
+func openAICacheIdentity(kind string, client *openAIClient, model string) string {
+	return strings.Join([]string{
+		kind,
+		client.baseURL,
+		model,
+		client.organization,
+		client.project,
+		client.timeout.String(),
+		strconv.FormatInt(client.maxTextBytes, 10),
+		strconv.FormatInt(client.maxRequestBytes, 10),
+		strconv.FormatInt(client.maxResponseBytes, 10),
+		strconv.Itoa(client.maxVectorDimensions),
+		strconv.FormatInt(client.errorSnippetBytes, 10),
+	}, "\x00")
 }
 
 type openAIUsage struct {
