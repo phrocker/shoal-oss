@@ -253,7 +253,10 @@ async function loadDocument(documentID, revisionID) {
   if (!capability("document")) return;
   const generation = ++documentGeneration;
   state.currentDocumentID = documentID;
+  state.document = null;
+  state.selectedSectionID = "";
   updateDocumentCardSelection();
+  $("hierarchy").replaceChildren();
   $("hierarchy").setAttribute("aria-busy", "true");
   setStatus($("hierarchy-status"), "Loading document hierarchy…");
   try {
@@ -266,7 +269,6 @@ async function loadDocument(documentID, revisionID) {
     pin(response.snapshot);
     state.document = response.document;
     state.sourceURIs.set(response.document.document.id, response.document.source_uri || "");
-    state.selectedSectionID = "";
     renderHierarchy(response.document.root);
     mergeGraph({nodes: [nodeFromDocument(response.document.document)], edges: []});
     draw();
