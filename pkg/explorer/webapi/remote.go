@@ -35,6 +35,7 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/document"
 	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/graph"
+	"github.com/phrocker/shoal-oss/pkg/retrieval"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
@@ -257,6 +258,13 @@ func (s *RemoteService) Retrieve(
 			shoal.ErrorConflict, "retrieval as_of does not match the pinned snapshot")
 	}
 	request.Query = query
+	if query.HasMode(retrieval.ModeVector) &&
+		len(query.Scope.DocumentIDs) == 0 &&
+		len(query.Scope.NodeIDs) == 0 {
+		if err := s.ensureCapability(ctx, CapabilityVector); err != nil {
+			return RetrievalResponse{}, err
+		}
+	}
 	var response RetrievalResponse
 	if err := s.post(
 		ctx, CapabilityRetrieve, "retrieve", request, &response,

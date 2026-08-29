@@ -36,6 +36,7 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/explorer/webapi"
 	"github.com/phrocker/shoal-oss/pkg/graph"
+	"github.com/phrocker/shoal-oss/pkg/model"
 	"github.com/phrocker/shoal-oss/pkg/retrieval"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
@@ -759,6 +760,7 @@ func TestMetadataAdvertisesCapabilities(t *testing.T) {
 		metadata.MaxUploadFileBytes != webapi.MaxUploadFileBytes ||
 		!metadata.Capabilities.Supports(webapi.CapabilityRetrieve) ||
 		!metadata.Capabilities.Supports(webapi.CapabilityPath) ||
+		metadata.Capabilities.Supports(webapi.CapabilityVector) ||
 		!metadata.Capabilities.Supports(webapi.CapabilityIngest) {
 		t.Fatalf("metadata = %+v", metadata)
 	}
@@ -786,8 +788,59 @@ func TestMetadataAdvertisesCapabilities(t *testing.T) {
 	}
 }
 
+func TestMetadataAdvertisesVectorOnlyWhenAvailable(t *testing.T) {
+	dataDir := t.TempDir()
+	corpus, err := explorer.OpenWithOptions(dataDir, explorer.Options{
+		Embedder: model.FakeEmbedder{Model: "webapi", Dimensions: 8},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := corpus.Ingest(context.Background(), explorer.Source{
+		URI:       "file:///vector.txt",
+		MediaType: explorer.MediaTypeText,
+		Content:   "vector capability is available",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	service, err := webapi.NewEmbeddedService(corpus)
+	if err != nil {
+		t.Fatal(err)
+	}
+	capabilities, err := service.Capabilities(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !capabilities.Supports(webapi.CapabilityVector) {
+		t.Fatalf("vector capabilities = %+v", capabilities)
+	}
+	if err := corpus.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := explorer.OpenWithOptions(dataDir, explorer.Options{
+		Embedder: model.FakeEmbedder{Model: "other", Dimensions: 8},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	service, err = webapi.NewEmbeddedService(reopened)
+	if err != nil {
+		t.Fatal(err)
+	}
+	capabilities, err = service.Capabilities(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if capabilities.Supports(webapi.CapabilityVector) {
+		t.Fatalf("mismatched vector capabilities = %+v", capabilities)
+	}
+}
+
 func TestRemoteServiceCapabilityNegotiation(t *testing.T) {
 	pathCalled := false
+	retrieveCalled := false
 	ingestCalled := false
 	upstream := httptest.NewServer(http.HandlerFunc(func(
 		writer http.ResponseWriter,
@@ -807,6 +860,9 @@ func TestRemoteServiceCapabilityNegotiation(t *testing.T) {
 		case request.Method == http.MethodPost && request.URL.Path == "/api/v1/path":
 			pathCalled = true
 			http.Error(writer, "path should not be called", http.StatusInternalServerError)
+		case request.Method == http.MethodPost && request.URL.Path == "/api/v1/retrieve":
+			retrieveCalled = true
+			http.Error(writer, "retrieve should not be called", http.StatusInternalServerError)
 		case request.Method == http.MethodPost && request.URL.Path == "/api/v1/ingest":
 			ingestCalled = true
 			http.Error(writer, "ingest should not be called", http.StatusInternalServerError)
@@ -835,6 +891,14 @@ func TestRemoteServiceCapabilityNegotiation(t *testing.T) {
 	}
 	if pathCalled {
 		t.Fatal("remote path endpoint was called")
+	}
+	_, err = service.Retrieve(context.Background(), webapi.RetrievalRequest{
+		Query: retrieval.Request{
+			Text: "query", Modes: []retrieval.Mode{retrieval.ModeVector},
+		},
+	})
+	if !shoal.IsErrorCode(err, shoal.ErrorUnavailable) || retrieveCalled {
+		t.Fatalf("unsupported vector retrieve error = %v, called = %t", err, retrieveCalled)
 	}
 	_, err = service.Ingest(context.Background(), webapi.IngestRequest{
 		Files: []webapi.UploadFile{{Name: "guide.md", Content: []byte("# Guide\n")}},
@@ -943,6 +1007,60 @@ func TestRemoteServiceCapabilityNegotiation(t *testing.T) {
 	_, err = insufficientUpload.Capabilities(context.Background())
 	if !shoal.IsErrorCode(err, shoal.ErrorInternal) {
 		t.Fatalf("insufficient upload bounds error = %v", err)
+	}
+}
+
+func TestRemoteServiceAllowsScopedVectorWhenGlobalCapabilityIsUnavailable(t *testing.T) {
+	retrieveCalled := false
+	now := time.Date(2026, time.August, 29, 12, 0, 0, 0, time.UTC)
+	upstream := httptest.NewServer(http.HandlerFunc(func(
+		writer http.ResponseWriter,
+		request *http.Request,
+	) {
+		switch {
+		case request.Method == http.MethodGet && request.URL.Path == "/api/v1/meta":
+			writeJSON(t, writer, webapi.MetadataResponse{
+				MaxPageSize: webapi.MaxPageSize,
+				MaxTopK:     webapi.MaxTopK,
+				MaxDepth:    webapi.MaxDepth,
+				MaxFanout:   webapi.MaxFanout,
+				MaxNodes:    webapi.MaxNodes,
+				Capabilities: webapi.Capabilities{
+					Documents: true, Document: true, Retrieve: true,
+					Neighborhood: true, Path: true, Vector: false,
+				},
+			})
+		case request.Method == http.MethodPost && request.URL.Path == "/api/v1/retrieve":
+			retrieveCalled = true
+			writeJSON(t, writer, webapi.RetrievalResponse{
+				Snapshot: webapi.Snapshot{
+					ID: "snapshot", AsOf: now, Frontier: 1,
+				},
+				Retrieval: retrieval.Response{},
+			})
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	defer upstream.Close()
+	service, err := webapi.NewRemoteService(upstream.URL, upstream.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = service.Retrieve(context.Background(), webapi.RetrievalRequest{
+		Query: retrieval.Request{
+			Text:  "query",
+			Modes: []retrieval.Mode{retrieval.ModeVector},
+			Scope: retrieval.Scope{DocumentIDs: []shoal.ID{
+				"document",
+			}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("scoped vector retrieve: %v", err)
+	}
+	if !retrieveCalled {
+		t.Fatal("scoped vector request did not reach remote endpoint")
 	}
 }
 

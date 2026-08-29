@@ -37,7 +37,11 @@ import (
 // Config supplies the trusted dependencies for an authorization-enforcing
 // Explorer client.
 type Config struct {
-	Base               explorer.Client
+	Base explorer.Client
+	// VectorScorer is an optional explicitly trusted scorer for authorized
+	// vector retrieval validation. It is intentionally separate from Base:
+	// Base responses are treated as untrusted and validated canonically.
+	VectorScorer       VectorScorer
 	Resolver           auth.Resolver
 	PolicySelector     PolicySelector
 	EdgePolicySelector EdgePolicySelector
@@ -49,6 +53,7 @@ type Config struct {
 // Client enforces trusted-context authorization around an Explorer client.
 type Client struct {
 	base               explorer.Client
+	vectorScorer       VectorScorer
 	resolver           auth.Resolver
 	policySelector     PolicySelector
 	edgePolicySelector EdgePolicySelector
@@ -56,6 +61,14 @@ type Client struct {
 	generationReader   auth.GenerationReader
 	clock              func() time.Time
 	mutationMu         sync.Mutex
+	vectorMu           sync.Mutex
+	vectorAvailability authorizedVectorAvailabilityCache
+}
+
+type authorizedVectorAvailabilityCache struct {
+	key       string
+	checkedAt time.Time
+	available bool
 }
 
 // NewClient validates every dependency and constructs an additive wrapper.
@@ -89,6 +102,7 @@ func NewClient(config Config) (*Client, error) {
 	}
 	return &Client{
 		base:               config.Base,
+		vectorScorer:       config.VectorScorer,
 		resolver:           config.Resolver,
 		policySelector:     config.PolicySelector,
 		edgePolicySelector: edgeSelector,
@@ -240,6 +254,7 @@ func (c *Client) Ingest(
 	if err := guard.Check(ctx); err != nil {
 		return explorer.IngestResult{}, err
 	}
+	c.invalidateAuthorizedVectorAvailability()
 	return cloned, nil
 }
 

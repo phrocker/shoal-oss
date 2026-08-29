@@ -35,6 +35,7 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/graph"
 	"github.com/phrocker/shoal-oss/pkg/inference"
 	"github.com/phrocker/shoal-oss/pkg/inference/harness"
+	"github.com/phrocker/shoal-oss/pkg/model"
 	"github.com/phrocker/shoal-oss/pkg/retrieval"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
@@ -64,6 +65,76 @@ func TestIngestListQueryWorkflow(t *testing.T) {
 	}
 	if !strings.Contains(output.String(), "Use exponential backoff for retries.") {
 		t.Fatalf("query output = %s", output.String())
+	}
+}
+
+func TestVectorIngestQueryWorkflowUsesConfiguredEmbedder(t *testing.T) {
+	dir := t.TempDir()
+	source := filepath.Join(dir, "vector.txt")
+	const quote = "Configured fake embeddings make vector retrieval usable."
+	if err := os.WriteFile(source, []byte(quote), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	data := filepath.Join(dir, "data")
+	var output bytes.Buffer
+	if err := run(context.Background(), []string{
+		"ingest", "-data", data, "-file", source,
+		"-embedding-provider", "fake",
+		"-embedding-model", "cli-vector",
+		"-embedding-dimensions", "8",
+	}, &output); err != nil {
+		t.Fatal(err)
+	}
+	output.Reset()
+	if err := run(context.Background(), []string{
+		"query", "-data", data, "-text", quote, "-modes", "vector",
+		"-embedding-provider", "fake",
+		"-embedding-model", "cli-vector",
+		"-embedding-dimensions", "8",
+	}, &output); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(output.String(), quote) {
+		t.Fatalf("vector query output = %s", output.String())
+	}
+}
+
+func TestEmbeddingConfigRequiresAndForwardsRemoteDimensions(t *testing.T) {
+	for _, providerName := range []string{"ollama", "openai"} {
+		t.Run(providerName, func(t *testing.T) {
+			modelName := "embed-model"
+			baseURL := "http://127.0.0.1:11434"
+			apiKeyEnv := "OPENAI_API_KEY"
+			zero := 0
+			missing := embeddingFlags{
+				provider: &providerName, model: &modelName,
+				baseURL: &baseURL, apiKeyEnv: &apiKeyEnv, dimensions: &zero,
+			}
+			if _, err := missing.embedder(); err == nil {
+				t.Fatal("missing embedding dimensions succeeded")
+			}
+
+			dimensions := 8
+			configured := embeddingFlags{
+				provider: &providerName, model: &modelName,
+				baseURL: &baseURL, apiKeyEnv: &apiKeyEnv, dimensions: &dimensions,
+			}
+			embedder, err := configured.embedder()
+			if err != nil {
+				t.Fatal(err)
+			}
+			space, ok := embedder.(model.EmbeddingSpaceIdentityProvider)
+			if !ok {
+				t.Fatal("embedder does not expose embedding space identity")
+			}
+			identity, err := space.EmbeddingSpaceIdentity()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(identity, "8") {
+				t.Fatalf("identity did not include dimensions: %q", identity)
+			}
+		})
 	}
 }
 

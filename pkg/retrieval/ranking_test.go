@@ -59,6 +59,7 @@ func TestCoverageFusionScorerPreservesExactScoreBits(t *testing.T) {
 		Lexical: lexical,
 		Tree:    tree,
 		Graph:   graph,
+		Vector:  0.875,
 	}
 	assertScoreBits(t, "lexical coverage", lexical, 0x3fe5555555555555)
 	assertScoreBits(
@@ -72,6 +73,10 @@ func TestCoverageFusionScorerPreservesExactScoreBits(t *testing.T) {
 	assertScoreBits(
 		t, "graph mode", scorer.ModeScore(retrieval.ModeGraph, scores),
 		0x3fe8000000000000,
+	)
+	assertScoreBits(
+		t, "vector mode", scorer.ModeScore(retrieval.ModeVector, scores),
+		0x3fec000000000000,
 	)
 	assertScoreBits(
 		t, "combined",
@@ -114,7 +119,7 @@ func TestRankingVersionIdentifiersAreStable(t *testing.T) {
 			t.Fatalf("analyzer version constant = %q", gotAnalyzer)
 		}
 		gotScorer := scorer.Version()
-		if gotScorer != "exact-coverage-lexical-tree-graph-fusion-v1" {
+		if gotScorer != "exact-coverage-lexical-tree-graph-vector-fusion-v2" {
 			t.Fatalf("scorer version literal = %q", gotScorer)
 		}
 		if gotScorer != retrieval.CoverageFusionScorerVersion {

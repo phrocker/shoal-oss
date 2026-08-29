@@ -24,15 +24,18 @@ import (
 	"errors"
 	"math"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/phrocker/shoal-oss/pkg/document"
 	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/explorer/authorized"
 	"github.com/phrocker/shoal-oss/pkg/graph"
+	"github.com/phrocker/shoal-oss/pkg/model"
 	"github.com/phrocker/shoal-oss/pkg/retrieval"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
@@ -156,6 +159,7 @@ func (f *fixture) newClient(
 	}
 	client, err := authorized.NewClient(authorized.Config{
 		Base:               base,
+		VectorScorer:       trustedVectorScorer(base),
 		Resolver:           f.authority.Resolver(),
 		PolicySelector:     selector,
 		EdgePolicySelector: edgeSelector,
@@ -167,6 +171,11 @@ func (f *fixture) newClient(
 		t.Fatal(err)
 	}
 	return client
+}
+
+func trustedVectorScorer(base explorer.Client) authorized.VectorScorer {
+	scorer, _ := base.(authorized.VectorScorer)
+	return scorer
 }
 
 func (f *fixture) decision(
@@ -373,6 +382,412 @@ func TestAuthorizedVisibilityAndRetrievalProjection(t *testing.T) {
 		!reflect.DeepEqual(nodeScope, nodeCopy) ||
 		!reflect.DeepEqual(modes, modeCopy) {
 		t.Fatal("Retrieve mutated caller slices")
+	}
+}
+
+func TestAuthorizedVectorRetrievalProjection(t *testing.T) {
+	f := newFixture(t)
+	base, err := explorer.OpenWithOptions(t.TempDir(), explorer.Options{
+		Embedder: model.FakeEmbedder{Model: "authorized", Dimensions: 8},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = base.Close() })
+	clientA := f.newClient(t, base, f.store, f.sourceA, f.policyA, nil)
+	clientB := f.newClient(t, base, f.store, f.sourceB, f.policyB, nil)
+	visible, err := clientA.Ingest(f.admin(t), explorer.Source{
+		URI:       "file:///visible-vector.txt",
+		Title:     "Visible Vector",
+		MediaType: explorer.MediaTypeText,
+		Content:   "authorized visible vector evidence",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	hidden, err := clientB.Ingest(f.admin(t), explorer.Source{
+		URI:       "file:///hidden-vector.txt",
+		Title:     "Hidden Vector",
+		MediaType: explorer.MediaTypeText,
+		Content:   "hidden vector evidence wins raw ranking",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := base.Retrieve(context.Background(), retrieval.Request{
+		Text:  "hidden vector evidence wins raw ranking",
+		TopK:  1,
+		Modes: []retrieval.Mode{retrieval.ModeVector},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(raw.Results) != 1 ||
+		raw.Results[0].Evidence[0].Citation.DocumentID != hidden.Document.ID {
+		t.Fatalf("raw vector retrieval = %#v", raw)
+	}
+	available, err := clientA.VectorAvailable(f.alice(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !available {
+		t.Fatal("authorized vector capability was not delegated")
+	}
+	response, err := clientA.Retrieve(f.alice(t), retrieval.Request{
+		Text:  "hidden vector evidence wins raw ranking",
+		TopK:  1,
+		Modes: []retrieval.Mode{retrieval.ModeVector},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(response.Results) != 1 ||
+		response.Results[0].Evidence[0].Citation.DocumentID != visible.Document.ID ||
+		response.RequestID != "" {
+		t.Fatalf("authorized vector retrieval = %#v", response)
+	}
+}
+
+func TestAuthorizedVectorRetrievalUsesTrustedScorer(t *testing.T) {
+	f := newFixture(t)
+	base, err := explorer.OpenWithOptions(t.TempDir(), explorer.Options{
+		Embedder: model.FakeEmbedder{Model: "authorized-trusted", Dimensions: 8},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = base.Close() })
+	clientA := f.newClient(t, base, f.store, f.sourceA, f.policyA, nil)
+	if _, err := clientA.Ingest(f.admin(t), explorer.Source{
+		URI:       "file:///trusted-vector.txt",
+		Title:     "Trusted Vector",
+		MediaType: explorer.MediaTypeText,
+		Content:   "trusted vector evidence",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	request := retrieval.Request{
+		Text:    "trusted vector evidence",
+		TopK:    1,
+		Modes:   []retrieval.Mode{retrieval.ModeVector},
+		Explain: true,
+	}
+	valid, err := clientA.Retrieve(f.alice(t), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	valid.Results[0].Score = shoal.Score(math.Nextafter(
+		float64(valid.Results[0].Score), math.Inf(1)))
+	valid.Results[0].Evidence[0].Score = valid.Results[0].Score
+	malicious := &maliciousVectorClient{
+		hookClient: &hookClient{
+			Client: base,
+			retrieve: func(
+				context.Context,
+				retrieval.Request,
+			) (retrieval.Response, error) {
+				return valid, nil
+			},
+		},
+	}
+	selector, err := authorized.NewStaticPolicySelector(f.sourceA, f.policyA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := authorized.NewClient(authorized.Config{
+		Base:             malicious,
+		VectorScorer:     base,
+		Resolver:         f.authority.Resolver(),
+		PolicySelector:   selector,
+		PolicyStore:      f.store,
+		GenerationReader: f.reader,
+		Clock:            f.clock.Now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.Retrieve(f.alice(t), request)
+	if !shoal.IsErrorCode(err, shoal.ErrorInternal) {
+		t.Fatalf("malicious vector response error = %v", err)
+	}
+	if malicious.scoreCalls != 0 {
+		t.Fatalf("untrusted vector scorer was called %d times", malicious.scoreCalls)
+	}
+}
+
+func TestAuthorizedVectorCapabilityIgnoresHiddenIncompleteCorpus(t *testing.T) {
+	f := newFixture(t)
+	dataDir := t.TempDir()
+	legacyBase, err := explorer.Open(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyClientB := f.newClient(t, legacyBase, f.store, f.sourceB, f.policyB, nil)
+	if _, err := legacyClientB.Ingest(f.admin(t), explorer.Source{
+		URI:       "file:///hidden-legacy.txt",
+		Title:     "Hidden Legacy",
+		MediaType: explorer.MediaTypeText,
+		Content:   "hidden legacy has no embeddings",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := legacyBase.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	base, err := explorer.OpenWithOptions(dataDir, explorer.Options{
+		Embedder: model.FakeEmbedder{Model: "authorized-visible", Dimensions: 8},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = base.Close() })
+	clientA := f.newClient(t, base, f.store, f.sourceA, f.policyA, nil)
+	visible, err := clientA.Ingest(f.admin(t), explorer.Source{
+		URI:       "file:///visible-complete.txt",
+		Title:     "Visible Complete",
+		MediaType: explorer.MediaTypeText,
+		Content:   "visible complete vector evidence",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	available, err := clientA.VectorAvailable(f.alice(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !available {
+		t.Fatal("hidden incomplete corpus disabled visible vector capability")
+	}
+	response, err := clientA.Retrieve(f.alice(t), retrieval.Request{
+		Text:  "visible complete vector evidence",
+		TopK:  1,
+		Modes: []retrieval.Mode{retrieval.ModeVector},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(response.Results) != 1 ||
+		response.Results[0].Evidence[0].Citation.DocumentID != visible.Document.ID {
+		t.Fatalf("visible vector response = %#v", response)
+	}
+}
+
+func TestAuthorizedVectorCapabilityCachesVisibleProjection(t *testing.T) {
+	f := newFixture(t)
+	base, err := explorer.OpenWithOptions(t.TempDir(), explorer.Options{
+		Embedder: model.FakeEmbedder{Model: "authorized-cache", Dimensions: 8},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = base.Close() })
+	ingestClient := f.newClient(t, base, f.store, f.sourceA, f.policyA, nil)
+	if _, err := ingestClient.Ingest(f.admin(t), explorer.Source{
+		URI:       "file:///cached-vector.txt",
+		Title:     "Cached Vector",
+		MediaType: explorer.MediaTypeText,
+		Content:   "cached vector evidence",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	documentCalls := 0
+	hooked := &hookClient{
+		Client: base,
+		document: func(
+			ctx context.Context,
+			documentID, revisionID shoal.ID,
+		) (explorer.DocumentView, error) {
+			documentCalls++
+			return base.Document(ctx, documentID, revisionID)
+		},
+	}
+	scorer := &countingVectorScorer{VectorScorer: base}
+	selector, err := authorized.NewStaticPolicySelector(f.sourceA, f.policyA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := authorized.NewClient(authorized.Config{
+		Base:             hooked,
+		VectorScorer:     scorer,
+		Resolver:         f.authority.Resolver(),
+		PolicySelector:   selector,
+		PolicyStore:      f.store,
+		GenerationReader: f.reader,
+		Clock:            f.clock.Now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		available, err := client.VectorAvailable(f.alice(t))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !available {
+			t.Fatal("vector unexpectedly unavailable")
+		}
+	}
+	if documentCalls != 1 || scorer.calls != 1 {
+		t.Fatalf("cache misses: documents=%d scores=%d", documentCalls, scorer.calls)
+	}
+	f.clock.Set(f.clock.Now().Add(-time.Minute))
+	available, err := client.VectorAvailable(f.alice(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !available {
+		t.Fatal("vector unexpectedly unavailable after clock rollback")
+	}
+	if documentCalls != 2 || scorer.calls != 2 {
+		t.Fatalf("rollback reused cache: documents=%d scores=%d", documentCalls, scorer.calls)
+	}
+}
+
+func TestAuthorizedVectorCapabilityRequiresBaseRetrievalSupport(t *testing.T) {
+	f := newFixture(t)
+	base, err := explorer.OpenWithOptions(t.TempDir(), explorer.Options{
+		Embedder: model.FakeEmbedder{Model: "authorized-base-support", Dimensions: 8},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = base.Close() })
+	ingestClient := f.newClient(t, base, f.store, f.sourceA, f.policyA, nil)
+	if _, err := ingestClient.Ingest(f.admin(t), explorer.Source{
+		URI:       "file:///base-support.txt",
+		Title:     "Base Support",
+		MediaType: explorer.MediaTypeText,
+		Content:   "base support vector evidence",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	hooked := &hookClient{
+		Client: base,
+		retrieve: func(
+			context.Context,
+			retrieval.Request,
+		) (retrieval.Response, error) {
+			return retrieval.Response{}, shoal.NewError(
+				shoal.ErrorUnavailable, "vector unsupported")
+		},
+	}
+	selector, err := authorized.NewStaticPolicySelector(f.sourceA, f.policyA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := authorized.NewClient(authorized.Config{
+		Base:             hooked,
+		VectorScorer:     base,
+		Resolver:         f.authority.Resolver(),
+		PolicySelector:   selector,
+		PolicyStore:      f.store,
+		GenerationReader: f.reader,
+		Clock:            f.clock.Now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	available, err := client.VectorAvailable(f.alice(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if available {
+		t.Fatal("base without vector retrieval support advertised vector capability")
+	}
+}
+
+func TestAuthorizedVectorCapabilityFailsClosedForOversizedProjection(t *testing.T) {
+	f := newFixture(t)
+	base, err := explorer.OpenWithOptions(t.TempDir(), explorer.Options{
+		Embedder: model.FakeEmbedder{Model: "authorized-large-projection", Dimensions: 8},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = base.Close() })
+	policy, err := auth.NewPolicy(auth.PolicyConfig{
+		AuthorizationDomain: f.domain,
+		SourceID:            f.sourceA,
+		GrantPolicyID:       f.policyA,
+		Epoch:               1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rule, err := authorized.NewAccessRule(policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	summaries := make([]explorer.DocumentSummary, 0, retrieval.MaxScopeIDs+1)
+	for i := 0; i <= retrieval.MaxScopeIDs; i++ {
+		documentID := shoal.ID("large-vector-doc-" + strconv.Itoa(i))
+		revisionID := shoal.ID("large-vector-rev-" + strconv.Itoa(i))
+		rootID := shoal.ID("large-vector-root-" + strconv.Itoa(i))
+		summaries = append(summaries, explorer.DocumentSummary{
+			Document: document.Document{
+				ID: documentID, RevisionID: revisionID, RootSectionID: rootID,
+			},
+			Revision: document.Revision{ID: revisionID, DocumentID: documentID},
+		})
+		if err := f.store.PutRevision(context.Background(), authorized.RevisionRegistration{
+			DocumentID:    documentID,
+			RevisionID:    revisionID,
+			NodeIDs:       []shoal.ID{documentID},
+			ContentDigest: auth.DigestBytes("test-large-vector-projection", []byte(documentID)),
+			Rule:          rule,
+			Current:       true,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	documentCalls := 0
+	retrieveCalls := 0
+	hooked := &hookClient{
+		Client: base,
+		documents: func(context.Context) ([]explorer.DocumentSummary, error) {
+			return summaries, nil
+		},
+		document: func(
+			context.Context, shoal.ID, shoal.ID,
+		) (explorer.DocumentView, error) {
+			documentCalls++
+			return explorer.DocumentView{}, errors.New("unexpected hydrate")
+		},
+		retrieve: func(
+			context.Context,
+			retrieval.Request,
+		) (retrieval.Response, error) {
+			retrieveCalls++
+			return retrieval.Response{}, errors.New("unexpected probe")
+		},
+	}
+	selector, err := authorized.NewStaticPolicySelector(f.sourceA, f.policyA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := authorized.NewClient(authorized.Config{
+		Base:             hooked,
+		VectorScorer:     base,
+		Resolver:         f.authority.Resolver(),
+		PolicySelector:   selector,
+		PolicyStore:      f.store,
+		GenerationReader: f.reader,
+		Clock:            f.clock.Now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	available, err := client.VectorAvailable(f.alice(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if available {
+		t.Fatal("oversized authorized vector projection advertised capability")
+	}
+	if documentCalls != 0 || retrieveCalls != 0 {
+		t.Fatalf("oversized projection probed base: documents=%d retrieve=%d",
+			documentCalls, retrieveCalls)
 	}
 }
 
@@ -2085,6 +2500,32 @@ type hookClient struct {
 	document    func(
 		context.Context, shoal.ID, shoal.ID,
 	) (explorer.DocumentView, error)
+}
+
+type maliciousVectorClient struct {
+	*hookClient
+	scoreCalls int
+}
+
+func (c *maliciousVectorClient) VectorScores(
+	context.Context,
+	explorer.VectorScoreRequest,
+) (map[shoal.ID]shoal.Score, error) {
+	c.scoreCalls++
+	return map[shoal.ID]shoal.Score{}, nil
+}
+
+type countingVectorScorer struct {
+	authorized.VectorScorer
+	calls int
+}
+
+func (c *countingVectorScorer) VectorScores(
+	ctx context.Context,
+	request explorer.VectorScoreRequest,
+) (map[shoal.ID]shoal.Score, error) {
+	c.calls++
+	return c.VectorScorer.VectorScores(ctx, request)
 }
 
 func (c *hookClient) Connect(ctx context.Context, edge graph.Edge) error {

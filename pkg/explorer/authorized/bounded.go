@@ -22,14 +22,19 @@ package authorized
 import (
 	"context"
 	"sort"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/graph"
 	"github.com/phrocker/shoal-oss/pkg/inference"
+	"github.com/phrocker/shoal-oss/pkg/retrieval"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
+
+const vectorCapabilityProbeText = "shoal vector capability probe"
 
 func (c *Client) Snapshot(ctx context.Context) (explorer.Snapshot, error) {
 	bounded, err := c.boundedBase()
@@ -53,6 +58,194 @@ func (c *Client) Snapshot(ctx context.Context) (explorer.Snapshot, error) {
 func (c *Client) BoundedAvailable() bool {
 	_, ok := c.base.(explorer.BoundedClient)
 	return ok
+}
+
+func (c *Client) VectorAvailable(ctx context.Context) (bool, error) {
+	if !c.authorizedVectorScoringAvailable() {
+		return false, nil
+	}
+	decision, guard, now, err := c.begin(ctx, auth.OperationRetrieve)
+	if err != nil {
+		return false, err
+	}
+	summaries, err := c.base.Documents(ctx)
+	if err != nil {
+		return false, directBaseError(err)
+	}
+	visibleOrder := make([]shoal.ID, 0, len(summaries))
+	visible := make(map[shoal.ID]RevisionRegistration, len(summaries))
+	for _, summary := range summaries {
+		if err := validateSummary(summary); err != nil {
+			return false, inconsistentBase()
+		}
+		registration, ok, err := c.policyStore.CurrentRevision(
+			ctx, summary.Document.ID)
+		if err != nil {
+			return false, policyCatalogReadError(ctx, err)
+		}
+		if !ok || registration.RevisionID != summary.Revision.ID {
+			continue
+		}
+		allowed, err := ruleAllows(
+			registration.Rule, decision, auth.OperationRetrieve, now)
+		if err != nil {
+			return false, err
+		}
+		if !allowed {
+			continue
+		}
+		if _, duplicate := visible[summary.Document.ID]; duplicate {
+			return false, inconsistentBase()
+		}
+		visible[summary.Document.ID] = registration
+		visibleOrder = append(visibleOrder, summary.Document.ID)
+	}
+	cacheKey := authorizedVectorAvailabilityKey(decision, visibleOrder, visible)
+	if available, ok := c.cachedAuthorizedVectorAvailability(cacheKey, now); ok {
+		if err := guard.Check(ctx); err != nil {
+			return false, err
+		}
+		return available, nil
+	}
+	if len(visibleOrder) > retrieval.MaxScopeIDs {
+		if err := guard.Check(ctx); err != nil {
+			return false, err
+		}
+		c.cacheAuthorizedVectorAvailability(cacheKey, false, now)
+		return false, nil
+	}
+	corpus, err := c.hydrateRetrievalCorpus(ctx, visibleOrder, visible, decision, now)
+	if err != nil {
+		return false, err
+	}
+	available := true
+	if len(visibleOrder) == 0 {
+		_, err = c.authorizedVectorScores(
+			ctx,
+			retrieval.Request{
+				Text:  vectorCapabilityProbeText,
+				Modes: []retrieval.Mode{retrieval.ModeVector},
+			},
+			corpus,
+			nil,
+		)
+		if err != nil {
+			switch {
+			case shoal.IsErrorCode(err, shoal.ErrorCanceled),
+				shoal.IsErrorCode(err, shoal.ErrorDeadline):
+				return false, err
+			case shoal.IsErrorCode(err, shoal.ErrorUnavailable),
+				shoal.IsErrorCode(err, shoal.ErrorConflict),
+				shoal.IsErrorCode(err, shoal.ErrorInvalidArgument):
+				available = false
+			default:
+				return false, err
+			}
+		}
+	} else {
+		probe := retrieval.Request{
+			Text:  vectorCapabilityProbeText,
+			Modes: []retrieval.Mode{retrieval.ModeVector},
+			Scope: retrieval.Scope{
+				DocumentIDs: append([]shoal.ID(nil), visibleOrder...),
+			},
+		}
+		probe, err = probe.Normalize()
+		if err != nil {
+			return false, err
+		}
+		response, err := c.base.Retrieve(ctx, probe)
+		if err != nil {
+			err = directBaseError(err)
+			switch {
+			case shoal.IsErrorCode(err, shoal.ErrorCanceled),
+				shoal.IsErrorCode(err, shoal.ErrorDeadline):
+				return false, err
+			case shoal.IsErrorCode(err, shoal.ErrorUnavailable),
+				shoal.IsErrorCode(err, shoal.ErrorConflict),
+				shoal.IsErrorCode(err, shoal.ErrorInvalidArgument):
+				available = false
+			default:
+				return false, err
+			}
+		} else if err := response.ValidateFor(probe); err != nil {
+			available = false
+		} else if err := c.validateRetrievedResponse(
+			ctx, response, probe, corpus, decision, now,
+		); err != nil {
+			if shoal.IsErrorCode(err, shoal.ErrorCanceled) ||
+				shoal.IsErrorCode(err, shoal.ErrorDeadline) {
+				return false, err
+			}
+			available = false
+		}
+	}
+	if err := guard.Check(ctx); err != nil {
+		return false, err
+	}
+	c.cacheAuthorizedVectorAvailability(cacheKey, available, now)
+	return available, nil
+}
+
+func (c *Client) cachedAuthorizedVectorAvailability(
+	key string,
+	now time.Time,
+) (bool, bool) {
+	c.vectorMu.Lock()
+	defer c.vectorMu.Unlock()
+	cached := c.vectorAvailability
+	age := now.Sub(cached.checkedAt)
+	if cached.key == key && !cached.checkedAt.IsZero() &&
+		age >= 0 && age < time.Minute {
+		return cached.available, true
+	}
+	return false, false
+}
+
+func (c *Client) cacheAuthorizedVectorAvailability(
+	key string,
+	available bool,
+	checkedAt time.Time,
+) {
+	c.vectorMu.Lock()
+	defer c.vectorMu.Unlock()
+	c.vectorAvailability = authorizedVectorAvailabilityCache{
+		key: key, checkedAt: checkedAt, available: available,
+	}
+}
+
+func (c *Client) invalidateAuthorizedVectorAvailability() {
+	c.vectorMu.Lock()
+	defer c.vectorMu.Unlock()
+	c.vectorAvailability = authorizedVectorAvailabilityCache{}
+}
+
+func authorizedVectorAvailabilityKey(
+	decision auth.Decision,
+	visibleOrder []shoal.ID,
+	visible map[shoal.ID]RevisionRegistration,
+) string {
+	ids := append([]shoal.ID(nil), visibleOrder...)
+	sort.Slice(ids, func(left, right int) bool {
+		return shoal.CompareID(ids[left], ids[right]) < 0
+	})
+	var builder strings.Builder
+	builder.WriteString(strconv.FormatInt(decision.PolicyGeneration(), 10))
+	for _, documentID := range ids {
+		registration := visible[documentID]
+		builder.WriteByte('|')
+		writeLengthPrefixedID(&builder, documentID)
+		writeLengthPrefixedID(&builder, registration.RevisionID)
+	}
+	return builder.String()
+}
+
+func writeLengthPrefixedID(builder *strings.Builder, id shoal.ID) {
+	value := string(id)
+	builder.WriteString(strconv.Itoa(len(value)))
+	builder.WriteByte(':')
+	builder.WriteString(value)
+	builder.WriteByte(';')
 }
 
 func (c *Client) ValidateAuthorization(ctx context.Context, pin inference.AuthPin) error {

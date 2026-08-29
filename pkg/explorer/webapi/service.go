@@ -50,7 +50,8 @@ type IngestProvider interface {
 }
 
 // CapabilityProvider is an optional service extension for dynamic feature
-// negotiation. Services that do not implement it are treated as fully capable.
+// negotiation. Services that do not implement it are treated as capable for
+// stable non-vector operations, while vector fails closed.
 type CapabilityProvider interface {
 	Capabilities(context.Context) (Capabilities, error)
 }
@@ -59,6 +60,10 @@ type CapabilityProvider interface {
 // negotiate both feature availability and public bounds.
 type MetadataProvider interface {
 	Metadata(context.Context) (MetadataResponse, error)
+}
+
+type vectorAvailabilityProvider interface {
+	VectorAvailable(context.Context) (bool, error)
 }
 
 // EmbeddedService adapts the public Explorer client to the workspace service.
@@ -75,8 +80,19 @@ func NewEmbeddedService(client explorer.BoundedClient) (*EmbeddedService, error)
 	return &EmbeddedService{client: client}, nil
 }
 
-func (s *EmbeddedService) Capabilities(context.Context) (Capabilities, error) {
-	return AllCapabilities(), nil
+func (s *EmbeddedService) Capabilities(ctx context.Context) (Capabilities, error) {
+	capabilities := AllCapabilities()
+	capabilities.Vector = false
+	provider, ok := s.client.(vectorAvailabilityProvider)
+	if !ok {
+		return capabilities, nil
+	}
+	available, err := provider.VectorAvailable(ctx)
+	if err != nil {
+		return Capabilities{}, err
+	}
+	capabilities.Vector = available
+	return capabilities, nil
 }
 
 func (s *EmbeddedService) Documents(

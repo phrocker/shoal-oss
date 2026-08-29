@@ -32,6 +32,7 @@ import (
 	"github.com/phrocker/shoal-oss/internal/engine"
 	"github.com/phrocker/shoal-oss/pkg/document"
 	"github.com/phrocker/shoal-oss/pkg/graph"
+	"github.com/phrocker/shoal-oss/pkg/model"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
@@ -48,6 +49,10 @@ type Explorer struct {
 	incoming                map[shoal.ID][]shoal.ID
 	graphErr                error
 	graphInitialized        bool
+	embedder                model.Embedder
+	embeddingSpace          embeddingSpaceCache
+	vectorProbeMu           sync.Mutex
+	vectorAvailability      vectorAvailabilityCache
 	snapshot                Snapshot
 	snapshotAnchor          time.Time
 	lastPublicationSequence uint64
@@ -62,8 +67,28 @@ type persistedDocument struct {
 	Spans               []document.Span
 	Nodes               []graph.Node
 	Edges               []graph.Edge
+	Embeddings          *persistedEmbeddingSet
 	PublicationSequence uint64 `json:"publication_sequence,omitempty"`
 	PublishedAt         time.Time
+}
+
+type persistedEmbeddingSet struct {
+	Provenance persistedEmbeddingProvenance
+	Spans      []persistedSpanEmbedding
+}
+
+type persistedEmbeddingProvenance struct {
+	Provider   string
+	Model      string
+	Identity   string
+	Dimensions int
+}
+
+type persistedSpanEmbedding struct {
+	SpanID     shoal.ID
+	TextDigest string
+	Range      document.SourceRange
+	Vector     []float32
 }
 
 type persistedEdge struct {
@@ -71,10 +96,31 @@ type persistedEdge struct {
 	PublishedAt time.Time
 }
 
+// Options configures optional embedded Explorer features.
+type Options struct {
+	// Embedder enables vector indexing and retrieval. It must also implement
+	// model.EmbeddingSpaceIdentityProvider so persisted provenance can detect
+	// incompatible vector spaces without storing credentials. A nil Embedder
+	// keeps ingestion and non-vector retrieval unchanged and advertises vector
+	// as unavailable.
+	Embedder model.Embedder
+}
+
 // Open opens or creates a local Explorer corpus rooted at dir.
 func Open(dir string) (*Explorer, error) {
+	return OpenWithOptions(dir, Options{})
+}
+
+// OpenWithOptions opens or creates a local Explorer corpus rooted at dir with
+// explicitly configured optional features.
+func OpenWithOptions(dir string, options Options) (*Explorer, error) {
 	if strings.TrimSpace(dir) == "" {
 		return nil, shoal.NewError(shoal.ErrorInvalidArgument, "data directory is required")
+	}
+	if options.Embedder != nil {
+		if _, err := embeddingIdentityFor(options.Embedder); err != nil {
+			return nil, err
+		}
 	}
 	eng, err := engine.Open(dir, engine.Options{})
 	if err != nil {
@@ -97,6 +143,7 @@ func Open(dir string) (*Explorer, error) {
 		engine:    eng,
 		documents: make(map[shoal.ID]map[shoal.ID]*persistedDocument),
 		edges:     make(map[shoal.ID]persistedEdge),
+		embedder:  options.Embedder,
 	}
 	if err := explorer.load(); err != nil {
 		_ = eng.Close()
@@ -178,14 +225,31 @@ func (e *Explorer) ingest(
 	if err != nil {
 		return IngestResult{}, err
 	}
+	e.mu.RLock()
+	if err := e.requireOpen(); err != nil {
+		e.mu.RUnlock()
+		return IngestResult{}, err
+	}
+	if revisions := e.documents[parsed.document.ID]; revisions != nil {
+		if existing := revisions[parsed.revision.ID]; existing != nil {
+			e.mu.RUnlock()
+			return ingestResult(existing, IngestUnchanged), nil
+		}
+	}
+	e.mu.RUnlock()
+	embeddings, err := e.embedParsedSpans(ctx, parsed.spans)
+	if err != nil {
+		return IngestResult{}, err
+	}
 	record := &persistedDocument{
-		Document: parsed.document,
-		Revision: parsed.revision,
-		Source:   parsed.source,
-		Sections: parsed.sections,
-		Spans:    parsed.spans,
-		Nodes:    parsed.nodes,
-		Edges:    parsed.edges,
+		Document:   parsed.document,
+		Revision:   parsed.revision,
+		Source:     parsed.source,
+		Sections:   parsed.sections,
+		Spans:      parsed.spans,
+		Nodes:      parsed.nodes,
+		Edges:      parsed.edges,
+		Embeddings: embeddings,
 	}
 
 	e.mu.Lock()
@@ -201,6 +265,17 @@ func (e *Explorer) ingest(
 	if e.lastPublicationSequence == math.MaxUint64 {
 		return IngestResult{}, shoal.NewError(
 			shoal.ErrorUnavailable, "embedded publication sequence is exhausted")
+	}
+	if record.Embeddings != nil {
+		if err := e.ensureEmbeddingSpaceCompatibleLocked(
+			record.Embeddings.Provenance,
+		); err != nil {
+			return IngestResult{}, err
+		}
+		e.embeddingSpace = embeddingSpaceCache{
+			provenance: record.Embeddings.Provenance,
+			found:      true,
+		}
 	}
 	record.PublishedAt = time.Now().UTC()
 	// A write error can occur after the WAL append committed, so attempted
@@ -218,6 +293,7 @@ func (e *Explorer) ingest(
 		e.documents[record.Document.ID] = make(map[shoal.ID]*persistedDocument)
 	}
 	e.documents[record.Document.ID][record.Revision.ID] = record
+	e.invalidateVectorAvailabilityLocked()
 	if e.graphInitialized {
 		if err := e.rebuildCurrentGraphLocked(); err != nil {
 			return IngestResult{}, err

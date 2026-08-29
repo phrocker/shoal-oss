@@ -163,19 +163,20 @@ func (r Request) ValidateSeedPlan(documentAssociationSeeds bool) error {
 		return err
 	}
 	hasLexical := normalized.HasMode(ModeLexical)
+	hasVector := normalized.HasMode(ModeVector)
 	hasTree := normalized.HasMode(ModeTree)
 	hasGraph := normalized.HasMode(ModeGraph)
 
-	treeSeeded := len(normalized.Scope.DocumentIDs) > 0 || hasLexical
+	treeSeeded := len(normalized.Scope.DocumentIDs) > 0 || hasLexical || hasVector
 	if hasTree && !treeSeeded {
 		return shoal.NewError(
 			shoal.ErrorUnavailable,
-			"tree retrieval requires document scope or earlier lexical seeds",
+			"tree retrieval requires document scope or earlier lexical/vector seeds",
 		)
 	}
 	graphSeeded := len(normalized.Scope.NodeIDs) > 0 ||
 		(documentAssociationSeeds && len(normalized.Scope.DocumentIDs) > 0) ||
-		hasLexical || (hasTree && treeSeeded)
+		hasLexical || hasVector || (hasTree && treeSeeded)
 	if hasGraph && !graphSeeded {
 		return shoal.NewError(
 			shoal.ErrorUnavailable,
