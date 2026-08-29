@@ -227,3 +227,51 @@ func postJSON(t *testing.T, url string, body string) []byte {
 type errStatus string
 
 func (e errStatus) Error() string { return string(e) }
+
+func TestEmbeddingProvidersCoverLocalAndHostedOptions(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		config embeddingConfig
+	}{
+		{
+			name: "lexical",
+			config: embeddingConfig{
+				provider: "lexical", model: "embed-model", dimensions: 8,
+			},
+		},
+		{
+			name: "voyage",
+			config: embeddingConfig{
+				provider: "voyage", model: "embed-model", dimensions: 8,
+				apiKeyEnv: "VOYAGE_API_KEY",
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			missing := tc.config
+			missing.dimensions = 0
+			if _, err := missing.embedder(); err == nil {
+				t.Fatal("missing embedding dimensions succeeded")
+			}
+
+			embedder, err := tc.config.embedder()
+			if err != nil {
+				t.Fatal(err)
+			}
+			space, ok := embedder.(model.EmbeddingSpaceIdentityProvider)
+			if !ok {
+				t.Fatal("embedder does not expose embedding space identity")
+			}
+			identity, err := space.EmbeddingSpaceIdentity()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(identity, tc.name) {
+				t.Fatalf("identity did not name the provider: %q", identity)
+			}
+			if strings.Contains(identity, "VOYAGE_API_KEY") {
+				t.Fatalf("identity leaked credential configuration: %q", identity)
+			}
+		})
+	}
+}

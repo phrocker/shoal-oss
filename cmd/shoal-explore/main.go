@@ -290,7 +290,7 @@ func addEmbeddingFlags(flags *flag.FlagSet) embeddingFlags {
 	return embeddingFlags{
 		provider: flags.String(
 			"embedding-provider", "",
-			"Optional vector provider for ingest/query: fake, ollama, or openai",
+			"Optional vector provider for ingest/query: fake, lexical, ollama, openai, or voyage",
 		),
 		model: flags.String(
 			"embedding-model", "",
@@ -298,11 +298,11 @@ func addEmbeddingFlags(flags *flag.FlagSet) embeddingFlags {
 		),
 		baseURL: flags.String(
 			"embedding-base-url", "",
-			"Embedding provider base URL for ollama/openai",
+			"Embedding provider base URL for ollama/openai/voyage",
 		),
 		apiKeyEnv: flags.String(
 			"embedding-api-key-env", "OPENAI_API_KEY",
-			"Environment variable read at request time for openai credentials",
+			"Environment variable read at request time for openai/voyage credentials",
 		),
 		dimensions: flags.Int(
 			"embedding-dimensions", 0,
@@ -319,6 +319,24 @@ func (f embeddingFlags) embedder() (model.Embedder, error) {
 		return model.FakeEmbedder{
 			Model: *f.model, Dimensions: *f.dimensions,
 		}, nil
+	case "lexical":
+		if *f.dimensions <= 0 {
+			return nil, fmt.Errorf("embedding dimensions are required for lexical")
+		}
+		return model.NewLexicalEmbedder(model.LexicalConfig{
+			Dimensions: *f.dimensions,
+			Model:      *f.model,
+		})
+	case "voyage":
+		if *f.dimensions <= 0 {
+			return nil, fmt.Errorf("embedding dimensions are required for voyage")
+		}
+		return model.NewVoyageEmbedder(model.VoyageConfig{
+			BaseURL:          *f.baseURL,
+			Model:            *f.model,
+			Dimensions:       *f.dimensions,
+			APICredentialEnv: *f.apiKeyEnv,
+		})
 	case "ollama":
 		if *f.dimensions <= 0 {
 			return nil, fmt.Errorf("embedding dimensions are required for ollama")
