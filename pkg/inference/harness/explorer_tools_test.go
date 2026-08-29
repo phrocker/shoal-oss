@@ -98,6 +98,31 @@ func TestNewExplorerToolHostRespectsOptionalBoundedAvailability(t *testing.T) {
 	}
 }
 
+func TestExplorerToolHostCacheIdentityDelimitsModesAndMetadata(t *testing.T) {
+	client := &boundedClientStub{}
+	withModes := &ExplorerToolHost{
+		Client:         client,
+		ClientIdentity: "client-v1",
+		RetrievalModes: []retrieval.Mode{retrieval.ModeLexical, retrieval.ModeVector},
+	}
+	withMetadata := &ExplorerToolHost{
+		Client:         client,
+		ClientIdentity: "client-v1",
+		Metadata:       shoal.Metadata{"lexical": "vector"},
+	}
+	modesIdentity, err := withModes.CacheIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	metadataIdentity, err := withMetadata.CacheIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if modesIdentity == metadataIdentity {
+		t.Fatal("cache identity collided across retrieval modes and metadata")
+	}
+}
+
 func TestExplorerToolHostAllowsFanoutOneMultiHopPath(t *testing.T) {
 	pack, _, _ := fixture(t)
 	custom := budgets()

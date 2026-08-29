@@ -226,7 +226,7 @@ func (r *secretActionRunner) Start(context.Context, SessionRequest) (Session, er
 	return &secretActionSession{request: r.starts}, nil
 }
 
-func (r *secretActionRunner) CacheIdentity() (string, error) { return "secret-action-runner-v1", nil }
+func (r *secretActionRunner) CacheIdentity() (string, error) { return "unsafe-output-runner-v1", nil }
 
 type recordingCache struct{ puts int }
 

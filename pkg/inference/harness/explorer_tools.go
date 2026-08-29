@@ -102,20 +102,24 @@ func (h *ExplorerToolHost) CacheIdentity() (string, error) {
 	}
 	sort.Strings(metadataKeys)
 	parts := []string{
-		"explorer-tool-host-v1",
+		"explorer-tool-host-v2",
 		clientIdentity,
 		boundedIdentity,
 		readerIdentity,
 		estimatorIdentity,
 		string(h.PolicyID),
 		strconv.FormatBool(h.RetrievalExplain),
+		"retrieval-modes",
+		strconv.Itoa(len(h.RetrievalModes)),
 	}
 	for _, mode := range h.RetrievalModes {
 		parts = append(parts, string(mode))
 	}
+	parts = append(parts, "metadata", strconv.Itoa(len(metadataKeys)))
 	for _, key := range metadataKeys {
 		parts = append(parts, key, h.Metadata[key])
 	}
+	parts = append(parts, "builder-limits")
 	limits := h.Builder.Limits
 	parts = append(parts,
 		strconv.Itoa(limits.MaxResults),
