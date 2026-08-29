@@ -36,6 +36,7 @@ import (
 const (
 	MediaTypeMarkdown = "text/markdown"
 	MediaTypeText     = "text/plain"
+	MediaTypeSource   = "text/x-source-code"
 )
 
 // Source is one textual source revision to ingest.
@@ -74,9 +75,10 @@ type IngestResult struct {
 
 // DocumentSummary is the current revision shown in corpus listings.
 type DocumentSummary struct {
-	Document  document.Document
-	Revision  document.Revision
-	SourceURI string
+	Document        document.Document
+	Revision        document.Revision
+	SourceURI       string
+	SourceMediaType string
 }
 
 // SectionView combines one section with its directly attributable spans and
@@ -89,10 +91,11 @@ type SectionView struct {
 
 // DocumentView is a revision-specific, navigable document.
 type DocumentView struct {
-	Document  document.Document
-	Revision  document.Revision
-	SourceURI string
-	Root      SectionView
+	Document        document.Document
+	Revision        document.Revision
+	SourceURI       string
+	SourceMediaType string
+	Root            SectionView
 }
 
 // NeighborhoodRequest bounds a graph expansion around one or more nodes.

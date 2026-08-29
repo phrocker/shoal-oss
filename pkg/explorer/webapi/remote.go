@@ -24,6 +24,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
+	"mime/multipart"
 	"net/http"
 	"net/url"
 	"sort"
@@ -89,6 +91,69 @@ func (s *RemoteService) Capabilities(ctx context.Context) (Capabilities, error) 
 
 func (s *RemoteService) Metadata(ctx context.Context) (MetadataResponse, error) {
 	return s.metadata(ctx)
+}
+
+func (s *RemoteService) Ingest(
+	ctx context.Context, request IngestRequest,
+) (IngestResponse, error) {
+	prepared, err := prepareUploads(request)
+	if err != nil {
+		return IngestResponse{}, err
+	}
+	if err := s.ensureCapability(ctx, CapabilityIngest); err != nil {
+		return IngestResponse{}, err
+	}
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	for _, item := range request.Files {
+		name, err := sanitizeUploadFilename(item.Name)
+		if err != nil {
+			_ = writer.Close()
+			return IngestResponse{}, err
+		}
+		part, err := writer.CreateFormFile("files", name)
+		if err != nil {
+			_ = writer.Close()
+			return IngestResponse{}, shoal.WrapError(
+				shoal.ErrorInternal, "encode workspace upload", err)
+		}
+		if _, err := part.Write(item.Content); err != nil {
+			_ = writer.Close()
+			return IngestResponse{}, shoal.WrapError(
+				shoal.ErrorInternal, "encode workspace upload", err)
+		}
+	}
+	if err := writer.Close(); err != nil {
+		return IngestResponse{}, shoal.WrapError(
+			shoal.ErrorInternal, "encode workspace upload", err)
+	}
+	httpRequest, err := http.NewRequestWithContext(
+		ctx, http.MethodPost, s.endpoint("ingest"), &body)
+	if err != nil {
+		return IngestResponse{}, shoal.WrapError(
+			shoal.ErrorInvalidArgument, "build remote upload request", err)
+	}
+	httpRequest.Header.Set("Content-Type", writer.FormDataContentType())
+	httpRequest.Header.Set("Accept", "application/json")
+	httpRequest.Header.Set("X-Shoal-Workspace-Request", "1")
+	httpResponse, err := s.client.Do(httpRequest)
+	if err != nil {
+		return IngestResponse{}, shoal.WrapError(
+			remoteTransportCode(err), "remote workspace unavailable", err)
+	}
+	defer httpResponse.Body.Close()
+	if httpResponse.StatusCode < 200 || httpResponse.StatusCode >= 300 {
+		return IngestResponse{}, decodeRemoteError(httpResponse)
+	}
+	var response IngestResponse
+	if err := decodeOneJSON(httpResponse.Body, &response, maxRemoteResponseBytes); err != nil {
+		return IngestResponse{}, shoal.WrapError(
+			remoteDecodeCode(err), "decode remote workspace response", err)
+	}
+	if err := validateRemoteIngestResponse(prepared, response); err != nil {
+		return IngestResponse{}, err
+	}
+	return response, nil
 }
 
 func (s *RemoteService) Documents(
@@ -457,14 +522,17 @@ func minInt64(left, right int64) int64 {
 
 func decodeRemoteMetadata(reader io.Reader) (MetadataResponse, error) {
 	var wire struct {
-		MaxPageSize      uint32        `json:"max_page_size"`
-		MaxTopK          uint32        `json:"max_top_k"`
-		MaxDepth         uint32        `json:"max_depth"`
-		MaxFanout        uint32        `json:"max_fanout"`
-		MaxNodes         uint32        `json:"max_nodes"`
-		MaxEdgeTypes     uint32        `json:"max_edge_types,omitempty"`
-		MaxResponseBytes uint64        `json:"max_response_bytes,omitempty"`
-		Capabilities     *Capabilities `json:"capabilities,omitempty"`
+		MaxPageSize         uint32        `json:"max_page_size"`
+		MaxTopK             uint32        `json:"max_top_k"`
+		MaxDepth            uint32        `json:"max_depth"`
+		MaxFanout           uint32        `json:"max_fanout"`
+		MaxNodes            uint32        `json:"max_nodes"`
+		MaxEdgeTypes        uint32        `json:"max_edge_types,omitempty"`
+		MaxResponseBytes    uint64        `json:"max_response_bytes,omitempty"`
+		MaxUploadFiles      uint32        `json:"max_upload_files,omitempty"`
+		MaxUploadFileBytes  uint64        `json:"max_upload_file_bytes,omitempty"`
+		MaxUploadTotalBytes uint64        `json:"max_upload_total_bytes,omitempty"`
+		Capabilities        *Capabilities `json:"capabilities,omitempty"`
 	}
 	if err := decodeOneJSON(reader, &wire, maxRemoteMetadataResponseBytes); err != nil {
 		return MetadataResponse{}, err
@@ -475,19 +543,29 @@ func decodeRemoteMetadata(reader io.Reader) (MetadataResponse, error) {
 		wire.MaxFanout < MaxFanout ||
 		wire.MaxNodes < MaxNodes ||
 		(wire.MaxEdgeTypes != 0 && wire.MaxEdgeTypes < MaxEdgeTypes) ||
-		(wire.MaxResponseBytes != 0 && wire.MaxResponseBytes < MaxResponseBytes) {
+		(wire.MaxResponseBytes != 0 && wire.MaxResponseBytes < MaxResponseBytes) ||
+		(wire.MaxUploadFiles != 0 && wire.MaxUploadFiles < MaxUploadFiles) ||
+		(wire.MaxUploadFileBytes != 0 && wire.MaxUploadFileBytes < MaxUploadFileBytes) ||
+		(wire.MaxUploadTotalBytes != 0 && wire.MaxUploadTotalBytes < MaxUploadTotalBytes) {
 		return MetadataResponse{}, errors.New("remote workspace bounds are below public bounds")
 	}
 	capabilities := Capabilities{}
 	if wire.Capabilities != nil {
 		capabilities = *wire.Capabilities
 	}
+	if capabilities.Ingest &&
+		(wire.MaxUploadFiles == 0 ||
+			wire.MaxUploadFileBytes == 0 ||
+			wire.MaxUploadTotalBytes == 0) {
+		return MetadataResponse{}, errors.New("remote workspace upload bounds are incomplete")
+	}
 	return MetadataResponse{
 		MaxPageSize: MaxPageSize, MaxTopK: MaxTopK,
 		MaxDepth: MaxDepth, MaxFanout: MaxFanout,
 		MaxNodes: MaxNodes, MaxEdgeTypes: MaxEdgeTypes,
 		MaxResponseBytes: MaxResponseBytes,
-		Capabilities:     capabilities,
+		MaxUploadFiles:   MaxUploadFiles, MaxUploadFileBytes: MaxUploadFileBytes,
+		MaxUploadTotalBytes: MaxUploadTotalBytes, Capabilities: capabilities,
 	}, nil
 }
 
@@ -508,9 +586,70 @@ func validateRemoteDocumentSummary(summary explorer.DocumentSummary) error {
 	if strings.TrimSpace(summary.SourceURI) == "" {
 		return remoteContractError("remote document summary has a blank source URI", nil)
 	}
+	if summary.SourceMediaType != "" && !knownExplorerMediaType(summary.SourceMediaType) {
+		return remoteContractError("remote document summary has an invalid media type", nil)
+	}
 	if summary.Document.ID != summary.Revision.DocumentID ||
 		summary.Document.RevisionID != summary.Revision.ID {
 		return remoteContractError("remote document summary has inconsistent ownership", nil)
+	}
+	return nil
+}
+
+func validateRemoteIngestResponse(
+	request []preparedUpload, response IngestResponse,
+) error {
+	if err := validateRemoteSnapshot(Snapshot{}, response.Snapshot); err != nil {
+		return err
+	}
+	if len(response.Files) != len(request) {
+		return remoteContractError("remote ingest response count does not match the request", nil)
+	}
+	seenDocuments := make(map[shoal.ID]struct{}, len(response.Files))
+	for index, file := range response.Files {
+		expected, err := explorer.AnalyzeSource(request[index].source)
+		if err != nil {
+			return remoteContractError("remote ingest request is invalid", err)
+		}
+		if file.Name != request[index].name {
+			return remoteContractError("remote ingest response name does not match the request", nil)
+		}
+		if file.MediaType != request[index].mediaType {
+			return remoteContractError("remote ingest response media type does not match the request", nil)
+		}
+		if file.Disposition != explorer.IngestApplied &&
+			file.Disposition != explorer.IngestUnchanged {
+			return remoteContractError("remote ingest response disposition is invalid", nil)
+		}
+		if file.SectionCount < 0 || file.SectionCount > document.MaxSectionsPerRevision ||
+			file.SpanCount < 0 || file.SpanCount > document.MaxSpansPerRevision {
+			return remoteContractError("remote ingest response counts exceed bounds", nil)
+		}
+		if err := file.Document.Validate(); err != nil {
+			return remoteContractError("invalid remote ingested document", err)
+		}
+		if err := file.Revision.Validate(); err != nil {
+			return remoteContractError("invalid remote ingested revision", err)
+		}
+		if file.Document.ID != file.Revision.DocumentID ||
+			file.Document.RevisionID != file.Revision.ID {
+			return remoteContractError("remote ingested document has inconsistent ownership", nil)
+		}
+		if file.Document.ID != expected.Document.ID ||
+			file.Revision.ID != expected.Revision.ID ||
+			file.Document.RootSectionID != expected.Document.RootSectionID ||
+			file.Document.Title != expected.Document.Title ||
+			file.Revision.SourceVersion != expected.Revision.SourceVersion ||
+			!maps.Equal(file.Document.Metadata, expected.Document.Metadata) ||
+			!maps.Equal(file.Revision.Metadata, expected.Revision.Metadata) ||
+			file.SectionCount != expected.SectionCount ||
+			file.SpanCount != expected.SpanCount {
+			return remoteContractError("remote ingest response does not match the uploaded source", nil)
+		}
+		if _, duplicate := seenDocuments[file.Document.ID]; duplicate {
+			return remoteContractError("remote ingest response has duplicate document IDs", nil)
+		}
+		seenDocuments[file.Document.ID] = struct{}{}
 	}
 	return nil
 }
@@ -528,6 +667,7 @@ func compareDocumentSummary(left, right explorer.DocumentSummary) int {
 func validateRemoteDocumentView(view explorer.DocumentView) error {
 	if err := validateRemoteDocumentSummary(explorer.DocumentSummary{
 		Document: view.Document, Revision: view.Revision, SourceURI: view.SourceURI,
+		SourceMediaType: view.SourceMediaType,
 	}); err != nil {
 		return err
 	}

@@ -22,7 +22,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"math"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -97,6 +100,30 @@ func TestRemoteServiceMatchesEmbeddedResponses(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertEqualJSON(t, "retrieval", embeddedRetrieval, remoteRetrieval)
+
+	ingestRequest := webapi.IngestRequest{
+		Files: []webapi.UploadFile{{
+			Name:    "remote.go",
+			Content: []byte("package remote\n\nconst ExactCitation = \"remote upload\"\n"),
+		}},
+	}
+	remoteIngest, err := remote.Ingest(ctx, ingestRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(remoteIngest.Files) != 1 ||
+		remoteIngest.Files[0].Disposition != explorer.IngestApplied ||
+		remoteIngest.Files[0].MediaType != explorer.MediaTypeSource {
+		t.Fatalf("remote ingest = %+v", remoteIngest)
+	}
+	remoteUnchanged, err := remote.Ingest(ctx, ingestRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(remoteUnchanged.Files) != 1 ||
+		remoteUnchanged.Files[0].Disposition != explorer.IngestUnchanged {
+		t.Fatalf("remote repeated ingest = %+v", remoteUnchanged)
+	}
 }
 
 func assertServiceBoundsAndSnapshot(
@@ -442,6 +469,13 @@ func TestHTTPHandlerValidationAndWorkspace(t *testing.T) {
 		t.Fatal("missing content security policy")
 	}
 
+	upload := postMultipartWithoutWorkspaceHeader(t, server.URL+"/api/v1/ingest", uploadFixture{
+		name: "csrf.txt", content: "cross site upload",
+	})
+	if upload.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("upload without workspace header status = %s: %s", upload.Status, upload.body)
+	}
+
 	request, err := http.NewRequest(http.MethodGet, server.URL+"/api/v1/meta", nil)
 	if err != nil {
 		t.Fatal(err)
@@ -454,6 +488,243 @@ func TestHTTPHandlerValidationAndWorkspace(t *testing.T) {
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusMisdirectedRequest {
 		t.Fatalf("forged host status = %s", response.Status)
+	}
+}
+
+func TestHTTPIngestUploadsDocumentsAndSourceCode(t *testing.T) {
+	dataDir := t.TempDir()
+	corpus, err := explorer.Open(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer corpus.Close()
+	service, err := webapi.NewEmbeddedService(corpus)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewUnstartedServer(nil)
+	handler, err := webapi.NewHandler(service, server.Listener.Addr().String())
+	if err != nil {
+		server.Close()
+		t.Fatal(err)
+	}
+	server.Config.Handler = handler
+	server.Start()
+	defer server.Close()
+
+	uploads := []uploadFixture{
+		{name: "guide.md", content: "# Guide\n\nMarkdown evidence survives.\n", mediaType: explorer.MediaTypeMarkdown},
+		{name: "notes.txt", content: "Plain text exact citation.\n", mediaType: explorer.MediaTypeText},
+		{name: "main.go", content: "package main\n\nfunc main() {\n\tprintln(\"code exact citation\")\n}\n", mediaType: explorer.MediaTypeSource},
+	}
+	response := postMultipart(t, server.URL+"/api/v1/ingest", uploads...)
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("upload status = %s: %s", response.Status, response.body)
+	}
+	var ingested webapi.IngestResponse
+	if err := json.Unmarshal(response.body, &ingested); err != nil {
+		t.Fatal(err)
+	}
+	if len(ingested.Files) != len(uploads) || ingested.Snapshot.ID == "" {
+		t.Fatalf("ingest response = %+v", ingested)
+	}
+	for index, upload := range uploads {
+		item := ingested.Files[index]
+		if item.Name != upload.name ||
+			item.MediaType != upload.mediaType ||
+			item.Disposition != explorer.IngestApplied ||
+			item.Document.Title != upload.name ||
+			item.SectionCount == 0 ||
+			item.SpanCount == 0 {
+			t.Fatalf("ingest item %d = %+v", index, item)
+		}
+		view, err := service.Document(context.Background(), webapi.DocumentRequest{
+			Snapshot:   ingested.Snapshot,
+			DocumentID: item.Document.ID,
+			RevisionID: item.Revision.ID,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		assertViewSpansMatchSource(t, view.Document.Root, upload.content)
+		if view.Document.SourceMediaType != upload.mediaType {
+			t.Fatalf("document media type = %q, want %q", view.Document.SourceMediaType, upload.mediaType)
+		}
+	}
+
+	repeated := postMultipart(t, server.URL+"/api/v1/ingest", uploads[2])
+	if repeated.StatusCode != http.StatusOK {
+		t.Fatalf("repeat upload status = %s: %s", repeated.Status, repeated.body)
+	}
+	var unchanged webapi.IngestResponse
+	if err := json.Unmarshal(repeated.body, &unchanged); err != nil {
+		t.Fatal(err)
+	}
+	if len(unchanged.Files) != 1 || unchanged.Files[0].Disposition != explorer.IngestUnchanged {
+		t.Fatalf("repeat response = %+v", unchanged)
+	}
+
+	documents := postJSON(t, server.URL+"/api/v1/documents", `{"page":{"limit":10}}`)
+	if bytes.Contains(documents, []byte(dataDir)) ||
+		bytes.Contains(response.body, []byte(dataDir)) {
+		t.Fatalf("response leaked a host path: ingest=%s documents=%s", response.body, documents)
+	}
+	if !bytes.Contains(documents, []byte(`"source_media_type":"text/x-source-code"`)) {
+		t.Fatalf("documents response did not expose source media type: %s", documents)
+	}
+}
+
+func TestHTTPIngestRejectsUntrustedUploads(t *testing.T) {
+	corpus, err := explorer.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer corpus.Close()
+	service, err := webapi.NewEmbeddedService(corpus)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewUnstartedServer(nil)
+	handler, err := webapi.NewHandler(service, server.Listener.Addr().String())
+	if err != nil {
+		server.Close()
+		t.Fatal(err)
+	}
+	server.Config.Handler = handler
+	server.Start()
+	defer server.Close()
+
+	cases := []struct {
+		name    string
+		uploads []uploadFixture
+	}{
+		{
+			name: "oversized",
+			uploads: []uploadFixture{{
+				name: "large.txt", content: strings.Repeat("a", int(webapi.MaxUploadFileBytes)+1),
+			}},
+		},
+		{
+			name: "too many files",
+			uploads: func() []uploadFixture {
+				files := make([]uploadFixture, webapi.MaxUploadFiles+1)
+				for index := range files {
+					files[index] = uploadFixture{
+						name:    fmt.Sprintf("file-%02d.txt", index),
+						content: "bounded",
+					}
+				}
+				return files
+			}(),
+		},
+		{
+			name: "disallowed media type",
+			uploads: []uploadFixture{{
+				name: "image.png", content: "not an accepted text extension",
+			}},
+		},
+		{
+			name: "invalid utf8",
+			uploads: []uploadFixture{{
+				name: "bad.txt", content: string([]byte{0xff, 0xfe}),
+			}},
+		},
+		{
+			name: "binary control after sniff prefix",
+			uploads: []uploadFixture{{
+				name: "payload.go", content: strings.Repeat("a", 600) + "\x00",
+			}},
+		},
+		{
+			name: "traversal filename",
+			uploads: []uploadFixture{{
+				name: "..\\secret.txt", content: "secret",
+			}},
+		},
+		{
+			name: "absolute filename",
+			uploads: []uploadFixture{{
+				name: "C:\\Users\\build\\secret.txt", content: "secret",
+			}},
+		},
+		{
+			name: "embedded separator",
+			uploads: []uploadFixture{{
+				name: "nested/secret.txt", content: "secret",
+			}},
+		},
+		{
+			name: "format control filename",
+			uploads: []uploadFixture{{
+				name: "safe\u202egnp.txt", content: "secret",
+			}},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			response := postMultipart(t, server.URL+"/api/v1/ingest", tc.uploads...)
+			if response.StatusCode != http.StatusBadRequest {
+				t.Fatalf("status = %s: %s", response.Status, response.body)
+			}
+			if bytes.Contains(response.body, []byte(`C:\Users`)) ||
+				bytes.Contains(response.body, []byte(`/secret.txt`)) ||
+				bytes.Contains(response.body, []byte(`..\secret`)) {
+				t.Fatalf("error leaked a hostile path: %s", response.body)
+			}
+		})
+	}
+}
+
+func TestHTTPIngestRedactsProviderFailures(t *testing.T) {
+	service, corpus, _, _ := testService(t)
+	defer corpus.Close()
+	for _, tc := range []struct {
+		name   string
+		err    error
+		status int
+	}{
+		{
+			name: "internal",
+			err: shoal.NewError(
+				shoal.ErrorInternal,
+				`write C:\private\shoal\tablet.rf failed`,
+			),
+			status: http.StatusInternalServerError,
+		},
+		{
+			name: "invalid argument",
+			err: shoal.NewError(
+				shoal.ErrorInvalidArgument,
+				`invalid C:\private\source.txt upload`,
+			),
+			status: http.StatusBadRequest,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewUnstartedServer(nil)
+			handler, err := webapi.NewHandler(failingIngestService{
+				Service: service,
+				err:     tc.err,
+			}, server.Listener.Addr().String())
+			if err != nil {
+				server.Close()
+				t.Fatal(err)
+			}
+			server.Config.Handler = handler
+			server.Start()
+			defer server.Close()
+
+			response := postMultipart(t, server.URL+"/api/v1/ingest", uploadFixture{
+				name: "safe.txt", content: "safe text",
+			})
+			if response.StatusCode != tc.status {
+				t.Fatalf("status = %s: %s", response.Status, response.body)
+			}
+			if bytes.Contains(response.body, []byte(`C:\private`)) ||
+				!bytes.Contains(response.body, []byte(`upload failed`)) {
+				t.Fatalf("provider failure was not redacted: %s", response.body)
+			}
+		})
 	}
 }
 
@@ -484,14 +755,40 @@ func TestMetadataAdvertisesCapabilities(t *testing.T) {
 	}
 	if metadata.MaxPageSize != webapi.MaxPageSize ||
 		metadata.MaxResponseBytes != webapi.MaxResponseBytes ||
+		metadata.MaxUploadFiles != webapi.MaxUploadFiles ||
+		metadata.MaxUploadFileBytes != webapi.MaxUploadFileBytes ||
 		!metadata.Capabilities.Supports(webapi.CapabilityRetrieve) ||
-		!metadata.Capabilities.Supports(webapi.CapabilityPath) {
+		!metadata.Capabilities.Supports(webapi.CapabilityPath) ||
+		!metadata.Capabilities.Supports(webapi.CapabilityIngest) {
 		t.Fatalf("metadata = %+v", metadata)
+	}
+
+	capabilityOnly := capabilityOnlyService{Service: service}
+	server = httptest.NewUnstartedServer(nil)
+	handler, err = webapi.NewHandler(capabilityOnly, server.Listener.Addr().String())
+	if err != nil {
+		server.Close()
+		t.Fatal(err)
+	}
+	server.Config.Handler = handler
+	server.Start()
+	defer server.Close()
+	response, err = http.Get(server.URL + "/api/v1/meta")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if err := json.NewDecoder(response.Body).Decode(&metadata); err != nil {
+		t.Fatal(err)
+	}
+	if metadata.Capabilities.Supports(webapi.CapabilityIngest) {
+		t.Fatalf("ingest did not fail closed for non-ingest provider: %+v", metadata.Capabilities)
 	}
 }
 
 func TestRemoteServiceCapabilityNegotiation(t *testing.T) {
 	pathCalled := false
+	ingestCalled := false
 	upstream := httptest.NewServer(http.HandlerFunc(func(
 		writer http.ResponseWriter,
 		request *http.Request,
@@ -510,6 +807,9 @@ func TestRemoteServiceCapabilityNegotiation(t *testing.T) {
 		case request.Method == http.MethodPost && request.URL.Path == "/api/v1/path":
 			pathCalled = true
 			http.Error(writer, "path should not be called", http.StatusInternalServerError)
+		case request.Method == http.MethodPost && request.URL.Path == "/api/v1/ingest":
+			ingestCalled = true
+			http.Error(writer, "ingest should not be called", http.StatusInternalServerError)
 		default:
 			http.NotFound(writer, request)
 		}
@@ -535,6 +835,15 @@ func TestRemoteServiceCapabilityNegotiation(t *testing.T) {
 	}
 	if pathCalled {
 		t.Fatal("remote path endpoint was called")
+	}
+	_, err = service.Ingest(context.Background(), webapi.IngestRequest{
+		Files: []webapi.UploadFile{{Name: "guide.md", Content: []byte("# Guide\n")}},
+	})
+	if !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
+		t.Fatalf("unsupported ingest error = %v", err)
+	}
+	if ingestCalled {
+		t.Fatal("remote ingest endpoint was called")
 	}
 
 	documentsCalled := false
@@ -586,7 +895,10 @@ func TestRemoteServiceCapabilityNegotiation(t *testing.T) {
 			writeJSON(t, writer, webapi.MetadataResponse{
 				MaxPageSize: webapi.MaxPageSize - 1, MaxTopK: webapi.MaxTopK,
 				MaxDepth: webapi.MaxDepth, MaxFanout: webapi.MaxFanout,
-				MaxNodes: webapi.MaxNodes, Capabilities: webapi.AllCapabilities(),
+				MaxNodes: webapi.MaxNodes, MaxUploadFiles: webapi.MaxUploadFiles,
+				MaxUploadFileBytes:  webapi.MaxUploadFileBytes,
+				MaxUploadTotalBytes: webapi.MaxUploadTotalBytes,
+				Capabilities:        webapi.AllCapabilities(),
 			})
 			return
 		}
@@ -602,6 +914,36 @@ func TestRemoteServiceCapabilityNegotiation(t *testing.T) {
 	if !shoal.IsErrorCode(err, shoal.ErrorInternal) {
 		t.Fatalf("insufficient bounds error = %v", err)
 	}
+
+	insufficientUploadBounds := httptest.NewServer(http.HandlerFunc(func(
+		writer http.ResponseWriter,
+		request *http.Request,
+	) {
+		if request.Method == http.MethodGet && request.URL.Path == "/api/v1/meta" {
+			writeJSON(t, writer, webapi.MetadataResponse{
+				MaxPageSize: webapi.MaxPageSize, MaxTopK: webapi.MaxTopK,
+				MaxDepth: webapi.MaxDepth, MaxFanout: webapi.MaxFanout,
+				MaxNodes: webapi.MaxNodes, MaxEdgeTypes: webapi.MaxEdgeTypes,
+				MaxResponseBytes:    webapi.MaxResponseBytes,
+				MaxUploadFiles:      webapi.MaxUploadFiles,
+				MaxUploadFileBytes:  webapi.MaxUploadFileBytes - 1,
+				MaxUploadTotalBytes: webapi.MaxUploadTotalBytes,
+				Capabilities:        webapi.AllCapabilities(),
+			})
+			return
+		}
+		http.NotFound(writer, request)
+	}))
+	defer insufficientUploadBounds.Close()
+	insufficientUpload, err := webapi.NewRemoteService(
+		insufficientUploadBounds.URL, insufficientUploadBounds.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = insufficientUpload.Capabilities(context.Background())
+	if !shoal.IsErrorCode(err, shoal.ErrorInternal) {
+		t.Fatalf("insufficient upload bounds error = %v", err)
+	}
 }
 
 func TestRemoteServiceErrorMappingAndLocalBounds(t *testing.T) {
@@ -614,7 +956,10 @@ func TestRemoteServiceErrorMappingAndLocalBounds(t *testing.T) {
 			writeJSON(t, writer, webapi.MetadataResponse{
 				MaxPageSize: webapi.MaxPageSize, MaxTopK: webapi.MaxTopK,
 				MaxDepth: webapi.MaxDepth, MaxFanout: webapi.MaxFanout,
-				MaxNodes: webapi.MaxNodes, Capabilities: webapi.AllCapabilities(),
+				MaxNodes: webapi.MaxNodes, MaxUploadFiles: webapi.MaxUploadFiles,
+				MaxUploadFileBytes:  webapi.MaxUploadFileBytes,
+				MaxUploadTotalBytes: webapi.MaxUploadTotalBytes,
+				Capabilities:        webapi.AllCapabilities(),
 			})
 		case request.Method == http.MethodPost && request.URL.Path == "/api/v1/documents":
 			writer.Header().Set("Content-Type", "application/json")
@@ -715,7 +1060,10 @@ func TestRemoteServiceRejectsNonconformingResponses(t *testing.T) {
 			writeJSON(t, writer, webapi.MetadataResponse{
 				MaxPageSize: webapi.MaxPageSize, MaxTopK: webapi.MaxTopK,
 				MaxDepth: webapi.MaxDepth, MaxFanout: webapi.MaxFanout,
-				MaxNodes: webapi.MaxNodes, Capabilities: webapi.AllCapabilities(),
+				MaxNodes: webapi.MaxNodes, MaxUploadFiles: webapi.MaxUploadFiles,
+				MaxUploadFileBytes:  webapi.MaxUploadFileBytes,
+				MaxUploadTotalBytes: webapi.MaxUploadTotalBytes,
+				Capabilities:        webapi.AllCapabilities(),
 			})
 		case request.Method == http.MethodPost && request.URL.Path == "/api/v1/documents":
 			writeJSON(t, writer, webapi.DocumentsResponse{
@@ -734,6 +1082,10 @@ func TestRemoteServiceRejectsNonconformingResponses(t *testing.T) {
 			if body.DocumentID == "blank-source" {
 				view = documentView("blank-source", snapshot.AsOf)
 				view.SourceURI = ""
+			}
+			if body.DocumentID == "invalid-media" {
+				view = documentView("invalid-media", snapshot.AsOf)
+				view.SourceMediaType = "application/x-hostile"
 			}
 			writeJSON(t, writer, webapi.DocumentResponse{
 				Snapshot: snapshot,
@@ -779,6 +1131,16 @@ func TestRemoteServiceRejectsNonconformingResponses(t *testing.T) {
 					}},
 				},
 			})
+		case request.Method == http.MethodPost && request.URL.Path == "/api/v1/ingest":
+			summary := documentSummary("one", snapshot.AsOf)
+			writeJSON(t, writer, webapi.IngestResponse{
+				Snapshot: snapshot,
+				Files: []webapi.IngestFileResult{{
+					Name: "remote.go", MediaType: explorer.MediaTypeSource,
+					Disposition: explorer.IngestApplied, Document: summary.Document,
+					Revision: summary.Revision, SectionCount: 1, SpanCount: 1,
+				}},
+			})
 		default:
 			http.NotFound(writer, request)
 		}
@@ -816,6 +1178,12 @@ func TestRemoteServiceRejectsNonconformingResponses(t *testing.T) {
 	if !shoal.IsErrorCode(err, shoal.ErrorInternal) {
 		t.Fatalf("blank document source URI error = %v", err)
 	}
+	_, err = service.Document(context.Background(), webapi.DocumentRequest{
+		Snapshot: snapshot, DocumentID: "invalid-media",
+	})
+	if !shoal.IsErrorCode(err, shoal.ErrorInternal) {
+		t.Fatalf("invalid document media type error = %v", err)
+	}
 	_, err = service.Neighborhood(context.Background(), webapi.NeighborhoodRequest{
 		Snapshot: snapshot, NodeIDs: []shoal.ID{"one"}, Depth: 1,
 		Fanout: 1, MaxNodes: 1,
@@ -849,6 +1217,14 @@ func TestRemoteServiceRejectsNonconformingResponses(t *testing.T) {
 	})
 	if !shoal.IsErrorCode(err, shoal.ErrorInternal) {
 		t.Fatalf("duplicate path edge error = %v", err)
+	}
+	_, err = service.Ingest(context.Background(), webapi.IngestRequest{
+		Files: []webapi.UploadFile{{
+			Name: "remote.go", Content: []byte("package remote\n"),
+		}},
+	})
+	if !shoal.IsErrorCode(err, shoal.ErrorInternal) {
+		t.Fatalf("mismatched ingest identity error = %v", err)
 	}
 }
 
@@ -1001,4 +1377,139 @@ func firstSpanIDOptional(view explorer.SectionView) shoal.ID {
 		}
 	}
 	return ""
+}
+
+type uploadFixture struct {
+	name      string
+	content   string
+	mediaType string
+}
+
+type responseBody struct {
+	StatusCode int
+	Status     string
+	body       []byte
+}
+
+type failingIngestService struct {
+	webapi.Service
+	err error
+}
+
+type capabilityOnlyService struct {
+	webapi.Service
+}
+
+func (s capabilityOnlyService) Capabilities(context.Context) (webapi.Capabilities, error) {
+	return webapi.AllCapabilities(), nil
+}
+
+func (s failingIngestService) Capabilities(context.Context) (webapi.Capabilities, error) {
+	return webapi.AllCapabilities(), nil
+}
+
+func (s failingIngestService) Ingest(
+	context.Context, webapi.IngestRequest,
+) (webapi.IngestResponse, error) {
+	return webapi.IngestResponse{}, s.err
+}
+
+func postMultipart(t *testing.T, url string, uploads ...uploadFixture) responseBody {
+	t.Helper()
+	return postMultipartWithHeader(t, url, true, uploads...)
+}
+
+func postMultipartWithoutWorkspaceHeader(
+	t *testing.T, url string, uploads ...uploadFixture,
+) responseBody {
+	t.Helper()
+	return postMultipartWithHeader(t, url, false, uploads...)
+}
+
+func postMultipartWithHeader(
+	t *testing.T, url string, workspaceHeader bool, uploads ...uploadFixture,
+) responseBody {
+	t.Helper()
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	for _, upload := range uploads {
+		part, err := writer.CreateFormFile("files", upload.name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := part.Write([]byte(upload.content)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	request, err := http.NewRequest(http.MethodPost, url, &body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", writer.FormDataContentType())
+	request.Header.Set("Accept", "application/json")
+	if workspaceHeader {
+		request.Header.Set("X-Shoal-Workspace-Request", "1")
+	}
+	client := http.Client{Timeout: 5 * time.Second}
+	response, err := client.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	data, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return responseBody{StatusCode: response.StatusCode, Status: response.Status, body: data}
+}
+
+func postJSON(t *testing.T, url string, body string) []byte {
+	t.Helper()
+	client := http.Client{Timeout: 5 * time.Second}
+	response, err := client.Post(url, "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	data, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("POST %s returned %s: %s", url, response.Status, data)
+	}
+	return data
+}
+
+func assertViewSpansMatchSource(t *testing.T, view explorer.SectionView, source string) {
+	t.Helper()
+	found := false
+	var walk func(explorer.SectionView)
+	walk = func(current explorer.SectionView) {
+		for _, span := range current.Spans {
+			found = true
+			start := span.Range.Start.Offset
+			end := span.Range.End.Offset
+			if start < 0 || end < start || end > int64(len(source)) {
+				t.Fatalf("span range outside source: %+v source length %d", span.Range, len(source))
+			}
+			if span.Text != source[start:end] {
+				t.Fatalf("span text %q does not match source range %d-%d %q",
+					span.Text, start, end, source[start:end])
+			}
+			if span.DocumentID == "" || span.RevisionID == "" || span.SectionID == "" {
+				t.Fatalf("span lost citation identity: %+v", span)
+			}
+		}
+		for _, child := range current.Children {
+			walk(child)
+		}
+	}
+	walk(view)
+	if !found {
+		t.Fatal("document view did not contain any exact spans")
+	}
 }

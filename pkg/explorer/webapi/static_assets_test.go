@@ -56,6 +56,64 @@ assert.strictEqual(aliasOnly.ids["mode-vector"].disabled, true);
 `)
 }
 
+func TestStaticWorkspaceAvoidsMarkupInjectionAPIs(t *testing.T) {
+	app := readStaticAsset(t, "static/app.js")
+	for _, forbidden := range []string{"innerHTML", "insertAdjacentHTML", "eval("} {
+		if strings.Contains(app, forbidden) {
+			t.Fatalf("app.js must not use %s with untrusted workspace data", forbidden)
+		}
+	}
+}
+
+func TestStaticWorkspaceUploadBehavior(t *testing.T) {
+	runNodeUITest(t, `
+const hidden = await runScenario({documents: true, document: true});
+assert.strictEqual(hidden.ids["upload-section"].hidden, true);
+
+const uploadedDocs = [{
+  document: {id: "doc-upload", title: "guide.md"},
+  revision: {id: "rev-upload"},
+  source_uri: "upload://workspace/guide.md",
+  source_media_type: "text/markdown",
+}];
+const uploaded = await runScenario(
+  {documents: true, document: true, ingest: true},
+  [],
+  {
+    documentSnapshot: {id: "uploadsnapshot", as_of: "2026-08-29T01:00:00Z", frontier: 2},
+    documentResponses: [[], uploadedDocs],
+    ingestResponse: {
+      snapshot: {id: "uploadsnapshot", as_of: "2026-08-29T01:00:00Z", frontier: 2},
+      files: [
+        {name: "guide.md", disposition: "applied", media_type: "text/markdown", span_count: 1},
+        {name: "main.go", disposition: "unchanged", media_type: "text/x-source-code", span_count: 1},
+      ],
+    },
+  },
+);
+uploaded.ids["upload-files"].files = [{name: "guide.md"}, {name: "main.go"}];
+await uploaded.ids.upload.onsubmit({preventDefault() {}});
+assert.strictEqual(uploaded.uploadRequest.url, "/api/v1/ingest");
+assert.strictEqual(uploaded.uploadRequest.options.method, "POST");
+assert.strictEqual(uploaded.uploadRequest.options.headers["x-shoal-workspace-request"], "1");
+assert.deepStrictEqual(uploaded.uploadRequest.options.body.parts.map((part) => part.filename), ["guide.md", "main.go"]);
+assert.match(uploaded.ids["upload-status"].textContent, /Uploaded 2 file/);
+assert.match(uploaded.ids["upload-results"].children[0].textContent, /guide\.md: applied/);
+assert.match(uploaded.ids["upload-results"].children[1].textContent, /main\.go: unchanged/);
+assert.strictEqual(uploaded.ids.documents.children.length, 1);
+assert.match(uploaded.ids.snapshot.textContent, /uploadsnap/);
+
+const failed = await runScenario(
+  {documents: true, document: true, ingest: true},
+  [],
+  {ingestError: {statusText: "Bad Request", body: {message: "upload failed"}}},
+);
+failed.ids["upload-files"].files = [{name: "bad.exe"}];
+await failed.ids.upload.onsubmit({preventDefault() {}});
+assert.match(failed.ids["upload-status"].textContent, /upload failed/);
+`)
+}
+
 func TestStaticWorkspaceSourceLabelsCollapseHostPaths(t *testing.T) {
 	runNodeUITest(t, `
 const fileURI = "file:///C:/Dev/shoal-web/docs/explorer-demo-guide.md";
@@ -204,8 +262,17 @@ function matches(element, selector) {
   return false;
 }
 
-function response(value) {
-  return {ok: true, statusText: "OK", json: async () => value};
+function response(value, options = {}) {
+  return {
+    ok: options.ok !== undefined ? options.ok : true,
+    statusText: options.statusText || "OK",
+    json: async () => value,
+  };
+}
+
+class TestFormData {
+  constructor() { this.parts = []; }
+  append(name, file, filename) { this.parts.push({name, file, filename}); }
 }
 
 function makeDocument(capabilities, documents) {
@@ -241,14 +308,20 @@ function makeDocument(capabilities, documents) {
     "query", "search", "search-button", "modes", "mode-vector", "mode-vector-control",
     "vector-mode-status", "evidence", "evidence-status", "evidence-results", "expand",
     "continue-expansion", "path-from", "path-to", "find-path", "graph-status",
+    "upload-section", "upload", "upload-drop", "upload-files", "upload-button",
+    "upload-status", "upload-results",
     "documents", "documents-status", "more", "graph-nodes", "graph-edges", "canvas",
     "selection", "hierarchy", "hierarchy-status", "snapshot",
   ]) ids[id] = new Element(id === "canvas" ? "canvas" : "div", id);
-  for (const id of ["documents-status", "hierarchy-status", "evidence-status", "vector-mode-status"]) {
+  for (const id of ["documents-status", "hierarchy-status", "evidence-status", "vector-mode-status", "upload-status"]) {
     ids[id].setAttribute("role", "status");
   }
   ids.query.value = "";
   ids.search = new Element("form", "search");
+  ids.upload = new Element("form", "upload");
+  ids["upload-files"] = new Element("input", "upload-files");
+  ids["upload-button"] = new Element("button", "upload-button");
+  ids["upload-drop"] = new Element("label", "upload-drop");
   ids["search-button"] = new Element("button", "search-button");
   ids.modes = new Element("fieldset", "modes");
   for (const value of ["lexical", "tree", "graph", "vector"]) {
@@ -267,20 +340,39 @@ function makeDocument(capabilities, documents) {
   return {document, ids};
 }
 
-async function runScenario(capabilities, documents = []) {
+async function runScenario(capabilities, documents = [], scenarioOptions = {}) {
   const dom = makeDocument(capabilities, documents);
   let retrieveBody = null;
+  let uploadRequest = null;
+  let documentCalls = 0;
   const snapshot = {id: "snapshot123456", as_of: "2026-08-29T00:00:00Z", frontier: 1};
   const ctx = {
     document: dom.document,
+    FormData: TestFormData,
     ResizeObserver: class { constructor(callback) { this.callback = callback; } observe() {} },
     devicePixelRatio: 1,
     URL,
-    fetch: async (url, options = {}) => {
+    fetch: async (url, requestOptions = {}) => {
       if (url === "/api/v1/meta") return response({capabilities});
-      if (url.endsWith("/documents")) return response({snapshot, documents, next_cursor: ""});
+      if (url.endsWith("/documents")) {
+        const sequence = scenarioOptions.documentResponses || [documents];
+        const docs = sequence[Math.min(documentCalls, sequence.length - 1)];
+        const documentSnapshot = scenarioOptions.documentSnapshot || snapshot;
+        documentCalls++;
+        return response({snapshot: documentSnapshot, documents: docs, next_cursor: ""});
+      }
+      if (url === "/api/v1/ingest") {
+        uploadRequest = {url, options: requestOptions};
+        if (scenarioOptions.ingestError) {
+          return response(scenarioOptions.ingestError.body, {
+            ok: false,
+            statusText: scenarioOptions.ingestError.statusText,
+          });
+        }
+        return response(scenarioOptions.ingestResponse);
+      }
       if (url.endsWith("/retrieve")) {
-        retrieveBody = JSON.parse(options.body);
+        retrieveBody = JSON.parse(requestOptions.body);
         return response({snapshot, retrieval: {results: []}});
       }
       throw new Error("unexpected fetch " + url);
@@ -290,7 +382,11 @@ async function runScenario(capabilities, documents = []) {
   vm.runInContext(app, ctx);
   await new Promise((resolve) => setImmediate(resolve));
   await new Promise((resolve) => setImmediate(resolve));
-  return {ctx, ids: dom.ids, get retrieveBody() { return retrieveBody; }};
+  return {
+    ctx, ids: dom.ids,
+    get retrieveBody() { return retrieveBody; },
+    get uploadRequest() { return uploadRequest; },
+  };
 }
 
 (async () => {

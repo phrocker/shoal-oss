@@ -16,12 +16,22 @@ const state = {
     neighborhood: false,
     path: false,
     vector_retrieval: false,
+    ingest: false,
+  },
+  uploadLimits: {
+    max_upload_files: 0,
+    max_upload_file_bytes: 0,
+    max_upload_total_bytes: 0,
   },
 };
 const $ = (id) => document.getElementById(id);
 let documentGeneration = 0;
 let searchGeneration = 0;
+let documentsGeneration = 0;
+let graphGeneration = 0;
 let documentsLoading = false;
+let documentsRefreshQueued = false;
+let uploadLoading = false;
 
 async function api(path, body) {
   const response = await fetch(`/api/v1/${path}`, {
@@ -39,6 +49,11 @@ async function loadMeta() {
   const value = await response.json();
   if (!response.ok) throw new Error(value.message || response.statusText);
   state.capabilities = {...state.capabilities, ...(value.capabilities || {})};
+  state.uploadLimits = {
+    max_upload_files: value.max_upload_files || 0,
+    max_upload_file_bytes: value.max_upload_file_bytes || 0,
+    max_upload_total_bytes: value.max_upload_total_bytes || 0,
+  };
   applyCapabilities();
 }
 
@@ -95,6 +110,27 @@ function applyCapabilities() {
     $("documents").replaceChildren();
     $("more").hidden = true;
   }
+  applyIngestCapability();
+}
+
+function applyIngestCapability() {
+  const canIngest = capability("ingest");
+  $("upload-section").hidden = !canIngest;
+  $("upload-files").disabled = !canIngest || uploadLoading;
+  $("upload-button").disabled = !canIngest || uploadLoading;
+  if (!canIngest) {
+    $("upload-results").replaceChildren();
+    setStatus($("upload-status"), "Uploads are unavailable from this Explorer service.");
+  } else if (!$("upload-status").textContent) {
+    setStatus($("upload-status"), uploadLimitText());
+  }
+}
+
+function uploadLimitText() {
+  const files = state.uploadLimits.max_upload_files || "bounded";
+  const bytes = state.uploadLimits.max_upload_file_bytes || 0;
+  const size = bytes ? `${Math.floor(bytes / 1024)} KiB` : "bounded";
+  return `Upload up to ${files} file(s), ${size} each.`;
 }
 
 function applyVectorCapability(canRetrieve) {
@@ -144,7 +180,14 @@ function pin(snapshot) {
 
 async function loadDocuments(reset = true) {
   if (!capability("documents")) return;
-  if (documentsLoading) return;
+  if (documentsLoading) {
+    if (reset) {
+      documentsRefreshQueued = true;
+      documentsGeneration++;
+    }
+    return;
+  }
+  const generation = ++documentsGeneration;
   documentsLoading = true;
   $("more").disabled = true;
   $("documents").setAttribute("aria-busy", "true");
@@ -157,6 +200,7 @@ async function loadDocuments(reset = true) {
       snapshot: state.snapshot,
       page: {limit: 25, cursor: state.cursor},
     });
+    if (generation !== documentsGeneration) return;
     pin(response.snapshot);
     if (reset) $("documents").replaceChildren();
     const documents = response.documents || [];
@@ -171,19 +215,134 @@ async function loadDocuments(reset = true) {
     state.cursor = response.next_cursor || "";
     $("more").hidden = !state.cursor;
   } catch (error) {
-    showError($("documents-status"), error);
+    if (generation === documentsGeneration) showError($("documents-status"), error);
   } finally {
     documentsLoading = false;
     $("documents").setAttribute("aria-busy", "false");
     $("more").disabled = false;
+    if (documentsRefreshQueued) {
+      documentsRefreshQueued = false;
+      loadDocuments(true);
+    }
   }
 }
+
+async function uploadFiles(fileList) {
+  if (!capability("ingest") || uploadLoading) return;
+  const files = [...(fileList || [])];
+  if (files.length === 0) {
+    setStatus($("upload-status"), "Choose at least one file to upload.", "empty-state");
+    return;
+  }
+  uploadLoading = true;
+  applyIngestCapability();
+  $("upload-results").replaceChildren();
+  setStatus($("upload-status"), `Uploading ${files.length} file(s)…`);
+  try {
+    const body = new FormData();
+    for (const file of files) body.append("files", file, file.name);
+    const response = await fetch("/api/v1/ingest", {
+      method: "POST",
+      headers: {"accept": "application/json", "x-shoal-workspace-request": "1"},
+      body,
+    });
+    const value = await response.json();
+    if (!response.ok) throw new Error(value.message || response.statusText);
+    clearSnapshotDependentViews();
+    pin(value.snapshot);
+    renderUploadResults(value.files || []);
+    await loadDocuments(true);
+  } catch (error) {
+    showError($("upload-status"), error);
+    clearSnapshotDependentViews();
+    clearPinnedSnapshot();
+    await loadDocuments(true);
+  } finally {
+    uploadLoading = false;
+    applyIngestCapability();
+    $("upload-files").value = "";
+  }
+}
+
+function clearPinnedSnapshot() {
+  state.snapshot = {};
+  $("snapshot").textContent = "snapshot latest";
+}
+
+function clearSnapshotDependentViews() {
+  documentGeneration++;
+  searchGeneration++;
+  graphGeneration++;
+  state.document = null;
+  state.currentDocumentID = "";
+  state.selectedSectionID = "";
+  state.selected = null;
+  state.nodes.clear();
+  state.edges.clear();
+  state.graphCursors.clear();
+  positions.clear();
+  $("hierarchy").replaceChildren();
+  setStatus($("hierarchy-status"), "Select a document.");
+  $("evidence-results").replaceChildren();
+  setStatus($("evidence-status"), "Run a retrieval query to inspect exact evidence and explanations.");
+  $("graph-status").textContent = "No graph expansion yet.";
+  $("selection").className = "muted";
+  setMessage($("selection"), "Select evidence, a hierarchy section, or a graph node.");
+  renderGraphList();
+  updateContinueButton();
+  draw();
+}
+
+function renderUploadResults(files) {
+  const results = $("upload-results");
+  results.replaceChildren();
+  if (files.length === 0) {
+    setStatus($("upload-status"), "No files were ingested.", "empty-state");
+    return;
+  }
+  setStatus($("upload-status"), `Uploaded ${files.length} file(s).`);
+  for (const file of files) {
+    const item = document.createElement("li");
+    item.textContent = `${file.name}: ${file.disposition} (${file.media_type}, ` +
+      `${file.span_count} span(s))`;
+    results.append(item);
+  }
+}
+
+$("upload").onsubmit = async (event) => {
+  event.preventDefault();
+  await uploadFiles($("upload-files").files);
+};
+
+$("upload-files").onchange = () => {
+  const count = $("upload-files").files ? $("upload-files").files.length : 0;
+  setStatus(
+    $("upload-status"),
+    count ? `${count} file(s) ready to upload.` : uploadLimitText(),
+  );
+};
+
+$("upload-drop").ondragover = (event) => {
+  event.preventDefault();
+  if (capability("ingest")) $("upload-drop").classList.add("dragging");
+};
+
+$("upload-drop").ondragleave = () => {
+  $("upload-drop").classList.remove("dragging");
+};
+
+$("upload-drop").ondrop = async (event) => {
+  event.preventDefault();
+  $("upload-drop").classList.remove("dragging");
+  await uploadFiles(event.dataTransfer && event.dataTransfer.files);
+};
 
 function createDocumentCard(item) {
   const documentValue = item.document || {};
   const title = documentValue.title || "(untitled document)";
   const documentID = documentValue.id || "";
   const sourceURI = item.source_uri || "";
+  const sourceMediaType = item.source_media_type || "";
   if (documentID) state.sourceURIs.set(documentID, sourceURI);
 
   const card = document.createElement("div");
@@ -203,6 +362,12 @@ function createDocumentCard(item) {
   sourceElement.className = "source-label";
   sourceElement.textContent = sourceLabel(sourceURI, documentID);
   button.append(titleElement, sourceElement);
+  if (sourceMediaType) {
+    const media = document.createElement("span");
+    media.className = "media-badge";
+    media.textContent = sourceMediaType;
+    button.append(media);
+  }
   card.append(button);
 
   if (sourceURI) {
@@ -470,6 +635,7 @@ function mergeGraph(graph) {
 
 async function expandIDs(ids, cursor = "") {
   if (!capability("neighborhood")) return;
+  const generation = graphGeneration;
   $("graph-status").textContent = cursor ? "Loading more neighbors…" : "Expanding graph…";
   try {
     const response = await api("neighborhood", {
@@ -480,6 +646,7 @@ async function expandIDs(ids, cursor = "") {
       max_nodes: 120,
       cursor,
     });
+    if (generation !== graphGeneration) return;
     pin(response.snapshot);
     mergeGraph(response.neighborhood);
     if (ids.length === 1) {
@@ -493,6 +660,7 @@ async function expandIDs(ids, cursor = "") {
     activate("graph");
     draw();
   } catch (error) {
+    if (generation !== graphGeneration) return;
     $("graph-status").textContent = `Graph expansion failed: ${error.message || String(error)}`;
     showError($("selection"), error);
   }
@@ -506,6 +674,7 @@ $("continue-expansion").onclick = () => {
 $("more").onclick = () => loadDocuments(false);
 $("find-path").onclick = async () => {
   if (!capability("path")) return;
+  const generation = graphGeneration;
   $("graph-status").textContent = "Finding directed path…";
   try {
     const response = await api("path", {
@@ -515,12 +684,14 @@ $("find-path").onclick = async () => {
       max_depth: 4,
       fanout: 25,
     });
+    if (generation !== graphGeneration) return;
     pin(response.snapshot);
     mergeGraph(response.path);
     $("graph-status").textContent =
       `Directed path at snapshot frontier ${response.snapshot.frontier}.`;
     draw();
   } catch (error) {
+    if (generation !== graphGeneration) return;
     $("graph-status").textContent = `Path finding failed: ${error.message || String(error)}`;
     showError($("selection"), error);
   }

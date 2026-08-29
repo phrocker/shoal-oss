@@ -26,6 +26,18 @@
   </header>
   <main>
     <aside class="left">
+      <section id="upload-section" hidden>
+        <h2>Upload</h2>
+        <form id="upload">
+          <label id="upload-drop" for="upload-files">
+            <span>Drop Markdown, text, or source files here.</span>
+            <input id="upload-files" type="file" multiple>
+          </label>
+          <button id="upload-button" type="submit">Upload</button>
+        </form>
+        <p id="upload-status" class="muted" role="status" aria-live="polite"></p>
+        <ul id="upload-results"></ul>
+      </section>
       <section><h2>Corpus</h2><p id="documents-status" class="muted" role="status" aria-live="polite"></p><div id="documents"></div><button id="more" type="button" hidden>More documents</button></section>
       <section><h2>Hierarchy</h2><p id="hierarchy-status" class="muted" role="status" aria-live="polite">Select a document.</p><div id="hierarchy" class="tree"></div></section>
     </aside>

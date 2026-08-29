@@ -198,8 +198,15 @@ workspace. In another shell, the metadata endpoint should also respond:
 Invoke-RestMethod http://127.0.0.1:8080/api/v1/meta
 ```
 
+When the backend advertises the `ingest` capability, the workspace shows an
+upload area above the corpus list. Use the file picker or drag and drop bounded
+Markdown, plain-text, or source-code files. Each successful upload reports
+whether the revision was `applied` or already `unchanged`, and then refreshes
+the snapshot and corpus list.
+
 Expected observable outcome: `/api/v1/meta` publishes the server bounds
-(`max_page_size`, `max_top_k`, `max_depth`, `max_fanout`, and `max_nodes`).
+(`max_page_size`, `max_top_k`, `max_depth`, `max_fanout`, `max_nodes`,
+`max_upload_files`, `max_upload_file_bytes`, and `max_upload_total_bytes`).
 
 Snapshot-bound API calls also carry snapshot identity. For example:
 

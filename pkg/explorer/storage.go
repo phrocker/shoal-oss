@@ -379,7 +379,7 @@ func validatePersistedDocument(record persistedDocument) error {
 		return fmt.Errorf("source semantic text is invalid")
 	}
 	switch record.Source.MediaType {
-	case MediaTypeMarkdown, MediaTypeText:
+	case MediaTypeMarkdown, MediaTypeText, MediaTypeSource:
 	default:
 		return fmt.Errorf("source media type is invalid")
 	}
