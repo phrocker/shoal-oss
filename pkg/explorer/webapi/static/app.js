@@ -15,13 +15,10 @@ const state = {
     retrieve: false,
     neighborhood: false,
     path: false,
-    vector: false,
     vector_retrieval: false,
-    retrieve_vector: false,
   },
 };
 const $ = (id) => document.getElementById(id);
-const vectorCapabilityNames = ["vector_retrieval", "vector", "retrieve_vector"];
 let documentGeneration = 0;
 let searchGeneration = 0;
 let documentsLoading = false;
@@ -50,7 +47,7 @@ function capability(name) {
 }
 
 function vectorRetrievalCapability() {
-  return vectorCapabilityNames.some(capability);
+  return capability("vector_retrieval");
 }
 
 function applyCapabilities() {
@@ -197,7 +194,7 @@ function createDocumentCard(item) {
   button.className = "doc";
   button.type = "button";
   button.disabled = !capability("document");
-  button.title = sourceURI || documentID;
+  button.title = sourceLabel(sourceURI, documentID);
   button.onclick = () => loadDocument(documentID, item.revision && item.revision.id);
 
   const titleElement = document.createElement("strong");

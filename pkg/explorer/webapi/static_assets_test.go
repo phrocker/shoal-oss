@@ -47,6 +47,12 @@ advertised.ids["mode-vector"].checked = true;
 advertised.ids.query.value = "knowledge graph";
 await advertised.ids.search.onsubmit({preventDefault() {}});
 assert.ok(advertised.retrieveBody.query.modes.includes("vector"));
+
+const aliasOnly = await runScenario({
+  documents: true, document: true, retrieve: true, neighborhood: true, path: true,
+  vector: true, retrieve_vector: true,
+});
+assert.strictEqual(aliasOnly.ids["mode-vector"].disabled, true);
 `)
 }
 
@@ -63,7 +69,9 @@ const card = scenario.ids.documents.children[0];
 const button = card.children[0];
 const details = card.children[1];
 assert.strictEqual(button.children[1].textContent, "explorer-demo-guide.md");
+assert.strictEqual(button.title, "explorer-demo-guide.md");
 assert.ok(!button.children[1].textContent.includes("C:/Dev"));
+assert.ok(!button.title.includes("C:/Dev"));
 assert.strictEqual(details.children[1].textContent, fileURI);
 assert.strictEqual(scenario.ctx.sourceLabel(unixURI, "doc"), "guide.md");
 assert.strictEqual(scenario.ctx.sourceLabel(webURI, "doc"), "example.test / guide.md");

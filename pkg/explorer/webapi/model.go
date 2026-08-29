@@ -61,7 +61,7 @@ type Capabilities struct {
 	Documents    bool `json:"documents"`
 	Document     bool `json:"document"`
 	Retrieve     bool `json:"retrieve"`
-	Vector       bool `json:"vector_retrieval,omitempty"`
+	Vector       bool `json:"vector_retrieval"`
 	Neighborhood bool `json:"neighborhood"`
 	Path         bool `json:"path"`
 }
