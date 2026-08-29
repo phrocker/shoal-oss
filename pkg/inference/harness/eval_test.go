@@ -216,6 +216,27 @@ func TestEvaluationTraceDigestDetectsDifferentToolTraces(t *testing.T) {
 	}
 }
 
+func TestFixtureGraphPathValidationAcceptsCanonicalLabelOrder(t *testing.T) {
+	path := graph.Path{
+		Nodes: []graph.Node{
+			{ID: "node-a", Kind: "entity", Labels: []string{"zeta", "alpha"}},
+			{ID: "node-b", Kind: "entity"},
+		},
+		Edges: []graph.Edge{{ID: "edge-a-b", From: "node-a", To: "node-b", Type: "related", Weight: 1}},
+	}
+	anchor, err := inference.NewGraphAnchor(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	canonical, ok := anchor.Path()
+	if !ok {
+		t.Fatal("graph anchor did not expose a path")
+	}
+	if err := validateFixtureGraphPath(anchor.ID(), canonical, map[shoal.ID]graph.Path{anchor.ID(): path}); err != nil {
+		t.Fatalf("canonical label ordering rejected: %v", err)
+	}
+}
+
 func runFixtureEvaluation(t *testing.T, cases []EvaluationCase, now time.Time) (EvaluationReport, error) {
 	t.Helper()
 	modelProvenance := evalModelProvenance(t)

@@ -623,21 +623,15 @@ func unsafeCacheText(value string) bool {
 }
 
 func recordCacheBytes(record Record) int {
-	total := len(record.Request.id) + len(record.Request.context.ID()) +
+	total := len(record.Request.id) + contextPackCacheBytes(record.Request.context) +
 		len(record.Transcript.id) + len(record.Result.ID()) +
-		len(record.Request.context.Query()) + len(record.Request.provenance.harness) +
+		len(record.Request.provenance.harness) +
 		len(record.Request.provenance.toolPolicy) + 256
 	total += len(canonicalBudgets(record.Request.budgets))
 	total += len(modelIdentity(record.Request.provenance.model))
 	total += len(record.Request.provenance.prompt.TemplateID()) +
 		len(record.Request.provenance.prompt.Version()) +
 		len(record.Request.provenance.prompt.Hash())
-	for key, value := range record.Request.context.Metadata() {
-		total += len(key) + len(value)
-	}
-	for _, anchor := range record.Request.context.Evidence() {
-		total += anchorCacheBytes(anchor)
-	}
 	total += contextPackCacheBytes(record.Transcript.context)
 	for _, exchange := range record.Transcript.exchanges {
 		total += len(actionKey(exchange.action)) + len(exchange.action.correlation) + 32
@@ -665,6 +659,11 @@ func recordCacheBytes(record Record) int {
 
 func contextPackCacheBytes(pack inference.ContextPack) int {
 	total := len(pack.ID()) + len(pack.Query()) + 128
+	total += len(pack.Snapshot().ID()) + len(cacheTime(pack.Snapshot().AsOf()))
+	total += len(pack.Authorization().Fingerprint()) + len(cacheTime(pack.Authorization().ExpiresAt()))
+	if ontology, ok := pack.Ontology(); ok {
+		total += len(ontology.SchemaID()) + len(ontology.VersionID())
+	}
 	for key, value := range pack.Metadata() {
 		total += len(key) + len(value)
 	}

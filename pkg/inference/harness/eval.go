@@ -269,6 +269,10 @@ func fixtureGraphEdgesEqual(got, want graph.Edge) bool {
 }
 
 func stringSlicesEqual(got, want []string) bool {
+	got = append([]string(nil), got...)
+	want = append([]string(nil), want...)
+	sort.Strings(got)
+	sort.Strings(want)
 	if len(got) != len(want) {
 		return false
 	}
