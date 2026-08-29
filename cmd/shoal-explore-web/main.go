@@ -54,7 +54,7 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 	remote := flags.String("remote", "", "Remote Explorer web API URL for -backend remote")
 	embeddingProvider := flags.String(
 		"embedding-provider", "",
-		"Optional embedded vector provider: fake, ollama, or openai",
+		"Optional embedded vector provider: fake, lexical, ollama, openai, or voyage",
 	)
 	embeddingModel := flags.String(
 		"embedding-model", "",
@@ -62,11 +62,11 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 	)
 	embeddingBaseURL := flags.String(
 		"embedding-base-url", "",
-		"Embedding provider base URL for ollama/openai",
+		"Embedding provider base URL for ollama/openai/voyage",
 	)
 	embeddingAPIKeyEnv := flags.String(
 		"embedding-api-key-env", "OPENAI_API_KEY",
-		"Environment variable read at request time for openai credentials",
+		"Environment variable read at request time for openai/voyage credentials",
 	)
 	embeddingDimensions := flags.Int(
 		"embedding-dimensions", 0,
@@ -137,6 +137,24 @@ func (c embeddingConfig) embedder() (model.Embedder, error) {
 		return nil, nil
 	case "fake":
 		return model.FakeEmbedder{Dimensions: c.dimensions, Model: c.model}, nil
+	case "lexical":
+		if c.dimensions <= 0 {
+			return nil, fmt.Errorf("embedding dimensions are required for lexical")
+		}
+		return model.NewLexicalEmbedder(model.LexicalConfig{
+			Dimensions: c.dimensions,
+			Model:      c.model,
+		})
+	case "voyage":
+		if c.dimensions <= 0 {
+			return nil, fmt.Errorf("embedding dimensions are required for voyage")
+		}
+		return model.NewVoyageEmbedder(model.VoyageConfig{
+			BaseURL:          c.baseURL,
+			Model:            c.model,
+			Dimensions:       c.dimensions,
+			APICredentialEnv: c.apiKeyEnv,
+		})
 	case "ollama":
 		if c.dimensions <= 0 {
 			return nil, fmt.Errorf("embedding dimensions are required for ollama")
