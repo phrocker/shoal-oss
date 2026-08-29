@@ -200,7 +200,30 @@ func evaluateRecord(tc EvaluationCase, record Record, runErr error) EvaluationCa
 			out.SupportedClaims++
 		}
 	}
-	out.UnsupportedIssues = len(record.Result.Unsupported())
+	unsupported := record.Result.Unsupported()
+	out.UnsupportedIssues = len(unsupported)
+	for _, issue := range unsupported {
+		for _, evidenceID := range issue.EvidenceIDs() {
+			anchor, found := available[evidenceID]
+			if !found {
+				out.InvalidEvidenceRefs++
+				continue
+			}
+			out.ValidEvidenceReferences++
+			if citation, quote, cited := anchor.Document(); cited {
+				out.CitationReferences++
+				if err := validateFixtureCitation(citation, quote, tc.Sources); err != nil {
+					out.InvalidCitationRefs++
+				}
+			}
+			if path, cited := anchor.Path(); cited {
+				out.GraphPathReferences++
+				if err := validateFixtureGraphPath(anchor.ID(), path, tc.GraphPaths); err != nil {
+					out.InvalidGraphPathRefs++
+				}
+			}
+		}
+	}
 	return out
 }
 

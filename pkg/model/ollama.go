@@ -201,7 +201,7 @@ func (o *OllamaEmbedder) Embed(ctx context.Context, req EmbedRequest) (EmbedResu
 }
 
 func ollamaCacheIdentity(kind string, cfg OllamaConfig, endpoint, httpClientIdentity string) string {
-	return strings.Join([]string{
+	return framedModelIdentity(
 		kind,
 		endpoint,
 		cfg.Model,
@@ -212,7 +212,7 @@ func ollamaCacheIdentity(kind string, cfg OllamaConfig, endpoint, httpClientIden
 		strconv.FormatInt(cfg.MaxResponseBytes, 10),
 		strconv.Itoa(cfg.MaxVectorDimensions),
 		strconv.FormatInt(cfg.ErrorSnippetBytes, 10),
-	}, "\x00")
+	)
 }
 
 func validateOllamaConfig(cfg OllamaConfig, path string) (OllamaConfig, string, error) {

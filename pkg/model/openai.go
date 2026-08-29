@@ -253,7 +253,7 @@ func (o *OpenAIEmbedder) Embed(ctx context.Context, req EmbedRequest) (EmbedResu
 }
 
 func openAICacheIdentity(kind string, client *openAIClient, model string) string {
-	return strings.Join([]string{
+	return framedModelIdentity(
 		kind,
 		client.baseURL,
 		model,
@@ -267,7 +267,7 @@ func openAICacheIdentity(kind string, client *openAIClient, model string) string
 		strconv.FormatInt(client.maxResponseBytes, 10),
 		strconv.Itoa(client.maxVectorDimensions),
 		strconv.FormatInt(client.errorSnippetBytes, 10),
-	}, "\x00")
+	)
 }
 
 type openAIUsage struct {

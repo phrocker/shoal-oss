@@ -25,7 +25,7 @@ func (f FakeGenerator) CacheIdentity() (string, error) {
 	if name == "" {
 		name = "deterministic"
 	}
-	return "model-fake-generator-v1:" + name, nil
+	return framedModelIdentity("model-fake-generator-v1", name), nil
 }
 
 func (f FakeGenerator) Generate(ctx context.Context, req GenerateRequest) (GenerateResult, error) {
@@ -154,7 +154,7 @@ func (f FakeEmbedder) CacheIdentity() (string, error) {
 	if dim == 0 {
 		dim = DefaultFakeDimensions
 	}
-	return "model-fake-embedder-v1:" + name + ":" + strconv.Itoa(dim), nil
+	return framedModelIdentity("model-fake-embedder-v1", name, strconv.Itoa(dim)), nil
 }
 
 func (f FakeEmbedder) Embed(ctx context.Context, req EmbedRequest) (EmbedResult, error) {
