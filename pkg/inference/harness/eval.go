@@ -478,16 +478,23 @@ func LoadFixtureEvaluationCases(root string, generatedAt time.Time) ([]Evaluatio
 		spanID     shoal.ID
 		query      string
 		quote      string
+		subject    shoal.ID
+		predicate  shoal.ID
+		object     string
 	}{
 		{
 			id: "q-grounded-aster-relay", path: "aster-relay-protocol-r2.md",
 			documentID: "aster-relay-protocol", revisionID: "r2", sectionID: "purpose", spanID: "purpose-relay",
-			query: "What carries sealed telemetry batches?", quote: "The Aster Relay is a component of the Aster Mesh.",
+			query: "What carries sealed telemetry batches?",
+			quote: "The Aster Relay is a component of the Aster Mesh. " +
+				"It carries sealed telemetry batches from the Juniper Agent to the Lumen Processor.",
+			subject: "component:aster-relay", predicate: "relation:carries", object: "sealed telemetry batches",
 		},
 		{
 			id: "q-grounded-quartz-ring", path: "adr-004-quartz-ring.md",
 			documentID: "adr-004-quartz-ring", revisionID: "r1", sectionID: "decision", spanID: "decision-quartz",
 			query: "What was selected for relay assignment?", quote: "The Aster Relay will place each sealed telemetry batch on the Quartz Ring.",
+			subject: "component:aster-relay", predicate: "relation:assigns_to", object: "Quartz Ring",
 		},
 	}
 	snapshot, err := inference.NewSnapshotPin("fixture-snapshot", generatedAt.Add(-time.Hour))
@@ -525,7 +532,7 @@ func LoadFixtureEvaluationCases(root string, generatedAt time.Time) ([]Evaluatio
 		if err != nil {
 			return nil, err
 		}
-		value, err := ontology.NewStringValue("grounded")
+		value, err := ontology.NewStringValue(spec.object)
 		if err != nil {
 			return nil, err
 		}
@@ -540,8 +547,8 @@ func LoadFixtureEvaluationCases(root string, generatedAt time.Time) ([]Evaluatio
 			ID:   spec.id,
 			Pack: pack,
 			ExpectedClaims: []ExpectedClaim{{
-				Subject:     "entity:fake",
-				Predicate:   "predicate:summary",
+				Subject:     spec.subject,
+				Predicate:   spec.predicate,
 				Object:      value,
 				EvidenceIDs: []shoal.ID{anchor.ID()},
 			}},
@@ -552,24 +559,24 @@ func LoadFixtureEvaluationCases(root string, generatedAt time.Time) ([]Evaluatio
 	}
 	graphPath := graph.Path{
 		Nodes: []graph.Node{
-			{ID: "node:violet-gate", Kind: "component"},
-			{ID: "node:celadon-hub", Kind: "component"},
+			{ID: "node:violet-gate", Kind: "component", Labels: []string{"Violet Gate"}},
+			{ID: "node:celadon-hub", Kind: "system", Labels: []string{"Celadon Hub"}},
 		},
 		Edges: []graph.Edge{{
-			ID: "edge:violet-routes-celadon", From: "node:violet-gate",
-			To: "node:celadon-hub", Type: "routes_to", Weight: 1,
+			ID: "edge:violet-part-of-celadon", From: "node:violet-gate",
+			To: "node:celadon-hub", Type: "part_of",
 		}},
 	}
 	graphAnchor, err := inference.NewGraphAnchor(graphPath)
 	if err != nil {
 		return nil, err
 	}
-	value, err := ontology.NewStringValue("grounded")
+	value, err := ontology.NewStringValue("node:celadon-hub")
 	if err != nil {
 		return nil, err
 	}
 	graphPack, err := inference.NewContextPack(
-		"Which component routes to Celadon Hub?",
+		"Which component is part of Celadon Hub?",
 		[]inference.EvidenceAnchor{graphAnchor}, nil,
 		snapshot, auth, shoal.Metadata{"fixture": "explorer-eval"},
 	)
@@ -580,8 +587,8 @@ func LoadFixtureEvaluationCases(root string, generatedAt time.Time) ([]Evaluatio
 		ID:   "q-grounded-graph-path",
 		Pack: graphPack,
 		ExpectedClaims: []ExpectedClaim{{
-			Subject:     "entity:fake",
-			Predicate:   "predicate:summary",
+			Subject:     "node:violet-gate",
+			Predicate:   "relation:part_of",
 			Object:      value,
 			EvidenceIDs: []shoal.ID{graphAnchor.ID()},
 		}},

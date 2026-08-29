@@ -74,13 +74,14 @@ func (f FakeGenerator) generateHarnessAction(req GenerateRequest) (GenerateResul
 		if evidenceID == "" {
 			text = `{"action":"stop","correlation_id":"` + fakeProtocolID("fake-stop") + `","unsupported":[{"input":"final claim","reason":"no evidence anchor was visible","evidence_ids":[]}]}`
 		} else {
+			subject, predicate, object := fakeHarnessClaim(req.Prompt)
 			payload := map[string]any{
 				"action":         "stop",
 				"correlation_id": fakeProtocolID("fake-stop"),
 				"claims": []map[string]any{{
-					"subject":      fakeProtocolID("entity:fake"),
-					"predicate":    fakeProtocolID("predicate:summary"),
-					"object":       map[string]any{"type": "string", "value": "grounded"},
+					"subject":      fakeProtocolID(subject),
+					"predicate":    fakeProtocolID(predicate),
+					"object":       map[string]any{"type": "string", "value": object},
 					"confidence":   1,
 					"evidence_ids": []string{evidenceID},
 				}},
@@ -105,6 +106,24 @@ func (f FakeGenerator) generateHarnessAction(req GenerateRequest) (GenerateResul
 			TotalTokens:  tokenEstimate(req.Prompt) + outputTokens,
 		},
 	}, nil
+}
+
+func fakeHarnessClaim(prompt string) (subject, predicate, object string) {
+	var envelope struct {
+		Query string `json:"query"`
+	}
+	_ = json.Unmarshal([]byte(prompt), &envelope)
+	query := strings.ToLower(envelope.Query)
+	switch {
+	case strings.Contains(query, "sealed telemetry"):
+		return "component:aster-relay", "relation:carries", "sealed telemetry batches"
+	case strings.Contains(query, "relay assignment") || strings.Contains(query, "quartz ring"):
+		return "component:aster-relay", "relation:assigns_to", "Quartz Ring"
+	case strings.Contains(query, "celadon hub") || strings.Contains(query, "part of"):
+		return "node:violet-gate", "relation:part_of", "node:celadon-hub"
+	default:
+		return "entity:fake", "predicate:summary", "grounded"
+	}
 }
 
 func fakeProtocolID(id string) string {
