@@ -128,7 +128,28 @@ ID, section ID, span ID, and byte range. `"Explanation"` is present with
 `"Modes"` containing `"lexical"`, `"tree"`, and `"graph"`, and `"Scores"` for
 those modes.
 
-## 7. Create a relationship and traverse neighbors
+## 7. Ask a grounded question
+
+```powershell
+go run .\cmd\shoal-explore ask `
+  -data .shoal\explorer-demo `
+  -provider fake `
+  -question "What keeps release notes grounded?"
+```
+
+Expected observable outcome: the deterministic offline fake provider returns
+`"Answer": "grounded"` with one grounded claim, `"StopReason": "stop"`, exact
+evidence entries containing citations, quotes, byte ranges, and graph paths,
+redacted provenance, local execution semantics, budget limits, and a concise
+`"Trace"` summary. Add `-trace` to include the detailed per-iteration tool
+trace or `-format markdown` for a readable Markdown report. For live model
+experiments, select `-provider ollama` or `-provider openai-compatible`;
+API-key credentials are read from the environment named by `-api-key-env` and
+are not printed. Opaque Shoal IDs in `ask` output are base64-encoded so
+document, graph, and evidence identifiers round-trip losslessly; graph
+metadata keys and values use the same lossless encoding.
+
+## 8. Create a relationship and traverse neighbors
 
 ```powershell
 go run .\cmd\shoal-explore connect `
@@ -155,7 +176,7 @@ Expected observable outcome: the neighborhood contains one `"supports"` edge
 and two document nodes. The node properties show the guide and release titles,
 confirming that traversal crossed the relationship created above.
 
-## 8. Start the optional web workspace
+## 9. Start the optional web workspace
 
 ```powershell
 go run .\cmd\shoal-explore-web `

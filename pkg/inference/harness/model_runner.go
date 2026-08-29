@@ -22,11 +22,14 @@ package harness
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -41,6 +44,221 @@ import (
 )
 
 const ModelPromptMarker = "shoal-harness-action-json/v1"
+
+const modelPromptInstruction = "Return only one JSON object. Use action retrieve, open_section, neighbors, or stop. " +
+	"All JSON ID fields are base64-encoded opaque ID bytes. Final stop claims must cite evidence_ids from this context; " +
+	"put unsupported or ungrounded output in unsupported."
+
+func modelPromptTools() []string {
+	return []string{
+		string(ActionRetrieve), string(ActionOpenSection),
+		string(ActionNeighbors), string(ActionStop),
+	}
+}
+
+func modelPromptSchemas() []promptSchema {
+	return []promptSchema{
+		{
+			Action: ActionRetrieve,
+			Required: []string{
+				"action=retrieve", "correlation_id", "query", "limit",
+			},
+			Description: "Retrieve ranked evidence for query with positive limit. correlation_id is base64-encoded opaque ID bytes.",
+		},
+		{
+			Action: ActionOpenSection,
+			Required: []string{
+				"action=open_section", "correlation_id", "document_id", "revision_id", "section_id",
+			},
+			Description: "Open exactly one visible section previously present in evidence. All *_id fields are base64-encoded opaque ID bytes.",
+		},
+		{
+			Action: ActionNeighbors,
+			Required: []string{
+				"action=neighbors", "correlation_id", "node_id", "hops", "fanout",
+			},
+			Description: "Expand from one visible graph node with positive hops and fanout. node_id is base64-encoded opaque ID bytes.",
+		},
+		{
+			Action: ActionStop,
+			Required: []string{
+				"action=stop", "correlation_id",
+				"claims[].subject", "claims[].predicate",
+				"claims[].object.type", "claims[].object.value",
+				"claims[].confidence", "claims[].evidence_ids",
+				"unresolved[].input", "unresolved[].reason",
+				"unsupported[].input", "unsupported[].reason",
+			},
+			Description: "Stop with at least one claim, unresolved issue, or unsupported issue. " +
+				"Ontology object types are string, integer, number, boolean, timestamp, or reference. " +
+				"Every claim evidence_ids entry must be copied from evidence[].id.",
+		},
+	}
+}
+
+// ModelPromptTemplateHash returns the canonical SHA-256 digest for the
+// model-action prompt template used by ModelRunner.
+func ModelPromptTemplateHash() string {
+	wireExample, err := modelPromptWireExample()
+	if err != nil {
+		panic(err)
+	}
+	payload := struct {
+		Protocol    string          `json:"protocol"`
+		Tools       []string        `json:"tools"`
+		Schemas     []promptSchema  `json:"schemas"`
+		Instruction string          `json:"instruction"`
+		WireSchema  []string        `json:"wire_schema"`
+		WireExample json.RawMessage `json:"wire_example"`
+	}{
+		Protocol:    ModelPromptMarker,
+		Tools:       modelPromptTools(),
+		Schemas:     modelPromptSchemas(),
+		Instruction: modelPromptInstruction,
+		WireSchema:  wireSchemaDescriptors(reflect.TypeOf(promptEnvelope{})),
+		WireExample: wireExample,
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		panic(err)
+	}
+	sum := sha256.Sum256(encoded)
+	return "sha256:" + hex.EncodeToString(sum[:])
+}
+
+func modelPromptWireExample() (json.RawMessage, error) {
+	example := promptEnvelope{
+		Protocol: ModelPromptMarker,
+		Tools:    modelPromptTools(),
+		Budgets: Budgets{
+			MaxSteps:          1,
+			MaxElapsed:        time.Second,
+			MaxInputTokens:    2,
+			MaxOutputTokens:   3,
+			MaxEvidence:       4,
+			MaxGraphHops:      5,
+			MaxGraphNodes:     6,
+			MaxFanout:         7,
+			MaxRepeatedAction: 8,
+		},
+		Consumed: BudgetUsage{ModelCalls: 1, InputTokens: 2, OutputTokens: 3, Evidence: 4, GraphHops: 5, GraphNodes: 6},
+		Remaining: BudgetUsage{
+			ModelCalls: 7, InputTokens: 8, OutputTokens: 9, Evidence: 10, GraphHops: 11, GraphNodes: 12,
+		},
+		Snapshot:  promptSnapshot{ID: newProtocolID("snapshot"), AsOf: "2000-01-02T03:04:05Z"},
+		Auth:      promptAuth{Fingerprint: newProtocolID("auth"), ExpiresAt: "2000-01-02T03:04:05Z"},
+		Query:     "question",
+		ContextID: newProtocolID("context"),
+		Evidence: []promptEvidence{{
+			ID:   newProtocolID("evidence"),
+			Kind: inference.AnchorDocument,
+			Citation: &promptCitation{
+				DocumentID: newProtocolID("document"),
+				RevisionID: newProtocolID("revision"),
+				SectionID:  newProtocolID("section"),
+				SpanID:     newProtocolID("span"),
+				Range: document.SourceRange{
+					Start: document.SourcePosition{Offset: 13, Page: 14},
+					End:   document.SourcePosition{Offset: 15, Page: 16},
+				},
+			},
+			Quote: "quote",
+			Path: &promptPath{
+				Nodes: []promptNode{{
+					ID:         newProtocolID("node"),
+					Kind:       "kind",
+					Labels:     []string{"label"},
+					Properties: []promptMetadataEntry{{Key: newProtocolBytes("node-key"), Value: newProtocolBytes("node-value")}},
+				}},
+				Edges: []promptEdge{{
+					ID:     newProtocolID("edge"),
+					From:   newProtocolID("from"),
+					To:     newProtocolID("to"),
+					Type:   "edge-type",
+					Weight: shoal.Score(0.5),
+					Properties: []promptMetadataEntry{{
+						Key: newProtocolBytes("edge-key"), Value: newProtocolBytes("edge-value"),
+					}},
+				}},
+			},
+		}},
+		Transcript: []promptExchange{{
+			Action:      ActionRetrieve,
+			Correlation: newProtocolID("correlation"),
+			Query:       "query",
+			Limit:       1,
+			DocumentID:  newProtocolID("document"),
+			RevisionID:  newProtocolID("revision"),
+			SectionID:   newProtocolID("section"),
+			NodeID:      newProtocolID("node"),
+			Hops:        2,
+			Fanout:      3,
+			Usage:       Usage{InputTokens: 4, OutputTokens: 5},
+			EvidenceIDs: []protocolID{newProtocolID("evidence")},
+		}},
+		Schemas:     modelPromptSchemas(),
+		Instruction: modelPromptInstruction,
+	}
+	return json.Marshal(example)
+}
+
+func wireSchemaDescriptors(roots ...reflect.Type) []string {
+	seen := make(map[reflect.Type]struct{})
+	descriptors := make([]string, 0, len(roots))
+	var walk func(reflect.Type)
+	walk = func(t reflect.Type) {
+		if t == nil {
+			return
+		}
+		for t.Kind() == reflect.Pointer {
+			t = t.Elem()
+		}
+		switch t.Kind() {
+		case reflect.Array, reflect.Slice:
+			walk(t.Elem())
+			return
+		case reflect.Map:
+			walk(t.Key())
+			walk(t.Elem())
+			return
+		case reflect.Struct:
+		default:
+			return
+		}
+		if _, ok := seen[t]; ok {
+			return
+		}
+		seen[t] = struct{}{}
+		descriptors = append(descriptors, typeDescriptor(t))
+		for i := 0; i < t.NumField(); i++ {
+			walk(t.Field(i).Type)
+		}
+	}
+	for _, root := range roots {
+		walk(root)
+	}
+	sort.Strings(descriptors)
+	return descriptors
+}
+
+func typeDescriptor(t reflect.Type) string {
+	var builder strings.Builder
+	builder.WriteString(t.PkgPath())
+	builder.WriteByte('.')
+	builder.WriteString(t.Name())
+	builder.WriteByte('{')
+	for i := 0; i < t.NumField(); i++ {
+		field := t.Field(i)
+		builder.WriteString(field.Name)
+		builder.WriteByte(':')
+		builder.WriteString(field.Type.String())
+		builder.WriteByte(':')
+		builder.WriteString(string(field.Tag))
+		builder.WriteByte(';')
+	}
+	builder.WriteByte('}')
+	return builder.String()
+}
 
 type ModelRunnerConfig struct {
 	MaxOutputTokens int
@@ -449,62 +667,21 @@ func modelPrompt(request SessionRequest, transcript Transcript) (string, error) 
 		}
 		exchanges = append(exchanges, item)
 	}
-	consumed := promptConsumed(transcript)
+	consumed := promptConsumed(request.context, transcript)
 	envelope := promptEnvelope{
-		Protocol: ModelPromptMarker,
-		Tools: []string{
-			string(ActionRetrieve), string(ActionOpenSection),
-			string(ActionNeighbors), string(ActionStop),
-		},
-		Budgets:    request.budgets,
-		Consumed:   consumed,
-		Remaining:  promptRemaining(request.budgets, consumed),
-		Snapshot:   promptSnapshot{ID: newProtocolID(request.context.Snapshot().ID()), AsOf: request.context.Snapshot().AsOf().Format(time.RFC3339Nano)},
-		Auth:       promptAuth{Fingerprint: newProtocolID(request.context.Authorization().Fingerprint()), ExpiresAt: request.context.Authorization().ExpiresAt().Format(time.RFC3339Nano)},
-		Query:      request.context.Query(),
-		ContextID:  newProtocolID(transcript.context.ID()),
-		Evidence:   evidence,
-		Transcript: exchanges,
-		Schemas: []promptSchema{
-			{
-				Action: ActionRetrieve,
-				Required: []string{
-					"action=retrieve", "correlation_id", "query", "limit",
-				},
-				Description: "Retrieve ranked evidence for query with positive limit. correlation_id is base64-encoded opaque ID bytes.",
-			},
-			{
-				Action: ActionOpenSection,
-				Required: []string{
-					"action=open_section", "correlation_id", "document_id", "revision_id", "section_id",
-				},
-				Description: "Open exactly one visible section previously present in evidence. All *_id fields are base64-encoded opaque ID bytes.",
-			},
-			{
-				Action: ActionNeighbors,
-				Required: []string{
-					"action=neighbors", "correlation_id", "node_id", "hops", "fanout",
-				},
-				Description: "Expand from one visible graph node with positive hops and fanout. node_id is base64-encoded opaque ID bytes.",
-			},
-			{
-				Action: ActionStop,
-				Required: []string{
-					"action=stop", "correlation_id",
-					"claims[].subject", "claims[].predicate",
-					"claims[].object.type", "claims[].object.value",
-					"claims[].confidence", "claims[].evidence_ids",
-					"unresolved[].input", "unresolved[].reason",
-					"unsupported[].input", "unsupported[].reason",
-				},
-				Description: "Stop with at least one claim, unresolved issue, or unsupported issue. " +
-					"Ontology object types are string, integer, number, boolean, timestamp, or reference. " +
-					"Every claim evidence_ids entry must be copied from evidence[].id.",
-			},
-		},
-		Instruction: "Return only one JSON object. Use action retrieve, open_section, neighbors, or stop. " +
-			"All JSON ID fields are base64-encoded opaque ID bytes. Final stop claims must cite evidence_ids from this context; " +
-			"put unsupported or ungrounded output in unsupported.",
+		Protocol:    ModelPromptMarker,
+		Tools:       modelPromptTools(),
+		Budgets:     request.budgets,
+		Consumed:    consumed,
+		Remaining:   promptRemaining(request.budgets, consumed),
+		Snapshot:    promptSnapshot{ID: newProtocolID(request.context.Snapshot().ID()), AsOf: request.context.Snapshot().AsOf().Format(time.RFC3339Nano)},
+		Auth:        promptAuth{Fingerprint: newProtocolID(request.context.Authorization().Fingerprint()), ExpiresAt: request.context.Authorization().ExpiresAt().Format(time.RFC3339Nano)},
+		Query:       request.context.Query(),
+		ContextID:   newProtocolID(transcript.context.ID()),
+		Evidence:    evidence,
+		Transcript:  exchanges,
+		Schemas:     modelPromptSchemas(),
+		Instruction: modelPromptInstruction,
 	}
 	payload, err := json.Marshal(envelope)
 	if err != nil {
@@ -513,9 +690,10 @@ func modelPrompt(request SessionRequest, transcript Transcript) (string, error) 
 	return string(payload), nil
 }
 
-func promptConsumed(transcript Transcript) BudgetUsage {
+func promptConsumed(initial inference.ContextPack, transcript Transcript) BudgetUsage {
 	usage := BudgetUsage{
 		ModelCalls: len(transcript.exchanges),
+		Evidence:   len(initial.Evidence()),
 		GraphNodes: len(graphNodeSet(transcript.context.Evidence())),
 	}
 	for _, exchange := range transcript.exchanges {

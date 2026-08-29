@@ -292,7 +292,7 @@ func TestRunAccountsAttemptedToolUsageBeforeBudgetFailures(t *testing.T) {
 		if !errors.Is(err, ErrBudgetExhausted) {
 			t.Fatalf("error = %v", err)
 		}
-		if record.Trace.Usage.Evidence != 2 || len(record.Trace.Iterations[0].EvidenceIDs) != 2 {
+		if record.Trace.Usage.Evidence != 3 || len(record.Trace.Iterations[0].EvidenceIDs) != 2 {
 			t.Fatalf("attempted evidence overage was not traced: %#v", record.Trace)
 		}
 	})
@@ -312,6 +312,40 @@ func TestRunAccountsAttemptedToolUsageBeforeBudgetFailures(t *testing.T) {
 			t.Fatalf("attempted graph-node overage was not traced: %#v", record.Trace)
 		}
 	})
+}
+
+func TestRunRejectsInitialEvidenceBudgetBeforeRunnerStart(t *testing.T) {
+	pack := mustPack(t, []inference.EvidenceAnchor{anchor(t, "one", 0), anchor(t, "two", 10)}, fixedTime.Add(time.Hour))
+	custom := budgets()
+	custom.MaxEvidence = 1
+	runner := &startCountingRunner{}
+	record, err := newGeneratorWithBudgets(t, runner, &fakeTools{pack: pack}, custom).Run(context.Background(), pack)
+	if !errors.Is(err, ErrBudgetExhausted) {
+		t.Fatalf("error = %v", err)
+	}
+	if runner.starts != 0 {
+		t.Fatalf("runner started despite initial evidence overage")
+	}
+	if record.Trace.StopReason != StopReasonBudgetExhausted || record.Trace.Usage.Evidence != 2 {
+		t.Fatalf("initial evidence overage not traced: %#v", record.Trace)
+	}
+}
+
+func TestRunRejectsInitialGraphNodeBudgetBeforeRunnerStart(t *testing.T) {
+	pack := mustPack(t, []inference.EvidenceAnchor{graphNeighborAnchor(t)}, fixedTime.Add(time.Hour))
+	custom := budgets()
+	custom.MaxGraphNodes = 1
+	runner := &startCountingRunner{}
+	record, err := newGeneratorWithBudgets(t, runner, &fakeTools{pack: pack}, custom).Run(context.Background(), pack)
+	if !errors.Is(err, ErrBudgetExhausted) {
+		t.Fatalf("error = %v", err)
+	}
+	if runner.starts != 0 {
+		t.Fatalf("runner started despite initial graph-node overage")
+	}
+	if record.Trace.StopReason != StopReasonBudgetExhausted || record.Trace.Usage.GraphNodes != 2 {
+		t.Fatalf("initial graph-node overage not traced: %#v", record.Trace)
+	}
 }
 
 func TestCancellationTimeoutAndRunnerFailure(t *testing.T) {
@@ -587,6 +621,13 @@ type captureRecorder struct{ record EvaluationRecord }
 func (r *captureRecorder) Record(_ context.Context, record EvaluationRecord) error {
 	r.record = record
 	return nil
+}
+
+type startCountingRunner struct{ starts int }
+
+func (r *startCountingRunner) Start(context.Context, SessionRequest) (Session, error) {
+	r.starts++
+	return nil, errors.New("should not start")
 }
 
 type blockingRunner struct{}
