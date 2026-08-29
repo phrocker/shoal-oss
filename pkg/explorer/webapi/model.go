@@ -22,6 +22,7 @@ package webapi
 import (
 	"time"
 
+	"github.com/phrocker/shoal-oss/pkg/document"
 	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/graph"
 	"github.com/phrocker/shoal-oss/pkg/retrieval"
@@ -41,6 +42,9 @@ const (
 	MaxEdgeTypes         uint32 = 64
 	MaxEvidencePerResult uint32 = 32
 	MaxResponseBytes     uint64 = 64 << 20
+	MaxUploadFiles       uint32 = 8
+	MaxUploadFileBytes   uint64 = 1 << 20
+	MaxUploadTotalBytes  uint64 = 9 << 20
 )
 
 // Capability identifies one browser-visible feature without revealing where or
@@ -54,6 +58,7 @@ const (
 	CapabilityVector       Capability = "vector_retrieval"
 	CapabilityNeighborhood Capability = "neighborhood"
 	CapabilityPath         Capability = "path"
+	CapabilityIngest       Capability = "ingest"
 )
 
 // Capabilities advertises only stable logical features supported by a backend.
@@ -64,6 +69,7 @@ type Capabilities struct {
 	Vector       bool `json:"vector_retrieval"`
 	Neighborhood bool `json:"neighborhood"`
 	Path         bool `json:"path"`
+	Ingest       bool `json:"ingest"`
 }
 
 // AllCapabilities returns the complete feature set implemented by the embedded
@@ -71,7 +77,7 @@ type Capabilities struct {
 func AllCapabilities() Capabilities {
 	return Capabilities{
 		Documents: true, Document: true, Retrieve: true,
-		Vector: false, Neighborhood: true, Path: true,
+		Vector: false, Neighborhood: true, Path: true, Ingest: true,
 	}
 }
 
@@ -90,6 +96,8 @@ func (c Capabilities) Supports(capability Capability) bool {
 		return c.Neighborhood
 	case CapabilityPath:
 		return c.Path
+	case CapabilityIngest:
+		return c.Ingest
 	default:
 		return false
 	}
@@ -182,14 +190,45 @@ type PathResponse struct {
 	Path     graph.Path `json:"path"`
 }
 
+// UploadFile carries one bounded, untrusted browser file after HTTP parsing.
+type UploadFile struct {
+	Name    string
+	Content []byte
+}
+
+// IngestRequest carries one bounded browser upload batch.
+type IngestRequest struct {
+	Files []UploadFile
+}
+
+// IngestFileResult reports the durable outcome for one uploaded file.
+type IngestFileResult struct {
+	Name         string                     `json:"name"`
+	MediaType    string                     `json:"media_type"`
+	Disposition  explorer.IngestDisposition `json:"disposition"`
+	Document     document.Document          `json:"document"`
+	Revision     document.Revision          `json:"revision"`
+	SectionCount int                        `json:"section_count"`
+	SpanCount    int                        `json:"span_count"`
+}
+
+// IngestResponse returns the fresh snapshot after a successful ingest batch.
+type IngestResponse struct {
+	Snapshot Snapshot           `json:"snapshot"`
+	Files    []IngestFileResult `json:"files"`
+}
+
 // MetadataResponse advertises server-enforced public bounds.
 type MetadataResponse struct {
-	MaxPageSize      uint32       `json:"max_page_size"`
-	MaxTopK          uint32       `json:"max_top_k"`
-	MaxDepth         uint32       `json:"max_depth"`
-	MaxFanout        uint32       `json:"max_fanout"`
-	MaxNodes         uint32       `json:"max_nodes"`
-	MaxEdgeTypes     uint32       `json:"max_edge_types"`
-	MaxResponseBytes uint64       `json:"max_response_bytes"`
-	Capabilities     Capabilities `json:"capabilities"`
+	MaxPageSize         uint32       `json:"max_page_size"`
+	MaxTopK             uint32       `json:"max_top_k"`
+	MaxDepth            uint32       `json:"max_depth"`
+	MaxFanout           uint32       `json:"max_fanout"`
+	MaxNodes            uint32       `json:"max_nodes"`
+	MaxEdgeTypes        uint32       `json:"max_edge_types"`
+	MaxResponseBytes    uint64       `json:"max_response_bytes"`
+	MaxUploadFiles      uint32       `json:"max_upload_files"`
+	MaxUploadFileBytes  uint64       `json:"max_upload_file_bytes"`
+	MaxUploadTotalBytes uint64       `json:"max_upload_total_bytes"`
+	Capabilities        Capabilities `json:"capabilities"`
 }

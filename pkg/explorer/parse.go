@@ -103,7 +103,7 @@ func parseSourceWithLimits(
 	switch source.MediaType {
 	case "", MediaTypeMarkdown:
 		source.MediaType = MediaTypeMarkdown
-	case MediaTypeText:
+	case MediaTypeText, MediaTypeSource:
 	default:
 		return parsedSource{}, shoal.NewError(
 			shoal.ErrorInvalidArgument, "source media type is not supported")

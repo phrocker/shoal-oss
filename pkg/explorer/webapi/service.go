@@ -44,6 +44,11 @@ type Service interface {
 	Path(context.Context, PathRequest) (PathResponse, error)
 }
 
+// IngestProvider is an optional service extension for mutable browser uploads.
+type IngestProvider interface {
+	Ingest(context.Context, IngestRequest) (IngestResponse, error)
+}
+
 // CapabilityProvider is an optional service extension for dynamic feature
 // negotiation. Services that do not implement it are treated as fully capable.
 type CapabilityProvider interface {

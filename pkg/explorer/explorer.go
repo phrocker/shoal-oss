@@ -129,9 +129,31 @@ func (e *Explorer) Close() error {
 	return nil
 }
 
-// Ingest parses and durably stores one immutable text or Markdown revision.
+// Ingest parses and durably stores one immutable Markdown, plain-text, or
+// source-code-as-text revision.
 func (e *Explorer) Ingest(ctx context.Context, source Source) (IngestResult, error) {
 	return e.ingest(ctx, source, time.Time{})
+}
+
+// ValidateSource checks whether a source can be parsed without publishing it.
+func ValidateSource(source Source) error {
+	_, err := parseSource(source, time.Now())
+	return err
+}
+
+// AnalyzeSource checks whether a source can be parsed and returns its stable
+// document identity and content counts without publishing it.
+func AnalyzeSource(source Source) (IngestResult, error) {
+	parsed, err := parseSource(source, time.Now())
+	if err != nil {
+		return IngestResult{}, err
+	}
+	return IngestResult{
+		Document:     cloneDocument(parsed.document),
+		Revision:     cloneRevision(parsed.revision),
+		SectionCount: len(parsed.sections),
+		SpanCount:    len(parsed.spans),
+	}, nil
 }
 
 // IngestWithOptions parses and durably stores one immutable revision with
@@ -224,9 +246,10 @@ func (e *Explorer) Documents(ctx context.Context) ([]DocumentSummary, error) {
 			continue
 		}
 		summaries = append(summaries, DocumentSummary{
-			Document:  cloneDocument(record.Document),
-			Revision:  cloneRevision(record.Revision),
-			SourceURI: record.Source.URI,
+			Document:        cloneDocument(record.Document),
+			Revision:        cloneRevision(record.Revision),
+			SourceURI:       record.Source.URI,
+			SourceMediaType: record.Source.MediaType,
 		})
 	}
 	sort.Slice(summaries, func(i, j int) bool {
@@ -283,10 +306,11 @@ func (e *Explorer) Document(
 		return DocumentView{}, err
 	}
 	return DocumentView{
-		Document:  cloneDocument(record.Document),
-		Revision:  cloneRevision(record.Revision),
-		SourceURI: record.Source.URI,
-		Root:      root,
+		Document:        cloneDocument(record.Document),
+		Revision:        cloneRevision(record.Revision),
+		SourceURI:       record.Source.URI,
+		SourceMediaType: record.Source.MediaType,
+		Root:            root,
 	}, nil
 }
 

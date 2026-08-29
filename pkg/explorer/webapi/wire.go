@@ -259,12 +259,14 @@ func (r DocumentsResponse) MarshalJSON() ([]byte, error) {
 	documents := make([]any, 0, len(r.Documents))
 	for _, summary := range r.Documents {
 		documents = append(documents, struct {
-			Document  wireDocument `json:"document"`
-			Revision  wireRevision `json:"revision"`
-			SourceURI string       `json:"source_uri"`
+			Document        wireDocument `json:"document"`
+			Revision        wireRevision `json:"revision"`
+			SourceURI       string       `json:"source_uri"`
+			SourceMediaType string       `json:"source_media_type,omitempty"`
 		}{
 			Document: wireDocumentValue(summary.Document),
 			Revision: wireRevisionValue(summary.Revision), SourceURI: summary.SourceURI,
+			SourceMediaType: summary.SourceMediaType,
 		})
 	}
 	return json.Marshal(struct {
@@ -278,9 +280,10 @@ func (r *DocumentsResponse) UnmarshalJSON(data []byte) error {
 	var wire struct {
 		Snapshot  Snapshot `json:"snapshot"`
 		Documents []struct {
-			Document  wireDocument `json:"document"`
-			Revision  wireRevision `json:"revision"`
-			SourceURI string       `json:"source_uri"`
+			Document        wireDocument `json:"document"`
+			Revision        wireRevision `json:"revision"`
+			SourceURI       string       `json:"source_uri"`
+			SourceMediaType string       `json:"source_media_type,omitempty"`
 		} `json:"documents"`
 		NextCursor string `json:"next_cursor,omitempty"`
 	}
@@ -299,6 +302,7 @@ func (r *DocumentsResponse) UnmarshalJSON(data []byte) error {
 		}
 		documents = append(documents, explorer.DocumentSummary{
 			Document: documentValue, Revision: revisionValue, SourceURI: item.SourceURI,
+			SourceMediaType: item.SourceMediaType,
 		})
 	}
 	*r = DocumentsResponse{
@@ -312,14 +316,16 @@ func (r DocumentResponse) MarshalJSON() ([]byte, error) {
 		Snapshot Snapshot `json:"snapshot"`
 		Document any      `json:"document"`
 	}{r.Snapshot, struct {
-		Document  wireDocument    `json:"document"`
-		Revision  wireRevision    `json:"revision"`
-		SourceURI string          `json:"source_uri"`
-		Root      wireSectionView `json:"root"`
+		Document        wireDocument    `json:"document"`
+		Revision        wireRevision    `json:"revision"`
+		SourceURI       string          `json:"source_uri"`
+		SourceMediaType string          `json:"source_media_type,omitempty"`
+		Root            wireSectionView `json:"root"`
 	}{
 		Document:  wireDocumentValue(r.Document.Document),
 		Revision:  wireRevisionValue(r.Document.Revision),
-		SourceURI: r.Document.SourceURI, Root: wireSectionViewValue(r.Document.Root),
+		SourceURI: r.Document.SourceURI, SourceMediaType: r.Document.SourceMediaType,
+		Root: wireSectionViewValue(r.Document.Root),
 	}})
 }
 
@@ -327,10 +333,11 @@ func (r *DocumentResponse) UnmarshalJSON(data []byte) error {
 	var wire struct {
 		Snapshot Snapshot `json:"snapshot"`
 		Document struct {
-			Document  wireDocument    `json:"document"`
-			Revision  wireRevision    `json:"revision"`
-			SourceURI string          `json:"source_uri"`
-			Root      wireSectionView `json:"root"`
+			Document        wireDocument    `json:"document"`
+			Revision        wireRevision    `json:"revision"`
+			SourceURI       string          `json:"source_uri"`
+			SourceMediaType string          `json:"source_media_type,omitempty"`
+			Root            wireSectionView `json:"root"`
 		} `json:"document"`
 	}
 	if err := strictUnmarshal(data, &wire); err != nil {
@@ -352,7 +359,8 @@ func (r *DocumentResponse) UnmarshalJSON(data []byte) error {
 		Snapshot: wire.Snapshot,
 		Document: explorer.DocumentView{
 			Document: documentValue, Revision: revisionValue,
-			SourceURI: wire.Document.SourceURI, Root: root,
+			SourceURI: wire.Document.SourceURI, SourceMediaType: wire.Document.SourceMediaType,
+			Root: root,
 		},
 	}
 	return nil
@@ -500,6 +508,66 @@ func (r *PathResponse) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	*r = PathResponse{Snapshot: wire.Snapshot, Path: path}
+	return nil
+}
+
+func (r IngestResponse) MarshalJSON() ([]byte, error) {
+	files := make([]any, 0, len(r.Files))
+	for _, file := range r.Files {
+		files = append(files, struct {
+			Name         string                     `json:"name"`
+			MediaType    string                     `json:"media_type"`
+			Disposition  explorer.IngestDisposition `json:"disposition"`
+			Document     wireDocument               `json:"document"`
+			Revision     wireRevision               `json:"revision"`
+			SectionCount int                        `json:"section_count"`
+			SpanCount    int                        `json:"span_count"`
+		}{
+			Name: file.Name, MediaType: file.MediaType, Disposition: file.Disposition,
+			Document:     wireDocumentValue(file.Document),
+			Revision:     wireRevisionValue(file.Revision),
+			SectionCount: file.SectionCount, SpanCount: file.SpanCount,
+		})
+	}
+	return json.Marshal(struct {
+		Snapshot Snapshot `json:"snapshot"`
+		Files    []any    `json:"files"`
+	}{r.Snapshot, files})
+}
+
+func (r *IngestResponse) UnmarshalJSON(data []byte) error {
+	var wire struct {
+		Snapshot Snapshot `json:"snapshot"`
+		Files    []struct {
+			Name         string                     `json:"name"`
+			MediaType    string                     `json:"media_type"`
+			Disposition  explorer.IngestDisposition `json:"disposition"`
+			Document     wireDocument               `json:"document"`
+			Revision     wireRevision               `json:"revision"`
+			SectionCount int                        `json:"section_count"`
+			SpanCount    int                        `json:"span_count"`
+		} `json:"files"`
+	}
+	if err := strictUnmarshal(data, &wire); err != nil {
+		return err
+	}
+	files := make([]IngestFileResult, 0, len(wire.Files))
+	for _, item := range wire.Files {
+		documentValue, err := documentValue(item.Document)
+		if err != nil {
+			return fmt.Errorf("ingest.files.document: %w", err)
+		}
+		revisionValue, err := revisionValue(item.Revision)
+		if err != nil {
+			return fmt.Errorf("ingest.files.revision: %w", err)
+		}
+		files = append(files, IngestFileResult{
+			Name: item.Name, MediaType: item.MediaType, Disposition: item.Disposition,
+			Document: documentValue, Revision: revisionValue,
+			SectionCount: item.SectionCount, SpanCount: item.SpanCount,
+		})
+	}
+	*r = IngestResponse{Snapshot: wire.Snapshot, Files: files}
 	return nil
 }
 
