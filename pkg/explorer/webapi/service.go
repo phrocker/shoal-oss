@@ -30,6 +30,7 @@ import (
 
 	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/graph"
+	"github.com/phrocker/shoal-oss/pkg/retrieval"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
@@ -41,6 +42,18 @@ type Service interface {
 	Retrieve(context.Context, RetrievalRequest) (RetrievalResponse, error)
 	Neighborhood(context.Context, NeighborhoodRequest) (NeighborhoodResponse, error)
 	Path(context.Context, PathRequest) (PathResponse, error)
+}
+
+// CapabilityProvider is an optional service extension for dynamic feature
+// negotiation. Services that do not implement it are treated as fully capable.
+type CapabilityProvider interface {
+	Capabilities(context.Context) (Capabilities, error)
+}
+
+// MetadataProvider is an optional service extension for backends that can
+// negotiate both feature availability and public bounds.
+type MetadataProvider interface {
+	Metadata(context.Context) (MetadataResponse, error)
 }
 
 // EmbeddedService adapts the public Explorer client to the workspace service.
@@ -55,6 +68,10 @@ func NewEmbeddedService(client explorer.BoundedClient) (*EmbeddedService, error)
 		return nil, shoal.NewError(shoal.ErrorInvalidArgument, "explorer client is required")
 	}
 	return &EmbeddedService{client: client}, nil
+}
+
+func (s *EmbeddedService) Capabilities(context.Context) (Capabilities, error) {
+	return AllCapabilities(), nil
 }
 
 func (s *EmbeddedService) Documents(
@@ -140,7 +157,7 @@ func (s *EmbeddedService) Retrieve(
 	if err != nil {
 		return RetrievalResponse{}, err
 	}
-	if err := response.ValidateFor(query); err != nil {
+	if err := validateRetrievalResponse(response, query); err != nil {
 		return RetrievalResponse{}, shoal.WrapError(
 			shoal.ErrorInternal, "invalid retrieval response", err)
 	}
@@ -170,6 +187,9 @@ func (s *EmbeddedService) Neighborhood(
 	}
 	request.NodeIDs = normalizedBase.NodeIDs
 	request.EdgeTypes = normalizedBase.EdgeTypes
+	if err := validateEdgeTypes(request.EdgeTypes); err != nil {
+		return NeighborhoodResponse{}, err
+	}
 	if len(request.NodeIDs) == 0 {
 		return NeighborhoodResponse{}, shoal.NewError(
 			shoal.ErrorInvalidArgument, "at least one graph node ID is required")
@@ -226,6 +246,16 @@ func (s *EmbeddedService) Path(
 	depth, fanout, maxNodes, err := normalizeGraphBounds(
 		request.MaxDepth, request.Fanout, MaxNodes)
 	if err != nil {
+		return PathResponse{}, err
+	}
+	normalized, err := (explorer.NeighborhoodRequest{
+		NodeIDs: []shoal.ID{request.From}, Depth: depth, EdgeTypes: request.EdgeTypes,
+	}).Normalize()
+	if err != nil {
+		return PathResponse{}, err
+	}
+	request.EdgeTypes = normalized.EdgeTypes
+	if err := validateEdgeTypes(request.EdgeTypes); err != nil {
 		return PathResponse{}, err
 	}
 	bounded, err := s.client.BoundedNeighborhood(ctx, explorer.BoundedNeighborhoodRequest{
@@ -332,6 +362,29 @@ func normalizeGraphBounds(depth, fanout, maxNodes uint32) (uint32, uint32, uint3
 			shoal.ErrorInvalidArgument, "graph max_nodes exceeds the server bound")
 	}
 	return depth, fanout, maxNodes, nil
+}
+
+func validateEdgeTypes(edgeTypes []string) error {
+	if uint32(len(edgeTypes)) > MaxEdgeTypes {
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument, "edge type count exceeds the server bound")
+	}
+	return nil
+}
+
+func validateRetrievalResponse(response retrieval.Response, query retrieval.Request) error {
+	if err := response.ValidateFor(query); err != nil {
+		return err
+	}
+	for _, result := range response.Results {
+		if uint32(len(result.Evidence)) > MaxEvidencePerResult {
+			return shoal.NewError(
+				shoal.ErrorInvalidArgument,
+				"retrieval evidence count exceeds the server bound",
+			)
+		}
+	}
+	return nil
 }
 
 func encodeCursor(snapshot string, offset int) string {

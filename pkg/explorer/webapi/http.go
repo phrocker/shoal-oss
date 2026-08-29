@@ -18,6 +18,7 @@
 package webapi
 
 import (
+	"bytes"
 	"context"
 	"embed"
 	"encoding/json"
@@ -28,12 +29,13 @@ import (
 	"mime"
 	"net"
 	"net/http"
+	"reflect"
 	"strings"
 
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
-const maxRequestBytes = 1 << 20
+const maxRequestBytes = 32 << 20
 
 //go:embed static/*
 var staticFiles embed.FS
@@ -79,11 +81,13 @@ func (h *Handler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 }
 
 func (h *Handler) routes() {
-	h.mux.HandleFunc("GET /api/v1/meta", func(writer http.ResponseWriter, _ *http.Request) {
-		writeResponse(writer, http.StatusOK, MetadataResponse{
-			MaxPageSize: MaxPageSize, MaxTopK: MaxTopK, MaxDepth: MaxDepth,
-			MaxFanout: MaxFanout, MaxNodes: MaxNodes,
-		})
+	h.mux.HandleFunc("GET /api/v1/meta", func(writer http.ResponseWriter, request *http.Request) {
+		metadata, err := metadataFor(request.Context(), h.service)
+		if err != nil {
+			writeError(writer, err)
+			return
+		}
+		writeResponse(writer, http.StatusOK, metadata)
 	})
 	h.mux.HandleFunc("POST /api/v1/documents", endpoint(h.service.Documents))
 	h.mux.HandleFunc("POST /api/v1/document", endpoint(h.service.Document))
@@ -101,6 +105,31 @@ func (h *Handler) routes() {
 		writer.Header().Set("Content-Type", "text/html; charset=utf-8")
 		http.ServeFileFS(writer, request, content, "index.html")
 	})
+}
+
+func metadataFor(ctx context.Context, service Service) (MetadataResponse, error) {
+	provider, ok := service.(MetadataProvider)
+	if ok {
+		return provider.Metadata(ctx)
+	}
+	capabilities, err := capabilitiesFor(ctx, service)
+	if err != nil {
+		return MetadataResponse{}, err
+	}
+	return MetadataResponse{
+		MaxPageSize: MaxPageSize, MaxTopK: MaxTopK, MaxDepth: MaxDepth,
+		MaxFanout: MaxFanout, MaxNodes: MaxNodes, MaxEdgeTypes: MaxEdgeTypes,
+		MaxResponseBytes: MaxResponseBytes,
+		Capabilities:     capabilities,
+	}, nil
+}
+
+func capabilitiesFor(ctx context.Context, service Service) (Capabilities, error) {
+	provider, ok := service.(CapabilityProvider)
+	if !ok {
+		return AllCapabilities(), nil
+	}
+	return provider.Capabilities(ctx)
 }
 
 func endpoint[Request any, Response any](
@@ -140,30 +169,123 @@ func decodeRequest(writer http.ResponseWriter, request *http.Request, value any)
 }
 
 func writeResponse(writer http.ResponseWriter, status int, value any) {
+	var body limitedResponseBuffer
+	body.limit = int64(MaxResponseBytes)
+	if err := json.NewEncoder(&body).Encode(value); err != nil {
+		writer.Header().Set("Content-Type", "application/json; charset=utf-8")
+		writer.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(writer).Encode(struct {
+			Code    shoal.ErrorCode `json:"code"`
+			Message string          `json:"message"`
+		}{
+			Code:    shoal.ErrorInternal,
+			Message: shoal.NewError(shoal.ErrorInternal, "response exceeds max_response_bytes").Error(),
+		})
+		return
+	}
 	writer.Header().Set("Content-Type", "application/json; charset=utf-8")
 	writer.WriteHeader(status)
-	_ = json.NewEncoder(writer).Encode(value)
+	_, _ = writer.Write(body.Bytes())
+}
+
+type limitedResponseBuffer struct {
+	bytes.Buffer
+	limit int64
+}
+
+func (b *limitedResponseBuffer) Write(p []byte) (int, error) {
+	if int64(b.Len()+len(p)) > b.limit {
+		return 0, errors.New("response exceeds max_response_bytes")
+	}
+	return b.Buffer.Write(p)
 }
 
 func writeError(writer http.ResponseWriter, err error) {
 	status := http.StatusInternalServerError
-	code := shoal.ErrorInternal
-	switch {
-	case shoal.IsErrorCode(err, shoal.ErrorInvalidArgument):
+	code := primaryErrorCode(err)
+	switch code {
+	case shoal.ErrorInvalidArgument:
 		status, code = http.StatusBadRequest, shoal.ErrorInvalidArgument
-	case shoal.IsErrorCode(err, shoal.ErrorNotFound):
+	case shoal.ErrorNotFound:
 		status, code = http.StatusNotFound, shoal.ErrorNotFound
-	case shoal.IsErrorCode(err, shoal.ErrorConflict):
+	case shoal.ErrorConflict:
 		status, code = http.StatusConflict, shoal.ErrorConflict
-	case shoal.IsErrorCode(err, shoal.ErrorUnavailable):
+	case shoal.ErrorUnauthorized:
+		status, code = http.StatusUnauthorized, shoal.ErrorUnauthorized
+	case shoal.ErrorUnavailable:
 		status, code = http.StatusServiceUnavailable, shoal.ErrorUnavailable
-	case shoal.IsErrorCode(err, shoal.ErrorCanceled):
+	case shoal.ErrorCanceled:
 		status, code = 499, shoal.ErrorCanceled
-	case shoal.IsErrorCode(err, shoal.ErrorDeadline):
+	case shoal.ErrorDeadline:
 		status, code = http.StatusGatewayTimeout, shoal.ErrorDeadline
 	}
 	writeResponse(writer, status, struct {
 		Code    shoal.ErrorCode `json:"code"`
 		Message string          `json:"message"`
 	}{Code: code, Message: err.Error()})
+}
+
+func primaryErrorCode(err error) shoal.ErrorCode {
+	pending := []error{err}
+	seenComparable := make(map[error]struct{})
+	seenReference := make(map[errorReference]struct{})
+	for visited := 0; len(pending) > 0 && visited < 10_000; visited++ {
+		current := pending[len(pending)-1]
+		pending = pending[:len(pending)-1]
+		if current == nil || errorAlreadyVisited(current, seenComparable, seenReference) {
+			continue
+		}
+		if shoalErr, ok := current.(*shoal.Error); ok && shoalErr != nil {
+			if !isKnownErrorCode(shoalErr.Code) {
+				return shoal.ErrorInternal
+			}
+			return shoalErr.Code
+		}
+		switch wrapped := current.(type) {
+		case interface{ Unwrap() []error }:
+			values := wrapped.Unwrap()
+			for index := len(values) - 1; index >= 0; index-- {
+				pending = append(pending, values[index])
+			}
+		case interface{ Unwrap() error }:
+			pending = append(pending, wrapped.Unwrap())
+		}
+	}
+	return shoal.ErrorInternal
+}
+
+type errorReference struct {
+	typ     reflect.Type
+	pointer uintptr
+}
+
+func errorAlreadyVisited(
+	err error,
+	comparable map[error]struct{},
+	references map[errorReference]struct{},
+) bool {
+	value := reflect.ValueOf(err)
+	if value.Type().Comparable() {
+		if _, ok := comparable[err]; ok {
+			return true
+		}
+		comparable[err] = struct{}{}
+		return false
+	}
+	var pointer uintptr
+	switch value.Kind() {
+	case reflect.Chan, reflect.Map, reflect.Pointer, reflect.Slice,
+		reflect.UnsafePointer:
+		pointer = uintptr(value.UnsafePointer())
+	case reflect.Func:
+		pointer = value.Pointer()
+	default:
+		return false
+	}
+	reference := errorReference{typ: value.Type(), pointer: pointer}
+	if _, ok := references[reference]; ok {
+		return true
+	}
+	references[reference] = struct{}{}
+	return false
 }

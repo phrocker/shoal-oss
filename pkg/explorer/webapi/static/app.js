@@ -6,6 +6,13 @@ const state = {
   edges: new Map(),
   graphCursors: new Map(),
   selected: null,
+  capabilities: {
+    documents: false,
+    document: false,
+    retrieve: false,
+    neighborhood: false,
+    path: false,
+  },
 };
 const $ = (id) => document.getElementById(id);
 let documentGeneration = 0;
@@ -23,6 +30,64 @@ async function api(path, body) {
   return value;
 }
 
+async function loadMeta() {
+  const response = await fetch("/api/v1/meta", {headers: {"accept": "application/json"}});
+  const value = await response.json();
+  if (!response.ok) throw new Error(value.message || response.statusText);
+  state.capabilities = {...state.capabilities, ...(value.capabilities || {})};
+  applyCapabilities();
+}
+
+function capability(name) {
+  return state.capabilities[name] !== false;
+}
+
+function applyCapabilities() {
+  const canRetrieve = capability("retrieve");
+  $("query").disabled = !canRetrieve;
+  $("search").querySelector("button").disabled = !canRetrieve;
+  $("modes").disabled = !canRetrieve;
+  const evidence = $("evidence");
+  if (!canRetrieve) {
+    evidence.dataset.capabilityPlaceholder = "retrieve";
+    evidence.innerHTML =
+      "<p class=muted>Retrieval is unavailable from this Explorer service.</p>";
+  } else if (evidence.dataset.capabilityPlaceholder === "retrieve") {
+    delete evidence.dataset.capabilityPlaceholder;
+    evidence.innerHTML =
+      "<p class=muted>Run a retrieval query to inspect exact evidence and explanations.</p>";
+  }
+
+  const canNeighborhood = capability("neighborhood");
+  $("expand").hidden = !canNeighborhood;
+  $("expand").disabled = !canNeighborhood || !state.selected;
+  updateContinueButton();
+
+  const canPath = capability("path");
+  document.querySelectorAll("[for='path-from'],[for='path-to']").forEach((label) => {
+    label.hidden = !canPath;
+  });
+  $("path-from").hidden = !canPath;
+  $("path-to").hidden = !canPath;
+  $("find-path").hidden = !canPath;
+  $("find-path").disabled = !canPath;
+  const graphStatus = $("graph-status");
+  if (!canNeighborhood && !canPath) {
+    graphStatus.dataset.capabilityPlaceholder = "graph";
+    graphStatus.textContent =
+      "Graph expansion and path finding are unavailable from this Explorer service.";
+  } else if (graphStatus.dataset.capabilityPlaceholder === "graph") {
+    delete graphStatus.dataset.capabilityPlaceholder;
+    graphStatus.textContent = "No graph expansion yet.";
+  }
+
+  if (!capability("documents")) {
+    $("documents").innerHTML =
+      "<p class=muted>Document listing is unavailable from this Explorer service.</p>";
+    $("more").hidden = true;
+  }
+}
+
 function escapeHTML(value) {
   return String(value ?? "").replace(
     /[&<>"']/g,
@@ -37,6 +102,7 @@ function pin(snapshot) {
 }
 
 async function loadDocuments(reset = true) {
+  if (!capability("documents")) return;
   if (documentsLoading) return;
   documentsLoading = true;
   $("more").disabled = true;
@@ -53,6 +119,7 @@ async function loadDocuments(reset = true) {
     for (const item of response.documents) {
       const element = document.createElement("button");
       element.className = "doc";
+      element.disabled = !capability("document");
       element.innerHTML =
         `<strong>${escapeHTML(item.document.title)}</strong><br>` +
         `<small>${escapeHTML(item.source_uri || item.document.id)}</small>`;
@@ -70,6 +137,7 @@ async function loadDocuments(reset = true) {
 }
 
 async function loadDocument(documentID, revisionID) {
+  if (!capability("document")) return;
   const generation = ++documentGeneration;
   try {
     const response = await api("document", {
@@ -108,7 +176,7 @@ function selectSection(id) {
     `<span>${escapeHTML(view.section.heading)}</span><b>ID</b>` +
     `<span>${escapeHTML(id)}</span><b>Range</b>` +
     `<span>${view.section.range.start.offset}–${view.section.range.end.offset}</span></div>`;
-  expandIDs([id]);
+  if (capability("neighborhood")) expandIDs([id]);
 }
 
 function nodeFromDocument(documentValue) {
@@ -122,6 +190,7 @@ function nodeFromDocument(documentValue) {
 
 $("search").onsubmit = async (event) => {
   event.preventDefault();
+  if (!capability("retrieve")) return;
   const generation = ++searchGeneration;
   try {
     const response = await api("retrieve", {
@@ -187,6 +256,7 @@ function mergeGraph(graph) {
 }
 
 async function expandIDs(ids, cursor = "") {
+  if (!capability("neighborhood")) return;
   try {
     const response = await api("neighborhood", {
       snapshot: state.snapshot,
@@ -220,6 +290,7 @@ $("continue-expansion").onclick = () => {
 };
 $("more").onclick = () => loadDocuments(false);
 $("find-path").onclick = async () => {
+  if (!capability("path")) return;
   try {
     const response = await api("path", {
       snapshot: state.snapshot,
@@ -298,7 +369,7 @@ function nodeName(node, fallback) {
 
 function selectNode(id) {
   state.selected = id;
-  $("expand").disabled = !id;
+  $("expand").disabled = !id || !capability("neighborhood");
   updateContinueButton();
   const node = state.nodes.get(id);
   if (node) {
@@ -315,7 +386,9 @@ function selectNode(id) {
 
 function updateContinueButton() {
   $("continue-expansion").hidden =
-    !state.selected || !state.graphCursors.has(state.selected);
+    !capability("neighborhood") ||
+    !state.selected ||
+    !state.graphCursors.has(state.selected);
 }
 
 const canvas = $("canvas");
@@ -390,4 +463,7 @@ new ResizeObserver(() => {
   positions.clear();
   draw();
 }).observe(canvas);
-loadDocuments();
+applyCapabilities();
+loadMeta()
+  .then(() => loadDocuments())
+  .catch((error) => showError($("documents"), error));
