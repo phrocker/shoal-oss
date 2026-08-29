@@ -672,6 +672,13 @@ func (g *Generator) Run(ctx context.Context, pack inference.ContextPack) (Record
 						if err := g.recorder.Record(runCtx, evaluationRecord(cached)); err != nil {
 							return earlyFinish(stopReasonFor(err), "recorder", err)
 						}
+						if err := runCtx.Err(); err != nil {
+							return earlyFinish(stopReasonFor(err), "recorder", err)
+						}
+						if !g.now().Before(pack.Authorization().ExpiresAt()) {
+							err := invalid("authorization pin expired during cache recording")
+							return earlyFinish(StopReasonInvalid, "authorization", err)
+						}
 					}
 					return cloneRecord(cached), nil
 				}

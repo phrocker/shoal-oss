@@ -326,7 +326,7 @@ func validateFixtureCitation(citation document.Citation, quote string, sources m
 		return invalid("citation source is absent from fixture case")
 	}
 	start, end := citation.Range.Start.Offset, citation.Range.End.Offset
-	if start < 0 || end <= start || end > int64(len(source)) {
+	if start < 0 || end < start || end > int64(len(source)) {
 		return invalid("citation range is outside the fixture source")
 	}
 	if source[int(start):int(end)] != quote {
