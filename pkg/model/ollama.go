@@ -40,6 +40,7 @@ const (
 type OllamaConfig struct {
 	BaseURL             string
 	Model               string
+	Dimensions          int
 	HTTPClient          *http.Client
 	Timeout             time.Duration
 	MaxTextBytes        int64
@@ -110,7 +111,18 @@ func (o *OllamaEmbedder) CacheIdentity() (string, error) {
 	if o.cacheIdentityUnsafe {
 		return "", ErrInvalidConfig
 	}
-	return ollamaCacheIdentity("ollama-embedder-v1", o.cfg, o.endpoint, o.httpClientIdentity), nil
+	space, err := o.EmbeddingSpaceIdentity()
+	if err != nil {
+		return "", err
+	}
+	return ollamaEmbeddingCacheIdentity(o.cfg, o.endpoint, o.httpClientIdentity, space), nil
+}
+
+func (o *OllamaEmbedder) EmbeddingSpaceIdentity() (string, error) {
+	if o == nil || o.cfg.Dimensions == 0 {
+		return "", ErrInvalidConfig
+	}
+	return embeddingSpaceIdentity("ollama", o.cfg.Model, o.cfg.Dimensions, normalizationProviderNativeUnchanged)
 }
 
 func (o *OllamaGenerator) Generate(ctx context.Context, req GenerateRequest) (GenerateResult, error) {
@@ -182,6 +194,9 @@ func (o *OllamaEmbedder) Embed(ctx context.Context, req EmbedRequest) (EmbedResu
 	if len(out.Embedding) > o.cfg.MaxVectorDimensions {
 		return EmbedResult{}, &Error{Kind: ErrOversizedResponse, Operation: "ollama embed", Detail: "vector exceeds configured dimensions"}
 	}
+	if o.cfg.Dimensions != 0 && len(out.Embedding) != o.cfg.Dimensions {
+		return EmbedResult{}, &Error{Kind: ErrMalformedResponse, Operation: "ollama embed", Detail: "vector dimensions mismatch"}
+	}
 	if !validUsage(out.PromptEvalCount) {
 		return EmbedResult{}, &Error{Kind: ErrMalformedResponse, Operation: "ollama embed", Detail: "invalid usage"}
 	}
@@ -205,6 +220,21 @@ func ollamaCacheIdentity(kind string, cfg OllamaConfig, endpoint, httpClientIden
 		kind,
 		endpoint,
 		cfg.Model,
+		httpClientIdentity,
+		cfg.Timeout.String(),
+		strconv.FormatInt(cfg.MaxTextBytes, 10),
+		strconv.FormatInt(cfg.MaxRequestBytes, 10),
+		strconv.FormatInt(cfg.MaxResponseBytes, 10),
+		strconv.Itoa(cfg.MaxVectorDimensions),
+		strconv.FormatInt(cfg.ErrorSnippetBytes, 10),
+	)
+}
+
+func ollamaEmbeddingCacheIdentity(cfg OllamaConfig, endpoint, httpClientIdentity, spaceIdentity string) string {
+	return framedModelIdentity(
+		"ollama-embedder-v1",
+		endpoint,
+		spaceIdentity,
 		httpClientIdentity,
 		cfg.Timeout.String(),
 		strconv.FormatInt(cfg.MaxTextBytes, 10),
@@ -259,7 +289,9 @@ func validateOllamaConfig(cfg OllamaConfig, path string) (OllamaConfig, string, 
 		cfg.MaxTextBytes < 1 || cfg.MaxTextBytes > maxConfiguredTextBytes ||
 		cfg.MaxRequestBytes < 1 || cfg.MaxRequestBytes > maxConfiguredRequestBytes ||
 		cfg.MaxResponseBytes < 1 || cfg.MaxResponseBytes > maxConfiguredResponseBytes ||
+		cfg.Dimensions < 0 || cfg.Dimensions > MaxVectorDimensions ||
 		cfg.MaxVectorDimensions < 1 || cfg.MaxVectorDimensions > MaxVectorDimensions ||
+		(cfg.Dimensions != 0 && cfg.Dimensions > cfg.MaxVectorDimensions) ||
 		cfg.ErrorSnippetBytes < 1 || cfg.ErrorSnippetBytes > maxConfiguredSnippetBytes {
 		return OllamaConfig{}, "", &Error{Kind: ErrInvalidConfig, Operation: op}
 	}
@@ -393,3 +425,9 @@ func validUsage(values ...int) bool {
 	}
 	return true
 }
+
+var (
+	_ TextGenerator                  = (*OllamaGenerator)(nil)
+	_ Embedder                       = (*OllamaEmbedder)(nil)
+	_ EmbeddingSpaceIdentityProvider = (*OllamaEmbedder)(nil)
+)
