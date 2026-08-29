@@ -142,13 +142,15 @@ func (c *MemoryCache) Get(ctx context.Context, key CacheKey) (Record, bool, erro
 		return Record{}, false, err
 	}
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	item, ok := c.items[key.digest]
 	if !ok {
+		c.mu.Unlock()
 		return Record{}, false, nil
 	}
 	c.touchLocked(key.digest)
-	return cloneRecord(item.record), true, nil
+	record := item.record
+	c.mu.Unlock()
+	return cloneRecord(record), true, nil
 }
 
 func (c *MemoryCache) Put(ctx context.Context, key CacheKey, record Record) error {
@@ -168,13 +170,14 @@ func (c *MemoryCache) Put(ctx context.Context, key CacheKey, record Record) erro
 	if size > c.cfg.MaxEntryBytes {
 		return ErrCacheEntryTooLarge
 	}
+	stored := cloneRecord(record)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if existing, ok := c.items[key.digest]; ok {
 		c.bytes -= existing.size
 		c.removeOrderLocked(key.digest)
 	}
-	c.items[key.digest] = memoryCacheItem{record: cloneRecord(record), size: size}
+	c.items[key.digest] = memoryCacheItem{record: stored, size: size}
 	c.order = append(c.order, key.digest)
 	c.bytes += size
 	c.evictLocked()
