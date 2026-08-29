@@ -60,28 +60,31 @@ func TestDeterministicFixtureEvaluationReport(t *testing.T) {
 	if string(firstJSON) != string(secondJSON) {
 		t.Fatalf("evaluation output is nondeterministic\nfirst:\n%s\nsecond:\n%s", firstJSON, secondJSON)
 	}
-	if first.Summary.CaseCount != 3 ||
-		first.Summary.ClaimCount != 3 ||
-		first.Summary.SupportedClaimCount != 3 ||
-		first.Summary.GroundingSupportRate != 1 ||
+	if first.Summary.CaseCount != 12 ||
+		first.Summary.ClaimCount != 10 ||
+		first.Summary.ExpectedClaimCount != 17 ||
+		first.Summary.SupportedClaimCount != 10 ||
+		first.Summary.MissingExpectedClaims != 7 ||
+		first.Summary.GroundingSupportRate != float64(10)/float64(17) ||
+		first.Summary.UnsupportedIssueCount != 2 ||
 		first.Summary.InvalidCitationRefs != 0 ||
 		first.Summary.InvalidGraphPathRefs != 0 ||
-		first.Summary.CitationReferenceCount != 2 ||
-		first.Summary.GraphPathReferenceCount != 1 ||
-		first.Summary.StopReasons[StopReasonStop] != 3 {
+		first.Summary.CitationReferenceCount != 10 ||
+		first.Summary.GraphPathReferenceCount != 0 ||
+		first.Summary.StopReasons[StopReasonStop] != 12 {
 		t.Fatalf("unexpected metrics: %#v", first.Summary)
 	}
 	citationRefs, graphRefs := 0, 0
 	for _, report := range first.Cases {
 		if report.Iterations != 2 || report.Budget.ModelCalls != 2 ||
-			report.ValidEvidenceReferences != 1 ||
+			report.InvalidEvidenceRefs != 0 ||
 			report.TraceDigest == "" {
 			t.Fatalf("case metrics not defensible: %#v", report)
 		}
 		citationRefs += report.CitationReferences
 		graphRefs += report.GraphPathReferences
 	}
-	if citationRefs != 2 || graphRefs != 1 {
+	if citationRefs != 10 || graphRefs != 0 {
 		t.Fatalf("unexpected citation/path coverage: citations=%d graph=%d", citationRefs, graphRefs)
 	}
 }
@@ -164,7 +167,7 @@ func TestEvaluationDetectsNegativeCases(t *testing.T) {
 	})
 
 	t.Run("invalid graph path", func(t *testing.T) {
-		graphCase := []EvaluationCase{cases[2]}
+		graphCase := []EvaluationCase{graphEvaluationCase(t, now)}
 		graphCase[0].GraphPaths = map[shoal.ID]graph.Path{}
 		report, err := runFixtureEvaluation(t, graphCase, now)
 		if err != nil {
@@ -176,7 +179,7 @@ func TestEvaluationDetectsNegativeCases(t *testing.T) {
 	})
 
 	t.Run("invalid graph path metadata", func(t *testing.T) {
-		graphCase := []EvaluationCase{cases[2]}
+		graphCase := []EvaluationCase{graphEvaluationCase(t, now)}
 		anchorID := graphCase[0].Pack.Evidence()[0].ID()
 		want := graphCase[0].GraphPaths[anchorID]
 		want.Nodes = append([]graph.Node(nil), want.Nodes...)
@@ -320,6 +323,53 @@ func evalGenerator(t *testing.T, runner Runner, now time.Time, provenance Proven
 		t.Fatal(err)
 	}
 	return g
+}
+
+func graphEvaluationCase(t *testing.T, now time.Time) EvaluationCase {
+	t.Helper()
+	path := graph.Path{
+		Nodes: []graph.Node{
+			{ID: "node:violet-gate", Kind: "component", Labels: []string{"Violet Gate"}},
+			{ID: "node:celadon-hub", Kind: "system", Labels: []string{"Celadon Hub"}},
+			{ID: "node:sable-sink", Kind: "service", Labels: []string{"Sable Sink"}},
+		},
+		Edges: []graph.Edge{
+			{ID: "edge:violet-part-of-celadon", From: "node:violet-gate", To: "node:celadon-hub", Type: "part_of"},
+			{ID: "edge:celadon-routes-sable", From: "node:celadon-hub", To: "node:sable-sink", Type: "routes_to"},
+		},
+	}
+	anchor, err := inference.NewGraphAnchor(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := inference.NewSnapshotPin("aster-graph-2026-04-01", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	auth, err := inference.NewAuthPin("fixture-public", now.Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pack, err := inference.NewContextPack(
+		"Which service is reached from Violet Gate through Celadon Hub?",
+		[]inference.EvidenceAnchor{anchor}, nil, snapshot, auth, nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	value, err := ontology.NewStringValue("node:sable-sink")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return EvaluationCase{
+		ID:   "q-graph-validation",
+		Pack: pack,
+		ExpectedClaims: []ExpectedClaim{{
+			Subject: "node:violet-gate", Predicate: "reaches", Object: value,
+			EvidenceIDs: []shoal.ID{anchor.ID()},
+		}},
+		GraphPaths: map[shoal.ID]graph.Path{anchor.ID(): path},
+	}
 }
 
 func evalModelProvenance(t *testing.T) inference.ModelProvenance {

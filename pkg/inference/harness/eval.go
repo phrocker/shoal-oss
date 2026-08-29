@@ -20,6 +20,7 @@
 package harness
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/sha256"
@@ -78,7 +79,9 @@ type EvaluationCaseReport struct {
 	TraceDigest             string      `json:"trace_digest"`
 	Budget                  BudgetUsage `json:"budget"`
 	Claims                  int         `json:"claims"`
+	ExpectedClaims          int         `json:"expected_claims"`
 	SupportedClaims         int         `json:"supported_claims"`
+	MissingExpectedClaims   int         `json:"missing_expected_claims"`
 	UnsupportedIssues       int         `json:"unsupported_issues"`
 	CitationReferences      int         `json:"citation_references"`
 	InvalidCitationRefs     int         `json:"invalid_citation_references"`
@@ -92,7 +95,9 @@ type EvaluationCaseReport struct {
 type EvaluationSummary struct {
 	CaseCount               int                `json:"case_count"`
 	ClaimCount              int                `json:"claim_count"`
+	ExpectedClaimCount      int                `json:"expected_claim_count"`
 	SupportedClaimCount     int                `json:"supported_claim_count"`
+	MissingExpectedClaims   int                `json:"missing_expected_claims"`
 	UnsupportedIssueCount   int                `json:"unsupported_issue_count"`
 	GroundingSupportRate    float64            `json:"grounding_support_rate"`
 	UnsupportedOutcomeRate  float64            `json:"unsupported_outcome_rate"`
@@ -135,7 +140,9 @@ func Evaluate(ctx context.Context, generator *Generator, cases []EvaluationCase,
 		report.Cases = append(report.Cases, caseReport)
 		report.Summary.CaseCount++
 		report.Summary.ClaimCount += caseReport.Claims
+		report.Summary.ExpectedClaimCount += caseReport.ExpectedClaims
 		report.Summary.SupportedClaimCount += caseReport.SupportedClaims
+		report.Summary.MissingExpectedClaims += caseReport.MissingExpectedClaims
 		report.Summary.UnsupportedIssueCount += caseReport.UnsupportedIssues
 		report.Summary.CitationReferenceCount += caseReport.CitationReferences
 		report.Summary.InvalidCitationRefs += caseReport.InvalidCitationRefs
@@ -150,7 +157,7 @@ func Evaluate(ctx context.Context, generator *Generator, cases []EvaluationCase,
 			continue
 		}
 	}
-	report.Summary.GroundingSupportRate = ratio(report.Summary.SupportedClaimCount, report.Summary.ClaimCount)
+	report.Summary.GroundingSupportRate = ratio(report.Summary.SupportedClaimCount, report.Summary.ExpectedClaimCount)
 	report.Summary.UnsupportedOutcomeRate = ratio(report.Summary.UnsupportedIssueCount, report.Summary.ClaimCount+report.Summary.UnsupportedIssueCount)
 	return report, nil
 }
@@ -165,22 +172,25 @@ func evaluateRecord(tc EvaluationCase, record Record, runErr error) EvaluationCa
 		resultID = string(record.Result.ID())
 	}
 	out := EvaluationCaseReport{
-		ID:            tc.ID,
-		ContextPackID: string(tc.Pack.ID()),
-		ResultID:      resultID,
-		StopReason:    record.Trace.StopReason,
-		Iterations:    len(record.Trace.Iterations),
-		TraceDigest:   traceDigest(record.Trace),
-		Budget:        record.Trace.Usage,
+		ID:             tc.ID,
+		ContextPackID:  string(tc.Pack.ID()),
+		ResultID:       resultID,
+		StopReason:     record.Trace.StopReason,
+		Iterations:     len(record.Trace.Iterations),
+		TraceDigest:    traceDigest(record.Trace),
+		Budget:         record.Trace.Usage,
+		ExpectedClaims: len(tc.ExpectedClaims),
 	}
 	if runErr != nil {
 		out.Error = runErr.Error()
 		return out
 	}
 	available := evidenceIndex(tc.Pack.Evidence(), record.Result.EvidenceAdditions())
+	matchedExpected := make([]bool, len(tc.ExpectedClaims))
 	for _, claim := range record.Result.Claims() {
 		out.Claims++
-		ok := claimMatchesExpected(claim, tc.ExpectedClaims)
+		matchIndex := expectedClaimIndex(claim, tc.ExpectedClaims)
+		ok := matchIndex >= 0
 		for _, evidenceID := range claim.EvidenceIDs() {
 			anchor, found := available[evidenceID]
 			if !found {
@@ -207,6 +217,12 @@ func evaluateRecord(tc EvaluationCase, record Record, runErr error) EvaluationCa
 
 		if ok {
 			out.SupportedClaims++
+			matchedExpected[matchIndex] = true
+		}
+	}
+	for _, matched := range matchedExpected {
+		if !matched {
+			out.MissingExpectedClaims++
 		}
 	}
 	unsupported := record.Result.Unsupported()
@@ -316,8 +332,8 @@ func metadataEqual(got, want shoal.Metadata) bool {
 	return true
 }
 
-func claimMatchesExpected(claim inference.Claim, expected []ExpectedClaim) bool {
-	for _, item := range expected {
+func expectedClaimIndex(claim inference.Claim, expected []ExpectedClaim) int {
+	for index, item := range expected {
 		if claim.Subject() != item.Subject || claim.Predicate() != item.Predicate ||
 			!ontologyValuesEqual(claim.Object(), item.Object) {
 			continue
@@ -338,10 +354,10 @@ func claimMatchesExpected(claim inference.Claim, expected []ExpectedClaim) bool 
 			}
 		}
 		if matches {
-			return true
+			return index
 		}
 	}
-	return false
+	return -1
 }
 
 func ontologyValuesEqual(left, right ontology.Value) bool {
@@ -469,130 +485,233 @@ func LoadFixtureEvaluationCases(root string, generatedAt time.Time) ([]Evaluatio
 	if strings.TrimSpace(root) == "" {
 		return nil, invalid("fixture root is required")
 	}
-	specs := []struct {
-		id         string
-		path       string
-		documentID shoal.ID
-		revisionID shoal.ID
-		sectionID  shoal.ID
-		spanID     shoal.ID
-		query      string
-		quote      string
-		subject    shoal.ID
-		predicate  shoal.ID
-		object     string
-	}{
-		{
-			id: "q-grounded-aster-relay", path: "aster-relay-protocol-r2.md",
-			documentID: "aster-relay-protocol", revisionID: "r2", sectionID: "purpose", spanID: "purpose-relay",
-			query: "What carries sealed telemetry batches?",
-			quote: "The Aster Relay is a component of the Aster Mesh. " +
-				"It carries sealed telemetry batches from the Juniper Agent to the Lumen Processor.",
-			subject: "component:aster-relay", predicate: "relation:carries", object: "sealed telemetry batches",
-		},
-		{
-			id: "q-grounded-quartz-ring", path: "adr-004-quartz-ring.md",
-			documentID: "adr-004-quartz-ring", revisionID: "r1", sectionID: "decision", spanID: "decision-quartz",
-			query: "What was selected for relay assignment?", quote: "The Aster Relay will place each sealed telemetry batch on the Quartz Ring.",
-			subject: "component:aster-relay", predicate: "relation:assigns_to", object: "Quartz Ring",
-		},
-	}
-	snapshot, err := inference.NewSnapshotPin("fixture-snapshot", generatedAt.Add(-time.Hour))
+	records, err := loadFixtureExpectations(filepath.Join(root, "expectations.jsonl"))
 	if err != nil {
 		return nil, err
 	}
-	auth, err := inference.NewAuthPin("fixture-public", generatedAt.Add(time.Hour))
+	cases := make([]EvaluationCase, 0, len(records))
+	for _, record := range records {
+		if record.Applicability.State != "current_evaluable" {
+			continue
+		}
+		tc, err := evaluationCaseFromExpectation(root, record, generatedAt)
+		if err != nil {
+			return nil, err
+		}
+		cases = append(cases, tc)
+	}
+	return cases, nil
+}
+
+type fixtureExpectation struct {
+	CaseID        string `json:"case_id"`
+	Query         string `json:"query"`
+	Request       fixtureExpectationRequest
+	Expected      fixtureExpected
+	Applicability struct {
+		State string `json:"state"`
+	} `json:"applicability"`
+}
+
+type fixtureExpectationRequest struct {
+	AsOf      string `json:"as_of"`
+	Principal struct {
+		Scopes []string `json:"scopes"`
+	} `json:"principal"`
+	Filters struct {
+		GraphSnapshotID string `json:"graph_snapshot_id"`
+	} `json:"filters"`
+}
+
+type fixtureExpected struct {
+	Evidence []fixtureEvidence `json:"evidence_exact"`
+	Facts    []fixtureFact     `json:"facts_exact"`
+}
+
+type fixtureEvidence struct {
+	EvidenceType    string           `json:"evidence_type"`
+	EvaluationState string           `json:"evaluation_state"`
+	Citation        *fixtureCitation `json:"citation"`
+}
+
+type fixtureCitation struct {
+	DocumentID shoal.ID `json:"document_id"`
+	RevisionID shoal.ID `json:"revision_id"`
+	Path       string   `json:"path"`
+	SectionID  shoal.ID `json:"section_id"`
+	SpanID     shoal.ID `json:"span_id"`
+	ByteStart  int64    `json:"byte_start"`
+	ByteEnd    int64    `json:"byte_end"`
+	Quote      string   `json:"quote"`
+}
+
+type fixtureFact struct {
+	SubjectID shoal.ID        `json:"subject_id"`
+	Predicate shoal.ID        `json:"predicate"`
+	Value     json.RawMessage `json:"value"`
+}
+
+func loadFixtureExpectations(path string) ([]fixtureExpectation, error) {
+	file, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
-	cases := make([]EvaluationCase, 0, len(specs))
-	for _, spec := range specs {
-		path := filepath.Join(root, "corpus", spec.path)
-		content, err := os.ReadFile(path)
-		if err != nil {
+	defer file.Close()
+	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+	var records []fixtureExpectation
+	for scanner.Scan() {
+		line := bytes.TrimSpace(scanner.Bytes())
+		if len(line) == 0 {
+			continue
+		}
+		var record fixtureExpectation
+		if err := json.Unmarshal(line, &record); err != nil {
 			return nil, err
 		}
-		if bytes.Contains(content, []byte("\r")) {
-			return nil, invalid("fixture corpus must use LF line endings")
-		}
-		offset := bytes.Index(content, []byte(spec.quote))
-		if offset < 0 {
-			return nil, invalid("fixture quote is absent from corpus")
-		}
-		anchor, err := inference.NewDocumentAnchor(document.Citation{
-			DocumentID: spec.documentID,
-			RevisionID: spec.revisionID,
-			SectionID:  spec.sectionID,
-			SpanID:     spec.spanID,
-			Range: document.SourceRange{
-				Start: document.SourcePosition{Offset: int64(offset)},
-				End:   document.SourcePosition{Offset: int64(offset + len(spec.quote))},
-			},
-		}, spec.quote)
-		if err != nil {
-			return nil, err
-		}
-		value, err := ontology.NewStringValue(spec.object)
-		if err != nil {
-			return nil, err
-		}
-		pack, err := inference.NewContextPack(
-			spec.query, []inference.EvidenceAnchor{anchor}, nil,
-			snapshot, auth, shoal.Metadata{"fixture": "explorer-eval"},
-		)
-		if err != nil {
-			return nil, err
-		}
-		cases = append(cases, EvaluationCase{
-			ID:   spec.id,
-			Pack: pack,
-			ExpectedClaims: []ExpectedClaim{{
-				Subject:     spec.subject,
-				Predicate:   spec.predicate,
-				Object:      value,
-				EvidenceIDs: []shoal.ID{anchor.ID()},
-			}},
-			Sources: map[DocumentRevision]string{
-				DocumentRevision{DocumentID: spec.documentID, RevisionID: spec.revisionID}: string(content),
-			},
+		records = append(records, record)
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	return records, nil
+}
+
+func evaluationCaseFromExpectation(root string, record fixtureExpectation, generatedAt time.Time) (EvaluationCase, error) {
+	asOf, err := time.Parse(time.RFC3339Nano, record.Request.AsOf)
+	if err != nil {
+		return EvaluationCase{}, err
+	}
+	snapshotID := shoal.ID("fixture-snapshot")
+	if strings.TrimSpace(record.Request.Filters.GraphSnapshotID) != "" {
+		snapshotID = shoal.ID(record.Request.Filters.GraphSnapshotID)
+	}
+	snapshot, err := inference.NewSnapshotPin(snapshotID, asOf)
+	if err != nil {
+		return EvaluationCase{}, err
+	}
+	scopes := append([]string(nil), record.Request.Principal.Scopes...)
+	sort.Strings(scopes)
+	authID := shoal.ID("fixture-public")
+	if len(scopes) > 0 {
+		authID = shoal.ID("fixture-scopes:" + strings.Join(scopes, ","))
+	}
+	auth, err := inference.NewAuthPin(authID, generatedAt.Add(24*time.Hour))
+	if err != nil {
+		return EvaluationCase{}, err
+	}
+	anchors, sources, err := fixtureAnchors(root, record.Expected.Evidence)
+	if err != nil {
+		return EvaluationCase{}, err
+	}
+	if len(anchors) == 0 {
+		anchor, err := inference.NewGraphAnchor(graph.Path{
+			Nodes: []graph.Node{{ID: shoal.ID("fixture-negative:" + record.CaseID), Kind: "negative-fixture"}},
 		})
+		if err != nil {
+			return EvaluationCase{}, err
+		}
+		anchors = append(anchors, anchor)
 	}
-	graphPath := graph.Path{
-		Nodes: []graph.Node{
-			{ID: "node:violet-gate", Kind: "component", Labels: []string{"Violet Gate"}},
-			{ID: "node:celadon-hub", Kind: "system", Labels: []string{"Celadon Hub"}},
-		},
-		Edges: []graph.Edge{{
-			ID: "edge:violet-part-of-celadon", From: "node:violet-gate",
-			To: "node:celadon-hub", Type: "part_of",
-		}},
-	}
-	graphAnchor, err := inference.NewGraphAnchor(graphPath)
-	if err != nil {
-		return nil, err
-	}
-	value, err := ontology.NewStringValue("node:celadon-hub")
-	if err != nil {
-		return nil, err
-	}
-	graphPack, err := inference.NewContextPack(
-		"Which component is part of Celadon Hub?",
-		[]inference.EvidenceAnchor{graphAnchor}, nil,
-		snapshot, auth, shoal.Metadata{"fixture": "explorer-eval"},
+	pack, err := inference.NewContextPack(
+		record.Query, anchors, nil, snapshot, auth,
+		shoal.Metadata{"fixture": "explorer-eval", "expectation": record.CaseID},
 	)
 	if err != nil {
-		return nil, err
+		return EvaluationCase{}, err
 	}
-	cases = append(cases, EvaluationCase{
-		ID:   "q-grounded-graph-path",
-		Pack: graphPack,
-		ExpectedClaims: []ExpectedClaim{{
-			Subject:     "node:violet-gate",
-			Predicate:   "relation:part_of",
-			Object:      value,
-			EvidenceIDs: []shoal.ID{graphAnchor.ID()},
-		}},
-		GraphPaths: map[shoal.ID]graph.Path{graphAnchor.ID(): graphPath},
-	})
-	return cases, nil
+	expected, err := fixtureExpectedClaims(record.Expected.Facts, pack.Evidence())
+	if err != nil {
+		return EvaluationCase{}, err
+	}
+	return EvaluationCase{ID: record.CaseID, Pack: pack, ExpectedClaims: expected, Sources: sources}, nil
+}
+
+func fixtureAnchors(root string, evidence []fixtureEvidence) ([]inference.EvidenceAnchor, map[DocumentRevision]string, error) {
+	var anchors []inference.EvidenceAnchor
+	sources := map[DocumentRevision]string{}
+	for _, item := range evidence {
+		if item.EvaluationState != "evaluable" || item.EvidenceType != "citation" || item.Citation == nil {
+			continue
+		}
+		citation := item.Citation
+		sourcePath := filepath.Join(root, citation.Path)
+		content, err := os.ReadFile(sourcePath)
+		if err != nil {
+			return nil, nil, err
+		}
+		if bytes.Contains(content, []byte("\r")) {
+			return nil, nil, invalid("fixture corpus must use LF line endings")
+		}
+		docCitation := document.Citation{
+			DocumentID: citation.DocumentID,
+			RevisionID: citation.RevisionID,
+			SectionID:  citation.SectionID,
+			SpanID:     citation.SpanID,
+			Range: document.SourceRange{
+				Start: document.SourcePosition{Offset: citation.ByteStart},
+				End:   document.SourcePosition{Offset: citation.ByteEnd},
+			},
+		}
+		if err := validateFixtureCitation(docCitation, citation.Quote, map[DocumentRevision]string{
+			{DocumentID: citation.DocumentID, RevisionID: citation.RevisionID}: string(content),
+		}); err != nil {
+			return nil, nil, err
+		}
+		anchor, err := inference.NewDocumentAnchor(docCitation, citation.Quote)
+		if err != nil {
+			return nil, nil, err
+		}
+		anchors = append(anchors, anchor)
+		sources[DocumentRevision{DocumentID: citation.DocumentID, RevisionID: citation.RevisionID}] = string(content)
+	}
+	return anchors, sources, nil
+}
+
+func fixtureExpectedClaims(facts []fixtureFact, anchors []inference.EvidenceAnchor) ([]ExpectedClaim, error) {
+	evidenceIDs := make([]shoal.ID, 0, 1)
+	if len(anchors) > 0 {
+		evidenceIDs = append(evidenceIDs, anchors[0].ID())
+	}
+	expected := make([]ExpectedClaim, 0, len(facts))
+	for _, fact := range facts {
+		value, err := fixtureOntologyValue(fact.Value)
+		if err != nil {
+			return nil, err
+		}
+		expected = append(expected, ExpectedClaim{
+			Subject: fact.SubjectID, Predicate: fact.Predicate, Object: value,
+			EvidenceIDs: evidenceIDs,
+		})
+	}
+	return expected, nil
+}
+
+func fixtureOntologyValue(raw json.RawMessage) (ontology.Value, error) {
+	var text string
+	if err := json.Unmarshal(raw, &text); err == nil {
+		return ontology.NewStringValue(text)
+	}
+	var number json.Number
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	if err := decoder.Decode(&number); err == nil {
+		if !strings.ContainsAny(number.String(), ".eE") {
+			value, err := strconv.ParseInt(number.String(), 10, 64)
+			if err != nil {
+				return ontology.Value{}, err
+			}
+			return ontology.NewIntegerValue(value), nil
+		}
+		value, err := strconv.ParseFloat(number.String(), 64)
+		if err != nil {
+			return ontology.Value{}, err
+		}
+		return ontology.NewNumberValue(value)
+	}
+	var boolean bool
+	if err := json.Unmarshal(raw, &boolean); err == nil {
+		return ontology.NewBooleanValue(boolean), nil
+	}
+	return ontology.Value{}, invalid("fixture fact value is unsupported")
 }

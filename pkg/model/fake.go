@@ -70,18 +70,34 @@ func (f FakeGenerator) generateHarnessAction(req GenerateRequest) (GenerateResul
 	}
 	text := `{"action":"retrieve","correlation_id":"` + fakeProtocolID("fake-retrieve-1") + `","query":"entity","limit":1}`
 	if !strings.Contains(req.Prompt, `"transcript":[]`) {
+		if reason := fakeHarnessUnsupportedReason(req.Prompt); reason != "" {
+			text = `{"action":"stop","correlation_id":"` + fakeProtocolID("fake-stop") + `","unsupported":[{"input":"final claim","reason":"` + reason + `","evidence_ids":[]}]}`
+			outputTokens := tokenEstimate(text)
+			if req.MaxOutputTokens > 0 && outputTokens > req.MaxOutputTokens {
+				return GenerateResult{}, &Error{Kind: ErrOversizedResponse, Operation: "fake generate"}
+			}
+			return GenerateResult{
+				Text:       text,
+				Provenance: Provenance{Provider: "fake", Model: name},
+				Usage: Usage{
+					InputTokens:  tokenEstimate(req.Prompt),
+					OutputTokens: outputTokens,
+					TotalTokens:  tokenEstimate(req.Prompt) + outputTokens,
+				},
+			}, nil
+		}
 		evidenceID := firstHarnessEvidenceID(req.Prompt)
 		if evidenceID == "" {
 			text = `{"action":"stop","correlation_id":"` + fakeProtocolID("fake-stop") + `","unsupported":[{"input":"final claim","reason":"no evidence anchor was visible","evidence_ids":[]}]}`
 		} else {
-			subject, predicate, object := fakeHarnessClaim(req.Prompt)
+			subject, predicate, objectType, object := fakeHarnessClaim(req.Prompt)
 			payload := map[string]any{
 				"action":         "stop",
 				"correlation_id": fakeProtocolID("fake-stop"),
 				"claims": []map[string]any{{
 					"subject":      fakeProtocolID(subject),
 					"predicate":    fakeProtocolID(predicate),
-					"object":       map[string]any{"type": "string", "value": object},
+					"object":       map[string]any{"type": objectType, "value": object},
 					"confidence":   1,
 					"evidence_ids": []string{evidenceID},
 				}},
@@ -108,21 +124,48 @@ func (f FakeGenerator) generateHarnessAction(req GenerateRequest) (GenerateResul
 	}, nil
 }
 
-func fakeHarnessClaim(prompt string) (subject, predicate, object string) {
+func fakeHarnessUnsupportedReason(prompt string) string {
+	var envelope struct {
+		Query string `json:"query"`
+	}
+	_ = json.Unmarshal([]byte(prompt), &envelope)
+	query := strings.ToLower(envelope.Query)
+	if strings.Contains(query, "amber lag runbook action depends") ||
+		strings.Contains(query, "fetch the amber lag runbook") {
+		return "fixture authorization oracle has no public supporting evidence"
+	}
+	return ""
+}
+
+func fakeHarnessClaim(prompt string) (subject, predicate, objectType string, object any) {
 	var envelope struct {
 		Query string `json:"query"`
 	}
 	_ = json.Unmarshal([]byte(prompt), &envelope)
 	query := strings.ToLower(envelope.Query)
 	switch {
+	case strings.Contains(query, "40") ||
+		strings.Contains(query, "2026-02-01") ||
+		strings.Contains(query, "before revision r2") ||
+		strings.Contains(query, "between revisions"):
+		return "component:aster-relay", "acknowledgement_window_seconds", "integer", 40
+	case strings.Contains(query, "acknowledgement window"):
+		return "component:aster-relay", "acknowledgement_window_seconds", "integer", 70
 	case strings.Contains(query, "sealed telemetry"):
-		return "component:aster-relay", "relation:carries", "sealed telemetry batches"
-	case strings.Contains(query, "relay assignment") || strings.Contains(query, "quartz ring"):
-		return "component:aster-relay", "relation:assigns_to", "Quartz Ring"
+		return "component:aster-relay", "buffer", "string", "queue:quartz-ring"
+	case strings.Contains(query, "relay assignment") ||
+		strings.Contains(query, "quartz ring") ||
+		strings.Contains(query, "buffer connects") ||
+		strings.Contains(query, "buffering"):
+		return "component:aster-relay", "buffer", "string", "queue:quartz-ring"
+	case strings.Contains(query, "aster mesh sentence"):
+		return "hierarchy-node:aster-relay-protocol@r2#purpose", "heading", "string", "Purpose"
+	case strings.Contains(query, "amber lag"):
+		return "runbook:amber-lag", "pause_intake_from", "string", "component:juniper-agent"
 	case strings.Contains(query, "celadon hub") || strings.Contains(query, "part of"):
-		return "node:violet-gate", "relation:part_of", "node:celadon-hub"
+		return "node:violet-gate", "reaches", "string", "node:sable-sink"
 	default:
-		return "entity:fake", "predicate:summary", "grounded"
+		return "entity:fake", "predicate:summary", "string", "grounded"
 	}
 }
 
