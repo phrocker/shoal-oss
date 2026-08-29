@@ -20,6 +20,14 @@ type FakeGenerator struct {
 	Model string
 }
 
+func (f FakeGenerator) CacheIdentity() (string, error) {
+	name := strings.TrimSpace(f.Model)
+	if name == "" {
+		name = "deterministic"
+	}
+	return framedModelIdentity("model-fake-generator-v1", name), nil
+}
+
 func (f FakeGenerator) Generate(ctx context.Context, req GenerateRequest) (GenerateResult, error) {
 	if err := ctx.Err(); err != nil {
 		return GenerateResult{}, contextError("fake generate", err)
@@ -62,17 +70,34 @@ func (f FakeGenerator) generateHarnessAction(req GenerateRequest) (GenerateResul
 	}
 	text := `{"action":"retrieve","correlation_id":"` + fakeProtocolID("fake-retrieve-1") + `","query":"entity","limit":1}`
 	if !strings.Contains(req.Prompt, `"transcript":[]`) {
-		evidenceID := firstHarnessEvidenceID(req.Prompt)
+		if reason := fakeHarnessUnsupportedReason(req.Prompt); reason != "" {
+			text = `{"action":"stop","correlation_id":"` + fakeProtocolID("fake-stop") + `","unsupported":[{"input":"final claim","reason":"` + reason + `","evidence_ids":[]}]}`
+			outputTokens := tokenEstimate(text)
+			if req.MaxOutputTokens > 0 && outputTokens > req.MaxOutputTokens {
+				return GenerateResult{}, &Error{Kind: ErrOversizedResponse, Operation: "fake generate"}
+			}
+			return GenerateResult{
+				Text:       text,
+				Provenance: Provenance{Provider: "fake", Model: name},
+				Usage: Usage{
+					InputTokens:  tokenEstimate(req.Prompt),
+					OutputTokens: outputTokens,
+					TotalTokens:  tokenEstimate(req.Prompt) + outputTokens,
+				},
+			}, nil
+		}
+		evidenceID := fakeHarnessEvidenceID(req.Prompt)
 		if evidenceID == "" {
 			text = `{"action":"stop","correlation_id":"` + fakeProtocolID("fake-stop") + `","unsupported":[{"input":"final claim","reason":"no evidence anchor was visible","evidence_ids":[]}]}`
 		} else {
+			subject, predicate, objectType, object := fakeHarnessClaim(req.Prompt)
 			payload := map[string]any{
 				"action":         "stop",
 				"correlation_id": fakeProtocolID("fake-stop"),
 				"claims": []map[string]any{{
-					"subject":      fakeProtocolID("entity:fake"),
-					"predicate":    fakeProtocolID("predicate:summary"),
-					"object":       map[string]any{"type": "string", "value": "grounded"},
+					"subject":      fakeProtocolID(subject),
+					"predicate":    fakeProtocolID(predicate),
+					"object":       map[string]any{"type": objectType, "value": object},
 					"confidence":   1,
 					"evidence_ids": []string{evidenceID},
 				}},
@@ -97,6 +122,101 @@ func (f FakeGenerator) generateHarnessAction(req GenerateRequest) (GenerateResul
 			TotalTokens:  tokenEstimate(req.Prompt) + outputTokens,
 		},
 	}, nil
+}
+
+func fakeHarnessUnsupportedReason(prompt string) string {
+	var envelope struct {
+		Query string `json:"query"`
+	}
+	_ = json.Unmarshal([]byte(prompt), &envelope)
+	query := strings.ToLower(envelope.Query)
+	if strings.Contains(query, "amber lag runbook action depends") ||
+		strings.Contains(query, "fetch the amber lag runbook") {
+		return "fixture authorization oracle has no public supporting evidence"
+	}
+	return ""
+}
+
+func fakeHarnessEvidenceID(prompt string) string {
+	var envelope struct {
+		Query    string `json:"query"`
+		Evidence []struct {
+			ID    string `json:"id"`
+			Quote string `json:"quote"`
+			Path  *struct {
+				Edges []struct{} `json:"edges"`
+			} `json:"path"`
+		} `json:"evidence"`
+	}
+	if err := json.Unmarshal([]byte(prompt), &envelope); err != nil {
+		return firstHarnessEvidenceID(prompt)
+	}
+	query := strings.ToLower(envelope.Query)
+	wantQuote := ""
+	switch {
+	case strings.Contains(query, "40") ||
+		strings.Contains(query, "2026-02-01") ||
+		strings.Contains(query, "before revision r2") ||
+		strings.Contains(query, "between revisions"):
+		wantQuote = "40 seconds"
+	case strings.Contains(query, "acknowledgement window"):
+		wantQuote = "70 seconds"
+	case strings.Contains(query, "aster mesh sentence"):
+		wantQuote = "Aster Mesh"
+	case strings.Contains(query, "amber lag"):
+		wantQuote = "Pause intake"
+	case strings.Contains(query, "buffer connects") ||
+		strings.Contains(query, "buffering"):
+		wantQuote = "before delivery"
+	case strings.Contains(query, "relay assignment") ||
+		strings.Contains(query, "quartz ring") ||
+		strings.Contains(query, "sealed telemetry"):
+		wantQuote = "Quartz Ring"
+	}
+	for _, evidence := range envelope.Evidence {
+		if strings.Contains(query, "celadon hub") && evidence.Path != nil && len(evidence.Path.Edges) > 0 {
+			return evidence.ID
+		}
+		if wantQuote != "" && strings.Contains(evidence.Quote, wantQuote) {
+			return evidence.ID
+		}
+	}
+	if len(envelope.Evidence) > 0 {
+		return envelope.Evidence[0].ID
+	}
+	return ""
+}
+
+func fakeHarnessClaim(prompt string) (subject, predicate, objectType string, object any) {
+	var envelope struct {
+		Query string `json:"query"`
+	}
+	_ = json.Unmarshal([]byte(prompt), &envelope)
+	query := strings.ToLower(envelope.Query)
+	switch {
+	case strings.Contains(query, "40") ||
+		strings.Contains(query, "2026-02-01") ||
+		strings.Contains(query, "before revision r2") ||
+		strings.Contains(query, "between revisions"):
+		return "component:aster-relay", "acknowledgement_window_seconds", "integer", 40
+	case strings.Contains(query, "acknowledgement window"):
+		return "component:aster-relay", "acknowledgement_window_seconds", "integer", 70
+	case strings.Contains(query, "sealed telemetry"):
+		return "component:aster-relay", "buffer", "string", "queue:quartz-ring"
+	case strings.Contains(query, "relay assignment") ||
+		strings.Contains(query, "quartz ring") ||
+		strings.Contains(query, "buffer connects") ||
+		strings.Contains(query, "buffering"):
+		return "component:aster-relay", "buffer", "string", "queue:quartz-ring"
+	case strings.Contains(query, "aster mesh sentence"):
+		return "hierarchy-node:aster-relay-protocol@r2#purpose", "heading", "string", "Purpose"
+	case strings.Contains(query, "amber lag"):
+		return "runbook:amber-lag", "pause_intake_from", "string", "component:juniper-agent"
+	case strings.Contains(query, "celadon hub") || strings.Contains(query, "part of"):
+		return "node:violet-gate", "reaches", "string", "node:sable-sink"
+	default:
+		return "entity:fake", "predicate:summary", "string", "grounded"
+	}
 }
 
 func fakeProtocolID(id string) string {
@@ -135,6 +255,18 @@ func isHarnessActionPrompt(prompt string) bool {
 type FakeEmbedder struct {
 	Dimensions int
 	Model      string
+}
+
+func (f FakeEmbedder) CacheIdentity() (string, error) {
+	name := strings.TrimSpace(f.Model)
+	if name == "" {
+		name = "deterministic"
+	}
+	dim := f.Dimensions
+	if dim == 0 {
+		dim = DefaultFakeDimensions
+	}
+	return framedModelIdentity("model-fake-embedder-v1", name, strconv.Itoa(dim)), nil
 }
 
 func (f FakeEmbedder) Embed(ctx context.Context, req EmbedRequest) (EmbedResult, error) {

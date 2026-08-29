@@ -556,6 +556,7 @@ type BudgetUsage struct {
 type IterationTrace struct {
 	Index         int
 	Decision      ActionKind
+	ActionKey     string
 	CorrelationID shoal.ID
 	Usage         Usage
 	EvidenceIDs   []shoal.ID
@@ -597,6 +598,7 @@ type Generator struct {
 	budgets    Budgets
 	provenance Provenance
 	recorder   Recorder
+	cache      Cache
 	now        func() time.Time
 }
 
@@ -612,6 +614,31 @@ func NewGenerator(runner Runner, tools ToolHost, budgets Budgets, provenance Pro
 		return nil, err
 	}
 	return &Generator{runner: runner, tools: tools, budgets: budgets, provenance: provenance, recorder: recorder, now: time.Now}, nil
+}
+
+func NewCachedGenerator(runner Runner, tools ToolHost, budgets Budgets, provenance Provenance, recorder Recorder, cache Cache) (*Generator, error) {
+	if cache == nil {
+		return nil, invalid("cache is required")
+	}
+	g, err := NewGenerator(runner, tools, budgets, provenance, recorder)
+	if err != nil {
+		return nil, err
+	}
+	g.cache = cache
+	return g, nil
+}
+
+// SetClock configures the generator clock. Callers that need reproducible
+// fixture evaluation can set this before the generator is used.
+func (g *Generator) SetClock(now func() time.Time) error {
+	if g == nil {
+		return invalid("generator is required")
+	}
+	if now == nil {
+		return invalid("clock is required")
+	}
+	g.now = now
+	return nil
 }
 
 func (g *Generator) Generate(ctx context.Context, pack inference.ContextPack) (inference.InferenceResult, error) {
@@ -662,6 +689,45 @@ func (g *Generator) Run(ctx context.Context, pack inference.ContextPack) (Record
 	}
 	runCtx, cancel := context.WithTimeout(ctx, maxElapsed)
 	defer cancel()
+	cacheKey, cacheable := CacheKey{}, false
+	if g.cache != nil {
+		runtimeIdentity, identityErr := runtimeCacheIdentity(g.runner, g.tools)
+		key, err := cacheKeyForRequest(request, runtimeIdentity)
+		if identityErr == nil && err == nil {
+			if cached, ok, err := g.cache.Get(runCtx, key); err == nil && ok {
+				if err := runCtx.Err(); err != nil {
+					return earlyFinish(stopReasonFor(err), "cache", err)
+				}
+				if !g.now().Before(pack.Authorization().ExpiresAt()) {
+					err := invalid("authorization pin expired during cache lookup")
+					return earlyFinish(StopReasonInvalid, "authorization", err)
+				}
+				if err := validateCachedRecord(cached, request, pack); err == nil {
+					if g.recorder != nil {
+						if err := g.recorder.Record(runCtx, evaluationRecord(cached)); err != nil {
+							return earlyFinish(stopReasonFor(err), "recorder", err)
+						}
+						if err := runCtx.Err(); err != nil {
+							return earlyFinish(stopReasonFor(err), "recorder", err)
+						}
+						if !g.now().Before(pack.Authorization().ExpiresAt()) {
+							err := invalid("authorization pin expired during cache recording")
+							return earlyFinish(StopReasonInvalid, "authorization", err)
+						}
+					}
+					if err := runCtx.Err(); err != nil {
+						return earlyFinish(stopReasonFor(err), "cache", err)
+					}
+					if !g.now().Before(pack.Authorization().ExpiresAt()) {
+						err := invalid("authorization pin expired before cache return")
+						return earlyFinish(StopReasonInvalid, "authorization", err)
+					}
+					return cloneRecord(cached), nil
+				}
+			}
+			cacheKey, cacheable = key, true
+		}
+	}
 	session, err := g.runner.Start(runCtx, request)
 	if err != nil {
 		if runCtx.Err() != nil {
@@ -708,10 +774,37 @@ func (g *Generator) Run(ctx context.Context, pack inference.ContextPack) (Record
 				trace.Iterations[len(trace.Iterations)-1].Failure = err.Error()
 			}
 		}
-		return Record{
+		record := Record{
 			Request: request, Transcript: cloneTranscript(transcript),
 			Result: result, Trace: cloneRunTrace(trace),
-		}, err
+		}
+		if err == nil && reason == StopReasonStop && cacheable && !unsafeRecordForCache(record) {
+			_ = g.cache.Put(runCtx, cacheKey, record)
+		}
+		if err == nil && reason == StopReasonStop {
+			if postErr := runCtx.Err(); postErr != nil {
+				trace.StopReason = stopReasonFor(postErr)
+				trace.Failures = append(trace.Failures, FailureTrace{
+					Iteration: iteration,
+					Operation: "cache",
+					Error:     postErr.Error(),
+				})
+				record.Trace = cloneRunTrace(trace)
+				return record, postErr
+			}
+			if !g.now().Before(pack.Authorization().ExpiresAt()) {
+				postErr := invalid("authorization pin expired before result return")
+				trace.StopReason = StopReasonInvalid
+				trace.Failures = append(trace.Failures, FailureTrace{
+					Iteration: iteration,
+					Operation: "authorization",
+					Error:     postErr.Error(),
+				})
+				record.Trace = cloneRunTrace(trace)
+				return record, postErr
+			}
+		}
+		return record, err
 	}
 	for step := 0; step < g.budgets.MaxSteps; step++ {
 		if !g.now().Before(pack.Authorization().ExpiresAt()) {
@@ -738,7 +831,7 @@ func (g *Generator) Run(ctx context.Context, pack inference.ContextPack) (Record
 		}
 		iteration := IterationTrace{
 			Index: step, Decision: action.kind, CorrelationID: action.correlation,
-			Usage: action.usage,
+			ActionKey: actionKey(action), Usage: action.usage,
 		}
 		trace.Iterations = append(trace.Iterations, iteration)
 		if err := action.validate(); err != nil {

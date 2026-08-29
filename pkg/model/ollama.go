@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -49,29 +50,67 @@ type OllamaConfig struct {
 }
 
 type OllamaGenerator struct {
-	cfg      OllamaConfig
-	endpoint string
+	cfg                 OllamaConfig
+	endpoint            string
+	httpClientIdentity  string
+	cacheIdentityUnsafe bool
 }
 
 type OllamaEmbedder struct {
-	cfg      OllamaConfig
-	endpoint string
+	cfg                 OllamaConfig
+	endpoint            string
+	httpClientIdentity  string
+	cacheIdentityUnsafe bool
 }
 
 func NewOllamaGenerator(cfg OllamaConfig) (*OllamaGenerator, error) {
+	httpIdentity, cacheable, err := httpClientCacheIdentity(cfg.HTTPClient)
+	if err != nil {
+		return nil, err
+	}
 	cfg, endpoint, err := validateOllamaConfig(cfg, "/api/generate")
 	if err != nil {
 		return nil, err
 	}
-	return &OllamaGenerator{cfg: cfg, endpoint: endpoint}, nil
+	return &OllamaGenerator{
+		cfg: cfg, endpoint: endpoint,
+		httpClientIdentity: httpIdentity, cacheIdentityUnsafe: !cacheable,
+	}, nil
 }
 
 func NewOllamaEmbedder(cfg OllamaConfig) (*OllamaEmbedder, error) {
+	httpIdentity, cacheable, err := httpClientCacheIdentity(cfg.HTTPClient)
+	if err != nil {
+		return nil, err
+	}
 	cfg, endpoint, err := validateOllamaConfig(cfg, "/api/embeddings")
 	if err != nil {
 		return nil, err
 	}
-	return &OllamaEmbedder{cfg: cfg, endpoint: endpoint}, nil
+	return &OllamaEmbedder{
+		cfg: cfg, endpoint: endpoint,
+		httpClientIdentity: httpIdentity, cacheIdentityUnsafe: !cacheable,
+	}, nil
+}
+
+func (o *OllamaGenerator) CacheIdentity() (string, error) {
+	if o == nil {
+		return "", ErrInvalidConfig
+	}
+	if o.cacheIdentityUnsafe {
+		return "", ErrInvalidConfig
+	}
+	return ollamaCacheIdentity("ollama-generator-v1", o.cfg, o.endpoint, o.httpClientIdentity), nil
+}
+
+func (o *OllamaEmbedder) CacheIdentity() (string, error) {
+	if o == nil {
+		return "", ErrInvalidConfig
+	}
+	if o.cacheIdentityUnsafe {
+		return "", ErrInvalidConfig
+	}
+	return ollamaCacheIdentity("ollama-embedder-v1", o.cfg, o.endpoint, o.httpClientIdentity), nil
 }
 
 func (o *OllamaGenerator) Generate(ctx context.Context, req GenerateRequest) (GenerateResult, error) {
@@ -159,6 +198,21 @@ func (o *OllamaEmbedder) Embed(ctx context.Context, req EmbedRequest) (EmbedResu
 		Provenance: Provenance{Provider: "ollama", Model: o.cfg.Model},
 		Usage:      Usage{InputTokens: usage, TotalTokens: usage},
 	}, nil
+}
+
+func ollamaCacheIdentity(kind string, cfg OllamaConfig, endpoint, httpClientIdentity string) string {
+	return framedModelIdentity(
+		kind,
+		endpoint,
+		cfg.Model,
+		httpClientIdentity,
+		cfg.Timeout.String(),
+		strconv.FormatInt(cfg.MaxTextBytes, 10),
+		strconv.FormatInt(cfg.MaxRequestBytes, 10),
+		strconv.FormatInt(cfg.MaxResponseBytes, 10),
+		strconv.Itoa(cfg.MaxVectorDimensions),
+		strconv.FormatInt(cfg.ErrorSnippetBytes, 10),
+	)
 }
 
 func validateOllamaConfig(cfg OllamaConfig, path string) (OllamaConfig, string, error) {

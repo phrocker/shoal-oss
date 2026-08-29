@@ -26,6 +26,13 @@ type TextGenerator interface {
 	Generate(context.Context, GenerateRequest) (GenerateResult, error)
 }
 
+// CacheIdentityProvider returns a stable, non-secret identity for
+// behavior-bearing provider configuration. Harness caches use it structurally
+// and bypass caching when a provider cannot supply one.
+type CacheIdentityProvider interface {
+	CacheIdentity() (string, error)
+}
+
 // Embedder creates a vector embedding from a bounded provider-neutral request.
 type Embedder interface {
 	Embed(context.Context, EmbedRequest) (EmbedResult, error)

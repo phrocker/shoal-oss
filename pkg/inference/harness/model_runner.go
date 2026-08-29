@@ -264,6 +264,7 @@ type ModelRunnerConfig struct {
 	MaxOutputTokens int
 	TokenEstimator  TextTokenEstimator
 	Now             func() time.Time
+	ClockIdentity   string
 }
 
 type TextTokenEstimator interface {
@@ -299,6 +300,38 @@ func (r *ModelRunner) Start(ctx context.Context, request SessionRequest) (Sessio
 		return nil, err
 	}
 	return &modelSession{runner: r, request: request}, nil
+}
+
+func (r *ModelRunner) CacheIdentity() (string, error) {
+	if r == nil || r.generator == nil {
+		return "", ErrCacheIdentityUnsafe
+	}
+	generatorIdentity, err := dependencyCacheIdentity(r.generator, "model generator")
+	if err != nil {
+		return "", err
+	}
+	estimatorIdentity := "byte-estimator-v1"
+	if r.cfg.TokenEstimator != nil {
+		estimatorIdentity, err = dependencyCacheIdentity(r.cfg.TokenEstimator, "token estimator")
+		if err != nil {
+			return "", err
+		}
+	}
+	clockIdentity := strings.TrimSpace(r.cfg.ClockIdentity)
+	if clockIdentity == "" || unsafeCacheText(clockIdentity) {
+		return "", ErrCacheIdentityUnsafe
+	}
+	identity := framed(
+		"model-runner-v1",
+		generatorIdentity,
+		strconv.Itoa(r.cfg.MaxOutputTokens),
+		estimatorIdentity,
+		clockIdentity,
+	)
+	if unsafeCacheText(identity) {
+		return "", ErrCacheIdentityUnsafe
+	}
+	return identity, nil
 }
 
 type modelSession struct {

@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"reflect"
 	"sort"
+	"strconv"
 	"time"
 
 	"github.com/phrocker/shoal-oss/pkg/contextpack"
@@ -43,6 +44,11 @@ type ExplorerToolHost struct {
 	Metadata         shoal.Metadata
 	RetrievalModes   []retrieval.Mode
 	RetrievalExplain bool
+
+	ClientIdentity         string
+	BoundedClientIdentity  string
+	BuilderReaderIdentity  string
+	TokenEstimatorIdentity string
 }
 
 func NewExplorerToolHost(client explorer.Client, builder contextpack.Builder) (*ExplorerToolHost, error) {
@@ -59,6 +65,82 @@ func NewExplorerToolHost(client explorer.Client, builder contextpack.Builder) (*
 		}
 	}
 	return host, nil
+}
+
+func (h *ExplorerToolHost) CacheIdentity() (string, error) {
+	if err := h.validate(); err != nil {
+		return "", err
+	}
+	clientIdentity, err := configuredHarnessIdentity(h.ClientIdentity, h.Client, "explorer client")
+	if err != nil {
+		return "", err
+	}
+	boundedIdentity := "no-bounded-client"
+	if h.BoundedClient != nil {
+		boundedIdentity, err = configuredHarnessIdentity(h.BoundedClientIdentity, h.BoundedClient, "bounded explorer client")
+		if err != nil {
+			return "", err
+		}
+	}
+	readerIdentity := "no-builder-reader"
+	if h.Builder.Reader != nil {
+		readerIdentity, err = configuredHarnessIdentity(h.BuilderReaderIdentity, h.Builder.Reader, "context builder reader")
+		if err != nil {
+			return "", err
+		}
+	}
+	estimatorIdentity := "no-token-estimator"
+	if h.Builder.TokenEstimator != nil {
+		estimatorIdentity, err = configuredHarnessIdentity(h.TokenEstimatorIdentity, h.Builder.TokenEstimator, "context token estimator")
+		if err != nil {
+			return "", err
+		}
+	}
+	metadataKeys := make([]string, 0, len(h.Metadata))
+	for key := range h.Metadata {
+		metadataKeys = append(metadataKeys, key)
+	}
+	sort.Strings(metadataKeys)
+	parts := []string{
+		"explorer-tool-host-v2",
+		clientIdentity,
+		boundedIdentity,
+		readerIdentity,
+		estimatorIdentity,
+		string(h.PolicyID),
+		strconv.FormatBool(h.RetrievalExplain),
+		"retrieval-modes",
+		strconv.Itoa(len(h.RetrievalModes)),
+	}
+	for _, mode := range h.RetrievalModes {
+		parts = append(parts, string(mode))
+	}
+	parts = append(parts, "metadata", strconv.Itoa(len(metadataKeys)))
+	for _, key := range metadataKeys {
+		parts = append(parts, key, h.Metadata[key])
+	}
+	parts = append(parts, "builder-limits")
+	limits := h.Builder.Limits
+	parts = append(parts,
+		strconv.Itoa(limits.MaxResults),
+		strconv.Itoa(limits.MaxAnchors),
+		strconv.Itoa(limits.MaxDocuments),
+		strconv.Itoa(limits.MaxSections),
+		strconv.Itoa(limits.MaxSpans),
+		strconv.Itoa(limits.MaxGraphNodes),
+		strconv.Itoa(limits.MaxGraphEdges),
+		strconv.Itoa(limits.MaxPathNodes),
+		strconv.Itoa(limits.MaxContextBytes),
+		strconv.Itoa(limits.MaxHydrationBytes),
+		strconv.Itoa(limits.MaxContextTokens),
+		strconv.Itoa(limits.MaxQuoteBytes),
+		strconv.Itoa(limits.MaxProvenanceBytes),
+		strconv.FormatUint(uint64(limits.MaxHierarchyDepth), 10),
+	)
+	if unsafeIdentityParts(parts) {
+		return "", ErrCacheIdentityUnsafe
+	}
+	return framed(parts...), nil
 }
 
 func (h *ExplorerToolHost) Retrieve(
