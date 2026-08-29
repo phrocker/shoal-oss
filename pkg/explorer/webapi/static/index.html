@@ -26,12 +26,12 @@
   </header>
   <main>
     <aside class="left">
-      <section><h2>Corpus</h2><div id="documents" aria-live="polite"></div><button id="more" type="button" hidden>More documents</button></section>
-      <section><h2>Hierarchy</h2><div id="hierarchy" class="tree muted" aria-live="polite">Select a document.</div></section>
+      <section><h2>Corpus</h2><p id="documents-status" class="muted" role="status" aria-live="polite"></p><div id="documents"></div><button id="more" type="button" hidden>More documents</button></section>
+      <section><h2>Hierarchy</h2><p id="hierarchy-status" class="muted" role="status" aria-live="polite">Select a document.</p><div id="hierarchy" class="tree"></div></section>
     </aside>
     <section class="center">
       <div class="tabs" role="tablist" aria-label="Explorer views"><button id="tab-evidence" class="tab active" data-panel="evidence" role="tab" aria-controls="evidence" aria-selected="true" type="button">Evidence</button><button id="tab-graph" class="tab" data-panel="graph" role="tab" aria-controls="graph" aria-selected="false" tabindex="-1" type="button">Graph</button></div>
-      <div id="evidence" class="panel active" role="tabpanel" aria-labelledby="tab-evidence" aria-live="polite"><p class="muted">Run a retrieval query to inspect exact evidence and explanations.</p></div>
+      <div id="evidence" class="panel active" role="tabpanel" aria-labelledby="tab-evidence"><p id="evidence-status" class="muted" role="status" aria-live="polite">Run a retrieval query to inspect exact evidence and explanations.</p><div id="evidence-results"></div></div>
       <div id="graph" class="panel" role="tabpanel" aria-labelledby="tab-graph">
         <div class="graph-tools">
           <button id="expand" type="button" disabled>Expand selected</button>

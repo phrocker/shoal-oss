@@ -71,6 +71,7 @@ assert.strictEqual(scenario.ctx.sourceLabel(webURI, "doc"), "example.test / guid
 }
 
 func TestStaticWorkspaceResponsiveHeaderWrapsBeforeTabletWidths(t *testing.T) {
+	html := readStaticAsset(t, "static/index.html")
 	style := readStaticAsset(t, "static/style.css")
 
 	for _, want := range []string{
@@ -83,6 +84,15 @@ func TestStaticWorkspaceResponsiveHeaderWrapsBeforeTabletWidths(t *testing.T) {
 	} {
 		if !strings.Contains(style, want) {
 			t.Fatalf("style.css missing responsive layout marker %q", want)
+		}
+	}
+	for _, noisy := range []string{
+		`id="documents" aria-live`,
+		`id="hierarchy" class="tree" aria-live`,
+		`id="evidence" class="panel active" role="tabpanel" aria-labelledby="tab-evidence" aria-live`,
+	} {
+		if strings.Contains(html, noisy) {
+			t.Fatalf("interactive content container should not be a broad live region: %q", noisy)
 		}
 	}
 }
@@ -221,10 +231,14 @@ function makeDocument(capabilities, documents) {
   };
   for (const id of [
     "query", "search", "search-button", "modes", "mode-vector", "mode-vector-control",
-    "vector-mode-status", "evidence", "expand", "continue-expansion", "path-from",
-    "path-to", "find-path", "graph-status", "documents", "more", "graph-nodes",
-    "graph-edges", "canvas", "selection", "hierarchy", "snapshot",
+    "vector-mode-status", "evidence", "evidence-status", "evidence-results", "expand",
+    "continue-expansion", "path-from", "path-to", "find-path", "graph-status",
+    "documents", "documents-status", "more", "graph-nodes", "graph-edges", "canvas",
+    "selection", "hierarchy", "hierarchy-status", "snapshot",
   ]) ids[id] = new Element(id === "canvas" ? "canvas" : "div", id);
+  for (const id of ["documents-status", "hierarchy-status", "evidence-status", "vector-mode-status"]) {
+    ids[id].setAttribute("role", "status");
+  }
   ids.query.value = "";
   ids.search = new Element("form", "search");
   ids["search-button"] = new Element("button", "search-button");

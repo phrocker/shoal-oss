@@ -60,13 +60,14 @@ function applyCapabilities() {
   $("modes").disabled = !canRetrieve;
   applyVectorCapability(canRetrieve);
 
-  const evidence = $("evidence");
+  const evidenceStatus = $("evidence-status");
   if (!canRetrieve) {
-    evidence.dataset.capabilityPlaceholder = "retrieve";
-    setMessage(evidence, "Retrieval is unavailable from this Explorer service.");
-  } else if (evidence.dataset.capabilityPlaceholder === "retrieve") {
-    delete evidence.dataset.capabilityPlaceholder;
-    setMessage(evidence, "Run a retrieval query to inspect exact evidence and explanations.");
+    evidenceStatus.dataset.capabilityPlaceholder = "retrieve";
+    setStatus(evidenceStatus, "Retrieval is unavailable from this Explorer service.");
+    $("evidence-results").replaceChildren();
+  } else if (evidenceStatus.dataset.capabilityPlaceholder === "retrieve") {
+    delete evidenceStatus.dataset.capabilityPlaceholder;
+    setStatus(evidenceStatus, "Run a retrieval query to inspect exact evidence and explanations.");
   }
 
   const canNeighborhood = capability("neighborhood");
@@ -93,11 +94,8 @@ function applyCapabilities() {
   }
 
   if (!capability("documents")) {
-    setMessage(
-      $("documents"),
-      "Document listing is unavailable from this Explorer service.",
-      "empty-state",
-    );
+    setStatus($("documents-status"), "Document listing is unavailable from this Explorer service.");
+    $("documents").replaceChildren();
     $("more").hidden = true;
   }
 }
@@ -128,7 +126,16 @@ function setMessage(element, message, className = "muted") {
   element.replaceChildren(paragraph);
 }
 
+function setStatus(element, message, className = "muted") {
+  element.className = className;
+  element.textContent = message;
+}
+
 function showError(element, error) {
+  if (element.getAttribute && element.getAttribute("role") === "status") {
+    setStatus(element, error.message || String(error), "error");
+    return;
+  }
   setMessage(element, error.message || String(error), "error");
 }
 
@@ -143,9 +150,10 @@ async function loadDocuments(reset = true) {
   if (documentsLoading) return;
   documentsLoading = true;
   $("more").disabled = true;
+  $("documents").setAttribute("aria-busy", "true");
   if (reset) {
     state.cursor = "";
-    setMessage($("documents"), "Loading documents…");
+    setStatus($("documents-status"), "Loading documents…");
   }
   try {
     const response = await api("documents", {
@@ -156,7 +164,9 @@ async function loadDocuments(reset = true) {
     if (reset) $("documents").replaceChildren();
     const documents = response.documents || [];
     if (documents.length === 0 && reset) {
-      setMessage($("documents"), "No documents have been ingested yet.", "empty-state");
+      setStatus($("documents-status"), "No documents have been ingested yet.", "empty-state");
+    } else {
+      setStatus($("documents-status"), `Showing ${$("documents").children.length + documents.length} document(s).`);
     }
     const fragment = document.createDocumentFragment();
     for (const item of documents) fragment.append(createDocumentCard(item));
@@ -164,9 +174,10 @@ async function loadDocuments(reset = true) {
     state.cursor = response.next_cursor || "";
     $("more").hidden = !state.cursor;
   } catch (error) {
-    showError($("documents"), error);
+    showError($("documents-status"), error);
   } finally {
     documentsLoading = false;
+    $("documents").setAttribute("aria-busy", "false");
     $("more").disabled = false;
   }
 }
@@ -243,7 +254,8 @@ async function loadDocument(documentID, revisionID) {
   const generation = ++documentGeneration;
   state.currentDocumentID = documentID;
   updateDocumentCardSelection();
-  setMessage($("hierarchy"), "Loading document hierarchy…");
+  $("hierarchy").setAttribute("aria-busy", "true");
+  setStatus($("hierarchy-status"), "Loading document hierarchy…");
   try {
     const response = await api("document", {
       snapshot: state.snapshot,
@@ -259,7 +271,9 @@ async function loadDocument(documentID, revisionID) {
     mergeGraph({nodes: [nodeFromDocument(response.document.document)], edges: []});
     draw();
   } catch (error) {
-    if (generation === documentGeneration) showError($("hierarchy"), error);
+    if (generation === documentGeneration) showError($("hierarchy-status"), error);
+  } finally {
+    if (generation === documentGeneration) $("hierarchy").setAttribute("aria-busy", "false");
   }
 }
 
@@ -275,11 +289,12 @@ function updateDocumentCardSelection(card) {
 
 function renderHierarchy(root) {
   const hierarchy = $("hierarchy");
-  hierarchy.classList.remove("muted");
   if (!root) {
-    setMessage(hierarchy, "This document has no hierarchy.", "empty-state");
+    hierarchy.replaceChildren();
+    setStatus($("hierarchy-status"), "This document has no hierarchy.", "empty-state");
     return;
   }
+  setStatus($("hierarchy-status"), "Document hierarchy loaded.");
   hierarchy.replaceChildren(sectionList(root));
 }
 
@@ -343,7 +358,8 @@ $("search").onsubmit = async (event) => {
   event.preventDefault();
   if (!capability("retrieve")) return;
   const generation = ++searchGeneration;
-  setMessage($("evidence"), "Searching evidence…");
+  setStatus($("evidence-status"), "Searching evidence…");
+  $("evidence-results").replaceChildren();
   try {
     const response = await api("retrieve", {
       snapshot: state.snapshot,
@@ -361,17 +377,19 @@ $("search").onsubmit = async (event) => {
     pin(response.snapshot);
     renderEvidence(response.retrieval);
   } catch (error) {
-    if (generation === searchGeneration) showError($("evidence"), error);
+    if (generation === searchGeneration) showError($("evidence-status"), error);
   }
 };
 
 function renderEvidence(response) {
   const results = response.results || [];
   if (results.length === 0) {
-    setMessage($("evidence"), "No evidence matched.", "empty-state");
+    $("evidence-results").replaceChildren();
+    setStatus($("evidence-status"), "No evidence matched.", "empty-state");
     draw();
     return;
   }
+  setStatus($("evidence-status"), `Showing ${results.length} evidence result(s).`);
   const fragment = document.createDocumentFragment();
   results.forEach((result) => {
     const element = document.createElement("article");
@@ -412,7 +430,7 @@ function renderEvidence(response) {
     }
     fragment.append(element);
   });
-  $("evidence").replaceChildren(fragment);
+  $("evidence-results").replaceChildren(fragment);
   draw();
 }
 
