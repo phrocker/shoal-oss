@@ -258,6 +258,14 @@ type FakeEmbedder struct {
 }
 
 func (f FakeEmbedder) CacheIdentity() (string, error) {
+	space, err := f.EmbeddingSpaceIdentity()
+	if err != nil {
+		return "", err
+	}
+	return framedModelIdentity("model-fake-embedder-v1", space), nil
+}
+
+func (f FakeEmbedder) EmbeddingSpaceIdentity() (string, error) {
 	name := strings.TrimSpace(f.Model)
 	if name == "" {
 		name = "deterministic"
@@ -266,7 +274,7 @@ func (f FakeEmbedder) CacheIdentity() (string, error) {
 	if dim == 0 {
 		dim = DefaultFakeDimensions
 	}
-	return framedModelIdentity("model-fake-embedder-v1", name, strconv.Itoa(dim)), nil
+	return embeddingSpaceIdentity("fake", name, dim, normalizationL2)
 }
 
 func (f FakeEmbedder) Embed(ctx context.Context, req EmbedRequest) (EmbedResult, error) {
@@ -329,3 +337,9 @@ func tokenEstimate(text string) int {
 	}
 	return (len([]byte(text)) + 3) / 4
 }
+
+var (
+	_ TextGenerator                  = FakeGenerator{}
+	_ Embedder                       = FakeEmbedder{}
+	_ EmbeddingSpaceIdentityProvider = FakeEmbedder{}
+)

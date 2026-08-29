@@ -353,10 +353,11 @@ func TestOpenAIGenerationValidation(t *testing.T) {
 
 func TestOpenAIEmbeddingValidation(t *testing.T) {
 	tests := []struct {
-		name       string
-		body       string
-		dimensions int
-		want       error
+		name               string
+		body               string
+		maxDimensions      int
+		expectedDimensions int
+		want               error
 	}{
 		{name: "empty data", body: `{"data":[]}`, want: ErrMalformedResponse},
 		{name: "multiple embeddings", body: `{"data":[{"embedding":[1],"index":0},{"embedding":[2],"index":1}]}`, want: ErrMalformedResponse},
@@ -364,7 +365,8 @@ func TestOpenAIEmbeddingValidation(t *testing.T) {
 		{name: "missing index", body: `{"data":[{"embedding":[1]}]}`, want: ErrMalformedResponse},
 		{name: "empty vector", body: `{"data":[{"embedding":[],"index":0}]}`, want: ErrMalformedResponse},
 		{name: "null vector value", body: `{"data":[{"embedding":[null],"index":0}]}`, want: ErrMalformedResponse},
-		{name: "oversized vector", body: `{"data":[{"embedding":[1,2],"index":0}]}`, dimensions: 1, want: ErrOversizedResponse},
+		{name: "oversized vector", body: `{"data":[{"embedding":[1,2],"index":0}]}`, maxDimensions: 1, want: ErrOversizedResponse},
+		{name: "dimension mismatch", body: `{"data":[{"embedding":[1,2],"index":0}]}`, expectedDimensions: 3, want: ErrMalformedResponse},
 		{name: "overflow", body: `{"data":[{"embedding":[1e400],"index":0}]}`, want: ErrMalformedResponse},
 		{name: "invalid usage", body: `{"data":[{"embedding":[1],"index":0}],"usage":{"prompt_tokens":-1}}`, want: ErrMalformedResponse},
 	}
@@ -375,7 +377,8 @@ func TestOpenAIEmbeddingValidation(t *testing.T) {
 			}))
 			defer server.Close()
 			cfg := openAITestConfig(server)
-			cfg.MaxVectorDimensions = test.dimensions
+			cfg.MaxVectorDimensions = test.maxDimensions
+			cfg.EmbeddingDimensions = test.expectedDimensions
 			embedder, err := NewOpenAIEmbedder(cfg)
 			if err != nil {
 				t.Fatal(err)
@@ -423,6 +426,7 @@ func TestOpenAIConfigAndRequestValidation(t *testing.T) {
 		func() OpenAIConfig { c := base; c.Organization = "bad\x01header"; return c }(),
 		func() OpenAIConfig { c := base; c.Project = "bad\x7fheader"; return c }(),
 		func() OpenAIConfig { c := base; c.Credentials = nil; return c }(),
+		func() OpenAIConfig { c := base; c.EmbeddingDimensions = MaxVectorDimensions + 1; return c }(),
 	}
 	for i, cfg := range tests {
 		if _, err := NewOpenAIGenerator(cfg); !errors.Is(err, ErrInvalidConfig) {
@@ -447,6 +451,87 @@ func TestOpenAIConfigAndRequestValidation(t *testing.T) {
 	}
 	if _, err := embedder.Embed(context.Background(), EmbedRequest{Text: string([]byte{0xff})}); !errors.Is(err, ErrInvalidRequest) {
 		t.Fatalf("invalid UTF-8 embedding request error = %v", err)
+	}
+	hostedNoCredential := base
+	hostedNoCredential.BaseURL = "https://example.com"
+	hostedNoCredential.Credentials = nil
+	if _, err := NewOpenAIEmbedder(hostedNoCredential); !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("hosted no-credential embedder error = %v", err)
+	}
+}
+
+func TestOpenAILocalCompatibleServerWithoutCredentials(t *testing.T) {
+	var sawAuthorization bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sawAuthorization = r.Header.Get(authorizationHeaderName) != ""
+		if r.URL.Path != openAIEmbeddingPath {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = io.WriteString(w, `{"data":[{"embedding":[1,2,3],"index":0}],"usage":{"prompt_tokens":2,"total_tokens":2}}`)
+	}))
+	defer server.Close()
+	embedder, err := NewOpenAIEmbedder(OpenAIConfig{
+		BaseURL:             server.URL,
+		EmbeddingModel:      "llama-cpp-embedding",
+		EmbeddingDimensions: 3,
+		HTTPClient:          server.Client(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := embedder.Embed(context.Background(), EmbedRequest{Text: "local text"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sawAuthorization {
+		t.Fatal("local no-credential request unexpectedly sent Authorization")
+	}
+	if len(result.Vector) != 3 || result.Provenance != (Provenance{Provider: openAIProvider, Model: "llama-cpp-embedding"}) {
+		t.Fatalf("result = %#v", result)
+	}
+}
+
+func TestOpenAINoCredentialCacheIdentity(t *testing.T) {
+	embedder, err := NewOpenAIEmbedder(OpenAIConfig{
+		BaseURL:             "https://localhost",
+		EmbeddingModel:      "local-embedding",
+		EmbeddingDimensions: 3,
+		HTTPClient:          &http.Client{Transport: identityTransport{identity: "transport-v1"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity, err := embedder.CacheIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	space, err := embedder.EmbeddingSpaceIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{openAIProvider, "local-embedding", "3", normalizationProviderNativeUnchanged} {
+		if !strings.Contains(identity, want) {
+			t.Fatalf("identity %q missing %q", identity, want)
+		}
+		if !strings.Contains(space, want) {
+			t.Fatalf("space identity %q missing %q", space, want)
+		}
+	}
+	if strings.Contains(identity, testAPIKey) {
+		t.Fatalf("identity leaked credential: %q", identity)
+	}
+
+	withoutDimensions, err := NewOpenAIEmbedder(OpenAIConfig{
+		BaseURL:        "https://localhost",
+		EmbeddingModel: "local-embedding",
+		HTTPClient:     &http.Client{Transport: identityTransport{identity: "transport-v1"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := withoutDimensions.CacheIdentity(); !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("cache identity without dimensions error = %v", err)
 	}
 }
 

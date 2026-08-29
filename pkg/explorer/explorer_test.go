@@ -370,6 +370,104 @@ func TestVectorRetrievalRejectsIncompatibleEmbeddingSpaces(t *testing.T) {
 	}
 }
 
+func TestVectorRetrievalUsesEmbeddingSpaceIdentity(t *testing.T) {
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	first, err := model.NewLexicalEmbedder(model.LexicalConfig{
+		Dimensions:   16,
+		MaxTextBytes: 1024,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	corpus, err := explorer.OpenWithOptions(dataDir, explorer.Options{Embedder: first})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := corpus.Ingest(ctx, explorer.Source{
+		URI:       "file:///lexical-space.txt",
+		MediaType: explorer.MediaTypeText,
+		Content:   "lexical embedding space survives cache-only configuration changes",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := corpus.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	sameSpace, err := model.NewLexicalEmbedder(model.LexicalConfig{
+		Dimensions:   16,
+		MaxTextBytes: 2048,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := explorer.OpenWithOptions(dataDir, explorer.Options{Embedder: sameSpace})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reopened.Retrieve(ctx, retrieval.Request{
+		Text:  "lexical embedding space",
+		Modes: []retrieval.Mode{retrieval.ModeVector},
+	}); err != nil {
+		t.Fatalf("cache-only configuration change was treated as incompatible: %v", err)
+	}
+	if err := reopened.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		name     string
+		embedder model.Embedder
+	}{
+		{
+			name: "provider",
+			embedder: spaceIdentityEmbedder{
+				provider: "other-provider", modelName: model.DefaultLexicalModel,
+				dimensions: 16, identity: "provider=other-provider|model=hashing-lexical-v1|dim=16|norm=l2",
+			},
+		},
+		{
+			name: "model",
+			embedder: spaceIdentityEmbedder{
+				provider: "local-lexical", modelName: "other-model",
+				dimensions: 16, identity: "provider=local-lexical|model=other-model|dim=16|norm=l2",
+			},
+		},
+		{
+			name: "dimension",
+			embedder: spaceIdentityEmbedder{
+				provider: "local-lexical", modelName: model.DefaultLexicalModel,
+				dimensions: 32, identity: "provider=local-lexical|model=hashing-lexical-v1|dim=32|norm=l2",
+			},
+		},
+		{
+			name: "normalization",
+			embedder: spaceIdentityEmbedder{
+				provider: "local-lexical", modelName: model.DefaultLexicalModel,
+				dimensions: 16, identity: "provider=local-lexical|model=hashing-lexical-v1|dim=16|norm=none",
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			corpus, err := explorer.OpenWithOptions(dataDir, explorer.Options{
+				Embedder: tc.embedder,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer corpus.Close()
+			_, err = corpus.Retrieve(ctx, retrieval.Request{
+				Text:  "lexical embedding space",
+				Modes: []retrieval.Mode{retrieval.ModeVector},
+			})
+			if !shoal.IsErrorCode(err, shoal.ErrorConflict) {
+				t.Fatalf("%s mismatch error = %v", tc.name, err)
+			}
+		})
+	}
+}
+
 func TestVectorRetrievalReportsDisabledAndPartiallyPopulatedEmbeddings(t *testing.T) {
 	ctx := context.Background()
 	dataDir := t.TempDir()
@@ -914,6 +1012,10 @@ func (failingEmbedder) CacheIdentity() (string, error) {
 	return "failing-embedder-v1", nil
 }
 
+func (failingEmbedder) EmbeddingSpaceIdentity() (string, error) {
+	return "failing-embedding-space-v1", nil
+}
+
 type noIdentityEmbedder struct{}
 
 func (noIdentityEmbedder) Embed(
@@ -932,4 +1034,31 @@ func (failingEmbedder) Embed(
 	context.Context, model.EmbedRequest,
 ) (model.EmbedResult, error) {
 	return model.EmbedResult{}, model.ErrUnavailable
+}
+
+type spaceIdentityEmbedder struct {
+	provider   string
+	modelName  string
+	dimensions int
+	identity   string
+}
+
+func (e spaceIdentityEmbedder) EmbeddingSpaceIdentity() (string, error) {
+	return e.identity, nil
+}
+
+func (e spaceIdentityEmbedder) Embed(
+	context.Context, model.EmbedRequest,
+) (model.EmbedResult, error) {
+	vector := make([]float32, e.dimensions)
+	if len(vector) > 0 {
+		vector[0] = 1
+	}
+	return model.EmbedResult{
+		Vector: vector,
+		Provenance: model.Provenance{
+			Provider: e.provider,
+			Model:    e.modelName,
+		},
+	}, nil
 }

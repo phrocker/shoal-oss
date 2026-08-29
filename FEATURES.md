@@ -43,11 +43,16 @@ operational contracts remain in the linked runbooks and ADRs.
 | Exact vector search | Shipped |
 | Distributed IVF-PQ lifecycle, tombstones, freshness, and recall contracts | Shipped |
 | Local RFile, local Parquet, mixed, and Accumulo-backed corpus parity | Shipped |
-| Provider-neutral model I/O with deterministic fake, bounded Ollama, and authenticated OpenAI-compatible adapters | Shipped |
+| Provider-neutral model I/O with deterministic fake, bounded local lexical, Ollama, OpenAI-compatible, and Voyage embedding adapters | Shipped |
 
 Authenticated hosted providers are opt-in adapters. Shoal does not configure,
 select, or imply any cloud model provider by default; applications must supply
-an explicit endpoint, model names, and request-time credential resolver.
+an explicit endpoint, model names, and request-time credential source.
+Production local deployments should use a real embedding model through Ollama
+or a loopback OpenAI-compatible server; the local lexical embedder is only a
+zero-dependency offline and CI fallback, produces lexical/statistical vectors,
+and makes no semantic quality claim. Anthropic publishes no embeddings API, so
+hosted embedding paths are OpenAI-compatible endpoints or Voyage.
 
 ## Knowledge and inference contracts
 

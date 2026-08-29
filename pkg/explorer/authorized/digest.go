@@ -102,6 +102,26 @@ func documentViewNodeIDs(view explorer.DocumentView) ([]shoal.ID, error) {
 }
 
 func documentViewDigest(view explorer.DocumentView) (auth.Digest, error) {
+	return documentViewDigestV2(view)
+}
+
+func documentViewDigestV2(view explorer.DocumentView) (auth.Digest, error) {
+	if _, err := documentViewNodeIDs(view); err != nil {
+		return auth.Digest{}, err
+	}
+	encoder := newViewDigestEncoder()
+	encoder.text("explorer-authorized-document-view-v2")
+	encoder.document(view.Document)
+	encoder.revision(view.Revision)
+	encoder.text(view.SourceURI)
+	encoder.text(view.SourceMediaType)
+	encoder.sectionView(view.Root)
+	var digest auth.Digest
+	copy(digest[:], encoder.hash.Sum(nil))
+	return digest, nil
+}
+
+func legacyDocumentViewDigestV1(view explorer.DocumentView) (auth.Digest, error) {
 	if _, err := documentViewNodeIDs(view); err != nil {
 		return auth.Digest{}, err
 	}

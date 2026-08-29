@@ -316,6 +316,13 @@ func (e *countingEmbedder) CacheIdentity() (string, error) {
 	return "counting-embedder-v1:" + e.model, nil
 }
 
+func (e *countingEmbedder) EmbeddingSpaceIdentity() (string, error) {
+	if e.identity != "" {
+		return e.identity, nil
+	}
+	return "counting-embedding-space-v1:" + e.model, nil
+}
+
 func (e *countingEmbedder) Embed(
 	ctx context.Context, req model.EmbedRequest,
 ) (model.EmbedResult, error) {

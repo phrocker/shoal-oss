@@ -431,16 +431,16 @@ func (e *Explorer) embeddingIdentity() (string, error) {
 }
 
 func embeddingIdentityFor(embedder model.Embedder) (string, error) {
-	provider, ok := embedder.(model.CacheIdentityProvider)
+	provider, ok := embedder.(model.EmbeddingSpaceIdentityProvider)
 	if !ok {
 		return "", shoal.NewError(
 			shoal.ErrorInvalidArgument,
-			"embedding provider must expose a non-secret identity",
+			"embedding provider must expose a stable embedding space identity",
 		)
 	}
-	identity, err := provider.CacheIdentity()
+	identity, err := provider.EmbeddingSpaceIdentity()
 	if err != nil {
-		return "", embeddingProviderError("identify embedding provider", err)
+		return "", embeddingProviderError("identify embedding space", err)
 	}
 	identity = strings.TrimSpace(identity)
 	if identity == "" || !utf8.ValidString(identity) ||

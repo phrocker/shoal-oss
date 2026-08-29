@@ -43,17 +43,24 @@ func (f CredentialResolverFunc) ResolveCredential(ctx context.Context) ([]byte, 
 	return f(ctx)
 }
 
-// OpenAIConfig configures an authenticated OpenAI-compatible adapter.
-// It intentionally exposes no arbitrary-header escape hatch.
+// OpenAIConfig configures an OpenAI-compatible adapter. Credentials are
+// optional only for embedding requests to local loopback compatible servers;
+// when Credentials is nil in that case, requests do not include an
+// Authorization header. It intentionally exposes no arbitrary-header escape
+// hatch.
 type OpenAIConfig struct {
 	BaseURL         string
 	GenerationModel string
 	EmbeddingModel  string
-	Organization    string
-	Project         string
-	Credentials     CredentialResolver
-	HTTPClient      *http.Client
-	Timeout         time.Duration
+	// EmbeddingDimensions, when non-zero, requires embedding responses to have
+	// exactly this dimensionality and includes that dimensionality in cache
+	// identity.
+	EmbeddingDimensions int
+	Organization        string
+	Project             string
+	Credentials         CredentialResolver
+	HTTPClient          *http.Client
+	Timeout             time.Duration
 
 	MaxTextBytes        int64
 	MaxRequestBytes     int64
@@ -66,6 +73,7 @@ type openAIClient struct {
 	baseURL             string
 	generationModel     string
 	embeddingModel      string
+	embeddingDimensions int
 	organization        string
 	project             string
 	credentials         CredentialResolver
@@ -93,7 +101,7 @@ func NewOpenAIGenerator(cfg OpenAIConfig) (*OpenAIGenerator, error) {
 	if err != nil {
 		return nil, err
 	}
-	_, credentialCacheable, err := configuredCacheIdentity(cfg.Credentials)
+	_, credentialCacheable, err := openAICredentialCacheIdentity(cfg.Credentials)
 	if err != nil {
 		return nil, err
 	}
@@ -111,7 +119,7 @@ func NewOpenAIEmbedder(cfg OpenAIConfig) (*OpenAIEmbedder, error) {
 	if err != nil {
 		return nil, err
 	}
-	_, credentialCacheable, err := configuredCacheIdentity(cfg.Credentials)
+	_, credentialCacheable, err := openAICredentialCacheIdentity(cfg.Credentials)
 	if err != nil {
 		return nil, err
 	}
@@ -131,7 +139,7 @@ func (o *OpenAIGenerator) CacheIdentity() (string, error) {
 	if o.client.cacheIdentityUnsafe {
 		return "", ErrInvalidConfig
 	}
-	credentialIdentity, credentialCacheable, _ := configuredCacheIdentity(o.client.credentials)
+	credentialIdentity, credentialCacheable, _ := openAICredentialCacheIdentity(o.client.credentials)
 	if !credentialCacheable {
 		return "", ErrInvalidConfig
 	}
@@ -145,11 +153,27 @@ func (o *OpenAIEmbedder) CacheIdentity() (string, error) {
 	if o.client.cacheIdentityUnsafe {
 		return "", ErrInvalidConfig
 	}
-	credentialIdentity, credentialCacheable, _ := configuredCacheIdentity(o.client.credentials)
+	space, err := o.EmbeddingSpaceIdentity()
+	if err != nil {
+		return "", err
+	}
+	credentialIdentity, credentialCacheable, _ := openAICredentialCacheIdentity(o.client.credentials)
 	if !credentialCacheable {
 		return "", ErrInvalidConfig
 	}
-	return openAICacheIdentity("openai-compatible-embedder-v1", o.client, o.client.embeddingModel, credentialIdentity), nil
+	return openAIEmbeddingCacheIdentity(o.client, space, credentialIdentity), nil
+}
+
+func (o *OpenAIEmbedder) EmbeddingSpaceIdentity() (string, error) {
+	if o == nil || o.client == nil || o.client.embeddingDimensions == 0 {
+		return "", ErrInvalidConfig
+	}
+	return embeddingSpaceIdentity(
+		openAIProvider,
+		o.client.embeddingModel,
+		o.client.embeddingDimensions,
+		normalizationProviderNativeUnchanged,
+	)
 }
 
 func (o *OpenAIGenerator) Generate(ctx context.Context, req GenerateRequest) (GenerateResult, error) {
@@ -238,6 +262,9 @@ func (o *OpenAIEmbedder) Embed(ctx context.Context, req EmbedRequest) (EmbedResu
 	if len(out.Data[0].Embedding) > o.client.maxVectorDimensions {
 		return EmbedResult{}, &Error{Kind: ErrOversizedResponse, Operation: op, Detail: "vector exceeds configured dimensions"}
 	}
+	if o.client.embeddingDimensions != 0 && len(out.Data[0].Embedding) != o.client.embeddingDimensions {
+		return EmbedResult{}, &Error{Kind: ErrMalformedResponse, Operation: op, Detail: "vector dimensions mismatch"}
+	}
 	vector := make([]float32, len(out.Data[0].Embedding))
 	for i, encoded := range out.Data[0].Embedding {
 		value := float64(encoded)
@@ -262,6 +289,24 @@ func openAICacheIdentity(kind string, client *openAIClient, model, credentialIde
 		kind,
 		client.baseURL,
 		model,
+		client.organization,
+		client.project,
+		credentialIdentity,
+		client.httpClientIdentity,
+		client.timeout.String(),
+		strconv.FormatInt(client.maxTextBytes, 10),
+		strconv.FormatInt(client.maxRequestBytes, 10),
+		strconv.FormatInt(client.maxResponseBytes, 10),
+		strconv.Itoa(client.maxVectorDimensions),
+		strconv.FormatInt(client.errorSnippetBytes, 10),
+	)
+}
+
+func openAIEmbeddingCacheIdentity(client *openAIClient, spaceIdentity, credentialIdentity string) string {
+	return framedModelIdentity(
+		"openai-compatible-embedder-v1",
+		client.baseURL,
+		spaceIdentity,
 		client.organization,
 		client.project,
 		credentialIdentity,
@@ -320,7 +365,7 @@ func validateOpenAIConfig(cfg OpenAIConfig, needGeneration, needEmbedding bool) 
 	embeddingModel := strings.TrimSpace(cfg.EmbeddingModel)
 	organization := strings.TrimSpace(cfg.Organization)
 	project := strings.TrimSpace(cfg.Project)
-	if baseURL == "" || cfg.Credentials == nil ||
+	if baseURL == "" ||
 		(needGeneration && !validConfigValue(generationModel, maxModelBytes)) ||
 		(needEmbedding && !validConfigValue(embeddingModel, maxModelBytes)) ||
 		(organization != "" && !validHTTPHeaderValue(organization, maxOrganizationBytes)) ||
@@ -328,9 +373,15 @@ func validateOpenAIConfig(cfg OpenAIConfig, needGeneration, needEmbedding bool) 
 		return nil, &Error{Kind: ErrInvalidConfig, Operation: op}
 	}
 	u, err := url.Parse(baseURL)
-	if err != nil || !u.IsAbs() || u.Scheme != "https" || u.Hostname() == "" || u.User != nil ||
+	if err != nil || !u.IsAbs() || u.Hostname() == "" || u.User != nil ||
 		u.RawQuery != "" || u.ForceQuery || strings.Contains(baseURL, "#") ||
 		u.Fragment != "" || (u.Path != "" && u.Path != "/") {
+		return nil, &Error{Kind: ErrInvalidConfig, Operation: op}
+	}
+	if u.Scheme != "https" && !(u.Scheme == "http" && isLoopbackHost(u.Hostname())) {
+		return nil, &Error{Kind: ErrInvalidConfig, Operation: op}
+	}
+	if cfg.Credentials == nil && !(needEmbedding && !needGeneration && isLoopbackHost(u.Hostname())) {
 		return nil, &Error{Kind: ErrInvalidConfig, Operation: op}
 	}
 	if cfg.HTTPClient == nil {
@@ -363,6 +414,7 @@ func validateOpenAIConfig(cfg OpenAIConfig, needGeneration, needEmbedding bool) 
 		cfg.MaxRequestBytes < 1 || cfg.MaxRequestBytes > maxConfiguredRequestBytes ||
 		cfg.MaxResponseBytes < 1 || cfg.MaxResponseBytes > maxConfiguredResponseBytes ||
 		cfg.MaxVectorDimensions < 1 || cfg.MaxVectorDimensions > MaxVectorDimensions ||
+		cfg.EmbeddingDimensions < 0 || cfg.EmbeddingDimensions > cfg.MaxVectorDimensions ||
 		cfg.ErrorSnippetBytes < 1 || cfg.ErrorSnippetBytes > maxConfiguredSnippetBytes {
 		return nil, &Error{Kind: ErrInvalidConfig, Operation: op}
 	}
@@ -370,6 +422,7 @@ func validateOpenAIConfig(cfg OpenAIConfig, needGeneration, needEmbedding bool) 
 		baseURL:             strings.TrimSuffix(baseURL, "/"),
 		generationModel:     generationModel,
 		embeddingModel:      embeddingModel,
+		embeddingDimensions: cfg.EmbeddingDimensions,
 		organization:        organization,
 		project:             project,
 		credentials:         cfg.Credentials,
@@ -381,6 +434,13 @@ func validateOpenAIConfig(cfg OpenAIConfig, needGeneration, needEmbedding bool) 
 		maxVectorDimensions: cfg.MaxVectorDimensions,
 		errorSnippetBytes:   cfg.ErrorSnippetBytes,
 	}, nil
+}
+
+func openAICredentialCacheIdentity(credentials CredentialResolver) (string, bool, error) {
+	if credentials == nil {
+		return "none", true, nil
+	}
+	return configuredCacheIdentity(credentials)
 }
 
 func validConfigValue(value string, limit int) bool {
@@ -431,20 +491,23 @@ func (o *openAIClient) post(ctx context.Context, path, op string, payload, out i
 	callCtx, cancel := context.WithTimeout(ctx, o.timeout)
 	defer cancel()
 
-	resolved, err := o.credentials.ResolveCredential(callCtx)
-	if err != nil {
-		if ctx.Err() != nil || callCtx.Err() != nil {
-			return classifyTransportError(ctx, callCtx, op, err)
+	var credential []byte
+	if o.credentials != nil {
+		resolved, err := o.credentials.ResolveCredential(callCtx)
+		if err != nil {
+			if ctx.Err() != nil || callCtx.Err() != nil {
+				return classifyTransportError(ctx, callCtx, op, err)
+			}
+			return &Error{Kind: ErrCredential, Operation: op}
 		}
-		return &Error{Kind: ErrCredential, Operation: op}
-	}
-	if len(resolved) > maxCredentialBytes {
-		return &Error{Kind: ErrCredential, Operation: op}
-	}
-	credential := append([]byte(nil), resolved...)
-	defer clear(credential)
-	if !validCredential(credential) {
-		return &Error{Kind: ErrCredential, Operation: op}
+		if len(resolved) > maxCredentialBytes {
+			return &Error{Kind: ErrCredential, Operation: op}
+		}
+		credential = append([]byte(nil), resolved...)
+		defer clear(credential)
+		if !validCredential(credential) {
+			return &Error{Kind: ErrCredential, Operation: op}
+		}
 	}
 
 	request, err := http.NewRequestWithContext(callCtx, http.MethodPost, o.baseURL+path, bytes.NewReader(body))
@@ -452,7 +515,9 @@ func (o *openAIClient) post(ctx context.Context, path, op string, payload, out i
 		return &Error{Kind: ErrInvalidConfig, Operation: op}
 	}
 	request.Header.Set("Content-Type", "application/json")
-	request.Header.Set(authorizationHeaderName, "Bearer "+string(credential))
+	if credential != nil {
+		request.Header.Set(authorizationHeaderName, "Bearer "+string(credential))
+	}
 	if o.organization != "" {
 		request.Header.Set("OpenAI-Organization", o.organization)
 	}
@@ -545,6 +610,7 @@ func parseRetryAfter(value string, now time.Time) time.Duration {
 }
 
 var (
-	_ TextGenerator = (*OpenAIGenerator)(nil)
-	_ Embedder      = (*OpenAIEmbedder)(nil)
+	_ TextGenerator                  = (*OpenAIGenerator)(nil)
+	_ Embedder                       = (*OpenAIEmbedder)(nil)
+	_ EmbeddingSpaceIdentityProvider = (*OpenAIEmbedder)(nil)
 )

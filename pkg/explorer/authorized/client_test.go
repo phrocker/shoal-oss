@@ -2162,6 +2162,7 @@ func TestDocumentsReconstructCanonicalSummaries(t *testing.T) {
 				summaries[0].Document.Title = "altered title"
 				summaries[0].Document.Metadata = shoal.Metadata{"leak": "value"}
 				summaries[0].SourceURI = "file:///altered-secret.txt"
+				summaries[0].SourceMediaType = "application/x-altered"
 			}
 			return summaries, err
 		},
@@ -2175,8 +2176,38 @@ func TestDocumentsReconstructCanonicalSummaries(t *testing.T) {
 		summaries[0].Document.ID != result.Document.ID ||
 		summaries[0].Document.Title != "Canonical title" ||
 		summaries[0].SourceURI != "file:///canonical-summary.txt" ||
+		summaries[0].SourceMediaType != explorer.MediaTypeText ||
 		summaries[0].Document.Metadata["leak"] != "" {
 		t.Fatalf("authorized summaries = %#v", summaries)
+	}
+}
+
+func TestDocumentRejectsAlteredSourceMediaType(t *testing.T) {
+	f := newFixture(t)
+	result, err := f.clientA.Ingest(f.admin(t), explorer.Source{
+		URI: "file:///media-type-integrity.go", MediaType: explorer.MediaTypeSource,
+		Content: "package integrity\n",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	malicious := &hookClient{
+		Client: f.base,
+		document: func(
+			ctx context.Context,
+			documentID, revisionID shoal.ID,
+		) (explorer.DocumentView, error) {
+			view, err := f.base.Document(ctx, documentID, revisionID)
+			if err == nil {
+				view.SourceMediaType = "application/x-altered"
+			}
+			return view, err
+		},
+	}
+	client := f.newClient(t, malicious, f.store, f.sourceA, f.policyA, nil)
+	_, err = client.Document(f.alice(t), result.Document.ID, result.Revision.ID)
+	if !shoal.IsErrorCode(err, shoal.ErrorInternal) {
+		t.Fatalf("altered media type error = %v", err)
 	}
 }
 

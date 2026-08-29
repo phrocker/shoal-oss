@@ -89,6 +89,7 @@ func (h *Handler) routes() {
 		}
 		writeResponse(writer, http.StatusOK, metadata)
 	})
+	h.mux.HandleFunc("POST /api/v1/ingest", ingestEndpoint(h.service))
 	h.mux.HandleFunc("POST /api/v1/documents", endpoint(h.service.Documents))
 	h.mux.HandleFunc("POST /api/v1/document", endpoint(h.service.Document))
 	h.mux.HandleFunc("POST /api/v1/retrieve", endpoint(h.service.Retrieve))
@@ -110,7 +111,14 @@ func (h *Handler) routes() {
 func metadataFor(ctx context.Context, service Service) (MetadataResponse, error) {
 	provider, ok := service.(MetadataProvider)
 	if ok {
-		return provider.Metadata(ctx)
+		metadata, err := provider.Metadata(ctx)
+		if err != nil {
+			return MetadataResponse{}, err
+		}
+		if _, ok := service.(IngestProvider); !ok {
+			metadata.Capabilities.Ingest = false
+		}
+		return metadata, nil
 	}
 	capabilities, err := capabilitiesFor(ctx, service)
 	if err != nil {
@@ -119,8 +127,9 @@ func metadataFor(ctx context.Context, service Service) (MetadataResponse, error)
 	return MetadataResponse{
 		MaxPageSize: MaxPageSize, MaxTopK: MaxTopK, MaxDepth: MaxDepth,
 		MaxFanout: MaxFanout, MaxNodes: MaxNodes, MaxEdgeTypes: MaxEdgeTypes,
-		MaxResponseBytes: MaxResponseBytes,
-		Capabilities:     capabilities,
+		MaxResponseBytes: MaxResponseBytes, MaxUploadFiles: MaxUploadFiles,
+		MaxUploadFileBytes: MaxUploadFileBytes, MaxUploadTotalBytes: MaxUploadTotalBytes,
+		Capabilities: capabilities,
 	}, nil
 }
 
@@ -128,10 +137,19 @@ func capabilitiesFor(ctx context.Context, service Service) (Capabilities, error)
 	provider, ok := service.(CapabilityProvider)
 	if !ok {
 		capabilities := AllCapabilities()
-		capabilities.Vector = false
+		if _, ok := service.(IngestProvider); !ok {
+			capabilities.Ingest = false
+		}
 		return capabilities, nil
 	}
-	return provider.Capabilities(ctx)
+	capabilities, err := provider.Capabilities(ctx)
+	if err != nil {
+		return Capabilities{}, err
+	}
+	if _, ok := service.(IngestProvider); !ok {
+		capabilities.Ingest = false
+	}
+	return capabilities, nil
 }
 
 func endpoint[Request any, Response any](

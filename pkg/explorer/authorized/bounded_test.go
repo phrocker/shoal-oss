@@ -162,6 +162,105 @@ func TestBoundedNeighborhoodPagesPastHiddenEdges(t *testing.T) {
 	}
 }
 
+func TestVerifyDocumentViewRegistrationAcceptsLegacyDigest(t *testing.T) {
+	now := time.Date(2026, time.August, 29, 12, 0, 0, 0, time.UTC)
+	view := explorer.DocumentView{
+		Document: document.Document{
+			ID: "legacy-doc", RevisionID: "legacy-revision", Title: "Legacy",
+			RootSectionID: "legacy-root",
+		},
+		Revision: document.Revision{
+			ID: "legacy-revision", DocumentID: "legacy-doc", CreatedAt: now,
+		},
+		SourceURI:       "file:///legacy.txt",
+		SourceMediaType: explorer.MediaTypeText,
+		Root: explorer.SectionView{Section: document.Section{
+			ID: "legacy-root", DocumentID: "legacy-doc", RevisionID: "legacy-revision",
+			Heading: "Legacy",
+		}},
+	}
+	legacyDigest, err := legacyDocumentViewDigestV1(view)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy, err := verifyDocumentViewRegistrationMode(view, RevisionRegistration{
+		DocumentID: "legacy-doc", RevisionID: "legacy-revision",
+		NodeIDs: []shoal.ID{"legacy-doc", "legacy-root"}, ContentDigest: legacyDigest,
+	})
+	if err != nil {
+		t.Fatalf("legacy digest verification = %v", err)
+	}
+	if !legacy {
+		t.Fatal("legacy digest was not reported")
+	}
+	policy, err := auth.NewPolicy(auth.PolicyConfig{
+		AuthorizationDomain: []byte("domain"),
+		SourceID:            []byte("source"),
+		GrantPolicyID:       []byte("policy"),
+		Epoch:               1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rule, err := NewAccessRule(policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := NewMemoryPolicyStore()
+	if err := store.PutRevision(context.Background(), RevisionRegistration{
+		DocumentID: "legacy-doc", RevisionID: "legacy-revision",
+		NodeIDs: []shoal.ID{"legacy-doc", "legacy-root"}, ContentDigest: legacyDigest,
+		Rule: rule, Current: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	selector, err := NewStaticPolicySelector([]byte("source"), []byte("policy"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	decision, err := auth.NewDecision(auth.DecisionConfig{
+		Subject:               "subject",
+		Actor:                 "actor",
+		AuthorizationDomain:   []byte("domain"),
+		AllowedOperations:     []auth.Operation{auth.OperationList, auth.OperationRead},
+		PermittedSourceIDs:    [][]byte{[]byte("source")},
+		PermittedPolicyIDs:    [][]byte{[]byte("policy")},
+		PolicyGeneration:      1,
+		AuthenticationExpires: now.Add(time.Hour),
+		RequestID:             "request",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := NewClient(Config{
+		Base:           &pagedBoundedBase{view: view},
+		Resolver:       resolverFunc(func(context.Context) (auth.Decision, error) { return decision, nil }),
+		PolicySelector: selector,
+		PolicyStore:    store,
+		GenerationReader: generationReaderFunc(func(context.Context, []byte) (int64, error) {
+			return 1, nil
+		}),
+		Clock: func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := client.Document(context.Background(), "legacy-doc", "legacy-revision")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.SourceMediaType != "" {
+		t.Fatalf("legacy document exposed unauthenticated media type %q", got.SourceMediaType)
+	}
+	summaries, err := client.Documents(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(summaries) != 1 || summaries[0].SourceMediaType != "" {
+		t.Fatalf("legacy summary exposed unauthenticated media type: %+v", summaries)
+	}
+}
+
 func TestBoundedNeighborhoodFailsClosedWhenAuthorizedScanLimitExhausts(t *testing.T) {
 	ctx := context.Background()
 	client, base := authorizedPaginationClient(t, true)

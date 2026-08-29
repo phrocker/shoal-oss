@@ -67,13 +67,19 @@ func (c *Client) Documents(
 		if err != nil {
 			return nil, directBaseError(err)
 		}
-		if err := verifyDocumentViewRegistration(view, registration); err != nil {
+		legacyDigest, err := verifyDocumentViewRegistrationMode(view, registration)
+		if err != nil {
 			return nil, err
 		}
+		sourceMediaType := view.SourceMediaType
+		if legacyDigest {
+			sourceMediaType = ""
+		}
 		visible = append(visible, explorer.DocumentSummary{
-			Document:  cloneDocument(view.Document),
-			Revision:  cloneRevision(view.Revision),
-			SourceURI: view.SourceURI,
+			Document:        cloneDocument(view.Document),
+			Revision:        cloneRevision(view.Revision),
+			SourceURI:       view.SourceURI,
+			SourceMediaType: sourceMediaType,
 		})
 	}
 	if err := guard.Check(ctx); err != nil {
@@ -137,10 +143,14 @@ func (c *Client) Document(
 		view.Revision.DocumentID != documentID {
 		return explorer.DocumentView{}, inconsistentBase()
 	}
-	if err := verifyDocumentViewRegistration(view, registration); err != nil {
+	legacyDigest, err := verifyDocumentViewRegistrationMode(view, registration)
+	if err != nil {
 		return explorer.DocumentView{}, err
 	}
 	cloned := cloneDocumentView(view)
+	if legacyDigest {
+		cloned.SourceMediaType = ""
+	}
 	if err := guard.Check(ctx); err != nil {
 		return explorer.DocumentView{}, err
 	}
@@ -165,20 +175,36 @@ func verifyDocumentViewRegistration(
 	view explorer.DocumentView,
 	registration RevisionRegistration,
 ) error {
+	_, err := verifyDocumentViewRegistrationMode(view, registration)
+	return err
+}
+
+func verifyDocumentViewRegistrationMode(
+	view explorer.DocumentView,
+	registration RevisionRegistration,
+) (bool, error) {
+	legacyDigest := false
 	digest, err := documentViewDigest(view)
-	if err != nil || digest != registration.ContentDigest {
-		return inconsistentBase()
+	if err != nil {
+		return false, inconsistentBase()
+	}
+	if digest != registration.ContentDigest {
+		legacy, legacyErr := legacyDocumentViewDigestV1(view)
+		if legacyErr != nil || legacy != registration.ContentDigest {
+			return false, inconsistentBase()
+		}
+		legacyDigest = true
 	}
 	nodeIDs, err := documentViewNodeIDs(view)
 	if err != nil || len(nodeIDs) != len(registration.NodeIDs) {
-		return inconsistentBase()
+		return false, inconsistentBase()
 	}
 	for index := range nodeIDs {
 		if nodeIDs[index] != registration.NodeIDs[index] {
-			return inconsistentBase()
+			return false, inconsistentBase()
 		}
 	}
-	return nil
+	return legacyDigest, nil
 }
 
 func ruleAllows(
