@@ -48,4 +48,6 @@ The same package exposes a fixture evaluation harness:
   regression checks.
 
 The fixture evaluation uses the deterministic fake provider in tests and
-requires no network access or credentials.
+requires no network access or credentials. For historical fixture timestamps,
+configure the generator with `SetClock` before calling `Evaluate` so
+authorization freshness is evaluated against the same deterministic clock.

@@ -619,6 +619,19 @@ func NewCachedGenerator(runner Runner, tools ToolHost, budgets Budgets, provenan
 	return g, nil
 }
 
+// SetClock configures the generator clock. Callers that need reproducible
+// fixture evaluation can set this before the generator is used.
+func (g *Generator) SetClock(now func() time.Time) error {
+	if g == nil {
+		return invalid("generator is required")
+	}
+	if now == nil {
+		return invalid("clock is required")
+	}
+	g.now = now
+	return nil
+}
+
 func (g *Generator) Generate(ctx context.Context, pack inference.ContextPack) (inference.InferenceResult, error) {
 	record, err := g.Run(ctx, pack)
 	return record.Result, err
@@ -679,6 +692,13 @@ func (g *Generator) Run(ctx context.Context, pack inference.ContextPack) (Record
 							err := invalid("authorization pin expired during cache recording")
 							return earlyFinish(StopReasonInvalid, "authorization", err)
 						}
+					}
+					if err := runCtx.Err(); err != nil {
+						return earlyFinish(stopReasonFor(err), "cache", err)
+					}
+					if !g.now().Before(pack.Authorization().ExpiresAt()) {
+						err := invalid("authorization pin expired before cache return")
+						return earlyFinish(StopReasonInvalid, "authorization", err)
 					}
 					return cloneRecord(cached), nil
 				}

@@ -192,6 +192,33 @@ func TestMemoryCacheEvictionAndEntryBounds(t *testing.T) {
 	}
 }
 
+func TestCacheHitRechecksAuthorizationBeforeReturn(t *testing.T) {
+	cache, err := NewMemoryCache(MemoryCacheConfig{MaxEntries: 4, MaxBytes: 1 << 20, MaxEntryBytes: 1 << 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pack, _, _ := fixture(t)
+	runner := &countingStopRunner{}
+	g := cachedGenerator(t, runner, pack, budgets(), nil, cache)
+	if _, err := g.Generate(context.Background(), pack); err != nil {
+		t.Fatal(err)
+	}
+	calls := 0
+	g.now = func() time.Time {
+		calls++
+		if calls >= 4 {
+			return pack.Authorization().ExpiresAt()
+		}
+		return fixedTime
+	}
+	if _, err := g.Run(context.Background(), pack); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("cache hit after authorization expiry error = %v", err)
+	}
+	if runner.starts != 1 {
+		t.Fatalf("cache hit should not restart runner; starts=%d", runner.starts)
+	}
+}
+
 func TestCacheKeyRejectsUnsetIdentity(t *testing.T) {
 	if err := (CacheKey{}).Validate(); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("unset key error = %v", err)

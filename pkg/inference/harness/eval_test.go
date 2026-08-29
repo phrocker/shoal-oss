@@ -272,7 +272,9 @@ func evalGenerator(t *testing.T, runner Runner, now time.Time, provenance Proven
 	if err != nil {
 		t.Fatal(err)
 	}
-	g.now = func() time.Time { return now }
+	if err := g.SetClock(func() time.Time { return now }); err != nil {
+		t.Fatal(err)
+	}
 	return g
 }
 
