@@ -134,6 +134,34 @@ func TestEvaluationDetectsNegativeCases(t *testing.T) {
 		}
 	})
 
+	t.Run("unresolved stale citation", func(t *testing.T) {
+		stale := append([]EvaluationCase(nil), base...)
+		stale[0].Sources = map[DocumentRevision]string{
+			DocumentRevision{DocumentID: "aster-relay-protocol", RevisionID: "r2"}: "fixture contents changed",
+		}
+		g := scriptedEvaluationGenerator(t, now, func(_ context.Context, tr Transcript) (Action, error) {
+			issue, err := inference.NewIssue(
+				inference.IssueUnresolved, "input", "needs more evidence",
+				[]shoal.ID{tr.Context().Evidence()[0].ID()},
+			)
+			if err != nil {
+				return Action{}, err
+			}
+			result, err := inference.NewInferenceResult(tr.Context(), nil, []inference.Issue{issue}, now, nil)
+			if err != nil {
+				return Action{}, err
+			}
+			return NewStopAction("stop", result, Usage{})
+		})
+		report, err := Evaluate(context.Background(), g, stale, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if report.Summary.InvalidCitationRefs != 1 {
+			t.Fatalf("unresolved stale citation was not detected: %#v", report.Summary)
+		}
+	})
+
 	t.Run("invalid graph path", func(t *testing.T) {
 		graphCase := []EvaluationCase{cases[2]}
 		graphCase[0].GraphPaths = map[shoal.ID]graph.Path{}

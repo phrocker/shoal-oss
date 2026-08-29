@@ -204,28 +204,40 @@ func evaluateRecord(tc EvaluationCase, record Record, runErr error) EvaluationCa
 	unsupported := record.Result.Unsupported()
 	out.UnsupportedIssues = len(unsupported)
 	for _, issue := range unsupported {
-		for _, evidenceID := range issue.EvidenceIDs() {
-			anchor, found := available[evidenceID]
-			if !found {
-				out.InvalidEvidenceRefs++
-				continue
+		validateIssueEvidenceReferences(issue, available, tc, &out)
+	}
+	for _, issue := range record.Result.Unresolved() {
+		validateIssueEvidenceReferences(issue, available, tc, &out)
+	}
+	return out
+}
+
+func validateIssueEvidenceReferences(
+	issue inference.Issue,
+	available map[shoal.ID]inference.EvidenceAnchor,
+	tc EvaluationCase,
+	out *EvaluationCaseReport,
+) {
+	for _, evidenceID := range issue.EvidenceIDs() {
+		anchor, found := available[evidenceID]
+		if !found {
+			out.InvalidEvidenceRefs++
+			continue
+		}
+		out.ValidEvidenceReferences++
+		if citation, quote, cited := anchor.Document(); cited {
+			out.CitationReferences++
+			if err := validateFixtureCitation(citation, quote, tc.Sources); err != nil {
+				out.InvalidCitationRefs++
 			}
-			out.ValidEvidenceReferences++
-			if citation, quote, cited := anchor.Document(); cited {
-				out.CitationReferences++
-				if err := validateFixtureCitation(citation, quote, tc.Sources); err != nil {
-					out.InvalidCitationRefs++
-				}
-			}
-			if path, cited := anchor.Path(); cited {
-				out.GraphPathReferences++
-				if err := validateFixtureGraphPath(anchor.ID(), path, tc.GraphPaths); err != nil {
-					out.InvalidGraphPathRefs++
-				}
+		}
+		if path, cited := anchor.Path(); cited {
+			out.GraphPathReferences++
+			if err := validateFixtureGraphPath(anchor.ID(), path, tc.GraphPaths); err != nil {
+				out.InvalidGraphPathRefs++
 			}
 		}
 	}
-	return out
 }
 
 func validateFixtureGraphPath(anchorID shoal.ID, path graph.Path, expected map[shoal.ID]graph.Path) error {
