@@ -466,6 +466,10 @@ func unsafeResultForCache(result inference.InferenceResult) bool {
 		if unsafeCacheText(string(claim.Subject())) || unsafeCacheText(string(claim.Predicate())) {
 			return true
 		}
+		if unsafeModelProvenanceForCache(claim.ModelProvenance()) ||
+			unsafePromptProvenanceForCache(claim.PromptProvenance()) {
+			return true
+		}
 		if unsafeOntologyValueForCache(claim.Object()) {
 			return true
 		}
@@ -481,6 +485,24 @@ func unsafeResultForCache(result inference.InferenceResult) bool {
 		}
 	}
 	return false
+}
+
+func unsafeModelProvenanceForCache(model inference.ModelProvenance) bool {
+	if unsafeCacheText(model.Provider()) || unsafeCacheText(model.Model()) ||
+		unsafeCacheText(model.Version()) {
+		return true
+	}
+	for key, value := range model.Parameters() {
+		if unsafeCacheText(key) || unsafeCacheText(value) {
+			return true
+		}
+	}
+	return false
+}
+
+func unsafePromptProvenanceForCache(prompt inference.PromptProvenance) bool {
+	return unsafeCacheText(prompt.TemplateID()) || unsafeCacheText(prompt.Version()) ||
+		unsafeCacheText(prompt.Hash())
 }
 
 func unsafeActionForCache(action Action) bool {
@@ -649,6 +671,8 @@ func resultCacheBytes(result inference.InferenceResult) int {
 	}
 	for _, claim := range result.Claims() {
 		total += len(claim.ID()) + len(claim.Subject()) + len(claim.Predicate()) + 64
+		total += modelProvenanceCacheBytes(claim.ModelProvenance())
+		total += promptProvenanceCacheBytes(claim.PromptProvenance())
 		total += ontologyValueCacheBytes(claim.Object())
 		for _, id := range claim.EvidenceIDs() {
 			total += len(id)
@@ -664,6 +688,18 @@ func resultCacheBytes(result inference.InferenceResult) int {
 		}
 	}
 	return total
+}
+
+func modelProvenanceCacheBytes(model inference.ModelProvenance) int {
+	total := len(model.Provider()) + len(model.Model()) + len(model.Version()) + 16
+	for key, value := range model.Parameters() {
+		total += len(key) + len(value)
+	}
+	return total
+}
+
+func promptProvenanceCacheBytes(prompt inference.PromptProvenance) int {
+	return len(prompt.TemplateID()) + len(prompt.Version()) + len(prompt.Hash())
 }
 
 func ontologyValueCacheBytes(value ontology.Value) int {

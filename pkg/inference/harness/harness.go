@@ -648,15 +648,28 @@ func (g *Generator) Run(ctx context.Context, pack inference.ContextPack) (Record
 		err := invalid("authorization pin is stale")
 		return earlyFinish(StopReasonInvalid, "authorization", err)
 	}
+	maxElapsed := g.budgets.MaxElapsed
+	if remainingAuth < maxElapsed {
+		maxElapsed = remainingAuth
+	}
+	runCtx, cancel := context.WithTimeout(ctx, maxElapsed)
+	defer cancel()
 	cacheKey, cacheable := CacheKey{}, false
 	if g.cache != nil {
 		runtimeIdentity, identityErr := runtimeCacheIdentity(g.runner, g.tools)
 		key, err := cacheKeyForRequest(request, runtimeIdentity)
 		if identityErr == nil && err == nil {
-			if cached, ok, err := g.cache.Get(ctx, key); err == nil && ok {
+			if cached, ok, err := g.cache.Get(runCtx, key); err == nil && ok {
+				if err := runCtx.Err(); err != nil {
+					return earlyFinish(stopReasonFor(err), "cache", err)
+				}
+				if !g.now().Before(pack.Authorization().ExpiresAt()) {
+					err := invalid("authorization pin expired during cache lookup")
+					return earlyFinish(StopReasonInvalid, "authorization", err)
+				}
 				if err := validateCachedRecord(cached, request, pack); err == nil {
 					if g.recorder != nil {
-						if err := g.recorder.Record(ctx, evaluationRecord(cached)); err != nil {
+						if err := g.recorder.Record(runCtx, evaluationRecord(cached)); err != nil {
 							return earlyFinish(stopReasonFor(err), "recorder", err)
 						}
 					}
@@ -666,12 +679,6 @@ func (g *Generator) Run(ctx context.Context, pack inference.ContextPack) (Record
 			cacheKey, cacheable = key, true
 		}
 	}
-	maxElapsed := g.budgets.MaxElapsed
-	if remainingAuth < maxElapsed {
-		maxElapsed = remainingAuth
-	}
-	runCtx, cancel := context.WithTimeout(ctx, maxElapsed)
-	defer cancel()
 	session, err := g.runner.Start(runCtx, request)
 	if err != nil {
 		if runCtx.Err() != nil {

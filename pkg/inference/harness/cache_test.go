@@ -127,6 +127,19 @@ func TestCacheRejectsUnsafeSecretMaterial(t *testing.T) {
 	if strings.Contains(encoded, "super-secret-token") {
 		t.Fatal("secret material entered cache storage")
 	}
+
+	cache, _ = NewMemoryCache(MemoryCacheConfig{MaxEntries: 4, MaxBytes: 1 << 20, MaxEntryBytes: 1 << 20})
+	secretRunner := &secretActionRunner{}
+	g = cachedGenerator(t, secretRunner, pack, budgets(), nil, cache)
+	if _, err := g.Generate(context.Background(), pack); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := g.Generate(context.Background(), pack); err != nil {
+		t.Fatal(err)
+	}
+	if secretRunner.starts != 2 || cache.Len() != 0 {
+		t.Fatalf("secret action/result material was cached; starts=%d entries=%d", secretRunner.starts, cache.Len())
+	}
 }
 
 func TestMemoryCacheEvictionAndEntryBounds(t *testing.T) {
@@ -195,6 +208,52 @@ func (f *fakeTools) CacheIdentity() (string, error) {
 
 type countingStopSession struct {
 	request SessionRequest
+}
+
+type secretActionRunner struct{ starts int }
+
+func (r *secretActionRunner) Start(context.Context, SessionRequest) (Session, error) {
+	r.starts++
+	return &secretActionSession{request: r.starts}, nil
+}
+
+func (r *secretActionRunner) CacheIdentity() (string, error) { return "secret-action-runner-v1", nil }
+
+type secretActionSession struct {
+	request int
+	step    int
+}
+
+func (s *secretActionSession) Next(_ context.Context, transcript Transcript) (Action, error) {
+	s.step++
+	if s.step == 1 {
+		request, err := NewRetrieveRequest("client_secret=redacted", 1)
+		if err != nil {
+			return Action{}, err
+		}
+		return NewRetrieveAction("secret-retrieve", request, Usage{})
+	}
+	value, _ := ontology.NewStringValue("secret generated value")
+	model, err := inference.NewModelProvenance("fake-provider", "fake-model", "v1", nil, nil)
+	if err != nil {
+		return Action{}, err
+	}
+	prompt, err := inference.NewPromptProvenance("agent", "v1", "sha256:"+strings.Repeat("a", 64))
+	if err != nil {
+		return Action{}, err
+	}
+	claim, err := inference.NewClaim(
+		"subject", "predicate", value, 1, []shoal.ID{transcript.Context().Evidence()[0].ID()},
+		inference.ClaimInferred, model, prompt, nil,
+	)
+	if err != nil {
+		return Action{}, err
+	}
+	result, err := inference.NewInferenceResult(transcript.Context(), []inference.Claim{claim}, nil, fixedTime, nil)
+	if err != nil {
+		return Action{}, err
+	}
+	return NewStopAction("secret-stop", result, Usage{})
 }
 
 func (s countingStopSession) Next(_ context.Context, transcript Transcript) (Action, error) {

@@ -33,6 +33,7 @@ import (
 	"time"
 
 	"github.com/phrocker/shoal-oss/pkg/document"
+	"github.com/phrocker/shoal-oss/pkg/graph"
 	"github.com/phrocker/shoal-oss/pkg/inference"
 	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
@@ -45,6 +46,7 @@ type EvaluationCase struct {
 	Pack           inference.ContextPack
 	ExpectedClaims []ExpectedClaim
 	Sources        map[DocumentRevision]string
+	GraphPaths     map[shoal.ID]graph.Path
 }
 
 type ExpectedClaim struct {
@@ -79,6 +81,8 @@ type EvaluationCaseReport struct {
 	UnsupportedIssues       int         `json:"unsupported_issues"`
 	CitationReferences      int         `json:"citation_references"`
 	InvalidCitationRefs     int         `json:"invalid_citation_references"`
+	GraphPathReferences     int         `json:"graph_path_references"`
+	InvalidGraphPathRefs    int         `json:"invalid_graph_path_references"`
 	ValidEvidenceReferences int         `json:"valid_evidence_references"`
 	InvalidEvidenceRefs     int         `json:"invalid_evidence_references"`
 	Error                   string      `json:"error,omitempty"`
@@ -93,6 +97,8 @@ type EvaluationSummary struct {
 	UnsupportedOutcomeRate  float64            `json:"unsupported_outcome_rate"`
 	CitationReferenceCount  int                `json:"citation_reference_count"`
 	InvalidCitationRefs     int                `json:"invalid_citation_references"`
+	GraphPathReferenceCount int                `json:"graph_path_reference_count"`
+	InvalidGraphPathRefs    int                `json:"invalid_graph_path_references"`
 	ValidEvidenceReferences int                `json:"valid_evidence_references"`
 	InvalidEvidenceRefs     int                `json:"invalid_evidence_references"`
 	TotalBudget             BudgetUsage        `json:"total_budget"`
@@ -124,6 +130,8 @@ func Evaluate(ctx context.Context, generator *Generator, cases []EvaluationCase,
 		report.Summary.UnsupportedIssueCount += caseReport.UnsupportedIssues
 		report.Summary.CitationReferenceCount += caseReport.CitationReferences
 		report.Summary.InvalidCitationRefs += caseReport.InvalidCitationRefs
+		report.Summary.GraphPathReferenceCount += caseReport.GraphPathReferences
+		report.Summary.InvalidGraphPathRefs += caseReport.InvalidGraphPathRefs
 		report.Summary.ValidEvidenceReferences += caseReport.ValidEvidenceReferences
 		report.Summary.InvalidEvidenceRefs += caseReport.InvalidEvidenceRefs
 		report.Summary.TotalBudget = addBudgetUsage(report.Summary.TotalBudget, caseReport.Budget)
@@ -179,13 +187,49 @@ func evaluateRecord(tc EvaluationCase, record Record, runErr error) EvaluationCa
 					ok = false
 				}
 			}
+			if path, cited := anchor.Path(); cited {
+				out.GraphPathReferences++
+				if err := validateFixtureGraphPath(anchor.ID(), path, tc.GraphPaths); err != nil {
+					out.InvalidGraphPathRefs++
+					ok = false
+				}
+			}
 		}
+
 		if ok {
 			out.SupportedClaims++
 		}
 	}
 	out.UnsupportedIssues = len(record.Result.Unsupported())
 	return out
+}
+
+func validateFixtureGraphPath(anchorID shoal.ID, path graph.Path, expected map[shoal.ID]graph.Path) error {
+	if err := path.Validate(); err != nil {
+		return err
+	}
+	want, ok := expected[anchorID]
+	if !ok {
+		return invalid("graph evidence path is absent from fixture case")
+	}
+	if len(path.Nodes) != len(want.Nodes) || len(path.Edges) != len(want.Edges) {
+		return invalid("graph evidence path does not match fixture oracle")
+	}
+	for i := range path.Nodes {
+		if path.Nodes[i].ID != want.Nodes[i].ID ||
+			path.Nodes[i].Kind != want.Nodes[i].Kind {
+			return invalid("graph evidence path node does not match fixture oracle")
+		}
+	}
+	for i := range path.Edges {
+		if path.Edges[i].ID != want.Edges[i].ID ||
+			path.Edges[i].From != want.Edges[i].From ||
+			path.Edges[i].To != want.Edges[i].To ||
+			path.Edges[i].Type != want.Edges[i].Type {
+			return invalid("graph evidence path edge does not match fixture oracle")
+		}
+	}
+	return nil
 }
 
 func claimMatchesExpected(claim inference.Claim, expected []ExpectedClaim) bool {
@@ -422,5 +466,42 @@ func LoadFixtureEvaluationCases(root string, generatedAt time.Time) ([]Evaluatio
 			},
 		})
 	}
+	graphPath := graph.Path{
+		Nodes: []graph.Node{
+			{ID: "node:violet-gate", Kind: "component"},
+			{ID: "node:celadon-hub", Kind: "component"},
+		},
+		Edges: []graph.Edge{{
+			ID: "edge:violet-routes-celadon", From: "node:violet-gate",
+			To: "node:celadon-hub", Type: "routes_to", Weight: 1,
+		}},
+	}
+	graphAnchor, err := inference.NewGraphAnchor(graphPath)
+	if err != nil {
+		return nil, err
+	}
+	value, err := ontology.NewStringValue("grounded")
+	if err != nil {
+		return nil, err
+	}
+	graphPack, err := inference.NewContextPack(
+		"Which component routes to Celadon Hub?",
+		[]inference.EvidenceAnchor{graphAnchor}, nil,
+		snapshot, auth, shoal.Metadata{"fixture": "explorer-eval"},
+	)
+	if err != nil {
+		return nil, err
+	}
+	cases = append(cases, EvaluationCase{
+		ID:   "q-grounded-graph-path",
+		Pack: graphPack,
+		ExpectedClaims: []ExpectedClaim{{
+			Subject:     "entity:fake",
+			Predicate:   "predicate:summary",
+			Object:      value,
+			EvidenceIDs: []shoal.ID{graphAnchor.ID()},
+		}},
+		GraphPaths: map[shoal.ID]graph.Path{graphAnchor.ID(): graphPath},
+	})
 	return cases, nil
 }

@@ -26,6 +26,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/phrocker/shoal-oss/pkg/graph"
 	"github.com/phrocker/shoal-oss/pkg/inference"
 	lowmodel "github.com/phrocker/shoal-oss/pkg/model"
 	"github.com/phrocker/shoal-oss/pkg/ontology"
@@ -58,20 +59,29 @@ func TestDeterministicFixtureEvaluationReport(t *testing.T) {
 	if string(firstJSON) != string(secondJSON) {
 		t.Fatalf("evaluation output is nondeterministic\nfirst:\n%s\nsecond:\n%s", firstJSON, secondJSON)
 	}
-	if first.Summary.CaseCount != 2 ||
-		first.Summary.ClaimCount != 2 ||
-		first.Summary.SupportedClaimCount != 2 ||
+	if first.Summary.CaseCount != 3 ||
+		first.Summary.ClaimCount != 3 ||
+		first.Summary.SupportedClaimCount != 3 ||
 		first.Summary.GroundingSupportRate != 1 ||
 		first.Summary.InvalidCitationRefs != 0 ||
-		first.Summary.StopReasons[StopReasonStop] != 2 {
+		first.Summary.InvalidGraphPathRefs != 0 ||
+		first.Summary.CitationReferenceCount != 2 ||
+		first.Summary.GraphPathReferenceCount != 1 ||
+		first.Summary.StopReasons[StopReasonStop] != 3 {
 		t.Fatalf("unexpected metrics: %#v", first.Summary)
 	}
+	citationRefs, graphRefs := 0, 0
 	for _, report := range first.Cases {
 		if report.Iterations != 2 || report.Budget.ModelCalls != 2 ||
-			report.ValidEvidenceReferences != 1 || report.CitationReferences != 1 ||
+			report.ValidEvidenceReferences != 1 ||
 			report.TraceDigest == "" {
 			t.Fatalf("case metrics not defensible: %#v", report)
 		}
+		citationRefs += report.CitationReferences
+		graphRefs += report.GraphPathReferences
+	}
+	if citationRefs != 2 || graphRefs != 1 {
+		t.Fatalf("unexpected citation/path coverage: citations=%d graph=%d", citationRefs, graphRefs)
 	}
 }
 
@@ -121,6 +131,18 @@ func TestEvaluationDetectsNegativeCases(t *testing.T) {
 		}
 		if report.Summary.InvalidCitationRefs != 1 {
 			t.Fatalf("stale citation was not detected: %#v", report.Summary)
+		}
+	})
+
+	t.Run("invalid graph path", func(t *testing.T) {
+		graphCase := cases[2:3]
+		graphCase[0].GraphPaths = map[shoal.ID]graph.Path{}
+		report, err := runFixtureEvaluation(t, graphCase, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if report.Summary.InvalidGraphPathRefs != 1 {
+			t.Fatalf("invalid graph path was not detected: %#v", report.Summary)
 		}
 	})
 

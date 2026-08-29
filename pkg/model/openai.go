@@ -70,6 +70,9 @@ type openAIClient struct {
 	project             string
 	credentials         CredentialResolver
 	httpClient          *http.Client
+	httpClientIdentity  string
+	credentialIdentity  string
+	cacheIdentityUnsafe bool
 	timeout             time.Duration
 	maxTextBytes        int64
 	maxRequestBytes     int64
@@ -87,18 +90,40 @@ type OpenAIEmbedder struct {
 }
 
 func NewOpenAIGenerator(cfg OpenAIConfig) (*OpenAIGenerator, error) {
+	httpIdentity, httpCacheable, err := httpClientCacheIdentity(cfg.HTTPClient)
+	if err != nil {
+		return nil, err
+	}
+	credentialIdentity, credentialCacheable, err := configuredCacheIdentity(cfg.Credentials)
+	if err != nil {
+		return nil, err
+	}
 	client, err := validateOpenAIConfig(cfg, true, false)
 	if err != nil {
 		return nil, err
 	}
+	client.httpClientIdentity = httpIdentity
+	client.credentialIdentity = credentialIdentity
+	client.cacheIdentityUnsafe = !httpCacheable || !credentialCacheable
 	return &OpenAIGenerator{client: client}, nil
 }
 
 func NewOpenAIEmbedder(cfg OpenAIConfig) (*OpenAIEmbedder, error) {
+	httpIdentity, httpCacheable, err := httpClientCacheIdentity(cfg.HTTPClient)
+	if err != nil {
+		return nil, err
+	}
+	credentialIdentity, credentialCacheable, err := configuredCacheIdentity(cfg.Credentials)
+	if err != nil {
+		return nil, err
+	}
 	client, err := validateOpenAIConfig(cfg, false, true)
 	if err != nil {
 		return nil, err
 	}
+	client.httpClientIdentity = httpIdentity
+	client.credentialIdentity = credentialIdentity
+	client.cacheIdentityUnsafe = !httpCacheable || !credentialCacheable
 	return &OpenAIEmbedder{client: client}, nil
 }
 
@@ -106,11 +131,17 @@ func (o *OpenAIGenerator) CacheIdentity() (string, error) {
 	if o == nil || o.client == nil {
 		return "", ErrInvalidConfig
 	}
+	if o.client.cacheIdentityUnsafe {
+		return "", ErrInvalidConfig
+	}
 	return openAICacheIdentity("openai-compatible-generator-v1", o.client, o.client.generationModel), nil
 }
 
 func (o *OpenAIEmbedder) CacheIdentity() (string, error) {
 	if o == nil || o.client == nil {
+		return "", ErrInvalidConfig
+	}
+	if o.client.cacheIdentityUnsafe {
 		return "", ErrInvalidConfig
 	}
 	return openAICacheIdentity("openai-compatible-embedder-v1", o.client, o.client.embeddingModel), nil
@@ -228,6 +259,8 @@ func openAICacheIdentity(kind string, client *openAIClient, model string) string
 		model,
 		client.organization,
 		client.project,
+		client.credentialIdentity,
+		client.httpClientIdentity,
 		client.timeout.String(),
 		strconv.FormatInt(client.maxTextBytes, 10),
 		strconv.FormatInt(client.maxRequestBytes, 10),

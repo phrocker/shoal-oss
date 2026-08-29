@@ -145,6 +145,18 @@ type FakeEmbedder struct {
 	Model      string
 }
 
+func (f FakeEmbedder) CacheIdentity() (string, error) {
+	name := strings.TrimSpace(f.Model)
+	if name == "" {
+		name = "deterministic"
+	}
+	dim := f.Dimensions
+	if dim == 0 {
+		dim = DefaultFakeDimensions
+	}
+	return "model-fake-embedder-v1:" + name + ":" + strconv.Itoa(dim), nil
+}
+
 func (f FakeEmbedder) Embed(ctx context.Context, req EmbedRequest) (EmbedResult, error) {
 	if err := ctx.Err(); err != nil {
 		return EmbedResult{}, contextError("fake embed", err)
