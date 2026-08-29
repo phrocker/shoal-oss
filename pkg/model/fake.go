@@ -86,7 +86,7 @@ func (f FakeGenerator) generateHarnessAction(req GenerateRequest) (GenerateResul
 				},
 			}, nil
 		}
-		evidenceID := firstHarnessEvidenceID(req.Prompt)
+		evidenceID := fakeHarnessEvidenceID(req.Prompt)
 		if evidenceID == "" {
 			text = `{"action":"stop","correlation_id":"` + fakeProtocolID("fake-stop") + `","unsupported":[{"input":"final claim","reason":"no evidence anchor was visible","evidence_ids":[]}]}`
 		} else {
@@ -133,6 +133,50 @@ func fakeHarnessUnsupportedReason(prompt string) string {
 	if strings.Contains(query, "amber lag runbook action depends") ||
 		strings.Contains(query, "fetch the amber lag runbook") {
 		return "fixture authorization oracle has no public supporting evidence"
+	}
+	return ""
+}
+
+func fakeHarnessEvidenceID(prompt string) string {
+	var envelope struct {
+		Query    string `json:"query"`
+		Evidence []struct {
+			ID    string `json:"id"`
+			Quote string `json:"quote"`
+		} `json:"evidence"`
+	}
+	if err := json.Unmarshal([]byte(prompt), &envelope); err != nil {
+		return firstHarnessEvidenceID(prompt)
+	}
+	query := strings.ToLower(envelope.Query)
+	wantQuote := ""
+	switch {
+	case strings.Contains(query, "40") ||
+		strings.Contains(query, "2026-02-01") ||
+		strings.Contains(query, "before revision r2") ||
+		strings.Contains(query, "between revisions"):
+		wantQuote = "40 seconds"
+	case strings.Contains(query, "acknowledgement window"):
+		wantQuote = "70 seconds"
+	case strings.Contains(query, "aster mesh sentence"):
+		wantQuote = "Aster Mesh"
+	case strings.Contains(query, "amber lag"):
+		wantQuote = "Pause intake"
+	case strings.Contains(query, "buffer connects") ||
+		strings.Contains(query, "buffering"):
+		wantQuote = "before delivery"
+	case strings.Contains(query, "relay assignment") ||
+		strings.Contains(query, "quartz ring") ||
+		strings.Contains(query, "sealed telemetry"):
+		wantQuote = "Quartz Ring"
+	}
+	for _, evidence := range envelope.Evidence {
+		if wantQuote != "" && strings.Contains(evidence.Quote, wantQuote) {
+			return evidence.ID
+		}
+	}
+	if len(envelope.Evidence) > 0 {
+		return envelope.Evidence[0].ID
 	}
 	return ""
 }

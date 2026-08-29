@@ -183,6 +183,7 @@ func evaluateRecord(tc EvaluationCase, record Record, runErr error) EvaluationCa
 	}
 	if runErr != nil {
 		out.Error = runErr.Error()
+		out.MissingExpectedClaims = len(tc.ExpectedClaims)
 		return out
 	}
 	available := evidenceIndex(tc.Pack.Evidence(), record.Result.EvidenceAdditions())
@@ -190,7 +191,7 @@ func evaluateRecord(tc EvaluationCase, record Record, runErr error) EvaluationCa
 	for _, claim := range record.Result.Claims() {
 		out.Claims++
 		matchIndex := expectedClaimIndex(claim, tc.ExpectedClaims)
-		ok := matchIndex >= 0
+		ok := matchIndex >= 0 && !matchedExpected[matchIndex]
 		for _, evidenceID := range claim.EvidenceIDs() {
 			anchor, found := available[evidenceID]
 			if !found {
@@ -529,6 +530,7 @@ type fixtureExpected struct {
 }
 
 type fixtureEvidence struct {
+	EvidenceID      string           `json:"evidence_id"`
 	EvidenceType    string           `json:"evidence_type"`
 	EvaluationState string           `json:"evaluation_state"`
 	Citation        *fixtureCitation `json:"citation"`
@@ -549,6 +551,7 @@ type fixtureFact struct {
 	SubjectID shoal.ID        `json:"subject_id"`
 	Predicate shoal.ID        `json:"predicate"`
 	Value     json.RawMessage `json:"value"`
+	Qualifier string          `json:"qualifier"`
 }
 
 func loadFixtureExpectations(path string) ([]fixtureExpectation, error) {
@@ -600,7 +603,7 @@ func evaluationCaseFromExpectation(root string, record fixtureExpectation, gener
 	if err != nil {
 		return EvaluationCase{}, err
 	}
-	anchors, sources, err := fixtureAnchors(root, record.Expected.Evidence)
+	anchors, anchorIDs, sources, err := fixtureAnchors(root, record.Expected.Evidence)
 	if err != nil {
 		return EvaluationCase{}, err
 	}
@@ -620,15 +623,16 @@ func evaluationCaseFromExpectation(root string, record fixtureExpectation, gener
 	if err != nil {
 		return EvaluationCase{}, err
 	}
-	expected, err := fixtureExpectedClaims(record.Expected.Facts, pack.Evidence())
+	expected, err := fixtureExpectedClaims(record, anchorIDs, pack.Evidence())
 	if err != nil {
 		return EvaluationCase{}, err
 	}
 	return EvaluationCase{ID: record.CaseID, Pack: pack, ExpectedClaims: expected, Sources: sources}, nil
 }
 
-func fixtureAnchors(root string, evidence []fixtureEvidence) ([]inference.EvidenceAnchor, map[DocumentRevision]string, error) {
+func fixtureAnchors(root string, evidence []fixtureEvidence) ([]inference.EvidenceAnchor, map[string]shoal.ID, map[DocumentRevision]string, error) {
 	var anchors []inference.EvidenceAnchor
+	anchorIDs := map[string]shoal.ID{}
 	sources := map[DocumentRevision]string{}
 	for _, item := range evidence {
 		if item.EvaluationState != "evaluable" || item.EvidenceType != "citation" || item.Citation == nil {
@@ -638,10 +642,10 @@ func fixtureAnchors(root string, evidence []fixtureEvidence) ([]inference.Eviden
 		sourcePath := filepath.Join(root, citation.Path)
 		content, err := os.ReadFile(sourcePath)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		if bytes.Contains(content, []byte("\r")) {
-			return nil, nil, invalid("fixture corpus must use LF line endings")
+			return nil, nil, nil, invalid("fixture corpus must use LF line endings")
 		}
 		docCitation := document.Citation{
 			DocumentID: citation.DocumentID,
@@ -656,28 +660,33 @@ func fixtureAnchors(root string, evidence []fixtureEvidence) ([]inference.Eviden
 		if err := validateFixtureCitation(docCitation, citation.Quote, map[DocumentRevision]string{
 			{DocumentID: citation.DocumentID, RevisionID: citation.RevisionID}: string(content),
 		}); err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		anchor, err := inference.NewDocumentAnchor(docCitation, citation.Quote)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		anchors = append(anchors, anchor)
+		anchorIDs[item.EvidenceID] = anchor.ID()
 		sources[DocumentRevision{DocumentID: citation.DocumentID, RevisionID: citation.RevisionID}] = string(content)
 	}
-	return anchors, sources, nil
+	return anchors, anchorIDs, sources, nil
 }
 
-func fixtureExpectedClaims(facts []fixtureFact, anchors []inference.EvidenceAnchor) ([]ExpectedClaim, error) {
-	evidenceIDs := make([]shoal.ID, 0, 1)
+func fixtureExpectedClaims(record fixtureExpectation, anchorIDs map[string]shoal.ID, anchors []inference.EvidenceAnchor) ([]ExpectedClaim, error) {
+	fallback := make([]shoal.ID, 0, 1)
 	if len(anchors) > 0 {
-		evidenceIDs = append(evidenceIDs, anchors[0].ID())
+		fallback = append(fallback, anchors[0].ID())
 	}
-	expected := make([]ExpectedClaim, 0, len(facts))
-	for _, fact := range facts {
+	expected := make([]ExpectedClaim, 0, len(record.Expected.Facts))
+	for _, fact := range record.Expected.Facts {
 		value, err := fixtureOntologyValue(fact.Value)
 		if err != nil {
 			return nil, err
+		}
+		evidenceIDs := fallback
+		if id, ok := anchorIDs[fixtureEvidenceIDForFact(record.CaseID, fact)]; ok {
+			evidenceIDs = []shoal.ID{id}
 		}
 		expected = append(expected, ExpectedClaim{
 			Subject: fact.SubjectID, Predicate: fact.Predicate, Object: value,
@@ -685,6 +694,51 @@ func fixtureExpectedClaims(facts []fixtureFact, anchors []inference.EvidenceAnch
 		})
 	}
 	return expected, nil
+}
+
+func fixtureEvidenceIDForFact(caseID string, fact fixtureFact) string {
+	switch caseID {
+	case "q01-current-window":
+		return "ev-q01-ack"
+	case "q02-historical-window":
+		return "ev-q02-ack"
+	case "q03-revision-boundary":
+		return "ev-q03-ack"
+	case "q04-revision-change":
+		if fact.Qualifier == "r1" {
+			return "ev-q04-r1-ack"
+		}
+		return "ev-q04-r2-ack"
+	case "q05-section-hierarchy":
+		return "ev-q05-local-sentence"
+	case "q06-cross-document-path":
+		if fact.Predicate == "consumer" {
+			return "ev-q06-consumer"
+		}
+		return "ev-q06-buffer"
+	case "q07-runbook-mitigation":
+		switch fact.Predicate {
+		case "leave_online":
+			return "ev-q07-online"
+		case "restart_only":
+			return "ev-q07-restart"
+		case "resume_below_age_seconds":
+			return "ev-q07-resume"
+		default:
+			return "ev-q07-pause"
+		}
+	case "q08-tiered-ranking":
+		if fact.Predicate == "restart_policy" {
+			return "ev-q08-adr-policy"
+		}
+		return "ev-q08-buffer"
+	case "q17-one-tick-before-boundary":
+		return "ev-q17-r1-ack"
+	case "q18-one-tick-after-boundary":
+		return "ev-q18-r2-ack"
+	default:
+		return ""
+	}
 }
 
 func fixtureOntologyValue(raw json.RawMessage) (ontology.Value, error) {
