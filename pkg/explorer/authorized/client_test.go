@@ -24,11 +24,13 @@ import (
 	"errors"
 	"math"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/phrocker/shoal-oss/pkg/document"
 	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/explorer/authorized"
@@ -681,6 +683,100 @@ func TestAuthorizedVectorCapabilityRequiresBaseRetrievalSupport(t *testing.T) {
 	}
 	if available {
 		t.Fatal("base without vector retrieval support advertised vector capability")
+	}
+}
+
+func TestAuthorizedVectorCapabilityFailsClosedForOversizedProjection(t *testing.T) {
+	f := newFixture(t)
+	base, err := explorer.OpenWithOptions(t.TempDir(), explorer.Options{
+		Embedder: model.FakeEmbedder{Model: "authorized-large-projection", Dimensions: 8},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = base.Close() })
+	policy, err := auth.NewPolicy(auth.PolicyConfig{
+		AuthorizationDomain: f.domain,
+		SourceID:            f.sourceA,
+		GrantPolicyID:       f.policyA,
+		Epoch:               1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rule, err := authorized.NewAccessRule(policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	summaries := make([]explorer.DocumentSummary, 0, retrieval.MaxScopeIDs+1)
+	for i := 0; i <= retrieval.MaxScopeIDs; i++ {
+		documentID := shoal.ID("large-vector-doc-" + strconv.Itoa(i))
+		revisionID := shoal.ID("large-vector-rev-" + strconv.Itoa(i))
+		rootID := shoal.ID("large-vector-root-" + strconv.Itoa(i))
+		summaries = append(summaries, explorer.DocumentSummary{
+			Document: document.Document{
+				ID: documentID, RevisionID: revisionID, RootSectionID: rootID,
+			},
+			Revision: document.Revision{ID: revisionID, DocumentID: documentID},
+		})
+		if err := f.store.PutRevision(context.Background(), authorized.RevisionRegistration{
+			DocumentID:    documentID,
+			RevisionID:    revisionID,
+			NodeIDs:       []shoal.ID{documentID},
+			ContentDigest: auth.DigestBytes("test-large-vector-projection", []byte(documentID)),
+			Rule:          rule,
+			Current:       true,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	documentCalls := 0
+	retrieveCalls := 0
+	hooked := &hookClient{
+		Client: base,
+		documents: func(context.Context) ([]explorer.DocumentSummary, error) {
+			return summaries, nil
+		},
+		document: func(
+			context.Context, shoal.ID, shoal.ID,
+		) (explorer.DocumentView, error) {
+			documentCalls++
+			return explorer.DocumentView{}, errors.New("unexpected hydrate")
+		},
+		retrieve: func(
+			context.Context,
+			retrieval.Request,
+		) (retrieval.Response, error) {
+			retrieveCalls++
+			return retrieval.Response{}, errors.New("unexpected probe")
+		},
+	}
+	selector, err := authorized.NewStaticPolicySelector(f.sourceA, f.policyA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := authorized.NewClient(authorized.Config{
+		Base:             hooked,
+		VectorScorer:     base,
+		Resolver:         f.authority.Resolver(),
+		PolicySelector:   selector,
+		PolicyStore:      f.store,
+		GenerationReader: f.reader,
+		Clock:            f.clock.Now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	available, err := client.VectorAvailable(f.alice(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if available {
+		t.Fatal("oversized authorized vector projection advertised capability")
+	}
+	if documentCalls != 0 || retrieveCalls != 0 {
+		t.Fatalf("oversized projection probed base: documents=%d retrieve=%d",
+			documentCalls, retrieveCalls)
 	}
 }
 

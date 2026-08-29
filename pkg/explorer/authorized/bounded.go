@@ -107,6 +107,13 @@ func (c *Client) VectorAvailable(ctx context.Context) (bool, error) {
 		}
 		return available, nil
 	}
+	if len(visibleOrder) > retrieval.MaxScopeIDs {
+		if err := guard.Check(ctx); err != nil {
+			return false, err
+		}
+		c.cacheAuthorizedVectorAvailability(cacheKey, false, now)
+		return false, nil
+	}
 	corpus, err := c.hydrateRetrievalCorpus(ctx, visibleOrder, visible, decision, now)
 	if err != nil {
 		return false, err
