@@ -33,6 +33,9 @@ snapshot or authorization pins. If identity material cannot be established or
 appears unsafe for cache use, the harness fails closed by bypassing the cache.
 Explorer tool hosts may also be given explicit stable dependency identities
 when a production client cannot implement `CacheIdentityProvider` directly.
+`ModelRunner` cache identity requires an explicit `ClockIdentity` because the
+clock affects generated timestamps and result IDs; omit it to fail closed and
+bypass caching for non-deterministic clocks.
 
 `MemoryCache` bounds both entry count and byte size and evicts least-recently
 used entries deterministically.

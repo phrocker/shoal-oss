@@ -21,6 +21,7 @@ package harness
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -241,6 +242,21 @@ func TestEvaluationTraceDigestDetectsDifferentToolTraces(t *testing.T) {
 	}
 	if first.Cases[0].TraceDigest == second.Cases[0].TraceDigest {
 		t.Fatal("different tool traces produced identical report digest")
+	}
+}
+
+func TestEvaluationRejectsDuplicateCaseIDs(t *testing.T) {
+	now := time.Date(2026, 8, 28, 12, 0, 0, 0, time.UTC)
+	root := filepath.Join("..", "..", "..", "testdata", "explorer-eval")
+	cases, err := LoadFixtureEvaluationCases(root, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	duplicate := []EvaluationCase{cases[0], cases[1]}
+	duplicate[1].ID = duplicate[0].ID
+	g := scriptedEvaluationGenerator(t, now)
+	if _, err := Evaluate(context.Background(), g, duplicate, now); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("duplicate case ID error = %v", err)
 	}
 }
 

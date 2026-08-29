@@ -113,15 +113,23 @@ func Evaluate(ctx context.Context, generator *Generator, cases []EvaluationCase,
 	}
 	ordered := append([]EvaluationCase(nil), cases...)
 	sort.Slice(ordered, func(i, j int) bool { return ordered[i].ID < ordered[j].ID })
+	seen := make(map[string]struct{}, len(ordered))
+	for _, tc := range ordered {
+		id := strings.TrimSpace(tc.ID)
+		if id == "" {
+			return EvaluationReport{}, invalid("evaluation case ID is required")
+		}
+		if _, ok := seen[id]; ok {
+			return EvaluationReport{}, invalid("evaluation case ID must be unique")
+		}
+		seen[id] = struct{}{}
+	}
 	report := EvaluationReport{
 		Version:   FixtureEvaluationVersion,
 		Generated: generatedAt.UTC().Format(time.RFC3339Nano),
 		Summary:   EvaluationSummary{StopReasons: make(map[StopReason]int)},
 	}
 	for _, tc := range ordered {
-		if strings.TrimSpace(tc.ID) == "" {
-			return EvaluationReport{}, invalid("evaluation case ID is required")
-		}
 		record, err := generator.Run(ctx, tc.Pack)
 		caseReport := evaluateRecord(tc, record, err)
 		report.Cases = append(report.Cases, caseReport)

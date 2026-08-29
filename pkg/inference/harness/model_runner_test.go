@@ -108,6 +108,50 @@ func TestModelRunnerWorksWithDeterministicFakeProvider(t *testing.T) {
 	}
 }
 
+func TestModelRunnerCacheIdentityIncludesClockIdentity(t *testing.T) {
+	uncacheable, err := NewModelRunner(
+		lowmodel.FakeGenerator{Model: "deterministic"},
+		ModelRunnerConfig{Now: func() time.Time { return fixedTime }},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := uncacheable.CacheIdentity(); !errors.Is(err, ErrCacheIdentityUnsafe) {
+		t.Fatalf("missing clock identity error = %v", err)
+	}
+	first, err := NewModelRunner(
+		lowmodel.FakeGenerator{Model: "deterministic"},
+		ModelRunnerConfig{
+			Now:           func() time.Time { return fixedTime },
+			ClockIdentity: "fixed-clock-v1",
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := NewModelRunner(
+		lowmodel.FakeGenerator{Model: "deterministic"},
+		ModelRunnerConfig{
+			Now:           func() time.Time { return fixedTime.Add(time.Second) },
+			ClockIdentity: "fixed-clock-v2",
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstIdentity, err := first.CacheIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondIdentity, err := second.CacheIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstIdentity == secondIdentity {
+		t.Fatal("clock identities did not separate model runner cache identity")
+	}
+}
+
 func TestModelRunnerPreflightsInputBudget(t *testing.T) {
 	pack, _, _ := fixture(t)
 	runner, err := NewModelRunner(&scriptedTextGenerator{responses: []string{
