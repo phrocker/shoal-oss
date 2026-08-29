@@ -492,7 +492,7 @@ func LoadFixtureEvaluationCases(root string, generatedAt time.Time) ([]Evaluatio
 	}
 	cases := make([]EvaluationCase, 0, len(records))
 	for _, record := range records {
-		if record.Applicability.State != "current_evaluable" {
+		if record.Applicability.State != "current_evaluable" && record.CaseID != "q11-graph-native-navigation" {
 			continue
 		}
 		tc, err := evaluationCaseFromExpectation(root, record, generatedAt)
@@ -534,6 +534,7 @@ type fixtureEvidence struct {
 	EvidenceType    string           `json:"evidence_type"`
 	EvaluationState string           `json:"evaluation_state"`
 	Citation        *fixtureCitation `json:"citation"`
+	GraphRecordID   shoal.ID         `json:"graph_record_id"`
 }
 
 type fixtureCitation struct {
@@ -580,6 +581,129 @@ func loadFixtureExpectations(path string) ([]fixtureExpectation, error) {
 	return records, nil
 }
 
+type fixtureGraphIndex struct {
+	nodes map[shoal.ID]graph.Node
+	edges map[shoal.ID]graph.Edge
+	paths map[shoal.ID]struct {
+		nodes []shoal.ID
+		edges []shoal.ID
+	}
+}
+
+func loadFixtureGraph(path string) (fixtureGraphIndex, error) {
+	index := fixtureGraphIndex{
+		nodes: map[shoal.ID]graph.Node{},
+		edges: map[shoal.ID]graph.Edge{},
+		paths: map[shoal.ID]struct {
+			nodes []shoal.ID
+			edges []shoal.ID
+		}{},
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return index, err
+	}
+	defer file.Close()
+	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+	for scanner.Scan() {
+		line := bytes.TrimSpace(scanner.Bytes())
+		if len(line) == 0 {
+			continue
+		}
+		var record struct {
+			RecordType   string     `json:"record_type"`
+			NodeID       shoal.ID   `json:"node_id"`
+			NodeType     string     `json:"node_type"`
+			Label        string     `json:"label"`
+			EdgeID       shoal.ID   `json:"edge_id"`
+			EdgeType     string     `json:"edge_type"`
+			SourceNodeID shoal.ID   `json:"source_node_id"`
+			TargetNodeID shoal.ID   `json:"target_node_id"`
+			PathID       shoal.ID   `json:"path_id"`
+			NodeIDs      []shoal.ID `json:"node_ids"`
+			EdgeIDs      []shoal.ID `json:"edge_ids"`
+		}
+		if err := json.Unmarshal(line, &record); err != nil {
+			return index, err
+		}
+		switch record.RecordType {
+		case "node":
+			index.nodes[record.NodeID] = graph.Node{
+				ID: record.NodeID, Kind: record.NodeType, Labels: []string{record.Label},
+			}
+		case "edge":
+			index.edges[record.EdgeID] = graph.Edge{
+				ID: record.EdgeID, From: record.SourceNodeID, To: record.TargetNodeID, Type: record.EdgeType,
+			}
+		case "path":
+			index.paths[record.PathID] = struct {
+				nodes []shoal.ID
+				edges []shoal.ID
+			}{nodes: append([]shoal.ID(nil), record.NodeIDs...), edges: append([]shoal.ID(nil), record.EdgeIDs...)}
+		}
+	}
+	return index, scanner.Err()
+}
+
+func (g fixtureGraphIndex) pathFor(recordID shoal.ID) (graph.Path, error) {
+	if node, ok := g.nodes[recordID]; ok {
+		return graph.Path{Nodes: []graph.Node{node}}, nil
+	}
+	if edge, ok := g.edges[recordID]; ok {
+		from, fromOK := g.nodes[edge.From]
+		to, toOK := g.nodes[edge.To]
+		if !fromOK || !toOK {
+			return graph.Path{}, invalid("fixture graph edge references unknown nodes")
+		}
+		return graph.Path{Nodes: []graph.Node{from, to}, Edges: []graph.Edge{edge}}, nil
+	}
+	if path, ok := g.paths[recordID]; ok {
+		nodes := make([]graph.Node, 0, len(path.nodes))
+		for _, id := range path.nodes {
+			node, ok := g.nodes[id]
+			if !ok {
+				return graph.Path{}, invalid("fixture graph path references unknown node")
+			}
+			nodes = append(nodes, node)
+		}
+		edges := make([]graph.Edge, 0, len(path.edges))
+		for _, id := range path.edges {
+			edge, ok := g.edges[id]
+			if !ok {
+				return graph.Path{}, invalid("fixture graph path references unknown edge")
+			}
+			edges = append(edges, edge)
+		}
+		return graph.Path{Nodes: nodes, Edges: edges}, nil
+	}
+	return graph.Path{}, invalid("fixture graph record is absent")
+}
+
+func safeFixtureCorpusPath(root, relative string) (string, error) {
+	clean := filepath.Clean(relative)
+	if filepath.IsAbs(clean) || !strings.HasPrefix(filepath.ToSlash(clean), "corpus/") {
+		return "", invalid("fixture path must be corpus-relative")
+	}
+	rootReal, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return "", err
+	}
+	candidate := filepath.Join(rootReal, clean)
+	candidateReal, err := filepath.EvalSymlinks(candidate)
+	if err != nil {
+		return "", err
+	}
+	rel, err := filepath.Rel(rootReal, candidateReal)
+	if err != nil {
+		return "", err
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+		return "", invalid("fixture path escapes root")
+	}
+	return candidateReal, nil
+}
+
 func evaluationCaseFromExpectation(root string, record fixtureExpectation, generatedAt time.Time) (EvaluationCase, error) {
 	asOf, err := time.Parse(time.RFC3339Nano, record.Request.AsOf)
 	if err != nil {
@@ -603,7 +727,11 @@ func evaluationCaseFromExpectation(root string, record fixtureExpectation, gener
 	if err != nil {
 		return EvaluationCase{}, err
 	}
-	anchors, anchorIDs, sources, err := fixtureAnchors(root, record.Expected.Evidence)
+	graphs, err := loadFixtureGraph(filepath.Join(root, "graph.jsonl"))
+	if err != nil {
+		return EvaluationCase{}, err
+	}
+	anchors, anchorIDs, sources, graphPaths, err := fixtureAnchors(root, record.Expected.Evidence, graphs)
 	if err != nil {
 		return EvaluationCase{}, err
 	}
@@ -627,25 +755,46 @@ func evaluationCaseFromExpectation(root string, record fixtureExpectation, gener
 	if err != nil {
 		return EvaluationCase{}, err
 	}
-	return EvaluationCase{ID: record.CaseID, Pack: pack, ExpectedClaims: expected, Sources: sources}, nil
+	return EvaluationCase{ID: record.CaseID, Pack: pack, ExpectedClaims: expected, Sources: sources, GraphPaths: graphPaths}, nil
 }
 
-func fixtureAnchors(root string, evidence []fixtureEvidence) ([]inference.EvidenceAnchor, map[string]shoal.ID, map[DocumentRevision]string, error) {
+func fixtureAnchors(root string, evidence []fixtureEvidence, graphs fixtureGraphIndex) ([]inference.EvidenceAnchor, map[string]shoal.ID, map[DocumentRevision]string, map[shoal.ID]graph.Path, error) {
 	var anchors []inference.EvidenceAnchor
 	anchorIDs := map[string]shoal.ID{}
 	sources := map[DocumentRevision]string{}
+	graphPaths := map[shoal.ID]graph.Path{}
 	for _, item := range evidence {
-		if item.EvaluationState != "evaluable" || item.EvidenceType != "citation" || item.Citation == nil {
+		if item.EvaluationState != "evaluable" {
+			continue
+		}
+		if item.EvidenceType == "graph_native" {
+			path, err := graphs.pathFor(item.GraphRecordID)
+			if err != nil {
+				return nil, nil, nil, nil, err
+			}
+			anchor, err := inference.NewGraphAnchor(path)
+			if err != nil {
+				return nil, nil, nil, nil, err
+			}
+			anchors = append(anchors, anchor)
+			anchorIDs[item.EvidenceID] = anchor.ID()
+			graphPaths[anchor.ID()] = path
+			continue
+		}
+		if item.EvidenceType != "citation" || item.Citation == nil {
 			continue
 		}
 		citation := item.Citation
-		sourcePath := filepath.Join(root, citation.Path)
+		sourcePath, err := safeFixtureCorpusPath(root, citation.Path)
+		if err != nil {
+			return nil, nil, nil, nil, err
+		}
 		content, err := os.ReadFile(sourcePath)
 		if err != nil {
-			return nil, nil, nil, err
+			return nil, nil, nil, nil, err
 		}
 		if bytes.Contains(content, []byte("\r")) {
-			return nil, nil, nil, invalid("fixture corpus must use LF line endings")
+			return nil, nil, nil, nil, invalid("fixture corpus must use LF line endings")
 		}
 		docCitation := document.Citation{
 			DocumentID: citation.DocumentID,
@@ -660,17 +809,17 @@ func fixtureAnchors(root string, evidence []fixtureEvidence) ([]inference.Eviden
 		if err := validateFixtureCitation(docCitation, citation.Quote, map[DocumentRevision]string{
 			{DocumentID: citation.DocumentID, RevisionID: citation.RevisionID}: string(content),
 		}); err != nil {
-			return nil, nil, nil, err
+			return nil, nil, nil, nil, err
 		}
 		anchor, err := inference.NewDocumentAnchor(docCitation, citation.Quote)
 		if err != nil {
-			return nil, nil, nil, err
+			return nil, nil, nil, nil, err
 		}
 		anchors = append(anchors, anchor)
 		anchorIDs[item.EvidenceID] = anchor.ID()
 		sources[DocumentRevision{DocumentID: citation.DocumentID, RevisionID: citation.RevisionID}] = string(content)
 	}
-	return anchors, anchorIDs, sources, nil
+	return anchors, anchorIDs, sources, graphPaths, nil
 }
 
 func fixtureExpectedClaims(record fixtureExpectation, anchorIDs map[string]shoal.ID, anchors []inference.EvidenceAnchor) ([]ExpectedClaim, error) {
@@ -732,6 +881,8 @@ func fixtureEvidenceIDForFact(caseID string, fact fixtureFact) string {
 			return "ev-q08-adr-policy"
 		}
 		return "ev-q08-buffer"
+	case "q11-graph-native-navigation":
+		return "ev-q11-public-path"
 	case "q17-one-tick-before-boundary":
 		return "ev-q17-r1-ack"
 	case "q18-one-tick-after-boundary":

@@ -143,6 +143,9 @@ func fakeHarnessEvidenceID(prompt string) string {
 		Evidence []struct {
 			ID    string `json:"id"`
 			Quote string `json:"quote"`
+			Path  *struct {
+				Edges []struct{} `json:"edges"`
+			} `json:"path"`
 		} `json:"evidence"`
 	}
 	if err := json.Unmarshal([]byte(prompt), &envelope); err != nil {
@@ -171,6 +174,9 @@ func fakeHarnessEvidenceID(prompt string) string {
 		wantQuote = "Quartz Ring"
 	}
 	for _, evidence := range envelope.Evidence {
+		if strings.Contains(query, "celadon hub") && evidence.Path != nil && len(evidence.Path.Edges) > 0 {
+			return evidence.ID
+		}
 		if wantQuote != "" && strings.Contains(evidence.Quote, wantQuote) {
 			return evidence.ID
 		}

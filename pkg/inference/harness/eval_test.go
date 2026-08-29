@@ -61,18 +61,18 @@ func TestDeterministicFixtureEvaluationReport(t *testing.T) {
 	if string(firstJSON) != string(secondJSON) {
 		t.Fatalf("evaluation output is nondeterministic\nfirst:\n%s\nsecond:\n%s", firstJSON, secondJSON)
 	}
-	if first.Summary.CaseCount != 12 ||
-		first.Summary.ClaimCount != 10 ||
-		first.Summary.ExpectedClaimCount != 17 ||
-		first.Summary.SupportedClaimCount != 10 ||
+	if first.Summary.CaseCount != 13 ||
+		first.Summary.ClaimCount != 11 ||
+		first.Summary.ExpectedClaimCount != 18 ||
+		first.Summary.SupportedClaimCount != 11 ||
 		first.Summary.MissingExpectedClaims != 7 ||
 		first.Summary.GroundingSupportRate != 1 ||
 		first.Summary.UnsupportedIssueCount != 2 ||
 		first.Summary.InvalidCitationRefs != 0 ||
 		first.Summary.InvalidGraphPathRefs != 0 ||
 		first.Summary.CitationReferenceCount != 10 ||
-		first.Summary.GraphPathReferenceCount != 0 ||
-		first.Summary.StopReasons[StopReasonStop] != 12 {
+		first.Summary.GraphPathReferenceCount != 1 ||
+		first.Summary.StopReasons[StopReasonStop] != 13 {
 		t.Fatalf("unexpected metrics: %#v", first.Summary)
 	}
 	citationRefs, graphRefs := 0, 0
@@ -85,7 +85,7 @@ func TestDeterministicFixtureEvaluationReport(t *testing.T) {
 		citationRefs += report.CitationReferences
 		graphRefs += report.GraphPathReferences
 	}
-	if citationRefs != 10 || graphRefs != 0 {
+	if citationRefs != 10 || graphRefs != 1 {
 		t.Fatalf("unexpected citation/path coverage: citations=%d graph=%d", citationRefs, graphRefs)
 	}
 }
@@ -252,6 +252,13 @@ func TestEvaluationDetectsNegativeCases(t *testing.T) {
 func TestFixtureOntologyValueRejectsNull(t *testing.T) {
 	if _, err := fixtureOntologyValue(json.RawMessage("null")); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("null fixture value error = %v", err)
+	}
+}
+
+func TestSafeFixtureCorpusPathRejectsEscape(t *testing.T) {
+	root := filepath.Join("..", "..", "..", "testdata", "explorer-eval")
+	if _, err := safeFixtureCorpusPath(root, "..\\README.md"); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("escaped fixture path error = %v", err)
 	}
 }
 
