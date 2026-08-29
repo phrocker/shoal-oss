@@ -219,6 +219,25 @@ func TestCacheHitRechecksAuthorizationBeforeReturn(t *testing.T) {
 	}
 }
 
+func TestCacheWriteRechecksAuthorizationBeforeReturn(t *testing.T) {
+	cache := &expiringPutCache{}
+	pack, _, _ := fixture(t)
+	runner := &countingStopRunner{}
+	g := cachedGenerator(t, runner, pack, budgets(), nil, cache)
+	g.now = func() time.Time {
+		if cache.puts > 0 {
+			return pack.Authorization().ExpiresAt()
+		}
+		return fixedTime
+	}
+	if _, err := g.Run(context.Background(), pack); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("cache write after authorization expiry error = %v", err)
+	}
+	if cache.puts != 1 {
+		t.Fatalf("cache writes = %d, want 1", cache.puts)
+	}
+}
+
 func TestCacheKeyRejectsUnsetIdentity(t *testing.T) {
 	if err := (CacheKey{}).Validate(); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("unset key error = %v", err)
@@ -262,6 +281,17 @@ func (c *recordingCache) Get(context.Context, CacheKey) (Record, bool, error) {
 }
 
 func (c *recordingCache) Put(context.Context, CacheKey, Record) error {
+	c.puts++
+	return nil
+}
+
+type expiringPutCache struct{ puts int }
+
+func (c *expiringPutCache) Get(context.Context, CacheKey) (Record, bool, error) {
+	return Record{}, false, nil
+}
+
+func (c *expiringPutCache) Put(context.Context, CacheKey, Record) error {
 	c.puts++
 	return nil
 }

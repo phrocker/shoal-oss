@@ -759,6 +759,29 @@ func (g *Generator) Run(ctx context.Context, pack inference.ContextPack) (Record
 		if err == nil && reason == StopReasonStop && cacheable && !unsafeRecordForCache(record) {
 			_ = g.cache.Put(runCtx, cacheKey, record)
 		}
+		if err == nil && reason == StopReasonStop {
+			if postErr := runCtx.Err(); postErr != nil {
+				trace.StopReason = stopReasonFor(postErr)
+				trace.Failures = append(trace.Failures, FailureTrace{
+					Iteration: iteration,
+					Operation: "cache",
+					Error:     postErr.Error(),
+				})
+				record.Trace = cloneRunTrace(trace)
+				return record, postErr
+			}
+			if !g.now().Before(pack.Authorization().ExpiresAt()) {
+				postErr := invalid("authorization pin expired before result return")
+				trace.StopReason = StopReasonInvalid
+				trace.Failures = append(trace.Failures, FailureTrace{
+					Iteration: iteration,
+					Operation: "authorization",
+					Error:     postErr.Error(),
+				})
+				record.Trace = cloneRunTrace(trace)
+				return record, postErr
+			}
+		}
 		return record, err
 	}
 	if len(graphNodes) > g.budgets.MaxGraphNodes {
