@@ -21,6 +21,7 @@ package harness
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"path/filepath"
 	"strings"
@@ -65,7 +66,7 @@ func TestDeterministicFixtureEvaluationReport(t *testing.T) {
 		first.Summary.ExpectedClaimCount != 17 ||
 		first.Summary.SupportedClaimCount != 10 ||
 		first.Summary.MissingExpectedClaims != 7 ||
-		first.Summary.GroundingSupportRate != float64(10)/float64(17) ||
+		first.Summary.GroundingSupportRate != 1 ||
 		first.Summary.UnsupportedIssueCount != 2 ||
 		first.Summary.InvalidCitationRefs != 0 ||
 		first.Summary.InvalidGraphPathRefs != 0 ||
@@ -121,6 +122,41 @@ func TestEvaluationDetectsNegativeCases(t *testing.T) {
 		}
 		if report.Summary.SupportedClaimCount != 0 || report.Summary.GroundingSupportRate != 0 {
 			t.Fatalf("unsupported claim counted as supported: %#v", report.Summary)
+		}
+	})
+
+	t.Run("hallucinated extra claim lowers support rate", func(t *testing.T) {
+		g := scriptedEvaluationGenerator(t, now, func(_ context.Context, tr Transcript) (Action, error) {
+			expected := base[0].ExpectedClaims[0]
+			good, err := inference.NewClaim(
+				expected.Subject, expected.Predicate, expected.Object, 1, expected.EvidenceIDs,
+				inference.ClaimInferred, evalModelProvenance(t), evalPromptProvenance(t), nil,
+			)
+			if err != nil {
+				return Action{}, err
+			}
+			value, _ := ontology.NewStringValue("not-grounded")
+			bad, err := inference.NewClaim(
+				"subject:unexpected", "predicate:summary", value, 1,
+				[]shoal.ID{tr.Context().Evidence()[0].ID()}, inference.ClaimInferred,
+				evalModelProvenance(t), evalPromptProvenance(t), nil,
+			)
+			if err != nil {
+				return Action{}, err
+			}
+			result, err := inference.NewInferenceResult(tr.Context(), []inference.Claim{good, bad}, nil, now, nil)
+			if err != nil {
+				return Action{}, err
+			}
+			return NewStopAction("stop", result, Usage{})
+		})
+		report, err := Evaluate(context.Background(), g, base, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if report.Summary.SupportedClaimCount != 1 || report.Summary.ClaimCount != 2 ||
+			report.Summary.GroundingSupportRate != 0.5 {
+			t.Fatalf("hallucinated claim did not lower support rate: %#v", report.Summary)
 		}
 	})
 
@@ -211,6 +247,12 @@ func TestEvaluationDetectsNegativeCases(t *testing.T) {
 			t.Fatalf("budget violation not reported: %#v", report.Cases[0])
 		}
 	})
+}
+
+func TestFixtureOntologyValueRejectsNull(t *testing.T) {
+	if _, err := fixtureOntologyValue(json.RawMessage("null")); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("null fixture value error = %v", err)
+	}
 }
 
 func TestEvaluationTraceDigestDetectsDifferentToolTraces(t *testing.T) {

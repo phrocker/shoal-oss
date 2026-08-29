@@ -157,7 +157,7 @@ func Evaluate(ctx context.Context, generator *Generator, cases []EvaluationCase,
 			continue
 		}
 	}
-	report.Summary.GroundingSupportRate = ratio(report.Summary.SupportedClaimCount, report.Summary.ExpectedClaimCount)
+	report.Summary.GroundingSupportRate = ratio(report.Summary.SupportedClaimCount, report.Summary.ClaimCount)
 	report.Summary.UnsupportedOutcomeRate = ratio(report.Summary.UnsupportedIssueCount, report.Summary.ClaimCount+report.Summary.UnsupportedIssueCount)
 	return report, nil
 }
@@ -742,6 +742,9 @@ func fixtureEvidenceIDForFact(caseID string, fact fixtureFact) string {
 }
 
 func fixtureOntologyValue(raw json.RawMessage) (ontology.Value, error) {
+	if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return ontology.Value{}, invalid("fixture fact value is unsupported")
+	}
 	var text string
 	if err := json.Unmarshal(raw, &text); err == nil {
 		return ontology.NewStringValue(text)
