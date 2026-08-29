@@ -291,7 +291,7 @@ function sectionList(view) {
   button.type = "button";
   button.dataset.section = view.section.id;
   button.textContent = view.section.heading || "(untitled)";
-  button.setAttribute("aria-selected", String(view.section.id === state.selectedSectionID));
+  button.setAttribute("aria-pressed", String(view.section.id === state.selectedSectionID));
   button.onclick = () => selectSection(view.section.id);
   item.append(button);
   for (const span of view.spans || []) {
@@ -324,7 +324,7 @@ function selectSection(id) {
 function updateSectionSelection() {
   $("hierarchy").querySelectorAll("[data-section]").forEach((element) => {
     element.setAttribute(
-      "aria-selected",
+      "aria-pressed",
       String(element.dataset.section === state.selectedSectionID),
     );
   });
@@ -476,6 +476,7 @@ async function expandIDs(ids, cursor = "") {
     activate("graph");
     draw();
   } catch (error) {
+    $("graph-status").textContent = `Graph expansion failed: ${error.message || String(error)}`;
     showError($("selection"), error);
   }
 }
@@ -503,6 +504,7 @@ $("find-path").onclick = async () => {
       `Directed path at snapshot frontier ${response.snapshot.frontier}.`;
     draw();
   } catch (error) {
+    $("graph-status").textContent = `Path finding failed: ${error.message || String(error)}`;
     showError($("selection"), error);
   }
 };
