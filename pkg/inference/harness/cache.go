@@ -324,6 +324,16 @@ func dependencyCacheIdentity(value any, _ string) (string, error) {
 	return identity, nil
 }
 
+func configuredHarnessIdentity(configured string, value any, name string) (string, error) {
+	if strings.TrimSpace(configured) != "" {
+		if unsafeCacheText(configured) {
+			return "", ErrCacheIdentityUnsafe
+		}
+		return configured, nil
+	}
+	return dependencyCacheIdentity(value, name)
+}
+
 func validateCachedRecord(record Record, request SessionRequest, pack inference.ContextPack) error {
 	if record.Request.id != request.id || record.Request.context.ID() != pack.ID() {
 		return invalid("cached record identity does not match request")

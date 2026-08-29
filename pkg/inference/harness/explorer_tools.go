@@ -44,6 +44,11 @@ type ExplorerToolHost struct {
 	Metadata         shoal.Metadata
 	RetrievalModes   []retrieval.Mode
 	RetrievalExplain bool
+
+	ClientIdentity         string
+	BoundedClientIdentity  string
+	BuilderReaderIdentity  string
+	TokenEstimatorIdentity string
 }
 
 func NewExplorerToolHost(client explorer.Client, builder contextpack.Builder) (*ExplorerToolHost, error) {
@@ -66,27 +71,27 @@ func (h *ExplorerToolHost) CacheIdentity() (string, error) {
 	if err := h.validate(); err != nil {
 		return "", err
 	}
-	clientIdentity, err := dependencyCacheIdentity(h.Client, "explorer client")
+	clientIdentity, err := configuredHarnessIdentity(h.ClientIdentity, h.Client, "explorer client")
 	if err != nil {
 		return "", err
 	}
 	boundedIdentity := "no-bounded-client"
 	if h.BoundedClient != nil {
-		boundedIdentity, err = dependencyCacheIdentity(h.BoundedClient, "bounded explorer client")
+		boundedIdentity, err = configuredHarnessIdentity(h.BoundedClientIdentity, h.BoundedClient, "bounded explorer client")
 		if err != nil {
 			return "", err
 		}
 	}
 	readerIdentity := "no-builder-reader"
 	if h.Builder.Reader != nil {
-		readerIdentity, err = dependencyCacheIdentity(h.Builder.Reader, "context builder reader")
+		readerIdentity, err = configuredHarnessIdentity(h.BuilderReaderIdentity, h.Builder.Reader, "context builder reader")
 		if err != nil {
 			return "", err
 		}
 	}
 	estimatorIdentity := "no-token-estimator"
 	if h.Builder.TokenEstimator != nil {
-		estimatorIdentity, err = dependencyCacheIdentity(h.Builder.TokenEstimator, "context token estimator")
+		estimatorIdentity, err = configuredHarnessIdentity(h.TokenEstimatorIdentity, h.Builder.TokenEstimator, "context token estimator")
 		if err != nil {
 			return "", err
 		}

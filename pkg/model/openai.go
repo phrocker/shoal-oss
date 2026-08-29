@@ -71,7 +71,6 @@ type openAIClient struct {
 	credentials         CredentialResolver
 	httpClient          *http.Client
 	httpClientIdentity  string
-	credentialIdentity  string
 	cacheIdentityUnsafe bool
 	timeout             time.Duration
 	maxTextBytes        int64
@@ -94,7 +93,7 @@ func NewOpenAIGenerator(cfg OpenAIConfig) (*OpenAIGenerator, error) {
 	if err != nil {
 		return nil, err
 	}
-	credentialIdentity, credentialCacheable, err := configuredCacheIdentity(cfg.Credentials)
+	_, credentialCacheable, err := configuredCacheIdentity(cfg.Credentials)
 	if err != nil {
 		return nil, err
 	}
@@ -103,7 +102,6 @@ func NewOpenAIGenerator(cfg OpenAIConfig) (*OpenAIGenerator, error) {
 		return nil, err
 	}
 	client.httpClientIdentity = httpIdentity
-	client.credentialIdentity = credentialIdentity
 	client.cacheIdentityUnsafe = !httpCacheable || !credentialCacheable
 	return &OpenAIGenerator{client: client}, nil
 }
@@ -113,7 +111,7 @@ func NewOpenAIEmbedder(cfg OpenAIConfig) (*OpenAIEmbedder, error) {
 	if err != nil {
 		return nil, err
 	}
-	credentialIdentity, credentialCacheable, err := configuredCacheIdentity(cfg.Credentials)
+	_, credentialCacheable, err := configuredCacheIdentity(cfg.Credentials)
 	if err != nil {
 		return nil, err
 	}
@@ -122,7 +120,6 @@ func NewOpenAIEmbedder(cfg OpenAIConfig) (*OpenAIEmbedder, error) {
 		return nil, err
 	}
 	client.httpClientIdentity = httpIdentity
-	client.credentialIdentity = credentialIdentity
 	client.cacheIdentityUnsafe = !httpCacheable || !credentialCacheable
 	return &OpenAIEmbedder{client: client}, nil
 }
@@ -134,7 +131,11 @@ func (o *OpenAIGenerator) CacheIdentity() (string, error) {
 	if o.client.cacheIdentityUnsafe {
 		return "", ErrInvalidConfig
 	}
-	return openAICacheIdentity("openai-compatible-generator-v1", o.client, o.client.generationModel), nil
+	credentialIdentity, credentialCacheable, _ := configuredCacheIdentity(o.client.credentials)
+	if !credentialCacheable {
+		return "", ErrInvalidConfig
+	}
+	return openAICacheIdentity("openai-compatible-generator-v1", o.client, o.client.generationModel, credentialIdentity), nil
 }
 
 func (o *OpenAIEmbedder) CacheIdentity() (string, error) {
@@ -144,7 +145,11 @@ func (o *OpenAIEmbedder) CacheIdentity() (string, error) {
 	if o.client.cacheIdentityUnsafe {
 		return "", ErrInvalidConfig
 	}
-	return openAICacheIdentity("openai-compatible-embedder-v1", o.client, o.client.embeddingModel), nil
+	credentialIdentity, credentialCacheable, _ := configuredCacheIdentity(o.client.credentials)
+	if !credentialCacheable {
+		return "", ErrInvalidConfig
+	}
+	return openAICacheIdentity("openai-compatible-embedder-v1", o.client, o.client.embeddingModel, credentialIdentity), nil
 }
 
 func (o *OpenAIGenerator) Generate(ctx context.Context, req GenerateRequest) (GenerateResult, error) {
@@ -252,14 +257,14 @@ func (o *OpenAIEmbedder) Embed(ctx context.Context, req EmbedRequest) (EmbedResu
 	}, nil
 }
 
-func openAICacheIdentity(kind string, client *openAIClient, model string) string {
+func openAICacheIdentity(kind string, client *openAIClient, model, credentialIdentity string) string {
 	return framedModelIdentity(
 		kind,
 		client.baseURL,
 		model,
 		client.organization,
 		client.project,
-		client.credentialIdentity,
+		credentialIdentity,
 		client.httpClientIdentity,
 		client.timeout.String(),
 		strconv.FormatInt(client.maxTextBytes, 10),

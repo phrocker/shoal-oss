@@ -31,6 +31,8 @@ version, tool policy, and stable runner/tool-host identities supplied through
 `CacheIdentityProvider`. Cache entries are never served across different
 snapshot or authorization pins. If identity material cannot be established or
 appears unsafe for cache use, the harness fails closed by bypassing the cache.
+Explorer tool hosts may also be given explicit stable dependency identities
+when a production client cannot implement `CacheIdentityProvider` directly.
 
 `MemoryCache` bounds both entry count and byte size and evicts least-recently
 used entries deterministically.
