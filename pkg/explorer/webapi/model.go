@@ -51,6 +51,7 @@ const (
 	CapabilityDocuments    Capability = "documents"
 	CapabilityDocument     Capability = "document"
 	CapabilityRetrieve     Capability = "retrieve"
+	CapabilityVector       Capability = "vector"
 	CapabilityNeighborhood Capability = "neighborhood"
 	CapabilityPath         Capability = "path"
 )
@@ -60,6 +61,7 @@ type Capabilities struct {
 	Documents    bool `json:"documents"`
 	Document     bool `json:"document"`
 	Retrieve     bool `json:"retrieve"`
+	Vector       bool `json:"vector"`
 	Neighborhood bool `json:"neighborhood"`
 	Path         bool `json:"path"`
 }
@@ -68,7 +70,7 @@ type Capabilities struct {
 // service. Remote services must advertise their supported features explicitly.
 func AllCapabilities() Capabilities {
 	return Capabilities{
-		Documents: true, Document: true, Retrieve: true,
+		Documents: true, Document: true, Retrieve: true, Vector: true,
 		Neighborhood: true, Path: true,
 	}
 }
@@ -82,6 +84,8 @@ func (c Capabilities) Supports(capability Capability) bool {
 		return c.Document
 	case CapabilityRetrieve:
 		return c.Retrieve
+	case CapabilityVector:
+		return c.Vector
 	case CapabilityNeighborhood:
 		return c.Neighborhood
 	case CapabilityPath:

@@ -137,6 +137,11 @@ func (e *Explorer) load() error {
 			return shoal.WrapError(shoal.ErrorInternal, "advance explorer scan", err)
 		}
 	}
+	space, found, err := e.embeddingSpaceLocked()
+	if err != nil {
+		return err
+	}
+	e.embeddingSpace = embeddingSpaceCache{provenance: space, found: found}
 	return nil
 }
 
@@ -412,6 +417,9 @@ func validatePersistedDocument(record persistedDocument) error {
 		if err := validatePersistedEdge(edge); err != nil {
 			return err
 		}
+	}
+	if err := validateEmbeddingSet(&record); err != nil {
+		return err
 	}
 	return nil
 }

@@ -10,6 +10,7 @@ const state = {
     documents: false,
     document: false,
     retrieve: false,
+    vector: false,
     neighborhood: false,
     path: false,
   },
@@ -39,7 +40,7 @@ async function loadMeta() {
 }
 
 function capability(name) {
-  return state.capabilities[name] !== false;
+  return state.capabilities[name] === true;
 }
 
 function applyCapabilities() {
@@ -47,6 +48,15 @@ function applyCapabilities() {
   $("query").disabled = !canRetrieve;
   $("search").querySelector("button").disabled = !canRetrieve;
   $("modes").disabled = !canRetrieve;
+  const vectorMode = $("mode-vector");
+  if (vectorMode) {
+    const canVector = canRetrieve && capability("vector");
+    vectorMode.disabled = !canVector;
+    if (!canVector) vectorMode.checked = false;
+    $("vector-status").textContent = canVector
+      ? ""
+      : "Vector unavailable";
+  }
   const evidence = $("evidence");
   if (!canRetrieve) {
     evidence.dataset.capabilityPlaceholder = "retrieve";

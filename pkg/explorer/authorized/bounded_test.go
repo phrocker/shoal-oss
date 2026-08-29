@@ -205,6 +205,27 @@ func TestAuthorizedBoundedPageUsesNormalizedSeedCount(t *testing.T) {
 	}
 }
 
+func TestAuthorizedVectorAvailabilityKeyLengthPrefixesIDs(t *testing.T) {
+	left := authorizedVectorAvailabilityKey(
+		auth.Decision{},
+		[]shoal.ID{"a"},
+		map[shoal.ID]RevisionRegistration{
+			"a": {RevisionID: "b|c@d"},
+		},
+	)
+	right := authorizedVectorAvailabilityKey(
+		auth.Decision{},
+		[]shoal.ID{"a@b", "c"},
+		map[shoal.ID]RevisionRegistration{
+			"a@b": {RevisionID: "c"},
+			"c":   {RevisionID: "d"},
+		},
+	)
+	if left == right {
+		t.Fatalf("distinct visibility sets produced same key %q", left)
+	}
+}
+
 func authorizedPaginationClient(t *testing.T, hiddenOnly bool) (*Client, *pagedBoundedBase) {
 	t.Helper()
 	ctx := context.Background()

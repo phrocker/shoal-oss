@@ -39,6 +39,7 @@ type rankedSpan struct {
 	lexical     shoal.Score
 	tree        shoal.Score
 	graph       shoal.Score
+	vector      shoal.Score
 	path        graph.Path
 	activeModes []retrieval.Mode
 }
@@ -53,6 +54,12 @@ type pathEdge struct {
 func (e *Explorer) Retrieve(
 	ctx context.Context, request retrieval.Request,
 ) (retrieval.Response, error) {
+	return e.retrieve(ctx, request)
+}
+
+func (e *Explorer) retrieve(
+	ctx context.Context, request retrieval.Request,
+) (retrieval.Response, error) {
 	if err := contextError(ctx); err != nil {
 		return retrieval.Response{}, err
 	}
@@ -61,13 +68,6 @@ func (e *Explorer) Retrieve(
 		return retrieval.Response{}, err
 	}
 	request = normalized
-	for _, mode := range request.Modes {
-		if mode == retrieval.ModeVector {
-			return retrieval.Response{}, shoal.NewError(
-				shoal.ErrorUnavailable,
-				"vector retrieval is not configured for the embedded Explorer")
-		}
-	}
 	if !request.AsOf.IsZero() {
 		return retrieval.Response{}, shoal.NewError(
 			shoal.ErrorUnavailable,
@@ -80,16 +80,41 @@ func (e *Explorer) Retrieve(
 	analyzer := retrieval.UnicodeTermAnalyzer{}
 	scorer := retrieval.CoverageFusionScorer{}
 	modes := request.Modes
+	hasVector := request.HasMode(retrieval.ModeVector)
+	hasTermMode := request.HasMode(retrieval.ModeLexical) ||
+		request.HasMode(retrieval.ModeTree) ||
+		request.HasMode(retrieval.ModeGraph)
 	queryTerms := analyzer.Analyze(request.Text)
-	if len(queryTerms) == 0 {
+	if hasTermMode && len(queryTerms) == 0 {
 		return retrieval.Response{}, shoal.NewError(
 			shoal.ErrorInvalidArgument, "retrieval text has no searchable terms")
+	}
+	var (
+		queryProvenance persistedEmbeddingProvenance
+		queryVector     []float32
+	)
+	if hasVector {
+		e.mu.RLock()
+		if err := e.requireOpen(); err != nil {
+			e.mu.RUnlock()
+			return retrieval.Response{}, err
+		}
+		e.mu.RUnlock()
+		queryProvenance, queryVector, err = e.embedQuery(ctx, request.Text)
+		if err != nil {
+			return retrieval.Response{}, err
+		}
 	}
 
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 	if err := e.requireOpen(); err != nil {
 		return retrieval.Response{}, err
+	}
+	if hasVector {
+		if err := e.ensureEmbeddingSpaceCompatibleLocked(queryProvenance); err != nil {
+			return retrieval.Response{}, err
+		}
 	}
 	documentScope := idSet(request.Scope.DocumentIDs)
 	nodeScope := idSet(request.Scope.NodeIDs)
@@ -119,6 +144,37 @@ func (e *Explorer) Retrieve(
 		for _, edge := range record.Edges {
 			edges[pathEdgeKey(edge.From, edge.To)] = edge
 		}
+		if len(nodeScope) > 0 {
+			recordEligible := false
+			for _, span := range record.Spans {
+				if spanInNodeScope(record, sectionByID, span, nodeScope) {
+					recordEligible = true
+					break
+				}
+			}
+			if !recordEligible {
+				continue
+			}
+		}
+		var spanEmbeddings map[shoal.ID]persistedSpanEmbedding
+		if hasVector && len(record.Spans) > 0 {
+			if record.Embeddings == nil {
+				return retrieval.Response{}, shoal.NewError(
+					shoal.ErrorUnavailable,
+					"vector retrieval requires embeddings for every eligible span",
+				)
+			}
+			if record.Embeddings.Provenance != queryProvenance {
+				return retrieval.Response{}, incompatibleEmbeddingSpaceError(
+					queryProvenance,
+					record.Embeddings.Provenance,
+				)
+			}
+			spanEmbeddings, err = recordEmbeddingMap(record)
+			if err != nil {
+				return retrieval.Response{}, err
+			}
+		}
 		for _, span := range record.Spans {
 			if len(nodeScope) > 0 &&
 				!spanInNodeScope(record, sectionByID, span, nodeScope) {
@@ -141,10 +197,25 @@ func (e *Explorer) Retrieve(
 				graphScore = scorer.Coverage(
 					queryTerms, analyzer.Analyze(pathSearchText(path, span.Text)))
 			}
+			vectorScoreValue := shoal.Score(0)
+			if hasVector {
+				embedding, ok := spanEmbeddings[span.ID]
+				if !ok || !embeddingMatchesSpan(embedding, span) {
+					return retrieval.Response{}, shoal.NewError(
+						shoal.ErrorUnavailable,
+						"stored span embeddings are stale or incomplete",
+					)
+				}
+				vectorScoreValue, err = vectorScore(queryVector, embedding.Vector)
+				if err != nil {
+					return retrieval.Response{}, err
+				}
+			}
 			score := scorer.CombinedScore(modes, retrieval.ComponentScores{
 				Lexical: lexical,
 				Tree:    treeScore,
 				Graph:   graphScore,
+				Vector:  vectorScoreValue,
 			})
 			if score <= 0 {
 				continue
@@ -152,7 +223,8 @@ func (e *Explorer) Retrieve(
 			ranked = append(ranked, rankedSpan{
 				record: record, span: span, score: score,
 				lexical: lexical, tree: treeScore, graph: graphScore,
-				path: path, activeModes: modes,
+				vector: vectorScoreValue,
+				path:   path, activeModes: modes,
 			})
 		}
 	}
@@ -192,6 +264,7 @@ func (e *Explorer) Retrieve(
 					Lexical: match.lexical,
 					Tree:    match.tree,
 					Graph:   match.graph,
+					Vector:  match.vector,
 				})
 			}
 			result.Explanation = &retrieval.Explanation{

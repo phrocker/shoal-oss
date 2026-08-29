@@ -122,7 +122,7 @@ Every advertised capability has exactly one primary state:
 | Ingestion job and readiness experience | Dependency-blocked | Alpha | No reviewed public ingestion/status contract |
 | Embedded document hierarchy and span navigation | Embedded implementation | Current | `pkg/explorer`; canonical source-byte hydration and remote/storage-neutral conformance remain dependency-blocked |
 | Embedded both-direction graph neighborhood workspace | Embedded implementation | Current | `pkg/explorer`; depth is 1..16 and final values order by ID |
-| Embedded citation-backed retrieval | Embedded implementation | Current | `pkg/explorer`; vector and explicit `AsOf` return `unavailable` |
+| Embedded citation-backed retrieval | Embedded implementation | Current | `pkg/explorer`; vector requires an explicitly configured embedder and complete compatible stored span embeddings; explicit `AsOf` returns `unavailable` |
 | Ask with generated prose over citation-backed evidence | Proposed surface | Alpha | Optional composition outside required Shoal runtime |
 | Explicit partial-result UI | Dependency-blocked | Future | Current response has no completeness envelope |
 | Authorization-aware result semantics | Dependency-blocked | Future | Current retrieval contract has no authorization/restriction envelope |

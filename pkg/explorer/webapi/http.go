@@ -127,7 +127,9 @@ func metadataFor(ctx context.Context, service Service) (MetadataResponse, error)
 func capabilitiesFor(ctx context.Context, service Service) (Capabilities, error) {
 	provider, ok := service.(CapabilityProvider)
 	if !ok {
-		return AllCapabilities(), nil
+		capabilities := AllCapabilities()
+		capabilities.Vector = false
+		return capabilities, nil
 	}
 	return provider.Capabilities(ctx)
 }

@@ -21,12 +21,14 @@ package explorer_test
 
 import (
 	"context"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/graph"
+	"github.com/phrocker/shoal-oss/pkg/model"
 	"github.com/phrocker/shoal-oss/pkg/retrieval"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
@@ -240,6 +242,287 @@ func TestVectorModeFailsExplicitly(t *testing.T) {
 	})
 	if !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
 		t.Fatalf("expected unavailable, got %v", err)
+	}
+}
+
+func TestVectorRetrievalWithFakeEmbedderPersistsExactEvidence(t *testing.T) {
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	corpus := openVectorCorpus(t, dataDir, "unit", 8)
+	source := explorer.Source{
+		URI:       "file:///vector.md",
+		MediaType: explorer.MediaTypeMarkdown,
+		Content:   "# Vector\n\nAlpha beta semantic target.\n\n## Other\n\nUnrelated filler text.",
+	}
+	ingested, err := corpus.Ingest(ctx, source)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	response, err := corpus.Retrieve(ctx, retrieval.Request{
+		Text: "Alpha beta semantic target.",
+		TopK: 1,
+		Modes: []retrieval.Mode{
+			retrieval.ModeVector,
+		},
+		Explain: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertVectorExactEvidence(t, source.Content, response, ingested.Document.ID)
+	if response.Results[0].Explanation == nil ||
+		response.Results[0].Explanation.Scores[string(retrieval.ModeVector)] <= 0.99 {
+		t.Fatalf("vector explanation = %+v", response.Results[0].Explanation)
+	}
+	if err := corpus.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened := openVectorCorpus(t, dataDir, "unit", 8)
+	defer reopened.Close()
+	reopenedResponse, err := reopened.Retrieve(ctx, retrieval.Request{
+		Text: "Alpha beta semantic target.",
+		TopK: 1,
+		Modes: []retrieval.Mode{
+			retrieval.ModeVector,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertVectorExactEvidence(t, source.Content, reopenedResponse, ingested.Document.ID)
+	if reopenedResponse.Results[0].ID != response.Results[0].ID {
+		t.Fatalf("persisted vector result changed: %#v then %#v", response, reopenedResponse)
+	}
+}
+
+func TestHybridVectorRankingIsDeterministic(t *testing.T) {
+	ctx := context.Background()
+	corpus := openVectorCorpus(t, t.TempDir(), "determinism", 12)
+	defer corpus.Close()
+	if _, err := corpus.Ingest(ctx, explorer.Source{
+		URI: "file:///hybrid.md", MediaType: explorer.MediaTypeMarkdown,
+		Content: "# Hybrid\n\nRepeatable ranking target.\n\n## Notes\n\nRepeatable lexical heading.",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	request := retrieval.Request{
+		Text: "Repeatable ranking target.",
+		TopK: 5,
+		Modes: []retrieval.Mode{
+			retrieval.ModeVector, retrieval.ModeLexical,
+			retrieval.ModeTree, retrieval.ModeGraph,
+		},
+		Explain: true,
+	}
+	first, err := corpus.Retrieve(ctx, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 5; i++ {
+		next, err := corpus.Retrieve(ctx, request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(next, first) {
+			t.Fatalf("hybrid response changed on run %d:\n%#v\n%#v", i, first, next)
+		}
+	}
+}
+
+func TestVectorRetrievalRejectsIncompatibleEmbeddingSpaces(t *testing.T) {
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	corpus := openVectorCorpus(t, dataDir, "space-a", 8)
+	if _, err := corpus.Ingest(ctx, explorer.Source{
+		URI:       "file:///space-a.txt",
+		MediaType: explorer.MediaTypeText,
+		Content:   "same embedding space",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := corpus.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	modelMismatch := openVectorCorpus(t, dataDir, "space-b", 8)
+	_, err := modelMismatch.Retrieve(ctx, retrieval.Request{
+		Text:  "same embedding space",
+		Modes: []retrieval.Mode{retrieval.ModeVector},
+	})
+	if !shoal.IsErrorCode(err, shoal.ErrorConflict) {
+		t.Fatalf("model mismatch error = %v", err)
+	}
+	if err := modelMismatch.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	dimensionMismatch := openVectorCorpus(t, dataDir, "space-a", 16)
+	defer dimensionMismatch.Close()
+	_, err = dimensionMismatch.Ingest(ctx, explorer.Source{
+		URI:       "file:///space-b.txt",
+		MediaType: explorer.MediaTypeText,
+		Content:   "different embedding dimensions",
+	})
+	if !shoal.IsErrorCode(err, shoal.ErrorConflict) {
+		t.Fatalf("dimension mismatch error = %v", err)
+	}
+}
+
+func TestVectorRetrievalReportsDisabledAndPartiallyPopulatedEmbeddings(t *testing.T) {
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	corpus, err := explorer.Open(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy, err := corpus.Ingest(ctx, explorer.Source{
+		URI:       "file:///legacy.txt",
+		MediaType: explorer.MediaTypeText,
+		Content:   "legacy document without embeddings",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = corpus.Retrieve(ctx, retrieval.Request{
+		Text:  "legacy",
+		Modes: []retrieval.Mode{retrieval.ModeVector},
+	})
+	if !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
+		t.Fatalf("disabled vector error = %v", err)
+	}
+	if err := corpus.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	enabled := openVectorCorpus(t, dataDir, "partial", 8)
+	defer enabled.Close()
+	current, err := enabled.Ingest(ctx, explorer.Source{
+		URI:       "file:///current.txt",
+		MediaType: explorer.MediaTypeText,
+		Content:   "current vector enabled document",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = enabled.Retrieve(ctx, retrieval.Request{
+		Text:  "current vector enabled document",
+		Modes: []retrieval.Mode{retrieval.ModeVector},
+	})
+	if !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
+		t.Fatalf("partial embeddings error = %v", err)
+	}
+	scoped, err := enabled.Retrieve(ctx, retrieval.Request{
+		Text:  "current vector enabled document",
+		Modes: []retrieval.Mode{retrieval.ModeVector},
+		Scope: retrieval.Scope{DocumentIDs: []shoal.ID{
+			current.Document.ID,
+		}},
+	})
+	if err != nil {
+		t.Fatalf("scoped vector retrieval: %v", err)
+	}
+	if len(scoped.Results) != 1 || scoped.Results[0].Evidence[0].Citation.DocumentID !=
+		current.Document.ID {
+		t.Fatalf("scoped vector response = %+v, legacy = %s", scoped, legacy.Document.ID)
+	}
+}
+
+func TestVectorRetrievalNodeScopeIgnoresUnrelatedMissingEmbeddings(t *testing.T) {
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	legacy, err := explorer.Open(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := legacy.Ingest(ctx, explorer.Source{
+		URI:       "file:///legacy-node-scope.txt",
+		MediaType: explorer.MediaTypeText,
+		Content:   "legacy missing embeddings outside node scope",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	enabled := openVectorCorpus(t, dataDir, "node-scope", 8)
+	defer enabled.Close()
+	current, err := enabled.Ingest(ctx, explorer.Source{
+		URI:       "file:///current-node-scope.txt",
+		MediaType: explorer.MediaTypeText,
+		Content:   "current scoped vector evidence",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	view, err := enabled.Document(ctx, current.Document.ID, current.Revision.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(view.Root.Spans) != 1 {
+		t.Fatalf("test document spans = %#v", view.Root.Spans)
+	}
+	response, err := enabled.Retrieve(ctx, retrieval.Request{
+		Text:  "current scoped vector evidence",
+		Modes: []retrieval.Mode{retrieval.ModeVector},
+		Scope: retrieval.Scope{NodeIDs: []shoal.ID{
+			view.Root.Spans[0].ID,
+		}},
+	})
+	if err != nil {
+		t.Fatalf("node-scoped vector retrieval: %v", err)
+	}
+	if len(response.Results) != 1 ||
+		response.Results[0].Evidence[0].Citation.SpanID != view.Root.Spans[0].ID {
+		t.Fatalf("node-scoped vector response = %#v", response)
+	}
+}
+
+func TestIdempotentIngestChecksExistingRevisionBeforeEmbedding(t *testing.T) {
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	source := explorer.Source{
+		URI:       "file:///retry.txt",
+		MediaType: explorer.MediaTypeText,
+		Content:   "retry should not need embedding provider",
+	}
+	corpus, err := explorer.Open(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := corpus.Ingest(ctx, source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := corpus.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := explorer.OpenWithOptions(dataDir, explorer.Options{
+		Embedder: failingEmbedder{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	second, err := reopened.Ingest(ctx, source)
+	if err != nil {
+		t.Fatalf("idempotent ingest used failing embedder: %v", err)
+	}
+	if second.Disposition != explorer.IngestUnchanged ||
+		second.Revision.ID != first.Revision.ID {
+		t.Fatalf("idempotent ingest = %+v, first = %+v", second, first)
+	}
+}
+
+func TestOpenWithOptionsRejectsEmbedderWithoutStableIdentity(t *testing.T) {
+	_, err := explorer.OpenWithOptions(t.TempDir(), explorer.Options{
+		Embedder: noIdentityEmbedder{},
+	})
+	if !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
+		t.Fatalf("missing embedding identity error = %v", err)
 	}
 }
 
@@ -579,4 +862,74 @@ func TestMarkdownHeadingsPreserveHashesAndIgnoreFences(t *testing.T) {
 	if got := top.Spans[0].Text; !strings.Contains(got, "# Not a section") {
 		t.Fatalf("fenced content span = %q", got)
 	}
+}
+
+func openVectorCorpus(
+	t *testing.T, dataDir, modelName string, dimensions int,
+) *explorer.Explorer {
+	t.Helper()
+	corpus, err := explorer.OpenWithOptions(dataDir, explorer.Options{
+		Embedder: model.FakeEmbedder{Model: modelName, Dimensions: dimensions},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return corpus
+}
+
+func assertVectorExactEvidence(
+	t *testing.T,
+	source string,
+	response retrieval.Response,
+	documentID shoal.ID,
+) {
+	t.Helper()
+	if len(response.Results) != 1 {
+		t.Fatalf("vector results = %+v", response.Results)
+	}
+	result := response.Results[0]
+	if len(result.Evidence) != 1 {
+		t.Fatalf("vector evidence = %+v", result.Evidence)
+	}
+	evidence := result.Evidence[0]
+	if evidence.Citation.DocumentID != documentID ||
+		evidence.Quote != "Alpha beta semantic target." {
+		t.Fatalf("vector evidence = %+v", evidence)
+	}
+	start, end := evidence.Citation.Range.Start.Offset, evidence.Citation.Range.End.Offset
+	if got := source[int(start):int(end)]; got != evidence.Quote {
+		t.Fatalf("citation slice = %q, quote = %q", got, evidence.Quote)
+	}
+	if err := evidence.Citation.Validate(); err != nil {
+		t.Fatalf("citation: %v", err)
+	}
+	if err := evidence.Path.Validate(); err != nil {
+		t.Fatalf("path: %v", err)
+	}
+}
+
+type failingEmbedder struct{}
+
+func (failingEmbedder) CacheIdentity() (string, error) {
+	return "failing-embedder-v1", nil
+}
+
+type noIdentityEmbedder struct{}
+
+func (noIdentityEmbedder) Embed(
+	context.Context, model.EmbedRequest,
+) (model.EmbedResult, error) {
+	return model.EmbedResult{
+		Vector: []float32{1},
+		Provenance: model.Provenance{
+			Provider: "custom",
+			Model:    "missing-identity",
+		},
+	}, nil
+}
+
+func (failingEmbedder) Embed(
+	context.Context, model.EmbedRequest,
+) (model.EmbedResult, error) {
+	return model.EmbedResult{}, model.ErrUnavailable
 }

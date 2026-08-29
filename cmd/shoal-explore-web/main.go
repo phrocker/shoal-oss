@@ -33,6 +33,7 @@ import (
 
 	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/explorer/webapi"
+	"github.com/phrocker/shoal-oss/pkg/model"
 )
 
 func main() {
@@ -51,11 +52,41 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 	data := flags.String("data", ".shoal/explorer", "Explorer corpus directory")
 	listen := flags.String("listen", "127.0.0.1:8080", "HTTP listen address")
 	remote := flags.String("remote", "", "Remote Explorer web API URL for -backend remote")
+	embeddingProvider := flags.String(
+		"embedding-provider", "",
+		"Optional embedded vector provider: fake, ollama, or openai",
+	)
+	embeddingModel := flags.String(
+		"embedding-model", "",
+		"Embedding model name for -embedding-provider",
+	)
+	embeddingBaseURL := flags.String(
+		"embedding-base-url", "",
+		"Embedding provider base URL for ollama/openai",
+	)
+	embeddingAPIKeyEnv := flags.String(
+		"embedding-api-key-env", "OPENAI_API_KEY",
+		"Environment variable read at request time for openai credentials",
+	)
+	embeddingDimensions := flags.Int(
+		"embedding-dimensions", 0,
+		"Fake embedding dimensions; zero uses the provider default",
+	)
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
 
-	service, cleanup, err := openService(*backend, *data, *remote)
+	embedding, err := embeddingConfig{
+		provider:   *embeddingProvider,
+		model:      *embeddingModel,
+		baseURL:    *embeddingBaseURL,
+		apiKeyEnv:  *embeddingAPIKeyEnv,
+		dimensions: *embeddingDimensions,
+	}.embedder()
+	if err != nil {
+		return err
+	}
+	service, cleanup, err := openService(*backend, *data, *remote, embedding)
 	if err != nil {
 		return err
 	}
@@ -92,10 +123,64 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 	return err
 }
 
-func openService(backend, data, remote string) (webapi.Service, func(), error) {
+type embeddingConfig struct {
+	provider   string
+	model      string
+	baseURL    string
+	apiKeyEnv  string
+	dimensions int
+}
+
+func (c embeddingConfig) embedder() (model.Embedder, error) {
+	switch c.provider {
+	case "":
+		return nil, nil
+	case "fake":
+		return model.FakeEmbedder{Dimensions: c.dimensions, Model: c.model}, nil
+	case "ollama":
+		return model.NewOllamaEmbedder(model.OllamaConfig{
+			BaseURL: c.baseURL,
+			Model:   c.model,
+		})
+	case "openai":
+		return model.NewOpenAIEmbedder(model.OpenAIConfig{
+			BaseURL:        c.baseURL,
+			EmbeddingModel: c.model,
+			Credentials:    envCredentialResolver(c.apiKeyEnv),
+		})
+	default:
+		return nil, fmt.Errorf("unknown embedding provider %q", c.provider)
+	}
+}
+
+type envCredentialResolver string
+
+func (r envCredentialResolver) ResolveCredential(context.Context) ([]byte, error) {
+	if r == "" {
+		return nil, model.ErrInvalidConfig
+	}
+	value := os.Getenv(string(r))
+	if value == "" {
+		return nil, model.ErrCredential
+	}
+	return []byte(value), nil
+}
+
+func (r envCredentialResolver) CacheIdentity() (string, error) {
+	if r == "" {
+		return "", model.ErrInvalidConfig
+	}
+	return "env:" + string(r), nil
+}
+
+func openService(
+	backend, data, remote string, embedder model.Embedder,
+) (webapi.Service, func(), error) {
 	switch backend {
 	case "embedded":
-		corpus, err := explorer.Open(data)
+		corpus, err := explorer.OpenWithOptions(data, explorer.Options{
+			Embedder: embedder,
+		})
 		if err != nil {
 			return nil, func() {}, err
 		}

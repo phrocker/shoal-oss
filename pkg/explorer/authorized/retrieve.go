@@ -40,6 +40,12 @@ func (c *Client) Retrieve(
 	if err := normalized.ValidateSeedPlan(true); err != nil {
 		return retrieval.Response{}, err
 	}
+	if normalized.HasMode(retrieval.ModeVector) && !c.authorizedVectorScoringAvailable() {
+		return retrieval.Response{}, shoal.NewError(
+			shoal.ErrorUnavailable,
+			"authorized vector retrieval requires trusted vector validation",
+		)
+	}
 	decision, guard, now, err := c.begin(ctx, auth.OperationRetrieve)
 	if err != nil {
 		return retrieval.Response{}, err
@@ -86,10 +92,16 @@ func (c *Client) Retrieve(
 			}
 		}
 		if len(documentIDs) == 0 {
+			if err := c.probeAuthorizedVector(ctx, normalized); err != nil {
+				return retrieval.Response{}, err
+			}
 			return c.emptyRetrieval(ctx, guard, normalized)
 		}
 	}
 	if len(documentIDs) == 0 {
+		if err := c.probeAuthorizedVector(ctx, normalized); err != nil {
+			return retrieval.Response{}, err
+		}
 		return c.emptyRetrieval(ctx, guard, normalized)
 	}
 	selected := make(map[shoal.ID]RevisionRegistration, len(documentIDs))
@@ -115,6 +127,9 @@ func (c *Client) Retrieve(
 			}
 		}
 		if len(nodeIDs) == 0 {
+			if err := c.probeAuthorizedVector(ctx, normalized); err != nil {
+				return retrieval.Response{}, err
+			}
 			return c.emptyRetrieval(ctx, guard, normalized)
 		}
 	}

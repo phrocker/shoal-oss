@@ -67,6 +67,37 @@ func TestIngestListQueryWorkflow(t *testing.T) {
 	}
 }
 
+func TestVectorIngestQueryWorkflowUsesConfiguredEmbedder(t *testing.T) {
+	dir := t.TempDir()
+	source := filepath.Join(dir, "vector.txt")
+	const quote = "Configured fake embeddings make vector retrieval usable."
+	if err := os.WriteFile(source, []byte(quote), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	data := filepath.Join(dir, "data")
+	var output bytes.Buffer
+	if err := run(context.Background(), []string{
+		"ingest", "-data", data, "-file", source,
+		"-embedding-provider", "fake",
+		"-embedding-model", "cli-vector",
+		"-embedding-dimensions", "8",
+	}, &output); err != nil {
+		t.Fatal(err)
+	}
+	output.Reset()
+	if err := run(context.Background(), []string{
+		"query", "-data", data, "-text", quote, "-modes", "vector",
+		"-embedding-provider", "fake",
+		"-embedding-model", "cli-vector",
+		"-embedding-dimensions", "8",
+	}, &output); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(output.String(), quote) {
+		t.Fatalf("vector query output = %s", output.String())
+	}
+}
+
 func TestAskWorkflowUsesFakeProviderDeterministically(t *testing.T) {
 	data := ingestAskFixture(t)
 	args := []string{

@@ -34,8 +34,8 @@ const (
 		unicode.Version
 
 	// CoverageFusionScorerVersion identifies the exact term coverage and
-	// lexical/tree/graph fusion formulas implemented below.
-	CoverageFusionScorerVersion = "exact-coverage-lexical-tree-graph-fusion-v1"
+	// lexical/tree/graph/vector fusion formulas implemented below.
+	CoverageFusionScorerVersion = "exact-coverage-lexical-tree-graph-vector-fusion-v2"
 )
 
 // TermSet is the unique analyzed terms for one value. Analyzer and Scorer
@@ -56,6 +56,7 @@ type ComponentScores struct {
 	Lexical shoal.Score
 	Tree    shoal.Score
 	Graph   shoal.Score
+	Vector  shoal.Score
 }
 
 // Scorer computes exact coverage and mode fusion. Implementations must return
@@ -135,6 +136,8 @@ func (CoverageFusionScorer) ModeScore(
 		return scores.Tree*0.35 + scores.Lexical*0.65
 	case ModeGraph:
 		return scores.Graph*0.25 + scores.Lexical*0.75
+	case ModeVector:
+		return scores.Vector
 	default:
 		return 0
 	}

@@ -54,6 +54,40 @@ type canonicalEdgePair struct {
 	to   shoal.ID
 }
 
+// VectorScorer recomputes vector scores for exact citations over a trusted
+// corpus. Callers must provide one explicitly; it is not inferred from the
+// untrusted retrieval backend.
+type VectorScorer interface {
+	VectorScores(
+		context.Context, explorer.VectorScoreRequest,
+	) (map[shoal.ID]shoal.Score, error)
+}
+
+func (c *Client) authorizedVectorScoringAvailable() bool {
+	return !isNilDependency(c.vectorScorer)
+}
+
+func (c *Client) probeAuthorizedVector(
+	ctx context.Context, request retrieval.Request,
+) error {
+	if !request.HasMode(retrieval.ModeVector) {
+		return nil
+	}
+	if isNilDependency(c.vectorScorer) {
+		return shoal.NewError(
+			shoal.ErrorUnavailable,
+			"authorized vector retrieval requires trusted vector validation",
+		)
+	}
+	_, err := c.vectorScorer.VectorScores(ctx, explorer.VectorScoreRequest{
+		Text: request.Text,
+	})
+	if err != nil {
+		return directBaseError(err)
+	}
+	return nil
+}
+
 func (c *Client) hydrateRetrievalCorpus(
 	ctx context.Context,
 	documentIDs []shoal.ID,
@@ -257,6 +291,10 @@ func (c *Client) validateRetrievedResponse(
 	for _, nodeID := range request.Scope.NodeIDs {
 		nodeScope[nodeID] = struct{}{}
 	}
+	vectorScores, err := c.authorizedVectorScores(ctx, request, corpus, nodeScope)
+	if err != nil {
+		return err
+	}
 	expectedIDs := make([]shoal.ID, 0)
 	expectedResults := make([]retrieval.Result, 0)
 	for _, canonical := range corpus.documents {
@@ -271,6 +309,11 @@ func (c *Client) validateRetrievedResponse(
 			}
 			scores := canonicalComponentScores(
 				canonical, span, path, queryTerms, scorer, analyzer)
+			if err := applyCanonicalVectorScore(
+				&scores, vectorScores, span.ID, request,
+			); err != nil {
+				return err
+			}
 			score := scorer.CombinedScore(request.Modes, scores)
 			if score <= 0 {
 				continue
@@ -360,6 +403,11 @@ func (c *Client) validateRetrievedResponse(
 		}
 		scores := canonicalComponentScores(
 			canonical, span, expectedPath, queryTerms, scorer, analyzer)
+		if err := applyCanonicalVectorScore(
+			&scores, vectorScores, span.ID, request,
+		); err != nil {
+			return err
+		}
 		expectedScore := scorer.CombinedScore(request.Modes, scores)
 		if expectedScore <= 0 ||
 			!scoresEqual(result.Score, expectedScore) ||
@@ -372,6 +420,70 @@ func (c *Client) validateRetrievedResponse(
 			return inconsistentRetrieval()
 		}
 	}
+	return nil
+}
+
+func (c *Client) authorizedVectorScores(
+	ctx context.Context,
+	request retrieval.Request,
+	corpus *canonicalRetrievalCorpus,
+	nodeScope map[shoal.ID]struct{},
+) (map[shoal.ID]shoal.Score, error) {
+	if !request.HasMode(retrieval.ModeVector) {
+		return nil, nil
+	}
+	if isNilDependency(c.vectorScorer) {
+		return nil, shoal.NewError(
+			shoal.ErrorUnavailable,
+			"authorized vector retrieval requires trusted vector validation",
+		)
+	}
+	var citations []document.Citation
+	for _, canonical := range corpus.documents {
+		for _, span := range canonical.spans {
+			if len(nodeScope) > 0 &&
+				!canonicalSpanInNodeScope(canonical, span, nodeScope) {
+				continue
+			}
+			citations = append(citations, document.Citation{
+				DocumentID: span.DocumentID,
+				RevisionID: span.RevisionID,
+				SectionID:  span.SectionID,
+				SpanID:     span.ID,
+				Range:      span.Range,
+			})
+		}
+	}
+	scores, err := c.vectorScorer.VectorScores(ctx, explorer.VectorScoreRequest{
+		Text:      request.Text,
+		Citations: citations,
+	})
+	if err != nil {
+		return nil, directBaseError(err)
+	}
+	if len(scores) != len(citations) {
+		return nil, inconsistentRetrieval()
+	}
+	return scores, nil
+}
+
+func applyCanonicalVectorScore(
+	scores *retrieval.ComponentScores,
+	vectorScores map[shoal.ID]shoal.Score,
+	spanID shoal.ID,
+	request retrieval.Request,
+) error {
+	if !request.HasMode(retrieval.ModeVector) {
+		return nil
+	}
+	if scores == nil {
+		return inconsistentRetrieval()
+	}
+	score, ok := vectorScores[spanID]
+	if !ok {
+		return inconsistentRetrieval()
+	}
+	scores.Vector = score
 	return nil
 }
 
