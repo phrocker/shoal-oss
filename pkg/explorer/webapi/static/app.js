@@ -2,9 +2,12 @@ const state = {
   snapshot: {},
   cursor: "",
   document: null,
+  currentDocumentID: "",
+  selectedSectionID: "",
   nodes: new Map(),
   edges: new Map(),
   graphCursors: new Map(),
+  sourceURIs: new Map(),
   selected: null,
   capabilities: {
     documents: false,
@@ -12,6 +15,7 @@ const state = {
     retrieve: false,
     neighborhood: false,
     path: false,
+    vector_retrieval: false,
   },
 };
 const $ = (id) => document.getElementById(id);
@@ -39,23 +43,28 @@ async function loadMeta() {
 }
 
 function capability(name) {
-  return state.capabilities[name] !== false;
+  return state.capabilities[name] === true;
+}
+
+function vectorRetrievalCapability() {
+  return capability("vector_retrieval");
 }
 
 function applyCapabilities() {
   const canRetrieve = capability("retrieve");
   $("query").disabled = !canRetrieve;
-  $("search").querySelector("button").disabled = !canRetrieve;
+  $("search-button").disabled = !canRetrieve;
   $("modes").disabled = !canRetrieve;
-  const evidence = $("evidence");
+  applyVectorCapability(canRetrieve);
+
+  const evidenceStatus = $("evidence-status");
   if (!canRetrieve) {
-    evidence.dataset.capabilityPlaceholder = "retrieve";
-    evidence.innerHTML =
-      "<p class=muted>Retrieval is unavailable from this Explorer service.</p>";
-  } else if (evidence.dataset.capabilityPlaceholder === "retrieve") {
-    delete evidence.dataset.capabilityPlaceholder;
-    evidence.innerHTML =
-      "<p class=muted>Run a retrieval query to inspect exact evidence and explanations.</p>";
+    evidenceStatus.dataset.capabilityPlaceholder = "retrieve";
+    setStatus(evidenceStatus, "Retrieval is unavailable from this Explorer service.");
+    $("evidence-results").replaceChildren();
+  } else if (evidenceStatus.dataset.capabilityPlaceholder === "retrieve") {
+    delete evidenceStatus.dataset.capabilityPlaceholder;
+    setStatus(evidenceStatus, "Run a retrieval query to inspect exact evidence and explanations.");
   }
 
   const canNeighborhood = capability("neighborhood");
@@ -82,23 +91,55 @@ function applyCapabilities() {
   }
 
   if (!capability("documents")) {
-    $("documents").innerHTML =
-      "<p class=muted>Document listing is unavailable from this Explorer service.</p>";
+    setStatus($("documents-status"), "Document listing is unavailable from this Explorer service.");
+    $("documents").replaceChildren();
     $("more").hidden = true;
   }
 }
 
-function escapeHTML(value) {
-  return String(value ?? "").replace(
-    /[&<>"']/g,
-    (character) => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[character]),
-  );
+function applyVectorCapability(canRetrieve) {
+  const checkbox = $("mode-vector");
+  const control = $("mode-vector-control");
+  const status = $("vector-mode-status");
+  const canVector = vectorRetrievalCapability();
+  checkbox.disabled = !canRetrieve || !canVector;
+  control.classList.toggle("unavailable", !canVector);
+  control.setAttribute("aria-disabled", String(!canVector));
+  if (!canVector) {
+    checkbox.checked = false;
+    status.hidden = false;
+    status.textContent =
+      "Vector retrieval is disabled because this Explorer service did not advertise vector support.";
+  } else {
+    status.hidden = true;
+    status.textContent = "";
+  }
+}
+
+function setMessage(element, message, className = "muted") {
+  const paragraph = document.createElement("p");
+  paragraph.className = className;
+  paragraph.textContent = message;
+  element.replaceChildren(paragraph);
+}
+
+function setStatus(element, message, className = "muted") {
+  element.className = className;
+  element.textContent = message;
+}
+
+function showError(element, error) {
+  if (element.getAttribute && element.getAttribute("role") === "status") {
+    setStatus(element, error.message || String(error), "error");
+    return;
+  }
+  setMessage(element, error.message || String(error), "error");
 }
 
 function pin(snapshot) {
   state.snapshot = snapshot;
   $("snapshot").textContent =
-    `snapshot ${snapshot.id.slice(0, 10)} · frontier ${snapshot.frontier}`;
+    `snapshot ${String(snapshot.id || "").slice(0, 10)} · frontier ${snapshot.frontier}`;
 }
 
 async function loadDocuments(reset = true) {
@@ -106,39 +147,115 @@ async function loadDocuments(reset = true) {
   if (documentsLoading) return;
   documentsLoading = true;
   $("more").disabled = true;
+  $("documents").setAttribute("aria-busy", "true");
+  if (reset) {
+    state.cursor = "";
+    setStatus($("documents-status"), "Loading documents…");
+  }
   try {
-    if (reset) {
-      state.cursor = "";
-      $("documents").innerHTML = "";
-    }
     const response = await api("documents", {
       snapshot: state.snapshot,
       page: {limit: 25, cursor: state.cursor},
     });
     pin(response.snapshot);
-    for (const item of response.documents) {
-      const element = document.createElement("button");
-      element.className = "doc";
-      element.disabled = !capability("document");
-      element.innerHTML =
-        `<strong>${escapeHTML(item.document.title)}</strong><br>` +
-        `<small>${escapeHTML(item.source_uri || item.document.id)}</small>`;
-      element.onclick = () => loadDocument(item.document.id, item.revision.id);
-      $("documents").append(element);
+    if (reset) $("documents").replaceChildren();
+    const documents = response.documents || [];
+    if (documents.length === 0 && reset) {
+      setStatus($("documents-status"), "No documents have been ingested yet.", "empty-state");
+    } else {
+      setStatus($("documents-status"), `Showing ${$("documents").children.length + documents.length} document(s).`);
     }
+    const fragment = document.createDocumentFragment();
+    for (const item of documents) fragment.append(createDocumentCard(item));
+    $("documents").append(fragment);
     state.cursor = response.next_cursor || "";
     $("more").hidden = !state.cursor;
   } catch (error) {
-    showError($("documents"), error);
+    showError($("documents-status"), error);
   } finally {
     documentsLoading = false;
+    $("documents").setAttribute("aria-busy", "false");
     $("more").disabled = false;
+  }
+}
+
+function createDocumentCard(item) {
+  const documentValue = item.document || {};
+  const title = documentValue.title || "(untitled document)";
+  const documentID = documentValue.id || "";
+  const sourceURI = item.source_uri || "";
+  if (documentID) state.sourceURIs.set(documentID, sourceURI);
+
+  const card = document.createElement("div");
+  card.className = "doc-card";
+  card.dataset.document = documentID;
+
+  const button = document.createElement("button");
+  button.className = "doc";
+  button.type = "button";
+  button.disabled = !capability("document");
+  button.title = sourceLabel(sourceURI, documentID);
+  button.onclick = () => loadDocument(documentID, item.revision && item.revision.id);
+
+  const titleElement = document.createElement("strong");
+  titleElement.textContent = title;
+  const sourceElement = document.createElement("small");
+  sourceElement.className = "source-label";
+  sourceElement.textContent = sourceLabel(sourceURI, documentID);
+  button.append(titleElement, sourceElement);
+  card.append(button);
+
+  if (sourceURI) {
+    const details = document.createElement("details");
+    details.className = "source-details";
+    const summary = document.createElement("summary");
+    summary.textContent = "Full source URI";
+    const code = document.createElement("code");
+    code.textContent = sourceURI;
+    details.append(summary, code);
+    card.append(details);
+  }
+  updateDocumentCardSelection(card);
+  return card;
+}
+
+function sourceLabel(uri, fallback = "") {
+  const value = String(uri || "").trim();
+  if (!value) return fallback || "source unavailable";
+  try {
+    const parsed = new URL(value);
+    if (parsed.protocol === "file:") return basename(parsed.pathname) || "local file";
+    if (parsed.protocol === "http:" || parsed.protocol === "https:") {
+      const leaf = basename(parsed.pathname);
+      return leaf ? `${parsed.hostname} / ${leaf}` : parsed.hostname;
+    }
+  } catch (_) {
+    // Fall through to generic path handling.
+  }
+  return basename(value) || value;
+}
+
+function basename(value) {
+  const withoutQuery = String(value || "").split(/[?#]/, 1)[0];
+  const normalized = withoutQuery.replace(/\\/g, "/").replace(/\/+$/, "");
+  const name = normalized.slice(normalized.lastIndexOf("/") + 1);
+  try {
+    return decodeURIComponent(name);
+  } catch (_) {
+    return name;
   }
 }
 
 async function loadDocument(documentID, revisionID) {
   if (!capability("document")) return;
   const generation = ++documentGeneration;
+  state.currentDocumentID = documentID;
+  state.document = null;
+  state.selectedSectionID = "";
+  updateDocumentCardSelection();
+  $("hierarchy").replaceChildren();
+  $("hierarchy").setAttribute("aria-busy", "true");
+  setStatus($("hierarchy-status"), "Loading document hierarchy…");
   try {
     const response = await api("document", {
       snapshot: state.snapshot,
@@ -148,35 +265,83 @@ async function loadDocument(documentID, revisionID) {
     if (generation !== documentGeneration) return;
     pin(response.snapshot);
     state.document = response.document;
-    $("hierarchy").classList.remove("muted");
-    $("hierarchy").innerHTML = sectionHTML(response.document.root);
-    $("hierarchy").querySelectorAll("[data-section]").forEach((element) => {
-      element.onclick = () => selectSection(element.dataset.section);
-    });
+    state.sourceURIs.set(response.document.document.id, response.document.source_uri || "");
+    renderHierarchy(response.document.root);
     mergeGraph({nodes: [nodeFromDocument(response.document.document)], edges: []});
     draw();
   } catch (error) {
-    if (generation === documentGeneration) showError($("hierarchy"), error);
+    if (generation === documentGeneration) showError($("hierarchy-status"), error);
+  } finally {
+    if (generation === documentGeneration) $("hierarchy").setAttribute("aria-busy", "false");
   }
 }
 
-function sectionHTML(view) {
-  return `<ul><li><button class="section-node" data-section="${escapeHTML(view.section.id)}">` +
-    `${escapeHTML(view.section.heading || "(untitled)")}</button>` +
-    view.spans.map((span) => `<div class="citation">${escapeHTML(span.text)}</div>`).join("") +
-    view.children.map(sectionHTML).join("") +
-    "</li></ul>";
+function updateDocumentCardSelection(card) {
+  const cards = card ? [card] : [...document.querySelectorAll(".doc-card")];
+  for (const candidate of cards) {
+    const selected = candidate.dataset.document === state.currentDocumentID;
+    candidate.classList.toggle("selected", selected);
+    const button = candidate.querySelector(".doc");
+    if (button) button.setAttribute("aria-current", selected ? "true" : "false");
+  }
+}
+
+function renderHierarchy(root) {
+  const hierarchy = $("hierarchy");
+  if (!root) {
+    hierarchy.replaceChildren();
+    setStatus($("hierarchy-status"), "This document has no hierarchy.", "empty-state");
+    return;
+  }
+  setStatus($("hierarchy-status"), "Document hierarchy loaded.");
+  hierarchy.replaceChildren(sectionList(root));
+}
+
+function sectionList(view) {
+  const list = document.createElement("ul");
+  const item = document.createElement("li");
+  const button = document.createElement("button");
+  button.className = "section-node";
+  button.type = "button";
+  button.dataset.section = view.section.id;
+  button.textContent = view.section.heading || "(untitled)";
+  button.setAttribute("aria-pressed", String(view.section.id === state.selectedSectionID));
+  button.onclick = () => selectSection(view.section.id);
+  item.append(button);
+  for (const span of view.spans || []) {
+    const snippet = document.createElement("div");
+    snippet.className = "citation span-snippet";
+    snippet.textContent = span.text || "";
+    item.append(snippet);
+  }
+  for (const child of view.children || []) item.append(sectionList(child));
+  list.append(item);
+  return list;
 }
 
 function selectSection(id) {
+  if (!state.document || !state.document.root) return;
   const find = (view) =>
-    view.section.id === id ? view : view.children.map(find).find(Boolean);
+    view.section.id === id ? view : (view.children || []).map(find).find(Boolean);
   const view = find(state.document.root);
-  $("selection").innerHTML = `<div class="kv"><b>Section</b>` +
-    `<span>${escapeHTML(view.section.heading)}</span><b>ID</b>` +
-    `<span>${escapeHTML(id)}</span><b>Range</b>` +
-    `<span>${view.section.range.start.offset}–${view.section.range.end.offset}</span></div>`;
+  if (!view) return;
+  state.selectedSectionID = id;
+  updateSectionSelection();
+  showSelection([
+    ["Section", view.section.heading || "(untitled)"],
+    ["ID", id],
+    ["Range", `${view.section.range.start.offset}–${view.section.range.end.offset}`],
+  ]);
   if (capability("neighborhood")) expandIDs([id]);
+}
+
+function updateSectionSelection() {
+  $("hierarchy").querySelectorAll("[data-section]").forEach((element) => {
+    element.setAttribute(
+      "aria-pressed",
+      String(element.dataset.section === state.selectedSectionID),
+    );
+  });
 }
 
 function nodeFromDocument(documentValue) {
@@ -192,13 +357,17 @@ $("search").onsubmit = async (event) => {
   event.preventDefault();
   if (!capability("retrieve")) return;
   const generation = ++searchGeneration;
+  setStatus($("evidence-status"), "Searching evidence…");
+  $("evidence-results").replaceChildren();
   try {
     const response = await api("retrieve", {
       snapshot: state.snapshot,
       query: {
         text: $("query").value,
         top_k: 20,
-        modes: [...document.querySelectorAll("#modes input:checked")].map((input) => input.value),
+        modes: [...document.querySelectorAll("#modes input:checked:not(:disabled)")].map(
+          (input) => input.value,
+        ),
         explain: true,
         as_of: state.snapshot.as_of,
       },
@@ -207,44 +376,88 @@ $("search").onsubmit = async (event) => {
     pin(response.snapshot);
     renderEvidence(response.retrieval);
   } catch (error) {
-    if (generation === searchGeneration) showError($("evidence"), error);
+    if (generation === searchGeneration) showError($("evidence-status"), error);
   }
 };
 
 function renderEvidence(response) {
   const results = response.results || [];
-  $("evidence").innerHTML = results.length ? "" : "<p class=muted>No evidence matched.</p>";
-  for (const result of results) {
+  if (results.length === 0) {
+    $("evidence-results").replaceChildren();
+    setStatus($("evidence-status"), "No evidence matched.", "empty-state");
+    draw();
+    return;
+  }
+  setStatus($("evidence-status"), `Showing ${results.length} evidence result(s).`);
+  const fragment = document.createDocumentFragment();
+  results.forEach((result) => {
     const element = document.createElement("article");
     element.className = "result";
-    const evidence = (result.evidence || []).map((item, index) =>
-      `<button class="evidence-quote" data-evidence="${index}">${escapeHTML(item.quote)}</button>` +
-      `<div class="citation">${escapeHTML(item.citation.document_id)} / ` +
-      `${escapeHTML(item.citation.revision_id)} / bytes ` +
-      `${item.citation.range.start.offset}–${item.citation.range.end.offset}</div>`,
-    ).join("");
-    const explanation = result.explanation
-      ? `<pre class="explanation">${escapeHTML(result.explanation.summary)}\n` +
-        `${escapeHTML(JSON.stringify(result.explanation.scores, null, 2))}</pre>`
-      : "";
-    element.innerHTML = `<b>${escapeHTML(result.id)}</b> ` +
-      `<span class=score>${Number(result.score).toFixed(3)}</span>${evidence}${explanation}`;
-    element.querySelectorAll(".evidence-quote").forEach((quote, index) => {
-      quote.onclick = () => selectEvidence(result, result.evidence[index]);
+
+    const header = document.createElement("div");
+    header.className = "result-header";
+    const title = document.createElement("b");
+    title.className = "result-title";
+    title.textContent = result.id;
+    title.title = result.id;
+    const score = document.createElement("span");
+    score.className = "score";
+    score.textContent = Number(result.score).toFixed(3);
+    header.append(title, score);
+    element.append(header);
+
+    (result.evidence || []).forEach((item) => {
+      const quote = document.createElement("button");
+      quote.className = "evidence-quote";
+      quote.type = "button";
+      quote.textContent = item.quote || "";
+      quote.onclick = () => selectEvidence(result, item);
+      const citation = document.createElement("div");
+      citation.className = "citation";
+      citation.textContent = `${item.citation.document_id} / ${item.citation.revision_id} / bytes ` +
+        `${item.citation.range.start.offset}–${item.citation.range.end.offset}`;
+      element.append(quote, citation);
+      mergeGraph(item.path || {});
     });
-    $("evidence").append(element);
-    for (const item of result.evidence || []) mergeGraph(item.path || {});
-  }
+
+    if (result.explanation) {
+      const explanation = document.createElement("pre");
+      explanation.className = "explanation";
+      explanation.textContent = `${result.explanation.summary || ""}\n` +
+        JSON.stringify(result.explanation.scores || {}, null, 2);
+      element.append(explanation);
+    }
+    fragment.append(element);
+  });
+  $("evidence-results").replaceChildren(fragment);
   draw();
 }
 
 function selectEvidence(result, evidence) {
-  $("selection").innerHTML = `<div class=kv><b>Result</b><span>${escapeHTML(result.id)}</span>` +
-    `<b>Quote</b><span>${escapeHTML(evidence.quote)}</span>` +
-    `<b>Document</b><span>${escapeHTML(evidence.citation.document_id)}</span>` +
-    `<b>Section</b><span>${escapeHTML(evidence.citation.section_id)}</span>` +
-    `<b>Span</b><span>${escapeHTML(evidence.citation.span_id)}</span></div>`;
+  const source = state.sourceURIs.get(evidence.citation.document_id) || "";
+  showSelection([
+    ["Result", result.id],
+    ["Quote", evidence.quote],
+    ["Document", sourceLabel(source, evidence.citation.document_id)],
+    ["Section", evidence.citation.section_id],
+    ["Span", evidence.citation.span_id],
+  ]);
   loadDocument(evidence.citation.document_id, evidence.citation.revision_id);
+}
+
+function showSelection(entries) {
+  const container = document.createElement("div");
+  container.className = "kv";
+  for (const [key, value] of entries) {
+    const label = document.createElement("b");
+    label.textContent = key;
+    const text = document.createElement("span");
+    text.textContent = value == null ? "" : String(value);
+    text.title = text.textContent;
+    container.append(label, text);
+  }
+  $("selection").classList.remove("muted");
+  $("selection").replaceChildren(container);
 }
 
 function mergeGraph(graph) {
@@ -257,6 +470,7 @@ function mergeGraph(graph) {
 
 async function expandIDs(ids, cursor = "") {
   if (!capability("neighborhood")) return;
+  $("graph-status").textContent = cursor ? "Loading more neighbors…" : "Expanding graph…";
   try {
     const response = await api("neighborhood", {
       snapshot: state.snapshot,
@@ -279,6 +493,7 @@ async function expandIDs(ids, cursor = "") {
     activate("graph");
     draw();
   } catch (error) {
+    $("graph-status").textContent = `Graph expansion failed: ${error.message || String(error)}`;
     showError($("selection"), error);
   }
 }
@@ -291,6 +506,7 @@ $("continue-expansion").onclick = () => {
 $("more").onclick = () => loadDocuments(false);
 $("find-path").onclick = async () => {
   if (!capability("path")) return;
+  $("graph-status").textContent = "Finding directed path…";
   try {
     const response = await api("path", {
       snapshot: state.snapshot,
@@ -305,6 +521,7 @@ $("find-path").onclick = async () => {
       `Directed path at snapshot frontier ${response.snapshot.frontier}.`;
     draw();
   } catch (error) {
+    $("graph-status").textContent = `Path finding failed: ${error.message || String(error)}`;
     showError($("selection"), error);
   }
 };
@@ -335,31 +552,42 @@ function activate(id) {
   if (id === "graph") draw();
 }
 
-function showError(element, error) {
-  element.innerHTML = `<p class=error>${escapeHTML(error.message)}</p>`;
-}
-
 function renderGraphList() {
-  $("graph-nodes").innerHTML = "";
-  $("graph-edges").innerHTML = "";
-  for (const node of state.nodes.values()) {
-    const button = document.createElement("button");
-    button.textContent = (node.labels && node.labels[0]) || node.kind || node.id;
-    button.setAttribute("aria-label", `${button.textContent}, node ${node.id}`);
-    button.setAttribute("aria-pressed", String(node.id === state.selected));
-    button.onclick = () => selectNode(node.id);
-    $("graph-nodes").append(button);
+  const nodesElement = $("graph-nodes");
+  const edgesElement = $("graph-edges");
+  nodesElement.replaceChildren();
+  edgesElement.replaceChildren();
+  if (state.nodes.size === 0) {
+    setMessage(nodesElement, "No graph nodes yet.", "empty-state");
+  } else {
+    for (const node of state.nodes.values()) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.textContent = nodeName(node, node.id);
+      button.title = button.textContent;
+      button.setAttribute("aria-label", `${button.textContent}, node ${node.id}`);
+      button.setAttribute("aria-pressed", String(node.id === state.selected));
+      button.onclick = () => selectNode(node.id);
+      nodesElement.append(button);
+    }
   }
-  for (const edge of state.edges.values()) {
+  if (state.edges.size === 0) {
     const item = document.createElement("li");
-    const from = state.nodes.get(edge.from);
-    const to = state.nodes.get(edge.to);
-    item.textContent = `${nodeName(from, edge.from)} → ${nodeName(to, edge.to)} (${edge.type})`;
-    item.setAttribute(
-      "aria-label",
-      `${nodeName(from, edge.from)} ${edge.from} to ${nodeName(to, edge.to)} ${edge.to}, ${edge.type}`,
-    );
-    $("graph-edges").append(item);
+    item.className = "muted";
+    item.textContent = "No graph edges yet.";
+    edgesElement.append(item);
+  } else {
+    for (const edge of state.edges.values()) {
+      const item = document.createElement("li");
+      const from = state.nodes.get(edge.from);
+      const to = state.nodes.get(edge.to);
+      item.textContent = `${nodeName(from, edge.from)} → ${nodeName(to, edge.to)} (${edge.type})`;
+      item.setAttribute(
+        "aria-label",
+        `${nodeName(from, edge.from)} ${edge.from} to ${nodeName(to, edge.to)} ${edge.to}, ${edge.type}`,
+      );
+      edgesElement.append(item);
+    }
   }
 }
 
@@ -373,11 +601,16 @@ function selectNode(id) {
   updateContinueButton();
   const node = state.nodes.get(id);
   if (node) {
-    $("selection").innerHTML = `<div class=kv><b>Node</b><span>${escapeHTML(id)}</span>` +
-      `<b>Kind</b><span>${escapeHTML(node.kind)}</span><b>Labels</b>` +
-      `<span>${escapeHTML((node.labels || []).join(", "))}</span><b>Properties</b>` +
-      `<span>${escapeHTML(JSON.stringify(node.properties || {}))}</span></div>`;
+    showSelection([
+      ["Node", id],
+      ["Kind", node.kind],
+      ["Labels", (node.labels || []).join(", ")],
+      ["Properties", JSON.stringify(node.properties || {})],
+    ]);
     $("path-from").value = id;
+  } else {
+    $("selection").className = "muted";
+    setMessage($("selection"), "Select evidence, a hierarchy section, or a graph node.");
   }
 
   renderGraphList();
@@ -389,6 +622,11 @@ function updateContinueButton() {
     !capability("neighborhood") ||
     !state.selected ||
     !state.graphCursors.has(state.selected);
+}
+
+function shortLabel(value) {
+  const text = String(value || "");
+  return text.length > 42 ? `${text.slice(0, 20)}…${text.slice(-18)}` : text;
 }
 
 const canvas = $("canvas");
@@ -416,6 +654,7 @@ function draw() {
     }
   });
   context.clearRect(0, 0, rectangle.width, rectangle.height);
+  if (nodes.length === 0) return;
   context.strokeStyle = "#536a8d";
   for (const edge of state.edges.values()) {
     const from = positions.get(edge.from);
@@ -426,7 +665,7 @@ function draw() {
     context.lineTo(to.x, to.y);
     context.stroke();
     context.fillStyle = "#8fa3bf";
-    context.fillText(edge.type, (from.x + to.x) / 2, (from.y + to.y) / 2);
+    context.fillText(shortLabel(edge.type), (from.x + to.x) / 2, (from.y + to.y) / 2);
   }
   for (const node of nodes) {
     const position = positions.get(node.id);
@@ -435,11 +674,7 @@ function draw() {
     context.fillStyle = node.id === state.selected ? "#ffd166" : "#55c2ff";
     context.fill();
     context.fillStyle = "#e5edf8";
-    context.fillText(
-      (node.labels && node.labels[0]) || node.kind || node.id,
-      position.x + 11,
-      position.y + 4,
-    );
+    context.fillText(shortLabel(nodeName(node, node.id)), position.x + 11, position.y + 4);
   }
 }
 
@@ -463,6 +698,7 @@ new ResizeObserver(() => {
   positions.clear();
   draw();
 }).observe(canvas);
+renderGraphList();
 applyCapabilities();
 loadMeta()
   .then(() => loadDocuments())

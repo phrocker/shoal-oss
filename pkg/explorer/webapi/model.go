@@ -51,6 +51,7 @@ const (
 	CapabilityDocuments    Capability = "documents"
 	CapabilityDocument     Capability = "document"
 	CapabilityRetrieve     Capability = "retrieve"
+	CapabilityVector       Capability = "vector_retrieval"
 	CapabilityNeighborhood Capability = "neighborhood"
 	CapabilityPath         Capability = "path"
 )
@@ -60,6 +61,7 @@ type Capabilities struct {
 	Documents    bool `json:"documents"`
 	Document     bool `json:"document"`
 	Retrieve     bool `json:"retrieve"`
+	Vector       bool `json:"vector_retrieval"`
 	Neighborhood bool `json:"neighborhood"`
 	Path         bool `json:"path"`
 }
@@ -69,7 +71,7 @@ type Capabilities struct {
 func AllCapabilities() Capabilities {
 	return Capabilities{
 		Documents: true, Document: true, Retrieve: true,
-		Neighborhood: true, Path: true,
+		Vector: false, Neighborhood: true, Path: true,
 	}
 }
 
@@ -82,6 +84,8 @@ func (c Capabilities) Supports(capability Capability) bool {
 		return c.Document
 	case CapabilityRetrieve:
 		return c.Retrieve
+	case CapabilityVector:
+		return c.Vector
 	case CapabilityNeighborhood:
 		return c.Neighborhood
 	case CapabilityPath:
