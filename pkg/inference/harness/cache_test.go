@@ -140,6 +140,15 @@ func TestCacheRejectsUnsafeSecretMaterial(t *testing.T) {
 	if secretRunner.starts != 2 || cache.Len() != 0 {
 		t.Fatalf("secret action/result material was cached; starts=%d entries=%d", secretRunner.starts, cache.Len())
 	}
+	custom := &recordingCache{}
+	secretRunner = &secretActionRunner{}
+	g = cachedGenerator(t, secretRunner, pack, budgets(), nil, custom)
+	if _, err := g.Generate(context.Background(), pack); err != nil {
+		t.Fatal(err)
+	}
+	if custom.puts != 0 {
+		t.Fatalf("unsafe record reached custom cache: puts=%d", custom.puts)
+	}
 }
 
 func TestMemoryCacheEvictionAndEntryBounds(t *testing.T) {
@@ -218,6 +227,17 @@ func (r *secretActionRunner) Start(context.Context, SessionRequest) (Session, er
 }
 
 func (r *secretActionRunner) CacheIdentity() (string, error) { return "secret-action-runner-v1", nil }
+
+type recordingCache struct{ puts int }
+
+func (c *recordingCache) Get(context.Context, CacheKey) (Record, bool, error) {
+	return Record{}, false, nil
+}
+
+func (c *recordingCache) Put(context.Context, CacheKey, Record) error {
+	c.puts++
+	return nil
+}
 
 type secretActionSession struct {
 	request int

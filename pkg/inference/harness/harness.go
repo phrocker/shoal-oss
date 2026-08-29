@@ -736,7 +736,7 @@ func (g *Generator) Run(ctx context.Context, pack inference.ContextPack) (Record
 			Request: request, Transcript: cloneTranscript(transcript),
 			Result: result, Trace: cloneRunTrace(trace),
 		}
-		if err == nil && reason == StopReasonStop && cacheable {
+		if err == nil && reason == StopReasonStop && cacheable && !unsafeRecordForCache(record) {
 			_ = g.cache.Put(runCtx, cacheKey, record)
 		}
 		return record, err
