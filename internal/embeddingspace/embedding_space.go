@@ -136,37 +136,50 @@ func Decode(b []byte) (FileState, error) {
 }
 
 func Compatible(operation string, states ...FileState) (FileState, error) {
-	out := FileState{}
 	for _, state := range states {
 		if err := state.Validate(); err != nil {
 			return FileState{}, err
 		}
+	}
+	// Conflicting identities are reported even when an unknown or
+	// embedding-free input sits between them. Folding the merge and the
+	// conflict check into one pass would let the absorbing unknown state
+	// mask a real mismatch, so that a misconfiguration surfaces or hides
+	// depending on input order.
+	var embedded FileState
+	for _, state := range states {
 		if state.State != StateHasEmbeddings {
-			switch out.State {
-			case "":
-				out = state
-			case StateNoEmbeddings:
-				if state.State == StateUnknown {
-					out = Unknown()
-				}
-			case StateHasEmbeddings:
-				out = Unknown()
-			}
 			continue
 		}
-		if out.State == StateHasEmbeddings && out.Identity != state.Identity {
-			return FileState{}, &MismatchError{Operation: operation, Left: out, Right: state}
+		if embedded.State != StateHasEmbeddings {
+			embedded = state
+			continue
 		}
-		if out.State == StateNoEmbeddings || out.State == StateUnknown {
-			out = Unknown()
-		} else {
-			out = state
+		if embedded.Identity != state.Identity {
+			return FileState{}, &MismatchError{Operation: operation, Left: embedded, Right: state}
 		}
 	}
-	if out.State == "" {
-		out = Unknown()
+	unresolved := false
+	for _, state := range states {
+		if state.State != StateHasEmbeddings {
+			unresolved = true
+			break
+		}
 	}
-	return out, nil
+	switch {
+	case len(states) == 0:
+		return Unknown(), nil
+	case embedded.State == StateHasEmbeddings && !unresolved:
+		return embedded, nil
+	case embedded.State == StateHasEmbeddings:
+		return Unknown(), nil
+	}
+	for _, state := range states {
+		if state.State == StateUnknown {
+			return Unknown(), nil
+		}
+	}
+	return NoEmbeddings(), nil
 }
 
 func EnsureSameIdentity(operation string, left, right string) error {
