@@ -71,6 +71,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/phrocker/shoal-oss/internal/compaction"
+	"github.com/phrocker/shoal-oss/internal/embeddingspace"
 	"github.com/phrocker/shoal-oss/internal/iterrt"
 	"github.com/phrocker/shoal-oss/internal/metadata"
 	"github.com/phrocker/shoal-oss/internal/rfile/bcfile/block"
@@ -271,6 +272,9 @@ type Options struct {
 	// Limits bounds the job's inputs. The zero value is unlimited; pass
 	// DefaultLimits() for the standard budget.
 	Limits Limits
+
+	// TargetEmbeddingSpace records the table's desired convergence target.
+	TargetEmbeddingSpace string
 }
 
 // OptionsFromTableProperties resolves the effective table configuration into
@@ -313,6 +317,7 @@ func OptionsFromTableProperties(properties map[string]string, limits Limits) (Op
 	}
 
 	opts := Options{Limits: limits}
+	opts.TargetEmbeddingSpace = strings.TrimSpace(properties[embeddingspace.TableTargetProperty])
 	if raw := properties[propCompressType]; raw != "" {
 		codec, ok := accumuloCodecs[raw]
 		if !ok {
@@ -420,7 +425,8 @@ type Plan struct {
 	// MaxOutputBytes is the caller's Limits.MaxOutputBytes, carried here
 	// so the executor enforces it without having to be handed the
 	// Limits separately. Zero means unlimited.
-	MaxOutputBytes int64
+	MaxOutputBytes       int64
+	TargetEmbeddingSpace string
 }
 
 // Spec assembles the compaction.Spec for this plan. inputs must be the
@@ -460,6 +466,7 @@ func (p *Plan) LogValue() slog.Value {
 		slog.String("codec", p.Codec),
 		slog.Int("block_size", p.BlockSize),
 		slog.Int64("max_output_bytes", p.MaxOutputBytes),
+		slog.String("target_embedding_space", p.TargetEmbeddingSpace),
 		slog.Any("stack", names),
 	)
 }
@@ -599,23 +606,24 @@ func Translate(job *tabletserver.TExternalCompactionJob, opts Options) (*Plan, e
 	}
 
 	return &Plan{
-		ECID:                ecid,
-		TableID:             tableID,
-		Extent:              cloneExtent(extent),
-		Kind:                kind,
-		FateID:              fateID,
-		Inputs:              inputFiles(inputs),
-		OutputFile:          outputFile,
-		PropagateDeletes:    job.GetPropagateDeletes(),
-		TotalInputBytes:     totalBytes,
-		TotalInputEntries:   totalEntries,
-		Iterators:           iters,
-		Stack:               stack,
-		Scope:               iterrt.ScopeMajc,
-		FullMajorCompaction: fullMajor,
-		Codec:               codec,
-		BlockSize:           blockSize,
-		MaxOutputBytes:      opts.Limits.MaxOutputBytes,
+		ECID:                 ecid,
+		TableID:              tableID,
+		Extent:               cloneExtent(extent),
+		Kind:                 kind,
+		FateID:               fateID,
+		Inputs:               inputFiles(inputs),
+		OutputFile:           outputFile,
+		PropagateDeletes:     job.GetPropagateDeletes(),
+		TotalInputBytes:      totalBytes,
+		TotalInputEntries:    totalEntries,
+		Iterators:            iters,
+		Stack:                stack,
+		Scope:                iterrt.ScopeMajc,
+		FullMajorCompaction:  fullMajor,
+		Codec:                codec,
+		BlockSize:            blockSize,
+		MaxOutputBytes:       opts.Limits.MaxOutputBytes,
+		TargetEmbeddingSpace: opts.TargetEmbeddingSpace,
 	}, nil
 }
 

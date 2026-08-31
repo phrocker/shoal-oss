@@ -26,10 +26,12 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"sort"
 	"strings"
 	"time"
 	"unicode/utf8"
 
+	"github.com/phrocker/shoal-oss/internal/embeddingspace"
 	"github.com/phrocker/shoal-oss/pkg/document"
 	"github.com/phrocker/shoal-oss/pkg/model"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
@@ -109,7 +111,7 @@ func (e *Explorer) VectorAvailable(ctx context.Context) (bool, error) {
 		}
 		return false, nil
 	}
-	space, found, corpusReady, err := e.vectorAvailabilitySnapshotLocked()
+	spaces, corpusReady, err := e.vectorAvailabilitySnapshotLocked()
 	if err != nil {
 		e.mu.RUnlock()
 		return false, err
@@ -122,18 +124,31 @@ func (e *Explorer) VectorAvailable(ctx context.Context) (bool, error) {
 		}
 		return false, nil
 	}
-	provenance, _, err := e.embedQuery(ctx, vectorCapabilityProbeText)
-	if err != nil {
-		if shoal.IsErrorCode(err, shoal.ErrorCanceled) ||
-			shoal.IsErrorCode(err, shoal.ErrorDeadline) {
-			return false, err
+	available := true
+	if len(spaces) == 0 {
+		_, _, err = e.embedQuery(ctx, vectorCapabilityProbeText)
+		if err != nil {
+			if shoal.IsErrorCode(err, shoal.ErrorCanceled) ||
+				shoal.IsErrorCode(err, shoal.ErrorDeadline) {
+				return false, err
+			}
+			available = false
 		}
-		if err := e.cacheVectorAvailability(false, now); err != nil {
-			return false, err
+	} else if len(spaces) > e.maxEmbeddingSpaceFanout {
+		available = false
+	} else {
+		for _, space := range spaces {
+			_, _, err := e.embedQueryInSpace(ctx, vectorCapabilityProbeText, space)
+			if err != nil {
+				if shoal.IsErrorCode(err, shoal.ErrorCanceled) ||
+					shoal.IsErrorCode(err, shoal.ErrorDeadline) {
+					return false, err
+				}
+				available = false
+				break
+			}
 		}
-		return false, nil
 	}
-	available := !found || provenance == space
 	if err := e.cacheVectorAvailability(available, now); err != nil {
 		return false, err
 	}
@@ -141,14 +156,23 @@ func (e *Explorer) VectorAvailable(ctx context.Context) (bool, error) {
 }
 
 func (e *Explorer) vectorAvailabilitySnapshotLocked() (
-	persistedEmbeddingProvenance, bool, bool, error,
+	[]persistedEmbeddingProvenance, bool, error,
 ) {
-	space, found := e.embeddingSpace.provenance, e.embeddingSpace.found
 	corpusReady := true
+	spacesByIdentity := map[string]persistedEmbeddingProvenance{}
 	for _, revisions := range e.documents {
+		for _, record := range revisions {
+			if record == nil || record.Embeddings == nil {
+				continue
+			}
+			if err := validateEmbeddingSet(record); err != nil {
+				return nil, false, err
+			}
+			spacesByIdentity[record.Embeddings.Provenance.Identity] = record.Embeddings.Provenance
+		}
 		record, err := latestRevision(revisions)
 		if err != nil {
-			return persistedEmbeddingProvenance{}, false, false, err
+			return nil, false, err
 		}
 		if record == nil || len(record.Spans) == 0 {
 			continue
@@ -157,13 +181,15 @@ func (e *Explorer) vectorAvailabilitySnapshotLocked() (
 			corpusReady = false
 			break
 		}
-		current := record.Embeddings.Provenance
-		if space != current {
-			corpusReady = false
-			break
-		}
 	}
-	return space, found, corpusReady, nil
+	spaces := make([]persistedEmbeddingProvenance, 0, len(spacesByIdentity))
+	for _, space := range spacesByIdentity {
+		spaces = append(spaces, space)
+	}
+	sort.Slice(spaces, func(i, j int) bool {
+		return spaces[i].Identity < spaces[j].Identity
+	})
+	return spaces, corpusReady, nil
 }
 
 // VectorScores recomputes vector scores for exact stored span citations. It is
@@ -186,20 +212,26 @@ func (e *Explorer) VectorScores(
 		e.mu.RUnlock()
 		return nil, err
 	}
-	e.mu.RUnlock()
-	queryProvenance, queryVector, err := e.embedQuery(ctx, request.Text)
-	if err != nil {
-		return nil, err
+	if len(request.Citations) == 0 {
+		e.mu.RUnlock()
+		_, _, err := e.embedQuery(ctx, request.Text)
+		if err != nil {
+			return nil, err
+		}
+		return map[shoal.ID]shoal.Score{}, nil
 	}
-	e.mu.RLock()
 	defer e.mu.RUnlock()
-	if err := e.requireOpen(); err != nil {
-		return nil, err
+	type scoreTarget struct {
+		span      document.Span
+		embedding persistedSpanEmbedding
+		space     persistedEmbeddingProvenance
 	}
 	embeddingMaps := make(
 		map[documentRevisionKey]map[shoal.ID]persistedSpanEmbedding)
 	spanMaps := make(map[documentRevisionKey]map[shoal.ID]document.Span)
-	scores := make(map[shoal.ID]shoal.Score, len(request.Citations))
+	targets := make([]scoreTarget, 0, len(request.Citations))
+	spacesByIdentity := map[string]persistedEmbeddingProvenance{}
+	var err error
 	for _, citation := range request.Citations {
 		key := documentRevisionKey{
 			documentID: citation.DocumentID,
@@ -216,12 +248,6 @@ func (e *Explorer) VectorScores(
 				return nil, shoal.NewError(
 					shoal.ErrorUnavailable,
 					"vector scoring requires embeddings for every cited span",
-				)
-			}
-			if record.Embeddings.Provenance != queryProvenance {
-				return nil, incompatibleEmbeddingSpaceError(
-					queryProvenance,
-					record.Embeddings.Provenance,
 				)
 			}
 			embeddings, err = recordEmbeddingMap(record)
@@ -251,11 +277,56 @@ func (e *Explorer) VectorScores(
 				"stored span embeddings are stale or incomplete",
 			)
 		}
-		score, err := vectorScore(queryVector, embedding.Vector)
+		spacesByIdentity[record.Embeddings.Provenance.Identity] = record.Embeddings.Provenance
+		targets = append(targets, scoreTarget{
+			span: span, embedding: embedding, space: record.Embeddings.Provenance,
+		})
+	}
+	if len(spacesByIdentity) > e.maxEmbeddingSpaceFanout {
+		return nil, shoal.NewError(
+			shoal.ErrorUnavailable,
+			"vector scoring spans too many embedding spaces",
+		)
+	}
+	spaceKeys := make([]string, 0, len(spacesByIdentity))
+	for identity := range spacesByIdentity {
+		spaceKeys = append(spaceKeys, identity)
+	}
+	sort.Strings(spaceKeys)
+	queryVectors := make(map[string][]float32, len(spaceKeys))
+	for _, identity := range spaceKeys {
+		_, vector, err := e.embedQueryInSpace(ctx, request.Text, spacesByIdentity[identity])
 		if err != nil {
 			return nil, err
 		}
-		scores[span.ID] = score
+		queryVectors[identity] = vector
+	}
+	scores := make(map[shoal.ID]shoal.Score, len(targets))
+	rawBySpace := make(map[string][]rankedSpan)
+	for _, target := range targets {
+		score, err := vectorScore(queryVectors[target.space.Identity], target.embedding.Vector)
+		if err != nil {
+			return nil, err
+		}
+		if len(spacesByIdentity) > 1 {
+			rawBySpace[target.space.Identity] = append(rawBySpace[target.space.Identity], rankedSpan{
+				span:  target.span,
+				score: score,
+				space: target.space.Identity,
+			})
+		} else {
+			scores[target.span.ID] = score
+		}
+	}
+	if len(spacesByIdentity) > 1 {
+		fused := make([]rankedSpan, 0, len(targets))
+		for _, group := range rawBySpace {
+			fused = append(fused, group...)
+		}
+		applyRankFusion(fused)
+		for _, item := range fused {
+			scores[item.span.ID] = item.score
+		}
 	}
 	return scores, nil
 }
@@ -382,6 +453,85 @@ func (e *Explorer) embedQuery(
 	return provenance, vector, nil
 }
 
+func (e *Explorer) embedQueryInSpace(
+	ctx context.Context,
+	text string,
+	space persistedEmbeddingProvenance,
+) (persistedEmbeddingProvenance, []float32, error) {
+	if err := validateEmbeddingProvenance(space); err != nil {
+		return persistedEmbeddingProvenance{}, nil, err
+	}
+	embedder := e.embedders[space.Identity]
+	if embedder == nil {
+		if e.embedder != nil {
+			current, _, err := e.embedQuery(ctx, text)
+			if err != nil {
+				return persistedEmbeddingProvenance{}, nil, err
+			}
+			if current != space {
+				return persistedEmbeddingProvenance{}, nil,
+					incompatibleEmbeddingSpaceError(space, current)
+			}
+		}
+		return persistedEmbeddingProvenance{}, nil, shoal.NewError(
+			shoal.ErrorUnavailable,
+			"embedding provider for stored space is unavailable",
+		)
+	}
+	identity, err := embeddingIdentityFor(embedder)
+	if err != nil {
+		return persistedEmbeddingProvenance{}, nil, err
+	}
+	if identity != space.Identity {
+		return persistedEmbeddingProvenance{}, nil,
+			incompatibleEmbeddingSpaceError(space, persistedEmbeddingProvenance{
+				Provider: space.Provider, Model: space.Model,
+				Identity: identity, Dimensions: space.Dimensions,
+			})
+	}
+	result, err := embedder.Embed(ctx, model.EmbedRequest{Text: text})
+	if err != nil {
+		return persistedEmbeddingProvenance{}, nil,
+			embeddingProviderError("embed retrieval query", err)
+	}
+	provenance, vector, err := normalizedEmbeddingResult(result, identity)
+	if err != nil {
+		return persistedEmbeddingProvenance{}, nil, err
+	}
+	if provenance != space {
+		return persistedEmbeddingProvenance{}, nil, incompatibleEmbeddingSpaceError(space, provenance)
+	}
+	return provenance, vector, nil
+}
+
+func embeddingProviderMap(options Options) (map[string]model.Embedder, error) {
+	providers := append([]model.Embedder(nil), options.EmbeddingProviders...)
+	if options.Embedder != nil {
+		providers = append([]model.Embedder{options.Embedder}, providers...)
+	}
+	if len(providers) == 0 {
+		return nil, nil
+	}
+	byIdentity := make(map[string]model.Embedder, len(providers))
+	for _, provider := range providers {
+		if provider == nil {
+			continue
+		}
+		identity, err := embeddingIdentityFor(provider)
+		if err != nil {
+			return nil, err
+		}
+		if existing := byIdentity[identity]; existing != nil && existing != provider {
+			return nil, shoal.NewError(
+				shoal.ErrorInvalidArgument,
+				"duplicate embedding provider identity",
+			)
+		}
+		byIdentity[identity] = provider
+	}
+	return byIdentity, nil
+}
+
 func normalizedEmbeddingResult(
 	result model.EmbedResult, identity string,
 ) (persistedEmbeddingProvenance, []float32, error) {
@@ -501,8 +651,7 @@ func (e *Explorer) embeddingSpaceLocked() (
 				continue
 			}
 			if space != current {
-				return persistedEmbeddingProvenance{}, false,
-					incompatibleEmbeddingSpaceError(space, current)
+				return persistedEmbeddingProvenance{}, false, nil
 			}
 		}
 	}
@@ -687,7 +836,7 @@ func embeddingProviderError(operation string, err error) error {
 func incompatibleEmbeddingSpaceError(
 	existing, incoming persistedEmbeddingProvenance,
 ) error {
-	return shoal.NewError(
+	return shoal.WrapError(
 		shoal.ErrorConflict,
 		fmt.Sprintf(
 			"embedding space mismatch: existing %s/%s/%s/%d, incoming %s/%s/%s/%d",
@@ -700,5 +849,10 @@ func incompatibleEmbeddingSpaceError(
 			incoming.Identity,
 			incoming.Dimensions,
 		),
+		&embeddingspace.MismatchError{
+			Operation: "compare embedding spaces",
+			Left:      embeddingspace.Has(existing.Identity),
+			Right:     embeddingspace.Has(incoming.Identity),
+		},
 	)
 }

@@ -8,6 +8,7 @@ import (
 	"io"
 
 	"github.com/phrocker/shoal-oss/internal/cache"
+	"github.com/phrocker/shoal-oss/internal/embeddingspace"
 	"github.com/phrocker/shoal-oss/internal/rfile/adjacency"
 	"github.com/phrocker/shoal-oss/internal/rfile/bcfile"
 	"github.com/phrocker/shoal-oss/internal/rfile/bcfile/block"
@@ -71,7 +72,8 @@ type Reader struct {
 	// files written without an AdjacencyEdgeCF. When present, Neighbors
 	// answers "out-edges of row" via binary search + a contiguous slice
 	// read, bypassing the merge/versioning/relkey decode a Scan pays.
-	adj *adjacency.Index
+	adj            *adjacency.Index
+	embeddingSpace embeddingspace.FileState
 
 	// Per-cell filter. Threaded into every relkey.Reader we open so it
 	// applies inside the inner decode loop — rejected cells skip value
@@ -197,6 +199,10 @@ func Open(bc *bcfile.Reader, dec *block.Decompressor, opts ...OpenOption) (*Read
 	if err != nil {
 		return nil, fmt.Errorf("rfile: load %q: %w", adjacency.MetaBlockName, err)
 	}
+	embedding, err := r.loadEmbeddingSpace()
+	if err != nil {
+		return nil, fmt.Errorf("rfile: load %q: %w", embeddingspace.RFileMetaBlockName, err)
+	}
 
 	r.idx = idx
 	r.walker = walker
@@ -204,7 +210,19 @@ func Open(bc *bcfile.Reader, dec *block.Decompressor, opts ...OpenOption) (*Read
 	r.dataCodec = dataCodec
 	r.bm = bm
 	r.adj = adj
+	r.embeddingSpace = embedding
 	return r, nil
+}
+
+func ReadEmbeddingSpaceMetadata(bc *bcfile.Reader, dec *block.Decompressor) (embeddingspace.FileState, error) {
+	if bc == nil {
+		return embeddingspace.FileState{}, errors.New("rfile: nil bcfile.Reader")
+	}
+	if dec == nil {
+		return embeddingspace.FileState{}, errors.New("rfile: nil Decompressor")
+	}
+	r := &Reader{bc: bc, dec: dec}
+	return r.loadEmbeddingSpace()
 }
 
 // SharedFile holds the immutable, parse-once state of one RFile's default
@@ -224,15 +242,16 @@ func Open(bc *bcfile.Reader, dec *block.Decompressor, opts ...OpenOption) (*Read
 // backs concurrent scans; each scan gets its own cursor Reader (own
 // decompressor + cursor state) via NewReaderFromShared.
 type SharedFile struct {
-	bc           *bcfile.Reader
-	idx          *index.Reader
-	lg           *index.LocalityGroup
-	dataCodec    string
-	dataBlocks   []bcfile.BlockRegion
-	dataBlockSet map[bcfile.BlockRegion]struct{}
-	bm           *blockmeta.BlockMeta
-	adj          *adjacency.Index
-	leaves       []*index.IndexEntry
+	bc             *bcfile.Reader
+	idx            *index.Reader
+	lg             *index.LocalityGroup
+	dataCodec      string
+	dataBlocks     []bcfile.BlockRegion
+	dataBlockSet   map[bcfile.BlockRegion]struct{}
+	bm             *blockmeta.BlockMeta
+	adj            *adjacency.Index
+	embeddingSpace embeddingspace.FileState
+	leaves         []*index.IndexEntry
 }
 
 // OpenShared parses an RFile once and collects its default-LG leaves,
@@ -250,21 +269,29 @@ func OpenShared(bc *bcfile.Reader, dec *block.Decompressor, opts ...OpenOption) 
 		return nil, err
 	}
 	return &SharedFile{
-		bc:           bc,
-		idx:          r.idx,
-		lg:           r.lg,
-		dataCodec:    r.dataCodec,
-		dataBlocks:   r.dataBlocks,
-		dataBlockSet: r.dataBlockSet,
-		bm:           r.bm,
-		adj:          r.adj,
-		leaves:       leaves,
+		bc:             bc,
+		idx:            r.idx,
+		lg:             r.lg,
+		dataCodec:      r.dataCodec,
+		dataBlocks:     r.dataBlocks,
+		dataBlockSet:   r.dataBlockSet,
+		bm:             r.bm,
+		adj:            r.adj,
+		embeddingSpace: r.embeddingSpace,
+		leaves:         leaves,
 	}, nil
 }
 
 // Adjacency returns the parsed shoal.adjacency out-edge index for this
 // shared file, or nil if it carries none.
 func (sf *SharedFile) Adjacency() *adjacency.Index { return sf.adj }
+
+func (sf *SharedFile) EmbeddingSpace() embeddingspace.FileState {
+	if sf.embeddingSpace.State == "" {
+		return embeddingspace.Unknown()
+	}
+	return sf.embeddingSpace
+}
 
 // Neighbors returns this file's out-edges for row, plus ok=false when the
 // file has no adjacency index (caller must fall back to a Scan). ok=true
@@ -286,17 +313,18 @@ func (sf *SharedFile) Neighbors(row []byte) ([]adjacency.Edge, bool) {
 // WithBlockCache to route data-block fetches through a shared cache.
 func NewReaderFromShared(sf *SharedFile, dec *block.Decompressor, opts ...OpenOption) *Reader {
 	r := &Reader{
-		bc:           sf.bc,
-		dec:          dec,
-		idx:          sf.idx,
-		lg:           sf.lg,
-		dataCodec:    sf.dataCodec,
-		dataBlocks:   sf.dataBlocks,
-		dataBlockSet: sf.dataBlockSet,
-		bm:           sf.bm,
-		adj:          sf.adj,
-		leaves:       sf.leaves,
-		sharedLeaves: true,
+		bc:             sf.bc,
+		dec:            dec,
+		idx:            sf.idx,
+		lg:             sf.lg,
+		dataCodec:      sf.dataCodec,
+		dataBlocks:     sf.dataBlocks,
+		dataBlockSet:   sf.dataBlockSet,
+		bm:             sf.bm,
+		adj:            sf.adj,
+		embeddingSpace: sf.embeddingSpace,
+		leaves:         sf.leaves,
+		sharedLeaves:   true,
 	}
 	for _, o := range opts {
 		o(r)
@@ -373,6 +401,14 @@ func OpenAll(bc *bcfile.Reader, dec *block.Decompressor, opts ...OpenOption) ([]
 	if err != nil {
 		return nil, fmt.Errorf("rfile: load %q: %w", blockmeta.MetaBlockName, err)
 	}
+	adj, err := root.loadAdjacency()
+	if err != nil {
+		return nil, fmt.Errorf("rfile: load %q: %w", adjacency.MetaBlockName, err)
+	}
+	embedding, err := root.loadEmbeddingSpace()
+	if err != nil {
+		return nil, fmt.Errorf("rfile: load %q: %w", embeddingspace.RFileMetaBlockName, err)
+	}
 
 	if len(idx.Groups) == 0 {
 		return nil, errors.New("rfile: file has no locality groups")
@@ -386,16 +422,18 @@ func OpenAll(bc *bcfile.Reader, dec *block.Decompressor, opts ...OpenOption) ([]
 			continue
 		}
 		r := &Reader{
-			bc:           bc,
-			dec:          dec,
-			cache:        root.cache,
-			cacheKey:     root.cacheKey,
-			idx:          idx,
-			lg:           lg,
-			dataCodec:    dataCodec,
-			dataBlocks:   root.dataBlocks,
-			dataBlockSet: root.dataBlockSet,
-			bm:           bm,
+			bc:             bc,
+			dec:            dec,
+			cache:          root.cache,
+			cacheKey:       root.cacheKey,
+			idx:            idx,
+			lg:             lg,
+			dataCodec:      dataCodec,
+			dataBlocks:     root.dataBlocks,
+			dataBlockSet:   root.dataBlockSet,
+			bm:             bm,
+			adj:            adj,
+			embeddingSpace: embedding,
 		}
 		r.walker = r.makeWalker(idx, lg.RootIndex, dataCodec)
 		out = append(out, r)
@@ -555,6 +593,29 @@ func (r *Reader) loadAdjacency() (*adjacency.Index, error) {
 		return nil, fmt.Errorf("parse: %w", err)
 	}
 	return adj, nil
+}
+
+func (r *Reader) loadEmbeddingSpace() (embeddingspace.FileState, error) {
+	entry, err := r.bc.MetaBlockEntry(embeddingspace.RFileMetaBlockName)
+	if err != nil {
+		return embeddingspace.Unknown(), nil
+	}
+	raw, err := r.fetchBlock(entry.Region, entry.CompressionAlgo)
+	if err != nil {
+		return embeddingspace.FileState{}, fmt.Errorf("decompress: %w", err)
+	}
+	state, err := embeddingspace.Decode(raw)
+	if err != nil {
+		return embeddingspace.FileState{}, fmt.Errorf("parse: %w", err)
+	}
+	return state, nil
+}
+
+func (r *Reader) EmbeddingSpace() embeddingspace.FileState {
+	if r.embeddingSpace.State == "" {
+		return embeddingspace.Unknown()
+	}
+	return r.embeddingSpace
 }
 
 // Adjacency returns the parsed shoal.adjacency out-edge index, or nil if

@@ -50,6 +50,9 @@ type Explorer struct {
 	graphErr                error
 	graphInitialized        bool
 	embedder                model.Embedder
+	embedders               map[string]model.Embedder
+	maxEmbeddingSpaceFanout int
+	recallEvidence          map[string]string
 	embeddingSpace          embeddingSpaceCache
 	vectorProbeMu           sync.Mutex
 	vectorAvailability      vectorAvailabilityCache
@@ -104,6 +107,17 @@ type Options struct {
 	// keeps ingestion and non-vector retrieval unchanged and advertises vector
 	// as unavailable.
 	Embedder model.Embedder
+
+	// EmbeddingProviders are additional embedders that can serve historical
+	// embedding spaces during a mixed-space migration.
+	EmbeddingProviders []model.Embedder
+
+	// MaxEmbeddingSpaceFanout bounds provider calls for one vector query. Zero
+	// defaults to eight distinct spaces.
+	MaxEmbeddingSpaceFanout int
+
+	// RecallEvidence records benchmark evidence per embedding-space identity.
+	RecallEvidence map[string]string
 }
 
 // Open opens or creates a local Explorer corpus rooted at dir.
@@ -117,10 +131,13 @@ func OpenWithOptions(dir string, options Options) (*Explorer, error) {
 	if strings.TrimSpace(dir) == "" {
 		return nil, shoal.NewError(shoal.ErrorInvalidArgument, "data directory is required")
 	}
-	if options.Embedder != nil {
-		if _, err := embeddingIdentityFor(options.Embedder); err != nil {
-			return nil, err
-		}
+	embedders, err := embeddingProviderMap(options)
+	if err != nil {
+		return nil, err
+	}
+	maxFanout := options.MaxEmbeddingSpaceFanout
+	if maxFanout <= 0 {
+		maxFanout = 8
 	}
 	eng, err := engine.Open(dir, engine.Options{})
 	if err != nil {
@@ -140,10 +157,13 @@ func OpenWithOptions(dir string, options Options) (*Explorer, error) {
 		}
 	}
 	explorer := &Explorer{
-		engine:    eng,
-		documents: make(map[shoal.ID]map[shoal.ID]*persistedDocument),
-		edges:     make(map[shoal.ID]persistedEdge),
-		embedder:  options.Embedder,
+		engine:                  eng,
+		documents:               make(map[shoal.ID]map[shoal.ID]*persistedDocument),
+		edges:                   make(map[shoal.ID]persistedEdge),
+		embedder:                options.Embedder,
+		embedders:               embedders,
+		maxEmbeddingSpaceFanout: maxFanout,
+		recallEvidence:          cloneStringMap(options.RecallEvidence),
 	}
 	if err := explorer.load(); err != nil {
 		_ = eng.Close()

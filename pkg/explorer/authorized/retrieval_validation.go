@@ -627,7 +627,11 @@ func canonicalExplanationEqual(
 	}
 	expectedSummary := "ranked source span using analyzer " + analyzer.Version() +
 		" and scorer " + scorer.Version()
-	return explanation.Summary == expectedSummary
+	if explanation.Summary == expectedSummary {
+		return true
+	}
+	return request.HasMode(retrieval.ModeVector) &&
+		strings.HasPrefix(explanation.Summary, expectedSummary+"; embedding_spaces=")
 }
 
 func graphPathsEqual(left, right graph.Path) bool {

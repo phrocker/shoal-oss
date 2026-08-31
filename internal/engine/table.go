@@ -59,6 +59,10 @@ type TableOptions struct {
 	// FileFormat explicitly selects the immutable storage format without
 	// exposing tablet internals. Empty derives the format from Workload.
 	FileFormat StorageFormat
+
+	// TargetEmbeddingSpace is the desired per-table convergence target. Actual
+	// embedding state remains per immutable file metadata.
+	TargetEmbeddingSpace string
 }
 
 type WorkloadProfile string
@@ -114,21 +118,23 @@ func PrefixSplit(prefixes ...string) [][]byte {
 // table is the internal representation of a named table. It owns N
 // tablets and routes mutations/scans based on split points.
 type table struct {
-	name     string
-	dir      string
-	tablets  []*tablet.Tablet
-	splits   [][]byte // sorted split points; len(tablets) == len(splits)+1
-	logger   *slog.Logger
-	format   tablet.FileFormat
-	formatMu sync.RWMutex
+	name                 string
+	dir                  string
+	tablets              []*tablet.Tablet
+	splits               [][]byte // sorted split points; len(tablets) == len(splits)+1
+	logger               *slog.Logger
+	format               tablet.FileFormat
+	targetEmbeddingSpace string
+	formatMu             sync.RWMutex
 }
 
 const tableManifestVersion = 1
 
 type tableManifest struct {
-	Version    int               `json:"version"`
-	Splits     [][]byte          `json:"splits,omitempty"`
-	FileFormat tablet.FileFormat `json:"file_format"`
+	Version              int               `json:"version"`
+	Splits               [][]byte          `json:"splits,omitempty"`
+	FileFormat           tablet.FileFormat `json:"file_format"`
+	TargetEmbeddingSpace string            `json:"target_embedding_space,omitempty"`
 }
 
 // createTable creates a new table on disk with the configured splits. notify,
@@ -173,9 +179,10 @@ func createTable(dir, name string, opts TableOptions, logger *slog.Logger, rfCac
 		return bytes.Compare(splits[i], splits[j]) < 0
 	})
 	if err := writeTableManifest(dir, tableManifest{
-		Version:    tableManifestVersion,
-		Splits:     splits,
-		FileFormat: format,
+		Version:              tableManifestVersion,
+		Splits:               splits,
+		FileFormat:           format,
+		TargetEmbeddingSpace: opts.TargetEmbeddingSpace,
 	}); err != nil {
 		return nil, err
 	}
@@ -207,12 +214,13 @@ func createTable(dir, name string, opts TableOptions, logger *slog.Logger, rfCac
 		slog.Int("splits", len(splits)))
 
 	return &table{
-		name:    name,
-		dir:     dir,
-		tablets: tablets,
-		splits:  splits,
-		logger:  logger,
-		format:  format,
+		name:                 name,
+		dir:                  dir,
+		tablets:              tablets,
+		splits:               splits,
+		logger:               logger,
+		format:               format,
+		targetEmbeddingSpace: opts.TargetEmbeddingSpace,
 	}, nil
 }
 
@@ -239,6 +247,28 @@ func tabletNotify(name string, notify func(table, kind, file string)) func(kind,
 		return nil
 	}
 	return func(kind, file string) { notify(name, kind, file) }
+}
+
+func (t *table) targetEmbedding() string {
+	t.formatMu.RLock()
+	defer t.formatMu.RUnlock()
+	return t.targetEmbeddingSpace
+}
+
+func (t *table) setTargetEmbedding(identity string) error {
+	t.formatMu.Lock()
+	defer t.formatMu.Unlock()
+	manifest := tableManifest{
+		Version:              tableManifestVersion,
+		Splits:               t.splits,
+		FileFormat:           t.format,
+		TargetEmbeddingSpace: identity,
+	}
+	if err := writeTableManifest(t.dir, manifest); err != nil {
+		return err
+	}
+	t.targetEmbeddingSpace = identity
+	return nil
 }
 
 // openTable opens an existing table from disk. It discovers tablets
@@ -297,12 +327,13 @@ func openTable(dir, name string, logger *slog.Logger, rfCache *tablet.Cache, wal
 		slog.Int("tablets", len(tablets)))
 
 	return &table{
-		name:    name,
-		dir:     dir,
-		tablets: tablets,
-		splits:  manifest.Splits,
-		logger:  logger,
-		format:  manifest.FileFormat,
+		name:                 name,
+		dir:                  dir,
+		tablets:              tablets,
+		splits:               manifest.Splits,
+		logger:               logger,
+		format:               manifest.FileFormat,
+		targetEmbeddingSpace: manifest.TargetEmbeddingSpace,
 	}, nil
 }
 
@@ -382,9 +413,10 @@ func (t *table) setFileFormatLocked(format tablet.FileFormat) error {
 		return err
 	}
 	if err := writeTableManifest(t.dir, tableManifest{
-		Version:    tableManifestVersion,
-		Splits:     t.splits,
-		FileFormat: parsed,
+		Version:              tableManifestVersion,
+		Splits:               t.splits,
+		FileFormat:           parsed,
+		TargetEmbeddingSpace: t.targetEmbeddingSpace,
 	}); err != nil {
 		return err
 	}

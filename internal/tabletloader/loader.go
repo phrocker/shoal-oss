@@ -17,6 +17,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/phrocker/shoal-oss/internal/embeddingspace"
+
 	"github.com/phrocker/shoal-oss/internal/metadata"
 	"github.com/phrocker/shoal-oss/internal/tserver"
 )
@@ -92,6 +94,7 @@ type DataFile struct {
 	Size         int64
 	NumEntries   int64
 	Time         int64
+	Embedding    embeddingspace.FileState
 	RawQualifier []byte
 }
 
@@ -397,8 +400,13 @@ func validateConfig(tableID string, snapshot ConfigurationSnapshot) error {
 func validateResolvedFiles(files []DataFile) error {
 	seen := make(map[string]struct{}, len(files))
 	for i, file := range files {
+		if file.Embedding.State == "" {
+			file.Embedding = embeddingspace.NoEmbeddings()
+			files[i].Embedding = file.Embedding
+		}
 		if file.Path == "" || len(file.RawQualifier) == 0 ||
-			file.Size < 0 || file.NumEntries < 0 || file.Time < -1 {
+			file.Size < 0 || file.NumEntries < 0 || file.Time < -1 ||
+			file.Embedding.Validate() != nil {
 			return fmt.Errorf("%w: data file %d has invalid path or statistics", ErrInvalidReference, i)
 		}
 		key := file.Path + "\x00" + file.StartRow + "\x00" + file.EndRow
@@ -544,7 +552,7 @@ func (s Specification) Equal(other Specification) bool {
 		a, b := s.Files[i], other.Files[i]
 		if a.Path != b.Path || a.StartRow != b.StartRow || a.EndRow != b.EndRow ||
 			a.Size != b.Size || a.NumEntries != b.NumEntries || a.Time != b.Time ||
-			!bytes.Equal(a.RawQualifier, b.RawQualifier) {
+			a.Embedding != b.Embedding || !bytes.Equal(a.RawQualifier, b.RawQualifier) {
 			return false
 		}
 	}

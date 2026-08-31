@@ -1,5 +1,7 @@
 package metadata
 
+import "github.com/phrocker/shoal-oss/internal/embeddingspace"
+
 // TabletInfo is the resolved metadata for a single tablet: which tserver
 // hosts it, the row range it covers, and the RFiles backing it.
 type TabletInfo struct {
@@ -21,6 +23,8 @@ type TabletInfo struct {
 	// The WAL-merged read path (scanserver, Phase W2) drains these on
 	// top of Files so a scan sees writes not yet flushed to an RFile.
 	Logs []LogEntry
+
+	fileEmbeddings map[string]embeddingspace.FileState
 }
 
 // LogEntry is one WAL segment referenced by a tablet's "log:" column
@@ -57,6 +61,7 @@ type FileEntry struct {
 	Size       int64
 	NumEntries int64
 	Time       int64 // -1 when unset
+	Embedding  embeddingspace.FileState
 
 	// RawQualifier preserves the exact JSON bytes as they appeared in the
 	// metadata table. Required if you ever want to delete or update this

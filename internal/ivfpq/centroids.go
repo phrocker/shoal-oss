@@ -22,6 +22,8 @@ import (
 	"encoding/binary"
 	"fmt"
 	"sort"
+
+	"github.com/phrocker/shoal-oss/internal/embeddingspace"
 )
 
 // centroidsFormatVersion mirrors IvfCentroids.FORMAT_VERSION on the Java side.
@@ -42,6 +44,7 @@ type Centroids struct {
 	k               int
 	dim             int
 	codebookVersion int32
+	embeddingSpace  string
 }
 
 // CentroidsFromBytes parses the veculo-compatible Centroids wire format.
@@ -75,6 +78,29 @@ func CentroidsFromBytes(b []byte) (*Centroids, error) {
 		return nil, fmt.Errorf("centroids: trailing bytes %d", r.Len())
 	}
 	return &Centroids{vecs: vecs, k: int(k), dim: int(dim), codebookVersion: cbVer}, nil
+}
+
+func (c *Centroids) WithEmbeddingSpace(identity string) (*Centroids, error) {
+	if err := embeddingspace.Has(identity).Validate(); err != nil {
+		return nil, err
+	}
+	clone := *c
+	clone.embeddingSpace = identity
+	return &clone, nil
+}
+
+func (c *Centroids) EmbeddingSpaceIdentity() (string, bool) {
+	if c == nil || c.embeddingSpace == "" {
+		return "", false
+	}
+	return c.embeddingSpace, true
+}
+
+func (c *Centroids) EnsureQuerySpace(identity string) error {
+	if c == nil || c.embeddingSpace == "" {
+		return nil
+	}
+	return embeddingspace.EnsureSameIdentity("compare centroids", c.embeddingSpace, identity)
 }
 
 // Bytes serialises the Centroids in veculo-compatible big-endian wire format.
@@ -157,6 +183,13 @@ func (c *Centroids) NProbe(query []float32, nprobe int) []int {
 		out[i] = ss[i].idx
 	}
 	return out
+}
+
+func (c *Centroids) NProbeInSpace(query []float32, nprobe int, identity string) ([]int, error) {
+	if err := c.EnsureQuerySpace(identity); err != nil {
+		return nil, err
+	}
+	return c.NProbe(query, nprobe), nil
 }
 
 // centroidIP computes the inner product between two float32 slices.

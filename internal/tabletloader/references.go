@@ -32,6 +32,7 @@ func (StrictReferenceResolver) ResolveDataFile(
 	return DataFile{
 		Path: entry.Path, StartRow: entry.StartRow, EndRow: entry.EndRow,
 		Size: entry.Size, NumEntries: entry.NumEntries, Time: entry.Time,
+		Embedding:    entry.Embedding,
 		RawQualifier: append([]byte(nil), entry.RawQualifier...),
 	}, nil
 }

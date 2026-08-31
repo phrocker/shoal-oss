@@ -21,7 +21,48 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
+
+	"github.com/phrocker/shoal-oss/internal/embeddingspace"
 )
+
+type TrainingSample struct {
+	Vector         []float32
+	EmbeddingSpace string
+}
+
+func TrainCentroidsForSamples(samples []TrainingSample, k, maxIter int, seed int64, codebookVersion int32) (*Centroids, error) {
+	vectors, identity, err := normalizeTrainingSamples("train centroids", samples)
+	if err != nil {
+		return nil, err
+	}
+	return TrainCentroidsInSpace(vectors, k, maxIter, seed, codebookVersion, identity)
+}
+
+func TrainPQForSamples(samples []TrainingSample, m, ks, maxIter int, seed int64, codebookVersion int32) (*VectorPQ, error) {
+	vectors, identity, err := normalizeTrainingSamples("train product quantizer", samples)
+	if err != nil {
+		return nil, err
+	}
+	return TrainPQInSpace(vectors, m, ks, maxIter, seed, codebookVersion, identity)
+}
+
+func normalizeTrainingSamples(operation string, samples []TrainingSample) ([][]float32, string, error) {
+	if len(samples) == 0 {
+		return nil, "", nil
+	}
+	identity := samples[0].EmbeddingSpace
+	if err := requireSampleSpace(operation, identity); err != nil {
+		return nil, "", err
+	}
+	vectors := make([][]float32, len(samples))
+	for i, sample := range samples {
+		if err := embeddingspace.EnsureSameIdentity(operation, identity, sample.EmbeddingSpace); err != nil {
+			return nil, "", err
+		}
+		vectors[i] = sample.Vector
+	}
+	return vectors, identity, nil
+}
 
 // TrainCentroids trains k coarse IVF centroids using spherical k-means:
 // samples are unit-normalised, assignment is by maximum inner product, and
@@ -95,6 +136,18 @@ func TrainCentroids(samples [][]float32, k, maxIter int, seed int64, codebookVer
 		dim:             dim,
 		codebookVersion: codebookVersion,
 	}, nil
+}
+
+func TrainCentroidsInSpace(samples [][]float32, k, maxIter int, seed int64, codebookVersion int32, identity string) (*Centroids, error) {
+	if err := requireSampleSpace("train centroids", identity); err != nil {
+		return nil, err
+	}
+	c, err := TrainCentroids(samples, k, maxIter, seed, codebookVersion)
+	if err != nil {
+		return nil, err
+	}
+	c.embeddingSpace = identity
+	return c, nil
 }
 
 // TrainPQ trains a PQ codebook by running Euclidean k-means independently on
@@ -176,6 +229,25 @@ func TrainPQ(samples [][]float32, m, ks, maxIter int, seed int64, codebookVersio
 	}
 
 	return New(codebook, dim, codebookVersion)
+}
+
+func TrainPQInSpace(samples [][]float32, m, ks, maxIter int, seed int64, codebookVersion int32, identity string) (*VectorPQ, error) {
+	if err := requireSampleSpace("train product quantizer", identity); err != nil {
+		return nil, err
+	}
+	pq, err := TrainPQ(samples, m, ks, maxIter, seed, codebookVersion)
+	if err != nil {
+		return nil, err
+	}
+	pq.embeddingSpace = identity
+	return pq, nil
+}
+
+func requireSampleSpace(operation, identity string) error {
+	if err := embeddingspace.Has(identity).Validate(); err != nil {
+		return err
+	}
+	return nil
 }
 
 // kppSphere picks k initial centroids from unit-normalised samples using

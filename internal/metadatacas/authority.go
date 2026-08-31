@@ -15,6 +15,7 @@ import (
 	gozk "github.com/go-zookeeper/zk"
 
 	"github.com/phrocker/shoal-oss/internal/cclient"
+	"github.com/phrocker/shoal-oss/internal/embeddingspace"
 	"github.com/phrocker/shoal-oss/internal/hostedingest"
 	"github.com/phrocker/shoal-oss/internal/ingestclient"
 	"github.com/phrocker/shoal-oss/internal/ingestrouter"
@@ -270,6 +271,13 @@ func (a *Authority) Commit(
 	updates := []update{{
 		cf: []byte(metadata.CFFile), cq: fileQualifier, value: fileValue,
 	}}
+	fileEmbedding, err := encodeFileEmbedding(request.File.Embedding)
+	if err != nil {
+		return mincauthority.CommitRejected, err
+	}
+	updates = append(updates, update{
+		cf: []byte(metadata.CFFileEmbedding), cq: fileQualifier, value: fileEmbedding,
+	})
 	if request.TabletTime != "" {
 		info, readErr := a.readOwned(ctx)
 		if readErr != nil {
@@ -344,7 +352,8 @@ func (a *Authority) commitApplied(
 	found := false
 	for _, current := range state.Files {
 		if current.Path == request.File.Path {
-			if current.Size != request.File.Size || current.Entries != request.File.Entries {
+			if current.Size != request.File.Size || current.Entries != request.File.Entries ||
+				normalizedEmbedding(current.Embedding) != normalizedEmbedding(request.File.Embedding) {
 				return false, ErrInconsistent
 			}
 			found = true
@@ -386,6 +395,7 @@ func (a *Authority) Read(
 		state.Files = append(state.Files, mincauthority.DataFile{
 			Path: file.Path, Format: "rfile", Size: file.Size, Entries: file.NumEntries,
 			StartRow: []byte(file.StartRow), EndRow: []byte(file.EndRow),
+			Embedding: file.Embedding,
 		})
 	}
 	for _, entry := range info.Logs {
@@ -639,6 +649,18 @@ func encodeFile(file mincauthority.DataFile) ([]byte, []byte, error) {
 	}
 	return qualifier, []byte(strconv.FormatInt(file.Size, 10) + "," +
 		strconv.FormatInt(file.Entries, 10)), nil
+}
+
+func encodeFileEmbedding(state embeddingspace.FileState) ([]byte, error) {
+	state = normalizedEmbedding(state)
+	return embeddingspace.Encode(state)
+}
+
+func normalizedEmbedding(state embeddingspace.FileState) embeddingspace.FileState {
+	if state.State == "" {
+		return embeddingspace.NoEmbeddings()
+	}
+	return state
 }
 
 type rootMetadata struct {
