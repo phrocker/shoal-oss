@@ -26,6 +26,7 @@ import (
 	"sort"
 
 	"github.com/phrocker/shoal-oss/pkg/graph"
+	"github.com/phrocker/shoal-oss/pkg/interaction"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
@@ -106,6 +107,7 @@ func (e *Explorer) BoundedNeighborhood(
 		frontier = append(frontier, id)
 	}
 	edges := make(map[shoal.ID]graph.Edge)
+	explicit := idSet(normalized.NodeIDs)
 	truncated := false
 	cursorEligible := len(normalized.NodeIDs) == 1 && normalized.Depth == 1
 	nextAfter := request.AfterEdgeID
@@ -135,6 +137,12 @@ func (e *Explorer) BoundedNeighborhood(
 						}
 						continue
 					}
+				}
+				if excludedInteractionEdge(e.graphNodes, explicit, edge) {
+					if cursorEligible {
+						nextAfter = edgeID
+					}
+					continue
 				}
 				other := edge.To
 				if other == seed {
@@ -273,7 +281,13 @@ func (e *Explorer) refreshSnapshotLocked() {
 		}
 	}
 	nodeIDs := make([]shoal.ID, 0, len(e.graphNodes))
-	for id := range e.graphNodes {
+	for id, node := range e.graphNodes {
+		// The snapshot is the content frontier. Interaction records are
+		// written while inference is being served, so including them would
+		// invalidate every concurrent reader's pinned snapshot.
+		if interaction.IsInteractionKind(node.Kind) {
+			continue
+		}
 		nodeIDs = append(nodeIDs, id)
 	}
 	sort.Slice(nodeIDs, func(i, j int) bool {
@@ -293,7 +307,10 @@ func (e *Explorer) refreshSnapshotLocked() {
 		writeSnapshotMetadata(hash, node.Properties)
 	}
 	edgeIDs := make([]shoal.ID, 0, len(e.graphEdges))
-	for id := range e.graphEdges {
+	for id, edge := range e.graphEdges {
+		if interaction.IsInteractionEdgeType(edge.Type) {
+			continue
+		}
 		edgeIDs = append(edgeIDs, id)
 	}
 	sort.Slice(edgeIDs, func(i, j int) bool {

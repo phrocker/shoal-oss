@@ -35,6 +35,7 @@ import (
 	"github.com/phrocker/shoal-oss/internal/engine"
 	"github.com/phrocker/shoal-oss/internal/iterrt"
 	"github.com/phrocker/shoal-oss/pkg/document"
+	"github.com/phrocker/shoal-oss/pkg/interaction"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
@@ -42,25 +43,32 @@ import (
 // kind, big-endian payload length, SHA-256 payload checksum, and gob payload.
 // It is intentionally separate from the future cross-adapter canonical codec.
 const (
-	explorerTable = "_shoal_explorer"
-	recordCF      = "record"
-	recordCQV1    = "v1"
-	recordCQV2    = "v2"
-	documentRow   = "document/"
-	edgeRow       = "edge/"
+	explorerTable  = "_shoal_explorer"
+	recordCF       = "record"
+	recordCQV1     = "v1"
+	recordCQV2     = "v2"
+	documentRow    = "document/"
+	edgeRow        = "edge/"
+	interactionRow = "interaction/"
 
-	embeddedRecordMagic            = "SHOALX2\x00"
-	embeddedEnvelopeVersion        = byte(1)
-	embeddedRecordDocument         = byte(1)
-	embeddedRecordEdge             = byte(2)
-	embeddedRecordSnapshotAnchor   = byte(3)
-	embeddedEnvelopeHeader         = 8 + 1 + 1 + 8 + sha256.Size
-	maxEmbeddedDocumentBytes       = uint64(document.MaxRevisionSourceBytes) * 8
-	maxEmbeddedEdgeBytes           = uint64(2 * 1024 * 1024)
-	maxEmbeddedSnapshotAnchorBytes = uint64(1024)
+	embeddedRecordMagic             = "SHOALX2\x00"
+	embeddedEnvelopeVersion         = byte(1)
+	embeddedRecordDocument          = byte(1)
+	embeddedRecordEdge              = byte(2)
+	embeddedRecordSnapshotAnchor    = byte(3)
+	embeddedRecordInteraction       = byte(4)
+	embeddedRecordInteractionSink   = byte(5)
+	embeddedEnvelopeHeader          = 8 + 1 + 1 + 8 + sha256.Size
+	maxEmbeddedDocumentBytes        = uint64(document.MaxRevisionSourceBytes) * 8
+	maxEmbeddedEdgeBytes            = uint64(2 * 1024 * 1024)
+	maxEmbeddedSnapshotAnchorBytes  = uint64(1024)
+	maxEmbeddedInteractionBytes     = uint64(64 * 1024 * 1024)
+	maxEmbeddedInteractionSinkBytes = uint64(1024)
 )
 
 var snapshotAnchorRow = []byte("meta/snapshot-anchor")
+
+var interactionSinkRow = []byte("meta/interaction-sink")
 
 type persistedSnapshotAnchor struct {
 	CreatedAt time.Time
@@ -84,6 +92,13 @@ func edgeRecordRow(edgeID shoal.ID) []byte {
 	row := make([]byte, 0, len(edgeRow)+len(edgeID))
 	row = append(row, edgeRow...)
 	row = append(row, []byte(edgeID)...)
+	return row
+}
+
+func interactionRecordRow(sessionID shoal.ID) []byte {
+	row := make([]byte, 0, len(interactionRow)+len(sessionID))
+	row = append(row, interactionRow...)
+	row = append(row, []byte(sessionID)...)
 	return row
 }
 
@@ -129,6 +144,12 @@ func (e *Explorer) load() error {
 		case bytes.HasPrefix(key.Row, []byte(edgeRow)):
 			if err := e.loadEdgeRecord(
 				key.Row, qualifier, scanner.Value(), edgeFormats,
+			); err != nil {
+				return err
+			}
+		case bytes.HasPrefix(key.Row, []byte(interactionRow)):
+			if err := e.loadInteractionRecord(
+				key.Row, qualifier, scanner.Value(),
 			); err != nil {
 				return err
 			}
@@ -271,6 +292,39 @@ func (e *Explorer) loadEdgeRecord(
 	return nil
 }
 
+func (e *Explorer) loadInteractionRecord(row, qualifier, encoded []byte) error {
+	if !bytes.Equal(qualifier, []byte(recordCQV2)) {
+		return nil
+	}
+	var record persistedInteraction
+	if err := decodeEmbeddedRecord(
+		encoded, embeddedRecordInteraction, &record,
+	); err != nil {
+		return shoal.WrapError(shoal.ErrorInternal, "decode explorer interaction", err)
+	}
+	if err := validatePersistedInteraction(record); err != nil {
+		return shoal.WrapError(
+			shoal.ErrorInternal, "stored explorer interaction is invalid", err)
+	}
+	if !bytes.Equal(row, interactionRecordRow(record.SessionID)) {
+		return shoal.NewError(
+			shoal.ErrorInternal, "stored explorer interaction row is invalid")
+	}
+	// A session row is written at most twice: once when the interaction is
+	// recorded and once when it is explicitly deleted. The scan returns raw
+	// cells, so both versions arrive here. Resolve without depending on scan
+	// order: a tombstone is terminal because a deleted session ID can never
+	// be reused, and otherwise the first cell seen wins.
+	if existing, ok := e.interactions[record.SessionID]; ok {
+		if existing.Deleted || !record.Deleted {
+			return nil
+		}
+	}
+	copy := record
+	e.interactions[record.SessionID] = &copy
+	return nil
+}
+
 func (e *Explorer) writeRecord(row []byte, kind byte, value any) error {
 	encoded, err := encodeEmbeddedRecord(kind, value)
 	if err != nil {
@@ -360,6 +414,10 @@ func embeddedRecordMaximum(kind byte) (uint64, error) {
 		return maxEmbeddedEdgeBytes, nil
 	case embeddedRecordSnapshotAnchor:
 		return maxEmbeddedSnapshotAnchorBytes, nil
+	case embeddedRecordInteraction:
+		return maxEmbeddedInteractionBytes, nil
+	case embeddedRecordInteractionSink:
+		return maxEmbeddedInteractionSinkBytes, nil
 	default:
 		return 0, fmt.Errorf("embedded record kind %d is unsupported", kind)
 	}
@@ -407,6 +465,9 @@ func validatePersistedDocument(record persistedDocument) error {
 		if !utf8.ValidString(node.Kind) {
 			return fmt.Errorf("graph node kind is invalid")
 		}
+		if interaction.IsInteractionKind(node.Kind) {
+			return fmt.Errorf("content cannot use the reserved interaction node kind namespace")
+		}
 		for _, label := range node.Labels {
 			if !utf8.ValidString(label) {
 				return fmt.Errorf("graph node label is invalid")
@@ -416,6 +477,9 @@ func validatePersistedDocument(record persistedDocument) error {
 	for _, edge := range record.Edges {
 		if err := validatePersistedEdge(edge); err != nil {
 			return err
+		}
+		if interaction.IsInteractionEdgeType(edge.Type) {
+			return fmt.Errorf("content cannot use the reserved interaction edge type namespace")
 		}
 	}
 	if err := validateEmbeddingSet(&record); err != nil {

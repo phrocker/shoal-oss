@@ -32,6 +32,7 @@ import (
 	"github.com/phrocker/shoal-oss/internal/engine"
 	"github.com/phrocker/shoal-oss/pkg/document"
 	"github.com/phrocker/shoal-oss/pkg/graph"
+	"github.com/phrocker/shoal-oss/pkg/interaction"
 	"github.com/phrocker/shoal-oss/pkg/model"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
@@ -43,6 +44,7 @@ type Explorer struct {
 	engine                  *engine.Engine
 	documents               map[shoal.ID]map[shoal.ID]*persistedDocument
 	edges                   map[shoal.ID]persistedEdge
+	interactions            map[shoal.ID]*persistedInteraction
 	graphNodes              map[shoal.ID]graph.Node
 	graphEdges              map[shoal.ID]graph.Edge
 	outgoing                map[shoal.ID][]shoal.ID
@@ -59,6 +61,7 @@ type Explorer struct {
 	snapshot                Snapshot
 	snapshotAnchor          time.Time
 	lastPublicationSequence uint64
+	readOnly                bool
 	closed                  bool
 }
 
@@ -118,6 +121,12 @@ type Options struct {
 
 	// RecallEvidence records benchmark evidence per embedding-space identity.
 	RecallEvidence map[string]string
+
+	// ReadOnly opens the corpus for reading only. A read-only corpus refuses
+	// every mutation, including interaction capture, so it cannot serve an
+	// inference: capture is part of serving one. Callers that need to serve
+	// inference must open the corpus writable.
+	ReadOnly bool
 }
 
 // Open opens or creates a local Explorer corpus rooted at dir.
@@ -160,10 +169,12 @@ func OpenWithOptions(dir string, options Options) (*Explorer, error) {
 		engine:                  eng,
 		documents:               make(map[shoal.ID]map[shoal.ID]*persistedDocument),
 		edges:                   make(map[shoal.ID]persistedEdge),
+		interactions:            make(map[shoal.ID]*persistedInteraction),
 		embedder:                options.Embedder,
 		embedders:               embedders,
 		maxEmbeddingSpaceFanout: maxFanout,
 		recallEvidence:          cloneStringMap(options.RecallEvidence),
+		readOnly:                options.ReadOnly,
 	}
 	if err := explorer.load(); err != nil {
 		_ = eng.Close()
@@ -171,12 +182,14 @@ func OpenWithOptions(dir string, options Options) (*Explorer, error) {
 	}
 	if explorer.snapshotAnchor.IsZero() {
 		explorer.snapshotAnchor = time.Now().UTC()
-		if err := explorer.writeRecord(
-			snapshotAnchorRow, embeddedRecordSnapshotAnchor,
-			persistedSnapshotAnchor{CreatedAt: explorer.snapshotAnchor},
-		); err != nil {
-			_ = eng.Close()
-			return nil, err
+		if !explorer.readOnly {
+			if err := explorer.writeRecord(
+				snapshotAnchorRow, embeddedRecordSnapshotAnchor,
+				persistedSnapshotAnchor{CreatedAt: explorer.snapshotAnchor},
+			); err != nil {
+				_ = eng.Close()
+				return nil, err
+			}
 		}
 	}
 	return explorer, nil
@@ -247,6 +260,10 @@ func (e *Explorer) ingest(
 	}
 	e.mu.RLock()
 	if err := e.requireOpen(); err != nil {
+		e.mu.RUnlock()
+		return IngestResult{}, err
+	}
+	if err := e.requireWritableLocked(); err != nil {
 		e.mu.RUnlock()
 		return IngestResult{}, err
 	}
@@ -419,19 +436,38 @@ func (e *Explorer) Connect(ctx context.Context, edge graph.Edge) error {
 	if err := validatePersistedEdge(edge); err != nil {
 		return err
 	}
+	if interaction.IsInteractionEdgeType(edge.Type) {
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"applications cannot create edges in the reserved interaction namespace",
+		)
+	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if err := e.requireOpen(); err != nil {
 		return err
 	}
+	if err := e.requireWritableLocked(); err != nil {
+		return err
+	}
 	if err := e.ensureGraphLocked(); err != nil {
 		return err
 	}
-	if _, ok := e.graphNodes[edge.From]; !ok {
+	if node, ok := e.graphNodes[edge.From]; !ok {
 		return shoal.NewError(shoal.ErrorNotFound, "edge source node not found")
+	} else if interaction.IsInteractionKind(node.Kind) {
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"applications cannot attach edges to interaction nodes",
+		)
 	}
-	if _, ok := e.graphNodes[edge.To]; !ok {
+	if node, ok := e.graphNodes[edge.To]; !ok {
 		return shoal.NewError(shoal.ErrorNotFound, "edge target node not found")
+	} else if interaction.IsInteractionKind(node.Kind) {
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"applications cannot attach edges to interaction nodes",
+		)
 	}
 	if existing, ok := e.graphEdges[edge.ID]; ok {
 		if edgesEqual(existing, edge) {
@@ -496,6 +532,7 @@ func (e *Explorer) Neighborhood(
 		frontier[id] = struct{}{}
 	}
 	selectedEdges := make(map[shoal.ID]graph.Edge)
+	explicit := idSet(request.NodeIDs)
 	for depth := uint32(0); depth < request.Depth && len(frontier) > 0; depth++ {
 		next := make(map[shoal.ID]struct{})
 		for _, edge := range edges {
@@ -507,6 +544,9 @@ func (e *Explorer) Neighborhood(
 			_, from := frontier[edge.From]
 			_, to := frontier[edge.To]
 			if !from && !to {
+				continue
+			}
+			if excludedInteractionEdge(nodes, explicit, edge) {
 				continue
 			}
 			selectedEdges[edge.ID] = edge
@@ -545,6 +585,31 @@ func (e *Explorer) requireOpen() error {
 	return nil
 }
 
+// excludedInteractionEdge reports whether graph expansion must not cross an
+// edge because doing so would surface an interaction node that the caller did
+// not explicitly seed. This is the default-exclusion property: a model that
+// expands the neighborhood of a source span must never discover, and so must
+// never be able to cite, an earlier session's own output.
+func excludedInteractionEdge(
+	nodes map[shoal.ID]graph.Node,
+	explicit map[shoal.ID]struct{},
+	edge graph.Edge,
+) bool {
+	for _, id := range []shoal.ID{edge.From, edge.To} {
+		node, ok := nodes[id]
+		if !ok {
+			continue
+		}
+		if !interaction.IsInteractionKind(node.Kind) {
+			continue
+		}
+		if _, seeded := explicit[id]; !seeded {
+			return true
+		}
+	}
+	return false
+}
+
 func (e *Explorer) computeCurrentGraph() (
 	map[shoal.ID]graph.Node,
 	map[shoal.ID]graph.Edge,
@@ -576,6 +641,26 @@ func (e *Explorer) computeCurrentGraph() (
 			continue
 		}
 		edges[id] = edge
+	}
+	// Interaction nodes share the corpus graph but are excluded from
+	// retrieval and from expansion that did not explicitly seed them. An
+	// interaction edge whose source endpoint disappeared (a superseded
+	// revision) is dropped so the graph stays connected and valid.
+	for _, record := range e.interactions {
+		for _, node := range record.Nodes {
+			nodes[node.ID] = node
+		}
+	}
+	for _, record := range e.interactions {
+		for _, edge := range record.Edges {
+			if _, from := nodes[edge.From]; !from {
+				continue
+			}
+			if _, to := nodes[edge.To]; !to {
+				continue
+			}
+			edges[edge.ID] = edge
+		}
 	}
 	return nodes, edges, nil
 }

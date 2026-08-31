@@ -515,7 +515,7 @@ func newGeneratorWithModel(t *testing.T, runner Runner, tools ToolHost, b Budget
 	if err != nil {
 		t.Fatal(err)
 	}
-	g, err := NewGenerator(runner, tools, b, p, nil)
+	g, err := NewGenerator(runner, tools, b, p, &captureRecorder{})
 	if err != nil {
 		t.Fatal(err)
 	}

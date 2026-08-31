@@ -578,16 +578,51 @@ type RunTrace struct {
 	Failures   []FailureTrace
 }
 
+// InteractionTurn is one redacted model decision. RetrievedNodeIDs are the
+// source graph nodes the turn's tool call put in front of the model. What the
+// model was shown is deliberately recorded alongside what it cited, because
+// exposure — and therefore the visibility an interaction record requires — is
+// determined by everything it saw.
+type InteractionTurn struct {
+	Index            int
+	Decision         ActionKind
+	Usage            Usage
+	Failed           bool
+	ToolKind         ActionKind
+	RetrievedNodeIDs []shoal.ID
+}
+
 // EvaluationRecord is a redacted deterministic execution record. It contains
-// identities and digests, never raw prompts, authorization grants, or tool
-// payloads.
+// identities and digests, never raw prompts, questions, answers, evidence
+// quotes, authorization grants, tool payloads, or model-chosen correlation
+// strings.
 type EvaluationRecord struct {
 	Provenance  Provenance
 	Budgets     Budgets
 	ActionKinds []ActionKind
 	ActionUsage []Usage
+
+	// TranscriptID, RequestID, ContextPackID, and ResultID are derived
+	// identities. QueryDigest is a one-way digest of the question, present so
+	// records can be correlated without persisting the question itself.
+	TranscriptID  shoal.ID
+	RequestID     shoal.ID
+	ContextPackID shoal.ID
+	ResultID      shoal.ID
+	QueryDigest   string
+	StopReason    StopReason
+
+	// SeedNodeIDs are source graph nodes the session was shown before its
+	// first turn. CitedNodeIDs are the source graph nodes the final answer
+	// actually cited. Both are sorted and deduplicated.
+	SeedNodeIDs  []shoal.ID
+	Turns        []InteractionTurn
+	CitedNodeIDs []shoal.ID
 }
 
+// Recorder durably captures an execution record. Recording is part of serving
+// an inference: a Generator cannot be constructed without one, and a recording
+// failure fails the request.
 type Recorder interface {
 	Record(context.Context, EvaluationRecord) error
 }
@@ -605,6 +640,10 @@ type Generator struct {
 func NewGenerator(runner Runner, tools ToolHost, budgets Budgets, provenance Provenance, recorder Recorder) (*Generator, error) {
 	if runner == nil || tools == nil {
 		return nil, invalid("runner and tool host are required")
+	}
+	if recorder == nil {
+		return nil, invalid(
+			"recorder is required: capture is part of serving an inference")
 	}
 	budgets = budgets.normalized()
 	if err := budgets.validate(); err != nil {
@@ -703,17 +742,15 @@ func (g *Generator) Run(ctx context.Context, pack inference.ContextPack) (Record
 					return earlyFinish(StopReasonInvalid, "authorization", err)
 				}
 				if err := validateCachedRecord(cached, request, pack); err == nil {
-					if g.recorder != nil {
-						if err := g.recorder.Record(runCtx, evaluationRecord(cached)); err != nil {
-							return earlyFinish(stopReasonFor(err), "recorder", err)
-						}
-						if err := runCtx.Err(); err != nil {
-							return earlyFinish(stopReasonFor(err), "recorder", err)
-						}
-						if !g.now().Before(pack.Authorization().ExpiresAt()) {
-							err := invalid("authorization pin expired during cache recording")
-							return earlyFinish(StopReasonInvalid, "authorization", err)
-						}
+					if err := g.recorder.Record(runCtx, evaluationRecord(cached)); err != nil {
+						return earlyFinish(stopReasonFor(err), "recorder", err)
+					}
+					if err := runCtx.Err(); err != nil {
+						return earlyFinish(stopReasonFor(err), "recorder", err)
+					}
+					if !g.now().Before(pack.Authorization().ExpiresAt()) {
+						err := invalid("authorization pin expired during cache recording")
+						return earlyFinish(StopReasonInvalid, "authorization", err)
 					}
 					if err := runCtx.Err(); err != nil {
 						return earlyFinish(stopReasonFor(err), "cache", err)
@@ -897,10 +934,8 @@ func (g *Generator) Run(ctx context.Context, pack inference.ContextPack) (Record
 				Request: request, Transcript: cloneTranscript(transcript),
 				Result: result, Trace: cloneRunTrace(trace),
 			}
-			if g.recorder != nil {
-				if err := g.recorder.Record(runCtx, evaluationRecord(record)); err != nil {
-					return finish(stopReasonFor(err), step, "recorder", inference.InferenceResult{}, err)
-				}
+			if err := g.recorder.Record(runCtx, evaluationRecord(record)); err != nil {
+				return finish(stopReasonFor(err), step, "recorder", inference.InferenceResult{}, err)
 			}
 			if err := runCtx.Err(); err != nil {
 				return finish(stopReasonFor(err), step, "model", inference.InferenceResult{}, err)
@@ -1098,18 +1133,135 @@ func evaluationRecord(record Record) EvaluationRecord {
 		Budgets:     record.Request.budgets,
 		ActionKinds: make([]ActionKind, 0, len(record.Transcript.exchanges)+1),
 		ActionUsage: make([]Usage, 0, len(record.Transcript.exchanges)+1),
+
+		TranscriptID:  record.Transcript.id,
+		RequestID:     record.Request.id,
+		ContextPackID: record.Request.context.ID(),
+		ResultID:      record.Result.ID(),
+		QueryDigest:   digestString(record.Request.context.Query()),
+		StopReason:    record.Trace.StopReason,
+	}
+	if evaluation.StopReason == "" && record.Transcript.final != nil {
+		evaluation.StopReason = StopReasonStop
 	}
 	add := func(action Action) {
 		evaluation.ActionKinds = append(evaluation.ActionKinds, action.kind)
 		evaluation.ActionUsage = append(evaluation.ActionUsage, action.usage)
 	}
-	for _, exchange := range record.Transcript.exchanges {
+	failedIterations := make(map[int]struct{}, len(record.Trace.Failures))
+	for _, failure := range record.Trace.Failures {
+		if failure.Iteration >= 0 {
+			failedIterations[failure.Iteration] = struct{}{}
+		}
+	}
+	evaluation.SeedNodeIDs = sourceNodeIDs(record.Request.context.Evidence())
+	for index, exchange := range record.Transcript.exchanges {
 		add(exchange.action)
+		turn := InteractionTurn{
+			Index:            index,
+			Decision:         exchange.action.kind,
+			Usage:            exchange.action.usage,
+			ToolKind:         exchange.result.kind,
+			RetrievedNodeIDs: sourceNodeIDs(exchange.result.anchors),
+		}
+		if _, failed := failedIterations[index]; failed {
+			turn.Failed = true
+		}
+		evaluation.Turns = append(evaluation.Turns, turn)
 	}
 	if record.Transcript.final != nil {
 		add(*record.Transcript.final)
+		index := len(record.Transcript.exchanges)
+		turn := InteractionTurn{
+			Index:    index,
+			Decision: record.Transcript.final.kind,
+			Usage:    record.Transcript.final.usage,
+		}
+		if _, failed := failedIterations[index]; failed {
+			turn.Failed = true
+		}
+		evaluation.Turns = append(evaluation.Turns, turn)
 	}
+	evaluation.CitedNodeIDs = citedSourceNodeIDs(
+		record.Result, record.Transcript.context.Evidence())
 	return evaluation
+}
+
+// sourceNodeIDs projects evidence anchors onto the source graph nodes they
+// expose: the document, section, and span behind a document citation, and
+// every node on a graph anchor's path.
+func sourceNodeIDs(anchors []inference.EvidenceAnchor) []shoal.ID {
+	seen := make(map[shoal.ID]struct{})
+	for _, anchor := range anchors {
+		addSourceNodeIDs(seen, anchor)
+	}
+	return sortedIDs(seen)
+}
+
+// citedSourceNodeIDs projects the anchors a result's claims and issues
+// actually referenced onto their source graph nodes. available is the full
+// anchor set the session ended with, because a claim may cite an anchor the
+// session was seeded with rather than one it added.
+func citedSourceNodeIDs(
+	result inference.InferenceResult, available []inference.EvidenceAnchor,
+) []shoal.ID {
+	cited := make(map[shoal.ID]struct{})
+	for _, claim := range result.Claims() {
+		for _, id := range claim.EvidenceIDs() {
+			cited[id] = struct{}{}
+		}
+	}
+	for _, issue := range append(result.Unresolved(), result.Unsupported()...) {
+		for _, id := range issue.EvidenceIDs() {
+			cited[id] = struct{}{}
+		}
+	}
+	seen := make(map[shoal.ID]struct{})
+	anchors := append(append([]inference.EvidenceAnchor(nil), available...),
+		result.EvidenceAdditions()...)
+	for _, anchor := range anchors {
+		if _, ok := cited[anchor.ID()]; !ok {
+			continue
+		}
+		addSourceNodeIDs(seen, anchor)
+	}
+	return sortedIDs(seen)
+}
+
+func addSourceNodeIDs(seen map[shoal.ID]struct{}, anchor inference.EvidenceAnchor) {
+	if citation, _, ok := anchor.Document(); ok {
+		for _, id := range []shoal.ID{
+			citation.DocumentID, citation.SectionID, citation.SpanID,
+		} {
+			if id != "" {
+				seen[id] = struct{}{}
+			}
+		}
+	}
+	if path, ok := anchor.Path(); ok {
+		for _, node := range path.Nodes {
+			if node.ID != "" {
+				seen[node.ID] = struct{}{}
+			}
+		}
+	}
+}
+
+func sortedIDs(seen map[shoal.ID]struct{}) []shoal.ID {
+	if len(seen) == 0 {
+		return nil
+	}
+	ids := make([]shoal.ID, 0, len(seen))
+	for id := range seen {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool { return shoal.CompareID(ids[i], ids[j]) < 0 })
+	return ids
+}
+
+func digestString(value string) string {
+	sum := sha256.Sum256([]byte(value))
+	return hex.EncodeToString(sum[:])
 }
 
 func validateToolResult(action Action, result ToolResult, original inference.ContextPack) error {

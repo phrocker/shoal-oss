@@ -198,6 +198,7 @@ func runAsk(ctx context.Context, args []string, output io.Writer) error {
 	flags := flag.NewFlagSet("ask", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
 	data := flags.String("data", ".shoal", "Explorer data directory")
+	readOnly := flags.Bool("read-only", false, "open the corpus read-only; ask refuses to run because it cannot record the interaction")
 	questionFlag := flags.String("question", "", "question to answer; positional text is also accepted")
 	provider := flags.String("provider", "fake", "model provider: fake, ollama, or openai-compatible")
 	modelName := flags.String("model", "", "provider model name")
@@ -272,12 +273,21 @@ func runAsk(ctx context.Context, args []string, output io.Writer) error {
 	if err != nil {
 		return err
 	}
-	corpus, err := explorer.Open(*data)
+	corpus, err := explorer.OpenWithOptions(*data, explorer.Options{ReadOnly: *readOnly})
 	if err != nil {
 		return err
 	}
 	defer corpus.Close()
-	record, err := runGroundedAsk(ctx, corpus, question, uint32(*initialTop), modes, budgets, generator, providerName, resolvedModel)
+	// Capture is part of serving an inference. Verify a writable interaction
+	// sink here, at setup, so a read-only or offline corpus refuses ask
+	// outright with a clear diagnostic instead of failing at first write or,
+	// worse, silently answering without a durable record.
+	recorder, err := harness.NewGraphRecorder(ctx, corpus)
+	if err != nil {
+		return fmt.Errorf(
+			"ask requires a writable interaction sink in %s: %w", *data, err)
+	}
+	record, err := runGroundedAsk(ctx, corpus, question, uint32(*initialTop), modes, budgets, generator, providerName, resolvedModel, recorder)
 	if errors.Is(err, errAskNoEvidence) {
 		return writeAskOutput(output, noEvidenceAskOutput(question, providerName, resolvedModel, budgets, *detailedTrace), outputFormat)
 	}
@@ -374,6 +384,7 @@ func runGroundedAsk(
 	textGenerator model.TextGenerator,
 	providerName string,
 	modelName string,
+	recorder harness.Recorder,
 ) (harness.Record, error) {
 	snapshot, err := client.Snapshot(ctx)
 	if err != nil {
@@ -461,7 +472,7 @@ func runGroundedAsk(
 	host.PolicyID = localAskPolicyID
 	host.RetrievalModes = modes
 	host.RetrievalExplain = true
-	generator, err := harness.NewGenerator(runner, host, budgets, provenance, nil)
+	generator, err := harness.NewGenerator(runner, host, budgets, provenance, recorder)
 	if err != nil {
 		return harness.Record{}, err
 	}

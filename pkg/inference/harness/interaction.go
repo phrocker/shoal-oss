@@ -1,0 +1,146 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements. See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership. The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License. You may obtain a copy of the License at
+ *
+ *     https://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied. See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+package harness
+
+import (
+	"context"
+	"time"
+
+	"github.com/phrocker/shoal-oss/pkg/interaction"
+)
+
+// InteractionSink is the durable corpus boundary a graph-backed recorder
+// writes through. *explorer.Explorer implements it.
+type InteractionSink interface {
+	// EnsureInteractionSink must report at setup time, not at first write,
+	// whether interactions can be durably recorded.
+	EnsureInteractionSink(context.Context) error
+	RecordInteraction(context.Context, interaction.Session) error
+}
+
+// GraphRecorder writes execution records into the corpus graph under the
+// reserved interaction.* namespace.
+//
+// It is fail-closed by construction: NewGraphRecorder refuses to build unless
+// the corpus already accepts an interaction write, and Record propagates every
+// write failure to its caller, which fails the inference.
+type GraphRecorder struct {
+	sink InteractionSink
+	now  func() time.Time
+}
+
+// NewGraphRecorder verifies the sink at setup time and returns a recorder.
+// A read-only or otherwise unwritable corpus fails here, with a clear
+// diagnostic, before any inference work is started.
+func NewGraphRecorder(ctx context.Context, sink InteractionSink) (*GraphRecorder, error) {
+	if ctx == nil {
+		return nil, invalid("context is required")
+	}
+	if sink == nil {
+		return nil, invalid("interaction sink is required")
+	}
+	if err := sink.EnsureInteractionSink(ctx); err != nil {
+		return nil, err
+	}
+	return &GraphRecorder{sink: sink, now: time.Now}, nil
+}
+
+// SetClock configures the recorder clock so fixture evaluation can be
+// reproducible.
+func (r *GraphRecorder) SetClock(now func() time.Time) error {
+	if r == nil {
+		return invalid("recorder is required")
+	}
+	if now == nil {
+		return invalid("clock is required")
+	}
+	r.now = now
+	return nil
+}
+
+// Record durably captures one execution record. Any failure fails the request.
+func (r *GraphRecorder) Record(ctx context.Context, record EvaluationRecord) error {
+	if r == nil || r.sink == nil {
+		return invalid("recorder is required")
+	}
+	session, err := InteractionSession(record, r.now().UTC())
+	if err != nil {
+		return err
+	}
+	return r.sink.RecordInteraction(ctx, session)
+}
+
+// InteractionSession projects a redacted evaluation record onto the public
+// interaction contract. It carries identities, digests, counts, and the source
+// node IDs the session was shown or cited — never the question, the prompt,
+// the answer, evidence text, credentials, or model-chosen correlation strings.
+func InteractionSession(
+	record EvaluationRecord, recordedAt time.Time,
+) (interaction.Session, error) {
+	if recordedAt.IsZero() {
+		return interaction.Session{}, invalid("interaction record time is required")
+	}
+	if err := validateLogicalID(
+		"evaluation transcript ID", record.TranscriptID,
+	); err != nil {
+		return interaction.Session{}, err
+	}
+	session := interaction.Session{
+		ID:         interaction.SessionID(record.TranscriptID, recordedAt),
+		RecordedAt: recordedAt.UTC(),
+		Provenance: interaction.Provenance{
+			Harness:      record.Provenance.Harness(),
+			Provider:     record.Provenance.Provider(),
+			Model:        record.Provenance.Model().Model(),
+			ModelVersion: record.Provenance.Model().Version(),
+			PromptID:     record.Provenance.Prompt().TemplateID(),
+			PromptVer:    record.Provenance.Prompt().Version(),
+			PromptHash:   record.Provenance.Prompt().Hash(),
+			ToolPolicy:   record.Provenance.ToolPolicy(),
+		},
+		QueryDigest:   record.QueryDigest,
+		RequestID:     record.RequestID,
+		ContextPackID: record.ContextPackID,
+		ResultID:      record.ResultID,
+		StopReason:    string(record.StopReason),
+		SeedNodeIDs:   record.SeedNodeIDs,
+		CitedNodeIDs:  record.CitedNodeIDs,
+	}
+	for _, turn := range record.Turns {
+		mapped := interaction.Turn{
+			Index:        turn.Index,
+			Decision:     string(turn.Decision),
+			InputTokens:  turn.Usage.InputTokens,
+			OutputTokens: turn.Usage.OutputTokens,
+			Failed:       turn.Failed,
+		}
+		if turn.ToolKind != "" {
+			mapped.ToolCall = &interaction.ToolCall{
+				Kind:             string(turn.ToolKind),
+				RetrievedNodeIDs: turn.RetrievedNodeIDs,
+			}
+		}
+		session.Turns = append(session.Turns, mapped)
+	}
+	if err := session.Validate(); err != nil {
+		return interaction.Session{}, err
+	}
+	return session, nil
+}

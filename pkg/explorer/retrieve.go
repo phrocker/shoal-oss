@@ -28,6 +28,7 @@ import (
 
 	"github.com/phrocker/shoal-oss/pkg/document"
 	"github.com/phrocker/shoal-oss/pkg/graph"
+	"github.com/phrocker/shoal-oss/pkg/interaction"
 	"github.com/phrocker/shoal-oss/pkg/retrieval"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
@@ -143,6 +144,14 @@ func (e *Explorer) retrieve(
 			return retrieval.Response{}, err
 		}
 		if record == nil {
+			continue
+		}
+		// Default-exclusion of the reserved interaction namespace. Retrieval
+		// returns source evidence only; an interaction record is reachable
+		// only by explicit traversal or by the explicit kind-scoped
+		// Interactions query. Enforcing it here rather than by convention is
+		// what stops a model from citing its own prior output as source.
+		if recordHasReservedKind(record) {
 			continue
 		}
 		sectionByID := make(map[shoal.ID]document.Section, len(record.Sections))
@@ -541,6 +550,18 @@ func allSpacesHaveRecallEvidence(
 		}
 	}
 	return true
+}
+
+// recordHasReservedKind reports whether a stored document revision carries a
+// node in the reserved interaction namespace. Ingestion refuses such kinds, so
+// this is a backstop against a corpus written by an older or hostile writer.
+func recordHasReservedKind(record *persistedDocument) bool {
+	for _, node := range record.Nodes {
+		if interaction.IsInteractionKind(node.Kind) {
+			return true
+		}
+	}
+	return false
 }
 
 func idSet(ids []shoal.ID) map[shoal.ID]struct{} {
